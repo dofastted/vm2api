@@ -4,18 +4,26 @@
  * Streaming: Claude SSE events → OpenAI Chat chunks / Responses events
  */
 
+import { createHash, randomUUID } from 'node:crypto'
 import {
   appendLiftedSystemMessage,
   applyStructuredOutput,
   canonicalizeClaudeMessagesShape,
+  mergeConsecutiveAnthropicMessages,
   openaiResponseFormatToOutputConfig,
   sanitizeAnthropicBody,
 } from './sanitize.mjs'
-import { defaultMaxTokensForModel } from './model-policy.mjs'
+import {
+  defaultMaxTokensForModel,
+  getCapabilities,
+  hasForcedToolChoice,
+  normalizeThinkingByPolicy,
+} from './model-policy.mjs'
 import { inboundHasOpenAIToolShape } from '../identity/crs-persona.mjs'
 import { openaiReasoningToClaudeThinking, claudeThinkingToOpenAIReasoning } from './thinking.mjs'
-import { openaiContentToClaudeContent } from './images.mjs'
+import { openaiContentToClaudeContent, openaiImagePartToClaude } from './images.mjs'
 import { remapCodexTools } from './codex-tools.mjs'
+import { ensureOutputConfigSchema } from './request-rectifier.mjs'
 import { CLAUDE_WEB_SEARCH_TOOL, isWebSearchTool } from './web-search.mjs'
 import {
   extractOpenaiUsage,
@@ -317,7 +325,7 @@ export function toClaudeMessages(protocol, body, opts = { rewrite: false, model_
   if (protocol === 'anthropic.messages' && opts.rewrite) {
     return {
       claude: withUpstreamStream({
-        ...body,
+        ...normalizeOpenAIToolsOnMessages(body),
         model: mapModel(body.model || DEFAULT_MODEL, { allowMap: opts.model_map }),
         max_tokens:
           body.max_tokens ||
@@ -334,7 +342,8 @@ export function toClaudeMessages(protocol, body, opts = { rewrite: false, model_
     return { claude: withUpstreamStream(completionsToClaude(body, opts)), mode: opts.rewrite ? 'rewrite' : 'convert' }
   }
   if (protocol === 'openai.responses') {
-    return { claude: withUpstreamStream(responsesToClaude(body, opts)), mode: opts.rewrite ? 'rewrite' : 'convert' }
+    const { claude, responseTools } = responsesToClaude(body, opts)
+    return { claude: withUpstreamStream(claude), responseTools, mode: opts.rewrite ? 'rewrite' : 'convert' }
   }
   throw new Error(`unsupported protocol: ${protocol}`)
 }
@@ -380,48 +389,350 @@ function completionsToClaude(body, opts) {
   )
 }
 
+const RESPONSES_THINKING_PREFIX = 'anthropic-thinking-v1:'
+
+function responsesThinkingBlock(block) {
+  if (
+    block?.type === 'thinking' &&
+    typeof block.thinking === 'string' &&
+    typeof block.signature === 'string' &&
+    block.signature
+  ) {
+    return { type: 'thinking', thinking: block.thinking, signature: block.signature }
+  }
+  if (block?.type === 'redacted_thinking' && typeof block.data === 'string' && block.data) {
+    return { type: 'redacted_thinking', data: block.data }
+  }
+  return null
+}
+
+function decodeResponsesThinking(value, param) {
+  if (typeof value !== 'string' || !value.startsWith(RESPONSES_THINKING_PREFIX)) return null
+  let block
+  try {
+    block = responsesThinkingBlock(
+      JSON.parse(Buffer.from(value.slice(RESPONSES_THINKING_PREFIX.length), 'base64').toString('utf8')),
+    )
+  } catch {
+    invalidResponses(param, 'invalid Anthropic thinking envelope')
+  }
+  if (!block) invalidResponses(param, 'invalid Anthropic thinking block')
+  return block
+}
+
+function invalidResponses(param, reason) {
+  const message = `${param}: ${reason}`
+  const code = 'invalid_responses_conversion'
+  throw Object.assign(new Error(message), {
+    status: 400,
+    code,
+    body: { type: 'error', error: { type: 'invalid_request_error', code, param, message } },
+  })
+}
+
+function responsesContent(content, param) {
+  if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : []
+  if (!Array.isArray(content)) invalidResponses(param, 'must be text or content blocks')
+  return content.flatMap((part, index) => {
+    if (typeof part === 'string') return part ? [{ type: 'text', text: part }] : []
+    if (['input_text', 'output_text', 'text', 'refusal'].includes(part?.type)) {
+      const text = part.text ?? part.refusal
+      if (typeof text === 'string') return text ? [withCacheControl({ type: 'text', text }, part)] : []
+    }
+    if (part?.type === 'input_image') {
+      const image = openaiImagePartToClaude({ type: 'image_url', image_url: part.image_url })
+      if (image) return [withCacheControl(image, part)]
+    }
+    return invalidResponses(`${param}[${index}]`, 'unsupported content for Claude')
+  })
+}
+
+function responsesToolName(tool) {
+  const name = tool.namespace ? `${tool.namespace}__${tool.name}` : tool.name
+  if (typeof name !== 'string' || !name) return name
+  if (/^[A-Za-z0-9_-]{1,59}$/.test(name) && !/_[0-9a-f]{12}$/.test(name)) return name
+  const hash = createHash('sha256').update(name).digest('hex').slice(0, 12)
+  return `${name.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 46)}_${hash}`
+}
+
+function responsesObjectSchema(schema) {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema) || (schema.type && schema.type !== 'object')) {
+    invalidResponses('tools.parameters', 'expected an object schema')
+  }
+  const out = { ...schema, type: 'object' }
+  for (const key of ['allOf', 'oneOf', 'anyOf']) {
+    const variants = out[key]
+    if (variants == null) continue
+    if (!Array.isArray(variants) || !variants.length || variants.some((branch) => branch?.type !== 'object')) {
+      invalidResponses('tools.parameters', 'root schema combinations must contain object schemas')
+    }
+    const branches = variants.map(responsesObjectSchema)
+    const properties = { ...out.properties }
+    const keys = new Set(branches.flatMap((branch) => Object.keys(branch.properties || {})))
+    for (const name of keys) {
+      const definitions = branches.flatMap((branch) =>
+        Object.hasOwn(branch.properties || {}, name) ? [branch.properties[name]] : [],
+      )
+      if (!Object.hasOwn(properties, name)) {
+        const unique = [...new Map(definitions.map((definition) => [JSON.stringify(definition), definition])).values()]
+        Object.defineProperty(properties, name, {
+          value: unique.length === 1 ? unique[0] : { [key === 'allOf' ? 'allOf' : 'anyOf']: unique },
+          enumerable: true,
+        })
+      }
+    }
+    const required = branches.flatMap((branch) => (Array.isArray(branch.required) ? branch.required : []))
+    const shared =
+      key === 'allOf'
+        ? required
+        : required.filter((name) => branches.every((branch) => branch.required?.includes(name)))
+    if (shared.length) out.required = [...new Set([...(out.required || []), ...shared])]
+    out.properties = properties
+    delete out[key]
+  }
+  return out
+}
+
 function responsesToClaude(body, opts) {
-  const systemParts = []
+  if (body.previous_response_id != null || body.conversation != null) {
+    invalidResponses('input', 'provide full input history instead of a remote response or conversation reference')
+  }
+  const responseTools = new Map()
+  const tools = []
+  const addTool = (tool, namespace, discovered = false) => {
+    if (isWebSearchTool(tool) && !['function', 'custom'].includes(tool.type)) {
+      if (!tools.some((entry) => entry.name === CLAUDE_WEB_SEARCH_TOOL.name)) tools.push({ ...CLAUDE_WEB_SEARCH_TOOL })
+      return
+    }
+    const search = tool?.type === 'tool_search' && tool.execution === 'client'
+    const definition = search
+      ? { ...tool, name: 'tool_search' }
+      : tool?.type === 'function'
+        ? (tool.function ?? tool)
+        : tool
+    const scope = namespace ?? definition?.namespace
+    const name = typeof definition?.name === 'string' && responsesToolName({ name: definition.name, namespace: scope })
+    if (!name || (!search && !['function', 'custom'].includes(tool?.type))) {
+      invalidResponses('tools', 'expected unique function or custom tools with Claude-compatible names')
+    }
+    const previous = responseTools.get(name)
+    if (previous) {
+      if (
+        discovered &&
+        previous.type === tool.type &&
+        previous.name === definition.name &&
+        previous.namespace === scope
+      )
+        return name
+      invalidResponses('tools', 'duplicate tool name')
+    }
+    let description = typeof definition.description === 'string' ? definition.description : ''
+    if (tool.type === 'custom') {
+      const format = tool.format
+      if (format?.type && !['text', 'grammar'].includes(format.type))
+        invalidResponses('tools.format', 'unsupported custom tool format')
+      description = [description, 'Provide the complete free-form tool input in the input string.', format?.definition]
+        .filter(Boolean)
+        .join('\n\n')
+    }
+    const schema =
+      tool.type === 'custom'
+        ? {
+            type: 'object',
+            properties: { input: { type: 'string' } },
+            required: ['input'],
+            additionalProperties: false,
+          }
+        : responsesObjectSchema(definition.parameters ?? { type: 'object' })
+    responseTools.set(name, { type: tool.type, name: definition.name, namespace: scope })
+    tools.push(
+      withCacheControl(
+        {
+          name,
+          description,
+          input_schema: schema,
+          ...(typeof definition.strict === 'boolean' ? { strict: definition.strict } : {}),
+        },
+        definition.cache_control ? definition : tool,
+      ),
+    )
+    return name
+  }
+  const addTools = (source, discovered) => {
+    if (!Array.isArray(source)) invalidResponses('tools', 'must be an array')
+    return source
+      .flatMap((tool) => {
+        if (tool?.type !== 'namespace') return [addTool(tool, undefined, discovered)]
+        if (typeof tool.name !== 'string' || !tool.name || !Array.isArray(tool.tools)) {
+          invalidResponses('tools', 'namespace must have a name and tools')
+        }
+        return tool.tools.map((child) => addTool(child, tool.name, discovered))
+      })
+      .filter(Boolean)
+  }
+  if (body.tools != null) addTools(body.tools)
+  if (body.instructions != null && typeof body.instructions !== 'string') {
+    invalidResponses('instructions', 'must be text')
+  }
+  const systemParts = body.instructions ? [{ type: 'text', text: body.instructions }] : []
   const messages = []
-  if (body.instructions) systemParts.push({ type: 'text', text: String(body.instructions) })
-  const input = body.input
-  if (typeof input === 'string') {
-    messages.push({ role: 'user', content: [{ type: 'text', text: input }] })
-  } else if (Array.isArray(input)) {
-    for (const item of input) {
-      if (typeof item === 'string') {
-        messages.push({ role: 'user', content: [{ type: 'text', text: item }] })
-        continue
+  const input = body.input ?? body.messages
+  const items = typeof input === 'string' ? [input] : input
+  if (!Array.isArray(items) || !items.length) invalidResponses('input', 'must contain conversation history')
+  let requestedEffort = body.reasoning?.effort ?? body.reasoning_effort
+  let replied = false
+  for (const [index, raw] of items.entries()) {
+    const param = `input[${index}]`
+    const item = typeof raw === 'string' ? { role: 'user', content: raw } : raw
+    if (!item || typeof item !== 'object') invalidResponses(param, 'must be a conversation item')
+    if (item.type === 'reasoning') {
+      replied = true
+      const block = decodeResponsesThinking(item.encrypted_content, param)
+      if (block) messages.push({ role: 'assistant', content: [block] })
+      continue
+    }
+    if (item.type === 'configuration_update') {
+      if (item.reasoning?.effort != null) requestedEffort = item.reasoning.effort
+      continue
+    }
+    if (['function_call', 'custom_tool_call', 'tool_search_call'].includes(item.type)) {
+      replied = true
+      if (item.encrypted_function_args?.length) invalidResponses(param, 'encrypted tool arguments cannot be replayed')
+      const name =
+        item.type === 'tool_search_call' ? 'tool_search' : typeof item.name === 'string' && responsesToolName(item)
+      const id = item.call_id
+      if (!/^[A-Za-z0-9_-]+$/.test(typeof id === 'string' ? id : '') || !/^[A-Za-z0-9_-]{1,64}$/.test(name || '')) {
+        invalidResponses(param, 'tool call requires a valid call_id and name')
       }
-      if (item.role === 'system' || item.role === 'developer') {
-        appendLiftedSystemMessage(systemParts, messages, { ...item, content: item.content ?? item.text ?? item })
-        continue
+      let args
+      if (item.type === 'custom_tool_call' && typeof item.input === 'string') args = { input: item.input }
+      if (item.type !== 'custom_tool_call') {
+        try {
+          args = typeof item.arguments === 'string' ? JSON.parse(item.arguments) : item.arguments
+        } catch {
+          invalidResponses(`${param}.arguments`, 'must be a JSON object')
+        }
       }
-      const role = item.role === 'assistant' ? 'assistant' : 'user'
-      const text = contentToText(item.content ?? item.text ?? item)
-      const block = withCacheControl({ type: 'text', text }, item)
-      const last = messages[messages.length - 1]
-      if (last?.role === role && Array.isArray(last.content)) last.content.push(block)
-      else messages.push({ role, content: [block] })
+      if (!args || typeof args !== 'object' || Array.isArray(args)) invalidResponses(param, 'invalid tool arguments')
+      messages.push({ role: 'assistant', content: [{ type: 'tool_use', id, name, input: args }] })
+      continue
+    }
+    if (['function_call_output', 'custom_tool_call_output', 'tool_search_output'].includes(item.type)) {
+      const content =
+        item.type === 'tool_search_output'
+          ? [{ type: 'text', text: `Tools now available: ${addTools(item.tools ?? [], true).join(', ') || '(none)'}` }]
+          : responsesContent(item.output, `${param}.output`)
+      messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: item.call_id, content }] })
+      continue
+    }
+    const role = item.type === 'agent_message' ? 'user' : item.role
+    if (
+      (item.type && !['message', 'agent_message'].includes(item.type)) ||
+      !['system', 'developer', 'user', 'assistant'].includes(role)
+    ) {
+      invalidResponses(param, 'unsupported Responses item for Claude')
+    }
+    const content = responsesContent(item.content, `${param}.content`)
+    if (!content.length) continue
+    if (role === 'system' || role === 'developer') {
+      if (content.some((block) => block.type !== 'text')) invalidResponses(param, 'instructions must be text')
+      if (!replied) systemParts.push(...content)
+      else
+        messages.push({
+          role: 'user',
+          content: content.map((block) => ({ ...block, text: `<system-reminder>\n${block.text}\n</system-reminder>` })),
+        })
+    } else {
+      if (role === 'assistant') replied = true
+      messages.push({ role, content })
     }
   }
-  if (!messages.length) messages.push({ role: 'user', content: '' })
-  if (messages[0].role !== 'user') messages.unshift({ role: 'user', content: '' })
+  const history = mergeConsecutiveAnthropicMessages(messages)
+  const ids = new Set()
+  let pending = new Set()
+  for (const message of history) {
+    const next = new Set()
+    for (const block of message.content) {
+      if (block.type === 'tool_use') {
+        if (ids.has(block.id)) invalidResponses('input', 'duplicate tool call_id')
+        next.add(block.id)
+        ids.add(block.id)
+      }
+      if (block.type === 'tool_result' && !pending.delete(block.tool_use_id)) {
+        invalidResponses('input', 'tool result has no matching call in the preceding assistant turn')
+      }
+    }
+    if (pending.size) invalidResponses('input', 'tool call is missing its result')
+    pending = next
+    if (message.content.some((block) => block.type === 'tool_result')) {
+      message.content = [
+        ...message.content.filter((block) => block.type === 'tool_result'),
+        ...message.content.filter((block) => block.type !== 'tool_result'),
+      ]
+    }
+  }
+  if (pending.size) invalidResponses('input', 'tool call is missing its result')
+  if (
+    !history.some(
+      (message) =>
+        message.role === 'user' && message.content.some((block) => block.type !== 'text' || block.text.trim()),
+    )
+  ) {
+    invalidResponses('input', 'must include a non-empty user turn')
+  }
   const out = {
     model: mapModel(body.model, { allowMap: opts.model_map !== false }),
-    max_tokens: body.max_output_tokens || body.max_tokens || defaultMaxTokensForModel(body.model),
-    messages,
+    max_tokens: body.max_output_tokens ?? body.max_tokens ?? defaultMaxTokensForModel(body.model),
+    messages: history,
   }
+  if (!Number.isSafeInteger(out.max_tokens) || out.max_tokens < 1)
+    invalidResponses('max_output_tokens', 'must be a positive integer')
   if (systemParts.length) out.system = systemParts
-  const tools = openaiToolsToClaude(body.tools)
-  if (tools?.length) out.tools = tools
-  const tc = openaiToolChoiceToClaude(body.tool_choice)
+  if (tools.length) out.tools = tools
+  const choice = body.tool_choice
+  const tc = ['function', 'custom'].includes(choice?.type)
+    ? { type: 'tool', name: responsesToolName(choice.function ?? choice) }
+    : openaiToolChoiceToClaude(choice)
+  if (choice != null && !tc) invalidResponses('tool_choice', 'unsupported choice for Claude')
   if (tc) out.tool_choice = tc
-  const thinking = openaiReasoningToClaudeThinking(body)
+  if (body.parallel_tool_calls === false && tc?.type !== 'none' && tools.length) {
+    out.tool_choice = { ...(tc || { type: 'auto' }), disable_parallel_tool_use: true }
+  }
+  const caps = getCapabilities(out.model)
+  const effort = requestedEffort === 'minimal' ? 'low' : requestedEffort
+  if (effort != null && !['none', 'off', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) {
+    invalidResponses('reasoning.effort', 'unsupported reasoning effort')
+  }
+  const thinking = openaiReasoningToClaudeThinking({ reasoning_effort: effort })
   if (thinking) out.thinking = thinking
   applyStructuredOutput(out, body)
+  if (thinking?.type === 'disabled' && caps.supports_between_tools && !hasForcedToolChoice(out)) {
+    out.thinking = { type: 'between_tools' }
+    out.output_config = { ...out.output_config, effort: 'low' }
+  } else if (
+    effort &&
+    caps.supports_adaptive &&
+    caps.supports_effort &&
+    thinking?.type === 'enabled' &&
+    !hasForcedToolChoice(out)
+  ) {
+    out.thinking = { type: 'adaptive' }
+    out.output_config = { ...out.output_config, effort }
+  }
   if (body.stream) out.stream = true
-  return canonicalizeClaudeMessagesShape(out)
+  normalizeThinkingByPolicy(out)
+  for (const key of ['temperature', 'top_p']) {
+    if (body[key] == null) continue
+    if (typeof body[key] !== 'number' || !(body[key] >= 0 && body[key] <= 1))
+      invalidResponses(key, 'must be between 0 and 1 for Claude')
+    if (['adaptive', 'enabled'].includes(out.thinking?.type)) {
+      if (body[key] !== 1 && !(key === 'top_p' && body[key] === 0.99))
+        invalidResponses(key, 'non-default sampling is not supported with Claude thinking')
+      if (key === 'top_p') continue
+    }
+    out[key] = body[key]
+  }
+  return { claude: ensureOutputConfigSchema(sanitizeAnthropicBody(out)), responseTools }
 }
 
 export function fromClaudeToOpenAIChat(claude, requestedModel, vmId, mode = 'convert') {
@@ -512,45 +823,78 @@ function promptTokensDetails(usage) {
   return details
 }
 
-export function fromClaudeToResponses(claude, requestedModel, vmId, mode = 'convert') {
-  const text = (claude.content || [])
-    .filter((b) => b.type === 'text')
-    .map((b) => b.text || '')
-    .join('')
-  const output = [
-    {
-      type: 'message',
-      id: 'msg_' + Math.random().toString(16).slice(2, 8),
-      role: 'assistant',
-      content: [{ type: 'output_text', text }],
-    },
-  ]
-  for (const b of claude.content || []) {
-    if (b.type === 'tool_use') {
-      output.push({
-        type: 'function_call',
-        id: b.id,
-        name: b.name,
-        arguments: JSON.stringify(b.input || {}),
-      })
+function responsesOutputItem(block, tools, id = randomUUID().replaceAll('-', '')) {
+  if (block.type === 'text' || block.type === 'refusal') {
+    const part =
+      block.type === 'text'
+        ? { type: 'output_text', text: block.text || '', annotations: [] }
+        : { type: 'refusal', refusal: block.refusal || block.text || '' }
+    return { type: 'message', id: `msg_${id}`, role: 'assistant', status: 'completed', content: [part] }
+  }
+  if (block.type === 'tool_use') {
+    const tool = tools?.get(block.name)
+    const fields = { call_id: block.id, name: tool?.name ?? block.name, status: 'completed' }
+    if (tool?.namespace) fields.namespace = tool.namespace
+    if (tool?.type === 'tool_search') {
+      return {
+        type: 'tool_search_call',
+        id: `tsc_${id}`,
+        call_id: block.id,
+        execution: 'client',
+        arguments: block.input ?? {},
+        status: 'completed',
+      }
+    }
+    if (tool?.type === 'custom') {
+      return { type: 'custom_tool_call', id: `ctc_${id}`, ...fields, input: block.input?.input ?? '' }
+    }
+    return {
+      type: 'function_call',
+      id: `fc_${id}`,
+      ...fields,
+      arguments: JSON.stringify(block.input ?? {}),
+      ...(tool?.namespace ? { encrypted_function_args: [] } : {}),
     }
   }
-  const refused = isClaudeRefusalStop(claude)
-  const refusal = claudeRefusalText(claude)
-  if (refused && !text && refusal) {
-    output[0].content = [{ type: 'output_text', text: refusal }]
+  const thinking = responsesThinkingBlock(block)
+  if (thinking) {
+    return {
+      type: 'reasoning',
+      id: `rs_${id}`,
+      summary: [],
+      encrypted_content:
+        RESPONSES_THINKING_PREFIX + Buffer.from(JSON.stringify(thinking)).toString('base64').replace(/=+$/, ''),
+    }
   }
+  return null
+}
+
+function completedResponse(state, output, stopReason, usage) {
+  const reason = stopReason === 'max_tokens' ? 'max_output_tokens' : stopReason === 'refusal' ? 'content_filter' : null
   return {
-    id: 'resp_' + Math.random().toString(16).slice(2, 10),
+    id: state.id,
     object: 'response',
-    created_at: Math.floor(Date.now() / 1000),
-    status: refused ? 'incomplete' : 'completed',
-    incomplete_details: refused ? { reason: 'content_filter' } : undefined,
-    model: requestedModel || claude.model,
+    created_at: state.createdAt,
+    status: reason ? 'incomplete' : 'completed',
+    incomplete_details: reason ? { reason } : null,
+    model: state.model,
     output,
-    output_text: text || (refused ? refusal || '' : text),
-    usage: responsesUsage(claude.usage),
+    output_text: output
+      .flatMap((item) => item.content || [])
+      .filter((part) => part.type === 'output_text')
+      .map((part) => part.text)
+      .join(''),
+    usage: responsesUsage(usage),
   }
+}
+
+export function fromClaudeToResponses(claude, requestedModel, vmId, _mode = 'convert', tools) {
+  const state = createResponsesStreamState(requestedModel || claude.model, vmId, tools)
+  const output = (claude.content || []).map((block) => responsesOutputItem(block, tools)).filter(Boolean)
+  if (isClaudeRefusalStop(claude) && !output.length) {
+    output.push(responsesOutputItem({ type: 'refusal', refusal: claudeRefusalText(claude) }))
+  }
+  return completedResponse(state, output, claude.stop_reason, claude.usage)
 }
 
 /** Claude usage → OpenAI Responses usage with input_tokens_details cache breakdown. */
@@ -869,12 +1213,16 @@ export function claudeSSELineToOpenAIChatChunks(line, state) {
 }
 
 // ---------- Streaming: Claude SSE → OpenAI Responses-like events ----------
-export function createResponsesStreamState(model, vmId) {
+export function createResponsesStreamState(model, vmId, tools) {
   return {
-    id: 'resp_' + Math.random().toString(36).slice(2, 10),
+    id: 'resp_' + randomUUID().replaceAll('-', ''),
+    createdAt: Math.floor(Date.now() / 1000),
     model,
     vmId,
-    text: '',
+    tools,
+    blocks: new Map(),
+    output: [],
+    sequence: 0,
     dataBuf: '',
   }
 }
@@ -883,109 +1231,105 @@ export function claudeSSELineToResponsesEvents(line, state) {
   const evt = consumeClaudeSSEData(line, state)
   if (!evt) return []
   const out = []
-
+  const emit = (type, fields) => out.push({ type: `response.${type}`, sequence_number: state.sequence++, ...fields })
   if (evt.type === 'message_start') {
-    state.outputIndex = 0
-    state.contentIndex = 0
-    state.itemId = 'msg_' + Math.random().toString(36).slice(2, 10)
-    out.push({
-      type: 'response.created',
-      response: { id: state.id, object: 'response', model: state.model, status: 'in_progress' },
-    })
-    out.push({ type: 'response.in_progress', response: { id: state.id, status: 'in_progress' } })
-  }
-
-  if (evt.type === 'content_block_start' && evt.content_block?.type === 'text') {
-    out.push({
-      type: 'response.output_item.added',
-      output_index: state.outputIndex || 0,
-      item: {
-        type: 'message',
-        id: state.itemId,
-        role: 'assistant',
-        content: [],
-        status: 'in_progress',
-      },
-    })
-    out.push({
-      type: 'response.content_part.added',
-      output_index: state.outputIndex || 0,
-      content_index: state.contentIndex || 0,
-      part: { type: 'output_text', text: '' },
-    })
-  }
-
-  if (evt.type === 'content_block_delta' && evt.delta?.type === 'text_delta') {
-    state.text += evt.delta.text || ''
-    out.push({
-      type: 'response.output_text.delta',
-      output_index: state.outputIndex || 0,
-      content_index: state.contentIndex || 0,
-      delta: evt.delta.text || '',
-    })
-  }
-
-  if (evt.type === 'content_block_stop') {
-    out.push({
-      type: 'response.output_text.done',
-      output_index: state.outputIndex || 0,
-      content_index: state.contentIndex || 0,
-      text: state.text,
-    })
-    out.push({
-      type: 'response.content_part.done',
-      output_index: state.outputIndex || 0,
-      content_index: state.contentIndex || 0,
-      part: { type: 'output_text', text: state.text },
-    })
-    out.push({
-      type: 'response.output_item.done',
-      output_index: state.outputIndex || 0,
-      item: {
-        type: 'message',
-        id: state.itemId,
-        role: 'assistant',
-        content: [{ type: 'output_text', text: state.text }],
-        status: 'completed',
-      },
-    })
-  }
-
-  if (evt.type === 'message_delta' && evt.delta?.stop_reason === 'refusal') {
-    state.refused = true
-    state.refusalText = state.refusalText || ''
-  }
-
-  if (evt.type === 'content_block_start' && evt.content_block?.type === 'refusal') {
-    state.refusalText = (state.refusalText || '') + (evt.content_block.refusal || '')
-  }
-
-  if (evt.type === 'content_block_delta' && evt.delta?.type === 'refusal_delta') {
-    state.refusalText = (state.refusalText || '') + (evt.delta.refusal || evt.delta.text || '')
-  }
-
-  if (evt.type === 'message_stop') {
-    const refused = !!state.refused
-    const text = state.text || (refused ? state.refusalText || '' : '')
-    out.push({
-      type: refused ? 'response.incomplete' : 'response.completed',
-      response: {
-        id: state.id,
-        object: 'response',
-        model: state.model,
-        status: refused ? 'incomplete' : 'completed',
-        incomplete_details: refused ? { reason: 'content_filter' } : undefined,
-        output: [
-          {
-            type: 'message',
-            id: state.itemId,
-            role: 'assistant',
-            content: [{ type: 'output_text', text }],
-          },
-        ],
-        output_text: text,
-      },
-    })
+    state.usage = evt.message?.usage
+    const response = { ...completedResponse(state, [], null), status: 'in_progress', usage: null }
+    emit('created', { response })
+    emit('in_progress', { response })
+  } else if (evt.type === 'content_block_start' && evt.content_block) {
+    const block = { ...evt.content_block }
+    const id = randomUUID().replaceAll('-', '')
+    const item = responsesOutputItem(block, state.tools, id)
+    const entry = { block, id, arguments: '' }
+    state.blocks.set(evt.index, entry)
+    if (item && !['reasoning', 'tool_search_call'].includes(item.type)) {
+      entry.index = state.output.push(null) - 1
+      entry.itemId = item.id
+      const started = { ...item, status: 'in_progress' }
+      if (item.type === 'message') started.content = []
+      if (item.type === 'function_call') started.arguments = ''
+      if (item.type === 'custom_tool_call') started.input = ''
+      emit('output_item.added', { output_index: entry.index, item: started })
+      if (item.type === 'message') {
+        emit('content_part.added', {
+          output_index: entry.index,
+          item_id: item.id,
+          content_index: 0,
+          part: item.content[0],
+        })
+      }
+    }
+  } else if (evt.type === 'content_block_delta') {
+    const entry = state.blocks.get(evt.index)
+    if (!entry) return out
+    const { block } = entry
+    const fields = { output_index: entry.index, item_id: entry.itemId }
+    const delta = evt.delta
+    if (delta?.type === 'input_json_delta') {
+      entry.arguments += delta.partial_json || ''
+      if (entry.itemId && state.tools?.get(block.name)?.type !== 'custom') {
+        emit('function_call_arguments.delta', { ...fields, delta: delta.partial_json || '' })
+      }
+    } else if (delta?.type === 'text_delta' || delta?.type === 'refusal_delta') {
+      const refusal = delta.type === 'refusal_delta'
+      const key = refusal ? 'refusal' : 'text'
+      const text = delta[key] || delta.text || ''
+      block[key] = (block[key] || '') + text
+      emit(`${refusal ? 'refusal' : 'output_text'}.delta`, { ...fields, content_index: 0, delta: text })
+    } else if (delta?.type === 'thinking_delta') {
+      block.thinking = (block.thinking || '') + (delta.thinking || '')
+    } else if (delta?.type === 'signature_delta') {
+      block.signature = delta.signature
+    }
+  } else if (evt.type === 'content_block_stop') {
+    const entry = state.blocks.get(evt.index)
+    if (!entry) return out
+    state.blocks.delete(evt.index)
+    const item = responsesOutputItem(entry.block, state.tools, entry.id)
+    if (!item) return out
+    const output_index = entry.index ?? state.output.length
+    const fields = { output_index, item_id: item.id }
+    if (item.type === 'message') {
+      const [part] = item.content
+      const key = part.type === 'refusal' ? 'refusal' : 'text'
+      emit(`${part.type}.done`, { ...fields, content_index: 0, [key]: part[key] })
+      emit('content_part.done', { ...fields, content_index: 0, part })
+    } else if (item.type === 'function_call') {
+      if (entry.arguments) item.arguments = entry.arguments
+      else emit('function_call_arguments.delta', { ...fields, delta: item.arguments })
+      emit('function_call_arguments.done', { ...fields, arguments: item.arguments })
+    } else if (item.type === 'custom_tool_call') {
+      if (entry.arguments) {
+        try {
+          const parsed = JSON.parse(entry.arguments)
+          item.input = typeof parsed?.input === 'string' ? parsed.input : entry.arguments
+        } catch {
+          item.input = entry.arguments
+        }
+      }
+      emit('custom_tool_call_input.delta', { ...fields, delta: item.input })
+      emit('custom_tool_call_input.done', { ...fields, input: item.input })
+    } else if (item.type === 'tool_search_call') {
+      if (entry.arguments) {
+        try {
+          item.arguments = JSON.parse(entry.arguments)
+        } catch {
+          item.arguments = entry.arguments
+        }
+      }
+      emit('output_item.added', { output_index, item: { ...item, status: 'in_progress' } })
+    } else {
+      emit('output_item.added', { output_index, item: { type: item.type, id: item.id, summary: [] } })
+    }
+    state.output[output_index] = item
+    emit('output_item.done', { output_index, item })
+  } else if (evt.type === 'message_delta') {
+    state.stopReason = evt.delta?.stop_reason || state.stopReason
+    if (evt.usage) state.usage = mergeUsage(state.usage, evt.usage)
+  } else if (evt.type === 'message_stop') {
+    const response = completedResponse(state, state.output.filter(Boolean), state.stopReason, state.usage)
+    emit(response.status, { response })
   }
   return out
 }

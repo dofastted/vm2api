@@ -1111,21 +1111,6 @@ export function createHandleProtocol(deps) {
         }),
       )
     }
-    if (protocol === 'openai.responses' && inferenceBackend !== 'api') {
-      stats.errors++
-      logBag.error_code = 'protocol_not_allowed'
-      return json(
-        res,
-        400,
-        makeError({
-          type: ErrorType.INVALID_REQUEST,
-          code: 'protocol_not_allowed',
-          message: 'Claude models are not accepted on /v1/responses',
-          status: 400,
-          param: 'model',
-        }).body,
-      )
-    }
     if (inferenceBackend !== 'api') {
       const modelCheck = validateOfficialModel(ctx.body?.model)
       if (!modelCheck.ok) {
@@ -1147,15 +1132,27 @@ export function createHandleProtocol(deps) {
     // Recognition alone is not passthrough. Only the protocol-tab switch keeps
     // the Claude Code family body; every other inbound is rewritten below.
     const officialPassthrough = officialFamilyBodyPassthrough(officialInbound, getRouting())
-    const converted = toClaudeMessages(protocol, ctx.body, {
-      rewrite: rewriteEnabled,
-      model_map: false,
-      preserve_content_shape: officialPassthrough,
-      onSystemBlock:
-        inferenceBackend !== 'api' && !officialPassthrough
-          ? trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
-          : undefined,
-    })
+    let converted
+    try {
+      converted =
+        apiOpenAI && protocol === 'openai.responses'
+          ? { claude: ctx.body, mode: 'passthrough' }
+          : toClaudeMessages(protocol, ctx.body, {
+              rewrite: rewriteEnabled,
+              model_map: false,
+              preserve_content_shape: officialPassthrough,
+              onSystemBlock:
+                inferenceBackend !== 'api' && !officialPassthrough
+                  ? trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
+                  : undefined,
+            })
+    } catch (error) {
+      if (error.code !== 'invalid_responses_conversion') throw error
+      stats.errors++
+      logBag.error_code = error.code
+      logBag.error_message = error.body.error.message
+      return json(res, error.status, error.body)
+    }
     stats.requests++
     stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
     if (converted.mode === 'passthrough') stats.passthrough++
@@ -1203,12 +1200,15 @@ export function createHandleProtocol(deps) {
       ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
     }
     let inboundToolReverse = {}
+    const deferToolNameRewrite =
+      (protocol === 'anthropic.messages' && inferenceBackend !== 'api') || protocol === 'openai.responses'
     const cragSystem = projectCallerSystem(ctx.body.system, callerEnvironment)
     const hasCragSystem = cragSystem !== ctx.body.system
     if (!apiOpenAI && !requestContext && !officialPassthrough) {
       const standard = toStandardAnthropicBody(ctx.body, {
         official: officialTraffic === true,
         rewriteTools: getRouting()?.compatibility?.tool_name_rewrite !== false,
+        preserveToolNames: deferToolNameRewrite,
       })
       ctx.body = standard.body
       inboundToolReverse = standard.reverse
@@ -1460,7 +1460,7 @@ export function createHandleProtocol(deps) {
             claudeSSELineToOpenAIChatChunks,
             createOpenAICompletionStreamState,
             claudeSSELineToOpenAICompletionChunks,
-            createResponsesStreamState,
+            createResponsesStreamState: (model, id) => createResponsesStreamState(model, id, converted.responseTools),
             claudeSSELineToResponsesEvents,
             hidePersonaUsageInSseLine,
             writeSSEHeaders,
@@ -1527,7 +1527,7 @@ export function createHandleProtocol(deps) {
       else
         output = apiOpenAI
           ? result.body
-          : fromClaudeToResponses(clientBody, inbound.model, result.endpointId, converted.mode)
+          : fromClaudeToResponses(clientBody, inbound.model, result.endpointId, converted.mode, converted.responseTools)
       return json(res, 200, output)
     }
 
@@ -1756,6 +1756,8 @@ export function createHandleProtocol(deps) {
               })
             if (cragPrint) {
               const cragPersona = resolveCragPrintPersona(selected.vm, routingNow)
+              const caps = preparedHop.ready.health?.capabilities
+              const preserveToolNames = deferToolNameRewrite && caps?.includes('generation_controls_v3')
               // CRAG print bypasses the cli-node envelope builder. Canonicalize
               // once more at this boundary so passthrough traffic cannot carry
               // client/OpenAI fields into the native worker.
@@ -1763,16 +1765,14 @@ export function createHandleProtocol(deps) {
               const cragStandard = toStandardAnthropicBody(cragInput, {
                 official: officialTraffic === true,
                 rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
+                preserveToolNames,
               })
-              if (Object.keys(cragStandard.reverse || {}).length) {
-                inboundToolReverse = composeToolNames(inboundToolReverse, cragStandard.reverse)
-              }
+              const cragToolReverse = composeToolNames(inboundToolReverse, cragStandard.reverse)
               // The CRAG kernel fingerprints the public stream it already sent,
               // including thinking. Rewriting an unrecorded signature into text
               // makes the tool continuation fail with tool_result history mismatch.
               let source = shallowCopyBody(cragStandard.body)
               for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
-              const caps = preparedHop.ready.health?.capabilities
               hopBody = prepareCragPrintBody(source, {
                 preset: cragPersona,
                 officialPassthrough,
@@ -1796,6 +1796,7 @@ export function createHandleProtocol(deps) {
               const scrubbed = scrubUpstreamClientBody(hopBody, {
                 official: officialTraffic === true,
                 rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
+                preserveToolNames,
               })
               hopBody = scrubbed.body
               if (
@@ -1824,7 +1825,7 @@ export function createHandleProtocol(deps) {
               return {
                 body: hopBody,
                 meta: {
-                  toolNames: composeToolNames(inboundToolReverse, scrubbed.reverse),
+                  toolNames: composeToolNames(cragToolReverse, scrubbed.reverse),
                   sessionId: attemptSessionId,
                   cliHop: true,
                   cragPrint: true,
@@ -2059,7 +2060,7 @@ export function createHandleProtocol(deps) {
           } else if (protocol === 'openai.completions') {
             state = createOpenAICompletionStreamState(inbound.model || body.model, candidate.vmId)
           } else if (protocol === 'openai.responses') {
-            state = createResponsesStreamState(inbound.model || body.model, candidate.vmId)
+            state = createResponsesStreamState(inbound.model || body.model, candidate.vmId, converted.responseTools)
           }
           const keepalive =
             anthropicKeepalive ||
@@ -2124,7 +2125,8 @@ export function createHandleProtocol(deps) {
                   if (!chunks.length) return
                   if (!res.headersSent) writeSSEHeaders(res)
                   for (const chunk of chunks) {
-                    res.write(`data: ${JSON.stringify(chunk)}\n\n`)
+                    const event = protocol === 'openai.responses' ? `event: ${chunk.type}\n` : ''
+                    res.write(`${event}data: ${JSON.stringify(chunk)}\n\n`)
                   }
                 }
                 if (protocol === 'openai.chat') {
@@ -2274,13 +2276,15 @@ export function createHandleProtocol(deps) {
         stats.errors++
         logBag.error_code = result?.body?.error?.code || 'stream_incomplete'
         logBag.error_message = result?.body?.error?.message || 'Stream did not reach a verified terminal state'
+        if (protocol === 'openai.responses' && !res.writableEnded) {
+          const { code, message, param = null } = mapProtocolClientError(result, logBag, logBag.error_code).body.error
+          res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', code, message, param })}\n\n`)
+          return res.end()
+        }
         if (logBag.error_code === ErrorCode.CLUSTER_DELIVERY_UNCONFIRMED && !res.writableEnded) {
           const { body } = mapProtocolClientError(result, logBag, logBag.error_code)
           if (protocol === 'anthropic.messages') {
             if (!streamTracker?.isFinished()) res.write(buildAnthropicSseError(body.error))
-          } else if (protocol === 'openai.responses') {
-            const { code, message } = body.error
-            res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', code, message, param: null })}\n\n`)
           } else {
             res.write(`data: ${JSON.stringify(body)}\n\n`)
           }
@@ -2328,7 +2332,7 @@ export function createHandleProtocol(deps) {
     } else if (protocol === 'openai.completions') {
       output = fromClaudeToOpenAICompletions(clientBody, inbound.model)
     } else {
-      output = fromClaudeToResponses(clientBody, inbound.model, result.vmId, converted.mode)
+      output = fromClaudeToResponses(clientBody, inbound.model, result.vmId, converted.mode, converted.responseTools)
     }
     ctx = applyIntercept(cfg.intercept.rules, 'before_client', { ...ctx, body: output })
     return json(res, 200, ctx.body)
