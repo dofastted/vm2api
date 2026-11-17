@@ -10,6 +10,10 @@ mount --make-rprivate /
 mount -t tmpfs tmpfs /run
 ip link set lo up
 echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -N DOCKER-USER
+iptables -A DOCKER-USER -j RETURN
+iptables -A FORWARD -j DOCKER-USER
+iptables -P FORWARD DROP
 ip netns add gemini-fixture
 ip link add gemini-fxh type veth peer name gemini-fxp netns gemini-fixture
 ip address add 192.0.2.1/24 dev gemini-fxh
@@ -36,6 +40,7 @@ proxy_pid=$!
 trap 'kill "$proxy_pid" "${egress_pid:-}" 2>/dev/null || true' EXIT
 helper="$1/scripts/gemini-host-egress.sh"
 bash "$helper" start 0 0 192.0.2.5 1080
+if bash "$helper" start 0 0 192.0.2.5 1080; then exit 1; fi
 ip netns exec vm2agy0 "$2" --socks socks5h://192.0.2.5:1080 --listen 127.0.0.1:1080 --dns 127.0.0.1:1053 &
 egress_pid=$!
 for attempt in {1..30}; do
@@ -65,5 +70,8 @@ else:
 PY
 bash "$helper" stop 0 0 192.0.2.5 1080
 [[ ! -e /run/netns/vm2agy0 ]]
-printf '%s\n' 'Gemini namespace: SOCKS5 forwarding, fail-closed disconnect and cleanup passed.'
+[[ $(iptables -S FORWARD) == $'-P FORWARD DROP\n-A FORWARD -j DOCKER-USER' ]]
+[[ $(iptables -S DOCKER-USER) == $'-N DOCKER-USER\n-A DOCKER-USER -j RETURN' ]]
+if iptables -S VM2API-AGY-0 >/dev/null 2>&1; then exit 1; fi
+printf '%s\n' 'Gemini namespace: scoped Docker forwarding, fail-closed disconnect and cleanup passed.'
 NS
