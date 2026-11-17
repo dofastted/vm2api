@@ -2,7 +2,12 @@
 
 ## Unreleased
 
-- 载荷 [payload-2026.11.17-cli-node-321](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.17-cli-node-321) 将 cli-node 换为 2.1.321 UPX 5.0.2 `--best --lzma`（31005108 字节，`f6c3744dda01f756049360113607d2bd9a25911de0fdaf30fe9bb1a1918a6788`）。其余附件沿用 `payload-2026.11.17-kernel-1091-968-crag-3.1.4`。ARM64 源码摘要改为 `34951c0743f79668bbda184ba743dd08a2049c31b89ed7349106587053e37d76`。未部署，未 `wrap-cli/sync`。
+## 1.4.131 — 2026-11-17 · Codex 调用 Claude 协议修复
+
+- `/v1/responses` 支持已获授权的 Claude 模型。控制面在派发给 CRAG 或 cli-node 前转换并校验结构化 Messages，按 `call_id` 配对工具历史，输出转换回 Responses JSON 或 SSE。无法转换的请求在本地报错，不把上游计费拒绝当作转换失败。
+- CRAG 保留调用方工具名、系统提示分块与缓存断点，避免重复改写影响续轮。
+- 纳入主线的 CRAG 订阅兼容与调度修复、风险审计系统提示改写开关、用量拒绝的会话级处理及官方客户端限制的明确报错。
+- 载荷 [payload-2026.11.17-cli-node-321](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.17-cli-node-321) 将 cli-node 换为 2.1.321 UPX 5.0.2 `--best --lzma`（31005108 字节，`f6c3744dda01f756049360113607d2bd9a25911de0fdaf30fe9bb1a1918a6788`）；其余附件沿用现有固定载荷。仅当现有 cli-node 槽的程序摘要不一致时需要 `wrap-cli/sync`，无需重装 CRAG 槽。
 
 ## 1.4.130 — 2026-11-17 · Gemini 宿主账号与专用密钥
 
