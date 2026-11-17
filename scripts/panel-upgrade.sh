@@ -145,7 +145,7 @@ services:
   vm2api:
     volumes:
       - type: bind
-        source: /etc/machine-id
+        source: "${VM2API_CRAG_HOST_ID_FILE:-/etc/machine-id}"
         target: /run/crag-host-machine-id
         read_only: true
         bind:
