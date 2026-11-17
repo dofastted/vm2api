@@ -451,6 +451,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
             className='text-sm text-muted-foreground'
           >
             每张码从兑换时独立计时，未到期额度相加；不绑定、不启动 VM。
+            若可用槽位少于已购数量，重新提交旧码即可找回，重复提交不会重算。
           </p>
           <Button type='submit' size='sm' disabled={!code.trim() || !!action}>
             {action === 'redeem' ? '正在兑换…' : '兑换到本机'}
