@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.4.136 — 2026-11-17 · CRAG thinking 采样参数修复
+
+- CRAG 在确定 thinking 模式后再校准采样参数：启用 thinking 或使用 adaptive 时将 `temperature` 设为 `1`，移除 `top_p` 和 `top_k`；关闭 thinking 时保留原值。修复最简 Messages 请求因采样参数不兼容返回 400 的问题。
+- 沿用现有签名载荷；只需更新控制面，无需 `wrap-cli/sync` 或重装槽位。
+
 ## 1.4.135 — 2026-11-17 · Claude 托管工具与 CRAG 请求兼容
 
 - Claude Messages、OpenAI Chat Completions 和 Responses 转发至 Claude 时保留受支持的托管工具定义；只无损转换根级工具 schema，无法转换时返回具体字段错误。
