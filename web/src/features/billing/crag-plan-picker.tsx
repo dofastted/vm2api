@@ -23,7 +23,7 @@ export function CragPlanPicker({
   return (
     <fieldset disabled={disabled} className='m-0 min-w-0 border-0 p-0'>
       <legend className='sr-only'>选择套餐</legend>
-      <div className='grid min-w-0 gap-2.5'>
+      <div className='grid min-w-0 gap-2.5 lg:grid-cols-2'>
         {plans
           .filter((plan) => plan.enabled !== false)
           .map((plan) => (

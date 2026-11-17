@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react'
+import { useEffect, useId, useState, type ReactNode } from 'react'
 import { api, cragDeviceApi, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -12,6 +12,36 @@ export type CommerceSelection = {
   slots?: number
   months?: number
   coupon?: string
+}
+
+export const paymentLabels = { wxpay: '微信支付', alipay: '支付宝' }
+export type PaymentMethod = keyof typeof paymentLabels
+
+export function CragPaymentButtons({
+  channels,
+  disabled,
+  onPay,
+}: {
+  channels: readonly PaymentMethod[]
+  disabled: boolean
+  onPay: (channel: PaymentMethod) => void
+}) {
+  return (
+    <div role='group' aria-label='付款方式' className='flex flex-wrap gap-2'>
+      {channels.map((channel, index) => (
+        <Button
+          key={channel}
+          type='button'
+          className='min-h-11 min-w-24'
+          variant={index === 0 ? 'default' : 'outline'}
+          disabled={disabled}
+          onClick={() => onPay(channel)}
+        >
+          {paymentLabels[channel]}
+        </Button>
+      ))}
+    </div>
+  )
 }
 
 type Quote = {
@@ -64,6 +94,8 @@ export function CragCommerce({
   catalogKey,
   customTitle,
   device = false,
+  paymentMethods,
+  deliveryOptions,
   onOrder,
 }: {
   rules: CommerceRules
@@ -77,7 +109,13 @@ export function CragCommerce({
   catalogKey?: string
   customTitle?: string
   device?: boolean
-  onOrder: (selection: CommerceSelection, price: number) => void
+  paymentMethods: readonly PaymentMethod[]
+  deliveryOptions?: ReactNode
+  onOrder: (
+    selection: CommerceSelection,
+    price: number,
+    method: PaymentMethod
+  ) => void
 }) {
   const id = useId()
   const [slots, setSlots] = useState(String(rules.min_slots ?? 1))
@@ -167,43 +205,46 @@ export function CragCommerce({
 
   return (
     <div className='space-y-4'>
-      <CommerceRulesSummary rules={rules} />
-      <fieldset className='grid gap-2' disabled={busy}>
-        <legend className='mb-2 text-sm font-medium'>固定套餐与续费</legend>
-        {plans
-          .filter((plan) => plan.enabled !== false)
-          .map((plan) => (
-            <label
-              key={plan.sku}
-              className='flex items-center gap-3 rounded-xl border bg-card p-4 text-sm text-card-foreground shadow-xs transition-colors has-checked:border-primary has-checked:bg-primary/5 has-checked:ring-2 has-checked:ring-primary/20 has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring has-enabled:cursor-pointer has-enabled:hover:border-primary/50 has-disabled:opacity-60'
-            >
+      {plans.length > 0 || allowRenewal ? (
+        <fieldset className='grid gap-2 sm:grid-cols-2' disabled={busy}>
+          <legend className='mb-2 text-sm font-medium'>
+            固定套餐{allowRenewal ? '与续费' : ''}
+          </legend>
+          {plans
+            .filter((plan) => plan.enabled !== false)
+            .map((plan) => (
+              <label
+                key={plan.sku}
+                className='flex items-center gap-3 rounded-xl border bg-card p-4 text-sm text-card-foreground shadow-xs transition-colors has-checked:border-primary has-checked:bg-primary/5 has-checked:ring-2 has-checked:ring-primary/20 has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring has-enabled:cursor-pointer has-enabled:hover:border-primary/50 has-disabled:opacity-60'
+              >
+                <input
+                  type='radio'
+                  name={id}
+                  className='accent-primary'
+                  checked={sku === plan.sku}
+                  disabled={plan.remaining === 0}
+                  onChange={() => onSelect(plan.sku)}
+                />
+                <CommercePlanContent plan={plan} />
+              </label>
+            ))}
+          {allowRenewal ? (
+            <label className='flex cursor-pointer items-center gap-3 rounded-xl border bg-card p-4 text-sm font-medium shadow-xs transition-colors hover:border-primary/50 has-checked:border-primary has-checked:bg-primary/5 has-checked:ring-2 has-checked:ring-primary/20'>
               <input
                 type='radio'
                 name={id}
                 className='accent-primary'
-                checked={sku === plan.sku}
-                disabled={plan.remaining === 0}
-                onChange={() => onSelect(plan.sku)}
-              />
-              <CommercePlanContent plan={plan} />
+                checked={sku === 'renewal'}
+                onChange={() => onSelect('renewal')}
+              />{' '}
+              续费本机当前套餐
             </label>
-          ))}
-        {allowRenewal ? (
-          <label className='flex cursor-pointer items-center gap-3 rounded-xl border bg-card p-4 text-sm font-medium shadow-xs transition-colors hover:border-primary/50 has-checked:border-primary has-checked:bg-primary/5 has-checked:ring-2 has-checked:ring-primary/20'>
-            <input
-              type='radio'
-              name={id}
-              className='accent-primary'
-              checked={sku === 'renewal'}
-              onChange={() => onSelect('renewal')}
-            />{' '}
-            续费本机当前套餐
-          </label>
-        ) : null}
-      </fieldset>
+          ) : null}
+        </fieldset>
+      ) : null}
       {customEnabled ? (
         <fieldset
-          className='space-y-3 rounded-xl border bg-card p-4 shadow-xs has-checked:border-primary has-checked:bg-primary/5'
+          className='space-y-2 rounded-xl border bg-card px-4 py-3 has-checked:border-primary'
           disabled={busy}
         >
           <legend className='px-1 text-sm font-medium'>
@@ -219,33 +260,36 @@ export function CragCommerce({
             />
             选择自定义套餐
           </label>
-          <div className='grid gap-3 sm:grid-cols-2'>
-            <label className='grid gap-1.5 text-sm'>
-              槽位数
-              <Input
-                value={slots}
-                inputMode='numeric'
-                maxLength={8}
-                disabled={sku !== 'custom'}
-                onChange={(e) => setSlots(e.target.value)}
-              />
-            </label>
-            <label className='grid gap-1.5 text-sm'>
-              月数
-              <Input
-                value={months}
-                inputMode='numeric'
-                maxLength={3}
-                disabled={sku !== 'custom'}
-                onChange={(e) => setMonths(e.target.value)}
-              />
-            </label>
-          </div>
-          {sku === 'custom' && !available ? (
-            <p className='text-sm text-destructive'>
-              槽位数须为 {rules.min_slots ?? 1}–{rules.max_slots} 的整数，
-              月份须为 {rules.min_months ?? 1}–{rules.max_months} 的整数。
-            </p>
+          {sku === 'custom' ? (
+            <>
+              <CommerceRulesSummary rules={rules} />
+              <div className='grid max-w-xl gap-3 sm:grid-cols-2'>
+                <label className='grid gap-1.5 text-sm'>
+                  槽位数
+                  <Input
+                    value={slots}
+                    inputMode='numeric'
+                    maxLength={8}
+                    onChange={(e) => setSlots(e.target.value)}
+                  />
+                </label>
+                <label className='grid gap-1.5 text-sm'>
+                  月数
+                  <Input
+                    value={months}
+                    inputMode='numeric'
+                    maxLength={3}
+                    onChange={(e) => setMonths(e.target.value)}
+                  />
+                </label>
+              </div>
+              {sku === 'custom' && !available ? (
+                <p className='text-sm text-destructive'>
+                  槽位数须为 {rules.min_slots ?? 1}–{rules.max_slots} 的整数，
+                  月份须为 {rules.min_months ?? 1}–{rules.max_months} 的整数。
+                </p>
+              ) : null}
+            </>
           ) : null}
         </fieldset>
       ) : null}
@@ -327,10 +371,11 @@ export function CragCommerce({
           </p>
         ) : null}
       </div>
-      <Button
-        type='button'
+      {sku !== 'renewal' ? deliveryOptions : null}
+      <CragPaymentButtons
+        channels={paymentMethods}
         disabled={!canQuote || !current?.quote || busy}
-        onClick={() => {
+        onPay={(method) => {
           if (!canQuote || busy || !current?.quote) return
           const selection: CommerceSelection = {
             sku,
@@ -339,11 +384,9 @@ export function CragCommerce({
               : {}),
             ...(appliedCoupon ? { coupon: appliedCoupon } : {}),
           }
-          onOrder(selection, current.quote.amount_minor)
+          onOrder(selection, current.quote.amount_minor, method)
         }}
-      >
-        {sku === 'renewal' ? '创建续费订单' : '创建订单'}
-      </Button>
+      />
     </div>
   )
 }

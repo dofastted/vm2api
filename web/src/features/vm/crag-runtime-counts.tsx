@@ -3,7 +3,7 @@ import type { CragHostStatus, CragRuntimeVm } from './queries'
 const numberLabel = (value: number | 'unlimited' | null | undefined) =>
   value === 'unlimited' ? '不限' : (value ?? '待核对')
 
-const statusLabels: Record<CragHostStatus['state'], string> = {
+export const cragHostStatusLabels: Record<CragHostStatus['state'], string> = {
   unavailable: '暂不可用',
   unredeemed: '尚未兑换',
   active: '订阅有效',
@@ -17,7 +17,7 @@ export function CragRuntimeCounts({ status }: { status?: CragHostStatus }) {
       {status?.runtime?.host_over_limit === true
         ? '宿主订阅超额，仅超额槽暂停调度'
         : status
-          ? statusLabels[status.state]
+          ? cragHostStatusLabels[status.state]
           : '状态待核对'}
       {' · 剩余可绑定槽位：'}
       {numberLabel(status?.available_seats)}

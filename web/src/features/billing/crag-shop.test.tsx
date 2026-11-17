@@ -41,6 +41,7 @@ const state = vi.hoisted(() => ({
   hostInput: undefined as InputHTMLAttributes<HTMLInputElement> | undefined,
   activationForm: undefined as ActivationFormProps | undefined,
   activationError: null as Error | null,
+  confirmCancel: undefined as (() => void) | undefined,
   queries: [] as Array<{
     queryKey: readonly unknown[]
     enabled?: boolean
@@ -170,6 +171,8 @@ vi.mock('@/components/page-header', () => ({
 vi.mock('@/components/confirm-dialog', () => ({
   ConfirmDialog: (props: ConfirmProps) => {
     if (props.title === '启用本机槽位回收？') state.upgradeConfirm = props
+    if (props.open && props.confirmText === '取消并释放')
+      state.confirmCancel = props.handleConfirm
     return null
   },
 }))
@@ -249,6 +252,7 @@ function render(device = false) {
   state.hostForm = undefined
   state.hostInput = undefined
   state.upgradeConfirm = undefined
+  state.confirmCancel = undefined
   return renderToStaticMarkup(
     device ? <CragDevicePurchasePage /> : <CragSubscriptionPage />
   )
@@ -313,7 +317,6 @@ beforeEach(() => {
     false,
     0,
     'quarter',
-    'alipay',
     false,
     '',
     '',
@@ -388,11 +391,11 @@ describe('CRAG buyer presentation and activation wire', () => {
   it('prefills the claimed code but requires a separate explicit manual target', () => {
     const code = `CRAGR1.${'a'.repeat(43)}`
     state.values[3] = [order]
-    state.values[16] = { order_id: order.order_id, redemption_code: code }
-    state.values[17] = 'vm-a' // Checkout target must not preselect a manual target.
+    state.values[15] = { order_id: order.order_id, redemption_code: code }
+    state.values[16] = 'vm-a' // Checkout target must not preselect a manual target.
     render()
     click('使用此码激活')
-    state.values.length = 19
+    state.values.length = 18
     const dialog = render()
     expect(dialog).toMatch(new RegExp(`<textarea[^>]*>${code}</textarea>`))
     expect(dialog).toMatch(/<option value="" selected="">请选择槽位/)
@@ -402,8 +405,8 @@ describe('CRAG buyer presentation and activation wire', () => {
     ).toBe(true)
     expect(activateVmCragLicense).not.toHaveBeenCalled()
 
-    state.values[20] = 'vm-b'
-    state.values[19] = ` ${code} `
+    state.values[19] = 'vm-b'
+    state.values[18] = ` ${code} `
     render()
     expect(
       state.buttons.find((button) => button.children === '激活')?.disabled
@@ -466,8 +469,9 @@ describe('CRAG buyer presentation and activation wire', () => {
       ],
     }
     const html = render()
-    expect(html).toMatch(/剩余可绑定槽位：(?:<!-- -->)?1/)
-    expect(html).not.toContain('vm-licensed')
+    expect(html).toMatch(/剩余可用槽位<\/dt><dd[^>]*>1<\/dd>/)
+    expect(html).toContain('原始状态数据（JSON）')
+    expect(html).toContain('vm-licensed')
     expect(html).not.toContain('已绑定 / 可绑定应用锁')
   })
 
@@ -517,7 +521,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     const updated = render()
     expect(updated).toContain('订阅有效')
     expect(updated).toContain('宿主机额度已更新，未自动绑定 VM')
-    expect(updated).toMatch(/剩余可绑定槽位：(?:<!-- -->)?2/)
+    expect(updated).toMatch(/剩余可用槽位<\/dt><dd[^>]*>2<\/dd>/)
     expect(updated).not.toContain(code)
     expect(state.hostInput?.value).toBe('')
     expect(state.setQueryData).toHaveBeenCalledExactlyOnceWith(
@@ -713,8 +717,8 @@ describe('CRAG buyer presentation and activation wire', () => {
   })
 
   it('puts the wider plans section first in actual DOM, with payment feedback above both panes', () => {
-    state.values[13] = '付款反馈'
-    state.values[14] = '订单错误'
+    state.values[12] = '付款反馈'
+    state.values[13] = '订单错误'
     const html = render()
     const plans = html.indexOf('<section aria-label="订阅套餐"')
     const orders = html.indexOf('<section aria-label="历史订单"')
@@ -771,10 +775,87 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(state.commerce?.sku).toBe('quarter')
     expect(state.commerce?.customTitle).toBe('自选套餐')
     expect(state.commerce?.catalogKey).toContain('"revision":4')
-    state.commerce?.onOrder({ sku: 'quarter' }, 555)
+    state.commerce?.onOrder({ sku: 'quarter' }, 555, 'alipay')
     const body = JSON.parse(String(vi.mocked(api).mock.calls[0][1]?.body))
     expect(body.expected_amount_minor).toBe(555)
     expect(body.activation_target).toBeUndefined()
+  })
+
+  it.each([
+    ['支付宝', 'alipay'],
+    ['微信支付', 'wxpay'],
+  ])(
+    'posts the form to %s directly from the payment button',
+    async (label, channel) => {
+      state.values[1] = {
+        status: 'ready',
+        data: { ...catalog, payment_methods: ['alipay', 'wxpay'] },
+      }
+      const submit = vi.fn()
+      const form = {
+        append: vi.fn(),
+        remove: vi.fn(),
+        action: '',
+        method: '',
+        target: '',
+      }
+      const append = vi.fn()
+      vi.stubGlobal('document', {
+        body: { append },
+        createElement: (tag: string) => (tag === 'form' ? form : {}),
+      })
+      vi.stubGlobal('HTMLFormElement', { prototype: { submit } })
+      vi.mocked(api).mockResolvedValue({
+        ...order,
+        status: 'pending',
+        payment_method: channel,
+        url: 'https://pay.example.test/submit.php',
+        data: { type: channel, out_trade_no: order.order_id },
+      })
+      render()
+      click(label)
+      await settle()
+      expect(
+        JSON.parse(String(vi.mocked(api).mock.calls[0][1]?.body)).payment_method
+      ).toBe(channel)
+      expect(form).toMatchObject({
+        action: 'https://pay.example.test/submit.php',
+        method: 'POST',
+        target: '_self',
+      })
+      expect(form.append).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'type', value: channel })
+      )
+      expect(append).toHaveBeenCalledWith(form)
+      expect(submit).toHaveBeenCalledTimes(1)
+      expect(form.remove).toHaveBeenCalledTimes(1)
+      expect(render()).not.toContain('订单收银台')
+    }
+  )
+
+  it('cancels only an eligible reservation after confirmation and retains its history', async () => {
+    state.values[3] = [
+      { ...order, status: 'reserved', cancelable: true },
+      { ...order, order_id: 'pending', status: 'pending' },
+    ]
+    render()
+    expect(
+      state.buttons.filter((button) => button.children === '取消预留订单')
+    ).toHaveLength(1)
+    click('取消预留订单')
+    expect(api).not.toHaveBeenCalled()
+    vi.mocked(api).mockResolvedValue({ ...order, status: 'cancelled' })
+    render()
+    state.confirmCancel?.()
+    await settle()
+    expect(api).toHaveBeenCalledExactlyOnceWith(
+      '/api/panel/crag-shop/orders/order-1/cancel',
+      { method: 'POST', body: '{}' }
+    )
+    const html = render()
+    expect(html).toContain('已取消')
+    expect(html).toContain('订单号 order-1')
+    expect(html).not.toContain('取消预留订单')
   })
 
   it('fetches targets only as admin through the scoped wrapper query', async () => {
@@ -804,13 +885,13 @@ describe('CRAG buyer presentation and activation wire', () => {
       state.targetResult = targetResult
       render()
       expect(
-        state.buttons.find((button) => button.children === '创建订单')?.disabled
+        state.buttons.find((button) => button.children === '支付宝')?.disabled
       ).toBe(false)
     }
   })
 
   it('never silently converts an explicit stale target to manual', () => {
-    state.values[17] = 'vm-a'
+    state.values[16] = 'vm-a'
     state.targetResult = {
       data: { targets: [] },
       isError: false,
@@ -819,7 +900,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     const html = render()
     expect(html).toContain('所选目标暂不可用：vm-a')
     expect(html).toMatch(/<option value="vm-a" disabled="" selected="">/)
-    click('创建订单')
+    click('支付宝')
     expect(api).not.toHaveBeenCalled()
   })
 
@@ -830,7 +911,7 @@ describe('CRAG buyer presentation and activation wire', () => {
       ),
     })
     render()
-    click('创建订单')
+    click('支付宝')
     await settle()
     expect(api).toHaveBeenCalledWith(
       '/api/panel/crag-shop/orders',
@@ -863,10 +944,10 @@ describe('CRAG buyer presentation and activation wire', () => {
   )
 
   it('adds only explicitly selected targets to new intents and matches them when retrying', async () => {
-    state.values[17] = 'vm-a'
+    state.values[16] = 'vm-a'
     vi.mocked(api).mockRejectedValue(new Error('unconfirmed'))
     render()
-    click('创建订单')
+    click('支付宝')
     await settle()
     const first = JSON.parse(String(vi.mocked(api).mock.calls[0][1]?.body))
     expect(first.activation_target).toEqual({ vm_id: 'vm-a' })
@@ -876,14 +957,14 @@ describe('CRAG buyer presentation and activation wire', () => {
       isFetching: false,
     }
     render()
-    click('创建订单')
+    click('支付宝')
     await settle()
     expect(JSON.parse(String(vi.mocked(api).mock.calls[1][1]?.body))).toEqual(
       first
     )
-    state.values[17] = ''
+    state.values[16] = ''
     render()
-    click('创建订单')
+    click('支付宝')
     await settle()
     const manual = JSON.parse(String(vi.mocked(api).mock.calls[2][1]?.body))
     expect(manual.activation_target).toBeUndefined()
@@ -891,10 +972,10 @@ describe('CRAG buyer presentation and activation wire', () => {
   })
 
   it('keeps targets out of renewals and resume bodies, including reserved automatic orders', async () => {
-    state.values[17] = 'vm-a'
+    state.values[16] = 'vm-a'
     state.values[1] = { status: 'ready', data: { ...catalog, commerce: rules } }
     render()
-    state.commerce?.onOrder({ sku: 'renewal' }, 600)
+    state.commerce?.onOrder({ sku: 'renewal' }, 600, 'alipay')
     expect(
       JSON.parse(String(vi.mocked(api).mock.calls[0][1]?.body))
         .activation_target
