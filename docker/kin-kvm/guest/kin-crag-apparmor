@@ -4,6 +4,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -26,6 +27,15 @@ DROPIN = (MARKER + '\n'
           '[Service]\n'
           'AppArmorProfile=' + PROFILE_NAME + '\n').encode()
 RESTART = ['systemctl', 'restart', 'kin-kernel.service']
+# Guest images built before v1.4.133 declare RuntimeDirectory=kin-guest in kin-kernel.service, so every kernel stop
+# removed /run/kin-guest/slot.env and the CRAG license projection then waited for guest setup forever. Only new images
+# carry the fixed unit; this helper is inlined on every start, so it neutralises the old declaration in place.
+RUNTIME_DROPIN_PATH = '/etc/systemd/system/kin-kernel.service.d/40-vm2api-guest-runtime.conf'
+RUNTIME_DROPIN = (MARKER + '\n'
+                  '# kin-guest-setup owns /run/kin-guest; kernel stops must not remove slot.env.\n'
+                  '[Service]\n'
+                  'RuntimeDirectory=\n').encode()
+SLOT_ENV = '/run/kin-guest/slot.env'
 
 
 def result(status, reason, profile=PROFILE_NAME):
@@ -97,6 +107,51 @@ def command(name):
     return executable
 
 
+def declares_runtime_directory(unit):
+    text = read_optional(unit)
+    return bool(text) and any(re.match(r'\s*RuntimeDirectory\s*=\s*\S', line) for line in text.splitlines())
+
+
+def preserve_guest_runtime(root):
+    """Keep slot.env across kernel stops on old guest units and restore it if a stop already removed it."""
+    unit = fixed_path(root, '/etc/systemd/system/kin-kernel.service')
+    state = {'guest_runtime': 'not-needed'}
+    if declares_runtime_directory(unit):
+        dropin = fixed_path(root, RUNTIME_DROPIN_PATH)
+        previous = snapshot(dropin)
+        if previous is not None and previous[0] == RUNTIME_DROPIN:
+            state['guest_runtime'] = 'already-preserved'
+        else:
+            systemctl = command('systemctl')
+            atomic_write(dropin, RUNTIME_DROPIN)
+            try:
+                run([systemctl, 'daemon-reload'], 'systemd reload')
+            except Exception as error:
+                try:
+                    restore(dropin, previous)
+                    run([systemctl, 'daemon-reload'], 'systemd rollback reload')
+                except Exception as rollback_error:
+                    raise RuntimeError(str(error) + '; rollback: ' + str(rollback_error)) from error
+                raise
+            state['guest_runtime'] = 'preserved'
+    slot_env = fixed_path(root, SLOT_ENV)
+    if os.path.lexists(slot_env):
+        state['guest_setup'] = 'present'
+        return state
+    systemctl = command('systemctl')
+    setup = run([systemctl, 'show', 'kin-guest-setup.service', '--property=ActiveState', '--value'],
+                'guest setup inspection')
+    if setup != 'active':
+        # First boot: setup has not finished yet and writes slot.env itself.
+        state['guest_setup'] = 'pending'
+        return state
+    run([systemctl, 'restart', 'kin-guest-setup.service'], 'guest setup restore')
+    if not slot_env.is_file():
+        raise RuntimeError('kin-guest-setup did not restore ' + SLOT_ENV)
+    state['guest_setup'] = 'restored'
+    return state
+
+
 def remove_binding(dropin):
     previous = snapshot(dropin)
     if previous is None:
@@ -126,7 +181,11 @@ def prepare(root):
         raise RuntimeError('kernel configuration must be an object')
     if config.get('dataplane') != 'crag' or config.get('crag_kernel_version') != 'v2':
         return remove_binding(dropin)
+    guest = preserve_guest_runtime(root)
+    return {**bind_profile(root, dropin), **guest}
 
+
+def bind_profile(root, dropin):
     enabled = read_optional(fixed_path(root, '/sys/module/apparmor/parameters/enabled'))
     if enabled not in ('Y', '1', 'yes'):
         return result('skipped', 'apparmor-disabled')

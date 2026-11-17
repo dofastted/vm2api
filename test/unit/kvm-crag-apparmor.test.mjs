@@ -9,11 +9,17 @@ import { kvmCragAppArmorCommand } from '../../src/lib/vm/kvm-crag-apparmor.mjs'
 const unixTest = process.platform === 'win32' ? test.skip : test
 const profilePath = '/etc/apparmor.d/vm2api-crag'
 const dropinPath = '/etc/systemd/system/kin-kernel.service.d/50-vm2api-crag-userns.conf'
+const runtimeDropinPath = '/etc/systemd/system/kin-kernel.service.d/40-vm2api-guest-runtime.conf'
+const slotEnvPath = '/run/kin-guest/slot.env'
+const currentUnit = '[Service]\nUser=kincli\n'
+// Unit shipped by guest images before v1.4.133: stopping the kernel removed /run/kin-guest.
+const oldUnit =
+  '[Service]\nUser=kincli\nRuntimeDirectory=kin-guest\nRuntimeDirectoryMode=0770\nEnvironmentFile=-/run/kin-guest/slot.env\n'
 const restrictionPath = '/proc/sys/kernel/apparmor_restrict_unprivileged_userns'
 const marker = '# Managed by vm2api kin-crag-apparmor.\n'
 const restart = ['systemctl', 'restart', 'kin-kernel.service']
 
-function fixture(context, { enabled = 'Y', restriction = '1', config } = {}) {
+function fixture(context, { enabled = 'Y', restriction = '1', config, unit = currentUnit, slotEnv = true } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-apparmor-'))
   context.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const file = (name) => path.join(root, name)
@@ -27,7 +33,8 @@ function fixture(context, { enabled = 'Y', restriction = '1', config } = {}) {
   if (restriction !== null) write(restrictionPath, `${restriction}\n`)
   write('/etc/apparmor.d/abi/4.0', 'fixture ABI\n')
   write('/run/kin/kernel.json', JSON.stringify(config || { dataplane: 'crag', crag_kernel_version: 'v2' }))
-  write('/etc/systemd/system/kin-kernel.service', '[Service]\nUser=kincli\n')
+  write('/etc/systemd/system/kin-kernel.service', unit)
+  if (slotEnv) write(slotEnvPath, 'KIN_SLOT_ID=fixture\n')
   write('/etc/systemd/system/kin-kernel.service.d/slot.conf', '[Service]\nGroup=987\n')
   const python = spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' })
   assert.equal(python.status, 0, python.stderr || String(python.error))
@@ -38,7 +45,7 @@ name=pathlib.Path(sys.argv[0]).name
 args=sys.argv[1:]
 log=root/'calls.jsonl'
 previous=[json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-entry={'command':name,'args':args,'profile_exists':(root/'etc/apparmor.d/vm2api-crag').exists(),'dropin_exists':(root/'etc/systemd/system/kin-kernel.service.d/50-vm2api-crag-userns.conf').exists()}
+entry={'command':name,'args':args,'profile_exists':(root/'etc/apparmor.d/vm2api-crag').exists(),'dropin_exists':(root/'etc/systemd/system/kin-kernel.service.d/50-vm2api-crag-userns.conf').exists(),'runtime_exists':(root/'etc/systemd/system/kin-kernel.service.d/40-vm2api-guest-runtime.conf').exists(),'slot_env_exists':(root/'run/kin-guest/slot.env').exists()}
 with log.open('a') as f:f.write(json.dumps(entry)+'\\n')
 if name=='apparmor_parser':
  if '-Q' in args:sys.exit(int(os.environ.get('FIXTURE_PARSE_EXIT','0')))
@@ -51,6 +58,13 @@ elif args==['daemon-reload']:
  if not any(p['command']==name and p['args']==args for p in previous):sys.exit(int(os.environ.get('FIXTURE_RELOAD_EXIT','0')))
 elif args==['restart','kin-kernel.service']:
  sys.exit(int(os.environ.get('FIXTURE_RESTART_EXIT','0')))
+elif args==['show','kin-guest-setup.service','--property=ActiveState','--value']:
+ print(os.environ.get('FIXTURE_SETUP_STATE','active'))
+elif args==['restart','kin-guest-setup.service']:
+ if os.environ.get('FIXTURE_SETUP_WRITES','1')=='1':
+  (root/'run/kin-guest').mkdir(parents=True,exist_ok=True)
+  (root/'run/kin-guest/slot.env').write_text('KIN_SLOT_ID=fixture\\n')
+ sys.exit(int(os.environ.get('FIXTURE_SETUP_EXIT','0')))
 else:
  print('unexpected stub command: '+repr(args),file=sys.stderr)
  sys.exit(97)
@@ -275,4 +289,132 @@ unixTest('the actual restart exit status reaches the caller', (context) => {
   const result = fx.run({ restart: true, env: { FIXTURE_RESTART_EXIT: '23' } })
   assert.equal(result.status, 23, result.stderr)
   assert.equal(fx.calls().filter((call) => call.args[0] === 'restart').length, 1)
+})
+
+const kernelRestart = (call) =>
+  call.command === 'systemctl' && call.args[0] === 'restart' && call.args[1] === 'kin-kernel.service'
+const setupRestart = (call) =>
+  call.command === 'systemctl' && call.args[0] === 'restart' && call.args[1] === 'kin-guest-setup.service'
+const reloads = (calls) => calls.filter((call) => call.command === 'systemctl' && call.args[0] === 'daemon-reload')
+
+unixTest('an old guest unit gets a runtime drop-in before the kernel restarts', (context) => {
+  const fx = fixture(context, { unit: oldUnit })
+  const result = successful(fx.run({ restart: true }))
+  assert.equal(result.status, 'prepared')
+  assert.equal(result.guest_runtime, 'preserved')
+  assert.equal(result.guest_setup, 'present')
+  const dropin = fx.read(runtimeDropinPath)
+  assert.ok(dropin.startsWith(marker))
+  assert.match(dropin, /^\[Service\]$/m)
+  assert.match(dropin, /^RuntimeDirectory=$/m)
+  assert.equal(fs.statSync(fx.file(runtimeDropinPath)).mode & 0o777, 0o644)
+  assert.equal(fx.read('/etc/systemd/system/kin-kernel.service'), oldUnit)
+  assert.equal(fx.read('/etc/systemd/system/kin-kernel.service.d/slot.conf'), '[Service]\nGroup=987\n')
+  const calls = fx.calls()
+  const firstReload = calls.findIndex((call) => call.command === 'systemctl' && call.args[0] === 'daemon-reload')
+  const restartAt = calls.findIndex(kernelRestart)
+  assert.ok(firstReload >= 0 && firstReload < restartAt)
+  assert.equal(calls[firstReload].runtime_exists, true)
+  assert.equal(calls[restartAt].runtime_exists, true)
+  assert.match(fx.read(dropinPath), /^AppArmorProfile=vm2api-crag$/m)
+})
+
+unixTest('a current guest unit needs no runtime drop-in', (context) => {
+  const fx = fixture(context)
+  const result = successful(fx.run({ restart: true }))
+  assert.equal(result.guest_runtime, 'not-needed')
+  assert.equal(result.guest_setup, 'present')
+  assert.equal(fx.exists(runtimeDropinPath), false)
+  assert.equal(fx.calls().some(setupRestart), false)
+})
+
+for (const options of [{ enabled: 'N' }, { restriction: '0' }]) {
+  unixTest(`the runtime drop-in does not depend on AppArmor: ${JSON.stringify(options)}`, (context) => {
+    const fx = fixture(context, { ...options, unit: oldUnit })
+    const result = successful(fx.run({ restart: true }))
+    assert.equal(result.status, 'skipped')
+    assert.equal(result.guest_runtime, 'preserved')
+    assert.match(fx.read(runtimeDropinPath), /^RuntimeDirectory=$/m)
+    noBinding(fx)
+    assert.equal(
+      fx.calls().some((call) => call.command === 'apparmor_parser'),
+      false,
+    )
+    assert.equal(fx.calls().filter(kernelRestart).length, 1)
+  })
+}
+
+unixTest('slot.env removed by an earlier kernel stop is restored before the restart', (context) => {
+  const fx = fixture(context, { unit: oldUnit, slotEnv: false })
+  const result = successful(fx.run({ restart: true }))
+  assert.equal(result.guest_runtime, 'preserved')
+  assert.equal(result.guest_setup, 'restored')
+  assert.equal(fx.exists(slotEnvPath), true)
+  const calls = fx.calls()
+  const setupAt = calls.findIndex(setupRestart)
+  const restartAt = calls.findIndex(kernelRestart)
+  assert.ok(setupAt >= 0 && setupAt < restartAt)
+  assert.equal(calls[setupAt].runtime_exists, true)
+  assert.equal(calls[restartAt].slot_env_exists, true)
+})
+
+unixTest('a guest still running its first setup is left to finish it', (context) => {
+  const fx = fixture(context, { unit: oldUnit, slotEnv: false })
+  const result = successful(fx.run({ restart: true, env: { FIXTURE_SETUP_STATE: 'activating' } }))
+  assert.equal(result.guest_setup, 'pending')
+  assert.equal(fx.calls().some(setupRestart), false)
+  assert.equal(fx.calls().filter(kernelRestart).length, 1)
+})
+
+for (const [name, env] of [
+  ['does not restore slot.env', { FIXTURE_SETUP_WRITES: '0' }],
+  ['fails', { FIXTURE_SETUP_EXIT: '14' }],
+]) {
+  unixTest(`a guest setup restart that ${name} stops before the kernel restart`, (context) => {
+    const fx = fixture(context, { unit: oldUnit, slotEnv: false })
+    const result = fx.run({ restart: true, env })
+    assert.notEqual(result.status, 0)
+    assert.ok(result.stderr.trim(), 'failure must provide a diagnostic')
+    assert.equal(fx.calls().some(kernelRestart), false)
+  })
+}
+
+unixTest('repeated preparation keeps the runtime drop-in without another reload', (context) => {
+  const fx = fixture(context, { unit: oldUnit })
+  successful(fx.run())
+  const before = [fx.read(runtimeDropinPath), fs.statSync(fx.file(runtimeDropinPath)).mtimeMs]
+  fx.clearCalls()
+  const result = successful(fx.run())
+  assert.equal(result.guest_runtime, 'already-preserved')
+  assert.deepEqual([fx.read(runtimeDropinPath), fs.statSync(fx.file(runtimeDropinPath)).mtimeMs], before)
+  assert.equal(reloads(fx.calls()).length, 0)
+})
+
+unixTest('a non-CRAG guest keeps its unit untouched', (context) => {
+  const fx = fixture(context, { unit: oldUnit, config: { dataplane: 'wrap' } })
+  const result = successful(fx.run({ restart: true }))
+  assert.equal(result.guest_runtime, undefined)
+  assert.equal(fx.exists(runtimeDropinPath), false)
+  assert.equal(reloads(fx.calls()).length, 0)
+})
+
+unixTest('administrator configuration at the runtime drop-in path is preserved', (context) => {
+  const fx = fixture(context, { unit: oldUnit })
+  const custom = '# Operator-owned configuration\n'
+  fx.write(runtimeDropinPath, custom)
+  assert.notEqual(fx.run({ restart: true }).status, 0)
+  assert.equal(fx.read(runtimeDropinPath), custom)
+  assert.equal(
+    fx.calls().some((call) => call.command === 'apparmor_parser' || kernelRestart(call)),
+    false,
+  )
+})
+
+unixTest('a failed reload removes the new runtime drop-in and does not restart', (context) => {
+  const fx = fixture(context, { unit: oldUnit })
+  const result = fx.run({ restart: true, env: { FIXTURE_RELOAD_EXIT: '13' } })
+  assert.notEqual(result.status, 0)
+  assert.equal(fx.exists(runtimeDropinPath), false)
+  assert.equal(reloads(fx.calls()).length, 2)
+  assert.equal(fx.calls().some(kernelRestart), false)
 })
