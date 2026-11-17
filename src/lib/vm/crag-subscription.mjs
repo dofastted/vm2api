@@ -569,7 +569,8 @@ export function createCragSubscription({
         const limit = roster
           ? Math.min(rights.claims.slot_limit === 'unlimited' ? 10000 : rights.claims.slot_limit, 10000)
           : rights.claims.slot_limit
-        if (limit !== 'unlimited' && occupying.size >= limit) {
+        const alreadyRunning = runtime.vms?.[vm.id]?.state === 'running'
+        if (!alreadyRunning && limit !== 'unlimited' && occupying.size >= limit) {
           return runtimeDenial(uncertain ? usageUnverified() : overQuota())
         }
         runtimeReservations.add(vm.id)

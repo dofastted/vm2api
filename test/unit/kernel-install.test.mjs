@@ -1005,6 +1005,36 @@ for (const stage of ['policy', 'materialize', 'seed', 'config']) {
     assert.equal(saved.kernel_installation, undefined)
   })
 }
+test('pre-replacement CRAG failure keeps the old package and rollback instead of claiming recovery', async (t) => {
+  const previous = { kernel: 'crag', version: '3.1.2', installed_at: '2026-11-16T00:00:00Z' }
+  const { root, vm, home } = fixture(t, {
+    dataplane: 'crag',
+    crag_kernel_version: 'v2',
+    kernel_installation: previous,
+  })
+  activateFixture(root, vm)
+  assert.equal(materializeResolvedKernel(root, vm).ok, true)
+  const manifest = path.join(home, '.kin', 'crag-v2', 'manifest.json')
+  const oldManifest = fs.readFileSync(manifest)
+  const life = lifecycle(root, {
+    materializeResolvedKernel: () => ({ ok: false, code: 'disk_full', error: 'disk full' }),
+    startSlotReady: () => assert.fail('the candidate must not boot'),
+    stopSlot() {
+      return { ok: true }
+    },
+  })
+  const result = await installKernelTargets({ projectRoot: root, targets: target('crag'), ops: life.ops })
+  assert.equal(result.items[0].code, 'disk_full', JSON.stringify(result))
+  assert.equal(result.items[0].stopped, false)
+  assert.match(result.items[0].error, /原版本仍在运行/)
+  assert.doesNotMatch(result.items[0].error, /未能验证原版本恢复/)
+  assert.deepEqual(fs.readFileSync(manifest), oldManifest)
+  const saved = getVm(root, vm.id)
+  assert.equal(saved.status, 'running')
+  assert.equal(saved.kernel_operation.phase, 'failed')
+  const backup = path.join(root, 'vms', vm.id, saved.kernel_operation.rollback_package, 'package', 'manifest.json')
+  assert.deepEqual(fs.readFileSync(backup), oldManifest)
+})
 
 test('VM lock and watchdog drain complete before stop; newer credentials are preserved', async (t) => {
   const { root, vm } = fixture(t)

@@ -74,6 +74,13 @@ const failure = (target, code, error, stopped = false) => ({
   error,
   stopped,
 })
+const ADMISSION_ERRORS = new Map([
+  ['crag_subscription_unavailable', 'CRAG 订阅状态暂时读不到。槽位和原服务未改动，请稍后重试。'],
+  ['crag_subscription_authority_unavailable', '授权服务暂时没有响应。槽位和原服务未改动，请稍后重试。'],
+  ['crag_subscription_busy', 'CRAG 启动操作繁忙。槽位和原服务未改动，请稍后重试。'],
+  ['license_crag_host_usage_unverified', '暂时对不上宿主机运行额度。槽位和原服务未改动，请稍后重试。'],
+  ['license_crag_host_over_quota', '宿主订阅的运行槽位已满。原服务未改动；释放其他运行槽或增加额度后再更新。'],
+])
 function installLicenseFailure(target, check) {
   if (check.code === 'license_payload_key_mismatch') {
     return failure(
@@ -82,7 +89,11 @@ function installLicenseFailure(target, check) {
       '下载包与已有许可使用不同的加密密钥。请选择兼容版本，或先完成授权迁移。',
     )
   }
-  return failure(target, check.code || 'license_required', check.error || '请先激活 CRAG 授权')
+  return failure(
+    target,
+    check.code || 'license_required',
+    ADMISSION_ERRORS.get(check.code) || check.error || '请先激活 CRAG 授权',
+  )
 }
 
 const healthy = (boot) => boot?.ok && boot.rust_ok !== false && boot.rust?.ok !== false && boot.kernel?.ok !== false
@@ -191,9 +202,11 @@ async function restoreCragRollback({ projectRoot, vm, rollback, routing, ops, bo
   } catch {
     // The rollback may have started a container before losing health or persistence.
   }
+  // The candidate never replaced the running process. Leave that slot serving.
+  if (!bootAttempted) return { serving: true }
   const halt = await (ops.stopSlot || stopSlot)(prior)
-  if (halt?.ok) await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(prior)
-  return null
+  if (!halt?.ok) return null
+  await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(prior)
 }
 
 const report = (items) => {
@@ -588,6 +601,22 @@ export async function installKernelTargets({
                 // Keep the maintenance hold and the verified backup for an operator.
               }
               const failed = result || failure(target, thrown?.code || phase, '新内核安装或启动失败', true)
+              if (recovered?.serving) {
+                const restored = patchVmRecord(projectRoot, target.id, (record) => {
+                  record.status = vm.status
+                  record.runtime = vm.runtime
+                })
+                if (!restored)
+                  return { ...failed, rolled_back: false, error: `${failed.error}；原服务未停止，但运行记录未能写回` }
+                stopped = false
+                stoppedPersisted = false
+                return {
+                  ...failed,
+                  stopped: false,
+                  rolled_back: false,
+                  error: `${failed.error}；原版本仍在运行，回滚包已保留`,
+                }
+              }
               if (recovered) {
                 installed = true
                 stopped = false
@@ -610,7 +639,7 @@ export async function installKernelTargets({
             : failure(
                 target,
                 result.code || 'crag_runtime_admission_failed',
-                result.error || 'CRAG 运行准入失败',
+                ADMISSION_ERRORS.get(result.code) || result.error || 'CRAG 运行准入失败',
                 stopped,
               )
         } catch (error) {
@@ -625,7 +654,7 @@ export async function installKernelTargets({
           )
         } finally {
           releaseCache?.()
-          if (rollback && !stopped) {
+          if (rollback && !stopped && installed) {
             try {
               fs.rmSync(rollback.backup, { recursive: true, force: true })
             } catch {
@@ -639,7 +668,7 @@ export async function installKernelTargets({
                 if (record.kernel_operation?.id !== operationId) return
                 record.kernel_operation.phase = interrupted ? 'pending' : 'failed'
                 record.kernel_operation.code = phase
-                if (!stopped && !interrupted) clearInstallHold(record)
+                if (!stopped && !interrupted && !rollback) clearInstallHold(record)
               })
             } catch {
               console.warn(`[kernel-install] ${target.id} failure state could not be persisted (${phase})`)
