@@ -972,11 +972,8 @@ test('a lost renewal response suspends real control admission until restart repl
     ready: true,
     state: 'unredeemed',
     available_seats: 0,
-<<<<<<< HEAD
     reclaim_pending_count: 0,
-=======
     vm_count: 3,
->>>>>>> ce083c95 (feat(crag): expose registered VM count in subscription status)
     total_slots: 2,
     enabled_slots: 0,
   })
@@ -989,9 +986,9 @@ test('a lost renewal response suspends real control admission until restart repl
   lose = true
   await assert.rejects(service.redeem(renewal), { code: 'crag_subscription_authority_unavailable' })
   assert.equal((await service.status()).state, 'sync_pending')
-  assert.equal((await service.status()).enabled_slots, 0)
-  assert.equal(checkCragLicense(root, slots[0]).ok, false)
-  assert.equal(checkCragLicense(root, slots[1]).ok, false)
+  // An in-flight or lost renewal must never suspend already-purchased running slots.
+  assert.equal(checkCragLicense(root, slots[0]).ok, true)
+  assert.equal(checkCragLicense(root, slots[1]).ok, true)
   const recovered = connect()
   await recovered.recover()
   assert.equal((await recovered.status()).revision, 2)
@@ -1113,10 +1110,9 @@ test('runtime quota follows a signed downgrade, unknown observations, and Author
   )
   assert.deepEqual(Object.keys(renewalIntent).sort(), ['host_id', 'redemption_code'])
   assert.equal((await service.status()).state, 'sync_pending')
-  assert.equal((await service.status()).enabled_slots, 0)
-  assert.equal(checkCragLicense(root, slots[0]).ok, false)
-  assert.equal(checkCragLicense(root, slots[1]).ok, false)
-  assert.equal((await service.admitInference({ vm: slots[0] })).body.error.code, 'license_crag_host_usage_unverified')
+  assert.equal(checkCragLicense(root, slots[0]).ok, true)
+  assert.equal(checkCragLicense(root, slots[1]).ok, true)
+  assert.equal(await service.admitInference({ vm: slots[0] }), null)
   const recovered = connect()
   await recovered.recover()
   const status = await recovered.status()
@@ -1412,13 +1408,13 @@ for (const runtime of ['docker', 'kvm']) {
       service.teardown(slots[0], async () => ({ ok: true, teardownConfirmed: true })),
       { code: 'crag_subscription_authority_unavailable' },
     )
-    assert.equal(checkCragLicense(root, slots[0]).ok, false)
     const recovered = connect()
     const pending = await recovered.status()
     assert.equal(pending.state, 'sync_pending')
     assert.equal(Object.hasOwn(pending, 'used_slots'), false)
     assert.equal(Object.hasOwn(pending, 'available_slots'), false)
     assert.equal(await recovered.recover(), undefined)
+    assert.equal(checkCragLicense(root, slots[0]).ok, false)
     assert.equal((await recovered.status()).available_slots, 1)
     reportedAvailable = 0
     assert.equal(
@@ -1897,4 +1893,214 @@ test('only an authenticated same-origin admin session can redeem without reveali
   assert.equal(response.body.error.code, 'redeem_unavailable')
   assert.equal(attempts, 1)
   assert.equal(JSON.stringify(response).includes(code), false)
+})
+
+test('failed authority syncs clear locks, new orders reconcile stale pins, and existing services stay active', async (t) => {
+  let failRedeemWith409 = false
+  let loseOrderRedeem = false
+  let current
+  let seats = 0
+  const { root, publicDir, privateDir, connect } = standaloneHost(t, async (url, { body }) => {
+    const action = url.split('/').at(-1)
+    const parsed = JSON.parse(body)
+    if (action === 'redeem') {
+      if (failRedeemWith409) {
+        return Response.json({ ok: false, error: { code: 'host_binding_conflict' } }, { status: 409 })
+      }
+      if (loseOrderRedeem) {
+        loseOrderRedeem = false
+        throw new Error('network lost on order 1')
+      }
+      current = issueHostEntitlement(root, parsed.host_id, {
+        revision: (current?.claims?.revision ?? 0) + 1,
+        slot_limit: 3,
+      })
+      return Response.json({
+        ok: true,
+        data: { entitlement: current.code, ...current.claims, used_slots: seats, available_slots: 3 - seats },
+      })
+    }
+    if (action === 'status') {
+      return Response.json({
+        ok: true,
+        data: { entitlement: current.code, ...current.claims, used_slots: seats, available_slots: 3 - seats },
+      })
+    }
+    const seat = ++seats
+    const { code } = issueSlotPermit(root, parsed.machine_code, parsed.host_id, { seat })
+    return Response.json({
+      ok: true,
+      data: { entitlement: current.code, ...current.claims, seat, slot_permit: code },
+    })
+  })
+  seedEncryptedPackage(root)
+  const vm1 = { id: 'vm-81', dataplane: 'crag', crag_kernel_version: 'v2', status: 'running' }
+  const vm2 = { id: 'vm-82', dataplane: 'crag', crag_kernel_version: 'v2', status: 'stopped' }
+  for (const vm of [vm1, vm2]) {
+    const dir = path.join(root, 'vms', vm.id)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'machine-id'), crypto.randomBytes(16).toString('hex'))
+  }
+  const service = connect({
+    listTargets: () => [vm1, vm2],
+    getTarget: (id) => [vm1, vm2].find((v) => v.id === id),
+    assertReady: () => true,
+  })
+  await service.redeem(voucher())
+  await service.bind(vm1)
+  assert.equal(await service.admitInference({ vm: vm1 }), null)
+
+  // Deterministic 4xx authority rejection must clear sync-pending immediately.
+  failRedeemWith409 = true
+  await assert.rejects(service.redeem(voucher()), { code: 'host_binding_conflict' })
+  assert.equal((await service.status()).state, 'active')
+  assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
+  assert.equal(fs.existsSync(path.join(privateDir, 'redeem.json')), false)
+  failRedeemWith409 = false
+
+  // An interrupted order-1 leaves sync_pending, must NOT pause vm1, and order-2 reconciles cleanly.
+  const fp2 = await service.pinOrderTarget(vm2.id)
+  loseOrderRedeem = true
+  await assert.rejects(
+    service.activateOrder({
+      orderId: 'ord-1',
+      target: { vm_id: vm2.id, fingerprint: fp2 },
+      claim: () => voucher(),
+    }),
+    { code: 'crag_subscription_authority_unavailable' },
+  )
+  assert.equal((await service.status()).state, 'sync_pending')
+  assert.equal(checkCragLicense(root, vm1).ok, true)
+  assert.equal(await service.admitInference({ vm: vm1 }), null)
+
+  const activated = await service.activateOrder({
+    orderId: 'ord-2',
+    target: { vm_id: vm2.id, fingerprint: fp2 },
+    claim: () => voucher(),
+  })
+  assert.equal(activated.seat, 2)
+  assert.equal((await service.status()).state, 'active')
+
+  // A running KVM slot must also be restored (never left blocked) when a 503 leaves sync_pending.
+  let kvmBlocked = false
+  const kvm = {
+    id: 'vm-kvm-83',
+    dataplane: 'crag',
+    crag_kernel_version: 'v2',
+    status: 'running',
+    runtime: { type: 'kvm' },
+    fingerprint: { guest_machine_id: crypto.randomBytes(16).toString('hex') },
+  }
+  fs.mkdirSync(path.join(root, 'vms', kvm.id), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', kvm.id, 'machine-id'), `${kvm.fingerprint.guest_machine_id}\n`)
+  const kvmService = connect({
+    listTargets: () => [vm1, vm2, kvm],
+    getTarget: (id) => [vm1, vm2, kvm].find((v) => v.id === id),
+    assertReady: () => true,
+    blockKvmBinding: async () => {
+      kvmBlocked = true
+      return true
+    },
+    publishKvmBinding: async () => {
+      kvmBlocked = false
+      return true
+    },
+  })
+  await kvmService.bind(kvm)
+  assert.equal(kvmBlocked, false)
+
+  // A 503 during standalone renewal leaves sync_pending, yet restoreKvmBindings unblocks the running KVM slot.
+  loseOrderRedeem = true
+  await assert.rejects(kvmService.redeem(voucher(), true), { code: 'crag_subscription_authority_unavailable' })
+  assert.equal((await kvmService.status()).state, 'sync_pending')
+  assert.equal(kvmBlocked, false, '503 sync_pending must not leave running KVM slot blocked')
+  assert.equal(await kvmService.admitInference({ vm: kvm }), null)
+  await kvmService.recover()
+  assert.equal((await kvmService.status()).state, 'active')
+
+  // Orphaned sync-pending marker without intent files is healed by recover().
+  fs.writeFileSync(path.join(publicDir, 'sync-pending'), 'pending\n')
+  await service.recover()
+  assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
+})
+
+test('runtime admission reclaims non-crag/orphaned seats and rebinds over-quota slots when running CRAG is below limit', async (t) => {
+  let roster = []
+  let revision = 0
+  let slotLimit = 2
+  let signed
+  const { root, connect } = standaloneHost(t, async (url, { body }) => {
+    const action = url.split('/').at(-1)
+    const { host_id, machine_code, permit_sha256 } = JSON.parse(body)
+    let result = {}
+    if (action === 'release') {
+      roster = roster.filter((entry) => entry.permit_sha256 !== permit_sha256)
+    }
+    if (action === 'bind') {
+      const freeSeat = [1, 2].find((s) => s <= slotLimit && !roster.some((e) => e.seat === s))
+      if (!freeSeat) return Response.json({ ok: false, error: { code: 'slot_limit_reached' } }, { status: 409 })
+      const { code } = issueSlotPermit(root, machine_code, host_id, { seat: freeSeat })
+      roster.push({ seat: freeSeat, permit_sha256: crypto.createHash('sha256').update(code).digest('hex') })
+      roster.sort((a, b) => a.seat - b.seat)
+      result = { seat: freeSeat, slot_permit: code }
+    }
+    const visibleRoster = roster.filter((entry) => entry.seat <= slotLimit)
+    const { claims } = issueHostEntitlement(root, host_id, { revision: ++revision, slot_limit: slotLimit })
+    signed = {
+      entitlement: signSubscriptionBytes(
+        root,
+        'CRAGH2',
+        JSON.stringify({ ...claims, version: 2, roster: visibleRoster }),
+      ),
+      revision,
+      expires_at: claims.expires_at,
+      slot_limit: slotLimit,
+      used_slots: visibleRoster.length,
+      available_slots: slotLimit - visibleRoster.length,
+    }
+    return Response.json({ ok: true, data: { ...signed, ...result } })
+  })
+  seedEncryptedPackage(root)
+  const vm1 = { id: 'vm-91', dataplane: 'crag', crag_kernel_version: 'v2', status: 'stopped' }
+  const vm2 = { id: 'vm-92', dataplane: 'crag', crag_kernel_version: 'v2', status: 'stopped' }
+  const vm3 = { id: 'vm-93', dataplane: 'crag', crag_kernel_version: 'v2', status: 'stopped' }
+  for (const vm of [vm1, vm2, vm3]) {
+    const dir = path.join(root, 'vms', vm.id)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'machine-id'), crypto.randomBytes(16).toString('hex'))
+  }
+  const targets = [vm1, vm2, vm3]
+  const vms = {}
+  const service = connect({
+    listTargets: () => targets,
+    assertReady: () => true,
+    runtimeInventory: {
+      snapshot: async () => ({ vms }),
+      confirmReclaimableStop: async (vm) => vm.status === 'stopped',
+    },
+  })
+  await service.redeem(voucher())
+  await service.bind(vm1)
+  await service.bind(vm2)
+  assert.equal(checkCragLicense(root, vm2).license.seat, 2)
+
+  // Downgrade limit to 1, switch vm1 to cli-node (running wrap), leaving vm2 with historical seat 2.
+  slotLimit = 1
+  await service.redeem(voucher(), true)
+  vm1.dataplane = 'wrap'
+  vm1.status = 'running'
+  vms[vm1.id] = { state: 'not_running', non_crag_confirmed: true, scope: 'host' }
+  assert.equal(checkCragLicense(root, vm2).code, 'license_crag_host_over_quota')
+
+  // Starting vm2 automatically reclaims switched-away vm1 (seat 1) and rebinds vm2 to seat 1.
+  const startedVm2 = await service.withRuntimeAdmission(vm2, { bindSubscription: true }, () => ({ ok: true }))
+  assert.equal(startedVm2.ok, true)
+  assert.equal(checkCragLicense(root, vm2).license.seat, 1)
+  vm2.status = 'running'
+  vms[vm2.id] = { state: 'running', scope: 'host' }
+
+  // Reaching running limit blocks vm3 from starting, while vm2 continues serving inference uninterrupted.
+  const blockedVm3 = await service.withRuntimeAdmission(vm3, { bindSubscription: true }, () => ({ ok: true }))
+  assert.equal(blockedVm3.code, 'license_crag_host_over_quota')
+  assert.equal(await service.admitInference({ vm: vm2 }), null)
 })

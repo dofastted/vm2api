@@ -304,7 +304,6 @@ for (const [change, expected] of [
   ['renewed', 'crag_subscription_projection_failed'],
   ['revoked', 'license_binding_mismatch'],
   ['missing', 'crag_subscription_projection_failed'],
-  ['pending', 'license_invalid'],
 ]) {
   linuxTest(`a ${change} host snapshot during publication is blocked by the second verification`, async (t) => {
     const f = fixture(t)
@@ -314,7 +313,6 @@ for (const [change, expected] of [
         if (change === 'renewed') f.rights({ revision: 2 })
         if (change === 'revoked') f.revoke()
         if (change === 'missing') fs.unlinkSync(f.registration)
-        if (change === 'pending') fs.writeFileSync(path.join(f.publicDir, 'sync-pending'), 'pending\n')
       },
     })
     await assert.rejects(publishKvmCragSubscription(f.root, f.vm, fake), { code: expected })
@@ -322,6 +320,18 @@ for (const [change, expected] of [
     assert.equal(fake.state.pending, true)
   })
 }
+
+linuxTest('a sync-pending marker without an active mutation hold does not block running KVM publication', async (t) => {
+  const f = fixture(t)
+  const fake = runner({
+    onAction: ({ action }) => {
+      if (action === 'publish') fs.writeFileSync(path.join(f.publicDir, 'sync-pending'), 'pending\n', { mode: 0o644 })
+    },
+  })
+  assert.equal(await publishKvmCragSubscription(f.root, f.vm, fake), true)
+  assert.deepEqual(fake.actions(), ['publish'])
+  assert.equal(fake.state.pending, false)
+})
 
 for (const [state, inspection, skips] of [
   ['stopped', { ok: true, code: 0, stdout: 'false\n' }, true],

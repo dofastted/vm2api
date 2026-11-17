@@ -67,7 +67,7 @@ export function sessionBuyerOwner(session, record, configuredAdmin) {
 }
 
 export function sameOriginPost(req, publicBaseUrl) {
-  const { origin, host, 'sec-fetch-site': site } = req.headers
+  const { origin, host, 'sec-fetch-site': site } = req?.headers || {}
   if (site !== undefined && site !== 'same-origin') return false
   if (origin === undefined) return site === 'same-origin'
   if (typeof origin !== 'string' || typeof host !== 'string' || /[^a-zA-Z0-9.:[\]-]/.test(host) || !host) return false
