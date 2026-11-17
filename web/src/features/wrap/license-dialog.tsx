@@ -1,8 +1,5 @@
-import { useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
-import { toast } from 'sonner'
-import { activateVmCragLicense } from '@/lib/api'
 import {
   Dialog,
   DialogContent,
@@ -10,11 +7,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { CragLicenseEditor } from '@/features/vm/crag-license-editor'
-import {
-  cragHostStatusQueryOptions,
-  vmCragLicenseQueryOptions,
-} from '@/features/vm/queries'
-import { kernelCatalogQueryOptions } from './queries'
+import { vmCragLicenseQueryOptions } from '@/features/vm/queries'
 
 export function KernelLicenseDialog({
   vm,
@@ -23,66 +16,26 @@ export function KernelLicenseDialog({
   vm: Vm
   onClose: () => void
 }) {
-  const qc = useQueryClient()
-  const [registrationCode, setRegistrationCode] = useState('')
   const license = useQuery(vmCragLicenseQueryOptions(vm.id))
-  const activate = useMutation({
-    // Registration codes must not be retained in mutation variables.
-    mutationFn: () => activateVmCragLicense(vm.id, registrationCode.trim()),
-    onSuccess: async (data) => {
-      setRegistrationCode('')
-      qc.setQueryData(vmCragLicenseQueryOptions(vm.id).queryKey, data)
-      await Promise.all([
-        qc.invalidateQueries({
-          queryKey: kernelCatalogQueryOptions().queryKey,
-        }),
-        qc.invalidateQueries({
-          queryKey: cragHostStatusQueryOptions().queryKey,
-        }),
-      ])
-      toast.success(
-        data.license.valid ? 'CRAG 授权已激活' : '授权未生效，请检查状态'
-      )
-    },
-  })
 
   return (
-    <Dialog
-      open
-      onOpenChange={(open) => {
-        if (!open && !activate.isPending) onClose()
-      }}
-    >
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent
         className='max-h-[88dvh] overflow-y-auto motion-reduce:animate-none sm:max-w-xl [&_button]:min-h-11 [&_svg]:motion-reduce:animate-none [&>section]:border-t-0 [&>section]:pt-0'
         showCloseButton={false}
-        onEscapeKeyDown={(event) => {
-          if (activate.isPending) event.preventDefault()
-        }}
-        onPointerDownOutside={(event) => {
-          if (activate.isPending) event.preventDefault()
-        }}
       >
         <DialogTitle>{vm.name || vm.id}</DialogTitle>
         <DialogDescription className='sr-only'>
-          粘贴激活码，系统自动识别授权类型。激活不会安装或启动内核。
+          查看本槽授权状态。订阅套餐只在订阅页用订阅使用券兑换。
         </DialogDescription>
         <CragLicenseEditor
           vmId={vm.id}
           data={license.data}
           loading={license.isFetching}
           loadError={license.error}
-          activationError={activate.error}
-          registrationCode={registrationCode}
-          activating={activate.isPending}
-          onChange={(code) => {
-            setRegistrationCode(code)
-            activate.reset()
-          }}
           onRefresh={() => {
             void license.refetch()
           }}
-          onActivate={() => activate.mutate()}
           onClose={onClose}
         />
       </DialogContent>

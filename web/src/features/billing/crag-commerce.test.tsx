@@ -75,6 +75,7 @@ function render(overrides: Partial<Parameters<typeof CragCommerce>[0]> = {}) {
       enabled
       busy={false}
       initialQuoteKey={0}
+      paymentMethods={['alipay', 'wxpay']}
       onOrder={onOrder}
       {...overrides}
     />
@@ -118,10 +119,11 @@ describe('CragCommerce', () => {
     const html = render({ sku: fixed.sku })
     const customGroup = html.split('</fieldset>')[1]
     expect(customGroup).toContain('自定义槽位和时长')
-    expect(customGroup).toContain('槽位数')
-    expect(customGroup).toContain('月数')
-    expect(state.inputs.slice(0, 2).every((input) => input.disabled)).toBe(true)
-    render()
+    expect(customGroup).not.toContain('槽位数')
+    expect(customGroup).not.toContain('月数')
+    const custom = render()
+    expect(custom).toContain('槽位数')
+    expect(custom).toContain('月数')
     expect(state.inputs.slice(0, 2).every((input) => !input.disabled)).toBe(
       true
     )
@@ -185,7 +187,8 @@ describe('CragCommerce', () => {
     lastButton()?.onClick?.({} as never)
     expect(onOrder).toHaveBeenCalledWith(
       { sku: 'custom', slots: 1, months: 1 },
-      777
+      777,
+      'wxpay'
     )
   })
 

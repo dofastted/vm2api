@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
-  useMutation,
   useQuery,
   useQueryClient,
   type UseQueryResult,
@@ -8,34 +7,21 @@ import {
 import { Link } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
 import type { StatusTone } from '@/types/status'
-import {
-  activateVmCragLicense,
-  api,
-  cragDeviceApi,
-  isApiError,
-} from '@/lib/api'
+import { api, cragDeviceApi, isApiError } from '@/lib/api'
 import { randomUUID } from '@/lib/random-uuid'
-import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { PageHeader } from '@/components/page-header'
 import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
-import { CragActivationForm } from '@/features/vm/crag-license-editor'
-import { CragRuntimeCounts } from '@/features/vm/crag-runtime-counts'
+import {
+  CragRuntimeCounts,
+  cragHostStatusLabels,
+} from '@/features/vm/crag-runtime-counts'
 import {
   cragHostStatusQueryOptions,
-  vmCragLicenseQueryOptions,
-  vmsListQueryOptions,
   type CragHostStatus,
 } from '@/features/vm/queries'
 import {
@@ -47,8 +33,11 @@ import {
 } from './crag-catalog'
 import {
   CragCommerce,
+  CragPaymentButtons,
+  paymentLabels as methods,
   quoteProblem,
   type CommerceSelection,
+  type PaymentMethod as Method,
 } from './crag-commerce'
 import { CragPlanPicker } from './crag-plan-picker'
 
@@ -59,8 +48,6 @@ const shopRoot = '/api/panel/crag-shop'
 const hostRoot = '/api/panel/crag-subscription'
 const catalogIntervalMs = 25_000
 const catalogTimeoutMs = 12_000
-const methods = { wxpay: '微信支付', alipay: '支付宝' }
-type Method = keyof typeof methods
 type Catalog = {
   plans: CragPlan[]
   payment_methods: Method[]
@@ -83,7 +70,8 @@ type Order = {
   request_id?: string
   expected_amount_minor?: number
   payment_method: Method
-  status: 'reserved' | 'pending' | 'paid' | 'fulfilled'
+  status: 'reserved' | 'pending' | 'paid' | 'fulfilled' | 'cancelled'
+  cancelable?: boolean
   activation?: {
     state:
       | 'manual'
@@ -117,12 +105,14 @@ const completedSteps: Record<Order['status'], number> = {
   pending: 1,
   paid: 2,
   fulfilled: 3,
+  cancelled: 0,
 }
 const orderTones: Record<Order['status'], StatusTone> = {
   reserved: { key: 'reserved', cls: 'none', text: '待确认订单' },
   pending: { key: 'pending', cls: 'caution', text: '待支付' },
   paid: { key: 'paid', cls: 'caution', text: '已付款，发码中' },
   fulfilled: { key: 'fulfilled', cls: 'ok', text: '已发码' },
+  cancelled: { key: 'cancelled', cls: 'none', text: '已取消' },
 }
 const activationTones: Record<
   NonNullable<Order['activation']>['state'],
@@ -160,7 +150,7 @@ function SubscriptionTime({ seconds }: { seconds: number }) {
 function hostRedemptionError(error: unknown) {
   switch (isApiError(error) ? error.code : undefined) {
     case 'crag_subscription_invalid_request':
-      return '请输入有效的宿主机兑换码'
+      return '请输入有效的订阅使用券'
     case 'redeem_unavailable':
       return '此码不可用于本机订阅或已失效'
     case 'host_redeem_conflict':
@@ -170,6 +160,60 @@ function hostRedemptionError(error: unknown) {
     default:
       return '兑换尚未确认，请刷新或继续同步'
   }
+}
+
+function quotaLabel(value: number | 'unlimited' | null | undefined) {
+  return value === 'unlimited' ? '不限' : (value ?? '待核对')
+}
+
+function HostSummary({
+  status,
+  plans,
+}: {
+  status?: CragHostStatus
+  plans: CragPlan[]
+}) {
+  const runtime = status?.runtime
+  const sku = status?.sku
+  const planName = sku
+    ? sku === 'custom'
+      ? '自定义'
+      : (plans.find((plan) => plan.sku === sku)?.name ?? sku)
+    : status?.state === 'unredeemed'
+      ? '未订阅'
+      : status
+        ? '未返回套餐'
+        : '待核对'
+  const fields = [
+    ['订阅状态', status ? cragHostStatusLabels[status.state] : '状态待核对'],
+    ['实际订阅套餐', planName],
+    ['剩余可用槽位', quotaLabel(status?.available_seats)],
+    ['当前 VM 总数', quotaLabel(status?.vm_count)],
+    ['CRAG 运行数', quotaLabel(runtime?.running_vms)],
+  ]
+  return (
+    <section
+      aria-label='CRAG 订阅与运行概况'
+      className='overflow-hidden rounded-xl border bg-card'
+    >
+      <dl className='grid grid-cols-2 gap-px bg-border md:grid-cols-5'>
+        {fields.map(([label, value]) => (
+          <div key={label} className='min-w-0 bg-card px-4 py-3'>
+            <dt className='text-xs text-muted-foreground'>{label}</dt>
+            <dd className='mt-1 font-semibold wrap-anywhere tabular-nums'>
+              {value}
+            </dd>
+          </div>
+        ))}
+      </dl>
+      <div className='flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t px-4 py-2 text-sm'>
+        <CragRuntimeCounts status={status} />
+        <Button size='sm' variant='link' className='px-0' asChild>
+          <Link to='/wrap'>前往内核页切换 VM 内核</Link>
+        </Button>
+      </div>
+    </section>
+  )
 }
 
 function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
@@ -267,13 +311,52 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
           刷新本机订阅
         </Button>
       </div>
-      {status?.sku ? (
-        <p className='text-sm text-muted-foreground'>
-          当前套餐：{status.sku === 'custom' ? '自定义' : status.sku}
-          {status.months != null ? ` · 每期 ${status.months} 个月` : ''}
-        </p>
+      {status ? (
+        <>
+          <dl className='grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-4 gap-y-2 text-sm tabular-nums [&_dd]:wrap-anywhere [&_dt]:text-muted-foreground'>
+            <dt>套餐编号 / 每期时长</dt>
+            <dd>
+              {status.sku ?? '—'} /{' '}
+              {status.months != null ? `${status.months} 个月` : '—'}
+            </dd>
+            <dt>下次额度到期</dt>
+            <dd>
+              {status.expires_at == null ? (
+                '—'
+              ) : (
+                <SubscriptionTime seconds={status.expires_at} />
+              )}
+            </dd>
+            <dt>订阅总额度 / 已占用</dt>
+            <dd>
+              {quotaLabel(status.slot_limit)} / {quotaLabel(status.used_slots)}
+            </dd>
+            <dt>适用 VM / 已启用</dt>
+            <dd>
+              {quotaLabel(status.total_slots)} /{' '}
+              {quotaLabel(status.enabled_slots)}
+            </dd>
+            <dt>订阅槽运行 / 还可运行</dt>
+            <dd>
+              {quotaLabel(status.runtime?.host_running_vms)} /{' '}
+              {quotaLabel(status.runtime?.host_runtime_available)}
+            </dd>
+            <dt>权益修订号</dt>
+            <dd>{status.revision ?? '—'}</dd>
+          </dl>
+          <details className='rounded-md border px-3 text-sm'>
+            <summary className='cursor-pointer py-2 font-medium'>
+              原始状态数据（JSON）
+            </summary>
+            <p className='text-xs text-muted-foreground'>
+              仅显示面板状态响应，不含签名权益、兑换码或密钥。可能包含 VM ID。
+            </p>
+            <pre className='my-3 max-h-72 overflow-auto rounded bg-muted p-3 text-xs wrap-anywhere whitespace-pre-wrap'>
+              {JSON.stringify(status, null, 2)}
+            </pre>
+          </details>
+        </>
       ) : null}
-      <CragRuntimeCounts status={status} />
       {reclaimPending && !status?.reclaim_supported ? (
         <p className='text-sm text-muted-foreground'>
           旧订阅的已删除绑定待启用槽位回收。
@@ -320,14 +403,14 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
       ) : null}
       <p className='text-sm text-muted-foreground empty:sr-only'>
         {syncPending
-          ? '如果继续同步后仍在等待，请核对原订单，或回到原 VM 槽位使用原码完成激活。'
+          ? '如果继续同步后仍在等待，请核对原订单。订阅使用券只在本页兑换。'
           : host.isError || status?.state === 'unavailable'
             ? '无法确认本机权益，请刷新后重试。'
             : probeFailed
               ? ''
               : status && !status.ready
                 ? '当前没有可绑定的 CRAG 槽位，仍可兑换。本机与集群的 Docker、KVM 槽共享额度。'
-                : '付款或领码不会更新本机权益。可在此兑换宿主机额度，再到所需槽位的授权页绑定应用锁。'}
+                : '付款或领码不会更新本机权益。兑换后，到内核页为目标 VM 管理 CRAG 授权。'}
       </p>
       {canRecover ? (
         <Button
@@ -342,7 +425,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
       ) : null}
       {!syncPending ? (
         <form
-          aria-label='兑换宿主机额度'
+          aria-label='兑换订阅使用券'
           className='max-w-xl space-y-2 border-t pt-3'
           onSubmit={(event) => {
             event.preventDefault()
@@ -350,7 +433,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
           }}
         >
           <label className='grid gap-1 text-sm'>
-            宿主机兑换码
+            订阅使用券
             <Input
               type='password'
               autoComplete='off'
@@ -460,102 +543,6 @@ export function CragDevicePurchasePage() {
   )
 }
 
-function ManualCragActivation({
-  initialCode,
-  onClose,
-}: {
-  initialCode: string
-  onClose: () => void
-}) {
-  const qc = useQueryClient()
-  const vms = useQuery(vmsListQueryOptions())
-  const targets = (vms.data?.items ?? []).filter(
-    (vm) => !isCodexVm(vm) && vm.node_platform !== 'darwin'
-  )
-  const [code, setCode] = useState(initialCode)
-  const [targetId, setTargetId] = useState('')
-  const [result, setResult] = useState<boolean>()
-  const targetAvailable =
-    !vms.isError && targets.some((vm) => vm.id === targetId)
-  const activation = useMutation({
-    // Keep codes out of cached mutation variables.
-    mutationFn: () => activateVmCragLicense(targetId, code.trim()),
-    onSuccess: async (data) => {
-      qc.setQueryData(vmCragLicenseQueryOptions(targetId).queryKey, data)
-      if (data.license.valid) setCode('')
-      setResult(data.license.valid)
-      await qc.invalidateQueries({
-        queryKey: cragHostStatusQueryOptions().queryKey,
-      })
-    },
-  })
-  return (
-    <Dialog
-      open
-      onOpenChange={(open) => {
-        if (!open && !activation.isPending) onClose()
-      }}
-    >
-      <DialogContent className='max-h-[90dvh] overflow-y-auto'>
-        <DialogHeader>
-          <DialogTitle>手动激活 CRAG</DialogTitle>
-          <DialogDescription>
-            选择目标槽位，粘贴激活码。激活不会安装或启动内核。
-          </DialogDescription>
-        </DialogHeader>
-        <label className='grid gap-1 text-sm'>
-          目标槽位
-          <select
-            className='h-9 w-full min-w-0 rounded-md border bg-background px-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
-            value={targetAvailable ? targetId : ''}
-            disabled={activation.isPending || vms.isError || !targets.length}
-            onChange={(event) => {
-              setTargetId(event.target.value)
-              setResult(undefined)
-              activation.reset()
-            }}
-          >
-            <option value=''>请选择槽位</option>
-            {targets.map((vm) => (
-              <option key={vm.id} value={vm.id}>
-                {vm.name ? `${vm.name} (${vm.id})` : vm.id}
-              </option>
-            ))}
-          </select>
-        </label>
-        {vms.isError ? (
-          <p role='alert' className='text-sm text-destructive'>
-            无法读取槽位，请关闭后重试。
-          </p>
-        ) : !targets.length ? (
-          <p role='status' className='text-sm text-muted-foreground'>
-            {vms.isFetching ? '正在读取槽位…' : '当前没有可选槽位。'}
-          </p>
-        ) : null}
-        <CragActivationForm
-          code={code}
-          disabled={!targetAvailable}
-          activating={activation.isPending}
-          error={activation.error}
-          onChange={(value) => {
-            setCode(value)
-            setResult(undefined)
-            activation.reset()
-          }}
-          onActivate={() => activation.mutate()}
-        />
-        {result !== undefined ? (
-          <p role='status' className='text-sm'>
-            {result
-              ? `槽位 ${targetId} 已激活。`
-              : '授权未生效，请在目标槽检查授权状态。'}
-          </p>
-        ) : null}
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 function ShopOrders({
   device = false,
   isAdmin,
@@ -584,12 +571,10 @@ function ShopOrders({
   const [loading, setLoading] = useState(true)
   const [revision, refresh] = useState(0)
   const [planSku, setPlanSku] = useState<string>()
-  const [method, setMethod] = useState<Method>()
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('')
   const [problem, setProblem] = useState('')
-  const [checkout, setCheckout] = useState<Checkout>()
-  const checkoutButton = useRef<HTMLButtonElement>(null)
+  const [cancelTarget, setCancelTarget] = useState<Order>()
   const [claim, setClaim] = useState<{
     order_id: string
     redemption_code: string
@@ -597,7 +582,6 @@ function ShopOrders({
   const intent = useRef<Intent | null>(null)
   const operating = useRef(false)
   const [targetVmId, setTargetVmId] = useState('')
-  const [manualCode, setManualCode] = useState<string>()
   const targets = useQuery({
     queryKey: ['panel', 'crag-shop', 'activation-targets', owner],
     queryFn: ({ signal }) =>
@@ -619,8 +603,12 @@ function ShopOrders({
       eligibleTargets.some((target) => target.vm_id === targetVmId))
 
   useEffect(() => {
-    if (checkout && !busy) checkoutButton.current?.focus()
-  }, [checkout, busy])
+    function afterCheckout(event: PageTransitionEvent) {
+      if (event.persisted) refresh((value) => value + 1)
+    }
+    window.addEventListener('pageshow', afterCheckout)
+    return () => window.removeEventListener('pageshow', afterCheckout)
+  }, [])
 
   useEffect(() => {
     let active: { controller: AbortController; timeout: number } | undefined
@@ -666,9 +654,6 @@ function ShopOrders({
                   : visiblePlans[0]?.sku)
             )
           }
-          if (data.payment_methods.length) {
-            setMethod((channel) => channel ?? data.payment_methods[0])
-          }
         })
         .catch(() => {
           if (active === catalogRequest) setCatalog({ status: 'error' })
@@ -713,8 +698,9 @@ function ShopOrders({
           .map((order, index) => ({ order, index }))
           .filter(
             ({ order }) =>
-              order.status !== 'fulfilled' ||
-              (automaticOrder(order) && order.activation?.state !== 'active')
+              order.status !== 'cancelled' &&
+              (order.status !== 'fulfilled' ||
+                (automaticOrder(order) && order.activation?.state !== 'active'))
           )
         for (let i = 0; i < pending.length && !signal.aborted; i += 4) {
           await Promise.all(
@@ -763,24 +749,26 @@ function ShopOrders({
       await action()
     } catch (error) {
       setProblem(
-        isApiError(error) && error.code === 'shop_device_package_unready'
-          ? '本机缺少可用的 CRAG 发行包。请让管理员从内核页拉取后，重试应用原订单。'
-          : isApiError(error) &&
-              /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable)$/.test(
-                error.code
-              )
-            ? quoteProblem(error)
-            : isApiError(error) && error.status === 401
-              ? '登录已过期，请重新登录后查看历史订单。'
-              : isApiError(error) &&
-                  error.code === 'shop_activation_target_unavailable'
-                ? '所选槽位暂不可用。请先核对历史订单，再刷新激活目标或选择仅领取兑换码。'
+        isApiError(error) && error.code === 'shop_order_cannot_cancel'
+          ? '商城可能已收到此订单，不能在面板取消。请刷新订单核对状态。'
+          : isApiError(error) && error.code === 'shop_device_package_unready'
+            ? '本机缺少可用的 CRAG 发行包。请让管理员从内核页拉取后，重试应用原订单。'
+            : isApiError(error) &&
+                /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable)$/.test(
+                  error.code
+                )
+              ? quoteProblem(error)
+              : isApiError(error) && error.status === 401
+                ? '登录已过期，请重新登录后查看历史订单。'
                 : isApiError(error) &&
-                    /coupon|stock|sold_out|inventory|renew|price|amount|cap/.test(
-                      error.code ?? ''
-                    )
-                  ? quoteProblem(error)
-                  : fallback
+                    error.code === 'shop_activation_target_unavailable'
+                  ? '所选槽位暂不可用。请先核对历史订单，再刷新激活目标或选择仅领取兑换码。'
+                  : isApiError(error) &&
+                      /coupon|stock|sold_out|inventory|renew|price|amount|cap/.test(
+                        error.code ?? ''
+                      )
+                    ? quoteProblem(error)
+                    : fallback
       )
     } finally {
       operating.current = false
@@ -792,7 +780,6 @@ function ShopOrders({
     void run(
       async () => {
         if (!resumeId) intent.current = input
-        setCheckout(undefined)
         const order = await request<Checkout>(
           resumeId
             ? `${root}/orders/${encodeURIComponent(resumeId)}/resume`
@@ -811,8 +798,15 @@ function ShopOrders({
           refreshCatalog.current?.()
           throw error
         })
-        if (order.status === 'pending' && order.url && order.data)
-          setCheckout(order)
+        if (order.status === 'pending' && order.url && order.data) {
+          if (
+            order.payment_method !== input.payment_method ||
+            (resumeId && order.order_id !== resumeId)
+          )
+            throw new Error('checkout order mismatch')
+          pay(order.url, order.data)
+        } else if (order.status === 'cancelled')
+          setNotice('该订单已取消，请选择套餐重新下单。')
         else if (order.status === 'paid')
           setNotice('已付款，等待交付，请勿重复支付。')
         else if (order.status === 'fulfilled')
@@ -835,20 +829,17 @@ function ShopOrders({
     )
   }
 
-  function pay(order: Checkout) {
-    if (!order.url || !order.data) return
-    const url = new URL(order.url)
-    if (url.protocol !== 'https:' || url.username || url.password || url.hash) {
-      setProblem('收银台地址未通过校验，未发送付款请求。')
-      return
-    }
+  function pay(action: string, data: Record<string, string>) {
+    const url = new URL(action)
+    if (url.protocol !== 'https:' || url.username || url.password || url.hash)
+      throw new Error('invalid checkout URL')
     const form = document.createElement('form')
     form.hidden = true
     form.action = url.href
     form.method = 'POST'
-    form.target = '_blank'
-    form.rel = 'noopener noreferrer'
-    for (const [key, value] of Object.entries(order.data)) {
+    form.target = '_self'
+    form.rel = 'noreferrer'
+    for (const [key, value] of Object.entries(data)) {
       const field = document.createElement('input')
       field.type = 'hidden'
       field.name = key
@@ -861,10 +852,7 @@ function ShopOrders({
     } finally {
       form.remove()
     }
-    setCheckout(undefined)
-    setNotice(
-      '已请求在新窗口打开收银台。支付后刷新历史订单；收银台回跳不代表到账。'
-    )
+    setNotice('正在前往收银台。支付后返回此页刷新历史订单。')
   }
 
   const allPlans = catalog.status === 'ready' ? catalog.data.plans : []
@@ -888,8 +876,6 @@ function ShopOrders({
   const channels =
     catalog.status === 'ready' ? catalog.data.payment_methods : []
   const selectedPlan = plans.find((plan) => plan.sku === planSku)
-  const selectedMethod =
-    method && channels.includes(method) ? method : undefined
   const hasPurchaseOptions =
     plans.length > 0 ||
     (!!commerce && (commerce.custom_enabled !== false || canRenew))
@@ -905,11 +891,15 @@ function ShopOrders({
           : !channels.length
             ? (presentation?.unavailable_text ??
               '当前未开放收款。可以选择和比较套餐，暂不能创建订单。')
-            : !selectedMethod || (!commerce && !selectedPlan)
-              ? '套餐或付款方式已更新，请重新选择后再创建订单。'
+            : !commerce && !selectedPlan
+              ? '套餐已更新，请重新选择。'
               : ''
-  function createOrder(selection: CommerceSelection, price?: number) {
-    if (!selectedMethod || !canOrder || busy) return
+  function createOrder(
+    selection: CommerceSelection,
+    paymentMethod: Method,
+    price?: number
+  ) {
+    if (!canOrder || !channels.includes(paymentMethod) || busy) return
     const activation_target =
       isAdmin && selection.sku !== 'renewal' && targetVmId
         ? { vm_id: targetVmId }
@@ -922,7 +912,7 @@ function ShopOrders({
       last.slots === selection.slots &&
       last.months === selection.months &&
       last.coupon === selection.coupon &&
-      last.payment_method === selectedMethod &&
+      last.payment_method === paymentMethod &&
       last.expected_amount_minor === price &&
       last.activation_target?.vm_id === activation_target?.vm_id
     if (!same && activation_target && !targetAvailable) {
@@ -936,7 +926,7 @@ function ShopOrders({
         ? last
         : {
             ...selection,
-            payment_method: selectedMethod,
+            payment_method: paymentMethod,
             request_id: randomUUID(),
             ...(price !== undefined ? { expected_amount_minor: price } : {}),
             ...(activation_target ? { activation_target } : {}),
@@ -974,11 +964,89 @@ function ShopOrders({
     )
   }
 
+  function cancelOrder(order: Order) {
+    void run(async () => {
+      const updated = await request<Order>(
+        `${root}/orders/${encodeURIComponent(order.order_id)}/cancel`,
+        {
+          method: 'POST',
+          body: '{}',
+        }
+      ).finally(() => {
+        setCancelTarget(undefined)
+        refresh((value) => value + 1)
+      })
+      if (updated.order_id !== order.order_id || updated.status !== 'cancelled')
+        throw new Error('order cancellation mismatch')
+      if (intent.current?.request_id === updated.request_id)
+        intent.current = null
+      setOrders((prior) =>
+        prior?.map((item) =>
+          item.order_id === updated.order_id ? updated : item
+        )
+      )
+      setNotice('已取消订单，释放本地预留。')
+    }, '未能确认取消，请刷新历史订单。')
+  }
+
   function showSection(id: string) {
     const section = document.getElementById(id)
     section?.focus({ preventScroll: true })
     section?.scrollIntoView({ block: 'start' })
   }
+
+  const deliveryOptions = isAdmin ? (
+    <details className='rounded-md border px-3 text-sm'>
+      <summary className='cursor-pointer py-2 font-medium'>
+        自动激活（新订单）
+        <span className='ms-2 font-normal text-muted-foreground'>
+          {targetVmId || '未启用，仅领取兑换码'}
+        </span>
+      </summary>
+      <div className='flex flex-wrap items-end gap-2 pb-3'>
+        <label className='grid min-w-0 flex-1 gap-1'>
+          交付目标
+          <select
+            className='min-h-11 min-w-0 rounded-md border bg-background px-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
+            value={targetVmId}
+            disabled={busy}
+            onChange={(event) => setTargetVmId(event.target.value)}
+          >
+            <option value=''>仅领取兑换码（不自动激活）</option>
+            {targetVmId &&
+            !eligibleTargets.some((target) => target.vm_id === targetVmId) ? (
+              <option value={targetVmId} disabled>
+                所选目标暂不可用：{targetVmId}
+              </option>
+            ) : null}
+            {eligibleTargets.map((target) => (
+              <option key={target.vm_id} value={target.vm_id}>
+                自动激活到 {target.vm_id}
+              </option>
+            ))}
+          </select>
+        </label>
+        <Button
+          type='button'
+          variant='ghost'
+          size='sm'
+          disabled={targets.isFetching || busy}
+          onClick={() => void targets.refetch()}
+        >
+          刷新激活目标
+        </Button>
+        <p role='status' className='basis-full text-muted-foreground'>
+          {targets.isError
+            ? '未能读取目标，可刷新或改为仅领码。'
+            : targets.isFetching
+              ? '正在查询目标…'
+              : !eligibleTargets.length
+                ? '暂无可用目标，可先领码。'
+                : '交付后自动兑换并绑定，不更改 VM 的内核选择。'}
+        </p>
+      </div>
+    </details>
+  ) : null
 
   return (
     <PageHeader
@@ -1005,21 +1073,11 @@ function ShopOrders({
               <Link to='/crag-purchase'>免登录购买到本机</Link>
             )}
           </Button>
-          {isAdmin ? (
-            <Button size='sm' onClick={() => setManualCode('')}>
-              手动激活
-            </Button>
-          ) : null}
         </div>
       }
     >
       <div className='grid min-w-0 gap-6'>
-        {isAdmin && manualCode !== undefined ? (
-          <ManualCragActivation
-            initialCode={manualCode}
-            onClose={() => setManualCode(undefined)}
-          />
-        ) : null}
+        {isAdmin ? <HostSummary status={host} plans={allPlans} /> : null}
         {problem ? (
           <p role='alert' className='text-sm text-destructive'>
             {problem}
@@ -1030,25 +1088,22 @@ function ShopOrders({
             {notice}
           </p>
         ) : null}
-        {checkout ? (
-          <section
-            aria-label='订单收银台'
-            className='flex flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/40 p-3 text-sm'
-          >
-            <span>
-              {termLabel(checkout.term, checkout.sku, checkout.months)} ·{' '}
-              {planTerms(checkout)}
-            </span>
-            <Button
-              ref={checkoutButton}
-              onClick={() => pay(checkout)}
-              disabled={busy}
-            >
-              打开{methods[checkout.payment_method]}收银台
-            </Button>
-          </section>
-        ) : null}
-        <div className='grid min-w-0 items-start gap-6 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]'>
+        <ConfirmDialog
+          open={!!cancelTarget}
+          onOpenChange={(open) => {
+            if (!open && !busy) setCancelTarget(undefined)
+          }}
+          title='取消预留订单？'
+          desc='仅取消尚未发送到商城的订单，释放本地预留。此操作不退款，也不会关闭已打开的收银台。'
+          confirmText='取消并释放'
+          cancelBtnText='返回'
+          destructive
+          isLoading={busy}
+          handleConfirm={() => {
+            if (cancelTarget) cancelOrder(cancelTarget)
+          }}
+        />
+        <div className='grid min-w-0 gap-6'>
           <section
             aria-label={presentation?.plans_title ?? '订阅套餐'}
             className='min-w-0 space-y-5 rounded-xl border bg-card p-4 sm:p-5'
@@ -1059,7 +1114,7 @@ function ShopOrders({
                   {presentation?.plans_title ?? '购买订阅'}
                 </h2>
                 <p className='text-sm text-muted-foreground'>
-                  选择套餐、交付方式和付款渠道。
+                  选择套餐后，点击付款方式直接进入对应收银台。
                 </p>
               </div>
               <Button
@@ -1096,104 +1151,16 @@ function ShopOrders({
                 disabled={busy}
               />
             ) : null}
-            {isAdmin ? (
-              <fieldset className='min-w-0 space-y-2 border-t pt-3'>
-                <legend className='pr-2 text-sm font-medium'>订单交付</legend>
-                <label className='grid gap-1 text-sm'>
-                  自动激活（新订单）
-                  <select
-                    className='h-9 w-full min-w-0 rounded-md border bg-background px-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
-                    value={targetVmId}
-                    disabled={busy}
-                    onChange={(event) => setTargetVmId(event.target.value)}
-                  >
-                    <option value=''>仅领取兑换码（不自动激活）</option>
-                    {targetVmId &&
-                    !eligibleTargets.some(
-                      (target) => target.vm_id === targetVmId
-                    ) ? (
-                      <option value={targetVmId} disabled>
-                        所选目标暂不可用：{targetVmId}
-                      </option>
-                    ) : null}
-                    {eligibleTargets.map((target) => (
-                      <option key={target.vm_id} value={target.vm_id}>
-                        自动激活到 {target.vm_id}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <p className='text-sm text-muted-foreground'>
-                  选择目标槽位后再下单；订单确认交付后，服务端自动兑换并绑定，无需保持页面打开。不影响历史订单和续费。
-                </p>
-                <p
-                  role='status'
-                  className='text-sm text-muted-foreground empty:sr-only'
-                >
-                  {targets.isError
-                    ? '读取自动激活目标失败；请刷新目标或选择仅领取兑换码。'
-                    : targets.isFetching
-                      ? '正在查询自动激活目标；仍可选择仅领取兑换码。'
-                      : !eligibleTargets.length
-                        ? '没有符合条件的本机槽位。可先领码，或在虚拟机页准备不带其他有效授权的 CRAG v2 槽位。'
-                        : ''}
-                </p>
-                {!targetAvailable ? (
-                  <p role='alert' className='text-sm text-destructive'>
-                    所选目标尚未确认可用。请先核对历史订单，再刷新激活目标或明确改选仅领取兑换码。
-                  </p>
-                ) : null}
-                <Button
-                  type='button'
-                  variant='ghost'
-                  size='sm'
-                  disabled={targets.isFetching || busy}
-                  onClick={() => void targets.refetch()}
-                >
-                  刷新激活目标
-                </Button>
-              </fieldset>
-            ) : null}
-            {canOrder ? (
-              <div className='flex flex-wrap items-end gap-3'>
-                <label className='grid gap-1 text-sm'>
-                  付款方式
-                  <select
-                    className='h-9 rounded-md border bg-background px-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
-                    value={selectedMethod ?? ''}
-                    disabled={busy}
-                    onChange={(event) =>
-                      setMethod(event.target.value as Method)
-                    }
-                  >
-                    <option value='' disabled>
-                      请选择付款方式
-                    </option>
-                    {channels.map((channel) => (
-                      <option key={channel} value={channel}>
-                        {methods[channel]}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                {!commerce ? (
-                  <Button
-                    type='button'
-                    disabled={
-                      busy ||
-                      !selectedPlan ||
-                      selectedPlan.remaining === 0 ||
-                      !selectedMethod
-                    }
-                    onClick={() => {
-                      if (!selectedPlan || selectedPlan.remaining === 0) return
-                      createOrder({ sku: selectedPlan.sku })
-                    }}
-                  >
-                    创建订单
-                  </Button>
-                ) : null}
-              </div>
+            {!commerce ? deliveryOptions : null}
+            {canOrder && !commerce ? (
+              <CragPaymentButtons
+                channels={channels}
+                disabled={busy || !selectedPlan || selectedPlan.remaining === 0}
+                onPay={(channel) => {
+                  if (!selectedPlan || selectedPlan.remaining === 0) return
+                  createOrder({ sku: selectedPlan.sku }, channel)
+                }}
+              />
             ) : null}
             {commerce && hasPurchaseOptions ? (
               <CragCommerce
@@ -1202,7 +1169,7 @@ function ShopOrders({
                 sku={commerceSku}
                 onSelect={setPlanSku}
                 allowRenewal={canRenew}
-                enabled={canOrder && !!selectedMethod}
+                enabled={canOrder}
                 busy={busy}
                 initialQuoteKey={revision + catalogRevision}
                 catalogKey={
@@ -1212,7 +1179,11 @@ function ShopOrders({
                 }
                 customTitle={presentation?.custom_title}
                 device={device}
-                onOrder={createOrder}
+                paymentMethods={channels}
+                deliveryOptions={deliveryOptions}
+                onOrder={(selection, price, channel) =>
+                  createOrder(selection, channel, price)
+                }
               />
             ) : null}
             {plans.length > 0 && !canOrder && !commerce ? (
@@ -1221,7 +1192,9 @@ function ShopOrders({
               </Button>
             ) : null}
           </section>
-          <div className='min-w-0 space-y-5'>
+          <div
+            className={`grid min-w-0 items-start gap-6 ${isAdmin ? 'xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]' : ''}`}
+          >
             <section
               aria-label={presentation?.orders_title ?? '历史订单'}
               id='crag-order-history'
@@ -1236,10 +1209,7 @@ function ShopOrders({
                   size='sm'
                   variant='ghost'
                   disabled={loading || busy}
-                  onClick={() => {
-                    setCheckout(undefined)
-                    refresh((n) => n + 1)
-                  }}
+                  onClick={() => refresh((n) => n + 1)}
                 >
                   刷新订单
                 </Button>
@@ -1255,6 +1225,15 @@ function ShopOrders({
               {staleOrders.length ? (
                 <p className='text-sm text-muted-foreground'>
                   部分订单暂未同步，显示上次确认的状态。付款后请先刷新，不要重复支付。
+                </p>
+              ) : null}
+              {orders?.some(
+                (order) =>
+                  !order.cancelable &&
+                  (order.status === 'pending' || order.status === 'reserved')
+              ) ? (
+                <p className='text-xs text-muted-foreground'>
+                  仅尚未发送至商城的预留订单可取消。已发送或状态未确认的订单不支持在面板关单。
                 </p>
               ) : null}
               {orders?.length === 0 ? (
@@ -1290,6 +1269,16 @@ function ShopOrders({
                             订单号 {order.order_id}
                           </p>
                         </div>
+                        {order.cancelable ? (
+                          <Button
+                            variant='outline'
+                            size='sm'
+                            disabled={busy || loading}
+                            onClick={() => setCancelTarget(order)}
+                          >
+                            取消预留订单
+                          </Button>
+                        ) : null}
                         {order.status === 'fulfilled' &&
                         !device &&
                         order.sku !== 'renewal' &&
@@ -1368,10 +1357,12 @@ function ShopOrders({
                           </Button>
                         ) : null}
                       </div>
-                      <OrderProgress
-                        status={order.status}
-                        automatic={device || automaticOrder(order)}
-                      />
+                      {order.status !== 'cancelled' ? (
+                        <OrderProgress
+                          status={order.status}
+                          automatic={device || automaticOrder(order)}
+                        />
+                      ) : null}
                       {order.activation ? (
                         <div className='space-y-1' aria-label='订单激活状态'>
                           <div className='flex flex-wrap items-center gap-2'>
@@ -1463,22 +1454,12 @@ function ShopOrders({
                                 await navigator.clipboard.writeText(
                                   claim.redemption_code
                                 )
-                                setNotice('已复制兑换码。')
-                              }, '无法访问剪贴板，请手动选中兑换码复制。')
+                                setNotice('已复制订阅使用券。')
+                              }, '无法访问剪贴板，请手动选中订阅使用券复制。')
                             }
                           >
-                            复制兑换码
+                            复制订阅使用券
                           </Button>
-                          {isAdmin ? (
-                            <Button
-                              size='sm'
-                              onClick={() =>
-                                setManualCode(claim.redemption_code)
-                              }
-                            >
-                              使用此码激活
-                            </Button>
-                          ) : null}
                         </div>
                       ) : null}
                       {order.status === 'paid' ? (
@@ -1533,7 +1514,7 @@ function ShopOrders({
                             )
                           ) : (
                             <>
-                              <p className='font-medium'>怎样使用兑换码</p>
+                              <p className='font-medium'>怎样使用订阅使用券</p>
                               <ol className='list-decimal space-y-1 ps-5 text-muted-foreground'>
                                 <li>
                                   点击「领取兑换码」，复制以{' '}
@@ -1542,11 +1523,12 @@ function ShopOrders({
                                 </li>
                                 <li>
                                   {isAdmin
-                                    ? '点击「使用此码激活」，核对宿主机与目标槽位后兑换。也可以在订阅页顶部手动输入兑换码。'
-                                    : '请将码私下交给目标宿主机的管理员，在该机面板的「订阅 CRAG → 手动激活」中兑换。'}
+                                    ? '在本页「订阅使用券」输入框兑换到本机。兑换只增加宿主机额度，不绑定、不启动 VM。'
+                                    : '请将券私下交给目标宿主机的管理员，在该机面板的订阅页用「订阅使用券」兑换。'}
                                 </li>
                                 <li>
-                                  激活后会自动给目标槽绑定应用锁。其他槽可在各自的授权页使用已有订阅绑定。
+                                  兑换后到内核页，为目标 VM 管理 CRAG
+                                  授权并切换内核。
                                 </li>
                               </ol>
                               <p className='text-xs text-muted-foreground'>
@@ -1560,7 +1542,7 @@ function ShopOrders({
                                   className='h-auto p-0'
                                   asChild
                                 >
-                                  <Link to='/vm'>打开虚拟机列表</Link>
+                                  <Link to='/wrap'>打开内核页</Link>
                                 </Button>
                               ) : null}
                             </>

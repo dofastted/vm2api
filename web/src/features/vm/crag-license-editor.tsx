@@ -152,24 +152,14 @@ export function CragLicenseEditor({
   data,
   loading,
   loadError,
-  activationError,
-  registrationCode,
-  activating,
-  onChange,
   onRefresh,
-  onActivate,
   onClose,
 }: {
   vmId: string
   data?: CragLicenseResponse
   loading: boolean
   loadError: unknown
-  activationError: unknown
-  registrationCode: string
-  activating: boolean
-  onChange: (code: string) => void
   onRefresh: () => void
-  onActivate: () => void
   onClose: () => void
 }) {
   const formId = useId()
@@ -180,7 +170,7 @@ export function CragLicenseEditor({
         licenseMessages[statusCodes[license.status]] ||
         '授权状态未知。请刷新状态，并联系管理员检查授权配置。'
       : null
-  const busy = loading || activating
+  const busy = loading
 
   return (
     <section
@@ -233,14 +223,6 @@ export function CragLicenseEditor({
           {statusMessage}
         </p>
       ) : null}
-      <CragActivationForm
-        code={registrationCode}
-        disabled={busy || !data || !!loadError}
-        activating={activating}
-        error={activationError}
-        onChange={onChange}
-        onActivate={onActivate}
-      />
       <CragHostSubscription vmId={vmId} />
       {data?.machine_code ? (
         <details className='space-y-2'>
@@ -306,69 +288,5 @@ export function CragLicenseEditor({
         </details>
       ) : null}
     </section>
-  )
-}
-
-export function CragActivationForm({
-  code,
-  disabled,
-  activating,
-  error,
-  onChange,
-  onActivate,
-}: {
-  code: string
-  disabled: boolean
-  activating: boolean
-  error: unknown
-  onChange: (code: string) => void
-  onActivate: () => void
-}) {
-  const formId = useId()
-  const ready = !disabled && !activating && !!code.trim()
-  return (
-    <form
-      className='space-y-3'
-      onSubmit={(event) => {
-        event.preventDefault()
-        if (ready) onActivate()
-      }}
-    >
-      <div className='space-y-2'>
-        <Label htmlFor={`${formId}-registration`}>CRAG 激活码</Label>
-        <Textarea
-          id={`${formId}-registration`}
-          rows={3}
-          maxLength={16384}
-          value={code}
-          onChange={(event) => onChange(event.target.value)}
-          disabled={activating}
-          autoComplete='off'
-          autoCapitalize='none'
-          spellCheck={false}
-          className='max-h-48 resize-y font-mono text-sm break-all'
-          aria-invalid={!!error}
-          aria-describedby={`${formId}-registration-help${error ? ` ${formId}-error` : ''}`}
-        />
-        <p
-          id={`${formId}-registration-help`}
-          className='text-xs leading-relaxed text-muted-foreground'
-        >
-          系统自动识别订阅码、设备兑换码、设备注册码和离线通用码。订阅码兑换到本机后无法转移；系统会为目标槽绑定应用锁，新套餐额度会替换现有额度。离线通用码会同步到所有兼容槽位。
-        </p>
-      </div>
-      {error ? (
-        <p
-          id={`${formId}-error`}
-          role='alert'
-          className='text-sm text-destructive'
-        >
-          {cragLicenseErrorMessage(error)}
-        </p>
-      ) : null}
-      <Button type='submit' disabled={!ready}>
-        {activating ? '正在激活…' : '激活'}
-      </Button>
-    </form>
   )
 }

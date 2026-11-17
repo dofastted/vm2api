@@ -527,7 +527,11 @@ test('KVM preinstalls the signed CRAG tree without selecting or licensing it, an
   assert.doesNotMatch(fs.readFileSync(path.join(dest, 'kin-kernel'), 'utf8'), /crag-v2/)
   assert.equal(vm.dataplane, 'wrap')
   assert.equal(fs.existsSync(path.join(project, 'vms', vm.id, 'machine-id')), false)
-  assert.equal(materializeCragV2(project, { ...vm, dataplane: 'crag' }).ok, false, 'selection still requires a license')
+  assert.equal(
+    materializeCragV2(project, { ...vm, dataplane: 'crag' }).ok,
+    true,
+    'unlicensed selection is never blocked',
+  )
   const before = fs.statSync(path.join(tree, 'crag-v2')).ino
   assert.equal(materializeResolvedKernel(project, vm).ok, true)
   assert.equal(fs.statSync(path.join(tree, 'crag-v2')).ino, before)

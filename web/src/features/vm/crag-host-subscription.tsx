@@ -114,7 +114,7 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
       ) : null}
       <p className='text-sm text-muted-foreground'>
         {pending
-          ? '同步完成前，订阅槽不会接收新请求。手动激活中断时，请在原槽提交原码；自动激活中断时，请处理原订单。'
+          ? '同步完成前，订阅槽不会接收新请求。未完成的兑换请在订阅页继续同步，或处理原订单。'
           : '本机与集群的 Docker、KVM 槽共享订阅额度。绑定不会自动启动或重启槽位。'}
       </p>
       {status?.state === 'active' ? (

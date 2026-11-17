@@ -73,9 +73,11 @@ export type CragHostStatus = {
   state: 'unavailable' | 'unredeemed' | 'active' | 'expired' | 'sync_pending'
   slot_limit?: number | 'unlimited'
   expires_at?: number
+  revision?: number
   sku?: string
   months?: number
   used_slots?: number
+  vm_count?: number
   total_slots?: number
   enabled_slots?: number
   activated_slots?: Array<{

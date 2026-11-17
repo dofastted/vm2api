@@ -42,6 +42,7 @@ const MIGRATIONS = new URL('../../src/lib/db/migrations/', import.meta.url)
 const MIGRATION = new URL('056_crag_shop_orders.sql', MIGRATIONS)
 const COMMERCE_MIGRATION = new URL('057_crag_shop_commerce.sql', MIGRATIONS)
 const ACTIVATION_MIGRATION = new URL('058_crag_shop_activation.sql', MIGRATIONS)
+const DISPATCH_MIGRATION = new URL('060_crag_shop_order_dispatch.sql', MIGRATIONS)
 const PILOT_TOKEN_FILE_ENV = 'VM2API_CRAG_SHOP_PILOT_TOKEN_FILE'
 
 test.beforeEach((t) => {
@@ -99,6 +100,7 @@ test('shop migration numbering preserves applied schemas and orders from either 
     assert.equal(saved.activation_vm_id, legacy ? 'vm-ready' : null)
     assert.equal(saved.activation_phase, legacy ? 'redeemed' : 'waiting')
     assert.equal(saved.activation_attempts, legacy ? 2 : 0)
+    assert.equal(saved.dispatch_state, 'submitted')
   }
 })
 
@@ -417,6 +419,7 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
   const [[id, firstReceipt]] = saved
   assert.equal(JSON.stringify(failed).includes(firstReceipt), false)
   assert.equal((await call(PERSON, 'GET', '/orders')).data.orders[0].status, 'reserved')
+  assert.equal((await call(PERSON, 'POST', `/orders/${id}/cancel`, {})).error.code, 'shop_order_cannot_cancel')
   db.close()
   db = createDatabase({ dbPath })
   handle = handler()
@@ -431,6 +434,7 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
   const beforeForeign = outcalls
   assert.deepEqual(await call(OTHER, 'GET', `/orders/${id}`), await call(OTHER, 'GET', `/orders/${randomUUID()}`))
   assert.equal((await call(OTHER, 'POST', `/orders/${id}/claim`)).http, 404)
+  assert.equal((await call(OTHER, 'POST', `/orders/${id}/cancel`)).http, 404)
   assert.equal(outcalls, beforeForeign)
   const bob = await call(OTHER, 'POST', '/orders', INPUT)
   assert.notEqual(bob.data.order_id, id)
@@ -445,6 +449,7 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
   }
   status = 'fulfilled'
   assert.equal((await call(PERSON, 'GET', `/orders/${id}`)).data.status, 'fulfilled')
+  assert.equal((await call(PERSON, 'POST', `/orders/${id}/cancel`, {})).http, 409)
   assert.deepEqual((await call(PERSON, 'POST', `/orders/${id}/claim`)).data, { order_id: id, redemption_code: CODE })
   status = 'pending'
   assert.equal((await call(PERSON, 'GET', `/orders/${id}`)).data.status, 'fulfilled')
@@ -467,6 +472,76 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
   fs.writeFileSync(keyPath, key, { mode: 0o600 })
   fs.chmodSync(keyPath, 0o644)
   assert.equal((await call(PERSON, 'GET', `/orders/${id}`)).error.code, 'shop_private_storage_unavailable')
+})
+
+test('cancels an unsent reservation even while price verification is in flight, without reaching checkout', {
+  timeout: 5000,
+}, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-shop-cancel-'))
+  const db = createDatabase({ dbPath: path.join(root, 'kin.db') })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const began = Promise.withResolvers()
+  const quote = Promise.withResolvers()
+  const handler = createCragShopHandler({
+    dataDir: root,
+    publicBaseUrl: PANEL,
+    getDb: () => db,
+    json: (_, http, body) => ({ http, ...body }),
+    readRawBody: (req) => req.raw,
+    supplier: {
+      quote: () => {
+        began.resolve()
+        return quote.promise
+      },
+      create: () => assert.fail('cancelled orders must not reach the supplier'),
+      status: () => assert.fail('unsent orders must not query the supplier'),
+    },
+  })
+  const call = (method, endpoint, body = {}, actor = PERSON) => {
+    const url = new URL(`${PANEL}${BASE}${endpoint}`)
+    return handler(
+      {
+        ...actor,
+        method,
+        raw: Buffer.from(JSON.stringify(body)),
+        headers: {
+          host: 'panel.example.test',
+          origin: PANEL,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+        },
+      },
+      {},
+      url,
+      cragShopRoute(method, url.pathname),
+    )
+  }
+  const input = { ...INPUT, expected_amount_minor: PLAN.amount_minor }
+  const creating = call('POST', '/orders', input)
+  await began.promise
+  const {
+    data: {
+      orders: [reserved],
+    },
+  } = await call('GET', '/orders')
+  assert.equal(reserved.status, 'reserved')
+  assert.equal(reserved.cancelable, true)
+  const endpoint = `/orders/${reserved.order_id}`
+  assert.deepEqual((await call('GET', endpoint)).data, reserved)
+  assert.equal((await call('POST', `${endpoint}/cancel`, {}, OTHER)).http, 404)
+  const cancelled = await call('POST', `${endpoint}/cancel`)
+  assert.equal(cancelled.data.status, 'cancelled')
+  assert.equal(cancelled.data.cancelable, undefined)
+  assert.equal(cancelled.data.activation, undefined)
+  quote.resolve(PLAN)
+  assert.deepEqual(await creating, cancelled)
+  assert.deepEqual(await call('POST', '/orders', input), cancelled)
+  assert.deepEqual(await call('POST', `${endpoint}/cancel`), cancelled)
+  assert.deepEqual(await call('GET', endpoint), cancelled)
+  assert.equal((await call('POST', `${endpoint}/resume`)).error.code, 'shop_order_cancelled')
 })
 
 test('device checkout skips panel login, scopes orders to browser and host, and applies without exposing the code', async (t) => {
@@ -618,6 +693,7 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
     OTHER.panelBuyerOwner,
   )
   db.exec(fs.readFileSync(ACTIVATION_MIGRATION, 'utf8'))
+  db.exec(fs.readFileSync(DISPATCH_MIGRATION, 'utf8'))
   // The legacy row normally already has a receipt key from its original checkout.
   const receiptKey = loadOrderReceiptKey(root, () => false)
   const publicDir = cragSubscriptionPublicDirectory(root)
