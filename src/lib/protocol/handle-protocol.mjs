@@ -97,6 +97,7 @@ import {
 import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { canReuseCanonicalHistory } from './sanitize.mjs'
+import { relocateThirdPartySystem, thirdPartyRelocateEnabled } from './third-party-system.mjs'
 import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
 import {
   callerCwdDeclaration,
@@ -1440,6 +1441,18 @@ export function createHandleProtocol(deps) {
     // mixed TTLs. The session default only governs platform-created markers.
     if (!apiOpenAI && !requestContext && !officialPassthrough) {
       ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
+    }
+    // Anthropic 400s a subscription request whose system field carries a third-party
+    // agent prompt; the same text in the first user message is accepted.
+    if (
+      !apiOpenAI &&
+      inferenceBackend !== 'api' &&
+      !requestContext &&
+      !officialPassthrough &&
+      !officialTraffic &&
+      thirdPartyRelocateEnabled(getRouting())
+    ) {
+      ctx.body = relocateThirdPartySystem(ctx.body).body
     }
     const personaIn = ctx.body
     // Capture ownership before rendering supplies gateway markers or projects
