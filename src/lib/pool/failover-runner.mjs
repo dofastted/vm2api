@@ -346,6 +346,9 @@ function isUnfinishedLastResult(result, policy) {
   if (!result) return false
   if (policy?.reason === 'incomplete_assistant') return true
   if (isUncommittedRateLimitAnswer(result)) return false
+  // An upstream entitlement answer is a complete answer even when the kernel
+  // tags the hop incomplete; the caller needs its message, not a generic 502.
+  if (policy?.reason === 'fable_credits_required' || policy?.reason === 'fable_plan_denied') return false
   if (hasKernelFailureCode(result)) return false
   if (result.terminalState === 'incomplete') return true
   return isIncompleteAssistantMessage(result)
@@ -1096,7 +1099,10 @@ export class FailoverRunner {
           )
         }
         notifyProxyFailure(this.onProxyFailure, selected, policy)
-        if (policy.reason === 'fable_plan_denied' && typeof this.onFablePlanDenied === 'function') {
+        if (
+          (policy.reason === 'fable_plan_denied' || policy.reason === 'fable_credits_required') &&
+          typeof this.onFablePlanDenied === 'function'
+        ) {
           try {
             this.onFablePlanDenied({ selected, policy })
           } catch {}

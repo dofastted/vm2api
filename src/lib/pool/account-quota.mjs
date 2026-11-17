@@ -28,9 +28,11 @@ import {
 import { rollWindowHistory } from './window-history.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from './quota-tiers.mjs'
 import { resolvePolicyModelId } from '../protocol/model-policy.mjs'
+import { isFableCreditsRequiredMessage } from './upstream-error-policy.mjs'
 import { SessionLimitRegistry } from './session-limit.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy } from './vm-quota-override.mjs'
 import {
+  FABLE_PROBE_MODEL,
   isFablePlanDenied,
   isInventedFableWindow,
   isOfficialUsageRateLimited,
@@ -54,6 +56,32 @@ import {
   quotaGateOf,
   worstGateZone,
 } from './quota-gate.mjs'
+
+/** How long a 'usage credits required' Fable answer keeps Fable off the seat. */
+export const FABLE_CREDITS_DENY_MS = 6 * 60 * 60_000
+
+function fableModelKey(model) {
+  return resolvePolicyModelId(model) || String(model || '').trim()
+}
+
+function setFableCreditsRequired(unified, key, now, durationMs) {
+  const until = now + durationMs
+  unified.model_denied_until = { ...(unified.model_denied_until || {}), [key]: until }
+  unified.fable_credits_required = {
+    model: key,
+    at: new Date(now).toISOString(),
+    until: new Date(until).toISOString(),
+  }
+}
+
+function clearFableCreditsRequired(unified, key) {
+  if (unified.model_denied_until?.[key]) {
+    const denied = { ...unified.model_denied_until }
+    delete denied[key]
+    unified.model_denied_until = denied
+  }
+  if (unified.fable_credits_required?.model === key) delete unified.fable_credits_required
+}
 
 export { extraHeadersFromLimitError }
 export { estimateRequestRisk }
@@ -433,6 +461,16 @@ export class AccountQuota {
             probed_at: probe.probed_at || leftover.probed_at || new Date().toISOString(),
           }
         }
+      }
+    }
+    // 限额查询's Fable hop sees the same 'usage credits required' 429 that
+    // routing does; record it the same way, and lift it when the hop succeeds.
+    if (probe.fable && !fableTransport) {
+      const fableKey = fableModelKey(FABLE_PROBE_MODEL)
+      if (Number(probe.fable.status) === 429 && isFableCreditsRequiredMessage(probe.fable.error)) {
+        setFableCreditsRequired(acc.unified, fableKey, Date.parse(nowIso) || Date.now(), FABLE_CREDITS_DENY_MS)
+      } else if (probe.fable.ok) {
+        clearFableCreditsRequired(acc.unified, fableKey)
       }
     }
     if (profileTier) {
@@ -1187,14 +1225,31 @@ export class AccountQuota {
     return this.repo.save(acc)
   }
 
+  /**
+   * Upstream said this account needs usage credits for Fable. Keep Fable off
+   * the seat for a while (other models still route) and leave a marker the
+   * panel shows instead of 未探测. The marker sits outside `unified.fable`
+   * because a Pro usage probe deletes that object. A later Fable success on
+   * the account clears both via clearModelUnsupported.
+   */
+  markFableCreditsRequired(accountId, model, durationMs = FABLE_CREDITS_DENY_MS) {
+    const key = fableModelKey(model)
+    if (!accountId || !key) return null
+    const acc = this.repo.get(accountId)
+    if (!acc) return null
+    const now = Date.now()
+    acc.unified = acc.unified || {}
+    setFableCreditsRequired(acc.unified, key, now, durationMs)
+    acc.unified.updated_at = new Date(now).toISOString()
+    return this.repo.save(acc)
+  }
+
   clearModelUnsupported(accountId, model) {
     const key = resolvePolicyModelId(model) || String(model || '').trim()
     if (!accountId || !key) return null
     const acc = this.repo.get(accountId)
     if (!acc?.unified?.model_denied_until?.[key]) return acc
-    const denied = { ...acc.unified.model_denied_until }
-    delete denied[key]
-    acc.unified.model_denied_until = denied
+    clearFableCreditsRequired(acc.unified, key)
     acc.unified.updated_at = new Date().toISOString()
     return this.repo.save(acc)
   }

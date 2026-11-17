@@ -104,6 +104,24 @@ export function inventedFableWindow(subject: FableSubject): boolean {
   return norm != null && norm >= 1 && !reset
 }
 
+/** Fable 无额度时的标签：上游要求 usage credits，Fable 已暂停调度到此槽。 */
+export const FABLE_NO_CREDITS_TEXT = '无额度'
+
+/**
+ * 上游对 Fable 回了「Usage credits are required」，网关已把 Fable 暂停调度到
+ * 此槽（`fable_credits_required.until` 前）。这时不能画「未探测」或旧百分比。
+ */
+export function fableCreditsRequired(
+  subject: FableSubject,
+  now = Date.now()
+): boolean {
+  const mark = subject.fable_credits_required as
+    Record<string, unknown> | null | undefined
+  if (!mark) return false
+  const until = expiresAtToMs(mark.until)
+  return until > now
+}
+
 /** Fable 已用比例（0-100 或 0-1，未归一化，交给 `pct()` 处理）。对齐 `fableUsedOf`。 */
 export function fableUsedOf(subject: FableSubject): number | null {
   const fb = (subject.fable as Record<string, unknown> | undefined) || {}
@@ -130,6 +148,7 @@ export function fableWeeklyFull(subject: FableSubject): boolean {
 export function fableProbeLabel(subject: FableSubject): string {
   const fb = subject.fable as Record<string, unknown> | undefined
   if (fablePlanDenied(fb)) return '无 Fable 权限'
+  if (fableCreditsRequired(subject)) return FABLE_NO_CREDITS_TEXT
   if (!fb) return '未探测'
   if (fb.banned) return '账号拒'
   if (fableWeeklyFull(subject)) return '周额度满'
@@ -151,6 +170,12 @@ export function fableState(subject: FableSubject): {
   const fb = subject.fable as Record<string, unknown> | undefined
   if (fb?.banned)
     return { usedPct: null, tone: { key: 'bad', cls: 'bad', text: '拒' } }
+  if (fableCreditsRequired(subject)) {
+    return {
+      usedPct: null,
+      tone: { key: 'bad', cls: 'bad', text: FABLE_NO_CREDITS_TEXT },
+    }
+  }
   if (fablePlanDenied(fb)) {
     return {
       usedPct: null,
@@ -341,13 +366,17 @@ export function fableCardInfo(
   if (fb?.banned) bits.unshift('账号拒')
   else if (fableWeeklyFull(subject)) bits.unshift('周额度满')
   if (reset) bits.push(fmtReset(reset))
+  const noCredits = fableCreditsRequired(subject)
+  if (noCredits) bits.unshift('需 usage credits，已暂停 Fable 调度')
 
-  if (used != null) {
+  if (used != null && !noCredits) {
     return { usedPct: pct(used), reset, bits, badgeText: '', badgeCls: 'ok' }
   }
   const txt = fableProbeLabel(subject)
   let badgeCls: 'ok' | 'warn' | 'bad' | 'none' = 'none'
-  if (fb) {
+  if (noCredits) {
+    badgeCls = 'bad'
+  } else if (fb) {
     if (fablePlanDenied(fb) || fb.banned) {
       badgeCls = 'bad'
     } else if (fb.limited) {

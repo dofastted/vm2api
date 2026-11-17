@@ -1128,3 +1128,22 @@ test('explicit overload errors retain overload classification', () => {
     assert.equal(policy.reason, 'provider_overloaded')
   }
 })
+
+test('fable usage-credits 429 moves on and marks the account, not the request', () => {
+  for (const message of ['Usage credits are required for this model.', 'Extra usage required for this model']) {
+    const policy = classifyUpstreamResult(
+      { status: 429, body: { type: 'error', error: { type: 'rate_limit_error', message } } },
+      { model: 'claude-fable-5-2', now: 1000 },
+    )
+    assert.equal(policy.reason, 'fable_credits_required')
+    assert.equal(policy.scope, 'account')
+    assert.equal(policy.action, 'continue')
+    assert.equal(policy.retrySameAccount, false)
+    assert.equal(policy.cooldownUntil, null)
+  }
+  const fast = classifyUpstreamResult(
+    { status: 429, body: { error: { message: 'Usage credits are required for fast mode' } } },
+    { model: 'claude-fable-5-2' },
+  )
+  assert.equal(fast.reason, 'entitlement_required')
+})

@@ -2,6 +2,33 @@ import { describe, expect, it } from 'vitest'
 import { fableCardInfo, fableState, fableUsedOf } from './fable-status'
 
 describe('Fable quota readings', () => {
+  it('shows 无额度 instead of 未探测 while upstream wants usage credits', () => {
+    const until = new Date(Date.now() + 60_000).toISOString()
+    const subject = {
+      account_tier: 'pro',
+      utilization_7d_oi: 0.25,
+      fable_credits_required: { model: 'claude-fable-5-2', until },
+    }
+    expect(fableState(subject)).toMatchObject({
+      usedPct: null,
+      tone: { cls: 'bad', text: '无额度' },
+    })
+    expect(fableCardInfo(subject, 4)).toMatchObject({
+      usedPct: null,
+      badgeText: '无额度',
+      badgeCls: 'bad',
+    })
+  })
+
+  it('drops the usage-credits mark once it has expired', () => {
+    const until = new Date(Date.now() - 1_000).toISOString()
+    const subject = {
+      account_tier: 'pro',
+      fable_credits_required: { model: 'claude-fable-5-2', until },
+    }
+    expect(fableState(subject).tone.text).toBe('未探测')
+  })
+
   it('uses the returned window regardless of the subscription tier', () => {
     for (const account_tier of ['pro', 'max', 'team', undefined]) {
       const subject = { account_tier, utilization_7d_oi: 0.25 }

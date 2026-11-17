@@ -34,6 +34,20 @@ test('a model entitlement rejection is persisted for that account and model', ()
   assert.equal(q.repo.get('a-denied').unified.model_denied_until['claude-fable-5'], undefined)
 })
 
+test('a Fable usage-credits rejection blocks Fable and leaves a panel marker until a success', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'a-credits' })
+  q.markFableCreditsRequired('a-credits', 'claude-fable-5-2', 60_000)
+  const u = q.repo.get('a-credits').unified
+  const key = u.fable_credits_required.model
+  assert.ok(u.model_denied_until[key] > Date.now())
+  assert.equal(Date.parse(u.fable_credits_required.until), u.model_denied_until[key])
+  q.clearModelUnsupported('a-credits', 'claude-fable-5-2')
+  const cleared = q.repo.get('a-credits').unified
+  assert.equal(cleared.model_denied_until[key], undefined)
+  assert.equal(cleared.fable_credits_required, undefined)
+})
+
 function futureReset(msFromNow) {
   return new Date(Date.now() + msFromNow).toISOString()
 }
@@ -1263,4 +1277,32 @@ test('complete usage may replace a profile-sourced tier', async () => {
   assert.equal(quota.repo.get('acct-profile').unified.account_tier_source, 'usage')
   quota.setAccountTier('acct-profile', 'max', { source: 'profile' })
   assert.equal(quota.repo.get('acct-profile').unified.account_tier, 'max')
+})
+
+test('a 限额查询 Fable hop that needs usage credits sets the same mark, and a Fable success lifts it', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'a-probe-credits' })
+  q.ingestOAuthUsage('a-probe-credits', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    usage_has_fable: false,
+    five_hour: { utilization: 0 },
+    seven_day: { utilization: 10 },
+    fable: { status: 429, ok: false, limited: true, error: 'Usage credits are required for this model.' },
+  })
+  const marked = q.repo.get('a-probe-credits').unified
+  const key = marked.fable_credits_required.model
+  assert.ok(marked.model_denied_until[key] > Date.now())
+  q.ingestOAuthUsage('a-probe-credits', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    five_hour: { utilization: 0 },
+    seven_day: { utilization: 10 },
+    fable: { status: 200, ok: true, limited: false, error: null },
+  })
+  const cleared = q.repo.get('a-probe-credits').unified
+  assert.equal(cleared.fable_credits_required, undefined)
+  assert.equal(cleared.model_denied_until[key], undefined)
 })

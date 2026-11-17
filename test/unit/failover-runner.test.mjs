@@ -2161,6 +2161,63 @@ test('fable 403 marks pro and failovers without credential cooldown', async () =
   assert.equal(scheduler.cooldowns.length, 0)
 })
 
+test('fable usage-credits 429 marks the account and failovers to the next one', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const denied = []
+  const accepted = []
+  const runner = new FailoverRunner({
+    scheduler,
+    onFablePlanDenied: (event) => denied.push([event.selected.accountId, event.policy.reason]),
+    onFableSuccess: (event) => accepted.push(event.selected.accountId),
+  })
+  const result = await runner.run({
+    requestId: 'req-fable-credits',
+    canonicalBody: { model: 'claude-fable-5-2' },
+    model: 'claude-fable-5-2',
+    callAttempt: ({ candidate: selected }) => {
+      if (selected.accountId === 'account-1') {
+        return {
+          ok: false,
+          status: 429,
+          terminalState: 'rejected',
+          body: {
+            type: 'error',
+            error: { type: 'rate_limit_error', message: 'Usage credits are required for this model.' },
+          },
+        }
+      }
+      return success()
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.accountId, 'account-2')
+  assert.deepEqual(denied, [['account-1', 'fable_credits_required']])
+  assert.deepEqual(accepted, ['account-2'])
+  assert.equal(scheduler.cooldowns.length, 0)
+})
+
+test('when every account needs Fable usage credits the caller gets that 429, not a generic 502', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler, onFablePlanDenied: () => {} })
+  const result = await runner.run({
+    requestId: 'req-fable-credits-all',
+    canonicalBody: { model: 'claude-fable-5-2' },
+    model: 'claude-fable-5-2',
+    callAttempt: () => ({
+      ok: false,
+      status: 429,
+      terminalState: 'incomplete',
+      body: {
+        type: 'error',
+        error: { type: 'rate_limit_error', message: 'Usage credits are required for this model.' },
+      },
+    }),
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.status, 429)
+  assert.match(result.body.error.message, /Usage credits are required/)
+})
+
 function leasingScheduler(candidates, cap = 2) {
   const state = { inflight: 0, selects: [] }
   return {

@@ -784,11 +784,15 @@ export function createRoutingRuntime(ctx) {
       onProxyFailure: (vmId, reason) => {
         ctx.proxyPool.reportRuntimeFailure(vmId, reason)
       },
-      onFablePlanDenied: ({ selected }) => {
+      onFablePlanDenied: ({ selected, policy }) => {
         const accountId = selected?.accountId
         if (accountId && selected?.model) {
           try {
-            ctx.accountQuota.markModelUnsupported(accountId, selected.model)
+            if (policy?.reason === 'fable_credits_required') {
+              ctx.accountQuota.markFableCreditsRequired(accountId, selected.model)
+            } else {
+              ctx.accountQuota.markModelUnsupported(accountId, selected.model)
+            }
           } catch {}
         }
       },
