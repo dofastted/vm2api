@@ -70,24 +70,54 @@ export function openaiContentToClaudeContent(content) {
  * Parts carrying no usable url stay untouched: the upstream 400 should keep
  * naming the real defect instead of silently dropping the caller's image.
  */
-export function normalizeImageContentBlocks(content) {
+export function normalizeImageContentBlocks(content, { inlineOnly = false } = {}) {
   if (!Array.isArray(content)) return content
   let changed = false
   const blocks = content.map((block) => {
     if (!block || typeof block !== 'object') return block
     if (block.type === 'tool_result' && Array.isArray(block.content)) {
-      const nested = normalizeImageContentBlocks(block.content)
+      const nested = normalizeImageContentBlocks(block.content, { inlineOnly })
       if (nested === block.content) return block
       changed = true
       return { ...block, content: nested }
     }
     if (block.type !== 'image_url') return block
+    if (inlineOnly) {
+      const url = typeof block.image_url === 'string' ? block.image_url : block.image_url?.url
+      if (typeof url === 'string' && /^https?:\/\//i.test(url)) return block
+      if (typeof url !== 'string') throw invalidInlineImageUrl()
+    }
     const image = openaiImagePartToClaude(block)
+    if (inlineOnly) {
+      const mediaType = image?.source.media_type?.toLowerCase()
+      const data = image?.source.data
+      const detail = block.image_url?.detail
+      if (
+        !/^image\/(jpeg|jpg|png|gif|webp)$/.test(mediaType || '') ||
+        !data ||
+        data.length % 4 !== 0 ||
+        !/^[A-Za-z0-9+/]+={0,2}$/.test(data) ||
+        (detail !== undefined && detail !== 'auto')
+      ) {
+        throw invalidInlineImageUrl()
+      }
+      image.source.media_type = mediaType === 'image/jpg' ? 'image/jpeg' : mediaType
+    }
     if (!image) return block
     changed = true
     return block.cache_control ? { ...image, cache_control: block.cache_control } : image
   })
   return changed ? blocks : content
+}
+
+function invalidInlineImageUrl() {
+  const message = 'image_url must contain a supported base64 image data URL without a non-default detail'
+  const code = 'invalid_image_url'
+  return Object.assign(new Error(message), {
+    status: 400,
+    code,
+    body: { type: 'error', error: { type: 'invalid_request_error', code, message, param: 'image_url' } },
+  })
 }
 
 const IMAGE_FETCH_MS = 20_000
