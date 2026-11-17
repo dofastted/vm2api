@@ -337,7 +337,6 @@ export function orderCodexSessionSlots(
     now,
     requestIntervalMs,
     preferredAccountId: home && ids.includes(home) ? home : null,
-    preferredOverridesWeight: true,
     roundRobinCursor: cursor,
   })
   if (!ordered.ids.length) {

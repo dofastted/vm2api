@@ -251,24 +251,27 @@ test('a bound OpenAI session stays on its VM and a full window is skipped', () =
   assert.deepEqual(orderCodexSessionSlots(seatsOnly, { sessionKey: 'conv-z', sessionLimit: sessions }).ids, ['vm-a'])
 })
 
-test('Codex schedules the highest level before weights and affinity, then fails over within that level', () => {
+test('Codex keeps a live binding before scheduling by level and weight', () => {
   const now = Date.parse('2026-10-18T00:00:00.000Z')
   const vms = [
-    gpt('vm-low', { schedule_level_manual: 1, weight: 100, utilization_5h: 0.1 }),
+    gpt('vm-low', { schedule_level_manual: 1, weight: 1, utilization_5h: 0.1 }),
     gpt('vm-auto', { weight: 200, reset_7d: new Date(now + 3600_000).toISOString() }),
     gpt('vm-high-a', { schedule_level_manual: 10, weight: 2, utilization_5h: 0.3 }),
     gpt('vm-high-b', { policy: { priority: 10, weight: 1 }, utilization_5h: 0.4 }),
   ]
   const options = { now, boundVmId: 'vm-low', roundRobinCursor: 0 }
   const ordered = orderCodexSessionSlots(vms, options)
-  assert.deepEqual(ordered.ids, ['vm-high-a', 'vm-high-b', 'vm-auto', 'vm-low'])
-  assert.equal(ordered.sticky, false)
+  assert.deepEqual(ordered.ids, ['vm-low', 'vm-high-a', 'vm-high-b', 'vm-auto'])
+  assert.equal(ordered.sticky, true)
+  const fresh = orderCodexSessionSlots(vms, { ...options, boundVmId: null })
+  assert.deepEqual(fresh.ids, ['vm-high-a', 'vm-high-b', 'vm-auto', 'vm-low'])
   assert.equal(pickCodexSlots(vms, { now }).ids[0], 'vm-high-a')
   const sameLevel = orderCodexSessionSlots(vms, { ...options, boundVmId: 'vm-high-b' })
   assert.equal(sameLevel.ids[0], 'vm-high-b')
   assert.equal(sameLevel.sticky, true)
-  const fallback = orderCodexSessionSlots(vms, { ...options, excluded: new Set(['vm-high-a', 'vm-high-b']) })
-  assert.deepEqual(fallback.ids, ['vm-auto', 'vm-low'])
+  const fallback = orderCodexSessionSlots(vms, { ...options, excluded: new Set(['vm-low', 'vm-high-a', 'vm-high-b']) })
+  assert.deepEqual(fallback.ids, ['vm-auto'])
+  assert.equal(fallback.sticky, false)
   assert.deepEqual(orderCodexSessionSlots(vms, { now, pin: 'vm-low' }).ids, ['vm-low'])
 })
 

@@ -81,11 +81,8 @@ export const DEFAULT_POOL_ROUTING = Object.freeze({
   circuit_failure_threshold: 3,
   circuit_open_ms: 30000,
   /**
-   * A continuing conversation keeps its own VM while that VM can take it,
-   * ahead of priority level and device affinity. Moving it costs a full
-   * prompt-cache rewrite on another account, which outweighs draining a
-   * soon-to-reset quota first. Matters most when many conversations share
-   * one device key (a relay in front of the pool).
+   * After a slot_busy spill, follow the VM that served the turn instead of
+   * returning to the original pin and rebuilding the prompt cache again.
    */
   session_affinity_first: false,
 })
@@ -203,12 +200,10 @@ function sessionIdFromStickyKey(key) {
   return body.slice('sess:'.length)
 }
 
-/** Machine VM, then this session's pin, then family. Empty and duplicate VMs drop out with their reason. */
-function seatHomes({ deviceVm = '', sessionVm = '', familyVm = '', sessionFirst = false } = {}) {
-  const device = { vmId: String(deviceVm || '').trim(), reason: 'device-affinity' }
-  const session = { vmId: String(sessionVm || '').trim(), reason: 'sticky' }
+/** Soft affinity for new sessions: machine, then family. */
+function seatHomes({ deviceVm = '', familyVm = '' } = {}) {
   const homes = [
-    ...(sessionFirst ? [session, device] : [device, session]),
+    { vmId: String(deviceVm || '').trim(), reason: 'device-affinity' },
     { vmId: String(familyVm || '').trim(), reason: 'family-affinity' },
   ]
   const seen = new Set()
@@ -901,7 +896,6 @@ export class PoolScheduler extends EventEmitter {
     const failoverDeadline = Number(deadline) || Number.POSITIVE_INFINITY
     const familyVm = familyVmId ? String(familyVmId).trim() : ''
     const machineKey = String(deviceKey || '').trim()
-    const deviceVmOf = () => this.machineHome(machineKey) || String(deviceVmId || '').trim()
     const avoided = (candidate) => !!avoid?.size && (avoid.has(candidate.accountId) || avoid.has(candidate.vmId))
     let stickyCleared = false
     let familyGated = false
@@ -1016,19 +1010,6 @@ export class PoolScheduler extends EventEmitter {
         }
         const byVm = new Map(candidates.map((candidate) => [candidate.vmId, candidate]))
         if (ticket) ticket.candidates = byVm
-        // Home left the pool (circuit open, unschedulable, hard cooldown, removed).
-        // A full home is still a candidate, so that wait keeps its sticky clock.
-        const waitingHome = ticket?.kind === 'seat' ? byVm.get(ticket.vmId) : null
-        if (
-          ticket?.kind === 'seat' &&
-          (now >= ticket.stickyUntil ||
-            !waitingHome ||
-            ((!ticket.sessionHome || waitingHome.draining) &&
-              candidates.some((candidate) => candidate.priority > waitingHome.priority && !avoided(candidate))))
-        ) {
-          ticket.deadline = Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms)
-          this.planner.toGlobal(ticket)
-        }
         let seat = this.planner.seatOf(seatKey)
         if (seat) {
           const home = byVm.get(seat.vmId)
@@ -1055,6 +1036,23 @@ export class PoolScheduler extends EventEmitter {
           familyVmId: null,
         })
         if (sticky.cleared) stickyCleared = true
+        const stickyHome = sticky.match && !sticky.match.draining && !avoided(sticky.match) ? sticky.match : null
+        if (ticket?.kind === 'seat') {
+          const waitingHome = byVm.get(ticket.vmId)
+          const homeUsable =
+            waitingHome &&
+            !avoided(waitingHome) &&
+            (!waitingHome.busy || stickyShouldWait(waitingHome.waitReason, waitingHome.cooldownReason))
+          if (
+            now >= ticket.stickyUntil ||
+            !homeUsable ||
+            (waitingHome.vmId !== stickyHome?.vmId &&
+              candidates.some((candidate) => candidate.priority > waitingHome.priority && !avoided(candidate)))
+          ) {
+            ticket.deadline = Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms)
+            this.planner.toGlobal(ticket)
+          }
+        }
         if (seat) {
           if (!ticket) {
             if (!this.planner.hasConcWaiters(seat.vmId)) {
@@ -1076,24 +1074,16 @@ export class PoolScheduler extends EventEmitter {
           }
           this.planner.pump(seat.vmId)
         } else {
-          // Within a priority level, prefer the machine, session, then family.
-          // With session_affinity_first a continuing conversation's own VM
-          // comes first, across priority levels.
-          const sessionVm = this.config.session_affinity_first ? String(sticky.vmId || '').trim() : ''
-          const homes = seatHomes({
-            deviceVm: deviceVmOf(),
-            sessionVm: sticky.vmId || '',
-            familyVm: familyGated ? '' : familyVm,
-            sessionFirst: !!sessionVm,
-          })
-
           if (!ticket) {
+            const homes = seatHomes({
+              deviceVm: this.machineHome(machineKey) || deviceVmId,
+              familyVm: familyGated ? '' : familyVm,
+            })
             const granted = this.openNewSeat(seatKey, candidates, {
               avoided,
               homes,
+              stickyHome,
               deviceKey: machineKey,
-              sessionVm,
-              waitForSession: allowWait && now < failoverDeadline,
             })
             if (granted) return finish(granted)
             if (!candidates.length) {
@@ -1102,20 +1092,11 @@ export class PoolScheduler extends EventEmitter {
             }
             if (!allowWait || now >= failoverDeadline) return fail('all_accounts_busy')
             const waitTier = highestPriorityCandidates(candidates.filter((candidate) => !avoided(candidate)))
-            const waitable = (candidate) => candidate && (!candidate.busy || stickyShouldWait(candidate.waitReason))
-            // The session's own VM also waits out a soft (RPM) cooldown, as reconcileSticky() does.
-            const sessionHome = sessionVm
-              ? candidates.find(
-                  (candidate) =>
-                    candidate.vmId === sessionVm &&
-                    !avoided(candidate) &&
-                    !candidate.draining &&
-                    (!candidate.busy || stickyShouldWait(candidate.waitReason, candidate.cooldownReason)),
-                )
-              : null
             const home =
-              sessionHome ||
-              homes.map((entry) => waitTier.find((candidate) => candidate.vmId === entry.vmId)).find(waitable)
+              stickyHome ||
+              homes
+                .map((entry) => waitTier.find((candidate) => candidate.vmId === entry.vmId))
+                .find((candidate) => candidate && (!candidate.busy || stickyShouldWait(candidate.waitReason)))
             ticket = home
               ? this.enqueueTicket({
                   seatKey,
@@ -1138,7 +1119,6 @@ export class PoolScheduler extends EventEmitter {
                   deadline: Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms),
                   avoided,
                 })
-            if (sessionHome) ticket.sessionHome = true
           } else if (ticket.kind === 'conc') {
             // Its seat moved away: wait for a new seat on the same terms as a new device.
             this.planner.place(ticket, { kind: 'global', vmId: null })
@@ -1179,22 +1159,14 @@ export class PoolScheduler extends EventEmitter {
   }
 
   /**
-   * Try every level in descending order. A full home can retain its sticky
-   * seat wait within its own level, but cannot block higher levels.
+   * A continuing session keeps its home even if a higher level has room.
+   * New sessions try levels in descending order, with soft affinity within a level.
    */
-  openNewSeat(seatKey, candidates, { avoided, homes = [], deviceKey = '', sessionVm = '', waitForSession = false }) {
+  openNewSeat(seatKey, candidates, { avoided, homes = [], stickyHome = null, deviceKey = '' }) {
     const openable = this.openableCandidates(candidates, avoided)
-    if (sessionVm) {
-      const own = candidates.find(
-        (candidate) => candidate.vmId === sessionVm && !avoided(candidate) && !candidate.draining,
-      )
-      if (own) {
-        const home = openable.find((candidate) => candidate.vmId === sessionVm)
-        const granted = home && this.claimSeat(seatKey, home, 'sticky', deviceKey)
-        if (granted) return granted
-        // Full or briefly busy: wait on it (sticky wait) rather than move now.
-        if (waitForSession && (!own.busy || stickyShouldWait(own.waitReason, own.cooldownReason))) return null
-      }
+    if (stickyHome) {
+      if (!openable.includes(stickyHome)) return null
+      return this.claimSeat(seatKey, stickyHome, 'sticky', deviceKey)
     }
     const ranked = this.planner.rank(openable)
     for (const priority of new Set(ranked.map((candidate) => candidate.priority))) {
@@ -1213,7 +1185,7 @@ export class PoolScheduler extends EventEmitter {
           const group = tier.filter((candidate) => candidate.draining === draining)
           for (const home of homes) {
             const match = group.find((candidate) => candidate.vmId === home.vmId)
-            if (!match || (home.reason !== 'sticky' && !hostAdmits(match, strict))) continue
+            if (!match || !hostAdmits(match, strict)) continue
             const granted = this.claimSeat(seatKey, match, home.reason, deviceKey)
             if (granted) return granted
           }
@@ -1410,28 +1382,28 @@ export class PoolScheduler extends EventEmitter {
   /**
    * The session pin as pick() treats it: a bound home that left the pool, or
    * sits in a cooldown that must rotate, releases the pin; capacity keeps it.
-   * `spilled` homes keep their pin. Returns the VM the pin still points at.
+   * `spilled` homes keep their pin. Returns the candidate the pin still points at.
    */
   reconcileSticky({ stickyKey = null, stickyKeys = null, eligible = [], spilled = null, familyVmId = null } = {}) {
     const bound = stickyKey ? this.stickyRouter?.resolve?.(stickyKey) : null
-    if (!bound) return { cleared: false, vmId: null, match: null }
+    if (!bound) return { cleared: false, match: null }
     const familyVm = familyVmId ? String(familyVmId).trim() : ''
     if (familyVm && bound.vmId !== familyVm && eligible.some((candidate) => candidate.vmId === familyVm)) {
       // The family home moved: this session follows it instead of keeping a stale pin.
       this.releaseSticky(bound, stickyKey, stickyKeys)
-      return { cleared: true, vmId: null, match: null }
+      return { cleared: true, match: null }
     }
     const match = eligible.find((candidate) => candidate.vmId === bound.vmId && candidate.accountId === bound.accountId)
     if (!match) {
       if (!spilled?.has(bound.accountId)) this.releaseSticky(bound, stickyKey, stickyKeys)
-      return { cleared: true, vmId: null, match: null }
+      return { cleared: true, match: null }
     }
     if (match.busy && !stickyShouldWait(match.waitReason, match.cooldownReason)) {
       // Auth / quota / pause cooldown: the conversation moves.
       this.releaseSticky(bound, stickyKey, stickyKeys)
-      return { cleared: true, vmId: null, match: null }
+      return { cleared: true, match: null }
     }
-    return { cleared: false, vmId: bound.vmId, match }
+    return { cleared: false, match }
   }
 
   /** VMs this request's conversation already sits on: its held seat and its session pins. */
@@ -2044,8 +2016,8 @@ export class PoolScheduler extends EventEmitter {
   }
 
   /**
-   * Direct path (pins, seatless probes). Affinity only breaks ties within
-   * a priority level; borrowing another VM does not clear the durable pin.
+   * Direct path (pins, seatless probes). Session affinity precedes priority;
+   * borrowing another VM does not clear the durable pin.
    */
   pick(
     candidates,
@@ -2061,18 +2033,15 @@ export class PoolScheduler extends EventEmitter {
       familyVmId,
     })
     this.lastStickyCleared = sticky.cleared
-    let pool = highestPriorityCandidates(candidates)
-    let borrowed = false
     if (sticky.match) {
-      const inPool = pool.some(
+      const inPool = candidates.find(
         (candidate) => candidate.vmId === sticky.match.vmId && candidate.accountId === sticky.match.accountId,
       )
-      if (inPool && this.isReservable(sticky.match)) return { ...sticky.match, selectionReason: 'sticky' }
-      // Capacity, or a replay steering around this unit: borrow, keep the pin.
-      borrowed = true
+      if (this.isReservable(inPool)) return { ...inPool, selectionReason: 'sticky' }
     }
     if (!candidates.length) return null
-    const reasonFor = (reason) => (borrowed ? 'sticky-spill' : reason)
+    let pool = highestPriorityCandidates(candidates)
+    const reasonFor = (reason) => (sticky.match ? 'sticky-spill' : reason)
     const familyVm = familyVmId ? String(familyVmId).trim() : ''
     if (familyVm) {
       const home = pool.find((candidate) => candidate.vmId === familyVm && this.isReservable(candidate))
@@ -2110,13 +2079,18 @@ export class PoolScheduler extends EventEmitter {
       return { ok: false, code: empty.reason, retry_after_ms: empty.retry_after_ms }
     }
     const idle = candidates.filter((candidate) => this.isReservable(candidate))
-    const tier = highestPriorityCandidates(idle.length ? idle : candidates)
+    const pool = idle.length ? idle : candidates
     const bound = stickyKey ? this.stickyRouter?.resolve?.(stickyKey) : null
     if (bound) {
-      const match = tier.find((candidate) => candidate.vmId === bound.vmId && candidate.accountId === bound.accountId)
+      const match = pool.find(
+        (candidate) =>
+          candidate.vmId === bound.vmId &&
+          candidate.accountId === bound.accountId &&
+          (!candidate.busy || stickyShouldWait(candidate.waitReason, candidate.cooldownReason)),
+      )
       if (match) return { ok: true, ...match, selectionReason: 'sticky' }
     }
-    const selected = this.peekRank(tier)
+    const selected = this.peekRank(pool)
     if (!selected) return { ok: false, code: 'no_eligible_accounts' }
     return { ok: true, ...selected }
   }
@@ -2458,9 +2432,7 @@ export class PoolScheduler extends EventEmitter {
   }
 
   resolveWaitPlan({ candidates = [], stickyKey = null, stickyCleared = false, requestDeadline = null } = {}) {
-    const waitable = highestPriorityCandidates(
-      candidates.filter((candidate) => candidate.busy && !this.isReservable(candidate)),
-    )
+    const waitable = candidates.filter((candidate) => candidate.busy && !this.isReservable(candidate))
     const bound = !stickyCleared && stickyKey ? this.stickyRouter?.resolve?.(stickyKey) : null
     if (bound) {
       const match = waitable.find(

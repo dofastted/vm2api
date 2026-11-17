@@ -329,12 +329,13 @@ test('healthy sticky binding outranks weighted selection', async (t) => {
   selected.release()
 })
 
-test('direct VM selection compares priority before all forms of affinity', async (t) => {
+test('direct VM selection keeps a healthy sticky binding before priority', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const file = path.join(root, 'vms', 'vm-01.json')
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   vm.policy.priority = 10
+  vm.policy.weight = 10
   fs.writeFileSync(file, JSON.stringify(vm))
   const pool = scheduler(root, {
     stickyRouter: { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) },
@@ -347,12 +348,16 @@ test('direct VM selection compares priority before all forms of affinity', async
     allowWait: false,
   }
   const selected = await pool.selectAndReserve(args)
-  assert.equal(selected.vmId, 'vm-01')
+  assert.equal(selected.vmId, 'vm-02')
+  assert.equal(selected.selectionReason, 'sticky')
   selected.release()
-  assert.equal((await pool.peekAccount(args)).vmId, 'vm-01')
-  const fallback = await pool.selectAndReserve({ ...args, excluded: new Set(['vm-01']) })
-  assert.equal(fallback.vmId, 'vm-02')
-  assert.equal(fallback.selectionReason, 'sticky')
+  assert.equal((await pool.peekAccount(args)).vmId, 'vm-02')
+  const fresh = await pool.selectAndReserve({ ...args, stickyKey: null })
+  assert.equal(fresh.vmId, 'vm-01')
+  fresh.release()
+  const fallback = await pool.selectAndReserve({ ...args, excluded: new Set(['vm-02']) })
+  assert.equal(fallback.vmId, 'vm-01')
+  assert.equal(fallback.stickyCleared, true)
   fallback.release()
 })
 
@@ -2030,40 +2035,44 @@ test('idle candidate is reserved before waiting when another account releases', 
   first.release()
 })
 
-test('a direct waiter takes the highest available priority even when the lower VM wakes it', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  for (const [id, priority] of [
-    ['vm-01', 10],
-    ['vm-02', 1],
-  ]) {
-    const file = path.join(root, 'vms', `${id}.json`)
-    const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
-    Object.assign(vm.policy, { priority, maxConcurrency: 1 })
-    fs.writeFileSync(file, JSON.stringify(vm))
-  }
-  const pool = scheduler(root, {
-    stickyRouter: { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) },
+for (const stickyKey of [null, 'conversation-1']) {
+  test(`a direct waiter selects by ${stickyKey ? 'sticky binding' : 'priority'} when the lower VM wakes it`, async (t) => {
+    const root = project()
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    for (const [id, priority] of [
+      ['vm-01', 10],
+      ['vm-02', 1],
+    ]) {
+      const file = path.join(root, 'vms', `${id}.json`)
+      const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+      Object.assign(vm.policy, { priority, maxConcurrency: 1 })
+      fs.writeFileSync(file, JSON.stringify(vm))
+    }
+    const pool = scheduler(root, {
+      stickyRouter: { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) },
+    })
+    applyShortWaits(pool, { sticky: 400, fallback: 400 })
+    const args = { model: 'claude-test' }
+    const high = await pool.selectAndReserve({ ...args, allowWait: false })
+    const low = await pool.selectAndReserve({ ...args, allowWait: false })
+    assert.equal(high.vmId, 'vm-01')
+    assert.equal(low.vmId, 'vm-02')
+    const pending = pool.selectAndReserve({ ...args, stickyKey })
+    await new Promise((resolve) => setImmediate(resolve))
+    const waiters = pool.snapshot().waiters
+    assert.equal(waiters.total, 1)
+    assert.equal(waiters[stickyKey ? low.accountId : high.accountId], 1)
+    const notify = pool.notifyCapacity.bind(pool)
+    pool.notifyCapacity = () => {}
+    low.release()
+    high.release()
+    pool.notifyCapacity = notify
+    notify(low.accountId)
+    const selected = await pending
+    assert.equal(selected.vmId, stickyKey ? 'vm-02' : 'vm-01')
+    selected.release()
   })
-  applyShortWaits(pool, { sticky: 400, fallback: 400 })
-  const args = { model: 'claude-test' }
-  const high = await pool.selectAndReserve({ ...args, allowWait: false })
-  const low = await pool.selectAndReserve({ ...args, allowWait: false })
-  assert.equal(high.vmId, 'vm-01')
-  assert.equal(low.vmId, 'vm-02')
-  const pending = pool.selectAndReserve({ ...args, stickyKey: 'conversation-1' })
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(pool.snapshot().waiters.total, 1)
-  const notify = pool.notifyCapacity.bind(pool)
-  pool.notifyCapacity = () => {}
-  low.release()
-  high.release()
-  pool.notifyCapacity = notify
-  notify(low.accountId)
-  const selected = await pending
-  assert.equal(selected.vmId, 'vm-01')
-  selected.release()
-})
+}
 
 test('account concurrency is not clamped to ready_slots', async (t) => {
   const root = project()
@@ -2770,7 +2779,7 @@ test('rebuild outbound session stays on one VM and changes after failover', asyn
   assert.equal(sticky.resolve(stickyKey).sessionId, seen[0].sessionId)
 })
 
-test('a device-affinity seat migrates a stale session pin and reuses its outbound session after restart', async (t) => {
+test('device affinity takes over only after a session loses its VM and keeps the new outbound session after restart', async (t) => {
   const root = project()
   let sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
   t.after(() => {
@@ -2802,6 +2811,16 @@ test('a device-affinity seat migrates a stale session pin and reuses its outboun
       applyAttempt: applyRebuildAttempt(caller, { seen, headers, epoch: turn }),
       callAttempt: () => verifiedHop('reply'),
     })
+
+  const kept = await run(0)
+  assert.equal(kept.ok, true)
+  assert.equal(kept.vmId, 'vm-01')
+  assert.equal(seen.shift().sessionId, 'old-outbound')
+  headers.shift()
+  const originalVmFile = path.join(root, 'vms', 'vm-01.json')
+  const originalVm = JSON.parse(fs.readFileSync(originalVmFile, 'utf8'))
+  originalVm.schedulable = false
+  fs.writeFileSync(originalVmFile, JSON.stringify(originalVm))
 
   const first = await run(1)
   assert.equal(first.ok, true)
@@ -2836,7 +2855,7 @@ test('a device-affinity seat migrates a stale session pin and reuses its outboun
   assert.ok(headers.every((item) => item.metadata_session_id === sessionId))
 })
 
-test('held and restored seats keep their outbound session despite a different family home', async (t) => {
+test('Claude follow-ups keep their VM and outbound session after another VM gains priority', async (t) => {
   const root = project()
   const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
   t.after(() => {
@@ -2872,6 +2891,10 @@ test('held and restored seats keep their outbound session despite a different fa
   assert.equal(first.ok, true)
   assert.equal(first.vmId, 'vm-02')
   const sessionId = seen[0].sessionId
+  const otherVmFile = path.join(root, 'vms', 'vm-01.json')
+  const otherVm = JSON.parse(fs.readFileSync(otherVmFile, 'utf8'))
+  Object.assign(otherVm.policy, { priority: 10, weight: 10 })
+  fs.writeFileSync(otherVmFile, JSON.stringify(otherVm))
   for (const turn of [2, 3]) {
     const result = await run(turn)
     assert.equal(result.ok, true)
@@ -2880,7 +2903,7 @@ test('held and restored seats keep their outbound session despite a different fa
     assert.equal(sticky.resolve(stickyKey).sessionId, sessionId)
   }
 
-  // A control-process restart restores the seat from the persisted binding.
+  // The persisted binding also survives a control-process restart.
   runner = makeRunner()
   const restored = await run(4)
   assert.equal(restored.ok, true)
@@ -3364,7 +3387,7 @@ function preferVm01(root) {
   fs.writeFileSync(file, JSON.stringify(vm))
 }
 
-test('session_affinity_first keeps a continuing conversation on its own VM over priority and device', async (t) => {
+test('a continuing conversation keeps its own VM over priority and device with either spill policy', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   preferVm01(root)
@@ -3379,18 +3402,15 @@ test('session_affinity_first keeps a continuing conversation on its own VM over 
     allowWait: false,
   }
 
-  const kept = await scheduler(root, { stickyRouter, config: { session_affinity_first: true } }).selectAndReserve(args)
-  assert.equal(kept.ok, true)
-  assert.equal(kept.vmId, 'vm-02')
-  assert.equal(kept.selectionReason, 'sticky')
-  kept.release()
+  for (const session_affinity_first of [false, true]) {
+    const kept = await scheduler(root, { stickyRouter, config: { session_affinity_first } }).selectAndReserve(args)
+    assert.equal(kept.ok, true)
+    assert.equal(kept.vmId, 'vm-02')
+    assert.equal(kept.selectionReason, 'sticky')
+    kept.release()
+  }
 
-  const moved = await scheduler(root, { stickyRouter }).selectAndReserve(args)
-  assert.equal(moved.ok, true)
-  assert.equal(moved.vmId, 'vm-01', 'off by default: priority still wins')
-  moved.release()
-
-  const fresh = await scheduler(root, { stickyRouter, config: { session_affinity_first: true } }).selectAndReserve({
+  const fresh = await scheduler(root, { stickyRouter }).selectAndReserve({
     ...args,
     seatKey: 'seat:sess:new',
     stickyKey: 'conversation-new',
@@ -3399,12 +3419,12 @@ test('session_affinity_first keeps a continuing conversation on its own VM over 
   fresh.release()
 })
 
-test('session_affinity_first falls back to priority when the own VM cannot take the turn', async (t) => {
+test('sticky selection falls back to priority when the own VM cannot take the turn', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   preferVm01(root)
   const stickyRouter = { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) }
-  const pool = scheduler(root, { stickyRouter, config: { session_affinity_first: true } })
+  const pool = scheduler(root, { stickyRouter })
   const excluded = await pool.selectAndReserve({
     model: 'claude-test',
     seatKey: 'seat:sess:own-excluded',
@@ -3417,7 +3437,7 @@ test('session_affinity_first falls back to priority when the own VM cannot take 
   excluded.release()
 })
 
-test('session_affinity_first waits out a soft RPM cooldown on the own VM instead of moving', async (t) => {
+test('a continuing conversation waits out a soft RPM cooldown on the own VM instead of moving', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   preferVm01(root)
@@ -3433,7 +3453,7 @@ test('session_affinity_first waits out a soft RPM cooldown on the own VM instead
   const pool = scheduler(root, {
     runtimeRepo,
     stickyRouter,
-    config: { session_affinity_first: true, sticky_wait_timeout_ms: 5000, fallback_wait_timeout_ms: 5000 },
+    config: { sticky_wait_timeout_ms: 5000, fallback_wait_timeout_ms: 5000 },
   })
   const selected = await pool.selectAndReserve({
     model: 'claude-test',
