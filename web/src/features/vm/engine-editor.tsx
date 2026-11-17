@@ -175,7 +175,6 @@ function SlotKernelSwitch({
   const qc = useQueryClient()
   const [pending, setPending] = useState<SlotKernelTarget | null>(null)
   const [licenseOpen, setLicenseOpen] = useState(false)
-  const [checkingLicense, setCheckingLicense] = useState(false)
   const handledObservation = useRef('')
   const switchToastId = `vm-kernel-switch-${id}`
   const kvm = ['kvm', 'qemu', 'libvirt'].includes(
@@ -256,6 +255,13 @@ function SlotKernelSwitch({
           job.error?.code
         )
       )
+    } else if (job.deferred_start) {
+      toast.warning(`本槽已切换到 ${slotKernelLabel(next)}（暂未启动）`, {
+        id: switchToastId,
+        description:
+          job.start_error ||
+          '运行中的 CRAG 已达上限或尚未激活授权，本槽已保留为停机状态。',
+      })
     } else {
       const notify = job.reclaim_pending ? toast.warning : toast.success
       notify(kernelSwitchSuccess(next, vm.status), {
@@ -288,32 +294,31 @@ function SlotKernelSwitch({
     ...vmCragLicenseQueryOptions(id),
     enabled: !blocked,
   })
-  async function requestV2() {
-    setCheckingLicense(true)
-    try {
-      const data = await qc.fetchQuery(vmCragLicenseQueryOptions(id))
-      if (data.license.valid && data.license.status === 'valid') {
-        setPending('v2')
-      } else {
-        setLicenseOpen(true)
-      }
-    } catch {
-      setLicenseOpen(true)
-    } finally {
-      setCheckingLicense(false)
-    }
-  }
 
+  function requestV2() {
+    setPending('v2')
+  }
   const switchKernel = useMutation({
     mutationFn: async (
       next: SlotKernelTarget
-    ): Promise<VmKernelSwitchJob | { reclaim_pending?: boolean }> => {
+    ): Promise<
+      | VmKernelSwitchJob
+      | {
+          reclaim_pending?: boolean
+          deferred_start?: boolean
+          start_error?: string | null
+        }
+    > => {
       const body =
         next === 'v2'
           ? ({ dataplane: 'crag', crag_kernel_version: 'v2' } as const)
           : ({ dataplane: 'wrap', crag_kernel_version: '' } as const)
       if (remote) return startVmKernelSwitch(id, body)
-      return patchVm<{ reclaim_pending?: boolean }>(id, body)
+      return patchVm<{
+        reclaim_pending?: boolean
+        deferred_start?: boolean
+        start_error?: string | null
+      }>(id, body)
     },
     // A disconnected POST may already have started the task. Never resubmit it.
     retry: false,
@@ -330,6 +335,15 @@ function SlotKernelSwitch({
       setPending(null)
       if (remote && 'status' in data) {
         qc.setQueryData(vmKernelSwitchQueryOptions(id).queryKey, data)
+        return
+      }
+      if (data?.deferred_start) {
+        toast.warning(`本槽已切换到 ${slotKernelLabel(next)}（暂未启动）`, {
+          id: switchToastId,
+          description:
+            data.start_error ||
+            '运行中的 CRAG 已达上限或尚未激活授权，本槽已保留为停机状态。',
+        })
         return
       }
       const notify = data?.reclaim_pending ? toast.warning : toast.success
@@ -380,16 +394,13 @@ function SlotKernelSwitch({
     !switching &&
     !switchFailed &&
     (remote ? job?.status === 'succeeded' : switchKernel.isSuccess)
-  const reclaimPending =
-    (remote ? job : switchKernel.data)?.reclaim_pending === true
+  const switchResult = remote ? job : switchKernel.data
+  const reclaimPending = switchResult?.reclaim_pending === true
+  const deferredStart = switchResult?.deferred_start === true
   const checkingJob = remote && !blocked && jobQuery.isPending
   const needsCheck = remote && (switchKernel.isError || jobQuery.isError)
   const busy =
-    checkingLicense ||
-    switching ||
-    checkingJob ||
-    needsCheck ||
-    (remote && jobQuery.isFetching)
+    switching || checkingJob || needsCheck || (remote && jobQuery.isFetching)
   return (
     <div className='mt-3 space-y-2'>
       <div className='flex flex-wrap gap-2'>
@@ -406,14 +417,12 @@ function SlotKernelSwitch({
         <Button
           variant='outline'
           disabled={blocked || busy || (onV2 && !canRetry)}
-          aria-busy={checkingLicense || (switching && target === 'v2')}
-          onClick={() => void requestV2()}
+          aria-busy={switching && target === 'v2'}
+          onClick={() => requestV2()}
         >
-          {checkingLicense
-            ? '正在检查授权…'
-            : switching && target === 'v2'
-              ? '正在切换到 CRAG v2…'
-              : '本槽切到 CRAG v2'}
+          {switching && target === 'v2'
+            ? '正在切换到 CRAG v2…'
+            : '本槽切到 CRAG v2'}
         </Button>
         {!blocked ? (
           <Button
@@ -468,16 +477,20 @@ function SlotKernelSwitch({
               ? `正在切换到 ${slotKernelLabel(target)}…`
               : switchFailed
                 ? '内核切换未完成'
-                : reclaimPending
-                  ? '内核切换完成，绑定待回收'
-                  : '内核切换完成'}
+                : deferredStart
+                  ? '内核切换完成（暂未启动）'
+                  : reclaimPending
+                    ? '内核切换完成，绑定待回收'
+                    : '内核切换完成'}
           </AlertTitle>
           <AlertDescription className='break-words'>
             {switching
               ? '请勿重复操作。正在等待服务端完成切换，并刷新 VM 运行和调度状态。关闭页面不会取消任务，可重新打开查看进度。'
               : switchFailed
                 ? `${switchErrorMessage} 请先核对当前内核、VM 运行和调度状态，再重试；也可在“恢复服务”中查看诊断。`
-                : `${kernelSwitchSuccess(target, vm.status)}${reclaimPending ? ' CRAG 绑定额度待回收确认；启用槽位回收后，请在内核页重装 cli-node 完成回收。' : ''}`}
+                : deferredStart
+                  ? `本槽已切换到 ${slotKernelLabel(target)}，因${switchResult?.start_error || '运行中的 CRAG 已达上限或尚未激活授权'}暂保持停机。`
+                  : `${kernelSwitchSuccess(target, vm.status)}${reclaimPending ? ' CRAG 绑定额度待回收确认；启用槽位回收后，请在内核页重装 cli-node 完成回收。' : ''}`}
           </AlertDescription>
         </Alert>
       ) : null}

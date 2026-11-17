@@ -404,7 +404,7 @@ test('both Anthropic choices install both packages with a cold standard wrapper'
     assert.equal(saved.crag_kernel_version, dataplane === 'crag' ? 'v2' : undefined)
     if (dataplane) {
       assert.equal(vm.schedulable, false)
-      assert.match(start_error, /激活本槽授权/)
+      assert.equal(start_error, undefined)
     } else assert.equal(start_error, undefined)
     const kin = path.join(root, 'vms', vm.id, 'cli-home', '.kin')
     assert.equal(fs.readFileSync(path.join(kin, 'kin-kernel.bin'), 'utf8'), 'fixture')

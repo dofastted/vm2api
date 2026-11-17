@@ -235,14 +235,14 @@ function projectRootFromExec(exec = {}) {
   return ''
 }
 
-function admitKernelLaunch(exec, start) {
+function admitKernelLaunch(exec, start, { bindSubscription = false } = {}) {
   const vm = exec?.vm
   const { dataplane } = readExistingKernelConfig(rustKernelPaths(exec).configPath)
   const candidate = dataplane === 'crag' && vm ? { ...vm, dataplane } : vm
   return withCragRuntimeAdmission(
     candidate,
     projectRootFromExec(exec),
-    { routing: { inference: { dataplane } } },
+    { routing: { inference: { dataplane } }, ...(bindSubscription ? { bindSubscription: true } : {}) },
     start,
   )
 }
@@ -558,8 +558,13 @@ export function wrapNewerThanKernel(exec) {
   }
 }
 
-export async function restartRustKernel(exec, { timeoutMs = 30000, runDockerExec = runDocker } = {}) {
-  return admitKernelLaunch(exec, () => restartAdmittedRustKernel(exec, { timeoutMs, runDockerExec }))
+export async function restartRustKernel(
+  exec,
+  { timeoutMs = 30000, runDockerExec = runDocker, bindSubscription = false } = {},
+) {
+  return admitKernelLaunch(exec, () => restartAdmittedRustKernel(exec, { timeoutMs, runDockerExec }), {
+    bindSubscription,
+  })
 }
 
 async function restartAdmittedRustKernel(exec, { timeoutMs, runDockerExec }) {

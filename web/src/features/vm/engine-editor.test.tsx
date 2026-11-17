@@ -68,7 +68,7 @@ vi.mock('@tanstack/react-query', async (importOriginal) => ({
       isError: false,
       error: null,
       mutate: vi.fn(),
-      ...(index === 2 ? mocks.mutationState : {}),
+      ...(index === 1 ? mocks.mutationState : {}),
     }
   },
 }))
@@ -138,7 +138,7 @@ function render(overrides: Partial<Vm> = {}) {
 }
 
 function options() {
-  return mocks.mutations[2] as SwitchOptions
+  return mocks.mutations[1] as SwitchOptions
 }
 
 function job(overrides: Partial<VmKernelSwitchJob> = {}): VmKernelSwitchJob {
@@ -685,5 +685,41 @@ describe('VM page kernel switch feedback', () => {
     } finally {
       client.clear()
     }
+  })
+
+  it('never blocks switching to CRAG v2 even when single-slot license is unlicensed, and surfaces deferred_start cleanly', () => {
+    render({ status: 'running' })
+    const switchButton = mocks.buttons.find(
+      (button) => button.children === '本槽切到 CRAG v2'
+    )
+    expect(switchButton?.disabled).toBe(false)
+
+    options().onSuccess(
+      { deferred_start: true, start_error: '运行中的 CRAG 槽位已达订阅上限' },
+      'v2'
+    )
+    expect(mocks.warning).toHaveBeenCalledWith(
+      '本槽已切换到 CRAG v2（暂未启动）',
+      expect.objectContaining({
+        id: 'vm-kernel-switch-vm-01',
+        description: '运行中的 CRAG 槽位已达订阅上限',
+      })
+    )
+
+    mocks.mutationState = {
+      isSuccess: true,
+      variables: 'v2',
+      data: {
+        deferred_start: true,
+        start_error: '运行中的 CRAG 槽位已达订阅上限',
+      },
+    }
+    const deferredHtml = render({
+      status: 'stopped',
+      resolved_dataplane: 'crag',
+      resolved_crag_kernel_version: 'v2',
+    })
+    expect(deferredHtml).toContain('内核切换完成（暂未启动）')
+    expect(deferredHtml).toContain('运行中的 CRAG 槽位已达订阅上限')
   })
 })

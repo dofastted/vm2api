@@ -497,8 +497,9 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, sel
   }
   const verified = verifyCragV2Tree(src)
   if (!verified.ok) return verified
-  // Preinstallation only copies encrypted distribution files. Selecting the entry
-  // still requires authorization, including when those files already exist.
+  // Preinstallation only copies encrypted distribution files; runtime admission
+  // and the encrypted native binary itself enforce licensing on start. Keep refusing
+  // an explicit payload-key downgrade/mismatch against an already installed license.
   if (select) {
     const licensed = checkCragLicense(
       projectRoot,
@@ -506,7 +507,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, sel
       {},
       { preferInstalled: false },
     )
-    if (!licensed.ok) return licensed
+    if (!licensed.ok && licensed.code === 'license_payload_key_mismatch') return licensed
   }
   // The node receives this tree, including native Claude Code, through the CRAG package push.
   if (clusterDockerSlot(vm)) {
