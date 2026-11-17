@@ -78,3 +78,22 @@ export function resolveImportProxy({ vm, proxyPool, overrideUrl = null } = {}) {
   if (fallback) return { ok: true, proxyUrl: fallback, blocked: false, reason: null }
   return { ok: false, proxyUrl: null, blocked: false, reason: 'proxy_required' }
 }
+
+/**
+ * The exit an OAuth exchange leaves through, resolved at the point of use so a
+ * pool reallocation since the panel's own check decides it, never the VM record
+ * snapshot or an authorize session minted up to its TTL ago.
+ *
+ * Throws with the resolver's `reason` as `code`: an unusable exit must not
+ * quietly become the host's direct route.
+ */
+export function resolveSlotOAuthProxy(vm, proxyPool) {
+  const resolved = resolveImportProxy({ vm, proxyPool })
+  if (!resolved.ok) {
+    throw Object.assign(new Error('OAuth requires the target VM bound egress'), {
+      code: resolved.reason || 'proxy_required',
+    })
+  }
+  // '' is local egress (direct); a URL is the bound SOCKS5. Never null here.
+  return resolved.proxyUrl
+}
