@@ -127,9 +127,11 @@ export function preflightFreshClaudeKernels(projectRoot, vm) {
 }
 
 export function seedFreshCliHome(projectRoot, vm, { routing, preinstallBoth = false } = {}) {
-  const written = writeSlotSeedFiles(projectRoot, vm)
+  const host = slotHost(vm)
+  const crag = resolveKernelDataplane(vm, routing) === 'crag'
+  const written = writeSlotSeedFiles(projectRoot, vm, null, { cragNativeTelemetry: crag && !host.native })
   // Cluster payloads go in slot-bin, not the control plane's .kin home.
-  if (!slotHost(vm).bakedKernel) {
+  if (!host.bakedKernel) {
     if (preinstallBoth) {
       const wrap = materializeWrapCli(projectRoot, vm)
       requireKernelResult(wrap)
@@ -140,7 +142,7 @@ export function seedFreshCliHome(projectRoot, vm, { routing, preinstallBoth = fa
       // Wrap already stages the encrypted CRAG package for local KVM slots.
       if (!isKvmRuntime(vm)) requireKernelResult(materializeCragV2(projectRoot, vm, { select: false }))
     } else {
-      const required = resolveKernelDataplane(vm, routing) === 'crag' || (isKvmRuntime(vm) && !isCodexVm(vm))
+      const required = crag || (isKvmRuntime(vm) && !isCodexVm(vm))
       try {
         const laid = materializeResolvedKernel(projectRoot, vm, { routing })
         if (required) requireKernelResult(laid)

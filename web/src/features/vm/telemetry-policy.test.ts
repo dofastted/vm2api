@@ -1,8 +1,11 @@
-import type { VmTelemetryState } from '@/types/panel-vm'
+import type { CragTelemetryState, VmTelemetryState } from '@/types/panel-vm'
 import { describe, expect, it } from 'vitest'
 import { telemetryLive } from './seed-settings'
 import { telemetryEnabled, telemetrySeedFlags } from './telemetry-policy'
-import { telemetryPolicyConfirmed } from './telemetry-status'
+import {
+  telemetryPolicyConfirmed,
+  telemetryStatusLabel,
+} from './telemetry-status'
 
 describe('telemetry reads one bit', () => {
   it('is on only when telemetry_disabled is false', () => {
@@ -72,5 +75,22 @@ describe('native policy acknowledgment', () => {
     expect(
       telemetryPolicyConfirmed(observed({ state: 'unsupported' }), false)
     ).toBe(false)
+  })
+
+  it('shows CRAG policy acknowledgment without claiming upload or queue state', () => {
+    const crag: CragTelemetryState = {
+      state: 'launch_policy',
+      enabled: true,
+      error: null,
+      upload_confirmed: false,
+    }
+    expect(telemetryPolicyConfirmed(crag, true)).toBe(true)
+    expect(telemetryStatusLabel(crag, true)).toContain('未验证上传')
+    const disabled = { ...crag, enabled: false }
+    expect(telemetryPolicyConfirmed(disabled, false)).toBe(true)
+    expect(telemetryStatusLabel(disabled, false)).not.toContain('队列')
+    const pending = { ...crag, enabled: null, error: '需要重启' }
+    expect(telemetryPolicyConfirmed(pending, false)).toBe(false)
+    expect(telemetryStatusLabel(pending, true)).toBe('需要重启')
   })
 })

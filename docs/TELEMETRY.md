@@ -138,20 +138,24 @@ single-VM and bulk controls can republish an unconfirmed, already-saved policy.
 ### CRAG native Claude launch policy
 
 CRAG uses a separate Unix-socket control route, not the queue/ACK protocol
-above. For a running CRAG slot whose authenticated health advertises
-`crag_telemetry_apply_v1`, the panel publishes the guest seed files. When
-enabling, it omits `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` from the official
-`settings.json`. Other kernels retain their existing settings policy.
+above. `kin-seed.json` explicitly opts in with `seed_policy.telemetry_disabled:
+false`. The panel writes the guest's `CLAUDE_CONFIG_DIR/settings.json` alongside
+it. On enable it removes `DISABLE_TELEMETRY`, `CLAUDE_CODE_DISABLE_TELEMETRY`,
+`DO_NOT_TRACK`, and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`; on disable it
+writes the kill switches. Other kernels retain their existing settings policy.
 
 The panel checks `POST /internal/v1/telemetry/apply` and, only on a restart-required
 response, uses slot maintenance to drain requests, restart the selected CRAG
 kernel, verify again and restore the scheduling intent. Active native work or
 an unavailable worker remains unconfirmed. Stopped slots are not started.
-`scope: "native_claude_launch"` and `upload_confirmed: false` distinguish this
-result from a running sender or queue acknowledgement. The managed upload
-interval is not applied to CRAG's official Claude process. The currently pinned
-CRAG artifact requires a capability-bearing replacement before this path can
-confirm policy on a deployed slot.
+
+The telemetry page's recheck reads the running worker's authenticated policy
+without republishing configuration or restarting anything. It requires
+`crag_telemetry_apply_v1` (available in CRAG 3.1.4) and shows an unconfirmed
+state when the running worker cannot attest the saved policy. A successful
+check reports `upload_confirmed: false`: it does not attest a running sender,
+an emptied queue, or network delivery. The managed upload interval is not
+applied to CRAG's official Claude process.
 
 ### Official initialization
 
