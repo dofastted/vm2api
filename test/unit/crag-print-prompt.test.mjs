@@ -554,3 +554,21 @@ test('an agent summary leaves no unpaired tool_use for CRAG (history tool_result
   )
   assert.equal(answered.length, 0)
 })
+
+test('summary cleanup turns ToolSearch tool_reference results into text', () => {
+  const body = agentBody({ summary: true })
+  const current = body.messages[2].content[0]
+  current.content = [{ type: 'tool_reference', tool_name: 'Monitor' }]
+  const before = structuredClone(body)
+  const out = prepareCragPrintBody(body, { agentSummary: true, officialPassthrough: true, foldSystemMessages: false })
+  const blocks = out.messages[2].content
+  // CRAG rejects a top-level tool_reference as "unsupported native history block".
+  assert.ok(blocks.every((block) => block.type === 'text'))
+  assert.deepEqual(blocks.slice(0, 2), [
+    { type: 'text', text: `[tool result ${current.tool_use_id}]` },
+    { type: 'text', text: '[tool_reference Monitor]' },
+  ])
+  assert.deepEqual(body, before)
+  // Outside a summary fork the live tool_reference continuation is untouched.
+  assert.deepEqual(prepareCragPrintBody(body, { foldSystemMessages: false }).messages, before.messages)
+})
