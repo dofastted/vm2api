@@ -1,11 +1,11 @@
 import type { JevScopeAccount } from '@/types/panel-routing'
 import type { UsageLogRow } from '@/types/panel-usage-logs'
 
-/** Gate order matches `evaluateProtocolIntercept`: cheap rules first, the model last. */
-export type StageId = 'distill' | 'hard-regex' | 'refusal' | 'jev'
-export type ViewKey = 'all' | StageId | 'pass'
+export type PreflightRule = 'distill' | 'hard-regex' | 'refusal'
+export type StageId = PreflightRule | 'jev'
+export type RiskView = 'preflight' | 'jev' | 'status'
 
-export const STAGES: { id: StageId; name: string; does: string }[] = [
+export const PREFLIGHT_RULES = [
   {
     id: 'distill',
     name: '蒸馏',
@@ -14,24 +14,32 @@ export const STAGES: { id: StageId; name: string; does: string }[] = [
   {
     id: 'hard-regex',
     name: '硬正则',
-    does: '检查系统提示词改写、禁用工具及类别正则，命中不出站。',
+    does: '按类别和自定义正则拦截。系统提示词改写与禁用工具规则始终单独检查。',
   },
   {
     id: 'refusal',
-    name: '拒答缓存',
-    does: '已封设备／会话，以及上游拒过的相同或近似正文，返回不可重试的 400。',
+    name: '拒答与封禁',
+    does: '配置拒答指纹、设备和会话封禁、禁用工具与上游拒答短语。',
   },
-  {
-    id: 'jev',
-    name: '决策模型',
-    does: '仅审核用户会话和可读取的内联文件文本，按评分拒绝、降级或常规放行。',
-  },
-]
+] as const
 
-export const VIEW_KEYS: ViewKey[] = ['all', ...STAGES.map((s) => s.id), 'pass']
+export function isPreflightRule(value: unknown): value is PreflightRule {
+  return PREFLIGHT_RULES.some((rule) => rule.id === value)
+}
 
-export function isViewKey(value: unknown): value is ViewKey {
-  return typeof value === 'string' && VIEW_KEYS.includes(value as ViewKey)
+export function riskSearch(search: Record<string, unknown>): {
+  view?: RiskView
+  rule?: PreflightRule
+} {
+  if (isPreflightRule(search.view))
+    return { view: 'preflight', rule: search.view }
+  if (search.view === 'preflight') {
+    return {
+      view: 'preflight',
+      rule: isPreflightRule(search.rule) ? search.rule : 'distill',
+    }
+  }
+  return { view: search.view === 'jev' ? 'jev' : 'status' }
 }
 
 export const PASS_REASONS: Record<string, { label: string; hint: string }> = {

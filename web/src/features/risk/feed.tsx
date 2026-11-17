@@ -7,7 +7,7 @@ const KIND_NAME: Record<FeedKind, string> = {
   distill: '蒸馏',
   'hard-regex': '硬正则',
   refusal: '拒答缓存',
-  jev: '决策模型',
+  jev: 'Jev',
   upstream: '上游拒答',
 }
 

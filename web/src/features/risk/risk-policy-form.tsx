@@ -65,20 +65,26 @@ const TOOL_OPTIONS = [
 const TOOL_DENIAL = '请求包含当前策略禁用的工具。'
 
 export function RiskPolicyForm({
+  section,
   value,
   pending,
   onSave,
   onDirtyChange,
 }: {
+  section: 'preflight' | 'jev'
   value: RiskAuditPolicy
   pending: boolean
   onSave: (value: RiskAuditPolicy) => void
   onDirtyChange: (dirty: boolean) => void
 }) {
   const [draft, setDraft] = useState(value)
-  const pools = useQuery(vmPoolsQueryOptions())
-  const endpoints = useQuery(apiEndpointsQueryOptions())
-  const models = useQuery(modelsQueryOptions())
+  const isRouting = section === 'jev'
+  const pools = useQuery({ ...vmPoolsQueryOptions(), enabled: isRouting })
+  const endpoints = useQuery({
+    ...apiEndpointsQueryOptions(),
+    enabled: isRouting,
+  })
+  const models = useQuery({ ...modelsQueryOptions(), enabled: isRouting })
   const channels = endpoints.data?.items ?? []
   const catalog = models.data?.data ?? models.data?.items ?? []
   const dirty = JSON.stringify(draft) !== JSON.stringify(value)
@@ -106,8 +112,12 @@ export function RiskPolicyForm({
 
   return (
     <Group
-      title='封禁、工具与降级策略'
-      hint='从现有配置中选择目标；不选目标就保留常规路由。'
+      title={isRouting ? '降级策略' : '封禁与工具策略'}
+      hint={
+        isRouting
+          ? '从现有配置中选择目标；不选目标就保留常规路由。'
+          : '分级封禁、禁用工具和上游拒答短语需保存。'
+      }
     >
       <form
         className='min-w-0 space-y-5'
@@ -127,280 +137,291 @@ export function RiskPolicyForm({
         }}
       >
         <fieldset disabled={pending} className='min-w-0 space-y-5'>
-          <Group
-            title='降级目标'
-            hint='账号池用于 OAuth 槽位，API 渠道用于 API 密钥。模型优先判定；仍受同平台及密钥授权限制。'
-          >
-            <div className='grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-3'>
-              <PolicyPicker
-                label='降级账号池（分组）'
-                options={poolOptions(pools.data?.pools ?? [])}
-                value={draft.downgrade_pool}
-                onChange={(next) => change('downgrade_pool', next)}
-                loading={pools.isPending}
-                error={pools.isError}
-              />
-              <PolicyPicker
-                label='降级 API 渠道'
-                options={endpointOptions(channels)}
-                value={draft.downgrade_endpoint}
-                onChange={(next) => change('downgrade_endpoint', next)}
-                loading={endpoints.isPending}
-                error={endpoints.isError}
-              />
-              <PolicyPicker
-                label='降级模型'
-                options={modelOptions(catalog, channels)}
-                value={draft.downgrade_model}
-                onChange={(next) => change('downgrade_model', next)}
-                loading={models.isPending || endpoints.isPending}
-                error={models.isError || endpoints.isError}
-              />
-            </div>
-            <div className='grid gap-3 sm:grid-cols-2'>
-              <PresetNumber
-                label='路线降级最大安全分差'
-                value={draft.route_margin}
-                options={[
-                  [0.05, '0.05'],
-                  [0.1, '0.10'],
-                  [0.15, '0.15（默认）'],
-                  [0.2, '0.20'],
-                ]}
-                min={0}
-                max={1}
-                step='any'
-                onChange={(next) => change('route_margin', next)}
-              />
-              <PresetNumber
-                label='模型降级最大安全分差'
-                value={draft.model_margin}
-                options={[
-                  [0.01, '0.01'],
-                  [0.03, '0.03'],
-                  [0.05, '0.05（默认）'],
-                  [0.1, '0.10'],
-                ]}
-                min={0}
-                max={1}
-                step='any'
-                onChange={(next) => change('model_margin', next)}
-              />
-            </div>
-            {!validMargins && (
-              <p className='text-xs text-destructive' role='alert'>
-                模型分差不能大于路线分差。
-              </p>
-            )}
-          </Group>
-
-          <Group
-            title='分级封禁'
-            hint='按违规次数从短到长；最后一级为永久。会话始终单独封禁。'
-            action={
-              <Button
-                type='button'
-                size='sm'
-                variant='ghost'
-                className='cursor-pointer'
-                onClick={() => change('ban_steps', [10, 1440, 0])}
-              >
-                恢复默认阶梯
-              </Button>
-            }
-          >
-            <div className='grid items-start gap-3 sm:grid-cols-2 xl:grid-cols-3'>
-              {draft.ban_steps.slice(0, -1).map((minutes, index) => (
-                <div key={index} className='flex min-w-0 items-end gap-1'>
-                  <PresetNumber
-                    label={`第 ${index + 1} 次违规`}
-                    value={minutes}
-                    options={BAN_DURATIONS}
-                    min={1}
-                    max={525600}
-                    step={1}
-                    onChange={(next) =>
-                      change(
-                        'ban_steps',
-                        draft.ban_steps.map((previous, position) =>
-                          position === index ? next : previous
-                        )
-                      )
-                    }
-                  />
-                  <RemoveButton
-                    label={`删除第 ${index + 1} 级封禁`}
-                    onClick={() =>
-                      change(
-                        'ban_steps',
-                        draft.ban_steps.filter(
-                          (_, position) => position !== index
-                        )
-                      )
-                    }
-                  />
-                </div>
-              ))}
-              <div className='space-y-2'>
-                <p className='text-sm leading-none font-medium'>
-                  第 {draft.ban_steps.length} 次违规
-                </p>
-                <p className='flex h-9 items-center rounded-md border bg-muted/40 px-3 text-sm'>
-                  永久封禁
-                </p>
-              </div>
-            </div>
-            {!validSteps && (
-              <p className='text-xs text-destructive' role='alert'>
-                封禁时长必须逐级增加。
-              </p>
-            )}
-            <Button
-              type='button'
-              size='sm'
-              variant='outline'
-              className='cursor-pointer'
-              disabled={draft.ban_steps.length >= 10 || lastTimedBan >= 525600}
-              onClick={() => {
-                const next =
-                  BAN_DURATIONS.find(
-                    ([minutes]) => minutes > lastTimedBan
-                  )?.[0] ?? Math.min(525600, lastTimedBan * 2)
-                change('ban_steps', [...draft.ban_steps.slice(0, -1), next, 0])
-              }}
+          {isRouting ? (
+            <Group
+              title='降级目标'
+              hint='账号池用于 OAuth 槽位，API 渠道用于 API 密钥。模型优先判定；仍受同平台及密钥授权限制。'
             >
-              <Plus /> 添加一级
-            </Button>
-          </Group>
-
-          <Group
-            title='禁用工具'
-            hint='可添加多个精确工具名。常用工具可直接选择，其他客户端和 MCP 工具可自定义。'
-          >
-            <ToolPicker
-              selected={draft.blocked_tools.map((tool) =>
-                tool.name.toLowerCase()
+              <div className='grid min-w-0 gap-3 sm:grid-cols-2 xl:grid-cols-3'>
+                <PolicyPicker
+                  label='降级账号池（分组）'
+                  options={poolOptions(pools.data?.pools ?? [])}
+                  value={draft.downgrade_pool}
+                  onChange={(next) => change('downgrade_pool', next)}
+                  loading={pools.isPending}
+                  error={pools.isError}
+                />
+                <PolicyPicker
+                  label='降级 API 渠道'
+                  options={endpointOptions(channels)}
+                  value={draft.downgrade_endpoint}
+                  onChange={(next) => change('downgrade_endpoint', next)}
+                  loading={endpoints.isPending}
+                  error={endpoints.isError}
+                />
+                <PolicyPicker
+                  label='降级模型'
+                  options={modelOptions(catalog, channels)}
+                  value={draft.downgrade_model}
+                  onChange={(next) => change('downgrade_model', next)}
+                  loading={models.isPending || endpoints.isPending}
+                  error={models.isError || endpoints.isError}
+                />
+              </div>
+              <div className='grid gap-3 sm:grid-cols-2'>
+                <PresetNumber
+                  label='路线降级最大安全分差'
+                  value={draft.route_margin}
+                  options={[
+                    [0.05, '0.05'],
+                    [0.1, '0.10'],
+                    [0.15, '0.15（默认）'],
+                    [0.2, '0.20'],
+                  ]}
+                  min={0}
+                  max={1}
+                  step='any'
+                  onChange={(next) => change('route_margin', next)}
+                />
+                <PresetNumber
+                  label='模型降级最大安全分差'
+                  value={draft.model_margin}
+                  options={[
+                    [0.01, '0.01'],
+                    [0.03, '0.03'],
+                    [0.05, '0.05（默认）'],
+                    [0.1, '0.10'],
+                  ]}
+                  min={0}
+                  max={1}
+                  step='any'
+                  onChange={(next) => change('model_margin', next)}
+                />
+              </div>
+              {!validMargins && (
+                <p className='text-xs text-destructive' role='alert'>
+                  模型分差不能大于路线分差。
+                </p>
               )}
-              onAdd={(name) =>
-                change('blocked_tools', [
-                  ...draft.blocked_tools,
-                  { name, message: TOOL_DENIAL },
-                ])
-              }
-            />
-            {draft.blocked_tools.length > 0 && (
-              <ul className='divide-y rounded-md border'>
-                {draft.blocked_tools.map((tool, index) => (
-                  <li
-                    key={index}
-                    className='grid items-center gap-2 p-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)_auto]'
+            </Group>
+          ) : (
+            <>
+              <Group
+                title='分级封禁'
+                hint='按违规次数从短到长；最后一级为永久。会话始终单独封禁。'
+                action={
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant='ghost'
+                    className='cursor-pointer'
+                    onClick={() => change('ban_steps', [10, 1440, 0])}
                   >
-                    <code className='text-xs break-all'>{tool.name}</code>
-                    <div className='flex items-center gap-1 sm:contents'>
-                      <Input
-                        aria-label={`${tool.name} 的拒绝提示`}
-                        required
-                        maxLength={240}
-                        value={tool.message}
-                        onChange={(event) =>
+                    恢复默认阶梯
+                  </Button>
+                }
+              >
+                <div className='grid items-start gap-3 sm:grid-cols-2 xl:grid-cols-3'>
+                  {draft.ban_steps.slice(0, -1).map((minutes, index) => (
+                    <div key={index} className='flex min-w-0 items-end gap-1'>
+                      <PresetNumber
+                        label={`第 ${index + 1} 次违规`}
+                        value={minutes}
+                        options={BAN_DURATIONS}
+                        min={1}
+                        max={525600}
+                        step={1}
+                        onChange={(next) =>
                           change(
-                            'blocked_tools',
-                            draft.blocked_tools.map((item, position) =>
-                              position === index
-                                ? { ...item, message: event.target.value }
-                                : item
+                            'ban_steps',
+                            draft.ban_steps.map((previous, position) =>
+                              position === index ? next : previous
                             )
                           )
                         }
                       />
                       <RemoveButton
-                        label={`移除工具 ${tool.name}`}
+                        label={`删除第 ${index + 1} 级封禁`}
                         onClick={() =>
                           change(
-                            'blocked_tools',
-                            draft.blocked_tools.filter(
+                            'ban_steps',
+                            draft.ban_steps.filter(
                               (_, position) => position !== index
                             )
                           )
                         }
                       />
                     </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-            {!validTools && (
-              <p className='text-xs text-destructive' role='alert'>
-                每条工具规则都需要拒绝提示。
-              </p>
-            )}
-          </Group>
-
-          <details
-            className='rounded-md border px-3 py-2.5'
-            open={value.upstream_policy_phrases.length > 0}
-          >
-            <summary className='cursor-pointer text-sm font-medium focus-visible:outline-ring'>
-              高级：自定义上游拒答短语
-            </summary>
-            <div className='mt-3 space-y-2'>
-              <p className='text-xs leading-5 text-muted-foreground'>
-                明确的 Usage
-                Policy、内容拒答和会话被标记已自动识别。仅补充实际观察到的特定短语，不要填通用
-                400 或 API Error。
-              </p>
-              {draft.upstream_policy_phrases.map((phrase, index) => (
-                <div key={index} className='flex items-center gap-1'>
-                  <Input
-                    aria-label={`第 ${index + 1} 条上游拒答短语`}
-                    minLength={6}
-                    maxLength={120}
-                    required
-                    value={phrase}
-                    onChange={(event) =>
-                      change(
-                        'upstream_policy_phrases',
-                        draft.upstream_policy_phrases.map((item, position) =>
-                          position === index ? event.target.value : item
-                        )
-                      )
-                    }
-                  />
-                  <RemoveButton
-                    label={`移除第 ${index + 1} 条短语`}
-                    onClick={() =>
-                      change(
-                        'upstream_policy_phrases',
-                        draft.upstream_policy_phrases.filter(
-                          (_, position) => position !== index
-                        )
-                      )
-                    }
-                  />
+                  ))}
+                  <div className='space-y-2'>
+                    <p className='text-sm leading-none font-medium'>
+                      第 {draft.ban_steps.length} 次违规
+                    </p>
+                    <p className='flex h-9 items-center rounded-md border bg-muted/40 px-3 text-sm'>
+                      永久封禁
+                    </p>
+                  </div>
                 </div>
-              ))}
-              {!validPhrases && (
-                <p className='text-xs text-destructive' role='alert'>
-                  请输入至少 6 个字符的具体拒答短语。
-                </p>
-              )}
-              <Button
-                type='button'
-                size='sm'
-                variant='outline'
-                className='cursor-pointer'
-                disabled={draft.upstream_policy_phrases.length >= 30}
-                onClick={() =>
-                  change('upstream_policy_phrases', [
-                    ...draft.upstream_policy_phrases,
-                    '',
-                  ])
-                }
+                {!validSteps && (
+                  <p className='text-xs text-destructive' role='alert'>
+                    封禁时长必须逐级增加。
+                  </p>
+                )}
+                <Button
+                  type='button'
+                  size='sm'
+                  variant='outline'
+                  className='cursor-pointer'
+                  disabled={
+                    draft.ban_steps.length >= 10 || lastTimedBan >= 525600
+                  }
+                  onClick={() => {
+                    const next =
+                      BAN_DURATIONS.find(
+                        ([minutes]) => minutes > lastTimedBan
+                      )?.[0] ?? Math.min(525600, lastTimedBan * 2)
+                    change('ban_steps', [
+                      ...draft.ban_steps.slice(0, -1),
+                      next,
+                      0,
+                    ])
+                  }}
+                >
+                  <Plus /> 添加一级
+                </Button>
+              </Group>
+
+              <Group
+                title='禁用工具'
+                hint='可添加多个精确工具名。常用工具可直接选择，其他客户端和 MCP 工具可自定义。'
               >
-                <Plus /> 添加短语
-              </Button>
-            </div>
-          </details>
+                <ToolPicker
+                  selected={draft.blocked_tools.map((tool) =>
+                    tool.name.toLowerCase()
+                  )}
+                  onAdd={(name) =>
+                    change('blocked_tools', [
+                      ...draft.blocked_tools,
+                      { name, message: TOOL_DENIAL },
+                    ])
+                  }
+                />
+                {draft.blocked_tools.length > 0 && (
+                  <ul className='divide-y rounded-md border'>
+                    {draft.blocked_tools.map((tool, index) => (
+                      <li
+                        key={index}
+                        className='grid items-center gap-2 p-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)_auto]'
+                      >
+                        <code className='text-xs break-all'>{tool.name}</code>
+                        <div className='flex items-center gap-1 sm:contents'>
+                          <Input
+                            aria-label={`${tool.name} 的拒绝提示`}
+                            required
+                            maxLength={240}
+                            value={tool.message}
+                            onChange={(event) =>
+                              change(
+                                'blocked_tools',
+                                draft.blocked_tools.map((item, position) =>
+                                  position === index
+                                    ? { ...item, message: event.target.value }
+                                    : item
+                                )
+                              )
+                            }
+                          />
+                          <RemoveButton
+                            label={`移除工具 ${tool.name}`}
+                            onClick={() =>
+                              change(
+                                'blocked_tools',
+                                draft.blocked_tools.filter(
+                                  (_, position) => position !== index
+                                )
+                              )
+                            }
+                          />
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {!validTools && (
+                  <p className='text-xs text-destructive' role='alert'>
+                    每条工具规则都需要拒绝提示。
+                  </p>
+                )}
+              </Group>
+
+              <details
+                className='rounded-md border px-3 py-2.5'
+                open={value.upstream_policy_phrases.length > 0}
+              >
+                <summary className='cursor-pointer text-sm font-medium focus-visible:outline-ring'>
+                  高级：自定义上游拒答短语
+                </summary>
+                <div className='mt-3 space-y-2'>
+                  <p className='text-xs leading-5 text-muted-foreground'>
+                    明确的 Usage
+                    Policy、内容拒答和会话被标记已自动识别。仅补充实际观察到的特定短语，不要填通用
+                    400 或 API Error。
+                  </p>
+                  {draft.upstream_policy_phrases.map((phrase, index) => (
+                    <div key={index} className='flex items-center gap-1'>
+                      <Input
+                        aria-label={`第 ${index + 1} 条上游拒答短语`}
+                        minLength={6}
+                        maxLength={120}
+                        required
+                        value={phrase}
+                        onChange={(event) =>
+                          change(
+                            'upstream_policy_phrases',
+                            draft.upstream_policy_phrases.map(
+                              (item, position) =>
+                                position === index ? event.target.value : item
+                            )
+                          )
+                        }
+                      />
+                      <RemoveButton
+                        label={`移除第 ${index + 1} 条短语`}
+                        onClick={() =>
+                          change(
+                            'upstream_policy_phrases',
+                            draft.upstream_policy_phrases.filter(
+                              (_, position) => position !== index
+                            )
+                          )
+                        }
+                      />
+                    </div>
+                  ))}
+                  {!validPhrases && (
+                    <p className='text-xs text-destructive' role='alert'>
+                      请输入至少 6 个字符的具体拒答短语。
+                    </p>
+                  )}
+                  <Button
+                    type='button'
+                    size='sm'
+                    variant='outline'
+                    className='cursor-pointer'
+                    disabled={draft.upstream_policy_phrases.length >= 30}
+                    onClick={() =>
+                      change('upstream_policy_phrases', [
+                        ...draft.upstream_policy_phrases,
+                        '',
+                      ])
+                    }
+                  >
+                    <Plus /> 添加短语
+                  </Button>
+                </div>
+              </details>
+            </>
+          )}
         </fieldset>
 
         <div className='flex flex-wrap items-center gap-2 border-t pt-3'>
