@@ -254,10 +254,7 @@ test('Responses output keeps tool call IDs, custom arguments, namespace and sign
             type: 'function',
             name: 'calculate',
             parameters: {
-              oneOf: [
-                { type: 'object', properties: { expr: { type: 'string' } }, required: ['expr'] },
-                { type: 'object', properties: { n: { type: 'integer' } }, required: ['n'] },
-              ],
+              oneOf: [{ type: 'object', properties: { expr: { type: 'string' } }, required: ['expr'] }],
             },
           },
         ],
@@ -271,8 +268,32 @@ test('Responses output keeps tool call IDs, custom arguments, namespace and sign
   )
   assert.deepEqual(claude.tools.at(-1).input_schema, {
     type: 'object',
-    properties: { expr: { type: 'string' }, n: { type: 'integer' } },
+    properties: { expr: { type: 'string' } },
+    required: ['expr'],
   })
+})
+
+test('Responses rejects root alternatives that cannot keep their input constraints', () => {
+  assert.throws(
+    () =>
+      toClaudeMessages('openai.responses', {
+        model: 'claude-sonnet-5-5',
+        input: 'sample',
+        tools: [
+          {
+            type: 'function',
+            name: 'lookup',
+            parameters: {
+              oneOf: [
+                { type: 'object', required: ['path'], properties: { path: { type: 'string' } } },
+                { type: 'object', required: ['id'], properties: { id: { type: 'integer' } } },
+              ],
+            },
+          },
+        ],
+      }),
+    (error) => error.status === 400 && error.body.error.param === 'tools[0].parameters',
+  )
 })
 
 test('Responses rejects dangling calls, foreign references and invalid arguments before conversion can dispatch', () => {

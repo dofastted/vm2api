@@ -1204,17 +1204,17 @@ export function createHandleProtocol(deps) {
       (protocol === 'anthropic.messages' && inferenceBackend !== 'api') || protocol === 'openai.responses'
     const cragSystem = projectCallerSystem(ctx.body.system, callerEnvironment)
     const hasCragSystem = cragSystem !== ctx.body.system
-    if (!apiOpenAI && !requestContext && !officialPassthrough) {
-      const standard = toStandardAnthropicBody(ctx.body, {
-        official: officialTraffic === true,
-        rewriteTools: getRouting()?.compatibility?.tool_name_rewrite !== false,
-        preserveToolNames: deferToolNameRewrite,
-        reuseCanonicalHistory: inferenceBackend !== 'api',
-      })
-      ctx.body = standard.body
-      inboundToolReverse = standard.reverse
-    }
     try {
+      if (!apiOpenAI && !requestContext && !officialPassthrough) {
+        const standard = toStandardAnthropicBody(ctx.body, {
+          official: officialTraffic === true,
+          rewriteTools: getRouting()?.compatibility?.tool_name_rewrite !== false,
+          preserveToolNames: deferToolNameRewrite,
+          reuseCanonicalHistory: inferenceBackend !== 'api',
+        })
+        ctx.body = standard.body
+        inboundToolReverse = standard.reverse
+      }
       validateBetweenToolsThinking(ctx.body)
       validateToolChoice(ctx.body)
     } catch (error) {

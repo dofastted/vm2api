@@ -24,7 +24,8 @@ import { openaiReasoningToClaudeThinking, claudeThinkingToOpenAIReasoning } from
 import { openaiContentToClaudeContent, openaiImagePartToClaude } from './images.mjs'
 import { remapCodexTools } from './codex-tools.mjs'
 import { ensureOutputConfigSchema } from './request-rectifier.mjs'
-import { CLAUDE_WEB_SEARCH_TOOL, isWebSearchTool } from './web-search.mjs'
+import { CLAUDE_WEB_SEARCH_TOOL, isVersionedAnthropicServerTool, isWebSearchTool } from './web-search.mjs'
+import { normalizeToolInputSchema } from './tool-input-schema.mjs'
 import {
   extractOpenaiUsage,
   isOpenaiWireUsage,
@@ -76,19 +77,25 @@ function contentToText(content) {
   return content?.text || ''
 }
 
-/** OpenAI tools → Claude tools. Server search maps to web_search_20250305; function tools stay client tools. */
+function appendCompatibleServerTool(out, tool) {
+  if (isVersionedAnthropicServerTool(tool)) {
+    const defaultIndex = /^web_search_\d{8}$/.test(tool.type) ? out.indexOf(CLAUDE_WEB_SEARCH_TOOL) : -1
+    if (defaultIndex < 0) out.push(tool)
+    else out[defaultIndex] = tool
+    return true
+  }
+  if (['function', 'custom'].includes(tool?.type) || !isWebSearchTool(tool)) return false
+  if (!out.some(isWebSearchTool)) out.push(CLAUDE_WEB_SEARCH_TOOL)
+  return true
+}
+
+/** OpenAI tools → Claude tools. Native definitions take precedence over OpenAI search aliases. */
 export function openaiToolsToClaude(tools) {
   if (!Array.isArray(tools) || !tools.length) return undefined
-  const seenSearch = new Set()
   const out = []
   for (const t of remapCodexTools(tools)) {
     if (!t) continue
-    if (isWebSearchTool(t)) {
-      if (seenSearch.has('web_search')) continue
-      seenSearch.add('web_search')
-      out.push({ ...CLAUDE_WEB_SEARCH_TOOL })
-      continue
-    }
+    if (appendCompatibleServerTool(out, t)) continue
     if (!(t.type === 'function' || t.function || t.name)) continue
     if (t.type === 'function' && t.function) {
       if (!t.function.name) continue
@@ -455,55 +462,14 @@ function responsesToolName(tool) {
   return `${name.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 46)}_${hash}`
 }
 
-function responsesObjectSchema(schema) {
-  if (!schema || typeof schema !== 'object' || Array.isArray(schema) || (schema.type && schema.type !== 'object')) {
-    invalidResponses('tools.parameters', 'expected an object schema')
-  }
-  const out = { ...schema, type: 'object' }
-  for (const key of ['allOf', 'oneOf', 'anyOf']) {
-    const variants = out[key]
-    if (variants == null) continue
-    if (!Array.isArray(variants) || !variants.length || variants.some((branch) => branch?.type !== 'object')) {
-      invalidResponses('tools.parameters', 'root schema combinations must contain object schemas')
-    }
-    const branches = variants.map(responsesObjectSchema)
-    const properties = { ...out.properties }
-    const keys = new Set(branches.flatMap((branch) => Object.keys(branch.properties || {})))
-    for (const name of keys) {
-      const definitions = branches.flatMap((branch) =>
-        Object.hasOwn(branch.properties || {}, name) ? [branch.properties[name]] : [],
-      )
-      if (!Object.hasOwn(properties, name)) {
-        const unique = [...new Map(definitions.map((definition) => [JSON.stringify(definition), definition])).values()]
-        Object.defineProperty(properties, name, {
-          value: unique.length === 1 ? unique[0] : { [key === 'allOf' ? 'allOf' : 'anyOf']: unique },
-          enumerable: true,
-        })
-      }
-    }
-    const required = branches.flatMap((branch) => (Array.isArray(branch.required) ? branch.required : []))
-    const shared =
-      key === 'allOf'
-        ? required
-        : required.filter((name) => branches.every((branch) => branch.required?.includes(name)))
-    if (shared.length) out.required = [...new Set([...(out.required || []), ...shared])]
-    out.properties = properties
-    delete out[key]
-  }
-  return out
-}
-
 function responsesToClaude(body, opts) {
   if (body.previous_response_id != null || body.conversation != null) {
     invalidResponses('input', 'provide full input history instead of a remote response or conversation reference')
   }
   const responseTools = new Map()
   const tools = []
-  const addTool = (tool, namespace, discovered = false) => {
-    if (isWebSearchTool(tool) && !['function', 'custom'].includes(tool.type)) {
-      if (!tools.some((entry) => entry.name === CLAUDE_WEB_SEARCH_TOOL.name)) tools.push({ ...CLAUDE_WEB_SEARCH_TOOL })
-      return
-    }
+  const addTool = (tool, namespace, path, discovered) => {
+    if (appendCompatibleServerTool(tools, tool)) return
     const search = tool?.type === 'tool_search' && tool.execution === 'client'
     const definition = search
       ? { ...tool, name: 'tool_search' }
@@ -543,7 +509,11 @@ function responsesToClaude(body, opts) {
             required: ['input'],
             additionalProperties: false,
           }
-        : responsesObjectSchema(definition.parameters ?? { type: 'object' })
+        : normalizeToolInputSchema(definition.parameters ?? { type: 'object' })
+    if (!schema) {
+      const param = definition === tool.function ? `${path}.function.parameters` : `${path}.parameters`
+      invalidResponses(param, 'must be an object schema without unsupported root combinations')
+    }
     responseTools.set(name, { type: tool.type, name: definition.name, namespace: scope })
     tools.push(
       withEagerInputStreaming(
@@ -561,19 +531,22 @@ function responsesToClaude(body, opts) {
     )
     return name
   }
-  const addTools = (source, discovered) => {
-    if (!Array.isArray(source)) invalidResponses('tools', 'must be an array')
+  const addTools = (source, path, discovered = false) => {
+    if (!Array.isArray(source)) invalidResponses(path, 'must be an array')
     return source
-      .flatMap((tool) => {
-        if (tool?.type !== 'namespace') return [addTool(tool, undefined, discovered)]
+      .flatMap((tool, index) => {
+        const toolPath = `${path}[${index}]`
+        if (tool?.type !== 'namespace') return [addTool(tool, undefined, toolPath, discovered)]
         if (typeof tool.name !== 'string' || !tool.name || !Array.isArray(tool.tools)) {
           invalidResponses('tools', 'namespace must have a name and tools')
         }
-        return tool.tools.map((child) => addTool(child, tool.name, discovered))
+        return tool.tools.map((child, childIndex) =>
+          addTool(child, tool.name, `${toolPath}.tools[${childIndex}]`, discovered),
+        )
       })
       .filter(Boolean)
   }
-  if (body.tools != null) addTools(body.tools)
+  if (body.tools != null) addTools(body.tools, 'tools')
   if (body.instructions != null && typeof body.instructions !== 'string') {
     invalidResponses('instructions', 'must be text')
   }
@@ -623,7 +596,12 @@ function responsesToClaude(body, opts) {
     if (['function_call_output', 'custom_tool_call_output', 'tool_search_output'].includes(item.type)) {
       const content =
         item.type === 'tool_search_output'
-          ? [{ type: 'text', text: `Tools now available: ${addTools(item.tools ?? [], true).join(', ') || '(none)'}` }]
+          ? [
+              {
+                type: 'text',
+                text: `Tools now available: ${addTools(item.tools ?? [], `${param}.tools`, true).join(', ') || '(none)'}`,
+              },
+            ]
           : responsesContent(item.output, `${param}.output`)
       messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: item.call_id, content }] })
       continue
