@@ -205,3 +205,15 @@ test('slot scheduling tier honors Pro rate veto and profile precedence', () => {
     'max',
   )
 })
+
+test('fableRequiresMax keeps Fable off pro slots and leaves other models alone', () => {
+  const pro = { claude: { account_tier: 'pro', account_tier_source: 'profile' }, policy: {} }
+  const max = { claude: { account_tier: 'max', account_tier_source: 'profile' }, policy: {} }
+  assert.deepEqual(slotAllowsModel({ vm: pro, model: 'claude-fable-5-2' }), { ok: true })
+  assert.deepEqual(slotAllowsModel({ vm: pro, model: 'claude-fable-5-2', fableRequiresMax: true }), {
+    ok: false,
+    reason: 'fable_requires_max',
+  })
+  assert.deepEqual(slotAllowsModel({ vm: pro, model: 'claude-sonnet-5', fableRequiresMax: true }), { ok: true })
+  assert.deepEqual(slotAllowsModel({ vm: max, model: 'claude-fable-5-2', fableRequiresMax: true }), { ok: true })
+})

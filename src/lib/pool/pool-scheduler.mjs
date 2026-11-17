@@ -118,6 +118,9 @@ export function normalizePoolRouting(pool = {}) {
   delete next.max_waiters_per_account
   next.strategy = next.strategy === 'fill' ? 'fill' : 'balanced'
   next.session_affinity_first = next.session_affinity_first === true
+  // Off by default: Pro may carry Fable. Turn on when Pro accounts only answer
+  // Fable with 'usage credits required'.
+  next.fable_requires_max = next.fable_requires_max === true
   next.queue_max = clampNumber(next.queue_max, DEFAULT_POOL_ROUTING.queue_max, QUEUE_MAX_MIN, QUEUE_MAX_MAX)
   next.seat_grace_ms = clampNumber(next.seat_grace_ms, DEFAULT_POOL_ROUTING.seat_grace_ms, 0, SEAT_GRACE_MAX_MS)
   next.seat_budget_reserve_pct = clampNumber(
@@ -258,6 +261,9 @@ function emptyPoolFailure(candidates, now = Date.now()) {
     return { reason: 'pool_overload_cooldown', retry_after_ms: Math.max(0, until - now) }
   }
   if (limited != null) return { reason: 'pool_rate_limited', retry_after_ms: Math.max(0, limited - now) }
+  if ((candidates?.rejections?.fable_requires_max || 0) > 0) {
+    return { reason: 'fable_requires_max', retry_after_ms: null }
+  }
   const restUntil = Number(candidates?.rest_until) || 0
   return { reason: 'no_eligible_accounts', retry_after_ms: restUntil > now ? restUntil - now : null }
 }
@@ -1440,7 +1446,7 @@ export class PoolScheduler extends EventEmitter {
     const guardConfig = quotaGuardConfigOf(this.accountQuota?.config)
     const candidates = Object.assign([], {
       cooldowns: { rate_limited: /** @type {number|null} */ (null), overloaded: /** @type {number|null} */ (null) },
-      rejections: { quota_guard_request_too_large: 0 },
+      rejections: { quota_guard_request_too_large: 0, fable_requires_max: 0 },
       rest_until: /** @type {number|null} */ (null),
       offline: new Map(),
     })
@@ -1503,6 +1509,8 @@ export class PoolScheduler extends EventEmitter {
           candidates.cooldowns[kind] = prev == null ? until : Math.min(prev, until)
         } else if (kind === 'quota_guard_request_too_large') {
           candidates.rejections.quota_guard_request_too_large += 1
+        } else if (kind === 'fable_requires_max') {
+          candidates.rejections.fable_requires_max += 1
         } else if (kind === 'rest_period') {
           const until = Number(eligibility.until) || 0
           candidates.rest_until = candidates.rest_until == null ? until : Math.min(candidates.rest_until, until)
@@ -1603,7 +1611,12 @@ export class PoolScheduler extends EventEmitter {
       if (account && account.status !== 'active') {
         return { ok: false, reason: 'account_disabled' }
       }
-      const modelGate = await slotAllowsModel({ vm, account, model })
+      const modelGate = await slotAllowsModel({
+        vm,
+        account,
+        model,
+        fableRequiresMax: this.config.fable_requires_max === true,
+      })
       if (!modelGate.ok) return modelGate
       if (account) {
         // Only repair an actual stale projection. A healthy candidate must not
@@ -2221,7 +2234,15 @@ export class PoolScheduler extends EventEmitter {
         })
         if (!availability.accept && availability.key !== 'cool') return null
       }
-      if (!slotAllowsModel({ vm, account, model: candidate.model }).ok) return null
+      if (
+        !slotAllowsModel({
+          vm,
+          account,
+          model: candidate.model,
+          fableRequiresMax: this.config.fable_requires_max === true,
+        }).ok
+      )
+        return null
       if (!evaluateActiveHours(activeHoursOf(vm), now, vm.timezone).active) return null
       if (cooldownActive(state?.cooldown_until, now)) return null
       if (isFableModel(candidate.model) && this.accountQuota?.fableWindowLimited?.(candidate.accountId, now, account))

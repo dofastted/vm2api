@@ -1570,6 +1570,34 @@ test('fable lands on a pro slot', async (t) => {
   selected.release()
 })
 
+test('with pool.fable_requires_max, fable skips an unlabeled slot and lands on max', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeTier(root, 'vm-01', null)
+  writeTier(root, 'vm-02', 'max')
+  const pool = scheduler(root, { config: { fable_requires_max: true } })
+  const selected = await pool.selectAndReserve({ model: 'claude-fable-5', allowWait: false })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02')
+  selected.release()
+  const sonnet = await pool.selectAndReserve({ model: 'claude-sonnet-5', allowWait: false })
+  assert.equal(sonnet.ok, true)
+  sonnet.release()
+})
+
+test('with pool.fable_requires_max and only pro slots, fable returns fable_requires_max', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeTier(root, 'vm-01', 'pro')
+  writeTier(root, 'vm-02', 'pro')
+  const selected = await scheduler(root, { config: { fable_requires_max: true } }).selectAndReserve({
+    model: 'claude-fable-5',
+    allowWait: false,
+  })
+  assert.equal(selected.ok, false)
+  assert.equal(selected.reason, 'fable_requires_max')
+})
+
 test('sonnet still lands on a pro slot', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
