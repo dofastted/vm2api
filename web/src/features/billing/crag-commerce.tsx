@@ -35,7 +35,11 @@ export function quoteProblem(error: unknown) {
   if (!isApiError(error)) return '暂时无法确认报价，请重试。'
   const code = error.code ?? ''
   if (code === 'shop_device_unavailable')
-    return '无法验证本机宿主设备，请联系管理员检查设备配置。'
+    return '无法读取本机宿主设备 ID，请让管理员检查宿主 ID 文件和 Docker 只读挂载，再操作原订单。'
+  if (code === 'shop_host_identity_changed')
+    return '当前宿主设备 ID 与原订阅不一致。请恢复原宿主 ID 配置，不要重复下单或付款。'
+  if (code === 'shop_private_storage_unavailable')
+    return '订单私有存储不可用。请让管理员检查数据目录和原收据密钥，再操作原订单。'
   if (code === 'shop_device_checkout_required')
     return '请允许浏览器 Cookie，刷新设备购买页后重试。'
   if (code.includes('coupon'))

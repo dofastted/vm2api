@@ -750,7 +750,9 @@ function ShopOrders({
         isApiError(error) && error.code === 'shop_device_package_unready'
           ? '本机缺少可用的 CRAG 发行包。请让管理员从内核页拉取后，重试应用原订单。'
           : isApiError(error) &&
-              /^shop_device_(unavailable|checkout_required)$/.test(error.code)
+              /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable)$/.test(
+                error.code
+              )
             ? quoteProblem(error)
             : isApiError(error) && error.status === 401
               ? '登录已过期，请重新登录后查看历史订单。'
@@ -811,9 +813,9 @@ function ShopOrders({
         refresh((n) => n + 1)
         setOffset(0)
       },
-      input.expected_amount_minor == null
-        ? '未能确认下单结果。请重试同一订单，或先刷新历史订单。'
-        : '未能确认订单：价格、优惠或库存可能已变动。请重新核价；已创建的订单请在历史订单继续支付。'
+      resumeId
+        ? '未能恢复原订单的付款信息。请先刷新历史订单，不要重复付款。'
+        : '未能确认下单结果。请先查看历史订单，或重试同一订单，不要重复付款。'
     )
   }
 

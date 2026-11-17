@@ -493,7 +493,10 @@ test('device checkout skips panel login, scopes orders to browser and host, and 
       json: (_, http, body) => ({ http, ...body }),
       readRawBody: (req) => req.raw,
       subscription: {
-        purchaseDeviceId: () => host,
+        purchaseDeviceId() {
+          if (host instanceof Error) throw host
+          return host
+        },
         async redeemDeviceOrder(expectedHost, code) {
           assert.equal(expectedHost, deviceId)
           assert.equal(code, CODE)
@@ -565,6 +568,12 @@ test('device checkout skips panel login, scopes orders to browser and host, and 
   assert.equal((await call('POST', '/quote', { sku: PLAN.sku })).http, 200)
   host = undefined
   assert.equal((await call('POST', '/orders', input)).error.code, 'shop_device_unavailable')
+  host = Object.assign(new Error('private details'), { code: 'crag_subscription_host_identity_changed' })
+  const changed = await call('POST', '/orders', input)
+  assert.equal(changed.error.code, 'shop_host_identity_changed')
+  assert.equal(JSON.stringify(changed).includes('private details'), false)
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM crag_shop_orders').get().count, 0)
+  assert.equal(created, 0)
   host = deviceId
   const first = await call('POST', '/orders', input)
   assert.equal(first.http, 200)

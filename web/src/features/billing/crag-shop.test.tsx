@@ -735,6 +735,26 @@ describe('CRAG buyer presentation and activation wire', () => {
     )
   })
 
+  it.each([
+    ['shop_device_unavailable', '无法读取本机宿主设备 ID'],
+    ['shop_host_identity_changed', '当前宿主设备 ID 与原订阅不一致'],
+    ['shop_private_storage_unavailable', '订单私有存储不可用'],
+    ['shop_invalid_reply', '未能确认下单结果。请先查看历史订单'],
+  ])(
+    'explains checkout failure %s without assuming a changed price',
+    async (code, message) => {
+      vi.mocked(api).mockRejectedValue(
+        new ApiError('opaque failure', 503, code)
+      )
+      render()
+      click('创建订单')
+      await settle()
+      const html = render()
+      expect(html).toContain(message)
+      expect(html).not.toContain('opaque failure')
+    }
+  )
+
   it('adds only explicitly selected targets to new intents and matches them when retrying', async () => {
     state.values[17] = 'vm-a'
     vi.mocked(api).mockRejectedValue(new Error('unconfirmed'))
