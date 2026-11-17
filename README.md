@@ -31,7 +31,7 @@
 
 <a href="https://proxylane.dev/go/vm2api-gh"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助商）" width="100%" /></a>
 
-**赞助商（ProxyLane）**：Claude Max 专用的原生静态住宅 IP：从未在 ProxyLane 用于注册 Claude，严格筛选 IP 与网段，Scamalytics 低欺诈评分，一个号一个独享 IP，不限流量，$7.90 起。一个槽位绑一个 IP：把 SOCKS5 `host:port:user:pass` 粘贴到「代理池」→「添加代理」即可。首次购买优惠码 `VM2API30` 享 7 折（有效期到 12 月 31 日）。详见 [ProxyLane](https://proxylane.dev/go/vm2api-gh)。
+**赞助商（ProxyLane）**：Claude Max 专用的原生静态住宅 IP：从未用于注册 Claude 账号，严格筛选 IP 与网段，Scamalytics 低欺诈评分，一个号一个独享 IP，不限流量，$7.90 起。一个槽位绑一个 IP：把 SOCKS5 `host:port:user:pass` 粘贴到「代理池」→「添加代理」即可。首次购买优惠码 `VM2API30` 享 7 折（有效期到 12 月 31 日）。详见 [ProxyLane](https://proxylane.dev/go/vm2api-gh)。
 
 </details>
 
