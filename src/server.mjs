@@ -1525,6 +1525,7 @@ server.listen(cfg.port, cfg.host, () => {
           routing: routingConfig,
           watchdog: kernelWatchdog,
           poolScheduler,
+          releaseStoppedBinding: cragSubscription.releaseStoppedBinding.bind(cragSubscription),
         })
         for (const item of report.items) {
           if (!item.ok) console.warn(`[kernel-install] ${item.id} recovery failed (${item.code})`)

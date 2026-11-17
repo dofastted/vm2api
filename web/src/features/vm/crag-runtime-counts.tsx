@@ -19,8 +19,14 @@ export function CragRuntimeCounts({ status }: { status?: CragHostStatus }) {
         : status
           ? statusLabels[status.state]
           : '状态待核对'}
-      {' · 剩余可用槽位：'}
+      {' · 剩余可绑定槽位：'}
       {numberLabel(status?.available_seats)}
+      {(status?.reclaim_pending_count ?? 0) > 0 && (
+        <>
+          {' · 待回收绑定：'}
+          {status?.reclaim_pending_count}
+        </>
+      )}
       {status?.runtime && (
         <>
           {' · 运行中的订阅槽：'}

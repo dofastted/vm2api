@@ -25,6 +25,8 @@ const AUTHORITY = 'https://crag.fkcodex.com'
 const HOST_ID_MOUNT = '/run/crag-host-machine-id'
 const SHARED_HOST_ID_FILESYSTEMS = new Set([0x01021997, 0x65735546])
 const localFilesystems = new Set([0xef53, 0x794c7630, 0x58465342, 0x9123683e, 0x2fc12fc1, 0xf2f52010])
+const MAX_DEFERRED_RELEASES = 10000
+const MAX_DEFERRED_RELEASE_BYTES = 4 * 1024 * 1024
 const terminalRedeem = new Map([
   ['redeem_unavailable', 404],
   ['host_redeem_conflict', 409],
@@ -314,6 +316,7 @@ export function createCragSubscription({
   const entitlementFile = path.join(publicDir, 'entitlement.code')
   const intentFile = path.join(privateDir, 'redeem.json')
   const rosterIntentFile = path.join(privateDir, 'roster.json')
+  const deferredReleaseFile = path.join(privateDir, 'deleted-slots.json')
   const marker = path.join(publicDir, 'sync-pending')
   let busy = false
   const runtimeReservations = new Set()
@@ -693,6 +696,7 @@ export function createCragSubscription({
     try {
       const local = readLocalRights()
       const { hostId, claims, pending, previous } = local
+      const reclaim_pending_count = readDeferredReleases(hostId).filter((entry) => entry.proven).length
       if (load(hostFile, 0o644, 64)) credential(hostId)
       const needsRefresh = claims && claims.expires_at * 1000 <= Date.now()
       if (needsRefresh && !pending && !confirmed && mayRetry) {
@@ -743,6 +747,7 @@ export function createCragSubscription({
         ...(claims && { slot_limit: claims.slot_limit, expires_at: claims.expires_at, revision: claims.revision }),
         ...rights,
         available_seats: pending || runtime === null ? null : availableSeats(claims, rights, claims && !expired),
+        reclaim_pending_count,
         ...inventory,
         ...(total_slots !== undefined && { total_slots }),
         ...(enabled_slots !== undefined && { enabled_slots }),
@@ -894,6 +899,65 @@ export function createCragSubscription({
     return raw == null ? null : JSON.parse(raw)
   }
 
+  function readDeferredReleases(hostId) {
+    const raw = load(deferredReleaseFile, 0o600, MAX_DEFERRED_RELEASE_BYTES)
+    if (raw == null) return []
+    const saved = JSON.parse(raw)
+    if (
+      !saved ||
+      saved.version !== 1 ||
+      Object.keys(saved).length !== 3 ||
+      !isDigest(saved.host_id) ||
+      !Array.isArray(saved.entries) ||
+      saved.entries.length > MAX_DEFERRED_RELEASES
+    )
+      throw fail('crag_subscription_invalid_reclaim', 409)
+    if (saved.host_id !== hostId) throw hostIdentityChanged()
+    const seen = new Set()
+    for (const entry of saved.entries) {
+      if (
+        !entry ||
+        Object.keys(entry).length !== 3 ||
+        !isCragOrderVmId(entry.vm_id) ||
+        !isDigest(entry.permit_sha256) ||
+        typeof entry.proven !== 'boolean' ||
+        seen.has(entry.permit_sha256)
+      )
+        throw fail('crag_subscription_invalid_reclaim', 409)
+      seen.add(entry.permit_sha256)
+    }
+    return saved.entries
+  }
+
+  function writeDeferredReleases(hostId, entries) {
+    if (entries.length) {
+      publish(deferredReleaseFile, JSON.stringify({ version: 1, host_id: hostId, entries }), 0o600)
+    } else if (fs.existsSync(deferredReleaseFile)) {
+      remove(deferredReleaseFile)
+    }
+  }
+
+  function saveDeferredRelease(hostId, vmId, permit, proven) {
+    const entries = readDeferredReleases(hostId)
+    const index = entries.findIndex((entry) => entry.permit_sha256 === permit)
+    if (index >= 0 && entries[index].vm_id !== vmId) throw fail('crag_subscription_invalid_reclaim', 409)
+    const entry = { vm_id: vmId, permit_sha256: permit, proven }
+    if (index >= 0) entries[index] = entry
+    else {
+      if (entries.length >= MAX_DEFERRED_RELEASES) throw fail('crag_subscription_reclaim_limit', 409)
+      entries.push(entry)
+    }
+    writeDeferredReleases(hostId, entries)
+  }
+
+  function removeDeferredRelease(hostId, vmId, permit) {
+    const entries = readDeferredReleases(hostId)
+    writeDeferredReleases(
+      hostId,
+      entries.filter((entry) => entry.vm_id !== vmId || entry.permit_sha256 !== permit),
+    )
+  }
+
   function checkNoIntent() {
     if (readRosterIntent() || load(intentFile, 0o600, 512) || load(marker, 0o644, 32))
       throw fail('crag_subscription_sync_pending', 409)
@@ -972,7 +1036,51 @@ export function createCragSubscription({
         : (await listTargets()).find(({ id }) => id === intent.vm_id)
       if (target?.id === intent.vm_id) removeReclaimedCragPermit(projectRoot, target, intent.permit_sha256)
     }
+    if (intent.action === 'release' && fs.existsSync(deferredReleaseFile))
+      removeDeferredRelease(hostId, intent.vm_id, intent.permit_sha256)
     clearRosterIntent()
+    return confirmed
+  }
+
+  async function replayDeferredReleases(hostId, previous) {
+    const entries = readDeferredReleases(hostId)
+    if (previous?.claims.version !== 2) return
+    let confirmed,
+      blocked = false
+    for (const entry of entries) {
+      if (!entry.proven) continue
+      if (!previous.claims.roster.some((item) => item.permit_sha256 === entry.permit_sha256)) {
+        removeDeferredRelease(hostId, entry.vm_id, entry.permit_sha256)
+        continue
+      }
+      const target = getTarget
+        ? await getTarget(entry.vm_id)
+        : (await listTargets()).find((vm) => vm.id === entry.vm_id)
+      if (target) {
+        if (runtimeReservations.has(target.id) || vmLockBusy(path.join(projectRoot, 'vms', `${target.id}.json`)))
+          continue
+        let permit
+        try {
+          permit = readCragSubscriptionReleaseCandidate(projectRoot, target, hostId)
+        } catch {
+          continue
+        }
+        // A failed panel delete can leave the record available for another start.
+        if (permit === entry.permit_sha256 && !(await runtimeInventory?.confirmReclaimableStop?.(target))) continue
+        if (runtimeReservations.has(target.id) || vmLockBusy(path.join(projectRoot, 'vms', `${target.id}.json`)))
+          continue
+      }
+      checkNoIntent()
+      if (!blocked) {
+        await blockKvmBindings()
+        blocked = true
+      }
+      if (current(hostId)?.code !== previous.code) throw fail('crag_subscription_sync_pending', 409)
+      const intent = { host_id: hostId, action: 'release', ...entry, reclaim: true, deferred: true }
+      beginRosterIntent(intent)
+      confirmed = await syncRoster(hostId, intent, previous)
+      previous = confirmed
+    }
     return confirmed
   }
 
@@ -1276,15 +1384,75 @@ export function createCragSubscription({
           const hostId = identity()
           checkNoIntent()
           const previous = current(hostId)
-          if (!previous || !(await ready({ reclaim: true }))) throw fail('crag_subscription_target_unready', 409)
-          if (previous.claims.version === 2) return status()
+          if (!previous) throw fail('crag_subscription_target_unready', 409)
+          if (previous.claims.version === 2) return status(await replayDeferredReleases(hostId, previous))
+          if (!(await ready({ reclaim: true }))) throw fail('crag_subscription_target_unready', 409)
           await blockKvmBindings()
           const intent = { host_id: hostId, action: 'upgrade' }
           beginRosterIntent(intent)
-          return status(await syncRoster(hostId, intent, previous))
+          const upgraded = await syncRoster(hostId, intent, previous)
+          return status((await replayDeferredReleases(hostId, upgraded)) || upgraded)
         },
         { blockBefore: false },
       )
+    },
+    async releaseStoppedBinding(vm, { stop } = {}) {
+      const unchanged = (supported = false) => ({ released: false, stopped: false, reclaim_supported: supported })
+      if (process.platform !== 'linux' || !fs.existsSync(entitlementFile)) return unchanged()
+      const hostId = identity()
+      const previous = current(hostId)
+      if (!previous) return unchanged()
+      const currentPermit = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
+      if (previous.claims.version !== 2) return currentPermit ? { ...unchanged(), reclaim_pending: true } : unchanged()
+      const priorIntent = readRosterIntent()
+      const permit =
+        currentPermit ||
+        (priorIntent?.action === 'release' &&
+        priorIntent.reclaim === true &&
+        priorIntent.vm_id === vm.id &&
+        priorIntent.proven === true &&
+        isDigest(priorIntent.permit_sha256)
+          ? priorIntent.permit_sha256
+          : null)
+      if (!permit) return unchanged(true)
+      return exclusive(async () => {
+        if (runtimeReservations.has(vm.id)) throw fail('crag_slot_start_busy', 409)
+        const saved = readRosterIntent()
+        if (
+          saved &&
+          (saved.action !== 'release' ||
+            saved.reclaim !== true ||
+            saved.vm_id !== vm.id ||
+            saved.permit_sha256 !== permit)
+        )
+          throw fail('crag_subscription_sync_pending', 409)
+        if (!saved) checkNoIntent()
+        const now = current(hostId)
+        if (now?.code !== previous.code) throw fail('crag_subscription_sync_pending', 409)
+        if (!saved && !now.claims.roster.some((entry) => entry.permit_sha256 === permit)) return unchanged(true)
+        if (!currentPermit && saved?.proven === true) {
+          await syncRoster(hostId, saved, now)
+          return { released: true, stopped: false, reclaim_supported: true }
+        }
+        if (stop && (await stop(vm))?.ok !== true) throw fail('crag_subscription_stop_unconfirmed', 409)
+        if (!(await runtimeInventory?.confirmReclaimableStop?.(vm)))
+          throw fail('crag_subscription_stop_unconfirmed', 409)
+        if (runtimeReservations.has(vm.id)) throw fail('crag_slot_start_busy', 409)
+        if (readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId) !== permit)
+          throw fail('crag_subscription_target_changed', 409)
+        if (current(hostId)?.code !== now.code) throw fail('crag_subscription_sync_pending', 409)
+        const intent = saved ?? {
+          host_id: hostId,
+          action: 'release',
+          vm_id: vm.id,
+          permit_sha256: permit,
+          proven: true,
+          reclaim: true,
+        }
+        if (!saved) beginRosterIntent(intent)
+        await syncRoster(hostId, intent, now)
+        return { released: true, stopped: true, reclaim_supported: true }
+      })
     },
     async teardown(vm, destroy) {
       if (process.platform !== 'linux') return destroy(false)
@@ -1296,8 +1464,24 @@ export function createCragSubscription({
         if (!fs.existsSync(entitlementFile)) return destroy(false)
         throw error
       }
-      if (previous?.claims.version !== 2) return destroy(false)
+      if (!previous) return destroy(false)
       const permit = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
+      if (previous.claims.version === 1) {
+        if (!permit) return destroy(false)
+        return exclusive(
+          async () => {
+            checkNoIntent()
+            if (current(hostId)?.code !== previous.code) throw fail('crag_subscription_sync_pending', 409)
+            saveDeferredRelease(hostId, vm.id, permit, false)
+            const result = await destroy(true)
+            if (!result.ok) return result
+            if (result.teardownConfirmed !== true) throw fail('crag_subscription_teardown_unconfirmed', 409)
+            saveDeferredRelease(hostId, vm.id, permit, true)
+            return { ...result, reclaim_pending: true }
+          },
+          { blockBefore: false },
+        )
+      }
       const priorIntent = readRosterIntent()
       if (!permit && priorIntent?.vm_id !== vm.id) return destroy(false)
       return exclusive(
@@ -1335,12 +1519,17 @@ export function createCragSubscription({
         // Unconfigured hosts have no startup work. An orphaned marker is never cleared implicitly.
         if (!fs.existsSync(intentFile) && !fs.existsSync(rosterIntentFile)) {
           if (fs.existsSync(marker)) throw fail('crag_subscription_sync_pending', 409)
+          if (fs.existsSync(deferredReleaseFile)) {
+            const hostId = identity()
+            await replayDeferredReleases(hostId, current(hostId))
+          }
           return
         }
         const hostId = identity()
         const rosterIntent = readRosterIntent()
         if (rosterIntent) {
-          await syncRoster(hostId, rosterIntent, current(hostId))
+          const confirmed = await syncRoster(hostId, rosterIntent, current(hostId))
+          await replayDeferredReleases(hostId, confirmed)
           return
         }
         const raw = load(intentFile, 0o600, 512)
@@ -1354,7 +1543,8 @@ export function createCragSubscription({
         const previous = current(hostId)
         // Old intents without local rights have no original digest, but still require a trusted package.
         if (!pinned && !previous) hostPackageDigest(projectRoot)
-        await finish(hostId, intent, previous)
+        const confirmed = await finish(hostId, intent, previous)
+        await replayDeferredReleases(hostId, confirmed)
       })
     },
     refreshExpiredEntitlement,

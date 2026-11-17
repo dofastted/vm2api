@@ -1,6 +1,7 @@
 import type { ComponentProps, ReactNode } from 'react'
 import type { CragLicenseStatus, Vm } from '@/types/panel-vm'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { toast } from 'sonner'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CragHostStatus } from '@/features/vm/queries'
 import { WrapSamplePage } from './index'
@@ -79,6 +80,7 @@ vi.mock('@tanstack/react-query', async (importOriginal) => ({
                 version: '3.0.8',
                 payload_tag: 'payload-2026.11.16-crag-3.0.8',
               },
+              { id: 'cli-node', paid: false, ready: true, version: '1.4.131' },
             ],
             licenses: state.licenses,
             install_licenses: state.installLicenses,
@@ -119,6 +121,9 @@ vi.mock('./queries', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./queries')>()),
   installKernelTargets: vi.fn(),
 }))
+vi.mock('sonner', () => ({
+  toast: { success: vi.fn(), warning: vi.fn(), error: vi.fn() },
+}))
 
 function render(vm: Partial<Vm> = {}) {
   state.cursor = 0
@@ -131,6 +136,7 @@ function render(vm: Partial<Vm> = {}) {
 }
 
 beforeEach(() => {
+  vi.clearAllMocks()
   state.installations = {}
   state.licenses = {}
   state.installLicenses = undefined
@@ -216,6 +222,51 @@ describe('KVM reinstall confirmation', () => {
       ])
     }
   )
+})
+
+it('shows deferred CRAG reclamation after a cli-node install and refreshes the host count', async () => {
+  vi.mocked(installKernelTargets).mockImplementationOnce(async (targets) => ({
+    ok: true,
+    total: targets.length,
+    ok_count: targets.length,
+    failed_count: 0,
+    items: targets.map((target) => ({
+      ...target,
+      ok: true,
+      stopped: true,
+      restarted: true,
+      reclaim_pending: true,
+    })),
+  }))
+  const vm = { id: 'slot-a', resolved_dataplane: 'crag' } as const
+  render(vm)
+  state.values[2] = { 'slot-a': 'cli-node' }
+  render(vm)
+  const button = state.buttons.find(
+    (entry) => entry['aria-label'] === '安装 slot-a 并重启'
+  )
+  expect(button?.disabled).toBe(false)
+  button?.onClick?.({} as Parameters<NonNullable<ButtonProps['onClick']>>[0])
+  render(vm)
+  expect(state.confirm?.open).toBe(true)
+  state.confirm?.handleConfirm?.()
+  await vi.waitFor(() => {
+    expect(state.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['crag-host-subscription'],
+    })
+  })
+  expect(installKernelTargets).toHaveBeenCalledExactlyOnceWith([
+    { id: 'slot-a', kernel: 'cli-node', expected_tag: undefined },
+  ])
+  expect(toast.warning).toHaveBeenCalledExactlyOnceWith(
+    '1 台内核已安装并重启，1 个 CRAG 绑定待回收',
+    {
+      description:
+        '启用槽位回收后，请重装 cli-node 完成回收，额度以服务端确认为准。',
+    }
+  )
+  expect(toast.success).not.toHaveBeenCalled()
+  expect(render(vm)).toContain('重启完成，原调度限制保留；CRAG 绑定待回收')
 })
 
 it.each(['license_required', 'license_payload_key_mismatch'])(
@@ -333,7 +384,8 @@ describe('CRAG runtime on the kernel page', () => {
     const html = render({ status: 'stopped' })
     expect(state.hostEnabled).toBe(true)
     expect(state.hostInterval).toBe(10_000)
-    expect(html).toMatch(/剩余可用槽位：(?:<!-- -->)?0/)
+    expect(html).toMatch(/剩余可绑定槽位：(?:<!-- -->)?0/)
+    expect(html).toMatch(/运行中的订阅槽：(?:<!-- -->)?2/)
     expect(html).not.toContain('可用运行名额')
     expect(html).toContain('宿主订阅超额，仅超额槽暂停调度')
     expect(html).toContain('兑换槽位')
@@ -342,7 +394,7 @@ describe('CRAG runtime on the kernel page', () => {
 
     state.role = 'user'
     const userHtml = render()
-    expect(userHtml).not.toContain('剩余可用槽位')
+    expect(userHtml).not.toContain('剩余可绑定槽位')
     expect(userHtml).not.toContain('超出订阅额度 / 暂停调度')
     expect(userHtml).not.toContain('兑换槽位')
     expect(state.hostEnabled).toBe(false)
@@ -357,13 +409,13 @@ describe('CRAG runtime on the kernel page', () => {
       status: 'running',
     } as const
     const html = render(cragVm)
-    expect(html).toMatch(/剩余可用槽位：(?:<!-- -->)?待核对/)
+    expect(html).toMatch(/剩余可绑定槽位：(?:<!-- -->)?待核对/)
     expect(html).toContain('CRAG：运行状态未知')
 
     state.hostError = true
     const errorHtml = render(cragVm)
     expect(errorHtml).toContain('重装 vm-old 的 CRAG 并重启')
     expect(errorHtml).toContain('CRAG：运行状态未知')
-    expect(errorHtml).toMatch(/剩余可用槽位：(?:<!-- -->)?待核对/)
+    expect(errorHtml).toMatch(/剩余可绑定槽位：(?:<!-- -->)?待核对/)
   })
 })

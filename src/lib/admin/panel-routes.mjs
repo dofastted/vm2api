@@ -203,7 +203,13 @@ import {
 } from './release.mjs'
 import { downloadReleaseKernel, kernelReleaseHttpStatus, listKernelReleaseVersions } from './release-kernel.mjs'
 import { describeKernelCatalog, pullKernelRelease } from './kernel-catalog.mjs'
-import { installKernelTargets, releaseKernelInstallSafetyHold, validateKernelTargets } from '../vm/kernel-install.mjs'
+import {
+  hasKernelInstallSafetyHold,
+  installKernelTargets,
+  releaseKernelInstallSafetyHold,
+  retainKernelInstallSafetyHold,
+  validateKernelTargets,
+} from '../vm/kernel-install.mjs'
 import { withSlotMaintenance } from '../vm/slot-maintenance.mjs'
 import { clearActiveVmFromDb, removeVmFromDb } from '../vm/vm-db-sync.mjs'
 import { renameVmId } from '../vm/vm-rename.mjs'
@@ -733,6 +739,12 @@ export function createPanelHandler(ctx) {
   const applyVmConcurrency = (...args) => ctx.applyVmConcurrency(...args)
   // Keep the last result per VM so slow SSH cutovers outlive an HTTP request.
   const kernelSwitchJobs = new Map()
+  const kernelSwitchWatchdog = {
+    hold: (id) => ctx.kernelWatchdog?.hold?.(id),
+    release(id) {
+      if (!hasKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)) ctx.kernelWatchdog?.release?.(id)
+    },
+  }
   const applyVmRpm = (...args) => ctx.applyVmRpm(...args)
   const applyVmSessionSlots = (...args) => ctx.applyVmSessionSlots(...args)
   const inheritVmScheduling = (...args) => ctx.inheritVmScheduling(...args)
@@ -1237,7 +1249,12 @@ export function createPanelHandler(ctx) {
   async function applySlotPolicyWithRuntimeLocked(
     id,
     patch,
-    { maintenance = false, previousRouting = structuredClone(ctx.routingConfig), cragLicenseProjected = false } = {},
+    {
+      maintenance = false,
+      previousRouting = structuredClone(ctx.routingConfig),
+      cragLicenseProjected = false,
+      releaseBinding = Object.hasOwn(patch, 'dataplane'),
+    } = {},
   ) {
     const current = getVm(cfg.paths.project, id)
     if (!current) return { ok: false, id, code: 'vm_not_found', error: 'vm not found' }
@@ -1254,22 +1271,32 @@ export function createPanelHandler(ctx) {
     const versionChanged =
       previousVersion !== targetVersion && (previousDataplane === 'crag' || targetDataplane === 'crag')
     const retryFailedRuntime =
-      current.status === 'running' &&
       current.unschedulable?.reason === 'runtime_start_failed' &&
-      (Object.hasOwn(patch, 'dataplane') || Object.hasOwn(patch, 'crag_kernel_version'))
+      (releaseBinding || Object.hasOwn(patch, 'crag_kernel_version'))
     const kernelSwitch = dataplaneChanged || versionChanged || retryFailedRuntime
+    const releaseRequested =
+      releaseBinding &&
+      targetDataplane !== 'crag' &&
+      !isCodexVm(desired) &&
+      typeof ctx.cragSubscription?.releaseStoppedBinding === 'function'
     if (kernelSwitch && targetDataplane === 'crag' && targetVersion === 'v2') {
       if (isNativeNodeVm(desired)) {
         return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
       }
     }
-    if (kernelSwitch && current.status === 'running' && !maintenance) {
+    if ((kernelSwitch || releaseRequested) && current.status === 'running' && !maintenance) {
       return withSlotMaintenance({
         projectRoot: cfg.paths.project,
         id,
-        watchdog: ctx.kernelWatchdog,
+        watchdog: kernelSwitchWatchdog,
         poolScheduler: ctx.poolScheduler,
-        operation: () => applySlotPolicyWithRuntimeLocked(id, patch, { maintenance: true, previousRouting }),
+        operation: () =>
+          applySlotPolicyWithRuntimeLocked(id, patch, {
+            maintenance: true,
+            previousRouting,
+            cragLicenseProjected,
+            releaseBinding,
+          }),
       })
     }
     if (!cragLicenseProjected) {
@@ -1298,64 +1325,127 @@ export function createPanelHandler(ctx) {
         return { ok: false, id, code: switched.code || 'engine_switch_failed', error: switched.error, switch: switched }
       }
     }
+    let stoppedForRelease = false
+    let bindingRelease
     try {
-      const saved = persistSlotEnginePolicy(cfg.paths.project, id, patch)
+      let saved = persistSlotEnginePolicy(cfg.paths.project, id, patch)
       if (!saved) return { ok: false, id, code: 'vm_not_found', error: 'vm not found' }
+      if (releaseRequested) {
+        try {
+          bindingRelease = await ctx.cragSubscription.releaseStoppedBinding(saved, {
+            stop: async () => {
+              const halt = await (ctx.kernelPolicyOps?.stopSlot || stopSlot)(saved)
+              if (!halt?.ok) return halt
+              stoppedForRelease = true
+              try {
+                saved = patchVmRecord(cfg.paths.project, id, (record) => {
+                  record.status = 'stopped'
+                  record.runtime = { ...record.runtime, ...halt.runtime, stopped: true, pid: null, ip: null }
+                })
+              } catch {
+                if (current.status === 'running')
+                  retainKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
+                throw Object.assign(new Error('Stopped slot state could not be persisted'), {
+                  code: 'kernel_stop_persist_failed',
+                })
+              }
+              if (!saved) throw Object.assign(new Error('vm not found'), { code: 'vm_not_found' })
+              return halt
+            },
+          })
+        } catch (error) {
+          return restartFailed({
+            ok: false,
+            id,
+            stopped: stoppedForRelease,
+            code: error.code || 'crag_subscription_release_failed',
+            error:
+              error.code === 'kernel_stop_persist_failed'
+                ? '虚拟机已停止，但停止状态写入失败；自动恢复保持暂停，请修复记录权限后重试或手动启动。'
+                : 'CRAG 订阅绑定未能完成释放，请同步订阅状态后重试。',
+          })
+        }
+      }
       if (!isCodexVm(saved) && (Object.prototype.hasOwnProperty.call(patch, 'persona_preset') || kernelSwitch)) {
         if (kernelSwitch) {
+          // KVM also refreshes its preinstalled CRAG package here. Release with the
+          // old package's verified public key before that package can be replaced.
           const laid = materializeSlotDataplane(cfg.paths.project, saved, targetDataplane || 'wrap', {
             routing: ctx.routingConfig,
           })
           if (!laid.ok) {
-            persistSlotEnginePolicy(cfg.paths.project, id, {
-              dataplane: current.dataplane || '',
-              crag_kernel_version: current.crag_kernel_version || '',
-            })
-            return { ok: false, id, code: laid.code || 'dataplane_materialize_failed', error: laid.error }
+            if (!stoppedForRelease && !bindingRelease?.released) {
+              persistSlotEnginePolicy(cfg.paths.project, id, {
+                dataplane: current.dataplane || '',
+                crag_kernel_version: current.crag_kernel_version || '',
+              })
+            }
+            const failed = {
+              ok: false,
+              id,
+              stopped: stoppedForRelease,
+              code: laid.code || 'dataplane_materialize_failed',
+              error: laid.error,
+            }
+            return stoppedForRelease ? restartFailed(failed) : failed
           }
         }
         const write = ctx.kernelPolicyOps?.writeKernelConfig || writeKernelConfig
         write(cfg.paths.project, saved, { routing: ctx.routingConfig })
-        if (kernelSwitch && saved.status === 'running') {
-          const remoteDocker =
-            Boolean(String(saved.node_id || '').trim()) && !isKvmRuntime(saved) && !isNativeNodeVm(saved)
-          const recreateNative =
-            !isKvmRuntime(saved) && (remoteDocker || previousDataplane === 'crag' || targetDataplane === 'crag')
-          // Both directions must replace CRAG's creation-only sandbox and command.
-          if (recreateNative) {
-            const booted = await (ctx.kernelPolicyOps?.startSlotReady || startSlotReady)(saved, cfg.paths.project, {
-              recreate: true,
-              routing: ctx.routingConfig,
-            })
-            if (!booted?.ok || booted.rust_ok === false || booted.rust?.ok === false || booted.kernel?.ok === false) {
-              return restartFailed({
-                ok: false,
-                id,
-                code: booted?.code || 'kernel_restart_failed',
-                error: booted?.error || booted?.rust?.error || booted?.rust?.reason || 'kernel recreate failed',
-              })
-            }
-          } else {
-            const exec = slotExec(cfg.paths.project, saved)
-            const restarted = await (ctx.kernelPolicyOps?.restartRustKernel || restartRustKernel)(exec).catch((e) => ({
+      }
+      if (!isCodexVm(saved) && (kernelSwitch || stoppedForRelease) && current.status === 'running') {
+        const remoteDocker =
+          Boolean(String(saved.node_id || '').trim()) && !isKvmRuntime(saved) && !isNativeNodeVm(saved)
+        const recreateNative =
+          !isKvmRuntime(saved) &&
+          (remoteDocker || previousDataplane === 'crag' || targetDataplane === 'crag' || stoppedForRelease)
+        // Both directions must replace CRAG's creation-only sandbox and command.
+        if (recreateNative || stoppedForRelease) {
+          const booted = await (ctx.kernelPolicyOps?.startSlotReady || startSlotReady)(saved, cfg.paths.project, {
+            recreate: recreateNative,
+            routing: ctx.routingConfig,
+          })
+          if (!booted?.ok || booted.rust_ok === false || booted.rust?.ok === false || booted.kernel?.ok === false) {
+            return restartFailed({
               ok: false,
-              error: String(e?.message || e).slice(0, 200),
-            }))
-            if (!restarted?.ok) {
-              return restartFailed({
-                ok: false,
-                id,
-                code: 'kernel_restart_failed',
-                error: restarted?.error || 'kernel restart failed',
-              })
-            }
+              id,
+              code: booted?.code || 'kernel_restart_failed',
+              error: booted?.error || booted?.rust?.error || booted?.rust?.reason || 'kernel recreate failed',
+            })
           }
-          ctx.kernelWatchdog?.reset?.(id)
-          panel.resetVmCircuit({ cfg, poolScheduler: ctx.poolScheduler, id })
-          if (getVm(cfg.paths.project, id)?.unschedulable?.reason === 'runtime_start_failed') {
-            clearUnschedulable(cfg.paths.project, id, { by: 'operator' })
+          if (stoppedForRelease) {
+            saved = patchVmRecord(cfg.paths.project, id, (record) => {
+              record.status = 'running'
+              record.runtime = { ...record.runtime, ...(booted.runtime || booted.docker?.runtime), stopped: false }
+            })
+            if (!saved) throw Object.assign(new Error('vm not found'), { code: 'vm_not_found' })
+          }
+        } else {
+          const exec = slotExec(cfg.paths.project, saved)
+          const restarted = await (ctx.kernelPolicyOps?.restartRustKernel || restartRustKernel)(exec).catch((e) => ({
+            ok: false,
+            error: String(e?.message || e).slice(0, 200),
+          }))
+          if (!restarted?.ok) {
+            return restartFailed({
+              ok: false,
+              id,
+              code: 'kernel_restart_failed',
+              error: restarted?.error || 'kernel restart failed',
+            })
           }
         }
+        ctx.kernelWatchdog?.reset?.(id)
+        panel.resetVmCircuit({ cfg, poolScheduler: ctx.poolScheduler, id })
+        if (getVm(cfg.paths.project, id)?.unschedulable?.reason === 'runtime_start_failed') {
+          clearUnschedulable(cfg.paths.project, id, { by: 'operator' })
+        }
+      }
+      if (
+        (kernelSwitch || stoppedForRelease) &&
+        hasKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
+      ) {
+        releaseKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
       }
       return {
         ok: true,
@@ -1367,13 +1457,15 @@ export function createPanelHandler(ctx) {
         resolved_dataplane: resolveKernelDataplane(saved, ctx.routingConfig),
         active_engine: switched?.active_engine || targetEngine,
         runtime: switched?.runtime || null,
+        ...(bindingRelease?.reclaim_pending && { reclaim_pending: true }),
       }
     } catch (error) {
-      if (kernelSwitch && current.status === 'running') {
+      if (kernelSwitch && (current.status === 'running' || stoppedForRelease || bindingRelease?.released)) {
         markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', { code: 'kernel_switch_failed' })
       }
       let rollback = null
-      if (switched) rollback = await switchSlotInferenceEngine(current, cfg.paths.project, previousEngine)
+      if (switched && !stoppedForRelease && !bindingRelease?.released)
+        rollback = await switchSlotInferenceEngine(current, cfg.paths.project, previousEngine)
       return {
         ok: false,
         id,
@@ -1792,6 +1884,7 @@ export function createPanelHandler(ctx) {
             const result = await applySlotPolicyWithRuntime(id, parsed.patch)
             if (!result.ok) throw Object.assign(new Error(result.error || '内核切换失败'), { code: result.code })
             job.status = 'succeeded'
+            if (result.reclaim_pending) job.reclaim_pending = true
           } catch (error) {
             job.status = 'failed'
             job.error = { code: error.code || 'kernel_switch_failed', message: redactSecrets(error.message) }
@@ -2881,6 +2974,7 @@ export function createPanelHandler(ctx) {
           poolScheduler: ctx.poolScheduler,
           ops: ctx.kernelInstallOps,
           cragSubscription: mayBindSubscription ? ctx.cragSubscription : undefined,
+          releaseStoppedBinding: ctx.cragSubscription?.releaseStoppedBinding?.bind(ctx.cragSubscription),
         })
         return json(res, 200, panel.ok(report))
       }
@@ -2949,9 +3043,15 @@ export function createPanelHandler(ctx) {
                   const switched = await applySlotPolicyWithRuntimeLocked(
                     id,
                     targets.all ? {} : { dataplane: parsed.value },
-                    { maintenance: true, previousRouting: previous, cragLicenseProjected: true },
+                    { maintenance: true, previousRouting: previous, cragLicenseProjected: true, releaseBinding: true },
                   )
-                  items.push({ id, ok: switched.ok, code: switched.code, error: switched.error })
+                  items.push({
+                    id,
+                    ok: switched.ok,
+                    code: switched.code,
+                    error: switched.error,
+                    ...(switched.reclaim_pending && { reclaim_pending: true }),
+                  })
                 }
                 const failed = items.filter((item) => !item.ok).length
                 return {
@@ -2969,7 +3069,7 @@ export function createPanelHandler(ctx) {
                   withSlotMaintenance({
                     projectRoot: cfg.paths.project,
                     id,
-                    watchdog: ctx.kernelWatchdog,
+                    watchdog: kernelSwitchWatchdog,
                     poolScheduler: ctx.poolScheduler,
                     operation,
                   })
@@ -3179,7 +3279,10 @@ export function createPanelHandler(ctx) {
           failed: failed.map(({ id, code, error }) => ({ id, code, error })),
           items: results
             .filter((item) => item.ok)
-            .map((item) => summarizeVm(item.vm, cfg.paths.project, ctx.routingConfig)),
+            .map((item) => ({
+              ...summarizeVm(item.vm, cfg.paths.project, ctx.routingConfig),
+              ...(item.reclaim_pending && { reclaim_pending: true }),
+            })),
         }
         return json(res, 200, panel.ok(report))
       }
@@ -3873,6 +3976,7 @@ export function createPanelHandler(ctx) {
             role: panelIdentity(req).role,
           })
           if (slotPolicyResult && detail?.data) {
+            if (slotPolicyResult.reclaim_pending) detail.data.reclaim_pending = true
             detail.data.engine_switch = {
               configured_engine: slotPolicyResult.configured_engine,
               resolved_engine: slotPolicyResult.resolved_engine,

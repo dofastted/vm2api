@@ -11,6 +11,7 @@ import {
   isApiError,
   patchVm,
   startVmKernelSwitch,
+  type VmKernelSwitchJob,
 } from '@/lib/api'
 import { isCodexVm } from '@/lib/vm-kind'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -199,6 +200,9 @@ function SlotKernelSwitch({
         qc.invalidateQueries({ queryKey: vmQueryOptions(id).queryKey }),
         qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
         qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
+        qc.invalidateQueries({
+          queryKey: cragHostStatusQueryOptions().queryKey,
+        }),
       ]),
     [id, qc]
   )
@@ -257,9 +261,12 @@ function SlotKernelSwitch({
         )
       )
     } else {
-      toast.success(kernelSwitchSuccess(next, vm.status), {
+      const notify = job.reclaim_pending ? toast.warning : toast.success
+      notify(kernelSwitchSuccess(next, vm.status), {
         id: switchToastId,
-        description: undefined,
+        description: job.reclaim_pending
+          ? 'CRAG 绑定额度待回收确认；启用槽位回收后，请在内核页重装 cli-node 完成回收。'
+          : undefined,
       })
     }
     void refreshVmState()
@@ -324,14 +331,15 @@ function SlotKernelSwitch({
     }
   }
   const switchKernel = useMutation({
-    mutationFn: async (next: SlotKernelTarget) => {
+    mutationFn: async (
+      next: SlotKernelTarget
+    ): Promise<VmKernelSwitchJob | { reclaim_pending?: boolean }> => {
       const body =
         next === 'v2'
           ? ({ dataplane: 'crag', crag_kernel_version: 'v2' } as const)
           : ({ dataplane: 'wrap', crag_kernel_version: '' } as const)
       if (remote) return startVmKernelSwitch(id, body)
-      await patchVm(id, body)
-      return null
+      return patchVm<{ reclaim_pending?: boolean }>(id, body)
     },
     // A disconnected POST may already have started the task. Never resubmit it.
     retry: false,
@@ -346,13 +354,16 @@ function SlotKernelSwitch({
     },
     onSuccess: (data, next) => {
       setPending(null)
-      if (remote && data) {
+      if (remote && 'status' in data) {
         qc.setQueryData(vmKernelSwitchQueryOptions(id).queryKey, data)
         return
       }
-      toast.success(kernelSwitchSuccess(next, vm.status), {
+      const notify = data?.reclaim_pending ? toast.warning : toast.success
+      notify(kernelSwitchSuccess(next, vm.status), {
         id: switchToastId,
-        description: undefined,
+        description: data?.reclaim_pending
+          ? 'CRAG 绑定额度待回收确认；启用槽位回收后，请在内核页重装 cli-node 完成回收。'
+          : undefined,
       })
     },
     onError: (error: Error) => {
@@ -395,6 +406,8 @@ function SlotKernelSwitch({
     !switching &&
     !switchFailed &&
     (remote ? job?.status === 'succeeded' : switchKernel.isSuccess)
+  const reclaimPending =
+    (remote ? job : switchKernel.data)?.reclaim_pending === true
   const checkingJob = remote && !blocked && jobQuery.isPending
   const needsCheck = remote && (switchKernel.isError || jobQuery.isError)
   const busy =
@@ -487,14 +500,16 @@ function SlotKernelSwitch({
               ? `正在切换到 ${slotKernelLabel(target)}…`
               : switchFailed
                 ? '内核切换未完成'
-                : '内核切换完成'}
+                : reclaimPending
+                  ? '内核切换完成，绑定待回收'
+                  : '内核切换完成'}
           </AlertTitle>
           <AlertDescription className='break-words'>
             {switching
               ? '请勿重复操作。正在等待服务端完成切换，并刷新 VM 运行和调度状态。关闭页面不会取消任务，可重新打开查看进度。'
               : switchFailed
                 ? `${switchErrorMessage} 请先核对当前内核、VM 运行和调度状态，再重试；也可在“恢复服务”中查看诊断。`
-                : kernelSwitchSuccess(target, vm.status)}
+                : `${kernelSwitchSuccess(target, vm.status)}${reclaimPending ? ' CRAG 绑定额度待回收确认；启用槽位回收后，请在内核页重装 cli-node 完成回收。' : ''}`}
           </AlertDescription>
         </Alert>
       ) : null}

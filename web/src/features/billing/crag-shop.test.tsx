@@ -1,5 +1,6 @@
 import type {
   ButtonHTMLAttributes,
+  ComponentProps,
   ElementType,
   FormHTMLAttributes,
   InputHTMLAttributes,
@@ -18,6 +19,9 @@ import { CragDevicePurchasePage, CragSubscriptionPage } from './crag-shop'
 type ActivationFormProps = Parameters<
   typeof CragLicenseEditorModule.CragActivationForm
 >[0]
+type ConfirmProps = ComponentProps<
+  typeof import('@/components/confirm-dialog').ConfirmDialog
+>
 
 const state = vi.hoisted(() => ({
   values: [] as unknown[],
@@ -29,6 +33,8 @@ const state = vi.hoisted(() => ({
   authenticated: true,
   targetResult: {} as Record<string, unknown>,
   hostStatus: undefined as CragHostStatus | undefined,
+  hostRefetch: vi.fn(),
+  upgradeConfirm: undefined as ConfirmProps | undefined,
   setQueryData: vi.fn(),
   invalidateQueries: vi.fn(),
   hostForm: undefined as FormHTMLAttributes<HTMLFormElement> | undefined,
@@ -118,7 +124,7 @@ vi.mock('@tanstack/react-query', async (importOriginal) => ({
       return { refetch: vi.fn(), ...state.targetResult }
     }
     if (options.queryKey[0] === 'crag-host-subscription')
-      return { data: state.hostStatus, refetch: vi.fn() }
+      return { data: state.hostStatus, refetch: state.hostRefetch }
     if (options.queryKey[1] === 'vms') {
       return {
         data: {
@@ -161,7 +167,12 @@ vi.mock('@/components/page-header', () => ({
     </main>
   ),
 }))
-vi.mock('@/components/confirm-dialog', () => ({ ConfirmDialog: () => null }))
+vi.mock('@/components/confirm-dialog', () => ({
+  ConfirmDialog: (props: ConfirmProps) => {
+    if (props.title === '启用本机槽位回收？') state.upgradeConfirm = props
+    return null
+  },
+}))
 vi.mock('@/components/ui/dialog', () => {
   const Children = ({ children }: { children: ReactNode }) => children
   return {
@@ -237,6 +248,7 @@ function render(device = false) {
   state.commerce = undefined
   state.hostForm = undefined
   state.hostInput = undefined
+  state.upgradeConfirm = undefined
   return renderToStaticMarkup(
     device ? <CragDevicePurchasePage /> : <CragSubscriptionPage />
   )
@@ -276,6 +288,8 @@ beforeEach(() => {
   state.authenticated = true
   state.refs = []
   state.hostStatus = undefined
+  state.hostRefetch.mockReset()
+  state.hostRefetch.mockResolvedValue(undefined)
   state.setQueryData.mockReset()
   state.setQueryData.mockImplementation((_key, data: CragHostStatus) => {
     state.hostStatus = data
@@ -452,7 +466,7 @@ describe('CRAG buyer presentation and activation wire', () => {
       ],
     }
     const html = render()
-    expect(html).toMatch(/剩余可用槽位：(?:<!-- -->)?1/)
+    expect(html).toMatch(/剩余可绑定槽位：(?:<!-- -->)?1/)
     expect(html).not.toContain('vm-licensed')
     expect(html).not.toContain('已绑定 / 可绑定应用锁')
   })
@@ -503,7 +517,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     const updated = render()
     expect(updated).toContain('订阅有效')
     expect(updated).toContain('宿主机额度已更新，未自动绑定 VM')
-    expect(updated).toMatch(/剩余可用槽位：(?:<!-- -->)?2/)
+    expect(updated).toMatch(/剩余可绑定槽位：(?:<!-- -->)?2/)
     expect(updated).not.toContain(code)
     expect(state.hostInput?.value).toBe('')
     expect(state.setQueryData).toHaveBeenCalledExactlyOnceWith(
@@ -513,6 +527,99 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(state.invalidateQueries).toHaveBeenCalledExactlyOnceWith({
       queryKey: ['crag-host-subscription'],
     })
+  })
+
+  it('keeps deleted H1 bindings pending until an explicit upgrade refresh confirms capacity', async () => {
+    state.hostStatus = {
+      state: 'active',
+      ready: true,
+      reclaim_supported: false,
+      upgrade_available: true,
+      available_seats: 0,
+      reclaim_pending_count: 1,
+    }
+    state.hostRefetch.mockImplementationOnce(async () => {
+      state.hostStatus = {
+        ...state.hostStatus!,
+        reclaim_supported: true,
+        upgrade_available: false,
+        available_seats: 1,
+        reclaim_pending_count: 0,
+      }
+    })
+    const pending = render()
+    expect(pending).toMatch(/剩余可绑定槽位：(?:<!-- -->)?0/)
+    expect(pending).toMatch(/待回收绑定：(?:<!-- -->)?1/)
+    expect(pending).toContain('旧订阅的已删除绑定待启用槽位回收')
+    expect(pending).not.toContain('继续同步')
+    expect(api).not.toHaveBeenCalled()
+    click('启用槽位回收')
+    render()
+    expect(state.upgradeConfirm?.open).toBe(true)
+    state.upgradeConfirm?.handleConfirm?.()
+    await settle()
+    expect(api).toHaveBeenCalledExactlyOnceWith(
+      '/api/panel/crag-subscription/upgrade',
+      { method: 'POST', body: '{}' }
+    )
+    expect(state.hostRefetch).toHaveBeenCalledTimes(1)
+    const updated = render()
+    expect(updated).toMatch(/剩余可绑定槽位：(?:<!-- -->)?1/)
+    expect(updated).not.toContain('待回收绑定')
+    expect(updated).not.toContain('旧订阅的已删除绑定')
+  })
+
+  it('can recover confirmed deletion records on an active H2 subscription without redeeming again', async () => {
+    state.hostStatus = {
+      state: 'active',
+      ready: true,
+      reclaim_supported: true,
+      available_seats: 0,
+      reclaim_pending_count: 1,
+    }
+    vi.mocked(api).mockResolvedValueOnce({
+      ...state.hostStatus,
+      available_seats: 1,
+      reclaim_pending_count: 0,
+    })
+    expect(render()).toContain('继续同步')
+    expect(state.hostInput).toBeDefined()
+    click('继续同步')
+    await settle()
+    expect(api).toHaveBeenCalledExactlyOnceWith(
+      '/api/panel/crag-subscription/recover',
+      { method: 'POST', body: '{}' }
+    )
+    const updated = render()
+    expect(updated).toMatch(/剩余可绑定槽位：(?:<!-- -->)?1/)
+    expect(updated).not.toContain('待回收绑定')
+    expect(updated).not.toContain('继续同步')
+    expect(updated).toContain('订阅状态已同步')
+    expect(state.invalidateQueries).toHaveBeenCalledExactlyOnceWith({
+      queryKey: ['crag-host-subscription'],
+    })
+  })
+
+  it('does not describe a successful H1 sync as reclaiming deleted bindings', async () => {
+    state.hostStatus = {
+      state: 'sync_pending',
+      ready: true,
+      reclaim_supported: false,
+      reclaim_pending_count: 1,
+    }
+    vi.mocked(api).mockResolvedValueOnce({
+      ...state.hostStatus,
+      state: 'active',
+      available_seats: 0,
+    })
+    render()
+    click('继续同步')
+    await settle()
+    const updated = render()
+    expect(updated).toContain('仍有绑定待回收确认')
+    expect(updated).toMatch(/剩余可绑定槽位：(?:<!-- -->)?0/)
+    expect(updated).toMatch(/待回收绑定：(?:<!-- -->)?1/)
+    expect(updated).not.toContain('订阅状态已同步')
   })
 
   it.each([
@@ -576,7 +683,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     click('继续同步')
     await settle()
     const recovered = render()
-    expect(recovered).toContain('宿主机额度已更新，未自动绑定 VM')
+    expect(recovered).toContain('订阅状态已同步')
     expect(recovered).not.toContain('继续同步')
     expect(recovered).toContain('兑换到本机')
     expect(activateVmCragLicense).not.toHaveBeenCalled()

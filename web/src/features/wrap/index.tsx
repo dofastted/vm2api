@@ -221,6 +221,7 @@ export function WrapSamplePage() {
       results: {},
     })
     let failures = 0
+    let reclaimPending = 0
     try {
       for (let index = 0; index < targets.length; index++) {
         const target = targets[index]
@@ -259,6 +260,7 @@ export function WrapSamplePage() {
           }
         }
         if (!result.ok) failures++
+        else if (result.reclaim_pending) reclaimPending++
         setJob((previous) =>
           previous
             ? {
@@ -272,6 +274,14 @@ export function WrapSamplePage() {
       if (failures)
         toast.error(
           `${targets.length - failures}/${targets.length} 台安装成功，请检查失败项`
+        )
+      else if (reclaimPending)
+        toast.warning(
+          `${targets.length} 台内核已安装并重启，${reclaimPending} 个 CRAG 绑定待回收`,
+          {
+            description:
+              '启用槽位回收后，请重装 cli-node 完成回收，额度以服务端确认为准。',
+          }
         )
       else toast.success(`${targets.length} 台内核已安装并重启，调度状态已更新`)
     } finally {
@@ -712,7 +722,7 @@ export function WrapSamplePage() {
                               )}
                               <span>
                                 {result.ok
-                                  ? `重启完成${result.schedulable ? '，已恢复调度' : '，原调度限制保留'}`
+                                  ? `重启完成${result.schedulable ? '，已恢复调度' : '，原调度限制保留'}${result.reclaim_pending ? '；CRAG 绑定待回收' : ''}`
                                   : `${result.error || '安装失败'}${result.stopped ? '；服务已停用' : ''}`}
                               </span>
                             </p>

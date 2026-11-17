@@ -199,6 +199,7 @@ export type VmKernelSwitchJob = VmKernelSwitchTarget & {
   started_at: string
   finished_at: string | null
   error: { code: string; message: string } | null
+  reclaim_pending?: boolean
 }
 
 export function startVmKernelSwitch(id: string, body: VmKernelSwitchTarget) {

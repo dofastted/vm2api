@@ -14,7 +14,6 @@ import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Slider } from '@/components/ui/slider'
 import {
   Select,
   SelectContent,
@@ -23,6 +22,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Separator } from '@/components/ui/separator'
+import { Slider } from '@/components/ui/slider'
 import { ChoiceTiles } from '@/components/choice-tiles'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { EmptyState } from '@/components/empty-state'
@@ -31,13 +31,14 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
 import { geminiInventoryOptions } from '@/features/import/gemini-environments'
-import {
-  dashboardQueryOptions,
-  usageQueryOptions,
-} from '@/features/overview/queries'
+import { usageQueryOptions } from '@/features/overview/queries'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import { DeleteActiveVmHint } from '@/features/vm/delete-active-hint'
+import {
+  completeVmDeletion,
+  type VmDeleteResult,
+} from '@/features/vm/delete-vm'
 import { FleetPulse } from '@/features/vm/fleet-pulse'
 import { geminiSlot } from '@/features/vm/gemini-slot'
 import { VmListSkeleton } from '@/features/vm/list-skeleton'
@@ -177,20 +178,18 @@ export function VmListPage() {
           method: 'POST',
         })
       }
-      return api(`/api/panel/vms/${encodeURIComponent(id)}`, {
+      return api<VmDeleteResult>(`/api/panel/vms/${encodeURIComponent(id)}`, {
         method: 'DELETE',
       })
     },
-    onSuccess: async (_data, { id, switchTo }) => {
-      toast.success(
-        switchTo ? `已切换活跃到 ${switchTo} 并删除 ${id}` : '已删除'
-      )
+    onSuccess: async (data, { id, switchTo }) => {
       setDeleteTarget(null)
       setDeleteInput('')
-      await Promise.all([
-        qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
-        qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
-      ])
+      await completeVmDeletion(
+        qc,
+        data,
+        switchTo ? `已切换活跃到 ${switchTo} 并删除 ${id}` : '已删除'
+      )
     },
     onError: (error: Error) => toast.error(error.message),
   })
