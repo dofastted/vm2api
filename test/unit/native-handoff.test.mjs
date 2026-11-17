@@ -1236,3 +1236,64 @@ for (const stream of [false, true]) {
     )
   }
 }
+
+for (const deliveryMode of ['realtime', 'verified']) {
+  unixTest(`thinking-only max_tokens 502 is recovered after a ${deliveryMode} commit`, async () => {
+    const facts = {
+      schema_version: 2,
+      type: 'kin_provider_result',
+      source: 'crag',
+      http_status: 200,
+      public_status: 502,
+      provider_complete: true,
+      usage_complete: true,
+      response_valid: false,
+      delivery_error: { status: 502, type: 'api_error' },
+      validation_error: { type: 'api_error', message: 'native request completed without response content' },
+      message_id: 'msg_native_thinking_only',
+      model: MODEL,
+      stop_reason: 'max_tokens',
+      stop_sequence: null,
+      usage: { input_tokens: 196, output_tokens: 64, cache_read_input_tokens: 49109, cache_creation_input_tokens: 0 },
+    }
+    const fx = await fixture(
+      async (req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.write(start({ ...summary(), message_id: facts.message_id }))
+        res.write(frame({ type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }))
+        res.write(frame({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'hmm' } }))
+        res.write(frame({ type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig' } }))
+        res.write(frame({ type: 'error', error: { type: 'api_error', message: facts.validation_error.message } }))
+        res.write(resultFrame(facts))
+        res.end()
+      },
+      { capabilities: ['native_handoff_v1', 'provider_result_v2'] },
+    )
+    try {
+      const lines = []
+      let commits = 0
+      const result = await streamGoWorker({
+        ...options(fx),
+        deliveryMode,
+        onCommit: () => commits++,
+        onEvent: async (line) => lines.push(line),
+      })
+      assert.equal(result.ok, true)
+      assert.equal(result.status, 200)
+      assert.equal(result.recoveredEmptyContent, true)
+      assert.equal(commits, 1)
+      const types = eventsFrom(lines).map((event) => event.type)
+      assert.equal(types.filter((type) => type === 'message_start').length, 1)
+      assert.ok(!types.includes('error'))
+      assert.deepEqual(types.slice(-2), ['message_delta', 'message_stop'])
+      const open = new Set()
+      for (const event of eventsFrom(lines)) {
+        if (event.type === 'content_block_start') open.add(event.index)
+        if (event.type === 'content_block_stop') open.delete(event.index)
+      }
+      assert.equal(open.size, 0)
+    } finally {
+      await fx.close()
+    }
+  })
+}

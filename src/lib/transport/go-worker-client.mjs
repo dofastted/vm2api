@@ -842,10 +842,6 @@ function restoreCragPolicyBlock(result) {
   }
 }
 
-export async function callGoWorker(options) {
-  return restoreCragPolicyBlock(await callGoWorkerRaw(options))
-}
-
 async function callGoWorkerRaw({
   requestContext = null,
   exec,
@@ -1052,10 +1048,6 @@ async function callGoWorkerRaw({
   } finally {
     stopCancel()
   }
-}
-
-export async function streamGoWorker(options) {
-  return restoreCragPolicyBlock(await streamGoWorkerRaw(options))
 }
 
 async function streamGoWorkerRaw({
@@ -2047,4 +2039,123 @@ export async function countTokensViaWorker(exec, { body, headers = {}, timeoutMs
     return { ok: true, status: 200, body: { input_tokens: 8 }, headers: {}, via: 'go-worker-mock' }
   }
   return runSlotOauth(exec, 'count-tokens', { body, headers, timeoutMs })
+}
+
+const EMPTY_CONTENT_VERDICT = 'native request completed without response content'
+
+/**
+ * Records which SSE events actually reached `onEvent`, so a recovered
+ * thinking-only reply can be closed cleanly after the hop already committed
+ * (realtime delivery commits on the first thinking delta).
+ */
+function trackDownstreamEvents(onEvent) {
+  const state = { messageStarted: false, terminal: false, open: new Set() }
+  if (typeof onEvent !== 'function') return { onEvent, state }
+  return {
+    state,
+    onEvent: (line) => {
+      const text = typeof line === 'string' ? line : ''
+      if (text.startsWith('data:') && !text.includes('"type":"content_block_delta"')) {
+        try {
+          const event = JSON.parse(text.slice(5))
+          if (event?.type === 'message_start') state.messageStarted = true
+          else if (event?.type === 'content_block_start' && Number.isInteger(event.index)) state.open.add(event.index)
+          else if (event?.type === 'content_block_stop') state.open.delete(event.index)
+          else if (['message_delta', 'message_stop', 'error'].includes(event?.type)) state.terminal = true
+        } catch {}
+      }
+      return onEvent(line)
+    },
+  }
+}
+
+/**
+ * CRAG 3.0.7 rejects a provider 200 whose only output is a thinking block that
+ * consumed all of max_tokens (e.g. Claude Code's 64-token `<severity>` probe or
+ * auto-mode classifier on an adaptive-thinking model) and projects it as 502.
+ * The official API returns 200 with `stop_reason: max_tokens`; clients treat it
+ * as "no answer" and move on, while a 502 makes every hop retry the same
+ * billable request. Rebuild the 200 from the authenticated provider facts
+ * (content left empty: the thinking block's signature is not forwarded by the
+ * kernel).
+ *
+ * Realtime delivery commits the hop on the first thinking delta, so a
+ * committed result is recovered too: with no downstream writer nothing was
+ * sent; with one, `downstream` says what was sent and only the missing
+ * block stops and terminal frames are appended.
+ */
+export function recoverThinkingOnlyMaxTokens(result, { onEvent, onCommit, downstream = null } = {}) {
+  const facts = result?.providerResult
+  const writer = typeof onEvent === 'function'
+  if (
+    !result ||
+    result.ok ||
+    (result.committed && writer && (!downstream || downstream.terminal)) ||
+    facts?.schema_version !== 2 ||
+    facts.http_status !== 200 ||
+    facts.provider_complete !== true ||
+    facts.usage_complete !== true ||
+    facts.stop_reason !== 'max_tokens' ||
+    facts.validation_error?.message !== EMPTY_CONTENT_VERDICT ||
+    !/^msg_[A-Za-z0-9_-]+$/.test(facts.message_id || '') ||
+    typeof facts.model !== 'string' ||
+    !facts.usage
+  )
+    return result
+  const usage = facts.usage
+  const body = {
+    id: facts.message_id,
+    type: 'message',
+    role: 'assistant',
+    model: facts.model,
+    content: [],
+    stop_reason: 'max_tokens',
+    stop_sequence: facts.stop_sequence ?? null,
+    usage,
+  }
+  return (async () => {
+    let committed = !!result.committed
+    if (writer) {
+      if (!committed) onCommit?.()
+      const started = committed && downstream?.messageStarted === true
+      committed = true
+      const startUsage = { ...usage, output_tokens: 0 }
+      const events = [
+        ...(started
+          ? []
+          : [{ type: 'message_start', message: { ...body, stop_reason: null, stop_sequence: null, usage: startUsage } }]),
+        ...(started ? [...downstream.open].sort((a, b) => a - b).map((index) => ({ type: 'content_block_stop', index })) : []),
+        { type: 'message_delta', delta: { stop_reason: 'max_tokens', stop_sequence: body.stop_sequence }, usage },
+        { type: 'message_stop' },
+      ]
+      for (const event of events) {
+        await onEvent(`event: ${event.type}`)
+        await onEvent(`data: ${JSON.stringify(event)}`)
+        await onEvent('')
+      }
+    }
+    return {
+      ...result,
+      ok: true,
+      status: 200,
+      body,
+      usage,
+      model: facts.model,
+      stopReason: 'max_tokens',
+      sawMessageStop: true,
+      committed,
+      terminalState: 'verified',
+      recoveredEmptyContent: true,
+    }
+  })()
+}
+
+export async function callGoWorker(opts = {}) {
+  return recoverThinkingOnlyMaxTokens(restoreCragPolicyBlock(await callGoWorkerRaw(opts)), {})
+}
+
+export async function streamGoWorker(opts = {}) {
+  const tracked = trackDownstreamEvents(opts.onEvent)
+  const result = restoreCragPolicyBlock(await streamGoWorkerRaw({ ...opts, onEvent: tracked.onEvent }))
+  return recoverThinkingOnlyMaxTokens(result, { ...opts, onEvent: opts.onEvent, downstream: tracked.state })
 }
