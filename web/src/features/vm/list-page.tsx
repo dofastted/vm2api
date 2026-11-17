@@ -30,7 +30,10 @@ import { PageHeader } from '@/components/page-header'
 import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
-import { geminiInventoryOptions } from '@/features/import/gemini-environments'
+import {
+  GeminiStartupStatus,
+  geminiInventoryOptions,
+} from '@/features/import/gemini-environments'
 import { usageQueryOptions } from '@/features/overview/queries'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
@@ -194,10 +197,15 @@ export function VmListPage() {
     onError: (error: Error) => toast.error(error.message),
   })
   const vms: Vm[] = vmsQ.data?.items || []
-  const slots =
-    isAdmin && gemini.data?.available
-      ? [...vms, ...gemini.data.environments.map(geminiSlot)]
-      : vms
+  const geminiInventory = isAdmin ? gemini.data : undefined
+  const slots = geminiInventory?.available
+    ? [
+        ...vms,
+        ...geminiInventory.environments.map((environment) =>
+          geminiSlot(environment, geminiInventory)
+        ),
+      ]
+    : vms
   const poolQueue = vmsQ.data?.pool_queue
   const accounts = usage.data?.accounts
   const canCreate =
@@ -252,6 +260,11 @@ export function VmListPage() {
         error={vmsQ.error}
         skeleton={<VmListSkeleton />}
       >
+        {kind === 'gemini' && geminiInventory ? (
+          <div className='mb-3'>
+            <GeminiStartupStatus inventory={geminiInventory} />
+          </div>
+        ) : null}
         <FleetPulse
           className='mb-3'
           vms={scoped}

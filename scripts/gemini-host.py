@@ -15,6 +15,7 @@ import secrets
 import select
 import shutil
 import signal
+import socket
 import socketserver
 import stat
 import struct
@@ -38,6 +39,13 @@ AUTH_FAILURE = re.compile(
     rb"(invalid authorization code|failed to exchange|authentication failed)", re.I
 )
 SYSTEM_ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin", "LANG": "C.UTF-8"}
+PAYLOAD_FILES = (
+    "manifest.json",
+    "manifest.sig",
+    "agy",
+    "craggemini",
+    "libagy_bridge.so",
+)
 
 
 class Failure(Exception):
@@ -419,6 +427,7 @@ class Host:
         self.public_key = args.public_key
         self.payload_version = None
         self.payload_state = "not_configured"
+        self.payload_issue = None
         self.egress = args.egress
         self.uid_base = args.uid_base
         self.egress_uid = args.uid_base + MAX_ENVIRONMENTS
@@ -470,13 +479,7 @@ class Host:
     def verify_payload(self, source, install=False):
         check_root_owned(source)
         check_root_owned(self.public_key)
-        for name in (
-            "manifest.json",
-            "manifest.sig",
-            "agy",
-            "craggemini",
-            "libagy_bridge.so",
-        ):
+        for name in PAYLOAD_FILES:
             check_root_owned(source / name)
         output = subprocess.run(
             [
@@ -501,53 +504,92 @@ class Host:
             raise RuntimeError("Unexpected Gemini installer response")
         return version[1]
 
-    def inspect_payload(self):
-        if self.payload.exists() or self.payload.is_symlink():
-            try:
-                self.payload_version = self.verify_payload(self.payload)
-                self.payload_state = "installed"
-            except (OSError, RuntimeError, subprocess.SubprocessError):
-                print("Installed Gemini payload failed verification", file=sys.stderr)
-                self.payload_state = "invalid"
-            return
-        if (
-            self.payload_source
-            and self.payload_source.is_dir()
-            and self.public_key.is_file()
+    def payload_inputs_issue(self, source):
+        if not self.public_key.is_file():
+            return "gemini_public_key_missing"
+        if source is None or not source.is_dir():
+            return "gemini_payload_source_missing"
+        if any(not (source / name).is_file() for name in PAYLOAD_FILES):
+            return "gemini_payload_incomplete"
+        if source == self.payload and any(
+            not os.access(source / name, os.X_OK) for name in ("agy", "craggemini")
         ):
-            self.payload_state = "install_on_create"
+            return "gemini_payload_incomplete"
+        return None
+
+    def inspect_payload(self):
+        installed = self.payload.exists() or self.payload.is_symlink()
+        source = self.payload if installed else self.payload_source
+        self.payload_version = None
+        issue = self.payload_inputs_issue(source)
+        if issue:
+            self.payload_state = "not_configured"
+            self.payload_issue = issue
+            return
+        if installed:
+            try:
+                self.payload_version = self.verify_payload(source)
+            except (OSError, RuntimeError, subprocess.SubprocessError):
+                self.payload_state = "invalid"
+                self.payload_issue = "gemini_payload_invalid"
+                print("Installed Gemini payload failed verification", file=sys.stderr)
+                return
+        self.payload_state = "installed" if installed else "install_on_create"
+        self.payload_issue = None
 
     def ensure_payload(self):
-        if self.payload_state == "installed":
+        installed = self.payload.exists() or self.payload.is_symlink()
+        issue = self.payload_inputs_issue(
+            self.payload if installed else self.payload_source
+        )
+        if issue:
+            self.payload_state = "not_configured"
+            self.payload_issue = issue
+            self.payload_version = None
+            raise Failure(503, issue)
+        if installed and self.payload_state == "installed":
             return
+        self.payload_version = None
         try:
-            if self.payload.exists() or self.payload.is_symlink():
+            if installed:
                 self.payload_version = self.verify_payload(self.payload)
             else:
-                if (
-                    not self.payload_source
-                    or not self.payload_source.is_dir()
-                    or not self.public_key.is_file()
-                ):
-                    raise Failure(503, "gemini_payload_not_configured")
                 check_root_owned(self.payload.parent)
                 self.payload_version = self.verify_payload(
                     self.payload_source, install=True
                 )
         except (OSError, RuntimeError, subprocess.SubprocessError) as error:
             self.payload_state = "invalid"
+            self.payload_issue = "gemini_payload_invalid"
             print("Gemini payload installation or verification failed", file=sys.stderr)
             raise Failure(503, "gemini_payload_invalid") from error
         self.payload_state = "installed"
+        self.payload_issue = None
+
+    def oauth_runtime_issue(self):
+        if any(
+            not shutil.which(tool, path=SYSTEM_ENV["PATH"])
+            for tool in ("ip", "nft", "setpriv", "bwrap", "curl")
+        ):
+            return "gemini_oauth_tools_missing"
+        try:
+            check_root_owned(self.egress)
+            if not self.egress.is_file() or not os.access(self.egress, os.X_OK):
+                raise RuntimeError("Gemini egress helper is not executable")
+        except (OSError, RuntimeError):
+            return "gemini_egress_unavailable"
+        try:
+            if Path("/proc/sys/net/ipv4/ip_forward").read_text().strip() == "1":
+                return None
+        except OSError:
+            print("Gemini OAuth could not read IPv4 forwarding state", file=sys.stderr)
+        return "gemini_ipv4_forwarding_unavailable"
 
     def ensure_oauth_runtime(self):
         self.ensure_payload()
-        try:
-            check_root_owned(self.egress)
-            if not os.access(self.egress, os.X_OK):
-                raise RuntimeError("Gemini egress helper is not executable")
-        except (OSError, RuntimeError) as error:
-            raise Failure(503, "gemini_egress_unavailable") from error
+        issue = self.oauth_runtime_issue()
+        if issue:
+            raise Failure(503, issue)
 
     def save(self):
         private_json(self.state_file, self.environments)
@@ -625,9 +667,12 @@ class Host:
                 profile=directory / env["profile"],
             )
         if account.get("state") in ("error", "reauth_required") and env.get("account"):
-            env["account"].update(
-                state=account["state"], checked_at=account["checked_at"]
-            )
+            previous = env["account"]
+            if previous.get("state") in ("ok", "partial") and not previous.get(
+                "data_at"
+            ):
+                previous["data_at"] = previous.get("checked_at")
+            previous.update(state=account["state"], checked_at=account["checked_at"])
         else:
             env["account"] = account
         if account.get("state") == "reauth_required":
@@ -640,16 +685,23 @@ class Host:
 
     def request(self, operation, body):
         if operation == "list":
-            if self.payload_state in ("not_configured", "install_on_create"):
-                self.payload_state = (
-                    "install_on_create"
-                    if self.payload_source
-                    and self.payload_source.is_dir()
-                    and self.public_key.is_file()
-                    else "not_configured"
+            installed = self.payload.exists() or self.payload.is_symlink()
+            inputs_issue = self.payload_inputs_issue(
+                self.payload if installed else self.payload_source
+            )
+            if (
+                inputs_issue
+                or self.payload_state == "not_configured"
+                or (
+                    installed != (self.payload_state == "installed")
+                    and self.payload_state != "invalid"
                 )
+            ):
+                self.inspect_payload()
             return {
                 "payload_state": self.payload_state,
+                "payload_issue": self.payload_issue,
+                "oauth_runtime_issue": self.oauth_runtime_issue(),
                 "environments": [self.view(env) for env in self.environments.values()],
             }
         if operation == "create":
@@ -893,6 +945,15 @@ def main():
             args.socket.chmod(0o660)
             server.host = host
             server.timeout = 0.25
+            notify_socket = os.environ.get("NOTIFY_SOCKET")
+            if notify_socket:
+                address = (
+                    "\0" + notify_socket[1:]
+                    if notify_socket.startswith("@")
+                    else notify_socket
+                )
+                with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify:
+                    notify.sendto(b"READY=1", address)
             while not stop:
                 server.handle_request()
                 host.cleanup()

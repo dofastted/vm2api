@@ -10,9 +10,15 @@ import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Progress } from '@/components/ui/progress'
 
 const ROOT = '/api/panel/gemini'
 const QUERY_KEY = ['panel', 'gemini-environments'] as const
+
+type QuotaReading = {
+  remaining_fraction: number | null
+  reset_at: string | null
+}
 
 export type GeminiEnvironment = {
   id: string
@@ -22,6 +28,7 @@ export type GeminiEnvironment = {
     'unverified' | 'authorizing' | 'authorized' | 'reauth_required' | 'disabled'
   runtime_ready: boolean
   billing_ready: boolean
+  proxy_ready?: boolean
   auth_method: 'oauth' | 'api_key'
   kernel_version: string | null
   created_at: string | null
@@ -30,24 +37,28 @@ export type GeminiEnvironment = {
   account: {
     state: 'ok' | 'partial' | 'error' | 'reauth_required'
     checked_at: string | null
+    data_at?: string | null
     email: string | null
     project_id: string | null
     region: string | null
     plan: string | null
     expires_at: string | null
-    quotas: {
-      model: string
-      remaining_fraction: number
-      reset_at: string | null
+    quotas: (QuotaReading & { model: string })[]
+    quota_groups?: {
+      name: string
+      windows: (QuotaReading & { id: string; period: '5h' | 'weekly' })[]
     }[]
     credits: { type: string; amount: string }[]
   } | null
 }
 
-type Inventory = {
+export type GeminiInventory = {
   available: boolean
+  host_message?: string
   payload_state?:
-    'installed' | 'install_on_create' | 'not_configured' | 'invalid'
+    'installed' | 'install_on_create' | 'not_configured' | 'invalid' | 'unknown'
+  payload_issue?: keyof typeof PAYLOAD_ISSUES | null
+  oauth_runtime_issue?: keyof typeof OAUTH_ISSUES | null
   environments: GeminiEnvironment[]
 }
 type Authorization = { url: string; attempt_id: string }
@@ -70,6 +81,60 @@ const AUTH_LABELS: Record<GeminiEnvironment['auth_state'], string> = {
   disabled: '已停用',
 }
 
+const PAYLOAD_ISSUES = {
+  gemini_public_key_missing: '缺少 Gemini 发行公钥。',
+  gemini_payload_source_missing: '缺少 Antigravity 签名载荷安装源。',
+  gemini_payload_incomplete: 'Antigravity 签名载荷不完整或不可执行。',
+  gemini_payload_invalid: 'Gemini 载荷校验失败，请检查宿主服务日志。',
+}
+
+const OAUTH_ISSUES = {
+  gemini_oauth_tools_missing: '宿主缺少 Google 授权所需工具。',
+  gemini_egress_unavailable: '宿主缺少可用的 kin-egress。',
+  gemini_ipv4_forwarding_unavailable: '宿主 IPv4 转发未就绪。',
+}
+
+export function geminiPayloadIssue(inventory?: GeminiInventory) {
+  if (inventory?.payload_issue) return PAYLOAD_ISSUES[inventory.payload_issue]
+  if (inventory?.payload_state === 'invalid')
+    return PAYLOAD_ISSUES.gemini_payload_invalid
+  if (inventory?.payload_state === 'not_configured')
+    return '缺少签名载荷安装源或发行公钥。'
+  if (
+    inventory?.available &&
+    (!inventory.payload_state || inventory.payload_state === 'unknown')
+  )
+    return '宿主未报告可识别的载荷状态，请对齐版本。'
+  return null
+}
+
+export function GeminiStartupStatus({
+  inventory,
+}: {
+  inventory: GeminiInventory
+}) {
+  if (!inventory.available)
+    return (
+      <p role='status' className='text-sm'>
+        {inventory.host_message || '未检测到可用的 Gemini 宿主服务。'}{' '}
+        请在宿主检查 <code>systemctl status vm2api-gemini</code>；未安装时运行{' '}
+        <code>deploy/install.sh prepare-gemini</code>。
+      </p>
+    )
+  const payloadIssue = geminiPayloadIssue(inventory)
+  return (
+    <div className='space-y-1 text-sm'>
+      {payloadIssue ? <p role='status'>{payloadIssue}</p> : null}
+      {inventory.payload_state === 'install_on_create' ? (
+        <p role='status'>首次创建时自动校验并安装 Gemini 内核和官方 CLI。</p>
+      ) : null}
+      {inventory.oauth_runtime_issue ? (
+        <p role='status'>{OAUTH_ISSUES[inventory.oauth_runtime_issue]}</p>
+      ) : null}
+    </div>
+  )
+}
+
 const ACCOUNT_LABELS = {
   ok: '已读取',
   partial: '部分数据未返回',
@@ -83,6 +148,128 @@ function localTime(value?: string | null) {
   return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString()
 }
 
+const percent = new Intl.NumberFormat(undefined, {
+  style: 'percent',
+  maximumFractionDigits: 2,
+})
+
+function QuotaRow({
+  label,
+  reading,
+}: {
+  label: string
+  reading: QuotaReading
+}) {
+  const remaining = reading.remaining_fraction
+  return (
+    <li className='grid gap-x-4 gap-y-1 py-2.5 text-sm sm:grid-cols-[minmax(0,1fr)_auto]'>
+      <span className='break-all'>{label}</span>
+      <span className='tabular-nums'>
+        {remaining === null
+          ? '未提供比例'
+          : `已用 ${percent.format(1 - remaining)} · 剩余 ${percent.format(remaining)}`}
+      </span>
+      <span className='text-xs text-muted-foreground'>
+        重置 {localTime(reading.reset_at)}
+      </span>
+      {remaining === null ? null : (
+        <Progress
+          aria-hidden='true'
+          className='my-auto h-1.5'
+          value={(1 - remaining) * 100}
+        />
+      )}
+    </li>
+  )
+}
+
+function AntigravityUsage({ environment }: { environment: GeminiEnvironment }) {
+  const account = environment.account
+  const isOAuth = environment.auth_method === 'oauth'
+  const isStale =
+    account?.state === 'error' || account?.state === 'reauth_required'
+  const groups = isOAuth ? (account?.quota_groups ?? []) : []
+  const quotas = isOAuth ? (account?.quotas ?? []) : []
+  return (
+    <section className='space-y-3 border-b pb-4' aria-label='额度与使用分析'>
+      <h3 className='text-base font-semibold'>
+        {isOAuth ? 'Antigravity 额度与使用分析' : 'Gemini 使用分析'}
+      </h3>
+      {isOAuth ? (
+        <>
+          {isStale ? (
+            <p role='status' className='text-sm text-muted-foreground'>
+              {ACCOUNT_LABELS[account.state]} · 数据时间{' '}
+              {localTime(account.data_at)}
+            </p>
+          ) : null}
+          {groups.length ? (
+            <div className='space-y-3'>
+              <p className='text-sm text-muted-foreground'>
+                上游共享额度，同组模型不重复合计。
+              </p>
+              {groups.map((group) => (
+                <div key={group.windows[0].id} className='space-y-1'>
+                  <h4 className='text-sm font-medium break-words'>
+                    {group.name}
+                  </h4>
+                  <ul className='divide-y border-y'>
+                    {group.windows.map((window) => (
+                      <QuotaRow
+                        key={window.id}
+                        label={window.period === '5h' ? '5 小时' : '每周'}
+                        reading={window}
+                      />
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className='text-sm text-muted-foreground'>
+              共享额度窗口未提供。
+            </p>
+          )}
+          {quotas.length ? (
+            <details open={!groups.length}>
+              <summary className='cursor-pointer text-sm font-medium'>
+                按模型查看（{quotas.length}）
+              </summary>
+              <p className='mt-1 text-xs text-muted-foreground'>
+                模型读数不与共享窗口叠加。
+              </p>
+              <ul className='mt-1 divide-y border-y'>
+                {quotas.map((quota) => (
+                  <QuotaRow
+                    key={quota.model}
+                    label={quota.model}
+                    reading={quota}
+                  />
+                ))}
+              </ul>
+            </details>
+          ) : null}
+          <p className='text-sm break-words'>
+            <span className='text-muted-foreground'>
+              AI Credits 余额（不等同于费用）：
+            </span>
+            {account?.credits
+              .map((credit) => `${credit.type}: ${credit.amount}`)
+              .join('、') || '未提供'}
+          </p>
+        </>
+      ) : (
+        <p className='text-sm text-muted-foreground'>
+          Gemini API Key 不提供 Antigravity 订阅额度。
+        </p>
+      )}
+      <p className='text-xs text-muted-foreground'>
+        本地逐回合用量尚不可用；请求数、Token 和费用不从额度变化推算。
+      </p>
+    </section>
+  )
+}
+
 function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
   const account = environment.account
   return (
@@ -90,6 +277,13 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
       <div>
         <dt className='text-muted-foreground'>凭证</dt>
         <dd>{AUTH_LABELS[environment.auth_state]}</dd>
+      </div>
+      <div>
+        <dt className='text-muted-foreground'>绑定代理</dt>
+        <dd>
+          {environment.proxy_id}
+          {environment.proxy_ready === false ? ' · 不可用' : null}
+        </dd>
       </div>
       <div>
         <dt className='text-muted-foreground'>推理</dt>
@@ -145,33 +339,6 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
           {environment.models?.join('、') || '未提供'}
         </dd>
       </div>
-      <div className='sm:col-span-2 lg:col-span-3'>
-        <dt className='text-muted-foreground'>模型配额（剩余 / 重置时间）</dt>
-        <dd>
-          {account?.quotas.length
-            ? account.quotas.map((quota) => (
-                <div key={quota.model}>
-                  {quota.model} ·{' '}
-                  {new Intl.NumberFormat(undefined, {
-                    style: 'percent',
-                    maximumFractionDigits: 2,
-                  }).format(quota.remaining_fraction)}{' '}
-                  · {localTime(quota.reset_at)}
-                </div>
-              ))
-            : '未提供'}
-        </dd>
-      </div>
-      <div className='sm:col-span-2 lg:col-span-3'>
-        <dt className='text-muted-foreground'>
-          AI Credits 余额（不等同于费用）
-        </dt>
-        <dd>
-          {account?.credits
-            .map((credit) => `${credit.type}: ${credit.amount}`)
-            .join('、') || '未提供'}
-        </dd>
-      </div>
     </dl>
   )
 }
@@ -179,7 +346,7 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
 export function geminiInventoryOptions() {
   return queryOptions({
     queryKey: QUERY_KEY,
-    queryFn: () => api<Inventory>(ROOT),
+    queryFn: () => api<GeminiInventory>(ROOT),
     retry: false,
     refetchInterval: (query) =>
       query.state.data?.environments.some(
@@ -242,7 +409,7 @@ export function GeminiEnvironments({
             ...(authMethod === 'api_key' ? { api_key: apiKey.trim() } : {}),
           }),
         })
-        client.setQueryData<Inventory>(
+        client.setQueryData<GeminiInventory>(
           QUERY_KEY,
           (current) =>
             current && {
@@ -291,15 +458,14 @@ export function GeminiEnvironments({
   if (inventory.isPending)
     return <p role='status'>正在检测 Gemini 宿主机服务…</p>
   if (inventory.isError) return <p role='alert'>读取 Gemini 环境失败。</p>
-  if (!inventory.data?.available)
-    return (
-      <p role='status'>
-        此宿主机尚未启用 Gemini。请先在宿主运行{' '}
-        <code>deploy/install.sh prepare-gemini</code>，再刷新面板。
-      </p>
-    )
+  if (!inventory.data) return null
+  if (!inventory.data.available)
+    return <GeminiStartupStatus inventory={inventory.data} />
   const payloadState = inventory.data.payload_state
-  const canInstall = payloadState !== 'not_configured'
+  const canInstall =
+    payloadState === 'installed' ||
+    payloadState === 'install_on_create' ||
+    payloadState === 'invalid'
   const selectedId = environmentId || createdId
   const environment = inventory.data.environments.find(
     (item) => item.id === selectedId
@@ -316,15 +482,7 @@ export function GeminiEnvironments({
           管理。
         </p>
       ) : null}
-      {payloadState === 'install_on_create' ? (
-        <p role='status'>首次创建时自动校验并安装 Gemini 内核和官方 CLI。</p>
-      ) : null}
-      {payloadState === 'not_configured' ? (
-        <p role='status'>宿主服务已连接，但缺少签名载荷安装源或发行公钥。</p>
-      ) : null}
-      {payloadState === 'invalid' ? (
-        <p role='alert'>Gemini 载荷校验失败，请检查安装源及宿主服务日志。</p>
-      ) : null}
+      <GeminiStartupStatus inventory={inventory.data} />
       {isImport ? (
         <form
           className='space-y-3'
@@ -429,17 +587,23 @@ export function GeminiEnvironments({
         </p>
       ) : null}
       {environment ? (
-        <div className='space-y-3'>
+        <div className='space-y-4'>
           {isImport ? (
             <h3 className='font-medium'>{environment.name}</h3>
           ) : null}
+          {!isImport ? <AntigravityUsage environment={environment} /> : null}
           <EnvironmentData environment={environment} />
           <div className='flex flex-wrap gap-2'>
             {environment.auth_method !== 'api_key' ? (
               <Button
                 type='button'
                 variant='outline'
-                disabled={operation.isPending}
+                disabled={
+                  operation.isPending ||
+                  !canInstall ||
+                  Boolean(inventory.data.oauth_runtime_issue) ||
+                  environment.proxy_ready === false
+                }
                 onClick={() =>
                   operation.mutate({ type: 'authorize', id: environment.id })
                 }
@@ -454,7 +618,9 @@ export function GeminiEnvironments({
               <Button
                 type='button'
                 variant='outline'
-                disabled={operation.isPending}
+                disabled={
+                  operation.isPending || environment.proxy_ready === false
+                }
                 onClick={() =>
                   operation.mutate({ type: 'refresh', id: environment.id })
                 }

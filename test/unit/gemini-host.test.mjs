@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { authorizePanelRoute } from '../../src/lib/admin/panel-acl.mjs'
+import { dispatchGeminiNativeTurn, prepareGeminiNativeTurn } from '../../src/lib/gemini/native-turn.mjs'
 import { AGY_SHA256, installGeminiPayload, readSignedGeminiManifest } from '../../src/lib/gemini/payload.mjs'
 import {
   createGeminiPanelHandler,
@@ -18,6 +20,108 @@ const official =
   'https://accounts.google.com/o/oauth2/auth?redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&code_challenge_method=S256&state=fixture&code_challenge=fixture'
 const record = { id: 'gemini-fixture', proxy_id: 'px-fixture', name: 'Fixture', auth_state: 'unverified' }
 const bound = { id: record.proxy_id, enabled: true, status: 'ok', owner_user_id: null }
+
+test('Gemini, Anthropic and OpenAI text inputs produce the same native turn envelope', () => {
+  const model = 'gemini-3.1-pro'
+  const requestId = 'turn-01'
+  const text = '  你好\nworld  '
+  const expected = {
+    request_id: requestId,
+    stream: true,
+    body: { model, contents: [{ role: 'user', parts: [{ text }] }] },
+  }
+  for (const [protocol, body] of [
+    ['gemini', { contents: [{ parts: [{ text: '  你好\n' }, { text: 'world  ' }] }] }],
+    ['anthropic', { model, stream: true, messages: [{ role: 'user', content: [{ type: 'text', text }] }] }],
+    ['openai-chat', { model, stream: true, messages: [{ role: 'user', content: text }] }],
+    [
+      'openai-responses',
+      { model, stream: true, input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text }] }] },
+    ],
+    ['openai-responses', { model, stream: true, input: text }],
+  ]) {
+    assert.deepEqual(prepareGeminiNativeTurn({ protocol, body, model, requestId, stream: true }), expected)
+  }
+})
+
+test('native turn conversion rejects unsupported fields, turns, and unsafe text before dispatch', () => {
+  const model = 'gemini-3.1-pro'
+  const requestId = 'turn-01'
+  const user = { role: 'user', content: 'hello' }
+  const valid = { model, stream: true, messages: [user] }
+  const turn = (body, options) =>
+    prepareGeminiNativeTurn({ protocol: 'openai-chat', body, model, requestId, ...options })
+  for (const body of [
+    { ...valid, stream: false },
+    { ...valid, stream: undefined },
+    { ...valid, model: 'other' },
+    { ...valid, temperature: 0 },
+    { ...valid, tools: [] },
+    { ...valid, messages: [{ role: 'system', content: 'do not drop' }, user] },
+    { ...valid, messages: [user, user] },
+    { ...valid, messages: [{ ...user, name: 'caller' }] },
+    { ...valid, messages: [{ ...user, content: [{ type: 'image_url', image_url: {} }] }] },
+    ...[' \t', 'hello\u0085/quit', 'hello\0world'].map((content) => ({ ...valid, messages: [{ ...user, content }] })),
+  ]) {
+    assert.throws(() => turn(body), { status: 400, code: 'gemini_unsupported_turn' })
+  }
+  assert.throws(() => turn(valid, { requestId: '../bad' }), { status: 400 })
+  assert.throws(() => turn(valid, { stream: false }), { status: 400 })
+  assert.throws(() => turn({ ...valid, messages: [{ ...user, content: '中'.repeat(90000) }] }), { status: 413 })
+  assert.throws(
+    () =>
+      turn(
+        { contents: [{ parts: [{ text: 'hello', thoughtSignature: 'preserve-or-reject' }] }] },
+        { protocol: 'gemini', stream: true },
+      ),
+    { status: 400 },
+  )
+})
+
+test('the native transport uses the internal Unix socket and returns Gemini SSE verbatim', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-turn-'))
+  const socketPath = path.join(directory, 'kernel.sock')
+  const internalToken = 'internal-fixture-not-a-secret'
+  const turn = {
+    socketPath,
+    internalToken,
+    protocol: 'gemini',
+    model: 'gemini-pro',
+    requestId: 'turn-01',
+    stream: true,
+    body: { contents: [{ parts: [{ text: 'hello' }] }] },
+  }
+  const sse = ': heartbeat\r\n\r\ndata: {"candidates":[{"finishReason":"STOP"}]}\r\n\r\n'
+  const received = []
+  const server = http.createServer(async (request, response) => {
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    received.push([
+      request.method,
+      request.url,
+      request.headers['x-kin-internal-token'],
+      JSON.parse(Buffer.concat(chunks)),
+    ])
+    response.writeHead(200, { 'Content-Type': 'text/event-stream' })
+    response.end(sse)
+  })
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve))
+    await rm(directory, { recursive: true, force: true })
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, resolve)
+  })
+  await assert.rejects(dispatchGeminiNativeTurn({ ...turn, body: { ...turn.body, tools: [] } }), { status: 400 })
+  const response = await dispatchGeminiNativeTurn({ ...turn, signal: AbortSignal.timeout(5000) })
+  assert.equal(response.statusCode, 200)
+  assert.equal(response.headers['content-type'], 'text/event-stream')
+  const chunks = []
+  for await (const chunk of response) chunks.push(chunk)
+  assert.equal(Buffer.concat(chunks).toString(), sse)
+  assert.deepEqual(received, [['POST', '/internal/v1/messages', internalToken, prepareGeminiNativeTurn(turn)]])
+})
 
 function setup(callHost, proxy = bound) {
   const response = { setHeader() {} }
@@ -45,7 +149,43 @@ test('Gemini import is admin-only and unavailable without the host service', asy
     throw new Error('private socket path')
   })
   const result = await run('GET', root)
-  assert.deepEqual(result, { status: 200, body: { ok: true, data: { available: false, environments: [] } } })
+  assert.equal(result.status, 200)
+  assert.equal(result.body.data.available, false)
+  assert.equal(result.body.data.host_error, 'gemini_host_unavailable')
+  assert.deepEqual(result.body.data.environments, [])
+  assert.doesNotMatch(JSON.stringify(result), /private socket path/)
+})
+
+test('unknown Gemini payload status is not installed and proxy failures do not hide inventory', async () => {
+  const run = setup(() => ({ payload_state: 'unexpected', payload_issue: 'private', environments: [record] }), {
+    ...bound,
+    enabled: false,
+  })
+  const { body } = await run('GET', root)
+  assert.equal(body.data.available, true)
+  assert.equal(body.data.payload_state, 'unknown')
+  assert.equal(body.data.payload_issue, null)
+  assert.equal(body.data.environments[0].proxy_ready, false)
+})
+
+test('Gemini inventory distinguishes a missing socket from an invalid host response', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-host-'))
+  const socketPath = path.join(directory, 'control.sock')
+  const server = http.createServer((_request, response) => response.end('<html>unexpected</html>'))
+  const previous = process.env.KIN_GEMINI_HOST_SOCKET
+  process.env.KIN_GEMINI_HOST_SOCKET = socketPath
+  const run = createGeminiPanelHandler({ json: (_response, _status, body) => body })
+  const status = async () => (await run({ method: 'GET' }, { setHeader() {} }, root)).data.host_error
+  try {
+    assert.equal(await status(), 'gemini_host_socket_missing')
+    await new Promise((resolve, reject) => server.once('error', reject).listen(socketPath, resolve))
+    assert.equal(await status(), 'gemini_host_protocol_error')
+  } finally {
+    if (previous === undefined) delete process.env.KIN_GEMINI_HOST_SOCKET
+    else process.env.KIN_GEMINI_HOST_SOCKET = previous
+    if (server.listening) await new Promise((resolve) => server.close(resolve))
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 test('reachable Gemini host reports lazy install without dependencies on an existing environment', async () => {
@@ -53,6 +193,8 @@ test('reachable Gemini host reports lazy install without dependencies on an exis
   assert.deepEqual((await run('GET', root)).body.data, {
     available: true,
     payload_state: 'install_on_create',
+    payload_issue: null,
+    oauth_runtime_issue: null,
     environments: [],
   })
   const invalidPayload = setup(() => {
@@ -129,6 +271,52 @@ test('API key import returns only approved account and quota fields', async () =
   assert.equal(result.body.data.billing_ready, false)
   assert.doesNotMatch(JSON.stringify(result.body), new RegExp(secret))
   assert.equal((await run('POST', `${root}/environments`, { ...create, api_key: 'invalid' })).status, 400)
+})
+
+test('Gemini panel exposes scoped quota windows without inventing missing fractions or exposing raw fields', async () => {
+  const run = setup(() => ({
+    environments: [
+      {
+        ...record,
+        auth_state: 'authorized',
+        account: {
+          state: 'error',
+          checked_at: '2030-01-02T00:00:00Z',
+          data_at: '2030-01-01T00:00:00Z',
+          quota_groups: [
+            {
+              name: 'Gemini Pro',
+              raw: 'private fixture',
+              windows: [
+                {
+                  id: 'gemini-5h',
+                  period: '5h',
+                  remaining_fraction: 0,
+                  reset_at: '2030-01-02T05:00:00Z',
+                  raw: 'private fixture',
+                },
+                { id: 'gemini-weekly', period: 'weekly', remaining_fraction: null },
+                { id: 'invalid-window', period: 'monthly', remaining_fraction: 4 },
+              ],
+            },
+          ],
+        },
+      },
+    ],
+  }))
+  const result = await run('GET', root)
+  const [environment] = result.body.data.environments
+  assert.equal(environment.account.data_at, '2030-01-01T00:00:00Z')
+  assert.deepEqual(environment.account.quota_groups, [
+    {
+      name: 'Gemini Pro',
+      windows: [
+        { id: 'gemini-5h', period: '5h', remaining_fraction: 0, reset_at: '2030-01-02T05:00:00Z' },
+        { id: 'gemini-weekly', period: 'weekly', remaining_fraction: null, reset_at: null },
+      ],
+    },
+  ])
+  assert.doesNotMatch(JSON.stringify(result.body), /private fixture/)
 })
 
 test('official login links are validated and code is returned only to its selected environment', async () => {
