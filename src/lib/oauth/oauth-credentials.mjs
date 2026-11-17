@@ -24,6 +24,15 @@ import { flattenOauthIdentity, normalizeSubscriptionType } from './oauth-identit
 
 export const REFRESH_SKEW_MS = 5 * 60 * 1000
 
+/**
+ * Scheduled refresh lead. The official CLI inside the slot refreshes on its own
+ * once a grant is within 5 minutes of expiry (same as REFRESH_SKEW_MS) and takes
+ * a different lock than the host. Refreshing 15 minutes ahead (monitor ticks
+ * every 5) means the CLI never sees an expiring grant, so only one party ever
+ * spends a refresh token.
+ */
+export const PROACTIVE_REFRESH_SKEW_MS = 15 * 60 * 1000
+
 export const SENSITIVE_CREDENTIAL_KEYS = [
   'access_token',
   'refresh_token',
@@ -142,6 +151,7 @@ function regularOauthGrant(file) {
     return {
       refresh: String(oauth.refreshToken || oauth.refresh_token || '').trim(),
       expires: Number(oauth.expiresAt || oauth.expires_at || 0) || 0,
+      account: String(oauth.accountUuid || oauth.account_uuid || '').trim(),
       mtimeMs: Number(st.mtimeMs) || 0,
     }
   } catch {
@@ -154,6 +164,8 @@ function officialGrantWins(official, worker) {
   if (!official?.refresh) return false
   if (!worker?.refresh) return true
   if (official.refresh === worker.refresh) return false
+  // Another account's grant is a leftover login, never a rotation of this slot's grant.
+  if (official.account && worker.account && official.account !== worker.account) return false
   if (official.expires !== worker.expires) {
     if (!worker.expires) return true
     if (!official.expires) return false
@@ -169,12 +181,21 @@ function officialGrantWins(official, worker) {
  * grant is copied onto the worker file first. Deleting it and refreshing
  * the older RT is what revokes the new grant.
  */
+/**
+ * `adoptOfficial: 'rotation'` adopts only over an existing worker grant: it keeps a
+ * refresh the CLI made while the alias was a regular file, but a loose native
+ * login never seeds an empty slot.
+ */
 export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false, adoptOfficial = true } = {}) {
   const claudeDir = path.join(homeDir || '', '.claude')
   const workerFile = path.join(claudeDir, 'credentials.json')
   const officialFile = path.join(claudeDir, '.credentials.json')
   if (!homeDir) return { wrote: false, error: 'home missing' }
-  const adopt = adoptOfficial && officialGrantWins(regularOauthGrant(officialFile), regularOauthGrant(workerFile))
+  const workerGrant = regularOauthGrant(workerFile)
+  const adopt =
+    !!adoptOfficial &&
+    (adoptOfficial !== 'rotation' || !!workerGrant?.refresh) &&
+    officialGrantWins(regularOauthGrant(officialFile), workerGrant)
   if (!fs.existsSync(workerFile)) {
     if (!adopt && !create) return { wrote: false, error: 'worker credentials.json missing' }
     fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 })
