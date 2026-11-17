@@ -117,6 +117,13 @@ export type VmTelemetryState = {
   last_error: string | null
 }
 
+export type CragTelemetryState = {
+  state: 'launch_policy'
+  enabled: boolean | null
+  error: string | null
+  upload_confirmed: false
+}
+
 export type VmKernelHealth = {
   reachable?: boolean
   process_up?: boolean
@@ -139,7 +146,7 @@ export type VmKernelSnapshot = {
   credential_owner?: string | null
   credential_state?: string | null
   proxy_state?: string | null
-  telemetry?: VmTelemetryState | null
+  telemetry?: VmTelemetryState | CragTelemetryState | null
   process_topology?: {
     rust_pid1?: boolean
     go_worker_pid1?: boolean

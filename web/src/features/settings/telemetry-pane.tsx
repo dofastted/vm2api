@@ -60,6 +60,11 @@ const LIVE: Record<LiveKey, { legend: string; swatch: string; text: string }> =
       swatch: 'bg-[var(--status-caution-solid)]',
       text: 'text-[var(--status-caution)]',
     },
+    policy: {
+      legend: 'CRAG 已开 · 未验证上传',
+      swatch: 'bg-[var(--status-caution-solid)]',
+      text: 'text-[var(--status-caution)]',
+    },
     blocked: {
       legend: '等待或失败',
       swatch: 'bg-[var(--status-warn-solid)]',
@@ -102,12 +107,18 @@ const CONTRACT: { file: string; key: string; on: string; off: string }[] = [
   {
     file: 'settings.json · env',
     key: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
-    on: '"1"',
+    on: 'CRAG 不写；其他 "1"',
     off: '"0"',
   },
   {
     file: 'settings.json · env',
     key: 'DISABLE_TELEMETRY',
+    on: '不写',
+    off: '"1"',
+  },
+  {
+    file: 'settings.json · env',
+    key: 'CLAUDE_CODE_DISABLE_TELEMETRY（CRAG）',
     on: '不写',
     off: '"1"',
   },
@@ -147,7 +158,7 @@ function pipeline(interval: number): { title: string; body: string }[] {
   return [
     {
       title: '播种',
-      body: '单 VM 开关发布到当前 VM；常驻 cli-node 热读，不重启 VM、推理进程或出口服务。',
+      body: 'cli-node 热读；CRAG 必要时排空并重启内核，随后复验并恢复调度。停机槽只发布设置。',
     },
     {
       title: '身份',
@@ -185,8 +196,8 @@ function IntervalSetting({
         label='上传间隔'
         desc={
           <>
-            只在有待发事件时按间隔合批。全局保存后确认发布各 VM 的 kernel.json；
-            不重启进程，缺有效凭证或当前出口信息时暂停上传。
+            仅适用
+            cli-node：有待发事件时才合批，缺有效凭证或当前出口信息时暂停上传。
           </>
         }
         value={amountIn(value, unit)}
@@ -357,12 +368,11 @@ export function TelemetryPane({
               </code>{' '}
               才算开，缺这个值也是关。把{' '}
               <code className='font-mono text-xs text-foreground'>
-                CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+                settings.json
               </code>{' '}
-              改成 0 不会打开：关的时候播种才写成 0，开的时候写成 1。官方 CLI
-              把这个变量的任何已设置值都当成只走必要流量。旧 Go
-              遥测服务已下线，发送者是常驻 cli-node，默认关。展开槽位可提取最近
-              40 条计数日志，不含正文或身份。
+              发布到原生 Claude 目录。CRAG
+              的检测只核验原生启动策略，不发送测试遥测，也不证明上传。 其他
+              Claude 槽由常驻 cli-node 发送，展开可查看最近 40 条计数日志。
               {codexCount
                 ? ` GPT 使用独立统计链路，${codexCount} 个不在此列。`
                 : ''}
@@ -395,10 +405,9 @@ export function TelemetryPane({
               ) : null}
             </Button>
             <Button
-              size='icon'
-              variant='ghost'
-              className='size-8'
-              aria-label='重新探测'
+              size='sm'
+              variant='outline'
+              aria-label='重新检测遥测状态'
               disabled={fetching}
               onClick={() => {
                 void dash.refetch()
@@ -408,6 +417,7 @@ export function TelemetryPane({
               <RefreshCw
                 className={cn('size-4', fetching && 'motion-safe:animate-spin')}
               />
+              检测
             </Button>
           </div>
         </CardHeader>
@@ -581,7 +591,7 @@ export function TelemetryPane({
             <p>
               依次重写 {pendingTargets.length} 个槽的种子文件
               {pendingRunning
-                ? `；其中 ${pendingRunning} 个运行中，将等待原生配置确认，不中断推理或重启出口`
+                ? `；其中 ${pendingRunning} 个运行中。CRAG 若需重启，先排空再重启内核，不重启 VM 或出口`
                 : ''}
               。
             </p>
@@ -672,27 +682,31 @@ function SlotRow({
   onToggleOpen: () => void
   onSet: (enabled: boolean) => void
 }) {
-  const { vm, on, live, label, probing, confirmed } = slot
+  const { vm, on, live, label, probing, confirmed, crag } = slot
   const name = slotNameLabel(vm)
   const panelId = `telemetry-log-${vm.id}`
   return (
     <li>
       <div className='grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 px-4 py-3 sm:grid-cols-[auto_minmax(0,1fr)_10rem_auto] sm:px-6'>
-        <button
-          type='button'
-          aria-expanded={open}
-          aria-controls={panelId}
-          aria-label={`${open ? '收起' : '展开'} ${vm.id} 上传记录`}
-          onClick={onToggleOpen}
-          className='-m-1 rounded-md p-1 text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
-        >
-          <ChevronRight
-            className={cn(
-              'size-4 motion-safe:transition-transform motion-safe:duration-200',
-              open && 'rotate-90'
-            )}
-          />
-        </button>
+        {crag ? (
+          <span className='w-4' />
+        ) : (
+          <button
+            type='button'
+            aria-expanded={open}
+            aria-controls={panelId}
+            aria-label={`${open ? '收起' : '展开'} ${vm.id} 上传记录`}
+            onClick={onToggleOpen}
+            className='-m-1 rounded-md p-1 text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
+          >
+            <ChevronRight
+              className={cn(
+                'size-4 motion-safe:transition-transform motion-safe:duration-200',
+                open && 'rotate-90'
+              )}
+            />
+          </button>
+        )}
         <div className='min-w-0'>
           <div className='flex min-w-0 items-baseline gap-2'>
             <span className='truncate text-sm font-medium'>{name}</span>
@@ -761,7 +775,9 @@ function SlotRow({
           })}
         </div>
       </div>
-      {open ? <UploadPanel id={vm.id} panelId={panelId} on={on} /> : null}
+      {open && !crag ? (
+        <UploadPanel id={vm.id} panelId={panelId} on={on} />
+      ) : null}
     </li>
   )
 }

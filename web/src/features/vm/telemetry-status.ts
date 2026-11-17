@@ -8,6 +8,7 @@ export function telemetryPolicyConfirmed(
   enabled: boolean
 ): boolean {
   if (!telemetry || telemetry.state === 'unsupported') return false
+  if (telemetry.state === 'launch_policy') return telemetry.enabled === enabled
   if (enabled) return telemetry.enabled && telemetry.state !== 'disabled'
   return (
     !telemetry.enabled &&
@@ -21,6 +22,17 @@ export function telemetryStatusLabel(
   desired: boolean | null = null
 ): string {
   if (telemetry?.state === 'unsupported') return '此运行环境不支持'
+  if (telemetry?.state === 'launch_policy') {
+    if (
+      telemetry.enabled === null ||
+      (desired !== null && telemetry.enabled !== desired)
+    ) {
+      return telemetry.error || 'CRAG 启动策略待确认'
+    }
+    return telemetry.enabled
+      ? 'CRAG 已确认开启 · 未验证上传'
+      : 'CRAG 已确认关闭启动策略'
+  }
   if (desired !== null && !telemetryPolicyConfirmed(telemetry, desired)) {
     return desired
       ? '已配置开启 · 等待 VM 确认'

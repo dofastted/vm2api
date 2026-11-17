@@ -1882,7 +1882,12 @@ export function prepareClaudeClientCredentials(exec, { refreshInSlot = runSlotOa
   return reconcileClaudeClientCredentials(exec, { ...options, refreshInSlot })
 }
 
-export async function callWorkerPost(exec, requestPath, body, { timeoutMs = 20000, signal } = {}) {
+export async function callWorkerPost(
+  exec,
+  requestPath,
+  body,
+  { timeoutMs = 20000, signal, requireInternalToken = false } = {},
+) {
   try {
     const response = await workerRequest(exec, {
       method: 'POST',
@@ -1890,6 +1895,7 @@ export async function callWorkerPost(exec, requestPath, body, { timeoutMs = 2000
       body,
       timeoutMs,
       signal,
+      requireInternalToken,
       maxRequestBytes: 8192,
     })
     const parsed = parseJson(await readAll(response, 16384), response.statusCode)

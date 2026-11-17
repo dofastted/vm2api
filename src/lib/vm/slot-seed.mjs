@@ -152,7 +152,13 @@ export function writeSlotSeedFiles(
     autoUpdates: false,
     grove_enabled: false,
   }
-  if (cragNativeTelemetry && isTelemetryEnabled(pol)) delete settings.env[NONESSENTIAL_TRAFFIC_ENV_KEY]
+  if (cragNativeTelemetry) {
+    if (isTelemetryEnabled(pol)) {
+      delete settings.env[NONESSENTIAL_TRAFFIC_ENV_KEY]
+    } else {
+      settings.env.CLAUDE_CODE_DISABLE_TELEMETRY = '1'
+    }
+  }
   const seedDoc = buildKinSeedJson(vm, pol, {
     timezone,
     locale,

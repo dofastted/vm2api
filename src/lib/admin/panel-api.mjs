@@ -925,7 +925,9 @@ export async function buildVmDetail({
       }
     }
   }
-  const processStatus = gpt ? null : await slotProcessStatus({ projectRoot: cfg.paths.project, vm })
+  const processStatus = gpt
+    ? null
+    : await slotProcessStatus({ projectRoot: cfg.paths.project, vm, routing: routingConfig })
   const activeEngine = gpt ? null : rustHealth?.reachable ? 'rust' : null
   return ok({
     vm: summary,

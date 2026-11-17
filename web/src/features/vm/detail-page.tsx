@@ -152,9 +152,12 @@ function VmDetailBody({
     enabled: perms.admin && wantedTab === 'seed',
     refetchInterval: wantedTab === 'seed' ? 2000 : false,
   })
+  const cragTelemetry =
+    detail.data?.kernel?.telemetry?.state === 'launch_policy' ||
+    detail.data?.vm?.resolved_dataplane === 'crag'
   const seedUploadLog = useQuery({
     ...vmSeedUploadLogQueryOptions(id),
-    enabled: perms.admin && wantedTab === 'seed' && seedDebug,
+    enabled: perms.admin && wantedTab === 'seed' && seedDebug && !cragTelemetry,
     refetchInterval: seedDebug && wantedTab === 'seed' ? 2000 : false,
   })
   usePoolSeatStream()
@@ -677,6 +680,7 @@ function VmDetailBody({
                     seed={seed.data}
                     slot={seedSlot}
                     telemetry={kernel?.telemetry}
+                    cragTelemetry={cragTelemetry}
                     saving={saveSeed.isPending}
                     readError={seed.isError ? seed.error.message : null}
                     debug={seedDebug}

@@ -1,6 +1,14 @@
 /** Native telemetry status, read from the same authenticated VM kernel as inference. */
-import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
+import {
+  rustKernelHealth,
+  supportsCragTelemetryApply,
+  toPublicKernelHealth,
+  verifyCragTelemetryPolicy,
+} from '../transport/rust-kernel-client.mjs'
+import { cragV2KernelActive } from '../protocol/crag-print-prompt.mjs'
+import { isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { slotExec } from './slot-runtime.mjs'
+import { resolveKernelDataplane } from './slot-engine.mjs'
 import { slotHost } from './slot-host.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { runSlotProcess } from '../transport/slot-oauth.mjs'
@@ -45,7 +53,13 @@ export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect 
     : { ok: false, code: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
 }
 
-export async function readSlotProcessStatus({ projectRoot, vm, health = rustKernelHealth, timeoutMs = 2500 } = {}) {
+export async function readSlotProcessStatus({
+  projectRoot,
+  vm,
+  routing = {},
+  health = rustKernelHealth,
+  timeoutMs = 2500,
+} = {}) {
   const unknown = { telemetry: null, process_topology: null }
   if (!projectRoot || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$/.test(String(vm?.id || ''))) return unknown
   if (isCodexVm(vm) || slotHost(vm).native) {
@@ -54,11 +68,24 @@ export async function readSlotProcessStatus({ projectRoot, vm, health = rustKern
       telemetry: { enabled: false, state: 'unsupported', pending_events: 0, last_upload_at: null, last_error: null },
     }
   }
+  let crag = resolveKernelDataplane(vm, routing) === 'crag'
+  const unconfirmed = '未能核验 CRAG 启动策略'
+  const cragStatus = ({ enabled = null, error = null } = {}) => ({
+    ...unknown,
+    telemetry: { state: 'launch_policy', enabled, error, upload_confirmed: false },
+  })
   try {
-    const observed = await health(slotExec(projectRoot, vm), { timeoutMs })
-    return { ...unknown, telemetry: toPublicKernelHealth(observed, 'rust').telemetry ?? null }
+    const exec = slotExec(projectRoot, vm)
+    const observed = await health(exec, { timeoutMs })
+    const liveCrag = cragV2KernelActive({ health: observed })
+    crag ||= liveCrag
+    if (!crag) return { ...unknown, telemetry: toPublicKernelHealth(observed, 'rust').telemetry ?? null }
+    if (observed?.ok !== true) return cragStatus({ error: unconfirmed })
+    if (!liveCrag) return cragStatus({ error: '运行中的内核不是 CRAG' })
+    if (!supportsCragTelemetryApply(observed)) return cragStatus({ error: '运行中的 CRAG 不支持遥测核验' })
+    const verified = await verifyCragTelemetryPolicy(exec, isTelemetryEnabled(vm.seed_policy), timeoutMs)
+    return cragStatus(verified)
   } catch {
-    // A stopped/unreachable VM is unknown, not disabled or uploading.
-    return unknown
+    return crag ? cragStatus({ error: unconfirmed }) : unknown
   }
 }

@@ -25,11 +25,20 @@ for (const dataplane of ['wrap', 'crag']) {
   test(`fresh ${dataplane} VM has private, VM-owned first-launch settings`, (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fresh-settings-'))
     t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-    const vm = { id: 'vm-13', node_id: 'node-a', dataplane, timezone: 'Asia/Shanghai' }
+    const vm = {
+      id: 'vm-13',
+      node_id: 'node-a',
+      dataplane,
+      timezone: 'Asia/Shanghai',
+      seed_policy: { telemetry_disabled: false, extra_env: { CLAUDE_CODE_DISABLE_TELEMETRY: '0', CUSTOM: 'kept' } },
+    }
     const { homeDir } = seedFreshCliHome(root, vm)
     const file = path.join(homeDir, '.claude', 'settings.json')
     const settings = JSON.parse(fs.readFileSync(file, 'utf8'))
     assert.equal(settings.env.TZ, 'Asia/Shanghai')
+    assert.equal(settings.env.CUSTOM, 'kept')
+    assert.equal(settings.env.CLAUDE_CODE_DISABLE_TELEMETRY, undefined)
+    assert.equal(settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, dataplane === 'crag' ? undefined : '1')
     assert.equal(settings.autoUpdates, false)
     assert.equal(fs.statSync(file).mode & 0o777, 0o600)
     for (const dir of [homeDir, path.dirname(file)]) {

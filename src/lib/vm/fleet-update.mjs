@@ -8,10 +8,10 @@ import { runtimeKind } from './runtime-kind.mjs'
 import { reloadSlotReady, slotExec } from './slot-runtime.mjs'
 import { collectSlotIdentity } from './guest-identity.mjs'
 import {
-  applyCragTelemetryPolicy,
   rustKernelHealth,
   rustKernelPaths,
   supportsCragTelemetryApply,
+  verifyCragTelemetryPolicy,
 } from '../transport/rust-kernel-client.mjs'
 import { restartRustKernel, wrapHopInflight } from '../transport/rust-kernel-supervisor.mjs'
 import path from 'node:path'
@@ -56,31 +56,6 @@ function publicationPlacement(vm) {
 
 const ACTIONS = new Set(['collect', 'reload', 'roll', 'telemetry'])
 
-const cragTelemetryErrors = {
-  telemetry_policy_not_published: 'CRAG 未读到已发布的槽内设置',
-  telemetry_native_settings_blocked: 'Claude Code 槽内设置或 OS 特征阻止开启遥测',
-  telemetry_restart_required: '槽内设置已发布；需排空并重启 CRAG 内核',
-}
-
-async function verifyCragTelemetry(exec, enabled, timeoutMs) {
-  const { status, body } = await applyCragTelemetryPolicy(exec, enabled, { timeoutMs })
-  if (
-    status === 200 &&
-    body?.ok === true &&
-    body.applied === true &&
-    body.enabled === enabled &&
-    body.scope === 'native_claude_launch' &&
-    body.upload_confirmed === false
-  ) {
-    return { ok: true, applied: true, action: 'applied', enabled, scope: body.scope, upload_confirmed: false }
-  }
-  const code = body?.error?.type
-  if (status === 409 && Object.hasOwn(cragTelemetryErrors, code)) {
-    return { ok: false, code, error: cragTelemetryErrors[code] }
-  }
-  return { ok: false, code: 'telemetry_observation_unavailable', error: 'CRAG 未确认原生遥测启动策略' }
-}
-
 async function restartForCragTelemetry({ projectRoot, vmPath, current, revision, enabled, timeoutMs, lifecycle, ops }) {
   return withVmLock(vmPath, async () => {
     const record = current()
@@ -98,7 +73,7 @@ async function restartForCragTelemetry({ projectRoot, vmPath, current, revision,
       drainTimeoutMs: timeoutMs,
       operation: async (tag) => {
         const supersededOperation = () => changed() || current().schedule_hold?.detail?.tag !== tag
-        const verified = await verifyCragTelemetry(exec, enabled, timeoutMs)
+        const verified = await verifyCragTelemetryPolicy(exec, enabled, timeoutMs)
         if (supersededOperation()) return superseded
         if (verified.code !== 'telemetry_restart_required') return verified
         const observed = await rustKernelHealth(exec, { timeoutMs })
@@ -131,7 +106,7 @@ async function restartForCragTelemetry({ projectRoot, vmPath, current, revision,
         const restarted = await (ops.restart || restartRustKernel)(exec)
         if (!restarted?.ok) return { ok: false, code: 'telemetry_restart_failed', error: 'CRAG 重启未确认' }
         if (supersededOperation()) return superseded
-        const applied = await verifyCragTelemetry(exec, enabled, timeoutMs)
+        const applied = await verifyCragTelemetryPolicy(exec, enabled, timeoutMs)
         if (supersededOperation()) return superseded
         return { ...applied, restarted: true }
       },
@@ -196,7 +171,7 @@ export async function applyNativeTelemetry({
       result.seed = writeSlotSeedFiles(projectRoot, record, null, {
         existingSettings: existing.files['settings.json'] === null ? {} : JSON.parse(existing.files['settings.json']),
         replaceEnv,
-        cragNativeTelemetry: supportsApply,
+        cragNativeTelemetry: supportsApply || (selectedCrag && !retired.running),
       })
       result.wrote = result.seed.wrote === true
       if (crag) {
@@ -218,7 +193,7 @@ export async function applyNativeTelemetry({
         if (!supportsApply)
           return { ...result, code: 'crag_telemetry_apply_unavailable', error: '运行中的 CRAG 不支持遥测生效路由' }
         const enabled = isTelemetryEnabled(record.seed_policy)
-        const verified = await verifyCragTelemetry(exec, enabled, timeoutMs)
+        const verified = await verifyCragTelemetryPolicy(exec, enabled, timeoutMs)
         if (publicationRevision(current()) !== revision) return superseded
         if (verified.code !== 'telemetry_restart_required' || !lifecycle) return { ...result, ...verified }
         const restarted = await restartForCragTelemetry({
@@ -265,6 +240,7 @@ export async function applyNativeTelemetry({
           }
         }
         if (
+          telemetry?.state !== 'launch_policy' &&
           telemetry?.enabled === written.enabled &&
           (written.enabled || (telemetry.state === 'disabled' && telemetry.pending_events === 0))
         ) {

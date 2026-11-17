@@ -101,8 +101,34 @@ export function supportsCragTelemetryApply(health) {
   return health?.ok === true && health.crag_telemetry_apply_v1 === true && cragV2KernelActive({ health })
 }
 
-export function applyCragTelemetryPolicy(exec, enabled, options = {}) {
-  return callWorkerPost(withRustKernelExec(exec), '/internal/v1/telemetry/apply', { enabled }, options)
+const CRAG_TELEMETRY_ERRORS = {
+  telemetry_policy_not_published: 'CRAG 未读到已发布的槽内设置',
+  telemetry_native_settings_blocked: 'Claude Code 槽内设置或 OS 特征阻止开启遥测',
+  telemetry_restart_required: '槽内设置已发布；需排空并重启 CRAG 内核',
+}
+
+export async function verifyCragTelemetryPolicy(exec, enabled, timeoutMs) {
+  const { status, body } = await callWorkerPost(
+    withRustKernelExec(exec),
+    '/internal/v1/telemetry/apply',
+    { enabled },
+    { timeoutMs, requireInternalToken: true },
+  )
+  if (
+    status === 200 &&
+    body?.ok === true &&
+    body.applied === true &&
+    body.enabled === enabled &&
+    body.scope === 'native_claude_launch' &&
+    body.upload_confirmed === false
+  ) {
+    return { ok: true, applied: true, action: 'applied', enabled, scope: body.scope, upload_confirmed: false }
+  }
+  const code = body?.error?.type
+  if (status === 409 && Object.hasOwn(CRAG_TELEMETRY_ERRORS, code)) {
+    return { ok: false, code, error: CRAG_TELEMETRY_ERRORS[code] }
+  }
+  return { ok: false, code: 'telemetry_observation_unavailable', error: 'CRAG 未确认原生遥测启动策略' }
 }
 
 export function withCragCredential(exec, health) {
