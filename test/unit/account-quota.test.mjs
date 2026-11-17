@@ -1278,3 +1278,31 @@ test('complete usage may replace a profile-sourced tier', async () => {
   quota.setAccountTier('acct-profile', 'max', { source: 'profile' })
   assert.equal(quota.repo.get('acct-profile').unified.account_tier, 'max')
 })
+
+test('a 限额查询 Fable hop that needs usage credits sets the same mark, and a Fable success lifts it', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'a-probe-credits' })
+  q.ingestOAuthUsage('a-probe-credits', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    usage_has_fable: false,
+    five_hour: { utilization: 0 },
+    seven_day: { utilization: 10 },
+    fable: { status: 429, ok: false, limited: true, error: 'Usage credits are required for this model.' },
+  })
+  const marked = q.repo.get('a-probe-credits').unified
+  const key = marked.fable_credits_required.model
+  assert.ok(marked.model_denied_until[key] > Date.now())
+  q.ingestOAuthUsage('a-probe-credits', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    five_hour: { utilization: 0 },
+    seven_day: { utilization: 10 },
+    fable: { status: 200, ok: true, limited: false, error: null },
+  })
+  const cleared = q.repo.get('a-probe-credits').unified
+  assert.equal(cleared.fable_credits_required, undefined)
+  assert.equal(cleared.model_denied_until[key], undefined)
+})

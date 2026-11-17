@@ -25,6 +25,12 @@ const ENTITLEMENT_PATTERNS = [
 // this way until credits are bought. Any other model keeps the request stop.
 const FABLE_CREDITS_PATTERNS = [/extra usage required/i, /usage credits? (?:are )?required/i]
 
+/** Whether an upstream message says the account must buy usage credits (not fast mode). */
+export function isFableCreditsRequiredMessage(message) {
+  const text = String(message || '')
+  return !/\bfast (?:mode|request)/i.test(text) && FABLE_CREDITS_PATTERNS.some((pattern) => pattern.test(text))
+}
+
 const SIGNATURE_PATTERNS = [
   /signature/i,
   /expected[`\s].*thinking/i,
@@ -639,11 +645,7 @@ function classifyUpstreamResultRaw(
   }
   if (status === 429) {
     if (ENTITLEMENT_PATTERNS.some((pattern) => pattern.test(message))) {
-      if (
-        isFableModel(model) &&
-        !/\bfast (?:mode|request)/i.test(message) &&
-        FABLE_CREDITS_PATTERNS.some((pattern) => pattern.test(message))
-      ) {
+      if (isFableModel(model) && isFableCreditsRequiredMessage(message)) {
         return {
           scope: 'account',
           action: 'continue',
