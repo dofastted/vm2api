@@ -19,7 +19,10 @@ import {
   wipeElapsedHeaderWindows,
   parseResetMs,
   listQuotaFromHeaders,
+  NO_RESET_REJECT_HOLD_MS,
+  noResetRejectUntilMs,
 } from '../../src/lib/pool/quota-window.mjs'
+import { quotaGuardUsage } from '../../src/lib/pool/pool-scheduler.mjs'
 
 test('wipeElapsedHeaderWindows clears unified 7d_oi when reset elapsed', () => {
   const now = Date.parse('2026-10-19T09:00:00Z')
@@ -280,4 +283,42 @@ test('isAccountQuotaExhausted keeps provider 429s with evidence and plan-limit t
   assert.equal(isAccountQuotaExhausted({ ok: false, status: 400, via: 'pool-failover' }, planText), true)
   assert.equal(isAccountQuotaExhausted({ ok: true, status: 200 }, planText), false)
   assert.equal(isAccountQuotaExhausted({ ok: false, status: 503, via: 'go-worker' }, ''), false)
+})
+
+test('a rejected 5h header with no reset lifts after its hold', () => {
+  // cf-9edf (2026-11-16): a bare 429 wrote 5h rejected with reset null and the
+  // seat stayed parked for 15h until a manual 限额查询.
+  const at = Date.parse('2026-11-16T15:12:05.879Z')
+  const unified = {
+    headers: {
+      '5h': { utilization: 0, reset: null, status: 'rejected' },
+      '7d': { utilization: 0.15, reset: '2026-11-21T12:00:00Z', status: 'allowed' },
+      sampled_at: '2026-11-16T15:11:59.704Z',
+      exhausted_at: '2026-11-16T15:12:05.879Z',
+    },
+  }
+  assert.equal(noResetRejectUntilMs(unified, '5h'), at + NO_RESET_REJECT_HOLD_MS)
+  assert.equal(headerHardBlocked(unified, '5h', at + 60_000), true)
+  assert.equal(headerHardBlocked(unified, '5h', at + NO_RESET_REJECT_HOLD_MS), false)
+  assert.equal(quotaGuardUsage(unified, at + 60_000)?.rejected, true)
+  assert.notEqual(quotaGuardUsage(unified, at + NO_RESET_REJECT_HOLD_MS)?.rejected, true)
+
+  const early = wipeElapsedHeaderWindows(unified, { now: at + 60_000 })
+  assert.equal(early.changed, false)
+  const late = wipeElapsedHeaderWindows(unified, { now: at + NO_RESET_REJECT_HOLD_MS + 1 })
+  assert.equal(late.changed, true)
+  assert.equal(late.headers['5h'].status, 'allowed')
+  assert.equal(late.headers.exhausted_at, null)
+  assert.equal(late.headers['7d'].status, 'allowed')
+})
+
+test('a rejected header with a future reset still holds past the no-reset hold', () => {
+  const at = Date.parse('2026-11-16T15:12:05.879Z')
+  const reset = new Date(at + 4 * 3600_000).toISOString()
+  const unified = {
+    headers: { '5h': { utilization: 1, reset, status: 'rejected' }, exhausted_at: new Date(at).toISOString() },
+  }
+  assert.equal(noResetRejectUntilMs(unified, '5h'), null)
+  assert.equal(headerHardBlocked(unified, '5h', at + 2 * 3600_000), true)
+  assert.equal(wipeElapsedHeaderWindows(unified, { now: at + 2 * 3600_000 }).changed, false)
 })
