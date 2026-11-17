@@ -33,13 +33,15 @@ export const featuredFallback = '推荐'
 /**
  * 逐字段宽容解析：非法字段丢弃回落默认，绝不抛错。
  *
- * 返回 null（而非全默认对象）用于区分「无 layout」与「有 layout 但取默认值」——
- * 调用方据此决定是退回自身原有默认排版，还是完全听 layout 的。
+ * 缺失、非对象、全字段非法都解析为同一份缺省排版（2 列 / regular / below /
+ * 显示月价 / 无推荐），与 crag-auth 的语义一致 —— Auth 在布局等于默认时直接
+ * 不写 `layout` 键，所以「没有 layout」和「layout 全取默认」是同一个状态。
  */
-export function normalizeLayout(value: unknown): ResolvedLayout | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value))
-    return null
-  const raw = value as Record<string, unknown>
+export function normalizeLayout(value: unknown): ResolvedLayout {
+  const raw: Record<string, unknown> =
+    typeof value === 'object' && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {}
   return {
     planColumns:
       raw.plan_columns === 1 || raw.plan_columns === 2 || raw.plan_columns === 3
@@ -73,11 +75,11 @@ function nonEmpty(value: unknown): value is string {
 /**
  * 列数查表。Tailwind JIT 扫源码，类名必须是静态字面量，不能拼 `lg:grid-cols-${n}`。
  *
- * 两张表而非一张：三处套餐网格的现有默认断点互不相同（picker `lg:`、
- * commerce `sm:`、preview 无前缀），单表会让「无 layout」路径的排版发生变化。
- * 各表 plan_columns=2 的输出恰好等于该处现有硬编码值。
+ * 两张表而非一张：契约只说「宽屏每行套餐数，窄屏仍单列」，没规定宽屏从哪开始。
+ * 选择器与预览画布的卡片带价格和说明，挤在 640px 放两列会压掉文本区，所以从
+ * lg(1024px) 起；固定套餐区的卡片是紧凑单行，sm(640px) 起两列就够。
  *
- * 3 列统一在 xl(1280px) 才放开：1024px 塞 3 张含价格的卡片会挤压文本区。
+ * 3 列统一在 xl(1280px) 才放开 —— 1024px 塞 3 张含价格的卡片同样会挤压文本区。
  */
 export const pickerColumnClass: Record<1 | 2 | 3, string> = {
   1: '',
@@ -93,9 +95,6 @@ export const commerceColumnClass: Record<1 | 2 | 3, string> = {
 
 /**
  * 密度类名。compact 只收紧空间，不删减任何信息。
- *
- * `grid` 间距同样只在 layout 非空时套用 —— 三处网格的原有 gap 各不相同
- * （2.5 / 2 / 3），无条件套表会改变默认排版。
  */
 export const densityClass = {
   regular: {

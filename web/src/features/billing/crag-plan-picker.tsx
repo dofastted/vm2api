@@ -14,8 +14,8 @@ type CragPlanPickerProps = {
   selectedSku: string | undefined
   onSelect: (sku: string) => void
   disabled?: boolean
-  /** 目录声明的排版。null / 缺省时回落到与引入 layout 之前一致的默认排版。 */
-  layout?: ResolvedLayout | null
+  /** 目录声明的排版，已由 normalizeLayout 解析，缺省即缺省排版。 */
+  layout: ResolvedLayout
 }
 
 export function CragPlanPicker({
@@ -30,12 +30,11 @@ export function CragPlanPicker({
   for (const { term } of plans)
     termCounts.set(term, (termCounts.get(term) ?? 0) + 1)
 
-  // 默认值 regular / 2 列恰好等于改动前的硬编码值，故缺省路径输出逐字符不变。
-  const density = layout?.cardDensity ?? 'regular'
+  const density = layout.cardDensity
   const space = densityClass[density]
   const visible = plans.filter((plan) => plan.enabled !== false)
   const featuredSku =
-    layout?.featuredSku &&
+    layout.featuredSku &&
     visible.some((plan) => plan.sku === layout.featuredSku)
       ? layout.featuredSku
       : null
@@ -47,7 +46,7 @@ export function CragPlanPicker({
         className={join(
           'grid min-w-0',
           space.grid,
-          pickerColumnClass[layout?.planColumns ?? 2]
+          pickerColumnClass[layout.planColumns]
         )}
       >
         {visible.map((plan) => (
@@ -78,10 +77,10 @@ export function CragPlanPicker({
               density={density}
               featured={
                 plan.sku === featuredSku
-                  ? (layout?.featuredLabel ?? featuredFallback)
+                  ? (layout.featuredLabel ?? featuredFallback)
                   : undefined
               }
-              monthly={layout?.showMonthlyPrice ? plan.monthly : null}
+              monthly={layout.showMonthlyPrice ? plan.monthly : null}
             />
           </label>
         ))}

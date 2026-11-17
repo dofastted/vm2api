@@ -629,7 +629,9 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(orders).toBeGreaterThan(plans)
     expect(html.indexOf('付款反馈')).toBeLessThan(plans)
     expect(html.indexOf('订单错误')).toBeLessThan(plans)
-    expect(html).toContain('xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]')
+    // 缺省排版的订单区在下方（不再因管理员身份旁置）；旁置由
+    // orders_position="side" 驱动，见「CRAG 买家页消费 presentation.layout」。
+    expect(html).not.toContain('xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]')
     expect(html).not.toContain('order-first')
     expect(html).toMatch(/<option value="" selected="">仅领取兑换码/)
   })
@@ -964,11 +966,11 @@ function withLayout(layout?: Record<string, unknown>) {
 }
 
 describe('CRAG 买家页消费 presentation.layout', () => {
-  it('无 layout 时订单区位置仍只由管理员身份决定', () => {
-    state.role = 'admin'
-    expect(withLayout()).toContain(sideClass)
-    state.role = 'user'
-    expect(withLayout()).not.toContain(sideClass)
+  it('无 layout 时按缺省排版处理，订单区在下方且不再看管理员身份', () => {
+    for (const role of ['admin', 'user']) {
+      state.role = role
+      expect(withLayout()).not.toContain(sideClass)
+    }
   })
 
   it('orders_position="side" 对普通买家同样生效', () => {
@@ -981,7 +983,7 @@ describe('CRAG 买家页消费 presentation.layout', () => {
     expect(withLayout({ orders_position: 'below' })).not.toContain(sideClass)
   })
 
-  it('声明 layout 但不设 orders_position 时按缺省 below 处理，管理员也单列', () => {
+  it('声明 layout 但不设 orders_position 时按缺省 below 处理', () => {
     state.role = 'admin'
     expect(withLayout({ plan_columns: 3 })).not.toContain(sideClass)
   })
@@ -1005,10 +1007,10 @@ describe('CRAG 买家页消费 presentation.layout', () => {
     expect(html).toContain('最超值')
   })
 
-  it('show_monthly_price 为季卡算出折合月价，关闭后不显示', () => {
+  it('缺省排版就显示季卡折合月价，show_monthly_price=false 才关闭', () => {
+    expect(withLayout()).toContain('约 ¥2 / 月')
     expect(withLayout({ show_monthly_price: true })).toContain('约 ¥2 / 月')
     expect(withLayout({ show_monthly_price: false })).not.toContain('/ 月')
-    expect(withLayout()).not.toContain('/ 月')
   })
 
   it('非法 layout 降级为缺省排版而不是让页面崩掉', () => {
@@ -1041,12 +1043,19 @@ describe('CRAG 买家页消费 presentation.layout', () => {
     })
   })
 
-  it('没有 layout 时报价组件收到 null，自行回落原排版', () => {
+  it('没有 layout 时报价组件收到缺省排版，而不是另一种状态', () => {
     state.values[1] = {
       status: 'ready',
       data: { ...catalog, commerce: rules },
     }
     render()
-    expect(state.commerce?.layout).toBeNull()
+    expect(state.commerce?.layout).toEqual({
+      planColumns: 2,
+      cardDensity: 'regular',
+      ordersPosition: 'below',
+      showMonthlyPrice: true,
+      featuredSku: null,
+      featuredLabel: null,
+    })
   })
 })

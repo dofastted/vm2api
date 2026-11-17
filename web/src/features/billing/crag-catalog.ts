@@ -130,15 +130,14 @@ export function monthlyPrice(
 }
 
 /**
- * 按 layout 门控的折合月价。layout 缺失时返回 null —— 引入 layout 之前
- * 买家页没有月价，缺省必须保持这一表现。
+ * 按 layout 门控的折合月价。缺省排版就是显示月价，与 crag-auth 的默认语义一致。
  */
 export function monthlyFor(
-  layout: Pick<ResolvedLayout, 'showMonthlyPrice'> | null | undefined,
+  layout: Pick<ResolvedLayout, 'showMonthlyPrice'>,
   amountMinor: number | null,
   term: string | null,
   months?: number
 ): string | null {
-  if (!layout?.showMonthlyPrice) return null
+  if (!layout.showMonthlyPrice) return null
   return monthlyPrice(amountMinor, planMonths(term, months))
 }

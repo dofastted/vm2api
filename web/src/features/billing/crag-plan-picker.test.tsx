@@ -1,6 +1,9 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
+import { normalizeLayout } from './crag-layout'
 import { CragPlanPicker } from './crag-plan-picker'
+
+const base = normalizeLayout({})
 
 describe('CragPlanPicker', () => {
   it('keeps published order and plain metadata while hiding disabled plans', () => {
@@ -36,6 +39,7 @@ describe('CragPlanPicker', () => {
         ]}
         selectedSku='first'
         onSelect={vi.fn()}
+        layout={base}
       />
     )
     expect(html.indexOf('第二套餐')).toBeLessThan(html.indexOf('第一套餐'))
@@ -57,6 +61,7 @@ describe('CragPlanPicker', () => {
         ]}
         selectedSku='legacy'
         onSelect={vi.fn()}
+        layout={base}
       />
     )
     expect(html).toContain('月卡')
@@ -83,7 +88,7 @@ const plans = [
   },
 ] as const
 
-function render(layout?: Parameters<typeof CragPlanPicker>[0]['layout']) {
+function render(layout: Parameters<typeof CragPlanPicker>[0]['layout'] = base) {
   return renderToStaticMarkup(
     <CragPlanPicker
       plans={plans}
@@ -94,17 +99,8 @@ function render(layout?: Parameters<typeof CragPlanPicker>[0]['layout']) {
   )
 }
 
-const base = {
-  planColumns: 2,
-  cardDensity: 'regular',
-  ordersPosition: 'below',
-  showMonthlyPrice: true,
-  featuredSku: null,
-  featuredLabel: null,
-} as const
-
 describe('CragPlanPicker 的 layout 排版', () => {
-  it('无 layout 时网格与卡片类名保持改动前的硬编码值', () => {
+  it('缺省排版的网格与卡片类名', () => {
     const html = render()
     expect(html).toContain('class="grid min-w-0 gap-2.5 lg:grid-cols-2"')
     expect(html).toContain('min-h-16')
@@ -151,14 +147,13 @@ describe('CragPlanPicker 的 layout 排版', () => {
       expect(render({ ...base, featuredSku })).not.toContain('data-featured')
   })
 
-  it('show_monthly_price 控制折合月价显隐；月卡本来就没有月价', () => {
-    const shown = render({ ...base, showMonthlyPrice: true })
-    expect(shown).toContain('约 ¥199.67 / 月')
-    expect(shown.match(/\/ 月/g)).toHaveLength(1)
-    expect(render({ ...base, showMonthlyPrice: false })).not.toContain('/ 月')
+  it('缺省排版显示折合月价；月卡本来就没有月价', () => {
+    const html = render()
+    expect(html).toContain('约 ¥199.67 / 月')
+    expect(html.match(/\/ 月/g)).toHaveLength(1)
   })
 
-  it('无 layout 时不显示折合月价，与改动前一致', () => {
-    expect(render()).not.toContain('/ 月')
+  it('show_monthly_price=false 关闭折合月价', () => {
+    expect(render({ ...base, showMonthlyPrice: false })).not.toContain('/ 月')
   })
 })

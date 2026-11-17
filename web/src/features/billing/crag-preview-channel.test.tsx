@@ -313,12 +313,14 @@ describe('preview parent channel', () => {
     expect(html).not.toContain('xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]')
   })
 
-  it('keeps the original canvas layout when the draft carries no layout', () => {
+  it('renders the shared default arrangement when the draft carries no layout', () => {
     receive()
     render()
-    expect(html).toContain('xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]')
+    // 缺省语义与正式买家页一致：2 列、订单区在下方、显示折合月价。
+    // （本页原先恒单列、恒旁置，与买家页默认并不相符。）
+    expect(html).toContain('grid gap-2.5 lg:grid-cols-2')
+    expect(html).not.toContain('xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]')
     expect(html).not.toContain('xl:grid-cols-3')
-    expect(html).not.toContain('/ 月')
     expect(html).not.toContain('data-featured')
   })
 

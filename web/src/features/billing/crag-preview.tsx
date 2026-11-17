@@ -153,18 +153,20 @@ export function PreviewCanvas({
   // 纯函数，不包 useMemo：本文件的测试用手搓的 react mock 按调用顺序分配
   // useState/useRef/useEffect 游标，这里新增任何 hook 都会让既有断言错位。
   const layout = normalizeLayout(presentation.layout)
-  const density = layout?.cardDensity ?? 'regular'
+  const density = layout.cardDensity
   const space = densityClass[density]
   const featuredSku =
-    layout?.featuredSku && plans.some((plan) => plan.sku === layout.featuredSku)
+    layout.featuredSku && plans.some((plan) => plan.sku === layout.featuredSku)
       ? layout.featuredSku
       : null
-  // 本页原有默认：套餐区恒单列、订单区恒旁置。没有 layout 时保持原状，
-  // 目录声明 layout 后才与正式买家页走同一张表。
-  const planGrid = layout
-    ? join('grid', space.grid, pickerColumnClass[layout.planColumns])
-    : 'grid gap-3'
-  const ordersSide = layout ? layout.ordersPosition === 'side' : true
+  // 与正式买家页走同一张表、同一套缺省语义，这样父页未开布局时画布与真实
+  // 买家页也一致（本页原先恒单列、恒旁置，与买家页默认并不相符）。
+  const planGrid = join(
+    'grid',
+    space.grid,
+    pickerColumnClass[layout.planColumns]
+  )
+  const ordersSide = layout.ordersPosition === 'side'
 
   function copy(key: CopyKey) {
     const maxLength = key.includes('title') ? 120 : 500
@@ -219,7 +221,7 @@ export function PreviewCanvas({
         edit ? (
           <PreviewField
             label='推荐角标'
-            value={layout?.featuredLabel ?? ''}
+            value={layout.featuredLabel ?? ''}
             fallback={featuredFallback}
             editable
             maxLength={FEATURED_LABEL_MAX}
@@ -228,7 +230,7 @@ export function PreviewCanvas({
             }
           />
         ) : (
-          (layout?.featuredLabel ?? featuredFallback)
+          (layout.featuredLabel ?? featuredFallback)
         )
       ) : undefined
     const slots = edit

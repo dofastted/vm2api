@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '@/lib/api'
 import { CragCommerce, type CommerceRules } from './crag-commerce'
+import { normalizeLayout } from './crag-layout'
 
 const state = vi.hoisted(() => ({
   values: [] as unknown[],
@@ -77,6 +78,7 @@ function render(overrides: Partial<Parameters<typeof CragCommerce>[0]> = {}) {
       initialQuoteKey={0}
       paymentMethods={['alipay', 'wxpay']}
       onOrder={onOrder}
+      layout={normalizeLayout({})}
       {...overrides}
     />
   )

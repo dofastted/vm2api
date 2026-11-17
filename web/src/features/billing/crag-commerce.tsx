@@ -128,8 +128,8 @@ export function CragCommerce({
     price: number,
     method: PaymentMethod
   ) => void
-  /** 目录声明的排版。null / 缺省时回落到与引入 layout 之前一致的默认排版。 */
-  layout?: ResolvedLayout | null
+  /** 目录声明的排版，已由 normalizeLayout 解析，缺省即缺省排版。 */
+  layout: ResolvedLayout
 }) {
   const id = useId()
   const [slots, setSlots] = useState(String(rules.min_slots ?? 1))
@@ -217,23 +217,20 @@ export function CragCommerce({
   const selectionUnavailable =
     !available && (sku !== 'custom' || !customEnabled)
 
-  const density = layout?.cardDensity ?? 'regular'
+  const density = layout.cardDensity
   const space = densityClass[density]
   const visiblePlans = plans.filter((plan) => plan.enabled !== false)
   const featuredSku =
-    layout?.featuredSku &&
+    layout.featuredSku &&
     visiblePlans.some((plan) => plan.sku === layout.featuredSku)
       ? layout.featuredSku
       : null
-  // 本区原有的网格间距是 gap-2（不同于 picker 的 gap-2.5），所以缺省必须退回原字面量；
-  // 目录声明 layout 后才统一到密度表。
-  const gridGap = layout ? space.grid : 'gap-2'
 
   return (
     <div className='space-y-4'>
       {plans.length > 0 || allowRenewal ? (
         <fieldset
-          className={`grid ${gridGap} ${commerceColumnClass[layout?.planColumns ?? 2]}`}
+          className={`grid ${space.grid} ${commerceColumnClass[layout.planColumns]}`}
           disabled={busy}
         >
           <legend className='mb-2 text-sm font-medium'>
@@ -259,7 +256,7 @@ export function CragCommerce({
                 density={density}
                 featured={
                   plan.sku === featuredSku
-                    ? (layout?.featuredLabel ?? featuredFallback)
+                    ? (layout.featuredLabel ?? featuredFallback)
                     : undefined
                 }
                 monthly={monthlyFor(

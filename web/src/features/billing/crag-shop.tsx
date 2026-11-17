@@ -864,9 +864,9 @@ function ShopOrders({
     catalog.status === 'ready' ? catalog.data.presentation : undefined
   // 纯函数，不包 useMemo：预览页的测试 mock 对 hook 调用顺序敏感，两边保持同一写法。
   const layout = normalizeLayout(presentation?.layout)
-  // 目录一旦声明 layout，订单区位置完全由 orders_position 决定（覆盖 isAdmin）；
-  // 没有 layout 时保持原有的「仅管理员旁置」行为。
-  const ordersSide = layout ? layout.ordersPosition === 'side' : isAdmin
+  // 目录没有 layout 时等同于全默认排版（crag-auth 在布局等于默认时直接不写该键），
+  // 所以订单区位置一律由 orders_position 决定，不再看 isAdmin。
+  const ordersSide = layout.ordersPosition === 'side'
   const commerce =
     catalog.status === 'ready' ? catalog.data.commerce : undefined
   const canRenew = !!(

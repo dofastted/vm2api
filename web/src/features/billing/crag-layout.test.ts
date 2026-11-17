@@ -21,10 +21,10 @@ describe('normalizeLayout 缺省语义', () => {
     expect(normalizeLayout({})).toEqual(defaults)
   })
 
-  it('无 layout 返回 null，与「有 layout 但取默认值」区分开', () => {
+  it('缺失、非对象、数组都解析为同一份缺省排版，而不是另一种状态', () => {
     for (const value of [undefined, null, [], 'layout', 1, true])
-      expect(normalizeLayout(value)).toBeNull()
-    expect(normalizeLayout({})).not.toBeNull()
+      expect(normalizeLayout(value)).toEqual(defaults)
+    expect(normalizeLayout({})).toEqual(defaults)
   })
 })
 
@@ -98,7 +98,7 @@ describe('normalizeLayout 宽容容错', () => {
     ).toEqual({ ...defaults, planColumns: 3 })
   })
 
-  it('全部字段非法时仍返回默认解析结果而非 null', () => {
+  it('全部字段非法时仍返回默认解析结果', () => {
     expect(normalizeLayout({ plan_columns: 9, card_density: 'x' })).toEqual(
       defaults
     )
