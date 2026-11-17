@@ -375,10 +375,10 @@ export function createHandleProtocol(deps) {
     if (opaqueCrag429) mapped.body.error.message = originalMessage
     const summary = formatPoolSelectionSummary(details)
     const mappedCode = mapped.body?.error?.code
-    if (mappedCode === ErrorCode.REFUSAL_GUARD) {
-      // The kernel often names an AUP refusal upstream_invalid_request. Keep
-      // the refusal code so the audit feed can see it, and the upstream sentence
-      // so the row still shows what was refused.
+    if (mappedCode === ErrorCode.REFUSAL_GUARD || mappedCode === ErrorCode.THIRD_PARTY_CLIENT) {
+      // The kernel often names an AUP refusal upstream_invalid_request, and a
+      // third-party extra-usage 400 upstream_error. Keep the mapped code so the
+      // logs count it, and the upstream sentence so the row shows what happened.
       logBag.error_code = mappedCode
       logBag.error_message = logBag.error_message || originalMessage || mapped.body?.error?.message || null
     } else {

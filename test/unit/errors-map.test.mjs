@@ -325,6 +325,7 @@ test('third-party extra-usage 400 and 503 are non-retryable third_party_client e
     assert.equal(mapped.body.error.details.upstream_status, status)
     assert.match(mapped.body.error.details.upstream_message, /Third-party apps now draw from/)
     assert.match(mapped.body.error.message, /第三方客户端/)
+    assert.doesNotMatch(mapped.body.error.message, /改用|换用|渠道/)
     assert.doesNotMatch(mapped.body.error.message, /usage policy/i)
   }
 })

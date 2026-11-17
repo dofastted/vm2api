@@ -177,7 +177,7 @@ export function isThirdPartyClientMessage(message = '') {
 }
 
 export const THIRD_PARTY_CLIENT_CLIENT_MESSAGE =
-  'Anthropic 将此请求识别为第三方客户端（非 Claude Code）调用：订阅额度不覆盖第三方客户端，只能扣 extra usage，上游因此拒绝。这不是内容拒答，换号重试也一样；请改用 Claude Code 客户端，或换用支持第三方客户端的渠道。'
+  '上游将此请求识别为第三方客户端调用，不按订阅额度计费，已拒绝。这不是内容拒答；原样重试会得到同样结果。'
 
 /** Non-retryable client error that keeps the upstream sentence. */
 export function makeThirdPartyClientError({ requestId, upstreamMessage, upstreamType, upstreamStatus } = {}) {
