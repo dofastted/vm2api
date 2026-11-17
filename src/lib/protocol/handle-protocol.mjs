@@ -730,8 +730,10 @@ export function createHandleProtocol(deps) {
     ) {
       stats.errors++
       const errorResult = claudeCodeOnlyError()
+      logBag.final_state = 'claude_code_only'
       logBag.error_code = ErrorCode.CLAUDE_CODE_ONLY
       logBag.error_message = errorResult.body?.error?.message || null
+      res.statusCode = errorResult.status
       return json(res, errorResult.status, errorResult.body)
     }
     const healthDecision = getHealthMonitor()?.decide?.(req.headers, inbound, protocol)

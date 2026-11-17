@@ -188,7 +188,7 @@ export function claudeCodeOnlyError() {
   return makeError({
     type: ErrorType.PERMISSION,
     code: ErrorCode.CLAUDE_CODE_ONLY,
-    message: '当前仅允许官方 Claude Code 客户端调用 Claude 模型',
+    message: '当前仅允许官方 Claude Code 客户端调用 Claude 模型。请使用 Claude 官方客户端。',
     status: 403,
   })
 }

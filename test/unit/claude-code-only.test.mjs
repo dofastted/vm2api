@@ -172,7 +172,7 @@ test('Claude Code family recognition: max_tokens 1 is not a bypass for arbitrary
 
 const REACHED = new Error('reached-scheduler')
 
-function protocolHarness({ routing, body, healthMonitor }) {
+function protocolHarness({ routing, body, healthMonitor, logs = [] }) {
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
   const stats = { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 }
   const handler = createHandleProtocol({
@@ -191,7 +191,12 @@ function protocolHarness({ routing, body, healthMonitor }) {
       limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
       paths: {},
     },
-    requestLog: { start: () => ({ request_id: 'cc-only-test' }), finish() {} },
+    requestLog: {
+      start: () => ({ request_id: 'cc-only-test' }),
+      finish(_ctx, entry) {
+        logs.push(entry)
+      },
+    },
     stickyRouter: {},
     accountQuota: {},
     apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
@@ -236,6 +241,9 @@ async function runProtocol({
     once() {},
     off() {},
   }
+  response.on = (event, listener) => {
+    if (event === 'finish') response.finish = listener
+  }
   let reached = false
   try {
     await handler.handleProtocol(req, response, protocol, '/v1/messages')
@@ -243,11 +251,41 @@ async function runProtocol({
     if (error !== REACHED) throw error
     reached = true
   }
-  return { reached, status: response.status, code: response.body?.error?.code }
+  response.finish?.()
+  return {
+    reached,
+    status: response.status,
+    code: response.body?.error?.code,
+  }
 }
 
 const AXIOS = { 'user-agent': 'axios/1.7' }
 const BLOCKED = { reached: false, status: 403, code: 'claude_code_only' }
+
+test('switch on: 403 tells the caller to use the official client and logs that reason', async () => {
+  const logs = []
+  const { handler, response } = protocolHarness({ routing: ON, body: THIRD_PARTY_BODY, logs })
+  const req = {
+    method: 'POST',
+    url: '/v1/messages',
+    headers: { authorization: 'Bearer sk-vm-api', ...AXIOS },
+    apiKeyKind: 'managed',
+    apiKeyRecord: { category: 'api' },
+    once() {},
+    off() {},
+  }
+  response.on = (event, listener) => {
+    if (event === 'finish') response.finish = listener
+  }
+  await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
+  response.finish?.()
+  const message = '当前仅允许官方 Claude Code 客户端调用 Claude 模型。请使用 Claude 官方客户端。'
+  assert.equal(response.body?.error?.message, message)
+  assert.equal(logs.at(-1).error_code, 'claude_code_only')
+  assert.equal(logs.at(-1).final_state, 'claude_code_only')
+  assert.equal(logs.at(-1).error_message, message)
+  assert.equal(logs.at(-1).status, 403)
+})
 
 test('switch on: third-party Claude requests are 403 before any account is picked', async () => {
   assert.deepEqual(await runProtocol({ routing: ON, body: THIRD_PARTY_BODY, headers: AXIOS }), BLOCKED)
