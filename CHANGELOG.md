@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.128 — 2026-11-17 · Gemini 授权启动修复
+
+- 修复 Ubuntu 22.04 等宿主上的 Gemini Google 授权启动失败：使用兼容的 nftables 优先级，在 Docker 默认禁止转发时临时放行当前环境到绑定 SOCKS5 节点的连接，授权结束后清理规则，不开放直连。
+- 纳入主线已合并的 CRAG 外部 thinking 签名错误修复（#1149）与集群 SSH 暂断时保留已有 VM 推理会话的修复（#1168）。
+- 沿用现有签名载荷，不需要 `wrap-cli/sync` 或重装槽位；已启用 Gemini 的宿主需更新宿主脚本。Google 同意与换票仍需账号持有人完成，Gemini 对外推理及计费保持关闭。
+
 ## 1.4.127 — 2026-11-17 · Gemini 导入与宿主环境
 
 - 「导入 → Gemini」支持 Google OAuth 授权码、回调链接及 Gemini API Key。可刷新上游返回的账号、项目、订阅、模型、配额和 Credits；API Key 模式只读取模型，不把未返回的数据显示为零。
