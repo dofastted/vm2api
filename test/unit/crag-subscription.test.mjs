@@ -37,6 +37,7 @@ function standaloneHost(t, fetchImpl) {
   fs.mkdirSync(path.dirname(path.dirname(publicDir)), { recursive: true })
   return {
     root,
+    machineIdFile,
     publicDir,
     privateDir,
     connect: (options = {}) =>
@@ -52,6 +53,28 @@ function standaloneHost(t, fetchImpl) {
       }),
   }
 }
+
+test('host checkout falls back to the D-Bus machine ID without changing an existing binding', (t) => {
+  const { root, machineIdFile, publicDir, connect } = standaloneHost(t)
+  const alternate = path.join(root, 'dbus-machine-id')
+  const service = connect({ machineIdFile: [machineIdFile, alternate] })
+  const raw = '1234567890abcdef1234567890abcdef'
+  const expected = crypto.createHash('sha256').update(`crag-host-v1:${raw}`).digest('hex')
+  fs.writeFileSync(alternate, '12345678-90AB-CDEF-1234-567890ABCDEF\n', { mode: 0o600 })
+  fs.writeFileSync(machineIdFile, 'uninitialized\n')
+  assert.equal(service.purchaseDeviceId(), expected)
+
+  fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
+  fs.writeFileSync(path.join(publicDir, 'host_id'), expected, { mode: 0o644 })
+  fs.writeFileSync(machineIdFile, 'b'.repeat(32))
+  assert.equal(service.purchaseDeviceId(), expected)
+
+  fs.rmSync(alternate)
+  assert.throws(() => service.purchaseDeviceId(), { code: 'crag_subscription_host_identity_changed' })
+  fs.rmSync(machineIdFile)
+  fs.symlinkSync(path.join(publicDir, 'host_id'), machineIdFile)
+  assert.throws(() => service.purchaseDeviceId(), { code: 'crag_subscription_host_identity_unavailable' })
+})
 
 function postSubscription(subscription) {
   return (action, body) =>

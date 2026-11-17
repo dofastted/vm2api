@@ -92,6 +92,23 @@ function failure(status, code, message) {
 
 const missingOrder = () => failure(404, 'shop_order_not_found', 'Order not found')
 const badBody = () => failure(400, 'shop_invalid_request', 'Invalid CRAG shop request')
+const unavailableDevice = () =>
+  failure(503, 'shop_device_unavailable', 'Cannot verify the host device for CRAG checkout')
+const unavailableStorage = () =>
+  failure(503, 'shop_private_storage_unavailable', 'CRAG shop private storage is unavailable')
+
+function hostCheckoutError(error) {
+  switch (error?.code) {
+    case 'crag_subscription_host_identity_unavailable':
+      return unavailableDevice()
+    case 'crag_subscription_host_identity_changed':
+      return failure(409, 'shop_host_identity_changed', 'The host device no longer matches the subscription')
+    case 'crag_subscription_storage_unavailable':
+      return unavailableStorage()
+    default:
+      return null
+  }
+}
 
 async function readInput(req, readRawBody, emptyAllowed) {
   let raw
@@ -347,11 +364,10 @@ export function createCragShopHandler({
     let hostId
     try {
       hostId = subscription?.purchaseDeviceId()
-    } catch {
-      throw failure(503, 'shop_device_unavailable', 'Cannot verify the host device for CRAG checkout')
+    } catch (error) {
+      throw hostCheckoutError(error) ?? unavailableDevice()
     }
-    if (typeof hostId !== 'string' || !/^[a-f0-9]{64}$/.test(hostId))
-      throw failure(503, 'shop_device_unavailable', 'Cannot verify the host device for CRAG checkout')
+    if (typeof hostId !== 'string' || !/^[a-f0-9]{64}$/.test(hostId)) throw unavailableDevice()
     return hostId
   }
 
@@ -359,7 +375,7 @@ export function createCragShopHandler({
     try {
       return loadOrderReceiptKey(dataDir, () => !!db.prepare('SELECT 1 FROM crag_shop_orders LIMIT 1').get())
     } catch {
-      throw failure(503, 'shop_private_storage_unavailable', 'CRAG shop private storage is unavailable')
+      throw unavailableStorage()
     }
   }
 
@@ -375,8 +391,11 @@ export function createCragShopHandler({
       const proof = await subscription.renewalProof()
       if (typeof proof !== 'string' || !proof.length || proof.length > 16384 || /[\p{Cc}]/u.test(proof)) throw badBody()
       return proof
-    } catch {
-      throw failure(409, 'shop_renewal_unavailable', 'The host subscription is not available for renewal')
+    } catch (error) {
+      throw (
+        hostCheckoutError(error) ??
+        failure(409, 'shop_renewal_unavailable', 'The host subscription is not available for renewal')
+      )
     }
   }
 
@@ -398,7 +417,7 @@ export function createCragShopHandler({
       return fingerprint
     } catch (error) {
       if (error instanceof ShopError) throw error
-      throw unavailableTarget()
+      throw hostCheckoutError(error) ?? unavailableTarget()
     }
   }
 
@@ -638,7 +657,10 @@ export function createCragShopHandler({
               'shop_device_package_unready',
               'No trusted host CRAG package available to apply the order',
             )
-          throw failure(409, 'shop_device_apply_failed', 'Could not apply this order to the host; retry the same order')
+          throw (
+            hostCheckoutError(error) ??
+            failure(409, 'shop_device_apply_failed', 'Could not apply this order to the host; retry the same order')
+          )
         }
         db.prepare("UPDATE crag_shop_orders SET activation_phase = 'active' WHERE owner = ? AND order_id = ?").run(
           owner,
@@ -688,11 +710,14 @@ export function createCragShopHandler({
         if (route === 'apply-renewal') {
           try {
             hostStatus = await subscription.redeemRenewal(result.redemption_code)
-          } catch {
-            throw failure(
-              503,
-              'shop_renewal_failed',
-              'Could not apply the renewal; refresh subscription status before retrying',
+          } catch (error) {
+            throw (
+              hostCheckoutError(error) ??
+              failure(
+                503,
+                'shop_renewal_failed',
+                'Could not apply the renewal; refresh subscription status before retrying',
+              )
             )
           }
         }

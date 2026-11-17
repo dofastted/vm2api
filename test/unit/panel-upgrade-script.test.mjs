@@ -229,7 +229,10 @@ test('image upgrade pulls the pinned ARM64 release and records VERSION only afte
   assert.equal(result.version, '1.2.7\n')
   assert.equal(result.cragOverlays.length, 1)
   const [overlay] = result.cragOverlays
-  assert.match(overlay.content, /source: \/etc\/machine-id\n\s+target: \/run\/crag-host-machine-id\n\s+read_only: true/)
+  assert.match(
+    overlay.content,
+    /source: "\$\{VM2API_CRAG_HOST_ID_FILE:-\/etc\/machine-id\}"\n\s+target: \/run\/crag-host-machine-id\n\s+read_only: true/,
+  )
   assert.match(overlay.content, /create_host_path: false/)
   const up = result.calls.find((args) => args.includes('up'))
   assert.deepEqual(up.at(-1).split(':'), [

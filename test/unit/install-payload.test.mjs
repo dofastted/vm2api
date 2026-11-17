@@ -52,3 +52,35 @@ test('installation and release scripts do not require cc-node', () => {
   assert.doesNotMatch(release, /dist\/cc-node/)
   assert.doesNotMatch(installer, /cc-node/)
 })
+
+test('macOS host preparation binds the platform UUID and does not overwrite it on a different host', (t) => {
+  const dest = fs.mkdtempSync(path.join(os.tmpdir(), 'install-crag-host-'))
+  t.after(() => fs.rmSync(dest, { recursive: true, force: true }))
+  const bin = path.join(dest, 'bin')
+  fs.mkdirSync(bin)
+  fs.writeFileSync(path.join(dest, '.env'), '')
+  for (const [name, script] of Object.entries({
+    id: 'echo 0',
+    uname: 'echo Darwin',
+    ioreg: `printf '    "IOPlatformUUID" = "%s"\n' "$TEST_HOST_UUID"`,
+  })) {
+    fs.writeFileSync(path.join(bin, name), `#!/bin/sh\n${script}\n`, { mode: 0o755 })
+  }
+  const run = (uuid) =>
+    spawnSync('bash', [path.join(root, 'deploy/install.sh'), 'prepare-crag-host', '--dir', dest], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TEST_HOST_UUID: uuid, VM2API_CRAG_HOST_ID_FILE: '' },
+    })
+  const original = '12345678-90AB-CDEF-1234-567890ABCDEF'
+  const file = path.join(dest, '.local', 'crag-host-machine-id')
+  const prepared = run(original)
+  assert.equal(prepared.status, 0, prepared.stderr)
+  assert.equal(fs.readFileSync(file, 'utf8'), '1234567890abcdef1234567890abcdef\n')
+  assert.match(
+    fs.readFileSync(path.join(dest, '.env'), 'utf8'),
+    /^VM2API_CRAG_HOST_ID_FILE=\.\/\.local\/crag-host-machine-id$/m,
+  )
+  assert.equal(run(original).status, 0)
+  assert.equal(run('87654321-90AB-CDEF-1234-567890ABCDEF').status, 1)
+  assert.equal(fs.readFileSync(file, 'utf8'), '1234567890abcdef1234567890abcdef\n')
+})

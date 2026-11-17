@@ -282,7 +282,13 @@ sudo bash /opt/vm2api/deploy/install.sh check
 
 面板：`GET /api/panel/version`、`GET /api/panel/changelog`、`POST /api/panel/update`。确认更新后，控制面会通过已挂载的 `docker.sock` 自省当前 Compose 项目和全部配置文件，拉起独立升级助手。助手记录更新前正常运行的槽位，按源码/镜像模式更新，保留已有 `src/config` 配置并 `--force-recreate` 控制面；通过健康检查、版本接口和槽位详情接口确认后端版本正确、此前健康的槽内内核仍能通过控制面鉴权，完成后才报告成功。忙碌但进程健康的槽位不视为故障；更新前已故障或停止的槽位不计入本次回归检查。助手失败时保留 `docker logs vm2api-upgrade-<project>`；容器里没有可识别的 Compose 服务时返回 `409 host_upgrade_required`，响应里带同一条 curl 命令。槽位内核健康检查不调用模型，不消耗上游额度。
 
-Docker 内的本机 CRAG 订阅需要宿主 `/etc/machine-id` 只读挂载到控制面的 `/run/crag-host-machine-id`，不能用容器自己的机器 ID。新版面板镜像升级助手发现现有 Compose 缺少该挂载时，会追加仅包含该挂载的持久覆盖文件，不改已有数据卷。仍在使用旧助手的部署，可通过官方 `install.sh upgrade` 更新 Compose，或在现有自定义 Compose 中加入同一只读挂载后重建控制面。手动使用旧 Compose 文件时也须带上覆盖文件。
+CRAG 订阅使用宿主 ID，不使用容器自己的机器 ID、网卡地址或每次启动随机生成的值。Linux 原生控制面依次读取 `/etc/machine-id` 和 `/var/lib/dbus/machine-id`；也可通过 `KIN_CRAG_HOST_ID_FILE` 指定可信的宿主 ID 文件。已有订阅继续使用原有 ID 摘要；如果多个 Linux 来源中存在与原订阅匹配的值，优先保留原绑定。
+
+Docker 的宿主 ID 文件须只读挂载到控制面的 `/run/crag-host-machine-id`。从宿主运行新版 `deploy/install.sh` 时，Linux（含 ARM64）优先使用原有 machine ID，其次使用 D-Bus、DMI UUID 或设备树序列号；macOS 的 Docker Desktop 场景由宿主通过 `ioreg` 读取 `IOPlatformUUID`，不使用 Desktop Linux 虚拟机的 ID。DMI、设备树和 macOS 使用安装目录中的固定快照，不会在检测到不同宿主时覆盖。Docker Desktop/WSL 共享文件即使显示为合成权限，也必须能核实该文件在容器内实际是只读挂载。这里支持的是 macOS 宿主采集和 Linux 容器内的订阅，不代表所有槽位运行时可原生运行在 macOS。
+
+手动部署可先在宿主运行 `sudo bash deploy/install.sh prepare-crag-host --dir <安装目录>`。这一步不重启服务；新版 Compose 从 `.env` 的 `VM2API_CRAG_HOST_ID_FILE` 读取挂载源（默认 `/etc/machine-id`）。自定义或旧 Compose 必须对齐该挂载后，仅重建控制面。面板镜像升级助手会补齐缺失挂载，但不会覆盖已有自定义挂载或替宿主采集 ID。
+
+如果原来曾用不同来源完成付款或绑定，请先恢复原来的宿主 ID 来源，再用同一浏览器操作原订单；不要删除订阅数据或重新付款。订单和授权私有目录仍须位于控制面可验证的 Linux 本地文件系统；Docker Desktop 的桌面共享目录可能不满足要求，新的安装可将控制面的 `data` 放在 Docker Linux VM 内的本地卷。已有订单迁移时必须一并保留原收据密钥，不要直接用空卷替换现有数据。
 
 如果服务健康但本机 CRAG 订阅显示「状态不可用」，用 `namei -l` 核对实际数据目录的每级父目录。CRAG 会拒绝组或其他用户可写的父目录；确认安装根目录无需组写权限后，只移除该目录的组写位，不要递归修改数据目录和槽位权限。
 

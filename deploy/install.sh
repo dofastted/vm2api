@@ -67,6 +67,7 @@ usage() {
   upgrade | update     升到最新 GitHub Release 并更新 CRAG（保留 .env / vms / data）
   crag-update          独立更新 CRAG V2 包及全部既有 CRAG 副本，不切换槽位内核
   prepare-native       仅准备 Docker CRAG 的宿主 AppArmor userns 权限
+  prepare-crag-host    仅准备 CRAG 订阅宿主 ID，不重启服务
   prepare-gemini       启用宿主 Gemini 服务，签名载荷在首次创建环境时安装
   check                对比当前版本与最新 Release，打印 changelog
   changelog            打印本地 CHANGELOG.md
@@ -307,7 +308,8 @@ env_set() {
   local value="$2"
   local envf="${INSTALL_DIR}/.env"
   if grep -qE "^${name}=" "$envf" 2>/dev/null; then
-    sed -i "s|^${name}=.*|${name}=${value}|" "$envf"
+    sed -i.bak "s|^${name}=.*|${name}=${value}|" "$envf"
+    rm -f "${envf}.bak"
   else
     printf '%s=%s\n' "$name" "$value" >>"$envf"
   fi
@@ -699,6 +701,72 @@ prepare_arm64_host() {
   fi
 }
 
+normalize_crag_host_id() {
+  local raw
+  raw="$(printf '%s' "${1%$'\r'}" | tr '[:upper:]' '[:lower:]')"
+  if ! [[ "$raw" =~ ^[0-9a-f]{32}$|^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]]; then
+    return 1
+  fi
+  raw="${raw//-/}"
+  [[ "$raw" != 00000000000000000000000000000000 && "$raw" != ffffffffffffffffffffffffffffffff ]] || return 1
+  printf '%s\n' "$raw"
+}
+
+prepare_crag_host() {
+  local snapshot='./.local/crag-host-machine-id' configured source raw id temp
+  configured="${VM2API_CRAG_HOST_ID_FILE:-$(env_get VM2API_CRAG_HOST_ID_FILE)}"
+  if [ -n "$configured" ] && [ "$configured" != "$snapshot" ]; then return 0; fi
+  case "$(uname -s)" in
+    Linux)
+      if [ -z "$configured" ]; then
+        for source in /etc/machine-id /var/lib/dbus/machine-id; do
+          [ -f "$source" ] && [ -r "$source" ] && normalize_crag_host_id "$(cat "$source")" >/dev/null || continue
+          if [ "$source" != /etc/machine-id ]; then env_set VM2API_CRAG_HOST_ID_FILE "$source"; fi
+          return 0
+        done
+      fi
+      if [ -r /sys/class/dmi/id/product_uuid ] && raw="$(cat /sys/class/dmi/id/product_uuid)" && normalize_crag_host_id "$raw" >/dev/null; then
+        :
+      elif [ -r /sys/firmware/devicetree/base/serial-number ]; then
+        raw="$(tr -d '\000' </sys/firmware/devicetree/base/serial-number | tr '[:upper:]' '[:lower:]')" || return 1
+        if ! [[ "$raw" =~ ^[0-9a-f]{16,32}$ ]] || [[ "$raw" =~ ^(0+|f+)$ ]]; then
+          err 'Linux 设备树序列号无效；请配置有效的宿主 ID 文件。'
+          return 1
+        fi
+        raw="$(printf 'crag-host-arm-serial:%s' "$raw" | sha256sum | cut -c1-32)" || return 1
+      else
+        err '无法读取 Linux 宿主 ID；请配置有效的宿主 ID 文件。'
+        return 1
+      fi
+      ;;
+    Darwin)
+      raw="$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F '"' '$2 == "IOPlatformUUID" { print $4 }')" || return 1
+      ;;
+    *) err '无法读取此系统的宿主 ID；请配置有效的宿主 ID 文件。'; return 1 ;;
+  esac
+  id="$(normalize_crag_host_id "$raw")" || { err '读取到的宿主 ID 无效；未更改 CRAG 身份。'; return 1; }
+  if [ -L "${INSTALL_DIR}/.local" ] || [ -L "${INSTALL_DIR}/${snapshot}" ]; then
+    err 'CRAG 宿主 ID 不能由符号链接提供。'
+    return 1
+  fi
+  if [ -e "${INSTALL_DIR}/${snapshot}" ]; then
+    if [ ! -f "${INSTALL_DIR}/${snapshot}" ] || [ "$(cat "${INSTALL_DIR}/${snapshot}")" != "$id" ]; then
+      err '本机宿主 ID 与已保存值不一致；未更改 CRAG 身份，请先恢复原宿主配置。'
+      return 1
+    fi
+  else
+    mkdir -p "${INSTALL_DIR}/.local" || return 1
+    temp="$(mktemp "${INSTALL_DIR}/.local/.crag-host-machine-id.XXXXXX")" || return 1
+    if ! printf '%s\n' "$id" >"$temp" || ! chmod 0644 "$temp" || ! ln "$temp" "${INSTALL_DIR}/${snapshot}"; then
+      rm -f "$temp"
+      err '无法保存 CRAG 宿主 ID 文件。'
+      return 1
+    fi
+    rm -f "$temp"
+  fi
+  if [ -z "$configured" ]; then env_set VM2API_CRAG_HOST_ID_FILE "$snapshot"; fi
+}
+
 checkout_tag() {
   local tag="$1"
   cd "${INSTALL_DIR}"
@@ -780,6 +848,7 @@ start_stack() {
     warn "--no-start：跳过 compose up"
     return
   fi
+  prepare_crag_host || return 1
   prepare_docker_crag_apparmor || return 1
   cd "${INSTALL_DIR}"
   auto_sync_wrap="${KIN_AUTO_SYNC_WRAP:-0}"
@@ -1052,7 +1121,7 @@ cmd_uninstall() {
 COMMAND="install"
 while [ $# -gt 0 ]; do
   case "$1" in
-    install|upgrade|update|crag-update|prepare-native|prepare-gemini|check|changelog|status|uninstall)
+    install|upgrade|update|crag-update|prepare-native|prepare-crag-host|prepare-gemini|check|changelog|status|uninstall)
       COMMAND="$1"
       shift
       ;;
@@ -1126,6 +1195,11 @@ case "$COMMAND" in
   upgrade|update) cmd_upgrade ;;
   crag-update) cmd_update_crag ;;
   prepare-native) need_root; prepare_docker_crag_apparmor ;;
+  prepare-crag-host)
+    need_root
+    [ -f "${INSTALL_DIR}/.env" ] || { err '请先创建控制面的 .env。'; exit 1; }
+    prepare_crag_host
+    ;;
   prepare-gemini)
     need_root
     resolve_host_arch

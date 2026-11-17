@@ -22,6 +22,8 @@ import { publishClusterSubscription } from '../cluster/crag-subscription-files.m
 import { blockKvmCragSubscription, holdKvmCragSubscriptionPublications } from './kvm-crag-subscription.mjs'
 
 const AUTHORITY = 'https://crag.fkcodex.com'
+const HOST_ID_MOUNT = '/run/crag-host-machine-id'
+const SHARED_HOST_ID_FILESYSTEMS = new Set([0x01021997, 0x65735546])
 const localFilesystems = new Set([0xef53, 0x794c7630, 0x58465342, 0x9123683e, 0x2fc12fc1, 0xf2f52010])
 const terminalRedeem = new Map([
   ['redeem_unavailable', 404],
@@ -52,6 +54,8 @@ const validSku = (value) => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9
 const validMonths = (value) => Number.isSafeInteger(value) && value >= 1 && value <= 4294967295
 const invalidRights = () => fail('crag_subscription_invalid_entitlement', 502)
 const hostPackageUnready = () => fail('crag_subscription_host_package_unready', 409)
+const hostIdentityUnavailable = () => fail('crag_subscription_host_identity_unavailable')
+const hostIdentityChanged = () => fail('crag_subscription_host_identity_changed', 409)
 const usageUnverified = () =>
   cragLicenseDeniedResult({
     code: 'license_crag_host_usage_unverified',
@@ -137,18 +141,32 @@ function checkParents(directory) {
   }
 }
 
+function readOnlySharedHostId(fd) {
+  if (!SHARED_HOST_ID_FILESYSTEMS.has(fs.statfsSync(`/proc/self/fd/${fd}`).type >>> 0)) return false
+  const mountId = /^mnt_id:\s+(\d+)$/m.exec(fs.readFileSync(`/proc/self/fdinfo/${fd}`, 'utf8'))?.[1]
+  if (!mountId) return false
+  return fs
+    .readFileSync('/proc/self/mountinfo', 'utf8')
+    .split('\n')
+    .some((line) => {
+      const [id, , , , mount, options] = line.split(' ', 6)
+      return id === mountId && mount === HOST_ID_MOUNT && options.split(',').includes('ro')
+    })
+}
+
 function load(file, mode, limit, owner = uid()) {
   let fd
   try {
     fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
     const st = fs.fstatSync(fd)
+    const ownerSafe = st.uid === owner || (owner === null && (st.uid === 0 || st.uid === uid()))
+    const modeSafe = mode == null ? !(st.mode & 0o022) : (st.mode & 0o777) === mode
     if (
       !st.isFile() ||
       st.nlink !== 1 ||
-      st.uid !== owner ||
-      (mode == null ? st.mode & 0o022 : (st.mode & 0o777) !== mode) ||
       st.size < 1 ||
-      st.size > limit
+      st.size > limit ||
+      (!(ownerSafe && modeSafe) && !(file === HOST_ID_MOUNT && mode === null && readOnlySharedHostId(fd)))
     )
       throw fail()
     const data = Buffer.alloc(st.size)
@@ -263,6 +281,13 @@ async function responseJson(response) {
   }
 }
 
+function isContainerized() {
+  return (
+    process.env.container ||
+    ['/.dockerenv', '/run/.containerenv', '/run/systemd/container'].some((file) => fs.existsSync(file))
+  )
+}
+
 export function createCragSubscription({
   projectRoot,
   listTargets,
@@ -277,7 +302,7 @@ export function createCragSubscription({
   blockKvmBinding = blockKvmCragSubscription,
   fetchImpl = globalThis.fetch,
   origin = AUTHORITY,
-  machineIdFile,
+  machineIdFile = process.env.KIN_CRAG_HOST_ID_FILE,
 } = {}) {
   if (origin !== AUTHORITY && !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(origin)) throw fail()
   const publicDir = cragSubscriptionPublicDirectory(projectRoot)
@@ -298,14 +323,39 @@ export function createCragSubscription({
   let lastExpiryProbe
 
   function identity() {
-    if (process.platform !== 'linux') throw fail()
-    const inContainer = fs.existsSync('/.dockerenv') || fs.existsSync('/run/.containerenv')
-    const file = machineIdFile || (inContainer ? '/run/crag-host-machine-id' : '/etc/machine-id')
-    const raw = load(file, null, 64, machineIdFile ? uid() : 0)
-      ?.trim()
-      .toLowerCase()
-    if (!/^[a-f0-9]{32}$/.test(raw || '') || /^0{32}$/.test(raw)) throw fail()
-    return createHash('sha256').update(`crag-host-v1:${raw}`).digest('hex')
+    if (process.platform !== 'linux') throw hostIdentityUnavailable()
+    const native = !machineIdFile && !fs.existsSync(HOST_ID_MOUNT) && !isContainerized()
+    const files = machineIdFile
+      ? [machineIdFile].flat()
+      : native
+        ? ['/etc/machine-id', '/var/lib/dbus/machine-id']
+        : [HOST_ID_MOUNT]
+    let saved
+    try {
+      storage()
+      saved = load(hostFile, 0o644, 64)
+    } catch {
+      throw fail('crag_subscription_storage_unavailable')
+    }
+    let changed = false
+    for (const file of files) {
+      let raw
+      try {
+        const resolved = native ? fs.realpathSync(file) : file
+        if (native) checkParents(path.dirname(resolved))
+        raw = load(resolved, null, 64, machineIdFile ? null : 0)
+          ?.trim()
+          .toLowerCase()
+      } catch {
+        continue
+      }
+      if (/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(raw || '')) raw = raw.replaceAll('-', '')
+      if (!/^[a-f0-9]{32}$/.test(raw || '') || /^(0{32}|f{32})$/.test(raw)) continue
+      const hostId = createHash('sha256').update(`crag-host-v1:${raw}`).digest('hex')
+      if (saved == null || saved === hostId) return hostId
+      changed = true
+    }
+    throw changed ? hostIdentityChanged() : hostIdentityUnavailable()
   }
 
   function storage(create = false) {
@@ -415,7 +465,6 @@ export function createCragSubscription({
 
   function readLocalRights() {
     const hostId = identity()
-    storage()
     const previous = current(hostId)
     const pending =
       load(marker, 0o644, 32) != null ||
@@ -999,7 +1048,7 @@ export function createCragSubscription({
       const redemption_code = typeof value === 'string' && value.trim()
       if (!validVoucher(redemption_code)) throw fail('crag_subscription_invalid_request', 400)
       const hostId = identity()
-      if (expectedHost && hostId !== expectedHost) throw fail()
+      if (expectedHost && hostId !== expectedHost) throw hostIdentityChanged()
       const packageDigest = renewal ? undefined : hostPackageDigest(projectRoot)
       storage(!renewal)
       const previous = current(hostId)
@@ -1133,7 +1182,6 @@ export function createCragSubscription({
         return resolved
       }
 
-      storage()
       await checkTarget()
       if (!redeemed) {
         storage(true)
@@ -1190,13 +1238,7 @@ export function createCragSubscription({
     status: () => status(),
     admitInference,
     withRuntimeAdmission,
-    purchaseDeviceId() {
-      const hostId = identity()
-      storage()
-      const saved = load(hostFile, 0o644, 64)
-      if (saved != null && saved !== hostId) throw fail()
-      return hostId
-    },
+    purchaseDeviceId: identity,
     redeemDeviceOrder(hostId, voucher) {
       if (!isDigest(hostId)) throw fail()
       return redeem(voucher, false, hostId)
@@ -1204,7 +1246,6 @@ export function createCragSubscription({
     async listOrderTargets() {
       try {
         const hostId = identity()
-        storage()
         current(hostId)
       } catch {
         return []
@@ -1224,13 +1265,11 @@ export function createCragSubscription({
     },
     async pinOrderTarget(vmId) {
       const hostId = identity()
-      storage()
       return (await orderTarget(hostId, vmId)).fingerprint
     },
     activateOrder: activateTarget,
     async activateVoucher(vmId, voucher) {
       const hostId = identity()
-      storage()
       const { fingerprint } = await orderTarget(hostId, vmId)
       const { activated } = await activateTarget({ target: { vm_id: vmId, fingerprint }, claim: () => voucher })
       return activated
@@ -1243,7 +1282,6 @@ export function createCragSubscription({
     },
     async renewalProof() {
       const hostId = identity()
-      storage()
       checkNoIntent()
       if (!current(hostId)) throw fail('host_subscription_inactive', 409)
       const { proof } = await authority('renewal-proof', hostId, credential(hostId))
@@ -1255,7 +1293,6 @@ export function createCragSubscription({
       return exclusive(
         async () => {
           const hostId = identity()
-          storage()
           checkNoIntent()
           const previous = current(hostId)
           if (!previous || !(await ready({ reclaim: true }))) throw fail('crag_subscription_target_unready', 409)
@@ -1273,7 +1310,6 @@ export function createCragSubscription({
       let hostId, previous
       try {
         hostId = identity()
-        storage()
         previous = current(hostId)
       } catch (error) {
         if (!fs.existsSync(entitlementFile)) return destroy(false)
@@ -1321,7 +1357,6 @@ export function createCragSubscription({
           return
         }
         const hostId = identity()
-        storage()
         const rosterIntent = readRosterIntent()
         if (rosterIntent) {
           await syncRoster(hostId, rosterIntent, current(hostId))
@@ -1347,7 +1382,6 @@ export function createCragSubscription({
         if ((await assertReady(vm, { allowPrepared: true })) === false)
           throw fail('crag_subscription_target_unready', 409)
         const hostId = identity()
-        storage()
         checkNoIntent()
         await refreshExpired(hostId, current(hostId))
         const previous = current(hostId, vm)
@@ -1366,7 +1400,6 @@ export function createCragSubscription({
       return exclusive(async () => {
         if (typeof vm?.id !== 'string' || !isValidVmId(vm.id)) throw fail('crag_subscription_target_unready', 409)
         const hostId = identity()
-        storage()
         checkNoIntent()
         const previous = await refreshExpired(hostId, current(hostId))
         assertActive(previous)
