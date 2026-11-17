@@ -68,6 +68,7 @@ const RESTRICTED_SLOT = [
   },
   { match: /^node_offline$/, text: '节点离线' },
   { match: /^kernel_faulted$/, text: '内核故障' },
+  { match: /^license_crag_host_over_quota$/, text: '宿主订阅满额' },
   { match: /^worker_unhealthy$/, text: '槽服务异常' },
   { match: /^maintenance$/, text: '维护中' },
   { match: /^rest_period$/, text: '休息时段' },

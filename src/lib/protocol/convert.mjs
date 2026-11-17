@@ -546,14 +546,17 @@ function responsesToClaude(body, opts) {
         : responsesObjectSchema(definition.parameters ?? { type: 'object' })
     responseTools.set(name, { type: tool.type, name: definition.name, namespace: scope })
     tools.push(
-      withCacheControl(
-        {
-          name,
-          description,
-          input_schema: schema,
-          ...(typeof definition.strict === 'boolean' ? { strict: definition.strict } : {}),
-        },
-        definition.cache_control ? definition : tool,
+      withEagerInputStreaming(
+        withCacheControl(
+          {
+            name,
+            description,
+            input_schema: schema,
+            ...(typeof definition.strict === 'boolean' ? { strict: definition.strict } : {}),
+          },
+          definition.cache_control ? definition : tool,
+        ),
+        tool,
       ),
     )
     return name
@@ -634,9 +637,10 @@ function responsesToClaude(body, opts) {
     }
     const content = responsesContent(item.content, `${param}.content`)
     if (!content.length) continue
+    if (item.cache_control && !content.at(-1).cache_control) content.push(withCacheControl(content.pop(), item))
     if (role === 'system' || role === 'developer') {
       if (content.some((block) => block.type !== 'text')) invalidResponses(param, 'instructions must be text')
-      if (!replied) systemParts.push(...content)
+      if (!replied) appendLiftedSystemMessage(systemParts, messages, { content })
       else
         messages.push({
           role: 'user',

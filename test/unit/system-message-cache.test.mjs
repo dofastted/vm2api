@@ -225,6 +225,16 @@ for (const protocol of ['openai.chat', 'openai.responses']) {
   })
 }
 
+test('OpenAI Responses keeps a lifted developer cache behind a block-level 1h user cache', () => {
+  const out = convert('openai.responses', [
+    { role: 'user', content: [{ type: 'input_text', text: 'Hello', cache_control: control('1h') }] },
+    { role: 'developer', content: [{ type: 'input_text', text: 'mid rule', cache_control: control() }] },
+    { role: 'user', content: 'Continue' },
+  ])
+  assert.deepEqual(out.system, [text('mid rule')])
+  assert.deepEqual(controls(out), [control('1h'), control()])
+})
+
 test('OpenAI Chat tool results remain adjacent after a cached system message is lifted', () => {
   const out = convert('openai.chat', [
     { role: 'user', content: 'Hello' },
