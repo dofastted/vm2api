@@ -8,6 +8,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { normalizeCragKernelVersion, normalizeKernelDataplane, normalizeSlotPersonaPreset } from '../vm/slot-engine.mjs'
+import { normalizeImageContentBlocks } from './images.mjs'
 /**
  * Print is the CRAG v2 worker only. A live health report wins, then an
  * explicit dataplane on the VM, then the kernel.json that worker was started
@@ -423,6 +424,13 @@ export function prepareCragPrintBody(
   } = {},
 ) {
   const out = { ...(body || {}) }
+  const nativeV3 = Array.isArray(capabilities) && capabilities.includes('generation_controls_v3')
+  if (nativeV3 && Array.isArray(out.messages)) {
+    out.messages = out.messages.map((message) => {
+      const content = normalizeImageContentBlocks(message?.content, { inlineOnly: true })
+      return content === message?.content ? message : { ...message, content }
+    })
+  }
   if (agentSummary) out.messages = readOnlySummaryResults(out.messages)
   if (foldSystemMessages) {
     const folded = agentSummary ? foldSummarySystemTurns(out.messages) : foldSystemTurns(out.messages)
@@ -438,7 +446,6 @@ export function prepareCragPrintBody(
   stripCallerPromptAlias(out)
   if (capabilities !== undefined && (!Array.isArray(capabilities) || !capabilities.includes(`prompt_${mode}`)))
     return out
-  const nativeV3 = Array.isArray(capabilities) && capabilities.includes('generation_controls_v3')
   const textCache = nativeV3 && capabilities.includes('system_text_cache_v3')
   if (
     nativeV3 &&

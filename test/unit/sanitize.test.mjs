@@ -9,7 +9,80 @@ import {
   promoteContentToBlocks,
   promoteSystemToBlocks,
   canonicalizeClaudeMessagesShape,
+  isSmallTextTurn,
+  sanitizeAnthropicBody,
 } from '../../src/lib/protocol/sanitize.mjs'
+
+test('small single-turn text uses the ordinary path, not the heavier history fast path', () => {
+  const short = { messages: [{ role: 'user', content: 'short prompt' }] }
+  assert.equal(isSmallTextTurn(short), true)
+  assert.equal(isSmallTextTurn(canonicalizeClaudeMessagesShape(short)), true)
+  assert.equal(isSmallTextTurn({ ...short, tools: [{ name: 'lookup' }] }), false)
+  assert.equal(isSmallTextTurn({ messages: [...short.messages, { role: 'assistant', content: 'reply' }] }), false)
+  assert.equal(isSmallTextTurn({ messages: [{ role: 'user', content: 'x'.repeat(4097) }] }), false)
+  assert.equal(isSmallTextTurn({ messages: [{ role: 'user', content: [{ type: 'image' }] }] }), false)
+})
+
+test('native history fast path preserves typed blocks without rebuilding them', () => {
+  const body = {
+    model: 'claude-haiku-4-5',
+    system: 'caller guidance',
+    settings: { unused: true },
+    stop: 'stop',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'keep spacing  ', cache_control: { type: 'ephemeral' } }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'signed', signature: 'signature' },
+          { type: 'tool_use', id: 'toolu_pair', name: 'lookup', input: {} },
+        ],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_pair', content: [{ type: 'text', text: 'result' }] }],
+      },
+    ],
+  }
+  const output = sanitizeAnthropicBody(body, { reuseCanonicalHistory: true })
+  assert.equal(output.messages, body.messages)
+  assert.deepEqual(output, sanitizeAnthropicBody(structuredClone(body)))
+  assert.deepEqual(output.stop_sequences, ['stop'])
+  assert.equal(Object.hasOwn(output, 'settings'), false)
+})
+
+test('native history fast path falls back for real normalization without modifying shared history', () => {
+  const text = { type: 'text', text: 'keep' }
+  const cases = [
+    [{ role: 'user', content: ['string block'] }],
+    [{ role: 'user', content: [text, { type: 'text', text: '  ' }] }],
+    [{ role: 'user', content: [{ ...text, annotations: ['strip'] }] }],
+    [
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_pair', content: [{ ...text, annotations: ['strip'] }] }],
+      },
+    ],
+    [{ role: 'user', content: [{ ...text, text: 'Auto mode still active (reported by harness).' }] }],
+    [
+      { role: 'developer', content: [text] },
+      { role: 'user', content: [text] },
+    ],
+    [{ role: 'assistant', content: [text] }],
+    [
+      { role: 'user', content: [text] },
+      { role: 'user', content: [text] },
+    ],
+  ]
+  for (const messages of cases) {
+    const body = { model: 'claude-haiku-4-5', messages }
+    const original = structuredClone(body)
+    const output = sanitizeAnthropicBody(body, { reuseCanonicalHistory: true })
+    assert.notEqual(output.messages, messages)
+    assert.deepEqual(body, original)
+    assert.deepEqual(output, sanitizeAnthropicBody(original))
+  }
+})
 
 test('copyOfficialAnthropicFields keeps official keys and drops client junk', () => {
   const out = copyOfficialAnthropicFields({

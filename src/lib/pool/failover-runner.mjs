@@ -1179,7 +1179,7 @@ export class FailoverRunner {
         if (attemptStarted === undefined) throw error
         const invalidRequest =
           error?.status === 400 &&
-          (error.body?.error?.code === 'invalid_cache_control' || error.body?.error?.code === 'crag_prompt_too_large')
+          ['invalid_cache_control', 'crag_prompt_too_large', 'invalid_image_url'].includes(error.body?.error?.code)
         noteHop(invalidRequest ? { upstreamExecutions: 0 } : null)
         if (error?.code === 'response_sent') {
           this.attemptsRepo?.complete?.(requestId, attemptNo, {
