@@ -182,13 +182,16 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
   const operating = useRef(false)
   const status = host.isError ? undefined : host.data
   const syncPending = host.data?.state === 'sync_pending'
+  const reclaimPending = (status?.reclaim_pending_count ?? 0) > 0
+  const canRecover =
+    syncPending || (status?.reclaim_supported && reclaimPending)
   const upgrading = action === 'upgrade'
 
   async function updateHost(operation: 'redeem' | 'recover') {
     const redemptionCode = code.trim()
     if (operating.current) return
     if (operation === 'redeem' && (!redemptionCode || syncPending)) return
-    if (operation === 'recover' && !syncPending) return
+    if (operation === 'recover' && !canRecover) return
     operating.current = true
     setAction(operation)
     setNotice(undefined)
@@ -204,7 +207,14 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
       qc.setQueryData(queryKey, next)
       if (next.state === 'active' || next.state === 'expired') {
         setCode('')
-        setNotice({ text: '宿主机额度已更新，未自动绑定 VM' })
+        setNotice({
+          text:
+            operation === 'redeem'
+              ? '宿主机额度已更新，未自动绑定 VM'
+              : (next.reclaim_pending_count ?? 0) > 0
+                ? '仍有绑定待回收确认'
+                : '订阅状态已同步',
+        })
       } else if (next.state !== 'sync_pending') {
         setNotice({ text: hostRedemptionError(undefined), error: true })
       }
@@ -264,6 +274,11 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
         </p>
       ) : null}
       <CragRuntimeCounts status={status} />
+      {reclaimPending && !status?.reclaim_supported ? (
+        <p className='text-sm text-muted-foreground'>
+          旧订阅的已删除绑定待启用槽位回收。
+        </p>
+      ) : null}
       {status?.upgrade_available && !status.reclaim_supported ? (
         <Button
           size='sm'
@@ -276,7 +291,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
       ) : null}
       {status?.reclaim_supported ? (
         <p className='text-sm text-muted-foreground'>
-          删除槽位并同步成功后，其应用锁可重新分配。停止槽位不释放额度。
+          删除槽位或切回 cli-node 后，经回收确认释放绑定额度。仅停止不立即回收。
         </p>
       ) : null}
       <ConfirmDialog
@@ -314,7 +329,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
                 ? '当前没有可绑定的 CRAG 槽位，仍可兑换。本机与集群的 Docker、KVM 槽共享额度。'
                 : '付款或领码不会更新本机权益。可在此兑换宿主机额度，再到所需槽位的授权页绑定应用锁。'}
       </p>
-      {syncPending ? (
+      {canRecover ? (
         <Button
           type='button'
           size='sm'
@@ -324,7 +339,8 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
         >
           {action === 'recover' ? '正在同步…' : '继续同步'}
         </Button>
-      ) : (
+      ) : null}
+      {!syncPending ? (
         <form
           aria-label='兑换宿主机额度'
           className='max-w-xl space-y-2 border-t pt-3'
@@ -357,7 +373,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
             {action === 'redeem' ? '正在兑换…' : '兑换到本机'}
           </Button>
         </form>
-      )}
+      ) : null}
       {notice ? (
         <p
           role={notice.error ? 'alert' : 'status'}

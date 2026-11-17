@@ -972,6 +972,7 @@ test('a lost renewal response suspends real control admission until restart repl
     ready: true,
     state: 'unredeemed',
     available_seats: 0,
+    reclaim_pending_count: 0,
     total_slots: 2,
     enabled_slots: 0,
   })
@@ -1514,6 +1515,350 @@ test('one running slot may update at capacity, and only confirmed stopped seats 
   assert.equal(binds, 2)
   assert.equal(checkCragLicense(root, first).code, 'license_required')
   assert.equal(checkCragLicense(root, second).license.seat, 1)
+})
+
+async function seatReleaseFixture(t, { version = 1, count = 2 } = {}) {
+  const state = { version, revision: 0, roster: [], calls: [], stopped: new Set(), targets: [], releaseFailure: false }
+  const context = standaloneHost(t, async (url, { body }) => {
+    const action = url.split('/').at(-1)
+    const request = JSON.parse(body)
+    state.calls.push({ action, ...request })
+    let binding
+    let changed = action === 'redeem'
+    if (action === 'bind') {
+      const seat = Math.max(0, ...state.roster.map((entry) => entry.seat)) + 1
+      binding = issueSlotPermit(context.root, request.machine_code, request.host_id, { seat })
+      state.roster.push({ seat, permit_sha256: crypto.createHash('sha256').update(binding.code).digest('hex') })
+      changed = state.version === 2
+    }
+    if (action === 'upgrade') {
+      state.version = 2
+      changed = true
+    }
+    if (action === 'release') {
+      const before = state.roster.length
+      state.roster = state.roster.filter((entry) => entry.permit_sha256 !== request.permit_sha256)
+      changed = before !== state.roster.length
+    }
+    if (changed) {
+      const rights = issueHostEntitlement(context.root, request.host_id, { slot_limit: 10, revision: ++state.revision })
+      state.rights =
+        state.version === 1
+          ? rights
+          : {
+              claims: { ...rights.claims, version: 2, roster: state.roster.map((entry) => ({ ...entry })) },
+              code: signSubscriptionBytes(
+                context.root,
+                'CRAGH2',
+                JSON.stringify({ ...rights.claims, version: 2, roster: state.roster }),
+              ),
+            }
+    }
+    if (action === 'release' && state.releaseFailure) throw new Error('lost release response')
+    return Response.json({
+      ok: true,
+      data: {
+        entitlement: state.rights.code,
+        ...state.rights.claims,
+        used_slots: state.roster.length,
+        available_slots: 10 - state.roster.length,
+        ...(binding && { seat: binding.claims.seat, slot_permit: binding.code }),
+      },
+    })
+  })
+  seedEncryptedPackage(context.root)
+  const createVm = (id) => {
+    const vm = { id, dataplane: 'crag', status: 'running', runtime: { type: 'docker' } }
+    const dir = path.join(context.root, 'vms', id)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'machine-id'), crypto.randomBytes(16).toString('hex'))
+    state.targets.push(vm)
+    return vm
+  }
+  const connect = (options = {}) =>
+    context.connect({
+      listTargets: () => state.targets,
+      getTarget: (id) => state.targets.find((vm) => vm.id === id),
+      assertReady: () => true,
+      isSlotEnabled: () => false,
+      runtimeInventory: { confirmReclaimableStop: async (vm) => state.stopped.has(vm.id) },
+      ...options,
+    })
+  const service = connect()
+  await service.redeem(voucher())
+  for (let i = 0; i < count; i++) await service.bind(createVm(`vm-release-${i}`))
+  const forget = (vm) => {
+    state.targets = state.targets.filter((candidate) => candidate !== vm)
+    fs.rmSync(path.join(context.root, 'vms', vm.id), { recursive: true, force: true })
+  }
+  const destroy = async (required) => {
+    assert.equal(required, true)
+    return { ok: true, teardownConfirmed: true }
+  }
+  return {
+    ...context,
+    connect,
+    service,
+    state,
+    createVm,
+    forget,
+    destroy,
+    deferredFile: path.join(context.privateDir, 'deleted-slots.json'),
+  }
+}
+
+test('H1 deletion preserves exact evidence until H2 upgrade releases the deleted seat', async (t) => {
+  const f = await seatReleaseFixture(t)
+  const removed = f.state.targets[0]
+  const digest = f.state.roster[0].permit_sha256
+  const deleted = await f.service.teardown(removed, f.destroy)
+  assert.equal(deleted.reclaim_pending, true)
+  f.forget(removed)
+  assert.equal(fs.statSync(f.deferredFile).mode & 0o777, 0o600)
+  assert.equal(fs.statSync(f.privateDir).mode & 0o777, 0o700)
+  const saved = JSON.parse(fs.readFileSync(f.deferredFile, 'utf8'))
+  assert.deepEqual(saved.entries, [{ vm_id: removed.id, permit_sha256: digest, proven: true }])
+  assert.doesNotMatch(JSON.stringify(saved), /CRAGS1|CRAGR1|private_key|credential/)
+  assert.equal(fs.existsSync(path.join(f.publicDir, 'sync-pending')), false)
+  await f.connect().recover()
+  assert.equal(f.state.calls.filter(({ action }) => action === 'release').length, 0)
+  assert.equal((await f.service.status()).reclaim_pending_count, 1)
+  const upgraded = await f.service.upgrade()
+  assert.equal(upgraded.reclaim_supported, true)
+  assert.equal(upgraded.reclaim_pending_count, 0)
+  assert.equal(upgraded.available_seats, 9)
+  assert.equal(f.state.roster.length, 1)
+  assert.equal(fs.existsSync(f.deferredFile), false)
+  assert.deepEqual(
+    f.state.calls
+      .filter(({ action }) => action === 'release')
+      .map(({ vm_id, permit_sha256 }) => ({ vm_id, permit_sha256 })),
+    [{ vm_id: removed.id, permit_sha256: digest }],
+  )
+})
+
+test('H1 deletion stores unproven intent before destruction and never reclaims an unconfirmed delete', async (t) => {
+  const f = await seatReleaseFixture(t)
+  const vm = f.state.targets[0]
+  await assert.rejects(
+    f.service.teardown(vm, async (required) => {
+      assert.equal(required, true)
+      assert.equal(JSON.parse(fs.readFileSync(f.deferredFile, 'utf8')).entries[0].proven, false)
+      return { ok: true }
+    }),
+    { code: 'crag_subscription_teardown_unconfirmed' },
+  )
+  assert.equal((await f.service.status()).state, 'active')
+  assert.equal((await f.service.status()).reclaim_pending_count, 0)
+  await f.service.bind(f.createVm('vm-another-binding'))
+  await f.service.upgrade()
+  await f.connect().recover()
+  assert.equal(f.state.calls.filter(({ action }) => action === 'release').length, 0)
+  assert.equal(JSON.parse(fs.readFileSync(f.deferredFile, 'utf8')).entries[0].proven, false)
+  assert.equal(f.state.roster.length, 3)
+})
+
+test('multiple H1 deletions survive a lost H2 release response and recover without VM records', async (t) => {
+  const f = await seatReleaseFixture(t, { count: 3 })
+  for (const vm of f.state.targets.slice(0, 2)) {
+    await f.service.teardown(vm, f.destroy)
+    f.forget(vm)
+  }
+  f.state.releaseFailure = true
+  await assert.rejects(f.service.upgrade(), { code: 'crag_subscription_authority_unavailable' })
+  assert.equal(JSON.parse(fs.readFileSync(f.deferredFile, 'utf8')).entries.length, 2)
+  assert.equal(fs.existsSync(path.join(f.publicDir, 'sync-pending')), true)
+  const intent = JSON.parse(fs.readFileSync(path.join(f.privateDir, 'roster.json'), 'utf8'))
+  assert.equal(intent.proven, true)
+  assert.equal(intent.deferred, true)
+  f.state.releaseFailure = false
+  await f.connect().recover()
+  assert.equal(fs.existsSync(f.deferredFile), false)
+  assert.equal(fs.existsSync(path.join(f.publicDir, 'sync-pending')), false)
+  assert.equal(f.state.roster.length, 1)
+  await f.connect().recover()
+  assert.equal(f.state.roster.length, 1)
+})
+
+test('deferred deletion never removes a new permit that reuses the same VM id', async (t) => {
+  const f = await seatReleaseFixture(t)
+  const old = f.state.targets[0]
+  const digest = f.state.roster[0].permit_sha256
+  await f.service.teardown(old, f.destroy)
+  f.forget(old)
+  const replacement = f.createVm(old.id)
+  await f.service.bind(replacement)
+  const registration = path.join(cragLicenseDirectory(f.root, replacement), 'registration.code')
+  const fresh = fs.readFileSync(registration)
+  await f.service.upgrade()
+  assert.equal(
+    f.state.roster.some((entry) => entry.permit_sha256 === digest),
+    false,
+  )
+  assert.deepEqual(fs.readFileSync(registration), fresh)
+  assert.equal(checkCragLicense(f.root, replacement).ok, true)
+})
+
+test('an H2 host can replay deferred deletion through upgrade without probing a live CRAG target', async (t) => {
+  const f = await seatReleaseFixture(t)
+  const vm = f.state.targets[0]
+  await f.service.teardown(vm, f.destroy)
+  f.forget(vm)
+  const entries = fs.readFileSync(f.deferredFile)
+  fs.unlinkSync(f.deferredFile)
+  await f.service.upgrade()
+  fs.writeFileSync(f.deferredFile, entries, { mode: 0o600 })
+  const upgraded = await f.connect({ assertReady: () => false }).upgrade()
+  assert.equal(upgraded.reclaim_pending_count, 0)
+  assert.equal(f.state.roster.length, 1)
+})
+
+test('deferred release evidence rejects a foreign host and unsafe files before destruction', async (t) => {
+  const f = await seatReleaseFixture(t)
+  const vm = f.state.targets[0]
+  await f.service.teardown(vm, f.destroy)
+  const saved = JSON.parse(fs.readFileSync(f.deferredFile, 'utf8'))
+  fs.writeFileSync(f.deferredFile, JSON.stringify({ ...saved, host_id: 'f'.repeat(64) }))
+  await assert.rejects(f.connect().recover(), { code: 'crag_subscription_host_identity_changed' })
+  await assert.rejects(
+    f.service.teardown(vm, () => assert.fail('foreign evidence must prevent destruction')),
+    { code: 'crag_subscription_host_identity_changed' },
+  )
+  fs.writeFileSync(f.deferredFile, JSON.stringify(saved))
+  fs.chmodSync(f.deferredFile, 0o644)
+  await assert.rejects(f.service.teardown(vm, () => assert.fail('unsafe evidence must prevent destruction')))
+  fs.chmodSync(f.deferredFile, 0o600)
+  const original = path.join(f.root, 'original-deferred')
+  fs.renameSync(f.deferredFile, original)
+  fs.symlinkSync(original, f.deferredFile)
+  await assert.rejects(f.connect().recover())
+  assert.equal(f.state.calls.filter(({ action }) => action === 'release').length, 0)
+})
+
+test('H2 explicit release stops and rechecks the physical runtime before removing the exact permit', async (t) => {
+  const f = await seatReleaseFixture(t, { version: 2 })
+  const vm = f.state.targets[0]
+  vm.dataplane = 'wrap'
+  const registration = path.join(cragLicenseDirectory(f.root, vm), 'registration.code')
+  const stopped = []
+  await assert.rejects(f.service.releaseStoppedBinding(vm, { stop: async () => ({ ok: true }) }), {
+    code: 'crag_subscription_stop_unconfirmed',
+  })
+  assert.equal(f.state.calls.filter(({ action }) => action === 'release').length, 0)
+  assert.equal(fs.existsSync(registration), true)
+  const result = await f.service.releaseStoppedBinding(vm, {
+    stop: async (target) => {
+      stopped.push(target.id)
+      f.state.stopped.add(target.id)
+      target.status = 'stopped'
+      return { ok: true }
+    },
+  })
+  assert.deepEqual(result, { released: true, stopped: true, reclaim_supported: true })
+  assert.deepEqual(stopped, [vm.id])
+  assert.equal(f.state.roster.length, 1)
+  assert.equal(fs.existsSync(registration), false)
+  assert.equal(fs.existsSync(path.join(f.publicDir, 'sync-pending')), false)
+})
+
+test('H2 stopped release recovers a lost response and H1 release never upgrades or stops a slot', async (t) => {
+  const legacy = await seatReleaseFixture(t)
+  const vm = legacy.state.targets[0]
+  const prior = legacy.state.calls.length
+  assert.deepEqual(await legacy.service.releaseStoppedBinding(vm, { stop: () => assert.fail('H1 cannot release') }), {
+    released: false,
+    stopped: false,
+    reclaim_supported: false,
+    reclaim_pending: true,
+  })
+  assert.equal(legacy.state.calls.length, prior)
+  const f = await seatReleaseFixture(t, { version: 2 })
+  const target = f.state.targets[0]
+  f.state.stopped.add(target.id)
+  f.state.releaseFailure = true
+  await assert.rejects(f.service.releaseStoppedBinding(target), { code: 'crag_subscription_authority_unavailable' })
+  f.state.releaseFailure = false
+  assert.equal((await f.connect().releaseStoppedBinding(target)).released, true)
+  assert.equal(fs.existsSync(path.join(cragLicenseDirectory(f.root, target), 'registration.code')), false)
+})
+
+test('slots without host entitlement do not need host identity or invoke a stop callback', async (t) => {
+  const f = standaloneHost(t, () => assert.fail('an unconfigured host must not contact Authority'))
+  fs.unlinkSync(f.machineIdFile)
+  assert.deepEqual(
+    await f.connect().releaseStoppedBinding(
+      { id: 'vm-default', dataplane: 'wrap' },
+      {
+        stop: () => assert.fail('an unconfigured host must not stop the slot'),
+      },
+    ),
+    { released: false, stopped: false, reclaim_supported: false },
+  )
+  const configured = await seatReleaseFixture(t, { version: 2 })
+  fs.unlinkSync(configured.machineIdFile)
+  await assert.rejects(configured.service.releaseStoppedBinding(configured.state.targets[0]), {
+    code: 'crag_subscription_host_identity_unavailable',
+  })
+})
+
+test('deferred deletion is bounded and refuses duplicate or malformed evidence', async (t) => {
+  const f = await seatReleaseFixture(t)
+  const vm = f.state.targets[0]
+  const hostId = f.service.purchaseDeviceId()
+  const entry = (index) => ({
+    vm_id: `vm-deferred-${index}`,
+    permit_sha256: index.toString(16).padStart(64, '0'),
+    proven: false,
+  })
+  const write = (entries) =>
+    fs.writeFileSync(f.deferredFile, JSON.stringify({ version: 1, host_id: hostId, entries }), { mode: 0o600 })
+  write(Array.from({ length: 10000 }, (_, index) => entry(index)))
+  await assert.rejects(
+    f.service.teardown(vm, () => assert.fail('full evidence storage must not destroy the VM')),
+    { code: 'crag_subscription_reclaim_limit' },
+  )
+  for (const entries of [
+    Array.from({ length: 10001 }, (_, index) => entry(index)),
+    [entry(1), entry(1)],
+    [{ ...entry(1), vm_id: '../escape' }],
+    [{ ...entry(1), proven: 'true' }],
+    [{ ...entry(1), extra: 'unexpected' }],
+  ]) {
+    write(entries)
+    await assert.rejects(f.connect().recover(), { code: 'crag_subscription_invalid_reclaim' })
+  }
+  assert.equal(f.state.calls.filter(({ action }) => action === 'release').length, 0)
+})
+
+test('a deferred deletion of a record that was restarted with the same permit stays pending', async (t) => {
+  const f = await seatReleaseFixture(t)
+  const vm = f.state.targets[0]
+  await f.service.teardown(vm, f.destroy)
+  await f.service.upgrade()
+  assert.equal(f.state.calls.filter(({ action }) => action === 'release').length, 0)
+  assert.equal((await f.service.status()).reclaim_pending_count, 1)
+  f.state.stopped.add(vm.id)
+  await f.connect().recover()
+  assert.equal(fs.existsSync(f.deferredFile), false)
+  assert.equal(fs.existsSync(path.join(cragLicenseDirectory(f.root, vm), 'registration.code')), false)
+})
+
+test('H2 stopped release detects a replaced permit after stop and preserves the new binding', async (t) => {
+  const f = await seatReleaseFixture(t, { version: 2 })
+  const [vm, other] = f.state.targets
+  const registration = path.join(cragLicenseDirectory(f.root, vm), 'registration.code')
+  const replacement = fs.readFileSync(path.join(cragLicenseDirectory(f.root, other), 'registration.code'))
+  await assert.rejects(
+    f.service.releaseStoppedBinding(vm, {
+      stop: async () => {
+        fs.writeFileSync(registration, replacement)
+        f.state.stopped.add(vm.id)
+        return { ok: true }
+      },
+    }),
+  )
+  assert.deepEqual(fs.readFileSync(registration), replacement)
+  assert.equal(f.state.calls.filter(({ action }) => action === 'release').length, 0)
 })
 
 test('only an authenticated same-origin admin session can redeem without revealing a failed voucher', async () => {

@@ -42,9 +42,20 @@ import { rustKernelHealth, rustKernelProcessUp } from '../transport/rust-kernel-
 const PRODUCTS = new Set(['cli-node', 'crag'])
 const INTERRUPTED_COMMAND =
   /^(node_not_ready|ssh_timeout|ssh_connect_failed|ssh_closed|ssh_link_error|exec_timeout|docker_timeout|docker_io_failed|ECONNRESET|EPIPE)$/
-// Only exceptional installer holds may be cleared by a later explicit start.
+// Exceptional switch holds may be cleared by a later explicit start.
 // Key by record path so independent projects cannot release each other's slot.
 const safetyHolds = new Map()
+
+export function hasKernelInstallSafetyHold(projectRoot, id, watchdog) {
+  return !!watchdog && safetyHolds.get(path.join(projectRoot, 'vms', `${id}.json`)) === watchdog
+}
+
+/** Preserve an existing watchdog hold after a confirmed stop could not be persisted. */
+export function retainKernelInstallSafetyHold(projectRoot, id, watchdog) {
+  if (typeof watchdog?.hold !== 'function') return false
+  safetyHolds.set(path.join(projectRoot, 'vms', `${id}.json`), watchdog)
+  return true
+}
 
 function clearInstallHold(record) {
   const operation = record.kernel_operation
@@ -301,6 +312,7 @@ export async function installKernelTargets({
   watchdog,
   poolScheduler,
   cragSubscription,
+  releaseStoppedBinding = cragSubscription?.releaseStoppedBinding?.bind(cragSubscription),
   ops = {},
   resumeId = null,
 }) {
@@ -519,6 +531,24 @@ export async function installKernelTargets({
             }
             const changedBeforeMaterialize = checkPin(installedProduct, true)
             if (changedBeforeMaterialize) return changedBeforeMaterialize
+            let bindingRelease
+            if (target.kernel !== 'crag' && typeof releaseStoppedBinding === 'function') {
+              phase = 'kernel_selection_persist_failed'
+              const selected = patchVmRecord(projectRoot, target.id, (record) => {
+                record.dataplane = candidate.dataplane
+                delete record.crag_kernel_version
+              })
+              if (!selected) return failure(target, 'vm_not_found', '虚拟机记录已移除', true)
+              // Replacing the preinstalled CRAG package can replace its trust key.
+              // Revoke the old permit while that verified package is still present.
+              phase = 'crag_subscription_release_failed'
+              try {
+                bindingRelease = await releaseStoppedBinding(selected)
+              } catch (error) {
+                return failure(target, error.code || phase, 'CRAG 订阅绑定未能完成释放，请同步订阅状态后重试。', true)
+              }
+            }
+            phase = 'kernel_materialize_failed'
             const baked = !!String(candidate.node_id || '').trim()
             const laid = baked
               ? await (ops.deployBakedKernel || deployBakedKernel)(projectRoot, candidate, target.kernel)
@@ -582,6 +612,7 @@ export async function installKernelTargets({
               status: running.status,
               version: installedProduct.version ?? null,
               ...(installedProduct.payload_tag ? { payload_tag: installedProduct.payload_tag } : {}),
+              ...(bindingRelease?.reclaim_pending && { reclaim_pending: true }),
             }
           }
           const run = async () => {
@@ -672,7 +703,14 @@ export async function installKernelTargets({
 }
 
 /** Resume only interrupted commands; the durable marker survives control-plane and SSH loss. */
-export async function resumePendingKernelInstalls({ projectRoot, routing = {}, watchdog, poolScheduler, ops = {} }) {
+export async function resumePendingKernelInstalls({
+  projectRoot,
+  routing = {},
+  watchdog,
+  poolScheduler,
+  releaseStoppedBinding,
+  ops = {},
+}) {
   const items = []
   for (const summary of listVms(projectRoot)) {
     const vm = getVm(projectRoot, summary.id)
@@ -708,6 +746,7 @@ export async function resumePendingKernelInstalls({ projectRoot, routing = {}, w
       routing,
       watchdog,
       poolScheduler,
+      releaseStoppedBinding,
       ops,
       resumeId: pending.id,
     })

@@ -110,7 +110,7 @@
 | POST | `/vms/:id/reset-fingerprint` | |
 | POST | `/vms/:id/allocate-proxy` | 从池分配 SOCKS5 |
 | POST | `/vms/:id/update-claude-code` | 410，`claude_cli_removed` |
-| DELETE | `/vms/:id` | 多槽时不能删仍占 `active.json` 的槽（409 `switch active first`）；管理台删除确认可在有健康可调度候选时先 `activate` 再删。只解绑本槽代理 |
+| DELETE | `/vms/:id` | 多槽时不能删仍占 `active.json` 的槽（409 `switch active first`）；管理台删除确认可在有健康可调度候选时先 `activate` 再删。只解绑本槽代理。成功返回 `{ deleted, reclaim_pending? }`；`reclaim_pending: true` 表示槽已删除，但其 CRAG 订阅绑定仍待回收确认 |
 | POST | `/vms/create` | 种子 VM + Claude Code home；依赖私有 `kin-computer`。未安装返回 400 `computer_service_missing`，身份生成失败返回 400 `computer_create_failed`。Docker 槽可在 `machine` 里可选传 `docker_cpus`（见下） |
 | POST | `/vms/import` | sessionKey 导入（必须已有 VM+代理） |
 | POST | `/vms/:id/shell-ticket` | 管理员获取 30 秒单次票据和 `cli_bin`。`{login:true}` 申请专用登录终端，要求绑定可用出口 |
@@ -137,6 +137,8 @@
 新安装与既有 PATCH/槽策略、同步、数据面切换、Release 同步及单槽修复共用同一记录锁；多槽操作在接收时固定目标并按稳定顺序加锁。其他页面的并发重装不能在安装器停止服务后穿插复制或自动重启；`restart:false` 仍只读检查。
 
 运行中槽位通过 PATCH、槽策略或 `/dataplane` 切核时，会先加入独立维护暂停并等待在途请求归零，同时暂停并排空该槽的看门狗操作。cli-node ↔ CRAG 双向切换重建需要变更创建参数的容器；容器已启动不等于内核就绪，`rust_ok:false` 仍视为失败。成功切核 / 重装重置该账号的请求熔断及内核恢复预算；失败不抹除故障。维护结束仅清除本次暂停，保留操作员调度关及其他出口 / 维护暂停。`restart:false` 的检查行为不变。
+
+切回 cli-node 时，H2 宿主订阅绑定须在确认该槽物理停止后回收，回收确认后才启动标准内核。回收失败会返回错误并保留停止状态。单独恢复订阅同步不会启动槽位；确认回收后可显式启动，或通过内核页重装恢复运行。H1 尚不支持回收；切核可以完成，但返回 `reclaim_pending: true`，不会宣称额度已释放。该字段位于单槽 PATCH 的 `data`、异步 `kernel-switch` 任务，以及 `/kernels/install`、槽策略和 `/dataplane` 的逐槽结果中。H1 切核的待回收绑定不属于已删除队列；启用 H2 回收后，可在内核页重装 cli-node 完成释放。
 
 `/vms`、`/vms/:id`、`/usage` 的账号行带窗口估算 `estimate_5h` / `estimate_7d` / `estimate_fable`（Fable 只在有 `7d_oi` 窗口的 Claude 号上非空）和 `window_fable_cost`。结构：`{ status, spent_usd, total_usd, remaining_usd, total_tokens, used_ratio }`。总量 = 窗口内官方费用 ÷ 已用比例，按官方价算，不乘分组倍率。`status` 不是 `ok` 时 `total_usd` / `remaining_usd` 为 `null`：`no_data`（无用量读数）、`no_reset`（无重置时间或已过期）、`log_gap`（日志没覆盖窗口起点，或已用比例动了但网关内无花费）、`low_usage`（已用 < 5%）、`unpriced`（窗口内有未定价请求）。token 字段 `total_tokens` / `today_tokens` / `window_*_tokens` 都是输入 + 输出 + 缓存读 + 缓存写，每类只算一次。
 
@@ -286,7 +288,13 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 收据主密钥保存在数据目录的 `crag-shop-private/receipt.key`，仅控制进程可读；迁移安装或恢复订单库时，须单独安全备份并恢复同一份密钥。标准数据库备份不含该密钥，已有订单而密钥丢失时服务拒绝重建密钥。
 
-宿主订阅状态 `GET /crag-subscription` 仅管理员可查。面板统一使用 `state` 和 `available_seats` 展示状态与剩余可绑定槽位；`null` 表示待核对，`"unlimited"` 表示不限。Docker、KVM 与集群槽共享同一订阅，不按 CRAG 发行版本分池。`used_slots` / `available_slots` 保留供兼容，`ready` 表示有兼容的绑定目标。H2 受签名名单 10,000 槽上限约束；支持的 H1 宿主可通过 `POST /crag-subscription/upgrade`（JSON `{}`）升级。删除 H2 槽须确认运行实例销毁后才释放额度；停机本身不释放额度，名额不足时可按需回收确认已停机且未在操作的槽。回收中断可通过 `POST /crag-subscription/recover`（JSON `{}`）继续。
+宿主订阅状态 `GET /crag-subscription` 仅管理员可查。面板统一使用 `state` 和 `available_seats` 展示状态与剩余可绑定槽位；`null` 表示待核对，`"unlimited"` 表示不限。Docker、KVM 与集群槽共享同一订阅，不按 CRAG 发行版本分池。`used_slots` / `available_slots` 保留供兼容，`ready` 表示有兼容的绑定目标。绑定额度与 `runtime.host_running_vms` 的实际运行数量不同，停止、删除或改用标准内核后，只有回收确认才会增加可绑定额度。
+
+H2 受签名名单 10,000 槽上限约束；支持的 H1 宿主可通过 `POST /crag-subscription/upgrade`（JSON `{}`）升级。删除 H2 槽须确认运行实例销毁后才释放额度；停机本身不释放额度，名额不足时可按需回收确认已停机且未在操作的槽。回收中断可通过 `POST /crag-subscription/recover`（JSON `{}`）继续。
+
+H1 删除已绑定槽时，控制面保留最小私有回收记录，只有严格确认运行实例已销毁才将记录标为可处理，并在删除响应中返回 `reclaim_pending: true`。可选 `reclaim_pending_count` 仅统计这些已确认销毁且仍待回收的记录，不包含未确认记录，也不包含仍存在的 cli-node 槽绑定。H1 的普通恢复不会伪称已回收；显式升级到 H2 或在 H2 下调用升级/恢复时处理已确认记录，并核对原许可摘要，避免影响重新创建的同名槽。面板在删除、切核及安装后刷新订阅状态，升级后的数量以服务端回读为准。
+
+旧版本中已经删除且未留下回收记录的历史绑定，不能依据名册与本地槽数量差推测后自动撤回。此类记录需要备份或 Authority 的精确绑定证据另行核对；更新控制面不会自动修复已经遗失的删除证据。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |

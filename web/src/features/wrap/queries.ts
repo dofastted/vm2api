@@ -43,6 +43,7 @@ export type KernelInstallItem = KernelTarget & {
   stopped: boolean
   restarted?: boolean
   rolled_back?: boolean
+  reclaim_pending?: boolean
   schedulable?: boolean
   status?: string
   version?: string | null

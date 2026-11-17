@@ -33,6 +33,7 @@ const mocks = vi.hoisted(() => ({
   invalidateQueries: vi.fn().mockResolvedValue(undefined),
   loading: vi.fn(),
   success: vi.fn(),
+  warning: vi.fn(),
   error: vi.fn(),
 }))
 
@@ -78,6 +79,7 @@ vi.mock('sonner', () => ({
   toast: {
     loading: mocks.loading,
     success: mocks.success,
+    warning: mocks.warning,
     error: mocks.error,
   },
 }))
@@ -305,6 +307,25 @@ describe('VM page kernel switch feedback', () => {
     expect(html).not.toContain('内核重启完成')
   })
 
+  it('retains the deferred binding result from the local PATCH and explains the remaining reclaim step', async () => {
+    vi.mocked(patchVm).mockResolvedValueOnce({ reclaim_pending: true })
+    render({ resolved_dataplane: 'crag' })
+    const result = await options().mutationFn('wrap')
+    options().onSuccess(result, 'wrap')
+    expect(mocks.warning).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining('cli-node'),
+      expect.objectContaining({
+        id: 'vm-kernel-switch-vm-01',
+        description: expect.stringContaining('在内核页重装 cli-node 完成回收'),
+      })
+    )
+    expect(mocks.success).not.toHaveBeenCalled()
+    mocks.mutationState = { isSuccess: true, variables: 'wrap', data: result }
+    const html = render()
+    expect(html).toContain('内核切换完成，绑定待回收')
+    expect(html).toContain('CRAG 绑定额度待回收确认')
+  })
+
   it('keeps failure details and a diagnostic next step visible', () => {
     mocks.mutationState = {
       isError: true,
@@ -378,7 +399,7 @@ describe('VM page kernel switch feedback', () => {
     )
   })
 
-  it('refreshes detail, list and dashboard after either outcome and awaits refresh', async () => {
+  it('refreshes VM and subscription state after either outcome and awaits refresh', async () => {
     render()
     let finishRefresh: () => void = () => {}
     mocks.invalidateQueries.mockImplementationOnce(
@@ -394,6 +415,7 @@ describe('VM page kernel switch feedback', () => {
       ['panel', 'vm', 'vm-01'],
       ['panel', 'vms'],
       ['panel', 'dashboard'],
+      ['crag-host-subscription'],
     ])
     if (!settled) throw new Error('Expected the VM refresh to be awaited')
     let finished = false
@@ -503,6 +525,7 @@ describe('VM page kernel switch feedback', () => {
       ['panel', 'vm', 'vm-01'],
       ['panel', 'vms'],
       ['panel', 'dashboard'],
+      ['crag-host-subscription'],
     ])
   })
 
@@ -521,6 +544,32 @@ describe('VM page kernel switch feedback', () => {
       expect.any(Object)
     )
     expect(startVmKernelSwitch).not.toHaveBeenCalled()
+  })
+
+  it('keeps a deferred remote binding visible after the switch job succeeds', () => {
+    mocks.jobState = {
+      data: job({
+        status: 'succeeded',
+        dataplane: 'wrap',
+        crag_kernel_version: '',
+        reclaim_pending: true,
+      }),
+    }
+    const html = render({ node_id: 'node-kvm', runtime_type: 'kvm' })
+    runEffects()
+    expect(html).toContain('内核切换完成，绑定待回收')
+    expect(html).toContain('在内核页重装 cli-node 完成回收')
+    expect(mocks.warning).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining('cli-node'),
+      expect.objectContaining({
+        id: 'vm-kernel-switch-vm-01',
+        description: expect.stringContaining('CRAG 绑定额度待回收确认'),
+      })
+    )
+    expect(mocks.success).not.toHaveBeenCalled()
+    expect(mocks.invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['crag-host-subscription'],
+    })
   })
 
   it('shows the final remote failure and refreshes without claiming success', () => {
@@ -542,7 +591,7 @@ describe('VM page kernel switch feedback', () => {
       expect.objectContaining({ id: 'vm-kernel-switch-vm-01' })
     )
     expect(mocks.success).not.toHaveBeenCalled()
-    expect(mocks.invalidateQueries).toHaveBeenCalledTimes(3)
+    expect(mocks.invalidateQueries).toHaveBeenCalledTimes(4)
   })
 
   it.each(['请求连接断开', '切换任务记录已丢失，操作可能已中断'])(
@@ -566,7 +615,7 @@ describe('VM page kernel switch feedback', () => {
           .filter((button) => button.children !== '核对切换状态')
           .every((button) => button.disabled)
       ).toBe(true)
-      expect(mocks.invalidateQueries).toHaveBeenCalledTimes(3)
+      expect(mocks.invalidateQueries).toHaveBeenCalledTimes(4)
       expect(startVmKernelSwitch).not.toHaveBeenCalled()
       expect(mocks.success).not.toHaveBeenCalled()
     }
@@ -632,7 +681,7 @@ describe('VM page kernel switch feedback', () => {
         '内核切换未完成：节点连接断开',
         expect.objectContaining({ id: 'vm-kernel-switch-vm-01' })
       )
-      expect(mocks.invalidateQueries).toHaveBeenCalledTimes(3)
+      expect(mocks.invalidateQueries).toHaveBeenCalledTimes(4)
     } finally {
       client.clear()
     }
