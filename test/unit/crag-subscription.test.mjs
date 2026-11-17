@@ -972,7 +972,11 @@ test('a lost renewal response suspends real control admission until restart repl
     ready: true,
     state: 'unredeemed',
     available_seats: 0,
+<<<<<<< HEAD
     reclaim_pending_count: 0,
+=======
+    vm_count: 3,
+>>>>>>> ce083c95 (feat(crag): expose registered VM count in subscription status)
     total_slots: 2,
     enabled_slots: 0,
   })

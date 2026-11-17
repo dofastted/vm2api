@@ -750,6 +750,7 @@ export function createCragSubscription({
         available_seats: pending || runtime === null ? null : availableSeats(claims, rights, claims && !expired),
         reclaim_pending_count,
         ...inventory,
+        ...(Array.isArray(targets) && { vm_count: targets.length }),
         ...(total_slots !== undefined && { total_slots }),
         ...(enabled_slots !== undefined && { enabled_slots }),
         ...(upgrade_available && { upgrade_available }),
@@ -762,6 +763,7 @@ export function createCragSubscription({
         available_seats: null,
         ...(target_probe_failed && { target_probe_failed }),
         ...inventory,
+        ...(Array.isArray(targets) && { vm_count: targets.length }),
         ...(await runtimeStatus()),
       }
     }
