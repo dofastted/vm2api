@@ -97,7 +97,7 @@ export function HardRegexSettings({
     if (focusIndex < 0) return
     listRef.current
       ?.querySelector(`[data-rule='${focusIndex}']`)
-      ?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      ?.scrollIntoView({ block: 'center' })
   }, [focusIndex, focusRule])
 
   const saved = q.data ? draftOf(q.data) : null

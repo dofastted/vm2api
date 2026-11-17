@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { JevInterceptConfig, JevScopeOption } from '@/types/panel-routing'
 import { ChevronDown } from 'lucide-react'
@@ -88,7 +88,11 @@ function Chip({
  * 风控的账号范围，独立于当前关卡。按平台+套餐收窄，可收起。
  * 全空 = 所有账号都进关卡。指定账号和勾选是并集。
  */
-export function AccountScopeSettings() {
+export function AccountScopeSettings({
+  onDirtyChange,
+}: {
+  onDirtyChange: (dirty: boolean) => void
+}) {
   const qc = useQueryClient()
   const q = useQuery(jevInterceptQueryOptions())
   const [draft, setDraft] = useServerDraft(q.data, draftOf, scopeDiffers)
@@ -97,6 +101,7 @@ export function AccountScopeSettings() {
   const saved = q.data ? draftOf(q.data) : null
   const current = draft ? scopeOf(draft) : null
   const dirty = !!current && !!saved && !sameScope(current, scopeOf(saved))
+  useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange])
 
   const save = useMutation({
     mutationFn: () => {
@@ -186,7 +191,8 @@ export function AccountScopeSettings() {
       </CollapsibleTrigger>
       <CollapsibleContent className='space-y-6 border-t px-4 py-4'>
         <p className='text-xs leading-5 text-muted-foreground'>
-          按平台和套餐决定哪些槽位进四道关。都不选 =
+          账号范围同时用于前置蒸馏、类别正则与
+          Jev，不跳过封禁、系统改写或禁用工具。 都不选 =
           全部账号。指定账号和勾选取并集。只选 GPT 套餐时 Claude
           照旧全进关卡；选了 Claude 套餐或指定了账号，才按槽位收窄 Claude。GPT
           没设范围时仍看「OpenAI 平台」。

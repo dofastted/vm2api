@@ -27,11 +27,133 @@ function shortFp(fp: string) {
 }
 
 export function RefusalSettings({
-  onOpen,
+  section,
   onDirtyChange,
 }: {
-  onOpen: (row: UsageLogRow) => void
+  section: 'preflight' | 'jev'
   onDirtyChange: (dirty: boolean) => void
+}) {
+  const qc = useQueryClient()
+  const q = useQuery(refusalGuardsQueryOptions())
+
+  const save = useMutation({
+    mutationFn: (patch: Partial<RefusalGuardConfig>) =>
+      api<RefusalGuardConfig>('/api/panel/refusal-guards', {
+        method: 'PUT',
+        body: JSON.stringify(patch),
+      }),
+    onSuccess: async (data) => {
+      toast.success(section === 'jev' ? '已保存降级策略' : '已保存前置策略')
+      qc.setQueryData(refusalGuardsQueryOptions().queryKey, data)
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+
+  if (q.error) return <SettingsError error={q.error} />
+  if (!q.data) return <SettingsLoading />
+  const data = q.data
+  const similarity = data.similarity ?? 90
+
+  return (
+    <div className='space-y-8 p-4'>
+      {section === 'preflight' && (
+        <Group
+          title='何时拦截'
+          hint='上游策略拒答回填为指纹。重复命中返回不可重试的 400；相似匹配只比较用户正文。开关立即生效。'
+        >
+          <ToggleList>
+            <ToggleItem
+              label='拦截重复拒答'
+              desc='REFUSAL_GUARD=0 时不使用拒答缓存'
+            >
+              <Switch
+                checked={data.enabled}
+                disabled={save.isPending}
+                onCheckedChange={(enabled) => save.mutate({ enabled })}
+              />
+            </ToggleItem>
+            <ToggleItem label='近似拦截' desc='不含共享 system'>
+              <Switch
+                checked={data.similarity_enabled !== false}
+                disabled={save.isPending || !data.enabled}
+                onCheckedChange={(similarity_enabled) =>
+                  save.mutate({ similarity_enabled })
+                }
+              />
+            </ToggleItem>
+            <ToggleItem
+              label='启用分级封禁'
+              desc='设备／机器按违规次数升级；违规会话永久阻止。系统提示词改写不受此开关放行。'
+            >
+              <Switch
+                checked={data.device_block_enabled !== false}
+                disabled={save.isPending || !data.enabled}
+                onCheckedChange={(device_block_enabled) =>
+                  save.mutate({ device_block_enabled })
+                }
+              />
+            </ToggleItem>
+            <ToggleItem label='相似度' desc='越高越不容易误伤'>
+              <div
+                role='radiogroup'
+                aria-label='相似度'
+                className='flex rounded-lg bg-muted p-0.5'
+              >
+                {SIMILARITY_CHOICES.map((choice) => (
+                  <button
+                    key={choice}
+                    type='button'
+                    role='radio'
+                    aria-checked={similarity === choice}
+                    disabled={
+                      save.isPending ||
+                      !data.enabled ||
+                      data.similarity_enabled === false
+                    }
+                    onClick={() => save.mutate({ similarity: choice })}
+                    className='cursor-pointer rounded-md px-2 py-1 text-xs text-muted-foreground tabular-nums transition-colors duration-200 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 aria-checked:bg-background aria-checked:text-foreground aria-checked:shadow-sm'
+                  >
+                    {choice}%
+                  </button>
+                ))}
+              </div>
+            </ToggleItem>
+          </ToggleList>
+        </Group>
+      )}
+      <RiskPolicyForm
+        key={JSON.stringify(data.risk_audit)}
+        section={section}
+        value={data.risk_audit}
+        pending={save.isPending}
+        onDirtyChange={onDirtyChange}
+        onSave={(risk_audit) => save.mutate({ risk_audit })}
+      />
+    </div>
+  )
+}
+
+function SettingsError({ error }: { error: Error }) {
+  return (
+    <p className='p-4 text-sm text-destructive' role='alert'>
+      {error.message}
+    </p>
+  )
+}
+
+function SettingsLoading() {
+  return (
+    <div
+      className='h-40 animate-pulse bg-muted/40 motion-reduce:animate-none'
+      aria-busy='true'
+    />
+  )
+}
+
+export function RefusalRecords({
+  onOpen,
+}: {
+  onOpen: (row: UsageLogRow) => void
 }) {
   const qc = useQueryClient()
   const q = useQuery(refusalGuardsQueryOptions())
@@ -55,19 +177,6 @@ export function RefusalSettings({
       return result.logs[0]
     },
     onSuccess: onOpen,
-    onError: (error: Error) => toast.error(error.message),
-  })
-
-  const save = useMutation({
-    mutationFn: (patch: Partial<RefusalGuardConfig>) =>
-      api<RefusalGuardConfig>('/api/panel/refusal-guards', {
-        method: 'PUT',
-        body: JSON.stringify(patch),
-      }),
-    onSuccess: async (data) => {
-      toast.success('已保存拒答设置')
-      qc.setQueryData(refusalGuardsQueryOptions().queryKey, data)
-    },
     onError: (error: Error) => toast.error(error.message),
   })
 
@@ -134,90 +243,15 @@ export function RefusalSettings({
     onError: (error: Error) => toast.error(error.message),
   })
 
-  if (q.error) {
-    return (
-      <p className='p-4 text-sm text-destructive' role='alert'>
-        {(q.error as Error).message}
-      </p>
-    )
-  }
-  if (!q.data) return <div className='h-40 animate-pulse bg-muted/40' />
+  if (q.error) return <SettingsError error={q.error} />
+  if (!q.data) return <SettingsLoading />
   const data = q.data
   const devices = data.devices ?? []
   const deviceCount = data.device_count ?? devices.length
-  const similarity = data.similarity ?? 90
   const deleting = data.items.find((item) => item.fingerprint === deleteFp)
 
   return (
     <div className='space-y-8 p-4'>
-      <Group
-        title='何时拦截'
-        hint='上游策略拒答回填为指纹。重复命中返回不可重试的 400；相似匹配只比较用户正文。'
-      >
-        <ToggleList>
-          <ToggleItem
-            label='拦截重复拒答'
-            desc='REFUSAL_GUARD=0 时不使用拒答缓存'
-          >
-            <Switch
-              checked={data.enabled}
-              disabled={save.isPending}
-              onCheckedChange={(v) => save.mutate({ enabled: v })}
-            />
-          </ToggleItem>
-          <ToggleItem label='近似拦截' desc='不含共享 system'>
-            <Switch
-              checked={data.similarity_enabled !== false}
-              disabled={save.isPending || !data.enabled}
-              onCheckedChange={(v) => save.mutate({ similarity_enabled: v })}
-            />
-          </ToggleItem>
-          <ToggleItem
-            label='启用分级封禁'
-            desc='设备／机器按违规次数升级；违规会话永久阻止。系统提示词改写不受此开关放行。'
-          >
-            <Switch
-              checked={data.device_block_enabled !== false}
-              disabled={save.isPending || !data.enabled}
-              onCheckedChange={(v) => save.mutate({ device_block_enabled: v })}
-            />
-          </ToggleItem>
-          <ToggleItem label='相似度' desc='越高越不容易误伤'>
-            <div
-              role='radiogroup'
-              aria-label='相似度'
-              className='flex rounded-lg bg-muted p-0.5'
-            >
-              {SIMILARITY_CHOICES.map((choice) => (
-                <button
-                  key={choice}
-                  type='button'
-                  role='radio'
-                  aria-checked={similarity === choice}
-                  disabled={
-                    save.isPending ||
-                    !data.enabled ||
-                    data.similarity_enabled === false
-                  }
-                  onClick={() => save.mutate({ similarity: choice })}
-                  className='cursor-pointer rounded-md px-2 py-1 text-xs text-muted-foreground tabular-nums transition-colors duration-200 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50 aria-checked:bg-background aria-checked:text-foreground aria-checked:shadow-sm'
-                >
-                  {choice}%
-                </button>
-              ))}
-            </div>
-          </ToggleItem>
-        </ToggleList>
-      </Group>
-
-      <RiskPolicyForm
-        key={JSON.stringify(data.risk_audit)}
-        value={data.risk_audit}
-        pending={save.isPending}
-        onDirtyChange={onDirtyChange}
-        onSave={(risk_audit) => save.mutate({ risk_audit })}
-      />
-
       <div className='grid gap-8 xl:grid-cols-2'>
         <Group
           title='设备与会话封禁'

@@ -130,7 +130,7 @@ export function FieldLine({
 
 export function ToggleList({ children }: { children: React.ReactNode }) {
   return (
-    <div className='grid overflow-hidden rounded-xl border md:grid-cols-2 [&>*]:border-b [&>*:last-child]:border-b-0 md:[&>*:last-child:nth-child(odd)]:col-span-2 md:[&>*:last-child:nth-child(odd)]:border-e-0 md:[&>*:nth-child(odd)]:border-e md:[&>*:nth-last-child(2):nth-child(odd)]:border-b-0'>
+    <div className='grid grid-cols-1 overflow-hidden rounded-xl border md:grid-cols-2 [&>*]:border-b [&>*:last-child]:border-b-0 md:[&>*:last-child:nth-child(odd)]:col-span-2 md:[&>*:last-child:nth-child(odd)]:border-e-0 md:[&>*:nth-child(odd)]:border-e md:[&>*:nth-last-child(2):nth-child(odd)]:border-b-0'>
       {children}
     </div>
   )

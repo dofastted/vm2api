@@ -1,4 +1,4 @@
-import { STAGES } from './model'
+import { PREFLIGHT_RULES } from './model'
 import type { GateRow } from './queries'
 
 const REFUSAL_KEYWORDS: Record<string, string> = {
@@ -43,7 +43,10 @@ export function HitTable({
             <p className='truncate text-sm'>
               {showSource ? (
                 <span className='mr-2 text-xs text-muted-foreground'>
-                  {STAGES.find((s) => s.id === row.by)?.name || row.label}
+                  {row.by === 'jev'
+                    ? 'Jev'
+                    : PREFLIGHT_RULES.find((rule) => rule.id === row.by)
+                        ?.name || row.label}
                 </span>
               ) : null}
               <span className='font-mono text-xs'>

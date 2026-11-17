@@ -1,11 +1,11 @@
 import { useCallback, useState } from 'react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useNavigate, useSearch } from '@tanstack/react-router'
+import { useQuery } from '@tanstack/react-query'
+import { useBlocker, useNavigate, useSearch } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
 import type { UsageLogRow } from '@/types/panel-usage-logs'
-import { ArrowUpRight, RefreshCw } from 'lucide-react'
+import { Activity, ScanText, ShieldCheck } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { Button } from '@/components/ui/button'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { PageHeader } from '@/components/page-header'
 import { StatusMark } from '@/components/status-mark'
 import {
@@ -15,425 +15,250 @@ import {
 import { AccountScopeSettings } from './account-scope'
 import { Panel } from './blocks'
 import { DistillSettings } from './distill-settings'
-import { RiskFeed } from './feed'
-import { GateRail, type StageState } from './gate-rail'
 import { HardRegexSettings } from './hard-regex-settings'
-import { HitTable } from './hits'
 import { JevUsagePanel } from './jev-usage'
 import {
-  PASS_REASONS,
-  STAGES,
-  type StageId,
-  type ViewKey,
-  feedKindOf,
-  share,
+  PREFLIGHT_RULES,
+  type PreflightRule,
+  type RiskView,
+  riskSearch,
 } from './model'
 import { ModelSettings } from './model-settings'
 import {
   distillQueryOptions,
-  gateStatsQueryOptions,
   jevInterceptQueryOptions,
   refusalGuardsQueryOptions,
-  riskFeedQueryOptions,
-  upstream400QueryOptions,
 } from './queries'
 import { RefusalSettings } from './refusal-settings'
+import { RiskStatus } from './status-panel'
+
+const PAGES = [
+  { id: 'preflight', label: '前置', icon: ShieldCheck, hint: '硬规则与封禁' },
+  { id: 'jev', label: 'Jev', icon: ScanText, hint: '模型与降级策略' },
+  { id: 'status', label: '状态', icon: Activity, hint: '统计与日志' },
+] as const
 
 const STATE_TONE = {
   on: { key: 'on', text: '开启', cls: 'ok' },
   off: { key: 'off', text: '关闭', cls: 'off' },
-  unset: { key: 'unset', text: '开启但未配置地址', cls: 'caution' },
+  unset: { key: 'unset', text: '未配置地址', cls: 'caution' },
   loading: { key: 'loading', text: '读取中', cls: 'none' },
+  error: { key: 'error', text: '读取失败', cls: 'bad' },
 } as const
 
-function FeedNote({ shown, more }: { shown: number; more: boolean }) {
-  if (!shown) return null
-  return (
-    <p className='border-t px-4 py-2 text-xs text-muted-foreground'>
-      {more ? `只列最近 ${shown} 条。` : `今天共 ${shown} 条。`}
-      点一行打开请求详情，看正文判断是否误伤。
-    </p>
-  )
+function ruleTone(enabled: boolean | undefined, error: boolean) {
+  if (error) return STATE_TONE.error
+  if (enabled === undefined) return STATE_TONE.loading
+  return enabled ? STATE_TONE.on : STATE_TONE.off
 }
 
 export function RiskAuditPage() {
-  const qc = useQueryClient()
-  const search = useSearch({ from: '/_authenticated/risk' })
+  const { view = 'status', rule = 'distill' } = useSearch({
+    from: '/_authenticated/risk',
+  })
   const navigate = useNavigate({ from: '/risk' })
-  const view: ViewKey = search.view ?? 'all'
-
-  const stats = useQuery(gateStatsQueryOptions())
-  const feed = useQuery(riskFeedQueryOptions(stats.data?.since))
-  const upstream400 = useQuery(upstream400QueryOptions(stats.data?.since))
-  const distill = useQuery(distillQueryOptions())
-  const jev = useQuery(jevInterceptQueryOptions())
-  const refusal = useQuery(refusalGuardsQueryOptions())
-
-  const [dirty, setDirty] = useState(false)
-  const [detail, setDetail] = useState<DetailState | null>(null)
+  const [scopeDirty, setScopeDirty] = useState(false)
+  const [ruleDirty, setRuleDirty] = useState(false)
+  const [modelDirty, setModelDirty] = useState(false)
+  const [routingDirty, setRoutingDirty] = useState(false)
   const [focusRule, setFocusRule] = useState<string | null>(null)
-  const onDirtyChange = useCallback((next: boolean) => setDirty(next), [])
+  const [detail, setDetail] = useState<DetailState | null>(null)
+  const open = useCallback((row: UsageLogRow) => setDetail({ row }), [])
+  const openSource = useCallback((row: UsageLogRow) => {
+    setDetail({ row, tab: row.logMode === 'debug' ? 'raw' : 'summary' })
+  }, [])
 
-  const go = (next: ViewKey) => {
-    if (next === view) return
-    if (dirty && !window.confirm('这一关有未保存的修改，离开会丢掉。继续？'))
-      return
-    setDirty(false)
-    setFocusRule(null)
-    void navigate({
-      search: { view: next === 'all' ? undefined : next },
-      replace: true,
-    })
-  }
+  useBlocker({
+    enableBeforeUnload: scopeDirty || ruleDirty || modelDirty || routingDirty,
+    shouldBlockFn: ({ next }) => {
+      const target =
+        next.routeId === '/_authenticated/risk' ? riskSearch(next.search) : null
+      const leavesPage = !target || target.view !== view
+      const leavesRule = leavesPage || (target?.rule ?? 'distill') !== rule
+      const discardsDraft =
+        (leavesPage && (scopeDirty || modelDirty || routingDirty)) ||
+        (leavesRule && ruleDirty)
+      if (
+        discardsDraft &&
+        !window.confirm('有未保存的修改。离开会丢弃这些修改，确认离开？')
+      )
+        return true
+      if (leavesPage) {
+        setScopeDirty(false)
+        setModelDirty(false)
+        setRoutingDirty(false)
+      }
+      if (leavesRule) setRuleDirty(false)
+      return false
+    },
+  })
 
-  const states: Record<StageId, StageState> = {
-    distill: distill.data ? (distill.data.enabled ? 'on' : 'off') : 'loading',
-    'hard-regex': jev.data
-      ? jev.data.hard_regex_enabled
-        ? 'on'
-        : 'off'
-      : 'loading',
-    refusal: refusal.data ? (refusal.data.enabled ? 'on' : 'off') : 'loading',
-    jev: jev.data
-      ? jev.data.enabled
-        ? jev.data.base_url.trim()
-          ? 'on'
-          : 'unset'
-        : 'off'
-      : 'loading',
-  }
-
-  const blocks = stats.data?.blocks || []
-  const passes = stats.data?.passes || []
-  const rows = feed.data?.rows || []
-  const blockedRows = rows.filter((row) => feedKindOf(row) !== 'upstream')
-  const upstreamRows = rows.filter(
-    (row) => feedKindOf(row) === 'upstream' && row.upstreamStatus !== 400
-  )
-  const open = (row: UsageLogRow) => setDetail({ row })
-  const stage = STAGES.find((s) => s.id === view)
-  const feedProps = {
-    loading: feed.isLoading || stats.isLoading,
-    error: (feed.error || stats.error) as Error | null,
-    onOpen: open,
+  const go = (next: RiskView, nextRule?: PreflightRule, source?: string) => {
+    setFocusRule(source ?? null)
+    void navigate({ search: { view: next, rule: nextRule }, resetScroll: true })
   }
 
   return (
     <PageHeader
       title={VIEW_TITLES.risk}
-      description='出站前先查封禁和硬规则，再由 Jev 判定常规放行、降级放行或拒绝。上游拒答回填到前置缓存。'
-      extra={
-        <Button
-          variant='outline'
-          size='sm'
-          className='cursor-pointer'
-          disabled={
-            stats.isFetching || feed.isFetching || upstream400.isFetching
-          }
-          onClick={() => {
-            void qc.invalidateQueries({
-              queryKey: gateStatsQueryOptions().queryKey,
-            })
-            void qc.invalidateQueries({ queryKey: ['panel', 'risk-feed'] })
-            void qc.invalidateQueries({
-              queryKey: ['panel', 'risk-upstream-400'],
-            })
-            void qc.invalidateQueries({
-              queryKey: refusalGuardsQueryOptions().queryKey,
-            })
-          }}
-        >
-          <RefreshCw
-            className={cn(
-              'size-3.5',
-              (stats.isFetching || feed.isFetching) &&
-                'animate-spin motion-reduce:animate-none'
-            )}
-            aria-hidden='true'
-          />
-          刷新
-        </Button>
-      }
+      description='先执行前置规则，再由 Jev 审核；在状态页查看拦截、放行和上游响应。'
     >
-      <AccountScopeSettings />
-
-      <div className='mt-4'>
-        <GateRail stats={stats.data} states={states} view={view} onView={go} />
-      </div>
-      {stats.error ? (
-        <p className='mt-2 text-sm text-destructive' role='alert'>
-          今日计数读取失败：{(stats.error as Error).message}
-        </p>
-      ) : null}
-
-      {view === 'all' || view === 'jev' ? (
-        <div className='mt-6'>
-          <JevUsagePanel defaultOpen />
-        </div>
-      ) : null}
-
-      <div
-        id='risk-panel'
-        role='tabpanel'
-        aria-labelledby={`risk-tab-${view}`}
-        className='mt-6 space-y-6'
+      <Tabs
+        value={view}
+        activationMode='manual'
+        className='gap-5'
+        onValueChange={(next) => {
+          const page = PAGES.find((item) => item.id === next)
+          if (page && page.id !== view) go(page.id)
+        }}
       >
-        {stage ? (
-          <div className='flex flex-wrap items-baseline gap-x-3 gap-y-1'>
-            <h3 className='text-lg font-semibold tracking-tight'>
-              {stage.name}
-            </h3>
-            <StatusMark tone={STATE_TONE[states[stage.id]]} />
-            <p className='basis-full text-sm text-muted-foreground'>
-              {stage.does}
-            </p>
-          </div>
-        ) : null}
+        <TabsList
+          aria-label='风险审计页面'
+          className='grid h-auto min-h-12 w-full grid-cols-3 border p-1 sm:min-h-14'
+        >
+          {PAGES.map(({ id, label, icon: Icon, hint }) => (
+            <TabsTrigger
+              key={id}
+              value={id}
+              className='h-full min-w-0 cursor-pointer py-2 motion-reduce:transition-none'
+            >
+              <Icon aria-hidden='true' />
+              <span>{label}</span>
+              <span className='hidden truncate text-xs font-normal text-muted-foreground md:inline'>
+                {hint}
+              </span>
+            </TabsTrigger>
+          ))}
+        </TabsList>
 
-        {view === 'pass' ? (
-          <div className='grid gap-6 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]'>
-            <Panel
-              title='放行原因'
-              hint='「模型故障放行」是没被检查就出站的请求，越少越好。'
-            >
-              <PassReasons
-                rows={passes}
-                total={(stats.data?.passed ?? 0) || 0}
-              />
-            </Panel>
-            <Panel
-              title='降级放行'
-              hint='按实际发起上游请求的路线计数，不含无法调度的请求。'
-            >
-              {stats.data?.routes?.length ? (
-                <ul className='divide-y'>
-                  {stats.data.routes.map((route) => (
-                    <li
-                      key={`${route.kind}:${route.target}`}
-                      className='flex items-baseline justify-between gap-3 px-4 py-2 text-sm'
-                    >
-                      <span className='min-w-0 break-all'>
-                        {route.kind === 'pool'
-                          ? '账号池'
-                          : route.kind === 'endpoint'
-                            ? 'API 渠道'
-                            : '模型'}{' '}
-                        · <code className='text-xs'>{route.target}</code>
-                      </span>
-                      <span className='shrink-0 tabular-nums'>
-                        {route.count} 次
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className='px-4 py-6 text-sm text-muted-foreground'>
-                  今天暂无降级出站。
-                </p>
-              )}
-            </Panel>
-            <Panel
-              title='上游拒答'
-              hint='过了四道关、被上游拒答的请求，是这里漏拦的。拒答缓存开着时会记成指纹，同类正文下次在第三关拦下。'
-            >
-              <div className='max-h-[34rem] overflow-y-auto'>
-                <RiskFeed
-                  {...feedProps}
-                  rows={upstreamRows}
-                  empty='今天没有上游拒答。'
-                  showKind={false}
-                />
-              </div>
-              <FeedNote shown={upstreamRows.length} more={!!feed.data?.more} />
-            </Panel>
-          </div>
-        ) : (
-          <div className='grid gap-6 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]'>
-            <Panel
-              title='今日命中'
-              hint='按触发的词和规则归并。远高于同行的那条，先怀疑误伤。'
-            >
-              <div className='max-h-[34rem] overflow-y-auto'>
-                <HitTable
-                  rows={
-                    stage ? blocks.filter((r) => r.by === stage.id) : blocks
-                  }
-                  showSource={!stage}
-                  empty={
-                    stats.isLoading
-                      ? '读取中'
-                      : stage
-                        ? '这一关今天没有拦下请求。'
-                        : '今天没有拦下请求。'
-                  }
-                  action={(row) => {
-                    if (!stage) {
-                      return (
-                        <Button
-                          size='sm'
-                          variant='ghost'
-                          className='h-7 shrink-0 cursor-pointer px-2'
-                          aria-label={`去${row.label}关`}
-                          onClick={() => go(row.by as ViewKey)}
-                        >
-                          <ArrowUpRight className='size-3.5' />
-                        </Button>
-                      )
-                    }
-                    if (stage.id !== 'hard-regex' || !row.rule) return null
-                    return (
-                      <Button
-                        size='sm'
-                        variant='ghost'
-                        className='h-7 shrink-0 cursor-pointer px-2 text-xs'
-                        onClick={() => {
-                          setFocusRule(row.rule)
-                          document
-                            .getElementById('risk-settings')
-                            ?.scrollIntoView({ behavior: 'smooth' })
-                        }}
-                      >
-                        定位规则
-                      </Button>
-                    )
-                  }}
-                />
-              </div>
-            </Panel>
-            <Panel
-              title={stage ? '最近拦截' : '拦截流水'}
-              hint={stage ? undefined : '今天被四道关拦下的请求，按时间倒序。'}
-            >
-              <div className='max-h-[34rem] overflow-y-auto'>
-                <RiskFeed
-                  {...feedProps}
-                  rows={
-                    stage
-                      ? blockedRows.filter((r) => feedKindOf(r) === stage.id)
-                      : blockedRows
-                  }
-                  empty={
-                    stage ? '这一关今天没有拦下请求。' : '今天没有拦下请求。'
-                  }
-                  showKind={!stage}
-                />
-              </div>
-              <FeedNote
-                shown={
-                  stage
-                    ? blockedRows.filter((r) => feedKindOf(r) === stage.id)
-                        .length
-                    : blockedRows.length
-                }
-                more={!!feed.data?.more}
-              />
-            </Panel>
-          </div>
-        )}
-
-        {view === 'all' || view === 'pass' ? (
-          <Panel
-            title='上游 HTTP 400'
-            hint='仅实际上游返回的 400；参数错误不是违规，不触发封禁。点开可查对应日志。'
-          >
-            <div className='max-h-[34rem] overflow-y-auto'>
-              <RiskFeed
-                rows={upstream400.data?.logs || []}
-                loading={upstream400.isLoading || stats.isLoading}
-                error={upstream400.error || stats.error}
-                empty='今天没有上游 HTTP 400。'
-                showKind
-                onOpen={open}
-              />
-            </div>
-            <FeedNote
-              shown={upstream400.data?.logs.length || 0}
-              more={!!upstream400.data?.hasMore}
-            />
-          </Panel>
-        ) : null}
-
-        {stage ? (
-          <div id='risk-settings' className='scroll-mt-4'>
-            <Panel
-              title='设置'
-              hint={
-                stage.id === 'refusal'
-                  ? '开关立即生效；封禁阶梯、工具和降级目标需保存。'
-                  : '改完在底部保存条里保存。'
-              }
-            >
-              {stage.id === 'distill' ? (
-                <DistillSettings onDirtyChange={onDirtyChange} />
-              ) : stage.id === 'hard-regex' ? (
-                <HardRegexSettings
-                  focusRule={focusRule}
-                  onDirtyChange={onDirtyChange}
-                />
-              ) : stage.id === 'refusal' ? (
-                <RefusalSettings
-                  onDirtyChange={onDirtyChange}
-                  onOpen={(row) =>
-                    setDetail({
-                      row,
-                      tab: row.logMode === 'debug' ? 'raw' : 'summary',
-                    })
-                  }
-                />
-              ) : (
-                <ModelSettings onDirtyChange={onDirtyChange} />
-              )}
-            </Panel>
-          </div>
-        ) : null}
-      </div>
-
+        <TabsContent value='preflight' className='min-w-0 space-y-4'>
+          <AccountScopeSettings onDirtyChange={setScopeDirty} />
+          <PreflightSettings
+            rule={rule}
+            onRule={(next) => go('preflight', next)}
+            focusRule={focusRule}
+            onDirtyChange={setRuleDirty}
+          />
+        </TabsContent>
+        <TabsContent value='jev' className='min-w-0 space-y-4'>
+          <JevSettings
+            onModelDirty={setModelDirty}
+            onRoutingDirty={setRoutingDirty}
+          />
+        </TabsContent>
+        <TabsContent value='status' className='min-w-0 space-y-4'>
+          <RiskStatus
+            onOpen={open}
+            onOpenSource={openSource}
+            onLocateRule={(source) => go('preflight', 'hard-regex', source)}
+          />
+        </TabsContent>
+      </Tabs>
       <LogDetailDialog state={detail} onClose={() => setDetail(null)} />
     </PageHeader>
   )
 }
 
-function PassReasons({
-  rows,
-  total,
+function PreflightSettings({
+  rule,
+  onRule,
+  focusRule,
+  onDirtyChange,
 }: {
-  rows: { by: string; count: number }[]
-  total: number
+  rule: PreflightRule
+  onRule: (rule: PreflightRule) => void
+  focusRule: string | null
+  onDirtyChange: (dirty: boolean) => void
 }) {
-  const counts: Record<string, number> = {}
-  for (const row of rows) counts[row.by] = (counts[row.by] || 0) + row.count
-  const keys = Object.keys(PASS_REASONS).filter(
-    (by) => counts[by] || by === 'fail-open'
-  )
+  const distill = useQuery(distillQueryOptions())
+  const regex = useQuery(jevInterceptQueryOptions())
+  const refusal = useQuery(refusalGuardsQueryOptions())
+  const tones = {
+    distill: ruleTone(distill.data?.enabled, distill.isError),
+    'hard-regex': ruleTone(regex.data?.hard_regex_enabled, regex.isError),
+    refusal: ruleTone(refusal.data?.enabled, refusal.isError),
+  }
+
   return (
-    <ul className='divide-y'>
-      {keys.map((by) => {
-        const count = counts[by] || 0
-        const risky = by === 'fail-open' && count > 0
-        return (
-          <li key={by} className='flex items-center gap-3 px-4 py-3'>
-            <div className='min-w-0 flex-1'>
-              <p
-                className={cn(
-                  'text-sm',
-                  risky && 'font-medium text-[var(--status-caution)]'
-                )}
-              >
-                {PASS_REASONS[by].label}
-              </p>
-              <p className='text-xs text-muted-foreground'>
-                {PASS_REASONS[by].hint}
-              </p>
-            </div>
-            <span className='text-sm font-medium tabular-nums'>
-              {count.toLocaleString()}
-            </span>
-            <span className='w-14 text-right text-xs text-muted-foreground tabular-nums'>
-              {share(count, total)}
-            </span>
-          </li>
-        )
-      })}
-    </ul>
+    <Tabs
+      value={rule}
+      activationMode='manual'
+      className='gap-4'
+      onValueChange={(next) => {
+        const entry = PREFLIGHT_RULES.find((item) => item.id === next)
+        if (entry && entry.id !== rule) onRule(entry.id)
+      }}
+    >
+      <TabsList
+        aria-label='前置规则'
+        className='grid h-auto w-full grid-cols-3 gap-2 bg-transparent p-0'
+      >
+        {PREFLIGHT_RULES.map((entry) => (
+          <TabsTrigger
+            key={entry.id}
+            value={entry.id}
+            className={cn(
+              'h-full min-w-0 cursor-pointer flex-col gap-1.5 border-border bg-card px-1 py-2.5 motion-reduce:transition-none sm:flex-row sm:gap-3',
+              'data-[state=active]:border-primary/60 data-[state=active]:bg-muted dark:data-[state=active]:border-primary/60'
+            )}
+          >
+            <span>{entry.name}</span>
+            <StatusMark tone={tones[entry.id]} />
+          </TabsTrigger>
+        ))}
+      </TabsList>
+      {PREFLIGHT_RULES.map((entry) => (
+        <TabsContent key={entry.id} value={entry.id} className='min-w-0'>
+          <Panel title={entry.name} hint={entry.does}>
+            {entry.id === 'distill' && (
+              <DistillSettings onDirtyChange={onDirtyChange} />
+            )}
+            {entry.id === 'hard-regex' && (
+              <HardRegexSettings
+                focusRule={focusRule}
+                onDirtyChange={onDirtyChange}
+              />
+            )}
+            {entry.id === 'refusal' && (
+              <RefusalSettings
+                section='preflight'
+                onDirtyChange={onDirtyChange}
+              />
+            )}
+          </Panel>
+        </TabsContent>
+      ))}
+    </Tabs>
+  )
+}
+
+function JevSettings({
+  onModelDirty,
+  onRoutingDirty,
+}: {
+  onModelDirty: (dirty: boolean) => void
+  onRoutingDirty: (dirty: boolean) => void
+}) {
+  const jev = useQuery(jevInterceptQueryOptions())
+  const enabled = jev.data?.enabled
+  const tone =
+    enabled && !jev.data?.base_url.trim() && !jev.isError
+      ? STATE_TONE.unset
+      : ruleTone(enabled, jev.isError)
+
+  return (
+    <>
+      <JevUsagePanel />
+      <Panel
+        title='决策模型'
+        hint='只审核用户会话和可读取的内联文件文本，不发送系统提示词和工具。'
+        action={<StatusMark tone={tone} />}
+      >
+        <ModelSettings onDirtyChange={onModelDirty} />
+      </Panel>
+      <Panel title='降级放行' hint='按安全分差选择模型、账号池或 API 渠道。'>
+        <RefusalSettings section='jev' onDirtyChange={onRoutingDirty} />
+      </Panel>
+    </>
   )
 }
