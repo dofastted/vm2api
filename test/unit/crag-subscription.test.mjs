@@ -10,6 +10,7 @@ import {
   checkCragLicense,
   cragLicenseDirectory,
   cragTargetIds,
+  effectiveCragHostSlots,
   readCragSubscriptionFiles,
 } from '../../src/lib/vm/crag-license.mjs'
 import { publishKvmCragSubscription } from '../../src/lib/vm/kvm-crag-subscription.mjs'
@@ -18,6 +19,7 @@ import { assertCragSubscriptionTarget } from '../../src/lib/vm/vm-runtime.mjs'
 import { materializeCragV2 } from '../../src/lib/vm/wrap-cli-runtime.mjs'
 import {
   activateFixture,
+  issueGrantedHostEntitlement,
   issueHostEntitlement,
   issueSlotPermit,
   seedEncryptedPackage,
@@ -53,6 +55,89 @@ function standaloneHost(t, fetchImpl) {
       }),
   }
 }
+
+test('a v3 ladder accumulates seats and each voucher lapses on its own schedule', async (t) => {
+  const now = Math.floor(Date.now() / 1000)
+  const early = now + 86400
+  const late = now + 30 * 86400
+  let issued
+  const { root, connect } = standaloneHost(t, async (url, { body }) => {
+    const request = JSON.parse(body)
+    // The client declares the highest ladder version it can verify.
+    assert.equal(request.entitlement_version, 3)
+    issued ??= issueGrantedHostEntitlement(root, request.host_id, [
+      { slots: 2, expires_at: early },
+      { slots: 5, expires_at: late },
+    ])
+    return Response.json({
+      ok: true,
+      data: {
+        entitlement: issued.code,
+        revision: issued.claims.revision,
+        expires_at: issued.claims.expires_at,
+      },
+    })
+  })
+  // Two vouchers of two and five seats, so the host holds seven right now.
+  seedEncryptedPackage(root)
+  const redeemed = await connect().redeem(voucher())
+  assert.equal(redeemed.available_seats, 7)
+  // v3 carries no single ceiling, so the status must report the live total and
+  // pass the ladder through for the panel to render each voucher's expiry.
+  assert.equal(redeemed.slot_limit, 7)
+  assert.deepEqual(redeemed.grants, [
+    { slots: 2, expires_at: early },
+    { slots: 5, expires_at: late },
+  ])
+
+  // The whole ladder travels with the claims, so the step down to five seats
+  // needs no further round trip to the Authority.
+  assert.equal(effectiveCragHostSlots(issued.claims, now), 7)
+  assert.equal(effectiveCragHostSlots(issued.claims, early - 1), 7)
+  assert.equal(effectiveCragHostSlots(issued.claims, early), 5)
+  assert.equal(effectiveCragHostSlots(issued.claims, late), 0)
+
+  // Unlimited absorbs any finite total for as long as it is live.
+  const open = issueGrantedHostEntitlement(root, 'a'.repeat(64), [
+    { slots: 3, expires_at: early },
+    { slots: 'unlimited', expires_at: late },
+  ])
+  assert.equal(effectiveCragHostSlots(open.claims, now), 'unlimited')
+  assert.equal(effectiveCragHostSlots(open.claims, early), 'unlimited')
+  assert.equal(effectiveCragHostSlots(open.claims, late), 0)
+})
+
+test('a malformed v3 ladder is refused', async (t) => {
+  const now = Math.floor(Date.now() / 1000)
+  const ladders = {
+    'not ascending': [
+      { slots: 1, expires_at: now + 200 },
+      { slots: 1, expires_at: now + 100 },
+    ],
+    'same expiry left unmerged': [
+      { slots: 1, expires_at: now + 100 },
+      { slots: 1, expires_at: now + 100 },
+    ],
+    empty: [],
+    'seat count out of range': [{ slots: 0, expires_at: now + 100 }],
+  }
+  for (const [name, grants] of Object.entries(ladders)) {
+    await t.test(name, async (subtest) => {
+      const { root, connect } = standaloneHost(subtest, async (url, { body }) => {
+        const issued = issueGrantedHostEntitlement(root, JSON.parse(body).host_id, grants, {
+          expires_at: now + 300,
+        })
+        return Response.json({
+          ok: true,
+          data: { entitlement: issued.code, revision: 1, expires_at: now + 300 },
+        })
+      })
+      // Seed the package so the rejection can only come from the ladder itself.
+      seedEncryptedPackage(root)
+      await assert.rejects(connect().redeem(voucher()), { code: 'license_invalid' })
+    })
+  }
+})
 
 test('host checkout falls back to the D-Bus machine ID without changing an existing binding', (t) => {
   const { root, machineIdFile, publicDir, connect } = standaloneHost(t)
@@ -159,7 +244,7 @@ test('Docker and KVM bind against the same redeemed pool without a version-speci
   const { root, connect } = standaloneHost(t, async (url, { body }) => {
     const request = JSON.parse(body)
     if (url.endsWith('/redeem')) {
-      assert.deepEqual(Object.keys(request).sort(), ['host_id', 'redemption_code'])
+      assert.deepEqual(Object.keys(request).sort(), ['entitlement_version', 'host_id', 'redemption_code'])
       entitlement = issueHostEntitlement(root, request.host_id, { slot_limit: 2 })
     }
     let binding = {}
@@ -458,7 +543,10 @@ test('an admin can redeem without VMs and use the cumulative capacity signed by 
   const host_id = fs.readFileSync(path.join(publicDir, 'host_id'), 'utf8')
   assert.deepEqual(
     requests,
-    [first, second, device].map((redemption_code) => ['/v1/host-subscriptions/redeem', { host_id, redemption_code }]),
+    [first, second, device].map((redemption_code) => [
+      '/v1/host-subscriptions/redeem',
+      { host_id, entitlement_version: 3, redemption_code },
+    ]),
   )
   assert.equal(fs.existsSync(path.join(root, 'vms')), false)
 })
@@ -565,7 +653,11 @@ test('a device purchase applies signed rights only to its verified host and repl
   await connect().redeemDeviceOrder(hostId, redemptionCode)
   assert.equal(requests.length, 2)
   assert.deepEqual(requests[1], requests[0])
-  assert.deepEqual(requests[0].request, { host_id: hostId, redemption_code: redemptionCode })
+  assert.deepEqual(requests[0].request, {
+    host_id: hostId,
+    entitlement_version: 3,
+    redemption_code: redemptionCode,
+  })
   assert.equal((await service.status()).available_seats, 10)
 })
 
