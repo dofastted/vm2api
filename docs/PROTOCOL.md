@@ -198,9 +198,9 @@ native CLI 对已有缓存 marker 的 wire system 直接保留块边界、显式
 
 ## Codex 模型与运行环境
 
-Codex 目录客户端 `auto` 跟随官方 npm 发布；网络不可用且没有缓存时使用已核实的 `0.167.1`。推理 UA 单独配置，新安装的默认画像同步到该版本，不覆盖已部署机自定义 UA。内核保留所选画像的 originator/version，忽略下游伪造的身份与设备证明头。
+Codex 目录客户端 `auto` 跟随官方 npm 发布；网络不可用且没有缓存时使用已核实的 `0.169.0`。推理 UA 单独配置，新安装的默认画像同步到该版本，不覆盖已部署机自定义 UA。内核保留所选画像的 originator/version，忽略下游伪造的身份与设备证明头。
 
-GPT 模型以账号返回的 `/backend-api/codex/models` 为准，6.2 等新增 ID 不在网关改名，也不按型号猜测能力、可用性或价格。同步发现的新 ID 沿用默认关闭，管理员启用后才调度。静态回退目录补齐官方参考目录中的 `gpt-6-astra`、`gpt-6.1-sol`、`gpt-6.1-terra` 与 `gpt-5.6-sol/terra/luna`。Responses、Chat 和 Completions 的 `ultra` 推理档位原样保留；Completions 也保留显式 `reasoning` / `reasoning_effort`。槽位测试、定时计划和日志支持该档位，具体模型是否接受由上游判断。
+GPT 模型以账号返回的 `/backend-api/codex/models` 为准，新增 ID 不在网关改名，也不按型号猜测能力、可用性或价格。静态回退目录补齐官方参考目录中的 `gpt-6.2-astra`、`gpt-6.2-sol`、`gpt-6-astra`、`gpt-6.1-sol`、`gpt-6.1-terra` 与 `gpt-5.6-sol/terra/luna`，这些 ID 默认启用，账号目录确认后立即可调度；回退目录之外、同步新发现的陌生 ID 仍默认关闭，管理员启用后才调度。回退目录的新增代次由 `gpt_model_policy.seed_version` 守护，对已同步过的实例一次性补齐，不整体合并回退目录，以免复活上游已下线的旧型号。6.2 两款尚无官方公布价目，内置价表不臆造，其用量按未计价处理。Responses、Chat 和 Completions 的 `ultra` 推理档位原样保留；Completions 也保留显式 `reasoning` / `reasoning_effort`。槽位测试、定时计划和日志支持该档位，具体模型是否接受由上游判断。
 
 `codex.analytics.enabled` 仍默认关闭。启用后的 `codex_thread_initialized` 使用当前槽内采集的系统、系统版本和架构，不读取内核所在控制面宿主。先执行槽位 `collect-identity`；数据不完整时不发送，不伪造环境或 CLI 工具事件。字段、队列和隐私边界见 [面板 API · OpenAI 传输与隐私](PANEL_API.md#openai-传输与隐私)。
 
