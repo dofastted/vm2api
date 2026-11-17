@@ -434,6 +434,39 @@ unixTest('native CRAG receives caller tool names and structured system cache blo
   assert.equal(envelope.body.max_tokens, 32000)
 })
 
+unixTest('zero CRAG sends mixed Responses tools and structured system to the capable worker', async (t) => {
+  const fixture = await protocolKernelFixture(t, {
+    health: {
+      ...printHealth,
+      capabilities: [...printCapabilities, 'generation_controls_v3', 'provider_managed_tools_v1'],
+    },
+    staleHealth: ordinaryHealth,
+    preset: 'zero',
+  })
+  const search = { type: 'web_search_20260209', name: 'web_search', max_uses: 2, allowed_domains: ['example.org'] }
+  const { envelope } = await fixture.send(
+    {
+      model: 'claude-sonnet-5-5',
+      instructions: 'Caller policy',
+      input: 'Sample',
+      tools: [
+        ...Array.from({ length: 47 }, (_, index) => ({
+          type: 'function',
+          name: `client_${index}`,
+          parameters: { type: 'object' },
+        })),
+        search,
+      ],
+    },
+    ordinaryHealth,
+    { protocol: 'openai.responses' },
+  )
+  assert.equal(envelope.body.tools.length, 48)
+  assert.deepEqual(envelope.body.tools[47], search)
+  assert.deepEqual(envelope.body.system, [{ type: 'text', text: 'Caller policy' }])
+  assert.equal(envelope.body.crag_prompt, undefined)
+})
+
 for (const runtime of ['crag-v2', 'cli-node']) {
   unixTest(`Codex Responses tool continuation is structured before ${runtime} dispatch`, async (t) => {
     const health =

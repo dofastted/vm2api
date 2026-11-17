@@ -9,6 +9,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { normalizeCragKernelVersion, normalizeKernelDataplane, normalizeSlotPersonaPreset } from '../vm/slot-engine.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
+import { needsCragProviderCompatibility } from './kernel-request.mjs'
 /**
  * Print is the CRAG v2 worker only. A live health report wins, then an
  * explicit dataplane on the VM, then the kernel.json that worker was started
@@ -443,6 +444,10 @@ export function prepareCragPrintBody(
     })
   }
   if (agentSummary) out.messages = readOnlySummaryResults(out.messages)
+  if (needsCragProviderCompatibility(out, capabilities)) {
+    stripCallerPromptAlias(out)
+    return out
+  }
   if (foldSystemMessages) {
     const folded = agentSummary ? foldSummarySystemTurns(out.messages) : foldSystemTurns(out.messages)
     out.messages = folded.messages

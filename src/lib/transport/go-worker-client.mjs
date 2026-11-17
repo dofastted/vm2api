@@ -559,7 +559,10 @@ function gateCragBody(body, print, health, isolated = false) {
   if (!body || typeof body !== 'object') return body
   const caps = print && Array.isArray(health?.capabilities) ? health.capabilities : []
   const prompt = body.crag_prompt
-  const model = print && !isolated && cragConsumesModelDirective(health) ? modelDirectiveForCrag(body.model) : null
+  const model =
+    print && !isolated && body.thread == null && cragConsumesModelDirective(health)
+      ? modelDirectiveForCrag(body.model)
+      : null
   const hasAlias = body.crag_options != null && Object.hasOwn(body.crag_options, 'prompt')
   if (!model && !Object.hasOwn(body, 'crag_prompt') && !Object.hasOwn(body, 'crag_model') && !hasAlias) {
     return body

@@ -150,6 +150,10 @@ Rikka / 客户端 `search_web`、`scrape_web` **不是** Anthropic 自带搜索�
 
 ## 清洗与整流
 
+Claude 后端先转换 Messages、Chat Completions 或 Responses 的结构，再清洗工具与历史，最后按目标运行时能力组装。混用 OpenAI function 与 Claude 托管工具时保留后者的版本和参数；已声明原生搜索时不会用 OpenAI 搜索别名生成的默认工具替换它。根级组合 schema 只在能无损转换时改写，否则按工具字段返回 400，不会放宽原约束。
+
+CRAG 声明 `provider_managed_tools_v1` 且支持对应工具时使用独立的 provider-compat 执行路径。该路径传结构化 `system`，不传 `crag_prompt`，包括 `zero` 人设；不支持时不删除调用方的托管工具，返回可定位的能力错误。普通 CRAG 与 cli-node 的出站路径不变。
+
 `sanitizeInboundBody` / `request-rectifier`：
 
 - 非法 Anthropic `role` 按 Sub2API 清洗
