@@ -637,9 +637,10 @@ function responsesToClaude(body, opts) {
     }
     const content = responsesContent(item.content, `${param}.content`)
     if (!content.length) continue
+    if (item.cache_control && !content.at(-1).cache_control) content.push(withCacheControl(content.pop(), item))
     if (role === 'system' || role === 'developer') {
       if (content.some((block) => block.type !== 'text')) invalidResponses(param, 'instructions must be text')
-      if (!replied) systemParts.push(...content)
+      if (!replied) appendLiftedSystemMessage(systemParts, messages, { content })
       else
         messages.push({
           role: 'user',
