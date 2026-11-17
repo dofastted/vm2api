@@ -28,6 +28,7 @@ import { PageHeader } from '@/components/page-header'
 import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
+import { GeminiEnvironments } from '@/features/import/gemini-environments'
 import {
   dashboardQueryOptions,
   usageQueryOptions,
@@ -353,6 +354,7 @@ export function VmListPage() {
           )}
         </VmActionsProvider>
       </QueryGate>
+      {me.data?.role === 'admin' ? <GeminiEnvironments view='vm' /> : null}
       <ConfirmDialog
         open={!!resetTarget}
         onOpenChange={(open) => {

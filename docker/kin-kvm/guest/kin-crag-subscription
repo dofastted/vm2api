@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Project verified host grants onto guest-local, read-only license mounts."""
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import uuid
+
+
+ROOT = "/run/vm2api-crag"
+RUN = "/run/kin"
+MARKER = b"vm2api-crag-subscription-v1\n"
+HOST_LIMIT = 1536 * 1024
+LIMIT = 2 * 1024 * 1024
+
+
+class GuestSetupPending(Exception):
+    pass
+
+
+def directory(path, mode, uid=0, gid=0, create=True):
+    try:
+        current = os.lstat(path)
+    except FileNotFoundError:
+        if not create:
+            raise
+        os.mkdir(path, mode)
+        os.chown(path, uid, gid)
+        os.chmod(path, mode)
+        current = os.lstat(path)
+    if not stat.S_ISDIR(current.st_mode) or stat.S_ISLNK(current.st_mode):
+        raise ValueError("unsafe directory")
+    if (current.st_uid, current.st_gid, stat.S_IMODE(current.st_mode)) != (uid, gid, mode):
+        raise ValueError("unexpected directory owner or permissions")
+
+
+def replace(directory_path, name, value, mode=0o644, uid=0, gid=0):
+    parent = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary = ".publish-" + uuid.uuid4().hex
+    try:
+        try:
+            previous = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if not stat.S_ISREG(previous.st_mode) or previous.st_nlink != 1:
+                raise ValueError("unsafe destination")
+        except FileNotFoundError:
+            pass
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
+        try:
+            os.fchmod(fd, mode)
+            os.fchown(fd, uid, gid)
+            with os.fdopen(fd, "wb", closefd=False) as output:
+                output.write(value)
+                output.flush()
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(temporary, name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        os.close(parent)
+
+
+def mount_options(target):
+    with open("/proc/self/mountinfo", encoding="utf8") as source:
+        for line in source:
+            fields = line.split()
+            mounted = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), fields[4])
+            if mounted == target:
+                return set(fields[5].split(","))
+    return None
+
+
+def same_directory(left, right):
+    a, b = os.stat(left, follow_symlinks=False), os.stat(right, follow_symlinks=False)
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def same_file(path, value, mode, uid, gid):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            current = os.fstat(fd)
+            return (stat.S_ISREG(current.st_mode) and current.st_nlink == 1
+                    and (stat.S_IMODE(current.st_mode), current.st_uid, current.st_gid) == (mode, uid, gid)
+                    and os.read(fd, len(value) + 1) == value)
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
+def command(*args, pass_fds=()):
+    subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+                   pass_fds=pass_fds)
+
+
+def project_mount(source, target):
+    try:
+        current = os.lstat(target)
+        if not stat.S_ISDIR(current.st_mode) or stat.S_ISLNK(current.st_mode):
+            raise ValueError("unsafe mount destination")
+    except FileNotFoundError:
+        os.mkdir(target, 0o755)
+    mounted = mount_options(target)
+    if mounted is not None and not same_directory(source, target):
+        raise ValueError("foreign mount")
+    if mounted is None:
+        fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            command("mount", "--no-canonicalize", "--bind", source, "/proc/self/fd/" + str(fd), pass_fds=(fd,))
+        finally:
+            os.close(fd)
+    fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        original = os.stat(source)
+        mounted = os.fstat(fd)
+        if (original.st_dev, original.st_ino) != (mounted.st_dev, mounted.st_ino):
+            raise ValueError("mount destination changed")
+        command("mount", "--no-canonicalize", "-o", "remount,bind,ro,nosuid,nodev,noexec",
+                "/proc/self/fd/" + str(fd), pass_fds=(fd,))
+    finally:
+        os.close(fd)
+    if "ro" not in (mount_options(target) or set()) or not same_directory(source, target):
+        raise ValueError("read-only mount missing")
+
+
+def managed_root(create):
+    directory("/run", 0o755, create=False)
+    try:
+        directory(ROOT, 0o700, create=False)
+    except FileNotFoundError:
+        if not create:
+            return False
+        directory(ROOT, 0o700)
+        replace(ROOT, "managed", MARKER, 0o600)
+    fd = os.open(ROOT + "/managed", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        current = os.fstat(fd)
+        if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 or current.st_uid != 0
+                or stat.S_IMODE(current.st_mode) != 0o600 or os.read(fd, 128) != MARKER):
+            raise ValueError("foreign projection")
+    finally:
+        os.close(fd)
+    filesystem = subprocess.run(["stat", "-f", "-c", "%t", ROOT], check=True, capture_output=True,
+                                text=True, timeout=5).stdout.strip()
+    if filesystem != "1021994":
+        raise ValueError("guest-local tmpfs required")
+    return True
+
+
+def apply(request):
+    if os.geteuid() != 0 or not isinstance(request, dict):
+        raise ValueError("root required")
+    action = request.get("action")
+    if action not in {"publish", "publish-universal", "block", "clear", "status"}:
+        raise ValueError("unknown operation")
+    if action in {"publish", "publish-universal"} and request.get("wait_for_setup") is True:
+        try:
+            setup = os.lstat("/run/kin-guest/slot.env")
+        except FileNotFoundError:
+            raise GuestSetupPending()
+        if not stat.S_ISREG(setup.st_mode):
+            raise ValueError("unsafe guest setup signal")
+    if not managed_root(action in {"publish", "publish-universal", "block"}):
+        if action == "status":
+            raise ValueError("projection missing")
+        return
+    lock = os.open(ROOT + "/lock", os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        current = os.fstat(lock)
+        if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1 or current.st_uid != 0:
+            raise ValueError("unsafe lock")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        host = ROOT + "/host"
+        license_dir = ROOT + "/license"
+        targets = [(license_dir, RUN + "/crag-license"), (host, RUN + "/crag-host")]
+        if action == "status":
+            for source, target in targets:
+                if "ro" not in (mount_options(target) or set()) or not same_directory(source, target):
+                    raise ValueError("projection missing")
+            if os.path.lexists(host + "/sync-pending"):
+                raise ValueError("projection pending")
+            fd = os.open(license_dir + "/device.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                device = json.loads(os.read(fd, 65537))
+            finally:
+                os.close(fd)
+            with open("/etc/machine-id", encoding="ascii") as identity:
+                machine = identity.read(64).strip()
+            if (not re.fullmatch(r"[a-f0-9]{32}", machine)
+                    or device.get("machine_id_hash") != hashlib.sha256(machine.encode()).hexdigest()
+                    or (request.get("machine_id") is not None and request["machine_id"] != machine)
+                    or (request.get("vm_id") is not None and request["vm_id"] != device.get("vm_id"))):
+                raise ValueError("guest identity changed")
+            return
+        directory(host, 0o755)
+        if action == "clear":
+            replace(host, "sync-pending", b"pending\n")
+            for source, target in targets:
+                if mount_options(target) is not None:
+                    if not same_directory(source, target):
+                        raise ValueError("foreign mount")
+                    command("umount", "-l", target)
+            return
+        if action == "block":
+            for source, target in targets:
+                if mount_options(target) is not None and not same_directory(source, target):
+                    raise ValueError("foreign mount")
+            replace(host, "sync-pending", b"pending\n")
+            return
+        uid, gid = request.get("uid"), request.get("gid")
+        if type(uid) is not int or uid <= 0 or type(gid) is not int or gid < 0:
+            raise ValueError("invalid runtime user")
+        if action == "publish-universal":
+            files = request.get("files")
+            if (not isinstance(files, dict) or set(files) != {"permit"}
+                    or not isinstance(files["permit"], str) or not files["permit"].startswith("CRAGU1.")
+                    or len(files["permit"].encode()) > 65536):
+                raise ValueError("invalid offline license projection")
+            directory(license_dir, 0o700, uid, gid)
+            private_target, host_target = RUN + "/crag-license", RUN + "/crag-host"
+            if (mount_options(host_target) is None
+                    and "ro" in (mount_options(private_target) or set())
+                    and same_directory(license_dir, private_target)
+                    and same_file(license_dir + "/registration.code", files["permit"].encode(), 0o600, uid, gid)):
+                return
+            replace(host, "sync-pending", b"pending\n")
+            if mount_options(host_target) is not None:
+                if not same_directory(host, host_target):
+                    raise ValueError("foreign mount")
+                command("umount", "-l", host_target)
+            current = os.lstat(RUN)
+            if not stat.S_ISDIR(current.st_mode) or stat.S_ISLNK(current.st_mode):
+                raise ValueError("unsafe run directory")
+            project_mount(license_dir, private_target)
+            replace(license_dir, "registration.code", files["permit"].encode(), 0o600, uid, gid)
+            return
+        machine, vm_id = request.get("machine_id"), request.get("vm_id")
+        if (not isinstance(machine, str) or not re.fullmatch(r"[a-f0-9]{32}", machine)
+                or machine == "0" * 32 or not isinstance(vm_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", vm_id)):
+            raise ValueError("invalid identity")
+        with open("/etc/machine-id", encoding="ascii") as identity:
+            if identity.read(64).strip() != machine:
+                raise ValueError("guest identity changed")
+        files = request.get("files")
+        if not isinstance(files, dict) or set(files) != {"device", "permit", "hostId", "entitlement"}:
+            raise ValueError("invalid snapshot")
+        if any(not isinstance(value, str) or not value or len(value.encode()) >
+               (HOST_LIMIT if key == "entitlement" else 65536) for key, value in files.items()):
+            raise ValueError("invalid snapshot")
+        device = json.loads(files["device"])
+        if device.get("vm_id") != vm_id or device.get("machine_id_hash") != hashlib.sha256(machine.encode()).hexdigest():
+            raise ValueError("device identity changed")
+        directory(license_dir, 0o700, uid, gid)
+        current = os.lstat(RUN)
+        if not stat.S_ISDIR(current.st_mode) or stat.S_ISLNK(current.st_mode):
+            raise ValueError("unsafe run directory")
+        values = [(license_dir, "device.json", files["device"].encode(), 0o600, uid, gid),
+                  (license_dir, "registration.code", files["permit"].encode(), 0o600, uid, gid),
+                  (host, "host_id", files["hostId"].encode(), 0o644, 0, 0),
+                  (host, "entitlement.code", files["entitlement"].encode(), 0o644, 0, 0)]
+        if (not os.path.lexists(host + "/sync-pending")
+                and all("ro" in (mount_options(target) or set()) and same_directory(source, target)
+                        for source, target in targets)
+                and all(same_file(parent + "/" + name, value, mode, owner, group)
+                        for parent, name, value, mode, owner, group in values)):
+            return
+        replace(host, "sync-pending", b"pending\n")
+        for source, target in targets:
+            project_mount(source, target)
+        for parent, name, value, mode, owner, group in values:
+            replace(parent, name, value, mode, owner, group)
+        os.unlink(host + "/sync-pending")
+    finally:
+        os.close(lock)
+
+
+def main():
+    try:
+        if len(sys.argv) in {2, 4} and sys.argv[1] == "--status":
+            request = {"action": "status"}
+            if len(sys.argv) == 4:
+                request.update(machine_id=sys.argv[2], vm_id=sys.argv[3])
+            apply(request)
+        else:
+            raw = sys.stdin.buffer.read(LIMIT + 1)
+            if len(raw) > LIMIT:
+                raise ValueError("oversized request")
+            apply(json.loads(raw))
+        print('{"ok":true}')
+        return 0
+    except GuestSetupPending:
+        print("CRAG guest setup is not ready", file=sys.stderr)
+        return 75
+    except Exception:
+        # Input contains the device private key; never print exception data or the snapshot.
+        print("CRAG guest subscription projection failed", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
