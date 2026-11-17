@@ -5,9 +5,20 @@ import {
   mergeProxyVm,
   mergeSeatSnapshot,
   parseSseFrames,
+  isLiveSeatQueryKey,
 } from './use-pool-seat-stream'
 
 describe('seat stream frames', () => {
+  it('recognizes the caches the seat stream writes', () => {
+    expect(isLiveSeatQueryKey(['panel', 'vms'])).toBe(true)
+    expect(isLiveSeatQueryKey(['panel', 'dashboard'])).toBe(true)
+    expect(isLiveSeatQueryKey(['panel', 'dashboard', 'extra'])).toBe(true)
+    expect(isLiveSeatQueryKey(['panel', 'vm', 'vm-1'])).toBe(true)
+    expect(isLiveSeatQueryKey(['panel', 'vm', 'vm-1', 'seed'])).toBe(false)
+    expect(isLiveSeatQueryKey(['panel', 'vms', 'create-options'])).toBe(false)
+    expect(isLiveSeatQueryKey(['panel', 'usage'])).toBe(false)
+  })
+
   it('keeps a frame split across chunks until its blank line arrives', () => {
     const first = parseSseFrames('event: seats\ndata: {"seats":')
     expect(first.frames).toEqual([])

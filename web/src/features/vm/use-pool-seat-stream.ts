@@ -64,6 +64,15 @@ function sameSessions(a: Vm['seat_sessions'], b: Vm['seat_sessions']) {
   })
 }
 
+/** 席位流会改写的查询。列表轮询和这些键共用缓存，旧响应不能盖掉更新的席位帧。 */
+export function isLiveSeatQueryKey(key: readonly unknown[]): boolean {
+  if (key[0] !== 'panel') return false
+  if (key[1] === 'vms' && key.length === 2) return true
+  if (key[1] === 'dashboard') return true
+  if (key[1] === 'vm' && key.length === 3) return true
+  return false
+}
+
 /** 席位快照只覆盖 Claude 行（`seats_max` 非空）的实时字段；缺席即空闲。 */
 export function mergeSeatVm(vm: Vm, snap: PoolSeatSnapshot): Vm {
   if (vm.seats_max == null) return vm
@@ -148,6 +157,9 @@ export function usePoolSeatStream() {
     const listKey = vmsListQueryOptions().queryKey
     const ctrl = new AbortController()
     let retry: number | undefined
+    let liveSnap: PoolSeatSnapshot | null = null
+    let streamOpen = false
+    let applying = false
 
     const patchVms = (patch: (vm: Vm) => Vm, queue?: PoolSeatSnapshot) => {
       qc.setQueryData<VmList>(listKey, (prev) =>
@@ -187,6 +199,27 @@ export function usePoolSeatStream() {
       )
     }
 
+    const applyLiveSnap = () => {
+      if (!liveSnap || applying) return
+      applying = true
+      try {
+        const snap = liveSnap
+        patchVms((vm) => mergeSeatVm(vm, snap), snap)
+      } finally {
+        applying = false
+      }
+    }
+
+    // 列表 / 总览 / 详情的 refetch 整份替换缓存。连接还在时，用最近一帧席位盖回去，
+    // 否则请求进行中会被发出更早的轮询清成 0。setQueryData 自身的通知在 applying 里跳过。
+    const unsubscribe = qc.getQueryCache().subscribe((event) => {
+      if (applying || !streamOpen || !liveSnap) return
+      if (event.type !== 'updated') return
+      if (event.action.type !== 'success') return
+      if (!isLiveSeatQueryKey(event.query.queryKey)) return
+      applyLiveSnap()
+    })
+
     const connect = async () => {
       if (!hasSession()) return
       let fatal = false
@@ -198,6 +231,7 @@ export function usePoolSeatStream() {
         // 鉴权失败不重连：等下次挂载（重新登录后）再订阅。
         if (res.status === 401 || res.status === 403) fatal = true
         if (!res.ok || !res.body) return
+        streamOpen = true
         const reader = res.body.pipeThrough(new TextDecoderStream()).getReader()
         let buffer = ''
         for (;;) {
@@ -209,7 +243,8 @@ export function usePoolSeatStream() {
             try {
               if (frame.event === 'seats') {
                 const snap = JSON.parse(frame.data) as PoolSeatSnapshot
-                patchVms((vm) => mergeSeatVm(vm, snap), snap)
+                liveSnap = snap
+                applyLiveSnap()
               } else if (frame.event === 'proxy') {
                 const snap = JSON.parse(frame.data) as PoolProxySnapshot
                 patchVms((vm) => mergeProxyVm(vm, snap))
@@ -222,6 +257,7 @@ export function usePoolSeatStream() {
       } catch {
         // 网络中断或 abort：abort 由 finally 判定，不重连。
       } finally {
+        streamOpen = false
         if (!ctrl.signal.aborted && !fatal) {
           retry = window.setTimeout(() => void connect(), RETRY_MS)
         }
@@ -230,6 +266,9 @@ export function usePoolSeatStream() {
 
     void connect()
     return () => {
+      unsubscribe()
+      streamOpen = false
+      liveSnap = null
       ctrl.abort()
       clearTimeout(retry)
     }

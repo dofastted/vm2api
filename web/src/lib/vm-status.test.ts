@@ -17,6 +17,7 @@ import {
   proxyNamedLabel,
   restrictionCopy,
   scheduleStateLabel,
+  vmRequestingCount,
   vmCircuit,
   vmCircuitTitle,
 } from './vm-status'
@@ -863,5 +864,41 @@ describe('four-state schedule model (backend resolveSlotState)', () => {
       text: '熔断中',
       cls: 'bad',
     })
+  })
+})
+
+describe('vmRequestingCount', () => {
+  it('sums inflight on sessions the VM is actually using', () => {
+    expect(
+      vmRequestingCount({
+        inflight: 0,
+        seat_sessions: [
+          { index: 0, session_id: 'a', state: 'active', inflight: 1 },
+          { index: 1, session_id: 'b', state: 'active', inflight: 2 },
+          { index: 2, session_id: 'c', state: 'held', inflight: 0 },
+          { index: 3, session_id: 'd', state: 'idle', inflight: 0 },
+        ],
+      })
+    ).toBe(3)
+  })
+
+  it('counts an active session whose inflight has not been filled in', () => {
+    expect(
+      vmRequestingCount({
+        inflight: 0,
+        seat_sessions: [
+          { index: 0, session_id: 'a', state: 'active', inflight: 0 },
+        ],
+      })
+    ).toBe(1)
+  })
+
+  it('does not let a stale VM inflight counter stand in for an empty seat book', () => {
+    expect(vmRequestingCount({ inflight: 1, seat_sessions: [] })).toBe(0)
+  })
+
+  it('falls back to VM inflight when the row has no per-session book', () => {
+    expect(vmRequestingCount({ inflight: 2 })).toBe(2)
+    expect(vmRequestingCount({ inflight: 0, seat_sessions: null })).toBe(0)
   })
 })

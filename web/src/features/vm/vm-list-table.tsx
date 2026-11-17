@@ -43,6 +43,7 @@ import {
   scheduleStateLabel,
   seatTitle,
   type ScheduleStateLabel,
+  vmRequestingCount,
 } from '@/lib/vm-status'
 import { vmCostLedger, vmTodayStats, vmWeekOutcome } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
@@ -340,7 +341,7 @@ function rowData(vm: Vm, accounts?: UsageAccountRow[]): RowData {
     seatsUsed: Number(vm.seats_used) || 0,
     seatsMax: vm.seats_max == null ? null : Number(vm.seats_max),
     queue: Number(vm.queue_depth) || 0,
-    inflight: Number(vm.inflight) || 0,
+    inflight: vmRequestingCount(vm),
     spend: d7.cost,
     tokens: d7.tokens,
     perReq: week.req > 0 && d7.cost ? d7.cost / week.req : null,
@@ -451,7 +452,7 @@ const COLS: Col[] = [
       ),
   },
   {
-    label: '在飞',
+    label: '请求中',
     sort: 'inflight',
     num: true,
     cell: (r) => (r.inflight ? r.inflight : <span className={TERT}>0</span>),
