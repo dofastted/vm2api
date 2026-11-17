@@ -258,3 +258,42 @@ test('inspect reports a surviving helper on a replaced binary as stale', async (
   assert.equal(repaired.reused, false)
   assert.equal(inspectEgressProcess(fx.root, 'px-ctr', opts).ok, true)
 })
+
+test('process runtime removes a helper container left by the container runtime before taking the ports', async (t) => {
+  const fx = fixture(t)
+  await fx.start()
+  assert.ok(fx.helper())
+  // KIN_EGRESS_RUNTIME=process (or a downgrade) cannot see that container's PID; it must not keep the ports.
+  const r = await fx.start({ runtime: 'process', bin: path.join(fx.root, 'missing') })
+  assert.equal(r.ok, false)
+  assert.match(r.error, /binary not found/)
+  assert.equal(fx.helper(), undefined)
+  assert.deepEqual(
+    fx.d.calls.filter((c) => c[0] === 'rm'),
+    [['rm', '-f', egressContainerName('px-ctr')]],
+  )
+})
+
+test('process runtime stop removes a leftover helper container', async (t) => {
+  const fx = fixture(t)
+  await fx.start()
+  const opts = { runtime: 'process', runDocker: fx.d.run }
+  assert.equal(stopEgressProcess(fx.root, 'px-ctr', opts).ok, true)
+  assert.equal(fx.helper(), undefined)
+  // Nothing left is still a successful stop.
+  assert.equal(stopEgressProcess(fx.root, 'px-ctr', opts).ok, true)
+})
+
+test('process runtime without a docker CLI behaves as before', async (t) => {
+  const fx = fixture(t)
+  const calls = []
+  const noDocker = (args) => {
+    calls.push(args)
+    return { ok: false, stdout: '', stderr: 'docker: command not found' }
+  }
+  const r = await fx.start({ runtime: 'process', runDocker: noDocker, bin: path.join(fx.root, 'missing') })
+  assert.equal(r.ok, false)
+  assert.match(r.error, /binary not found/)
+  assert.equal(stopEgressProcess(fx.root, 'px-ctr', { runtime: 'process', runDocker: noDocker }).ok, true)
+  assert.equal(calls.filter((c) => c[0] === 'rm').length, 0)
+})
