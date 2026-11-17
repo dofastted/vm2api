@@ -2,7 +2,6 @@ import { useEffect, useState, type ReactNode } from 'react'
 import type { ApiEndpoint } from '@/types/panel-api-endpoints'
 import type { ApiKeyItem, VmPool } from '@/types/panel-keys'
 import type { Vm } from '@/types/panel-vm'
-import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -21,6 +20,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import type { KeyGroupType, KeyLimitsDraft } from './key-payload'
+import { keyVmSelection, vmsInGroup } from './key-vm-selection'
 
 const CONC = [0, 1, 2, 4, 8, 16, 20, 32, 64]
 const QUOTA_CREATE = [0, 1000, 5000, 10000, 50000]
@@ -94,6 +94,8 @@ export function KeyLimitsDialog({
   pending,
   onSubmit,
   vms = [],
+  vmsReady = false,
+  vmsError = false,
   pools,
   channels,
   channelsLoading,
@@ -106,6 +108,8 @@ export function KeyLimitsDialog({
   pending: boolean
   onSubmit: (draft: KeyLimitsDraft) => void
   vms?: Vm[]
+  vmsReady?: boolean
+  vmsError?: boolean
   pools?: VmPool[]
   channels?: ApiEndpoint[]
   channelsLoading?: boolean
@@ -154,6 +158,7 @@ export function KeyLimitsDialog({
     !!draft.api_endpoint_id &&
     initial?.api_endpoint_id === draft.api_endpoint_id
   const listed = vmsInGroup(vms || [], draft.group_type)
+  const selection = keyVmSelection(draft, vms, vmsReady)
   const scopeBlocked = isApi
     ? !selectedChannel &&
       !unchangedChannel &&
@@ -162,7 +167,7 @@ export function KeyLimitsDialog({
       ? !draft.vm_pool_id
       : draft.group_type !== 'all' &&
         draft.group_type !== 'gemini' &&
-        draft.allowed_vms.length === 0
+        selection.blocked
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -415,6 +420,18 @@ export function KeyLimitsDialog({
             ) : (
               <div className='sm:col-span-2'>
                 <Field label='可用 VM'>
+                  {!vmsReady ? (
+                    <p role='status' className='text-xs text-muted-foreground'>
+                      {vmsError
+                        ? '无法加载可用 VM，请刷新后重试。保存已暂停。'
+                        : '正在核对可用 VM…'}
+                    </p>
+                  ) : selection.removed.length > 0 ? (
+                    <p role='status' className='text-xs text-muted-foreground'>
+                      已排除当前不可用的旧选择：{selection.removed.join(', ')}。
+                      请确认可用 VM 后保存。
+                    </p>
+                  ) : null}
                   <div className='max-h-40 space-y-1 overflow-y-auto rounded-md border p-2'>
                     {listed.length === 0 ? (
                       <p className='text-xs text-muted-foreground'>
@@ -429,7 +446,10 @@ export function KeyLimitsDialog({
                           <input
                             type='checkbox'
                             className='size-3.5'
-                            checked={draft.allowed_vms.includes(vm.id)}
+                            checked={selection.draft.allowed_vms.includes(
+                              vm.id
+                            )}
+                            disabled={!vmsReady}
                             onChange={(e) => {
                               const on = e.target.checked
                               setDraft((d) => ({
@@ -478,7 +498,9 @@ export function KeyLimitsDialog({
             取消
           </Button>
           <Button
-            onClick={() => onSubmit(draft)}
+            onClick={() => {
+              if (!scopeBlocked) onSubmit(selection.draft)
+            }}
             disabled={
               pending ||
               (mode === 'create' && !draft.name.trim()) ||
@@ -514,10 +536,4 @@ function groupOf(value: string | undefined): KeyGroupType {
   if (value === 'anthropic' || value === 'openai' || value === 'gemini')
     return value
   return 'all'
-}
-
-function vmsInGroup(vms: Vm[], group: KeyGroupType): Vm[] {
-  if (group === 'openai') return vms.filter((vm) => isCodexVm(vm))
-  if (group === 'anthropic') return vms.filter((vm) => !isCodexVm(vm))
-  return []
 }
