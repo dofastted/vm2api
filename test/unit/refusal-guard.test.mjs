@@ -226,6 +226,18 @@ test('post-hop warms the right front rule without treating ordinary HTTP 400 as 
     assert.equal(repo.count(), 0)
     assert.equal(devices.count(), 0)
     assert.equal(
+      observeUpstreamRisk({
+        ...opts,
+        result: upstream(
+          'Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going.',
+        ),
+      }),
+      'upstream:extra_usage_session',
+    )
+    assert.equal(repo.count(), 0)
+    assert.equal(devices.findBan(identity).subject_kind, 'session')
+    devices.clear()
+    assert.equal(
       observeUpstreamRisk({ ...opts, result: upstream('Third-party apps now draw from your extra usage', 503) }),
       'upstream:billing_refusal',
     )

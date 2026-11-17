@@ -95,7 +95,10 @@ export function observeUpstreamRisk({ inbound, body, identity, result, logBag, r
   if (message) logBag.error_message = message
   logBag.error_code ||= 'content_filter_refusal'
   if (!policy?.enabled) return reason
-  const fingerprint = reason === 'upstream:flagged_session' ? null : refusalFingerprint(body, inbound)
+  const fingerprint =
+    reason === 'upstream:flagged_session' || reason === 'upstream:extra_usage_session'
+      ? null
+      : refusalFingerprint(body, inbound)
   try {
     if (fingerprint)
       repo?.remember?.({
@@ -119,7 +122,7 @@ export function upstreamRiskClientError(reason, requestId) {
   return makeRefusalGuardError({
     requestId,
     message:
-      reason === 'upstream:flagged_session'
+      reason === 'upstream:flagged_session' || reason === 'upstream:extra_usage_session'
         ? '上游已标记此会话，请勿继续使用此会话。'
         : reason === 'upstream:configured_policy'
           ? '上游因内容策略拒绝了此请求，请勿重试。'

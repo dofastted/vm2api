@@ -212,7 +212,10 @@ export function upstreamRiskReason(result, phrases = []) {
     .filter(Boolean)
     .join('\n')
     .toLowerCase()
-  if ((status === 400 || status === 503) && isUnanswerablePromptMessage(text) && !isUsagePolicyErrorMessage(text)) {
+  if (status === 400 && isUnanswerablePromptMessage(text) && !isUsagePolicyErrorMessage(text)) {
+    return 'upstream:extra_usage_session'
+  }
+  if (status === 503 && isUnanswerablePromptMessage(text) && !isUsagePolicyErrorMessage(text)) {
     return 'upstream:billing_refusal'
   }
   const isRejection = [400, 403, 422].includes(status) || [400, 403, 422].includes(httpStatus)
