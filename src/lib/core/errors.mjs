@@ -176,6 +176,7 @@ const REFUSAL_GUARD_MESSAGES = Object.freeze({
   exact: REFUSAL_GUARD_MESSAGE,
   similar: `${REFUSAL_GUARD_MESSAGE} 当前提示词与曾被拒答的内容相似。`,
   device: `${REFUSAL_GUARD_MESSAGE} 该设备此前已被封禁。`,
+  session: `${REFUSAL_GUARD_MESSAGE} 这个会话此前被上游拒答。`,
   upstream: 'Anthropic refused this request under its usage policy. Do not retry this request.',
 })
 

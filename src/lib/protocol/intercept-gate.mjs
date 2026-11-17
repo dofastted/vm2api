@@ -10,6 +10,7 @@ import {
 import {
   blockedRiskTool,
   DEFAULT_BAN_STEPS,
+  matchRefusalSession,
   matchStoredRefusal,
   refusalFingerprint,
   refusalGuardError,
@@ -153,8 +154,16 @@ function similarityRatio(value) {
   return n > 1 ? n / 100 : n
 }
 
-export function commitProtocolBlock(decision, { repo, devices, policy, requestId } = {}) {
+export function commitProtocolBlock(decision, { repo, devices, sessions, policy, requestId } = {}) {
   if (!decision || decision.action !== 'block') return
+  if (decision.kind === 'session') {
+    try {
+      sessions?.hit?.(decision.sessionId)
+    } catch {
+      /* counter is best-effort */
+    }
+    return
+  }
   if (decision.kind === 'device') {
     try {
       devices?.hit?.(decision.deviceId)
@@ -212,6 +221,7 @@ export async function evaluateProtocolIntercept({
   jev,
   repo,
   devices,
+  sessions = null,
   requestId,
   account = null,
   scopeMatched = false,
@@ -228,6 +238,26 @@ export async function evaluateProtocolIntercept({
   const interceptOpts = { interceptSession, ctx: bodyCtx }
   let rawDocument
   if (!skipMandatory) {
+    // A session the provider already refused never hops again: before every
+    // other layer, whatever the prompt now says.
+    if (policy?.session_block_enabled !== false && sessions) {
+      const refused = matchRefusalSession({ inbound, body, headers, sessions })
+      if (refused) {
+        const error = refusalGuardError(requestId, refused)
+        return block({
+          kind: 'session',
+          via: 'refusal-guard',
+          final_state: 'refusal_session',
+          error,
+          errorMessage: error.body?.error?.message,
+          intercept: gateVerdict({ kind: 'block', by: 'refusal', keyword: 'session' }),
+          sessionId: refused.sessionId,
+          banDevice: false,
+          remember: false,
+          reason: 'refusal_session',
+        })
+      }
+    }
     const banned = devices?.findBan?.(identity, Date.now(), (row) => enforcesBan(policy, row))
     if (banned) {
       const error = refusalGuardError(requestId, { kind: 'device', row: banned })

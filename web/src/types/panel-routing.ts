@@ -105,6 +105,18 @@ export type RiskAuditPolicy = {
   model_margin: number
 }
 
+export type RefusalSessionBlock = {
+  session_id: string
+  first_seen_at: string
+  last_seen_at: string
+  hit_count: number
+  source_request_id: string | null
+  account_id: string | null
+  model: string | null
+  preview: string | null
+  reason: string | null
+}
+
 export type RefusalGuardConfig = {
   enabled: boolean
   similarity_enabled: boolean
@@ -112,10 +124,14 @@ export type RefusalGuardConfig = {
   similarity: number
   device_block_enabled: boolean
   risk_audit: RiskAuditPolicy
+  /** 独立于 enabled：上游拒答过的会话永久停止转发。 */
+  session_block_enabled: boolean
   count: number
   items: RefusalGuardItem[]
   device_count: number
   devices: RefusalDeviceBlock[]
+  session_count: number
+  sessions: RefusalSessionBlock[]
 }
 
 export type PolicyQuestion = {
