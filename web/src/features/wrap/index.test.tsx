@@ -320,6 +320,7 @@ describe('CRAG runtime on the kernel page', () => {
           'vm-old': {
             state: 'running',
             ready: false,
+            quota_blocked: true,
             scope: 'host',
             version: '3.0.8',
             active_requests: 0,
@@ -334,15 +335,15 @@ describe('CRAG runtime on the kernel page', () => {
     expect(state.hostInterval).toBe(10_000)
     expect(html).toMatch(/剩余可用槽位：(?:<!-- -->)?0/)
     expect(html).not.toContain('可用运行名额')
-    expect(html).toContain('已暂停宿主机 CRAG 调用')
+    expect(html).toContain('宿主订阅超额，仅超额槽暂停调度')
     expect(html).toContain('兑换槽位')
-    expect(html).toContain('服役中 / 暂不可用')
+    expect(html).toContain('超出订阅额度 / 暂停调度')
     expect(html).toContain('版本 3.0.8 · 处理中 0 · 排队 0 · 就绪处理槽 0')
 
     state.role = 'user'
     const userHtml = render()
     expect(userHtml).not.toContain('剩余可用槽位')
-    expect(userHtml).not.toContain('服役中 / 暂不可用')
+    expect(userHtml).not.toContain('超出订阅额度 / 暂停调度')
     expect(userHtml).not.toContain('兑换槽位')
     expect(state.hostEnabled).toBe(false)
     expect(state.hostInterval).toBe(false)

@@ -754,6 +754,7 @@ export function createRoutingRuntime(ctx) {
       accountQuota: ctx.accountQuota,
       runtimeRepo,
       workerHealth: rustKernelHealth,
+      getRouting,
       config: poolSchedulerConfig(),
     })
     setPool(poolScheduler)

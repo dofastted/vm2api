@@ -15,7 +15,7 @@ export function CragRuntimeCounts({ status }: { status?: CragHostStatus }) {
   return (
     <p role='status' className='text-sm break-words tabular-nums'>
       {status?.runtime?.host_over_limit === true
-        ? '已暂停宿主机 CRAG 调用'
+        ? '宿主订阅超额，仅超额槽暂停调度'
         : status
           ? statusLabels[status.state]
           : '状态待核对'}
@@ -48,7 +48,7 @@ export function CragRuntimeDetail({ detail }: { detail: CragRuntimeVm }) {
   ].filter(Boolean)
   return (
     <div className='mt-2 space-y-0.5 text-sm'>
-      <p>CRAG：{state}</p>
+      <p>CRAG：{detail.quota_blocked ? '超出订阅额度 / 暂停调度' : state}</p>
       {fields.length > 0 ? (
         <p className='text-xs wrap-anywhere text-muted-foreground tabular-nums'>
           {fields.join(' · ')}

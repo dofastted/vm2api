@@ -295,7 +295,7 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 宿主 `expires_at` 是当前签名额度的下一个到期点，不表示全部套餐同时失效。到期后控制面向 Authority 刷新剩余有效额度；刷新不可用时不沿用过期签名。
 
-可选 `runtime` 返回实际运行的 `running_vms`、`ready_vms`、`unknown_vms`、`host_running_vms`、`host_unknown_vms`、`host_runtime_available`、`host_over_limit`、`checked_at` 和逐 VM 明细 `vms`。独立授权计入全局服役但不占宿主额度；未知不视为零。宿主订阅超额或无法核实在额度内时，新的宿主授权推理请求分别返回 `403 license_crag_host_over_quota` 或 `403 license_crag_host_usage_unverified`，不取消在途请求、不代替逐槽许可。
+可选 `runtime` 返回实际运行的 `running_vms`、`ready_vms`、`unknown_vms`、`host_running_vms`、`host_unknown_vms`、`host_runtime_available`、`host_over_limit`、`checked_at` 和逐 VM 明细 `vms`。独立授权计入全局服役但不占宿主额度；未知不视为零。`host_over_limit` 仅反映运行盘点；超出签名额度的槽标记 `quota_blocked: true`，不参加调度，直连该槽返回 `403 license_crag_host_over_quota`。额度内且授权有效的槽继续接单，不因其他槽的运行状态未知而被暂停。不改手动调度开关，不取消在途请求；订阅同步中的安全检查仍有效。
 
 `target_probe_failed: true` 表示至少一项本机槽位观测失败，不影响已验证的宿主权益状态。槽位授权接口 `POST /vms/:id/crag-license` 可提交联网兑换码；经 Authority 确认为宿主订阅码后，会兑换到本机并绑定所选槽。
 

@@ -393,8 +393,9 @@ export function createCragRuntimeInventory({
         if (scope.permit && observed.state === 'running') hostRunning++
         if ((scope.permit && observed.state === 'unknown') || (scope.permitError && observed.state !== 'not_running'))
           hostUnknown++
+        const hostBound = !!scope.permit || scope.permitError
         const license =
-          observed.state === 'running'
+          observed.state === 'running' || scope.permit
             ? checkCragLicense(projectRoot, { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' }, routing)
             : null
         const grantScope = (
@@ -407,14 +408,18 @@ export function createCragRuntimeInventory({
             state: observed.state,
             ...(observed.stopped_confirmed === true ? { stopped_confirmed: true } : {}),
             ...(observed.non_crag_confirmed === true ? { non_crag_confirmed: true } : {}),
-            ready: observed.reachable && license?.ok === true && vm.schedulable !== false,
+            ready:
+              observed.reachable &&
+              license?.ok === true &&
+              vm.schedulable !== false &&
+              (!hostBound || (!!scope.permit && !!claims && !pending)),
+            ...(license?.code === 'license_crag_host_over_quota' && { quota_blocked: true }),
             scope: scope.permit ? 'host' : !scope.permitError && independent ? 'independent' : 'unknown',
             version: observed.version,
             active_requests: observed.active_requests,
             queued: observed.queued,
             ready_slots: observed.ready_slots,
           },
-          !!scope.permit || scope.permitError,
         ])
       }
       // Status must not present a wholly failed sample as a verified zero.
@@ -423,7 +428,6 @@ export function createCragRuntimeInventory({
         throw new Error('crag_runtime_inventory_unavailable')
       const checkedAt = now()
       const quota = hostQuota({ hostId, claims, pending }, hostRunning, hostUnknown, checkedAt)
-      for (const [, value, hostBound] of entries) if (hostBound && quota.host_over_limit !== false) value.ready = false
       return {
         running_vms: entries.filter(([, value]) => value.state === 'running').length,
         ready_vms: entries.filter(([, value]) => value.ready).length,
