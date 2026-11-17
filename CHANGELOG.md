@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.137 — 2026-11-18 · Claude 入口工具历史兼容
+
+- `/v1/messages` 转换混入的 Chat 工具调用及结果，保留原生内容块。`/v1/responses` 支持 Codex 动态工具声明，并在不跨消息和缓存边界时归并交错的并行工具历史；无法转换时返回具体字段错误。
+- CRAG 面板复用已校验的入站结构，减少重复转换和冗余请求头（#1201）。
+- 沿用现有签名载荷，无需 `wrap-cli/sync` 或重装槽位；本版不改变上游计费策略。
+
 ## 1.4.136 — 2026-11-17 · CRAG thinking 采样参数修复
 
 - CRAG 在确定 thinking 模式后再校准采样参数：启用 thinking 或使用 adaptive 时将 `temperature` 设为 `1`，移除 `top_p` 和 `top_k`；关闭 thinking 时保留原值。修复最简 Messages 请求因采样参数不兼容返回 400 的问题。

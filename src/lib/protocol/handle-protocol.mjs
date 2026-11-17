@@ -1148,7 +1148,7 @@ export function createHandleProtocol(deps) {
                   : undefined,
             })
     } catch (error) {
-      if (error.code !== 'invalid_responses_conversion') throw error
+      if (!['invalid_responses_conversion', 'invalid_messages_conversion'].includes(error.code)) throw error
       stats.errors++
       logBag.error_code = error.code
       logBag.error_message = error.body.error.message
