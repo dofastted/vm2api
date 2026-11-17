@@ -157,3 +157,16 @@ test('repo keeps the first source, counts hits, removes and clears', async () =>
     assert.equal(sessions.clear(), 1)
   })
 })
+
+test('an auto-mode classifier refusal stays on that request; the conversation itself still blocks', async () => {
+  const { refusalSessionBlockDecision } = await import('../../src/lib/protocol/handle-protocol.mjs')
+  const classifier = { purpose: 'auto_mode_classifier', format: 'xml', stage: 'xml_s2' }
+  for (const reason of ['upstream:usage_policy', 'upstream:flagged_session']) {
+    assert.deepEqual(refusalSessionBlockDecision(reason, classifier), { block: false, skipped: 'auto_mode_classifier' })
+    assert.deepEqual(refusalSessionBlockDecision(reason, null), { block: true })
+  }
+  for (const reason of ['', 'upstream:billing_refusal', 'upstream:configured_policy']) {
+    assert.deepEqual(refusalSessionBlockDecision(reason, classifier), { block: false })
+    assert.deepEqual(refusalSessionBlockDecision(reason, null), { block: false })
+  }
+})

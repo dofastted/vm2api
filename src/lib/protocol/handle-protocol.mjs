@@ -206,6 +206,19 @@ import { materializeRemoteImageSources } from './images.mjs'
 import { applyMinMaxTokens } from './min-max-tokens.mjs'
 import { detectWarmupIntercept, formatWarmupSse, warmupMockMessage } from './warmup-intercept.mjs'
 
+/**
+ * Which upstream refusals end the caller session. Claude Code's auto-mode
+ * classifier is a side request judging one tool action: its refusal stays on
+ * that request. The main conversation carries the same transcript, so a real
+ * violation still ends the session the first time the conversation itself is
+ * refused.
+ */
+export function refusalSessionBlockDecision(reason, classifier = null) {
+  if (reason !== 'upstream:usage_policy' && reason !== 'upstream:flagged_session') return { block: false }
+  if (classifier?.purpose === 'auto_mode_classifier') return { block: false, skipped: 'auto_mode_classifier' }
+  return { block: true }
+}
+
 export function createHandleProtocol(deps) {
   const json = (...args) => deps.json(...args)
   const writeSSEHeaders = (...args) => deps.writeSSEHeaders(...args)
@@ -1009,7 +1022,9 @@ export function createHandleProtocol(deps) {
         logBag,
         requestId: logCtx.request_id,
       })
-      if (reason === 'upstream:usage_policy' || reason === 'upstream:flagged_session') {
+      const sessionBlock = refusalSessionBlockDecision(reason, logBag.classifier)
+      if (sessionBlock.skipped) logBag.risk_session_block_skipped = sessionBlock.skipped
+      if (sessionBlock.block) {
         blockRefusedSession({
           inbound,
           body: inbound,
