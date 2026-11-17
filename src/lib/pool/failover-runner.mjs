@@ -752,6 +752,10 @@ export class FailoverRunner {
     })
     const bindAll = (account, opts) => {
       if (!this.stickyRouter || !account) return
+      // keep_pin_on_model_gate: the pinned home only could not serve this
+      // model, so this request borrows the account. No session, family or
+      // device pin follows it; the next turn goes home.
+      if (lastSelected?.stickyBorrowed === true && lastSelected.accountId === account.accountId) return
       const sessionId = account.sessionId || (account.accountId === outboundSessionAccountId ? outboundSessionId : '')
       const payload = { accountId: account.accountId, vmId: account.vmId }
       const slotIndex = account.slotIndex != null ? account.slotIndex : pinnedSlot

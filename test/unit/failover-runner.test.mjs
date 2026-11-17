@@ -2619,3 +2619,30 @@ test('keep_session_home: a home kernel with no free slot is retried instead of s
   assert.equal(result.accountId, 'account-1')
   assert.deepEqual(seen, ['account-1', 'account-1', 'account-1'])
 })
+
+test('keep_pin_on_model_gate: a borrowed account never takes the session, family or device pin', async () => {
+  const binds = []
+  const scheduler = new Scheduler([{ ...candidate(2), stickyBorrowed: true }])
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: {
+      resolve: (key) => (key === 'sess:home' ? { accountId: 'account-1', vmId: 'vm-01', generation: 1 } : null),
+      bind: (key) => binds.push(key),
+      bindDeviceAffinity: (key) => binds.push(key),
+      unbind() {},
+    },
+    config: { same_account_retry_delay_ms: 0, keep_session_home: true },
+  })
+  const result = await runner.run({
+    requestId: 'req-borrow',
+    canonicalBody: { model: 'claude-fable-test' },
+    model: 'claude-fable-test',
+    stickyKey: 'sess:home',
+    familyKey: 'family2:home',
+    deviceKey: 'dev2:machine',
+    callAttempt: () => success('borrowed'),
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.accountId, 'account-2')
+  assert.deepEqual(binds, [])
+})
