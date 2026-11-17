@@ -617,6 +617,21 @@ export function inspectEgressContainer(name, runDocker = docker) {
   }
 }
 
+/**
+ * The process runtime cannot see a helper container's PID (separate PID namespace on the host network),
+ * so a `kin-cp-egress-*` left by the container runtime would hold the ports with an old config. Remove it
+ * first; no docker CLI/socket means no such container.
+ */
+function removeLeftoverEgressContainer(proxyId, runDocker) {
+  const name = egressContainerName(proxyId)
+  if (!inspectEgressContainer(name, runDocker)) return { ok: true, removed: false }
+  const removed = runDocker(['rm', '-f', name])
+  if (!removed.ok && !/no such container/i.test(removed.stderr || '')) {
+    return { ok: false, error: `egress_container_remove_failed: ${removed.stderr || 'docker rm failed'}` }
+  }
+  return { ok: true, removed: true }
+}
+
 /** A crash loop reports Running too; only a settled helper counts. */
 function egressContainerHealthy(info) {
   return !!(info?.running && !info.restarting)
@@ -755,6 +770,8 @@ export async function startEgressProcess({
       }
     } catch {}
   }
+  const leftover = removeLeftoverEgressContainer(proxyId, runDocker)
+  if (!leftover.ok) return { ok: false, error: leftover.error }
   const portOwner = listenerPid(tcpPort)
   if (portOwner && !ownsEgressProcess(portOwner, cfgPath, { allowDeleted: true })) {
     return { ok: false, error: 'egress_port_busy', pid: portOwner }
@@ -805,6 +822,9 @@ export function stopEgressProcess(projectRoot, proxyId, { runtime = egressRuntim
     if (!removed.ok && !/no such container/i.test(removed.stderr || ''))
       return { ok: false, error: 'egress_stop_failed' }
     // Fall through: a process-runtime helper from an older control plane may still run.
+  } else {
+    const leftover = removeLeftoverEgressContainer(proxyId, runDocker)
+    if (!leftover.ok) return { ok: false, error: 'egress_stop_failed' }
   }
   const pids = [...new Set(egressPidsForProxyConfig(projectRoot, proxyId))]
   const pending = []
