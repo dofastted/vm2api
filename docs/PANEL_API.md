@@ -273,6 +273,7 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 | GET | `/crag-shop/orders` | 查看本人订单列表 `{ orders, next_offset }`，每页最多 100 单，可用 `?offset=` 继续 |
 | GET | `/crag-shop/orders/:id` | 查看本人订单状态，不返回支付表单或兑换码 |
 | POST | `/crag-shop/orders/:id/resume` | 空请求体或 JSON `{}`；按订单 ID 恢复原付款表单（若仍可用），不会创建新订单。供应方未确认创建时返回 `404` |
+| POST | `/crag-shop/orders/:id/cancel` | 空请求体或 `{}`；仅取消 `cancelable: true` 的本地预留，阻止后续建单并停止自动激活。取消保留记录、可幂等重试。已提交或旧版未确认送达的订单返回 `409`；不会关闭外部收银台、退款或释放商城库存。设备购买同样支持此接口。 |
 | POST | `/crag-shop/orders/:id/claim` | 空请求体或 JSON `{}`，普通订单返回 `{ order_id, redemption_code }`；未发货返回 `409`，不兑换到宿主机，续费订单不提供兑换码 |
 | POST | `/crag-shop/orders/:id/apply-renewal` | 空请求体或 JSON `{}`；仅管理员本人可将已发货的续费订单应用到当前宿主机，返回宿主订阅状态，不返回兑换码或续费证明 |
 
@@ -282,7 +283,7 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 历史订单优先按订单 ID 恢复。仅在供应方未收到建单时，才需要用原选项和 `request_id` 重新发起建单。未核价的旧方案仅在兼容模式下可建单。浏览器不能提交续费证明；控制面用已有的宿主凭据向固定供应方申请证明。
 
-订单视图包含 `order_id`、`request_id`、`status`、`sku`、`payment_method`、`created_at`（Unix 秒）、`term`、`amount_minor`、`slot_limit`。`reserved` 表示仅保留了本地订单标识、尚未确认供应方创建，后三个快照字段为 `null`；确认后的状态是 `pending`、`paid` 或 `fulfilled`。目录下架不影响已创建订单的历史快照。
+订单视图包含 `order_id`、`request_id`、`status`、`sku`、`payment_method`、`created_at`（Unix 秒）、`term`、`amount_minor`、`slot_limit`。`reserved` 表示尚未确认供应方创建，`cancelled` 表示已取消未发送的本地预留，两者的后三个快照字段为 `null`；供应方确认后的状态是 `pending`、`paid` 或 `fulfilled`。目录下架不影响已创建订单的历史快照。
 
 创建或恢复接口可能返回付款表单。收到配对的 `url` 和 `data` 时，使用 `url` 作为表单 POST 的目标，不能换成买家提供的地址。接口不返回订单私有凭据；仅普通订单的领取接口返回兑换码。有效的历史订单可能没有可用的支付表单，不能把这种情况当作支付成功。
 
