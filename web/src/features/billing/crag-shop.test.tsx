@@ -10,15 +10,11 @@ import type * as JsxDevRuntime from 'react/jsx-dev-runtime'
 import type * as JsxRuntime from 'react/jsx-runtime'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, activateVmCragLicense, api, cragDeviceApi } from '@/lib/api'
-import type * as CragLicenseEditorModule from '@/features/vm/crag-license-editor'
+import { ApiError, api, cragDeviceApi } from '@/lib/api'
 import type { CragHostStatus } from '@/features/vm/queries'
 import type { CragCommerce } from './crag-commerce'
 import { CragDevicePurchasePage, CragSubscriptionPage } from './crag-shop'
 
-type ActivationFormProps = Parameters<
-  typeof CragLicenseEditorModule.CragActivationForm
->[0]
 type ConfirmProps = ComponentProps<
   typeof import('@/components/confirm-dialog').ConfirmDialog
 >
@@ -39,8 +35,6 @@ const state = vi.hoisted(() => ({
   invalidateQueries: vi.fn(),
   hostForm: undefined as FormHTMLAttributes<HTMLFormElement> | undefined,
   hostInput: undefined as InputHTMLAttributes<HTMLInputElement> | undefined,
-  activationForm: undefined as ActivationFormProps | undefined,
-  activationError: null as Error | null,
   confirmCancel: undefined as (() => void) | undefined,
   queries: [] as Array<{
     queryKey: readonly unknown[]
@@ -58,7 +52,7 @@ function captureHostControls<Rest extends unknown[], Result>(
   return (type: ElementType, props: unknown, ...rest: Rest) => {
     if (type === 'form') {
       const form = props as FormHTMLAttributes<HTMLFormElement>
-      if (form['aria-label'] === '兑换宿主机额度') state.hostForm = form
+      if (form['aria-label'] === '兑换订阅使用券') state.hostForm = form
     } else if (type === 'input') {
       const input = props as InputHTMLAttributes<HTMLInputElement>
       if (input['aria-describedby'] === 'crag-host-redeem-help')
@@ -103,11 +97,6 @@ vi.mock('react', async (importOriginal) => ({
 }))
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@tanstack/react-query')>()),
-  useMutation: (options: { mutationFn: () => Promise<unknown> }) => ({
-    mutate: () => void options.mutationFn(),
-    reset: vi.fn(),
-    error: state.activationError,
-  }),
   useQueryClient: () => ({
     setQueryData: state.setQueryData,
     invalidateQueries: state.invalidateQueries,
@@ -176,28 +165,6 @@ vi.mock('@/components/confirm-dialog', () => ({
     return null
   },
 }))
-vi.mock('@/components/ui/dialog', () => {
-  const Children = ({ children }: { children: ReactNode }) => children
-  return {
-    Dialog: Children,
-    DialogContent: ({ children }: { children: ReactNode }) => (
-      <div role='dialog'>{children}</div>
-    ),
-    DialogDescription: Children,
-    DialogHeader: Children,
-    DialogTitle: Children,
-  }
-})
-vi.mock('@/features/vm/crag-license-editor', async (importOriginal) => {
-  const actual = await importOriginal<typeof CragLicenseEditorModule>()
-  return {
-    ...actual,
-    CragActivationForm: (props: ActivationFormProps) => {
-      state.activationForm = props
-      return <actual.CragActivationForm {...props} />
-    },
-  }
-})
 vi.mock('@/components/ui/button', () => ({
   Button: (props: ButtonHTMLAttributes<HTMLButtonElement>) => {
     state.buttons.push(props)
@@ -206,7 +173,6 @@ vi.mock('@/components/ui/button', () => ({
 }))
 vi.mock('@/lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/api')>()),
-  activateVmCragLicense: vi.fn(),
   api: vi.fn(),
   cragDeviceApi: vi.fn(),
 }))
@@ -247,7 +213,6 @@ function render(device = false) {
   state.refCursor = 0
   state.buttons = []
   state.queries = []
-  state.activationForm = undefined
   state.commerce = undefined
   state.hostForm = undefined
   state.hostInput = undefined
@@ -299,7 +264,6 @@ beforeEach(() => {
     state.hostStatus = data
   })
   state.invalidateQueries.mockReset()
-  state.activationError = null
   state.targetResult = {
     data: { targets: [{ vm_id: 'vm-a' }] },
     isError: false,
@@ -323,25 +287,19 @@ beforeEach(() => {
     undefined,
     undefined,
   ]
-  vi.mocked(activateVmCragLicense).mockReset()
   vi.mocked(api).mockReset()
   vi.mocked(api).mockResolvedValue({ ...order, status: 'paid' })
 })
 
 describe('CRAG buyer presentation and activation wire', () => {
-  it('keeps administrator redemption available when the catalogue is down', () => {
+  it('keeps the subscription voucher form when the catalogue is down', () => {
     state.values[1] = { status: 'error' }
     const html = render()
     expect(html).toContain('自动激活到 vm-a')
-    click('手动激活')
-    state.values.length = 19 // Reset slots previously used by HostOverview.
-    const dialog = render()
-    expect(dialog).toContain('手动激活 CRAG')
-    expect(dialog.match(/<textarea\b/g)).toHaveLength(1)
-    expect(dialog).toContain('CRAG 激活码')
-    expect(dialog).toMatch(/role="dialog"[\s\S]*?<textarea/)
-    expect(dialog).toContain('宿主机兑换码')
-    expect(activateVmCragLicense).not.toHaveBeenCalled()
+    expect(html).toContain('订阅使用券')
+    expect(html).toContain('兑换到本机')
+    expect(html).not.toContain('手动激活')
+    expect(html).not.toContain('CRAG 激活码')
     expect(api).not.toHaveBeenCalled()
   })
 
@@ -386,59 +344,6 @@ describe('CRAG buyer presentation and activation wire', () => {
     )
     expect(api).not.toHaveBeenCalled()
     expect(render(true)).toContain('订阅额度已加入本机')
-  })
-
-  it('prefills the claimed code but requires a separate explicit manual target', () => {
-    const code = `CRAGR1.${'a'.repeat(43)}`
-    state.values[3] = [order]
-    state.values[15] = { order_id: order.order_id, redemption_code: code }
-    state.values[16] = 'vm-a' // Checkout target must not preselect a manual target.
-    render()
-    click('使用此码激活')
-    state.values.length = 18
-    const dialog = render()
-    expect(dialog).toMatch(new RegExp(`<textarea[^>]*>${code}</textarea>`))
-    expect(dialog).toMatch(/<option value="" selected="">请选择槽位/)
-    expect(dialog).not.toContain('vm-mac')
-    expect(
-      state.buttons.find((button) => button.children === '激活')?.disabled
-    ).toBe(true)
-    expect(activateVmCragLicense).not.toHaveBeenCalled()
-
-    state.values[19] = 'vm-b'
-    state.values[18] = ` ${code} `
-    render()
-    expect(
-      state.buttons.find((button) => button.children === '激活')?.disabled
-    ).toBe(false)
-    state.activationForm?.onActivate()
-    expect(activateVmCragLicense).toHaveBeenCalledExactlyOnceWith('vm-b', code)
-    expect(api).not.toHaveBeenCalled()
-    state.role = 'user'
-    const buyer = render()
-    expect(buyer).toContain('领取兑换码')
-    expect(buyer).not.toContain('手动激活 CRAG')
-    expect(buyer).not.toContain('CRAG 激活码')
-    expect(buyer).not.toContain('使用此码激活')
-    expect(buyer).not.toContain('自动激活（新订单）')
-    expect(state.activationForm).toBeUndefined()
-  })
-
-  it('distinguishes authority rejection from a changed activation target', () => {
-    render()
-    click('手动激活')
-    state.values.length = 19
-    state.activationError = new ApiError('opaque', 409, 'issuer_mismatch')
-    const rejected = render()
-    expect(rejected).toContain('授权服务不认可目标内核的发行方，本次未兑换。')
-    state.activationError = new ApiError(
-      'opaque',
-      409,
-      'license_redeem_target_changed'
-    )
-    const changed = render()
-    expect(changed).toContain('激活期间目标槽、设备或授权发生变化')
-    expect(changed).not.toContain('授权服务不认可目标内核的发行方')
   })
 
   it('shows the slot probe failure without hiding the signed entitlement', () => {
@@ -490,7 +395,7 @@ describe('CRAG buyer presentation and activation wire', () => {
 
     const html = render()
     expect(html).toContain('当前没有可绑定的 CRAG 槽位')
-    expect(html).toContain('宿主机兑换码')
+    expect(html).toContain('订阅使用券')
     expect(html).toContain(
       '每张码从兑换时独立计时，未到期额度相加；不绑定、不启动 VM。'
     )
@@ -513,7 +418,6 @@ describe('CRAG buyer presentation and activation wire', () => {
       '/api/panel/crag-subscription/redeem',
       { method: 'POST', body: JSON.stringify({ redemption_code: code }) }
     )
-    expect(activateVmCragLicense).not.toHaveBeenCalled()
     expect(render()).toContain('正在兑换…')
     expect(state.hostInput?.disabled).toBe(true)
 
@@ -627,7 +531,7 @@ describe('CRAG buyer presentation and activation wire', () => {
   })
 
   it.each([
-    ['crag_subscription_invalid_request', '请输入有效的宿主机兑换码'],
+    ['crag_subscription_invalid_request', '请输入有效的订阅使用券'],
     ['redeem_unavailable', '此码不可用于本机订阅或已失效'],
     ['host_redeem_conflict', '此码与当前宿主机或订阅不匹配'],
     [
@@ -664,7 +568,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     state.hostStatus = pending
     state.role = 'user'
     const buyer = render()
-    expect(buyer).not.toContain('宿主机兑换码')
+    expect(buyer).not.toContain('订阅使用券')
     expect(buyer).not.toContain('兑换到本机')
     expect(buyer).not.toContain('继续同步')
     expect(api).not.toHaveBeenCalled()
@@ -679,7 +583,7 @@ describe('CRAG buyer presentation and activation wire', () => {
       '/api/panel/crag-subscription/recover',
       { method: 'POST', body: '{}' }
     )
-    expect(waiting).toContain('请核对原订单，或回到原 VM 槽位使用原码完成激活')
+    expect(waiting).toContain('请核对原订单。订阅使用券只在本页兑换')
     expect(waiting).not.toContain('宿主机额度已更新')
 
     const active = { state: 'active', ready: false, slot_limit: 3 }
@@ -690,7 +594,6 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(recovered).toContain('订阅状态已同步')
     expect(recovered).not.toContain('继续同步')
     expect(recovered).toContain('兑换到本机')
-    expect(activateVmCragLicense).not.toHaveBeenCalled()
     expect(state.setQueryData).toHaveBeenLastCalledWith(
       ['crag-host-subscription'],
       active
@@ -757,7 +660,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(history).toContain('¥6')
     expect(history).not.toContain('9,999')
     expect(history).toContain('领取兑换码')
-    expect(history).toContain('自动给目标槽绑定应用锁')
+    expect(history).toContain('订阅使用券')
   })
 
   it('uses commerce for fixed plans when custom is disabled and keeps renewal metadata independent', () => {
@@ -935,7 +838,7 @@ describe('CRAG buyer presentation and activation wire', () => {
         new ApiError('opaque failure', 503, code)
       )
       render()
-      click('创建订单')
+      click('支付宝')
       await settle()
       const html = render()
       expect(html).toContain(message)

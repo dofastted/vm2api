@@ -7,7 +7,6 @@ import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   ApiError,
-  activateVmCragLicense,
   isApiError,
   patchVm,
   startVmKernelSwitch,
@@ -176,9 +175,7 @@ function SlotKernelSwitch({
   const qc = useQueryClient()
   const [pending, setPending] = useState<SlotKernelTarget | null>(null)
   const [licenseOpen, setLicenseOpen] = useState(false)
-  const [switchAfterActivation, setSwitchAfterActivation] = useState(false)
   const [checkingLicense, setCheckingLicense] = useState(false)
-  const [registrationCode, setRegistrationCode] = useState('')
   const handledObservation = useRef('')
   const switchToastId = `vm-kernel-switch-${id}`
   const kvm = ['kvm', 'qemu', 'libvirt'].includes(
@@ -214,7 +211,6 @@ function SlotKernelSwitch({
           description: undefined,
         })
         setLicenseOpen(true)
-        setSwitchAfterActivation(true)
         void qc.invalidateQueries({
           queryKey: vmCragLicenseQueryOptions(id).queryKey,
         })
@@ -292,30 +288,7 @@ function SlotKernelSwitch({
     ...vmCragLicenseQueryOptions(id),
     enabled: !blocked,
   })
-  const activateLicense = useMutation({
-    // Keep the registration code out of cached mutation variables.
-    mutationFn: () => activateVmCragLicense(id, registrationCode.trim()),
-    onSuccess: async (data) => {
-      qc.setQueryData(vmCragLicenseQueryOptions(id).queryKey, data)
-      setRegistrationCode('')
-      if (!data.license.valid || data.license.status !== 'valid') {
-        toast.error('授权未生效，请检查下方状态并联系授权方。')
-        return
-      }
-      toast.success('CRAG 授权已激活')
-      if (switchAfterActivation && (!onV2 || canRetry)) setPending('v2')
-      await Promise.all([
-        qc.invalidateQueries({
-          queryKey: cragHostStatusQueryOptions().queryKey,
-        }),
-        qc.invalidateQueries({ queryKey: vmQueryOptions(id).queryKey }),
-        qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
-      ])
-    },
-  })
-
   async function requestV2() {
-    setSwitchAfterActivation(true)
     setCheckingLicense(true)
     try {
       const data = await qc.fetchQuery(vmCragLicenseQueryOptions(id))
@@ -330,6 +303,7 @@ function SlotKernelSwitch({
       setCheckingLicense(false)
     }
   }
+
   const switchKernel = useMutation({
     mutationFn: async (
       next: SlotKernelTarget
@@ -413,7 +387,6 @@ function SlotKernelSwitch({
   const busy =
     checkingLicense ||
     switching ||
-    activateLicense.isPending ||
     checkingJob ||
     needsCheck ||
     (remote && jobQuery.isFetching)
@@ -448,12 +421,7 @@ function SlotKernelSwitch({
             disabled={busy}
             aria-expanded={licenseOpen}
             aria-controls={`crag-license-${id}`}
-            onClick={() => {
-              setSwitchAfterActivation(false)
-              setLicenseOpen(!licenseOpen)
-              setRegistrationCode('')
-              activateLicense.reset()
-            }}
+            onClick={() => setLicenseOpen(!licenseOpen)}
           >
             CRAG 授权 / 续期
           </Button>
@@ -534,23 +502,10 @@ function SlotKernelSwitch({
               data={licenseQuery.data}
               loading={licenseQuery.isFetching}
               loadError={licenseQuery.error}
-              activationError={activateLicense.error}
-              registrationCode={registrationCode}
-              activating={activateLicense.isPending}
-              onChange={(code) => {
-                setRegistrationCode(code)
-                activateLicense.reset()
-              }}
               onRefresh={() => {
                 void licenseQuery.refetch()
               }}
-              onActivate={() => activateLicense.mutate()}
-              onClose={() => {
-                setLicenseOpen(false)
-                setRegistrationCode('')
-                setSwitchAfterActivation(false)
-                activateLicense.reset()
-              }}
+              onClose={() => setLicenseOpen(false)}
             />
           ) : licenseQuery.isError ? (
             <p role='alert' className='text-sm text-destructive'>

@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
-  useMutation,
   useQuery,
   useQueryClient,
   type UseQueryResult,
@@ -8,34 +7,21 @@ import {
 import { Link } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
 import type { StatusTone } from '@/types/status'
-import {
-  activateVmCragLicense,
-  api,
-  cragDeviceApi,
-  isApiError,
-} from '@/lib/api'
+import { api, cragDeviceApi, isApiError } from '@/lib/api'
 import { randomUUID } from '@/lib/random-uuid'
-import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { PageHeader } from '@/components/page-header'
 import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
-import { CragActivationForm } from '@/features/vm/crag-license-editor'
-import { cragHostStatusLabels } from '@/features/vm/crag-runtime-counts'
+import {
+  CragRuntimeCounts,
+  cragHostStatusLabels,
+} from '@/features/vm/crag-runtime-counts'
 import {
   cragHostStatusQueryOptions,
-  vmCragLicenseQueryOptions,
-  vmsListQueryOptions,
   type CragHostStatus,
 } from '@/features/vm/queries'
 import {
@@ -164,7 +150,7 @@ function SubscriptionTime({ seconds }: { seconds: number }) {
 function hostRedemptionError(error: unknown) {
   switch (isApiError(error) ? error.code : undefined) {
     case 'crag_subscription_invalid_request':
-      return '请输入有效的宿主机兑换码'
+      return '请输入有效的订阅使用券'
     case 'redeem_unavailable':
       return '此码不可用于本机订阅或已失效'
     case 'host_redeem_conflict':
@@ -221,13 +207,7 @@ function HostSummary({
         ))}
       </dl>
       <div className='flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t px-4 py-2 text-sm'>
-        <p className='text-muted-foreground'>
-          {runtime?.host_over_limit === true
-            ? '已暂停宿主机 CRAG 调用：运行数超过订阅额度。'
-            : runtime
-              ? `可接请求的 CRAG 内核 ${runtime.ready_vms} 台${runtime.unknown_vms > 0 ? `，另有 ${runtime.unknown_vms} 台状态未知` : ''}`
-              : '运行状态待核对。'}
-        </p>
+        <CragRuntimeCounts status={status} />
         <Button size='sm' variant='link' className='px-0' asChild>
           <Link to='/wrap'>前往内核页切换 VM 内核</Link>
         </Button>
@@ -423,7 +403,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
       ) : null}
       <p className='text-sm text-muted-foreground empty:sr-only'>
         {syncPending
-          ? '如果继续同步后仍在等待，请核对原订单，或回到原 VM 槽位使用原码完成激活。'
+          ? '如果继续同步后仍在等待，请核对原订单。订阅使用券只在本页兑换。'
           : host.isError || status?.state === 'unavailable'
             ? '无法确认本机权益，请刷新后重试。'
             : probeFailed
@@ -445,7 +425,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
       ) : null}
       {!syncPending ? (
         <form
-          aria-label='兑换宿主机额度'
+          aria-label='兑换订阅使用券'
           className='max-w-xl space-y-2 border-t pt-3'
           onSubmit={(event) => {
             event.preventDefault()
@@ -453,7 +433,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
           }}
         >
           <label className='grid gap-1 text-sm'>
-            宿主机兑换码
+            订阅使用券
             <Input
               type='password'
               autoComplete='off'
@@ -563,102 +543,6 @@ export function CragDevicePurchasePage() {
   )
 }
 
-function ManualCragActivation({
-  initialCode,
-  onClose,
-}: {
-  initialCode: string
-  onClose: () => void
-}) {
-  const qc = useQueryClient()
-  const vms = useQuery(vmsListQueryOptions())
-  const targets = (vms.data?.items ?? []).filter(
-    (vm) => !isCodexVm(vm) && vm.node_platform !== 'darwin'
-  )
-  const [code, setCode] = useState(initialCode)
-  const [targetId, setTargetId] = useState('')
-  const [result, setResult] = useState<boolean>()
-  const targetAvailable =
-    !vms.isError && targets.some((vm) => vm.id === targetId)
-  const activation = useMutation({
-    // Keep codes out of cached mutation variables.
-    mutationFn: () => activateVmCragLicense(targetId, code.trim()),
-    onSuccess: async (data) => {
-      qc.setQueryData(vmCragLicenseQueryOptions(targetId).queryKey, data)
-      if (data.license.valid) setCode('')
-      setResult(data.license.valid)
-      await qc.invalidateQueries({
-        queryKey: cragHostStatusQueryOptions().queryKey,
-      })
-    },
-  })
-  return (
-    <Dialog
-      open
-      onOpenChange={(open) => {
-        if (!open && !activation.isPending) onClose()
-      }}
-    >
-      <DialogContent className='max-h-[90dvh] overflow-y-auto'>
-        <DialogHeader>
-          <DialogTitle>手动激活 CRAG</DialogTitle>
-          <DialogDescription>
-            选择目标槽位，粘贴激活码。激活不会安装或启动内核。
-          </DialogDescription>
-        </DialogHeader>
-        <label className='grid gap-1 text-sm'>
-          目标槽位
-          <select
-            className='h-9 w-full min-w-0 rounded-md border bg-background px-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
-            value={targetAvailable ? targetId : ''}
-            disabled={activation.isPending || vms.isError || !targets.length}
-            onChange={(event) => {
-              setTargetId(event.target.value)
-              setResult(undefined)
-              activation.reset()
-            }}
-          >
-            <option value=''>请选择槽位</option>
-            {targets.map((vm) => (
-              <option key={vm.id} value={vm.id}>
-                {vm.name ? `${vm.name} (${vm.id})` : vm.id}
-              </option>
-            ))}
-          </select>
-        </label>
-        {vms.isError ? (
-          <p role='alert' className='text-sm text-destructive'>
-            无法读取槽位，请关闭后重试。
-          </p>
-        ) : !targets.length ? (
-          <p role='status' className='text-sm text-muted-foreground'>
-            {vms.isFetching ? '正在读取槽位…' : '当前没有可选槽位。'}
-          </p>
-        ) : null}
-        <CragActivationForm
-          code={code}
-          disabled={!targetAvailable}
-          activating={activation.isPending}
-          error={activation.error}
-          onChange={(value) => {
-            setCode(value)
-            setResult(undefined)
-            activation.reset()
-          }}
-          onActivate={() => activation.mutate()}
-        />
-        {result !== undefined ? (
-          <p role='status' className='text-sm'>
-            {result
-              ? `槽位 ${targetId} 已激活。`
-              : '授权未生效，请在目标槽检查授权状态。'}
-          </p>
-        ) : null}
-      </DialogContent>
-    </Dialog>
-  )
-}
-
 function ShopOrders({
   device = false,
   isAdmin,
@@ -698,7 +582,6 @@ function ShopOrders({
   const intent = useRef<Intent | null>(null)
   const operating = useRef(false)
   const [targetVmId, setTargetVmId] = useState('')
-  const [manualCode, setManualCode] = useState<string>()
   const targets = useQuery({
     queryKey: ['panel', 'crag-shop', 'activation-targets', owner],
     queryFn: ({ signal }) =>
@@ -1190,22 +1073,11 @@ function ShopOrders({
               <Link to='/crag-purchase'>免登录购买到本机</Link>
             )}
           </Button>
-          {isAdmin ? (
-            <Button size='sm' onClick={() => setManualCode('')}>
-              手动激活
-            </Button>
-          ) : null}
         </div>
       }
     >
       <div className='grid min-w-0 gap-6'>
         {isAdmin ? <HostSummary status={host} plans={allPlans} /> : null}
-        {isAdmin && manualCode !== undefined ? (
-          <ManualCragActivation
-            initialCode={manualCode}
-            onClose={() => setManualCode(undefined)}
-          />
-        ) : null}
         {problem ? (
           <p role='alert' className='text-sm text-destructive'>
             {problem}
@@ -1582,22 +1454,12 @@ function ShopOrders({
                                 await navigator.clipboard.writeText(
                                   claim.redemption_code
                                 )
-                                setNotice('已复制兑换码。')
-                              }, '无法访问剪贴板，请手动选中兑换码复制。')
+                                setNotice('已复制订阅使用券。')
+                              }, '无法访问剪贴板，请手动选中订阅使用券复制。')
                             }
                           >
-                            复制兑换码
+                            复制订阅使用券
                           </Button>
-                          {isAdmin ? (
-                            <Button
-                              size='sm'
-                              onClick={() =>
-                                setManualCode(claim.redemption_code)
-                              }
-                            >
-                              使用此码激活
-                            </Button>
-                          ) : null}
                         </div>
                       ) : null}
                       {order.status === 'paid' ? (
@@ -1652,7 +1514,7 @@ function ShopOrders({
                             )
                           ) : (
                             <>
-                              <p className='font-medium'>怎样使用兑换码</p>
+                              <p className='font-medium'>怎样使用订阅使用券</p>
                               <ol className='list-decimal space-y-1 ps-5 text-muted-foreground'>
                                 <li>
                                   点击「领取兑换码」，复制以{' '}
@@ -1661,13 +1523,12 @@ function ShopOrders({
                                 </li>
                                 <li>
                                   {isAdmin
-                                    ? '点击「使用此码激活」，核对宿主机与目标槽位后兑换。也可以在订阅页顶部手动输入兑换码。'
-                                    : '请将码私下交给目标宿主机的管理员，在该机面板的「订阅 CRAG → 手动激活」中兑换。'}
+                                    ? '在本页「订阅使用券」输入框兑换到本机。兑换只增加宿主机额度，不绑定、不启动 VM。'
+                                    : '请将券私下交给目标宿主机的管理员，在该机面板的订阅页用「订阅使用券」兑换。'}
                                 </li>
                                 <li>
-                                  激活后会自动给目标槽绑定应用锁。在内核页找到目标
-                                  VM，将「安装内核」设为
-                                  CRAG，再确认安装并重启。
+                                  兑换后到内核页，为目标 VM 管理 CRAG
+                                  授权并切换内核。
                                 </li>
                               </ol>
                               <p className='text-xs text-muted-foreground'>
