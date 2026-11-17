@@ -546,14 +546,17 @@ function responsesToClaude(body, opts) {
         : responsesObjectSchema(definition.parameters ?? { type: 'object' })
     responseTools.set(name, { type: tool.type, name: definition.name, namespace: scope })
     tools.push(
-      withCacheControl(
-        {
-          name,
-          description,
-          input_schema: schema,
-          ...(typeof definition.strict === 'boolean' ? { strict: definition.strict } : {}),
-        },
-        definition.cache_control ? definition : tool,
+      withEagerInputStreaming(
+        withCacheControl(
+          {
+            name,
+            description,
+            input_schema: schema,
+            ...(typeof definition.strict === 'boolean' ? { strict: definition.strict } : {}),
+          },
+          definition.cache_control ? definition : tool,
+        ),
+        tool,
       ),
     )
     return name
