@@ -1,7 +1,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { hostProxyUrlForVm, slotHost } from '../vm/slot-host.mjs'
+import { slotHost } from '../vm/slot-host.mjs'
+import { resolveSlotOAuthProxy } from '../vm/proxy-resolve.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { resolveSlotClaude } from '../vm/slot-engine.mjs'
 import { slotExec, startSlotReady } from '../vm/slot-runtime.mjs'
@@ -24,6 +25,7 @@ export async function prepareSlotOAuth({
   projectRoot = exec?.projectRoot,
   routing = {},
   timeoutMs,
+  proxyPool,
   startReady = startSlotReady,
   readHealth = rustKernelHealth,
 } = {}) {
@@ -33,7 +35,11 @@ export async function prepareSlotOAuth({
   const vm = getVm(projectRoot, exec.vmId)
   if (!vm?.id) throw fail('oauth_vm_required', 'OAuth target VM is missing')
   const host = slotHost(vm)
-  if (host.native) return { exec: { ...exec, vm }, host }
+  // A native node has no container: the helper runs on the controller, through
+  // this VM's exit as it is now. The caller's payload value is never the exit.
+  if (host.native) {
+    return { exec: { ...exec, vm }, host, controlPlane: true, proxyUrl: resolveSlotOAuthProxy(vm, proxyPool) }
+  }
   const blocked = proxyBlockedReason(vm.proxy)
   if (blocked || !hasBoundExit(vm.proxy)) {
     throw fail(blocked || 'proxy_required', 'OAuth requires the target VM bound egress')
@@ -43,9 +49,7 @@ export async function prepareSlotOAuth({
   // Legacy kernels cannot gain telemetry by restarting. Exchange through the
   // same bound exit on the controller before entering the slot startup path.
   if (health?.vm_telemetry !== true || health?.telemetry_ready !== true) {
-    const proxyUrl = hostProxyUrlForVm(vm)
-    if (proxyUrl == null) throw fail('proxy_required', 'OAuth requires the target VM bound egress')
-    return { exec, host, controlPlane: true, proxyUrl }
+    return { exec, host, controlPlane: true, proxyUrl: resolveSlotOAuthProxy(vm, proxyPool) }
   }
   const boot = await startReady(vm, projectRoot, { routing, allowMissingCredential: true, timeoutMs })
   if (!boot?.ok || boot.rust_ok === false || !boot.rust?.ok || boot.rust.skipped) {
@@ -90,16 +94,18 @@ export async function runGuestOAuthAuthService(
     projectRoot = exec?.projectRoot,
     routing,
     timeoutMs = 15000,
+    proxyPool,
     prepare = prepareSlotOAuth,
     runDocker = runSlotProcess,
     postTelemetry = postRustKernelTelemetryEvent,
     runNative,
   } = {},
 ) {
-  const context = await prepare({ exec, projectRoot, routing, timeoutMs })
+  const context = await prepare({ exec, projectRoot, routing, timeoutMs, proxyPool })
   const { host, configDir, home } = context
   exec = context.exec
-  if (host.native) return runNative(payload)
+  // Native nodes and legacy kernels both exchange on the controller, through the
+  // exit prepare resolved for this VM. Guest execution is below.
   if (context.controlPlane) return runNative({ ...payload, proxy_url: context.proxyUrl })
   const bin = host.bins.oauthAuth
   if (!bin) throw fail('oauth_auth_bin_missing', 'Target VM OAuth helper is not installed')
@@ -145,24 +151,15 @@ export async function runGuestOAuthAuthService(
   await record('start')
   try {
     const selected = resolveSlotClaude(exec.vm, routing, host)
-    let claudeVersion = payload.claude_version
-    if (selected.native) {
-      const version = await runDocker(
-        slotExecArgv(exec.vm, [selected.bin, '--version'], { user: host.execUser(exec.vm) }),
-        {
-          env: host.dockerEnv(),
-          timeoutMs: Math.min(timeoutMs, 5000),
-        },
-      )
-      claudeVersion =
-        version?.code === 0 && !version.timed_out && !version.output_limit
-          ? /^([0-9]+\.[0-9]+\.[0-9]+)(?:\s|$)/.exec(String(version.stdout || '').trim())?.[1]
-          : undefined
-      if (!claudeVersion)
-        throw fail('oauth_cli_version_unavailable', 'Cannot read the selected native Claude CLI version')
-    }
-    // Linux slots join a kin-eg-* transparent network. A proxy URL may be a
-    // controller-local forwarder and is not reachable from inside the guest.
+    // The crag v2 entrypoint is version-locked by its own path and payload ships
+    // that exact build, so the UA version comes from the entrypoint itself. Asking
+    // the CLI for it cost an exec per exchange and refused valid exchanges whenever
+    // that exec failed, for a value that was already known.
+    const claudeVersion = selected.native ? selected.version : payload.claude_version
+    // Linux slots join a kin-eg-* transparent network: the network picks the exit,
+    // so the helper gets no proxy at all. This '' is not a resolved exit and must
+    // not be replaced by one — a resolved URL may be a controller-local forwarder,
+    // unreachable from inside the guest. The env above is cleared for the same reason.
     const result = await runDocker(argv, {
       env: host.dockerEnv(),
       timeoutMs: Math.max(timeoutMs * 8, 45000),

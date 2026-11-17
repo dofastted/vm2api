@@ -9,8 +9,11 @@ test('slot CLI follows VM kernel pins, inherited routing and placement without f
   assert.deepEqual(resolveSlotClaude({}, routing, local), {
     bin: '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude',
     native: true,
+    version: '2.1.321',
   })
   assert.equal(resolveSlotClaude({}, routing, remote).bin, '/opt/kin-live/crag-v2/claude-code-2.1.321/claude')
+  // The locked version comes with the entrypoint, so no caller has to read it off the CLI.
+  assert.equal(resolveSlotClaude({}, routing, remote).version, '2.1.321')
   assert.deepEqual(resolveSlotClaude({ dataplane: 'wrap' }, routing, remote), {
     bin: '/opt/kin/cli-node',
     native: false,

@@ -45,12 +45,27 @@ worker 和 egress 二进制均为 ARM64。已有 Rust kernels、OAuth 和 CLI �
 | 该部署中的 Ubuntu amd64 Claude slot | 已在现有部署验证 |
 | 原生 ARM64 远程节点 | 未验证 |
 | Codex 模型真实请求、其他 guest 镜像 | 未验证 |
+| x86 CLI 载荷（`image-wrap-cli/cli-node`）在 qemu-user 下执行 | **不可用**，见下 |
 | 主机重启后的恢复、性能与容量 | 未验证 |
 
 这些结果只覆盖上述环境，不构成其他 ARM 主机、镜像或负载的兼容性承诺。
 **每个 Docker daemon 仅运行一个部署**：slot 使用 `kin-01` 等全局容器名称，
 即使为控制容器指定不同名称，也无法隔离 slot。已有 x86 部署的主机不要直接
 叠加此 override；迁移应先停止原控制器并保留其状态和密钥。
+
+### x86 CLI 载荷在 qemu-user 下不可执行
+
+x86 `cli-node` 经 qemu-user 执行时，Bun 的 JavaScriptCore 在 `LocalAllocator::allocateSlowCase`
+抛 `MemoryExhaustion` 断言，QEMU 收到 SIGABRT，`--version` 都打不出来。**已排除**：缺库或架构
+错配（`check-x86-deps.py` 闭包校验与 `ld-linux --list` 均通过）、宿主内存不足（该容器无
+`--memory` 限制）、大页内核（`prepare-arm64.py` 的 `page-size` 通过，页大小 4096）。由于
+`ld-linux-x86-64.so.2` 本身就是在 QEMU 下执行的 x86 ELF 且运行正常，故障特定于 JSC 预留
+大块连续虚拟地址空间（gigacage / JIT 区），不是 QEMU 执行能力问题；缓解方向是关 JIT 或限制
+gigacage，而非加内存。
+
+该路径只服务 Codex、KVM 与远程 slot（见 §Native CLI for local ARM64 Docker slots 的选择
+逻辑），均为上表未验证项，故 `test/deploy/smoke_arm64_image.py` 不执行它、只校验 ELF。要恢复
+执行须先改支持矩阵。本地 ARM64 Docker 的 Claude slot 不受影响，走原生 overlay。
 
 ## 主机要求
 

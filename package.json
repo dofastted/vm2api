@@ -31,6 +31,7 @@
     "ws": "^8.22.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.11"
+    "@biomejs/biome": "2.5.11",
+    "esbuild": "0.28.2"
   }
 }

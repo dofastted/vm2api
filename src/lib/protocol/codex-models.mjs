@@ -38,7 +38,7 @@ export const CODEX_USER_AGENT = `${CODEX_CATALOG_ORIGINATOR}/${CODEX_APP_VERSION
 export const CODEX_CATALOG_VERSION_URL = 'https://registry.npmjs.org/@openai%2fcodex/latest'
 export const CODEX_CATALOG_VERSION_TTL_MS = 6 * 60 * 60 * 1000
 export const CODEX_CATALOG_VERSION_CACHE_FILE = 'codex-catalog-client.json'
-export const CODEX_CATALOG_DEFAULT_VERSION = '0.167.1'
+export const CODEX_CATALOG_DEFAULT_VERSION = '0.169.0'
 
 const SEMVER_RE = /^\d+\.\d+\.\d+$/
 

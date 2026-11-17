@@ -5740,11 +5740,11 @@ export function createPanelHandler(ctx) {
               String(requestedType).toLowerCase() === 'setup_token' ||
               String(body.scope || '').toLowerCase() === 'inference'
             oauth = await sessionKeyToOAuth(String(sessionKey).trim(), {
-              proxyUrl,
               scope: inference ? 'inference' : 'full',
               exec: slotExec(cfg.paths.project, existing),
               projectRoot: cfg.paths.project,
               routing: ctx.routingConfig,
+              proxyPool,
             })
             oauthFromVm = true
             if (inference) {
@@ -5920,7 +5920,8 @@ export function createPanelHandler(ctx) {
             const oauth = await exchangeCodexAuthCode({
               sessionId: body.session_id || body.sessionId,
               code: body.code || body.auth_code || body.callback || body.callback_url,
-              proxyUrl: slotProxy.proxyUrl,
+              vm: existing,
+              proxyPool,
               vmId: id,
             })
             const committed = await commitImportedCodexVm({
@@ -5965,6 +5966,7 @@ export function createPanelHandler(ctx) {
               exec: slotExec(cfg.paths.project, existing),
               projectRoot: cfg.paths.project,
               routing: ctx.routingConfig,
+              proxyPool,
             })
           }
           if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
