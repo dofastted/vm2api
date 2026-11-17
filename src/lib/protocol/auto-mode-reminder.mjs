@@ -33,7 +33,7 @@ function collapseDuplicateCanonical(text) {
  * User reminders become one official reminder. Other text stays.
  */
 export function repairAutoModeReminderText(text, role = 'user') {
-  if (typeof text !== 'string' || (!text.includes('Auto mode') && !text.includes('## Auto Mode Active'))) return text
+  if (!mayRepairAutoModeReminder(text)) return text
   const replaced = text.replace(REMINDER_BLOCK, (full, inner) => {
     if (!isBadInner(inner)) return full
     return role === 'assistant' ? '' : CANONICAL
@@ -45,6 +45,10 @@ export function repairAutoModeReminderText(text, role = 'user') {
     if (!rest) return ''
   }
   return out
+}
+
+export function mayRepairAutoModeReminder(text) {
+  return typeof text === 'string' && (text.includes('Auto mode') || text.includes('## Auto Mode Active'))
 }
 
 function repairBlocks(blocks, role) {

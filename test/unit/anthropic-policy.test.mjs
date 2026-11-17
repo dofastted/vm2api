@@ -779,6 +779,35 @@ test('official Claude Code tool names stay, stray mcp_ names do not', () => {
   assert.equal(result.reverse.Bash, undefined)
 })
 
+test('native client scrub shares untouched blocks without modifying tool history', () => {
+  const text = { type: 'text', text: 'retain content' }
+  const schema = { type: 'object' }
+  const body = {
+    tools: [{ name: 'lookup', input_schema: schema }],
+    messages: [
+      { role: 'user', content: [text] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_pair', name: 'lookup', input: {} }] },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_pair',
+            content: [{ type: 'tool_reference', tool_name: 'lookup' }],
+          },
+        ],
+      },
+    ],
+  }
+  const original = structuredClone(body)
+  const optimized = scrubUpstreamClientBody(body, { shareUnchanged: true })
+  assert.deepEqual(optimized, scrubUpstreamClientBody(original))
+  assert.deepEqual(body, original)
+  assert.equal(optimized.body.messages[0].content[0], text)
+  assert.equal(optimized.body.tools[0].input_schema, schema)
+  assert.deepEqual(optimized.reverse, { mcp__lookup: 'lookup' })
+})
+
 test('#953 third-party scrub rewrites tool_reference inside tool_result history', () => {
   const result = scrubUpstreamClientBody({
     tools: [

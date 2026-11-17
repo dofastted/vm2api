@@ -1,4 +1,4 @@
-import { repairAutoModeReminders } from './auto-mode-reminder.mjs'
+import { mayRepairAutoModeReminder, repairAutoModeReminders } from './auto-mode-reminder.mjs'
 import { defaultMaxTokensForModel } from './model-policy.mjs'
 
 /**
@@ -117,6 +117,21 @@ export function applyStructuredOutput(out, source = {}) {
 
 /** OpenAI / client leftovers Anthropic TextBlock rejects as Extra inputs. */
 const DROP_CONTENT_KEYS = new Set(['annotations'])
+const SMALL_TEXT_TURN_CHARS = 4096
+
+export function isSmallTextTurn(body) {
+  if (body?.messages?.length !== 1 || body.tools?.length) return false
+  const message = body.messages[0]
+  if (message?.role !== 'user') return false
+  const content = message.content
+  const text =
+    typeof content === 'string'
+      ? content
+      : Array.isArray(content) && content.length === 1 && content[0]?.type === 'text'
+        ? content[0].text
+        : null
+  return typeof text === 'string' && text.length <= SMALL_TEXT_TURN_CHARS
+}
 
 /** Drop content-block fields the public Messages schema rejects (annotations, …). */
 export function stripIllegalContentFields(content) {
@@ -193,7 +208,38 @@ export function canonicalizeClaudeMessagesShape(body, { preserveContentShape = f
   return out
 }
 
-export function sanitizeAnthropicBody(body, { preserveContentShape = false, onSystemBlock } = {}) {
+function reusableContent(content) {
+  for (const block of content) {
+    if (!block || typeof block !== 'object' || typeof block.type !== 'string' || !block.type) return false
+    for (const key of DROP_CONTENT_KEYS) {
+      if (Object.hasOwn(block, key)) return false
+    }
+    if (
+      block.type === 'text' &&
+      (typeof block.text !== 'string' || !block.text.trim() || mayRepairAutoModeReminder(block.text))
+    )
+      return false
+    if (block.type === 'tool_result' && Array.isArray(block.content) && !reusableContent(block.content)) return false
+  }
+  return true
+}
+
+function reusableHistory(messages) {
+  if (!Array.isArray(messages) || !messages.length) return false
+  let previousRole = 'assistant'
+  for (const message of messages) {
+    const role = message?.role
+    if ((role !== 'user' && role !== 'assistant') || role === previousRole) return false
+    if (!Array.isArray(message.content) || !message.content.length || !reusableContent(message.content)) return false
+    previousRole = role
+  }
+  return true
+}
+
+export function sanitizeAnthropicBody(
+  body,
+  { preserveContentShape = false, onSystemBlock, reuseCanonicalHistory = false } = {},
+) {
   if (!body || typeof body !== 'object') return body
 
   const out = copyOfficialAnthropicFields(body)
@@ -214,14 +260,23 @@ export function sanitizeAnthropicBody(body, { preserveContentShape = false, onSy
       .filter(Boolean)
   }
 
-  normalizeAnthropicMessages(out)
-  stripIllegalBodyContentFields(out)
+  const reuseHistory = reuseCanonicalHistory && !preserveContentShape && reusableHistory(out.messages)
+  if (reuseHistory) {
+    if (Array.isArray(out.system)) out.system = stripIllegalContentFields(out.system)
+  } else {
+    if (reuseCanonicalHistory && Array.isArray(out.messages)) {
+      out.messages = out.messages.map((message) => (message && typeof message === 'object' ? { ...message } : message))
+    }
+    normalizeAnthropicMessages(out)
+    stripIllegalBodyContentFields(out)
+  }
 
   if (Array.isArray(out.tools) && out.tools.length === 0) delete out.tools
   // Do not overwrite caller max_tokens (thinking budget). Only fill if missing.
   if (!out.max_tokens) out.max_tokens = defaultMaxTokensForModel(out.model)
   normalizeStop(out)
-  const normalized = canonicalizeClaudeMessagesShape(out, { preserveContentShape })
+  const normalized = reuseHistory ? out : canonicalizeClaudeMessagesShape(out, { preserveContentShape })
+  if (reuseHistory && out.system != null) out.system = promoteSystemToBlocks(out.system)
   // A nonempty source string becomes the first block; lifted history only appends.
   if (!preserveContentShape && onSystemBlock && typeof body.system === 'string') {
     onSystemBlock(normalized.system?.[0], 0)

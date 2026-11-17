@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 修复 KVM 来宾内核退出时误删 `/run/kin-guest/slot.env`、导致已校验的 CRAG 许可同步返回 403 的问题。已有来宾需更新 `kin-kernel.service` 并从原 seed 重新运行 `kin-guest-setup.service` 后再同步；无需重置虚拟机或重新签发许可。
+
 ## 1.4.132 — 2026-11-17 · 已安装 CRAG 槽更新
 
 - 宿主订阅满额时，正在运行的原 CRAG 槽仍可更新，不因运行额度拒绝。

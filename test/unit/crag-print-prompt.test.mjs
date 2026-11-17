@@ -210,6 +210,58 @@ test('official passthrough does not append the caller system', () => {
   assert.equal(out.crag_prompt, undefined)
 })
 
+test('native CRAG normalizes inline image aliases without moving content or tool results', () => {
+  const cache = { type: 'ephemeral' }
+  const alias = { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAB' }, cache_control: cache }
+  const image = {
+    type: 'image',
+    source: { type: 'base64', media_type: 'image/png', data: 'AAAB' },
+    cache_control: cache,
+  }
+  const before = { type: 'text', text: 'before' }
+  const after = { type: 'text', text: 'after' }
+  const result = { type: 'tool_result', tool_use_id: 'toolu_example', is_error: true, content: [before, alias, after] }
+  const remote = { type: 'image_url', image_url: 'https://example.invalid/image.png' }
+  const messages = [
+    { role: 'user', content: [before, alias, after, remote] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: result.tool_use_id, name: 'lookup', input: {} }] },
+    { role: 'user', content: [result, after] },
+  ]
+  const expected = [
+    { ...messages[0], content: [before, image, after, remote] },
+    messages[1],
+    { ...messages[2], content: [{ ...result, content: [before, image, after] }, after] },
+  ]
+  const body = { messages }
+  const original = structuredClone(body)
+  const options = { capabilities: ['prompt_append', 'generation_controls_v3'] }
+  assert.deepEqual(prepareCragPrintBody(body, options).messages, expected)
+  assert.deepEqual(prepareCragPrintBody({ messages: expected }, options).messages, expected)
+  assert.deepEqual(prepareCragPrintBody(body, { capabilities: ['prompt_append'] }).messages, messages)
+  assert.deepEqual(body, original)
+})
+
+test('native CRAG rejects invalid or lossy inline image aliases, including in tool results', () => {
+  const options = { capabilities: ['prompt_append', 'generation_controls_v3'] }
+  for (const imageUrl of [
+    null,
+    {},
+    { url: 123 },
+    'data:image/png;base64,!!==',
+    'data:text/plain;base64,AAAB',
+    'data:image/png,AAAB',
+    { url: 'data:image/png;base64,AAAB', detail: 'high' },
+  ]) {
+    const block = { type: 'image_url', image_url: imageUrl }
+    for (const content of [[block], [{ type: 'tool_result', tool_use_id: 'toolu_example', content: [block] }]]) {
+      assert.throws(
+        () => prepareCragPrintBody({ messages: [{ role: 'user', content }] }, options),
+        (error) => error.status === 400 && error.body.error.code === 'invalid_image_url',
+      )
+    }
+  }
+})
+
 test('caller tail drops billing lines and non-text blocks', () => {
   assert.equal(
     callerSystemTail([
