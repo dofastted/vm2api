@@ -3,7 +3,7 @@
  * Derived from status / error_code / message so historical rows classify without a migration.
  */
 
-import { isUnanswerablePromptMessage } from '../core/errors.mjs'
+import { isThirdPartyClientMessage, isUnanswerablePromptMessage } from '../core/errors.mjs'
 
 export const ERROR_CLASSES = {
   auth: { id: 'auth', owner: 'client', label: '认证' },
@@ -32,6 +32,7 @@ const CODE_MAP = {
   vm_pool_unavailable: 'request',
   api_key_model_not_allowed: 'request',
   claude_code_only: 'request',
+  third_party_client: 'request',
   invalid_json: 'request',
   body_too_large: 'request',
   empty_body: 'request',
@@ -135,6 +136,7 @@ export const SLA_OK_ERROR_CODES = new Set([
   'vm_pool_unavailable',
   'api_key_model_not_allowed',
   'claude_code_only',
+  'third_party_client',
   // Pool queue full / timeout moved from 429 to 529; SLA keeps counting them as it did at 429.
   'pool_overloaded',
   'pool_wait_queue_full',
@@ -255,6 +257,9 @@ export function classifyRequestError(row = {}) {
   ) {
     id = 'refusal'
   }
+  // "Third-party apps now draw from your extra usage": the caller is not
+  // Claude Code. Older rows logged it as refusal_guard; it is a client error.
+  if (id !== 'auth' && id !== 'credential' && isThirdPartyClientMessage(row?.error_message)) id = 'request'
   if (!id) {
     if (/extra usage|entitlement|quota|5h|7d/.test(text) && (status === 429 || /quota|usage/.test(text))) id = 'quota'
     else if (/socks|proxy|cloudflare|just a moment/.test(text)) id = 'proxy'

@@ -88,6 +88,19 @@ test('streaming Usage Policy SSE error remaps to policy_blocked / refusal_guard 
   assert.equal(payload.error.details?.retryable, false)
 })
 
+test('streaming third-party extra-usage SSE error remaps to third_party_client, not a refusal', () => {
+  const msg = 'Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going.'
+  const upstream = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: msg } })
+  const remapper = createAnthropicSseErrorRemapper()
+  remapper.remapLine('event: error\n')
+  const payload = JSON.parse(remapper.remapLine(`data: ${upstream}\n`).trim().slice(5))
+  assert.equal(payload.error.type, 'invalid_request_error')
+  assert.equal(payload.error.code, 'third_party_client')
+  assert.equal(payload.error.details?.upstream_message, msg)
+  assert.equal(payload.error.details?.retryable, false)
+  assert.notEqual(payload.error.code, 'refusal_guard')
+})
+
 test('non-error SSE lines pass through the Anthropic error remapper unchanged', () => {
   const remapper = createAnthropicSseErrorRemapper()
   const line = 'data: {"type":"message_start","message":{"id":"msg_1","content":[]}}\n'

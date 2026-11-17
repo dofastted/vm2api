@@ -694,7 +694,7 @@ test('Usage Policy API Error stops the request and is cached with no expiry', ()
   }
 })
 
-test('third-party extra-usage 400 and 503 are cached refusals, not invalid requests', () => {
+test('third-party extra-usage 400 and 503 stop as third_party_client without cooldown or refusal cache', () => {
   const messages = [
     "HTTP 400: Third-party apps now draw from your extra usage, not your plan limits. We've added a $20 credit to get you started.",
     'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from your extra usage, not your plan limits."}}',
@@ -712,10 +712,11 @@ test('third-party extra-usage 400 and 503 are cached refusals, not invalid reque
         },
       })
       assert.equal(policy.action, 'stop', `${status} ${message}`)
-      assert.equal(policy.reason, 'usage_policy_refusal')
-      assert.equal(policy.rememberRefusal, true)
-      assert.equal(policy.refusalTtlMs, 0)
+      assert.equal(policy.reason, 'third_party_client')
+      assert.equal(policy.scope, 'request')
+      assert.equal(policy.rememberRefusal, undefined)
       assert.equal(policy.cooldownUntil, null)
+      assert.equal(policy.retrySameAccount, false)
       assert.equal(policy.circuit, undefined)
       assert.equal(policy.decision.origin, 'client')
       assert.equal(shouldContinue(policy), false)
