@@ -20,6 +20,15 @@ describe('Fable quota readings', () => {
     })
   })
 
+  it('shows 仅 Max on a non-Max slot when Fable only goes to Max', () => {
+    const subject = { account_tier: 'pro', fable_requires_max: true }
+    expect(fableState(subject)).toMatchObject({
+      usedPct: null,
+      tone: { text: '仅 Max' },
+    })
+    expect(fableCardInfo(subject, 4).badgeText).toBe('仅 Max')
+  })
+
   it('drops the usage-credits mark once it has expired', () => {
     const until = new Date(Date.now() - 1_000).toISOString()
     const subject = {

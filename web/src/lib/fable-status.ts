@@ -107,6 +107,13 @@ export function inventedFableWindow(subject: FableSubject): boolean {
 /** Fable 无额度时的标签：上游要求 usage credits，Fable 已暂停调度到此槽。 */
 export const FABLE_NO_CREDITS_TEXT = '无额度'
 
+/** 开了「Fable 只派 Max」且本槽不是 Max。 */
+export const FABLE_MAX_ONLY_TEXT = '仅 Max'
+
+function fableMaxOnly(subject: FableSubject): boolean {
+  return subject.fable_requires_max === true
+}
+
 /**
  * 上游对 Fable 回了「Usage credits are required」，网关已把 Fable 暂停调度到
  * 此槽（`fable_credits_required.until` 前）。这时不能画「未探测」或旧百分比。
@@ -147,6 +154,7 @@ export function fableWeeklyFull(subject: FableSubject): boolean {
 /** 对齐 `fableProbeLabel`。 */
 export function fableProbeLabel(subject: FableSubject): string {
   const fb = subject.fable as Record<string, unknown> | undefined
+  if (fableMaxOnly(subject)) return FABLE_MAX_ONLY_TEXT
   if (fablePlanDenied(fb)) return '无 Fable 权限'
   if (fableCreditsRequired(subject)) return FABLE_NO_CREDITS_TEXT
   if (!fb) return '未探测'
@@ -170,6 +178,12 @@ export function fableState(subject: FableSubject): {
   const fb = subject.fable as Record<string, unknown> | undefined
   if (fb?.banned)
     return { usedPct: null, tone: { key: 'bad', cls: 'bad', text: '拒' } }
+  if (fableMaxOnly(subject)) {
+    return {
+      usedPct: null,
+      tone: { key: 'none', cls: 'none', text: FABLE_MAX_ONLY_TEXT },
+    }
+  }
   if (fableCreditsRequired(subject)) {
     return {
       usedPct: null,
@@ -366,15 +380,19 @@ export function fableCardInfo(
   if (fb?.banned) bits.unshift('账号拒')
   else if (fableWeeklyFull(subject)) bits.unshift('周额度满')
   if (reset) bits.push(fmtReset(reset))
+  const maxOnly = fableMaxOnly(subject)
   const noCredits = fableCreditsRequired(subject)
-  if (noCredits) bits.unshift('需 usage credits，已暂停 Fable 调度')
+  if (maxOnly) bits.unshift('Fable 只派 Max 账号')
+  else if (noCredits) bits.unshift('需 usage credits，已暂停 Fable 调度')
 
-  if (used != null && !noCredits) {
+  if (used != null && !noCredits && !maxOnly) {
     return { usedPct: pct(used), reset, bits, badgeText: '', badgeCls: 'ok' }
   }
   const txt = fableProbeLabel(subject)
   let badgeCls: 'ok' | 'warn' | 'bad' | 'none' = 'none'
-  if (noCredits) {
+  if (maxOnly) {
+    badgeCls = 'none'
+  } else if (noCredits) {
     badgeCls = 'bad'
   } else if (fb) {
     if (fablePlanDenied(fb) || fb.banned) {

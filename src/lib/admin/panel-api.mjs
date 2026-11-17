@@ -2171,6 +2171,8 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     rate_limit_tier: isCodex ? null : v.rate_limit_tier || null,
     usage_has_fable: isCodex ? null : q.usage_has_fable,
     fable_credits_required: isCodex ? null : q.fable_credits_required || null,
+    // pool.fable_requires_max: this slot never gets Fable because it is not Max.
+    fable_requires_max: !isCodex && extras.routingConfig?.pool?.fable_requires_max === true && tierKey !== 'max',
     availability,
     cred_status: credStatusFromAvailability(availability),
     cooldown_until: Number(restrictionUntil) > Date.now() ? Number(restrictionUntil) : null,
