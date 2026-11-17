@@ -60,6 +60,13 @@ test('a failed native handoff never manufactures a max_tokens terminal', () => {
   }
 })
 
+test('an unconfirmed cluster turn is never closed as max_tokens', () => {
+  assert.equal(
+    isRecoverableTruncation({ body: { error: { code: 'cluster_delivery_unconfirmed' } }, committed: true }),
+    false,
+  )
+})
+
 test('streaming Usage Policy SSE error remaps to policy_blocked / refusal_guard (#503)', () => {
   const msg =
     'provider error: provider error: API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing the request'

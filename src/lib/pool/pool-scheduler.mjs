@@ -52,7 +52,9 @@ import { resolveSessionSlots } from '../vm/slot-engine.mjs'
 import { SeatPlanner, rankSeatCandidates } from './seat-planner.mjs'
 import { GATE_DRAINING } from './quota-gate.mjs'
 import { activeHoursOf, evaluateActiveHours } from './active-hours.mjs'
-import { vmNodeReady } from '../cluster/placement.mjs'
+import { vmNodeDataPath } from '../cluster/placement.mjs'
+import { GATE_DIAL_TIMEOUT_MS } from '../cluster/direct-link.mjs'
+import { ErrorCode } from '../core/errors.mjs'
 import { HOST_PRESSURE_CRITICAL, HOST_PRESSURE_OK, hostMemoryLevelForVm } from '../cluster/host-memory-pressure.mjs'
 
 const WAIT_TIMEOUT_MIN_MS = 1000
@@ -451,6 +453,10 @@ function grantable(candidate) {
   return !candidate.busy || LIVE_RECHECKED_WAITS.has(candidate.waitReason)
 }
 
+function directWorkerAnswered(value) {
+  return value?.ok === true || value?.engine === 'rust' || !!value?.worker_version
+}
+
 function platformMismatch(model, vm) {
   const detected = detectInboundPlatform(model)
   if (!detected.ok) return false
@@ -642,6 +648,7 @@ export class PoolScheduler extends EventEmitter {
     const defaultPlanMs = stickyKey ? this.config.sticky_wait_timeout_ms : this.config.fallback_wait_timeout_ms
     const loopDeadline = failoverDeadline || startedAt + defaultPlanMs
     let waitStartedAt = null
+    let recoveringVm = null
     let waitCutoff = loopDeadline
     let queuedDeadline = Infinity
     const finishReserve = (selected, reservation) => ({
@@ -670,7 +677,7 @@ export class PoolScheduler extends EventEmitter {
     })
     for (;;) {
       if (signal?.aborted) throw makeAbortError()
-      const candidates = await this.eligibleCandidates({
+      let candidates = await this.eligibleCandidates({
         model,
         excluded: blocked,
         signal,
@@ -681,13 +688,27 @@ export class PoolScheduler extends EventEmitter {
         continuingVmIds: this.continuingVmIds({ stickyKey, stickyKeys }),
       })
       if (signal?.aborted) throw makeAbortError()
+      const home = this.clusterHome(candidates, { stickyKey, pinVmId, familyVmId, avoid })
+      const recovering = home?.offline ? home : null
+      if (recovering) {
+        recoveringVm = recovering
+        const queuedAt = Date.now()
+        const deadline = Math.min(waitCutoff, queuedDeadline, startedAt + defaultPlanMs)
+        const woken = allowWait && (await this.waitForClusterHome(recovering, deadline, signal))
+        queueWaitMs += Date.now() - queuedAt
+        if (!woken) return fail(ErrorCode.CLUSTER_SLOT_RECONNECTING, candidates)
+        waitStartedAt ??= queuedAt
+        waitCutoff = deadline
+        continue
+      }
       if ((failoverDeadline || waitStartedAt !== null) && Date.now() >= waitCutoff) {
         return fail('all_accounts_busy', candidates)
       }
       // A gated family home (quota, credential, excluded) is a migration
       // signal for the caller. Busy is not: it still yields a candidate.
       const familyVm = familyVmId ? String(familyVmId).trim() : ''
-      if (familyVm && !pinned && !candidates.some((candidate) => candidate.vmId === familyVm)) familyGated = true
+      if (familyVm && !pinned && !this.hasClusterCandidate(candidates, familyVm)) familyGated = true
+      candidates = this.preferClusterHome(candidates, home || recoveringVm)
       const reservable = candidates.filter((candidate) => this.isReservable(candidate))
       const available = pinned ? reservable : filterByHostMemory(reservable, boundBefore?.vmId || '')
       const preferred = avoid?.size
@@ -887,10 +908,13 @@ export class PoolScheduler extends EventEmitter {
     let seatMoved = false
     let candidates = []
     let ticket = null
+    let recoveringVm = null
+    let recoveryWaitMs = 0
     let consumed = false
     const timings = () => {
       const waitMs = Date.now() - startedAt
-      const queueWaitMs = ticket ? Math.max(0, (ticket.grantedAt || Date.now()) - ticket.enqueuedAt) : 0
+      const queueWaitMs =
+        recoveryWaitMs + (ticket ? Math.max(0, (ticket.grantedAt || Date.now()) - ticket.enqueuedAt) : 0)
       return { waitMs, queueWaitMs, schedulingMs: Math.max(0, waitMs - queueWaitMs) }
     }
     const fail = (reason) => {
@@ -948,7 +972,9 @@ export class PoolScheduler extends EventEmitter {
             continuingVmIds: this.continuingVmIds({ seatKey, stickyKey, stickyKeys }),
           })
           const home = candidates[0]
-          checkedHomeOnly = !!home && (!home.busy || stickyShouldWait(home.waitReason, home.cooldownReason))
+          checkedHomeOnly =
+            candidates.offline?.has(held.vmId) ||
+            (!!home && (!home.busy || stickyShouldWait(home.waitReason, home.cooldownReason)))
         }
         if (!checkedHomeOnly) {
           candidates = await this.eligibleCandidates({
@@ -965,11 +991,29 @@ export class PoolScheduler extends EventEmitter {
         const now = Date.now()
         // A grant can land while eligibility was being re-read.
         if (ticket?.granted) return finish(ticket.granted)
+        const home = this.clusterHome(candidates, { stickyKey, held, familyVmId, avoid })
+        const recovering = home?.offline ? home : null
+        if (recovering) {
+          recoveringVm = recovering
+          const queuedAt = Date.now()
+          const deadline = Math.min(
+            failoverDeadline,
+            ticket?.deadline ?? Infinity,
+            startedAt + this.config.sticky_wait_timeout_ms,
+          )
+          if (ticket) recoveryWaitMs += Math.max(0, queuedAt - ticket.enqueuedAt)
+          this.planner.remove(ticket)
+          ticket = null
+          const woken = allowWait && (await this.waitForClusterHome(recovering, deadline, signal))
+          recoveryWaitMs += Date.now() - queuedAt
+          if (!woken) return fail(ErrorCode.CLUSTER_SLOT_RECONNECTING)
+          continue
+        }
+        if (!checkedHomeOnly && familyVm && !this.hasClusterCandidate(candidates, familyVm)) familyGated = true
+        candidates = this.preferClusterHome(candidates, home || recoveringVm)
         if (now >= failoverDeadline || (ticket && ticket.kind !== 'seat' && now >= ticket.deadline)) {
           return fail('pool_queue_timeout')
         }
-        if (!checkedHomeOnly && familyVm && !candidates.some((candidate) => candidate.vmId === familyVm))
-          familyGated = true
         const byVm = new Map(candidates.map((candidate) => [candidate.vmId, candidate]))
         if (ticket) ticket.candidates = byVm
         // Home left the pool (circuit open, unschedulable, hard cooldown, removed).
@@ -1320,6 +1364,49 @@ export class PoolScheduler extends EventEmitter {
     })
   }
 
+  hasClusterCandidate(candidates, vmId) {
+    return candidates.offline?.has(vmId) || candidates.some((candidate) => candidate.vmId === vmId)
+  }
+
+  clusterHome(candidates, { stickyKey, pinVmId, held, familyVmId, avoid }) {
+    const sticky = stickyKey ? this.stickyRouter?.resolve?.(stickyKey) : null
+    const home = held || sticky
+    const homeId = String(pinVmId || home?.vmId || familyVmId || '').trim()
+    if (!homeId || avoid?.has(homeId)) return null
+    const entry = candidates.offline?.get(homeId)
+    if (entry && !avoid?.has(entry.accountId) && (pinVmId || !home || home.accountId === entry.accountId)) return entry
+    return candidates.find(
+      ({ vmId, accountId, dataPath }) =>
+        vmId === homeId &&
+        !avoid?.has(accountId) &&
+        (pinVmId || !home || accountId === home.accountId) &&
+        dataPath === 'direct',
+    )
+  }
+
+  preferClusterHome(candidates, home) {
+    if (!home) return candidates
+    const candidate = candidates.find(({ vmId, accountId }) => vmId === home.vmId && accountId === home.accountId)
+    if (candidate && (!candidate.busy || stickyShouldWait(candidate.waitReason, candidate.cooldownReason))) {
+      return [candidate]
+    }
+    return candidates
+  }
+
+  async waitForClusterHome({ accountId, vmId }, deadline, signal) {
+    const now = Date.now()
+    if (now >= deadline || this.queuedTotal() >= this.config.queue_max) return false
+    const result = await this.waitForCapacity({
+      accountId,
+      vmId,
+      sticky: true,
+      deadline,
+      refreshAt: Math.min(deadline, now + QUEUE_REFRESH_MS),
+      signal,
+    })
+    return result.woken
+  }
+
   /**
    * The session pin as pick() treats it: a bound home that left the pool, or
    * sits in a cooldown that must rotate, releases the pin; capacity keeps it.
@@ -1378,6 +1465,7 @@ export class PoolScheduler extends EventEmitter {
       cooldowns: { rate_limited: /** @type {number|null} */ (null), overloaded: /** @type {number|null} */ (null) },
       rejections: { quota_guard_request_too_large: 0 },
       rest_until: /** @type {number|null} */ (null),
+      offline: new Map(),
     })
     const pin = pinVmId ? String(pinVmId).trim() : ''
     const entries = []
@@ -1441,6 +1529,8 @@ export class PoolScheduler extends EventEmitter {
         } else if (kind === 'rest_period') {
           const until = Number(eligibility.until) || 0
           candidates.rest_until = candidates.rest_until == null ? until : Math.min(candidates.rest_until, until)
+        } else if (kind === 'node_offline') {
+          candidates.offline.set(vm.id, { vmId: vm.id, accountId, offline: true })
         }
         continue
       }
@@ -1471,6 +1561,7 @@ export class PoolScheduler extends EventEmitter {
         loadRatio: (inflight + this.waiterCount(accountId)) / maxConcurrency,
         lastUsedAt: this.lastUsed.get(accountId) || state?.last_used_at || 0,
         workerStatus: eligibility.workerStatus,
+        dataPath: eligibility.dataPath,
         busy: !!eligibility.busy,
         availableAt: eligibility.availableAt || null,
         waitReason: eligibility.waitReason || null,
@@ -1612,15 +1703,25 @@ export class PoolScheduler extends EventEmitter {
       const rest = evaluateActiveHours(activeHoursOf(vm), now, vm.timezone)
       if (!rest.active) return { ok: false, reason: 'rest_period', until: rest.until }
     }
+    const dataPath = vmNodeDataPath(vm)
     const workerStatus =
-      knownHealth === undefined
-        ? await this.getWorkerHealth(this.executionContext(vm, accountId), { signal, state })
-        : knownHealth
+      dataPath === 'offline'
+        ? null
+        : knownHealth === undefined
+          ? await this.getWorkerHealth(this.executionContext(vm, accountId), { signal, state, dataPath })
+          : knownHealth
     // Health probing is asynchronous. Re-read time before applying cooldown
     // and credential gates, otherwise a cooldown that expired during the hop
     // can be re-enqueued with an already-past wakeup and lose its notification.
     const eligibilityNow = Date.now()
-    const cred = evaluateCredentialEligibility({ vm, workerStatus, now: eligibilityNow })
+    const workerUnavailable =
+      (dataPath === 'direct' && !directWorkerAnswered(workerStatus)) ||
+      (dataPath === 'ssh' && workerStatus?.status === 0 && workerStatus.ok !== true)
+    const cred = evaluateCredentialEligibility({
+      vm,
+      workerStatus: workerUnavailable ? null : workerStatus,
+      now: eligibilityNow,
+    })
     if (!cred.ok) return cred
     if (isLeftoverGrantRevokeRuntime(state, vm)) {
       try {
@@ -1702,14 +1803,17 @@ export class PoolScheduler extends EventEmitter {
     }
     // A sticky preference must not bypass exhausted kernel recovery.
     if (kernelFaults.has(vm.id)) return { ok: false, reason: 'kernel_faulted' }
-    // Node offline or asleep: the relay has no link behind it, a pick would only fail. Back on reconnect.
-    if (!vmNodeReady(vm)) return { ok: false, reason: 'node_offline' }
+    const livePath = vmNodeDataPath(vm)
+    if (livePath === 'offline' || workerUnavailable || (livePath === 'direct' && dataPath !== 'direct')) {
+      if (busy && !stickyShouldWait(waitReason, state?.cooldown_reason)) return { ok: false, reason: waitReason }
+      return { ok: false, reason: 'node_offline' }
+    }
     if (rustKernelBusy(workerStatus)) {
       markWait('slot_busy')
     } else if (workerStatus && rustKernelProcessUp(workerStatus) && !rustKernelReachable(workerStatus)) {
       return { ok: false, reason: 'worker_unhealthy' }
     }
-    return { ok: true, account, workerStatus, busy, availableAt, waitReason, headroom, gateZone }
+    return { ok: true, account, workerStatus, dataPath: livePath, busy, availableAt, waitReason, headroom, gateZone }
   }
 
   executionContext(vm, accountId) {
@@ -1734,21 +1838,24 @@ export class PoolScheduler extends EventEmitter {
     }
   }
 
-  async getWorkerHealth(exec, { signal = undefined, state = null } = {}) {
+  async getWorkerHealth(exec, { signal = undefined, state = null, dataPath = vmNodeDataPath(exec.vm) } = {}) {
     if (signal?.aborted) throw makeAbortError()
-    if (typeof this.workerHealth !== 'function') return { ok: true, source: 'scheduler-no-health-provider' }
+    if (typeof this.workerHealth !== 'function') {
+      return dataPath === 'direct' ? null : { ok: true, source: 'scheduler-no-health-provider' }
+    }
     const cached = this.healthCache.get(exec.vmId)
     if (
       cached &&
+      cached.dataPath === dataPath &&
       cached.accountId === exec.accountId &&
       Number(state?.credential_generation || 0) <= cached.generation &&
       Date.now() - cached.at < this.config.worker_health_ttl_ms
     )
       return cached.value
-    const flightKey = `${exec.vmId}:${exec.accountId}`
+    const flightKey = `${exec.vmId}:${exec.accountId}:${dataPath}`
     let flight = this.healthFlights.get(flightKey)
     if (!flight) {
-      flight = this.refreshWorkerHealth(exec, state).finally(() => {
+      flight = this.refreshWorkerHealth(exec, state, dataPath).finally(() => {
         if (this.healthFlights.get(flightKey) === flight) this.healthFlights.delete(flightKey)
       })
       this.healthFlights.set(flightKey, flight)
@@ -1765,13 +1872,21 @@ export class PoolScheduler extends EventEmitter {
     })
   }
 
-  async refreshWorkerHealth(exec, state) {
+  async refreshWorkerHealth(exec, state, dataPath = vmNodeDataPath(exec.vm)) {
     const now = Date.now()
     let value
     try {
-      value = await this.workerHealth(exec, {})
+      value = await this.workerHealth(exec, dataPath === 'direct' ? { timeoutMs: GATE_DIAL_TIMEOUT_MS + 1500 } : {})
     } catch (error) {
       value = { ok: false, error: String(error.message || error) }
+    }
+    if (dataPath !== vmNodeDataPath(exec.vm)) return value
+    if (
+      (dataPath === 'direct' && !directWorkerAnswered(value)) ||
+      (dataPath === 'ssh' && value?.status === 0 && value.ok !== true)
+    ) {
+      if (this.healthCache.get(exec.vmId)?.dataPath === dataPath) this.healthCache.delete(exec.vmId)
+      return value
     }
     if (this.runtimeRepo && exec.accountId) {
       const prev = state
@@ -1819,6 +1934,7 @@ export class PoolScheduler extends EventEmitter {
     this.healthCache.set(exec.vmId, {
       at: Date.now(),
       value,
+      dataPath,
       accountId: exec.accountId,
       generation: Math.max(Number(state?.credential_generation) || 0, Number(value?.credential?.generation) || 0),
     })
@@ -1871,6 +1987,7 @@ export class PoolScheduler extends EventEmitter {
     const snapshots = await this.runtimeRepo.schedulingSnapshot(vms.map((vm) => accountIdOf(vm, this.projectRoot)))
     for (const vm of vms) {
       if (this.maintenanceStopped) return
+      if (vmNodeDataPath(vm) === 'offline') continue
       const accountId = accountIdOf(vm, this.projectRoot)
       await this.getWorkerHealth(this.executionContext(vm, accountId), { state: snapshots.get(accountId)?.state })
     }
@@ -2054,7 +2171,8 @@ export class PoolScheduler extends EventEmitter {
       return null
     const gate = evaluateSlotGate(vm)
     if (!gate.ok && gate.reason !== 'no_credential' && !(pinned && gate.reason === 'vm_unschedulable')) return null
-    if (!slotHasBoundProxy(vm) || kernelFaults.has(vm.id) || !vmNodeReady(vm)) return null
+    const dataPath = vmNodeDataPath(vm)
+    if (!slotHasBoundProxy(vm) || kernelFaults.has(vm.id) || dataPath === 'offline') return null
     const proxySync = evaluateProxySync({
       vm,
       workerProxyEndpoint: readWorkerProxyEndpoint(this.projectRoot, vm.id),
@@ -2069,12 +2187,14 @@ export class PoolScheduler extends EventEmitter {
     if (
       typeof this.workerHealth === 'function' &&
       (!cached ||
+        cached.dataPath !== dataPath ||
         cached.accountId !== candidate.accountId ||
         now - cached.at >= this.config.worker_health_ttl_ms ||
         Number(state?.credential_generation || 0) > cached.generation)
     )
       return null
     const health = cached?.value || candidate.workerStatus
+    if (dataPath === 'direct' && !directWorkerAnswered(health)) return null
     if (!evaluateCredentialEligibility({ vm, workerStatus: health, now }).ok) return null
     if (!rustKernelBusy(health) && rustKernelProcessUp(health) && !rustKernelReachable(health)) return null
     state = viewRuntimeWithoutLeftoverRevoke(state, vm)

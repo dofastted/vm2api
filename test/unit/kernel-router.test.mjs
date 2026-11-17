@@ -526,6 +526,38 @@ linuxTest('transport and credential retries preserve the readiness-gated CRAG en
   }
 })
 
+for (const mode of ['json', 'stream']) {
+  unixTest(`cluster ${mode} inference is not replayed after a kernel disconnect`, async (t) => {
+    const previous = process.env.KIN_KERNEL_BIN
+    process.env.KIN_KERNEL_BIN = '/bin/true'
+    t.after(() => {
+      if (previous == null) delete process.env.KIN_KERNEL_BIN
+      else process.env.KIN_KERNEL_BIN = previous
+    })
+    let posts = 0
+    const fx = await kernelFixture(async (req, res) => {
+      await readPostedEnvelope(req)
+      posts++
+      res.destroy()
+    })
+    t.after(() => fx.close())
+    fx.exec.vm.node_id = 'cluster-node'
+    const dispatch = mode === 'stream' ? dispatchStreamInference : dispatchCallInference
+    const result = await dispatch({
+      exec: fx.exec,
+      body: { model: 'claude-test', messages: [{ role: 'user', content: 'Hello' }] },
+      routing: { inference: { engine: 'rust' } },
+      ensureRust: async () => ({ ok: true, health: { ok: true, engine: 'rust', ready_slots: 1 } }),
+      timeoutMs: 2000,
+    })
+    assert.equal(result.clusterDeliveryUnconfirmed, true)
+    assert.equal(result.status, 502)
+    assert.equal(result.body.error.code, 'cluster_delivery_unconfirmed')
+    assert.equal(result.rust_transport_retried, undefined)
+    assert.equal(posts, 1)
+  })
+}
+
 for (const phase of ['transport retry', 'credential refresh', 'credential retry']) {
   linuxTest(`CRAG rechecks admission before ${phase}`, async (t) => {
     const previous = process.env.KIN_KERNEL_BIN

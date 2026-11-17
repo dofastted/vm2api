@@ -97,11 +97,9 @@ export class SocketRelay {
     local.on('error', () => {})
     if (this.dialDirect) {
       const direct = await this.dialDirect().catch(() => null)
-      if (direct) {
-        this._pipeDirect(local, direct)
-        return
-      }
+      if (direct && (await this._pipeDirect(local, direct))) return
     }
+    if (local.destroyed) return
     const client = this.getClient()
     if (!client) {
       local.destroy()
@@ -130,26 +128,33 @@ export class SocketRelay {
   }
 
   /**
-   * The request body goes out at once (the gate buffers it behind the preface);
-   * the reply is piped back only after the gate's OK. A refusal at that point
-   * (missing slot socket) drops the local connection, like a refused streamlocal.
+   * A rejected preface is safe to fall back from: no request bytes have crossed the gate.
    */
-  _pipeDirect(local, { sock, ready }) {
+  async _pipeDirect(local, { sock, ready }) {
     if (local.destroyed) {
       sock.destroy()
-      return
+      return true
     }
+    try {
+      await ready
+    } catch {
+      sock.destroy()
+      return false
+    }
+    if (local.destroyed) {
+      sock.destroy()
+      return true
+    }
+    if (sock.destroyed) return false
+    local.once('close', () => sock.destroy())
     sock.on('error', () => local.destroy())
-    local.on('close', () => sock.destroy())
+    sock.once('close', () => {
+      if (!sock.readableEnded) local.destroy()
+    })
     // pipe() forwards each half-close as end(); see the half-open note in _listen.
     local.pipe(sock)
-    ready.then(
-      () => {
-        sock.pipe(local)
-        sock.resume()
-      },
-      () => local.destroy(),
-    )
+    sock.pipe(local)
+    return true
   }
 
   async stop() {

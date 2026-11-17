@@ -168,7 +168,9 @@ function linkCheck(status, internal) {
   if (!link) return check('node_link', '节点 SSH 链路', 'error', 'node_not_found', '槽位所在节点不存在')
   if (link.state === 'ready') return check('node_link', '节点 SSH 链路', 'ok', null, '已连接')
   const why = internal && link.error?.message ? `：${redactSecrets(link.error.message)}` : ''
-  return check('node_link', '节点 SSH 链路', 'error', 'node_link_down', `节点未连接（${link.state}）${why}`, {
+  const direct = status.data_path === 'direct'
+  const message = direct ? 'SSH 未连接；直连通道可达' : `节点未连接（${link.state}）`
+  return check('node_link', '节点 SSH 链路', direct ? 'warn' : 'error', 'node_link_down', `${message}${why}`, {
     state: link.state,
     error_code: link.error?.code || null,
   })
@@ -188,7 +190,7 @@ function relayCheck(status, internal) {
   return check('relay', '集群桥服务', 'error', 'relay_down', `未在监听：${dead.join('、')}`, detail)
 }
 
-async function egressCheck(vm, projectRoot, probes) {
+async function egressCheck(vm, projectRoot, probes, { sshUnavailable = false } = {}) {
   const label = '出口代理 / 出口桥'
   const proxy = vm.proxy
   if (!hasBoundExit(proxy)) return check('egress', label, 'error', 'proxy_required', '未绑定出口代理')
@@ -196,6 +198,7 @@ async function egressCheck(vm, projectRoot, probes) {
   if (blocked) return check('egress', label, 'error', 'proxy_blocked', `出口被策略禁用：${blocked}`)
   const local = isLocalEgressProxy(proxy)
   if (vmNodeId(vm)) {
+    if (sshUnavailable) return check('egress', label, 'warn', 'egress_unverified', 'SSH 未连接，无法检查节点出口')
     if (local) return check('egress', label, 'ok', null, '节点本地出口')
     const eg = await probes.remoteEgress(vm)
     if (eg.running) return check('egress', label, 'ok', null, `节点出口容器运行中（${proxy.id}）`)
@@ -370,13 +373,17 @@ export async function diagnoseSlotServices(
   const nodeId = vmNodeId(vm)
   const hasCredential = vmHasSchedulableCredential(vm, projectRoot)
   const checks = [recordCheck(vm), credentialCheck(vm, projectRoot)]
+  let sshUnavailable = false
   if (nodeId) {
     const status = p.cluster()?.slotBridgeStatus(nodeId, vm.id) || null
+    sshUnavailable = status?.data_path === 'direct'
     checks.push(linkCheck(status, internal), relayCheck(status, internal))
   }
   checks.push(
-    await guarded('egress', '出口代理 / 出口桥', internal, () => egressCheck(vm, projectRoot, p)),
-    await guarded('container', '槽位容器', internal, () => containerCheck(vm, p, internal)),
+    await guarded('egress', '出口代理 / 出口桥', internal, () => egressCheck(vm, projectRoot, p, { sshUnavailable })),
+    sshUnavailable
+      ? check('container', '槽位容器', 'warn', 'container_unverified', 'SSH 未连接，无法检查容器状态')
+      : await guarded('container', '槽位容器', internal, () => containerCheck(vm, p, internal)),
     await guarded('kernel', '推理内核', internal, () =>
       kernelCheck(vm, projectRoot, engine, hasCredential, p, internal),
     ),

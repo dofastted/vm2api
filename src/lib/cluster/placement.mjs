@@ -5,9 +5,9 @@
  * runtime (src/lib/vm, src/lib/transport) to the ClusterManager, bound once at
  * server start.
  *
- * Node reaches a remote slot three ways, all over the node's one SSH link:
+ * Node reaches a remote slot three ways:
  *   - docker CLI (async spawns only) → DOCKER_HOST=unix://<bridge> → remote docker.sock
- *   - kernel/worker socket → local SocketRelay → remote <root>/vms/<id>/run/*.sock
+ *   - kernel/worker socket → local SocketRelay → TLS gate or SSH → remote <root>/vms/<id>/run/*.sock
  *   - slot files → SFTP into <root>/vms/<id> (remote-slot-files.mjs)
  * A synchronous docker CLI call (execFileSync) through the bridge would deadlock:
  * the bridge is served by this same event loop. Remote lifecycle uses the Engine API.
@@ -80,15 +80,15 @@ export function isNativeNodeVm(vm) {
   return !!nodeId && nodePlatform(nodeId) === 'darwin'
 }
 
-/**
- * False while the slot's node has no live SSH link (offline, asleep, rebooting):
- * nothing can reach the slot, so the scheduler must not pick it. Local slots and
- * an unbound cluster are always reachable as far as placement can tell.
- */
-export function vmNodeReady(vm) {
+export function vmNodeDataPath(vm) {
   const nodeId = vmNodeId(vm)
-  if (!nodeId || !bound) return true
-  return bound.manager.linkReady?.(nodeId) !== false
+  if (!nodeId || !bound) return 'local'
+  const { manager } = bound
+  return manager.slotDataPath?.(nodeId, vm.id) ?? (manager.linkReady?.(nodeId) === false ? 'offline' : 'ssh')
+}
+
+export function vmNodeReady(vm) {
+  return vmNodeDataPath(vm) !== 'offline'
 }
 
 function state() {

@@ -100,6 +100,39 @@ test('diagnosis: reports error (kernel_slots_closed) when all slots are closed',
   }
 })
 
+test('diagnosis separates a working TLS kernel from SSH-only checks', async (t) => {
+  const vm = {
+    id: 'vm-direct',
+    node_id: 'node-a',
+    status: 'running',
+    claude: { has_access: true, has_refresh: true },
+    proxy: SOCKS,
+  }
+  const root = project([vm])
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const d = await diagnoseSlotServices(vm, {
+    projectRoot: root,
+    probes: healthyProbes({
+      cluster: () => ({
+        slotBridgeStatus: () => ({
+          data_path: 'direct',
+          link: { state: 'backoff' },
+          bridge: { alive: true },
+          relays: { kernel: { alive: true }, worker: { alive: true } },
+        }),
+      }),
+      container: async () => assert.fail('SSH container probe must not run'),
+      remoteEgress: async () => assert.fail('SSH egress probe must not run'),
+    }),
+  })
+  const checks = Object.fromEntries(d.checks.map((entry) => [entry.id, entry]))
+  assert.equal(d.ok, true)
+  assert.equal(checks.node_link.status, 'warn')
+  assert.equal(checks.container.code, 'container_unverified')
+  assert.equal(checks.egress.code, 'egress_unverified')
+  assert.equal(checks.kernel.status, 'ok')
+})
+
 test('vmTimeoutTracker and FailoverRunner: 3 consecutive silent timeouts mark kernel fault', () => {
   const vmId = 'vm-stall-test'
   kernelFaults.delete(vmId)

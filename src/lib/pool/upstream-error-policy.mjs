@@ -365,6 +365,12 @@ function classifyUpstreamResultRaw(
       retrySameAccount: false,
     }
   }
+  if (result.clusterDeliveryUnconfirmed === true) {
+    return { scope: 'request', action: 'stop', reason: ErrorCode.CLUSTER_DELIVERY_UNCONFIRMED }
+  }
+  if (handoffCode === ErrorCode.CLUSTER_SLOT_RECONNECTING) {
+    return { scope: 'request', action: 'stop', reason: handoffCode }
+  }
   if (isContentFilterRefusal(result) && !result.committed) {
     return cacheRefusal('content_filter_refusal')
   }
