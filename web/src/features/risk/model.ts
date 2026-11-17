@@ -14,7 +14,7 @@ export const PREFLIGHT_RULES = [
   {
     id: 'hard-regex',
     name: '硬正则',
-    does: '按类别和自定义正则拦截。系统提示词改写与禁用工具规则始终单独检查。',
+    does: '按类别和自定义正则拦截。系统提示词改写可在前置策略单独开关。',
   },
   {
     id: 'refusal',

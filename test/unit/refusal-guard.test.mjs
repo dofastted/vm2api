@@ -189,6 +189,10 @@ test('normal 2.1.321-style system context passes; the release probe is not a nor
     assert.equal(allowed.action, 'pass')
     const blocked = await runProtocolIntercept({ inbound: probe, devices, policy })
     assert.equal(blocked.error.status, 400)
+    const disabled = refusalGuardPolicy()
+    disabled.risk_audit.block_system_prompt_rewrite = false
+    const released = await runProtocolIntercept({ inbound: probe, devices, policy: disabled })
+    assert.equal(released.action, 'pass')
     assert.equal(blocked.error.body.error.code, 'system_prompt_rewrite_blocked')
     assert.equal(devices.count(), 0)
   } finally {
@@ -256,6 +260,15 @@ test('policy editor rejects ambiguous keywords and invalid punishments before wr
   )
   assert.equal(saved.size, 0)
   assert.equal(applyRefusalGuardPatch(saved, { risk_audit: { ...policy, ban_steps: [5, 30, 60, 0] } }).ok, true)
+  assert.equal(
+    applyRefusalGuardPatch(saved, { risk_audit: { ...policy, block_system_prompt_rewrite: false } }).ok,
+    true,
+  )
+  assert.equal(saved.get('risk_audit_policy').block_system_prompt_rewrite, false)
+  assert.equal(
+    applyRefusalGuardPatch(saved, { risk_audit: { ...policy, block_system_prompt_rewrite: 'off' } }).ok,
+    false,
+  )
 })
 
 test('fingerprint ignores stream and max_tokens, includes model', () => {

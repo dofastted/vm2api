@@ -83,7 +83,7 @@ export function RefusalSettings({
             </ToggleItem>
             <ToggleItem
               label='启用分级封禁'
-              desc='设备／机器按违规次数升级；违规会话永久阻止。系统提示词改写不受此开关放行。'
+              desc='设备／机器按违规次数升级；违规会话永久阻止。'
             >
               <Switch
                 checked={data.device_block_enabled !== false}
