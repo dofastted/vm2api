@@ -97,6 +97,8 @@ Go worker JSON 透传，不必因人设重建 worker。
 
 `routing.compatibility.preserve_pruned_tool_results: true` 可为槽位推理开启 DSH 工具结果裁剪保护；缺省关闭，API 直连端点不启用。它不会修改客户端配置或路由粘性。
 
+`routing.compatibility.crag_drop_foreign_thinking: true` 让 CRAG print 在发出前丢掉不是本账号签发的 thinking 块（`thinking_signature_owners` 里没有记录或记在别的账号上）；命中进行中的工具循环时清掉循环内 thinking 并关闭 thinking，结果记在 `hop_meta.thinking_owner_crag`。缺省关闭：签名记录不完整时（清库、记录开始前的老会话）会误丢本账号的 thinking，并让提示缓存失效。
+
 DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pruned标记和后1024码点。开启后，网关在同一认证密钥、严格的DSH `session-UUID`、模型和完整历史前缀内，仅恢复精确等于该裁剪结果的旧文本。必须有此前完整verified且未重试的请求作为原文基线；仅收到keepalive、取消、失败或不完整流不会提交原文。真正的历史编辑、删消息、工具参数变化及摘要替换不还原。
 
 原文只在进程内保存：TTL 1小时、总量16MiB、最多128会话、每会话2MiB、单工具文本256KiB，待确认快照也计入总预算。凭据和会话仅用于进程HMAC隔离，日志只记录 `hop_meta.tool_result_prune` 的恢复数量和原因，不增加正文日志。并发同会话、快照缺失、超预算或无法确认上下文空间时，整组保持调用方较短的原请求；不做部分还原。重启后从自然成功请求重新建立基线。

@@ -161,3 +161,114 @@ export function recordThinkingOwners(message, accountId, store = thinkingOwners)
   } catch {}
   return keys.length
 }
+
+function isThinkingBlock(block) {
+  return block?.type === 'thinking' || block?.type === 'redacted_thinking'
+}
+
+function isPureToolResultTurn(message) {
+  const content = Array.isArray(message?.content) ? message.content : null
+  return !!content?.length && content.every((block) => block?.type === 'tool_result')
+}
+
+/**
+ * CRAG print drops other accounts' thinking before the hop
+ * (routing.compatibility.crag_drop_foreign_thinking, default off).
+ *
+ * CRAG print replays the caller body unfiltered and only strips after the
+ * upstream answers "Invalid `signature` in `thinking` block". Every such 400
+ * tells the upstream this account was handed another account's reasoning.
+ * Recording covers every block this pool returns, so a signature with no
+ * record (or another account's) never came from this slot's kernel and is
+ * dropped before the hop instead. Off by default because an incomplete record
+ * (a cleared table, sessions older than the record) drops the account's own
+ * thinking and breaks the prompt cache.
+ *
+ * - Only signed blocks this account did not mint go; its own stay byte-identical.
+ * - A turn left with no blocks is dropped (it has no tool_use to orphan).
+ * - If the open tool loop (after the last user turn that is not pure
+ *   tool_result) loses a block, every thinking block in the loop goes and
+ *   thinking is off for this hop: the shape signature repair already sends.
+ * - A trailing assistant turn (prefill) carrying a foreign block is left alone.
+ * - Without a reachable database the body goes unchanged.
+ * @returns {{ body: object, kept: number, dropped: number, droppedTurns: number, openLoop: boolean, thinkingOff: boolean, bailed: string|null }}
+ */
+export function dropForeignThinkingForCrag(body, accountId, store = thinkingOwners) {
+  const counts = { kept: 0, dropped: 0, droppedTurns: 0, openLoop: false, thinkingOff: false, bailed: null }
+  const account = String(accountId || '')
+  const messages = Array.isArray(body?.messages) ? body.messages : null
+  if (!account || !messages?.length) return { body, ...counts }
+  const keys = historyKeys(body)
+  if (!keys.length) return { body, ...counts }
+  let owners = null
+  try {
+    owners = store.ownersOf([...new Set(keys)])
+  } catch {}
+  if (!owners) return { body, ...counts, bailed: 'no_db' }
+
+  let loopStart = 0
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role === 'user' && !isPureToolResultTurn(messages[i])) {
+      loopStart = i + 1
+      break
+    }
+  }
+  let any = false
+  const foreignAt = messages.map((message, i) => {
+    if (message?.role !== 'assistant' || !Array.isArray(message.content)) return null
+    const foreign = new Set()
+    message.content.forEach((block, j) => {
+      const key = thinkingSignatureKey(block)
+      if (!key) return
+      if (owners.get(key) === account) {
+        counts.kept += 1
+        return
+      }
+      foreign.add(j)
+      any = true
+      if (i >= loopStart) counts.openLoop = true
+    })
+    return foreign
+  })
+  if (!any) return { body, ...counts }
+  const last = messages.length - 1
+  if (messages[last]?.role === 'assistant' && foreignAt[last]?.size) {
+    return { body, ...counts, openLoop: false, bailed: 'prefill' }
+  }
+
+  const out = []
+  messages.forEach((message, i) => {
+    const foreign = foreignAt[i]
+    if (!foreign) {
+      out.push(message)
+      return
+    }
+    const wipeLoop = counts.openLoop && i >= loopStart
+    const content = message.content.filter((block, j) => !(wipeLoop ? isThinkingBlock(block) : foreign.has(j)))
+    const removed = message.content.length - content.length
+    if (!removed) {
+      out.push(message)
+      return
+    }
+    counts.dropped += removed
+    if (!content.length) {
+      counts.droppedTurns += 1
+      return
+    }
+    out.push({ ...message, content })
+  })
+  const next = { ...body, messages: out }
+  if (counts.openLoop) {
+    if (next.thinking) {
+      delete next.thinking
+      counts.thinkingOff = true
+    }
+    if (Array.isArray(next.context_management?.edits)) {
+      const edits = next.context_management.edits.filter((edit) => edit?.type !== 'clear_thinking_20251015')
+      next.context_management = { ...next.context_management }
+      if (edits.length) next.context_management.edits = edits
+      else delete next.context_management.edits
+    }
+  }
+  return { body: next, ...counts }
+}
