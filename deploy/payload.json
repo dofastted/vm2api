@@ -24,8 +24,8 @@
     {
       "path": "bin/kin-oauth-auth",
       "asset": "kin-oauth-auth",
-      "size": 47386182,
-      "sha256": "2466b8c841ec1a1d098c31f3e7de36786be8c5cce2acc114eade28d4548b050d"
+      "size": 47393198,
+      "sha256": "e0eb86e5f9036437c84160ccf48e2fd31148f42933da930eb28eddb54825507f"
     },
     {
       "path": "bin/kin-computer",
