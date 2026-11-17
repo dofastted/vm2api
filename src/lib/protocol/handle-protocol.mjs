@@ -1826,6 +1826,9 @@ export function createHandleProtocol(deps) {
                   sessionId: attemptSessionId,
                   cliHop: true,
                   cragPrint: true,
+                  // CRAG replays caller thinking unfiltered; signatures this pool never
+                  // issued make an "Invalid signature" 400 safe to strip and retry.
+                  foreignThinking: owned.converted + owned.dropped > 0,
                   callerCwd: callerEnvironment?.cwd,
                   preparedHop,
                   transportRouting,

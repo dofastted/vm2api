@@ -1026,7 +1026,7 @@ export class FailoverRunner {
                 model,
                 repaired,
                 oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
-                signatureRepair: signatureRepairEnabled(this.config),
+                signatureRepair: signatureRepairEnabled(this.config) || attemptMeta?.foreignThinking === true,
               },
               this.scheduler?.accountQuota,
             )
