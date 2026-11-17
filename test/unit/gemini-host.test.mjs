@@ -8,7 +8,8 @@ import { authorizePanelRoute } from '../../src/lib/admin/panel-acl.mjs'
 import { AGY_SHA256, installGeminiPayload, readSignedGeminiManifest } from '../../src/lib/gemini/payload.mjs'
 import {
   createGeminiPanelHandler,
-  geminiBillingUnavailable,
+  geminiKeyAllowsPath,
+  handleGeminiPublic,
   officialGeminiAuthUrl,
 } from '../../src/lib/gemini/routes.mjs'
 
@@ -173,9 +174,33 @@ test('official login links are validated and code is returned only to its select
 })
 
 test('missing official settlement cannot be enabled by a host response or a paid route request', () => {
-  const result = geminiBillingUnavailable((_res, status, body) => ({ status, body }), { setHeader() {} })
+  const respond = (_res, status, body) => ({ status, body })
+  const res = { setHeader() {} }
+  for (const group_type of ['all', 'anthropic', 'openai']) {
+    const denied = handleGeminiPublic({ apiKeyKind: 'managed', apiKeyRecord: { group_type } }, res, respond)
+    assert.equal(denied.status, 403)
+    assert.equal(denied.body.error.code, 'gemini_key_required')
+  }
+  assert.equal(handleGeminiPublic({ apiKeyKind: 'master' }, res, respond).status, 403)
+  const result = handleGeminiPublic({ apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' } }, res, respond)
   assert.equal(result.status, 503)
-  assert.equal(result.body.error.code, 'gemini_official_billing_unavailable')
+  assert.equal(result.body.error.code, 'gemini_runtime_not_supported')
+})
+
+test('Gemini keys cannot reach other inference endpoints via HTTP or WebSocket', () => {
+  for (const route of [
+    '/v1/responses',
+    '/responses',
+    '/v1/chat/completions',
+    '/v1/messages',
+    '/v1/images/edits',
+    '/admin/models/refresh',
+  ]) {
+    assert.equal(geminiKeyAllowsPath(route, 'POST'), false)
+    assert.equal(geminiKeyAllowsPath(route, 'GET'), false)
+  }
+  assert.equal(geminiKeyAllowsPath('/v1/gemini/sessions', 'POST'), true)
+  assert.equal(geminiKeyAllowsPath('/v1/me/quota', 'GET'), true)
 })
 
 test('host installer refuses an unsigned manifest and never activates damaged payload members', async (t) => {

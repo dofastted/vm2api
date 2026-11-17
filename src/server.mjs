@@ -11,7 +11,7 @@ import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
 import { loadConfig, reloadActiveVm, routingConfigFile } from './lib/core/config.mjs'
-import { geminiBillingUnavailable, isGeminiPublicPath } from './lib/gemini/routes.mjs'
+import { geminiKeyAllowsPath, handleGeminiPublic, isGeminiPublicPath } from './lib/gemini/routes.mjs'
 import {
   extractApiKey,
   timingSafeEqualStr,
@@ -822,6 +822,21 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
       }),
     )
   }
+  if (
+    managed.record.group_type === 'gemini' &&
+    !geminiKeyAllowsPath(parseRequestUrl(req)?.pathname || '', req.method)
+  ) {
+    return rejectAuth(
+      req,
+      res,
+      makeError({
+        type: ErrorType.PERMISSION,
+        code: 'key_group_mismatch',
+        message: 'This key can only call Gemini endpoints.',
+        status: 403,
+      }),
+    )
+  }
   const gate = keyGate ? apiKeyStore.canAccept(managed.record) : { ok: true }
   if (!gate.ok) {
     const type =
@@ -1325,6 +1340,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
+      if (groupType === 'gemini') return json(res, 200, { object: 'list', data: [] })
       if (resolveInferenceBackend(req) === 'api') {
         return json(res, 200, filterModelCatalogForKey(apiScheduler.catalog(apiScheduleScope(req, groupType)), req))
       }
@@ -1356,7 +1372,7 @@ const server = http.createServer(async (req, res) => {
 
     if (isGeminiPublicPath(p)) {
       if (!requireAuth(req, res)) return
-      return geminiBillingUnavailable(json, res)
+      return handleGeminiPublic(req, res, json)
     }
 
     if (req.method === 'POST' && (p === '/v1/chat/completions' || p === '/chat/completions')) {

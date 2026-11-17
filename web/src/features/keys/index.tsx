@@ -474,6 +474,7 @@ function KeyRow({
 }
 
 function scopeText(item: ApiKeyItem): string {
+  if (item.group_type === 'gemini') return 'Gemini · CRAGAnti'
   if (item.vm_pool_id) return `账号池 · ${item.vm_pool_name || item.vm_pool_id}`
   if (item.group_type === 'anthropic')
     return `Anthropic · ${item.allowed_vms?.length || 0} 台`

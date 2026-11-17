@@ -30,6 +30,13 @@ export function isGeminiPublicPath(value) {
   return value === PUBLIC_PATH || value.startsWith(`${PUBLIC_PATH}/`)
 }
 
+export function geminiKeyAllowsPath(pathname, method) {
+  return (
+    isGeminiPublicPath(pathname) ||
+    (method === 'GET' && ['/models', '/v1/models', '/v1/usage', '/v1/me/quota', '/v1/me/usage'].includes(pathname))
+  )
+}
+
 function hostError(code, status = 503) {
   return Object.assign(new Error(code), { code, status })
 }
@@ -327,13 +334,22 @@ export function createGeminiPanelHandler({
   }
 }
 
-export function geminiBillingUnavailable(json, res) {
+export function handleGeminiPublic(req, res, json) {
   res.setHeader('Cache-Control', 'no-store')
+  if (req.apiKeyKind !== 'managed' || req.apiKeyRecord?.group_type !== 'gemini') {
+    return json(res, 403, {
+      error: {
+        type: 'permission_error',
+        code: 'gemini_key_required',
+        message: 'This endpoint requires a dedicated Gemini API key.',
+      },
+    })
+  }
   return json(res, 503, {
     error: {
       type: 'service_unavailable',
-      code: 'gemini_official_billing_unavailable',
-      message: 'Gemini paid inference is disabled until verified per-turn official settlement is available.',
+      code: 'gemini_runtime_not_supported',
+      message: 'The current CRAGAnti payload does not support Google OAuth inference.',
     },
   })
 }
