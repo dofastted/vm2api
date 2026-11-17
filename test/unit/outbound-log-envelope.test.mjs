@@ -377,7 +377,7 @@ async function protocolKernelFixture(t, { health, staleHealth, preset = 'officia
       const envelope = kernel.posted.at(-1)
       const extra = finished.at(-1)
       assert.deepEqual(JSON.parse(JSON.stringify(extra.outbound_body)), envelope.body)
-      assert.deepEqual(extra.worker_envelope_headers, envelope.headers)
+      assert.deepEqual(extra.worker_envelope_headers, envelope.headers ?? null)
       assert.equal(Object.hasOwn(envelope.body, 'caller_cwd'), false)
       assert.equal(Object.hasOwn(extra, 'caller_cwd'), false)
       assert.equal(Object.hasOwn(extra.outbound_body, 'caller_cwd'), false)
@@ -392,7 +392,7 @@ unixTest('native CRAG receives caller tool names and structured system cache blo
   const fixture = await protocolKernelFixture(t, {
     health: {
       ...printHealth,
-      capabilities: [...printCapabilities, 'generation_controls_v3', 'system_text_cache_v3'],
+      capabilities: [...printCapabilities, 'generation_controls_v3', 'system_text_cache_v3', 'linux_tui_native_queue'],
     },
     staleHealth: ordinaryHealth,
   })
@@ -413,11 +413,11 @@ unixTest('native CRAG receives caller tool names and structured system cache blo
       role: 'user',
       content: [
         { type: 'tool_result', tool_use_id: 'toolu_fixture', content: 'result' },
-        { type: 'text', text: 'Summarize it', cache_control: anchor },
+        { type: 'text', text: 'Summarize it', cache_control: { type: 'ephemeral' } },
       ],
     },
   ]
-  const { envelope } = await fixture.send({
+  const { envelope, extra } = await fixture.send({
     model: 'claude-sonnet-5-5',
     max_tokens: 32000,
     stream: true,
@@ -426,6 +426,8 @@ unixTest('native CRAG receives caller tool names and structured system cache blo
     messages,
     tool_choice: { type: 'auto' },
   })
+  assert.equal(Object.hasOwn(envelope, 'headers'), false)
+  assert.equal(extra.worker_envelope_headers, null)
   assert.deepEqual(envelope.body.tools, tools)
   assert.deepEqual(envelope.body.system, system)
   assert.equal(envelope.body.crag_prompt, undefined)
@@ -438,7 +440,12 @@ unixTest('zero CRAG sends mixed Responses tools and structured system to the cap
   const fixture = await protocolKernelFixture(t, {
     health: {
       ...printHealth,
-      capabilities: [...printCapabilities, 'generation_controls_v3', 'provider_managed_tools_v1'],
+      capabilities: [
+        ...printCapabilities,
+        'generation_controls_v3',
+        'provider_managed_tools_v1',
+        'linux_tui_native_queue',
+      ],
     },
     staleHealth: ordinaryHealth,
     preset: 'zero',
@@ -461,6 +468,7 @@ unixTest('zero CRAG sends mixed Responses tools and structured system to the cap
     ordinaryHealth,
     { protocol: 'openai.responses' },
   )
+  assert.equal(Object.hasOwn(envelope, 'headers'), false)
   assert.equal(envelope.body.tools.length, 48)
   assert.deepEqual(envelope.body.tools[47], search)
   assert.deepEqual(envelope.body.system, [{ type: 'text', text: 'Caller policy' }])

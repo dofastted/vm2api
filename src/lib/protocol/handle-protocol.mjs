@@ -89,6 +89,7 @@ import {
 } from '../core/errors.mjs'
 import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
+import { canReuseCanonicalHistory } from './sanitize.mjs'
 import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
 import {
   callerCwdDeclaration,
@@ -1759,23 +1760,38 @@ export function createHandleProtocol(deps) {
               const cragPersona = resolveCragPrintPersona(selected.vm, routingNow)
               const caps = preparedHop.ready.health?.capabilities
               const preserveToolNames = deferToolNameRewrite && caps?.includes('generation_controls_v3')
-              // CRAG print bypasses the cli-node envelope builder. Canonicalize
-              // once more at this boundary so passthrough traffic cannot carry
-              // client/OpenAI fields into the native worker.
               const cragInput = hasCragSystem ? { ...personaIn, system: cragSystem } : personaIn
               const reuseHistory = !officialPassthrough && !repaired && !extra.repairs?.length
-              const cragStandard = toStandardAnthropicBody(cragInput, {
+              const reuseIngress =
+                reuseHistory &&
+                preserveToolNames &&
+                caps.includes('linux_tui_native_queue') &&
+                !hasCragSystem &&
+                !summarySession &&
+                !toolPruneAttempt &&
+                personaIn.thread == null &&
+                (!Array.isArray(personaIn.system) ||
+                  !personaIn.system.some((block) => /x-anthropic-billing-header:/i.test(block?.text || ''))) &&
+                canReuseCanonicalHistory(personaIn.messages)
+              const scrubOptions = {
                 official: officialTraffic === true,
                 rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
                 preserveToolNames,
-                reuseCanonicalHistory: reuseHistory,
                 shareUnchanged: reuseHistory,
-              })
-              const cragToolReverse = composeToolNames(inboundToolReverse, cragStandard.reverse)
+              }
+              let toolNames = inboundToolReverse
+              let source = cragInput
+              if (!reuseIngress) {
+                const standard = toStandardAnthropicBody(cragInput, {
+                  ...scrubOptions,
+                  reuseCanonicalHistory: reuseHistory,
+                })
+                source = shallowCopyBody(standard.body)
+                toolNames = composeToolNames(toolNames, standard.reverse)
+              }
               // The CRAG kernel fingerprints the public stream it already sent,
               // including thinking. Rewriting an unrecorded signature into text
               // makes the tool continuation fail with tool_result history mismatch.
-              let source = shallowCopyBody(cragStandard.body)
               for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
               hopBody = prepareCragPrintBody(source, {
                 preset: cragPersona,
@@ -1797,13 +1813,11 @@ export function createHandleProtocol(deps) {
                   epoch: attemptStartedAt,
                 })
               }
-              const scrubbed = scrubUpstreamClientBody(hopBody, {
-                official: officialTraffic === true,
-                rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
-                preserveToolNames,
-                shareUnchanged: reuseHistory,
-              })
-              hopBody = scrubbed.body
+              if (!reuseIngress) {
+                const scrubbed = scrubUpstreamClientBody(hopBody, scrubOptions)
+                hopBody = scrubbed.body
+                toolNames = composeToolNames(toolNames, scrubbed.reverse)
+              }
               if (
                 caps?.includes('generation_controls_v3') &&
                 hopBody.cache_ttl == null &&
@@ -1830,7 +1844,7 @@ export function createHandleProtocol(deps) {
               return {
                 body: hopBody,
                 meta: {
-                  toolNames: composeToolNames(cragToolReverse, scrubbed.reverse),
+                  toolNames,
                   sessionId: attemptSessionId,
                   cliHop: true,
                   cragPrint: true,

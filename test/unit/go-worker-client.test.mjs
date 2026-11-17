@@ -186,6 +186,26 @@ test('setup-token worker envelope is inference-only', () => {
   assert.match(String(out.headers['anthropic-beta'] || ''), /oauth-2025-04-20/)
 })
 
+test('native queue delegates ordinary headers to CC but keeps compatibility headers', () => {
+  const body = { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hi' }] }
+  const workerStatus = {
+    runtime_variant: 'crag-v2',
+    capabilities: ['generation_controls_v3', 'linux_tui_native_queue', 'message_threads_beta'],
+  }
+  const args = { body, exec: { workerStatus }, cliHop: true, cragPrint: true }
+  assert.equal(finalizeWorkerPayload(args).headers, undefined)
+  assert.equal(finalizeWorkerPayload(args).body.betas, undefined)
+  for (const overrides of [
+    { requestContext: { purpose: 'auto_mode_classifier', format: 'xml' } },
+    { repaired: true },
+    { body: { ...body, thread: { type: 'create' } } },
+    { exec: { workerStatus: { ...workerStatus, capabilities: ['generation_controls_v3'] } } },
+    { cragPrint: false },
+  ]) {
+    assert.ok(finalizeWorkerPayload({ ...args, ...overrides }).headers['anthropic-beta'])
+  }
+})
+
 test('worker canonicalizes passthrough bodies before either kernel', () => {
   const body = {
     model: 'claude-sonnet-5',

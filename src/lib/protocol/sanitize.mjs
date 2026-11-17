@@ -208,23 +208,26 @@ export function canonicalizeClaudeMessagesShape(body, { preserveContentShape = f
   return out
 }
 
+export function reusableContentBlock(block) {
+  if (!block || typeof block !== 'object' || typeof block.type !== 'string' || !block.type) return false
+  for (const key of DROP_CONTENT_KEYS) {
+    if (Object.hasOwn(block, key)) return false
+  }
+  return (
+    block.type !== 'text' ||
+    (typeof block.text === 'string' && !!block.text.trim() && !mayRepairAutoModeReminder(block.text))
+  )
+}
+
 function reusableContent(content) {
   for (const block of content) {
-    if (!block || typeof block !== 'object' || typeof block.type !== 'string' || !block.type) return false
-    for (const key of DROP_CONTENT_KEYS) {
-      if (Object.hasOwn(block, key)) return false
-    }
-    if (
-      block.type === 'text' &&
-      (typeof block.text !== 'string' || !block.text.trim() || mayRepairAutoModeReminder(block.text))
-    )
-      return false
+    if (!reusableContentBlock(block)) return false
     if (block.type === 'tool_result' && Array.isArray(block.content) && !reusableContent(block.content)) return false
   }
   return true
 }
 
-function reusableHistory(messages) {
+export function canReuseCanonicalHistory(messages) {
   if (!Array.isArray(messages) || !messages.length) return false
   let previousRole = 'assistant'
   for (const message of messages) {
@@ -260,7 +263,11 @@ export function sanitizeAnthropicBody(
       .filter(Boolean)
   }
 
-  const reuseHistory = reuseCanonicalHistory && !preserveContentShape && reusableHistory(out.messages)
+  const reuseHistory =
+    !preserveContentShape &&
+    (typeof reuseCanonicalHistory === 'function'
+      ? reuseCanonicalHistory(out.messages)
+      : reuseCanonicalHistory && canReuseCanonicalHistory(out.messages))
   if (reuseHistory) {
     if (Array.isArray(out.system)) out.system = stripIllegalContentFields(out.system)
   } else {

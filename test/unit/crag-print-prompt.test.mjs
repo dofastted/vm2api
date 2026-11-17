@@ -20,6 +20,26 @@ import { prepareCragRequest } from '../../src/lib/protocol/kernel-request.mjs'
 import { agentBody } from '../fixtures/agent-summary.mjs'
 
 const billing = 'x-anthropic-billing-header: cc_version=2.1.317'
+
+test('CRAG boundary validates while reusing typed history and normalizes noncanonical history', () => {
+  const result = { type: 'tool_result', tool_use_id: 'toolu_read', content: 'result' }
+  const body = {
+    model: 'claude-sonnet-5-5',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'Read this' }] },
+      { role: 'assistant', content: [{ type: 'tool_use', name: 'read', id: 'toolu_read', input: {} }] },
+      { role: 'user', content: [result] },
+    ],
+  }
+  assert.equal(prepareCragRequest(body).messages, body.messages)
+  result.content = [{ type: 'text', text: 'result', annotations: [] }]
+  assert.deepEqual(prepareCragRequest(body).messages[2].content[0].content, [{ type: 'text', text: 'result' }])
+  result.content = [{ type: 'text', text: 123 }]
+  assert.throws(
+    () => prepareCragRequest(body),
+    (error) => error.body?.error?.param === 'messages[2].content[0].content[0].text',
+  )
+})
 const identity = 'You are Claude Code, an agent.'
 const harness = 'You are an agent working with the user.'
 const guidance = 'Bias toward working.'
