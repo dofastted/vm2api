@@ -59,6 +59,20 @@ export function VmActionMenu({
   const restricted = restrictionTitle(vm)
   const admin = me.data?.role === 'admin'
   const perms = useVmPerms()
+  if (vm.gemini) {
+    return (
+      <Button
+        type='button'
+        size='sm'
+        variant='ghost'
+        className={className}
+        aria-label={`管理 ${vm.name || vm.id}`}
+        onClick={() => actions.openDetail(vm)}
+      >
+        <MoreHorizontal />
+      </Button>
+    )
+  }
   return (
     <>
       <DropdownMenu>

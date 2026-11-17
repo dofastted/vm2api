@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
 import type { Vm } from '@/types/panel-vm'
 import {
@@ -28,7 +29,7 @@ import { PageHeader } from '@/components/page-header'
 import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
-import { GeminiEnvironments } from '@/features/import/gemini-environments'
+import { geminiInventoryOptions } from '@/features/import/gemini-environments'
 import {
   dashboardQueryOptions,
   usageQueryOptions,
@@ -37,6 +38,7 @@ import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import { DeleteActiveVmHint } from '@/features/vm/delete-active-hint'
 import { FleetPulse } from '@/features/vm/fleet-pulse'
+import { geminiSlot } from '@/features/vm/gemini-slot'
 import { VmListSkeleton } from '@/features/vm/list-skeleton'
 import { vmsListQueryOptions } from '@/features/vm/queries'
 import { usePoolSeatStream } from '@/features/vm/use-pool-seat-stream'
@@ -97,6 +99,8 @@ function writePref(key: string, value: string) {
 export function VmListPage() {
   const me = useQuery(meQueryOptions())
   const vmsQ = useQuery(vmsListQueryOptions(5000))
+  const isAdmin = me.data?.role === 'admin'
+  const gemini = useQuery({ ...geminiInventoryOptions(), enabled: isAdmin })
   usePoolSeatStream()
   const usage = useQuery({
     ...usageQueryOptions(5000),
@@ -167,14 +171,18 @@ export function VmListPage() {
     onError: (error: Error) => toast.error(error.message),
   })
   const vms: Vm[] = vmsQ.data?.items || []
+  const slots =
+    isAdmin && gemini.data?.available
+      ? [...vms, ...gemini.data.environments.map(geminiSlot)]
+      : vms
   const poolQueue = vmsQ.data?.pool_queue
   const accounts = usage.data?.accounts
   const canCreate =
     me.data?.role === 'admin' ||
     (me.data?.role === 'user' && (me.data.vm_create_quota || 0) > 0)
   const perms = vmPermsFor(me.data?.role)
-  const scoped = filterVms(vms, '', 'all', kind)
-  const list = sortVms(filterVms(vms, q, filter, kind), sort, dir, accounts)
+  const scoped = filterVms(slots, '', 'all', kind)
+  const list = sortVms(filterVms(slots, q, filter, kind), sort, dir, accounts)
   const deletePlan = deleteTarget
     ? planDeleteActiveVm(deleteTarget, vms)
     : { kind: 'normal' as const }
@@ -202,6 +210,13 @@ export function VmListPage() {
                 全局排队 {poolQueue.global_queue_depth}/{poolQueue.queue_max}
               </span>
             ) : null}
+            {isAdmin ? (
+              <Button asChild variant='outline'>
+                <Link to='/import' search={{ tab: 'gemini' }}>
+                  导入 Gemini
+                </Link>
+              </Button>
+            ) : null}
             {canCreate ? (
               <Button onClick={() => setCreateOpen(true)}>创建</Button>
             ) : null}
@@ -222,7 +237,12 @@ export function VmListPage() {
           onFilter={setFilter}
         />
         <div className='mb-4 flex flex-wrap items-center gap-2'>
-          <KindFilterChips vms={vms} kind={kind} onChange={setKind} />
+          <KindFilterChips
+            vms={slots}
+            kind={kind}
+            onChange={setKind}
+            showGemini={isAdmin}
+          />
           <Separator orientation='vertical' className='mx-1 h-5' />
           <Input
             className='h-8 w-64'
@@ -354,7 +374,6 @@ export function VmListPage() {
           )}
         </VmActionsProvider>
       </QueryGate>
-      {me.data?.role === 'admin' ? <GeminiEnvironments view='vm' /> : null}
       <ConfirmDialog
         open={!!resetTarget}
         onOpenChange={(open) => {

@@ -63,6 +63,7 @@ function computePulse(vms: Vm[], accounts?: UsageAccountRow[]): Pulse {
 
   for (const vm of vms) {
     counts[zoneOf(vm)] += 1
+    if (vm.gemini) continue
     if (vm.has_token) {
       const remain = Math.max(0, 100 - usedPctOf(vm, '7d'))
       remains.push(remain)

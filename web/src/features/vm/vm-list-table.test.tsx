@@ -3,8 +3,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
+import { geminiSlot } from './gemini-slot'
 import { VmTable } from './vm-list-table'
+import { VmRack } from './vm-rack'
 import { VmSchedulingBlock, VmSchedulingEditor } from './vm-scheduling'
+import { filterVms } from './vm-table'
 
 vi.mock('./vm-actions-context', () => ({ useVmActions: () => ({}) }))
 vi.mock('./vm-action-menu', () => ({ VmActionMenu: () => null }))
@@ -88,6 +91,56 @@ describe('VM row interaction and health', () => {
 })
 
 describe('VM account column kernel label', () => {
+  it('shares the VM table and rack with a host Gemini account without VM controls or fake readiness', () => {
+    const gemini = geminiSlot({
+      id: 'gemini-fixture',
+      name: 'Gemini account',
+      proxy_id: 'px-011f7746',
+      auth_state: 'authorized',
+      runtime_ready: false,
+      billing_ready: false,
+      auth_method: 'oauth',
+      kernel_version: '0.3.0-rc.1',
+      created_at: null,
+      updated_at: null,
+      models: [],
+      account: null,
+    })
+    expect(filterVms([gemini], 'px-011f', 'dead', 'gemini')).toEqual([gemini])
+    expect(filterVms([gemini], '', 'all', 'gpt')).toEqual([])
+    expect(filterVms([gemini], '', 'all', 'claude')).toEqual([])
+
+    const openai = { id: 'vm-02', platform: 'openai', has_token: true }
+    const renderSlots = (nodes: ReactNode) =>
+      renderToStaticMarkup(
+        <QueryClientProvider client={new QueryClient()}>
+          {nodes}
+        </QueryClientProvider>
+      )
+    const table = renderSlots(<VmTable vms={[openai, gemini]} />)
+    expect(table).toContain('aria-label="openai"')
+    expect(table).toContain('data-vm-table')
+    for (const html of [
+      table,
+      renderSlots(<VmRack vms={[gemini]} filter='all' size='l' />),
+    ]) {
+      for (const label of [
+        'Gemini account',
+        'CRAGAnti',
+        '宿主机',
+        '已授权',
+        '载荷未启用推理',
+        'px-011f7746',
+      ]) {
+        expect(html).toContain(label)
+      }
+      expect(html).not.toContain('运行就绪')
+    }
+    const hostOnly = renderSlots(<VmTable vms={[gemini]} />)
+    expect(hostOnly).not.toContain('role="switch"')
+    expect(hostOnly).not.toContain('24h 无请求')
+  })
+
   it.each(['wrap', 'cc'] as const)(
     'renders %s as a silver standard kernel',
     (dataplane) => {

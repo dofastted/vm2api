@@ -56,6 +56,7 @@ import { riskFg, RISK_SOLID, riskLevel } from '@/features/vm/usage-meter'
 import { PlatformMark } from '@/features/vm/vm-account-identity'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
+import { GeminiSlotStatus } from '@/features/vm/vm-rack-blade'
 import {
   vmWindows,
   type WindowKey,
@@ -103,6 +104,7 @@ const STATE_ICON_FG: Partial<Record<ScheduleStateLabel, string>> = {
 }
 
 function SchedCell({ vm }: { vm: Vm }) {
+  if (vm.gemini) return <GeminiSlotStatus vm={vm} />
   const level = Number(vm.schedule_level)
   const levelOk = Number.isInteger(level) && level >= 1 && level <= 10
   const manual = vm.schedule_level_mode === 'manual'
@@ -486,6 +488,7 @@ const COLS: Col[] = [
 
 function ProdCell({ vm }: { vm: Vm }) {
   const tier = claudeTier(vm)
+  const plan = vm.gemini ? vm.gemini.account?.plan : tier.label
   const crag = (vm.resolved_dataplane ?? vm.dataplane) === 'crag'
   const registration = credentialRegistrationOf(vm)
   const node = vm.node_name || vm.node_id || 'local'
@@ -493,19 +496,22 @@ function ProdCell({ vm }: { vm: Vm }) {
     <>
       <PlatformMark vm={vm} />
       <span
-        className='shrink-0 font-mono font-semibold'
+        className={cn(
+          'font-mono font-semibold',
+          vm.gemini ? 'min-w-0 truncate' : 'shrink-0'
+        )}
         title={vm.name || vm.id}
       >
-        {vm.id}
+        {vm.gemini ? vm.name : vm.id}
       </span>
-      {tier.label && tier.label !== '—' ? (
+      {plan && plan !== '—' ? (
         <span
           className={cn(
             'shrink-0 rounded-[3px] px-1 font-mono text-[10px] leading-[1.5] font-semibold',
             tierVisual(vm).badge
           )}
         >
-          {tier.label}
+          {plan}
         </span>
       ) : null}
       <span
@@ -517,7 +523,7 @@ function ProdCell({ vm }: { vm: Vm }) {
         )}
         title='当前内核'
       >
-        {crag ? 'crag' : '默认'}
+        {vm.gemini ? 'CRAGAnti' : crag ? 'crag' : '默认'}
       </span>
       <span
         className={cn(
@@ -534,7 +540,9 @@ function ProdCell({ vm }: { vm: Vm }) {
           SEC
         )}
       >
-        <span>{vm.runtime_type === 'kvm' ? 'kvm' : 'vm'}</span>
+        <span>
+          {vm.gemini ? '宿主机' : vm.runtime_type === 'kvm' ? 'kvm' : 'vm'}
+        </span>
         <span aria-hidden>·</span>
         <span>{registration === 'none' ? '无凭证' : registration}</span>
         <span aria-hidden>·</span>
@@ -1012,7 +1020,11 @@ export function VmTable({
                                   dim && i > 0 && 'opacity-50'
                                 )}
                               >
-                                {c.cell(r, now)}
+                                {vm.gemini && i > 0 ? (
+                                  <span className={TERT}>—</span>
+                                ) : (
+                                  c.cell(r, now)
+                                )}
                               </div>
                             ))}
                             <div
@@ -1042,7 +1054,26 @@ export function VmTable({
                               </span>
                             </div>
                           </div>
-                          {open ? (
+                          {open && vm.gemini ? (
+                            <div
+                              id={detailId}
+                              className='flex items-center gap-3 border-b px-4 py-2 text-xs text-muted-foreground'
+                            >
+                              <span>{vm.email || '未提供邮箱'}</span>
+                              <span>
+                                {vm.gemini.account?.plan || '未提供订阅'}
+                              </span>
+                              <ProxyChip vm={vm} compact />
+                              <Button
+                                type='button'
+                                size='sm'
+                                variant='ghost'
+                                onClick={() => actions.openDetail(vm)}
+                              >
+                                管理 Gemini 凭证
+                              </Button>
+                            </div>
+                          ) : open ? (
                             <VmRowDetail
                               id={detailId}
                               vm={vm}

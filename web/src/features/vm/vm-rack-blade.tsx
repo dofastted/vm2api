@@ -116,9 +116,36 @@ export function BladeControls({
       onClick={(e) => e.stopPropagation()}
       onKeyDown={(e) => e.stopPropagation()}
     >
-      <SchedulableSwitch {...vmSchedulableProps(vm)} />
+      {vm.gemini ? null : <SchedulableSwitch {...vmSchedulableProps(vm)} />}
       <VmActionMenu vm={vm} />
     </div>
+  )
+}
+
+export function GeminiSlotStatus({ vm }: { vm: Vm }) {
+  const environment = vm.gemini
+  if (!environment) return null
+  const labels = {
+    authorized: '已授权',
+    authorizing: '等待 Google 授权',
+    unverified: '未授权',
+    reauth_required: '需要重新授权',
+    disabled: '已停用',
+  }
+  const detail =
+    environment.auth_state === 'authorized' ? vm.unschedulable_text : null
+  const tone =
+    environment.auth_state === 'authorized'
+      ? { key: 'ok', cls: 'ok' as const, text: labels.authorized }
+      : poolStatus(vm)
+  return (
+    <span className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground'>
+      <StatusMark
+        variant='pill'
+        tone={{ ...tone, label: labels[environment.auth_state] }}
+      />
+      {detail ? <span>{detail}</span> : null}
+    </span>
   )
 }
 
@@ -437,7 +464,9 @@ export const VmBlade = memo(function VmBlade({
         ) : null}
       </div>
       <ProxyChip vm={vm} className='min-w-0 justify-self-start' />
-      {state === 'live' ? (
+      {vm.gemini ? (
+        <GeminiSlotStatus vm={vm} />
+      ) : state === 'live' ? (
         <BladeUsage vm={vm} accounts={accounts} now={now} />
       ) : state === 'unprobed' ? (
         <div className='grid min-w-0 content-start gap-1.5'>

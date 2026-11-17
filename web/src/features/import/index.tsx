@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
+import { useSearch } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { PageHeader } from '@/components/page-header'
@@ -15,9 +16,18 @@ export function ImportPage() {
   const dash = useQuery(dashboardQueryOptions())
   const me = useQuery(meQueryOptions())
   const isAdmin = me.data?.role === 'admin'
-  const [tab, setTab] = useState(() =>
-    window.location.hash === '#gemini' ? 'gemini' : 'onboard'
-  )
+  const requested = useSearch({
+    from: '/_authenticated/import',
+    select: (search) => search.tab,
+  })
+  const [selected, setSelected] = useState<{
+    requested?: string
+    tab: string
+  }>()
+  const tab =
+    selected && selected.requested === requested
+      ? selected.tab
+      : requested || 'onboard'
   return (
     <PageHeader
       title={VIEW_TITLES.import}
@@ -25,7 +35,7 @@ export function ImportPage() {
     >
       <Tabs
         value={tab === 'gemini' && !isAdmin ? 'onboard' : tab}
-        onValueChange={setTab}
+        onValueChange={(tab) => setSelected({ requested, tab })}
         className='max-w-6xl gap-6'
       >
         <TabsList>
