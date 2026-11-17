@@ -6,6 +6,7 @@ import path from 'node:path'
 import http from 'node:http'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 const MESSAGE = {
   model: 'claude-haiku-4-5',
@@ -490,6 +491,9 @@ test('an incomplete native handoff never becomes a successful output-limit termi
       runtime: { kernel_socket: socketPath, worker_run_dir: root, worker_token_file: tokenPath },
     },
   }
+  // Live CRAG health is license-checked before the inference POST.
+  seedEncryptedPackage(root)
+  activateFixture(root, exec.vm)
   const res = createResponse()
   const handler = createHandler({
     root,
