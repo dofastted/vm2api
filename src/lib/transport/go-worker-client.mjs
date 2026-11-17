@@ -603,13 +603,6 @@ export function prepareWorkerPayload({
   const health = exec?.workerStatus
   const print = nativeCragRequest(exec, cragPrint)
   const canonicalBody = print ? prepareCragRequest(body, health) : prepareCliNodeRequest(body)
-  const model = canonicalBody?.model || ''
-  const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
-  const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
-    credentialMode: credMode,
-    routing,
-    want1m: want1m === true,
-  })
   const displayed =
     requestContext?.purpose === 'auto_mode_classifier' || repaired
       ? canonicalBody
@@ -618,20 +611,35 @@ export function prepareWorkerPayload({
           ccEntrypointFromRouting(routing),
         )
   const main = stripSubagentBilling(displayed)
-  const thread = pinThreadBetas(
-    main,
-    withRequestProtocolBetas(String(headers?.['anthropic-beta'] || '').split(','), main),
-  )
-  const betas = thread.betas
-  headers['anthropic-beta'] = betas.join(',')
   // V3's official CC owns beta selection. Its strict request contract does not
   // accept the panel's legacy cli-node beta body extension.
   const officialBetas = print && health?.capabilities?.includes('generation_controls_v3')
-  const gated = cliHop
-    ? officialBetas
-      ? main
-      : { ...main, betas }
-    : sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
+  const nativeOwnsHeaders =
+    cliHop &&
+    cragPrint === true &&
+    officialBetas &&
+    health.capabilities.includes('linux_tui_native_queue') &&
+    !requestContext &&
+    !repaired &&
+    main.thread == null
+  let headers
+  let turn = null
+  let gated = main
+  if (!nativeOwnsHeaders) {
+    headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, canonicalBody?.model || '', {
+      credentialMode: credentialModeFromOauth(exec?.vm?.claude || {}),
+      routing,
+      want1m: want1m === true,
+    })
+    const thread = pinThreadBetas(
+      main,
+      withRequestProtocolBetas(String(headers['anthropic-beta'] || '').split(','), main),
+    )
+    turn = thread.turn
+    headers['anthropic-beta'] = thread.betas.join(',')
+    if (!cliHop) gated = sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
+    else if (!officialBetas) gated = { ...main, betas: thread.betas }
+  }
   const directed = gateCragBody(gated, print, health, requestContext?.purpose === 'auto_mode_classifier')
   return {
     headers,
@@ -639,7 +647,7 @@ export function prepareWorkerPayload({
     cliHop,
     routing,
     acceptsCallerCwd: print && Array.isArray(health?.capabilities) && health.capabilities.includes('caller_cwd'),
-    thread: thread.turn,
+    thread: turn,
   }
 }
 
@@ -705,7 +713,7 @@ async function workerEnvelope({
     ...(requestContext ? { request_context: requestContext } : {}),
     ...(typeof outgoingCwd === 'string' ? { caller_cwd: outgoingCwd } : {}),
     body: finalized.body,
-    headers: finalized.headers,
+    ...(finalized.headers ? { headers: finalized.headers } : {}),
     stream: !!stream,
     delivery_mode: deliveryMode || 'realtime',
     preserve_cache_breakpoints: preserveCacheBreakpoints == null ? cacheTtl == null : preserveCacheBreakpoints === true,

@@ -664,7 +664,9 @@ export function scrubUpstreamClientBody(
   const reverse = {}
   const used = new Set()
   const assigned = new Map()
-  const declared = new Set(Array.isArray(out.tools) ? out.tools.map((tool) => tool?.name).filter(Boolean) : [])
+  const declared = new Set(
+    !preserveToolNames && Array.isArray(out.tools) ? out.tools.map((tool) => tool?.name).filter(Boolean) : [],
+  )
   const rename = (name) => {
     if (preserveToolNames) return name
     if (assigned.has(name)) return assigned.get(name)
@@ -699,7 +701,9 @@ export function scrubUpstreamClientBody(
     if (name !== undefined && name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
   }
   if (Array.isArray(out.messages)) {
-    out.messages = out.messages.map((message) => scrubMessage(message, rename))
+    out.messages = out.messages.map((message) =>
+      preserveToolNames && message?.role !== 'system' ? message : scrubMessage(message, rename),
+    )
   }
   return { body: out, reverse }
 }

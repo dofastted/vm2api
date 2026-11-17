@@ -161,13 +161,8 @@ async function fetchImageAsBase64(url, fetchImpl) {
   }
 }
 
-async function materializeBlock(block, fetchImpl) {
-  if (!block || typeof block !== 'object') return block
-  if (block.type === 'tool_result' && Array.isArray(block.content)) {
-    const nested = []
-    for (const child of block.content) nested.push(await materializeBlock(child, fetchImpl))
-    return { ...block, content: nested }
-  }
+function remoteImageUrl(block) {
+  if (!block || typeof block !== 'object') return ''
   const url =
     block.type === 'image' && block.source?.type === 'url'
       ? String(block.source.url || '')
@@ -176,7 +171,23 @@ async function materializeBlock(block, fetchImpl) {
           ? block.image_url
           : String(block.image_url?.url || '')
         : ''
-  if (!/^https?:\/\//i.test(url)) return block
+  return /^https?:\/\//i.test(url) ? url : ''
+}
+
+function hasRemoteImage(block) {
+  return block?.type === 'tool_result' && Array.isArray(block.content)
+    ? block.content.some(hasRemoteImage)
+    : !!remoteImageUrl(block)
+}
+
+async function materializeBlock(block, fetchImpl) {
+  if (block?.type === 'tool_result' && Array.isArray(block.content)) {
+    const nested = []
+    for (const child of block.content) nested.push(await materializeBlock(child, fetchImpl))
+    return { ...block, content: nested }
+  }
+  const url = remoteImageUrl(block)
+  if (!url) return block
   const source = await fetchImageAsBase64(url, fetchImpl)
   if (!source) return block
   const image = { type: 'image', source }
@@ -186,6 +197,8 @@ async function materializeBlock(block, fetchImpl) {
 /** Wrap CLI / SDK often reject `image.source.type=url`. Fetch to base64; leave URL if fetch fails. */
 export async function materializeRemoteImageSources(body, { fetchImpl = fetch } = {}) {
   if (!body || typeof body !== 'object' || !Array.isArray(body.messages)) return body
+  if (!body.messages.some((message) => Array.isArray(message?.content) && message.content.some(hasRemoteImage)))
+    return body
   let changed = false
   const messages = []
   for (const msg of body.messages) {
