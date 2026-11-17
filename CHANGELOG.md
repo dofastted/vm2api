@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 内核页默认拉取 CRAG `3.1.5` 标准签名包：普通请求与认证分类请求保留调用方的 system 文本块和缓存标记。沿用 `3.1.4` 的授权身份及官方 Claude Code `2.1.321`；旧版仍可选，本次不自动重装运行槽位。
+
 - 上游「Third-party apps now draw from your extra usage…」和「no third-party apps allowed」（HTTP 400/503）单独归类为 `third_party_client`：客户端收到 400 `invalid_request_error`，文案为中性说明，`details.upstream_message` 保留原文，请求日志 `error_code` 记为 `third_party_client`。主修复是 #1208（把第三方 system 搬进首条 user，避免触发）；这里只管漏网时的归类和兜底。不再报成 `refusal_guard`「usage policy」，不写拒答缓存、不封会话或设备（取代 #842 的缓存和 1.4.131 的会话封锁），不换号、不冷却槽位，请求日志归「请求格式」、不计 SLA 失败；历史上记成 `refusal_guard` 的同类行也按「请求格式」统计。
 
 ## 1.4.138 — 2026-11-18 · OpenAI 模型目录 6.2 系列默认暴露
