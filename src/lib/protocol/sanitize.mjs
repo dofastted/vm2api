@@ -177,8 +177,22 @@ export function promoteContentToBlocks(content) {
 export function promoteSystemToBlocks(system) {
   if (system == null || system === '') return system
   if (typeof system === 'string') return [{ type: 'text', text: system }]
-  if (!Array.isArray(system)) return system
+  if (!Array.isArray(system)) return [canonicalSystemBlock(system, 'system')]
   return system.map((block) => (typeof block === 'string' ? { type: 'text', text: block } : block))
+}
+
+function canonicalSystemBlock(block, param) {
+  if (typeof block === 'string') return { type: 'text', text: block }
+  if ((block?.type === 'text' || block?.type === undefined) && typeof block?.text === 'string') {
+    return block.type === 'text' ? block : { ...block, type: 'text' }
+  }
+  const code = 'invalid_system_block'
+  const message = `${param}: must be a text block with a string text field`
+  throw Object.assign(new Error(message), {
+    status: 400,
+    code,
+    body: { type: 'error', error: { type: 'invalid_request_error', code, param, message } },
+  })
 }
 
 /**
@@ -248,19 +262,15 @@ export function sanitizeAnthropicBody(
   const out = copyOfficialAnthropicFields(body)
   applyStructuredOutput(out, body)
 
-  if (!preserveContentShape && Array.isArray(out.system)) {
-    out.system = out.system
-      .map((b, index) => {
-        let block = b && typeof b === 'object' ? b : null
-        if (typeof b === 'string') block = { type: 'text', text: b }
-        else if (typeof b?.text === 'string') {
-          block = { type: 'text', text: b.text }
-          if (b.cache_control) block.cache_control = b.cache_control
-        }
-        onSystemBlock?.(block, index)
-        return block
-      })
-      .filter(Boolean)
+  if (!preserveContentShape && out.system != null && typeof out.system !== 'string') {
+    const list = Array.isArray(out.system)
+    out.system = (list ? out.system : [out.system]).map((value, index) => {
+      const source = canonicalSystemBlock(value, list ? `system[${index}]` : 'system')
+      const block = { type: 'text', text: source.text }
+      if (source.cache_control) block.cache_control = source.cache_control
+      onSystemBlock?.(block, index)
+      return block
+    })
   }
 
   const reuseHistory =
