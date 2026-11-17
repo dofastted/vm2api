@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
-import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
+import { alignSamplingWithThinking, sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
 import { prepareCliNodeRequest, prepareCragRequest } from '../protocol/kernel-request.mjs'
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
@@ -557,6 +557,7 @@ function dumpSessionEnvelope(envelope) {
 
 function gateCragBody(body, print, health, isolated = false) {
   if (!body || typeof body !== 'object') return body
+  if (print) alignSamplingWithThinking(body)
   const caps = print && Array.isArray(health?.capabilities) ? health.capabilities : []
   const prompt = body.crag_prompt
   const model =
