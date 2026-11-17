@@ -330,9 +330,22 @@ function hasKernelFailureCode(result) {
   return Object.hasOwn(KERNEL_FAILURE_STATUS, String(result?.body?.error?.code || ''))
 }
 
+/**
+ * The provider answered 429 before anything reached the caller. The native
+ * stream path tags every failed hop 'incomplete', so when all accounts were
+ * rate limited the caller got a generic 502 incomplete_response and a gateway
+ * in front read it as a broken upstream. The 429 (with its retry-after) is the
+ * complete answer.
+ */
+function isUncommittedRateLimitAnswer(result) {
+  if (result.committed || Number(result.status) !== 429) return false
+  return result.body?.type === 'error' || !!result.body?.error
+}
+
 function isUnfinishedLastResult(result, policy) {
   if (!result) return false
   if (policy?.reason === 'incomplete_assistant') return true
+  if (isUncommittedRateLimitAnswer(result)) return false
   if (hasKernelFailureCode(result)) return false
   if (result.terminalState === 'incomplete') return true
   return isIncompleteAssistantMessage(result)

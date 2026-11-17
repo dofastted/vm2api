@@ -2372,3 +2372,32 @@ test('signature 400 without foreign thinking still surfaces with the switch off'
   assert.equal(result.status, 400)
   assert.equal(calls, 1)
 })
+
+// 2026-11-17 prod: three accounts each answered 429 (native stream path tags any
+// failed hop 'incomplete'), and the caller got 502 incomplete_response.
+test('when every account answers 429 the caller gets that 429, not a generic 502', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const seen = []
+  const runner = new FailoverRunner({ scheduler, config: { same_account_retry_delay_ms: 0 } })
+  const result = await runner.run({
+    requestId: 'req-all-429',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return {
+        ok: false,
+        status: 429,
+        committed: false,
+        terminalState: 'incomplete',
+        headers: { 'retry-after': '30' },
+        body: { type: 'error', error: { type: 'rate_limit_error', message: 'Error' } },
+      }
+    },
+  })
+  assert.ok(seen.includes('account-1') && seen.includes('account-2'), 'every account was tried first')
+  assert.equal(result.ok, false)
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.type, 'rate_limit_error')
+  assert.equal(result.headers['retry-after'], '30')
+})
