@@ -8,6 +8,7 @@ import {
   prepareSlotOAuth,
   runGuestOAuthAuthService,
 } from '../../src/lib/oauth/guest-oauth-helper.mjs'
+import { CRAG_CLAUDE_VERSION } from '../../src/lib/vm/slot-engine.mjs'
 
 test('OAuth without native telemetry uses the persisted bound exit without starting the slot', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-legacy-'))
@@ -113,23 +114,24 @@ test('guest OAuth helper delegates egress selection to the slot network', async 
   }
 })
 
-test('guest OAuth uses the installed native Claude version, and does not exchange when it is unreadable', async () => {
+test('guest OAuth takes the version from the locked crag entrypoint, without an extra exec', async () => {
   const exec = {
     projectRoot: '/srv/vm2api',
     vmId: 'vm-01',
     vm: { id: 'vm-01', dataplane: 'crag', crag_kernel_version: 'v2', runtime_type: 'kvm' },
   }
   const calls = []
-  const run = (stdout) =>
+  const run = (vm) =>
     runGuestOAuthAuthService(
+      // A caller-supplied version must not win over the entrypoint's own.
       { operation: 'exchange_code', claude_version: '0.0.0' },
       {
-        exec,
+        exec: { ...exec, vm },
         prepare: async () => ({
-          exec,
+          exec: { ...exec, vm },
           host: {
             bakedKernel: true,
-            bins: { oauthAuth: '/usr/local/bin/kin-oauth-auth' },
+            bins: { oauthAuth: '/usr/local/bin/kin-oauth-auth', cli: '/opt/kin/cli-node' },
             dockerEnv: () => ({}),
             execUser: () => 'kincli',
           },
@@ -139,15 +141,21 @@ test('guest OAuth uses the installed native Claude version, and does not exchang
         postTelemetry: async () => ({ ok: true }),
         runDocker: async (argv, { stdin }) => {
           calls.push({ argv, stdin })
-          if (argv.at(-1) === '--version') return { code: 0, stdout }
           return { code: 0, stdout: JSON.stringify({ ok: true, credential: { access_token: 'fixture-access' } }) }
         },
       },
     )
-  await run('2.1.321 (Claude Code)\n')
-  assert.equal(calls[0].argv.at(-1), '--version')
-  assert.ok(calls[0].argv.includes('/usr/local/bin/kin-guest-exec'))
-  assert.equal(JSON.parse(calls[1].stdin).claude_version, '2.1.321')
-  await assert.rejects(run('unknown'), { code: 'oauth_cli_version_unavailable' })
-  assert.equal(calls.length, 3)
+
+  const credential = await run(exec.vm)
+  assert.equal(credential.access_token, 'fixture-access')
+  assert.equal(JSON.parse(calls[0].stdin).claude_version, CRAG_CLAUDE_VERSION)
+  // One exec only: the helper itself. Reading the version back off the CLI cost an
+  // exec per exchange and refused valid exchanges when it failed.
+  assert.equal(calls.length, 1)
+  assert.ok(!calls.some((call) => call.argv.includes('--version')))
+
+  // A non-crag slot has no locked entrypoint, so the caller's value stands.
+  await run({ ...exec.vm, dataplane: 'wrap' })
+  assert.equal(JSON.parse(calls[1].stdin).claude_version, '0.0.0')
+  assert.equal(calls.length, 2)
 })

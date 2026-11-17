@@ -151,22 +151,11 @@ export async function runGuestOAuthAuthService(
   await record('start')
   try {
     const selected = resolveSlotClaude(exec.vm, routing, host)
-    let claudeVersion = payload.claude_version
-    if (selected.native) {
-      const version = await runDocker(
-        slotExecArgv(exec.vm, [selected.bin, '--version'], { user: host.execUser(exec.vm) }),
-        {
-          env: host.dockerEnv(),
-          timeoutMs: Math.min(timeoutMs, 5000),
-        },
-      )
-      claudeVersion =
-        version?.code === 0 && !version.timed_out && !version.output_limit
-          ? /^([0-9]+\.[0-9]+\.[0-9]+)(?:\s|$)/.exec(String(version.stdout || '').trim())?.[1]
-          : undefined
-      if (!claudeVersion)
-        throw fail('oauth_cli_version_unavailable', 'Cannot read the selected native Claude CLI version')
-    }
+    // The crag v2 entrypoint is version-locked by its own path and payload ships
+    // that exact build, so the UA version comes from the entrypoint itself. Asking
+    // the CLI for it cost an exec per exchange and refused valid exchanges whenever
+    // that exec failed, for a value that was already known.
+    const claudeVersion = selected.native ? selected.version : payload.claude_version
     // Linux slots join a kin-eg-* transparent network: the network picks the exit,
     // so the helper gets no proxy at all. This '' is not a resolved exit and must
     // not be replaced by one — a resolved URL may be a controller-local forwarder,
