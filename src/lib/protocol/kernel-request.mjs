@@ -1,4 +1,4 @@
-import { sanitizeAnthropicBody, messageHasTurnControls } from './sanitize.mjs'
+import { isSmallTextTurn, sanitizeAnthropicBody, messageHasTurnControls } from './sanitize.mjs'
 
 const INTERNAL_FIELDS = ['gateway_policy', 'request_context', 'kin_outbound_shape', 'request_id', 'delivery_mode']
 const CRAG_ALIASES = new Set(['model', 'max_tokens', 'effort', 'cache_ttl', 'session_slots'])
@@ -39,7 +39,7 @@ function validateContent(content, param) {
   }
 }
 
-function canonicalRequest(body) {
+function canonicalRequest(body, { reuseCanonicalHistory = false } = {}) {
   if (!object(body)) invalid('body', 'must be an object')
   if (typeof body.model !== 'string' || !body.model.trim()) invalid('model', 'is required')
   if (body.max_tokens != null && (!Number.isSafeInteger(body.max_tokens) || body.max_tokens < 1)) {
@@ -77,7 +77,7 @@ function canonicalRequest(body) {
   }
   // Keep official extension fields, history bytes and cache anchors. In particular,
   // changing tool IDs or thinking signatures here invalidates CRAG continuation hashes.
-  const out = sanitizeAnthropicBody(body, { preserveContentShape: false })
+  const out = sanitizeAnthropicBody(body, { reuseCanonicalHistory })
   for (const key of INTERNAL_FIELDS) delete out[key]
   if (!out.messages.length) invalid('messages', 'contains no content after normalization')
   return out
@@ -98,7 +98,7 @@ export function prepareCliNodeRequest(body) {
 
 /** Native CRAG imports history itself; PTY projection remains worker-owned. */
 export function prepareCragRequest(body, health) {
-  const out = canonicalRequest(body)
+  const out = canonicalRequest(body, { reuseCanonicalHistory: !isSmallTextTurn(body) })
   if (health?.capabilities?.includes('generation_controls_v3')) {
     for (const [index, tool] of (out.tools || []).entries()) {
       if (tool.type != null && !['custom', 'advisor_20260301'].includes(tool.type)) {

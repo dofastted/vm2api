@@ -1209,6 +1209,7 @@ export function createHandleProtocol(deps) {
         official: officialTraffic === true,
         rewriteTools: getRouting()?.compatibility?.tool_name_rewrite !== false,
         preserveToolNames: deferToolNameRewrite,
+        reuseCanonicalHistory: inferenceBackend !== 'api',
       })
       ctx.body = standard.body
       inboundToolReverse = standard.reverse
@@ -1762,10 +1763,13 @@ export function createHandleProtocol(deps) {
               // once more at this boundary so passthrough traffic cannot carry
               // client/OpenAI fields into the native worker.
               const cragInput = hasCragSystem ? { ...personaIn, system: cragSystem } : personaIn
+              const reuseHistory = !officialPassthrough && !repaired && !extra.repairs?.length
               const cragStandard = toStandardAnthropicBody(cragInput, {
                 official: officialTraffic === true,
                 rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
                 preserveToolNames,
+                reuseCanonicalHistory: reuseHistory,
+                shareUnchanged: reuseHistory,
               })
               const cragToolReverse = composeToolNames(inboundToolReverse, cragStandard.reverse)
               // The CRAG kernel fingerprints the public stream it already sent,
@@ -1797,6 +1801,7 @@ export function createHandleProtocol(deps) {
                 official: officialTraffic === true,
                 rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
                 preserveToolNames,
+                shareUnchanged: reuseHistory,
               })
               hopBody = scrubbed.body
               if (

@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import {
   anthropicContentIsEmpty,
   dropEmptySystemControlTurns,
+  isSmallTextTurn,
   liftMidConversationSystemMessages,
   mergeConsecutiveAnthropicMessages,
   messageHasTurnControls,
@@ -655,10 +656,10 @@ export function wireToolName(name, { official = false, rewriteTools = true } = {
  */
 export function scrubUpstreamClientBody(
   body,
-  { official = false, rewriteTools = true, preserveToolNames = false } = {},
+  { official = false, rewriteTools = true, preserveToolNames = false, shareUnchanged = false } = {},
 ) {
   if (!body || typeof body !== 'object') return { body, reverse: {} }
-  const out = clone(body)
+  const out = shareUnchanged && !isSmallTextTurn(body) ? { ...body } : clone(body)
   const reverse = {}
   const used = new Set()
   const assigned = new Map()
@@ -802,7 +803,9 @@ export function composeToolNames(front = {}, hop = {}) {
  * official passthrough is on; the project template writes its own.
  */
 export function toStandardAnthropicBody(body, options = {}) {
-  const shaped = sanitizeAnthropicBody(stripCallerBilling(body), { preserveContentShape: false })
+  const shaped = sanitizeAnthropicBody(stripCallerBilling(body), {
+    reuseCanonicalHistory: options.reuseCanonicalHistory === true && !isSmallTextTurn(body),
+  })
   applyMaxTokensCap(shaped)
   return scrubUpstreamClientBody(shaped, options)
 }
