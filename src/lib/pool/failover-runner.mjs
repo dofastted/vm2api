@@ -1096,7 +1096,10 @@ export class FailoverRunner {
           )
         }
         notifyProxyFailure(this.onProxyFailure, selected, policy)
-        if (policy.reason === 'fable_plan_denied' && typeof this.onFablePlanDenied === 'function') {
+        if (
+          (policy.reason === 'fable_plan_denied' || policy.reason === 'fable_credits_required') &&
+          typeof this.onFablePlanDenied === 'function'
+        ) {
           try {
             this.onFablePlanDenied({ selected, policy })
           } catch {}

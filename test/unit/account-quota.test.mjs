@@ -34,6 +34,20 @@ test('a model entitlement rejection is persisted for that account and model', ()
   assert.equal(q.repo.get('a-denied').unified.model_denied_until['claude-fable-5'], undefined)
 })
 
+test('a Fable usage-credits rejection blocks Fable and leaves a panel marker until a success', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'a-credits' })
+  q.markFableCreditsRequired('a-credits', 'claude-fable-5-2', 60_000)
+  const u = q.repo.get('a-credits').unified
+  const key = u.fable_credits_required.model
+  assert.ok(u.model_denied_until[key] > Date.now())
+  assert.equal(Date.parse(u.fable_credits_required.until), u.model_denied_until[key])
+  q.clearModelUnsupported('a-credits', 'claude-fable-5-2')
+  const cleared = q.repo.get('a-credits').unified
+  assert.equal(cleared.model_denied_until[key], undefined)
+  assert.equal(cleared.fable_credits_required, undefined)
+})
+
 function futureReset(msFromNow) {
   return new Date(Date.now() + msFromNow).toISOString()
 }

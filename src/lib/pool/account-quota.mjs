@@ -55,6 +55,9 @@ import {
   worstGateZone,
 } from './quota-gate.mjs'
 
+/** How long a 'usage credits required' Fable answer keeps Fable off the seat. */
+export const FABLE_CREDITS_DENY_MS = 6 * 60 * 60_000
+
 export { extraHeadersFromLimitError }
 export { estimateRequestRisk }
 
@@ -1187,6 +1190,34 @@ export class AccountQuota {
     return this.repo.save(acc)
   }
 
+  /**
+   * Upstream said this account needs usage credits for Fable. Keep Fable off
+   * the seat for a while (other models still route) and leave a marker the
+   * panel shows instead of 未探测. The marker sits outside `unified.fable`
+   * because a Pro usage probe deletes that object. A later Fable success on
+   * the account clears both via clearModelUnsupported.
+   */
+  markFableCreditsRequired(accountId, model, durationMs = FABLE_CREDITS_DENY_MS) {
+    const key = resolvePolicyModelId(model) || String(model || '').trim()
+    if (!accountId || !key) return null
+    const acc = this.repo.get(accountId)
+    if (!acc) return null
+    const now = Date.now()
+    const until = now + durationMs
+    acc.unified = acc.unified || {}
+    acc.unified.model_denied_until = {
+      ...(acc.unified.model_denied_until || {}),
+      [key]: until,
+    }
+    acc.unified.fable_credits_required = {
+      model: key,
+      at: new Date(now).toISOString(),
+      until: new Date(until).toISOString(),
+    }
+    acc.unified.updated_at = new Date(now).toISOString()
+    return this.repo.save(acc)
+  }
+
   clearModelUnsupported(accountId, model) {
     const key = resolvePolicyModelId(model) || String(model || '').trim()
     if (!accountId || !key) return null
@@ -1195,6 +1226,7 @@ export class AccountQuota {
     const denied = { ...acc.unified.model_denied_until }
     delete denied[key]
     acc.unified.model_denied_until = denied
+    if (acc.unified.fable_credits_required?.model === key) delete acc.unified.fable_credits_required
     acc.unified.updated_at = new Date().toISOString()
     return this.repo.save(acc)
   }

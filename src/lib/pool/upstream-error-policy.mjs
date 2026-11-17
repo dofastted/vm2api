@@ -20,6 +20,11 @@ const ENTITLEMENT_PATTERNS = [
   /fast (?:mode|request).*(?:credit|entitlement)/i,
 ]
 
+// A Fable 429 with one of these bodies is the account's plan, not this request:
+// Pro seats whose included Fable allowance is gone answer every Fable request
+// this way until credits are bought. Any other model keeps the request stop.
+const FABLE_CREDITS_PATTERNS = [/extra usage required/i, /usage credits? (?:are )?required/i]
+
 const SIGNATURE_PATTERNS = [
   /signature/i,
   /expected[`\s].*thinking/i,
@@ -634,6 +639,19 @@ function classifyUpstreamResultRaw(
   }
   if (status === 429) {
     if (ENTITLEMENT_PATTERNS.some((pattern) => pattern.test(message))) {
+      if (
+        isFableModel(model) &&
+        !/\bfast (?:mode|request)/i.test(message) &&
+        FABLE_CREDITS_PATTERNS.some((pattern) => pattern.test(message))
+      ) {
+        return {
+          scope: 'account',
+          action: 'continue',
+          reason: 'fable_credits_required',
+          cooldownUntil: null,
+          retrySameAccount: false,
+        }
+      }
       return { scope: 'request', action: 'stop', reason: 'entitlement_required', cooldownUntil: null }
     }
     const facts = result.providerResult

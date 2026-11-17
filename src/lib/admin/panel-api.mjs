@@ -1651,6 +1651,17 @@ function hostStats() {
   }
 }
 
+/** The 'usage credits required' Fable marker while its routing block lasts. */
+function activeFableCreditsRequired(unified, now = Date.now()) {
+  const mark = unified?.fable_credits_required
+  if (!mark) return null
+  const until = Date.parse(mark.until || '')
+  if (!Number.isFinite(until) || until <= now) return null
+  const deniedUntil = Number(unified.model_denied_until?.[mark.model]) || 0
+  if (deniedUntil <= now) return null
+  return { model: mark.model || null, at: mark.at || null, until: mark.until }
+}
+
 export function quotaFromAccount(acc, quotaConfig) {
   const u = acc?.unified || {}
   const listed = listQuotaFromHeaders(u)
@@ -1703,6 +1714,7 @@ export function quotaFromAccount(acc, quotaConfig) {
     account_tier: u.account_tier || null,
     account_tier_source: u.account_tier_source || null,
     usage_has_fable: u.usage_has_fable ?? null,
+    fable_credits_required: activeFableCreditsRequired(u),
   }
   const cfg = weeklySplitConfig(quotaConfig || {})
   const split = publicWeeklySplit(
@@ -2158,6 +2170,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     subscription_type: isCodex ? null : v.subscription_type || null,
     rate_limit_tier: isCodex ? null : v.rate_limit_tier || null,
     usage_has_fable: isCodex ? null : q.usage_has_fable,
+    fable_credits_required: isCodex ? null : q.fable_credits_required || null,
     availability,
     cred_status: credStatusFromAvailability(availability),
     cooldown_until: Number(restrictionUntil) > Date.now() ? Number(restrictionUntil) : null,
