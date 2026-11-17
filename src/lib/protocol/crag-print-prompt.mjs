@@ -214,6 +214,17 @@ export function cragPromptTooLarge(bytes) {
   return error
 }
 
+// Unwrapped result items become top-level user blocks. CRAG takes text, image
+// and document there; a ToolSearch tool_reference (or any other result-only
+// block) is rejected as "unsupported native history block", so it goes to text.
+const READ_ONLY_RESULT_TYPES = new Set(['text', 'image', 'document'])
+
+function readOnlyResultBlock(item) {
+  if (READ_ONLY_RESULT_TYPES.has(item?.type)) return item
+  if (item?.type === 'tool_reference') return { type: 'text', text: `[tool_reference ${item.tool_name}]` }
+  return { type: 'text', text: JSON.stringify(item) }
+}
+
 function readOnlySummaryResults(messages) {
   if (!Array.isArray(messages)) return messages
   const index = messages.findLastIndex((message) => message?.role === 'user')
@@ -227,7 +238,7 @@ function readOnlySummaryResults(messages) {
     const label = { type: 'text', text: `[tool result ${block.tool_use_id}${block.is_error ? ' (error)' : ''}]` }
     if (block.cache_control) label.cache_control = block.cache_control
     const result = typeof block.content === 'string' ? [{ type: 'text', text: block.content }] : block.content || []
-    return [label, ...result]
+    return [label, ...result.map(readOnlyResultBlock)]
   })
   const out = messages.slice()
   out[index] = { ...message, content }
