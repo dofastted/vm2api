@@ -121,6 +121,10 @@ export function normalizePoolRouting(pool = {}) {
   // Off by default: Pro may carry Fable. Turn on when Pro accounts only answer
   // Fable with 'usage credits required'.
   next.fable_requires_max = next.fable_requires_max === true
+  // A new seat tries the family home (where the parent conversation runs)
+  // before the device home, so sub-agents and side requests join their
+  // parent's account. Off by default: machine first, then family.
+  next.family_affinity_first = next.family_affinity_first === true
   next.queue_max = clampNumber(next.queue_max, DEFAULT_POOL_ROUTING.queue_max, QUEUE_MAX_MIN, QUEUE_MAX_MAX)
   next.seat_grace_ms = clampNumber(next.seat_grace_ms, DEFAULT_POOL_ROUTING.seat_grace_ms, 0, SEAT_GRACE_MAX_MS)
   next.seat_budget_reserve_pct = clampNumber(
@@ -204,12 +208,11 @@ function sessionIdFromStickyKey(key) {
   return body.slice('sess:'.length)
 }
 
-/** Soft affinity for new sessions: machine, then family. */
-function seatHomes({ deviceVm = '', familyVm = '' } = {}) {
-  const homes = [
-    { vmId: String(deviceVm || '').trim(), reason: 'device-affinity' },
-    { vmId: String(familyVm || '').trim(), reason: 'family-affinity' },
-  ]
+/** Soft affinity for new sessions: machine, then family (`familyFirst`: family, then machine). */
+export function seatHomes({ deviceVm = '', familyVm = '', familyFirst = false } = {}) {
+  const device = { vmId: String(deviceVm || '').trim(), reason: 'device-affinity' }
+  const family = { vmId: String(familyVm || '').trim(), reason: 'family-affinity' }
+  const homes = familyFirst ? [family, device] : [device, family]
   const seen = new Set()
   return homes.filter((home) => {
     if (!home.vmId || seen.has(home.vmId)) return false
@@ -1089,6 +1092,7 @@ export class PoolScheduler extends EventEmitter {
             const homes = seatHomes({
               deviceVm: this.machineHome(machineKey) || deviceVmId,
               familyVm: familyGated ? '' : familyVm,
+              familyFirst: this.config.family_affinity_first === true,
             })
             const granted = this.openNewSeat(seatKey, candidates, {
               avoided,

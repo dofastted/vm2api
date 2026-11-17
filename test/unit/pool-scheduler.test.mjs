@@ -3556,3 +3556,18 @@ test('pool routing normalizes session_affinity_first to a strict boolean', () =>
   assert.equal(normalizePoolRouting({ session_affinity_first: 'yes' }).session_affinity_first, false)
   assert.equal(normalizePoolRouting({ session_affinity_first: true }).session_affinity_first, true)
 })
+
+test('seatHomes: machine first by default, family first when family_affinity_first is on', async () => {
+  const { seatHomes, normalizePoolRouting: normalize } = await import('../../src/lib/pool/pool-scheduler.mjs')
+  assert.deepEqual(
+    seatHomes({ deviceVm: 'vm-dev', familyVm: 'vm-fam' }).map((home) => home.reason),
+    ['device-affinity', 'family-affinity'],
+  )
+  assert.deepEqual(
+    seatHomes({ deviceVm: 'vm-dev', familyVm: 'vm-fam', familyFirst: true }).map((home) => home.vmId),
+    ['vm-fam', 'vm-dev'],
+  )
+  assert.equal(seatHomes({ deviceVm: 'vm-1', familyVm: 'vm-1', familyFirst: true }).length, 1)
+  assert.equal(normalize({}).family_affinity_first, false)
+  assert.equal(normalize({ family_affinity_first: true }).family_affinity_first, true)
+})
