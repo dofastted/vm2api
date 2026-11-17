@@ -2196,6 +2196,28 @@ test('fable usage-credits 429 marks the account and failovers to the next one', 
   assert.equal(scheduler.cooldowns.length, 0)
 })
 
+test('when every account needs Fable usage credits the caller gets that 429, not a generic 502', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler, onFablePlanDenied: () => {} })
+  const result = await runner.run({
+    requestId: 'req-fable-credits-all',
+    canonicalBody: { model: 'claude-fable-5-2' },
+    model: 'claude-fable-5-2',
+    callAttempt: () => ({
+      ok: false,
+      status: 429,
+      terminalState: 'incomplete',
+      body: {
+        type: 'error',
+        error: { type: 'rate_limit_error', message: 'Usage credits are required for this model.' },
+      },
+    }),
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.status, 429)
+  assert.match(result.body.error.message, /Usage credits are required/)
+})
+
 function leasingScheduler(candidates, cap = 2) {
   const state = { inflight: 0, selects: [] }
   return {
