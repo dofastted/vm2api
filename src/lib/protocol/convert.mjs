@@ -5,6 +5,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import {
   appendLiftedSystemMessage,
   applyStructuredOutput,
@@ -90,10 +91,10 @@ function appendCompatibleServerTool(out, tool) {
 }
 
 /** OpenAI tools → Claude tools. Native definitions take precedence over OpenAI search aliases. */
-export function openaiToolsToClaude(tools) {
+export function openaiToolsToClaude(tools, { remapNames = true } = {}) {
   if (!Array.isArray(tools) || !tools.length) return undefined
   const out = []
-  for (const t of remapCodexTools(tools)) {
+  for (const t of remapNames ? remapCodexTools(tools) : tools) {
     if (!t) continue
     if (appendCompatibleServerTool(out, t)) continue
     if (!(t.type === 'function' || t.function || t.name)) continue
@@ -311,35 +312,103 @@ function acceptQuality(accept, type) {
 export function normalizeOpenAIToolsOnMessages(body) {
   if (!body || typeof body !== 'object' || !inboundHasOpenAIToolShape(body)) return body
   const out = { ...body }
-  const tools = openaiToolsToClaude(body.tools)
+  const tools = openaiToolsToClaude(body.tools, { remapNames: false })
   if (tools) out.tools = tools
   const choice = openaiToolChoiceToClaude(body.tool_choice)
   if (choice) out.tool_choice = choice
   return out
 }
 
+function normalizeMixedToolHistory(body) {
+  if (!Array.isArray(body.messages) || !body.messages.some((msg) => msg?.role === 'tool' || msg?.tool_calls != null)) {
+    return body
+  }
+  const invalid = (param, reason) => invalidConversion('invalid_messages_conversion', param, reason)
+  const origins = new WeakMap()
+  const messages = []
+  for (const [index, message] of body.messages.entries()) {
+    const path = `messages[${index}]`
+    let converted = message
+    if (message?.role === 'tool') {
+      if (!validToolCallId(message.tool_call_id)) invalid(`${path}.tool_call_id`, 'must be a valid tool call ID')
+      if (typeof message.content !== 'string' && !Array.isArray(message.content)) {
+        invalid(`${path}.content`, 'must be text or content blocks')
+      }
+      const { tool_call_id, content, cache_control, ...rest } = message
+      const result = { type: 'tool_result', tool_use_id: tool_call_id, content }
+      if (cache_control) result.cache_control = cache_control
+      origins.set(result, `${path}.tool_call_id`)
+      converted = { ...rest, role: 'user', content: [result] }
+    } else if (message?.tool_calls != null) {
+      if (message.role !== 'assistant' || !Array.isArray(message.tool_calls)) {
+        invalid(`${path}.tool_calls`, 'must be an array on an assistant message')
+      }
+      if (message.content != null && typeof message.content !== 'string' && !Array.isArray(message.content)) {
+        invalid(`${path}.content`, 'must be text or content blocks')
+      }
+      const { tool_calls, ...rest } = message
+      const content = Array.isArray(message.content)
+        ? [...message.content]
+        : message.content == null || message.content === ''
+          ? []
+          : [{ type: 'text', text: message.content }]
+      for (const [callIndex, call] of tool_calls.entries()) {
+        const callPath = `${path}.tool_calls[${callIndex}]`
+        const name = call?.function?.name
+        if (call?.type !== 'function' || typeof name !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(name)) {
+          invalid(callPath, 'must be a named function call')
+        }
+        if (!validToolCallId(call.id)) invalid(`${callPath}.id`, 'must be a valid tool call ID')
+        const input = parseToolArguments(call.function.arguments, `${callPath}.function.arguments`, invalid)
+        const block = withCacheControl({ type: 'tool_use', id: call.id, name, input }, call)
+        origins.set(block, `${callPath}.id`)
+        content.push(block)
+      }
+      if (!content.length) invalid(`${path}.content`, 'must contain text, content blocks or function calls')
+      converted = { ...rest, content }
+    }
+    if (Array.isArray(message?.content)) {
+      for (const [blockIndex, block] of message.content.entries()) {
+        if (block?.type === 'tool_use' || block?.type === 'tool_result') {
+          const field = block.type === 'tool_use' ? 'id' : 'tool_use_id'
+          origins.set(block, `${path}.content[${blockIndex}].${field}`)
+        }
+      }
+    }
+    const previous = messages.at(-1)
+    if (
+      toolOnlyMessage(previous, 'user', 'tool_result') &&
+      toolOnlyMessage(converted, 'user', 'tool_result') &&
+      (message.role === 'tool' || previous.content.some((block) => origins.get(block)?.endsWith('.tool_call_id')))
+    ) {
+      messages[messages.length - 1] = { ...previous, content: [...previous.content, ...converted.content] }
+    } else {
+      messages.push(converted)
+    }
+  }
+  return { ...body, messages: normalizeConvertedToolHistory(messages, origins, invalid) }
+}
+
 export function toClaudeMessages(protocol, body, opts = { rewrite: false, model_map: true }) {
-  if (protocol === 'anthropic.messages' && !opts.rewrite) {
-    const normalized = normalizeOpenAIToolsOnMessages(body)
+  if (protocol === 'anthropic.messages') {
+    const normalized = normalizeMixedToolHistory(normalizeOpenAIToolsOnMessages(body))
+    if (opts.rewrite) {
+      const model = mapModel(normalized.model || DEFAULT_MODEL, { allowMap: opts.model_map })
+      return {
+        claude: withUpstreamStream({
+          ...normalized,
+          model,
+          max_tokens: normalized.max_tokens || defaultMaxTokensForModel(model),
+        }),
+        mode: 'rewrite',
+      }
+    }
     const out = sanitizeAnthropicBody(normalized, {
       preserveContentShape: opts.preserve_content_shape === true,
       onSystemBlock: opts.onSystemBlock,
     })
     if (!out.max_tokens) out.max_tokens = defaultMaxTokensForModel(out.model)
-    return { claude: withUpstreamStream(out), mode: inboundHasOpenAIToolShape(body) ? 'convert' : 'passthrough' }
-  }
-
-  if (protocol === 'anthropic.messages' && opts.rewrite) {
-    return {
-      claude: withUpstreamStream({
-        ...normalizeOpenAIToolsOnMessages(body),
-        model: mapModel(body.model || DEFAULT_MODEL, { allowMap: opts.model_map }),
-        max_tokens:
-          body.max_tokens ||
-          defaultMaxTokensForModel(mapModel(body.model || DEFAULT_MODEL, { allowMap: opts.model_map })),
-      }),
-      mode: 'rewrite',
-    }
+    return { claude: withUpstreamStream(out), mode: normalized !== body ? 'convert' : 'passthrough' }
   }
 
   if (protocol === 'openai.chat') {
@@ -428,13 +497,122 @@ function decodeResponsesThinking(value, param) {
 }
 
 function invalidResponses(param, reason) {
+  invalidConversion('invalid_responses_conversion', param, reason)
+}
+
+function invalidConversion(code, param, reason) {
   const message = `${param}: ${reason}`
-  const code = 'invalid_responses_conversion'
   throw Object.assign(new Error(message), {
     status: 400,
     code,
     body: { type: 'error', error: { type: 'invalid_request_error', code, param, message } },
   })
+}
+
+function validToolCallId(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]+$/.test(value)
+}
+
+function parseToolArguments(value, param, invalid) {
+  let args = value
+  try {
+    if (typeof value === 'string') args = JSON.parse(value)
+  } catch {
+    invalid(param, 'must be a JSON object')
+  }
+  if (!args || typeof args !== 'object' || Array.isArray(args)) invalid(param, 'must be a JSON object')
+  return args
+}
+
+function toolOnlyMessage(message, role, type) {
+  return (
+    message?.role === role &&
+    Object.keys(message).every((key) => key === 'role' || key === 'content') &&
+    Array.isArray(message.content) &&
+    message.content.length > 0 &&
+    message.content.every((block) => block?.type === type)
+  )
+}
+
+function toolBlockHasCacheControl(block) {
+  return block?.cache_control || (Array.isArray(block?.content) && block.content.some((part) => part?.cache_control))
+}
+
+function normalizeConvertedToolHistory(messages, origins, invalid, { rejoinParallel = false } = {}) {
+  const history = []
+  const ids = new Set()
+  const pending = new Map()
+  let assistant
+  const bufferedResults = []
+  let regroupedCallPath
+  const missingResult = () => invalid(pending.values().next().value, 'tool call is missing its result')
+  for (const [index, message] of messages.entries()) {
+    const content = Array.isArray(message?.content) ? message.content : []
+    for (const block of content) {
+      if (block?.type === 'tool_use' && message.role !== 'assistant') {
+        invalid(origins.get(block), 'tool call must be in an assistant turn')
+      }
+      if (block?.type === 'tool_result' && message.role !== 'user') {
+        invalid(origins.get(block), 'tool result must be in a user turn')
+      }
+    }
+    if (message?.role === 'assistant') {
+      if (pending.size && !bufferedResults.length) missingResult()
+      for (const block of content) {
+        if (block?.type !== 'tool_use') continue
+        const path = origins.get(block)
+        if (!validToolCallId(block.id)) invalid(path, 'must be a valid tool call ID')
+        if (ids.has(block.id)) invalid(path, 'duplicate tool call_id')
+        ids.add(block.id)
+        pending.set(block.id, path)
+      }
+      if (bufferedResults.length) {
+        for (const block of content) assistant.content.push(block)
+        continue
+      }
+      assistant = rejoinParallel ? { ...message, content: [...content] } : message
+      history.push(assistant)
+      continue
+    }
+    const results = []
+    for (const block of content) {
+      if (block?.type !== 'tool_result') continue
+      if (!pending.delete(block.tool_use_id)) {
+        invalid(origins.get(block), 'tool result has no matching call in the preceding assistant turn')
+      }
+      results.push(block)
+    }
+    if (bufferedResults.length && content.some(toolBlockHasCacheControl)) {
+      invalid(regroupedCallPath, 'cannot regroup tool results across a cache boundary')
+    }
+    if (pending.size) {
+      const next = messages[index + 1]
+      if (
+        rejoinParallel &&
+        toolOnlyMessage(message, 'user', 'tool_result') &&
+        toolOnlyMessage(next, 'assistant', 'tool_use') &&
+        !results.some(toolBlockHasCacheControl) &&
+        !next.content.some(toolBlockHasCacheControl)
+      ) {
+        regroupedCallPath ??= pending.values().next().value
+        for (const block of results) bufferedResults.push(block)
+        continue
+      }
+      missingResult()
+    }
+    if (bufferedResults.length || (rejoinParallel && results.length)) {
+      history.push({
+        ...message,
+        content: [...bufferedResults, ...results, ...content.filter((block) => block?.type !== 'tool_result')],
+      })
+      bufferedResults.length = 0
+      regroupedCallPath = undefined
+      continue
+    }
+    history.push(message)
+  }
+  if (pending.size) missingResult()
+  return history
 }
 
 function responsesContent(content, param) {
@@ -467,8 +645,16 @@ function responsesToClaude(body, opts) {
     invalidResponses('input', 'provide full input history instead of a remote response or conversation reference')
   }
   const responseTools = new Map()
+  const toolDefinitions = new Map()
   const tools = []
   const addTool = (tool, namespace, path, discovered) => {
+    if (discovered && isVersionedAnthropicServerTool(tool)) {
+      const previous = tools.find((entry) => entry.name === tool.name && entry !== CLAUDE_WEB_SEARCH_TOOL)
+      if (previous) {
+        if (!isDeepStrictEqual(previous, tool)) invalidResponses(path, 'conflicting tool definition')
+        return
+      }
+    }
     if (appendCompatibleServerTool(tools, tool)) return
     const search = tool?.type === 'tool_search' && tool.execution === 'client'
     const definition = search
@@ -479,24 +665,13 @@ function responsesToClaude(body, opts) {
     const scope = namespace ?? definition?.namespace
     const name = typeof definition?.name === 'string' && responsesToolName({ name: definition.name, namespace: scope })
     if (!name || (!search && !['function', 'custom'].includes(tool?.type))) {
-      invalidResponses('tools', 'expected unique function or custom tools with Claude-compatible names')
-    }
-    const previous = responseTools.get(name)
-    if (previous) {
-      if (
-        discovered &&
-        previous.type === tool.type &&
-        previous.name === definition.name &&
-        previous.namespace === scope
-      )
-        return name
-      invalidResponses('tools', 'duplicate tool name')
+      invalidResponses(path, 'expected unique function or custom tools with Claude-compatible names')
     }
     let description = typeof definition.description === 'string' ? definition.description : ''
     if (tool.type === 'custom') {
       const format = tool.format
       if (format?.type && !['text', 'grammar'].includes(format.type))
-        invalidResponses('tools.format', 'unsupported custom tool format')
+        invalidResponses(`${path}.format`, 'unsupported custom tool format')
       description = [description, 'Provide the complete free-form tool input in the input string.', format?.definition]
         .filter(Boolean)
         .join('\n\n')
@@ -514,21 +689,33 @@ function responsesToClaude(body, opts) {
       const param = definition === tool.function ? `${path}.function.parameters` : `${path}.parameters`
       invalidResponses(param, 'must be an object schema without unsupported root combinations')
     }
-    responseTools.set(name, { type: tool.type, name: definition.name, namespace: scope })
-    tools.push(
-      withEagerInputStreaming(
-        withCacheControl(
-          {
-            name,
-            description,
-            input_schema: schema,
-            ...(typeof definition.strict === 'boolean' ? { strict: definition.strict } : {}),
-          },
-          definition.cache_control ? definition : tool,
-        ),
-        tool,
+    const mapping = { type: tool.type, name: definition.name, namespace: scope }
+    const cooked = withEagerInputStreaming(
+      withCacheControl(
+        {
+          name,
+          description,
+          input_schema: schema,
+          ...(typeof definition.strict === 'boolean' ? { strict: definition.strict } : {}),
+        },
+        definition.cache_control ? definition : tool,
       ),
+      tool,
     )
+    if (responseTools.has(name)) {
+      if (
+        discovered &&
+        isDeepStrictEqual(responseTools.get(name), mapping) &&
+        isDeepStrictEqual(toolDefinitions.get(name), cooked)
+      ) {
+        return name
+      }
+      invalidResponses(path, 'duplicate or conflicting tool definition')
+    }
+    if (discovered && tools.some((entry) => entry.name === name)) invalidResponses(path, 'conflicting tool definition')
+    responseTools.set(name, mapping)
+    toolDefinitions.set(name, cooked)
+    tools.push(cooked)
     return name
   }
   const addTools = (source, path, discovered = false) => {
@@ -538,7 +725,7 @@ function responsesToClaude(body, opts) {
         const toolPath = `${path}[${index}]`
         if (tool?.type !== 'namespace') return [addTool(tool, undefined, toolPath, discovered)]
         if (typeof tool.name !== 'string' || !tool.name || !Array.isArray(tool.tools)) {
-          invalidResponses('tools', 'namespace must have a name and tools')
+          invalidResponses(toolPath, 'namespace must have a name and tools')
         }
         return tool.tools.map((child, childIndex) =>
           addTool(child, tool.name, `${toolPath}.tools[${childIndex}]`, discovered),
@@ -552,6 +739,7 @@ function responsesToClaude(body, opts) {
   }
   const systemParts = body.instructions ? [{ type: 'text', text: body.instructions }] : []
   const messages = []
+  const origins = new WeakMap()
   const input = body.input ?? body.messages
   const items = typeof input === 'string' ? [input] : input
   if (!Array.isArray(items) || !items.length) invalidResponses('input', 'must contain conversation history')
@@ -571,26 +759,29 @@ function responsesToClaude(body, opts) {
       if (item.reasoning?.effort != null) requestedEffort = item.reasoning.effort
       continue
     }
+    if (item.type === 'additional_tools') {
+      if (item.role != null && item.role !== 'developer') invalidResponses(`${param}.role`, 'must be developer')
+      addTools(item.tools, `${param}.tools`, true)
+      continue
+    }
     if (['function_call', 'custom_tool_call', 'tool_search_call'].includes(item.type)) {
       replied = true
       if (item.encrypted_function_args?.length) invalidResponses(param, 'encrypted tool arguments cannot be replayed')
       const name =
         item.type === 'tool_search_call' ? 'tool_search' : typeof item.name === 'string' && responsesToolName(item)
       const id = item.call_id
-      if (!/^[A-Za-z0-9_-]+$/.test(typeof id === 'string' ? id : '') || !/^[A-Za-z0-9_-]{1,64}$/.test(name || '')) {
-        invalidResponses(param, 'tool call requires a valid call_id and name')
+      if (!validToolCallId(id)) invalidResponses(`${param}.call_id`, 'must be a valid tool call ID')
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(name || '')) invalidResponses(`${param}.name`, 'must be a valid tool name')
+      if (item.type === 'custom_tool_call' && typeof item.input !== 'string') {
+        invalidResponses(`${param}.input`, 'must be text')
       }
-      let args
-      if (item.type === 'custom_tool_call' && typeof item.input === 'string') args = { input: item.input }
-      if (item.type !== 'custom_tool_call') {
-        try {
-          args = typeof item.arguments === 'string' ? JSON.parse(item.arguments) : item.arguments
-        } catch {
-          invalidResponses(`${param}.arguments`, 'must be a JSON object')
-        }
-      }
-      if (!args || typeof args !== 'object' || Array.isArray(args)) invalidResponses(param, 'invalid tool arguments')
-      messages.push({ role: 'assistant', content: [{ type: 'tool_use', id, name, input: args }] })
+      const args =
+        item.type === 'custom_tool_call'
+          ? { input: item.input }
+          : parseToolArguments(item.arguments, `${param}.arguments`, invalidResponses)
+      const block = withCacheControl({ type: 'tool_use', id, name, input: args }, item)
+      origins.set(block, `${param}.call_id`)
+      messages.push({ role: 'assistant', content: [block] })
       continue
     }
     if (['function_call_output', 'custom_tool_call_output', 'tool_search_output'].includes(item.type)) {
@@ -603,7 +794,9 @@ function responsesToClaude(body, opts) {
               },
             ]
           : responsesContent(item.output, `${param}.output`)
-      messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: item.call_id, content }] })
+      const block = withCacheControl({ type: 'tool_result', tool_use_id: item.call_id, content }, item)
+      origins.set(block, `${param}.call_id`)
+      messages.push({ role: 'user', content: [block] })
       continue
     }
     const role = item.type === 'agent_message' ? 'user' : item.role
@@ -629,31 +822,14 @@ function responsesToClaude(body, opts) {
       messages.push({ role, content })
     }
   }
-  const history = mergeConsecutiveAnthropicMessages(messages)
-  const ids = new Set()
-  let pending = new Set()
-  for (const message of history) {
-    const next = new Set()
-    for (const block of message.content) {
-      if (block.type === 'tool_use') {
-        if (ids.has(block.id)) invalidResponses('input', 'duplicate tool call_id')
-        next.add(block.id)
-        ids.add(block.id)
-      }
-      if (block.type === 'tool_result' && !pending.delete(block.tool_use_id)) {
-        invalidResponses('input', 'tool result has no matching call in the preceding assistant turn')
-      }
-    }
-    if (pending.size) invalidResponses('input', 'tool call is missing its result')
-    pending = next
-    if (message.content.some((block) => block.type === 'tool_result')) {
-      message.content = [
-        ...message.content.filter((block) => block.type === 'tool_result'),
-        ...message.content.filter((block) => block.type !== 'tool_result'),
-      ]
-    }
-  }
-  if (pending.size) invalidResponses('input', 'tool call is missing its result')
+  const history = normalizeConvertedToolHistory(
+    mergeConsecutiveAnthropicMessages(messages),
+    origins,
+    invalidResponses,
+    {
+      rejoinParallel: true,
+    },
+  )
   if (
     !history.some(
       (message) =>

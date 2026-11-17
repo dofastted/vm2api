@@ -296,6 +296,111 @@ test('Responses rejects root alternatives that cannot keep their input constrain
   )
 })
 
+test('Messages converts mixed Chat tool history without rebuilding signed Claude blocks', () => {
+  const thinking = { type: 'thinking', thinking: 'plan', signature: 'fixture-signature' }
+  const marker = { type: 'ephemeral' }
+  const messages = [
+    { role: 'user', content: 'Read the sample' },
+    {
+      role: 'assistant',
+      content: [thinking],
+      tool_calls: [{ type: 'function', id: 'call_read', function: { name: 'read_file', arguments: '{"page":1}' } }],
+    },
+    { role: 'tool', tool_call_id: 'call_read', content: 'sample', cache_control: marker },
+    { role: 'user', content: 'Summarize it' },
+  ]
+  const schema = { type: 'object' }
+  const tools = [{ type: 'function', function: { name: 'read_file', parameters: schema } }]
+  for (const rewrite of [false, true]) {
+    const { claude, mode } = toClaudeMessages('anthropic.messages', { model: MODEL, messages, tools }, { rewrite })
+    assert.equal(mode, rewrite ? 'rewrite' : 'convert')
+    assert.deepEqual(claude.tools, [{ name: 'read_file', description: '', input_schema: schema }])
+    assert.deepEqual(claude.messages[1], {
+      role: 'assistant',
+      content: [thinking, { type: 'tool_use', id: 'call_read', name: 'read_file', input: { page: 1 } }],
+    })
+    assert.deepEqual(claude.messages[2].content[0], {
+      type: 'tool_result',
+      tool_use_id: 'call_read',
+      content: 'sample',
+      cache_control: marker,
+    })
+    assert.equal(messages[1].tool_calls.length, 1)
+    assert.equal(messages[2].role, 'tool')
+  }
+  assert.throws(
+    () => toClaudeMessages('anthropic.messages', { model: MODEL, messages: messages.slice(0, 2), tools }),
+    (error) =>
+      error.status === 400 &&
+      error.code === 'invalid_messages_conversion' &&
+      error.body.error.param === 'messages[1].tool_calls[0].id',
+  )
+})
+
+test('Responses registers additional_tools and coalesces overlapping tool-only exchanges', () => {
+  const read = { type: 'function', name: 'read', parameters: { type: 'object' } }
+  const definition = { type: 'namespace', name: 'sample', tools: [read] }
+  const call = (name) => ({
+    type: 'function_call',
+    call_id: `call_${name}`,
+    namespace: 'sample',
+    name: 'read',
+    arguments: '{}',
+  })
+  const result = (name) => ({ type: 'function_call_output', call_id: `call_${name}`, output: name })
+  const input = [
+    { role: 'user', content: 'Read the sample' },
+    { type: 'additional_tools', role: 'developer', tools: [definition] },
+    call('first'),
+    call('second'),
+    result('first'),
+    call('third'),
+    result('third'),
+    result('second'),
+  ]
+  const { claude, responseTools } = toClaudeMessages('openai.responses', { model: MODEL, input, tools: [definition] })
+  assert.deepEqual(
+    claude.tools.map((tool) => tool.name),
+    ['sample__read'],
+  )
+  assert.equal(responseTools.get('sample__read').name, 'read')
+  assert.deepEqual(
+    claude.messages.map((message) => message.role),
+    ['user', 'assistant', 'user'],
+  )
+  assert.deepEqual(
+    claude.messages[1].content.map((block) => block.id),
+    ['call_first', 'call_second', 'call_third'],
+  )
+  assert.deepEqual(
+    claude.messages[2].content.map((block) => block.tool_use_id),
+    ['call_first', 'call_third', 'call_second'],
+  )
+  const interrupted = input.toSpliced(5, 0, { role: 'user', content: 'New turn' })
+  assert.throws(
+    () => toClaudeMessages('openai.responses', { model: MODEL, input: interrupted }),
+    (error) => error.status === 400 && error.body.error.param === 'input[3].call_id',
+  )
+  const cached = input.toSpliced(4, 1, { ...result('first'), cache_control: { type: 'ephemeral' } })
+  assert.throws(
+    () => toClaudeMessages('openai.responses', { model: MODEL, input: cached }),
+    (error) => error.status === 400 && error.body.error.param === 'input[3].call_id',
+  )
+  const cachedFinalResult = input.toSpliced(7, 1, {
+    ...result('second'),
+    output: [{ type: 'output_text', text: 'second', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+  })
+  assert.throws(
+    () => toClaudeMessages('openai.responses', { model: MODEL, input: cachedFinalResult }),
+    (error) => error.status === 400 && error.body.error.param === 'input[3].call_id',
+  )
+  const conflict = { ...definition, tools: [{ ...read, parameters: { type: 'object', required: ['page'] } }] }
+  assert.throws(
+    () => toClaudeMessages('openai.responses', { model: MODEL, input, tools: [conflict] }),
+    (error) => error.status === 400 && error.body.error.param === 'input[1].tools[0].tools[0]',
+  )
+})
+
 test('Responses rejects dangling calls, foreign references and invalid arguments before conversion can dispatch', () => {
   const user = { role: 'user', content: 'Read the sample' }
   for (const input of [
