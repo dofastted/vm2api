@@ -207,13 +207,54 @@ function wipeElapsedWindow(window, now) {
   }
 }
 
+/**
+ * A rejected 5h/7d window with no reset never names its own end: it was written
+ * from a 429 that carried no window header. Hold it this long from when it was
+ * recorded, then lift it and let the next request decide (every 429 asks for a
+ * usage probe, which brings a real reset if the window is really spent).
+ * Without this the seat stays parked until someone runs 限额查询 by hand.
+ */
+export const NO_RESET_REJECT_HOLD_MS = 30 * 60_000
+
+function headerRecordedAtMs(headers = {}) {
+  for (const value of [headers?.exhausted_at, headers?.sampled_at]) {
+    const ms = Date.parse(value || '')
+    if (Number.isFinite(ms)) return ms
+  }
+  return null
+}
+
+/** Until when a reset-less rejected header window still holds; null if it does not apply. */
+export function noResetRejectUntilMs(unified = {}, key = '5h') {
+  const window = unified?.headers?.[key]
+  if (!window || !isRejectedStatus(window.status)) return null
+  if (Number.isFinite(parseResetMs(window.reset))) return null
+  const at = headerRecordedAtMs(unified.headers)
+  // No record time: nothing says it is recent, so it does not hold.
+  return at == null ? 0 : at + NO_RESET_REJECT_HOLD_MS
+}
+
+export function noResetRejectExpired(unified = {}, key = '5h', now = Date.now()) {
+  const until = noResetRejectUntilMs(unified, key)
+  return until != null && until <= now
+}
+
 export function wipeElapsedHeaderWindows(unified = {}, { now = Date.now() } = {}) {
   const headers = unified?.headers
   let changed = false
   let next = headers && typeof headers === 'object' ? { ...headers } : headers
   if (next && typeof next === 'object') {
     for (const key of ['5h', '7d', '7d_oi']) {
-      const wiped = wipeElapsedWindow(next[key], now)
+      let wiped = wipeElapsedWindow(next[key], now)
+      if (!wiped && key !== '7d_oi' && noResetRejectExpired(unified, key, now)) {
+        wiped = {
+          utilization: next[key].utilization ?? null,
+          status: 'allowed',
+          reset: null,
+          stale: true,
+          stale_reason: 'reject_without_reset_expired',
+        }
+      }
       if (!wiped) continue
       next[key] = wiped
       changed = true
@@ -388,6 +429,7 @@ export function headerHardBlocked(unified = {}, key = '5h', now = Date.now()) {
   if (isPercentReading(h.utilization) && ratio != null && ratio < 1) return false
   const resetMs = parseResetMs(h.reset)
   if (Number.isFinite(resetMs) && resetMs <= now) return false
+  if (noResetRejectExpired(unified, key, now)) return false
   return true
 }
 

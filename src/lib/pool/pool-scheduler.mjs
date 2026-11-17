@@ -31,7 +31,7 @@ import {
   isLeftoverQuotaScheduleOff,
   isQuotaWindowReason,
 } from './availability.mjs'
-import { listQuotaFromHeaders } from './quota-window.mjs'
+import { listQuotaFromHeaders, noResetRejectExpired } from './quota-window.mjs'
 import { hardBlockOf } from './rate-limit-service.mjs'
 import { unitCircuit } from './unit-circuit.mjs'
 import { isSlotProxyDesynced, readWorkerProxyEndpoint, readWorkerEgressMode } from '../vm/vm-runtime.mjs'
@@ -316,7 +316,9 @@ function guardWindowReading(window, now) {
 export function quotaGuardUsage(unified = {}, now = Date.now()) {
   let worst = null
   for (const key of ['5h', '7d']) {
-    for (const sample of [unified?.headers?.[key], unified?.official?.[key], unified?.[key]]) {
+    // A header reject with no reset lifts after its hold (see noResetRejectExpired).
+    const headerSample = noResetRejectExpired(unified, key, now) ? null : unified?.headers?.[key]
+    for (const sample of [headerSample, unified?.official?.[key], unified?.[key]]) {
       const reading = guardWindowReading(sample, now)
       if (!reading) continue
       const better =
