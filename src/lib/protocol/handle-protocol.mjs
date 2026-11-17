@@ -1203,12 +1203,14 @@ export function createHandleProtocol(deps) {
       ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
     }
     let inboundToolReverse = {}
+    const deferToolNameRewrite = protocol === 'anthropic.messages' && inferenceBackend !== 'api'
     const cragSystem = projectCallerSystem(ctx.body.system, callerEnvironment)
     const hasCragSystem = cragSystem !== ctx.body.system
     if (!apiOpenAI && !requestContext && !officialPassthrough) {
       const standard = toStandardAnthropicBody(ctx.body, {
         official: officialTraffic === true,
         rewriteTools: getRouting()?.compatibility?.tool_name_rewrite !== false,
+        preserveToolNames: deferToolNameRewrite,
       })
       ctx.body = standard.body
       inboundToolReverse = standard.reverse
@@ -1756,6 +1758,8 @@ export function createHandleProtocol(deps) {
               })
             if (cragPrint) {
               const cragPersona = resolveCragPrintPersona(selected.vm, routingNow)
+              const caps = preparedHop.ready.health?.capabilities
+              const preserveToolNames = deferToolNameRewrite && caps?.includes('generation_controls_v3')
               // CRAG print bypasses the cli-node envelope builder. Canonicalize
               // once more at this boundary so passthrough traffic cannot carry
               // client/OpenAI fields into the native worker.
@@ -1763,16 +1767,14 @@ export function createHandleProtocol(deps) {
               const cragStandard = toStandardAnthropicBody(cragInput, {
                 official: officialTraffic === true,
                 rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
+                preserveToolNames,
               })
-              if (Object.keys(cragStandard.reverse || {}).length) {
-                inboundToolReverse = composeToolNames(inboundToolReverse, cragStandard.reverse)
-              }
+              const cragToolReverse = composeToolNames(inboundToolReverse, cragStandard.reverse)
               // The CRAG kernel fingerprints the public stream it already sent,
               // including thinking. Rewriting an unrecorded signature into text
               // makes the tool continuation fail with tool_result history mismatch.
               let source = shallowCopyBody(cragStandard.body)
               for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
-              const caps = preparedHop.ready.health?.capabilities
               hopBody = prepareCragPrintBody(source, {
                 preset: cragPersona,
                 officialPassthrough,
@@ -1796,6 +1798,7 @@ export function createHandleProtocol(deps) {
               const scrubbed = scrubUpstreamClientBody(hopBody, {
                 official: officialTraffic === true,
                 rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
+                preserveToolNames,
               })
               hopBody = scrubbed.body
               if (
@@ -1824,7 +1827,7 @@ export function createHandleProtocol(deps) {
               return {
                 body: hopBody,
                 meta: {
-                  toolNames: composeToolNames(inboundToolReverse, scrubbed.reverse),
+                  toolNames: composeToolNames(cragToolReverse, scrubbed.reverse),
                   sessionId: attemptSessionId,
                   cliHop: true,
                   cragPrint: true,

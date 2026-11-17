@@ -471,6 +471,10 @@ export function prepareCragPrintBody(
   }
   const tail = officialPassthrough ? '' : callerSystemTail(body?.system)
   if (!tail) return out
+  if (textCache && mode === 'append') {
+    out.system = body.system
+    return out
+  }
   if (!nativeV3 && mode === 'replace' && Buffer.byteLength(tail, 'utf8') > CRAG_PRINT_PROMPT_MAX_BYTES) {
     throw cragPromptTooLarge(Buffer.byteLength(tail, 'utf8'))
   }

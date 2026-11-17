@@ -385,6 +385,52 @@ async function protocolKernelFixture(t, { health, staleHealth, preset = 'officia
   }
 }
 
+unixTest('native CRAG receives caller tool names and structured system cache blocks', async (t) => {
+  const fixture = await protocolKernelFixture(t, {
+    health: {
+      ...printHealth,
+      capabilities: [...printCapabilities, 'generation_controls_v3', 'system_text_cache_v3'],
+    },
+    staleHealth: ordinaryHealth,
+  })
+  const anchor = { type: 'ephemeral', ttl: '1h' }
+  const system = [
+    { type: 'text', text: 'Policy alpha', cache_control: anchor },
+    { type: 'text', text: 'Policy beta', cache_control: anchor },
+    { type: 'text', text: 'Supplementary policy' },
+  ]
+  const tools = ['lookup', 'mcp__lookup', 'mcp_legacy'].map((name) => ({
+    name,
+    input_schema: { type: 'object' },
+  }))
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: 'Look up the entry' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_fixture', name: 'lookup', input: {} }] },
+    {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'toolu_fixture', content: 'result' },
+        { type: 'text', text: 'Summarize it', cache_control: anchor },
+      ],
+    },
+  ]
+  const { envelope } = await fixture.send({
+    model: 'claude-sonnet-5-5',
+    max_tokens: 32000,
+    stream: true,
+    system,
+    tools,
+    messages,
+    tool_choice: { type: 'auto' },
+  })
+  assert.deepEqual(envelope.body.tools, tools)
+  assert.deepEqual(envelope.body.system, system)
+  assert.equal(envelope.body.crag_prompt, undefined)
+  assert.deepEqual(envelope.body.messages, messages)
+  assert.deepEqual(envelope.body.tool_choice, { type: 'auto' })
+  assert.equal(envelope.body.max_tokens, 32000)
+})
+
 function cwdRequest(stream, fields = {}) {
   return {
     model: 'claude-haiku-4-5',

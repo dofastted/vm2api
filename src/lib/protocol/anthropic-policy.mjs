@@ -653,13 +653,17 @@ export function wireToolName(name, { official = false, rewriteTools = true } = {
  * product strings leave system and tool text, and tool names land on mcp__.
  * Official Claude Code keeps its own tool names; a stray mcp_ name is still fixed.
  */
-export function scrubUpstreamClientBody(body, { official = false, rewriteTools = true } = {}) {
+export function scrubUpstreamClientBody(
+  body,
+  { official = false, rewriteTools = true, preserveToolNames = false } = {},
+) {
   if (!body || typeof body !== 'object') return { body, reverse: {} }
   const out = clone(body)
   const reverse = {}
   const used = new Set()
   const assigned = new Map()
   const rename = (name) => {
+    if (preserveToolNames) return name
     if (assigned.has(name)) return assigned.get(name)
     let wire = wireToolName(name, { official, rewriteTools })
     if (!wire) return name
@@ -793,10 +797,10 @@ export function composeToolNames(front = {}, hop = {}) {
  * blocks before persona or either hop. Caller billing is removed here unless
  * official passthrough is on; the project template writes its own.
  */
-export function toStandardAnthropicBody(body, { official = false, rewriteTools = true } = {}) {
+export function toStandardAnthropicBody(body, options = {}) {
   const shaped = sanitizeAnthropicBody(stripCallerBilling(body), { preserveContentShape: false })
   applyMaxTokensCap(shaped)
-  return scrubUpstreamClientBody(shaped, { official, rewriteTools })
+  return scrubUpstreamClientBody(shaped, options)
 }
 
 function stripBillingText(text) {
