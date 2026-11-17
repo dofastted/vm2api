@@ -625,9 +625,12 @@ class Host:
                 profile=directory / env["profile"],
             )
         if account.get("state") in ("error", "reauth_required") and env.get("account"):
-            env["account"].update(
-                state=account["state"], checked_at=account["checked_at"]
-            )
+            previous = env["account"]
+            if previous.get("state") in ("ok", "partial") and not previous.get(
+                "data_at"
+            ):
+                previous["data_at"] = previous.get("checked_at")
+            previous.update(state=account["state"], checked_at=account["checked_at"])
         else:
             env["account"] = account
         if account.get("state") == "reauth_required":

@@ -133,6 +133,55 @@ def models(data, is_api_key=False):
     return sorted(names), sorted(quotas, key=lambda quota: quota["model"])
 
 
+def quota_groups(data):
+    entries = data.get("groups")
+    if not isinstance(entries, list):
+        return []
+    groups = []
+    seen = set()
+    for group in entries[:12]:
+        if not isinstance(group, dict):
+            continue
+        name = text(group.get("displayName"))
+        buckets = group.get("buckets")
+        if not name or not isinstance(buckets, list):
+            continue
+        windows = []
+        for bucket in buckets[:4]:
+            if not isinstance(bucket, dict) or bucket.get("disabled") is True:
+                continue
+            identifier, period = bucket.get("bucketId"), bucket.get("window")
+            if (
+                not isinstance(identifier, str)
+                or not MODEL.fullmatch(identifier)
+                or identifier in seen
+                or period not in ("5h", "weekly")
+            ):
+                continue
+            remaining = bucket.get("remainingFraction")
+            if remaining is not None and (
+                type(remaining) not in (int, float) or not 0 <= remaining <= 1
+            ):
+                continue
+            seen.add(identifier)
+            windows.append(
+                {
+                    "id": identifier,
+                    "period": period,
+                    "remaining_fraction": remaining,
+                    "reset_at": text(bucket.get("resetTime")),
+                }
+            )
+        if windows:
+            groups.append(
+                {
+                    "name": name,
+                    "windows": sorted(windows, key=lambda window: window["period"]),
+                }
+            )
+    return groups
+
+
 def probe_api_key(proxy_url, api_key):
     status, data = get_json(proxy_url, GEMINI_MODELS, f"x-goog-api-key: {api_key}")
     if status == 200 and isinstance(data.get("models"), list):
@@ -199,12 +248,31 @@ def probe_oauth(proxy_url, profile):
         ]
     model_status = None
     if assist_status == 200:
-        model_status, data = get_json(
-            proxy_url,
-            CODE_ASSIST + "fetchAvailableModels",
-            header,
-            {"project": project} if project else {},
-        )
+        project_body = {"project": project} if project else {}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            model_result = executor.submit(
+                get_json,
+                proxy_url,
+                CODE_ASSIST + "fetchAvailableModels",
+                header,
+                project_body,
+            )
+            summary = (
+                executor.submit(
+                    get_json,
+                    proxy_url,
+                    CODE_ASSIST + "retrieveUserQuotaSummary",
+                    header,
+                    project_body,
+                )
+                if project
+                else None
+            )
+            model_status, data = model_result.result()
+            if summary is not None:
+                summary_status, summary_data = summary.result()
+                if summary_status == 200:
+                    account["quota_groups"] = quota_groups(summary_data)
         if model_status == 200:
             account["models"], account["quotas"] = models(data)
     state = "partial"

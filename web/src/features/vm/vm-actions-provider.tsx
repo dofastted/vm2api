@@ -212,7 +212,10 @@ export function VmActionsProvider({
             <DialogHeader>
               <DialogTitle>{geminiTarget.name || geminiTarget.id}</DialogTitle>
               <DialogDescription>
-                Gemini 宿主机账号 · {geminiTarget.proxy_id}
+                {geminiTarget.gemini?.auth_method === 'api_key'
+                  ? 'Gemini API Key 宿主环境'
+                  : 'Antigravity 宿主机账号'}{' '}
+                · {geminiTarget.proxy_id}
               </DialogDescription>
             </DialogHeader>
             <GeminiEnvironments

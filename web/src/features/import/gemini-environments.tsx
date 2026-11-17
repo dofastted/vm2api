@@ -10,9 +10,15 @@ import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Progress } from '@/components/ui/progress'
 
 const ROOT = '/api/panel/gemini'
 const QUERY_KEY = ['panel', 'gemini-environments'] as const
+
+type QuotaReading = {
+  remaining_fraction: number | null
+  reset_at: string | null
+}
 
 export type GeminiEnvironment = {
   id: string
@@ -30,15 +36,16 @@ export type GeminiEnvironment = {
   account: {
     state: 'ok' | 'partial' | 'error' | 'reauth_required'
     checked_at: string | null
+    data_at?: string | null
     email: string | null
     project_id: string | null
     region: string | null
     plan: string | null
     expires_at: string | null
-    quotas: {
-      model: string
-      remaining_fraction: number
-      reset_at: string | null
+    quotas: (QuotaReading & { model: string })[]
+    quota_groups?: {
+      name: string
+      windows: (QuotaReading & { id: string; period: '5h' | 'weekly' })[]
     }[]
     credits: { type: string; amount: string }[]
   } | null
@@ -81,6 +88,128 @@ function localTime(value?: string | null) {
   if (!value) return '—'
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString()
+}
+
+const percent = new Intl.NumberFormat(undefined, {
+  style: 'percent',
+  maximumFractionDigits: 2,
+})
+
+function QuotaRow({
+  label,
+  reading,
+}: {
+  label: string
+  reading: QuotaReading
+}) {
+  const remaining = reading.remaining_fraction
+  return (
+    <li className='grid gap-x-4 gap-y-1 py-2.5 text-sm sm:grid-cols-[minmax(0,1fr)_auto]'>
+      <span className='break-all'>{label}</span>
+      <span className='tabular-nums'>
+        {remaining === null
+          ? '未提供比例'
+          : `已用 ${percent.format(1 - remaining)} · 剩余 ${percent.format(remaining)}`}
+      </span>
+      <span className='text-xs text-muted-foreground'>
+        重置 {localTime(reading.reset_at)}
+      </span>
+      {remaining === null ? null : (
+        <Progress
+          aria-hidden='true'
+          className='my-auto h-1.5'
+          value={(1 - remaining) * 100}
+        />
+      )}
+    </li>
+  )
+}
+
+function AntigravityUsage({ environment }: { environment: GeminiEnvironment }) {
+  const account = environment.account
+  const isOAuth = environment.auth_method === 'oauth'
+  const isStale =
+    account?.state === 'error' || account?.state === 'reauth_required'
+  const groups = isOAuth ? (account?.quota_groups ?? []) : []
+  const quotas = isOAuth ? (account?.quotas ?? []) : []
+  return (
+    <section className='space-y-3 border-b pb-4' aria-label='额度与使用分析'>
+      <h3 className='text-base font-semibold'>
+        {isOAuth ? 'Antigravity 额度与使用分析' : 'Gemini 使用分析'}
+      </h3>
+      {isOAuth ? (
+        <>
+          {isStale ? (
+            <p role='status' className='text-sm text-muted-foreground'>
+              {ACCOUNT_LABELS[account.state]} · 数据时间{' '}
+              {localTime(account.data_at)}
+            </p>
+          ) : null}
+          {groups.length ? (
+            <div className='space-y-3'>
+              <p className='text-sm text-muted-foreground'>
+                上游共享额度，同组模型不重复合计。
+              </p>
+              {groups.map((group) => (
+                <div key={group.windows[0].id} className='space-y-1'>
+                  <h4 className='text-sm font-medium break-words'>
+                    {group.name}
+                  </h4>
+                  <ul className='divide-y border-y'>
+                    {group.windows.map((window) => (
+                      <QuotaRow
+                        key={window.id}
+                        label={window.period === '5h' ? '5 小时' : '每周'}
+                        reading={window}
+                      />
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className='text-sm text-muted-foreground'>
+              共享额度窗口未提供。
+            </p>
+          )}
+          {quotas.length ? (
+            <details open={!groups.length}>
+              <summary className='cursor-pointer text-sm font-medium'>
+                按模型查看（{quotas.length}）
+              </summary>
+              <p className='mt-1 text-xs text-muted-foreground'>
+                模型读数不与共享窗口叠加。
+              </p>
+              <ul className='mt-1 divide-y border-y'>
+                {quotas.map((quota) => (
+                  <QuotaRow
+                    key={quota.model}
+                    label={quota.model}
+                    reading={quota}
+                  />
+                ))}
+              </ul>
+            </details>
+          ) : null}
+          <p className='text-sm break-words'>
+            <span className='text-muted-foreground'>
+              AI Credits 余额（不等同于费用）：
+            </span>
+            {account?.credits
+              .map((credit) => `${credit.type}: ${credit.amount}`)
+              .join('、') || '未提供'}
+          </p>
+        </>
+      ) : (
+        <p className='text-sm text-muted-foreground'>
+          Gemini API Key 不提供 Antigravity 订阅额度。
+        </p>
+      )}
+      <p className='text-xs text-muted-foreground'>
+        本地逐回合用量尚不可用；请求数、Token 和费用不从额度变化推算。
+      </p>
+    </section>
+  )
 }
 
 function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
@@ -143,33 +272,6 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
         <dt className='text-muted-foreground'>模型</dt>
         <dd className='break-words'>
           {environment.models?.join('、') || '未提供'}
-        </dd>
-      </div>
-      <div className='sm:col-span-2 lg:col-span-3'>
-        <dt className='text-muted-foreground'>模型配额（剩余 / 重置时间）</dt>
-        <dd>
-          {account?.quotas.length
-            ? account.quotas.map((quota) => (
-                <div key={quota.model}>
-                  {quota.model} ·{' '}
-                  {new Intl.NumberFormat(undefined, {
-                    style: 'percent',
-                    maximumFractionDigits: 2,
-                  }).format(quota.remaining_fraction)}{' '}
-                  · {localTime(quota.reset_at)}
-                </div>
-              ))
-            : '未提供'}
-        </dd>
-      </div>
-      <div className='sm:col-span-2 lg:col-span-3'>
-        <dt className='text-muted-foreground'>
-          AI Credits 余额（不等同于费用）
-        </dt>
-        <dd>
-          {account?.credits
-            .map((credit) => `${credit.type}: ${credit.amount}`)
-            .join('、') || '未提供'}
         </dd>
       </div>
     </dl>
@@ -429,10 +531,11 @@ export function GeminiEnvironments({
         </p>
       ) : null}
       {environment ? (
-        <div className='space-y-3'>
+        <div className='space-y-4'>
           {isImport ? (
             <h3 className='font-medium'>{environment.name}</h3>
           ) : null}
+          {!isImport ? <AntigravityUsage environment={environment} /> : null}
           <EnvironmentData environment={environment} />
           <div className='flex flex-wrap gap-2'>
             {environment.auth_method !== 'api_key' ? (

@@ -7,7 +7,11 @@ vi.mock('@tanstack/react-router', () => ({
   Link: ({ children }: { children: string }) => <a>{children}</a>,
 }))
 
-function showGemini(available: boolean, view: 'import' | 'vm' = 'import') {
+function showGemini(
+  available: boolean,
+  view: 'import' | 'vm' = 'import',
+  kind: 'oauth' | 'api_key' = 'oauth'
+) {
   const client = new QueryClient()
   client.setQueryData(['panel', 'gemini-environments'], {
     available,
@@ -18,19 +22,40 @@ function showGemini(available: boolean, view: 'import' | 'vm' = 'import') {
         name: '宿主环境',
         proxy_id: 'px-one',
         auth_state: 'authorized',
-        auth_method: 'oauth',
+        auth_method: kind,
         runtime_ready: false,
         billing_ready: false,
         kernel_version: '0.3.0-rc.1',
         models: ['gemini-3.1-pro'],
-        account: {
-          email: 'fixture@example.test',
-          state: 'partial',
-          project_id: 'fixture-project',
-          plan: 'Google AI Pro',
-          quotas: [{ model: 'gemini-3.1-pro', remaining_fraction: 0 }],
-          credits: [{ type: 'AI', amount: '0' }],
-        },
+        account:
+          kind === 'api_key'
+            ? { state: 'ok', quotas: [], credits: [] }
+            : {
+                email: 'fixture@example.test',
+                state: 'partial',
+                project_id: 'fixture-project',
+                plan: 'Google AI Pro',
+                quotas: [{ model: 'gemini-3.1-pro', remaining_fraction: 0 }],
+                quota_groups: [
+                  {
+                    name: 'Gemini Pro',
+                    windows: [
+                      {
+                        id: 'gemini-5h',
+                        period: '5h',
+                        remaining_fraction: 0.25,
+                        reset_at: '2030-01-01T05:00:00Z',
+                      },
+                      {
+                        id: 'gemini-weekly',
+                        period: 'weekly',
+                        remaining_fraction: null,
+                      },
+                    ],
+                  },
+                ],
+                credits: [{ type: 'AI', amount: '0' }],
+              },
       },
     ],
   })
@@ -103,4 +128,22 @@ test('VM page renders Gemini inventory and measured data without treating the ho
   expect(html).toContain('部分数据未返回')
   expect(html).toContain('刷新数据')
   expect(html).not.toContain('创建 Gemini 环境')
+})
+
+test('VM details separate official pool utilization, absent values and unavailable local usage', () => {
+  const html = showGemini(true, 'vm')
+  expect(html).toContain('Antigravity 额度与使用分析')
+  expect(html).toContain('Gemini Pro')
+  expect(html).toContain('5 小时')
+  expect(html).toContain('已用 75% · 剩余 25%')
+  expect(html).toContain('每周')
+  expect(html).toContain('未提供比例')
+  expect(html).toContain('已用 100% · 剩余 0%')
+  expect(html).toContain('本地逐回合用量尚不可用')
+})
+
+test('Gemini API key does not claim to expose Antigravity subscription quota', () => {
+  const html = showGemini(true, 'vm', 'api_key')
+  expect(html).toContain('Gemini API Key 不提供 Antigravity 订阅额度')
+  expect(html).not.toContain('已用 0%')
 })

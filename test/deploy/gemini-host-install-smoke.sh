@@ -98,7 +98,15 @@ def google(proxy_url, url, header, body=None):
     if url.endswith("loadCodeAssist"):
         return 200, {"cloudaicompanionProject": "example", "paidTier": {
             "name": "Pro", "availableCredits": [{"creditType": "AI", "creditAmount": "0"}]}}
-    assert url.endswith("fetchAvailableModels") and body == {"project": "example"}
+    assert body == {"project": "example"}
+    if url.endswith("retrieveUserQuotaSummary"):
+        return 200, {"groups": [{"displayName": "Gemini Pro", "buckets": [
+            {"bucketId": "pro-weekly", "window": "weekly"},
+            {"bucketId": "pro-5h", "window": "5h", "remainingFraction": 0, "resetTime": "2030-01-02T05:00:00Z"},
+            {"bucketId": "pro-disabled", "window": "5h", "remainingFraction": 1, "disabled": True},
+            {"bucketId": "pro-invalid", "window": "5h", "remainingFraction": False},
+        ]}]}
+    assert url.endswith("fetchAvailableModels")
     return 200, {"models": {"gemini-3.1-pro": {"quotaInfo": {"remainingFraction": 0}}, "gemini-unknown": {}}}
 
 with patch.dict(probe.__globals__, {
@@ -111,11 +119,24 @@ with patch.dict(probe.__globals__, {
     assert (info["state"], info["email"], info["plan"], info["project_id"]) == ("ok", "test@example.invalid", "Pro", "example")
     assert info["models"] == ["gemini-3.1-pro", "gemini-unknown"]
     assert info["quotas"] == [{"model": "gemini-3.1-pro", "remaining_fraction": 0, "reset_at": None}]
+    assert info["quota_groups"] == [{"name": "Gemini Pro", "windows": [
+        {"id": "pro-5h", "period": "5h", "remaining_fraction": 0, "reset_at": "2030-01-02T05:00:00Z"},
+        {"id": "pro-weekly", "period": "weekly", "remaining_fraction": None, "reset_at": None},
+    ]}]
     assert info["credits"] == [{"type": "AI", "amount": "0"}]
     assert info["region"] == "fixture-region" and info["expires_at"] == "2030-01-01T00:00:00Z"
     assert "never expose" not in str(info) and proxy not in str(info)
     api = module["probe_api_key"](proxy, "fixture")
-    assert api["state"] == "partial" and api["models"] == ["gemini-3.1-pro"] and "email" not in api
+    assert api["state"] == "partial" and api["models"] == ["gemini-3.1-pro"] and "email" not in api and "quota_groups" not in api
+
+    def summary_unavailable(proxy_url, url, header, body=None):
+        if url.endswith("retrieveUserQuotaSummary"):
+            return 403, {}
+        return google(proxy_url, url, header, body)
+
+    with patch.dict(probe.__globals__, {"get_json": summary_unavailable}):
+        fallback = probe(proxy, None)
+        assert fallback["state"] == "ok" and "quota_groups" not in fallback and fallback["quotas"] == info["quotas"]
 
 with patch.dict(probe.__globals__, {"get_json": lambda *_: (401, {})}):
     assert module["probe_api_key"](proxy, "fixture")["state"] == "reauth_required"

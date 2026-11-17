@@ -116,24 +116,45 @@ function modelName(model) {
   return typeof model === 'string' && MODEL.test(model) ? model : null
 }
 
+function isFraction(value) {
+  return Number.isFinite(value) && value >= 0 && value <= 1
+}
+
 function accountView(account) {
   if (!ACCOUNT_STATES.has(account?.state)) return null
+  const current = account.state === 'ok' || account.state === 'partial'
   return {
     state: account.state,
     checked_at: text(account.checked_at),
+    data_at: text(account.data_at) || (current ? text(account.checked_at) : null),
     email: text(account.email, 254),
     project_id: text(account.project_id),
     region: text(account.region),
     plan: text(account.plan),
     expires_at: text(account.expires_at),
     quotas: items(account.quotas, 128, (quota) =>
-      modelName(quota?.model) &&
-      Number.isFinite(quota.remaining_fraction) &&
-      quota.remaining_fraction >= 0 &&
-      quota.remaining_fraction <= 1
+      modelName(quota?.model) && isFraction(quota.remaining_fraction)
         ? { model: quota.model, remaining_fraction: quota.remaining_fraction, reset_at: text(quota.reset_at) }
         : null,
     ),
+    quota_groups: items(account.quota_groups, 12, (group) => {
+      const name = text(group?.name)
+      const windows = items(group?.windows, 4, (window) => {
+        if (
+          !modelName(window?.id) ||
+          !['5h', 'weekly'].includes(window.period) ||
+          !(window.remaining_fraction === null || isFraction(window.remaining_fraction))
+        )
+          return null
+        return {
+          id: window.id,
+          period: window.period,
+          remaining_fraction: window.remaining_fraction,
+          reset_at: text(window.reset_at),
+        }
+      })
+      return name && windows.length ? { name, windows } : null
+    }),
     credits: items(account.credits, 16, (credit) => {
       const type = text(credit?.type)
       const amount = text(credit?.amount)

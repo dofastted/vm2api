@@ -235,6 +235,52 @@ test('API key import returns only approved account and quota fields', async () =
   assert.equal((await run('POST', `${root}/environments`, { ...create, api_key: 'invalid' })).status, 400)
 })
 
+test('Gemini panel exposes scoped quota windows without inventing missing fractions or exposing raw fields', async () => {
+  const run = setup(() => ({
+    environments: [
+      {
+        ...record,
+        auth_state: 'authorized',
+        account: {
+          state: 'error',
+          checked_at: '2030-01-02T00:00:00Z',
+          data_at: '2030-01-01T00:00:00Z',
+          quota_groups: [
+            {
+              name: 'Gemini Pro',
+              raw: 'private fixture',
+              windows: [
+                {
+                  id: 'gemini-5h',
+                  period: '5h',
+                  remaining_fraction: 0,
+                  reset_at: '2030-01-02T05:00:00Z',
+                  raw: 'private fixture',
+                },
+                { id: 'gemini-weekly', period: 'weekly', remaining_fraction: null },
+                { id: 'invalid-window', period: 'monthly', remaining_fraction: 4 },
+              ],
+            },
+          ],
+        },
+      },
+    ],
+  }))
+  const result = await run('GET', root)
+  const [environment] = result.body.data.environments
+  assert.equal(environment.account.data_at, '2030-01-01T00:00:00Z')
+  assert.deepEqual(environment.account.quota_groups, [
+    {
+      name: 'Gemini Pro',
+      windows: [
+        { id: 'gemini-5h', period: '5h', remaining_fraction: 0, reset_at: '2030-01-02T05:00:00Z' },
+        { id: 'gemini-weekly', period: 'weekly', remaining_fraction: null, reset_at: null },
+      ],
+    },
+  ])
+  assert.doesNotMatch(JSON.stringify(result.body), /private fixture/)
+})
+
 test('official login links are validated and code is returned only to its selected environment', async () => {
   assert.equal(officialGeminiAuthUrl(official), official)
   assert.equal(officialGeminiAuthUrl(official.replace('accounts.google.com', 'accounts.google.com.example.test')), null)

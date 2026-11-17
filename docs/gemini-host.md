@@ -15,7 +15,7 @@
 - 在面板为环境选平台所有的可用 IPv4 SOCKS5 节点。宿主服务使用独立 UID、文件系统隔离和独立网络命名空间；`agy` 无直连规则，只有 `kin-egress` 可向选定 SOCKS5 的地址和端口建立出站连接。首版不接直连、HTTP 代理或域名型代理端点。
 - **Google OAuth**：打开 CLI 生成的官方链接，回填授权码或完整回调链接。完整链接的 `state` 必须匹配当前授权尝试。CLI 持有凭据；不在面板填写 Google 密码、访问令牌或刷新令牌。尝试最多 5 分钟；停用或删除可取消等待中的授权。
 - **Gemini API Key**：经绑定代理调用 Google 模型列表验证凭据，再以仅宿主服务可读的权限保存。模型列表不是推理验收；该凭据通道不返回账号邮箱、订阅或按模型使用配额。
-- 两种方式都在 VM 页显示环境、代理绑定、授权状态、载荷版本和可读取的数据。「刷新数据」经绑定代理读取 Google 响应：OAuth 按可用权限读取账号、项目、订阅、模型、配额及 Credits，API Key 读取模型。没有返回的字段标为未提供，不显示为零。凭据失效时需重新授权或导入；尚未启用 OAuth 自动续票。宿主服务的状态目录不纳入 VM 包或面板备份。
+- 两种方式都在 VM 页显示环境、代理绑定、授权状态、载荷版本和可读取的数据。「刷新数据」经绑定代理读取 Google 响应：OAuth 按可用权限读取账号、项目、订阅、模型、配额及 Credits，API Key 读取模型。展开 OAuth 账号可看共享额度的 5 小时和每周窗口、使用比例、剩余比例和重置时间；共享窗口未返回仍可看逐模型额度。两类读数不叠加，未返回比例不显示为零，旧数据标明读取失败后的快照时间。额度和 Credits 不代表本地调用量或费用。凭据失效时需重新授权或导入；尚未启用 OAuth 自动续票。宿主服务的状态目录不纳入 VM 包或面板备份。
 - `0.3.0-rc.1` 已用真实 `agy` 验证受管 PTY 和隔离回环上游 SSE。自动安装和数据读取可用本地夹具验证；真实 Google 换票和 OAuth 推理未验收，不标记推理就绪。
 - 可使用非 root 账号运行 `bash test/deploy/gemini-host-egress-smoke.sh /absolute/path/kin-egress`，在一次性 Linux 命名空间用 `iptables` 模拟 Docker 的默认转发丢弃策略，检查选定 SOCKS5 的透明转发、转发器退出后失败和网络清理。该测试不访问 Google 或主机代理池。
 - 有测试签名产物时，可在带 Node 和 Python 的一次性 Linux amd64 容器内以 root 运行 `bash test/deploy/gemini-host-install-smoke.sh /path/to/signed-payload /path/to/public-key`。禁用容器网络即可验证 Unix socket 启动、签名失败不建环境、首次创建自动安装和重启持久化。
