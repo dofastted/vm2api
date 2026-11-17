@@ -662,6 +662,7 @@ export function scrubUpstreamClientBody(
   const reverse = {}
   const used = new Set()
   const assigned = new Map()
+  const declared = new Set(Array.isArray(out.tools) ? out.tools.map((tool) => tool?.name).filter(Boolean) : [])
   const rename = (name) => {
     if (preserveToolNames) return name
     if (assigned.has(name)) return assigned.get(name)
@@ -670,7 +671,10 @@ export function scrubUpstreamClientBody(
     if (wire !== name) {
       const base = wireToolName(name, { official, rewriteTools })
       let suffix = 2
-      while (used.has(wire)) wire = `${base}_${suffix++}`
+      while (used.has(wire) || declared.has(wire)) {
+        const tail = `_${suffix++}`
+        wire = `${base.slice(0, 64 - tail.length)}${tail}`
+      }
       reverse[wire] = name
     }
     used.add(wire)

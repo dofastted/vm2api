@@ -598,7 +598,7 @@ export function prepareWorkerPayload({
 } = {}) {
   const health = exec?.workerStatus
   const print = nativeCragRequest(exec, cragPrint)
-  const canonicalBody = print ? prepareCragRequest(body) : prepareCliNodeRequest(body)
+  const canonicalBody = print ? prepareCragRequest(body, health) : prepareCliNodeRequest(body)
   const model = canonicalBody?.model || ''
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
   const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
@@ -725,7 +725,7 @@ async function preparePrebuiltEnvelope(envelope, redaction, messages, exec, crag
     delete out.gateway_policy
     const print = nativeCragRequest(exec, cragPrint)
     out.body = gateCragBody(
-      print ? prepareCragRequest(out.body) : prepareCliNodeRequest(out.body),
+      print ? prepareCragRequest(out.body, exec?.workerStatus) : prepareCliNodeRequest(out.body),
       print,
       exec?.workerStatus,
       out.request_context?.purpose === 'auto_mode_classifier',

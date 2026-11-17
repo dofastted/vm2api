@@ -1857,16 +1857,29 @@ unixTest('invalid Messages are rejected before either kernel accepts a turn', as
   })
   t.after(() => fx.close())
   for (const runtime_variant of ['cli-node', 'crag-v2']) {
-    const exec = { ...fx.exec, workerStatus: { runtime_variant } }
+    const isCrag = runtime_variant === 'crag-v2'
+    const exec = {
+      ...fx.exec,
+      workerStatus: { runtime_variant, capabilities: isCrag ? ['generation_controls_v3'] : [] },
+    }
     for (const send of [callGoWorker, streamGoWorker]) {
       for (const prebuilt of [false, true]) {
-        for (const messages of [
-          [],
-          [{ role: 'user', content: ' \n\t' }],
-          [{ role: 'user', content: 42 }],
-          [{ role: 'user', content: [{ type: 'tool_result', content: 'result' }] }],
+        for (const fields of [
+          { messages: [] },
+          { messages: [{ role: 'user', content: ' \n\t' }] },
+          { messages: [{ role: 'user', content: 42 }] },
+          { messages: [{ role: 'user', content: [{ type: 'tool_result', content: 'result' }] }] },
+          {
+            messages: [
+              { role: 'assistant', content: [{ type: 'tool_use', id: 'call_bad', name: 'sample', input: [] }] },
+            ],
+          },
+          { tools: [{ type: 'function', name: 'sample', parameters: { type: 'object' } }] },
+          { tools: [{ name: 'sample', input_schema: { type: 'string' } }] },
+          { max_tokens: 3.5 },
+          ...(isCrag ? [{ tools: [{ type: 'web_search_20250305', name: 'web_search' }] }] : []),
         ]) {
-          const body = { model: 'claude-sonnet-5', messages }
+          const body = { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }], ...fields }
           const result = await send({ exec, ...(prebuilt ? { envelope: { body } } : { body }) })
           assert.equal(result.status, 400)
           assert.equal(result.body.error.code, 'invalid_kernel_request')

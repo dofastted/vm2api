@@ -240,10 +240,7 @@ for (const protocol of ['anthropic.messages', 'openai.chat', 'openai.responses']
     }
     await handler.handleProtocol(req, response, protocol, '/v1/messages')
     assert.equal(response.status, 400)
-    assert.equal(
-      response.body.error.code,
-      protocol === 'openai.responses' ? 'protocol_not_allowed' : 'tool_choice_incompatible',
-    )
+    assert.equal(response.body.error.code, 'tool_choice_incompatible')
     assert.equal(admissions, 0)
     assert.equal(selections, 0)
   })

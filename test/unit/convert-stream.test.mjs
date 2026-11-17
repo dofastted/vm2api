@@ -11,6 +11,7 @@ import {
   claudeSSELineToOpenAICompletionChunks,
   createClaudeMessageAssembler,
   applyClaudeSSELineToMessage,
+  fromClaudeToResponses,
 } from '../../src/lib/protocol/convert.mjs'
 import { officialMessagesBody } from '../../src/lib/protocol/anthropic-messages.mjs'
 
@@ -158,6 +159,149 @@ test('pretty-printed SSE converts to Responses events', () => {
   assert.ok(events.some((e) => e.type === 'response.created'))
   assert.ok(events.some((e) => e.type === 'response.output_text.delta' && e.delta === 'pong'))
   assert.ok(events.some((e) => e.type === 'response.completed'))
+})
+
+test('Responses output keeps tool call IDs, custom arguments, namespace and signed history on replay', () => {
+  const tools = [
+    { type: 'namespace', name: 'sample', tools: [{ type: 'function', name: 'read', parameters: { type: 'object' } }] },
+    { type: 'custom', name: 'note', format: { type: 'grammar', syntax: 'lark', definition: 'start: "note"' } },
+    { type: 'tool_search', execution: 'client', parameters: { type: 'object' } },
+  ]
+  const user = { role: 'user', content: 'Read the sample' }
+  const model = 'claude-sonnet-5-5'
+  const { responseTools } = toClaudeMessages('openai.responses', { model, input: [user], tools })
+  const thinking = { type: 'thinking', thinking: '', signature: 'fixture-signed-opaque-history' }
+  const blocks = [
+    thinking,
+    { type: 'tool_use', id: 'toolu_read', name: 'sample__read', input: { name: 'fixture' } },
+    { type: 'tool_use', id: 'toolu_note', name: 'note', input: { input: 'note' } },
+    { type: 'tool_use', id: 'toolu_search', name: 'tool_search', input: { query: 'math' } },
+  ]
+  const labelled = (event) => `data: ${JSON.stringify(event)}`
+  const events = collect(claudeSSELineToResponsesEvents, createResponsesStreamState(model, 'vm-01', responseTools), [
+    labelled({ type: 'message_start', message: { usage: { input_tokens: 5, cache_read_input_tokens: 2 } } }),
+    ...blocks.flatMap((block, index) => [
+      labelled({
+        type: 'content_block_start',
+        index,
+        content_block: block.type === 'tool_use' ? { ...block, input: {} } : block,
+      }),
+      ...(block.type === 'tool_use'
+        ? [
+            labelled({
+              type: 'content_block_delta',
+              index,
+              delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) },
+            }),
+          ]
+        : []),
+      labelled({ type: 'content_block_stop', index }),
+    ]),
+    labelled({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 3 } }),
+    labelled({ type: 'message_stop' }),
+  ])
+  const terminal = events.at(-1)
+  assert.equal(terminal.type, 'response.completed')
+  assert.equal(terminal.response.usage.total_tokens, 10)
+  const [reasoning, read, custom, search] = terminal.response.output
+  assert.equal(reasoning.type, 'reasoning')
+  assert.equal(read.type, 'function_call')
+  assert.equal(read.namespace, 'sample')
+  assert.deepEqual(read.encrypted_function_args, [])
+  assert.equal(read.name, 'read')
+  assert.equal(read.call_id, 'toolu_read')
+  assert.notEqual(read.id, read.call_id)
+  assert.equal(custom.type, 'custom_tool_call')
+  assert.equal(custom.input, 'note')
+  assert.equal(search.type, 'tool_search_call')
+  assert.deepEqual(search.arguments, { query: 'math' })
+  for (const item of [read, custom]) {
+    const kind = item.type === 'function_call' ? 'function_call_arguments' : 'custom_tool_call_input'
+    const field = item.type === 'function_call' ? 'arguments' : 'input'
+    assert.equal(
+      events
+        .filter((event) => event.type === `response.${kind}.delta` && event.item_id === item.id)
+        .map((event) => event.delta)
+        .join(''),
+      item[field],
+    )
+  }
+  const whole = fromClaudeToResponses(
+    { model, content: blocks, stop_reason: 'tool_use' },
+    model,
+    'vm-01',
+    'convert',
+    responseTools,
+  )
+  assert.deepEqual(
+    whole.output.map(({ id, ...item }) => item),
+    terminal.response.output.map(({ id, ...item }) => item),
+  )
+
+  const { claude } = toClaudeMessages('openai.responses', {
+    model,
+    tools,
+    input: [
+      user,
+      ...terminal.response.output,
+      { type: 'function_call_output', call_id: read.call_id, output: 'sample read' },
+      { type: 'custom_tool_call_output', call_id: custom.call_id, output: 'note saved' },
+      {
+        type: 'tool_search_output',
+        call_id: search.call_id,
+        tools: [
+          {
+            type: 'function',
+            name: 'calculate',
+            parameters: {
+              oneOf: [
+                { type: 'object', properties: { expr: { type: 'string' } }, required: ['expr'] },
+                { type: 'object', properties: { n: { type: 'integer' } }, required: ['n'] },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  })
+  assert.deepEqual(claude.messages[1].content, blocks)
+  assert.deepEqual(
+    claude.messages[2].content.map((block) => block.tool_use_id),
+    ['toolu_read', 'toolu_note', 'toolu_search'],
+  )
+  assert.deepEqual(claude.tools.at(-1).input_schema, {
+    type: 'object',
+    properties: { expr: { type: 'string' }, n: { type: 'integer' } },
+  })
+})
+
+test('Responses rejects dangling calls, foreign references and invalid arguments before conversion can dispatch', () => {
+  const user = { role: 'user', content: 'Read the sample' }
+  for (const input of [
+    { input: [user, { type: 'function_call_output', call_id: 'call_orphan', output: 'lost context' }] },
+    { input: [user, { type: 'function_call', call_id: 'call_pending', name: 'read', arguments: '{}' }] },
+    { input: [user, { type: 'function_call', call_id: 'call_bad', name: 'read', arguments: '[]' }] },
+    {
+      input: [
+        user,
+        {
+          type: 'function_call',
+          call_id: 'call_encrypted',
+          name: 'read',
+          arguments: '{}',
+          encrypted_function_args: ['fixture'],
+        },
+        { type: 'function_call_output', call_id: 'call_encrypted', output: 'result' },
+      ],
+    },
+    { input: [user, { type: 'item_reference', id: 'item_remote' }] },
+    { input: [user], previous_response_id: 'resp_remote' },
+  ]) {
+    assert.throws(() => toClaudeMessages('openai.responses', { model: MODEL, ...input }), {
+      status: 400,
+      code: 'invalid_responses_conversion',
+    })
+  }
 })
 
 test('SSE assembler rebuilds a Claude message for buffered chat completions', () => {
