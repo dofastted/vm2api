@@ -151,8 +151,22 @@ export function classifyImportHelperOutput(stderr) {
   return 'cookie_auth_failed'
 }
 
-export function publicImportError(raw) {
+/**
+ * `code` wins when the resolver already classified the failure: an exit policy
+ * decision carries no recognisable text, and IPv6-off is a policy, not a fault.
+ */
+export function publicImportError(raw, code = '') {
   const s = String(raw || 'session import failed')
+  switch (String(code || '')) {
+    case 'proxy_unavailable':
+      return '槽位 SOCKS5 当前不可用（已停用或探测失败）。请更换代理或重新探测后再导入。'
+    case 'ipv6_disabled':
+      return 'IPv6 已关闭，请在设置 → SOCKS5 开启 IPv6 代理出口'
+    case 'proxy_required':
+      return '虚拟机未绑定 SOCKS5，请先分配代理再导入。'
+    default:
+      break
+  }
   if (isSessionStale(s)) {
     return 'sessionKey 不够新，Anthropic 拒绝授权（Session is not fresh enough）。请重新登录 claude.ai 后立刻复制最新 sessionKey，不要用旧 cookie。'
   }
@@ -182,10 +196,16 @@ export function panelImportErrorPayload(err) {
   const code = err?.code || classifyImportHelperOutput(raw)
   const stale = code === 'session_stale_relogin' || code === 'authorize_no_code' || code === 'state_mismatch'
   const proxyAuth = code === 'proxy_auth_rejected'
+  // An exit the resolver refused is the operator's to fix, like a rejected
+  // SOCKS5 login: 400, and never reported as an upstream fault.
+  const exitPolicy = code === 'proxy_unavailable' || code === 'ipv6_disabled' || code === 'proxy_required'
   const cf =
-    !stale && !proxyAuth && (code === 'cloudflare_challenge' || /just a moment|cloudflare|doctype html/i.test(raw))
+    !stale &&
+    !proxyAuth &&
+    !exitPolicy &&
+    (code === 'cloudflare_challenge' || /just a moment|cloudflare|doctype html/i.test(raw))
   return {
-    status: stale || proxyAuth ? 400 : cf ? 502 : 500,
+    status: stale || proxyAuth || exitPolicy ? 400 : cf ? 502 : 500,
     error: {
       code: stale
         ? code === 'authorize_no_code'
@@ -198,7 +218,7 @@ export function panelImportErrorPayload(err) {
           : cf
             ? 'cloudflare_challenge'
             : code || 'import_failed',
-      message: publicImportError(raw),
+      message: publicImportError(raw, code),
     },
   }
 }
@@ -232,6 +252,8 @@ export async function exchangeTokenViaCookieAuth({
   code,
   codeVerifier,
   state = '',
+  // proxyUrl is the fetchImpl test seam only: the real exchange resolves the
+  // exit at the point of use (prepareSlotOAuth), never from a caller's value.
   proxyUrl = null,
   redirectUri = null,
   fetchImpl = null,
@@ -239,6 +261,7 @@ export async function exchangeTokenViaCookieAuth({
   exec,
   projectRoot,
   routing,
+  proxyPool,
 } = {}) {
   const parsed = parseFullCode(code, state)
   if (!fetchImpl) {
@@ -249,10 +272,9 @@ export async function exchangeTokenViaCookieAuth({
         code_verifier: codeVerifier,
         state: parsed.state,
         redirect_uri: redirectUri || REDIRECT_URI,
-        proxy_url: proxyUrl,
         timeout_ms: timeoutMs,
       },
-      { exec, projectRoot, routing, timeoutMs, runNative: runNativeOAuthAuthService },
+      { exec, projectRoot, routing, timeoutMs, proxyPool, runNative: runNativeOAuthAuthService },
     )
   }
   const auth = await loadLocalAuthForTest()
@@ -270,7 +292,17 @@ export async function exchangeTokenViaCookieAuth({
 
 export async function sessionKeyToOAuth(
   sessionKey,
-  { scope = 'full', proxyUrl = null, fetchImpl = null, timeoutMs = 15000, exec, projectRoot, routing } = {},
+  {
+    scope = 'full',
+    // see exchangeTokenViaCookieAuth: test seam only
+    proxyUrl = null,
+    fetchImpl = null,
+    timeoutMs = 15000,
+    exec,
+    projectRoot,
+    routing,
+    proxyPool,
+  } = {},
 ) {
   const sk = String(sessionKey || '')
     .trim()
@@ -291,10 +323,9 @@ export async function sessionKeyToOAuth(
             session_key: sk,
             scope: requestedScope,
             runtime_mode: setup ? 'setup-token' : 'oauth',
-            proxy_url: proxyUrl,
             timeout_ms: timeoutMs,
           },
-          { exec, projectRoot, routing, timeoutMs, runNative: runNativeOAuthAuthService },
+          { exec, projectRoot, routing, timeoutMs, proxyPool, runNative: runNativeOAuthAuthService },
         )
       : await (async () => {
           const auth = await loadLocalAuthForTest()
@@ -314,9 +345,10 @@ export async function sessionKeyToOAuth(
       source: cred.source || 'sessionKey-cookie-auth',
     })
   } catch (e) {
-    const err = new Error(publicImportError(e.message || 'session import failed'))
     const classified = classifyImportHelperOutput(e.message)
-    err.code = classified === 'cookie_auth_failed' ? e.code || classified : classified
+    const code = classified === 'cookie_auth_failed' ? e.code || classified : classified
+    const err = new Error(publicImportError(e.message || 'session import failed', code))
+    err.code = code
     throw err
   }
 }

@@ -13,6 +13,7 @@ import {
   CODEX_OAUTH_SCOPE,
   exchangeCodexAuthorizationCode,
 } from '../protocol/codex-models.mjs'
+import { resolveSlotOAuthProxy } from '../vm/proxy-resolve.mjs'
 
 export const CODEX_OAUTH_SESSION_TTL_MS = 10 * 60 * 1000
 const SURFACE_STABLE_ID_DOMAIN = Buffer.from('openai/codex-desktop/surface-stable-id/v1\0')
@@ -131,7 +132,15 @@ export function generateCodexAuthUrl({ vmId, proxyUrl, installationId } = {}) {
   }
 }
 
-export async function exchangeCodexAuthCode({ sessionId, code, proxyUrl, vmId, fetchImpl } = {}) {
+export async function exchangeCodexAuthCode({
+  sessionId,
+  code,
+  vmId,
+  vm,
+  proxyPool,
+  fetchImpl,
+  exchange = exchangeCodexAuthorizationCode,
+} = {}) {
   sweepExpired()
   const session = sessions.get(sessionId)
   if (!session || Date.now() - session.createdAt > CODEX_OAUTH_SESSION_TTL_MS) {
@@ -146,9 +155,13 @@ export async function exchangeCodexAuthCode({ sessionId, code, proxyUrl, vmId, f
   if (parsed.state && parsed.state !== session.state) {
     throw fail('state_mismatch', '回调 state 与授权会话不匹配')
   }
-  const px = proxyUrl ?? session.proxyUrl
-  if (px == null) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
-  const tok = await exchangeCodexAuthorizationCode({
+  // Codex exchanges on the control plane, so this URL is the one actually
+  // dialled. Resolve it at the point of use: a pool reallocation inside
+  // CODEX_OAUTH_SESSION_TTL_MS decides the exit, never the authorize-time
+  // snapshot on the session, which stays only for audit. A fetch seam replaces
+  // the transport, not the exit: resolution is not skipped for it.
+  const px = resolveSlotOAuthProxy(vm, proxyPool)
+  const tok = await exchange({
     code: parsed.code,
     codeVerifier: session.codeVerifier,
     proxyUrl: px,
