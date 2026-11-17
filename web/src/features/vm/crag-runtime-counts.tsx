@@ -3,6 +3,13 @@ import type { CragHostStatus, CragRuntimeVm } from './queries'
 const numberLabel = (value: number | 'unlimited' | null | undefined) =>
   value === 'unlimited' ? '不限' : (value ?? '待核对')
 
+const dateLabel = (seconds: number) =>
+  new Date(seconds * 1000).toLocaleDateString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  })
+
 export const cragHostStatusLabels: Record<CragHostStatus['state'], string> = {
   unavailable: '暂不可用',
   unredeemed: '尚未兑换',
@@ -34,6 +41,27 @@ export function CragRuntimeCounts({ status }: { status?: CragHostStatus }) {
         </>
       )}
     </p>
+  )
+}
+
+/** Per-voucher seats and expiry, so a stacked subscription stays legible. */
+export function CragGrantLadder({ status }: { status?: CragHostStatus }) {
+  const grants = status?.grants
+  if (!grants?.length) return null
+  const now = Math.floor(Date.now() / 1000)
+  return (
+    <ul className='mt-1 space-y-0.5 text-xs text-muted-foreground tabular-nums'>
+      {grants.map((grant) => (
+        <li key={grant.expires_at}>
+          {'兑换码槽位 '}
+          {numberLabel(grant.slots)}
+          {' · '}
+          {grant.expires_at <= now
+            ? `已于 ${dateLabel(grant.expires_at)} 到期`
+            : `有效至 ${dateLabel(grant.expires_at)}`}
+        </li>
+      ))}
+    </ul>
   )
 }
 
