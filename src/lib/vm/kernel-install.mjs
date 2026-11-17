@@ -202,11 +202,10 @@ async function restoreCragRollback({ projectRoot, vm, rollback, routing, ops, bo
   } catch {
     // The rollback may have started a container before losing health or persistence.
   }
-  // The candidate never replaced the running process. Leave that slot serving.
-  if (!bootAttempted) return { serving: true }
   const halt = await (ops.stopSlot || stopSlot)(prior)
   if (!halt?.ok) return null
   await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(prior)
+  return null
 }
 
 const report = (items) => {
@@ -601,22 +600,6 @@ export async function installKernelTargets({
                 // Keep the maintenance hold and the verified backup for an operator.
               }
               const failed = result || failure(target, thrown?.code || phase, '新内核安装或启动失败', true)
-              if (recovered?.serving) {
-                const restored = patchVmRecord(projectRoot, target.id, (record) => {
-                  record.status = vm.status
-                  record.runtime = vm.runtime
-                })
-                if (!restored)
-                  return { ...failed, rolled_back: false, error: `${failed.error}；原服务未停止，但运行记录未能写回` }
-                stopped = false
-                stoppedPersisted = false
-                return {
-                  ...failed,
-                  stopped: false,
-                  rolled_back: false,
-                  error: `${failed.error}；原版本仍在运行，回滚包已保留`,
-                }
-              }
               if (recovered) {
                 installed = true
                 stopped = false
@@ -654,7 +637,7 @@ export async function installKernelTargets({
           )
         } finally {
           releaseCache?.()
-          if (rollback && !stopped && installed) {
+          if (rollback && !stopped) {
             try {
               fs.rmSync(rollback.backup, { recursive: true, force: true })
             } catch {
@@ -668,7 +651,7 @@ export async function installKernelTargets({
                 if (record.kernel_operation?.id !== operationId) return
                 record.kernel_operation.phase = interrupted ? 'pending' : 'failed'
                 record.kernel_operation.code = phase
-                if (!stopped && !interrupted && !rollback) clearInstallHold(record)
+                if (!stopped && !interrupted) clearInstallHold(record)
               })
             } catch {
               console.warn(`[kernel-install] ${target.id} failure state could not be persisted (${phase})`)

@@ -1005,32 +1005,40 @@ for (const stage of ['policy', 'materialize', 'seed', 'config']) {
     assert.equal(saved.kernel_installation, undefined)
   })
 }
-test('pre-replacement CRAG failure keeps the old package and rollback instead of claiming recovery', async (t) => {
+test('failed old-version restart stays stopped and does not report the slot as running', async (t) => {
   const previous = { kernel: 'crag', version: '3.1.2', installed_at: '2026-11-16T00:00:00Z' }
   const { root, vm, home } = fixture(t, {
     dataplane: 'crag',
     crag_kernel_version: 'v2',
     kernel_installation: previous,
+    runtime: { type: 'docker', pid: 77, ip: '10.0.0.8' },
   })
   activateFixture(root, vm)
   assert.equal(materializeResolvedKernel(root, vm).ok, true)
   const manifest = path.join(home, '.kin', 'crag-v2', 'manifest.json')
   const oldManifest = fs.readFileSync(manifest)
+  let starts = 0
   const life = lifecycle(root, {
     materializeResolvedKernel: () => ({ ok: false, code: 'disk_full', error: 'disk full' }),
-    startSlotReady: () => assert.fail('the candidate must not boot'),
     stopSlot() {
       return { ok: true }
     },
+    startSlotReady() {
+      starts++
+      return { ok: false, code: 'kernel_health_timeout' }
+    },
   })
   const result = await installKernelTargets({ projectRoot: root, targets: target('crag'), ops: life.ops })
+  assert.equal(starts, 1, 'only the verified old version may be started')
   assert.equal(result.items[0].code, 'disk_full', JSON.stringify(result))
-  assert.equal(result.items[0].stopped, false)
-  assert.match(result.items[0].error, /原版本仍在运行/)
-  assert.doesNotMatch(result.items[0].error, /未能验证原版本恢复/)
+  assert.equal(result.items[0].stopped, true)
+  assert.equal(result.items[0].rolled_back, false)
+  assert.match(result.items[0].error, /未能验证原版本恢复/)
+  assert.doesNotMatch(result.items[0].error, /原版本仍在运行/)
   assert.deepEqual(fs.readFileSync(manifest), oldManifest)
   const saved = getVm(root, vm.id)
-  assert.equal(saved.status, 'running')
+  assert.equal(saved.status, 'stopped')
+  assert.equal(saved.runtime.pid, null)
   assert.equal(saved.kernel_operation.phase, 'failed')
   const backup = path.join(root, 'vms', vm.id, saved.kernel_operation.rollback_package, 'package', 'manifest.json')
   assert.deepEqual(fs.readFileSync(backup), oldManifest)
