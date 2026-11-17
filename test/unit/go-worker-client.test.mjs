@@ -1996,3 +1996,42 @@ unixTest('kernel preparation isolates controls without rewriting tool continuati
     }
   }
 })
+
+unixTest('streamGoWorker preserves refusal details when an empty response becomes an error', async () => {
+  const details = {
+    type: 'refusal',
+    category: 'reasoning_extraction',
+    explanation: 'Synthetic provider refusal explanation.',
+  }
+  const fx = await fixture((_req, res) => {
+    res.setHeader('content-type', 'text/event-stream')
+    writeData(res, { type: 'message_start', message: { type: 'message', role: 'assistant', content: [] } })
+    writeData(res, { type: 'message_delta', delta: { stop_reason: 'refusal', stop_details: details } })
+    writeData(res, { type: 'message_stop' })
+    writeData(res, {
+      type: 'error',
+      error: { type: 'api_error', message: 'native request completed without response content' },
+    })
+    res.end()
+  })
+  try {
+    const lines = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: {
+        model: 'claude-sonnet-5',
+        stream: true,
+        messages: [{ role: 'user', content: 'synthetic classifier input' }],
+      },
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.committed, false)
+    assert.equal(result.stopReason, 'refusal')
+    assert.deepEqual(result.stopDetails, details)
+    assert.equal(result.body.error.code, 'empty_response')
+    assert.deepEqual(lines, [])
+  } finally {
+    await fx.close()
+  }
+})
