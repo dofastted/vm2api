@@ -31,7 +31,6 @@ import {
   type DraftMessage,
   type PreviewDraft,
   type PreviewEdit,
-  type PreviewLayoutEdit,
 } from './crag-preview-protocol'
 
 export function CragPreviewPage() {
@@ -123,9 +122,6 @@ export function CragPreviewPage() {
       onEdit={(change) => {
         if (message.edit) send({ type: 'crag-preview:edit', ...change })
       }}
-      onLayoutEdit={(change) => {
-        if (message.edit) send({ type: 'crag-preview:layout', ...change })
-      }}
     />
   )
 }
@@ -137,7 +133,6 @@ export function PreviewCanvas({
   onPick,
   onFocus,
   onEdit,
-  onLayoutEdit,
 }: {
   draft: PreviewDraft
   selected: string | null
@@ -145,7 +140,6 @@ export function PreviewCanvas({
   onPick: (sku: string) => void
   onFocus?: (sku: string) => void
   onEdit?: (change: PreviewEdit) => void
-  onLayoutEdit?: (change: PreviewLayoutEdit) => void
 }) {
   const presentation = draft.presentation ?? {}
   const commerce = draft.commerce
@@ -218,6 +212,8 @@ export function PreviewCanvas({
     )
     // 推荐角标是布局在画布上唯一有自然落点的可视元素，故只让它内联可编辑；
     // 列数 / 密度 / 订单区位置 / featured_sku 仍由父页属性栏负责。
+    // 回传走 edit 通道的 target:'layout'，不是 crag-preview:layout —— 父页那条
+    // 通道只认 plan_columns / orders_position / featured_sku，别的 key 会被丢弃。
     const featured =
       plan.sku === featuredSku ? (
         edit ? (
@@ -227,7 +223,9 @@ export function PreviewCanvas({
             fallback={featuredFallback}
             editable
             maxLength={FEATURED_LABEL_MAX}
-            onSave={(value) => onLayoutEdit?.({ key: 'featured_label', value })}
+            onSave={(value) =>
+              onEdit?.({ target: 'layout', key: 'featured_label', value })
+            }
           />
         ) : (
           (layout?.featuredLabel ?? featuredFallback)

@@ -5,7 +5,6 @@ import {
   type CopyKey,
   type Presentation,
 } from './crag-catalog'
-import type { PresentationLayout } from './crag-layout'
 
 export type PreviewDraft = {
   plans: DraftPlan[]
@@ -30,16 +29,12 @@ export type PreviewEdit =
       field: 'name' | 'description'
       value: string
     }
-
-/**
- * 画布回传给父页的布局变更。key 严格取 layout 的契约字段名，不自创。
- */
-export type PreviewLayoutEdit = {
-  [K in keyof PresentationLayout]-?: {
-    key: K
-    value: PresentationLayout[K]
-  }
-}[keyof PresentationLayout]
+  // 推荐角标文案走 edit 通道而不是 layout 通道：父页的 crag-preview:layout
+  // 只认 plan_columns / orders_position / featured_sku，其余 key 一律丢弃，
+  // featured_label 在它的 crag-preview:edit 分支里以 target:'layout' 处理，
+  // 且父页未设推荐位时会拒收。画布目前不做列数/密度/位置/推荐位控件，
+  // 所以没有往 crag-preview:layout 发消息的路径。
+  | { target: 'layout'; key: 'featured_label'; value: string }
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)

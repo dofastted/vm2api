@@ -322,7 +322,7 @@ describe('preview parent channel', () => {
     expect(html).not.toContain('data-featured')
   })
 
-  it('sends featured_label edits back with the contract field name', () => {
+  it('sends featured_label edits on the channel the parent actually reads', () => {
     receive({
       ...draft,
       draft: {
@@ -336,13 +336,21 @@ describe('preview parent channel', () => {
     expect(field?.fallback).toBe('推荐')
     expect(field?.maxLength).toBe(12)
     field?.onSave('最超值')
+    // 父页的 crag-preview:layout 只认 plan_columns / orders_position /
+    // featured_sku，featured_label 必须走 edit 通道的 target:'layout'，
+    // 否则会命中父页的 else return 被静默丢弃。
     expect(parent.postMessage).toHaveBeenLastCalledWith(
-      { type: 'crag-preview:layout', key: 'featured_label', value: '最超值' },
+      {
+        type: 'crag-preview:edit',
+        target: 'layout',
+        key: 'featured_label',
+        value: '最超值',
+      },
       origin
     )
   })
 
-  it('does not send layout edits while editing is off', () => {
+  it('does not send the featured_label edit while editing is off', () => {
     receive({
       ...draft,
       edit: false,
@@ -354,7 +362,11 @@ describe('preview parent channel', () => {
     const readOnly = render()
     expect(state.fields.some((entry) => entry.label === '推荐角标')).toBe(false)
     parent.postMessage.mockClear()
-    readOnly.props.onLayoutEdit?.({ key: 'featured_label', value: '不允许' })
+    readOnly.props.onEdit?.({
+      target: 'layout',
+      key: 'featured_label',
+      value: '不允许',
+    })
     expect(parent.postMessage).not.toHaveBeenCalled()
   })
 })
