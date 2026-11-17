@@ -97,6 +97,7 @@ import {
 import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { canReuseCanonicalHistory } from './sanitize.mjs'
+import { relocateThirdPartySystem, thirdPartyRelocateEnabled } from './third-party-system.mjs'
 import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
 import {
   callerCwdDeclaration,
@@ -1441,6 +1442,26 @@ export function createHandleProtocol(deps) {
     if (!apiOpenAI && !requestContext && !officialPassthrough) {
       ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
     }
+    // Anthropic 400s a subscription request whose system field carries a third-party
+    // agent prompt; the same text in the first user message is accepted.
+    let cragRelocated = null
+    if (
+      !apiOpenAI &&
+      inferenceBackend !== 'api' &&
+      !requestContext &&
+      !officialPassthrough &&
+      !officialTraffic &&
+      thirdPartyRelocateEnabled(getRouting())
+    ) {
+      const relocated = relocateThirdPartySystem(ctx.body)
+      if (relocated.moved) {
+        // A CRAG hop sends cragSystem (the caller system without its <cwd>
+        // declaration) instead of personaIn.system. Relocate that projection
+        // too, or the hop would put the third-party prompt back into system.
+        if (hasCragSystem) cragRelocated = relocateThirdPartySystem({ ...ctx.body, system: cragSystem }).body
+        ctx.body = relocated.body
+      }
+    }
     const personaIn = ctx.body
     // Capture ownership before rendering supplies gateway markers or projects
     // the caller's automatic cache policy onto a CLI message block.
@@ -1824,7 +1845,7 @@ export function createHandleProtocol(deps) {
               const cragPersona = resolveCragPrintPersona(selected.vm, routingNow)
               const caps = preparedHop.ready.health?.capabilities
               const preserveToolNames = deferToolNameRewrite && caps?.includes('generation_controls_v3')
-              const cragInput = hasCragSystem ? { ...personaIn, system: cragSystem } : personaIn
+              const cragInput = cragRelocated || (hasCragSystem ? { ...personaIn, system: cragSystem } : personaIn)
               const reuseHistory = !officialPassthrough && !repaired && !extra.repairs?.length
               const reuseIngress =
                 reuseHistory &&
