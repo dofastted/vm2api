@@ -66,15 +66,9 @@ test('no system or no messages is a no-op', () => {
   assert.equal(relocateThirdPartySystem(null).moved, false)
 })
 
-test('switch: default on, routing or env turns it off', () => {
-  assert.equal(thirdPartyRelocateEnabled(null, {}), true)
-  assert.equal(thirdPartyRelocateEnabled({ compatibility: { third_party_system_relocate: false } }, {}), false)
-  assert.equal(thirdPartyRelocateEnabled({ compatibility: {} }, { KIN_THIRD_PARTY_SYSTEM_RELOCATE: '0' }), false)
-  assert.equal(
-    thirdPartyRelocateEnabled(
-      { compatibility: { third_party_system_relocate: false } },
-      { KIN_THIRD_PARTY_SYSTEM_RELOCATE: '1' },
-    ),
-    true,
-  )
+test('switch: follows claude_code_only (off admits and relocates, on rejects upstream of this)', () => {
+  assert.equal(thirdPartyRelocateEnabled(null), true)
+  assert.equal(thirdPartyRelocateEnabled({ compatibility: {} }), true)
+  assert.equal(thirdPartyRelocateEnabled({ compatibility: { claude_code_only: false } }), true)
+  assert.equal(thirdPartyRelocateEnabled({ compatibility: { claude_code_only: true } }), false)
 })

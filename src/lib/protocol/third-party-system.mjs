@@ -10,22 +10,17 @@
  * moved there before the persona renders its own system.
  *
  * Runs once on the caller body, ahead of every hop. Official Claude Code
- * traffic is left alone. Switch: routing.compatibility.third_party_system_relocate
- * (default on) or env KIN_THIRD_PARTY_SYSTEM_RELOCATE=0.
+ * traffic is left alone. Bound to routing.compatibility.claude_code_only
+ * (面板「仅允许 Claude Code 家族请求」): off admits third-party clients and
+ * relocates their system; on rejects them at the gate with 403
+ * claude_code_only before any slot is picked, so nothing is relocated.
  */
 import { CRS_OFFICIAL_CLI_SYSTEM, isKnownOfficialSystemText } from '../identity/crs-persona.mjs'
+import { claudeCodeOnlyFromRouting } from '../identity/claude-code-only.mjs'
 
-export const THIRD_PARTY_RELOCATE_ENV = 'KIN_THIRD_PARTY_SYSTEM_RELOCATE'
-
-const OFF_VALUES = new Set(['0', 'false', 'off', 'no', 'disabled'])
-
-export function thirdPartyRelocateEnabled(routing = null, env = process.env) {
-  const fromEnv = env?.[THIRD_PARTY_RELOCATE_ENV]
-  if (fromEnv != null && fromEnv !== '') return !OFF_VALUES.has(String(fromEnv).trim().toLowerCase())
-  const setting = routing?.compatibility?.third_party_system_relocate
-  if (setting == null) return true
-  if (typeof setting === 'string') return !OFF_VALUES.has(setting.trim().toLowerCase())
-  return setting !== false
+/** Third-party clients are admitted (and relocated) exactly when claude_code_only is off. */
+export function thirdPartyRelocateEnabled(routing = null) {
+  return !claudeCodeOnlyFromRouting(routing)
 }
 
 function systemBlocks(system) {

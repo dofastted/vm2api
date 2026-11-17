@@ -77,7 +77,11 @@ export function ProtocolPane({
         <div className='divide-y'>
           <SettingRow
             label='仅允许 Claude Code 家族请求'
-            desc='其余一律 403，返回“请使用 Claude 官方客户端”，不选号、不上游。'
+            desc={
+              strict
+                ? '第三方客户端一律 403，返回“请使用 Claude 官方客户端”，不选号、不上游。'
+                : '已关：第三方客户端放行，其 system 自动搬进首条 user，避开上游「Third-party apps」计费拒绝。'
+            }
           >
             <Switch
               checked={strict}
