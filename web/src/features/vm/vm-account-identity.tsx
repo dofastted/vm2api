@@ -5,7 +5,7 @@ import OpenAI from '@lobehub/icons/es/OpenAI/components/Mono'
 import { credentialRegistrationOf } from '@/lib/cred-type'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { clipLabel, isCodexVm } from '@/lib/vm-kind'
 import { claudeTier } from '@/lib/vm-status'
 import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
 import { VmRentedMark } from '@/features/vm/vm-owner-line'
@@ -39,12 +39,15 @@ export function VmAccountIdentity({ vm }: { vm: Vm }) {
           className='truncate font-mono font-medium'
           title={vm.name || vm.id}
         >
-          {vm.gemini ? vm.name : vm.id}
+          {clipLabel(vm.gemini ? vm.name || vm.id : vm.id)}
         </span>
       </div>
       <div className='flex min-w-0 items-center gap-1.5'>
-        <div className='truncate text-xs font-semibold' title={email}>
-          {email || '未绑定邮箱'}
+        <div
+          className='truncate text-xs font-semibold'
+          title={email || undefined}
+        >
+          {email ? clipLabel(email) : '未绑定邮箱'}
         </div>
         <ActiveVmBadge vm={vm} />
       </div>

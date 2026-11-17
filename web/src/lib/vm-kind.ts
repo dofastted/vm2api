@@ -134,6 +134,16 @@ export function compactEmail(email: string, max = 22): string {
   return `${local.slice(0, localKeep)}…@${keepDomain}`
 }
 
+/** 左侧名称：固定字符数，超出用省略号。完整原文放 title。 */
+export const SLOT_LABEL_MAX = 10
+
+export function clipLabel(value: string, max = SLOT_LABEL_MAX): string {
+  const text = String(value || '')
+  const chars = Array.from(text)
+  if (chars.length <= max) return text
+  return `${chars.slice(0, max).join('')}…`
+}
+
 function domainTail(domain: string, max: number): string {
   const labels = domain.split('.')
   if (labels.length >= 2) {

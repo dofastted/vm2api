@@ -37,6 +37,7 @@ import {
   SLOT_BG,
   type SlotState,
 } from '@/lib/vm-health'
+import { clipLabel } from '@/lib/vm-kind'
 import {
   claudeTier,
   poolStatus,
@@ -502,7 +503,7 @@ function ProdCell({ vm }: { vm: Vm }) {
         )}
         title={vm.name || vm.id}
       >
-        {vm.gemini ? vm.name : vm.id}
+        {clipLabel(vm.gemini ? vm.name || vm.id : vm.id)}
       </span>
       {plan && plan !== '—' ? (
         <span
@@ -532,7 +533,7 @@ function ProdCell({ vm }: { vm: Vm }) {
         )}
         title={vm.email || ''}
       >
-        {vm.email || '未绑定邮箱'}
+        {vm.email ? clipLabel(vm.email) : '未绑定邮箱'}
       </span>
       <span
         className={cn(
@@ -722,9 +723,12 @@ function ToggleBtn({
 export function VmTable({
   vms,
   accounts,
+  zoom = 100,
 }: {
   vms: Vm[]
   accounts?: UsageAccountRow[]
+  /** 列表放大，100–200。100 为原尺寸。 */
+  zoom?: number
 }) {
   const actions = useVmActions()
   const now = useNow()
@@ -834,7 +838,12 @@ export function VmTable({
         data-pin={pinSec}
         className='group/tbl overflow-x-auto rounded-lg border border-border/60 bg-card text-[12.5px]'
       >
-        <div className='min-w-[1408px]' role='table' aria-label='槽位列表'>
+        <div
+          className='min-w-[1408px]'
+          role='table'
+          aria-label='槽位列表'
+          style={zoom === 100 ? undefined : { zoom: zoom / 100 }}
+        >
           <div
             role='row'
             className='sticky top-0 z-[6] grid h-8 border-b bg-muted/40 text-[11.5px] text-muted-foreground [--row-bg:var(--card)]'
