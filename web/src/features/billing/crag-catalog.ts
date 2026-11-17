@@ -1,3 +1,5 @@
+import type { PresentationLayout, ResolvedLayout } from './crag-layout'
+
 export type CommerceRules = {
   unit_amount_minor: number
   max_amount_minor: number
@@ -38,6 +40,8 @@ export type PlanOption = {
   enabled?: boolean
   remaining?: number | null
   renewable?: boolean
+  /** 已格式化的折合月价；null 表示该套餐不适用（月卡或未定价）。 */
+  monthly?: string | null
 }
 
 export const copyDefaults = {
@@ -61,7 +65,9 @@ export const copyLabels: Record<CopyKey, string> = {
   empty_plans_text: '无套餐提示',
   empty_orders_text: '无历史订单提示',
 }
-export type Presentation = Partial<Record<CopyKey, string>>
+export type Presentation = Partial<Record<CopyKey, string>> & {
+  layout?: PresentationLayout | null
+}
 
 const money = new Intl.NumberFormat('zh-CN', {
   style: 'currency',
@@ -97,4 +103,41 @@ export function formatPlanDetails(
           ? `${slotLimit} 把应用锁`
           : '槽位待填写',
   }
+}
+
+/**
+ * 套餐覆盖的月数。沿用既有推导：显式 months 优先，否则从 term 解析，
+ * 无法判定时按 1 个月处理（折合月价因此不会显示）。
+ */
+export function planMonths(term: string | null, months?: number): number {
+  if (months != null && Number.isSafeInteger(months) && months >= 1)
+    return months
+  if (term === '1y') return 12
+  if (term && /^[1-9][0-9]*m$/.test(term)) return Number(term.slice(0, -1))
+  return 1
+}
+
+/**
+ * 折合月价。只对跨月套餐有意义：月卡（months <= 1）或未定价时返回 null，
+ * 由调用方决定不渲染。
+ */
+export function monthlyPrice(
+  amountMinor: number | null,
+  months: number
+): string | null {
+  if (amountMinor == null || months <= 1) return null
+  return yuan(amountMinor / months)
+}
+
+/**
+ * 按 layout 门控的折合月价。缺省排版就是显示月价，与 crag-auth 的默认语义一致。
+ */
+export function monthlyFor(
+  layout: Pick<ResolvedLayout, 'showMonthlyPrice'>,
+  amountMinor: number | null,
+  term: string | null,
+  months?: number
+): string | null {
+  if (!layout.showMonthlyPrice) return null
+  return monthlyPrice(amountMinor, planMonths(term, months))
 }

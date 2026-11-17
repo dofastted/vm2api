@@ -30,6 +30,34 @@ export class ShopError extends Error {
 
 const invalidReply = () => new ShopError(502, 'shop_invalid_reply', 'Invalid response from CRAG shop')
 
+const LAYOUT_COLUMNS = [1, 2, 3]
+const LAYOUT_DENSITY = ['regular', 'compact']
+const LAYOUT_ORDERS = ['below', 'side']
+const FEATURED_LABEL_MAX = 12
+
+// presentation.layout only affects how the buyer page is arranged, so a field the
+// panel cannot interpret degrades to the buyer-page default instead of failing the
+// whole catalog: a layout value crag-auth adds before this panel knows about it must
+// never take the plans, prices or checkout down with it. Unknown keys are dropped the
+// same way the copy whitelist drops them.
+function publicLayout(value) {
+  const layout = {}
+  if (LAYOUT_COLUMNS.includes(value.plan_columns)) layout.plan_columns = value.plan_columns
+  if (LAYOUT_DENSITY.includes(value.card_density)) layout.card_density = value.card_density
+  if (LAYOUT_ORDERS.includes(value.orders_position)) layout.orders_position = value.orders_position
+  if (typeof value.show_monthly_price === 'boolean') layout.show_monthly_price = value.show_monthly_price
+  // Membership in the published plan list is decided by the page that renders the
+  // badge; here only the shape is checked so a hidden plan's sku is not silently lost.
+  if (isSku(value.featured_sku)) layout.featured_sku = value.featured_sku
+  if (
+    typeof value.featured_label === 'string' &&
+    value.featured_label.trim().length > 0 &&
+    [...value.featured_label].length <= FEATURED_LABEL_MAX
+  )
+    layout.featured_label = value.featured_label
+  return layout
+}
+
 export function publicPlan(value) {
   if (!object(value)) throw invalidReply()
   const { sku, term, amount_minor, slot_limit } = value
@@ -386,6 +414,7 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
           if (typeof value.presentation[key] !== 'string') throw invalidReply()
           result.presentation[key] = value.presentation[key]
         }
+        if (object(value.presentation.layout)) result.presentation.layout = publicLayout(value.presentation.layout)
       }
       return result
     },

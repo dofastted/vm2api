@@ -131,7 +131,7 @@ afterEach(() => {
 describe('preview parent channel', () => {
   it('acknowledges only after rendering and the commit effect, then restores theme', () => {
     expect(parent.postMessage).toHaveBeenCalledExactlyOnceWith(
-      { type: 'crag-preview:ready' },
+      { type: 'crag-preview:ready', caps: ['layout-1'] },
       '*'
     )
     receive()
@@ -280,6 +280,95 @@ describe('preview parent channel', () => {
     const readOnly = render()
     parent.postMessage.mockClear()
     readOnly.props.onEdit?.({ target: 'copy', key: 'title', value: '不允许' })
+    expect(parent.postMessage).not.toHaveBeenCalled()
+  })
+
+  it('declares the layout-1 capability so the parent keeps sending layout', () => {
+    const [[message]] = parent.postMessage.mock.calls
+    expect(message.type).toBe('crag-preview:ready')
+    expect(message.caps).toContain('layout-1')
+  })
+
+  it('applies an incoming layout draft instead of dropping the whole message', () => {
+    receive({
+      ...draft,
+      draft: {
+        ...draft.draft,
+        presentation: {
+          layout: {
+            plan_columns: 3,
+            card_density: 'compact',
+            orders_position: 'below',
+            featured_sku: 'draft-1',
+            featured_label: '最超值',
+          },
+        },
+      },
+    })
+    render()
+    expect(html).toContain('lg:grid-cols-2 xl:grid-cols-3')
+    expect(html).toContain('data-density="compact"')
+    expect(html).toContain('data-featured="true"')
+    expect(html).toContain('最超值')
+    expect(html).not.toContain('xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]')
+  })
+
+  it('renders the shared default arrangement when the draft carries no layout', () => {
+    receive()
+    render()
+    // 缺省语义与正式买家页一致：2 列、订单区在下方、显示折合月价。
+    // （本页原先恒单列、恒旁置，与买家页默认并不相符。）
+    expect(html).toContain('grid gap-2.5 lg:grid-cols-2')
+    expect(html).not.toContain('xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]')
+    expect(html).not.toContain('xl:grid-cols-3')
+    expect(html).not.toContain('data-featured')
+  })
+
+  it('sends featured_label edits on the channel the parent actually reads', () => {
+    receive({
+      ...draft,
+      draft: {
+        ...draft.draft,
+        presentation: { layout: { featured_sku: 'draft-1' } },
+      },
+    })
+    render()
+    const field = state.fields.find((entry) => entry.label === '推荐角标')
+    expect(field).toBeDefined()
+    expect(field?.fallback).toBe('推荐')
+    expect(field?.maxLength).toBe(12)
+    field?.onSave('最超值')
+    // 父页的 crag-preview:layout 只认 plan_columns / orders_position /
+    // featured_sku，featured_label 必须走 edit 通道的 target:'layout'，
+    // 否则会命中父页的 else return 被静默丢弃。
+    expect(parent.postMessage).toHaveBeenLastCalledWith(
+      {
+        type: 'crag-preview:edit',
+        target: 'layout',
+        key: 'featured_label',
+        value: '最超值',
+      },
+      origin
+    )
+  })
+
+  it('does not send the featured_label edit while editing is off', () => {
+    receive({
+      ...draft,
+      edit: false,
+      draft: {
+        ...draft.draft,
+        presentation: { layout: { featured_sku: 'draft-1' } },
+      },
+    })
+    const readOnly = render()
+    expect(state.fields.some((entry) => entry.label === '推荐角标')).toBe(false)
+    parent.postMessage.mockClear()
+    readOnly.props.onEdit?.({
+      target: 'layout',
+      key: 'featured_label',
+      value: '不允许',
+    })
     expect(parent.postMessage).not.toHaveBeenCalled()
   })
 })

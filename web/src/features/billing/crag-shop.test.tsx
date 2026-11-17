@@ -629,7 +629,9 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(orders).toBeGreaterThan(plans)
     expect(html.indexOf('付款反馈')).toBeLessThan(plans)
     expect(html.indexOf('订单错误')).toBeLessThan(plans)
-    expect(html).toContain('xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]')
+    // 缺省排版的订单区在下方（不再因管理员身份旁置）；旁置由
+    // orders_position="side" 驱动，见「CRAG 买家页消费 presentation.layout」。
+    expect(html).not.toContain('xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]')
     expect(html).not.toContain('order-first')
     expect(html).toMatch(/<option value="" selected="">仅领取兑换码/)
   })
@@ -947,5 +949,113 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(
       state.buttons.some((button) => button.children === '重试自动激活')
     ).toBe(false)
+  })
+})
+
+const sideClass = 'xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]'
+
+function withLayout(layout?: Record<string, unknown>) {
+  state.values[1] = {
+    status: 'ready',
+    data: {
+      ...catalog,
+      ...(layout ? { presentation: { layout } } : {}),
+    },
+  }
+  return render()
+}
+
+describe('CRAG 买家页消费 presentation.layout', () => {
+  it('无 layout 时按缺省排版处理，订单区在下方且不再看管理员身份', () => {
+    for (const role of ['admin', 'user']) {
+      state.role = role
+      expect(withLayout()).not.toContain(sideClass)
+    }
+  })
+
+  it('orders_position="side" 对普通买家同样生效', () => {
+    state.role = 'user'
+    expect(withLayout({ orders_position: 'side' })).toContain(sideClass)
+  })
+
+  it('orders_position="below" 覆盖管理员的旁置视图', () => {
+    state.role = 'admin'
+    expect(withLayout({ orders_position: 'below' })).not.toContain(sideClass)
+  })
+
+  it('声明 layout 但不设 orders_position 时按缺省 below 处理', () => {
+    state.role = 'admin'
+    expect(withLayout({ plan_columns: 3 })).not.toContain(sideClass)
+  })
+
+  it('plan_columns 驱动套餐网格列数', () => {
+    expect(withLayout({ plan_columns: 3 })).toContain(
+      'lg:grid-cols-2 xl:grid-cols-3'
+    )
+    expect(withLayout({ plan_columns: 1 })).not.toContain('lg:grid-cols-2')
+    expect(withLayout()).toContain('lg:grid-cols-2')
+  })
+
+  it('card_density 与 featured_sku 透传到套餐卡', () => {
+    const html = withLayout({
+      card_density: 'compact',
+      featured_sku: 'quarter',
+      featured_label: '最超值',
+    })
+    expect(html).toContain('data-density="compact"')
+    expect(html).toContain('data-featured="true"')
+    expect(html).toContain('最超值')
+  })
+
+  it('缺省排版就显示季卡折合月价，show_monthly_price=false 才关闭', () => {
+    expect(withLayout()).toContain('约 ¥2 / 月')
+    expect(withLayout({ show_monthly_price: true })).toContain('约 ¥2 / 月')
+    expect(withLayout({ show_monthly_price: false })).not.toContain('/ 月')
+  })
+
+  it('非法 layout 降级为缺省排版而不是让页面崩掉', () => {
+    for (const layout of [
+      { plan_columns: 9 },
+      { orders_position: 'float' },
+      { featured_sku: 'missing' },
+    ]) {
+      state.role = 'user'
+      const html = withLayout(layout)
+      expect(html).toContain('发布套餐')
+      expect(html).not.toContain(sideClass)
+      expect(html).not.toContain('data-featured')
+    }
+  })
+
+  it('layout 透传给报价组件，固定套餐区与选择器排版一致', () => {
+    state.values[1] = {
+      status: 'ready',
+      data: {
+        ...catalog,
+        commerce: rules,
+        presentation: { layout: { plan_columns: 3, card_density: 'compact' } },
+      },
+    }
+    render()
+    expect(state.commerce?.layout).toMatchObject({
+      planColumns: 3,
+      cardDensity: 'compact',
+    })
+  })
+
+  it('没有 layout 时报价组件收到缺省排版，而不是另一种状态', () => {
+    state.values[1] = {
+      status: 'ready',
+      data: { ...catalog, commerce: rules },
+    }
+    render()
+    expect(state.commerce?.layout).toEqual({
+      planColumns: 2,
+      cardDensity: 'regular',
+      ordersPosition: 'below',
+      showMonthlyPrice: true,
+      featuredSku: null,
+      featuredLabel: null,
+    })
   })
 })

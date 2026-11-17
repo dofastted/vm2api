@@ -26,6 +26,8 @@ import {
 } from '@/features/vm/queries'
 import {
   formatPlanDetails,
+  monthlyPrice,
+  planMonths,
   termLabel,
   type CommerceRules,
   type CragPlan,
@@ -39,6 +41,7 @@ import {
   type CommerceSelection,
   type PaymentMethod as Method,
 } from './crag-commerce'
+import { normalizeLayout, ordersSideClass } from './crag-layout'
 import { CragPlanPicker } from './crag-plan-picker'
 
 export { formatPlanDetails, termLabel } from './crag-catalog'
@@ -859,6 +862,11 @@ function ShopOrders({
   const plans = allPlans.filter((plan) => plan.enabled !== false)
   const presentation =
     catalog.status === 'ready' ? catalog.data.presentation : undefined
+  // 纯函数，不包 useMemo：预览页的测试 mock 对 hook 调用顺序敏感，两边保持同一写法。
+  const layout = normalizeLayout(presentation?.layout)
+  // 目录没有 layout 时等同于全默认排版（crag-auth 在布局等于默认时直接不写该键），
+  // 所以订单区位置一律由 orders_position 决定，不再看 isAdmin。
+  const ordersSide = layout.ordersPosition === 'side'
   const commerce =
     catalog.status === 'ready' ? catalog.data.commerce : undefined
   const canRenew = !!(
@@ -1144,11 +1152,16 @@ function ShopOrders({
                   description: plan.description,
                   remaining: plan.remaining,
                   renewable: plan.renewable,
+                  monthly: monthlyPrice(
+                    plan.amount_minor,
+                    planMonths(plan.term, plan.months)
+                  ),
                   ...formatPlanDetails(plan.amount_minor, plan.slot_limit),
                 }))}
                 selectedSku={selectedPlan?.sku}
                 onSelect={setPlanSku}
                 disabled={busy}
+                layout={layout}
               />
             ) : null}
             {!commerce ? deliveryOptions : null}
@@ -1181,6 +1194,7 @@ function ShopOrders({
                 device={device}
                 paymentMethods={channels}
                 deliveryOptions={deliveryOptions}
+                layout={layout}
                 onOrder={(selection, price, channel) =>
                   createOrder(selection, channel, price)
                 }
@@ -1193,7 +1207,7 @@ function ShopOrders({
             ) : null}
           </section>
           <div
-            className={`grid min-w-0 items-start gap-6 ${isAdmin ? 'xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]' : ''}`}
+            className={`grid min-w-0 items-start gap-6 ${ordersSide ? ordersSideClass : ''}`}
           >
             <section
               aria-label={presentation?.orders_title ?? '历史订单'}

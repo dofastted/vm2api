@@ -2,7 +2,18 @@ import { useEffect, useId, useState, type ReactNode } from 'react'
 import { api, cragDeviceApi, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { yuan, type CommerceRules, type CragPlan as Plan } from './crag-catalog'
+import {
+  monthlyFor,
+  yuan,
+  type CommerceRules,
+  type CragPlan as Plan,
+} from './crag-catalog'
+import {
+  commerceColumnClass,
+  densityClass,
+  featuredFallback,
+  type ResolvedLayout,
+} from './crag-layout'
 import { CommercePlanContent, CommerceRulesSummary } from './crag-plan-content'
 
 export type { CommerceRules } from './crag-catalog'
@@ -97,6 +108,7 @@ export function CragCommerce({
   paymentMethods,
   deliveryOptions,
   onOrder,
+  layout,
 }: {
   rules: CommerceRules
   plans: Plan[]
@@ -116,6 +128,8 @@ export function CragCommerce({
     price: number,
     method: PaymentMethod
   ) => void
+  /** 目录声明的排版，已由 normalizeLayout 解析，缺省即缺省排版。 */
+  layout: ResolvedLayout
 }) {
   const id = useId()
   const [slots, setSlots] = useState(String(rules.min_slots ?? 1))
@@ -203,31 +217,57 @@ export function CragCommerce({
   const selectionUnavailable =
     !available && (sku !== 'custom' || !customEnabled)
 
+  const density = layout.cardDensity
+  const space = densityClass[density]
+  const visiblePlans = plans.filter((plan) => plan.enabled !== false)
+  const featuredSku =
+    layout.featuredSku &&
+    visiblePlans.some((plan) => plan.sku === layout.featuredSku)
+      ? layout.featuredSku
+      : null
+
   return (
     <div className='space-y-4'>
       {plans.length > 0 || allowRenewal ? (
-        <fieldset className='grid gap-2 sm:grid-cols-2' disabled={busy}>
+        <fieldset
+          className={`grid ${space.grid} ${commerceColumnClass[layout.planColumns]}`}
+          disabled={busy}
+        >
           <legend className='mb-2 text-sm font-medium'>
             固定套餐{allowRenewal ? '与续费' : ''}
           </legend>
-          {plans
-            .filter((plan) => plan.enabled !== false)
-            .map((plan) => (
-              <label
-                key={plan.sku}
-                className='flex items-center gap-3 rounded-xl border bg-card p-4 text-sm text-card-foreground shadow-xs transition-colors has-checked:border-primary has-checked:bg-primary/5 has-checked:ring-2 has-checked:ring-primary/20 has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring has-enabled:cursor-pointer has-enabled:hover:border-primary/50 has-disabled:opacity-60'
-              >
-                <input
-                  type='radio'
-                  name={id}
-                  className='accent-primary'
-                  checked={sku === plan.sku}
-                  disabled={plan.remaining === 0}
-                  onChange={() => onSelect(plan.sku)}
-                />
-                <CommercePlanContent plan={plan} />
-              </label>
-            ))}
+          {visiblePlans.map((plan) => (
+            <label
+              key={plan.sku}
+              data-density={density}
+              data-featured={plan.sku === featuredSku || undefined}
+              className={`flex items-center gap-3 rounded-xl border bg-card ${space.card} text-sm text-card-foreground shadow-xs transition-colors has-checked:border-primary has-checked:bg-primary/5 has-checked:ring-2 has-checked:ring-primary/20 has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring has-enabled:cursor-pointer has-enabled:hover:border-primary/50 has-disabled:opacity-60`}
+            >
+              <input
+                type='radio'
+                name={id}
+                className='accent-primary'
+                checked={sku === plan.sku}
+                disabled={plan.remaining === 0}
+                onChange={() => onSelect(plan.sku)}
+              />
+              <CommercePlanContent
+                plan={plan}
+                density={density}
+                featured={
+                  plan.sku === featuredSku
+                    ? (layout.featuredLabel ?? featuredFallback)
+                    : undefined
+                }
+                monthly={monthlyFor(
+                  layout,
+                  plan.amount_minor,
+                  plan.term,
+                  plan.months
+                )}
+              />
+            </label>
+          ))}
           {allowRenewal ? (
             <label className='flex cursor-pointer items-center gap-3 rounded-xl border bg-card p-4 text-sm font-medium shadow-xs transition-colors hover:border-primary/50 has-checked:border-primary has-checked:bg-primary/5 has-checked:ring-2 has-checked:ring-primary/20'>
               <input

@@ -5,6 +5,7 @@ import {
   type DraftPlan,
   type PlanOption,
 } from './crag-catalog'
+import { densityClass, type ResolvedLayout } from './crag-layout'
 
 type ContentSlots = {
   name?: ReactNode
@@ -12,8 +13,39 @@ type ContentSlots = {
   price?: ReactNode
 }
 
+/**
+ * layout 驱动的展示参数。全部可选，缺省时渲染结果与引入 layout 之前一致。
+ *
+ * `monthly` 由调用方算好传入（折合月价需要原始 amount_minor 与月数，
+ * PlanOption 只带格式化后的字符串）；`showMonthlyPrice=false` 时调用方不传。
+ */
+type LayoutSlots = {
+  featured?: ReactNode
+  density?: ResolvedLayout['cardDensity']
+  monthly?: string | null
+}
+
 const tag =
   'inline-flex items-center rounded-full px-2 py-0.5 text-[11px] leading-4 font-medium'
+
+function Featured({ children }: { children: ReactNode }) {
+  return (
+    <span
+      className={`${tag} me-2 bg-primary/10 align-middle font-semibold text-primary ring-1 ring-primary/20 ring-inset`}
+    >
+      {children}
+    </span>
+  )
+}
+
+function Monthly({ price }: { price: string | null | undefined }) {
+  if (!price) return null
+  return (
+    <span className='block text-end text-xs leading-4 font-normal text-muted-foreground tabular-nums'>
+      约 {price} / 月
+    </span>
+  )
+}
 
 function Renewal({ renewable }: { renewable: boolean | undefined }) {
   if (renewable === undefined) return null
@@ -70,15 +102,20 @@ export function PickerPlanContent({
   plan,
   duplicateTerm = false,
   slots = {},
+  featured,
+  density = 'regular',
+  monthly,
 }: {
   plan: PlanOption
   duplicateTerm?: boolean
   slots?: ContentSlots
-}) {
+} & LayoutSlots) {
+  const space = densityClass[density]
   return (
     <>
-      <span className='grid min-w-0 gap-1'>
+      <span className={`grid min-w-0 ${space.content}`}>
         <span className='text-[15px] leading-snug font-semibold'>
+          {featured ? <Featured>{featured}</Featured> : null}
           {slots.name ?? plan.name ?? plan.term}
           {duplicateTerm ? (
             <span className='ms-2 text-xs wrap-anywhere text-muted-foreground'>
@@ -96,7 +133,7 @@ export function PickerPlanContent({
               {plan.description}
             </span>
           ) : null)}
-        <span className='mt-1 flex flex-wrap gap-1.5 empty:hidden'>
+        <span className={`${space.tags} flex flex-wrap gap-1.5 empty:hidden`}>
           <Stock
             remaining={plan.remaining}
             soldOut='已售罄'
@@ -107,6 +144,7 @@ export function PickerPlanContent({
       </span>
       <span className='text-end text-lg font-bold tracking-tight whitespace-nowrap tabular-nums'>
         {slots.price ?? plan.price}
+        <Monthly price={monthly} />
       </span>
     </>
   )
@@ -115,21 +153,26 @@ export function PickerPlanContent({
 export function CommercePlanContent({
   plan,
   slots = {},
+  featured,
+  density = 'regular',
+  monthly,
 }: {
   plan: DraftPlan
   slots?: ContentSlots
-}) {
+} & LayoutSlots) {
+  const space = densityClass[density]
   const months =
     plan.months ?? (plan.term === '1y' ? '12' : plan.term.replace(/m$/, ''))
   return (
     <>
-      <span className='grid min-w-0 flex-1 gap-1'>
+      <span className={`grid min-w-0 flex-1 ${space.content}`}>
         <span className='block text-[15px] leading-snug font-semibold'>
           {slots.name != null ? (
             <span className='block'>{slots.name}</span>
           ) : plan.name ? (
             <span className='block'>{plan.name}</span>
           ) : null}
+          {featured ? <Featured>{featured}</Featured> : null}
           {plan.slot_limit === 'unlimited'
             ? '不限槽位'
             : plan.slot_limit != null
@@ -143,7 +186,7 @@ export function CommercePlanContent({
               {plan.description}
             </span>
           ) : null)}
-        <span className='mt-1 flex flex-wrap gap-1.5'>
+        <span className={`${space.tags} flex flex-wrap gap-1.5`}>
           <Stock
             remaining={plan.remaining}
             soldOut='首批售罄'
@@ -156,6 +199,7 @@ export function CommercePlanContent({
       <span className='shrink-0 text-lg font-bold tracking-tight tabular-nums'>
         {slots.price ??
           formatPlanDetails(plan.amount_minor, plan.slot_limit).price}
+        <Monthly price={monthly} />
       </span>
     </>
   )

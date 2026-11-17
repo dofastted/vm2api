@@ -141,3 +141,90 @@ test('duplicate SKUs are rejected even when one plan is hidden', async () => {
 test('catalog-only metadata does not change the shared quote and order plan projection', () => {
   assert.deepEqual(publicPlan({ ...PLAN, name: {}, enabled: 'invalid', stock: -1, months: null }), PLAN)
 })
+
+const LAYOUT = {
+  plan_columns: 3,
+  card_density: 'compact',
+  orders_position: 'side',
+  show_monthly_price: false,
+  featured_sku: 'quarter',
+  featured_label: '最超值',
+}
+
+async function layoutOf(layout, rest = {}) {
+  const catalog = { plans: [PLAN], payment_methods: ['alipay'], presentation: { title: '订阅', ...rest, layout } }
+  const result = await supplier(catalog).plans()
+  return result.presentation
+}
+
+test('published layout is forwarded instead of being stripped with the unknown keys', async () => {
+  assert.deepEqual(await layoutOf(LAYOUT), { title: '订阅', layout: LAYOUT })
+  for (const [key, value] of Object.entries(LAYOUT)) {
+    assert.deepEqual((await layoutOf({ [key]: value })).layout, { [key]: value })
+  }
+  assert.deepEqual((await layoutOf({})).layout, {})
+})
+
+test('layout drops unknown keys the same way the copy whitelist does', async () => {
+  const layout = await layoutOf({ plan_columns: 2, hero_video: 'https://not.public', nested: { a: 1 } })
+  assert.deepEqual(layout.layout, { plan_columns: 2 })
+})
+
+test('a malformed layout field degrades to the page default without failing the catalog', async () => {
+  for (const field of [
+    { plan_columns: 0 },
+    { plan_columns: 4 },
+    { plan_columns: '2' },
+    { plan_columns: 2.5 },
+    { plan_columns: null },
+    { card_density: 'cozy' },
+    { card_density: 1 },
+    { orders_position: 'above' },
+    { orders_position: true },
+    { show_monthly_price: 'true' },
+    { show_monthly_price: 1 },
+    { featured_sku: '' },
+    { featured_sku: '-bad' },
+    { featured_sku: 'has space' },
+    { featured_sku: 42 },
+    { featured_label: '' },
+    { featured_label: '   ' },
+    { featured_label: '推'.repeat(13) },
+    { featured_label: 7 },
+  ]) {
+    const presentation = await layoutOf({ ...field })
+    assert.deepEqual(presentation, { title: '订阅', layout: {} }, `expected ${JSON.stringify(field)} to degrade`)
+  }
+  // Valid siblings survive a single bad field; only that field is dropped.
+  assert.deepEqual((await layoutOf({ plan_columns: 9, card_density: 'compact' })).layout, {
+    card_density: 'compact',
+  })
+})
+
+test('featured_label counts characters, so a 12-emoji badge is still published', async () => {
+  const featured_label = '🎉'.repeat(12)
+  assert.ok(featured_label.length > 12)
+  assert.deepEqual((await layoutOf({ featured_label })).layout, { featured_label })
+  assert.deepEqual((await layoutOf({ featured_label: '🎉'.repeat(13) })).layout, {})
+})
+
+test('a layout that is not an object is omitted rather than rejected', async () => {
+  for (const layout of ['side', 3, true, null, []]) {
+    assert.deepEqual(await layoutOf(layout), { title: '订阅' })
+  }
+})
+
+test('catalogs without layout stay byte-identical, so legacy buyers see no change', async () => {
+  const catalog = {
+    plans: [PLAN],
+    payment_methods: ['alipay'],
+    presentation: { title: '订阅', plans_title: '套餐' },
+  }
+  const result = await supplier(catalog).plans()
+  assert.deepEqual(result, catalog)
+  assert.ok(!('layout' in result.presentation))
+  assert.deepEqual(await supplier({ plans: [PLAN], payment_methods: [] }).plans(), {
+    plans: [PLAN],
+    payment_methods: [],
+  })
+})
