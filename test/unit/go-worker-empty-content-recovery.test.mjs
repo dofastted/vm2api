@@ -85,11 +85,47 @@ test('other failures stay untouched', async () => {
     [{ provider_complete: false }, {}],
     [{ validation_error: { type: 'api_error', message: 'something else' } }, {}],
     [{ schema_version: 1 }, {}],
-    [{}, { committed: true }],
     [{}, { ok: true, status: 200 }],
     [{}, { providerResult: null }],
   ]) {
     const input = failed(over, result)
     assert.equal(await recoverThinkingOnlyMaxTokens(input), input)
+  }
+})
+
+const dataEvents = (lines) => lines.filter((l) => l.startsWith('data: ')).map((l) => JSON.parse(l.slice(6)))
+
+test('committed hop without a downstream writer recovers silently (non-stream assemble)', async () => {
+  const out = await recoverThinkingOnlyMaxTokens(failed({}, { committed: true }))
+  assert.equal(out.ok, true)
+  assert.equal(out.status, 200)
+  assert.deepEqual(out.body.content, [])
+})
+
+test('committed stream closes open blocks and appends only terminal frames', async () => {
+  const lines = []
+  let commits = 0
+  const out = await recoverThinkingOnlyMaxTokens(failed({}, { committed: true }), {
+    onEvent: async (line) => lines.push(line),
+    onCommit: () => commits++,
+    downstream: { messageStarted: true, terminal: false, open: new Set([0]) },
+  })
+  assert.equal(out.ok, true)
+  assert.equal(out.committed, true)
+  assert.equal(commits, 0)
+  assert.deepEqual(
+    dataEvents(lines).map((e) => [e.type, e.index]),
+    [
+      ['content_block_stop', 0],
+      ['message_delta', undefined],
+      ['message_stop', undefined],
+    ],
+  )
+})
+
+test('committed stream without tracking or with a terminal frame already sent stays untouched', async () => {
+  for (const downstream of [null, { messageStarted: true, terminal: true, open: new Set() }]) {
+    const input = failed({}, { committed: true })
+    assert.equal(await recoverThinkingOnlyMaxTokens(input, { onEvent: async () => {}, downstream }), input)
   }
 })
