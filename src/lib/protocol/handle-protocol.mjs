@@ -8,9 +8,16 @@ import { hashKey } from '../core/security.mjs'
 import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
 import { validateBetweenToolsThinking, validateToolChoice, getCapabilities } from './model-policy.mjs'
 import { ToolResultPruneCache, dshPruneScope } from './tool-result-prune-cache.mjs'
-import { refusalAuditIdentity, refusalGuardPolicy, riskPrincipal } from '../core/refusal-guard.mjs'
+import {
+  refusalAuditIdentity,
+  refusalGuardPolicy,
+  refusalPreview,
+  refusalSessionId,
+  riskPrincipal,
+} from '../core/refusal-guard.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
+import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
@@ -435,6 +442,7 @@ export function createHandleProtocol(deps) {
       jev: mandatoryOnly ? null : readRuntimeJev(),
       repo: riskState.repo,
       devices: riskState.devices,
+      sessions: riskState.sessions,
       requestId,
       account,
       scopeMatched,
@@ -494,6 +502,34 @@ export function createHandleProtocol(deps) {
       return new RefusalDeviceBlocksRepo()
     } catch {
       return null
+    }
+  }
+
+  function sessionRepo() {
+    if (deps.refusalSessions) return deps.refusalSessions
+    try {
+      return new RefusalSessionBlocksRepo()
+    } catch {
+      return null
+    }
+  }
+
+  /** An upstream content refusal ends the caller session for good (own switch, default on). */
+  function blockRefusedSession({ inbound, body, headers, result, requestId, policy, sessions }) {
+    if (policy?.session_block_enabled === false) return
+    const sessionId = refusalSessionId({ inbound, body, headers })
+    if (!sessionId) return
+    try {
+      sessions?.block?.({
+        sessionId,
+        requestId,
+        accountId: result?.accountId || null,
+        model: body?.model || inbound?.model || '',
+        preview: refusalPreview(body, inbound),
+        reason: 'upstream_refusal',
+      })
+    } catch {
+      /* the refusal itself still goes back to the caller */
     }
   }
 
@@ -717,7 +753,7 @@ export function createHandleProtocol(deps) {
     }
     // After the Desktop sign-in probe, which runs no model.
     if (rejectKeyModel(req, res, protocol, inbound?.model, logBag)) return
-    const riskState = { policy: refusalPolicy(), repo: refusalRepo(), devices: deviceRepo() }
+    const riskState = { policy: refusalPolicy(), repo: refusalRepo(), devices: deviceRepo(), sessions: sessionRepo() }
     const gateArgs = { req, inbound, fp, logBag, requestId: logCtx.request_id, res, identity: auditIdentity, riskState }
     if (await applyProtocolIntercept({ ...gateArgs, body: inbound, mandatoryOnly: true })) return
     if (
@@ -973,6 +1009,17 @@ export function createHandleProtocol(deps) {
         logBag,
         requestId: logCtx.request_id,
       })
+      if (reason === 'upstream:usage_policy' || reason === 'upstream:flagged_session') {
+        blockRefusedSession({
+          inbound,
+          body: inbound,
+          headers: req.headers,
+          result,
+          requestId: logCtx.request_id,
+          policy: riskState.policy,
+          sessions: riskState.sessions,
+        })
+      }
       if (reason) {
         logBag.risk_upstream_reason = reason
         logBag.risk_request_id = logCtx.request_id

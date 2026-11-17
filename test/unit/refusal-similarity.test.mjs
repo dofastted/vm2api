@@ -160,6 +160,7 @@ test('panel policy defaults on at 90 and rejects an unknown threshold', () => {
     similarity_enabled: true,
     similarity: 90,
     device_block_enabled: true,
+    session_block_enabled: true,
   })
   assert.deepEqual(risk_audit.ban_steps, [10, 1440, 0])
   const settings = new Map()
@@ -178,6 +179,7 @@ test('panel policy defaults on at 90 and rejects an unknown threshold', () => {
       similarity: 85,
       device_block_enabled: true,
       risk_audit,
+      session_block_enabled: true,
     },
   )
 })
