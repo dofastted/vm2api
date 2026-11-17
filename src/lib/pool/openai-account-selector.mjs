@@ -2,7 +2,7 @@
  * OpenAI account decision, ported from codex-proxy-rs
  * `gateway-core` AccountSelector (`selection.rs`).
  *
- * Eligibility, highest scheduling level, then session affinity and weight.
+ * Eligibility, session affinity, then scheduling level and weight.
  * `smart` is the default strategy.
  */
 
@@ -115,17 +115,13 @@ function priorityOf(candidate) {
   return Number(candidate.priority) || 0
 }
 
-function preferredOutcome(candidates, context, highestPriority, highestWeight) {
+function preferredOutcome(candidates, context) {
   const preferredId = context.preferredAccountId ? asId(context.preferredAccountId) : ''
   if (!preferredId) return { kind: 'not_requested', candidate: null, blocker: null }
   const candidate = candidates.find((item) => asId(item.id) === preferredId) || null
   if (!candidate) return { kind: 'missing', candidate: null, blocker: null }
   const blocker = schedulingBlocker(candidate, context)
   if (blocker) return { kind: 'blocked', candidate, blocker }
-  if (priorityOf(candidate) < highestPriority) return { kind: 'blocked', candidate, blocker: 'lower_priority' }
-  if (!context.preferredOverridesWeight && weightOf(candidate) < highestWeight) {
-    return { kind: 'blocked', candidate, blocker: 'lower_weight' }
-  }
   return { kind: 'hit', candidate, blocker: null }
 }
 
@@ -186,15 +182,15 @@ function selectInBand(eligible, context) {
  */
 export function selectOpenAIAccount(candidates, context = {}) {
   const list = Array.isArray(candidates) ? candidates : []
+  const preferred = preferredOutcome(list, context)
+  if (preferred.kind === 'hit') {
+    return { candidate: preferred.candidate, preferred: 'hit', blocker: null }
+  }
   const eligible = list.filter((candidate) => !schedulingBlocker(candidate, context))
   if (!eligible.length) return null
   const highestPriority = Math.max(...eligible.map(priorityOf))
   const tier = eligible.filter((candidate) => priorityOf(candidate) === highestPriority)
   const highestWeight = Math.max(...tier.map(weightOf))
-  const preferred = preferredOutcome(list, context, highestPriority, highestWeight)
-  if (preferred.kind === 'hit') {
-    return { candidate: preferred.candidate, preferred: 'hit', blocker: null }
-  }
   const band = tier.filter((candidate) => weightOf(candidate) === highestWeight)
   const candidate = selectInBand(band, context)
   if (!candidate) return null

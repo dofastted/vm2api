@@ -1269,26 +1269,41 @@ test('codex rebuild outbound session is not the inbound session', async () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('codex rebuild outbound session is stable on the same slot', async () => {
+test('Codex follow-ups keep their VM and outbound session after another VM gains priority', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-stable-'))
   const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
   writeGptVm(root, 'vm-gpt-a')
+  const seen = []
+  const onHop = ({ exec }) => {
+    seen.push(exec.vmId)
+    return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp_ok' } }
+  }
   const inbound = 'sess-stable'
   const first = await hopCodex({
     root,
     stickyRouter: sticky,
     headers: { 'x-session-id': inbound },
     body: { model: 'gpt-5.4', input: 'hi', stream: false },
+    onHop,
   })
+  writeGptVm(root, 'vm-gpt-b')
+  const otherVmFile = path.join(root, 'vms', 'vm-gpt-b.json')
+  const otherVm = JSON.parse(fs.readFileSync(otherVmFile, 'utf8'))
+  otherVm.policy = { priority: 10, weight: 10 }
+  fs.writeFileSync(otherVmFile, JSON.stringify(otherVm))
   const second = await hopCodex({
     root,
     stickyRouter: sticky,
     headers: { 'x-session-id': inbound },
     body: { model: 'gpt-5.4', input: 'hi again', stream: false },
+    onHop,
   })
+  assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-a'])
   assert.equal(first.envelopes[0].session.session_id, second.envelopes[0].session.session_id)
-  sticky.db?.close?.()
-  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('codex rebuild remints session after failover to another slot', async () => {

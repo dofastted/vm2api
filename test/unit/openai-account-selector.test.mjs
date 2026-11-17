@@ -44,7 +44,6 @@ test('session affinity hits even when another account scores higher', () => {
   const selected = selectOpenAIAccount([bound, better], {
     strategy: 'smart',
     preferredAccountId: 'bound',
-    preferredOverridesWeight: true,
     roundRobinCursor: 0,
   })
   assert.equal(selected.candidate.id, 'bound')
@@ -54,7 +53,7 @@ test('session affinity hits even when another account scores higher', () => {
 test('quota exhausted affinity escapes and the next normal account is used', () => {
   const ordered = orderOpenAIAccounts(
     [account('bound', { status: 'quota_exhausted' }), account('other', { quotaRemainingRank: 8_000 })],
-    { strategy: 'smart', preferredAccountId: 'bound', preferredOverridesWeight: true, roundRobinCursor: 0 },
+    { strategy: 'smart', preferredAccountId: 'bound', roundRobinCursor: 0 },
   )
   assert.deepEqual(ordered.ids, ['other'])
   assert.equal(ordered.preferred, 'blocked')

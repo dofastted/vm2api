@@ -715,6 +715,40 @@ test('a sticky seat wait leaves a home VM that stopped being eligible', async (t
   pool.planner.free(pool.planner.seatOf(planned('c')))
 })
 
+test('a queued sticky session is not rehomed when another VM gains priority', async (t) => {
+  const pool = setup(
+    t,
+    [
+      { id: 'vm-01', policy: { priority: 1, sessionSlots: 1 } },
+      { id: 'vm-02', policy: { priority: 1, sessionSlots: 1 } },
+    ],
+    { sticky: 5000, fallback: 5000 },
+  )
+  const stickyKey = 'p:anthropic:sess:continuation'
+  pool.stickyRouter = {
+    resolve: (key) => (key === stickyKey ? { vmId: 'vm-01', accountId: 'account-1' } : null),
+  }
+  const held = await seat(pool, 'occupant', { deviceVmId: 'vm-01' })
+  assert.equal(held.vmId, 'vm-01')
+  const pending = seat(pool, 'continuation', { stickyKey, deadline: Date.now() + 4000 })
+  const getTicket = () =>
+    pool.planner.vmQueues.get('vm-01')?.find((ticket) => ticket.seatKey === planned('continuation'))
+  await waitFor(() => !!getTicket()?.wake)
+  const ticket = getTicket()
+  const otherVmFile = path.join(pool.projectRoot, 'vms', 'vm-02.json')
+  const otherVm = JSON.parse(fs.readFileSync(otherVmFile, 'utf8'))
+  otherVm.policy.priority = 10
+  fs.writeFileSync(otherVmFile, JSON.stringify(otherVm))
+  ticket.wake()
+  await waitFor(() => ticket.candidates.get('vm-02')?.priority === 10)
+  assert.equal(ticket.kind, 'seat')
+  held.release()
+  const resumed = await pending
+  assert.equal(resumed.ok, true)
+  assert.equal(resumed.vmId, 'vm-01')
+  resumed.release()
+})
+
 test('seat stream frames carry per-VM seats, global queue and queue_max', async (t) => {
   const pool = setup(t, [{ id: 'vm-01', policy: { sessionSlots: 1 } }])
   let changes = 0
@@ -853,12 +887,11 @@ test('new seats exhaust the highest priority tier before using a lower affinity 
   for (const hold of [first, next, fallback]) hold.release()
 })
 
-test('session_affinity_first does not hold a turn on its draining own VM', async (t) => {
+test('a released seat does not hold a new turn on its draining own VM', async (t) => {
   const { pool, quota } = gatedSetup(t, [
     { id: 'vm-01', policy: { priority: 10, sessionSlots: 1 } },
     { id: 'vm-02', policy: { priority: 1, sessionSlots: 1 } },
   ])
-  pool.config.session_affinity_first = true
   pool.stickyRouter = { resolve: (key) => (key === 'conv-drain' ? { vmId: 'vm-02', accountId: 'account-2' } : null) }
   const high = await seat(pool, 'high')
   const low = await seat(pool, 'low')
