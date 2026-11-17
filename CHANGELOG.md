@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 载荷 [payload-2026.11.17-cli-node-321](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.17-cli-node-321) 将 cli-node 换为 2.1.321 UPX 5.0.2 `--best --lzma`（31005108 字节，`f6c3744dda01f756049360113607d2bd9a25911de0fdaf30fe9bb1a1918a6788`）。其余附件沿用 `payload-2026.11.17-kernel-1091-968-crag-3.1.4`。ARM64 源码摘要改为 `34951c0743f79668bbda184ba743dd08a2049c31b89ed7349106587053e37d76`。未部署，未 `wrap-cli/sync`。
+
 ## 1.4.130 — 2026-11-17 · Gemini 宿主账号与专用密钥
 
 - 在 VM 列表和机架管理 Gemini 宿主账号，分开显示授权与运行状态。导入仍不创建 VM 或槽位。
