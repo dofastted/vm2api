@@ -5,6 +5,7 @@ import {
   type CopyKey,
   type Presentation,
 } from './crag-catalog'
+import type { PresentationLayout } from './crag-layout'
 
 export type PreviewDraft = {
   plans: DraftPlan[]
@@ -29,6 +30,16 @@ export type PreviewEdit =
       field: 'name' | 'description'
       value: string
     }
+
+/**
+ * 画布回传给父页的布局变更。key 严格取 layout 的契约字段名，不自创。
+ */
+export type PreviewLayoutEdit = {
+  [K in keyof PresentationLayout]-?: {
+    key: K
+    value: PresentationLayout[K]
+  }
+}[keyof PresentationLayout]
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -85,13 +96,20 @@ function validCommerce(value: unknown): value is CommerceRules {
   )
 }
 
+/**
+ * presentation 校验。`layout` 的内容只校验到「是对象」为止，具体取值交
+ * normalizeLayout 逐字段兜底 —— 一个排版字段的取值错不该让整条草稿被丢弃。
+ *
+ * 顶层未知文案键仍整条拒绝，沿用既有协议强度，未在本次放宽。
+ */
 function validPresentation(value: unknown): value is Presentation {
   return (
     record(value) &&
-    Object.entries(value).every(
-      ([key, content]) =>
-        Object.prototype.hasOwnProperty.call(copyDefaults, key) &&
-        text(content, key.includes('title') ? 120 : 500)
+    Object.entries(value).every(([key, content]) =>
+      key === 'layout'
+        ? content == null || record(content)
+        : Object.prototype.hasOwnProperty.call(copyDefaults, key) &&
+          text(content, key.includes('title') ? 120 : 500)
     )
   )
 }

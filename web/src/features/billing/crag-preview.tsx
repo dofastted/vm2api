@@ -4,10 +4,20 @@ import {
   copyDefaults,
   copyLabels,
   formatPlanDetails,
+  monthlyFor,
   termLabel,
   type CopyKey,
   type DraftPlan,
 } from './crag-catalog'
+import {
+  FEATURED_LABEL_MAX,
+  densityClass,
+  featuredFallback,
+  join,
+  normalizeLayout,
+  ordersSideClass,
+  pickerColumnClass,
+} from './crag-layout'
 import {
   CommercePlanContent,
   CommerceRulesSummary,
@@ -21,6 +31,7 @@ import {
   type DraftMessage,
   type PreviewDraft,
   type PreviewEdit,
+  type PreviewLayoutEdit,
 } from './crag-preview-protocol'
 
 export function CragPreviewPage() {
@@ -64,7 +75,10 @@ export function CragPreviewPage() {
     }
     window.addEventListener('message', onMessage)
     if (window.parent !== window)
-      window.parent.postMessage({ type: 'crag-preview:ready' }, '*')
+      window.parent.postMessage(
+        { type: 'crag-preview:ready', caps: ['layout-1'] },
+        '*'
+      )
     return () => {
       window.removeEventListener('message', onMessage)
       root.classList.remove('light', 'dark')
@@ -109,6 +123,9 @@ export function CragPreviewPage() {
       onEdit={(change) => {
         if (message.edit) send({ type: 'crag-preview:edit', ...change })
       }}
+      onLayoutEdit={(change) => {
+        if (message.edit) send({ type: 'crag-preview:layout', ...change })
+      }}
     />
   )
 }
@@ -120,6 +137,7 @@ export function PreviewCanvas({
   onPick,
   onFocus,
   onEdit,
+  onLayoutEdit,
 }: {
   draft: PreviewDraft
   selected: string | null
@@ -127,6 +145,7 @@ export function PreviewCanvas({
   onPick: (sku: string) => void
   onFocus?: (sku: string) => void
   onEdit?: (change: PreviewEdit) => void
+  onLayoutEdit?: (change: PreviewLayoutEdit) => void
 }) {
   const presentation = draft.presentation ?? {}
   const commerce = draft.commerce
@@ -136,6 +155,22 @@ export function PreviewCanvas({
   )
   const customEnabled = !!commerce && commerce.custom_enabled !== false
   const empty = !plans.length && !customEnabled
+
+  // 纯函数，不包 useMemo：本文件的测试用手搓的 react mock 按调用顺序分配
+  // useState/useRef/useEffect 游标，这里新增任何 hook 都会让既有断言错位。
+  const layout = normalizeLayout(presentation.layout)
+  const density = layout?.cardDensity ?? 'regular'
+  const space = densityClass[density]
+  const featuredSku =
+    layout?.featuredSku && plans.some((plan) => plan.sku === layout.featuredSku)
+      ? layout.featuredSku
+      : null
+  // 本页原有默认：套餐区恒单列、订单区恒旁置。没有 layout 时保持原状，
+  // 目录声明 layout 后才与正式买家页走同一张表。
+  const planGrid = layout
+    ? join('grid', space.grid, pickerColumnClass[layout.planColumns])
+    : 'grid gap-3'
+  const ordersSide = layout ? layout.ordersPosition === 'side' : true
 
   function copy(key: CopyKey) {
     const maxLength = key.includes('title') ? 120 : 500
@@ -175,6 +210,29 @@ export function PreviewCanvas({
       ...details,
       term: termLabel(plan.term, plan.sku, plan.months),
     }
+    const monthly = monthlyFor(
+      layout,
+      displayPlan.amount_minor,
+      plan.term,
+      plan.months
+    )
+    // 推荐角标是布局在画布上唯一有自然落点的可视元素，故只让它内联可编辑；
+    // 列数 / 密度 / 订单区位置 / featured_sku 仍由父页属性栏负责。
+    const featured =
+      plan.sku === featuredSku ? (
+        edit ? (
+          <PreviewField
+            label='推荐角标'
+            value={layout?.featuredLabel ?? ''}
+            fallback={featuredFallback}
+            editable
+            maxLength={FEATURED_LABEL_MAX}
+            onSave={(value) => onLayoutEdit?.({ key: 'featured_label', value })}
+          />
+        ) : (
+          (layout?.featuredLabel ?? featuredFallback)
+        )
+      ) : undefined
     const slots = edit
       ? {
           name: (
@@ -239,7 +297,9 @@ export function PreviewCanvas({
         onClick={() => {
           if (edit || plan.remaining !== 0) onPick(plan.sku)
         }}
-        className={`${commerce ? 'flex items-start gap-3 text-sm' : 'grid min-h-16 min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3'} cursor-pointer rounded-xl border bg-card p-4 text-card-foreground shadow-xs transition-colors hover:border-primary/50 ${selected === plan.sku ? 'border-primary bg-primary/5 ring-2 ring-primary/20' : ''}`}
+        className={`${commerce ? 'flex items-start gap-3 text-sm' : join('grid', space.minHeight, 'min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-3')} cursor-pointer rounded-xl border bg-card ${space.card} text-card-foreground shadow-xs transition-colors hover:border-primary/50 ${selected === plan.sku ? 'border-primary bg-primary/5 ring-2 ring-primary/20' : ''}`}
+        data-density={density}
+        data-featured={plan.sku === featuredSku || undefined}
       >
         <input
           type='radio'
@@ -252,11 +312,20 @@ export function PreviewCanvas({
           className='mt-1 size-4 shrink-0 accent-primary'
         />
         {commerce ? (
-          <CommercePlanContent plan={displayPlan} slots={slots} />
+          <CommercePlanContent
+            plan={displayPlan}
+            slots={slots}
+            density={density}
+            featured={featured}
+            monthly={monthly}
+          />
         ) : (
           <PickerPlanContent
             plan={option}
             slots={slots}
+            density={density}
+            featured={featured}
+            monthly={monthly}
             duplicateTerm={
               plans.filter(
                 (candidate) =>
@@ -290,7 +359,9 @@ export function PreviewCanvas({
             {copy('description')}
           </p>
         </header>
-        <div className='grid min-w-0 items-start gap-5 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]'>
+        <div
+          className={`grid min-w-0 items-start gap-5 ${ordersSide ? ordersSideClass : ''}`}
+        >
           <section className='min-w-0 space-y-4 rounded-2xl border bg-card p-4 text-card-foreground shadow-sm sm:p-5'>
             <div className='flex items-center justify-between gap-3'>
               <h2 className='min-w-0 flex-1 text-base leading-6 font-semibold'>
@@ -315,7 +386,7 @@ export function PreviewCanvas({
                 自定义计价未启用或规则未完整。
               </p>
             ) : null}
-            <div className='grid gap-3'>{plans.map(card)}</div>
+            <div className={planGrid}>{plans.map(card)}</div>
             {customEnabled ? (
               <label className='flex cursor-pointer items-start gap-3 rounded-xl border bg-card p-4 text-sm shadow-xs transition-colors hover:border-primary/50 has-checked:border-primary has-checked:bg-primary/5 has-checked:ring-2 has-checked:ring-primary/20'>
                 <input
