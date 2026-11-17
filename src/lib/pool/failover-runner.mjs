@@ -62,6 +62,13 @@ const DEFAULTS = {
   same_account_retry_delay_ms: 500,
   same_account_retry_max_hop_ms: 10_000,
   signature_repair: false,
+  // A conversation that already had a session pin when the request arrived
+  // stays on the account its first attempt ran on: a failed attempt retries
+  // that account or returns its error, it never replays the transcript on
+  // another account. Off by default (upstream behaviour).
+  keep_session_home: false,
+  // keep_session_home: pause between retries of a home kernel that had no free slot.
+  home_slot_busy_retry_ms: 2000,
 }
 
 function clone(value) {
@@ -745,6 +752,10 @@ export class FailoverRunner {
     })
     const bindAll = (account, opts) => {
       if (!this.stickyRouter || !account) return
+      // keep_pin_on_model_gate: the pinned home only could not serve this
+      // model, so this request borrows the account. No session, family or
+      // device pin follows it; the next turn goes home.
+      if (lastSelected?.stickyBorrowed === true && lastSelected.accountId === account.accountId) return
       const sessionId = account.sessionId || (account.accountId === outboundSessionAccountId ? outboundSessionId : '')
       const payload = { accountId: account.accountId, vmId: account.vmId }
       const slotIndex = account.slotIndex != null ? account.slotIndex : pinnedSlot
@@ -827,6 +838,31 @@ export class FailoverRunner {
     }
     // A unit that just failed replayably waits behind every other free seat.
     let avoid = null
+    // keep_session_home: the continuing conversation's account for this
+    // request is the one its first attempt ran on.
+    const keepHome = this.config.keep_session_home === true && !pinVmId && !!stickyKey
+    const continuing = keepHome && !!this.stickyRouter?.resolve?.(stickyKey)?.accountId
+    let homeAccountId = null
+    let homeRetryPending = false
+    const isHome = (unit) => continuing && !!homeAccountId && unit?.accountId === homeAccountId
+    const retryOrStay = (unit) => {
+      if (isHome(unit)) {
+        homeRetryPending = true
+        return null
+      }
+      return new Set([unit.accountId, unit.vmId])
+    }
+    // The home kernel had no free slot: nothing ran, so wait for it instead of
+    // spilling the transcript to another account. The request deadline bounds it.
+    const waitHomeSlot = (unit, policy) => {
+      if (!isHome(unit) || policy?.reason !== 'slot_busy') return false
+      homeRetryPending = 'slot_busy'
+      return true
+    }
+    const keptHome = () => {
+      releaseStickySlots()
+      return preferLastResult(lastResult, lastPolicy, null, { ...attribution(), session_home_kept: true })
+    }
 
     for (;;) {
       const attemptNo = budget.hops + 1
@@ -870,6 +906,14 @@ export class FailoverRunner {
             sessionId: outboundSessionId || quotaRequest?.sessionId || stickyKey,
             preserveMessageCache: quotaRequest?.preserveMessageCache,
           },
+        }
+        if (homeRetryPending) {
+          const waitMs =
+            homeRetryPending === 'slot_busy'
+              ? Number(this.config.home_slot_busy_retry_ms ?? 2000)
+              : this.config.same_account_retry_delay_ms
+          homeRetryPending = false
+          await sleepWithSignal(waitMs, signal)
         }
         if (avoid) {
           const elsewhere = await this.scheduler.selectAndReserve({ ...selectArgs, avoid, allowWait: false })
@@ -920,6 +964,10 @@ export class FailoverRunner {
         ) {
           releaseStickySlots()
           return preferLastResult(lastResult, lastPolicy, null, { ...attribution(), account_cap: accountCap })
+        }
+        if (continuing && selected?.ok) {
+          if (!homeAccountId) homeAccountId = selected.accountId
+          else if (selected.accountId !== homeAccountId) return keptHome()
         }
         if (selected?.familyGated && familyKey && familyVmId) {
           // The family home left the pool (quota, credential): the family moves
@@ -1191,9 +1239,11 @@ export class FailoverRunner {
         }
         if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
           budget.noteSameUnit(selected.accountId)
-          avoid = new Set([selected.accountId, selected.vmId])
+          avoid = retryOrStay(selected)
           continue
         }
+        if (waitHomeSlot(selected, policy)) continue
+        if (isHome(selected)) return keptHome()
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } catch (error) {
         if (attemptStarted === undefined) throw error
@@ -1314,9 +1364,11 @@ export class FailoverRunner {
         const hopMs = Date.now() - attemptStarted
         if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
           budget.noteSameUnit(selected.accountId)
-          avoid = new Set([selected.accountId, selected.vmId])
+          avoid = retryOrStay(selected)
           continue
         }
+        if (waitHomeSlot(selected, policy)) continue
+        if (isHome(selected)) return keptHome()
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } finally {
         // Setup and attempt share the same permit lifetime.

@@ -121,6 +121,14 @@ export function normalizePoolRouting(pool = {}) {
   // Off by default: Pro may carry Fable. Turn on when Pro accounts only answer
   // Fable with 'usage credits required'.
   next.fable_requires_max = next.fable_requires_max === true
+  // A new seat tries the family home (where the parent conversation runs)
+  // before the device home, so sub-agents and side requests join their
+  // parent's account. Off by default: machine first, then family.
+  next.family_affinity_first = next.family_affinity_first === true
+  // When the pinned account only cannot serve this request's model (model
+  // gate or a model-scoped cooldown), borrow another account for this request
+  // and keep the conversation pinned. Off by default: the pin is released.
+  next.keep_pin_on_model_gate = next.keep_pin_on_model_gate === true
   next.queue_max = clampNumber(next.queue_max, DEFAULT_POOL_ROUTING.queue_max, QUEUE_MAX_MIN, QUEUE_MAX_MAX)
   next.seat_grace_ms = clampNumber(next.seat_grace_ms, DEFAULT_POOL_ROUTING.seat_grace_ms, 0, SEAT_GRACE_MAX_MS)
   next.seat_budget_reserve_pct = clampNumber(
@@ -204,12 +212,11 @@ function sessionIdFromStickyKey(key) {
   return body.slice('sess:'.length)
 }
 
-/** Soft affinity for new sessions: machine, then family. */
-function seatHomes({ deviceVm = '', familyVm = '' } = {}) {
-  const homes = [
-    { vmId: String(deviceVm || '').trim(), reason: 'device-affinity' },
-    { vmId: String(familyVm || '').trim(), reason: 'family-affinity' },
-  ]
+/** Soft affinity for new sessions: machine, then family (`familyFirst`: family, then machine). */
+export function seatHomes({ deviceVm = '', familyVm = '', familyFirst = false } = {}) {
+  const device = { vmId: String(deviceVm || '').trim(), reason: 'device-affinity' }
+  const family = { vmId: String(familyVm || '').trim(), reason: 'family-affinity' }
+  const homes = familyFirst ? [family, device] : [device, family]
   const seen = new Set()
   return homes.filter((home) => {
     if (!home.vmId || seen.has(home.vmId)) return false
@@ -422,6 +429,17 @@ function cooldownActive(until, now) {
   return Number(until) > now
 }
 
+/** Eligibility rejections that only concern the requested model, not the account. */
+export const MODEL_GATE_REASONS = new Set([
+  'fable_requires_max',
+  'model_not_supported',
+  'model_not_allowed',
+  'model_fast_unavailable',
+])
+
+/** Busy reasons that only concern the requested model, not the account. */
+export const MODEL_WAIT_REASONS = new Set(['model_cooldown', 'fable_cooldown', 'fable_quota', 'fable_split'])
+
 /** Account cooldowns that do not prove the account left the pool. */
 export const SOFT_COOLDOWN_REASONS = new Set(['rpm_limited', 'rate_limited_unknown'])
 
@@ -506,6 +524,7 @@ export class PoolScheduler extends EventEmitter {
     this.getRouting = getRouting
     this.config = normalizePoolConfig(config)
     this.lastStickyCleared = false
+    this.lastStickyBorrowed = false
     this.inflight = new Map()
     this.inflightFamily = new Map()
     /** vmId → live reservations; mirrors `inflight` (per account) for the panel. */
@@ -636,6 +655,7 @@ export class PoolScheduler extends EventEmitter {
     const pinned = !!String(pinVmId || '').trim()
     const blocked = new Set(excluded)
     let stickyCleared = false
+    let stickyBorrowed = false
     let familyGated = false
     const boundBefore = stickyKey ? this.stickyRouter?.resolve?.(stickyKey) : null
     const fail = (reason, candidates = [], available = [], waitPool = candidates) => {
@@ -662,6 +682,7 @@ export class PoolScheduler extends EventEmitter {
       ...reservation,
       familyGated,
       stickyCleared,
+      stickyBorrowed,
       waitMs: Date.now() - startedAt,
       queueWaitMs,
       schedulingMs: Math.max(0, Date.now() - startedAt - queueWaitMs),
@@ -713,7 +734,14 @@ export class PoolScheduler extends EventEmitter {
       // A gated family home (quota, credential, excluded) is a migration
       // signal for the caller. Busy is not: it still yields a candidate.
       const familyVm = familyVmId ? String(familyVmId).trim() : ''
-      if (familyVm && !pinned && !this.hasClusterCandidate(candidates, familyVm)) familyGated = true
+      if (
+        familyVm &&
+        !pinned &&
+        !this.hasClusterCandidate(candidates, familyVm) &&
+        !this.modelOnlyGated(candidates, familyVm)
+      ) {
+        familyGated = true
+      }
       candidates = this.preferClusterHome(candidates, home || recoveringVm)
       const reservable = candidates.filter((candidate) => this.isReservable(candidate))
       const available = pinned ? reservable : filterByHostMemory(reservable, boundBefore?.vmId || '')
@@ -729,6 +757,7 @@ export class PoolScheduler extends EventEmitter {
         familyVmId: familyGated ? null : familyVm,
       })
       if (this.lastStickyCleared) stickyCleared = true
+      if (this.lastStickyBorrowed) stickyBorrowed = true
       const reserveMisses = []
       const attempted = new Set()
       // Free capacity first: a sticky or preferred miss scans every other
@@ -845,13 +874,17 @@ export class PoolScheduler extends EventEmitter {
           for (let remaining = available; remaining.length; ) {
             const next = this.pick(remaining, {
               stickyKey,
-              eligible: waitCandidates.map((candidate) => live.get(candidate.accountId) || candidate),
+              eligible: Object.assign(
+                waitCandidates.map((candidate) => live.get(candidate.accountId) || candidate),
+                { modelGated: candidates.modelGated },
+              ),
               spilled,
               stickyKeys,
               deviceVmId,
               familyVmId: familyGated ? null : familyVm,
             })
             if (this.lastStickyCleared) stickyCleared = true
+            if (this.lastStickyBorrowed) stickyBorrowed = true
             if (Date.now() >= waitCap) return null
             const reservation = this.reserve(next, { skipQuota: pinned, pinned })
             if (reservation) return { selected: next, reservation }
@@ -909,6 +942,7 @@ export class PoolScheduler extends EventEmitter {
     const machineKey = String(deviceKey || '').trim()
     const avoided = (candidate) => !!avoid?.size && (avoid.has(candidate.accountId) || avoid.has(candidate.vmId))
     let stickyCleared = false
+    let stickyBorrowed = false
     let familyGated = false
     let seatMoved = false
     let candidates = []
@@ -949,6 +983,7 @@ export class PoolScheduler extends EventEmitter {
         seatMoved: seatMoved && granted.seatOpened,
         familyGated,
         stickyCleared,
+        stickyBorrowed,
         ...timings(),
         slotWaitMs: this.remainingSlotWaitMs({ startedAt: Date.now(), loopDeadline: failoverDeadline, sticky: true }),
         slotWaitDeadlineMs:
@@ -1014,7 +1049,14 @@ export class PoolScheduler extends EventEmitter {
           if (!woken) return fail(ErrorCode.CLUSTER_SLOT_RECONNECTING)
           continue
         }
-        if (!checkedHomeOnly && familyVm && !this.hasClusterCandidate(candidates, familyVm)) familyGated = true
+        if (
+          !checkedHomeOnly &&
+          familyVm &&
+          !this.hasClusterCandidate(candidates, familyVm) &&
+          !this.modelOnlyGated(candidates, familyVm)
+        ) {
+          familyGated = true
+        }
         candidates = this.preferClusterHome(candidates, home || recoveringVm)
         if (now >= failoverDeadline || (ticket && ticket.kind !== 'seat' && now >= ticket.deadline)) {
           return fail('pool_queue_timeout')
@@ -1047,6 +1089,7 @@ export class PoolScheduler extends EventEmitter {
           familyVmId: null,
         })
         if (sticky.cleared) stickyCleared = true
+        if (sticky.borrowed) stickyBorrowed = true
         const stickyHome = sticky.match && !sticky.match.draining && !avoided(sticky.match) ? sticky.match : null
         if (ticket?.kind === 'seat') {
           const waitingHome = byVm.get(ticket.vmId)
@@ -1089,6 +1132,7 @@ export class PoolScheduler extends EventEmitter {
             const homes = seatHomes({
               deviceVm: this.machineHome(machineKey) || deviceVmId,
               familyVm: familyGated ? '' : familyVm,
+              familyFirst: this.config.family_affinity_first === true,
             })
             const granted = this.openNewSeat(seatKey, candidates, {
               avoided,
@@ -1405,9 +1449,17 @@ export class PoolScheduler extends EventEmitter {
       return { cleared: true, match: null }
     }
     const match = eligible.find((candidate) => candidate.vmId === bound.vmId && candidate.accountId === bound.accountId)
+    const keepOnModel = this.config.keep_pin_on_model_gate === true
     if (!match) {
+      // The home only cannot serve this model: borrow for this request, keep the pin.
+      if (keepOnModel && eligible?.modelGated?.has?.(bound.accountId)) {
+        return { cleared: false, match: null, borrowed: true }
+      }
       if (!spilled?.has(bound.accountId)) this.releaseSticky(bound, stickyKey, stickyKeys)
       return { cleared: true, match: null }
+    }
+    if (keepOnModel && match.busy && MODEL_WAIT_REASONS.has(match.waitReason)) {
+      return { cleared: false, match: null, borrowed: true }
     }
     if (match.busy && !stickyShouldWait(match.waitReason, match.cooldownReason)) {
       // Auth / quota / pause cooldown: the conversation moves.
@@ -1447,6 +1499,8 @@ export class PoolScheduler extends EventEmitter {
     const candidates = Object.assign([], {
       cooldowns: { rate_limited: /** @type {number|null} */ (null), overloaded: /** @type {number|null} */ (null) },
       rejections: { quota_guard_request_too_large: 0, fable_requires_max: 0 },
+      // Accounts left out only because they cannot serve this model.
+      modelGated: new Set(),
       rest_until: /** @type {number|null} */ (null),
       offline: new Map(),
     })
@@ -1503,6 +1557,10 @@ export class PoolScheduler extends EventEmitter {
       })
       if (!eligibility.ok) {
         const kind = eligibility.reason
+        if (MODEL_GATE_REASONS.has(kind)) {
+          candidates.modelGated.add(accountId)
+          candidates.modelGated.add(vm.id)
+        }
         if (kind === 'rate_limited' || kind === 'overloaded') {
           const until = Number(eligibility.until) || 0
           const prev = candidates.cooldowns[kind]
@@ -2019,6 +2077,11 @@ export class PoolScheduler extends EventEmitter {
     return cleared
   }
 
+  /** keep_pin_on_model_gate: the VM is out of this pool only because it cannot serve the model. */
+  modelOnlyGated(candidates, vmId) {
+    return this.config.keep_pin_on_model_gate === true && !!candidates?.modelGated?.has?.(vmId)
+  }
+
   /** Session leaves this VM: drop its alias keys. A device seat lives in the planner, not here. */
   releaseSticky(bound, stickyKey, stickyKeys) {
     const keys = Array.isArray(stickyKeys) && stickyKeys.length ? stickyKeys : stickyKey ? [stickyKey] : []
@@ -2044,6 +2107,7 @@ export class PoolScheduler extends EventEmitter {
     { stickyKey, eligible = candidates, spilled = null, stickyKeys = null, deviceVmId = null, familyVmId = null } = {},
   ) {
     this.lastStickyCleared = false
+    this.lastStickyBorrowed = false
     if (!candidates.length && !eligible?.length) return null
     const sticky = this.reconcileSticky({
       stickyKey,
@@ -2053,6 +2117,7 @@ export class PoolScheduler extends EventEmitter {
       familyVmId,
     })
     this.lastStickyCleared = sticky.cleared
+    this.lastStickyBorrowed = sticky.borrowed === true
     if (sticky.match) {
       const inPool = candidates.find(
         (candidate) => candidate.vmId === sticky.match.vmId && candidate.accountId === sticky.match.accountId,

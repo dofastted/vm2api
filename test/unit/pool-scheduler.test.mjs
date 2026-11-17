@@ -3556,3 +3556,105 @@ test('pool routing normalizes session_affinity_first to a strict boolean', () =>
   assert.equal(normalizePoolRouting({ session_affinity_first: 'yes' }).session_affinity_first, false)
   assert.equal(normalizePoolRouting({ session_affinity_first: true }).session_affinity_first, true)
 })
+
+test('seatHomes: machine first by default, family first when family_affinity_first is on', async () => {
+  const { seatHomes, normalizePoolRouting: normalize } = await import('../../src/lib/pool/pool-scheduler.mjs')
+  assert.deepEqual(
+    seatHomes({ deviceVm: 'vm-dev', familyVm: 'vm-fam' }).map((home) => home.reason),
+    ['device-affinity', 'family-affinity'],
+  )
+  assert.deepEqual(
+    seatHomes({ deviceVm: 'vm-dev', familyVm: 'vm-fam', familyFirst: true }).map((home) => home.vmId),
+    ['vm-fam', 'vm-dev'],
+  )
+  assert.equal(seatHomes({ deviceVm: 'vm-1', familyVm: 'vm-1', familyFirst: true }).length, 1)
+  assert.equal(normalize({}).family_affinity_first, false)
+  assert.equal(normalize({ family_affinity_first: true }).family_affinity_first, true)
+})
+
+function pinRouter(bound) {
+  const unbound = []
+  return {
+    unbound,
+    resolve: (key) => (key === 'sess:a' ? bound : null),
+    unbind: (key) => unbound.push(key),
+  }
+}
+
+test('keep_pin_on_model_gate: a model-gated home is borrowed around, its pin stays', () => {
+  const bound = { accountId: 'acc-1', vmId: 'vm-1' }
+  for (const keep of [true, false]) {
+    const router = pinRouter(bound)
+    const pool = new PoolScheduler({ stickyRouter: router, config: { keep_pin_on_model_gate: keep } })
+    const eligible = Object.assign([{ vmId: 'vm-2', accountId: 'acc-2' }], {
+      modelGated: new Set(['acc-1', 'vm-1']),
+    })
+    const result = pool.reconcileSticky({ stickyKey: 'sess:a', stickyKeys: ['sess:a'], eligible })
+    if (keep) {
+      assert.deepEqual(result, { cleared: false, match: null, borrowed: true })
+      assert.deepEqual(router.unbound, [])
+      assert.equal(pool.modelOnlyGated(eligible, 'vm-1'), true)
+    } else {
+      assert.equal(result.cleared, true)
+      assert.deepEqual(router.unbound, ['sess:a'])
+      assert.equal(pool.modelOnlyGated(eligible, 'vm-1'), false)
+    }
+  }
+})
+
+test('keep_pin_on_model_gate: a model cooldown keeps the pin, an account cooldown still releases it', () => {
+  const bound = { accountId: 'acc-1', vmId: 'vm-1' }
+  const home = (waitReason) => [{ vmId: 'vm-1', accountId: 'acc-1', busy: true, waitReason }]
+  const router = pinRouter(bound)
+  const pool = new PoolScheduler({ stickyRouter: router, config: { keep_pin_on_model_gate: true } })
+  for (const reason of ['model_cooldown', 'fable_cooldown', 'fable_quota', 'fable_split']) {
+    const result = pool.reconcileSticky({ stickyKey: 'sess:a', stickyKeys: ['sess:a'], eligible: home(reason) })
+    assert.equal(result.borrowed, true, reason)
+  }
+  assert.deepEqual(router.unbound, [])
+  const moved = pool.reconcileSticky({
+    stickyKey: 'sess:a',
+    stickyKeys: ['sess:a'],
+    eligible: home('account_cooldown'),
+  })
+  assert.equal(moved.cleared, true)
+  assert.deepEqual(router.unbound, ['sess:a'])
+  const gone = pinRouter(bound)
+  const pool2 = new PoolScheduler({ stickyRouter: gone, config: { keep_pin_on_model_gate: true } })
+  const left = pool2.reconcileSticky({ stickyKey: 'sess:a', stickyKeys: ['sess:a'], eligible: [] })
+  assert.equal(left.cleared, true)
+})
+
+test('keep_pin_on_model_gate: a model the pinned slot does not allow borrows another slot and the pin stays', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeTier(root, 'vm-01', 'pro', { allowed_models: ['claude-sonnet-5'] })
+  writeTier(root, 'vm-02', 'max')
+  for (const keep of [true, false]) {
+    const sticky = new StickyRouter({ dataDir: path.join(root, `data-${keep}`), config: { sticky: { enabled: true } } })
+    sticky.bind('sess:conv', { vmId: 'vm-01', accountId: 'account-1' })
+    const pool = scheduler(root, { stickyRouter: sticky, config: { keep_pin_on_model_gate: keep } })
+    const fable = await pool.selectAndReserve({
+      model: 'claude-fable-5',
+      stickyKey: 'sess:conv',
+      stickyKeys: ['sess:conv'],
+      allowWait: false,
+    })
+    assert.equal(fable.ok, true)
+    assert.equal(fable.vmId, 'vm-02')
+    assert.equal(fable.stickyBorrowed, keep)
+    fable.release()
+    assert.equal(sticky.resolve('sess:conv')?.accountId || null, keep ? 'account-1' : null)
+    if (keep) {
+      const sonnet = await pool.selectAndReserve({
+        model: 'claude-sonnet-5',
+        stickyKey: 'sess:conv',
+        stickyKeys: ['sess:conv'],
+        allowWait: false,
+      })
+      assert.equal(sonnet.vmId, 'vm-01')
+      assert.equal(sonnet.selectionReason, 'sticky')
+      sonnet.release()
+    }
+  }
+})
