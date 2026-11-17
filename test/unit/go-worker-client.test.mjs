@@ -303,6 +303,37 @@ test('setup-token cli-hop summarizes hidden thinking by default and keeps update
   assert.ok(passed.body.betas.includes('thinking-display-updates-2026-08-18'))
 })
 
+test('CRAG aligns sampling after resolving explicit or default thinking', () => {
+  const exec = { workerStatus: { runtime_variant: 'crag-v2', capabilities: ['generation_controls_v3'] } }
+  const sampling = { temperature: 0.5, top_p: 0.9, top_k: 10 }
+  for (const [thinking, expectedType] of [
+    [undefined, 'adaptive'],
+    [{ type: 'adaptive' }, 'adaptive'],
+    [{ type: 'enabled', budget_tokens: 1024 }, 'enabled'],
+    [{ type: 'disabled' }, 'disabled'],
+  ]) {
+    const { body } = finalizeWorkerPayload({
+      body: {
+        model: thinking?.type === 'adaptive' || !thinking ? 'claude-opus-5-5' : 'claude-opus-4-8',
+        max_tokens: 2048,
+        messages: [{ role: 'user', content: 'hello' }],
+        thinking,
+        ...sampling,
+      },
+      exec,
+      cliHop: true,
+    })
+    assert.equal(body.thinking.type, expectedType)
+    if (expectedType === 'disabled') {
+      for (const [key, value] of Object.entries(sampling)) assert.equal(body[key], value)
+      continue
+    }
+    assert.equal(body.temperature, 1)
+    assert.equal(Object.hasOwn(body, 'top_p'), false)
+    assert.equal(Object.hasOwn(body, 'top_k'), false)
+  }
+})
+
 test('cli-hop appends inline-tools when a message carries a tool_definition', () => {
   const block = {
     type: 'tool_addition',
