@@ -2588,3 +2588,34 @@ test('keep_session_home off: a pinned session fails over as before', async () =>
   assert.equal(result.ok, true)
   assert.deepEqual(seen, ['account-1', 'account-2'])
 })
+
+test('keep_session_home: a home kernel with no free slot is retried instead of spilling the transcript', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: pinnedStickyRouter(),
+    config: { same_account_retry_delay_ms: 0, home_slot_busy_retry_ms: 0, keep_session_home: true },
+  })
+  const seen = []
+  const result = await runner.run({
+    requestId: 'req-home-slot-busy',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    stickyKey: 'sess:home',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      if (seen.length < 3) {
+        return {
+          ok: false,
+          status: 503,
+          upstreamExecutions: 0,
+          body: { error: { type: 'api_error', code: 'slot_busy', message: 'no free slot' } },
+        }
+      }
+      return success('home')
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.accountId, 'account-1')
+  assert.deepEqual(seen, ['account-1', 'account-1', 'account-1'])
+})

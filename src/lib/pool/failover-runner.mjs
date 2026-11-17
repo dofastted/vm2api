@@ -67,6 +67,8 @@ const DEFAULTS = {
   // that account or returns its error, it never replays the transcript on
   // another account. Off by default (upstream behaviour).
   keep_session_home: false,
+  // keep_session_home: pause between retries of a home kernel that had no free slot.
+  home_slot_busy_retry_ms: 2000,
 }
 
 function clone(value) {
@@ -846,6 +848,13 @@ export class FailoverRunner {
       }
       return new Set([unit.accountId, unit.vmId])
     }
+    // The home kernel had no free slot: nothing ran, so wait for it instead of
+    // spilling the transcript to another account. The request deadline bounds it.
+    const waitHomeSlot = (unit, policy) => {
+      if (!isHome(unit) || policy?.reason !== 'slot_busy') return false
+      homeRetryPending = 'slot_busy'
+      return true
+    }
     const keptHome = () => {
       releaseStickySlots()
       return preferLastResult(lastResult, lastPolicy, null, { ...attribution(), session_home_kept: true })
@@ -895,8 +904,12 @@ export class FailoverRunner {
           },
         }
         if (homeRetryPending) {
+          const waitMs =
+            homeRetryPending === 'slot_busy'
+              ? Number(this.config.home_slot_busy_retry_ms ?? 2000)
+              : this.config.same_account_retry_delay_ms
           homeRetryPending = false
-          await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
+          await sleepWithSignal(waitMs, signal)
         }
         if (avoid) {
           const elsewhere = await this.scheduler.selectAndReserve({ ...selectArgs, avoid, allowWait: false })
@@ -1225,6 +1238,7 @@ export class FailoverRunner {
           avoid = retryOrStay(selected)
           continue
         }
+        if (waitHomeSlot(selected, policy)) continue
         if (isHome(selected)) return keptHome()
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } catch (error) {
@@ -1349,6 +1363,7 @@ export class FailoverRunner {
           avoid = retryOrStay(selected)
           continue
         }
+        if (waitHomeSlot(selected, policy)) continue
         if (isHome(selected)) return keptHome()
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } finally {
