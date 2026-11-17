@@ -14,6 +14,7 @@ import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Slider } from '@/components/ui/slider'
 import {
   Select,
   SelectContent,
@@ -74,6 +75,19 @@ const SIZES: [RackSize, string, string][] = [
 
 const LS_VIEW = 'vm-list-view'
 const LS_SIZE = 'vm-rack-size'
+const LS_ZOOM = 'vm-list-zoom'
+const ZOOM_MIN = 100
+const ZOOM_MAX = 200
+
+function readZoom(): number {
+  try {
+    const n = Number(localStorage.getItem(LS_ZOOM))
+    if (Number.isInteger(n) && n >= ZOOM_MIN && n <= ZOOM_MAX) return n
+  } catch {
+    // 隐私模式读不到时用 100%。
+  }
+  return ZOOM_MIN
+}
 
 function readPref<T extends string>(
   key: string,
@@ -116,6 +130,7 @@ export function VmListPage() {
   const [size, setSizeState] = useState(() =>
     readPref(LS_SIZE, ['s', 'm', 'l'] as const, 'l')
   )
+  const [zoom, setZoomState] = useState(readZoom)
   const setView = (next: 'grid' | 'list') => {
     setViewState(next)
     writePref(LS_VIEW, next)
@@ -123,6 +138,15 @@ export function VmListPage() {
   const setSize = (next: RackSize) => {
     setSizeState(next)
     writePref(LS_SIZE, next)
+  }
+  const setZoom = (next: number) => {
+    const value = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(next)))
+    setZoomState(value)
+    try {
+      localStorage.setItem(LS_ZOOM, String(value))
+    } catch {
+      // 写不进去只影响下次打开。
+    }
   }
   const [sort, setSort] = useState<VmSortKey>('status')
   const [dir, setDir] = useState<'asc' | 'desc'>('asc')
@@ -312,6 +336,23 @@ export function VmListPage() {
                 ))}
               </div>
             ) : null}
+            {view === 'list' ? (
+              <div className='flex items-center gap-2'>
+                <span className='text-xs text-muted-foreground'>放大</span>
+                <Slider
+                  className='w-28'
+                  min={ZOOM_MIN}
+                  max={ZOOM_MAX}
+                  step={10}
+                  value={[zoom]}
+                  aria-label='列表放大'
+                  onValueChange={(next) => setZoom(next[0] ?? ZOOM_MIN)}
+                />
+                <span className='w-10 text-right font-mono text-xs text-muted-foreground tabular-nums'>
+                  {zoom}%
+                </span>
+              </div>
+            ) : null}
             <Button
               size='sm'
               variant={view === 'list' ? 'default' : 'outline'}
@@ -363,7 +404,7 @@ export function VmListPage() {
                 onCreate={canCreate ? () => setCreateOpen(true) : undefined}
               />
             ) : (
-              <VmTable vms={list} accounts={accounts} />
+              <VmTable vms={list} accounts={accounts} zoom={zoom} />
             )
           ) : (
             <EmptyState

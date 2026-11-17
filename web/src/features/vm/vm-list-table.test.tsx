@@ -189,7 +189,7 @@ describe('VM account column kernel label', () => {
     expect(html).toContain('aria-label="anthropic"')
     for (const label of [
       'vm-01',
-      'account@example.com',
+      'account@ex…',
       'Max',
       'kvm',
       'oauth',
@@ -197,6 +197,7 @@ describe('VM account column kernel label', () => {
     ]) {
       expect(html).toMatch(new RegExp(`>${label}</(?:span|div)>`))
     }
+    expect(html).toContain('title="account@example.com"')
     expect(html).not.toContain('订阅 未知')
     expect(html).not.toContain('01·account')
     expect(

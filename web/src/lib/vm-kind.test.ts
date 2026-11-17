@@ -8,6 +8,7 @@ import {
   kindFromModel,
   platformLabel,
   compactEmail,
+  clipLabel,
   slotAccountLabel,
   slotCredentialLabel,
   vmKindOf,
@@ -70,6 +71,13 @@ describe('kindFromModel / slotAccountLabel', () => {
     expect(compactEmail('no-at-but-extremely-long-label-here', 12)).toBe(
       'no-at-but-e…'
     )
+  })
+
+  it('clips left-side names to 10 characters', () => {
+    expect(clipLabel('vm-01')).toBe('vm-01')
+    expect(clipLabel('account@example.com')).toBe('account@ex…')
+    expect(clipLabel('十个字符刚好够用啊啊')).toBe('十个字符刚好够用啊啊')
+    expect(clipLabel('十个字符刚好够用啊啊多')).toBe('十个字符刚好够用啊啊…')
   })
 })
 
