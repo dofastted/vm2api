@@ -5,8 +5,7 @@ Requires=kin-guest-setup.service
 
 [Service]
 User=kincli
-RuntimeDirectory=kin-guest
-RuntimeDirectoryMode=0770
+# Guest setup owns /run/kin-guest so kernel stops cannot remove slot.env.
 EnvironmentFile=-/run/kin-guest/slot.env
 Environment=HOME=/home/kincli
 Environment=CLAUDE_CONFIG_DIR=/home/kincli/.claude
