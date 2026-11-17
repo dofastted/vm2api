@@ -571,12 +571,8 @@ fetch_release_files() {
 prepare_gemini_host() {
   local PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   local tag="$1" mode="$2" source="${GEMINI_PAYLOAD_SOURCE:-$(env_get VM2API_GEMINI_PAYLOAD_SOURCE)}"
-  if [ -z "$source" ]; then
-    if [ "${3:-}" != required ] && [ ! -f /etc/systemd/system/vm2api-gemini.service ]; then return 0; fi
-    if [ ! -d "${INSTALL_DIR}/share/gemini/current" ]; then
-      err "请指定 --gemini-payload-source DIR"
-      return 1
-    fi
+  if [ -z "$source" ] && [ "${3:-}" != required ] && [ ! -f /etc/systemd/system/vm2api-gemini.service ]; then
+    return 0
   fi
   if [ "$HOST_ARCH" != amd64 ] || { [ -n "$source" ] && [[ ! "$source" =~ ^/[A-Za-z0-9._/-]+$ ]]; } ||
     [[ ! "$INSTALL_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
@@ -584,23 +580,22 @@ prepare_gemini_host() {
     return 1
   fi
   local host_dir=/usr/local/lib/vm2api-gemini staging file dependency
-  for dependency in systemctl node python3 curl ip nft setpriv bwrap; do
+  for dependency in systemctl node python3; do
     command -v "$dependency" >/dev/null || { err "Gemini 宿主机缺少 $dependency"; return 1; }
   done
+  if ! systemctl show --property=Version --value >/dev/null; then
+    err "Gemini 宿主服务需要正在运行的 systemd；请在 Linux 宿主机上执行，不要在控制面容器内执行"
+    return 1
+  fi
   if systemctl is-active --quiet gemini-host.service; then
     err "旧版 gemini-host.service 正在运行；请先迁移该服务，避免争用控制 socket"
     return 1
   fi
-  if { [ -n "$source" ] && [ ! -d "$source" ] && [ ! -d "${INSTALL_DIR}/share/gemini/current" ]; } ||
-    [ ! -f /etc/vm2api/gemini-ed25519.pub ]; then
-    err "Gemini 需要已解包的签名载荷和 /etc/vm2api/gemini-ed25519.pub"
-    return 1
-  fi
-  staging="$(mktemp -d)"
+  staging="$(mktemp -d)" || return 1
   local -a files=(deploy/gemini-host.service.example scripts/gemini-host.py scripts/gemini_host_account.py
     scripts/gemini-host-egress.sh scripts/install-gemini-payload.mjs src/lib/gemini/payload.mjs)
   for file in "${files[@]}"; do
-    mkdir -p "${staging}/${file%/*}"
+    mkdir -p "${staging}/${file%/*}" || { rm -rf -- "$staging"; return 1; }
     if [ "$mode" = source ]; then
       cp "${INSTALL_DIR}/${file}" "${staging}/${file}" || { rm -rf -- "$staging"; return 1; }
     else
@@ -623,9 +618,9 @@ prepare_gemini_host() {
       "${staging}/${files[0]}" > "${staging}/vm2api-gemini.service" || exit 1
     install -m 644 "${staging}/vm2api-gemini.service" /etc/systemd/system/vm2api-gemini.service || exit 1
     systemctl daemon-reload && systemctl enable vm2api-gemini.service && systemctl restart vm2api-gemini.service
-  ) || return 1
-  if [ -n "$source" ]; then env_set VM2API_GEMINI_PAYLOAD_SOURCE "$source"; fi
-  ok "Gemini 宿主服务已启动；首次创建 Gemini 环境时安装签名载荷"
+  ) || { err "Gemini 宿主服务未就绪，请检查 journalctl -u vm2api-gemini.service"; return 1; }
+  if [ -n "$source" ]; then env_set VM2API_GEMINI_PAYLOAD_SOURCE "$source" || return 1; fi
+  ok "Gemini 控制 socket 已就绪；签名载荷与 OAuth 启动条件请在面板检查"
 }
 
 # 从 COMPOSE_FILE 去掉源码 ARM64 override 段，保留其它 overlay；全去掉后只剩 docker-compose.yml。
@@ -969,7 +964,9 @@ cmd_install() {
   prepare_arch_env "$mode"
   prepare_arm64_host
   start_stack
-  if [ "$NO_START" = 0 ]; then prepare_gemini_host "$tag" "$mode" || exit 1; fi
+  if [ "$NO_START" = 0 ]; then
+    prepare_gemini_host "$tag" "$mode" || warn "Gemini 宿主服务未就绪；控制面继续安装，请修复后单独执行 prepare-gemini"
+  fi
   if [ "$NO_START" = 0 ] && [ "$SYNC_WRAP" = 1 ]; then
     update_default_crag || { err "CRAG 二进制更新失败，安装未完成"; exit 1; }
     sync_wrap_cli || { err "槽内 wrap CLI / kernel 同步失败，安装未完成"; exit 1; }
@@ -1019,7 +1016,9 @@ cmd_upgrade() {
   fi
   prepare_arm64_host
   start_stack
-  if [ "$NO_START" = 0 ]; then prepare_gemini_host "$tag" "$mode" || exit 1; fi
+  if [ "$NO_START" = 0 ]; then
+    prepare_gemini_host "$tag" "$mode" || warn "Gemini 宿主服务未就绪；控制面继续升级，请修复后单独执行 prepare-gemini"
+  fi
   if [ "$NO_START" = 0 ] && [ "$SYNC_WRAP" = 1 ]; then
     update_default_crag || { err "CRAG 二进制更新失败，升级未完成"; exit 1; }
     sync_wrap_cli || { err "槽内 wrap CLI / kernel 同步失败，升级未完成"; exit 1; }

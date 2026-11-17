@@ -54,8 +54,11 @@ with socket.socket(socket.AF_UNIX) as transport:
 PY
 }
 
+mv "$fixture/public-key" "$fixture/held-key"
 start
-request list | python3 -c 'import json,sys; assert json.load(sys.stdin) == {"payload_state":"install_on_create", "environments":[]}'
+request list | python3 -c 'import json,sys; data=json.load(sys.stdin); assert (data["payload_state"], data["payload_issue"]) == ("not_configured", "gemini_public_key_missing")'
+mv "$fixture/held-key" "$fixture/public-key"
+request list | python3 -c 'import json,sys; data=json.load(sys.stdin); assert (data["payload_state"], data["payload_issue"], data["environments"]) == ("install_on_create", None, []) and data["oauth_runtime_issue"] in ("gemini_egress_unavailable", "gemini_oauth_tools_missing")'
 KIN_GEMINI_HOST_SOCKET="$socket" node --input-type=module - "$root/src/lib/gemini/routes.mjs" <<'JS'
 import assert from 'node:assert/strict'
 import { pathToFileURL } from 'node:url'
@@ -63,10 +66,19 @@ import { pathToFileURL } from 'node:url'
 const { createGeminiPanelHandler } = await import(pathToFileURL(process.argv[2]))
 const handler = createGeminiPanelHandler({ json: (_response, status, body) => ({ status, body }) })
 const result = await handler({ method: 'GET' }, { setHeader() {} }, '/api/panel/gemini')
-assert.deepEqual(result.body.data, { available: true, payload_state: 'install_on_create', environments: [] })
+assert.equal(result.body.data.available, true)
+assert.equal(result.body.data.payload_state, 'install_on_create')
+assert.equal(result.body.data.payload_issue, null)
+assert.deepEqual(result.body.data.environments, [])
 JS
 [[ ! -e $fixture/payload/current ]]
 create='{"name":"Fixture","proxy_id":"fixture","proxy_url":"socks5h://192.0.2.1:1080"}'
+mv "$fixture/source" "$fixture/held-source"
+request create "$create" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_payload_source_missing"'
+mv "$fixture/held-source" "$fixture/source"
+mv "$fixture/source/agy" "$fixture/held-agy"
+request create "$create" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_payload_incomplete"'
+mv "$fixture/held-agy" "$fixture/source/agy"
 printf '%064d' 0 > "$fixture/source/manifest.sig"
 request create "$create" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_payload_invalid"'
 [[ ! -e $fixture/state/environments.json && ! -e $fixture/payload/current ]]
@@ -76,7 +88,45 @@ request create "$create" | python3 -c 'import json,sys; data=json.load(sys.stdin
 stop
 start
 request list | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["payload_state"] == "installed" and data["environments"][0]["name"] == "Fixture"'
-printf '%s\n' 'Gemini host: socket ready before install, corrupt payload blocked, lazy install and restart persistence passed.'
+chmod -x "$fixture/payload/current/agy"
+request list | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["payload_issue"] == "gemini_payload_incomplete" and data["environments"][0]["kernel_version"] is None'
+chmod +x "$fixture/payload/current/agy"
+request list | python3 -c 'import json,sys; assert json.load(sys.stdin)["payload_state"] == "installed"'
+stop
+
+python3 - "$fixture" <<'PY'
+import os
+from pathlib import Path
+import socket
+import stat
+import subprocess
+import sys
+
+root = Path(sys.argv[1])
+control = root / "control.sock"
+address = "\0gemini-host-smoke-" + root.name
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stale:
+    stale.bind(str(control))
+with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as listener:
+    listener.bind(address)
+    listener.settimeout(10)
+    host = subprocess.Popen([
+        sys.executable, "-I", str(root / "scripts/gemini-host.py"),
+        "--state", str(root / "state"), "--payload", str(root / "payload/current"),
+        "--public-key", str(root / "public-key"), "--egress", str(root / "unneeded-kin-egress"),
+        "--socket", str(control), "--gateway-group", "root", "--uid-base", "29000",
+    ], env={**os.environ, "NOTIFY_SOCKET": "@" + address[1:]})
+    try:
+        assert listener.recv(64) == b"READY=1"
+        assert stat.S_IMODE(control.stat().st_mode) == 0o660
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(str(control))
+    finally:
+        host.terminate()
+        assert host.wait(timeout=10) == 0
+PY
+printf '%s\n' 'Gemini host: readiness notification, missing prerequisites, signature enforcement, lazy install and restart persistence passed.'
 
 python3 -I - "$fixture/scripts/gemini_host_account.py" <<'PY'
 import runpy

@@ -4,14 +4,13 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 RuntimeDirectory=vm2api-gemini
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
 StateDirectory=vm2api-gemini
 StateDirectoryMode=0711
 ExecStart=/usr/bin/python3 -I /usr/local/lib/vm2api-gemini/scripts/gemini-host.py --state /var/lib/vm2api-gemini --payload @INSTALL_DIR@/share/gemini/current @PAYLOAD_SOURCE_ARG@ --public-key /etc/vm2api/gemini-ed25519.pub --egress @INSTALL_DIR@/bin/kin-egress --socket /run/vm2api-gemini/control.sock --gateway-group vm2api --uid-base 29000
-ExecStartPost=/bin/bash -c 'for attempt in {1..45}; do if test -S /run/vm2api-gemini/control.sock; then exit 0; fi; sleep 1; done; exit 1'
 TimeoutStartSec=50
 Restart=on-failure
 RestartSec=5

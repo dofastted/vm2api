@@ -149,7 +149,43 @@ test('Gemini import is admin-only and unavailable without the host service', asy
     throw new Error('private socket path')
   })
   const result = await run('GET', root)
-  assert.deepEqual(result, { status: 200, body: { ok: true, data: { available: false, environments: [] } } })
+  assert.equal(result.status, 200)
+  assert.equal(result.body.data.available, false)
+  assert.equal(result.body.data.host_error, 'gemini_host_unavailable')
+  assert.deepEqual(result.body.data.environments, [])
+  assert.doesNotMatch(JSON.stringify(result), /private socket path/)
+})
+
+test('unknown Gemini payload status is not installed and proxy failures do not hide inventory', async () => {
+  const run = setup(() => ({ payload_state: 'unexpected', payload_issue: 'private', environments: [record] }), {
+    ...bound,
+    enabled: false,
+  })
+  const { body } = await run('GET', root)
+  assert.equal(body.data.available, true)
+  assert.equal(body.data.payload_state, 'unknown')
+  assert.equal(body.data.payload_issue, null)
+  assert.equal(body.data.environments[0].proxy_ready, false)
+})
+
+test('Gemini inventory distinguishes a missing socket from an invalid host response', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-host-'))
+  const socketPath = path.join(directory, 'control.sock')
+  const server = http.createServer((_request, response) => response.end('<html>unexpected</html>'))
+  const previous = process.env.KIN_GEMINI_HOST_SOCKET
+  process.env.KIN_GEMINI_HOST_SOCKET = socketPath
+  const run = createGeminiPanelHandler({ json: (_response, _status, body) => body })
+  const status = async () => (await run({ method: 'GET' }, { setHeader() {} }, root)).data.host_error
+  try {
+    assert.equal(await status(), 'gemini_host_socket_missing')
+    await new Promise((resolve, reject) => server.once('error', reject).listen(socketPath, resolve))
+    assert.equal(await status(), 'gemini_host_protocol_error')
+  } finally {
+    if (previous === undefined) delete process.env.KIN_GEMINI_HOST_SOCKET
+    else process.env.KIN_GEMINI_HOST_SOCKET = previous
+    if (server.listening) await new Promise((resolve) => server.close(resolve))
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 test('reachable Gemini host reports lazy install without dependencies on an existing environment', async () => {
@@ -157,6 +193,8 @@ test('reachable Gemini host reports lazy install without dependencies on an exis
   assert.deepEqual((await run('GET', root)).body.data, {
     available: true,
     payload_state: 'install_on_create',
+    payload_issue: null,
+    oauth_runtime_issue: null,
     environments: [],
   })
   const invalidPayload = setup(() => {
