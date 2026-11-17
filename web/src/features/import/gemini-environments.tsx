@@ -28,6 +28,7 @@ export type GeminiEnvironment = {
     'unverified' | 'authorizing' | 'authorized' | 'reauth_required' | 'disabled'
   runtime_ready: boolean
   billing_ready: boolean
+  proxy_ready?: boolean
   auth_method: 'oauth' | 'api_key'
   kernel_version: string | null
   created_at: string | null
@@ -51,10 +52,13 @@ export type GeminiEnvironment = {
   } | null
 }
 
-type Inventory = {
+export type GeminiInventory = {
   available: boolean
+  host_message?: string
   payload_state?:
-    'installed' | 'install_on_create' | 'not_configured' | 'invalid'
+    'installed' | 'install_on_create' | 'not_configured' | 'invalid' | 'unknown'
+  payload_issue?: keyof typeof PAYLOAD_ISSUES | null
+  oauth_runtime_issue?: keyof typeof OAUTH_ISSUES | null
   environments: GeminiEnvironment[]
 }
 type Authorization = { url: string; attempt_id: string }
@@ -75,6 +79,60 @@ const AUTH_LABELS: Record<GeminiEnvironment['auth_state'], string> = {
   authorized: '已授权',
   reauth_required: '需要重新授权',
   disabled: '已停用',
+}
+
+const PAYLOAD_ISSUES = {
+  gemini_public_key_missing: '缺少 Gemini 发行公钥。',
+  gemini_payload_source_missing: '缺少 Antigravity 签名载荷安装源。',
+  gemini_payload_incomplete: 'Antigravity 签名载荷不完整或不可执行。',
+  gemini_payload_invalid: 'Gemini 载荷校验失败，请检查宿主服务日志。',
+}
+
+const OAUTH_ISSUES = {
+  gemini_oauth_tools_missing: '宿主缺少 Google 授权所需工具。',
+  gemini_egress_unavailable: '宿主缺少可用的 kin-egress。',
+  gemini_ipv4_forwarding_unavailable: '宿主 IPv4 转发未就绪。',
+}
+
+export function geminiPayloadIssue(inventory?: GeminiInventory) {
+  if (inventory?.payload_issue) return PAYLOAD_ISSUES[inventory.payload_issue]
+  if (inventory?.payload_state === 'invalid')
+    return PAYLOAD_ISSUES.gemini_payload_invalid
+  if (inventory?.payload_state === 'not_configured')
+    return '缺少签名载荷安装源或发行公钥。'
+  if (
+    inventory?.available &&
+    (!inventory.payload_state || inventory.payload_state === 'unknown')
+  )
+    return '宿主未报告可识别的载荷状态，请对齐版本。'
+  return null
+}
+
+export function GeminiStartupStatus({
+  inventory,
+}: {
+  inventory: GeminiInventory
+}) {
+  if (!inventory.available)
+    return (
+      <p role='status' className='text-sm'>
+        {inventory.host_message || '未检测到可用的 Gemini 宿主服务。'}{' '}
+        请在宿主检查 <code>systemctl status vm2api-gemini</code>；未安装时运行{' '}
+        <code>deploy/install.sh prepare-gemini</code>。
+      </p>
+    )
+  const payloadIssue = geminiPayloadIssue(inventory)
+  return (
+    <div className='space-y-1 text-sm'>
+      {payloadIssue ? <p role='status'>{payloadIssue}</p> : null}
+      {inventory.payload_state === 'install_on_create' ? (
+        <p role='status'>首次创建时自动校验并安装 Gemini 内核和官方 CLI。</p>
+      ) : null}
+      {inventory.oauth_runtime_issue ? (
+        <p role='status'>{OAUTH_ISSUES[inventory.oauth_runtime_issue]}</p>
+      ) : null}
+    </div>
+  )
 }
 
 const ACCOUNT_LABELS = {
@@ -221,6 +279,13 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
         <dd>{AUTH_LABELS[environment.auth_state]}</dd>
       </div>
       <div>
+        <dt className='text-muted-foreground'>绑定代理</dt>
+        <dd>
+          {environment.proxy_id}
+          {environment.proxy_ready === false ? ' · 不可用' : null}
+        </dd>
+      </div>
+      <div>
         <dt className='text-muted-foreground'>推理</dt>
         <dd>{environment.runtime_ready ? '就绪' : '当前载荷未启用推理'}</dd>
       </div>
@@ -281,7 +346,7 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
 export function geminiInventoryOptions() {
   return queryOptions({
     queryKey: QUERY_KEY,
-    queryFn: () => api<Inventory>(ROOT),
+    queryFn: () => api<GeminiInventory>(ROOT),
     retry: false,
     refetchInterval: (query) =>
       query.state.data?.environments.some(
@@ -344,7 +409,7 @@ export function GeminiEnvironments({
             ...(authMethod === 'api_key' ? { api_key: apiKey.trim() } : {}),
           }),
         })
-        client.setQueryData<Inventory>(
+        client.setQueryData<GeminiInventory>(
           QUERY_KEY,
           (current) =>
             current && {
@@ -393,15 +458,14 @@ export function GeminiEnvironments({
   if (inventory.isPending)
     return <p role='status'>正在检测 Gemini 宿主机服务…</p>
   if (inventory.isError) return <p role='alert'>读取 Gemini 环境失败。</p>
-  if (!inventory.data?.available)
-    return (
-      <p role='status'>
-        此宿主机尚未启用 Gemini。请先在宿主运行{' '}
-        <code>deploy/install.sh prepare-gemini</code>，再刷新面板。
-      </p>
-    )
+  if (!inventory.data) return null
+  if (!inventory.data.available)
+    return <GeminiStartupStatus inventory={inventory.data} />
   const payloadState = inventory.data.payload_state
-  const canInstall = payloadState !== 'not_configured'
+  const canInstall =
+    payloadState === 'installed' ||
+    payloadState === 'install_on_create' ||
+    payloadState === 'invalid'
   const selectedId = environmentId || createdId
   const environment = inventory.data.environments.find(
     (item) => item.id === selectedId
@@ -418,15 +482,7 @@ export function GeminiEnvironments({
           管理。
         </p>
       ) : null}
-      {payloadState === 'install_on_create' ? (
-        <p role='status'>首次创建时自动校验并安装 Gemini 内核和官方 CLI。</p>
-      ) : null}
-      {payloadState === 'not_configured' ? (
-        <p role='status'>宿主服务已连接，但缺少签名载荷安装源或发行公钥。</p>
-      ) : null}
-      {payloadState === 'invalid' ? (
-        <p role='alert'>Gemini 载荷校验失败，请检查安装源及宿主服务日志。</p>
-      ) : null}
+      <GeminiStartupStatus inventory={inventory.data} />
       {isImport ? (
         <form
           className='space-y-3'
@@ -542,7 +598,12 @@ export function GeminiEnvironments({
               <Button
                 type='button'
                 variant='outline'
-                disabled={operation.isPending}
+                disabled={
+                  operation.isPending ||
+                  !canInstall ||
+                  Boolean(inventory.data.oauth_runtime_issue) ||
+                  environment.proxy_ready === false
+                }
                 onClick={() =>
                   operation.mutate({ type: 'authorize', id: environment.id })
                 }
@@ -557,7 +618,9 @@ export function GeminiEnvironments({
               <Button
                 type='button'
                 variant='outline'
-                disabled={operation.isPending}
+                disabled={
+                  operation.isPending || environment.proxy_ready === false
+                }
                 onClick={() =>
                   operation.mutate({ type: 'refresh', id: environment.id })
                 }

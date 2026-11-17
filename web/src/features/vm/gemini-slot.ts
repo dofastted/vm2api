@@ -1,17 +1,27 @@
 import type { Vm } from '@/types/panel-vm'
-import type { GeminiEnvironment } from '@/features/import/gemini-environments'
+import {
+  geminiPayloadIssue,
+  type GeminiEnvironment,
+  type GeminiInventory,
+} from '@/features/import/gemini-environments'
 
-export function geminiSlot(environment: GeminiEnvironment): Vm {
+export function geminiSlot(
+  environment: GeminiEnvironment,
+  inventory?: GeminiInventory
+): Vm {
   const { auth_state: auth, account } = environment
   const authorized = auth === 'authorized'
   const reason =
     auth === 'reauth_required'
       ? '凭证失效'
-      : !environment.runtime_ready
-        ? '载荷未启用推理'
-        : !environment.billing_ready
-          ? '付费调用未开放'
-          : null
+      : geminiPayloadIssue(inventory) ||
+        (environment.proxy_ready === false
+          ? '绑定代理不可用'
+          : !environment.runtime_ready
+            ? '载荷未启用推理'
+            : !environment.billing_ready
+              ? '付费调用未开放'
+              : null)
   return {
     id: environment.id,
     name: environment.name,

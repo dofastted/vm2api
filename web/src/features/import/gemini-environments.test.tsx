@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { expect, test, vi } from 'vitest'
-import { GeminiEnvironments } from './gemini-environments'
+import { GeminiEnvironments, type GeminiInventory } from './gemini-environments'
 
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ children }: { children: string }) => <a>{children}</a>,
@@ -10,12 +10,14 @@ vi.mock('@tanstack/react-router', () => ({
 function showGemini(
   available: boolean,
   view: 'import' | 'vm' = 'import',
-  kind: 'oauth' | 'api_key' = 'oauth'
+  kind: 'oauth' | 'api_key' = 'oauth',
+  status: Partial<GeminiInventory> = {}
 ) {
   const client = new QueryClient()
   client.setQueryData(['panel', 'gemini-environments'], {
     available,
     payload_state: 'install_on_create',
+    ...status,
     environments: [
       {
         id: 'gemini-one',
@@ -96,10 +98,24 @@ function showGemini(
   )
 }
 
-test('Gemini is unavailable without the separate host service', () => {
-  const html = showGemini(false)
-  expect(html).toContain('尚未启用 Gemini')
+test('Gemini shows the socket failure without claiming the service is disabled', () => {
+  const html = showGemini(false, 'import', 'oauth', {
+    host_message: '控制面无权访问 Gemini 控制 socket',
+  })
+  expect(html).toContain('控制面无权访问 Gemini 控制 socket')
+  expect(html).toContain('systemctl status vm2api-gemini')
   expect(html).not.toContain('创建 Gemini 环境')
+})
+
+test('VM details distinguish missing Antigravity files from OAuth host prerequisites', () => {
+  const html = showGemini(true, 'vm', 'oauth', {
+    payload_state: 'not_configured',
+    payload_issue: 'gemini_payload_incomplete',
+    oauth_runtime_issue: 'gemini_egress_unavailable',
+  })
+  expect(html).toContain('Antigravity 签名载荷不完整')
+  expect(html).toContain('宿主缺少可用的 kin-egress')
+  expect(html).toContain('Antigravity 额度与使用分析')
 })
 
 test('Gemini import only displays eligible platform SOCKS5 and leaves inventory management to VM', () => {
