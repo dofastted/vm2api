@@ -5,6 +5,7 @@ import {
   activateCragSubscriptionBinding,
   cragLicenseDeniedResult,
   cragTargetIds,
+  effectiveCragHostSlots,
   getCragLicense,
   MAX_CRAG_HOST_ENTITLEMENT_BYTES,
   prepareCragSubscriptionBinding,
@@ -78,6 +79,9 @@ const denyRuntime = (license) => ({ ok: false, status: 403, code: license.code, 
 
 function projection(data, claims) {
   const reclaim = claims.version === 2
+  // v1 and v2 expose a single ceiling; a v3 ladder resolves to the seats live
+  // right now. Identical for v1/v2, since the accessor returns their slot_limit.
+  const limit = effectiveCragHostSlots(claims)
   const result = { reclaim_supported: reclaim }
   if (Object.hasOwn(data, 'sku')) {
     if (!validSku(data.sku)) throw invalidRights()
@@ -91,7 +95,7 @@ function projection(data, claims) {
     if (
       !safeTime(data.used_slots) ||
       data.used_slots > 4294967295 ||
-      (claims.slot_limit !== 'unlimited' && data.used_slots > claims.slot_limit) ||
+      (limit !== 'unlimited' && data.used_slots > limit) ||
       (reclaim && data.used_slots !== claims.roster.length)
     )
       throw invalidRights()
@@ -100,10 +104,10 @@ function projection(data, claims) {
   if (Object.hasOwn(data, 'available_slots')) {
     const available = data.available_slots
     const capacity = reclaim
-      ? Math.min(claims.slot_limit === 'unlimited' ? 10000 : claims.slot_limit, 10000) - claims.roster.length
-      : claims.slot_limit === 'unlimited'
+      ? Math.min(limit === 'unlimited' ? 10000 : limit, 10000) - claims.roster.length
+      : limit === 'unlimited'
         ? null
-        : claims.slot_limit - (result.used_slots ?? 0)
+        : limit - (result.used_slots ?? 0)
     if (
       available !== 0 &&
       (capacity === null
@@ -122,11 +126,14 @@ function projection(data, claims) {
 function availableSeats(claims, rights, active) {
   if (!active) return 0
   if (Object.hasOwn(rights, 'available_slots')) return rights.available_slots ?? 'unlimited'
+  const limit = effectiveCragHostSlots(claims)
   if (claims.version === 2) {
-    return Math.min(claims.slot_limit === 'unlimited' ? 10000 : claims.slot_limit, 10000) - claims.roster.length
+    return Math.min(limit === 'unlimited' ? 10000 : limit, 10000) - claims.roster.length
   }
-  if (claims.slot_limit === 'unlimited') return 'unlimited'
-  return rights.used_slots === undefined ? null : claims.slot_limit - rights.used_slots
+  if (limit === 'unlimited') return 'unlimited'
+  // A v3 ladder already states the live total, so it needs no used_slots report.
+  if (claims.version === 3) return limit
+  return rights.used_slots === undefined ? null : limit - rights.used_slots
 }
 export const isCragOrderVmId = (id) => typeof id === 'string' && id.length <= 131 && isValidVmId(id)
 
@@ -752,7 +759,14 @@ export function createCragSubscription({
         ready: targetReady,
         ...(target_probe_failed && { target_probe_failed }),
         state: pending ? 'sync_pending' : claims ? (expired ? 'expired' : 'active') : 'unredeemed',
-        ...(claims && { slot_limit: claims.slot_limit, expires_at: claims.expires_at, revision: claims.revision }),
+        ...(claims && {
+          // v3 has no single ceiling of its own; report the seats live right now
+          // and hand the panel the ladder so it can show each voucher's expiry.
+          slot_limit: effectiveCragHostSlots(claims),
+          expires_at: claims.expires_at,
+          revision: claims.revision,
+          ...(claims.grants && { grants: claims.grants }),
+        }),
         ...rights,
         available_seats: pending || runtime === null ? null : availableSeats(claims, rights, claims && !expired),
         reclaim_pending_count,
@@ -777,6 +791,9 @@ export function createCragSubscription({
   }
 
   async function authority(action, hostId, key, extra) {
+    // Declare the ladder only where the Authority accepts the field. Its bind and
+    // renewal-proof requests deny unknown fields, so sending it there is a 400.
+    const negotiated = ['redeem', 'status'].includes(action) ? { entitlement_version: 3 } : undefined
     try {
       const response = await fetchImpl(`${origin}/v1/host-subscriptions/${action}`, {
         method: 'POST',
@@ -784,7 +801,7 @@ export function createCragSubscription({
         cache: 'no-store',
         signal: AbortSignal.timeout(8000),
         headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'application/json' },
-        body: JSON.stringify({ host_id: hostId, ...extra }),
+        body: JSON.stringify({ host_id: hostId, ...negotiated, ...extra }),
       })
       const envelope = await responseJson(response)
       if (response.ok && envelope?.ok === true && envelope.data && typeof envelope.data === 'object')
@@ -802,7 +819,10 @@ export function createCragSubscription({
     if (
       next.revision !== data.revision ||
       next.expires_at !== data.expires_at ||
-      next.slot_limit !== data.slot_limit ||
+      // A v3 slot_limit is a snapshot of the ladder at the authority's clock.
+      // Comparing it would reject the response whenever the two clocks straddle
+      // a voucher's expiry; the signed grants are the truth and are checked above.
+      (next.version !== 3 && next.slot_limit !== data.slot_limit) ||
       (previous &&
         (next.revision < previous.claims.revision ||
           (previous.claims.version === 2 && next.version !== 2) ||

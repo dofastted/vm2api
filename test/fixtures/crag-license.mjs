@@ -98,6 +98,17 @@ export function issueHostEntitlement(root, hostId, overrides = {}) {
   }
   return { claims, code: signSubscriptionBytes(root, 'CRAGH1', JSON.stringify(claims)) }
 }
+export function issueGrantedHostEntitlement(root, hostId, grants, overrides = {}) {
+  const now = Math.floor(Date.now() / 1000)
+  const claims = {
+    version: 3, product: 'crag-v2', host_id: hostId, revision: 1,
+    issued_at: now - 60,
+    // The last voucher defines the signed window.
+    expires_at: grants.at(-1)?.expires_at ?? now + 86400,
+    grants, ...overrides,
+  }
+  return { claims, code: signSubscriptionBytes(root, 'CRAGH3', JSON.stringify(claims)) }
+}
 export function issueSlotPermit(root, machineCode, hostId, overrides = {}, wrap = {}) {
   const authority = fixtureAuthority(root)
   const challenge = JSON.parse(Buffer.from(machineCode.split('.')[1], 'base64url'))

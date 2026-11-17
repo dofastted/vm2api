@@ -87,6 +87,11 @@ export type CragHostStatus = {
   }>
   available_slots?: number | null
   available_seats?: number | 'unlimited' | null
+  /** v3 ladder: one entry per redeemed voucher, earliest expiry first. */
+  grants?: Array<{
+    slots: number | 'unlimited'
+    expires_at: number
+  }>
   reclaim_pending_count?: number
   reclaim_supported?: boolean
   upgrade_available?: boolean
