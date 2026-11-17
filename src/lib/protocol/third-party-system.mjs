@@ -30,22 +30,23 @@ function systemBlocks(system) {
   return []
 }
 
-function withoutCache(block) {
-  if (!block || block.cache_control == null) return block
-  const { cache_control: _drop, ...rest } = block
-  return rest
-}
-
 /**
  * Split system blocks into caller content (to relocate) and what stays
- * (official identity/billing boilerplate and non-text blocks).
+ * (official identity/billing boilerplate and non-text blocks). Caller cache
+ * markers move with their blocks: system precedes messages, so the breakpoint
+ * count and TTL order stay as the caller (and the earlier TTL repair) left
+ * them, and the relocated prefix stays cacheable across requests.
  */
 function splitSystem(system) {
   const move = []
   for (const block of systemBlocks(system)) {
     if (!block || block.type !== 'text' || typeof block.text !== 'string') continue
     if (!block.text.trim() || isKnownOfficialSystemText(block.text)) continue
-    move.push(withoutCache(block))
+    move.push(
+      block.cache_control == null
+        ? { type: 'text', text: block.text }
+        : { type: 'text', text: block.text, cache_control: block.cache_control },
+    )
   }
   return move
 }
@@ -65,18 +66,17 @@ export function relocateThirdPartySystem(body) {
   const messages = body.messages.slice()
   const at = firstUserIndex(messages)
   const first = at >= 0 ? messages[at] : null
-  const lead = moved.map((b) => ({ type: 'text', text: b.text }))
   if (first) {
     const content =
       typeof first.content === 'string'
-        ? [...lead, { type: 'text', text: first.content }]
+        ? [...moved, { type: 'text', text: first.content }]
         : Array.isArray(first.content)
-          ? [...lead, ...first.content]
-          : lead
+          ? [...moved, ...first.content]
+          : moved
     messages[at] = { ...first, content }
   } else {
     // No user turn to attach to; an alternation-safe one goes first.
-    messages.unshift({ role: 'user', content: lead })
+    messages.unshift({ role: 'user', content: moved })
   }
   return {
     body: { ...body, system: [{ type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }], messages },

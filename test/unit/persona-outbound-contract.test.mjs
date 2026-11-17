@@ -21,6 +21,16 @@ const text = (value, ttl) => ({ type: 'text', text: value, ...(ttl === null ? {}
 
 const model = 'claude-opus-5-5'
 
+// The CLI backend relocates a non Claude Code caller's system ('test-client'
+// here) to the head of the first user message, keeping its cache markers,
+// before the persona renders (third-party-system.mjs). The persona then only
+// sees the official identity line as caller system. The API backend still
+// forwards the caller system, so those variants keep covering the templates.
+const leadingUserBlocks = (body, count) => {
+  const content = body.messages.find((message) => message.role === 'user').content
+  return (typeof content === 'string' ? [{ type: 'text', text: content }] : content).slice(0, count)
+}
+
 // Capture at the transport boundary after conversion, persona rendering and
 // slot selection. API requests go through the real local-kernel client.
 async function outbound(
@@ -239,7 +249,10 @@ for (const backend of ['cli', 'api']) {
               ['1h', shortTtl ?? null],
             )
             for (const source of system) assert.equal(JSON.stringify(out).split(source.text).length - 1, 1)
-            if (placement === 'agent-first') {
+            if (backend === 'cli') {
+              // Relocated in caller order, so the template placements do not apply.
+              assert.deepEqual(leadingUserBlocks(out, system.length), system)
+            } else if (placement === 'agent-first') {
               assert.ok(
                 out.system.findIndex((block) => block.text === system[1].text) <
                   out.system.findIndex((block) => block.text === system[0].text),
@@ -345,7 +358,7 @@ for (const backend of ['cli', 'api']) {
       })
       const markers = listCacheMarkers(out)
       assert.equal(markers.length, 1)
-      assert.equal(markers[0].section, 'system')
+      assert.equal(markers[0].section, backend === 'cli' ? 'messages' : 'system')
       assert.equal(markers[0].ttl, ttl ?? null)
       assert.ok(JSON.stringify(out).includes('BUSINESS_RULE'))
     })
@@ -371,11 +384,11 @@ for (const backend of ['cli', 'api']) {
             input: { messages },
           })
           assert.deepEqual(
-            out.system.find((item) => item.text === block.text),
+            backend === 'cli' ? leadingUserBlocks(out, 1)[0] : out.system.find((item) => item.text === block.text),
             block,
           )
           assert.equal(listCacheMarkers(out).length, 1)
-          assert.equal(messageMarkers(out).length, 0)
+          assert.equal(messageMarkers(out).length, backend === 'cli' ? 1 : 0)
         })
       }
     }
@@ -682,11 +695,7 @@ for (const [name, compatibility] of billingCases) {
       input: { system },
       compatibility: { persona_preset: 'official', ...compatibility },
     })
-    for (const block of system)
-      assert.deepEqual(
-        out.system.find((candidate) => candidate.text === block.text),
-        block,
-      )
+    assert.deepEqual(leadingUserBlocks(out, system.length), system)
     assert.equal(listCacheMarkers(out).length, 2)
     assert.equal(JSON.stringify(out).split('CALLER_RULE_MUST_SURVIVE').length - 1, 1)
   })
@@ -696,7 +705,7 @@ for (const [name, compatibility] of billingCases) {
       input: { system: 'CALLER_RULE_MUST_SURVIVE' },
       compatibility: { persona_preset: 'official', cache_ttl: '5m', ...compatibility },
     })
-    assert.ok(out.system.some((block) => block.text === 'CALLER_RULE_MUST_SURVIVE'))
+    assert.equal(leadingUserBlocks(out, 1)[0].text, 'CALLER_RULE_MUST_SURVIVE')
     const markers = listCacheMarkers(out)
     assert.equal(markers.length, 1)
     assert.equal(markers[0].section, 'messages')
@@ -718,7 +727,7 @@ test('zero without billing preserves caller boundary text and the omitted tool T
     input: { system, tools: [tool] },
     compatibility: { persona_block_presets: { zero: { billing: false } } },
   })
-  assert.deepEqual(out.system.slice(1), system)
+  assert.deepEqual(leadingUserBlocks(out, system.length), system)
   assert.deepEqual(out.tools[0].cache_control, control())
   assert.equal(listCacheMarkers(out).length, 1)
 })
@@ -744,7 +753,8 @@ for (const backend of ['cli', 'api']) {
       const user = out.messages.find((message) => message.role === 'user')
       const content =
         typeof user.content === 'string' ? user.content : user.content.map((block) => block.text || '').join('')
-      assert.ok(content.startsWith(`<system-reminder>\n${rule}\n</system-reminder>\n`))
+      // CLI: already relocated as plain leading text, so the template has nothing to wrap.
+      assert.ok(content.startsWith(backend === 'cli' ? rule : `<system-reminder>\n${rule}\n</system-reminder>\n`))
     })
   }
 }
@@ -821,7 +831,7 @@ for (const ttl of [undefined, '5m', '1h']) {
       const system = [text('Caller hour prefix', '1h')]
       const out = await outbound(t, { preset: 'zero', input: { system, messages, cache_control: control(ttl) } })
       assert.equal(out.cache_control, undefined)
-      assert.deepEqual(out.system.slice(1), system)
+      assert.deepEqual(leadingUserBlocks(out, system.length), system)
       const message = out.messages.findLast((message) => message.role === tail)
       assert.deepEqual(message.content.at(-1).cache_control, control(ttl))
       assert.equal(listCacheMarkers(out).length, 2)
@@ -836,7 +846,8 @@ test('CLI zero translates automatic cache within a full caller budget', async (t
     input: { system, cache_control: control('5m') },
     compatibility: { persona_templates: { zero: [...DEFAULT_PERSONA_TEMPLATES.zero, text('Template rule', '1h')] } },
   })
-  assert.deepEqual(out.system.slice(1), [text('Template rule', null), ...system])
+  assert.deepEqual(out.system[1], text('Template rule', null))
+  assert.deepEqual(leadingUserBlocks(out, system.length), system)
   assert.equal(listCacheMarkers(out).length, 4)
   assert.deepEqual(out.messages[0].content.at(-1).cache_control, control('5m'))
 })
@@ -850,9 +861,16 @@ test('CLI zero advances an automatic breakpoint as conversation history grows', 
       input: { system: [text('Stable caller prefix', '1h')], messages, cache_control: control('5m') },
     })
     const markers = listCacheMarkers(out).filter((marker) => marker.section === 'messages')
-    assert.equal(markers.length, 1)
-    assert.equal(markers[0].index, messages.length - 1)
-    assert.deepEqual(out.messages[markers[0].index].content.at(-1), text(`Question ${turn}`, '5m'))
+    // The relocated caller prefix keeps its own marker at the head of the first user turn.
+    assert.deepEqual(leadingUserBlocks(out, 1), [text('Stable caller prefix', '1h')])
+    assert.deepEqual(
+      markers.map((marker) => [marker.index, marker.blockIndex]),
+      [
+        [0, 0],
+        [messages.length - 1, out.messages[messages.length - 1].content.length - 1],
+      ],
+    )
+    assert.deepEqual(out.messages.at(-1).content.at(-1), text(`Question ${turn}`, '5m'))
     messages.push({ role: 'assistant', content: `Answer ${turn}` })
   }
 })
@@ -889,7 +907,11 @@ for (const backend of ['cli', 'api']) {
         persona_block_presets: { official: { caller_system: false } },
       },
     })
-    assert.ok(!JSON.stringify(out).includes(rule))
+    if (backend === 'cli') {
+      // Relocation runs before the persona, so the opt-out has no caller system left to drop.
+      assert.equal(JSON.stringify(out).split(rule).length - 1, 1)
+      assert.equal(leadingUserBlocks(out, 1)[0].text, rule)
+    } else assert.ok(!JSON.stringify(out).includes(rule))
   })
   run(`${backend} keeps edited official placement without appending a duplicate reminder`, async (t) => {
     const out = await outbound(t, {
@@ -901,7 +923,8 @@ for (const backend of ['cli', 'api']) {
       },
     })
     assert.equal(JSON.stringify(out).split(rule).length - 1, 1)
-    assert.ok(out.system.some((block) => block.text === `Custom: ${rule}`))
+    if (backend === 'cli') assert.equal(leadingUserBlocks(out, 1)[0].text, rule)
+    else assert.ok(out.system.some((block) => block.text === `Custom: ${rule}`))
   })
 }
 

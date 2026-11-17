@@ -15,10 +15,29 @@ test('moves the caller system into the first user message', () => {
   assert.equal(r.moved, true)
   assert.deepEqual(r.body.system, [{ type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }])
   assert.deepEqual(r.body.messages[0].content, [
-    { type: 'text', text: AGENT },
+    { type: 'text', text: AGENT, cache_control: { type: 'ephemeral' } },
     { type: 'text', text: 'hi' },
   ])
   assert.equal(body.system[0].text, AGENT, 'input is not mutated')
+})
+
+test('caller cache markers move with their blocks in order', () => {
+  const hour = { type: 'ephemeral', ttl: '1h' }
+  const r = relocateThirdPartySystem({
+    system: [
+      { type: 'text', text: AGENT, cache_control: hour },
+      { type: 'text', text: 'Second', extra: 'dropped' },
+      { type: 'text', text: 'Third', cache_control: { type: 'ephemeral' } },
+    ],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }] }],
+  })
+  assert.deepEqual(r.body.messages[0].content, [
+    { type: 'text', text: AGENT, cache_control: hour },
+    { type: 'text', text: 'Second' },
+    { type: 'text', text: 'Third', cache_control: { type: 'ephemeral' } },
+    { type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } },
+  ])
+  assert.equal(r.body.system[0].cache_control, undefined)
 })
 
 test('keeps array user content and later turns untouched', () => {
