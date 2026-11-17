@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import {
+  GPT_SEED_VERSION,
   getGptModelPolicy,
   isGptFastAliasAvailable,
   isGptModelEnabled,
@@ -183,9 +184,21 @@ test('panel save keeps the synced catalog; only a sync writes it', (t) => {
   assert.equal(getGptModelPolicy().models['gpt-7'].catalog, undefined)
 })
 
-test('new 6.2 catalog IDs require explicit enablement without invented capabilities', (t) => {
+test('the static fallback catalog ships the 6.2 series enabled', (t) => {
   withDb(t)
-  const id = 'gpt-6.2-astra'
+  assert.equal(isGptModelEnabled('gpt-6.2-astra'), true)
+  assert.equal(isGptModelEnabled('gpt-6.2-sol'), true)
+  const ids = listGptPolicyModels().map((m) => m.id)
+  assert.ok(ids.includes('gpt-6.2-astra'))
+  assert.ok(ids.includes('gpt-6.2-sol'))
+  // 6.2 sorts ahead of the 6.1 and 6 entries on the models page.
+  assert.ok(ids.indexOf('gpt-6.2-astra') < ids.indexOf('gpt-6.1-sol'))
+  assert.equal(getGptModelPolicy().seed_version, GPT_SEED_VERSION)
+})
+
+test('an id outside the fallback catalog still requires explicit enablement', (t) => {
+  withDb(t)
+  const id = 'gpt-6.2-not-in-account-catalog'
   syncGptIdsIntoPolicy([{ id, display_name: 'Account catalog model', catalog: {} }])
   assert.equal(isGptModelEnabled(id), false)
   assert.equal(getGptModelPolicy().models[id].capabilities.context_window, undefined)
@@ -194,5 +207,62 @@ test('new 6.2 catalog IDs require explicit enablement without invented capabilit
   loadGptModelPolicy({ force: true })
   syncGptIdsIntoPolicy([{ id, catalog: {} }])
   assert.equal(isGptModelEnabled(id), true)
-  assert.equal(isGptModelEnabled('gpt-6.2-not-in-account-catalog'), false)
+  assert.equal(isGptModelEnabled('gpt-7-unknown-to-the-catalog'), false)
+})
+
+test('a sync that confirms the 6.2 series keeps it enabled and takes the upstream catalog', (t) => {
+  withDb(t)
+  syncGptIdsIntoPolicy([
+    { id: 'gpt-6.2-astra', catalog: { context_window: 272000 } },
+    { id: 'gpt-6.2-sol', catalog: {} },
+  ])
+  const models = getGptModelPolicy().models
+  assert.equal(models['gpt-6.2-astra'].enabled, true)
+  assert.equal(models['gpt-6.2-sol'].enabled, true)
+  assert.equal(models['gpt-6.2-astra'].catalog.context_window, 272000)
+  assert.ok(models['gpt-6.2-astra'].catalog.synced_at)
+})
+
+test('a synced policy backfills the seed generation without reviving dropped ids', (t) => {
+  withDb(t)
+  new SettingsRepo().set('gpt_model_policy', {
+    version: 1,
+    source: 'codex',
+    models: { 'gpt-6-astra': { enabled: true } },
+  })
+  loadGptModelPolicy({ force: true })
+  const pol = getGptModelPolicy()
+  assert.equal(pol.models['gpt-6.2-astra'].enabled, true)
+  assert.equal(pol.models['gpt-6.2-sol'].enabled, true)
+  // 6.1 belongs to the previous seed generation; a sync dropped it on purpose.
+  assert.equal(pol.models['gpt-6.1-sol'], undefined)
+  assert.equal(pol.seed_version, GPT_SEED_VERSION)
+  assert.equal(new SettingsRepo().get('gpt_model_policy', null).seed_version, GPT_SEED_VERSION)
+})
+
+test('the backfill corrects a 6.2 row the old sync default had disabled, keeping upstream facts', (t) => {
+  withDb(t)
+  new SettingsRepo().set('gpt_model_policy', {
+    version: 1,
+    source: 'codex',
+    models: { 'gpt-6.2-astra': { enabled: false, catalog: { context_window: 9 } } },
+  })
+  loadGptModelPolicy({ force: true })
+  const row = getGptModelPolicy().models['gpt-6.2-astra']
+  assert.equal(row.enabled, true)
+  assert.equal(row.catalog.context_window, 9)
+})
+
+test('the backfill runs once; a policy already on this generation is left alone', (t) => {
+  withDb(t)
+  new SettingsRepo().set('gpt_model_policy', {
+    version: 1,
+    seed_version: GPT_SEED_VERSION,
+    source: 'codex',
+    models: { 'gpt-6-astra': { enabled: true } },
+  })
+  loadGptModelPolicy({ force: true })
+  const pol = getGptModelPolicy()
+  assert.equal(pol.models['gpt-6.2-astra'], undefined)
+  assert.equal(pol.models['gpt-6.2-sol'], undefined)
 })

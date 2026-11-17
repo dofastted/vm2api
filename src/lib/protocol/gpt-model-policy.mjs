@@ -8,6 +8,18 @@ import { IMAGE_TOOL_MODELS, canonicalImageToolModel } from './image-tool-models.
 
 const SETTINGS_KEY = 'gpt_model_policy'
 
+/** Generation of the static fallback catalog below. Stored policies without the field are gen 1. */
+export const GPT_SEED_VERSION = 2
+
+/**
+ * Ids each seed generation added over the previous one. The load-time migration touches only
+ * these, instead of merging the whole seed: a blanket merge would resurrect older seed models
+ * that an upstream sync legitimately dropped from the account catalog.
+ */
+const SEED_ADDITIONS = Object.freeze({
+  2: Object.freeze(['gpt-6.2-astra', 'gpt-6.2-sol']),
+})
+
 const CAP_GPT = {
   context_window: 272000,
   supports_1m: false,
@@ -125,6 +137,8 @@ function normalizeImageTools(raw, base = null) {
 export function seedGptPolicy() {
   const models = {}
   for (const [id, extra] of [
+    ['gpt-6.2-astra', { display_name: 'GPT-6.2 Astra', sort: 62 }],
+    ['gpt-6.2-sol', { display_name: 'GPT-6.2 Sol', sort: 63 }],
     ['gpt-6-astra', { display_name: 'GPT-6 Astra', sort: 66 }],
     ['gpt-6.1-sol', { display_name: 'GPT-6.1 Sol', sort: 67 }],
     [
@@ -145,12 +159,22 @@ export function seedGptPolicy() {
   }
   return {
     version: 1,
+    seed_version: GPT_SEED_VERSION,
     updated_at: new Date().toISOString(),
     source: 'seed',
     platform: 'openai',
     models,
     image_tools: normalizeImageTools(null),
   }
+}
+
+/** Seed ids that ship enabled. Computed from the seed so the two never drift apart. */
+function seedDefaultEnabledIds() {
+  const out = new Set()
+  for (const [id, row] of Object.entries(seedGptPolicy().models || {})) {
+    if (row?.enabled !== false) out.add(id.toLowerCase())
+  }
+  return out
 }
 
 let policy = seedGptPolicy()
@@ -162,6 +186,33 @@ function persist() {
   } catch (e) {
     console.warn('[gpt-model-policy] persist failed', e?.message || e)
   }
+}
+
+/**
+ * One-shot backfill of the ids a newer seed generation introduced, guarded by `seed_version`.
+ * A policy already synced from the account catalog (`source: 'codex'`) never merges the seed,
+ * so without this a shipped seed addition would stay invisible on every live instance.
+ * An id the stored policy already carries keeps its upstream `catalog` facts and only has its
+ * `enabled` corrected: before this generation that `false` was the system default for a freshly
+ * synced id, not an admin decision, and the two are indistinguishable in the stored data.
+ * @returns {boolean} true when the policy changed and must be persisted
+ */
+function applySeedAdditions(stored) {
+  const storedVersion = Number.isSafeInteger(stored?.seed_version) ? stored.seed_version : 1
+  // Only reachable with an explicit marker at or past this generation, which the policy spread
+  // already carried over. Leave it alone so a rollback/forward cycle cannot re-run the backfill.
+  if (storedVersion >= GPT_SEED_VERSION) return false
+  const seed = seedGptPolicy()
+  for (let version = storedVersion + 1; version <= GPT_SEED_VERSION; version++) {
+    for (const id of SEED_ADDITIONS[version] || []) {
+      const seedRow = seed.models[id]
+      if (!seedRow) continue
+      if (policy.models[id]) policy.models[id].enabled = seedRow.enabled !== false
+      else policy.models[id] = { ...seedRow }
+    }
+  }
+  policy.seed_version = GPT_SEED_VERSION
+  return true
 }
 
 export function loadGptModelPolicy({ force = false } = {}) {
@@ -187,6 +238,7 @@ export function loadGptModelPolicy({ force = false } = {}) {
       )
       policy.image_tools = normalizeImageTools(stored.image_tools)
       policy.source = policy.source || 'settings'
+      if (applySeedAdditions(stored)) persist()
     } else {
       policy = seedGptPolicy()
       persist()
@@ -229,6 +281,8 @@ export function saveGptModelPolicy(next) {
     models,
     image_tools: normalizeImageTools(next?.image_tools, currentImageTools),
     platform: 'openai',
+    // The panel body may carry a stale marker; a save never un-applies a seed generation.
+    seed_version: GPT_SEED_VERSION,
     updated_at: new Date().toISOString(),
     source: 'panel',
   }
@@ -310,6 +364,7 @@ export function syncGptIdsIntoPolicy(ids = [], { displayNameOf = null } = {}) {
   }
   const next = {}
   const added = []
+  const seedEnabled = seedDefaultEnabledIds()
   for (const row of live) {
     const prev = policy.models[row.id]
     if (!prev) added.push(row.id)
@@ -319,7 +374,9 @@ export function syncGptIdsIntoPolicy(ids = [], { displayNameOf = null } = {}) {
       capabilities: prev?.capabilities || {},
       params: prev?.params || {},
       display_name: row.display_name || prev?.display_name || displayNameOf?.(row.id) || row.id,
-      enabled: prev ? prev.enabled !== false : false,
+      // An id the static fallback catalog ships enabled stays schedulable the moment the
+      // account catalog confirms it. An id outside that catalog waits for the admin.
+      enabled: prev ? prev.enabled !== false : seedEnabled.has(row.id.toLowerCase()),
       source: 'codex',
     })
     // Upstream catalog facts replace the previous snapshot; a sync without them keeps it.
