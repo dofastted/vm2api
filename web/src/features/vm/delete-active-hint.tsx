@@ -1,6 +1,8 @@
 import type { Vm } from '@/types/panel-vm'
+import { Checkbox } from '@/components/ui/checkbox'
 import { SlotIdentity } from '@/components/platform-chip'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
+import type { NodeGone } from '@/features/vm/delete-vm'
 
 export function DeleteActiveVmHint({ target, vms }: { target: Vm; vms: Vm[] }) {
   const plan = planDeleteActiveVm(target, vms)
@@ -36,5 +38,33 @@ export function DeleteActiveVmHint({ target, vms }: { target: Vm; vms: Vm[] }) {
         </span>
       </p>
     </>
+  )
+}
+
+/** 槽所在节点不在或连不上时才出现；勾上后删除不再去节点上清理容器。 */
+export function NodeGoneDeleteOption({
+  gone,
+  checked,
+  onCheckedChange,
+}: {
+  gone: NodeGone | null
+  checked: boolean
+  onCheckedChange: (checked: boolean) => void
+}) {
+  if (!gone) return null
+  return (
+    <div>
+      <label className='flex items-center gap-2 text-sm'>
+        <Checkbox
+          checked={checked}
+          onCheckedChange={(next) => onCheckedChange(next === true)}
+        />
+        节点不可达：只删除面板记录，节点上的容器不清理
+      </label>
+      <p className='mt-2 text-sm text-muted-foreground'>
+        {gone === 'missing' ? '节点已不在集群列表里。' : '节点当前连不上。'}
+        删除前服务端会再连一次节点，连得上就拒绝，请改用普通删除。
+      </p>
+    </div>
   )
 }

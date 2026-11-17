@@ -41,10 +41,13 @@ import {
   forwardOut,
   forwardOutStreamLocal,
   privateKeyProblem,
+  READY_TIMEOUT_MS,
   SshLink,
 } from './ssh-link.mjs'
 
 export const HEALTH_INTERVAL_MS = 30_000
+// Outlasts one SSH handshake, so a slow node settles before it is called gone.
+export const NODE_GONE_CHECK_MS = READY_TIMEOUT_MS + 5_000
 export const SHELL_TICKET_TTL_MS = 30_000
 export const LOCAL_STATUS_TTL_MS = 30_000
 // A failed gate dial sends that node's slot traffic over SSH until the next good health ping or this long.
@@ -954,6 +957,26 @@ export class ClusterManager {
       throw new ClusterError(409, 'node_not_ready', `节点未连接（${link.state}）${detail}`)
     }
     return link.snapshot()
+  }
+
+  /**
+   * Gate for deleting a slot without touching its node: the node record is gone, or a
+   * fresh connect attempt failed and no direct link answers. Otherwise 409 node_reachable.
+   */
+  async confirmNodeUnreachable(id, timeoutMs = NODE_GONE_CHECK_MS) {
+    const link = this.links.get(id)
+    if (!link || !this.repo.get(id)) return { state: 'missing', error: null }
+    if (!this._directHealthy(id)) {
+      await this.ensureLinkReady(id, timeoutMs).catch((err) => {
+        if (err.code !== 'node_not_ready') throw err
+      })
+      if (link.state === 'backoff' || link.state === 'error') {
+        return { state: link.state, error: link.error?.code || null }
+      }
+    }
+    const message =
+      link.state === 'connecting' ? '节点仍在连接中，稍后再试' : '节点仍可连接，请用普通删除清理节点上的容器'
+    throw new ClusterError(409, 'node_reachable', message)
   }
 
   /**

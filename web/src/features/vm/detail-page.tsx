@@ -66,9 +66,14 @@ import {
   type DeleteActiveVmPlan,
 } from '@/features/vm/active-vm'
 import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
-import { DeleteActiveVmHint } from '@/features/vm/delete-active-hint'
+import {
+  DeleteActiveVmHint,
+  NodeGoneDeleteOption,
+} from '@/features/vm/delete-active-hint'
 import {
   completeVmDeletion,
+  useNodeGone,
+  vmDeletePath,
   type VmDeleteResult,
 } from '@/features/vm/delete-vm'
 import { VmAccountTab } from '@/features/vm/detail-account-tab'
@@ -171,6 +176,7 @@ function VmDetailBody({
 
   const [bindId, setBindId] = useState('')
   const [confirmDel, setConfirmDel] = useState(false)
+  const [forceDel, setForceDel] = useState(false)
   const [confirmReset, setConfirmReset] = useState(false)
   const [resetMode, setResetMode] = useState<'keep' | 'traits'>('keep')
   const [resetInput, setResetInput] = useState('')
@@ -328,15 +334,16 @@ function VmDetailBody({
     },
   })
   const deletePlan: DeleteActiveVmPlan = planDeleteActiveVm(vm, slotList)
+  const nodeGone = useNodeGone(confirmDel ? vm : null)
   const remove = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (force: boolean) => {
       if (deletePlan.kind === 'switch') {
         await api(
           `/api/panel/vms/${encodeURIComponent(deletePlan.replacement.id)}/activate`,
           { method: 'POST' }
         )
       }
-      return api<VmDeleteResult>(`/api/panel/vms/${encodeURIComponent(id)}`, {
+      return api<VmDeleteResult>(vmDeletePath(id, force), {
         method: 'DELETE',
       })
     },
@@ -709,7 +716,10 @@ function VmDetailBody({
         </Tabs>
         <ConfirmDialog
           open={confirmDel}
-          onOpenChange={setConfirmDel}
+          onOpenChange={(open) => {
+            setConfirmDel(open)
+            if (!open) setForceDel(false)
+          }}
           title={`删除 ${id}`}
           desc={
             <>
@@ -724,10 +734,16 @@ function VmDetailBody({
           isLoading={remove.isPending}
           handleConfirm={() => {
             if (!remove.isPending && deletePlan.kind !== 'blocked') {
-              remove.mutate()
+              remove.mutate(forceDel && !!nodeGone)
             }
           }}
-        />
+        >
+          <NodeGoneDeleteOption
+            gone={nodeGone}
+            checked={forceDel}
+            onCheckedChange={setForceDel}
+          />
+        </ConfirmDialog>
         <ConfirmDialog
           open={confirmReset}
           onOpenChange={(open) => {
