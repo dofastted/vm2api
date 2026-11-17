@@ -6,6 +6,7 @@ import {
   isCompleteAssistantMessage,
   isClientCancelledResult,
   isIncompleteAssistantMessage,
+  isThirdPartyClientMessage,
   isUnanswerablePromptMessage,
   isWrapConnectionError,
   ErrorCode,
@@ -433,6 +434,18 @@ function classifyUpstreamResultRaw(
       scope: 'request',
       action: 'stop',
       reason: code || workerCode,
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
+  // The caller is a third-party client and the seat has no extra usage.
+  // Every seat without extra usage answers the same and one with it bills
+  // money, so stop here; the seat itself is fine, so no cooldown, no cache.
+  if (isThirdPartyClientMessage(message) || isThirdPartyClientMessage(hay)) {
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: 'third_party_client',
       cooldownUntil: null,
       retrySameAccount: false,
     }

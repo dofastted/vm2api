@@ -90,6 +90,7 @@ export const ErrorCode = {
   DISTILL_BLOCKED: 'distill_blocked',
   REFUSAL_GUARD: 'refusal_guard',
   CONTENT_FILTER_REFUSAL: 'content_filter_refusal',
+  THIRD_PARTY_CLIENT: 'third_party_client',
   POLICY_BLOCKED: 'policy_blocked',
   // resource
   VM_NOT_FOUND: 'vm_not_found',
@@ -152,8 +153,9 @@ const POOL_CAPACITY_MESSAGE = /no eligible|no ready api|account pool|号池没�
 const WRAP_CONNECTION_MESSAGE = /provider error:.*connection error/i
 const USAGE_POLICY_MESSAGE =
   /usage policy|legal\/aup|unable to respond to this request|violate our usage|content_filter_refusal/i
-// Billing refusal, not a content violation and not "extra usage required".
-const UNANSWERABLE_PROMPT_MESSAGE = /third[-\s]?party apps now draw from|no third[-\s]?party apps(?:\s+are)?\s+allowed/i
+// Anthropic bills a non-Claude-Code client against extra usage and refuses it
+// when the seat has none. A client/billing rejection, not a content refusal.
+const THIRD_PARTY_CLIENT_MESSAGE = /third[-\s]?party apps now draw from|no third[-\s]?party apps(?:\s+are)?\s+allowed/i
 
 export function isWrapConnectionError(message = '') {
   return WRAP_CONNECTION_MESSAGE.test(String(message || ''))
@@ -163,10 +165,35 @@ export function isUsagePolicyErrorMessage(message = '') {
   return USAGE_POLICY_MESSAGE.test(String(message || ''))
 }
 
-/** Usage Policy text, or a 400/503 the upstream will not answer for this prompt. */
+/** Usage Policy text the upstream will not answer for this prompt. */
 export function isUnanswerablePromptMessage(message = '') {
+  return USAGE_POLICY_MESSAGE.test(String(message || ''))
+}
+
+/** "Third-party apps now draw from your extra usage": the caller is not Claude Code. */
+export function isThirdPartyClientMessage(message = '') {
   const text = String(message || '')
-  return USAGE_POLICY_MESSAGE.test(text) || UNANSWERABLE_PROMPT_MESSAGE.test(text)
+  return THIRD_PARTY_CLIENT_MESSAGE.test(text) && !USAGE_POLICY_MESSAGE.test(text)
+}
+
+export const THIRD_PARTY_CLIENT_CLIENT_MESSAGE =
+  'Anthropic 将此请求识别为第三方客户端（非 Claude Code）调用：订阅额度不覆盖第三方客户端，只能扣 extra usage，上游因此拒绝。这不是内容拒答，换号重试也一样；请改用 Claude Code 客户端，或换用支持第三方客户端的渠道。'
+
+/** Non-retryable client error that keeps the upstream sentence. */
+export function makeThirdPartyClientError({ requestId, upstreamMessage, upstreamType, upstreamStatus } = {}) {
+  return makeError({
+    type: ErrorType.INVALID_REQUEST,
+    code: ErrorCode.THIRD_PARTY_CLIENT,
+    message: THIRD_PARTY_CLIENT_CLIENT_MESSAGE,
+    status: 400,
+    details: {
+      upstream_message: String(upstreamMessage || '').slice(0, 300),
+      upstream_type: upstreamType,
+      upstream_status: upstreamStatus,
+      retryable: false,
+    },
+    request_id: requestId,
+  })
 }
 
 export const REFUSAL_GUARD_MESSAGE =
@@ -566,6 +593,14 @@ export function mapUpstreamError(status, body, headers = {}) {
         ...(body?.error?.upstream_code ? { upstream_code: body.error.upstream_code } : {}),
       },
       request_id,
+    })
+  }
+  if (isThirdPartyClientMessage(msg)) {
+    return makeThirdPartyClientError({
+      requestId: request_id,
+      upstreamMessage: msg,
+      upstreamType: upType,
+      upstreamStatus: status,
     })
   }
   if (isUnanswerablePromptMessage(msg)) {

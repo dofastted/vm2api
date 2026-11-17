@@ -42,6 +42,7 @@ export function decisionOrigin(policy = {}) {
     policy.reason === 'content_filter_refusal' ||
     policy.reason === 'content_policy_refusal' ||
     policy.reason === 'usage_policy_refusal' ||
+    policy.reason === 'third_party_client' ||
     policy.reason === 'client_cancelled'
   )
     return 'client'
