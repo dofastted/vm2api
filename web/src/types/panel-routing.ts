@@ -96,6 +96,7 @@ export type RefusalDeviceBlock = {
 export type RiskAuditPolicy = {
   ban_steps: number[]
   blocked_tools: { name: string; message: string }[]
+  block_system_prompt_rewrite: boolean
   upstream_policy_phrases: string[]
   downgrade_pool: string
   downgrade_endpoint: string

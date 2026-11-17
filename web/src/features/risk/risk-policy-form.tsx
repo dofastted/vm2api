@@ -24,10 +24,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import { apiEndpointsQueryOptions } from '@/features/api-endpoints/queries'
 import { vmPoolsQueryOptions } from '@/features/keys/vm-pools-card'
 import { modelsQueryOptions } from '@/features/models/queries'
-import { Group } from './blocks'
+import { Group, ToggleItem, ToggleList } from './blocks'
 import {
   endpointOptions,
   modelOptions,
@@ -352,6 +353,21 @@ export function RiskPolicyForm({
                     每条工具规则都需要拒绝提示。
                   </p>
                 )}
+              </Group>
+              <Group title='系统提示词'>
+                <ToggleList>
+                  <ToggleItem
+                    label='拦截改写或绕过'
+                    desc='命中后返回 400 并计入封禁。关闭后这类请求继续走后续关卡。'
+                  >
+                    <Switch
+                      checked={draft.block_system_prompt_rewrite !== false}
+                      onCheckedChange={(checked) =>
+                        change('block_system_prompt_rewrite', checked)
+                      }
+                    />
+                  </ToggleItem>
+                </ToggleList>
               </Group>
 
               <details

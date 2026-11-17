@@ -30,6 +30,7 @@ export const DEFAULT_BAN_STEPS = Object.freeze([10, 1440, 0])
 const DEFAULT_RISK_POLICY = Object.freeze({
   ban_steps: DEFAULT_BAN_STEPS,
   blocked_tools: [],
+  block_system_prompt_rewrite: true,
   upstream_policy_phrases: [],
   downgrade_pool: '',
   downgrade_endpoint: '',
@@ -397,6 +398,7 @@ function validateRiskPolicy(policy) {
     )
   )
     problems.push('工具规则需要精确工具名和错误提示，最多 100 条')
+  if (typeof policy.block_system_prompt_rewrite !== 'boolean') problems.push('block_system_prompt_rewrite 必须是布尔')
   if (
     !Array.isArray(policy.upstream_policy_phrases) ||
     policy.upstream_policy_phrases.length > 30 ||

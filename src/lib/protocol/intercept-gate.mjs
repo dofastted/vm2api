@@ -252,20 +252,24 @@ export async function evaluateProtocolIntercept({
         reason: `blocked_tool:${tool.name}`,
       })
     }
-    rawDocument = jevDocument(inbound, body, { ...interceptOpts, keepPromptReminders: true })
-    const system = systemRewrite(prepareInterceptText(rawDocument, { stripReminders: false, stripEnvironment: false }))
-    if (system) {
-      const error = hardPolicyError(requestId, 'system_prompt_rewrite_blocked', '不允许改写或绕过系统提示词。')
-      return reject({
-        kind: 'hard_regex',
-        via: 'hard-regex',
-        final_state: 'policy_blocked',
-        error,
-        intercept: gateVerdict({ kind: 'block', by: 'hard-regex', keyword: system, rule: 'system_prompt_rewrite' }),
-        banDevice: true,
-        forceDeviceBan: true,
-        reason: 'system_prompt_rewrite',
-      })
+    if (audit?.block_system_prompt_rewrite !== false) {
+      rawDocument = jevDocument(inbound, body, { ...interceptOpts, keepPromptReminders: true })
+      const system = systemRewrite(
+        prepareInterceptText(rawDocument, { stripReminders: false, stripEnvironment: false }),
+      )
+      if (system) {
+        const error = hardPolicyError(requestId, 'system_prompt_rewrite_blocked', '不允许改写或绕过系统提示词。')
+        return reject({
+          kind: 'hard_regex',
+          via: 'hard-regex',
+          final_state: 'policy_blocked',
+          error,
+          intercept: gateVerdict({ kind: 'block', by: 'hard-regex', keyword: system, rule: 'system_prompt_rewrite' }),
+          banDevice: true,
+          forceDeviceBan: true,
+          reason: 'system_prompt_rewrite',
+        })
+      }
     }
   }
   const routeTarget = backend === 'api' ? audit?.downgrade_endpoint : audit?.downgrade_pool
