@@ -1,4 +1,14 @@
-/** Shared public OAuth protocol constants. Secret exchange code stays in the local-only auth service bundle. */
+/**
+ * Shared public OAuth protocol constants. Secret exchange code stays in the
+ * local-only auth service bundle (`src/lib/oauth/auth.js`, git-ignored as
+ * "not part of the published tree").
+ *
+ * This module stays a leaf to avoid the vm-identity cycle (oauth-contract →
+ * vm-identity → oauth-credentials → oauth-identity → oauth-contract), so the CLI
+ * User-Agent is NOT built here: callers take `officialClaudeCliUa` from
+ * `identity/vm-identity.mjs`, which owns `OFFICIAL_CLI_VERSION`. A hand-synced
+ * literal here had drifted to 2.1.303.
+ */
 export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 export const REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback'
 export const CLAUDE_WEB = 'https://claude.ai'
@@ -11,9 +21,6 @@ export const FULL_OAUTH_SCOPE =
   'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
 export const BROWSER_AUTHORIZE_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
-/** Keep in lockstep with OFFICIAL_CLI_VERSION; this module stays a leaf to avoid the vm-identity cycle. */
-export const TOKEN_UA = 'claude-cli/2.1.303 (external, sdk-cli)'
-export const BOOTSTRAP_UA = TOKEN_UA
 export const BETA_OAUTH = 'oauth-2025-04-20'
 
 export const OFFICIAL_CLI_HEADERS = Object.freeze({

@@ -4,8 +4,8 @@
  * This is part of ticket exchange, not official Claude Code first-run.
  */
 import { makeProxyFetch } from '../protocol/codex-models.mjs'
-import { OFFICIAL_STAINLESS } from '../identity/vm-identity.mjs'
-import { BETA_OAUTH, BOOTSTRAP_UA, BOOTSTRAP_URL } from './oauth-contract.mjs'
+import { officialClaudeCliUa, OFFICIAL_STAINLESS } from '../identity/vm-identity.mjs'
+import { BETA_OAUTH, BOOTSTRAP_URL } from './oauth-contract.mjs'
 
 export const CLAUDE_CLI_BOOTSTRAP_URL = BOOTSTRAP_URL
 
@@ -140,7 +140,9 @@ export function bootstrapRequestHeaders(accessToken) {
   return {
     accept: 'application/json',
     authorization: `Bearer ${String(accessToken || '').trim()}`,
-    'user-agent': BOOTSTRAP_UA,
+    // The CLI's own entrypoint, pinned to OFFICIAL_CLI_VERSION rather than a
+    // hand-synced literal that had drifted to 2.1.303.
+    'user-agent': officialClaudeCliUa(undefined, 'cli'),
     'anthropic-beta': BETA_OAUTH,
     'anthropic-version': '2023-06-01',
     'x-stainless-lang': OFFICIAL_STAINLESS.stainless_lang,

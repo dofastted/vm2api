@@ -15,7 +15,8 @@ import {
   resetAuthUrlSessions,
 } from '../../src/lib/oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth } from '../../src/lib/oauth/cookie-auth.mjs'
-import { CLIENT_ID, FULL_OAUTH_SCOPE, REDIRECT_URI, TOKEN_UA } from '../../src/lib/oauth/oauth-contract.mjs'
+import { CLIENT_ID, FULL_OAUTH_SCOPE, REDIRECT_URI } from '../../src/lib/oauth/oauth-contract.mjs'
+import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
 import { prepareSlotOAuth, runGuestOAuthAuthService } from '../../src/lib/oauth/guest-oauth-helper.mjs'
 import { slotExec } from '../../src/lib/vm/slot-runtime.mjs'
 
@@ -292,6 +293,12 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       assert.equal(Object.hasOwn(token.payload, 'expires_in'), false)
       assert.equal(bootstrap.headers.authorization, `Bearer ${accessToken}`)
       assert.equal(bootstrap.headers.cookie, undefined)
+      // Both token-bearing stages are the CLI itself: the version follows
+      // OFFICIAL_CLI_VERSION, and the entrypoint is the TUI one (`sdk-cli` is
+      // `--print`, which an OAuth exchange never is).
+      for (const request of [token, bootstrap]) {
+        assert.equal(request.headers['user-agent'], `claude-cli/${OFFICIAL_CLI_VERSION} (external, cli)`)
+      }
     })
   }
   assert.equal(tokenRequests, 3)
@@ -326,6 +333,10 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       for (const request of [orgs, authorize]) {
         assert.equal(request.headers.cookie, `sessionKey=${sessionKey}`)
         assert.match(request.headers['user-agent'], /Chrome\/146\.0\.0\.0/)
+      }
+      // The cookie stages pass as a browser; the token-bearing ones as the CLI.
+      for (const request of [token, bootstrap]) {
+        assert.equal(request.headers['user-agent'], `claude-cli/${OFFICIAL_CLI_VERSION} (external, cli)`)
       }
       assert.equal(authorize.payload.response_type, 'code')
       assert.equal(authorize.payload.client_id, CLIENT_ID)
