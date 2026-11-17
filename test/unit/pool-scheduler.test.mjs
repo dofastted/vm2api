@@ -1590,7 +1590,14 @@ test('with pool.fable_requires_max and only pro slots, fable returns fable_requi
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   writeTier(root, 'vm-01', 'pro')
   writeTier(root, 'vm-02', 'pro')
-  const selected = await scheduler(root, { config: { fable_requires_max: true } }).selectAndReserve({
+  const accountQuota = {
+    canAccept: () => ({ ok: true }),
+    repo: { get: () => ({ unified: { model_denied_until: { 'claude-fable-5': Date.now() + 60_000 } } }) },
+  }
+  const selected = await scheduler(root, {
+    accountQuota,
+    config: { fable_requires_max: true },
+  }).selectAndReserve({
     model: 'claude-fable-5',
     allowWait: false,
   })

@@ -153,11 +153,13 @@ export function slotAllowsModel({ vm, account = null, model, fableRequiresMax = 
     return { ok: false, reason: 'claude_model_required' }
   }
   const canonical = resolvePolicyModelId(modelKey) || modelKey
-  const deniedUntil = Number(account?.unified?.model_denied_until?.[canonical]) || 0
-  if (deniedUntil > Date.now()) return { ok: false, reason: 'model_not_supported' }
+  // Before the per-account denial: a Pro slot is out for the plan, which is
+  // what the caller should hear, whatever else was recorded on it.
   if (fableRequiresMax && isFableModel(modelKey) && resolveSlotTier(vm, account) !== 'max') {
     return { ok: false, reason: 'fable_requires_max' }
   }
+  const deniedUntil = Number(account?.unified?.model_denied_until?.[canonical]) || 0
+  if (deniedUntil > Date.now()) return { ok: false, reason: 'model_not_supported' }
   const allowed = normalizeAllowedModels(vm?.policy?.allowed_models)
   if (allowed && !modelMatchesAllowlist(modelKey, allowed)) {
     return { ok: false, reason: 'model_not_allowed' }
