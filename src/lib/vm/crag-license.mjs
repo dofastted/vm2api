@@ -457,8 +457,6 @@ const UNIVERSAL_WRAP = Buffer.from('CRAG-UNIVERSAL-WRAP-V1\0')
 const UNIVERSAL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const MAX_SUBSCRIPTION_TOKEN_BYTES = 8192
 const MAX_HOST_ROSTER_ENTRIES = 10000
-// A host may redeem many vouchers; each keeps its own seats and its own expiry.
-const MAX_HOST_GRANT_ENTRIES = 10000
 export const MAX_CRAG_HOST_ENTITLEMENT_BYTES = 1536 * 1024
 
 function exactKeys(value, keys) {
@@ -547,10 +545,7 @@ function subscriptionInteger(value, minimum, maximum) {
 }
 
 function authenticateSubscription(code, prefix, publicKey) {
-  // A nonzero nested limit is what lets subscriptionJson parse an array of
-  // objects at all, so v2 rosters and v3 grant ladders both need one.
-  const nested = prefix === 'CRAGH2' ? MAX_HOST_ROSTER_ENTRIES : prefix === 'CRAGH3' ? MAX_HOST_GRANT_ENTRIES : 0
-  const maxBytes = nested ? MAX_CRAG_HOST_ENTITLEMENT_BYTES : MAX_SUBSCRIPTION_TOKEN_BYTES
+  const maxBytes = prefix === 'CRAGH2' ? MAX_CRAG_HOST_ENTITLEMENT_BYTES : MAX_SUBSCRIPTION_TOKEN_BYTES
   if (typeof code !== 'string' || code.length > maxBytes || Buffer.byteLength(code) > maxBytes) fail()
   const parts = code.split('.')
   if (parts.length !== 3 || parts[0] !== prefix) fail()
@@ -559,19 +554,17 @@ function authenticateSubscription(code, prefix, publicKey) {
     !crypto.verify(null, Buffer.concat([Buffer.from(`${prefix}\0`), raw]), publicKey, decodeLicenseBytes(parts[2], 64))
   )
     fail()
-  return subscriptionJson(raw, nested)
+  return subscriptionJson(raw, prefix === 'CRAGH2' ? MAX_HOST_ROSTER_ENTRIES : 0)
 }
 
 function hostEntitlement(code, hostId, publicKey) {
-  const granted = typeof code === 'string' && code.startsWith('CRAGH3.')
   const rosterRequired = typeof code === 'string' && code.startsWith('CRAGH2.')
-  const claims = authenticateSubscription(code, granted ? 'CRAGH3' : rosterRequired ? 'CRAGH2' : 'CRAGH1', publicKey)
-  const keys = ['version', 'product', 'host_id', 'revision', 'issued_at', 'expires_at']
-  keys.push(granted ? 'grants' : 'slot_limit')
+  const claims = authenticateSubscription(code, rosterRequired ? 'CRAGH2' : 'CRAGH1', publicKey)
+  const keys = ['version', 'product', 'host_id', 'revision', 'issued_at', 'expires_at', 'slot_limit']
   if (rosterRequired) keys.push('roster')
   exactKeys(claims, keys)
   if (
-    claims.version !== (granted ? 3 : rosterRequired ? 2 : 1) ||
+    claims.version !== (rosterRequired ? 2 : 1) ||
     claims.product !== 'crag-v2' ||
     !hex(claims.host_id) ||
     claims.host_id.length !== 64
@@ -580,30 +573,8 @@ function hostEntitlement(code, hostId, publicKey) {
   subscriptionInteger(claims.revision, 1, 9223372036854775807n)
   subscriptionInteger(claims.issued_at, 0, 9223372036854775807n)
   subscriptionInteger(claims.expires_at, 0, 9223372036854775807n)
-  // A v3 ladder whose every voucher has lapsed is signed on purpose, so that a
-  // holder can read it and see the subscription expired. Its window therefore
-  // legitimately ends before it was issued.
-  if (!granted && claims.expires_at <= claims.issued_at) fail()
-  if (granted) {
-    if (!Array.isArray(claims.grants) || claims.grants.length === 0 || claims.grants.length > MAX_HOST_GRANT_ENTRIES)
-      fail()
-    let previousExpiry = 0
-    claims.grants = Object.freeze(
-      claims.grants.map((entry) => {
-        exactKeys(entry, ['slots', 'expires_at'])
-        // Strictly ascending, so same-expiry vouchers are already merged and the
-        // ladder has one unambiguous step per expiry.
-        subscriptionInteger(entry.expires_at, previousExpiry + 1, 9223372036854775807n)
-        if (entry.slots !== 'unlimited') subscriptionInteger(entry.slots, 1, 2147483647)
-        previousExpiry = entry.expires_at
-        return Object.freeze({ ...entry })
-      }),
-    )
-    // The last voucher defines the signed window.
-    if (claims.expires_at !== previousExpiry) fail()
-  } else if (claims.slot_limit !== 'unlimited') {
-    subscriptionInteger(claims.slot_limit, 1, 2147483647)
-  }
+  if (claims.expires_at <= claims.issued_at) fail()
+  if (claims.slot_limit !== 'unlimited') subscriptionInteger(claims.slot_limit, 1, 2147483647)
   if (rosterRequired) {
     if (!Array.isArray(claims.roster)) fail()
     const digests = new Set()
@@ -647,22 +618,6 @@ export function verifyCragHostEntitlement(projectRoot, code, hostId, { allowExpi
     if (error instanceof CragLicenseError) throw error
     fail()
   }
-}
-
-/// Seats a host actually has at `now`.
-///
-/// v1 and v2 carry a single ceiling. A v3 ladder is summed over the vouchers
-/// that have not lapsed, with unlimited absorbing any finite total, so a holder
-/// reaches the same answer the authority would without contacting it.
-export function effectiveCragHostSlots(claims, now = Math.floor(Date.now() / 1000)) {
-  if (!claims?.grants) return claims?.slot_limit
-  let total = 0
-  for (const grant of claims.grants) {
-    if (grant.expires_at <= now) continue
-    if (grant.slots === 'unlimited') return 'unlimited'
-    total += grant.slots
-  }
-  return Math.min(total, 2147483647)
 }
 
 function subscriptionSlot(vm) {

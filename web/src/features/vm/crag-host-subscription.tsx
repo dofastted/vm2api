@@ -2,7 +2,7 @@ import { useId, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
-import { CragGrantLadder, CragRuntimeCounts } from './crag-runtime-counts'
+import { CragRuntimeCounts } from './crag-runtime-counts'
 import {
   cragHostStatusQueryOptions,
   vmCragLicenseQueryOptions,
@@ -99,7 +99,6 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
         </Button>
       </div>
       <CragRuntimeCounts status={host.isError ? undefined : status} />
-      <CragGrantLadder status={host.isError ? undefined : status} />
       {host.isError ? (
         <p role='alert' className='text-sm text-destructive'>
           读取失败。请刷新订阅后重试。

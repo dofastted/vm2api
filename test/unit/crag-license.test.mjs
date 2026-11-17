@@ -256,9 +256,7 @@ test('purchase activation binds the slot and pinned installs reuse or preserve i
       assert.match(init.headers.authorization, /^Bearer /)
       if (action === 'redeem') {
         assert.equal(body.redemption_code, registration_code)
-        // The client declares the highest ladder version it can verify; this mock
-        // still answers with v2, so the field is a ceiling and not a demand.
-        assert.deepEqual(Object.keys(body).sort(), ['entitlement_version', 'host_id', 'redemption_code'])
+        assert.deepEqual(Object.keys(body).sort(), ['host_id', 'redemption_code'])
         accepted ??= issueHostEntitlement(root, body.host_id, { slot_limit: 1, version: 2, roster: [] })
         accepted.code = signSubscriptionBytes(root, 'CRAGH2', JSON.stringify(accepted.claims))
       }
