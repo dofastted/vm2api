@@ -2,7 +2,15 @@
 
 ## Unreleased
 
+## 1.4.133 — 2026-11-17 · CRAG 面板与 Responses 续轮
+
+- 面板为原生 CRAG 规范化内嵌 `image_url`（含工具结果），保留内容顺序和缓存标记；无法保真的输入在面板返回 400。合规长历史由 4 次重建降为 1 次重建加 3 次校验复用。
+- 删除 CRAG 槽、单槽或批量切回 cli-node、以及内核安装都会释放宿主订阅席位，避免已删除或已切走的槽继续占用名册。
+- 面板可开关 CRAG 原生遥测：停机槽只发布设置；需要生效时先排空，再重启内核并恢复原调度。区分已生效和已验证上传。非 CRAG 槽的发送状态与日志展示不变。
+- `/v1/responses` 转 Claude 时保留调用方工具的 `eager_input_streaming`，恢复消息级 `cache_control`，中途 developer 消息的缓存断点留在原位。
+- 调度原因表补上 `license_crag_host_over_quota`（受限 · 宿主订阅满额）。
 - 修复 KVM 来宾内核退出时误删 `/run/kin-guest/slot.env`、导致已校验的 CRAG 许可同步返回 403 的问题。已有来宾需更新 `kin-kernel.service` 并从原 seed 重新运行 `kin-guest-setup.service` 后再同步；无需重置虚拟机或重新签发许可。
+- 沿用现有签名载荷，不需要 `wrap-cli/sync` 或重装 CRAG 槽。控制面与面板需更新到本版。
 
 ## 1.4.132 — 2026-11-17 · 已安装 CRAG 槽更新
 
