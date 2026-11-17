@@ -20,3 +20,14 @@
 - 可使用非 root 账号运行 `bash test/deploy/gemini-host-egress-smoke.sh /absolute/path/kin-egress`，在一次性 Linux 命名空间用 `iptables` 模拟 Docker 的默认转发丢弃策略，检查选定 SOCKS5 的透明转发、转发器退出后失败和网络清理。该测试不访问 Google 或主机代理池。
 - 有测试签名产物时，可在带 Node 和 Python 的一次性 Linux amd64 容器内以 root 运行 `bash test/deploy/gemini-host-install-smoke.sh /path/to/signed-payload /path/to/public-key`。禁用容器网络即可验证 Unix socket 启动、签名失败不建环境、首次创建自动安装和重启持久化。
 - 管理员可生成 `Gemini · CRAGAnti` 专用密钥，只能访问 Gemini 会话入口及密钥查询，不会落入 Claude、Codex 或 API 直连。当前二进制的推理桥仅验收过 Gemini API Key provider；即使 Google OAuth 已授权，`/v1/gemini/sessions` 也会返回 `gemini_runtime_not_supported`，不会分配会话或扣费。对外推理还需支持 OAuth 的载荷及逐回合可核销的官方结算；不把订阅等级、Token 数或余额变化当成实扣凭证。
+
+## 协议参考与原生边界
+
+| 参考 | vm2api 取舍 |
+| --- | --- |
+| Sub2API 把 Anthropic Messages 和 Gemini v1beta 接入其 Antigravity 专用路由，再直连 Code Assist；按共享组展示 5 小时与每周额度，模型读数作补充。 | 借鉴分开入口和额度分组，不复制其上游鉴权、协议包装、混合调度或重试。 |
+| Magpie 先把客户端协议收敛为内部请求，再转换成 Gemini；退役了旧的直连 Antigravity 订阅路径，建议使用官方 `agy`。 | 沿用 vm2api 先整流再派发的边界；这里只接受原生桥明确支持的能力，不移植完整的 schema、工具或签名兼容。 |
+
+内部适配器 [`native-turn.mjs`](../src/lib/gemini/native-turn.mjs) 把 Gemini `streamGenerateContent` 请求体、Anthropic Messages、OpenAI Chat Completions 和 Responses 的单条文本输入收敛为 `{ request_id, stream: true, body: { model, contents } }`，保留文本顺序和空白。由受信服务端选定固定模型和每会话独立的 `kernel.sock`，经 `/internal/v1/messages` 调用现有 CRAGGemini。历史由原生会话持有，不接收外部历史、系统指令、工具、生成参数、多模态或非流式选项；不支持的字段明确拒绝，不静默丢弃。适配器保留原生 Gemini SSE，不把首个 HTTP 200 当作回合成功，也不自动重试。
+
+该适配器尚未接到公共路由：先在绑定代理和独立工作目录下验收官方 CLI 的 OAuth 同会话双轮、不同会话隔离、断流取消和上游用量来源。对外开放还需接好客户端 SSE 编码和逐回合记录，区分上游用量与实际结算。
