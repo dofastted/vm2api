@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.135 — 2026-11-17 · Claude 托管工具与 CRAG 请求兼容
+
+- Claude Messages、OpenAI Chat Completions 和 Responses 转发至 Claude 时保留受支持的托管工具定义；只无损转换根级工具 schema，无法转换时返回具体字段错误。
+- CRAG 按运行时能力处理托管工具；`zero` 模式直接传递结构化 `system`。运行时不支持时在本地返回错误，不执行请求或轮换账号。
+- 沿用签名载荷，无需 `wrap-cli/sync` 或重装槽位；本版不改变上游计费策略。
+
 ## 1.4.134 — 2026-11-17 · CRAG 订阅准入与开槽切核修复
 
 - 解除 `sync-pending` 对整机有效宿主订阅和已购 CRAG 槽位的连坐失效，修复 4xx 拒绝或跨订单中断后遗留永久同步锁的问题，并在切换/兑换过程中不再无差别阻断运行中的 KVM 槽位。

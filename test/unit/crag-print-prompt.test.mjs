@@ -16,6 +16,7 @@ import {
   trackCallerSystemBlock,
 } from '../../src/lib/protocol/crag-print-prompt.mjs'
 import { sanitizeAnthropicBody } from '../../src/lib/protocol/sanitize.mjs'
+import { prepareCragRequest } from '../../src/lib/protocol/kernel-request.mjs'
 import { agentBody } from '../fixtures/agent-summary.mjs'
 
 const billing = 'x-anthropic-billing-header: cc_version=2.1.317'
@@ -25,6 +26,58 @@ const guidance = 'Bias toward working.'
 
 const cwdTag = (cwd) => `<cwd>\n${cwd}\n</cwd>`
 const callerCwdFromSystem = (system) => callerCwdDeclaration(system)?.cwd ?? null
+
+test('CRAG provider compatibility keeps the caller system and requires advertised tool support', () => {
+  const body = {
+    model: 'claude-sonnet-5-5',
+    system: [{ type: 'text', text: 'Policy', cache_control: { type: 'ephemeral' } }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'Sample' }] }],
+    tools: [
+      ...Array.from({ length: 47 }, (_, index) => ({ name: `client_${index}`, input_schema: { type: 'object' } })),
+      { type: 'web_search_20250305', name: 'web_search', max_uses: 2 },
+    ],
+  }
+  const legacy = ['generation_controls_v3', 'prompt_replace', 'prompt_append']
+  const capabilities = [...legacy, 'provider_managed_tools_v1']
+  for (const preset of ['zero', 'official_full']) {
+    const projected = prepareCragPrintBody(body, { preset, capabilities })
+    const request = prepareCragRequest(projected, { capabilities })
+    assert.deepEqual(request.system, body.system)
+    assert.deepEqual(request.tools, body.tools)
+    assert.equal(request.crag_prompt, undefined)
+  }
+  assert.throws(() => prepareCragRequest(body, { capabilities: legacy }), {
+    message: /^tools\[47\]\.type:/,
+    code: 'invalid_kernel_request',
+  })
+  assert.throws(() => prepareCragRequest(body, { capabilities: [] }), {
+    message: /^tools\[47\]\.type:/,
+  })
+  assert.throws(
+    () => prepareCragRequest({ ...body, crag_prompt: { mode: 'replace', text: 'Policy' } }, { capabilities }),
+    {
+      message: /^crag_prompt:/,
+    },
+  )
+  assert.throws(
+    () =>
+      prepareCragRequest({ ...body, tools: [{ type: 'web_search_20990101', name: 'web_search' }] }, { capabilities }),
+    { message: /^tools\[0\]\.type:/ },
+  )
+  const replay = {
+    ...body,
+    tools: body.tools.slice(0, 1),
+    messages: [
+      body.messages[0],
+      {
+        role: 'assistant',
+        content: [{ type: 'server_tool_use', id: 'srvtoolu_example', name: 'web_search', input: {} }],
+      },
+      { role: 'user', content: [{ type: 'text', text: 'Continue' }] },
+    ],
+  }
+  assert.deepEqual(prepareCragPrintBody(replay, { preset: 'zero', capabilities }), replay)
+})
 
 test('caller cwd accepts a single standalone absolute path from the raw system', () => {
   const posix = '/synthetic/work space/项目'

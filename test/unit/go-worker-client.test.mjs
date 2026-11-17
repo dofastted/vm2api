@@ -1876,6 +1876,11 @@ unixTest('invalid Messages are rejected before either kernel accepts a turn', as
           },
           { tools: [{ type: 'function', name: 'sample', parameters: { type: 'object' } }] },
           { tools: [{ name: 'sample', input_schema: { type: 'string' } }] },
+          {
+            tools: [
+              { name: 'sample', input_schema: { type: 'object', oneOf: [{ required: ['a'] }, { required: ['b'] }] } },
+            ],
+          },
           { max_tokens: 3.5 },
           ...(isCrag ? [{ tools: [{ type: 'web_search_20250305', name: 'web_search' }] }] : []),
         ]) {

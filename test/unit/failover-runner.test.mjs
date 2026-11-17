@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { resolveOutboundSessionId } from '../../src/lib/identity/identity-rewrite.mjs'
+import { prepareCragPrintBody } from '../../src/lib/protocol/crag-print-prompt.mjs'
 
 class Scheduler {
   constructor(candidates) {
@@ -220,6 +221,27 @@ test('oversized CRAG zero replace stops before execution without cooling account
   })
   assert.equal(result.status, 400)
   assert.equal(result.body.error.code, 'crag_prompt_too_large')
+  assert.equal(result.attemptCount, 0)
+  assert.equal(scheduler.selectCalls, 1)
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.equal(attempts.items[0].errorScope, 'request')
+})
+
+test('unsupported CRAG provider tool reports its field without execution or account rotation', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const attempts = new Attempts()
+  const runner = new FailoverRunner({ scheduler, attemptsRepo: attempts })
+  const model = 'claude-sonnet-5-5'
+  const result = await runner.run({
+    requestId: 'unsupported-provider-tool',
+    model,
+    canonicalBody: { model, tools: [{ type: 'web_search_20250305', name: 'web_search' }] },
+    applyAttempt: (body) => prepareCragPrintBody(body, { capabilities: ['generation_controls_v3'] }),
+    callAttempt: () => assert.fail('unsupported provider tool must not execute'),
+  })
+  assert.equal(result.status, 400)
+  assert.equal(result.body.error.code, 'invalid_kernel_request')
+  assert.equal(result.body.error.param, 'tools[0].type')
   assert.equal(result.attemptCount, 0)
   assert.equal(scheduler.selectCalls, 1)
   assert.deepEqual(scheduler.cooldowns, [])

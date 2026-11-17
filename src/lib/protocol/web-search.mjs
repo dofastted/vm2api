@@ -91,6 +91,10 @@ export function isAnthropicServerTool(tool) {
   return type !== '' && type !== 'function' && type !== 'custom'
 }
 
+export function isVersionedAnthropicServerTool(tool) {
+  return typeof tool?.type === 'string' && /_\d{8}$/.test(tool.type) && typeof tool.name === 'string' && !!tool.name
+}
+
 export function hasClaudeWebSearch(tools) {
   return Array.isArray(tools) && tools.some(isWebSearchTool)
 }

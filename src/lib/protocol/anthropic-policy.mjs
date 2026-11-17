@@ -27,6 +27,7 @@ import {
 import { ensureOutputConfigSchema, rectifyUnofficialRequest } from './request-rectifier.mjs'
 import { DEFAULT_CACHE_TTL, applyCacheBreakpoints, stripCacheScopeFields } from './cache-ttl.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
+import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
 const TOOL_NAME = /^[A-Za-z0-9_-]{1,64}$/
 
@@ -806,6 +807,7 @@ export function toStandardAnthropicBody(body, options = {}) {
   const shaped = sanitizeAnthropicBody(stripCallerBilling(body), {
     reuseCanonicalHistory: options.reuseCanonicalHistory === true && !isSmallTextTurn(body),
   })
+  if (Array.isArray(shaped.tools)) shaped.tools = normalizeToolInputSchemas(shaped.tools)
   applyMaxTokensCap(shaped)
   return scrubUpstreamClientBody(shaped, options)
 }

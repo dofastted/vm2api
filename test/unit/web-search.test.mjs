@@ -134,6 +134,37 @@ test('OpenAI web_search type is not dropped during convert', () => {
   assert.equal(tools[1].name, 'lookup')
 })
 
+test('mixed protocol tools keep explicit Claude server definitions instead of search defaults', () => {
+  const search = {
+    type: 'web_search_20260209',
+    name: 'web_search',
+    max_uses: 2,
+    allowed_domains: ['example.org'],
+    cache_control: { type: 'ephemeral' },
+  }
+  const fetchTool = { type: 'web_fetch_20260209', name: 'web_fetch', max_uses: 1 }
+  const tools = [
+    { type: 'function', function: { name: 'lookup', parameters: { type: 'object' } } },
+    { type: 'web_search' },
+    search,
+    fetchTool,
+  ]
+  const model = 'claude-sonnet-5-5'
+  for (const protocol of ['anthropic.messages', 'openai.chat', 'openai.responses']) {
+    const { claude } = toClaudeMessages(protocol, {
+      model,
+      input: 'sample',
+      messages: [{ role: 'user', content: 'sample' }],
+      tools,
+    })
+    assert.deepEqual(claude.tools, [
+      { name: 'lookup', description: '', input_schema: { type: 'object' } },
+      search,
+      fetchTool,
+    ])
+  }
+})
+
 test('OpenAI path does not inject web_search just because the prompt says search', () => {
   const hello = toClaudeMessages('openai.chat', {
     model: 'claude-sonnet-5',
