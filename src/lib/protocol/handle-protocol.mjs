@@ -370,6 +370,8 @@ export function createHandleProtocol(deps) {
         type: result?.body?.error?.type || null,
         code: originalCode,
         upstream_code: result?.body?.error?.upstream_code || null,
+        stop_reason: result?.stopReason || null,
+        stop_details: result?.stopDetails ?? null,
         request_id: result?.body?.error?.request_id || result?.headers?.['request-id'] || null,
         retry_after: result?.body?.error?.retry_after || result?.headers?.['retry-after'] || null,
       }
