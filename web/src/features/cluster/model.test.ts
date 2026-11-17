@@ -17,8 +17,10 @@ import {
   machineCapacity,
   memoryBytes,
   NEW_SLOT_QUOTA_BYTES,
+  nodeReachable,
   remoteLink,
   remoteLinkTone,
+  removeNodeHint,
   shortNodeLabel,
   slotBucket,
   slotQuotaBytes,
@@ -357,5 +359,30 @@ describe('machines', () => {
     expect(local.link).toBe('none')
     expect(local.tone.text).toBe('读不到')
     expect(local.capacity).toBeNull()
+  })
+})
+
+describe('remove node', () => {
+  const slots = [vm({ id: 'slot-a', node_id: 'node-1' })]
+
+  it('treats a node as gone only when neither SSH nor the direct link answers', () => {
+    expect(nodeReachable(api())).toBe(true)
+    expect(nodeReachable(api({ state: 'backoff' }))).toBe(false)
+    expect(nodeReachable(api({ state: 'error' }))).toBe(false)
+    expect(nodeReachable(api({ state: 'backoff', direct: directOk(20) }))).toBe(
+      true
+    )
+  })
+
+  it('points at the slot force delete only while the node is unreachable', () => {
+    expect(removeNodeHint(buildRemoteMachine(api(), []))).toBe(
+      '断开 SSH、删除本地凭证与 Docker 桥；远端容器保持运行'
+    )
+    expect(removeNodeHint(buildRemoteMachine(api(), slots))).toBe(
+      '这台上还有 1 个槽，先删掉或挪走才能移除'
+    )
+    expect(
+      removeNodeHint(buildRemoteMachine(api({ state: 'backoff' }), slots))
+    ).toContain('勾选「节点不可达」只删面板记录')
   })
 })

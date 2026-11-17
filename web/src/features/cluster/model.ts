@@ -97,6 +97,21 @@ export function remoteLinkTone(node: ClusterApiNode): StatusTone {
   return { ...LINK_TONE[link], text, label: text }
 }
 
+/** SSH 就绪或直连在线：机器还在，删槽要走普通删除去清理节点上的容器。 */
+export function nodeReachable(node: ClusterApiNode): boolean {
+  return node.link.state === 'ready' || node.direct_link?.state === 'ok'
+}
+
+/** 「移除节点」的提示；节点连不上时指向槽位删除里的「节点不可达」。 */
+export function removeNodeHint(m: ClusterMachine): string {
+  const n = m.slots.length
+  if (!n) return '断开 SSH、删除本地凭证与 Docker 桥；远端容器保持运行'
+  if (!m.remote || nodeReachable(m.remote)) {
+    return `这台上还有 ${n} 个槽，先删掉或挪走才能移除`
+  }
+  return `这台上还有 ${n} 个槽。节点连不上时，删除槽位可勾选「节点不可达」只删面板记录，删完再移除`
+}
+
 /** 第二行小字：`直连 21ms · SSH 4ms`；没连上时给错误原因。 */
 export function linkLatencyText(node: ClusterApiNode): string {
   if (node.link.state !== 'ready') {

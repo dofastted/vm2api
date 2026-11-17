@@ -1,7 +1,8 @@
 import { QueryClient, QueryObserver } from '@tanstack/react-query'
+import type { ClusterApiNode } from '@/types/panel-cluster'
 import { toast } from 'sonner'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { completeVmDeletion } from './delete-vm'
+import { completeVmDeletion, nodeGoneOf, vmDeletePath } from './delete-vm'
 
 vi.mock('sonner', () => ({
   toast: { success: vi.fn(), warning: vi.fn() },
@@ -69,4 +70,38 @@ it('invalidates VM and subscription counts after a confirmed deletion', async ()
   for (const key of affected)
     expect(client.getQueryState(key)?.isInvalidated).toBe(true)
   expect(client.getQueryState(['unrelated'])?.isInvalidated).toBe(false)
+})
+
+it('warns that a force delete left the node container in place', async () => {
+  await completeVmDeletion(client, {
+    deleted: 'slot-a',
+    remote_teardown: 'skipped',
+  })
+  expect(toast.warning).toHaveBeenCalledExactlyOnceWith('已删除', {
+    description: '节点不可达，节点上的容器没有清理。',
+  })
+  expect(toast.success).not.toHaveBeenCalled()
+})
+
+it('offers force delete only for a slot whose node is missing or offline', () => {
+  const node = (
+    state: ClusterApiNode['link']['state'],
+    direct: 'ok' | 'down' | null = null
+  ) =>
+    ({
+      id: 'node-a',
+      link: { state },
+      direct_link: direct ? { state: direct } : null,
+    }) as ClusterApiNode
+  expect(nodeGoneOf({ node_id: null }, [])).toBeNull()
+  expect(nodeGoneOf({ node_id: 'node-a' }, undefined)).toBeNull()
+  expect(nodeGoneOf({ node_id: 'node-a' }, [])).toBe('missing')
+  expect(nodeGoneOf({ node_id: 'node-a' }, [node('ready')])).toBeNull()
+  expect(nodeGoneOf({ node_id: 'node-a' }, [node('backoff')])).toBe('offline')
+  expect(nodeGoneOf({ node_id: 'node-a' }, [node('error', 'down')])).toBe(
+    'offline'
+  )
+  expect(nodeGoneOf({ node_id: 'node-a' }, [node('backoff', 'ok')])).toBeNull()
+  expect(vmDeletePath('slot a')).toBe('/api/panel/vms/slot%20a')
+  expect(vmDeletePath('slot-a', true)).toBe('/api/panel/vms/slot-a?force=1')
 })

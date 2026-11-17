@@ -34,9 +34,14 @@ import { geminiInventoryOptions } from '@/features/import/gemini-environments'
 import { usageQueryOptions } from '@/features/overview/queries'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
-import { DeleteActiveVmHint } from '@/features/vm/delete-active-hint'
+import {
+  DeleteActiveVmHint,
+  NodeGoneDeleteOption,
+} from '@/features/vm/delete-active-hint'
 import {
   completeVmDeletion,
+  useNodeGone,
+  vmDeletePath,
   type VmDeleteResult,
 } from '@/features/vm/delete-vm'
 import { FleetPulse } from '@/features/vm/fleet-pulse'
@@ -156,6 +161,8 @@ export function VmListPage() {
   const [resetInput, setResetInput] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<Vm | null>(null)
   const [deleteInput, setDeleteInput] = useState('')
+  const [forceDelete, setForceDelete] = useState(false)
+  const nodeGone = useNodeGone(deleteTarget)
   const [createOpen, setCreateOpen] = useState(false)
   const resetVm = useMutation({
     mutationFn: ({ id, mode }: { id: string; mode: 'keep' | 'traits' }) =>
@@ -172,19 +179,28 @@ export function VmListPage() {
     onError: (error: Error) => toast.error(error.message),
   })
   const deleteVm = useMutation({
-    mutationFn: async ({ id, switchTo }: { id: string; switchTo?: string }) => {
+    mutationFn: async ({
+      id,
+      switchTo,
+      force,
+    }: {
+      id: string
+      switchTo?: string
+      force?: boolean
+    }) => {
       if (switchTo) {
         await api(`/api/panel/vms/${encodeURIComponent(switchTo)}/activate`, {
           method: 'POST',
         })
       }
-      return api<VmDeleteResult>(`/api/panel/vms/${encodeURIComponent(id)}`, {
+      return api<VmDeleteResult>(vmDeletePath(id, force), {
         method: 'DELETE',
       })
     },
     onSuccess: async (data, { id, switchTo }) => {
       setDeleteTarget(null)
       setDeleteInput('')
+      setForceDelete(false)
       await completeVmDeletion(
         qc,
         data,
@@ -388,6 +404,7 @@ export function VmListPage() {
             perms.remove
               ? (vm) => {
                   setDeleteInput('')
+                  setForceDelete(false)
                   setDeleteTarget(vm)
                 }
               : undefined
@@ -494,6 +511,7 @@ export function VmListPage() {
           if (!open) {
             setDeleteTarget(null)
             setDeleteInput('')
+            setForceDelete(false)
           }
         }}
         title='删除'
@@ -522,10 +540,16 @@ export function VmListPage() {
             deleteVm.mutate({
               id: deleteTarget.id,
               switchTo: deleteSwitchId,
+              force: forceDelete && !!nodeGone,
             })
           }
         }}
       >
+        <NodeGoneDeleteOption
+          gone={nodeGone}
+          checked={forceDelete}
+          onCheckedChange={setForceDelete}
+        />
         <Input
           autoFocus
           autoComplete='off'
@@ -544,6 +568,7 @@ export function VmListPage() {
               deleteVm.mutate({
                 id: deleteTarget.id,
                 switchTo: deleteSwitchId,
+                force: forceDelete && !!nodeGone,
               })
             }
           }}

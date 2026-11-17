@@ -237,7 +237,7 @@ import { preflightFreshClaudeKernels, recreateVmFiles, seedFreshCliHome } from '
 import { diagnoseSlotServices, powerOnSlot, recoverSlot, redactSecrets } from '../vm/slot-recovery.mjs'
 import { commitVmPackage, exportVmPackage, parseVmPackage } from '../vm/vm-package.mjs'
 import { slotMigrationBusy, slotMigrationJob, startSlotMigration } from '../cluster/slot-migration.mjs'
-import { isNativeNodeVm, preflightNode } from '../cluster/placement.mjs'
+import { isNativeNodeVm, preflightNode, vmNodeId } from '../cluster/placement.mjs'
 import { stageFreshClaudeKernels } from '../cluster/remote-slot-files.mjs'
 import { cragSlotPayload } from '../cluster/slot-image.mjs'
 import { normalizeAutoPlacement, pickPlacement, readLocalHost, requestedPlacement } from '../cluster/auto-placement.mjs'
@@ -571,14 +571,45 @@ function syncInstalledKernels(args, operation = runKernelSync) {
   return run
 }
 
-async function teardownSlot(vm, subscription) {
+async function teardownSlot(
+  vm,
+  subscription,
+  destroy = (requireConfirmation) => destroySlot(vm, { requireConfirmation }),
+) {
   try {
-    return subscription?.teardown
-      ? await subscription.teardown(vm, (requireConfirmation) => destroySlot(vm, { requireConfirmation }))
-      : await destroySlot(vm)
+    return subscription?.teardown ? await subscription.teardown(vm, destroy) : await destroy(false)
   } catch {
     return { ok: false, code: 'vm_teardown_unconfirmed', error: 'Could not safely finish VM teardown' }
   }
+}
+
+/**
+ * Force delete of a slot whose node is gone: the manager must confirm the node is
+ * unreachable. Only local relays are dropped; the node container is never touched,
+ * and a held CRAG permit is released as if the node had confirmed the teardown.
+ */
+async function forgetNodeSlot(vm, subscription, manager) {
+  const nodeId = vmNodeId(vm)
+  if (!nodeId) {
+    return { ok: false, httpStatus: 400, code: 'force_delete_local_slot', error: '本机槽位不能强制删除' }
+  }
+  if (!manager?.confirmNodeUnreachable) {
+    return { ok: false, httpStatus: 503, code: 'cluster_unavailable', error: '集群未初始化' }
+  }
+  let node
+  try {
+    node = await manager.confirmNodeUnreachable(nodeId)
+  } catch (err) {
+    return { ok: false, httpStatus: err.status || 500, code: err.code || 'node_check_failed', error: err.message }
+  }
+  const gone = await teardownSlot(vm, subscription, async () => {
+    // Local relay sockets only; a leftover one must not block forgetting the slot.
+    try {
+      await manager.dropSlotRelays?.(vm.id)
+    } catch {}
+    return { ok: true, action: 'skipped', teardownConfirmed: true }
+  })
+  return gone.ok ? { ...gone, node } : gone
 }
 
 async function runKernelSync({
@@ -4370,12 +4401,14 @@ export function createPanelHandler(ctx) {
         })
       }
 
-      // DELETE /api/panel/vms/:id — remove VM record, cli-home, unbind proxy
+      // DELETE /api/panel/vms/:id — remove VM record, cli-home, unbind proxy.
+      // ?force=1: the slot's node is gone; skip the node teardown, still clean up here.
       if (req.method === 'DELETE' && /^\/api\/panel\/vms\/[^/]+$/.test(p)) {
         const id = p.split('/')[4]
         if (!isValidVmId(id)) {
           return json(res, 400, { ok: false, error: { message: 'invalid vm id' } })
         }
+        const force = url.searchParams.get('force') === '1'
         const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
         return await withVmLock(vmPath, async () => {
           const vm = getVm(cfg.paths.project, id)
@@ -4385,9 +4418,11 @@ export function createPanelHandler(ctx) {
             return json(res, 409, { ok: false, error: { message: 'cannot delete active VM, switch active first' } })
           }
           if (denyIfUserCannotDeleteVm(req, res, vm, json)) return true
-          const gone = await teardownSlot(vm, ctx.cragSubscription)
+          const gone = force
+            ? await forgetNodeSlot(vm, ctx.cragSubscription, ctx.clusterManager)
+            : await teardownSlot(vm, ctx.cragSubscription)
           if (!gone.ok) {
-            return json(res, 409, {
+            return json(res, gone.httpStatus || 409, {
               ok: false,
               error: { code: gone.code || 'vm_destroy_failed', message: gone.error || 'VM teardown failed' },
             })
@@ -4420,7 +4455,15 @@ export function createPanelHandler(ctx) {
             const chat = path.join(cfg.paths.project, 'vms', `${id}-chat.json`)
             if (fs.existsSync(chat)) fs.unlinkSync(chat)
           } catch {}
-          return json(res, 200, panel.ok({ deleted: id, ...(gone.reclaim_pending && { reclaim_pending: true }) }))
+          return json(
+            res,
+            200,
+            panel.ok({
+              deleted: id,
+              ...(gone.reclaim_pending && { reclaim_pending: true }),
+              ...(gone.node && { remote_teardown: 'skipped', node_state: gone.node.state }),
+            }),
+          )
         })
       }
       // POST /api/panel/vms/:id/reset — destroy container + home, recreate same slot

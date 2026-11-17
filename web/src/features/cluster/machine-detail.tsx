@@ -12,6 +12,7 @@ import {
   gib,
   gibFloor,
   memoryBytes,
+  removeNodeHint,
   slotStatusTone,
   type ClusterMachine,
 } from '@/features/cluster/model'
@@ -433,11 +434,7 @@ export function MachineDetail({
                 variant='ghost'
                 className='h-7 px-2.5 text-xs text-[color:var(--status-bad)] hover:bg-[color:var(--status-bad-bg)] hover:text-[color:var(--status-bad)]'
                 disabled={m.slots.length > 0}
-                title={
-                  m.slots.length
-                    ? `这台上还有 ${m.slots.length} 个槽，先删掉或挪走才能移除`
-                    : '断开 SSH、删除本地凭证与 Docker 桥；远端容器保持运行'
-                }
+                title={removeNodeHint(m)}
                 onClick={() => onRemove(m)}
               >
                 移除节点

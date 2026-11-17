@@ -2,6 +2,7 @@ import { behindNat, localAddresses, parseSshClient } from '../../src/lib/cluster
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import ssh2 from 'ssh2'
 import { createAuthHandler } from '../../src/lib/cluster/ssh-auth.mjs'
 import {
@@ -249,6 +250,51 @@ test('shell tickets are single-use and bound to one node', () => {
   assert.equal(manager.consumeShellTicket(second, 'a'), false)
   manager.links.set('c', { state: 'backoff', client: null })
   assert.throws(() => manager.issueShellTicket('c'), { code: 'node_not_ready' })
+})
+
+/** Link double: reconnect() lands on `next` (or stays connecting) and counts attempts. */
+function fakeLink(state, next) {
+  const link = new EventEmitter()
+  Object.assign(link, { state, client: state === 'ready' ? {} : null, error: null, reconnects: 0 })
+  link.snapshot = () => ({ state: link.state })
+  link.reconnect = () => {
+    link.reconnects += 1
+    link.state = 'connecting'
+    link.emit('state', 'connecting')
+    if (!next) return
+    setImmediate(() => {
+      link.state = next
+      link.client = next === 'ready' ? {} : null
+      link.error = next === 'ready' ? null : { code: 'ssh_timeout', message: 'SSH 握手超时' }
+      link.emit('state', next)
+    })
+  }
+  return link
+}
+
+test('a node only counts as gone when it is missing or a fresh connect attempt fails', async () => {
+  const nodes = new Set(['up', 'down', 'back', 'slow', 'gated'])
+  const manager = new ClusterManager({ repo: { get: (id) => (nodes.has(id) ? { id } : null) }, dataDir: '/tmp' })
+  assert.deepEqual(await manager.confirmNodeUnreachable('gone'), { state: 'missing', error: null })
+
+  manager.links.set('up', fakeLink('ready'))
+  await assert.rejects(manager.confirmNodeUnreachable('up'), { status: 409, code: 'node_reachable' })
+  assert.equal(manager.links.get('up').reconnects, 0)
+
+  manager.links.set('down', fakeLink('backoff', 'backoff'))
+  assert.deepEqual(await manager.confirmNodeUnreachable('down'), { state: 'backoff', error: 'ssh_timeout' })
+  assert.equal(manager.links.get('down').reconnects, 1, 'a stale backoff is re-checked, not trusted')
+
+  manager.links.set('back', fakeLink('backoff', 'ready'))
+  await assert.rejects(manager.confirmNodeUnreachable('back'), { code: 'node_reachable' })
+
+  manager.links.set('slow', fakeLink('backoff', null))
+  await assert.rejects(manager.confirmNodeUnreachable('slow', 20), { code: 'node_reachable', message: /仍在连接中/ })
+
+  manager.links.set('gated', fakeLink('backoff', 'backoff'))
+  manager.directState.set('gated', { checked_at: new Date().toISOString() })
+  await assert.rejects(manager.confirmNodeUnreachable('gated'), { code: 'node_reachable' })
+  assert.equal(manager.links.get('gated').reconnects, 0, 'a live direct link means the machine is still there')
 })
 
 test('NAT verdict compares the address a node sees against local interfaces', () => {
