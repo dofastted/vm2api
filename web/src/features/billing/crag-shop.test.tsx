@@ -377,9 +377,10 @@ describe('CRAG buyer presentation and activation wire', () => {
       ],
     }
     const html = render()
-    // 展示两个值：使用中（额度 − 可用 = 1）与额度（2）。共享容量而非逐授权计数。
-    expect(html).toMatch(/使用中<\/dt><dd[^>]*>1/)
-    expect(html).toMatch(/额度<\/dt><dd[^>]*>2/)
+    // 这份响应只有绑定数据、没有运行态，所以「使用中」诚实地显示待核对 ——
+    // 真值只认真正运行中的 CRAG 内核，不从绑定数反推。
+    expect(html).toMatch(/使用中的槽位<\/dt><dd[^>]*>待核对/)
+    expect(html).toMatch(/充值可用槽位<\/dt><dd[^>]*>2/)
     expect(html).toContain('原始状态数据（JSON）')
     expect(html).toContain('vm-licensed')
     expect(html).not.toContain('已绑定 / 可绑定应用锁')
@@ -399,7 +400,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     vi.mocked(api).mockResolvedValueOnce(active)
 
     const html = render()
-    expect(html).toContain('当前没有可用于绑定的 CRAG 槽位')
+    expect(html).toContain('切换 VM 内核到 CRAG 不受额度限制')
     expect(html).toContain('订阅使用券')
     expect(html).toContain(
       '每张码从兑换时独立计时，未到期额度相加；不绑定、不启动 VM。'
@@ -429,9 +430,9 @@ describe('CRAG buyer presentation and activation wire', () => {
     await settle()
     const updated = render()
     expect(updated).toContain('订阅有效')
-    expect(updated).toContain('宿主机额度已更新，未自动绑定 VM')
-    expect(updated).toMatch(/使用中<\/dt><dd[^>]*>0/)
-    expect(updated).toMatch(/额度<\/dt><dd[^>]*>2/)
+    expect(updated).toContain('充值可用槽位已更新，未自动把 VM 切到 CRAG')
+    expect(updated).toMatch(/使用中的槽位<\/dt><dd[^>]*>待核对/)
+    expect(updated).toMatch(/充值可用槽位<\/dt><dd[^>]*>2/)
     expect(updated).not.toContain(code)
     expect(state.hostInput?.value).toBe('')
     expect(state.setQueryData).toHaveBeenCalledExactlyOnceWith(
@@ -463,9 +464,11 @@ describe('CRAG buyer presentation and activation wire', () => {
       }
     })
     const pending = render()
-    // 额度 1、可用 0 ⇒ 使用中 1；回收确认后可用变 1 ⇒ 使用中 0。
-    expect(pending).toMatch(/使用中<\/dt><dd[^>]*>1/)
-    expect(pending).toMatch(/待回收绑定<\/dt><dd[^>]*>1/)
+    // 回收流程的响应不带运行态，「使用中」显示待核对；本用例的主题是回收流程
+    // 本身（下方断言覆盖），容量看充值可用槽位。
+    expect(pending).toMatch(/充值可用槽位<\/dt><dd[^>]*>1/)
+    // 待回收绑定不再作为数字展示（真值只认运行中，过期绑定本就不计入）。
+    // 回收流程仍可用，由下方的说明与按钮断言覆盖。
     expect(pending).toContain('旧订阅的已删除绑定待启用槽位回收')
     expect(pending).not.toContain('继续同步')
     expect(api).not.toHaveBeenCalled()
@@ -480,7 +483,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     )
     expect(state.hostRefetch).toHaveBeenCalledTimes(1)
     const updated = render()
-    expect(updated).toMatch(/使用中<\/dt><dd[^>]*>0/)
+    expect(updated).toMatch(/充值可用槽位<\/dt><dd[^>]*>1/)
     expect(updated).not.toContain('待回收绑定')
     expect(updated).not.toContain('旧订阅的已删除绑定')
   })
@@ -508,7 +511,7 @@ describe('CRAG buyer presentation and activation wire', () => {
       { method: 'POST', body: '{}' }
     )
     const updated = render()
-    expect(updated).toMatch(/使用中<\/dt><dd[^>]*>0/)
+    expect(updated).toMatch(/充值可用槽位<\/dt><dd[^>]*>1/)
     expect(updated).not.toContain('待回收绑定')
     expect(updated).not.toContain('继续同步')
     expect(updated).toContain('订阅状态已同步')
@@ -535,8 +538,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     await settle()
     const updated = render()
     expect(updated).toContain('仍有绑定待回收确认')
-    expect(updated).toMatch(/使用中<\/dt><dd[^>]*>1/)
-    expect(updated).toMatch(/待回收绑定<\/dt><dd[^>]*>1/)
+    expect(updated).toMatch(/充值可用槽位<\/dt><dd[^>]*>1/)
     expect(updated).not.toContain('订阅状态已同步')
   })
 

@@ -189,10 +189,15 @@ function HostSummary({
       : status
         ? '未返回套餐'
         : '待核对'
-  const reclaim = status?.reclaim_pending_count ?? 0
-  // 额度只展示两个值：使用中 与 额度。余量由用户相减，不单独呈现 —— 那个派生值
-  // 历史上有四种叫法，少展示它就少一处产生别名的地方。
-  // 这里也刻意不再渲染 CragRuntimeCounts：它与下方网格读同一批字段。
+  // 用户侧只看两个数字：使用中的槽位 与 充值可用槽位。满了就继续充。
+  //
+  // 「使用中」只取真值 —— 真正运行中的 CRAG 内核数，与准入强制同源
+  // （crag-runtime-inventory.mjs 的同一个 hostRunning 既喂该字段又喂
+  // host_over_limit）。切换到 CRAG 内核不受额度限制，只有真正要调度才需要槽位凭证。
+  //
+  // 刻意砍掉的：CRAG 运行数、当前 VM 总数、待回收绑定 —— 三个看起来都像
+  // 「在用多少」的计数，对用户没有行动价值；过期绑定本就不在运行数里，
+  // 不需要用户去回收一个数字。也不再渲染 CragRuntimeCounts（与本网格同源）。
   const fields: Array<[string, ReactNode]> = [
     [
       '订阅状态',
@@ -201,8 +206,8 @@ function HostSummary({
       </Badge>,
     ],
     ['订阅套餐', planName],
-    ['使用中', cragSlotsInUse(status) ?? '待核对'],
-    ['额度', quotaLabel(status?.slot_limit)],
+    ['使用中的槽位', cragSlotsInUse(status) ?? '待核对'],
+    ['充值可用槽位', quotaLabel(status?.slot_limit)],
     [
       '到期',
       status?.expires_at == null ? (
@@ -211,16 +216,13 @@ function HostSummary({
         <SubscriptionTime seconds={status.expires_at} />
       ),
     ],
-    ['CRAG 运行数', quotaLabel(runtime?.running_vms)],
-    ['当前 VM 总数', quotaLabel(status?.vm_count)],
   ]
-  if (reclaim > 0) fields.push(['待回收绑定', reclaim])
   return (
     <section
       aria-label='CRAG 订阅与运行概况'
       className='overflow-hidden rounded-xl border bg-card'
     >
-      <dl className='grid grid-cols-2 gap-px bg-border sm:grid-cols-3 lg:grid-cols-6'>
+      <dl className='grid grid-cols-2 gap-px bg-border sm:grid-cols-3 lg:grid-cols-5'>
         {fields.map(([label, value]) => (
           <div key={label} className='min-w-0 bg-card px-4 py-3'>
             <dt className='text-xs text-muted-foreground'>{label}</dt>
@@ -285,7 +287,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
         setNotice({
           text:
             operation === 'redeem'
-              ? '宿主机额度已更新，未自动绑定 VM'
+              ? '充值可用槽位已更新，未自动把 VM 切到 CRAG'
               : (next.reclaim_pending_count ?? 0) > 0
                 ? '仍有绑定待回收确认'
                 : '订阅状态已同步',
@@ -440,8 +442,8 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
             : probeFailed
               ? ''
               : status && !status.ready
-                ? '当前没有可用于绑定的 CRAG 槽位，仍可兑换。本机与集群的 Docker、KVM 槽共享额度。'
-                : '付款或领码不会更新本机权益。兑换后，到内核页为目标 VM 管理 CRAG 授权。'}
+                ? '切换 VM 内核到 CRAG 不受额度限制；只有真正调度运行时才占用槽位。本机与集群的 VM 共享同一份槽位。'
+                : '充值只增加可用槽位，不会自动把 VM 切到 CRAG。切换内核随时可做，到内核页为目标 VM 操作即可。'}
       </p>
       {canRecover ? (
         <Button

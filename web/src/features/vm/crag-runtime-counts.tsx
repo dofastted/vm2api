@@ -54,19 +54,24 @@ function expiry(status?: CragHostStatus) {
 }
 
 /**
- * 使用中的槽位数。上游不一定下发 `used_slots`（`crag-subscription.mjs:90` 只在
- * payload 带它时才透传），此时用「额度 − 可用」反推 —— 这正是后端自己的关系式
- * （同文件 `:106`）。两者都拿不到时返回 null，不猜。
+ * 使用中的槽位数 —— **只取真值：真正运行中的 CRAG 内核数**。
  *
- * 导出给订阅页复用：同一个数字在两处各算一遍，迟早会算出两个值。
+ * 读 `runtime.host_running_vms`，不从绑定数反推。这不是风格选择：
+ * `crag-runtime-inventory.mjs:430-435` 把同一个 `hostRunning` 既喂给该字段、
+ * 又喂给 `hostQuota` 算出 `host_over_limit: running > limit`，所以运行数**就是**
+ * 准入强制所依据的真值。而 `available_seats` / `used_slots` 走的是席位与绑定
+ * （roster 长度），与强制逻辑不同源 —— 拿它反推会让「显示的数」和「真正卡住
+ * 用户的数」对不上，用户照着它充值可能白充。
+ *
+ * 关调度的内核、以及缺 permit/claims 的，都不计入（见同文件 `:414` 的就绪判定）。
+ * 切换到 CRAG 内核本身不受额度限制，只有真正要调度才需要槽位凭证。
+ *
+ * 返回 null 表示运行状态未知，此时展示「待核对」而不是一个可能错的 0 ——
+ * 上游也遵循同一原则：「Status must not present a wholly failed sample as a
+ * verified zero.」
  */
 export function cragSlotsInUse(status?: CragHostStatus) {
-  if (status?.used_slots != null) return status.used_slots
-  const limit = status?.slot_limit
-  const free = status?.available_seats
-  if (typeof limit === 'number' && typeof free === 'number')
-    return Math.max(0, limit - free)
-  return null
+  return status?.runtime?.host_running_vms ?? null
 }
 
 function Metric({ label, children }: { label: string; children: ReactNode }) {
@@ -79,19 +84,21 @@ function Metric({ label, children }: { label: string; children: ReactNode }) {
 }
 
 /**
- * 宿主订阅的额度与运行概况。
+ * 宿主订阅概况。
  *
- * 额度只展示两个值：**使用中** 与 **额度**。余量由用户自己相减，不再单独呈现 ——
- * 那个派生值历史上有四种叫法（「剩余可用槽位」「剩余可绑定槽位」「订阅槽位额度」
- * 「宿主机应用锁额度」），其中前两种还同屏相邻出现。少展示一个派生值，就少一处
- * 可以产生别名的地方。
+ * 用户侧只看两个数字：**使用中的槽位** 与 **充值可用槽位**。满了就继续充 ——
+ * 这是个余额心智，其余计数一概不展示。
  *
- * 不要再引入新叫法；「绑定」只用于绑定这个动作本身（它有自己的错误态）。
+ * 历史上同一个量有过四种叫法（「剩余可用槽位」「剩余可绑定槽位」「订阅槽位额度」
+ * 「宿主机应用锁额度」），其中两种还同屏相邻出现；此外还有「CRAG 运行数」
+ * 「当前 VM 总数」「运行中的订阅槽」三个看起来都像「在用多少」的计数。少展示
+ * 一个数字，就少一处能产生别名的地方。
+ *
+ * 唯一的例外是**用户能据此行动**的异常态：超额时说明为什么被暂停调度。
  */
 export function CragRuntimeCounts({ status }: { status?: CragHostStatus }) {
   const over = status?.runtime?.host_over_limit === true
   const due = expiry(status)
-  const reclaim = status?.reclaim_pending_count ?? 0
   const used = cragSlotsInUse(status)
   return (
     <div
@@ -110,8 +117,8 @@ export function CragRuntimeCounts({ status }: { status?: CragHostStatus }) {
       {over ? (
         <span className='text-muted-foreground'>仅超额槽暂停调度</span>
       ) : null}
-      <Metric label='使用中'>{used ?? '待核对'}</Metric>
-      <Metric label='额度'>{numberLabel(status?.slot_limit)}</Metric>
+      <Metric label='使用中的槽位'>{used ?? '待核对'}</Metric>
+      <Metric label='充值可用槽位'>{numberLabel(status?.slot_limit)}</Metric>
       {due ? (
         <Metric label={due.lapsed ? '已于' : '到期'}>
           <time
@@ -129,12 +136,6 @@ export function CragRuntimeCounts({ status }: { status?: CragHostStatus }) {
               {' 天'}
             </span>
           ) : null}
-        </Metric>
-      ) : null}
-      {reclaim > 0 ? <Metric label='待回收绑定'>{reclaim}</Metric> : null}
-      {status?.runtime ? (
-        <Metric label='运行中的订阅槽'>
-          {numberLabel(status.runtime.host_running_vms)}
         </Metric>
       ) : null}
     </div>
