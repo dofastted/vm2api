@@ -411,17 +411,6 @@ function disabledImageTool(body, logBag) {
   return null
 }
 
-function usageTokens(usage) {
-  const normalized = disjointOpenaiUsage(usage)
-  if (!normalized) return 0
-  return (
-    (normalized.input_tokens || 0) +
-    (normalized.output_tokens || 0) +
-    (normalized.cache_read_input_tokens || normalized.cache_read_tokens || 0) +
-    (normalized.cache_creation_input_tokens || normalized.cache_creation_tokens || 0)
-  )
-}
-
 const WAIT_TIMEOUT_MIN_MS = 1000
 const WAIT_TIMEOUT_MAX_MS = 120000
 const DEFAULT_WAIT_TIMEOUT_MS = 30000
@@ -934,12 +923,7 @@ export async function handleCodexProtocol({
         const hopUsage = result.usage || result.body?.usage || result.body?.response?.usage || null
         const preferredUsage = preferUsage(hopUsage, streamedUsage)
         const usage = mergeUsage(preferredUsage === hopUsage ? streamedUsage : hopUsage, preferredUsage)
-        // Responses SSE is not a Claude assistant message, so the stream client
-        // reports ok:false / incomplete. A 200 hop that carried tokens still billed.
-        const delivered =
-          !policyRefusal &&
-          !conversionError &&
-          (result?.ok || (Number(result?.status) === 200 && usageTokens(usage) > 0))
+        const delivered = !policyRefusal && !conversionError && result?.ok
         if (delivered) {
           attemptKind = 'succeeded'
           bindSticky(outboundSessionId)
@@ -957,10 +941,13 @@ export async function handleCodexProtocol({
           logBag.cache_read_tokens = logged?.cache_read_input_tokens ?? logged?.cache_read_tokens ?? null
           logBag.cache_creation_tokens = logged?.cache_creation_input_tokens ?? logged?.cache_creation_tokens ?? null
           reportOpenAIAttempt(vm.id, 'succeeded', result.ttftMs ?? null)
-          logBag.final_state = result?.ok ? result.terminalState || 'verified' : 'verified'
+          logBag.final_state = result.terminalState || 'verified'
+          logBag.stop_reason = result.body?.incomplete_details?.reason || null
           logBag.upstream_model = converted.body.model
           if (hops > 1) logBag.codex_failed_over = true
           if (!stream) {
+            if (protocol === 'openai.responses' && result.body?.status === 'incomplete')
+              return json(res, 200, result.body)
             let body
             try {
               const assembled = assembleCodexBodyFromSse(chunks, result.body || {})
@@ -1005,7 +992,9 @@ export async function handleCodexProtocol({
           stats.errors++
           logBag.error_code = result?.body?.error?.code || 'codex_upstream'
           logBag.upstream_status = result?.status || 0
-          return res.end()
+          logBag.final_state = result?.terminalState || 'incomplete'
+          if (stream) return res.end()
+          return json(res, result?.status >= 400 ? result.status : 502, result?.body)
         }
         if (!policyRefusal && isCodexFailoverError(result)) {
           pickOpts.excluded.add(vm.id)

@@ -5,6 +5,8 @@
  */
 import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, openaiChatUsageFromExtract } from './openai-usage.mjs'
 import { resolveGptFastAlias } from './gpt-model-policy.mjs'
+import { buildAnthropicSseError } from './stream-truncation.mjs'
+import { claudeStopReasonToOpenAIFinish } from './convert.mjs'
 
 const IDENTITY_KEYS = [
   'base_url',
@@ -165,7 +167,9 @@ export function responsesToolChoice(choice) {
         if (!tool || typeof tool !== 'object') return null
         const toolName = String(tool.name || tool.function?.name || '').trim()
         if (tool.type === 'function' || tool.function) {
-          return toolName ? { type: 'function', name: toolName } : null
+          return toolName
+            ? { type: 'function', name: toolName, ...(tool.namespace ? { namespace: tool.namespace } : {}) }
+            : null
         }
         return tool
       })
@@ -176,7 +180,11 @@ export function responsesToolChoice(choice) {
 
   if (type === 'function' || type === 'tool' || type === 'custom') {
     if (!name) return type === 'custom' ? undefined : 'required'
-    return { type: type === 'tool' ? 'function' : type, name }
+    return {
+      type: type === 'tool' ? 'function' : type,
+      name,
+      ...(choice.namespace ? { namespace: choice.namespace } : {}),
+    }
   }
 
   if (type === 'mcp') {
@@ -281,6 +289,7 @@ function stripUnsupportedCodexFields(body = {}) {
     next.service_tier = 'priority'
   }
   delete next.max_output_tokens
+  delete next.max_completion_tokens
   delete next.max_tokens
   delete next.temperature
   delete next.prompt_cache_retention
@@ -442,6 +451,21 @@ function toolDoneDeltas(slot, full) {
   return calls
 }
 
+function incompleteStopReason(response) {
+  if (response?.status !== 'incomplete') return null
+  const reason = response.incomplete_details?.reason
+  if (reason === 'max_output_tokens') return 'max_tokens'
+  if (reason === 'content_filter') return 'refusal'
+  return null
+}
+
+function responsesSseError(event) {
+  if (event.type !== 'response.failed' && event.type !== 'error') return null
+  return (
+    event.error || event.response?.error || { type: 'upstream_error', message: 'Upstream returned a Responses error' }
+  )
+}
+
 export function responsesSseToChatChunk(line, id = 'codex', state = null) {
   const session = state || createChatSseState(id)
   if (session.finished) return null
@@ -453,6 +477,11 @@ export function responsesSseToChatChunk(line, id = 'codex', state = null) {
   }
   const event = parsed.event || {}
   const type = event.type || ''
+  const error = responsesSseError(event)
+  if (error) {
+    session.finished = true
+    return `data: ${JSON.stringify({ error })}\n\ndata: [DONE]\n\n`
+  }
   if (
     (type === 'response.output_item.added' || type === 'response.output_item.done') &&
     (event.item?.type === 'function_call' || event.item?.type === 'custom_tool_call')
@@ -490,7 +519,7 @@ export function responsesSseToChatChunk(line, id = 'codex', state = null) {
   ) {
     return chatChunk(session.id, { content: event.delta || event.text || '' })
   }
-  if (type === 'response.completed' || type === 'response.done') {
+  if (type === 'response.completed' || type === 'response.done' || type === 'response.incomplete') {
     const calls = []
     for (const [index, item] of (event.response?.output || []).entries()) {
       if (item?.type !== 'function_call' && item?.type !== 'custom_tool_call') continue
@@ -499,8 +528,10 @@ export function responsesSseToChatChunk(line, id = 'codex', state = null) {
     }
     const usage = openaiChatUsageFromExtract(extractOpenaiUsage(event.response?.usage || event.usage))
     const repaired = calls.length ? chatChunk(session.id, { tool_calls: calls }) : ''
+    const stop = incompleteStopReason(event.response)
+    const finish = stop ? claudeStopReasonToOpenAIFinish(stop) : session.sawTool ? 'tool_calls' : 'stop'
     session.finished = true
-    return `${repaired}${chatChunk(session.id, {}, session.sawTool ? 'tool_calls' : 'stop', usage ? { usage } : {})}data: [DONE]\n\n`
+    return `${repaired}${chatChunk(session.id, {}, finish, usage ? { usage } : {})}data: [DONE]\n\n`
   }
   return null
 }
@@ -578,6 +609,11 @@ export function responsesSseToAnthropicEvents(line, state = createAnthropicSseSt
   if (parsed.skip || state.finished) return null
   const event = parsed.event || {}
   const type = event.type || ''
+  const error = responsesSseError(event)
+  if (error) {
+    state.finished = true
+    return buildAnthropicSseError(error)
+  }
   if (event.response?.id) state.id = event.response.id
   if (event.response?.model) state.model = event.response.model
   const frames = []
@@ -695,14 +731,14 @@ export function responsesSseToAnthropicEvents(line, state = createAnthropicSseSt
     )
     return frames.join('')
   }
-  if (type === 'response.completed' || type === 'response.done' || parsed.done) {
+  if (type === 'response.completed' || type === 'response.done' || type === 'response.incomplete' || parsed.done) {
     ensureStart()
     for (const [index, item] of (event.response?.output || []).entries()) fullItem(item, index)
     for (const slot of new Set(state.tools.values())) closeTool(slot)
     if (state.textIndex != null) frames.push(anthropicEvent('content_block_stop', { index: state.textIndex }))
     frames.push(
       anthropicEvent('message_delta', {
-        delta: { stop_reason: state.sawTool ? 'tool_use' : 'end_turn' },
+        delta: { stop_reason: incompleteStopReason(event.response) || (state.sawTool ? 'tool_use' : 'end_turn') },
         usage: openaiAnthropicUsageFromExtract(extractOpenaiUsage(event.response?.usage || event.usage)),
       }),
     )
@@ -815,7 +851,8 @@ export function codexBodyToAnthropicMessage(body = {}, model = '') {
     role: 'assistant',
     model: resp?.model || model || 'gpt',
     content,
-    stop_reason: content.some((block) => block.type === 'tool_use') ? 'tool_use' : 'end_turn',
+    stop_reason:
+      incompleteStopReason(resp) || (content.some((block) => block.type === 'tool_use') ? 'tool_use' : 'end_turn'),
     usage: openaiAnthropicUsageFromExtract(extractOpenaiUsage(resp?.usage || body?.usage || {})),
   }
 }
