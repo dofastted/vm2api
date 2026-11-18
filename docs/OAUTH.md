@@ -124,9 +124,9 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 顺序：
 
 1. wipe 初装文件  
-2. 物化 `~/.claude/.credentials.json`（worker 活票）  
-3. 槽内 cli-node（`~/.kin/cli-node`，与 kernel 同一构建，不再另装官方 Claude Code）跑 `hello`；缺 cli-node 时报错，先 `wrap-cli/sync`  
-4. 槽内 CLI `/usage` 写 5h/7d/Fable 刻度，失败再试 2 次。账号等级只用成功且完整的官方 `/usage` 判定 Pro/Max
+2. 物化 `~/.claude/.credentials.json`，且必须是指向 `credentials.json` 的相对软链接  
+3. 凭证必须仍在有效期内（access + refresh，未过期）。然后槽内执行 CRAG 包内原生 Claude Code（本地 `/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude`，集群 `/opt/kin-live/crag-v2/claude-code-2.1.321/claude`）跑 `hello`。不使用 `cli-node` / `cc-node`，不注入 `CLAUDE_CODE_VERSION` 或 system prompt。缺原生程序或软链接未建立则报错，不执行  
+4. 槽内官方 usage 端点写 5h/7d/Fable 刻度。账号等级只用成功且完整的官方 usage 判定 Pro/Max  
 5. 后置播种（含强制 env：`DISABLE_TELEMETRY` 等按 seed_policy）  
 6. `~/.claude.json` 的 userID/machineID 写入槽位指纹；清 leftover `.claude/.claude.json`  
 7. `sync_telemetry`：写 `kin-identity.json` + `worker.json.telemetry`，reload 槽位拉 sidecar  
@@ -157,4 +157,4 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 - `GET /api/panel/oauth`、`GET /admin/vm/oauth`：worker + 脱敏 credential 状态。
 - `GET/POST /api/panel/vms/:id/official-cc-bootstrap`：初装进度 / 手动再跑。
 
-Claude CLI 不参与推理或 token rotation；只在初装窗口启动一次。
+Claude CLI 不参与推理或 token rotation；只在初装窗口启动一次，且只在凭证有效、`.credentials.json` 已软链接到 `credentials.json` 之后。
