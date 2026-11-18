@@ -165,7 +165,9 @@ export function responsesToolChoice(choice) {
         if (!tool || typeof tool !== 'object') return null
         const toolName = String(tool.name || tool.function?.name || '').trim()
         if (tool.type === 'function' || tool.function) {
-          return toolName ? { type: 'function', name: toolName } : null
+          return toolName
+            ? { type: 'function', name: toolName, ...(tool.namespace ? { namespace: tool.namespace } : {}) }
+            : null
         }
         return tool
       })
@@ -176,7 +178,11 @@ export function responsesToolChoice(choice) {
 
   if (type === 'function' || type === 'tool' || type === 'custom') {
     if (!name) return type === 'custom' ? undefined : 'required'
-    return { type: type === 'tool' ? 'function' : type, name }
+    return {
+      type: type === 'tool' ? 'function' : type,
+      name,
+      ...(choice.namespace ? { namespace: choice.namespace } : {}),
+    }
   }
 
   if (type === 'mcp') {
@@ -281,6 +287,7 @@ function stripUnsupportedCodexFields(body = {}) {
     next.service_tier = 'priority'
   }
   delete next.max_output_tokens
+  delete next.max_completion_tokens
   delete next.max_tokens
   delete next.temperature
   delete next.prompt_cache_retention
