@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- 默认 CRAG 签名载荷改为 `payload-2026.11.19-crag-3.1.7`。原生 TUI 固定 `CLAUDE_CODE_ENTRYPOINT=cli`。不自动切换运行槽位，其余载荷不变。
 
 ## 1.4.150 — 2026-11-19 · OAuth Setup Token 与原生 Claude 初始化
 
