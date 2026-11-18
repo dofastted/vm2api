@@ -232,6 +232,50 @@ async function kernelFixture(handler) {
 }
 
 const cragCapabilities = ['prompt_append', 'prompt_replace', 'model_directive', 'caller_cwd']
+
+unixTest('OAuth inference refuses an unreadable credential and repairs the relative alias once saved', async (t) => {
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  t.after(() => {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  })
+  let probes = 0
+  const fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    probes++
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 1 }))
+  })
+  t.after(() => fx.close())
+  fx.exec.vm.claude = { has_access: true, mode: 'oauth' }
+  const claudeDir = path.join(fx.exec.homeDir, '.claude')
+  const alias = path.join(claudeDir, '.credentials.json')
+  const source = path.join(claudeDir, 'credentials.json')
+  fs.mkdirSync(claudeDir)
+  fs.symlinkSync('/old/host/credentials.json', alias)
+  const opts = {
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    routing: { inference: { health_ttl_ms: 0 } },
+  }
+  const failed = await dispatchCallInference(opts)
+  assert.equal(failed.status, 503)
+  assert.equal(failed.upstreamExecutions, 0)
+  assert.equal(failed.body.error.code, 'slot_oauth_unavailable')
+  assert.equal(probes, 0)
+  const stored = '{"claudeAiOauth":{"accessToken":"fixture-access"}}\n'
+  fs.writeFileSync(source, stored)
+  const prepared = await prepareInferenceHop(opts)
+  assert.equal(prepared.ready?.ok, true)
+  assert.equal(probes, 1)
+  assert.equal(fs.readlinkSync(alias), 'credentials.json')
+  assert.equal(fs.readFileSync(alias, 'utf8'), stored)
+  assert.equal(fs.readFileSync(source, 'utf8'), stored)
+})
+
 const cragHealth = (capabilities) => ({ ok: true, runtime_variant: 'crag-v2', ready_slots: 1, capabilities })
 
 function licenseCragFixture({ root, exec }) {
@@ -1453,6 +1497,59 @@ test('writeKernelConfig points cc at cc-node and crag at native Claude', () => {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+test('writeKernelConfig creates the Claude config the native CLI reads', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-claude-setup-'))
+  const home = path.join(root, 'vms', 'vm-09', 'cli-home')
+  fs.mkdirSync(home, { recursive: true })
+  fs.writeFileSync(
+    path.join(home, '.claude.json'),
+    `${JSON.stringify({ hasCompletedOnboarding: true, userID: 'keep-me', machineID: 'machine-1' })}\n`,
+  )
+  try {
+    writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' })
+    const nested = JSON.parse(fs.readFileSync(path.join(home, '.claude', '.claude.json'), 'utf8'))
+    const outer = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'))
+    for (const doc of [nested, outer]) {
+      assert.equal(doc.hasCompletedOnboarding, true)
+      assert.equal(doc.theme, 'dark')
+      assert.equal(doc.projects['/run/kin/work'].hasTrustDialogAccepted, true)
+      assert.equal(doc.projects['/home/kincli'].hasTrustDialogAccepted, true)
+    }
+    assert.equal(outer.userID, 'keep-me')
+    assert.equal(outer.machineID, 'machine-1')
+    assert.equal(nested.userID, undefined)
+    const again = fs.readFileSync(path.join(home, '.claude', '.claude.json'))
+    writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' })
+    assert.deepEqual(fs.readFileSync(path.join(home, '.claude', '.claude.json')), again)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+test('root hands a new Claude home and config to the slot user', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-claude-owner-'))
+  const vm = { id: 'vm-09', dataplane: 'crag' }
+  const home = path.join(root, 'vms', vm.id, 'cli-home')
+  const owner = slotRuntimeOwner(vm)
+  const calls = []
+  const chown = mock.method(fs, 'chownSync', (file, uid, gid) => {
+    calls.push({ file, uid, gid })
+  })
+  const fchown = mock.method(fs, 'fchownSync', () => {})
+  const getuid = mock.method(process, 'getuid', () => 0)
+  try {
+    writeKernelConfig(root, vm, { token: 'tok' })
+    const nested = path.join(home, '.claude', '.claude.json')
+    const owned = calls.filter((call) => call.file === nested || String(call.file).startsWith(`${nested}.`))
+    assert.ok(owned.length > 0, JSON.stringify(calls.map((call) => call.file)))
+    assert.ok(owned.every((call) => call.uid === owner.uid && call.gid === owner.gid))
+    assert.equal(fs.statSync(path.join(home, '.claude')).mode & 0o777, 0o700)
+  } finally {
+    getuid.mock.restore()
+    chown.mock.restore()
+    fchown.mock.restore()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
 
 test('saved or switched Claude kernel owns the executable despite a legacy global CLI override', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-cli-selection-'))
@@ -1792,6 +1889,8 @@ test('reconcileCliHopRuntime accepts Claude onboarding inside a cluster-node slo
   assert.ok(setup, JSON.stringify(calls))
   assert.deepEqual(setup.slice(0, 4), ['exec', '-u', '10001:987', 'kin-vm-node-onboard'])
   assert.match(setup.at(-1), /hasCompletedOnboarding/)
+  assert.match(setup.at(-1), /\.claude\/\.claude\.json/)
+  assert.match(setup.at(-1), /FileNotFoundError/)
   const second = await reconcileCliHopRuntime(exec, { runDockerExec })
   assert.deepEqual(second.actions, ['reap_zombies'])
   assert.equal(calls.filter((args) => args.includes('python3')).length, 1)

@@ -16,28 +16,38 @@ export const CAI_AUTHORIZE_URL = 'https://claude.com/cai/oauth/authorize'
 export const PLATFORM = 'https://platform.claude.com'
 export const ANTHROPIC_API = 'https://api.anthropic.com'
 export const TOKEN_URL = `${PLATFORM}/v1/oauth/token`
-export const BOOTSTRAP_URL = `${ANTHROPIC_API}/api/claude_cli/bootstrap?entrypoint=claude-code&model=claude-opus-5-5`
-/** Setup-token mint (README: local-src/oauth-auth) reads identity as the VS Code entrypoint. */
-export const SETUP_TOKEN_BOOTSTRAP_URL = `${ANTHROPIC_API}/api/claude_cli/bootstrap?entrypoint=claude-vscode&model=claude-opus-5`
-/** Account settings PATCH target; `{"grove_enabled": true}` is the Grove agreement. */
-export const ACCOUNT_SETTINGS_URL = `${ANTHROPIC_API}/api/oauth/account/settings`
+/** Native 2.1.321 login reads bootstrap as sdk-cli on Opus 5.5, after the eval posts. */
+export const BOOTSTRAP_URL = `${ANTHROPIC_API}/api/claude_cli/bootstrap?entrypoint=sdk-cli&model=claude-opus-5-5`
+export const OAUTH_PROFILE_URL = `${ANTHROPIC_API}/api/oauth/profile`
+export const OAUTH_ROLES_URL = `${ANTHROPIC_API}/api/oauth/claude_cli/roles`
+export const FIRST_TOKEN_DATE_URL = `${ANTHROPIC_API}/api/organization/claude_code_first_token_date`
+/** GrowthBook remote eval. Both posts after a token exchange hit this path. */
+export const EVAL_SDK_URL = `${ANTHROPIC_API}/api/eval/sdk-zAZezfDKGoZuXXKe`
 export const FULL_OAUTH_SCOPE =
   'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
+/**
+ * `claude setup-token` authorizes with `inferenceOnly: true`, so the mint asks
+ * for this one scope — not the full login set (see the CLI's `buildAuthUrl`).
+ */
+export const INFERENCE_ONLY_SCOPE = 'user:inference'
+/** `expiresIn: 365 * 24 * 60 * 60` in the CLI's setup-token mode: a one-year inference token. */
+export const SETUP_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60
 export const BROWSER_AUTHORIZE_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
-/** setup-token profile exchanges its code as the browser, not as the CLI (README step 2). */
-export const BROWSER_TOKEN_UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.8037.100 Safari/537.36'
-/** sub2api exchanges its code as axios; the cookie stages still carry a Chrome fingerprint. */
-export const TOKEN_UA_AXIOS = 'axios/1.13.6'
+/** Native 2.1.321 `exchangeCodeForTokens` posts as axios/1.15.2, content-type only. */
+export const TOKEN_UA_AXIOS = 'axios/1.15.2'
 export const BETA_OAUTH = 'oauth-2025-04-20'
 /** Per-request ceiling for every exchange hop; one slow hop must not time out the flow. */
 export const OAUTH_REQUEST_TIMEOUT_MS = 60_000
 /** claude.ai app origin + referer the cookie stages are opened from (sub2api style). */
 export const CLAUDE_AI_ORIGIN = 'https://claude.ai'
 export const CLAUDE_AI_REFERER = 'https://claude.ai/new'
-/** The setup-token mint authorizes from the CAI page, so it keeps that origin. */
-export const CAI_ORIGIN = 'https://claude.com'
+/**
+ * Legacy app origin. `claude.com/cai/oauth/authorize` now 307s to
+ * `claude.ai/oauth/authorize` and `CLAUDE_AI_ORIGIN` is what the CLI carries, so
+ * this is only a fallback for the authorize origin allowlist.
+ */
+export const CLAUDE_COM_ORIGIN = 'https://claude.com'
 /**
  * HTTP-level Chrome fingerprint. TLS/HTTP2 fingerprint impersonation needs a
  * libcurl/utls client, which the Node helper does not carry, so the header set

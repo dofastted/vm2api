@@ -4,8 +4,10 @@
  * Credential import/ensure 仍可走 Go 客户端，但不参与推理 hop。
  */
 import { clientCancelledResult, ErrorCode, isClientCancelledResult } from '../core/errors.mjs'
-import { ensureWorkerCredential } from './go-worker-client.mjs'
-import { ensureOfficialCredentialLink, slotUidGidFromHomeDir } from '../oauth/oauth-credentials.mjs'
+import { ensureWorkerCredential, repairLocalCredentialLink, slotOAuthUnavailable } from './go-worker-client.mjs'
+import { credentialModeOfVm, CREDENTIAL_OAUTH } from '../oauth/credential-mode.mjs'
+import { hasCredentialPresence, readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
+import { isCrsMock } from './crs-mock.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { vmNodeDataPath } from '../cluster/placement.mjs'
 import { GATE_DIAL_TIMEOUT_MS } from '../cluster/direct-link.mjs'
@@ -216,12 +218,6 @@ function credentialEnsureFailure(result, ensured) {
   }
 }
 
-async function prepareSlotCredentials(exec) {
-  if (!exec?.homeDir) return
-  const ids = slotUidGidFromHomeDir(exec.homeDir)
-  ensureOfficialCredentialLink(exec.homeDir, ids || {})
-}
-
 async function prepareRust(exec, { ensure, routing, slotWaitMs, slotWaitDeadlineMs } = {}) {
   await awaitWrapRecycle(exec)
   const fault = kernelFaults.get(cacheKey(exec))
@@ -232,7 +228,19 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs, slotWaitDeadline
     clearRustHealthCache(cacheKey(exec))
     return CLUSTER_RECONNECTING
   }
-  await prepareSlotCredentials(exec)
+  if (exec?.homeDir && slotHost(exec.vm).kind === 'local' && !isCrsMock()) {
+    const expectsOAuth =
+      credentialModeOfVm(exec.vm) === CREDENTIAL_OAUTH && hasCredentialPresence(exec.vm?.claude || {})
+    try {
+      const link = await repairLocalCredentialLink(exec.homeDir)
+      if (expectsOAuth && (!link.linked || !hasCredentialPresence(readWorkerCredentialFile(exec.homeDir) || {}))) {
+        return { ok: false, reason: ErrorCode.SLOT_OAUTH_UNAVAILABLE }
+      }
+    } catch (error) {
+      if (!expectsOAuth) throw error
+      return { ok: false, reason: ErrorCode.SLOT_OAUTH_UNAVAILABLE }
+    }
+  }
   const ttl = rustHealthTtlMs(routing)
   const cached = peekRustHealth(exec, ttl)
   if (cached && rustHopReady(cached.health)) {
@@ -301,6 +309,9 @@ export async function prepareInferenceHop({
   const decision = resolveHopEngine(exec?.vm, routing)
   if (decision.blocked) return { decision }
   const ready = await prepareRust(exec, { ensure: ensureRust, routing, slotWaitMs, slotWaitDeadlineMs: deadline })
+  if (ready?.reason === ErrorCode.SLOT_OAUTH_UNAVAILABLE) {
+    return { rejection: slotOAuthUnavailable({ committed: false, upstreamExecutions: 0 }) }
+  }
   return { decision, ready, slotWaitDeadlineMs: deadline }
 }
 
