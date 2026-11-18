@@ -363,6 +363,15 @@ function classifyUpstreamResultRaw(
     }
   }
   const handoffCode = result?.body?.error?.code
+  if (handoffCode === ErrorCode.SLOT_OAUTH_UNAVAILABLE) {
+    return {
+      scope: 'worker',
+      action: result.committed ? 'stop' : 'continue',
+      reason: handoffCode,
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
   if (
     result.nativeHandoff === true &&
     /^native_handoff_(missing|invalid|conflict|incomplete)$/.test(handoffCode || '')

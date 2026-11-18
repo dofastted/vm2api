@@ -2391,7 +2391,11 @@ export function createHandleProtocol(deps) {
           res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', code, message, param })}\n\n`)
           return res.end()
         }
-        if (logBag.error_code === ErrorCode.CLUSTER_DELIVERY_UNCONFIRMED && !res.writableEnded) {
+        if (
+          (logBag.error_code === ErrorCode.CLUSTER_DELIVERY_UNCONFIRMED ||
+            logBag.error_code === ErrorCode.SLOT_OAUTH_UNAVAILABLE) &&
+          !res.writableEnded
+        ) {
           const { body } = mapProtocolClientError(result, logBag, logBag.error_code)
           if (protocol === 'anthropic.messages') {
             if (!streamTracker?.isFinished()) res.write(buildAnthropicSseError(body.error))
