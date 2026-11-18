@@ -9,6 +9,7 @@ import { VIEW_TITLES } from '@/config/nav'
 import type { StatusTone } from '@/types/status'
 import { api, cragDeviceApi, isApiError } from '@/lib/api'
 import { randomUUID } from '@/lib/random-uuid'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -17,8 +18,8 @@ import { PageHeader } from '@/components/page-header'
 import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
 import {
-  CragRuntimeCounts,
   cragHostStatusLabels,
+  cragHostStatusVariant,
 } from '@/features/vm/crag-runtime-counts'
 import {
   cragHostStatusQueryOptions,
@@ -187,19 +188,51 @@ function HostSummary({
       : status
         ? '未返回套餐'
         : '待核对'
-  const fields = [
-    ['订阅状态', status ? cragHostStatusLabels[status.state] : '状态待核对'],
-    ['实际订阅套餐', planName],
-    ['剩余可用槽位', quotaLabel(status?.available_seats)],
-    ['当前 VM 总数', quotaLabel(status?.vm_count)],
+  const reclaim = status?.reclaim_pending_count ?? 0
+  // 术语以 crag-runtime-counts 的那套为准：可用槽位 / 已用 / 总额度。
+  // 这里刻意不再渲染 CragRuntimeCounts —— 它与下方网格读同一批字段，
+  // 同屏重复过一次（曾分别叫「剩余可用槽位」和「剩余可绑定槽位」）。
+  const fields: Array<[string, ReactNode]> = [
+    [
+      '订阅状态',
+      <Badge variant={status ? cragHostStatusVariant[status.state] : 'outline'}>
+        {status ? cragHostStatusLabels[status.state] : '状态待核对'}
+      </Badge>,
+    ],
+    ['订阅套餐', planName],
+    [
+      '可用槽位',
+      <>
+        {quotaLabel(status?.available_seats)}
+        {status?.used_slots == null ? null : (
+          <span className='ml-1 text-xs font-normal text-muted-foreground'>
+            {'已用 '}
+            {status.used_slots}
+            {status.slot_limit == null
+              ? null
+              : ` / ${quotaLabel(status.slot_limit)}`}
+          </span>
+        )}
+      </>,
+    ],
+    [
+      '到期',
+      status?.expires_at == null ? (
+        '—'
+      ) : (
+        <SubscriptionTime seconds={status.expires_at} />
+      ),
+    ],
     ['CRAG 运行数', quotaLabel(runtime?.running_vms)],
+    ['当前 VM 总数', quotaLabel(status?.vm_count)],
   ]
+  if (reclaim > 0) fields.push(['待回收绑定', reclaim])
   return (
     <section
       aria-label='CRAG 订阅与运行概况'
       className='overflow-hidden rounded-xl border bg-card'
     >
-      <dl className='grid grid-cols-2 gap-px bg-border md:grid-cols-5'>
+      <dl className='grid grid-cols-2 gap-px bg-border sm:grid-cols-3 lg:grid-cols-6'>
         {fields.map(([label, value]) => (
           <div key={label} className='min-w-0 bg-card px-4 py-3'>
             <dt className='text-xs text-muted-foreground'>{label}</dt>
@@ -209,8 +242,15 @@ function HostSummary({
           </div>
         ))}
       </dl>
+      {runtime?.host_over_limit === true ? (
+        <p role='alert' className='border-t px-4 py-2 text-sm text-destructive'>
+          宿主订阅超额，仅超额槽暂停调度
+        </p>
+      ) : null}
       <div className='flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t px-4 py-2 text-sm'>
-        <CragRuntimeCounts status={status} />
+        <p className='min-w-0 text-muted-foreground'>
+          本机与集群的 Docker、KVM 槽共享同一份订阅额度
+        </p>
         <Button size='sm' variant='link' className='px-0' asChild>
           <Link to='/wrap'>前往内核页切换 VM 内核</Link>
         </Button>

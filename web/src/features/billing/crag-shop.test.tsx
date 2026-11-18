@@ -374,7 +374,7 @@ describe('CRAG buyer presentation and activation wire', () => {
       ],
     }
     const html = render()
-    expect(html).toMatch(/剩余可用槽位<\/dt><dd[^>]*>1<\/dd>/)
+    expect(html).toMatch(/可用槽位<\/dt><dd[^>]*>1/)
     expect(html).toContain('原始状态数据（JSON）')
     expect(html).toContain('vm-licensed')
     expect(html).not.toContain('已绑定 / 可绑定应用锁')
@@ -425,7 +425,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     const updated = render()
     expect(updated).toContain('订阅有效')
     expect(updated).toContain('宿主机额度已更新，未自动绑定 VM')
-    expect(updated).toMatch(/剩余可用槽位<\/dt><dd[^>]*>2<\/dd>/)
+    expect(updated).toMatch(/可用槽位<\/dt><dd[^>]*>2/)
     expect(updated).not.toContain(code)
     expect(state.hostInput?.value).toBe('')
     expect(state.setQueryData).toHaveBeenCalledExactlyOnceWith(
@@ -456,8 +456,8 @@ describe('CRAG buyer presentation and activation wire', () => {
       }
     })
     const pending = render()
-    expect(pending).toMatch(/剩余可绑定槽位：(?:<!-- -->)?0/)
-    expect(pending).toMatch(/待回收绑定：(?:<!-- -->)?1/)
+    expect(pending).toMatch(/可用槽位<\/dt><dd[^>]*>0/)
+    expect(pending).toMatch(/待回收绑定<\/dt><dd[^>]*>1/)
     expect(pending).toContain('旧订阅的已删除绑定待启用槽位回收')
     expect(pending).not.toContain('继续同步')
     expect(api).not.toHaveBeenCalled()
@@ -472,7 +472,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     )
     expect(state.hostRefetch).toHaveBeenCalledTimes(1)
     const updated = render()
-    expect(updated).toMatch(/剩余可绑定槽位：(?:<!-- -->)?1/)
+    expect(updated).toMatch(/可用槽位<\/dt><dd[^>]*>1/)
     expect(updated).not.toContain('待回收绑定')
     expect(updated).not.toContain('旧订阅的已删除绑定')
   })
@@ -499,7 +499,7 @@ describe('CRAG buyer presentation and activation wire', () => {
       { method: 'POST', body: '{}' }
     )
     const updated = render()
-    expect(updated).toMatch(/剩余可绑定槽位：(?:<!-- -->)?1/)
+    expect(updated).toMatch(/可用槽位<\/dt><dd[^>]*>1/)
     expect(updated).not.toContain('待回收绑定')
     expect(updated).not.toContain('继续同步')
     expect(updated).toContain('订阅状态已同步')
@@ -525,8 +525,8 @@ describe('CRAG buyer presentation and activation wire', () => {
     await settle()
     const updated = render()
     expect(updated).toContain('仍有绑定待回收确认')
-    expect(updated).toMatch(/剩余可绑定槽位：(?:<!-- -->)?0/)
-    expect(updated).toMatch(/待回收绑定：(?:<!-- -->)?1/)
+    expect(updated).toMatch(/可用槽位<\/dt><dd[^>]*>0/)
+    expect(updated).toMatch(/待回收绑定<\/dt><dd[^>]*>1/)
     expect(updated).not.toContain('订阅状态已同步')
   })
 

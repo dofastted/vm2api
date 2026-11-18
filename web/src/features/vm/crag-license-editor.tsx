@@ -45,7 +45,7 @@ const licenseMessages: Record<string, string> = {
   payload_key_unknown:
     '授权服务未登记此内核载荷。已到账的订阅额度会保留，可在兼容槽位使用。',
   payload_key_conflict: '本槽已有绑定对应不同的内核载荷。',
-  slot_limit_reached: '宿主机应用锁额度已用完，本槽未绑定。',
+  slot_limit_reached: '可用槽位已用完，本槽未绑定。',
   crag_subscription_target_unready:
     '此槽暂不能绑定订阅。请确认使用可信 CRAG 包，且未绑定其他有效授权。',
   crag_subscription_target_changed: '目标槽或内核已变化，请核对后重试。',

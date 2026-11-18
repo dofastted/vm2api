@@ -11,7 +11,7 @@ import {
 
 const root = '/api/panel/crag-subscription'
 const operationErrors: Record<string, string> = {
-  slot_limit_reached: '订阅槽位额度已用完。',
+  slot_limit_reached: '可用槽位已用完。',
   host_subscription_inactive: '本机没有有效订阅，请兑换或续费。',
   host_binding_conflict: '此槽的设备身份与原绑定不一致。',
   crag_subscription_target_unready:

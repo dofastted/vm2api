@@ -384,17 +384,19 @@ describe('CRAG runtime on the kernel page', () => {
     const html = render({ status: 'stopped' })
     expect(state.hostEnabled).toBe(true)
     expect(state.hostInterval).toBe(10_000)
-    expect(html).toMatch(/剩余可绑定槽位：(?:<!-- -->)?0/)
-    expect(html).toMatch(/运行中的订阅槽：(?:<!-- -->)?2/)
+    expect(html).toMatch(/可用槽位<\/span><span[^>]*>0<\/span>/)
+    expect(html).toMatch(/运行中的订阅槽<\/span><span[^>]*>2<\/span>/)
     expect(html).not.toContain('可用运行名额')
-    expect(html).toContain('宿主订阅超额，仅超额槽暂停调度')
+    // 超额现在拆成「徽章=状态」+「文字=后果」两段，不再是一句连续文案。
+    expect(html).toContain('宿主订阅超额')
+    expect(html).toContain('仅超额槽暂停调度')
     expect(html).toContain('兑换槽位')
     expect(html).toContain('超出订阅额度 / 暂停调度')
     expect(html).toContain('版本 3.0.8 · 处理中 0 · 排队 0 · 就绪处理槽 0')
 
     state.role = 'user'
     const userHtml = render()
-    expect(userHtml).not.toContain('剩余可绑定槽位')
+    expect(userHtml).not.toContain('可用槽位')
     expect(userHtml).not.toContain('超出订阅额度 / 暂停调度')
     expect(userHtml).not.toContain('兑换槽位')
     expect(state.hostEnabled).toBe(false)
@@ -409,13 +411,13 @@ describe('CRAG runtime on the kernel page', () => {
       status: 'running',
     } as const
     const html = render(cragVm)
-    expect(html).toMatch(/剩余可绑定槽位：(?:<!-- -->)?待核对/)
+    expect(html).toMatch(/可用槽位<\/span><span[^>]*>待核对<\/span>/)
     expect(html).toContain('CRAG：运行状态未知')
 
     state.hostError = true
     const errorHtml = render(cragVm)
     expect(errorHtml).toContain('重装 vm-old 的 CRAG 并重启')
     expect(errorHtml).toContain('CRAG：运行状态未知')
-    expect(errorHtml).toMatch(/剩余可绑定槽位：(?:<!-- -->)?待核对/)
+    expect(errorHtml).toMatch(/可用槽位<\/span><span[^>]*>待核对<\/span>/)
   })
 })
