@@ -26,20 +26,28 @@ function fakeDocker() {
       if (args[2] === '{{.Image}}') return { ok: true, stdout: 'sha256:selfimage' }
       const c = containers.get(name)
       if (!c) return { ok: false, stdout: '', stderr: `Error: No such object: ${name}` }
-      return { ok: true, stdout: `${c.running}|${c.restarting}|${c.pid}|${c.digest}|${c.bin}` }
+      return { ok: true, stdout: `${c.running}|${c.restarting}|${c.pid}|${c.digest}|${c.bin}|${c.reload || ''}` }
     }
     if (cmd === 'run') {
       const name = args[args.indexOf('--name') + 1]
-      const label = (key) => args.find((a) => String(a).startsWith(`${key}=`)).split('=')[1]
+      const label = (key) => args.find((a) => String(a).startsWith(`${key}=`))?.split('=')[1]
       containers.set(name, {
         running: true,
         restarting: false,
         pid: 4242,
         digest: label('kin.egress.cfg'),
         bin: label('kin.egress.bin'),
+        reload: label('kin.egress.reload'),
+        hups: 0,
         args,
       })
       return { ok: true, stdout: 'cid' }
+    }
+    if (cmd === 'kill') {
+      const c = containers.get(args.at(-1))
+      if (!c || args[args.indexOf('--signal') + 1] !== 'HUP') return { ok: false, stderr: 'no such container' }
+      c.hups++
+      return { ok: true }
     }
     if (cmd === 'rm') {
       const name = args.at(-1)
@@ -161,24 +169,39 @@ test('container runtime creates the helper once and reuses it across control-pla
   assert.equal(fx.d.mutations(), before)
 })
 
-test('container runtime replaces the helper on config change, binary upgrade or crash loop', async (t) => {
+test('container runtime reloads proxy/DNS changes by SIGHUP and rebuilds on binary upgrade or crash loop', async (t) => {
   const fx = fixture(t)
   await fx.start()
   const d1 = fx.helper().digest
+  const cfgPath = path.join(egressRunDir(fx.root, 'px-ctr'), 'egress.json')
 
-  const changed = await fx.start({ dnsUpstream: '8.8.8.8:53' })
-  assert.equal(changed.reused, false)
+  // Proxy/DNS change: same container, new config file, one HUP, no rm/run.
+  const before = fx.d.mutations()
+  const changed = await fx.start({ dnsUpstream: '8.8.8.8:53', proxyUrl: 'socks5h://192.0.2.9:1080' })
+  assert.equal(changed.reused, true)
+  assert.equal(changed.reloaded, true)
+  assert.equal(fx.d.mutations(), before)
+  assert.equal(fx.helper().hups, 1)
+  assert.equal(fx.helper().digest, d1)
+  const written = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+  assert.equal(written.dns_upstream, '8.8.8.8:53')
+  assert.equal(written.proxy_url, 'socks5h://192.0.2.9:1080')
+  assert.equal(fs.statSync(cfgPath).mode & 0o777, 0o600)
   const d2 = fx.helper().digest
-  assert.notEqual(d2, d1)
-  assert.ok(fx.d.calls.some((c) => c[0] === 'rm' && c.includes('-f')))
+
+  // A helper created by an older binary has no reload label: rebuild, never HUP.
+  fx.helper().reload = ''
+  const legacy = await fx.start({ dnsUpstream: '1.1.1.1:53' })
+  assert.equal(legacy.reused, false)
+  assert.equal(fx.helper().hups, 0)
 
   fs.writeFileSync(fx.bin, 'static-binary-v2-longer')
-  const upgraded = await fx.start({ dnsUpstream: '8.8.8.8:53' })
+  const upgraded = await fx.start({ dnsUpstream: '1.1.1.1:53' })
   assert.equal(upgraded.reused, false)
   assert.notEqual(fx.helper().digest, d2)
 
   fx.helper().restarting = true
-  const healed = await fx.start({ dnsUpstream: '8.8.8.8:53' })
+  const healed = await fx.start({ dnsUpstream: '1.1.1.1:53' })
   assert.equal(healed.reused, false)
   assert.equal(fx.helper().restarting, false)
 })

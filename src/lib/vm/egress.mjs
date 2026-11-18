@@ -515,9 +515,11 @@ export function egressContainerSpec({
   platform = nativeDockerPlatform(),
 }) {
   const name = egressContainerName(proxyId)
+  // Proxy URL, DNS and policy reload via SIGHUP; only fields that need a new
+  // container are hashed. The container name already pins proxy_id.
   const digest = crypto
     .createHash('sha256')
-    .update([body, hostDir, hostBinDir, binName, binFingerprint].map(String).join('\0'))
+    .update(['egress-v2', egressRebuildKey(body), hostDir, hostBinDir, binName, binFingerprint].map(String).join('\0'))
     .digest('hex')
     .slice(0, 16)
   const args = [
@@ -551,6 +553,8 @@ export function egressContainerSpec({
     `kin.egress.cfg=${digest}`,
     '--label',
     `kin.egress.bin=${binFingerprint}`,
+    '--label',
+    'kin.egress.reload=hup',
     ...(platform ? ['--platform', platform] : []),
     '-v',
     `${hostDir}:${EGRESS_CONTAINER_CFG_DIR}:ro`,
@@ -563,6 +567,23 @@ export function egressContainerSpec({
     `${EGRESS_CONTAINER_CFG_DIR}/egress.json`,
   ]
   return { name, digest, args }
+}
+
+/** Config fields that a running helper cannot take by SIGHUP. */
+export function egressRebuildKey(body) {
+  try {
+    const cfg = typeof body === 'string' ? JSON.parse(body) : body
+    return [cfg?.proxy_id || '', cfg?.listen_tcp || '', cfg?.listen_dns || ''].join('\0')
+  } catch {
+    return String(body)
+  }
+}
+
+/** Atomically replace a 0600 config file. */
+function writeConfigAtomic(file, body) {
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`
+  fs.writeFileSync(tmp, body, { mode: 0o600 })
+  fs.renameSync(tmp, file)
 }
 
 /** Docker platform of this control plane; the helper image and binary are native to it. */
@@ -601,10 +622,10 @@ export function egressBinFingerprint(bin) {
 /** null when the container does not exist. */
 export function inspectEgressContainer(name, runDocker = docker) {
   const format =
-    '{{.State.Running}}|{{.State.Restarting}}|{{.State.Pid}}|{{index .Config.Labels "kin.egress.cfg"}}|{{index .Config.Labels "kin.egress.bin"}}'
+    '{{.State.Running}}|{{.State.Restarting}}|{{.State.Pid}}|{{index .Config.Labels "kin.egress.cfg"}}|{{index .Config.Labels "kin.egress.bin"}}|{{index .Config.Labels "kin.egress.reload"}}'
   const r = runDocker(['inspect', '-f', format, name])
   if (!r.ok) return null
-  const [running, restarting, pid, digest, bin] = String(r.stdout || '')
+  const [running, restarting, pid, digest, bin, reload] = String(r.stdout || '')
     .trim()
     .split('|')
   return {
@@ -614,6 +635,7 @@ export function inspectEgressContainer(name, runDocker = docker) {
     pid: Number(pid) || 0,
     digest: String(digest || '').trim(),
     bin: String(bin || '').trim(),
+    reload: String(reload || '').trim(),
   }
 }
 
@@ -675,16 +697,29 @@ async function startEgressContainer({
     image: imageRef,
     binFingerprint,
   })
-  const done = (reused) => ({
+  const done = (reused, reloaded = false) => ({
     ok: true,
     pid: 0,
     reused,
+    reloaded,
     configPath: cfgPath,
     container: spec.name,
     listen_tcp: cfg.listen_tcp,
   })
   const existing = inspectEgressContainer(spec.name, runDocker)
-  if (egressContainerHealthy(existing) && existing.digest === spec.digest && fs.existsSync(cfgPath)) return done(true)
+  if (
+    egressContainerHealthy(existing) &&
+    existing.digest === spec.digest &&
+    existing.reload === 'hup' &&
+    fs.existsSync(cfgPath)
+  ) {
+    if (fs.readFileSync(cfgPath, 'utf8') === body) return done(true)
+    // Proxy/DNS/policy change: keep the container and its established connections.
+    writeConfigAtomic(cfgPath, body)
+    const hup = runDocker(['kill', '--signal', 'HUP', spec.name])
+    if (hup.ok) return done(true, true)
+    // Fall through and rebuild if the signal could not be delivered.
+  }
   // A helper spawned by an older control plane (process runtime) still holds the ports.
   for (const pid of egressPidsForProxyConfig(projectRoot, proxyId)) {
     const stopped = await stopOwnedEgress(pid)
@@ -732,6 +767,9 @@ export async function startEgressProcess({
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
   const pidFile = path.join(dir, 'egress.pid')
   const cfgPath = path.join(dir, 'egress.json')
+  // Fingerprint of the binary the running helper was started from; only a
+  // helper started by this version (which handles SIGHUP) writes it.
+  const binFpFile = path.join(dir, 'egress.binfp')
   const listenTcp = `${listenHost}:${tcpPort}`
   const listenDns = `${listenHost}:${dnsPort}`
   if (runtime === 'container') {
@@ -767,6 +805,27 @@ export async function startEgressProcess({
         staleEgressPids(cfgPath, existing).length === 0
       ) {
         return { ok: true, pid: existing, reused: true, configPath: cfgPath }
+      }
+      // Same listeners and a reload-capable binary: swap proxy/DNS/policy by SIGHUP.
+      const binFp = egressBinFingerprint(bin)
+      let runningFp = ''
+      try {
+        runningFp = fs.readFileSync(binFpFile, 'utf8').trim()
+      } catch {}
+      if (
+        old.listen_tcp === listenTcp &&
+        old.listen_dns === listenDns &&
+        binFp &&
+        runningFp === binFp &&
+        staleEgressPids(cfgPath, existing).length === 0
+      ) {
+        const cfg = { proxy_id: proxyId, proxy_url: proxyUrl, listen_tcp: listenTcp, listen_dns: listenDns }
+        if (dnsUpstream) cfg.dns_upstream = dnsUpstream
+        if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
+        if (domainForward) cfg.domain_forward = true
+        writeConfigAtomic(cfgPath, JSON.stringify(cfg, null, 2) + '\n')
+        process.kill(existing, 'SIGHUP')
+        return { ok: true, pid: existing, reused: true, reloaded: true, configPath: cfgPath }
       }
     } catch {}
   }
@@ -810,6 +869,7 @@ export async function startEgressProcess({
   const realPid = tcpPort > 0 ? await waitForListenerPid(listenHost, tcpPort) : spawned.pid
   if (!realPid) return { ok: false, error: `kin-egress ${listenTcp} did not listen` }
   fs.writeFileSync(pidFile, String(realPid) + '\n', { mode: 0o600 })
+  fs.writeFileSync(binFpFile, egressBinFingerprint(bin) + '\n', { mode: 0o600 })
   return { ok: true, pid: realPid, reused: false, configPath: cfgPath, listen_tcp: listenTcp }
 }
 

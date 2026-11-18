@@ -153,9 +153,11 @@ import {
 import { createDownstreamKeepalive } from './stream-keepalive.mjs'
 import {
   buildAnthropicSseError,
+  buildRetryableTruncationError,
   createAnthropicSseErrorRemapper,
   createAnthropicStreamTracker,
   isRecoverableTruncation,
+  truncationReason,
 } from './stream-truncation.mjs'
 import {
   hidePersonaUsageInSseLine,
@@ -2406,6 +2408,12 @@ export function createHandleProtocol(deps) {
           // content. Legacy queue pings still receive the mapped SSE error.
           const mapped = mapProtocolClientError(result, logBag, logBag.error_code)
           res.write(buildAnthropicSseError(mapped.body?.error || {}))
+        } else if (protocol === 'anthropic.messages' && !res.writableEnded && !streamTracker?.isFinished()) {
+          // Started but not closable: ask the client to retry instead of
+          // dropping the connection. error_code/error_message keep the cause.
+          logBag.client_error_type = 'rate_limit_error'
+          logBag.truncation_reason = truncationReason(result, streamTracker)
+          res.write(buildRetryableTruncationError())
         }
       }
       return res.end()

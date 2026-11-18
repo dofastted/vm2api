@@ -82,13 +82,18 @@ var DefaultDNSUpstreams = []string{
 const dnsAttemptTimeout = 4 * time.Second
 
 type Server struct {
-	cfg       Config
-	dialer    *kinproxy.Dialer
-	http      *http.Client
-	upstreams []string
+	// cur holds everything a SIGHUP may swap. Each connection or query reads
+	// it once, so established splices stay on the exit they were dialed with.
+	cur       atomic.Pointer[runtime]
 	preferred atomic.Int32
 	domains   domainTable
+	// dnsSlots caps in-flight UDP DNS queries; a full set answers SERVFAIL
+	// inline so a flood cannot pile up goroutines and upstream connections.
+	dnsSlots chan struct{}
 }
+
+// dnsMaxInflight bounds concurrent UDP DNS resolutions per helper.
+const dnsMaxInflight = 256
 
 // parseDNSUpstreams splits a comma-separated dns_upstream value.
 func parseDNSUpstreams(v string) []string {
@@ -101,10 +106,55 @@ func parseDNSUpstreams(v string) []string {
 	return out
 }
 
+// runtime is the reloadable part of the helper: proxy dialer, DNS upstreams
+// and policy flags. Listen addresses are fixed for the process lifetime.
+type runtime struct {
+	cfg       Config
+	dialer    *kinproxy.Dialer
+	http      *http.Client
+	upstreams []string
+}
+
+func (s *Server) rt() *runtime { return s.cur.Load() }
+
 func New(cfg Config) (*Server, error) {
 	if cfg.ListenTCP == "" {
 		return nil, fmt.Errorf("listen tcp address is required")
 	}
+	rt, err := newRuntime(cfg)
+	if err != nil {
+		return nil, err
+	}
+	s := &Server{dnsSlots: make(chan struct{}, dnsMaxInflight)}
+	s.cur.Store(rt)
+	return s, nil
+}
+
+// Reload swaps proxy, DNS and policy settings without closing listeners or
+// established connections; new connections use the new settings. A bad config
+// leaves the running one untouched.
+func (s *Server) Reload(cfg Config) error {
+	old := s.rt()
+	if cfg.ListenTCP != old.cfg.ListenTCP || cfg.ListenDNS != old.cfg.ListenDNS {
+		return fmt.Errorf("reload cannot change listen addresses (tcp %s->%s dns %s->%s)",
+			old.cfg.ListenTCP, cfg.ListenTCP, old.cfg.ListenDNS, cfg.ListenDNS)
+	}
+	next, err := newRuntime(cfg)
+	if err != nil {
+		return err
+	}
+	if next.cfg.DNSUpstream != old.cfg.DNSUpstream {
+		s.preferred.Store(0)
+	}
+	s.cur.Store(next)
+	// Idle DoH connections still go through the old proxy; in-flight ones finish.
+	old.http.CloseIdleConnections()
+	log.Printf("kin-egress reloaded proxy_id=%s dns_upstreams=%s domain_forward=%t",
+		next.cfg.ProxyID, strings.Join(next.upstreams, ","), next.cfg.DomainForward)
+	return nil
+}
+
+func newRuntime(cfg Config) (*runtime, error) {
 	cfg.DNSEmptyTypes = append([]uint16(nil), cfg.DNSEmptyTypes...)
 	upstreams := parseDNSUpstreams(cfg.DNSUpstream)
 	if len(upstreams) == 0 {
@@ -114,7 +164,7 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{
+	return &runtime{
 		cfg:       cfg,
 		dialer:    dialer,
 		upstreams: upstreams,
@@ -137,7 +187,8 @@ func New(cfg Config) (*Server, error) {
 }
 
 func (s *Server) Serve(ctx context.Context) error {
-	tcpLn, err := net.Listen("tcp", s.cfg.ListenTCP)
+	rt := s.rt()
+	tcpLn, err := net.Listen("tcp", rt.cfg.ListenTCP)
 	if err != nil {
 		return fmt.Errorf("listen tcp: %w", err)
 	}
@@ -145,14 +196,14 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	var dnsUDP net.PacketConn
 	var dnsTCP net.Listener
-	if s.cfg.ListenDNS != "" {
-		dnsUDP, err = net.ListenPacket("udp", s.cfg.ListenDNS)
+	if rt.cfg.ListenDNS != "" {
+		dnsUDP, err = net.ListenPacket("udp", rt.cfg.ListenDNS)
 		if err != nil {
 			return fmt.Errorf("listen dns udp: %w", err)
 		}
 		defer dnsUDP.Close()
 		go s.serveDNS(ctx, dnsUDP)
-		dnsTCP, err = net.Listen("tcp", s.cfg.ListenDNS)
+		dnsTCP, err = net.Listen("tcp", rt.cfg.ListenDNS)
 		if err != nil {
 			return fmt.Errorf("listen dns tcp: %w", err)
 		}
@@ -160,7 +211,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		go s.serveDNSTCP(ctx, dnsTCP)
 	}
 
-	log.Printf("kin-egress ready proxy_id=%s tcp=%s dns=%s dns_upstreams=%s", s.cfg.ProxyID, s.cfg.ListenTCP, s.cfg.ListenDNS, strings.Join(s.upstreams, ","))
+	log.Printf("kin-egress ready proxy_id=%s tcp=%s dns=%s dns_upstreams=%s", rt.cfg.ProxyID, rt.cfg.ListenTCP, rt.cfg.ListenDNS, strings.Join(rt.upstreams, ","))
 	go func() {
 		<-ctx.Done()
 		_ = tcpLn.Close()
@@ -207,11 +258,12 @@ func (s *Server) ForwardTCP(ctx context.Context, client net.Conn, dest string) e
 	if err != nil {
 		return err
 	}
-	dialDest, err := s.dialDest(dest)
+	rt := s.rt()
+	dialDest, err := s.dialDestFor(rt, dest)
 	if err != nil {
 		return err
 	}
-	up, err := s.dialer.DialContext(ctx, "tcp", dialDest)
+	up, err := rt.dialer.DialContext(ctx, "tcp", dialDest)
 	if err != nil {
 		return &spliceError{class: classSocksDial, dest: dialDest, err: err}
 	}
@@ -331,7 +383,17 @@ func (s *Server) serveDNS(ctx context.Context, ln net.PacketConn) {
 		}
 		query := make([]byte, n)
 		copy(query, buf[:n])
-		go s.handleDNS(ctx, ln, addr, query)
+		select {
+		case s.dnsSlots <- struct{}{}:
+			go func() {
+				defer func() { <-s.dnsSlots }()
+				s.handleDNS(ctx, ln, addr, query)
+			}()
+		default:
+			if servfail, ok := dnsServFail(query); ok {
+				_, _ = ln.WriteTo(servfail, addr)
+			}
+		}
 	}
 }
 
@@ -444,7 +506,8 @@ func dnsServFail(query []byte) ([]byte, bool) {
 // ResolveDNS tries each upstream in order, starting from the last one that
 // succeeded, and returns the first valid reply.
 func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
-	if len(s.cfg.DNSEmptyTypes) > 0 {
+	rt := s.rt()
+	if len(rt.cfg.DNSEmptyTypes) > 0 {
 		var msg dnsmessage.Message
 		if err := msg.Unpack(query); err != nil {
 			return nil, fmt.Errorf("decode DNS query for override: %w", err)
@@ -454,7 +517,7 @@ func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
 		}
 		blocked := 0
 		for _, question := range msg.Questions {
-			if slices.Contains(s.cfg.DNSEmptyTypes, uint16(question.Type)) {
+			if slices.Contains(rt.cfg.DNSEmptyTypes, uint16(question.Type)) {
 				blocked++
 			}
 		}
@@ -473,17 +536,17 @@ func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
 			return reply.Pack()
 		}
 	}
-	n := len(s.upstreams)
+	n := len(rt.upstreams)
 	start := int(s.preferred.Load())
 	var errs []error
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
-		upstream := s.upstreams[idx]
+		upstream := rt.upstreams[idx]
 		attemptCtx, cancel := context.WithTimeout(ctx, dnsAttemptTimeout)
-		reply, err := s.resolveOne(attemptCtx, upstream, query)
+		reply, err := rt.resolveOne(attemptCtx, upstream, query)
 		cancel()
 		if err == nil {
-			if s.cfg.DomainForward {
+			if rt.cfg.DomainForward {
 				s.domains.observe(reply, time.Now())
 			}
 			if idx != start {
@@ -500,21 +563,21 @@ func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
 	return nil, errors.Join(errs...)
 }
 
-func (s *Server) resolveOne(ctx context.Context, upstream string, query []byte) ([]byte, error) {
+func (rt *runtime) resolveOne(ctx context.Context, upstream string, query []byte) ([]byte, error) {
 	if strings.HasPrefix(upstream, "https://") || strings.HasPrefix(upstream, "http://") {
-		return s.resolveDoH(ctx, upstream, query)
+		return rt.resolveDoH(ctx, upstream, query)
 	}
-	return s.resolveDNSTCP(ctx, upstream, query)
+	return rt.resolveDNSTCP(ctx, upstream, query)
 }
 
-func (s *Server) resolveDoH(ctx context.Context, upstream string, query []byte) ([]byte, error) {
+func (rt *runtime) resolveDoH(ctx context.Context, upstream string, query []byte) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstream, bytes.NewReader(query))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
-	resp, err := s.http.Do(req)
+	resp, err := rt.http.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -532,8 +595,8 @@ func (s *Server) resolveDoH(ctx context.Context, upstream string, query []byte) 
 	return body, nil
 }
 
-func (s *Server) resolveDNSTCP(ctx context.Context, upstream string, query []byte) ([]byte, error) {
-	up, err := s.dialer.DialContext(ctx, "tcp", upstream)
+func (rt *runtime) resolveDNSTCP(ctx context.Context, upstream string, query []byte) ([]byte, error) {
+	up, err := rt.dialer.DialContext(ctx, "tcp", upstream)
 	if err != nil {
 		return nil, err
 	}
