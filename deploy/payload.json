@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.18-egress-reload-cache",
+  "release": "payload-2026.11.18-oauth-profiles",
   "crag_release": "payload-2026.11.18-crag-3.1.6",
   "crag_authorization": {
     "family": "crag",
