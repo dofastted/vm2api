@@ -1,6 +1,6 @@
 import { queryOptions } from '@tanstack/react-query'
 import type { CragLicenseStatus } from '@/types/panel-vm'
-import { api } from '@/lib/api'
+import { ApiError, api, isApiError } from '@/lib/api'
 
 export type KernelId = 'cli-node' | 'crag'
 
@@ -91,11 +91,57 @@ export function pullKernelRelease(body: { kernel: KernelId; tag?: string }) {
   })
 }
 
-export function installKernelTargets(targets: KernelTarget[]) {
-  return api<KernelInstallReport>('/api/panel/kernels/install', {
+export async function installKernelTargets(targets: KernelTarget[]) {
+  const endpoint = '/api/panel/kernels/install'
+  const unknown = () =>
+    new ApiError(
+      '无法确认安装结果，请先核对槽位状态，不要重复提交。',
+      0,
+      'kernel_install_unconfirmed'
+    )
+  const receipt = await api<{ job_id?: string }>(endpoint, {
     method: 'POST',
-    body: JSON.stringify({ targets }),
+    body: JSON.stringify({ targets, background: true }),
+    signal: AbortSignal.timeout(15_000),
+  }).catch((error: unknown) => {
+    if (
+      isApiError(error) &&
+      error.status >= 400 &&
+      error.status < 500 &&
+      error.status !== 408 &&
+      error.status !== 499
+    )
+      throw error
+    throw unknown()
   })
+  if (!receipt?.job_id) throw unknown()
+  const statusUrl = `${endpoint}?${new URLSearchParams({ job_id: receipt.job_id })}`
+  const deadline = Date.now() + 15 * 60_000
+  while (Date.now() < deadline) {
+    const job = await api<{
+      state: 'running' | 'completed' | 'unknown'
+      report?: KernelInstallReport
+    }>(statusUrl, {
+      cache: 'no-store',
+      signal: AbortSignal.timeout(10_000),
+    }).catch((error: unknown) => {
+      if (
+        isApiError(error) &&
+        error.status >= 400 &&
+        error.status !== 408 &&
+        error.status !== 429 &&
+        error.status !== 499 &&
+        error.status < 500
+      )
+        throw unknown()
+      return null
+    })
+    if (job?.state === 'completed' && Array.isArray(job.report?.items))
+      return job.report
+    if (job && job.state !== 'running') throw unknown()
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+  throw unknown()
 }
 
 /** Abandons one VM's in-flight install and frees the kernel cache for other VMs. */

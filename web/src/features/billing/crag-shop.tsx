@@ -7,6 +7,7 @@ import {
 import { Link } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
 import type { StatusTone } from '@/types/status'
+import { IconTelegram } from '@/assets/brand-icons'
 import { api, cragDeviceApi, isApiError } from '@/lib/api'
 import { randomUUID } from '@/lib/random-uuid'
 import { Badge } from '@/components/ui/badge'
@@ -1096,7 +1097,17 @@ function ShopOrders({
             '查看订阅套餐和本人历史订单。付款、交付与激活状态分别确认。')
       }
       extra={
-        <div className='flex flex-wrap gap-2'>
+        <div className='flex flex-wrap items-center gap-2'>
+          <a
+            href='https://t.me/vm2api'
+            target='_blank'
+            rel='noreferrer'
+            title='Telegram 群 @vm2api'
+            className='inline-flex h-8 items-center gap-1.5 rounded-md border border-[#229ED9]/40 bg-[#229ED9]/10 px-2.5 text-sm font-medium text-[#229ED9] outline-hidden transition-colors hover:bg-[#229ED9]/18 focus-visible:ring-2 focus-visible:ring-ring'
+          >
+            <IconTelegram aria-hidden className='size-4 shrink-0' />
+            TG 群
+          </a>
           <Button
             size='sm'
             variant='outline'

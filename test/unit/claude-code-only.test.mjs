@@ -172,7 +172,7 @@ test('Claude Code family recognition: max_tokens 1 is not a bypass for arbitrary
 
 const REACHED = new Error('reached-scheduler')
 
-function protocolHarness({ routing, body, healthMonitor, logs = [] }) {
+function protocolHarness({ routing, body, healthMonitor, logs = [], users = null, onRun = null }) {
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
   const stats = { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 }
   const handler = createHandleProtocol({
@@ -199,14 +199,15 @@ function protocolHarness({ routing, body, healthMonitor, logs = [] }) {
     },
     stickyRouter: {},
     accountQuota: {},
-    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiKeyStore: { acquire: () => ({ ok: true }), release() {}, users },
     apiScheduler: {
       pick: () => {
         throw REACHED
       },
     },
     failoverRunner: {
-      run: async () => {
+      run: async (args) => {
+        onRun?.(args)
         throw REACHED
       },
     },
@@ -345,6 +346,37 @@ test('switch on: master-key pinned panel diagnostics are not inbound clients', a
     apiKeyKind: 'master',
   })
   assert.equal(result.reached, true)
+})
+
+test('an admin-owned key pins a slot but stays an inbound client', async () => {
+  const users = { getById: (id) => ({ a1: { role: 'admin' }, u1: { role: 'user' } })[id] || null }
+  const run = async (userId, routing, body, headers) => {
+    const seen = []
+    const { handler, response } = protocolHarness({ routing, body, users, onRun: (args) => seen.push(args) })
+    const req = {
+      method: 'POST',
+      url: '/v1/messages',
+      headers: { authorization: 'Bearer sk-vm-api', ...headers, 'x-kin-vm': 'vm-01' },
+      apiKeyKind: 'managed',
+      apiKeyRecord: { category: 'oauth', user_id: userId },
+      once() {},
+      off() {},
+    }
+    await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages').catch((error) => {
+      if (error !== REACHED) throw error
+    })
+    return { status: response.status, args: seen[0] }
+  }
+  const admin = await run('a1', {}, OFFICIAL_BODY, CLI_HEADERS)
+  assert.equal(admin.args.pinVmId, 'vm-01')
+  assert.deepEqual(admin.args.ownerScope, { type: 'platform' })
+  const tenant = await run('u1', {}, OFFICIAL_BODY, CLI_HEADERS)
+  assert.equal(tenant.args.pinVmId, null)
+  assert.deepEqual(tenant.args.ownerScope, { type: 'user', userId: 'u1' })
+  // The pin does not exempt an admin's key from the Claude Code only gate.
+  const gated = await run('a1', ON, THIRD_PARTY_BODY, AXIOS)
+  assert.equal(gated.status, 403)
+  assert.equal(gated.args, undefined)
 })
 
 test('switch off: third-party Claude requests are not gated', async () => {

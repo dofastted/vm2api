@@ -179,7 +179,7 @@ export function deriveScheduleFields(vm, { preserveStatus = true } = {}) {
   const schedulable = !off && !bad && !hold
   vm.schedulable = schedulable
   vm.schedule_manual = off
-  vm.schedule_disabled_reason = off ? vm.schedule_off_reason || 'disabled' : bad || hold || null
+  vm.schedule_disabled_reason = bad || (off ? vm.schedule_off_reason || 'disabled' : hold || null)
   const status = String(vm.status || '').toLowerCase()
   if (schedulable && status === 'paused') vm.status = 'running'
   if (!preserveStatus && !schedulable && status === 'running') vm.status = 'paused'
@@ -352,10 +352,13 @@ export function resolveSlotState({
     unschedulable_reason: reason,
     unschedulable_text: textOf(reason),
   })
-  if (vm.schedule_off === true || (vm.schedulable === false && vm.schedule_manual === true && !vm.unschedulable)) {
+  // A recorded deterministic failure (revoked, org disabled, …) outranks the
+  // operator's 调度关: a dead slot parked in 关闭调用 looks like a healthy one
+  // waiting to be switched back on.
+  if (vm.unschedulable?.reason) return unschedulable(vm.unschedulable.reason)
+  if (vm.schedule_off === true || (vm.schedulable === false && vm.schedule_manual === true)) {
     return { ...base, schedule_state: 'off' }
   }
-  if (vm.unschedulable?.reason) return unschedulable(vm.unschedulable.reason)
   // A record not yet migrated: its legacy reason decides.
   if (vm.schedulable === false && !vm.schedule_hold) {
     const legacy = stateOfReason(vm.schedule_disabled_reason)

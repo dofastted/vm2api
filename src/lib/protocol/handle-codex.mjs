@@ -7,10 +7,10 @@ import { upstreamRiskClientError } from './intercept-gate.mjs'
 import { buildAnthropicSseError } from './stream-truncation.mjs'
 import { isClientStream, fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions } from './convert.mjs'
 import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
-import { isValidVmId, listVmRecordFiles, readJsonCached } from '../vm/vm-file.mjs'
+import { listVmRecordFiles, readJsonCached } from '../vm/vm-file.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
-import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
+import { ownerScopeFromRequest, pinnedVmIdFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
 import { normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
 import { restrictCodexClient } from './codex-restriction.mjs'
 import {
@@ -204,12 +204,6 @@ function applyCodexRebuildBody(body, sessionId, mode) {
   return out
 }
 
-function pinnedVmId(req) {
-  const pinVmRaw = String(req?.headers?.['x-kin-vm'] || '').trim()
-  if (req?.apiKeyKind !== 'master') return null
-  return isValidVmId(pinVmRaw) ? pinVmRaw : null
-}
-
 /**
  * Current OpenAI candidates, re-read on every admission. A busy home keeps
  * its pin; only a home that left the pool for good releases the session.
@@ -227,9 +221,11 @@ export function pickCodexCandidates(
     routing = {},
     ownerScope = null,
     keyScope = null,
+    pinVmId = undefined,
   } = {},
 ) {
-  const pin = pinnedVmId(req)
+  // The caller resolves the pin when it knows the key owner's role; alone, only the master key pins.
+  const pin = pinVmId === undefined ? pinnedVmIdFromRequest(req) : pinVmId
   const owner = ownerScope || ownerScopeFromRequest(req)
   const model = body?.model || null
   const routingPolicy = normalizeCodexRouting(routing.codex || routing).quota
@@ -572,6 +568,7 @@ export async function handleCodexProtocol({
   keyScope = null,
   afterHop = null,
   ownerScope = null,
+  pinVmId = undefined,
   cfg = null,
 }) {
   const codex = normalizeCodexRouting(routing.codex)
@@ -662,6 +659,7 @@ export async function handleCodexProtocol({
     excluded: new Set(),
     routing,
     ownerScope,
+    pinVmId,
   }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)

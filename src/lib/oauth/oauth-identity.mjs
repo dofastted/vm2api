@@ -116,6 +116,13 @@ export function flattenOauthIdentity(raw = {}) {
       profile.organization?.rate_limit_tier,
       raw.oauth_profile?.organization?.rate_limit_tier,
     ),
+    organization_role: firstText(raw.organization_role, raw.organizationRole, raw.oauthAccount?.organizationRole),
+    subscription_created_at: firstText(
+      raw.subscription_created_at,
+      raw.subscriptionCreatedAt,
+      organization.subscription_created_at,
+      profile.organization?.subscription_created_at,
+    ),
   }
 }
 
@@ -133,6 +140,8 @@ export function applyOauthIdentity(cred = {}, identity = {}) {
   if (identity.org_uuid) next.org_uuid = identity.org_uuid
   if (identity.subscription_type) next.subscription_type = identity.subscription_type
   if (identity.rate_limit_tier) next.rate_limit_tier = identity.rate_limit_tier
+  if (identity.organization_role) next.organization_role = identity.organization_role
+  if (identity.subscription_created_at) next.subscription_created_at = identity.subscription_created_at
   return next
 }
 

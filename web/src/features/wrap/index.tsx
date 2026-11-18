@@ -127,7 +127,10 @@ export function WrapSamplePage() {
   const cragOptions = cragProduct?.release_options
 
   function cragReleaseLabel(tag?: string) {
-    return cragOptions?.find((option) => option.tag === tag)?.label || tag
+    if (!tag) return tag
+    const named = cragOptions?.find((option) => option.tag === tag)?.label
+    const version = /(?:^|-)(\d+\.\d+\.\d+)(?:-|$)/.exec(named || tag)?.[1]
+    return version || named || tag
   }
 
   const pull = useMutation({
@@ -161,6 +164,9 @@ export function WrapSamplePage() {
   const succeededCount = job
     ? Object.values(job.results).filter((item) => item.ok).length
     : 0
+  const installUnconfirmed = Object.values(job?.results || {}).some(
+    (item) => item.code === 'kernel_install_unconfirmed'
+  )
   const confirmedCrag = confirm?.find((target) => target.kernel === 'crag')
   const confirmedCragTag =
     confirmedCrag?.payload_tag ?? confirmedCrag?.expected_tag
@@ -234,6 +240,7 @@ export function WrapSamplePage() {
     })
     let failures = 0
     let reclaimPending = 0
+    let unconfirmed = false
     try {
       for (let index = 0; index < targets.length; index++) {
         const target = targets[index]
@@ -250,6 +257,7 @@ export function WrapSamplePage() {
             ...target,
             ok: false,
             stopped: false,
+            code: 'kernel_install_unconfirmed',
             error: '未收到该 VM 的安装结果',
           }
           if (result.ok && result.restarted !== true)
@@ -282,8 +290,16 @@ export function WrapSamplePage() {
               }
             : previous
         )
+        if (result.code === 'kernel_install_unconfirmed') {
+          unconfirmed = true
+          break
+        }
       }
-      if (failures)
+      if (unconfirmed)
+        toast.warning('安装结果未确认，已停止提交后续槽位', {
+          description: '请先核对当前槽位的实际状态，再决定是否重新安装。',
+        })
+      else if (failures)
         toast.error(
           `${targets.length - failures}/${targets.length} 台安装成功，请检查失败项`
         )
@@ -570,7 +586,7 @@ export function WrapSamplePage() {
                         aria-hidden='true'
                         className='size-4 animate-spin motion-reduce:animate-none'
                       />
-                    ) : failedCount ? (
+                    ) : failedCount || installUnconfirmed ? (
                       <TriangleAlert
                         aria-hidden='true'
                         className='size-4 text-destructive'
@@ -583,7 +599,9 @@ export function WrapSamplePage() {
                     )}
                     {installing
                       ? `正在安装 ${Math.min(job.completed + (job.activeId ? 1 : 0), job.total)}/${job.total}`
-                      : `已完成：${succeededCount} 台成功${failedCount ? `，${failedCount} 台失败` : ''}`}
+                      : installUnconfirmed
+                        ? `已暂停：${succeededCount} 台成功，当前槽位结果未确认`
+                        : `已完成：${succeededCount} 台成功${failedCount ? `，${failedCount} 台失败` : ''}`}
                   </span>
                   {installing && job.activeId ? (
                     <Button

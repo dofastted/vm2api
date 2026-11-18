@@ -10,6 +10,7 @@ import {
   filterVmsForPanel,
   ownerScopeFromApiKey,
   ownerScopeFromRequest,
+  pinnedVmIdFromRequest,
   vmMatchesOwnerScope,
 } from '../../src/lib/admin/resource-owner.mjs'
 
@@ -82,4 +83,30 @@ test('unassign origin and proxy bind rules', () => {
   assert.equal(canBindProxyToVm({ owner_user_id: 'u1' }, { owner_user_id: 'u1' }, { role: 'user' }), true)
   assert.equal(canBindProxyToVm({ owner_user_id: 'u1' }, {}, { role: 'admin' }), false)
   assert.equal(canBindProxyToVm({}, { owner_user_id: 'u1' }, { role: 'admin' }), true)
+})
+
+test('x-kin-vm pins a slot for the master key and for an admin-owned key only', () => {
+  const users = {
+    getById: (id) => ({ a1: { role: 'Admin' }, s1: { role: 'super' }, u1: { role: 'user' } })[id] || null,
+  }
+  const pin = { 'x-kin-vm': ' cf-0123456789ab ' }
+  const managed = (userId, headers = pin) => ({ apiKeyKind: 'managed', apiKeyRecord: { user_id: userId }, headers })
+  assert.equal(pinnedVmIdFromRequest({ apiKeyKind: 'master', headers: pin }), 'cf-0123456789ab')
+  assert.equal(pinnedVmIdFromRequest(managed('a1'), users), 'cf-0123456789ab')
+  assert.equal(pinnedVmIdFromRequest(managed('s1'), users), 'cf-0123456789ab')
+  // A tenant's header is ignored, and so is an admin key when the role cannot be read.
+  assert.equal(pinnedVmIdFromRequest(managed('u1'), users), null)
+  assert.equal(pinnedVmIdFromRequest(managed('gone'), users), null)
+  assert.equal(pinnedVmIdFromRequest(managed(null), users), null)
+  assert.equal(pinnedVmIdFromRequest(managed('a1')), null)
+  const broken = {
+    getById() {
+      throw new Error('db closed')
+    },
+  }
+  assert.equal(pinnedVmIdFromRequest(managed('a1'), broken), null)
+  // No header, or one that is not a slot id, pins nothing for anyone.
+  assert.equal(pinnedVmIdFromRequest(managed('a1', {}), users), null)
+  assert.equal(pinnedVmIdFromRequest({ apiKeyKind: 'master', headers: { 'x-kin-vm': '../etc' } }), null)
+  assert.equal(pinnedVmIdFromRequest({ panelUser: 'root', panelRole: 'admin', headers: pin }, users), null)
 })

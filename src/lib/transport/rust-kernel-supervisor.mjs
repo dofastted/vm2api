@@ -260,16 +260,16 @@ export const NODE_CLAUDE_SETUP_PY = `
 import json, os
 home = "/home/kincli"
 want = ("/run/kin/work", home)
-for f, create in ((home + "/.claude/.claude.json", True), (home + "/.claude.json", False)):
+for f in (home + "/.claude/.claude.json", home + "/.claude.json"):
+    changed = False
     try:
         doc = json.load(open(f))
     except FileNotFoundError:
-        if not create or not os.path.isdir(os.path.dirname(f)):
-            continue
+        os.makedirs(os.path.dirname(f), mode=0o700, exist_ok=True)
         doc = {}
+        changed = True
     if not isinstance(doc, dict):
         continue
-    changed = False
     if doc.get("hasCompletedOnboarding") is not True:
         doc["hasCompletedOnboarding"] = True
         changed = True
@@ -288,7 +288,8 @@ for f, create in ((home + "/.claude/.claude.json", True), (home + "/.claude.json
             changed = True
     if not changed:
         continue
-    mode = os.stat(f).st_mode & 0o777 if os.path.exists(f) else 0o600
+    existed = os.path.exists(f)
+    mode = os.stat(f).st_mode & 0o777 if existed else 0o600
     tmp = f + ".kin-setup.tmp"
     with open(tmp, "w") as fh:
         fh.write(json.dumps(doc) + "\\n")
@@ -1136,24 +1137,39 @@ function kernelConfigText(config) {
   return JSON.stringify(config, null, 2) + '\n'
 }
 
-function acceptNativeClaudeSetup(homeDir, workDir) {
-  // The TUI refuses login, theme, and folder-trust screens. The credential file is
-  // separate; these flags are what Claude reads before it will take a prompt.
-  for (const file of [path.join(homeDir, '.claude', '.claude.json'), path.join(homeDir, '.claude.json')]) {
-    let raw
+function acceptNativeClaudeSetup(homeDir, workDir, vm) {
+  // CLAUDE_CONFIG_DIR points at ~/.claude, so the TUI reads ~/.claude/.claude.json.
+  // ~/.claude.json is a different file. Create the one the CLI opens when it is
+  // missing; otherwise a completed home file still leaves the welcome screen up.
+  // Root must hand a new 0700 dir to the slot user, or kincli cannot read it.
+  const configDir = path.join(homeDir, '.claude')
+  const privileged = typeof process.getuid === 'function' && process.getuid() === 0
+  const owner = runtimeFileOwner(vm)
+  const created = fs.mkdirSync(homeDir, { recursive: true, mode: 0o700 })
+  const home = fs.lstatSync(homeDir)
+  if (!home.isDirectory()) return
+  if (created && privileged) fs.chownSync(homeDir, owner.uid, owner.gid)
+  ensureHostPrivateDir(configDir, { uid: owner.uid, gid: owner.gid, privileged })
+  for (const file of [path.join(configDir, '.claude.json'), path.join(homeDir, '.claude.json')]) {
+    let doc = {}
+    let mode = 0o600
+    let uid = privileged ? owner.uid : null
+    let gid = privileged ? owner.gid : null
+    let existed = false
     try {
-      raw = fs.readFileSync(file, 'utf8')
-    } catch {
-      continue
+      const st = fs.lstatSync(file)
+      if (st.isSymbolicLink() || !st.isFile()) continue
+      existed = true
+      mode = st.mode & 0o777
+      uid = st.uid
+      gid = st.gid
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue
+      doc = parsed
+    } catch (error) {
+      if (error?.code !== 'ENOENT') continue
     }
-    let doc
-    try {
-      doc = JSON.parse(raw)
-    } catch {
-      continue
-    }
-    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) continue
-    let changed = false
+    let changed = !existed
     if (doc.hasCompletedOnboarding !== true) {
       doc.hasCompletedOnboarding = true
       changed = true
@@ -1175,12 +1191,13 @@ function acceptNativeClaudeSetup(homeDir, workDir) {
       changed = true
     }
     if (!changed) continue
-    const st = fs.statSync(file)
     const tmp = `${file}.${process.pid}.tmp`
-    fs.writeFileSync(tmp, `${JSON.stringify(doc)}\n`, { mode: st.mode & 0o777 })
-    try {
-      fs.chownSync(tmp, st.uid, st.gid)
-    } catch {}
+    fs.writeFileSync(tmp, `${JSON.stringify(doc)}\n`, { mode })
+    if (uid != null) {
+      try {
+        fs.chownSync(tmp, uid, gid)
+      } catch {}
+    }
     fs.renameSync(tmp, file)
   }
 }
@@ -1337,7 +1354,7 @@ export function writeKernelConfig(
           privileged,
         })
       }
-      acceptNativeClaudeSetup(homeDir, '/run/kin/work')
+      acceptNativeClaudeSetup(homeDir, '/run/kin/work', vm)
       if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
         const workstation = resolveWorkstationProfile(record)
         config.telemetry = {

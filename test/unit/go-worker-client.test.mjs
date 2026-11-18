@@ -25,6 +25,8 @@ import { normalizeRedaction } from '../../src/lib/redaction/policy.mjs'
 import { publishRedactionForTests } from '../../src/lib/redaction/runtime.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
+import { mapUpstreamError } from '../../src/lib/core/errors.mjs'
+import { createAnthropicSseErrorRemapper } from '../../src/lib/protocol/stream-truncation.mjs'
 
 test('restoreUncommittedHop keeps a structured upstream code', () => {
   const restored = restoreUncommittedHop({
@@ -505,6 +507,103 @@ async function fixture(handler) {
 function writeData(res, event) {
   res.write(`data: ${JSON.stringify(event)}\n\n`)
 }
+
+const noClaudeAccount = { error: 'No signed-in Claude account found', code: 'NO_ACCOUNT' }
+
+for (const [status, stream] of [
+  [200, false],
+  [502, false],
+  [200, true],
+]) {
+  unixTest(`Claude slot login failure in HTTP ${status} JSON (stream=${stream}) is not a caller error`, async (t) => {
+    const fx = await fixture((_req, res) => {
+      res.writeHead(status, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(noClaudeAccount))
+    })
+    t.after(() => fx.close())
+    const lines = []
+    const result = await (stream ? streamGoWorker : callGoWorker)({
+      exec: fx.exec,
+      body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.status, 503)
+    assert.equal(result.body.error.code, 'slot_oauth_unavailable')
+    const policy = classifyUpstreamResult(result)
+    assert.equal(policy.action, 'continue')
+    assert.equal(policy.retrySameAccount, false)
+    assert.equal(policy.cooldownUntil, null)
+    const mapped = mapUpstreamError(result.status, result.body, result.headers)
+    assert.equal(mapped.body.error.code, 'pool_unavailable')
+    assert.doesNotMatch(JSON.stringify(mapped), /NO_ACCOUNT|No signed-in Claude account found|slot_oauth_unavailable/)
+    assert.deepEqual(lines, [])
+  })
+}
+
+for (const committed of [false, true]) {
+  unixTest(`Claude SSE login error stays private (committed=${committed})`, async (t) => {
+    const fx = await fixture((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      writeData(res, { type: 'message_start', message: { content: [] } })
+      if (committed)
+        writeData(res, { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'partial' } })
+      res.write('event: error\n')
+      writeData(
+        res,
+        committed
+          ? {
+              type: 'error',
+              error: { type: 'api_error', message: `provider error: ${JSON.stringify(noClaudeAccount)}` },
+            }
+          : noClaudeAccount,
+      )
+      res.end()
+    })
+    t.after(() => fx.close())
+    const lines = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.committed, committed)
+    assert.equal(result.status, 503)
+    assert.equal(result.body.error.code, 'slot_oauth_unavailable')
+    assert.equal(classifyUpstreamResult(result).action, committed ? 'stop' : 'continue')
+    if (committed) {
+      assert.match(lines.join('\n'), /partial/)
+      const remapper = createAnthropicSseErrorRemapper()
+      assert.match(lines.map((line) => remapper.remapLine(line)).join('\n'), /pool_unavailable/)
+    } else assert.deepEqual(lines, [])
+    assert.doesNotMatch(lines.join('\n'), /NO_ACCOUNT|No signed-in Claude account found|slot_oauth_unavailable/)
+  })
+}
+
+unixTest('native handoff keeps flat slot login errors off the public stream', async (t) => {
+  const fx = await fixture((_req, res) => {
+    res.setHeader('content-type', 'text/event-stream')
+    res.write('event: error\n')
+    writeData(res, noClaudeAccount)
+    res.end()
+  })
+  t.after(() => fx.close())
+  fx.exec.workerStatus = { runtime_variant: 'crag-v2', capabilities: ['native_handoff_v1'] }
+  const lines = []
+  const body = { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }
+  const result = await streamGoWorker({
+    exec: fx.exec,
+    managedCrag: true,
+    cragPrint: false,
+    envelope: { body, headers: {}, stream: true },
+    onEvent: (line) => lines.push(line),
+  })
+  assert.equal(result.nativeHandoff, true)
+  assert.equal(result.committed, false)
+  assert.equal(result.status, 503)
+  assert.equal(result.body.error.code, 'slot_oauth_unavailable')
+  assert.deepEqual(lines, [])
+})
 
 for (const eventType of ['response.completed', 'response.incomplete']) {
   unixTest(`Codex delivers ${eventType} without any assistant deltas`, async (t) => {
