@@ -354,11 +354,10 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       assert.equal(orgs.headers.host, 'claude.ai')
       assert.equal(authorize.headers.host, setup ? 'platform.claude.com' : 'claude.ai')
       assert.equal(orgs.headers.origin, 'https://claude.ai')
+      assert.equal(authorize.headers.origin, 'https://claude.ai')
       if (setup) {
-        assert.equal(authorize.headers.origin, 'https://claude.com')
-        assert.equal(authorize.headers.referer, 'https://claude.com/cai/oauth/authorize?code=true')
+        assert.equal(authorize.headers.referer, 'https://platform.claude.com/oauth/authorize?code=true')
       } else {
-        assert.equal(authorize.headers.origin, 'https://claude.ai')
         assert.equal(authorize.headers.referer, 'https://claude.ai/new')
       }
       // Token stage: axios for the cookie import, the browser for the mint.
