@@ -33,30 +33,64 @@ import {
 import { gateVerdict } from './intercept-stats.mjs'
 import { prepareInterceptText } from './jev-prepare.mjs'
 
-const SYSTEM_REWRITE =
-  /\b(?:ignore|override|replace|rewrite|modify|change|edit|reset|discard|forget|bypass|set)\b[^.\n!?;；]{0,70}\b(?:system|developer)[\s_-]*(?:prompts?|instructions?|messages?)\b|(?:忽略|无视|覆盖|替换|改写|重写|修改|更改|绕过|清除|重置)[^。\n！？;；]{0,36}(?:system\s*(?:prompt|提示词|指令)|系统(?:提示词|提示|指令|消息)|开发者(?:指令|消息))/giu
+// Only an order to the model to drop its system prompt counts. Docs and skills
+// talk about "changing the system message" all the time, so the verb must open
+// a clause (or follow please / you must), only determiners may sit between verb
+// and target, and "system message" is not a target. "Change/edit/set/modify the
+// system prompt" is ordinary developer talk and is not matched.
+const REWRITE_LEAD = String.raw`(?:^|[.!?:;,，。、！？；"'(\[#>*-]\s*|\b(?:please|now|just|and|then|so|ok|okay|also|instead|first|you\s+(?:must|should|will|need\s+to|have\s+to)|i\s+(?:want|need)\s+you\s+to)\s+)`
+const REWRITE_DET = String.raw`(?:(?:all|any|every|of|the|your|my|these|those|previous|prior|above|earlier|preceding|original|existing|current|default|built-?in)\s+){1,4}(?:\w+\s+)?`
+const REWRITE_TARGET = String.raw`(?:system|developer)[\s_-]*(?:prompts?|instructions?|rules|directives?)\b`
+const SYSTEM_REWRITE = [
+  new RegExp(
+    `${REWRITE_LEAD}(?:ignore|disregard|forget|override|bypass|discard|drop)\\s+${REWRITE_DET}${REWRITE_TARGET}`,
+    'giu',
+  ),
+  // "ignore all previous system instructions" reads as an order anywhere.
+  new RegExp(
+    String.raw`\b(?:ignore|disregard|forget|override|bypass)\s+(?:all|any)\s+(?:of\s+)?(?:the\s+|your\s+)?(?:previous|prior|above|earlier|preceding)\s+${REWRITE_TARGET}`,
+    'giu',
+  ),
+  new RegExp(
+    `${REWRITE_LEAD}(?:replace|rewrite|overwrite)\\s+(?:your|the)\\s+(?:\\w+\\s+)?(?:system|developer)[\\s_-]*(?:prompts?|instructions?)\\s+with\\b`,
+    'giu',
+  ),
+  /(?:忽略|无视|忘记|忘掉|绕过|跳过|覆盖|抛弃|丢弃)掉?(?:你|你的|之前|之前的|此前的|上面|上面的|以上|以上的|前面的|原有的|原来的|原始|全部|所有|一切)[^。\n！？；;]{0,8}?(?:系统提示词|系统提示|系统指令|系统设定|开发者指令|system\s*prompt)/giu,
+  /(?:把|将)?你的(?:系统提示词|系统提示|系统指令)(?:改|换|替换|改写|重写)(?:成|为)/giu,
+]
 const NEGATED_REWRITE =
-  /(?:\b(?:do not|don't|never|must not|should not)\s+|(?:不得|禁止|不要|不可|不允许|不能|勿)\s*)$/iu
+  /(?:\b(?:do not|don't|never|must not|should not|cannot|can't|won't)\s+|(?:不得|禁止|不要|不可|不允许|不能|勿|别)\s*)$/iu
+const REWRITE_LEAD_TAIL = /[.!?:;,，。、！？；"'([#>*-]\s*$/u
+const REWRITE_LEAD_PREFIX = new RegExp(`^${REWRITE_LEAD}`, 'iu')
 
-function systemRewrite(document) {
-  const text = document.normalize('NFKC')
-  for (const match of text.matchAll(SYSTEM_REWRITE)) {
-    if (!NEGATED_REWRITE.test(text.slice(Math.max(0, match.index - 32), match.index))) return match[0]
+/** Exported for tests. Returns the matched order, or '' when none. */
+export function systemRewrite(document) {
+  const text = String(document || '').normalize('NFKC')
+  for (const rule of SYSTEM_REWRITE) {
+    for (const match of text.matchAll(rule)) {
+      const lead = match[0].length - match[0].replace(REWRITE_LEAD_PREFIX, '').length
+      const at = match.index + lead
+      const head = text.slice(Math.max(0, at - 40), at).replace(REWRITE_LEAD_TAIL, '')
+      if (!NEGATED_REWRITE.test(head)) return match[0].slice(lead).trim()
+    }
   }
   return ''
 }
 
+function rewriteContext(document, hit) {
+  const text = String(document || '').normalize('NFKC')
+  const at = text.toLowerCase().indexOf(hit.toLowerCase())
+  if (at < 0) return hit
+  return text.slice(Math.max(0, at - 80), at + hit.length + 80)
+}
+
 function enforcesBan(policy, row) {
-  return (
-    row.reason === 'system_prompt_rewrite' ||
-    (policy?.enabled && (policy.device_block_enabled || row.reason?.endsWith(':nsfw')))
-  )
+  return !!(policy?.enabled && (policy.device_block_enabled || row.reason?.endsWith(':nsfw')))
 }
 
 function recordBan(decision, { devices, policy, requestId }) {
   if (!decision.banDevice || !decision.identity) return
-  const mandatory = decision.reason === 'system_prompt_rewrite'
-  if (!mandatory && (!policy?.enabled || (!policy.device_block_enabled && !decision.forceDeviceBan))) return
+  if (!policy?.enabled || (!policy.device_block_enabled && !decision.forceDeviceBan)) return
   const identity = decision.identity
   const store = devices
   const evidence = { requestId, fingerprint: decision.fingerprint || null, reason: decision.reason || decision.kind }
@@ -283,19 +317,21 @@ export async function evaluateProtocolIntercept({
     }
     if (audit?.block_system_prompt_rewrite !== false) {
       rawDocument = jevDocument(inbound, body, { ...interceptOpts, keepPromptReminders: true })
-      const system = systemRewrite(
-        prepareInterceptText(rawDocument, { stripReminders: false, stripEnvironment: false }),
-      )
+      const scanned = prepareInterceptText(rawDocument, { stripReminders: false, stripEnvironment: false })
+      const system = systemRewrite(scanned)
       if (system) {
         const error = hardPolicyError(requestId, 'system_prompt_rewrite_blocked', '不允许改写或绕过系统提示词。')
+        // A keyword hit only refuses this request. It does not ban the device
+        // or end the session: the client can rephrase, and a real jailbreak
+        // still meets the provider refusal and the refused-session block.
         return reject({
           kind: 'hard_regex',
           via: 'hard-regex',
           final_state: 'policy_blocked',
           error,
+          errorMessage: `不允许改写或绕过系统提示词：${rewriteContext(scanned, system)}`.slice(0, 400),
           intercept: gateVerdict({ kind: 'block', by: 'hard-regex', keyword: system, rule: 'system_prompt_rewrite' }),
-          banDevice: true,
-          forceDeviceBan: true,
+          banDevice: false,
           reason: 'system_prompt_rewrite',
         })
       }
