@@ -10,6 +10,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
 import { applyClearUnschedulable, applyUnschedulable, migrateScheduleRecord } from '../pool/schedule-state.mjs'
 import {
@@ -225,17 +226,23 @@ export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false
         return { wrote: true, path: officialFile, linked: true, adopted: adopt }
       }
     }
-    fs.rmSync(officialFile, { force: true })
-  } catch {}
-  try {
-    fs.symlinkSync('credentials.json', officialFile)
-  } catch (e) {
-    return { wrote: false, error: String(e.message || e).slice(0, 200) }
+  } catch (error) {
+    if (error.code !== 'ENOENT') return { wrote: false, error: String(error.message || error).slice(0, 200) }
   }
-  if (uid != null && gid != null) {
+  const tempLink = `${officialFile}.${randomUUID()}.tmp`
+  try {
+    fs.symlinkSync('credentials.json', tempLink)
+    if (uid != null && gid != null) {
+      try {
+        fs.lchownSync(tempLink, uid, gid)
+      } catch {}
+    }
+    fs.renameSync(tempLink, officialFile)
+  } catch (e) {
     try {
-      fs.lchownSync(officialFile, uid, gid)
+      fs.unlinkSync(tempLink)
     } catch {}
+    return { wrote: false, error: String(e.message || e).slice(0, 200) }
   }
   return { wrote: true, path: officialFile, linked: true, adopted: adopt }
 }
