@@ -8,10 +8,8 @@ import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
-import {
-  CragHostSubscription,
-  cragSubscriptionErrors,
-} from './crag-host-subscription'
+import { CragHostSubscription } from './crag-host-subscription'
+import { cragSubscriptionErrors } from './crag-subscription-errors'
 
 /**
  * 错误码 → 文案，一码一句。宿主订阅（按槽位计）的错误码来自

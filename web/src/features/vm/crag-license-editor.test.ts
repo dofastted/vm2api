@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { ApiError } from '@/lib/api'
-import { cragSubscriptionErrors } from './crag-host-subscription'
 import { cragLicenseErrorMessage } from './crag-license-editor'
+import { cragSubscriptionErrors } from './crag-subscription-errors'
 
 const message = (code: string) =>
   cragLicenseErrorMessage(new ApiError(code, 409, code))
