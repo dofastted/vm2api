@@ -1,7 +1,7 @@
 {
   "repo": "dofastted/vm2api",
   "release": "payload-2026.11.19-oauth-eval",
-  "crag_release": "payload-2026.11.18-crag-3.1.6",
+  "crag_release": "payload-2026.11.19-crag-3.1.7",
   "crag_authorization": {
     "family": "crag",
     "product": "crag-v2",
