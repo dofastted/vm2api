@@ -100,15 +100,16 @@ def models(data, is_api_key=False):
         entries = data.get("models")
         if not isinstance(entries, list):
             return []
-        return sorted(
-            {
-                entry["name"].removeprefix("models/")
-                for entry in entries
-                if isinstance(entry, dict)
-                and isinstance(entry.get("name"), str)
-                and MODEL.fullmatch(entry["name"].removeprefix("models/"))
-            }
-        )[:128]
+        names = set()
+        for entry in entries:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str):
+                continue
+            if name.startswith("models/"):
+                name = name[len("models/"):]
+            if MODEL.fullmatch(name):
+                names.add(name)
+        return sorted(names)[:128]
     entries = data.get("models")
     if not isinstance(entries, dict):
         return [], []

@@ -39,7 +39,7 @@ import { splitBlocksModel } from './weekly-split.mjs'
 import { slotAllowsModel } from './slot-model-gate.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { detectInboundPlatform } from '../protocol/platform-detect.mjs'
-import { resolveCredentialScheduleLevel } from './credential-weight.mjs'
+import { resolveCredentialScheduleLevel, setResetPriorityEnabled } from './credential-weight.mjs'
 import { PLATFORM_SCOPE, normalizeOwnerId, vmMatchesOwnerScope, vmOwnerId } from '../admin/resource-owner.mjs'
 import { keyAllowsVm } from '../admin/key-scope.mjs'
 import {
@@ -129,6 +129,9 @@ export function normalizePoolRouting(pool = {}) {
   // gate or a model-scoped cooldown), borrow another account for this request
   // and keep the conversation pinned. Off by default: the pin is released.
   next.keep_pin_on_model_gate = next.keep_pin_on_model_gate === true
+  // Auto schedule level from the weekly reset (closer reset = higher level).
+  // On by default; off flattens every auto-level slot so load spreads evenly.
+  next.reset_priority = next.reset_priority !== false
   next.queue_max = clampNumber(next.queue_max, DEFAULT_POOL_ROUTING.queue_max, QUEUE_MAX_MIN, QUEUE_MAX_MAX)
   next.seat_grace_ms = clampNumber(next.seat_grace_ms, DEFAULT_POOL_ROUTING.seat_grace_ms, 0, SEAT_GRACE_MAX_MS)
   next.seat_budget_reserve_pct = clampNumber(
@@ -169,7 +172,9 @@ function circuitSetting(value, fallback, min, max) {
 }
 
 function normalizePoolConfig(config = {}) {
-  return { ...DEFAULT_CONFIG, ...normalizePoolRouting(config) }
+  const next = { ...DEFAULT_CONFIG, ...normalizePoolRouting(config) }
+  setResetPriorityEnabled(next.reset_priority)
+  return next
 }
 
 export function formatPoolSelectionSummary(details = {}) {

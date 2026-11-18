@@ -89,7 +89,7 @@ func TestDNSEmptyTypesOverride(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(srv.http.CloseIdleConnections)
+		t.Cleanup(srv.rt().http.CloseIdleConnections)
 		// The server owns its immutable override config even if the caller changes the slice.
 		if enabled {
 			cfg.DNSEmptyTypes[0] = 1

@@ -291,7 +291,7 @@ func TestResolveDNSOverDomainTLSDoH(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			transport := srv.http.Transport.(*http.Transport)
+			transport := srv.rt().http.Transport.(*http.Transport)
 			defer transport.CloseIdleConnections()
 			// Install only the fixture CA, keeping normal TLS hostname verification.
 			transport.TLSClientConfig = &tls.Config{RootCAs: x509.NewCertPool()}
@@ -413,7 +413,7 @@ func TestDoHRedirectRequiresHTTPS(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				transport := srv.http.Transport.(*http.Transport)
+				transport := srv.rt().http.Transport.(*http.Transport)
 				defer transport.CloseIdleConnections()
 				transport.TLSClientConfig = ts.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -478,7 +478,7 @@ func TestResolveDNSFallsBackToNextUpstream(t *testing.T) {
 	if len(reply) < 3 || reply[0] != 0x12 || reply[2]&0x80 == 0 {
 		t.Fatalf("reply=%v", reply)
 	}
-	if got := srv.preferred.Load(); got != 1 {
+	if got := srv.rt().preferred.Load(); got != 1 {
 		t.Fatalf("preferred=%d want 1", got)
 	}
 }
@@ -488,8 +488,8 @@ func TestDefaultDNSUpstreamsWhenEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(srv.upstreams) != len(DefaultDNSUpstreams) || srv.upstreams[0] != DefaultDNSUpstreams[0] {
-		t.Fatalf("upstreams=%v", srv.upstreams)
+	if len(srv.rt().upstreams) != len(DefaultDNSUpstreams) || srv.rt().upstreams[0] != DefaultDNSUpstreams[0] {
+		t.Fatalf("upstreams=%v", srv.rt().upstreams)
 	}
 }
 

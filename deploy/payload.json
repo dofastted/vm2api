@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.18-crag-3.1.6",
+  "release": "payload-2026.11.18-egress-reload-cache",
   "crag_release": "payload-2026.11.18-crag-3.1.6",
   "crag_authorization": {
     "family": "crag",
@@ -42,8 +42,8 @@
     {
       "path": "bin/kin-egress",
       "asset": "kin-egress",
-      "size": 6199128,
-      "sha256": "528ca2a4044a13ed9f032f23efe41717c90fbed61ebfab39a05138331e080002"
+      "size": 6238392,
+      "sha256": "3a09ab9534cf872bc1774e7cb9ae8680febc0b2049bed6d2ba451dfe686b68d8"
     },
     {
       "path": "bin/kin-slot-gate",

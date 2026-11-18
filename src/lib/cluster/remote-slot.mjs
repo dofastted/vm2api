@@ -71,6 +71,7 @@ import {
   connectContainerToNetwork,
   disconnectContainerFromNetwork,
   removeContainer,
+  signalContainer,
   removeNetwork,
   renameContainer,
 } from './docker-remote.mjs'
@@ -431,12 +432,23 @@ export function slotEgressNames(vmId) {
  * user, so it runs as that same uid:gid; with a root login the image default
  * (kincli) could not open the root-owned file and crash-looped on EACCES. The
  * user is part of the digest so a helper created under the old spec is rebuilt.
+ *
+ * Only what needs a new container is hashed: listen addresses, image, user,
+ * binary and mounts. Proxy, DNS and policy fields reload via SIGHUP instead
+ * (see ensureRemoteEgress), so `kin.egress.proxy` records the proxy at creation.
  */
 export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host, binaryDigest = '' }) {
   const user = `${host.uid}:${host.gid}`
+  let listen = ''
+  try {
+    const cfg = JSON.parse(body)
+    listen = `${cfg.listen_tcp || ''}\0${cfg.listen_dns || ''}`
+  } catch {
+    listen = String(body)
+  }
   const digest = crypto
     .createHash('sha256')
-    .update(body)
+    .update(`egress-v2\0${listen}\0${dir}\0`)
     .update(imageRef)
     .update(user)
     .update(binaryDigest)
@@ -453,6 +465,8 @@ export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host
         'kin.egress.vm': vmId,
         'kin.egress.proxy': proxyId,
         'kin.egress.cfg': digest,
+        // Helpers created from this spec run a binary that reloads on SIGHUP.
+        'kin.egress.reload': 'hup',
         'vm2api.cluster': '1',
       },
       HostConfig: {
@@ -465,6 +479,11 @@ export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host
       },
     },
   }
+}
+
+/** A reused helper may take a new config by SIGHUP only if it was created with a reload-capable binary. */
+export function canReloadRemoteEgress(existing) {
+  return existing?.Config?.Labels?.['kin.egress.reload'] === 'hup'
 }
 
 /** Keep the running helper only when it is healthy and matches the spec. A crash loop reports Running too. */
@@ -537,9 +556,22 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
     binaryDigest,
   })
   const existing = await inspectContainerOrNull(session.docker, names.egress)
-  if (!canReuseRemoteEgress(existing, digest)) {
+  const cfgFile = `${dir}/egress.json`
+  let reuse = canReuseRemoteEgress(existing, digest) && canReloadRemoteEgress(existing)
+  let reloaded = false
+  if (reuse) {
+    const current = await readRemoteFileNoFollow(session.client, cfgFile).catch(() => null)
+    if (current == null) reuse = false
+    else if (current.toString('utf8') !== body) {
+      // Proxy/DNS/policy change: keep the container and its established connections.
+      await writeRemoteFile(await openSftp(session.client), cfgFile, body, { mode: 0o600 })
+      await signalContainer(session.docker, names.egress, 'HUP')
+      reloaded = true
+    }
+  }
+  if (!reuse) {
     await runRemote(session.client, `umask 077 && mkdir -p ${shellQuote(dir)} && chmod 700 ${shellQuote(dir)}`)
-    await writeRemoteFile(await openSftp(session.client), `${dir}/egress.json`, body, { mode: 0o600 })
+    await writeRemoteFile(await openSftp(session.client), cfgFile, body, { mode: 0o600 })
     if (existing) await removeContainer(session.docker, names.egress)
     await createContainerRaw(session.docker, names.egress, spec)
     await containerAction(session.docker, names.egress, 'start')
@@ -558,7 +590,7 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
   await runRemote(session.client, remoteIptablesScript(plan, { sudo: session.host.uid !== 0 }), {
     code: 'egress_iptables_failed',
   })
-  return { ok: true, mode: 'socks', network: net.name, egress: names.egress }
+  return { ok: true, mode: 'socks', network: net.name, egress: names.egress, reused: reuse, reloaded }
 }
 /** Policy changes stop only the exit helper, preserving slot containers and bindings. */
 export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {

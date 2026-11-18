@@ -199,7 +199,14 @@ func usableAssocIP(ip string) bool {
 }
 
 func (s *Server) dialDest(dest string) (string, error) {
-	if s == nil || !s.cfg.DomainForward {
+	if s == nil {
+		return dest, nil
+	}
+	return s.dialDestFor(s.rt(), dest)
+}
+
+func (s *Server) dialDestFor(rt *runtime, dest string) (string, error) {
+	if !rt.cfg.DomainForward {
 		return dest, nil
 	}
 	rewritten, err := s.domains.rewrite(dest, time.Now())

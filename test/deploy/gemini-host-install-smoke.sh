@@ -136,6 +136,9 @@ from unittest.mock import patch
 module = runpy.run_path(sys.argv[1])
 probe = module["probe_oauth"]
 proxy = "socks5h://fixture:secret@192.0.2.1:1080"
+assert module["models"]({"models": [
+    {"name": "models/gemini-3.1-pro"}, {"name": "gemini-bare"}, {"name": "other/gemini-invalid"},
+]}, is_api_key=True) == ["gemini-3.1-pro", "gemini-bare"]
 
 def google(proxy_url, url, header, body=None):
     assert proxy_url == proxy

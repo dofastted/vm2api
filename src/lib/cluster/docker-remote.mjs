@@ -484,6 +484,16 @@ export async function containerAction(connect, id, action, { t } = {}) {
   )
 }
 
+/** Send a signal (e.g. HUP for a config reload) to a running container. */
+export async function signalContainer(connect, id, signal) {
+  if (!/^[A-Z0-9]+$/.test(String(signal || ''))) throw new ClusterError(400, 'invalid_signal', '信号名不合法')
+  await dockerJson(
+    connect,
+    { method: 'POST', path: `${containerPath(id)}/kill?signal=${signal}`, timeoutMs: 30_000 },
+    [204],
+  )
+}
+
 export async function removeContainer(connect, id) {
   await dockerJson(connect, { method: 'DELETE', path: `${containerPath(id)}?force=1&v=1`, timeoutMs: 60_000 }, [204])
 }
