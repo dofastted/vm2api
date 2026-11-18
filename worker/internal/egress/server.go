@@ -31,6 +31,8 @@ type Config struct {
 	// DomainForward sends a unique helper DNS answer as a SOCKS hostname.
 	// Off by default: the original IP literal is unchanged.
 	DomainForward bool `json:"domain_forward,omitempty"`
+	// DNSCacheDisabled sends every query upstream, as before the cache.
+	DNSCacheDisabled bool `json:"dns_cache_disabled,omitempty"`
 }
 
 // IdleClose is how long a splice may sit with no bytes before both sides
@@ -88,6 +90,7 @@ type Server struct {
 	upstreams []string
 	preferred atomic.Int32
 	domains   domainTable
+	cache     dnsCache
 }
 
 // parseDNSUpstreams splits a comma-separated dns_upstream value.
@@ -441,8 +444,7 @@ func dnsServFail(query []byte) ([]byte, bool) {
 	return packed, true
 }
 
-// ResolveDNS tries each upstream in order, starting from the last one that
-// succeeded, and returns the first valid reply.
+// ResolveDNS answers from the cache when it can, else from upstream.
 func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
 	if len(s.cfg.DNSEmptyTypes) > 0 {
 		var msg dnsmessage.Message
@@ -473,6 +475,46 @@ func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
 			return reply.Pack()
 		}
 	}
+	if s.cfg.DNSCacheDisabled {
+		return s.resolveUpstream(ctx, query)
+	}
+	parsed, key, cacheable := dnsQueryKey(query)
+	if !cacheable {
+		return s.resolveUpstream(ctx, query)
+	}
+	now := time.Now()
+	if reply, stale, ok := s.cache.lookup(key, parsed, now); ok {
+		if s.cfg.DomainForward {
+			s.domains.observe(reply, now)
+		}
+		if stale && s.cache.beginRefresh(key) {
+			go s.refreshDNS(key, query)
+		}
+		return reply, nil
+	}
+	reply, err := s.resolveUpstream(ctx, query)
+	if err == nil {
+		s.cache.store(key, reply, time.Now())
+	}
+	return reply, err
+}
+
+// refreshDNS re-resolves a stale entry off the request path.
+func (s *Server) refreshDNS(key dnsCacheKey, query []byte) {
+	defer s.cache.endRefresh(key)
+	ctx, cancel := context.WithTimeout(context.Background(), dnsRefreshTimeout)
+	defer cancel()
+	reply, err := s.resolveUpstream(ctx, query)
+	if err != nil {
+		log.Printf("kin-egress dns refresh %s: %v", key.name, err)
+		return
+	}
+	s.cache.store(key, reply, time.Now())
+}
+
+// resolveUpstream tries each upstream in order, starting from the last one
+// that succeeded.
+func (s *Server) resolveUpstream(ctx context.Context, query []byte) ([]byte, error) {
 	n := len(s.upstreams)
 	start := int(s.preferred.Load())
 	var errs []error
