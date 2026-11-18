@@ -15,7 +15,13 @@ import {
   resetAuthUrlSessions,
 } from '../../src/lib/oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth } from '../../src/lib/oauth/cookie-auth.mjs'
-import { BROWSER_TOKEN_UA, CLIENT_ID, FULL_OAUTH_SCOPE, REDIRECT_URI } from '../../src/lib/oauth/oauth-contract.mjs'
+import {
+  CLIENT_ID,
+  FULL_OAUTH_SCOPE,
+  INFERENCE_ONLY_SCOPE,
+  REDIRECT_URI,
+  SETUP_TOKEN_TTL_SECONDS,
+} from '../../src/lib/oauth/oauth-contract.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
 import { prepareSlotOAuth, runGuestOAuthAuthService } from '../../src/lib/oauth/guest-oauth-helper.mjs'
 import { slotExec } from '../../src/lib/vm/slot-runtime.mjs'
@@ -263,6 +269,10 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
     await t.test(`${scenario.flavor}: ${scenario.returnedState || 'no state suffix'}`, async () => {
       const generated = generateAuthUrl({ vmId: vm.id, proxyUrl, flavor: scenario.flavor })
       const url = new URL(generated.auth_url)
+      assert.equal(
+        url.searchParams.get('scope'),
+        scenario.flavor === 'setup_token' ? INFERENCE_ONLY_SCOPE : FULL_OAUTH_SCOPE,
+      )
       const session = peekAuthUrlSession(generated.session_id)
       const state = scenario.returnedState === 'session' ? url.searchParams.get('state') : scenario.returnedState
       expectedExchange = {
@@ -292,12 +302,17 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       assert.equal(token.payload.grant_type, 'authorization_code')
       assert.equal(token.payload.client_id, CLIENT_ID)
       assert.equal(token.headers.cookie, undefined)
-      assert.equal(Object.hasOwn(token.payload, 'expires_in'), false)
+      // The mint is a year-long inference token (CLI `expiresIn: 365d`); a
+      // cookie-import exchange never carries `expires_in`.
+      assert.equal(token.payload.expires_in, setup ? SETUP_TOKEN_TTL_SECONDS : undefined)
       assert.equal(bootstrap.headers.authorization, `Bearer ${accessToken}`)
       assert.equal(bootstrap.headers.cookie, undefined)
-      // CAI paste codes exchange as sub2api does (axios agent); the setup-token
-      // flavor exchanges as the browser and then accepts Grove (README).
-      assert.equal(token.headers['user-agent'], setup ? BROWSER_TOKEN_UA : 'axios/1.13.6')
+      // Both flavors exchange as the app: the CLI posts with `content-type`
+      // only and axios' UA. A browser UA here is what the token endpoint
+      // answered with `429 rate_limit_error`.
+      assert.equal(token.headers['user-agent'], 'axios/1.13.6')
+      // Only the cookie import adds the Chrome fingerprint on the token hop.
+      if (setup) assert.equal(token.headers['sec-ch-ua'], undefined)
       if (!setup) {
         assert.equal(flow.length, 2)
         assert.equal(bootstrap.headers['user-agent'], `claude-cli/${OFFICIAL_CLI_VERSION} (external, cli)`)
@@ -349,19 +364,21 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
         assert.match(request.headers['user-agent'], /Chrome\/146\.0\.0\.0/)
         assert.match(request.headers['sec-ch-ua'], /Google Chrome/)
       }
-      // The cookie stages pass as a browser on both profiles, but the app
-      // origin is sub2api's claude.ai while the mint posts to the console.
+      // The cookie stages pass as a browser on both profiles; the mint posts to
+      // the console but speaks as the app, because claude.com/cai/oauth/authorize
+      // now 307s to claude.ai/oauth/authorize.
       assert.equal(orgs.headers.host, 'claude.ai')
       assert.equal(authorize.headers.host, setup ? 'platform.claude.com' : 'claude.ai')
       assert.equal(orgs.headers.origin, 'https://claude.ai')
       assert.equal(authorize.headers.origin, 'https://claude.ai')
-      if (setup) {
-        assert.equal(authorize.headers.referer, 'https://platform.claude.com/oauth/authorize?code=true')
-      } else {
-        assert.equal(authorize.headers.referer, 'https://claude.ai/new')
-      }
-      // Token stage: axios for the cookie import, the browser for the mint.
-      assert.equal(token.headers['user-agent'], setup ? BROWSER_TOKEN_UA : 'axios/1.13.6')
+      assert.equal(
+        authorize.headers.referer,
+        setup ? 'https://platform.claude.com/oauth/authorize?code=true' : 'https://claude.ai/new',
+      )
+      // Token stage is the app on both profiles: axios UA, no browser headers,
+      // and a sessionKey mint never asks for a setup-token lifetime.
+      assert.equal(token.headers['user-agent'], 'axios/1.13.6')
+      assert.equal(Object.hasOwn(token.payload, 'expires_in'), false)
       assert.equal(
         bootstrap.headers['user-agent'],
         setup ? `claude-code/${OFFICIAL_CLI_VERSION}` : `claude-cli/${OFFICIAL_CLI_VERSION} (external, cli)`,
