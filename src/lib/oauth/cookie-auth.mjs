@@ -168,13 +168,24 @@ function isTokenForbidden(s) {
   return /token_exchange_forbidden|request not allowed/i.test(String(s || ''))
 }
 
+/**
+ * claude.ai now requires `client_attestation: { hcaptcha_token }` — a token only
+ * the page's hCaptcha can mint. The refusal says so, and no retry fixes it.
+ */
+function isClientAttestationRequired(s) {
+  return /missing_client_attestation|client_attestation/i.test(String(s || ''))
+}
+
 export function classifyImportHelperOutput(stderr) {
   const t = String(stderr || '')
   if (isSessionStale(t)) return 'session_stale_relogin'
   if (/state_mismatch/i.test(t)) return 'state_mismatch'
   if (/authorize_no_code/i.test(t)) return 'authorize_no_code'
   if (/proxy_auth_rejected|user was rejected by the socks5 server/i.test(t)) return 'proxy_auth_rejected'
+  if (isClientAttestationRequired(t)) return 'client_attestation_required'
   if (isOriginRejected(t)) return 'origin_rejected'
+  if (/worker_session_code_unsupported/i.test(t)) return 'worker_session_code_unsupported'
+  if (/worker_session_code_config/i.test(t)) return 'worker_session_code_config'
   if (isRateLimited(t)) return 'token_exchange_rate_limited'
   if (isTokenForbidden(t)) return 'token_exchange_forbidden'
   if (/bootstrap/i.test(t)) return 'bootstrap_failed'
@@ -203,6 +214,15 @@ export function publicImportError(raw, code = '') {
     return 'sessionKey 不够新，Anthropic 拒绝授权（Session is not fresh enough）。请重新登录 claude.ai 后立刻复制最新 sessionKey，不要用旧 cookie。'
   }
   if (/state_mismatch/i.test(s)) return 'OAuth state 校验失败，请重新生成授权链接后再导入。'
+  if (isClientAttestationRequired(s)) {
+    return '上游拒绝了这次 authorize 的客户端指纹（missing_client_attestation）：闸门量的是 TLS/HTTP2 指纹，cookie 段必须经 kin-worker 的 Chrome 传输（oauth session-code）。请确认槽位里的 kin-worker 是本次构建、kernel config 可读；临时也可改用「授权链接」在浏览器完成授权。'
+  }
+  if (/worker_session_code_unsupported/i.test(s)) {
+    return '槽位里的 kin-worker 太旧，没有 oauth session-code 操作（cookie 段要靠它的 Chrome TLS 指纹才能过 authorize）。请把 kin-worker 更新到本次构建后重试。'
+  }
+  if (/worker_session_code_config/i.test(s)) {
+    return '槽位里的 kernel config 读不到，cookie 段没法用它选出口（Chrome TLS 传输需要这一步）。请检查槽位 /run/kin/kernel.json 是否可读，或改用「授权链接」。'
+  }
   if (isOriginRejected(s)) {
     return '授权端点拒绝了来源头（Origin not allowed）：claude.ai 与 claude.com 两套来源都被拒。上游前端域名可能再次变更，请更新 src/lib/oauth/oauth-contract.mjs 里的授权来源常量。'
   }
@@ -242,9 +262,11 @@ export function panelImportErrorPayload(err) {
   const exitPolicy = code === 'proxy_unavailable' || code === 'ipv6_disabled' || code === 'proxy_required'
   const settled = stale || proxyAuth || exitPolicy
   const cf = !settled && (code === 'cloudflare_challenge' || /just a moment|cloudflare|doctype html/i.test(raw))
-  // Edge refusals: a refused Origin, or a token hop blocked by region, is the
-  // upstream moving under us — not a bad authorization code.
-  const upstreamProtocol = !settled && (code === 'origin_rejected' || code === 'token_exchange_forbidden')
+  // Edge refusals: a refused Origin, a region-blocked token hop, or a new
+  // browser-attestation gate is the upstream moving under us — not a bad code.
+  const upstreamProtocol =
+    !settled &&
+    (code === 'origin_rejected' || code === 'token_exchange_forbidden' || code === 'client_attestation_required')
   // A throttle is the one failure worth retrying unchanged, after a wait.
   const throttled = !settled && (code === 'token_exchange_rate_limited' || isRateLimited(raw))
   const reported = stale

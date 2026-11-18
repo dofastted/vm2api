@@ -166,6 +166,20 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
         )
         return
       }
+      if (authorizeMode === 'attestation') {
+        res.writeHead(400)
+        res.end(
+          JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'invalid_request_error',
+              message: "This request couldn't be completed.",
+              details: { error_code: 'missing_client_attestation' },
+            },
+          }),
+        )
+        return
+      }
       expectedExchange = {
         code: 'cookie-auth-code',
         challenge: payload.code_challenge,
@@ -439,12 +453,15 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       )
     })
   }
-  for (const mode of ['stale', 'state_mismatch']) {
+  for (const mode of ['stale', 'state_mismatch', 'attestation']) {
     await t.test(`session cookie rejects ${mode} before token exchange`, async () => {
       authorizeMode = mode
       const before = tokenRequests
       const requestStart = requests.length
-      await assert.rejects(run({ operation: 'session_key', session_key: sessionKey }))
+      // A missing browser attestation is final: no other origin variant is tried.
+      await assert.rejects(run({ operation: 'session_key', session_key: sessionKey }), (err) =>
+        mode === 'attestation' ? err.code === 'authorize_client_attestation' : true,
+      )
       assert.equal(tokenRequests, before)
       assert.deepEqual(
         requests.slice(requestStart).map(({ url }) => url),

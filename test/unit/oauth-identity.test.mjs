@@ -11,9 +11,9 @@ import { normalizeOauth } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { liveOauthToSetupToken } from '../../src/lib/oauth/credential-mode.mjs'
 import { createImportCommit } from '../../src/lib/oauth/import-commit.mjs'
 
-test('bootstrap URL uses claude-code entrypoint without vscode fields', () => {
-  assert.match(CLAUDE_CLI_BOOTSTRAP_URL, /\/api\/claude_cli\/bootstrap\?entrypoint=claude-code&model=claude-opus-5-5$/)
-  assert.doesNotMatch(CLAUDE_CLI_BOOTSTRAP_URL, /vscode/)
+test('bootstrap URL uses the captured sdk-cli entrypoint without vscode fields', () => {
+  assert.match(CLAUDE_CLI_BOOTSTRAP_URL, /\/api\/claude_cli\/bootstrap\?entrypoint=sdk-cli&model=claude-opus-5-5$/)
+  assert.doesNotMatch(CLAUDE_CLI_BOOTSTRAP_URL, /vscode|claude-code/)
 })
 test('flattenOauthIdentity reads oauth_account bootstrap shape', () => {
   assert.deepEqual(
@@ -30,6 +30,8 @@ test('flattenOauthIdentity reads oauth_account bootstrap shape', () => {
       org_uuid: 'org-1',
       subscription_type: null,
       rate_limit_tier: null,
+      organization_role: null,
+      subscription_created_at: null,
     },
   )
 })
@@ -46,6 +48,8 @@ test('flattenOauthIdentity reads token account/organization objects', () => {
       org_uuid: 'org-2',
       subscription_type: null,
       rate_limit_tier: null,
+      organization_role: null,
+      subscription_created_at: null,
     },
   )
 })
@@ -57,6 +61,8 @@ test('flattenOauthIdentity ignores empty strings', () => {
     org_uuid: null,
     subscription_type: null,
     rate_limit_tier: null,
+    organization_role: null,
+    subscription_created_at: null,
   })
 })
 
