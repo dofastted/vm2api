@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- 后续版本的 CRAG 商城、设备激活和宿主订阅请求改指向 `https://www.vm2api.org`。源站继续同时接受 `crag.fkcodex.com`。
+
 
 ## 1.4.152 — 2026-11-19 · 内核多版本缓存与调度状态修正
 

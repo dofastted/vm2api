@@ -21,7 +21,7 @@ import { publishKvmCragLicense } from './kvm-crag-license.mjs'
 import { publishClusterSubscription } from '../cluster/crag-subscription-files.mjs'
 import { blockKvmCragSubscription, holdKvmCragSubscriptionPublications } from './kvm-crag-subscription.mjs'
 
-const AUTHORITY = 'https://crag.fkcodex.com'
+const AUTHORITY = 'https://www.vm2api.org'
 const HOST_ID_MOUNT = '/run/crag-host-machine-id'
 const SHARED_HOST_ID_FILESYSTEMS = new Set([0x01021997, 0x65735546])
 const localFilesystems = new Set([0xef53, 0x794c7630, 0x58465342, 0x9123683e, 0x2fc12fc1, 0xf2f52010])

@@ -2,7 +2,7 @@
 
 ## 职责和信任边界
 
-vm2api 内置的是**商城代理和授权消费端**，不是收款服务。面板把核价、订单状态及领取请求发给固定供应方 `https://crag.fkcodex.com`。同域的 `/shop/*` 由私有 `crag-shop` 负责；支付平台通知它的 `/shop/epay/notify`，不是本地 vm2api。商城验证回调、登记真实交易，再向 `crag-auth` 的 `/v1/integrations/deliveries/callback` 发起 HMAC 签名交付。浏览器 `/shop/return` 只是回跳，不是付款证明。Authority 负责发码、核销和签发权益；vm2api 验证签名、载荷和设备绑定，不签发权限。供应方视角见 CRAG 仓库 `docs/CRAG-PAYMENT-AUTH.md`。
+vm2api 内置的是**商城代理和授权消费端**，不是收款服务。面板把核价、订单状态及领取请求发给固定供应方 `https://www.vm2api.org`。同域的 `/shop/*` 由私有 `crag-shop` 负责；支付平台通知它的 `/shop/epay/notify`，不是本地 vm2api。商城验证回调、登记真实交易，再向 `crag-auth` 的 `/v1/integrations/deliveries/callback` 发起 HMAC 签名交付。浏览器 `/shop/return` 只是回跳，不是付款证明。Authority 负责发码、核销和签发权益；vm2api 验证签名、载荷和设备绑定，不签发权限。供应方视角见 CRAG 仓库 `docs/CRAG-PAYMENT-AUTH.md`。
 
 面板买家会话、商城订单收据、Authority 交付 HMAC、宿主订阅凭据是四种不同的凭据。浏览器只持有买家会话；vm2api 在服务端按订单使用收据，在宿主核销时使用另一套宿主凭据。收据主密钥持久化在数据目录 `crag-shop-private/receipt.key`，不随常规数据库备份；要恢复原订单必须同时保留此密钥。不要记录 Cookie、付款表单、支付交易号、收银台会话链接、兑换码、授权凭证或机器码。
 

@@ -1,7 +1,7 @@
 import { constants } from 'node:fs'
 import { open } from 'node:fs/promises'
 
-const ROOT = 'https://crag.fkcodex.com'
+const ROOT = 'https://www.vm2api.org'
 const MAX_RESPONSE = 64 * 1024
 // Catalog descriptions can use the full published 128-plan limit with UTF-8 copy.
 const MAX_PLANS_RESPONSE = 384 * 1024

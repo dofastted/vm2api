@@ -29,7 +29,7 @@ import {
 } from '../fixtures/crag-license.mjs'
 
 const PANEL = 'https://panel.example.test'
-const SHOP = 'https://crag.fkcodex.com'
+const SHOP = 'https://www.vm2api.org'
 const BASE = '/api/panel/crag-shop'
 const INPUT = { sku: 'quarter', payment_method: 'alipay', request_id: 'same-client-key' }
 const PLAN = { sku: 'quarter', term: '3m', amount_minor: 59900, slot_limit: 10 }
