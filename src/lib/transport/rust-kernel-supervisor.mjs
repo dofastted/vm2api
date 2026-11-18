@@ -60,10 +60,15 @@ import { clearKvmCragSubscription } from '../vm/kvm-crag-subscription.mjs'
 import { workerPaths } from './go-worker-client.mjs'
 import { effectiveSlotCount } from '../vm/slot-capacity.mjs'
 
-/** The native host is authenticated separately from account scheduling readiness. */
+/**
+ * The native host is authenticated separately from account scheduling readiness.
+ * A CRAG v2 process pool spawns its Claude processes on demand: with prewarm off an
+ * idle healthy pool reports `cli_pid: 0`, so a live process is not required there.
+ */
 function runtimeReady(health, allowMissingCredential) {
   if (!allowMissingCredential) return rustKernelReachable(health)
-  return rustKernelProcessUp(health) && health?.healthy !== false && Number(health?.cli_pid) > 0
+  if (!rustKernelProcessUp(health) || health?.healthy === false) return false
+  return Number(health?.cli_pid) > 0 || health?.execution_mode === 'v2_process_pool'
 }
 
 function normalizeAutoCompactWindow(value) {
@@ -1118,6 +1123,14 @@ export function stopAllRustKernels() {
   const cancelled = starts.size
   starts.clear()
   return { ok: true, stopped: 0, cancelled }
+}
+
+/** Abandon one VM's pending kernel start; its health wait returns `start_cancelled`. */
+export function cancelRustKernelStart(vmId) {
+  const pending = starts.get(String(vmId || ''))
+  if (!pending) return false
+  pending.control.cancelled = true
+  return true
 }
 function kernelConfigText(config) {
   return JSON.stringify(config, null, 2) + '\n'

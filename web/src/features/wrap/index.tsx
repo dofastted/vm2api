@@ -41,6 +41,7 @@ import { cragHostStatusQueryOptions } from '@/features/vm/queries'
 import { KernelLicenseDialog } from './license-dialog'
 import {
   installKernelTargets,
+  cancelKernelInstall,
   kernelCatalogQueryOptions,
   kernelVersionsQueryOptions,
   pullKernelRelease,
@@ -209,6 +210,17 @@ export function WrapSamplePage() {
       }
     })
     setConfirm(pinned)
+  }
+
+  async function forceCancel(id: string) {
+    try {
+      await cancelKernelInstall(id)
+      toast.warning('已强制取消该虚拟机的安装', {
+        description: '已停止的槽位保持维护状态，请检查后重装或手动启动。',
+      })
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '取消失败')
+    }
   }
 
   async function runInstall(targets: KernelTarget[]) {
@@ -573,6 +585,15 @@ export function WrapSamplePage() {
                       ? `正在安装 ${Math.min(job.completed + (job.activeId ? 1 : 0), job.total)}/${job.total}`
                       : `已完成：${succeededCount} 台成功${failedCount ? `，${failedCount} 台失败` : ''}`}
                   </span>
+                  {installing && job.activeId ? (
+                    <Button
+                      variant='outline'
+                      size='sm'
+                      onClick={() => void forceCancel(job.activeId!)}
+                    >
+                      强制取消
+                    </Button>
+                  ) : null}
                   {!installing ? (
                     <Button
                       variant='ghost'
