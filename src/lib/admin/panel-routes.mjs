@@ -185,7 +185,7 @@ import {
   SESSION_SLOT_MIN,
   validateInferenceRoutingPatch,
 } from '../vm/slot-engine.mjs'
-import { validateTelemetryRoutingPatch } from '../vm/native-telemetry.mjs'
+import { telemetryDefaultEnabled, validateTelemetryRoutingPatch } from '../vm/native-telemetry.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import * as panel from './panel-api.mjs'
 import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
@@ -5109,6 +5109,7 @@ export function createPanelHandler(ctx) {
           owner: { role: ident.role, userId: req.panelUserId },
           proxyPool,
           occupied: historic,
+          telemetryDefaultEnabled: telemetryDefaultEnabled(ctx.routingConfig),
         })
         if (!result.ok) return json(res, result.status, { ok: false, error: result.error })
         await fillTimezoneFromExit(result.vm.id)
@@ -5419,7 +5420,7 @@ export function createPanelHandler(ctx) {
           unschedulable: { reason: 'no_credential', detail: null, at: new Date().toISOString() },
           proxy_cli_enabled: body.proxy_cli_enabled === true,
           proxy_required: false,
-          seed_policy: standardSeedPolicy(),
+          seed_policy: standardSeedPolicy({}, { defaultEnabled: telemetryDefaultEnabled(ctx.routingConfig) }),
           runtime: { type: runtime },
           machine,
         }
@@ -6672,6 +6673,7 @@ export function createPanelHandler(ctx) {
             applied_rpm: applied.rpm,
             applied_session_slots: applied.session_slots,
             kernel_persona: applied.kernel_persona || null,
+            telemetry_sync: applied.telemetry_sync || null,
             inference_runtime: publicEngineRuntime,
           }),
         )

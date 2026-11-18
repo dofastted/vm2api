@@ -61,7 +61,7 @@ import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig } from '../vm/machine-spec.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
-import { telemetryUploadInterval } from '../vm/native-telemetry.mjs'
+import { telemetryDefaultEnabled, telemetryUploadInterval } from '../vm/native-telemetry.mjs'
 
 export function createRoutingRuntime(ctx) {
   const getRouting = () => (typeof ctx.getRoutingConfig === 'function' ? ctx.getRoutingConfig() : ctx.routingConfig)
@@ -442,18 +442,35 @@ export function createRoutingRuntime(ctx) {
   }
 
   // Native slots hot-read kernel.json; publication must be acknowledged per VM.
-  async function syncTelemetryUploadInterval(routingConfig) {
+  async function syncTelemetryUploadInterval(
+    routingConfig,
+    { defaultEnabled = false, prevDefaultEnabled = false } = {},
+  ) {
     const project = ctx.cfg.paths.project
     const applied = { updated: 0, queued: 0, skipped: 0, failed: [] }
+    const optIn = defaultEnabled === true && prevDefaultEnabled !== true
     for (const { id } of listVms(project)) {
       const vm = getVm(project, id)
       if (!vm || isCodexVm(vm)) continue
-      if (resolveKernelDataplane(vm, routingConfig) === 'crag') {
+      if (optIn && vm.seed_policy?.telemetry_disabled !== false) {
+        const vmPath = path.join(project, 'vms', `${id}.json`)
+        const fresh = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+        fresh.seed_policy = { ...(fresh.seed_policy || {}), telemetry_disabled: false }
+        fresh.updated_at = new Date().toISOString()
+        atomicWriteJson(vmPath, fresh, { mode: 0o600 })
+      }
+      if (resolveKernelDataplane(vm, routingConfig) === 'crag' && !optIn) {
         applied.skipped += 1
         continue
       }
       try {
-        const result = await applyNativeTelemetry({ projectRoot: project, vm, routing: routingConfig })
+        const current = getVm(project, id) || vm
+        const result = await applyNativeTelemetry({
+          projectRoot: project,
+          vm: current,
+          routing: routingConfig,
+          lifecycle: { watchdog: ctx.kernelWatchdog, poolScheduler: ctx.poolScheduler },
+        })
         if (result.supported === false) {
           applied.skipped += 1
           continue
@@ -490,6 +507,7 @@ export function createRoutingRuntime(ctx) {
     const prevIdleMs = streamIdleTimeoutMs(routingConfig)
     const prevRequestBytes = maxRequestBytes(routingConfig)
     const prevUploadInterval = telemetryUploadInterval(routingConfig)
+    const prevDefaultEnabled = telemetryDefaultEnabled(routingConfig)
     setRouting(routingConfig)
     if (body.sticky) routingConfig.sticky = { ...(routingConfig.sticky || {}), ...body.sticky }
     if (body.quota) routingConfig.quota = { ...(routingConfig.quota || {}), ...body.quota }
@@ -537,11 +555,15 @@ export function createRoutingRuntime(ctx) {
       }
       routingConfig.vm = normalizeVmConfig(next)
     }
-    if (body.telemetry && Object.hasOwn(body.telemetry, 'upload_interval_seconds')) {
-      routingConfig.telemetry = {
-        ...(routingConfig.telemetry || {}),
-        upload_interval_seconds: telemetryUploadInterval({ telemetry: body.telemetry }),
+    if (body.telemetry && typeof body.telemetry === 'object' && !Array.isArray(body.telemetry)) {
+      const nextTelemetry = { ...(routingConfig.telemetry || {}) }
+      if (Object.hasOwn(body.telemetry, 'upload_interval_seconds')) {
+        nextTelemetry.upload_interval_seconds = telemetryUploadInterval({ telemetry: body.telemetry })
       }
+      if (Object.hasOwn(body.telemetry, 'default_enabled')) {
+        nextTelemetry.default_enabled = body.telemetry.default_enabled === true
+      }
+      routingConfig.telemetry = nextTelemetry
     }
     applyOfficialCcRoutingBody(body, prevOfficialCc)
     applyHealthProbeRoutingBody(body, prevHealthProbe)
@@ -587,9 +609,10 @@ export function createRoutingRuntime(ctx) {
       idleChanged || requestBytesChanged
         ? reloadClaudeKernelsWhenIdle(routingConfig, { idleOnly: !requestBytesChanged })
         : 0
+    const defaultEnabled = telemetryDefaultEnabled(routingConfig)
     const telemetrySync =
-      telemetryUploadInterval(routingConfig) !== prevUploadInterval
-        ? await syncTelemetryUploadInterval(routingConfig)
+      telemetryUploadInterval(routingConfig) !== prevUploadInterval || defaultEnabled !== prevDefaultEnabled
+        ? await syncTelemetryUploadInterval(routingConfig, { defaultEnabled, prevDefaultEnabled })
         : null
     // Pool and failover settings hot-reload into the live scheduler and runner.
     // Rebuilding them would drop the seat book and queues while their requests

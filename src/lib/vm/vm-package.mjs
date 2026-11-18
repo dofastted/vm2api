@@ -555,10 +555,13 @@ async function attachProxy(projectRoot, id, spec, proxyPool, ownerUserId) {
   return { ok: true }
 }
 
-function finishControl(projectRoot, id, spec, status) {
+function finishControl(projectRoot, id, spec, status, { telemetryDefaultEnabled = false } = {}) {
   const file = path.join(projectRoot, 'vms', `${id}.json`)
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   applyTraits(vm, spec)
+  if (telemetryDefaultEnabled === true && !isCodexVm(vm)) {
+    vm.seed_policy = standardSeedPolicy(vm.seed_policy || {}, { defaultEnabled: true })
+  }
   applySchedule(vm, spec, credentialPresent(spec, vm))
   vm.status = status
   // Do not reset proxy_cli_enabled: attachProxy/bindVmProxy owns it.
@@ -595,6 +598,7 @@ export async function commitVmPackage({
   owner = { role: 'admin', userId: null },
   proxyPool,
   occupied = [],
+  telemetryDefaultEnabled = false,
 }) {
   if (!parsed?.ok)
     return { ok: false, status: 400, error: parsed?.error || { code: 'invalid_package', message: '包无效' } }
@@ -646,7 +650,7 @@ export async function commitVmPackage({
       unschedulable: { reason: 'no_credential', detail: null, at: new Date().toISOString() },
       proxy_cli_enabled: false,
       proxy_required: false,
-      seed_policy: standardSeedPolicy(),
+      seed_policy: standardSeedPolicy({}, { defaultEnabled: telemetryDefaultEnabled === true }),
       runtime: { type: 'docker' },
       machine: resolveMachineSpec({ config: normalizeVmConfig(), runtime: 'docker' }),
       owner_user_id: owner.role === 'user' ? normalizeOwnerId(owner.userId) : null,
@@ -675,6 +679,9 @@ export async function commitVmPackage({
     return { ok: false, status: 403, error: { code: 'proxy_forbidden', message: '无权绑定这个出口' } }
   }
   applyTraits(vm, spec)
+  if (create && telemetryDefaultEnabled === true && !isCodexVm(vm)) {
+    vm.seed_policy = standardSeedPolicy(vm.seed_policy || {}, { defaultEnabled: true })
+  }
   applySchedule(vm, spec, false)
   atomicWriteJson(file, vm, { mode: 0o600 })
   if (create) {
@@ -688,7 +695,7 @@ export async function commitVmPackage({
 
   const written = writeCredential(projectRoot, id, spec)
   if (!written.ok) return { ok: false, status: 400, error: written.error }
-  let saved = finishControl(projectRoot, id, spec, status)
+  let saved = finishControl(projectRoot, id, spec, status, { telemetryDefaultEnabled })
   if (written.account) {
     mirrorCodex(saved, written.account)
     saved.updated_at = new Date().toISOString()
@@ -696,7 +703,7 @@ export async function commitVmPackage({
   }
   const attached = await attachProxy(projectRoot, id, spec, proxyPool, saved.owner_user_id || null)
   if (!attached.ok) return { ok: false, status: 400, error: attached.error }
-  saved = finishControl(projectRoot, id, spec, status)
+  saved = finishControl(projectRoot, id, spec, status, { telemetryDefaultEnabled })
   if (written.account) mirrorCodex(saved, written.account)
   // Flag already follows the bound exit from attachProxy.
   saved.updated_at = new Date().toISOString()
