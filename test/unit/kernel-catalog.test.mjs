@@ -5,7 +5,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { gzipSync } from 'node:zlib'
-import { describeKernelCatalog, pullKernelRelease } from '../../src/lib/admin/kernel-catalog.mjs'
+import {
+  describeKernelCatalog,
+  listKernelReleases,
+  pullKernelRelease,
+  selectKernelRelease,
+} from '../../src/lib/admin/kernel-catalog.mjs'
 import { CRAG_V2_RELEASE_ASSET } from '../../src/lib/admin/release-kernel.mjs'
 import {
   cragV2Arch,
@@ -643,7 +648,7 @@ test('publication failure preserves the pointer and prior package byte-for-byte'
   assert.equal(fs.readdirSync(path.join(root, 'share/wrap-cli-releases/packages')).length, 1)
 })
 
-test('cache retains only current and previous immutable snapshots', async (t) => {
+test('re-pulling the same release keeps only its newest immutable snapshot', async (t) => {
   const root = fixture(t)
   const selected = []
   for (const revision of ['one', 'two', 'three']) {
@@ -656,7 +661,7 @@ test('cache retains only current and previous immutable snapshots', async (t) =>
     selected.push(wrapCliTemplateDir(root))
   }
   assert.equal(fs.existsSync(selected[0]), false)
-  assert.equal(fs.existsSync(selected[1]), true)
+  assert.equal(fs.existsSync(selected[1]), false)
   assert.equal(fs.existsSync(selected[2]), true)
 })
 
@@ -877,4 +882,49 @@ test('incomplete selected CLI cache cannot silently reuse the factory kernel', a
   } finally {
     delete process.env.KIN_KERNEL_BIN
   }
+})
+
+test('CRAG cache keeps several releases and switches between them without downloading', {
+  skip: cragV2Arch() !== 'amd64',
+}, async (t) => {
+  const root = fixture(t)
+  const factory = seedEncryptedPackage(root, { revision: 'new' })
+  const bytes = archive(factory)
+  seedEncryptedPackage(root, { revision: 'factory' })
+  const pull = async (tag) => {
+    const result = await pullKernelRelease(
+      root,
+      { kernel: 'crag' },
+      transport({ [CRAG_V2_RELEASE_ASSET]: bytes }, { tag }),
+    )
+    assert.equal(result.ok, true, result.error)
+    return cragV2PackageRoot(root)
+  }
+  const first = await pull('v1.2.3')
+  const second = await pull('v1.2.4')
+  const third = await pull('v1.2.5')
+  assert.notEqual(first, second)
+  for (const dir of [first, second, third]) assert.equal(fs.existsSync(dir), true)
+  assert.deepEqual(
+    listKernelReleases(root, 'crag').releases.map((row) => [row.tag, row.current]),
+    [
+      ['v1.2.5', true],
+      ['v1.2.4', false],
+      ['v1.2.3', false],
+    ],
+  )
+  const selected = selectKernelRelease(root, {
+    kernel: 'crag',
+    tag: 'v1.2.3',
+  })
+  assert.equal(selected.ok, true, selected.error)
+  assert.equal(cragV2PackageRoot(root), first)
+  assert.equal(describeKernelCatalog(root)[1].release_tag, 'v1.2.3')
+  assert.equal(selectKernelRelease(root, { kernel: 'crag', tag: 'v9.9.9' }).code, 'kernel_release_not_cached')
+  // Re-pulling a cached release replaces only that release's package.
+  const again = await pull('v1.2.4')
+  assert.notEqual(again, second)
+  assert.equal(fs.existsSync(second), false)
+  assert.equal(fs.existsSync(first), true)
+  assert.equal(listKernelReleases(root, 'crag').releases.length, 3)
 })

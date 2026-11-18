@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 内核缓存可同时保留多个版本：每个版本（CRAG 按 `payload_tag`，cli-node 按 tag）留一份，最多 6 个，当前版本不会被清理。此前只留当前和上一份，想让不同槽位跑不同版本就得反复重新下载。新增 `GET /api/panel/kernels/cached?kernel=crag` 列出本机已缓存的版本，`POST /api/panel/kernels/select {kernel, tag}` 把安装用的当前版本切到已缓存的包，不重新下载；安装进行中拒绝切换。已安装的槽位各自持有内核副本，切换或清理缓存不影响运行中的槽位。
 - 「订阅 CRAG」页头和套餐预览画布都显示 Telegram 群入口，徽标链接到 https://t.me/vm2api。免登录购买页同样显示。
 
 ## 1.4.151 — 2026-11-19 · OAuth 换票与 CRAG 3.1.7
