@@ -16,13 +16,13 @@ export const CAI_AUTHORIZE_URL = 'https://claude.com/cai/oauth/authorize'
 export const PLATFORM = 'https://platform.claude.com'
 export const ANTHROPIC_API = 'https://api.anthropic.com'
 export const TOKEN_URL = `${PLATFORM}/v1/oauth/token`
-export const BOOTSTRAP_URL = `${ANTHROPIC_API}/api/claude_cli/bootstrap?entrypoint=claude-code&model=claude-opus-5-5`
-/** Setup-token mint (README: local-src/oauth-auth) reads identity as the VS Code entrypoint. */
-export const SETUP_TOKEN_BOOTSTRAP_URL = `${ANTHROPIC_API}/api/claude_cli/bootstrap?entrypoint=claude-vscode&model=claude-opus-5`
-/** Account settings PATCH target; `{"grove_enabled": true}` is the Grove agreement. */
-export const ACCOUNT_SETTINGS_URL = `${ANTHROPIC_API}/api/oauth/account/settings`
-/** What the CLI reads a setup token's account from (`getOauthProfileFromOauthToken`). */
+/** Native 2.1.321 login reads bootstrap as sdk-cli on Opus 5.5, after the eval posts. */
+export const BOOTSTRAP_URL = `${ANTHROPIC_API}/api/claude_cli/bootstrap?entrypoint=sdk-cli&model=claude-opus-5-5`
 export const OAUTH_PROFILE_URL = `${ANTHROPIC_API}/api/oauth/profile`
+export const OAUTH_ROLES_URL = `${ANTHROPIC_API}/api/oauth/claude_cli/roles`
+export const FIRST_TOKEN_DATE_URL = `${ANTHROPIC_API}/api/organization/claude_code_first_token_date`
+/** GrowthBook remote eval. Both posts after a token exchange hit this path. */
+export const EVAL_SDK_URL = `${ANTHROPIC_API}/api/eval/sdk-zAZezfDKGoZuXXKe`
 export const FULL_OAUTH_SCOPE =
   'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
 /**
@@ -34,8 +34,8 @@ export const INFERENCE_ONLY_SCOPE = 'user:inference'
 export const SETUP_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60
 export const BROWSER_AUTHORIZE_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36'
-/** sub2api exchanges its code as axios; the cookie stages still carry a Chrome fingerprint. */
-export const TOKEN_UA_AXIOS = 'axios/1.13.6'
+/** Native 2.1.321 `exchangeCodeForTokens` posts as axios/1.15.2, content-type only. */
+export const TOKEN_UA_AXIOS = 'axios/1.15.2'
 export const BETA_OAUTH = 'oauth-2025-04-20'
 /** Per-request ceiling for every exchange hop; one slow hop must not time out the flow. */
 export const OAUTH_REQUEST_TIMEOUT_MS = 60_000
