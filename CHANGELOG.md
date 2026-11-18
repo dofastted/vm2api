@@ -1,7 +1,12 @@
 # Changelog
 
 ## Unreleased
-- 默认 CRAG 签名载荷改为 `payload-2026.11.19-crag-3.1.7`。原生 TUI 固定 `CLAUDE_CODE_ENTRYPOINT=cli`。不自动切换运行槽位，其余载荷不变。
+
+## 1.4.151 — 2026-11-19 · OAuth 换票与 CRAG 3.1.7
+
+- Cookie 导入和粘贴授权码共用换票后的账号资料、角色及客户端初始化流程；后续资料读取失败不丢弃已换到的票据（`a1e77411`）。
+- 锁定新版 `kin-oauth-auth` 到 `payload-2026.11.19-oauth-eval`，使控制面与槽内 helper 使用同一契约（#1286）。
+- 内核页默认下载 CRAG 3.1.7 标准签名包，保留原授权。原生 TUI 固定使用 `cli` 入口，不自动替换已安装的内核（#1288）。
 
 ## 1.4.150 — 2026-11-19 · OAuth Setup Token 与原生 Claude 初始化
 
