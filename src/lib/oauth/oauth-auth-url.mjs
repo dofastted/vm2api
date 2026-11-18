@@ -164,6 +164,9 @@ async function exchangeCodeForToken(authCode, codeVerifier, state, session, opti
     state,
     redirectUri: session.redirectUri,
     tokenUrls: session.tokenUrls,
+    // The setup-token flavor is the README mint; CAI paste codes exchange as
+    // sub2api does. The runtime mode is what picks the transport profile.
+    runtimeMode: session.flavor === 'setup_token' ? 'setup-token' : 'oauth',
     ...options,
   })
 }
