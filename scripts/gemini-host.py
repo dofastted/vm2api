@@ -841,7 +841,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             if length < 1 or length > 8192:
                 raise Failure(400)
-            operation = self.path.removeprefix("/")
+            operation = self.path[1:] if self.path.startswith("/") else self.path
             if operation not in {
                 "list",
                 "get",

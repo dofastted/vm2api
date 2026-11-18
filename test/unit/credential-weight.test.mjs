@@ -7,8 +7,10 @@ import {
   automaticScheduleLevel,
   parseScheduleLevelInput,
   resolveCredentialScheduleLevel,
+  setResetPriorityEnabled,
   weeklyResetAt,
 } from '../../src/lib/pool/credential-weight.mjs'
+import { normalizePoolRouting, PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { persistVmActiveHours, persistVmScheduleLevel, summarizeVm } from '../../src/lib/vm/vm-registry.mjs'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -103,4 +105,33 @@ test('VM active hours persist, normalize, and clear to 24h duty', (t) => {
   assert.equal(summarizeVm(saved).active_hours, null)
 
   assert.throws(() => persistVmActiveHours(root, 'vm-01', { start: '8:00', end: '22:00' }), TypeError)
+})
+
+test('pool.reset_priority off flattens auto levels; manual levels still apply', () => {
+  try {
+    assert.equal(normalizePoolRouting({}).reset_priority, true)
+    assert.equal(normalizePoolRouting({ reset_priority: false }).reset_priority, false)
+    setResetPriorityEnabled(false)
+    assert.equal(automaticScheduleLevel(NOW + 1, NOW), 1)
+    assert.equal(automaticScheduleLevel(NOW + 6 * DAY_MS, NOW), 1)
+    assert.deepEqual(resolveCredentialScheduleLevel({ manualLevel: 5, resetAt: NOW + 1, now: NOW }), {
+      level: 5,
+      mode: 'manual',
+    })
+    setResetPriorityEnabled(true)
+    assert.equal(automaticScheduleLevel(NOW + 1, NOW), 7)
+  } finally {
+    setResetPriorityEnabled(true)
+  }
+})
+
+test('PoolScheduler config load and hot reload drive reset_priority', () => {
+  try {
+    const scheduler = new PoolScheduler({ config: { reset_priority: false } })
+    assert.equal(automaticScheduleLevel(NOW + 1, NOW), 1)
+    scheduler.reloadConfig({})
+    assert.equal(automaticScheduleLevel(NOW + 1, NOW), 7)
+  } finally {
+    setResetPriorityEnabled(true)
+  }
 })
