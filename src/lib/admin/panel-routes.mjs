@@ -721,6 +721,13 @@ export function createPanelHandler(ctx) {
   })
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
+  const kernelInstallJobs = new Map()
+  const pruneKernelInstallJobs = () => {
+    const now = Date.now()
+    for (const [id, job] of kernelInstallJobs) {
+      if (job.expiresAt <= now) kernelInstallJobs.delete(id)
+    }
+  }
   const json = (...args) => ctx.json(...args)
   const hostUnsupported = (res, vm, cap) => {
     if (slotHost(vm).supports(cap)) return false
@@ -3118,25 +3125,48 @@ export function createPanelHandler(ctx) {
             releaseStoppedBinding: ctx.cragSubscription?.releaseStoppedBinding?.bind(ctx.cragSubscription),
           })
         if (body.background === true) {
-          // The request returns at once; progress is the VM record's kernel_operation and
-          // GET /api/panel/kernels/install, so a proxy timeout cannot strand the installer.
+          pruneKernelInstallJobs()
+          if (kernelInstallJobs.size >= 256)
+            return json(res, 429, {
+              ok: false,
+              error: { code: 'kernel_install_queue_full', message: '内核安装任务过多，请稍后再试。' },
+            })
+          const jobId = randomUUID()
+          const targets = body.targets.map(({ id, kernel }) => ({ id, kernel }))
+          const job = { targets, state: 'running', expiresAt: Infinity }
+          kernelInstallJobs.set(jobId, job)
           install()
             .then((report) => {
+              job.state = 'completed'
+              job.report = report
               for (const item of report.items || [])
                 console.log(
                   `[kernel-install] background ${item.id} ${item.kernel} ${item.ok ? 'ok' : `failed ${item.code || ''}`}`,
                 )
             })
-            .catch((error) => console.warn(`[kernel-install] background install crashed: ${error?.message || error}`))
-          return json(
-            res,
-            202,
-            panel.ok({ background: true, targets: body.targets.map(({ id, kernel }) => ({ id, kernel })) }),
-          )
+            .catch(() => {
+              job.state = 'unknown'
+              console.warn(`[kernel-install] background job ${jobId} did not return a result`)
+            })
+            .finally(() => {
+              job.expiresAt = Date.now() + 15 * 60_000
+            })
+          return json(res, 202, panel.ok({ background: true, job_id: jobId, targets }))
         }
         return json(res, 200, panel.ok(await install()))
       }
       if (req.method === 'GET' && p === '/api/panel/kernels/install') {
+        const jobId = url.searchParams.get('job_id')
+        if (jobId !== null) {
+          pruneKernelInstallJobs()
+          const job = kernelInstallJobs.get(jobId)
+          if (!job || job.targets.some(({ id }) => userMissesVmId(req, cfg.paths.project, id)))
+            return json(res, 404, {
+              ok: false,
+              error: { code: 'kernel_install_job_missing', message: '未找到安装结果，请核对槽位后再操作。' },
+            })
+          return json(res, 200, panel.ok({ state: job.state, ...(job.report && { report: job.report }) }))
+        }
         const items = listActiveKernelInstalls().filter((item) => !userMissesVmId(req, cfg.paths.project, item.id))
         return json(res, 200, panel.ok({ items }))
       }

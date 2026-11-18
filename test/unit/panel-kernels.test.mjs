@@ -60,8 +60,7 @@ function fixture(t) {
   seedEncryptedPackage(root)
   return { root, vms }
 }
-async function route(root, method, endpoint, body, options = {}) {
-  const response = {}
+function routes(root, options = {}) {
   const handle = createPanelHandler({
     cfg: { paths: { project: root } },
     routingConfig: {},
@@ -71,16 +70,22 @@ async function route(root, method, endpoint, body, options = {}) {
       req.panelUserId = 'owner-a'
       return true
     },
-    json(_res, status, payload) {
-      response.status = status
-      response.body = payload
+    json(res, status, payload) {
+      res.status = status
+      res.body = payload
       return true
     },
-    readBody: async () => body,
+    readBody: async (req) => req.body,
     ...options.ctx,
   })
-  await handle({ method }, {}, new URL(`http://localhost/api/panel/kernels${endpoint}`))
-  return response
+  return async (method, endpoint, body) => {
+    const response = {}
+    await handle({ method, body }, response, new URL(`http://localhost/api/panel/kernels${endpoint}`))
+    return response
+  }
+}
+function route(root, method, endpoint, body, options) {
+  return routes(root, options)(method, endpoint, body)
 }
 
 test('catalog has exactly two public products and lists licenses without initializing any identity', async (t) => {
@@ -133,6 +138,7 @@ for (const role of ['user', 'super']) {
     ['GET', '/releases'],
     ['POST', '/pull'],
     ['POST', '/install'],
+    ['GET', '/install'],
   ]) {
     test(`${role} cannot access kernel ${method} ${endpoint || 'inventory'}`, async (t) => {
       const { root } = fixture(t)
@@ -246,6 +252,47 @@ test('install route changes only explicit Claude target, returns partial outcome
   assert.equal(getVm(root, 'vm-14').status, 'running')
   assert.equal(fs.existsSync(cragLicenseDirectory(root, { id: 'vm-14' })), false)
   assert.deepEqual(fs.readFileSync(path.join(root, 'vms', 'vm-gpt.json')), untouched)
+})
+
+test('background install keeps the final per-slot result after the POST has returned', async (t) => {
+  const { root } = fixture(t)
+  const stop = Promise.withResolvers()
+  let stopCount = 0
+  const handle = routes(root, {
+    ctx: {
+      kernelInstallOps: {
+        stopSlot() {
+          stopCount++
+          return stop.promise
+        },
+      },
+    },
+  })
+  const receipt = await handle('POST', '/install', {
+    background: true,
+    targets: [{ id: 'vm-13', kernel: 'cli-node' }],
+  })
+  assert.equal(receipt.status, 202)
+  const endpoint = `/install?job_id=${receipt.body.data.job_id}`
+  assert.deepEqual((await handle('GET', endpoint)).body.data, { state: 'running' })
+  assert.equal((await handle('GET', '/install?job_id=missing')).status, 404)
+  stop.resolve({ ok: false, code: 'fixture_stop_failed', error: 'fixture refused to stop' })
+  await new Promise((resolve) => setImmediate(resolve))
+  const result = (await handle('GET', endpoint)).body.data
+  assert.equal(result.state, 'completed')
+  assert.deepEqual(result.report.items, [
+    {
+      id: 'vm-13',
+      kernel: 'cli-node',
+      ok: false,
+      code: 'fixture_stop_failed',
+      error: 'fixture refused to stop',
+      stopped: false,
+    },
+  ])
+  assert.equal(stopCount, 1)
+  assert.equal(getVm(root, 'vm-13').status, 'running')
+  assert.deepEqual((await handle('GET', endpoint)).body.data, result)
 })
 
 function releaseFetch() {

@@ -3,6 +3,7 @@ import type { CragLicenseStatus, Vm } from '@/types/panel-vm'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { toast } from 'sonner'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { ApiError } from '@/lib/api'
 import type { CragHostStatus } from '@/features/vm/queries'
 import { WrapSamplePage } from './index'
 import { installKernelTargets, type KernelInstallation } from './queries'
@@ -125,12 +126,13 @@ vi.mock('sonner', () => ({
   toast: { success: vi.fn(), warning: vi.fn(), error: vi.fn() },
 }))
 
-function render(vm: Partial<Vm> = {}) {
+function render(vm: Partial<Vm> = {}, otherVms: Vm[] = []) {
   state.cursor = 0
   state.buttons.length = 0
   state.confirm = undefined
   state.vms = [
     { id: 'vm-old', resolved_dataplane: 'wrap', runtime_type: 'kvm', ...vm },
+    ...otherVms,
   ]
   return renderToStaticMarkup(<WrapSamplePage />)
 }
@@ -267,6 +269,35 @@ it('shows deferred CRAG reclamation after a cli-node install and refreshes the h
   )
   expect(toast.success).not.toHaveBeenCalled()
   expect(render(vm)).toContain('重启完成，原调度限制保留；CRAG 绑定待回收')
+})
+
+it('pauses a bulk installation when the first slot result is unconfirmed', async () => {
+  vi.mocked(installKernelTargets).mockRejectedValueOnce(
+    new ApiError('无法确认安装结果', 0, 'kernel_install_unconfirmed')
+  )
+  const otherVms: Vm[] = [
+    { id: 'vm-next', resolved_dataplane: 'crag', runtime_type: 'docker' },
+  ]
+  render({}, otherVms)
+  const button = state.buttons.find(
+    (entry) => entry['aria-label'] === '把 CRAG 更新到全部槽位'
+  )
+  expect(button?.disabled).toBe(false)
+  button?.onClick?.({} as Parameters<NonNullable<ButtonProps['onClick']>>[0])
+  render({}, otherVms)
+  expect(state.confirm?.open).toBe(true)
+  state.confirm?.handleConfirm?.()
+  await vi.waitFor(() =>
+    expect(render({}, otherVms)).toContain('当前槽位结果未确认')
+  )
+  expect(installKernelTargets).toHaveBeenCalledExactlyOnceWith([
+    {
+      id: 'vm-old',
+      kernel: 'crag',
+      payload_tag: 'payload-2026.11.16-crag-3.0.8',
+    },
+  ])
+  expect(toast.success).not.toHaveBeenCalled()
 })
 
 it.each(['license_required', 'license_payload_key_mismatch'])(
