@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.142 — 2026-11-18 · 安装升级失败可恢复、本地排队 529 可区分
+
+- 一键安装与升级在 `compose pull` 失败时还原 `.env` 的 `VM2API_IMAGE_TAG`。此前目标 tag 先写入 `.env` 再拉镜像，拉取失败直接退出，`.env` 指向一个不存在的镜像，下一次 `compose up` 起不来控制面。
+- 托管 CRAG 内核的本地队列满或排队超时，仍按 529 `pool_overloaded` 返回，但 `error.details` 标明 `{source: "local_kernel_queue", reason}`，客户端和日志能把本机内核排队与上游过载区分开。
+- 本版不改变上游计费策略。
+
 ## 1.4.141 — 2026-11-18 · CRAG 重装热修
 
 - 修复 CRAG 内核重装必定失败：CRAG v2 进程池在 prewarm 关闭时按需拉起 Claude 进程，空闲健康时上报 `cli_pid: 0`，安装的就绪判定却要求常驻进程，于是内核已健康监听也判 `kernel_start_failed`。进程池模式下不再要求常驻进程。
