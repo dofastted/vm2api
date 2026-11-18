@@ -428,6 +428,7 @@ export function PoolPane({
   pending = false,
 }: PoolPaneProps) {
   const strategy = pool.strategy === 'fill' ? 'fill' : 'balanced'
+  const resetPriority = pool.reset_priority !== false
   const seatCap = Math.min(
     SEAT_CAP_MAX,
     Math.max(1, numOf(inference, 'session_slots', SEAT_CAP_MAX))
@@ -499,6 +500,7 @@ export function PoolPane({
     if (open === 'strategy') {
       onPoolChange({
         strategy: poolDraft.strategy,
+        reset_priority: poolDraft.reset_priority !== false,
       })
     } else if (open === 'seats') {
       onInferenceChange({
@@ -560,7 +562,7 @@ export function PoolPane({
         <SummaryButton
           icon={Layers}
           title='分配策略'
-          value={strategy === 'fill' ? '填充' : '平衡'}
+          value={`${strategy === 'fill' ? '填充' : '平衡'}${resetPriority ? ' · 临近重置优先' : ''}`}
           desc='Claude 新 session 开席的优先顺序'
           pending={pending}
           disabled={saving}
@@ -657,6 +659,21 @@ export function PoolPane({
                   value={poolDraft.strategy === 'fill' ? 'fill' : 'balanced'}
                   onChange={(next) => updateDraft('pool', { strategy: next })}
                 />
+                <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
+                  <div>
+                    <Label htmlFor='pool-reset-priority'>临近重置优先</Label>
+                    <p className='text-xs leading-5 text-muted-foreground'>
+                      开启：离周额度刷新越近的账号级别越高，先被用掉。关闭：所有自动级别的账号同一级，按上面的策略平均分配。手动级别不受影响。
+                    </p>
+                  </div>
+                  <Switch
+                    id='pool-reset-priority'
+                    checked={poolDraft.reset_priority !== false}
+                    onCheckedChange={(value) =>
+                      updateDraft('pool', { reset_priority: value })
+                    }
+                  />
+                </div>
               </>
             ) : null}
             {open === 'seats' ? (
