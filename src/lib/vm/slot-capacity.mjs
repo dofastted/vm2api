@@ -17,7 +17,7 @@
  *
  * Config: routing.slot_capacity (all keys optional).
  */
-import { KERNEL_NATIVE_SLOT_COUNT } from './slot-engine.mjs'
+import { KERNEL_NATIVE_SLOT_COUNT, resolveSessionSlots } from './slot-engine.mjs'
 import { memoryMiB, slotMemory, VM_MEMORY_OPTIONS } from './machine-spec.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 
@@ -110,9 +110,18 @@ export function slotPlanOf(vm = {}) {
   return 'default'
 }
 
+/**
+ * Session target the container is sized for. A seat count set on the VM is the
+ * operator's decision and wins outright; otherwise the plan table applies, but
+ * never above the global seat setting — a slot is not sized for sessions the
+ * seat book will never admit.
+ */
 export function planSlots(vm, routing) {
   const cfg = slotCapacityConfig(routing)
-  return cfg.plans[slotPlanOf(vm)] ?? cfg.plans.default
+  const plan = cfg.plans[slotPlanOf(vm)] ?? cfg.plans.default
+  const override = vm?.policy?.sessionSlotsOverride ?? vm?.session_slots_override
+  const configured = resolveSessionSlots(override === true ? vm : {}, routing || {})
+  return override === true ? configured : Math.min(plan, configured)
 }
 
 /** Smallest standard memory option that holds `slots` sessions. */

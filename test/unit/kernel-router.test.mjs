@@ -2523,6 +2523,52 @@ unixTest(
   },
 )
 
+unixTest('credential-free readiness accepts an idle CRAG v2 process pool with no live Claude process', async () => {
+  // Health a freshly installed CRAG v2 slot reports with prewarm off: healthy, no process yet.
+  const fx = await kernelFixture((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(
+      JSON.stringify({
+        ok: true,
+        engine: 'rust',
+        healthy: true,
+        ready_slots: 2,
+        cli_pid: 0,
+        execution_mode: 'v2_process_pool',
+      }),
+    )
+  })
+  try {
+    fs.writeFileSync(rustKernelPaths(fx.exec).configPath, JSON.stringify({ slots_per_worker: WRAP_SLOT_MAX }))
+    const ready = await ensureRustKernel(fx.exec, {
+      allowMissingCredential: true,
+      timeoutMs: 100,
+      runDockerExec: async () => ({ ok: true }),
+    })
+    assert.equal(ready.ok, true, JSON.stringify(ready))
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('credential-free readiness still requires a live process outside the CRAG v2 pool', async () => {
+  const fx = await kernelFixture((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: true, engine: 'rust', healthy: true, ready_slots: 1, cli_pid: 0 }))
+  })
+  try {
+    fs.writeFileSync(rustKernelPaths(fx.exec).configPath, JSON.stringify({ slots_per_worker: WRAP_SLOT_MAX }))
+    const ready = await ensureRustKernel(fx.exec, {
+      allowMissingCredential: true,
+      timeoutMs: 100,
+      runDockerExec: async () => ({ ok: true }),
+    })
+    assert.equal(ready.ok, false, JSON.stringify(ready))
+  } finally {
+    await fx.close()
+  }
+})
+
 unixTest('supervisor repairs a Max subscription from a VM summary without restarting the live kernel', async () => {
   const fx = await kernelFixture((_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' })
