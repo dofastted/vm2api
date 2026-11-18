@@ -569,16 +569,214 @@ function removeStaged(root) {
     if (entry.isDirectory()) removeStaged(path.join(root, entry.name))
   fs.rmSync(root, { recursive: true, force: true })
 }
-// Keep the current and immediately preceding snapshot, not an ever-growing
-// download history. Cleanup is post-commit and can never turn success into an error.
-function prunePackages(base, arch, current, previous) {
+// The cache keeps one package per release
+// (payload_tag for CRAG, tag for cli-node), up to MAX_CACHED_RELEASES, so slots can
+// be installed with different versions side by side. `current-<arch>.json` still
+// names the one package installs and materialization read; selectKernelRelease
+// repoints it to an already cached package without downloading again.
+const MAX_CACHED_RELEASES = 6
+const releaseKey = (release) => release?.payload_tag || release?.tag || ''
+const packageName = (arch) => new RegExp(`^packages/${arch}-[a-f0-9-]{36}$`)
+function readPointer(base, arch) {
   try {
-    for (const entry of fs.readdirSync(path.join(base, 'packages'), { withFileTypes: true })) {
-      if (!entry.isDirectory() || !new RegExp(`^${arch}-[a-f0-9-]{36}$`).test(entry.name)) continue
+    const value = jsonFile(path.join(base, `current-${arch}.json`), 4096)
+    return packageName(arch).test(value?.package) ? value : null
+  } catch {
+    return null
+  }
+}
+// Infer a release for a package directory written before the index existed.
+function inferRelease(base, kernel, relative) {
+  const root = path.join(base, relative)
+  try {
+    if (kernel === 'crag') {
+      const sha = crypto
+        .createHash('sha256')
+        .update(fs.readFileSync(path.join(root, 'manifest.json')))
+        .digest('hex')
+      const known = CRAG_PINNED_RELEASES.find((entry) => entry.manifestSha256 === sha)
+      if (!known) return null
+      const version = /-crag-(\d+\.\d+\.\d+)$/.exec(known.tag)?.[1]
+      return {
+        ...(version ? { tag: `v${version}`, version } : {}),
+        asset: CRAG_V2_RELEASE_ASSET,
+        payload_tag: known.tag,
+      }
+    }
+    const meta = jsonFile(path.join(root, 'RELEASE.json'))
+    const { updated_at, ...release } = meta
+    return release.tag ? release : null
+  } catch {
+    return null
+  }
+}
+/** Cached releases, newest first. Entries whose package directory vanished are dropped. */
+function cachedReleases(base, kernel) {
+  const arch = archFor(kernel)
+  const index = path.join(base, `releases-${arch}.json`)
+  let rows = null
+  try {
+    const value = jsonFile(index, 64 * 1024)
+    if (Array.isArray(value?.releases)) rows = value.releases
+  } catch {}
+  if (!rows) {
+    rows = []
+    const pointer = readPointer(base, arch)
+    if (pointer)
+      rows.push({
+        package: pointer.package,
+        release: pointer.release || {},
+        updated_at: pointer.updated_at,
+      })
+    try {
+      for (const entry of fs.readdirSync(path.join(base, 'packages'), {
+        withFileTypes: true,
+      })) {
+        const relative = `packages/${entry.name}`
+        if (!entry.isDirectory() || !packageName(arch).test(relative) || relative === pointer?.package) continue
+        const release = inferRelease(base, kernel, relative)
+        if (release) {
+          const updated_at = fs.statSync(path.join(base, relative)).mtime.toISOString()
+          rows.push({ package: relative, release, updated_at })
+        }
+      }
+    } catch {}
+  }
+  const seen = new Set()
+  return rows
+    .filter((row) => packageName(arch).test(row?.package) && fs.existsSync(path.join(base, row.package)))
+    .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))
+    .filter((row) => {
+      const key = releaseKey(row.release) || row.package
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+}
+function writeReleaseIndex(base, kernel, rows) {
+  const file = path.join(base, `releases-${archFor(kernel)}.json`)
+  const tmp = `${file}.${crypto.randomUUID()}.tmp`
+  try {
+    fs.writeFileSync(tmp, JSON.stringify({ releases: rows }), {
+      flag: 'wx',
+      mode: 0o644,
+    })
+    fs.renameSync(tmp, file)
+  } catch {
+    fs.rmSync(tmp, { force: true })
+  }
+}
+// Post-commit cleanup: index the new package, keep one package per release up to
+// MAX_CACHED_RELEASES (never evicting the current one), remove unindexed packages.
+// It can never turn success into an error.
+function prunePackages(base, kernel, current, added) {
+  try {
+    const arch = archFor(kernel)
+    const rows = cachedReleases(base, kernel).filter((row) => row.package !== added.package)
+    const addedKey = releaseKey(added.release)
+    let keep = [added, ...rows.filter((row) => !addedKey || releaseKey(row.release) !== addedKey)]
+    while (keep.length > MAX_CACHED_RELEASES) {
+      const victim = keep.findLastIndex((row) => row.package !== current)
+      if (victim < 0) break
+      keep.splice(victim, 1)
+    }
+    writeReleaseIndex(base, kernel, keep)
+    const kept = new Set([current, ...keep.map((row) => row.package)])
+    for (const entry of fs.readdirSync(path.join(base, 'packages'), {
+      withFileTypes: true,
+    })) {
       const relative = `packages/${entry.name}`
-      if (relative !== current && relative !== previous) removeStaged(path.join(base, relative))
+      if (!entry.isDirectory() || !packageName(arch).test(relative)) continue
+      if (!kept.has(relative)) removeStaged(path.join(base, relative))
     }
   } catch {}
+}
+
+/** Releases held in the local cache, newest first, with the one installs currently use marked. */
+export function listKernelReleases(projectRoot, kernel) {
+  if (!['cli-node', 'crag'].includes(kernel))
+    return {
+      ok: false,
+      code: 'kernel_invalid',
+      error: '请选择 cli-node 或 CRAG',
+    }
+  const base = baseFor(projectRoot, kernel)
+  const current = readPointer(base, archFor(kernel))?.package
+  return {
+    ok: true,
+    releases: cachedReleases(base, kernel).map((row) => ({
+      ...(isReleaseTag(row.release?.tag) ? { tag: row.release.tag } : {}),
+      ...(typeof row.release?.version === 'string' ? { version: row.release.version } : {}),
+      ...(row.release?.payload_tag ? { payload_tag: row.release.payload_tag } : {}),
+      updated_at: row.updated_at || null,
+      current: row.package === current,
+    })),
+  }
+}
+
+/** Repoint the install selection at an already cached release (payload_tag or tag). No download. */
+export function selectKernelRelease(projectRoot, { kernel, tag } = {}) {
+  if (!['cli-node', 'crag'].includes(kernel))
+    return {
+      ok: false,
+      code: 'kernel_invalid',
+      error: '请选择 cli-node 或 CRAG',
+    }
+  if (typeof tag !== 'string' || !tag || tag.length > 120)
+    return {
+      ok: false,
+      code: 'kernel_tag_invalid',
+      error: '请指定要切换的版本',
+    }
+  let lock, pointerTemp
+  try {
+    if (String(process.env[kernel === 'crag' ? 'KIN_CRAG_V2_ROOT' : 'KIN_WRAP_CLI_ROOT'] || '').trim())
+      throw coded('kernel_override_active', '已配置显式内核路径，请先移除覆盖配置再切换')
+    const base = baseFor(projectRoot, kernel)
+    const arch = archFor(kernel)
+    lock = acquireKernelCacheLock(projectRoot, kernel)
+    const rows = cachedReleases(base, kernel)
+    const row = rows.find((entry) => entry.release?.payload_tag === tag || entry.release?.tag === tag)
+    if (!row) throw coded('kernel_release_not_cached', `本机缓存里没有 ${tag}，请先拉取`)
+    if (kernel === 'crag' && !verifiedPackage(path.join(base, row.package)).ok)
+      throw coded('crag_v2_package_changed', 'CRAG 缓存包校验失败，请重新拉取')
+    ensureKernelCacheNotInstalling(base)
+    const pointer = path.join(base, `current-${arch}.json`)
+    const updated_at = new Date().toISOString()
+    pointerTemp = `${pointer}.${crypto.randomUUID()}.tmp`
+    fs.writeFileSync(
+      pointerTemp,
+      JSON.stringify({
+        package: row.package,
+        release: row.release,
+        updated_at,
+      }),
+      {
+        flag: 'wx',
+        mode: 0o644,
+      },
+    )
+    fs.renameSync(pointerTemp, pointer)
+    pointerTemp = null
+    // Persist the inferred index so later pulls never mistake cached releases for strays.
+    writeReleaseIndex(base, kernel, rows)
+    return {
+      ok: true,
+      kernel: publicProduct(kernel, true, { ...row.release, updated_at }),
+      release: row.release,
+    }
+  } catch (error) {
+    const code =
+      typeof error.code === 'string' && /^[a-z][a-z0-9_]+$/.test(error.code) ? error.code : 'kernel_select_failed'
+    return { ok: false, code, error: error.message || '切换内核版本失败' }
+  } finally {
+    if (pointerTemp) fs.rmSync(pointerTemp, { force: true })
+    if (lock) {
+      try {
+        fs.rmdirSync(lock)
+      } catch {}
+    }
+  }
 }
 
 function pinnedAuthority(projectRoot) {
@@ -705,10 +903,6 @@ export async function pullKernelRelease(
     fs.renameSync(stage, published)
     stage = null
     const pointer = path.join(base, `current-${archFor(kernel)}.json`)
-    let previous
-    try {
-      previous = jsonFile(pointer, 4096).package
-    } catch {}
     pointerTemp = `${pointer}.${crypto.randomUUID()}.tmp`
     fs.writeFileSync(pointerTemp, JSON.stringify({ package: relative, release, updated_at: metadata.updated_at }), {
       flag: 'wx',
@@ -718,7 +912,7 @@ export async function pullKernelRelease(
     fs.renameSync(pointerTemp, pointer)
     pointerTemp = null
     published = null
-    prunePackages(base, archFor(kernel), relative, previous)
+    prunePackages(base, kernel, relative, { package: relative, release, updated_at: metadata.updated_at })
     return { ok: true, kernel: product, release }
   } catch (error) {
     const timeout = ['TimeoutError', 'AbortError'].includes(error.name)

@@ -330,3 +330,37 @@ test('pull route updates cache only and returns actionable paid asset failure wi
     assert.equal(fs.existsSync(path.join(root, 'vms', vm.id)), false)
   }
 })
+
+test('cached route lists every cached release and select switches back without downloading', async (t) => {
+  const { root } = fixture(t)
+  let downloads = 0
+  const fetchImpl = releaseFetch()
+  const options = {
+    ctx: {
+      fetchImpl: async (url) => {
+        if (String(url).includes('/releases/assets/')) downloads++
+        return fetchImpl(url)
+      },
+    },
+  }
+  assert.equal((await route(root, 'POST', '/pull', { kernel: 'cli-node' }, options)).status, 200)
+  assert.equal((await route(root, 'POST', '/pull', { kernel: 'cli-node', tag: 'v1.2.1' }, options)).status, 200)
+  const cached = await route(root, 'GET', '/cached?kernel=cli-node', null, options)
+  assert.equal(cached.status, 200, JSON.stringify(cached.body))
+  assert.deepEqual(
+    cached.body.data.releases.map((row) => [row.tag, row.current]),
+    [
+      ['v1.2.1', true],
+      ['v1.2.3', false],
+    ],
+  )
+  const before = downloads
+  const selected = await route(root, 'POST', '/select', { kernel: 'cli-node', tag: 'v1.2.3' }, options)
+  assert.equal(selected.status, 200, JSON.stringify(selected.body))
+  assert.equal(downloads, before)
+  const inventory = await route(root, 'GET', '')
+  assert.equal(inventory.body.data.kernels[0].release_tag, 'v1.2.3')
+  const missing = await route(root, 'POST', '/select', { kernel: 'cli-node', tag: 'v9.9.9' }, options)
+  assert.equal(missing.status, 404)
+  assert.equal(missing.body.error.code, 'kernel_release_not_cached')
+})
