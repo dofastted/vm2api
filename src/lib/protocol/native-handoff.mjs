@@ -1,5 +1,6 @@
 import { StringDecoder } from 'node:string_decoder'
 import { isDeepStrictEqual } from 'node:util'
+import { isClaudeSlotOAuthError } from '../core/errors.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from './convert.mjs'
 import { mergeUsage } from './openai-usage.mjs'
 
@@ -462,6 +463,9 @@ export async function consumeNativeHandoffStream(
     if (name === 'kin_outbound_headers' || event?.type === 'kin_outbound_headers') {
       onOutboundHeaders?.(event)
       return
+    }
+    if ((name === 'error' || !name) && !event?.type && isClaudeSlotOAuthError(event)) {
+      event = { ...event, type: 'error' }
     }
     if (!object(event) || !identity(event.type) || (name && name !== event.type)) {
       throw protocolError('native_handoff_invalid', 'Invalid native SSE event')

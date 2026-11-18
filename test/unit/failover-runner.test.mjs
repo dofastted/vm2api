@@ -75,6 +75,34 @@ function success(text = 'ok') {
   }
 }
 
+test('slot OAuth load failure skips the bad VM without retrying or parking its account', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler })
+  const visited = []
+  const result = await runner.run({
+    requestId: 'slot-oauth-unavailable',
+    model: 'claude-sonnet-test',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    callAttempt: ({ candidate: selected }) => {
+      visited.push(selected.vmId)
+      return selected.vmId === 'vm-01'
+        ? {
+            ok: false,
+            status: 503,
+            upstreamExecutions: 0,
+            terminalState: 'rejected',
+            body: { type: 'error', error: { type: 'worker_error', code: 'slot_oauth_unavailable' } },
+          }
+        : success()
+    },
+  })
+  assert.deepEqual(visited, ['vm-01', 'vm-02'])
+  assert.equal(result.ok, true)
+  assert.equal(result.attemptCount, 1)
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.deepEqual(scheduler.releasedAccounts, [])
+})
+
 test('a CRAG quota change after selection skips that VM without a cooldown or upstream replay', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const runner = new FailoverRunner({ scheduler })

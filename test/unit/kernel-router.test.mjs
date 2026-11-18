@@ -232,6 +232,50 @@ async function kernelFixture(handler) {
 }
 
 const cragCapabilities = ['prompt_append', 'prompt_replace', 'model_directive', 'caller_cwd']
+
+unixTest('OAuth inference refuses an unreadable credential and repairs the relative alias once saved', async (t) => {
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  t.after(() => {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  })
+  let probes = 0
+  const fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    probes++
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 1 }))
+  })
+  t.after(() => fx.close())
+  fx.exec.vm.claude = { has_access: true, mode: 'oauth' }
+  const claudeDir = path.join(fx.exec.homeDir, '.claude')
+  const alias = path.join(claudeDir, '.credentials.json')
+  const source = path.join(claudeDir, 'credentials.json')
+  fs.mkdirSync(claudeDir)
+  fs.symlinkSync('/old/host/credentials.json', alias)
+  const opts = {
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    routing: { inference: { health_ttl_ms: 0 } },
+  }
+  const failed = await dispatchCallInference(opts)
+  assert.equal(failed.status, 503)
+  assert.equal(failed.upstreamExecutions, 0)
+  assert.equal(failed.body.error.code, 'slot_oauth_unavailable')
+  assert.equal(probes, 0)
+  const stored = '{"claudeAiOauth":{"accessToken":"fixture-access"}}\n'
+  fs.writeFileSync(source, stored)
+  const prepared = await prepareInferenceHop(opts)
+  assert.equal(prepared.ready?.ok, true)
+  assert.equal(probes, 1)
+  assert.equal(fs.readlinkSync(alias), 'credentials.json')
+  assert.equal(fs.readFileSync(alias, 'utf8'), stored)
+  assert.equal(fs.readFileSync(source, 'utf8'), stored)
+})
+
 const cragHealth = (capabilities) => ({ ok: true, runtime_variant: 'crag-v2', ready_slots: 1, capabilities })
 
 function licenseCragFixture({ root, exec }) {

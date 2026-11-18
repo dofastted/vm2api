@@ -43,9 +43,12 @@ import {
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../protocol/convert.mjs'
 import {
   clientCancelledResult,
+  ErrorCode,
+  isClaudeSlotOAuthError,
   isClientCancelledResult,
   isCompleteAssistantMessage,
   isWrapConnectionError,
+  mapUpstreamError,
 } from '../core/errors.mjs'
 import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
@@ -814,7 +817,10 @@ function mockScenario(exec) {
   }
 }
 
-function restoreCragPolicyBlock(result) {
+function restoreInferenceFailure(result, requestPath = '/internal/v1/messages') {
+  if (requestPath === '/internal/v1/messages' && isClaudeSlotOAuthError(result?.body)) {
+    return slotOAuthUnavailable(result)
+  }
   if (!result || result.ok || result.committed || isClientCancelledResult(result)) return result
   const facts = result.providerResult
   if (
@@ -837,6 +843,24 @@ function restoreCragPolicyBlock(result) {
         code: 'crag_policy_blocked',
         message: 'Gateway kernel rejected the request cache controls before dispatch (CRAG_CACHE_CONTROL)',
         details: { retryable: false },
+      },
+    },
+  }
+}
+
+export function slotOAuthUnavailable(result = {}) {
+  return {
+    ...result,
+    ok: false,
+    status: 503,
+    transportError: false,
+    terminalState: result.committed ? 'incomplete' : 'rejected',
+    body: {
+      type: 'error',
+      error: {
+        type: 'worker_error',
+        code: ErrorCode.SLOT_OAUTH_UNAVAILABLE,
+        message: 'The VM slot could not load its Claude OAuth credential',
       },
     },
   }
@@ -1244,7 +1268,9 @@ async function streamGoWorkerRaw({
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     observedHeaders = headers
     handoff?.observeHeaders(response.headers)
-    if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
+    const claudeMessages = requestPath === '/internal/v1/messages'
+    const jsonReply = claudeMessages && /^application\/json\b/i.test(response.headers['content-type'] || '')
+    if (jsonReply || (response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, handoff ? MAX_BODY : 1024 * 1024)
       let decoded = await inferenceCodec.decode(data, { status: response.statusCode, signal })
       if (handoff) decoded = handoff.consumeBody(decoded)
@@ -1368,6 +1394,10 @@ async function streamGoWorkerRaw({
     const observeSseEvent = (event) => {
       if (!event) return event
       timing.observe(event, receivedAt)
+      if (claudeMessages && isClaudeSlotOAuthError(event)) {
+        lastError = slotOAuthUnavailable().body
+        return lastError
+      }
       if (event.type === 'response_headers' && event.headers && typeof event.headers === 'object') {
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
       }
@@ -1400,7 +1430,14 @@ async function streamGoWorkerRaw({
       if (stop) sseStop = stop
       return event
     }
-    const shouldCommit = (event) => isDownstreamCommitEvent(event) || (!!event && event === responsesTerminal)
+    const shouldCommit = (event) =>
+      lastError?.error?.code !== ErrorCode.SLOT_OAUTH_UNAVAILABLE &&
+      (isDownstreamCommitEvent(event) || (!!event && event === responsesTerminal))
+    const publicSseLine = (line, event) => {
+      if (event?.error?.code !== ErrorCode.SLOT_OAUTH_UNAVAILABLE) return line
+      const { body } = mapUpstreamError(503, event)
+      return `data: ${JSON.stringify({ type: 'error', ...body })}`
+    }
     const firstByteMs = Math.max(0, Number(timeoutMs) || 0)
     const idleMs = Math.max(0, Number(idleTimeoutMs) || 0)
     let lastChunkAt = Date.now()
@@ -1472,6 +1509,7 @@ async function streamGoWorkerRaw({
             if (piece && piece !== '[DONE]') {
               dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
               const event = observeSseEvent(takeSseEvent())
+              line = publicSseLine(line, event)
               if (shouldCommit(event)) await flushCommit()
             }
           } else if (line === '') {
@@ -1497,6 +1535,7 @@ async function streamGoWorkerRaw({
           if (piece && piece !== '[DONE]') {
             dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
             const event = observeSseEvent(takeSseEvent())
+            buffer = publicSseLine(buffer, event)
             if (shouldCommit(event)) await flushCommit()
           }
         }
@@ -2204,11 +2243,15 @@ export function recoverThinkingOnlyMaxTokens(result, { onEvent, onCommit, downst
 }
 
 export async function callGoWorker(opts = {}) {
-  return recoverThinkingOnlyMaxTokens(restoreCragPolicyBlock(await callGoWorkerRaw(opts)), {})
+  const result = restoreInferenceFailure(await callGoWorkerRaw(opts), opts.requestPath)
+  return recoverThinkingOnlyMaxTokens(result, {})
 }
 
 export async function streamGoWorker(opts = {}) {
   const tracked = trackDownstreamEvents(opts.onEvent)
-  const result = restoreCragPolicyBlock(await streamGoWorkerRaw({ ...opts, onEvent: tracked.onEvent }))
+  const result = restoreInferenceFailure(
+    await streamGoWorkerRaw({ ...opts, onEvent: tracked.onEvent }),
+    opts.requestPath,
+  )
   return recoverThinkingOnlyMaxTokens(result, { ...opts, onEvent: opts.onEvent, downstream: tracked.state })
 }
