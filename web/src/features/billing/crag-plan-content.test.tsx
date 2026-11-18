@@ -11,19 +11,19 @@ describe('shared catalog presentation', () => {
   it('preserves published price and slot formatting, including zero values', () => {
     expect(formatPlanDetails(12345, 2)).toEqual({
       price: '¥123.45',
-      locks: '2 把应用锁',
+      quota: '2 个槽位',
     })
     expect(formatPlanDetails(0, 0)).toEqual({
       price: '¥0',
-      locks: '0 把应用锁',
+      quota: '0 个槽位',
     })
     expect(formatPlanDetails(100, 'unlimited')).toEqual({
       price: '¥1',
-      locks: '应用锁不限',
+      quota: '额度不限',
     })
     expect(formatPlanDetails(null, null)).toEqual({
       price: '未定价',
-      locks: '槽位待填写',
+      quota: '槽位待填写',
     })
   })
 
@@ -67,7 +67,7 @@ describe('shared catalog presentation', () => {
           sku: 'monthly-second',
           term: '月卡',
           price: '¥50',
-          locks: '1 把应用锁',
+          quota: '1 个槽位',
           name: '第二月卡',
           remaining: 7,
           renewable: true,
@@ -76,7 +76,7 @@ describe('shared catalog presentation', () => {
       />
     )
     expect(html).toContain('monthly-second')
-    expect(html).toContain('月卡 · 1 把应用锁')
+    expect(html).toContain('月卡 · 1 个槽位')
     expect(html).toContain('剩余 7 份')
     expect(html).toContain('可续费')
     expect(html).toContain('text-lg font-bold')
@@ -87,7 +87,7 @@ const picker = {
   sku: 'quarter',
   term: '季卡',
   price: '¥599',
-  locks: '10 把应用锁',
+  quota: '10 个槽位',
 } as const
 
 const draft = {
@@ -156,7 +156,7 @@ describe('layout 驱动的套餐卡展示', () => {
     expect(regular).not.toEqual(compact)
     for (const html of [regular, compact]) {
       expect(html).toContain('季卡')
-      expect(html).toContain('10 把应用锁')
+      expect(html).toContain('10 个槽位')
       expect(html).toContain('¥599')
     }
   })

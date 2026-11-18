@@ -9,10 +9,21 @@ import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { CragHostSubscription } from './crag-host-subscription'
+import { cragSubscriptionErrors } from './crag-subscription-errors'
 
+/**
+ * 错误码 → 文案，一码一句。宿主订阅（按槽位计）的错误码来自
+ * `cragSubscriptionErrors`，这里只写本槽授权与设备授权独有的码。
+ *
+ * 三类兑换冲突必须可区分：
+ * - `host_redeem_conflict`：订阅兑换码已在别的宿主机兑换
+ * - `license_redeem_conflict`：设备兑换码已绑定另一台设备
+ * - `payload_key_conflict`：内核版本（CRAG 包）冲突
+ */
 const licenseMessages: Record<string, string> = {
+  ...cragSubscriptionErrors,
   license_required:
-    '尚未授权。可用联网兑换码激活本槽，或用离线通用码授权全部兼容槽位。',
+    '尚未授权。可绑定宿主订阅（占用槽位），或使用设备兑换码、离线通用码授权本槽。',
   license_expired: '授权已到期。请向授权方申请续期，并在下方替换注册码。',
   license_not_yet_valid:
     '授权尚未生效。请核对服务器 UTC 时间和生效时间；如签发时间有误，请联系授权方重新签发。',
@@ -20,41 +31,24 @@ const licenseMessages: Record<string, string> = {
     '注册码无法通过校验，可能不完整、已被修改或签发密钥不匹配。请重新复制完整注册码，或联系授权方重新签发。',
   license_binding_mismatch:
     '注册码不属于本槽或当前机器。请使用下方机器码申请匹配的注册码。',
-  license_crag_host_over_quota: '本槽超出宿主订阅额度，已暂停调度。',
-  license_payload_key_mismatch:
-    '注册码对应另一版 CRAG 内核。请复制含载荷 ID 的机器码，向授权方申请匹配当前版本的注册码。',
+  license_crag_host_over_quota:
+    '使用中的槽位超过充值可用槽位，本槽已暂停调度。请继续充值，或停止其他正在运行的 CRAG 槽。',
   license_unconfigured:
     '服务器尚未配置可信授权公钥或加密 CRAG 包。请联系管理员安装受信任的完整软件包后重试。',
   license_redeem_unavailable:
-    '兑换码无效、已过期或已使用。若兑换时连接中断，请联系签发方核对兑换记录。',
+    '设备兑换码无效、已过期或已使用。若兑换时连接中断，请联系签发方核对兑换记录。',
   license_redeem_conflict:
-    '此兑换码已绑定另一台设备或另一版内核。请回到原槽并使用原内核版本。',
+    '此设备兑换码已绑定另一台设备，不能用于本槽。请回到原槽使用。',
   license_redeem_target_changed:
     '激活期间目标槽、设备或授权发生变化，未覆盖现有授权。请联系管理员核对本次签发。',
   license_redeem_subscription:
-    '本槽已使用宿主订阅许可。请在「宿主机订阅」管理续期或绑定。',
+    '本槽已在使用宿主订阅，不需要设备兑换码。请在下方「宿主订阅」管理绑定。',
   license_redeem_service:
     '未确认联网激活。请在同一槽使用原码重试；若提示已使用，请联系签发方核对兑换记录。',
   license_redeem_origin: '请在当前面板页提交兑换，不要从其他站点发起。',
-  redeem_unavailable: '兑换码无效、已过期或不可用，请核对原码。',
-  host_redeem_conflict: '兑换码不属于本机或已在其他宿主机使用。',
-  auth_forbidden: '鉴权服务不接受当前宿主机的订阅凭据。',
-  host_subscription_inactive: '本机没有有效订阅，请兑换或续费。',
-  host_binding_conflict: '此槽的设备身份与原绑定不一致。',
   issuer_mismatch: '授权服务不认可目标内核的发行方，本次未兑换。',
-  payload_key_unknown:
-    '授权服务未登记此内核载荷。已到账的订阅额度会保留，可在兼容槽位使用。',
-  payload_key_conflict: '本槽已有绑定对应不同的内核载荷。',
-  slot_limit_reached: '宿主机应用锁额度已用完，本槽未绑定。',
-  crag_subscription_target_unready:
-    '此槽暂不能绑定订阅。请确认使用可信 CRAG 包，且未绑定其他有效授权。',
-  crag_subscription_target_changed: '目标槽或内核已变化，请核对后重试。',
-  crag_subscription_sync_pending:
-    '宿主机还有未完成的同步。请在原目标槽使用原码完成激活，或先完成原订单的激活。',
-  crag_subscription_authority_unavailable:
-    '尚未确认订阅已激活，请在同一目标槽使用原码重试，不必重新购买。',
   crag_v2_unsupported_placement:
-    '此槽不支持该授权方式。单设备兑换码需要本机 Linux Docker 槽。',
+    '此槽不支持该授权方式。设备兑换码需要本机 Linux Docker 槽。',
 }
 
 const statusLabels: Record<CragLicenseStatus['status'], string> = {
@@ -118,10 +112,10 @@ export function CragLicenseSummary({
           <dt className='text-xs text-muted-foreground'>授权方式</dt>
           <dd className='mt-1'>
             {license.scope === 'host'
-              ? `宿主机订阅 · 应用锁 ${license.seat ?? '—'}`
+              ? `宿主订阅 · 绑定编号 ${license.seat ?? '—'}`
               : license.kind === 'offline'
-                ? '离线通用码'
-                : '在线设备授权'}
+                ? '设备授权 · 离线通用码'
+                : '设备授权 · 在线兑换'}
           </dd>
         </div>
       ) : null}
@@ -225,67 +219,78 @@ export function CragLicenseEditor({
       ) : null}
       <CragHostSubscription vmId={vmId} />
       {data?.machine_code ? (
-        <details className='space-y-2'>
-          <summary className='cursor-pointer text-sm'>
-            签发设备注册码所需的机器码
-          </summary>
-          <div className='flex flex-wrap items-center justify-between gap-2'>
-            <Label htmlFor={`${formId}-machine`}>本槽机器码</Label>
-            <Button
-              type='button'
-              variant='outline'
-              disabled={busy}
-              onClick={async () => {
-                try {
-                  const challenge = data.payload_key_id
-                    ? JSON.stringify({
+        <section
+          className='min-w-0 space-y-2 border-t pt-4'
+          aria-labelledby={`${formId}-device-heading`}
+        >
+          <h4 id={`${formId}-device-heading`} className='text-sm font-medium'>
+            设备授权（按机器码）
+          </h4>
+          <p className='text-sm text-muted-foreground'>
+            设备注册码只绑定本槽机器码与匹配的内核版本，不占用宿主订阅的槽位。
+          </p>
+          <details className='space-y-2'>
+            <summary className='cursor-pointer text-sm'>
+              签发设备注册码所需的机器码
+            </summary>
+            <div className='flex flex-wrap items-center justify-between gap-2'>
+              <Label htmlFor={`${formId}-machine`}>本槽机器码</Label>
+              <Button
+                type='button'
+                variant='outline'
+                disabled={busy}
+                onClick={async () => {
+                  try {
+                    const challenge = data.payload_key_id
+                      ? JSON.stringify({
+                          machine_code: data.machine_code,
+                          payload_key_id: data.payload_key_id,
+                        })
+                      : data.machine_code
+                    await navigator.clipboard.writeText(challenge)
+                    toast.success(
+                      data.payload_key_id
+                        ? '机器码和目标载荷已复制'
+                        : '机器码已复制'
+                    )
+                  } catch {
+                    toast.error('复制失败，请选中机器码后手动复制')
+                  }
+                }}
+              >
+                复制机器码
+              </Button>
+            </div>
+            <Textarea
+              id={`${formId}-machine`}
+              readOnly
+              rows={3}
+              value={
+                data.payload_key_id
+                  ? JSON.stringify(
+                      {
                         machine_code: data.machine_code,
                         payload_key_id: data.payload_key_id,
-                      })
-                    : data.machine_code
-                  await navigator.clipboard.writeText(challenge)
-                  toast.success(
-                    data.payload_key_id
-                      ? '机器码和目标载荷已复制'
-                      : '机器码已复制'
-                  )
-                } catch {
-                  toast.error('复制失败，请选中机器码后手动复制')
-                }
-              }}
+                      },
+                      null,
+                      2
+                    )
+                  : data.machine_code
+              }
+              spellCheck={false}
+              onFocus={(event) => event.currentTarget.select()}
+              className='max-h-36 resize-y font-mono text-sm break-all'
+              aria-describedby={`${formId}-machine-help`}
+            />
+            <p
+              id={`${formId}-machine-help`}
+              className='text-xs leading-relaxed text-muted-foreground'
             >
-              复制机器码
-            </Button>
-          </div>
-          <Textarea
-            id={`${formId}-machine`}
-            readOnly
-            rows={3}
-            value={
-              data.payload_key_id
-                ? JSON.stringify(
-                    {
-                      machine_code: data.machine_code,
-                      payload_key_id: data.payload_key_id,
-                    },
-                    null,
-                    2
-                  )
-                : data.machine_code
-            }
-            spellCheck={false}
-            onFocus={(event) => event.currentTarget.select()}
-            className='max-h-36 resize-y font-mono text-sm break-all'
-            aria-describedby={`${formId}-machine-help`}
-          />
-          <p
-            id={`${formId}-machine-help`}
-            className='text-xs leading-relaxed text-muted-foreground'
-          >
-            将完整机器码交给授权方；若显示载荷
-            ID，请一并复制。注册码只对本槽和匹配的内核版本有效。
-          </p>
-        </details>
+              将完整机器码交给授权方；若显示载荷
+              ID，请一并复制。注册码只对本槽和匹配的内核版本有效。
+            </p>
+          </details>
+        </section>
       ) : null}
     </section>
   )

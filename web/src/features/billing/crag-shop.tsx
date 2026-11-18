@@ -9,6 +9,7 @@ import { VIEW_TITLES } from '@/config/nav'
 import type { StatusTone } from '@/types/status'
 import { api, cragDeviceApi, isApiError } from '@/lib/api'
 import { randomUUID } from '@/lib/random-uuid'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -17,8 +18,9 @@ import { PageHeader } from '@/components/page-header'
 import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
 import {
-  CragRuntimeCounts,
   cragHostStatusLabels,
+  cragHostStatusVariant,
+  cragSlotsInUse,
 } from '@/features/vm/crag-runtime-counts'
 import {
   cragHostStatusQueryOptions,
@@ -187,19 +189,40 @@ function HostSummary({
       : status
         ? '未返回套餐'
         : '待核对'
-  const fields = [
-    ['订阅状态', status ? cragHostStatusLabels[status.state] : '状态待核对'],
-    ['实际订阅套餐', planName],
-    ['剩余可用槽位', quotaLabel(status?.available_seats)],
-    ['当前 VM 总数', quotaLabel(status?.vm_count)],
-    ['CRAG 运行数', quotaLabel(runtime?.running_vms)],
+  // 用户侧只看两个数字：使用中的槽位 与 充值可用槽位。满了就继续充。
+  //
+  // 「使用中」只取真值 —— 真正运行中的 CRAG 内核数，与准入强制同源
+  // （crag-runtime-inventory.mjs 的同一个 hostRunning 既喂该字段又喂
+  // host_over_limit）。切换到 CRAG 内核不受额度限制，只有真正要调度才需要槽位凭证。
+  //
+  // 刻意砍掉的：CRAG 运行数、当前 VM 总数、待回收绑定 —— 三个看起来都像
+  // 「在用多少」的计数，对用户没有行动价值；过期绑定本就不在运行数里，
+  // 不需要用户去回收一个数字。也不再渲染 CragRuntimeCounts（与本网格同源）。
+  const fields: Array<[string, ReactNode]> = [
+    [
+      '订阅状态',
+      <Badge variant={status ? cragHostStatusVariant[status.state] : 'outline'}>
+        {status ? cragHostStatusLabels[status.state] : '状态待核对'}
+      </Badge>,
+    ],
+    ['订阅套餐', planName],
+    ['使用中的槽位', cragSlotsInUse(status) ?? '待核对'],
+    ['充值可用槽位', quotaLabel(status?.slot_limit)],
+    [
+      '到期',
+      status?.expires_at == null ? (
+        '—'
+      ) : (
+        <SubscriptionTime seconds={status.expires_at} />
+      ),
+    ],
   ]
   return (
     <section
       aria-label='CRAG 订阅与运行概况'
       className='overflow-hidden rounded-xl border bg-card'
     >
-      <dl className='grid grid-cols-2 gap-px bg-border md:grid-cols-5'>
+      <dl className='grid grid-cols-2 gap-px bg-border sm:grid-cols-3 lg:grid-cols-5'>
         {fields.map(([label, value]) => (
           <div key={label} className='min-w-0 bg-card px-4 py-3'>
             <dt className='text-xs text-muted-foreground'>{label}</dt>
@@ -209,8 +232,15 @@ function HostSummary({
           </div>
         ))}
       </dl>
+      {runtime?.host_over_limit === true ? (
+        <p role='alert' className='border-t px-4 py-2 text-sm text-destructive'>
+          宿主订阅超额，仅超额槽暂停调度
+        </p>
+      ) : null}
       <div className='flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-t px-4 py-2 text-sm'>
-        <CragRuntimeCounts status={status} />
+        <p className='min-w-0 text-muted-foreground'>
+          本机与集群的 Docker、KVM 槽共享同一份订阅额度
+        </p>
         <Button size='sm' variant='link' className='px-0' asChild>
           <Link to='/wrap'>前往内核页切换 VM 内核</Link>
         </Button>
@@ -257,7 +287,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
         setNotice({
           text:
             operation === 'redeem'
-              ? '宿主机额度已更新，未自动绑定 VM'
+              ? '充值可用槽位已更新，未自动把 VM 切到 CRAG'
               : (next.reclaim_pending_count ?? 0) > 0
                 ? '仍有绑定待回收确认'
                 : '订阅状态已同步',
@@ -412,8 +442,8 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
             : probeFailed
               ? ''
               : status && !status.ready
-                ? '当前没有可绑定的 CRAG 槽位，仍可兑换。本机与集群的 Docker、KVM 槽共享额度。'
-                : '付款或领码不会更新本机权益。兑换后，到内核页为目标 VM 管理 CRAG 授权。'}
+                ? '切换 VM 内核到 CRAG 不受额度限制；只有真正调度运行时才占用槽位。本机与集群的 VM 共享同一份槽位。'
+                : '充值只增加可用槽位，不会自动把 VM 切到 CRAG。切换内核随时可做，到内核页为目标 VM 操作即可。'}
       </p>
       {canRecover ? (
         <Button
@@ -509,9 +539,9 @@ function OrderProgress({
 
 function planTerms(plan: Pick<Order, 'amount_minor' | 'slot_limit'>) {
   if (plan.amount_minor === null || plan.slot_limit === null)
-    return '金额与应用锁待确认'
-  const { price, locks } = formatPlanDetails(plan.amount_minor, plan.slot_limit)
-  return `${price} · ${locks}`
+    return '金额与额度待确认'
+  const { price, quota } = formatPlanDetails(plan.amount_minor, plan.slot_limit)
+  return `${price} · ${quota}`
 }
 
 function useHostStatus(enabled: boolean) {

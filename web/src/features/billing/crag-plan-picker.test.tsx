@@ -14,7 +14,7 @@ describe('CragPlanPicker', () => {
             sku: 'second',
             term: '3 个月',
             price: '¥100',
-            locks: '2 把应用锁',
+            quota: '2 个槽位',
             name: '第二套餐',
             description: '<b>说明</b>',
             remaining: 0,
@@ -24,14 +24,14 @@ describe('CragPlanPicker', () => {
             sku: 'hidden',
             term: '1 个月',
             price: '¥1',
-            locks: '1 把应用锁',
+            quota: '1 个槽位',
             enabled: false,
           },
           {
             sku: 'first',
             term: '1 个月',
             price: '¥50',
-            locks: '1 把应用锁',
+            quota: '1 个槽位',
             name: '第一套餐',
             remaining: null,
             renewable: true,
@@ -57,7 +57,7 @@ describe('CragPlanPicker', () => {
     const html = renderToStaticMarkup(
       <CragPlanPicker
         plans={[
-          { sku: 'legacy', term: '月卡', price: '¥50', locks: '1 把应用锁' },
+          { sku: 'legacy', term: '月卡', price: '¥50', quota: '1 个槽位' },
         ]}
         selectedSku='legacy'
         onSelect={vi.fn()}
@@ -65,7 +65,7 @@ describe('CragPlanPicker', () => {
       />
     )
     expect(html).toContain('月卡')
-    expect(html).toContain('1 把应用锁')
+    expect(html).toContain('1 个槽位')
     expect(html).not.toContain('disabled=""')
     expect(html).not.toContain('已售罄')
   })
@@ -76,14 +76,14 @@ const plans = [
     sku: 'monthly',
     term: '月卡',
     price: '¥59',
-    locks: '1 把应用锁',
+    quota: '1 个槽位',
     monthly: null,
   },
   {
     sku: 'quarter',
     term: '季卡',
     price: '¥599',
-    locks: '10 把应用锁',
+    quota: '10 个槽位',
     monthly: '¥199.67',
   },
 ] as const

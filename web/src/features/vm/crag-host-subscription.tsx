@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { CragRuntimeCounts } from './crag-runtime-counts'
+import { cragSubscriptionErrors } from './crag-subscription-errors'
 import {
   cragHostStatusQueryOptions,
   vmCragLicenseQueryOptions,
@@ -10,20 +11,6 @@ import {
 } from './queries'
 
 const root = '/api/panel/crag-subscription'
-const operationErrors: Record<string, string> = {
-  slot_limit_reached: '订阅槽位额度已用完。',
-  host_subscription_inactive: '本机没有有效订阅，请兑换或续费。',
-  host_binding_conflict: '此槽的设备身份与原绑定不一致。',
-  crag_subscription_target_unready:
-    '此槽不兼容订阅，或尚未配置可信的 CRAG 包。',
-  crag_subscription_target_changed: '槽位或内核已变更，请确认目标后重试。',
-  crag_subscription_sync_pending: '上次订阅变更尚未同步，请先完成同步。',
-  payload_key_unknown: '鉴权服务未登记此 CRAG 包的载荷密钥。',
-  payload_key_conflict: '此槽仍绑定旧 CRAG 包，未能换签。',
-  license_payload_key_mismatch: '签发的许可与此槽的 CRAG 包不匹配。',
-  not_found: '鉴权服务找不到当前宿主机的订阅或槽位。',
-  auth_forbidden: '鉴权服务不接受当前宿主机的订阅凭据。',
-}
 
 export function CragHostSubscription({ vmId }: { vmId: string }) {
   const id = useId()
@@ -50,7 +37,7 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
           }
         )
         setNotice({
-          text: '本槽已绑定。如内核尚未加载授权，请重启本槽。',
+          text: '本槽已绑定，开始运行调度后计入使用中的槽位。如内核尚未加载授权，请重启本槽。',
         })
       } else {
         const next = await api<CragHostStatus>(`${root}/${action}`, {
@@ -62,7 +49,7 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
     } catch (error) {
       setNotice({
         text:
-          (isApiError(error) && operationErrors[error.code]) ||
+          (isApiError(error) && cragSubscriptionErrors[error.code]) ||
           '无法确认订阅操作，请检查连接后重试。',
         error: true,
       })
@@ -85,7 +72,7 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
     >
       <div className='flex flex-wrap items-center justify-between gap-2'>
         <h4 id={`${id}-heading`} className='text-sm font-medium'>
-          宿主机订阅
+          宿主订阅（按槽位计）
         </h4>
         <Button
           type='button'
@@ -114,8 +101,8 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
       ) : null}
       <p className='text-sm text-muted-foreground'>
         {pending
-          ? '同步完成前，订阅槽不会接收新请求。未完成的兑换请在订阅页继续同步，或处理原订单。'
-          : '本机与集群的 Docker、KVM 槽共享订阅额度。绑定不会自动启动或重启槽位。'}
+          ? '上次订阅变更尚未同步。已在运行的槽不受影响；请点「继续同步」完成后，再进行新的绑定或兑换。'
+          : '切换到 CRAG 内核不占槽位。只有绑定订阅且正在运行调度的 CRAG 槽计入使用中的槽位；本机与集群的 Docker、KVM 槽共用同一份充值可用槽位，用满后继续充值即可。绑定不会自动启动或重启槽位。'}
       </p>
       {status?.state === 'active' ? (
         <Button

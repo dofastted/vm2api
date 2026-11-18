@@ -34,7 +34,7 @@ export type PlanOption = {
   sku: string
   term: string
   price: string
-  locks: string
+  quota: string
   name?: string
   description?: string
   enabled?: boolean
@@ -96,11 +96,11 @@ export function formatPlanDetails(
 ) {
   return {
     price: amountMinor != null ? yuan(amountMinor) : '未定价',
-    locks:
+    quota:
       slotLimit === 'unlimited'
-        ? '应用锁不限'
+        ? '额度不限'
         : slotLimit != null
-          ? `${slotLimit} 把应用锁`
+          ? `${slotLimit} 个槽位`
           : '槽位待填写',
   }
 }
