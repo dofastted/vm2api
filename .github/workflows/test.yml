@@ -109,7 +109,7 @@ jobs:
       - run: npm ci
         if: needs.changes.outputs.backend == 'true'
       - uses: actions/setup-go@v7
-        if: needs.changes.outputs.go == 'true' || inputs.full
+        if: needs.changes.outputs.go == 'true' || inputs.full || contains(needs.changes.outputs.unit_tests, 'test/unit/egress.test.mjs')
         with:
           go-version: '1.25.x'
           cache-dependency-path: |
@@ -133,6 +133,10 @@ jobs:
           FULL: ${{ inputs.full }}
           CHANGED_TESTS: ${{ needs.changes.outputs.unit_tests }}
         run: |
+          # egress.test.mjs spawns the real helper from bin/kin-egress.
+          if [ "$FULL" = true ] || jq -e 'index("test/unit/egress.test.mjs") != null' <<< "$CHANGED_TESTS" >/dev/null; then
+            (cd worker && CGO_ENABLED=0 go build -o ../bin/kin-egress ./cmd/kin-egress)
+          fi
           if [ "$FULL" = true ]; then
             npm run test:unit
           else
