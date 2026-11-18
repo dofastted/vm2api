@@ -300,26 +300,35 @@ for (const deliveryMode of ['realtime', 'verified']) {
         }),
       )
       await parsedTools.ready
-      assert.equal(committed, false)
-      assert.deepEqual(lines, [])
+      if (deliveryMode === 'verified') {
+        assert.equal(committed, false)
+        assert.deepEqual(lines, [])
+      } else assert.equal(committed, true)
       release.release()
       const received = await pending
-      assert.equal(received.ok, true)
-      assert.equal(received.stopReason, 'refusal')
-      assert.equal(received.body.stop_reason, 'refusal')
-      assert.deepEqual(received.body.content, [{ type: 'text', text: 'Cannot assist with that request.' }])
-      assert.deepEqual(received.usage, USAGE)
-      assert.doesNotMatch(
-        JSON.stringify(received.body) + lines.join('\n'),
-        /tool_secret|parameters|tool_use|client_tool/,
-      )
+      if (deliveryMode === 'verified') {
+        assert.equal(received.ok, true)
+        assert.equal(received.stopReason, 'refusal')
+        assert.equal(received.body.stop_reason, 'refusal')
+        assert.deepEqual(received.body.content, [{ type: 'text', text: 'Cannot assist with that request.' }])
+        assert.deepEqual(received.usage, USAGE)
+        assert.doesNotMatch(
+          JSON.stringify(received.body) + lines.join('\n'),
+          /tool_secret|parameters|tool_use|client_tool/,
+        )
+        assert.deepEqual(
+          eventsFrom(lines)
+            .filter((event) => event.type.startsWith('content_block'))
+            .map((event) => event.index),
+          [0, 0, 0],
+        )
+      } else {
+        assert.equal(received.ok, false)
+        assert.equal(received.committed, true)
+        assert.match(lines.join('\n'), /tool_secret/)
+        assert.match(lines.join('\n'), /event: error/)
+      }
       assertPrivate(received, lines)
-      assert.deepEqual(
-        eventsFrom(lines)
-          .filter((event) => event.type.startsWith('content_block'))
-          .map((event) => event.index),
-        [0, 0, 0],
-      )
     } finally {
       release.release()
       await fx.close()
@@ -407,13 +416,15 @@ for (const stream of [false, true]) {
         assert.equal(received.ok, false)
         assert.equal(received.nativeHandoff, true)
         assert.equal(received.status, 502)
-        assert.equal(received.committed ?? false, false)
-        assert.match(received.body.error.code, /^native_handoff_(missing|invalid|conflict)$/)
+        if (stream) assert.equal(received.committed, true)
+        else assert.equal(received.committed ?? false, false)
+        if (!stream) assert.match(received.body.error.code, /^native_handoff_(missing|invalid|conflict)$/)
         assert.equal(received.providerResult, null)
         assert.deepEqual(received.usage, { input_tokens: 47, output_tokens: stream ? 1 : 2 })
         assert.notEqual(received.usage.output_tokens, result.usage.output_tokens)
         assert.notEqual(received.usage.output_tokens, 9)
-        assert.doesNotMatch(lines.join('\n'), /tool_secret|parameters|tool_use|message_stop/)
+        if (stream) assert.match(lines.join('\n'), /event: error/)
+        else assert.doesNotMatch(lines.join('\n'), /tool_secret|parameters|tool_use|message_stop/)
         assertPrivate(received, lines)
       } finally {
         await fx.close()
@@ -461,6 +472,72 @@ unixTest('realtime text is delivered before native terminal, verified text is wi
   }
 })
 
+unixTest('realtime tool deltas arrive before terminal, verified tools stay withheld', async () => {
+  for (const deliveryMode of ['realtime', 'verified']) {
+    const result = summary({ stop_reason: 'tool_use', usage: { input_tokens: 47, output_tokens: 4 } })
+    const observed = gate()
+    const release = gate()
+    const first = '{"step":'
+    const second = '1}'
+    const fx = await fixture(async (_req, res) => {
+      res.setHeader('content-type', 'text/event-stream')
+      res.write(
+        start(result) +
+          frame({
+            type: 'content_block_start',
+            index: 0,
+            content_block: { type: 'tool_use', id: 'tool_live', name: 'client_tool', input: {} },
+          }) +
+          frame({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: first } }) +
+          frame({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: second } }) +
+          frame({ type: 'kin_outbound_headers', headers: { 'x-fixture-phase': 'tool-observed' } }),
+      )
+      await release.ready
+      res.end(frame({ type: 'content_block_stop', index: 0 }) + resultFrame(result) + terminalFrames(result))
+    })
+    const lines = []
+    try {
+      const pending = streamGoWorker(
+        options(fx, {
+          deliveryMode,
+          onEvent: (line) => lines.push(line),
+          onOutboundHeaders: () => observed.release(),
+        }),
+      )
+      await observed.ready
+      const events = eventsFrom(lines)
+      if (deliveryMode === 'realtime') {
+        assert.deepEqual(
+          events.filter((event) => event.delta?.type === 'input_json_delta').map((event) => event.delta.partial_json),
+          [first, second],
+        )
+        assert.equal(events.filter((event) => event.type === 'content_block_start').length, 1)
+        assert.doesNotMatch(lines.join('\n'), /message_delta|message_stop|kin_provider_result/)
+      } else assert.deepEqual(lines, [])
+      release.release()
+      const received = await pending
+      assert.equal(received.ok, true)
+      const completed = eventsFrom(lines)
+      const starts = completed.filter(
+        (event) => event.type === 'content_block_start' && event.content_block?.type === 'tool_use',
+      )
+      const deltas = completed.filter((event) => event.delta?.type === 'input_json_delta')
+      assert.equal(starts.length, 1)
+      assert.deepEqual(
+        deltas.map((event) => event.delta.partial_json),
+        [first, second],
+      )
+      assert.equal(completed.filter((event) => event.type === 'content_block_stop').length, 1)
+      assert.equal(completed.filter((event) => event.type === 'message_delta').length, 1)
+      assert.equal(completed.at(-1).type, 'message_stop')
+      assertPrivate(received, lines)
+    } finally {
+      release.release()
+      await fx.close()
+    }
+  }
+})
+
 unixTest('real provider error and partial observed usage survive late CLI rows without tool grants', async () => {
   const providerError = {
     type: 'api_error',
@@ -497,7 +574,9 @@ unixTest('real provider error and partial observed usage survive late CLI rows w
     assert.deepEqual(received.body.error, providerError)
     assert.equal(received.body.request_id, 'req_actual_provider')
     assert.deepEqual(received.usage, { input_tokens: 47, output_tokens: 3 })
-    assert.doesNotMatch(lines.join('\n'), /tool_secret|parameters|message_stop/)
+    assert.match(lines.join('\n'), /tool_secret/)
+    assert.match(lines.join('\n'), /event: error/)
+    assert.doesNotMatch(lines.join('\n'), /message_stop/)
     assertPrivate(received, lines)
   } finally {
     await fx.close()
@@ -1128,7 +1207,9 @@ unixTest('a conflicted summary cannot supply the error cause or final usage over
     assert.equal(received.status, 503)
     assert.deepEqual(received.body.error, actualError)
     assert.deepEqual(received.usage, { input_tokens: 47, output_tokens: 0 })
-    assert.deepEqual(lines, [])
+    assert.equal(received.committed, true)
+    assert.match(lines.join('\n'), /tool_secret/)
+    assert.match(lines.join('\n'), /event: error/)
     assertPrivate(received)
   } finally {
     await fx.close()
@@ -1213,13 +1294,19 @@ for (const stream of [false, true]) {
         try {
           const args = options(fx, { onEvent: (line) => lines.push(line) })
           const received = await (stream ? streamGoWorker(args) : callGoWorker(args))
-          assert.equal(received.ok, true)
+          assert.equal(received.ok, !(stream && stopReason === 'refusal'))
           assert.equal(received.nativeHandoff, true)
-          assert.equal(received.stopReason, stopReason)
-          assert.deepEqual(received.providerResult, result)
-          assert.deepEqual(received.body.content, serverContent)
+          if (!(stream && stopReason === 'refusal')) {
+            assert.equal(received.stopReason, stopReason)
+            assert.deepEqual(received.providerResult, result)
+            assert.deepEqual(received.body.content, serverContent)
+          } else {
+            assert.equal(received.committed, true)
+            assert.match(lines.join('\n'), /client_secret/)
+            assert.match(lines.join('\n'), /event: error/)
+          }
           assert.deepEqual(received.usage, USAGE)
-          if (stream) {
+          if (stream && stopReason !== 'refusal') {
             assert.deepEqual(
               eventsFrom(lines)
                 .filter((event) => event.type === 'content_block_start')
@@ -1227,7 +1314,6 @@ for (const stream of [false, true]) {
               serverContent,
             )
           }
-          assert.doesNotMatch(JSON.stringify(received.body) + lines.join('\n'), /client_secret|client_tool|parameters/)
           assertPrivate(received, lines)
         } finally {
           await fx.close()
@@ -1262,7 +1348,9 @@ for (const deliveryMode of ['realtime', 'verified']) {
         res.write(start({ ...summary(), message_id: facts.message_id }))
         res.write(frame({ type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } }))
         res.write(frame({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'hmm' } }))
-        res.write(frame({ type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig' } }))
+        res.write(
+          frame({ type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'sig' } }),
+        )
         res.write(frame({ type: 'error', error: { type: 'api_error', message: facts.validation_error.message } }))
         res.write(resultFrame(facts))
         res.end()
