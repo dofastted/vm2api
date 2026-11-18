@@ -207,6 +207,8 @@ import { describeKernelCatalog, pullKernelRelease } from './kernel-catalog.mjs'
 import {
   hasKernelInstallSafetyHold,
   installKernelTargets,
+  cancelKernelInstall,
+  listActiveKernelInstalls,
   releaseKernelInstallSafetyHold,
   retainKernelInstallSafetyHold,
   validateKernelTargets,
@@ -3104,17 +3106,49 @@ export function createPanelHandler(ctx) {
         if (body.targets.some((target) => userMissesVmId(req, cfg.paths.project, target.id))) {
           return json(res, 403, { ok: false, error: { code: 'forbidden', message: '无权管理所选虚拟机' } })
         }
-        const report = await installKernelTargets({
-          projectRoot: cfg.paths.project,
-          targets: body.targets,
-          routing: ctx.routingConfig,
-          watchdog: ctx.kernelWatchdog,
-          poolScheduler: ctx.poolScheduler,
-          ops: ctx.kernelInstallOps,
-          cragSubscription: mayBindSubscription ? ctx.cragSubscription : undefined,
-          releaseStoppedBinding: ctx.cragSubscription?.releaseStoppedBinding?.bind(ctx.cragSubscription),
-        })
-        return json(res, 200, panel.ok(report))
+        const install = () =>
+          installKernelTargets({
+            projectRoot: cfg.paths.project,
+            targets: body.targets,
+            routing: ctx.routingConfig,
+            watchdog: ctx.kernelWatchdog,
+            poolScheduler: ctx.poolScheduler,
+            ops: ctx.kernelInstallOps,
+            cragSubscription: mayBindSubscription ? ctx.cragSubscription : undefined,
+            releaseStoppedBinding: ctx.cragSubscription?.releaseStoppedBinding?.bind(ctx.cragSubscription),
+          })
+        if (body.background === true) {
+          // The request returns at once; progress is the VM record's kernel_operation and
+          // GET /api/panel/kernels/install, so a proxy timeout cannot strand the installer.
+          install()
+            .then((report) => {
+              for (const item of report.items || [])
+                console.log(
+                  `[kernel-install] background ${item.id} ${item.kernel} ${item.ok ? 'ok' : `failed ${item.code || ''}`}`,
+                )
+            })
+            .catch((error) => console.warn(`[kernel-install] background install crashed: ${error?.message || error}`))
+          return json(
+            res,
+            202,
+            panel.ok({ background: true, targets: body.targets.map(({ id, kernel }) => ({ id, kernel })) }),
+          )
+        }
+        return json(res, 200, panel.ok(await install()))
+      }
+      if (req.method === 'GET' && p === '/api/panel/kernels/install') {
+        const items = listActiveKernelInstalls().filter((item) => !userMissesVmId(req, cfg.paths.project, item.id))
+        return json(res, 200, panel.ok({ items }))
+      }
+      if (req.method === 'POST' && p === '/api/panel/kernels/install/cancel') {
+        const body = await readBody(req, 8 * 1024).catch(() => ({}))
+        const id = typeof body?.id === 'string' ? body.id : ''
+        if (!id) return json(res, 400, { ok: false, error: { code: 'vm_id_required', message: '请选择虚拟机' } })
+        if (userMissesVmId(req, cfg.paths.project, id))
+          return json(res, 403, { ok: false, error: { code: 'forbidden', message: '无权管理所选虚拟机' } })
+        const result = cancelKernelInstall(id)
+        if (!result.ok) return json(res, 404, { ok: false, error: { code: result.code, message: result.error } })
+        return json(res, 200, panel.ok(result))
       }
       if (req.method === 'GET' && p === '/api/panel/wrap-cli') {
         const sample = describeWrapSample(cfg.paths.project)

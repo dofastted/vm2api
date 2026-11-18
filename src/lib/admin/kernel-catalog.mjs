@@ -33,7 +33,7 @@ const MAX_ARCHIVE = MAX_CRAG_V2_DOWNLOAD_BYTES
 const MAX_EXPANDED = 768 * 1024 * 1024
 const MAX_MEMBERS = 64
 const verificationCache = new Map()
-const installingCaches = new Set()
+const installingCaches = new Map()
 const coded = (code, message) => Object.assign(new Error(message), { code })
 const baseFor = (root, kernel) =>
   kernel === 'crag' ? path.join(root, 'share/crag/kernels/v2') : path.join(root, 'share/wrap-cli-releases')
@@ -154,11 +154,18 @@ const CRAG_PINNED_RELEASES = [
   },
 ]
 
+/**
+ * One installer per kernel cache. The release only clears its own reservation, so a
+ * forced cancel can free the cache early without a late `finally` freeing the next one.
+ */
 export function reserveKernelInstallCache(projectRoot, kernel) {
   const key = path.resolve(baseFor(projectRoot, kernel))
   if (installingCaches.has(key)) return null
-  installingCaches.add(key)
-  return () => installingCaches.delete(key)
+  const token = Symbol(key)
+  installingCaches.set(key, token)
+  return () => {
+    if (installingCaches.get(key) === token) installingCaches.delete(key)
+  }
 }
 
 function ensureKernelCacheNotInstalling(base) {

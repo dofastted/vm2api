@@ -1124,6 +1124,14 @@ export function stopAllRustKernels() {
   starts.clear()
   return { ok: true, stopped: 0, cancelled }
 }
+
+/** Abandon one VM's pending kernel start; its health wait returns `start_cancelled`. */
+export function cancelRustKernelStart(vmId) {
+  const pending = starts.get(String(vmId || ''))
+  if (!pending) return false
+  pending.control.cancelled = true
+  return true
+}
 function kernelConfigText(config) {
   return JSON.stringify(config, null, 2) + '\n'
 }
