@@ -26,7 +26,25 @@ export function manualScheduleLevelOf(vm) {
   return normalizedManualLevel(vm?.policy?.priority)
 }
 
+/**
+ * `routing.pool.reset_priority`: when on (default), an auto-level slot rises
+ * one level per day closer to its weekly reset, so slots about to reset are
+ * drained first. When off, every auto-level slot sits on one level and the
+ * balanced ranking (occupancy, headroom) spreads load evenly. Manual levels
+ * apply either way. The pool scheduler sets this on load and hot reload.
+ */
+let resetPriorityEnabled = true
+
+export function setResetPriorityEnabled(enabled) {
+  resetPriorityEnabled = enabled !== false
+}
+
+export function resetPriorityIsEnabled() {
+  return resetPriorityEnabled
+}
+
 export function automaticScheduleLevel(resetAt, now = Date.now()) {
+  if (!resetPriorityEnabled) return MIN_LEVEL
   const resetMs = parseResetMs(resetAt)
   if (!Number.isFinite(resetMs) || resetMs <= now) return MIN_LEVEL
   const fullDaysRemaining = Math.floor((resetMs - now) / DAY_MS)
