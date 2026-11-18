@@ -160,7 +160,8 @@ test('egress reload waits for the previous process to exit before spawning', {
       return false
     }
   })
-  const replacement = await fx.start({ proxyUrl: 'socks5h://192.0.2.2:1080' })
+  // A listen change cannot be reloaded by SIGHUP, so it replaces the process.
+  const replacement = await fx.start({ listenHost: '127.0.0.2' })
   assert.equal(replacement.ok, true)
   assert.notEqual(replacement.pid, original.pid)
   assert.equal(egressPidActive(original.pid), false, 'old egress must exit before spawn returns')
@@ -224,7 +225,7 @@ test('an egress helper can be reused, replaced and stopped only by its own proxy
   assert.equal(inspectEgressProcess(fx.root, 'px-other').ok, false)
   assert.equal(stopEgressProcess(fx.root, 'px-other').ok, true)
   assert.equal(inspectEgressProcess(fx.root, fx.base.proxyId).ok, true)
-  const replacement = await fx.start({ proxyUrl: 'socks5h://192.0.2.2:1080' })
+  const replacement = await fx.start({ listenHost: '127.0.0.2' })
   assert.equal(replacement.reused, false)
   assert.notEqual(replacement.pid, original.pid)
   await waitForProcess(() => !fs.existsSync(`/proc/${original.pid}`))
@@ -660,22 +661,38 @@ test('egress readiness checks the exact listener without opening a connection', 
   assert.equal(egressListening(root, proxyId, 100).reason, 'not_listening')
 })
 
-test('DNS override changes restart the helper and disabling clears the override', async (t) => {
+test('DNS override and proxy changes reload the running helper in place', async (t) => {
   const fx = egressFixture(t, 'px-dns-override')
   const original = await fx.start()
   assert.equal(original.ok, true)
   await waitForProcess(() => inspectEgressProcess(fx.root, 'px-dns-override').ok)
   assert.equal((await fx.start()).reused, true)
-  const enabled = await fx.start({ dnsEmptyTypes: [64, 65] })
+  const enabled = await fx.start({ dnsEmptyTypes: [64, 65], proxyUrl: 'socks5h://192.0.2.2:1080' })
   assert.equal(enabled.ok, true)
-  assert.equal(enabled.reused, false)
-  assert.notEqual(enabled.pid, original.pid)
-  assert.deepEqual(JSON.parse(fs.readFileSync(fx.configPath, 'utf8')).dns_empty_types, [64, 65])
-  await waitForProcess(() => inspectEgressProcess(fx.root, 'px-dns-override').ok)
-  assert.equal((await fx.start({ dnsEmptyTypes: [64, 65] })).reused, true)
-  const disabled = await fx.start()
-  assert.equal(disabled.reused, false)
+  assert.equal(enabled.reused, true)
+  assert.equal(enabled.reloaded, true)
+  assert.equal(enabled.pid, original.pid)
+  const cfg = JSON.parse(fs.readFileSync(fx.configPath, 'utf8'))
+  assert.deepEqual(cfg.dns_empty_types, [64, 65])
+  assert.equal(cfg.proxy_url, 'socks5h://192.0.2.2:1080')
+  assert.equal(fs.statSync(fx.configPath).mode & 0o777, 0o600)
+  // The helper survived SIGHUP (an old binary would have exited).
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  assert.equal(egressPidActive(original.pid), true)
+  assert.equal((await fx.start({ dnsEmptyTypes: [64, 65], proxyUrl: 'socks5h://192.0.2.2:1080' })).reloaded, undefined)
+  const disabled = await fx.start({ proxyUrl: 'socks5h://192.0.2.2:1080' })
+  assert.equal(disabled.reloaded, true)
   assert.equal(JSON.parse(fs.readFileSync(fx.configPath, 'utf8')).dns_empty_types, undefined)
+})
+
+test('a helper without a recorded binary fingerprint is restarted, never sent SIGHUP', async (t) => {
+  const fx = egressFixture(t, 'px-legacy')
+  const original = await fx.start()
+  await waitForProcess(() => inspectEgressProcess(fx.root, 'px-legacy').ok)
+  fs.rmSync(path.join(fx.dir, 'egress.binfp'))
+  const next = await fx.start({ proxyUrl: 'socks5h://192.0.2.3:1080' })
+  assert.equal(next.reused, false)
+  assert.notEqual(next.pid, original.pid)
 })
 
 test('runExclusiveProxyEgress runs overlapping work for one proxy serially', async () => {

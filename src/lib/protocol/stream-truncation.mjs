@@ -119,6 +119,10 @@ export function createAnthropicStreamTracker() {
     hasStarted() {
       return started
     },
+    /** Type of the content block still open when the stream ended, or null. */
+    openBlockType() {
+      return open?.type || null
+    },
     isFinished() {
       return finished
     },
@@ -138,6 +142,25 @@ export function createAnthropicStreamTracker() {
       return out
     },
   }
+}
+
+/**
+ * A started stream that cannot be closed as max_tokens (thinking block open,
+ * or a timeout) would otherwise just drop the connection. Send a retryable
+ * rate_limit_error (429) instead; the real cause stays in the request log.
+ */
+export function buildRetryableTruncationError() {
+  return buildAnthropicSseError({
+    type: 'rate_limit_error',
+    message: 'Upstream stream was interrupted mid-response; please retry',
+  })
+}
+
+/** Why a started stream could not be closed, for the log. */
+export function truncationReason(result, tracker) {
+  if (!isRecoverableTruncation(result)) return 'timeout'
+  if (tracker?.openBlockType() === 'thinking') return 'thinking_open'
+  return 'other'
 }
 
 /** A timeout would just stall again if the client retries. An upstream error event already reached the client. */

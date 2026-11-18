@@ -2,9 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   buildAnthropicSseError,
+  buildRetryableTruncationError,
   createAnthropicSseErrorRemapper,
   createAnthropicStreamTracker,
   isRecoverableTruncation,
+  truncationReason,
 } from '../../src/lib/protocol/stream-truncation.mjs'
 
 test('a cut tool call closes as max_tokens and a thinking block does not', () => {
@@ -105,4 +107,26 @@ test('non-error SSE lines pass through the Anthropic error remapper unchanged', 
   const remapper = createAnthropicSseErrorRemapper()
   const line = 'data: {"type":"message_start","message":{"id":"msg_1","content":[]}}\n'
   assert.equal(remapper.remapLine(line), line)
+})
+
+test('an unclosable started stream gets a retryable rate_limit_error and a logged cause', () => {
+  const thinking = createAnthropicStreamTracker()
+  thinking.observe('data: {"type":"message_start","message":{"usage":{"output_tokens":1}}}\n\n')
+  thinking.observe('data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}\n\n')
+  assert.equal(thinking.openBlockType(), 'thinking')
+  assert.equal(truncationReason({ ok: false }, thinking), 'thinking_open')
+
+  const timeout = { body: { error: { code: 'worker_timeout', message: 'slot worker idle timeout' } } }
+  assert.equal(truncationReason(timeout, thinking), 'timeout')
+
+  const text = createAnthropicStreamTracker()
+  text.observe('data: {"type":"message_start","message":{"usage":{"output_tokens":1}}}\n\n')
+  text.observe('data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}\n\n')
+  assert.equal(truncationReason(timeout, text), 'timeout')
+  assert.match(text.closingEvents(), /"stop_reason":"max_tokens"/)
+
+  const event = buildRetryableTruncationError()
+  assert.match(event, /^event: error\ndata: /)
+  const payload = JSON.parse(event.split('\n')[1].slice(5).trim())
+  assert.equal(payload.error.type, 'rate_limit_error')
 })
