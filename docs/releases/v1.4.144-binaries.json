@@ -1,0 +1,23 @@
+{
+  "component": "kin-egress",
+  "source": {
+    "repository": "dofastted/vm2api",
+    "commit": "00384d52904dbd09432cb6ce017c9bbdeffa5a96",
+    "module": "worker"
+  },
+  "toolchain": {
+    "go": "1.25.1",
+    "GOOS": "linux",
+    "GOARCH": "amd64",
+    "GOAMD64": "v1",
+    "CGO_ENABLED": "0"
+  },
+  "build": "go build -buildvcs=false -trimpath -ldflags='-s -w' -o kin-egress ./cmd/kin-egress",
+  "payload_release": "payload-2026.11.18-egress-reload-cache",
+  "baseline_payload_release": "payload-2026.11.18-crag-3.1.6",
+  "artifact": {
+    "name": "kin-egress",
+    "size": 6238392,
+    "sha256": "3a09ab9534cf872bc1774e7cb9ae8680febc0b2049bed6d2ba451dfe686b68d8"
+  }
+}
