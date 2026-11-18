@@ -14,6 +14,8 @@ import { cn } from '@/lib/utils'
 import { isCodexVm, slotNameLabel } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Label } from '@/components/ui/label'
+import { Switch } from '@/components/ui/switch'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { routingQueryOptions } from '@/features/settings/queries'
@@ -232,10 +234,14 @@ function IntervalSetting({
 
 export function TelemetryPane({
   interval,
+  defaultEnabled,
   onIntervalChange,
+  onDefaultEnabledChange,
 }: {
   interval: number
+  defaultEnabled: boolean
   onIntervalChange: (seconds: number) => void
+  onDefaultEnabledChange: (enabled: boolean) => void
 }) {
   const qc = useQueryClient()
   const dash = useQuery(dashboardQueryOptions())
@@ -465,6 +471,26 @@ export function TelemetryPane({
             </div>
           ) : null}
           <IntervalSetting value={interval} onChange={onIntervalChange} />
+          <div className='flex items-center justify-between gap-3 border-t border-[var(--hairline)] pt-4'>
+            <div className='min-w-0'>
+              <Label
+                htmlFor='telemetry-default-enabled'
+                className='text-sm font-normal'
+              >
+                新建槽默认开启
+              </Label>
+              <p className='text-xs text-muted-foreground'>
+                打开后，保存会把现有 Claude
+                槽全部开启，之后新建的槽也默认开启。关闭只影响之后新建的槽。
+              </p>
+            </div>
+            <Switch
+              id='telemetry-default-enabled'
+              checked={defaultEnabled}
+              onCheckedChange={onDefaultEnabledChange}
+              aria-label='新建槽默认开启遥测'
+            />
+          </div>
         </CardContent>
       </Card>
 

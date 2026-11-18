@@ -105,7 +105,7 @@ import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/opena
 import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig, memoryMiB } from '../vm/machine-spec.mjs'
 import { runtimeKind } from '../vm/runtime-kind.mjs'
-import { telemetryUploadInterval } from '../vm/native-telemetry.mjs'
+import { telemetryDefaultEnabled, telemetryUploadInterval } from '../vm/native-telemetry.mjs'
 
 export function ok(data, meta) {
   const out = { ok: true, data }
@@ -1560,7 +1560,10 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     usage_probe: normalizeUsageProbeConfig(routingConfig?.usage_probe),
     notify: publicNotifyConfig(routingConfig?.notify),
     vm: normalizeVmConfig(routingConfig?.vm),
-    telemetry: { upload_interval_seconds: telemetryUploadInterval(routingConfig) },
+    telemetry: {
+      upload_interval_seconds: telemetryUploadInterval(routingConfig),
+      default_enabled: telemetryDefaultEnabled(routingConfig),
+    },
     redaction: normalizeRedaction(routingConfig?.redaction),
     redaction_runtime: redactionStatus(),
     sessions: stickyRouter.stats(),

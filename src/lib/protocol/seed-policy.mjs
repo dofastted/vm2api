@@ -169,13 +169,13 @@ export function defaultSeedPolicy(partial = {}) {
 }
 
 /**
- * New slots default to telemetry off. Only an explicit override enables uploads.
+ * New slots follow `routing.telemetry.default_enabled`. Missing or false keeps telemetry off.
+ * When `defaultEnabled` is true it overrides a packaged `telemetry_disabled`.
+ * When it is false, an explicit `telemetry_disabled` in `partial` still wins.
  */
-export function standardSeedPolicy(partial = {}) {
-  return defaultSeedPolicy({
-    telemetry_disabled: true,
-    ...partial,
-  })
+export function standardSeedPolicy(partial = {}, { defaultEnabled = false } = {}) {
+  const telemetryDisabled = defaultEnabled === true ? false : !isTelemetryEnabled(partial)
+  return defaultSeedPolicy({ ...partial, telemetry_disabled: telemetryDisabled })
 }
 
 /**

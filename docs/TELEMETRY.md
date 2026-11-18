@@ -1,6 +1,9 @@
 # VM-native telemetry
 
-Telemetry is an explicit per-VM seed-policy opt-in. New VMs are disabled.
+Telemetry is a per-VM seed-policy opt-in. New VMs follow
+`routing.telemetry.default_enabled` (missing or false means off). Turning that
+switch on also enables every existing Claude VM; turning it off does not opt
+existing VMs out.
 `kin-seed.json` → `seed_policy.telemetry_disabled` is the only enable authority.
 Linux Docker and KVM use the existing resident cli-node, supervised by the Rust
 kernel, as the sole upstream sender. macOS native slots report `unsupported`.
@@ -74,6 +77,9 @@ are whole minutes from **60–86400** seconds. Changes are published and observe
 without restarting the VM or inference process. All events share that cadence:
 no key-event, full-queue, shutdown, credential-ready or geo-ready forced flush.
 Empty batches are not sent.
+`routing.telemetry.default_enabled` defaults to **false**. When it changes to
+true, every Claude VM is opted in and the policy is published. Changing it back
+to false only affects VMs created afterward.
 
 ## Queue and disable semantics
 

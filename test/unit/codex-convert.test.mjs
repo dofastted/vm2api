@@ -30,6 +30,23 @@ test('strips client identity fields', () => {
   assert.equal(out.metadata.topic, 'keep')
 })
 
+for (const [reason, finish, stop] of [
+  ['max_output_tokens', 'length', 'max_tokens'],
+  ['content_filter', 'content_filter', 'refusal'],
+]) {
+  test(`converted clients preserve the Responses ${reason} stop`, () => {
+    const response = { status: 'incomplete', output: [], incomplete_details: { reason } }
+    const line = `data: ${JSON.stringify({ type: 'response.incomplete', response })}`
+    const chat = responsesSseToChatChunk(line)
+    assert.ok(chat.includes(`"finish_reason":"${finish}"`))
+    assert.ok(chat.endsWith('data: [DONE]\n\n'))
+    const messages = responsesSseToAnthropicEvents(line)
+    assert.ok(messages.includes(`"stop_reason":"${stop}"`))
+    assert.ok(messages.includes('event: message_stop'))
+    assert.equal(codexBodyToAnthropicMessage(response).stop_reason, stop)
+  })
+}
+
 test('chat tool turns become function_call items', () => {
   const body = chatToCodexResponses({
     model: 'gpt-5.5',
@@ -89,6 +106,15 @@ test('chat tool_choice hoists function.name onto Responses tool_choice.name', ()
   assert.equal(responsesToolChoice({ type: 'tool', name: 'get_weather' }).name, 'get_weather')
   assert.equal(responsesToolChoice({ type: 'any' }), 'required')
   assert.equal(responsesToolChoice('auto'), 'auto')
+})
+
+test('Codex Responses preserves namespaced tools inside allowed_tools', () => {
+  const choice = {
+    type: 'allowed_tools',
+    mode: 'required',
+    tools: [{ type: 'function', namespace: 'catalog', name: 'lookup' }],
+  }
+  assert.deepEqual(responsesToolChoice(choice), choice)
 })
 
 test('chat converts to responses input', () => {
@@ -162,15 +188,17 @@ test('chat and completions conversion preserve service_tier', () => {
   assert.equal(completions.body.service_tier, 'flex')
 })
 
-test('Codex hop drops max_output_tokens and keeps reasoning effort', () => {
+test('Codex hop drops top-level output token caps and keeps reasoning effort', () => {
   const converted = toCodexResponses('openai.responses', {
     model: 'gpt-5.5',
     input: 'hello',
     max_output_tokens: 8192,
+    max_completion_tokens: 4096,
     temperature: 1,
     reasoning_effort: 'high',
   })
   assert.equal(converted.body.max_output_tokens, undefined)
+  assert.equal(converted.body.max_completion_tokens, undefined)
   assert.equal(converted.body.temperature, undefined)
   assert.equal(converted.body.reasoning.effort, 'high')
 })
