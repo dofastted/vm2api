@@ -102,11 +102,11 @@ def models(data, is_api_key=False):
             return []
         return sorted(
             {
-                entry["name"].removeprefix("models/")
+                entry["name"][len("models/"):]
                 for entry in entries
                 if isinstance(entry, dict)
                 and isinstance(entry.get("name"), str)
-                and MODEL.fullmatch(entry["name"].removeprefix("models/"))
+                and MODEL.fullmatch(entry["name"][len("models/"):])
             }
         )[:128]
     entries = data.get("models")
