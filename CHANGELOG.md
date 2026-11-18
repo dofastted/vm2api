@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 1.4.143 — 2026-11-18 · CRAG 3.1.6 原生遥测
+
+- CRAG 签名标准载荷更新至 3.1.6。沿用槽位遥测开关，默认关闭；可通过 `CRAG_NATIVE_TELEMETRY_ALLOWLIST` 限定官方 Claude Code 上传的事件与字段。不自动切换运行槽位。
+
 ## 1.4.142 — 2026-11-18 · 安装升级失败可恢复、本地排队 529 可区分
 
 - 一键安装与升级在 `compose pull` 失败时还原 `.env` 的 `VM2API_IMAGE_TAG`。此前目标 tag 先写入 `.env` 再拉镜像，拉取失败直接退出，`.env` 指向一个不存在的镜像，下一次 `compose up` 起不来控制面。
