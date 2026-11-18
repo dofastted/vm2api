@@ -139,3 +139,45 @@ class ArchMappingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ImageTagRollbackTests(unittest.TestCase):
+    """#1220: a failed image pull must not leave .env pointing at a missing tag."""
+
+    def run_upgrade_pull(self, tmp: str, *, pull_ok: bool) -> subprocess.CompletedProcess:
+        script = (
+            DEFINITIONS
+            + f'INSTALL_DIR="{tmp}"\nHOST_ARCH=amd64\n'
+            + "prepare_crag_host() { :; }\nprepare_docker_crag_apparmor() { :; }\n"
+            + "wait_health() { :; }\nrefresh_slot_services() { :; }\n"
+            + f"compose() {{ [ \"$1\" = pull ] && return {0 if pull_ok else 1}; return 0; }}\n"
+            + 'set_image_tag "v9.9.9"\nstart_stack\n'
+        )
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+
+    def image_tag(self, tmp: str) -> str | None:
+        for line in (Path(tmp) / ".env").read_text(encoding="utf-8").splitlines():
+            if line.startswith("VM2API_IMAGE_TAG="):
+                return line.split("=", 1)[1]
+        return None
+
+    def test_failed_pull_restores_previous_tag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".env").write_text("PORT=8787\nVM2API_IMAGE_TAG=v1.4.130-amd64\n")
+            result = self.run_upgrade_pull(tmp, pull_ok=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(self.image_tag(tmp), "v1.4.130-amd64")
+
+    def test_successful_pull_keeps_new_tag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".env").write_text("VM2API_IMAGE_TAG=v1.4.130-amd64\n")
+            result = self.run_upgrade_pull(tmp, pull_ok=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.image_tag(tmp), "v9.9.9")
+
+    def test_failed_fresh_install_without_previous_tag_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".env").write_text("PORT=8787\n")
+            result = self.run_upgrade_pull(tmp, pull_ok=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(self.image_tag(tmp), "v9.9.9")

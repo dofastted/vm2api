@@ -41,6 +41,7 @@ WROTE_DEFAULT_PASSWORD=0
 HOST_ARCH=""
 REQUESTED_ARCH=""
 GEMINI_PAYLOAD_SOURCE=""
+PREV_IMAGE_TAG=""
 
 info() { echo -e "${BLUE}[信息]${NC} $*"; }
 ok() { echo -e "${GREEN}[成功]${NC} $*"; }
@@ -312,6 +313,21 @@ env_set() {
     rm -f "${envf}.bak"
   else
     printf '%s=%s\n' "$name" "$value" >>"$envf"
+  fi
+}
+
+# 写入目标镜像 tag 前记下原值；pull 失败时还原，避免 .env 指向不存在的镜像。
+set_image_tag() {
+  PREV_IMAGE_TAG="$(env_get VM2API_IMAGE_TAG)"
+  env_set VM2API_IMAGE_TAG "$(image_tag_for "$1")"
+}
+
+restore_image_tag() {
+  local failed
+  failed="$(env_get VM2API_IMAGE_TAG)"
+  if [ -n "$PREV_IMAGE_TAG" ] && [ "$PREV_IMAGE_TAG" != "$failed" ]; then
+    env_set VM2API_IMAGE_TAG "$PREV_IMAGE_TAG"
+    warn "已把 .env 的 VM2API_IMAGE_TAG 从 ${failed} 还原为 ${PREV_IMAGE_TAG}，当前运行的控制面不受影响"
   fi
 }
 
@@ -855,6 +871,7 @@ start_stack() {
       else
         err "拉取控制面镜像失败。检查网络与 registry 可达性，或用 --from-source 走本机构建。"
       fi
+      restore_image_tag
       exit 1
     fi
     if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d; then
@@ -959,7 +976,7 @@ cmd_install() {
     mode=image
     fetch_release_files "$tag"
     ensure_env
-    env_set VM2API_IMAGE_TAG "$(image_tag_for "$tag")"
+    set_image_tag "$tag"
   fi
   prepare_arch_env "$mode"
   prepare_arm64_host
@@ -1002,7 +1019,7 @@ cmd_upgrade() {
   else
     fetch_release_files "$tag"
     ensure_env
-    env_set VM2API_IMAGE_TAG "$(image_tag_for "$tag")"
+    set_image_tag "$tag"
   fi
   prepare_arch_env "$mode"
   echo ""
