@@ -410,7 +410,7 @@ VM 页「总计」按当前账号累计本平台已记录的官方价费用和 t
 
 ## 开发验证与 CI
 
-CI 配置以 [`.github/workflows/test.yml`](.github/workflows/test.yml) 为准，使用 Node.js 22、pnpm 10 和 Go 1.25。日常验证优先运行本次改动涉及的核心测试或指定测试文件，完整回归按需运行。
+分支、工作树与发版流程见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)：日常开发合入 `dev`，`main` 只用于发布。CI 配置以 [`.github/workflows/test.yml`](.github/workflows/test.yml) 为准，使用 Node.js 22、pnpm 10 和 Go 1.25。日常验证优先运行本次改动涉及的核心测试或指定测试文件，完整回归按需运行。
 
 先按需安装依赖：后端 `npm ci`，前端 `pnpm -C web install --frozen-lockfile`。以下命令均在仓库根目录执行：
 

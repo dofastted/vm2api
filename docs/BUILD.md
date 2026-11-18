@@ -7,7 +7,7 @@ git 里只有源码。`bin/`、`web/dist`、`share/crag` 与 `share/wrap-cli` �
 
 ## 完整应用交付
 
-发版必须先取得最新 `origin/main` 和最新应用正式版。正式版 tag 若包含尚未进入 `main` 的提交，先保留历史地合并，不能从旧本地分支或单一组件分支覆盖云端已发布功能。`v1.4.071` 同时包含最新主分支 Codex 改动与 `v1.4.070` 的 Claude 监看、CRAG 清单修复。
+发版流程（`dev` → `main` → tag）见 [DEVELOPMENT.md](DEVELOPMENT.md#发版)。发版必须先取得最新 `origin/main` 和最新应用正式版。正式版 tag 若包含尚未进入 `main` 的提交，先保留历史地合并，不能从旧本地分支或单一组件分支覆盖云端已发布功能。`v1.4.071` 同时包含最新主分支 Codex 改动与 `v1.4.070` 的 Claude 监看、CRAG 清单修复。
 
 1. 对照最新应用正式版与候选提交的 `deploy/payload.json`。清单不变就复用已发布的 payload，不新建二进制发行版；只在更换组件时重新固定实际变更的资产。不从未提交的本地 `bin/` 取出厂文件。
 2. 更换组件时，将完整资产集发布到新的不可变 payload prerelease，保持非 Latest。逐项更新变更成员的大小与 SHA-256，其余保留旧 pin。`--pin` 只用于已完整核验的独立 staging；用 `--check` 校验，`--stage <目录>` 导出发布附件。
