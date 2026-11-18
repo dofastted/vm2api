@@ -2126,7 +2126,24 @@ export async function countTokensViaWorker(exec, { body, headers = {}, timeoutMs
   return runSlotOauth(exec, 'count-tokens', { body, headers, timeoutMs })
 }
 
-const EMPTY_CONTENT_VERDICT = 'native request completed without response content'
+export const EMPTY_CONTENT_VERDICT = 'native request completed without response content'
+
+export function isRecoverableThinkingOnly(result) {
+  const facts = result?.providerResult
+  return (
+    !!result &&
+    !result.ok &&
+    facts?.schema_version === 2 &&
+    facts.http_status === 200 &&
+    facts.provider_complete === true &&
+    facts.usage_complete === true &&
+    facts.stop_reason === 'max_tokens' &&
+    facts.validation_error?.message === EMPTY_CONTENT_VERDICT &&
+    /^msg_[A-Za-z0-9_-]+$/.test(facts.message_id || '') &&
+    typeof facts.model === 'string' &&
+    !!facts.usage
+  )
+}
 
 /**
  * Records which SSE events actually reached `onEvent`, so a recovered
@@ -2146,7 +2163,7 @@ function trackDownstreamEvents(onEvent) {
           if (event?.type === 'message_start') state.messageStarted = true
           else if (event?.type === 'content_block_start' && Number.isInteger(event.index)) state.open.add(event.index)
           else if (event?.type === 'content_block_stop') state.open.delete(event.index)
-          else if (['message_delta', 'message_stop', 'error'].includes(event?.type)) state.terminal = true
+          else if (['message_delta', 'message_stop'].includes(event?.type)) state.terminal = true
         } catch {}
       }
       return onEvent(line)
@@ -2172,20 +2189,7 @@ function trackDownstreamEvents(onEvent) {
 export function recoverThinkingOnlyMaxTokens(result, { onEvent, onCommit, downstream = null } = {}) {
   const facts = result?.providerResult
   const writer = typeof onEvent === 'function'
-  if (
-    !result ||
-    result.ok ||
-    (result.committed && writer && (!downstream || downstream.terminal)) ||
-    facts?.schema_version !== 2 ||
-    facts.http_status !== 200 ||
-    facts.provider_complete !== true ||
-    facts.usage_complete !== true ||
-    facts.stop_reason !== 'max_tokens' ||
-    facts.validation_error?.message !== EMPTY_CONTENT_VERDICT ||
-    !/^msg_[A-Za-z0-9_-]+$/.test(facts.message_id || '') ||
-    typeof facts.model !== 'string' ||
-    !facts.usage
-  )
+  if (!isRecoverableThinkingOnly(result) || (result.committed && writer && (!downstream || downstream.terminal)))
     return result
   const usage = facts.usage
   const body = {

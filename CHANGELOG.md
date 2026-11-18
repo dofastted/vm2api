@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.4.154 — 2026-11-19 · OAuth Cookie 桥接与 CRAG 3.1.7
+
+- Cookie 导入改为在 `kin-worker` 内铸造 session code（经 Chrome-TLS 桥），普通 fetch 会被上游以 `missing_client_attestation` 拒绝。helper 新增可选输入 `worker_config_path`，guest 槽继续走 `KERNEL_CONFIG`；缺少新 `kin-worker` 时明确报错，不再静默降级（#1297）。
+- Setup Token 粘贴码改为铸造一年期 `user:inference` 票据，与保留刷新票据的账号转换区分；换票后续按原生客户端链路（profile → eval → roles → first_token_date → eval → bootstrap），不再写 Grove。授权链接的 scope 同步收窄为 `user:inference`（#1297）。
+- 内核载荷升级到 CRAG 3.1.7（标准签名包，授权与产品密钥不变），并更新 `kin-oauth-auth` 与 `kin-worker` 的锁定大小和 SHA-256；`kin-egress` 等其余锁定载荷不变（#1297）。
+- 原生 handoff 的 realtime 在第一个可见工具字节之前提交当前槽，然后按到达顺序放出工具 start 和每一段 `input_json_delta`。`verified` 仍扣到 EOF。参数到 EOF 不是完整 JSON object 时返回错误，不补成成功 `tool_use`，已提交的流不换槽（#1296）。
+
 ## 1.4.153 — 2026-11-19 · CRAG 域名切换与回调兼容
 
 - 后续版本的 CRAG 商城、设备激活和宿主订阅请求改指向 `https://www.vm2api.org`。源站继续同时接受 `crag.fkcodex.com`。

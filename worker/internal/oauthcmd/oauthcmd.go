@@ -68,6 +68,12 @@ func Run(args []string, stdin io.Reader, stdout io.Writer) int {
 		return writeAndReturn(stdout, errorEnvelope(0, code, errorMessage(code)), 0)
 	}
 
+	// Cookie import's browser stage: Chrome-transport organizations + authorize,
+	// before any credential or token client exists.
+	if op == "session-code" {
+		return runSessionCode(cfg, stdin, stdout)
+	}
+
 	httpClient, err := oauthHTTPClient(cfg)
 	if err != nil {
 		code := classifyError(err)
@@ -183,7 +189,7 @@ func parseArgs(args []string) (string, string, bool, bool) {
 
 func validateOperation(op string) error {
 	switch op {
-	case "refresh", "usage", "profile", "models", "count-tokens", "reset-status", "reset-redeem":
+	case "refresh", "usage", "profile", "models", "count-tokens", "reset-status", "reset-redeem", "session-code":
 		return nil
 	default:
 		return fmt.Errorf("unknown oauth operation %q", op)

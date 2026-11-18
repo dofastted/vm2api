@@ -166,6 +166,20 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
         )
         return
       }
+      if (authorizeMode === 'attestation') {
+        res.writeHead(400)
+        res.end(
+          JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'invalid_request_error',
+              message: "This request couldn't be completed.",
+              details: { error_code: 'missing_client_attestation' },
+            },
+          }),
+        )
+        return
+      }
       expectedExchange = {
         code: 'cookie-auth-code',
         challenge: payload.code_challenge,
@@ -227,7 +241,9 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
   fs.writeFileSync(
     path.join(runDir, 'kernel.json'),
     JSON.stringify({
+      vm_id: vm.id,
       credential_path: '/home/kincli/.claude/credentials.json',
+      proxy_url: `socks5h://127.0.0.1:${proxy.address().port}`,
     }),
   )
   const exec = slotExec(root, vm)
@@ -439,12 +455,15 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       )
     })
   }
-  for (const mode of ['stale', 'state_mismatch']) {
+  for (const mode of ['stale', 'state_mismatch', 'attestation']) {
     await t.test(`session cookie rejects ${mode} before token exchange`, async () => {
       authorizeMode = mode
       const before = tokenRequests
       const requestStart = requests.length
-      await assert.rejects(run({ operation: 'session_key', session_key: sessionKey }))
+      // A missing browser attestation is final: no other origin variant is tried.
+      await assert.rejects(run({ operation: 'session_key', session_key: sessionKey }), (err) =>
+        mode === 'attestation' ? err.code === 'authorize_client_attestation' : true,
+      )
       assert.equal(tokenRequests, before)
       assert.deepEqual(
         requests.slice(requestStart).map(({ url }) => url),
@@ -457,10 +476,17 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
     'legacy kernel authorization-link and Cookie exchanges use the real helper and bound SOCKS exit',
     async (t) => {
       const previousCert = process.env.NODE_EXTRA_CA_CERTS
+      // kin-worker mints the session code in its own Go process, which does not
+      // read NODE_EXTRA_CA_CERTS. Go reads SSL_CERT_FILE, so the bridge trusts
+      // the same fixture CA the Node side already trusts.
+      const previousSslCert = process.env.SSL_CERT_FILE
       process.env.NODE_EXTRA_CA_CERTS = cert
+      process.env.SSL_CERT_FILE = cert
       t.after(() => {
         if (previousCert === undefined) delete process.env.NODE_EXTRA_CA_CERTS
         else process.env.NODE_EXTRA_CA_CERTS = previousCert
+        if (previousSslCert === undefined) delete process.env.SSL_CERT_FILE
+        else process.env.SSL_CERT_FILE = previousSslCert
       })
       const generated = generateAuthUrl({ vmId: vm.id, proxyUrl: 'socks5h://127.0.0.1:1' })
       const url = new URL(generated.auth_url)

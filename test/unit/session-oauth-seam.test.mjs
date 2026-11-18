@@ -129,3 +129,14 @@ test('a region-blocked token exchange is a 502 pointing at the exit', () => {
   assert.match(payload.error.message, /出口/)
   assert.doesNotMatch(payload.error.message, /限流|Cloudflare/)
 })
+
+test('a browser-attestation gate is reported as such, not as a stale cookie', () => {
+  const raw = `authorize failed: 400 {"type":"error","error":{"type":"invalid_request_error","message":"This request couldn't be completed.","details":{"error_code":"missing_client_attestation"}},"request_id":"req_011ChB59nWjC5BhWghnDMkbA"}`
+  assert.equal(classifyImportHelperOutput(raw), 'client_attestation_required')
+  const payload = panelImportErrorPayload({ message: raw })
+  assert.equal(payload.status, 502)
+  assert.equal(payload.error.code, 'client_attestation_required')
+  assert.match(payload.error.message, /client_attestation/)
+  assert.match(payload.error.message, /授权链接/)
+  assert.doesNotMatch(payload.error.message, /sessionKey 不够新|限流|Cloudflare/)
+})
