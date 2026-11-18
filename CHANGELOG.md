@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 「订阅 CRAG」页头增加 Telegram 群入口，徽标链接到 https://t.me/vm2api。免登录购买页同样显示。
+
 ## 1.4.148 — 2026-11-19 · OAuth helper 载荷更新
 
 - 更新 `kin-oauth-auth` 的锁定大小和 SHA-256，匹配已更新的 OAuth 载荷附件；Setup Token 首次授权使用 `https://claude.ai` 作为来源。保留 `1.4.147` 的 WARP 修复；CRAG 3.1.6 和其他二进制不变。

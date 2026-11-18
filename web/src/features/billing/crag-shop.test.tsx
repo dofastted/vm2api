@@ -324,6 +324,15 @@ describe('CRAG buyer presentation and activation wire', () => {
     }
   })
 
+  it('links the Telegram group from both purchase pages', () => {
+    for (const device of [false, true]) {
+      const page = render(device)
+      expect(page).toContain('href="https://t.me/vm2api"')
+      expect(page).toContain('TG 群')
+      expect(page).toContain('Telegram 群 @vm2api')
+    }
+  })
+
   it('shows device orders and applies the paid entitlement without a panel login or a voucher', async () => {
     state.authenticated = false
     state.values[3] = [{ ...order, activation: { state: 'ready_to_apply' } }]
