@@ -29,14 +29,35 @@ probe() {
     const port = process.env.PORT || "8787"
     const base = `http://127.0.0.1:${port}`
     const key = process.env.KIN_API_KEY || process.env.VM2API_API_KEY || ""
+    const refill = Number(process.env.KIN_RATE_REFILL || 1)
+    const interval = Number.isFinite(refill) && refill > 0 ? Math.min(30000, Math.ceil(1000 / refill)) : 1000
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    let nextRequestAt = 0
+
     async function json(path) {
-      const res = await fetch(`${base}${path}`, {
-        headers: { Authorization: `Bearer ${key}` },
-        signal: AbortSignal.timeout(12000),
-      })
-      if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`)
-      const body = await res.json()
-      return body.data || body
+      for (let attempt = 0; ; attempt++) {
+        await sleep(Math.max(0, nextRequestAt - Date.now()))
+        nextRequestAt = Date.now() + interval
+        const res = await fetch(`${base}${path}`, {
+          headers: { Authorization: `Bearer ${key}` },
+          signal: AbortSignal.timeout(12000),
+        })
+        if (res.ok) {
+          const body = await res.json()
+          return body.data || body
+        }
+        const retryAfter = res.headers.get("retry-after")
+        await res.body?.cancel()
+        if (res.status !== 429 || attempt >= 3) throw new Error(`${path}: HTTP ${res.status}`)
+
+        const retryMs = retryAfter === null ? 0 : /^\d+$/.test(retryAfter)
+          ? Number(retryAfter) * 1000
+          : Date.parse(retryAfter) - Date.now()
+        const delay = Math.max(interval, 2000 * 2 ** attempt, Number.isFinite(retryMs) ? retryMs : 0)
+        if (delay > 30000) throw new Error(`${path}: HTTP 429; Retry-After exceeds the 30s probe retry limit`)
+        console.error(`${path}: HTTP 429; retrying in ${delay}ms`)
+        nextRequestAt = Date.now() + delay
+      }
     }
     function kernelHealthy(detail) {
       const kernel = detail.kernel

@@ -203,7 +203,7 @@ import {
   startHostUpgrade,
 } from './release.mjs'
 import { downloadReleaseKernel, kernelReleaseHttpStatus, listKernelReleaseVersions } from './release-kernel.mjs'
-import { describeKernelCatalog, pullKernelRelease } from './kernel-catalog.mjs'
+import { describeKernelCatalog, listKernelReleases, pullKernelRelease, selectKernelRelease } from './kernel-catalog.mjs'
 import {
   hasKernelInstallSafetyHold,
   installKernelTargets,
@@ -3066,6 +3066,32 @@ export function createPanelHandler(ctx) {
             error: { code: 'kernel_releases_unavailable', message: '暂时无法读取发行版本' },
           })
         }
+      }
+      // Several cached releases side by side.
+      if (req.method === 'GET' && p === '/api/panel/kernels/cached') {
+        const result = listKernelReleases(cfg.paths.project, url.searchParams.get('kernel') || 'crag')
+        if (!result.ok)
+          return json(res, 400, {
+            ok: false,
+            error: { code: result.code, message: result.error },
+          })
+        return json(res, 200, panel.ok({ releases: result.releases }))
+      }
+      if (req.method === 'POST' && p === '/api/panel/kernels/select') {
+        const body = await readBody(req, 8 * 1024)
+        const result = selectKernelRelease(cfg.paths.project, {
+          kernel: body?.kernel,
+          tag: body?.tag,
+        })
+        if (!result.ok) {
+          const status =
+            result.code === 'kernel_pull_busy' ? 409 : result.code === 'kernel_release_not_cached' ? 404 : 400
+          return json(res, status, {
+            ok: false,
+            error: { code: result.code, message: result.error },
+          })
+        }
+        return json(res, 200, panel.ok({ kernel: result.kernel, release: result.release }))
       }
       if (req.method === 'POST' && p === '/api/panel/kernels/pull') {
         const body = await readBody(req, 8 * 1024)
