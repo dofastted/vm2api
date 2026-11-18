@@ -37,7 +37,7 @@ import { pushKernelSelection } from '../cluster/remote-slot-files.mjs'
 import { accountIdOf } from '../pool/pool-scheduler.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { clearRustHealthCache } from '../transport/kernel-router.mjs'
-import { rustKernelHealth, rustKernelProcessUp } from '../transport/rust-kernel-client.mjs'
+import { rustKernelHealth, rustKernelReachable } from '../transport/rust-kernel-client.mjs'
 
 const PRODUCTS = new Set(['cli-node', 'crag'])
 const INTERRUPTED_COMMAND =
@@ -200,11 +200,8 @@ async function restoreCragRollback({ projectRoot, vm, rollback, routing, ops, bo
       const health = await (ops.rustKernelHealth || rustKernelHealth)(exec, { requireInternalToken: true })
       if (
         health?.internalTokenAuthenticated === true &&
-        rustKernelProcessUp(health) &&
-        health.healthy !== false &&
-        health.license_valid !== false &&
-        health.recovering !== true &&
-        Number(health.cli_pid) > 0
+        rustKernelReachable(health) &&
+        (health.execution_mode === 'v2_process_pool' || Number(health.cli_pid) > 0)
       ) {
         const running = patchVmRecord(projectRoot, vm.id, (record) => markRunning(record, boot, projectRoot))
         if (running) return running
