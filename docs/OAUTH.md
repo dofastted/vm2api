@@ -47,7 +47,7 @@ CAI 粘贴码按 sub2api 规则换票：`code#state` 只将 `#` 后的上游返�
 | | `sub2api`（cookie → 完整 OAuth、CAI 粘贴码） | `setup-token`（一年期 setup-token mint） |
 |---|---|---|
 | authorize 主机 | `https://claude.ai/v1/oauth/{org}/authorize` | `https://platform.claude.com/v1/oauth/{org}/authorize` |
-| 授权来源头 | `Origin: https://claude.ai`、`Referer: https://claude.ai/new` | `Origin: https://claude.com`、`Referer: https://claude.com/cai/oauth/authorize?code=true` |
+| 首次授权来源头 | `Origin: https://claude.ai`、`Referer: https://claude.ai/new` | `Origin: https://claude.ai`、`Referer: https://platform.claude.com/oauth/authorize?code=true` |
 | token UA | `axios/1.13.6` | 浏览器 UA（macOS Chrome 154） |
 | bootstrap | `entrypoint=claude-code&model=claude-opus-5-5`，UA `claude-cli/… (external, cli)` | `entrypoint=claude-vscode&model=claude-opus-5`，UA `claude-code/…` |
 | Grove | 不动 | bootstrap 后 `PATCH /api/oauth/account/settings {"grove_enabled": true}` |
