@@ -22,15 +22,30 @@ export function telemetryUploadInterval(routing) {
   return TELEMETRY_UPLOAD_INTERVAL_DEFAULT
 }
 
+/** routing.telemetry.default_enabled. Only an explicit true opts new Claude VMs in. */
+export function telemetryDefaultEnabled(routing) {
+  return routing?.telemetry?.default_enabled === true
+}
+
 export function validateTelemetryRoutingPatch(body = {}) {
   if (!body || typeof body !== 'object' || body.telemetry == null) return []
   if (typeof body.telemetry !== 'object' || Array.isArray(body.telemetry)) return ['telemetry 必须是对象']
-  if (!Object.hasOwn(body.telemetry, 'upload_interval_seconds')) return []
-  const n = body.telemetry.upload_interval_seconds
-  if (!Number.isInteger(n) || n % 60 !== 0 || n < TELEMETRY_UPLOAD_INTERVAL_MIN || n > TELEMETRY_UPLOAD_INTERVAL_MAX) {
-    return ['telemetry.upload_interval_seconds 必须是 60–86400 之间、60 的整数倍']
+  const problems = []
+  if (Object.hasOwn(body.telemetry, 'default_enabled') && typeof body.telemetry.default_enabled !== 'boolean') {
+    problems.push('telemetry.default_enabled 必须是布尔值')
   }
-  return []
+  if (Object.hasOwn(body.telemetry, 'upload_interval_seconds')) {
+    const n = body.telemetry.upload_interval_seconds
+    if (
+      !Number.isInteger(n) ||
+      n % 60 !== 0 ||
+      n < TELEMETRY_UPLOAD_INTERVAL_MIN ||
+      n > TELEMETRY_UPLOAD_INTERVAL_MAX
+    ) {
+      problems.push('telemetry.upload_interval_seconds 必须是 60–86400 之间、60 的整数倍')
+    }
+  }
+  return problems
 }
 
 function routingFor(projectRoot, routing) {

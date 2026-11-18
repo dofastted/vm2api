@@ -18,6 +18,9 @@ test('default seed policy includes the editable claude setting', () => {
 test('explicit opt-in removes telemetry kill switches; omitted policy retains them', () => {
   assert.equal(buildSlotSettingsEnv(standardSeedPolicy()).DISABLE_TELEMETRY, '1')
   assert.equal(buildSlotSettingsEnv(standardSeedPolicy({ telemetry_disabled: false })).DISABLE_TELEMETRY, undefined)
+  assert.equal(standardSeedPolicy({}, { defaultEnabled: true }).telemetry_disabled, false)
+  assert.equal(standardSeedPolicy({ telemetry_disabled: true }, { defaultEnabled: true }).telemetry_disabled, false)
+  assert.equal(standardSeedPolicy().telemetry_disabled, true)
   const contradicted = defaultSeedPolicy({
     telemetry_disabled: false,
     disable_nonessential_traffic: false,

@@ -489,7 +489,7 @@ test('native interval publication reports an unreachable remote VM as failed, no
   const vms = path.join(root, 'vms')
   const routingFile = path.join(root, 'routing.json')
   const user = 'cd'.repeat(32)
-  const seed = { telemetry_disabled: false }
+  const seed = { telemetry_disabled: true }
   for (const [id, extra] of [
     ['vm-claude', {}],
     ['vm-node', { node_id: 'node-test' }],
@@ -513,7 +513,7 @@ test('native interval publication reports an unreachable remote VM as failed, no
     const localSeed = JSON.parse(
       fs.readFileSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'kin-seed.json'), 'utf8'),
     )
-    assert.equal(localSeed.seed_policy.telemetry_disabled, false)
+    assert.equal(localSeed.seed_policy.telemetry_disabled, true)
     assert.equal(fs.existsSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'settings.json')), true)
     assert.equal(fs.existsSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'claude.setting')), true)
     assert.equal(fs.existsSync(path.join(vms, 'vm-codex', 'run', 'kernel.json')), false)
@@ -523,6 +523,25 @@ test('native interval publication reports an unreachable remote VM as failed, no
     )
     assert.equal((await runtime.persistRoutingPatch({ sticky: {} })).telemetry_sync, null)
     assert.equal(JSON.parse(fs.readFileSync(routingFile, 'utf8')).telemetry.upload_interval_seconds, 3600)
+    const opted = await runtime.persistRoutingPatch({ telemetry: { default_enabled: true } })
+    assert.equal(opted.telemetry_sync.updated, 1)
+    assert.deepEqual(opted.telemetry_sync.failed, ['vm-node'])
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(vms, 'vm-claude.json'), 'utf8')).seed_policy.telemetry_disabled,
+      false,
+    )
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(vms, 'vm-codex.json'), 'utf8')).seed_policy.telemetry_disabled,
+      true,
+    )
+    assert.equal(
+      (await runtime.persistRoutingPatch({ telemetry: { default_enabled: false } })).telemetry_sync.updated,
+      1,
+    )
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(vms, 'vm-claude.json'), 'utf8')).seed_policy.telemetry_disabled,
+      false,
+    )
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

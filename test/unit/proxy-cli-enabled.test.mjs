@@ -239,3 +239,37 @@ test('package import with a proxy keeps proxy_cli_enabled even if the spec says 
   assert.equal(saved.proxy_cli_enabled, true)
   assert.equal(slotHasBoundProxy(saved), true)
 })
+
+test('package import with default telemetry on ignores a packaged opt-out', async (t) => {
+  const root = tmpRoot()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const db = createDatabase({ dbPath: ':memory:' })
+  const pool = new ProxyPool({ db })
+  t.after(() => {
+    pool.stopScheduler()
+    db.close()
+  })
+  const doc = buildVmPackage({
+    vm: {
+      id: 'vm-pkg',
+      name: 'pkg',
+      platform: 'anthropic',
+      family: 'claude',
+      kernel: 'ubuntu-24.04',
+      seed_policy: { telemetry_disabled: true },
+    },
+  })
+  const parsed = parseVmPackage(doc)
+  assert.equal(parsed.ok, true, parsed.error?.message)
+  assert.equal(parsed.value.vm.seed_policy.telemetry_disabled, true)
+  const result = await commitVmPackage({
+    projectRoot: root,
+    parsed,
+    mode: 'create',
+    proxyPool: pool,
+    telemetryDefaultEnabled: true,
+    owner: { role: 'admin', userId: null },
+  })
+  assert.equal(result.ok, true, result.error?.message)
+  assert.equal(getVm(root, 'vm-pkg').seed_policy.telemetry_disabled, false)
+})
