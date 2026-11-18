@@ -58,7 +58,7 @@ jobs:
           name: vm2api ${{ github.ref_name }}
           body: |
             无后缀附件为 linux amd64；`-linux-arm64` 后缀为 ARM64 控制面原生 helper。槽位 kernel / CLI 只有 amd64，ARM64 主机经 QEMU 运行。
-            控制面镜像：`ghcr.io/dofastted/vm2api:${{ github.ref_name }}`（多架构），`${{ github.ref_name }}-amd64` / `${{ github.ref_name }}-arm64`（单架构）。一键脚本按宿主架构自动选择。
+            控制面镜像：`ghcr.io/dofastted/vm2api:${{ github.ref_name }}`（多架构，ARM64 构建未通过时只含 amd64），`${{ github.ref_name }}-amd64` / `${{ github.ref_name }}-arm64`（单架构）。一键脚本按宿主架构自动选择。
 
             升级见 [CHANGELOG.md](https://github.com/dofastted/vm2api/blob/main/CHANGELOG.md)、[docs/DEPLOY.md](https://github.com/dofastted/vm2api/blob/main/docs/DEPLOY.md) 与 [docs/ARM64.md](https://github.com/dofastted/vm2api/blob/main/docs/ARM64.md)。
           files: dist/*
@@ -165,6 +165,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: [image-amd64, image-arm64]
+    # amd64 推成功就发布 `<ref>` 与 `latest`；ARM64 失败时降级为 amd64 单架构，
+    # 否则这两个 tag 会一直停在上一次两架构都通过的版本上。ARM64 主机由一键脚本
+    # 固定写 `-arm64` 单架构 tag（见 docs/ARM64.md），不依赖这里的多架构 tag。
+    if: ${{ !cancelled() && needs.image-amd64.result == 'success' }}
     permissions:
       contents: read
       packages: write
@@ -177,6 +181,8 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: publish multi-arch tags
         shell: bash
+        env:
+          ARM64_RESULT: ${{ needs.image-arm64.result }}
         run: |
           set -euo pipefail
           owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
@@ -188,11 +194,21 @@ jobs:
             targets+=(-t "${image}:latest")
           fi
           targets+=(-t "${image}:${ref}")
-          docker buildx imagetools create "${targets[@]}" "${image}:${ref}-amd64" "${image}:${ref}-arm64"
-          docker buildx imagetools inspect --raw "${image}:${ref}" | python3 -c '
-          import json, sys
+          sources=("${image}:${ref}-amd64")
+          expected=amd64
+          if [ "${ARM64_RESULT}" = "success" ]; then
+            sources+=("${image}:${ref}-arm64")
+            expected="amd64 arm64"
+          else
+            echo "::warning title=ARM64 image missing::image-arm64 结果为 ${ARM64_RESULT}，${ref} 与 latest 本次只含 amd64；ARM64 主机请拉 ${ref}-arm64"
+          fi
+          docker buildx imagetools create "${targets[@]}" "${sources[@]}"
+          docker buildx imagetools inspect --raw "${image}:${ref}" | EXPECTED="${expected}" python3 -c '
+          import json, os, sys
+          expected = set(os.environ["EXPECTED"].split())
           found = {(m.get("platform") or {}).get("architecture") for m in json.load(sys.stdin).get("manifests", [])}
-          missing = {"amd64", "arm64"} - found
+          missing = expected - found
           assert not missing, f"manifest list lacks {sorted(missing)}"
           print("manifest platforms:", sorted(p for p in found if p))
           '
+          printf '%s\n' "多架构 tag \`${ref}\`（tag 推送时同时更新 \`latest\`）架构：${expected// /, }" >> "$GITHUB_STEP_SUMMARY"

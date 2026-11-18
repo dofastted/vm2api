@@ -53,6 +53,21 @@ test('installation and release scripts do not require cc-node', () => {
   assert.doesNotMatch(installer, /cc-node/)
 })
 
+test('the release manifest job publishes amd64 tags even when the ARM64 image is missing', () => {
+  const release = fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8')
+  const manifest = release.slice(release.indexOf('\n  manifest:'))
+  // Gating on amd64 alone keeps `latest` and the bare version tag from freezing on an older
+  // release every time the ARM64 smoke test fails.
+  assert.ok(manifest.includes("if: ${{ !cancelled() && needs.image-amd64.result == 'success' }}"))
+  assert.ok(manifest.includes('sources=("${image}:${ref}-amd64")'))
+  assert.match(
+    manifest,
+    /if \[ "\$\{ARM64_RESULT\}" = "success" \]; then\n\s+sources\+=\("\$\{image\}:\$\{ref\}-arm64"\)\n\s+expected="amd64 arm64"/,
+  )
+  // The published list is still checked against the architectures that actually got built.
+  assert.ok(manifest.includes('missing = expected - found'))
+})
+
 test('macOS host preparation binds the platform UUID and does not overwrite it on a different host', (t) => {
   const dest = fs.mkdtempSync(path.join(os.tmpdir(), 'install-crag-host-'))
   t.after(() => fs.rmSync(dest, { recursive: true, force: true }))

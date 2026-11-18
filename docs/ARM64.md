@@ -9,8 +9,14 @@ checkout 本机构建。
 | 发布物 | amd64 | arm64 |
 | --- | --- | --- |
 | 控制面镜像（单架构） | `ghcr.io/dofastted/vm2api:vX.Y.Z-amd64` | `ghcr.io/dofastted/vm2api:vX.Y.Z-arm64` |
-| 控制面镜像（多架构） | `vX.Y.Z` / `latest`，按拉取平台选择 | 同左 |
+| 控制面镜像（多架构） | `vX.Y.Z` / `latest`，按拉取平台选择 | 同左，ARM64 构建通过时才含 arm64 |
 | Release 附件 | 无后缀：`kin-kernel`、`cli-node`、`kin-worker` 等 | `kin-worker-linux-arm64`、`kin-egress-linux-arm64` |
+
+`vX.Y.Z` 与 `latest` 只要 amd64 镜像推成功就会发布：ARM64 job 失败时这两个 tag
+降级为 amd64 单架构，并在 release 流水线里留一条 warning，不会让它们停在上一个
+两架构都通过的版本上。此时 ARM64 主机拉 `vX.Y.Z` / `latest` 会报
+`no matching manifest`，须改拉 `vX.Y.Z-arm64`（一键脚本和面板本来就固定写该
+单架构 tag，不受影响）。
 
 无后缀附件保持 linux amd64，已部署的面板按原名下载 kernel / CLI。slot 内
 kernel、OAuth 和控制面造机服务 `kin-computer` 仍使用 amd64/QEMU。本机 Docker
