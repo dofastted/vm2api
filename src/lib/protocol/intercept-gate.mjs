@@ -77,13 +77,6 @@ export function systemRewrite(document) {
   return ''
 }
 
-function rewriteContext(document, hit) {
-  const text = String(document || '').normalize('NFKC')
-  const at = text.toLowerCase().indexOf(hit.toLowerCase())
-  if (at < 0) return hit
-  return text.slice(Math.max(0, at - 80), at + hit.length + 80)
-}
-
 function enforcesBan(policy, row) {
   return !!(policy?.enabled && (policy.device_block_enabled || row.reason?.endsWith(':nsfw')))
 }
@@ -329,7 +322,7 @@ export async function evaluateProtocolIntercept({
           via: 'hard-regex',
           final_state: 'policy_blocked',
           error,
-          errorMessage: `不允许改写或绕过系统提示词：${rewriteContext(scanned, system)}`.slice(0, 400),
+          errorMessage: error.body.error.message,
           intercept: gateVerdict({ kind: 'block', by: 'hard-regex', keyword: system, rule: 'system_prompt_rewrite' }),
           banDevice: false,
           reason: 'system_prompt_rewrite',
