@@ -128,9 +128,10 @@ export function WrapSamplePage() {
 
   function cragReleaseLabel(tag?: string) {
     if (!tag) return tag
-    const named = cragOptions?.find((option) => option.tag === tag)?.label
-    const version = /(?:^|-)(\d+\.\d+\.\d+)(?:-|$)/.exec(named || tag)?.[1]
-    return version || named || tag
+    const version = /^payload-\d{4}\.\d{2}\.\d{2}-crag-(\d+\.\d+\.\d+)(?:-legacy)?$/.exec(
+      tag
+    )?.[1]
+    return version || tag
   }
 
   const pull = useMutation({

@@ -15,22 +15,25 @@ type ButtonProps = ComponentProps<
   typeof import('@/components/ui/button').Button
 >
 
-const state = vi.hoisted(() => ({
-  vms: [] as Vm[],
-  installations: {} as Record<string, KernelInstallation>,
-  licenses: {} as Record<string, CragLicenseStatus>,
-  installLicenses: undefined as Record<string, CragLicenseStatus> | undefined,
-  role: 'admin',
-  host: undefined as CragHostStatus | undefined,
-  hostError: false,
-  hostEnabled: false,
-  hostInterval: undefined as number | false | undefined,
-  values: [] as unknown[],
-  cursor: 0,
-  buttons: [] as ButtonProps[],
-  confirm: undefined as ConfirmProps | undefined,
-  invalidateQueries: vi.fn(),
-}))
+ const state = vi.hoisted(() => ({
+   vms: [] as Vm[],
+   installations: {} as Record<string, KernelInstallation>,
+   licenses: {} as Record<string, CragLicenseStatus>,
+   installLicenses: undefined as Record<string, CragLicenseStatus> | undefined,
+   releaseOptions: undefined as
+     | { tag: string; label: string }[]
+     | undefined,
+   role: 'admin',
+   host: undefined as CragHostStatus | undefined,
+   hostError: false,
+   hostEnabled: false,
+   hostInterval: undefined as number | false | undefined,
+   values: [] as unknown[],
+   cursor: 0,
+   buttons: [] as ButtonProps[],
+   confirm: undefined as ConfirmProps | undefined,
+   invalidateQueries: vi.fn(),
+ }))
 
 vi.mock('react', async (importOriginal) => ({
   ...(await importOriginal<typeof import('react')>()),
@@ -74,13 +77,16 @@ vi.mock('@tanstack/react-query', async (importOriginal) => ({
       data: queryKey.includes('kernels')
         ? {
             kernels: [
-              {
-                id: 'crag',
-                paid: true,
-                ready: true,
-                version: '3.0.8',
-                payload_tag: 'payload-2026.11.16-crag-3.0.8',
-              },
+               {
+                 id: 'crag',
+                 paid: true,
+                 ready: true,
+                 version: '3.0.8',
+                 payload_tag: 'payload-2026.11.16-crag-3.0.8',
+                 ...(state.releaseOptions
+                   ? { release_options: state.releaseOptions }
+                   : {}),
+               },
               { id: 'cli-node', paid: false, ready: true, version: '1.4.131' },
             ],
             licenses: state.licenses,
@@ -137,21 +143,22 @@ function render(vm: Partial<Vm> = {}, otherVms: Vm[] = []) {
   return renderToStaticMarkup(<WrapSamplePage />)
 }
 
-beforeEach(() => {
-  vi.clearAllMocks()
-  state.installations = {}
-  state.licenses = {}
-  state.installLicenses = undefined
-  state.role = 'admin'
-  state.host = undefined
-  state.hostError = false
-  state.hostEnabled = false
-  state.hostInterval = undefined
-  state.values = []
-  state.cursor = 0
-  state.buttons = []
-  state.confirm = undefined
-  state.invalidateQueries.mockReset()
+ beforeEach(() => {
+   vi.clearAllMocks()
+   state.installations = {}
+   state.licenses = {}
+   state.installLicenses = undefined
+   state.releaseOptions = undefined
+   state.role = 'admin'
+   state.host = undefined
+   state.hostError = false
+   state.hostEnabled = false
+   state.hostInterval = undefined
+   state.values = []
+   state.cursor = 0
+   state.buttons = []
+   state.confirm = undefined
+   state.invalidateQueries.mockReset()
   vi.mocked(installKernelTargets).mockReset()
   vi.mocked(installKernelTargets).mockImplementation(async (targets) => ({
     ok: true,
@@ -451,3 +458,34 @@ describe('CRAG runtime on the kernel page', () => {
     expect(errorHtml).toMatch(/使用中的槽位<\/span><span[^>]*>待核对<\/span>/)
   })
 })
+ 
+ it('shows only the version number from payload tags, not catalog suffixes', () => {
+   state.releaseOptions = [
+     {
+       tag: 'payload-2026.11.19-crag-3.1.7',
+       label: '3.1.7 固定 CLI 入口',
+     },
+     {
+       tag: 'payload-2026.11.16-crag-3.1.2-legacy',
+       label: '3.1.2',
+     },
+   ]
+   state.installations = {
+     'vm-old': {
+       kernel: 'crag',
+       payload_tag: 'payload-2026.11.19-crag-3.1.7',
+       version: '3.1.7',
+       installed_at: '2026-11-19T00:00:00.000Z',
+     },
+   }
+   const html = render({
+     resolved_dataplane: 'crag',
+     resolved_crag_kernel_version: 'v2',
+   })
+   expect(html).toContain('已安装：3.1.7')
+   expect(html).toContain('缓存：3.0.8')
+   expect(html).not.toContain('payload-')
+   expect(html).not.toContain('固定 CLI 入口')
+   expect(html).not.toContain('3.1.7 固定')
+   expect(html).not.toContain('3.1.2-legacy')
+ })
