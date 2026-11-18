@@ -478,7 +478,7 @@ func TestResolveDNSFallsBackToNextUpstream(t *testing.T) {
 	if len(reply) < 3 || reply[0] != 0x12 || reply[2]&0x80 == 0 {
 		t.Fatalf("reply=%v", reply)
 	}
-	if got := srv.preferred.Load(); got != 1 {
+	if got := srv.rt().preferred.Load(); got != 1 {
 		t.Fatalf("preferred=%d want 1", got)
 	}
 }

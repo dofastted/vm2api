@@ -30,7 +30,8 @@ type Config struct {
 	DNSEmptyTypes []uint16 `json:"dns_empty_types,omitempty"`
 	// DomainForward sends a unique helper DNS answer as a SOCKS hostname.
 	// Off by default: the original IP literal is unchanged.
-	DomainForward bool `json:"domain_forward,omitempty"`
+	DomainForward    bool `json:"domain_forward,omitempty"`
+	DNSCacheDisabled bool `json:"dns_cache_disabled,omitempty"`
 }
 
 // IdleClose is how long a splice may sit with no bytes before both sides
@@ -84,9 +85,8 @@ const dnsAttemptTimeout = 4 * time.Second
 type Server struct {
 	// cur holds everything a SIGHUP may swap. Each connection or query reads
 	// it once, so established splices stay on the exit they were dialed with.
-	cur       atomic.Pointer[runtime]
-	preferred atomic.Int32
-	domains   domainTable
+	cur     atomic.Pointer[runtime]
+	domains domainTable
 	// dnsSlots caps in-flight UDP DNS queries; a full set answers SERVFAIL
 	// inline so a flood cannot pile up goroutines and upstream connections.
 	dnsSlots chan struct{}
@@ -113,6 +113,8 @@ type runtime struct {
 	dialer    *kinproxy.Dialer
 	http      *http.Client
 	upstreams []string
+	preferred atomic.Int32
+	cache     dnsCache
 }
 
 func (s *Server) rt() *runtime { return s.cur.Load() }
@@ -143,8 +145,8 @@ func (s *Server) Reload(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	if next.cfg.DNSUpstream != old.cfg.DNSUpstream {
-		s.preferred.Store(0)
+	if next.cfg.DNSUpstream == old.cfg.DNSUpstream && next.cfg.ProxyURL == old.cfg.ProxyURL {
+		next.preferred.Store(old.preferred.Load())
 	}
 	s.cur.Store(next)
 	// Idle DoH connections still go through the old proxy; in-flight ones finish.
@@ -536,8 +538,62 @@ func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
 			return reply.Pack()
 		}
 	}
+	parsed, key, cacheable := dnsQueryKey(query)
+	cacheable = cacheable && !rt.cfg.DNSCacheDisabled
+	if cacheable {
+		if reply, stale, ok := rt.cache.lookup(key, parsed, time.Now()); ok {
+			if stale {
+				s.startDNSRefresh(rt, key, parsed.ID, query)
+			}
+			s.observeDNS(rt, reply)
+			return reply, nil
+		}
+	}
+	reply, err := rt.resolveUpstream(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if cacheable {
+		rt.cache.store(key, parsed.ID, reply, time.Now())
+	}
+	s.observeDNS(rt, reply)
+	return reply, nil
+}
+
+func (s *Server) observeDNS(rt *runtime, reply []byte) {
+	if rt.cfg.DomainForward && s.rt() == rt {
+		s.domains.observe(reply, time.Now())
+	}
+}
+
+func (s *Server) startDNSRefresh(rt *runtime, key dnsCacheKey, queryID uint16, query []byte) {
+	select {
+	case s.dnsSlots <- struct{}{}:
+	default:
+		return
+	}
+	if !rt.cache.beginRefresh(key) {
+		<-s.dnsSlots
+		return
+	}
+	query = bytes.Clone(query)
+	go func() {
+		defer func() { <-s.dnsSlots }()
+		defer rt.cache.endRefresh(key)
+		ctx, cancel := context.WithTimeout(context.Background(), dnsRefreshTimeout)
+		defer cancel()
+		reply, err := rt.resolveUpstream(ctx, query)
+		if err != nil {
+			log.Printf("kin-egress dns refresh %s: %v", key.name, err)
+			return
+		}
+		rt.cache.store(key, queryID, reply, time.Now())
+	}()
+}
+
+func (rt *runtime) resolveUpstream(ctx context.Context, query []byte) ([]byte, error) {
 	n := len(rt.upstreams)
-	start := int(s.preferred.Load())
+	start := int(rt.preferred.Load())
 	var errs []error
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
@@ -546,11 +602,8 @@ func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
 		reply, err := rt.resolveOne(attemptCtx, upstream, query)
 		cancel()
 		if err == nil {
-			if rt.cfg.DomainForward {
-				s.domains.observe(reply, time.Now())
-			}
 			if idx != start {
-				s.preferred.Store(int32(idx))
+				rt.preferred.Store(int32(idx))
 				log.Printf("kin-egress dns upstream switched to %s", upstream)
 			}
 			return reply, nil
