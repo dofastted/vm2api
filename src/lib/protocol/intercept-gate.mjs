@@ -1,11 +1,6 @@
 import { detectDistill, distillBlockError, isOpenaiPlatformModel } from '../core/distill-detect.mjs'
 import { redactSecrets } from '../core/security.mjs'
-import {
-  ErrorType,
-  isThirdPartyClientMessage,
-  makeError,
-  makeRefusalGuardError,
-} from '../core/errors.mjs'
+import { ErrorType, isThirdPartyClientMessage, makeError, makeRefusalGuardError } from '../core/errors.mjs'
 import {
   blockedRiskTool,
   DEFAULT_BAN_STEPS,
@@ -444,9 +439,7 @@ export async function evaluateProtocolIntercept({
         intercept: gateVerdict({ kind: 'block', by: 'refusal', keyword: match.kind }),
         deviceId: match.deviceId,
         fingerprint: match.fingerprint,
-        banDevice:
-          match.kind !== 'device' &&
-          !isThirdPartyClientMessage(match.row?.error_message),
+        banDevice: match.kind !== 'device' && !isThirdPartyClientMessage(match.row?.error_message),
         reason:
           match.kind === 'device' ? 'refusal_device' : match.kind === 'similar' ? 'refusal_similar' : 'refusal_guard',
       })
