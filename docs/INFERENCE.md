@@ -96,10 +96,12 @@ CRAG 2.8.16 没有该能力，旧槽保留 legacy 路径，不能将只更新 No
 职责分工：
 
 - CRAG 只执行一次主模型请求，交接 provider 原始 message ID、model、stop、usage 和结构化错误；
-  不执行交互式恢复，不抬预算，不替面板关闭思考，也不把 refusal 改成工具成功。
+    不执行交互式恢复，不抬预算，不替面板关闭思考，也不把 refusal 改成工具成功。
 - 面板验证原生事实，决定公共 JSON/SSE 交付、拒绝、记账及既有重试/切号策略。正文和思考可实时
-  交付；客户端工具 ID、参数和终态须等完整响应及权威终态验证后才公开。非 `tool_use` 停止中的
-  客户端工具块由面板抑制，`server_tool_use` 等服务端记录保留，不另建 pending/consumed 账本。
+    交付。realtime 下客户端工具 start 和每一段非空 `input_json_delta` 按到达顺序公开，
+    第一个可见工具字节之前提交当前槽，之后不得换槽。`verified` 仍扣到 EOF。
+    参数到 EOF 不是完整 JSON object 时失败，不补写成功工具块。终态仍等权威 stop/usage。
+    非 `tool_use` 停止中的客户端工具块由面板抑制，`server_tool_use` 等服务端记录保留，不另建 pending/consumed 账本。
 - 内核仅为真正 `tool_use` 且匹配完整 MCP 回调集的响应登记安全 handoff。新模式每个调用方回合
   使用独立原生进程，工具结果按原有租户、集合、历史、期限和防重放校验交给下一进程；不重跑客户端
   工具。这牺牲热进程复用以隔离 CLI 的交互恢复，存在额外启动开销，不保证历史热进程性能或缓存命中。

@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { isClaudeSlotOAuthError } from '../core/errors.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from './convert.mjs'
 import { mergeUsage } from './openai-usage.mjs'
+import { isRecoverableThinkingOnly } from '../transport/go-worker-client.mjs'
 
 const RESULT_HEADER = 'x-kin-provider-result'
 const MAX_METADATA_BYTES = 32 * 1024
@@ -309,7 +310,7 @@ export function createNativeHandoffState({ nativeHandoff = true } = {}) {
         failure ||= error
       }
     },
-    finish(body, { stream = false, sawMessageStop = false } = {}) {
+    finish(body, { stream = false, sawMessageStop = false, committed = false } = {}) {
       body = this.consumeBody(body)
       this.observeError(body)
       if (!nativeHandoff) {
@@ -364,6 +365,16 @@ export function createNativeHandoffState({ nativeHandoff = true } = {}) {
         )
       ) {
         throw protocolError('native_handoff_invalid', 'Native tool batch has invalid identity or arguments')
+      }
+      if (committed && providerResult.stop_reason !== 'tool_use' && stream && body.content.some(toolBlock)) {
+        return {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            code: 'native_handoff_conflict',
+            message: 'Native tool stream was not completed',
+          },
+        }
       }
       return {
         ...body,
@@ -494,7 +505,7 @@ export async function consumeNativeHandoffStream(
       if (toolBlock(event.content_block)) {
         tools.add(event.index)
         toolJson.set(event.index, '')
-        holding = true
+        if (deliveryMode !== 'realtime') holding = true
       }
     }
     if (event.type === 'content_block_delta' && (!Number.isInteger(event.index) || !openBlocks.has(event.index))) {
@@ -510,77 +521,122 @@ export async function consumeNativeHandoffStream(
     }
     if (event.type === 'message_stop') sawMessageStop = true
     for (const line of [`data: ${JSON.stringify(event)}`, '']) applyClaudeSSELineToMessage(line, assembler)
-    if (holding || ['message_start', 'message_delta', 'message_stop', 'error'].includes(event.type)) {
+    const toolFrame = deliveryMode === 'realtime' && tools.has(event.index)
+    const terminal = ['message_delta', 'message_stop', 'error'].includes(event.type)
+    if (
+      (holding && !toolFrame) ||
+      terminal ||
+      (event.type === 'message_start' && event.message?.content?.some(toolBlock))
+    ) {
       pending.push(event)
       bufferedBytes += Buffer.byteLength(data)
       if (bufferedBytes > MAX_BUFFER_BYTES)
         throw protocolError('worker_response_too_large', 'Native stream buffer exceeds limit')
     } else {
-      // Start must precede the first visible text frame, but never expose embedded tools.
       while (pending[0]?.type === 'message_start') await emit(pending.shift())
       await emit(event)
     }
   }
-  for await (const chunk of response) {
-    buffer += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
-    if (Buffer.byteLength(buffer) > MAX_BUFFER_BYTES)
-      throw protocolError('worker_response_too_large', 'Native SSE frame exceeds limit')
-    let newline
-    while ((newline = buffer.indexOf('\n')) >= 0) {
-      const line = buffer.slice(0, newline).replace(/\r$/, '')
-      buffer = buffer.slice(newline + 1)
-      if (line === '') await acceptFrame()
-      else {
-        frame.push(line)
-        frameBytes += Buffer.byteLength(line)
-        if (frameBytes > MAX_BUFFER_BYTES)
-          throw protocolError('worker_response_too_large', 'Native SSE frame exceeds limit')
-      }
-    }
-  }
-  buffer += decoder.end()
-  if (buffer) frame.push(buffer.replace(/\r$/, ''))
-  await acceptFrame()
-  state.observeHeaders(response.trailers)
-  const body = state.finish(lastError || assembler.message, { stream: true, sawMessageStop })
-  if (body.type !== 'error' && !body.error) {
-    if (openBlocks.size && state.providerResult.stop_reason === 'tool_use')
-      throw protocolError('native_handoff_incomplete', 'Native tool batch is incomplete')
-    if (state.providerResult.stop_reason === 'tool_use') {
-      for (const text of toolJson.values()) {
-        if (!text) continue
-        try {
-          if (!object(JSON.parse(text))) throw new Error('tool input')
-        } catch {
-          throw protocolError('native_handoff_invalid', 'Native tool arguments are not a complete JSON object')
+  try {
+    for await (const chunk of response) {
+      buffer += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      if (Buffer.byteLength(buffer) > MAX_BUFFER_BYTES)
+        throw protocolError('worker_response_too_large', 'Native SSE frame exceeds limit')
+      let newline
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline).replace(/\r$/, '')
+        buffer = buffer.slice(newline + 1)
+        if (line === '') await acceptFrame()
+        else {
+          frame.push(line)
+          frameBytes += Buffer.byteLength(line)
+          if (frameBytes > MAX_BUFFER_BYTES)
+            throw protocolError('worker_response_too_large', 'Native SSE frame exceeds limit')
         }
       }
     }
-    if (!pending.some((event) => event.type === 'message_delta')) {
-      throw protocolError('native_handoff_incomplete', 'Native stream has no terminal message_delta')
+    buffer += decoder.end()
+    if (buffer) frame.push(buffer.replace(/\r$/, ''))
+    await acceptFrame()
+    state.observeHeaders(response.trailers)
+  } catch (error) {
+    if (!committed) throw error
+    await dispatch({ type: 'error', error: { type: 'api_error', code: error.code, message: error.message } })
+    return {
+      body: { type: 'error', error: { type: 'api_error', code: error.code, message: error.message } },
+      headers,
+      sawMessageStop,
+      committed,
     }
-    for (const event of pending) {
-      if (Number.isInteger(event.index) && tools.has(event.index) && state.providerResult.stop_reason !== 'tool_use')
-        continue
-      if (event.type === 'message_start') {
-        await emit({
-          ...event,
-          message: {
-            ...event.message,
-            content: (event.message.content || []).filter(
-              (block) => state.providerResult.stop_reason === 'tool_use' || !toolBlock(block),
-            ),
-          },
-        })
-      } else if (event.type === 'message_delta') {
-        await emit({
-          ...event,
-          delta: { ...event.delta, stop_reason: body.stop_reason, stop_sequence: body.stop_sequence },
-          usage: body.usage,
-        })
-      } else await emit(event)
-    }
-    await commit()
   }
-  return { body, headers, sawMessageStop, committed }
+  let body
+  try {
+    body = state.finish(lastError || assembler.message, { stream: true, sawMessageStop, committed })
+  } catch (error) {
+    if (!committed) throw error
+    await dispatch({ type: 'error', error: { type: 'api_error', code: error.code, message: error.message } })
+    return {
+      body: { type: 'error', error: { type: 'api_error', code: error.code, message: error.message } },
+      headers,
+      sawMessageStop,
+      committed,
+    }
+  }
+  let publicBody = body
+  const failed = body.type === 'error' || !!body.error
+  if (failed && committed && !isRecoverableThinkingOnly({ ok: false, providerResult: state.providerResult }))
+    await dispatch(
+      body.type === 'error'
+        ? body
+        : {
+            type: 'error',
+            error: body.error || { type: 'api_error', message: 'Native tool stream was not completed' },
+          },
+    )
+  if (!failed) {
+    try {
+      if (openBlocks.size && state.providerResult.stop_reason === 'tool_use')
+        throw protocolError('native_handoff_incomplete', 'Native tool batch is incomplete')
+      if (state.providerResult.stop_reason === 'tool_use') {
+        for (const text of toolJson.values()) {
+          if (!text) continue
+          try {
+            if (!object(JSON.parse(text))) throw new Error('tool input')
+          } catch {
+            throw protocolError('native_handoff_invalid', 'Native tool arguments are not a complete JSON object')
+          }
+        }
+      }
+      if (!pending.some((event) => event.type === 'message_delta')) {
+        throw protocolError('native_handoff_incomplete', 'Native stream has no terminal message_delta')
+      }
+      for (const event of pending) {
+        if (Number.isInteger(event.index) && tools.has(event.index) && state.providerResult.stop_reason !== 'tool_use')
+          continue
+        if (event.type === 'message_start') {
+          await emit({
+            ...event,
+            message: {
+              ...event.message,
+              content: (event.message.content || []).filter(
+                (block) => state.providerResult.stop_reason === 'tool_use' || !toolBlock(block),
+              ),
+            },
+          })
+        } else if (event.type === 'message_delta') {
+          await emit({
+            ...event,
+            delta: { ...event.delta, stop_reason: body.stop_reason, stop_sequence: body.stop_sequence },
+            usage: body.usage,
+          })
+        } else await emit(event)
+      }
+      await commit()
+    } catch (error) {
+      if (!committed) throw error
+      await dispatch({ type: 'error', error: { type: 'api_error', message: error.message } })
+      publicBody = { type: 'error', error: { type: 'api_error', code: error.code, message: error.message } }
+    }
+  }
+  return { body: publicBody, headers, sawMessageStop, committed }
 }
