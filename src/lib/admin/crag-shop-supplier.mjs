@@ -1,7 +1,8 @@
 import { constants } from 'node:fs'
 import { open } from 'node:fs/promises'
 
-const ROOT = 'https://crag.fkcodex.com'
+const ROOT = 'https://www.vm2api.org'
+const CALLBACK_ORIGINS = ['https://crag.fkcodex.com', ROOT]
 const MAX_RESPONSE = 64 * 1024
 // Catalog descriptions can use the full published 128-plan limit with UTF-8 copy.
 const MAX_PLANS_RESPONSE = 384 * 1024
@@ -188,8 +189,9 @@ function checkout(value, order, receipt) {
     fields.device !== 'pc' ||
     fields.sign_type !== 'MD5' ||
     !/^[0-9a-f]{32}$/.test(fields.sign) ||
-    fields.notify_url !== `${ROOT}/shop/epay/notify` ||
-    fields.return_url !== `${ROOT}/shop/return`
+    !CALLBACK_ORIGINS.some(
+      (origin) => fields.notify_url === `${origin}/shop/epay/notify` && fields.return_url === `${origin}/shop/return`,
+    )
   )
     throw invalidReply()
   return { url: value.url, data: Object.fromEntries(FORM_KEYS.map((key) => [key, fields[key]])) }

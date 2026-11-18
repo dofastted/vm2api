@@ -55,7 +55,7 @@ const packageTrustCache = new Map()
 // public key and ids, so keep the bound well above any realistic host.
 const MAX_TRUST_ROOTS = 512
 const redeemingSlots = new Set()
-const DEVICE_ACTIVATION_URL = 'https://crag.fkcodex.com/v1/device-activation'
+const DEVICE_ACTIVATION_URL = 'https://www.vm2api.org/v1/device-activation'
 
 export class CragLicenseError extends Error {
   constructor(code, status = 403) {

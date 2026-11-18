@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.4.153 — 2026-11-19 · CRAG 域名切换与回调兼容
+
+- 后续版本的 CRAG 商城、设备激活和宿主订阅请求改指向 `https://www.vm2api.org`。源站继续同时接受 `crag.fkcodex.com`。
+- 商城 checkout 回复的 `notify_url` 与 `return_url` 接受新旧两个源站域名，但两者必须同源；混用新旧域名的回复仍按无效回复拒绝。
+
 ## 1.4.152 — 2026-11-19 · 内核多版本缓存与调度状态修正
 
 - 内核缓存可同时保留多个版本：每个版本（CRAG 按 `payload_tag`，cli-node 按 tag）留一份，最多 6 个，当前版本不会被清理。此前只留当前和上一份，想让不同槽位跑不同版本就得反复重新下载。新增 `GET /api/panel/kernels/cached?kernel=crag` 列出本机已缓存的版本，`POST /api/panel/kernels/select {kernel, tag}` 把安装用的当前版本切到已缓存的包，不重新下载；安装进行中拒绝切换。已安装的槽位各自持有内核副本，切换或清理缓存不影响运行中的槽位（#1269）。

@@ -7,7 +7,7 @@ const COMMERCE = { unit_amount_minor: 100, max_amount_minor: 999900, max_months:
 
 function supplier(catalog) {
   return createShopSupplier(async (url, init) => {
-    assert.equal(url, 'https://crag.fkcodex.com/shop/plans')
+    assert.equal(url, 'https://www.vm2api.org/shop/plans')
     assert.equal(init.method, 'GET')
     assert.equal(init.body, undefined)
     return Response.json(catalog)
