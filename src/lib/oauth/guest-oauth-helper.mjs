@@ -163,9 +163,9 @@ export async function runGuestOAuthAuthService(
     // unreachable from inside the guest. The env above is cleared for the same reason.
     const result = await runDocker(argv, {
       env: host.dockerEnv(),
-      // Four hops at the per-request ceiling (the mint adds the Grove PATCH),
-      // plus helper startup: a slow hop must not read as an unresponsive guest.
-      timeoutMs: Math.max(timeoutMs * 5, 120_000),
+      // Token plus the native follow-ups (profile, two evals, roles,
+      // first-token date, bootstrap) at the per-request ceiling, plus startup.
+      timeoutMs: Math.max(timeoutMs * 8, 120_000),
       stdin:
         JSON.stringify({
           ...payload,

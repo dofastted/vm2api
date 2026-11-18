@@ -1,15 +1,17 @@
 /**
- * Post-OAuth workflow: run the slot's cli-node with the imported credential,
- * complete one hello turn, then optionally keep it resident. Slot /usage and
- * seed follow. Existing native identity, settings, credentials and telemetry
- * backlog survive initialization and reauthorization.
+ * Post-OAuth workflow: run CRAG's packaged native Claude Code with the imported
+ * credential, complete one hello turn, then optionally keep it resident. Slot
+ * /usage and seed follow. Existing native identity, settings, credentials and
+ * telemetry backlog survive initialization and reauthorization.
  *
  * Telemetry synchronization publishes the saved VM policy; it never opts a
  * VM in, rotates identity, or restarts the telemetry/inference process.
  * Node restart restores already-initialized residents without another hello.
- * Every bootstrap CLI runs with CLAUDE_CODE_HOST_REFRESH=1 plus the supported
- * CLAUDE_CODE_VERSION. The guest Go Refresher is the only RT writer; Node never
- * dials Anthropic.
+ * The native CLI runs only after the slot grant is still inside its expiry
+ * and `.credentials.json` is the relative symlink onto `credentials.json`.
+ * It keeps its own identity: no CLAUDE_CODE_VERSION and no injected system
+ * prompt. The guest Go Refresher is the only RT writer; Node never dials
+ * Anthropic.
  * After hello, quota is CLI `/usage` inside the slot (one try, then two retries).
  * Account tier comes from GET /api/oauth/profile via kin-worker oauth.
  */
@@ -41,21 +43,19 @@ import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { inferTierFromOfficialStats, parseOfficialCcStats, tierFromOauthProfile } from './official-cc-stats.mjs'
 import { flattenOauthIdentity } from './oauth-identity.mjs'
 import { defaultSeedPolicy } from '../protocol/seed-policy.mjs'
-import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { applyOfficialFingerprintToVm, readOfficialCcIdentity } from '../identity/official-fingerprint.mjs'
 import { writeSlotSeedFiles, inferProjectRootFromCliHome } from '../vm/slot-seed.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { atomicWriteJson, listVmRecordFiles } from '../vm/vm-file.mjs'
 import {
-  CONTAINER_CLI_NODE_BIN,
+  LOCAL_CRAG_CLAUDE,
+  REMOTE_CRAG_CLAUDE,
   normalizeOfficialCcInference,
   resolveOfficialCcInference,
-  resolveSlotClaude,
 } from '../vm/slot-engine.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { guardUsageTier } from '../pool/claude-tier.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
-import { CRS_OFFICIAL_CLI_SYSTEM } from '../identity/crs-persona.mjs'
 
 export { officialCcUidGid } from '../vm/vm-runtime.mjs'
 export const DEFAULT_HELLO_PROMPT = 'hello'
@@ -200,10 +200,7 @@ export function applyContainerMemory(vmId, memory, vm) {
   return sh(['docker', 'update', '--memory', mem, '--memory-swap', mem, containerName(vmId)], { timeout: 15_000 })
 }
 
-/**
- * Marks bootstrap CLI processes. They share the cli-node binary with the
- * kernel's native CLI, so neither a path nor a pkill pattern can tell them apart.
- */
+/** Marks bootstrap CLI processes. They share the native binary with inference. */
 const OFFICIAL_CC_MARKER = 'KIN_OFFICIAL_CC=1'
 
 function officialCcMarkedPidsScript(action) {
@@ -310,7 +307,9 @@ export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, ti
   const runDir = officialCcRunDir(projectRoot, vmId)
   fs.mkdirSync(runDir, { recursive: true, mode: 0o700 })
   const pidFile = officialCcPidPath(projectRoot, vmId, 'resident')
-  const execArgv = slotExecArgv(vm || { id: vmId }, [CONTAINER_CLI_NODE_BIN], {
+  const host = slotHost(vm || { id: vmId })
+  const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
+  const execArgv = slotExecArgv(vm || { id: vmId }, [bin], {
     user: `${uid}:${gid}`,
     env: [
       'HOME=/home/kincli',
@@ -320,7 +319,6 @@ export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, ti
       `LC_ALL=${locale || 'en_US.UTF-8'}`,
       'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
       'CLAUDE_CODE_HOST_REFRESH=1',
-      `CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`,
       'USER_TYPE=external',
       OFFICIAL_CC_MARKER,
       'CLAUDE_CODE_USE_BEDROCK=0',
@@ -342,8 +340,7 @@ export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, ti
       KIN_CONTAINER: containerName(vmId),
       KIN_UID: String(uid),
       KIN_GID: String(gid),
-      KIN_CLI_BIN: CONTAINER_CLI_NODE_BIN,
-      KIN_CLI_VERSION: OFFICIAL_CLI_VERSION,
+      KIN_CLI_BIN: bin,
       TZ: timezone || 'UTC',
       LANG: locale || 'en_US.UTF-8',
       LC_ALL: locale || 'en_US.UTF-8',
@@ -527,9 +524,13 @@ export function officialCcHome(projectRoot, vmId) {
   return path.join(projectRoot, 'vms', vmId, 'cli-home')
 }
 
-/** Slot cli-node on the host; wrap-cli sync installs it under the slot home. */
+/** Slot cli-node on the host; setup-token still uses it. Init uses the native package. */
 export function officialCcHostCli(homeDir) {
   return path.join(homeDir, '.kin', 'cli-node')
+}
+
+export function officialCcNativeCli(homeDir) {
+  return path.join(homeDir, '.kin', path.posix.relative('/home/kincli/.kin', LOCAL_CRAG_CLAUDE))
 }
 
 export function officialCcStatusPath(homeDir) {
@@ -623,7 +624,7 @@ export function summarizeOfficialCcHome(homeDir) {
     has_user_id: !!identity.user_id,
     has_machine_id: !!identity.machine_id,
     has_completed_onboarding: !!doc.hasCompletedOnboarding,
-    has_cli_node: fs.existsSync(officialCcHostCli(homeDir)),
+    has_cli_node: fs.existsSync(officialCcNativeCli(homeDir)),
   }
 }
 
@@ -702,11 +703,38 @@ export function materializeOfficialClaudeCredentials(homeDir, { uid, gid } = {})
   return ensureOfficialCredentialLink(homeDir, { uid, gid })
 }
 
+/** Init may run only when the on-disk grant is inside its expiry and the alias is the relative symlink. */
+export function officialCcNativeReady(homeDir) {
+  const cred = readWorkerCredentialFile(homeDir)
+  if (!cred?.access_token || !cred?.refresh_token || needsRefresh(cred.expires_at, Date.now(), 0)) {
+    return { ok: false, error: 'official Claude Code init requires an unexpired OAuth grant' }
+  }
+  const before = `${cred.access_token}\n${cred.refresh_token}`
+  // Repair the alias only. A loose official file must not replace the imported grant.
+  const linked = ensureOfficialCredentialLink(homeDir, { adoptOfficial: false })
+  const after = readWorkerCredentialFile(homeDir)
+  if (
+    `${after?.access_token || ''}\n${after?.refresh_token || ''}` !== before ||
+    needsRefresh(after?.expires_at, Date.now(), 0)
+  ) {
+    return { ok: false, error: 'official Claude Code init requires an unexpired OAuth grant' }
+  }
+  if (!linked.linked) {
+    return { ok: false, error: linked.error || 'official .credentials.json is not the credentials.json symlink' }
+  }
+  return { ok: true, linked: true }
+}
+
 export function prepareClaudeJsonForOfficialInit(homeDir, opts = {}) {
   const { uid, gid } = opts
   const wiped = wipeOfficialFirstUseHome(homeDir, { uid, gid })
   const login = materializeOfficialClaudeCredentials(homeDir, { uid, gid })
-  return { ...wiped, official_login: !!login.wrote, official_login_error: login.error || null }
+  const ready = officialCcNativeReady(homeDir)
+  return {
+    ...wiped,
+    official_login: !!login.linked && ready.ok,
+    official_login_error: ready.ok ? null : ready.error || login.error || null,
+  }
 }
 
 export function officialCcShouldForceRefresh(homeDir, vm = {}) {
@@ -799,20 +827,18 @@ export function buildOfficialCcDockerArgs({
   bridgeUrl,
   prompt = DEFAULT_PLAN_PROMPT,
   vm,
-  routing = {},
 }) {
   const text = String(prompt || '').trim() || DEFAULT_PLAN_PROMPT
   const slash = isOfficialCcSlashPrompt(text)
-  const selected = resolveSlotClaude(vm || { id: vmId }, routing, slotHost(vm || { id: vmId }))
+  const host = slotHost(vm || { id: vmId })
+  const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
   return slotExecArgv(
     vm || { id: vmId },
     [
-      selected.bin,
+      bin,
       ...(slash
         ? [text, '--print', '--permission-mode', 'bypassPermissions', '--output-format', 'stream-json', '--verbose']
         : ['-p', text, '--permission-mode', 'bypassPermissions', '--output-format', 'json']),
-      // cli-node drops the first-party identity; the native CLI owns its own.
-      ...(!selected.native ? ['--append-system-prompt', CRS_OFFICIAL_CLI_SYSTEM] : []),
     ],
     {
       user: `${uid}:${gid}`,
@@ -825,7 +851,6 @@ export function buildOfficialCcDockerArgs({
         'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
         'CLAUDE_CODE_HOST_REFRESH=1',
         OFFICIAL_CC_MARKER,
-        ...(!selected.native ? [`CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`] : []),
         'USER_TYPE=external',
         'CLAUDE_CODE_USE_BEDROCK=0',
         'CLAUDE_CODE_USE_VERTEX=0',
@@ -1077,18 +1102,8 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
   if (!canOfficialCc(credentialModeOfVm(vm))) {
     return { ok: false, error: 'official Claude Code init requires full OAuth' }
   }
-  if (!(hasAccessPresence(vm.claude) || hasRefreshPresence(vm.claude))) {
-    const credFile = path.join(homeDir, '.claude', 'credentials.json')
-    let live = false
-    try {
-      const doc = JSON.parse(fs.readFileSync(credFile, 'utf8'))
-      const oauth = doc.claudeAiOauth && typeof doc.claudeAiOauth === 'object' ? doc.claudeAiOauth : doc
-      live = !!(oauth.accessToken || oauth.access_token || oauth.refreshToken || oauth.refresh_token)
-    } catch {}
-    if (!live) {
-      return { ok: false, error: 'slot has no live OAuth credential' }
-    }
-  }
+  const ready = officialCcNativeReady(homeDir)
+  if (!ready.ok) return { ok: false, error: ready.error }
 
   const keepResident = resident !== false && resolveOfficialCcInference(vm, routing) !== 'cli-hop'
   const idleMemory = keepResident
@@ -1157,14 +1172,15 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       step: 'login',
     })
     const login = materializeOfficialClaudeCredentials(homeDir, { uid, gid })
-    if (!login.wrote) {
+    const linked = officialCcNativeReady(homeDir)
+    if (!login.linked || !linked.ok) {
       const status = writeOfficialCcStatus(homeDir, {
         status: 'error',
         vm_id: vmId,
         started_at: startedAt,
         finished_at: new Date().toISOString(),
         wiped: wiped.wiped,
-        error: login.error || 'failed to materialize official .credentials.json',
+        error: linked.error || login.error || 'failed to materialize official .credentials.json',
       })
       return { ok: false, error: status.error, status }
     }
@@ -1179,22 +1195,22 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     })
 
     const host = slotHost(vm)
-    const selected = resolveSlotClaude(vm, routing, host)
-    const cliNode = path.join(homeDir, '.kin', path.posix.relative('/home/kincli/.kin', selected.bin))
-    if (!host.bakedKernel && !fs.existsSync(cliNode)) {
+    const bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
+    const staged = officialCcNativeCli(homeDir)
+    if (!host.bakedKernel && !fs.existsSync(staged)) {
       const status = writeOfficialCcStatus(homeDir, {
         status: 'error',
         vm_id: vmId,
         started_at: startedAt,
         finished_at: new Date().toISOString(),
         wiped: wiped.wiped,
-        error: 'selected Claude CLI missing; sync the selected kernel first',
+        error: 'native Claude Code missing; sync the CRAG package first',
       })
       return { ok: false, error: status.error, status }
     }
     const claudeVersion =
       (
-        await spawnCaptured(['docker', ...slotExecArgv(vm, [selected.bin, '--version'], { user: host.execUser(vm) })], {
+        await spawnCaptured(['docker', ...slotExecArgv(vm, [bin, '--version'], { user: host.execUser(vm) })], {
           timeoutMs: 15_000,
           env: host.dockerEnv() || process.env,
         })
@@ -1239,7 +1255,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       force,
       step: 'usage',
     })
-    const nativeOauth = selected.native ? slotOauth || (await import('../transport/slot-oauth.mjs')).runSlotOauth : null
+    const nativeOauth = slotOauth || (await import('../transport/slot-oauth.mjs')).runSlotOauth
     const usageRun = hello.ok
       ? await runOfficialCcUsage({
           turn,

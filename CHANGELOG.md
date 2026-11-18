@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 1.4.151 — 2026-11-19 · OAuth 换票与 CRAG 3.1.7
+
+- Cookie 导入和粘贴授权码共用换票后的账号资料、角色及客户端初始化流程；后续资料读取失败不丢弃已换到的票据（`a1e77411`）。
+- 锁定新版 `kin-oauth-auth` 到 `payload-2026.11.19-oauth-eval`，使控制面与槽内 helper 使用同一契约（#1286）。
+- 内核页默认下载 CRAG 3.1.7 标准签名包，保留原授权。原生 TUI 固定使用 `cli` 入口，不自动替换已安装的内核（#1288）。
+
+## 1.4.150 — 2026-11-19 · OAuth Setup Token 与原生 Claude 初始化
+
+- Setup Token 粘贴码按原生 CLI 契约申请一年期 `user:inference`，与保留刷新票据的账号转换区分。授权来源拒绝、换票限流和出口拒绝显示不同提示（#1283）。
+- 官方初始化只在原生 Claude Code 且磁盘凭据有效时运行；CRAG 补齐原生 CLI 实际读取的引导配置，保留已有槽位身份（#1283）。
+- 更新 `kin-oauth-auth` 锁定载荷；CRAG 3.1.6 及其他附件保持不变，无需 `wrap-cli/sync`。
+
 ## 1.4.149 — 2026-11-19 · Claude 槽位 OAuth 读取修复
 
 - 原子修复 Claude 槽位的 `.credentials.json` 相对软链接，继续读取面板保存的 `credentials.json`。本地 OAuth 凭据无法加载时，不向该槽位派发推理（#1278）。

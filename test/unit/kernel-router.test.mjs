@@ -1525,12 +1525,11 @@ test('writeKernelConfig creates the Claude config the native CLI reads', () => {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
-test('root hands a new Claude config directory to the slot user', () => {
+test('root hands a new Claude home and config to the slot user', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-claude-owner-'))
   const vm = { id: 'vm-09', dataplane: 'crag' }
   const home = path.join(root, 'vms', vm.id, 'cli-home')
   const owner = slotRuntimeOwner(vm)
-  fs.mkdirSync(home, { recursive: true })
   const calls = []
   const chown = mock.method(fs, 'chownSync', (file, uid, gid) => {
     calls.push({ file, uid, gid })

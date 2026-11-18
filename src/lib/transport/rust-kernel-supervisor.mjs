@@ -260,13 +260,11 @@ export const NODE_CLAUDE_SETUP_PY = `
 import json, os
 home = "/home/kincli"
 want = ("/run/kin/work", home)
-for f, create in ((home + "/.claude/.claude.json", True), (home + "/.claude.json", True)):
+for f in (home + "/.claude/.claude.json", home + "/.claude.json"):
     changed = False
     try:
         doc = json.load(open(f))
     except FileNotFoundError:
-        if not create:
-            continue
         os.makedirs(os.path.dirname(f), mode=0o700, exist_ok=True)
         doc = {}
         changed = True
@@ -1147,6 +1145,10 @@ function acceptNativeClaudeSetup(homeDir, workDir, vm) {
   const configDir = path.join(homeDir, '.claude')
   const privileged = typeof process.getuid === 'function' && process.getuid() === 0
   const owner = runtimeFileOwner(vm)
+  const created = fs.mkdirSync(homeDir, { recursive: true, mode: 0o700 })
+  const home = fs.lstatSync(homeDir)
+  if (!home.isDirectory()) return
+  if (created && privileged) fs.chownSync(homeDir, owner.uid, owner.gid)
   ensureHostPrivateDir(configDir, { uid: owner.uid, gid: owner.gid, privileged })
   for (const file of [path.join(configDir, '.claude.json'), path.join(homeDir, '.claude.json')]) {
     let doc = {}
