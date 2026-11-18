@@ -20,6 +20,7 @@ import { meQueryOptions } from '@/features/auth/queries'
 import {
   cragHostStatusLabels,
   cragHostStatusVariant,
+  cragSlotsInUse,
 } from '@/features/vm/crag-runtime-counts'
 import {
   cragHostStatusQueryOptions,
@@ -189,9 +190,9 @@ function HostSummary({
         ? '未返回套餐'
         : '待核对'
   const reclaim = status?.reclaim_pending_count ?? 0
-  // 术语以 crag-runtime-counts 的那套为准：可用槽位 / 已用 / 总额度。
-  // 这里刻意不再渲染 CragRuntimeCounts —— 它与下方网格读同一批字段，
-  // 同屏重复过一次（曾分别叫「剩余可用槽位」和「剩余可绑定槽位」）。
+  // 额度只展示两个值：使用中 与 额度。余量由用户相减，不单独呈现 —— 那个派生值
+  // 历史上有四种叫法，少展示它就少一处产生别名的地方。
+  // 这里也刻意不再渲染 CragRuntimeCounts：它与下方网格读同一批字段。
   const fields: Array<[string, ReactNode]> = [
     [
       '订阅状态',
@@ -200,21 +201,8 @@ function HostSummary({
       </Badge>,
     ],
     ['订阅套餐', planName],
-    [
-      '可用槽位',
-      <>
-        {quotaLabel(status?.available_seats)}
-        {status?.used_slots == null ? null : (
-          <span className='ml-1 text-xs font-normal text-muted-foreground'>
-            {'已用 '}
-            {status.used_slots}
-            {status.slot_limit == null
-              ? null
-              : ` / ${quotaLabel(status.slot_limit)}`}
-          </span>
-        )}
-      </>,
-    ],
+    ['使用中', cragSlotsInUse(status) ?? '待核对'],
+    ['额度', quotaLabel(status?.slot_limit)],
     [
       '到期',
       status?.expires_at == null ? (
@@ -452,7 +440,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
             : probeFailed
               ? ''
               : status && !status.ready
-                ? '当前没有可绑定的 CRAG 槽位，仍可兑换。本机与集群的 Docker、KVM 槽共享额度。'
+                ? '当前没有可用于绑定的 CRAG 槽位，仍可兑换。本机与集群的 Docker、KVM 槽共享额度。'
                 : '付款或领码不会更新本机权益。兑换后，到内核页为目标 VM 管理 CRAG 授权。'}
       </p>
       {canRecover ? (
@@ -549,9 +537,9 @@ function OrderProgress({
 
 function planTerms(plan: Pick<Order, 'amount_minor' | 'slot_limit'>) {
   if (plan.amount_minor === null || plan.slot_limit === null)
-    return '金额与应用锁待确认'
-  const { price, locks } = formatPlanDetails(plan.amount_minor, plan.slot_limit)
-  return `${price} · ${locks}`
+    return '金额与额度待确认'
+  const { price, quota } = formatPlanDetails(plan.amount_minor, plan.slot_limit)
+  return `${price} · ${quota}`
 }
 
 function useHostStatus(enabled: boolean) {

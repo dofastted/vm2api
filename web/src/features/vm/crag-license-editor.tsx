@@ -118,7 +118,7 @@ export function CragLicenseSummary({
           <dt className='text-xs text-muted-foreground'>授权方式</dt>
           <dd className='mt-1'>
             {license.scope === 'host'
-              ? `宿主机订阅 · 应用锁 ${license.seat ?? '—'}`
+              ? `宿主机订阅 · 槽位 ${license.seat ?? '—'}`
               : license.kind === 'offline'
                 ? '离线通用码'
                 : '在线设备授权'}

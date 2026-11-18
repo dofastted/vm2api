@@ -125,7 +125,7 @@ export function PickerPlanContent({
         </span>
         <span className='text-[13px] text-muted-foreground'>
           {plan.name ? `${plan.term} · ` : ''}
-          {plan.locks}
+          {plan.quota}
         </span>
         {slots.description ??
           (plan.description ? (

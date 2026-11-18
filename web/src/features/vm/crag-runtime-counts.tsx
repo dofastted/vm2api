@@ -53,6 +53,22 @@ function expiry(status?: CragHostStatus) {
   return { date, left, lapsed: left <= 0, soon: left > 0 && left < SOON }
 }
 
+/**
+ * 使用中的槽位数。上游不一定下发 `used_slots`（`crag-subscription.mjs:90` 只在
+ * payload 带它时才透传），此时用「额度 − 可用」反推 —— 这正是后端自己的关系式
+ * （同文件 `:106`）。两者都拿不到时返回 null，不猜。
+ *
+ * 导出给订阅页复用：同一个数字在两处各算一遍，迟早会算出两个值。
+ */
+export function cragSlotsInUse(status?: CragHostStatus) {
+  if (status?.used_slots != null) return status.used_slots
+  const limit = status?.slot_limit
+  const free = status?.available_seats
+  if (typeof limit === 'number' && typeof free === 'number')
+    return Math.max(0, limit - free)
+  return null
+}
+
 function Metric({ label, children }: { label: string; children: ReactNode }) {
   return (
     <span className='inline-flex min-w-0 items-baseline gap-1'>
@@ -65,15 +81,18 @@ function Metric({ label, children }: { label: string; children: ReactNode }) {
 /**
  * 宿主订阅的额度与运行概况。
  *
- * 术语：可用槽位 / 已用 / 总额度 是这套词汇的唯一叫法。历史上同一个
- * `available_seats` 曾被叫作「剩余可用槽位」「剩余可绑定槽位」「订阅槽位额度」
- * 「宿主机应用锁额度」四种，其中前两种还同屏出现过。不要再引入新别名；
- * 「绑定」只用于绑定这个动作本身（它有自己的错误态）。
+ * 额度只展示两个值：**使用中** 与 **额度**。余量由用户自己相减，不再单独呈现 ——
+ * 那个派生值历史上有四种叫法（「剩余可用槽位」「剩余可绑定槽位」「订阅槽位额度」
+ * 「宿主机应用锁额度」），其中前两种还同屏相邻出现。少展示一个派生值，就少一处
+ * 可以产生别名的地方。
+ *
+ * 不要再引入新叫法；「绑定」只用于绑定这个动作本身（它有自己的错误态）。
  */
 export function CragRuntimeCounts({ status }: { status?: CragHostStatus }) {
   const over = status?.runtime?.host_over_limit === true
   const due = expiry(status)
   const reclaim = status?.reclaim_pending_count ?? 0
+  const used = cragSlotsInUse(status)
   return (
     <div
       role='status'
@@ -91,18 +110,8 @@ export function CragRuntimeCounts({ status }: { status?: CragHostStatus }) {
       {over ? (
         <span className='text-muted-foreground'>仅超额槽暂停调度</span>
       ) : null}
-      <Metric label='可用槽位'>{numberLabel(status?.available_seats)}</Metric>
-      {status?.used_slots == null ? null : (
-        <Metric label='已用'>
-          {status.used_slots}
-          {status.slot_limit == null ? null : (
-            <span className='text-muted-foreground'>
-              {' / '}
-              {numberLabel(status.slot_limit)}
-            </span>
-          )}
-        </Metric>
-      )}
+      <Metric label='使用中'>{used ?? '待核对'}</Metric>
+      <Metric label='额度'>{numberLabel(status?.slot_limit)}</Metric>
       {due ? (
         <Metric label={due.lapsed ? '已于' : '到期'}>
           <time
