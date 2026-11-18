@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.4.145 — 2026-11-18 · 槽位 OAuth helper 更新
+
+- 更新 `kin-oauth-auth` 和控制面调用契约。普通授权码与 Cookie 导入使用 OAuth profile，`setup-token` 使用独立 profile；换票仍走槽位绑定的出口（#1259）。
+- CI 对 OAuth 代码或锁定载荷变更运行真实二进制契约测试，验证 PKCE、回调 state、Cookie 导入和设置确认。CRAG 3.1.6 和其他载荷不变。
+
 ## 1.4.144 — 2026-11-18 · 出口热加载、DNS 缓存与调度策略
 
 - 流已开始但上游无法正常收尾时，返回可重试的 `rate_limit_error`，日志保留真实截断原因（#1247）。
