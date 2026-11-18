@@ -15,7 +15,7 @@ import {
   resetAuthUrlSessions,
 } from '../../src/lib/oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth } from '../../src/lib/oauth/cookie-auth.mjs'
-import { CLIENT_ID, FULL_OAUTH_SCOPE, REDIRECT_URI } from '../../src/lib/oauth/oauth-contract.mjs'
+import { BROWSER_TOKEN_UA, CLIENT_ID, FULL_OAUTH_SCOPE, REDIRECT_URI } from '../../src/lib/oauth/oauth-contract.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
 import { prepareSlotOAuth, runGuestOAuthAuthService } from '../../src/lib/oauth/guest-oauth-helper.mjs'
 import { slotExec } from '../../src/lib/vm/slot-runtime.mjs'
@@ -286,19 +286,31 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       assert.equal(credential.org_uuid, org)
       assert.equal(credential.scope, FULL_OAUTH_SCOPE)
       assert.equal(credential.mode, scenario.flavor === 'setup_token' ? 'setup-token' : 'oauth')
-      const [token, bootstrap] = requests.slice(requestStart)
+      const flow = requests.slice(requestStart)
+      const [token, bootstrap, settings] = flow
+      const setup = scenario.flavor === 'setup_token'
       assert.equal(token.payload.grant_type, 'authorization_code')
       assert.equal(token.payload.client_id, CLIENT_ID)
       assert.equal(token.headers.cookie, undefined)
       assert.equal(Object.hasOwn(token.payload, 'expires_in'), false)
       assert.equal(bootstrap.headers.authorization, `Bearer ${accessToken}`)
       assert.equal(bootstrap.headers.cookie, undefined)
-      // Both token-bearing stages are the CLI itself: the version follows
-      // OFFICIAL_CLI_VERSION, and the entrypoint is the TUI one (`sdk-cli` is
-      // `--print`, which an OAuth exchange never is).
-      for (const request of [token, bootstrap]) {
-        assert.equal(request.headers['user-agent'], `claude-cli/${OFFICIAL_CLI_VERSION} (external, cli)`)
+      // CAI paste codes exchange as sub2api does (axios agent); the setup-token
+      // flavor exchanges as the browser and then accepts Grove (README).
+      assert.equal(token.headers['user-agent'], setup ? BROWSER_TOKEN_UA : 'axios/1.13.6')
+      if (!setup) {
+        assert.equal(flow.length, 2)
+        assert.equal(bootstrap.headers['user-agent'], `claude-cli/${OFFICIAL_CLI_VERSION} (external, cli)`)
+        return
       }
+      assert.equal(flow.length, 3)
+      assert.equal(bootstrap.headers['user-agent'], `claude-code/${OFFICIAL_CLI_VERSION}`)
+      assert.match(bootstrap.url, /^\/api\/claude_cli\/bootstrap\?entrypoint=claude-vscode&model=claude-opus-5$/)
+      assert.equal(settings.method, 'PATCH')
+      assert.equal(settings.url, '/api/oauth/account/settings')
+      assert.deepEqual(settings.payload, { grove_enabled: true })
+      assert.equal(settings.headers.authorization, `Bearer ${accessToken}`)
+      assert.equal(settings.headers['user-agent'], `claude-code/${OFFICIAL_CLI_VERSION}`)
     })
   }
   assert.equal(tokenRequests, 3)
@@ -320,6 +332,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       assert.equal(credential.account_uuid, 'account-exchange')
       assert.equal(credential.org_uuid, org)
       const flow = requests.slice(requestStart)
+      const setup = runtimeMode === 'setup-token'
       assert.deepEqual(
         flow.map(({ method, url }) => [method, url.split('?')[0]]),
         [
@@ -327,17 +340,33 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
           ['POST', `/v1/oauth/${org}/authorize`],
           ['POST', '/v1/oauth/token'],
           ['GET', '/api/claude_cli/bootstrap'],
+          ...(setup ? [['PATCH', '/api/oauth/account/settings']] : []),
         ],
       )
-      const [orgs, authorize, token, bootstrap] = flow
+      const [orgs, authorize, token, bootstrap, settings] = flow
       for (const request of [orgs, authorize]) {
         assert.equal(request.headers.cookie, `sessionKey=${sessionKey}`)
         assert.match(request.headers['user-agent'], /Chrome\/146\.0\.0\.0/)
+        assert.match(request.headers['sec-ch-ua'], /Google Chrome/)
       }
-      // The cookie stages pass as a browser; the token-bearing ones as the CLI.
-      for (const request of [token, bootstrap]) {
-        assert.equal(request.headers['user-agent'], `claude-cli/${OFFICIAL_CLI_VERSION} (external, cli)`)
+      // The cookie stages pass as a browser on both profiles, but the app
+      // origin is sub2api's claude.ai while the mint posts to the console.
+      assert.equal(orgs.headers.host, 'claude.ai')
+      assert.equal(authorize.headers.host, setup ? 'platform.claude.com' : 'claude.ai')
+      assert.equal(orgs.headers.origin, 'https://claude.ai')
+      if (setup) {
+        assert.equal(authorize.headers.origin, 'https://claude.com')
+        assert.equal(authorize.headers.referer, 'https://claude.com/cai/oauth/authorize?code=true')
+      } else {
+        assert.equal(authorize.headers.origin, 'https://claude.ai')
+        assert.equal(authorize.headers.referer, 'https://claude.ai/new')
       }
+      // Token stage: axios for the cookie import, the browser for the mint.
+      assert.equal(token.headers['user-agent'], setup ? BROWSER_TOKEN_UA : 'axios/1.13.6')
+      assert.equal(
+        bootstrap.headers['user-agent'],
+        setup ? `claude-code/${OFFICIAL_CLI_VERSION}` : `claude-cli/${OFFICIAL_CLI_VERSION} (external, cli)`,
+      )
       assert.equal(authorize.payload.response_type, 'code')
       assert.equal(authorize.payload.client_id, CLIENT_ID)
       assert.equal(authorize.payload.redirect_uri, REDIRECT_URI)
@@ -351,11 +380,13 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       )
       assert.equal(token.headers.cookie, undefined)
       assert.equal(bootstrap.headers.authorization, `Bearer ${accessToken}`)
-      if (process.env.KIN_TEST_OAUTH_AUTH_BIN) {
-        assert.equal(token.headers['user-agent'], 'claude-cli/2.1.321 (external, sdk-cli)')
-        assert.equal(bootstrap.headers['user-agent'], 'claude-cli/2.1.321 (external, cli)')
-      }
       assert.equal(bootstrap.headers.cookie, undefined)
+      if (setup) {
+        assert.match(bootstrap.url, /entrypoint=claude-vscode&model=claude-opus-5$/)
+        assert.deepEqual(settings.payload, { grove_enabled: true })
+        assert.equal(settings.headers.authorization, `Bearer ${accessToken}`)
+        assert.equal(settings.headers['user-agent'], `claude-code/${OFFICIAL_CLI_VERSION}`)
+      }
     })
   }
   for (const mode of ['stale', 'state_mismatch']) {

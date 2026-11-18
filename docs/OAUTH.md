@@ -8,7 +8,7 @@ sessionKey（默认 Setup Token）或授权码
    ▼
 目标 VM 内的 `bin/kin-oauth-auth`（控制面只负责 `docker exec`，OAuth 源码只在本地构建）
    │ sessionKey / 授权码 → authorize → token
-   │ bootstrap（entrypoint=claude-code&model=claude-opus-5-5）仍经同一 VM 出口读取 oauth_account
+   │ bootstrap（cookie 导入 entrypoint=claude-code&model=claude-opus-5-5；setup-token 用 claude-vscode&model=claude-opus-5）仍经同一 VM 出口读取 oauth_account
    │ 控制面接收完整凭证，不在 helper 返回后再次 bootstrap 或套一层代理
    ▼
 槽 ~/.claude/credentials.json   ← 活票只在这里（含 email / account_uuid / org_uuid）
@@ -39,6 +39,24 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
 远端 Claude 槽以节点上的 `credentials.json` 为准。官方 CLI 的 `.credentials.json` 使用同目录相对软链接；即使轮换通过原子替换更新文件，下次打开也会读到最新版。节点凭据回拉（包括启动、重载）会修正丢失或指向旧副本的链接，不会把旧副本写回凭据。对已运行的槽，启用的 `credential_refresh` 巡检也会检查链接（默认每 300 秒），不等令牌到期，不读取令牌内容、不额外换票、不重启槽。巡检快照的 `link_failures` 单列未修复的槽，与换票结果分开。
 
 CAI 粘贴码按 sub2api 规则换票：`code#state` 只将 `#` 后的上游返回值作为 token 请求的 `state`；只有 code 时不发送 `state`。Claude Code 由原生客户端保存 PKCE，面板将完整授权码交给原进程处理。Setup Token 和 Cookie 流程不变。
+
+### 换票传输：两套 profile
+
+`kin-oauth-auth` 按 `runtime_mode` 选传输 profile，别的都不看；两套都在 `src/lib/oauth/auth.js`，常量在 `oauth-contract.mjs`。
+
+| | `sub2api`（cookie → 完整 OAuth、CAI 粘贴码） | `setup-token`（一年期 setup-token mint） |
+|---|---|---|
+| authorize 主机 | `https://claude.ai/v1/oauth/{org}/authorize` | `https://platform.claude.com/v1/oauth/{org}/authorize` |
+| 授权来源头 | `Origin: https://claude.ai`、`Referer: https://claude.ai/new` | `Origin: https://claude.com`、`Referer: https://claude.com/cai/oauth/authorize?code=true` |
+| token UA | `axios/1.13.6` | 浏览器 UA（macOS Chrome 154） |
+| bootstrap | `entrypoint=claude-code&model=claude-opus-5-5`，UA `claude-cli/… (external, cli)` | `entrypoint=claude-vscode&model=claude-opus-5`，UA `claude-code/…` |
+| Grove | 不动 | bootstrap 后 `PATCH /api/oauth/account/settings {"grove_enabled": true}` |
+
+- 每次请求 60 秒上限（`OAUTH_REQUEST_TIMEOUT_MS`），不是整条流程 60 秒；helper 的整体超时按 4 跳留余量。
+- 浏览器阶段发 Chrome 的 HTTP 头（`sec-ch-ua`、`sec-fetch-*`、`accept-language`）。TLS/HTTP2 指纹伪装需要 libcurl/utls 客户端，Node helper 做不到，别把它当已实现。
+- 不保存响应 Cookie：整个流程只主动带 `Cookie: sessionKey`，`Set-Cookie` 一律不落盘（sub2api `SetCookieJar(nil)`）。
+- Grove 的 PATCH 是尽力而为：票据已经绑定该账号，不因为设置同步失败丢掉一次换票。
+- 出口仍是 fail closed：`proxy_url=""` 是本地出口（直连），`null` 是未绑定（`proxy_required`），不因为上游直连就放开。
 
 Cookie authorize 的组织 UUID 同时出现在 `/v1/oauth/{uuid}/authorize` 路径和 JSON 的 `organization_uuid` 字段；只有路径 UUID 不够，上游会返回 400 `Invalid request format`。
 
