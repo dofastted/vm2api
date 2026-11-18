@@ -18,7 +18,8 @@ try {
 const localOnly = auth ? {} : { skip: 'src/lib/oauth/auth.js is local-only and absent from this tree' }
 
 const ORG = '11111111-2222-4333-8444-555555555555'
-const CLI_UA = `claude-cli/${OFFICIAL_CLI_VERSION} (external, cli)`
+const CLI_UA = `claude-cli/${OFFICIAL_CLI_VERSION} (external, sdk-cli)`
+const CODE_UA = `claude-code/${OFFICIAL_CLI_VERSION}`
 
 const json = (body) => ({ ok: true, status: 200, json: async () => body })
 
@@ -50,6 +51,22 @@ function fakeProvider({ onAuthorize } = {}) {
         },
       })
     }
+    if (u.includes('/api/oauth/profile')) {
+      return json({
+        account: { uuid: 'acct-fixture', email: 'seam@example.test' },
+        organization: {
+          uuid: 'org-fixture',
+          organization_type: 'claude_pro',
+          rate_limit_tier: 'default',
+          subscription_created_at: '2020-01-01T00:00:00.000Z',
+        },
+      })
+    }
+    if (u.includes('/api/oauth/claude_cli/roles')) {
+      return json({ organization_role: 'admin', workspace_role: 'workspace_admin' })
+    }
+    if (u.includes('/claude_code_first_token_date')) return json({ first_token_date: null })
+    if (u.includes('/api/eval/')) return json({ features: {} })
     throw new Error(`unexpected request: ${u}`)
   }
   return { fetchImpl, seen }
@@ -80,8 +97,13 @@ test('the sessionKey seam runs the whole protocol through the injected fetch', l
     seen.map((r) => r.url),
     [
       'https://claude.ai/api/organizations',
-      `https://platform.claude.com/v1/oauth/${ORG}/authorize`,
+      `https://claude.ai/v1/oauth/${ORG}/authorize`,
       'https://platform.claude.com/v1/oauth/token',
+      'https://api.anthropic.com/api/oauth/profile',
+      'https://api.anthropic.com/api/eval/sdk-zAZezfDKGoZuXXKe',
+      'https://api.anthropic.com/api/oauth/claude_cli/roles',
+      'https://api.anthropic.com/api/organization/claude_code_first_token_date',
+      'https://api.anthropic.com/api/eval/sdk-zAZezfDKGoZuXXKe',
       'https://api.anthropic.com/api/claude_cli/bootstrap',
     ],
   )
@@ -91,24 +113,25 @@ test('the CLI stages send the pinned CLI User-Agent; the cookie stages send the 
   const { fetchImpl, seen } = fakeProvider()
   await sessionKeyToOAuth('sk-ant-sid-fixture', { fetchImpl, proxyUrl: '' })
 
-  const [orgs, authorize, token, bootstrap] = seen
-  // claude.ai and the CAI authorize page are reached with the session cookie,
-  // as a browser would.
+  const [orgs, authorize, token, profile, evalBefore, roles, firstToken, evalAfter, bootstrap] = seen
   assert.match(orgs.ua, /^Mozilla\/5\.0 /)
   assert.match(authorize.ua, /^Mozilla\/5\.0 /)
   assert.equal(orgs.headers.cookie, 'sessionKey=sk-ant-sid-fixture')
-  // Anything carrying the token is the CLI. `sdk-cli` is `--print`, which an
-  // OAuth exchange never is, and the version follows OFFICIAL_CLI_VERSION
-  // instead of a hand-synced literal that had drifted to 2.1.303.
-  assert.equal(token.ua, CLI_UA)
-  assert.equal(bootstrap.ua, CLI_UA)
+  assert.equal(token.ua, 'axios/1.15.2')
+  assert.equal(profile.ua, CODE_UA)
+  assert.equal(evalBefore.ua, CODE_UA)
+  assert.equal(evalBefore.headers['anthropic-beta'], 'oauth-2025-04-20')
+  assert.equal(roles.ua, CODE_UA)
+  assert.equal(firstToken.ua, CLI_UA)
+  assert.equal(evalAfter.ua, CODE_UA)
+  assert.equal(bootstrap.ua, CODE_UA)
   assert.equal(bootstrap.headers['anthropic-beta'], 'oauth-2025-04-20')
 })
 
 test('an explicit claude_version overrides the pin, and a malformed one falls back', localOnly, async () => {
   for (const [version, expected] of [
-    ['2.1.400', 'claude-cli/2.1.400 (external, cli)'],
-    ['not-a-version', CLI_UA],
+    ['2.1.400', 'axios/1.15.2'],
+    ['not-a-version', 'axios/1.15.2'],
   ]) {
     const { fetchImpl, seen } = fakeProvider()
     await auth.exchangeAuthorizationCode({
@@ -157,7 +180,15 @@ test('the paste-code seam exchanges and bootstraps through the injected fetch', 
   assert.equal(token.email, 'seam@example.test')
   assert.deepEqual(
     seen.map((r) => r.url),
-    ['https://platform.claude.com/v1/oauth/token', 'https://api.anthropic.com/api/claude_cli/bootstrap'],
+    [
+      'https://platform.claude.com/v1/oauth/token',
+      'https://api.anthropic.com/api/oauth/profile',
+      'https://api.anthropic.com/api/eval/sdk-zAZezfDKGoZuXXKe',
+      'https://api.anthropic.com/api/oauth/claude_cli/roles',
+      'https://api.anthropic.com/api/organization/claude_code_first_token_date',
+      'https://api.anthropic.com/api/eval/sdk-zAZezfDKGoZuXXKe',
+      'https://api.anthropic.com/api/claude_cli/bootstrap',
+    ],
   )
 })
 
