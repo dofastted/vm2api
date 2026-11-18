@@ -24,8 +24,8 @@
     {
       "path": "bin/kin-oauth-auth",
       "asset": "kin-oauth-auth",
-      "size": 14453862,
-      "sha256": "f81e1f210693001a7a36cd4bb5391d9850295446a28b4c4accc9220022cd63cf"
+      "size": 14461786,
+      "sha256": "aa985cc45c96ad04265e71cde7897080543be1ae438a03ed8c46edb03c9bd037"
     },
     {
       "path": "bin/kin-computer",
@@ -36,8 +36,8 @@
     {
       "path": "bin/kin-worker",
       "asset": "kin-worker",
-      "size": 11540584,
-      "sha256": "941a2ce603854a96e7d97ce0fb86a786c3581ff874b36492025f538dd4cb32ce"
+      "size": 11567288,
+      "sha256": "b8434ed06543164f2131cfefa49e778c78780c2fb5e5b24c06aed4c8efb33db3"
     },
     {
       "path": "bin/kin-egress",

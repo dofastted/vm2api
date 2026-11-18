@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 更新 `kin-oauth-auth` 与 `kin-worker` 的锁定载荷大小和 SHA-256，匹配 `payload-2026.11.19-oauth-eval` 上重新构建的二进制。其他锁定载荷不变。
+
 ## 1.4.153 — 2026-11-19 · CRAG 域名切换与回调兼容
 
 - 后续版本的 CRAG 商城、设备激活和宿主订阅请求改指向 `https://www.vm2api.org`。源站继续同时接受 `crag.fkcodex.com`。
