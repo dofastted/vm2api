@@ -107,6 +107,52 @@ for (const [name, body, headers, streamed] of [
   })
 }
 
+for (const stream of [true, false]) {
+  test(`Codex 6.2 preserves a large tool catalog and the incomplete terminal (stream=${stream})`, async (t) => {
+    const members = Array.from({ length: 150 }, (_, index) => ({
+      type: 'function',
+      name: `lookup_${index}`,
+      description: `Tool description ${'long '.repeat(240)}`,
+      parameters: { type: 'object', properties: { max_output_tokens: { type: 'integer' } } },
+    }))
+    const tools = [
+      { type: 'namespace', name: 'catalog', tools: members },
+      { type: 'tool_search', execution: 'client' },
+    ]
+    const toolChoice = { type: 'function', namespace: 'catalog', name: members.at(-1).name }
+    const terminal = {
+      ...response,
+      model: 'gpt-6.2-sol',
+      status: 'incomplete',
+      incomplete_details: { reason: 'max_output_tokens' },
+      output: [],
+      usage: { input_tokens: 20000, output_tokens: 0 },
+    }
+    const event = { type: 'response.incomplete', response: terminal }
+    let attempts = 0
+    const fx = fixture(t, {
+      body: { model: terminal.model, stream, tools, tool_choice: toolChoice, max_completion_tokens: 10 },
+      hop: async ({ envelope, onEvent }) => {
+        attempts++
+        assert.deepEqual(envelope.body.tools, tools)
+        assert.deepEqual(envelope.body.tool_choice, toolChoice)
+        assert.equal(Object.hasOwn(envelope.body, 'max_completion_tokens'), false)
+        await onEvent(`data: ${JSON.stringify(event)}`)
+        await onEvent('')
+        return { ok: true, status: 200, body: terminal, terminalState: 'incomplete' }
+      },
+    })
+    await handleCodexProtocol(fx.args)
+    assert.equal(attempts, 1)
+    assert.equal(fx.res.statusCode, 200)
+    assert.equal(fx.args.logBag.final_state, 'incomplete')
+    assert.equal(fx.args.logBag.stop_reason, 'max_output_tokens')
+    assert.equal(fx.args.logBag.input_tokens, 20000)
+    if (stream) assert.equal(fx.chunks.join(''), `event: response.incomplete\ndata: ${JSON.stringify(event)}\n\n`)
+    else assert.deepEqual(fx.res.body, terminal)
+  })
+}
+
 test('non-stream Codex Chat returns Chat content, tool calls and usage', async (t) => {
   const result = {
     ...response,

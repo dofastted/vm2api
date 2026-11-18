@@ -30,6 +30,23 @@ test('strips client identity fields', () => {
   assert.equal(out.metadata.topic, 'keep')
 })
 
+for (const [reason, finish, stop] of [
+  ['max_output_tokens', 'length', 'max_tokens'],
+  ['content_filter', 'content_filter', 'refusal'],
+]) {
+  test(`converted clients preserve the Responses ${reason} stop`, () => {
+    const response = { status: 'incomplete', output: [], incomplete_details: { reason } }
+    const line = `data: ${JSON.stringify({ type: 'response.incomplete', response })}`
+    const chat = responsesSseToChatChunk(line)
+    assert.ok(chat.includes(`"finish_reason":"${finish}"`))
+    assert.ok(chat.endsWith('data: [DONE]\n\n'))
+    const messages = responsesSseToAnthropicEvents(line)
+    assert.ok(messages.includes(`"stop_reason":"${stop}"`))
+    assert.ok(messages.includes('event: message_stop'))
+    assert.equal(codexBodyToAnthropicMessage(response).stop_reason, stop)
+  })
+}
+
 test('chat tool turns become function_call items', () => {
   const body = chatToCodexResponses({
     model: 'gpt-5.5',

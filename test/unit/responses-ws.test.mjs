@@ -909,7 +909,7 @@ test('real handleProtocol: interrupt after hop finish bills once without duplica
   }
 })
 
-test('real handleProtocol: Codex spend fills the managed key USD quota and the next request is refused', async () => {
+test('real handleProtocol: a Codex incomplete response reaches WebSocket and its usage counts toward quota', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-responses-ws-key-quota-'))
   writeGptVm(root, 'vm-gpt-a')
   const keys = new ApiKeyStore({ dataDir: fs.mkdtempSync(path.join(root, 'keys-')) })
@@ -934,13 +934,16 @@ test('real handleProtocol: Codex spend fills the managed key USD quota and the n
     codexOps: {
       streamCodexKernel: async ({ onEvent }) => {
         hops += 1
-        await onEvent(
-          `data: ${JSON.stringify({
-            type: 'response.completed',
-            response: { id: `resp_quota_${hops}`, status: 'completed', output: [], usage },
-          })}\n\n`,
-        )
-        return { ok: true, status: 200, terminalState: 'verified', usage }
+        const response = {
+          id: `resp_quota_${hops}`,
+          status: 'incomplete',
+          incomplete_details: { reason: 'max_output_tokens' },
+          output: [],
+          usage,
+        }
+        await onEvent(`data: ${JSON.stringify({ type: 'response.incomplete', response })}`)
+        await onEvent('')
+        return { ok: true, status: 200, body: response, terminalState: 'incomplete', usage }
       },
     },
   })
@@ -954,8 +957,12 @@ test('real handleProtocol: Codex spend fills the managed key USD quota and the n
   let opened = null
   try {
     opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    const terminal = nextFrame(opened.ws, (frame) => frame.type === 'response.incomplete')
     opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'first' }))
+    const frame = await terminal
+    assert.equal(frame.response.incomplete_details.reason, 'max_output_tokens')
     await waitFinish(1)
+    assert.equal(finishCalls[0].final_state, 'incomplete')
     const spent = keys.getById(key.id)
     assert.equal(spent.requests, 1)
     assert.equal(spent.tokens_in, 100_000)
