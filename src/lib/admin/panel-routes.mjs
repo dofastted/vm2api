@@ -6081,7 +6081,15 @@ export function createPanelHandler(ctx) {
               proxyPool,
             })
           }
-          if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
+          // The paste-code mint is the CLI's own setup token: inference-only,
+          // one year, no refresh. That is `official-setup-token`; the converted
+          // setup-token mode is the one that still carries a refresh token.
+          const mintedSetupToken =
+            (normalizeOauthFlavor(flavor) === 'setup_token' ||
+              oauth.flavor === 'setup_token' ||
+              oauth.flavor === 'setup-token') &&
+            !String(oauth.refresh_token || '').trim()
+          if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR || mintedSetupToken) {
             oauth.type = 'official-setup-token'
             oauth.mode = 'official-setup-token'
           } else if (
@@ -6122,12 +6130,17 @@ export function createPanelHandler(ctx) {
             }),
           )
         } catch (e) {
-          const status =
-            e.code === 'session_expired' || e.code === 'session_vm_mismatch' || e.code === 'code_required' ? 400 : 502
-          return json(res, status, {
-            ok: false,
-            error: { code: e.code || 'exchange_code_failed', message: String(e.message || e).slice(0, 240) },
-          })
+          if (e.code === 'session_expired' || e.code === 'session_vm_mismatch' || e.code === 'code_required') {
+            return json(res, 400, {
+              ok: false,
+              error: { code: e.code, message: String(e.message || e).slice(0, 240) },
+            })
+          }
+          // An exchange failure carries an upstream class — throttled (429),
+          // blocked exit, refused origin — so report it like the cookie import
+          // does instead of flattening every one of them into a 502.
+          const failure = panelImportErrorPayload(e)
+          return json(res, failure.status === 500 ? 502 : failure.status, { ok: false, error: failure.error })
         }
       }
 

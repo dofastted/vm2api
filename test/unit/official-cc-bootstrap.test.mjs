@@ -31,9 +31,8 @@ import {
   listOfficialCcVmIds,
   officialCcQuotaSucceeded,
   finalizeOfficialCcTelemetry,
+  officialCcNativeReady,
 } from '../../src/lib/oauth/official-cc-bootstrap.mjs'
-import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
-import { CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
 
 test('uid follows vm index', () => {
   assert.deepEqual(officialCcUidGid('vm-30'), { uid: 10030, gid: 987 })
@@ -128,7 +127,7 @@ test('status file never stores tokens', () => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('docker args use hello//usage bypassPermissions without CONNECT proxy', () => {
+test('docker args always run packaged native Claude Code', () => {
   const args = buildOfficialCcDockerArgs({
     vmId: 'vm-30',
     uid: 10030,
@@ -145,13 +144,15 @@ test('docker args use hello//usage bypassPermissions without CONNECT proxy', () 
     false,
   )
   assert.ok(args.includes('ANTHROPIC_BASE_URL='))
-  // Bootstrap must not race the host Go Refresher. cli-node reads this name.
   assert.ok(args.includes('CLAUDE_CODE_HOST_REFRESH=1'))
-  assert.ok(args.includes(`CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`))
+  assert.equal(
+    args.some((arg) => String(arg).startsWith('CLAUDE_CODE_VERSION=')),
+    false,
+  )
   assert.ok(args.includes('USER_TYPE=external'))
   assert.equal(args.includes('CI=1'), false)
-  assert.equal(args[args.indexOf('kin-30') + 1], '/home/kincli/.kin/cli-node')
-  assert.equal(args[args.indexOf('--append-system-prompt') + 1], CRS_OFFICIAL_CLI_SYSTEM)
+  assert.equal(args[args.indexOf('kin-30') + 1], '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
+  assert.equal(args.includes('--append-system-prompt'), false)
   const usageArgs = buildOfficialCcDockerArgs({
     vmId: 'vm-30',
     uid: 10030,
@@ -159,21 +160,19 @@ test('docker args use hello//usage bypassPermissions without CONNECT proxy', () 
     prompt: DEFAULT_USAGE_PROMPT,
   })
   assert.ok(usageArgs.includes('/usage'))
-  // stream-json keeps the structured usage_report (server limits[]) the
-  // plain json envelope drops.
   assert.equal(usageArgs[usageArgs.indexOf('--output-format') + 1], 'stream-json')
   assert.ok(usageArgs.includes('--verbose'))
-  assert.equal(usageArgs[usageArgs.indexOf('--append-system-prompt') + 1], CRS_OFFICIAL_CLI_SYSTEM)
+  assert.equal(usageArgs.includes('--append-system-prompt'), false)
 })
 
-test('native bootstrap runs the selected CLI without cli-node identity overrides', () => {
+test('native bootstrap uses the same packaged CLI on local and cluster slots', () => {
   for (const vm of [{ id: 'vm-30' }, { id: 'vm-30', node_id: 'node-a' }]) {
     const args = buildOfficialCcDockerArgs({
       vmId: vm.id,
       vm,
       uid: 10030,
       gid: 987,
-      routing: { inference: { dataplane: 'crag', crag_kernel_version: 'v2' } },
+      routing: { inference: { dataplane: 'wrap' } },
     })
     assert.equal(
       args[args.indexOf('kin-30') + 1],
@@ -271,6 +270,52 @@ test('fresh ticket does not force-refresh before official login', () => {
     }),
   )
   assert.equal(officialCcShouldForceRefresh(dir, {}), true)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('native init waits for an unexpired grant and the credential symlink', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-ready-'))
+  fs.mkdirSync(path.join(dir, '.claude'), { recursive: true })
+  const write = (expiresAt) => {
+    fs.writeFileSync(
+      path.join(dir, '.claude', 'credentials.json'),
+      JSON.stringify({
+        claudeAiOauth: { accessToken: 'at', refreshToken: 'rt', expiresAt, scopes: ['user:profile', 'user:inference'] },
+      }),
+    )
+  }
+  write(Date.now() - 1000)
+  assert.equal(officialCcNativeReady(dir).ok, false)
+  write(Date.now() + 60 * 60 * 1000)
+  const ready = officialCcNativeReady(dir)
+  assert.equal(ready.ok, true)
+  assert.equal(fs.readlinkSync(path.join(dir, '.claude', '.credentials.json')), 'credentials.json')
+  fs.rmSync(path.join(dir, '.claude', '.credentials.json'))
+  fs.writeFileSync(path.join(dir, '.claude', '.credentials.json'), '{}')
+  assert.equal(officialCcNativeReady(dir).ok, true)
+  assert.equal(fs.lstatSync(path.join(dir, '.claude', '.credentials.json')).isSymbolicLink(), true)
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('native init ignores vm metadata when the disk grant is empty and keeps the imported grant', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-ready-empty-'))
+  fs.mkdirSync(path.join(dir, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(dir, '.claude', 'credentials.json'), '{}\n')
+  assert.equal(officialCcNativeReady(dir).ok, false)
+  const future = Date.now() + 3_600_000
+  fs.writeFileSync(
+    path.join(dir, '.claude', 'credentials.json'),
+    JSON.stringify({ claudeAiOauth: { accessToken: 'imported-at', refreshToken: 'imported-rt', expiresAt: future } }),
+  )
+  fs.writeFileSync(
+    path.join(dir, '.claude', '.credentials.json'),
+    JSON.stringify({ claudeAiOauth: { accessToken: 'loose-at', refreshToken: 'loose-rt', expiresAt: future + 1000 } }),
+  )
+  const ready = officialCcNativeReady(dir)
+  assert.equal(ready.ok, true)
+  const kept = JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'credentials.json'), 'utf8'))
+  assert.equal(kept.claudeAiOauth.refreshToken, 'imported-rt')
+  assert.equal(fs.readlinkSync(path.join(dir, '.claude', '.credentials.json')), 'credentials.json')
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
@@ -466,8 +511,8 @@ test('auto init still runs when official IDs are missing or account changes', ()
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-function writeSlotCliNode(home) {
-  const bin = path.join(home, '.kin', 'cli-node')
+function writeNativeClaude(home) {
+  const bin = path.join(home, '.kin', 'crag-v2', 'claude-code-2.1.321', 'claude')
   fs.mkdirSync(path.dirname(bin), { recursive: true })
   fs.writeFileSync(bin, '#!/bin/sh\nexit 0\n')
 }
@@ -476,7 +521,7 @@ test('resident restore skips incomplete, disabled, and already-running slots', (
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-restore-'))
   const vmId = 'vm-13'
   const home = writeCompletedOfficialHome(root, vmId)
-  writeSlotCliNode(home)
+  writeNativeClaude(home)
   fs.writeFileSync(
     path.join(root, 'vms', `${vmId}.json`),
     JSON.stringify({
@@ -520,7 +565,7 @@ test('cli-hop slots do not restore official resident PTY', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-clihop-'))
   const vmId = 'vm-05'
   const home = writeCompletedOfficialHome(root, vmId)
-  writeSlotCliNode(home)
+  writeNativeClaude(home)
   fs.writeFileSync(
     path.join(root, 'vms', `${vmId}.json`),
     JSON.stringify({ id: vmId, official_cc_inference: 'cli-hop', inference_engine: 'rust' }),
@@ -537,7 +582,7 @@ test('cli-hop slots do not restore official resident PTY', () => {
 test('Node boot restores dead residents without another hello', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-boot-'))
   const live = writeCompletedOfficialHome(root, 'vm-30')
-  writeSlotCliNode(live)
+  writeNativeClaude(live)
   fs.writeFileSync(path.join(root, 'vms', 'vm-30.json'), JSON.stringify({ id: 'vm-30', inference_engine: 'go' }))
   const empty = writeCompletedOfficialHome(root, 'vm-31')
   writeOfficialCcStatus(empty, { status: 'error', hello_ok: false, step: 'hello' })

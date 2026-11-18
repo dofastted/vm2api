@@ -147,6 +147,8 @@ test('re-asserts Claude onboarding in a cluster-node Docker slot, at most once a
   assert.equal(setup[0].container, 'kin-vm-node-01')
   assert.equal(setup[0].opts.user, '10001:987')
   assert.match(setup[0].Cmd.at(-1), /hasCompletedOnboarding/)
+  assert.match(setup[0].Cmd.at(-1), /\.claude\/\.claude\.json/)
+  assert.match(setup[0].Cmd.at(-1), /FileNotFoundError/)
   await guard.tick()
   assert.equal(execed.filter((e) => e.Cmd[0] === 'python3').length, 1)
   assert.equal(execed.filter((e) => e.Cmd[0] === '/bin/sh').length, 4)

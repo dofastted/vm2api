@@ -11,7 +11,7 @@ import {
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
+import { FULL_OAUTH_SCOPE, INFERENCE_ONLY_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
 import { slotExec } from '../../src/lib/vm/slot-runtime.mjs'
 
 test('sessionKeyToOAuth rejects malformed session cookies before execution', async () => {
@@ -71,11 +71,12 @@ test('panel import catch maps helper codes without leaking ReferenceError', () =
   assert.equal(coded.status, 400)
 })
 
-test('setup-token CAI URL helper requests full OAuth scope', () => {
+test('setup-token CAI URL helper asks for the inference-only scope', () => {
   const url = buildSetupTokenAuthorizeURL('st', 'ch')
   assert.match(url, /^https:\/\/claude\.com\/cai\/oauth\/authorize\?code=true/)
   assert.match(url, /client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e/)
-  assert.ok(url.includes(encodeURIComponent(FULL_OAUTH_SCOPE).replace(/%20/g, '+')))
+  assert.ok(url.includes(`scope=${encodeURIComponent(INFERENCE_ONLY_SCOPE)}`))
+  assert.equal(url.includes(encodeURIComponent(FULL_OAUTH_SCOPE).replace(/%20/g, '+')), false)
 })
 
 test('extractOAuthCodeFromRedirect reads callback query', () => {
@@ -92,4 +93,39 @@ test('authorize_no_code is a 400 not Cloudflare', () => {
   const payload = panelImportErrorPayload({ code: 'authorize_no_code', message: 'authorize_no_code' })
   assert.equal(payload.status, 400)
   assert.equal(payload.error.code, 'authorize_no_code')
+})
+
+test('a refused authorize Origin is an upstream protocol change, not a bad slot', () => {
+  const raw =
+    'authorize failed: 403 {"type":"error","error":{"type":"permission_error","message":"Origin not allowed"},"request_id":"req_011ChAgZMSqnv2VAeefKwWbW"} (Origin 被拒，已尝试：claude.ai, claude.com, cai, no-origin)'
+  assert.equal(classifyImportHelperOutput(raw), 'origin_rejected')
+  const payload = panelImportErrorPayload({ message: raw })
+  assert.equal(payload.status, 502)
+  assert.equal(payload.error.code, 'origin_rejected')
+  assert.match(payload.error.message, /Origin not allowed/)
+  assert.doesNotMatch(payload.error.message, /sessionKey 不够新|Cloudflare/)
+})
+
+test('a throttled token exchange is a 429 that says wait, not a bad code', () => {
+  const raw =
+    'token_exchange failed: 429 {"error":{"type":"rate_limit_error","message":"Ratelimited. Please try again later."}}'
+  assert.equal(classifyImportHelperOutput(raw), 'token_exchange_rate_limited')
+  assert.match(publicImportError(raw), /限流/)
+  const payload = panelImportErrorPayload({ message: raw })
+  assert.equal(payload.status, 429)
+  assert.equal(payload.error.code, 'token_exchange_rate_limited')
+  // A coded failure wins over text sniffing, and keeps its status.
+  const coded = panelImportErrorPayload({ code: 'token_exchange_rate_limited', message: raw })
+  assert.equal(coded.status, 429)
+  assert.equal(coded.error.code, 'token_exchange_rate_limited')
+})
+
+test('a region-blocked token exchange is a 502 pointing at the exit', () => {
+  const raw = 'token_exchange failed: 403 { "error": { "type": "forbidden", "message": "Request not allowed" } }'
+  assert.equal(classifyImportHelperOutput(raw), 'token_exchange_forbidden')
+  const payload = panelImportErrorPayload({ message: raw })
+  assert.equal(payload.status, 502)
+  assert.equal(payload.error.code, 'token_exchange_forbidden')
+  assert.match(payload.error.message, /出口/)
+  assert.doesNotMatch(payload.error.message, /限流|Cloudflare/)
 })
