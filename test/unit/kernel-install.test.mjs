@@ -8,6 +8,8 @@ import {
   installKernelTargets,
   releaseKernelInstallSafetyHold,
   resumePendingKernelInstalls,
+  cancelKernelInstall,
+  listActiveKernelInstalls,
 } from '../../src/lib/vm/kernel-install.mjs'
 import { kvmKernelSelector, selectChangedPayloadFiles } from '../../src/lib/cluster/remote-slot-files.mjs'
 import { describeKernelCatalog, pullKernelRelease } from '../../src/lib/admin/kernel-catalog.mjs'
@@ -1374,4 +1376,44 @@ test('kernel installation resets an open request circuit only after verified rea
   })
   assert.equal(repaired.ok, true, JSON.stringify(repaired))
   assert.equal(unitCircuit.view(account).state, 'closed')
+})
+
+test('a forced cancel stops the installer at its next checkpoint without starting the slot', async (t) => {
+  const { root, vm } = fixture(t)
+  let releaseStop
+  const stopping = new Promise((resolve) => (releaseStop = resolve))
+  let stopEntered
+  const entered = new Promise((resolve) => (stopEntered = resolve))
+  let started = false
+  const life = lifecycle(root, {
+    async stopSlot(current) {
+      stopEntered()
+      await stopping
+      return { ok: true, runtime: { ...current.runtime, stopped: true } }
+    },
+    startSlotReady() {
+      started = true
+      return { ok: true, rust_ok: true }
+    },
+  })
+  const running = installKernelTargets({ projectRoot: root, targets: target('cli-node'), ops: life.ops })
+  await entered
+  assert.deepEqual(
+    listActiveKernelInstalls().map(({ id, kernel, phase }) => ({ id, kernel, phase })),
+    [{ id: vm.id, kernel: 'cli-node', phase: 'kernel_stop_failed' }],
+  )
+  const cancel = cancelKernelInstall(vm.id)
+  assert.equal(cancel.ok, true, JSON.stringify(cancel))
+  releaseStop()
+  const result = await running
+  assert.equal(result.ok, false)
+  assert.equal(result.items[0].code, 'kernel_install_cancelled')
+  assert.equal(result.items[0].stopped, true)
+  assert.equal(started, false, 'a cancelled install must not start the slot')
+  const saved = getVm(root, vm.id)
+  assert.equal(saved.kernel_operation.phase, 'failed')
+  assert.equal(saved.kernel_operation.code, 'kernel_install_cancelled')
+  assert.equal(saved.schedulable, false, 'a stopped slot stays under maintenance for review')
+  assert.deepEqual(listActiveKernelInstalls(), [])
+  assert.equal(cancelKernelInstall(vm.id).code, 'kernel_install_not_running')
 })

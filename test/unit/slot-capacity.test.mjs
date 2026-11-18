@@ -102,3 +102,24 @@ test('a kernel start sizes from the current record, not the exec snapshot', () =
   assert.equal(expectedKernelSlots({ vm: max5({ memory: '512m' }) }), 1)
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+test('a seat count set on the VM sizes the container, not the plan table', () => {
+  const seats = (n, machine = {}) => ({ ...pro(machine), policy: { sessionSlots: n, sessionSlotsOverride: true } })
+  // Pro plan would ask for 5 seats (2g); the operator set 2 / 1 → 1g fits.
+  assert.equal(planSlots(seats(2)), 2)
+  assert.equal(planSlots(seats(1)), 1)
+  assert.deepEqual(slotCreationLimits(seats(2, { memory: '1g' })), { memory: '1g', pids: 256 })
+  assert.equal(slotCreationLimits(seats(1, { memory: '512m' })).memory, '1g')
+  // An explicit override may also ask for more than the plan.
+  const max = { ...max5(), policy: { sessionSlots: 5, sessionSlotsOverride: true } }
+  assert.equal(planSlots(max), 5)
+})
+
+test('without a VM override the global seat setting caps the plan target', () => {
+  const routing = { inference: { session_slots: 3 } }
+  assert.equal(planSlots(max5(), routing), 3)
+  assert.equal(planSlots(pro(), { inference: { session_slots: 8 } }), 5)
+  // A VM that follows the global value is not treated as an override.
+  const following = { ...pro(), policy: { sessionSlots: 2, sessionSlotsOverride: false } }
+  assert.equal(planSlots(following, routing), 3)
+})
