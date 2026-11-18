@@ -2,9 +2,23 @@
 
 ## Unreleased
 
-- 内核页默认拉取 CRAG `3.1.5` 标准签名包：普通请求与认证分类请求保留调用方的 system 文本块和缓存标记。沿用 `3.1.4` 的授权身份及官方 Claude Code `2.1.321`；旧版仍可选，本次不自动重装运行槽位。
-- 发布流水线的 `vX.Y.Z` 与 `latest` 镜像 tag 只要 amd64 推成功就发布：ARM64 job 失败时降级为 amd64 单架构并留 warning，不再因为 ARM64 冒烟测试挂掉就整段跳过，导致这两个 tag 长期停在旧版本（v1.4.131~v1.4.138 就都没有裸 tag、`latest` 停在 v1.4.130）。ARM64 主机继续拉 `-arm64` 单架构 tag，一键脚本和面板不受影响。
+## 1.4.139 — 2026-11-18 · 连续会话固定账号与 Antigravity 接入
+
+- 延续的对话固定在它首次落到的账号上：`keep_session_home` 下 home 槽位忙时等待而不是溢出到别的账号，只有模型门禁挡住时才借用其他账号，并且保留会话 pin，门禁解除后回到原账号。
+- 新增可选 `pool.fable_requires_max`，开启后 Fable 不落 Pro 账号，面板在非 Max 槽位显示「仅 Max」；该门禁先于按账号的 Fable 拒绝上报。需要 usage credits 的账号把 Fable 停放并在面板标注，failover 用尽时返回上游那个 usage-credits 429 而不是通用错误，限额查询的 Fable hop 也记录同一标记。
+- 第三方客户端的 system prompt 搬进首条 user 消息（绑定 `claude_code_only`），避免触发上游的第三方限制；搬动时保留缓存标记，CRAG 的 system 投影一并重定位，合并前导指令前先规范化 system 文本块。
 - 上游「Third-party apps now draw from your extra usage…」和「no third-party apps allowed」（HTTP 400/503）单独归类为 `third_party_client`：客户端收到 400 `invalid_request_error`，文案为中性说明，`details.upstream_message` 保留原文，请求日志 `error_code` 记为 `third_party_client`。主修复是 #1208（把第三方 system 搬进首条 user，避免触发）；这里只管漏网时的归类和兜底。不再报成 `refusal_guard`「usage policy」，不写拒答缓存、不封会话或设备（取代 #842 的缓存和 1.4.131 的会话封锁），不换号、不冷却槽位，请求日志归「请求格式」、不计 SLA 失败；历史上记成 `refusal_guard` 的同类行也按「请求格式」统计。
+- 上游拒答会彻底结束调用方会话，但 auto-mode 分类器自己的拒答不触发结束；SSE 的拒答细节保留在分类器诊断里。
+- 池内每个账号都回 429 时，返回上游那个 429，不再折成通用 502。
+- 只含 thinking 的 `max_tokens` 响应返回 200，不再被 CRAG 判成空内容 502；realtime commit 之后该值能恢复。
+- 接入 Gemini Antigravity：原生文本流适配器、面板展示共享额度与使用比例、宿主启动修复并把载荷故障与出口故障分开上报，导入页和 VM 页显示启动被阻塞的原因。
+- 内核页默认拉取 CRAG `3.1.5` 标准签名包：普通请求与认证分类请求保留调用方的 system 文本块和缓存标记。沿用 `3.1.4` 的授权身份及官方 Claude Code `2.1.321`；旧版仍可选，本次不自动重装运行槽位。
+- CRAG 买家订阅页按目录声明的 `presentation.layout` 排版，代理层透传该字段，`/crag-preview` 声明 `layout-1` 并消费布局草稿；`layout` 缺失按缺省排版处理，与 crag-auth 语义对齐。推荐角标回传改走父页真正读取的 edit 通道。
+- OAuth 换票按使用点解析当前 VM 的代理出口，UA 跟随 `OFFICIAL_CLI_VERSION` 并统一 cli 入口，版本取 CRAG 原生入口锁定的那个；宿主与槽内 CLI 不再重复消费同一个 refresh token。
+- 集群与槽位运维：节点不可达时可强制删除槽位，不再和「移除节点」互相卡死；旧来宾内核服务停机不再删除 `slot.env`，切 CRAG 时就地修复；出口以进程方式启停时清理容器方式遗留的 `kin-cp-egress`；槽位重新分配后清理过期的 VM 选择；引导流程未完成前已授权页面可访问。
+- 发布流水线的 `vX.Y.Z` 与 `latest` 镜像 tag 只要 amd64 推成功就发布：ARM64 job 失败时降级为 amd64 单架构并留 warning，不再因为 ARM64 冒烟测试挂掉就整段跳过，导致这两个 tag 长期停在旧版本（v1.4.131~v1.4.138 就都没有裸 tag、`latest` 停在 v1.4.130）。ARM64 主机继续拉 `-arm64` 单架构 tag，一键脚本和面板不受影响。
+- ARM64 发布门禁不再在 qemu 下执行 x86 CLI，只校验 ELF；该调用只服务 `docs/ARM64.md` 支持矩阵里未验证的 Codex / KVM / 远程 slot，本机 Docker 的 Claude slot 走原生 overlay 不受影响。
+- 本版不改变上游计费策略。
 
 ## 1.4.138 — 2026-11-18 · OpenAI 模型目录 6.2 系列默认暴露
 
