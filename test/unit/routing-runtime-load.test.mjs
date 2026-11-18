@@ -574,6 +574,35 @@ test('PUT /api/panel/routing rejects an invalid vm patch before persist', async 
   assert.match(response.body?.error?.message, /memory/)
 })
 
+test('PUT /api/panel/routing returns telemetry publication failures to the panel', async () => {
+  const response = {}
+  const handlePanel = createPanelHandler({
+    cfg: { paths: { project: os.tmpdir() }, limits: { max_body_bytes: 4096 } },
+    routingConfig: { telemetry: { default_enabled: false, upload_interval_seconds: 600 } },
+    stickyRouter: { stats: () => ({}) },
+    persistRoutingPatch: async () => ({
+      concurrency: { skipped: 0 },
+      rpm: { skipped: 0 },
+      session_slots: { updated: 0, skipped: 0 },
+      telemetry_sync: { updated: 1, queued: 0, skipped: 0, failed: ['vm-node'] },
+    }),
+    requireAuth(req) {
+      req.apiKeyKind = 'master'
+      req.panelRole = 'admin'
+      return true
+    },
+    json(_res, status, payload) {
+      response.status = status
+      response.body = payload
+      return true
+    },
+    readBody: async () => ({ telemetry: { default_enabled: true } }),
+  })
+  await handlePanel({ method: 'PUT' }, {}, new URL('http://localhost/api/panel/routing'))
+  assert.equal(response.status, 200)
+  assert.deepEqual(response.body?.data?.telemetry_sync?.failed, ['vm-node'])
+})
+
 test('persistRoutingPatch round-trips websocket gates and analytics', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-ws-persist-'))
   const routingFile = path.join(root, 'routing.json')

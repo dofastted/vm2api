@@ -6673,6 +6673,7 @@ export function createPanelHandler(ctx) {
             applied_rpm: applied.rpm,
             applied_session_slots: applied.session_slots,
             kernel_persona: applied.kernel_persona || null,
+            telemetry_sync: applied.telemetry_sync || null,
             inference_runtime: publicEngineRuntime,
           }),
         )
