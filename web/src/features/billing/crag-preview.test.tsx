@@ -43,6 +43,18 @@ describe('CRAG draft boundary', () => {
     expect(html).not.toContain('¥0')
   })
 
+  it('shows the Telegram group on the preview canvas', () => {
+    const html = renderToStaticMarkup(
+      <PreviewCanvas
+        draft={{ plans: [plan] }}
+        selected={null}
+        onPick={vi.fn()}
+      />
+    )
+    expect(html).toContain('href="https://t.me/vm2api"')
+    expect(html).toContain('TG 群')
+  })
+
   it('rejects invalid theme, edit and duplicate draft ids', () => {
     expect(parseDraftMessage({ ...message, theme: 'system' })).toBeNull()
     expect(parseDraftMessage({ ...message, edit: 'true' })).toBeNull()
