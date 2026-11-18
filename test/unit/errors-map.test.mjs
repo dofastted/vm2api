@@ -365,6 +365,26 @@ test('kernel slot_busy on the last hop is pool capacity: 529 with Retry-After', 
   assert.ok(mapped.retryAfterSec >= 1)
 })
 
+test('managed CRAG queue rejections stay 529 but name the local kernel queue (#1213)', () => {
+  for (const [message, reason] of [
+    ['runtime queue timeout', 'runtime_queue_timeout'],
+    ['runtime queue is full', 'runtime_queue_full'],
+  ]) {
+    const mapped = mapUpstreamError(504, {
+      type: 'error',
+      error: { type: 'timeout_error', code: 'slot_busy', message },
+    })
+    assert.equal(mapped.status, 529)
+    assert.equal(mapped.body.error.code, 'pool_overloaded')
+    assert.deepEqual(mapped.body.error.details, { source: 'local_kernel_queue', reason })
+  }
+  const plain = mapUpstreamError(503, {
+    type: 'error',
+    error: { type: 'worker_error', code: 'slot_busy', message: 'rust kernel has no free slot' },
+  })
+  assert.equal(plain.body.error.details, undefined)
+})
+
 test('upstream 429 / 529 hand their Retry-After to the client; 529 always has one', () => {
   const limited = mapUpstreamError(
     429,

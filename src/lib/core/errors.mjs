@@ -538,7 +538,16 @@ export function mapUpstreamError(status, body, headers = {}) {
   }
   // Kernel slot busy on the last hop is capacity, same as a full pool queue.
   if (inboundCode === 'slot_busy' || /rust kernel has no free slot/i.test(String(msg || ''))) {
-    return poolClientError('overloaded')
+    const out = poolClientError('overloaded')
+    // Name the local CRAG queue so a 529 here is not read as provider overload (#1213).
+    const queue = /runtime queue (timeout|is full)/i.exec(String(msg || ''))
+    if (queue) {
+      out.body.error.details = {
+        source: 'local_kernel_queue',
+        reason: queue[1].toLowerCase() === 'timeout' ? 'runtime_queue_timeout' : 'runtime_queue_full',
+      }
+    }
+    return out
   }
   if (
     inboundCode === 'wrap_connection_error' ||
