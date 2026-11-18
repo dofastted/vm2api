@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- 「订阅 CRAG」页头增加 Telegram 群入口，徽标链接到 https://t.me/vm2api。免登录购买页同样显示。
+- 「订阅 CRAG」页头和套餐预览画布都显示 Telegram 群入口，徽标链接到 https://t.me/vm2api。免登录购买页同样显示。
 
 ## 1.4.148 — 2026-11-19 · OAuth helper 载荷更新
 

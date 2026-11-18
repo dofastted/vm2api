@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Eye, EyeOff, Info, ReceiptText } from 'lucide-react'
+import { IconTelegram } from '@/assets/brand-icons'
 import {
   copyDefaults,
   copyLabels,
@@ -351,13 +352,25 @@ export function PreviewCanvas({
             未发布草稿 · 仅预览，不可购买；库存为草稿配置，不是实时余量。
           </span>
         </div>
-        <header className='mb-6'>
-          <h2 className='text-2xl font-bold tracking-tight sm:text-3xl'>
-            {copy('title')}
-          </h2>
-          <p className='mt-2 max-w-prose text-sm leading-6 text-muted-foreground'>
-            {copy('description')}
-          </p>
+        <header className='mb-6 flex flex-wrap items-start justify-between gap-3'>
+          <div className='min-w-0'>
+            <h2 className='text-2xl font-bold tracking-tight sm:text-3xl'>
+              {copy('title')}
+            </h2>
+            <p className='mt-2 max-w-prose text-sm leading-6 text-muted-foreground'>
+              {copy('description')}
+            </p>
+          </div>
+          <a
+            href='https://t.me/vm2api'
+            target='_blank'
+            rel='noreferrer'
+            title='Telegram 群 @vm2api'
+            className='inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-[#229ED9]/40 bg-[#229ED9]/10 px-2.5 text-sm font-medium text-[#229ED9] outline-hidden transition-colors hover:bg-[#229ED9]/18 focus-visible:ring-2 focus-visible:ring-ring'
+          >
+            <IconTelegram aria-hidden className='size-4 shrink-0' />
+            TG 群
+          </a>
         </header>
         <div
           className={`grid min-w-0 items-start gap-5 ${ordersSide ? ordersSideClass : ''}`}
