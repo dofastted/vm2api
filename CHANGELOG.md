@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.149 — 2026-11-19 · Claude 槽位 OAuth 读取修复
+
+- 原子修复 Claude 槽位的 `.credentials.json` 相对软链接，继续读取面板保存的 `credentials.json`。本地 OAuth 凭据无法加载时，不向该槽位派发推理（#1278）。
+- 拦截槽位返回的 `NO_ACCOUNT`，尚未输出且允许切槽时改用其他槽位；无可用槽位时返回通用 `503 pool_unavailable`。不重放已开始输出的请求（#1278）。
+- CRAG 3.1.6 与其他锁定二进制载荷不变。
+
 ## 1.4.148 — 2026-11-19 · OAuth helper 载荷更新
 
 - 更新 `kin-oauth-auth` 的锁定大小和 SHA-256，匹配已更新的 OAuth 载荷附件；Setup Token 首次授权使用 `https://claude.ai` 作为来源。保留 `1.4.147` 的 WARP 修复；CRAG 3.1.6 和其他二进制不变。
