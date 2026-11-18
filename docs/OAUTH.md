@@ -8,7 +8,7 @@ sessionKey（默认 Setup Token）或授权码
    ▼
 目标 VM 内的 `bin/kin-oauth-auth`（控制面只负责 `docker exec`，OAuth 源码只在本地构建）
    │ sessionKey / 授权码 → authorize → token
-   │ bootstrap（cookie 导入 entrypoint=claude-code&model=claude-opus-5-5；setup-token 用 claude-vscode&model=claude-opus-5）仍经同一 VM 出口读取 oauth_account
+   │ bootstrap（cookie 导入 entrypoint=claude-code&model=claude-opus-5-5；setup-token 用 claude-vscode&model=claude-opus-5，读不到身份再回落 /api/oauth/profile）仍经同一 VM 出口读取 oauth_account
    │ 控制面接收完整凭证，不在 helper 返回后再次 bootstrap 或套一层代理
    ▼
 槽 ~/.claude/credentials.json   ← 活票只在这里（含 email / account_uuid / org_uuid）
@@ -32,7 +32,7 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
 | 已有 OAuth → Setup Token | `POST /api/panel/vms/:id/oauth/to-setup-token` | 读 worker 活票，仅切换运行模式；保留 access、refresh、真实过期时间和全部实际 scope。不会凭空增加权限，也不会删 scope。官方一年期 token（`official-setup-token`）不能转。 |
 | 官方 `claude setup-token` | 槽内 PTY / 粘贴一年期 oat | 只有 `user:inference`、无 refresh。落盘 `credential_mode=official-setup-token`，与面板转换的完整 Setup Token 区分。 |
 | Claude Code OAuth（默认） | 账号面板 → OAuth → Claude Code 授权 | 打开专用终端，VM 内原生 `claude auth login` 生成链接并处理回调；面板保存并同步结果。 |
-| 通用授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | CAI 和 Setup Token 使用面板 PKCE；要求绑定可用出口。 |
+| 通用授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | CAI 与 Setup Token 都走面板 PKCE 的 CAI 授权链接（`claude.com/cai/oauth/authorize`）；CAI 用完整 OAuth scope，Setup Token 用 `user:inference` 的一年期 mint（与 `claude setup-token` 一致）。要求绑定可用出口。 |
 
 正式凭证的 access/refresh 写入 `credentials.json`；导入时文档顶层和 `claudeAiOauth` 都写 `kinGeneration`，文件仍是 `0444`。`vm.json` / DB 只留 `has_access` / `has_refresh` / email / expiry / generation。
 
@@ -48,15 +48,20 @@ CAI 粘贴码按 sub2api 规则换票：`code#state` 只将 `#` 后的上游返�
 |---|---|---|
 | authorize 主机 | `https://claude.ai/v1/oauth/{org}/authorize` | `https://platform.claude.com/v1/oauth/{org}/authorize` |
 | 首次授权来源头 | `Origin: https://claude.ai`、`Referer: https://claude.ai/new` | `Origin: https://claude.ai`、`Referer: https://platform.claude.com/oauth/authorize?code=true` |
-| token UA | `axios/1.13.6` | 浏览器 UA（macOS Chrome 154） |
-| bootstrap | `entrypoint=claude-code&model=claude-opus-5-5`，UA `claude-cli/… (external, cli)` | `entrypoint=claude-vscode&model=claude-opus-5`，UA `claude-code/…` |
-| Grove | 不动 | bootstrap 后 `PATCH /api/oauth/account/settings {"grove_enabled": true}` |
+| scope | 完整 OAuth（profile/inference/sessions/MCP/file_upload） | `user:inference` 单项——`claude setup-token` 的 `inferenceOnly` |
+| 授权链接 | `claude.com/cai/oauth/authorize?code=true&…` | 同上（CLI 的 `CLAUDE_AI_AUTHORIZE_URL`，307 到 `claude.ai/oauth/authorize`） |
+| token UA | `axios/1.13.6` + Chrome 头 | `axios/1.13.6`，只带 `content-type`（CLI `exchangeCodeForTokens`） |
+| token body | 无 `expires_in` | `expires_in: 31536000`（一年期） |
+| bootstrap | `entrypoint=claude-code&model=claude-opus-5-5`，UA `claude-cli/… (external, cli)` | 先 `entrypoint=claude-vscode&model=claude-opus-5`，UA `claude-code/…`；失败回落 `GET /api/oauth/profile`（CLI 读 setup token 账号的接口），两者都空则保留票据不报错 |
+| Grove | 不动 | 取到票据后 `PATCH /api/oauth/account/settings {"grove_enabled": true}` |
 
 - 每次请求 60 秒上限（`OAUTH_REQUEST_TIMEOUT_MS`），不是整条流程 60 秒；helper 的整体超时按 4 跳留余量。
 - 浏览器阶段发 Chrome 的 HTTP 头（`sec-ch-ua`、`sec-fetch-*`、`accept-language`）。TLS/HTTP2 指纹伪装需要 libcurl/utls 客户端，Node helper 做不到，别把它当已实现。
 - 不保存响应 Cookie：整个流程只主动带 `Cookie: sessionKey`，`Set-Cookie` 一律不落盘（sub2api `SetCookieJar(nil)`）。
 - Grove 的 PATCH 是尽力而为：票据已经绑定该账号，不因为设置同步失败丢掉一次换票。
 - 出口仍是 fail closed：`proxy_url=""` 是本地出口（直连），`null` 是未绑定（`proxy_required`），不因为上游直连就放开。
+- authorize 的来源头会按序回退：上游按调用方 `Origin` 做允许列表，来源不对时是 `403 permission_error: Origin not allowed`（与 sessionKey 失效无关）。`claude.com/cai/oauth/authorize` 已 307 到 `claude.ai/oauth/authorize`，官方 CLI 的 `CLAUDE_AI_ORIGIN` 也是 `https://claude.ai`，所以 `auth.js` 依次尝试「profile 参考来源 → 同一主机的另一来源 → 不带 Origin」；只有这条 Origin 拒绝才换下一组，其它 403 立即失败，全被拒时错误列出尝试过的来源（面板映射成 `origin_rejected`，502）。
+- token 端点两种边缘拒绝单独归类，不再和授权码问题混在一起：`429 rate_limit_error` → `token_exchange_rate_limited`（面板 429，提示等 1 分钟再交同一个码，别连点；持续出现说明该出口 IP 被限速）；`403 Request not allowed` → `token_exchange_forbidden`（面板 502，提示换出口，通常是地区不支持）。
 
 Cookie authorize 的组织 UUID 同时出现在 `/v1/oauth/{uuid}/authorize` 路径和 JSON 的 `organization_uuid` 字段；只有路径 UUID 不够，上游会返回 400 `Invalid request format`。
 
