@@ -17,16 +17,41 @@
 
 ## 工作树
 
-主工作区固定停在 `dev`，只用来 `fetch` 和看代码，不在里面开发。每个任务单开工作树：
+主工作区固定停在 `dev`，只用来 `fetch` 和看代码，不在里面开发。
+
+**创建**：一个任务一个工作树，目录名 `vm2api-wt-<slug>`，与主工作区同级。
 
 ```sh
 git fetch origin
 git worktree add ../vm2api-wt-<slug> -b feat/<slug> origin/dev
-# ……开发、提交、推送、开 PR 到 dev
-git worktree remove ../vm2api-wt-<slug> && git branch -d feat/<slug>   # 合并后
 ```
 
-工作树之间不复制未提交的改动、配置或二进制。
+- 只从 `origin/dev`（hotfix 从 `origin/main`）新建，不从本地旧分支或别的工作树复制。
+- 工作树之间不复制未提交的改动、配置或二进制；需要的依赖在新工作树里重新安装。
+
+**移除时机**：PR 合并（或关闭不做）后当天清理，不留“以后可能用”的工作树。
+
+```sh
+git -C ../vm2api-wt-<slug> status --porcelain    # 必须为空，有改动先确认去留
+git worktree remove ../vm2api-wt-<slug>
+git branch -d feat/<slug>                        # 未合并的分支 -d 会拒绝，先确认再 -D
+git push origin --delete feat/<slug>             # 远端分支未被自动删除时
+git worktree prune
+```
+
+- 有未提交改动、未推送提交或打开中的 PR，不删；先问清楚。
+- 不是工作树的残留目录（`git worktree list` 里没有）只在确认无用后删除。
+- 不删除别人的工作树，不在别人正在使用的工作树里切分支。
+
+## 环境清理
+
+| 时机 | 清理什么 | 保留什么 |
+|---|---|---|
+| PR 合并后 | 该任务的工作树、本地与远端任务分支 | 主工作区 |
+| 每周或磁盘紧张时 | `git worktree prune`、`git fetch --prune`，删除已合并的本地分支 | `dev`、`main`、有未合并改动的分支 |
+| 构建验证完成后 | 临时产物（`/tmp` 下的打包、校验目录，`dist/` 暂存） | 已钉进 `deploy/payload.json` 的发布资产、部署备份 |
+
+清理前先看目标内容；不删 `vms/`、`data/`、设备授权和部署备份。
 
 ## 验证
 
