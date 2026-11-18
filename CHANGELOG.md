@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 原生 handoff 的 realtime 在第一个可见工具字节之前提交当前槽，然后按到达顺序放出工具 start 和每一段 `input_json_delta`。`verified` 仍扣到 EOF。参数到 EOF 不是完整 JSON object 时返回错误，不补成成功 `tool_use`，已提交的流不换槽。
+
 ## 1.4.153 — 2026-11-19 · CRAG 域名切换与回调兼容
 
 - 后续版本的 CRAG 商城、设备激活和宿主订阅请求改指向 `https://www.vm2api.org`。源站继续同时接受 `crag.fkcodex.com`。
