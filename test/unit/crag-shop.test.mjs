@@ -108,6 +108,8 @@ function order(id, status = 'pending') {
   return { ...PLAN, order_id: id, status, payment_method: 'alipay', created_at: 1_800_000_000, redemption_code: CODE }
 }
 
+const LEGACY_SHOP = 'https://crag.fkcodex.com'
+
 function fields(id) {
   return {
     pid: '42',
@@ -193,6 +195,27 @@ test('supplier transport bounds, gateway pairing and response projection', async
   const kpay = 'https://api.kpay.cc/epay/submit.php'
   reply = { ...order(id), url: kpay, data: fields(id) }
   assert.deepEqual((await supplier.create(row, PROOF)).form, { url: kpay, data: fields(id) })
+  reply = {
+    ...order(id),
+    url: ACTION,
+    data: {
+      ...fields(id),
+      notify_url: `${LEGACY_SHOP}/shop/epay/notify`,
+      return_url: `${LEGACY_SHOP}/shop/return`,
+    },
+  }
+  assert.equal((await supplier.create(row, PROOF)).form.data.notify_url, `${LEGACY_SHOP}/shop/epay/notify`)
+  reply = {
+    ...order(id),
+    url: ACTION,
+    data: {
+      ...fields(id),
+      notify_url: `${LEGACY_SHOP}/shop/epay/notify`,
+      return_url: `${SHOP}/shop/return`,
+    },
+  }
+  await assert.rejects(supplier.create(row, PROOF), { code: 'shop_invalid_reply' })
+
   for (const url of [
     'http://gateway.example.test/submit.php',
     `${ACTION}?a=1`,
