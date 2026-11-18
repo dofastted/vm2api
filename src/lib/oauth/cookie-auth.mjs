@@ -7,7 +7,13 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { CAI_AUTHORIZE_URL, CLIENT_ID, FULL_OAUTH_SCOPE, REDIRECT_URI } from './oauth-contract.mjs'
+import {
+  CAI_AUTHORIZE_URL,
+  CLIENT_ID,
+  FULL_OAUTH_SCOPE,
+  OAUTH_REQUEST_TIMEOUT_MS,
+  REDIRECT_URI,
+} from './oauth-contract.mjs'
 import { carryOAuthAttempt, runGuestOAuthAuthService } from './guest-oauth-helper.mjs'
 
 export { CLIENT_ID, REDIRECT_URI }
@@ -256,8 +262,9 @@ export async function exchangeTokenViaCookieAuth({
   // exit at the point of use (prepareSlotOAuth), never from a caller's value.
   proxyUrl = null,
   redirectUri = null,
+  runtimeMode = 'oauth',
   fetchImpl = null,
-  timeoutMs = 15000,
+  timeoutMs = OAUTH_REQUEST_TIMEOUT_MS,
   exec,
   projectRoot,
   routing,
@@ -272,22 +279,25 @@ export async function exchangeTokenViaCookieAuth({
         code_verifier: codeVerifier,
         state: parsed.state,
         redirect_uri: redirectUri || REDIRECT_URI,
+        runtime_mode: runtimeMode,
         timeout_ms: timeoutMs,
       },
       { exec, projectRoot, routing, timeoutMs, proxyPool, runNative: runNativeOAuthAuthService },
     )
   }
   const auth = await loadLocalAuthForTest()
+  const profile = runtimeMode === 'setup-token' ? 'setup-token' : 'sub2api'
   const token = await auth.exchangeAuthorizationCode({
     code: parsed.code,
     codeVerifier,
     state: parsed.state,
+    profile,
     proxyUrl,
     redirectUri: redirectUri || REDIRECT_URI,
     fetchImpl,
     timeoutMs,
   })
-  return auth.completeAuthorizedToken({ token, proxyUrl, fetchImpl, timeoutMs })
+  return auth.completeAuthorizedToken({ token, profile, proxyUrl, fetchImpl, timeoutMs })
 }
 
 export async function sessionKeyToOAuth(
@@ -297,7 +307,7 @@ export async function sessionKeyToOAuth(
     // see exchangeTokenViaCookieAuth: test seam only
     proxyUrl = null,
     fetchImpl = null,
-    timeoutMs = 15000,
+    timeoutMs = OAUTH_REQUEST_TIMEOUT_MS,
     exec,
     projectRoot,
     routing,
@@ -332,6 +342,7 @@ export async function sessionKeyToOAuth(
           return auth.sessionKeyToAuthorizedOAuth({
             sessionKey: sk,
             scope: requestedScope,
+            profile: setup ? 'setup-token' : 'sub2api',
             proxyUrl,
             fetchImpl,
             timeoutMs,
