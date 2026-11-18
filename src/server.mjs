@@ -97,6 +97,7 @@ import { bindPlacement, isNativeNodeVm, nodeImageBuildRunning, warmNodeSlotImage
 import { ClusterError } from './lib/cluster/ssh-link.mjs'
 import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
+import { createSlotDesktop } from './lib/vm/slot-desktop.mjs'
 import { vmLockBusy } from './lib/vm/vm-file.mjs'
 import { isKvmRuntime } from './lib/vm/runtime-kind.mjs'
 import { resolveKernelDataplane } from './lib/vm/slot-engine.mjs'
@@ -1034,6 +1035,7 @@ const slotShell = createSlotShell({
   projectRoot: cfg.paths.project,
   importOauth: commitImportedOauth,
 })
+const slotDesktop = createSlotDesktop({ projectRoot: cfg.paths.project })
 for (const vm of listVms(cfg.paths.project)) {
   if (isCodexVm(vm)) continue
   try {
@@ -1175,6 +1177,7 @@ const handlePanel = createPanelHandler({
   clusterRoutes,
   clusterManager,
   slotShell,
+  slotDesktop,
 })
 
 const gracefulShutdown = createGracefulShutdown({
@@ -1429,6 +1432,7 @@ server.on('upgrade', (req, socket, head) => {
   }
   if (responsesWs.handleUpgrade(req, socket, head)) return
   if (clusterRoutes.handleUpgrade(req, socket, head)) return
+  if (slotDesktop.handleUpgrade(req, socket, head)) return
   if (!slotShell.handleUpgrade(req, socket, head)) socket.destroy()
 })
 gracefulShutdown.setServer(server)

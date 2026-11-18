@@ -2,6 +2,7 @@
  * /admin and /api/panel routes. Login / logout / me and { ok, data }
  * envelopes are unchanged; slot start/reload go through startSlotReady.
  */
+import { setSlotDesktopEnabled, slotDesktopStatus } from '../vm/slot-desktop.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -3671,6 +3672,45 @@ export function createPanelHandler(ctx) {
         if (!result.ok) return json(res, result.status, result)
         return json(res, 200, panel.ok({ synced: true }))
       }
+      // GET /api/panel/vms/:id/desktop — browser desktop companion status
+      if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+\/desktop$/.test(p)) {
+        const vm = getVm(cfg.paths.project, p.split('/')[4])
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
+        try {
+          return json(res, 200, panel.ok(await slotDesktopStatus(vm)))
+        } catch (e) {
+          return json(res, 502, {
+            ok: false,
+            error: { code: 'desktop_status_failed', message: String(e?.message || e) },
+          })
+        }
+      }
+      // POST /api/panel/vms/:id/desktop {enabled} — enable / disable the browser desktop companion
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/desktop$/.test(p)) {
+        const body = await readBody(req, 1024).catch(() => ({}))
+        if (typeof body?.enabled !== 'boolean') {
+          return json(res, 400, { ok: false, error: { code: 'bad_request', message: 'enabled (boolean) required' } })
+        }
+        let result
+        try {
+          result = await setSlotDesktopEnabled(cfg.paths.project, p.split('/')[4], body.enabled)
+        } catch (e) {
+          result = { ok: false, status: 502, code: 'desktop_start_failed', message: String(e?.message || e) }
+        }
+        if (!result.ok) {
+          return json(res, result.status || 409, {
+            ok: false,
+            error: { code: result.code, message: String(result.message || '').slice(0, 240) },
+          })
+        }
+        return json(res, 200, panel.ok({ enabled: result.enabled, state: result.state }))
+      }
+      // POST /api/panel/vms/:id/desktop-ticket — single-use ticket for the desktop RFB WebSocket
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/desktop-ticket$/.test(p)) {
+        const issued = await ctx.slotDesktop.issueTicket(p.split('/')[4])
+        if (!issued.ok) return json(res, issued.status, { ok: false, error: issued.error })
+        return json(res, 200, panel.ok({ ticket: issued.ticket, expires_in: issued.expires_in }))
+      }
       // POST /api/panel/vms/:id/shell-ticket — single-use ticket for the slot terminal WebSocket
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/shell-ticket$/.test(p)) {
         const body = await readBody(req, 1024).catch(() => ({}))
@@ -5475,6 +5515,7 @@ export function createPanelHandler(ctx) {
           schedule_disabled_reason: 'no_credential',
           unschedulable: { reason: 'no_credential', detail: null, at: new Date().toISOString() },
           proxy_cli_enabled: body.proxy_cli_enabled === true,
+          ...(!codexCreate && body.desktop === true ? { desktop: { enabled: true } } : {}),
           proxy_required: false,
           seed_policy: standardSeedPolicy({}, { defaultEnabled: telemetryDefaultEnabled(ctx.routingConfig) }),
           runtime: { type: runtime },
