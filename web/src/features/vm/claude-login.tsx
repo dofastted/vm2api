@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import { Copy, ExternalLink, Keyboard, SquareTerminal } from 'lucide-react'
@@ -44,6 +44,18 @@ export function ClaudeLogin({
   const start = useMutation({ mutationFn: () => prepareLoginTerminal(vm) })
   const code = loginAuthCode(callback)
   const usableUrl = connected && !committed ? url : ''
+
+  // Backstop for a stalled commit: the backend reads the grant and imports the
+  // credential over the node SSH link; if that link wedges, no terminal frame
+  // ever arrives and `submitted` would stay pending forever.
+  useEffect(() => {
+    if (!submitted || committed) return
+    const timer = setTimeout(() => {
+      setSubmitted(false)
+      toast.error('等待凭证确认超时，请检查槽位凭证状态后重试')
+    }, 5 * 60_000)
+    return () => clearTimeout(timer)
+  }, [submitted, committed])
 
   function changeOpen(next: boolean) {
     setOpen(next)
