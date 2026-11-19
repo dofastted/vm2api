@@ -13,7 +13,13 @@ import {
   sharedRoutes,
   unroutedMembers,
 } from '../../src/lib/vm/shared-egress.mjs'
-import { iptablesPlan, sharedIptablesPlan } from '../../src/lib/vm/egress.mjs'
+import {
+  ensureSharedEgressNetwork,
+  inspectSharedEgressNetwork,
+  iptablesPlan,
+  sharedEndpointIps,
+  sharedIptablesPlan,
+} from '../../src/lib/vm/egress.mjs'
 import { parseCidr } from '../../src/lib/vm/subnet-pool.mjs'
 
 const ipInt = (ip) => parseCidr(`${ip}/32`).network
@@ -187,4 +193,159 @@ test('shared rule count does not grow with the number of VMs', () => {
   assert.equal(fiveThousand.del.length, ten.del.length)
   // The count is what makes the node scale; per-VM plans multiply by VM count.
   assert.ok(ten.add.length < 20, `shared plan has ${ten.add.length} rules`)
+})
+
+/**
+ * A docker double that answers both inspect shapes this module uses: the
+ * `subnet|gateway` IPAM query and the container-address query.
+ */
+function fakeDocker({ networks = {}, endpoints = {}, routes = '', createFails = '' } = {}) {
+  const table = { ...networks }
+  const calls = []
+  const run = (args) => {
+    calls.push(args)
+    if (args[0] !== 'network') return { ok: true, stdout: '' }
+    const action = args[1]
+    if (action === 'ls') return { ok: true, stdout: Object.keys(table).join('\n') }
+    if (action === 'inspect') {
+      const fmt = args[3] || ''
+      const name = args[4]
+      if (fmt.includes('.Containers')) {
+        if (!(name in table)) return { ok: false, stderr: 'no such network' }
+        return { ok: true, stdout: (endpoints[name] || []).join(' ') }
+      }
+      if (fmt.includes('|')) {
+        const value = table[name]
+        if (!value) return { ok: false, stderr: 'no such network' }
+        // Arrays model a dual-stack network emitting several IPAM configs.
+        const configs = Array.isArray(value) ? value : [value]
+        return {
+          ok: true,
+          stdout: configs.map((c) => `${c}|${c.includes(':') ? '' : ipGateway(c)}`).join(' '),
+        }
+      }
+      const found = args
+        .slice(4)
+        .map((n) => table[n])
+        .flat()
+        .filter(Boolean)
+      return { ok: true, stdout: found.join(' ') }
+    }
+    if (action === 'create') {
+      const name = args[args.length - 1]
+      if (createFails) return { ok: false, stderr: createFails }
+      const at = args.indexOf('--subnet')
+      table[name] = at >= 0 ? args[at + 1] : '172.17.0.0/16'
+      return { ok: true, stdout: name }
+    }
+    return { ok: true, stdout: '' }
+  }
+  return { run, runIp: () => ({ ok: true, stdout: routes }), calls, table }
+}
+
+const ipGateway = (cidr) => {
+  const c = parseCidr(cidr)
+  return c ? formatIpFromInt(c.network + 1) : ''
+}
+const formatIpFromInt = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join('.')
+
+const optOf = (create, key) => {
+  for (let i = 0; i < create.length - 1; i++) {
+    if (create[i] === '--opt' && String(create[i + 1]).startsWith(`${key}=`)) {
+      return String(create[i + 1]).slice(key.length + 1)
+    }
+  }
+  return null
+}
+
+test('the shared network is created with an explicit /20 and both VM barriers', () => {
+  const d = fakeDocker()
+  const r = ensureSharedEgressNetwork('node-a', d.run, { runIp: d.runIp })
+  assert.equal(r.ok, true)
+  assert.equal(r.reused, false)
+  assert.equal(r.network, sharedNetworkName('node-a'))
+  assert.equal(r.bridge, sharedBridgeName('node-a'))
+  const create = d.calls.find((a) => a[1] === 'create')
+  const at = create.indexOf('--subnet')
+  assert.ok(at >= 0, 'no explicit --subnet; the daemon pool is what runs dry')
+  assert.equal(parseCidr(create[at + 1]).prefix, DEFAULT_SHARED_PREFIX)
+  assert.equal(r.subnet, create[at + 1])
+  // Masquerade would open a way out that the helper's route table never sees.
+  assert.equal(optOf(create, 'com.docker.network.bridge.enable_ip_masquerade'), 'false')
+  // First of the two barriers between VMs on this bridge; sharedIptablesPlan is the second.
+  assert.equal(optOf(create, 'com.docker.network.bridge.enable_icc'), 'false')
+  assert.equal(optOf(create, 'com.docker.network.bridge.name'), sharedBridgeName('node-a'))
+  assert.equal(r.gateway, ipGateway(r.subnet))
+})
+
+test('an existing shared network is reused, not recreated', () => {
+  const name = sharedNetworkName('node-a')
+  const d = fakeDocker({ networks: { [name]: '100.64.16.0/20' } })
+  const r = ensureSharedEgressNetwork('node-a', d.run, { runIp: d.runIp })
+  assert.equal(r.ok, true)
+  assert.equal(r.reused, true)
+  assert.equal(r.subnet, '100.64.16.0/20')
+  // Recreating would renumber every VM already holding an address here.
+  assert.equal(
+    d.calls.filter((a) => a[1] === 'create').length,
+    0,
+    'reuse still called docker network create',
+  )
+})
+
+test('the shared subnet avoids ranges docker and the host already use', () => {
+  const wanted = allocateSharedSubnet('node-a')
+  const d = fakeDocker({ networks: { 'some-other-net': wanted } })
+  const r = ensureSharedEgressNetwork('node-a', d.run, { runIp: d.runIp })
+  assert.equal(r.ok, true)
+  assert.notEqual(r.subnet, wanted)
+  assert.equal(parseCidr(r.subnet).prefix, DEFAULT_SHARED_PREFIX)
+})
+
+test('a dual-stack shared network still yields its IPv4 range', () => {
+  const name = sharedNetworkName('node-a')
+  // Back-to-back IPAM configs parse as neither range unless split apart.
+  const d = fakeDocker({ networks: { [name]: ['fd21:f843::/64', '100.64.16.0/20'] } })
+  const info = inspectSharedEgressNetwork('node-a', d.run)
+  assert.equal(info.subnet, '100.64.16.0/20')
+  assert.equal(info.gateway, '100.64.16.1')
+})
+
+test('a failed create surfaces instead of reporting a network that is not there', () => {
+  const d = fakeDocker({ createFails: 'permission denied' })
+  const r = ensureSharedEgressNetwork('node-a', d.run, { runIp: d.runIp })
+  assert.equal(r.ok, false)
+  assert.match(r.error, /permission denied/)
+})
+
+test('an exhausted pool surfaces rather than falling back to the daemon pool', () => {
+  // A /20 cannot be placed inside a /24 of pool space.
+  const d = fakeDocker({ routes: '100.64.0.0/10 dev eth0' })
+  const r = ensureSharedEgressNetwork('node-a', d.run, { runIp: d.runIp })
+  assert.equal(r.ok, false)
+  // Falling back would re-create the exhaustion this module exists to avoid.
+  assert.equal(d.calls.filter((a) => a[1] === 'create').length, 0)
+})
+
+test('endpoint addresses on the shared network are read from live state', () => {
+  const name = sharedNetworkName('node-a')
+  const d = fakeDocker({
+    networks: { [name]: '100.64.16.0/20' },
+    endpoints: { [name]: ['100.64.16.5/20', '100.64.16.9/20'] },
+  })
+  const live = sharedEndpointIps('node-a', d.run)
+  assert.equal(live.ok, true)
+  assert.deepEqual(live.items, ['100.64.16.5', '100.64.16.9'])
+  // Those addresses must steer the allocator away from handing them out twice.
+  const next = allocateHostIp('vm-new', { subnet: '100.64.16.0/20', taken: live.items })
+  assert.ok(!live.items.includes(next))
+})
+
+test('an unreadable shared network is not reported as empty', () => {
+  const d = fakeDocker()
+  const live = sharedEndpointIps('node-a', d.run)
+  // ok:false, not an empty list: "cannot read" must not look like "nothing
+  // there", or the allocator would hand out addresses already in use.
+  assert.equal(live.ok, false)
+  assert.deepEqual(live.items, [])
 })

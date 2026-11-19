@@ -14,7 +14,8 @@ import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { toHostPath } from './host-path.mjs'
 import { socksProxyUrl } from './socks-address.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
-import { collectTakenSubnets, createSubnetAllocator, gatewayOf, subnetPoolConfig } from './subnet-pool.mjs'
+import { collectTakenSubnets, createSubnetAllocator, gatewayOf, parseCidr, subnetPoolConfig } from './subnet-pool.mjs'
+import { allocateSharedSubnet, sharedBridgeName, sharedNetworkName } from './shared-egress.mjs'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
 export const LOCAL_EGRESS_ID = 'px-local'
@@ -227,8 +228,14 @@ export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
  * the nat chain, and a FORWARD DROP that only fires on `! -d subnet`. On a /28
  * holding one VM and its gateway that allows nothing. On a shared /20 it would
  * let every VM on the node reach every other VM directly, and that path never
- * touches the helper, so the route table cannot refuse it. The isolation rule is
- * what keeps the helper the only way out.
+ * reaches the helper, so the route table cannot refuse it.
+ *
+ * The network is created with `enable_icc=false`, so Docker's own isolation
+ * chain drops that traffic too. This rule is the second of the two: it lives in
+ * FORWARD rather than in Docker's chains, so it still stands if those are
+ * rebuilt, and it does not depend on which isolation chain a given Docker
+ * version installs. Both are cheap and the failure they prevent is one VM
+ * reaching another tenant's VM, so neither is relied on alone.
  *
  * It does not affect a VM reaching the internet (REDIRECT delivers that locally,
  * so it never reaches FORWARD) or the helper itself (addressed to the gateway).
@@ -515,6 +522,102 @@ export function ensureEgressNetwork(proxyId, run = docker, { runIp = ipRoute } =
   const info = inspectEgressNetwork(proxyId, run)
   if (!info?.subnet) return { ok: false, error: 'egress network missing subnet' }
   return { ok: true, ...info, reused: false }
+}
+
+/**
+ * Inspect the node's one shared egress network.
+ *
+ * Reads the IPv4 config only: a dual-stack network emits its ranges back to
+ * back, so taking the first field whole would parse as neither.
+ */
+export function inspectSharedEgressNetwork(nodeId, run = docker) {
+  const name = sharedNetworkName(nodeId)
+  const r = run(['network', 'inspect', '-f', '{{range .IPAM.Config}}{{.Subnet}}|{{.Gateway}} {{end}}', name])
+  if (!r.ok) return null
+  let subnet = ''
+  let gateway = ''
+  for (const pair of String(r.stdout || '').trim().split(/\s+/)) {
+    const [net, gw] = pair.split('|')
+    if (parseCidr(String(net || '').trim())?.prefix === undefined) continue
+    subnet = String(net || '').trim()
+    gateway = String(gw || '').trim()
+    break
+  }
+  if (!subnet) return null
+  return {
+    name,
+    network: name,
+    subnet,
+    gateway: gateway || gatewayFromSubnet(subnet),
+    bridge: sharedBridgeName(nodeId),
+    shared: true,
+  }
+}
+
+/**
+ * The node's one shared egress network, created on first use.
+ *
+ * Masquerade stays off for the same reason as a per-VM egress network: every
+ * VM leaves through the helper's REDIRECT, so letting the bridge NAT would open
+ * a way out that the route table never sees. `enable_icc=false` is the first of
+ * the two barriers between VMs sharing this bridge; `sharedIptablesPlan` adds
+ * the second.
+ *
+ * The /20 is allocated against live Docker and route state, like a per-VM
+ * subnet, and an exhausted pool surfaces rather than silently falling back to
+ * the daemon pool whose exhaustion is the reason this exists.
+ */
+export function ensureSharedEgressNetwork(nodeId, run = docker, { runIp = ipRoute } = {}) {
+  const name = sharedNetworkName(nodeId)
+  const br = sharedBridgeName(nodeId)
+  const existing = inspectSharedEgressNetwork(nodeId, run)
+  if (existing?.subnet) return { ok: true, ...existing, reused: true }
+  let subnet = ''
+  try {
+    const { pool } = subnetPoolConfig()
+    subnet = allocateSharedSubnet(nodeId, { pool, taken: collectTakenSubnets({ runDocker: run, runIp }) })
+  } catch (e) {
+    return { ok: false, error: e?.message || 'shared subnet allocation failed', code: e?.code || 'shared_subnet_failed' }
+  }
+  const gateway = gatewayOf(subnet)
+  const created = run([
+    'network',
+    'create',
+    '--ipv6=false',
+    '--subnet',
+    subnet,
+    ...(gateway ? ['--gateway', gateway] : []),
+    '--opt',
+    `com.docker.network.bridge.name=${br}`,
+    '--opt',
+    'com.docker.network.bridge.enable_ip_masquerade=false',
+    '--opt',
+    'com.docker.network.bridge.enable_icc=false',
+    name,
+  ])
+  if (!created.ok && !/already exists/i.test(created.stderr || '')) {
+    return { ok: false, error: created.stderr || 'docker network create failed' }
+  }
+  const info = inspectSharedEgressNetwork(nodeId, run)
+  if (!info?.subnet) return { ok: false, error: 'shared egress network missing subnet' }
+  return { ok: true, ...info, reused: false }
+}
+
+/**
+ * Addresses already held by endpoints on the shared network, for the host-bit
+ * allocator. Read from live state rather than a registry, so a VM removed
+ * outside the control plane frees its address.
+ */
+export function sharedEndpointIps(nodeId, run = docker) {
+  const name = sharedNetworkName(nodeId)
+  const r = run(['network', 'inspect', '-f', '{{range .Containers}}{{.IPv4Address}} {{end}}', name])
+  if (!r.ok) return { ok: false, items: [] }
+  const items = []
+  for (const token of String(r.stdout || '').trim().split(/\s+/)) {
+    const ip = String(token || '').split('/')[0].trim()
+    if (ip) items.push(ip)
+  }
+  return { ok: true, items }
 }
 
 function applyIptables(plan, runIptables = iptables) {
