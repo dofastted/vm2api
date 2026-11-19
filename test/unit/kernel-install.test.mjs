@@ -1423,3 +1423,46 @@ test('a forced cancel stops the installer at its next checkpoint without startin
   assert.deepEqual(listActiveKernelInstalls(), [])
   assert.equal(cancelKernelInstall(vm.id).code, 'kernel_install_not_running')
 })
+
+test('a kernel start failure keeps the runtime cause on the result and the install record', async (t) => {
+  const { root, vm } = fixture(t)
+  const result = await installKernelTargets({
+    projectRoot: root,
+    targets: target('cli-node'),
+    ops: lifecycle(root, {
+      // Container came up; the kernel behind it did not. The cause lives on boot.rust.
+      startSlotReady: () => ({
+        ok: true,
+        rust_ok: false,
+        rust: {
+          ok: false,
+          code: 'kernel_health_timeout',
+          error: 'Legacy telemetry process did not stop',
+          rust: { ok: false, reason: 'legacy_telemetry_stop_failed' },
+        },
+      }),
+    }).ops,
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.items[0].code, 'kernel_health_timeout', JSON.stringify(result))
+  assert.equal(result.items[0].error, 'Legacy telemetry process did not stop')
+  const operation = getVm(root, vm.id).kernel_operation
+  assert.equal(operation.phase, 'failed')
+  assert.equal(operation.code, 'kernel_start_failed', 'the phase stays the record code')
+  assert.equal(operation.failure.code, 'kernel_health_timeout')
+  assert.equal(operation.failure.error, 'Legacy telemetry process did not stop')
+  assert.equal(operation.failure.reason, 'legacy_telemetry_stop_failed')
+  assert.ok(Date.parse(operation.failure.at) > 0)
+})
+
+test('a start failure without runtime detail still reports the generic phase', async (t) => {
+  const { root, vm } = fixture(t)
+  const result = await installKernelTargets({
+    projectRoot: root,
+    targets: target('cli-node'),
+    ops: lifecycle(root, { startSlotReady: () => ({ ok: true, rust_ok: false }) }).ops,
+  })
+  assert.equal(result.items[0].code, 'kernel_start_failed')
+  assert.equal(result.items[0].error, '内核重启或健康检查失败')
+  assert.equal(getVm(root, vm.id).kernel_operation.failure.reason, null)
+})
