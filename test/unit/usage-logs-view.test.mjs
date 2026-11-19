@@ -344,7 +344,7 @@ test('overview splits today/yesterday-same-time in the requested zone', () => {
   assert.equal(utc.yesterdayRequests, 1)
 })
 
-test('active sessions and session suggestions group by outbound session, owner-scoped, newest first', () => {
+test('active sessions group by caller session, owner-scoped, newest first; suggestions stay per outbound session', () => {
   const db = freshDb()
   const now = Date.now()
   const iso = (ago) => new Date(now - ago).toISOString()
@@ -373,21 +373,18 @@ test('active sessions and session suggestions group by outbound session, owner-s
   ])
   const view = new UsageLogsView(db)
   const active = view.activeSessions({ owner_user_id: 'u1', now })
-  assert.equal(active.total, 2)
+  assert.equal(active.total, 1)
   assert.deepEqual(
     active.sessions.map((s) => [s.sessionId, s.clientSessionId, s.requests]),
-    [
-      ['abc-1b', 'client-1', 1],
-      ['abc-1', 'client-1', 2],
-    ],
+    [['client-1', 'client-1', 3]],
   )
-  assert.equal(active.sessions[1].lastStatus, 200)
-  assert.equal(active.sessions[1].keyName, 'alice-key')
-  assert.equal(view.activeSessions({ now }).total, 3)
+  assert.equal(active.sessions[0].lastStatus, 200)
+  assert.equal(active.sessions[0].keyName, 'alice-key')
+  assert.equal(view.activeSessions({ now }).total, 2)
   assert.deepEqual(view.sessionSuggestions({ q: 'abc', owner_user_id: 'u1' }), ['abc-1b', 'abc-1', 'abc-3'])
   assert.deepEqual(view.sessionSuggestions({ q: 'abc-2' }), ['abc-2'])
   assert.deepEqual(view.sessionSuggestions({ q: 'client' }), [])
-  assert.equal(view.overview({ now }).activeSessions, 3)
+  assert.equal(view.overview({ now }).activeSessions, 2)
 })
 
 test('active sessions never resolve the last row from another tenant sharing the session id', () => {

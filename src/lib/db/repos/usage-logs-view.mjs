@@ -30,6 +30,8 @@ const SCAN_CAP = 2000
 const SUMMARY_SCAN_CAP = 5000
 /** Recent rows mined for distinct filter values / empty-prefix session suggestions. */
 const RECENT_SCAN = 5000
+/** One conversation = the caller's session id; rows without one fall back to the outbound id. */
+const CONVERSATION_KEY_SQL = "COALESCE(NULLIF(session_id, ''), outbound_session_id)"
 const OPTION_LIMIT = 200
 const EXPORT_LIMIT_DEFAULT = 2000
 const EXPORT_LIMIT_MAX = 5000
@@ -712,7 +714,12 @@ export class UsageLogsView {
       .map((r) => r.sid)
   }
 
-  /** Outbound sessions with a completed request in the last `minutes`. */
+  /**
+   * Conversations with a completed request in the last `minutes`, grouped by the
+   * caller's session_id (falling back to the outbound id). Grouping by outbound id
+   * splits one conversation into many: side requests (title / topic / suggestion
+   * forks) mint their own session id while sharing the main prompt cache.
+   */
   activeSessions({ minutes = 5, limit = 50, owner_user_id = null, now = Date.now() } = {}) {
     const mins = clampInt(minutes, 1, 1440, 5)
     const n = clampInt(limit, 1, 200, 50)
@@ -725,21 +732,21 @@ export class UsageLogsView {
     }
     const cond = `WHERE ${where.join(' AND ')}`
     const total = this.db
-      .prepare(`SELECT COUNT(DISTINCT outbound_session_id) AS n FROM usage_logs ${cond}`)
+      .prepare(`SELECT COUNT(DISTINCT ${CONVERSATION_KEY_SQL}) AS n FROM usage_logs ${cond}`)
       .get(...params).n
     // Aggregate first, then pull the newest row per session by id; SQLite's
     // bare-column-with-MAX shortcut is undefined once MIN() is also present.
     const rows = this.db
       .prepare(`
       WITH s AS (
-        SELECT outbound_session_id AS sid,
+        SELECT ${CONVERSATION_KEY_SQL} AS sid,
                MAX(created_at) AS last_at,
                MIN(created_at) AS first_at,
                COUNT(*) AS requests,
                SUM(IFNULL(input_tokens, 0) + IFNULL(output_tokens, 0) + IFNULL(cache_read_tokens, 0) + IFNULL(cache_creation_tokens, 0)) AS tokens,
                COALESCE(SUM(total_cost), 0) AS cost
         FROM usage_logs ${cond}
-        GROUP BY outbound_session_id
+        GROUP BY ${CONVERSATION_KEY_SQL}
         ORDER BY last_at DESC
         LIMIT ?
       )
@@ -748,7 +755,7 @@ export class UsageLogsView {
       FROM s
       JOIN usage_logs l ON l.id = (
         SELECT id FROM usage_logs
-        WHERE outbound_session_id = s.sid AND created_at = s.last_at${own.sql ? ` AND ${own.sql}` : ''}
+        WHERE ${CONVERSATION_KEY_SQL} = s.sid AND created_at = s.last_at${own.sql ? ` AND ${own.sql}` : ''}
         ORDER BY id DESC LIMIT 1
       )
       ORDER BY s.last_at DESC
@@ -815,7 +822,7 @@ export class UsageLogsView {
                COALESCE(SUM(${PROMPT_TOKENS_SQL}), 0) AS prompt_tokens,
                AVG(duration_ms) AS avg_duration_ms,
                AVG(first_token_ms) AS avg_ttft_ms,
-               COUNT(DISTINCT outbound_session_id) AS sessions
+               COUNT(DISTINCT CASE WHEN outbound_session_id IS NOT NULL THEN ${CONVERSATION_KEY_SQL} END) AS sessions
         FROM usage_logs WHERE ${where.join(' AND ')}
       `)
         .get(...params)
