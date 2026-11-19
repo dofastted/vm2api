@@ -87,6 +87,41 @@ export function sharedEgressNodeId(proxyId) {
   return id.startsWith(`${SHARED_EGRESS_PREFIX}-`) ? id.slice(SHARED_EGRESS_PREFIX.length + 1) : ''
 }
 
+export const NETWORK_MODES = Object.freeze(['per-vm', 'shared'])
+
+export function normalizeNetworkMode(value, fallback = 'per-vm') {
+  const mode = String(value || '').trim()
+  return NETWORK_MODES.includes(mode) ? mode : fallback
+}
+
+/**
+ * A VM's own mode, recorded on the VM rather than read from the setting.
+ *
+ * This is the difference that makes the switch safe to turn off. The setting
+ * decides the mode a VM is *created* with; after that the VM carries it. Were
+ * the mode read live, flipping the setting back to per-vm would make the
+ * control plane look for a per-VM bridge for a VM whose container is attached
+ * to the shared network at a fixed address — it would be rebuilt onto a
+ * different network, or simply not found. An existing VM therefore keeps the
+ * mode it was built with, and a VM with nothing recorded is per-vm, which is
+ * every VM that exists today.
+ */
+export function networkModeOf(vm) {
+  return normalizeNetworkMode(vm?.runtime?.network_mode)
+}
+
+export function isSharedModeVm(vm) {
+  return networkModeOf(vm) === 'shared'
+}
+
+/**
+ * Which node's shared network a VM belongs to. Cluster VMs carry a node id;
+ * a VM on the control plane host has none, and shares that host's network.
+ */
+export function sharedNodeIdForVm(vm) {
+  return String(vm?.node_id || '').trim()
+}
+
 /**
  * The node's shared subnet. Allocated before any per-VM subnet and reserved
  * against that allocator, because a /20 carved out of an already-fragmented pool

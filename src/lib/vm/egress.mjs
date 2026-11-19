@@ -17,16 +17,27 @@ import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 import { collectTakenSubnets, createSubnetAllocator, gatewayOf, parseCidr, subnetPoolConfig } from './subnet-pool.mjs'
 import {
   allocateSharedSubnet,
+  isSharedModeVm,
+  normalizeNetworkMode,
   sharedBridgeName,
   sharedChainName,
   sharedEgressId,
   sharedNetworkName,
+  sharedNodeIdForVm,
   sharedRoutes,
   unroutedMembers,
 } from './shared-egress.mjs'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
 export const LOCAL_EGRESS_ID = 'px-local'
+
+/**
+ * Descriptor ceiling for a helper container. See the `--ulimit` comment in
+ * egressContainerSpec for why it is a constant rather than a function of how
+ * many VMs the helper serves.
+ */
+export const EGRESS_NOFILE = 1048576
+
 const LOCAL_EGRESS_NODE_PREFIX = `${LOCAL_EGRESS_ID}-`
 
 /**
@@ -814,6 +825,17 @@ export function egressContainerSpec({
     'local',
     '--log-opt',
     'max-size=10m',
+    // Each spliced connection holds two descriptors, and a shared helper holds
+    // them for every VM on the node rather than for one. The daemon default
+    // (often 1024 soft) is ample for a per-VM helper and the first thing a
+    // shared one hits.
+    //
+    // Fixed, not derived from how many VMs there are: this is a container
+    // argument, so a limit that tracked membership would force a new container
+    // every time a VM joined — exactly the rebuild the SIGHUP reload avoids. A
+    // descriptor table grows lazily, so an unused ceiling costs nothing.
+    '--ulimit',
+    `nofile=${EGRESS_NOFILE}:${EGRESS_NOFILE}`,
     '--label',
     'kin.egress=1',
     '--label',
@@ -1691,7 +1713,54 @@ export function stopProxyEgress(projectRoot, proxyId, { subnet, runDocker = dock
   return { ok: true }
 }
 
+/**
+ * The mode a newly created VM is given.
+ *
+ * Opt-in: a node only folds onto one bridge once someone turns it on. The plan
+ * called for new VMs to default to shared, but that would move every VM created
+ * after this merge onto a path no real fleet has run yet, with no step in
+ * between. An operator can switch one host on, watch it, and switch it back —
+ * and the mode a VM already holds is unaffected either way, since that is
+ * recorded on the VM.
+ */
+export function configuredNetworkMode() {
+  if (!isDbOpen()) return 'per-vm'
+  try {
+    return normalizeNetworkMode(new SettingsRepo(getDb()).get('proxy_pool_config')?.egress_network_mode)
+  } catch {
+    return 'per-vm'
+  }
+}
+
+/** The address a shared-network VM was given, recorded on the VM. */
+export function sharedIpOf(vm) {
+  return String(vm?.runtime?.shared_ip || '').trim()
+}
+
+/**
+ * Docker network arguments for a VM's slot container.
+ *
+ * A shared-network VM is addressed explicitly, because the helper's route table
+ * is keyed on that exact address. Letting Docker assign one would put the VM on
+ * the bridge with an address no route names — refused fail-closed, which is the
+ * good case — or with an address another VM's route names, which is not. So a
+ * shared VM with no recorded address is an error here rather than a container
+ * that boots onto the wrong footing.
+ */
+export function slotNetworkArgs(vm) {
+  const network = slotNetworkForVm(vm)
+  if (!network) return { ok: false, error: 'bound SOCKS5 network required; refusing host/bridge fallback' }
+  if (!isSharedModeVm(vm)) return { ok: true, network, args: ['--network', network] }
+  const ip = sharedIpOf(vm)
+  if (!ip) return { ok: false, error: 'shared_ip_missing' }
+  return { ok: true, network, ip, args: ['--network', network, '--ip', ip] }
+}
+
 export function slotNetworkForVm(vm, _env = process.env) {
+  // The VM's own mode, not the setting: a VM attached to the shared network at
+  // a fixed address must keep resolving to it even after the setting is turned
+  // back off.
+  if (isSharedModeVm(vm)) return sharedNetworkName(sharedNodeIdForVm(vm))
   const id = vm?.proxy?.id
   if (!id) return ''
   return networkName(id)

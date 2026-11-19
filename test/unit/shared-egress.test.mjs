@@ -9,7 +9,10 @@ import {
   allocateSharedSubnet,
   hostRange,
   isSharedEgressId,
+  isSharedModeVm,
   isSharedNetwork,
+  networkModeOf,
+  normalizeNetworkMode,
   sharedBridgeName,
   sharedCapacity,
   sharedChainName,
@@ -20,21 +23,28 @@ import {
   unroutedMembers,
 } from '../../src/lib/vm/shared-egress.mjs'
 import {
+  EGRESS_NOFILE,
   egressBinFingerprint,
   egressConfigBody,
   egressConfigFor,
   egressContainerSpec,
   egressRunDir,
+  configuredNetworkMode,
+  networkName,
   ensureSharedEgressNetwork,
   inspectSharedEgressNetwork,
   iptablesPlan,
   sharedEndpointIps,
+  sharedIpOf,
   sharedIptablesPlan,
+  slotNetworkArgs,
+  slotNetworkForVm,
   startEgressProcess,
   startSharedEgress,
   stopSharedEgress,
 } from '../../src/lib/vm/egress.mjs'
 import { parseCidr } from '../../src/lib/vm/subnet-pool.mjs'
+import { buildKvmRunArgs } from '../../src/lib/vm/vm-runtime.mjs'
 
 const ipInt = (ip) => parseCidr(`${ip}/32`).network
 
@@ -629,4 +639,129 @@ test('a VM leaving also reaches the helper', async (t) => {
   // A departed VM left in the table keeps an exit reachable by an address that
   // may since have been handed to someone else.
   assert.deepEqual(JSON.parse(fs.readFileSync(h.cfgPath, 'utf8')).routes, ROUTE_ONE)
+})
+
+test('a helper container raises its descriptor ceiling', (t) => {
+  const h = runningHelper(t, ROUTE_ONE)
+  const spec = egressContainerSpec({
+    proxyId: h.proxyId,
+    body: '{}\n',
+    hostDir: '/d',
+    hostBinDir: '/b',
+    binName: 'kin-egress',
+    image: 'kin:test',
+    binFingerprint: 'fp',
+  })
+  const at = spec.args.indexOf('--ulimit')
+  assert.ok(at >= 0, 'a shared helper holds every VM’s sockets against the daemon default')
+  assert.equal(spec.args[at + 1], `nofile=${EGRESS_NOFILE}:${EGRESS_NOFILE}`)
+  assert.ok(EGRESS_NOFILE >= 65536, `nofile=${EGRESS_NOFILE} is too low for a node-wide helper`)
+})
+
+test('the descriptor ceiling does not enter the container rebuild key', (t) => {
+  // It is a container argument but deliberately a constant: were it derived
+  // from membership it would change the digest and force a rebuild — and with
+  // it every live connection — each time a VM joined.
+  const h = runningHelper(t, ROUTE_ONE)
+  const digestOf = (routes) => h.digestFor(routes)
+  assert.equal(digestOf(ROUTE_ONE), digestOf(ROUTE_TWO))
+})
+
+test('an unrecognised or absent network mode is per-vm', () => {
+  assert.equal(normalizeNetworkMode('shared'), 'shared')
+  assert.equal(normalizeNetworkMode('per-vm'), 'per-vm')
+  for (const bad of ['', null, undefined, 'Shared', 'host', 'bridge', 'per_vm']) {
+    assert.equal(normalizeNetworkMode(bad), 'per-vm', `${JSON.stringify(bad)} was not treated as per-vm`)
+  }
+  // Every VM that exists today has nothing recorded, and must stay per-vm.
+  assert.equal(networkModeOf({ proxy: { id: 'px-a1b2c3d4' } }), 'per-vm')
+  assert.equal(networkModeOf({ runtime: {} }), 'per-vm')
+  assert.ok(!isSharedModeVm({ runtime: { network_mode: 'per-vm' } }))
+  assert.ok(isSharedModeVm({ runtime: { network_mode: 'shared' } }))
+})
+
+test('a VM resolves to the network its own mode names', () => {
+  const perVm = { proxy: { id: 'px-a1b2c3d4' } }
+  assert.equal(slotNetworkForVm(perVm), networkName('px-a1b2c3d4'))
+
+  const shared = { proxy: { id: 'px-a1b2c3d4' }, runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' } }
+  assert.equal(slotNetworkForVm(shared), sharedNetworkName(''))
+  // A cluster VM belongs to its own node's shared network.
+  assert.equal(
+    slotNetworkForVm({ ...shared, node_id: 'node-a' }),
+    sharedNetworkName('node-a'),
+  )
+})
+
+test('a shared VM is attached at its recorded address, never one Docker picks', () => {
+  const shared = { proxy: { id: 'px-a1b2c3d4' }, runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' } }
+  const args = slotNetworkArgs(shared)
+  assert.equal(args.ok, true)
+  assert.deepEqual(args.args, ['--network', sharedNetworkName(''), '--ip', '100.64.16.3'])
+  assert.equal(sharedIpOf(shared), '100.64.16.3')
+
+  // A per-VM slot is alone on its bridge, so it keeps letting Docker assign.
+  const perVm = slotNetworkArgs({ proxy: { id: 'px-a1b2c3d4' } })
+  assert.deepEqual(perVm.args, ['--network', networkName('px-a1b2c3d4')])
+  assert.equal(perVm.ip, undefined)
+})
+
+test('a shared VM with no recorded address refuses to start', () => {
+  // Booting it anyway puts it on the bridge with an address no route names, or
+  // worse, one another VM's route names.
+  const r = slotNetworkArgs({ proxy: { id: 'px-a1b2c3d4' }, runtime: { network_mode: 'shared' } })
+  assert.equal(r.ok, false)
+  assert.equal(r.error, 'shared_ip_missing')
+  assert.equal(r.args, undefined)
+})
+
+test('a VM already on the shared network is unaffected by the mode setting', () => {
+  // The setting decides what a new VM is built as; this VM carries its own
+  // mode, so turning the setting off does not send the control plane looking
+  // for a per-VM bridge that was never created for it.
+  const shared = { proxy: { id: 'px-a1b2c3d4' }, runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' } }
+  assert.equal(slotNetworkForVm(shared), sharedNetworkName(''))
+  // configuredNetworkMode reads settings; with no DB open it is the safe default.
+  assert.equal(configuredNetworkMode(), 'per-vm')
+})
+
+test('the kvm slot container carries the fixed address through', () => {
+  const args = buildKvmRunArgs({
+    vm: { id: 'vm-1', runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' } },
+    name: 'kin-vm-1',
+    image: 'kin:test',
+    hostName: 'vm-1',
+    network: sharedNetworkName(''),
+    ip: '100.64.16.3',
+    memory: '2g',
+    uid: 1000,
+    gid: 1000,
+    home: '/home/x',
+    runDir: '/run/x',
+    kvmDir: '/run/x/kvm',
+    projectRoot: '/tmp/root',
+  })
+  const at = args.indexOf('--ip')
+  assert.ok(at >= 0, 'the kvm slot was attached without its fixed address')
+  assert.equal(args[at + 1], '100.64.16.3')
+  // Right after --network, so it applies to that attachment.
+  assert.equal(args[args.indexOf('--network') + 2], '--ip')
+})
+
+test('a per-vm kvm slot gets no address argument', () => {
+  const args = buildKvmRunArgs({
+    vm: { id: 'vm-1' },
+    name: 'kin-vm-1',
+    image: 'kin:test',
+    hostName: 'vm-1',
+    network: networkName('px-a1b2c3d4'),
+    memory: '2g',
+    uid: 1000,
+    gid: 1000,
+    home: '/home/x',
+    runDir: '/run/x',
+    kvmDir: '/run/x/kvm',
+    projectRoot: '/tmp/root',
+  })
+  assert.equal(args.indexOf('--ip'), -1)
 })

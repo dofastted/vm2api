@@ -40,7 +40,7 @@ import { cragV2KernelWrapperScript, installedCragV2Root, materializeResolvedKern
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
 import { ensureSlotComputer, rememberComputer } from '../identity/slot-computer.mjs'
 import { coerceRfc4122Uuid } from '../identity/rfc4122-uuid.mjs'
-import { boundProxyUrl, ensureProxyEgress, isLocalEgressProxy, slotNetworkForVm } from './egress.mjs'
+import { boundProxyUrl, ensureProxyEgress, isLocalEgressProxy, slotNetworkArgs, slotNetworkForVm } from './egress.mjs'
 import { socksProxyEndpoint } from './socks-address.mjs'
 import { assertProxyAllowed } from './proxy-policy.mjs'
 import { toHostPath } from './host-path.mjs'
@@ -1144,6 +1144,9 @@ export function buildKvmRunArgs({
   image,
   hostName,
   network,
+  // Set for a shared-network VM: the helper's route table is keyed on this
+  // exact address, so it cannot be left to Docker.
+  ip = '',
   memory,
   accel,
   uid,
@@ -1176,6 +1179,7 @@ export function buildKvmRunArgs({
     hostName,
     '--network',
     network,
+    ...(ip ? ['--ip', ip] : []),
     '--restart',
     slotRestartPolicy(vm, routing),
     '--stop-timeout',
@@ -1433,8 +1437,10 @@ async function startVmRuntimeAdmitted(
   } catch {}
   const machineIdFile = ensureGuestMachineIdFile(projectRoot, vm)
   const hostOf = (p) => toHostPath(p, { projectRoot })
-  const netName = slotNetworkForVm(vm)
-  if (!netName || netName === 'host' || netName === 'bridge') {
+  const slotNet = slotNetworkArgs(vm)
+  if (!slotNet.ok) return slotNet
+  const netName = slotNet.network
+  if (netName === 'host' || netName === 'bridge') {
     return { ok: false, error: 'bound SOCKS5 network required; refusing host/bridge fallback' }
   }
 
@@ -1451,6 +1457,7 @@ async function startVmRuntimeAdmitted(
       image,
       hostName: host,
       network: netName,
+      ip: slotNet.ip || '',
       memory: mem,
       accel: accelOpt,
       uid: runtimeUidNum(vm),
@@ -1496,8 +1503,7 @@ async function startVmRuntimeAdmitted(
       name,
       '--hostname',
       host,
-      '--network',
-      netName,
+      ...slotNet.args,
       '--restart',
       slotRestartPolicy(vm, resolvedRouting),
       ...dockerSlotResourceArgs(vm, resolvedRouting),
