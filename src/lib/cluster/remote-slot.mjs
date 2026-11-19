@@ -28,6 +28,7 @@ import {
   portsForProxy,
   proxyKey,
 } from '../vm/egress.mjs'
+import { parseCidr, parseRouteSubnets, createSubnetAllocator, gatewayOf, subnetPoolConfig } from '../vm/subnet-pool.mjs'
 import { OS_CATALOG } from '../vm/os-catalog.mjs'
 import {
   REMOTE_CRAG_ENTRY,
@@ -68,6 +69,7 @@ import {
   imagePresent,
   inspectContainerOrNull,
   inspectNetworkOrNull,
+  listNetworks,
   connectContainerToNetwork,
   disconnectContainerFromNetwork,
   removeContainer,
@@ -387,14 +389,63 @@ export function remoteIptablesScript(plan, { sudo = false } = {}) {
   return out.join('\n')
 }
 
-async function ensureRemoteNetwork(docker, { name, bridge, masquerade, labels = {} }) {
+/**
+ * IPAM body for a node network, given what the node already holds. Pure, so the
+ * allocation contract is testable without standing up a docker connection.
+ *
+ * Keyed on the network name, so a rebuild lands on the same range. Subnets are
+ * per-node: VMs never talk to each other (enable_icc=false) and an IP is not a
+ * VM's durable identity, so two nodes may hold the same range.
+ */
+export function remoteEgressIpam({ name, networks = [], routes = '' } = {}) {
+  const taken = []
+  for (const net of networks) {
+    for (const cfg of net?.IPAM?.Config || []) {
+      const cidr = parseCidr(cfg?.Subnet)
+      if (cidr) taken.push(cidr)
+    }
+  }
+  taken.push(...parseRouteSubnets(routes))
+  const { pool, prefix } = subnetPoolConfig()
+  // A drained pool propagates: falling back here would only hide the same failure.
+  const subnet = createSubnetAllocator({ pool, prefix, taken }).allocate(name)
+  const gateway = gatewayOf(subnet)
+  return { Driver: 'default', Config: [{ Subnet: subnet, ...(gateway ? { Gateway: gateway } : {}) }] }
+}
+
+/**
+ * Explicit subnet for a node network. Created without one, docker draws from the
+ * daemon's `default-address-pools`, which runs dry after a few dozen networks —
+ * the reason a node stops creating exits past ~200 VMs, since a SOCKS slot holds
+ * one network each.
+ */
+async function remoteSubnetIpam(docker, name, runIp) {
+  let networks
+  try {
+    networks = await listNetworks(docker)
+  } catch {
+    // No conflict data means no safe explicit choice; let the daemon pool decide.
+    return null
+  }
+  let routes = ''
+  if (typeof runIp === 'function') {
+    try {
+      routes = await runIp()
+    } catch {}
+  }
+  return remoteEgressIpam({ name, networks, routes })
+}
+
+async function ensureRemoteNetwork(docker, { name, bridge, masquerade, labels = {}, runIp } = {}) {
   let info = await inspectNetworkOrNull(docker, name)
   if (!info) {
+    const ipam = await remoteSubnetIpam(docker, name, runIp)
     await createNetwork(docker, {
       Name: name,
       Driver: 'bridge',
       EnableIPv6: false,
       Labels: labels,
+      ...(ipam ? { IPAM: ipam } : {}),
       Options: {
         'com.docker.network.bridge.name': bridge,
         'com.docker.network.bridge.enable_ip_masquerade': masquerade ? 'true' : 'false',
@@ -511,6 +562,7 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
       name: networkName(id),
       bridge: bridgeName(id),
       masquerade: true,
+      runIp: () => runRemote(session.client, 'ip route'),
     })
     return { ok: true, mode: 'local', network: net.name, egress: null }
   }
@@ -532,6 +584,7 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
     bridge: names.bridge,
     masquerade: false,
     labels: { 'kin.egress.vm': vm.id },
+    runIp: () => runRemote(session.client, 'ip route'),
   })
   const cfg = {
     proxy_id: proxyId,
