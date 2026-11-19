@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.19-oauth-eval",
+  "release": "payload-2026.11.19-oauth-config",
   "crag_release": "payload-2026.11.19-crag-3.1.7",
   "crag_authorization": {
     "family": "crag",
@@ -24,8 +24,8 @@
     {
       "path": "bin/kin-oauth-auth",
       "asset": "kin-oauth-auth",
-      "size": 14461786,
-      "sha256": "aa985cc45c96ad04265e71cde7897080543be1ae438a03ed8c46edb03c9bd037"
+      "size": 47417574,
+      "sha256": "ef7bda33c289becbf593655f65d615a00639054355699fac7b8cbef7a6b62c22"
     },
     {
       "path": "bin/kin-computer",
@@ -37,7 +37,7 @@
       "path": "bin/kin-worker",
       "asset": "kin-worker",
       "size": 11567288,
-      "sha256": "b8434ed06543164f2131cfefa49e778c78780c2fb5e5b24c06aed4c8efb33db3"
+      "sha256": "402716ec3a168a2f80dbb1b38fe37733546dafa37f9d482a5c5618eb22975300"
     },
     {
       "path": "bin/kin-egress",
