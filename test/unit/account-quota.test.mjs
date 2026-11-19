@@ -1260,6 +1260,96 @@ test('elapsed header reset wipes Extra and becomes schedulable', () => {
   assert.equal(saved.unified.headers['5h'].status, 'active')
 })
 
+// #1312: Extra 5h stayed at the last window's 37% while one shared sampled_at
+// moved to every new probe, next to official 100% for the window after it.
+function seedEndedFiveHour(q, id, { at, endedAt }) {
+  const acc = q.ensure({ account_id: id })
+  acc.unified.headers = {
+    '5h': {
+      utilization: 0.37,
+      reset: new Date(endedAt).toISOString(),
+      status: 'allowed',
+      sampled_at: new Date(at).toISOString(),
+    },
+    '7d': { utilization: 0.5, reset: futureReset(3 * 24 * 3600_000), status: 'allowed' },
+    sampled_at: new Date(at).toISOString(),
+  }
+  acc.window_history = { '5h': { current: { reset: new Date(endedAt).toISOString(), used_ratio: 0.37 } } }
+  q.repo.save(acc)
+}
+
+test('a probe after a 5h rollover marks the ended Extra window stale and keeps its own sample time', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  const H = 3600_000
+  const now = Date.now()
+  const lastRead = now - 4.5 * H
+  const ended = now - 4.3 * H
+  seedEndedFiveHour(q, 'acc-1312', { at: lastRead, endedAt: ended })
+  const probedAt = new Date(now).toISOString()
+  const nextReset = new Date(now + H).toISOString()
+  q.ingestOAuthUsage('acc-1312', {
+    ok: true,
+    usage_status: 200,
+    source: 'official-cc-usage',
+    five_hour: { utilization: 100, status: 'rejected', resets_at: nextReset },
+    seven_day: { utilization: 61, status: 'allowed', resets_at: futureReset(9 * 60_000) },
+    probed_at: probedAt,
+  })
+  const acc = q.repo.get('acc-1312')
+  assert.equal(acc.unified.official['5h'].utilization, 1)
+  const h5 = acc.unified.headers['5h']
+  assert.equal(h5.stale, true)
+  assert.equal(h5.stale_reason, 'reset_elapsed')
+  assert.notEqual(h5.utilization, 0.37)
+  assert.equal(h5.sampled_at, new Date(lastRead).toISOString(), 'the ended reading keeps the time it was read')
+  assert.equal(acc.unified.headers['7d'].utilization, 0.61)
+  assert.equal(acc.unified.headers['7d'].sampled_at, probedAt)
+  // The archive moves on to the window official reports and closes the old one at 37%.
+  assert.deepEqual(acc.window_history['5h'].current, { reset: nextReset, used_ratio: 1 })
+  assert.equal(acc.window_history['5h'].prev.used_ratio, 0.37)
+  assert.equal(acc.window_history['5h'].prev.end, new Date(ended).toISOString())
+})
+
+test('a response naming only 7d does not refresh the 5h sample time', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  const H = 3600_000
+  const now = Date.now()
+  const reset5 = String(Math.floor((now + 2 * H) / 1000))
+  q.ingestHeaders('acc-7d-only', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.2',
+    'anthropic-ratelimit-unified-5h-reset': reset5,
+    'anthropic-ratelimit-unified-7d-utilization': '0.4',
+  })
+  const first = q.repo.get('acc-7d-only').unified.headers['5h'].sampled_at
+  assert.ok(first)
+  const acc = q.repo.get('acc-7d-only')
+  acc.unified.headers['5h'].sampled_at = new Date(now - 10 * 60_000).toISOString()
+  q.repo.save(acc)
+  q.ingestHeaders('acc-7d-only', { 'anthropic-ratelimit-unified-7d-utilization': '0.45' })
+  const headers = q.repo.get('acc-7d-only').unified.headers
+  assert.equal(headers['5h'].sampled_at, new Date(now - 10 * 60_000).toISOString())
+  assert.equal(headers['5h'].utilization, 0.2)
+  assert.equal(headers['7d'].utilization, 0.45)
+  assert.ok(Date.parse(headers['7d'].sampled_at) >= now)
+  assert.equal(headers.sampled_at, headers['7d'].sampled_at)
+})
+
+test('a new 5h reading does not inherit utilization from a window that already ended', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  const H = 3600_000
+  const now = Date.now()
+  seedEndedFiveHour(q, 'acc-carry', { at: now - 4.5 * H, endedAt: now - 4.3 * H })
+  const nextReset = String(Math.floor((now + H) / 1000))
+  q.ingestHeaders('acc-carry', {
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-5h-reset': nextReset,
+  })
+  const h5 = q.repo.get('acc-carry').unified.headers['5h']
+  assert.equal(h5.utilization, null)
+  assert.equal(parseResetMs(h5.reset), Number(nextReset) * 1000)
+  assert.ok(Date.parse(h5.sampled_at) >= now)
+})
+
 test('complete usage may replace a profile-sourced tier', async () => {
   const quota = new AccountQuota({ dataDir: tmpDir(), config: {} })
   quota.ensure({ account_id: 'acct-profile', vm_id: 'vm-01' })

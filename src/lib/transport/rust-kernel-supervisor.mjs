@@ -49,9 +49,10 @@ import {
   runtimeFileOwner,
 } from '../oauth/oauth-credentials.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { repairClaudeConfigFromBackup } from '../vm/claude-config-repair.mjs'
 import { buildNativeTelemetry } from '../vm/native-telemetry.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
-import { RETIRE_LEGACY_TELEMETRY } from '../vm/slot-process-status.mjs'
+import { RETIRE_LEGACY_TELEMETRY, retireScriptVerdict } from '../vm/slot-process-status.mjs'
 import { checkCragLicense } from '../vm/crag-license.mjs'
 import { publishKvmCragLicense } from '../vm/kvm-crag-license.mjs'
 import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
@@ -813,13 +814,49 @@ function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
 
 /** Only actual Linux launches retire the old sender; healthy kernels do no extra exec. */
 async function retireLegacyTelemetryBeforeStart(exec, runDockerExec) {
-  try {
-    const retired = await runDockerExec(execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), {
-      timeoutMs: 5000,
-    })
-    if (retired?.ok) return { ok: true }
-  } catch {}
-  return { ok: false, reason: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
+  const retired = await retireLegacyTelemetryChecked(
+    execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]),
+    runDockerExec,
+  )
+  if (retired.unverified) {
+    console.warn(
+      `[rust-kernel] ${exec?.vmId || exec?.vm?.id || 'unknown'} legacy telemetry retire unverified; boot continues`,
+    )
+  }
+  return retired
+}
+
+/**
+ * Shared transport-aware retire: a numeric exit after the script's marker is
+ * its verdict; anything else means the exec never completed (docker CLI
+ * transport error, node-link flap, timeout, spawn error). One retry, then fail open so transport jitter cannot brick
+ * a boot; a genuinely stuck sender still fails deterministically.
+ */
+export async function retireLegacyTelemetryChecked(argv, runDockerExec) {
+  const attempt = async () => {
+    try {
+      return await runDockerExec(argv, { timeoutMs: 5000 })
+    } catch (error) {
+      return { ok: false, error: String(error?.message || error) }
+    }
+  }
+  const deterministicFailure = {
+    ok: false,
+    reason: 'legacy_telemetry_stop_failed',
+    error: 'Legacy telemetry process did not stop',
+  }
+  const first = await attempt()
+  if (first?.ok) return { ok: true }
+  if (retireScriptVerdict(first)) return deterministicFailure
+  const retry = await attempt()
+  if (retry?.ok) return { ok: true }
+  if (retireScriptVerdict(retry)) return deterministicFailure
+  return {
+    ok: true,
+    unverified: true,
+    reason: 'legacy_telemetry_unverified',
+    error: 'Legacy telemetry retire unverified (slot exec unavailable); boot continues',
+  }
 }
 
 async function startKvmGuestKernel(
@@ -1261,6 +1298,14 @@ export function writeKernelConfig(
   const kernelRouting = routing ?? { inference: previous }
   const dataplane = resolveKernelDataplane(target, kernelRouting) || 'wrap'
   const host = slotHost(record)
+  // Before any kernel (cli-node or CRAG) starts the CLI: an empty .claude/.claude.json crash-loops it.
+  if (host.kind === 'local' && !isCodexVm(record)) {
+    try {
+      const fixed = repairClaudeConfigFromBackup(homeDir)
+      if (fixed.repaired)
+        console.warn(`[kernel] ${vm.id}: restored unreadable .claude/.claude.json from ${fixed.backup}`)
+    } catch {}
+  }
   // A macOS node runs the kernel on the host itself: real node paths instead of the container mounts.
   // Unknown until that node has connected once; the slot's own start writes the config then.
   let nodePaths = null

@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { clearStaleRuntimeMaintenanceHold } from '../../src/lib/vm/vm-registry.mjs'
 import { createKernelWatchdog, isKernelWatchdogTarget } from '../../src/lib/transport/kernel-watchdog.mjs'
 import { kernelFaults, rustKernelPaths } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { configureSlotCapacity } from '../../src/lib/vm/slot-capacity.mjs'
@@ -569,6 +570,113 @@ test('watchdog reloads a kernel only when its live slot count is off; a stale fi
     await wd.tick()
     assert.deepEqual(ensured, ['vm-live'], 'only the kernel running another count is reloaded')
     assert.equal(JSON.parse(fs.readFileSync(configOf('vm-file'), 'utf8')).slots_per_worker, 20)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// A control-plane restart can kill a withSlotMaintenance cutover mid-flight and
+// leak its slot-runtime: hold; a healthy kernel plus a stale hold means the
+// operation is gone and the slot must return to scheduling on its own.
+function staleHoldFixture(root, id, holdAgeMs, tag) {
+  fs.mkdirSync(path.join(root, 'vms', id, 'cli-home'), { recursive: true })
+  const vmFile = path.join(root, 'vms', `${id}.json`)
+  fs.writeFileSync(
+    vmFile,
+    JSON.stringify({
+      id,
+      status: 'running',
+      schedulable: false,
+      schedule_hold: { reason: 'maintenance', detail: { tag }, at: new Date(Date.now() - holdAgeMs).toISOString() },
+    }),
+  )
+  return vmFile
+}
+
+function holdWatchdog(root, id, vmFile, { hold }) {
+  return createKernelWatchdog({
+    probeVm: (vm) => ({ vmId: vm.id }),
+    health: async () => ({ healthy: true, ok: true, ready_slots: 1, closed_slots: 0 }),
+    listTargets: () => [
+      {
+        id,
+        inference_engine: 'rust',
+        status: 'running',
+        schedule_hold: hold
+          ? {
+              reason: 'maintenance',
+              detail: { tag: hold.tag },
+              at: new Date(Date.now() - hold.ageMs).toISOString(),
+            }
+          : undefined,
+      },
+    ],
+    homeDirFor: () => path.join(root, 'vms', id, 'cli-home'),
+    config: { restart_backoff_sec: [60], restart_window_sec: 3600 },
+  })
+}
+
+test('a healthy kernel lifts a stale slot-runtime maintenance hold', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wd-stalehold-'))
+  try {
+    const vmFile = staleHoldFixture(root, 'vm-held', 11 * 60_000, 'slot-runtime:abc')
+    const wd = holdWatchdog(root, 'vm-held', vmFile, {
+      hold: { tag: 'slot-runtime:abc', ageMs: 11 * 60_000 },
+    })
+    await wd.tick()
+    const after = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+    assert.equal(after.schedule_hold, undefined)
+    assert.equal(after.schedulable, true)
+    wd.stop?.()
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a fresh slot-runtime maintenance hold is left alone (cutover may still be running)', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wd-freshhold-'))
+  try {
+    const vmFile = staleHoldFixture(root, 'vm-fresh', 30_000, 'slot-runtime:abc')
+    const wd = holdWatchdog(root, 'vm-fresh', vmFile, {
+      hold: { tag: 'slot-runtime:abc', ageMs: 30_000 },
+    })
+    await wd.tick()
+    const after = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+    assert.equal(after.schedule_hold?.reason, 'maintenance')
+    assert.equal(after.schedulable, false)
+    wd.stop?.()
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('stale holds from other owners (migration, kernel install) are never lifted', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wd-otherhold-'))
+  try {
+    const vmFile = staleHoldFixture(root, 'vm-mig', 11 * 60_000, 'migration:job-1')
+    const wd = holdWatchdog(root, 'vm-mig', vmFile, {
+      hold: { tag: 'migration:job-1', ageMs: 11 * 60_000 },
+    })
+    await wd.tick()
+    const after = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+    assert.equal(after.schedule_hold?.detail?.tag, 'migration:job-1')
+    assert.equal(after.schedulable, false)
+    wd.stop?.()
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('stale-hold lift is pinned to the observed tag: a newer cutover keeps its hold', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wd-newtag-'))
+  try {
+    const vmFile = staleHoldFixture(root, 'vm-race', 11 * 60_000, 'slot-runtime:new')
+    const lifted = clearStaleRuntimeMaintenanceHold(root, 'vm-race', {
+      tag: 'slot-runtime:old',
+      minAgeMs: 10 * 60_000,
+    })
+    assert.equal(lifted, false)
+    assert.equal(JSON.parse(fs.readFileSync(vmFile, 'utf8')).schedule_hold?.detail?.tag, 'slot-runtime:new')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
