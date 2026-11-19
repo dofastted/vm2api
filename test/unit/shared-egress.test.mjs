@@ -19,6 +19,8 @@ import {
   sharedChainName,
   sharedEgressId,
   sharedEgressNodeId,
+  mergeSharedRoute,
+  pruneSharedRoutes,
   sharedMembersOf,
   sharedNetworkName,
   sharedRoutes,
@@ -38,6 +40,7 @@ import {
   inspectSharedEgressNetwork,
   iptablesPlan,
   sharedEndpointIps,
+  ensureSharedEgressForVm,
   ensureSharedEgressForVms,
   sharedIpOf,
   sharedIptablesPlan,
@@ -905,4 +908,175 @@ test('the container’s NetworkMode is not mistaken for the egress mode', () => 
   const perVm = { id: 'vm-2', proxy: { id: 'px-a1b2c3d4' }, runtime: { network_mode: 'shared' } }
   assert.equal(networkModeOf(perVm), 'per-vm')
   assert.equal(slotNetworkForVm(perVm), networkName('px-a1b2c3d4'))
+})
+
+test('routes for addresses no longer on the network are pruned', () => {
+  const routes = [
+    { vm_ip: '100.64.16.3', proxy_url: 'socks5h://a:1080' },
+    { vm_ip: '100.64.16.4', proxy_url: 'socks5h://b:1080' },
+  ]
+  // vm-4 has gone; its address is no longer held.
+  assert.deepEqual(pruneSharedRoutes(routes, ['100.64.16.3']), [
+    { vm_ip: '100.64.16.3', proxy_url: 'socks5h://a:1080' },
+  ])
+  // A VM is routed before its container exists, so its own address is exempt.
+  assert.deepEqual(pruneSharedRoutes(routes, [], { keep: ['100.64.16.4'] }), [
+    { vm_ip: '100.64.16.4', proxy_url: 'socks5h://b:1080' },
+  ])
+  assert.deepEqual(pruneSharedRoutes([], ['100.64.16.3']), [])
+})
+
+test('merging a member replaces the entry for its address', () => {
+  const routes = [{ vm_ip: '100.64.16.3', proxy_url: 'socks5h://old:1080' }]
+  // Two entries for one address make the whole table invalid at the helper,
+  // so the reload fails and every VM on the node stays on the previous table.
+  const merged = mergeSharedRoute(routes, { vmId: 'vm-1', ip: '100.64.16.3', proxyUrl: 'socks5h://new:1080' })
+  assert.deepEqual(merged, [{ vm_ip: '100.64.16.3', proxy_url: 'socks5h://new:1080' }])
+
+  const added = mergeSharedRoute(routes, { vmId: 'vm-2', ip: '100.64.16.4', proxyUrl: 'socks5h://b:1080' })
+  assert.equal(added.length, 2)
+  // Still sorted, so an unchanged membership yields an unchanged config.
+  assert.deepEqual(
+    added.map((r) => r.vm_ip),
+    ['100.64.16.3', '100.64.16.4'],
+  )
+})
+
+/** A node whose shared network already holds `endpoints` and whose helper has `routes`. */
+function vmHarness(t, { endpoints = [], routes = [] } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vmshared-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const nodeId = ''
+  const name = sharedNetworkName(nodeId)
+  const subnet = '100.64.16.0/20'
+  if (routes.length) {
+    const dir = egressRunDir(root, sharedEgressId(nodeId))
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(
+      path.join(dir, 'egress.json'),
+      egressConfigBody(
+        egressConfigFor({ proxyId: sharedEgressId(nodeId), listenTcp: '1:1', listenDns: '1:2', routes }),
+      ),
+    )
+  }
+  const d = fakeDocker({ networks: { [name]: subnet }, endpoints: { [name]: endpoints.map((ip) => `${ip}/20`) } })
+  const startCalls = []
+  return {
+    root,
+    subnet,
+    startCalls,
+    opts: {
+      runDocker: d.run,
+      runIp: d.runIp,
+      runIptables: (args) => (args.includes('-C') ? { ok: false, stderr: 'no chain' } : { ok: true }),
+      ports: { tcp: 18080, dns: 18053 },
+      startProcess: async (cfg) => {
+        startCalls.push(cfg)
+        return { ok: true, pid: 1, reused: false, reloaded: true }
+      },
+      stopProcess: () => ({ ok: true, stopped: true }),
+      waitListening: async () => true,
+      bridgeNetfilter: () => true,
+    },
+  }
+}
+
+const sharedVm = (id, ip) => ({
+  id,
+  runtime: { egress_mode: 'shared', ...(ip ? { shared_ip: ip } : {}) },
+  proxy: { id: `px-${id}`, scheme: 'socks5h', host: `${id}.example`, port: 1080 },
+})
+
+test('a VM joining a node is given an address and routed', async (t) => {
+  const h = vmHarness(t)
+  const r = await ensureSharedEgressForVm(h.root, sharedVm('vm-1'), h.opts)
+  assert.equal(r.ok, true)
+  assert.ok(r.ip, 'no address was assigned')
+  assert.equal(r.ip, allocateHostIp('vm-1', { subnet: h.subnet }))
+  // Routed before its container exists, so its own address survives the prune.
+  assert.deepEqual(
+    h.startCalls[0].routes.map((x) => x.vm_ip),
+    [r.ip],
+  )
+})
+
+test('a VM already holding an address keeps it', async (t) => {
+  const h = vmHarness(t, { endpoints: ['100.64.16.77'] })
+  const r = await ensureSharedEgressForVm(h.root, sharedVm('vm-1', '100.64.16.77'), h.opts)
+  assert.equal(r.ok, true)
+  assert.equal(r.ip, '100.64.16.77')
+})
+
+test('a reused address does not inherit the departed VM\u2019s exit', async (t) => {
+  // vm-old left and the allocator hands its address to vm-new. The stale route
+  // names vm-old's upstream; left in place, vm-new would leave through someone
+  // else's exit. The address is exempt from the prune (vm-new's container does
+  // not exist yet), so what has to protect it here is the merge replacing the
+  // entry rather than adding beside it.
+  const reused = allocateHostIp('vm-new', { subnet: '100.64.16.0/20' })
+  const h = vmHarness(t, { endpoints: [], routes: [{ vm_ip: reused, proxy_url: 'socks5h://old-vm-exit:1080' }] })
+  const r = await ensureSharedEgressForVm(h.root, sharedVm('vm-new'), h.opts)
+  assert.equal(r.ok, true)
+  assert.equal(r.ip, reused)
+  const table = h.startCalls[0].routes
+  assert.equal(table.length, 1, 'two entries for one address make the whole table invalid')
+  assert.match(table[0].proxy_url, /vm-new\.example/)
+  assert.ok(
+    !table.some((x) => x.proxy_url.includes('old-vm-exit')),
+    'the new VM would leave through the departed VM\u2019s exit',
+  )
+})
+
+test('a departed VM\u2019s route is pruned when its address is not reused', async (t) => {
+  // Here the prune is what removes it: the address is neither held on the
+  // network nor the joining VM's own.
+  const gone = '100.64.16.200'
+  const h = vmHarness(t, { endpoints: [], routes: [{ vm_ip: gone, proxy_url: 'socks5h://old-vm-exit:1080' }] })
+  const r = await ensureSharedEgressForVm(h.root, sharedVm('vm-new'), h.opts)
+  assert.equal(r.ok, true)
+  assert.notEqual(r.ip, gone)
+  assert.equal(r.dropped, 1, 'the departed VM\u2019s route was not pruned')
+  const table = h.startCalls[0].routes
+  assert.deepEqual(
+    table.map((x) => x.vm_ip),
+    [r.ip],
+  )
+})
+
+test('a VM joining does not disturb the routes of VMs still present', async (t) => {
+  const present = '100.64.16.5'
+  const h = vmHarness(t, {
+    endpoints: [present],
+    routes: [{ vm_ip: present, proxy_url: 'socks5h://still-here:1080' }],
+  })
+  const r = await ensureSharedEgressForVm(h.root, sharedVm('vm-2'), h.opts)
+  assert.equal(r.ok, true)
+  assert.equal(r.dropped, 0)
+  const table = h.startCalls[0].routes
+  assert.equal(table.length, 2)
+  assert.ok(table.some((x) => x.vm_ip === present && x.proxy_url === 'socks5h://still-here:1080'))
+})
+
+test('a VM with no bound upstream is refused before anything is built', async (t) => {
+  const h = vmHarness(t)
+  const r = await ensureSharedEgressForVm(h.root, { id: 'vm-1', runtime: { egress_mode: 'shared' }, proxy: {} }, h.opts)
+  assert.equal(r.ok, false)
+  assert.match(r.error, /bound SOCKS5/)
+  assert.equal(h.startCalls.length, 0)
+})
+
+test('an unreadable shared network does not become an empty one', async (t) => {
+  const h = vmHarness(t)
+  // ok:false from the endpoint read must stop the allocation: treating it as
+  // "no addresses in use" would hand out one already held.
+  const r = await ensureSharedEgressForVm(h.root, sharedVm('vm-1'), {
+    ...h.opts,
+    runDocker: (args) =>
+      args[1] === 'inspect' && String(args[3]).includes('.Containers')
+        ? { ok: false, stderr: 'x' }
+        : h.opts.runDocker(args),
+  })
+  assert.equal(r.ok, false)
+  assert.equal(r.error, 'shared_network_unreadable')
+  assert.equal(h.startCalls.length, 0)
 })

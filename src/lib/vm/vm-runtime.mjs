@@ -40,7 +40,15 @@ import { cragV2KernelWrapperScript, installedCragV2Root, materializeResolvedKern
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
 import { ensureSlotComputer, rememberComputer } from '../identity/slot-computer.mjs'
 import { coerceRfc4122Uuid } from '../identity/rfc4122-uuid.mjs'
-import { boundProxyUrl, ensureProxyEgress, isLocalEgressProxy, slotNetworkArgs, slotNetworkForVm } from './egress.mjs'
+import {
+  boundProxyUrl,
+  ensureProxyEgress,
+  ensureSharedEgressForVm,
+  isLocalEgressProxy,
+  slotNetworkArgs,
+  slotNetworkForVm,
+} from './egress.mjs'
+import { isSharedModeVm } from './shared-egress.mjs'
 import { socksProxyEndpoint } from './socks-address.mjs'
 import { assertProxyAllowed } from './proxy-policy.mjs'
 import { toHostPath } from './host-path.mjs'
@@ -582,6 +590,13 @@ export function runtimePatch(vm, info, extra = {}) {
     worker_token_file: rest.worker_token_file || vm.runtime?.worker_token_file || null,
     kernel_socket: rest.kernel_socket || vm.runtime?.kernel_socket || null,
     egress: rest.egress || (isLocalEgressProxy(vm.proxy) ? 'local' : 'explicit-socks5'),
+    // Carried across refreshes like the worker paths above: this object is
+    // rebuilt from scratch each time, and these two decide which network the
+    // slot is attached to and at which address. Losing them would leave a VM
+    // sitting on the shared bridge while the control plane looked for a per-VM
+    // one that was never created for it.
+    egress_mode: rest.egress_mode || vm.runtime?.egress_mode || null,
+    shared_ip: rest.shared_ip || vm.runtime?.shared_ip || null,
     ...rest,
     ...(rest.kernel_socket ? { kernel_socket: rest.kernel_socket } : {}),
   }
@@ -1312,8 +1327,15 @@ async function startVmRuntimeAdmitted(
 
   const proxy = ensureOuterSocks(vm)
   if (!proxy.ok) return proxy
-  const eg = await ensureProxyEgress(projectRoot, vm.proxy)
+  // A shared-mode VM is routed through its node's one helper, and comes back
+  // with the address it must be attached at. It is written onto the VM before
+  // slotNetworkArgs reads it below, and carried across refreshes by
+  // runtimePatch; the caller persists the VM as it already does.
+  const eg = isSharedModeVm(vm)
+    ? await ensureSharedEgressForVm(projectRoot, vm)
+    : await ensureProxyEgress(projectRoot, vm.proxy)
   if (!eg.ok) return eg
+  if (eg.ip) vm.runtime = { ...vm.runtime, egress_mode: 'shared', shared_ip: eg.ip }
   if (!eg.network && !eg.name) return { ok: false, error: 'egress network missing; refusing host fallback' }
 
   let existing = inspectContainer(name)

@@ -17,7 +17,11 @@ import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 import { collectTakenSubnets, createSubnetAllocator, gatewayOf, parseCidr, subnetPoolConfig } from './subnet-pool.mjs'
 import {
   allocateSharedSubnet,
+  assignSharedIp,
   isSharedModeVm,
+  mergeSharedRoute,
+  pruneSharedRoutes,
+  routesAsMembers,
   normalizeNetworkMode,
   sharedBridgeName,
   sharedIpOf,
@@ -1724,6 +1728,65 @@ export async function ensureSharedEgress(projectRoot, opts = {}) {
 export async function ensureSharedEgressForVms(projectRoot, vms = [], { nodeId = '', proxyUrlOf, ...opts } = {}) {
   const members = sharedMembersOf(vms, { nodeId, proxyUrlOf: proxyUrlOf || ((vm) => boundProxyUrl(vm?.proxy)) })
   return ensureSharedEgress(projectRoot, { nodeId, members, ...opts })
+}
+
+/** The route table the helper is currently configured with, as written on disk. */
+export function persistedEgressRoutes(projectRoot, proxyId) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(egressRunDir(projectRoot, proxyId), 'egress.json'), 'utf8'))
+    return Array.isArray(cfg?.routes) ? cfg.routes : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Make one VM routable through its node's shared helper.
+ *
+ * Used from the slot boot path, which holds one VM and has no access to the VM
+ * store. The membership is therefore rebuilt from two things that are available
+ * there and are both authoritative: the addresses the shared network currently
+ * holds, and the table the helper is already configured with. Their intersection
+ * drops any VM that has since gone, which matters because the allocator hands
+ * out addresses by what the network holds — a departed VM's address can be
+ * reused while its route still names its upstream, and the new VM would leave
+ * through someone else's exit.
+ *
+ * The VM's own entry needs no special handling across the prune: whatever the
+ * prune does with it, the merge below puts the correct one back. What protects
+ * a reused address is the merge replacing the entry for it rather than adding
+ * beside it; the prune is what removes a departed VM whose address was *not*
+ * reused.
+ *
+ * Returns the address to record on the VM. The caller persists it, since the
+ * boot path owns the VM object.
+ */
+export async function ensureSharedEgressForVm(projectRoot, vm, { runDocker = docker, runIp = ipRoute, ...opts } = {}) {
+  const nodeId = sharedNodeIdForVm(vm)
+  const proxyUrl = boundProxyUrl(vm?.proxy)
+  if (!proxyUrl) return { ok: false, error: 'bound SOCKS5 url required; refusing fallback' }
+  const net = ensureSharedEgressNetwork(nodeId, runDocker, { runIp })
+  if (!net.ok) return net
+  const live = sharedEndpointIps(nodeId, runDocker)
+  if (!live.ok) return { ok: false, error: 'shared_network_unreadable' }
+  let ip
+  try {
+    ip = assignSharedIp(vm, { subnet: net.subnet, taken: live.items }).ip
+  } catch (e) {
+    return { ok: false, error: e?.message || 'shared_ip_allocation_failed', code: 'shared_subnet_full' }
+  }
+  const existing = persistedEgressRoutes(projectRoot, sharedEgressId(nodeId))
+  const pruned = pruneSharedRoutes(existing, live.items)
+  const routes = mergeSharedRoute(pruned, { vmId: vm?.id || '', ip, proxyUrl })
+  const started = await ensureSharedEgress(projectRoot, {
+    nodeId,
+    members: routesAsMembers(routes),
+    runDocker,
+    runIp,
+    ...opts,
+  })
+  if (!started.ok) return started
+  return { ...started, ip, subnet: net.subnet, dropped: existing.length - pruned.length }
 }
 
 export function stopSharedEgress(projectRoot, nodeId = '', { runDocker = docker, runIptables = iptables } = {}) {

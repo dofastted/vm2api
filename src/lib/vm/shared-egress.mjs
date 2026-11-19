@@ -263,3 +263,48 @@ export function unroutedMembers(members = []) {
   const routed = new Set(sharedRoutes(members).map((r) => r.vm_ip))
   return members.filter((m) => !routed.has(String(m?.ip || '').trim())).map((m) => m?.vmId || m?.ip || '')
 }
+
+/**
+ * Drop routes for addresses no longer held on the shared network.
+ *
+ * The danger a stale route creates is not a dead entry — it is that the
+ * allocator hands out addresses by what the network currently holds, so a
+ * departed VM's address can be given to a new VM while the old route still
+ * names the departed VM's upstream. The new VM would then leave through
+ * someone else's exit, which is the exact failure the route table exists to
+ * prevent, arriving by the back door.
+ *
+ * `keep` is for an address that is about to exist: a VM is routed before its
+ * container is created, so its own address is not on the network yet.
+ */
+export function pruneSharedRoutes(routes = [], liveIps = [], { keep = [] } = {}) {
+  const live = new Set([...liveIps, ...keep].map((ip) => String(ip || '').trim()).filter(Boolean))
+  return routes.filter((r) => live.has(String(r?.vm_ip || '').trim()))
+}
+
+/**
+ * Put one member into a route table, replacing any entry for its address.
+ *
+ * Replacing rather than appending is the point: two entries for one address
+ * would make the whole table invalid at the helper, which fails the reload and
+ * leaves every VM on the node on the previous table.
+ */
+export function mergeSharedRoute(routes = [], member) {
+  const ip = String(member?.ip || '').trim()
+  const proxyUrl = String(member?.proxyUrl || '').trim()
+  const others = routes.filter((r) => String(r?.vm_ip || '').trim() !== ip)
+  if (!ip || !proxyUrl) return sharedRoutes(others.map((r) => ({ ip: r.vm_ip, proxyUrl: r.proxy_url })))
+  return sharedRoutes([
+    ...others.map((r) => ({ ip: r.vm_ip, proxyUrl: r.proxy_url })),
+    { vmId: member?.vmId || '', ip, proxyUrl },
+  ])
+}
+
+/** A route table as members, for the helpers above. */
+export function routesAsMembers(routes = []) {
+  return routes.map((r) => ({
+    vmId: '',
+    ip: String(r?.vm_ip || '').trim(),
+    proxyUrl: String(r?.proxy_url || '').trim(),
+  }))
+}
