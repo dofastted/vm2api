@@ -204,6 +204,9 @@ import {
   composeToolNames,
   restoreToolNames,
   restoreToolNamesInSSELine,
+  indexIssuedToolUses,
+  captureIssuedToolUseEvent,
+  restoreIssuedToolUses,
   wantsFastMode,
 } from './anthropic-policy.mjs'
 import { materializeRemoteImageSources } from './images.mjs'
@@ -224,6 +227,70 @@ export function refusalSessionBlockDecision(reason, classifier = null) {
 }
 
 export function createHandleProtocol(deps) {
+  // Public tool_use fields the client was shown, keyed by authenticated
+  // principal then inbound session then tool id. The next request puts omitted
+  // fields back before the kernel fingerprints history. Unauthenticated
+  // traffic is not recorded. Restart drops the map; the client then owns the echo.
+  const issuedToolUses = new Map()
+  const ISSUED_TOOL_USE_SESSIONS = 256
+
+  function requestTenantPrincipal(req) {
+    const managedKey = req?.apiKeyRecord || null
+    if (managedKey?.id != null) return `key:${managedKey.id}`
+    if (req?.apiKeyKind === 'master') return 'master'
+    if (req?.panelUserId != null) return `panel-id:${req.panelUserId}`
+    if (req?.panelUser) return `panel-user:${req.panelUser}`
+    return ''
+  }
+
+  function issuedToolSession(req, body) {
+    const principal = requestTenantPrincipal(req)
+    if (!principal) return ''
+    const header = String(req?.headers?.['x-claude-code-session-id'] || '').trim()
+    const meta = body?.metadata?.user_id
+    const session = header || (typeof meta === 'string' ? meta.trim() : '')
+    if (!session) return ''
+    return `${principal}\0${session}`
+  }
+
+  function rememberIssuedToolUses(session, issued) {
+    if (!session || !issued?.size) return
+    let known = issuedToolUses.get(session)
+    if (!known) {
+      known = new Map()
+      issuedToolUses.set(session, known)
+    } else {
+      issuedToolUses.delete(session)
+      issuedToolUses.set(session, known)
+    }
+    for (const [id, fields] of issued) known.set(id, fields)
+    while (issuedToolUses.size > ISSUED_TOOL_USE_SESSIONS) {
+      const oldest = issuedToolUses.keys().next().value
+      if (oldest === undefined) break
+      issuedToolUses.delete(oldest)
+    }
+  }
+
+  function issuedToolUsesFor(session) {
+    return session ? issuedToolUses.get(session) : null
+  }
+
+  function notePublicToolUseLine(session, line) {
+    if (!session) return
+    const raw = String(line || '').trim()
+    if (!raw.startsWith('data:')) return
+    let event
+    try {
+      event = JSON.parse(raw.slice(5).trim())
+    } catch {
+      return
+    }
+    const known = issuedToolUses.get(session) || new Map()
+    const before = known.size
+    captureIssuedToolUseEvent(event, known)
+    if (known.size !== before) rememberIssuedToolUses(session, known)
+  }
+
   const json = (...args) => deps.json(...args)
   const writeSSEHeaders = (...args) => deps.writeSSEHeaders(...args)
   const readBody = (...args) => deps.readBody(...args)
@@ -568,6 +635,7 @@ export function createHandleProtocol(deps) {
   async function streamAndAssembleClaudeMessage({
     candidate,
     body,
+    req = null,
     reqHeaders,
     timeoutMs,
     idleTimeoutMs,
@@ -625,6 +693,12 @@ export function createHandleProtocol(deps) {
       },
     })
     Object.assign(workerResult, mergeAssembledAssistantHop(workerResult, assembler.message))
+    if (workerResult?.body) {
+      rememberIssuedToolUses(
+        issuedToolSession(req, null),
+        indexIssuedToolUses(restoreToolNames(workerResult.body, toolNames)),
+      )
+    }
     if (workerResult?.body) {
       workerResult.body = restoreToolNames(workerResult.body, toolNames)
     }
@@ -1289,6 +1363,8 @@ export function createHandleProtocol(deps) {
         })
         ctx.body = standard.body
         inboundToolReverse = standard.reverse
+        const issued = issuedToolUsesFor(issuedToolSession(req, ctx.body))
+        if (issued) ctx.body = restoreIssuedToolUses(ctx.body, issued)
       }
       validateBetweenToolsThinking(ctx.body)
       validateToolChoice(ctx.body)
@@ -1617,6 +1693,9 @@ export function createHandleProtocol(deps) {
       }
       let output
       const clientBody = hidePersonaUsageOnMessage(result.body, personaHideTokens)
+      if (protocol === 'anthropic.messages') {
+        rememberIssuedToolUses(issuedToolSession(req, inbound), indexIssuedToolUses(clientBody))
+      }
       if (protocol === 'anthropic.messages') output = clientBody
       else if (protocol === 'openai.chat') output = fromClaudeToOpenAIChat(clientBody, inbound.model)
       else if (protocol === 'openai.completions') output = fromClaudeToOpenAICompletions(clientBody, inbound.model)
@@ -1638,11 +1717,7 @@ export function createHandleProtocol(deps) {
     const managedKey = req.apiKeyRecord || null
     // Only the authentication layer supplies these identities. Namespace the
     // sources so a key ID cannot share native sessions with a panel login.
-    let tenantPrincipal = ''
-    if (managedKey?.id != null) tenantPrincipal = `key:${managedKey.id}`
-    else if (req.apiKeyKind === 'master') tenantPrincipal = 'master'
-    else if (req.panelUserId != null) tenantPrincipal = `panel-id:${req.panelUserId}`
-    else if (req.panelUser) tenantPrincipal = `panel-user:${req.panelUser}`
+    const tenantPrincipal = requestTenantPrincipal(req)
     const tenantId = tenantPrincipal ? hashKey(`crag-tenant:${tenantPrincipal}`) : ''
     if (managedKey) {
       const gate = apiKeyStore.acquire(managedKey)
@@ -2141,6 +2216,7 @@ export function createHandleProtocol(deps) {
             return streamAndAssembleClaudeMessage({
               candidate,
               body,
+              req,
               reqHeaders: req.headers,
               timeoutMs: cfg.limits.upstream_timeout_ms,
               idleTimeoutMs: streamIdleTimeoutMs,
@@ -2223,6 +2299,7 @@ export function createHandleProtocol(deps) {
               onEvent: async (line) => {
                 if (/response_headers/.test(String(line))) return
                 line = restoreToolNamesInSSELine(line, attemptMeta?.toolNames || {})
+                if (protocol === 'anthropic.messages') notePublicToolUseLine(issuedToolSession(req, body), line)
                 if (personaHideTokens) line = hidePersonaUsageInSseLine(line, personaHideTokens, cacheTtl)
                 keepalive.observeLine(line)
                 if (protocol === 'anthropic.messages') {
@@ -2438,6 +2515,9 @@ export function createHandleProtocol(deps) {
 
     let output
     const clientBody = hidePersonaUsageOnMessage(result.body, personaHideTokens, cacheTtl)
+    if (protocol === 'anthropic.messages') {
+      rememberIssuedToolUses(issuedToolSession(req, inbound), indexIssuedToolUses(clientBody))
+    }
     if (protocol === 'anthropic.messages') {
       output = { ...clientBody }
       if (String(req.headers['x-kin-debug'] || '') === '1') {

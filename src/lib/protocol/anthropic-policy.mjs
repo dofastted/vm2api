@@ -625,6 +625,78 @@ export function restoreToolNamesInSSELine(line, reverse = {}) {
   return `${prefix} ${JSON.stringify(payload)}`
 }
 
+/** Fields a client may omit when it echoes a tool_use we already sent. */
+const ISSUED_TOOL_USE_FIELDS = ['caller']
+
+function issuedToolUse(block) {
+  if (!block || block.type !== 'tool_use' || typeof block.id !== 'string' || !block.id) return null
+  const kept = {}
+  for (const field of ISSUED_TOOL_USE_FIELDS) {
+    if (block[field] !== undefined) kept[field] = block[field]
+  }
+  return Object.keys(kept).length ? { id: block.id, fields: kept } : null
+}
+
+/**
+ * Parse the assistant message we are about to return. The map is what the
+ * client was shown, keyed by tool_use id, so the next request can put omitted
+ * fields back before the kernel fingerprints history.
+ */
+export function indexIssuedToolUses(message) {
+  const content = Array.isArray(message?.content) ? message.content : []
+  const out = new Map()
+  for (const block of content) {
+    const issued = issuedToolUse(block)
+    if (issued && !out.has(issued.id)) out.set(issued.id, issued.fields)
+  }
+  return out
+}
+
+/** Same capture from one public SSE frame, after tool-name restore. */
+export function captureIssuedToolUseEvent(event, into) {
+  if (!into || event?.type !== 'content_block_start') return into
+  const issued = issuedToolUse(event.content_block)
+  if (issued && !into.has(issued.id)) into.set(issued.id, issued.fields)
+  return into
+}
+
+function restoreIssuedToolUseBlock(block, issued) {
+  if (!block || block.type !== 'tool_use' || typeof block.id !== 'string') return block
+  const fields = issued.get(block.id)
+  if (!fields) return block
+  let changed = false
+  const next = { ...block }
+  for (const field of ISSUED_TOOL_USE_FIELDS) {
+    if (next[field] === undefined && fields[field] !== undefined) {
+      next[field] = fields[field]
+      changed = true
+    }
+  }
+  return changed ? next : block
+}
+
+/**
+ * Put omitted tool_use fields back from the response we already parsed.
+ * A field the client sent, including a non-default caller, stays as sent.
+ */
+export function restoreIssuedToolUses(body = {}, issued) {
+  if (!issued?.size || !Array.isArray(body.messages)) return body
+  let changed = false
+  const messages = body.messages.map((message) => {
+    if (message?.role !== 'assistant' || !Array.isArray(message.content)) return message
+    let messageChanged = false
+    const content = message.content.map((block) => {
+      const next = restoreIssuedToolUseBlock(block, issued)
+      if (next !== block) messageChanged = true
+      return next
+    })
+    if (!messageChanged) return message
+    changed = true
+    return { ...message, content }
+  })
+  return changed ? { ...body, messages } : body
+}
+
 const CLIENT_PROSE = [
   ['Hermes Agent', 'Claude Code'],
   ['Hermes agent', 'Claude Code'],

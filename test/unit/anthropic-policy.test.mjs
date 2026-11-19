@@ -9,6 +9,9 @@ import {
   toStandardAnthropicBody,
   restoreToolNames,
   restoreToolNamesInSSELine,
+  indexIssuedToolUses,
+  captureIssuedToolUseEvent,
+  restoreIssuedToolUses,
   sanitizeAnthropicBodyForBetaTokens,
   anthropicBetaTokensContains,
   CONTEXT_MANAGEMENT_BETA,
@@ -1123,4 +1126,55 @@ test('already-Claude image blocks and unusable image_url parts pass through', ()
   })
   assert.deepEqual(body.messages[0].content[0], { type: 'image', source })
   assert.deepEqual(body.messages[0].content[1], { type: 'image_url', image_url: {} })
+})
+
+test('issued tool_use caller is restored only when the client omitted it', () => {
+  const shown = {
+    content: [
+      { type: 'tool_use', id: 'toolu_direct', name: 'Bash', input: { command: 'pwd' }, caller: { type: 'direct' } },
+      { type: 'tool_use', id: 'toolu_agent', name: 'Bash', input: {}, caller: { type: 'agent', id: 'a1' } },
+      { type: 'text', text: 'done' },
+    ],
+  }
+  const issued = indexIssuedToolUses(shown)
+  const echoed = restoreIssuedToolUses(
+    {
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'tool_use', id: 'toolu_direct', name: 'Bash', input: { command: 'pwd' } },
+            { type: 'tool_use', id: 'toolu_agent', name: 'Bash', input: {}, caller: { type: 'agent', id: 'a1' } },
+            { type: 'tool_use', id: 'toolu_new', name: 'Bash', input: {} },
+          ],
+        },
+      ],
+    },
+    issued,
+  )
+  assert.deepEqual(echoed.messages[0].content[0].caller, { type: 'direct' })
+  assert.deepEqual(echoed.messages[0].content[1].caller, { type: 'agent', id: 'a1' })
+  assert.equal(echoed.messages[0].content[2].caller, undefined)
+  assert.equal(echoed.messages[0].content[0].name, 'Bash')
+  assert.deepEqual(echoed.messages[0].content[0].input, { command: 'pwd' })
+})
+
+test('issued caller is captured from the public content_block_start frame', () => {
+  const issued = new Map()
+  captureIssuedToolUseEvent(
+    {
+      type: 'content_block_start',
+      content_block: { type: 'tool_use', id: 'toolu_1', name: 'Bash', caller: { type: 'direct' } },
+    },
+    issued,
+  )
+  captureIssuedToolUseEvent(
+    { type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: '{}' } },
+    issued,
+  )
+  const restored = restoreIssuedToolUses(
+    { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} }] }] },
+    issued,
+  )
+  assert.deepEqual(restored.messages[0].content[0].caller, { type: 'direct' })
 })

@@ -1065,3 +1065,137 @@ test('a caller header cannot skip the inbound rewrite', async (t) => {
     ['mcp__terminal'],
   )
 })
+
+test('issued tool caller stays inside the authenticated tenant that was shown it', async (t) => {
+  const session = '11111111-1111-4111-8111-111111111111'
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'issued-tool-tenant-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const routingFile = path.join(root, 'routing.json')
+  fs.writeFileSync(
+    routingFile,
+    JSON.stringify({ sticky: { outbound_session: 'passthrough' }, compatibility: { persona_preset: 'off' } }),
+  )
+  const tool = {
+    type: 'tool_use',
+    id: 'toolu_shared',
+    name: 'Bash',
+    input: { command: 'pwd' },
+    caller: { type: 'direct' },
+  }
+  const base = {
+    model,
+    max_tokens: 128,
+    stream: false,
+    metadata: { user_id: JSON.stringify({ device_id: 'a'.repeat(64), session_id: session }) },
+  }
+  const shown = { ...base, messages: [{ role: 'user', content: 'run' }] }
+  const echo = {
+    ...base,
+    messages: [
+      { role: 'user', content: 'run' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: tool.id, name: 'Bash', input: { command: 'pwd' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: tool.id, content: 'ok' }] },
+    ],
+  }
+  let phase = 'show'
+  const runner = new FailoverRunner({
+    scheduler: {
+      async selectAndReserve() {
+        return {
+          ok: true,
+          vmId: 'a',
+          accountId: 'a',
+          vm: { id: 'a' },
+          exec: { vmId: 'a', vm: { id: 'a' }, homeDir: root },
+          release() {},
+        }
+      },
+      markSuccess() {},
+      markCooldown() {},
+      releaseAccountSessions() {},
+    },
+    config: { max_same_account_retries: 0 },
+  })
+
+  const outboundBodies = []
+  const handler = createHandleProtocol({
+    json(res, status, body) {
+      res.status = status
+      res.body = body
+    },
+    writeSSEHeaders() {},
+    readBody: async () => structuredClone(phase === 'show' ? shown : echo),
+    requireAuth: () => true,
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+      paths: { data: root, project: root },
+    },
+    requestLog: { start: () => ({ request_id: 'issued-tool-tenant', t0: Date.now() }), finish() {}, tapResponse() {} },
+    stickyRouter: { extractPoolKey: () => session, collectPoolKeys: () => [session] },
+    accountQuota: { ingestHeaders() {} },
+    apiKeyStore: { acquire: () => ({ ok: true }), release() {}, recordUsage() {} },
+    apiScheduler: { pick: () => null },
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfigPath: routingFile,
+    groupsRepo: { rateMultiplier: () => 1 },
+    failoverRunner: {
+      run(opts) {
+        return runner.run({
+          ...opts,
+          callAttempt({ body }) {
+            outboundBodies.push(structuredClone(body))
+            return {
+              ok: true,
+              status: 200,
+              terminalState: 'verified',
+              body: {
+                id: 'msg_a',
+                type: 'message',
+                role: 'assistant',
+                model,
+                content: [structuredClone(tool)],
+                stop_reason: 'tool_use',
+                usage: { input_tokens: 1, output_tokens: 1 },
+              },
+            }
+          },
+        })
+      },
+    },
+  })
+  const ask = async (id) => {
+    const response = { headersSent: false, status: 0, body: null, on() {}, once() {}, off() {}, write() {}, end() {} }
+    await handler.handleProtocol(
+      {
+        method: 'POST',
+        url: '/v1/messages',
+        headers: { authorization: 'Bearer fixture', 'user-agent': 'test-client', 'x-claude-code-session-id': session },
+        apiKeyKind: 'managed',
+        apiKeyRecord: { id },
+        once() {},
+        off() {},
+      },
+      response,
+      'anthropic.messages',
+      '/v1/messages',
+    )
+    return response
+  }
+  const first = await ask('tenant-a')
+  assert.equal(first.status, 200, JSON.stringify(first.body))
+  assert.deepEqual(first.body.content[0].caller, { type: 'direct' })
+  phase = 'echo'
+  const same = await ask('tenant-a')
+  assert.equal(same.status, 200, JSON.stringify(same.body))
+  const assistant = (body) => body.messages.find((message) => message.role === 'assistant')
+  assert.equal(outboundBodies.length, 2)
+  assert.deepEqual(assistant(outboundBodies[1]).content[0].caller, { type: 'direct' })
+  const other = await ask('tenant-b')
+  assert.equal(other.status, 200, JSON.stringify(other.body))
+  assert.equal(outboundBodies.length, 3)
+  assert.equal(assistant(outboundBodies[2]).content[0].caller, undefined)
+})
