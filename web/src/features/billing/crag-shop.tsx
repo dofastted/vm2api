@@ -163,6 +163,17 @@ function hostRedemptionError(error: unknown) {
       return '此码与当前宿主机或订阅不匹配'
     case 'crag_subscription_host_package_unready':
       return '请先在内核页拉取可信 CRAG 发行包'
+    case 'auth_forbidden': {
+      const details = isApiError(error) ? error.details : undefined
+      const id = (details as { authority_request_id?: unknown } | undefined)
+        ?.authority_request_id
+      const validId =
+        typeof id === 'string' &&
+        /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(
+          id
+        )
+      return `授权服务拒绝了这台宿主机的兑换请求。请联系管理员核对，不要重置宿主凭据。${validId ? `请求 ID：${id}` : ''}`
+    }
     default:
       return '兑换尚未确认，请刷新或继续同步'
   }

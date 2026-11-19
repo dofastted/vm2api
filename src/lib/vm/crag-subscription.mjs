@@ -45,6 +45,7 @@ const authorityErrors = new Map([
   ['payload_key_conflict', 409],
 ])
 const fail = (code = 'crag_subscription_unavailable', status = 503) => Object.assign(new Error(code), { code, status })
+const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
 const uid = () => process.getuid()
 const validVoucher = (code) =>
   typeof code === 'string' &&
@@ -777,6 +778,9 @@ export function createCragSubscription({
   }
 
   async function authority(action, hostId, key, extra) {
+    let requestId
+    let status
+    let code
     try {
       const response = await fetchImpl(`${origin}/v1/host-subscriptions/${action}`, {
         method: 'POST',
@@ -786,15 +790,21 @@ export function createCragSubscription({
         headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'application/json' },
         body: JSON.stringify({ host_id: hostId, ...extra }),
       })
+      const id = response.headers.get('x-request-id')
+      if (authorityRequestId.test(id ?? '')) requestId = id
+      status = response.status
       const envelope = await responseJson(response)
       if (response.ok && envelope?.ok === true && envelope.data && typeof envelope.data === 'object')
         return envelope.data
-      const code = envelope?.error?.code
-      if (envelope?.ok === false && authorityErrors.get(code) === response.status) throw fail(code, response.status)
-    } catch (error) {
-      if (authorityErrors.has(error.code)) throw error
+      if (envelope?.ok === false && authorityErrors.get(envelope.error?.code) === status) {
+        code = envelope.error.code
+      }
+    } catch {
+      // A transport or decoding failure does not prove the Authority rejected the operation.
     }
-    throw fail('crag_subscription_authority_unavailable', 502)
+    const error = code ? fail(code, status) : fail('crag_subscription_authority_unavailable', 502)
+    if (requestId) error.authorityRequestId = requestId
+    throw error
   }
 
   function verifyRights(hostId, data, previous, vm) {

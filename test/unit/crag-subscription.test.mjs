@@ -640,6 +640,52 @@ test('standalone recovery waits for the original verified host package before re
   assert.equal(fs.readFileSync(entitlement, 'utf8'), issued.code)
 })
 
+test('an Authority denial is not retried or installed, and only a valid correlation ID is exposed', async (t) => {
+  const redemption_code = voucher()
+  const requestId = crypto.randomUUID()
+  let replyId = requestId
+  let denied = true
+  let calls = 0
+  const { root, publicDir, privateDir, connect } = standaloneHost(t, async (url, { body, headers }) => {
+    assert.ok(url.endsWith('/redeem'))
+    calls++
+    if (denied) {
+      return Response.json(
+        { ok: false, error: { code: 'auth_forbidden', message: `${redemption_code} ${headers.authorization}` } },
+        { status: 403, headers: { 'x-request-id': replyId } },
+      )
+    }
+    const { code, claims } = issueHostEntitlement(root, JSON.parse(body).host_id, { slot_limit: 2 })
+    return Response.json({ ok: true, data: { entitlement: code, ...claims } })
+  })
+  seedEncryptedPackage(root)
+  const submit = postSubscription(connect())
+  const blocked = await submit('redeem', { redemption_code })
+  assert.equal(blocked.status, 403)
+  assert.equal(blocked.error.code, 'auth_forbidden')
+  assert.deepEqual(blocked.error.details, { authority_request_id: requestId })
+  assert.equal(calls, 1, 'a refused request must not trigger automatic retries')
+  assert.equal(fs.existsSync(path.join(publicDir, 'entitlement.code')), false)
+  assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
+  assert.equal(fs.existsSync(path.join(privateDir, 'redeem.json')), false)
+  const key = fs.readFileSync(path.join(privateDir, 'credential'), 'utf8')
+  assert.equal(JSON.stringify(blocked).includes(redemption_code), false)
+  assert.equal(JSON.stringify(blocked).includes(key), false)
+
+  replyId = `${requestId}, ${redemption_code}`
+  const untrusted = await submit('redeem', { redemption_code })
+  assert.equal(untrusted.status, 403)
+  assert.equal(untrusted.error.details, undefined)
+  assert.equal(JSON.stringify(untrusted).includes(redemption_code), false)
+  assert.equal(calls, 2)
+
+  denied = false
+  const applied = await submit('redeem', { redemption_code })
+  assert.equal(applied.status, 200)
+  assert.equal(applied.data.slot_limit, 2)
+  assert.equal(fs.readFileSync(path.join(privateDir, 'credential'), 'utf8'), key)
+})
+
 test('a failed slot probe does not hide signed host rights', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-host-probe-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
