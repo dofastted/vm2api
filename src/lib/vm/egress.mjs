@@ -219,6 +219,34 @@ export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
   }
 }
 
+/**
+ * The shared-bridge variant: the same rules, once per node instead of once per
+ * VM, plus isolation between the VMs now sharing the bridge.
+ *
+ * The per-VM plan leaves intra-subnet traffic alone — `-d subnet -j RETURN` in
+ * the nat chain, and a FORWARD DROP that only fires on `! -d subnet`. On a /28
+ * holding one VM and its gateway that allows nothing. On a shared /20 it would
+ * let every VM on the node reach every other VM directly, and that path never
+ * touches the helper, so the route table cannot refuse it. The isolation rule is
+ * what keeps the helper the only way out.
+ *
+ * It does not affect a VM reaching the internet (REDIRECT delivers that locally,
+ * so it never reaches FORWARD) or the helper itself (addressed to the gateway).
+ * The per-VM plan is deliberately left unchanged.
+ */
+export function sharedIptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
+  const base = iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort })
+  const isolation = ['-i', bridge, '-o', bridge, '-j', 'DROP']
+  return {
+    add: [
+      ['-t', 'filter', '-C', 'FORWARD', ...isolation],
+      ['-t', 'filter', '-I', 'FORWARD', '1', ...isolation],
+      ...base.add,
+    ],
+    del: [...base.del, ['-t', 'filter', '-D', 'FORWARD', ...isolation]],
+  }
+}
+
 function commandPrefix(name) {
   const raw = String(process.env.KIN_EGRESS_CMD_PREFIX || '').trim()
   if (!raw || !['ss', 'iptables', 'ip'].includes(name)) return []
