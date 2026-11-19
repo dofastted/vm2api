@@ -23,6 +23,13 @@ const MAX_BODY = 4096
 const PAGE_SIZE = 100
 const ACTIVATION_WINDOW = 24 * 60 * 60
 const ACTIVATION_LEASE = 120
+// Supplier order states before money arrives. ORDER_STATES is ordered, so everything
+// up to 'paid' is still unpaid; the supplier protocol has no expired or cancelled state.
+const UNPAID_STATES = ORDER_STATES.slice(0, ORDER_STATES.indexOf('paid'))
+// How long a checkout link is worth waiting for. The supplier never reports an order as
+// expired, so an unpaid order older than this is closed locally — but only after the
+// supplier confirms it is still unpaid, so a late payment is never dropped.
+const PAYMENT_WINDOW = 30 * 60
 const nowSeconds = () => Math.floor(Date.now() / 1000)
 
 export const isCragShopPath = (pathname) => pathname === ROOT || pathname.startsWith(`${ROOT}/`)
@@ -187,6 +194,11 @@ function createInput(body) {
   }
 }
 
+// An order closed on this side. closed_at carries the decision for everything the 060
+// CHECK forbids marking in dispatch_state (anything past 'reserved'); the dispatch_state
+// arm keeps orders cancelled before that column existed reading as closed.
+const isClosed = (row) => row?.closed_at != null || row?.dispatch_state === 'cancelled'
+
 function view(row) {
   const { order_id, request_id, sku, payment_method, status, created_at, term, amount_minor, slot_limit, reserved_at } =
     row
@@ -195,14 +207,18 @@ function view(row) {
     request_id,
     sku,
     payment_method,
-    status: row.dispatch_state === 'cancelled' ? 'cancelled' : status,
+    status: isClosed(row) ? 'cancelled' : status,
     created_at: created_at ?? reserved_at,
     term,
     amount_minor,
     slot_limit,
   }
-  if (row.dispatch_state === 'cancelled') return result
-  if (row.dispatch_state === 'unsent') result.cancelable = true
+  if (isClosed(row)) return result
+  // An unsent order is cancelable outright. A submitted one is offered only while the
+  // locally known state is unpaid; the cancel route re-checks with the supplier before
+  // it writes, because the local status can lag behind a payment.
+  if (row.dispatch_state === 'unsent' || (row.dispatch_state === 'submitted' && UNPAID_STATES.includes(status)))
+    result.cancelable = true
   for (const key of ['expected_amount_minor', 'months', 'subtotal_minor', 'discount_minor', 'remaining']) {
     if (row[key] != null) result[key] = row[key]
   }
@@ -424,6 +440,52 @@ export function createCragShopHandler({
     }
   }
 
+  let expiring = false
+  // Close checkout links nobody paid. Independent of the activation poll: an order
+  // outliving its payment window is part of the order lifecycle, not of activation,
+  // so it must keep working with activation turned off. One order per tick keeps the
+  // supplier re-reads spread out.
+  async function pollOrderExpiry() {
+    if (expiring) return
+    expiring = true
+    try {
+      const db = getDb()
+      const row = db
+        .prepare(`SELECT * FROM crag_shop_orders
+        WHERE dispatch_state = 'submitted' AND status IN ('reserved', 'pending')
+          AND closed_at IS NULL
+          AND reserved_at IS NOT NULL AND reserved_at <= ?
+        ORDER BY reserved_at, order_id LIMIT 1`)
+        .get(nowSeconds() - PAYMENT_WINDOW)
+      if (!row) return
+      // A reserved order never returned a checkout form, so no payment link ever
+      // reached the buyer. Anything else has one, so ask the supplier before closing:
+      // a paid order is left alone, and an unreachable supplier is retried next tick
+      // rather than closed on a guess.
+      if (row.status !== 'reserved') {
+        // Derive the receipt outside the catch below: it reads local private storage,
+        // and a failure there is not the supplier being unreachable. Letting it throw
+        // surfaces the real fault in the poll log instead of looking like a deferral.
+        const receipt = deriveOrderReceipt(receiptKey(db), row.order_id)
+        let current = row
+        try {
+          current = reflectOrder(db, row.owner, await supplier.status(row, receipt))
+        } catch (error) {
+          if (!(error instanceof ShopError) || error.code !== 'shop_order_not_found') return
+        }
+        if (!UNPAID_STATES.includes(current.status)) return
+      }
+      durable(db, () =>
+        db
+          .prepare(`UPDATE crag_shop_orders SET closed_at = ?, activation_next_at = NULL
+          WHERE order_id = ? AND closed_at IS NULL AND dispatch_state = 'submitted'`)
+          .run(nowSeconds(), row.order_id),
+      )
+    } finally {
+      expiring = false
+    }
+  }
+
   let processing = false
   async function pollActivation() {
     if (!activationEnabled || processing) return
@@ -435,6 +497,7 @@ export function createCragShopHandler({
       const row = db
         .prepare(`SELECT * FROM crag_shop_orders
         WHERE dispatch_state = 'submitted' AND activation_vm_id IS NOT NULL
+          AND closed_at IS NULL
           AND activation_next_at IS NOT NULL AND activation_next_at <= ?
         ORDER BY activation_next_at, order_id LIMIT 1`)
         .get(now)
@@ -608,7 +671,7 @@ export function createCragShopHandler({
           }),
         })
         const { row, existing } = await reserve(db, owner, { ...input, purchase_json }, (id) => pinTarget(owner, id))
-        if (row.dispatch_state === 'cancelled') return ok(view(row))
+        if (isClosed(row)) return ok(view(row))
         const receipt = deriveOrderReceipt(key, row.order_id)
         const result = (reply) => {
           const current = reflectOrder(db, owner, reply.order)
@@ -637,7 +700,7 @@ export function createCragShopHandler({
         const dispatch = durable(db, () =>
           db
             .prepare(`UPDATE crag_shop_orders SET dispatch_state = 'submitted'
-            WHERE owner = ? AND order_id = ? AND dispatch_state <> 'cancelled'`)
+            WHERE owner = ? AND order_id = ? AND closed_at IS NULL AND dispatch_state <> 'cancelled'`)
             .run(owner, row.order_id),
         )
         if (!dispatch.changes) return ok(view(findOrder(db, owner, row.order_id)))
@@ -654,18 +717,42 @@ export function createCragShopHandler({
         if (Object.keys(input).length !== 0) throw badBody()
       }
       if (route === 'cancel') {
+        // The supplier protocol has no cancel endpoint and no expired state, so a
+        // submitted order stays 'pending' there forever and has to be closed locally.
+        if (row.dispatch_state === 'submitted') {
+          if (!UNPAID_STATES.includes(row.status))
+            throw failure(409, 'shop_order_paid', 'This order was already paid and cannot be cancelled')
+          // 'reserved' means create never returned a checkout form, so the buyer never
+          // received a payment link and cannot have paid: close it without asking the
+          // supplier, which is what makes an order orphaned by a failed create
+          // cancelable even while the supplier is down. A 'pending' order does have a
+          // live payment link, so re-read it first — the local status can lag a payment
+          // and cancelling a paid order would keep the money while dropping the
+          // entitlement. An order the supplier no longer knows (404) is cancelable.
+          if (row.status !== 'reserved') {
+            let current = row
+            try {
+              const receipt = deriveOrderReceipt(receiptKey(db), row.order_id)
+              current = reflectOrder(db, owner, await supplier.status(row, receipt))
+            } catch (error) {
+              if (!(error instanceof ShopError) || error.code !== 'shop_order_not_found') throw error
+            }
+            if (!UNPAID_STATES.includes(current.status))
+              throw failure(409, 'shop_order_paid', 'This order was already paid and cannot be cancelled')
+          }
+        }
         durable(db, () =>
           db
-            .prepare(`UPDATE crag_shop_orders SET dispatch_state = 'cancelled', activation_next_at = NULL
-            WHERE owner = ? AND order_id = ? AND dispatch_state = 'unsent'`)
-            .run(owner, row.order_id),
+            .prepare(`UPDATE crag_shop_orders SET closed_at = ?, activation_next_at = NULL
+            WHERE owner = ? AND order_id = ? AND closed_at IS NULL
+              AND dispatch_state IN ('unsent', 'submitted')`)
+            .run(nowSeconds(), owner, row.order_id),
         )
         const current = findOrder(db, owner, orderId)
-        if (current.dispatch_state !== 'cancelled')
-          throw failure(409, 'shop_order_cannot_cancel', 'Only orders not sent to the supplier can be cancelled')
+        if (!isClosed(current)) throw failure(409, 'shop_order_cannot_cancel', 'This order can no longer be cancelled')
         return ok(view(current))
       }
-      if (row.dispatch_state === 'cancelled') {
+      if (isClosed(row)) {
         if (route === 'status') return ok(view(row))
         throw failure(409, 'shop_order_cancelled', 'This order was cancelled')
       }
@@ -773,5 +860,5 @@ export function createCragShopHandler({
     }
   }
 
-  return Object.assign(handleCragShop, { pollActivation })
+  return Object.assign(handleCragShop, { pollActivation, pollOrderExpiry })
 }
