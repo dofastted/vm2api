@@ -49,6 +49,7 @@ import {
   runtimeFileOwner,
 } from '../oauth/oauth-credentials.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { repairClaudeConfigFromBackup } from '../vm/claude-config-repair.mjs'
 import { buildNativeTelemetry } from '../vm/native-telemetry.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { RETIRE_LEGACY_TELEMETRY } from '../vm/slot-process-status.mjs'
@@ -1260,6 +1261,14 @@ export function writeKernelConfig(
   const kernelRouting = routing ?? { inference: previous }
   const dataplane = resolveKernelDataplane(target, kernelRouting) || 'wrap'
   const host = slotHost(record)
+  // Before any kernel (cli-node or CRAG) starts the CLI: an empty .claude/.claude.json crash-loops it.
+  if (host.kind === 'local' && !isCodexVm(record)) {
+    try {
+      const fixed = repairClaudeConfigFromBackup(homeDir)
+      if (fixed.repaired)
+        console.warn(`[kernel] ${vm.id}: restored unreadable .claude/.claude.json from ${fixed.backup}`)
+    } catch {}
+  }
   // A macOS node runs the kernel on the host itself: real node paths instead of the container mounts.
   // Unknown until that node has connected once; the slot's own start writes the config then.
   let nodePaths = null
