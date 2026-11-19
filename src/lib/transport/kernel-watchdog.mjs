@@ -322,7 +322,9 @@ export function createKernelWatchdog({
         path.resolve(home, '..').endsWith(path.join('/vms', vm.id))
       ) {
         const lifted = clearStaleRuntimeMaintenanceHold(path.resolve(home, '../../..'), vm.id, {
+          tag: vm.schedule_hold.detail.tag,
           minAgeMs: STALE_RUNTIME_LOCK_MS,
+          now: now(),
         })
         if (lifted) {
           console.warn(`[kernel-watchdog] ${vm.id} kernel healthy; stale slot-runtime maintenance hold lifted`)

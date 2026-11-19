@@ -36,6 +36,7 @@ export const MAX_VMS_PER_PROXY = 5
 export const BIND_LIMIT_MIN = 1
 export const BIND_LIMIT_MAX = 32
 export const PROXY_LABEL_MAX = 64
+const PROBE_BATCH_CONCURRENCY = 4
 
 const DEFAULT_CONFIG = {
   probe_interval_min: 10, // 5 | 10 | 30 | 60
@@ -419,6 +420,7 @@ export class ProxyPool extends EventEmitter {
     onEnableVm,
     egressCheck,
     repairEgress,
+    usesHostEgress = () => true,
     geoLookup,
     geoV6Lookup,
     vmNodeOf,
@@ -435,6 +437,7 @@ export class ProxyPool extends EventEmitter {
     this.onEnableVm = onEnableVm // (vmId, reason, proxyId) => void
     this.egressCheck = egressCheck
     this.repairEgress = repairEgress
+    this.usesHostEgress = usesHostEgress
     // Injectable so geo detection is testable without leaving the machine.
     this.geoLookup = geoLookup || lookupProxyGeo
     this.geoV6Lookup = geoV6Lookup || lookupProxyGeoV6
@@ -445,6 +448,7 @@ export class ProxyPool extends EventEmitter {
     this.state = { config: { ...DEFAULT_CONFIG }, proxies: [] }
     this._timer = null
     this._probing = false
+    this._activeProbes = new WeakMap()
     this._probeSockets = new Map()
     // Node exits are not pool rows: px-local's geo is the control plane's, a node slot leaves elsewhere.
     this._exitGeo = new Map()
@@ -656,8 +660,7 @@ export class ProxyPool extends EventEmitter {
     const p = this.state.proxies.find((x) => x.id === localEgressIdForNode(nodeId) && localEgressNodeId(x.id))
     // An operator-disabled row stays out of automatic probes, as in probeAll.
     if (!p || !p.enabled) return null
-    const result = await this.probeOne(p)
-    this._applyProbeResult(p, result)
+    const result = await this._probeAndApply(p)
     this.save()
     return result
   }
@@ -946,11 +949,14 @@ export class ProxyPool extends EventEmitter {
   }
 
   setEnabled(proxyId, enabled) {
-    const p = this.state.proxies.find((x) => x.id === proxyId)
-    if (!p) return { ok: false, error: 'proxy_not_found' }
-    p.enabled = !!enabled
+    const index = this.state.proxies.findIndex((x) => x.id === proxyId)
+    if (index < 0) return { ok: false, error: 'proxy_not_found' }
+    // A result from before an explicit operator action must not undo that action.
+    const p = { ...this.state.proxies[index], enabled: !!enabled }
+    this.state.proxies[index] = p
     if (!enabled) {
       p.status = 'dead'
+      p.last_error = null
       this._cascadeDisableVm(p, 'proxy_manually_disabled')
     } else {
       p.status = 'unknown'
@@ -1031,19 +1037,28 @@ export class ProxyPool extends EventEmitter {
       password: has('password') ? patch.password : username ? p.password : null,
     })
     if (!next) return { ok: false, error: 'invalid_proxy' }
-    p.scheme = next.scheme
-    p.host = next.host
-    p.port = next.port
-    p.username = next.username
-    p.password = next.password
+    const updated = {
+      ...p,
+      scheme: next.scheme,
+      host: next.host,
+      port: next.port,
+      username: next.username,
+      password: next.password,
+    }
     // Imported rows keep the original line in `raw`, which for a
     // socks5://user:pass@host form means a plaintext password sitting in the
     // store. Rewrite it to host:port so editing also cleans that up.
-    p.raw = socksEndpoint(next.host, next.port)
-    p.label = label
-    p.domain_forward = domainForward
+    updated.raw = socksEndpoint(next.host, next.port)
+    updated.label = label
+    updated.domain_forward = domainForward
+    this.state.proxies[this.state.proxies.indexOf(p)] = updated
     this.save()
-    return { ok: true, proxy: this.publicProxy(p), connection_changed: true, domain_forward_changed: domainChanged }
+    return {
+      ok: true,
+      proxy: this.publicProxy(updated),
+      connection_changed: true,
+      domain_forward_changed: domainChanged,
+    }
   }
 
   updateConfig(patch = {}) {
@@ -1147,9 +1162,9 @@ export class ProxyPool extends EventEmitter {
     }
   }
 
-  _cascadeDisableVm(proxy, reason) {
+  _cascadeDisableVm(proxy, reason, vmIds = boundVmIdsOf(proxy)) {
     if (typeof this.onDisableVm !== 'function') return
-    for (const vmId of boundVmIdsOf(proxy)) {
+    for (const vmId of vmIds) {
       try {
         this.onDisableVm(vmId, reason, proxy.id)
       } catch {
@@ -1158,9 +1173,9 @@ export class ProxyPool extends EventEmitter {
     }
   }
 
-  _cascadeEnableVm(proxy, reason) {
+  _cascadeEnableVm(proxy, reason, vmIds = boundVmIdsOf(proxy)) {
     if (typeof this.onEnableVm !== 'function') return
-    for (const vmId of boundVmIdsOf(proxy)) {
+    for (const vmId of vmIds) {
       try {
         this.onEnableVm(vmId, reason, proxy.id)
       } catch {
@@ -1169,11 +1184,15 @@ export class ProxyPool extends EventEmitter {
     }
   }
 
+  _hostEgressVmIds(proxy) {
+    return boundVmIdsOf(proxy).filter((vmId) => this.usesHostEgress(vmId, proxy.id))
+  }
+
   /**
    * SOCKS5 method-selection probe. TCP connect alone is not healthy:
    * an HTTP port that accepts the socket and never answers 0x05 is a failure.
    */
-  async probeOne(proxy) {
+  async probeOne(proxy, stillCurrent = () => true) {
     const blocked = proxyBlockedReason(proxy, this.state.config.ipv6_enabled)
     if (blocked) return { ok: false, scope: 'policy', error: blocked, latency_ms: null }
     if (isLocalEgressProxy(proxy)) {
@@ -1197,18 +1216,23 @@ export class ProxyPool extends EventEmitter {
     const socks = await this._probeSocks(proxy)
     if (socks.scope === 'policy') return socks
     if (!socks.ok) return { ...socks, scope: 'socks' }
-    // Unused proxies need no egress network; probing must not consume Docker subnets.
-    if (!boundVmIdsOf(proxy).length) return { ...socks, scope: 'socks' }
+    // Remote slots and host Codex use their own dataplane, not this host helper.
+    if (!stillCurrent()) return { ok: false, scope: 'pending', error: 'probe_superseded', latency_ms: null }
+    if (proxy.enabled === false && proxy.status === 'dead' && !proxy.last_error) return { ...socks, scope: 'socks' }
+    if (!this._hostEgressVmIds(proxy).length) return { ...socks, scope: 'socks' }
     if (typeof this.egressCheck !== 'function') return { ...socks, scope: 'socks' }
     let eg = this.egressCheck(proxy)
-    if (!eg?.ok && typeof this.repairEgress === 'function') {
+    if (!eg?.ok && !eg?.pending && typeof this.repairEgress === 'function') {
       try {
-        await this.repairEgress(proxy)
+        await this.repairEgress(proxy, () => stillCurrent() && this._hostEgressVmIds(proxy).length > 0)
       } catch {
         /* keep egress failure */
       }
+      if (!stillCurrent()) return { ok: false, scope: 'pending', error: 'probe_superseded', latency_ms: null }
+      if (!this._hostEgressVmIds(proxy).length) return { ...socks, scope: 'socks' }
       eg = this.egressCheck(proxy)
     }
+    if (eg?.pending) return { ok: false, scope: 'pending', latency_ms: socks.latency_ms, error: eg.reason }
     if (eg?.ok) return { ...socks, scope: 'socks' }
     return {
       ok: false,
@@ -1500,13 +1524,34 @@ export class ProxyPool extends EventEmitter {
     })
   }
 
+  _probeAndApply(proxy) {
+    const pending = this._activeProbes.get(proxy)
+    if (pending) return pending
+    const isCurrent = () => this.state.proxies.includes(proxy)
+    const run = (async () => {
+      let result
+      try {
+        result = await this.probeOne(proxy, isCurrent)
+      } catch {
+        // An internal check failure is not evidence that the SOCKS exit is down.
+        result = { ok: false, scope: 'pending', error: 'proxy_probe_internal_error', latency_ms: null }
+        console.warn(`[proxy-probe] ${proxy.id}: ${result.error}`)
+      }
+      if (!isCurrent()) return { ok: false, scope: 'pending', error: 'probe_superseded', latency_ms: null }
+      this._applyProbeResult(proxy, result)
+      return result
+    })().finally(() => this._activeProbes.delete(proxy))
+    this._activeProbes.set(proxy, run)
+    return run
+  }
+
   async probeById(proxyId) {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
-    const result = await this.probeOne(p)
-    this._applyProbeResult(p, result)
+    const result = await this._probeAndApply(p)
     this.save()
-    return { ok: true, proxy: this.publicProxy(p), probe: result }
+    const current = this.state.proxies.find((x) => x.id === proxyId)
+    return { ok: true, proxy: this.publicProxy(current || p), probe: result }
   }
 
   async probeAll({ onlyEnabled = true } = {}) {
@@ -1520,11 +1565,17 @@ export class ProxyPool extends EventEmitter {
         if (p.enabled) return true
         return p.status === 'fail' || (p.status === 'dead' && p.last_error)
       })
-      for (const p of list) {
-        const result = await this.probeOne(p)
-        this._applyProbeResult(p, result)
-        results.push({ id: p.id, ...result, status: p.status, enabled: p.enabled })
-      }
+      let next = 0
+      await Promise.all(
+        Array.from({ length: Math.min(PROBE_BATCH_CONCURRENCY, list.length) }, async () => {
+          while (next < list.length) {
+            const index = next++
+            const p = list[index]
+            const result = await this._probeAndApply(p)
+            results[index] = { id: p.id, ...result, status: p.status, enabled: p.enabled }
+          }
+        }),
+      )
       this.save()
       return { ok: true, total: results.length, results }
     } finally {
@@ -1681,6 +1732,8 @@ export class ProxyPool extends EventEmitter {
     // Disabled by policy is not a failed probe and must not damage health/history.
     if (result.scope === 'policy' || proxyBlockedReason(p, this.state.config.ipv6_enabled)) return
     if (result.scope === 'pending') return
+    // A manual disable has no probe error; keep it distinct from an automatic quarantine.
+    if (!p.enabled && p.status === 'dead' && !p.last_error) return
     p.last_probe_at = new Date().toISOString()
     p.latency_ms = result.latency_ms
     // SSH only measures the control-plane route; it cannot park or resume the slot's exit.
@@ -1690,22 +1743,26 @@ export class ProxyPool extends EventEmitter {
       p.last_error = result.ok ? null : result.error || 'node_unreachable'
       return
     }
-    if (result.scope === 'egress') {
-      p.last_error = `egress_down:${result.error || 'down'}`
-      if (p.enabled) p.status = 'ok'
-      if (cascade) this._cascadeDisableVm(p, p.last_error)
-      return
-    }
-    if (result.ok) {
+    if (result.ok || result.scope === 'egress') {
       const resume =
         /egress_down|proxy_probe_failed/.test(String(p.last_error || '')) ||
         p.status === 'fail' ||
         (p.status === 'dead' && !!p.last_error)
       p.status = 'ok'
       p.consecutive_failures = 0
-      p.last_error = null
+      p.last_error = result.scope === 'egress' ? `egress_down:${result.error || 'down'}` : null
       if (resume && !p.enabled) p.enabled = true
-      if (cascade && resume) this._cascadeEnableVm(p, 'proxy_recovered')
+      if (cascade && p.enabled) {
+        // Slot records can retain a hold even after the pool row became healthy.
+        const vmIds = boundVmIdsOf(p)
+        const affected = result.scope === 'egress' ? this._hostEgressVmIds(p) : []
+        if (affected.length) this._cascadeDisableVm(p, p.last_error, affected)
+        this._cascadeEnableVm(
+          p,
+          'proxy_recovered',
+          vmIds.filter((id) => !affected.includes(id)),
+        )
+      }
       return
     }
     p.consecutive_failures = (p.consecutive_failures || 0) + 1

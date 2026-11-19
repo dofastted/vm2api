@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 import { ProxyPool, MAX_VMS_PER_PROXY, clampBindLimit } from '../../src/lib/vm/proxy-pool.mjs'
+import { reconcileProxyScheduleHold } from '../../src/lib/vm/vm-registry.mjs'
 
 function tmpDir(prefix = 'kin-px-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
@@ -309,6 +310,133 @@ test('egress_down does not mark a live SOCKS proxy dead', async () => {
     pool.stopScheduler()
     socks.server.close()
   }
+})
+
+test('a failed host helper only restricts its local consumers and healthy probes clear persisted holds', async (t) => {
+  const a = await listenSocks()
+  const b = await listenSocks()
+  const root = tmpDir()
+  const vms = path.join(root, 'vms')
+  fs.mkdirSync(vms)
+  t.after(() => {
+    a.server.close()
+    b.server.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  let aHealthy = false
+  let observationPending = false
+  const pool = new ProxyPool({
+    dataDir: path.join(root, 'data'),
+    usesHostEgress: (vmId) => vmId !== 'vm-remote' && vmId !== 'vm-codex',
+    egressCheck: (p) => ({
+      ok: p.port !== a.port || aHealthy,
+      pending: p.port === a.port && observationPending,
+      reason: observationPending ? 'egress_listener_probe_unavailable' : 'not_listening',
+    }),
+    onDisableVm: (id, reason, proxyId) => reconcileProxyScheduleHold(root, id, proxyId, reason),
+    onEnableVm: (id, _reason, proxyId) => reconcileProxyScheduleHold(root, id, proxyId),
+  })
+  const tracked = ['vm-local', 'vm-remote', 'vm-codex', 'vm-off', 'vm-maintenance', 'vm-healthy']
+  const [broken, healthy] = pool.importLines(`${a.host}:${a.port}\n${b.host}:${b.port}`).items.map((p) => p.id)
+  const save = (id, record) => fs.writeFileSync(path.join(vms, `${id}.json`), JSON.stringify(record))
+  const get = (id) => JSON.parse(fs.readFileSync(path.join(vms, `${id}.json`), 'utf8'))
+  for (const id of tracked) {
+    const proxyId = id === 'vm-healthy' ? healthy : broken
+    assert.equal(pool.bind(proxyId, id).ok, true)
+    save(id, {
+      id,
+      status: 'running',
+      schedulable: true,
+      proxy: { id: proxyId },
+      ...(id === 'vm-off' ? { schedulable: false, schedule_off: true } : {}),
+      ...(id === 'vm-maintenance' ? { schedulable: false, schedule_hold: { reason: 'maintenance' } } : {}),
+    })
+  }
+  const outage = await pool.probeAll()
+  assert.equal(outage.results.find((p) => p.id === broken).scope, 'egress')
+  assert.equal(outage.results.find((p) => p.id === healthy).ok, true)
+  assert.equal(get('vm-local').schedule_hold?.detail.tag, broken)
+  assert.equal(get('vm-local').schedulable, false)
+  for (const id of ['vm-healthy', 'vm-remote', 'vm-codex']) assert.equal(get(id).schedulable, true, id)
+  assert.equal(get('vm-maintenance').schedule_hold.reason, 'maintenance')
+
+  // SOCKS recovered, but a broken host helper must not leave independent slots parked.
+  const row = pool.state.proxies.find((p) => p.id === broken)
+  pool._applyProbeResult(row, { ok: false, scope: 'socks', error: 'connection_refused' })
+  pool._applyProbeResult(row, { ok: false, scope: 'socks', error: 'connection_refused' })
+  assert.equal(get('vm-remote').schedulable, false)
+  assert.equal((await pool.probeById(broken)).probe.scope, 'egress')
+  assert.equal(row.enabled, true)
+  assert.equal(get('vm-local').schedulable, false)
+  for (const id of ['vm-remote', 'vm-codex']) assert.equal(get(id).schedulable, true, id)
+
+  observationPending = true
+  const hold = get('vm-local').schedule_hold
+  assert.equal((await pool.probeById(broken)).probe.scope, 'pending')
+  assert.deepEqual(get('vm-local').schedule_hold, hold)
+  observationPending = false
+
+  aHealthy = true
+  // Reproduce the production mismatch: proxy healthy, restriction persisted on disk.
+  row.last_error = null
+  assert.equal(row.status, 'ok')
+  for (let i = 0; i < 2; i += 1) assert.equal((await pool.probeById(broken)).probe.ok, true)
+  assert.equal(get('vm-local').schedule_hold, undefined)
+  assert.equal(get('vm-local').schedulable, true)
+  assert.equal(get('vm-off').schedule_hold, undefined)
+  assert.equal(get('vm-off').schedulable, false)
+  assert.equal(get('vm-maintenance').schedule_hold.reason, 'maintenance')
+})
+
+test('a probe fault does not abort healthy exits or manufacture a failed observation', async (t) => {
+  const a = await listenSocks()
+  const b = await listenSocks()
+  const dir = tmpDir()
+  t.after(() => {
+    a.server.close()
+    b.server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  const pool = new ProxyPool({
+    dataDir: dir,
+    egressCheck: (p) => {
+      if (p.port === a.port) throw new Error('internal probe failure')
+      return { ok: true }
+    },
+  })
+  const [faulted, healthy] = pool.importLines(`${a.host}:${a.port}\n${b.host}:${b.port}`).items.map((p) => p.id)
+  pool.bind(faulted, 'vm-a')
+  pool.bind(healthy, 'vm-b')
+  const { results } = await pool.probeAll()
+  const failed = results.find((p) => p.id === faulted)
+  assert.equal(failed.scope, 'pending')
+  assert.equal(failed.error, 'proxy_probe_internal_error')
+  assert.equal(pool.snapshot().proxies.find((p) => p.id === faulted).consecutive_failures, 0)
+  assert.equal(results.find((p) => p.id === healthy).ok, true)
+})
+
+test('a manual disable wins against an in-flight successful probe', async (t) => {
+  const dir = tmpDir()
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  let resumeCount = 0
+  const pool = new ProxyPool({
+    dataDir: dir,
+    onEnableVm: () => {
+      resumeCount += 1
+    },
+  })
+  const [{ id }] = pool.importLines('192.0.2.5:1080').items
+  pool.bind(id, 'vm-a')
+  const result = Promise.withResolvers()
+  pool.probeOne = () => result.promise
+  const probing = pool.probeById(id)
+  pool.setEnabled(id, false)
+  result.resolve({ ok: true, scope: 'socks', latency_ms: 1 })
+  assert.equal((await probing).probe.error, 'probe_superseded')
+  await pool.probeById(id)
+  assert.equal(resumeCount, 0)
+  assert.equal(pool.snapshot().proxies[0].enabled, false)
+  assert.equal(pool.snapshot().proxies[0].status, 'dead')
 })
 
 test('TCP connect without a SOCKS5 reply is not healthy', async () => {

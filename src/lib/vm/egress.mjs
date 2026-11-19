@@ -624,7 +624,10 @@ export function inspectEgressContainer(name, runDocker = docker) {
   const format =
     '{{.State.Running}}|{{.State.Restarting}}|{{.State.Pid}}|{{index .Config.Labels "kin.egress.cfg"}}|{{index .Config.Labels "kin.egress.bin"}}|{{index .Config.Labels "kin.egress.reload"}}'
   const r = runDocker(['inspect', '-f', format, name])
-  if (!r.ok) return null
+  if (!r.ok) {
+    if (/no such (?:object|container)/i.test(r.stderr || '')) return null
+    return { name, error: 'egress_container_inspect_unavailable' }
+  }
   const [running, restarting, pid, digest, bin, reload] = String(r.stdout || '')
     .trim()
     .split('|')
@@ -646,7 +649,9 @@ export function inspectEgressContainer(name, runDocker = docker) {
  */
 function removeLeftoverEgressContainer(proxyId, runDocker) {
   const name = egressContainerName(proxyId)
-  if (!inspectEgressContainer(name, runDocker)) return { ok: true, removed: false }
+  const existing = inspectEgressContainer(name, runDocker)
+  // Process mode also runs without Docker; it must still verify the port before taking it.
+  if (!existing || existing.error) return { ok: true, removed: false }
   const removed = runDocker(['rm', '-f', name])
   if (!removed.ok && !/no such container/i.test(removed.stderr || '')) {
     return { ok: false, error: `egress_container_remove_failed: ${removed.stderr || 'docker rm failed'}` }
@@ -707,6 +712,7 @@ async function startEgressContainer({
     listen_tcp: cfg.listen_tcp,
   })
   const existing = inspectEgressContainer(spec.name, runDocker)
+  if (existing?.error) return { ok: false, error: existing.error }
   if (
     egressContainerHealthy(existing) &&
     existing.digest === spec.digest &&
@@ -916,6 +922,7 @@ export function inspectEgressProcess(
   if (runtime === 'container') {
     const container = egressContainerName(proxyId)
     const info = inspectEgressContainer(container, runDocker)
+    if (info?.error) return { ok: false, pending: true, reason: info.error, container }
     if (!egressContainerHealthy(info)) return { ok: false, pid: info?.pid || null, reason: 'not_running', container }
     // A surviving helper keeps executing the replaced inode; report it down so probe and watchdog repair it,
     // as the process runtime does for a deleted executable.
@@ -949,7 +956,9 @@ export function egressListening(projectRoot, proxyId, timeoutMs = 400) {
   const host = colon > 0 ? spec.slice(0, colon) : ''
   const port = colon > 0 ? Number(spec.slice(colon + 1)) : 0
   if (!host || !Number.isFinite(port) || port <= 0) return { ok: false, pid: st.pid, reason: 'bad_listen' }
-  if (!waitListen(host, port, timeoutMs)) return { ok: false, pid: st.pid, reason: 'not_listening' }
+  const listening = waitListen(host, port, timeoutMs, st.container ? 0 : st.pid)
+  if (listening == null) return { ok: false, pending: true, pid: st.pid, reason: 'egress_listener_probe_unavailable' }
+  if (!listening) return { ok: false, pid: st.pid, reason: 'not_listening' }
   return st
 }
 
@@ -1032,7 +1041,9 @@ export async function drainEgressForProxyConfig(projectRoot, proxyId) {
 export async function waitPortReleased(host, port, timeoutMs = 3000) {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
-    if (!portListening(host, port)) return { ok: true }
+    const listening = portListening(host, port)
+    if (listening === false) return { ok: true }
+    if (listening == null) return { ok: false, error: 'egress_listener_probe_unavailable', port }
     await delay(EGRESS_POLL_MS)
   }
   return { ok: false, error: 'egress_port_busy', port }
@@ -1084,26 +1095,36 @@ function portListening(host, port, ownerPid = 0) {
     ? ['ss', '-H', '-ltnp', `sport = :${Number(port)}`]
     : ['ss', '-H', '-ltn', `sport = :${Number(port)}`]
   const r = sh(probe, { timeout: 2000 })
-  return (
-    r.ok &&
-    r.stdout.split('\n').some((line) => {
-      const fields = line.trim().split(/\s+/)
-      const local = fields[3]
-      const addressMatches =
-        local === `${h}:${port}` || local === `0.0.0.0:${port}` || local === `*:${port}` || local === `[::]:${port}`
-      if (!addressMatches) return false
-      if (!ownerPid) return true
-      return new RegExp(`pid=${ownerPid}(?:\\D|$)`).test(fields.at(-1) || '')
-    })
-  )
+  if (!r.ok) return null
+  return r.stdout.split('\n').some((line) => {
+    const fields = line.trim().split(/\s+/)
+    const local = fields[3]
+    const addressMatches =
+      local === `${h}:${port}` || local === `0.0.0.0:${port}` || local === `*:${port}` || local === `[::]:${port}`
+    if (!addressMatches) return false
+    if (!ownerPid) return true
+    return new RegExp(`pid=${ownerPid}(?:\\D|$)`).test(fields.at(-1) || '')
+  })
 }
 
 function waitListen(host, port, timeoutMs = 8000, ownerPid = 0) {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
-    if (portListening(host, port, ownerPid)) return true
+    const listening = portListening(host, port, ownerPid)
+    if (listening !== false) return listening
     sleepMsSync(100)
   }
+  return false
+}
+
+async function waitForEgressListen(host, port, ownerPid) {
+  const deadline = Date.now() + 8000
+  do {
+    const listening = portListening(host, port, ownerPid)
+    if (listening !== false) return listening
+    // One slow helper must not block requests or probes for other exits.
+    await delay(EGRESS_POLL_MS)
+  } while (Date.now() < deadline)
   return false
 }
 
@@ -1154,7 +1175,10 @@ export async function runExclusiveProxyEgress(projectRoot, proxyId, fn) {
 
 export async function ensureProxyEgress(projectRoot, proxy, opts = {}) {
   if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker: opts.runDocker })
-  return runExclusiveProxyEgress(projectRoot, proxy?.id, () => startProxyEgress(projectRoot, proxy, opts))
+  return runExclusiveProxyEgress(projectRoot, proxy?.id, () => {
+    if (opts.shouldStart && !opts.shouldStart()) return { ok: false, error: 'probe_superseded' }
+    return startProxyEgress(projectRoot, proxy, opts)
+  })
 }
 
 export async function startProxyEgress(
@@ -1204,7 +1228,9 @@ export async function startProxyEgress(
     ...(bin ? { bin } : {}),
   })
   if (!started.ok) return started
-  if (!waitListen(listenHost, selectedPorts.tcp, 8000, selectedPorts.tcp > 0 ? started.pid : 0))
+  const listening = await waitForEgressListen(listenHost, selectedPorts.tcp, selectedPorts.tcp > 0 ? started.pid : 0)
+  if (listening == null) return { ok: false, error: 'egress_listener_probe_unavailable', pid: started.pid }
+  if (!listening)
     return { ok: false, error: `kin-egress ${listenHost}:${selectedPorts.tcp} did not listen`, pid: started.pid }
   return {
     ok: true,

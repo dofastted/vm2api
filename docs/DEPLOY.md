@@ -109,6 +109,11 @@ curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
 `bin/` 与 `share/wrap-cli` 由镜像入口写入挂载目录，`src/config` 缺文件时用镜像内默认值补齐。
+
+同一安装目录只能运行一个控制面，不要让宿主机 `vm2api.service` 和 Compose 控制面共用其 `data/` 同时运行。即使 HTTP 端口不同，槽位出口仍使用同一组监听端口。Linux 源码直跑需要 `flock`（`util-linux`，官方镜像已包含）；重复启动会报 `vm2api_control_plane_already_running`，不会接管已有出口。首次从未使用该锁的旧版本迁移时，先停旧控制面再启动新的；不要靠换 HTTP 端口做并行切换。
+
+Docker 入口在覆盖共享二进制前加锁，并把同一把锁交给 Node。`KIN_AUTO_SYNC_WRAP=1` 时，共享内核文件有变化才会在该 Node 实例开始监听后同步槽位，不向其他控制面发送 HTTP 请求。
+
 KVM / Docker 槽位将宿主 `data/run/slot-guest-bin/`（仅含 `kin-worker`、`kin-kernel` 两个文件，**不会**挂载整个 `bin/`）只读挂进容器，避免单文件 bind mount 在升级替换二进制后仍粘旧 inode，也避免把 `kin-egress`、`kin-api-kernel` 等其它 helper 暴露进槽位 PATH。此后升级 worker/kernel **不必重建槽位**；若容器仍是旧版单文件挂载创建的，须 **重建该槽位容器一次** 才能切换到 staging 目录挂载。
 槽位系统镜像优先 `docker pull ghcr.io/dofastted/kin-os-*`，拉不到时在建槽阶段用仓内 Dockerfile 兜底构建（启动不阻塞）。
 
@@ -153,6 +158,12 @@ kin-<槽> 容器 → keg* 网桥 → 宿主机 kin-egress（网关 IP:端口）�
 升级时控制面会用 `docker update --restart no` 原地迁移已有本机代理槽位（包括暂停槽位的容器），不重建槽位、不改凭据。请先升级并确认控制面成功启动，再重启 Docker。迁移失败会阻止控制面启动并打印错误；不能仅凭版本号认定已启用保护。该保护针对 Docker 守护进程重启；不要手工 `docker start` 代理槽位或清除其防火墙规则，`live-restore` 场景也不在此启动顺序保证范围内。
 
 宿主机 `kin-egress` 的运行方式（v1.4.134 起）：控制面在 Docker 中运行（compose 设置 `VM2API_CONTAINER_NAME` 并挂载 `docker.sock`）时，每个代理的 `kin-egress` 作为独立的 host 网络容器 `kin-cp-egress-<代理>`（`--restart unless-stopped`）运行，控制面重启不会打断槽位 DNS；其他情况作为控制面子进程运行。可用 `KIN_EGRESS_RUNTIME=process|container` 强制指定。从容器方式切回进程方式时，控制面会先删除同一代理遗留的 `kin-cp-egress-*` 容器再占用端口；降级到 v1.4.133 及更早版本前，请先执行 `docker ps -aq --filter name=kin-cp-egress- | xargs -r docker rm -f`，否则旧版本看不到这些容器的进程，会一直等待端口释放。
+
+**代理故障与恢复（Unreleased）：** 单条宿主 `kin-egress` 故障只限制当前依赖该 helper 的本机运行或暂停槽位；同一代理上的远端槽和本机 GPT 槽不依赖这个 helper。代理端点自身连续探测失败仍按代理池阈值处理，影响绑定该代理的槽位。Docker inspect 或 `ss` 不可用不算已确认故障，不新增或清除槽位限制。
+
+定时探测（启用时）和面板「探测」使用同一恢复逻辑：代理协议探测成功，需要宿主 helper 的槽还须确认其 TCP 监听；随后只清除当前绑定代理留下的自动 `proxy_cooldown`，即使代理行此前已显示健康也会核对。手动禁用代理仍须点「启用」；手动调度关、维护锁、凭据或内核造成的不可调度不会被清除。监听检查不是 DNS 或真实推理验收；若恢复后请求仍失败，按下方步骤从槽内验证网络。
+
+故障期间不会改绑、换 IP、自动直连或放宽防火墙与 IPv6 策略。这是同一控制面内的出口隔离，不是跨宿主高可用；宿主或共享上游故障仍可能影响多个出口，进程模式下控制面进程树退出也可能同时停止多个 helper。
 
 控制面用 iptables 把容器的 TCP 和 DNS 重定向到宿主机上的 `kin-egress`。这一跳的目的地是宿主机本身，要经过宿主机 **INPUT** 链。UFW 默认入站 `DROP`，而 vm2api 不改你的 INPUT 规则，所以需要手动放行：
 
