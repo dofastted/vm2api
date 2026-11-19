@@ -20,8 +20,10 @@ import {
   isSharedModeVm,
   normalizeNetworkMode,
   sharedBridgeName,
+  sharedIpOf,
   sharedChainName,
   sharedEgressId,
+  sharedMembersOf,
   sharedNetworkName,
   sharedNodeIdForVm,
   sharedRoutes,
@@ -37,6 +39,8 @@ export const LOCAL_EGRESS_ID = 'px-local'
  * many VMs the helper serves.
  */
 export const EGRESS_NOFILE = 1048576
+
+export { sharedIpOf }
 
 const LOCAL_EGRESS_NODE_PREFIX = `${LOCAL_EGRESS_ID}-`
 
@@ -1709,6 +1713,19 @@ export async function ensureSharedEgress(projectRoot, opts = {}) {
   return runExclusiveProxyEgress(projectRoot, sharedEgressId(opts?.nodeId), () => startSharedEgress(projectRoot, opts))
 }
 
+/**
+ * Bring a node's shared helper in line with the VMs on it.
+ *
+ * The one-line form for a call site that holds the VM list. Where
+ * `ensureProxyEgress` is handed the one proxy whose helper it ensures, this is
+ * handed the node's VMs and derives the membership, because a shared helper's
+ * config depends on all of them rather than on any one.
+ */
+export async function ensureSharedEgressForVms(projectRoot, vms = [], { nodeId = '', proxyUrlOf, ...opts } = {}) {
+  const members = sharedMembersOf(vms, { nodeId, proxyUrlOf: proxyUrlOf || ((vm) => boundProxyUrl(vm?.proxy)) })
+  return ensureSharedEgress(projectRoot, { nodeId, members, ...opts })
+}
+
 export function stopSharedEgress(projectRoot, nodeId = '', { runDocker = docker, runIptables = iptables } = {}) {
   const info = inspectSharedEgressNetwork(nodeId, runDocker)
   const stopped = stopEgressProcess(projectRoot, sharedEgressId(nodeId), { runDocker })
@@ -1763,11 +1780,6 @@ export function configuredNetworkMode() {
   } catch {
     return 'per-vm'
   }
-}
-
-/** The address a shared-network VM was given, recorded on the VM. */
-export function sharedIpOf(vm) {
-  return String(vm?.runtime?.shared_ip || '').trim()
 }
 
 /**

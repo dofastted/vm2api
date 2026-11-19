@@ -123,6 +123,44 @@ export function sharedNodeIdForVm(vm) {
 }
 
 /**
+ * The shared members of one node, from that node's VMs.
+ *
+ * This is the shape difference between the two modes. A per-VM helper is
+ * ensured from one proxy, which is why `ensureProxyEgress` takes one; a shared
+ * helper is ensured from the whole node's membership, so its caller has to be
+ * somewhere that can see the VM list. A VM whose mode is per-vm is not a member
+ * even if it lives on this node — both modes run side by side.
+ */
+export function sharedMembersOf(vms = [], { nodeId = '', proxyUrlOf = () => '' } = {}) {
+  const node = String(nodeId || '').trim()
+  const members = []
+  for (const vm of vms) {
+    if (!vm?.id || !isSharedModeVm(vm)) continue
+    if (sharedNodeIdForVm(vm) !== node) continue
+    members.push({ vmId: vm.id, ip: sharedIpOf(vm), proxyUrl: String(proxyUrlOf(vm) || '').trim() })
+  }
+  return members
+}
+
+/** The address a shared-network VM was given, recorded on the VM. */
+export function sharedIpOf(vm) {
+  return String(vm?.runtime?.shared_ip || '').trim()
+}
+
+/**
+ * The address to record for a VM joining the shared network.
+ *
+ * An address already recorded is kept: it is what the VM's container is
+ * attached with and what the helper's route table names, so re-deriving it
+ * would strand both. Only a VM that has none gets a new one.
+ */
+export function assignSharedIp(vm, { subnet, taken = [], maxProbe = MAX_HOST_PROBE } = {}) {
+  const existing = sharedIpOf(vm)
+  if (existing) return { ip: existing, reused: true }
+  return { ip: allocateHostIp(vm?.id || '', { subnet, taken, maxProbe }), reused: false }
+}
+
+/**
  * The node's shared subnet. Allocated before any per-VM subnet and reserved
  * against that allocator, because a /20 carved out of an already-fragmented pool
  * may have nowhere to land once the /28s are placed.

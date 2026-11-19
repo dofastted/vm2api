@@ -6,6 +6,7 @@ import path from 'node:path'
 import {
   DEFAULT_SHARED_PREFIX,
   allocateHostIp,
+  assignSharedIp,
   allocateSharedSubnet,
   hostRange,
   isSharedEgressId,
@@ -18,6 +19,7 @@ import {
   sharedChainName,
   sharedEgressId,
   sharedEgressNodeId,
+  sharedMembersOf,
   sharedNetworkName,
   sharedRoutes,
   unroutedMembers,
@@ -36,6 +38,7 @@ import {
   inspectSharedEgressNetwork,
   iptablesPlan,
   sharedEndpointIps,
+  ensureSharedEgressForVms,
   sharedIpOf,
   sharedIptablesPlan,
   slotNetworkArgs,
@@ -800,4 +803,80 @@ test('a node whose bridged traffic skips iptables refuses to fold', async () => 
   assert.equal(h.docker.calls.filter((a) => a[1] === 'create').length, 0)
   assert.deepEqual(h.iptablesCalls, [])
   assert.equal(h.startCalls.length, 0)
+})
+
+test('node membership is derived from the node\u2019s shared VMs only', () => {
+  const vms = [
+    { id: 'vm-1', runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' }, proxy: { id: 'px-1' } },
+    // per-vm VMs run beside shared ones on the same node and are not members.
+    { id: 'vm-2', runtime: {}, proxy: { id: 'px-2' } },
+    // Another node's shared VM belongs to that node's helper, not this one.
+    {
+      id: 'vm-3',
+      node_id: 'node-b',
+      runtime: { network_mode: 'shared', shared_ip: '100.64.32.3' },
+      proxy: { id: 'px-3' },
+    },
+    { id: 'vm-4', runtime: { network_mode: 'shared', shared_ip: '100.64.16.4' }, proxy: { id: 'px-4' } },
+  ]
+  const members = sharedMembersOf(vms, { nodeId: '', proxyUrlOf: (vm) => `socks5h://${vm.proxy.id}:1080` })
+  assert.deepEqual(members, [
+    { vmId: 'vm-1', ip: '100.64.16.3', proxyUrl: 'socks5h://px-1:1080' },
+    { vmId: 'vm-4', ip: '100.64.16.4', proxyUrl: 'socks5h://px-4:1080' },
+  ])
+  assert.deepEqual(sharedMembersOf(vms, { nodeId: 'node-b', proxyUrlOf: (vm) => `socks5h://${vm.proxy.id}:1080` }), [
+    { vmId: 'vm-3', ip: '100.64.32.3', proxyUrl: 'socks5h://px-3:1080' },
+  ])
+})
+
+test('a VM keeps the shared address it already holds', () => {
+  const subnet = '100.64.16.0/20'
+  const held = { id: 'vm-1', runtime: { network_mode: 'shared', shared_ip: '100.64.16.77' } }
+  // Re-deriving would strand both the container attachment and the route.
+  const kept = assignSharedIp(held, { subnet, taken: ['100.64.16.77'] })
+  assert.deepEqual(kept, { ip: '100.64.16.77', reused: true })
+
+  const fresh = { id: 'vm-2', runtime: { network_mode: 'shared' } }
+  const given = assignSharedIp(fresh, { subnet, taken: ['100.64.16.77'] })
+  assert.equal(given.reused, false)
+  assert.notEqual(given.ip, '100.64.16.77')
+  assert.equal(given.ip, allocateHostIp('vm-2', { subnet, taken: ['100.64.16.77'] }))
+})
+
+test('the node-wide entry point derives membership and routes it', async () => {
+  const h = sharedHarness()
+  const vms = [
+    {
+      id: 'vm-1',
+      node_id: 'node-a',
+      runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' },
+      proxy: { id: 'px-1' },
+    },
+    { id: 'vm-2', node_id: 'node-a', runtime: {}, proxy: { id: 'px-2' } },
+  ]
+  const r = await ensureSharedEgressForVms('/tmp/root', vms, {
+    nodeId: 'node-a',
+    proxyUrlOf: () => 'socks5h://a:1080',
+    ...h.opts,
+  })
+  assert.equal(r.ok, true)
+  // Only the shared VM is in the table; the per-vm one keeps its own helper.
+  assert.equal(r.routes, 1)
+  assert.deepEqual(h.startCalls[0].routes, [{ vm_ip: '100.64.16.3', proxy_url: 'socks5h://a:1080' }])
+})
+
+test('a node with only per-vm VMs stands up no shared helper', async () => {
+  const h = sharedHarness()
+  const r = await ensureSharedEgressForVms(
+    '/tmp/root',
+    [{ id: 'vm-1', node_id: 'node-a', runtime: {}, proxy: { id: 'px-1' } }],
+    {
+      nodeId: 'node-a',
+      ...h.opts,
+    },
+  )
+  assert.equal(r.ok, true)
+  assert.equal(r.routes, 0)
+  assert.equal(h.startCalls.length, 0)
+  assert.equal(h.docker.calls.filter((a) => a[1] === 'create').length, 0)
 })
