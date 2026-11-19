@@ -41,7 +41,7 @@ function dockerFrame(payload) {
   return Buffer.concat([header, payload])
 }
 
-function buildLoginHarness(t, { vmId = 'vm-01', runtime = 'docker' } = {}) {
+function buildLoginHarness(t, { vmId = 'vm-01', runtime = 'docker', stallInspect = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-login-'))
   fs.mkdirSync(path.join(root, 'vms'))
   fs.writeFileSync(
@@ -95,6 +95,9 @@ function buildLoginHarness(t, { vmId = 'vm-01', runtime = 'docker' } = {}) {
         .writeHead(200)
         .end(req.url.startsWith(`/exec/${'d'.repeat(64)}`) ? dockerFrame(nativeCredentialOutput()) : undefined)
     } else if (/^\/exec\/[a-f0-9]{64}\/json$/.test(req.url)) {
+      // The TTY login exec's exit-code inspect is the first node-link hop of
+      // the commit; stalling it must still trip the deadline.
+      if (stallInspect && req.url.startsWith(`/exec/${'a'.repeat(64)}`)) return
       res.end(JSON.stringify({ Running: false, ExitCode: 0 }))
     } else {
       res.end(JSON.stringify({ Running: false, ExitCode: 0 }))
@@ -144,7 +147,7 @@ test('native login commit deadline reports a framed error when the node link sta
   process.env.KIN_LOGIN_COMMIT_DEADLINE_MS = '300'
   t.after(() => delete process.env.KIN_LOGIN_COMMIT_DEADLINE_MS)
   const harness = buildLoginHarness(t)
-  // The credential read never resolves: the engine answered, the panel hangs.
+  // The import never resolves: the engine answered, the panel-side commit hangs.
   const { ws } = await openLoginShell(t, harness, {
     importOauth: () => new Promise(() => {}),
   })
@@ -163,21 +166,57 @@ test('native login commit deadline reports a framed error when the node link sta
   assert.match(error.message, /超时/)
 })
 
+test('native login commit deadline also covers a stalled exit-code inspect', async (t) => {
+  process.env.KIN_LOGIN_COMMIT_DEADLINE_MS = '300'
+  t.after(() => delete process.env.KIN_LOGIN_COMMIT_DEADLINE_MS)
+  const harness = buildLoginHarness(t, { stallInspect: true })
+  let imported = false
+  const { ws } = await openLoginShell(t, harness, {
+    importOauth: async () => {
+      imported = true
+      return { ok: true, official_cc_bootstrap: null }
+    },
+  })
+  const frames = []
+  ws.on('message', (raw) => frames.push(JSON.parse(String(raw))))
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    if (frames.some((f) => f.t === 'error')) break
+    await delay(100)
+  }
+  const error = frames.find((f) => f.t === 'error')
+  assert.ok(error, 'expected an error frame when the exit-code inspect stalls')
+  assert.match(error.message, /超时/)
+  assert.equal(imported, false, 'a stalled inspect must not proceed to import')
+})
+
 test('native login commit completes normally inside the deadline', async (t) => {
   process.env.KIN_LOGIN_COMMIT_DEADLINE_MS = '30000'
   t.after(() => delete process.env.KIN_LOGIN_COMMIT_DEADLINE_MS)
   const harness = buildLoginHarness(t)
+  let imported = 0
   const { ws } = await openLoginShell(t, harness, {
-    importOauth: async () => ({ ok: true, official_cc_bootstrap: null }),
+    importOauth: async () => {
+      imported += 1
+      return { ok: true, official_cc_bootstrap: null }
+    },
   })
   const frames = []
   ws.on('message', (raw) => frames.push(JSON.parse(String(raw))))
-  await delay(150)
-  ws.close(1000)
-  // The stubbed import resolves immediately; no error frame should arrive.
-  await delay(800)
+  // The commit must actually run and report success — "no error frame" alone
+  // would also pass if the commit never started.
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    if (frames.some((f) => f.t === 'login' || f.t === 'error')) break
+    await delay(50)
+  }
   assert.equal(
     frames.some((f) => f.t === 'error'),
     false,
+    JSON.stringify(frames.filter((f) => f.t === 'error')),
   )
+  const login = frames.find((f) => f.t === 'login')
+  assert.ok(login, 'expected a login success frame')
+  assert.equal(login.ok, true)
+  assert.equal(imported, 1)
 })

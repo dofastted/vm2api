@@ -46,6 +46,9 @@ function loginCommitDeadlineMs() {
   return Math.max(1_000, Number(process.env.KIN_LOGIN_COMMIT_DEADLINE_MS) || 180_000)
 }
 
+const LOGIN_COMMIT_TIMEOUT_MESSAGE =
+  '凭证确认超时（节点链路无响应）。请稍后在槽位详情确认凭证是否已写入；未写入则重新生成授权链接。'
+
 /** Reject with a stable code when `ms` elapses before `promise` settles. */
 function loginDeadline(promise, ms) {
   let timer
@@ -544,8 +547,22 @@ export function createSlotShell({
       if (ended) return
       ended = true
       clearInterval(syncTimer)
-      const info = await inspectExec(connect, session.execId).catch(() => null)
-      if (size.login && info?.ExitCode !== 124) {
+      // One deadline budget covers every node-link hop of the login commit:
+      // inspectExec, readNativeLoginOauth and importOauth. A stalled link at
+      // any hop (including the exit-code inspect) must not wedge the dialog.
+      const commitDeadlineAt = size.login ? Date.now() + loginCommitDeadlineMs() : 0
+      const remainingMs = () => Math.max(0, commitDeadlineAt - Date.now())
+      let inspectStalled = false
+      const info = await (size.login
+        ? loginDeadline(inspectExec(connect, session.execId), remainingMs())
+        : inspectExec(connect, session.execId)
+      ).catch((err) => {
+        if (err?.code === 'login_commit_timeout') inspectStalled = true
+        return null
+      })
+      if (inspectStalled) {
+        sendError(LOGIN_COMMIT_TIMEOUT_MESSAGE)
+      } else if (size.login && info?.ExitCode !== 124) {
         try {
           // readNativeLoginOauth + importOauth both cross the node SSH link.
           // Without a deadline a stalled link wedges the panel dialog forever.
@@ -565,7 +582,7 @@ export function createSlotShell({
                 fromNativeLogin: true,
               })
             })(),
-            loginCommitDeadlineMs(),
+            remainingMs(),
           )
           if (!committed?.ok) {
             sendError(committed?.error?.message || '授权成功，但面板未能同步凭证')
@@ -576,7 +593,7 @@ export function createSlotShell({
           }
         } catch (err) {
           if (err?.code === 'login_commit_timeout') {
-            sendError('凭证确认超时（节点链路无响应）。请稍后在槽位详情确认凭证是否已写入；未写入则重新生成授权链接。')
+            sendError(LOGIN_COMMIT_TIMEOUT_MESSAGE)
           } else {
             sendError(err.code?.startsWith('auth_login_') ? err.message : '面板未能保存原生 CC 凭证，请检查槽位后重试')
           }
