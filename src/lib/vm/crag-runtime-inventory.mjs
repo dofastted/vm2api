@@ -9,7 +9,7 @@ import { checkCragLicense, getCragLicense, readCragSubscriptionReleaseCandidate 
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { normalizeKernelDataplane, resolveKernelDataplane } from './slot-engine.mjs'
 import { slotExec } from './slot-runtime.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isClaudeVm } from './vm-kind.mjs'
 
 const CACHE_TTL_MS = 2000
 const MAX_PROBES = 8
@@ -318,7 +318,7 @@ export function createCragRuntimeInventory({
           typeof vm.id !== 'string' ||
           !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(vm.id) ||
           vm.id === '..' ||
-          isCodexVm(vm) ||
+          !isClaudeVm(vm) ||
           isNativeNodeVm(vm) ||
           (!vmNodeId(vm) && process.platform !== 'linux')
         )

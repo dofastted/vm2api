@@ -2,6 +2,9 @@ import type { Vm } from '@/types/panel-vm'
 import { describe, expect, it } from 'vitest'
 import {
   credEndpointOf,
+  canRefreshCredential,
+  credTypeOf,
+  supportsOfficialCc,
   defaultImportKind,
   defaultImportMethod,
   IMPORT_KINDS,
@@ -122,5 +125,26 @@ describe('credEndpointOf', () => {
     ).toBe('oauth')
     expect(credEndpointOf(claude({ has_token: false }))).toBe('none')
     expect(credEndpointOf(undefined)).toBe('none')
+  })
+})
+
+describe('Antigravity credential surface', () => {
+  it('uses official-client login without Claude credential operations', () => {
+    const vm: Vm = {
+      id: 'ag',
+      platform: 'antigravity',
+      has_token: false,
+      has_refresh: false,
+      antigravity: { authenticated: true },
+      credential_mode: 'setup-token',
+    }
+    expect(importSurfaceFor(vm)).toBe('antigravity')
+    expect(credTypeOf(vm)).toBe('oauth')
+    expect(credEndpointOf(vm)).toBe('oauth')
+    expect(supportsOfficialCc(vm)).toBe(false)
+    expect(canRefreshCredential(vm)).toBe(false)
+    expect(importSurfaceFor({ id: 'bad', platform: 'unsupported' })).toBe(
+      'unknown'
+    )
   })
 })

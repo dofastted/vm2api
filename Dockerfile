@@ -25,6 +25,8 @@ WORKDIR /src
 COPY deploy/payload.json deploy/payload.json
 COPY scripts/fetch-payload.mjs scripts/fetch-payload.mjs
 RUN node scripts/fetch-payload.mjs --dest /payload
+COPY scripts/fetch-antigravity-cli.mjs scripts/fetch-antigravity-cli.mjs
+RUN node scripts/fetch-antigravity-cli.mjs --dest /antigravity-cli
 
 FROM node:22-bookworm-slim
 RUN apt-get update \
@@ -42,6 +44,7 @@ COPY docker/kin-os ./docker/kin-os
 COPY docker/kin-kvm ./docker/kin-kvm
 COPY --from=web /src/web/dist ./web/dist
 COPY --from=payload /payload/bin/ /opt/vm2api/image-bin/
+COPY --from=payload /antigravity-cli/ /opt/vm2api/image-antigravity-cli/
 COPY --from=helpers /out/ /opt/vm2api/image-bin/
 COPY share/wrap-cli /opt/vm2api/image-wrap-cli
 COPY --from=payload /payload/share/wrap-cli/ /opt/vm2api/image-wrap-cli/

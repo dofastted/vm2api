@@ -12,7 +12,7 @@ import {
   startVmKernelSwitch,
   type VmKernelSwitchJob,
 } from '@/lib/api'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/confirm-dialog'
@@ -88,6 +88,16 @@ export function VmEngineEditor({
     onError: (error: Error) =>
       toast.error(`恢复跟随全局失败：${error.message}`),
   })
+
+  if (isAntigravityVm(vm))
+    return (
+      <CardSection title='推理运行时'>
+        <p className='text-sm'>Antigravity 独立运行时 · 官方客户端接入</p>
+        <p className='mt-2 text-xs text-muted-foreground'>
+          账号页完成 OAuth，测试页同步账号模型，平台设置中控制 API 接入。
+        </p>
+      </CardSection>
+    )
 
   return (
     <CardSection title='推理内核'>

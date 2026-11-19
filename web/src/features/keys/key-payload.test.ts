@@ -19,6 +19,12 @@ const draft: KeyLimitsDraft = {
 }
 
 describe('API key limit payload', () => {
+  it('preserves the independent Antigravity platform scope', () => {
+    expect(
+      keyLimitsPayload({ ...draft, group_type: 'antigravity' }, 'create')
+    ).toMatchObject({ group_type: 'antigravity', allowed_vms: ['vm-01'] })
+  })
+
   it('saves Gemini as admin-only OAuth without a VM scope', () => {
     const gemini = {
       ...draft,
@@ -41,6 +47,7 @@ describe('API key limit payload', () => {
       keyLimitsPayload({ ...gemini, category: 'api' }, 'create')
     ).toThrow('宿主机 OAuth')
   })
+
   it('keeps request and USD quotas separate', () => {
     expect(keyLimitsPayload(draft, 'create')).toEqual({
       name: 'ops',

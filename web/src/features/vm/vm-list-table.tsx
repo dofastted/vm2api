@@ -37,7 +37,12 @@ import {
   SLOT_BG,
   type SlotState,
 } from '@/lib/vm-health'
-import { clipLabel } from '@/lib/vm-kind'
+import {
+  clipLabel,
+  isAntigravityVm,
+  isClaudeVm,
+  slotCredentialLabel,
+} from '@/lib/vm-kind'
 import {
   claudeTier,
   poolStatus,
@@ -330,7 +335,8 @@ function rowData(vm: Vm, accounts?: UsageAccountRow[]): RowData {
   const [, d7, total] = vmCostLedger(vm, accounts)
   const week = vmWeekOutcome(vm, accounts)
   const win: RowData['win'] = {}
-  for (const w of vmWindows(vm)) win[w.key] = w
+  // Antigravity 没有 Claude / GPT 的 5H / 7D 窗口，额度在展开明细里按模型组显示。
+  if (!isAntigravityVm(vm)) for (const w of vmWindows(vm)) win[w.key] = w
   const h = healthSummary(vm.health_24h)
   return {
     vm,
@@ -340,7 +346,8 @@ function rowData(vm: Vm, accounts?: UsageAccountRow[]): RowData {
     win,
     today: vmTodayStats(vm, accounts).req,
     seatsUsed: Number(vm.seats_used) || 0,
-    seatsMax: vm.seats_max == null ? null : Number(vm.seats_max),
+    seatsMax:
+      !isClaudeVm(vm) || vm.seats_max == null ? null : Number(vm.seats_max),
     queue: Number(vm.queue_depth) || 0,
     inflight: vmRequestingCount(vm),
     spend: d7.cost,
@@ -525,7 +532,13 @@ function ProdCell({ vm }: { vm: Vm }) {
         )}
         title='当前内核'
       >
-        {vm.gemini ? 'CRAGAnti' : crag ? 'crag' : '默认'}
+        {vm.gemini
+          ? 'CRAGAnti'
+          : isAntigravityVm(vm)
+            ? '独立'
+            : crag
+              ? 'crag'
+              : '默认'}
       </span>
       <span
         className={cn(
@@ -534,7 +547,11 @@ function ProdCell({ vm }: { vm: Vm }) {
         )}
         title={vm.email || ''}
       >
-        {vm.email ? clipLabel(vm.email) : '未绑定邮箱'}
+        {isAntigravityVm(vm)
+          ? clipLabel(slotCredentialLabel(vm))
+          : vm.email
+            ? clipLabel(vm.email)
+            : '未绑定邮箱'}
       </span>
       <span
         className={cn(

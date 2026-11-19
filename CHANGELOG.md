@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- 新增 Antigravity 槽位平台（默认关闭）：本机 Docker 槽内运行官方 `agy` 1.4.4，Google OAuth 授权、账号模型同步与额度查询都在槽内经绑定出口完成。`/v1/messages`、`/v1/chat/completions`、`/v1/responses` 用官方基础模型 ID 调用，保留历史、system、图片与工具往返，补回 Gemini 工具调用的 `thoughtSignature`；独立账号池按分组密钥、所属用户、模型目录、并发与排队调度，会话按前缀粘在原槽以提高缓存命中。Antigravity 槽不进入 Claude 的内核同步重启、槽容量调整、遥测、CRAG 许可和凭据巡检。新增 `antigravity` 密钥分组，与 `gemini` 宿主环境分开。说明见 [Antigravity 接入](docs/ANTIGRAVITY.md)。
+- 每个 GPT 槽固定一个 Codex 安装身份：推理、搜索、生图、模型目录、OAuth 换票与额度查询共用该槽的安装 UUID、UA、`originator` 与 `version`；`originator` / `version` 从槽位 UA 派生，不转发调用方的值。
+- 宿主防火墙重载（如 `firewall-cmd --reload`）清掉槽位出口规则后，`kin-egress` 规则会被检测并恢复。
+
 ## 1.4.155 — 2026-11-19 · 未支付订单自动过期与手动取消
 
 - 已提交给商城但未支付的 CRAG 订单现在可以在面板取消。`reserved`（下单请求没拿到支付表单，买家从未收到支付链接）直接关闭，商城不可用时也能清理；`pending`（支付链接有效）先向商城复核，仍未支付才关闭，已支付的返回 `shop_order_paid` 并拒绝取消。此前只有未发给商城的订单可取消，导致失败的下单留下的订单永久堆积在历史里。

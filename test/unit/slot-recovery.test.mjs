@@ -541,6 +541,38 @@ test('bridge healer restarts a dead kin-egress once per interval and per proxy',
   assert.deepEqual(started, ['px-a', 'px-a'])
 })
 
+test('bridge healer reapplies egress rules dropped by a host firewall reload', async () => {
+  let now = 0
+  let intact = true
+  const started = []
+  const heal = createSlotBridgeHealer({
+    projectRoot: '/unused',
+    minIntervalMs: 60_000,
+    now: () => now,
+    logger: quiet,
+    ops: {
+      getVm: (_root, id) => ({ id, proxy: SOCKS }),
+      egressAlive: () => true,
+      egressRulesIntact: () => intact,
+      ensureProxyEgress: (proxy) => {
+        started.push(proxy.id)
+        return { ok: true }
+      },
+      cluster: () => null,
+    },
+  })
+  const vms = [{ id: 'vm-a', status: 'running' }]
+  await heal(vms)
+  assert.deepEqual(started, [], 'a listening helper with its rules is left alone')
+  intact = false
+  now = 61_000
+  await heal(vms)
+  assert.deepEqual(started, ['px-a'], 'a live helper whose NAT rules vanished is re-applied')
+  now = 90_000
+  await heal(vms)
+  assert.deepEqual(started, ['px-a'], 'rule checks are throttled per interval')
+})
+
 test('bridge healer rebuilds dead node relays only over a ready link', async () => {
   const healed = []
   let state = 'backoff'

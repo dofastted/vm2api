@@ -11,7 +11,7 @@ import { ArrowRight, ChevronRight, RefreshCw } from 'lucide-react'
 import { toast } from 'sonner'
 import { api, isApiError } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { isCodexVm, slotNameLabel } from '@/lib/vm-kind'
+import { isClaudeVm, slotNameLabel } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
@@ -247,7 +247,7 @@ export function TelemetryPane({
   const dash = useQuery(dashboardQueryOptions())
   const routing = useQuery(routingQueryOptions())
   const vms: Vm[] = dash.data?.vms || []
-  const claude = vms.filter((vm) => !isCodexVm(vm))
+  const claude = vms.filter((vm) => isClaudeVm(vm))
   const codexCount = vms.length - claude.length
   // A saved opt-out is not proof that the VM stopped its sender.
   const probed = claude

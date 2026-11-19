@@ -4,6 +4,7 @@
  */
 import { hasBoundExit, isLocalEgressProxy } from '../vm/egress.mjs'
 import { isVmScheduleReady, vmHasClaudeCredential, isCodexVm } from '../vm/vm-registry.mjs'
+import { isClaudeVm, normalizeVmKind } from '../vm/vm-kind.mjs'
 import { expiresAtToMs, hasRefreshPresence } from '../oauth/oauth-credentials.mjs'
 import { rustKernelBusy } from '../transport/rust-kernel-client.mjs'
 import { socksProxyEndpoint } from '../vm/socks-address.mjs'
@@ -103,6 +104,7 @@ export function slotHasBoundProxy(vm) {
 
 export function evaluateSlotGate(vm) {
   if (isCodexVm(vm)) return { ok: false, reason: 'codex_vm' }
+  if (!isClaudeVm(vm)) return { ok: false, reason: `${normalizeVmKind(vm).kind}_vm` }
   const blocked = proxyBlockedReason(vm?.proxy)
   if (blocked) return { ok: false, reason: blocked }
   const oauthProjection = /^oauth_/.test(String(vm?.schedule_disabled_reason || ''))

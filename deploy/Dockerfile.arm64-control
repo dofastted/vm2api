@@ -37,6 +37,8 @@ WORKDIR /src
 COPY deploy/payload.json deploy/payload.json
 COPY scripts/fetch-payload.mjs scripts/fetch-payload.mjs
 RUN node scripts/fetch-payload.mjs --dest /payload
+COPY scripts/fetch-antigravity-cli.mjs scripts/fetch-antigravity-cli.mjs
+RUN node scripts/fetch-antigravity-cli.mjs --dest /antigravity-cli
 
 # Native CLI only for local ARM slots; the portable x86 payload stays untouched.
 FROM --platform=linux/arm64 ${NODE_IMAGE} AS native-cli
@@ -77,6 +79,7 @@ COPY docker/kin-kvm/guest/kin-crag-license ./docker/kin-kvm/guest/kin-crag-licen
 COPY docker/kin-kvm/guest/kin-crag-subscription ./docker/kin-kvm/guest/kin-crag-subscription
 COPY --from=web /src/web/dist ./web/dist
 COPY --from=payload /payload/bin/ /opt/vm2api/image-bin/
+COPY --from=payload /antigravity-cli/ /opt/vm2api/image-antigravity-cli/
 COPY --from=helpers /out/amd64/ /opt/vm2api/cluster-bin-amd64/
 COPY share/wrap-cli /opt/vm2api/image-wrap-cli/
 COPY --from=payload /payload/share/wrap-cli/ /opt/vm2api/image-wrap-cli/

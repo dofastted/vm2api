@@ -5,7 +5,7 @@ import { SlidersHorizontal } from 'lucide-react'
 import { toast } from 'sonner'
 import { patchVm, type VmPatch } from '@/lib/api'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { seatTitle } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import {
@@ -293,6 +293,69 @@ function Tile({
   )
 }
 
+function AntigravityConcurrencyEditor({
+  vm,
+  ceiling,
+  current,
+}: {
+  vm: Vm
+  ceiling: number
+  current: number
+}) {
+  const qc = useQueryClient()
+  const [value, setValue] = useState(String(current))
+  const save = useMutation({
+    mutationFn: (next: number | null) =>
+      patchVm(vm.id, { max_concurrency: next }),
+    onSuccess: (_data, next) => {
+      toast.success(
+        next === null ? '已改为跟随全局并发' : `本槽并发已设为 ${next}`
+      )
+      void qc.invalidateQueries({ queryKey: vmQueryOptions(vm.id).queryKey })
+      void qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey })
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const parsed = Number(value)
+  const valid = Number.isInteger(parsed) && parsed >= 1 && parsed <= ceiling
+  return (
+    <div className='flex flex-wrap items-center gap-2'>
+      <Label htmlFor={`ag-conc-${vm.id}`} className='text-xs font-normal'>
+        本槽并发（1–{ceiling}）
+      </Label>
+      <Input
+        id={`ag-conc-${vm.id}`}
+        type='number'
+        min={1}
+        max={ceiling}
+        className='h-7 w-20'
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+      />
+      <Button
+        size='sm'
+        variant='outline'
+        className='h-7'
+        disabled={!valid || save.isPending}
+        onClick={() => save.mutate(parsed)}
+      >
+        保存
+      </Button>
+      {vm.concurrency_override ? (
+        <Button
+          size='sm'
+          variant='ghost'
+          className='h-7'
+          disabled={save.isPending}
+          onClick={() => save.mutate(null)}
+        >
+          跟随全局
+        </Button>
+      ) : null}
+    </div>
+  )
+}
+
 /**
  * VM 内的「调度」块：席位、并发、RPM、调度优先级与配额闸的生效值；
  * 本槽覆盖的项高亮，悬停看全局值，一个弹窗改全部。
@@ -320,6 +383,28 @@ export function VmSchedulingBlock({
   const quotaOverride = vm.quota_override || {}
   const level = Number(vm.schedule_level)
   const canEdit = useVmPerms().admin
+
+  if (isAntigravityVm(vm)) {
+    const ceiling = Number(vm.max_sessions) || 1
+    return (
+      <div className='space-y-1.5 rounded-md border px-2.5 py-2 text-xs'>
+        <div className='font-medium'>Antigravity API 调度</div>
+        <p className='text-muted-foreground'>
+          完成账号授权并同步可用模型后，使用槽位开关控制 API 调度。 当前并发{' '}
+          {inf}/{concMax || 1}
+          {vm.concurrency_override ? '（本槽覆盖）' : '（跟随全局）'}，排队{' '}
+          {queued}。
+        </p>
+        {canEdit ? (
+          <AntigravityConcurrencyEditor
+            vm={vm}
+            ceiling={ceiling}
+            current={concMax || 1}
+          />
+        ) : null}
+      </div>
+    )
+  }
 
   return (
     <div className='space-y-2 rounded-md border border-primary/30 bg-primary/5 px-2.5 py-2'>
@@ -515,6 +600,11 @@ function KnobRow({
 }
 
 export function VmSchedulingEditor({ vm }: { vm: Vm }) {
+  if (isAntigravityVm(vm)) return null
+  return <NativeVmSchedulingEditor vm={vm} />
+}
+
+function NativeVmSchedulingEditor({ vm }: { vm: Vm }) {
   const qc = useQueryClient()
   const [open, setOpen] = useState(false)
   const [draft, setDraft] = useState(() => draftOf(vm))

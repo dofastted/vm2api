@@ -68,6 +68,30 @@ test('initVmDbSync reconciles existing vm files into DB (credentials included)',
   assert.equal(repo.getActiveVmId(), 'vm-t1')
 })
 
+test('Antigravity DB mirrors only display metadata, never CLI or leftover provider secrets', () => {
+  const vm = seedVmFile('vm-ag', {
+    platform: 'antigravity',
+    antigravity: {
+      email: 'ag@example.com',
+      access_token: 'ag-secret',
+      refresh_token: 'ag-refresh',
+      keyring: { secret: 'keyring-secret' },
+    },
+    codex: { access_token: 'old-gpt-secret' },
+  })
+  const repo = new VmsRepo(getDb())
+  repo.upsertFromVmJson(vm)
+  const row = repo.get(vm.id)
+  assert.equal(row.email, 'ag@example.com')
+  assert.equal(row.access_token, null)
+  assert.equal(row.refresh_token, null)
+  assert.deepEqual(row.vm.antigravity, { email: 'ag@example.com' })
+  assert.equal(row.vm.claude, undefined)
+  assert.equal(row.vm.codex, undefined)
+  const stored = getDb().prepare('SELECT vm_json FROM vms WHERE id = ?').get(vm.id).vm_json
+  assert.doesNotMatch(stored, /ag-secret|ag-refresh|keyring-secret|old-gpt-secret|sk-ant-/)
+})
+
 test('startup reclaims deleted users assigned VMs, including DB-only restored records', () => {
   process.env.KIN_DB_SECRET = 'reclaim-test-secret'
   const users = new UsersRepo(getDb())

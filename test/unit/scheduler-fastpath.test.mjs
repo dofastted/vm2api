@@ -379,6 +379,16 @@ test('database errors do not reuse a prior candidate snapshot', async (t) => {
   assert.equal(pool.inflight.size, 0)
 })
 
+test('maintenance probes running Claude slots and skips GPT slots', async (t) => {
+  const { root, pool, probes } = fixture(t)
+  fs.writeFileSync(
+    path.join(root, 'vms', 'gpt-01.json'),
+    JSON.stringify({ id: 'gpt-01', name: 'gpt-01', status: 'running', schedulable: true, platform: 'openai' }),
+  )
+  await pool.maintain()
+  assert.deepEqual(probes.sort(), ['vm-01', 'vm-02'])
+})
+
 test('missing and disabled account admissions have explicit schedule-state reasons', async () => {
   const { stateOfReason } = await import('../../src/lib/pool/schedule-state.mjs')
   assert.equal(stateOfReason('account_missing').state, 'unschedulable')

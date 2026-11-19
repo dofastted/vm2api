@@ -11,6 +11,7 @@ import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
 import { redactionStatus } from '../redaction/runtime.mjs'
 import { readSlotProcessStatus } from '../vm/slot-process-status.mjs'
+import { isAntigravityVm } from '../vm/vm-kind.mjs'
 import { openaiUsageAccountId } from '../vm/codex-slot.mjs'
 import os from 'node:os'
 import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
@@ -59,6 +60,8 @@ import { hardBlockOf } from '../pool/rate-limit-service.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { codexMaxSessions, codexScheduleLevel } from '../pool/codex-slot-pool.mjs'
+import { antigravityPoolRuntime } from '../pool/antigravity-slot-pool.mjs'
+import { readAntigravityQuota } from '../oauth/antigravity-quota.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
 import { activeHoursZoneOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import {
@@ -101,6 +104,7 @@ import {
 import { PERSONA_STANDING_MAX } from '../identity/crs-persona.mjs'
 import { MESSAGES_BREAKPOINT_MODES } from '../protocol/cache-ttl.mjs'
 import { normalizeCodexRouting, normalizeInferenceWebsocket } from '../protocol/codex-route.mjs'
+import { normalizeAntigravityRouting } from '../protocol/antigravity-route.mjs'
 import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
 import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { normalizeVmConfig, memoryMiB } from '../vm/machine-spec.mjs'
@@ -879,6 +883,25 @@ export async function buildVmDetail({
     clusterNodes,
     role,
   })
+  if (isAntigravityVm(vm)) {
+    return ok({
+      vm: summary,
+      proxy: summary.proxy || null,
+      proxy_pool: summarizeProxyPool(proxyPool),
+      billing: null,
+      account: null,
+      official_cc: null,
+      kernel: {
+        credential_owner: 'antigravity',
+        configured_engine: 'antigravity',
+        resolved_engine: 'antigravity',
+        active_engine: null,
+        go_health: null,
+        rust_health: null,
+        codex_health: null,
+      },
+    })
+  }
   const acc = findAccount(accountQuota, summary)
   const billing = (() => {
     try {
@@ -1138,6 +1161,16 @@ export async function buildProbeOne({
   routingConfig = {},
 } = {}) {
   const vm = getVm(cfg.paths.project, id)
+  if (isAntigravityVm(vm)) {
+    return fail(
+      makeError({
+        type: ErrorType.INVALID_REQUEST,
+        code: 'antigravity_operation_unsupported',
+        message: '请使用 Antigravity 专用状态面板与文本会话',
+        status: 400,
+      }),
+    )
+  }
   if (!vm) {
     return fail(
       makeError({
@@ -1555,6 +1588,7 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     inference: presentInference(routingConfig?.inference),
     websocket: normalizeInferenceWebsocket(routingConfig?.websocket),
     codex: normalizeCodexRouting(routingConfig?.codex),
+    antigravity: normalizeAntigravityRouting(routingConfig?.antigravity),
     official_cc: normalizeOfficialCcConfig(routingConfig?.official_cc),
     health_probe: normalizeHealthProbeConfig(routingConfig?.health_probe),
     usage_probe: normalizeUsageProbeConfig(routingConfig?.usage_probe),
@@ -1858,6 +1892,42 @@ function mergeVmProxy(v, poolSnap, { role = 'admin', nodes = [] } = {}) {
 }
 
 function enrichVm(v, accountQuota, active, extras = {}) {
+  if (isAntigravityVm(v)) {
+    const proxy = mergeVmProxy(v, extras.poolSnap, { role: extras.role, nodes: extras.clusterNodes })
+    const config = normalizeAntigravityRouting(extras.routingConfig?.antigravity)
+    const authenticated = v.antigravity?.authenticated === true
+    const schedulable = authenticated && v.schedulable !== false
+    const runtime = antigravityPoolRuntime.snapshot(v.id)
+    return {
+      ...v,
+      ...proxy,
+      is_active: v.id === active,
+      resolved_inference_engine: 'antigravity',
+      resolved_persona_preset: null,
+      schedulable,
+      schedule_disabled_reason: schedulable
+        ? null
+        : !authenticated
+          ? 'antigravity_official_login_required'
+          : v.schedule_disabled_reason || 'manual',
+      max_concurrency: Math.max(1, Math.min(config.max_sessions, Number(v.max_concurrency) || config.max_sessions)),
+      max_sessions: config.max_sessions,
+      max_sessions_override: false,
+      max_rpm: v.max_rpm ?? 0,
+      concurrency_override: v.max_concurrency_override === true,
+      rpm_override: v.max_rpm_override === true,
+      scheduling_inherited: {
+        max_concurrency: config.max_sessions,
+        max_sessions: config.max_sessions,
+        max_rpm: 0,
+        session_slots: null,
+      },
+      inflight: runtime.inFlight,
+      rpm: runtime.rpm,
+      can_import_credential: proxy.can_import_credential && !v.node_id && runtimeKind(v) === 'docker',
+      antigravity_quota: extras.projectRoot ? readAntigravityQuota(extras.projectRoot, v) : null,
+    }
+  }
   if (extras.projectRoot && isLeftoverQuotaScheduleOff(v)) {
     migrateVmSchedule(extras.projectRoot, v.id)
     const fresh = getVm(extras.projectRoot, v.id)

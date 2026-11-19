@@ -1,6 +1,7 @@
 import { useQueryClient } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
+import { isAntigravityVm } from '@/lib/vm-kind'
 import {
   Dialog,
   DialogContent,
@@ -30,7 +31,9 @@ export function VmReauthDialog({
             {vm ? <SlotIdentity vm={vm} compact /> : null}
           </DialogTitle>
           <DialogDescription>
-            生成授权链接换取新凭证，写入后覆盖当前槽位的令牌。
+            {vm && isAntigravityVm(vm)
+              ? '完成官方 Antigravity OAuth 登录，将账号绑定到当前槽位。'
+              : '生成授权链接换取新凭证，写入后覆盖当前槽位的令牌。'}
           </DialogDescription>
         </DialogHeader>
         <div className='-me-3 min-h-0 flex-1 overflow-y-auto pe-3'>

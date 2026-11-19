@@ -19,7 +19,7 @@
  */
 import { KERNEL_NATIVE_SLOT_COUNT, resolveSessionSlots } from './slot-engine.mjs'
 import { memoryMiB, slotMemory, VM_MEMORY_OPTIONS } from './machine-spec.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isClaudeVm } from './vm-kind.mjs'
 
 export const SLOT_PLAN_KEYS = Object.freeze(['pro', 'max_5x', 'max_20x', 'default'])
 /** Docker's default for slot containers before this module existed. */
@@ -181,7 +181,7 @@ export function slotCreationLimits(vm, routing) {
   const recorded = slotMemory(vm, routing)
   const pids = recordedPidsLimit(vm)
   const cfg = slotCapacityConfig(routing)
-  if (!cfg.enabled || isCodexVm(vm)) return { memory: recorded, pids }
+  if (!cfg.enabled || !isClaudeVm(vm)) return { memory: recorded, pids }
   const target = slotCapacityTarget(vm, routing)
   return {
     memory: memoryMiB(target.memory) > memoryMiB(recorded) ? target.memory : recorded,

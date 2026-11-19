@@ -484,5 +484,7 @@ function scopeText(item: ApiKeyItem): string {
     return `Anthropic · ${item.allowed_vms?.length || 0} 台`
   if (item.group_type === 'openai')
     return `OpenAI · ${item.allowed_vms?.length || 0} 台`
+  if (item.group_type === 'antigravity')
+    return `Antigravity · ${item.allowed_vms?.length || 0} 台`
   return '全局'
 }

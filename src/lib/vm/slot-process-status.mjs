@@ -10,7 +10,7 @@ import { isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { slotExec } from './slot-runtime.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 import { slotHost } from './slot-host.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isClaudeVm } from './vm-kind.mjs'
 import { runSlotProcess } from '../transport/slot-oauth.mjs'
 import { slotExecArgv, slotExecContainer } from './slot-exec.mjs'
 import { inspectContainerOrNull } from '../cluster/docker-remote.mjs'
@@ -35,6 +35,7 @@ printf '{"ok":true}\\n'
 
 export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect = inspectContainerOrNull } = {}) {
   if (!vm?.id) return { ok: false, code: 'invalid_vm' }
+  if (!isClaudeVm(vm)) return { ok: true, running: false }
   const host = slotHost(vm)
   if (host.native) return { ok: false, code: 'telemetry_unsupported' }
   let runtime
@@ -62,7 +63,7 @@ export async function readSlotProcessStatus({
 } = {}) {
   const unknown = { telemetry: null, process_topology: null }
   if (!projectRoot || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$/.test(String(vm?.id || ''))) return unknown
-  if (isCodexVm(vm) || slotHost(vm).native) {
+  if (!isClaudeVm(vm) || slotHost(vm).native) {
     return {
       ...unknown,
       telemetry: { enabled: false, state: 'unsupported', pending_events: 0, last_upload_at: null, last_error: null },

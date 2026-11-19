@@ -21,6 +21,16 @@ const vms = new Map<string, Vm>([
 ])
 
 describe('billing platform split', () => {
+  it('keeps Antigravity costs separate from Claude and GPT', () => {
+    const slots = new Map(vms)
+    slots.set('vm-a', { id: 'vm-a', platform: 'antigravity' } as Vm)
+    const out = splitBilling([row('vm-a', 5)], 'vm', slots)
+    expect(out.rows[0].kind).toBe('antigravity')
+    expect(out.antigravity.cost_usd).toBe(5)
+    expect(out.claude.cost_usd).toBe(0)
+    expect(out.gpt.cost_usd).toBe(0)
+  })
+
   it('puts GPT slots under GPT and Claude slots under Claude', () => {
     const out = splitBilling([row('vm-c', 2), row('vm-g', 3)], 'vm', vms)
     expect(out.claude.cost_usd).toBe(2)

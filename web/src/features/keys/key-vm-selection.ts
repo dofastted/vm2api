@@ -1,10 +1,11 @@
 import type { Vm } from '@/types/panel-vm'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isClaudeVm, isCodexVm } from '@/lib/vm-kind'
 import type { KeyGroupType, KeyLimitsDraft } from './key-payload'
 
 export function vmsInGroup(vms: Vm[], group: KeyGroupType): Vm[] {
   if (group === 'openai') return vms.filter((vm) => isCodexVm(vm))
-  if (group === 'anthropic') return vms.filter((vm) => !isCodexVm(vm))
+  if (group === 'anthropic') return vms.filter((vm) => isClaudeVm(vm))
+  if (group === 'antigravity') return vms.filter((vm) => isAntigravityVm(vm))
   return []
 }
 
@@ -16,7 +17,9 @@ export function keyVmSelection(
 ) {
   const scoped =
     draft.category === 'oauth' &&
-    (draft.group_type === 'anthropic' || draft.group_type === 'openai')
+    (draft.group_type === 'anthropic' ||
+      draft.group_type === 'openai' ||
+      draft.group_type === 'antigravity')
   if (!scoped || !inventoryReady) {
     return { draft, removed: [] as string[], blocked: scoped }
   }

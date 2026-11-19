@@ -1,7 +1,7 @@
 import type { Vm } from '@/types/panel-vm'
 import { expiresAtToMs, fableUsedOf, fableWeeklyFull } from '@/lib/fable-status'
 import { pct, usedPctOf } from '@/lib/format'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { accountUsable, claudeTier, fablePlanDenied } from '@/lib/vm-status'
 
 /**
@@ -74,7 +74,8 @@ function buildWindow(
  * 不受 OAuth refresh 相关错误字段影响（vm-05 案例）。
  */
 export function poolEligible(vm: Vm): boolean {
-  return accountUsable(vm)
+  // Antigravity exposes model access, not measured Claude/GPT quota windows.
+  return !isAntigravityVm(vm) && accountUsable(vm)
 }
 
 /** 该窗口有没有实测用量。缺省时 `usedPctOf` 回 0，不能当成「确认没用过」。 */

@@ -115,6 +115,10 @@ import {
 } from './lib/oauth/oauth-credentials.mjs'
 import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
 import { ensureWorkerCredential, repairLocalCredentialLink } from './lib/transport/go-worker-client.mjs'
+import { stopAllAntigravityBridges } from './lib/transport/antigravity-bridge-supervisor.mjs'
+import { stopAllAntigravityAuthLogins } from './lib/oauth/antigravity-auth-login.mjs'
+import { createAntigravityQuotaMonitor } from './lib/oauth/antigravity-quota.mjs'
+import { isClaudeVm } from './lib/vm/vm-kind.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
 import { corsHeadersForRequest } from './lib/http/cors.mjs'
@@ -203,6 +207,7 @@ let cliNodeGuard = null
 let usageProbeMonitor = null
 let catalogMonitor = null
 let notifyMonitor = null
+let antigravityQuotaMonitor = null
 
 let routingConfig = {}
 
@@ -446,7 +451,7 @@ const USAGE_ACTIVE_WINDOW_MS = 5 * 3600_000
 
 /** Serving traffic within one 5h window, or still holding pinned conversations (#163). */
 function usageProbeActive(vm, account) {
-  if (isCodexVm(vm)) return false
+  if (!isClaudeVm(vm)) return false
   const id = account?.account_id || vm?.claude?.account_uuid || vm?.account_uuid || vm?.id
   const lastUsed = Number(poolScheduler?.lastUsed?.get?.(id) || runtimeRepo?.get?.(id)?.last_used_at || 0)
   if (lastUsed && Date.now() - lastUsed < USAGE_ACTIVE_WINDOW_MS) return true
@@ -536,6 +541,12 @@ kernelWatchdog = createKernelWatchdog({
   homeDirFor: (vm) => path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'),
   revive: (vm) => bootSlot(vm.id),
   healBridges: createSlotBridgeHealer({ projectRoot: cfg.paths.project }),
+})
+
+antigravityQuotaMonitor = createAntigravityQuotaMonitor({
+  projectRoot: cfg.paths.project,
+  listTargets: () => listVms(cfg.paths.project),
+  getRouting: () => routingConfig,
 })
 
 configureSlotCapacity(routingConfig.slot_capacity)
@@ -879,7 +890,7 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
 
 function fetchWorkerModels(opts = {}) {
   const mappingKeys = Object.keys(routingConfig?.codex?.model_mappings || {})
-  return gatewayModelCatalog({ ...opts, mappingKeys })
+  return gatewayModelCatalog({ ...opts, mappingKeys, antigravityRouting: routingConfig.antigravity })
 }
 
 const importCommit = createImportCommit({
@@ -1035,7 +1046,7 @@ const slotShell = createSlotShell({
   importOauth: commitImportedOauth,
 })
 for (const vm of listVms(cfg.paths.project)) {
-  if (isCodexVm(vm)) continue
+  if (!isClaudeVm(vm)) continue
   try {
     ensureSlotSubscriptionType(path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'), vm.account_tier, {
       source: vm.account_tier_source,
@@ -1054,7 +1065,7 @@ const listCragTargets = () =>
     .map(({ id }) => getVm(cfg.paths.project, id))
     .filter(Boolean)
 
-const isCragSlot = (vm) => !isNativeNodeVm(vm) && !isCodexVm(vm) && resolveKernelDataplane(vm, routingConfig) === 'crag'
+const isCragSlot = (vm) => !isNativeNodeVm(vm) && isClaudeVm(vm) && resolveKernelDataplane(vm, routingConfig) === 'crag'
 
 const cragSubscription = createCragSubscription({
   projectRoot: cfg.paths.project,
@@ -1067,7 +1078,7 @@ const cragSubscription = createCragSubscription({
   getTarget: (id) => getVm(cfg.paths.project, id),
   isLocalCragSlot: (vm) =>
     !isNativeNodeVm(vm) &&
-    !isCodexVm(vm) &&
+    isClaudeVm(vm) &&
     (vm.node_id || isKvmRuntime(vm) || Boolean(installedCragV2Root(cfg.paths.project, vm))),
   isSubscriptionSlot: isCragSlot,
   assertReady: (vm, opts) => assertCragSubscriptionTarget(cfg.paths.project, vm, routingConfig, opts),
@@ -1209,6 +1220,9 @@ const gracefulShutdown = createGracefulShutdown({
       usageProbeMonitor?.stop?.()
     } catch {}
     try {
+      antigravityQuotaMonitor?.stop?.()
+    } catch {}
+    try {
       catalogMonitor?.stop?.()
     } catch {}
     try {
@@ -1220,6 +1234,8 @@ const gracefulShutdown = createGracefulShutdown({
       stopVmWatch()
     } catch {}
     try {
+      await stopAllAntigravityAuthLogins()
+      await stopAllAntigravityBridges(cfg.paths.project)
       stopAllRustKernels()
     } catch {}
     try {
@@ -1602,6 +1618,11 @@ server.listen(cfg.port, cfg.host, () => {
   }
   // The KIN_CRS_MOCK harness promises no outbound network; catalogs stay on builtin data there.
   if (process.env.KIN_CRS_MOCK !== '1') {
+    try {
+      antigravityQuotaMonitor?.start?.({ immediate: true })
+    } catch (e) {
+      console.warn('[antigravity-quota] start failed', e?.message || e)
+    }
     try {
       catalogMonitor?.start?.()
     } catch (e) {

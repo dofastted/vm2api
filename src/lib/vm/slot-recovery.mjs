@@ -20,9 +20,11 @@ import {
 } from '../transport/rust-kernel-client.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { codexKernelTracked } from '../transport/codex-kernel-supervisor.mjs'
+import { antigravityBridgeStatus } from '../transport/antigravity-bridge-supervisor.mjs'
 import {
   egressListening,
   ensureProxyEgress,
+  egressRulesIntact,
   hasBoundExit,
   inspectEgressProcess,
   isLocalEgressProxy,
@@ -35,7 +37,7 @@ import { slotExecContainer } from './slot-exec.mjs'
 import { slotHost } from './slot-host.mjs'
 import { slotExec, startSlotReady, stopSlot } from './slot-runtime.mjs'
 import { withCragRuntimeAdmission } from './slot-runtime-admission.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isAntigravityVm, isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotDockerCpus } from './machine-spec.mjs'
 import { withSlotMaintenance } from './slot-maintenance.mjs'
@@ -71,6 +73,7 @@ function check(id, label, status, code, message, detail) {
 }
 
 function slotEngine(vm, routing) {
+  if (isAntigravityVm(vm)) return 'antigravity'
   return isCodexVm(vm) ? 'codex' : resolveInferenceEngine(vm, routing || {})
 }
 
@@ -134,8 +137,13 @@ const DEFAULT_PROBES = Object.freeze({
   container: inspectSlotContainer,
   rustHealth: (exec) => rustKernelHealth(exec, { timeoutMs: HEALTH_TIMEOUT_MS }),
   codexHealth: (exec) => codexKernelHealth(exec, { timeoutMs: HEALTH_TIMEOUT_MS }),
+  antigravityHealth: (projectRoot, vm, routing) => antigravityBridgeStatus({ projectRoot, vm, routing }),
   localEgress: (proxy) => localEgressStatus(proxy),
-  socksEgress: (projectRoot, proxyId) => egressListening(projectRoot, proxyId),
+  socksEgress: (projectRoot, proxyId) => {
+    const st = egressListening(projectRoot, proxyId)
+    if (!st.ok || egressRulesIntact(projectRoot, proxyId)) return st
+    return { ok: false, pid: st.pid, reason: 'rules_missing' }
+  },
   remoteEgress: async (vm) => {
     const info = await inspectContainerOrNull(slotHost(vm).dockerApi(), slotEgressNames(vm.id).egress)
     return { exists: !!info, running: info?.State?.Running === true, status: info?.State?.Status || null }
@@ -152,6 +160,14 @@ function recordCheck(vm) {
 }
 
 function credentialCheck(vm, projectRoot) {
+  if (isAntigravityVm(vm))
+    return check(
+      'credential',
+      '凭证',
+      'warn',
+      'antigravity_auth_unknown',
+      '登录状态由槽内官方客户端验证，请通过文本测试确认',
+    )
   if (vmHasSchedulableCredential(vm, projectRoot)) return check('credential', '凭证', 'ok', null, '已导入可用凭证')
   const refreshFailed = isCredentialRefreshFailed({ vm, now: Date.now() })
   return check(
@@ -218,7 +234,11 @@ async function egressCheck(vm, projectRoot, probes, { sshUnavailable = false } =
   if (isCodexVm(vm)) return check('egress', label, 'ok', null, `Codex 内核直接走代理 ${proxy.id}`)
   const st = probes.socksEgress(projectRoot, proxy.id)
   if (st?.ok) return check('egress', label, 'ok', null, `出口桥 kin-egress 运行中（${proxy.id}）`)
-  const why = st?.reason === 'not_listening' ? '进程在但未监听' : '进程不在'
+  const why =
+    {
+      not_listening: '进程在但未监听',
+      rules_missing: '在运行但 iptables 转发规则丢失（宿主机防火墙重载？）',
+    }[st?.reason] || '进程不在'
   return check('egress', label, 'error', 'egress_down', `本机出口桥 kin-egress ${why}（${proxy.id}）`, {
     reason: st?.reason || null,
   })
@@ -251,8 +271,19 @@ async function containerCheck(vm, probes, internal) {
   return check('container', label, 'error', code, `${lead}：${bits.join('，')}${why}`, detail)
 }
 
-async function kernelCheck(vm, projectRoot, engine, hasCredential, probes, internal) {
+async function kernelCheck(vm, projectRoot, engine, hasCredential, probes, internal, routing) {
   const label = '推理内核'
+  if (engine === 'antigravity') {
+    const health = await probes.antigravityHealth(projectRoot, vm, routing)
+    if (health.ok) return check('kernel', 'Antigravity 会话桥', 'ok', null, '文本会话桥在线；登录状态由实际请求验证')
+    return check(
+      'kernel',
+      'Antigravity 会话桥',
+      'warn',
+      health.code || 'antigravity_bridge_idle',
+      '文本会话桥未就绪，请检查配置或启动槽位',
+    )
+  }
   const exec = slotExec(projectRoot, vm)
   if (engine === 'codex') {
     const health = await probes.codexHealth(exec)
@@ -385,7 +416,7 @@ export async function diagnoseSlotServices(
       ? check('container', '槽位容器', 'warn', 'container_unverified', 'SSH 未连接，无法检查容器状态')
       : await guarded('container', '槽位容器', internal, () => containerCheck(vm, p, internal)),
     await guarded('kernel', '推理内核', internal, () =>
-      kernelCheck(vm, projectRoot, engine, hasCredential, p, internal),
+      kernelCheck(vm, projectRoot, engine, hasCredential, p, internal, routing),
     ),
     watchdogCheck(vm, engine, watchdog, internal),
     scheduleCheck(vm),
@@ -694,6 +725,7 @@ export function createSlotBridgeHealer({
   logger = console,
 }) {
   const egressAlive = ops.egressAlive || ((proxyId) => inspectEgressProcess(projectRoot, proxyId).ok)
+  const rulesIntact = ops.egressRulesIntact || ((proxyId) => egressRulesIntact(projectRoot, proxyId))
   const startEgress = ops.ensureProxyEgress || ((proxy) => ensureProxyEgress(projectRoot, proxy))
   const getCluster = ops.cluster || cluster
   const lastAttempt = new Map()
@@ -707,6 +739,7 @@ export function createSlotBridgeHealer({
     const seenProxies = new Set()
     for (const vm of vms) {
       if (vm?.status !== 'running') continue
+      if (isAntigravityVm(vm) && vmNodeId(vm)) continue
       const nodeId = vmNodeId(vm)
       if (nodeId) {
         const manager = getCluster()
@@ -727,10 +760,13 @@ export function createSlotBridgeHealer({
       if (isCodexVm(vm) || !hasBoundExit(proxy) || isLocalEgressProxy(proxy) || proxyBlockedReason(proxy)) continue
       if (seenProxies.has(proxy.id)) continue
       seenProxies.add(proxy.id)
-      if (egressAlive(proxy.id) || !due(`egress:${proxy.id}`)) continue
+      const alive = egressAlive(proxy.id)
+      if (alive && (!due(`egress-rules:${proxy.id}`) || rulesIntact(proxy.id))) continue
+      if (!due(`egress:${proxy.id}`)) continue
       const result = await startEgress(proxy)
-      if (result?.ok) logger.warn(`[bridge-heal] kin-egress ${proxy.id} was down; restarted`)
-      else logger.warn(`[bridge-heal] kin-egress ${proxy.id} restart failed: ${result?.error || 'unknown'}`)
+      const fault = alive ? 'iptables rules were missing' : 'was down'
+      if (result?.ok) logger.warn(`[bridge-heal] kin-egress ${proxy.id} ${fault}; restored`)
+      else logger.warn(`[bridge-heal] kin-egress ${proxy.id} ${fault}; restore failed: ${result?.error || 'unknown'}`)
     }
   }
 }

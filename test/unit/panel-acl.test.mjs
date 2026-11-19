@@ -98,6 +98,24 @@ test('user can rotate owned api keys; super cannot', () => {
   assert.equal(authorizePanelRoute('POST', p, 'super').ok, false)
 })
 
+test('Antigravity OAuth endpoints allow credential writers and deny read-only operators', () => {
+  for (const [method, suffix] of [
+    ['POST', 'start'],
+    ['GET', 'session'],
+    ['POST', 'complete'],
+    ['POST', 'cancel'],
+  ]) {
+    const p = `/api/panel/vms/vm-01/antigravity/oauth/${suffix}`
+    assert.equal(authorizePanelRoute(method, p, 'user').ok, true)
+    assert.equal(authorizePanelRoute(method, p, 'admin').ok, true)
+    assert.equal(authorizePanelRoute(method, p, 'super').ok, false)
+    assert.equal(authorizePanelRoute(method === 'GET' ? 'POST' : 'GET', p, 'user').ok, false)
+  }
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/antigravity/oauth/logout', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01/antigravity/oauth/credential', 'user').ok, false)
+  assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01/antigravity/status', 'super').ok, true)
+})
+
 test('usage-logs and statistics are read-only for user and super', () => {
   const paths = [
     '/api/panel/usage-logs',

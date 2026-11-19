@@ -20,7 +20,8 @@ import {
   normalizeCodexCredits,
   normalizeCodexLimits,
 } from '../protocol/codex-usage.mjs'
-import { CODEX_OAUTH_ORIGINATOR, makeProxyFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
+import { makeProxyFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
+import { codexSlotIdentity } from '../protocol/codex-identity.mjs'
 import { openaiIdentityFromJwt } from './openai-jwt.mjs'
 
 export const CHATGPT_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
@@ -52,18 +53,19 @@ function accountIdFromToken(accessToken) {
   return firstString(openaiIdentityFromJwt(accessToken).chatgpt_account_id)
 }
 
-export function buildOpenaiQuotaHeaders({ accessToken, accountId, fedRamp = false } = {}) {
+export function buildOpenaiQuotaHeaders({ accessToken, accountId, fedRamp = false, identity = null } = {}) {
   const headers = {
     authorization: `Bearer ${String(accessToken || '').trim()}`,
     accept: 'application/json',
     'openai-beta': CODEX_BETA,
-    'oai-language': 'zh-CN',
-    originator: CODEX_OAUTH_ORIGINATOR,
+    'oai-language': 'en-US',
+    originator: identity?.originator || 'Codex Desktop',
     'sec-fetch-site': 'none',
     'sec-fetch-mode': 'no-cors',
     'sec-fetch-dest': 'empty',
     priority: 'u=4, i',
   }
+  if (identity?.userAgent) headers['user-agent'] = identity.userAgent
   const account = firstString(accountIdFromToken(accessToken), accountId)
   if (account) headers['chatgpt-account-id'] = account
   if (fedRamp) headers['x-openai-fedramp'] = 'true'
@@ -266,6 +268,7 @@ async function loadSlot(projectRoot, vmId) {
     accountId: firstString(first.chatgpt_account_id, vm.codex?.chatgpt_account_id),
     proxyUrl,
     direct: isLocalEgressProxy(vm.proxy),
+    identity: codexSlotIdentity(projectRoot, vm),
   }
 }
 
@@ -300,6 +303,7 @@ async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
     proxyUrl: slot.proxyUrl,
     fetchImpl,
     timeoutMs: OPENAI_QUOTA_TIMEOUT_MS,
+    userAgent: slot.identity?.userAgent,
   })
   if (!tok.ok) {
     // Surface dead credentials (refresh_rejected / refresh_empty / missing_refresh_token)
@@ -343,7 +347,8 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
     return fail('proxy_required', 'GPT 槽未绑定 SOCKS5', 400)
   }
   let current = slot
-  const headersOf = (access) => buildOpenaiQuotaHeaders({ accessToken: access, accountId: current.accountId })
+  const headersOf = (access) =>
+    buildOpenaiQuotaHeaders({ accessToken: access, accountId: current.accountId, identity: current.identity })
 
   const run = async (access) => {
     const usage = await quotaFetch(CHATGPT_USAGE_URL, {
@@ -431,7 +436,7 @@ export async function resetOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = 
 
   let current = slot
   const headersOf = (access) => ({
-    ...buildOpenaiQuotaHeaders({ accessToken: access, accountId: current.accountId }),
+    ...buildOpenaiQuotaHeaders({ accessToken: access, accountId: current.accountId, identity: current.identity }),
     'content-type': 'application/json',
   })
   const redeemId = redeemRequestId()

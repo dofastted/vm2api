@@ -14,7 +14,11 @@ import { maxRequestBytes, readRoutingConfigFile, streamIdleTimeoutMs } from '../
 import { US_TIMEZONES, validTimezone } from '../core/timezone.mjs'
 import { runtimeKind, isKvmRuntime, RUNTIME_KVM } from './runtime-kind.mjs'
 import { isValidVmId } from './vm-file.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isAntigravityVm, isClaudeVm, isCodexVm } from './vm-kind.mjs'
+import { antigravityRuntimeSupport, writeAntigravityBridgeConfig } from '../transport/antigravity-bridge-supervisor.mjs'
+import { antigravityBridgePaths } from '../transport/antigravity-bridge-client.mjs'
+import { normalizeAntigravityRouting } from '../protocol/antigravity-route.mjs'
+import { publishAntigravitySlotAssets } from '../oauth/antigravity-auth-login.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 import {
@@ -347,7 +351,7 @@ export function assertCragSubscriptionTarget(
     !isValidVmId(vm.id) ||
     isNativeNodeVm(vm) ||
     ['darwin', 'macos'].includes(vm.node_platform) ||
-    isCodexVm(vm) ||
+    !isClaudeVm(vm) ||
     (!isKvmRuntime(vm) &&
       String(vm.runtime?.type || vm.runtime_type || 'docker')
         .trim()
@@ -414,7 +418,7 @@ export function assertCragSubscriptionTarget(
 
 /** An enabled slot has both current host authorization and a ready local runtime. */
 export function isCragSubscriptionSlotEnabled(projectRoot, vm, routing, opts) {
-  if (vm.status !== 'running' || vm.node_id || isCodexVm(vm)) return false
+  if (vm.status !== 'running' || vm.node_id || !isClaudeVm(vm)) return false
   const { ok, license } = checkCragLicense(projectRoot, vm, routing)
   if (!ok || license?.scope !== 'host') return false
   try {
@@ -475,6 +479,7 @@ export function syncLocalSlotRestartPolicies(vms, { routing, run = sh } = {}) {
 
 /** Label on GPT slot containers: their PID 1 idles; the Codex kernel runs on the host. */
 export const CODEX_SLOT_ROLE = 'codex'
+export const ANTIGRAVITY_SLOT_ROLE = 'antigravity'
 
 /**
  * PID 1 of a docker slot. Claude slots run kin-kernel. A GPT slot's Codex
@@ -484,7 +489,8 @@ export const CODEX_SLOT_ROLE = 'codex'
  * few minutes under `--restart unless-stopped`.
  */
 export function slotContainerCommand(vm, { wrapKernel = false, routing = {} } = {}) {
-  if (isCodexVm(vm)) return ['sleep', 'infinity']
+  if (isCodexVm(vm) || isAntigravityVm(vm)) return ['sleep', 'infinity']
+  if (!isClaudeVm(vm)) throw new TypeError('Unsupported slot platform')
   const argv = [
     wrapKernel ? '/home/kincli/.kin/kin-kernel' : '/usr/local/bin/kin-kernel',
     '--gateway-worker',
@@ -496,7 +502,9 @@ export function slotContainerCommand(vm, { wrapKernel = false, routing = {} } = 
 
 /** A GPT slot container created before CODEX_SLOT_ROLE still runs kin-kernel as PID 1. */
 function codexContainerStale(existing, vm) {
-  return !!existing && isCodexVm(vm) && existing.role !== CODEX_SLOT_ROLE
+  if (!existing) return false
+  if (isAntigravityVm(vm)) return existing.role !== ANTIGRAVITY_SLOT_ROLE
+  return isCodexVm(vm) && existing.role !== CODEX_SLOT_ROLE
 }
 
 export function containerHasKernelMount(name) {
@@ -576,7 +584,7 @@ export function runtimePatch(vm, info, extra = {}) {
     os: meta.pretty,
     memory: memory || slotMemory(vm, routing),
     user: runtimeUser(vm),
-    worker: rest.worker || vm.runtime?.worker || 'rust',
+    worker: rest.worker || (isAntigravityVm(vm) ? 'antigravity' : vm.runtime?.worker || 'rust'),
     worker_socket: rest.worker_socket || vm.runtime?.worker_socket || null,
     worker_run_dir: rest.worker_run_dir || vm.runtime?.worker_run_dir || null,
     worker_token_file: rest.worker_token_file || vm.runtime?.worker_token_file || null,
@@ -605,8 +613,22 @@ function workerPaths(projectRoot, vmId, vm = { id: vmId }) {
   }
 }
 
+function slotWorkerPaths(projectRoot, vm) {
+  if (!isAntigravityVm(vm)) return workerPaths(projectRoot, vm.id, vm)
+  const paths = antigravityBridgePaths(projectRoot, vm)
+  return {
+    ...workerPaths(projectRoot, vm.id, vm),
+    socket: paths.socketPath,
+    kernelSocket: paths.socketPath,
+    token: paths.tokenPath,
+    config: paths.configPath,
+    worker: 'antigravity',
+  }
+}
+
 function workerRuntimeExtra(worker) {
   return {
+    ...(worker.worker ? { worker: worker.worker } : {}),
     worker_socket: worker.socket,
     worker_run_dir: worker.runDir,
     worker_token_file: worker.token,
@@ -662,7 +684,7 @@ export function isSlotProxyDesynced(vm, projectRoot) {
 /** Publish native kernel telemetry routing. kin-seed remains the sole policy authority. */
 export function syncNativeTelemetry(vm, projectRoot, routing = null, { publish = true } = {}) {
   if (!vm?.id || !projectRoot) return { wrote: false, supported: false, enabled: false }
-  const supported = !isCodexVm(vm) && !slotHost(vm).native
+  const supported = isClaudeVm(vm) && !slotHost(vm).native
   const enabled = supported && isTelemetryEnabled(defaultSeedPolicy(vm.seed_policy || {}))
   if (!supported) return { wrote: false, supported, enabled, error: 'telemetry_unsupported' }
   const written = writeKernelConfig(projectRoot, vm, { routing, publish })
@@ -704,13 +726,17 @@ async function reloadSlotWorkerAdmitted(vm, projectRoot, { routing }) {
   const licensed = checkCragLicense(projectRoot, vm, routing)
   if (!licensed.ok) return licensed
   if (!vm?.id) return { ok: false, error: 'vm required' }
+  if (isAntigravityVm(vm)) {
+    const support = antigravityRuntimeSupport(vm)
+    if (!support.ok) return support
+  }
   // Outside the cached-config fallback: invalid quotas must never reach restart.
   if (!isKvmRuntime(vm)) slotDockerCpus(vm)
   if (vm.kernel_installation?.kernel === 'crag' && resolveKernelDataplane(vm, routing) === 'crag') {
     const installed = inspectInstalledCragEntry(projectRoot, vm)
     if (!installed.ok) return installed
   }
-  const paths = workerPaths(projectRoot, vm.id, vm)
+  const paths = slotWorkerPaths(projectRoot, vm)
   const name = containerName(vm.id)
   let worker
   try {
@@ -718,6 +744,8 @@ async function reloadSlotWorkerAdmitted(vm, projectRoot, { routing }) {
       throw new Error('slot SOCKS5 proxy is required')
     worker = writeWorkerFiles(vm, projectRoot, { routing })
   } catch (error) {
+    if (isAntigravityVm(vm))
+      return { ok: false, code: error.code || 'antigravity_config_failed', error: String(error.message || error) }
     if (!fs.existsSync(paths.config) || !fs.existsSync(paths.token)) {
       return { ok: false, error: String(error.message || error) }
     }
@@ -800,6 +828,7 @@ async function reloadSlotWorkerAdmitted(vm, projectRoot, { routing }) {
 export function slotKernelAlive(existing, paths, vm) {
   if (isKvmRuntime(vm) || existing?.runtime === 'kvm') return true
   if (isCodexVm(vm) && existing?.role === CODEX_SLOT_ROLE) return true
+  if (isAntigravityVm(vm) && existing?.role === ANTIGRAVITY_SLOT_ROLE) return true
   return fs.existsSync(paths.kernelSocket)
 }
 
@@ -816,7 +845,23 @@ export function resolveSlotRouting(projectRoot, routing) {
   return readProjectRouting(projectRoot) || {}
 }
 
-export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {}) {
+export function writeWorkerFiles(vm, projectRoot, { transparent, routing, forAuthentication = false } = {}) {
+  if (isAntigravityVm(vm)) {
+    const support = antigravityRuntimeSupport(vm)
+    if (!support.ok) throw Object.assign(new Error(support.error), { code: support.code })
+    const resolvedRouting = resolveSlotRouting(projectRoot, routing)
+    if (forAuthentication !== true && !normalizeAntigravityRouting(resolvedRouting.antigravity || {}).enabled)
+      throw Object.assign(new Error('Antigravity is disabled'), { code: 'antigravity_disabled' })
+    if (forAuthentication === true) {
+      const paths = slotWorkerPaths(projectRoot, vm)
+      fs.mkdirSync(paths.runDir, { recursive: true, mode: 0o700 })
+      chownSlotRuntimeFile(paths.runDir, vm)
+      return paths
+    }
+    writeAntigravityBridgeConfig(projectRoot, vm, { routing: resolvedRouting })
+    return slotWorkerPaths(projectRoot, vm)
+  }
+  if (!isClaudeVm(vm) && !isCodexVm(vm)) throw new TypeError('Unsupported slot platform')
   assertProxyAllowed(vm.proxy)
   const paths = workerPaths(projectRoot, vm.id, vm)
   const uid = runtimeUidNum(vm)
@@ -1240,10 +1285,20 @@ export function dockerSlotResourceArgs(vm, routing) {
   ]
 }
 
-export async function startVmRuntime(vm, projectRoot, { recreate = false, routing, accel, useInstalledCrag } = {}) {
+export async function startVmRuntime(
+  vm,
+  projectRoot,
+  { recreate = false, routing, accel, useInstalledCrag, forAuthentication = false } = {},
+) {
   const resolvedRouting = resolveSlotRouting(projectRoot, routing)
   return withCragRuntimeAdmission(vm, projectRoot, { routing: resolvedRouting, action: 'start' }, () =>
-    startVmRuntimeAdmitted(vm, projectRoot, { recreate, routing: resolvedRouting, accel, useInstalledCrag }),
+    startVmRuntimeAdmitted(vm, projectRoot, {
+      recreate,
+      routing: resolvedRouting,
+      accel,
+      useInstalledCrag,
+      forAuthentication,
+    }),
   )
 }
 
@@ -1266,8 +1321,16 @@ export function inspectInstalledCragEntry(projectRoot, vm) {
 async function startVmRuntimeAdmitted(
   vm,
   projectRoot,
-  { recreate, routing: resolvedRouting, accel, useInstalledCrag },
+  { recreate, routing: resolvedRouting, accel, useInstalledCrag, forAuthentication = false },
 ) {
+  if (isAntigravityVm(vm)) {
+    const support = antigravityRuntimeSupport(vm)
+    if (!support.ok) return support
+    if (forAuthentication !== true && !normalizeAntigravityRouting(resolvedRouting.antigravity || {}).enabled)
+      return { ok: false, code: 'antigravity_disabled', error: 'Antigravity is disabled' }
+  }
+  if (!isClaudeVm(vm) && !isCodexVm(vm) && !isAntigravityVm(vm))
+    return { ok: false, code: 'platform_not_supported', error: 'Unsupported slot platform' }
   const dataplane = resolveKernelDataplane(vm, resolvedRouting)
   const preserveCrag = dataplane === 'crag' && (useInstalledCrag === true || vm.kernel_installation?.kernel === 'crag')
   if (preserveCrag) {
@@ -1299,9 +1362,11 @@ async function startVmRuntimeAdmitted(
   const mem = slotMemory(vm, resolvedRouting)
   const image = kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel)
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
-  fs.mkdirSync(home, { recursive: true })
+  const isolatedAuthHome = isAntigravityVm(vm) && forAuthentication === true
+  if (isolatedAuthHome) publishAntigravitySlotAssets(projectRoot, vm)
+  else fs.mkdirSync(home, { recursive: true })
   try {
-    ensureSlotClaudeOwnership(home, runtimeUidNum(vm), Number(GID))
+    if (isClaudeVm(vm)) ensureSlotClaudeOwnership(home, runtimeUidNum(vm), Number(GID))
   } catch (error) {
     if (!kvm) throw error
   }
@@ -1313,12 +1378,23 @@ async function startVmRuntimeAdmitted(
   if (!eg.network && !eg.name) return { ok: false, error: 'egress network missing; refusing host fallback' }
 
   let existing = inspectContainer(name)
+  if (
+    isAntigravityVm(vm) &&
+    forAuthentication === true &&
+    existing?.running &&
+    slotContainerNetworkMismatch(existing, vm)
+  )
+    return {
+      ok: false,
+      code: 'antigravity_egress_mismatch',
+      error: 'Antigravity 槽位出口网络不匹配，请先停止槽位后重试授权',
+    }
   if (kvm && existing) {
     ensureKvmMachineRecord(vm, { projectRoot, containerName: name, run: sh, persist: true })
   }
   const restartPolicy = updateSlotRestartPolicy(existing, slotRestartPolicy(vm, resolvedRouting), sh)
   if (!restartPolicy.ok) return { ok: false, error: restartPolicy.stderr || 'slot restart policy update failed' }
-  const paths = workerPaths(projectRoot, vm.id, vm)
+  const paths = slotWorkerPaths(projectRoot, vm)
   let replace =
     recreate ||
     existing?.restarting ||
@@ -1337,6 +1413,7 @@ async function startVmRuntimeAdmitted(
   // Node restart / 开机 must not bounce a live slot with a healthy worker.
   if (existing?.running && !replace) {
     runtimePatch(vm, existing, {
+      ...(isAntigravityVm(vm) ? { worker: 'antigravity' } : {}),
       worker_socket: paths.socket,
       worker_run_dir: paths.runDir,
       worker_token_file: paths.token,
@@ -1348,7 +1425,8 @@ async function startVmRuntimeAdmitted(
     return { ok: true, action: 'already-running', runtime: vm.runtime }
   }
   const codex = isCodexVm(vm)
-  if (!codex && !preserveCrag) {
+  const claude = isClaudeVm(vm)
+  if (claude && !preserveCrag) {
     try {
       const laid = materializeResolvedKernel(projectRoot, vm, {
         uid: runtimeUidNum(vm),
@@ -1364,19 +1442,19 @@ async function startVmRuntimeAdmitted(
   }
   const wrapKernel = path.join(home, '.kin', 'kin-kernel')
   const kernelBin = kernelBinPath()
-  const mountKernel = !codex && !!kernelBin && fs.existsSync(kernelBin)
-  if (!codex && !fs.existsSync(wrapKernel) && !mountKernel) {
+  const mountKernel = claude && !!kernelBin && fs.existsSync(kernelBin)
+  if (claude && !fs.existsSync(wrapKernel) && !mountKernel) {
     return { ok: false, error: 'kin-kernel missing; wrap CLI sample not materialized' }
   }
 
   let worker
   try {
-    worker = writeWorkerFiles(vm, projectRoot, { transparent: true, routing: resolvedRouting })
+    worker = writeWorkerFiles(vm, projectRoot, { transparent: true, routing: resolvedRouting, forAuthentication })
   } catch (error) {
     return { ok: false, error: String(error.message || error) }
   }
   try {
-    fs.chownSync(home, runtimeUidNum(vm), Number(GID))
+    if (!isolatedAuthHome) fs.chownSync(home, runtimeUidNum(vm), Number(GID))
   } catch {}
 
   const replaceContainer =
@@ -1536,12 +1614,13 @@ async function startVmRuntimeAdmitted(
       '--label',
       'kin.vm.runtime=docker',
       ...(codex ? ['--label', `kin.vm.role=${CODEX_SLOT_ROLE}`] : []),
+      ...(isAntigravityVm(vm) ? ['--label', `kin.vm.role=${ANTIGRAVITY_SLOT_ROLE}`] : []),
       '-v',
       `${hostOf(home)}:/home/kincli`,
       '-v',
       `${hostOf(worker.runDir)}:/run/kin`,
       ...slotGuestBinMountArgs({
-        workerBin: fs.existsSync(WORKER_BIN) ? WORKER_BIN : null,
+        workerBin: !isAntigravityVm(vm) && fs.existsSync(WORKER_BIN) ? WORKER_BIN : null,
         kernelBin: mountKernel ? kernelBin : null,
         guestBinDir: '/usr/local/bin',
         hostOf,
@@ -1551,8 +1630,7 @@ async function startVmRuntimeAdmitted(
       ...computerDockerArgs({ dir: computer.dir, mac: computer.mac, hostOf }),
       '-e',
       'HOME=/home/kincli',
-      '-e',
-      'CLAUDE_CONFIG_DIR=/home/kincli/.claude',
+      ...(claude ? ['-e', 'CLAUDE_CONFIG_DIR=/home/kincli/.claude'] : []),
       '-e',
       `TZ=${zone || 'UTC'}`,
       '-e',

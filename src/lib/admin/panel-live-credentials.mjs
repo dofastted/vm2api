@@ -1,3 +1,4 @@
+import { isClaudeVm } from '../vm/vm-kind.mjs'
 /**
  * Live credential view for the panel.
  * Go worker is the refresh owner; vm.json / SQLite runtime can lag for hours
@@ -99,7 +100,7 @@ export async function collectLivePanelCredentials(
 ) {
   const now = Date.now()
   if (cache.map && cacheMs > 0 && now - cache.at < cacheMs) return cache.map
-  const list = Array.isArray(vms) ? vms.filter((vm) => vm?.id) : []
+  const list = Array.isArray(vms) ? vms.filter((vm) => vm?.id && isClaudeVm(vm)) : []
   const map = new Map()
   await mapPool(list, concurrency, async (vm) => {
     const exec = slotExec(projectRoot, vm)

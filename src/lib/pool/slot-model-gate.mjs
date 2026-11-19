@@ -3,7 +3,8 @@ import { isFableModel } from './upstream-error-policy.mjs'
 import { getModelEntry, getPolicyCatalogIds, resolvePolicyModelId } from '../protocol/model-policy.mjs'
 import { getGptPolicyCatalogIds, listImageToolModels, resolveGptFastAlias } from '../protocol/gpt-model-policy.mjs'
 import { isCodexCatalogModel } from '../protocol/models.mjs'
-import { isCodexVm } from '../vm/vm-kind.mjs'
+import { isCodexVm, isAntigravityVm } from '../vm/vm-kind.mjs'
+import { antigravityModelId } from '../protocol/antigravity-route.mjs'
 
 export function normalizeAllowedModels(raw) {
   if (raw == null) return null
@@ -59,6 +60,15 @@ export function modelMatchesAllowlist(model, allowed) {
 export function parseAllowedModelsPatch(raw, opts = {}) {
   if (raw == null) return { ok: true, value: null }
   if (!Array.isArray(raw)) return { ok: false, error: 'allowed_models must be an array' }
+  if (opts.platform === 'antigravity' || isAntigravityVm(opts.vm)) {
+    const ids = []
+    for (const item of raw) {
+      const id = typeof item === 'string' ? antigravityModelId(item) : null
+      if (!id) return { ok: false, error: 'Invalid Antigravity model ID' }
+      ids.push(id)
+    }
+    return { ok: true, value: normalizeAllowedModels(ids) }
+  }
   const gpt = opts.platform === 'openai' || opts.platform === 'gpt' || opts.platform === 'codex' || isCodexVm(opts.vm)
   const catalog = new Set(
     (gpt

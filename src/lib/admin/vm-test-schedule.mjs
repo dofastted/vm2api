@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { Cron } from 'croner'
 import { validTimezone } from '../core/timezone.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
-import { isCodexVm } from '../vm/vm-kind.mjs'
+import { isCodexVm, isClaudeVm } from '../vm/vm-kind.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { listTestableModels } from './vm-test-chat.mjs'
 
@@ -25,6 +25,16 @@ export class VmTestScheduleError extends Error {
     this.name = 'VmTestScheduleError'
     this.code = code
     this.status = status
+  }
+}
+
+export function isVmTestScheduleTarget(vm) {
+  return !!vm && (isClaudeVm(vm) || isCodexVm(vm))
+}
+
+function assertScheduleTarget(vm) {
+  if (!isVmTestScheduleTarget(vm)) {
+    throw new VmTestScheduleError('scheduled tests support only Claude and GPT slots', 'platform_not_supported', 409)
   }
 }
 
@@ -179,6 +189,7 @@ function defaultDialogParams(vm) {
 }
 
 export function normalizeVmTestSchedule(input, vm) {
+  assertScheduleTarget(vm)
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     throw new VmTestScheduleError('request body must be an object')
   }
@@ -372,7 +383,7 @@ export class VmTestScheduleRunner {
     const raw = this._settings().get(keyFor(vmId))
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
     const vm = this._vm(vmId)
-    if (!vm) return null
+    if (!isVmTestScheduleTarget(vm)) return null
     try {
       const structure = structureFromStored(raw, vm)
       if (structure.parse_error) return null
@@ -465,6 +476,7 @@ export class VmTestScheduleRunner {
   }
 
   get(vmId) {
+    if (!isVmTestScheduleTarget(this._vm(vmId))) return null
     const raw = this._settings().get(keyFor(vmId))
     const schedule = this._stored(vmId)
     if (schedule) return this._public(vmId, schedule)
@@ -487,6 +499,7 @@ export class VmTestScheduleRunner {
     if (!isValidVmId(vmId)) throw new VmTestScheduleError('invalid vm id', 'invalid_vm_id')
     const vm = this._vm(vmId)
     if (!vm) throw new VmTestScheduleError('vm not found', 'vm_not_found', 404)
+    assertScheduleTarget(vm)
     const normalized = normalizeScheduleStructure(structure)
     const cron = compileStructuredSchedule(normalized)
     assertCron(cron, normalized.timezone)
@@ -541,9 +554,15 @@ export class VmTestScheduleRunner {
 
     const updated = []
     const missing = []
+    const unsupported = []
     for (const vmId of targets) {
-      if (!this._vm(vmId)) {
+      const vm = this._vm(vmId)
+      if (!vm) {
         missing.push(vmId)
+        continue
+      }
+      if (!isVmTestScheduleTarget(vm)) {
+        unsupported.push(vmId)
         continue
       }
       if (full) {
@@ -563,7 +582,7 @@ export class VmTestScheduleRunner {
       }
       updated.push(vmId)
     }
-    return { updated, missing, schedule: structure }
+    return { updated, missing, unsupported, schedule: structure }
   }
 
   _applyFullTest(vmId, structure, full) {
@@ -622,7 +641,7 @@ export class VmTestScheduleRunner {
   _syncJob(vmId, schedule) {
     this.jobs.get(vmId)?.stop()
     this.jobs.delete(vmId)
-    if (!this.started || !schedule.enabled || !this._vm(vmId)) return
+    if (!this.started || !schedule.enabled || !isVmTestScheduleTarget(this._vm(vmId))) return
     const job = new Cron(schedule.cron, { timezone: schedule.timezone, mode: '5-part', catch: true, unref: true }, () =>
       this._run(vmId),
     )
@@ -633,6 +652,11 @@ export class VmTestScheduleRunner {
     if (!this.started || this.running.has(vmId)) return
     if (!this._vm(vmId)) {
       this.remove(vmId)
+      return
+    }
+    if (!isVmTestScheduleTarget(this._vm(vmId))) {
+      this.jobs.get(vmId)?.stop()
+      this.jobs.delete(vmId)
       return
     }
     const schedule = this._stored(vmId)

@@ -29,9 +29,13 @@ export function PlatformChip({
     <span
       className={cn(
         'inline-flex shrink-0 items-center rounded-[5px] border px-1.5 py-0.5 text-[10px] leading-none font-semibold tracking-[0.03em]',
-        gpt
-          ? 'border-[color:var(--tier-codex-border)] text-[color:var(--tier-codex-fg)]'
-          : 'border-[color:var(--tier-pro-border)] text-[color:var(--tier-pro-fg)]',
+        resolved === 'antigravity'
+          ? 'border-sky-500/40 text-sky-700 dark:text-sky-300'
+          : resolved === 'unknown'
+            ? 'border-border text-muted-foreground'
+            : gpt
+              ? 'border-[color:var(--tier-codex-border)] text-[color:var(--tier-codex-fg)]'
+              : 'border-[color:var(--tier-pro-border)] text-[color:var(--tier-pro-fg)]',
         className
       )}
     >

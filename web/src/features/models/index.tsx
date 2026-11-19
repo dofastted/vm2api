@@ -17,6 +17,7 @@ import {
   modelPolicyQueryOptions,
   pricingQueryOptions,
 } from '@/features/models/queries'
+import { AntigravityCatalog } from './antigravity-catalog'
 import { EntryStrip } from './entry-strip'
 import { ImageToolSection } from './image-tool-section'
 import { ModelAdvanced } from './model-advanced'
@@ -56,6 +57,7 @@ export function ModelsPage() {
   const [catalogPlatform, setCatalogPlatform] = useState<
     'anthropic' | 'openai'
   >('anthropic')
+  const [antigravityView, setAntigravityView] = useState(false)
   const q = useQuery(modelPolicyQueryOptions(catalogPlatform))
   const pricingQ = useQuery(pricingQueryOptions())
   const [draft, setDraft] = useState<ModelPolicy>(() => hydratePolicy(null))
@@ -259,7 +261,12 @@ export function ModelsPage() {
     })
   }
 
-  function switchPlatform(next: 'anthropic' | 'openai') {
+  function switchPlatform(next: 'anthropic' | 'openai' | 'antigravity') {
+    if (next === 'antigravity') {
+      setAntigravityView(true)
+      return
+    }
+    setAntigravityView(false)
     if (next === catalogPlatform) return
     if (
       dirty &&
@@ -282,6 +289,32 @@ export function ModelsPage() {
   const poolHint = claudePool
     ? 'Claude 号池。同一会话只占一个 VM session 窗口，不和 GPT 混调度。'
     : 'GPT 号池。粘性独立，不占用 Claude 原生 session 槽。'
+  const platformTabs = (
+    <Tabs
+      value={antigravityView ? 'antigravity' : catalogPlatform}
+      onValueChange={(value) => {
+        if (
+          value === 'anthropic' ||
+          value === 'openai' ||
+          value === 'antigravity'
+        ) {
+          switchPlatform(value)
+        }
+      }}
+    >
+      <TabsList aria-label='模型平台'>
+        <TabsTrigger value='anthropic' className='cursor-pointer px-4'>
+          Anthropic
+        </TabsTrigger>
+        <TabsTrigger value='openai' className='cursor-pointer px-4'>
+          OpenAI
+        </TabsTrigger>
+        <TabsTrigger value='antigravity' className='cursor-pointer px-4'>
+          Antigravity
+        </TabsTrigger>
+      </TabsList>
+    </Tabs>
+  )
 
   return (
     <PageHeader
@@ -289,7 +322,7 @@ export function ModelsPage() {
       description='对外模型目录、模型参数、覆写别名与官方计费配置。'
       fluid
       extra={
-        pageTab === 'models' ? (
+        pageTab === 'models' && !antigravityView ? (
           <div className='flex flex-wrap gap-2'>
             {claudePool ? (
               <Button
@@ -358,233 +391,215 @@ export function ModelsPage() {
         </TabsList>
         <TabsContent value='models'>
           <EntryStrip />
-          <QueryGate
-            loading={q.isLoading}
-            error={q.error}
-            skeleton={
-              <div className='space-y-3'>
-                <div className='h-32 rounded-2xl bg-muted' />
-                <div className='grid gap-3 md:grid-cols-2 xl:grid-cols-3'>
-                  {Array.from({ length: 6 }).map((_, i) => (
-                    <div key={i} className='h-44 rounded-xl bg-muted' />
-                  ))}
+          {antigravityView ? (
+            <AntigravityCatalog platformTabs={platformTabs} />
+          ) : (
+            <QueryGate
+              loading={q.isLoading}
+              error={q.error}
+              skeleton={
+                <div className='space-y-3'>
+                  <div className='h-32 rounded-2xl bg-muted' />
+                  <div className='grid gap-3 md:grid-cols-2 xl:grid-cols-3'>
+                    {Array.from({ length: 6 }).map((_, i) => (
+                      <div key={i} className='h-44 rounded-xl bg-muted' />
+                    ))}
+                  </div>
                 </div>
-              </div>
-            }
-          >
-            <div className='space-y-4'>
-              <section className='rounded-2xl border border-border/70 bg-card p-4 shadow-sm'>
-                <div className='grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end'>
-                  <div className='min-w-0 space-y-3'>
-                    <Tabs
-                      value={catalogPlatform}
-                      onValueChange={(value) => {
-                        if (value === 'anthropic' || value === 'openai') {
-                          switchPlatform(value)
+              }
+            >
+              <div className='space-y-4'>
+                <section className='rounded-2xl border border-border/70 bg-card p-4 shadow-sm'>
+                  <div className='grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end'>
+                    <div className='min-w-0 space-y-3'>
+                      {platformTabs}
+                      <div className='max-w-3xl space-y-1'>
+                        <h3 className='text-xl font-semibold tracking-tight'>
+                          {claudePool
+                            ? 'Claude 官方模型矩阵'
+                            : 'GPT / Codex 官方模型矩阵'}
+                        </h3>
+                        <p className='text-sm leading-6 text-muted-foreground'>
+                          {poolHint}
+                        </p>
+                        <CatalogSyncBar
+                          claude={pricingQ.data?.catalog_sync?.claude ?? null}
+                          codex={pricingQ.data?.catalog_sync?.codex ?? null}
+                        />
+                      </div>
+                    </div>
+                    <div className='grid grid-cols-2 gap-2 sm:grid-cols-4 lg:w-[28rem]'>
+                      <PoolStat label='配置' value={stats.configured} />
+                      <PoolStat label='启用' value={stats.enabled} />
+                      <PoolStat label='对外' value={stats.live} />
+                      <PoolStat
+                        label={claudePool ? '1M beta' : '未对外'}
+                        value={
+                          claudePool
+                            ? stats.pass1m
+                            : all.filter((m) => !effectiveIds.has(m.id)).length
                         }
-                      }}
-                    >
-                      <TabsList aria-label='模型平台'>
-                        <TabsTrigger
-                          value='anthropic'
-                          className='cursor-pointer px-4'
-                        >
-                          Anthropic
-                        </TabsTrigger>
-                        <TabsTrigger
-                          value='openai'
-                          className='cursor-pointer px-4'
-                        >
-                          OpenAI
-                        </TabsTrigger>
-                      </TabsList>
-                    </Tabs>
-                    <div className='max-w-3xl space-y-1'>
-                      <h3 className='text-xl font-semibold tracking-tight'>
-                        {claudePool
-                          ? 'Claude 官方模型矩阵'
-                          : 'GPT / Codex 官方模型矩阵'}
-                      </h3>
-                      <p className='text-sm leading-6 text-muted-foreground'>
-                        {poolHint}
-                      </p>
-                      <CatalogSyncBar
-                        claude={pricingQ.data?.catalog_sync?.claude ?? null}
-                        codex={pricingQ.data?.catalog_sync?.codex ?? null}
                       />
                     </div>
                   </div>
-                  <div className='grid grid-cols-2 gap-2 sm:grid-cols-4 lg:w-[28rem]'>
-                    <PoolStat label='配置' value={stats.configured} />
-                    <PoolStat label='启用' value={stats.enabled} />
-                    <PoolStat label='对外' value={stats.live} />
-                    <PoolStat
-                      label={claudePool ? '1M beta' : '未对外'}
-                      value={
-                        claudePool
-                          ? stats.pass1m
-                          : all.filter((m) => !effectiveIds.has(m.id)).length
-                      }
-                    />
-                  </div>
-                </div>
-              </section>
+                </section>
 
-              {claudePool ? null : (
-                <ModelMappingCard targets={gptTargets} imageIds={imageIds} />
-              )}
+                {claudePool ? null : (
+                  <ModelMappingCard targets={gptTargets} imageIds={imageIds} />
+                )}
 
-              {dirty ? (
-                <p
-                  role='status'
-                  className='flex items-center gap-2 rounded-xl border border-[color:var(--status-caution)]/40 bg-[color:var(--status-caution)]/10 px-3 py-2 text-sm text-foreground'
-                >
-                  <AlertTriangle className='size-4 shrink-0 text-[color:var(--status-caution)]' />
-                  有未保存更改。离开页面或切换平台前请先保存。
-                </p>
-              ) : null}
+                {dirty ? (
+                  <p
+                    role='status'
+                    className='flex items-center gap-2 rounded-xl border border-[color:var(--status-caution)]/40 bg-[color:var(--status-caution)]/10 px-3 py-2 text-sm text-foreground'
+                  >
+                    <AlertTriangle className='size-4 shrink-0 text-[color:var(--status-caution)]' />
+                    有未保存更改。离开页面或切换平台前请先保存。
+                  </p>
+                ) : null}
 
-              {claudePool ? (
-                <section className='rounded-2xl border border-primary/20 bg-primary/[0.035] p-4'>
-                  <div className='grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center'>
-                    <div className='space-y-1'>
-                      <h3 className='font-semibold'>
-                        Haiku 5.5 · 100K 实用模型
-                      </h3>
-                      <p className='text-sm leading-6 text-muted-foreground'>
-                        默认策略把 claude-haiku-5-5 的上下文窗口、默认
-                        max_tokens、输出上限统一收敛到 100K，避免超过官方 Haiku
-                        5.5 长上下文计费阈值。
-                      </p>
+                {claudePool ? (
+                  <section className='rounded-2xl border border-primary/20 bg-primary/[0.035] p-4'>
+                    <div className='grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center'>
+                      <div className='space-y-1'>
+                        <h3 className='font-semibold'>
+                          Haiku 5.5 · 100K 实用模型
+                        </h3>
+                        <p className='text-sm leading-6 text-muted-foreground'>
+                          默认策略把 claude-haiku-5-5 的上下文窗口、默认
+                          max_tokens、输出上限统一收敛到 100K，避免超过官方
+                          Haiku 5.5 长上下文计费阈值。
+                        </p>
+                      </div>
+                      <Button
+                        variant='outline'
+                        onClick={() => {
+                          setQtext('claude-haiku-5-5')
+                          setFamily('all')
+                          setBeta('all')
+                          setExpanded('claude-haiku-5-5')
+                        }}
+                      >
+                        打开 Haiku 5.5
+                      </Button>
                     </div>
-                    <Button
-                      variant='outline'
-                      onClick={() => {
-                        setQtext('claude-haiku-5-5')
-                        setFamily('all')
-                        setBeta('all')
-                        setExpanded('claude-haiku-5-5')
-                      }}
-                    >
-                      打开 Haiku 5.5
-                    </Button>
+                  </section>
+                ) : null}
+
+                <section className='rounded-2xl border border-border/70 bg-card p-3 shadow-sm'>
+                  <div className='grid gap-2 lg:grid-cols-[18rem_minmax(0,1fr)_auto] lg:items-center'>
+                    <Input
+                      className='w-full'
+                      type='search'
+                      placeholder='搜索模型 / 别名…'
+                      aria-label='搜索模型'
+                      value={qtext}
+                      onChange={(e) => setQtext(e.target.value)}
+                    />
+                    <div className='flex flex-wrap gap-1.5'>
+                      {families.map((f) => (
+                        <Button
+                          key={f}
+                          size='sm'
+                          className='cursor-pointer'
+                          variant={family === f ? 'default' : 'outline'}
+                          onClick={() => setFamily(f)}
+                        >
+                          {f === 'all' ? '全部' : f}
+                        </Button>
+                      ))}
+                      {claudePool
+                        ? BETA_FILTERS.map(([id, lab]) => (
+                            <Button
+                              key={id}
+                              size='sm'
+                              className='cursor-pointer'
+                              variant={beta === id ? 'secondary' : 'ghost'}
+                              onClick={() => setBeta(id)}
+                            >
+                              {lab}
+                            </Button>
+                          ))
+                        : null}
+                    </div>
+                    <div className='flex flex-wrap gap-1.5 lg:justify-end'>
+                      <Button
+                        size='sm'
+                        variant='ghost'
+                        onClick={() => batch('enable')}
+                      >
+                        全开
+                      </Button>
+                      <Button
+                        size='sm'
+                        variant='ghost'
+                        onClick={() => batch('disable')}
+                      >
+                        全关
+                      </Button>
+                      <Button
+                        size='sm'
+                        variant='ghost'
+                        onClick={() => batch('invert')}
+                      >
+                        反选
+                      </Button>
+                    </div>
                   </div>
                 </section>
-              ) : null}
 
-              <section className='rounded-2xl border border-border/70 bg-card p-3 shadow-sm'>
-                <div className='grid gap-2 lg:grid-cols-[18rem_minmax(0,1fr)_auto] lg:items-center'>
-                  <Input
-                    className='w-full'
-                    type='search'
-                    placeholder='搜索模型 / 别名…'
-                    aria-label='搜索模型'
-                    value={qtext}
-                    onChange={(e) => setQtext(e.target.value)}
+                {visible.length === 0 ? (
+                  <EmptyState
+                    reason={
+                      qtext || family !== 'all' || beta !== 'all'
+                        ? '无匹配模型。改搜索或筛选条件。'
+                        : claudePool
+                          ? '暂无模型配置。可先同步 Worker 目录。'
+                          : '暂无 GPT 模型。可先同步 GPT 目录。'
+                    }
                   />
-                  <div className='flex flex-wrap gap-1.5'>
-                    {families.map((f) => (
-                      <Button
-                        key={f}
-                        size='sm'
-                        className='cursor-pointer'
-                        variant={family === f ? 'default' : 'outline'}
-                        onClick={() => setFamily(f)}
-                      >
-                        {f === 'all' ? '全部' : f}
-                      </Button>
+                ) : (
+                  <div className='grid gap-3 md:grid-cols-2 xl:grid-cols-3'>
+                    {visible.map((m) => (
+                      <ModelRow
+                        key={m.id}
+                        model={m}
+                        live={effectiveIds.has(m.id)}
+                        pol={draft}
+                        pricing={pricingQ.data?.policy?.[m.id]}
+                        open={expanded === m.id}
+                        platform={catalogPlatform}
+                        onToggleOpen={() => requestExpand(m.id)}
+                        onToggleEnabled={(on) =>
+                          patchModel(m.id, (rec) => {
+                            rec.enabled = on
+                          })
+                        }
+                        onModel={(fn) => patchModel(m.id, fn)}
+                        onParam={(key, value) => setParam(m.id, key, value)}
+                        onPass1m={(mode) => setPass1m(m.id, mode)}
+                      />
                     ))}
-                    {claudePool
-                      ? BETA_FILTERS.map(([id, lab]) => (
-                          <Button
-                            key={id}
-                            size='sm'
-                            className='cursor-pointer'
-                            variant={beta === id ? 'secondary' : 'ghost'}
-                            onClick={() => setBeta(id)}
-                          >
-                            {lab}
-                          </Button>
-                        ))
-                      : null}
                   </div>
-                  <div className='flex flex-wrap gap-1.5 lg:justify-end'>
-                    <Button
-                      size='sm'
-                      variant='ghost'
-                      onClick={() => batch('enable')}
-                    >
-                      全开
-                    </Button>
-                    <Button
-                      size='sm'
-                      variant='ghost'
-                      onClick={() => batch('disable')}
-                    >
-                      全关
-                    </Button>
-                    <Button
-                      size='sm'
-                      variant='ghost'
-                      onClick={() => batch('invert')}
-                    >
-                      反选
-                    </Button>
-                  </div>
-                </div>
-              </section>
+                )}
 
-              {visible.length === 0 ? (
-                <EmptyState
-                  reason={
-                    qtext || family !== 'all' || beta !== 'all'
-                      ? '无匹配模型。改搜索或筛选条件。'
-                      : claudePool
-                        ? '暂无模型配置。可先同步 Worker 目录。'
-                        : '暂无 GPT 模型。可先同步 GPT 目录。'
-                  }
-                />
-              ) : (
-                <div className='grid gap-3 md:grid-cols-2 xl:grid-cols-3'>
-                  {visible.map((m) => (
-                    <ModelRow
-                      key={m.id}
-                      model={m}
-                      live={effectiveIds.has(m.id)}
-                      pol={draft}
-                      pricing={pricingQ.data?.policy?.[m.id]}
-                      open={expanded === m.id}
-                      platform={catalogPlatform}
-                      onToggleOpen={() => requestExpand(m.id)}
-                      onToggleEnabled={(on) =>
-                        patchModel(m.id, (rec) => {
-                          rec.enabled = on
-                        })
-                      }
-                      onModel={(fn) => patchModel(m.id, fn)}
-                      onParam={(key, value) => setParam(m.id, key, value)}
-                      onPass1m={(mode) => setPass1m(m.id, mode)}
-                    />
-                  ))}
-                </div>
-              )}
-
-              {claudePool ? (
-                <ModelAdvanced
-                  pol={draft}
-                  onCatalogMode={setCatalog}
-                  onDefaults={patchDefaults}
-                />
-              ) : (
-                <ImageToolSection
-                  models={imageTools}
-                  enabled={draft.image_tools}
-                  pricing={pricingQ.data?.policy}
-                  onToggle={setImageTool}
-                />
-              )}
-            </div>
-          </QueryGate>
+                {claudePool ? (
+                  <ModelAdvanced
+                    pol={draft}
+                    onCatalogMode={setCatalog}
+                    onDefaults={patchDefaults}
+                  />
+                ) : (
+                  <ImageToolSection
+                    models={imageTools}
+                    enabled={draft.image_tools}
+                    pricing={pricingQ.data?.policy}
+                    onToggle={setImageTool}
+                  />
+                )}
+              </div>
+            </QueryGate>
+          )}
         </TabsContent>
         <TabsContent value='pricing'>
           <PricingTab />

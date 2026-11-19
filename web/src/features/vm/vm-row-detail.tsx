@@ -12,6 +12,7 @@ import {
   SLOT_BG,
   SLOT_LABEL,
 } from '@/lib/vm-health'
+import { isAntigravityVm } from '@/lib/vm-kind'
 import {
   usageAccountForVm,
   vmCacheHitPct,
@@ -22,7 +23,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { vmHealthQueryOptions, type VmHealthRange } from './queries'
 import { riskFg } from './usage-meter'
-import { VmQuotaActions, WindowBar } from './usage-windows'
+import { VmQuotaActions, VmUsageWindows, WindowBar } from './usage-windows'
 import { vmWindows } from './vm-rack-model'
 import { windowTiming } from './window-timing'
 
@@ -174,6 +175,15 @@ function HealthCard({ vm }: { vm: Vm }) {
 
 function WindowsCard({ vm, now }: { vm: Vm; now: number }) {
   const hasToken = Boolean(vm.has_token)
+  if (isAntigravityVm(vm))
+    return (
+      <section className={CARD} aria-label='账号额度明细'>
+        <div className={CARD_HEAD}>
+          <span>账号额度</span>
+        </div>
+        <VmUsageWindows vm={vm} now={now} quotaActions />
+      </section>
+    )
   return (
     <section className={CARD} aria-label='用量窗口明细'>
       <div className={CARD_HEAD}>

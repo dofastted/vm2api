@@ -12,6 +12,7 @@ import {
   PackageCheck,
   RadioTower,
   ScrollText,
+  Sparkles,
   ShieldCheck,
   type LucideIcon,
 } from 'lucide-react'
@@ -21,6 +22,7 @@ export const SETTINGS_TABS = [
   ['pool', '账号池'],
   ['quota', '配额'],
   ['openai', 'OpenAI'],
+  ['antigravity', 'Antigravity'],
   ['logs', '日志'],
   ['protocol', '协议'],
   ['redaction', '脱敏'],
@@ -50,6 +52,7 @@ export const SETTINGS_NAV_GROUPS: {
       { id: 'pool', icon: Layers },
       { id: 'quota', icon: Gauge },
       { id: 'openai', icon: Bot },
+      { id: 'antigravity', icon: Sparkles },
     ],
   },
   {

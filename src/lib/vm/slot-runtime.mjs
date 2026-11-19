@@ -16,8 +16,11 @@ import {
   stopCodexKernelAndWait,
   writeCodexKernelConfig,
 } from '../transport/codex-kernel-supervisor.mjs'
+import { antigravityRuntimeSupport, ensureAntigravityBridge } from '../transport/antigravity-bridge-supervisor.mjs'
+import { stopAntigravityAuthLogin } from '../oauth/antigravity-auth-login.mjs'
 import { runtimeKind, isKvmRuntime } from './runtime-kind.mjs'
 import { getVm, listVms, isCodexVm, persistVmRuntime } from './vm-registry.mjs'
+import { isAntigravityVm, isClaudeVm } from './vm-kind.mjs'
 import { resolveCragKernelVersion, resolveInferenceEngine, resolveKernelDataplane } from './slot-engine.mjs'
 import {
   containerHasKernelMount,
@@ -42,6 +45,10 @@ function unsupportedOnHost(action) {
 }
 
 export function startSlot(vm, projectRoot, opts = {}) {
+  if (isAntigravityVm(vm)) {
+    const support = antigravityRuntimeSupport(vm)
+    if (!support.ok) return support
+  }
   return slotHost(vm).start(vm, projectRoot, opts)
 }
 
@@ -65,6 +72,14 @@ export async function startSlotReady(vm, projectRoot, opts = {}) {
 }
 
 async function startSlotReadyAdmitted(vm, projectRoot, opts) {
+  if (isAntigravityVm(vm)) {
+    const support = antigravityRuntimeSupport(vm)
+    if (!support.ok) return support
+    const boot = await (opts.ops?.startSlot || startSlot)(vm, projectRoot, opts)
+    if (!boot?.ok) return boot
+    const bridge = await ensureSlotInferenceRuntime(vm, projectRoot, opts)
+    return { ...boot, engine: 'antigravity', antigravity: bridge, antigravity_ready: bridge.ok === true }
+  }
   const codex = isCodexVm(vm)
   if (codex && !slotHost(vm).supports('codex')) return unsupportedOnHost('codex')
   const boot = await (opts.ops?.startSlot || startSlot)(vm, projectRoot, opts)
@@ -79,17 +94,23 @@ async function startSlotReadyAdmitted(vm, projectRoot, opts) {
 }
 
 export async function stopSlot(vm) {
+  if (isAntigravityVm(vm)) await stopAntigravityAuthLogin(vm.id)
   if (isCodexVm(vm)) stopCodexKernel(vm.id)
   return slotHost(vm).stop(vm)
 }
 
 /** Destroy the slot container. Used only by explicit reset / delete. */
 export async function destroySlot(vm, opts) {
+  if (isAntigravityVm(vm)) await stopAntigravityAuthLogin(vm.id)
   return slotHost(vm).destroy(vm, opts)
 }
 
 /** Reload guest worker so a new bind-mounted / virtiofs binary is picked up. Recreate only when the bound egress network moved; otherwise never docker rm. */
 export async function reloadSlot(vm, projectRoot, opts = {}) {
+  if (isAntigravityVm(vm)) {
+    const support = antigravityRuntimeSupport(vm)
+    if (!support.ok) return support
+  }
   return slotHost(vm).reload(vm, projectRoot, opts)
 }
 
@@ -154,6 +175,12 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
 
 async function ensureSlotInferenceRuntimeAdmitted(vm, projectRoot, opts) {
   const { routing } = opts
+  if (isAntigravityVm(vm)) {
+    const result = await (opts.ops?.ensureAntigravityBridge || ensureAntigravityBridge)({ projectRoot, vm, routing })
+    return { ...result, engine: 'antigravity' }
+  }
+  if (!isClaudeVm(vm) && !isCodexVm(vm))
+    return { ok: false, code: 'platform_not_supported', error: 'Unsupported slot platform' }
   const licensed = checkCragLicense(projectRoot, vm, routing)
   if (!licensed.ok) return licensed
   const eager = routing?.inference?.eager_start !== false
@@ -252,6 +279,8 @@ async function attachInferenceRuntime(boot, vm, projectRoot, opts = {}) {
     resolveKernelDataplane(vm, opts.routing || {}) === 'crag' &&
     resolveCragKernelVersion(vm, opts.routing || {}) === 'v2'
   const rust = await ensureSlotInferenceRuntime(vm, projectRoot, { ...opts, prepareGuestAppArmor })
+  if (isAntigravityVm(vm))
+    return { ...boot, engine: 'antigravity', antigravity: rust, antigravity_ready: rust.ok === true }
   const engine = resolveInferenceEngine(vm, opts.routing || {})
   if (vm.runtime && typeof vm.runtime === 'object') vm.runtime.worker = engine
   return {
@@ -296,8 +325,12 @@ function kernelBinaryError(bin) {
 export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeoutMs = 8000, ops = {} } = {}) {
   if (!vm?.id || !projectRoot) return { ok: false, code: 'vm_required', error: 'vm required' }
   if (!slotHost(vm).supports('engine_switch')) return unsupportedOnHost('engine_switch')
-  if (isCodexVm(vm)) {
-    return { ok: false, code: 'gpt_engine_forbidden', error: 'GPT slots do not use rust inference engines' }
+  if (!isClaudeVm(vm)) {
+    return {
+      ok: false,
+      code: isCodexVm(vm) ? 'gpt_engine_forbidden' : 'antigravity_engine_forbidden',
+      error: 'This platform does not use Claude inference engines',
+    }
   }
   if (engine === 'go') {
     return { ok: false, code: 'go_engine_disabled', error: 'Go HTTP forwarding is disabled' }
@@ -411,7 +444,7 @@ export async function switchInheritedInferenceEngines({
     .filter(
       (vm) =>
         vm &&
-        !isCodexVm(vm) &&
+        isClaudeVm(vm) &&
         slotHost(vm).supports('engine_switch') &&
         !Object.prototype.hasOwnProperty.call(vm, 'inference_engine'),
     )

@@ -251,7 +251,8 @@ export function makeProxyFetch(proxyUrl, timeoutMs = 15000, { maxMs = 30000 } = 
 
 /**
  * User-initiated Codex OAuth refresh. Not used by background model probes.
- * @param {{ refreshToken?: string, proxyUrl?: string, fetchImpl?: Function, timeoutMs?: number }} opts
+ * `userAgent` is the slot's client identity when the caller knows the slot.
+ * @param {{ refreshToken?: string, proxyUrl?: string, fetchImpl?: Function, timeoutMs?: number, userAgent?: string }} opts
  */
 export async function refreshCodexAccessToken(opts = {}) {
   const refreshToken = String(opts.refreshToken || '').trim()
@@ -269,7 +270,7 @@ export async function refreshCodexAccessToken(opts = {}) {
       headers: {
         accept: 'application/json',
         'content-type': 'application/x-www-form-urlencoded',
-        'user-agent': CODEX_USER_AGENT,
+        'user-agent': opts.userAgent || CODEX_USER_AGENT,
       },
       body: String(body),
     })
@@ -297,7 +298,7 @@ export async function refreshCodexAccessToken(opts = {}) {
 
 /**
  * Official Codex Desktop authorization-code + PKCE exchange.
- * @param {{ code?: string, codeVerifier?: string, proxyUrl?: string, fetchImpl?: Function, timeoutMs?: number }} opts
+ * @param {{ code?: string, codeVerifier?: string, proxyUrl?: string, fetchImpl?: Function, timeoutMs?: number, userAgent?: string }} opts
  */
 export async function exchangeCodexAuthorizationCode(opts = {}) {
   const code = String(opts.code || '').trim()
@@ -317,7 +318,7 @@ export async function exchangeCodexAuthorizationCode(opts = {}) {
       headers: {
         accept: 'application/json',
         'content-type': 'application/x-www-form-urlencoded',
-        'user-agent': CODEX_USER_AGENT,
+        'user-agent': opts.userAgent || CODEX_USER_AGENT,
       },
       body: String(body),
     })
@@ -352,6 +353,7 @@ export async function exchangeCodexAuthorizationCode(opts = {}) {
  *   catalogVersion?: string,
  *   configuredCatalogVersion?: string,
  *   catalogVersionCachePath?: string,
+ *   identity?: { userAgent: string, originator: string, version: string, clientVersion: string },
  * }} opts
  */
 export async function fetchChatgptModelCatalog(opts = {}) {
@@ -362,23 +364,25 @@ export async function fetchChatgptModelCatalog(opts = {}) {
     .replace(/^socks5:\/\//i, 'socks5h://')
   if (!proxyUrl && !opts.fetchImpl && !opts.direct) return { ok: false, error: 'proxy_required', ids: [], models: [] }
 
-  const catalogVersion =
-    normalizeCodexCatalogVersion(opts.catalogVersion) ||
-    (
-      await resolveCodexCatalogVersion({
-        configuredVersion: opts.configuredCatalogVersion,
-        cachePath: opts.catalogVersionCachePath,
-        fetchImpl: opts.versionFetchImpl,
-      })
-    ).version
+  // A slot identity speaks for its own client build; otherwise the catalog client is resolved.
+  const identity = opts.identity?.userAgent ? opts.identity : null
+  const catalogVersion = identity
+    ? identity.clientVersion
+    : normalizeCodexCatalogVersion(opts.catalogVersion) ||
+      (
+        await resolveCodexCatalogVersion({
+          configuredVersion: opts.configuredCatalogVersion,
+          cachePath: opts.catalogVersionCachePath,
+          fetchImpl: opts.versionFetchImpl,
+        })
+      ).version
   if (!catalogVersion) return { ok: false, error: 'catalog_version_unavailable', ids: [], models: [] }
-  const catalogUserAgent = `${CODEX_CATALOG_ORIGINATOR}/${catalogVersion} (linux x86_64)`
   const headers = {
     accept: 'application/json',
     authorization: `Bearer ${token}`,
-    'user-agent': catalogUserAgent,
-    originator: CODEX_CATALOG_ORIGINATOR,
-    version: catalogVersion,
+    'user-agent': identity ? identity.userAgent : `${CODEX_CATALOG_ORIGINATOR}/${catalogVersion} (linux x86_64)`,
+    originator: identity ? identity.originator : CODEX_CATALOG_ORIGINATOR,
+    version: identity ? identity.version : catalogVersion,
   }
   const accountId = String(opts.accountId || '').trim()
   if (accountId) headers['chatgpt-account-id'] = accountId

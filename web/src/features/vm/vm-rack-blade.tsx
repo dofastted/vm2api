@@ -6,10 +6,11 @@ import {
 } from 'react'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
-import { Download, LifeBuoy, Link2, RefreshCw } from 'lucide-react'
+import { Download, LifeBuoy, Link2, Play, RefreshCw } from 'lucide-react'
 import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
+import { isAntigravityVm } from '@/lib/vm-kind'
 import {
   claudeTier,
   credentialStatus,
@@ -84,6 +85,7 @@ export function TierBadge({ vm, className }: { vm: Vm; className?: string }) {
 
 export const BLADE_STATE_CLASS: Record<BladeState, string> = {
   live: 'bg-muted/50',
+  official: 'bg-muted/50',
   unprobed: 'bg-muted/50',
   dead: 'bg-[color:color-mix(in_oklch,var(--status-bad-bg)_35%,var(--card))]',
   vacant: 'bg-transparent shadow-[inset_0_0_0_1px_var(--border)]',
@@ -218,7 +220,7 @@ function Callout({
   children,
   action,
 }: {
-  tone: 'bad' | 'caution' | 'none'
+  tone: 'ok' | 'bad' | 'caution' | 'none'
   title: ReactNode
   children?: ReactNode
   action: ReactNode
@@ -227,6 +229,8 @@ function Callout({
     <div
       className={cn(
         'grid min-w-0 content-center gap-1.5 rounded-lg px-3.5 py-3 text-[12.5px]',
+        tone === 'ok' &&
+          'bg-[color:var(--status-ok-bg)] text-[color:var(--status-ok)]',
         tone === 'bad' &&
           'bg-[color:var(--status-bad-bg)] text-[color:var(--status-bad)]',
         tone === 'caution' &&
@@ -291,6 +295,25 @@ export function BladeCallout({
   const actions = useVmActions()
   const perms = useVmPerms()
   const canCred = perms.credential
+  if (state === 'official') {
+    return (
+      <Callout
+        tone='ok'
+        title='已登录官方客户端'
+        action={
+          perms.test ? (
+            <CalloutAction icon={<Play />} onClick={() => actions.openTest(vm)}>
+              测试文本会话
+            </CalloutAction>
+          ) : null
+        }
+      >
+        <span>
+          同步账号模型并启用调度后可使用 Antigravity API；测试页可检查文本回复。
+        </span>
+      </Callout>
+    )
+  }
   if (state === 'dead') {
     const failed = vmFailedAt(vm)
     const ago = failed ? fmtAgo(new Date(failed).toISOString()) : ''
@@ -351,7 +374,11 @@ export function BladeCallout({
           ) : null
         }
       >
-        <span>绑定后进入探测，再按结果入池。</span>
+        <span>
+          {isAntigravityVm(vm)
+            ? '通过 OAuth 登录槽位内的官方 Antigravity 客户端。'
+            : '绑定后进入探测，再按结果入池。'}
+        </span>
       </Callout>
     )
   }
@@ -472,6 +499,13 @@ export const VmBlade = memo(function VmBlade({
         <div className='grid min-w-0 content-start gap-1.5'>
           <BladeCallout vm={vm} accounts={accounts} state={state} />
           <QuotaRow vm={vm} now={now} />
+        </div>
+      ) : state === 'official' ? (
+        <div className='grid min-w-0 content-start gap-1.5'>
+          {vm.antigravity_quota?.groups.length ? null : (
+            <BladeCallout vm={vm} accounts={accounts} state={state} />
+          )}
+          <VmUsageWindows vm={vm} now={now} quiet quotaActions />
         </div>
       ) : (
         <BladeCallout vm={vm} accounts={accounts} state={state} />

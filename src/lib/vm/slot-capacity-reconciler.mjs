@@ -22,7 +22,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { isKvmRuntime } from './runtime-kind.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isClaudeVm } from './vm-kind.mjs'
 import { memoryMiB, slotMemory, VM_MEMORY_OPTIONS } from './machine-spec.mjs'
 import { withVmLock } from './vm-file.mjs'
 import { getVm } from './vm-registry.mjs'
@@ -61,7 +61,7 @@ const EVENT_REPEAT_MS = 60 * 60 * 1000
 export const NODE_MEMORY_STALE_MS = 120_000
 
 function reconcilable(vm) {
-  if (!vm?.id || isCodexVm(vm) || isKvmRuntime(vm)) return false
+  if (!vm?.id || !isClaudeVm(vm) || isKvmRuntime(vm)) return false
   if (vm.status && vm.status !== 'running') return false
   return true
 }

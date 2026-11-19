@@ -16,7 +16,7 @@ import {
   type WeeklySplitSummary,
 } from '@/lib/fable-status'
 import { fmtNum, fmtUsd } from '@/lib/format'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import {
   accountStatus,
   accountUsable,
@@ -36,6 +36,7 @@ import {
 import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
 import { ActiveUsageAction } from '@/features/vm/active-usage-action'
+import { AntigravityQuotaWindows } from '@/features/vm/antigravity-quota'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { CodexKernelHealthFields } from '@/features/vm/codex-kernel-health-card'
 import { kernelRouteLabel } from '@/features/vm/dataplane-contract'
@@ -202,6 +203,29 @@ export function VmStatusBoard(props: Props) {
     today,
     billing,
   } = props
+  if (isAntigravityVm(vm)) {
+    return (
+      <section className='space-y-3 rounded-lg border bg-card p-4'>
+        <h2 className='text-lg font-semibold'>Antigravity · 官方客户端接入</h2>
+        <p className='text-sm text-muted-foreground'>
+          在账号页检查官方客户端登录和独立运行时状态；在测试页发一条真实对话验证凭证、代理与槽位
+          bridge 整条链路。
+        </p>
+        <p className='text-xs text-muted-foreground'>
+          支持 Messages、Chat Completions 与 Responses
+          API；账号模型需在槽位测试页同步。
+        </p>
+        <div className='max-w-md'>
+          <h3 className='mb-1.5 text-xs font-medium text-muted-foreground'>
+            账号额度
+          </h3>
+          <AntigravityQuotaWindows vm={vm} now={now} actions />
+        </div>
+        <VmSchedulingBlock vm={vm} />
+        <VmMemoryBlock vm={vm} />
+      </section>
+    )
+  }
   const verdict = slotVerdict(vm, kernel, proxy)
   const proxyH = proxyHealthOf(vm, proxy)
   const fable = fableCardInfo(vm, fableCap(dash.data))

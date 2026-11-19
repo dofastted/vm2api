@@ -11,6 +11,7 @@ import { SettingsRepo } from './settings-repo.mjs'
 import { maybeEncrypt, maybeDecrypt, encryptionEnabled } from '../secure.mjs'
 import { hasAccessPresence, hasRefreshPresence, stripCredentialSecrets } from '../../oauth/oauth-credentials.mjs'
 import { normalizeOwnerId, vmOriginOf } from '../../admin/resource-owner.mjs'
+import { isAntigravityVm } from '../../vm/vm-kind.mjs'
 
 const ACTIVE_VM_KEY = 'active_vm'
 
@@ -47,20 +48,29 @@ export class VmsRepo {
   upsertFromVmJson(vm, { mtimeMs = null } = {}) {
     if (!vm?.id) return null
     const now = new Date().toISOString()
-    const c = vm.claude || {}
+    const antigravity = isAntigravityVm(vm)
+    const c = antigravity ? {} : vm.claude || {}
     const safeClaude = stripCredentialSecrets({
       ...c,
       has_access: hasAccessPresence(c),
       has_refresh: hasRefreshPresence(c),
     })
     const safeVm = { ...vm, claude: safeClaude }
+    if (vm.antigravity) {
+      // CLI authentication belongs to the slot keyring; mirror display metadata only.
+      safeVm.antigravity = { email: typeof vm.antigravity.email === 'string' ? vm.antigravity.email : null }
+    }
+    if (antigravity) {
+      delete safeVm.claude
+      delete safeVm.codex
+    }
     const enc = encryptionEnabled()
     this._upsert.run(
       vm.id,
       vm.name ?? null,
       vm.status ?? null,
       vm.schedulable === false ? 0 : 1,
-      safeClaude.email ?? null,
+      antigravity ? (safeVm.antigravity?.email ?? null) : (safeClaude.email ?? null),
       safeClaude.account_uuid ?? null,
       safeClaude.org_uuid ?? null,
       null,

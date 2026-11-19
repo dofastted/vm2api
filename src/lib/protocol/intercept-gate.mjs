@@ -242,6 +242,7 @@ export async function evaluateProtocolIntercept({
   sessions = null,
   requestId,
   account = null,
+  platform = null,
   scopeMatched = false,
   fetchImpl,
   bodyCtx = null,
@@ -328,7 +329,13 @@ export async function evaluateProtocolIntercept({
   const routeTarget = backend === 'api' ? audit?.downgrade_endpoint : audit?.downgrade_pool
   const routeConfigured = !!(jev?.enabled && (routeTarget || audit?.downgrade_model))
   let outside = ''
-  if (!scopeMatched && openaiPlatform) {
+  if (!scopeMatched && platform === 'antigravity') {
+    if (jevScopeConfigured(jev)) {
+      if (!jevScopeWaits(jev, 'antigravity')) outside = 'scope'
+      else if (!account && !routeConfigured) outside = 'scope-wait'
+      else if (account && !jevAccountInScope(jev, account)) outside = 'scope'
+    }
+  } else if (!scopeMatched && openaiPlatform) {
     if (!jevScopeConfigured(jev)) {
       if (jev?.openai_platform_enabled !== true) outside = 'platform'
     } else if (!jevScopeWaits(jev, 'gpt')) {

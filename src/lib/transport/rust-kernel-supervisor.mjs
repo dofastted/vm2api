@@ -21,7 +21,7 @@ import { thinkingDisplayMode } from '../protocol/thinking.mjs'
 import { getModelPolicy } from '../protocol/model-policy.mjs'
 import { ccEntrypointFromRouting } from '../identity/crs-persona.mjs'
 import { setVmSchedulable, listVms, getVm } from '../vm/vm-registry.mjs'
-import { isCodexVm } from '../vm/vm-kind.mjs'
+import { isClaudeVm } from '../vm/vm-kind.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { ensureHostPrivateDir } from '../vm/private-dir.mjs'
@@ -302,7 +302,7 @@ const nodeSetupAcceptedAt = new Map()
 
 async function acceptNodeClaudeSetup(exec, runDockerExec) {
   const host = slotHost(exec?.vm)
-  if (!host.bakedKernel || host.native || isCodexVm(exec?.vm || {}) || isKvmRuntime(exec?.vm)) return null
+  if (!host.bakedKernel || host.native || !isClaudeVm(exec?.vm || {}) || isKvmRuntime(exec?.vm)) return null
   const vmId = exec?.vmId || exec?.vm?.id
   if (!vmId) return null
   const last = nodeSetupAcceptedAt.get(vmId) || 0
@@ -1221,8 +1221,9 @@ export function writeKernelConfig(
   vm,
   { token, proxyUrl, proxyRequired, officialCcInference, timezone, routing, publish = true } = {},
 ) {
-  // Callers pass partial vm snapshots; persisted placement owns the guest run mount.
+  if (!projectRoot || !vm?.id) return null
   const record = getVm(projectRoot, vm.id) || vm
+  if (!isClaudeVm(record)) return null
   const homeDir = path.join(projectRoot, 'vms', vm.id, 'cli-home')
   const runDir = workerPaths({
     vm: record,
@@ -1335,7 +1336,7 @@ export function writeKernelConfig(
     cch_enabled: cchEnabled,
     auto_compact_window: autoCompactWindow,
     model_effort: modelEffort,
-    ...(!host.native && !isCodexVm(record) ? { telemetry: buildNativeTelemetry(record, projectRoot, routing) } : {}),
+    ...(!host.native && isClaudeVm(record) ? { telemetry: buildNativeTelemetry(record, projectRoot, routing) } : {}),
   }
   if (dataplane === 'crag' && resolveCragKernelVersion(target, kernelRouting) === 'v2' && !host.native) {
     config.session_slots = Math.min(requestedCragSessionSlots(target, routing, kernelRouting), config.slots_per_worker)
@@ -1418,7 +1419,7 @@ export function syncClaudeKernelConfigs(projectRoot, routing, onSessionPolicyCha
   let skipped = 0
   for (const { id } of listVms(projectRoot)) {
     const vm = getVm(projectRoot, id)
-    if (!vm || isCodexVm(vm)) {
+    if (!vm || !isClaudeVm(vm)) {
       skipped += 1
       continue
     }

@@ -122,6 +122,50 @@ test('runVmTestChat loopbacks /v1/messages with x-kin-vm pin and never calls a w
   assert.ok(!result.log.some((l) => /Go slot worker|streamGoWorker|callGoWorker/i.test(l.message)))
 })
 
+test('Antigravity test-chat pins the slot and forwards only a supported reasoning level', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-testchat-ag-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const vmDir = path.join(root, 'vms')
+  fs.mkdirSync(path.join(vmDir, 'vm-ag', 'run'), { recursive: true })
+  fs.writeFileSync(
+    path.join(vmDir, 'vm-ag.json'),
+    JSON.stringify({
+      id: 'vm-ag',
+      platform: 'antigravity',
+      family: 'antigravity',
+      status: 'running',
+      proxy: { url: 'socks5h://127.0.0.1:1080', host: '127.0.0.1' },
+    }),
+  )
+  fs.writeFileSync(path.join(vmDir, 'vm-ag', 'run', 'antigravity-auth.json'), JSON.stringify({ authenticated: true }))
+  fs.mkdirSync(path.join(root, 'src', 'config'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'src', 'config', 'routing.json'),
+    JSON.stringify({ antigravity: { enabled: true, models: [{ id: 'claude-example', levels: ['low', 'high'] }] } }),
+  )
+  const { baseUrl, calls } = await startLoopbackServer(t, () => ({
+    status: 200,
+    body: { type: 'message', content: [{ type: 'text', text: 'pong' }], stop_reason: 'end_turn' },
+  }))
+  const run = (reasoning_effort) =>
+    runVmTestChat({
+      projectRoot: root,
+      vmId: 'vm-ag',
+      model: 'claude-example',
+      reasoning_effort,
+      baseUrl,
+      apiKey: 'test-master-key',
+    })
+  const result = await run('high')
+  assert.equal(result.ok, true, JSON.stringify(result.log))
+  assert.equal(result.text, 'pong')
+  assert.equal(calls[0].headers['x-kin-vm'], 'vm-ag')
+  assert.equal(calls[0].body.model, 'claude-example')
+  assert.deepEqual(calls[0].body.output_config, { effort: 'high' })
+  await run('medium')
+  assert.equal(calls[1].body.output_config, undefined)
+})
+
 test('testChatCredentialMode treats inference-only as official-setup-token', () => {
   assert.equal(testChatCredentialMode({ claude: { mode: 'setup-token' } }), 'setup-token')
   assert.equal(testChatCredentialMode({ claude: { mode: 'oauth', scope: 'user:inference' } }), 'official-setup-token')

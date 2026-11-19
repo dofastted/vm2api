@@ -22,6 +22,7 @@ import {
   localEgressProxyUrl,
   localEgressStatus,
   egressListening,
+  egressRulesIntact,
   egressRunDir,
   proxyEgressReady,
   networkName,
@@ -766,4 +767,45 @@ test('waitPortReleased returns at once for a free port without blocking the even
 test('egress wait loops do not shell out to python3', () => {
   const src = fs.readFileSync(path.join(import.meta.dirname, '../../src/lib/vm/egress.mjs'), 'utf8')
   assert.equal(src.includes('python3'), false)
+})
+
+test('egressRulesIntact detects NAT rules wiped by a firewall reload, using the helper listen ports', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-rules-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const proxyId = 'px-77738402'
+  fs.mkdirSync(egressRunDir(root, proxyId), { recursive: true })
+  fs.writeFileSync(
+    path.join(egressRunDir(root, proxyId), 'egress.json'),
+    JSON.stringify({ listen_tcp: '172.20.0.1:40000', listen_dns: '172.20.0.1:40001' }),
+  )
+  const rules = new Set()
+  const runIptables = (args) => {
+    const [, table, op, chain, ...rest] = args
+    const key = [table, chain, ...(op === '-I' ? rest.slice(1) : rest)].join(' ')
+    if (op === '-C') return { ok: rules.has(key) }
+    if (op === '-A' || op === '-I') rules.add(key)
+    if (op === '-F') for (const rule of [...rules]) if (rule.startsWith(`${table} ${chain} `)) rules.delete(rule)
+    return { ok: true }
+  }
+  const runDocker = () => ({ ok: true, stdout: '172.20.0.0/16|172.20.0.1' })
+  const install = (tcpPort, dnsPort) => {
+    const plan = iptablesPlan({
+      chain: chainName(proxyId),
+      bridge: bridgeName(proxyId),
+      subnet: '172.20.0.0/16',
+      tcpPort,
+      dnsPort,
+    })
+    for (const args of plan.add) if (!args.includes('-C')) runIptables(args)
+  }
+  const intact = () => egressRulesIntact(root, proxyId, { runDocker, runIptables })
+  install(40000, 40001)
+  assert.equal(intact(), true)
+  for (const rule of [...rules]) if (rule.startsWith('nat ')) rules.delete(rule)
+  assert.equal(intact(), false, 'filter rules alone do not route slot traffic')
+  rules.clear()
+  const fallback = portsForProxy(proxyId)
+  install(fallback.tcp, fallback.dns)
+  assert.equal(intact(), false, 'rules pointing at other ports than the live helper are not intact')
+  assert.equal(egressRulesIntact(root, proxyId, { runDocker: () => ({ ok: false }), runIptables }), false)
 })

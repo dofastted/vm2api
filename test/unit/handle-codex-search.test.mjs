@@ -75,7 +75,13 @@ test('search posts to the Codex backend as the slot and returns the backend JSON
       prompt_cache_retention: '24h',
       store: false,
     },
-    headers: { 'x-codex-turn-metadata': '{"turn_id":"t-1"}', authorization: 'Bearer sk-client' },
+    headers: {
+      'x-codex-turn-metadata': JSON.stringify({
+        installation_id: '22222222-2222-4222-8222-222222222222',
+        turn_id: 't-1',
+      }),
+      authorization: 'Bearer sk-client',
+    },
     ops: { fetchImpl },
   })
   assert.equal(calls.length, 1)
@@ -87,7 +93,9 @@ test('search posts to the Codex backend as the slot and returns the backend JSON
   assert.equal(sent.originator, 'codex_cli_rs')
   assert.match(sent['user-agent'], /^codex_cli_rs\//)
   assert.equal(sent.version, CODEX_APP_VERSION)
-  assert.equal(sent['x-codex-turn-metadata'], '{"turn_id":"t-1"}')
+  const slotInstall = fs.readFileSync(path.join(root, 'vms', 'vm-gpt-a', 'run', 'codex-installation-id'), 'utf8').trim()
+  assert.deepEqual(JSON.parse(sent['x-codex-turn-metadata']), { installation_id: slotInstall, turn_id: 't-1' })
+  assert.equal(logBag.inbound_device_id, '22222222-2222-4222-8222-222222222222')
   const payload = JSON.parse(calls[0].init.body)
   assert.deepEqual(payload, { id: 'sess-1', model: 'gpt-6.1-sol', commands: { search_query: [{ q: 'vm2api' }] } })
   assert.equal(res.statusCode, 200)

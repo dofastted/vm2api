@@ -332,6 +332,21 @@ test('selectHealthProbeTargets uses summary credential flags', () => {
   assert.deepEqual(selectHealthProbeTargets(vms, pinned), [])
 })
 
+test('health probes reject Antigravity and unknown raw records even with stale native credential flags', () => {
+  const ready = { schedulable: true, status: 'running', has_token: true, has_refresh: true }
+  const vms = [
+    { ...ready, id: 'legacy-claude' },
+    { ...ready, id: 'gpt', platform: 'openai' },
+    { ...ready, id: 'antigravity', platform: 'antigravity', family: 'claude', codex_kernel: true },
+    { ...ready, id: 'unknown', platform: 'unsupported', codex_kernel: true },
+    { ...ready, id: 'antigravity-leftover', platform: 'antigravity', claude: { has_access: true } },
+  ]
+  assert.deepEqual(
+    selectHealthProbeTargets(vms, cfg).map((vm) => vm.id),
+    ['legacy-claude', 'gpt'],
+  )
+})
+
 test('selectHealthProbeTargets skips slots outside their working window', () => {
   const now = Date.parse('2026-09-17T12:00:00.000Z')
   const vms = [

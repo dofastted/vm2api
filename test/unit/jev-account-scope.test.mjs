@@ -38,6 +38,39 @@ test('an empty scope takes every account; credential form no longer narrows it',
   assert.equal(jevAccountInScope(typed, { id: 'vm-02', type: 'apikey' }), true)
 })
 
+test('Antigravity has an isolated policy scope and never inherits Claude tier', async () => {
+  const account = scopeAccountFromVm({
+    id: 'vm-g-01',
+    platform: 'antigravity',
+    antigravity: { authenticated: true },
+    claude: { account_tier: 'max', has_access: true },
+  })
+  assert.equal(scopeKeyOf(account), 'antigravity:none')
+  assert.equal(account.account_tier, null)
+  const config = normalizeJevConfig({ hard_regex_enabled: true, account_platform_plans: ['antigravity:none'] })
+  assert.deepEqual(config.account_platform_plans, ['antigravity:none'])
+  assert.equal(jevAccountInScope(config, account), true)
+  assert.equal(jevAccountInScope(config, { platform: 'claude' }), false)
+  assert.equal(jevScopeWaits(config, 'antigravity'), true)
+  assert.equal(jevScopeWaits(config, 'claude'), false)
+  const inventory = buildScopeInventory([account])
+  assert.equal(inventory.account_platform_plan_options[0].label, 'Antigravity · 未标注')
+  // The handler resolves the platform (with the key group) and passes it in; the model ID alone
+  // is the official one, so a same-name Claude model is still routed by the caller's decision.
+  const inbound = { model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: JAILBREAK }] }
+  const deferred = await evaluateProtocolIntercept({ inbound, jev: config, platform: 'antigravity' })
+  assert.equal(JSON.parse(deferred.intercept).by, 'scope-wait')
+  const denied = await evaluateProtocolIntercept({ inbound, jev: config, account, platform: 'antigravity' })
+  assert.equal(denied.action, 'block')
+  const excluded = await evaluateProtocolIntercept({
+    inbound,
+    account,
+    platform: 'antigravity',
+    jev: normalizeJevConfig({ hard_regex_enabled: true, account_platform_plans: ['claude:max'] }),
+  })
+  assert.equal(JSON.parse(excluded.intercept).by, 'scope')
+})
+
 test('a platform and plan are one key, and a named account is a union', () => {
   const jev = normalizeJevConfig({
     account_platform_plans: ['Claude:Max', 'gpt:plus', 'gpt:business'],

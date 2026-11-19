@@ -326,8 +326,8 @@ H1 删除已绑定槽时，控制面保留最小私有回收记录，只有严�
 | `websocket.enabled` | `true` | 全局推理 WS 总闸，不影响面板终端或集群连接 |
 | `codex.websocket.enabled` | `true` | GPT 推理 WS 子闸；必须与总闸同时开启 |
 | `codex.upstream_transport` | `prefer_websocket` | `prefer_websocket` 或 `http`；入站与上游传输不是同一段连接 |
-| `codex.user_agent` | `codex_cli_rs/0.167.1 (linux x86_64)` | 上游客户端画像，不读取下游用户的系统信息；originator/version 由内核按该画像生成，调用方不能覆盖 |
-| `codex.catalog_client_version` | `auto` | 模型目录同步的客户端版本，与推理 UA 分开 |
+| `codex.user_agent` | `codex_cli_rs/0.167.1 (linux x86_64)` | 上游客户端画像模板，不读取下游用户的系统信息。`Mac OS x.y.z` 形状的 UA 由每个槽位固定换成一个 macOS 版本（按安装 UUID 选定）；出站 `originator` / `version` 取槽位 UA 的 `名称/版本` 部分，调用方不能覆盖 |
+| `codex.catalog_client_version` | `auto` | 没有槽位身份时模型目录同步使用的客户端版本，与推理 UA 分开；按槽位同步时用该槽 UA 的版本 |
 | `codex.client_features.enabled` | `false` | 显式开启后上送槽位独立安装 UUID 与官方 `client_metadata`；不使用 VM/硬件指纹 |
 | `codex.analytics.enabled` | `false` | 显式开启后独立上报运行环境 Analytics，不是推理成功的前提 |
 | `codex.model_mappings` | 见下 | 入站 `model` 精确别名 → 上游 GPT id（对标 [codex-proxy-rs `modelMappings`](https://github.com/zyycn/codex-proxy-rs)）；保存后随 `routing.json` 热读，无需重启 Node |
@@ -342,7 +342,7 @@ H1 删除已绑定槽时，控制面保留最小私有回收记录，只有严�
 
 任一 WS 闸关闭时，新 WS 握手被拒绝，HTTP/SSE 入口继续可用且上游强制 HTTP。传输、UA 与隐私选项通过每次内部 envelope 的 `options` 生效，不为修改这些 settings 而重启共享 kernel；已开始的请求保留其选定策略。
 
-安装 UUID 存在槽位 `run/codex-installation-id`，不取 MAC、主机名、machine-id 或调用方安装 ID。每次 envelope 的 `options.installation_id` 使用该文件的 UUID，覆盖运行中 kernel 的旧启动身份；非法安装 ID 在拨号前拒绝，避免复用旧进程时重新上传 VM 指纹。关闭安装元数据时，不生成 `client_metadata`，并从调用方的 turn 元数据移除安装 ID；会话路由所需信息保留。
+安装 UUID 存在槽位 `run/codex-installation-id`，不取 MAC、主机名、machine-id 或调用方安装 ID。一个槽位的所有上游调用（推理、`alpha/search`、`images/*`、模型目录、OAuth 换票/刷新、额度查询、测试对话）都用同一个槽位身份：安装 UUID、UA、`originator`、`version`。推理与搜索/生图出站的 `x-codex-turn-metadata` 中 `installation_id` 换成槽位 UUID（客户端值只写入本地日志 `inbound_device_id`），`sandbox` 与槽位系统一致；调用方 `x-codex-installation-id` 头不转发；调用方没有 turn 元数据时按出站会话补一份根轮元数据。官方 Codex 客户端的会话 id（UUID v7）原样作为出站会话，`session-id`、`thread-id`、`x-client-request-id`、`x-codex-window-id`、turn 元数据与 `prompt_cache_key` 保持同一个值；其它客户端仍按 `sticky.outbound_session` 生成，并把这些字段一并改到出站会话。输入里的 `<environment_context>` 改成槽位工作站：cwd / workspace root 落在槽位 home（`/Users/<槽位用户名>`，Windows 盘符路径同样映射），shell、时区（槽位 `timezone`）与当地日期随槽位。每次 envelope 的 `options.installation_id` / `options.user_agent` 使用该槽身份，覆盖运行中 kernel 的旧启动身份；非法安装 ID 在拨号前拒绝。关闭 `codex.client_features` 时 kernel 不生成 `client_metadata`，并从 turn 元数据移除安装 ID；要让上游每次都看到槽位安装 UUID，需开启该开关。`codex.analytics` 保持关闭：kernel 上报的是宿主 Linux 运行环境，与 macOS 画像不一致。
 
 Analytics 按官方 [`codex_thread_initialized`](https://github.com/openai/codex/blob/main/codex-rs/analytics/src/events.rs) 的事件结构，向 `https://chatgpt.com/backend-api/codex/analytics-events/events` 单独 POST，使用所选账号鉴权并沿用该槽出口及客户端画像。包含真实 kernel 版本、**所选 VM 内采集**的系统/系统版本/架构、会话标识、模型和 Unix 秒级时间；不读取控制面宿主的 `/etc/os-release` 或编译目标架构，也不使用随机工作站画像和下游电脑信息。不上传提示词、文件内容、仓库路径、主机名、MAC、SMBIOS 或 machine-id。每进程每账号/会话去重（最多保留 4096 个键），队列最多 256 条，单次上传最多 10 秒，失败只记录状态、不重放推理、不重试上报。未启用时零 Analytics 请求。OTEL/Statsig 与 Sentry 反馈不随这个开关启用。官方发送实现见 [`analytics/src/client.rs`](https://github.com/openai/codex/blob/main/codex-rs/analytics/src/client.rs)。
 

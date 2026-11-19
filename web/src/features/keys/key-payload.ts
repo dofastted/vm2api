@@ -1,4 +1,5 @@
-export type KeyGroupType = 'all' | 'anthropic' | 'openai' | 'gemini' | 'pool'
+export type KeyGroupType =
+  'all' | 'anthropic' | 'openai' | 'antigravity' | 'gemini' | 'pool'
 
 export const KEY_ALLOWED_MODELS_MAX = 200
 
@@ -37,7 +38,12 @@ export function parseModelList(text: string): string[] {
 }
 
 function groupTypeOf(value: string): KeyGroupType {
-  if (value === 'anthropic' || value === 'openai' || value === 'gemini')
+  if (
+    value === 'anthropic' ||
+    value === 'openai' ||
+    value === 'antigravity' ||
+    value === 'gemini'
+  )
     return value
   return 'all'
 }

@@ -242,6 +242,30 @@ export type VmPhysicalFeatures = {
   runtimes?: string | null
 }
 
+export type AntigravityQuotaBucket = {
+  id: string | null
+  name: string | null
+  description: string | null
+  /** 例如 `5h`、`7d`、`weekly`，由官方返回。 */
+  window: string | null
+  /** 剩余比例 0–1。 */
+  remaining: number | null
+  remaining_amount: number | null
+  disabled: boolean
+  reset_at: string | null
+}
+
+export type AntigravityQuota = {
+  updated_at: string | null
+  description: string | null
+  groups: {
+    name: string | null
+    description: string | null
+    buckets: AntigravityQuotaBucket[]
+  }[]
+  error: { code: string; message: string; at: string } | null
+}
+
 /** 单台 VM 上一个被 client session 占住的槽位。 */
 export type SeatOccupant = {
   index: number
@@ -269,6 +293,16 @@ export type Vm = {
   status?: string
   has_token?: boolean
   has_refresh?: boolean
+  /** Display metadata only; Antigravity credentials stay in the official client. */
+  antigravity?: {
+    authenticated?: boolean | null
+    email?: string | null
+    credential_storage?: string
+    credential_state?: 'authenticated' | 'unauthenticated' | 'unknown'
+    updated_at?: string | number | null
+    experimental?: boolean
+  } | null
+  antigravity_quota?: AntigravityQuota | null
   cred_status?: string | { text?: string; key?: string; tone?: string }
   /**
    * 凭证类型的权威字段（`oauth` / `setup-token` / `official-setup-token` / `apikey`）。
@@ -397,9 +431,9 @@ export type Vm = {
     at?: string | null
     until?: string | null
   } | null
-  /** anthropic | openai。缺省按 Claude 槽展示。 */
+  /** anthropic | openai | antigravity。缺省兼容旧 Claude 槽。 */
   platform?: string | null
-  /** claude | codex */
+  /** claude | codex | antigravity */
   family?: string | null
   codex_kernel?: boolean
   inference_engine?: 'go' | 'rust' | null
@@ -870,10 +904,18 @@ export type OfficialCcBootstrapPayload = {
   status?: OfficialCcStatus
 }
 
+export type TestModelOption = {
+  id: string
+  label?: string
+  display_name?: string
+  family?: string
+  reasoning_levels?: string[]
+}
+
 export type TestModelsPayload = {
-  items?: { id: string; label?: string; family?: string }[]
-  models?: { id: string; label?: string; family?: string }[]
-  platform?: 'openai' | 'anthropic' | 'all'
+  items?: TestModelOption[]
+  models?: TestModelOption[]
+  platform?: 'openai' | 'anthropic' | 'antigravity' | 'all'
   protocol?: 'openai.responses' | 'anthropic.messages' | null
   inbound_path?: '/v1/responses' | '/v1/messages' | null
   source?: string

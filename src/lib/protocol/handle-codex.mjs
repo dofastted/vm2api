@@ -43,15 +43,19 @@ import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { openaiUsageAccountId, readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
 import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
-  CODEX_APP_VERSION,
-  CODEX_CATALOG_ORIGINATOR,
   CODEX_IMAGE_EDITS_URL,
   CODEX_IMAGE_GENERATIONS_URL,
   CODEX_SEARCH_URL,
-  CODEX_USER_AGENT,
   makeProxyFetch,
   refreshCodexAccessToken,
 } from './codex-models.mjs'
+import {
+  alignCodexSessionHeaders,
+  codexSlotIdentity,
+  codexTurnMetadata,
+  inboundCodexInstallationId,
+  rewriteCodexEnvironment,
+} from './codex-identity.mjs'
 import { orderCodexSessionSlots, codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
 import {
   holdOpenAIAccount,
@@ -76,13 +80,13 @@ import {
 import { clientIp } from '../pool/sticky-router.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
+// `originator` and the installation id are the slot's own, never the caller's.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
   'openai-beta',
   'session-id',
   'thread-id',
   'x-client-request-id',
   'x-codex-beta-features',
-  'x-codex-installation-id',
   'x-codex-parent-thread-id',
   'x-codex-turn-metadata',
   'x-codex-turn-state',
@@ -97,15 +101,18 @@ function headerString(headers, name) {
   return typeof value === 'string' && value.trim() ? value : ''
 }
 
-function codexKernelHeaders(reqHeaders = {}, body = {}, session = null) {
-  const headers = {}
+function codexKernelHeaders(reqHeaders = {}, body = {}, session = null, identity, callerSession = '') {
+  const sessionId = typeof session?.session_id === 'string' ? session.session_id : ''
+  let headers = { originator: identity.originator }
   for (const name of CODEX_KERNEL_HEADER_ALLOWLIST) {
     const value = headerString(reqHeaders, name)
     if (value) headers[name] = value
   }
-  if (typeof session?.session_id === 'string' && session.session_id) {
-    headers['session-id'] = session.session_id
-  }
+  if (sessionId) headers['session-id'] = sessionId
+  const metadata = codexTurnMetadata(headers['x-codex-turn-metadata'], identity, { sessionId, callerSession })
+  if (metadata) headers['x-codex-turn-metadata'] = metadata
+  else delete headers['x-codex-turn-metadata']
+  headers = alignCodexSessionHeaders(headers, metadata, { sessionId, callerSession })
   const model = typeof body?.model === 'string' ? body.model.trim() : ''
   if (model) {
     const tier = typeof body?.service_tier === 'string' ? body.service_tier.trim().toLowerCase() : ''
@@ -642,6 +649,10 @@ export async function handleCodexProtocol({
   })
   // Chat→Responses conversion can surface a session key the raw inbound lacked.
   if (!logBag.session_id) logBag.session_id = sessionIdForLog(callerSession)
+  logBag.inbound_device_id = sessionIdForLog(inboundCodexInstallationId(req.headers, ctx.body || inbound))
+  // Official Codex already mints UUID v7 session/thread ids; keeping them keeps every
+  // session-scoped header, metadata field and prompt_cache_key on one value.
+  const officialSession = restriction.kind === 'official_codex' ? String(callerSession || '').trim() : ''
   const firstUserIdentity = firstUserIdentityFromCodex(converted.body)
   const hop = ops.streamCodexKernel || streamCodexKernel
   const writeCfg = ops.writeCodexKernelConfig || writeCodexKernelConfig
@@ -798,17 +809,22 @@ export async function handleCodexProtocol({
         // passthrough forwards an explicit inbound session verbatim; without
         // one it still derives the deterministic seed instead of sending null.
         const outboundSessionId =
-          sessionMode === 'passthrough'
+          officialSession ||
+          (sessionMode === 'passthrough'
             ? inboundSession.session_id ||
               resolveOutboundSessionId(callerSession, { ...sessionOptions, mode: 'passthrough', officialClient: true })
-            : resolveOutboundSessionId(callerSession, { ...sessionOptions, mode: sessionMode })
+            : resolveOutboundSessionId(callerSession, { ...sessionOptions, mode: sessionMode }))
         const session = {
           session_id: outboundSessionId,
           previous_response_id: inboundSession.previous_response_id,
         }
         logBag.outbound_session_id = sessionIdForLog(outboundSessionId)
-        const outboundBody = applyCodexRebuildBody({ ...converted.body, stream: true }, outboundSessionId, sessionMode)
-        const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
+        const identity = written?.identity || codexSlotIdentity(projectRoot, vm, routing)
+        const outboundBody = rewriteCodexEnvironment(
+          applyCodexRebuildBody({ ...converted.body, stream: true }, outboundSessionId, sessionMode),
+          identity,
+        )
+        const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session, identity, callerSession)
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
         let hopEmitted = false
@@ -829,7 +845,11 @@ export async function handleCodexProtocol({
                 headers: outboundHeaders,
                 stream: true,
                 session,
-                options: { ...codexKernelRequestOptions(routing, vm), installation_id: written?.installationId },
+                options: {
+                  ...codexKernelRequestOptions(routing, vm),
+                  user_agent: identity.userAgent,
+                  installation_id: identity.installationId,
+                },
               },
             },
             onReasoningFallback: ({ body: retryBody }) => {
@@ -1135,14 +1155,14 @@ function searchCredentials(projectRoot, vm) {
  * refresh token on its own, so first adopt a token it wrote meanwhile; otherwise refresh
  * once per slot, shared by concurrent callers.
  */
-function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh }) {
+function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh, userAgent }) {
   const now = searchCredentials(projectRoot, vm)
   if (now.access && now.access !== usedAccess) return now.access
   if (!now.refresh) return ''
   let pending = searchRefreshes.get(vm.id)
   if (!pending) {
     pending = (async () => {
-      const tok = await refresh({ refreshToken: now.refresh, proxyUrl, fetchImpl })
+      const tok = await refresh({ refreshToken: now.refresh, proxyUrl, fetchImpl, userAgent })
       if (!tok?.ok || !tok.access_token) return ''
       upsertCodexAccount(projectRoot, vm.id, {
         access_token: tok.access_token,
@@ -1174,6 +1194,7 @@ async function postCodexJson({
   body,
   turnMetadata,
   extraHeaders = {},
+  routing = null,
   fetchImpl,
   refresh = refreshCodexAccessToken,
 }) {
@@ -1181,18 +1202,20 @@ async function postCodexJson({
   if (!fetchImpl && !proxyUrl && !isLocalEgressProxy(vm.proxy)) return { status: 0, error: 'proxy_required' }
   const doFetch = fetchImpl || makeProxyFetch(proxyUrl, timeoutMs, { maxMs: timeoutMs })
   const creds = searchCredentials(projectRoot, vm)
+  const identity = codexSlotIdentity(projectRoot, vm, routing)
+  const metadata = codexTurnMetadata(turnMetadata, identity)
   const send = async (access) => {
     // Same identity as the slot's kernel; the backend wants originator, User-Agent and version to agree.
     const headers = {
       authorization: `Bearer ${access}`,
       'content-type': 'application/json',
       accept: 'application/json',
-      originator: CODEX_CATALOG_ORIGINATOR,
-      'user-agent': CODEX_USER_AGENT,
-      version: CODEX_APP_VERSION,
+      originator: identity.originator,
+      'user-agent': identity.userAgent,
+      version: identity.version,
     }
     if (creds.accountId) headers['chatgpt-account-id'] = creds.accountId
-    if (turnMetadata) headers['x-codex-turn-metadata'] = turnMetadata
+    if (metadata) headers['x-codex-turn-metadata'] = metadata
     Object.assign(headers, extraHeaders)
     try {
       const res = await doFetch(url, { method: 'POST', headers, body: JSON.stringify(body) })
@@ -1209,7 +1232,12 @@ async function postCodexJson({
   if (!creds.access && !creds.refresh) return { status: 0, error: 'no_oauth_token' }
   let out = creds.access ? await send(creds.access) : { status: 401 }
   if (out.status === 401 || out.status === 403) {
-    const access = await refreshSearchAccess(projectRoot, vm, creds.access, { proxyUrl, fetchImpl, refresh })
+    const access = await refreshSearchAccess(projectRoot, vm, creds.access, {
+      proxyUrl,
+      fetchImpl,
+      refresh,
+      userAgent: identity.userAgent,
+    })
     if (access) out = await send(access)
   }
   return out
@@ -1266,6 +1294,7 @@ export async function handleCodexSearch({
   const outbound = { ...body }
   for (const key of CODEX_SEARCH_DROP_FIELDS) delete outbound[key]
   const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
+  logBag.inbound_device_id = sessionIdForLog(inboundCodexInstallationId(req.headers, body))
   const redactionState = await ensureRedaction(routing, { projectRoot })
   const redaction = redactionState.enabled
     ? {
@@ -1309,6 +1338,7 @@ export async function handleCodexSearch({
           vm,
           body: outbound,
           turnMetadata,
+          routing,
           fetchImpl: ops.fetchImpl,
           refresh: ops.refresh,
         })
@@ -1425,6 +1455,7 @@ export async function handleCodexImages({
     )
   }
   const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
+  logBag.inbound_device_id = sessionIdForLog(inboundCodexInstallationId(req.headers, body))
   const imageTurnId = headerString(req.headers, 'x-codex-image-turn-id')
   const extraHeaders = imageTurnId ? { 'x-codex-image-turn-id': imageTurnId } : {}
   const redactionState = await ensureRedaction(routing, { projectRoot })
@@ -1475,6 +1506,7 @@ export async function handleCodexImages({
           body: outboundBody,
           turnMetadata,
           extraHeaders,
+          routing,
           fetchImpl: ops.fetchImpl,
           refresh: ops.refresh,
         })

@@ -139,6 +139,7 @@ export async function exchangeCodexAuthCode({
   vm,
   proxyPool,
   fetchImpl,
+  userAgent,
   exchange = exchangeCodexAuthorizationCode,
 } = {}) {
   sweepExpired()
@@ -166,6 +167,7 @@ export async function exchangeCodexAuthCode({
     codeVerifier: session.codeVerifier,
     proxyUrl: px,
     fetchImpl,
+    userAgent,
   })
   if (!tok.ok) {
     throw fail(tok.error || 'exchange_failed', 'Codex OAuth 换票失败，请重新生成授权链接')

@@ -40,9 +40,12 @@ export function splitBilling(
   })
   let claude = emptyTotals()
   let gpt = emptyTotals()
+  let antigravity = emptyTotals()
   for (const item of rows) {
     if (item.kind === 'codex') gpt = addItem(gpt, item.row)
+    else if (item.kind === 'antigravity')
+      antigravity = addItem(antigravity, item.row)
     else if (item.kind === 'claude') claude = addItem(claude, item.row)
   }
-  return { rows, claude, gpt }
+  return { rows, claude, gpt, antigravity }
 }

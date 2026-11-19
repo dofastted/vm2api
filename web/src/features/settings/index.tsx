@@ -17,7 +17,7 @@ import {
   personaPresetFromCompat,
 } from '@/lib/persona-template'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isClaudeVm } from '@/lib/vm-kind'
 import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { dashboardQueryOptions } from '@/features/overview/queries'
@@ -53,6 +53,7 @@ import { Socks5Pane } from '@/features/settings/socks5-pane'
 import { StickyPane } from '@/features/settings/sticky-pane'
 import { uploadIntervalOf } from '@/features/settings/telemetry-interval'
 import { TelemetryPane } from '@/features/settings/telemetry-pane'
+import { AntigravitySettings } from '@/features/vm/antigravity-panel'
 import { ProtocolPane } from './protocol-pane'
 import { RedactionPane } from './redaction-pane'
 
@@ -140,7 +141,7 @@ export function SettingsPage() {
         try {
           const dash = await api<Dashboard>('/api/panel/dashboard')
           const follow = await inheritProtocolOnSlots(
-            (dash.vms || []).filter((vm) => !isCodexVm(vm)),
+            (dash.vms || []).filter((vm) => isClaudeVm(vm)),
             patchVm
           )
           inherited = follow.changed
@@ -199,7 +200,11 @@ export function SettingsPage() {
     serverJson !== null &&
     Object.keys(draft).length > 0 &&
     JSON.stringify(draft) !== serverJson
-  const hideSave = tab === 'socks5' || tab === 'backup' || tab === 'about'
+  const hideSave =
+    tab === 'socks5' ||
+    tab === 'backup' ||
+    tab === 'about' ||
+    tab === 'antigravity'
   const showSaveBar = dirty && !hideSave
 
   const discard = () => {
@@ -391,6 +396,7 @@ export function SettingsPage() {
                   pending={dirty}
                 />
               ) : null}
+              {tab === 'antigravity' ? <AntigravitySettings /> : null}
               {tab === 'logs' ? (
                 <LogsPane
                   value={logging}

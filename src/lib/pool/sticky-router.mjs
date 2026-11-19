@@ -33,6 +33,7 @@ export function normalizeStickyPlatform(platform) {
     .toLowerCase()
   if (value === 'openai' || value === 'gpt' || value === 'codex') return 'openai'
   if (value === 'anthropic' || value === 'claude') return 'anthropic'
+  if (value === 'antigravity') return 'antigravity'
   return ''
 }
 

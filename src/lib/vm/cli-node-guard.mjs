@@ -12,7 +12,7 @@
  */
 import { execDetached } from '../cluster/docker-remote.mjs'
 import { NODE_CLAUDE_SETUP_PY, slotContainerName } from '../transport/rust-kernel-supervisor.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isClaudeVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotExecCmd } from './slot-exec.mjs'
 import { slotHost } from './slot-host.mjs'
@@ -28,7 +28,7 @@ export const NODE_SETUP_INTERVAL_MS = 60_000
 const HARD_DOWN = new Set(['stopped', 'dead', 'error', 'disabled'])
 
 export function isCliNodeGuardTarget(vm) {
-  if (!vm?.id || isCodexVm(vm)) return false
+  if (!vm?.id || !isClaudeVm(vm)) return false
   return !HARD_DOWN.has(String(vm.status || '').toLowerCase())
 }
 
@@ -102,7 +102,11 @@ export function createCliNodeGuard({
             user: isKvmRuntime(vm) ? '0' : undefined,
           })
           await exec(connect, container, Cmd, { user: User })
-          if (host.bakedKernel && !isKvmRuntime(vm) && Date.now() - (setupAt.get(vm.id) || 0) >= NODE_SETUP_INTERVAL_MS) {
+          if (
+            host.bakedKernel &&
+            !isKvmRuntime(vm) &&
+            Date.now() - (setupAt.get(vm.id) || 0) >= NODE_SETUP_INTERVAL_MS
+          ) {
             const setup = slotExecCmd(vm, ['python3', '-c', NODE_CLAUDE_SETUP_PY], {
               detach: true,
               user: host.execUser(vm),

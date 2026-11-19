@@ -22,7 +22,7 @@ import {
   templateBlockEnabled,
   type RawBlock,
 } from '@/lib/persona-template'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isClaudeVm } from '@/lib/vm-kind'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -87,7 +87,7 @@ export function SystemPreview({
   const zones = [
     ...new Set(
       (dash.data?.vms || [])
-        .filter((vm) => !isCodexVm(vm))
+        .filter((vm) => isClaudeVm(vm))
         .map((vm) => String(vm.timezone || '').trim() || 'UTC')
     ),
   ].sort()

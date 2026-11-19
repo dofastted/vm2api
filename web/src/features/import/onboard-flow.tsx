@@ -8,7 +8,12 @@ import { api } from '@/lib/api'
 import { credTypeOf } from '@/lib/cred-type'
 import { importErrorMessage } from '@/lib/import-errors'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import {
+  hasSlotCredential,
+  isAntigravityVm,
+  isClaudeVm,
+  isCodexVm,
+} from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { ChoiceTiles, Segmented } from '@/components/choice-tiles'
 import { PlatformChip } from '@/components/platform-chip'
@@ -117,7 +122,11 @@ function slotSpecRows(vm: Vm): SpecRow[] {
       label: '账号',
       value: vm.email || (
         <span className='text-muted-foreground'>
-          {vm.has_token ? '已导入' : '未导入'}
+          {hasSlotCredential(vm)
+            ? isAntigravityVm(vm)
+              ? '已登录官方客户端'
+              : '已导入'
+            : '未导入'}
         </span>
       ),
     },
@@ -337,7 +346,7 @@ export function OnboardFlow() {
   })
 
   const vms: Vm[] = dash.data?.vms || []
-  const empty = vms.filter((v) => !v.has_token)
+  const empty = vms.filter((v) => !hasSlotCredential(v))
   const pinned = pinnedId ? vms.find((v) => v.id === pinnedId) || null : null
   const current = pinned || vms.find((v) => v.id === vmId) || null
   const activeId = pinned ? pinnedId : current ? vmId : ''
@@ -349,7 +358,7 @@ export function OnboardFlow() {
       ? 1
       : !hasProxy
         ? 2
-        : current.has_token
+        : hasSlotCredential(current)
           ? 4
           : 3
   const step = backTo != null && backTo < natural ? backTo : natural
@@ -360,7 +369,11 @@ export function OnboardFlow() {
 
   // 选中的槽被别处导入了凭证 / 被删了，就从选中态退出来。
   // pinned 分支放行：换票成功的那一刻本槽正好会从 empty 里消失。
-  const stillEmpty = !!vmId && vms.some((v) => v.id === vmId && !v.has_token)
+  const stillEmpty =
+    !!vmId &&
+    vms.some(
+      (v) => v.id === vmId && (!hasSlotCredential(v) || isAntigravityVm(v))
+    )
   useEffect(() => {
     if (pinnedId) return
     if (vmId && !stillEmpty) setVmId('')
@@ -369,7 +382,7 @@ export function OnboardFlow() {
   const boot = useQuery(
     officialCcBootstrapQueryOptions(
       activeId,
-      !!activeId && !!current?.has_token
+      !!activeId && !!current?.has_token && isClaudeVm(current)
     )
   )
   const bootStatus = boot.data?.status || null
@@ -500,7 +513,10 @@ export function OnboardFlow() {
         ? '新建一台'
         : '从空槽里选',
     2: current ? (hasProxy ? '已绑出口' : '待绑定') : null,
-    3: pinned || current?.has_token ? current?.email || '已导入' : null,
+    3:
+      pinned || hasSlotCredential(current ?? undefined)
+        ? current?.email || '已导入'
+        : null,
     4: pinned
       ? isCodexVm(pinned) || credType !== 'oauth'
         ? running
@@ -515,6 +531,28 @@ export function OnboardFlow() {
     : source === 'new'
       ? draftSpecRows(draft)
       : null
+
+  if (current && isAntigravityVm(current)) {
+    return (
+      <div className='space-y-4'>
+        <div className='flex flex-wrap items-center gap-3'>
+          <PlatformChip vm={current} />
+          <span className='text-sm font-medium'>
+            {current.name || current.id}
+          </span>
+          <Button size='sm' variant='ghost' onClick={restart}>
+            换一台
+          </Button>
+          <Button size='sm' variant='outline' asChild>
+            <Link to='/vm/$id' params={{ id: current.id }}>
+              打开槽位详情与运维终端
+            </Link>
+          </Button>
+        </div>
+        <CredentialPanel vm={current} />
+      </div>
+    )
+  }
 
   return (
     <div className='grid items-start gap-x-10 gap-y-6 lg:grid-cols-[minmax(0,1fr)_17rem]'>
@@ -646,7 +684,7 @@ export function OnboardFlow() {
         <Step
           n={3}
           step={step}
-          done={!!pinned || !!current?.has_token}
+          done={!!pinned || hasSlotCredential(current ?? undefined)}
           title={current && isCodexVm(current) ? '导入 GPT 账号' : '账号'}
           lead={
             !current || !hasProxy

@@ -13,7 +13,8 @@ import crypto from 'node:crypto'
 import { WebSocketServer } from 'ws'
 import { execCapture, execDetached, inspectExec, openExecTty, resizeExec } from '../cluster/docker-remote.mjs'
 import { slotHost } from './slot-host.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isAntigravityVm, isClaudeVm, isCodexVm } from './vm-kind.mjs'
+import { antigravityRuntimeSupport } from '../transport/antigravity-bridge-supervisor.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotExecCmd, slotExecContainer } from './slot-exec.mjs'
 import { getVm } from './vm-registry.mjs'
@@ -262,6 +263,24 @@ export function panelShellLaunch(cliBin) {
     rc,
   }
 }
+
+/** Plain slot terminal; Antigravity authentication stays inside its official CLI. */
+export function panelAntigravityShellLaunch() {
+  return {
+    cmd: [
+      '/bin/sh',
+      '-c',
+      `rc=$(mktemp) && printf '%s\\n' "$${RC_ENV}" > "$rc" && export KIN_PANEL_RCFILE=$rc && if command -v bash >/dev/null 2>&1; then exec bash --rcfile "$rc" -i; fi; ENV=$rc exec sh -i`,
+    ],
+    rc: [
+      'if [ -n "${BASH_VERSION:-}" ]; then [ -f /etc/bash.bashrc ] && . /etc/bash.bashrc; [ -f ~/.bashrc ] && . ~/.bashrc; fi',
+      'export HOME="${HOME:-/home/kincli}"',
+      'export PATH="$HOME/.local/bin:$HOME/.antigravity/bin:$PATH"',
+      SYSTEM_FACTS_RC,
+      'rm -f "$KIN_PANEL_RCFILE"',
+    ].join('\n'),
+  }
+}
 // Closing the hijacked stream does not end a TTY exec: bash would linger in the
 // slot. Every process of the session inherits the marker, so HUP them by it.
 const REAP_SCRIPT = `for d in /proc/[0-9]*; do tr '\\0' '\\n' < "$d/environ" 2>/dev/null | grep -qx "${SESSION_ENV}=$1" || continue; cmd=$(tr '\\0' ' ' < "$d/cmdline" 2>/dev/null || true); case "$cmd" in *cli-node*|*"$2"*) kill -KILL "\${d#/proc/}" 2>/dev/null || true ;; *) kill -HUP "\${d#/proc/}" 2>/dev/null || true ;; esac; done; exit 0`
@@ -292,6 +311,11 @@ export function createSlotShell({
     const vm = getVm(projectRoot, vmId)
     if (!vm) return refuse(404, 'vm_not_found', 'vm not found')
     if (isCodexVm(vm)) return refuse(409, 'no_container', 'GPT 槽没有容器，无法打开终端')
+    if (isAntigravityVm(vm)) {
+      const support = antigravityRuntimeSupport(vm)
+      if (!support.ok) return refuse(support.status || 409, support.code, support.message)
+      if (login) return refuse(409, 'platform_login_not_supported', '请在普通终端中使用 Antigravity 官方客户端登录')
+    } else if (!isClaudeVm(vm)) return refuse(409, 'platform_not_supported', 'Unsupported slot platform')
     if (slotHost(vm).native) return refuse(409, 'native_node_unsupported', '此节点不支持 VM 终端')
     if (login && (!hasBoundExit(vm.proxy) || proxyBlockedReason(vm.proxy))) {
       return refuse(409, 'proxy_required', '请先为槽位绑定可用出口，再生成授权链接')
@@ -303,7 +327,12 @@ export function createSlotShell({
     if (tickets.size >= MAX_TICKETS) return refuse(429, 'shell_limit', '终端 ticket 过多，请稍后再试')
     const ticket = crypto.randomBytes(24).toString('base64url')
     tickets.set(ticket, { vmId: vm.id, exp: now + TICKET_TTL_MS, login })
-    return { ok: true, ticket, expires_in: TICKET_TTL_MS / 1000, cli_bin: terminalClaudeBin(vm) }
+    return {
+      ok: true,
+      ticket,
+      expires_in: TICKET_TTL_MS / 1000,
+      ...(isAntigravityVm(vm) ? {} : { cli_bin: terminalClaudeBin(vm) }),
+    }
   }
 
   /** Single use: the ticket is burned whether or not it matches. */
@@ -334,6 +363,10 @@ export function createSlotShell({
     const vm = getVm(projectRoot, vmId)
     if (!vm || isCodexVm(vm)) {
       rejectUpgrade(socket, 404, 'Not Found')
+      return true
+    }
+    if ((!isClaudeVm(vm) && !isAntigravityVm(vm)) || (entry.login && !isClaudeVm(vm))) {
+      rejectUpgrade(socket, 409, 'Conflict')
       return true
     }
     const requestedLogin = url.searchParams.get('login') === '1'
@@ -372,7 +405,8 @@ export function createSlotShell({
     let syncTimer
     let syncing = false
     let lastSyncError = ''
-    const sessionCli = terminalClaudeBin(vm)
+    const antigravity = isAntigravityVm(vm)
+    const sessionCli = antigravity ? '' : terminalClaudeBin(vm)
     const configDir = `/tmp/kin-auth-${token}`
     let released = false
     const release = () => {
@@ -463,7 +497,7 @@ export function createSlotShell({
         throw new Error('槽位未绑定可用出口')
       }
       if (size.login) await checkClaude(projectRoot, vm)
-      else {
+      else if (!antigravity) {
         try {
           await checkClaude(projectRoot, vm)
         } catch (err) {
@@ -476,12 +510,18 @@ export function createSlotShell({
         release()
         return
       }
-      const launch = size.login ? nativeLoginLaunch(sessionCli, configDir) : panelShellLaunch(sessionCli)
+      const launch = antigravity
+        ? panelAntigravityShellLaunch()
+        : size.login
+          ? nativeLoginLaunch(sessionCli, configDir)
+          : panelShellLaunch(sessionCli)
       const env = [
         'TERM=xterm-256color',
         'HOME=/home/kincli',
         `${SESSION_ENV}=${token}`,
-        ...(size.login ? launch.env : ['CLAUDE_CONFIG_DIR=/home/kincli/.claude', `${RC_ENV}=${launch.rc}`]),
+        ...(size.login
+          ? launch.env
+          : [...(antigravity ? [] : ['CLAUDE_CONFIG_DIR=/home/kincli/.claude']), `${RC_ENV}=${launch.rc}`]),
       ]
       const kvm = isKvmRuntime(vm)
       const { Cmd, User } = slotExecCmd(vm, launch.cmd, {
@@ -513,7 +553,7 @@ export function createSlotShell({
     }
     // ConsoleSize on exec start is API >= 1.42; resize covers older daemons.
     resize(size.cols, size.rows)
-    if (!size.login) {
+    if (!size.login && !antigravity) {
       syncTimer = setInterval(() => void sync(), CREDENTIAL_SYNC_INTERVAL_MS)
       syncTimer.unref()
     }

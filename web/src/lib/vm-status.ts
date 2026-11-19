@@ -1,7 +1,23 @@
 import type { Vm } from '@/types/panel-vm'
 import type { StatusTone } from '@/types/status'
 import { pct } from '@/lib/format'
-import { isCodexVm } from '@/lib/vm-kind'
+import {
+  hasSlotCredential,
+  isAntigravityVm,
+  isClaudeVm,
+  isCodexVm,
+} from '@/lib/vm-kind'
+
+function antigravityCredentialStatus(vm: Vm | undefined): StatusTone {
+  return hasSlotCredential(vm)
+    ? {
+        cls: 'ok',
+        key: 'ok',
+        text: '已登录官方客户端',
+        label: '已登录官方客户端',
+      }
+    : { cls: 'none', key: 'none', text: '未绑定账号', label: '未绑定账号' }
+}
 
 function credTextOf(vm: Vm): { text: string; key: string; tone: string } {
   const cred = vm.cred_status
@@ -184,6 +200,8 @@ function transportFailTone(): StatusTone {
 }
 
 export function credExpiry(vm: Vm): StatusTone & { ms: number | null } {
+  if (isAntigravityVm(vm))
+    return { ...antigravityCredentialStatus(vm), ms: null }
   if (!vm.has_token)
     return { cls: 'none', key: 'none', text: '无凭证', ms: null }
   const worker = vm.worker_credential || {}
@@ -321,6 +339,7 @@ export function vmCooldownTitle(vm: Vm): string {
 }
 
 export function accountStatus(vm: Vm | undefined): StatusTone {
+  if (isAntigravityVm(vm)) return antigravityCredentialStatus(vm)
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
   const unschedulable = unschedulableTone(vm)
   if (unschedulable) return { ...unschedulable, label: unschedulable.text }
@@ -447,6 +466,7 @@ export function accountStatus(vm: Vm | undefined): StatusTone {
  * `accountStatus` 的 revoke 分支截走了，不会走到这里。
  */
 export function credentialStatus(vm: Vm | undefined): StatusTone {
+  if (isAntigravityVm(vm)) return antigravityCredentialStatus(vm)
   const base = accountStatus(vm)
   // 休息时段同理是调度意图（排班），不是凭证状态。
   if (base.key !== 'off' && base.key !== 'rest') return base
@@ -592,6 +612,17 @@ function seatsFullTone(vm: Vm | undefined): StatusTone | null {
  * 受限、不可调度与调度关互斥（后端先判调度关）。
  */
 export function poolStatus(vm: Vm | undefined): StatusTone {
+  if (isAntigravityVm(vm)) {
+    if (!hasSlotCredential(vm))
+      return { key: 'none', text: '未绑定账号', cls: 'none' }
+    if (vm?.schedulable === false || vm?.schedule_state === 'off')
+      return { key: 'off', text: 'API 调度关', cls: 'off' }
+    if (vm?.schedule_state === 'restricted')
+      return { key: 'cool', text: 'API 调度受限', cls: 'caution' }
+    if (['stopped', 'dead', 'disabled'].includes(String(vm?.status)))
+      return { key: 'cool', text: '槽位未运行', cls: 'caution' }
+    return { key: 'ok', text: 'API 调度开', cls: 'ok' }
+  }
   // 吊销 / 废票先判：它可能同时带着 off / quota 的 availability.key，照 key
   // 判会显示成「调度关」，把真正的死因盖掉。
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
@@ -682,6 +713,7 @@ export function poolStatus(vm: Vm | undefined): StatusTone {
  * 完整判定链（revoke 先于一切）。号池额度卡与本口径共用同一谓词。
  */
 export function accountUsable(vm: Vm | undefined): boolean {
+  if (isAntigravityVm(vm)) return hasSlotCredential(vm)
   return Boolean(vm?.has_token) && credentialStatus(vm).cls !== 'bad'
 }
 
@@ -689,7 +721,7 @@ export function vmRunning(vm: Vm | undefined): boolean {
   if (!vm) return false
   const s = String(vm.status || '').toLowerCase()
   if (s === 'stopped' || s === 'dead' || s === 'disabled') return false
-  if (!vm.has_token) return false
+  if (!hasSlotCredential(vm)) return false
   return Boolean(vm.active || s === 'running' || s === 'ok' || !s)
 }
 
@@ -734,6 +766,8 @@ export function openaiPlanLabel(planType: unknown): string {
 }
 
 export function claudeTier(vm: Vm | undefined): StatusTone {
+  if (!isClaudeVm(vm) && !isCodexVm(vm))
+    return { key: 'none', label: '—', cls: 'none', text: '—' }
   if (isCodexVm(vm)) {
     if (!vm?.has_token)
       return { key: 'none', label: '—', cls: 'none', text: '—' }

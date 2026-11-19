@@ -81,6 +81,7 @@ afterEach(() => {
 
 test('generations posts the JSON body to the Codex Images endpoint as the slot', async () => {
   writeGptVm('vm-a')
+  const callerInstall = '11111111-1111-4111-8111-111111111111'
   const calls = []
   const fetchImpl = async (url, init) => {
     calls.push({ url, init })
@@ -89,7 +90,7 @@ test('generations posts the JSON body to the Codex Images endpoint as the slot',
   const { res, logBag, stats } = await images({
     headers: {
       authorization: 'Bearer sk-client',
-      'x-codex-turn-metadata': '{"turn_id":"t-1"}',
+      'x-codex-turn-metadata': JSON.stringify({ installation_id: callerInstall, turn_id: 't-1' }),
       'x-codex-image-turn-id': 'img-1',
       'x-codex-turn-state': 'state-from-another-account',
     },
@@ -101,7 +102,9 @@ test('generations posts the JSON body to the Codex Images endpoint as the slot',
   assert.equal(sent.authorization, 'Bearer at')
   assert.equal(sent['chatgpt-account-id'], 'vm-a')
   assert.equal(sent.originator, 'codex_cli_rs')
-  assert.equal(sent['x-codex-turn-metadata'], '{"turn_id":"t-1"}')
+  const slotInstall = fs.readFileSync(path.join(root, 'vms', 'vm-a', 'run', 'codex-installation-id'), 'utf8').trim()
+  assert.deepEqual(JSON.parse(sent['x-codex-turn-metadata']), { installation_id: slotInstall, turn_id: 't-1' })
+  assert.equal(logBag.inbound_device_id, callerInstall)
   assert.equal(sent['x-codex-image-turn-id'], 'img-1')
   assert.equal(sent['x-codex-turn-state'], undefined)
   assert.deepEqual(JSON.parse(calls[0].init.body), { model: 'gpt-image-2.5-flare', prompt: 'a cat', size: '1024x1024' })

@@ -1,3 +1,4 @@
+import { isClaudeVm } from '../vm/vm-kind.mjs'
 /**
  * Periodic OAuth refresh for every slot that still has a refresh token,
  * including operator 调度关. Inference no longer reaches those workers, so
@@ -6,7 +7,6 @@
  */
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
-import { isCodexVm } from '../vm/vm-kind.mjs'
 import {
   PROACTIVE_REFRESH_SKEW_MS,
   hasCredentialPresence,
@@ -59,7 +59,7 @@ export function vmHasProxyPath(vm) {
 }
 
 export function isCredentialRefreshTarget(vm) {
-  if (!vm?.id) return false
+  if (!vm?.id || !isClaudeVm(vm)) return false
   if (!hasRefreshPresence(vm.claude) && !vm.has_refresh) return false
   const status = String(vm.status || '').toLowerCase()
   if (HARD_DOWN.has(status)) return false
@@ -94,7 +94,7 @@ export function needsScheduledRefresh(vm, now = Date.now(), skewMs = PROACTIVE_R
  */
 export function isLocalCredentialLinkTarget(vm) {
   if (!vm?.id || vm.node_id) return false
-  if (isCodexVm(vm)) return false
+  if (!isClaudeVm(vm)) return false
   if (HARD_DOWN.has(String(vm.status || '').toLowerCase())) return false
   return hasCredentialPresence(vm.claude) || hasCredentialPresence(vm)
 }
@@ -165,7 +165,7 @@ export function createCredentialRefreshMonitor(opts = {}) {
           (vm) =>
             vm.node_id &&
             vm.status === 'running' &&
-            !isCodexVm(vm) &&
+            isClaudeVm(vm) &&
             (hasCredentialPresence(vm.claude) || hasCredentialPresence(vm)),
         )
         await mapPool(running, config.concurrency, async (vm) => {

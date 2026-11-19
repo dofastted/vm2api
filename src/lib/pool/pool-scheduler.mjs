@@ -37,7 +37,7 @@ import { unitCircuit } from './unit-circuit.mjs'
 import { isSlotProxyDesynced, readWorkerProxyEndpoint, readWorkerEgressMode } from '../vm/vm-runtime.mjs'
 import { splitBlocksModel } from './weekly-split.mjs'
 import { slotAllowsModel } from './slot-model-gate.mjs'
-import { isCodexVm } from '../vm/vm-kind.mjs'
+import { isClaudeVm, normalizeVmKind } from '../vm/vm-kind.mjs'
 import { detectInboundPlatform } from '../protocol/platform-detect.mjs'
 import { resolveCredentialScheduleLevel, setResetPriorityEnabled } from './credential-weight.mjs'
 import { PLATFORM_SCOPE, normalizeOwnerId, vmMatchesOwnerScope, vmOwnerId } from '../admin/resource-owner.mjs'
@@ -487,10 +487,7 @@ function directWorkerAnswered(value) {
 function platformMismatch(model, vm) {
   const detected = detectInboundPlatform(model)
   if (!detected.ok) return false
-  const codex = isCodexVm(vm)
-  if (detected.platform === 'openai') return !codex
-  if (detected.platform === 'anthropic') return codex
-  return false
+  return detected.platform !== normalizeVmKind(vm).platform
 }
 
 function runtimeHealthStatus(value) {
@@ -1509,6 +1506,10 @@ export class PoolScheduler extends EventEmitter {
       rest_until: /** @type {number|null} */ (null),
       offline: new Map(),
     })
+    // Antigravity sessions belong to their dedicated bridge, including pinned calls.
+    const detected = detectInboundPlatform(model, { groupType: keyScope?.group_type })
+    if ((model && !detected.ok) || detected.platform === 'antigravity' || keyScope?.group_type === 'antigravity')
+      return candidates
     const pin = pinVmId ? String(pinVmId).trim() : ''
     const entries = []
     for (const summary of summaries) {
@@ -2038,7 +2039,7 @@ export class PoolScheduler extends EventEmitter {
     }
     const vms = listVms(this.projectRoot)
       .map((summary) => getVm(this.projectRoot, summary.id))
-      .filter((vm) => vm && vm.schedulable !== false && vm.status === 'running' && !isCodexVm(vm))
+      .filter((vm) => vm && vm.schedulable !== false && vm.status === 'running' && isClaudeVm(vm))
     const snapshots = await this.runtimeRepo.schedulingSnapshot(vms.map((vm) => accountIdOf(vm, this.projectRoot)))
     for (const vm of vms) {
       if (this.maintenanceStopped) return

@@ -10,7 +10,7 @@ import {
 import { extraUsageText } from '@/lib/fable-status'
 import { fmtExpiresAt, fmtNum, pct } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { claudeTier, credExpiry } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -22,6 +22,7 @@ import {
 } from '@/components/ui/tooltip'
 import { StatusMark } from '@/components/status-mark'
 import { AllowedModelsCard } from '@/features/vm/allowed-models-card'
+import { AntigravityCredentialPanel } from '@/features/vm/antigravity-credential-panel'
 import { AuthSchemeEditor } from '@/features/vm/auth-scheme-editor'
 import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
 import { ConvertOauthToSetupButton } from '@/features/vm/convert-oauth-button'
@@ -93,6 +94,24 @@ export function VmAccountTab(props: VmAccountTabProps) {
     acc.last_probe as ProbeCheck | undefined,
     vm.last_probe
   )
+
+  if (isAntigravityVm(vm))
+    return (
+      <TabsContent value='account' className='space-y-3 pt-3'>
+        <Card>
+          <CardHeader className='pb-2'>
+            <CardTitle className='text-sm'>Antigravity 账号授权</CardTitle>
+          </CardHeader>
+          <CardContent className='pt-0'>
+            <AntigravityCredentialPanel
+              vm={vm}
+              onCommitted={onCredentialCommitted}
+            />
+          </CardContent>
+        </Card>
+        <AllowedModelsCard vm={vm} />
+      </TabsContent>
+    )
 
   return (
     <TabsContent value='account' className='space-y-3 pt-3'>

@@ -541,7 +541,7 @@ function splitList(value: string): string[] {
     .filter(Boolean)
 }
 
-function formatK(value: number): string {
+export function formatK(value: number): string {
   if (value >= 1_000_000) return `${Math.floor(value / 1_000_000)}M`
   if (value >= 1000) return `${Math.floor(value / 1000)}K`
   return String(value)

@@ -7,10 +7,11 @@ import {
 } from '@/lib/fable-status'
 import { fmtNum, fmtUsd } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { vmCostLedger } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
 import { ActiveUsageAction } from '@/features/vm/active-usage-action'
+import { AntigravityQuotaWindows } from '@/features/vm/antigravity-quota'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { OpenaiQuotaActions } from '@/features/vm/openai-quota-actions'
 import { riskFg, UsageMeter } from '@/features/vm/usage-meter'
@@ -94,6 +95,7 @@ function WindowRow({
 
 /** GPT 槽：查询 / 重置券；Claude 完整 OAuth：原生限额查询 / 重置。 */
 export function VmQuotaActions({ vm, now }: { vm: Vm; now: number }) {
+  if (isAntigravityVm(vm)) return null
   return isCodexVm(vm) ? (
     <OpenaiQuotaActions vm={vm} compact />
   ) : (
@@ -122,6 +124,16 @@ export function VmUsageWindows({
   quotaActions?: boolean
   className?: string
 }) {
+  if (isAntigravityVm(vm))
+    return (
+      <AntigravityQuotaWindows
+        vm={vm}
+        now={now}
+        quiet={quiet}
+        actions={quotaActions}
+        className={className}
+      />
+    )
   const hasToken = Boolean(vm.has_token)
   return (
     <div className={cn('grid min-w-0 gap-1', className)}>

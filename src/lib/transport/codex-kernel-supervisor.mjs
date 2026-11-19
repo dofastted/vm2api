@@ -13,6 +13,7 @@ import { maxRequestBytes } from '../core/config.mjs'
 import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { codexKernelHealth, codexKernelPaths } from './codex-kernel-client.mjs'
 import { computedUpstreamTransport, normalizeCodexRouting } from '../protocol/codex-route.mjs'
+import { codexSlotIdentity } from '../protocol/codex-identity.mjs'
 
 const starts = new Map()
 const stops = new Map()
@@ -90,21 +91,10 @@ export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxy
   const proxy = hostLocal ? localEgressProxyUrl() : String(proxyUrl || boundProxyUrl(vm?.proxy) || '').trim()
   // A configured deployment proxy is this slot's exit: fail closed instead of going direct.
   const required = hostLocal ? !!proxy : proxyRequired == null ? !!proxy : !!proxyRequired
-  const installationPath = path.join(runDir, 'codex-installation-id')
-  let deviceId = ''
-  try {
-    deviceId = fs.readFileSync(installationPath, 'utf8').trim()
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error
-  }
-  // Official installation identity is a random UUID, never a VM or hardware fingerprint.
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deviceId)) {
-    deviceId = crypto.randomUUID()
-    fs.writeFileSync(installationPath, `${deviceId}\n`, { mode: 0o600 })
-  }
+  const identity = codexSlotIdentity(projectRoot, vm, routing)
   const config = {
     vm_id: vm.id,
-    device_id: deviceId,
+    device_id: identity.installationId,
     socket_path: socketPath,
     credential_path: credentialPath,
     proxy_url: proxy,
@@ -112,10 +102,19 @@ export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxy
     internal_token: secret,
     max_request_bytes: maxRequestBytes(routing),
     ...codexKernelRequestOptions(routing, vm),
+    user_agent: identity.userAgent,
     test_endpoints: process.env.KIN_CODEX_TEST_ENDPOINTS === '1',
   }
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 })
-  return { runDir, socketPath, configPath, credentialPath, tokenPath, installationId: deviceId }
+  return {
+    runDir,
+    socketPath,
+    configPath,
+    credentialPath,
+    tokenPath,
+    installationId: identity.installationId,
+    identity,
+  }
 }
 
 export function shouldRecycleCodexKernel({ wanted, stamped, inFlight } = {}) {

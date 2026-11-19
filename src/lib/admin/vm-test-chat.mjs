@@ -1,7 +1,7 @@
 /**
  * Per-VM connectivity probe.
  *
- * Claude slots loopback POST /v1/messages.
+ * Claude and Antigravity slots loopback POST /v1/messages.
  * Codex/GPT slots loopback POST /v1/responses.
  * Pin with master-only x-kin-vm. Does not call the Go worker directly.
  *
@@ -15,7 +15,9 @@ import { Readable } from 'node:stream'
 import path from 'node:path'
 import { readRoutingConfigFile } from '../core/config.mjs'
 import { getVm, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
-import { isCodexVm } from '../vm/vm-kind.mjs'
+import { isAntigravityVm, isCodexVm } from '../vm/vm-kind.mjs'
+import { summarizeAntigravitySlot } from '../vm/antigravity-slot.mjs'
+import { antigravityModelId, normalizeAntigravityRouting } from '../protocol/antigravity-route.mjs'
 import { summarizeCodexSlot, readCodexAccounts, writeCodexAccounts } from '../vm/codex-slot.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
@@ -38,8 +40,8 @@ import {
   fetchChatgptModelCatalog,
   refreshCodexAccessToken,
   resolveCodexCatalogVersion,
-  CODEX_USER_AGENT,
 } from '../protocol/codex-models.mjs'
+import { codexSessionUuid, codexSlotIdentity } from '../protocol/codex-identity.mjs'
 import { isGptSeriesId } from '../protocol/gpt-ids.mjs'
 import {
   resolveInferenceEngine,
@@ -213,6 +215,7 @@ export async function syncCodexCatalog({
       let access = account.access_token || target.codex?.access_token
       const accountId = account.chatgpt_account_id || target.codex?.chatgpt_account_id
       const refreshToken = account.refresh_token || target.codex?.refresh_token
+      const identity = codexSlotIdentity(projectRoot, target)
       const fetchOnce = () =>
         fetchChatgptModelCatalog({
           accessToken: access,
@@ -221,10 +224,11 @@ export async function syncCodexCatalog({
           fetchImpl,
           direct,
           catalogVersion: catalogVersion.version,
+          identity,
         })
       let live = await fetchOnce()
       if (live.error === 'upstream_auth' && rotate && refreshToken) {
-        const tok = await refreshCodexAccessToken({ refreshToken, proxyUrl, fetchImpl })
+        const tok = await refreshCodexAccessToken({ refreshToken, proxyUrl, fetchImpl, userAgent: identity.userAgent })
         if (!tok.ok) {
           lastError = {
             ok: false,
@@ -866,6 +870,105 @@ async function postV1Responses(opts) {
   return postV1Loopback({ ...opts, path: '/v1/responses' })
 }
 
+async function runAntigravityTestChat({ opts, vm, routing, baseUrl, apiKey, log, push, started }) {
+  const vmId = vm.id
+  const fail = (code, message, extra = {}) => {
+    push('error', message)
+    return { ok: false, vm_id: vmId, error: { code, message }, log, duration_ms: Date.now() - started, ...extra }
+  }
+  const config = normalizeAntigravityRouting(routing.antigravity)
+  push('info', `推理 antigravity / 槽内官方客户端 bridge · API 接入${config.enabled ? '已启用' : '未启用'}`)
+  if (!config.enabled) return fail('antigravity_disabled', '模型页 Antigravity 分区未启用 API 接入')
+  if (summarizeAntigravitySlot(opts.projectRoot, vm).authenticated !== true)
+    return fail('no_credential', '凭证 未登录 Antigravity 账号，请先在账号页完成 OAuth')
+  push('info', '凭证 Antigravity OAuth · 官方客户端保存')
+  if (!vm.proxy?.url && !vm.proxy?.host)
+    return fail('proxy_required', '未绑定 SOCKS5，拒绝测试。Antigravity 槽位需绑定独立出口代理。')
+  push('info', `代理 ${vm.proxy?.host || 'bound'}`)
+
+  const enabled = config.models.filter((entry) => entry.enabled)
+  const model = antigravityModelId(String(opts.model || '').trim()) || enabled[0]?.id || ''
+  push('info', `模型 ${model || '—'}`)
+  const entry = enabled.find((item) => item.id === model)
+  if (!entry)
+    return fail('model_not_allowed', `模型不可用: ${model || '未配置'}，请在模型页 Antigravity 分区同步并启用`, {
+      model,
+    })
+
+  const prompt = String(opts.prompt || DEFAULT_PROMPT).trim() || DEFAULT_PROMPT
+  const rawEffort = String(opts.reasoning_effort ?? opts.effort ?? '')
+    .trim()
+    .toLowerCase()
+  const effort = entry.levels.includes(rawEffort) ? rawEffort : ''
+  let maxTokens = Number(opts.max_tokens)
+  if (!Number.isFinite(maxTokens) || maxTokens <= 0) maxTokens = 8192
+  maxTokens = Math.min(Math.max(1, Math.floor(maxTokens)), 128000)
+  push('info', `prompt=${JSON.stringify(prompt).slice(0, 120)} max_tokens=${maxTokens} effort=${effort || '默认'}`)
+
+  const inbound = {
+    model,
+    max_tokens: maxTokens,
+    stream: true,
+    messages: [{ role: 'user', content: prompt }],
+    ...(effort ? { output_config: { effort } } : {}),
+  }
+  const headers = {
+    'user-agent': String(opts.userAgent || 'kin-console-test/1.0'),
+    'anthropic-version': '2023-06-01',
+    accept: 'text/event-stream',
+  }
+  push('info', `入站 ua=${headers['user-agent']} protocol=anthropic.messages`)
+  push('info', `loopback POST /v1/messages pin=x-kin-vm:${vmId}（站点用户路径，走 Antigravity 槽位 bridge）`)
+  const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 120000, 10000), 180000)
+  const result = await postV1Messages({
+    baseUrl,
+    apiKey,
+    inbound,
+    headers,
+    vmId,
+    timeoutMs,
+    extraHeaders: opts.extraHeaders || {},
+  })
+  const duration = Date.now() - started
+  const text = result?.text || extractText(result?.body)
+  const usage = result?.usage || result?.body?.usage || null
+  const errObj = result?.ok ? null : extractError(result, { wrapHop: false })
+  if (result?.ok) {
+    push(
+      'ok',
+      `成功 status=${result.status} stop=${result.stop_reason || result.body?.stop_reason || '—'} ${duration}ms`,
+    )
+    if (text) push('content', text.slice(0, 2000))
+    if (usage) push('info', `usage in=${usage.input_tokens ?? '—'} out=${usage.output_tokens ?? '—'}`)
+  } else {
+    push('error', `失败 status=${result?.status || 0}: ${errObj.message}`)
+    if (errObj.request_id) push('info', `request_id=${errObj.request_id}`)
+  }
+  return {
+    ok: !!result?.ok,
+    vm_id: vmId,
+    vm_name: vm.name || null,
+    account_uuid: null,
+    model,
+    prompt,
+    max_tokens: maxTokens,
+    status: result?.status || 0,
+    stop_reason: result?.stop_reason || result?.body?.stop_reason || null,
+    usage,
+    text: text ? text.slice(0, 4000) : null,
+    body: result?.ok ? result.body : null,
+    error: errObj,
+    log,
+    duration_ms: duration,
+    via: 'v1-loopback',
+    credential_mode: 'antigravity',
+    inference_engine: 'antigravity',
+    dataplane: null,
+    official_cc_inference: null,
+    debug: { path: '/v1/messages', pin_vm: vmId, inbound_ua: headers['user-agent'], reasoning_effort: effort || null },
+  }
+}
+
 /**
  * @param {{ projectRoot: string, vmId: string, model?: string, prompt?: string, max_tokens?: number, timeoutMs?: number, baseUrl?: string, apiKey?: string, accountQuota?: object }} opts
  */
@@ -902,6 +1005,8 @@ export async function runVmTestChat(opts = {}) {
   push('info', `开始测试凭证槽 ${vm.name || vmId}`)
   push('info', `状态 running=${vm.status === 'running'} schedulable=${vm.schedulable !== false}`)
   const routing = loadRouting(projectRoot)
+  if (isAntigravityVm(vm))
+    return await runAntigravityTestChat({ opts, vm, routing, baseUrl, apiKey, log, push, started })
   const codex = isCodexVm(vm)
   const inferenceEngine = codex ? null : resolveInferenceEngine(vm, routing)
   const cliHop = !codex && resolveOfficialCcInference(vm, routing) === 'cli-hop'
@@ -1090,11 +1195,12 @@ export async function runVmTestChat(opts = {}) {
       store: false,
     }
     if (effort) inbound.reasoning = { effort }
+    const identity = codexSlotIdentity(projectRoot, vm)
     if (serviceTier) inbound.service_tier = serviceTier
     headers = {
-      'user-agent': CODEX_USER_AGENT,
-      'x-codex-installation-id': String(vm.device_id || vm.id),
-      'session-id': `kin-test-${vmId}`,
+      'user-agent': identity.userAgent,
+      'x-codex-installation-id': identity.installationId,
+      'session-id': codexSessionUuid(),
       accept: 'text/event-stream',
     }
     identitySource = 'codex'
@@ -1161,6 +1267,7 @@ export async function runVmTestChat(opts = {}) {
           refreshToken,
           proxyUrl: hostProxyUrlForVm(vm),
           fetchImpl: opts.fetchImpl,
+          userAgent: codexSlotIdentity(projectRoot, vm).userAgent,
         })
         if (tok.ok) {
           persistRefreshedCodexAccount(projectRoot, vmId, {

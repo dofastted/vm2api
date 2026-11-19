@@ -54,7 +54,14 @@ export function readPackageFacts(text: string): PackageRead | null {
   let credentialText = '无凭证'
   if (credential) {
     const platform = textOf(credential.platform).toLowerCase()
-    credentialText = platform === 'openai' ? 'Codex 凭证' : 'Claude 凭证'
+    credentialText =
+      platform === 'openai'
+        ? 'Codex 凭证'
+        : platform === 'antigravity'
+          ? 'Antigravity 官方客户端凭证'
+          : platform === 'anthropic' || !platform
+            ? 'Claude 凭证'
+            : '未知平台凭证'
   }
   const platform = textOf(vm.platform || vm.family) || '—'
   return {

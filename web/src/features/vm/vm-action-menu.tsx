@@ -17,6 +17,7 @@ import {
 } from 'lucide-react'
 import { canRefreshCredential, credTypeOf } from '@/lib/cred-type'
 import { cn } from '@/lib/utils'
+import { isAntigravityVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -35,6 +36,8 @@ import { useVmPerms } from '@/features/vm/vm-perms'
 
 /** 无法刷新时给出原因，与详情页 refreshBlocked 文案一致。 */
 export function refreshBlockedReason(vm: Vm): string {
+  if (isAntigravityVm(vm))
+    return '凭证由官方 Antigravity 客户端管理，请通过 OAuth 重新授权'
   if (canRefreshCredential(vm)) return ''
   return credTypeOf(vm) === 'apikey'
     ? 'Console API Key 不能刷新'

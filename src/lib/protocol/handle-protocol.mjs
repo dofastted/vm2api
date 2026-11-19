@@ -41,6 +41,7 @@ import { sanitizeInboundBody, defaultSeedPolicy, callerAutoCompactWindow } from 
 import { fingerprintRequest } from './client-fingerprint.mjs'
 import { validateOfficialModel } from './models.mjs'
 import { handleCodexImages, handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
+import { handleAntigravityProtocol } from './handle-antigravity.mjs'
 import { isMultipartFormData, normalizeImageEditBody } from './image-edit-multipart.mjs'
 import { readRawBody } from '../http/respond.mjs'
 import { disjointOpenaiUsage } from './openai-usage.mjs'
@@ -194,6 +195,7 @@ import {
   thinkingOwners as defaultThinkingOwners,
 } from '../pool/thinking-owner.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
+import { isAntigravityVm } from '../vm/vm-kind.mjs'
 import { credentialModeFromOauth, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import {
   prepareAnthropicRequest,
@@ -255,8 +257,8 @@ export function createHandleProtocol(deps) {
     return disjointOpenaiUsage(next)
   }
 
-  function attachPricing(logBag, { managedKey = null, rateMultiplier = 1, bill = false } = {}) {
-    const model = logBag.upstream_model || logBag.model
+  function attachPricing(logBag, { managedKey = null, rateMultiplier = 1, bill = false, pricingModel = null } = {}) {
+    const model = pricingModel || logBag.upstream_model || logBag.model
     const priced = costColumnsFromUsage(logBag.usage || {}, model)
     Object.assign(logBag, priced)
     if (!bill || !managedKey) return
@@ -438,6 +440,7 @@ export function createHandleProtocol(deps) {
     requestId,
     res,
     account = null,
+    platform = null,
     scopeMatched = false,
     bodyCtx = null,
     interceptSessionKey = null,
@@ -468,6 +471,7 @@ export function createHandleProtocol(deps) {
       sessions: riskState.sessions,
       requestId,
       account,
+      platform,
       scopeMatched,
       bodyCtx,
       interceptSession,
@@ -750,6 +754,11 @@ export function createHandleProtocol(deps) {
     const routingNow = getRouting()
     const pinVmId = pinnedVmIdFromRequest(req, apiKeyStore?.users)
     const panelDiagnostics = req.apiKeyKind === 'master' && !!pinVmId
+    // A panel test pinned to an Antigravity slot reaches that slot even for same-name Claude/GPT IDs.
+    const groupType =
+      panelDiagnostics && cfg.paths?.project && isAntigravityVm(getVm(cfg.paths.project, pinVmId))
+        ? 'antigravity'
+        : keyScopeFromRequest(req).group_type
     if (
       claudeCodeOnlyFromRouting(routingNow) &&
       !panelDiagnostics &&
@@ -784,7 +793,7 @@ export function createHandleProtocol(deps) {
     if (
       claudeCodeOnlyFromRouting(routingNow) &&
       !panelDiagnostics &&
-      detectInboundPlatform(inbound?.model).platform === 'anthropic' &&
+      detectInboundPlatform(inbound?.model, { groupType }).platform === 'anthropic' &&
       (protocol !== 'anthropic.messages' ||
         isHealthShape(req.headers, inbound, getHealthMonitor()?.getConfig?.() || DEFAULT_HEALTH_PROBE, protocol) ||
         !isClaudeCodeFamilyRequest(req.headers, inbound, { routing: routingNow }))
@@ -797,7 +806,10 @@ export function createHandleProtocol(deps) {
       res.statusCode = errorResult.status
       return json(res, errorResult.status, errorResult.body)
     }
-    const healthDecision = getHealthMonitor()?.decide?.(req.headers, inbound, protocol)
+    const healthDecision =
+      detectInboundPlatform(inbound?.model, { groupType }).platform === 'antigravity'
+        ? null
+        : getHealthMonitor()?.decide?.(req.headers, inbound, protocol)
     if (healthDecision?.action === 'fail') {
       stats.requests++
       stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
@@ -925,7 +937,7 @@ export function createHandleProtocol(deps) {
       ? { ok: true, platform: apiPicked.endpoint.protocol === 'openai' ? 'openai' : 'anthropic' }
       : imageModel
         ? { ok: true, platform: 'openai' }
-        : detectInboundPlatform(ctx.body?.model)
+        : detectInboundPlatform(ctx.body?.model, { groupType })
     const apiOpenAI = inferenceBackend === 'api' && platform.platform === 'openai'
     const apiInputError = apiOpenAI ? validateApiOpenAIRequest(protocol, apiInbound) : null
     if (apiInputError) {
@@ -978,6 +990,51 @@ export function createHandleProtocol(deps) {
       logBag.error_code = ErrorCode.KEY_GROUP_MISMATCH
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, 403, errorResult.body)
+    }
+    if (platform.platform === 'antigravity') {
+      if (
+        await applyProtocolIntercept({
+          ...gateArgs,
+          body: ctx.body,
+          platform: 'antigravity',
+          skipMandatory: true,
+        })
+      )
+        return
+      return handleAntigravityProtocol({
+        req,
+        res,
+        protocol,
+        ctx,
+        inbound,
+        logBag,
+        stats,
+        json,
+        writeSSEHeaders,
+        routing: getRouting() || {},
+        projectRoot: cfg.paths.project,
+        stickyRouter,
+        apiKeyStore,
+        requestStartedAt: logCtx.t0,
+        accountGate: (vm) =>
+          applyProtocolIntercept({
+            ...gateArgs,
+            body: ctx.body,
+            account: scopeAccountFromVm(vm),
+            platform: 'antigravity',
+            skipMandatory: true,
+          }),
+        recordUsage: () =>
+          attachPricing(logBag, {
+            managedKey: req.apiKeyRecord,
+            rateMultiplier: deps.groupsRepo.rateMultiplier(req.apiKeyRecord?.group_id ?? 1),
+            bill: !!req.apiKeyRecord,
+            // A vendor name must not inherit that vendor's direct API price; the namespaced
+            // id resolves to no catalog price.
+            pricingModel: `antigravity/${ctx.body.model}`,
+          }),
+        ops: deps.antigravityOps || {},
+      })
     }
     if (imageModel) return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag })
     // Codex returns before conversion. Distill does not apply to OpenAI platform models; the rest

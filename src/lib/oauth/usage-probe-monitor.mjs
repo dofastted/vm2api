@@ -1,3 +1,4 @@
+import { isClaudeVm } from '../vm/vm-kind.mjs'
 /**
  * Periodic Extra reconcile for live credential slots.
  *
@@ -58,7 +59,7 @@ export function normalizeUsageProbeConfig(raw = {}) {
 }
 
 export function isUsageProbeTarget(vm) {
-  if (!vm?.id) return false
+  if (!vm?.id || !isClaudeVm(vm)) return false
   if (!hasRefreshPresence(vm.claude) && !vm.has_refresh && !vm.has_token) return false
   const grantErr = String(vm.claude?.refresh_error || vm.refresh_error || '')
   if (/invalid_grant|refresh token not found/i.test(grantErr)) return false

@@ -1,6 +1,6 @@
 import type { Vm } from '@/types/panel-vm'
 
-export type VmKind = 'claude' | 'codex'
+export type VmKind = 'claude' | 'codex' | 'antigravity' | 'unknown'
 
 function labelOf(vm: Vm | undefined, key: 'platform' | 'family' | 'kind') {
   return String(vm?.[key] || '')
@@ -13,16 +13,12 @@ export function vmKindOf(vm: Vm | undefined): VmKind {
   const platform = labelOf(vm, 'platform')
   const family = labelOf(vm, 'family')
   const kind = labelOf(vm, 'kind')
-  if (
-    platform === 'openai' ||
-    family === 'codex' ||
-    kind === 'codex' ||
-    kind === 'gpt'
-  ) {
-    return 'codex'
-  }
-  if (platform === 'anthropic' || family === 'claude' || kind === 'claude') {
-    return 'claude'
+  for (const label of [platform, family, kind]) {
+    if (!label) continue
+    if (label === 'antigravity') return 'antigravity'
+    if (label === 'anthropic' || label === 'claude') return 'claude'
+    if (['openai', 'codex', 'gpt', 'chatgpt'].includes(label)) return 'codex'
+    if (label === platform) return 'unknown'
   }
   if (vm.codex_kernel === true) return 'codex'
   if (String(vm.inference_engine || '').trim() === 'codex') return 'codex'
@@ -34,12 +30,25 @@ export function isCodexVm(vm: Vm | undefined): boolean {
   return vmKindOf(vm) === 'codex'
 }
 
-export function platformLabel(vm: Vm | undefined): 'Claude' | 'GPT' {
-  return isCodexVm(vm) ? 'GPT' : 'Claude'
+export function isAntigravityVm(vm: Vm | undefined): boolean {
+  return vmKindOf(vm) === 'antigravity'
 }
 
-export function platformLabelOf(kind: VmKind): 'Claude' | 'GPT' {
-  return kind === 'codex' ? 'GPT' : 'Claude'
+export function isClaudeVm(vm: Vm | undefined): boolean {
+  return vmKindOf(vm) === 'claude'
+}
+
+export function platformLabel(vm: Vm | undefined): string {
+  return platformLabelOf(vmKindOf(vm))
+}
+
+export function platformLabelOf(kind: VmKind): string {
+  return {
+    claude: 'Claude',
+    codex: 'GPT',
+    antigravity: 'Antigravity',
+    unknown: '未知平台',
+  }[kind]
 }
 
 export function indexVms(vms: Vm[] | undefined | null): Map<string, Vm> {
@@ -55,9 +64,11 @@ export function kindFromModel(
   model?: string | null,
   protocol?: string | null
 ): VmKind {
+  const raw = String(model || '').trim()
   const proto = String(protocol || '')
     .trim()
     .toLowerCase()
+  if (/^gemini-/i.test(raw) || proto === 'antigravity') return 'antigravity'
   if (
     proto === 'openai' ||
     proto === 'codex' ||
@@ -66,17 +77,25 @@ export function kindFromModel(
   ) {
     return 'codex'
   }
-  if (isGptCatalogId(String(model || ''), proto)) return 'codex'
+  if (isGptCatalogId(raw, proto)) return 'codex'
   return 'claude'
 }
 
+/** UI binding state only. This does not imply gateway token availability or pool eligibility. */
+export function hasSlotCredential(vm?: Partial<Vm>): boolean {
+  if (isAntigravityVm(vm as Vm | undefined))
+    return vm?.antigravity?.authenticated === true
+  return vm?.has_token === true
+}
+
 /** Account line on rack cards: credential presence is independent of the email. */
-export function slotCredentialLabel(
-  vm?: Pick<Vm, 'email' | 'has_token' | 'has_refresh'>,
-  compact = false
-): string {
+export function slotCredentialLabel(vm?: Partial<Vm>, compact = false): string {
+  if (isAntigravityVm(vm as Vm | undefined) && !hasSlotCredential(vm))
+    return '空槽'
   const email = String(vm?.email || '').trim()
   if (email) return compact ? email.split('@')[0] : email
+  if (isAntigravityVm(vm as Vm | undefined) && hasSlotCredential(vm))
+    return '已登录官方客户端'
   return vm?.has_token || vm?.has_refresh ? '已导入账号 · 邮箱未知' : '空槽'
 }
 
@@ -96,17 +115,15 @@ export function slotAccountLabel(
 }
 
 /** `vm-01` with only its creation number is unbound. A distinct display name stays visible. */
-export function slotNameLabel(vm?: {
-  id?: string | null
-  name?: string | null
-  email?: string | null
-}): string {
+export function slotNameLabel(vm?: Partial<Vm>): string {
   const id = String(vm?.id || '').trim()
   const rawName = String(vm?.name || '').trim()
   const email = String(vm?.email || '').trim()
   const nameNum = slotNumber(rawName)
   const idNum = slotNumber(id)
   const sameNumber = nameNum != null && idNum != null && nameNum === idNum
+  if (isAntigravityVm(vm as Vm | undefined) && hasSlotCredential(vm))
+    return rawName || id || '已登录官方客户端'
   if (rawName && rawName !== id && !sameNumber) return rawName
   const name = rawName || id
   if (email || (name && !/^vm-\d+$/i.test(id))) return name || '未绑定账号'
@@ -161,12 +178,25 @@ export function isGptCatalogId(id: string, family?: string) {
   return /^gpt/i.test(String(id || '')) && !/^gpt-image/i.test(String(id || ''))
 }
 
-export function catalogForVm<T extends { id: string; family?: string }>(
-  items: T[],
-  vm: Vm | undefined
-): T[] {
-  const gpt = isCodexVm(vm)
-  return items.filter((item) =>
-    isGptCatalogId(item.id, item.family) ? gpt : !gpt
-  )
+export function catalogForVm<
+  T extends { id: string; family?: string; platform?: string },
+>(items: T[], vm: Vm | undefined): T[] {
+  const kind = vmKindOf(vm)
+  return items.filter((item) => {
+    const platform = String(item.platform || '').toLowerCase()
+    const itemKind: VmKind = platform
+      ? platform === 'antigravity'
+        ? 'antigravity'
+        : platform === 'openai'
+          ? 'codex'
+          : platform === 'anthropic'
+            ? 'claude'
+            : 'unknown'
+      : /^gemini-/i.test(item.id) || item.family === 'antigravity'
+        ? 'antigravity'
+        : isGptCatalogId(item.id, item.family)
+          ? 'codex'
+          : 'claude'
+    return itemKind === kind
+  })
 }

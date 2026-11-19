@@ -9,7 +9,7 @@ import path from 'node:path'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { runSlotOauth } from '../transport/slot-oauth.mjs'
 import { getVm, listVms, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
-import { isCodexVm } from '../vm/vm-kind.mjs'
+import { isCodexVm, isClaudeVm } from '../vm/vm-kind.mjs'
 import { vmHasProxyPath } from '../oauth/credential-refresh-monitor.mjs'
 import { seedModelCatalog } from '../protocol/models.mjs'
 import { syncWorkerModelsIntoPolicy } from '../protocol/model-policy.mjs'
@@ -46,7 +46,7 @@ function syncStatus(status, { added = [], error = null } = {}) {
 // listVms strips credentials; the exec needs the raw record's OAuth block.
 function claudeCatalogTargets(projectRoot) {
   return listVms(projectRoot)
-    .filter((vm) => vm?.id && !isCodexVm(vm) && !HARD_DOWN.has(String(vm.status || '').toLowerCase()))
+    .filter((vm) => vm?.id && isClaudeVm(vm) && !HARD_DOWN.has(String(vm.status || '').toLowerCase()))
     .map((vm) => getVm(projectRoot, vm.id))
     .filter((vm) => vm && vmHasClaudeCredential(vm) && vmHasProxyPath(vm))
 }

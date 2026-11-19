@@ -1322,6 +1322,49 @@ test('opus is not scheduled onto an OpenAI slot', async (t) => {
   assert.equal(selected.reason, 'no_eligible_accounts')
 })
 
+test('Antigravity model namespaces cannot enter the Claude pool even through a pin or peek', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let probes = 0
+  const pool = scheduler(root, {
+    workerHealth: async () => {
+      probes += 1
+      return { ok: true, credential: { has_access: true } }
+    },
+  })
+  for (const model of [
+    'gemini-4-argon',
+    'antigravity/claude-test',
+    'antigravity/gpt-test',
+    'prefix/antigravity/claude-test',
+  ]) {
+    for (const pinVmId of [null, 'vm-01']) {
+      const selected = await pool.selectAndReserve({ model, pinVmId, allowWait: false })
+      assert.equal(selected.ok, false, `${model} pin=${pinVmId}`)
+      assert.equal(selected.reason, 'no_eligible_accounts')
+    }
+    const peeked = await pool.peekAccount({ model })
+    assert.equal(peeked.ok, false, model)
+  }
+  assert.equal(probes, 0)
+})
+
+test('explicit Antigravity or unknown VMs never supply stale credentials to the Claude pool', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  for (const [id, platform] of [
+    ['vm-01', 'antigravity'],
+    ['vm-02', 'unsupported'],
+  ]) {
+    const file = path.join(root, 'vms', `${id}.json`)
+    const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    fs.writeFileSync(file, JSON.stringify({ ...vm, platform }))
+  }
+  const result = await scheduler(root).selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(result.ok, false)
+  assert.equal(result.reason, 'no_eligible_accounts')
+})
+
 test('dead sticky binding is unbound then selection continues', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

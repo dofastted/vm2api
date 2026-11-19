@@ -403,6 +403,24 @@ function removeIptables(plan, runIptables = iptables) {
   return { ok: true }
 }
 
+/** A host firewall reload (e.g. `firewall-cmd --reload`) drops these rules while kin-egress keeps listening. */
+export function egressRulesIntact(projectRoot, proxyId, { runDocker = docker, runIptables = iptables } = {}) {
+  const net = inspectEgressNetwork(proxyId, runDocker)
+  if (!net?.subnet) return false
+  const portOf = (spec) => Number(String(spec || '').slice(String(spec || '').lastIndexOf(':') + 1)) || 0
+  let ports = portsForProxy(proxyId)
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(egressRunDir(projectRoot, proxyId), 'egress.json'), 'utf8'))
+    if (portOf(cfg.listen_tcp) && portOf(cfg.listen_dns))
+      ports = { tcp: portOf(cfg.listen_tcp), dns: portOf(cfg.listen_dns) }
+  } catch {}
+  const chain = chainName(proxyId)
+  const plan = iptablesPlan({ chain, bridge: net.bridge, subnet: net.subnet, tcpPort: ports.tcp, dnsPort: ports.dns })
+  return plan.add
+    .filter((args) => args.includes('-C') || (args[2] === '-A' && args[3] === chain))
+    .every((args) => runIptables(args.map((arg) => (arg === '-A' ? '-C' : arg))).ok)
+}
+
 // Must mirror DefaultDNSUpstreams in worker/internal/egress/server.go.
 export const DNS_UPSTREAMS = Object.freeze([
   'https://1.1.1.1/dns-query',

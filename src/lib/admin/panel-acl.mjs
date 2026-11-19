@@ -133,7 +133,7 @@ const LOG_STATS_GET = new Set([
 
 function isSuperVmRead(path) {
   if (path === '/api/panel/vms/fleet-status' || path === '/api/panel/vms/create-options') return false
-  return /^\/api\/panel\/vms\/[^/]+$/.test(path)
+  return /^\/api\/panel\/vms\/[^/]+(?:\/antigravity\/status)?$/.test(path)
 }
 
 function isSuperSchedule(method, path) {
@@ -156,6 +156,8 @@ function userVmPathAllowed(method, path) {
     if (!rest) return true
     if (rest === 'oauth/credential' || rest === 'package') return false
     return (
+      rest === 'antigravity/status' ||
+      rest === 'antigravity/oauth/session' ||
       rest === 'test-schedule' ||
       rest === 'probe' ||
       rest === 'count-tokens' ||
@@ -170,6 +172,9 @@ function userVmPathAllowed(method, path) {
     if (head === 'official-cc-bootstrap' || head === 'wrap-cli' || head === 'reset-fingerprint') return false
     if (head === 'owner') return false
     return (
+      rest === 'antigravity/models/sync' ||
+      rest === 'antigravity/quota/refresh' ||
+      ['antigravity/oauth/start', 'antigravity/oauth/complete', 'antigravity/oauth/cancel'].includes(rest) ||
       rest === 'schedulable' ||
       rest === 'cooldown/clear' ||
       rest === 'circuit/reset' ||

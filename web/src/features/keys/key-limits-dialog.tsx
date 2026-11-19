@@ -379,6 +379,9 @@ export function KeyLimitsDialog({
                   <SelectItem value='openai'>
                     {isApi ? 'openai · OpenAI 协议' : 'openai'}
                   </SelectItem>
+                  {!isApi ? (
+                    <SelectItem value='antigravity'>antigravity</SelectItem>
+                  ) : null}
                   {!isApi && pools ? (
                     <SelectItem value='gemini'>Gemini · CRAGAnti</SelectItem>
                   ) : null}
@@ -419,6 +422,12 @@ export function KeyLimitsDialog({
               </p>
             ) : (
               <div className='sm:col-span-2'>
+                {draft.group_type === 'antigravity' ? (
+                  <p className='mb-2 text-xs text-muted-foreground'>
+                    Antigravity 范围独立保存，仅调度已授权且支持所选模型的
+                    Antigravity 槽位。
+                  </p>
+                ) : null}
                 <Field label='可用 VM'>
                   {!vmsReady ? (
                     <p role='status' className='text-xs text-muted-foreground'>
@@ -533,7 +542,12 @@ function blankDraft(): KeyLimitsDraft {
 }
 
 function groupOf(value: string | undefined): KeyGroupType {
-  if (value === 'anthropic' || value === 'openai' || value === 'gemini')
+  if (
+    value === 'anthropic' ||
+    value === 'openai' ||
+    value === 'antigravity' ||
+    value === 'gemini'
+  )
     return value
   return 'all'
 }

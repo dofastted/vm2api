@@ -6,7 +6,7 @@ import { toast } from 'sonner'
 import { api, patchVm } from '@/lib/api'
 import { protocolPersonaSaveToast } from '@/lib/persona-template'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isClaudeVm } from '@/lib/vm-kind'
 import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { dashboardQueryOptions } from '@/features/overview/queries'
@@ -61,7 +61,7 @@ export function SystemPromptPage() {
       try {
         const dash = await api<Dashboard>('/api/panel/dashboard')
         const follow = await inheritProtocolOnSlots(
-          (dash.vms || []).filter((vm) => !isCodexVm(vm)),
+          (dash.vms || []).filter((vm) => isClaudeVm(vm)),
           patchVm
         )
         inherited = follow.changed

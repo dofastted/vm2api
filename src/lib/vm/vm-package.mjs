@@ -30,7 +30,7 @@ import { parseSocks5Fields } from './proxy-pool.mjs'
 import { seedFreshCliHome } from './vm-recreate.mjs'
 import { atomicWriteJson, isValidVmId } from './vm-file.mjs'
 import { bindVmProxy, getVm, listVms } from './vm-registry.mjs'
-import { isCodexVm, stampVmKind } from './vm-kind.mjs'
+import { isClaudeVm, isCodexVm, stampVmKind } from './vm-kind.mjs'
 import { normalizeVmConfig, resolveMachineSpec } from './machine-spec.mjs'
 import {
   SESSION_SLOT_MAX,
@@ -559,7 +559,7 @@ function finishControl(projectRoot, id, spec, status, { telemetryDefaultEnabled 
   const file = path.join(projectRoot, 'vms', `${id}.json`)
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   applyTraits(vm, spec)
-  if (telemetryDefaultEnabled === true && !isCodexVm(vm)) {
+  if (telemetryDefaultEnabled === true && isClaudeVm(vm)) {
     vm.seed_policy = standardSeedPolicy(vm.seed_policy || {}, { defaultEnabled: true })
   }
   applySchedule(vm, spec, credentialPresent(spec, vm))
@@ -679,7 +679,7 @@ export async function commitVmPackage({
     return { ok: false, status: 403, error: { code: 'proxy_forbidden', message: '无权绑定这个出口' } }
   }
   applyTraits(vm, spec)
-  if (create && telemetryDefaultEnabled === true && !isCodexVm(vm)) {
+  if (create && telemetryDefaultEnabled === true && isClaudeVm(vm)) {
     vm.seed_policy = standardSeedPolicy(vm.seed_policy || {}, { defaultEnabled: true })
   }
   applySchedule(vm, spec, false)

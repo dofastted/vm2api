@@ -47,6 +47,7 @@ export function SchedulableSwitch({
   restrictionUntil,
   unschedulableText,
   className,
+  unsupported = false,
 }: {
   vmId: string
   schedulable: boolean
@@ -55,11 +56,12 @@ export function SchedulableSwitch({
   restrictionReason?: string | null
   unschedulableText?: string | null
   className?: string
+  unsupported?: boolean
 }) {
   const qc = useQueryClient()
   const restricted = scheduleState === 'restricted'
   const [optimistic, setOptimistic] = useState<boolean | null>(null)
-  const checked = optimistic ?? schedulable
+  const checked = !unsupported && (optimistic ?? schedulable)
   const mutation = useMutation({
     mutationFn: (next: boolean) =>
       api(`/api/panel/vms/${encodeURIComponent(vmId)}/schedulable`, {
@@ -83,8 +85,9 @@ export function SchedulableSwitch({
   })
 
   const untilText = formatRestrictionUntil(restrictionUntil)
-  const tooltip =
-    scheduleState === 'unschedulable' && !checked
+  const tooltip = unsupported
+    ? '当前槽位不支持 API 调度'
+    : scheduleState === 'unschedulable' && !checked
       ? `不可调度：${unschedulableText || '错误'}。处理后点击重新开启调度`
       : restricted && checked
         ? untilText
@@ -104,7 +107,7 @@ export function SchedulableSwitch({
         >
           <Switch
             checked={checked}
-            disabled={mutation.isPending}
+            disabled={unsupported || mutation.isPending}
             onCheckedChange={(next) => mutation.mutate(next)}
             aria-label={tooltip}
           />

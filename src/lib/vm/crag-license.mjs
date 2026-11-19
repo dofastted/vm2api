@@ -5,7 +5,7 @@ import { runtimeFileOwner } from '../oauth/oauth-credentials.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 import { cragV2PackageRoot, installedCragV2Root, matchesCragIssuer, verifyCragV2Tree } from './wrap-cli-runtime.mjs'
 import { workerPaths } from '../transport/go-worker-client.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isClaudeVm } from './vm-kind.mjs'
 import { getVm, listVms } from './vm-registry.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { cragSubscriptionPublicDirectory } from './crag-subscription-paths.mjs'
@@ -627,7 +627,7 @@ function subscriptionSlot(vm) {
     .toLowerCase()
   if (
     process.platform !== 'linux' ||
-    isCodexVm(vm) ||
+    !isClaudeVm(vm) ||
     (runtime !== 'docker' && !kvm) ||
     ['darwin', 'macos'].includes(vm?.node_platform)
   )
@@ -904,7 +904,7 @@ export function activateCragSubscriptionBinding(
 }
 
 export function readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId) {
-  if (process.platform !== 'linux' || isCodexVm(vm)) return null
+  if (process.platform !== 'linux' || !isClaudeVm(vm)) return null
   const registration = storedRegistration(cragLicenseDirectory(projectRoot, vm))
   if (!selectsSubscription(registration)) return null
   subscriptionSlot(vm)
@@ -1054,7 +1054,7 @@ function universalCodeFromLocalSlots(projectRoot) {
   let found = ''
   for (const summary of listVms(projectRoot)) {
     const vm = getVm(projectRoot, summary.id)
-    if (!vm || vm.node_id || isCodexVm(vm)) continue
+    if (!vm || vm.node_id || !isClaudeVm(vm)) continue
     let code = ''
     try {
       code = storedRegistration(cragLicenseDirectory(projectRoot, vm))
@@ -1094,7 +1094,7 @@ function machineExport(machine_code, keyId) {
 
 /** Copy the installation grant without replacing a device-bound L1 or host-bound S1. */
 export function projectLocalGrant(projectRoot, vm, code) {
-  if (!vm?.id || isCodexVm(vm) || vm.node_id) return false
+  if (!vm?.id || !isClaudeVm(vm) || vm.node_id) return false
   const dir = cragLicenseDirectory(projectRoot, vm)
   let existing = ''
   try {
@@ -1153,7 +1153,7 @@ async function projectRemoteGrant(vm, code) {
 /** Make the installation grant visible to one slot kernel. No-op without a CRAGU1 grant. */
 export async function projectCragUniversalVm(projectRoot, vm) {
   const code = readUniversalCode(projectRoot)
-  if (!code || !vm?.id || isCodexVm(vm)) return { ok: true, skipped: true }
+  if (!code || !vm?.id || !isClaudeVm(vm)) return { ok: true, skipped: true }
   if (vm.node_id) {
     await projectRemoteGrant(vm, code)
     return { ok: true }
@@ -1169,7 +1169,7 @@ export async function distributeCragUniversalGrant(projectRoot) {
   const errors = []
   for (const summary of listVms(projectRoot)) {
     const vm = getVm(projectRoot, summary.id)
-    if (!vm?.id || isCodexVm(vm)) continue
+    if (!vm?.id || !isClaudeVm(vm)) continue
     try {
       if (vm.node_id) await projectRemoteGrant(vm, code)
       else projectLocalGrant(projectRoot, vm, code)
@@ -1313,7 +1313,7 @@ export async function redeemCragDeviceVoucher(
   { fetchImpl = globalThis.fetch, getTarget } = {},
 ) {
   if (typeof voucher !== 'string' || !/^CRAGR1\.[A-Za-z0-9_-]{43}$/.test(voucher)) fail()
-  if (process.platform !== 'linux' || vm.node_id || isKvmRuntime(vm) || isCodexVm(vm)) fail('license_unconfigured')
+  if (process.platform !== 'linux' || vm.node_id || isKvmRuntime(vm) || !isClaudeVm(vm)) fail('license_unconfigured')
   decodeLicenseBytes(voucher.slice(7), 32)
   const slot = path.resolve(projectRoot, 'vms', vm.id)
   const targetAuthority = (target) => {
@@ -1343,7 +1343,7 @@ export async function redeemCragDeviceVoucher(
       currentVm.id !== vm.id ||
       currentVm.node_id ||
       isKvmRuntime(currentVm) ||
-      isCodexVm(currentVm) ||
+      !isClaudeVm(currentVm) ||
       currentVm.owner_user_id !== vm.owner_user_id
     )
       throw new CragLicenseError('license_redeem_target_changed', 409)

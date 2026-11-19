@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import type { Vm } from '@/types/panel-vm'
 import { api } from '@/lib/api'
 import { fmtResetClock, resetCountdown } from '@/lib/fable-status'
+import { isAntigravityVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { type SlashCommand, WsTerminal } from '@/components/ws-terminal-lazy'
@@ -210,7 +211,7 @@ export function VmShellCard({
               key={`${id}:${vm.resolved_dataplane}:${vm.resolved_crag_kernel_version}`}
               ticketPath={`/api/panel/vms/${encodeURIComponent(id)}/shell-ticket`}
               socketPath={`/api/panel/vms/${encodeURIComponent(id)}/shell`}
-              commands={commands}
+              commands={isAntigravityVm(vm) ? [] : commands}
             />
           </div>
         ) : (

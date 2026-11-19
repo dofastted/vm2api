@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { TestModelsPayload, Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { api, isApiError } from '@/lib/api'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isCodexVm } from '@/lib/vm-kind'
 import { testModelsQueryOptions } from '@/features/vm/queries'
 import type { TestChatResult } from '@/features/vm/test-chat-types'
 import { useVmPerms } from '@/features/vm/vm-perms'
@@ -87,7 +87,9 @@ export function useVmTestChat(vm: Vm) {
             prompt,
             ...(isCodexVm(vm)
               ? { reasoning_effort: reasoningEffort }
-              : { max_tokens: maxTokens }),
+              : isAntigravityVm(vm)
+                ? { max_tokens: maxTokens, reasoning_effort: reasoningEffort }
+                : { max_tokens: maxTokens }),
           }),
         }
       ),

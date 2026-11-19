@@ -480,7 +480,7 @@ function scopeText(value) {
 }
 
 function isScopePair(value) {
-  return /^(claude|gpt):[a-z0-9_-]{1,64}$/.test(value)
+  return /^(claude|gpt|antigravity):[a-z0-9_-]{1,64}$/.test(value)
 }
 
 function gptPlanBucket(raw) {
@@ -491,11 +491,12 @@ function gptPlanBucket(raw) {
   return plan.replace(/[^a-z0-9_-]/g, '').slice(0, 64) || PLAN_TYPE_NONE
 }
 
-/** `claude` or `gpt`. A summary's `platform: openai` and a raw Codex file both count as GPT. */
+/** A summary's `platform: openai` and a raw Codex file both count as GPT. */
 export function scopePlatformOf(account = {}) {
   const platform = scopeText(account.platform)
   const family = scopeText(account.family)
   const tier = scopeText(account.account_tier)
+  if (platform === 'antigravity' || family === 'antigravity') return 'antigravity'
   if (
     account.codex_kernel === true ||
     tier === 'codex' ||
@@ -523,6 +524,7 @@ function claudeSubscriptionPlan(account = {}) {
 }
 
 export function scopePlanOf(account = {}) {
+  if (scopePlatformOf(account) === 'antigravity') return PLAN_TYPE_NONE
   if (scopePlatformOf(account) === 'gpt') return gptPlanBucket(account.plan_type)
   const plan = claudeSubscriptionPlan(account)
   if (plan) return plan
@@ -557,7 +559,7 @@ export function scopeKeyLabel(key) {
   const split = text.indexOf(':')
   const platform = split < 0 ? text : text.slice(0, split)
   const plan = split < 0 ? '' : text.slice(split + 1)
-  const platformLabel = platform === 'gpt' ? 'GPT' : 'Claude'
+  const platformLabel = platform === 'antigravity' ? 'Antigravity' : platform === 'gpt' ? 'GPT' : 'Claude'
   if (!plan || plan === PLAN_TYPE_NONE) return `${platformLabel} · 未标注`
   if (platform === 'claude') {
     if (plan === 'max') return 'Claude · Max'
@@ -571,7 +573,8 @@ export function scopeKeyLabel(key) {
 function compareScopeKeys(left, right) {
   const [lp, lplan] = left.split(':')
   const [rp, rplan] = right.split(':')
-  const platform = (lp === 'gpt' ? 1 : 0) - (rp === 'gpt' ? 1 : 0)
+  const rank = { claude: 0, gpt: 1, antigravity: 2 }
+  const platform = (rank[lp] ?? 3) - (rank[rp] ?? 3)
   if (platform) return platform
   const li = SCOPE_PLAN_RANK.indexOf(lplan)
   const ri = SCOPE_PLAN_RANK.indexOf(rplan)
@@ -585,6 +588,16 @@ function compareScopeKeys(left, right) {
 export function scopeAccountFromVm(vm = {}, quota = null) {
   if (!vm || typeof vm !== 'object') return null
   const platform = scopePlatformOf(vm)
+  if (platform === 'antigravity')
+    return {
+      id: vm.id || null,
+      email: vm.antigravity?.email || vm.email || null,
+      name: vm.name || null,
+      platform,
+      plan_type: null,
+      account_tier: null,
+      has_token: vm.antigravity?.authenticated === true,
+    }
   const attached = vm.quota && typeof vm.quota === 'object' ? vm.quota.unified || vm.quota : {}
   const passed = quota && typeof quota === 'object' ? quota.unified || quota : {}
   const q = { ...attached, ...passed }
@@ -692,7 +705,8 @@ export function jevScopeConfigured(jev) {
 export function jevScopeWaits(jev, platform) {
   if (!jevScopeConfigured(jev)) return false
   if ((jev.account_ids || []).length > 0) return true
-  const prefix = platform === 'gpt' || platform === 'openai' ? 'gpt:' : 'claude:'
+  const prefix =
+    platform === 'antigravity' ? 'antigravity:' : platform === 'gpt' || platform === 'openai' ? 'gpt:' : 'claude:'
   return (jev.account_platform_plans || []).some((key) => String(key).startsWith(prefix))
 }
 

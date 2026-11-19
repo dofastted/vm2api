@@ -1,19 +1,38 @@
 import type { Vm } from '@/types/panel-vm'
+import AntigravityColor from '@lobehub/icons/es/Antigravity/components/Color'
 import ClaudeColor from '@lobehub/icons/es/Claude/components/Color'
 import GeminiColor from '@lobehub/icons/es/Gemini/components/Color'
 import OpenAI from '@lobehub/icons/es/OpenAI/components/Mono'
 import { credentialRegistrationOf } from '@/lib/cred-type'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
-import { clipLabel, isCodexVm } from '@/lib/vm-kind'
+import {
+  clipLabel,
+  isAntigravityVm,
+  isCodexVm,
+  slotCredentialLabel,
+} from '@/lib/vm-kind'
 import { claudeTier } from '@/lib/vm-status'
 import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
 import { VmRentedMark } from '@/features/vm/vm-owner-line'
 
 export function PlatformMark({ vm }: { vm: Vm }) {
   const gpt = isCodexVm(vm)
-  const Icon = vm.gemini ? GeminiColor : gpt ? OpenAI : ClaudeColor
-  const label = vm.gemini ? 'Gemini' : gpt ? 'openai' : 'anthropic'
+  const antigravity = isAntigravityVm(vm)
+  const Icon = vm.gemini
+    ? GeminiColor
+    : antigravity
+      ? AntigravityColor
+      : gpt
+        ? OpenAI
+        : ClaudeColor
+  const label = vm.gemini
+    ? 'Gemini'
+    : antigravity
+      ? 'antigravity'
+      : gpt
+        ? 'openai'
+        : 'anthropic'
   return (
     <span
       className='inline-flex size-3.5 shrink-0 items-center justify-center'
@@ -47,7 +66,11 @@ export function VmAccountIdentity({ vm }: { vm: Vm }) {
           className='truncate text-xs font-semibold'
           title={email || undefined}
         >
-          {email ? clipLabel(email) : '未绑定邮箱'}
+          {isAntigravityVm(vm)
+            ? clipLabel(slotCredentialLabel(vm))
+            : email
+              ? clipLabel(email)
+              : '未绑定邮箱'}
         </div>
         <ActiveVmBadge vm={vm} />
       </div>
@@ -57,7 +80,9 @@ export function VmAccountIdentity({ vm }: { vm: Vm }) {
         >
           {vm.gemini
             ? vm.gemini.account?.plan || 'Gemini'
-            : claudeTier(vm).label}
+            : isAntigravityVm(vm)
+              ? 'Antigravity'
+              : claudeTier(vm).label}
         </span>
         <span aria-hidden='true'>|</span>
         <span>
@@ -77,7 +102,13 @@ export function VmAccountIdentity({ vm }: { vm: Vm }) {
           )}
           title='当前内核'
         >
-          {vm.gemini ? 'CRAGAnti' : crag ? 'crag' : '默认'}
+          {vm.gemini
+            ? 'CRAGAnti'
+            : isAntigravityVm(vm)
+              ? '独立'
+              : crag
+                ? 'crag'
+                : '默认'}
         </span>
         <span className='truncate' title={node}>
           {node}

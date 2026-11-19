@@ -132,3 +132,10 @@ describe('filterVms fleet chips', () => {
     ])
   })
 })
+
+it('isolates Antigravity slots from native Claude and GPT filters', () => {
+  const ag = { id: 'ag', platform: 'antigravity' }
+  expect(filterVms([ag], '', 'all', 'claude')).toEqual([])
+  expect(filterVms([ag], '', 'all', 'gpt')).toEqual([])
+  expect(filterVms([ag], '', 'all', 'antigravity')).toEqual([ag])
+})

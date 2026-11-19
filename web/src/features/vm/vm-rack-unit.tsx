@@ -61,6 +61,7 @@ function MiniColumn({ w, now }: { w: WindowReadout; now: number }) {
 }
 
 const NOTE: Record<string, string> = {
+  official: '已登录官方客户端',
   dead: '无效凭证',
   vacant: '未绑定账号',
   unprobed: '额度未探测',

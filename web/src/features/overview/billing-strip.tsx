@@ -3,7 +3,7 @@ import { Link } from '@tanstack/react-router'
 import type { BillingAccountRow, BillingSnapshot } from '@/types/panel-overview'
 import type { Vm } from '@/types/panel-vm'
 import { fmtUsd } from '@/lib/format'
-import { indexVms, isCodexVm } from '@/lib/vm-kind'
+import { indexVms, isAntigravityVm, isClaudeVm, isCodexVm } from '@/lib/vm-kind'
 import { billingRowSlot } from '@/lib/vm-usage'
 import { Button } from '@/components/ui/button'
 import { SlotIdentity } from '@/components/platform-chip'
@@ -28,18 +28,21 @@ export function BillingStrip({
   const byId = indexVms(vms)
   let claudeCost = 0
   let gptCost = 0
+  let antigravityCost = 0
   // 与今日/累计同口径：官方价（total_cost），不乘分组倍率。
   for (const item of owned.data?.items || []) {
     const vm = item.vm_id ? byId.get(item.vm_id) : undefined
     const cost = Number(item.official_cost_usd ?? 0)
-    if (isCodexVm(vm)) gptCost += cost
-    else claudeCost += cost
+    if (isAntigravityVm(vm)) antigravityCost += cost
+    else if (isCodexVm(vm)) gptCost += cost
+    else if (vm && isClaudeVm(vm)) claudeCost += cost
   }
   if (!owned.data?.items?.length) {
     for (const vm of vms || []) {
       const cost = Number(vm.total_cost || 0)
-      if (isCodexVm(vm)) gptCost += cost
-      else claudeCost += cost
+      if (isAntigravityVm(vm)) antigravityCost += cost
+      else if (isCodexVm(vm)) gptCost += cost
+      else if (isClaudeVm(vm)) claudeCost += cost
     }
   }
   const rows: BillingAccountRow[] = (billing?.accounts || [])
@@ -49,14 +52,14 @@ export function BillingStrip({
   return (
     <PanelCard
       title='计费'
-      meta='上海日切 · Claude / GPT'
+      meta='上海日切 · Claude / GPT / Antigravity'
       action={
         <Button variant='outline' size='sm' asChild>
           <Link to='/billing'>计费详情</Link>
         </Button>
       }
     >
-      <div className='grid gap-px bg-border/60 sm:grid-cols-4'>
+      <div className='grid gap-px bg-border/60 sm:grid-cols-5'>
         <StatCell
           label='今日费用'
           value={fmtUsd(today)}
@@ -76,6 +79,11 @@ export function BillingStrip({
           label='GPT'
           value={fmtUsd(gptCost)}
           hint='OpenAI 官方价 · 累计'
+        />
+        <StatCell
+          label='Antigravity'
+          value={fmtUsd(antigravityCost)}
+          hint='托管计价 · 累计'
         />
       </div>
       {rows.length ? (

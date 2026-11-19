@@ -7,6 +7,7 @@
 import { isOfficialClaudeUa } from '../identity/crs-headers.mjs'
 import { isOfficialClaudeCodeTraffic } from '../identity/crs-persona.mjs'
 import { vmHasClaudeCredential } from '../vm/vm-registry.mjs'
+import { isClaudeVm, isCodexVm } from '../vm/vm-kind.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import { fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions, fromClaudeToResponses } from '../protocol/convert.mjs'
@@ -581,6 +582,7 @@ const HARD_UNAVAILABLE = new Set(['stopped', 'dead', 'error', 'disabled'])
 
 export function isHealthProbeTarget(vm, now = Date.now()) {
   if (!vm) return false
+  if (!isClaudeVm(vm) && !isCodexVm(vm)) return false
   if (vm.schedulable === false) return false
   const status = String(vm.status || '').toLowerCase()
   if (HARD_UNAVAILABLE.has(status)) return false

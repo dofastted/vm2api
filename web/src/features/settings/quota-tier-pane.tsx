@@ -10,7 +10,7 @@ import {
   Info,
   ServerCog,
 } from 'lucide-react'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isClaudeVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -561,7 +561,7 @@ export function QuotaTierPane({
     setDialog(null)
   }
 
-  const claudeItems = (list.data?.items || []).filter((vm) => !isCodexVm(vm))
+  const claudeItems = (list.data?.items || []).filter((vm) => isClaudeVm(vm))
   const title =
     dialog === 'gates'
       ? '配额闸线'

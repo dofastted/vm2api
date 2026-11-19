@@ -19,7 +19,7 @@ import { checkCragLicense } from './crag-license.mjs'
 import { isValidVmId, withVmLock } from './vm-file.mjs'
 import { ensureHostPrivateDir } from './private-dir.mjs'
 import { getVm, listVms, patchVmRecord, vmHasSchedulableCredential, waitForSlotDrain } from './vm-registry.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isClaudeVm, isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotExec, startSlotReady, stopSlot } from './slot-runtime.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
@@ -230,6 +230,7 @@ function desiredVm(vm, kernel) {
 
 function placementFailure(vm, kernel) {
   if (isCodexVm(vm)) return { code: 'kernel_codex_unsupported', error: '请选择 Claude 虚拟机' }
+  if (!isClaudeVm(vm)) return { code: 'kernel_platform_unsupported', error: '请选择 Claude 虚拟机' }
   if (vm.node_platform === 'darwin') {
     return { code: 'kernel_install_unsupported_placement', error: 'macOS 原生节点不能在内核页重装' }
   }

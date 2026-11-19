@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import type { Vm, VmKernelSnapshot, VmProxySnap } from '@/types/panel-vm'
 import { type CredType, credTypeLabel } from '@/lib/cred-type'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isAntigravityVm, isClaudeVm, isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
@@ -128,29 +128,35 @@ export function VmOpsTab(props: VmOpsTabProps) {
         onFollowProxy={onTimezoneFollowProxy}
       />
       <div className='flex flex-wrap gap-2'>
-        <Button
-          size='sm'
-          variant='outline'
-          disabled={busy('/activate') || busy('/deactivate')}
-          loading={busy('/activate') || busy('/deactivate')}
-          title={
-            isActiveVmPointer(vm)
-              ? '清空面板默认槽位，不影响调度'
-              : '写入 vms/active.json，面板默认接口指向此槽'
-          }
-          onClick={() =>
-            onAction(isActiveVmPointer(vm) ? '/deactivate' : '/activate')
-          }
-        >
-          {isActiveVmPointer(vm) ? '取消活跃' : '设为活跃'}
-        </Button>
+        {!isAntigravityVm(vm) ? (
+          <Button
+            size='sm'
+            variant='outline'
+            disabled={busy('/activate') || busy('/deactivate')}
+            loading={busy('/activate') || busy('/deactivate')}
+            title={
+              isActiveVmPointer(vm)
+                ? '清空面板默认槽位，不影响调度'
+                : '写入 vms/active.json，面板默认接口指向此槽'
+            }
+            onClick={() =>
+              onAction(isActiveVmPointer(vm) ? '/deactivate' : '/activate')
+            }
+          >
+            {isActiveVmPointer(vm) ? '取消活跃' : '设为活跃'}
+          </Button>
+        ) : null}
         <Button
           size='sm'
           variant='outline'
           loading={busy('/reload')}
           onClick={() => onAction('/reload')}
         >
-          {gpt ? '重载 Codex kernel' : '重载 worker'}
+          {isAntigravityVm(vm)
+            ? '重载 Antigravity bridge'
+            : gpt
+              ? '重载 Codex kernel'
+              : '重载 worker'}
         </Button>
         <Button
           size='sm'
@@ -160,7 +166,7 @@ export function VmOpsTab(props: VmOpsTabProps) {
         >
           采集特征
         </Button>
-        {gpt ? null : (
+        {!isClaudeVm(vm) ? null : (
           <>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -219,7 +225,7 @@ export function VmOpsTab(props: VmOpsTabProps) {
           ) : null}
         </Tooltip>
       </div>
-      {gpt ? null : (
+      {!isClaudeVm(vm) ? null : (
         <>
           <Separator />
           <div className='flex flex-wrap items-center gap-2'>

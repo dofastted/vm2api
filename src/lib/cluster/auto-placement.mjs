@@ -28,7 +28,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import { memoryMiB, slotMemory } from '../vm/machine-spec.mjs'
 import { resourcesForSlots, slotCapacityConfig, slotCreationLimits, slotPlanOf } from '../vm/slot-capacity.mjs'
-import { isCodexVm } from '../vm/vm-kind.mjs'
+import { isClaudeVm } from '../vm/vm-kind.mjs'
 
 export const LOCAL_PLACEMENT = 'local'
 
@@ -95,7 +95,7 @@ export function bookedMiB(vm, routing, policy) {
   const limit = memoryMiB(slotMemory(vm, routing))
   const reserve = policy.slot_reserve_memory ? memoryMiB(policy.slot_reserve_memory) : 0
   const capacity = slotCapacityConfig(routing)
-  if (!capacity.enabled || isCodexVm(vm)) return Math.max(limit, reserve)
+  if (!capacity.enabled || !isClaudeVm(vm)) return Math.max(limit, reserve)
   if (slotPlanOf(vm) === 'default') {
     const largest = resourcesForSlots(Math.max(...Object.values(capacity.plans)), routing).memoryMiB
     return Math.max(limit, reserve || largest)

@@ -5,7 +5,7 @@ import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { credTypeOf } from '@/lib/cred-type'
 import { importErrorMessage } from '@/lib/import-errors'
-import { isCodexVm } from '@/lib/vm-kind'
+import { isClaudeVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { dashboardQueryOptions } from '@/features/overview/queries'
@@ -46,7 +46,7 @@ export function ConvertOauthToSetupButton({
     onError: (e: Error) => toast.error(importErrorMessage(e)),
   })
 
-  if (!perms.credential || isCodexVm(vm) || credTypeOf(vm) !== 'oauth') {
+  if (!perms.credential || !isClaudeVm(vm) || credTypeOf(vm) !== 'oauth') {
     return null
   }
 

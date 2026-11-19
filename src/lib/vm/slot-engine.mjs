@@ -14,7 +14,7 @@ import {
   OFFICIAL_303_PRESET,
   personaPresetFromLegacyMode,
 } from '../identity/persona-template.mjs'
-import { isCodexVm } from './vm-kind.mjs'
+import { isClaudeVm } from './vm-kind.mjs'
 
 export const INFERENCE_ENGINES = Object.freeze(['rust'])
 export const SLOT_PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero', OFFICIAL_303_PRESET])
@@ -144,7 +144,7 @@ export function normalizeInferenceConfig(raw = {}) {
 }
 
 export function resolveInferenceEngine(vm, routing = {}) {
-  if (isCodexVm(vm)) return null
+  if (!isClaudeVm(vm)) return null
   const fromVm = normalizeInferenceEngine(vm?.inference_engine, { inherit: true })
   if (fromVm) return fromVm
   return normalizeInferenceEngine(routing?.inference?.engine)
@@ -169,7 +169,7 @@ export function normalizeKernelDataplane(value, { inherit = false } = {}) {
 }
 
 export function resolveKernelDataplane(vm, routing = {}) {
-  if (isCodexVm(vm)) return null
+  if (!isClaudeVm(vm)) return null
   const fromVm = normalizeKernelDataplane(vm?.dataplane, { inherit: true })
   if (fromVm) return fromVm
   return normalizeKernelDataplane(routing?.inference?.dataplane)
@@ -189,7 +189,7 @@ export function normalizeCragKernelVersion(value, { inherit = false } = {}) {
 }
 
 export function resolveCragKernelVersion(vm, routing = {}) {
-  if (isCodexVm(vm)) return null
+  if (!isClaudeVm(vm)) return null
   const fromVm = normalizeCragKernelVersion(vm?.crag_kernel_version, { inherit: true })
   if (fromVm) return fromVm
   const fromRouting = normalizeCragKernelVersion(routing?.inference?.crag_kernel_version, { inherit: true })
@@ -246,7 +246,7 @@ export function normalizeOfficialCcInference(value, { inherit = false } = {}) {
 }
 
 export function resolveOfficialCcInference(vm, routing = {}) {
-  if (isCodexVm(vm)) return null
+  if (!isClaudeVm(vm)) return null
   if (resolveInferenceEngine(vm, routing) === 'rust') return 'cli-hop'
   const fromVm = normalizeOfficialCcInference(vm?.official_cc_inference, { inherit: true })
   if (fromVm) return fromVm

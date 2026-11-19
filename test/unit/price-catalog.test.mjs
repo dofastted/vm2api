@@ -74,6 +74,13 @@ test.afterEach(() => {
   setPriceCatalogTestHooks(null)
 })
 
+test('Antigravity never inherits direct vendor API prices or wildcard overrides', () => {
+  assert.ok(resolvePrice('claude-sonnet-5-5'))
+  assert.equal(resolvePrice('antigravity/claude-sonnet-5-5'), null)
+  assert.equal(setPriceOverride('*/claude-sonnet-5-5', FULL).ok, true)
+  assert.equal(resolvePrice('antigravity/claude-sonnet-5-5'), null)
+})
+
 test('layer precedence: override provider/model > provider/* > */model > models.dev > builtin', async () => {
   const id = 'claude-sonnet-5-5'
   const builtin = resolvePrice(id)

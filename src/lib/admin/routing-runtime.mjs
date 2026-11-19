@@ -56,9 +56,10 @@ import {
   syncClaudeKernelConfigs,
   syncCragSessionPolicy,
 } from '../transport/rust-kernel-supervisor.mjs'
-import { isCodexVm } from '../vm/vm-kind.mjs'
+import { isCodexVm, isClaudeVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
+import { normalizeAntigravityRouting, validateAntigravityRoutingPatch } from '../protocol/antigravity-route.mjs'
 import { normalizeVmConfig } from '../vm/machine-spec.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { telemetryDefaultEnabled, telemetryUploadInterval } from '../vm/native-telemetry.mjs'
@@ -98,7 +99,7 @@ export function createRoutingRuntime(ctx) {
     vm.policy = { ...(vm.policy || {}), maxConcurrency: value, concurrencyOverride: override }
     vm.updated_at = new Date().toISOString()
     atomicWriteJson(vmPath, vm, { mode: 0o600 })
-    if (!isCodexVm(vm)) ctx.accountQuota.setMaxConcurrency(vm.claude?.account_uuid || vm.id, value, { override })
+    if (isClaudeVm(vm)) ctx.accountQuota.setMaxConcurrency(vm.claude?.account_uuid || vm.id, value, { override })
     return vm
   }
 
@@ -110,7 +111,7 @@ export function createRoutingRuntime(ctx) {
     vm.policy = { ...(vm.policy || {}), maxRpm: value, rpmOverride: override }
     vm.updated_at = new Date().toISOString()
     atomicWriteJson(vmPath, vm, { mode: 0o600 })
-    if (!isCodexVm(vm) && vm.claude) ctx.accountQuota.setMaxRpm(vm.claude.account_uuid || vm.id, value, { override })
+    if (isClaudeVm(vm) && vm.claude) ctx.accountQuota.setMaxRpm(vm.claude.account_uuid || vm.id, value, { override })
     return vm
   }
 
@@ -137,7 +138,7 @@ export function createRoutingRuntime(ctx) {
     const value = normalizeSessionSlots(n)
     const applied = { updated: 0, skipped: 0 }
     for (const vm of listVms(ctx.cfg.paths.project)) {
-      if (vm.codex_kernel || vm.platform === 'openai' || vm.family === 'codex') continue
+      if (!isClaudeVm(vm)) continue
       if (vm.session_slots_override === true) {
         applied.skipped += 1
         continue
@@ -153,7 +154,7 @@ export function createRoutingRuntime(ctx) {
     const v = Math.max(0, Math.min(256, Number(n) || 0))
     const skip = []
     for (const vm of listVms(ctx.cfg.paths.project)) {
-      if (isCodexVm(vm)) {
+      if (!isClaudeVm(vm)) {
         skip.push(vm.id)
         if (vm.account_uuid) skip.push(vm.account_uuid)
         continue
@@ -186,7 +187,7 @@ export function createRoutingRuntime(ctx) {
     const skip = []
     const applied = { default: 0, pro: 0, max: 0, skipped: 0 }
     for (const vm of listVms(ctx.cfg.paths.project)) {
-      if (isCodexVm(vm)) {
+      if (!isClaudeVm(vm)) {
         skip.push(vm.id)
         if (vm.account_uuid) skip.push(vm.account_uuid)
         continue
@@ -265,7 +266,7 @@ export function createRoutingRuntime(ctx) {
     const skip = []
     const applied = { default: 0, pro: 0, max: 0, skipped: 0 }
     for (const vm of listVms(ctx.cfg.paths.project)) {
-      if (isCodexVm(vm)) {
+      if (!isClaudeVm(vm)) {
         skip.push(vm.id)
         if (vm.account_uuid) skip.push(vm.account_uuid)
         continue
@@ -425,7 +426,7 @@ export function createRoutingRuntime(ctx) {
     const pending = []
     for (const { id } of listVms(project)) {
       const vm = getVm(project, id)
-      if (!vm || isCodexVm(vm) || vm.status !== 'running') continue
+      if (!vm || !isClaudeVm(vm) || vm.status !== 'running') continue
       if (resolveInferenceEngine(vm, routingConfig) !== 'rust') continue
       const exec = slotExec(project, vm)
       pending.push(
@@ -451,7 +452,7 @@ export function createRoutingRuntime(ctx) {
     const optIn = defaultEnabled === true && prevDefaultEnabled !== true
     for (const { id } of listVms(project)) {
       const vm = getVm(project, id)
-      if (!vm || isCodexVm(vm)) continue
+      if (!vm || !isClaudeVm(vm)) continue
       if (optIn && vm.seed_policy?.telemetry_disabled !== false) {
         const vmPath = path.join(project, 'vms', `${id}.json`)
         const fresh = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
@@ -491,6 +492,7 @@ export function createRoutingRuntime(ctx) {
     const hasCodexQuota = body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')
     if (hasCodexQuota) validateOpenAIQuotaPatch(body.codex.quota)
     validateInferenceWebsocketPatch(body)
+    validateAntigravityRoutingPatch(body)
     let nextRedaction = null
     if (body.redaction !== undefined) {
       nextRedaction = normalizeRedaction(body.redaction)
@@ -538,6 +540,12 @@ export function createRoutingRuntime(ctx) {
       routingConfig.websocket = normalizeInferenceWebsocket({
         ...(routingConfig.websocket || {}),
         ...body.websocket,
+      })
+    }
+    if (body.antigravity) {
+      routingConfig.antigravity = normalizeAntigravityRouting({
+        ...(routingConfig.antigravity || {}),
+        ...body.antigravity,
       })
     }
     if (body.codex) {
@@ -665,6 +673,7 @@ export function createRoutingRuntime(ctx) {
       const hasOpenAIQuota = Object.prototype.hasOwnProperty.call(doc.codex || {}, 'quota')
       doc.websocket = normalizeInferenceWebsocket(doc.websocket)
       doc.codex = normalizeCodexRouting(doc.codex)
+      doc.antigravity = normalizeAntigravityRouting(doc.antigravity)
       doc.pool = normalizePoolRouting(doc.pool)
       doc.vm = normalizeVmConfig(doc.vm)
       if (!hasOpenAIQuota) migrateLegacyOpenAIPolicies(doc)

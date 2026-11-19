@@ -1,5 +1,10 @@
 import type { AuthScheme, OauthFlavor, Vm } from '@/types/panel-vm'
-import { isCodexVm } from '@/lib/vm-kind'
+import {
+  hasSlotCredential,
+  isAntigravityVm,
+  isClaudeVm,
+  isCodexVm,
+} from '@/lib/vm-kind'
 
 export type CredType =
   'oauth' | 'setup-token' | 'official-setup-token' | 'apikey' | 'none'
@@ -43,7 +48,8 @@ export function credTypeFromMode(raw: unknown): CredType {
 }
 
 export function credTypeOf(vm: Vm | undefined): CredType {
-  if (!vm?.has_token) return 'none'
+  if (isAntigravityVm(vm)) return hasSlotCredential(vm) ? 'oauth' : 'none'
+  if (!vm?.has_token || (!isClaudeVm(vm) && !isCodexVm(vm))) return 'none'
   return credTypeFromMode(vm.credential_mode || vm.claude_mode || '')
 }
 
@@ -85,13 +91,13 @@ export function credentialRegistrationOf(vm: Vm): CredEndpoint {
  */
 export function credEndpointOf(vm: Vm | undefined): CredEndpoint {
   if (credTypeOf(vm) === 'none') return 'none'
-  if (isCodexVm(vm)) return 'oauth'
+  if (isCodexVm(vm) || isAntigravityVm(vm)) return 'oauth'
   return authSchemeOf(vm) === 'x_api_key' ? 'api' : 'console'
 }
 
 /** 只有 Claude 完整 OAuth 槽才支持官方初装。GPT 槽走 Codex OAuth。 */
 export function supportsOfficialCc(vm: Vm | undefined): boolean {
-  if (isCodexVm(vm)) return false
+  if (!isClaudeVm(vm)) return false
   return credTypeOf(vm) === 'oauth'
 }
 
@@ -101,6 +107,7 @@ export function supportsOfficialCc(vm: Vm | undefined): boolean {
  * GPT 槽有 refresh_token 才能刷新。
  */
 export function canRefreshCredential(vm: Vm | undefined): boolean {
+  if (isAntigravityVm(vm) || (!isClaudeVm(vm) && !isCodexVm(vm))) return false
   if (isCodexVm(vm)) return Boolean(vm?.has_refresh)
   const type = credTypeOf(vm)
   if (type === 'apikey' || type === 'official-setup-token') return false
@@ -112,8 +119,12 @@ export function canRefreshCredential(vm: Vm | undefined): boolean {
 export type ImportKind = 'oauth' | 'setup-token' | 'apikey'
 
 /** GPT 槽只走 Codex OAuth / 账号文件；Claude 才有 Setup Token / Console。 */
-export function importSurfaceFor(vm: Vm | undefined): 'claude' | 'codex' {
-  return isCodexVm(vm) ? 'codex' : 'claude'
+export function importSurfaceFor(
+  vm: Vm | undefined
+): 'claude' | 'codex' | 'antigravity' | 'unknown' {
+  if (isAntigravityVm(vm)) return 'antigravity'
+  if (isCodexVm(vm)) return 'codex'
+  return isClaudeVm(vm) ? 'claude' : 'unknown'
 }
 
 /** 导入方式。Setup Token 只有 Cookie / 授权链接；OAuth 另加官方 Claude Code。 */
