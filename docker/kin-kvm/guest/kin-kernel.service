@@ -2,6 +2,10 @@
 Description=kin-kernel gateway worker
 After=kin-guest-setup.service
 Requires=kin-guest-setup.service
+# The kernel exits while its license or guest setup is still being delivered. With the default
+# 5 starts / 10 s and RestartSec=2, that hits start-limit-hit in ~8 s and the unit stays failed,
+# so a later license projection never brings the kernel back. Keep retrying every RestartSec.
+StartLimitIntervalSec=0
 
 [Service]
 User=kincli
