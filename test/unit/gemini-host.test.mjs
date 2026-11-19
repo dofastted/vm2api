@@ -128,7 +128,7 @@ function setup(callHost, proxy = bound) {
   const panel = createGeminiPanelHandler({
     json: (_response, status, body) => ({ status, body }),
     readBody: async (req, maxBytes) => {
-      assert.equal(maxBytes, 4096)
+      assert.equal(maxBytes, 'redemption_code' in req.body ? 1024 : 4096)
       return req.body
     },
     proxyPool: () => ({
@@ -145,6 +145,8 @@ test('Gemini import is admin-only and unavailable without the host service', asy
   assert.equal(authorizePanelRoute('POST', `${root}/environments`, 'super').ok, false)
   assert.equal(authorizePanelRoute('POST', `${root}/environments/${record.id}/refresh`, 'user').ok, false)
   assert.equal(authorizePanelRoute('POST', `${root}/environments`, 'admin').ok, true)
+  assert.equal(authorizePanelRoute('POST', `${root}/payload/redeem`, 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', `${root}/payload/redeem`, 'admin').ok, true)
   const run = setup(() => {
     throw new Error('private socket path')
   })
@@ -188,12 +190,13 @@ test('Gemini inventory distinguishes a missing socket from an invalid host respo
   }
 })
 
-test('reachable Gemini host reports lazy install without dependencies on an existing environment', async () => {
-  const run = setup(() => ({ payload_state: 'install_on_create', environments: [] }))
+test('Gemini host reports an unredeemed installation source separately from runtime', async () => {
+  const run = setup(() => ({ payload_state: 'awaiting_redemption', release_activated: false, environments: [] }))
   assert.deepEqual((await run('GET', root)).body.data, {
     available: true,
-    payload_state: 'install_on_create',
+    payload_state: 'awaiting_redemption',
     payload_issue: null,
+    release_activated: false,
     oauth_runtime_issue: null,
     environments: [],
   })
@@ -203,6 +206,22 @@ test('reachable Gemini host reports lazy install without dependencies on an exis
   const result = await invalidPayload('POST', `${root}/environments`, { name: record.name, proxy_id: record.proxy_id })
   assert.equal(result.status, 503)
   assert.equal(result.body.error.code, 'gemini_payload_invalid')
+})
+
+test('Gemini redemption rejects Google codes and reports a different signed release as conflict', async () => {
+  let count = 0
+  const run = setup(() => {
+    count++
+    throw Object.assign(new Error('private information'), { code: 'gemini_release_payload_mismatch' })
+  })
+  const endpoint = `${root}/payload/redeem`
+  const invalid = await run('POST', endpoint, { redemption_code: '4/google-oauth-code' })
+  assert.equal(invalid.status, 400)
+  assert.equal(invalid.body.error.code, 'gemini_release_code_invalid')
+  assert.equal(count, 0)
+  const mismatch = await run('POST', endpoint, { redemption_code: `CGG1-${'A'.repeat(43)}` })
+  assert.equal(mismatch.status, 409)
+  assert.doesNotMatch(JSON.stringify(mismatch), /private information/)
 })
 
 test('only explicit platform SOCKS5 environments are created and credentials stay private', async () => {

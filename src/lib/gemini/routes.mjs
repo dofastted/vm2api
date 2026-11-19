@@ -9,9 +9,10 @@ const MODEL = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const AUTH_CODE = /^[A-Za-z0-9._~/-]{1,2048}$/
 const AUTH_STATE = /^[A-Za-z0-9._~-]{1,512}$/
 const API_KEY = /^[A-Za-z0-9_-]{20,256}$/
+const RELEASE_CODE = /^CGG1-[A-Za-z0-9_-]{43}$/
 const STATES = new Set(['unverified', 'authorizing', 'authorized', 'reauth_required', 'disabled'])
 const ACCOUNT_STATES = new Set(['ok', 'partial', 'error', 'reauth_required'])
-const PAYLOAD_STATES = new Set(['installed', 'install_on_create', 'not_configured', 'invalid'])
+const PAYLOAD_STATES = new Set(['installed', 'awaiting_redemption', 'not_configured', 'invalid'])
 const FAILURE = 'gemini_host_unavailable'
 const PROTOCOL_ERROR = 'gemini_host_protocol_error'
 const SOCKET_ERRORS = new Map([
@@ -45,6 +46,11 @@ const HOST_ERRORS = {
   gemini_payload_source_missing: [503, '缺少 Gemini 签名载荷，请配置已解包的安装源'],
   gemini_payload_incomplete: [503, 'Gemini 签名载荷不完整，请检查 agy、CRAGGemini 和清单文件'],
   gemini_payload_invalid: [503, 'Gemini 载荷安装或校验失败，请检查宿主服务日志'],
+  gemini_release_not_configured: [503, '此宿主机尚未配置当前版本的 CRAGGemini 授权'],
+  gemini_release_invalid: [503, '宿主机的 CRAGGemini 授权配置无效，请联系部署管理员'],
+  gemini_release_code_invalid: [400, '兑换码无效，或不适用于当前版本'],
+  gemini_release_payload_mismatch: [409, '当前宿主机的签名载荷与兑换码适用的版本不匹配'],
+  gemini_release_redemption_required: [403, '请先前往「订阅 CRAG」兑换 CRAGGemini 内核'],
   gemini_egress_unavailable: [503, '缺少可用的 Gemini 出口组件，请检查宿主 kin-egress 安装'],
   gemini_oauth_tools_missing: [503, '缺少 Google 授权所需工具，请检查宿主 ip、nft、setpriv、bwrap 和 curl'],
   gemini_ipv4_forwarding_unavailable: [503, '宿主 IPv4 转发未就绪，无法经绑定代理启动 Google 授权'],
@@ -106,7 +112,7 @@ function hostRequest(socketPath, operation, payload) {
         method: 'POST',
         path: `/${operation}`,
         headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-        signal: AbortSignal.timeout(operation === 'create' ? 60000 : 30000),
+        signal: AbortSignal.timeout(operation === 'create' || operation === 'redeem' ? 60000 : 30000),
       },
       async (response) => {
         try {
@@ -117,10 +123,10 @@ function hostRequest(socketPath, operation, payload) {
             if (total > 512 * 1024) throw hostError(PROTOCOL_ERROR)
             chunks.push(chunk)
           }
-          if (response.statusCode === 404) throw hostError('gemini_environment_not_found', 404)
-          if (response.statusCode === 409) throw hostError('gemini_environment_conflict', 409)
           const data = JSON.parse(Buffer.concat(chunks))
           if (Object.hasOwn(HOST_ERRORS, data?.code)) throw hostError(data.code)
+          if (response.statusCode === 404) throw hostError('gemini_environment_not_found', 404)
+          if (response.statusCode === 409) throw hostError('gemini_environment_conflict', 409)
           if (response.statusCode !== 200) throw hostError(FAILURE)
           resolve(data)
         } catch (error) {
@@ -287,6 +293,7 @@ export function createGeminiPanelHandler({
           available: true,
           payload_state: PAYLOAD_STATES.has(view.payload_state) ? view.payload_state : 'unknown',
           payload_issue: PAYLOAD_ISSUES.has(view.payload_issue) ? view.payload_issue : null,
+          release_activated: typeof view.release_activated === 'boolean' ? view.release_activated : null,
           oauth_runtime_issue: OAUTH_ISSUES.has(view.oauth_runtime_issue) ? view.oauth_runtime_issue : null,
           environments: view.environments.map((value) => {
             const environment = environmentView(value)
@@ -301,6 +308,19 @@ export function createGeminiPanelHandler({
             return environment
           }),
         })
+      }
+      if (req.method === 'POST' && pathname === `${PANEL_PATH}/payload/redeem`) {
+        const body = await readBody(req, 1024)
+        const code = typeof body?.redemption_code === 'string' ? body.redemption_code.trim() : ''
+        if (!RELEASE_CODE.test(code)) {
+          const [status, message] = HOST_ERRORS.gemini_release_code_invalid
+          return fail(status, 'gemini_release_code_invalid', message)
+        }
+        const result = await callHost('redeem', { redemption_code: code })
+        if (typeof result?.kernel_version !== 'string' || !/^[a-zA-Z0-9.-]{1,64}$/.test(result.kernel_version)) {
+          throw hostError(PROTOCOL_ERROR)
+        }
+        return ok({ kernel_version: result.kernel_version })
       }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/environments`) {
         const body = await readBody(req, 4096)
