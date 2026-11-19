@@ -35,6 +35,24 @@ test('renamed calls require one matching issued batch and unambiguous result lin
   assert.equal(book.restore('scope', ambiguous), ambiguous)
 })
 
+test('moving a cache breakpoint between turns preserves replay and the current cache placement', () => {
+  const book = createIssuedToolReplay()
+  const marker = { type: 'ephemeral', ttl: '1h' }
+  const text = { type: 'text', text: 'hello' }
+  const prior = answer([call('prior', { cache_control: 'business policy' })])
+  const issued = { ...call('issued'), caller: { type: 'direct' } }
+  book.remember('scope', [...prior, { role: 'user', content: [{ ...text, cache_control: marker }] }], [issued])
+  const body = {
+    messages: [...prior, { role: 'user', content: [text] }, ...answer([{ ...call('issued'), cache_control: marker }])],
+  }
+  const restored = book.restore('scope', body)
+  assert.deepEqual(restored.messages.at(-2).content, [{ ...issued, cache_control: marker }])
+  assert.deepEqual(restored.messages.at(-3).content, [text])
+  const different = structuredClone(body)
+  different.messages[0].content[0].input.cache_control = 'different business policy'
+  assert.equal(book.restore('scope', different), different)
+})
+
 test('later tool turns match the actual public prefix, even if earlier IDs were aliases', () => {
   const book = createIssuedToolReplay()
   book.remember('scope', prefix, [call('first')])

@@ -10,6 +10,18 @@ const unique = (ids) => ids.every((id) => typeof id === 'string' && id.length) &
 // Hash public messages in order without retaining transcript text. Object key
 // order is immaterial; plain text and its single-block representation agree.
 function appendMessage(hash, message) {
+  // Breakpoints move between turns. Ignore only the protocol block's own
+  // marker in this hash view; tool input and result data are semantic.
+  if (blocks(message).some((b) => b?.type && Object.hasOwn(b, 'cache_control'))) {
+    message = {
+      ...message,
+      content: message.content.map((b) => {
+        if (!b?.type || !Object.hasOwn(b, 'cache_control')) return b
+        const { cache_control, ...semantic } = b
+        return semantic
+      }),
+    }
+  }
   const content = message?.content
   if (
     Array.isArray(content) &&
@@ -153,6 +165,9 @@ export function createIssuedToolReplay() {
               if (!isCall(block)) return block
               const issued = batch[n++]
               if (issued.id !== block.id) aliases.set(block.id, issued.id)
+              // The snapshot owns the call, not this request's cache breakpoint.
+              if (Object.hasOwn(block, 'cache_control')) issued.cache_control = block.cache_control
+              else delete issued.cache_control
               return issued
             }),
           }

@@ -58,6 +58,8 @@ OpenAI 模型页的 Fast 开关只对已同步、已启用且目录明确声明 
 
 若客户端同步重编了 `tool_use.id` 和 `tool_result.tool_use_id`，只有历史前缀、调用顺序、工具名和参数能唯一对应时，网关才一起还原这两处 ID。截断流、歧义或无记录时不猜测。记录只在当前网关进程内有界保留；进程重启、记录被淘汰或未提供可识别的会话时，仍以客户端历史为准。
 
+历史匹配忽略消息内容块外层的 `cache_control`，因此客户端可以移动缓存断点。还原工具块时保留本轮指定的断点；`tool_use.input` 内的同名字段仍是业务参数，参与匹配。
+
 ## Responses WebSocket
 
 用相同 Bearer API key 对 `GET /v1/responses` 发起标准 WebSocket Upgrade，然后发送文本帧：
