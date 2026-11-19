@@ -223,6 +223,21 @@ export function scanContainers({ runDocker, networks = [], live = {} } = {}) {
 }
 
 /**
+ * Bridges belonging to networks that will still be there afterwards. A network that
+ * is itself residue does not count: its chain and device have to go in the same
+ * pass, or one sweep leaves exactly the half-cleanup state this module guards
+ * against and only the next scan notices.
+ */
+function survivingBridges(networks) {
+  return new Set(
+    networks
+      .filter((n) => !n.orphan)
+      .map((n) => n.bridge)
+      .filter(Boolean),
+  )
+}
+
+/**
  * The allocator cannot see iptables. `stopProxyEgress` does call `removeIptables`,
  * but a helper that dies outside that path leaves its chain and the PREROUTING row
  * that jumps to it, so this has to be read from the live ruleset.
@@ -232,7 +247,7 @@ export function scanContainers({ runDocker, networks = [], live = {} } = {}) {
  * lets a row mentioning only the chain still be judged.
  */
 export function scanIptablesChains({ runIptables, networks = [] } = {}) {
-  const expected = new Set(networks.map((n) => n.bridge).filter(Boolean))
+  const expected = survivingBridges(networks)
   const byTag = new Map()
   let ok = true
   for (const table of ['nat', 'filter']) {
@@ -280,7 +295,7 @@ export function scanIptablesChains({ runIptables, networks = [] } = {}) {
 export function scanBridges({ runIp, networks = [] } = {}) {
   const r = runIp(['-o', 'link', 'show'])
   if (!r?.ok) return { ok: false, items: [] }
-  const expected = new Set(networks.map((n) => n.bridge).filter(Boolean))
+  const expected = survivingBridges(networks)
   const items = []
   for (const line of lines(r.stdout)) {
     // `3: kegabc123: <BROADCAST,MULTICAST> mtu 1500 ...`
@@ -292,7 +307,7 @@ export function scanBridges({ runIp, networks = [] } = {}) {
       kind: 'bridge',
       name: dev,
       orphan,
-      reason: orphan ? 'no docker network claims this bridge' : 'claimed by a live network',
+      reason: orphan ? 'no surviving docker network claims this bridge' : 'claimed by a live network',
     })
   }
   return { ok: true, items }
@@ -383,4 +398,138 @@ export function residueReport(scan, { orphansOnly = true } = {}) {
       ...unavailable.map((k) => `${k}  (not readable -- cleanliness unknown for this class)`),
     ],
   }
+}
+
+/**
+ * Removal order, by dependency rather than by preference:
+ *
+ *   container  a network cannot be removed while something sits on it
+ *   iptables   a rule steers a bridge, so the rule goes before the device
+ *   network    removing it normally takes its bridge along
+ *   bridge     whatever survived a removal that did not finish
+ *   rundir     plain files, and freeing them releases the claimed port pair
+ */
+const CLEANUP_ORDER = ['container', 'iptables', 'network', 'bridge', 'rundir']
+
+/**
+ * Argument lists needed to retire one iptables chain.
+ *
+ * Rules inside the chain need no individual delete because `-F` clears them, but
+ * every rule that jumps into the chain from PREROUTING/FORWARD/INPUT has to go
+ * first -- `-X` refuses to drop a chain that is still referenced.
+ */
+function iptablesSteps(item) {
+  const steps = []
+  let declared = false
+  for (const rule of item.rules || []) {
+    const parts = String(rule).trim().split(/\s+/)
+    if (parts[0] === '-N') {
+      declared = true
+      continue
+    }
+    if (parts[0] !== '-A') continue
+    // `-A KEGxxx ...` lives inside the chain; -F takes care of it.
+    if (CHAIN_RE.test(parts[1])) continue
+    steps.push(['-t', item.table, '-D', ...parts.slice(1)])
+  }
+  const chain = item.chain || item.name
+  if ((declared || item.chain) && CHAIN_RE.test(chain)) {
+    steps.push(['-t', item.table, '-F', chain])
+    steps.push(['-t', item.table, '-X', chain])
+  }
+  return steps
+}
+
+/**
+ * What it would take to clear a scan, in dependency order. Pure: it plans, it does
+ * not act, so the same plan backs both the standalone sweep and the dry run.
+ *
+ * Scope is the egress layer only. A unified reprovision still has to detach and
+ * stop the VM containers itself before handing their networks here, since those
+ * are not egress resources and never appear in a scan.
+ */
+export function cleanupPlan(scan, { orphansOnly = true } = {}) {
+  const items = residueItems(scan, { orphansOnly })
+  const plan = []
+  for (const kind of CLEANUP_ORDER) {
+    for (const item of items.filter((i) => i.kind === kind)) {
+      let steps = []
+      if (kind === 'container') steps = [['rm', '-f', item.name]]
+      else if (kind === 'iptables') steps = iptablesSteps(item)
+      else if (kind === 'network') steps = [['network', 'rm', item.name]]
+      else if (kind === 'bridge') steps = [['link', 'delete', item.name]]
+      else if (kind === 'rundir') steps = [[item.dir]]
+      if (!steps.length) continue
+      plan.push({ kind, name: item.name, item, steps })
+    }
+  }
+  return plan
+}
+
+/** One-line preview per planned action, for a dry run or a confirmation prompt. */
+export function cleanupPlanLines(plan) {
+  const render = (entry) =>
+    entry.steps.map((s) => {
+      if (entry.kind === 'container' || entry.kind === 'network') return `docker ${s.join(' ')}`
+      if (entry.kind === 'iptables') return `iptables ${s.join(' ')}`
+      if (entry.kind === 'bridge') return `ip ${s.join(' ')}`
+      return `rm -rf ${s[0]}`
+    })
+  return plan.flatMap((entry) => render(entry).map((cmd) => `${entry.kind} ${entry.name}  ${cmd}`))
+}
+
+/**
+ * Run a plan. `dryRun` reports exactly what would happen and touches nothing, which
+ * is what the gate before a reprovision needs.
+ *
+ * Failures are collected and reported rather than thrown, so one stubborn network
+ * does not strand the rest half-removed -- but they are never swallowed: a caller
+ * that sees a non-empty `failed` must not treat the host as clean.
+ */
+export function executeCleanup(plan, { runDocker, runIptables, runIp, removeDir, dryRun = true } = {}) {
+  const done = []
+  const failed = []
+  const rmdir =
+    removeDir ||
+    ((dir) => {
+      fs.rmSync(dir, { recursive: true, force: true })
+    })
+
+  for (const entry of plan) {
+    if (dryRun) {
+      done.push({ kind: entry.kind, name: entry.name, dryRun: true })
+      continue
+    }
+    const errors = []
+    for (const step of entry.steps) {
+      try {
+        if (entry.kind === 'rundir') {
+          rmdir(step[0])
+          continue
+        }
+        const run = entry.kind === 'iptables' ? runIptables : entry.kind === 'bridge' ? runIp : runDocker
+        if (typeof run !== 'function') {
+          errors.push(`no executor for ${entry.kind}`)
+          continue
+        }
+        const r = run(step)
+        // Already absent is the desired state, not a failure. Removing a network
+        // takes its bridge along, so the later `ip link delete` normally finds
+        // nothing -- that is success, phrased by the tool as an error.
+        const benign = /No chain\/target\/match|does not exist|No such|not found|Cannot find device/i
+        if (!r?.ok && !benign.test(String(r?.stderr || ''))) {
+          errors.push(
+            String(r?.stderr || `${entry.kind} step failed`)
+              .trim()
+              .slice(0, 200),
+          )
+        }
+      } catch (e) {
+        errors.push(String(e?.message || e).slice(0, 200))
+      }
+    }
+    if (errors.length) failed.push({ kind: entry.kind, name: entry.name, errors })
+    else done.push({ kind: entry.kind, name: entry.name })
+  }
+  return { dryRun, done, failed }
 }

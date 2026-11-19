@@ -8,6 +8,9 @@ import {
   isProtectedNetwork,
   residueItems,
   residueReport,
+  cleanupPlan,
+  cleanupPlanLines,
+  executeCleanup,
   scanBridges,
   scanContainers,
   scanIptablesChains,
@@ -319,7 +322,33 @@ test('a keg device outliving its network is residue', () => {
     ['kegzombie12'],
   )
   assert.equal(found[0].orphan, true)
-  assert.match(found[0].reason, /no docker network claims this bridge/)
+  assert.match(found[0].reason, /no surviving docker network claims this bridge/)
+})
+
+test('a chain and bridge belonging to an orphan network are swept in the same pass', (t) => {
+  // Judging against "any network has this bridge" would spare them, and deleting
+  // the orphan network would then leave exactly the half-cleanup state. One scan
+  // has to see all three.
+  const root = tmpRoot(t)
+  const scan = scanResidue({
+    projectRoot: root,
+    runDocker: fakeDocker({
+      nets: { 'kin-eg-px-dead': { subnet: '172.23.0.0/16', bridge: 'kegdead12345', containers: 0 } },
+    }),
+    runIptables: fakeIptables({ nat: ['-N KEGdead12345', '-A PREROUTING -i kegdead12345 -j KEGdead12345'] }),
+    runIp: fakeIp(['kegdead12345']),
+    live: {},
+  })
+  const report = residueReport(scan)
+
+  assert.equal(report.counts.network, 1)
+  assert.equal(report.counts.iptables, 1, 'the chain of a doomed network is residue too')
+  assert.equal(report.counts.bridge, 1, 'so is its device')
+  // And a single sweep covers all three.
+  assert.deepEqual(
+    cleanupPlan(scan).map((p) => p.kind),
+    ['iptables', 'network', 'bridge'],
+  )
 })
 
 test('a keg device claimed by a live network is kept', () => {
@@ -450,4 +479,188 @@ test('residueItems can include in-use resources, which a unified rebuild needs',
   )
   // Protected stays out even when everything is being torn down.
   assert.ok(!all.some((i) => i.name === 'kin-eg-px-local'))
+})
+
+// ---------- cleanup plan ----------
+
+test('a cleanup plan is ordered by dependency, not by class', (t) => {
+  const root = tmpRoot(t)
+  writeRunDir(root, 'px-test-b', { proxy_id: 'px-test-b', listen_tcp: '1.2.3.4:20218', listen_dns: '1.2.3.4:20219' })
+  const scan = scanResidue({
+    projectRoot: root,
+    runDocker: fakeDocker({
+      nets: { 'kin-eg-px-dead': { subnet: '172.23.0.0/16', bridge: 'kegdead12345', containers: 0 } },
+      ps: [{ name: 'kin-cp-egress-px-dead', egress: '1', proxy: 'px-dead' }],
+    }),
+    runIptables: fakeIptables({ nat: ['-N KEGdead12345', '-A PREROUTING -i kegdead12345 -j KEGdead12345'] }),
+    runIp: fakeIp(['kegdead12345']),
+    live: {},
+  })
+  const plan = cleanupPlan(scan)
+
+  // A network cannot go while a container sits on it; a rule steers a bridge.
+  assert.deepEqual(
+    plan.map((p) => p.kind),
+    ['container', 'iptables', 'network', 'bridge', 'rundir'],
+  )
+})
+
+test('retiring a chain drops the jump rules before flushing and deleting it', () => {
+  const scan = {
+    iptables: [
+      {
+        kind: 'iptables',
+        name: 'KEGdead12345',
+        table: 'nat',
+        chain: 'KEGdead12345',
+        bridge: 'kegdead12345',
+        orphan: true,
+        rules: [
+          '-N KEGdead12345',
+          '-A PREROUTING -i kegdead12345 -j KEGdead12345',
+          // Inside the chain: -F clears it, so no individual delete.
+          '-A KEGdead12345 -p tcp -j REDIRECT --to-ports 20334',
+        ],
+      },
+    ],
+  }
+  const steps = cleanupPlan(scan)[0].steps
+
+  assert.deepEqual(steps, [
+    ['-t', 'nat', '-D', 'PREROUTING', '-i', 'kegdead12345', '-j', 'KEGdead12345'],
+    ['-t', 'nat', '-F', 'KEGdead12345'],
+    ['-t', 'nat', '-X', 'KEGdead12345'],
+  ])
+  // -X refuses a chain that is still referenced, so the jump must go first.
+  assert.ok(steps.findIndex((s) => s.includes('-D')) < steps.findIndex((s) => s.includes('-X')))
+})
+
+test('a dry run touches nothing and still reports every action', (t) => {
+  const root = tmpRoot(t)
+  const dir = writeRunDir(root, 'px-test-b', { proxy_id: 'px-test-b', listen_tcp: '1.2.3.4:20218' })
+  const calls = []
+  const spy = (args) => {
+    calls.push(args)
+    return { ok: true, stdout: '' }
+  }
+  const scan = scanResidue({
+    projectRoot: root,
+    runDocker: fakeDocker({
+      nets: { 'kin-eg-px-dead': { subnet: '172.23.0.0/16', bridge: 'kegdead1', containers: 0 } },
+    }),
+    runIp: fakeIp(['kegdead1']),
+    live: {},
+  })
+  const plan = cleanupPlan(scan)
+  const r = executeCleanup(plan, { runDocker: spy, runIptables: spy, runIp: spy, dryRun: true })
+
+  assert.equal(r.dryRun, true)
+  assert.equal(r.done.length, plan.length)
+  assert.deepEqual(r.failed, [])
+  assert.ok(r.done.every((d) => d.dryRun === true))
+  assert.deepEqual(calls, [], 'a dry run must not invoke any executor')
+  assert.equal(fs.existsSync(dir), true, 'a dry run must not delete the directory')
+})
+
+test('executing a plan issues the real commands and removes the directory', (t) => {
+  const root = tmpRoot(t)
+  const dir = writeRunDir(root, 'px-test-b', { proxy_id: 'px-test-b', listen_tcp: '1.2.3.4:20218' })
+  const docker = []
+  const ip = []
+  const scan = scanResidue({
+    projectRoot: root,
+    runDocker: fakeDocker({
+      nets: { 'kin-eg-px-dead': { subnet: '172.23.0.0/16', bridge: 'kegdead1', containers: 0 } },
+      ps: [{ name: 'kin-egress-px-ancient' }],
+    }),
+    runIp: fakeIp(['kegzombie1']),
+    live: {},
+  })
+  const r = executeCleanup(cleanupPlan(scan), {
+    runDocker: (a) => (docker.push(a), { ok: true }),
+    runIp: (a) => (ip.push(a), { ok: true }),
+    dryRun: false,
+  })
+
+  assert.deepEqual(r.failed, [])
+  assert.ok(docker.some((a) => a.join(' ') === 'rm -f kin-egress-px-ancient'))
+  assert.ok(docker.some((a) => a.join(' ') === 'network rm kin-eg-px-dead'))
+  assert.deepEqual(ip, [['link', 'delete', 'kegzombie1']])
+  assert.equal(fs.existsSync(dir), false, 'the run directory should be gone')
+})
+
+test('a resource that is already gone counts as done, a real failure does not', () => {
+  const scan = {
+    networks: [
+      { kind: 'network', name: 'kin-eg-px-gone', subnet: '172.23.0.0/16', bridge: 'keggone', orphan: true },
+      { kind: 'network', name: 'kin-eg-px-stuck', subnet: '172.24.0.0/16', bridge: 'kegstuck', orphan: true },
+    ],
+  }
+  const r = executeCleanup(cleanupPlan(scan), {
+    runDocker: (args) =>
+      args[2] === 'kin-eg-px-gone'
+        ? { ok: false, stderr: 'Error: No such network: kin-eg-px-gone' }
+        : { ok: false, stderr: 'Error response from daemon: network has active endpoints' },
+    dryRun: false,
+  })
+
+  // Already absent is the desired state.
+  assert.deepEqual(
+    r.done.map((d) => d.name),
+    ['kin-eg-px-gone'],
+  )
+  // A network still holding endpoints is a real failure and must surface.
+  assert.deepEqual(
+    r.failed.map((f) => f.name),
+    ['kin-eg-px-stuck'],
+  )
+  assert.match(r.failed[0].errors.join(' '), /active endpoints/)
+})
+
+test('a missing executor is a failure, never a silent skip', () => {
+  const scan = { networks: [{ kind: 'network', name: 'kin-eg-px-dead', bridge: 'kegdead', orphan: true }] }
+  const r = executeCleanup(cleanupPlan(scan), { dryRun: false })
+
+  assert.deepEqual(r.done, [])
+  assert.match(r.failed[0].errors.join(' '), /no executor for network/)
+})
+
+test('a cleanup plan skips the protected local bridge and keeps in-use resources', (t) => {
+  const root = tmpRoot(t)
+  const scan = scanResidue({
+    projectRoot: root,
+    runDocker: fakeDocker({
+      nets: {
+        'kin-eg-px-local': { subnet: '192.168.144.0/20', bridge: 'keglocal1', containers: 1 },
+        'kin-eg-px-busy': { subnet: '172.24.0.0/16', bridge: 'kegbusy1', containers: 2 },
+      },
+    }),
+    live: {},
+  })
+
+  assert.deepEqual(cleanupPlan(scan, { orphansOnly: true }), [])
+  // A unified reprovision takes the in-use one too, but never the shared bridge.
+  const all = cleanupPlan(scan, { orphansOnly: false })
+  assert.deepEqual(
+    all.map((p) => p.name),
+    ['kin-eg-px-busy'],
+  )
+})
+
+test('plan lines render the actual commands for a confirmation prompt', (t) => {
+  const root = tmpRoot(t)
+  writeRunDir(root, 'px-test-b', { proxy_id: 'px-test-b' })
+  const scan = scanResidue({
+    projectRoot: root,
+    runDocker: fakeDocker({
+      nets: { 'kin-eg-px-dead': { subnet: '172.23.0.0/16', bridge: 'kegdead1', containers: 0 } },
+    }),
+    runIp: fakeIp(['kegdead1']),
+    live: {},
+  })
+  const text = cleanupPlanLines(cleanupPlan(scan)).join('\n')
+
+  assert.match(text, /network kin-eg-px-dead\s+docker network rm kin-eg-px-dead/)
+  assert.match(text, /bridge kegdead1\s+ip link delete kegdead1/)
+  assert.match(text, /rundir px-test-b\s+rm -rf .*px-test-b/)
 })
