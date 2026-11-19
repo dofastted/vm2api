@@ -390,3 +390,109 @@ func TestForwardTCPRoutesConcurrentlyAcrossSources(t *testing.T) {
 		t.Errorf("configured ProxyURL took %d conns under load", hitsDefault.Load())
 	}
 }
+
+// A shared helper is configured with routes and no proxy_url at all: there is
+// no default exit to serve a source the table does not cover, not even by
+// mistake.
+func sharedOnlyHelper(t *testing.T, hitsA, hitsB *atomic.Int32) *Server {
+	t.Helper()
+	srv, err := New(Config{
+		ListenTCP: "127.0.0.1:0",
+		Routes: []Route{
+			{VMIP: "100.64.0.10", ProxyURL: countingSOCKS(t, hitsA)},
+			{VMIP: "100.64.0.11", ProxyURL: countingSOCKS(t, hitsB)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("shared helper without proxy_url rejected: %v", err)
+	}
+	return srv
+}
+
+func TestSharedHelperNeedsNoDefaultExit(t *testing.T) {
+	echo := routeEcho(t)
+	var hitsA, hitsB atomic.Int32
+	srv := sharedOnlyHelper(t, &hitsA, &hitsB)
+	if srv.rt().def != nil {
+		t.Fatal("a helper configured without proxy_url still built a default exit")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client, served := clientFrom(t, "100.64.0.11:51000")
+	go func() { _ = srv.ForwardTCP(ctx, served, echo.Addr().String()) }()
+	routeRoundTrip(t, client, "shared-only")
+	if hitsB.Load() != 1 || hitsA.Load() != 0 {
+		t.Fatalf("hits a=%d b=%d, want 0 and 1", hitsA.Load(), hitsB.Load())
+	}
+}
+
+func TestSharedHelperWithoutADefaultExitStillRefusesCleanly(t *testing.T) {
+	echo := routeEcho(t)
+	var hitsA, hitsB atomic.Int32
+	srv := sharedOnlyHelper(t, &hitsA, &hitsB)
+	// The refusal path must not depend on a default exit being present.
+	for _, src := range []string{"100.64.0.99:51000", ""} {
+		_, served := clientFrom(t, src)
+		err := refusal(t, srv, served, echo.Addr().String())
+		var se *spliceError
+		if !errors.As(err, &se) || se.class != classNoRoute {
+			t.Fatalf("source %q: got %v, want a %s spliceError", src, err, classNoRoute)
+		}
+	}
+	if hitsA.Load() != 0 || hitsB.Load() != 0 {
+		t.Fatalf("refused conns reached an upstream: a=%d b=%d", hitsA.Load(), hitsB.Load())
+	}
+}
+
+func TestNewRejectsAHelperThatCanServeNothing(t *testing.T) {
+	// No routes and no proxy_url is a helper with nowhere to send anything; it
+	// has to fail at load rather than accept connections it cannot serve.
+	for _, cfg := range []Config{
+		{ListenTCP: "127.0.0.1:0"},
+		{ListenTCP: "127.0.0.1:0", ProxyURL: "   "},
+	} {
+		if _, err := New(cfg); err == nil {
+			t.Fatalf("accepted a helper with neither routes nor proxy_url: %+v", cfg)
+		} else if !strings.Contains(err.Error(), "proxy_url is required") {
+			t.Fatalf("error %q does not explain what is missing", err)
+		}
+	}
+}
+
+func TestReloadSwitchesBetweenSharedAndPerVmShapes(t *testing.T) {
+	echo := routeEcho(t)
+	var hitsSingle, hitsA atomic.Int32
+	single := countingSOCKS(t, &hitsSingle)
+	routeA := countingSOCKS(t, &hitsA)
+	srv, err := New(Config{ListenTCP: "127.0.0.1:0", ProxyURL: single})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// per-VM -> shared: the default exit is dropped along with proxy_url.
+	if err := srv.Reload(Config{ListenTCP: "127.0.0.1:0", Routes: []Route{{VMIP: "100.64.0.10", ProxyURL: routeA}}}); err != nil {
+		t.Fatal(err)
+	}
+	if srv.rt().def != nil {
+		t.Fatal("reload to shared kept a default exit")
+	}
+	client, served := clientFrom(t, "100.64.0.10:51000")
+	go func() { _ = srv.ForwardTCP(ctx, served, echo.Addr().String()) }()
+	routeRoundTrip(t, client, "to-shared")
+
+	// shared -> per-VM is the rollback: proxy_url returns and serves everyone.
+	if err := srv.Reload(Config{ListenTCP: "127.0.0.1:0", ProxyURL: single}); err != nil {
+		t.Fatal(err)
+	}
+	if srv.rt().def == nil {
+		t.Fatal("rollback to per-VM left no default exit")
+	}
+	back, servedBack := clientFrom(t, "100.64.0.99:51000")
+	go func() { _ = srv.ForwardTCP(ctx, servedBack, echo.Addr().String()) }()
+	routeRoundTrip(t, back, "rolled-back")
+	if hitsA.Load() != 1 || hitsSingle.Load() != 1 {
+		t.Fatalf("hits route=%d single=%d, want 1 each", hitsA.Load(), hitsSingle.Load())
+	}
+}

@@ -142,8 +142,12 @@ type exit struct {
 // lifetime.
 type runtime struct {
 	cfg Config
+	// upstreams is helper-wide policy: which resolvers to try, in order. Each
+	// exit tracks for itself which one it settled on.
+	upstreams []string
 	// def serves every connection and query while routes is empty, which is how
-	// a per-VM helper works.
+	// a per-VM helper works. It is nil on a shared helper, which has no default
+	// exit to fall back to — see exitFor.
 	def *exit
 	// routes is nil for a single-exit helper. When it is set, the source address
 	// is the only thing that picks an exit: see exitFor.
@@ -176,10 +180,11 @@ func sourceAddrOf(c net.Conn) (netip.Addr, error) {
 //
 // Without routes the helper serves one exit and everything takes it, which is
 // how a per-VM helper has always worked. With routes the source address is the
-// sole selector and an unknown one is refused: falling back to the default exit
+// sole selector and an unknown one is refused: falling back to a default exit
 // would send an unauthorised VM's traffic out through someone else's upstream,
-// which is the whole failure this design exists to prevent. There is
-// deliberately no branch that can reach rt.def once routes are configured.
+// which is the whole failure this design exists to prevent. A shared helper has
+// no default exit to fall back to even by mistake — rt.def is nil there, and
+// newRuntime refuses a config that would leave both empty.
 func (rt *runtime) exitFor(src netip.Addr) (*exit, error) {
 	if len(rt.routes) == 0 {
 		return rt.def, nil
@@ -234,7 +239,7 @@ func (s *Server) Reload(cfg Config) error {
 	// An exit that did not change keeps the resolver it had settled on, so a
 	// reload does not make every exit re-probe its upstreams.
 	if next.cfg.DNSUpstream == old.cfg.DNSUpstream {
-		if next.cfg.ProxyURL == old.cfg.ProxyURL {
+		if next.cfg.ProxyURL == old.cfg.ProxyURL && next.def != nil && old.def != nil {
 			next.def.preferred.Store(old.def.preferred.Load())
 		}
 		oldURL := make(map[netip.Addr]string, len(old.cfg.Routes))
@@ -257,13 +262,15 @@ func (s *Server) Reload(cfg Config) error {
 	// Idle DoH connections still go through the old proxy; in-flight ones finish.
 	old.closeIdle()
 	log.Printf("kin-egress reloaded proxy_id=%s dns_upstreams=%s domain_forward=%t routes=%d",
-		next.cfg.ProxyID, strings.Join(next.def.upstreams, ","), next.cfg.DomainForward, len(next.routes))
+		next.cfg.ProxyID, strings.Join(next.upstreams, ","), next.cfg.DomainForward, len(next.routes))
 	return nil
 }
 
 // closeIdle drops idle DoH connections on every exit this runtime owned.
 func (rt *runtime) closeIdle() {
-	rt.def.http.CloseIdleConnections()
+	if rt.def != nil {
+		rt.def.http.CloseIdleConnections()
+	}
 	for _, e := range rt.routes {
 		e.http.CloseIdleConnections()
 	}
@@ -344,15 +351,25 @@ func newRuntime(cfg Config) (*runtime, error) {
 	if len(cfg.Routes) > 0 && cfg.DomainForward {
 		return nil, fmt.Errorf("domain_forward cannot be combined with routes: the observed domain table is shared across all routes")
 	}
-	def, err := newExit(cfg.ProxyURL, upstreams)
-	if err != nil {
-		return nil, err
+	// A shared helper has no default exit: every VM leaves through its own, and
+	// proxy_url is left empty rather than holding a placeholder that looks
+	// usable. Without routes there is nothing to route on, so one is required.
+	if len(cfg.Routes) == 0 && strings.TrimSpace(cfg.ProxyURL) == "" {
+		return nil, fmt.Errorf("proxy_url is required when no routes are configured")
+	}
+	var def *exit
+	if strings.TrimSpace(cfg.ProxyURL) != "" {
+		var err error
+		def, err = newExit(cfg.ProxyURL, upstreams)
+		if err != nil {
+			return nil, err
+		}
 	}
 	routes, err := buildRoutes(cfg.Routes, upstreams)
 	if err != nil {
 		return nil, err
 	}
-	return &runtime{cfg: cfg, def: def, routes: routes}, nil
+	return &runtime{cfg: cfg, upstreams: upstreams, def: def, routes: routes}, nil
 }
 
 func (s *Server) Serve(ctx context.Context) error {
@@ -380,7 +397,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		go s.serveDNSTCP(ctx, dnsTCP)
 	}
 
-	log.Printf("kin-egress ready proxy_id=%s tcp=%s dns=%s dns_upstreams=%s routes=%d", rt.cfg.ProxyID, rt.cfg.ListenTCP, rt.cfg.ListenDNS, strings.Join(rt.def.upstreams, ","), len(rt.routes))
+	log.Printf("kin-egress ready proxy_id=%s tcp=%s dns=%s dns_upstreams=%s routes=%d", rt.cfg.ProxyID, rt.cfg.ListenTCP, rt.cfg.ListenDNS, strings.Join(rt.upstreams, ","), len(rt.routes))
 	go func() {
 		<-ctx.Done()
 		_ = tcpLn.Close()
