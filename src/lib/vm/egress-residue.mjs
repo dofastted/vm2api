@@ -45,7 +45,9 @@ const FIELD = '\u0001'
 
 const NETWORK_FORMAT = [
   '{{.Name}}',
-  '{{range .IPAM.Config}}{{.Subnet}}{{end}}',
+  // Space-separated: a dual-stack network has an IPv6 entry too, and concatenating
+  // them yields `172.90.27.0/24fd21:...::/64`, which parses as nothing.
+  '{{range .IPAM.Config}}{{.Subnet}}={{.Gateway}} {{end}}',
   '{{index .Options "com.docker.network.bridge.name"}}',
   '{{len .Containers}}',
   '{{index .Labels "kin.egress.vm"}}',
@@ -65,6 +67,23 @@ function lines(stdout) {
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean)
+}
+
+/**
+ * First IPv4 `subnet=gateway` pair out of a dual-stack IPAM list. Docker templates
+ * cannot filter by family, so all entries are emitted and the IPv6 ones dropped
+ * here -- a concatenated `172.90.27.0/24fd21:...::/64` parses as nothing, which
+ * would quietly keep a foreign range out of the conflict set.
+ */
+export function pickIpv4Config(blob) {
+  for (const pair of String(blob || '').split(/\s+/)) {
+    if (!pair) continue
+    const [subnet, gateway] = pair.split('=')
+    if (/^\d{1,3}(?:\.\d{1,3}){3}\/\d{1,2}$/.test(String(subnet || ''))) {
+      return { subnet, gateway: gateway || '' }
+    }
+  }
+  return { subnet: '', gateway: '' }
 }
 
 function liveSets({ proxyIds = [], vmIds = [] } = {}) {
@@ -105,8 +124,9 @@ export function scanNetworks({ runDocker, live = {} } = {}) {
       continue
     }
     for (const line of lines(r.stdout)) {
-      const [name, subnet, bridge, count, labelVm, labelProxy] = line.split(FIELD)
+      const [name, ipam, bridge, count, labelVm, labelProxy] = line.split(FIELD)
       if (!name) continue
+      const { subnet } = pickIpv4Config(ipam)
       const containers = Number(count) || 0
       const key = proxyKeyOfNetwork(name)
       const protected_ = isProtectedNetwork(name)
@@ -357,7 +377,11 @@ export function residueItems(scan, { orphansOnly = true } = {}) {
   for (const kind of RESIDUE_KINDS) {
     for (const item of scan?.[KIND_FIELD[kind]] || []) {
       if (orphansOnly && !item.orphan) continue
-      if (item.protected) continue
+      // The shared local bridge is never *residue*, so a standalone sweep leaves it
+      // alone. A unified reprovision is a different job: it moves every exit onto
+      // the current pool, and sparing this one would leave a range of the old pool
+      // held for good, which is the thing the reprovision exists to undo.
+      if (orphansOnly && item.protected) continue
       out.push(item)
     }
   }
