@@ -15,8 +15,16 @@ import { runSlotProcess } from '../transport/slot-oauth.mjs'
 import { slotExecArgv, slotExecContainer } from './slot-exec.mjs'
 import { inspectContainerOrNull } from '../cluster/docker-remote.mjs'
 
+/**
+ * Printed before anything can fail. The docker CLI exits 1 for its own transport
+ * errors (bridge socket gone, connection reset) — indistinguishable from the
+ * script's `exit 1` — but it only relays stdout once the exec really ran.
+ */
+export const RETIRE_RAN_MARKER = 'kin-retire:ran'
+
 export const RETIRE_LEGACY_TELEMETRY = `
 set -eu
+printf '${RETIRE_RAN_MARKER}\\n'
 legacy_pids() { ps -eo pid,args | awk '$2 ~ /(^|\\/)kin-worker$/ && $3 == "telemetry" {print $1}'; }
 pids=$(legacy_pids)
 for pid in $pids; do
@@ -32,6 +40,11 @@ while [ -n "$(legacy_pids)" ]; do
 done
 printf '{"ok":true}\\n'
 `
+
+/** A failed retire is the script's own verdict only when it exited numerically after printing the marker. */
+export function retireScriptVerdict(result) {
+  return typeof result?.code === 'number' && String(result?.stdout || '').includes(RETIRE_RAN_MARKER)
+}
 
 export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect = inspectContainerOrNull } = {}) {
   if (!vm?.id) return { ok: false, code: 'invalid_vm' }
@@ -51,18 +64,20 @@ export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect 
     })
   const result = await attempt()
   if (result.code === 0 && !result.timed_out) return { ok: true, running: true }
-  // A numeric exit code means the script really ran and the sender survived;
-  // anything else (null code, timeout) is the slot exec never completing —
-  // node-link flap, not a dead sender. Retry once, then report unverified
-  // instead of failing the publication on transport jitter.
-  if (typeof result.code === 'number') {
+  // Only a numeric exit after the marker means the script really ran and the
+  // sender survived; anything else (docker CLI transport error, null code,
+  // timeout) is the slot exec never completing — node-link flap, not a dead
+  // sender. Retry once, then report unverified instead of failing the
+  // publication on transport jitter.
+  if (retireScriptVerdict(result)) {
     return { ok: false, code: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
   }
   const retry = await attempt()
   if (retry.code === 0 && !retry.timed_out) return { ok: true, running: true }
-  if (typeof retry.code === 'number') {
+  if (retireScriptVerdict(retry)) {
     return { ok: false, code: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
   }
+  console.warn(`[slot-process] ${vm.id} legacy telemetry retire unverified (slot exec unavailable)`)
   return {
     ok: true,
     running: true,

@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   RETIRE_LEGACY_TELEMETRY,
+  RETIRE_RAN_MARKER,
   readSlotProcessStatus,
   retireLegacyTelemetry,
 } from '../../src/lib/vm/slot-process-status.mjs'
@@ -83,10 +84,23 @@ test('retire legacy telemetry fails only on a deterministic script verdict', asy
   }
   const deterministic = await retireLegacyTelemetry({
     ...base,
-    run: async () => ({ code: 1, timed_out: false }),
+    run: async () => ({ code: 1, timed_out: false, stdout: `${RETIRE_RAN_MARKER}\n` }),
   })
   assert.equal(deterministic.ok, false)
   assert.equal(deterministic.code, 'legacy_telemetry_stop_failed')
+
+  // docker CLI's own transport error: exit 1 but the script never printed its marker.
+  let cliCalls = 0
+  const cliTransport = await retireLegacyTelemetry({
+    ...base,
+    run: async () => {
+      cliCalls += 1
+      return { code: 1, timed_out: false, stdout: '', stderr: 'error during connect: EOF' }
+    },
+  })
+  assert.equal(cliCalls, 2)
+  assert.equal(cliTransport.ok, true)
+  assert.equal(cliTransport.unverified, true)
 
   const recovered = await retireLegacyTelemetry({
     ...base,
