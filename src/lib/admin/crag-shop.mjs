@@ -749,8 +749,7 @@ export function createCragShopHandler({
             .run(nowSeconds(), owner, row.order_id),
         )
         const current = findOrder(db, owner, orderId)
-        if (!isClosed(current))
-          throw failure(409, 'shop_order_cannot_cancel', 'This order can no longer be cancelled')
+        if (!isClosed(current)) throw failure(409, 'shop_order_cannot_cancel', 'This order can no longer be cancelled')
         return ok(view(current))
       }
       if (isClosed(row)) {
