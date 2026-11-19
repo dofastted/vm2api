@@ -215,5 +215,21 @@ with patch.dict(probe.__globals__, {
 
 with patch.dict(probe.__globals__, {"get_json": lambda *_: (401, {})}):
     assert module["probe_api_key"](proxy, "fixture")["state"] == "reauth_required"
+
+def model_reply(proxy_url, url, header, body, *, timeout):
+    assert proxy_url == proxy
+    assert url == 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:generateContent'
+    return 200, {"candidates": [{"content": {"parts": [
+        {"text": "hidden", "thought": True}, {"text": "pong"},
+    ]}, "finishReason": "STOP"}], "usageMetadata": {
+        "promptTokenCount": 8, "cachedContentTokenCount": 3, "candidatesTokenCount": 1,
+    }}
+
+with patch.dict(probe.__globals__, {"get_json": model_reply}):
+    answer = module["test_api_key"](proxy, "fixture", "gemini-3.1-pro", "ping")
+    assert answer == {"status": 200, "text": "pong", "stop_reason": "STOP", "usage": {
+        "input_tokens": 5, "cache_read_input_tokens": 3, "output_tokens": 1,
+    }}
+print("Gemini diagnostic: visible reply and disjoint upstream usage passed.")
 print("Gemini account reads: OAuth and API key fixtures, quota zero, credential redaction and failure status passed.")
 PY

@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Progress } from '@/components/ui/progress'
+import { GeminiTestChat } from './gemini-test-chat'
 
 const ROOT = '/api/panel/gemini'
 const QUERY_KEY = ['panel', 'gemini-environments'] as const
@@ -671,6 +672,13 @@ export function GeminiEnvironments({
               </Button>
             )}
           </div>
+          {!isImport ? (
+            <GeminiTestChat
+              key={environment.id}
+              environment={environment}
+              payloadReady={payloadReady}
+            />
+          ) : null}
           {challenge?.id === environment.id &&
           environment.auth_state === 'authorizing' ? (
             <form

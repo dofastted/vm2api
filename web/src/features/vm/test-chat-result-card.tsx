@@ -43,18 +43,21 @@ export function TestChatResultCard({
 }: {
   result: TestChatResult | null
   running: boolean
-  vm: Vm
+  vm?: Vm
 }) {
   const [recoveryOpen, setRecoveryOpen] = useState(false)
   const status = result?.status
   // 仅上游 5xx 才自动诊断；缺 status 的网络错不请求，避免误报槽位故障。
   const shouldDiagnose =
+    !!vm &&
     !running &&
     !!result &&
     !result.ok &&
     typeof status === 'number' &&
     status >= 500
-  const diagnose = useQuery(vmDiagnoseQueryOptions(vm.id, shouldDiagnose))
+  const diagnose = useQuery(
+    vmDiagnoseQueryOptions(vm?.id ?? '', shouldDiagnose)
+  )
 
   if (running) {
     return (
@@ -64,7 +67,7 @@ export function TestChatResultCard({
         </CardHeader>
         <CardContent className='pt-0'>
           <p className='text-sm text-muted-foreground'>
-            测试中… 正在走 loopback 发一条真实对话，耗时取决于上游响应。
+            测试中… 正在发送一条真实对话，耗时取决于上游响应。
           </p>
         </CardContent>
       </Card>
@@ -199,14 +202,16 @@ export function TestChatResultCard({
             {causeLine ? (
               <p className='text-xs text-muted-foreground'>{causeLine}</p>
             ) : null}
-            <Button
-              size='sm'
-              variant='outline'
-              onClick={() => setRecoveryOpen(true)}
-            >
-              <LifeBuoy />
-              恢复服务
-            </Button>
+            {vm ? (
+              <Button
+                size='sm'
+                variant='outline'
+                onClick={() => setRecoveryOpen(true)}
+              >
+                <LifeBuoy />
+                恢复服务
+              </Button>
+            ) : null}
           </div>
         ) : null}
 
@@ -244,11 +249,13 @@ export function TestChatResultCard({
           )}
         </div>
       </CardContent>
-      <VmRecoveryDialog
-        vm={vm}
-        open={recoveryOpen}
-        onOpenChange={setRecoveryOpen}
-      />
+      {vm ? (
+        <VmRecoveryDialog
+          vm={vm}
+          open={recoveryOpen}
+          onOpenChange={setRecoveryOpen}
+        />
+      ) : null}
     </Card>
   )
 }

@@ -61,7 +61,7 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def read_account(uid, proxy_url, method, api_key=None, profile=None):
+def read_account(uid, proxy_url, method, api_key=None, profile=None, **parameters):
     try:
         result = subprocess.run(
             [
@@ -81,9 +81,11 @@ def read_account(uid, proxy_url, method, api_key=None, profile=None):
                 method,
                 *([str(profile)] if profile is not None else []),
             ],
-            input=json.dumps({"proxy_url": proxy_url, "api_key": api_key}).encode(),
+            input=json.dumps(
+                {"proxy_url": proxy_url, "api_key": api_key, **parameters}
+            ).encode(),
             check=True,
-            timeout=17,
+            timeout=23 if method == "test_chat" else 17,
             capture_output=True,
             env=SYSTEM_ENV,
         )
@@ -862,6 +864,32 @@ class Host:
             raise Failure(409)
         proxy_url = body.get("proxy_url")
         proxy_config(proxy_url)
+        if operation == "test-chat":
+            if env["auth_state"] != "authorized":
+                raise Failure(409, "gemini_test_auth_required")
+            if env.get("auth_method") != "api_key":
+                raise Failure(503, "gemini_test_oauth_unsupported")
+            model, prompt = body.get("model"), body.get("prompt")
+            if (
+                not isinstance(model, str)
+                or not model.startswith("gemini-")
+                or model not in env.get("account", {}).get("models", [])
+                or not isinstance(prompt, str)
+                or not prompt.strip()
+                or len(prompt.encode()) > 4096
+            ):
+                raise Failure(400, "gemini_test_invalid_input")
+            self.ensure_payload()
+            credential = self.directory / identifier / "credential.json"
+            api_key = json.loads(credential.read_bytes())["api_key"]
+            return read_account(
+                self.uid_base + env["slot"],
+                proxy_url,
+                "test_chat",
+                api_key=api_key,
+                model=model,
+                prompt=prompt,
+            )
         if operation == "refresh":
             if env["auth_state"] not in ("authorized", "reauth_required") or (
                 env.get("auth_method") != "api_key" and not env.get("profile")
@@ -916,10 +944,10 @@ class ControlHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            if length < 1 or length > 8192:
-                raise Failure(400)
             operation = self.path[1:] if self.path.startswith("/") else self.path
+            length = int(self.headers.get("Content-Length", 0))
+            if length < 1 or length > (32768 if operation == "test-chat" else 8192):
+                raise Failure(400)
             if operation not in {
                 "list",
                 "redeem",
@@ -929,6 +957,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "complete",
                 "refresh",
                 "disable",
+                "test-chat",
                 "delete",
             }:
                 raise Failure(404)

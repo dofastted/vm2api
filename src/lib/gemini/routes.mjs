@@ -57,6 +57,9 @@ const HOST_ERRORS = {
   gemini_authorization_unavailable: [503, 'Gemini 服务已连接，但未能启动 Google 授权，请检查代理与宿主日志'],
   gemini_account_read_failed: [502, '无法通过所选代理读取 Google 账号数据'],
   gemini_api_key_rejected: [400, 'Google 未接受该 Gemini API Key，请检查密钥和项目权限'],
+  gemini_test_oauth_unsupported: [503, '当前签名载荷不支持 Google OAuth 推理测试'],
+  gemini_test_auth_required: [409, '请先为 Gemini 环境完成授权'],
+  gemini_test_invalid_input: [400, '请选择此环境的 Gemini 模型并输入有效的测试内容'],
 }
 
 export function isGeminiPanelPath(value) {
@@ -150,6 +153,39 @@ function items(value, size, project) {
 
 function modelName(model) {
   return typeof model === 'string' && MODEL.test(model) ? model : null
+}
+
+function testChatView(value, model, start) {
+  const status = Number.isInteger(value?.status) && value.status >= 100 && value.status <= 599 ? value.status : null
+  const stop = /^[A-Z_]{1,64}$/.test(value?.stop_reason ?? '') ? value.stop_reason : null
+  const answer = text(value?.text, 4000)
+  const ok = status === 200 && !!answer?.trim() && (stop === 'STOP' || stop === 'MAX_TOKENS')
+  const usage = Object.fromEntries(
+    ['input_tokens', 'output_tokens', 'cache_read_input_tokens'].flatMap((key) => {
+      const count = value?.usage?.[key]
+      return Number.isSafeInteger(count) && count >= 0 ? [[key, count]] : []
+    }),
+  )
+  const message =
+    status === 200
+      ? 'Google 未完成可用的文本回复'
+      : status
+        ? `Google Gemini API 拒绝测试请求（HTTP ${status}）`
+        : '未能通过绑定代理取得 Gemini 响应'
+  return {
+    ok,
+    model,
+    status,
+    stop_reason: stop,
+    duration_ms: Date.now() - start,
+    text: answer,
+    usage: Object.keys(usage).length ? usage : null,
+    ...(!ok && { error: { code: 'gemini_test_failed', message } }),
+    log: [
+      { at: new Date(start).toISOString(), level: 'info', message: '通过绑定代理调用 Gemini API' },
+      { at: new Date().toISOString(), level: ok ? 'ok' : 'error', message: ok ? '已收到完整回复' : message },
+    ],
+  }
 }
 
 function isFraction(value) {
@@ -352,7 +388,7 @@ export function createGeminiPanelHandler({
         )
       }
       const match =
-        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|disable|refresh))?$/.exec(
+        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|disable|refresh|test-chat))?$/.exec(
           pathname,
         )
       if (!match || !ID.test(match[1])) return fail(404, 'not_found')
@@ -371,6 +407,25 @@ export function createGeminiPanelHandler({
         return ok(
           environmentView(await callHost('refresh', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl })),
         )
+      }
+      if (req.method === 'POST' && action === 'test-chat') {
+        const input = await readBody(req, 32 * 1024)
+        const model = modelName(input?.model)
+        const prompt = input?.prompt
+        if (!model || typeof prompt !== 'string' || !prompt.trim() || Buffer.byteLength(prompt) > 4096) {
+          return fail(400, 'gemini_test_invalid_input', HOST_ERRORS.gemini_test_invalid_input[1])
+        }
+        const environment = environmentView(await callHost('get', { id }))
+        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
+        const start = Date.now()
+        const result = await callHost('test-chat', {
+          id,
+          proxy_id: environment.proxy_id,
+          proxy_url: proxyUrl,
+          model,
+          prompt,
+        })
+        return ok(testChatView(result, model, start))
       }
       if (action !== 'authorization') return fail(404, 'not_found')
       if (req.method === 'POST') {

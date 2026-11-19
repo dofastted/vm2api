@@ -128,7 +128,10 @@ function setup(callHost, proxy = bound) {
   const panel = createGeminiPanelHandler({
     json: (_response, status, body) => ({ status, body }),
     readBody: async (req, maxBytes) => {
-      assert.equal(maxBytes, 'redemption_code' in req.body ? 1024 : 4096)
+      assert.equal(
+        maxBytes,
+        req.pathname.endsWith('/test-chat') ? 32 * 1024 : 'redemption_code' in req.body ? 1024 : 4096,
+      )
       return req.body
     },
     proxyPool: () => ({
@@ -137,7 +140,7 @@ function setup(callHost, proxy = bound) {
     }),
     callHost,
   })
-  return (method, pathname, body) => panel({ method, body }, response, pathname)
+  return (method, pathname, body) => panel({ method, pathname, body }, response, pathname)
 }
 
 test('Gemini import is admin-only and unavailable without the host service', async () => {
@@ -147,6 +150,7 @@ test('Gemini import is admin-only and unavailable without the host service', asy
   assert.equal(authorizePanelRoute('POST', `${root}/environments`, 'admin').ok, true)
   assert.equal(authorizePanelRoute('POST', `${root}/payload/redeem`, 'user').ok, false)
   assert.equal(authorizePanelRoute('POST', `${root}/payload/redeem`, 'admin').ok, true)
+  assert.equal(authorizePanelRoute('POST', `${root}/environments/${record.id}/test-chat`, 'user').ok, false)
   const run = setup(() => {
     throw new Error('private socket path')
   })
@@ -222,6 +226,27 @@ test('Gemini redemption rejects Google codes and reports a different signed rele
   const mismatch = await run('POST', endpoint, { redemption_code: `CGG1-${'A'.repeat(43)}` })
   assert.equal(mismatch.status, 409)
   assert.doesNotMatch(JSON.stringify(mismatch), /private information/)
+})
+
+test('Gemini diagnostic distinguishes complete replies, blocked responses and upstream errors', async () => {
+  const endpoint = `${root}/environments/${record.id}/test-chat`
+  const input = { model: 'gemini-3.1-pro', prompt: 'ping' }
+  const complete = { status: 200, text: 'pong', stop_reason: 'STOP', usage: { input_tokens: 3 } }
+  for (const [response, success] of [
+    [complete, true],
+    [{ ...complete, stop_reason: 'SAFETY' }, false],
+    [{ ...complete, text: ' ' }, false],
+    [{ status: 429, secret: 'upstream credential' }, false],
+  ]) {
+    const run = setup((operation) => (operation === 'get' ? record : response))
+    const result = await run('POST', endpoint, input)
+    assert.equal(result.status, 200)
+    assert.equal(result.body.data.ok, success)
+    assert.equal(result.body.data.status, response.status)
+    assert.doesNotMatch(JSON.stringify(result), /upstream credential/)
+  }
+  const run = setup(() => assert.fail('must not query a host for invalid input'))
+  assert.equal((await run('POST', endpoint, { ...input, prompt: '你'.repeat(1400) })).status, 400)
 })
 
 test('only explicit platform SOCKS5 environments are created and credentials stay private', async () => {
