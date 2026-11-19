@@ -1,8 +1,9 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import { Copy, ExternalLink, Keyboard, SquareTerminal } from 'lucide-react'
 import { toast } from 'sonner'
+import { copyText } from '@/lib/clipboard'
 import { importErrorMessage } from '@/lib/import-errors'
 import { loginAuthCode, type LoginCommit } from '@/lib/login-terminal'
 import { Button } from '@/components/ui/button'
@@ -44,6 +45,18 @@ export function ClaudeLogin({
   const start = useMutation({ mutationFn: () => prepareLoginTerminal(vm) })
   const code = loginAuthCode(callback)
   const usableUrl = connected && !committed ? url : ''
+
+  // Backstop for a stalled commit: the backend reads the grant and imports the
+  // credential over the node SSH link; if that link wedges, no terminal frame
+  // ever arrives and `submitted` would stay pending forever.
+  useEffect(() => {
+    if (!submitted || committed) return
+    const timer = setTimeout(() => {
+      setSubmitted(false)
+      toast.error('等待凭证确认超时，请检查槽位凭证状态后重试')
+    }, 5 * 60_000)
+    return () => clearTimeout(timer)
+  }, [submitted, committed])
 
   function changeOpen(next: boolean) {
     setOpen(next)
@@ -119,10 +132,11 @@ export function ClaudeLogin({
                 variant='outline'
                 disabled={!usableUrl}
                 onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(usableUrl)
+                  // 纯 HTTP 面板没有 navigator.clipboard（secure-context only），
+                  // copyText 会回落到 execCommand；失败时给出可操作指引。
+                  if (await copyText(usableUrl)) {
                     toast.success('已复制授权链接')
-                  } catch {
+                  } else {
                     toast.error('复制失败，请选中输入框中的链接手动复制')
                   }
                 }}
