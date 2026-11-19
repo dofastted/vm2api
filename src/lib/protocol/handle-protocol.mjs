@@ -180,6 +180,8 @@ import {
   peekInterceptSession,
   prepareCachePrefix,
 } from './cache-prefix.mjs'
+import { createIssuedToolReplay } from './issued-tool-replay.mjs'
+import { createIssuedToolStream } from './issued-tool-stream.mjs'
 import { createRequestBodyContext, shallowCopyBody } from './request-body-context.mjs'
 import { jevInterceptSessionCache } from './jev-intercept.mjs'
 import { ensureClaudeWebSearch, shouldInjectClaudeWebSearch } from './web-search.mjs'
@@ -223,7 +225,16 @@ export function refusalSessionBlockDecision(reason, classifier = null) {
   return { block: true }
 }
 
+function authenticatedTenant(req) {
+  if (req.apiKeyRecord?.id != null) return `key:${req.apiKeyRecord.id}`
+  if (req.apiKeyKind === 'master') return 'master'
+  if (req.panelUserId != null) return `panel-id:${req.panelUserId}`
+  if (req.panelUser) return `panel-user:${req.panelUser}`
+  return ''
+}
+
 export function createHandleProtocol(deps) {
+  const issuedTools = createIssuedToolReplay()
   const json = (...args) => deps.json(...args)
   const writeSSEHeaders = (...args) => deps.writeSSEHeaders(...args)
   const readBody = (...args) => deps.readBody(...args)
@@ -1204,6 +1215,25 @@ export function createHandleProtocol(deps) {
     const officialInbound =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
+    const officialTraffic = officialInbound
+    const requestContext = classifyClaudeRequestPurpose(inbound, { officialTraffic })
+    const summarySession = agentSummarySession(inbound, { officialTraffic })
+    const tenantPrincipal = authenticatedTenant(req)
+    // Match on what the caller saw, before conversion, persona or outbound session rebuild.
+    const publicSession =
+      protocol === 'anthropic.messages' && !apiOpenAI && tenantPrincipal && !requestContext && !summarySession
+        ? extractCallerSession({ inbound, headers: req.headers })
+        : ''
+    const replayScope = publicSession ? JSON.stringify([tenantPrincipal, publicSession, inbound.model]) : ''
+    const rememberPublic = (content) => {
+      if (replayScope && Array.isArray(content)) issuedTools.remember(replayScope, inbound.messages, content)
+    }
+    const sendPublicJson = (message) => {
+      const sent = json(res, 200, message)
+      if (message?.role === 'assistant' && message.type === 'message') rememberPublic(message.content)
+      return sent
+    }
+    if (replayScope) ctx.body = issuedTools.restore(replayScope, ctx.body)
     // Recognition alone is not passthrough. Only the protocol-tab switch keeps
     // the Claude Code family body; every other inbound is rewritten below.
     const officialPassthrough = officialFamilyBodyPassthrough(officialInbound, getRouting())
@@ -1239,8 +1269,6 @@ export function createHandleProtocol(deps) {
       ctx = applyIntercept(cfg.intercept.rules, 'before_upstream', ctx)
       if (route?.kind === 'model') ctx.body = { ...ctx.body, model: validateOfficialModel(route.target).model }
     }
-    const officialTraffic = officialInbound
-    const requestContext = classifyClaudeRequestPurpose(inbound, { officialTraffic })
     if (requestContext) {
       logBag.classifier = classifierRequestSummary(inbound, ctx.body, requestContext)
       try {
@@ -1337,7 +1365,6 @@ export function createHandleProtocol(deps) {
     const bodyCtx = createRequestBodyContext(ctx.body)
     const officialClient = isOfficialClaudeClient(fp.client_class)
     const callerSession = extractCallerSession({ inbound, body: ctx.body, headers: req.headers })
-    const summarySession = agentSummarySession(inbound, { officialTraffic })
     const executionSession = summarySession || callerSession
     const firstUserText = extractFirstUserText(ctx.body?.messages) || extractFirstUserText(inbound?.messages)
     // Seed identity skips a leading <system-reminder>; firstUserText stays billing-only.
@@ -1516,6 +1543,7 @@ export function createHandleProtocol(deps) {
       }
       const clientAbort = bindClientAbort(req, res)
       const clientStream = isClientStream(inbound, req.headers)
+      const publicStream = replayScope && clientStream && !apiOpenAI ? createIssuedToolStream() : null
       const requestedDelivery = String(
         req.headers['x-kin-delivery'] || getRouting()?.failover?.delivery_mode || 'realtime',
       )
@@ -1544,6 +1572,7 @@ export function createHandleProtocol(deps) {
           timeoutMs: cfg.limits.upstream_timeout_ms,
           personaHideTokens,
           cacheTtl,
+          onPublicLine: publicStream ? (line) => publicStream.observe(line) : null,
           requestContext,
           passthrough: officialPassthrough,
           routing: getRouting(),
@@ -1594,6 +1623,7 @@ export function createHandleProtocol(deps) {
         bill: !!(result?.ok && managedKey),
       })
       if (clientStream) {
+        if (result?.ok && !logBag.risk_upstream_reason) rememberPublic(publicStream?.completedContent())
         if (isClientCancelledResult(result)) return finishClientCancel(res, result, logBag)
         if (!res.headersSent) {
           const mapped = mapProtocolClientError(result, logBag, 'api_pool_exhausted')
@@ -1624,7 +1654,7 @@ export function createHandleProtocol(deps) {
         output = apiOpenAI
           ? result.body
           : fromClaudeToResponses(clientBody, inbound.model, result.endpointId, converted.mode, converted.responseTools)
-      return json(res, 200, output)
+      return sendPublicJson(output)
     }
 
     const canonicalBody = officialMessagesBody(ctx.body)
@@ -1636,13 +1666,6 @@ export function createHandleProtocol(deps) {
     const queueKeepaliveDelay = queueKeepaliveDelayMs(getRouting(), cfg.limits?.queue_keepalive_delay_ms)
     const streamIdleTimeoutMs = resolveStreamIdleTimeoutMs(getRouting(), cfg)
     const managedKey = req.apiKeyRecord || null
-    // Only the authentication layer supplies these identities. Namespace the
-    // sources so a key ID cannot share native sessions with a panel login.
-    let tenantPrincipal = ''
-    if (managedKey?.id != null) tenantPrincipal = `key:${managedKey.id}`
-    else if (req.apiKeyKind === 'master') tenantPrincipal = 'master'
-    else if (req.panelUserId != null) tenantPrincipal = `panel-id:${req.panelUserId}`
-    else if (req.panelUser) tenantPrincipal = `panel-user:${req.panelUser}`
     const tenantId = tenantPrincipal ? hashKey(`crag-tenant:${tenantPrincipal}`) : ''
     if (managedKey) {
       const gate = apiKeyStore.acquire(managedKey)
@@ -2165,6 +2188,7 @@ export function createHandleProtocol(deps) {
               tenantId,
             })
           }
+          const publicStream = replayScope ? createIssuedToolStream() : null
           let state
           if (protocol === 'openai.chat') {
             state = createOpenAIChatStreamState(inbound.model || body.model, candidate.vmId)
@@ -2187,7 +2211,7 @@ export function createHandleProtocol(deps) {
             })
           keepalive.arm()
           try {
-            return await dispatchStreamInference({
+            const streamed = await dispatchStreamInference({
               exec: candidate.exec,
               admitCragInference: deps.admitCragInference,
               cacheTtl,
@@ -2230,6 +2254,7 @@ export function createHandleProtocol(deps) {
                   if (!res.headersSent) writeSSEHeaders(res)
                   const outbound = anthropicSseErrorRemapper ? anthropicSseErrorRemapper.remapLine(line) : line
                   res.write(String(outbound).endsWith('\n') ? String(outbound) : String(outbound) + '\n')
+                  publicStream?.observe(outbound)
                   return
                 }
                 const writeChunks = (chunks) => {
@@ -2251,6 +2276,8 @@ export function createHandleProtocol(deps) {
                 writeChunks(claudeSSELineToResponsesEvents(line, state))
               },
             })
+            if (streamed?.ok) rememberPublic(publicStream?.completedContent())
+            return streamed
           } finally {
             if (anthropicKeepalive) anthropicKeepalive.endAttempt()
             else keepalive.stop()
@@ -2456,7 +2483,7 @@ export function createHandleProtocol(deps) {
       output = fromClaudeToResponses(clientBody, inbound.model, result.vmId, converted.mode, converted.responseTools)
     }
     ctx = applyIntercept(cfg.intercept.rules, 'before_client', { ...ctx, body: output })
-    return json(res, 200, ctx.body)
+    return sendPublicJson(ctx.body)
   }
 
   /** POST /v1/alpha/search (Codex web search): same logging, auth and body handling as handleProtocol. */
