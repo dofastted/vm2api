@@ -35,6 +35,30 @@ test('renamed calls require one matching issued batch and unambiguous result lin
   assert.equal(book.restore('scope', ambiguous), ambiguous)
 })
 
+test('exact IDs restore only when the next user turn answers the entire batch once', () => {
+  const book = createIssuedToolReplay()
+  const issued = [call('a'), call('b')]
+  book.remember('scope', prefix, issued)
+  const [assistant, user] = answer(issued.map((b) => ({ ...b, input: { changed: true } })))
+  const [a, b] = user.content
+  for (const tail of [
+    [],
+    [{ ...user, content: [a] }],
+    [{ ...user, content: [a, a] }],
+    [{ ...user, content: [a, { ...b, tool_use_id: 'other' }] }],
+    [{ role: 'user', content: 'not results' }, user],
+    [user, { ...user, content: [b] }],
+  ]) {
+    const body = { messages: [...prefix, assistant, ...tail] }
+    assert.equal(book.restore('scope', body), body)
+  }
+  // Parallel results may arrive out of order: their references, not their positions, pair them.
+  const reversed = { ...user, content: [b, a] }
+  const restored = book.restore('scope', { messages: [...prefix, assistant, reversed] })
+  assert.deepEqual(restored.messages.at(-2).content, issued)
+  assert.equal(restored.messages.at(-1), reversed)
+})
+
 test('moving a cache breakpoint between turns preserves replay and the current cache placement', () => {
   const book = createIssuedToolReplay()
   const marker = { type: 'ephemeral', ttl: '1h' }

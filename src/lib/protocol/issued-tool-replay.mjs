@@ -63,15 +63,15 @@ function frequencies(messages) {
 function resolveBatch(variants, echo, next, { uses, results }) {
   const ids = echo.map((b) => b.id)
   if (!unique(ids) || ids.some((id) => uses.get(id) !== 1)) return null
-  const candidates = variants.map((json) => JSON.parse(json))
-  const exact = candidates.filter((batch) => batch.length === ids.length && batch.every((b, i) => b.id === ids[i]))
-  if (exact.length) return exact.length === 1 ? exact[0] : null
   if (next?.role !== 'user') return null
   const refs = blocks(next)
     .filter(isResult)
     .map((b) => b.tool_use_id)
   if (refs.length !== ids.length || !unique(refs) || ids.some((id) => !refs.includes(id) || results.get(id) !== 1))
     return null
+  const candidates = variants.map((json) => JSON.parse(json))
+  const exact = candidates.filter((batch) => batch.length === ids.length && batch.every((b, i) => b.id === ids[i]))
+  if (exact.length) return exact.length === 1 ? exact[0] : null
   const issuedIds = new Set(candidates.flat().map((b) => b.id))
   const matches = candidates.filter(
     (batch) =>
