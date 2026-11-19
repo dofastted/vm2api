@@ -23,6 +23,7 @@ import {
   pruneSharedRoutes,
   sharedMembersOf,
   sharedNetworkName,
+  sharedNodeIdFromNetwork,
   sharedRoutes,
   unroutedMembers,
 } from '../../src/lib/vm/shared-egress.mjs'
@@ -50,8 +51,9 @@ import {
   startSharedEgress,
   stopSharedEgress,
 } from '../../src/lib/vm/egress.mjs'
-import { parseCidr } from '../../src/lib/vm/subnet-pool.mjs'
+import { gatewayOf, parseCidr } from '../../src/lib/vm/subnet-pool.mjs'
 import { buildKvmRunArgs } from '../../src/lib/vm/vm-runtime.mjs'
+import { exitOf, ipv4ConfigOf, remoteEgressIpam, sharedRemoteNames } from '../../src/lib/cluster/remote-slot.mjs'
 
 const ipInt = (ip) => parseCidr(`${ip}/32`).network
 
@@ -1079,4 +1081,96 @@ test('an unreadable shared network does not become an empty one', async (t) => {
   assert.equal(r.ok, false)
   assert.equal(r.error, 'shared_network_unreadable')
   assert.equal(h.startCalls.length, 0)
+})
+
+test('a shared network name maps back to its node', () => {
+  assert.equal(sharedNodeIdFromNetwork(sharedNetworkName('node-a')), 'node-a')
+  assert.equal(sharedNodeIdFromNetwork(sharedNetworkName('')), '')
+  // Not a shared network, so reclaiming it must not take the shared path.
+  assert.equal(sharedNodeIdFromNetwork('kin-eg-vm-234'), null)
+  assert.equal(sharedNodeIdFromNetwork(''), null)
+  // Guards against a name that merely starts with the prefix but is not one.
+  assert.equal(sharedNodeIdFromNetwork('kin-eg-sharedX'), null)
+})
+
+test('a shared network reclaims through its own chain and bridge', () => {
+  const host = { root: '/srv/kin', uid: 0 }
+  const names = sharedRemoteNames('node-a', host)
+  assert.equal(names.network, sharedNetworkName('node-a'))
+  assert.equal(names.chain, sharedChainName('node-a'))
+  assert.equal(names.bridge, sharedBridgeName('node-a'))
+  // Node-level, beside the per-proxy exits rather than inside any VM tree: the
+  // helper outlives every single VM on the node.
+  assert.equal(names.dir, `/srv/kin/egress/${sharedEgressId('node-a')}`)
+  assert.ok(!names.dir.includes('/vms/'))
+  assert.equal(names.egress, `kin-egress-${sharedEgressId('node-a')}`)
+})
+
+test('the node IPAM sizes a shared network for the whole node', () => {
+  const perVm = remoteEgressIpam({ name: 'kin-eg-vm-1', networks: [], routes: '' })
+  assert.equal(parseCidr(perVm.Config[0].Subnet).prefix, 28)
+  const shared = remoteEgressIpam({
+    name: sharedNetworkName('node-a'),
+    networks: [],
+    routes: '',
+    prefix: DEFAULT_SHARED_PREFIX,
+  })
+  assert.equal(parseCidr(shared.Config[0].Subnet).prefix, DEFAULT_SHARED_PREFIX)
+  assert.equal(shared.Config[0].Gateway, gatewayOf(shared.Config[0].Subnet))
+  // Still avoids what the node already holds.
+  const moved = remoteEgressIpam({
+    name: sharedNetworkName('node-a'),
+    networks: [{ IPAM: { Config: [{ Subnet: shared.Config[0].Subnet }] } }],
+    prefix: DEFAULT_SHARED_PREFIX,
+  })
+  assert.notEqual(moved.Config[0].Subnet, shared.Config[0].Subnet)
+})
+
+test('a dual-stack node network still yields its IPv4 range', () => {
+  // Config[0] can be the IPv6 entry, and taking it whole gives a value that
+  // parses as neither a subnet nor a gateway.
+  const info = {
+    IPAM: { Config: [{ Subnet: 'fd21:f843::/64' }, { Subnet: '100.64.16.0/20', Gateway: '100.64.16.1' }] },
+  }
+  assert.deepEqual(ipv4ConfigOf(info), { subnet: '100.64.16.0/20', gateway: '100.64.16.1' })
+  // A missing gateway is derived rather than left empty.
+  assert.equal(ipv4ConfigOf({ IPAM: { Config: [{ Subnet: '100.64.16.0/20' }] } }).gateway, '100.64.16.1')
+  assert.equal(ipv4ConfigOf({ IPAM: { Config: [{ Subnet: 'fd21::/64' }] } }), null)
+  assert.equal(ipv4ConfigOf(null), null)
+})
+
+test('the node-side helper config carries routes through the shared builder', () => {
+  // The cluster side used to build this object itself, in a second file. A
+  // routes field present in one writer and missing from the other is a VM that
+  // is routed on the control plane host and refused on a node.
+  const cfg = egressConfigFor({
+    proxyId: 'px-1',
+    proxyUrl: 'socks5h://a:1080',
+    listenTcp: '100.64.16.1:18080',
+    listenDns: '100.64.16.1:18053',
+    routes: [{ vm_ip: '100.64.16.3', proxy_url: 'socks5h://b:1080' }],
+  })
+  assert.deepEqual(cfg.routes, [{ vm_ip: '100.64.16.3', proxy_url: 'socks5h://b:1080' }])
+  assert.ok(egressConfigBody(cfg).endsWith('\n'))
+})
+
+test('reclaiming a shared network targets the rules it actually created', () => {
+  const host = { root: '/srv/kin', uid: 0 }
+  const name = sharedNetworkName('node-a')
+  // No kin.egress.vm label: the network belongs to the node, not to one VM.
+  const exit = exitOf(name, { Labels: {} }, host)
+  assert.equal(exit.shared, true)
+  // Without the shared branch this falls through to the per-proxy parse, which
+  // reads 'shared-node-a' as a proxy id and derives a chain and bridge that
+  // were never created — deleting nothing and leaving the real rules behind,
+  // pointing at a bridge that has been removed.
+  assert.equal(exit.chain, sharedChainName('node-a'))
+  assert.equal(exit.bridge, sharedBridgeName('node-a'))
+  assert.equal(exit.egress, `kin-egress-${sharedEgressId('node-a')}`)
+  assert.equal(exit.dir, `/srv/kin/egress/${sharedEgressId('node-a')}`)
+
+  // A per-VM exit is unaffected and still resolves through its VM label.
+  const perVm = exitOf('kin-eg-vm-1-net', { Labels: { 'kin.egress.vm': 'vm-1' } }, host)
+  assert.ok(!perVm.shared)
+  assert.ok(perVm.dir.includes('/vms/vm-1/'))
 })

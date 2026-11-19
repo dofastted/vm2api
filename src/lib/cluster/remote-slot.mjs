@@ -20,6 +20,8 @@ import {
   chainName,
   configuredDnsUpstream,
   configuredDnsEmptyTypes,
+  egressConfigBody,
+  egressConfigFor,
   gatewayFromSubnet,
   iptablesPlan,
   isLocalEgressProxy,
@@ -30,6 +32,14 @@ import {
   proxyKey,
 } from '../vm/egress.mjs'
 import { parseCidr, parseRouteSubnets, createSubnetAllocator, gatewayOf, subnetPoolConfig } from '../vm/subnet-pool.mjs'
+import {
+  isSharedNetwork,
+  sharedBridgeName,
+  sharedChainName,
+  sharedEgressId,
+  sharedNetworkName,
+  sharedNodeIdFromNetwork,
+} from '../vm/shared-egress.mjs'
 import { OS_CATALOG } from '../vm/os-catalog.mjs'
 import {
   REMOTE_CRAG_ENTRY,
@@ -398,7 +408,7 @@ export function remoteIptablesScript(plan, { sudo = false } = {}) {
  * per-node: VMs never talk to each other (enable_icc=false) and an IP is not a
  * VM's durable identity, so two nodes may hold the same range.
  */
-export function remoteEgressIpam({ name, networks = [], routes = '' } = {}) {
+export function remoteEgressIpam({ name, networks = [], routes = '', prefix: want } = {}) {
   const taken = []
   for (const net of networks) {
     for (const cfg of net?.IPAM?.Config || []) {
@@ -407,7 +417,10 @@ export function remoteEgressIpam({ name, networks = [], routes = '' } = {}) {
     }
   }
   taken.push(...parseRouteSubnets(routes))
-  const { pool, prefix } = subnetPoolConfig()
+  const { pool, prefix: perVm } = subnetPoolConfig()
+  // A shared network holds one address per VM on the node, so it is sized for
+  // the node rather than per VM.
+  const prefix = Number.isInteger(want) ? want : perVm
   // A drained pool propagates: falling back here would only hide the same failure.
   const subnet = createSubnetAllocator({ pool, prefix, taken }).allocate(name)
   const gateway = gatewayOf(subnet)
@@ -420,7 +433,7 @@ export function remoteEgressIpam({ name, networks = [], routes = '' } = {}) {
  * the reason a node stops creating exits past ~200 VMs, since a SOCKS slot holds
  * one network each.
  */
-async function remoteSubnetIpam(docker, name, runIp) {
+async function remoteSubnetIpam(docker, name, runIp, prefix) {
   let networks
   try {
     networks = await listNetworks(docker)
@@ -434,13 +447,29 @@ async function remoteSubnetIpam(docker, name, runIp) {
       routes = await runIp()
     } catch {}
   }
-  return remoteEgressIpam({ name, networks, routes })
+  return remoteEgressIpam({ name, networks, routes, prefix })
 }
 
-async function ensureRemoteNetwork(docker, { name, bridge, masquerade, labels = {}, runIp } = {}) {
+/**
+ * The IPv4 range of a node network.
+ *
+ * A dual-stack network lists several IPAM configs and the IPv6 one can come
+ * first, so taking Config[0] whole yields a range that parses as neither a
+ * subnet nor a gateway.
+ */
+export function ipv4ConfigOf(info) {
+  for (const cfg of info?.IPAM?.Config || []) {
+    const cidr = parseCidr(cfg?.Subnet)
+    if (!cidr) continue
+    return { subnet: String(cfg.Subnet), gateway: String(cfg.Gateway || '') || gatewayFromSubnet(cfg.Subnet) }
+  }
+  return null
+}
+
+async function ensureRemoteNetwork(docker, { name, bridge, masquerade, labels = {}, runIp, prefix } = {}) {
   let info = await inspectNetworkOrNull(docker, name)
   if (!info) {
-    const ipam = await remoteSubnetIpam(docker, name, runIp)
+    const ipam = await remoteSubnetIpam(docker, name, runIp, prefix)
     await createNetwork(docker, {
       Name: name,
       Driver: 'bridge',
@@ -652,17 +681,19 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
     labels: { 'kin.egress.vm': vm.id },
     runIp: () => runRemote(session.client, 'ip route'),
   })
-  const cfg = {
-    proxy_id: proxyId,
-    proxy_url: proxyUrl,
-    listen_tcp: `${net.gateway}:${ports.tcp}`,
-    listen_dns: `${net.gateway}:${ports.dns}`,
-  }
-  const dnsUpstream = configuredDnsUpstream()
-  if (dnsUpstream) cfg.dns_upstream = dnsUpstream
-  const dnsEmptyTypes = configuredDnsEmptyTypes()
-  if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
-  const body = `${JSON.stringify(cfg, null, 2)}\n`
+  // Built through the same builder the local side uses, so a field cannot be
+  // present in one config writer and missing from the other. This was the
+  // fourth construction site, in a second file, and the node side is where
+  // thousands of VMs actually run.
+  const cfg = egressConfigFor({
+    proxyId,
+    proxyUrl,
+    listenTcp: `${net.gateway}:${ports.tcp}`,
+    listenDns: `${net.gateway}:${ports.dns}`,
+    dnsUpstream: configuredDnsUpstream(),
+    dnsEmptyTypes: configuredDnsEmptyTypes(),
+  })
+  const body = egressConfigBody(cfg)
   const { digest, spec } = remoteEgressContainer({
     vmId: vm.id,
     proxyId,
@@ -747,7 +778,41 @@ export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
 }
 
 /** Where a network's exit lives: per-slot (labelled), pre-1.3.88 per-proxy, or the shared px-local bridge. */
-function exitOf(name, info, host) {
+/**
+ * Where a node's shared exit lives. Node-level, beside the per-proxy exits
+ * rather than inside any VM's tree, because it outlives every single VM on the
+ * node.
+ */
+export function sharedRemoteNames(nodeId, host) {
+  const id = sharedEgressId(nodeId)
+  return {
+    network: sharedNetworkName(nodeId),
+    bridge: sharedBridgeName(nodeId),
+    chain: sharedChainName(nodeId),
+    egress: `kin-egress-${id}`,
+    dir: `${host.root}/egress/${id}`,
+    ports: portsForProxy(id),
+  }
+}
+
+/**
+ * Which helper, chain, bridge, ports and config directory a network's exit
+ * uses. Pure, so the reclaim contract is testable without a docker connection —
+ * getting it wrong deletes rules that were never created and leaves the real
+ * ones behind, naming a bridge that is gone.
+ */
+export function exitOf(name, info, host) {
+  // A shared network carries no per-VM label, so without this it falls through
+  // to the per-proxy parse below, which reads 'shared-<nodeId>' as a proxy id
+  // and derives a chain and bridge that were never created. Reclaiming the
+  // network would then delete rules that do not exist and leave the real ones
+  // behind, pointing at a bridge that is gone.
+  if (isSharedNetwork(name)) {
+    const nodeId = sharedNodeIdFromNetwork(name)
+    if (nodeId === null) return { egress: null }
+    const n = sharedRemoteNames(nodeId, host)
+    return { egress: n.egress, chain: n.chain, bridge: n.bridge, ports: n.ports, dir: n.dir, shared: true }
+  }
   const vmId = info.Labels?.['kin.egress.vm']
   if (vmId) {
     const n = slotEgressNames(vmId)

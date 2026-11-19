@@ -61,6 +61,23 @@ export function isSharedNetwork(name) {
 }
 
 /**
+ * The node a shared network's name belongs to.
+ *
+ * Needed because a shared network carries no per-VM label — it belongs to the
+ * node, not to any one VM — so code that reclaims an exit from its network name
+ * has nothing else to go on. Without this it falls through to the per-proxy
+ * parse, which reads 'shared-<nodeId>' as a proxy id and derives a chain and
+ * bridge that do not exist.
+ */
+export function sharedNodeIdFromNetwork(name) {
+  const value = String(name || '')
+  if (!isSharedNetwork(value)) return null
+  const rest = value.slice(SHARED_NETWORK_PREFIX.length)
+  if (!rest) return ''
+  return rest.startsWith('-') ? rest.slice(1) : null
+}
+
+/**
  * The shared helper's identity.
  *
  * It is shaped like a proxy id so the whole per-proxy helper lifecycle applies
