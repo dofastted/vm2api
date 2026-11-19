@@ -48,6 +48,14 @@ const WS_RE = /^\/api\/panel\/vms\/([^/]+)\/desktop\/ws$/
 const TICKET_TTL_MS = 30_000
 const MAX_TICKETS = 64
 const MAX_VIEWERS = 8
+// Viewer input queued before the exec stream is up (RFB handshake is a few
+// hundred bytes; anything near this is a misbehaving client).
+const MAX_EARLY_BYTES = 1 << 20
+// RFB framebuffer updates outrun a slow (cross-ocean) viewer; pause the exec
+// stream above HIGH and resume once the socket drains below LOW, so ws send
+// buffers stay bounded instead of growing with the backlog.
+const WS_HIGH_WATER = 8 << 20
+const WS_LOW_WATER = 1 << 20
 
 function parseBytes(raw, dflt) {
   const m = /^(\d+)([kmg])?$/i.exec(String(raw || '').trim())
@@ -128,10 +136,33 @@ export function desktopAction(slot, companion, image = DESKTOP_IMAGE, imageId = 
   return ownStarted < slotStarted ? 'restart' : 'ok'
 }
 
-/** Bring the companion in line with the running slot. Idempotent. */
-export async function ensureSlotDesktop(vm, { connect = slotHost(vm).dockerApi(), image = DESKTOP_IMAGE } = {}) {
+const inFlight = new Map()
+
+/**
+ * Collapse concurrent calls sharing `key` into one in-flight promise. Pure
+ * helper (exported for tests): the slot-start follow hook and a viewer ticket
+ * routinely race on the same companion, and two parallel creates of one
+ * container name lose to a 409 conflict.
+ */
+export function singleFlight(key, fn) {
+  const running = inFlight.get(key)
+  if (running) return running
+  const p = Promise.resolve()
+    .then(fn)
+    .finally(() => inFlight.delete(key))
+  inFlight.set(key, p)
+  return p
+}
+
+/** Bring the companion in line with the running slot. Idempotent; concurrent calls per companion share one run. */
+export function ensureSlotDesktop(vm, opts = {}) {
   const unsupported = desktopUnsupported(vm)
-  if (unsupported) return { ok: false, ...unsupported }
+  if (unsupported) return Promise.resolve({ ok: false, ...unsupported })
+  const key = `${vm.node_id || 'local'}:${desktopNames(vm).container}`
+  return singleFlight(key, () => ensureSlotDesktopOnce(vm, opts))
+}
+
+async function ensureSlotDesktopOnce(vm, { connect = slotHost(vm).dockerApi(), image = DESKTOP_IMAGE } = {}) {
   const names = desktopNames(vm)
   const slot = await inspectContainerOrNull(connect, names.slot)
   if (!slot?.State?.Running) {
@@ -304,19 +335,40 @@ export function createSlotDesktop({ projectRoot, logger = console, ops = {} } = 
     }
     ws.on('close', close)
     ws.on('error', close)
-    // Bytes the viewer sends before the exec stream is up are queued, not lost.
+    // Bytes the viewer sends before the exec stream is up are queued, not lost (bounded).
     const early = []
+    let earlyBytes = 0
     ws.on('message', (data) => {
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data)
       if (stream && !stream.destroyed) stream.write(buf)
-      else if (!stream) early.push(buf)
+      else if (!stream) {
+        earlyBytes += buf.length
+        if (earlyBytes > MAX_EARLY_BYTES) {
+          if (ws.readyState === ws.OPEN) ws.close(1009, 'desktop_input_overflow')
+          close()
+          return
+        }
+        early.push(buf)
+      }
     })
+    let paused = false
+    const onSent = () => {
+      if (paused && ws.bufferedAmount < WS_LOW_WATER && stream && !stream.destroyed) {
+        paused = false
+        stream.resume()
+      }
+    }
     try {
       const { container } = desktopNames(vm)
       ;({ stream } = await openStream(slotHost(vm).dockerApi(), container, {
         cmd: ['socat', 'STDIO', `UNIX-CONNECT:${DESKTOP_SOCKET}`],
         onStdout: (chunk) => {
-          if (ws.readyState === ws.OPEN) ws.send(chunk, { binary: true })
+          if (ws.readyState !== ws.OPEN) return
+          ws.send(chunk, { binary: true }, onSent)
+          if (!paused && ws.bufferedAmount > WS_HIGH_WATER && stream && !stream.destroyed) {
+            paused = true
+            stream.pause()
+          }
         },
         onStderr: (chunk) => logger.warn?.('[slot-desktop]', vm.id, String(chunk).trim().slice(0, 200)),
       }))

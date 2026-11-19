@@ -182,6 +182,8 @@ export interface CreateVmDraft {
   /** 浏览器桌面伴生（仅 Claude 容器槽可勾选）。 */
   desktop: boolean
   setDesktop: (next: boolean) => void
+  /** 管理员 + Claude 容器槽才显示勾选项并提交。 */
+  desktopAllowed: boolean
   create: UseMutationResult<CreateVmResult, Error, void>
   /** 预检未过 / KVM 仍在检测：提交按钮禁用。 */
   blocked: boolean
@@ -262,6 +264,11 @@ export function useCreateVmDraft({
   const exit = useCreateExit(placement.nodeId)
   const wantsExit = after !== 'idle'
   const [desktop, setDesktop] = useState(false)
+  // 桌面伴生仅管理员可开（后端同口径），且只对 Claude 容器槽有意义。
+  const desktopAllowed =
+    me.data?.role === 'admin' &&
+    platform === 'anthropic' &&
+    runtimeType !== 'kvm'
 
   const create = useMutation({
     mutationFn: async () => {
@@ -284,9 +291,7 @@ export function useCreateVmDraft({
           ...(platform === 'anthropic' ? { dataplane } : {}),
           ...(nodeId ? { node_id: nodeId } : {}),
           ...(wantsExit && exit.proxyId ? { proxy_id: exit.proxyId } : {}),
-          ...(platform === 'anthropic' && runtimeType !== 'kvm' && desktop
-            ? { desktop: true }
-            : {}),
+          ...(desktopAllowed && desktop ? { desktop: true } : {}),
           ...createMachinePayload({ runtimeType, memory, vcpus, diskGb }),
         }),
       })
@@ -365,6 +370,7 @@ export function useCreateVmDraft({
     wantsExit,
     desktop,
     setDesktop,
+    desktopAllowed,
     create,
     blocked: placement.blocked || kvmPending,
     placementChecks: preflightChecksFromError(create.error),
@@ -441,7 +447,7 @@ export function draftSpecRows(d: CreateVmDraft): SpecRow[] {
       label: '规格',
       value: machineLine(d.runtimeType, d.memory, d.vcpus, d.diskGb),
     },
-    ...(d.platform === 'anthropic' && d.runtimeType !== 'kvm'
+    ...(d.desktopAllowed
       ? [{ label: '浏览器桌面', value: d.desktop ? '启用' : '关闭' }]
       : []),
     {
@@ -617,7 +623,7 @@ export function CreateVmForm({
         title='形态'
         hint='容器轻、快；虚拟机给每个槽一台独立的机器。勾选浏览器桌面会为 Claude 槽创建伴生容器，共享本槽出口；创建后也可在槽位「桌面」页签随时开启或关闭。'
         action={
-          d.platform === 'anthropic' && d.runtimeType !== 'kvm' ? (
+          d.desktopAllowed ? (
             <label className='flex cursor-pointer items-center gap-2 text-sm font-normal'>
               <Checkbox
                 checked={d.desktop}

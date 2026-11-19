@@ -4,6 +4,9 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { PassThrough } from 'node:stream'
+import http from 'node:http'
+import { once } from 'node:events'
+import { WebSocket } from 'ws'
 import { createDockerFrameDecoder } from '../../src/lib/cluster/docker-remote.mjs'
 import { authorizePanelRoute } from '../../src/lib/admin/panel-acl.mjs'
 import { isCodexVm } from '../../src/lib/vm/vm-kind.mjs'
@@ -15,6 +18,7 @@ import {
   desktopContainerBody,
   desktopNames,
   desktopUnsupported,
+  singleFlight,
 } from '../../src/lib/vm/slot-desktop.mjs'
 
 const IMAGE = 'ghcr.io/example/kin-desktop:debian-12'
@@ -183,4 +187,67 @@ test('desktop ticket surfaces a stopped slot', async () => {
   const r = await desk.issueTicket('vm-05')
   assert.equal(r.ok, false)
   assert.equal(r.error.code, 'slot_not_running')
+})
+
+test('singleFlight collapses concurrent ensures of one companion', async () => {
+  let runs = 0
+  let release
+  const gate = new Promise((r) => {
+    release = r
+  })
+  const work = async () => {
+    runs += 1
+    await gate
+    return { ok: true, action: 'create' }
+  }
+  // Slot-start follow hook and a viewer ticket hit the same companion together.
+  const a = singleFlight('local:kin-07-desktop', work)
+  const b = singleFlight('local:kin-07-desktop', work)
+  const other = singleFlight('local:kin-08-desktop', work)
+  release()
+  const [ra, rb] = await Promise.all([a, b, other])
+  assert.equal(runs, 2, 'one run per companion, not per caller')
+  assert.equal(ra, rb)
+  // Settled: the next call starts a fresh run.
+  await singleFlight('local:kin-07-desktop', work)
+  assert.equal(runs, 3)
+})
+
+test('desktop viewer drops a client flooding input before the exec stream is up', async (t) => {
+  const root = projectWith([{ id: 'vm-02', desktop: { enabled: true } }])
+  let openStream
+  const opened = new Promise((r) => {
+    openStream = r
+  })
+  const desk = createSlotDesktop({
+    projectRoot: root,
+    logger: { warn() {} },
+    ops: {
+      ensureSlotDesktop: async () => ({ ok: true, action: 'ok' }),
+      // The exec stream never comes up during the flood.
+      openExecStream: () => opened,
+    },
+  })
+  const server = http.createServer()
+  server.on('upgrade', (req, socket, head) => desk.handleUpgrade(req, socket, head))
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  t.after(() => {
+    openStream({ stream: new PassThrough() })
+    server.closeAllConnections?.()
+    server.close()
+  })
+  const issued = await desk.issueTicket('vm-02')
+  assert.equal(issued.ok, true)
+  const ws = new WebSocket(
+    `ws://127.0.0.1:${server.address().port}/api/panel/vms/vm-02/desktop/ws?ticket=${issued.ticket}`,
+    'binary',
+  )
+  await once(ws, 'open')
+  assert.equal(desk.viewerCount(), 1)
+  const chunk = Buffer.alloc(256 << 10)
+  for (let i = 0; i < 8; i += 1) ws.send(chunk)
+  const [code] = await once(ws, 'close')
+  assert.equal(code, 1009)
+  assert.equal(desk.viewerCount(), 0, 'the viewer slot is released')
 })

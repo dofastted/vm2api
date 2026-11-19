@@ -5515,7 +5515,10 @@ export function createPanelHandler(ctx) {
           schedule_disabled_reason: 'no_credential',
           unschedulable: { reason: 'no_credential', detail: null, at: new Date().toISOString() },
           proxy_cli_enabled: body.proxy_cli_enabled === true,
-          ...(!codexCreate && body.desktop === true ? { desktop: { enabled: true } } : {}),
+          // Desktop companion: admin-only (the toggle routes are admin-only too) and docker-only.
+          ...(!codexCreate && runtime !== RUNTIME_KVM && ident.role === 'admin' && body.desktop === true
+            ? { desktop: { enabled: true } }
+            : {}),
           proxy_required: false,
           seed_policy: standardSeedPolicy({}, { defaultEnabled: telemetryDefaultEnabled(ctx.routingConfig) }),
           runtime: { type: runtime },
