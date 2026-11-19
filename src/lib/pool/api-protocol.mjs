@@ -292,6 +292,7 @@ export async function runApiInference({
   personaHideTokens,
   cacheTtl,
   converters,
+  onPublicLine = null,
   requestContext = null,
   passthrough = false,
   routing = null,
@@ -623,6 +624,7 @@ export async function runApiInference({
     if (protocol === 'anthropic.messages') {
       if (!res.headersSent) converters.writeSSEHeaders(res)
       res.write(String(line).endsWith('\n') ? String(line) : `${line}\n`)
+      onPublicLine?.(line)
       return
     }
     const writeChunks = (chunks) => {
