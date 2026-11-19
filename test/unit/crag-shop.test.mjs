@@ -441,8 +441,13 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
   assert.equal(failed.http, 503)
   const [[id, firstReceipt]] = saved
   assert.equal(JSON.stringify(failed).includes(firstReceipt), false)
-  assert.equal((await call(PERSON, 'GET', '/orders')).data.orders[0].status, 'reserved')
-  assert.equal((await call(PERSON, 'POST', `/orders/${id}/cancel`, {})).error.code, 'shop_order_cannot_cancel')
+  const listed = (await call(PERSON, 'GET', '/orders')).data.orders[0]
+  assert.equal(listed.status, 'reserved')
+  // A create that never returned a checkout form leaves an orphaned reservation. The
+  // buyer never received a payment link, so it is offered as cancelable even while the
+  // supplier is unavailable. The replay below still needs this reservation, so only the
+  // offer is asserted here; `fulfilled` refusing a cancel is asserted further down.
+  assert.equal(listed.cancelable, true)
   db.close()
   db = createDatabase({ dbPath })
   handle = handler()

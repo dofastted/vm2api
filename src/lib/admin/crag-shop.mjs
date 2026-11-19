@@ -23,6 +23,9 @@ const MAX_BODY = 4096
 const PAGE_SIZE = 100
 const ACTIVATION_WINDOW = 24 * 60 * 60
 const ACTIVATION_LEASE = 120
+// Supplier order states before money arrives. ORDER_STATES is ordered, so everything
+// up to 'paid' is still unpaid; the supplier protocol has no expired or cancelled state.
+const UNPAID_STATES = ORDER_STATES.slice(0, ORDER_STATES.indexOf('paid'))
 const nowSeconds = () => Math.floor(Date.now() / 1000)
 
 export const isCragShopPath = (pathname) => pathname === ROOT || pathname.startsWith(`${ROOT}/`)
@@ -202,7 +205,11 @@ function view(row) {
     slot_limit,
   }
   if (row.dispatch_state === 'cancelled') return result
-  if (row.dispatch_state === 'unsent') result.cancelable = true
+  // An unsent order is cancelable outright. A submitted one is offered only while the
+  // locally known state is unpaid; the cancel route re-checks with the supplier before
+  // it writes, because the local status can lag behind a payment.
+  if (row.dispatch_state === 'unsent' || (row.dispatch_state === 'submitted' && UNPAID_STATES.includes(status)))
+    result.cancelable = true
   for (const key of ['expected_amount_minor', 'months', 'subtotal_minor', 'discount_minor', 'remaining']) {
     if (row[key] != null) result[key] = row[key]
   }
@@ -654,15 +661,39 @@ export function createCragShopHandler({
         if (Object.keys(input).length !== 0) throw badBody()
       }
       if (route === 'cancel') {
+        // The supplier protocol has no cancel endpoint and no expired state, so a
+        // submitted order stays 'pending' there forever and has to be closed locally.
+        if (row.dispatch_state === 'submitted') {
+          if (!UNPAID_STATES.includes(row.status))
+            throw failure(409, 'shop_order_paid', 'This order was already paid and cannot be cancelled')
+          // 'reserved' means create never returned a checkout form, so the buyer never
+          // received a payment link and cannot have paid: close it without asking the
+          // supplier, which is what makes an order orphaned by a failed create
+          // cancelable even while the supplier is down. A 'pending' order does have a
+          // live payment link, so re-read it first — the local status can lag a payment
+          // and cancelling a paid order would keep the money while dropping the
+          // entitlement. An order the supplier no longer knows (404) is cancelable.
+          if (row.status !== 'reserved') {
+            let current = row
+            try {
+              const receipt = deriveOrderReceipt(receiptKey(db), row.order_id)
+              current = reflectOrder(db, owner, await supplier.status(row, receipt))
+            } catch (error) {
+              if (!(error instanceof ShopError) || error.code !== 'shop_order_not_found') throw error
+            }
+            if (!UNPAID_STATES.includes(current.status))
+              throw failure(409, 'shop_order_paid', 'This order was already paid and cannot be cancelled')
+          }
+        }
         durable(db, () =>
           db
             .prepare(`UPDATE crag_shop_orders SET dispatch_state = 'cancelled', activation_next_at = NULL
-            WHERE owner = ? AND order_id = ? AND dispatch_state = 'unsent'`)
+            WHERE owner = ? AND order_id = ? AND dispatch_state IN ('unsent', 'submitted')`)
             .run(owner, row.order_id),
         )
         const current = findOrder(db, owner, orderId)
         if (current.dispatch_state !== 'cancelled')
-          throw failure(409, 'shop_order_cannot_cancel', 'Only orders not sent to the supplier can be cancelled')
+          throw failure(409, 'shop_order_cannot_cancel', 'This order can no longer be cancelled')
         return ok(view(current))
       }
       if (row.dispatch_state === 'cancelled') {

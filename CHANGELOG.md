@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 已提交给商城但未支付的 CRAG 订单现在可以在面板取消。`reserved`（下单请求没拿到支付表单，买家从未收到支付链接）直接关闭，商城不可用时也能清理；`pending`（支付链接有效）先向商城复核，仍未支付才关闭，已支付的返回 `shop_order_paid` 并拒绝取消。此前只有未发给商城的订单可取消，导致失败的下单留下的订单永久堆积在历史里。
+
 ## 1.4.154 — 2026-11-19 · OAuth Cookie 桥接与 CRAG 3.1.7
 
 - Cookie 导入改为在 `kin-worker` 内铸造 session code（经 Chrome-TLS 桥），普通 fetch 会被上游以 `missing_client_attestation` 拒绝。helper 新增可选输入 `worker_config_path`，guest 槽继续走 `KERNEL_CONFIG`；缺少新 `kin-worker` 时明确报错，不再静默降级（#1297）。

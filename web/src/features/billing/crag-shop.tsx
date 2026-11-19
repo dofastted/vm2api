@@ -783,8 +783,12 @@ function ShopOrders({
       await action()
     } catch (error) {
       setProblem(
-        isApiError(error) && error.code === 'shop_order_cannot_cancel'
-          ? '商城可能已收到此订单，不能在面板取消。请刷新订单核对状态。'
+        isApiError(error) &&
+          (error.code === 'shop_order_paid' ||
+            error.code === 'shop_order_cannot_cancel')
+          ? error.code === 'shop_order_paid'
+            ? '此订单已完成支付，不能取消。请刷新查看交付状态。'
+            : '订单状态已变化，无法取消。请刷新订单核对状态。'
           : isApiError(error) && error.code === 'shop_device_package_unready'
             ? '本机缺少可用的 CRAG 发行包。请让管理员从内核页拉取后，重试应用原订单。'
             : isApiError(error) &&
