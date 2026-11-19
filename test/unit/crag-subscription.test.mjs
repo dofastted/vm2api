@@ -640,6 +640,41 @@ test('standalone recovery waits for the original verified host package before re
   assert.equal(fs.readFileSync(entitlement, 'utf8'), issued.code)
 })
 
+test('the exact pending voucher can resume after a lost response, even when an intermediate attempt is denied', async (t) => {
+  const redemption_code = voucher()
+  let issued
+  let attempts = 0
+  const { root, publicDir, privateDir, connect } = standaloneHost(t, async (url, { body }) => {
+    assert.ok(url.endsWith('/redeem'))
+    const request = JSON.parse(body)
+    assert.equal(request.redemption_code, redemption_code)
+    attempts++
+    if (attempts === 1) {
+      issued = issueHostEntitlement(root, request.host_id, { slot_limit: 2 })
+      throw new Error('fixture lost the committed response')
+    }
+    if (attempts === 2) {
+      return Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+    }
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+  })
+  seedEncryptedPackage(root)
+  const initial = await postSubscription(connect())('redeem', { redemption_code })
+  assert.equal(initial.status, 502)
+  const denied = await postSubscription(connect())('recover', {})
+  assert.equal(denied.status, 403)
+  assert.equal((await connect().status()).state, 'sync_pending')
+  const blocked = await postSubscription(connect())('redeem', { redemption_code: voucher() })
+  assert.equal(blocked.status, 409)
+  assert.equal(attempts, 2)
+  const replayed = await postSubscription(connect())('redeem', { redemption_code })
+  assert.equal(replayed.status, 200)
+  assert.equal(replayed.data.revision, issued.claims.revision)
+  assert.equal(replayed.data.slot_limit, 2)
+  assert.equal(fs.existsSync(path.join(privateDir, 'redeem.json')), false)
+  assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
+})
+
 test('an Authority denial is not retried or installed, and only a valid correlation ID is exposed', async (t) => {
   const redemption_code = voucher()
   const requestId = crypto.randomUUID()
