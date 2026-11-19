@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import net from 'node:net'
+import { once } from 'node:events'
 import {
   egressContainerName,
   egressContainerSpec,
@@ -11,6 +13,7 @@ import {
   inspectEgressProcess,
   nativeDockerPlatform,
   startEgressProcess,
+  startProxyEgress,
   stopEgressProcess,
 } from '../../src/lib/vm/egress.mjs'
 
@@ -280,6 +283,75 @@ test('inspect reports a surviving helper on a replaced binary as stale', async (
   const repaired = await fx.start()
   assert.equal(repaired.reused, false)
   assert.equal(inspectEgressProcess(fx.root, 'px-ctr', opts).ok, true)
+})
+
+test('an unavailable Docker inspector cannot justify replacing a running helper', async (t) => {
+  const fx = fixture(t)
+  await fx.start()
+  const calls = []
+  const runDocker = (args) => {
+    calls.push(args[0])
+    return { ok: false, stderr: 'Cannot connect to the Docker daemon' }
+  }
+  const current = inspectEgressProcess(fx.root, 'px-ctr', { runtime: 'container', runDocker })
+  assert.equal(current.pending, true)
+  assert.equal(current.reason, 'egress_container_inspect_unavailable')
+  const stopped = await fx.start({ runDocker, image: 'sha256:selfimage' })
+  assert.equal(stopped.error, current.reason)
+  assert.deepEqual(calls, ['inspect', 'inspect'])
+  assert.equal(fx.helper().running, true)
+})
+
+test('a stalled helper startup lets a timer run on the same event loop', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const fx = fixture(t)
+  const listener = net.createServer()
+  listener.listen(0, '127.0.0.1')
+  await once(listener, 'listening')
+  const { port } = listener.address()
+  listener.close()
+  await once(listener, 'close')
+
+  const runtime = process.env.KIN_EGRESS_RUNTIME
+  process.env.KIN_EGRESS_RUNTIME = 'container'
+  let timer
+  t.after(async () => {
+    if (runtime === undefined) delete process.env.KIN_EGRESS_RUNTIME
+    else process.env.KIN_EGRESS_RUNTIME = runtime
+    clearTimeout(timer)
+    if (listener.listening) await new Promise((resolve) => listener.close(resolve))
+  })
+
+  let settled = false
+  let timerRanWhilePending = false
+  const runDocker = (args) => {
+    if (args[0] === 'network' && args[1] === 'inspect') return { ok: true, stdout: '172.31.250.0/24|127.0.0.1' }
+    const result = fx.d.run(args)
+    if (args[0] === 'run' && result.ok) {
+      // Simulate a helper whose TCP port becomes ready only after the startup poll yields.
+      timer = setTimeout(() => {
+        timerRanWhilePending = !settled
+        listener.listen(port, '127.0.0.1')
+      }, 25)
+    }
+    return result
+  }
+  const result = await startProxyEgress(
+    fx.root,
+    { id: 'px-ctr', url: 'socks5h://192.0.2.1:1080' },
+    {
+      runDocker,
+      runIptables: () => ({ ok: true }),
+      bin: fx.bin,
+      ports: { tcp: port, dns: 0 },
+      dnsUpstream: '',
+      dnsEmptyTypes: [],
+    },
+  )
+  settled = true
+  assert.equal(timerRanWhilePending, true, `startup settled before the same-process timer: ${result.error}`)
+  assert.equal(result.ok, true, result.error)
 })
 
 test('process runtime removes a helper container left by the container runtime before taking the ports', async (t) => {

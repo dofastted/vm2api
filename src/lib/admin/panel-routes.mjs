@@ -546,7 +546,7 @@ function mergeKernelReports(local, cluster) {
   }
 }
 
-// The entrypoint auto-sync and the panel upgrade can both ask at once; a slot must not be recreated twice concurrently.
+// Startup auto-sync and panel upgrades share the same queue so a slot is not recreated concurrently.
 let kernelSyncTail = Promise.resolve()
 
 /** Acquire an exact VM scope in canonical order; callers inside must not re-enter it. */
@@ -566,7 +566,7 @@ function kernelSyncIds(project, body = {}) {
     .map((vm) => vm.id)
 }
 
-function syncInstalledKernels(args, operation = runKernelSync) {
+export function syncInstalledKernels(args, operation = runKernelSync) {
   // Snapshot at admission, not after waiting for another sync or installer.
   const ids = kernelSyncIds(args.project, args.body)
   const exact = { ...args, body: { ...args.body, ids } }

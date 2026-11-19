@@ -693,7 +693,12 @@ export function createSlotBridgeHealer({
   ops = {},
   logger = console,
 }) {
-  const egressAlive = ops.egressAlive || ((proxyId) => inspectEgressProcess(projectRoot, proxyId).ok)
+  const egressAlive =
+    ops.egressAlive ||
+    ((proxyId) => {
+      const result = inspectEgressProcess(projectRoot, proxyId)
+      return result.ok || result.pending
+    })
   const startEgress = ops.ensureProxyEgress || ((proxy) => ensureProxyEgress(projectRoot, proxy))
   const getCluster = ops.cluster || cluster
   const lastAttempt = new Map()

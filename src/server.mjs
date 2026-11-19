@@ -7,6 +7,7 @@
  * OAuth import it may spawn official Claude Code once (slot SOCKS5) to seed
  * ~/.claude.json and complete a plan turn.
  */
+import { spawnSync } from 'node:child_process'
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -64,8 +65,7 @@ import {
   listVms,
   getVm,
   getActiveVmId,
-  setScheduleHold,
-  clearScheduleHold,
+  reconcileProxyScheduleHold,
   isCodexVm,
   syncCodexQuotaSchedule,
 } from './lib/vm/vm-registry.mjs'
@@ -75,7 +75,6 @@ import { configureCragRuntimeAdmission } from './lib/vm/slot-runtime-admission.m
 import { syncRemoteSlotRestartPolicy } from './lib/cluster/remote-slot.mjs'
 import { installedCragV2Root } from './lib/vm/wrap-cli-runtime.mjs'
 import { makeError, ErrorType, ErrorCode } from './lib/core/errors.mjs'
-import { HOLD_PROXY } from './lib/pool/schedule-state.mjs'
 import * as panel from './lib/admin/panel-api.mjs'
 import { ProxyPool } from './lib/vm/proxy-pool.mjs'
 import { ensureProxyEgress, proxyEgressReady } from './lib/vm/egress.mjs'
@@ -127,7 +126,7 @@ import { createHandleProtocol } from './lib/protocol/handle-protocol.mjs'
 import { createResponsesWsHandler } from './lib/protocol/responses-ws.mjs'
 import { handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
 import { createKeySelfHandler, KEY_SELF_PATHS } from './lib/protocol/key-self.mjs'
-import { createPanelHandler } from './lib/admin/panel-routes.mjs'
+import { createPanelHandler, syncInstalledKernels } from './lib/admin/panel-routes.mjs'
 import { createCragShopHandler, isCragShopPath, sessionBuyerOwner } from './lib/admin/crag-shop.mjs'
 
 const FEATURES = [
@@ -158,6 +157,38 @@ const LIMITATIONS = {
 const cfg = loadConfig()
 if (!getPanelAdmin().password) {
   throw new Error('VM2API_ADMIN_PASSWORD must be set; insecure default panel credentials are disabled')
+}
+// Egress state lives under the project root even when SQLite uses KIN_DATA_DIR.
+const stateDir = path.join(cfg.paths.project, 'data')
+const inheritedLockFd = process.env.VM2API_BOOTSTRAP_LOCK_FD
+const syncWrapAtStartup =
+  inheritedLockFd !== undefined &&
+  process.env.VM2API_BOOTSTRAP_WRAP_CHANGED === '1' &&
+  process.env.KIN_AUTO_SYNC_WRAP === '1'
+delete process.env.VM2API_BOOTSTRAP_LOCK_FD
+delete process.env.VM2API_BOOTSTRAP_WRAP_CHANGED
+fs.mkdirSync(stateDir, { recursive: true })
+// Bootstrap passes the same open file description through exec, without releasing the lock.
+// Node marks inherited fds close-on-exec, so helpers do not extend the owner's lifetime.
+const controlPlaneFd =
+  inheritedLockFd === undefined
+    ? fs.openSync(stateDir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY)
+    : Number(inheritedLockFd)
+if (inheritedLockFd !== undefined) {
+  const actual = fs.fstatSync(controlPlaneFd, { bigint: true })
+  const expected = fs.statSync(stateDir, { bigint: true })
+  if (actual.dev !== expected.dev || actual.ino !== expected.ino) {
+    throw new Error('vm2api_control_plane_lock_failed: bootstrap fd does not identify project data')
+  }
+}
+const lock = spawnSync('flock', ['-n', '-E', '75', '3'], {
+  stdio: ['ignore', 'ignore', 'pipe', controlPlaneFd],
+  encoding: 'utf8',
+})
+if (lock.status !== 0) {
+  fs.closeSync(controlPlaneFd)
+  if (lock.status === 75) throw new Error('vm2api_control_plane_already_running: stop the other controller first')
+  throw new Error(`vm2api_control_plane_lock_failed: ${lock.error?.message || lock.stderr?.trim() || lock.signal}`)
 }
 fs.mkdirSync(cfg.paths.captures, { recursive: true })
 
@@ -385,20 +416,14 @@ proxyPool = new ProxyPool({
     if (state === 'idle' || state === 'connecting') return { pending: true, error: `node_link_${state}` }
     return { ok: false, error: `node_link_${state}` }
   },
-  onDisableVm: (vmId, reason, proxyId) => {
-    setScheduleHold(cfg.paths.project, vmId, HOLD_PROXY, { tag: proxyId, message: reason })
+  usesHostEgress: (vmId, proxyId) => {
+    const vm = getVm(cfg.paths.project, vmId)
+    return vm?.proxy?.id === proxyId && !vm.node_id && !isCodexVm(vm) && ['running', 'paused'].includes(vm.status)
   },
-  onDisconnectVm: (vmId, reason, proxyId) => {
-    setScheduleHold(cfg.paths.project, vmId, HOLD_PROXY, { tag: proxyId, message: reason })
-  },
-  // Lifts only the hold this proxy put on the slot (受限); 调度关 / 不可调度 stay.
-  onEnableVm: (vmId, _reason, proxyId) => {
-    const hold = getVm(cfg.paths.project, vmId)?.schedule_hold
-    if (hold?.reason !== HOLD_PROXY) return
-    clearScheduleHold(cfg.paths.project, vmId, HOLD_PROXY, { tag: hold.detail?.tag == null ? null : proxyId })
-  },
+  onDisableVm: (vmId, reason, proxyId) => reconcileProxyScheduleHold(cfg.paths.project, vmId, proxyId, reason),
+  onEnableVm: (vmId, _reason, proxyId) => reconcileProxyScheduleHold(cfg.paths.project, vmId, proxyId),
   egressCheck: (proxy) => proxyEgressReady(proxy, cfg.paths.project),
-  repairEgress: (proxy) => ensureProxyEgress(cfg.paths.project, proxy),
+  repairEgress: (proxy, shouldStart) => ensureProxyEgress(cfg.paths.project, proxy, { shouldStart }),
 })
 // An upgrade replaces bin/ files; slots mounting data/run/slot-guest-bin must see the new ones.
 try {
@@ -1643,4 +1668,15 @@ server.listen(cfg.port, cfg.host, () => {
       rewrite: cfg.rewrite.enabled,
     }),
   )
+  if (syncWrapAtStartup) {
+    // Stay in the owning process: an HTTP request could hit a different controller after a failed start.
+    void Promise.resolve()
+      .then(() => syncInstalledKernels({ project: cfg.paths.project, routingConfig, body: { restart: true } }))
+      .then((report) => {
+        const summary = `${report.ok_count}/${report.total}, failed=${report.failed_count}`
+        if (report.ok) console.log(`vm2api: wrap-cli slot sync complete (${summary})`)
+        else console.error(`vm2api: wrap-cli slot sync failed (${summary})`)
+      })
+      .catch((error) => console.error(`vm2api: wrap-cli slot sync failed: ${error?.message || error}`))
+  }
 })
