@@ -2182,10 +2182,12 @@ unixTest('kernel preparation isolates controls without rewriting tool continuati
     if (sent.body.crag_prompt) {
       assert.deepEqual(sent.body.crag_options, { effort: 'high' })
       assert.equal(sent.body.auto_compact_window, undefined)
+      assert.equal(Object.hasOwn(sent.body, 'diagnostics'), false)
     } else {
       assert.equal(sent.body.crag_model, undefined)
       assert.equal(sent.body.crag_options, undefined)
       assert.equal(sent.body.auto_compact_window, 200000)
+      assert.deepEqual(sent.body.diagnostics, { previous_message_id: null })
     }
     res.writeHead(409, { 'content-type': 'application/json' })
     res.end(
@@ -2208,6 +2210,7 @@ unixTest('kernel preparation isolates controls without rewriting tool continuati
         crag_prompt: { mode: 'append', text: 'caller instruction' },
         crag_options: { transport: 'print', effort: 'high' },
         auto_compact_window: 200000,
+        diagnostics: { previous_message_id: null },
         safeguards: { synthetic_extension: true },
       }
       const result = await callGoWorker({ exec, cliHop: true, ...(prebuilt ? { envelope: { body } } : { body }) })
