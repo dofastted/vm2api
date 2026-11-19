@@ -25,6 +25,7 @@ import {
   isLocalEgressProxy,
   LOCAL_EGRESS_ID,
   networkName,
+  portFromListenSpec,
   portsForProxy,
   proxyKey,
 } from '../vm/egress.mjs'
@@ -474,7 +475,66 @@ export function slotEgressNames(vmId) {
     egress: `${slot}-egress`,
     bridge: `keg${tag}`,
     chain: `KEG${tag}`,
+    // Bare hash of the VM id, and only a starting point: see
+    // resolveRemoteEgressPorts, which keeps an already-started pair and
+    // otherwise probes past the pairs other slots on the node hold.
     ports: portsForProxy(vmId),
+  }
+}
+
+/** Port pair out of a slot's own egress.json; null when it was never started. */
+async function readRemoteEgressPorts(session, dir, { readFile = readRemoteFileNoFollow } = {}) {
+  const body = await readFile(session.client, `${dir}/egress.json`).catch(() => null)
+  if (!body) return null
+  try {
+    const cfg = JSON.parse(body.toString('utf8'))
+    const tcp = portFromListenSpec(cfg?.listen_tcp)
+    const dns = portFromListenSpec(cfg?.listen_dns)
+    return tcp && dns ? { tcp, dns } : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Ports already spoken for on a node: every slot's recorded pair, plus whatever
+ * is actually listening. Extracted on the node rather than shipped over, since a
+ * node at scale holds thousands of configs.
+ */
+async function remoteAllocatedPorts(session, { run = runRemote } = {}) {
+  const root = shellQuote(`${session.host.root}/vms`)
+  const script = [
+    `awk -F'"' '/listen_(tcp|dns)/{n=split($4,a,":"); print a[n]}' ${root}/*/egress/egress.json 2>/dev/null || true`,
+    `ss -ltnH 2>/dev/null | awk '{n=split($4,a,":"); print a[n]}' || true`,
+  ].join('\n')
+  const used = new Set()
+  const out = await run(session.client, script).catch(() => '')
+  for (const line of String(out || '').split('\n')) {
+    const port = Number(line.trim())
+    if (Number.isInteger(port) && port > 0 && port < 65536) used.add(port)
+  }
+  return used
+}
+
+/**
+ * The pair this slot's helper should listen on.
+ *
+ * An already-started helper keeps its pair: the iptables rows that REDIRECT into
+ * it were written with those ports, and moving them would leave the rules
+ * pointing at a port nothing listens on. Only a fresh exit probes, and then it
+ * steps past the pairs other slots on the node already hold -- the bare hash has
+ * 8000 slots and no collision check, so two slots on a busy node can otherwise
+ * land on the same pair and have their traffic redirected into each other's
+ * helper.
+ */
+export async function resolveRemoteEgressPorts(session, vmId, dir, io = {}) {
+  const persisted = await readRemoteEgressPorts(session, dir, io)
+  if (persisted) return { ...persisted, reused: true }
+  const used = await remoteAllocatedPorts(session, io)
+  if (!used.size) return { ...portsForProxy(vmId), reused: false }
+  return {
+    ...portsForProxy(vmId, { taken: (pair) => used.has(pair.tcp) || used.has(pair.dns) }),
+    reused: false,
   }
 }
 
@@ -575,6 +635,12 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
     return { ok: false, code: 'egress_sudo_required', error: '节点需要 root 或免密 sudo 才能为 SOCKS5 出口写 iptables' }
   }
   const names = slotEgressNames(vm.id)
+  // Beside the slot tree, outside every guest bind: the guest never sees the proxy password.
+  const dir = `${remoteSlotDir(session.host, vm.id)}/egress`
+  // Resolved before the config is built: an existing helper keeps its pair so the
+  // iptables rows that REDIRECT into it stay aligned, and a fresh one steps past
+  // the pairs other slots on this node hold.
+  const ports = await resolveRemoteEgressPorts(session, vm.id, dir)
   // Keep the helper's executable on the persistent mount even when egress is
   // enabled independently of a slot start/update.
   const slotBin = shellQuote(`${remoteSlotDir(session.host, vm.id)}/slot-bin`)
@@ -589,16 +655,14 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
   const cfg = {
     proxy_id: proxyId,
     proxy_url: proxyUrl,
-    listen_tcp: `${net.gateway}:${names.ports.tcp}`,
-    listen_dns: `${net.gateway}:${names.ports.dns}`,
+    listen_tcp: `${net.gateway}:${ports.tcp}`,
+    listen_dns: `${net.gateway}:${ports.dns}`,
   }
   const dnsUpstream = configuredDnsUpstream()
   if (dnsUpstream) cfg.dns_upstream = dnsUpstream
   const dnsEmptyTypes = configuredDnsEmptyTypes()
   if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
   const body = `${JSON.stringify(cfg, null, 2)}\n`
-  // Beside the slot tree, outside every guest bind: the guest never sees the proxy password.
-  const dir = `${remoteSlotDir(session.host, vm.id)}/egress`
   const { digest, spec } = remoteEgressContainer({
     vmId: vm.id,
     proxyId,
@@ -630,7 +694,7 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
     await containerAction(session.docker, names.egress, 'start')
   }
   // Passive: a TCP connect would enter kin-egress's transparent path (it refuses self-destined conns).
-  const tcp = names.ports.tcp
+  const tcp = ports.tcp
   const probe = `for i in $(seq 1 40); do ss -H -ltn 'sport = :${tcp}' | awk '{print $4}' | grep -qxF -e '${net.gateway}:${tcp}' -e '0.0.0.0:${tcp}' -e '*:${tcp}' && exit 0; sleep 0.2; done; exit 1`
   await runRemote(session.client, `bash -c ${shellQuote(probe)}`, { timeoutMs: 20_000, code: 'egress_not_listening' })
   const plan = iptablesPlan({
@@ -638,12 +702,20 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
     bridge: net.bridge,
     subnet: net.subnet,
     tcpPort: tcp,
-    dnsPort: names.ports.dns,
+    dnsPort: ports.dns,
   })
   await runRemote(session.client, remoteIptablesScript(plan, { sudo: session.host.uid !== 0 }), {
     code: 'egress_iptables_failed',
   })
-  return { ok: true, mode: 'socks', network: net.name, egress: names.egress, reused: reuse, reloaded }
+  return {
+    ok: true,
+    mode: 'socks',
+    network: net.name,
+    egress: names.egress,
+    reused: reuse,
+    reloaded,
+    ports: { tcp: ports.tcp, dns: ports.dns },
+  }
 }
 /** Policy changes stop only the exit helper, preserving slot containers and bindings. */
 export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
@@ -717,12 +789,17 @@ export async function releaseRemoteEgress(session, networkMode) {
   }
   const subnet = info.IPAM?.Config?.[0]?.Subnet
   if (exit.egress && subnet) {
+    // Read back the pair the helper was started with. Probing means the hash is
+    // only a starting point, so recomputing it here would delete rows for ports
+    // this exit never used and leave its real ones behind.
+    const started = exit.dir ? await readRemoteEgressPorts(session, exit.dir) : null
+    const ports = started || exit.ports
     const plan = iptablesPlan({
       chain: exit.chain,
       bridge: exit.bridge,
       subnet,
-      tcpPort: exit.ports.tcp,
-      dnsPort: exit.ports.dns,
+      tcpPort: ports.tcp,
+      dnsPort: ports.dns,
     })
     const ipt = `${session.host.uid !== 0 ? 'sudo -n ' : ''}iptables`
     // Each row may already be gone; deletion keeps going like the local removeIptables.
