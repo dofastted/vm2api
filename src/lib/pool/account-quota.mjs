@@ -14,18 +14,21 @@ import { AccountsRepo } from '../db/repos/accounts-repo.mjs'
 import { computeWeeklySplit, weeklySplitConfig } from './weekly-split.mjs'
 import {
   applyEffectiveWindows,
+  effectiveRateWindow,
   extraHeadersFromLimitError,
   extraIsLiveOpen,
   headerHardBlocked,
   headerWindow,
   headerWindowOrEmpty,
+  isOfficialWindowLimited,
   leftoverClearHeaderWindows,
   listQuotaFromHeaders,
   officialWindow,
   parseResetMs,
   wipeElapsedHeaderWindows,
+  wipeElapsedWindow,
 } from './quota-window.mjs'
-import { rollWindowHistory } from './window-history.mjs'
+import { HISTORY_WINDOW_MS, rollWindowHistory } from './window-history.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from './quota-tiers.mjs'
 import { resolvePolicyModelId } from '../protocol/model-policy.mjs'
 import { isFableCreditsRequiredMessage } from './upstream-error-policy.mjs'
@@ -148,12 +151,27 @@ export class AccountQuota {
     } catch {}
   }
 
-  /** Archive the window that just rolled over; live headers win over the official probe, as in `_writeSessionWindow`. */
+  /**
+   * Archive the window that just rolled over. A live header reading wins over the
+   * official probe; once its reset has passed it belongs to the closed window and
+   * the official reading of the newer window counts, unless it is a leftover 100%
+   * (no gateway traffic since that window started).
+   */
   _rollWindowHistory(acc) {
     if (!acc?.unified) return
+    const now = Date.now()
     const read = (key) => {
       const extra = headerWindow(acc.unified, key)
-      return extra.utilization != null && extra.reset ? extra : officialWindow(acc.unified, key)
+      if (extra.utilization != null && parseResetMs(extra.reset) > now) return extra
+      const official = officialWindow(acc.unified, key)
+      if (!isOfficialWindowLimited(official, { now })) return official
+      const effective = effectiveRateWindow(official, {
+        now,
+        lastUsedAt: this._lastUsedAt(acc.account_id),
+        source: 'vm-oauth-usage',
+        durationMs: HISTORY_WINDOW_MS[key],
+      })
+      return effective.stale ? null : official
     }
     acc.window_history = rollWindowHistory(acc.window_history, { '5h': read('5h'), '7d': read('7d') })
   }
@@ -214,6 +232,7 @@ export class AccountQuota {
     const writeExtra = countRequest || exhausted
     const u5 = num(h['anthropic-ratelimit-unified-5h-utilization'])
     const u7 = num(h['anthropic-ratelimit-unified-7d-utilization'])
+    const sampledAt = new Date().toISOString()
     let sampled = false
     if (exhausted) {
       dropElapsedReset(acc, '5h', h['anthropic-ratelimit-unified-5h-reset'])
@@ -227,6 +246,7 @@ export class AccountQuota {
         utilization: u5,
         reset: h['anthropic-ratelimit-unified-5h-reset'],
         status: h['anthropic-ratelimit-unified-5h-status'] || (u5 != null ? statusFromUtil(u5) : null),
+        sampled_at: sampledAt,
       })
       sampled = true
     }
@@ -238,6 +258,7 @@ export class AccountQuota {
         utilization: u7,
         reset: h['anthropic-ratelimit-unified-7d-reset'],
         status: h['anthropic-ratelimit-unified-7d-status'] || (u7 != null ? statusFromUtil(u7) : null),
+        sampled_at: sampledAt,
       })
       sampled = true
     }
@@ -266,7 +287,7 @@ export class AccountQuota {
       acc.unified.overage_status = h['anthropic-ratelimit-unified-overage-status']
     }
     acc.unified.updated_at = new Date().toISOString()
-    if (sampled) acc.unified.headers.sampled_at = new Date().toISOString()
+    if (sampled) acc.unified.headers.sampled_at = sampledAt
 
     const usage = normalizeUsage(disjointOpenaiUsage(usageBody || {}) || {})
     if (
@@ -283,7 +304,7 @@ export class AccountQuota {
     }
     if (countRequest) acc.requests += 1
 
-    if (exhausted) applyHeaderExhausted(acc, h)
+    if (exhausted) applyHeaderExhausted(acc, h, sampledAt)
 
     if (countRequest) {
       const view = headerWindowOrEmpty(acc.unified, '5h')
@@ -301,6 +322,7 @@ export class AccountQuota {
       })
     }
 
+    settleElapsedHeaderWindows(acc, sampledAt)
     this._rollWindowHistory(acc)
     const saved = this.repo.save(acc)
     this._writeSessionWindow(saved)
@@ -493,6 +515,7 @@ export class AccountQuota {
       healOfficialOverwriteExtra(acc, accountId, this.repo)
       clearHeaderExhaustIfOfficialOpen(acc)
     }
+    settleElapsedHeaderWindows(acc, nowIso)
     this._rollWindowHistory(acc)
     const saved = this.repo.save(acc)
     this._writeSessionWindow(saved)
@@ -518,6 +541,7 @@ export class AccountQuota {
   ingestCliRateLimit(accountId, rateLimitInfo, usageBody = null, { countRequest = null } = {}) {
     const acc = this.ensure({ account_id: accountId })
     const infos = Array.isArray(rateLimitInfo) ? rateLimitInfo : rateLimitInfo ? [rateLimitInfo] : []
+    const sampledAt = new Date().toISOString()
     for (const info of infos) {
       if (!info || typeof info !== 'object') continue
       const typ = String(info.rateLimitType || info.rate_limit_type || '')
@@ -530,6 +554,7 @@ export class AccountQuota {
           status: info.status || (utilization != null ? statusFromUtil(utilization) : null),
           reset: info.resetsAt != null || info.resets_at != null ? epochToIso(info.resetsAt ?? info.resets_at) : null,
           utilization,
+          sampled_at: sampledAt,
         })
         acc.unified.headers[window].rate_limit_type = typ || null
         if (['rejected', 'rate_limited'].includes(String(info.status || '').toLowerCase())) {
@@ -563,6 +588,7 @@ export class AccountQuota {
       tokens_out: usageBody?.output_tokens ?? null,
     })
 
+    settleElapsedHeaderWindows(acc, sampledAt)
     this._rollWindowHistory(acc)
     return this.repo.save(acc)
   }
@@ -1378,18 +1404,43 @@ function isUnifiedRejected(h = {}) {
   return s5 === 'rejected' || s5 === 'rate_limited' || s7 === 'rejected' || s7 === 'rate_limited'
 }
 
+/**
+ * Merge one reading into an Extra window. Each window keeps its own `sampled_at`:
+ * a response that names only 7d must not make the 5h number look freshly read.
+ * A stored window whose reset already passed has ended, so none of its values
+ * carry into the new reading.
+ */
 function writeHeaderWindow(acc, key, incoming = {}) {
   acc.unified.headers = acc.unified.headers || {}
-  const cur = acc.unified.headers[key] || {}
+  const stored = acc.unified.headers[key] || {}
+  const cur = parseResetMs(stored.reset) <= Date.now() ? {} : stored
   const next = {
     utilization: incoming.utilization != null ? incoming.utilization : (cur.utilization ?? null),
     reset: incoming.reset || incoming.resets_at || cur.reset || null,
     status: incoming.status || cur.status || null,
   }
-  if (incoming.rate_limit_type || cur.rate_limit_type) {
-    next.rate_limit_type = incoming.rate_limit_type || cur.rate_limit_type
+  if (incoming.rate_limit_type || stored.rate_limit_type) {
+    next.rate_limit_type = incoming.rate_limit_type || stored.rate_limit_type
   }
+  const sampledAt = incoming.sampled_at || cur.sampled_at
+  if (sampledAt) next.sampled_at = sampledAt
   acc.unified.headers[key] = next
+}
+
+/**
+ * A 5h/7d window this write did not read again, whose reset has passed, is
+ * stored as stale now (as `persistEffectiveWindows` would later), instead of
+ * keeping the last window's numbers beside fresher ones.
+ */
+function settleElapsedHeaderWindows(acc, sampledAt, now = Date.now()) {
+  const headers = acc?.unified?.headers
+  if (!headers) return
+  for (const key of ['5h', '7d']) {
+    const window = headers[key]
+    if (!window || window.stale || (sampledAt && window.sampled_at === sampledAt)) continue
+    const wiped = wipeElapsedWindow(window, now)
+    if (wiped) headers[key] = wiped
+  }
 }
 
 function officialUtilToExtra(value) {
@@ -1432,10 +1483,15 @@ function shouldCopyOfficialToExtra(official, extra, now = Date.now()) {
   return false
 }
 
-/** Official /usage writes Extra only when Extra is empty, elapsed, or leftover rejected. */
+/**
+ * Official /usage writes Extra only when Extra is empty, elapsed, or leftover rejected.
+ * Only what it copies counts as sampled at the probe time.
+ */
 function syncActiveToPassive(acc, sampledAt) {
   acc.unified.headers = acc.unified.headers || {}
   const now = Date.now()
+  const at = sampledAt || new Date(now).toISOString()
+  let copied = false
   for (const key of ['5h', '7d']) {
     const src = acc.unified.official?.[key] || acc.unified[key]
     const extra = acc.unified.headers[key]
@@ -1448,7 +1504,9 @@ function syncActiveToPassive(acc, sampledAt) {
       utilization: officialUtilToExtra(src.utilization),
       reset: officialReset || extra?.reset || null,
       status: src.status || null,
+      sampled_at: at,
     })
+    copied = true
   }
   const oi = acc.unified['7d_oi']
   if (oi && (oi.utilization != null || oi.status || oi.reset)) {
@@ -1457,8 +1515,9 @@ function syncActiveToPassive(acc, sampledAt) {
       reset: oi.reset || acc.unified.headers['7d_oi']?.reset || null,
       status: oi.status || acc.unified.headers['7d_oi']?.status || null,
     }
+    copied = true
   }
-  acc.unified.headers.sampled_at = sampledAt || new Date().toISOString()
+  if (copied) acc.unified.headers.sampled_at = at
 }
 
 function lastHeaderAllocation(repo, accountId) {
@@ -1494,7 +1553,8 @@ function healOfficialOverwriteExtra(acc, accountId, repo) {
   const official = officialWindow(acc.unified, '5h')
   if (!officialLooksLimited(extra) || !officialLooksLimited(official)) return false
   if (extraIsLiveOpen(extra)) return false
-  const sampled = acc.unified.headers.sampled_at
+  // Only undo a value this probe copied; rows written before per-window times use the shared one.
+  const sampled = extra.sampled_at || acc.unified.headers.sampled_at
   const probeAt = acc.last_probe?.at || acc.unified.last_probe?.at
   if (sampled && probeAt) {
     const sampledMs = Date.parse(sampled)
@@ -1508,12 +1568,13 @@ function healOfficialOverwriteExtra(acc, accountId, repo) {
     utilization: prev,
     status: last.status_5h || 'allowed',
     reset: extra.reset || last.reset_5h || official.reset || null,
+    sampled_at: last.at,
   })
   acc.unified.headers.exhausted_at = null
   return true
 }
 
-function applyHeaderExhausted(acc, h = {}) {
+function applyHeaderExhausted(acc, h = {}, sampledAt = new Date().toISOString()) {
   const s5 = String(h['anthropic-ratelimit-unified-5h-status'] || '').toLowerCase()
   const s7 = String(h['anthropic-ratelimit-unified-7d-status'] || '').toLowerCase()
   // Callers only pass exhausted with evidence: a window status, plan-limit
@@ -1528,6 +1589,7 @@ function applyHeaderExhausted(acc, h = {}) {
       utilization: num(h['anthropic-ratelimit-unified-7d-utilization']),
       reset: h['anthropic-ratelimit-unified-7d-reset'],
       status: 'rejected',
+      sampled_at: sampledAt,
     })
   }
   if (hit5 || !hit7) {
@@ -1535,6 +1597,7 @@ function applyHeaderExhausted(acc, h = {}) {
       utilization: num(h['anthropic-ratelimit-unified-5h-utilization']),
       reset: h['anthropic-ratelimit-unified-5h-reset'],
       status: 'rejected',
+      sampled_at: sampledAt,
     })
   }
   acc.unified.headers.exhausted_at = new Date().toISOString()
