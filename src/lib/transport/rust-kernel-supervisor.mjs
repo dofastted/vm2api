@@ -52,7 +52,7 @@ import { slotHost } from '../vm/slot-host.mjs'
 import { repairClaudeConfigFromBackup } from '../vm/claude-config-repair.mjs'
 import { buildNativeTelemetry } from '../vm/native-telemetry.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
-import { RETIRE_LEGACY_TELEMETRY } from '../vm/slot-process-status.mjs'
+import { RETIRE_LEGACY_TELEMETRY, retireScriptVerdict } from '../vm/slot-process-status.mjs'
 import { checkCragLicense } from '../vm/crag-license.mjs'
 import { publishKvmCragLicense } from '../vm/kvm-crag-license.mjs'
 import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
@@ -814,13 +814,22 @@ function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
 
 /** Only actual Linux launches retire the old sender; healthy kernels do no extra exec. */
 async function retireLegacyTelemetryBeforeStart(exec, runDockerExec) {
-  return retireLegacyTelemetryChecked(execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), runDockerExec)
+  const retired = await retireLegacyTelemetryChecked(
+    execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]),
+    runDockerExec,
+  )
+  if (retired.unverified) {
+    console.warn(
+      `[rust-kernel] ${exec?.vmId || exec?.vm?.id || 'unknown'} legacy telemetry retire unverified; boot continues`,
+    )
+  }
+  return retired
 }
 
 /**
- * Shared transport-aware retire: a numeric exit code is the script's verdict,
- * anything else means the exec never completed (node-link flap, timeout,
- * spawn error). One retry, then fail open so transport jitter cannot brick
+ * Shared transport-aware retire: a numeric exit after the script's marker is
+ * its verdict; anything else means the exec never completed (docker CLI
+ * transport error, node-link flap, timeout, spawn error). One retry, then fail open so transport jitter cannot brick
  * a boot; a genuinely stuck sender still fails deterministically.
  */
 export async function retireLegacyTelemetryChecked(argv, runDockerExec) {
@@ -838,10 +847,10 @@ export async function retireLegacyTelemetryChecked(argv, runDockerExec) {
   }
   const first = await attempt()
   if (first?.ok) return { ok: true }
-  if (typeof first?.code === 'number') return deterministicFailure
+  if (retireScriptVerdict(first)) return deterministicFailure
   const retry = await attempt()
   if (retry?.ok) return { ok: true }
-  if (typeof retry?.code === 'number') return deterministicFailure
+  if (retireScriptVerdict(retry)) return deterministicFailure
   return {
     ok: true,
     unverified: true,
