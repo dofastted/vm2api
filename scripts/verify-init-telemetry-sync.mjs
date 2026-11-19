@@ -3,7 +3,9 @@
  * Fixtures never opt a VM in, generate activity, or claim runtime activation.
  * Usage (on the gateway host):
  *   node scripts/verify-init-telemetry-sync.mjs
- *   VERIFY_LIVE=1 node scripts/verify-init-telemetry-sync.mjs
+ *   VERIFY_LIVE=1 node scripts/verify-init-telemetry-sync.mjs   (or: --live)
+ * KIN_VERIFY_BASE is the gateway origin (default http://127.0.0.1:8787); both live
+ * checks append their own paths to it.
  */
 import fs from 'node:fs'
 import os from 'node:os'
@@ -30,12 +32,23 @@ function record(name, ok, detail = '') {
   console.log(`${mark}  ${name}${detail ? `  ${detail}` : ''}`)
 }
 
+const verifyBase = () => (process.env.KIN_VERIFY_BASE || 'http://127.0.0.1:8787').replace(/\/+$/, '')
+
+/** KIN_API_KEY from `systemctl show -p Environment --value`; values may contain `=` (base64 padding). */
+function masterKeyFrom(envText) {
+  for (const pair of String(envText || '').split(/\s+/)) {
+    const at = pair.indexOf('=')
+    if (at > 0 && pair.slice(0, at) === 'KIN_API_KEY') return pair.slice(at + 1)
+  }
+  return ''
+}
+
 function codeOf(res) {
   return Number(res.status || 0)
 }
 
 async function liveHttp() {
-  const base = process.env.KIN_VERIFY_BASE || 'http://127.0.0.1:8787'
+  const base = verifyBase()
   const headers = { Authorization: `Bearer ${FAKE_KEY}`, 'Content-Type': 'application/json' }
   const panel = await fetch(`${base}/api/panel/routing`, { headers })
   record('fake sk-kin cannot GET /api/panel/routing', [401, 403].includes(codeOf(panel)), `http ${codeOf(panel)}`)
@@ -175,8 +188,8 @@ function liveFiles() {
   return occ.sync_telemetry === false
 }
 
+// Only called in live mode; the caller decides (`--live` or VERIFY_LIVE=1).
 async function liveMasterRead() {
-  if (!process.env.VERIFY_LIVE) return
   const envText = await (await import('node:child_process')).execFileSync(
     'systemctl',
     ['show', 'kin-gateway', '-p', 'Environment', '--value'],
@@ -184,15 +197,12 @@ async function liveMasterRead() {
       encoding: 'utf8',
     },
   )
-  const master = String(envText || '')
-    .split(/\s+/)
-    .map((p) => p.split('='))
-    .find((p) => p[0] === 'KIN_API_KEY')?.[1]
+  const master = masterKeyFrom(envText)
   if (!master) {
     record('master key present for routing GET', false, 'KIN_API_KEY missing')
     return
   }
-  const res = await fetch(process.env.KIN_VERIFY_BASE || 'http://127.0.0.1:8787/api/panel/routing', {
+  const res = await fetch(`${verifyBase()}/api/panel/routing`, {
     headers: { Authorization: `Bearer ${master}` },
   })
   const body = await res.json().catch(() => ({}))
