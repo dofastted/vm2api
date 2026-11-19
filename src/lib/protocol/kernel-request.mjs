@@ -189,6 +189,10 @@ export function prepareCragRequest(body, health) {
     invalid('crag_prompt', 'provider compatibility requests must use system instead')
   }
   delete out.auto_compact_window
+  // Claude Code 2.1.325+ sends `diagnostics: { previous_message_id }` (cache-diagnosis beta) on every turn.
+  // CRAG's bundled Claude Code predates it and rejects the whole request with 400
+  // "unsupported request field: diagnostics"; the field only asks for optional cache diagnostics.
+  delete out.diagnostics
   if (out.crag_options != null) {
     if (!object(out.crag_options)) invalid('crag_options', 'must be an object')
     const aliases = Object.fromEntries(Object.entries(out.crag_options).filter(([key]) => CRAG_ALIASES.has(key)))

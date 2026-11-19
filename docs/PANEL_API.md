@@ -111,10 +111,14 @@
 | POST | `/vms/:id/allocate-proxy` | 从池分配 SOCKS5 |
 | POST | `/vms/:id/update-claude-code` | 410，`claude_cli_removed` |
 | DELETE | `/vms/:id` | 多槽时不能删仍占 `active.json` 的槽（409 `switch active first`）；管理台删除确认可在有健康可调度候选时先 `activate` 再删。只解绑本槽代理。成功返回 `{ deleted, reclaim_pending? }`；`reclaim_pending: true` 表示槽已删除，但其 CRAG 订阅绑定仍待回收确认 |
-| POST | `/vms/create` | 种子 VM + Claude Code home；依赖私有 `kin-computer`。未安装返回 400 `computer_service_missing`，身份生成失败返回 400 `computer_create_failed`。Docker 槽可在 `machine` 里可选传 `docker_cpus`（见下） |
+| POST | `/vms/create` | 种子 VM + Claude Code home；依赖私有 `kin-computer`。未安装返回 400 `computer_service_missing`，身份生成失败返回 400 `computer_create_failed`。Docker 槽可在 `machine` 里可选传 `docker_cpus`（见下）；Claude 槽可传 `desktop: true` 同时启用伴生浏览器桌面 |
 | POST | `/vms/import` | sessionKey 导入（必须已有 VM+代理） |
 | POST | `/vms/:id/shell-ticket` | 管理员获取 30 秒单次票据和 `cli_bin`。`{login:true}` 申请专用登录终端，要求绑定可用出口 |
 | WS | `/vms/:id/shell?ticket=&cols=&rows=` | 运维票据打开槽内 shell；登录票据须附 `login=1`，只运行包内原生 `claude auth login`。输入 `{"t":"d","d":"…"}`，尺寸 `{"t":"r","c":列,"r":行}`；二进制帧为终端输出，文本帧为 `exit` / `error`。保存并同步成功后登录会话发送 `{"t":"login","ok":true,"official_cc_bootstrap":…}`，不返回 token |
+| GET | `/vms/:id/desktop` | 伴生浏览器桌面状态 `{enabled, supported, state: running\|stale\|absent\|unsupported, image, container}`（见 [slot-desktop.md](slot-desktop.md)） |
+| POST | `/vms/:id/desktop` | `{enabled: boolean}` 开关伴生桌面；开启时槽在运行即拉起，未运行返回 `state: pending_slot_start`，下次启动槽时自动拉起。关闭只删容器，保留浏览器资料卷 |
+| POST | `/vms/:id/desktop-ticket` | 管理员获取 30 秒单次票据；先确保伴生容器跟上槽位当前网络命名空间 |
+| WS | `/vms/:id/desktop/ws?ticket=` | 二进制帧双向透传 RFB（noVNC 直连，无 websockify），子协议可选 `binary` |
 | GET | `/vms/fleet-status` | 全槽更新状态 |
 | POST | `/vms/fleet-update` | 全槽 roll / 采集；`action=telemetry` 只更新 Go telemetry/egress 服务，不重建 VM |
 | POST | `/vms/reconcile-fingerprints` | 用官方 `~/.claude.json` 对齐指纹 |

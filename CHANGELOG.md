@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.4.157 — 2026-11-19 · 槽位伴生浏览器桌面与登录、启动稳定性
+
+- Docker 槽可选开启伴生浏览器桌面：独立容器跑 Xvfb + fluxbox + Chromium + x11vnc，与槽容器共享网络命名空间，浏览器流量因此走槽位自己的出口（同一出口 IP、同一 DNS-over-TCP 重定向）。x11vnc 只监听容器私有 `/tmp` 下的 unix socket，面板经 Engine API 的非 TTY `docker exec socat` 透传 RFB，再由票据 WebSocket 交给 noVNC，不发布任何端口。仅管理员可用；GPT 槽、KVM 槽和 macOS 原生节点不支持。浏览器资料存在命名卷里，重置或删除槽位时一并清除（#1292）。
+- 原生登录的凭证确认加 180 秒 deadline，覆盖 exit-code inspect、凭据读取与导入这三个都要过节点链路的步骤。链路挂死时面板给出超时提示并说明去槽位详情核对凭证，不再永远停在「等待确认」。授权链接复制改走 `copyText` 兜底，纯 HTTP 面板（没有 secure context，`navigator.clipboard` 不存在）不再复制失败（#1313）。
+- 槽位内核启动前修复空的或无法解析的 `~/.claude/.claude.json`：从 CLI 自己写的最新一份可解析备份还原，保留 `userID` 与 `oauthAccount`。此前这个文件损坏会让 CLI 无限重启、内核切换一直挂住。文件健康、缺失、是符号链接或刚被写过时一律不动，没有可用备份时什么都不写（#1308）。
+- 来宾 `kin-kernel` 不再因 start-limit-hit 停在 failed。许可还在投送时内核会快速退出，systemd 默认的 5 次 / 10 秒配上 `RestartSec=2` 会在约 8 秒后放弃，之后许可到位也不会把内核拉起来；单元加 `StartLimitIntervalSec=0`，按 `RestartSec` 一直重试（#1309）。
+- 发往 CRAG 的请求移除 Claude Code 2.1.325+ 每轮都会带的 `diagnostics` 字段。CRAG 内置的 Claude Code 早于这个字段，带上会把整个请求以 400 `unsupported request field` 拒掉，而该字段只是请求可选的缓存诊断（#1306）。
+- 锁定 `payload-2026.11.19-oauth-config` 的 `kin-oauth-auth` 与 `kin-worker`，其余锁定载荷不变（#1301）。
+
 ## 1.4.156 — 2026-11-19 · 已关闭订单收进折叠历史
 
 - CRAG 订阅页的订单列表按状态分流：进行中的订单保留完整详情行，已取消和已过期的收进可展开的「已关闭订单」折叠区，并标明笔数。此前所有订单平铺同等高度，关闭很久的订单会一直压着买家正在等付款的那一笔。折叠区用原生 `details`，内容始终在 DOM 里，页面内搜索和读屏都能拿到。全部订单都已关闭时，空状态改为提示已关闭订单在下方，不再显示「还没有订阅订单」。

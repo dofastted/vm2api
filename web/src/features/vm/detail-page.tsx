@@ -100,6 +100,7 @@ import { SeedPolicyCard } from '@/features/vm/seed-policy-card'
 import { seedSaveState } from '@/features/vm/seed-settings'
 import { usePoolSeatStream } from '@/features/vm/use-pool-seat-stream'
 import { useVmTestChat } from '@/features/vm/use-vm-test-chat'
+import { VmDesktopCard } from '@/features/vm/vm-desktop-card'
 import { VmNameField } from '@/features/vm/vm-name-field'
 import {
   pickBindTarget,
@@ -171,7 +172,10 @@ function VmDetailBody({
   })
   usePoolSeatStream()
 
-  const tabs = vmDetailTabs(perms)
+  // 桌面依赖槽容器：Codex 槽没有容器，不显示该页签。
+  const tabs = vmDetailTabs(perms).filter(
+    (t) => t !== 'desktop' || (!!detail.data?.vm && !isCodexVm(detail.data.vm))
+  )
   const tab = visibleTab(wantedTab, tabs)
 
   const [bindId, setBindId] = useState('')
@@ -540,6 +544,9 @@ function VmDetailBody({
             {tabs.includes('ops') ? (
               <TabsTrigger value='ops'>运维</TabsTrigger>
             ) : null}
+            {tabs.includes('desktop') ? (
+              <TabsTrigger value='desktop'>桌面</TabsTrigger>
+            ) : null}
             {tabs.includes('seed') ? (
               <TabsTrigger value='seed'>种子</TabsTrigger>
             ) : null}
@@ -685,6 +692,11 @@ function VmDetailBody({
                 }}
                 onDelete={() => setConfirmDel(true)}
               />
+              {tabs.includes('desktop') ? (
+                <TabsContent value='desktop' className='pt-4'>
+                  <VmDesktopCard vm={vm} />
+                </TabsContent>
+              ) : null}
               <TabsContent value='seed' className='pt-4'>
                 {seed.data ? (
                   <SeedPolicyCard
