@@ -814,13 +814,40 @@ function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
 
 /** Only actual Linux launches retire the old sender; healthy kernels do no extra exec. */
 async function retireLegacyTelemetryBeforeStart(exec, runDockerExec) {
-  try {
-    const retired = await runDockerExec(execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), {
-      timeoutMs: 5000,
-    })
-    if (retired?.ok) return { ok: true }
-  } catch {}
-  return { ok: false, reason: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
+  return retireLegacyTelemetryChecked(execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), runDockerExec)
+}
+
+/**
+ * Shared transport-aware retire: a numeric exit code is the script's verdict,
+ * anything else means the exec never completed (node-link flap, timeout,
+ * spawn error). One retry, then fail open so transport jitter cannot brick
+ * a boot; a genuinely stuck sender still fails deterministically.
+ */
+export async function retireLegacyTelemetryChecked(argv, runDockerExec) {
+  const attempt = async () => {
+    try {
+      return await runDockerExec(argv, { timeoutMs: 5000 })
+    } catch (error) {
+      return { ok: false, error: String(error?.message || error) }
+    }
+  }
+  const deterministicFailure = {
+    ok: false,
+    reason: 'legacy_telemetry_stop_failed',
+    error: 'Legacy telemetry process did not stop',
+  }
+  const first = await attempt()
+  if (first?.ok) return { ok: true }
+  if (typeof first?.code === 'number') return deterministicFailure
+  const retry = await attempt()
+  if (retry?.ok) return { ok: true }
+  if (typeof retry?.code === 'number') return deterministicFailure
+  return {
+    ok: true,
+    unverified: true,
+    reason: 'legacy_telemetry_unverified',
+    error: 'Legacy telemetry retire unverified (slot exec unavailable); boot continues',
+  }
 }
 
 async function startKvmGuestKernel(

@@ -72,3 +72,56 @@ test('malformed public counters and free text error data are not leaked as nativ
   assert.equal(result.telemetry.last_error, null)
   assert.ok(!JSON.stringify(result).includes('private-host'))
 })
+
+// Transport jitter (node-link flap, exec timeout) must not be reported as
+// "legacy telemetry process did not stop": only a numeric exit code is the
+// script's own verdict.
+test('retire legacy telemetry fails only on a deterministic script verdict', async () => {
+  const base = {
+    vm: { id: 'vm-retire-x', runtime: { container: 'kin-retire-x' } },
+    inspect: async () => ({ State: { Running: true }, Config: { User: '10001:987' } }),
+  }
+  const deterministic = await retireLegacyTelemetry({
+    ...base,
+    run: async () => ({ code: 1, timed_out: false }),
+  })
+  assert.equal(deterministic.ok, false)
+  assert.equal(deterministic.code, 'legacy_telemetry_stop_failed')
+
+  const recovered = await retireLegacyTelemetry({
+    ...base,
+    run: async () => ({ code: 0, timed_out: false }),
+  })
+  assert.equal(recovered.ok, true)
+})
+
+test('retire legacy telemetry retries transport failures and reports unverified, not failed', async () => {
+  const base = {
+    vm: { id: 'vm-retire-t', runtime: { container: 'kin-retire-t' } },
+    inspect: async () => ({ State: { Running: true }, Config: { User: '10001:987' } }),
+  }
+  let calls = 0
+  const flappy = await retireLegacyTelemetry({
+    ...base,
+    run: async () => {
+      calls += 1
+      return { code: null, timed_out: true, error: 'docker exec timeout after 5000ms' }
+    },
+  })
+  assert.equal(calls, 2, 'transport failure is retried once')
+  assert.equal(flappy.ok, true)
+  assert.equal(flappy.unverified, true)
+  assert.equal(flappy.code, 'legacy_telemetry_unverified')
+
+  let secondCalls = 0
+  const recoveredOnRetry = await retireLegacyTelemetry({
+    ...base,
+    run: async () => {
+      secondCalls += 1
+      return secondCalls === 1 ? { code: null, timed_out: true } : { code: 0, timed_out: false }
+    },
+  })
+  assert.equal(secondCalls, 2)
+  assert.equal(recoveredOnRetry.ok, true)
+  assert.ok(!recoveredOnRetry.unverified)
+})
