@@ -616,6 +616,10 @@ function ShopOrders({
   const intent = useRef<Intent | null>(null)
   const operating = useRef(false)
   const [targetVmId, setTargetVmId] = useState('')
+  // A cancelled or expired checkout is history, not work. It stays reachable, but the
+  // order the buyer came for should not have to be found among closed ones.
+  const activeOrders = orders?.filter((order) => order.status !== 'cancelled')
+  const closedOrders = orders?.filter((order) => order.status === 'cancelled')
   const targets = useQuery({
     queryKey: ['panel', 'crag-shop', 'activation-targets', owner],
     queryFn: ({ signal }) =>
@@ -1028,7 +1032,7 @@ function ShopOrders({
           item.order_id === updated.order_id ? updated : item
         )
       )
-      setNotice('已取消订单，释放本地预留。')
+      setNotice('已关闭该订单。')
     }, '未能确认取消，请刷新历史订单。')
   }
 
@@ -1146,9 +1150,9 @@ function ShopOrders({
           onOpenChange={(open) => {
             if (!open && !busy) setCancelTarget(undefined)
           }}
-          title='取消预留订单？'
-          desc='仅取消尚未发送到商城的订单，释放本地预留。此操作不退款，也不会关闭已打开的收银台。'
-          confirmText='取消并释放'
+          title='取消这笔订单？'
+          desc='未支付的订单会在核对商城状态后关闭。已支付的订单不会被取消。此操作不退款，也不会关闭已打开的收银台。'
+          confirmText='取消订单'
           cancelBtnText='返回'
           destructive
           isLoading={busy}
@@ -1286,24 +1290,17 @@ function ShopOrders({
                   部分订单暂未同步，显示上次确认的状态。付款后请先刷新，不要重复支付。
                 </p>
               ) : null}
-              {orders?.some(
-                (order) =>
-                  !order.cancelable &&
-                  (order.status === 'pending' || order.status === 'reserved')
-              ) ? (
-                <p className='text-xs text-muted-foreground'>
-                  仅尚未发送至商城的预留订单可取消。已发送或状态未确认的订单不支持在面板关单。
-                </p>
-              ) : null}
-              {orders?.length === 0 ? (
+              {activeOrders?.length === 0 ? (
                 <p className='text-sm text-muted-foreground'>
-                  {presentation?.empty_orders_text ??
-                    '还没有订阅订单。下单后可以在这里查看支付和激活状态。'}
+                  {closedOrders?.length
+                    ? '没有进行中的订单。已关闭的订单在下方。'
+                    : (presentation?.empty_orders_text ??
+                      '还没有订阅订单。下单后可以在这里查看支付和激活状态。')}
                 </p>
               ) : null}
-              {orders?.length ? (
+              {activeOrders?.length ? (
                 <ul className='divide-y rounded-md border'>
-                  {orders.map((order) => (
+                  {activeOrders.map((order) => (
                     <li
                       key={order.order_id}
                       className='space-y-3 px-4 py-4 text-sm'
@@ -1335,7 +1332,7 @@ function ShopOrders({
                             disabled={busy || loading}
                             onClick={() => setCancelTarget(order)}
                           >
-                            取消预留订单
+                            取消订单
                           </Button>
                         ) : null}
                         {order.status === 'fulfilled' &&
@@ -1611,6 +1608,36 @@ function ShopOrders({
                     </li>
                   ))}
                 </ul>
+              ) : null}
+              {closedOrders?.length ? (
+                <details className='rounded-md border px-3 text-sm'>
+                  <summary className='cursor-pointer py-2 text-muted-foreground'>
+                    显示 {closedOrders.length} 笔已关闭订单
+                  </summary>
+                  <ul className='divide-y border-t text-muted-foreground'>
+                    {closedOrders.map((order) => (
+                      <li
+                        key={order.order_id}
+                        className='flex flex-wrap items-center gap-x-2 gap-y-1 py-2 text-xs'
+                      >
+                        <span className='font-medium'>
+                          {termLabel(order.term, order.sku, order.months)}
+                        </span>
+                        <span>· {methods[order.payment_method]}</span>
+                        <span>
+                          · 下单 <SubscriptionTime seconds={order.created_at} />
+                        </span>
+                        <StatusMark
+                          tone={orderTones[order.status]}
+                          variant='pill'
+                        />
+                        <span className='w-full truncate'>
+                          订单号 {order.order_id}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
               ) : null}
               {offset > 0 || typeof nextOffset === 'number' ? (
                 <div className='flex justify-end gap-2'>

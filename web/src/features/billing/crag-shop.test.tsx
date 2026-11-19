@@ -160,7 +160,7 @@ vi.mock('@/components/page-header', () => ({
 vi.mock('@/components/confirm-dialog', () => ({
   ConfirmDialog: (props: ConfirmProps) => {
     if (props.title === '启用本机槽位回收？') state.upgradeConfirm = props
-    if (props.open && props.confirmText === '取消并释放')
+    if (props.open && props.confirmText === '取消订单')
       state.confirmCancel = props.handleConfirm
     return null
   },
@@ -759,16 +759,16 @@ describe('CRAG buyer presentation and activation wire', () => {
     }
   )
 
-  it('cancels only an eligible reservation after confirmation and retains its history', async () => {
+  it('cancels only an eligible reservation after confirmation and files it under closed history', async () => {
     state.values[3] = [
       { ...order, status: 'reserved', cancelable: true },
       { ...order, order_id: 'pending', status: 'pending' },
     ]
     render()
     expect(
-      state.buttons.filter((button) => button.children === '取消预留订单')
+      state.buttons.filter((button) => button.children === '取消订单')
     ).toHaveLength(1)
-    click('取消预留订单')
+    click('取消订单')
     expect(api).not.toHaveBeenCalled()
     vi.mocked(api).mockResolvedValue({ ...order, status: 'cancelled' })
     render()
@@ -778,10 +778,13 @@ describe('CRAG buyer presentation and activation wire', () => {
       '/api/panel/crag-shop/orders/order-1/cancel',
       { method: 'POST', body: '{}' }
     )
+    // The cancelled order leaves the main list for collapsed history, so it stops
+    // competing with the order the buyer is actually waiting on.
     const html = render()
+    expect(html).toContain('显示 1 笔已关闭订单')
     expect(html).toContain('已取消')
     expect(html).toContain('订单号 order-1')
-    expect(html).not.toContain('取消预留订单')
+    expect(html).not.toContain('取消订单')
   })
 
   it('fetches targets only as admin through the scoped wrapper query', async () => {
