@@ -15,7 +15,15 @@ import { toHostPath } from './host-path.mjs'
 import { socksProxyUrl } from './socks-address.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 import { collectTakenSubnets, createSubnetAllocator, gatewayOf, parseCidr, subnetPoolConfig } from './subnet-pool.mjs'
-import { allocateSharedSubnet, sharedBridgeName, sharedNetworkName } from './shared-egress.mjs'
+import {
+  allocateSharedSubnet,
+  sharedBridgeName,
+  sharedChainName,
+  sharedEgressId,
+  sharedNetworkName,
+  sharedRoutes,
+  unroutedMembers,
+} from './shared-egress.mjs'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
 export const LOCAL_EGRESS_ID = 'px-local'
@@ -1013,6 +1021,39 @@ async function startEgressContainer({
   return done(false)
 }
 
+/**
+ * The helper's on-disk config.
+ *
+ * One construction point on purpose: the container path, the SIGHUP path and
+ * the spawn path all have to agree, and a field added to only some of them
+ * becomes a setting that survives a restart but not a reload, or the reverse.
+ * `routes` is the field that makes this load-bearing — a shared helper's
+ * membership changes far more often than anything else here.
+ */
+export function egressConfigFor({
+  proxyId,
+  proxyUrl = '',
+  listenTcp,
+  listenDns,
+  dnsUpstream = '',
+  dnsEmptyTypes = [],
+  domainForward = false,
+  routes = [],
+}) {
+  const cfg = { proxy_id: proxyId, proxy_url: proxyUrl, listen_tcp: listenTcp, listen_dns: listenDns }
+  if (dnsUpstream) cfg.dns_upstream = dnsUpstream
+  if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
+  if (domainForward) cfg.domain_forward = true
+  // Omitted when empty, so a per-VM helper's config is byte-identical to what
+  // an older control plane wrote and does not look like a change to reload.
+  if (routes.length) cfg.routes = routes
+  return cfg
+}
+
+export function egressConfigBody(cfg) {
+  return JSON.stringify(cfg, null, 2) + '\n'
+}
+
 export async function startEgressProcess({
   projectRoot,
   proxyId,
@@ -1024,6 +1065,7 @@ export async function startEgressProcess({
   dnsUpstream = '',
   dnsEmptyTypes = [],
   domainForward = false,
+  routes = [],
   runtime = egressRuntime(),
   runDocker = docker,
   hostPath = (p) => toHostPath(p, { projectRoot }),
@@ -1042,10 +1084,16 @@ export async function startEgressProcess({
   const listenTcp = `${listenHost}:${tcpPort}`
   const listenDns = `${listenHost}:${dnsPort}`
   if (runtime === 'container') {
-    const cfg = { proxy_id: proxyId, proxy_url: proxyUrl, listen_tcp: listenTcp, listen_dns: listenDns }
-    if (dnsUpstream) cfg.dns_upstream = dnsUpstream
-    if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
-    if (domainForward) cfg.domain_forward = true
+    const cfg = egressConfigFor({
+      proxyId,
+      proxyUrl,
+      listenTcp,
+      listenDns,
+      dnsUpstream,
+      dnsEmptyTypes,
+      domainForward,
+      routes,
+    })
     return startEgressContainer({
       projectRoot,
       proxyId,
@@ -1059,20 +1107,23 @@ export async function startEgressProcess({
       image,
     })
   }
+  const wanted = egressConfigFor({
+    proxyId,
+    proxyUrl,
+    listenTcp,
+    listenDns,
+    dnsUpstream,
+    dnsEmptyTypes,
+    domainForward,
+    routes,
+  })
+  const wantedBody = egressConfigBody(wanted)
   const existing = readPid(pidFile)
   const configMatches = ownsEgressProcess(existing, cfgPath)
   if (configMatches) {
     try {
       const old = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
-      if (
-        old.listen_tcp === listenTcp &&
-        old.listen_dns === listenDns &&
-        old.proxy_url === proxyUrl &&
-        (old.dns_upstream || '') === dnsUpstream &&
-        JSON.stringify(old.dns_empty_types || []) === JSON.stringify(dnsEmptyTypes) &&
-        !!old.domain_forward === !!domainForward &&
-        staleEgressPids(cfgPath, existing).length === 0
-      ) {
+      if (egressConfigBody(old) === wantedBody && staleEgressPids(cfgPath, existing).length === 0) {
         return { ok: true, pid: existing, reused: true, configPath: cfgPath }
       }
       // Same listeners and a reload-capable binary: swap proxy/DNS/policy by SIGHUP.
@@ -1088,11 +1139,7 @@ export async function startEgressProcess({
         runningFp === binFp &&
         staleEgressPids(cfgPath, existing).length === 0
       ) {
-        const cfg = { proxy_id: proxyId, proxy_url: proxyUrl, listen_tcp: listenTcp, listen_dns: listenDns }
-        if (dnsUpstream) cfg.dns_upstream = dnsUpstream
-        if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
-        if (domainForward) cfg.domain_forward = true
-        writeConfigAtomic(cfgPath, JSON.stringify(cfg, null, 2) + '\n')
+        writeConfigAtomic(cfgPath, wantedBody)
         process.kill(existing, 'SIGHUP')
         return { ok: true, pid: existing, reused: true, reloaded: true, configPath: cfgPath }
       }
@@ -1122,16 +1169,7 @@ export async function startEgressProcess({
   if (!fs.existsSync(bin)) {
     return { ok: false, error: `kin-egress binary not found: ${bin}` }
   }
-  const cfg = {
-    proxy_id: proxyId,
-    proxy_url: proxyUrl,
-    listen_tcp: listenTcp,
-    listen_dns: listenDns,
-  }
-  if (dnsUpstream) cfg.dns_upstream = dnsUpstream
-  if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
-  if (domainForward) cfg.domain_forward = true
-  fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 })
+  fs.writeFileSync(cfgPath, wantedBody, { mode: 0o600 })
   const spawned = await spawnDetachedEgress(bin, cfgPath)
   if (!spawned.ok) return spawned
   // Port 0 is ephemeral: no fixed port to resolve a listener from, so the spawned helper is the owner.
@@ -1508,6 +1546,130 @@ export async function startProxyEgress(
     pid: started.pid,
     proxy_id: proxyId,
   }
+}
+
+/**
+ * Bring the node's one shared helper in line with its membership.
+ *
+ * Membership arrives as `{ vmId, ip, proxyUrl }` per VM. The route table is
+ * written into the helper's config, so a VM joining or leaving is a config
+ * rewrite plus SIGHUP — `egressRebuildKey` hashes only the fields that need a
+ * new container, and routes are not among them, so established connections
+ * survive another VM's arrival.
+ *
+ * With no routable member the helper is stopped rather than left running on a
+ * stale table. The network and its rules stay: the FORWARD drop keeps holding,
+ * and REDIRECT to a port nobody listens on refuses traffic rather than letting
+ * it out, so a node between VMs is closed, not open.
+ */
+export async function startSharedEgress(
+  projectRoot,
+  {
+    nodeId = '',
+    members = [],
+    runDocker = docker,
+    runIptables = iptables,
+    runIp = ipRoute,
+    dnsUpstream = configuredDnsUpstream(),
+    dnsEmptyTypes = configuredDnsEmptyTypes(),
+    bin,
+    ports,
+    listenHost: listenHostOverride,
+    startProcess = startEgressProcess,
+    stopProcess = stopEgressProcess,
+    waitListening = waitForEgressListen,
+  } = {},
+) {
+  const proxyId = sharedEgressId(nodeId)
+  const routes = sharedRoutes(members)
+  const unrouted = unroutedMembers(members)
+  if (!routes.length) {
+    const stopped = stopProcess(projectRoot, proxyId, { runDocker })
+    return {
+      ok: true,
+      proxy_id: proxyId,
+      routes: 0,
+      unrouted,
+      stopped: true,
+      reason: 'no_routable_members',
+      ...stopped,
+    }
+  }
+  const net = ensureSharedEgressNetwork(nodeId, runDocker, { runIp })
+  if (!net.ok) return net
+  const listenHost = listenHostOverride || net.gateway || gatewayFromSubnet(net.subnet)
+  if (!listenHost) return { ok: false, error: 'shared egress network gateway missing' }
+  const selectedPorts = ports || resolveEgressPorts(projectRoot, proxyId)
+  const plan = sharedIptablesPlan({
+    chain: sharedChainName(nodeId),
+    bridge: net.bridge,
+    subnet: net.subnet,
+    tcpPort: selectedPorts.tcp,
+    dnsPort: selectedPorts.dns,
+  })
+  const rules = applyIptables(plan, runIptables)
+  if (!rules.ok) return rules
+  const started = await startProcess({
+    projectRoot,
+    proxyId,
+    // A shared helper has no upstream of its own; every VM leaves through the
+    // one its route names.
+    proxyUrl: '',
+    routes,
+    tcpPort: selectedPorts.tcp,
+    dnsPort: selectedPorts.dns,
+    listenHost,
+    dnsUpstream,
+    dnsEmptyTypes,
+    runDocker,
+    ...(bin ? { bin } : {}),
+  })
+  if (!started.ok) return started
+  const listening = await waitListening(listenHost, selectedPorts.tcp, selectedPorts.tcp > 0 ? started.pid : 0)
+  if (listening == null) return { ok: false, error: 'egress_listener_probe_unavailable', pid: started.pid }
+  if (!listening)
+    return { ok: false, error: `kin-egress ${listenHost}:${selectedPorts.tcp} did not listen`, pid: started.pid }
+  return {
+    ok: true,
+    proxy_id: proxyId,
+    network: net.name,
+    bridge: net.bridge,
+    subnet: net.subnet,
+    gateway: listenHost,
+    listen_tcp: `${listenHost}:${selectedPorts.tcp}`,
+    routes: routes.length,
+    unrouted,
+    pid: started.pid,
+    reused: started.reused === true,
+    reloaded: started.reloaded === true,
+  }
+}
+
+/**
+ * One stop/start sequence at a time for the node's shared helper, for the same
+ * reason per-proxy starts are serialised: the pid file is written only after
+ * spawn, so two concurrent membership changes could otherwise both spawn.
+ */
+export async function ensureSharedEgress(projectRoot, opts = {}) {
+  return runExclusiveProxyEgress(projectRoot, sharedEgressId(opts?.nodeId), () => startSharedEgress(projectRoot, opts))
+}
+
+export function stopSharedEgress(projectRoot, nodeId = '', { runDocker = docker, runIptables = iptables } = {}) {
+  const info = inspectSharedEgressNetwork(nodeId, runDocker)
+  const stopped = stopEgressProcess(projectRoot, sharedEgressId(nodeId), { runDocker })
+  if (info?.subnet) {
+    removeIptables(
+      sharedIptablesPlan({
+        chain: sharedChainName(nodeId),
+        bridge: info.bridge,
+        subnet: info.subnet,
+        tcpPort: 0,
+        dnsPort: 0,
+      }),
+      runIptables,
+    )
+  }
+  return { ok: true, proxy_id: sharedEgressId(nodeId), ...stopped }
 }
 
 export function stopProxyEgress(projectRoot, proxyId, { subnet, runDocker = docker, runIptables = iptables } = {}) {

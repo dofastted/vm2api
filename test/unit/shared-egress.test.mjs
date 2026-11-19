@@ -1,24 +1,38 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import {
   DEFAULT_SHARED_PREFIX,
   allocateHostIp,
   allocateSharedSubnet,
   hostRange,
+  isSharedEgressId,
   isSharedNetwork,
   sharedBridgeName,
   sharedCapacity,
   sharedChainName,
+  sharedEgressId,
+  sharedEgressNodeId,
   sharedNetworkName,
   sharedRoutes,
   unroutedMembers,
 } from '../../src/lib/vm/shared-egress.mjs'
 import {
+  egressBinFingerprint,
+  egressConfigBody,
+  egressConfigFor,
+  egressContainerSpec,
+  egressRunDir,
   ensureSharedEgressNetwork,
   inspectSharedEgressNetwork,
   iptablesPlan,
   sharedEndpointIps,
   sharedIptablesPlan,
+  startEgressProcess,
+  startSharedEgress,
+  stopSharedEgress,
 } from '../../src/lib/vm/egress.mjs'
 import { parseCidr } from '../../src/lib/vm/subnet-pool.mjs'
 
@@ -344,4 +358,275 @@ test('an unreadable shared network is not reported as empty', () => {
   // there", or the allocator would hand out addresses already in use.
   assert.equal(live.ok, false)
   assert.deepEqual(live.items, [])
+})
+
+test('the shared helper id reuses the per-proxy lifecycle shape', () => {
+  assert.equal(sharedEgressId('node-a'), 'eg-shared-node-a')
+  assert.ok(isSharedEgressId(sharedEgressId('node-a')))
+  assert.ok(isSharedEgressId(sharedEgressId('')))
+  assert.ok(!isSharedEgressId('px-a1b2c3d4'))
+  // The node is recoverable from the id, so a run directory found on disk can
+  // be matched back to the network it belongs to.
+  assert.equal(sharedEgressNodeId(sharedEgressId('node-a')), 'node-a')
+  assert.equal(sharedEgressNodeId(sharedEgressId('')), '')
+})
+
+test('a per-VM config is byte-identical to one without the routes field', () => {
+  const base = {
+    proxyId: 'px-a1b2c3d4',
+    proxyUrl: 'socks5h://a:1080',
+    listenTcp: '100.64.0.1:18080',
+    listenDns: '100.64.0.1:18053',
+  }
+  // An older control plane wrote no `routes`, so a per-VM helper must not see
+  // its config change and reload for nothing.
+  assert.equal(egressConfigBody(egressConfigFor(base)), egressConfigBody(egressConfigFor({ ...base, routes: [] })))
+  assert.equal(egressConfigFor(base).routes, undefined)
+})
+
+test('a membership change changes the config body, so the helper reloads', () => {
+  const base = { proxyId: 'eg-shared-node-a', proxyUrl: '', listenTcp: '1:1', listenDns: '1:2' }
+  const one = egressConfigBody(
+    egressConfigFor({ ...base, routes: sharedRoutes([{ ip: '100.64.16.3', proxyUrl: 'socks5h://a:1080' }]) }),
+  )
+  const two = egressConfigBody(
+    egressConfigFor({
+      ...base,
+      routes: sharedRoutes([
+        { ip: '100.64.16.3', proxyUrl: 'socks5h://a:1080' },
+        { ip: '100.64.16.4', proxyUrl: 'socks5h://b:1080' },
+      ]),
+    }),
+  )
+  assert.notEqual(one, two, 'a VM joining left the config unchanged; the helper would never learn its route')
+  // Same membership in a different order must not look like a change.
+  const reordered = egressConfigBody(
+    egressConfigFor({
+      ...base,
+      routes: sharedRoutes([
+        { ip: '100.64.16.4', proxyUrl: 'socks5h://b:1080' },
+        { ip: '100.64.16.3', proxyUrl: 'socks5h://a:1080' },
+      ]),
+    }),
+  )
+  assert.equal(two, reordered)
+})
+
+function sharedHarness(t, { networks = {}, endpoints = {} } = {}) {
+  const d = fakeDocker({ networks, endpoints })
+  const iptablesCalls = []
+  const startCalls = []
+  const stopCalls = []
+  return {
+    docker: d,
+    iptablesCalls,
+    startCalls,
+    stopCalls,
+    opts: {
+      runDocker: d.run,
+      runIp: d.runIp,
+      runIptables: (args) => {
+        iptablesCalls.push(args.join(' '))
+        // -C reports "not present" so the paired -I is exercised.
+        return args.includes('-C') ? { ok: false, stderr: 'No chain/target/match' } : { ok: true, stdout: '' }
+      },
+      ports: { tcp: 18080, dns: 18053 },
+      startProcess: async (cfg) => {
+        startCalls.push(cfg)
+        return { ok: true, pid: 4242, reused: false, reloaded: false }
+      },
+      stopProcess: (root, proxyId) => {
+        stopCalls.push(proxyId)
+        return { ok: true, stopped: true }
+      },
+      waitListening: async () => true,
+    },
+  }
+}
+
+test('a node with no routable member stops the helper and builds no network', async () => {
+  const h = sharedHarness()
+  const r = await startSharedEgress('/tmp/root', {
+    nodeId: 'node-a',
+    members: [{ vmId: 'vm-1', ip: '100.64.16.3', proxyUrl: '' }],
+    ...h.opts,
+  })
+  assert.equal(r.ok, true)
+  assert.equal(r.stopped, true)
+  assert.equal(r.reason, 'no_routable_members')
+  assert.deepEqual(r.unrouted, ['vm-1'])
+  assert.deepEqual(h.stopCalls, [sharedEgressId('node-a')])
+  // Nothing to serve means nothing to stand up.
+  assert.equal(h.docker.calls.filter((a) => a[1] === 'create').length, 0)
+  assert.equal(h.startCalls.length, 0)
+})
+
+test('a shared helper starts with the route table and no upstream of its own', async () => {
+  const h = sharedHarness()
+  const members = [
+    { vmId: 'vm-1', ip: '100.64.16.3', proxyUrl: 'socks5h://a:1080' },
+    { vmId: 'vm-2', ip: '100.64.16.4', proxyUrl: 'socks5h://b:1080' },
+    { vmId: 'vm-3', ip: '100.64.16.5', proxyUrl: '' },
+  ]
+  const r = await startSharedEgress('/tmp/root', { nodeId: 'node-a', members, ...h.opts })
+  assert.equal(r.ok, true)
+  assert.equal(r.routes, 2)
+  assert.deepEqual(r.unrouted, ['vm-3'])
+  assert.equal(r.network, sharedNetworkName('node-a'))
+  assert.equal(parseCidr(r.subnet).prefix, DEFAULT_SHARED_PREFIX)
+
+  assert.equal(h.startCalls.length, 1)
+  const cfg = h.startCalls[0]
+  assert.equal(cfg.proxyId, sharedEgressId('node-a'))
+  // No default exit: every VM leaves through the upstream its route names.
+  assert.equal(cfg.proxyUrl, '')
+  assert.deepEqual(cfg.routes, [
+    { vm_ip: '100.64.16.3', proxy_url: 'socks5h://a:1080' },
+    { vm_ip: '100.64.16.4', proxy_url: 'socks5h://b:1080' },
+  ])
+  // The helper listens on the shared gateway, where REDIRECT delivers.
+  assert.equal(cfg.listenHost, r.gateway)
+  assert.equal(cfg.tcpPort, 18080)
+})
+
+test('starting a shared helper installs the isolation rule', async () => {
+  const h = sharedHarness()
+  const r = await startSharedEgress('/tmp/root', {
+    nodeId: 'node-a',
+    members: [{ vmId: 'vm-1', ip: '100.64.16.3', proxyUrl: 'socks5h://a:1080' }],
+    ...h.opts,
+  })
+  assert.equal(r.ok, true)
+  const bridge = sharedBridgeName('node-a')
+  assert.ok(
+    h.iptablesCalls.includes(`-t filter -I FORWARD 1 -i ${bridge} -o ${bridge} -j DROP`),
+    'inter-VM isolation was not applied when the shared helper started',
+  )
+  assert.ok(h.iptablesCalls.some((c) => c.includes(`-j REDIRECT --to-ports 18080`)))
+  assert.ok(h.iptablesCalls.some((c) => c.startsWith(`-t nat -N ${sharedChainName('node-a')}`)))
+})
+
+test('a failed network stops the start before any helper or rule', async () => {
+  const d = fakeDocker({ createFails: 'permission denied' })
+  const h = sharedHarness()
+  const r = await startSharedEgress('/tmp/root', {
+    nodeId: 'node-a',
+    members: [{ vmId: 'vm-1', ip: '100.64.16.3', proxyUrl: 'socks5h://a:1080' }],
+    ...h.opts,
+    runDocker: d.run,
+    runIp: d.runIp,
+  })
+  assert.equal(r.ok, false)
+  assert.equal(h.startCalls.length, 0)
+  // Rules naming a bridge that does not exist would outlive the failure.
+  assert.deepEqual(h.iptablesCalls, [])
+})
+
+test('stopping the shared helper withdraws its rules', () => {
+  const name = sharedNetworkName('node-a')
+  const h = sharedHarness(null, { networks: { [name]: '100.64.16.0/20' } })
+  const removed = []
+  const r = stopSharedEgress('/tmp/root', 'node-a', {
+    runDocker: h.docker.run,
+    runIptables: (args) => {
+      removed.push(args.join(' '))
+      return { ok: true }
+    },
+  })
+  assert.equal(r.ok, true)
+  const bridge = sharedBridgeName('node-a')
+  assert.ok(
+    removed.includes(`-t filter -D FORWARD -i ${bridge} -o ${bridge} -j DROP`),
+    'the isolation rule survived teardown and now names a bridge that may be gone',
+  )
+  assert.ok(removed.some((c) => c.startsWith(`-t nat -X ${sharedChainName('node-a')}`)))
+})
+
+/** A shared helper already running with `routes`, as the container runtime sees it. */
+function runningHelper(t, routes) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-shared-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const binDir = path.join(root, 'bin')
+  fs.mkdirSync(binDir, { recursive: true })
+  const bin = path.join(binDir, 'kin-egress')
+  fs.writeFileSync(bin, '#!/bin/sh\n', { mode: 0o755 })
+  const proxyId = sharedEgressId('node-a')
+  const dir = egressRunDir(root, proxyId)
+  fs.mkdirSync(dir, { recursive: true })
+  const listenTcp = '100.64.16.1:18080'
+  const listenDns = '100.64.16.1:18053'
+  const cfgPath = path.join(dir, 'egress.json')
+  fs.writeFileSync(cfgPath, egressConfigBody(egressConfigFor({ proxyId, proxyUrl: '', listenTcp, listenDns, routes })))
+  const fingerprint = egressBinFingerprint(bin)
+  const digestFor = (forRoutes) =>
+    egressContainerSpec({
+      proxyId,
+      body: egressConfigBody(egressConfigFor({ proxyId, proxyUrl: '', listenTcp, listenDns, routes: forRoutes })),
+      hostDir: dir,
+      hostBinDir: binDir,
+      binName: 'kin-egress',
+      image: 'kin:test',
+      binFingerprint: fingerprint,
+    }).digest
+  const calls = []
+  const runDocker = (args) => {
+    calls.push(args)
+    if (args[0] === 'inspect') return { ok: true, stdout: `true|false|999|${digestFor(routes)}|${fingerprint}|hup` }
+    return { ok: true, stdout: '' }
+  }
+  const start = (nextRoutes) =>
+    startEgressProcess({
+      projectRoot: root,
+      proxyId,
+      proxyUrl: '',
+      routes: nextRoutes,
+      tcpPort: 18080,
+      dnsPort: 18053,
+      listenHost: '100.64.16.1',
+      runtime: 'container',
+      runDocker,
+      bin,
+      image: 'kin:test',
+      hostPath: (p) => p,
+    })
+  return { root, proxyId, cfgPath, calls, start, digestFor }
+}
+
+const ROUTE_ONE = [{ vm_ip: '100.64.16.3', proxy_url: 'socks5h://a:1080' }]
+const ROUTE_TWO = [...ROUTE_ONE, { vm_ip: '100.64.16.4', proxy_url: 'socks5h://b:1080' }]
+
+test('a VM joining reloads the helper rather than leaving it on a stale table', async (t) => {
+  const h = runningHelper(t, ROUTE_ONE)
+  const r = await h.start(ROUTE_TWO)
+  assert.equal(r.ok, true)
+  // Membership is not part of the container rebuild key, so the joining VM
+  // must arrive by signal with every established connection intact.
+  assert.equal(r.reloaded, true)
+  assert.ok(
+    h.calls.some((a) => a[0] === 'kill' && a.includes('HUP')),
+    'no SIGHUP: the new VM would have no route and be refused fail-closed',
+  )
+  assert.ok(!h.calls.some((a) => a[0] === 'run'), 'the container was rebuilt, dropping every live connection')
+  const written = JSON.parse(fs.readFileSync(h.cfgPath, 'utf8'))
+  assert.deepEqual(written.routes, ROUTE_TWO)
+})
+
+test('unchanged membership neither rewrites the table nor signals the helper', async (t) => {
+  const h = runningHelper(t, ROUTE_ONE)
+  const before = fs.statSync(h.cfgPath).mtimeMs
+  const r = await h.start(ROUTE_ONE)
+  assert.equal(r.ok, true)
+  assert.equal(r.reused, true)
+  assert.equal(r.reloaded, false)
+  assert.ok(!h.calls.some((a) => a[0] === 'kill'), 'signalled the helper for a membership that did not change')
+  assert.equal(fs.statSync(h.cfgPath).mtimeMs, before)
+})
+
+test('a VM leaving also reaches the helper', async (t) => {
+  const h = runningHelper(t, ROUTE_TWO)
+  const r = await h.start(ROUTE_ONE)
+  assert.equal(r.reloaded, true)
+  // A departed VM left in the table keeps an exit reachable by an address that
+  // may since have been handed to someone else.
+  assert.deepEqual(JSON.parse(fs.readFileSync(h.cfgPath, 'utf8')).routes, ROUTE_ONE)
 })

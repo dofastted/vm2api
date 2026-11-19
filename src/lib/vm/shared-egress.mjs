@@ -61,6 +61,33 @@ export function isSharedNetwork(name) {
 }
 
 /**
+ * The shared helper's identity.
+ *
+ * It is shaped like a proxy id so the whole per-proxy helper lifecycle applies
+ * unchanged: its own run directory, port pair, pid file and container name, and
+ * — the part that matters most — the existing SIGHUP reload. A membership change
+ * is a config rewrite plus a signal, not a restart, so VMs already connected
+ * through the helper keep their connections when another VM joins or leaves.
+ */
+export const SHARED_EGRESS_PREFIX = 'eg-shared'
+
+export function sharedEgressId(nodeId = '') {
+  const id = String(nodeId || '').trim()
+  return id ? `${SHARED_EGRESS_PREFIX}-${id}` : SHARED_EGRESS_PREFIX
+}
+
+export function isSharedEgressId(proxyId) {
+  const id = String(proxyId || '')
+  return id === SHARED_EGRESS_PREFIX || id.startsWith(`${SHARED_EGRESS_PREFIX}-`)
+}
+
+/** The node a shared helper id belongs to; '' for the control plane's own. */
+export function sharedEgressNodeId(proxyId) {
+  const id = String(proxyId || '')
+  return id.startsWith(`${SHARED_EGRESS_PREFIX}-`) ? id.slice(SHARED_EGRESS_PREFIX.length + 1) : ''
+}
+
+/**
  * The node's shared subnet. Allocated before any per-VM subnet and reserved
  * against that allocator, because a /20 carved out of an already-fragmented pool
  * may have nowhere to land once the /28s are placed.
