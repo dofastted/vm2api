@@ -159,6 +159,12 @@ kin-<槽> 容器 → keg* 网桥 → 宿主机 kin-egress（网关 IP:端口）�
 
 宿主机 `kin-egress` 的运行方式（v1.4.134 起）：控制面在 Docker 中运行（compose 设置 `VM2API_CONTAINER_NAME` 并挂载 `docker.sock`）时，每个代理的 `kin-egress` 作为独立的 host 网络容器 `kin-cp-egress-<代理>`（`--restart unless-stopped`）运行，控制面重启不会打断槽位 DNS；其他情况作为控制面子进程运行。可用 `KIN_EGRESS_RUNTIME=process|container` 强制指定。从容器方式切回进程方式时，控制面会先删除同一代理遗留的 `kin-cp-egress-*` 容器再占用端口；降级到 v1.4.133 及更早版本前，请先执行 `docker ps -aq --filter name=kin-cp-egress- | xargs -r docker rm -f`，否则旧版本看不到这些容器的进程，会一直等待端口释放。
 
+**代理故障与恢复（Unreleased）：** 单条宿主 `kin-egress` 故障只限制当前依赖该 helper 的本机运行或暂停槽位；同一代理上的远端槽和本机 GPT 槽不依赖这个 helper。代理端点自身连续探测失败仍按代理池阈值处理，影响绑定该代理的槽位。Docker inspect 或 `ss` 不可用不算已确认故障，不新增或清除槽位限制。
+
+定时探测（启用时）和面板「探测」使用同一恢复逻辑：代理协议探测成功，需要宿主 helper 的槽还须确认其 TCP 监听；随后只清除当前绑定代理留下的自动 `proxy_cooldown`，即使代理行此前已显示健康也会核对。手动禁用代理仍须点「启用」；手动调度关、维护锁、凭据或内核造成的不可调度不会被清除。监听检查不是 DNS 或真实推理验收；若恢复后请求仍失败，按下方步骤从槽内验证网络。
+
+故障期间不会改绑、换 IP、自动直连或放宽防火墙与 IPv6 策略。这是同一控制面内的出口隔离，不是跨宿主高可用；宿主或共享上游故障仍可能影响多个出口，进程模式下控制面进程树退出也可能同时停止多个 helper。
+
 控制面用 iptables 把容器的 TCP 和 DNS 重定向到宿主机上的 `kin-egress`。这一跳的目的地是宿主机本身，要经过宿主机 **INPUT** 链。UFW 默认入站 `DROP`，而 vm2api 不改你的 INPUT 规则，所以需要手动放行：
 
 | 项 | 值 |

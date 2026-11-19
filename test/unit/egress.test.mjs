@@ -623,7 +623,7 @@ test('egress config carries dns_upstream only when configured', async () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('egress readiness checks the exact listener without opening a connection', async (t) => {
+test('egress readiness requires the helper listener without opening a connection', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-listen-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   let accepted = 0
@@ -637,7 +637,11 @@ test('egress readiness checks the exact listener without opening a connection', 
   const dir = egressRunDir(root, proxyId)
   fs.mkdirSync(dir, { recursive: true })
   const config = path.join(dir, 'egress.json')
-  fs.writeFileSync(config, JSON.stringify({ proxy_url: 'socks5h://192.0.2.1:1080', listen_tcp: '127.0.0.1:0' }))
+  const helperPort = await reservePort()
+  fs.writeFileSync(
+    config,
+    JSON.stringify({ proxy_url: 'socks5h://192.0.2.1:1080', listen_tcp: `127.0.0.1:${helperPort}` }),
+  )
   const helper = spawn(egressBin, ['-config', config], { stdio: ['ignore', 'ignore', 'pipe'] })
   const closed = once(helper, 'close')
   let helperLog = ''
@@ -652,13 +656,25 @@ test('egress readiness checks the exact listener without opening a connection', 
   // exec precedes config loading. Wait for Serve before overwriting the file
   // so the helper cannot read the probe's deliberately incomplete config.
   await waitForProcess(() => helperLog.includes('kin-egress ready'))
+  assert.equal(egressListening(root, proxyId).ok, true)
   const port = listener.address().port
   fs.writeFileSync(config, JSON.stringify({ listen_tcp: `127.0.0.1:${port}` }))
-  assert.equal(egressListening(root, proxyId).ok, true)
+  assert.equal(egressListening(root, proxyId, 100).reason, 'not_listening')
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(accepted, 0, 'readiness must not enter the transparent forwarding path')
-  fs.writeFileSync(config, JSON.stringify({ listen_tcp: `127.0.0.2:${port}` }))
-  assert.equal(egressListening(root, proxyId, 100).reason, 'not_listening')
+
+  const originalPath = process.env.PATH
+  fs.writeFileSync(path.join(root, 'ss'), '#!/bin/sh\nexit 1\n', { mode: 0o755 })
+  process.env.PATH = `${root}:${originalPath}`
+  try {
+    const unknown = egressListening(root, proxyId)
+    assert.equal(unknown.ok, false)
+    assert.equal(unknown.pending, true)
+    assert.equal(unknown.reason, 'egress_listener_probe_unavailable')
+    assert.equal((await waitPortReleased('127.0.0.1', port)).error, 'egress_listener_probe_unavailable')
+  } finally {
+    process.env.PATH = originalPath
+  }
 })
 
 test('DNS override and proxy changes reload the running helper in place', async (t) => {

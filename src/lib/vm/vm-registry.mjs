@@ -613,6 +613,25 @@ export function clearScheduleHold(projectRoot, id, reason, { tag = null } = {}) 
   })
 }
 
+/** A probe may only change its current binding's automatic proxy hold. */
+export function reconcileProxyScheduleHold(projectRoot, id, proxyId, failure = null) {
+  return writeSchedule(projectRoot, id, (vm) => {
+    if (vm.proxy?.id !== proxyId) return false
+    const hold = vm.schedule_hold
+    const tag = hold?.detail?.tag
+    if (hold && (hold.reason !== HOLD_PROXY || (tag != null && tag !== proxyId))) return false
+    if (failure != null) {
+      if (hold?.detail?.message === 'proxy_manually_disabled' || (tag === proxyId && hold?.detail?.message === failure))
+        return false
+      return applyHold(vm, HOLD_PROXY, { tag: proxyId, message: failure })
+    }
+    if (!hold || hold.detail?.message === 'proxy_manually_disabled') return false
+    // Pre-tag migration only emitted these automatic failure reasons.
+    if (tag == null && !/^(egress_down|proxy_probe_failed)(:|$)/.test(hold.detail?.message || '')) return false
+    return applyClearHold(vm, HOLD_PROXY, { tag })
+  })
+}
+
 /**
  * Lift a `slot-runtime:` maintenance hold older than minAgeMs. Only
  * withSlotMaintenance owns that tag namespace (kernel installs use their

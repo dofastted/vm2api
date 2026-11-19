@@ -282,6 +282,23 @@ test('inspect reports a surviving helper on a replaced binary as stale', async (
   assert.equal(inspectEgressProcess(fx.root, 'px-ctr', opts).ok, true)
 })
 
+test('an unavailable Docker inspector cannot justify replacing a running helper', async (t) => {
+  const fx = fixture(t)
+  await fx.start()
+  const calls = []
+  const runDocker = (args) => {
+    calls.push(args[0])
+    return { ok: false, stderr: 'Cannot connect to the Docker daemon' }
+  }
+  const current = inspectEgressProcess(fx.root, 'px-ctr', { runtime: 'container', runDocker })
+  assert.equal(current.pending, true)
+  assert.equal(current.reason, 'egress_container_inspect_unavailable')
+  const stopped = await fx.start({ runDocker, image: 'sha256:selfimage' })
+  assert.equal(stopped.error, current.reason)
+  assert.deepEqual(calls, ['inspect', 'inspect'])
+  assert.equal(fx.helper().running, true)
+})
+
 test('process runtime removes a helper container left by the container runtime before taking the ports', async (t) => {
   const fx = fixture(t)
   await fx.start()
