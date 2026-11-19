@@ -84,3 +84,37 @@ test('AccountQuota archives the 5h window across header readings and persists it
   const snap = q.snapshot().accounts.find((a) => a.account_id === 'a-hist')
   assert.equal(snap.window_history['5h'].prev.used_ratio, 0.6)
 })
+
+test('an ended Extra window lets official open the next one, but not a leftover 100% with no traffic in it', () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-winhist-'))
+  const q = new AccountQuota({ dataDir, config: {} })
+  const t = Date.now()
+  const ended = iso(t - 4.3 * H)
+  const nextReset = iso(t + H)
+  const seed = (id, usedAt) => {
+    const acc = q.ensure({ account_id: id })
+    acc.unified.headers = { '5h': { utilization: 0.4, reset: ended, status: 'allowed' } }
+    acc.window_history = { '5h': { current: { reset: ended, used_ratio: 0.4 } } }
+    q.repo.save(acc)
+    q.repo.addAllocation(id, { at: iso(usedAt), source: 'headers', util_5h: 0.4 })
+  }
+  const probe = (id) =>
+    q.ingestOAuthUsage(id, {
+      ok: true,
+      usage_status: 200,
+      source: 'official-cc-usage',
+      five_hour: { utilization: 100, status: 'rejected', resets_at: nextReset },
+      probed_at: iso(t),
+    })
+  // Last request before the new window started: official 100% is the known leftover.
+  seed('a-idle', t - 4.5 * H)
+  probe('a-idle')
+  assert.deepEqual(q.repo.get('a-idle').window_history['5h'], { current: { reset: ended, used_ratio: 0.4 } })
+  // Traffic inside the new window: official 100% is that window's reading.
+  seed('a-busy', t - 10 * 60_000)
+  probe('a-busy')
+  const busy = q.repo.get('a-busy').window_history['5h']
+  assert.deepEqual(busy.current, { reset: nextReset, used_ratio: 1 })
+  assert.equal(busy.prev.used_ratio, 0.4)
+  assert.equal(busy.prev.end, ended)
+})

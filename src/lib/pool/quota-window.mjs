@@ -194,7 +194,13 @@ export function headerWindowOrEmpty(unified = {}, key = '5h', { now = Date.now()
   }
 }
 
-function wipeElapsedWindow(window, now) {
+/** A wiped window still says when its last reading was taken. */
+function keepSampledAt(window) {
+  return window?.sampled_at ? { sampled_at: window.sampled_at } : {}
+}
+
+/** An Extra window whose reset has passed, as stored once it ended; null while it is still open. */
+export function wipeElapsedWindow(window, now = Date.now()) {
   if (!windowHasData(window)) return null
   const resetMs = parseResetMs(window.reset)
   if (!Number.isFinite(resetMs) || resetMs > now) return null
@@ -204,6 +210,7 @@ function wipeElapsedWindow(window, now) {
     reset: window.reset ?? null,
     stale: true,
     stale_reason: 'reset_elapsed',
+    ...keepSampledAt(window),
   }
 }
 
@@ -253,6 +260,7 @@ export function wipeElapsedHeaderWindows(unified = {}, { now = Date.now() } = {}
           reset: null,
           stale: true,
           stale_reason: 'reject_without_reset_expired',
+          ...keepSampledAt(next[key]),
         }
       }
       if (!wiped) continue
