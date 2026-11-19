@@ -397,6 +397,18 @@ export async function installKernelTargets({
           }
           const unsupported = placementFailure(vm, target.kernel)
           if (unsupported) return failure(target, unsupported.code, unsupported.error)
+          const updateExisting = target.update_existing === true
+          if (
+            updateExisting &&
+            (target.kernel !== 'crag' ||
+              (!target.expected_tag && !target.payload_tag) ||
+              resolveKernelDataplane(vm, routing) !== 'crag' ||
+              !['running', 'stopped'].includes(vm.status))
+          ) {
+            return failure(target, 'crag_update_target_changed', '槽位不再是可更新的 CRAG 槽，请核对当前状态')
+          }
+          const keepStopped =
+            updateExisting && (resumeId ? vm.kernel_operation.keep_stopped === true : vm.status === 'stopped')
           if (target.expected_tag || target.payload_tag) {
             releaseCache = reserveKernelInstallCache(projectRoot, target.kernel)
             if (!releaseCache) {
@@ -459,6 +471,7 @@ export async function installKernelTargets({
                 kernel: target.kernel,
                 ...(target.expected_tag ? { expected_tag: target.expected_tag } : {}),
                 ...(target.payload_tag ? { payload_tag: target.payload_tag } : {}),
+                ...(updateExisting ? { update_existing: true, keep_stopped: keepStopped } : {}),
                 phase: 'pending',
                 recovery_attempts: resumeId ? (previous.recovery_attempts || 0) + 1 : 0,
                 previous_hold: previous ? previous.previous_hold : record.schedule_hold || null,
@@ -472,6 +485,23 @@ export async function installKernelTargets({
             const drained = await waitForSlotDrain(poolScheduler, [target.id])
             if (cancelled()) return cancelled()
             if (!drained.ok) return failure(target, phase, '在途请求未结束，未重启内核')
+            if (updateExisting && vm.status === 'running') {
+              // Never fall back to a local worker socket for a node slot.
+              const health =
+                !clusterVm || vm.runtime?.kernel_socket
+                  ? await (ops.rustKernelHealth || rustKernelHealth)(slotExec(projectRoot, vm), { timeoutMs: 3000 })
+                  : null
+              if (
+                health?.healthy !== true ||
+                health.runtime_variant !== 'crag-v2' ||
+                health.license_valid !== true ||
+                health.active_requests !== 0 ||
+                health.continuations !== 0 ||
+                health.queued !== 0
+              ) {
+                return failure(target, 'crag_slot_not_idle', 'CRAG 未确认空闲，未重启内核')
+              }
+            }
 
             const currentProduct = () =>
               (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot).find(
@@ -550,7 +580,10 @@ export async function installKernelTargets({
             if (!halted) return failure(target, 'vm_not_found', '虚拟机记录已移除', true)
             stoppedPersisted = true
             phase = 'kernel_restart_policy_failed'
-            const policy = await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(halted)
+            // The node's stop operation already disables restart on its own daemon.
+            const policy = clusterVm
+              ? { ok: true }
+              : await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(halted)
             if (!policy?.ok)
               return failure(target, policy?.code || phase, policy?.error || '无法关闭容器自动重启', true)
             restartSuspended = true
@@ -611,9 +644,11 @@ export async function installKernelTargets({
             if (target.kernel === 'crag' && !baked) prepareNativeDirectories(config.runDir, owner)
             phase = 'kernel_selection_persist_failed'
             const saved = patchVmRecord(projectRoot, target.id, (record) => {
-              record.dataplane = candidate.dataplane
-              if (target.kernel === 'crag') record.crag_kernel_version = 'v2'
-              else delete record.crag_kernel_version
+              if (!updateExisting) {
+                record.dataplane = candidate.dataplane
+                if (target.kernel === 'crag') record.crag_kernel_version = 'v2'
+                else delete record.crag_kernel_version
+              }
               record.kernel_installation = {
                 kernel: target.kernel,
                 version: installedProduct.version ?? null,
@@ -623,6 +658,20 @@ export async function installKernelTargets({
             })
             if (!saved) return failure(target, 'vm_not_found', '虚拟机记录已移除', true)
             if (cancelled()) return cancelled()
+            if (keepStopped) {
+              patchVmRecord(projectRoot, target.id, clearInstallHold)
+              installed = true
+              return {
+                id: target.id,
+                kernel: target.kernel,
+                ok: true,
+                stopped: true,
+                restarted: false,
+                status: 'stopped',
+                version: installedProduct.version ?? null,
+                ...(installedProduct.payload_tag ? { payload_tag: installedProduct.payload_tag } : {}),
+              }
+            }
             phase = 'kernel_start_failed'
             bootAttempted = true
             const boot = await (ops.startSlotReady || startSlotReady)(saved, projectRoot, {
@@ -696,7 +745,9 @@ export async function installKernelTargets({
             if (thrown) throw thrown
             return result
           }
-          const result = await withCragRuntimeAdmission(desired, projectRoot, { routing, install: true }, run)
+          const result = keepStopped
+            ? await run()
+            : await withCragRuntimeAdmission(desired, projectRoot, { routing, install: true }, run)
           return result.id === target.id
             ? result
             : failure(
@@ -793,6 +844,7 @@ export async function resumePendingKernelInstalls({
           kernel: pending.kernel,
           ...(pending.expected_tag ? { expected_tag: pending.expected_tag } : {}),
           ...(pending.payload_tag ? { payload_tag: pending.payload_tag } : {}),
+          ...(pending.update_existing ? { update_existing: true } : {}),
         },
       ],
       routing,

@@ -3122,7 +3122,7 @@ export function createPanelHandler(ctx) {
           panel.ok({ kernel: result.kernel, ...(result.release ? { release: result.release } : {}) }),
         )
       }
-      if (req.method === 'POST' && p === '/api/panel/kernels/install') {
+      if (req.method === 'POST' && ['/api/panel/kernels/install', '/api/panel/kernels/crag-update'].includes(p)) {
         const body = await readBody(req, 32 * 1024)
         const selection = validateKernelTargets(cfg.paths.project, body?.targets)
         if (!selection.ok)
@@ -3140,10 +3140,20 @@ export function createPanelHandler(ctx) {
         if (body.targets.some((target) => userMissesVmId(req, cfg.paths.project, target.id))) {
           return json(res, 403, { ok: false, error: { code: 'forbidden', message: '无权管理所选虚拟机' } })
         }
+        const updateExisting = p === '/api/panel/kernels/crag-update'
+        if (
+          updateExisting &&
+          body.targets.some((target) => target.kernel !== 'crag' || !(target.payload_tag || target.expected_tag))
+        ) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'kernel_target_invalid', message: '更新必须指定 CRAG 发行版本' },
+          })
+        }
         const install = () =>
           installKernelTargets({
             projectRoot: cfg.paths.project,
-            targets: body.targets,
+            targets: body.targets.map((target) => ({ ...target, update_existing: updateExisting })),
             routing: ctx.routingConfig,
             watchdog: ctx.kernelWatchdog,
             poolScheduler: ctx.poolScheduler,
