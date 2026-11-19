@@ -69,6 +69,7 @@ describe('vmDetailTabs', () => {
       'proxy',
       'test',
       'ops',
+      'desktop',
       'seed',
     ])
     expect(vmDetailTabs(vmPermsFor('user'))).toEqual([
@@ -87,6 +88,7 @@ describe('vmDetailTabs', () => {
     const tabs = vmDetailTabs(vmPermsFor('user'))
     expect(visibleTab('ops', tabs)).toBe('overview')
     expect(visibleTab('seed', tabs)).toBe('overview')
+    expect(visibleTab('desktop', tabs)).toBe('overview')
     expect(visibleTab('test', tabs)).toBe('test')
     expect(visibleTab('proxy', tabs)).toBe('overview')
   })

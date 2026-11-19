@@ -18,6 +18,12 @@ type DesktopStatus = {
   container?: string
 }
 
+const UNSUPPORTED_TEXT: Record<string, string> = {
+  no_container: 'Codex 槽位没有槽容器，不支持浏览器桌面。',
+  kvm_unsupported: 'KVM 槽位暂不支持浏览器桌面。',
+  native_node_unsupported: 'macOS 原生节点上的槽位不支持浏览器桌面。',
+}
+
 const STATE_TEXT: Record<DesktopStatus['state'], string> = {
   running: '运行中',
   stale: '待同步（槽位重启后会在打开时自动重连网络）',
@@ -61,8 +67,12 @@ export function VmDesktopCard({ vm }: { vm: Vm }) {
   })
 
   const s = status.data
-  // Non-admin roles get 403 on the desktop routes: hide rather than show a dead toggle.
-  if (status.isError || (s && !s.supported)) return null
+  if (status.isError || (s && !s.supported)) {
+    const text = status.isError
+      ? `读取桌面状态失败：${status.error instanceof Error ? status.error.message : String(status.error)}`
+      : UNSUPPORTED_TEXT[s?.reason || ''] || '当前槽位不支持浏览器桌面。'
+    return <p className='text-sm text-muted-foreground'>{text}</p>
+  }
 
   const goFullscreen = () => {
     const el = frameRef.current
@@ -94,7 +104,11 @@ export function VmDesktopCard({ vm }: { vm: Vm }) {
           <>
             <div
               ref={frameRef}
-              className={fullscreen ? 'h-screen w-screen' : 'h-[560px]'}
+              className={
+                fullscreen
+                  ? 'h-screen w-screen'
+                  : 'h-[calc(100vh-280px)] min-h-[480px]'
+              }
             >
               <NoVncViewer
                 ticketPath={`${root}/desktop-ticket`}

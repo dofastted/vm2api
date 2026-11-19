@@ -26,7 +26,6 @@ import { VmEnvironmentCard } from '@/features/vm/environment-card'
 import { NodeChip } from '@/features/vm/node-chip'
 import { VmPhysicalFeaturesCard } from '@/features/vm/physical-features-card'
 import { isRemoteVm, REMOTE_UNSUPPORTED_TEXT } from '@/features/vm/placement'
-import { VmDesktopCard } from '@/features/vm/vm-desktop-card'
 import { VmOwnerAdminCard } from '@/features/vm/vm-owner-admin-card'
 import { VmShellCard } from '@/features/vm/vm-shell-card'
 
@@ -245,7 +244,6 @@ export function VmOpsTab(props: VmOpsTabProps) {
         </>
       )}
       {gpt ? null : <VmShellCard vm={vm} onChanged={onRefresh} />}
-      {gpt ? null : <VmDesktopCard vm={vm} />}
       <Separator />
       <div className='flex flex-wrap gap-2'>
         <Button size='sm' variant='outline' onClick={onReset}>

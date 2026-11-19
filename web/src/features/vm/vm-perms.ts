@@ -78,13 +78,13 @@ export function useVmPerms(): VmPerms {
 }
 
 export type VmDetailTab =
-  'overview' | 'account' | 'proxy' | 'test' | 'ops' | 'seed'
+  'overview' | 'account' | 'proxy' | 'test' | 'ops' | 'desktop' | 'seed'
 
 export function vmDetailTabs(perms: VmPerms): VmDetailTab[] {
   const tabs: VmDetailTab[] = ['overview', 'account']
   if (perms.proxy) tabs.push('proxy')
   if (perms.test) tabs.push('test')
-  if (perms.admin) tabs.push('ops', 'seed')
+  if (perms.admin) tabs.push('ops', 'desktop', 'seed')
   return tabs
 }
 
