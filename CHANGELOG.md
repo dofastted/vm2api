@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.4.159 — 2026-11-19 · 节点链路抖动不再误伤启动与调度
+
+- 启动前退役旧 telemetry sender 时区分「脚本判定」与「传输失败」：数字退出码才算脚本真的跑过、sender 确实没停；没有退出码（链路抖动、超时、spawn 失败）先重试一次，仍无法验证就放行启动并标记 `legacy_telemetry_unverified`。此前控制面重启后的 SSH 抖动窗口会把健康槽报成 `kernel_start_failed`，而容器里根本没有 telemetry 进程。真正卡死的 sender 在链路恢复后的下一次启动仍会确定性失败。
+- 内核健康的槽位上，`slot-runtime:` 维护锁超过 10 分钟未释放时由 watchdog 解除。控制面在 cutover 中途重启会把操作级维护锁永久留在槽 json 上，容器和内核之后完全健康，槽却一直「维护中」退出调度，此前只能手工改 json 救回。活体 cutover 全程把 watchdog 挡在外面，解锁只作用于 `slot-runtime:` 这个命名空间，内核安装、迁移和代理 hold 都不受影响（#1320）。
+
 ## 1.4.158 — 2026-11-19 · 用量窗口各记各的采样时间
 
 - 5h 与 7d 的 Extra 窗口各自记录 `sampled_at`，只带 7d 头的响应不再让 5h 的旧数字看起来是刚读到的。官方 `/usage` 探测只在真的把读数抄进 Extra 时才刷新共享的 `sampled_at`。

@@ -44,13 +44,32 @@ export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect 
     return { ok: false, code: 'telemetry_runtime_unavailable' }
   }
   if (!runtime?.State?.Running) return { ok: true, running: false, state: 'stopped' }
-  const result = await run(slotExecArgv(vm, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), {
-    timeoutMs: 5000,
-    env: host.dockerEnv(),
-  })
-  return result.code === 0 && !result.timed_out
-    ? { ok: true, running: true }
-    : { ok: false, code: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
+  const attempt = () =>
+    run(slotExecArgv(vm, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), {
+      timeoutMs: 5000,
+      env: host.dockerEnv(),
+    })
+  const result = await attempt()
+  if (result.code === 0 && !result.timed_out) return { ok: true, running: true }
+  // A numeric exit code means the script really ran and the sender survived;
+  // anything else (null code, timeout) is the slot exec never completing —
+  // node-link flap, not a dead sender. Retry once, then report unverified
+  // instead of failing the publication on transport jitter.
+  if (typeof result.code === 'number') {
+    return { ok: false, code: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
+  }
+  const retry = await attempt()
+  if (retry.code === 0 && !retry.timed_out) return { ok: true, running: true }
+  if (typeof retry.code === 'number') {
+    return { ok: false, code: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
+  }
+  return {
+    ok: true,
+    running: true,
+    unverified: true,
+    code: 'legacy_telemetry_unverified',
+    error: 'Legacy telemetry retire unverified (slot exec unavailable)',
+  }
 }
 
 export async function readSlotProcessStatus({
