@@ -62,11 +62,11 @@ sudo bash /opt/vm2api/deploy/install.sh crag-update
 
 需要包含 `scripts/seed-crag.mjs`、`scripts/update-crag.mjs` 的消费端源码/镜像；只下载一个新版 shell 到旧镜像不足以补齐 Node 更新器。支持已有 Docker 控制面和主机 Node 部署；读取进程环境或 `.env` 的 `VM2API_API_KEY` / `KIN_API_KEY`。无 `.env` 的主机 systemd 部署可由 root 从既有 `vm2api.service` 进程环境读取 key/port，不复制或打印完整环境；也可用进程环境 `PORT` 指定本地控制面端口。普通 amd64 `install` / `upgrade` 即使没有 CRAG 缓存也执行获取；`--no-start` / `--no-sync-wrap` 跳过，显式 `crag-update --no-start` 报错。当前 CRAG 发行包仅支持 amd64，ARM64 一键安装明确提示并跳过 CRAG 获取，不影响原有安装路径。缺少有效出厂包时，拉取只信任随官方 vm2api 交付的 `deploy/payload.json` 固定公钥摘要；未携带此摘要的部署仍需可信出厂包。
 
-更新顺序：从 vm2api 公开 Release 下载完整包，以原信任锚校验签名、成员 SHA 与 ELF → 原子切换下载指针 → 全槽清点 → 检查已有 CRAG V2 槽 → 有变化时以唯一标记暂停调度并排空在途请求 → 确认原生 `active_requests`、`queued`、`continuations` 全为 0 → 受管同步或重载对应槽 → 核验运行中 memfd 的 SHA 与签名 payload 承诺一致。安装目录哈希相同不能证明运行进程已更新。
+更新器先下载并验证签名包，再把指定版本交给运行中的控制面安装。控制面使用各槽的实际部署位置，逐槽暂停调度、排空在途请求，并确认运行槽的 `active_requests`、`queued`、`continuations` 均为 0 后才重启，不需要全局暂停。本机槽确认安装文件与运行中的 memfd 都已是目标版本时，不会再次安装；集群槽由控制面在节点安装并报告结果，不使用本机容器或文件校验远端状态。
 
-不改变内核选择：CRAG V2 槽更新运行内核；已停止槽只更新磁盘，不开机；非 CRAG 本地槽若留有 `crag-v2` 缓存，仅原子更新该目录，不碰 wrapper、配置和进程；无副本的槽、Codex 槽不安装 CRAG。非 CRAG 集群槽标为 skip，不宣称替换其远端文件；当前物化器不支持的集群/KVM CRAG V2 目标在下载/停调度前失败。报告逐槽列出 `sync` / `cache` / `skip`。
+仅更新已选用 CRAG V2 的槽；已停止的槽只换包，不开机。非 CRAG 本地槽若留有 `crag-v2` 缓存，仅原子更新该目录，不碰 wrapper、配置和进程；非 CRAG 集群槽、无副本的槽和 Codex 槽标为 `skip`。macOS 原生节点不支持此安装方式。报告逐槽列出 `sync` / `cache` / `skip`。
 
-下载或信任校验失败不覆盖旧包、不停槽；未完成工具续接时拒绝强制重启。更新锁为 `share/crag/kernels/v2/.update-lock`，并发更新失败；强杀后须先确认无更新进程再清理锁。调度 hold 使用本次唯一 `crag_update_*` 标记，正常退出时只恢复自己的 hold；断电/强杀不承诺自动恢复。失败返回非零，不伪装成功。回滚用保留的前一完整包，仍须验证原发行公钥、空闲/续接状态并显式重载；禁止轮换授权身份、用 legacy ELF 降级或仅改指针后宣称已回滚。
+下载或信任校验失败不覆盖旧包、不停槽。更新锁为 `share/crag/kernels/v2/.update-lock`；强杀后须先确认后台安装和更新进程均已结束，再清理锁。失败返回非零，批量安装可能已更新其中部分槽；结果不明时先核对槽位状态，不要重复提交。回滚须选择保留的前一完整签名包并重新安装；仅改下载指针不会回滚槽内运行版本。
 
 当前重装接口在同一槽生命周期锁内排空请求、停止服务、关闭 Docker 自动重启、替换文件并验证重启；成功报告 `restarted: true`、`stopped: false`、`status: running`，无需再发一次启动请求。失败可能保持 stopped，须按逐槽错误和实际运行状态处理，不能用 HTTP 200 判断成功。较旧控制面可能只安装并保持停止，按实际部署版本核对；详见[托管节点内核排障与验收](managed-kernel-troubleshooting.md)。安装不主动重置家目录、凭据、指纹或工作区；启动阶段若需更新容器布局可能保留持久目录重建，不能承诺容器 ID 恒定。
 
