@@ -483,6 +483,37 @@ test('API key import returns only approved account and quota fields', async () =
   assert.equal((await run('POST', `${root}/environments`, { ...create, api_key: 'invalid' })).status, 400)
 })
 
+test('OAuth account import redacts credentials and preserves the authorization boundary', async () => {
+  const endpoint = `${root}/environments`
+  const credential = {
+    access_token: 'fixture-access-never-returned',
+    expiry_timestamp: 4102444800,
+  }
+  const body = { name: record.name, proxy_id: record.proxy_id, oauth_account: credential }
+  const invalid = setup(() => assert.fail('malformed credentials must not reach the host'))
+  const rejected = await invalid('POST', endpoint, {
+    ...body,
+    oauth_account: { ...credential, access_token: 'invalid\r\nheader' },
+  })
+  assert.equal(rejected.status, 400)
+  assert.equal(rejected.body.error.code, 'gemini_oauth_import_invalid')
+
+  const run = setup(() => ({
+    ...record,
+    auth_state: 'authorized',
+    auth_method: 'oauth',
+    oauth_imported: true,
+    oauth_account: credential,
+    account: { state: 'ok', email: 'verified@example.test', access_token: credential.access_token },
+  }))
+  const accepted = await run('POST', endpoint, body)
+  assert.equal(accepted.status, 200)
+  assert.equal(accepted.body.data.oauth_imported, true)
+  assert.equal(accepted.body.data.account.email, 'verified@example.test')
+  assert.equal(accepted.body.data.runtime_ready, false)
+  assert.doesNotMatch(JSON.stringify(accepted.body), /fixture-access-never-returned/)
+})
+
 test('Gemini panel exposes scoped quota windows without inventing missing fractions or exposing raw fields', async () => {
   const run = setup(() => ({
     environments: [

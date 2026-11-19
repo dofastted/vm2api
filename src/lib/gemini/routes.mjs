@@ -92,6 +92,11 @@ const HOST_ERRORS = {
   gemini_terminal_conflict: [409, '此 Gemini 环境已有终端会话或正在执行其他操作，请稍后重试'],
   gemini_terminal_requires_oauth: [409, 'Antigravity CLI 需要有效的 Google OAuth 凭据，请重新授权后再启动'],
   gemini_terminal_limit: [429, '终端会话或连接票据已达上限，请关闭现有终端或稍后重试'],
+  gemini_oauth_import_invalid: [400, 'Google 账号文件中的凭据格式无效'],
+  gemini_oauth_import_rejected: [400, 'Google 凭据已过期或未获授权，请导出新文件或进行 Google 授权'],
+  gemini_test_oauth_unsupported: [503, '当前签名载荷不支持 Google OAuth 推理测试'],
+  gemini_test_auth_required: [409, '请先为 Gemini 环境完成授权'],
+  gemini_test_invalid_input: [400, '请选择此环境的 Gemini 模型并输入有效的测试内容'],
 }
 
 export function isGeminiPanelPath(value) {
@@ -311,6 +316,7 @@ function environmentView(value, { id, proxyId } = {}) {
     name: text(value.name, 80) || '',
     auth_state: value.auth_state,
     auth_method: value.auth_method === 'api_key' ? 'api_key' : 'oauth',
+    ...(value.oauth_imported === true && value.auth_method === 'oauth' ? { oauth_imported: true } : {}),
     kernel_version: text(value.kernel_version),
     runtime_ready: value.runtime_ready === true,
     models: items(value.models, 128, modelName),
@@ -468,7 +474,7 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
         return ok({ kernel_version: result.kernel_version })
       }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/environments`) {
-        const body = await readBody(req, 4096)
+        const body = await readBody(req, 8192)
         const name = typeof body?.name === 'string' ? body.name.trim() : ''
         const method = body?.auth_method ?? 'oauth'
         if (!name || name.length > 80 || !validId(body?.proxy_id) || !['oauth', 'api_key'].includes(method)) {
@@ -478,6 +484,17 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
         if ((method === 'api_key' && !API_KEY.test(apiKey)) || (method === 'oauth' && body?.api_key != null)) {
           return fail(400, 'gemini_invalid_api_key', '请提供有效格式的 Gemini API Key')
         }
+        const imported = body?.oauth_account
+        if (
+          imported != null &&
+          (method !== 'oauth' ||
+            typeof imported.access_token !== 'string' ||
+            !/^[A-Za-z0-9._~+/-]{1,4096}={0,2}$/.test(imported.access_token) ||
+            !Number.isSafeInteger(imported.expiry_timestamp) ||
+            imported.expiry_timestamp <= 0)
+        ) {
+          return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
+        }
         const proxyUrl = proxyFor(proxyPool(), body.proxy_id)
         return ok(
           environmentView(
@@ -486,6 +503,9 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
               proxy_id: body.proxy_id,
               proxy_url: proxyUrl,
               ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
+              ...(imported != null && {
+                oauth_account: { access_token: imported.access_token, expiry_timestamp: imported.expiry_timestamp },
+              }),
             }),
           ),
         )
