@@ -1516,6 +1516,18 @@ server.listen(cfg.port, cfg.host, () => {
     server.once('close', () => clearInterval(timer))
     poll()
   }
+  // An unpaid checkout link outliving its payment window is part of the order
+  // lifecycle, so this runs whether or not activation polling is enabled. One order
+  // per tick, so a backlog drains without bursting requests at the supplier.
+  {
+    const expireOrders = () =>
+      void handleCragShop.pollOrderExpiry().catch(() => {
+        console.warn('[crag-shop] order expiry deferred')
+      })
+    const timer = setInterval(expireOrders, 60_000).unref()
+    server.once('close', () => clearInterval(timer))
+    expireOrders()
+  }
   // Installation intent is durable; reconnecting nodes must not depend on a lost HTTP callback.
   if (process.env.KIN_CRS_MOCK !== '1') {
     let resuming = false
