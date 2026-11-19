@@ -1570,6 +1570,29 @@ export async function startProxyEgress(
   }
 }
 
+const BRIDGE_NF_CALL_IPTABLES = '/proc/sys/net/bridge/bridge-nf-call-iptables'
+
+/**
+ * Whether bridged traffic reaches iptables at all.
+ *
+ * Both barriers between VMs sharing the folded bridge live in iptables — our
+ * FORWARD drop and Docker's own isolation chain from `enable_icc=false`. Neither
+ * sees a packet unless br_netfilter is loaded and bridge-nf-call-iptables is on.
+ * With it off they are inert and every VM on the node can reach every other,
+ * silently and with nothing in any log to say so.
+ *
+ * An unreadable path means the module is not loaded, which has the same effect,
+ * so it counts as off rather than unknown. A per-VM bridge carries one VM and
+ * does not depend on this.
+ */
+export function bridgeNetfilterEnabled(readFile = (p) => fs.readFileSync(p, 'utf8')) {
+  try {
+    return String(readFile(BRIDGE_NF_CALL_IPTABLES) || '').trim() === '1'
+  } catch {
+    return false
+  }
+}
+
 /**
  * Bring the node's one shared helper in line with its membership.
  *
@@ -1600,6 +1623,7 @@ export async function startSharedEgress(
     startProcess = startEgressProcess,
     stopProcess = stopEgressProcess,
     waitListening = waitForEgressListen,
+    bridgeNetfilter = bridgeNetfilterEnabled,
   } = {},
 ) {
   const proxyId = sharedEgressId(nodeId)
@@ -1615,6 +1639,15 @@ export async function startSharedEgress(
       stopped: true,
       reason: 'no_routable_members',
       ...stopped,
+    }
+  }
+  // Checked before any VM is placed on the folded bridge: with bridged traffic
+  // bypassing iptables, nothing separates the VMs that would share it.
+  if (!bridgeNetfilter()) {
+    return {
+      ok: false,
+      error: 'bridge_netfilter_disabled',
+      hint: 'load br_netfilter and set net.bridge.bridge-nf-call-iptables=1; without it VMs on the shared bridge are not isolated from each other',
     }
   }
   const net = ensureSharedEgressNetwork(nodeId, runDocker, { runIp })

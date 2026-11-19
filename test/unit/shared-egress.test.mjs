@@ -24,6 +24,7 @@ import {
 } from '../../src/lib/vm/shared-egress.mjs'
 import {
   EGRESS_NOFILE,
+  bridgeNetfilterEnabled,
   egressBinFingerprint,
   egressConfigBody,
   egressConfigFor,
@@ -687,10 +688,7 @@ test('a VM resolves to the network its own mode names', () => {
   const shared = { proxy: { id: 'px-a1b2c3d4' }, runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' } }
   assert.equal(slotNetworkForVm(shared), sharedNetworkName(''))
   // A cluster VM belongs to its own node's shared network.
-  assert.equal(
-    slotNetworkForVm({ ...shared, node_id: 'node-a' }),
-    sharedNetworkName('node-a'),
-  )
+  assert.equal(slotNetworkForVm({ ...shared, node_id: 'node-a' }), sharedNetworkName('node-a'))
 })
 
 test('a shared VM is attached at its recorded address, never one Docker picks', () => {
@@ -764,4 +762,42 @@ test('a per-vm kvm slot gets no address argument', () => {
     projectRoot: '/tmp/root',
   })
   assert.equal(args.indexOf('--ip'), -1)
+})
+
+test('bridged traffic bypassing iptables is read as isolation off', () => {
+  assert.equal(
+    bridgeNetfilterEnabled(() => '1\n'),
+    true,
+  )
+  assert.equal(
+    bridgeNetfilterEnabled(() => '0\n'),
+    false,
+  )
+  // An unreadable path means br_netfilter is not loaded, which leaves bridged
+  // traffic outside iptables just as surely as the switch being off.
+  assert.equal(
+    bridgeNetfilterEnabled(() => {
+      throw new Error('ENOENT')
+    }),
+    false,
+  )
+})
+
+test('a node whose bridged traffic skips iptables refuses to fold', async () => {
+  const h = sharedHarness()
+  const r = await startSharedEgress('/tmp/root', {
+    nodeId: 'node-a',
+    members: [{ vmId: 'vm-1', ip: '100.64.16.3', proxyUrl: 'socks5h://a:1080' }],
+    ...h.opts,
+    bridgeNetfilter: () => false,
+  })
+  assert.equal(r.ok, false)
+  assert.equal(r.error, 'bridge_netfilter_disabled')
+  assert.match(r.hint, /bridge-nf-call-iptables/)
+  // Nothing is placed on a bridge that cannot isolate: no network, no rules,
+  // no helper. Starting anyway would put every VM on the node in reach of
+  // every other, with nothing in any log to say so.
+  assert.equal(h.docker.calls.filter((a) => a[1] === 'create').length, 0)
+  assert.deepEqual(h.iptablesCalls, [])
+  assert.equal(h.startCalls.length, 0)
 })
