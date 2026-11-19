@@ -14,6 +14,7 @@ import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { toHostPath } from './host-path.mjs'
 import { socksProxyUrl } from './socks-address.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
+import { collectTakenSubnets, createSubnetAllocator, gatewayOf, subnetPoolConfig } from './subnet-pool.mjs'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
 export const LOCAL_EGRESS_ID = 'px-local'
@@ -119,17 +120,51 @@ export function chainName(proxyId) {
   return (`KEG${hex}` || 'KEG').slice(0, 28)
 }
 
-export function portsForProxy(proxyId) {
+/** 8000 slots, two ports each, starting at 20000. */
+const PORT_SLOTS = 8000
+const PORT_BASE = 20000
+
+function portPairAt(slot) {
+  return { tcp: PORT_BASE + slot * 2, dns: PORT_BASE + slot * 2 + 1 }
+}
+
+/**
+ * Deterministic port pair for an egress helper. With `taken` it probes past slots
+ * already handed out; without it the result is the bare hash, which is what every
+ * existing caller relies on. The unprobed form silently collides once a host runs
+ * a few hundred exits — 8000 slots is a birthday-problem wall, not a safe ceiling.
+ *
+ * Keyed on the egress artifact id, so every local row on a host shares one pair.
+ */
+export function portsForProxy(proxyId, { taken, maxProbe = PORT_SLOTS } = {}) {
   const s = proxyKey(egressArtifactId(proxyId))
   let h = 2166136261
   for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619)
-  const n = (h >>> 0) % 8000
-  return { tcp: 20000 + n * 2, dns: 20000 + n * 2 + 1 }
+  const base = (h >>> 0) % PORT_SLOTS
+  if (typeof taken !== 'function') return portPairAt(base)
+  const limit = Math.min(Math.max(1, maxProbe), PORT_SLOTS)
+  for (let probe = 0; probe < limit; probe++) {
+    const pair = portPairAt((base + probe) % PORT_SLOTS)
+    if (!taken(pair)) return pair
+  }
+  const err = new Error(`egress_ports_exhausted: no free pair in ${PORT_SLOTS} slots from ${PORT_BASE}`)
+  err.code = 'egress_ports_exhausted'
+  throw err
+}
+
+/** Trailing port of a `host:port` listen spec. */
+export function portFromListenSpec(spec) {
+  const port = Number(
+    String(spec || '')
+      .trim()
+      .split(':')
+      .pop(),
+  )
+  return Number.isInteger(port) && port > 0 && port < 65536 ? port : 0
 }
 
 export function gatewayFromSubnet(subnet) {
-  const m = String(subnet || '').match(/^(\d+\.\d+\.\d+)\.(\d+)\/\d+$/)
-  return m ? `${m[1]}.1` : ''
+  return gatewayOf(String(subnet || '').trim())
 }
 
 export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
@@ -186,7 +221,7 @@ export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
 
 function commandPrefix(name) {
   const raw = String(process.env.KIN_EGRESS_CMD_PREFIX || '').trim()
-  if (!raw || !['ss', 'iptables'].includes(name)) return []
+  if (!raw || !['ss', 'iptables', 'ip'].includes(name)) return []
   return raw.split(/\s+/).filter(Boolean)
 }
 
@@ -213,8 +248,43 @@ function iptables(args) {
   return sh(['iptables', ...args], { timeout: 8_000 })
 }
 
+function ipRoute(args) {
+  return sh(['ip', ...args], { timeout: 8_000 })
+}
+
 function docker(args, timeout = 30_000) {
   return sh(['docker', ...args], { timeout })
+}
+
+/**
+ * Explicit `--subnet` for a new egress network. Creating one without it draws from
+ * the daemon's `default-address-pools`, which runs dry at a few dozen networks and
+ * is why the fleet stalls around 200 VMs; an explicit subnet bypasses that pool, so
+ * no dockerd restart and no disturbance to running containers.
+ *
+ * Keyed on the egress artifact id, so the per-node local rows that already share one
+ * bridge keep sharing one subnet.
+ */
+function subnetCreateArgs(proxyId, run, runIp) {
+  const { pool, prefix } = subnetPoolConfig()
+  const taken = collectTakenSubnets({ runDocker: run, runIp })
+  const subnet = createSubnetAllocator({ pool, prefix, taken }).allocate(egressArtifactId(proxyId))
+  const gateway = gatewayOf(subnet)
+  return ['--subnet', subnet, ...(gateway ? ['--gateway', gateway] : [])]
+}
+
+/**
+ * A drained pool must surface, since falling back to the daemon pool would only
+ * hide the same failure. Anything else (bad override, unreadable routes) degrades to
+ * the old behaviour rather than blocking a VM from booting.
+ */
+function subnetArgsOrFallback(proxyId, run, runIp) {
+  try {
+    return { args: subnetCreateArgs(proxyId, run, runIp) }
+  } catch (e) {
+    if (e?.code === 'subnet_pool_exhausted') return { error: e }
+    return { args: [] }
+  }
 }
 
 export function egressRunDir(projectRoot, proxyId) {
@@ -326,6 +396,55 @@ export function readEgressListenTcp(projectRoot, proxyId) {
     return ''
   }
 }
+
+/**
+ * The pair a helper was actually started with. Probing means the hash is only a
+ * starting point, so teardown has to read back what was written instead of
+ * recomputing it — otherwise it removes iptables rows for the wrong ports.
+ */
+export function persistedEgressPorts(projectRoot, proxyId) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(egressRunDir(projectRoot, proxyId), 'egress.json'), 'utf8'))
+    const tcp = portFromListenSpec(cfg?.listen_tcp)
+    const dns = portFromListenSpec(cfg?.listen_dns)
+    return tcp && dns ? { tcp, dns } : null
+  } catch {
+    return null
+  }
+}
+
+/** Ports this control plane has already written for its other egress helpers. */
+export function allocatedEgressPorts(projectRoot, exceptProxyId = '') {
+  const used = new Set()
+  const base = path.join(projectRoot || '', 'data', 'run', 'egress')
+  const except = proxyKey(egressArtifactId(exceptProxyId))
+  let entries = []
+  try {
+    entries = fs.readdirSync(base, { withFileTypes: true })
+  } catch {
+    return used
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === except) continue
+    try {
+      const cfg = JSON.parse(fs.readFileSync(path.join(base, entry.name, 'egress.json'), 'utf8'))
+      for (const spec of [cfg?.listen_tcp, cfg?.listen_dns]) {
+        const port = portFromListenSpec(spec)
+        if (port) used.add(port)
+      }
+    } catch {}
+  }
+  return used
+}
+
+/** Keep a helper's existing pair; otherwise probe past the pairs already in use. */
+export function resolveEgressPorts(projectRoot, proxyId) {
+  const persisted = persistedEgressPorts(projectRoot, proxyId)
+  if (persisted) return persisted
+  const used = allocatedEgressPorts(projectRoot, proxyId)
+  if (!used.size) return portsForProxy(proxyId)
+  return portsForProxy(proxyId, { taken: (pair) => used.has(pair.tcp) || used.has(pair.dns) })
+}
 export function inspectEgressNetwork(proxyId, run = docker) {
   const name = networkName(proxyId)
   if (!name) return null
@@ -341,16 +460,19 @@ export function inspectEgressNetwork(proxyId, run = docker) {
   }
 }
 
-export function ensureEgressNetwork(proxyId, run = docker) {
+export function ensureEgressNetwork(proxyId, run = docker, { runIp = ipRoute } = {}) {
   const name = networkName(proxyId)
   const br = bridgeName(proxyId)
   if (!name) return { ok: false, error: 'proxy_id_required' }
   const existing = inspectEgressNetwork(proxyId, run)
   if (existing?.subnet) return { ok: true, ...existing, reused: true }
+  const subnet = subnetArgsOrFallback(proxyId, run, runIp)
+  if (subnet.error) return { ok: false, error: subnet.error.message, code: subnet.error.code }
   const created = run([
     'network',
     'create',
     '--ipv6=false',
+    ...subnet.args,
     '--opt',
     `com.docker.network.bridge.name=${br}`,
     '--opt',
@@ -1128,17 +1250,20 @@ async function waitForEgressListen(host, port, ownerPid) {
   return false
 }
 
-export function ensureLocalProxyEgress(proxy, { runDocker = docker } = {}) {
+export function ensureLocalProxyEgress(proxy, { runDocker = docker, runIp = ipRoute } = {}) {
   const proxyId = proxy?.id || LOCAL_EGRESS_ID
   const name = networkName(proxyId)
   const br = bridgeName(proxyId)
   if (!name) return { ok: false, error: 'proxy_id_required' }
   const existing = inspectEgressNetwork(proxyId, runDocker)
   if (existing?.subnet) return { ok: true, mode: 'local', ...existing, reused: true, proxy_id: proxyId }
+  const subnet = subnetArgsOrFallback(proxyId, runDocker, runIp)
+  if (subnet.error) return { ok: false, error: subnet.error.message, code: subnet.error.code }
   const created = runDocker([
     'network',
     'create',
     '--ipv6=false',
+    ...subnet.args,
     '--opt',
     `com.docker.network.bridge.name=${br}`,
     '--opt',
@@ -1203,7 +1328,7 @@ export async function startProxyEgress(
   if (!net.ok) return net
   const listenHost = listenHostOverride || net.gateway || gatewayFromSubnet(net.subnet)
   if (!listenHost) return { ok: false, error: 'egress network gateway missing' }
-  const selectedPorts = ports || portsForProxy(proxyId)
+  const selectedPorts = ports || resolveEgressPorts(projectRoot, proxyId)
   const chain = chainName(proxyId)
   const plan = iptablesPlan({
     chain,
@@ -1248,12 +1373,14 @@ export function stopProxyEgress(projectRoot, proxyId, { subnet, runDocker = dock
   // A node's local row owns nothing here; its bridge name is the control plane's px-local one.
   if (localEgressNodeId(proxyId)) return { ok: true, skipped: 'node_local' }
   const net = inspectEgressNetwork(proxyId, runDocker)
+  // Read back the started pair; a probed port is not recoverable from the hash.
+  const teardownPorts = persistedEgressPorts(projectRoot, proxyId) || portsForProxy(proxyId)
   const plan = iptablesPlan({
     chain: chainName(proxyId),
     bridge: bridgeName(proxyId),
     subnet: subnet || net?.subnet || '0.0.0.0/0',
-    tcpPort: portsForProxy(proxyId).tcp,
-    dnsPort: portsForProxy(proxyId).dns,
+    tcpPort: teardownPorts.tcp,
+    dnsPort: teardownPorts.dns,
   })
   removeIptables(plan, runIptables)
   stopEgressProcess(projectRoot, proxyId)

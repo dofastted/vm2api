@@ -765,6 +765,14 @@ export async function inspectNetworkOrNull(connect, name) {
   return JSON.parse(res.body.toString('utf8'))
 }
 
+/** Every network on the node, IPAM included, so subnet allocation can see what is taken. */
+export async function listNetworks(connect) {
+  const res = await dockerRequest(connect, { path: '/networks', timeoutMs: 20_000 })
+  if (res.status !== 200) throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
+  const parsed = JSON.parse(res.body.toString('utf8'))
+  return Array.isArray(parsed) ? parsed : []
+}
+
 export async function createNetwork(connect, body) {
   const res = await dockerRequest(connect, { method: 'POST', path: '/networks/create', body, timeoutMs: 30_000 })
   // 409: a concurrent create won; the caller re-inspects.
