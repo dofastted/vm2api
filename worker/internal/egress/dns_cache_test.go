@@ -65,7 +65,7 @@ func answerServer(t *testing.T, ttl uint32, nx bool, calls *atomic.Int32, ip *at
 
 func testCacheServer(url string, client *http.Client) *Server {
 	server := &Server{dnsSlots: make(chan struct{}, dnsMaxInflight)}
-	server.cur.Store(&runtime{upstreams: []string{url}, http: client})
+	server.cur.Store(&runtime{def: &exit{upstreams: []string{url}, http: client}})
 	return server
 }
 
@@ -124,7 +124,7 @@ func TestDNSCacheServesStaleAndRefreshes(t *testing.T) {
 	}
 	// Age the entry past its TTL but inside the stale window.
 	_, key, _ := dnsQueryKey(query)
-	cache := &s.rt().cache
+	cache := &s.rt().def.cache
 	cache.mu.Lock()
 	e := cache.entries[key]
 	e.expires = time.Now().Add(-time.Second)
@@ -181,7 +181,7 @@ func TestDNSCacheNegativeNotServedStale(t *testing.T) {
 		t.Fatalf("upstream calls = %d, want 1", got)
 	}
 	_, key, _ := dnsQueryKey(query)
-	cache := &s.rt().cache
+	cache := &s.rt().def.cache
 	cache.mu.Lock()
 	e := cache.entries[key]
 	if d := time.Until(e.expires); d > 20*time.Second {
