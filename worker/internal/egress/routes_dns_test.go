@@ -379,7 +379,8 @@ func TestReloadDropsRoutesBackToASingleExit(t *testing.T) {
 	}
 }
 
-func TestResolveDNSFromConcurrentlyKeepsAnswersOnTheirOwnExit(t *testing.T) {	const vms = 6
+func TestResolveDNSFromConcurrentlyKeepsAnswersOnTheirOwnExit(t *testing.T) {
+	const vms = 6
 	const each = 4
 	var hitsDefault atomic.Int32
 	routes := make([]Route, vms)

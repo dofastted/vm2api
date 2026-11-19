@@ -536,7 +536,9 @@ export function inspectSharedEgressNetwork(nodeId, run = docker) {
   if (!r.ok) return null
   let subnet = ''
   let gateway = ''
-  for (const pair of String(r.stdout || '').trim().split(/\s+/)) {
+  for (const pair of String(r.stdout || '')
+    .trim()
+    .split(/\s+/)) {
     const [net, gw] = pair.split('|')
     if (parseCidr(String(net || '').trim())?.prefix === undefined) continue
     subnet = String(net || '').trim()
@@ -577,7 +579,11 @@ export function ensureSharedEgressNetwork(nodeId, run = docker, { runIp = ipRout
     const { pool } = subnetPoolConfig()
     subnet = allocateSharedSubnet(nodeId, { pool, taken: collectTakenSubnets({ runDocker: run, runIp }) })
   } catch (e) {
-    return { ok: false, error: e?.message || 'shared subnet allocation failed', code: e?.code || 'shared_subnet_failed' }
+    return {
+      ok: false,
+      error: e?.message || 'shared subnet allocation failed',
+      code: e?.code || 'shared_subnet_failed',
+    }
   }
   const gateway = gatewayOf(subnet)
   const created = run([
@@ -613,8 +619,12 @@ export function sharedEndpointIps(nodeId, run = docker) {
   const r = run(['network', 'inspect', '-f', '{{range .Containers}}{{.IPv4Address}} {{end}}', name])
   if (!r.ok) return { ok: false, items: [] }
   const items = []
-  for (const token of String(r.stdout || '').trim().split(/\s+/)) {
-    const ip = String(token || '').split('/')[0].trim()
+  for (const token of String(r.stdout || '')
+    .trim()
+    .split(/\s+/)) {
+    const ip = String(token || '')
+      .split('/')[0]
+      .trim()
     if (ip) items.push(ip)
   }
   return { ok: true, items }

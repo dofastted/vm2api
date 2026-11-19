@@ -286,11 +286,7 @@ test('an existing shared network is reused, not recreated', () => {
   assert.equal(r.reused, true)
   assert.equal(r.subnet, '100.64.16.0/20')
   // Recreating would renumber every VM already holding an address here.
-  assert.equal(
-    d.calls.filter((a) => a[1] === 'create').length,
-    0,
-    'reuse still called docker network create',
-  )
+  assert.equal(d.calls.filter((a) => a[1] === 'create').length, 0, 'reuse still called docker network create')
 })
 
 test('the shared subnet avoids ranges docker and the host already use', () => {

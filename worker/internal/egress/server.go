@@ -203,7 +203,6 @@ func (rt *runtime) exitForConn(client net.Conn) (*exit, error) {
 	return rt.exitFor(src)
 }
 
-
 func (s *Server) rt() *runtime { return s.cur.Load() }
 
 func New(cfg Config) (*Server, error) {
