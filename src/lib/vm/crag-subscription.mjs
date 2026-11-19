@@ -45,6 +45,7 @@ const authorityErrors = new Map([
   ['payload_key_conflict', 409],
 ])
 const fail = (code = 'crag_subscription_unavailable', status = 503) => Object.assign(new Error(code), { code, status })
+const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
 const uid = () => process.getuid()
 const validVoucher = (code) =>
   typeof code === 'string' &&
@@ -777,6 +778,9 @@ export function createCragSubscription({
   }
 
   async function authority(action, hostId, key, extra) {
+    let requestId
+    let status
+    let code
     try {
       const response = await fetchImpl(`${origin}/v1/host-subscriptions/${action}`, {
         method: 'POST',
@@ -786,15 +790,21 @@ export function createCragSubscription({
         headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'application/json' },
         body: JSON.stringify({ host_id: hostId, ...extra }),
       })
+      const id = response.headers.get('x-request-id')
+      if (authorityRequestId.test(id ?? '')) requestId = id
+      status = response.status
       const envelope = await responseJson(response)
       if (response.ok && envelope?.ok === true && envelope.data && typeof envelope.data === 'object')
         return envelope.data
-      const code = envelope?.error?.code
-      if (envelope?.ok === false && authorityErrors.get(code) === response.status) throw fail(code, response.status)
-    } catch (error) {
-      if (authorityErrors.has(error.code)) throw error
+      if (envelope?.ok === false && authorityErrors.get(envelope.error?.code) === status) {
+        code = envelope.error.code
+      }
+    } catch {
+      // A transport or decoding failure does not prove the Authority rejected the operation.
     }
-    throw fail('crag_subscription_authority_unavailable', 502)
+    const error = code ? fail(code, status) : fail('crag_subscription_authority_unavailable', 502)
+    if (requestId) error.authorityRequestId = requestId
+    throw error
   }
 
   function verifyRights(hostId, data, previous, vm) {
@@ -813,7 +823,7 @@ export function createCragSubscription({
     return { code: data.entitlement, claims: next, rights: projection(data, next) }
   }
 
-  async function finish(hostId, intent, previous, asserted = {}) {
+  async function finish(hostId, intent, previous, asserted = {}, replay = false) {
     const enrollment = Object.hasOwn(intent, 'host_package_sha256')
       ? hostEnrollmentIdentity(projectRoot, intent.host_package_sha256)
       : asserted
@@ -825,7 +835,8 @@ export function createCragSubscription({
         ...enrollment,
       })
     } catch (error) {
-      if (error?.code !== 'crag_subscription_authority_unavailable') {
+      // A denial on replay does not tell us whether the original request committed.
+      if (error?.code !== 'crag_subscription_authority_unavailable' && !(replay && error?.code === 'auth_forbidden')) {
         remove(marker)
         remove(intentFile)
       }
@@ -1180,24 +1191,22 @@ export function createCragSubscription({
         storage(!renewal)
         const previous = current(hostId)
         if (renewal && !previous) throw fail('host_subscription_inactive', 409)
-        const pending = expectedHost && load(intentFile, 0o600, 512)
-        if (pending) {
-          const intent = JSON.parse(pending)
-          if (
-            intent.host_id !== hostId ||
-            intent.redemption_code !== redemption_code ||
-            intent.host_package_sha256 !== packageDigest ||
-            Object.keys(intent).length !== 3 ||
-            readRosterIntent()
-          )
-            throw fail('crag_subscription_sync_pending', 409)
-          await finish(hostId, intent, previous)
-          return
-        }
         const rawIntent = load(intentFile, 0o600, 512)
         if (rawIntent != null) {
-          const savedIntent = JSON.parse(rawIntent)
-          if (Object.hasOwn(savedIntent, 'order_id') || Object.hasOwn(savedIntent, 'target_fingerprint')) {
+          const saved = JSON.parse(rawIntent)
+          if (
+            !renewal &&
+            saved.host_id === hostId &&
+            saved.redemption_code === redemption_code &&
+            saved.host_package_sha256 === packageDigest &&
+            Object.keys(saved).length === 3 &&
+            !readRosterIntent()
+          ) {
+            const confirmed = await finish(hostId, saved, previous, {}, true)
+            return expectedHost ? undefined : status(confirmed)
+          }
+          if (expectedHost) throw fail('crag_subscription_sync_pending', 409)
+          if (Object.hasOwn(saved, 'order_id') || Object.hasOwn(saved, 'target_fingerprint')) {
             await reconcileStaleOrderIntent(hostId, previous)
           }
         }
@@ -1411,7 +1420,7 @@ export function createCragSubscription({
               intent.issuer_public_key_id !== standard.issuer_public_key_id)
           )
             throw hostPackageUnready()
-          await finish(hostId, intent, current(hostId), asserted ? standard : {})
+          await finish(hostId, intent, current(hostId), asserted ? standard : {}, raw != null)
           onRedeemed?.()
         }
 
@@ -1660,7 +1669,7 @@ export function createCragSubscription({
         const previous = current(hostId)
         // Old intents without local rights have no original digest, but still require a trusted package.
         if (!pinned && !previous) hostPackageDigest(projectRoot)
-        const confirmed = await finish(hostId, intent, previous)
+        const confirmed = await finish(hostId, intent, previous, {}, true)
         await replayDeferredReleases(hostId, confirmed)
       })
     },

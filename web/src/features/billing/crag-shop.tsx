@@ -163,6 +163,27 @@ function hostRedemptionError(error: unknown) {
       return '此码与当前宿主机或订阅不匹配'
     case 'crag_subscription_host_package_unready':
       return '请先在内核页拉取可信 CRAG 发行包'
+    case 'auth_forbidden': {
+      const details = isApiError(error) ? error.details : undefined
+      const id = (details as { authority_request_id?: unknown } | undefined)
+        ?.authority_request_id
+      const validId =
+        typeof id === 'string' &&
+        /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(
+          id
+        )
+      return `授权服务拒绝了这台宿主机的兑换请求。请联系管理员核对，不要重置宿主凭据。${validId ? `请求 ID：${id}` : ''}`
+    }
+    case 'crag_subscription_sync_pending':
+      return '上一笔兑换待同步。请点「继续同步」核对原码，不要提交新码。'
+    case 'crag_subscription_busy':
+      return '另一项宿主订阅操作正在处理，请稍后再试。'
+    case 'crag_subscription_authority_unavailable':
+      return '未收到授权服务的确认。若显示待同步，请点「继续同步」核对原码，不要重新购买。'
+    case 'crag_subscription_host_identity_changed':
+      return '本机身份与已保存的订阅不一致。请恢复原实例的身份配置，不要重置凭据。'
+    case 'crag_subscription_invalid_entitlement':
+      return '未能验证返回的订阅权益。请保留原码并继续同步，不要重新购买。'
     default:
       return '兑换尚未确认，请刷新或继续同步'
   }
@@ -294,7 +315,10 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
                 : '订阅状态已同步',
         })
       } else if (next.state !== 'sync_pending') {
-        setNotice({ text: hostRedemptionError(undefined), error: true })
+        setNotice({
+          text: '授权结果尚未安装，请刷新本机订阅并核对状态。',
+          error: true,
+        })
       }
     } catch (error) {
       setNotice({ text: hostRedemptionError(error), error: true })
@@ -437,7 +461,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
       ) : null}
       <p className='text-sm text-muted-foreground empty:sr-only'>
         {syncPending
-          ? '如果继续同步后仍在等待，请核对原订单。订阅使用券只在本页兑换。'
+          ? '继续同步会核对原码；新码请等原兑换确认后再提交。'
           : host.isError || status?.state === 'unavailable'
             ? '无法确认本机权益，请刷新后重试。'
             : probeFailed
