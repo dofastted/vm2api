@@ -613,6 +613,36 @@ export function clearScheduleHold(projectRoot, id, reason, { tag = null } = {}) 
   })
 }
 
+/**
+ * Lift a `slot-runtime:` maintenance hold older than minAgeMs. Only
+ * withSlotMaintenance owns that tag namespace (kernel installs use their
+ * operation id, migrations use `migration:`, proxies use their own reason),
+ * and a live cutover always has the watchdog held off the slot — so a stale
+ * hold here belongs to an operation whose process died (e.g. a control-plane
+ * restart mid-cutover) and would otherwise pin a healthy slot out of
+ * scheduling forever.
+ */
+export function clearStaleRuntimeMaintenanceHold(projectRoot, id, { minAgeMs = 0 } = {}) {
+  const file = path.join(projectRoot, 'vms', `${id}.json`)
+  if (!fs.existsSync(file)) return false
+  let vm
+  try {
+    vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return false
+  }
+  migrateScheduleRecord(vm)
+  if (vm.schedule_hold?.reason !== 'maintenance') return false
+  const tag = String(vm.schedule_hold?.detail?.tag || '')
+  if (!tag.startsWith('slot-runtime:')) return false
+  const at = Date.parse(vm.schedule_hold?.at || '') || 0
+  if (at <= 0 || Date.now() - at < Math.max(0, minAgeMs)) return false
+  delete vm.schedule_hold
+  deriveScheduleFields(vm)
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  return true
+}
+
 const LEGACY_WORKER_RELOAD = /^[a-z_]*_worker_reload$/
 
 /**
