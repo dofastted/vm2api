@@ -36,11 +36,7 @@ function SessionListItem({
     <button
       type='button'
       onClick={() => onSelect(session.sessionId)}
-      title={
-        session.clientSessionId && session.clientSessionId !== session.sessionId
-          ? `出站 ${session.sessionId}\n客户端 ${session.clientSessionId}\n点击按此 Session 筛选日志`
-          : `出站 ${session.sessionId}\n点击按此 Session 筛选日志`
-      }
+      title={`Session ${session.sessionId}\n点击按此 Session 筛选日志`}
       className='group block w-full rounded-md px-3 py-2 text-left transition-colors hover:bg-muted/50'
     >
       <div className='flex items-center gap-2 text-sm'>
