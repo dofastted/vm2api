@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -20,6 +21,16 @@ import (
 	kinproxy "github.com/dofastted/kin-gateway/worker/internal/proxy"
 	"golang.org/x/net/dns/dnsmessage"
 )
+
+// Route sends one VM's traffic to its own upstream, keyed by the source address
+// the shared bridge hands that VM. Its presence is what switches the helper from
+// serving a single exit to multiplexing many: with routes configured the source
+// address is the only thing that selects an upstream, and an address that is not
+// in the table gets no upstream at all.
+type Route struct {
+	VMIP     string `json:"vm_ip"`
+	ProxyURL string `json:"proxy_url"`
+}
 
 type Config struct {
 	ProxyID       string   `json:"proxy_id"`
@@ -32,6 +43,9 @@ type Config struct {
 	// Off by default: the original IP literal is unchanged.
 	DomainForward    bool `json:"domain_forward,omitempty"`
 	DNSCacheDisabled bool `json:"dns_cache_disabled,omitempty"`
+	// Routes is empty for a per-VM helper, which keeps serving ProxyURL alone.
+	// An older config therefore behaves exactly as before.
+	Routes []Route `json:"routes,omitempty"`
 }
 
 // IdleClose is how long a splice may sit with no bytes before both sides
@@ -43,6 +57,7 @@ const (
 	classSpliceRST       = "splice_rst"
 	classSocksDial       = "socks_dial"
 	classAmbiguousDomain = "ambiguous_domain"
+	classNoRoute         = "no_route"
 )
 
 type spliceError struct {
@@ -115,6 +130,46 @@ type runtime struct {
 	upstreams []string
 	preferred atomic.Int32
 	cache     dnsCache
+	// routes is nil for a single-exit helper. When it is set, it is the only
+	// thing that picks an upstream: see dialerFor.
+	routes map[netip.Addr]*kinproxy.Dialer
+}
+
+// sourceAddrOf is the address the shared bridge gave the VM on the other end.
+// Unmapped, since a helper listening on a dual-stack socket sees an IPv4 peer as
+// ::ffff:a.b.c.d and the route table is keyed on the plain form.
+func sourceAddrOf(c net.Conn) (netip.Addr, error) {
+	if c == nil || c.RemoteAddr() == nil {
+		return netip.Addr{}, fmt.Errorf("connection has no remote address")
+	}
+	ap, err := netip.ParseAddrPort(c.RemoteAddr().String())
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("unparsable remote address %q: %w", c.RemoteAddr(), err)
+	}
+	return ap.Addr().Unmap(), nil
+}
+
+// dialerFor picks the upstream for one connection.
+//
+// Without routes the helper serves one exit and every connection takes it, which
+// is how a per-VM helper has always worked. With routes the source address is
+// the sole selector and an unknown one is refused: falling back to ProxyURL here
+// would send an unauthorised VM's traffic out through someone else's exit, which
+// is the whole failure this design exists to prevent. There is deliberately no
+// branch that can reach rt.dialer once routes are configured.
+func (s *Server) dialerFor(rt *runtime, client net.Conn) (*kinproxy.Dialer, error) {
+	if len(rt.routes) == 0 {
+		return rt.dialer, nil
+	}
+	src, err := sourceAddrOf(client)
+	if err != nil {
+		return nil, err
+	}
+	dialer := rt.routes[src]
+	if dialer == nil {
+		return nil, fmt.Errorf("no route for source %s", src)
+	}
+	return dialer, nil
 }
 
 func (s *Server) rt() *runtime { return s.cur.Load() }
@@ -156,8 +211,40 @@ func (s *Server) Reload(cfg Config) error {
 	return nil
 }
 
+// buildRoutes turns the configured table into one dialer per VM address.
+//
+// A duplicate or unparsable address is a hard error rather than a skipped entry:
+// a route silently dropped here becomes a VM whose traffic is refused at dial
+// time, and the reload that introduced it would have reported success.
+func buildRoutes(routes []Route) (map[netip.Addr]*kinproxy.Dialer, error) {
+	if len(routes) == 0 {
+		return nil, nil
+	}
+	out := make(map[netip.Addr]*kinproxy.Dialer, len(routes))
+	for _, r := range routes {
+		addr, err := netip.ParseAddr(strings.TrimSpace(r.VMIP))
+		if err != nil {
+			return nil, fmt.Errorf("route %q: unparsable vm_ip: %w", r.VMIP, err)
+		}
+		addr = addr.Unmap()
+		if _, dup := out[addr]; dup {
+			return nil, fmt.Errorf("route %s: duplicate vm_ip", addr)
+		}
+		if strings.TrimSpace(r.ProxyURL) == "" {
+			return nil, fmt.Errorf("route %s: proxy_url is required", addr)
+		}
+		dialer, err := kinproxy.New(r.ProxyURL, 15*time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("route %s: %w", addr, err)
+		}
+		out[addr] = dialer
+	}
+	return out, nil
+}
+
 func newRuntime(cfg Config) (*runtime, error) {
 	cfg.DNSEmptyTypes = append([]uint16(nil), cfg.DNSEmptyTypes...)
+	cfg.Routes = append([]Route(nil), cfg.Routes...)
 	upstreams := parseDNSUpstreams(cfg.DNSUpstream)
 	if len(upstreams) == 0 {
 		upstreams = append([]string(nil), DefaultDNSUpstreams...)
@@ -166,10 +253,15 @@ func newRuntime(cfg Config) (*runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	routes, err := buildRoutes(cfg.Routes)
+	if err != nil {
+		return nil, err
+	}
 	return &runtime{
 		cfg:       cfg,
 		dialer:    dialer,
 		upstreams: upstreams,
+		routes:    routes,
 		http: &http.Client{
 			Timeout: 10 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -265,7 +357,11 @@ func (s *Server) ForwardTCP(ctx context.Context, client net.Conn, dest string) e
 	if err != nil {
 		return err
 	}
-	up, err := rt.dialer.DialContext(ctx, "tcp", dialDest)
+	dialer, err := s.dialerFor(rt, client)
+	if err != nil {
+		return &spliceError{class: classNoRoute, dest: dialDest, err: err}
+	}
+	up, err := dialer.DialContext(ctx, "tcp", dialDest)
 	if err != nil {
 		return &spliceError{class: classSocksDial, dest: dialDest, err: err}
 	}
