@@ -640,6 +640,87 @@ test('standalone recovery waits for the original verified host package before re
   assert.equal(fs.readFileSync(entitlement, 'utf8'), issued.code)
 })
 
+test('the exact pending voucher can resume after a lost response, even when an intermediate attempt is denied', async (t) => {
+  const redemption_code = voucher()
+  let issued
+  let attempts = 0
+  const { root, publicDir, privateDir, connect } = standaloneHost(t, async (url, { body }) => {
+    assert.ok(url.endsWith('/redeem'))
+    const request = JSON.parse(body)
+    assert.equal(request.redemption_code, redemption_code)
+    attempts++
+    if (attempts === 1) {
+      issued = issueHostEntitlement(root, request.host_id, { slot_limit: 2 })
+      throw new Error('fixture lost the committed response')
+    }
+    if (attempts === 2) {
+      return Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+    }
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+  })
+  seedEncryptedPackage(root)
+  const initial = await postSubscription(connect())('redeem', { redemption_code })
+  assert.equal(initial.status, 502)
+  const denied = await postSubscription(connect())('recover', {})
+  assert.equal(denied.status, 403)
+  assert.equal((await connect().status()).state, 'sync_pending')
+  const blocked = await postSubscription(connect())('redeem', { redemption_code: voucher() })
+  assert.equal(blocked.status, 409)
+  assert.equal(attempts, 2)
+  const replayed = await postSubscription(connect())('redeem', { redemption_code })
+  assert.equal(replayed.status, 200)
+  assert.equal(replayed.data.revision, issued.claims.revision)
+  assert.equal(replayed.data.slot_limit, 2)
+  assert.equal(fs.existsSync(path.join(privateDir, 'redeem.json')), false)
+  assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
+})
+
+test('an Authority denial is not retried or installed, and only a valid correlation ID is exposed', async (t) => {
+  const redemption_code = voucher()
+  const requestId = crypto.randomUUID()
+  let replyId = requestId
+  let denied = true
+  let calls = 0
+  const { root, publicDir, privateDir, connect } = standaloneHost(t, async (url, { body, headers }) => {
+    assert.ok(url.endsWith('/redeem'))
+    calls++
+    if (denied) {
+      return Response.json(
+        { ok: false, error: { code: 'auth_forbidden', message: `${redemption_code} ${headers.authorization}` } },
+        { status: 403, headers: { 'x-request-id': replyId } },
+      )
+    }
+    const { code, claims } = issueHostEntitlement(root, JSON.parse(body).host_id, { slot_limit: 2 })
+    return Response.json({ ok: true, data: { entitlement: code, ...claims } })
+  })
+  seedEncryptedPackage(root)
+  const submit = postSubscription(connect())
+  const blocked = await submit('redeem', { redemption_code })
+  assert.equal(blocked.status, 403)
+  assert.equal(blocked.error.code, 'auth_forbidden')
+  assert.deepEqual(blocked.error.details, { authority_request_id: requestId })
+  assert.equal(calls, 1, 'a refused request must not trigger automatic retries')
+  assert.equal(fs.existsSync(path.join(publicDir, 'entitlement.code')), false)
+  assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
+  assert.equal(fs.existsSync(path.join(privateDir, 'redeem.json')), false)
+  const key = fs.readFileSync(path.join(privateDir, 'credential'), 'utf8')
+  assert.equal(JSON.stringify(blocked).includes(redemption_code), false)
+  assert.equal(JSON.stringify(blocked).includes(key), false)
+
+  replyId = `${requestId}, ${redemption_code}`
+  const untrusted = await submit('redeem', { redemption_code })
+  assert.equal(untrusted.status, 403)
+  assert.equal(untrusted.error.details, undefined)
+  assert.equal(JSON.stringify(untrusted).includes(redemption_code), false)
+  assert.equal(calls, 2)
+
+  denied = false
+  const applied = await submit('redeem', { redemption_code })
+  assert.equal(applied.status, 200)
+  assert.equal(applied.data.slot_limit, 2)
+  assert.equal(fs.readFileSync(path.join(privateDir, 'credential'), 'utf8'), key)
+})
+
 test('a failed slot probe does not hide signed host rights', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-host-probe-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

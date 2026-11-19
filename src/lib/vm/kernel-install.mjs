@@ -363,6 +363,7 @@ export async function installKernelTargets({
         let operationId = null
         let operationPersisted = false
         let interrupted = false
+        let bootFailure = null
         let clusterVm = false
         let rollback
         let releaseCache
@@ -635,7 +636,15 @@ export async function installKernelTargets({
             if (cancelled()) return cancelled()
             if (!healthy(boot) || (target.kernel === 'crag' && boot.rust?.skipped === true)) {
               interrupted = baked && INTERRUPTED_COMMAND.test(boot?.code || '')
-              return failure(target, boot?.code || phase, boot?.error || '内核重启或健康检查失败', true)
+              // A healthy container with a failed kernel carries its cause on boot.rust;
+              // keep it instead of collapsing every start failure into the generic phase.
+              bootFailure = {
+                code: boot?.code || boot?.rust?.code || phase,
+                error: boot?.error || boot?.rust?.error || '内核重启或健康检查失败',
+                reason: boot?.rust?.rust?.reason || boot?.rust?.reason || null,
+                at: new Date().toISOString(),
+              }
+              return failure(target, bootFailure.code, bootFailure.error, true)
             }
             phase = 'kernel_running_persist_failed'
             const running = patchVmRecord(projectRoot, target.id, (record) => markRunning(record, boot, projectRoot))
@@ -725,6 +734,7 @@ export async function installKernelTargets({
                 if (record.kernel_operation?.id !== operationId) return
                 record.kernel_operation.phase = interrupted ? 'pending' : 'failed'
                 record.kernel_operation.code = phase
+                if (bootFailure) record.kernel_operation.failure = bootFailure
                 if (!stopped && !interrupted) clearInstallHold(record)
               })
             } catch {

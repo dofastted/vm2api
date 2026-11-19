@@ -24,15 +24,21 @@ const messages = {
   crag_subscription_host_identity_changed: 'Restore the original host identity before retrying.',
   crag_subscription_storage_unavailable: 'Check the host subscription data directory before retrying.',
   crag_subscription_host_package_unready: 'Install or restore the trusted CRAG host package before retrying.',
+  auth_forbidden:
+    'The authorization service rejected this host request. Contact the administrator with the request ID; do not reset the host credential.',
   vm_not_found: 'VM not found.',
   crag_subscription_failed: 'The host subscription operation failed. Refresh its status before retrying.',
 }
 
 export function createCragSubscriptionHandler({ subscription, getVm, publicBaseUrl, json, readRawBody }) {
-  const reject = (res, status, code) =>
+  const reject = (res, status, code, authorityRequestId) =>
     json(res, status, {
       ok: false,
-      error: { code, message: Object.hasOwn(messages, code) ? messages[code] : messages.crag_subscription_failed },
+      error: {
+        code,
+        message: Object.hasOwn(messages, code) ? messages[code] : messages.crag_subscription_failed,
+        ...(authorityRequestId && { details: { authority_request_id: authorityRequestId } }),
+      },
     })
   const ok = (res, data) => json(res, 200, { ok: true, data })
 
@@ -84,7 +90,7 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
       ) {
         return reject(res, 500, 'crag_subscription_failed')
       }
-      return reject(res, error.status === 401 ? 502 : error.status, error.code)
+      return reject(res, error.status === 401 ? 502 : error.status, error.code, error.authorityRequestId)
     }
   }
 }

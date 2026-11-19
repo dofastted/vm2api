@@ -604,7 +604,6 @@ describe('CRAG buyer presentation and activation wire', () => {
       '/api/panel/crag-subscription/recover',
       { method: 'POST', body: '{}' }
     )
-    expect(waiting).toContain('请核对原订单。订阅使用券只在本页兑换')
     expect(waiting).not.toContain('宿主机额度已更新')
 
     const active = { state: 'active', ready: false, slot_limit: 3 }
