@@ -3,7 +3,17 @@ set -eu
 
 ROOT="${KIN_PROJECT_ROOT:-/opt/vm2api}"
 IMAGE_BIN="/opt/vm2api/image-bin"
-mkdir -p "$ROOT/vms" "$ROOT/data" "$ROOT/bin"
+mkdir -p "$ROOT/data"
+# Match the Node startup lock before replacing any shared binaries or configuration.
+exec 9<"$ROOT/data"
+flock -n -E 75 9 || {
+  rc=$?
+  if [ "$rc" = 75 ]; then
+    echo 'vm2api_control_plane_already_running: stop the other controller first' >&2
+  fi
+  exit "$rc"
+}
+mkdir -p "$ROOT/vms" "$ROOT/bin"
 
 # 镜像安装没有仓库 checkout：把镜像内默认配置补进被 bind-mount 覆盖的 src/config。
 mkdir -p "$ROOT/src/config"
@@ -166,9 +176,6 @@ if [ -z "${VM2API_DB_SECRET:-}" ] && [ -z "${KIN_DB_SECRET:-}" ]; then
   env_upsert_if_empty VM2API_DB_SECRET "$VM2API_DB_SECRET" "$ENVF"
 fi
 
-if [ "$WRAP_CHANGED" = 1 ] && [ "${KIN_AUTO_SYNC_WRAP:-0}" = 1 ]; then
-  node /opt/vm2api/scripts/sync-wrap-cli.mjs &
-fi
-
+export VM2API_BOOTSTRAP_LOCK_FD=9 VM2API_BOOTSTRAP_WRAP_CHANGED="$WRAP_CHANGED"
 cd /opt/vm2api
 exec node src/server.mjs

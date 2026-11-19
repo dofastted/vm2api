@@ -109,6 +109,11 @@ curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
 `bin/` 与 `share/wrap-cli` 由镜像入口写入挂载目录，`src/config` 缺文件时用镜像内默认值补齐。
+
+同一安装目录只能运行一个控制面，不要让宿主机 `vm2api.service` 和 Compose 控制面共用其 `data/` 同时运行。即使 HTTP 端口不同，槽位出口仍使用同一组监听端口。Linux 源码直跑需要 `flock`（`util-linux`，官方镜像已包含）；重复启动会报 `vm2api_control_plane_already_running`，不会接管已有出口。首次从未使用该锁的旧版本迁移时，先停旧控制面再启动新的；不要靠换 HTTP 端口做并行切换。
+
+Docker 入口在覆盖共享二进制前加锁，并把同一把锁交给 Node。`KIN_AUTO_SYNC_WRAP=1` 时，共享内核文件有变化才会在该 Node 实例开始监听后同步槽位，不向其他控制面发送 HTTP 请求。
+
 KVM / Docker 槽位将宿主 `data/run/slot-guest-bin/`（仅含 `kin-worker`、`kin-kernel` 两个文件，**不会**挂载整个 `bin/`）只读挂进容器，避免单文件 bind mount 在升级替换二进制后仍粘旧 inode，也避免把 `kin-egress`、`kin-api-kernel` 等其它 helper 暴露进槽位 PATH。此后升级 worker/kernel **不必重建槽位**；若容器仍是旧版单文件挂载创建的，须 **重建该槽位容器一次** 才能切换到 staging 目录挂载。
 槽位系统镜像优先 `docker pull ghcr.io/dofastted/kin-os-*`，拉不到时在建槽阶段用仓内 Dockerfile 兜底构建（启动不阻塞）。
 

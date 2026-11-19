@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 宿主机和 Docker 控制面共用安装目录时，只允许一个启动，避免两者争抢 `kin-egress` 的 TCP/DNS 端口。Docker 从入口脚本到 Node 持续持锁，自动槽位同步仅由成功监听的实例执行。
+
 ## 1.4.159 — 2026-11-19 · 节点链路抖动不再误伤启动与调度
 
 - 启动前退役旧 telemetry sender 时区分「脚本判定」与「传输失败」：数字退出码才算脚本真的跑过、sender 确实没停；没有退出码（链路抖动、超时、spawn 失败）先重试一次，仍无法验证就放行启动并标记 `legacy_telemetry_unverified`。此前控制面重启后的 SSH 抖动窗口会把健康槽报成 `kernel_start_failed`，而容器里根本没有 telemetry 进程。真正卡死的 sender 在链路恢复后的下一次启动仍会确定性失败。
