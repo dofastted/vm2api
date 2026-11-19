@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.158 — 2026-11-19 · 用量窗口各记各的采样时间
+
+- 5h 与 7d 的 Extra 窗口各自记录 `sampled_at`，只带 7d 头的响应不再让 5h 的旧数字看起来是刚读到的。官方 `/usage` 探测只在真的把读数抄进 Extra 时才刷新共享的 `sampled_at`。
+- 过了 reset 的 Extra 窗口在每次写入时就存成过期（`stale_reason: reset_elapsed`），不再等定时 reconcile；新读数只带 status / reset 时也不会把上一窗口的 utilization 合并进来。
+- 窗口档案在 Extra 的 reset 已过时改用官方读数，上一窗口收进 `prev`、新窗口进 `current`；官方那份是「窗口开始后没有网关流量」的残留 100% 时仍然跳过。调度门禁本身不变，过了 reset 的 Extra 一直按 0% 看待（#1312、#1317）。
+
 ## 1.4.157 — 2026-11-19 · 槽位伴生浏览器桌面与登录、启动稳定性
 
 - Docker 槽可选开启伴生浏览器桌面：独立容器跑 Xvfb + fluxbox + Chromium + x11vnc，与槽容器共享网络命名空间，浏览器流量因此走槽位自己的出口（同一出口 IP、同一 DNS-over-TCP 重定向）。x11vnc 只监听容器私有 `/tmp` 下的 unix socket，面板经 Engine API 的非 TTY `docker exec socat` 透传 RFB，再由票据 WebSocket 交给 noVNC，不发布任何端口。仅管理员可用；GPT 槽、KVM 槽和 macOS 原生节点不支持。浏览器资料存在命名卷里，重置或删除槽位时一并清除（#1292）。
