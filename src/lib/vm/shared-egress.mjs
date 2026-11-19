@@ -95,7 +95,7 @@ export function normalizeNetworkMode(value, fallback = 'per-vm') {
 }
 
 /**
- * A VM's own mode, recorded on the VM rather than read from the setting.
+ * A VM's own egress mode, recorded on the VM rather than read from the setting.
  *
  * This is the difference that makes the switch safe to turn off. The setting
  * decides the mode a VM is *created* with; after that the VM carries it. Were
@@ -105,9 +105,15 @@ export function normalizeNetworkMode(value, fallback = 'per-vm') {
  * different network, or simply not found. An existing VM therefore keeps the
  * mode it was built with, and a VM with nothing recorded is per-vm, which is
  * every VM that exists today.
+ *
+ * Deliberately not `runtime.network_mode`: that key already holds the
+ * container's Docker NetworkMode (a network name, or 'host'), written on every
+ * refresh. Sharing it would let a refresh overwrite the egress mode with a
+ * network name, which normalises back to per-vm — and the control plane would
+ * then hunt for a per-VM bridge for a VM sitting on the shared one.
  */
 export function networkModeOf(vm) {
-  return normalizeNetworkMode(vm?.runtime?.network_mode)
+  return normalizeNetworkMode(vm?.runtime?.egress_mode)
 }
 
 export function isSharedModeVm(vm) {

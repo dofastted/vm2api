@@ -680,22 +680,22 @@ test('an unrecognised or absent network mode is per-vm', () => {
   // Every VM that exists today has nothing recorded, and must stay per-vm.
   assert.equal(networkModeOf({ proxy: { id: 'px-a1b2c3d4' } }), 'per-vm')
   assert.equal(networkModeOf({ runtime: {} }), 'per-vm')
-  assert.ok(!isSharedModeVm({ runtime: { network_mode: 'per-vm' } }))
-  assert.ok(isSharedModeVm({ runtime: { network_mode: 'shared' } }))
+  assert.ok(!isSharedModeVm({ runtime: { egress_mode: 'per-vm' } }))
+  assert.ok(isSharedModeVm({ runtime: { egress_mode: 'shared' } }))
 })
 
 test('a VM resolves to the network its own mode names', () => {
   const perVm = { proxy: { id: 'px-a1b2c3d4' } }
   assert.equal(slotNetworkForVm(perVm), networkName('px-a1b2c3d4'))
 
-  const shared = { proxy: { id: 'px-a1b2c3d4' }, runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' } }
+  const shared = { proxy: { id: 'px-a1b2c3d4' }, runtime: { egress_mode: 'shared', shared_ip: '100.64.16.3' } }
   assert.equal(slotNetworkForVm(shared), sharedNetworkName(''))
   // A cluster VM belongs to its own node's shared network.
   assert.equal(slotNetworkForVm({ ...shared, node_id: 'node-a' }), sharedNetworkName('node-a'))
 })
 
 test('a shared VM is attached at its recorded address, never one Docker picks', () => {
-  const shared = { proxy: { id: 'px-a1b2c3d4' }, runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' } }
+  const shared = { proxy: { id: 'px-a1b2c3d4' }, runtime: { egress_mode: 'shared', shared_ip: '100.64.16.3' } }
   const args = slotNetworkArgs(shared)
   assert.equal(args.ok, true)
   assert.deepEqual(args.args, ['--network', sharedNetworkName(''), '--ip', '100.64.16.3'])
@@ -710,7 +710,7 @@ test('a shared VM is attached at its recorded address, never one Docker picks', 
 test('a shared VM with no recorded address refuses to start', () => {
   // Booting it anyway puts it on the bridge with an address no route names, or
   // worse, one another VM's route names.
-  const r = slotNetworkArgs({ proxy: { id: 'px-a1b2c3d4' }, runtime: { network_mode: 'shared' } })
+  const r = slotNetworkArgs({ proxy: { id: 'px-a1b2c3d4' }, runtime: { egress_mode: 'shared' } })
   assert.equal(r.ok, false)
   assert.equal(r.error, 'shared_ip_missing')
   assert.equal(r.args, undefined)
@@ -720,7 +720,7 @@ test('a VM already on the shared network is unaffected by the mode setting', () 
   // The setting decides what a new VM is built as; this VM carries its own
   // mode, so turning the setting off does not send the control plane looking
   // for a per-VM bridge that was never created for it.
-  const shared = { proxy: { id: 'px-a1b2c3d4' }, runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' } }
+  const shared = { proxy: { id: 'px-a1b2c3d4' }, runtime: { egress_mode: 'shared', shared_ip: '100.64.16.3' } }
   assert.equal(slotNetworkForVm(shared), sharedNetworkName(''))
   // configuredNetworkMode reads settings; with no DB open it is the safe default.
   assert.equal(configuredNetworkMode(), 'per-vm')
@@ -728,7 +728,7 @@ test('a VM already on the shared network is unaffected by the mode setting', () 
 
 test('the kvm slot container carries the fixed address through', () => {
   const args = buildKvmRunArgs({
-    vm: { id: 'vm-1', runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' } },
+    vm: { id: 'vm-1', runtime: { egress_mode: 'shared', shared_ip: '100.64.16.3' } },
     name: 'kin-vm-1',
     image: 'kin:test',
     hostName: 'vm-1',
@@ -807,17 +807,17 @@ test('a node whose bridged traffic skips iptables refuses to fold', async () => 
 
 test('node membership is derived from the node\u2019s shared VMs only', () => {
   const vms = [
-    { id: 'vm-1', runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' }, proxy: { id: 'px-1' } },
+    { id: 'vm-1', runtime: { egress_mode: 'shared', shared_ip: '100.64.16.3' }, proxy: { id: 'px-1' } },
     // per-vm VMs run beside shared ones on the same node and are not members.
     { id: 'vm-2', runtime: {}, proxy: { id: 'px-2' } },
     // Another node's shared VM belongs to that node's helper, not this one.
     {
       id: 'vm-3',
       node_id: 'node-b',
-      runtime: { network_mode: 'shared', shared_ip: '100.64.32.3' },
+      runtime: { egress_mode: 'shared', shared_ip: '100.64.32.3' },
       proxy: { id: 'px-3' },
     },
-    { id: 'vm-4', runtime: { network_mode: 'shared', shared_ip: '100.64.16.4' }, proxy: { id: 'px-4' } },
+    { id: 'vm-4', runtime: { egress_mode: 'shared', shared_ip: '100.64.16.4' }, proxy: { id: 'px-4' } },
   ]
   const members = sharedMembersOf(vms, { nodeId: '', proxyUrlOf: (vm) => `socks5h://${vm.proxy.id}:1080` })
   assert.deepEqual(members, [
@@ -831,12 +831,12 @@ test('node membership is derived from the node\u2019s shared VMs only', () => {
 
 test('a VM keeps the shared address it already holds', () => {
   const subnet = '100.64.16.0/20'
-  const held = { id: 'vm-1', runtime: { network_mode: 'shared', shared_ip: '100.64.16.77' } }
+  const held = { id: 'vm-1', runtime: { egress_mode: 'shared', shared_ip: '100.64.16.77' } }
   // Re-deriving would strand both the container attachment and the route.
   const kept = assignSharedIp(held, { subnet, taken: ['100.64.16.77'] })
   assert.deepEqual(kept, { ip: '100.64.16.77', reused: true })
 
-  const fresh = { id: 'vm-2', runtime: { network_mode: 'shared' } }
+  const fresh = { id: 'vm-2', runtime: { egress_mode: 'shared' } }
   const given = assignSharedIp(fresh, { subnet, taken: ['100.64.16.77'] })
   assert.equal(given.reused, false)
   assert.notEqual(given.ip, '100.64.16.77')
@@ -849,7 +849,7 @@ test('the node-wide entry point derives membership and routes it', async () => {
     {
       id: 'vm-1',
       node_id: 'node-a',
-      runtime: { network_mode: 'shared', shared_ip: '100.64.16.3' },
+      runtime: { egress_mode: 'shared', shared_ip: '100.64.16.3' },
       proxy: { id: 'px-1' },
     },
     { id: 'vm-2', node_id: 'node-a', runtime: {}, proxy: { id: 'px-2' } },
@@ -879,4 +879,30 @@ test('a node with only per-vm VMs stands up no shared helper', async () => {
   assert.equal(r.routes, 0)
   assert.equal(h.startCalls.length, 0)
   assert.equal(h.docker.calls.filter((a) => a[1] === 'create').length, 0)
+})
+
+test('the container’s NetworkMode is not mistaken for the egress mode', () => {
+  // runtime.network_mode already holds the Docker NetworkMode — a network name,
+  // or 'host' — and is rewritten on every refresh. The egress mode lives in its
+  // own key, or a refresh would overwrite it with a network name that
+  // normalises back to per-vm, sending the control plane looking for a per-VM
+  // bridge for a VM sitting on the shared one.
+  const shared = {
+    id: 'vm-1',
+    proxy: { id: 'px-a1b2c3d4' },
+    runtime: {
+      egress_mode: 'shared',
+      shared_ip: '100.64.16.3',
+      // What runtimePatch writes: the network the container is attached to.
+      network_mode: sharedNetworkName(''),
+    },
+  }
+  assert.equal(networkModeOf(shared), 'shared')
+  assert.equal(slotNetworkForVm(shared), sharedNetworkName(''))
+
+  // And the reverse: a per-vm VM whose NetworkMode happens to read 'shared'
+  // must not be promoted by it.
+  const perVm = { id: 'vm-2', proxy: { id: 'px-a1b2c3d4' }, runtime: { network_mode: 'shared' } }
+  assert.equal(networkModeOf(perVm), 'per-vm')
+  assert.equal(slotNetworkForVm(perVm), networkName('px-a1b2c3d4'))
 })
