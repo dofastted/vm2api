@@ -7,6 +7,7 @@ import {
   isClean,
   isProtectedNetwork,
   residueItems,
+  pickIpv4Config,
   residueReport,
   cleanupPlan,
   cleanupPlanLines,
@@ -47,7 +48,13 @@ function fakeDocker({ nets = {}, ps = [], failLs = false, failInspect = false, f
         .filter((n) => nets[n])
         .map((n) => {
           const d = nets[n]
-          return [n, d.subnet || '', d.bridge || '', String(d.containers ?? 0), d.vm || '', d.proxy || ''].join(F)
+          // Docker emits one `subnet=gateway` pair per IPAM entry; a dual-stack
+          // network has an IPv6 one alongside the IPv4.
+          const ipam = [
+            `${d.subnet || ''}=${d.gateway || ''}`,
+            ...(d.ipv6 ? [`${d.ipv6}=${d.ipv6.replace(/::\/\d+$/, '::1')}`] : []),
+          ].join(' ')
+          return [n, `${ipam} `, d.bridge || '', String(d.containers ?? 0), d.vm || '', d.proxy || ''].join(F)
         })
       return { ok: true, stdout: out.join('\n') }
     }
@@ -100,6 +107,38 @@ function byName(items, name) {
 }
 
 // ---------- networks ----------
+
+test('a dual-stack network still yields its IPv4 range', () => {
+  // With IPv6 enabled on the daemon, IPAM carries two entries. Concatenating them
+  // gives `172.90.27.0/24fd21:...::/64`, which parses as no subnet -- and a range
+  // that parses as nothing never makes it into the conflict set.
+  assert.deepEqual(pickIpv4Config('172.90.27.0/24=172.90.27.1 fd21:f843::/64=fd21:f843::1 '), {
+    subnet: '172.90.27.0/24',
+    gateway: '172.90.27.1',
+  })
+  // IPv6 first is just as valid an ordering.
+  assert.deepEqual(pickIpv4Config('fd21:f843::/64=fd21:f843::1 10.1.0.0/16=10.1.0.1 '), {
+    subnet: '10.1.0.0/16',
+    gateway: '10.1.0.1',
+  })
+  assert.deepEqual(pickIpv4Config('fd21:f843::/64=fd21:f843::1 '), { subnet: '', gateway: '' })
+  assert.deepEqual(pickIpv4Config(''), { subnet: '', gateway: '' })
+
+  const runDocker = fakeDocker({
+    nets: {
+      'kin-eg-px-dual': {
+        subnet: '172.90.27.0/24',
+        gateway: '172.90.27.1',
+        ipv6: 'fd21:f843:948b:5::/64',
+        bridge: 'kegdual',
+        containers: 0,
+      },
+    },
+  })
+  const item = byName(scanNetworks({ runDocker, live: {} }).items, 'kin-eg-px-dual')
+
+  assert.equal(item.subnet, '172.90.27.0/24', 'the IPv4 range must survive the scan')
+})
 
 test('an unused network whose owner is gone is residue, and carries what it holds', () => {
   const runDocker = fakeDocker({
@@ -471,14 +510,15 @@ test('residueItems can include in-use resources, which a unified rebuild needs',
     live: { proxyIds: ['px-busy'] },
   })
 
+  // Nothing here is residue: one is in use, the other is the shared bridge.
   assert.deepEqual(residueItems(scan, { orphansOnly: true }), [])
-  const all = residueItems(scan, { orphansOnly: false })
+  // A unified rebuild needs both, since it moves every exit onto the pool.
   assert.deepEqual(
-    all.map((i) => i.name),
-    ['kin-eg-px-busy'],
+    residueItems(scan, { orphansOnly: false })
+      .map((i) => i.name)
+      .sort(),
+    ['kin-eg-px-busy', 'kin-eg-px-local'],
   )
-  // Protected stays out even when everything is being torn down.
-  assert.ok(!all.some((i) => i.name === 'kin-eg-px-local'))
 })
 
 // ---------- cleanup plan ----------
@@ -625,7 +665,7 @@ test('a missing executor is a failure, never a silent skip', () => {
   assert.match(r.failed[0].errors.join(' '), /no executor for network/)
 })
 
-test('a cleanup plan skips the protected local bridge and keeps in-use resources', (t) => {
+test('a sweep spares the shared local bridge; a unified rebuild takes it too', (t) => {
   const root = tmpRoot(t)
   const scan = scanResidue({
     projectRoot: root,
@@ -635,15 +675,19 @@ test('a cleanup plan skips the protected local bridge and keeps in-use resources
         'kin-eg-px-busy': { subnet: '172.24.0.0/16', bridge: 'kegbusy1', containers: 2 },
       },
     }),
-    live: {},
+    live: { proxyIds: ['px-busy'] },
   })
 
+  // Standalone sweep: nothing here is residue, and the shared bridge is spared.
   assert.deepEqual(cleanupPlan(scan, { orphansOnly: true }), [])
-  // A unified reprovision takes the in-use one too, but never the shared bridge.
-  const all = cleanupPlan(scan, { orphansOnly: false })
+
+  // Unified reprovision: every exit moves onto the current pool, the shared
+  // bridge included -- leaving it would hold a range of the old pool for good.
   assert.deepEqual(
-    all.map((p) => p.name),
-    ['kin-eg-px-busy'],
+    cleanupPlan(scan, { orphansOnly: false })
+      .map((p) => p.name)
+      .sort(),
+    ['kin-eg-px-busy', 'kin-eg-px-local'],
   )
 })
 
