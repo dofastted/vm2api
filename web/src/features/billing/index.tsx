@@ -52,6 +52,7 @@ export function BillingPage() {
   return (
     <PageHeader
       title={VIEW_TITLES.billing}
+      description='当前日志保留窗口内的请求、成功、失败和费用。保留时间在设置的日志保留页调整。'
       extra={
         <div className='flex flex-wrap gap-2'>
           <CragShopLink />
