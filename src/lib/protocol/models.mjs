@@ -24,6 +24,20 @@ const FAMILY_ALIASES = new Map([
   ['fable', 'fable'],
 ])
 
+/**
+ * Claude catalog ids are hyphenated; the marketing form callers type is dotted
+ * (claude-opus-5.5 → claude-opus-5-5). Normalize every dotted claude-* id here
+ * instead of listing them one by one, so a new x.y model never has to be added
+ * to a hardcoded map to stay routable. Only digit.digit inside a claude- id is
+ * rewritten: gpt-/codex- ids keep their dots, and dated or already-hyphenated
+ * ids (claude-haiku-4-5-20251001, claude-3-5-haiku) are returned unchanged.
+ */
+export function canonicalizeDottedClaudeId(raw) {
+  const s = String(raw || '')
+  if (!/^claude-/i.test(s)) return s
+  return s.replace(/(\d)\.(\d)/g, '$1-$2')
+}
+
 /** @type {{ at: number, ids: string[], aliases: string[], source: string|null }} */
 let cache = { at: 0, ids: [], aliases: [], source: null }
 
@@ -197,7 +211,7 @@ export function resolveCatalogModel(raw, ids = cache.ids) {
   if (!m) return { ok: false, reason: 'empty' }
   const popped = m.split('/').filter(Boolean).pop() || m
   const want1m = hasClaudeCode1mSuffix(popped)
-  const bare = stripClaudeCode1mSuffix(popped)
+  const bare = canonicalizeDottedClaudeId(stripClaudeCode1mSuffix(popped))
   const lower = bare.toLowerCase()
   if (lower === 'auto') return { ok: true, model: 'auto' }
   if (FAMILY_ALIASES.has(lower)) {
@@ -230,18 +244,7 @@ export function resolveCatalogModel(raw, ids = cache.ids) {
 export function setModelCatalog(ids, { source = 'go-slot-worker' } = {}) {
   cache = {
     at: Date.now(),
-    ids: [
-      ...new Set(
-        (ids || [])
-          .map((id) => {
-            if (id === 'claude-fable-5.1') return 'claude-fable-5-1'
-            if (id === 'claude-fable-5.2') return 'claude-fable-5-2'
-            if (id === 'claude-opus-5.5') return 'claude-opus-5-5'
-            return id
-          })
-          .filter((id) => isCatalogModelId(id)),
-      ),
-    ],
+    ids: [...new Set((ids || []).map(canonicalizeDottedClaudeId).filter((id) => isCatalogModelId(id)))],
     aliases: [...FAMILY_ALIASES.keys()],
     source,
   }
@@ -313,7 +316,7 @@ export function validateOfficialModel(model) {
   }
 
   const bare = stripClaudeCode1mSuffix(m.split('/').filter(Boolean).pop() || m)
-  const id = bare
+  const id = canonicalizeDottedClaudeId(bare)
 
   if (
     /^(gemini|deepseek|mistral|grok|text-|davinci)/i.test(id) ||
