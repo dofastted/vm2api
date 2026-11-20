@@ -7,7 +7,7 @@
 
 import http from 'node:http'
 import net from 'node:net'
-import { ClusterError, forwardOutStreamLocal } from './ssh-link.mjs'
+import { ClusterError, connectUnixSocket } from './ssh-link.mjs'
 
 export const DOCKER_SOCKET_PATH = '/var/run/docker.sock'
 const MAX_RESPONSE_BYTES = 8 << 20
@@ -16,7 +16,7 @@ const MAX_RESPONSE_BYTES = 8 << 20
 
 /** @returns {DockerConnector} */
 export function sshDocker(client) {
-  return () => forwardOutStreamLocal(client, DOCKER_SOCKET_PATH)
+  return () => connectUnixSocket(client, DOCKER_SOCKET_PATH, { docker: true })
 }
 
 /** @returns {DockerConnector} */
