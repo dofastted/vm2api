@@ -30,9 +30,9 @@ function chartData(): StatisticsData {
       { id: 'beta', name: 'Beta', dataKey: 'beta' },
     ],
     metrics: {
-      cost: [{ time: '00:00', alpha: 1, beta: 1 }],
-      requests: [{ time: '00:00', alpha: 1, beta: 1 }],
-      tokens: [{ time: '00:00', alpha: 1, beta: 1 }],
+      cost: [{ date: '2026-11-20T16:00:00.000Z', alpha: 1, beta: 1 }],
+      requests: [{ date: '2026-11-20T16:00:00.000Z', alpha: 1, beta: 1 }],
+      tokens: [{ date: '2026-11-20T16:00:00.000Z', alpha: 1, beta: 1 }],
     },
     seriesTotals: { alpha: totals, beta: totals },
     totals: {
@@ -51,8 +51,7 @@ function chartData(): StatisticsData {
       avgDurationMs: null,
       avgTtftMs: null,
     },
-    previousTotals: null,
-    changes: null,
+    deltas: { requests: null, cost: null, tokens: null },
   }
 }
 
