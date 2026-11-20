@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.4.167 — 2026-11-20 · 共享出口产物修正
+
+- 修正 amd64 `kin-egress` 的锁定产物。`release.yml` 只在 ARM64 分支从 `worker/` 源码编 Go helper，amd64 的 helper 取自 `deploy/payload.json` 锁定的产物，因此 1.4.166 发出的是「控制面带共享出口、helper 还是改动之前的版本」这一组合：第一台 VM 折叠时 helper 在 `unsupported proxy scheme ""` 上崩溃循环。锁定改为 `payload-2026.11.20-shared-egress`，只换 `bin/kin-egress` 一项，其余 23 个文件重算后字节一致。判断主机上的产物是否够新：`strings -a /opt/vm2api/bin/kin-egress | grep -c 'no route for source'`，0 即为旧产物（#1369）。
+- 默认 CRAG 标准载荷升级到 `3.1.9`：有请求排队且槽位耗尽时，等待工具结果的父会话可让出进程槽，子代理完成后仍可按已验证的历史续接。不自动重启现有槽位。
+- 普通硬正则的关键词命中只拒绝本次请求，不再封设备或会话。此前文档里引用 `keygen` 这类子命令名就会把设备打进封禁阶梯，被拦请求还会留下永久的会话封禁行；与系统提示词改写规则（cd14409c）同理，真实越狱仍会被上游拒绝并进入拒答缓存。NSFW 类别证据确凿（显式内容而非歧义关键词），维持强制封禁，且面板关闭设备封禁开关也不放松。升级后请一并清理既有误封记录（`DELETE /api/panel/refusal-device-blocks`），该修复只拦截新的写入。
+- 出站采样参数与思考模式对齐补齐两种 shape 并加值域校验。`between_tools` 是 effort `off` 时由控制面自己注入的思考模式，此前调用方的 `temperature` 原样送到上游而被 400；`requires_adaptive` 的模型即使请求体不带 `thinking` 也在思考，现在按模型 shape 锁定采样参数。非法值（`temperature: 2.5`、`top_k: -1`）就地纠正而不是透传（#1368）。
+
 ## 1.4.166 — 2026-11-20 · 并发请求内核修复与共享出口
 
 - 重编 `wrap` / `cc` 的 Linux amd64 `kin-kernel`。共享 stdin 的 10 秒超时仅计算实际写入，避免并发请求等待写锁时误触发 CLI 重启；半写失败会关闭旧管道，防止下一条请求接到残缺帧后。

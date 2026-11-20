@@ -406,7 +406,13 @@ export async function evaluateProtocolIntercept({
             rule: hard.evidence,
           }),
           category: hard.category,
-          banDevice: true,
+          // A keyword hit refuses this request only, same reasoning as the
+          // system-prompt rewrite rule (cd14409c): ordinary documents quote
+          // subcommand names like `openstar-sign keygen`, and a real
+          // jailbreak still meets the provider refusal and the
+          // refused-session block. NSFW stays a forced ban: its evidence is
+          // explicit content, not an ambiguous keyword.
+          banDevice: hard.category === 'nsfw',
           forceDeviceBan: hard.category === 'nsfw',
           reason: `hard_regex:${hard.category}`,
         })
