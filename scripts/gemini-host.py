@@ -684,6 +684,9 @@ class Host:
         return self.view(env)
 
     def request(self, operation, body):
+        if operation == "install-payload":
+            self.ensure_payload()
+            return {"version": self.payload_version}
         if operation == "list":
             installed = self.payload.exists() or self.payload.is_symlink()
             inputs_issue = self.payload_inputs_issue(
@@ -851,11 +854,23 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "refresh",
                 "disable",
                 "delete",
+                "install-payload",
             }:
                 raise Failure(404)
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise Failure(400)
+            if operation == "install-payload":
+                _, uid, _ = struct.unpack(
+                    "3i",
+                    self.request.getsockopt(
+                        socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+                    ),
+                )
+                if uid != 0:
+                    raise Failure(403)
+                if body:
+                    raise Failure(400)
             status, payload = 200, self.server.host.request(operation, body)
         except Failure as error:
             status, payload = error.status, {"code": error.code} if error.code else {}

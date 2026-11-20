@@ -4,11 +4,11 @@
 
 ## 启用服务与自动安装
 
-1. 反代源码保留在独立 `antigravity-cli-proxy` 仓。供应方使用 `scripts/package-release.sh` 构建 `craggemini` 和 `libagy_bridge.so`，再用该仓的 `scripts/sign-host-payload.sh` 签署预装包。包只含这两个二进制、摘要固定的官方 `agy 1.5.9`、清单和签名。不在 vm2api 提交反代源码、二进制、发行私钥或 OAuth 凭据。
+1. 反代源码保留在独立 `antigravity-cli-proxy` 仓。部署使用已签名的 CRAGGemini 宿主载荷（支持 `0.3.0-rc.1` 和 `0.3.0-rc.2`），内含 `craggemini`、`libagy_bridge.so`、摘要固定的官方 Antigravity CLI `agy 1.5.9`、清单和签名。不在 vm2api 提交反代源码、二进制、发行私钥或 OAuth 凭据。
 2. 从独立信任渠道设置 `/etc/vm2api/gemini-ed25519.pub`，把已解包的签名载荷放入 root 所有且不可由非 root 写入的绝对目录（例如 `/srv/vm2api-gemini-payload`，不能位于 `/tmp`）。候选包的测试签名不能当成发行签名。不要把签发私钥放到部署机。
 3. 宿主服务需要运行中的 `systemd`、`python3` 和系统路径可用的 `node`。Google OAuth 另需 `ip`、`nft`、`setpriv`、支持非特权用户命名空间的 `bwrap`、`curl`、vm2api 自带的 `kin-egress` 和 IPv4 转发；API Key 验证和账号读取需要 `setpriv`、`curl`。预留示例的 9 个 UID/GID 与 `198.18.252.0/27`，确认网段无冲突。若宿主有 Docker 的 `iptables` `DOCKER-USER` 链，授权时只临时允许当前环境与绑定 SOCKS5 地址和端口之间的转发，结束后删除规则。其他防火墙仍需允许同一范围的转发；不要调整全局转发策略或开放直连。
 4. 现有部署先升级控制面和 Compose 配置，再在宿主运行 `sudo bash deploy/install.sh prepare-gemini --gemini-payload-source /srv/vm2api-gemini-payload`；新安装可直接传同一选项。已用标准路径安装载荷的部署可省略安装源。Gemini 服务启动失败不阻断控制面安装或升级，`prepare-gemini` 单独运行仍会报错。使用独立 Node 网关时，将网关进程加入 `vm2api` 组，并重启网关让组权限生效。默认 socket 是 `/run/vm2api-gemini/control.sock`，可用 `KIN_GEMINI_HOST_SOCKET` 覆盖。已有自定义 unit 应先迁移，避免两个服务争用 socket；保留原状态目录。
-5. 载荷、公钥尚未配置时也可启动宿主服务，控制 socket 开始监听且权限设置完成后才通知 systemd 就绪。首次在面板创建 Gemini 环境时，校验 Ed25519 签名、文件大小、文件摘要和固定的 `agy` 摘要，再将完整载荷原子安装到 `share/gemini/current`。安装失败不创建环境。已安装载荷在重启时复验；不会覆盖损坏的现有载荷，不从不可信地址下载。导入页和 VM 的 Gemini 筛选区分 socket 缺失、权限或连接错误、缺公钥、缺载荷或文件不全、校验失败，以及 OAuth 出口前置条件；用 `journalctl -u vm2api-gemini.service` 核对宿主日志。socket 就绪、载荷已安装、账号已授权和可调度推理是不同状态。
+5. 控制 socket 监听且权限设置完成后，服务才通知 systemd 就绪。指定签名载荷源时，`prepare-gemini` 会通过该 socket 请求校验和安装，失败则返回错误；未配置源时，服务仍可启动，也可在首次创建环境时按同一流程安装。服务核对 Ed25519 签名、文件大小、文件摘要和固定的 `agy` 摘要，再原子安装到 `share/gemini/current`。重启会验证已安装载荷；不会自动覆盖现有载荷，也不会下载未经验证的二进制。socket 就绪、载荷已安装、CLI 已启动、账号已授权和公共推理可用是不同状态。故障可用 `journalctl -u vm2api-gemini.service` 排查。
 
 ## 导入与验收边界
 

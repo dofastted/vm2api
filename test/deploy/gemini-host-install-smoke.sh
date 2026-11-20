@@ -21,6 +21,7 @@ install -m 644 "$public_key" "$fixture/public-key"
 for member in manifest.json manifest.sig agy craggemini libagy_bridge.so; do
     install -m 644 "$source/$member" "$fixture/source/$member"
 done
+version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$source/manifest.json")
 
 socket="$fixture/control.sock"
 start() {
@@ -82,8 +83,16 @@ mv "$fixture/held-agy" "$fixture/source/agy"
 printf '%064d' 0 > "$fixture/source/manifest.sig"
 request create "$create" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_payload_invalid"'
 [[ ! -e $fixture/state/environments.json && ! -e $fixture/payload/current ]]
+request install-payload | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_payload_invalid"'
+[[ ! -e $fixture/state/environments.json && ! -e $fixture/payload/current ]]
 install -m 644 "$source/manifest.sig" "$fixture/source/manifest.sig"
-request create "$create" | python3 -c 'import json,sys; data=json.load(sys.stdin); assert (data["name"], data["auth_state"], data["kernel_version"]) == ("Fixture", "unverified", "0.3.0-rc.1")'
+request install-payload | python3 -c 'import json,sys; assert json.load(sys.stdin)["version"] == sys.argv[1]' "$version"
+[[ ! -e $fixture/state/environments.json ]]
+[[ $("$fixture/payload/current/agy" --version) == 1.5.9 ]]
+stop
+mv "$fixture/payload/current" "$fixture/eager-payload"
+start
+request create "$create" | python3 -c 'import json,sys; data=json.load(sys.stdin); assert (data["name"], data["auth_state"], data["kernel_version"]) == ("Fixture", "unverified", sys.argv[1])' "$version"
 [[ -x $fixture/payload/current/craggemini && -x $fixture/payload/current/agy ]]
 stop
 start
@@ -126,7 +135,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as listener:
         host.terminate()
         assert host.wait(timeout=10) == 0
 PY
-printf '%s\n' 'Gemini host: readiness notification, missing prerequisites, signature enforcement, lazy install and restart persistence passed.'
+printf '%s\n' 'Gemini host: readiness, signature enforcement, eager/lazy install, real agy and restart persistence passed.'
 
 python3 -I - "$fixture/scripts/gemini_host_account.py" <<'PY'
 import runpy
