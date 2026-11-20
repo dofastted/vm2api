@@ -139,7 +139,11 @@ export function forwardOut(client, host, port) {
 export function forwardOutStreamLocal(client, socketPath) {
   return new Promise((resolve, reject) => {
     client.openssh_forwardOutStreamLocal(socketPath, (err, stream) => {
-      if (err) return reject(new ClusterError(502, 'streamlocal_failed', `打开远端 ${socketPath} 失败：${err.message}`))
+      if (err) {
+        const failure = new ClusterError(502, 'streamlocal_failed', `打开远端 ${socketPath} 失败：${err.message}`)
+        failure.reason = err.reason // ssh2: ADMINISTRATIVELY_PROHIBITED, CONNECT_FAILED, RESOURCE_SHORTAGE...
+        return reject(failure)
+      }
       resolve(stream)
     })
   })
@@ -183,6 +187,9 @@ export async function connectUnixSocket(client, socketPath, { docker = false } =
     return stream
   } catch (err) {
     if (err.code !== 'streamlocal_failed') throw err
+    // The target socket not being there yet (kernel restarting) is a normal answer; bridging
+    // would only hide it and burn a session on the node.
+    if (err.reason === 'CONNECT_FAILED') throw err
     const tools = await probeBridgeTools(client)
     const order = [docker && tools.docker && 'docker-dial-stdio', tools.socat && 'socat', tools.nc && 'nc'].filter(Boolean)
     for (const name of order) {
@@ -204,42 +211,86 @@ export function unixTransportOf(client, socketPath = '/var/run/docker.sock') {
 }
 
 async function probeBridgeTools(client) {
-  const r = await execCollect(client, 'command -v docker socat nc 2>/dev/null', { timeoutMs: 8000 }).catch(() => null)
+  // nc without -N keeps the remote process alive after our side closes, leaking one
+  // session per call until the node's MaxSessions (default 10) is exhausted.
+  const r = await execCollect(
+    client,
+    'command -v docker socat nc 2>/dev/null; if command -v nc >/dev/null 2>&1 && nc -h 2>&1 | grep -q -e " -N"; then echo nc-N; fi',
+    { timeoutMs: 8000 },
+  ).catch(() => null)
   const out = r?.stdout ?? ''
   const has = (n) => new RegExp(`(^|/)${n}$`, 'm').test(out)
-  return { docker: has('docker'), socat: has('socat'), nc: has('nc') }
+  return { docker: has('docker'), socat: has('socat'), nc: has('nc-N') }
 }
 
-function execUnixStream(client, transport, socketPath) {
+// Each bridge holds one SSH session for the life of the stream; sshd allows MaxSessions (10)
+// per connection and Docker health, relays and guards all share the link. Keep headroom.
+const MAX_BRIDGE_SESSIONS = 6
+const bridgeSlots = new WeakMap()
+
+function acquireBridgeSlot(client) {
+  let state = bridgeSlots.get(client)
+  if (!state) bridgeSlots.set(client, (state = { active: 0, waiters: [] }))
+  const release = () => {
+    state.active -= 1
+    state.waiters.shift()?.()
+  }
+  if (state.active < MAX_BRIDGE_SESSIONS) {
+    state.active += 1
+    return Promise.resolve(release)
+  }
+  return new Promise((resolve) =>
+    state.waiters.push(() => {
+      state.active += 1
+      resolve(release)
+    }),
+  )
+}
+
+async function execUnixStream(client, transport, socketPath) {
   const q = shQuote(socketPath)
   const command =
     transport === 'docker-dial-stdio'
       ? 'docker system dial-stdio'
       : transport === 'socat'
         ? `exec socat - UNIX-CONNECT:${q}`
-        : `exec nc -U ${q}`
-  return new Promise((resolve, reject) => {
-    client.exec(command, (err, stream) => {
-      if (err) return reject(new ClusterError(502, 'unix_bridge_failed', `远端桥接失败：${err.message}`))
-      let settled = false
-      const fail = (msg) => {
-        if (settled) return
-        settled = true
-        stream.close()
-        reject(new ClusterError(502, 'unix_bridge_failed', msg))
-      }
-      // A missing tool / refused socket exits at once; a healthy bridge stays open waiting for input.
-      stream.once('exit', (code) => fail(`桥接命令提前退出(${code})`))
-      stream.once('close', () => fail('桥接通道提前关闭'))
-      setTimeout(() => {
-        if (settled) return
-        settled = true
-        stream.removeAllListeners('exit')
-        stream.removeAllListeners('close')
-        resolve(stream)
-      }, 250)
+        : `exec nc -N -U ${q}`
+  const release = await acquireBridgeSlot(client)
+  let released = false
+  const done = () => {
+    if (!released) {
+      released = true
+      release()
+    }
+  }
+  try {
+    return await new Promise((resolve, reject) => {
+      client.exec(command, (err, stream) => {
+        if (err) return reject(new ClusterError(502, 'unix_bridge_failed', `远端桥接失败：${err.message}`))
+        let settled = false
+        const fail = (msg) => {
+          if (settled) return
+          settled = true
+          stream.close()
+          reject(new ClusterError(502, 'unix_bridge_failed', msg))
+        }
+        // A missing tool / refused socket exits at once; a healthy bridge stays open waiting for input.
+        stream.once('exit', (code) => fail(`桥接命令提前退出(${code})`))
+        stream.once('close', () => fail('桥接通道提前关闭'))
+        setTimeout(() => {
+          if (settled) return
+          settled = true
+          stream.removeAllListeners('exit')
+          stream.removeAllListeners('close')
+          stream.once('close', done) // the session is free again only when the channel is gone
+          resolve(stream)
+        }, 250)
+      })
     })
-  })
+  } catch (err) {
+    done()
+    throw err
+  }
 }
 
 /** Run a command, collect output. Rejects only on channel failure; non-zero exit is data. */
