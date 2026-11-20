@@ -416,7 +416,7 @@ const COLS: Col[] = [
     cell: (r, now) => <QuotaCell vm={r.vm} w={r.win.fable} now={now} />,
   },
   {
-    label: '今日',
+    label: '今日请求数',
     sort: 'today',
     num: true,
     cell: (r) => (r.today ? fmtNum(r.today) : <span className={TERT}>0</span>),
@@ -669,7 +669,11 @@ function SummaryBar({ a }: { a: Agg }) {
         x={`失败 ${fmtNum(a.req - a.ok)}`}
         tone={HEALTH_FG[healthTone(pct)]}
       />
-      <Kpi k='24h 请求' v={fmtNum(a.req)} x={`今日 ${fmtNum(a.today)}`} />
+      <Kpi
+        k='近 24h 请求'
+        v={fmtNum(a.req)}
+        x={`北京时间今日 ${fmtNum(a.today)}`}
+      />
       <Kpi
         k='7D 花费'
         v={a.spend ? fmtUsd(a.spend, 2) : '—'}
@@ -936,7 +940,7 @@ export function VmTable({
                         </b>
                       </span>
                       <span>
-                        24h 请求{' '}
+                        近 24h 请求{' '}
                         <b className='font-mono text-foreground'>
                           {fmtNum(sec.agg.req)}
                         </b>
