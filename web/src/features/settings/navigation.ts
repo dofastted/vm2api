@@ -21,7 +21,7 @@ export const SETTINGS_TABS = [
   ['pool', '账号池'],
   ['quota', '配额'],
   ['openai', 'OpenAI'],
-  ['logs', '日志'],
+  ['logs', '日志保留'],
   ['protocol', '协议'],
   ['redaction', '脱敏'],
   ['init', '初装'],
