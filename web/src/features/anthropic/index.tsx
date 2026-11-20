@@ -276,7 +276,10 @@ export function AnthropicConsolePage() {
   })
 
   return (
-    <PageHeader title={VIEW_TITLES.api}>
+    <PageHeader
+      title={VIEW_TITLES.api}
+      description='配置上游 API 渠道。客户端密钥、调用日志和风险策略分别在密钥、日志和风险审计页。'
+    >
       <div className='mx-auto grid max-w-5xl gap-6'>
         <div
           className='flex flex-wrap gap-2'
@@ -300,10 +303,6 @@ export function AnthropicConsolePage() {
             </Button>
           ))}
         </div>
-        <p className='text-sm text-muted-foreground'>
-          保存地址、密钥及模型后，渠道选择 API 的密钥会从这里调用，不使用 OAuth
-          虚拟机。
-        </p>
         <div>
           <div className='mb-2 hidden grid-cols-[minmax(10rem,1.1fr)_8rem_minmax(0,1.4fr)_8rem_auto] gap-2 px-1 text-xs text-muted-foreground @2xl/content:grid'>
             <span>地址</span>
