@@ -150,7 +150,8 @@ export function TenantUsage({ tz }: { tz: string }) {
   const overview = useQuery(usageOverviewQueryOptions(tz))
   const past = useQuery(statisticsQueryOptions(history, 'model', tz))
   const today = overview.data ? fromOverview(overview.data) : null
-  const historySnapshot = past.data ? fromTotals(past.data.totals) : null
+  const historySnapshot =
+    past.data && !past.isPlaceholderData ? fromTotals(past.data.totals) : null
 
   return (
     <div className='grid gap-6 lg:grid-cols-2'>
