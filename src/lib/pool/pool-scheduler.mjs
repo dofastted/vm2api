@@ -86,6 +86,14 @@ export const DEFAULT_POOL_ROUTING = Object.freeze({
    * returning to the original pin and rebuilding the prompt cache again.
    */
   session_affinity_first: false,
+  /**
+   * Fresh-account isolation window. Within N ms after an account first enters
+   * the pool, a conversation already pinned to another VM must not spill its
+   * transcript onto the fresh account: replaying another account's full
+   * conversation history onto a brand-new account is a strong ban signal at
+   * the provider. 0 disables the guard (upstream behaviour).
+   */
+  fresh_account_isolation_ms: 0,
 })
 
 const DEFAULT_CONFIG = {
@@ -94,6 +102,15 @@ const DEFAULT_CONFIG = {
   heartbeat_stale_ms: 15000,
   fable_max_per_account: 4,
   default_max_per_account: 2,
+}
+
+/** Epoch-ms of an ISO string or epoch number; 0 when unknown. */
+function toEpochMs(value) {
+  if (value == null) return 0
+  const n = Number(value)
+  if (Number.isFinite(n)) return n > 0 ? n : 0
+  const t = Date.parse(String(value))
+  return Number.isFinite(t) ? t : 0
 }
 
 function clampNumber(value, fallback, min, max, { round = true } = {}) {
@@ -118,6 +135,13 @@ export function normalizePoolRouting(pool = {}) {
   delete next.max_waiters_per_account
   next.strategy = next.strategy === 'fill' ? 'fill' : 'balanced'
   next.session_affinity_first = next.session_affinity_first === true
+  // Fresh-account isolation window (see DEFAULT_POOL_ROUTING). 0 disables.
+  next.fresh_account_isolation_ms = clampNumber(
+    next.fresh_account_isolation_ms,
+    DEFAULT_POOL_ROUTING.fresh_account_isolation_ms,
+    0,
+    Number.MAX_SAFE_INTEGER,
+  )
   // Off by default: Pro may carry Fable. Turn on when Pro accounts only answer
   // Fable with 'usage credits required'.
   next.fable_requires_max = next.fable_requires_max === true
@@ -1546,6 +1570,17 @@ export class PoolScheduler extends EventEmitter {
           continue
         }
         if (guard.level === 'continuing' && continuingVmIds && !continuingVmIds.has(vm.id)) continue
+        // Fresh-account isolation: a conversation already pinned to another VM
+        // must not spill its transcript onto a freshly onboarded account.
+        // Replaying another account's full history onto a brand-new account is
+        // a strong ban signal at the provider. Without session context the
+        // guard does not apply (new conversations start cold on the fresh slot).
+        if (continuingVmIds && continuingVmIds.size > 0 && !continuingVmIds.has(vm.id)) {
+          const isolationMs = Number(this.config.fresh_account_isolation_ms) || 0
+          // created_at may be an ISO string (DB row) or an epoch-ms number.
+          const createdAt = toEpochMs(account?.created_at)
+          if (isolationMs > 0 && createdAt > 0 && now - createdAt < isolationMs) continue
+        }
       }
       // Admission re-reads the guard; it needs to know whether this request continues here.
       const quotaContinuing = continuingVmIds ? continuingVmIds.has(vm.id) : null
