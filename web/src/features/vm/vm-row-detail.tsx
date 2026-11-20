@@ -168,9 +168,10 @@ function HealthCard({ vm }: { vm: Vm }) {
               </b>
             </div>
             <div>
-              <span className={KV_LABEL}>有请求的时段</span>
+              <span className={KV_LABEL}>有请求的时间段</span>
               <b className={KV_VALUE}>
-                {fmtNum(s.active)} / {fmtNum(s.slots.length)}
+                {fmtNum(s.active)} 段 · 每段{' '}
+                {slotMin >= 60 ? `${slotMin / 60} 小时` : `${slotMin} 分钟`}
               </b>
             </div>
           </div>
