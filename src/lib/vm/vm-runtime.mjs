@@ -45,10 +45,11 @@ import {
   ensureProxyEgress,
   ensureSharedEgressForVm,
   isLocalEgressProxy,
+  releaseSharedIp,
   slotNetworkArgs,
   slotNetworkForVm,
 } from './egress.mjs'
-import { isSharedModeVm } from './shared-egress.mjs'
+import { isSharedModeVm, sharedNodeIdForVm } from './shared-egress.mjs'
 import { socksProxyEndpoint } from './socks-address.mjs'
 import { assertProxyAllowed } from './proxy-policy.mjs'
 import { toHostPath } from './host-path.mjs'
@@ -1605,6 +1606,12 @@ async function startVmRuntimeAdmitted(
 
   const r = sh(args, { timeout: 90_000 })
   if (!r.ok) return { ok: false, error: r.stderr || r.stdout || 'docker run failed' }
+  // The container is on the bridge now, so the network can speak for this
+  // address and the claim has done its job. Dropping it is tidiness rather
+  // than correctness: a claim left behind keeps an address reserved until it
+  // expires, which is the safe direction, and readSharedClaims discards
+  // expired entries on read.
+  if (slotNet.ip) releaseSharedIp(projectRoot, sharedNodeIdForVm(vm), vm.id)
   const chownErr = applyKvmBindChown(name, vm)
   if (chownErr) return chownErr
   runtimePatch(vm, inspectContainer(name), {

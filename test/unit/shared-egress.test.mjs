@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import {
   DEFAULT_SHARED_PREFIX,
   allocateHostIp,
@@ -20,6 +23,10 @@ import {
 } from '../../src/lib/vm/shared-egress.mjs'
 import {
   EGRESS_NOFILE,
+  SHARED_CLAIM_TTL_MS,
+  claimSharedIp,
+  readSharedClaims,
+  releaseSharedIp,
   egressConfigBody,
   egressConfigFor,
   ensureSharedEgressForVm,
@@ -334,4 +341,123 @@ test('a node reclaims a shared network through the rules it actually created', (
   const shared = remoteEgressIpam({ name: sharedNetworkName('node-a'), prefix: DEFAULT_SHARED_PREFIX })
   assert.equal(parseCidr(shared.Config[0].Subnet).prefix, DEFAULT_SHARED_PREFIX)
   assert.equal(parseCidr(remoteEgressIpam({ name: 'kin-eg-vm-1' }).Config[0].Subnet).prefix, 28)
+})
+
+/**
+ * Two slots starting on one node, the second beginning before the first has
+ * attached its container. Deterministic: the first slot is held inside its
+ * critical section by a gate, so the overlap is forced rather than raced.
+ *
+ * This is the shape that whole-table replacement gets wrong. Computing the
+ * table outside the node's lock lets both slots start from one snapshot and the
+ * later publish drops the earlier slot's route — its container is up with no
+ * way out. A starting slot is also invisible to `docker network inspect`, so
+ * without a record of promised addresses the second slot would both reuse the
+ * first slot's address and prune its route as though that VM had left.
+ */
+function concurrentHarness(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-shared-conc-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const subnet = '100.64.16.0/20'
+  // Endpoints stay empty for the whole test: neither container attaches, which
+  // is exactly the window the claims exist for.
+  const published = []
+  const runDocker = (args) => {
+    if (args[0] !== 'network') return { ok: true, stdout: '' }
+    if (args[1] === 'ls') return { ok: true, stdout: sharedNetworkName('') }
+    if (args[1] === 'inspect') {
+      const fmt = String(args[3] || '')
+      if (fmt.includes('.Containers')) return { ok: true, stdout: '' }
+      if (fmt.includes('|')) return { ok: true, stdout: `${subnet}|100.64.16.1` }
+      return { ok: true, stdout: subnet }
+    }
+    return { ok: true, stdout: '' }
+  }
+  let release
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  let held = false
+  return {
+    root,
+    subnet,
+    published,
+    release,
+    opts: (hold) => ({
+      runDocker,
+      runIp: () => ({ ok: true, stdout: '' }),
+      runIptables: (a) => (a.includes('-C') ? { ok: false, stderr: 'no chain' } : { ok: true }),
+      ports: { tcp: 18080, dns: 18053 },
+      // The helper's config is the only record of the published table, so the
+      // join path reads back what the previous slot actually wrote.
+      readRoutes: () => published.at(-1) || [],
+      startProcess: async (cfg) => {
+        if (hold && !held) {
+          held = true
+          await gate
+        }
+        published.push(cfg.routes)
+        return { ok: true, pid: 1, reused: false, reloaded: true }
+      },
+      stopProcess: () => ({ ok: true, stopped: true }),
+      waitListening: async () => true,
+      bridgeNetfilter: () => true,
+    }),
+  }
+}
+
+test('two slots starting at once both keep their route and their own address', async (t) => {
+  const h = concurrentHarness(t)
+  // vm-1 and vm-4 hash to the same address on an empty snapshot, which is what
+  // both slots see while neither container has attached. Only the other slot's
+  // claim makes the probe shift one of them; without it both would be handed
+  // 100.64.23.247 and the second container would fail to start.
+  const first = ensureSharedEgressForVm(h.root, sharedVm('vm-1'), h.opts(true))
+  // Let the first slot reach its publish and block there.
+  await new Promise((r) => setTimeout(r, 20))
+  const second = ensureSharedEgressForVm(h.root, sharedVm('vm-4'), h.opts(false))
+  await new Promise((r) => setTimeout(r, 20))
+  h.release()
+  const [a, b] = await Promise.all([first, second])
+
+  assert.equal(a.ok, true)
+  assert.equal(b.ok, true)
+  // Distinct addresses: the second slot could not see the first on the network,
+  // so only the claim keeps it from handing out the same one.
+  assert.notEqual(a.ip, b.ip, 'both slots were given the same address')
+
+  // The table the helper ends up with must name both VMs. A whole-table
+  // replacement computed from a stale snapshot would carry only the last one.
+  const final = h.published.at(-1)
+  assert.deepEqual(
+    final.map((r) => r.vm_ip).sort(),
+    [a.ip, b.ip].sort(),
+    `final table ${JSON.stringify(final)} lost a slot's route`,
+  )
+  assert.ok(final.some((r) => r.proxy_url.includes('vm-1.example')))
+  assert.ok(final.some((r) => r.proxy_url.includes('vm-4.example')))
+  // The colliding pair proves the claim drove the probe: one of them had to move.
+  assert.ok(
+    [a.ip, b.ip].includes('100.64.23.247') && [a.ip, b.ip].includes('100.64.23.248'),
+    `expected the colliding pair to be spread apart, got ${a.ip} and ${b.ip}`,
+  )
+})
+
+test('a claim expires so a slot that died starting cannot hold an address', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-shared-claim-'))
+  try {
+    const now = Date.now()
+    claimSharedIp(root, '', 'vm-dead', '100.64.16.9', now - SHARED_CLAIM_TTL_MS - 1000)
+    claimSharedIp(root, '', 'vm-live', '100.64.16.10', now)
+    const claims = readSharedClaims(root, '', now)
+    // The stale one is gone, so its address is allocatable again; the live one
+    // still holds, or a slot mid-start would lose its address.
+    assert.equal(claims['vm-dead'], undefined)
+    assert.equal(claims['vm-live'].ip, '100.64.16.10')
+    // Released explicitly once the container is on the bridge.
+    releaseSharedIp(root, '', 'vm-live')
+    assert.deepEqual(readSharedClaims(root, '', now), {})
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

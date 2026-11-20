@@ -1741,56 +1741,145 @@ export function persistedEgressRoutes(projectRoot, proxyId) {
 }
 
 /**
+ * How long a claim on an address stays trusted.
+ *
+ * A claim is dropped by the slot that made it once its container is attached.
+ * One left behind means the process died between claiming and attaching, so it
+ * has to expire — but not before a slow slot start finishes, or the claim is
+ * gone while the VM it belongs to is still coming up. Slot starts are bounded
+ * by their own timeouts well inside this.
+ */
+export const SHARED_CLAIM_TTL_MS = 10 * 60 * 1000
+
+function claimsFile(projectRoot, nodeId) {
+  return path.join(egressRunDir(projectRoot, sharedEgressId(nodeId)), 'shared-claims.json')
+}
+
+/**
+ * Addresses promised to slots that are still starting.
+ *
+ * A VM is routed before its container exists, so between the two it holds an
+ * address that `docker network inspect` cannot see. Without this record a
+ * second slot starting in that window reads the network, does not find the
+ * first VM, and both hands its address to someone else and prunes its route —
+ * taking a VM that is already running offline.
+ *
+ * Expired entries are dropped on read, so a crashed starter cannot hold an
+ * address forever.
+ */
+export function readSharedClaims(projectRoot, nodeId, now = Date.now()) {
+  let doc
+  try {
+    doc = JSON.parse(fs.readFileSync(claimsFile(projectRoot, nodeId), 'utf8'))
+  } catch {
+    return {}
+  }
+  const out = {}
+  for (const [vmId, entry] of Object.entries(doc?.claims || {})) {
+    const ip = String(entry?.ip || '').trim()
+    const at = Number(entry?.at)
+    if (!ip || !Number.isFinite(at) || now - at > SHARED_CLAIM_TTL_MS) continue
+    out[vmId] = { ip, at }
+  }
+  return out
+}
+
+function writeSharedClaims(projectRoot, nodeId, claims) {
+  const file = claimsFile(projectRoot, nodeId)
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  writeConfigAtomic(file, `${JSON.stringify({ claims }, null, 2)}\n`)
+}
+
+/** Record that `vmId` holds `ip` while its container is created. */
+export function claimSharedIp(projectRoot, nodeId, vmId, ip, now = Date.now()) {
+  const claims = readSharedClaims(projectRoot, nodeId, now)
+  claims[String(vmId)] = { ip: String(ip), at: now }
+  writeSharedClaims(projectRoot, nodeId, claims)
+  return claims
+}
+
+/**
+ * Drop a claim once the container is attached and the network can speak for it.
+ * Safe to call when there is nothing to drop.
+ */
+export function releaseSharedIp(projectRoot, nodeId, vmId) {
+  const claims = readSharedClaims(projectRoot, nodeId)
+  if (!(String(vmId) in claims)) return claims
+  delete claims[String(vmId)]
+  writeSharedClaims(projectRoot, nodeId, claims)
+  return claims
+}
+
+/**
  * Make one VM routable through its node's shared helper.
  *
  * Used from the slot boot path, which holds one VM and has no access to the VM
- * store. The membership is therefore rebuilt from two things that are available
- * there and are both authoritative: the addresses the shared network currently
- * holds, and the table the helper is already configured with. Their intersection
- * drops any VM that has since gone, which matters because the allocator hands
- * out addresses by what the network holds — a departed VM's address can be
- * reused while its route still names its upstream, and the new VM would leave
- * through someone else's exit.
+ * store. The membership is therefore rebuilt from three things available there:
+ * the addresses the shared network currently holds, the addresses promised to
+ * slots that are still starting, and the table the helper is already
+ * configured with.
  *
- * The VM's own entry needs no special handling across the prune: whatever the
- * prune does with it, the merge below puts the correct one back. What protects
- * a reused address is the merge replacing the entry for it rather than adding
- * beside it; the prune is what removes a departed VM whose address was *not*
- * reused.
+ * All of it runs under one acquisition of the node's lock — reading, allocating
+ * and publishing together. Computing a whole-table replacement outside the lock
+ * and only serialising the publish lets two slots start from one snapshot, and
+ * the later publish drops the earlier slot's route: its container is up and has
+ * no way out. The lock is taken once rather than nested, because
+ * runExclusiveProxyEgress chains on its key and would wait on itself.
  *
- * Returns the address to record on the VM. The caller persists it, since the
- * boot path owns the VM object.
+ * A starting slot's address cannot be seen on the network yet, which is why
+ * claims exist: without them a second slot would hand out an address already
+ * promised, and prune the first slot's route as though that VM had left.
+ *
+ * Returns the address to record on the VM, and the claim the caller must
+ * release once the container is attached.
  */
 export async function ensureSharedEgressForVm(
   projectRoot,
   vm,
-  { runDocker = docker, runIp = ipRoute, readRoutes = persistedEgressRoutes, ...opts } = {},
+  { runDocker = docker, runIp = ipRoute, readRoutes = persistedEgressRoutes, now = Date.now, ...opts } = {},
 ) {
   const nodeId = sharedNodeIdForVm(vm)
+  const vmId = String(vm?.id || '')
   const proxyUrl = boundProxyUrl(vm?.proxy)
   if (!proxyUrl) return { ok: false, error: 'bound SOCKS5 url required; refusing fallback' }
-  const net = ensureSharedEgressNetwork(nodeId, runDocker, { runIp })
-  if (!net.ok) return net
-  const live = sharedEndpointIps(nodeId, runDocker)
-  if (!live.ok) return { ok: false, error: 'shared_network_unreadable' }
-  let ip
-  try {
-    ip = assignSharedIp(vm, { subnet: net.subnet, taken: live.items }).ip
-  } catch (e) {
-    return { ok: false, error: e?.message || 'shared_ip_allocation_failed', code: 'shared_subnet_full' }
-  }
-  const existing = readRoutes(projectRoot, sharedEgressId(nodeId))
-  const pruned = pruneSharedRoutes(existing, live.items)
-  const routes = mergeSharedRoute(pruned, { vmId: vm?.id || '', ip, proxyUrl })
-  const started = await ensureSharedEgress(projectRoot, {
-    nodeId,
-    members: routesAsMembers(routes),
-    runDocker,
-    runIp,
-    ...opts,
+  if (!vmId) return { ok: false, error: 'vm id required for a shared address claim' }
+  return runExclusiveProxyEgress(projectRoot, sharedEgressId(nodeId), async () => {
+    const net = ensureSharedEgressNetwork(nodeId, runDocker, { runIp })
+    if (!net.ok) return net
+    const live = sharedEndpointIps(nodeId, runDocker)
+    if (!live.ok) return { ok: false, error: 'shared_network_unreadable' }
+    const at = now()
+    const claims = readSharedClaims(projectRoot, nodeId, at)
+    // Another slot's promised address is as taken as one already on the bridge.
+    const others = Object.entries(claims)
+      .filter(([id]) => id !== vmId)
+      .map(([, c]) => c.ip)
+    let ip
+    try {
+      ip = assignSharedIp(vm, { subnet: net.subnet, taken: [...live.items, ...others] }).ip
+    } catch (e) {
+      return { ok: false, error: e?.message || 'shared_ip_allocation_failed', code: 'shared_subnet_full' }
+    }
+    // Claimed before the table is published, so a slot starting next sees it
+    // even though its container does not exist yet.
+    claimSharedIp(projectRoot, nodeId, vmId, ip, at)
+    const existing = readRoutes(projectRoot, sharedEgressId(nodeId))
+    const pruned = pruneSharedRoutes(existing, live.items, { keep: [ip, ...others] })
+    const routes = mergeSharedRoute(pruned, { vmId, ip, proxyUrl })
+    const started = await startSharedEgress(projectRoot, {
+      nodeId,
+      members: routesAsMembers(routes),
+      runDocker,
+      runIp,
+      ...opts,
+    })
+    if (!started.ok) {
+      // Nothing was published, so holding the address would only block it.
+      releaseSharedIp(projectRoot, nodeId, vmId)
+      return started
+    }
+    return { ...started, ip, subnet: net.subnet, dropped: existing.length - pruned.length }
   })
-  if (!started.ok) return started
-  return { ...started, ip, subnet: net.subnet, dropped: existing.length - pruned.length }
 }
 
 export function stopSharedEgress(projectRoot, nodeId = '', { runDocker = docker, runIptables = iptables } = {}) {
