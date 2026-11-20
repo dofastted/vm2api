@@ -57,7 +57,9 @@ export async function prepareSlotOAuth({
   }
   const boot = await startReady(vm, projectRoot, { routing, allowMissingCredential: true, timeoutMs })
   if (!boot?.ok || boot.rust_ok === false || !boot.rust?.ok || boot.rust.skipped) {
-    throw fail(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'Target VM native CLI is not ready')
+    const code = boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready'
+    // The code is the only clue to why the slot is not ready; keep it in the message the panel shows.
+    throw fail(code, `Target VM native CLI is not ready (${safeCode(code, 'oauth_runtime_not_ready')})`)
   }
   const patch = { ...(boot.runtime ? { runtime: boot.runtime } : {}), status: 'running' }
   const stored = patchVmRecord(projectRoot, vm.id, patch)
