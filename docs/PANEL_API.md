@@ -620,7 +620,13 @@ Claude 槽测试走官方 CC 入站（`/v1/messages`）。GPT/Codex 槽测试走
 
 `PUT /proxies/config` 的 `dns_primary` 保持字符串（默认 `auto`）：远程 SOCKS5 透明出口优先使用的 DNS 上游，可选 `auto`、`https://1.1.1.1/dns-query`、`https://8.8.8.8/dns-query`、`8.8.8.8:53`、`1.1.1.1:53`，或自定义 HTTPS DoH URL（如 `https://cloudflare-dns.com/dns-query`、`https://[2606:4700:4700::1111]/dns-query`）。URL 可包含路径、查询参数和 1–65535 的显式端口，主机须为有效域名或 IP literal；不允许 userinfo、fragment、空白、反斜杠或原始逗号（上游链用逗号分隔，参数中的逗号须编码为 `%2C`）。非法值返回 `invalid_dns_primary`，不改动原设置。所选上游排第一，其余内置上游按默认顺序排在其后作为自动 fallback；自定义 URL 后依次为 `https://1.1.1.1/dns-query`、`https://8.8.8.8/dns-query`、`8.8.8.8:53`、`1.1.1.1:53`，`auto` 直接用 kin-egress 内置顺序。DoH 经 SOCKS5 出口访问，域名由 SOCKS5 代理解析；`IP:53` 为经 SOCKS 转发的 DNS-over-TCP，出口到 DNS 服务器之间明文。变更后重载本机已绑定的 `kin-egress`（先 SIGTERM 等待旧进程退出并释放监听端口，超时后 SIGKILL，再启动新进程；启动失败时 `egress` 数组报告错误），不重建槽位；集群节点出口在下次槽位启动 / 重载时读取新设置。本地直连出口不使用此设置。
 
-`PUT /proxies/config` 的 `dns_disable_svcb_https` 为布尔值（默认 `false`），Web「代理 → 管理」显示「关闭 DNS type 64 / 65」开关。开启后向 SOCKS5 透明出口下发 DNS 覆写参数 `dns_empty_types: [64, 65]`：SVCB（64）和 HTTPS（65）查询返回 `NOERROR` 空答案，不访问上游；A、AAAA 等其它查询正常转发。关闭后移除覆写参数，恢复正常查询。非布尔值返回 `invalid_dns_disable_svcb_https`。保存后重载本机已绑定出口，`egress` 数组报告结果；集群出口在下次槽位启动 / 重载时生效，本地直连出口不使用此设置。
+SVCB（64）/ HTTPS（65）覆写**按单条代理生效**。开启后向该代理的 SOCKS5 透明出口下发 `dns_empty_types: [64, 65]`：SVCB 与 HTTPS 查询返回 `NOERROR` 空答案，不访问上游；A、AAAA 等其它查询正常转发。关闭后移除覆写参数，恢复正常查询。本地直连出口没有独立的 kin-egress helper，不支持此设置。
+
+`PUT /proxies/:id` 的 `dns_disable_svcb_https` 为布尔值：只改这一条代理。非布尔值返回 `invalid_dns_disable_svcb_https`，对本地直连行返回 `dns_disable_svcb_https_unsupported`。该条已绑定时重启它自己的 `kin-egress`（`egress` 字段报告结果）；此字段不写入 `worker.json`，所以不重载已绑槽位的 worker。
+
+`PUT /proxies/config` 的 `dns_disable_svcb_https` 为布尔值（默认 `false`），语义是**批量动作**而非继承来源：写入全部非本地代理的该字段，同时作为此后新增代理的初始值。运行时读的是代理自己的字段，池级键不参与。保存后只重载被该次动作真正改变且已绑定的出口，`egress` 数组报告结果；集群出口在下次槽位启动 / 重载时生效。非布尔值返回 `invalid_dns_disable_svcb_https`。
+
+共享出口模式（一个节点一个 helper 带多条上游）下，kin-egress 的 `dns_empty_types` 是 helper 级而非 route 级，无法按条区分，取**交集**：该节点全部成员代理都开启才下发覆写。因此某条代理开启后，只要同节点存在未开启的代理，这条就暂不生效——界面会就此给出提示。升级时 `064_proxy_dns_disable_svcb_https` 迁移把原池级值写入每一条代理，行为不变。
 
 kin-egress 的 UDP DNS 与 TCP 一致：上游全部不可达或解析失败时向客户端返回 `SERVFAIL`（保留查询 ID），不再让 UDP 客户端空等超时；UDP 接收缓冲支持最大 65535 字节报文。
 

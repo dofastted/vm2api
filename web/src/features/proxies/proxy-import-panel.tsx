@@ -99,12 +99,14 @@ export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
       }
     >
       <div className='mb-2 flex flex-wrap items-center gap-2'>
-        <span className='text-xs text-muted-foreground'>协议</span>
+        <span className='text-xs text-muted-foreground'>
+          没写前缀的按哪种算
+        </span>
         <ProxySchemeToggle
           value={scheme}
           onChange={setScheme}
           disabled={importPx.isPending}
-          label='未写协议前缀的行按此协议导入'
+          label='没写协议前缀的行按这个算'
         />
       </div>
       <label htmlFor='proxy-import' className='sr-only'>
@@ -130,9 +132,9 @@ export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
         className='field-host min-h-40 resize-y text-xs leading-relaxed'
       />
       <p className='mt-1.5 text-[11px] text-muted-foreground'>
-        未写协议的行按上方所选（当前 {scheme === 'http' ? 'HTTP' : 'SOCKS5'}
-        ）导入；写了 socks5:// 或 http://
-        前缀的以前缀为准，可混填。账密入库后不再回显，重复的自动跳过。
+        没写前缀的行按上面选的（现在是 {scheme === 'http' ? 'HTTP' : 'SOCKS5'}
+        ）算；写了 socks5:// 或 http://
+        前缀的以前缀为准，可以混着填。账密存进去就不再显示出来，重复的会自动跳过。
       </p>
       <div className='mt-3 flex flex-wrap items-center gap-2'>
         <Button
@@ -151,7 +153,7 @@ export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
           onClick={() => addLocal.mutate()}
           disabled={addLocal.isPending || hasLocal}
           loading={addLocal.isPending}
-          title='本地代理：不走 SOCKS5，槽位经所在 VPS（本机或集群节点）自身出口出站。每台 VPS 一条，绑定额度按机器单独计'
+          title='不走 SOCKS5，机器直接从所在 VPS（本机或集群节点）自己的出口上网。每台 VPS 只能有一条，带机器的额度单独算'
         >
           <House aria-hidden='true' />
           {hasLocal ? '已有本地代理' : '本地代理'}

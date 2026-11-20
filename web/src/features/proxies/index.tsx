@@ -119,6 +119,9 @@ export function ProxiesPage() {
     open: boolean
     kind: 'import' | 'settings'
   }>({ open: false, kind: 'import' })
+  // 池设置改成草稿提交后，关闭抽屉会丢掉未保存的改动，所以要拦一下。
+  const [settingsDirty, setSettingsDirty] = useState(false)
+  const [discardOpen, setDiscardOpen] = useState(false)
   const [dragVm, setDragVm] = useState('')
   const [delId, setDelId] = useState('')
   const [disableId, setDisableId] = useState('')
@@ -388,7 +391,7 @@ export function ProxiesPage() {
                 onClick={() => setDrawer({ open: true, kind: 'settings' })}
               >
                 <Settings2 aria-hidden='true' />
-                池设置
+                代理池设置
               </Button>
             </>
           ) : null}
@@ -504,39 +507,61 @@ export function ProxiesPage() {
       <Sheet
         open={drawer.open}
         onOpenChange={(open) => {
-          if (!open) setDrawer((d) => ({ ...d, open: false }))
+          if (open) return
+          // 池设置是草稿提交：有未保存的改动就先问一句，别让滑出动画把改动带走。
+          if (drawer.kind === 'settings' && settingsDirty) {
+            setDiscardOpen(true)
+            return
+          }
+          setDrawer((d) => ({ ...d, open: false }))
         }}
       >
         <SheetContent
           side='right'
-          className='w-[95vw] gap-0 overflow-y-auto sm:max-w-[420px]'
+          // 窄屏不再糊满整屏：留出可见的遮罩边，让「这是一层浮层」看得出来。
+          // p-0 + flex 把滚动交给内容区，底部确认栏才能常驻可见。
+          className='flex w-[88vw] max-w-[360px] flex-col gap-0 p-0 sm:max-w-[420px]'
         >
           <SheetHeader className='border-b'>
             <SheetTitle>
-              {drawer.kind === 'settings' ? '池设置' : '添加代理'}
+              {drawer.kind === 'settings' ? '代理池设置' : '添加代理'}
             </SheetTitle>
             <SheetDescription className='text-xs'>
               {drawer.kind === 'settings'
-                ? '绑定上限、自动探测、出口 DNS 与时区跟随，对整个代理池生效。'
-                : '粘贴 SOCKS5 行批量导入，或添加走所在 VPS 出口的本地代理。'}
+                ? '这些设置作用于整个代理池。想单独调一条代理，到那一行的「编辑」里改。'
+                : '一行一条粘进来批量添加，或者加一条直接走本机 VPS 出口的代理。'}
             </SheetDescription>
           </SheetHeader>
-          <div className='p-4'>
-            {drawer.kind === 'settings' ? (
-              <ProxyManagePanel
-                proxies={list}
-                bindLimit={bindLimit}
-                probeMin={probeMin}
-                dnsPrimary={String(cfg.dns_primary || 'auto')}
-                dnsDisableSvcbHttps={cfg.dns_disable_svcb_https === true}
-                followProxyTimezone={cfg.follow_proxy_timezone !== false}
-              />
-            ) : (
+          {drawer.kind === 'settings' ? (
+            <ProxyManagePanel
+              proxies={list}
+              bindLimit={bindLimit}
+              probeMin={probeMin}
+              dnsPrimary={String(cfg.dns_primary || 'auto')}
+              followProxyTimezone={cfg.follow_proxy_timezone !== false}
+              onDirtyChange={setSettingsDirty}
+            />
+          ) : (
+            <div className='min-h-0 flex-1 overflow-y-auto p-4'>
               <ProxyImportPanel hasLocal={list.some(proxyIsControlLocal)} />
-            )}
-          </div>
+            </div>
+          )}
         </SheetContent>
       </Sheet>
+      <ConfirmDialog
+        open={discardOpen}
+        onOpenChange={(open) => !open && setDiscardOpen(false)}
+        title='放弃未保存的改动？'
+        desc='代理池设置里有改动还没保存，关掉就没了。'
+        confirmText='放弃并关闭'
+        cancelBtnText='继续编辑'
+        destructive
+        handleConfirm={() => {
+          setDiscardOpen(false)
+          setSettingsDirty(false)
+          setDrawer((d) => ({ ...d, open: false }))
+        }}
+      />
       <ProxyEditDialog
         proxy={editing}
         onOpenChange={(open) => !open && setEditId('')}
