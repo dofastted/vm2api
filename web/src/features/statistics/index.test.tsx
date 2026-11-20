@@ -24,6 +24,16 @@ vi.mock('@tanstack/react-query', async (importOriginal) => {
       if (queryKey[0] === 'panel' && queryKey[1] === 'statistics') {
         return { data: EMPTY_STATISTICS, isLoading: false, error: null }
       }
+      if (queryKey[0] === 'panel' && queryKey[1] === 'usage-logs-overview') {
+        return {
+          data: {
+            todayAvgDurationMs: 80,
+            yesterdayAvgDurationMs: 100,
+          },
+          isLoading: false,
+          error: null,
+        }
+      }
       return {
         data: { entries: [], active: [] },
         isLoading: false,
@@ -41,5 +51,19 @@ describe('statistics VM labels', () => {
     expect(html).toContain('>虚拟机<')
     expect(html).not.toContain('供应商排行')
     expect(html).not.toContain('>供应商<')
+  })
+})
+
+describe('response time comparison', () => {
+  it('keeps a real decrease pointed down', () => {
+    const html = renderToStaticMarkup(<StatisticsPage />)
+    const start = html.indexOf('平均响应时间')
+    const card = html.slice(start, start + 1200)
+    expect(card).toContain('>−20%<')
+    expect(card).toContain('较昨日同期')
+    expect(card).toContain('lucide-arrow-down')
+    expect(card).toContain('text-emerald-500')
+    expect(card).not.toContain('>+20%<')
+    expect(card).not.toContain('lucide-arrow-up')
   })
 })
