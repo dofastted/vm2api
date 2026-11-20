@@ -83,7 +83,7 @@ export function healthSummary(
 
 export const SLOT_LABEL: Record<SlotState, string> = {
   ok: '错误率 ≤5%',
-  slow: '错误率 5–30%',
+  slow: '错误率 >5% 且 ≤30%',
   down: '错误率 >30%',
   none: '无请求',
 }
