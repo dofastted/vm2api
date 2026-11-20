@@ -137,6 +137,88 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as listener:
 PY
 printf '%s\n' 'Gemini host: readiness, signature enforcement, eager/lazy install, real agy and restart persistence passed.'
 
+python3 -I - "$fixture" <<'PY'
+import base64
+import json
+import os
+from pathlib import Path
+import pty
+import runpy
+import select
+import sys
+import tty
+from unittest.mock import patch
+
+root = Path(sys.argv[1])
+module = runpy.run_path(str(root / 'scripts/gemini-host.py'))
+Host, Agy, Failure = (module[name] for name in ('Host', 'Agy', 'Failure'))
+host = Host.__new__(Host)
+host.directory = root / 'terminal-regression'
+host.state_file = host.directory / 'environments.json'
+host.uid_base = host.egress_uid = os.getuid()
+host.pending, host.terminals = {}, {}
+env = {'id': 'gemini-fixture', 'slot': 0, 'profile': 'fixture', 'proxy_id': 'fixture', 'auth_state': 'authorized'}
+host.environments = {env['id']: env}
+settings = host.directory / env['id'] / env['profile'] / 'home/.gemini/antigravity-cli'
+settings.mkdir(parents=True, mode=0o700)
+for directory in (settings.parent, settings.parent.parent):
+    directory.chmod(0o700)
+credential = 'fixture-private-access-token'
+token = settings / 'antigravity-oauth-token'
+token.write_text(json.dumps({'token': {'access_token': credential}}))
+token.chmod(0o600)
+host.save()
+authorized = host.state_file.read_bytes()
+session = {'session_id': 'a' * 32}
+start = {**session, 'proxy_id': 'fixture', 'proxy_url': 'socks5h://192.0.2.1:1080', 'cols': 100, 'rows': 30}
+menu = (b'> 1. Google', b' \x1b[1mOAuth\x1b[0m\r\n')
+
+with patch.object(Host, 'ensure_oauth_runtime'), patch.object(Agy, 'alive', return_value=True):
+    for initial in (b'Workspace ready\r\n', b''.join(menu)):
+        master, slave = pty.openpty()
+        tty.setraw(slave)
+        os.set_blocking(master, False)
+
+        def launch_fixture(self, *_):
+            self.terminal = master
+            os.write(slave, module['CLI_MARKER'] + initial)
+
+        def poll():
+            return host.terminal_request('terminal-io', env, session)
+
+        try:
+            with patch.object(Agy, 'start', launch_fixture):
+                if initial == b''.join(menu):
+                    try:
+                        host.terminal_request('terminal-start', env, start)
+                    except Failure as error:
+                        assert (error.status, error.code) == (409, 'gemini_terminal_requires_oauth')
+                    else:
+                        raise AssertionError('a startup OAuth menu must require reauthorization')
+                    assert json.loads(host.state_file.read_bytes())[env['id']]['auth_state'] == 'reauth_required'
+                    continue
+                assert host.terminal_request('terminal-start', env, start) == {'ok': True}
+            assert base64.b64decode(poll()['data']) == initial
+            rendered = b''
+            for chunk in menu:
+                os.write(slave, chunk)
+                assert select.select([master], [], [], 1)[0]
+                response = poll()
+                assert response['closed'] is False
+                rendered += base64.b64decode(response['data'])
+            assert rendered == b''.join(menu)
+            assert env['auth_state'] == 'authorized' and host.state_file.read_bytes() == authorized
+            os.write(slave, credential.encode())
+            assert select.select([master], [], [], 1)[0]
+            assert poll() == {'data': '', 'closed': True}
+            assert host.state_file.read_bytes() == authorized
+        finally:
+            host.stop_terminal(env['id'])
+            os.close(slave)
+
+print('Gemini PTY: startup menu requires OAuth, active menu text stays visible without changing account state.')
+PY
+
 python3 -I - "$fixture/scripts/gemini_host_account.py" <<'PY'
 import runpy
 import sys
