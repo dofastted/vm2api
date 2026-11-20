@@ -45,11 +45,14 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
   return async (req, res, { action, id }) => {
     res.setHeader('Cache-Control', 'no-store')
     const identity = panelIdentity(req)
-    if (req.apiKeyKind || !identity.user || identity.role !== 'admin') return reject(res, 403, 'forbidden')
+    // The master API key is the operator's own automation (seat binding for new slots); it is not a browser
+    // session, so the same-origin CSRF guard does not apply to it.
+    const master = req.apiKeyKind === 'master'
+    if (!master && (req.apiKeyKind || !identity.user || identity.role !== 'admin')) return reject(res, 403, 'forbidden')
 
     let body
     if (action !== 'status') {
-      if (!sameOriginPost(req, publicBaseUrl)) return reject(res, 403, 'crag_subscription_origin_denied')
+      if (!master && !sameOriginPost(req, publicBaseUrl)) return reject(res, 403, 'crag_subscription_origin_denied')
       if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) {
         return reject(res, 415, 'crag_subscription_json_required')
       }
