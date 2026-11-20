@@ -269,7 +269,11 @@ ANTI-PATTERN: Local board vs remote table, lifetime spend per host, one-sample l
             <MiniStat
               label='今日花费'
               value={fmtUsd(today, 2)}
-              hint={total != null ? `累计 ${fmtUsd(total, 2)}` : undefined}
+              hint={
+                total != null
+                  ? `北京时间今日 · 保留日志合计 ${fmtUsd(total, 2)}`
+                  : '北京时间今日'
+              }
             />
           </div>
 
