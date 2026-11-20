@@ -27,8 +27,8 @@ export function ErrorCollectionSummary({
   collection: ErrorCollection | undefined
   serverMuted?: string[]
 }) {
-  const bag = collection || {}
-  const classes = bag.by_class || []
+  const bag = collection ?? null
+  const classes = bag?.by_class || []
   const muted = new Set(resolveMutedClasses(serverMuted))
   const visible = classes.filter((c) => !muted.has(c.id))
   const hidden = classes.filter((c) => muted.has(c.id))
@@ -53,7 +53,9 @@ export function ErrorCollectionSummary({
       }
     >
       <div className='px-4 py-3'>
-        {!visible.length && !hidden.length ? (
+        {bag == null ? (
+          <EmptyState reason='错误统计暂不可用' />
+        ) : !visible.length && !hidden.length ? (
           <EmptyState reason='该窗口无错误' />
         ) : (
           <div className='flex flex-wrap gap-2'>
