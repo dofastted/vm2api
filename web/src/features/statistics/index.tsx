@@ -94,7 +94,7 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
           )}
         />
         <BentoMetricCard
-          title='今日消费'
+          title='今日消费 · 官方价'
           value={overview?.todayCost ?? 0}
           formatter={(v) => formatCurrency(v)}
           icon={DollarSign}

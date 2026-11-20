@@ -778,9 +778,11 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
               label={`${view.summary.days} 天请求`}
               value={fmtNum(view.summary.requests)}
               hint={
-                view.summary.errors > 0
-                  ? `含 ${fmtNum(view.summary.errors)} 次失败`
-                  : '全部成功'
+                view.summary.requests === 0
+                  ? '窗口内无请求'
+                  : view.summary.errors > 0
+                    ? `含 ${fmtNum(view.summary.errors)} 次失败`
+                    : '全部成功'
               }
             />
             <MetricCard
@@ -835,7 +837,7 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             <InfoCard
               tone='bg-lime-500/15 text-lime-600 dark:text-lime-400'
               icon={<ClipboardList />}
-              title='7D 请求'
+              title='7 天额度窗口请求'
               rows={[
                 {
                   label: '成功',

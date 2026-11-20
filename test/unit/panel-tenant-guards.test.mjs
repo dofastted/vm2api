@@ -24,7 +24,7 @@ const { parseAllowedVms } = await import('../../src/lib/admin/key-scope.mjs')
 const { parseKeyAllowedModels } = await import('../../src/lib/admin/key-models.mjs')
 const { createVmPool } = await import('../../src/lib/admin/vm-pools.mjs')
 const { VmPoolsRepo } = await import('../../src/lib/db/repos/vm-pools-repo.mjs')
-const { createDatabase } = await import('../../src/lib/db/database.mjs')
+const { openDatabase, closeDatabase } = await import('../../src/lib/db/database.mjs')
 const { createPanelSession, verifyPanelSession } = await import('../../src/lib/core/security.mjs')
 const { readCodexAccounts, upsertCodexAccount } = await import('../../src/lib/vm/codex-slot.mjs')
 
@@ -541,9 +541,12 @@ test('tenant key create/patch vm_pool_id guard; admin can set pool', async (t) =
 
 function usersFixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tenant-guards-users-'))
-  const db = createDatabase({ dataDir: dir })
+  // The user routes read the 2FA flag through a bare `SettingsRepo()`, which
+  // resolves the process-wide handle, so a detached `createDatabase()` is not
+  // enough here. Close it afterwards so the handle does not outlive the test.
+  const db = openDatabase({ dataDir: dir })
   t.after(() => {
-    db.close()
+    closeDatabase()
     fs.rmSync(dir, { recursive: true, force: true })
   })
   const panelUsers = new PanelUserStore({ db })

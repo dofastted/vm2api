@@ -300,7 +300,16 @@ test('redundant separators in an egress config path do not change its owner', {
   const fx = egressFixture(t)
   fs.writeFileSync(
     fx.configPath,
-    JSON.stringify({ proxy_url: fx.base.proxyUrl, listen_tcp: '127.0.0.1:0', listen_dns: '127.0.0.1:0' }),
+    // The reuse check compares this against the config `startEgressProcess`
+    // would generate, `proxy_id` included, so seed the whole body. Leaving a
+    // field out makes the helper look misconfigured and tests config drift
+    // instead of the separator this case is about.
+    JSON.stringify({
+      proxy_id: fx.base.proxyId,
+      proxy_url: fx.base.proxyUrl,
+      listen_tcp: '127.0.0.1:0',
+      listen_dns: '127.0.0.1:0',
+    }),
   )
   const child = spawn(egressBin, ['-config', fx.dir + '//egress.json'], { stdio: 'ignore' })
   const closed = once(child, 'close')
