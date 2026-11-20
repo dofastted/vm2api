@@ -39,8 +39,9 @@ describe('cluster spend wording', () => {
       </QueryClientProvider>
     )
 
-    expect(html).toContain('今日花费')
-    expect(html).toContain('北京时间今日 · 保留日志合计')
+    expect(html).toContain('今日花费 · 北京时间')
+    expect(html).toContain('保留日志合计')
+    expect(html).toContain('break-words')
     expect(html).not.toContain('累计 $')
   })
 })
