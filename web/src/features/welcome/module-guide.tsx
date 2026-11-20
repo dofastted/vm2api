@@ -42,7 +42,7 @@ const GROUPS: { title: string; items: GuideItem[] }[] = [
         title: '统计',
         view: 'statistics',
         to: '/statistics',
-        summary: '请求、消费、耗时，以及用户、供应商和模型排行。',
+        summary: '请求、消费、耗时，以及用户、虚拟机和模型排行。',
       },
       {
         title: '日志',
