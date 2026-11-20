@@ -615,7 +615,7 @@ export function createResponsesWsHandler({
           }
           if (bridge.terminal === 'completed') {
             const snap = bridge.snapshot()
-            if (snap && !isProtocolWarmup(decoded.body)) {
+            if (snap) {
               replay.remember(snap.id, { input: hopBody.input, output: snap.output })
             }
             continue

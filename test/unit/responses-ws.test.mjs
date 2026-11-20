@@ -419,6 +419,54 @@ test('two response.create rounds replay full output including reasoning and tool
   }
 })
 
+test('a completed warmup can be continued on the same connection', async () => {
+  const hops = []
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth: allowAuth,
+    async handleProtocol(req, res) {
+      hops.push(await readJson(req))
+      const frame = { type: 'response.completed', response: { id: `resp_${hops.length}`, output: [] } }
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(`event: response.completed\ndata: ${JSON.stringify(frame)}\n\n`)
+    },
+  })
+  let ws
+  try {
+    const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    assert.equal(opened.ok, true)
+    ws = opened.ws
+    const warmupFrame = nextFrame(ws)
+    ws.send(
+      JSON.stringify({ type: 'response.create', model: 'gpt-5.4', generate: false, store: false, input: 'warmup' }),
+    )
+    const warmup = await warmupFrame
+    assert.equal(warmup.type, 'response.completed')
+
+    const continuationFrame = nextFrame(ws)
+    ws.send(
+      JSON.stringify({
+        type: 'response.create',
+        model: 'gpt-5.4',
+        store: false,
+        previous_response_id: warmup.response.id,
+        input: 'continue',
+      }),
+    )
+    const continuation = await continuationFrame
+    assert.equal(continuation.type, 'response.completed', continuation.error?.code)
+    assert.equal(hops.length, 2)
+    assert.equal(hops[1].previous_response_id, undefined)
+    assert.deepEqual(hops[1].input, [
+      { type: 'message', role: 'user', content: 'warmup' },
+      { type: 'message', role: 'user', content: 'continue' },
+    ])
+  } finally {
+    ws?.terminate()
+    await live.close()
+  }
+})
+
 test('unknown previous_response_id is a recovery error with zero hop', async () => {
   const hops = []
   const live = await listen({
