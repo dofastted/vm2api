@@ -120,7 +120,7 @@ export function ActiveFiltersDisplay({
   return (
     <div className='-mb-1 flex [scrollbar-width:none] flex-wrap items-center gap-2 overflow-x-auto pb-1'>
       <span className='shrink-0 text-xs font-medium text-muted-foreground'>
-        已激活筛选:
+        筛选条件:
       </span>
       {chips.map((chip) => (
         <Badge

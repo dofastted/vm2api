@@ -114,6 +114,9 @@ export function UsageLogsFilters({
         </FilterSection>
       </div>
       <div className='flex flex-wrap items-center gap-2 pt-2'>
+        <p className='w-full text-xs text-muted-foreground'>
+          单项修改需应用；清空全部立即生效
+        </p>
         <Button type='button' onClick={() => onApply(draft)}>
           应用筛选
         </Button>
