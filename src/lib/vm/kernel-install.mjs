@@ -526,7 +526,10 @@ export async function installKernelTargets({
             if (pendingGrant && !pendingGrant.ok) {
               if (!canAuthorizeInstall(pendingGrant)) return installLicenseFailure(target, pendingGrant)
               try {
-                await cragSubscription.authorizeInstall(desired)
+                // The panel already authorized this intent (`mayBindSubscription`);
+                // without passing it on, migrating a slot that holds an old grant
+                // is unreachable.
+                await cragSubscription.authorizeInstall(desired, { allowLegacyReissue: target.reissue === true })
               } catch (error) {
                 const code = error?.code || 'crag_subscription_install_failed'
                 const messages = {
