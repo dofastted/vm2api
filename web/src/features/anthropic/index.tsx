@@ -40,6 +40,7 @@ import {
   draftFromStored,
   endpointModelRequest,
   endpointSaveRequest,
+  asBodyPolicy,
 } from './endpoint-save'
 
 type ModelList = {
@@ -52,6 +53,7 @@ function freshEndpoint(protocol: ApiProtocol = 'anthropic'): EndpointDraft {
     id: randomUUID(),
     protocol,
     riskReviewEnabled: false,
+    bodyPolicy: 'persona',
     ...API_DEFAULTS[protocol],
     apiKey: '',
     proxyId: DIRECT,
@@ -254,6 +256,7 @@ export function AnthropicConsolePage() {
                   stored: {
                     protocol: item.protocol,
                     riskReviewEnabled: item.riskReviewEnabled === true,
+                    bodyPolicy: asBodyPolicy(item.bodyPolicy),
                     baseUrl: item.baseUrl.trim() || defaultUrl,
                     authScheme: item.authScheme,
                     headers: row.stored?.headers,
@@ -492,6 +495,40 @@ export function AnthropicConsolePage() {
                             风险审计
                           </a>
                           中启用的规则与决策模型审查，通过后再调用此端点；不影响本页连通性测试。
+                        </p>
+                      </div>
+                    </div>
+                  ) : null}
+                  {protocol === 'anthropic' ? (
+                    <div className='mt-3 flex items-start gap-3 px-1 pb-1'>
+                      <Switch
+                        id={`body-policy-${item.id}`}
+                        aria-describedby={`body-policy-help-${item.id}`}
+                        checked={asBodyPolicy(item.bodyPolicy) === 'caller'}
+                        disabled={save.isPending}
+                        onCheckedChange={(checked) =>
+                          patchEndpoint(item.id, {
+                            bodyPolicy: checked ? 'caller' : 'persona',
+                          })
+                        }
+                      />
+                      <div className='grid gap-1 text-sm'>
+                        <label htmlFor={`body-policy-${item.id}`}>
+                          转发调用方原始正文
+                        </label>
+                        <p
+                          id={`body-policy-help-${item.id}`}
+                          className='text-xs text-muted-foreground'
+                        >
+                          默认关闭，修改后需保存。关闭时按
+                          <a
+                            href='#/settings/protocol'
+                            className='underline underline-offset-4'
+                          >
+                            协议
+                          </a>
+                          里配置的人设改写身份与计费块；开启后保留调用方自带的
+                          system、计费标记与工具身份，适用于上游自行读取这些内容的地址。只影响人设注入，不改变风控、配额、模型映射与预算下限。
                         </p>
                       </div>
                     </div>
