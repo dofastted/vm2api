@@ -42,7 +42,7 @@ export function ActiveFiltersDisplay({
   if (isAdmin && filters.vmId)
     chips.push({
       key: 'vmId',
-      label: '供应商',
+      label: '虚拟机',
       value: nameOf(options?.vms, filters.vmId),
     })
   if (filters.sessionId)

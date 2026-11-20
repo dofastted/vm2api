@@ -73,7 +73,7 @@ export function UsageLogsFilters({
         <FilterSection
           title='身份信息'
           description={
-            isAdmin ? '按用户、密钥、供应商和会话筛选' : '按密钥和会话筛选'
+            isAdmin ? '按用户、密钥、虚拟机和会话筛选' : '按密钥和会话筛选'
           }
           icon={User}
           defaultOpen

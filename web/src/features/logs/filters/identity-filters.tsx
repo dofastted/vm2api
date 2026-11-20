@@ -155,13 +155,13 @@ export function IdentityFilters({
       </div>
       {isAdmin ? (
         <div className='space-y-2'>
-          <Label>供应商</Label>
+          <Label>虚拟机</Label>
           <FilterCombobox
             value={filters.vmId}
             options={options?.vms ?? []}
-            allLabel='全部供应商'
-            searchPlaceholder='搜索供应商...'
-            emptyLabel='未找到匹配的供应商'
+            allLabel='全部虚拟机'
+            searchPlaceholder='搜索虚拟机...'
+            emptyLabel='未找到匹配的虚拟机'
             loading={optionsLoading}
             onChange={(vmId) => onChange({ ...filters, vmId })}
           />

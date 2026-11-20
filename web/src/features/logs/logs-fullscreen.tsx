@@ -108,11 +108,11 @@ export function LogsFullscreen({
         <div className='mt-4 h-16 w-1.5 rounded-l-sm bg-primary/20 group-hover:bg-primary/50' />
         <div className='flex w-72 flex-col gap-3 rounded-l-lg border border-r-0 bg-popover p-4 shadow-xl'>
           <div className='flex items-center justify-between gap-3'>
-            <div className='text-sm font-medium'>隐藏供应商列</div>
+            <div className='text-sm font-medium'>隐藏虚拟机列</div>
             <Switch
               checked={hideProvider}
               onCheckedChange={setHideProvider}
-              aria-label='隐藏供应商列'
+              aria-label='隐藏虚拟机列'
             />
           </div>
         </div>
