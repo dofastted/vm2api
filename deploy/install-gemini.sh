@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Manual CRAGGemini installer. It only runs prepare-gemini from the main installer.
+# Manual CRAGGemini installer. It fetches the matching installer and runs only prepare-gemini.
 set -euo pipefail
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ $# -ne 0 ]]; then
   echo "install-gemini.sh does not take arguments; it always runs prepare-gemini" >&2
   exit 2
 fi
-exec bash "$here/install.sh" prepare-gemini
+url="${VM2API_INSTALL_URL:-https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install.sh}"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+curl -fsSL "$url" -o "$tmp"
+exec bash "$tmp" prepare-gemini
