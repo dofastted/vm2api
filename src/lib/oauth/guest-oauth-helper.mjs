@@ -89,13 +89,15 @@ export async function finishOAuthImport(oauth, ok) {
 }
 
 /**
- * A controller-side exchange has no KERNEL_CONFIG env of its own: hand the
- * helper the slot's kernel config so `kin-worker oauth session-code` picks the
- * same exit (proxy, or transparent egress) the slot would use.
+ * A controller-side exchange has no env of its own: hand the helper the slot's
+ * **worker** config (`worker.json`), which is what carries `vm_id`, `proxy_url`
+ * and `egress_mode`. `kernel.json` lacks `egress_mode`, and an empty proxy there
+ * made the worker refuse every dial ("upstream transport failed").
  */
 function workerConfig(exec) {
   try {
-    const configPath = rustKernelPaths(exec).configPath
+    const runDir = rustKernelPaths(exec).runDir
+    const configPath = runDir ? path.join(runDir, 'worker.json') : null
     return configPath && fs.existsSync(configPath) ? { worker_config_path: configPath } : {}
   } catch {
     return {}
@@ -131,6 +133,9 @@ export async function runGuestOAuthAuthService(
     env: {
       HOME: home,
       CLAUDE_CONFIG_DIR: configDir,
+      // The worker config (`worker.json`) carries vm_id/proxy_url/egress_mode and
+      // is what `kin-worker oauth session-code` needs; the kernel config does not.
+      KIN_WORKER_CONFIG: '/run/kin/worker.json',
       KERNEL_CONFIG: '/run/kin/kernel.json',
       HTTP_PROXY: '',
       HTTPS_PROXY: '',

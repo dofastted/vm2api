@@ -1,5 +1,11 @@
-import { useId, useRef, useState, type FormEvent } from 'react'
-import { useQueryClient } from '@tanstack/react-query'
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type FormEvent,
+  type RefObject,
+} from 'react'
 import { api, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import {
@@ -14,17 +20,28 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { geminiInventoryOptions } from '@/features/import/gemini-environments'
 
-export function GeminiRedeemDialog() {
+export function GeminiRedeemDialog({
+  triggerVisible = true,
+  returnFocusTo,
+  onRedeemed,
+}: {
+  triggerVisible?: boolean
+  returnFocusTo?: RefObject<HTMLElement | null>
+  onRedeemed: () => void
+}) {
   const [open, setOpen] = useState(false)
   const [code, setCode] = useState('')
   const [version, setVersion] = useState<string>()
   const [error, setError] = useState('')
   const [pending, setPending] = useState(false)
   const redeeming = useRef(false)
+  const done = useRef<HTMLButtonElement>(null)
   const codeId = useId()
-  const queryClient = useQueryClient()
+
+  useEffect(() => {
+    if (version) done.current?.focus()
+  }, [version])
 
   async function redeem(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -40,9 +57,7 @@ export function GeminiRedeemDialog() {
       )
       setCode('')
       setVersion(result.kernel_version)
-      void queryClient.invalidateQueries({
-        queryKey: geminiInventoryOptions().queryKey,
-      })
+      onRedeemed()
     } catch (failure) {
       setError(
         isApiError(failure) && failure.code?.startsWith('gemini_')
@@ -68,12 +83,22 @@ export function GeminiRedeemDialog() {
         setOpen(next)
       }}
     >
-      <DialogTrigger asChild>
-        <Button size='sm' variant='outline'>
-          兑换 CRAGGemini
-        </Button>
-      </DialogTrigger>
-      <DialogContent showCloseButton={!pending}>
+      {triggerVisible ? (
+        <DialogTrigger asChild>
+          <Button type='button' size='sm' variant='outline'>
+            兑换 CRAGGemini
+          </Button>
+        </DialogTrigger>
+      ) : null}
+      <DialogContent
+        showCloseButton={!pending}
+        onCloseAutoFocus={(event) => {
+          if (!triggerVisible && returnFocusTo?.current) {
+            event.preventDefault()
+            returnFocusTo.current.focus()
+          }
+        }}
+      >
         <DialogHeader>
           <DialogTitle>兑换 CRAGGemini 内核</DialogTitle>
           <DialogDescription>
@@ -83,12 +108,13 @@ export function GeminiRedeemDialog() {
         {version ? (
           <>
             <p role='status' className='text-sm'>
-              CRAGGemini {version} 已激活。Google 账号授权与推理支持状态请在
-              Gemini 环境中查看。
+              CRAGGemini {version} 已激活。Google 账号仍需单独授权。
             </p>
             <DialogFooter>
               <DialogClose asChild>
-                <Button type='button'>完成</Button>
+                <Button ref={done} type='button'>
+                  完成
+                </Button>
               </DialogClose>
             </DialogFooter>
           </>

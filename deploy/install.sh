@@ -64,12 +64,12 @@ usage() {
 用法: $(basename "$0") [命令] [选项]
 
 命令:
-  install              安装到 ${INSTALL_DIR}（默认，amd64 自动获取最新正式版 CRAG）
-  upgrade | update     升到最新 GitHub Release 并更新 CRAG（保留 .env / vms / data）
+  install              安装到 ${INSTALL_DIR}（amd64 自动获取 CRAG 和 Gemini）
+  upgrade | update     升级控制面和 CRAG，准备缺失的 Gemini（保留 .env / vms / data）
   crag-update          独立更新 CRAG V2 包及全部既有 CRAG 副本，不切换槽位内核
   prepare-native       仅准备 Docker CRAG 的宿主 AppArmor userns 权限
   prepare-crag-host    仅准备 CRAG 订阅宿主 ID，不重启服务
-  prepare-gemini       启用宿主 Gemini 服务并校验、安装已配置的签名载荷
+  prepare-gemini       启用宿主 Gemini 服务并安装签名载荷（amd64 默认自动获取）
   check                对比当前版本与最新 Release，打印 changelog
   changelog            打印本地 CHANGELOG.md
   status               当前版本、容器、探活
@@ -81,7 +81,7 @@ usage() {
   --gemini-payload-source DIR  已解包的 Gemini 签名载荷目录（Linux amd64，需独立配置发行公钥）
   --dir PATH           安装目录（默认 ${INSTALL_DIR}）
   --yes                非交互
-  --no-start           只拉代码，不 compose up
+  --no-start           只拉代码，不启动控制面或准备 Gemini
   --no-sync-wrap       跳过 CRAG 获取及槽内 kernel 检查、调度与同步
   --from-source        clone 仓库并在本机构建镜像（默认拉预构建镜像）
   -h, --help           帮助
@@ -584,23 +584,132 @@ fetch_release_files() {
     "${INSTALL_DIR}/share" "${INSTALL_DIR}/src/config"
 }
 
-prepare_gemini_host() {
+fetch_gemini_host_file() {
+  local tag="$1" mode="$2" file="$3" dest="$4" status
+  mkdir -p -- "${dest%/*}" || return 1
+  if [ "$mode" = source ]; then
+    [ -e "${INSTALL_DIR}/${file}" ] || return 44
+    cp -- "${INSTALL_DIR}/${file}" "$dest"
+  else
+    status="$(curl -sSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 -w '%{http_code}' \
+      "${RAW_BASE}/${tag}/${file}" -o "$dest")" || return 1
+    case "$status" in
+      200) return 0 ;;
+      404) return 44 ;;
+      *) err "Gemini 部署文件 ${file} 下载失败（HTTP ${status}）"; return 1 ;;
+    esac
+  fi
+}
+
+gemini_node_supported() {
+  command -v node >/dev/null && node -e 'process.exit(typeof require("node:util").parseArgs === "function" ? 0 : 1)'
+}
+
+prepare_gemini_dependencies() {
+  local -a packages=()
+  command -v python3 >/dev/null || packages+=(python3)
+  gemini_node_supported || packages+=(nodejs)
+  command -v ip >/dev/null || packages+=(iproute2)
+  command -v nft >/dev/null || packages+=(nftables)
+  command -v setpriv >/dev/null || packages+=(util-linux)
+  command -v bwrap >/dev/null || packages+=(bubblewrap)
+  command -v curl >/dev/null || packages+=(curl)
+  if [ "${#packages[@]}" -gt 0 ]; then
+    if ! command -v apt-get >/dev/null; then
+      err "Gemini 缺少宿主依赖: ${packages[*]}；请先安装对应软件包"
+      return 1
+    fi
+    info "安装 Gemini 宿主依赖: ${packages[*]}"
+    if ! DEBIAN_FRONTEND=noninteractive apt-get update ||
+      ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"; then
+      err "Gemini 宿主依赖安装失败，请检查 apt 源后重试 prepare-gemini"
+      return 1
+    fi
+  fi
+}
+
+prepare_gemini_host() (
   local PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-  local tag="$1" mode="$2" source="${GEMINI_PAYLOAD_SOURCE:-$(env_get VM2API_GEMINI_PAYLOAD_SOURCE)}"
-  if [ -z "$source" ] && [ "${3:-}" != required ] && [ ! -f /etc/systemd/system/vm2api-gemini.service ]; then
+  local tag="$1" mode="$2"
+  local manual_source="${GEMINI_PAYLOAD_SOURCE:-${VM2API_GEMINI_PAYLOAD_SOURCE:-$(env_get VM2API_GEMINI_PAYLOAD_SOURCE)}}"
+  local source="$manual_source"
+  if [ "$NO_START" = 1 ]; then
+    info "--no-start：已跳过 Gemini 宿主服务和载荷准备"
     return 0
   fi
-  if [ "$HOST_ARCH" != amd64 ] || { [ -n "$source" ] && [[ ! "$source" =~ ^/[A-Za-z0-9._/-]+$ ]]; } ||
+  if [ -z "$source" ] && { [ "$HOST_ARCH" != amd64 ] || [ "$(uname -s)" != Linux ]; }; then
+    info "Gemini 自动获取仅支持 Linux amd64，已跳过"
+    return 0
+  fi
+  if [ "$HOST_ARCH" != amd64 ] || [ "$(uname -s)" != Linux ] ||
+    { [ -n "$source" ] && [[ ! "$source" =~ ^/[A-Za-z0-9._/-]+$ ]]; } ||
     [[ ! "$INSTALL_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
     err "Gemini 需要 Linux amd64，安装目录和签名载荷目录必须为不含空格的绝对路径"
     return 1
   fi
-  local host_dir=/usr/local/lib/vm2api-gemini staging file dependency
-  for dependency in systemctl node python3; do
-    command -v "$dependency" >/dev/null || { err "Gemini 宿主机缺少 $dependency"; return 1; }
-  done
-  if [ -n "$source" ] && ! command -v curl >/dev/null; then
-    err "Gemini 宿主机缺少 curl，无法请求初始化签名载荷"
+
+  local host_dir=/usr/local/lib/vm2api-gemini
+  local default_source="${host_dir}/defaults/0.3.0-rc.2"
+  local unit=/etc/systemd/system/vm2api-gemini.service
+  local current="${INSTALL_DIR}/share/gemini/current"
+  if [ -z "$source" ] && command -v systemctl >/dev/null; then
+    # Keep a source supplied by an existing unit/drop-in without copying it into .env.
+    local exec_start source_pattern='(^|[[:space:]])--payload-source(=|[[:space:]]+)(/[A-Za-z0-9._/-]+)([[:space:]]|$)'
+    exec_start="$(systemctl show --property=ExecStart --value vm2api-gemini.service 2>/dev/null)" || exec_start=""
+    if [[ "$exec_start" =~ $source_pattern ]] && [ "${BASH_REMATCH[3]}" != "$default_source" ]; then
+      source="${BASH_REMATCH[3]}"
+    fi
+  fi
+  if [ "$mode" != source ] && ! command -v curl >/dev/null; then
+    err "Gemini 宿主机缺少 curl；请用包管理器安装 curl 后重试"
+    return 1
+  fi
+  local installed=0 want_default=0 use_default=0 default_args="" staging file dependency status host_mode
+  if [ -e "$current" ] || [ -L "$current" ]; then
+    installed=1
+    # Retain the trust inputs of an installed default payload, never replace current.
+    if { [ -f "${current}/manifest.json" ] &&
+      cmp -s -- "${current}/manifest.json" "${default_source}/manifest.json"; } ||
+      { [ -f "$unit" ] && grep -Fq -- "--default-public-key ${default_source}/gemini-ed25519.pub" "$unit"; }; then
+      want_default=1
+    fi
+  elif [ -z "$source" ]; then
+    want_default=1
+  fi
+
+  staging="$(mktemp -d)" || { err "无法创建 Gemini 临时目录"; return 1; }
+  trap 'rm -rf -- "$staging"' EXIT
+  if [ "$want_default" = 1 ]; then
+    file=deploy/payload.json
+    if fetch_gemini_host_file "$tag" "$mode" "$file" "${staging}/${file}"; then
+      # Detect the marker on old releases without a host JSON interpreter.
+      # The downloader validates the descriptor before using it.
+      if grep -Fq '"geminiDefaultLinuxAmd64"' "${staging}/${file}"; then
+        use_default=1
+      fi
+    else
+      status=$?
+      [ "$status" = 44 ] || { err "无法获取 ${tag} 的 ${file}；请检查网络或本地源码"; return 1; }
+    fi
+    if [ "$use_default" = 0 ]; then
+      if [ "$installed" = 1 ]; then
+        err "${tag} 不提供已安装 Gemini 默认载荷所需的配置；已保留原宿主服务和载荷"
+        return 1
+      fi
+      info "${tag} 未提供 Gemini 默认载荷；可选择较新版本或用 --gemini-payload-source 指定签名载荷"
+      if [ "${3:-}" != required ] && [ ! -f "$unit" ]; then
+        return 0
+      fi
+    fi
+  fi
+
+  if ! command -v systemctl >/dev/null; then
+    err "Gemini 宿主服务需要 systemd；请在支持 systemd 的 Linux 宿主机上执行"
+    return 1
+  fi
+  if { [ "$mode" != source ] || [ "$use_default" = 1 ] || [ "$installed" = 1 ] || [ -n "$source" ]; } &&
+    ! command -v curl >/dev/null; then
+    err "Gemini 宿主机缺少 curl；请用包管理器安装 curl 后重试"
     return 1
   fi
   if ! systemctl show --property=Version --value >/dev/null; then
@@ -611,55 +720,96 @@ prepare_gemini_host() {
     err "旧版 gemini-host.service 正在运行；请先迁移该服务，避免争用控制 socket"
     return 1
   fi
-  staging="$(mktemp -d)" || return 1
+  if [ "$use_default" = 1 ]; then
+    prepare_gemini_dependencies || return 1
+  fi
+  if ! command -v python3 >/dev/null || ! gemini_node_supported; then
+    err "Gemini 需要 python3 和支持 parseArgs 的 Node.js（Ubuntu 24.04：python3、nodejs）"
+    return 1
+  fi
+
   local -a files=(deploy/gemini-host.service.example scripts/gemini-host.py scripts/gemini_host_account.py
+    scripts/gemini_host_inference.py
     scripts/gemini-host-egress.sh scripts/install-gemini-payload.mjs src/lib/gemini/payload.mjs)
   for file in "${files[@]}"; do
-    mkdir -p "${staging}/${file%/*}" || { rm -rf -- "$staging"; return 1; }
-    if [ "$mode" = source ]; then
-      cp "${INSTALL_DIR}/${file}" "${staging}/${file}" || { rm -rf -- "$staging"; return 1; }
-    else
-      if ! curl -fsSL --connect-timeout 10 --max-time 60 "${RAW_BASE}/${tag}/${file}" -o "${staging}/${file}"; then
-        rm -rf -- "$staging"
-        err "当前版本缺少 Gemini 宿主服务文件: $file"
-        return 1
-      fi
+    if ! fetch_gemini_host_file "$tag" "$mode" "$file" "${staging}/${file}"; then
+      err "无法获取 ${tag} 的 Gemini 宿主服务文件: $file"
+      return 1
     fi
   done
-  (
-    trap 'rm -rf -- "$staging"' EXIT
-    getent group vm2api >/dev/null || groupadd --system vm2api || exit 1
-    install -d -m 755 "$host_dir" "${INSTALL_DIR}/share/gemini" || exit 1
-    for file in "${files[@]:1}"; do
-      install -D -m 644 "${staging}/${file}" "${host_dir}/${file}" || exit 1
-    done
-    local source_arg="${source:+--payload-source $source}"
-    sed -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" -e "s|@PAYLOAD_SOURCE_ARG@|${source_arg}|g" \
-      "${staging}/${files[0]}" > "${staging}/vm2api-gemini.service" || exit 1
-    install -m 644 "${staging}/vm2api-gemini.service" /etc/systemd/system/vm2api-gemini.service || exit 1
-    systemctl daemon-reload && systemctl enable vm2api-gemini.service && systemctl restart vm2api-gemini.service
-  ) || { err "Gemini 宿主服务未就绪，请检查 journalctl -u vm2api-gemini.service"; return 1; }
-  if [ -n "$source" ]; then
-    local result version
+
+  if [ ! -e "$host_dir" ] && [ ! -L "$host_dir" ]; then
+    install -d -m 755 "$host_dir" || return 1
+  fi
+  if [ -L "$host_dir" ] || [ ! -d "$host_dir" ] || [ ! -O "$host_dir" ] ||
+    ! host_mode="$(stat -c '%a' -- "$host_dir")" || [ "$((0$host_mode & 022))" -ne 0 ]; then
+    err "Gemini 宿主目录必须由 root 拥有且不可由其他用户写入: ${host_dir}"
+    return 1
+  fi
+  if [ "$use_default" = 1 ]; then
+    file=scripts/fetch-default-gemini.py
+    if ! fetch_gemini_host_file "$tag" "$mode" "$file" "${staging}/${file}" ||
+      ! grep -Fq '@DEFAULT_PAYLOAD_ARGS@' "${staging}/${files[0]}"; then
+      err "${tag} 缺少 Gemini 默认载荷下载脚本或服务模板配置"
+      return 1
+    fi
+    if [ ! -e "${default_source%/*}" ] && [ ! -L "${default_source%/*}" ]; then
+      install -d -m 700 "${default_source%/*}" || return 1
+    fi
+    if ! python3 -I "${staging}/${file}" --manifest "${staging}/deploy/payload.json" --dest "$default_source"; then
+      err "无法准备 Gemini 默认签名载荷；请检查上述错误后重新执行 prepare-gemini"
+      return 1
+    fi
+    default_args="--default-public-key ${default_source}/gemini-ed25519.pub --default-release-verifier ${default_source}/gemini-release.json"
+    if [ -z "$source" ]; then
+      source="$default_source"
+    fi
+  fi
+
+  getent group vm2api >/dev/null || groupadd --system vm2api || return 1
+  install -d -m 755 "${INSTALL_DIR}/share/gemini" || return 1
+  for file in "${files[@]:1}"; do
+    install -D -m 644 "${staging}/${file}" "${host_dir}/${file}" || return 1
+  done
+  local source_arg="${source:+--payload-source $source}"
+  sed -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" -e "s|@PAYLOAD_SOURCE_ARG@|${source_arg}|g" \
+    -e "s|@DEFAULT_PAYLOAD_ARGS@|${default_args}|g" \
+    "${staging}/${files[0]}" > "${staging}/vm2api-gemini.service" || return 1
+  install -m 644 "${staging}/vm2api-gemini.service" "$unit" || return 1
+  if ! (systemctl daemon-reload && systemctl enable vm2api-gemini.service && systemctl restart vm2api-gemini.service); then
+    err "Gemini 宿主服务未就绪，请检查 journalctl -u vm2api-gemini.service"
+    return 1
+  fi
+
+  if [ -n "$source" ] || [ "$installed" = 1 ]; then
+    local result version activation
     result="$(curl -sS --noproxy '*' --max-time 45 --unix-socket /run/vm2api-gemini/control.sock \
       -H 'Content-Type: application/json' --data '{}' http://localhost/install-payload)" || {
-      err "无法通过 Gemini 控制 socket 请求签名载荷初始化"
+      err "无法通过 Gemini 控制 socket 请求签名载荷初始化；请检查 journalctl -u vm2api-gemini.service"
       return 1
     }
-    version="$(printf '%s' "$result" | node -e '
+    status="$(printf '%s' "$result" | node -e '
       const data = JSON.parse(require("node:fs").readFileSync(0, "utf8"))
-      if (/^[0-9A-Za-z.-]+$/.test(data.version ?? "")) console.log(data.version)
-      else {
+      if (typeof data.version === "string" && /^[0-9A-Za-z.-]+$/.test(data.version)) {
+        console.log(data.version, data.activation_required === true ? "awaiting_redemption" : "installed")
+      } else {
         if (/^gemini_[a-z_]+$/.test(data.code ?? "")) console.error(data.code)
         process.exitCode = 1
       }
     ')" || { err "Gemini 签名载荷未就绪，请检查安装源、公钥和 journalctl -u vm2api-gemini.service"; return 1; }
-    env_set VM2API_GEMINI_PAYLOAD_SOURCE "$source" || return 1
-    ok "Gemini 控制 socket 与签名载荷 ${version} 已就绪；CLI 出口状态请在面板检查"
+    read -r version activation <<< "$status"
+    if [ -n "$manual_source" ]; then
+      env_set VM2API_GEMINI_PAYLOAD_SOURCE "$manual_source" || return 1
+    fi
+    if [ "$activation" = awaiting_redemption ]; then
+      ok "Gemini 签名载荷 ${version} 已安装，尚待兑换；请在管理面板输入兑换码激活"
+    else
+      ok "Gemini 签名载荷 ${version} 已安装；CLI 出口状态请在面板检查"
+    fi
   else
     ok "Gemini 控制 socket 已就绪；签名载荷与 CLI 出口状态请在面板检查"
   fi
-}
+)
 
 # 从 COMPOSE_FILE 去掉源码 ARM64 override 段，保留其它 overlay；全去掉后只剩 docker-compose.yml。
 compose_file_without_arm64_override() {

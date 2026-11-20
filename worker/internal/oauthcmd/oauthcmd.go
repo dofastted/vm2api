@@ -364,6 +364,7 @@ func classifyError(err error) string {
 	lower := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(lower, "proxy required"),
+		strings.Contains(lower, "proxy is required"),
 		strings.Contains(lower, "socks"):
 		return "proxy_required"
 	case strings.Contains(lower, "upstream transport"),

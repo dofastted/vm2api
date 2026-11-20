@@ -20,6 +20,10 @@ const official =
   'https://accounts.google.com/o/oauth2/auth?redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&code_challenge_method=S256&state=fixture&code_challenge=fixture'
 const record = { id: 'gemini-fixture', proxy_id: 'px-fixture', name: 'Fixture', auth_state: 'unverified' }
 const bound = { id: record.proxy_id, enabled: true, status: 'ok', owner_user_id: null }
+const environmentPath = `${root}/environments/${record.id}`
+const proxyUrl = 'socks5h://fixture:private@192.0.2.11:1080'
+const runId = '0123456789abcdef0123456789abcdef'
+const model = 'gemini-3-pro'
 
 test('Gemini, Anthropic and OpenAI text inputs produce the same native turn envelope', () => {
   const model = 'gemini-3.1-pro'
@@ -127,16 +131,13 @@ function setup(callHost, proxy = bound) {
   const response = { setHeader() {} }
   const panel = createGeminiPanelHandler({
     json: (_response, status, body) => ({ status, body }),
-    readBody: async (req, maxBytes) => {
-      assert.equal(
-        maxBytes,
-        req.pathname.endsWith('/test-chat') ? 32 * 1024 : 'redemption_code' in req.body ? 1024 : 4096,
-      )
-      return req.body
-    },
+    readBody: async (req) => req.body,
     proxyPool: () => ({
-      snapshot: () => ({ proxies: [proxy] }),
-      getProxyByIdWithAuth: () => ({ url: 'socks5://fixture:private@192.0.2.11:1080' }),
+      snapshot: ({ ownerUserId }) => {
+        assert.equal(ownerUserId, null)
+        return { proxies: [proxy] }
+      },
+      getProxyByIdWithAuth: (id) => (id === proxy.id ? { url: proxyUrl } : null),
     }),
     callHost,
   })
@@ -148,9 +149,22 @@ test('Gemini import is admin-only and unavailable without the host service', asy
   assert.equal(authorizePanelRoute('POST', `${root}/environments`, 'super').ok, false)
   assert.equal(authorizePanelRoute('POST', `${root}/environments/${record.id}/refresh`, 'user').ok, false)
   assert.equal(authorizePanelRoute('POST', `${root}/environments`, 'admin').ok, true)
-  assert.equal(authorizePanelRoute('POST', `${root}/payload/redeem`, 'user').ok, false)
-  assert.equal(authorizePanelRoute('POST', `${root}/payload/redeem`, 'admin').ok, true)
-  assert.equal(authorizePanelRoute('POST', `${root}/environments/${record.id}/test-chat`, 'user').ok, false)
+  for (const [method, suffix] of [
+    ['POST', 'proxy/probe'],
+    ['PUT', 'proxy'],
+    ['POST', 'models'],
+    ['POST', 'test-chat'],
+    ['GET', `test-chat/${runId}`],
+    ['DELETE', `test-chat/${runId}`],
+  ]) {
+    for (const [role, allowed] of [
+      ['user', false],
+      ['super', false],
+      ['admin', true],
+    ]) {
+      assert.equal(authorizePanelRoute(method, `${environmentPath}/${suffix}`, role).ok, allowed)
+    }
+  }
   const run = setup(() => {
     throw new Error('private socket path')
   })
@@ -174,6 +188,15 @@ test('unknown Gemini payload status is not installed and proxy failures do not h
   assert.equal(body.data.environments[0].proxy_ready, false)
 })
 
+test('Gemini payload redemption is admin-only and rejects malformed codes before host dispatch', async () => {
+  const route = `${root}/payload/redeem`
+  assert.equal(authorizePanelRoute('POST', route, 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', route, 'super').ok, false)
+  assert.equal(authorizePanelRoute('POST', route, 'admin').ok, true)
+  const blocked = setup(() => assert.fail('malformed code must not reach the host'))
+  assert.equal((await blocked('POST', route, { redemption_code: 'CGG1-invalid' })).status, 400)
+})
+
 test('Gemini inventory distinguishes a missing socket from an invalid host response', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-host-'))
   const socketPath = path.join(directory, 'control.sock')
@@ -192,6 +215,20 @@ test('Gemini inventory distinguishes a missing socket from an invalid host respo
     if (server.listening) await new Promise((resolve) => server.close(resolve))
     await rm(directory, { recursive: true, force: true })
   }
+})
+
+test('reachable Gemini host reports lazy install without dependencies on an existing environment', async () => {
+  const run = setup(() => ({ payload_state: 'install_on_create', environments: [] }))
+  const { body } = await run('GET', root)
+  assert.equal(body.data.available, true)
+  assert.equal(body.data.payload_state, 'install_on_create')
+  assert.deepEqual(body.data.environments, [])
+  const invalidPayload = setup(() => {
+    throw Object.assign(new Error(), { code: 'gemini_payload_invalid' })
+  })
+  const result = await invalidPayload('POST', `${root}/environments`, { name: record.name, proxy_id: record.proxy_id })
+  assert.equal(result.status, 503)
+  assert.equal(result.body.error.code, 'gemini_payload_invalid')
 })
 
 test('Gemini host reports an unredeemed installation source separately from runtime', async () => {
@@ -228,27 +265,6 @@ test('Gemini redemption rejects Google codes and reports a different signed rele
   assert.doesNotMatch(JSON.stringify(mismatch), /private information/)
 })
 
-test('Gemini diagnostic distinguishes complete replies, blocked responses and upstream errors', async () => {
-  const endpoint = `${root}/environments/${record.id}/test-chat`
-  const input = { model: 'gemini-3.1-pro', prompt: 'ping' }
-  const complete = { status: 200, text: 'pong', stop_reason: 'STOP', usage: { input_tokens: 3 } }
-  for (const [response, success] of [
-    [complete, true],
-    [{ ...complete, stop_reason: 'SAFETY' }, false],
-    [{ ...complete, text: ' ' }, false],
-    [{ status: 429, secret: 'upstream credential' }, false],
-  ]) {
-    const run = setup((operation) => (operation === 'get' ? record : response))
-    const result = await run('POST', endpoint, input)
-    assert.equal(result.status, 200)
-    assert.equal(result.body.data.ok, success)
-    assert.equal(result.body.data.status, response.status)
-    assert.doesNotMatch(JSON.stringify(result), /upstream credential/)
-  }
-  const run = setup(() => assert.fail('must not query a host for invalid input'))
-  assert.equal((await run('POST', endpoint, { ...input, prompt: '你'.repeat(1400) })).status, 400)
-})
-
 test('only explicit platform SOCKS5 environments are created and credentials stay private', async () => {
   const create = { name: 'Fixture', proxy_id: record.proxy_id }
   const run = setup((operation, payload) => {
@@ -276,6 +292,154 @@ test('only explicit platform SOCKS5 environments are created and credentials sta
   ]) {
     const blocked = setup(() => assert.fail('unavailable proxy must not reach the host'), proxy)
     assert.equal((await blocked('POST', `${root}/environments`, create)).status, 409)
+  }
+})
+
+test('only a probe may use its currently bound enabled proxy with failed health', async () => {
+  for (const status of ['fail', 'dead']) {
+    const operations = []
+    const run = setup(
+      (operation, payload) => {
+        operations.push([operation, payload])
+        return operation === 'get' ? record : { ok: false, latency_ms: 14, code: 'private', detail: proxyUrl }
+      },
+      { ...bound, status },
+    )
+    const probe = await run('POST', `${environmentPath}/proxy/probe`, { proxy_id: 'untrusted', proxy_url: 'untrusted' })
+    assert.deepEqual(probe, {
+      status: 200,
+      body: { ok: true, data: { ok: false, latency_ms: 14, code: 'gemini_proxy_probe_failed' } },
+    })
+    assert.deepEqual(operations, [
+      ['get', { id: record.id }],
+      ['proxy-probe', { id: record.id, proxy_id: bound.id, proxy_url: proxyUrl }],
+    ])
+    const blocked = [
+      await run('PUT', `${environmentPath}/proxy`, { proxy_id: bound.id }),
+      await run('POST', `${environmentPath}/models`),
+      await run('POST', `${environmentPath}/test-chat`, { model, prompt: 'ping' }),
+    ]
+    assert.ok(blocked.every(({ status, body }) => status === 409 && body.error.code === 'gemini_proxy_unavailable'))
+    assert.deepEqual(
+      operations.slice(2).map(([operation]) => operation),
+      ['get', 'get', 'get'],
+    )
+  }
+  for (const proxy of [
+    { ...bound, enabled: false },
+    { ...bound, owner_user_id: 'tenant' },
+    { ...bound, blocked_reason: 'ipv6_disabled' },
+  ]) {
+    const run = setup((operation) => {
+      assert.equal(operation, 'get')
+      return record
+    }, proxy)
+    assert.equal((await run('POST', `${environmentPath}/proxy/probe`)).status, 409)
+  }
+})
+
+test('Gemini rebind and model discovery use trusted proxy arguments and return only the matching environment view', async () => {
+  const newProxy = { ...bound, id: 'px-replacement' }
+  const boundRecord = { ...record, proxy_id: newProxy.id }
+  let stored = record
+  const run = setup((operation, payload) => {
+    if (operation === 'get') return stored
+    assert.equal(payload.id, record.id)
+    assert.equal(payload.proxy_id, newProxy.id)
+    assert.equal(payload.proxy_url, proxyUrl)
+    if (operation === 'proxy-bind') {
+      assert.equal(payload.previous_proxy_id, bound.id)
+      stored = boundRecord
+      return { ...stored, proxy_url: proxyUrl, billing_ready: true }
+    }
+    assert.equal(operation, 'models')
+    assert.equal(payload.previous_proxy_id, undefined)
+    return { ...stored, models: [model, 'bad/slug', [model]], raw: proxyUrl, billing_ready: true }
+  }, newProxy)
+  const rebind = await run('PUT', `${environmentPath}/proxy`, { proxy_id: newProxy.id, proxy_url: 'untrusted' })
+  assert.equal(rebind.status, 200)
+  assert.equal(rebind.body.data.proxy_id, newProxy.id)
+  assert.equal(rebind.body.data.billing_ready, false)
+  const discovery = await run('POST', `${environmentPath}/models`, { proxy_id: bound.id, proxy_url: 'untrusted' })
+  assert.equal(discovery.status, 200)
+  assert.deepEqual(discovery.body.data.models, [model])
+  assert.equal(discovery.body.data.billing_ready, false)
+  assert.doesNotMatch(JSON.stringify([rebind, discovery]), /private|untrusted/)
+
+  const mismatched = setup(() => ({ ...record, id: 'other-env', models: [model] }))
+  assert.equal((await mismatched('POST', `${environmentPath}/models`)).body.error.code, 'gemini_host_protocol_error')
+  const empty = setup(() => record)
+  assert.equal((await empty('POST', `${environmentPath}/models`)).body.error.code, 'gemini_models_empty')
+})
+
+test('Gemini test-chat validates bytes and IDs before dispatch and polls or cancels without a proxy', async () => {
+  const route = `${environmentPath}/test-chat`
+  const poll = `${route}/${runId}`
+  const prompt = '😺'.repeat(1024)
+  const operations = []
+  const start = setup((operation, payload) => {
+    operations.push([operation, payload])
+    return operation === 'get' ? record : { run_id: runId, proxy_url: proxyUrl }
+  })
+  assert.equal((await start('POST', route, { model: [model], prompt })).body.error.code, 'gemini_invalid_model')
+  for (const invalid of [123, '  ', `${prompt}x`, '\ud800']) {
+    assert.equal((await start('POST', route, { model, prompt: invalid })).body.error.code, 'gemini_invalid_prompt')
+  }
+  assert.equal((await start('GET', `${route}/${runId.toUpperCase()}`)).body.error.code, 'gemini_invalid_run_id')
+  const invalidProxy = await start('PUT', `${environmentPath}/proxy`, { proxy_id: [bound.id] })
+  assert.equal(invalidProxy.body.error.code, 'gemini_invalid_proxy_id')
+  assert.deepEqual(operations, [])
+
+  const started = await start('POST', route, { model, prompt, proxy_id: 'untrusted', proxy_url: 'untrusted' })
+  assert.deepEqual(started.body.data, { run_id: runId })
+  assert.deepEqual(operations, [
+    ['get', { id: record.id }],
+    ['test-chat', { id: record.id, proxy_id: bound.id, proxy_url: proxyUrl, model, prompt }],
+  ])
+
+  const status = createGeminiPanelHandler({
+    json: (_res, httpStatus, body) => ({ status: httpStatus, body }),
+    readBody: () => assert.fail('poll and cancel must not read a request body'),
+    proxyPool: () => assert.fail('poll and cancel must not look up a proxy'),
+    callHost(operation, payload) {
+      assert.deepEqual(payload, { id: record.id, run_id: runId })
+      if (operation === 'test-chat-cancel') return { cancelled: true, proxy_url: proxyUrl }
+      assert.equal(operation, 'test-chat-status')
+      return {
+        state: 'failed',
+        text: `${proxyUrl} ${'x'.repeat(16384)}`,
+        usage: { input_tokens: 4, output_tokens: -1, total_tokens: 8, raw: proxyUrl },
+        error: { code: 'gemini_proxy_error', message: proxyUrl },
+      }
+    },
+  })
+  const response = { setHeader() {} }
+  const result = await status({ method: 'GET' }, response, poll)
+  assert.equal(result.status, 200)
+  assert.equal(result.body.data.state, 'failed')
+  assert.equal(result.body.data.text.length, 16384)
+  assert.deepEqual(result.body.data.usage, { input_tokens: 4, total_tokens: 8 })
+  assert.equal(result.body.data.error.code, 'gemini_proxy_error')
+  assert.doesNotMatch(JSON.stringify(result), /private|192\.0\.2\.11/)
+  assert.deepEqual((await status({ method: 'DELETE' }, response, poll)).body.data, { cancelled: true })
+})
+
+test('Gemini diagnostics use fixed HTTP statuses and messages for known host errors', async () => {
+  for (const [code, expected] of [
+    ['gemini_operation_busy', 409],
+    ['gemini_run_not_found', 404],
+    ['gemini_oauth_required', 409],
+    ['gemini_model_unavailable', 409],
+    ['gemini_proxy_error', 502],
+    ['gemini_inference_timeout', 503],
+  ]) {
+    const run = setup(() => {
+      throw Object.assign(new Error(proxyUrl), { code, status: 400 })
+    })
+    const { body, status } = await run('GET', `${environmentPath}/test-chat/${runId}`)
+    assert.equal(status, expected)
+    assert.equal(body.error.code, code)
+    assert.doesNotMatch(JSON.stringify(body), /private/)
   }
 })
 
