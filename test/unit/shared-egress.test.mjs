@@ -37,7 +37,7 @@ import {
   startSharedEgress,
 } from '../../src/lib/vm/egress.mjs'
 import { parseCidr } from '../../src/lib/vm/subnet-pool.mjs'
-import { exitOf, remoteEgressIpam } from '../../src/lib/cluster/remote-slot.mjs'
+import { exitOf, remoteEgressIpam, sharedRemoteNames } from '../../src/lib/cluster/remote-slot.mjs'
 import { patchVmRecord } from '../../src/lib/vm/vm-registry.mjs'
 import { slotContainerNetworkMismatch } from '../../src/lib/vm/vm-runtime.mjs'
 
@@ -543,4 +543,18 @@ test('rolling a VM back to per-vm drops the shared address', (t) => {
   // The container is on the shared network, so the start path recreates it.
   assert.equal(slotContainerNetworkMismatch({ networkMode: back.runtime.network_mode }, back), true)
   assert.deepEqual(slotNetworkArgs(back).args, ['--network', 'kin-eg-px-aaaa1111'])
+})
+
+test('the shared helper binary lands in the node-level mount its container binds', () => {
+  const host = { root: '/home/ubuntu/.vm2api', uid: 1000, gid: 1000 }
+  // What remoteEgressContainer binds as the executable directory, for both the
+  // control-plane host's shared helper and a cluster node's.
+  for (const nodeId of ['', 'node-7b55028e']) {
+    const names = sharedRemoteNames(nodeId, host)
+    const bound = path.posix.join(names.dir, '..', 'slot-bin')
+    // Node level, not inside any VM tree: the helper outlives every single VM
+    // on the node, and the per-slot push path would never put a binary here.
+    assert.equal(bound, `${host.root}/egress/slot-bin`)
+    assert.ok(!bound.includes('/vms/'))
+  }
 })

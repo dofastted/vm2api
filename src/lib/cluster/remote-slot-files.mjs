@@ -137,6 +137,53 @@ export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session
   return { pushed }
 }
 
+/**
+ * Publish the egress helper into the node-level mount a shared helper runs from.
+ *
+ * A per-VM helper takes its binary from that VM's own slot-bin, which is also
+ * where the push path puts it. A shared helper belongs to the node rather than
+ * to any VM — it outlives every single one of them — so its container binds
+ * `<root>/egress/slot-bin`, and nothing was putting a binary there.
+ *
+ * Only kin-egress goes here. The rest of slot-bin is the guest's runtime
+ * (worker, CRAG tree, live wrap), which a helper never executes.
+ *
+ * Owned by the SSH user, because that is who the helper container runs as
+ * (`${host.uid}:${host.gid}` in remoteEgressContainer). With CAP_DAC_OVERRIDE
+ * dropped, container root cannot traverse a directory owned by someone else —
+ * the failure looks like `permission denied` on the config, not on the binary.
+ */
+export async function pushSharedEgressBinary(session, projectRoot) {
+  const host = session.host
+  const dir = `${host.root}/egress/slot-bin`
+  const local = clusterBin(
+    'KIN_CLUSTER_EGRESS_BIN',
+    clusterBin('KIN_EGRESS_BIN', fs.existsSync(EGRESS_BIN) ? EGRESS_BIN : path.join(projectRoot, 'bin', 'kin-egress')),
+  )
+  let data
+  try {
+    data = fs.readFileSync(local)
+  } catch {
+    return { ok: false, error: `kin-egress binary not found: ${local}`, code: 'egress_binary_missing' }
+  }
+  const owner = { uid: host.uid, gid: host.gid }
+  const chown = host.uid === 0 ? '' : ` && chown ${owner.uid}:${owner.gid} ${shellQuote(dir)}`
+  await runRemote(session.client, `umask 022 && mkdir -p ${shellQuote(dir)} && chmod 755 ${shellQuote(dir)}${chown}`, {
+    timeoutMs: 20_000,
+  })
+  const target = `${dir}/kin-egress`
+  const sha = crypto.createHash('sha256').update(data).digest('hex')
+  // Every shared helper start lands here; resending an unchanged binary over a
+  // slow node link is what pushed panel requests past the proxy timeout when
+  // the per-slot push did it unconditionally.
+  const reused = (await remoteFileSha256(session.client, target)) === sha
+  if (!reused) {
+    const sftp = await openSftp(session.client)
+    await writeRemoteFile(sftp, target, data, { mode: 0o755, owner })
+  }
+  return { ok: true, dir, path: target, sha256: sha, reused }
+}
+
 /** Publish Go service payloads into the persistent per-slot mount. */
 export async function pushSlotBinaries(vm, projectRoot, session = null) {
   const s = session || (await nodeSession(vmNodeId(vm)))
