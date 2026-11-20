@@ -1565,7 +1565,7 @@ unixTest('streamGoWorker keeps rate-limit trailers after message_stop', async ()
 })
 
 unixTest('streamGoWorker restores a streamed plan-limit error to 429 with a parsed reset', async () => {
-  // Kernel cli-hop: HTTP 200, then `event: error` (sub2api sseStreamErrorEventError).
+  // The CLI hop reports the failure as an SSE error after sending HTTP 200.
   const fx = await fixture((req, res) => {
     res.setHeader('content-type', 'text/event-stream')
     res.write('event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n')

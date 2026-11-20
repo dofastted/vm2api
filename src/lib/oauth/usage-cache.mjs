@@ -1,7 +1,7 @@
 /**
  * In-memory cache for official GET /api/oauth/usage hops.
  *
- * Matches sub2api UsageCache: 3 min success TTL, 1 min error TTL,
+ * 3 min success TTL, 1 min error TTL,
  * per-account singleflight, 0–800ms jitter on miss.
  * force=true still honors the success TTL; it may replace a negative cache.
  */

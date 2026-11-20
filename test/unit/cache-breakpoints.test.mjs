@@ -1,5 +1,5 @@
 /**
- * Outbound cache_control breakpoint injection (sub2api parity).
+ * Outbound cache_control breakpoint injection.
  *
  * cache_ttl only retimes markers that already exist, so a caller that sends no
  * cache_control at all used to reach Anthropic with zero breakpoints and pay

@@ -7,7 +7,7 @@ import (
 	"sync"
 )
 
-// Rule is one the user added (Settings → Privacy) for a secret magpie's own
+// Rule is one the user added (Settings → Privacy) for a secret the built-in
 // rules don't know, a gateway's key say (#195): what its placeholders are
 // called, and the prefix its cur().values start with or a pattern for them. Its
 // cur().values are masked with the secrets, as they are: the same placeholder
@@ -16,7 +16,7 @@ type Rule struct {
 	Kind   string `json:"kind"`
 	Prefix string `json:"prefix,omitempty"`
 	// Regex is an RE2 pattern; the value is its group 1 when it has one,
-	// else all of what it matches, as with magpie's own rules.
+	// else all of what it matches, as with the redactor's own rules.
 	Regex string `json:"regex,omitempty"`
 }
 

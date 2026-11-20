@@ -54,9 +54,9 @@ export const DEFAULT_HEALTH_PROBE = Object.freeze({
     require_single_user: true,
     skip_official: true,
     ua_regex: '',
-    // new-api / sub2api chat and responses tests send no max_tokens at all.
+    // OpenAI Chat and Responses probes can omit the token limit.
     allow_missing_max_tokens: true,
-    // sub2api account test: CC banner system + "hi" + 1024 + temperature 1.
+    // Match the account-test shape: CC system banner, "hi", 1024 tokens, temperature 1.
     sub2api_account_test: true,
   }),
 })
@@ -278,7 +278,7 @@ function matchesProbePrompt(text, match) {
 }
 
 /**
- * sub2api AccountTestService payload: official CC banner as the whole system,
+ * Account-test payload: official CC banner as the whole system prompt,
  * one "hi" user turn, max_tokens 1024, temperature 1, no tools. It carries a
  * claude-cli UA, so it is matched before the official-client skip.
  */
@@ -294,7 +294,7 @@ export function isSub2apiAccountTest(body = {}) {
 
 /**
  * @param {string} [protocol] inbound protocol; a missing max_tokens only counts
- *   for OpenAI chat / responses (new-api and sub2api send none there).
+ *   for OpenAI Chat and Responses probes with no token limit field.
  */
 export function isHealthShape(headers = {}, body = {}, cfg = DEFAULT_HEALTH_PROBE, protocol = '') {
   const match = cfg?.match || DEFAULT_HEALTH_PROBE.match
@@ -479,7 +479,7 @@ export function formatHealthSse(protocol, inbound, snapshot, cfg = DEFAULT_HEALT
       model: chat.model,
       choices: [{ index: 0, delta: { role: 'assistant', content: text }, finish_reason: null }],
     })
-    // new-api test sets stream_options.include_usage and requires parseable usage.
+    // Channel tests set stream_options.include_usage and require parseable usage.
     ev(null, {
       id: chat.id,
       object: 'chat.completion.chunk',
@@ -508,7 +508,7 @@ export function formatHealthSse(protocol, inbound, snapshot, cfg = DEFAULT_HEALT
       .filter((b) => b.type === 'text')
       .map((b) => b.text || '')
       .join('')
-    // sub2api processOpenAIStream fails a stream that never sends response.completed.
+    // End the Responses probe stream with response.completed so clients recognize completion.
     const response = fromClaudeToResponses(claude, claude.model)
     ev('response.created', {
       type: 'response.created',

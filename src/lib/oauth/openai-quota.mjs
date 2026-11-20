@@ -1,7 +1,7 @@
 /**
  * ChatGPT / Codex quota + rate-limit-reset-credit.
- * Upstream via slot SOCKS5 only. Mirrors sub2api OpenAIQuotaService,
- * without auto-reset, spark shadow, or agent-identity recovery.
+ * Upstream via slot SOCKS5 only, without auto-reset, spark shadow, or
+ * agent-identity recovery.
  */
 import crypto from 'node:crypto'
 import { getVm, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'

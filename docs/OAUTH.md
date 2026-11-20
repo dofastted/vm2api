@@ -28,7 +28,7 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
 
 | 入口 | 路径 | 说明 |
 |------|------|------|
-| Setup Token + Cookie | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | `sk-ant-sid*` 经槽位出口申请完整 OAuth scope（profile、inference、sessions、MCP、文件），采集身份；落盘后以 Setup Token 运行模式执行，不跑官方初装。浏览器段（organizations + authorize）由 `kin-worker oauth session-code` 发出，走 Chrome TLS 指纹，和 sub2api 同一传输。 |
+| Setup Token + Cookie | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | `sk-ant-sid*` 经槽位出口申请完整 OAuth scope（profile、inference、sessions、MCP、文件），采集身份；落盘后以 Setup Token 运行模式执行，不跑官方初装。浏览器段（organizations + authorize）由 `kin-worker oauth session-code` 发出，走 Chrome TLS 指纹。 |
 | 已有 OAuth → Setup Token | `POST /api/panel/vms/:id/oauth/to-setup-token` | 读 worker 活票，仅切换运行模式；保留 access、refresh、真实过期时间和全部实际 scope。不会凭空增加权限，也不会删 scope。官方一年期 token（`official-setup-token`）不能转。 |
 | 官方 `claude setup-token` | 槽内 PTY / 粘贴一年期 oat | 只有 `user:inference`、无 refresh。落盘 `credential_mode=official-setup-token`，与面板转换的完整 Setup Token 区分。 |
 | Claude Code OAuth（默认） | 账号面板 → OAuth → Claude Code 授权 | 打开专用终端，VM 内原生 `claude auth login` 生成链接并处理回调；面板保存并同步结果。 |
@@ -38,7 +38,7 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
 
 远端 Claude 槽以节点上的 `credentials.json` 为准。官方 CLI 的 `.credentials.json` 使用同目录相对软链接；即使轮换通过原子替换更新文件，下次打开也会读到最新版。节点凭据回拉（包括启动、重载）会修正丢失或指向旧副本的链接，不会把旧副本写回凭据。对已运行的槽，启用的 `credential_refresh` 巡检也会检查链接（默认每 300 秒），不等令牌到期，不读取令牌内容、不额外换票、不重启槽。巡检快照的 `link_failures` 单列未修复的槽，与换票结果分开。
 
-CAI 粘贴码按 sub2api 规则换票：`code#state` 只将 `#` 后的上游返回值作为 token 请求的 `state`；只有 code 时不发送 `state`。Claude Code 由原生客户端保存 PKCE，面板将完整授权码交给原进程处理。Setup Token 和 Cookie 流程不变。
+CAI 粘贴码换票规则：`code#state` 只将 `#` 后的上游返回值作为 token 请求的 `state`；只有 code 时不发送 `state`。Claude Code 由原生客户端保存 PKCE，面板将完整授权码交给原进程处理。Setup Token 和 Cookie 流程不变。
 
 ### 换票传输
 
@@ -46,7 +46,7 @@ CAI 粘贴码按 sub2api 规则换票：`code#state` 只将 `#` 后的上游返�
 
 | 跳 | 请求 |
 |---|---|
-| browser | `kin-worker oauth session-code`（Go，`req` + `ImpersonateChrome` + 禁 CookieJar）：`GET /api/organizations` → `POST /v1/oauth/{org}/authorize`，返回 `code#state`。只有 cookie 段需要；授权链接段的证明由浏览器页面自己铸 |
+| browser | `kin-worker oauth session-code --config /run/kin/worker.json`（Go，`req` + `ImpersonateChrome` + 禁 CookieJar）：`GET /api/organizations` → `POST /v1/oauth/{org}/authorize`，返回 `code#state`。只有 cookie 段需要；授权链接段的证明由浏览器页面自己铸。配置必须是 **worker.json**——`kernel.json` 没有 `egress_mode`、`proxy_url` 为空，worker 会退化成拒绝所有连接（表现为 `upstream transport failed`） |
 | token | `POST /v1/oauth/token`，`axios/1.15.2`，只带 `content-type`。抓包 body 无 `expires_in`、无 Chrome 头；mint 仍可显式带一年期 |
 | 1 | `GET /api/oauth/profile`，UA `claude-code/2.1.321`，`cache-control: no-cache` |
 | 2 | `POST /api/eval/sdk-zAZezfDKGoZuXXKe`，`sdkCachePartition=served-to-bearer:<uuid>`，尚无套餐字段 |
@@ -59,12 +59,12 @@ CAI 粘贴码按 sub2api 规则换票：`code#state` 只将 `#` 后的上游返�
 
 - 每次请求 60 秒上限（`OAUTH_REQUEST_TIMEOUT_MS`），不是整条流程 60 秒；helper 的整体超时按 token 加 6 跳留余量。
 - 浏览器阶段发 Chrome 的 HTTP 头（`sec-ch-ua`、`sec-fetch-*`、`accept-language`）。TLS/HTTP2 指纹伪装需要 libcurl/utls 客户端，Node helper 做不到，别把它当已实现。
-- 不保存响应 Cookie：整个流程只主动带 `Cookie: sessionKey`，`Set-Cookie` 一律不落盘（sub2api `SetCookieJar(nil)`）。
+- 不保存响应 Cookie：整个流程只主动带 `Cookie: sessionKey`，`Set-Cookie` 一律不落盘。
 - profile / roles / eval / first-token / bootstrap 都是尽力而为：票据已经绑定该账号，不因为后续一跳失败丢掉一次换票。profile 和 bootstrap 都空时身份留空。
 - 出口仍是 fail closed：`proxy_url=""` 是本地出口（直连），`null` 是未绑定（`proxy_required`），不因为上游直连就放开。
 - authorize 的来源头会按序回退：上游按调用方 `Origin` 做允许列表，来源不对时是 `403 permission_error: Origin not allowed`（与 sessionKey 失效无关）。`claude.com/cai/oauth/authorize` 已 307 到 `claude.ai/oauth/authorize`，官方 CLI 的 `CLAUDE_AI_ORIGIN` 也是 `https://claude.ai`，所以 `auth.js` 依次尝试「profile 参考来源 → 同一主机的另一来源 → 不带 Origin」；只有这条 Origin 拒绝才换下一组，其它 403 立即失败，全被拒时错误列出尝试过的来源（面板映射成 `origin_rejected`，502）。
 - token 端点两种边缘拒绝单独归类，不再和授权码问题混在一起：`429 rate_limit_error` → `token_exchange_rate_limited`（面板 429，提示等 1 分钟再交同一个码，别连点；持续出现说明该出口 IP 被限速）；`403 Request not allowed` → `token_exchange_forbidden`（面板 502，提示换出口，通常是地区不支持）。
-- authorize 的**客户端指纹**才是门槛：claude.ai 前端会给每个改动型请求补 `client_attestation: { hcaptcha_token }`，但闸门量的是传输层——同样的 body/Cookie/出口，Sub2API 的 `ImpersonateChrome`（Chrome TLS + HTTP/2）能过，Node/undici 只写 Chrome 头会被判 `400 missing_client_attestation`。因此 cookie 段改由 `kin-worker oauth session-code`（`worker/internal/oauthcmd/sessioncode.go`，客户端 = `upstream.NewOAuthHTTPClient`，与 `claude_oauth_service.go` 对齐）取 code，`auth.js` 拿回 code 后照旧换票。缺 kin-worker / kernel config 时退回内置 fetch，那条会报 `authorize_client_attestation` / 面板 `client_attestation_required`（502），立即失败不试来源头。授权链接那条完全在浏览器里发生，页面自己铸证明，不受影响。
+- authorize 的**客户端指纹**才是门槛：claude.ai 前端会给每个改动型请求补 `client_attestation: { hcaptcha_token }`，但闸门量的是传输层——同样的 body/Cookie/出口，Chrome TLS + HTTP/2 客户端能通过，Node/undici 只写 Chrome 头会被判 `400 missing_client_attestation`。因此 cookie 段改由 `kin-worker oauth session-code`（`worker/internal/oauthcmd/sessioncode.go`，客户端 = `upstream.NewOAuthHTTPClient`，与 `claude_oauth_service.go` 对齐）取 code，`auth.js` 拿回 code 后照旧换票。缺 kin-worker / worker.json 时退回内置 fetch，那条会报 `authorize_client_attestation` / 面板 `client_attestation_required`（502），立即失败不试来源头。授权链接那条完全在浏览器里发生，页面自己铸证明，不受影响。
 
 Cookie authorize 的组织 UUID 同时出现在 `/v1/oauth/{uuid}/authorize` 路径和 JSON 的 `organization_uuid` 字段；只有路径 UUID 不够，上游会返回 400 `Invalid request format`。
 
@@ -150,7 +150,7 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 - `five_hour` / `seven_day` utilization 0–100
 - 成功且完整的官方 `/usage`：有 5h、7d，且能确定 Fable 7d 是否存在；有 Fable 即 Max，没有即 Pro。失败、scope 不足、只有 5h 或 CLI 文本不完整都不改套餐
 - Fable `weekly_scoped` → `7d_oi`
-- 同包可带 Sub2API 对照；旧 KIN「窗口滚过后仍 100%」刻度已废弃
+- 旧 KIN「窗口滚过后仍 100%」刻度已废弃
 
 已判定 Pro（完整 usage 无 Fable 模型）的槽只探 5h/7d，不再 hop Fable。完整 usage 一旦列出 Fable，即使 hop 403/401 或落盘 pro 也改判 Max。Fable 不可用、7d_oi、家族冷却 **不**把账号标成整号限制。探测早于 `refreshed_at` 不算整号吊销。
 

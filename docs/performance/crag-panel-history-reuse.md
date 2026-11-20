@@ -15,7 +15,7 @@
 
 快路径要求从 `user` 开始且角色严格交替、内容为非空 typed blocks；相邻同角色、system 回合、需修复的提醒和待清理字段保留原整流。官方透传与修复重试不使用 CRAG hop 的共享复制分支。无工具、单 `user` 文本且不超过 4096 个 UTF-16 码元的短请求仍走旧路径。这不是一次遍历或跳过验证，也不是环境去重、隐式 TTL 修复或 CRAG 准入变更。
 
-Magpie 的 Claude TUI `renderClaudeTurn` / `renderParts` 也按结构化内容边界识别工具结果与其后的用户文字。可借鉴保留块与调用配对的原则，不移植其面向 TUI 的文本拼接或提示补充：vm2api 对 CRAG 保留 typed blocks，由原生运行时负责会话导入。
+vm2api 向 CRAG 传递 typed blocks，保留工具调用与结果的配对，以及结果和随后的用户正文之间的块边界；会话导入由原生运行时负责，不将这些块拼成文本或补充提示。
 
 ## 面板 CPU
 

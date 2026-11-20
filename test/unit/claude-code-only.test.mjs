@@ -308,7 +308,7 @@ test('switch on: health probes are refused, never answered from the probe cache'
     },
   }
   assert.deepEqual(await runProtocol({ routing: ON, body: THIRD_PARTY_BODY, headers: AXIOS, healthMonitor }), BLOCKED)
-  // sub2api's account test carries the CLI banner; even with a full CLI header set it is a probe.
+  // The account probe carries the CLI banner but is still a probe with a full CLI header set.
   const accountTest = {
     model: 'claude-sonnet-5',
     max_tokens: 1024,

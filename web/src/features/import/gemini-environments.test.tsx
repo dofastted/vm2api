@@ -16,7 +16,8 @@ function showGemini(
   const client = new QueryClient()
   client.setQueryData(['panel', 'gemini-environments'], {
     available,
-    payload_state: 'install_on_create',
+    payload_state: 'awaiting_redemption',
+    release_activated: false,
     ...status,
     environments: [
       {
@@ -121,7 +122,7 @@ test('VM details distinguish missing Antigravity files from OAuth host prerequis
 test('Gemini import only displays eligible platform SOCKS5 and leaves inventory management to VM', () => {
   const html = showGemini(true)
   expect(html).toContain('不创建虚拟机')
-  expect(html).toContain('首次创建时自动校验并安装')
+  expect(html).toContain('兑换当前版本的 CRAGGemini 内核')
   expect(html).toContain('Gemini API Key')
   expect(html).toContain('允许的平台代理')
   expect(html).not.toContain('租户代理')
@@ -133,7 +134,6 @@ test('VM page renders Gemini inventory and measured data without treating the ho
   const html = showGemini(true, 'vm')
   expect(html).toContain('Gemini 宿主环境')
   expect(html).toContain('已授权')
-  expect(html).toContain('当前载荷未启用推理')
   expect(html).toContain('缺少官方逐回合结算')
   expect(html).toContain('fixture@example.test')
   expect(html).toContain('fixture-project')

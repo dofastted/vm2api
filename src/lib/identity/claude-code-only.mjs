@@ -1,5 +1,5 @@
 /**
- * routing.compatibility.claude_code_only — sub2api's group `claude_code_only`, made strict.
+ * Strict client-family gate: routing.compatibility.claude_code_only.
  * On: Anthropic-platform models accept only the official Claude Code family.
  * Callers gate on the detected platform first; OpenAI-platform models never reach this.
  */
@@ -128,8 +128,8 @@ function isCliSideQuery(headers, body) {
 
 /**
  * Claude Desktop's fixed gateway sign-in check (4.4212.0): Electron UA, `anthropic-version`,
- * one user turn `.`, `max_tokens` 1 (16 when a local gateway such as Magpie 0.1.2597 raises
- * it), no system/tools/metadata, never streamed. It carries no Claude Code session, so it can
+ * one user turn `.`, `max_tokens` 1 (a local gateway may raise it to 16), no
+ * system/tools/metadata, never streamed. It carries no Claude Code session, so it can
  * never pass the family check; the caller answers it locally without a model call.
  */
 export function isClaudeDesktopConnectionProbe(headers = {}, body = {}) {

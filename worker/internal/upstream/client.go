@@ -57,7 +57,7 @@ func NewHTTPClient(proxyURL string, proxyRequired bool, timeout time.Duration) (
 	return httpClient, nil
 }
 
-// NewOAuthHTTPClient mirrors Sub2API's Claude OAuth transport: Chrome TLS
+// NewOAuthHTTPClient uses Chrome TLS
 // impersonation over the slot-bound SOCKS5 dialer. SetProxyURL is not used —
 // that made req/v3 TCP-dial the proxy and then SOCKS-CONNECT to the proxy
 // itself (pcap 2026-08-19). The impersonate client must Dial through kinproxy

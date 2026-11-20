@@ -719,6 +719,7 @@ export function createPanelHandler(ctx) {
     json: ctx.json,
     readBody: ctx.readBody,
     proxyPool: () => ctx.proxyPool,
+    terminal: ctx.geminiTerminal,
   })
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
@@ -4384,7 +4385,7 @@ export function createPanelHandler(ctx) {
         return await handleVmTestScheduleSync(req, res)
       }
 
-      // POST /api/panel/vms/:id/test-chat — sub2api-style model connectivity test
+      // POST /api/panel/vms/:id/test-chat — test model connectivity through this VM
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/test-chat$/.test(p)) {
         const id = p.split('/')[4]
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
@@ -4448,7 +4449,7 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok({ restored: restored.length }))
       }
 
-      // POST /api/panel/vms/:id/schedulable — sub2api-style schedule toggle
+      // POST /api/panel/vms/:id/schedulable — enable or disable scheduling for this VM
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/schedulable$/.test(p)) {
         const id = p.split('/')[4]
         if (!getVm(cfg.paths.project, id)) {
@@ -6269,7 +6270,7 @@ export function createPanelHandler(ctx) {
         if (!oauth?.access_token && !oauth?.refresh_token && !oauth?.api_key) {
           return json(res, 400, {
             ok: false,
-            error: { code: 'credential_required', message: 'sub2api JSON 需要 access_token、refresh_token 或 api_key' },
+            error: { code: 'credential_required', message: '账号 JSON 需要 access_token、refresh_token 或 api_key' },
           })
         }
         const committed = await commitImportedOauth({

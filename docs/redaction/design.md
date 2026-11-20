@@ -4,7 +4,7 @@
 
 ## 1. 结论与范围
 
-采用 **vm2api 内置能力 + Node 清洗阶段插件 + 本机 Go 算法进程 + Web 控制面板**。Node 负责在既有请求清洗中触发/跳过关键元素脱敏；Go 仅作为受控本机算法实现，不是另一台网关或外部部署目标。不创建通用插件市场，不搬入 AgentDock 整个插件运行时，不用 JS 重写识别规则，不引入云端脱敏调用。
+采用 **vm2api 内置能力 + Node 清洗阶段插件 + 本机 Go helper + Web 控制面板**。Node 负责在既有请求清洗中触发或跳过关键元素脱敏；Go helper 运行仓库内置的脱敏引擎，不是另一台网关或外部部署目标。不创建通用插件市场或运行时，不用 JS 重写识别规则，不引入云端脱敏调用。
 
 用户可通过现有管理设置开启/关闭。默认关闭；关闭时保持原有推理流程，开启时对支持路径中可处理的文本执行本地稳定假名化，回复中可恢复的标签在返回调用方前还原。**开启但处理不可用时拒绝请求，不回落明文。**
 
@@ -102,7 +102,7 @@ flowchart LR
 
 建议新增 `kin-redact`，由控制面 Node 管理，使用仅本机 Unix domain socket，目录 0700、socket 0600；不监听 TCP、不进槽内、不依赖 Go fallback worker 是否启用。复用现有 Unix HTTP 客户端/子进程生命周期模式，不做 HTTP MITM、不改变槽位代理或供应商出口。
 
-Go 核心迁入自身模块合法的 internal 包，保留 MIT 和来源快照身份；只引入实际需要的 publicsuffix 依赖，不复制 AgentDock settings/pluginrt/gui/pii。交付构建与 payload 安装也必须包含 helper，不能只部署 Node 就允许开启。
+仓库内置的 Go 脱敏引擎位于 `redact/internal/engine`，保留 MIT 和来源快照；只引入算法所需的 `publicsuffix` 依赖，不引入设置管理、插件运行时、GUI 或额外的个人信息处理模块。交付构建与 payload 安装也必须包含 helper，不能只部署 Node 就允许开启。
 
 ### 4.2 内部契约（建议，非现有 API）
 

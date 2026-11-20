@@ -802,7 +802,7 @@ test('disconnect_on_error config persists and runtime failure disables slot', ()
 })
 
 test('isShortProbeRequest matches one-shot test calls of any max_tokens', () => {
-  // sub2api account test
+  // One-shot account probe with the CLI banner.
   assert.equal(
     isShortProbeRequest({
       model: 'claude-sonnet-4-5-20250929',
@@ -812,7 +812,7 @@ test('isShortProbeRequest matches one-shot test calls of any max_tokens', () => 
     }),
     true,
   )
-  // new-api channel test
+  // Channel test: one short user turn, no tools.
   assert.equal(isShortProbeRequest({ max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }), true)
   assert.equal(
     isShortProbeRequest({ max_tokens: 32, messages: [{ role: 'user', content: 'verify-session f4: reply OK' }] }),

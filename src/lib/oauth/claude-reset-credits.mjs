@@ -2,8 +2,7 @@
  * Claude native limit-reset credits.
  * Query and redeem go through the slot worker so egress stays on the VM.
  * Grant and organization IDs never leave this module.
- * Mirrors sub2api ClaudeResetCreditService, including the org fence:
- * an unconfirmed claim blocks another redemption until it settles.
+ * Within an organization, an unconfirmed claim blocks another redemption until it settles.
  * Each held grant is exposed as an opaque card ref so the operator can pick
  * which reset to spend (e.g. a Fable reset vs a full reset); without a ref the
  * server's next grant is used, as before.

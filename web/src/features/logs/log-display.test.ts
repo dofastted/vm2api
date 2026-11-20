@@ -215,6 +215,46 @@ describe('display helpers', () => {
     expect(statusBadgeTooltip(200, 'verified', 'worker_timeout')).toBeNull()
   })
 
+  it('does not treat a committed 2xx with a failed terminal as success (#1213)', () => {
+    // A CRAG queue timeout is rejected inside an already-committed stream.
+    expect(statusBadgeClass(200, 'rejected')).not.toContain('bg-green-100')
+    expect(statusBadgeClass(200, 'rejected')).toContain('bg-orange-100')
+    expect(statusBadgeTooltip(200, 'rejected', 'pool_overloaded')).toBe(
+      '被拒绝（pool_overloaded）'
+    )
+    expect(statusBadgeTooltip(200, 'rejected', null)).toBe('被拒绝')
+    for (const state of ['exhausted', 'transport_error', 'error']) {
+      expect(statusBadgeClass(200, state)).not.toContain('bg-green-100')
+      expect(statusBadgeTooltip(200, state, null)).not.toBeNull()
+    }
+  })
+
+  it('keeps successful and unrecorded terminals green (#1213)', () => {
+    // Older rows carry no terminal state; they must not be reclassified.
+    expect(statusBadgeClass(200, null)).toContain('bg-green-100')
+    expect(statusBadgeClass(200, undefined)).toContain('bg-green-100')
+    expect(statusBadgeClass(200)).toContain('bg-green-100')
+    expect(statusBadgeClass(200, 'verified')).toContain('bg-green-100')
+    expect(statusBadgeTooltip(200, null, 'x')).toBeNull()
+    expect(statusBadgeTooltip(200, 'verified', 'x')).toBeNull()
+    // A non-2xx status keeps its own colour regardless of the terminal.
+    expect(statusBadgeClass(503, 'rejected')).toContain('bg-red-100')
+    expect(statusBadgeClass(429, 'rejected')).toContain('bg-yellow-100')
+  })
+
+  it('agrees with chainItemStatus on what counts as a failure (#1213)', () => {
+    for (const state of ['rejected', 'exhausted', 'transport_error', 'error']) {
+      expect(
+        chainItemStatus(attempt({ attemptNumber: 1, terminalState: state }))
+      ).toBe('failure')
+      expect(statusBadgeClass(200, state)).not.toContain('bg-green-100')
+    }
+    expect(
+      chainItemStatus(attempt({ attemptNumber: 1, terminalState: 'verified' }))
+    ).toBe('success')
+    expect(statusBadgeClass(200, 'verified')).toContain('bg-green-100')
+  })
+
   it('styles known and unknown effort levels', () => {
     expect(thinkingEffortBadgeClass('XHigh')).toContain('bg-red-50')
     expect(thinkingEffortBadgeClass('weird')).toContain('bg-muted/40')

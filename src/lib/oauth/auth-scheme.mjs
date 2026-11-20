@@ -1,6 +1,6 @@
 /**
  * Upstream Anthropic auth header: x-api-key vs Authorization: Bearer.
- * Matches sub2api extra.anthropic_apikey_auth_scheme.
+ * Account exports can override it with `extra.anthropic_apikey_auth_scheme`.
  *
  * Defaults: OAuth / official setup-token → Bearer (Claude Console accepts
  * sk-ant-oat01-… this way). Console API key → x-api-key.

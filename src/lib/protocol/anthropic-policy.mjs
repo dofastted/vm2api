@@ -114,7 +114,7 @@ const DUMMY_THINKING_SIGNATURES = new Set(['', 'skip_thought_signature_validator
 
 export function hasUsableThinkingSignature(signature) {
   const value = String(signature || '').trim()
-  // Truncated SSE signatures look present but fail Anthropic checksum (sub2api pre-filter).
+  // Truncated SSE signatures look present but fail the Anthropic checksum.
   if (!value || value.length < 24) return false
   return !DUMMY_THINKING_SIGNATURES.has(value)
 }
@@ -212,13 +212,26 @@ function thinkingLocksSampling(body) {
   }
 }
 
+/** Remove every sampling field; `drop` retries send none of them at all. */
+function stripSampling(body) {
+  for (const key of ['temperature', 'top_p', 'top_k']) {
+    if (Object.prototype.hasOwnProperty.call(body, key)) delete body[key]
+  }
+  return body
+}
+
 /**
  * Anthropic: a thinking request only accepts temperature=1 and rejects
  * top_p / top_k. Real Claude Code sends temperature: 1, so the value is
  * pinned rather than omitted. Illegal values are corrected, never forwarded.
+ *
+ * `drop` is the retry after an upstream refused the sampling fields themselves
+ * rather than their values: pinning temperature=1 would be refused again, so
+ * the mimicry value gives way and the request carries no sampling at all.
  */
-export function alignSamplingWithThinking(body = {}) {
+export function alignSamplingWithThinking(body = {}, { drop = false } = {}) {
   if (!body || typeof body !== 'object') return body
+  if (drop) return stripSampling(body)
   const out = normalizeSamplingRanges(body)
   if (!thinkingLocksSampling(out)) return out
   if (out.temperature !== 1) out.temperature = 1
@@ -229,7 +242,7 @@ export function alignSamplingWithThinking(body = {}) {
 
 /**
  * Drop history thinking blocks Anthropic would reject.
- * Opus / Sonnet / Haiku 5.5 follow sub2api: one invalid block drops the whole
+ * For Opus / Sonnet / Haiku 5.5, one invalid block drops the whole
  * signed chain, including later valid thinking and redacted_thinking. Turns
  * left with no content are dropped. redacted_thinking stays when it carries
  * data on 5.5, otherwise when its signature is usable. The preserve path
@@ -463,10 +476,11 @@ export function sanitizeAnthropicBodyForBetaTokens(body = {}, anthropicBetaHeade
   return downgradeUngatedThinkingDisplay(out, anthropicBetaHeader)
 }
 
-/** sub2api normalizeClaudeOAuthRequestBody defaults (temperature / empty tools). */
-export function ensureClaudeOAuthBodyDefaults(body = {}) {
+/** Fill missing Claude OAuth body defaults for temperature and tools. */
+export function ensureClaudeOAuthBodyDefaults(body = {}, { dropSampling = false } = {}) {
   const out = body && typeof body === 'object' ? body : {}
-  if (out.temperature == null) out.temperature = 1
+  // A drop retry must not refill what the upstream just refused.
+  if (!dropSampling && out.temperature == null) out.temperature = 1
   if (!Array.isArray(out.tools)) out.tools = []
   if (out.tools.length === 0 && out.tool_choice) delete out.tool_choice
   return out
@@ -486,6 +500,7 @@ export function prepareAnthropicRequest(
     cacheTtl = DEFAULT_CACHE_TTL,
     inbound = null,
     preserveThinkingBlocks = false,
+    dropSampling = false,
   } = {},
 ) {
   let out = clone(body)
@@ -511,8 +526,8 @@ export function prepareAnthropicRequest(
   const stripped = stripInvalidThinkingBlocks(out, { preserveThinkingBlocks })
   if (stripped.messages) out.messages = stripped.messages
   out = ensureClearThinkingContextManagement(out)
-  out = alignSamplingWithThinking(out)
-  out = ensureClaudeOAuthBodyDefaults(out)
+  out = alignSamplingWithThinking(out, { drop: dropSampling })
+  out = ensureClaudeOAuthBodyDefaults(out, { dropSampling })
   if (cacheBreakpoints) {
     out = applyCacheBreakpoints(out, { ttl: cacheTtl, config: cacheBreakpoints, inbound })
   }

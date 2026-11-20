@@ -239,9 +239,8 @@ function HealthCacheCard({
       <CardHeader>
         <CardTitle>健康缓存</CardTitle>
         <p className='text-xs text-muted-foreground'>
-          定时用真实槽位跑一次对话并缓存结果。new-api 渠道测试、sub2api
-          账号测试这类 hi / ping 请求直接回放缓存，覆盖
-          Messages、Chat、Responses 的流式和非流式。
+          定时用真实槽位跑一次对话并缓存结果。渠道或账号测试发出的简短 hi / ping
+          探测请求直接回放缓存，覆盖 Messages、Chat、Responses 的流式和非流式。
         </p>
       </CardHeader>
       <CardContent className='divide-y'>

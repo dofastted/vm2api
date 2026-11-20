@@ -16,7 +16,7 @@ test('defaults: setup-token/oauth Bearer, console x-api-key', () => {
   assert.equal(defaultAuthScheme('apikey'), AUTH_SCHEME_X_API_KEY)
 })
 
-test('normalize accepts sub2api extra and aliases', () => {
+test('normalize accepts auth scheme aliases', () => {
   assert.equal(normalizeAuthScheme('authorization_bearer'), AUTH_SCHEME_BEARER)
   assert.equal(normalizeAuthScheme('Authorization-Bearer'), AUTH_SCHEME_BEARER)
   assert.equal(normalizeAuthScheme('x-api-key'), AUTH_SCHEME_X_API_KEY)

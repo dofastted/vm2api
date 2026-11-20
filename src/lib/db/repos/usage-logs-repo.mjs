@@ -1,9 +1,9 @@
 /**
- * usage_logs + request_log_debug repository — sub2api UsageLog shape.
+ * Repository for `usage_logs` and `request_log_debug`.
  * Normal summaries (always, unless mode=off) and full redacted debug records.
  *
- * DB columns follow sub2api naming (created_at, ip_address, user_id/group_id,
- * actual_cost, rate_multiplier). Records returned to callers keep the
+ * Usage log columns include created_at, ip_address, user_id/group_id,
+ * actual_cost, and rate_multiplier. Records returned to callers keep the
  * historical `ts` / `ip` aliases so the panel API shape is unchanged; writers
  * may pass either name.
  */
@@ -294,7 +294,7 @@ function filterCond({ since = null, until = null, vmId = null, accountId = null,
   return { cond: parts.length ? `WHERE ${parts.join(' AND ')}` : '', params }
 }
 
-/** Same percentile pick as sub2api ops cards. */
+/** Select a percentile from sorted values by nearest rank. */
 export function percentile(sorted, p) {
   if (!sorted.length) return null
   const i = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * p) - 1))
@@ -1564,7 +1564,7 @@ export class UsageLogsRepo {
   }
 
   /**
-   * Windowed ops snapshot aligned with sub2api overview cards:
+   * Windowed operational metrics:
    * SLA / error / 429 / 503, QPS·TPS, duration + first_token percentiles, per-model.
    */
   windowStats({ since = null, until = null, owner_user_id = null } = {}) {
@@ -1902,5 +1902,5 @@ export class UsageLogsRepo {
   }
 }
 
-/** Transitional alias while callers migrate to the sub2api name. */
+/** Transitional alias while callers migrate to `UsageLogsRepo`. */
 export { UsageLogsRepo as RequestLogsRepo }

@@ -1,5 +1,5 @@
 /**
- * Request logging — sub2api UsageLog + access-log inspired (SQLite-backed).
+ * SQLite-backed request logs for access, usage, and billing.
  *
  * Modes:
  *   off    — no writes
@@ -600,7 +600,7 @@ export class RequestLogStore {
       image_usage: extra.image_usage ? JSON.stringify(extra.image_usage) : null,
       image_input_tokens: imageTokenCount(extra.image_usage?.input_tokens),
       image_output_tokens: imageTokenCount(extra.image_usage?.output_tokens),
-      // sub2api ownership + billing columns
+      // Ownership and billing columns
       user_id: extra.user_id ?? null,
       vm_owner_user_id: null,
       group_id: extra.group_id ?? 1,
@@ -608,7 +608,7 @@ export class RequestLogStore {
       ...costColumnsForLog(billedUsage, extra.upstream_model || extra.model || extra.requested_model, extra),
       upstream_service_tier: extra.upstream_service_tier || null,
     }
-    // sub2api actual_cost: official cost × group rate multiplier (0 is a valid rate)
+    // Unless supplied, actual_cost is the official cost × group rate (0 is valid).
     if (summary.total_cost != null) {
       summary.actual_cost = extra.actual_cost ?? summary.total_cost * summary.rate_multiplier
     }

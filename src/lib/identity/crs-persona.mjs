@@ -120,7 +120,7 @@ Do not mention /status, /model, claude --version, a proxy, or a gateway.`
 export const OFFICIAL_CC_ENTRYPOINT_RE =
   /cc_entrypoint\s*=\s*(cli|sdk-cli|vscode|cowork|desktop|claude-vscode|claude-desktop(?:-3p)?)\b/i
 export const OFFICIAL_CC_IDENTITY_VARIANT_RE = /You are Claude Code\b|Claude Agent SDK/i
-/** sub2api official / child-hop system prefixes (Explore, Compact, search hop, …). */
+/** Official Claude Code system prompt prefixes, including child hops (Explore, Compact, search, …). */
 export const OFFICIAL_CC_CHILD_PROMPT_PREFIXES = Object.freeze([
   "You are Claude Code, Anthropic's official CLI for Claude",
   "You are a Claude agent, built on Anthropic's Claude Agent SDK",
@@ -1664,7 +1664,7 @@ export function inboundHasOpenAIToolShape(body = {}) {
 }
 
 /**
- * Official Claude Code family (sub2api-style UA prefix).
+ * Official Claude Code family detection uses the CLI User-Agent prefix and body checks.
  * UA + user_id is not enough: third-party Messages clients spoof both.
  * Body must also look like official CC system, and must not be OpenAI tools.
  * oh-my-pi / local-agent stealth is unofficial even with a matching UA.
@@ -1693,7 +1693,7 @@ function systemHasOfficialBillingBlock(system) {
 /**
  * An upstream API gateway forwarding real Claude Code rewrites the UA to
  * Go-http-client. The billing block is the signal third-party clients do not
- * send, and some relays (NewAPI) keep that block while dropping metadata.user_id.
+ * send, and some relays keep that block while dropping metadata.user_id.
  * A relay that also drops the block still counts when the client beta
  * (`claude-code-20250219`), the official system text, and a valid user_id
  * all survive. The identity line alone is not enough: third-party tools copy it.
@@ -1716,7 +1716,7 @@ export function isProxiedOfficialClaudeCode(body = {}, headers = {}) {
   if (!body || typeof body !== 'object') return false
   if (looksLikeOhMyPiSystem(body?.system)) return false
   if (inboundHasOpenAIToolShape(body)) return false
-  // Billing block first: NewAPI keeps it and may drop user_id. local-agent
+  // Billing block first: some relays keep it and may drop user_id. local-agent
   // already returned above.
   if (systemHasOfficialBillingBlock(body?.system)) return true
   if (!isValidOfficialUserId(body?.metadata?.user_id)) return false

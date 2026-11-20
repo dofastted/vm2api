@@ -20,7 +20,7 @@ import (
 // transport (`upstream.NewOAuthHTTPClient`): claude.ai answers a Node/undici
 // request that only *claims* to be Chrome with
 // `400 invalid_request_error: missing_client_attestation`, while the same
-// request over Sub2API's ImpersonateChrome transport is accepted.
+// request over the Chrome TLS transport is accepted.
 const (
 	sessionCodeTimeout  = 60 * time.Second
 	sessionCodeMaxBody  = 4 << 20
@@ -132,6 +132,11 @@ func sessionCodeClient(cfg config.Config) (*http.Client, error) {
 	if cfg.EgressMode == "transparent" {
 		return upstream.NewTransparentOAuthHTTPClient(sessionCodeTimeout)
 	}
+	if strings.TrimSpace(cfg.ProxyURL) == "" {
+		// NewOAuthHTTPClient would hand back a client that refuses every dial,
+		// which reads as "upstream transport failed"; name the real reason.
+		return nil, errors.New("slot proxy is required")
+	}
 	return upstream.NewOAuthHTTPClient(cfg.ProxyURL, cfg.ProxyRequired, sessionCodeTimeout)
 }
 
@@ -228,7 +233,7 @@ func doOAuthRequest(ctx context.Context, client *http.Client, method, target, se
 	if err != nil {
 		return 0, nil, err
 	}
-	// Sub2API's browser headers. The Chrome UA/H2 fingerprint comes from the
+	// Browser headers. The Chrome UA/H2 fingerprint comes from the
 	// transport; a hand-written UA is what got the attestation gate.
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")

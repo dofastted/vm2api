@@ -259,12 +259,12 @@ func withModel(o Options, texts []string) Options {
 // cur().values where the rules masked 17, most of them wrongly: the count in
 // each turn's <total_tokens>14983666 tokens left</total_tokens> as an
 // account, a run's id as a phone, "Claude" and "Opus 5.5" in the system
-// prompt as people, /Users/yetone's folder as a person, the tail of
+// prompt as people, /Users/alice's folder as a person, the tail of
 // toolu_01… and req_011C… as a name or a secret, a grep pattern as a
 // secret. Each goes as written now:
 //   - a piece cut out of a longer word, whatever its kind;
 //   - a name with a digit, a slash, an @ or a file's dot in it, all in
-//     lower case (magpie, claude-in-chrome), a path's part, or an
+//     lower case (the redactor's name or claude-in-chrome), a path's part, or an
 //     assistant's or a model's own (Claude, Codex, Haiku 4.5);
 //   - an account that is a commit's hash, a version, or a number with
 //     nothing before it to say it is an account's; a phone number that is
@@ -292,7 +292,7 @@ func withModel(o Options, texts []string) Options {
 //     a word the text also has as a host's name (Greptile, app.greptile.com).
 //
 // A name's words each start with a capital, but for the particles names
-// have (van, de, bin): "local LLM", "User yetone" and claudeKeychain are
+// have (van, de, bin): "local LLM", "User alice" and claudeKeychain are
 // a program's or a log's words.
 func modelFits(s string, a, b int, kind string) bool {
 	if a > 0 && wordByte(s[a-1]) && wordByte(s[a]) || b < len(s) && wordByte(s[b-1]) && wordByte(s[b]) {
@@ -355,7 +355,7 @@ func personFits(s string, a, b int, v string) bool {
 			return false
 		}
 	}
-	// a path's part: /Users/yetone, ~/.orca/
+	// a path's part: /Users/alice, ~/.orca/
 	if a > 0 && (s[a-1] == '/' || s[a-1] == '\\' || s[a-1] == '.' && a > 1 && (s[a-2] == '/' || s[a-2] == '\\')) || b < len(s) && (s[b] == '/' || s[b] == '\\') {
 		return false
 	}

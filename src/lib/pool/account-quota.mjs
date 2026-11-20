@@ -823,7 +823,7 @@ export class AccountQuota {
     return { ok: true, release: () => this.release(accountId, token), token }
   }
 
-  /** sub2api 7d_oi: Fable-only window. Does not unschedulable the account. */
+  /** The `7d_oi` window limits Fable only; it does not block account scheduling. */
   fableWindowLimited(accountId, now = Date.now(), account = undefined) {
     const oi = (account === undefined ? this.repo.get(accountId) : account)?.unified?.['7d_oi']
     if (!oi) return false

@@ -875,7 +875,7 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
   )
 }
 
-/** 查看统计：近 30 天用量的可视化面板，版式参照 sub2api 的 AccountStatsModal。 */
+/** 查看近 30 天用量的可视化面板。 */
 export function VmStatsDialog({
   vm,
   accounts,

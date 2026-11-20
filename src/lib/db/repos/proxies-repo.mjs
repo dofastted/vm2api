@@ -52,7 +52,7 @@ const COLUMNS = [
 
 function rowToProxy(row) {
   if (!row) return null
-  // ProxyPool still speaks `scheme`; the column is sub2api's `protocol`.
+  // ProxyPool uses `scheme`; the stored column is `protocol`.
   return { ...row, scheme: row.protocol, enabled: !!row.enabled, domain_forward: !!row.domain_forward }
 }
 

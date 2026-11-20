@@ -8,9 +8,8 @@
  *                   passthrough: official Claude Code keeps the caller
  *                   session; unofficial hashes the caller token. With no
  *                   caller session, derive a UUID from account + client +
- *                   first user identity text (first non-reminder block;
- *                   sub2api buildStableSessionSeed). Never
- *                   randomUUID while any of those anchors exist. A sticky
+ *                   first user identity text (first non-reminder block).
+ *                   Never use a random UUID while any of those anchors exist. A sticky
  *                   row for the same VM reuses the id it already stored.
  *                   Outbound always has a session. Email never goes in
  *                   metadata.user_id (Anthropic 400 has_at).
@@ -64,7 +63,6 @@ const SESSION_UA_VERSION = /\bv?\d+(?:\.\d+){1,3}\b/g
 
 /**
  * Product names only, sorted. CLI version bumps must not mint a new session.
- * Same rule as sub2api NormalizeSessionUserAgent.
  */
 export function normalizeSessionUserAgent(raw) {
   const text = String(raw || '').trim()

@@ -1,8 +1,8 @@
 /**
- * Public console landing. Layout and palette follow the newapi web/default
- * home page (floating header, gradient hero with API demo, bento features,
- * three steps, CTA); tokens are scoped by `.welcome-theme` so the console
- * keeps its own theme. After sign-in the live setup checklist sits under the hero.
+ * Public console landing: floating header, gradient hero with an API demo,
+ * bento features, three steps, and a CTA. Tokens are scoped by
+ * `.welcome-theme` so the console keeps its own theme. After sign-in the live
+ * setup checklist sits under the hero.
  */
 import { useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
