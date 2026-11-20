@@ -45,7 +45,7 @@ const PERIODS: { id: StatsRange; label: string; empty: string }[] = [
 const SCOPE_LABELS: Record<LeaderboardScope, string> = {
   user: '用户',
   key: '密钥',
-  vm: '供应商',
+  vm: '虚拟机',
   model: '模型',
 }
 
