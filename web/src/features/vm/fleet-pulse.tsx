@@ -283,7 +283,7 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title='今日消耗'
+        title='今日消耗 · 北京时间'
         className='xl:col-span-2'
         meta={
           <span className='text-[11px] text-muted-foreground tabular-nums'>
