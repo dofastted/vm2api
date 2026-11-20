@@ -15,8 +15,8 @@ import { statisticsQueryOptions, usageOverviewQueryOptions } from './queries'
 type HistoryRange = Exclude<StatsRange, 'today'>
 
 const HISTORY_RANGES: { id: HistoryRange; label: string }[] = [
-  { id: '7days', label: '7天' },
-  { id: '30days', label: '30天' },
+  { id: '7days', label: '近 7 天（含今天）' },
+  { id: '30days', label: '近 30 天（含今天）' },
   { id: 'thisMonth', label: '本月' },
 ]
 
@@ -170,7 +170,7 @@ export function TenantUsage({ tz }: { tz: string }) {
       <BentoCard>
         <div className='mb-3 flex flex-wrap items-start justify-between gap-2'>
           <div>
-            <h3 className='text-sm font-semibold'>历史用量</h3>
+            <h3 className='text-sm font-semibold'>区间用量</h3>
             <p className='text-xs text-muted-foreground'>
               同一组参数，按所选窗口合计
             </p>
