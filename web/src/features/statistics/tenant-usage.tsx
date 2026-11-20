@@ -198,7 +198,7 @@ export function TenantUsage({ tz }: { tz: string }) {
         {historySnapshot ? (
           <ParameterGrid snapshot={historySnapshot} />
         ) : past.isError ? (
-          <p className='text-sm text-muted-foreground'>历史用量加载失败</p>
+          <p className='text-sm text-muted-foreground'>区间用量加载失败</p>
         ) : (
           <LoadingGrid />
         )}

@@ -51,7 +51,7 @@ function chart(cost: number): StatisticsData {
 }
 
 function historyCard(html: string) {
-  const history = html.split('历史用量')[1]
+  const history = html.split('区间用量')[1]
   expect(history).toEqual(expect.any(String))
   return history
 }
