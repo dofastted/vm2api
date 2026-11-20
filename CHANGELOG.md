@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Gemini 宿主部署支持签名的 `0.3.0-rc.2`；配置安装源时，安装命令会先验证并落地载荷，再报告成功。已授权的 Google 账号可从详情页点「启动 Gemini」，打开走绑定代理的 Antigravity CLI 终端，不影响公共推理和计费。
+- Gemini 终端仅在启动时识别 Google OAuth 菜单；会话中的同样文本不再断开终端或改写账号授权状态。
+
 ## 1.4.167 — 2026-11-20 · 共享出口产物修正
 
 - 修正 amd64 `kin-egress` 的锁定产物。`release.yml` 只在 ARM64 分支从 `worker/` 源码编 Go helper，amd64 的 helper 取自 `deploy/payload.json` 锁定的产物，因此 1.4.166 发出的是「控制面带共享出口、helper 还是改动之前的版本」这一组合：第一台 VM 折叠时 helper 在 `unsupported proxy scheme ""` 上崩溃循环。锁定改为 `payload-2026.11.20-shared-egress`，只换 `bin/kin-egress` 一项，其余 23 个文件重算后字节一致。判断主机上的产物是否够新：`strings -a /opt/vm2api/bin/kin-egress | grep -c 'no route for source'`，0 即为旧产物（#1369）。

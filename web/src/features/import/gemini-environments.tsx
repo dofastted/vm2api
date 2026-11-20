@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Progress } from '@/components/ui/progress'
+import { WsTerminal } from '@/components/ws-terminal-lazy'
 
 const ROOT = '/api/panel/gemini'
 const QUERY_KEY = ['panel', 'gemini-environments'] as const
@@ -343,6 +344,51 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
   )
 }
 
+function GeminiTerminal({
+  environmentId,
+  busy,
+}: {
+  environmentId: string
+  busy: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const resource = `${ROOT}/environments/${encodeURIComponent(environmentId)}`
+  const terminalId = `gemini-terminal-${environmentId}`
+
+  return (
+    <div className='min-w-0 space-y-2 border-t pt-3'>
+      <div className='flex flex-wrap items-center gap-x-3 gap-y-2'>
+        <Button
+          type='button'
+          variant='outline'
+          disabled={busy && !open}
+          aria-expanded={open}
+          aria-controls={open ? terminalId : undefined}
+          onClick={() => setOpen((current) => !current)}
+        >
+          {open ? '关闭 Gemini 终端' : '启动 Gemini'}
+        </Button>
+        <p className='text-sm text-muted-foreground'>
+          通过绑定代理以 Plan 模式运行 Antigravity CLI，不启用 API 推理。
+        </p>
+      </div>
+      {open ? (
+        <div
+          id={terminalId}
+          role='region'
+          aria-label='Gemini 终端'
+          className='h-[min(420px,65dvh)]'
+        >
+          <WsTerminal
+            ticketPath={`${resource}/terminal-ticket`}
+            socketPath={`${resource}/terminal/ws`}
+          />
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 export function geminiInventoryOptions() {
   return queryOptions({
     queryKey: QUERY_KEY,
@@ -470,6 +516,13 @@ export function GeminiEnvironments({
   const environment = inventory.data.environments.find(
     (item) => item.id === selectedId
   )
+  const terminalUnavailable =
+    environment?.proxy_ready === false
+      ? '绑定的 IPv4 SOCKS5 代理不可用。'
+      : geminiPayloadIssue(inventory.data) ||
+        (inventory.data.oauth_runtime_issue
+          ? OAUTH_ISSUES[inventory.data.oauth_runtime_issue]
+          : null)
 
   return (
     <section className='max-w-3xl space-y-4' aria-label='Gemini 宿主环境'>
@@ -662,6 +715,20 @@ export function GeminiEnvironments({
               </Button>
             )}
           </div>
+          {environment.auth_method === 'oauth' &&
+          environment.auth_state === 'authorized' ? (
+            terminalUnavailable ? (
+              <p role='status' className='text-sm text-muted-foreground'>
+                暂时无法启动 Gemini：{terminalUnavailable}
+              </p>
+            ) : (
+              <GeminiTerminal
+                key={environment.id}
+                environmentId={environment.id}
+                busy={operation.isPending}
+              />
+            )
+          ) : null}
           {challenge?.id === environment.id &&
           environment.auth_state === 'authorizing' ? (
             <form

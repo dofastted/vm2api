@@ -69,7 +69,7 @@ usage() {
   crag-update          独立更新 CRAG V2 包及全部既有 CRAG 副本，不切换槽位内核
   prepare-native       仅准备 Docker CRAG 的宿主 AppArmor userns 权限
   prepare-crag-host    仅准备 CRAG 订阅宿主 ID，不重启服务
-  prepare-gemini       启用宿主 Gemini 服务，签名载荷在首次创建环境时安装
+  prepare-gemini       启用宿主 Gemini 服务并校验、安装已配置的签名载荷
   check                对比当前版本与最新 Release，打印 changelog
   changelog            打印本地 CHANGELOG.md
   status               当前版本、容器、探活
@@ -599,6 +599,10 @@ prepare_gemini_host() {
   for dependency in systemctl node python3; do
     command -v "$dependency" >/dev/null || { err "Gemini 宿主机缺少 $dependency"; return 1; }
   done
+  if [ -n "$source" ] && ! command -v curl >/dev/null; then
+    err "Gemini 宿主机缺少 curl，无法请求初始化签名载荷"
+    return 1
+  fi
   if ! systemctl show --property=Version --value >/dev/null; then
     err "Gemini 宿主服务需要正在运行的 systemd；请在 Linux 宿主机上执行，不要在控制面容器内执行"
     return 1
@@ -635,8 +639,26 @@ prepare_gemini_host() {
     install -m 644 "${staging}/vm2api-gemini.service" /etc/systemd/system/vm2api-gemini.service || exit 1
     systemctl daemon-reload && systemctl enable vm2api-gemini.service && systemctl restart vm2api-gemini.service
   ) || { err "Gemini 宿主服务未就绪，请检查 journalctl -u vm2api-gemini.service"; return 1; }
-  if [ -n "$source" ]; then env_set VM2API_GEMINI_PAYLOAD_SOURCE "$source" || return 1; fi
-  ok "Gemini 控制 socket 已就绪；签名载荷与 OAuth 启动条件请在面板检查"
+  if [ -n "$source" ]; then
+    local result version
+    result="$(curl -sS --noproxy '*' --max-time 45 --unix-socket /run/vm2api-gemini/control.sock \
+      -H 'Content-Type: application/json' --data '{}' http://localhost/install-payload)" || {
+      err "无法通过 Gemini 控制 socket 请求签名载荷初始化"
+      return 1
+    }
+    version="$(printf '%s' "$result" | node -e '
+      const data = JSON.parse(require("node:fs").readFileSync(0, "utf8"))
+      if (/^[0-9A-Za-z.-]+$/.test(data.version ?? "")) console.log(data.version)
+      else {
+        if (/^gemini_[a-z_]+$/.test(data.code ?? "")) console.error(data.code)
+        process.exitCode = 1
+      }
+    ')" || { err "Gemini 签名载荷未就绪，请检查安装源、公钥和 journalctl -u vm2api-gemini.service"; return 1; }
+    env_set VM2API_GEMINI_PAYLOAD_SOURCE "$source" || return 1
+    ok "Gemini 控制 socket 与签名载荷 ${version} 已就绪；CLI 出口状态请在面板检查"
+  else
+    ok "Gemini 控制 socket 已就绪；签名载荷与 CLI 出口状态请在面板检查"
+  fi
 }
 
 # 从 COMPOSE_FILE 去掉源码 ARM64 override 段，保留其它 overlay；全去掉后只剩 docker-compose.yml。
