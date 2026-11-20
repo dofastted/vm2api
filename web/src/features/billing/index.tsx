@@ -127,7 +127,13 @@ export function BillingPage() {
           </div>
         ) : null}
         {visible.length === 0 ? (
-          <EmptyState reason='暂无计费数据' />
+          <EmptyState
+            reason={
+              groupBy === 'vm' && platform !== 'all'
+                ? '当前筛选未显示计费明细'
+                : '暂无计费数据'
+            }
+          />
         ) : (
           <Table>
             <TableHeader>
