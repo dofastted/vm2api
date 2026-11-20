@@ -148,6 +148,35 @@ function panel(root, { ops, subscription, routing = {}, ...extra } = {}) {
   }
 }
 
+test('master CRAG update uses the existing install job without booting a stopped slot', async (t) => {
+  const { root, vm } = fixture(t, { vm: { status: 'stopped' } })
+  const payload_tag = 'payload-2026.11.20-crag-3.1.8'
+  const runDir = path.join(root, 'run')
+  fs.mkdirSync(runDir)
+  const request = panel(root, {
+    ops: {
+      describeKernelCatalog: () => [{ id: 'crag', ready: true, payload_tag }],
+      checkCragLicense: () => ({ ok: true }),
+      stopSlot: () => ({ ok: true }),
+      suspendVmRuntimeRestart: () => ({ ok: true }),
+      materializeResolvedKernel: () => ({ ok: true }),
+      initializeSlotSeedFiles: () => {},
+      writeKernelConfig: () => ({ configPath: '/tmp/kernel.json', runDir: path.join(root, 'run') }),
+      startSlotReady: () => assert.fail('脚本更新不能启动已停止的槽'),
+    },
+  })
+  const targets = [{ id: vm.id, kernel: 'crag', payload_tag }]
+  const queued = await request('POST', '/kernels/crag-update', { targets, background: true })
+  assert.equal(queued.status, 202)
+  await new Promise((resolve) => setImmediate(resolve))
+  const job = await request('GET', `/kernels/install?job_id=${queued.body.data.job_id}`)
+  assert.equal(job.status, 200)
+  assert.equal(job.body.data.state, 'completed')
+  assert.equal(job.body.data.report.ok, true, JSON.stringify(job.body.data.report))
+  assert.equal(job.body.data.report.items[0].payload_tag, payload_tag)
+  assert.equal(getVm(root, vm.id).status, 'stopped')
+})
+
 for (const entry of ['slot', 'targets', 'default']) {
   linuxTest(`explicit ${entry} CRAG to cli-node switch releases its H2 binding before restarting`, async (t) => {
     const { root, vm } = fixture(t, { inherited: entry === 'default' })
@@ -449,7 +478,13 @@ for (const all of [false, true]) {
 linuxTest('install API can release a seat without granting subscription authorization privileges', async (t) => {
   const { root, vm } = fixture(t)
   const life = operations(root)
-  life.subscription.authorizeInstall = () => assert.fail('API key requests cannot authorize a new subscription binding')
+  // Deploy (fix/crag-master-bind): the master key may bind a seat, so the CRAG
+  // install reaches authorizeInstall; the fixture refuses it there.
+  let authorized = 0
+  life.subscription.authorizeInstall = () => {
+    authorized += 1
+    throw Object.assign(new Error('fixture refuses the binding'), { code: 'license_required' })
+  }
   const response = await panel(root, life)('POST', '/kernels/install', { targets: [{ id: vm.id, kernel: 'cli-node' }] })
   assert.equal(response.body.data.ok, true, JSON.stringify(response.body))
   assert.deepEqual(life.events, ['stop', 'release', 'start'])
@@ -460,6 +495,7 @@ linuxTest('install API can release a seat without granting subscription authoriz
   })
   assert.equal(unauthorized.body.data.ok, false)
   assert.equal(unauthorized.body.data.items[0].code, 'license_required')
+  assert.equal(authorized, 1)
   assert.deepEqual(life.events, ['stop', 'release', 'start'])
 })
 

@@ -40,6 +40,27 @@ const baseFor = (root, kernel) =>
 const archFor = (kernel) => (kernel === 'crag' ? cragV2Arch() : 'amd64')
 const CRAG_PINNED_RELEASES = [
   {
+    tag: 'payload-2026.11.20-crag-3.1.10',
+    label: '3.1.10 遥测修复',
+    size: 171058868,
+    manifestSha256: '1e78af225e07e2b4adf0ba6074f32c313b725f5a15ae7156735622bf5ecbd71b',
+    sha256: 'faafd0011dbfd8d4d136eaf3056b57520d5e00777f37bd2d864edc81b4c49026',
+  },
+  {
+    tag: 'payload-2026.11.20-crag-3.1.9',
+    label: '3.1.9 子代理槽位调度',
+    size: 170999424,
+    manifestSha256: 'aa67bb6214d3931a73cfbcfcdb8327d510cacb7ed8a83c006464a41563fa6c2c',
+    sha256: '68fe21ab5f1f19cb3482749a63a37d71328eaad967ede3ccff03337a54291614',
+  },
+  {
+    tag: 'payload-2026.11.20-crag-3.1.8',
+    label: '3.1.8 账号变更续接恢复',
+    size: 170992580,
+    manifestSha256: '8efbbf765967631a5c5d1f1c809f34264c1acd945b08db61d0aecbbf9ca93822',
+    sha256: '890b7d5bbfbac5ad4d1c01a70df0f549ce2e739d3a5f2d52c2954a8ba95e7c87',
+  },
+  {
     tag: 'payload-2026.11.19-crag-3.1.7',
     label: '3.1.7 固定 CLI 入口',
     size: 171009876,

@@ -719,6 +719,7 @@ export function createPanelHandler(ctx) {
     json: ctx.json,
     readBody: ctx.readBody,
     proxyPool: () => ctx.proxyPool,
+    terminal: ctx.geminiTerminal,
   })
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
@@ -3122,14 +3123,15 @@ export function createPanelHandler(ctx) {
           panel.ok({ kernel: result.kernel, ...(result.release ? { release: result.release } : {}) }),
         )
       }
-      if (req.method === 'POST' && p === '/api/panel/kernels/install') {
+      if (req.method === 'POST' && ['/api/panel/kernels/install', '/api/panel/kernels/crag-update'].includes(p)) {
         const body = await readBody(req, 32 * 1024)
         const selection = validateKernelTargets(cfg.paths.project, body?.targets)
         if (!selection.ok)
           return json(res, selection.status, { ok: false, error: { code: selection.code, message: selection.error } })
         const identity = panelIdentity(req)
         const mayBindSubscription =
-          !req.apiKeyKind && identity.role === 'admin' && !!identity.user && sameOriginPost(req, cfg.base_url)
+          req.apiKeyKind === 'master' ||
+          (!req.apiKeyKind && identity.role === 'admin' && !!identity.user && sameOriginPost(req, cfg.base_url))
         if (!mayBindSubscription && body.targets.some((target) => target.reissue === true)) {
           return json(res, 403, {
             ok: false,
@@ -3140,10 +3142,20 @@ export function createPanelHandler(ctx) {
         if (body.targets.some((target) => userMissesVmId(req, cfg.paths.project, target.id))) {
           return json(res, 403, { ok: false, error: { code: 'forbidden', message: '无权管理所选虚拟机' } })
         }
+        const updateExisting = p === '/api/panel/kernels/crag-update'
+        if (
+          updateExisting &&
+          body.targets.some((target) => target.kernel !== 'crag' || !(target.payload_tag || target.expected_tag))
+        ) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'kernel_target_invalid', message: '更新必须指定 CRAG 发行版本' },
+          })
+        }
         const install = () =>
           installKernelTargets({
             projectRoot: cfg.paths.project,
-            targets: body.targets,
+            targets: body.targets.map((target) => ({ ...target, update_existing: updateExisting })),
             routing: ctx.routingConfig,
             watchdog: ctx.kernelWatchdog,
             poolScheduler: ctx.poolScheduler,
@@ -3800,7 +3812,11 @@ export function createPanelHandler(ctx) {
               },
             })
           }
-          if (online && (req.apiKeyKind || !panelIdentity(req).user || !sameOriginPost(req, cfg.base_url))) {
+          if (
+            online &&
+            req.apiKeyKind !== 'master' &&
+            (req.apiKeyKind || !panelIdentity(req).user || !sameOriginPost(req, cfg.base_url))
+          ) {
             return json(res, 403, {
               ok: false,
               error: { code: 'license_redeem_origin', message: 'Same origin required.' },
@@ -5725,7 +5741,8 @@ export function createPanelHandler(ctx) {
         const id = p.split('/')[4]
         const identity = panelIdentity(req)
         const bindSubscription =
-          !req.apiKeyKind && identity.role === 'admin' && !!identity.user && sameOriginPost(req, cfg.base_url)
+          req.apiKeyKind === 'master' ||
+          (!req.apiKeyKind && identity.role === 'admin' && !!identity.user && sameOriginPost(req, cfg.base_url))
         const started = await withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), async () => {
           const result = await powerOnSlot({
             projectRoot: cfg.paths.project,

@@ -6,7 +6,7 @@ import { Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 
 export const AGY_SHA256 = '39816d49d5ab92229952987225c23ea3fed7580699dcb4a444e0388e0ac1ce43'
-const GEMINI_PAYLOAD_VERSION = '0.3.0-rc.1'
+const GEMINI_PAYLOAD_VERSIONS = new Set(['0.3.0-rc.1', '0.3.0-rc.2'])
 const FILES = new Map([
   ['craggemini', 0o755],
   ['libagy_bridge.so', 0o644],
@@ -57,7 +57,7 @@ export async function readSignedGeminiManifest(source, publicKey) {
   if (
     manifest?.schema !== 1 ||
     manifest.platform !== 'linux-amd64' ||
-    manifest.version !== GEMINI_PAYLOAD_VERSION ||
+    !GEMINI_PAYLOAD_VERSIONS.has(manifest.version) ||
     !Array.isArray(manifest.files) ||
     manifest.files.length !== FILES.size
   ) {

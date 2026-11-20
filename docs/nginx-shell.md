@@ -1,24 +1,25 @@
 # 终端 WebSocket 排查
 
-集群页终端和 VM 详情「运维」终端都是浏览器 WebSocket。nginx 没把 `Upgrade` 原样交给 Node 时，面板显示「已断开」或「连接失败」，xterm 资源本身可以是 200。
+集群页、VM 详情「运维」和 Gemini 账号详情「启动 Gemini」都通过浏览器 WebSocket 打开终端。nginx 没把 `Upgrade` 原样交给 Node 时，面板显示「已断开」或「连接失败」，xterm 资源本身仍可能是 200。
 
-两条路径：
+终端路径：
 
 | 页面 | 路径 |
 |---|---|
 | 集群节点 | `/api/panel/cluster/nodes/<id>/shell` |
 | 槽运维 | `/api/panel/vms/<id>/shell` |
+| Gemini | `/api/panel/gemini/environments/<id>/terminal/ws` |
 
-鉴权不走 `Authorization`。面板先 `POST` 对应的 `shell-ticket`（30 秒、一次性），再把 `ticket` 放在 WebSocket 查询串上。ticket 用过或过期再握一次手，401 是正常的。
+握手不使用 `Authorization`。面板先 `POST` 对应的 `shell-ticket`（Gemini 使用 `terminal-ticket`），再把短时、一次性的 `ticket` 放在 WebSocket 查询串上。ticket 用过或过期再握手，返回 401。
 
 ## 正确反代
 
-shell 的 `location` 必须写在会设置 `Connection ""` 的 `location /` 或 `location /api/` **前面**。`Connection ""` 会剥掉 `Upgrade`，后面的 Node 收不到 101。
+终端的 `location` 必须匹配相应路径，而不是落入设置 `Connection ""` 的 `location /` 或 `location /api/`。`Connection ""` 会剥掉 `Upgrade`，Node 收不到握手请求。
 
 只有 Node、没有前门时，`proxy_pass` 指 Node（Compose 默认 `:8787`）：
 
 ```nginx
-location ~ ^/api/panel/(cluster/nodes|vms)/[^/]+/shell$ {
+location ~ ^/api/panel/((cluster/nodes|vms)/[^/]+/shell|gemini/environments/[^/]+/terminal/ws)$ {
     proxy_pass http://127.0.0.1:8787;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
@@ -33,7 +34,7 @@ location ~ ^/api/panel/(cluster/nodes|vms)/[^/]+/shell$ {
 生产机前面还有 Go 前门 `:8787`，Node 在 `:8788`。前门会丢掉 `Upgrade`。shell 必须直连 Node，不要指 `:8787`：
 
 ```nginx
-location ~ ^/api/panel/(cluster/nodes|vms)/[^/]+/shell$ {
+location ~ ^/api/panel/((cluster/nodes|vms)/[^/]+/shell|gemini/environments/[^/]+/terminal/ws)$ {
     proxy_pass http://127.0.0.1:8788;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
@@ -46,8 +47,6 @@ location ~ ^/api/panel/(cluster/nodes|vms)/[^/]+/shell$ {
     proxy_send_timeout 3600s;
 }
 ```
-
-只写 `cluster/nodes` 时，集群终端正常，槽运维终端失败。1.3.92 起两条都要覆盖。
 
 改完 `nginx -t`，然后 `systemctl reload nginx`。不要为此重启 `kin-gateway`。
 
@@ -67,7 +66,7 @@ curl -sk -D - -o /dev/null \
 |---|---|
 | `101 Switching Protocols` | nginx 已把 Upgrade 交给 Node |
 | `401`，`Connection: keep-alive`，正文 `missing_api_key` | 没进 shell location，落到了普通 `/api/`。Go 前门或 Node 把它当成要登录的 HTTP 请求 |
-| `401`，且 location 已匹配 | ticket 空、过期或用过。重新 `POST .../shell-ticket` |
+| `401`，且 location 已匹配 | ticket 空、过期或用过。重新申请对应终端的 ticket |
 | `502` / `504` | `proxy_pass` 指错端口，或 Node 没在听 |
 
 再确认实际生效的是哪一段：

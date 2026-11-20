@@ -1,6 +1,7 @@
 import http from 'node:http'
 import { isIP } from 'node:net'
 import path from 'node:path'
+import { createGeminiTerminalBridge } from './terminal.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
 const PUBLIC_PATH = '/v1/gemini/sessions'
@@ -60,6 +61,10 @@ const HOST_ERRORS = {
   gemini_test_oauth_unsupported: [503, '当前签名载荷不支持 Google OAuth 推理测试'],
   gemini_test_auth_required: [409, '请先为 Gemini 环境完成授权'],
   gemini_test_invalid_input: [400, '请选择此环境的 Gemini 模型并输入有效的测试内容'],
+  gemini_terminal_unavailable: [503, '无法启动 Gemini 终端，请检查宿主服务、Antigravity 安装和绑定代理'],
+  gemini_terminal_conflict: [409, '此 Gemini 环境已有终端会话或正在执行其他操作，请稍后重试'],
+  gemini_terminal_requires_oauth: [409, 'Antigravity CLI 需要有效的 Google OAuth 凭据，请重新授权后再启动'],
+  gemini_terminal_limit: [429, '终端会话或连接票据已达上限，请关闭现有终端或稍后重试'],
 }
 
 export function isGeminiPanelPath(value) {
@@ -107,6 +112,7 @@ export function officialGeminiAuthUrl(value) {
 function hostRequest(socketPath, operation, payload) {
   if (process.platform !== 'linux' || process.arch !== 'x64') throw hostError('gemini_host_unsupported_platform')
   if (!path.isAbsolute(socketPath || '')) throw hostError('gemini_host_invalid_socket')
+  const terminal = operation.startsWith('terminal-')
   const body = JSON.stringify(payload)
   return new Promise((resolve, reject) => {
     const request = http.request(
@@ -115,7 +121,9 @@ function hostRequest(socketPath, operation, payload) {
         method: 'POST',
         path: `/${operation}`,
         headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-        signal: AbortSignal.timeout(operation === 'create' || operation === 'redeem' ? 60000 : 30000),
+        signal: AbortSignal.timeout(
+          ['create', 'redeem', 'terminal-start'].includes(operation) ? 60000 : 30000,
+        ),
       },
       async (response) => {
         try {
@@ -128,8 +136,9 @@ function hostRequest(socketPath, operation, payload) {
           }
           const data = JSON.parse(Buffer.concat(chunks))
           if (Object.hasOwn(HOST_ERRORS, data?.code)) throw hostError(data.code)
-          if (response.statusCode === 404) throw hostError('gemini_environment_not_found', 404)
-          if (response.statusCode === 409) throw hostError('gemini_environment_conflict', 409)
+          if (!terminal && response.statusCode === 404) throw hostError('gemini_environment_not_found', 404)
+          if (!terminal && response.statusCode === 409) throw hostError('gemini_environment_conflict', 409)
+          if (terminal && response.statusCode === 404) throw hostError('gemini_terminal_unavailable')
           if (response.statusCode !== 200) throw hostError(FAILURE)
           resolve(data)
         } catch (error) {
@@ -310,13 +319,40 @@ function proxyFor(proxyPool, proxyId) {
   throw hostError('gemini_proxy_unavailable', 409)
 }
 
-export function createGeminiPanelHandler({
-  json,
-  readBody,
-  proxyPool,
-  callHost = (operation, payload) =>
-    hostRequest(process.env.KIN_GEMINI_HOST_SOCKET ?? '/run/vm2api-gemini/control.sock', operation, payload),
-}) {
+const defaultCallHost = (operation, payload) =>
+  hostRequest(process.env.KIN_GEMINI_HOST_SOCKET ?? '/run/vm2api-gemini/control.sock', operation, payload)
+
+export function createGeminiTerminal({ proxyPool, callHost = defaultCallHost }) {
+  return createGeminiTerminalBridge({
+    callHost,
+    async resolveTarget(id) {
+      const environment = await callHost('get', { id })
+      if (environment?.id !== id) throw hostError(PROTOCOL_ERROR)
+      if (environment.auth_method !== 'oauth' || environment.auth_state !== 'authorized') {
+        throw hostError('gemini_terminal_requires_oauth', 409)
+      }
+      if (typeof environment.proxy_id !== 'string' || !ID.test(environment.proxy_id)) {
+        throw hostError('gemini_proxy_unavailable', 409)
+      }
+      return { proxy_id: environment.proxy_id, proxy_url: proxyFor(proxyPool(), environment.proxy_id) }
+    },
+    errorMessage(code, stage) {
+      if (code === 'gemini_proxy_unavailable') return '需要绑定可用的 IPv4 SOCKS5 代理'
+      if (code === 'gemini_environment_not_found') return 'Gemini 环境不存在'
+      if (code === 'gemini_environment_conflict') return 'Gemini 环境状态已变化，请刷新后重试'
+      return (
+        (Object.hasOwn(HOST_ERRORS, code) && HOST_ERRORS[code][1]) ||
+        (stage === 'resolve'
+          ? '无法读取 Gemini 环境，请检查宿主服务'
+          : stage === 'io'
+            ? 'Gemini 终端连接中断，请检查宿主服务或重新打开终端'
+            : HOST_ERRORS.gemini_terminal_unavailable[1])
+      )
+    },
+  })
+}
+
+export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, callHost = defaultCallHost }) {
   return async function handleGeminiPanel(req, res, pathname) {
     const ok = (data) => json(res, 200, { ok: true, data })
     const fail = (status, code, message = code) => json(res, status, { ok: false, error: { code, message } })
@@ -388,11 +424,15 @@ export function createGeminiPanelHandler({
         )
       }
       const match =
-        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|disable|refresh|test-chat))?$/.exec(
+        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|disable|refresh|test-chat|terminal-ticket))?$/.exec(
           pathname,
         )
       if (!match || !ID.test(match[1])) return fail(404, 'not_found')
       const [, id, action] = match
+      if (req.method === 'POST' && action === 'terminal-ticket') {
+        if (!terminal) throw hostError('gemini_terminal_unavailable')
+        return ok(await terminal.issueTicket(id))
+      }
       if (req.method === 'DELETE' && !action) {
         await callHost('delete', { id })
         return ok({ deleted: true })

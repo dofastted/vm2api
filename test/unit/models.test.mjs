@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  canonicalizeDottedClaudeId,
   isCatalogModelId,
   latestIdForFamily,
   resolveCatalogModel,
@@ -127,6 +128,50 @@ test('old worker catalogs cannot restore the unsupported dotted Fable 5.1 id', (
   setModelCatalog(['claude-fable-5.1', 'claude-fable-5-1'])
   assert.deepEqual(getCatalogIds(), ['claude-fable-5-1'])
   assert.equal(validateOfficialModel('claude-fable-5.1').model, 'claude-fable-5-1')
+  clearModelsCache()
+})
+
+test('every dotted claude id is canonicalized, not just the listed ones', () => {
+  // Regression: the dotted → hyphen map used to be hardcoded per model, so each
+  // new x.y release (sonnet 5.5, haiku 5.5) silently failed to route.
+  assert.equal(canonicalizeDottedClaudeId('claude-opus-5.5'), 'claude-opus-5-5')
+  assert.equal(canonicalizeDottedClaudeId('claude-sonnet-5.5'), 'claude-sonnet-5-5')
+  assert.equal(canonicalizeDottedClaudeId('claude-haiku-5.5'), 'claude-haiku-5-5')
+  assert.equal(canonicalizeDottedClaudeId('claude-fable-5.1'), 'claude-fable-5-1')
+  // Already canonical, dated, and non-claude ids must pass through untouched.
+  assert.equal(canonicalizeDottedClaudeId('claude-opus-5-5'), 'claude-opus-5-5')
+  assert.equal(canonicalizeDottedClaudeId('claude-haiku-4-5-20251001'), 'claude-haiku-4-5-20251001')
+  assert.equal(canonicalizeDottedClaudeId('claude-3-5-haiku'), 'claude-3-5-haiku')
+  assert.equal(canonicalizeDottedClaudeId('gpt-6.2-sol'), 'gpt-6.2-sol')
+  assert.equal(canonicalizeDottedClaudeId('codex-1.0'), 'codex-1.0')
+  assert.equal(canonicalizeDottedClaudeId(''), '')
+})
+
+test('dotted 5.5 ids resolve for every family, with prefix and 1m suffix', () => {
+  clearModelsCache()
+  gatewayModelCatalog()
+  for (const [dotted, canonical] of [
+    ['claude-opus-5.5', 'claude-opus-5-5'],
+    ['claude-sonnet-5.5', 'claude-sonnet-5-5'],
+    ['claude-haiku-5.5', 'claude-haiku-5-5'],
+  ]) {
+    assert.equal(validateOfficialModel(dotted).model, canonical)
+    assert.equal(validateOfficialModel(`anthropic/${dotted}`).model, canonical)
+    assert.equal(validateOfficialModel(`openrouter/anthropic/${dotted}`).model, canonical)
+    const with1m = validateOfficialModel(`${dotted}[1m]`)
+    assert.equal(with1m.model, canonical)
+    assert.equal(with1m.want1m, true)
+    assert.ok(!getCatalogIds().includes(dotted))
+  }
+  clearModelsCache()
+})
+
+test('a dotted id stays canonical when the worker catalog is still pending', () => {
+  clearModelsCache()
+  setModelCatalog([], { source: 'go-slot-worker' })
+  const pending = validateOfficialModel('claude-sonnet-5.5')
+  assert.equal(pending.ok, true)
+  assert.equal(pending.model, 'claude-sonnet-5-5')
   clearModelsCache()
 })
 
