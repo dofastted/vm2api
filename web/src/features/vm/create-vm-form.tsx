@@ -137,6 +137,7 @@ const MEMORY_SHORT: Record<VmMemoryOption, string> = {
   '256m': '256M',
   '512m': '512M',
   '1g': '1G',
+  '1536m': '1.5G',
   '2g': '2G',
   '4g': '4G',
   '8g': '8G',

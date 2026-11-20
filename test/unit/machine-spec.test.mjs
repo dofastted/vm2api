@@ -181,3 +181,10 @@ test('create picks a random catalog portrait and an existing brand stays', () =>
   assert.ok(SMBIOS_CATALOG.some((item) => item.product === bare.machine.smbios.product))
   assert.equal(ensureSlotSmbios(bare), false)
 })
+
+test('1536m is a standard slot memory step between 1g and 2g', () => {
+  assert.deepEqual(VM_MEMORY_OPTIONS.slice(2, 5), ['1g', '1536m', '2g'])
+  assert.equal(memoryMiB('1536m'), 1536)
+  assert.equal(slotMemory({ machine: { memory: '1536m' } }, {}), '1536m')
+  assert.equal(validateVmConfigPatch({ machine: { memory: '1536m' } }).ok, true)
+})
