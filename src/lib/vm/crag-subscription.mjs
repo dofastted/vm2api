@@ -105,9 +105,10 @@ function settledWithin(pending, budgetMs) {
   let timer
   return Promise.race([
     pending.done.then(() => true),
+    // Not unref'd on purpose: an unref'd timer never fires once the loop has
+    // nothing else to do, which would leave this await pending forever.
     new Promise((resolve) => {
       timer = setTimeout(() => resolve(false), budgetMs)
-      timer.unref?.()
     }),
   ]).finally(() => clearTimeout(timer))
 }
