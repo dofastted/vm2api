@@ -673,16 +673,24 @@ export async function remoteBridgeNetfilter(session) {
   return String(stdout).trim() === '1'
 }
 
-/** Addresses currently held by endpoints on the node's shared network. */
+/**
+ * Addresses held by endpoints on the node's shared network, with their holder.
+ *
+ * The holder matters: a VM's own endpoint is here once its container is
+ * attached, and counting that as taken would renumber the VM on every restart.
+ */
 function remoteSharedEndpointIps(info) {
-  const out = []
+  const items = []
+  const owners = {}
   for (const entry of Object.values(info?.Containers || {})) {
     const ip = String(entry?.IPv4Address || '')
       .split('/')[0]
       .trim()
-    if (ip) out.push(ip)
+    if (!ip) continue
+    items.push(ip)
+    owners[ip] = String(entry?.Name || '')
   }
-  return out
+  return { items, owners }
 }
 
 /** The route table the node's shared helper is currently configured with. */
@@ -756,6 +764,10 @@ export async function ensureRemoteSharedEgress(session, vm, projectRoot, { image
     if (!ipv4)
       return { ok: false, code: 'egress_network_failed', error: `shared network ${names.network} has no IPv4 range` }
     const live = remoteSharedEndpointIps(info)
+    // This VM's own endpoint is in the live set once its container is attached,
+    // so ownership is compared rather than membership.
+    const selfContainer = String(vm?.runtime?.container || containerName(vm.id))
+    const heldByOthers = live.items.filter((addr) => live.owners[addr] !== selfContainer)
 
     const at = Date.now()
     const claims = readSharedClaims(projectRoot, nodeId, at)
@@ -764,7 +776,7 @@ export async function ensureRemoteSharedEgress(session, vm, projectRoot, { image
       .map(([, c]) => c.ip)
     let ip
     try {
-      ip = assignSharedIp(vm, { subnet: ipv4.subnet, taken: [...live, ...others] }).ip
+      ip = assignSharedIp(vm, { subnet: ipv4.subnet, taken: [...heldByOthers, ...others] }).ip
     } catch (e) {
       return { ok: false, code: 'shared_subnet_full', error: e?.message || 'shared address allocation failed' }
     }
@@ -772,7 +784,7 @@ export async function ensureRemoteSharedEgress(session, vm, projectRoot, { image
 
     const ports = await resolveRemoteEgressPorts(session, sharedEgressId(nodeId), names.dir)
     const existing = await remoteSharedRoutes(session, names.dir)
-    const pruned = pruneSharedRoutes(existing, live, { keep: [ip, ...others] })
+    const pruned = pruneSharedRoutes(existing, live.items, { keep: [ip, ...others] })
     const routes = mergeSharedRoute(pruned, { vmId, ip, proxyUrl })
     const cfg = egressConfigFor({
       proxyId: sharedEgressId(nodeId),

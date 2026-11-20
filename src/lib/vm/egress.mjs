@@ -637,24 +637,41 @@ export function ensureSharedEgressNetwork(nodeId, run = docker, { runIp = ipRout
 }
 
 /**
- * Addresses already held by endpoints on the shared network, for the host-bit
- * allocator. Read from live state rather than a registry, so a VM removed
+ * Addresses already held by endpoints on the shared network, with the
+ * container that holds each.
+ *
+ * The owner matters: a VM's own endpoint is in this list once its container is
+ * attached, so an address can only be judged "someone else's" by comparing
+ * holders. Read from live state rather than a registry, so a VM removed
  * outside the control plane frees its address.
  */
 export function sharedEndpointIps(nodeId, run = docker) {
   const name = sharedNetworkName(nodeId)
-  const r = run(['network', 'inspect', '-f', '{{range .Containers}}{{.IPv4Address}} {{end}}', name])
-  if (!r.ok) return { ok: false, items: [] }
+  const r = run([
+    'network',
+    'inspect',
+    '-f',
+    '{{range $k, $v := .Containers}}{{$v.Name}}={{$v.IPv4Address}} {{end}}',
+    name,
+  ])
+  if (!r.ok) return { ok: false, items: [], owners: {} }
   const items = []
+  const owners = {}
   for (const token of String(r.stdout || '')
     .trim()
     .split(/\s+/)) {
-    const ip = String(token || '')
+    const at = String(token || '').lastIndexOf('=')
+    if (at <= 0) continue
+    const holder = token.slice(0, at).trim()
+    const ip = token
+      .slice(at + 1)
       .split('/')[0]
       .trim()
-    if (ip) items.push(ip)
+    if (!ip) continue
+    items.push(ip)
+    owners[ip] = holder
   }
-  return { ok: true, items }
+  return { ok: true, items, owners }
 }
 
 function applyIptables(plan, runIptables = iptables) {
@@ -1854,9 +1871,14 @@ export async function ensureSharedEgressForVm(
     const others = Object.entries(claims)
       .filter(([id]) => id !== vmId)
       .map(([, c]) => c.ip)
+    // This VM's own endpoint is in the live set once its container is attached,
+    // so ownership is compared rather than membership: counting its own address
+    // as taken would renumber it on every restart.
+    const selfContainer = String(vm?.runtime?.container || '')
+    const heldByOthers = live.items.filter((addr) => !selfContainer || live.owners?.[addr] !== selfContainer)
     let ip
     try {
-      ip = assignSharedIp(vm, { subnet: net.subnet, taken: [...live.items, ...others] }).ip
+      ip = assignSharedIp(vm, { subnet: net.subnet, taken: [...heldByOthers, ...others] }).ip
     } catch (e) {
       return { ok: false, error: e?.message || 'shared_ip_allocation_failed', code: 'shared_subnet_full' }
     }

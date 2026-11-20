@@ -173,14 +173,25 @@ export function sharedIpOf(vm) {
 /**
  * The address to record for a VM joining the shared network.
  *
- * An address already recorded is kept: it is what the VM's container is
- * attached with and what the helper's route table names, so re-deriving it
- * would strand both. Only a VM that has none gets a new one.
+ * An address already recorded is kept when it is still this VM's to keep: it is
+ * what the container is attached with and what the helper's route table names,
+ * so re-deriving it would strand both.
+ *
+ * But a record is not proof of ownership. A slot whose container was removed
+ * loses its endpoint, so its address leaves the live set and the allocator may
+ * hand it to another VM — while the stale record still names it. Reusing it
+ * unconditionally then puts two slots on one address, and the second container
+ * fails to start. So a recorded address that now belongs to someone else is
+ * given up and a fresh one allocated; `taken` here is the addresses held by
+ * *others*, never this VM's own.
  */
 export function assignSharedIp(vm, { subnet, taken = [], maxProbe = MAX_HOST_PROBE } = {}) {
   const existing = sharedIpOf(vm)
-  if (existing) return { ip: existing, reused: true }
-  return { ip: allocateHostIp(vm?.id || '', { subnet, taken, maxProbe }), reused: false }
+  if (existing && !taken.some((ip) => String(ip || '').trim() === existing)) {
+    return { ip: existing, reused: true }
+  }
+  const ip = allocateHostIp(vm?.id || '', { subnet, taken, maxProbe })
+  return { ip, reused: false, ...(existing ? { displaced: existing } : {}) }
 }
 
 /**

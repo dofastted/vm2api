@@ -31,6 +31,7 @@ import {
   egressConfigFor,
   ensureSharedEgressForVm,
   iptablesPlan,
+  sharedEndpointIps,
   sharedIpOf,
   sharedIptablesPlan,
   slotNetworkArgs,
@@ -226,7 +227,12 @@ test('the helper config is written by one builder, with routes and a raised fd c
 })
 
 /** A node whose shared network holds `endpoints` and whose helper has `routes`. */
-function nodeHarness({ endpoints = [], routes = [] } = {}) {
+function nodeHarness(t, { endpoints = [], routes = [] } = {}) {
+  // Its own directory per harness: claims are written to disk and live for
+  // SHARED_CLAIM_TTL_MS, so a shared path would carry one test's reservations
+  // into the next.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-node-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const subnet = '100.64.16.0/20'
   const startCalls = []
   const runDocker = (args) => {
@@ -234,13 +240,26 @@ function nodeHarness({ endpoints = [], routes = [] } = {}) {
     if (args[1] === 'ls') return { ok: true, stdout: sharedNetworkName('') }
     if (args[1] === 'inspect') {
       const fmt = String(args[3] || '')
-      if (fmt.includes('.Containers')) return { ok: true, stdout: endpoints.map((ip) => `${ip}/20`).join(' ') }
+      if (fmt.includes('.Containers')) {
+        // Renders what the format string actually asks for. A double that
+        // emitted `name=ip` regardless would pass even if the query stopped
+        // asking for the name — and in production that silently yields no
+        // addresses at all, so the allocator hands out one already in use.
+        const withOwner = fmt.includes('$v.Name')
+        const render = (e, i) => {
+          const ip = typeof e === 'string' ? e : e.ip
+          const owner = typeof e === 'string' ? `kin-held-${i}` : e.owner
+          return withOwner ? `${owner}=${ip}/20` : `${ip}/20`
+        }
+        return { ok: true, stdout: endpoints.map(render).join(' ') }
+      }
       if (fmt.includes('|')) return { ok: true, stdout: `${subnet}|100.64.16.1` }
       return { ok: true, stdout: subnet }
     }
     return { ok: true, stdout: '' }
   }
   return {
+    root,
     subnet,
     startCalls,
     opts: {
@@ -260,16 +279,23 @@ function nodeHarness({ endpoints = [], routes = [] } = {}) {
   }
 }
 
-const sharedVm = (id, ip) => ({
+const sharedVm = (id, ip, container = '') => ({
   id,
-  runtime: { egress_mode: 'shared', ...(ip ? { shared_ip: ip } : {}) },
+  runtime: {
+    egress_mode: 'shared',
+    ...(ip ? { shared_ip: ip } : {}),
+    ...(container ? { container } : {}),
+  },
   proxy: { id: `px-${id}`, scheme: 'socks5h', host: `${id}.example`, port: 1080 },
 })
 
-test('a VM joining is addressed and routed without disturbing the VMs present', async () => {
+test('a VM joining is addressed and routed without disturbing the VMs present', async (t) => {
   const present = '100.64.16.5'
-  const h = nodeHarness({ endpoints: [present], routes: [{ vm_ip: present, proxy_url: 'socks5h://still-here:1080' }] })
-  const r = await ensureSharedEgressForVm('/tmp/kin-shared-test', sharedVm('vm-2'), h.opts)
+  const h = nodeHarness(t, {
+    endpoints: [present],
+    routes: [{ vm_ip: present, proxy_url: 'socks5h://still-here:1080' }],
+  })
+  const r = await ensureSharedEgressForVm(h.root, sharedVm('vm-2'), h.opts)
   assert.equal(r.ok, true)
   assert.ok(r.ip)
   const table = h.startCalls[0].routes
@@ -278,21 +304,27 @@ test('a VM joining is addressed and routed without disturbing the VMs present', 
   // No default exit: every VM leaves through the upstream its own route names.
   assert.equal(h.startCalls[0].proxyUrl, '')
 
-  // An address the VM already holds is kept rather than re-derived.
-  const held = await ensureSharedEgressForVm('/tmp/kin-shared-test', sharedVm('vm-3', present), h.opts)
-  assert.equal(held.ip, present)
-  assert.deepEqual(assignSharedIp(sharedVm('vm-1', '100.64.16.77'), { subnet: h.subnet, taken: ['100.64.16.77'] }), {
-    ip: '100.64.16.77',
-    reused: true,
-  })
+  // An address is kept when the VM still holds it: same address recorded, and
+  // the endpoint on the bridge is this VM's own container.
+  const mine = nodeHarness(t, { endpoints: [{ ip: present, owner: 'kin-vm-3' }] })
+  const kept = await ensureSharedEgressForVm(mine.root, sharedVm('vm-3', present, 'kin-vm-3'), mine.opts)
+  assert.equal(kept.ip, present)
+
+  // But a record is not proof: here the address is held by someone else's
+  // container, which is what happens after this VM's container is removed and
+  // the allocator hands its address on. Keeping it would put two slots on one
+  // address and the second container would fail to start.
+  const taken = await ensureSharedEgressForVm(h.root, sharedVm('vm-4', present, 'kin-vm-4'), h.opts)
+  assert.notEqual(taken.ip, present)
+  assert.equal(taken.ok, true)
 })
 
-test('a node that cannot isolate, or has nothing to route, builds nothing', async () => {
+test('a node that cannot isolate, or has nothing to route, builds nothing', async (t) => {
   // Both barriers between VMs live in iptables, and bridged traffic only
   // reaches it when br_netfilter is on. With it off they are inert at once and
   // every VM on the node can reach every other, with nothing in any log.
-  const blocked = nodeHarness()
-  const r = await startSharedEgress('/tmp/kin-shared-test', {
+  const blocked = nodeHarness(t)
+  const r = await startSharedEgress(blocked.root, {
     nodeId: '',
     members: [{ vmId: 'vm-1', ip: '100.64.16.3', proxyUrl: 'socks5h://a:1080' }],
     ...blocked.opts,
@@ -305,8 +337,8 @@ test('a node that cannot isolate, or has nothing to route, builds nothing', asyn
   // No routable member: the helper is stopped rather than left on a stale
   // table, while the network and rules stay, so a node between VMs is closed
   // rather than open.
-  const empty = nodeHarness()
-  const idle = await startSharedEgress('/tmp/kin-shared-test', {
+  const empty = nodeHarness(t)
+  const idle = await startSharedEgress(empty.root, {
     nodeId: '',
     members: [{ vmId: 'vm-1', ip: '100.64.16.3', proxyUrl: '' }],
     ...empty.opts,
@@ -317,8 +349,8 @@ test('a node that cannot isolate, or has nothing to route, builds nothing', asyn
 
   // An unreadable endpoint list must not read as "no addresses in use", which
   // would hand out one already held.
-  const unreadable = nodeHarness()
-  const bad = await ensureSharedEgressForVm('/tmp/kin-shared-test', sharedVm('vm-1'), {
+  const unreadable = nodeHarness(t)
+  const bad = await ensureSharedEgressForVm(unreadable.root, sharedVm('vm-1'), {
     ...unreadable.opts,
     runDocker: (args) =>
       args[1] === 'inspect' && String(args[3]).includes('.Containers')
@@ -695,4 +727,63 @@ test('a node reports its bridge filtering through the real remote call', async (
 
   // An unexpected payload is not a pass either.
   assert.equal(await remoteBridgeNetfilter({ client: fakeSshClient({ stdout: 'enabled\n' }) }), false)
+})
+
+test('a recorded address is kept only while it is still this VM’s', () => {
+  const subnet = '100.64.16.0/20'
+  const vm = { id: 'vm-1', runtime: { egress_mode: 'shared', shared_ip: '100.64.16.77' } }
+
+  // Nobody else holds it: kept, because it is what the container is attached
+  // with and what the helper's route table names.
+  assert.deepEqual(assignSharedIp(vm, { subnet, taken: ['100.64.16.5'] }), {
+    ip: '100.64.16.77',
+    reused: true,
+  })
+
+  // Its container was removed, so the address left the live set and the
+  // allocator gave it to another VM — while this record still named it.
+  // Reusing it would put two slots on one address and the second container
+  // would fail to start, so it is given up.
+  const moved = assignSharedIp(vm, { subnet, taken: ['100.64.16.77'] })
+  assert.equal(moved.reused, false)
+  assert.notEqual(moved.ip, '100.64.16.77')
+  assert.equal(moved.displaced, '100.64.16.77')
+  assert.equal(moved.ip, allocateHostIp('vm-1', { subnet, taken: ['100.64.16.77'] }))
+})
+
+test('a VM’s own endpoint does not count against it', () => {
+  // The live set contains this VM's own address once its container is
+  // attached. Comparing membership rather than ownership would renumber it on
+  // every restart — worse than the stale-record bug, since it would hit every
+  // healthy VM.
+  const run = (args) => {
+    const fmt = String(args[3] || '')
+    if (fmt.includes('.Containers')) {
+      // Only renders holders when the query asks for them, so a query that
+      // stops asking fails this test instead of passing it.
+      const holders = fmt.includes('$v.Name')
+      return {
+        ok: true,
+        stdout: holders ? 'kin-vm-1=100.64.16.7/20 kin-vm-2=100.64.16.9/20' : '100.64.16.7/20 100.64.16.9/20',
+      }
+    }
+    return { ok: true, stdout: '100.64.16.0/20|100.64.16.1' }
+  }
+  const live = sharedEndpointIps('', run)
+  assert.equal(live.ok, true)
+  assert.deepEqual(live.items, ['100.64.16.7', '100.64.16.9'])
+  // The holder is what makes ownership decidable.
+  assert.equal(live.owners['100.64.16.7'], 'kin-vm-1')
+  assert.equal(live.owners['100.64.16.9'], 'kin-vm-2')
+
+  const self = 'kin-vm-1'
+  const heldByOthers = live.items.filter((ip) => live.owners[ip] !== self)
+  assert.deepEqual(heldByOthers, ['100.64.16.9'])
+
+  // So a VM already attached at .7 keeps it.
+  const vm = { id: 'vm-1', runtime: { egress_mode: 'shared', shared_ip: '100.64.16.7', container: self } }
+  assert.deepEqual(assignSharedIp(vm, { subnet: '100.64.16.0/20', taken: heldByOthers }), {
+    ip: '100.64.16.7',
+    reused: true,
+  })
 })
