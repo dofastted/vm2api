@@ -46,6 +46,7 @@ import {
 } from './crag-commerce'
 import { normalizeLayout, ordersSideClass } from './crag-layout'
 import { CragPlanPicker } from './crag-plan-picker'
+import { GeminiRedeemDialog } from './gemini-redeem-dialog'
 
 export { formatPlanDetails, termLabel } from './crag-catalog'
 export type { CragPlan, Presentation } from './crag-catalog'
@@ -1154,6 +1155,7 @@ function ShopOrders({
               <Link to='/crag-purchase'>免登录购买到本机</Link>
             )}
           </Button>
+          {isAdmin && !device ? <GeminiRedeemDialog /> : null}
         </div>
       }
     >

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 管理员可在「订阅 CRAG」右上角兑换本机 CRAGGemini 签名载荷。只接受当前签名清单对应的授权码；载荷激活与 Google 授权、推理支持和 Claude CRAG 订阅独立。
+- Gemini 环境详情新增「测试对话」，复用其他平台的结果卡。使用环境已保存的 API Key 经绑定代理发送测试；不开放 OAuth 或对外付费调用。
 - Gemini 宿主部署支持签名的 `0.3.0-rc.2`；配置安装源时，安装命令会先验证并落地载荷，再报告成功。已授权的 Google 账号可从详情页点「启动 Gemini」，打开走绑定代理的 Antigravity CLI 终端，不影响公共推理和计费。
 - Gemini 终端仅在启动时识别 Google OAuth 菜单；会话中的同样文本不再断开终端或改写账号授权状态。
 

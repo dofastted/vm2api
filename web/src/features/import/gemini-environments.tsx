@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Progress } from '@/components/ui/progress'
+import { GeminiTestChat } from './gemini-test-chat'
 import { WsTerminal } from '@/components/ws-terminal-lazy'
 
 const ROOT = '/api/panel/gemini'
@@ -57,8 +58,13 @@ export type GeminiInventory = {
   available: boolean
   host_message?: string
   payload_state?:
-    'installed' | 'install_on_create' | 'not_configured' | 'invalid' | 'unknown'
+    | 'installed'
+    | 'awaiting_redemption'
+    | 'not_configured'
+    | 'invalid'
+    | 'unknown'
   payload_issue?: keyof typeof PAYLOAD_ISSUES | null
+  release_activated?: boolean | null
   oauth_runtime_issue?: keyof typeof OAUTH_ISSUES | null
   environments: GeminiEnvironment[]
 }
@@ -126,8 +132,14 @@ export function GeminiStartupStatus({
   return (
     <div className='space-y-1 text-sm'>
       {payloadIssue ? <p role='status'>{payloadIssue}</p> : null}
-      {inventory.payload_state === 'install_on_create' ? (
-        <p role='status'>首次创建时自动校验并安装 Gemini 内核和官方 CLI。</p>
+      {!payloadIssue && inventory.release_activated === false ? (
+        <p role='status'>
+          请前往{' '}
+          <Link to='/crag-subscription' className='text-primary underline'>
+            订阅 CRAG
+          </Link>{' '}
+          兑换当前版本的 CRAGGemini 内核。
+        </p>
       ) : null}
       {inventory.oauth_runtime_issue ? (
         <p role='status'>{OAUTH_ISSUES[inventory.oauth_runtime_issue]}</p>
@@ -507,11 +519,9 @@ export function GeminiEnvironments({
   if (!inventory.data) return null
   if (!inventory.data.available)
     return <GeminiStartupStatus inventory={inventory.data} />
-  const payloadState = inventory.data.payload_state
-  const canInstall =
-    payloadState === 'installed' ||
-    payloadState === 'install_on_create' ||
-    payloadState === 'invalid'
+  const payloadReady =
+    inventory.data.payload_state === 'installed' &&
+    inventory.data.release_activated === true
   const selectedId = environmentId || createdId
   const environment = inventory.data.environments.find(
     (item) => item.id === selectedId
@@ -620,7 +630,7 @@ export function GeminiEnvironments({
             type='submit'
             disabled={
               operation.isPending ||
-              !canInstall ||
+              !payloadReady ||
               !name.trim() ||
               (authMethod === 'api_key' && !apiKey.trim()) ||
               !exits.some((proxy) => proxy.id === proxyId)
@@ -653,7 +663,7 @@ export function GeminiEnvironments({
                 variant='outline'
                 disabled={
                   operation.isPending ||
-                  !canInstall ||
+                  !payloadReady ||
                   Boolean(inventory.data.oauth_runtime_issue) ||
                   environment.proxy_ready === false
                 }
@@ -728,6 +738,12 @@ export function GeminiEnvironments({
                 busy={operation.isPending}
               />
             )
+          ) : !isImport ? (
+            <GeminiTestChat
+              key={environment.id}
+              environment={environment}
+              payloadReady={payloadReady}
+            />
           ) : null}
           {challenge?.id === environment.id &&
           environment.auth_state === 'authorizing' ? (

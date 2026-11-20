@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
 GOOGLE_USERINFO = "https://www.googleapis.com/oauth2/v2/userinfo"
 CODE_ASSIST = "https://cloudcode-pa.googleapis.com/v1internal:"
-GEMINI_MODELS = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000"
+GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_MODELS = f"{GEMINI_API}/models?pageSize=1000"
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin", "LANG": "C.UTF-8"}
 TOKEN_FILE = "home/.gemini/antigravity-cli/antigravity-oauth-token"
 
@@ -37,7 +38,7 @@ def read_token(profile):
         return None
 
 
-def get_json(proxy_url, url, header, body=None):
+def get_json(proxy_url, url, header, body=None, *, timeout=6):
     options = {"proxy": proxy_url, "noproxy": "", "header": header}
     args = [
         "curl",
@@ -50,7 +51,7 @@ def get_json(proxy_url, url, header, body=None):
         "--connect-timeout",
         "3",
         "--max-time",
-        "6",
+        str(timeout),
         "--max-filesize",
         "2097152",
         "--write-out",
@@ -63,7 +64,11 @@ def get_json(proxy_url, url, header, body=None):
     config = "".join(f"{key} = {json.dumps(value)}\n" for key, value in options.items())
     try:
         output = subprocess.run(
-            args, input=config.encode(), capture_output=True, timeout=7, env=ENV
+            args,
+            input=config.encode(),
+            capture_output=True,
+            timeout=timeout + 1,
+            env=ENV,
         )
         if output.returncode != 0:
             return 0, {}
@@ -106,7 +111,7 @@ def models(data, is_api_key=False):
             if not isinstance(name, str):
                 continue
             if name.startswith("models/"):
-                name = name[len("models/"):]
+                name = name[len("models/") :]
             if MODEL.fullmatch(name):
                 names.add(name)
         return sorted(names)[:128]
@@ -286,12 +291,80 @@ def probe_oauth(proxy_url, profile):
     return checked(state, **account)
 
 
+def test_api_key(proxy_url, api_key, model, prompt):
+    if not MODEL.fullmatch(model):
+        raise ValueError("Invalid Gemini test model")
+    status, payload = get_json(
+        proxy_url,
+        f"{GEMINI_API}/models/{model}:generateContent",
+        f"x-goog-api-key: {api_key}",
+        {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 1024},
+        },
+        timeout=20,
+    )
+    if status != 200:
+        return {"status": status}
+    candidates = payload.get("candidates")
+    candidate = candidates[0] if isinstance(candidates, list) and candidates else None
+    candidate = candidate if isinstance(candidate, dict) else {}
+    content = candidate.get("content")
+    parts = content.get("parts") if isinstance(content, dict) else None
+    answer = (
+        "".join(
+            part["text"]
+            for part in parts
+            if isinstance(part, dict)
+            and isinstance(part.get("text"), str)
+            and part.get("thought") is not True
+        )
+        if isinstance(parts, list)
+        else ""
+    )
+    feedback = payload.get("promptFeedback")
+    stop = candidate.get("finishReason") or (
+        feedback.get("blockReason") if isinstance(feedback, dict) else None
+    )
+    usage = {}
+    counts = payload.get("usageMetadata")
+    if isinstance(counts, dict):
+        for source, target in (
+            ("promptTokenCount", "input_tokens"),
+            ("candidatesTokenCount", "output_tokens"),
+            ("cachedContentTokenCount", "cache_read_input_tokens"),
+        ):
+            value = counts.get(source)
+            if type(value) is int and value >= 0:
+                usage[target] = value
+        cached = usage.get("cache_read_input_tokens", 0)
+        if "input_tokens" in usage and cached <= usage["input_tokens"]:
+            usage["input_tokens"] -= cached
+        elif cached:
+            usage.pop("input_tokens", None)
+    return {
+        "status": status,
+        "text": answer[:4000],
+        "stop_reason": text(stop, 64),
+        "usage": usage,
+    }
+
+
 if __name__ == "__main__":
     request = json.load(sys.stdin)
     if sys.argv[1] == "api_key" and re.fullmatch(
         r"[A-Za-z0-9_-]{20,256}", request["api_key"]
     ):
         result = probe_api_key(request["proxy_url"], request["api_key"])
+    elif sys.argv[1] == "test_chat" and re.fullmatch(
+        r"[A-Za-z0-9_-]{20,256}", request["api_key"]
+    ):
+        result = test_api_key(
+            request["proxy_url"],
+            request["api_key"],
+            request["model"],
+            request["prompt"],
+        )
     elif sys.argv[1] == "oauth":
         result = probe_oauth(request["proxy_url"], sys.argv[2])
     else:

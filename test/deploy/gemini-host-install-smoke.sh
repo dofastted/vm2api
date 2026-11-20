@@ -22,12 +22,21 @@ for member in manifest.json manifest.sig agy craggemini libagy_bridge.so; do
     install -m 644 "$source/$member" "$fixture/source/$member"
 done
 version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$source/manifest.json")
+node "$root/scripts/issue-gemini-release-code.mjs" --source "$source" --public-key "$public_key" --release-dir "$fixture/release"
+node "$root/scripts/issue-gemini-release-code.mjs" --source "$source" --public-key "$public_key" --release-dir "$fixture/release"
+codes=("$fixture"/release/*.code)
+verifiers=("$fixture"/release/*.json)
+[[ ${#codes[@]} == 1 && ${#verifiers[@]} == 1 ]]
+install -m 600 "${verifiers[0]}" "$fixture/release.json"
+code=$(cat "${codes[0]}")
+printf -v redeem '{"redemption_code":"%s"}' "$code"
 
 socket="$fixture/control.sock"
 start() {
     python3 -I "$fixture/scripts/gemini-host.py" --state "$fixture/state" \
         --payload "$fixture/payload/current" --payload-source "$fixture/source" \
         --public-key "$fixture/public-key" --egress "$fixture/unneeded-kin-egress" \
+        --release-verifier "$fixture/release.json" \
         --socket "$socket" --gateway-group root --uid-base 29000 &
     pid=$!
     for attempt in {1..50}; do
@@ -59,7 +68,7 @@ mv "$fixture/public-key" "$fixture/held-key"
 start
 request list | python3 -c 'import json,sys; data=json.load(sys.stdin); assert (data["payload_state"], data["payload_issue"]) == ("not_configured", "gemini_public_key_missing")'
 mv "$fixture/held-key" "$fixture/public-key"
-request list | python3 -c 'import json,sys; data=json.load(sys.stdin); assert (data["payload_state"], data["payload_issue"], data["environments"]) == ("install_on_create", None, []) and data["oauth_runtime_issue"] in ("gemini_egress_unavailable", "gemini_oauth_tools_missing")'
+request list | python3 -c 'import json,sys; data=json.load(sys.stdin); assert (data["payload_state"], data["payload_issue"], data["environments"], data["release_activated"]) == ("awaiting_redemption", None, [], False) and data["oauth_runtime_issue"] in ("gemini_egress_unavailable", "gemini_oauth_tools_missing")'
 KIN_GEMINI_HOST_SOCKET="$socket" node --input-type=module - "$root/src/lib/gemini/routes.mjs" <<'JS'
 import assert from 'node:assert/strict'
 import { pathToFileURL } from 'node:url'
@@ -68,24 +77,32 @@ const { createGeminiPanelHandler } = await import(pathToFileURL(process.argv[2])
 const handler = createGeminiPanelHandler({ json: (_response, status, body) => ({ status, body }) })
 const result = await handler({ method: 'GET' }, { setHeader() {} }, '/api/panel/gemini')
 assert.equal(result.body.data.available, true)
-assert.equal(result.body.data.payload_state, 'install_on_create')
+assert.equal(result.body.data.payload_state, 'awaiting_redemption')
 assert.equal(result.body.data.payload_issue, null)
 assert.deepEqual(result.body.data.environments, [])
 JS
 [[ ! -e $fixture/payload/current ]]
 create='{"name":"Fixture","proxy_id":"fixture","proxy_url":"socks5h://192.0.2.1:1080"}'
+request create "$create" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_release_redemption_required"'
+request redeem '{"redemption_code":"CGG1-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}' | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_release_code_invalid"'
 mv "$fixture/source" "$fixture/held-source"
-request create "$create" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_payload_source_missing"'
+request redeem "$redeem" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_payload_source_missing"'
 mv "$fixture/held-source" "$fixture/source"
 mv "$fixture/source/agy" "$fixture/held-agy"
-request create "$create" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_payload_incomplete"'
+request redeem "$redeem" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_payload_incomplete"'
 mv "$fixture/held-agy" "$fixture/source/agy"
 printf '%064d' 0 > "$fixture/source/manifest.sig"
-request create "$create" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_payload_invalid"'
+request redeem "$redeem" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_payload_invalid"'
 [[ ! -e $fixture/state/environments.json && ! -e $fixture/payload/current ]]
 request install-payload | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_payload_invalid"'
 [[ ! -e $fixture/state/environments.json && ! -e $fixture/payload/current ]]
 install -m 644 "$source/manifest.sig" "$fixture/source/manifest.sig"
+printf ' ' >> "$fixture/source/manifest.json"
+request redeem "$redeem" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_release_payload_mismatch"'
+install -m 644 "$source/manifest.json" "$fixture/source/manifest.json"
+request redeem "$redeem" | python3 -c 'import json,sys; assert json.load(sys.stdin) == {"kernel_version":"0.3.0-rc.1"}'
+request redeem "$redeem" | python3 -c 'import json,sys; assert json.load(sys.stdin) == {"kernel_version":"0.3.0-rc.1"}'
+request create "$create" | python3 -c 'import json,sys; data=json.load(sys.stdin); assert (data["name"], data["auth_state"], data["kernel_version"]) == ("Fixture", "unverified", "0.3.0-rc.1")'
 request install-payload | python3 -c 'import json,sys; assert json.load(sys.stdin)["version"] == sys.argv[1]' "$version"
 [[ ! -e $fixture/state/environments.json ]]
 [[ $("$fixture/payload/current/agy" --version) == 1.5.9 ]]
@@ -96,12 +113,18 @@ request create "$create" | python3 -c 'import json,sys; data=json.load(sys.stdin
 [[ -x $fixture/payload/current/craggemini && -x $fixture/payload/current/agy ]]
 stop
 start
-request list | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["payload_state"] == "installed" and data["environments"][0]["name"] == "Fixture"'
+request list | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["payload_state"] == "installed" and data["release_activated"] is True and data["environments"][0]["name"] == "Fixture" and data["environments"][0]["runtime_ready"] is False'
 chmod -x "$fixture/payload/current/agy"
 request list | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["payload_issue"] == "gemini_payload_incomplete" and data["environments"][0]["kernel_version"] is None'
 chmod +x "$fixture/payload/current/agy"
 request list | python3 -c 'import json,sys; assert json.load(sys.stdin)["payload_state"] == "installed"'
 stop
+mv "$fixture/release.json" "$fixture/held-release.json"
+start
+request list | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["payload_state"] == "installed" and data["release_activated"] is False'
+request create "$create" | python3 -c 'import json,sys; assert json.load(sys.stdin)["code"] == "gemini_release_redemption_required"'
+stop
+mv "$fixture/held-release.json" "$fixture/release.json"
 
 python3 - "$fixture" <<'PY'
 import os
@@ -135,7 +158,7 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as listener:
         host.terminate()
         assert host.wait(timeout=10) == 0
 PY
-printf '%s\n' 'Gemini host: readiness, signature enforcement, eager/lazy install, real agy and restart persistence passed.'
+printf '%s\n' 'Gemini host: readiness, single release code, signature enforcement, redemption, eager/lazy install, real agy and restart persistence passed.'
 
 python3 -I - "$fixture" <<'PY'
 import base64
@@ -284,5 +307,21 @@ with patch.dict(probe.__globals__, {
 
 with patch.dict(probe.__globals__, {"get_json": lambda *_: (401, {})}):
     assert module["probe_api_key"](proxy, "fixture")["state"] == "reauth_required"
+
+def model_reply(proxy_url, url, header, body, *, timeout):
+    assert proxy_url == proxy
+    assert url == 'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-pro:generateContent'
+    return 200, {"candidates": [{"content": {"parts": [
+        {"text": "hidden", "thought": True}, {"text": "pong"},
+    ]}, "finishReason": "STOP"}], "usageMetadata": {
+        "promptTokenCount": 8, "cachedContentTokenCount": 3, "candidatesTokenCount": 1,
+    }}
+
+with patch.dict(probe.__globals__, {"get_json": model_reply}):
+    answer = module["test_api_key"](proxy, "fixture", "gemini-3.1-pro", "ping")
+    assert answer == {"status": 200, "text": "pong", "stop_reason": "STOP", "usage": {
+        "input_tokens": 5, "cache_read_input_tokens": 3, "output_tokens": 1,
+    }}
+print("Gemini diagnostic: visible reply and disjoint upstream usage passed.")
 print("Gemini account reads: OAuth and API key fixtures, quota zero, credential redaction and failure status passed.")
 PY
