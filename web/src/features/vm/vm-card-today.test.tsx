@@ -7,11 +7,6 @@ import { VmDetailCard } from './vm-detail-card'
 import { VmRowDetail } from './vm-row-detail'
 
 vi.mock('./vm-actions-context', () => ({ useVmActions: () => ({}) }))
-vi.mock('./vm-action-menu', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('./vm-action-menu')>()),
-  VmActionMenu: () => null,
-}))
-vi.mock('./vm-perms', () => ({ useVmPerms: () => ({ admin: false }) }))
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ children }: { children?: ReactNode }) => <a>{children}</a>,
 }))
@@ -28,10 +23,26 @@ function render(node: ReactNode) {
   )
 }
 
+async function renderLoaded(node: ReactNode) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  client.setQueryData(['panel', 'vm', 'vm-01', 'health', '24h'], {
+    range: '24h',
+    slot_min: 30,
+    start: '2026-11-21T00:00:00.000Z',
+    buckets: [[1, 0]],
+    top_errors: [],
+  })
+  return renderToStaticMarkup(
+    <QueryClientProvider client={client}>{node}</QueryClientProvider>
+  )
+}
+
 describe('VM card today cost wording', () => {
-  it('names Shanghai-calendar spend as Beijing time', () => {
+  it('names Shanghai-calendar spend as Beijing time', async () => {
     const card = render(<VmDetailCard vm={vm} onOpenChange={() => undefined} />)
-    const row = render(
+    const row = await renderLoaded(
       <VmRowDetail
         vm={vm}
         now={0}
@@ -55,5 +66,8 @@ describe('VM card today cost wording', () => {
     expect(row).not.toContain('>7D</button>')
     expect(row).not.toContain('7D 成功 / 失败')
     expect(row).not.toContain('每请求 · 7D')
+    expect(row).toContain('有请求的时段')
+    expect(row).toContain('1 / 48')
+    expect(row).not.toContain('有请求时长')
   })
 })
