@@ -204,7 +204,7 @@ export function OverviewPage() {
             />
             <KpiCard
               icon={Server}
-              label='在线'
+              label='判定为运行的虚拟机'
               value={
                 <>
                   {running}
