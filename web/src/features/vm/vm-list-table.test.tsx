@@ -129,7 +129,7 @@ describe('VM account column kernel label', () => {
         'CRAGAnti',
         '宿主机',
         '已授权',
-        '载荷未启用推理',
+        '尚未拉取模型，不能调度',
         'px-011f7746',
       ]) {
         expect(html).toContain(label)

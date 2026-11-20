@@ -10,6 +10,7 @@ import {
   Magnet,
   Network,
   PackageCheck,
+  Sparkles,
   RadioTower,
   ScrollText,
   ShieldCheck,
@@ -31,6 +32,7 @@ export const SETTINGS_TABS = [
   ['socks5', 'SOCKS5'],
   ['backup', '备份'],
   ['about', '关于'],
+  ['gemini', 'Gemini'],
 ] as const
 
 export type SettingsTabId = (typeof SETTINGS_TABS)[number][0]
@@ -75,6 +77,7 @@ export const SETTINGS_NAV_GROUPS: {
       { id: 'logs', icon: ScrollText },
       { id: 'backup', icon: Archive },
       { id: 'about', icon: Info },
+      { id: 'gemini', icon: Sparkles },
     ],
   },
 ]

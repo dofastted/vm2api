@@ -104,8 +104,13 @@ export function isGeminiPublicPath(value) {
 export function geminiKeyAllowsPath(pathname, method) {
   return (
     isGeminiPublicPath(pathname) ||
+    (method === 'POST' && (pathname === '/v1/messages' || pathname === '/messages')) ||
     (method === 'GET' && ['/models', '/v1/models', '/v1/usage', '/v1/me/quota', '/v1/me/usage'].includes(pathname))
   )
+}
+
+export function geminiProxyFor(proxyPool, proxyId) {
+  return proxyFor(proxyPool, proxyId)
 }
 
 function hostError(code, status = 503) {
@@ -379,10 +384,10 @@ function boundProxy(proxyPool, environment, options) {
   return { proxy_id: environment.proxy_id, proxy_url: proxyFor(proxyPool(), environment.proxy_id, options) }
 }
 
-const defaultCallHost = (operation, payload) =>
+export const callGeminiHost = (operation, payload) =>
   hostRequest(process.env.KIN_GEMINI_HOST_SOCKET ?? '/run/vm2api-gemini/control.sock', operation, payload)
 
-export function createGeminiTerminal({ proxyPool, callHost = defaultCallHost }) {
+export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
   return createGeminiTerminalBridge({
     callHost,
     async resolveTarget(id) {
@@ -418,7 +423,7 @@ export function createGeminiTerminal({ proxyPool, callHost = defaultCallHost }) 
   })
 }
 
-export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, callHost = defaultCallHost }) {
+export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, callHost = callGeminiHost }) {
   return async function handleGeminiPanel(req, res, pathname) {
     const ok = (data) => json(res, 200, { ok: true, data })
     const fail = (status, code, message = code) => json(res, status, { ok: false, error: { code, message } })
@@ -612,22 +617,96 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
   }
 }
 
-export function handleGeminiPublic(req, res, json) {
-  res.setHeader('Cache-Control', 'no-store')
-  if (req.apiKeyKind !== 'managed' || req.apiKeyRecord?.group_type !== 'gemini') {
-    return json(res, 403, {
+function publicError(error) {
+  const code = typeof error?.code === 'string' ? error.code : FAILURE
+  const known = HOST_ERRORS[code]
+  const status = Number.isInteger(error?.status) ? error.status : known?.[0] || 503
+  return {
+    status,
+    body: {
       error: {
-        type: 'permission_error',
-        code: 'gemini_key_required',
-        message: 'This endpoint requires a dedicated Gemini API key.',
+        type: status === 429 ? 'rate_limit_error' : status >= 500 ? 'api_error' : 'invalid_request_error',
+        code,
+        message: known?.[1] || error?.message || 'Gemini request failed.',
       },
-    })
-  }
-  return json(res, 503, {
-    error: {
-      type: 'service_unavailable',
-      code: 'gemini_runtime_not_supported',
-      message: 'The current CRAGAnti payload does not support Google OAuth inference.',
     },
-  })
+  }
+}
+
+function anthropicText(content) {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content) || content.length !== 1 || content[0]?.type !== 'text') return ''
+  return typeof content[0].text === 'string' ? content[0].text : ''
+}
+
+export function geminiTurnFromBody(body) {
+  const model = typeof body?.model === 'string' ? body.model : ''
+  let text = ''
+  if (typeof body?.input === 'string') text = body.input
+  else if (Array.isArray(body?.messages) && body.messages.length === 1) text = anthropicText(body.messages[0]?.content)
+  else if (Array.isArray(body?.contents) && body.contents.length === 1) {
+    const parts = body.contents[0]?.parts
+    text = Array.isArray(parts) && parts.length === 1 && typeof parts[0]?.text === 'string' ? parts[0].text : ''
+  }
+  return MODEL.test(model) && text.trim() ? { model, text } : null
+}
+
+export function createGeminiPublicHandler({ json, readBody, scheduler }) {
+  return async function handleGeminiPublic(req, res) {
+    res.setHeader('Cache-Control', 'no-store')
+    if (req.apiKeyKind !== 'managed' || req.apiKeyRecord?.group_type !== 'gemini') {
+      return json(res, 403, {
+        error: {
+          type: 'permission_error',
+          code: 'gemini_key_required',
+          message: 'This endpoint requires a dedicated Gemini API key.',
+        },
+      })
+    }
+    const url = new URL(req.url || PUBLIC_PATH, 'http://127.0.0.1')
+    if (req.method === 'GET' && url.pathname === PUBLIC_PATH) {
+      try {
+        const catalog = await scheduler.catalog()
+        return json(res, 200, { object: 'list', data: catalog.models })
+      } catch (error) {
+        const mapped = publicError(error)
+        return json(res, mapped.status, mapped.body)
+      }
+    }
+    const session = /^\/v1\/gemini\/sessions\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/.exec(url.pathname)
+    if (req.method !== 'POST' || !session) return json(res, 404, { error: { code: 'not_found', message: 'not found' } })
+    let body = req.body
+    if (body == null) {
+      try {
+        body = await readBody(req, 256 * 1024)
+      } catch (error) {
+        return json(res, error?.status || 400, { error: { code: 'invalid_json', message: 'Invalid JSON body.' } })
+      }
+    }
+    const requested = geminiTurnFromBody(body)
+    if (!requested) {
+      return json(res, 400, {
+        error: { code: 'gemini_unsupported_turn', message: 'Send one plain-text turn and a Gemini model id.' },
+      })
+    }
+    const controller = new AbortController()
+    req.once('aborted', () => controller.abort())
+    res.once('close', () => {
+      if (!res.writableEnded) controller.abort()
+    })
+    try {
+      const turn = await scheduler.complete({ model: requested.model, text: requested.text, signal: controller.signal, apiKeyRecord: req.apiKeyRecord })
+      return json(res, 200, {
+        id: session[1],
+        model: turn.model,
+        account_id: turn.account_id,
+        output_text: turn.text,
+        usage: turn.usage,
+      })
+    } catch (error) {
+      if (controller.signal.aborted) return
+      const mapped = publicError(error)
+      return json(res, mapped.status, mapped.body)
+    }
+  }
 }

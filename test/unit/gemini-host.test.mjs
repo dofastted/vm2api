@@ -6,12 +6,14 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { authorizePanelRoute } from '../../src/lib/admin/panel-acl.mjs'
+import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
 import { dispatchGeminiNativeTurn, prepareGeminiNativeTurn } from '../../src/lib/gemini/native-turn.mjs'
 import { AGY_SHA256, installGeminiPayload, readSignedGeminiManifest } from '../../src/lib/gemini/payload.mjs'
 import {
   createGeminiPanelHandler,
+  callGeminiHost,
+  createGeminiPublicHandler,
   geminiKeyAllowsPath,
-  handleGeminiPublic,
   officialGeminiAuthUrl,
 } from '../../src/lib/gemini/routes.mjs'
 
@@ -569,18 +571,95 @@ test('official login links are validated and code is returned only to its select
   )
 })
 
-test('missing official settlement cannot be enabled by a host response or a paid route request', () => {
+test('Gemini public routes schedule one plain-text turn and reject other keys', async () => {
   const respond = (_res, status, body) => ({ status, body })
-  const res = { setHeader() {} }
+  const calls = []
+  const handle = createGeminiPublicHandler({
+    json: respond,
+    readBody: async () => ({ model: 'gemini-3-pro', input: 'hello' }),
+    scheduler: {
+      async catalog() {
+        return { models: [{ id: 'gemini-3-pro', object: 'model', owned_by: 'google' }] }
+      },
+      async complete(request) {
+        calls.push(request)
+        return { text: 'ok', usage: { input_tokens: 1, output_tokens: 1 }, account_id: 'gemini-fixture', model: request.model }
+      },
+    },
+  })
+  const res = { setHeader() {}, once() {} }
   for (const group_type of ['all', 'anthropic', 'openai']) {
-    const denied = handleGeminiPublic({ apiKeyKind: 'managed', apiKeyRecord: { group_type } }, res, respond)
+    const denied = await handle({ apiKeyKind: 'managed', apiKeyRecord: { group_type }, once() {} }, res)
     assert.equal(denied.status, 403)
     assert.equal(denied.body.error.code, 'gemini_key_required')
   }
-  assert.equal(handleGeminiPublic({ apiKeyKind: 'master' }, res, respond).status, 403)
-  const result = handleGeminiPublic({ apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' } }, res, respond)
-  assert.equal(result.status, 503)
-  assert.equal(result.body.error.code, 'gemini_runtime_not_supported')
+  assert.equal((await handle({ apiKeyKind: 'master', once() {} }, res)).status, 403)
+  const listed = await handle(
+    { method: 'GET', url: '/v1/gemini/sessions', apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' }, once() {} },
+    res,
+  )
+  assert.equal(listed.status, 200)
+  assert.equal(listed.body.data[0].id, 'gemini-3-pro')
+  const result = await handle(
+    { method: 'POST', url: '/v1/gemini/sessions/turn-1', apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' }, once() {} },
+    res,
+  )
+  assert.equal(result.status, 200)
+  assert.equal(result.body.output_text, 'ok')
+  assert.equal(calls.length, 1)
+  const bad = createGeminiPublicHandler({
+    json: respond,
+    readBody: async () => ({ model: 'gemini-3-pro', input: ['not text'] }),
+    scheduler: { catalog() {}, complete() {} },
+  })
+  const rejected = await bad(
+    { method: 'POST', url: '/v1/gemini/sessions/turn-2', apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' }, once() {} },
+    res,
+  )
+  assert.equal(rejected.status, 400)
+  assert.equal(rejected.body.error.code, 'gemini_unsupported_turn')
+})
+
+test('the public scheduler completes one turn through the host socket', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-public-'))
+  const socketPath = path.join(directory, 'control.sock')
+  const account = { id: 'gemini-fixture', auth_state: 'authorized', proxy_id: 'px-fixture', models_discovered: true, models: ['gemini-3-pro'] }
+  const server = http.createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString() || '{}')
+      const payload = request.url === '/list' ? { environments: [account] }
+        : request.url === '/get' ? account
+        : request.url === '/test-chat' && body.prompt === 'hello' ? { run_id: runId }
+        : request.url === '/test-chat-status' ? { state: 'completed', text: 'ready', usage: { input_tokens: 1, output_tokens: 1 } }
+        : null
+      response.writeHead(payload ? 200 : 404, { 'Content-Type': 'application/json' })
+      response.end(JSON.stringify(payload || { code: 'gemini_host_protocol_error' }))
+    })
+  })
+  const previous = process.env.KIN_GEMINI_HOST_SOCKET
+  process.env.KIN_GEMINI_HOST_SOCKET = socketPath
+  const scheduler = createGeminiScheduler({ callHost: callGeminiHost, resolveProxy: () => proxyUrl })
+  const handle = createGeminiPublicHandler({
+    json: (_response, status, body) => ({ status, body }),
+    readBody: async () => ({ model, input: 'hello' }),
+    scheduler,
+  })
+  try {
+    await new Promise((resolve, reject) => server.once('error', reject).listen(socketPath, resolve))
+    const result = await handle({
+      method: 'POST', url: '/v1/gemini/sessions/turn-1', apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' }, once() {},
+    }, { setHeader() {}, once() {} })
+    assert.equal(result.status, 200)
+    assert.equal(result.body.output_text, 'ready')
+    assert.equal(result.body.account_id, account.id)
+  } finally {
+    if (previous === undefined) delete process.env.KIN_GEMINI_HOST_SOCKET
+    else process.env.KIN_GEMINI_HOST_SOCKET = previous
+    if (server.listening) await new Promise((resolve) => server.close(resolve))
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 test('Gemini keys cannot reach other inference endpoints via HTTP or WebSocket', () => {
@@ -588,7 +667,6 @@ test('Gemini keys cannot reach other inference endpoints via HTTP or WebSocket',
     '/v1/responses',
     '/responses',
     '/v1/chat/completions',
-    '/v1/messages',
     '/v1/images/edits',
     '/admin/models/refresh',
   ]) {
@@ -596,6 +674,8 @@ test('Gemini keys cannot reach other inference endpoints via HTTP or WebSocket',
     assert.equal(geminiKeyAllowsPath(route, 'GET'), false)
   }
   assert.equal(geminiKeyAllowsPath('/v1/gemini/sessions', 'POST'), true)
+  assert.equal(geminiKeyAllowsPath('/v1/messages', 'POST'), true)
+  assert.equal(geminiKeyAllowsPath('/messages', 'POST'), true)
   assert.equal(geminiKeyAllowsPath('/v1/me/quota', 'GET'), true)
 })
 

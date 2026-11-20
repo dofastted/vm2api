@@ -199,7 +199,7 @@ export function SettingsPage() {
     serverJson !== null &&
     Object.keys(draft).length > 0 &&
     JSON.stringify(draft) !== serverJson
-  const hideSave = tab === 'socks5' || tab === 'backup' || tab === 'about'
+  const hideSave = tab === 'socks5' || tab === 'backup' || tab === 'about' || tab === 'gemini'
   const showSaveBar = dirty && !hideSave
 
   const discard = () => {
@@ -515,6 +515,7 @@ export function SettingsPage() {
               {tab === 'socks5' ? <Socks5Pane /> : null}
               {tab === 'backup' ? <BackupPane /> : null}
               {tab === 'about' ? <AboutPane /> : null}
+              {tab === 'gemini' ? <GeminiInstallPane /> : null}
             </div>
           </QueryGate>
         </div>
