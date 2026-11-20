@@ -211,12 +211,7 @@ export function VmActionsProvider({
           <DialogContent className='max-h-[85dvh] overflow-y-auto sm:max-w-2xl'>
             <DialogHeader>
               <DialogTitle>{geminiTarget.name || geminiTarget.id}</DialogTitle>
-              <DialogDescription>
-                {geminiTarget.gemini?.auth_method === 'api_key'
-                  ? 'Gemini API Key 宿主环境'
-                  : 'Antigravity 宿主机账号'}{' '}
-                · {geminiTarget.proxy_id}
-              </DialogDescription>
+              <DialogDescription>Gemini 宿主环境</DialogDescription>
             </DialogHeader>
             <GeminiEnvironments
               key={geminiTarget.id}

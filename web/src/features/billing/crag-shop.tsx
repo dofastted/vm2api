@@ -18,6 +18,7 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { PageHeader } from '@/components/page-header'
 import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
+import { geminiInventoryOptions } from '@/features/import/gemini-environments'
 import {
   cragHostStatusLabels,
   cragHostStatusVariant,
@@ -1155,7 +1156,15 @@ function ShopOrders({
               <Link to='/crag-purchase'>免登录购买到本机</Link>
             )}
           </Button>
-          {isAdmin && !device ? <GeminiRedeemDialog /> : null}
+          {isAdmin && !device ? (
+            <GeminiRedeemDialog
+              onRedeemed={() => {
+                void qc.invalidateQueries({
+                  queryKey: geminiInventoryOptions().queryKey,
+                })
+              }}
+            />
+          ) : null}
         </div>
       }
     >

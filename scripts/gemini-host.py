@@ -6,6 +6,7 @@ import fcntl
 import grp
 import hashlib
 import hmac
+import importlib.util
 from http.server import BaseHTTPRequestHandler
 import ipaddress
 import json
@@ -57,6 +58,7 @@ CODE = re.compile(r"[A-Za-z0-9._~/-]{1,2048}\Z")
 API_KEY = re.compile(r"[A-Za-z0-9_-]{20,256}\Z")
 RELEASE_CODE = re.compile(r"CGG1-[A-Za-z0-9_-]{43}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
+MANUAL_RELEASE = Path("/etc/vm2api/gemini-release.json")
 AUTH_LINK = re.compile(
     rb"\x1b\]8;[^;\x1b]*;(https://accounts\.google\.com/o/oauth2/auth\?[^\x07\x1b]{1,4096})(?:\x07|\x1b\\)"
 )
@@ -71,6 +73,19 @@ PAYLOAD_FILES = (
     "craggemini",
     "libagy_bridge.so",
 )
+INFERENCE_MODULE = ROOT / "scripts/gemini_host_inference.py"
+MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
+RUN_TTL = 90
+
+
+def invocation_module():
+    check_root_owned(INFERENCE_MODULE)
+    spec = importlib.util.spec_from_file_location(
+        "gemini_host_inference", INFERENCE_MODULE
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class Failure(Exception):
@@ -83,31 +98,33 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def read_account(uid, proxy_url, method, api_key=None, profile=None, **parameters):
+def account_command(uid, method, profile=None):
+    return [
+        "setpriv",
+        "--reuid",
+        str(uid),
+        "--regid",
+        str(uid),
+        "--clear-groups",
+        "--no-new-privs",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--bounding-set=-all",
+        sys.executable,
+        "-I",
+        str(ROOT / "scripts/gemini_host_account.py"),
+        method,
+        *([str(profile)] if profile is not None else []),
+    ]
+
+
+def read_account(uid, proxy_url, method, api_key=None, profile=None):
     try:
         result = subprocess.run(
-            [
-                "setpriv",
-                "--reuid",
-                str(uid),
-                "--regid",
-                str(uid),
-                "--clear-groups",
-                "--no-new-privs",
-                "--inh-caps=-all",
-                "--ambient-caps=-all",
-                "--bounding-set=-all",
-                sys.executable,
-                "-I",
-                str(ROOT / "scripts/gemini_host_account.py"),
-                method,
-                *([str(profile)] if profile is not None else []),
-            ],
-            input=json.dumps(
-                {"proxy_url": proxy_url, "api_key": api_key, **parameters}
-            ).encode(),
+            account_command(uid, method, profile),
+            input=json.dumps({"proxy_url": proxy_url, "api_key": api_key}).encode(),
             check=True,
-            timeout=23 if method == "test_chat" else 17,
+            timeout=17,
             capture_output=True,
             env=SYSTEM_ENV,
         )
@@ -144,6 +161,37 @@ def check_root_owned(target):
             )
 
 
+def read_root_file(path, limit):
+    check_root_owned(path)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), "rb") as data:
+        info = os.fstat(data.fileno())
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_mode & 0o022
+            or not 0 < info.st_size <= limit
+        ):
+            raise ValueError("Invalid Gemini file")
+        value = data.read(limit + 1)
+        if not 0 < len(value) <= limit:
+            raise ValueError("Invalid Gemini file size")
+        return value
+
+
+def read_release_verifier(path):
+    value = json.loads(read_root_file(path, 1024))
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"manifest_sha256", "code_sha256"}
+        or any(
+            not isinstance(v, str) or not SHA256.fullmatch(v) for v in value.values()
+        )
+    ):
+        raise ValueError("Invalid Gemini release verifier")
+    return value
+
+
 def proxy_config(value):
     if not isinstance(value, str) or len(value) > 4096:
         raise Failure(400)
@@ -169,7 +217,7 @@ def proxy_config(value):
     return str(address), str(port)
 
 
-def profile_secrets(profile, uid):
+def profile_secrets(profile, uid, *, include_raw=False):
     """Open only beneath a root-owned profile, without traversing symlinks."""
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     fd = None
@@ -206,7 +254,7 @@ def profile_secrets(profile, uid):
         access = credential.get("access_token")
         if not isinstance(access, str) or not ACCESS_TOKEN.fullmatch(access):
             return None
-        return tuple(
+        secrets = tuple(
             value
             for value in (
                 access,
@@ -215,6 +263,7 @@ def profile_secrets(profile, uid):
             )
             if isinstance(value, str) and 1 <= len(value) <= 16384 and value.isascii()
         )
+        return (secrets, raw) if include_raw else secrets
     except (OSError, ValueError, RecursionError):
         return None
     finally:
@@ -284,12 +333,7 @@ class Agy:
         work.mkdir(mode=0o700)
         os.chown(work, self.uid, self.uid)
         if self.profile is None:
-            settings = home / ".gemini" / "antigravity-cli"
-            for private in (home, home / ".gemini", settings):
-                private.mkdir(mode=0o700)
-                os.chown(private, self.uid, self.uid)
-            private_json(settings / "settings.json", CLI_SETTINGS)
-            os.chown(settings / "settings.json", self.uid, self.uid)
+            self.initialize_home(home)
         config = self.directory / "egress.json"
         private_json(
             config,
@@ -424,6 +468,19 @@ class Agy:
             "--setenv",
             "AGY_CLI_DISABLE_AUTO_UPDATE",
             "true",
+        ]
+        self.launch_cli(self.launch_args(self.uid) + sandbox, size)
+
+    def initialize_home(self, home):
+        settings = home / ".gemini" / "antigravity-cli"
+        for private in (home, home / ".gemini", settings):
+            private.mkdir(mode=0o700)
+            os.chown(private, self.uid, self.uid)
+        private_json(settings / "settings.json", CLI_SETTINGS)
+        os.chown(settings / "settings.json", self.uid, self.uid)
+
+    def launch_cli(self, argv, size):
+        argv += [
             "--setenv",
             "SSH_TTY",
             "/dev/tty",
@@ -431,15 +488,10 @@ class Agy:
             "SSH_CONNECTION",
             "127.0.0.1 12345 127.0.0.1 22",
             "--",
-            *(
-                ["/usr/bin/python3", "-I", "-c", TERMINAL_EXEC]
-                if self.profile is not None
-                else []
-            ),
-            "/opt/agy",
-            "--mode",
-            "plan",
         ]
+        if self.profile is not None:
+            argv += ["/usr/bin/python3", "-I", "-c", TERMINAL_EXEC]
+        argv += ["/opt/agy", "--mode", "plan"]
         self.pid, self.terminal = pty.fork()
         if self.pid == 0:
             try:
@@ -450,7 +502,6 @@ class Agy:
                 if self.profile is not None:
                     with open(os.devnull, "wb") as quiet:
                         os.dup2(quiet.fileno(), 2)
-                argv = self.launch_args(self.uid) + sandbox
                 os.execvpe(argv[0], argv, SYSTEM_ENV)
             finally:
                 os._exit(125)
@@ -549,6 +600,66 @@ class Agy:
             else:
                 shutil.rmtree(self.directory)
             self.owns_directory = False
+
+
+class Headless(Agy):
+    def __init__(self, host, environment, proxy_url, auth, args, prompt):
+        self.invocation = None
+        self.credentials, self.token_bytes = auth
+        self.args, self.prompt = args, prompt
+        super().__init__(host, environment, proxy_url)
+
+    def initialize_home(self, home):
+        super().initialize_home(home)
+        settings = home / ".gemini" / "antigravity-cli"
+        private_json(
+            settings / "settings.json",
+            {
+                **CLI_SETTINGS,
+                "permissions": {
+                    "deny": [
+                        "read_file(*)",
+                        "write_file(*)",
+                        "command(*)",
+                        "mcp(*)",
+                        "read_url(*)",
+                        "execute_url(*)",
+                    ]
+                },
+            },
+        )
+        os.chown(settings / "settings.json", self.uid, self.uid)
+        token = settings / TOKEN_NAME
+        token.write_bytes(self.token_bytes)
+        os.chown(token, self.uid, self.uid)
+        self.token_bytes = None
+
+    def launch_cli(self, argv, size):
+        self.invocation = invocation_module().Invocation(
+            argv + ["--", "/opt/agy", *self.args],
+            SYSTEM_ENV,
+            self.prompt,
+            secrets=self.credentials,
+        )
+
+    def poll(self):
+        if self.egress.poll() is not None:
+            return {
+                "state": "failed",
+                "text": "",
+                "error": {
+                    "code": "gemini_proxy_error",
+                    "message": "Gemini egress stopped",
+                },
+            }
+        return self.invocation.poll()
+
+    def close(self, preserve=False):
+        try:
+            if self.invocation is not None:
+                self.invocation.close()
+        finally:
+            super().close(preserve)
 
 
 class Login(Agy):
@@ -823,8 +934,12 @@ class Host:
         self.payload = args.payload
         self.payload_source = args.payload_source
         self.public_key = args.public_key
-        self.release = args.release_verifier
+        self.default_public_key = args.default_public_key
+        self.default_release = args.default_release_verifier
+        self.manual_release = args.release_verifier or MANUAL_RELEASE
+        self.manual_release_optional = args.release_verifier is None
         self.activation = self.directory / "release-activation.json"
+        self.verified_payload = None
         self.payload_version = None
         self.payload_state = "not_configured"
         self.payload_issue = None
@@ -834,6 +949,7 @@ class Host:
         self.state_file = self.directory / "environments.json"
         self.pending = {}
         self.terminals = {}
+        self.runs = {}
         self.network_scope = os.stat("/proc/self/ns/net").st_ino
         self.environments = (
             json.loads(self.state_file.read_bytes()) if self.state_file.exists() else {}
@@ -883,9 +999,9 @@ class Host:
             self.save()
         self.inspect_payload()
 
-    def verify_payload(self, source, install=False):
+    def verify_payload(self, source, public_key, install=False):
         check_root_owned(source)
-        check_root_owned(self.public_key)
+        check_root_owned(public_key)
         for name in PAYLOAD_FILES:
             check_root_owned(source / name)
         output = subprocess.run(
@@ -895,7 +1011,7 @@ class Host:
                 "--source",
                 str(source),
                 "--public-key",
-                str(self.public_key),
+                str(public_key),
                 *(["--dest", str(self.payload)] if install else ["--check"]),
             ],
             check=True,
@@ -911,137 +1027,176 @@ class Host:
             raise RuntimeError("Unexpected Gemini installer response")
         return version[1]
 
-    def payload_inputs_issue(self, source):
-        if not self.public_key.is_file():
-            return "gemini_public_key_missing"
-        if source is None or not source.is_dir():
-            return "gemini_payload_source_missing"
-        if any(not (source / name).is_file() for name in PAYLOAD_FILES):
-            return "gemini_payload_incomplete"
-        if source == self.payload and any(
-            not os.access(source / name, os.X_OK) for name in ("agy", "craggemini")
-        ):
-            return "gemini_payload_incomplete"
-        return None
-
-    def inspect_payload(self):
-        installed = self.payload.exists() or self.payload.is_symlink()
-        source = self.payload if installed else self.payload_source
-        self.payload_version = None
-        issue = self.payload_inputs_issue(source)
-        if issue:
-            self.payload_state = "not_configured"
-            self.payload_issue = issue
-            return
-        if installed:
-            try:
-                self.payload_version = self.verify_payload(source)
-            except (OSError, RuntimeError, subprocess.SubprocessError):
-                self.payload_state = "invalid"
-                self.payload_issue = "gemini_payload_invalid"
-                print("Installed Gemini payload failed verification", file=sys.stderr)
-                return
-        self.payload_state = "installed" if installed else "awaiting_redemption"
-        self.payload_issue = None
-
-    def release_verifier(self):
+    def release_verifier(self, path, optional=False):
         try:
-            check_root_owned(self.release)
-            info = self.release.stat()
-            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 1024:
-                raise ValueError()
-            value = json.loads(self.release.read_bytes())
-            if (
-                not isinstance(value, dict)
-                or set(value) != {"manifest_sha256", "code_sha256"}
-                or any(
-                    not isinstance(v, str) or not SHA256.fullmatch(v)
-                    for v in value.values()
-                )
-            ):
-                raise ValueError()
-            return value
+            return read_release_verifier(path)
         except FileNotFoundError:
+            if optional:
+                return None
             raise Failure(503, "gemini_release_not_configured") from None
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, ValueError, RecursionError):
             raise Failure(503, "gemini_release_invalid") from None
 
-    def manifest_digest(self, source):
-        manifest = source / "manifest.json"
-        check_root_owned(manifest)
-        info = manifest.stat()
-        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 8192:
-            raise RuntimeError("Invalid Gemini manifest file")
-        return hashlib.sha256(manifest.read_bytes()).hexdigest()
-
-    def release_activated(self):
-        if self.payload_state != "installed" or not self.activation.is_file():
-            return False
-        try:
-            verifier = self.release_verifier()
-            return (
-                json.loads(self.activation.read_bytes()) == verifier
-                and self.manifest_digest(self.payload) == verifier["manifest_sha256"]
+    def payload_config(self):
+        installed = self.payload.exists() or self.payload.is_symlink()
+        source = self.payload if installed else self.payload_source
+        if source is None or not source.is_dir():
+            raise Failure(503, "gemini_payload_source_missing")
+        if any(not (source / name).is_file() for name in PAYLOAD_FILES):
+            raise Failure(503, "gemini_payload_incomplete")
+        if installed and any(
+            not os.access(source / name, os.X_OK) for name in ("agy", "craggemini")
+        ):
+            raise Failure(503, "gemini_payload_incomplete")
+        digest = hashlib.sha256(
+            read_root_file(source / "manifest.json", 8192)
+        ).hexdigest()
+        default = (
+            self.release_verifier(self.default_release)
+            if self.default_release
+            else None
+        )
+        # The shell pins the default verifier. A different manifest must never
+        # be validated with the staged default key, even as a fallback.
+        if default is not None and digest == default["manifest_sha256"]:
+            public_key, verifier = self.default_public_key, default
+        else:
+            public_key = self.public_key
+            verifier = self.release_verifier(
+                self.manual_release, self.manual_release_optional
             )
-        except (Failure, OSError, RuntimeError, ValueError):
+            if verifier is not None:
+                # Only a genuinely unconfigured legacy install is exempt.
+                self.manual_release_optional = False
+                if digest != verifier["manifest_sha256"]:
+                    raise Failure(409, "gemini_release_payload_mismatch")
+        if not public_key.is_file():
+            raise Failure(503, "gemini_public_key_missing")
+        check_root_owned(public_key)
+        return source, installed, public_key, verifier, digest
+
+    def payload_identity(self, source, public_key, digest):
+        # Hash large binaries only on first use or when a trusted input changes.
+        files = (public_key, source, *(source / name for name in PAYLOAD_FILES))
+        stats = (entry.lstat() for entry in files)
+        identities = tuple(
+            (
+                s.st_dev,
+                s.st_ino,
+                s.st_mode,
+                s.st_uid,
+                s.st_size,
+                s.st_ctime_ns,
+                s.st_mtime_ns,
+            )
+            for s in stats
+        )
+        return (source, public_key, digest, identities)
+
+    def release_activated(self, verifier):
+        try:
+            return read_release_verifier(self.activation) == verifier
+        except (OSError, RuntimeError, ValueError, RecursionError):
             return False
+
+    def load_payload(
+        self, *, materialize=False, verify_again=False, legacy_install=False
+    ):
+        try:
+            source, installed, public_key, verifier, digest = self.payload_config()
+            install = not installed and (
+                materialize or (legacy_install and verifier is None)
+            )
+            version = None
+            if installed or install:
+                identity = self.payload_identity(source, public_key, digest)
+                if install:
+                    check_root_owned(self.payload.parent)
+                cached = None if verify_again else self.verified_payload
+                if not install and cached is not None and identity == cached[0]:
+                    version = cached[1]
+                else:
+                    version = self.verify_payload(source, public_key, install=install)
+                    if install:
+                        target_digest = hashlib.sha256(
+                            read_root_file(self.payload / "manifest.json", 8192)
+                        ).hexdigest()
+                        if target_digest != digest:
+                            raise RuntimeError(
+                                "Gemini manifest changed during installation"
+                            )
+                        identity = self.payload_identity(
+                            self.payload, public_key, digest
+                        )
+                    elif self.payload_identity(source, public_key, digest) != identity:
+                        raise RuntimeError("Gemini payload changed during verification")
+                    self.verified_payload = (identity, version)
+                self.payload_state = (
+                    "installed"
+                    if verifier is None or self.release_activated(verifier)
+                    else "awaiting_redemption"
+                )
+            elif verifier is None:
+                self.payload_state = "install_on_create"
+            else:
+                raise Failure(503, "gemini_payload_not_installed")
+            self.payload_version = version
+            self.payload_issue = None
+            return verifier
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            if self.payload_issue != "gemini_payload_invalid":
+                print(
+                    "Gemini payload installation or verification failed",
+                    file=sys.stderr,
+                )
+            self.payload_failure("gemini_payload_invalid")
+            raise Failure(503, "gemini_payload_invalid") from None
+        except Failure as error:
+            self.payload_failure(error.code)
+            raise
+
+    def payload_failure(self, code):
+        self.payload_issue = code
+        self.payload_state = (
+            "not_configured"
+            if code
+            in (
+                "gemini_payload_source_missing",
+                "gemini_payload_incomplete",
+                "gemini_public_key_missing",
+                "gemini_payload_not_installed",
+            )
+            else "invalid"
+        )
+        self.payload_version = None
+        self.verified_payload = None
+
+    def inspect_payload(self):
+        try:
+            self.load_payload()
+        except Failure:
+            pass  # Inventory remains available for diagnosis even if not usable.
+
+    def ensure_payload(self, *, legacy_install=True):
+        self.load_payload(legacy_install=legacy_install)
+        if self.payload_state == "awaiting_redemption":
+            raise Failure(403, "gemini_release_redemption_required")
+        if self.payload_state != "installed":
+            raise Failure(503, "gemini_payload_not_installed")
 
     def redeem_payload(self, code):
         if not isinstance(code, str) or not RELEASE_CODE.fullmatch(code):
             raise Failure(400, "gemini_release_code_invalid")
-        verifier = self.release_verifier()
+        verifier = self.load_payload()
+        if verifier is None:
+            raise Failure(503, "gemini_release_not_configured")
         if not hmac.compare_digest(
-            hashlib.sha256(code.encode()).hexdigest(), verifier["code_sha256"]
+            hashlib.sha256(code.encode("ascii")).hexdigest(), verifier["code_sha256"]
         ):
             raise Failure(400, "gemini_release_code_invalid")
-        installed = self.payload.exists() or self.payload.is_symlink()
-        source = self.payload if installed else self.payload_source
-        issue = self.payload_inputs_issue(source)
-        if issue:
-            raise Failure(503, issue)
-        try:
-            if self.manifest_digest(source) != verifier["manifest_sha256"]:
-                raise Failure(409, "gemini_release_payload_mismatch")
-            if not installed:
-                check_root_owned(self.payload.parent)
-            version = self.verify_payload(source, install=not installed)
-        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-            print("Gemini payload redemption failed verification", file=sys.stderr)
-            raise Failure(503, "gemini_payload_invalid") from error
         private_json(self.activation, verifier)
-        self.payload_version = version
         self.payload_state = "installed"
-        self.payload_issue = None
-        return {"kernel_version": version}
-
-    def ensure_payload(self):
-        installed = self.payload.exists() or self.payload.is_symlink()
-        issue = self.payload_inputs_issue(
-            self.payload if installed else self.payload_source
-        )
-        if issue:
-            self.payload_state = "not_configured"
-            self.payload_issue = issue
-            self.payload_version = None
-            raise Failure(503, issue)
-        if not installed:
-            raise Failure(403, "gemini_release_redemption_required")
-        if self.payload_state == "installed":
-            if not self.release_activated():
-                raise Failure(403, "gemini_release_redemption_required")
-            return
-        self.payload_version = None
-        try:
-            self.payload_version = self.verify_payload(self.payload)
-        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-            self.payload_state = "invalid"
-            self.payload_issue = "gemini_payload_invalid"
-            print("Gemini payload installation or verification failed", file=sys.stderr)
-            raise Failure(503, "gemini_payload_invalid") from error
-        self.payload_state = "installed"
-        self.payload_issue = None
-        if not self.release_activated():
-            raise Failure(403, "gemini_release_redemption_required")
+        return {"kernel_version": self.payload_version}
 
     def oauth_runtime_issue(self):
         if any(
@@ -1215,6 +1370,195 @@ class Host:
         if terminal:
             terminal.close()
 
+    def stop_run(self, identifier):
+        entry = self.runs.pop(identifier, None)
+        if entry and entry["process"] is not None:
+            entry["process"].close()
+
+    def running(self, identifier):
+        entry = self.runs.get(identifier)
+        return bool(entry and entry["process"] is not None)
+
+    def update_run(self, entry):
+        if entry["process"] is None:
+            return entry["result"]
+        result = entry["process"].poll()
+        if result["state"] != "running" or time.monotonic() >= entry["deadline"]:
+            entry["process"].close()
+            entry["process"] = None
+            entry["result"] = (
+                result
+                if result["state"] != "running"
+                else {
+                    "state": "failed",
+                    "text": "",
+                    "error": {
+                        "code": "gemini_inference_timeout",
+                        "message": "Gemini request timed out",
+                    },
+                }
+            )
+            entry["deadline"] = time.monotonic() + RUN_TTL
+            return entry["result"]
+        return result
+
+    def operation_account(self, env):
+        self.ensure_payload(legacy_install=False)
+        if env["auth_state"] != "authorized":
+            code = (
+                "gemini_api_key_invalid"
+                if env.get("auth_method") == "api_key"
+                else "gemini_oauth_required"
+            )
+            raise Failure(409, code)
+        identifier = env["id"]
+        if (
+            self.running(identifier)
+            or identifier in self.terminals
+            or identifier in self.pending
+        ):
+            raise Failure(409, "gemini_operation_busy")
+        uid = self.uid_base + env["slot"]
+        directory = self.directory / identifier
+        if env.get("auth_method") == "api_key":
+            key = json.loads(read_root_file(directory / "credential.json", 1024)).get(
+                "api_key"
+            )
+            if isinstance(key, str) and API_KEY.fullmatch(key):
+                return uid, key, None
+            raise Failure(409, "gemini_api_key_invalid")
+        profile = env.get("profile")
+        auth = profile and profile_secrets(directory / profile, uid, include_raw=True)
+        if not auth:
+            raise Failure(409, "gemini_oauth_required")
+        issue = self.oauth_runtime_issue()
+        if issue:
+            raise Failure(503, issue)
+        return uid, None, auth
+
+    def pull_models(self, env, proxy_url):
+        uid, key, auth = self.operation_account(env)
+        if key:
+            data = read_account(uid, proxy_url, "api-key-models", api_key=key)
+            if data.get("state") == "reauth_required":
+                raise Failure(409, "gemini_api_key_invalid")
+            if data.get("state") not in ("ok", "partial"):
+                raise Failure(502, "gemini_proxy_error")
+            models = data.get("models", [])
+        else:
+            run = Headless(
+                self, env, proxy_url, auth, invocation_module().MODEL_ARGS, None
+            )
+            try:
+                deadline = time.monotonic() + 19
+                while True:
+                    result = run.poll()
+                    if result["state"] != "running":
+                        break
+                    if time.monotonic() >= deadline:
+                        raise Failure(504, "gemini_inference_timeout")
+                    time.sleep(0.05)
+                if result["state"] != "completed":
+                    raise Failure(502, result["error"]["code"])
+                models = result.get("models", [])
+            finally:
+                run.close()
+        if not models:
+            raise Failure(502, "gemini_models_empty")
+        self.save_environment(env, {**env, "call_models": models, "updated_at": now()})
+        return self.view(env)
+
+    def start_run(self, env, proxy_url, body):
+        model, prompt = body.get("model"), body.get("prompt")
+        if (
+            not isinstance(model, str)
+            or not MODEL.fullmatch(model)
+            or not isinstance(prompt, str)
+            or not prompt.strip()
+            or len(prompt.encode()) > 4096
+        ):
+            raise Failure(400)
+        uid, key, auth = self.operation_account(env)
+        if model not in env.get("call_models", []):
+            raise Failure(409, "gemini_model_unavailable")
+        identifier = env["id"]
+        self.stop_run(identifier)
+        module = invocation_module()
+        if key:
+            process = module.Invocation(
+                account_command(uid, "api-key-chat"),
+                SYSTEM_ENV,
+                prompt,
+                input_bytes=json.dumps(
+                    {
+                        "api_key": key,
+                        "proxy_url": proxy_url,
+                        "prompt": prompt,
+                        "model": model,
+                    }
+                ).encode(),
+                secrets=(key,),
+            )
+        else:
+            process = Headless(
+                self, env, proxy_url, auth, module.chat_args(model), prompt
+            )
+        run_id = secrets.token_hex(16)
+        self.runs[identifier] = {
+            "id": run_id,
+            "process": process,
+            "deadline": time.monotonic() + RUN_TTL,
+        }
+        return {"run_id": run_id}
+
+    def run_request(self, operation, identifier, body):
+        entry = self.runs.get(identifier)
+        if not entry or entry["id"] != body.get("run_id"):
+            raise Failure(404, "gemini_run_not_found")
+        if operation == "test-chat-cancel":
+            self.stop_run(identifier)
+            return {"cancelled": True}
+        try:
+            self.ensure_payload(legacy_install=False)
+        except Failure:
+            self.stop_run(identifier)
+            raise
+        return self.update_run(entry)
+
+    def probe_proxy(self, env, proxy_url):
+        started = time.monotonic()
+        result = read_account(self.uid_base + env["slot"], proxy_url, "proxy-probe")
+        return {
+            "ok": result.get("ok") is True,
+            "latency_ms": round((time.monotonic() - started) * 1000),
+        }
+
+    def save_environment(self, env, updated):
+        private_json(self.state_file, {**self.environments, env["id"]: updated})
+        env.clear()
+        env.update(updated)
+
+    def bind_proxy(self, env, body):
+        new_id = body.get("proxy_id")
+        if not isinstance(new_id, str) or not ID.fullmatch(new_id):
+            raise Failure(400)
+        proxy_config(body.get("proxy_url"))
+        identifier = env["id"]
+        if (
+            body.get("previous_proxy_id") != env["proxy_id"]
+            or self.running(identifier)
+            or identifier in self.terminals
+            or identifier in self.pending
+        ):
+            raise Failure(409, "gemini_operation_busy")
+        if new_id != env["proxy_id"]:
+            self.stop_run(identifier)
+            updated = {**env, "proxy_id": new_id, "updated_at": now()}
+            updated.pop("call_models", None)
+            updated.pop("account", None)
+            self.save_environment(env, updated)
+        return self.view(env)
+
     def terminal_request(self, operation, env, body):
         identifier = env["id"]
         session_id = body.get("session_id")
@@ -1229,6 +1573,11 @@ class Host:
             closed = {"data": "", "closed": True}
             if not terminal or terminal.session_id != session_id:
                 return closed
+            try:
+                self.ensure_payload(legacy_install=False)
+            except Failure:
+                self.stop_terminal(identifier)
+                raise
             size = terminal_size(body)
             text = body.get("input", "")
             if not isinstance(text, str):
@@ -1251,6 +1600,7 @@ class Host:
         if (
             terminal
             or identifier in self.pending
+            or self.running(identifier)
             or any(other.session_id == session_id for other in self.terminals.values())
         ):
             raise Failure(409, "gemini_terminal_conflict")
@@ -1269,8 +1619,11 @@ class Host:
         proxy_url = body.get("proxy_url")
         proxy_config(proxy_url)
         size = terminal_size(body, required=True)
+        self.ensure_payload()
         try:
-            self.ensure_oauth_runtime()
+            issue = self.oauth_runtime_issue()
+            if issue:
+                raise Failure(503, issue)
             self.terminals[identifier] = Terminal(
                 self, env, proxy_url, profile, size, session_id, credentials
             )
@@ -1287,6 +1640,7 @@ class Host:
     def close(self):
         failed = False
         for stop, active in (
+            (self.stop_run, self.runs),
             (self.stop_terminal, self.terminals),
             (self.cancel, self.pending),
         ):
@@ -1299,6 +1653,26 @@ class Host:
             raise RuntimeError("Gemini child cleanup failed")
 
     def cleanup(self):
+        for identifier, entry in list(self.runs.items()):
+            if entry["process"] is None and time.monotonic() >= entry["deadline"]:
+                self.stop_run(identifier)
+            else:
+                self.update_run(entry)
+        if self.terminals or self.pending or self.runs:
+            try:
+                self.ensure_payload(legacy_install=False)
+            except Failure:
+                for identifier in list(self.runs):
+                    self.stop_run(identifier)
+                for identifier in list(self.terminals):
+                    self.stop_terminal(identifier)
+                for identifier in list(self.pending):
+                    self.cancel(identifier)
+                    self.environments[identifier].update(
+                        auth_state="reauth_required", updated_at=now()
+                    )
+                    self.save()
+                return
         for identifier, terminal in list(self.terminals.items()):
             if (
                 time.monotonic() >= terminal.deadline
@@ -1324,6 +1698,7 @@ class Host:
                     auth_state="authorized", profile=login.attempt, updated_at=now()
                 )
                 env.pop("account", None)
+                env.pop("call_models", None)
                 self.save()
                 del self.pending[identifier]
                 if old_profile:
@@ -1345,7 +1720,8 @@ class Host:
             "auth_method": env.get("auth_method", "oauth"),
             "runtime_ready": False,
             "kernel_version": self.payload_version,
-            "models": account.get("models", []),
+            "models": env.get("call_models", account.get("models", [])),
+            "models_discovered": bool(env.get("call_models")),
             "account": account,
             "created_at": env.get("created_at"),
             "updated_at": env.get("updated_at"),
@@ -1377,6 +1753,8 @@ class Host:
         else:
             env["account"] = account
         if account.get("state") == "reauth_required":
+            self.stop_run(env["id"])
+            env.pop("call_models", None)
             self.stop_terminal(env["id"])
             env["auth_state"] = "reauth_required"
         elif account.get("state") in ("ok", "partial"):
@@ -1386,29 +1764,20 @@ class Host:
         return self.view(env)
 
     def request(self, operation, body):
+        if operation == "install-payload":
+            self.load_payload(materialize=True, verify_again=True)
+            return {
+                "version": self.payload_version,
+                "activation_required": self.payload_state == "awaiting_redemption",
+            }
         if operation == "redeem":
             return self.redeem_payload(body.get("redemption_code"))
-        if operation == "install-payload":
-            self.ensure_payload()
-            return {"version": self.payload_version}
         if operation == "list":
-            installed = self.payload.exists() or self.payload.is_symlink()
-            inputs_issue = self.payload_inputs_issue(
-                self.payload if installed else self.payload_source
-            )
-            if (
-                inputs_issue
-                or self.payload_state == "not_configured"
-                or (
-                    installed != (self.payload_state == "installed")
-                    and self.payload_state != "invalid"
-                )
-            ):
-                self.inspect_payload()
+            self.inspect_payload()
             return {
                 "payload_state": self.payload_state,
                 "payload_issue": self.payload_issue,
-                "release_activated": self.release_activated(),
+                "release_activated": self.payload_state == "installed",
                 "oauth_runtime_issue": self.oauth_runtime_issue(),
                 "environments": [self.view(env) for env in self.environments.values()],
             }
@@ -1477,12 +1846,22 @@ class Host:
             raise Failure(404)
         env = self.environments[identifier]
         if operation == "get":
-            return self.view(env)
+            self.inspect_payload()
+            return {
+                **self.view(env),
+                "payload_state": self.payload_state,
+                "payload_issue": self.payload_issue,
+            }
+        if operation == "proxy-bind":
+            return self.bind_proxy(env, body)
+        if operation in ("test-chat-status", "test-chat-cancel"):
+            return self.run_request(operation, identifier, body)
         if operation in ("terminal-start", "terminal-io", "terminal-stop"):
             return self.terminal_request(operation, env, body)
         if operation == "logout":
             if env.get("auth_method", "oauth") != "oauth":
                 raise Failure(409)
+            self.stop_run(identifier)
             self.stop_terminal(identifier)
             self.cancel(identifier)
             self.recover_network(self.directory / identifier, env["slot"])
@@ -1493,12 +1872,14 @@ class Host:
                 except FileNotFoundError:
                     pass
             env.pop("account", None)
+            env.pop("call_models", None)
             if env["auth_state"] != "disabled":
                 env["auth_state"] = "reauth_required"
             env["updated_at"] = now()
             self.save()
             return {}
         if operation in ("delete", "disable"):
+            self.stop_run(identifier)
             self.stop_terminal(identifier)
             self.cancel(identifier)
             self.recover_network(self.directory / identifier, env["slot"])
@@ -1514,33 +1895,14 @@ class Host:
             raise Failure(409)
         proxy_url = body.get("proxy_url")
         proxy_config(proxy_url)
+        if operation == "proxy-probe":
+            return self.probe_proxy(env, proxy_url)
+        if operation == "models":
+            return self.pull_models(env, proxy_url)
         if operation == "test-chat":
-            if env["auth_state"] != "authorized":
-                raise Failure(409, "gemini_test_auth_required")
-            if env.get("auth_method") != "api_key":
-                raise Failure(503, "gemini_test_oauth_unsupported")
-            model, prompt = body.get("model"), body.get("prompt")
-            if (
-                not isinstance(model, str)
-                or not model.startswith("gemini-")
-                or model not in env.get("account", {}).get("models", [])
-                or not isinstance(prompt, str)
-                or not prompt.strip()
-                or len(prompt.encode()) > 4096
-            ):
-                raise Failure(400, "gemini_test_invalid_input")
-            self.ensure_payload()
-            credential = self.directory / identifier / "credential.json"
-            api_key = json.loads(credential.read_bytes())["api_key"]
-            return read_account(
-                self.uid_base + env["slot"],
-                proxy_url,
-                "test_chat",
-                api_key=api_key,
-                model=model,
-                prompt=prompt,
-            )
+            return self.start_run(env, proxy_url, body)
         if operation == "refresh":
+            self.ensure_payload(legacy_install=False)
             if env["auth_state"] not in ("authorized", "reauth_required") or (
                 env.get("auth_method") != "api_key" and not env.get("profile")
             ):
@@ -1549,10 +1911,11 @@ class Host:
         if env.get("auth_method", "oauth") != "oauth":
             raise Failure(409)
         if operation == "authorize":
-            if identifier in self.terminals:
+            if identifier in self.terminals or self.running(identifier):
                 raise Failure(409, "gemini_terminal_conflict")
             self.ensure_oauth_runtime()
             self.cancel(identifier)
+            self.stop_run(identifier)
             env["auth_state"] = "authorizing"
             env["updated_at"] = now()
             self.save()
@@ -1568,6 +1931,7 @@ class Host:
                 print("Gemini CLI authorization did not start", file=sys.stderr)
                 raise Failure(503, "gemini_authorization_unavailable") from error
         if operation == "complete":
+            self.ensure_payload(legacy_install=False)
             login = self.pending.get(identifier)
             code = body.get("code")
             state = body.get("state")
@@ -1596,8 +1960,8 @@ class ControlHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
-            operation = self.path[1:] if self.path.startswith("/") else self.path
             length = int(self.headers.get("Content-Length", 0))
+            operation = self.path[1:] if self.path.startswith("/") else self.path
             if length < 1 or length > (32768 if operation == "test-chat" else 8192):
                 raise Failure(400)
             if operation not in {
@@ -1609,13 +1973,18 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "complete",
                 "refresh",
                 "disable",
-                "test-chat",
                 "delete",
                 "logout",
                 "terminal-start",
                 "terminal-io",
                 "terminal-stop",
                 "install-payload",
+                "proxy-probe",
+                "proxy-bind",
+                "models",
+                "test-chat",
+                "test-chat-status",
+                "test-chat-cancel",
             }:
                 raise Failure(404)
             body = json.loads(self.rfile.read(length))
@@ -1685,12 +2054,16 @@ def main():
     for name in ("state", "payload", "public-key", "egress", "socket"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--payload-source", type=Path)
-    parser.add_argument(
-        "--release-verifier", type=Path, default=Path("/etc/vm2api/gemini-release.json")
-    )
+    parser.add_argument("--default-public-key", type=Path)
+    parser.add_argument("--default-release-verifier", type=Path)
+    parser.add_argument("--release-verifier", type=Path)
     parser.add_argument("--gateway-group", required=True)
     parser.add_argument("--uid-base", type=int, required=True)
     args = parser.parse_args()
+    if (args.default_public_key is None) != (args.default_release_verifier is None):
+        parser.error(
+            "--default-public-key and --default-release-verifier must be used together"
+        )
     if os.geteuid() != 0 or not 1024 <= args.uid_base <= 65524:
         raise SystemExit("Gemini host setup requires root and a dedicated UID range")
     os.umask(0o077)
@@ -1715,6 +2088,7 @@ def main():
         ROOT / "scripts/gemini-host-egress.sh",
         ROOT / "scripts/install-gemini-payload.mjs",
         ROOT / "scripts/gemini_host_account.py",
+        INFERENCE_MODULE,
         ROOT / "src/lib/gemini/payload.mjs",
         args.state,
         args.socket.parent,
@@ -1728,6 +2102,8 @@ def main():
         args.public_key,
         args.egress,
         args.payload_source,
+        args.default_public_key,
+        args.default_release_verifier,
         args.release_verifier,
     ):
         if entry is not None and not entry.is_absolute():

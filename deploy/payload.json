@@ -8,6 +8,35 @@
     "issuer_public_key_id": "9dbb4bc2109f1637e64174d80d659168910843b34dbe4870f70a14af49ccb902",
     "payload_key_id": "835451e266145220a2e75b1f39ff22a0d7b17be48395553a24666b1946e0333a"
   },
+  "geminiDefaultLinuxAmd64": {
+    "tag": "payload-2026.11.20-gemini-0.3.0-rc.2",
+    "assets": {
+      "craggemini": {
+        "size": 1700584,
+        "sha256": "2a1f4e3b037afe8aee12c2d3ed4955ffd407ad75cbb07d45eb389be3cf7aea31"
+      },
+      "libagy_bridge.so": {
+        "size": 593976,
+        "sha256": "e1d6de82ff0d8b0a7327be440dbeae4a85d30d23acac3d60f258a80655592d01"
+      },
+      "manifest.json": {
+        "size": 410,
+        "sha256": "ce55f4b8bdf1e8dbdb48249ee088ebe7f25b7284452d35e0a2456616b774c06c"
+      },
+      "manifest.sig": {
+        "size": 64,
+        "sha256": "ae63d37757e789d83977d074bf8b5989586d214feb9a6936c5a7da97cbfa4bcf"
+      },
+      "gemini-ed25519.pub": {
+        "size": 113,
+        "sha256": "29618d11448c07978867004ccf11373c6637ba4808051eed0cedfb8e75041e3e"
+      },
+      "gemini-release.json": {
+        "size": 168,
+        "sha256": "18087e02b72c40f42ce69e73e142bf800bd8f68502dcae059fce15a096b87e44"
+      }
+    }
+  },
   "files": [
     {
       "path": "bin/kin-kernel",
