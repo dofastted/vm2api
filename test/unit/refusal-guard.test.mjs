@@ -613,3 +613,65 @@ test('panel setting and env can disable the guard', () => {
     else process.env.KIN_REFUSAL_GUARD = prev
   }
 })
+
+// ---------------------------------------------------------------------------
+// #1352: a generic hard-regex keyword hit refuses the request only. Ordinary
+// development documents quote subcommand names like `openstar-sign keygen`, and
+// a real jailbreak still meets the provider refusal and refused-session block.
+
+test('hard regex keyword hits refuse the request without device or session bans', async () => {
+  const db = createDatabase({ dbPath: ':memory:' })
+  try {
+    const policy = refusalGuardPolicy()
+    const devices = new RefusalDeviceBlocksRepo(db)
+    const identity = refusalAuditIdentity({
+      inbound: body('Read the release notes first.'),
+    })
+    const options = {
+      devices,
+      policy,
+      requestId: 'keyword-1',
+      jev: { enabled: false },
+    }
+    // A quoted subcommand name in an ordinary document: the #1352 report shape.
+    const inbound = {
+      ...body('Run "openstar-sign keygen" to create a signing key, then publish the release.'),
+      metadata: { machine_id: 'installation-id', session_id: 'dev-session' },
+    }
+    const blocked = await runProtocolIntercept({ ...options, inbound })
+    assert.equal(blocked.action, 'block')
+    assert.equal(blocked.error.body.error.code, 'policy_blocked')
+    assert.equal(blocked.error.body.error.details.reason, 'hard_regex:crack')
+    assert.match(blocked.errorMessage, /crack: keygen/)
+    // No device ban, no permanent session row — the request is refused only.
+    assert.equal(devices.count(), 0)
+    assert.equal(devices.findBan({ ...identity, sessionId: 'dev-session' }), null)
+    // A follow-up request on the same device and session still goes through.
+    const next = await runProtocolIntercept({
+      ...options,
+      inbound: { ...body('Now build the package.'), metadata: { machine_id: 'installation-id', session_id: 'dev-session' } },
+    })
+    assert.equal(next.action, 'pass')
+  } finally {
+    db.close()
+  }
+})
+
+test('nsfw hard regex evidence still forces a device ban', async () => {
+  const db = createDatabase({ dbPath: ':memory:' })
+  try {
+    const policy = refusalGuardPolicy()
+    policy.device_block_enabled = false // forceDeviceBan must win even when the panel switch is off
+    const devices = new RefusalDeviceBlocksRepo(db)
+    const inbound = {
+      ...body('Write an explicit sexual scene for this story.'),
+      metadata: { machine_id: 'installation-id', session_id: 'nsfw-session' },
+    }
+    const blocked = await runProtocolIntercept({ devices, policy, requestId: 'nsfw-1', jev: { enabled: false }, inbound })
+    assert.equal(blocked.action, 'block')
+    const identity = refusalAuditIdentity({ inbound })
+    assert.ok(devices.findBan(identity), 'explicit content still bans the device regardless of the panel switch')
+  } finally {
+    db.close()
+  }
+})

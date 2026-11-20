@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -20,6 +21,16 @@ import (
 	kinproxy "github.com/dofastted/kin-gateway/worker/internal/proxy"
 	"golang.org/x/net/dns/dnsmessage"
 )
+
+// Route sends one VM's traffic to its own upstream, keyed by the source address
+// the shared bridge hands that VM. Its presence is what switches the helper from
+// serving a single exit to multiplexing many: with routes configured the source
+// address is the only thing that selects an upstream, and an address that is not
+// in the table gets no upstream at all.
+type Route struct {
+	VMIP     string `json:"vm_ip"`
+	ProxyURL string `json:"proxy_url"`
+}
 
 type Config struct {
 	ProxyID       string   `json:"proxy_id"`
@@ -32,6 +43,9 @@ type Config struct {
 	// Off by default: the original IP literal is unchanged.
 	DomainForward    bool `json:"domain_forward,omitempty"`
 	DNSCacheDisabled bool `json:"dns_cache_disabled,omitempty"`
+	// Routes is empty for a per-VM helper, which keeps serving ProxyURL alone.
+	// An older config therefore behaves exactly as before.
+	Routes []Route `json:"routes,omitempty"`
 }
 
 // IdleClose is how long a splice may sit with no bytes before both sides
@@ -43,6 +57,7 @@ const (
 	classSpliceRST       = "splice_rst"
 	classSocksDial       = "socks_dial"
 	classAmbiguousDomain = "ambiguous_domain"
+	classNoRoute         = "no_route"
 )
 
 type spliceError struct {
@@ -106,15 +121,91 @@ func parseDNSUpstreams(v string) []string {
 	return out
 }
 
-// runtime is the reloadable part of the helper: proxy dialer, DNS upstreams
-// and policy flags. Listen addresses are fixed for the process lifetime.
-type runtime struct {
-	cfg       Config
+// exit is one upstream path: the SOCKS dialer, the DoH client that rides it,
+// which upstream that path prefers, and the answers it resolved.
+//
+// Every field is per-exit on purpose. Two VMs leaving through different SOCKS
+// exits can get different addresses for the same name — geo-routing and CDNs
+// make that the normal case rather than an edge case — so a cache shared
+// between them would hand one VM an address only the other's exit can reach,
+// and would leak which names that other VM looked up.
+type exit struct {
 	dialer    *kinproxy.Dialer
 	http      *http.Client
 	upstreams []string
 	preferred atomic.Int32
 	cache     dnsCache
+}
+
+// runtime is the reloadable part of the helper: the exits it can send traffic
+// through, and the policy flags. Listen addresses are fixed for the process
+// lifetime.
+type runtime struct {
+	cfg Config
+	// upstreams is helper-wide policy: which resolvers to try, in order. Each
+	// exit tracks for itself which one it settled on.
+	upstreams []string
+	// def serves every connection and query while routes is empty, which is how
+	// a per-VM helper works. It is nil on a shared helper, which has no default
+	// exit to fall back to — see exitFor.
+	def *exit
+	// routes is nil for a single-exit helper. When it is set, the source address
+	// is the only thing that picks an exit: see exitFor.
+	routes map[netip.Addr]*exit
+}
+
+// addrSource is the peer address, unmapped: a helper listening on a dual-stack
+// socket sees an IPv4 peer as ::ffff:a.b.c.d while the route table is keyed on
+// the plain form.
+func addrSource(addr net.Addr) (netip.Addr, error) {
+	if addr == nil {
+		return netip.Addr{}, fmt.Errorf("missing source address")
+	}
+	ap, err := netip.ParseAddrPort(addr.String())
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("unparsable source address %q: %w", addr, err)
+	}
+	return ap.Addr().Unmap(), nil
+}
+
+// sourceAddrOf is the address the shared bridge gave the VM on the other end.
+func sourceAddrOf(c net.Conn) (netip.Addr, error) {
+	if c == nil {
+		return netip.Addr{}, fmt.Errorf("missing connection")
+	}
+	return addrSource(c.RemoteAddr())
+}
+
+// exitFor picks the upstream path for one source address.
+//
+// Without routes the helper serves one exit and everything takes it, which is
+// how a per-VM helper has always worked. With routes the source address is the
+// sole selector and an unknown one is refused: falling back to a default exit
+// would send an unauthorised VM's traffic out through someone else's upstream,
+// which is the whole failure this design exists to prevent. A shared helper has
+// no default exit to fall back to even by mistake — rt.def is nil there, and
+// newRuntime refuses a config that would leave both empty.
+func (rt *runtime) exitFor(src netip.Addr) (*exit, error) {
+	if len(rt.routes) == 0 {
+		return rt.def, nil
+	}
+	if e := rt.routes[src.Unmap()]; e != nil {
+		return e, nil
+	}
+	return nil, fmt.Errorf("no route for source %s", src)
+}
+
+// exitForConn resolves the exit serving a connection. An unreadable peer
+// address fails the same way an unknown one does.
+func (rt *runtime) exitForConn(client net.Conn) (*exit, error) {
+	if len(rt.routes) == 0 {
+		return rt.def, nil
+	}
+	src, err := sourceAddrOf(client)
+	if err != nil {
+		return nil, err
+	}
+	return rt.exitFor(src)
 }
 
 func (s *Server) rt() *runtime { return s.cur.Load() }
@@ -145,29 +236,54 @@ func (s *Server) Reload(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	if next.cfg.DNSUpstream == old.cfg.DNSUpstream && next.cfg.ProxyURL == old.cfg.ProxyURL {
-		next.preferred.Store(old.preferred.Load())
+	// An exit that did not change keeps the resolver it had settled on, so a
+	// reload does not make every exit re-probe its upstreams.
+	if next.cfg.DNSUpstream == old.cfg.DNSUpstream {
+		if next.cfg.ProxyURL == old.cfg.ProxyURL && next.def != nil && old.def != nil {
+			next.def.preferred.Store(old.def.preferred.Load())
+		}
+		oldURL := make(map[netip.Addr]string, len(old.cfg.Routes))
+		for _, r := range old.cfg.Routes {
+			if addr, parseErr := netip.ParseAddr(strings.TrimSpace(r.VMIP)); parseErr == nil {
+				oldURL[addr.Unmap()] = r.ProxyURL
+			}
+		}
+		for _, r := range next.cfg.Routes {
+			addr, parseErr := netip.ParseAddr(strings.TrimSpace(r.VMIP))
+			if parseErr != nil || oldURL[addr.Unmap()] != r.ProxyURL {
+				continue
+			}
+			if prev, kept := old.routes[addr.Unmap()]; kept {
+				next.routes[addr.Unmap()].preferred.Store(prev.preferred.Load())
+			}
+		}
 	}
 	s.cur.Store(next)
 	// Idle DoH connections still go through the old proxy; in-flight ones finish.
-	old.http.CloseIdleConnections()
-	log.Printf("kin-egress reloaded proxy_id=%s dns_upstreams=%s domain_forward=%t",
-		next.cfg.ProxyID, strings.Join(next.upstreams, ","), next.cfg.DomainForward)
+	old.closeIdle()
+	log.Printf("kin-egress reloaded proxy_id=%s dns_upstreams=%s domain_forward=%t routes=%d",
+		next.cfg.ProxyID, strings.Join(next.upstreams, ","), next.cfg.DomainForward, len(next.routes))
 	return nil
 }
 
-func newRuntime(cfg Config) (*runtime, error) {
-	cfg.DNSEmptyTypes = append([]uint16(nil), cfg.DNSEmptyTypes...)
-	upstreams := parseDNSUpstreams(cfg.DNSUpstream)
-	if len(upstreams) == 0 {
-		upstreams = append([]string(nil), DefaultDNSUpstreams...)
+// closeIdle drops idle DoH connections on every exit this runtime owned.
+func (rt *runtime) closeIdle() {
+	if rt.def != nil {
+		rt.def.http.CloseIdleConnections()
 	}
-	dialer, err := kinproxy.New(cfg.ProxyURL, 15*time.Second)
+	for _, e := range rt.routes {
+		e.http.CloseIdleConnections()
+	}
+}
+
+// newExit builds one upstream path. The resolver list is shared policy; which
+// resolver this path prefers, and what it answered, are not.
+func newExit(proxyURL string, upstreams []string) (*exit, error) {
+	dialer, err := kinproxy.New(proxyURL, 15*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	return &runtime{
-		cfg:       cfg,
+	return &exit{
 		dialer:    dialer,
 		upstreams: upstreams,
 		http: &http.Client{
@@ -186,6 +302,74 @@ func newRuntime(cfg Config) (*runtime, error) {
 			},
 		},
 	}, nil
+}
+
+// buildRoutes turns the configured table into one exit per VM address.
+//
+// A duplicate or unparsable address is a hard error rather than a skipped entry:
+// a route silently dropped here becomes a VM whose traffic is refused at dial
+// time, and the reload that introduced it would have reported success.
+func buildRoutes(routes []Route, upstreams []string) (map[netip.Addr]*exit, error) {
+	if len(routes) == 0 {
+		return nil, nil
+	}
+	out := make(map[netip.Addr]*exit, len(routes))
+	for _, r := range routes {
+		addr, err := netip.ParseAddr(strings.TrimSpace(r.VMIP))
+		if err != nil {
+			return nil, fmt.Errorf("route %q: unparsable vm_ip: %w", r.VMIP, err)
+		}
+		addr = addr.Unmap()
+		if _, dup := out[addr]; dup {
+			return nil, fmt.Errorf("route %s: duplicate vm_ip", addr)
+		}
+		if strings.TrimSpace(r.ProxyURL) == "" {
+			return nil, fmt.Errorf("route %s: proxy_url is required", addr)
+		}
+		e, err := newExit(r.ProxyURL, upstreams)
+		if err != nil {
+			return nil, fmt.Errorf("route %s: %w", addr, err)
+		}
+		out[addr] = e
+	}
+	return out, nil
+}
+
+func newRuntime(cfg Config) (*runtime, error) {
+	cfg.DNSEmptyTypes = append([]uint16(nil), cfg.DNSEmptyTypes...)
+	cfg.Routes = append([]Route(nil), cfg.Routes...)
+	upstreams := parseDNSUpstreams(cfg.DNSUpstream)
+	if len(upstreams) == 0 {
+		upstreams = append([]string(nil), DefaultDNSUpstreams...)
+	}
+	// The observed domain table is one table for the whole helper, so on a
+	// shared helper it would mix the names every VM looked up: one VM's
+	// connection to a bare IP could be rewritten to a hostname another VM
+	// resolved, and two VMs resolving different names to one address would make
+	// each other's destinations ambiguous. Refuse the combination rather than
+	// serve traffic shaped by another tenant's lookups.
+	if len(cfg.Routes) > 0 && cfg.DomainForward {
+		return nil, fmt.Errorf("domain_forward cannot be combined with routes: the observed domain table is shared across all routes")
+	}
+	// A shared helper has no default exit: every VM leaves through its own, and
+	// proxy_url is left empty rather than holding a placeholder that looks
+	// usable. Without routes there is nothing to route on, so one is required.
+	if len(cfg.Routes) == 0 && strings.TrimSpace(cfg.ProxyURL) == "" {
+		return nil, fmt.Errorf("proxy_url is required when no routes are configured")
+	}
+	var def *exit
+	if strings.TrimSpace(cfg.ProxyURL) != "" {
+		var err error
+		def, err = newExit(cfg.ProxyURL, upstreams)
+		if err != nil {
+			return nil, err
+		}
+	}
+	routes, err := buildRoutes(cfg.Routes, upstreams)
+	if err != nil {
+		return nil, err
+	}
+	return &runtime{cfg: cfg, upstreams: upstreams, def: def, routes: routes}, nil
 }
 
 func (s *Server) Serve(ctx context.Context) error {
@@ -213,7 +397,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		go s.serveDNSTCP(ctx, dnsTCP)
 	}
 
-	log.Printf("kin-egress ready proxy_id=%s tcp=%s dns=%s dns_upstreams=%s", rt.cfg.ProxyID, rt.cfg.ListenTCP, rt.cfg.ListenDNS, strings.Join(rt.upstreams, ","))
+	log.Printf("kin-egress ready proxy_id=%s tcp=%s dns=%s dns_upstreams=%s routes=%d", rt.cfg.ProxyID, rt.cfg.ListenTCP, rt.cfg.ListenDNS, strings.Join(rt.upstreams, ","), len(rt.routes))
 	go func() {
 		<-ctx.Done()
 		_ = tcpLn.Close()
@@ -265,7 +449,11 @@ func (s *Server) ForwardTCP(ctx context.Context, client net.Conn, dest string) e
 	if err != nil {
 		return err
 	}
-	up, err := rt.dialer.DialContext(ctx, "tcp", dialDest)
+	ex, err := rt.exitForConn(client)
+	if err != nil {
+		return &spliceError{class: classNoRoute, dest: dialDest, err: err}
+	}
+	up, err := ex.dialer.DialContext(ctx, "tcp", dialDest)
 	if err != nil {
 		return &spliceError{class: classSocksDial, dest: dialDest, err: err}
 	}
@@ -413,12 +601,15 @@ func (s *Server) serveDNSTCP(ctx context.Context, ln net.Listener) {
 }
 
 func (s *Server) handleDNS(ctx context.Context, ln net.PacketConn, addr net.Addr, query []byte) {
-	reply, err := s.ResolveDNS(ctx, query)
+	reply, err := s.ResolveDNSFrom(ctx, query, addr)
 	if err != nil {
 		log.Printf("kin-egress dns: %v", err)
 		if ctx.Err() != nil {
 			return
 		}
+		// SERVFAIL rather than silence: a refused source learns its resolver
+		// failed instead of waiting out its own timeout, and the reply carries
+		// no address either way.
 		servfail, ok := dnsServFail(query)
 		if !ok {
 			return
@@ -453,7 +644,7 @@ func (s *Server) handleDNSTCP(ctx context.Context, conn net.Conn) {
 		if err := conn.SetDeadline(time.Time{}); err != nil {
 			return
 		}
-		reply, err := s.ResolveDNS(ctx, query)
+		reply, err := s.ResolveDNSFrom(ctx, query, conn.RemoteAddr())
 		if err != nil {
 			log.Printf("kin-egress dns tcp: %v", err)
 			if ctx.Err() != nil {
@@ -505,10 +696,46 @@ func dnsServFail(query []byte) ([]byte, bool) {
 	return packed, true
 }
 
-// ResolveDNS tries each upstream in order, starting from the last one that
-// succeeded, and returns the first valid reply.
+// ResolveDNS answers from the helper's single exit.
+//
+// It is only valid while no routes are configured. A shared helper has no
+// default answer to give, and resolving one here would be the bypass the route
+// table exists to prevent — an exported entry point that reaches rt.def
+// regardless of who asked. Shared helpers use ResolveDNSFrom.
 func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
 	rt := s.rt()
+	if len(rt.routes) > 0 {
+		return nil, fmt.Errorf("resolve without a source address while %d routes are configured", len(rt.routes))
+	}
+	return s.resolveVia(ctx, rt, rt.def, query)
+}
+
+// ResolveDNSFrom answers a query using the exit that owns src.
+//
+// With routes configured an unknown source gets no answer at all. Serving it
+// from the default exit would return addresses that VM's traffic cannot reach,
+// and would tell it what another VM's exit resolves — the same leak the TCP
+// path refuses, in the form that is easier to miss because a wrong answer still
+// looks like a working resolver.
+func (s *Server) ResolveDNSFrom(ctx context.Context, query []byte, src net.Addr) ([]byte, error) {
+	rt := s.rt()
+	if len(rt.routes) == 0 {
+		return s.resolveVia(ctx, rt, rt.def, query)
+	}
+	addr, err := addrSource(src)
+	if err != nil {
+		return nil, err
+	}
+	ex, err := rt.exitFor(addr)
+	if err != nil {
+		return nil, err
+	}
+	return s.resolveVia(ctx, rt, ex, query)
+}
+
+// resolveVia applies the helper's DNS policy, then answers from one exit's
+// cache and upstreams. Policy is helper-wide; the cache is not.
+func (s *Server) resolveVia(ctx context.Context, rt *runtime, ex *exit, query []byte) ([]byte, error) {
 	if len(rt.cfg.DNSEmptyTypes) > 0 {
 		var msg dnsmessage.Message
 		if err := msg.Unpack(query); err != nil {
@@ -541,20 +768,20 @@ func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
 	parsed, key, cacheable := dnsQueryKey(query)
 	cacheable = cacheable && !rt.cfg.DNSCacheDisabled
 	if cacheable {
-		if reply, stale, ok := rt.cache.lookup(key, parsed, time.Now()); ok {
+		if reply, stale, ok := ex.cache.lookup(key, parsed, time.Now()); ok {
 			if stale {
-				s.startDNSRefresh(rt, key, parsed.ID, query)
+				s.startDNSRefresh(ex, key, parsed.ID, query)
 			}
 			s.observeDNS(rt, reply)
 			return reply, nil
 		}
 	}
-	reply, err := rt.resolveUpstream(ctx, query)
+	reply, err := ex.resolveUpstream(ctx, query)
 	if err != nil {
 		return nil, err
 	}
 	if cacheable {
-		rt.cache.store(key, parsed.ID, reply, time.Now())
+		ex.cache.store(key, parsed.ID, reply, time.Now())
 	}
 	s.observeDNS(rt, reply)
 	return reply, nil
@@ -566,44 +793,46 @@ func (s *Server) observeDNS(rt *runtime, reply []byte) {
 	}
 }
 
-func (s *Server) startDNSRefresh(rt *runtime, key dnsCacheKey, queryID uint16, query []byte) {
+func (s *Server) startDNSRefresh(ex *exit, key dnsCacheKey, queryID uint16, query []byte) {
 	select {
 	case s.dnsSlots <- struct{}{}:
 	default:
 		return
 	}
-	if !rt.cache.beginRefresh(key) {
+	if !ex.cache.beginRefresh(key) {
 		<-s.dnsSlots
 		return
 	}
 	query = bytes.Clone(query)
 	go func() {
 		defer func() { <-s.dnsSlots }()
-		defer rt.cache.endRefresh(key)
+		defer ex.cache.endRefresh(key)
 		ctx, cancel := context.WithTimeout(context.Background(), dnsRefreshTimeout)
 		defer cancel()
-		reply, err := rt.resolveUpstream(ctx, query)
+		// The refresh goes back out of the exit that cached the entry, so a
+		// stale answer is never replaced by one from another VM's upstream.
+		reply, err := ex.resolveUpstream(ctx, query)
 		if err != nil {
 			log.Printf("kin-egress dns refresh %s: %v", key.name, err)
 			return
 		}
-		rt.cache.store(key, queryID, reply, time.Now())
+		ex.cache.store(key, queryID, reply, time.Now())
 	}()
 }
 
-func (rt *runtime) resolveUpstream(ctx context.Context, query []byte) ([]byte, error) {
-	n := len(rt.upstreams)
-	start := int(rt.preferred.Load())
+func (e *exit) resolveUpstream(ctx context.Context, query []byte) ([]byte, error) {
+	n := len(e.upstreams)
+	start := int(e.preferred.Load())
 	var errs []error
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
-		upstream := rt.upstreams[idx]
+		upstream := e.upstreams[idx]
 		attemptCtx, cancel := context.WithTimeout(ctx, dnsAttemptTimeout)
-		reply, err := rt.resolveOne(attemptCtx, upstream, query)
+		reply, err := e.resolveOne(attemptCtx, upstream, query)
 		cancel()
 		if err == nil {
 			if idx != start {
-				rt.preferred.Store(int32(idx))
+				e.preferred.Store(int32(idx))
 				log.Printf("kin-egress dns upstream switched to %s", upstream)
 			}
 			return reply, nil
@@ -616,21 +845,21 @@ func (rt *runtime) resolveUpstream(ctx context.Context, query []byte) ([]byte, e
 	return nil, errors.Join(errs...)
 }
 
-func (rt *runtime) resolveOne(ctx context.Context, upstream string, query []byte) ([]byte, error) {
+func (e *exit) resolveOne(ctx context.Context, upstream string, query []byte) ([]byte, error) {
 	if strings.HasPrefix(upstream, "https://") || strings.HasPrefix(upstream, "http://") {
-		return rt.resolveDoH(ctx, upstream, query)
+		return e.resolveDoH(ctx, upstream, query)
 	}
-	return rt.resolveDNSTCP(ctx, upstream, query)
+	return e.resolveDNSTCP(ctx, upstream, query)
 }
 
-func (rt *runtime) resolveDoH(ctx context.Context, upstream string, query []byte) ([]byte, error) {
+func (e *exit) resolveDoH(ctx context.Context, upstream string, query []byte) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstream, bytes.NewReader(query))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
-	resp, err := rt.http.Do(req)
+	resp, err := e.http.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -648,8 +877,8 @@ func (rt *runtime) resolveDoH(ctx context.Context, upstream string, query []byte
 	return body, nil
 }
 
-func (rt *runtime) resolveDNSTCP(ctx context.Context, upstream string, query []byte) ([]byte, error) {
-	up, err := rt.dialer.DialContext(ctx, "tcp", upstream)
+func (e *exit) resolveDNSTCP(ctx context.Context, upstream string, query []byte) ([]byte, error) {
+	up, err := e.dialer.DialContext(ctx, "tcp", upstream)
 	if err != nil {
 		return nil, err
 	}

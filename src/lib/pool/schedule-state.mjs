@@ -329,6 +329,7 @@ export function resolveSlotState({
   vm = {},
   availability = {},
   restrictionReason = null,
+  kernelFaulted = false,
   restrictionUntil = null,
   circuit = null,
   seats = null,
@@ -395,6 +396,11 @@ export function resolveSlotState({
   if (availability?.key === 'drain') {
     return restricted(availability.reason || 'gate_5h_draining', null, 'new_session', true)
   }
+  // A spent kernel-recovery budget parks the slot in memory only. It wins over
+  // the final 开 so the panel shows what the scheduler already enforces, but it
+  // stays 受限 (self-clearing): the watchdog keeps a low-frequency retry and
+  // clears the fault once the kernel is healthy again.
+  if (kernelFaulted) return restricted('kernel_faulted', null)
   const seatMax = Number(seats?.max) || 0
   if (seatMax > 0 && (Number(seats?.used) || 0) >= seatMax) return restricted('seats_full', null, 'new_session')
   const sessionMax = Number(sessions?.max) || 0

@@ -551,6 +551,15 @@ function restrictionTone(vm: Vm | undefined): StatusTone | null {
         cls: 'bad',
       }
     }
+    // 内核故障（自动恢复预算耗尽）不是额度问题：用红色与「额度限制」区分，
+    // 提示运维去详情页诊断，而不是等窗口重置。
+    if (/^kernel_faulted$/.test(reason)) {
+      return {
+        key: 'kernel_fault',
+        text: restrictionLabel(vm, '内核故障'),
+        cls: 'bad',
+      }
+    }
     // 休息时段是操作员排班，不是上游冷却：单独成态，别引人去点「清冷却」。
     if (vm.availability?.key === 'rest' || /rest_period/.test(reason)) {
       return {
