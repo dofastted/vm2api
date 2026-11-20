@@ -79,7 +79,7 @@ export function ActiveFiltersDisplay({
   if (filters.protocol)
     chips.push({ key: 'protocol', label: '协议', value: filters.protocol })
   if (filters.excludeStatus200)
-    chips.push({ key: 'status', label: '状态码', value: '!200' })
+    chips.push({ key: 'status', label: '状态码', value: '仅非 2xx' })
   else if (filters.statusCode != null)
     chips.push({
       key: 'status',
