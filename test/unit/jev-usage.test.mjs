@@ -215,3 +215,47 @@ test('configured keys aggregate separately, include unused keys, and distinguish
   assert.equal(keys[2].status, 'unrequested')
   assert.equal(keys[2].last_request_at, null)
 })
+
+test('key statuses come from the latest event alone, without the usage aggregate (#1043)', (t) => {
+  const repo = fixture(t)
+  const a = jevKeyFingerprint('status-insufficient')
+  const b = jevKeyFingerprint('status-throttled')
+  for (const [fingerprint, http_status] of [
+    [a, 402],
+    [b, 429],
+  ]) {
+    repo.record(
+      normalizeJevUsage(value({ key_fingerprint: fingerprint, http_status, outcome: 'http_error', usage: null })),
+    )
+  }
+  const configured = [
+    { number: 1, key_fingerprint: a, retired: false },
+    { number: 2, key_fingerprint: b, retired: true },
+    { number: 3, key_fingerprint: '000000000000', retired: false },
+    { number: 4, key_fingerprint: '111111111111', retired: true },
+  ]
+  const statuses = repo.configuredKeyStatuses(configured)
+  assert.deepEqual(
+    statuses.map((row) => row.status),
+    ['insufficient_balance', 'rate_limited', 'unrequested', 'paused'],
+  )
+
+  // The panel and the usage page must not derive two different verdicts.
+  const full = repo.configuredKeys(configured)
+  for (const [index, row] of statuses.entries()) {
+    assert.equal(row.status, full[index].status, `status ${index}`)
+    assert.equal(row.last_http_status, full[index].last_http_status, `last_http_status ${index}`)
+    assert.equal(row.last_request_at, full[index].last_request_at, `last_request_at ${index}`)
+    assert.equal(row.key_fingerprint, configured[index].key_fingerprint)
+  }
+
+  // Status rows carry no usage totals: nothing here needs the table-wide sums.
+  for (const row of statuses) {
+    for (const name of ['requests', 'successful', 'estimated_cost_nano_usd', 'unknown_cost_requests']) {
+      assert.equal(Object.hasOwn(row, name), false, name)
+    }
+  }
+  // The usage page still gets its totals.
+  assert.equal(full[0].requests, 1)
+  assert.equal(Object.hasOwn(full[0], 'estimated_cost_nano_usd'), true)
+})
