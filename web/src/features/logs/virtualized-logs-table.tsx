@@ -443,6 +443,17 @@ export function VirtualizedLogsTable({
       <div className='py-8 text-center text-muted-foreground'>暂无数据</div>
     )
   }
+  if (!allLogs.length && hasNextPage) {
+    return (
+      <div
+        role='status'
+        className='flex items-center justify-center py-12 text-muted-foreground'
+      >
+        <Loader2 className='h-6 w-6 animate-spin' />
+        <span className='ml-2'>正在查找符合条件的日志…</span>
+      </div>
+    )
+  }
 
   return (
     <div className='space-y-4'>

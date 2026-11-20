@@ -298,7 +298,7 @@ export function LeaderboardSection({
         ))}
       </div>
 
-      {board.isLoading ? (
+      {board.isLoading || board.isPlaceholderData ? (
         <Card>
           <CardContent className='space-y-4 py-6'>
             <div className='space-y-2'>
@@ -343,7 +343,9 @@ export function LeaderboardSection({
                 <TableHeader>
                   <TableRow>
                     <TableHead className='w-24'>排名</TableHead>
-                    <TableHead>{SCOPE_LABELS[scope]}</TableHead>
+                    <TableHead>
+                      {scopeLabels?.[scope] ?? SCOPE_LABELS[scope]}
+                    </TableHead>
                     {COLUMNS.map((col) => (
                       <TableHead
                         key={col.key}
