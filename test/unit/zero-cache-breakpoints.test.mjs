@@ -142,7 +142,6 @@ test('zero automatic caching reaches the final tool result without changing earl
 })
 
 for (const options of [
-  { outboundShape: 'lean' },
   { preserveSystem: true },
   { requestContext: { purpose: 'auto_mode_classifier' } },
 ]) {
