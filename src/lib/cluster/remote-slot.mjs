@@ -889,7 +889,20 @@ async function probeRemoteAccel(session, routing) {
   }
 }
 
-function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, slotUser }) {
+/**
+ * Endpoint config pinning a slot to its address on the shared network.
+ *
+ * The helper's route table is keyed on this exact address, so letting docker
+ * assign one would put the VM on the bridge either with an address no route
+ * names — refused fail-closed — or with an address another VM's route names.
+ * Empty for a per-VM slot, which is alone on its bridge.
+ */
+function sharedEndpointConfig(network, ip) {
+  if (!ip) return {}
+  return { NetworkingConfig: { EndpointsConfig: { [network]: { IPAMConfig: { IPv4Address: ip } } } } }
+}
+
+function kvmSlotContainerBody(vm, { image, network, ip = '', remoteDir, routing, accel, slotUser }) {
   const slotName = displayName(vm.id)
   const memStr = slotMemory(vm, routing)
   const mem = parseMemoryBytes(memStr) + KVM_MEMORY_OVERHEAD
@@ -957,6 +970,7 @@ function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, s
       Dns: ['8.8.8.8'],
       DnsOptions: ['use-vc'],
     },
+    ...sharedEndpointConfig(network, ip),
   }
   if (accel === 'kvm') {
     body.HostConfig.Devices = [{ PathOnHost: '/dev/kvm', PathInContainer: '/dev/kvm', CgroupPermissions: 'rwm' }]
@@ -964,8 +978,12 @@ function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, s
   return body
 }
 
-export function slotContainerBody(vm, { image, network, remoteDir, user, routing, accel, subscription = false }) {
-  if (isKvmRuntime(vm)) return kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, slotUser: user })
+export function slotContainerBody(
+  vm,
+  { image, network, ip = '', remoteDir, user, routing, accel, subscription = false },
+) {
+  if (isKvmRuntime(vm))
+    return kvmSlotContainerBody(vm, { image, network, ip, remoteDir, routing, accel, slotUser: user })
   const slotName = displayName(vm.id)
   const limits = slotCreationLimits(vm, routing)
   const mem = parseMemoryBytes(limits.memory)
@@ -1030,6 +1048,7 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
       Dns: ['8.8.8.8'],
       DnsOptions: ['use-vc'],
     },
+    ...sharedEndpointConfig(network, ip),
   }
 }
 

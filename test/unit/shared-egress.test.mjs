@@ -37,7 +37,7 @@ import {
   startSharedEgress,
 } from '../../src/lib/vm/egress.mjs'
 import { parseCidr } from '../../src/lib/vm/subnet-pool.mjs'
-import { exitOf, remoteEgressIpam, sharedRemoteNames } from '../../src/lib/cluster/remote-slot.mjs'
+import { exitOf, remoteEgressIpam, sharedRemoteNames, slotContainerBody } from '../../src/lib/cluster/remote-slot.mjs'
 import { patchVmRecord } from '../../src/lib/vm/vm-registry.mjs'
 import { slotContainerNetworkMismatch } from '../../src/lib/vm/vm-runtime.mjs'
 
@@ -557,4 +557,26 @@ test('the shared helper binary lands in the node-level mount its container binds
     assert.equal(bound, `${host.root}/egress/slot-bin`)
     assert.ok(!bound.includes('/vms/'))
   }
+})
+
+test('a remote shared slot is pinned to its address, a per-VM slot is not', () => {
+  const base = { image: 'kin:test', remoteDir: '/srv/kin/vms/vm-01', user: '1000:1000', routing: {} }
+  const vm = { id: 'vm-01', kernel: 'ubuntu-24.04' }
+
+  const shared = slotContainerBody(vm, { ...base, network: sharedNetworkName(''), ip: '100.64.16.7' })
+  // Pinned, because the helper's route table is keyed on this exact address:
+  // letting docker assign one puts the VM on the bridge with an address either
+  // no route names, or another VM's route names.
+  assert.deepEqual(shared.NetworkingConfig, {
+    EndpointsConfig: { [sharedNetworkName('')]: { IPAMConfig: { IPv4Address: '100.64.16.7' } } },
+  })
+  // A sibling of HostConfig, not nested inside it, or docker ignores it.
+  assert.equal(shared.HostConfig.NetworkingConfig, undefined)
+  assert.equal(shared.HostConfig.NetworkMode, sharedNetworkName(''))
+
+  // A per-VM slot is alone on its bridge, so docker still assigns and the
+  // body stays byte-identical to what it was before shared mode existed.
+  const perVm = slotContainerBody(vm, { ...base, network: 'kin-eg-px-abc' })
+  assert.equal(perVm.NetworkingConfig, undefined)
+  assert.equal(perVm.HostConfig.NetworkMode, 'kin-eg-px-abc')
 })
