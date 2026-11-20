@@ -1237,6 +1237,13 @@ export function createHandleProtocol(deps) {
     // Recognition alone is not passthrough. Only the protocol-tab switch keeps
     // the Claude Code family body; every other inbound is rewritten below.
     const officialPassthrough = officialFamilyBodyPassthrough(officialInbound, getRouting())
+    // Operator opt-in, per API endpoint: forward the caller's own identity and
+    // billing blocks instead of preparing them for the configured persona (#1321).
+    // Evaluated here on purpose -- after the risk/route pass may have re-picked
+    // `apiPicked`, so the policy always comes from the endpoint actually used.
+    // Never derived from caller input.
+    const preserveApiCallerBody =
+      inferenceBackend === 'api' && !apiOpenAI && apiPicked?.endpoint?.body_policy === 'caller'
     let converted
     try {
       converted =
@@ -1308,7 +1315,7 @@ export function createHandleProtocol(deps) {
     const cragSystem = projectCallerSystem(ctx.body.system, callerEnvironment)
     const hasCragSystem = cragSystem !== ctx.body.system
     try {
-      if (!apiOpenAI && !requestContext && !officialPassthrough) {
+      if (!preserveApiCallerBody && !apiOpenAI && !requestContext && !officialPassthrough) {
         const standard = toStandardAnthropicBody(ctx.body, {
           official: officialTraffic === true,
           rewriteTools: getRouting()?.compatibility?.tool_name_rewrite !== false,
@@ -1510,7 +1517,7 @@ export function createHandleProtocol(deps) {
         personaIn.messages.some(
           (message) => Array.isArray(message?.content) && message.content.some((block) => block?.cache_control != null),
         ))
-    if (!apiOpenAI && !requestContext)
+    if (!preserveApiCallerBody && !apiOpenAI && !requestContext)
       ctx.body = applyCrsUnofficialPersona(ctx.body, {
         officialClient: officialPassthrough,
         forceConfigured: !officialPassthrough,
@@ -1523,7 +1530,7 @@ export function createHandleProtocol(deps) {
       })
     if (!officialPassthrough && !requestContext) ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
     let personaHideTokens =
-      requestContext || apiOpenAI
+      requestContext || apiOpenAI || preserveApiCallerBody
         ? 0
         : personaHideForUnofficial(personaIn, ctx.body, {
             officialClient: officialPassthrough,

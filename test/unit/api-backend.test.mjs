@@ -219,6 +219,142 @@ test('API backend applies the global official_full persona setting', async () =>
   }
 })
 
+/**
+ * One API-backend hop against a local fake kernel, returning what reached it.
+ * `endpoint` is merged into what the scheduler picks, so a test can set
+ * `body_policy` the way an operator would (#1321).
+ */
+async function apiBackendHop({ endpoint = {}, body, reqHeaders = {}, pick, routing } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-body-policy-'))
+  const routingFile = path.join(root, 'routing.json')
+  const socketPath = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true })
+  const compatibility = routing || {
+    persona_preset: 'official_full',
+    overlay_preset: 'off',
+    agent_standing_presets: { official_full: true },
+  }
+  fs.writeFileSync(routingFile, JSON.stringify({ compatibility }))
+  let received = null
+  const kernel = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => {
+      received = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(completeAnthropicSse())
+    })
+  })
+  await new Promise((resolve, reject) => {
+    kernel.once('error', reject)
+    kernel.listen(socketPath, resolve)
+  })
+  const response = fakeResponse()
+  const picks = []
+  const handler = createHandleProtocol({
+    json: (_res, status, payload) => {
+      response.status = status
+      response.body = payload
+      return payload
+    },
+    writeSSEHeaders() {},
+    readBody: async () => body || { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hello' }] },
+    requireAuth: () => true,
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+      paths: { data: root },
+    },
+    requestLog: { start: () => ({ request_id: 'api-body-policy-test' }), finish() {} },
+    stickyRouter: {},
+    accountQuota: {},
+    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiScheduler: {
+      pick: (...args) => {
+        picks.push(args)
+        const chosen = pick ? pick(picks.length) : endpoint
+        return {
+          ok: true,
+          endpoint: {
+            id: 'ep-test',
+            kind: 'claude',
+            protocol: 'anthropic',
+            base_url: 'https://upstream.invalid',
+            ...chosen,
+          },
+          upstream_model: 'claude-haiku-4-5',
+          key: { id: 'key-test', api_key: 'secret' },
+        }
+      },
+    },
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfigPath: routingFile,
+    routingConfig: { compatibility, failover: {} },
+    groupsRepo: { rateMultiplier: () => 1 },
+  })
+  const req = {
+    method: 'POST',
+    url: '/v1/messages',
+    headers: { authorization: 'Bearer sk-vm-api', 'user-agent': 'test-client', ...reqHeaders },
+    apiKeyKind: 'managed',
+    apiKeyRecord: { category: 'api' },
+    once() {},
+    off() {},
+  }
+  try {
+    await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
+    return { received, response, outbound: received ? JSON.parse(received.body) : null, picks }
+  } finally {
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+}
+
+const CALLER_SYSTEM = 'CALLER_OWN_SYSTEM_MARKER'
+const callerBody = () => ({
+  model: 'claude-haiku-4-5',
+  messages: [{ role: 'user', content: 'hello' }],
+  system: CALLER_SYSTEM,
+})
+
+test('an endpoint on body_policy=caller forwards the caller body instead of the persona (#1321)', async () => {
+  const { response, outbound } = await apiBackendHop({
+    endpoint: { body_policy: 'caller' },
+    body: callerBody(),
+  })
+  assert.equal(response.status, 200)
+  assert.ok(outbound)
+  const wire = JSON.stringify(outbound)
+  assert.ok(wire.includes(CALLER_SYSTEM), 'the caller system must survive untouched')
+  assert.equal(wire.includes(CRS_OFFICIAL_CLI_SYSTEM), false, 'no injected CLI identity')
+  assert.equal(wire.includes(DEFAULT_AGENT_STANDING), false, 'no injected agent standing')
+  assert.equal(wire.includes(OFFICIAL_303_HARNESS), false, 'no injected harness')
+  assert.equal(wire.includes('x-anthropic-billing-header'), false, 'no injected billing block')
+})
+
+test('an endpoint without body_policy still applies the configured persona (#1321)', async () => {
+  // Explicit: an absent policy is the historical path, not an accidental opt-in.
+  const { response, outbound } = await apiBackendHop({ endpoint: {}, body: callerBody() })
+  assert.equal(response.status, 200)
+  const wire = JSON.stringify(outbound)
+  assert.ok(wire.includes(CRS_OFFICIAL_CLI_SYSTEM), 'the persona identity is still injected')
+  assert.ok(wire.includes('x-anthropic-billing-header'), 'the billing block is still injected')
+})
+
+test('a caller cannot turn on body_policy through headers or body (#1321)', async () => {
+  const { outbound } = await apiBackendHop({
+    endpoint: {},
+    body: { ...callerBody(), body_policy: 'caller' },
+    reqHeaders: { 'x-kin-body-policy': 'caller', 'anthropic-beta': 'body-policy=caller' },
+  })
+  const wire = JSON.stringify(outbound)
+  assert.ok(wire.includes(CRS_OFFICIAL_CLI_SYSTEM), 'caller input must not opt the endpoint in')
+  assert.ok(wire.includes('x-anthropic-billing-header'))
+})
+
 test('OAuth cli-hop applies the resolved Protocol custom persona template', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-persona-'))
   const routingFile = path.join(root, 'routing.json')
