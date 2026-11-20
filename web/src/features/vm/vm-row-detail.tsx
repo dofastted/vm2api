@@ -47,6 +47,48 @@ function fmtClock(ms: number | null): string {
   return ms ? (fmtResetClock(new Date(ms).toISOString()) ?? '—') : '—'
 }
 
+function healthAxisMarks(range: VmHealthRange) {
+  return range === '7d'
+    ? [
+        { label: '7 天前', at: 0 },
+        { label: '5d', at: 2 / 7 },
+        { label: '3d', at: 4 / 7 },
+        { label: '1d', at: 6 / 7 },
+        { label: '现在', at: 1 },
+      ]
+    : [
+        { label: '24h 前', at: 0 },
+        { label: '18h', at: 0.25 },
+        { label: '12h', at: 0.5 },
+        { label: '6h', at: 0.75 },
+        { label: '现在', at: 1 },
+      ]
+}
+
+export function HealthAxis({ range }: { range: VmHealthRange }) {
+  return (
+    <div className='relative mt-1 h-4 text-[10.5px] text-[color:var(--text-tertiary)]'>
+      {healthAxisMarks(range).map((mark) => (
+        <span
+          key={mark.label}
+          className='absolute whitespace-nowrap'
+          style={{
+            left: `${mark.at * 100}%`,
+            transform:
+              mark.at === 0
+                ? undefined
+                : mark.at === 1
+                  ? 'translateX(-100%)'
+                  : 'translateX(-50%)',
+          }}
+        >
+          {mark.label}
+        </span>
+      ))}
+    </div>
+  )
+}
+
 function HealthCard({ vm }: { vm: Vm }) {
   const [range, setRange] = useState<VmHealthRange>('24h')
   const q = useQuery(vmHealthQueryOptions(vm.id, range))
@@ -54,10 +96,6 @@ function HealthCard({ vm }: { vm: Vm }) {
   const slotMin = q.data?.slot_min ?? (range === '7d' ? 120 : 30)
   const s = healthSummary(q.data?.buckets ?? null, slots)
   const startMs = q.data ? Date.parse(q.data.start) : null
-  const axis =
-    range === '7d'
-      ? ['7 天前', '5d', '3d', '1d', '现在']
-      : ['24h 前', '18h', '12h', '6h', '现在']
   return (
     <section className={CARD} aria-label='请求健康'>
       <div className={CARD_HEAD}>
@@ -106,11 +144,7 @@ function HealthCard({ vm }: { vm: Vm }) {
               />
             ))}
           </div>
-          <div className='mt-1 flex justify-between text-[10.5px] text-[color:var(--text-tertiary)]'>
-            {axis.map((a) => (
-              <span key={a}>{a}</span>
-            ))}
-          </div>
+          <HealthAxis range={range} />
           <div className='mt-3 grid grid-cols-4 gap-2'>
             <div>
               <span className={KV_LABEL}>成功率</span>
