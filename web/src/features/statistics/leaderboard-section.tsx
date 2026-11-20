@@ -34,13 +34,18 @@ import {
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { EntryName } from './leaderboard-card'
 import { leaderboardQueryOptions } from './queries'
+import { STATS_RANGES } from './stats-format'
 
-const PERIODS: { id: StatsRange; label: string; empty: string }[] = [
-  { id: 'today', label: '今日', empty: '今日暂无数据' },
-  { id: '7days', label: '7天', empty: '暂无数据' },
-  { id: '30days', label: '30天', empty: '暂无数据' },
-  { id: 'thisMonth', label: '本月', empty: '本月暂无数据' },
-]
+const PERIODS: { id: StatsRange; label: string; empty: string }[] =
+  STATS_RANGES.map((range) => ({
+    ...range,
+    empty:
+      range.id === 'today'
+        ? '今日暂无数据'
+        : range.id === 'thisMonth'
+          ? '本月暂无数据'
+          : '暂无数据',
+  }))
 
 const SCOPE_LABELS: Record<LeaderboardScope, string> = {
   user: '用户',
@@ -279,7 +284,7 @@ export function LeaderboardSection({
         </div>
       </div>
 
-      <div className='mb-6 flex items-center gap-1'>
+      <div className='mb-6 flex flex-wrap items-center gap-1'>
         {PERIODS.map((item) => (
           <Button
             key={item.id}
