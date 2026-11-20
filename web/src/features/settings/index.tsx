@@ -23,6 +23,7 @@ import { QueryGate } from '@/components/query-gate'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { AboutPane } from '@/features/settings/about-pane'
 import { BackupPane } from '@/features/settings/backup-pane'
+import { GeminiInstallPane } from '@/features/settings/gemini-install-pane'
 import { HealthPane } from '@/features/settings/health-pane'
 import { LogsPane } from '@/features/settings/logs-pane'
 import {
