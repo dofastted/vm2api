@@ -11,8 +11,14 @@ import { spawnSync } from 'node:child_process'
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { loadConfig, reloadActiveVm, routingConfigFile } from './lib/core/config.mjs'
-import { geminiKeyAllowsPath, handleGeminiPublic, isGeminiPublicPath } from './lib/gemini/routes.mjs'
+import {
+  createGeminiTerminal,
+  geminiKeyAllowsPath,
+  handleGeminiPublic,
+  isGeminiPublicPath,
+} from './lib/gemini/routes.mjs'
 import {
   extractApiKey,
   timingSafeEqualStr,
@@ -1130,6 +1136,7 @@ const handleCragShop = createCragShopHandler({
   activationEnabled: cragShopActivationEnabled,
 })
 
+const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })
 const handlePanel = createPanelHandler({
   getDb,
   cragSubscription,
@@ -1203,10 +1210,13 @@ const handlePanel = createPanelHandler({
   clusterManager,
   slotShell,
   slotDesktop,
+  geminiTerminal,
 })
 
+let geminiTerminalDrain
 const gracefulShutdown = createGracefulShutdown({
   beforeDrain: async () => {
+    geminiTerminalDrain = geminiTerminal.close()
     installJevUsageRecorder(null)
     try {
       vmTestSchedule.stop()
@@ -1244,6 +1254,8 @@ const gracefulShutdown = createGracefulShutdown({
     } catch {}
   },
   afterDrain: async () => {
+    // Let host cleanup finish without extending shutdown to the launch deadline.
+    await Promise.race([geminiTerminalDrain, delay(2000, undefined, { ref: false })])
     try {
       stopVmWatch()
     } catch {}
@@ -1455,6 +1467,7 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy()
     return
   }
+  if (geminiTerminal.handleUpgrade(req, socket, head)) return
   if (responsesWs.handleUpgrade(req, socket, head)) return
   if (clusterRoutes.handleUpgrade(req, socket, head)) return
   if (slotDesktop.handleUpgrade(req, socket, head)) return

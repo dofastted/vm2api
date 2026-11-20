@@ -217,8 +217,8 @@ docker exec kin-<槽> curl -sS -o /dev/null -w '%{http_code}\n' --max-time 10 ht
 Node 听 `:8787`。HTTPS 放在 nginx。
 
 ```nginx
-# 集群页 / 槽位运维终端是 WebSocket：必须透传 Upgrade，并直连 Node（前面若有会丢 Upgrade 的网关，也要绕过）。
-location ~ ^/api/panel/(cluster/nodes|vms)/[^/]+/shell$ {
+# 集群、槽位和 Gemini 终端是 WebSocket：必须透传 Upgrade，并直连 Node。
+location ~ ^/api/panel/((cluster/nodes|vms)/[^/]+/shell|gemini/environments/[^/]+/terminal/ws)$ {
   proxy_pass http://127.0.0.1:8787;
   proxy_http_version 1.1;
   proxy_set_header Host $host;
@@ -251,7 +251,7 @@ location / {
 }
 ```
 
-`Connection ""` 会剥掉 Upgrade，终端或 Responses WS 握手拿不到 101，所以 shell / responses 路径单独放在前面。生产机的 Go 前门在 `:8787`、Node 在 `:8788` 时，这些 location 必须 `proxy_pass` 到 Node。终端症状和核对命令见 [nginx-shell.md](nginx-shell.md)。
+`Connection ""` 会剥掉 Upgrade，终端或 Responses WS 握手拿不到 101。生产机的 Go 前门在 `:8787`、Node 在 `:8788` 时，上述两个 WebSocket location 必须 `proxy_pass` 到 Node。终端症状和核对命令见 [nginx-shell.md](nginx-shell.md)。
 
 ## 本机 Node（备选）
 

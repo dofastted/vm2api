@@ -17,16 +17,18 @@ docker network ls --format '{{.Name}}' | grep '^kin-eg-' | while read -r n; do
 done
 ```
 
-实测一台生产控制面（2026-11-19）：**15 个出口网络，只有 4 个在用，11 个是零容器孤儿**，占掉 6 个 `/16` + 5 个 `/20`。而 8 台 VM 只用 4 个代理（一个代理服务多台 VM 是常态）。
+但**零容器不等于孤儿**。实测一台生产控制面（2026-11-20）：15 个出口网络里 12 个零容器，而 `verify` 只判定 **1 个**是残留——另外 11 个的 owner 代理还活着（该机 16 个活代理、9 台 VM、8 个运行容器），只是对应 VM 当前没开机，随时会用上。工具不删它们是对的。
 
-所以顺序是：
+所以收益要按判定结果算，不是按零容器数算：
 
-| 先做 | 收益 | 风险 |
+| 先做 | 该例实测收益 | 风险 |
 |---|---|---|
-| `egress-maintenance.mjs sweep` 清孤儿 | 该例 15 → 4 个网络 | 低，不碰运行中的 VM |
-| 再折叠成共享 | 4 → 1 个网络 | 高，要重建真实用户的容器 |
+| `egress-maintenance.mjs sweep` 清残留 | 15 → 14 个网络（`/20` 占用 9 → 8） | 低，不碰运行中的 VM |
+| 再折叠成共享 | 每节点收敛到 1 个网络 | 高，要重建真实用户的容器 |
 
-**先清理，再决定还要不要折叠。** 孤儿清理往往就够了；节点 VM 密度真的高时，折叠才划得来。
+清扫的主要价值是**悬空规则**而非网段：该例实得 1 个网络 + 39 个 rundir + 13 条 iptables 链 + 1 个网桥（54 项），其中 12 个网桥早已消失、只剩规则。真正压地址池的是「每代理一个网络」，那只有折叠能解。
+
+**先清理，再决定还要不要折叠。** 清理是无风险的，先做；但别指望它腾出网段。
 
 ```bash
 node scripts/egress-maintenance.mjs verify --root=/opt/vm2api            # 先看判定
@@ -38,6 +40,7 @@ node scripts/egress-maintenance.mjs sweep --root=/opt/vm2api --apply
 
 ```bash
 cat /proc/sys/net/bridge/bridge-nf-call-iptables   # 必须是 1
+strings -a /opt/vm2api/bin/kin-egress | grep -c 'no route for source'   # 必须 ≥ 1
 ```
 
 这是**隔离前提**，不是性能项：共享网桥上 VM 之间的隔离两道都在 iptables 里，此开关为 0 时两道同时失效，整节点 VM 可互通且无任何日志。控制面在折叠前会检查并拒绝（`bridge_netfilter_disabled`），所以这是会被挡住的，不是悄悄发生的。细节见内核参数文档。
@@ -101,6 +104,11 @@ node scripts/egress-switch-mode.mjs to-per-vm --vm=vm-01 --root=/opt/vm2api --ap
 
 ## 已知边界
 
+- **amd64 的 `kin-egress` 不是从源码编出来的**：`release.yml` 只在 ARM64 分支编 `worker/`；amd64 的 Go helper 来自 `deploy/payload.json` pin 的产物（`node scripts/fetch-payload.mjs`）。所以改了 `worker/internal/egress/` 的代码**并不会进 amd64 二进制**——必须另编产物、发 payload 组件 release、`fetch-payload.mjs --pin <TAG>` 重算清单，才会随下一次发版落到主机。2026-11-20 第一次实机折叠就是栽在这里：源码正确、helper 却报 `unsupported proxy scheme ""`。判断方法：
+  ```bash
+  strings -a /opt/vm2api/bin/kin-egress | grep -c 'no route for source'   # 0 = 旧产物
+  ```
+  这条探针对剥过符号的产物同样有效（字符串在 rodata，`-s -w` 不会删）。
 - **集群节点需要先升级节点上的 `kin-egress`**：旧版遇到空 `proxy_url` 会拒绝启动（见上文「切之前确认节点前提」）。二进制由控制面在启动共享 helper 前自动推到 `<root>/egress/slot-bin`，但它推的是控制面自己那份——所以控制面必须先部署到含共享支持的版本。
 - **节点侧与控制面侧的串行化共用控制面进程内的锁**。控制面是任何节点的唯一写入方，所以这是成立的；但这也意味着**两个控制面同时管同一个节点**会绕过它。本项目的部署形态是单控制面，若将来不是，这里需要改成节点上的锁。
 - **一个代理服务多台 VM 时**，路由表是多条指向同一上游 URL——功能正常，但要据此重新算收益：瓶颈是网络数而非 VM 数。
