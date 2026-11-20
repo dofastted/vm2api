@@ -7349,20 +7349,21 @@ export function createPanelHandler(ctx) {
           })
         // DNS changes must reach running egress helpers; slots stay intact.
         const egress = []
-        if (
-          ((body.dns_primary != null && body.dns_primary !== previousConfig.dns_primary) ||
-            (body.dns_disable_svcb_https != null &&
-              body.dns_disable_svcb_https !== previousConfig.dns_disable_svcb_https)) &&
-          egressEnabled() &&
-          process.env.KIN_CRS_MOCK !== '1'
-        ) {
+        const upstreamChanged = body.dns_primary != null && body.dns_primary !== previousConfig.dns_primary
+        // The pool-level SVCB/HTTPS switch is a bulk write over the proxy rows,
+        // so only the outlets it actually flipped need a new helper config —
+        // reloading the whole pool for a no-op would cut exits for nothing.
+        const flipped = new Set(result.dns_disable_svcb_https_changed || [])
+        if ((upstreamChanged || flipped.size) && egressEnabled() && process.env.KIN_CRS_MOCK !== '1') {
           const dnsUpstream = dnsUpstreamChain(result.config.dns_primary)
-          const dnsEmptyTypes = result.config.dns_disable_svcb_https ? [64, 65] : []
           for (const proxy of proxyPool.snapshot().proxies) {
             if (isLocalEgressProxy(proxy) || !proxy.bound_vm_ids?.length) continue
+            if (!upstreamChanged && !flipped.has(proxy.id)) continue
+            // dnsEmptyTypes is deliberately NOT passed: startProxyEgress reads
+            // it off each proxy, so changing the shared upstream cannot flatten
+            // every outlet onto one override.
             const r = await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(proxy.id), {
               dnsUpstream,
-              dnsEmptyTypes,
             })
             egress.push({ proxy_id: proxy.id, ok: r.ok, error: r.ok ? null : r.error })
           }
@@ -7381,7 +7382,16 @@ export function createPanelHandler(ctx) {
         // Forward only the keys the caller actually sent — update() reads
         // presence, not value, to tell "leave alone" from "clear".
         const patch = {}
-        for (const key of ['scheme', 'host', 'port', 'username', 'password', 'label', 'domain_forward']) {
+        for (const key of [
+          'scheme',
+          'host',
+          'port',
+          'username',
+          'password',
+          'label',
+          'domain_forward',
+          'dns_disable_svcb_https',
+        ]) {
           if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
         }
         const result = proxyPool.update(id, patch)
@@ -7390,14 +7400,17 @@ export function createPanelHandler(ctx) {
           const type = status === 404 ? 'not_found_error' : 'invalid_request_error'
           return json(res, status, { ok: false, error: { type, code: result.error, message: result.error } })
         }
-        // Hostname mode and SOCKS upstream both live inside kin-egress.
+        // Hostname mode, SOCKS upstream and the SVCB/HTTPS DNS override all
+        // live inside kin-egress.
         // Domain-forward-only: restart the helper; slots keep the same bridge.
         // Same-id connection change: network name is unchanged so reload would
         // only docker restart — the helper must pick up the new proxy_url or
         // transparent traffic keeps the old exit.
+        // DNS-override-only: the helper's egress.json changes, but worker.json
+        // does not carry the field, so the bound slots below stay untouched.
         let egress = null
         if (
-          (result.domain_forward_changed || result.connection_changed) &&
+          (result.domain_forward_changed || result.dns_disable_svcb_https_changed || result.connection_changed) &&
           egressEnabled() &&
           process.env.KIN_CRS_MOCK !== '1' &&
           (result.proxy.bound_vm_ids || []).length

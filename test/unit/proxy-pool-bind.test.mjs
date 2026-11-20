@@ -717,3 +717,84 @@ test('local egress probe stays direct when kin-egress is down', async () => {
   assert.equal(row.enabled, true)
   assert.equal(disabled.length, 0)
 })
+
+test('the SVCB/HTTPS override lives on each proxy and the pool switch applies it in bulk', (t) => {
+  const dir = tmpDir()
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pool = new ProxyPool({ dataDir: dir })
+  pool.stopScheduler()
+  pool.ensureLocal()
+  pool.importLines('10.0.0.1:1080\n10.0.0.2:1080')
+  const [a, b] = pool.snapshot().proxies.filter((p) => p.id !== 'px-local')
+
+  // Default is off, and the pool switch writes through to every eligible row.
+  assert.equal(a.dns_disable_svcb_https, false)
+  const on = pool.setDnsDisableSvcbHttpsAll(true)
+  assert.equal(on.ok, true)
+  assert.deepEqual(on.changed.sort(), [a.id, b.id].sort())
+  // The local row has no helper of its own, so it is not eligible.
+  assert.equal(on.eligible, 2)
+  assert.equal(pool.state.proxies.find((p) => p.id === 'px-local').dns_disable_svcb_https, undefined)
+  for (const p of pool.snapshot().proxies.filter((p) => p.id !== 'px-local')) {
+    assert.equal(p.dns_disable_svcb_https, true)
+  }
+
+  // A second apply of the same value flips nothing: the caller must not reload
+  // helpers that already carry it.
+  assert.deepEqual(pool.setDnsDisableSvcbHttpsAll(true).changed, [])
+  assert.equal(pool.setDnsDisableSvcbHttpsAll('true').error, 'invalid_dns_disable_svcb_https')
+
+  // startProxyEgress reads the trimmed shape, so the field has to survive it.
+  assert.equal(pool.getProxyByIdWithAuth(a.id).dns_disable_svcb_https, true)
+
+  // One proxy can differ from the pool.
+  const off = pool.update(a.id, { dns_disable_svcb_https: false })
+  assert.equal(off.ok, true)
+  assert.equal(off.dns_disable_svcb_https_changed, true)
+  assert.equal(off.connection_changed, false)
+  assert.equal(off.proxy.dns_disable_svcb_https, false)
+  assert.equal(pool.getProxyByIdWithAuth(a.id).dns_disable_svcb_https, false)
+  assert.equal(pool.getProxyByIdWithAuth(b.id).dns_disable_svcb_https, true)
+  // Setting the value it already has is still ok, just not a change.
+  assert.equal(pool.update(a.id, { dns_disable_svcb_https: false }).dns_disable_svcb_https_changed, false)
+  assert.equal(pool.update(a.id, { dns_disable_svcb_https: 1 }).error, 'invalid_dns_disable_svcb_https')
+  assert.equal(pool.update('px-local', { dns_disable_svcb_https: true }).error, 'dns_disable_svcb_https_unsupported')
+
+  // A connection edit must carry the switch through the rebuilt record.
+  const moved = pool.update(b.id, { host: '10.0.0.9', port: 1081 })
+  assert.equal(moved.ok, true)
+  assert.equal(moved.connection_changed, true)
+  assert.equal(moved.proxy.dns_disable_svcb_https, true)
+
+  // The pool key is the default for rows added later.
+  pool.importLines('10.0.0.3:1080')
+  const added = pool.snapshot().proxies.find((p) => p.host === '10.0.0.3')
+  assert.equal(added.dns_disable_svcb_https, true)
+
+  const reopened = new ProxyPool({ dataDir: dir })
+  reopened.stopScheduler()
+  assert.equal(reopened.getProxyByIdWithAuth(a.id).dns_disable_svcb_https, false)
+  assert.equal(reopened.getProxyByIdWithAuth(b.id).dns_disable_svcb_https, true)
+})
+
+test('the pool-level config switch reports which proxies it flipped', (t) => {
+  const dir = tmpDir()
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pool = new ProxyPool({ dataDir: dir })
+  pool.stopScheduler()
+  pool.importLines('10.0.0.1:1080\n10.0.0.2:1080')
+  const ids = pool
+    .snapshot()
+    .proxies.map((p) => p.id)
+    .sort()
+
+  const result = pool.updateConfig({ dns_disable_svcb_https: true })
+  assert.equal(result.ok, true)
+  assert.equal(result.config.dns_disable_svcb_https, true)
+  assert.deepEqual([...result.dns_disable_svcb_https_changed].sort(), ids)
+  for (const p of pool.snapshot().proxies) assert.equal(p.dns_disable_svcb_https, true)
+
+  // An unrelated config key touches no proxy.
+  const other = pool.updateConfig({ probe_interval_min: 30 })
+  assert.deepEqual(other.dns_disable_svcb_https_changed, [])
+})
