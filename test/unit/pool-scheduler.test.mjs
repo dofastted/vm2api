@@ -3740,7 +3740,7 @@ test('normalizePoolRouting clamps fresh_account_isolation_ms', () => {
   assert.equal(normalizePoolRouting({ fresh_account_isolation_ms: 'junk' }).fresh_account_isolation_ms, 0)
 })
 
-test('fresh_account_isolation_ms: an orphaned huge cold transcript never lands on a fresh account', async (t) => {
+test('fresh_account_isolation_ms: a huge cold first prompt is normal traffic and lands on a fresh account', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const now = Date.now()
@@ -3751,59 +3751,50 @@ test('fresh_account_isolation_ms: an orphaned huge cold transcript never lands o
     config: { fresh_account_isolation_ms: 48 * 3600_000 },
   })
   runtime.accounts = new Map([
-    // 老号 home（vm-01）已死被排除：不在 excluded 语义里体现为排除即可；
-    // 其 created_at 留空 = 窗口外，防止 bootstrap escape 把池误判成全新池。
-    ['account-1', {}],
-    // 全池唯一的窗口内新号
+    // home（vm-01）不在隔离窗口内的意义：防止 bootstrap escape 把池当全新池
+    ['account-1', { created_at: new Date(now - 30 * 86400_000).toISOString() }],
     ['account-2', { created_at: new Date(now - 10 * 60_000).toISOString() }],
   ])
-  // 30 万 token 的冷 prompt（messages 数组带大文本，无缓存前缀可言）；
-  // 场景 = home 号凭证死亡后 pin 已被清，孤儿转写只能落新号
-  const bigText = 'x'.repeat(900_000)
-  const body = { model: 'claude-test', messages: [{ role: 'user', content: bigText }] }
-  const orphan = await pool.selectAndReserve({
-    model: 'claude-test',
-    quotaRequest: { body },
-    excluded: new Set(['account-1']),
-    allowWait: false,
-  })
-  assert.equal(orphan.ok, false)
-  assert.equal(orphan.reason, 'no_eligible_accounts')
-
-  // 正常小请求（< large_cold 阈值）照常落新号
-  const small = await pool.selectAndReserve({
-    model: 'claude-test',
-    quotaRequest: { body: { model: 'claude-test', messages: [{ role: 'user', content: 'hi' }] } },
-    excluded: new Set(['account-1']),
-    allowWait: false,
-  })
-  assert.equal(small.ok, true)
-  assert.equal(small.vmId, 'vm-02')
-  small.release()
-})
-
-test('fresh_account_isolation_ms: bootstrap escape serves a brand-new pool its own huge first prompts', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const now = Date.now()
-  const runtime = new RuntimeRepo()
-  const pool = scheduler(root, {
-    runtimeRepo: runtime,
-    accountQuota: { canAccept: () => ({ ok: true }), config: {} },
-    config: { fresh_account_isolation_ms: 48 * 3600_000 },
-  })
-  // 全池都是窗口内新号（全新部署），entry 100% 被隔离 → 逃生门放行
-  runtime.accounts = new Map([
-    ['account-1', { created_at: new Date(now - 5 * 60_000).toISOString() }],
-    ['account-2', { created_at: new Date(now - 10 * 60_000).toISOString() }],
-  ])
+  // 用户离开对话数小时后回来，缓存早已过期，整段历史冷提交 —— 正常流量，
+  // 不是跨号关联信号：新开长会话（无 sticky 行）不受隔离门影响
   const bigText = 'x'.repeat(900_000)
   const served = await pool.selectAndReserve({
     model: 'claude-test',
     quotaRequest: { body: { model: 'claude-test', messages: [{ role: 'user', content: bigText }] } },
+    excluded: new Set(['account-1']),
     allowWait: false,
   })
-  assert.equal(served.ok, true)
+  assert.equal(served.ok, true, 'a huge new conversation is legitimate and must be served')
+  assert.equal(served.vmId, 'vm-02')
+  served.release()
+})
+
+test('fresh_account_isolation_ms: bootstrap escape releases a continuing conversation when the whole pool is fresh', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const now = Date.now()
+  const runtime = new RuntimeRepo()
+  // 全池都是窗口内新号（全新部署）：续入会话的 home 已不存在（槽已删），
+  // 没有可等待的老号 —— 逃生门必须放行，否则全新池不可用
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  sticky.bind('sess:conv', { vmId: 'vm-gone', accountId: 'account-gone' })
+  const pool = scheduler(root, {
+    stickyRouter: sticky,
+    runtimeRepo: runtime,
+    accountQuota: { canAccept: () => ({ ok: true }), config: {} },
+    config: { fresh_account_isolation_ms: 48 * 3600_000 },
+  })
+  runtime.accounts = new Map([
+    ['account-1', { created_at: new Date(now - 5 * 60_000).toISOString() }],
+    ['account-2', { created_at: new Date(now - 10 * 60_000).toISOString() }],
+  ])
+  const served = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'sess:conv',
+    stickyKeys: ['sess:conv'],
+    allowWait: false,
+  })
+  assert.equal(served.ok, true, 'a brand-new pool must stay schedulable even for continuing conversations')
   assert.ok(served.vmId === 'vm-01' || served.vmId === 'vm-02')
   served.release()
 })

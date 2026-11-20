@@ -33,7 +33,6 @@ import {
 } from './availability.mjs'
 import { listQuotaFromHeaders, noResetRejectExpired } from './quota-window.mjs'
 import { hardBlockOf } from './rate-limit-service.mjs'
-import { largeColdThresholdOf, resolveRequestRisk } from './quota-request-risk.mjs'
 import { unitCircuit } from './unit-circuit.mjs'
 import { isSlotProxyDesynced, readWorkerProxyEndpoint, readWorkerEgressMode } from '../vm/vm-runtime.mjs'
 import { splitBlocksModel } from './weekly-split.mjs'
@@ -1584,10 +1583,6 @@ export class PoolScheduler extends EventEmitter {
     const snapshots = this.runtimeRepo
       ? this.runtimeRepo.schedulingSnapshot(entries.map((entry) => entry.accountId))
       : new Map()
-    // Fresh-account isolation: entries skipped by the window land here; if the
-    // window ends up skipping everything, one retry pass runs with the guard
-    // suspended so a brand-new pool stays schedulable (bootstrap escape).
-    const freshSkipped = []
     for (const { vm, accountId } of entries) {
       if (signal?.aborted) throw makeAbortError()
       const snapshot = snapshots.get(accountId)
@@ -1608,36 +1603,26 @@ export class PoolScheduler extends EventEmitter {
         }
         if (guard.level === 'continuing' && continuingVmIds && !continuingVmIds.has(vm.id)) continue
       }
-      // Fresh-account isolation: a freshly onboarded account must not receive
-      // another account's conversation. Two signals, one window
-      // (fresh_account_isolation_ms, 0 disables both):
-      //  1. a pinned conversation spilling off its home (capacity, failover);
-      //  2. a huge cold first prompt — orphaned transcripts (home credential
-      //     died, pin already cleared) and oversized new conversations look
-      //     identical at the provider: a brand-new account whose first request
-      //     carries a 300k-token prefix it cannot own.
-      // Bootstrap escape (signal 2 only): when every eligible slot is inside
-      // the window the pool is brand new and must stay schedulable — a huge
-      // first prompt is then served by whoever is available. Signal 1 never
-      // participates: its sticky row exists, so the conversation's own home is
-      // merely unavailable and waiting for it is the correct behaviour.
+      // Fresh-account isolation: a conversation already pinned to another VM
+      // must not spill its transcript onto a freshly onboarded account.
+      // Replaying another account's full history onto a brand-new account is
+      // a strong ban signal at the provider. Size alone is NOT the signal: a
+      // legitimate user resuming a long conversation after a cache-expiry gap
+      // submits the whole transcript cold too, and that is normal traffic. What
+      // separates the two is prefix ownership — the transcript was recently
+      // served by a different account — and that is exactly what a sticky row
+      // on another VM records.
+      // Bootstrap escape: when every account in the platform pool is inside
+      // the window the pool is brand new; a continuing conversation then has
+      // no home to wait for, so the pin is released to keep the pool usable.
       if (!pin && isolationMs > 0 && !isolationSuspended) {
         // created_at may be an ISO string (DB row) or an epoch-ms number.
         const createdAt = toEpochMs(account?.created_at)
-        if (createdAt > 0 && now - createdAt < isolationMs) {
-          const continuingElsewhere = continuingVmIds && continuingVmIds.size > 0 && !continuingVmIds.has(vm.id)
-          let coldTooLarge = false
-          if (!continuingElsewhere && quotaRequest?.body && this.accountQuota?.config) {
-            const quotaConfig = this.accountQuota.quotaConfigFor?.(account) || this.accountQuota.config
-            const risk = resolveRequestRisk({ quotaRequest }, accountId, quotaConfig)
-            coldTooLarge = !!risk?.cold && (risk.uncachedTokens || 0) >= largeColdThresholdOf(quotaConfig)
-          }
-          if (continuingElsewhere || coldTooLarge) {
-            candidates.freshWindow ??= new Set()
-            candidates.freshWindow.add(accountId)
-            if (coldTooLarge) freshSkipped.push({ vm, accountId })
-            continue
-          }
+        const continuingElsewhere = continuingVmIds && continuingVmIds.size > 0 && !continuingVmIds.has(vm.id)
+        if (continuingElsewhere && createdAt > 0 && now - createdAt < isolationMs) {
+          candidates.freshWindow ??= new Set()
+          candidates.freshWindow.add(accountId)
+          continue
         }
       }
       // Admission re-reads the guard; it needs to know whether this request continues here.
@@ -1715,9 +1700,11 @@ export class PoolScheduler extends EventEmitter {
         exec: this.executionContext(vm, accountId),
       })
     }
-    // Bootstrap escape: a pool whose every entry is inside the isolation
-    // window is brand new — serve it instead of returning an empty pool.
-    if (!isolationSuspended && allFresh && freshSkipped.length > 0 && candidates.length === 0) {
+    // Bootstrap escape: a pool whose every account is inside the isolation
+    // window is brand new — a continuing conversation has no window-exempt
+    // home to wait for there, so the pin is released to keep the pool usable.
+    const freshBlocked = (candidates.freshWindow || new Set()).size
+    if (!isolationSuspended && allFresh && freshBlocked > 0 && candidates.length === 0) {
       candidates.freshWindow = undefined
       return this.eligibleCandidates({
         model,
