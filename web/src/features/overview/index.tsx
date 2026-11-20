@@ -231,9 +231,9 @@ export function OverviewPage() {
             />
             <KpiCard
               icon={Activity}
-              label={`请求 · 缓存 ${cachePct == null ? '—' : `${cachePct.toFixed(0)}%`}`}
+              label={`请求 · 缓存命中率 ${cachePct == null ? '—' : `${cachePct.toFixed(0)}%`}`}
               value={fmtNum(reqs)}
-              hint={`Tokens ${fmtNum(tokensIn)}/${fmtNum(tokensOut)}`}
+              hint={`输入 ${fmtNum(tokensIn)} / 输出 ${fmtNum(tokensOut)} Token`}
               ringPct={cachePct}
               tone='good'
             />
