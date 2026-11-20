@@ -86,12 +86,27 @@ describe('GPT vm-id usage rows are live when the slot has no uuid', () => {
 })
 
 describe('vm cost ledger labels', () => {
-  it('names the account total separately from retained model costs', () => {
-    const rows = vmCostLedger({
+  it('names an archived account total and a retained-log fallback separately', () => {
+    const archived = vmCostLedger({
       id: 'vm-1',
       total_cost: 4,
       total_tokens: 9,
+      lifetime_usage: { cost: 12, tokens: 30 },
     } as never)
-    expect(rows.map((row) => row.label)).toEqual(['5H', '7D', '账号总计'])
+    expect(archived[2]).toMatchObject({
+      label: '账号总计',
+      cost: 12,
+      tokens: 30,
+    })
+
+    const retained = vmCostLedger(
+      { id: 'vm-2', total_cost: 7, total_tokens: 11 } as never,
+      [{ account_id: 'vm-2', vm_id: 'vm-2', total_cost: 19, total_tokens: 41 }]
+    )
+    expect(retained[2]).toMatchObject({
+      label: '保留日志合计',
+      cost: 19,
+      tokens: 41,
+    })
   })
 })

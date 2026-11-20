@@ -296,7 +296,7 @@ function CostCard({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
       cost: ledger[1].cost,
     },
     {
-      label: '总计',
+      label: ledger[2].label,
       req: null,
       tokens: ledger[2].tokens,
       cost: ledger[2].cost,
