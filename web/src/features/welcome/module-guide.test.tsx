@@ -3,13 +3,9 @@ import { describe, expect, it, vi } from 'vitest'
 import { WelcomeModuleGuide } from './module-guide'
 
 vi.mock('@tanstack/react-router', () => ({
-  Link: ({
-    to,
-    children,
-  }: {
-    to: string
-    children: string
-  }) => <a href={to}>{children}</a>,
+  Link: ({ to, children }: { to: string; children: string }) => (
+    <a href={to}>{children}</a>
+  ),
 }))
 
 describe('API module guide', () => {
