@@ -454,7 +454,11 @@ export function VirtualizedLogsTable({
               <Loader2 className='h-3 w-3 animate-spin' />
               加载更多中...
             </span>
-          ) : !hasNextPage && allLogs.length > 0 ? (
+          ) : hasNextPage ? (
+            <span>
+              {lastPageEmpty ? '正在自动查找下一页…' : '向下滚动以继续查找'}
+            </span>
+          ) : allLogs.length > 0 ? (
             <span>已加载全部记录</span>
           ) : null}
         </div>
