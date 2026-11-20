@@ -114,6 +114,47 @@ test('guest OAuth helper delegates egress selection to the slot network', async 
   }
 })
 
+test('a helper failure without a usable code falls back instead of reporting undefined', async () => {
+  const exec = {
+    projectRoot: '/srv/vm2api',
+    vmId: 'vm-01',
+    vm: { id: 'vm-01', runtime: { type: 'docker' } },
+  }
+  const run = (error) =>
+    runGuestOAuthAuthService(
+      { operation: 'exchange_code', code: 'fixture-code', code_verifier: 'fixture-verifier' },
+      {
+        exec,
+        prepare: async () => ({
+          exec,
+          host: {
+            bins: { oauthAuth: '/usr/local/bin/kin-oauth-auth' },
+            dockerEnv: () => ({}),
+            execUser: () => 'kincli',
+          },
+          configDir: '/home/kincli/.claude',
+          home: '/home/kincli',
+        }),
+        postTelemetry: async () => ({ ok: true }),
+        runDocker: async () => ({ code: 0, stdout: JSON.stringify({ ok: false, ...(error ? { error } : {}) }) }),
+      },
+    )
+
+  // A code the panel can act on is kept.
+  await assert.rejects(run({ code: 'authorize_client_attestation', message: 'boom' }), {
+    code: 'authorize_client_attestation',
+    message: 'boom',
+  })
+  // Everything the pattern rejects becomes the fallback, including a missing or
+  // non-string code — `undefined`/`null` used to pass the bare regexp test.
+  for (const error of [undefined, {}, { message: 'boom' }, { code: null }, { code: 'Bad Code' }, { code: 42 }]) {
+    await assert.rejects(run(error), (err) => {
+      assert.equal(err.code, 'oauth_auth_failed')
+      return true
+    })
+  }
+})
+
 test('guest OAuth takes the version from the locked crag entrypoint, without an extra exec', async () => {
   const exec = {
     projectRoot: '/srv/vm2api',
