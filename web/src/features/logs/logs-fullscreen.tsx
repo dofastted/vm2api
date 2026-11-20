@@ -92,7 +92,7 @@ export function LogsFullscreen({
             <Metric label='活跃 Session 数' value={data?.activeSessions ?? 0} />
             <Metric label='今日请求' value={data?.todayRequests ?? 0} />
             <Metric
-              label='今日消费'
+              label='今日消费 · 实际计费'
               value={formatCurrency(data?.todayActualCost ?? 0, 2)}
             />
             <Metric
