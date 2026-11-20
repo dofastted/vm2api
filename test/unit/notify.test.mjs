@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHmac } from 'node:crypto'
 import {
   normalizeNotifyConfig,
   mergeNotifyConfig,
@@ -72,6 +73,115 @@ test('publicRoutingNotify redacts notify secrets and keeps routing fields', () =
   assert.equal(pub.notify.email.pass_set, true)
   assert.equal(pub.notify.telegram.bot_token, '')
   assert.equal(pub.notify.telegram.bot_token_set, true)
+})
+
+const feishuWebhook = 'https://open.feishu.cn/open-apis/bot/v2/hook/test-webhook'
+
+test('Feishu settings keep and redact credentials and allow removing the signature secret', () => {
+  const config = mergeNotifyConfig(
+    { feishu: { enabled: true, webhook: feishuWebhook, secret: 'test-secret' } },
+    { feishu: { webhook: '', secret: SECRET_KEEP } },
+  )
+  assert.equal(config.feishu.webhook, feishuWebhook)
+  assert.equal(config.feishu.secret, 'test-secret')
+  assert.deepEqual(publicRoutingNotify({ notify: config }).notify.feishu, {
+    enabled: true,
+    webhook: '',
+    webhook_set: true,
+    secret: '',
+    secret_set: true,
+  })
+  assert.equal(mergeNotifyConfig(config, { feishu: { clear_secret: true } }).feishu.secret, '')
+  assert.equal(notifyChannelsReady(config).feishu, true)
+  assert.equal(notifyChannelsReady({ feishu: { enabled: true, webhook: feishuWebhook + '?extra=1' } }).any, false)
+})
+
+test('Feishu manual test can use unsaved settings and sends a compact signed card', async () => {
+  const config = normalizeNotifyConfig({ feishu: { webhook: feishuWebhook, secret: 'test-secret' } })
+  const result = await sendNotifyTest(config, 'feishu', {
+    title: '飞书测试',
+    fetch: async (url, options) => {
+      assert.equal(url, feishuWebhook)
+      assert.equal(options.method, 'POST')
+      assert.equal(options.redirect, 'error')
+      const payload = JSON.parse(options.body)
+      assert.equal(payload.msg_type, 'interactive')
+      assert.equal(payload.card.schema, '2.0')
+      assert.equal(payload.card.header.title.content, '飞书测试')
+      assert.equal(payload.card.header.template, 'blue')
+      assert.match(payload.card.body.elements[0].text.content, /测试通知/)
+      assert.doesNotMatch(JSON.stringify(payload.card), /凭证 0|429 0|今日 \$0/)
+      assert.match(payload.timestamp, /^\d+$/)
+      assert.equal(payload.sign, createHmac('sha256', `${payload.timestamp}\ntest-secret`).digest('base64'))
+      return Response.json({ code: 0 })
+    },
+  })
+  assert.deepEqual(result, { ok: true, channel: 'feishu' })
+})
+
+test('Feishu regular dispatch recognizes provider errors and omits secrets from the result', async () => {
+  const config = normalizeNotifyConfig({ feishu: { enabled: true, webhook: feishuWebhook } })
+  const result = await dispatchNotify(
+    config,
+    { text: 'a'.repeat(5000) },
+    {
+      channels: ['feishu'],
+      fetch: async (_url, options) => {
+        const payload = JSON.parse(options.body)
+        assert.equal(payload.sign, undefined)
+        assert.ok(Buffer.byteLength(payload.card.body.elements[0].text.content) <= 3000)
+        return Response.json({ code: 19024, msg: feishuWebhook })
+      },
+    },
+  )
+  assert.deepEqual(result, {
+    ok: false,
+    results: [{ ok: false, channel: 'feishu', error: '飞书机器人拒绝请求，请检查关键词设置' }],
+  })
+  await assert.rejects(sendNotifyTest(config, 'feishu', { fetch: async () => Response.json({}) }), /无效响应/)
+  await assert.rejects(sendNotifyTest({ feishu: { webhook: 'https://example.test/' } }, 'feishu'), /飞书群自定义机器人/)
+})
+
+test('Feishu outage cards put incident details ahead of metrics and link to the console', async () => {
+  const config = normalizeNotifyConfig({
+    console_url: 'https://panel.example/cc/',
+    feishu: { enabled: true, webhook: feishuWebhook },
+  })
+  const message = formatNotifyMessage(
+    { type: 'vm_down', id: 'vm-01', node_id: 'node-01', reason: 'node_offline' },
+    {
+      available: 2,
+      online: 2,
+      unavailable: 1,
+      with_token: 3,
+      total: 3,
+      today: { requests: 128, tokens: 92000, cost: 2.48, sla: 0.992, errors: 1, status_429: 1 },
+    },
+    config,
+  )
+  const result = await dispatchNotify(config, message, {
+    fetch: async (_url, options) => {
+      const { card } = JSON.parse(options.body)
+      const elements = card.body.elements
+      assert.equal(card.header.template, 'red')
+      assert.equal(elements[0].content, '**事件详情**')
+      assert.match(elements[1].text.content, /vm-01\n节点 node-01\n原因 node_offline/)
+      assert.equal(elements[2].tag, 'hr')
+      assert.equal(elements[3].columns.length, 3)
+      const tables = elements.filter(({ tag }) => tag === 'table')
+      assert.equal(tables.length, 2)
+      assert.equal(tables[0].header_style.bold, true)
+      assert.deepEqual(
+        tables[0].columns.map(({ display_name }) => display_name),
+        ['请求量', 'Token', '费用'],
+      )
+      assert.deepEqual(tables[0].rows, [{ value_0: '128', value_1: '92.0k', value_2: '$2.48' }])
+      assert.deepEqual(tables[1].rows, [{ value_0: '99.2%', value_1: '1', value_2: '1 / 0' }])
+      assert.equal(elements.at(-1).behaviors[0].default_url, 'https://panel.example/cc/#/cluster')
+      return Response.json({ StatusCode: 0 })
+    },
+  })
+  assert.deepEqual(result, { ok: true, results: [{ ok: true, channel: 'feishu' }] })
 })
 
 test('summarize matches overview usable口径', () => {
