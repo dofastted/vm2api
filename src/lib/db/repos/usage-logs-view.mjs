@@ -731,9 +731,20 @@ export class UsageLogsView {
       params.push(...own.params)
     }
     const cond = `WHERE ${where.join(' AND ')}`
-    const total = this.db
-      .prepare(`SELECT COUNT(DISTINCT ${CONVERSATION_KEY_SQL}) AS n FROM usage_logs ${cond}`)
-      .get(...params).n
+    // "One-off" = a conversation key seen once with no tools: side requests (title /
+    // topic forks) that mint their own session id. Counted apart, never merged.
+    const counts = this.db
+      .prepare(`
+      SELECT COUNT(*) AS total,
+             COALESCE(SUM(CASE WHEN c.requests = 1 AND c.tools = 0 THEN 1 ELSE 0 END), 0) AS one_off
+      FROM (
+        SELECT COUNT(*) AS requests, SUM(IFNULL(has_tools, 0)) AS tools
+        FROM usage_logs ${cond}
+        GROUP BY ${CONVERSATION_KEY_SQL}
+      ) c
+    `)
+      .get(...params)
+    const total = counts.total
     // Aggregate first, then pull the newest row per session by id; SQLite's
     // bare-column-with-MAX shortcut is undefined once MIN() is also present.
     const rows = this.db
@@ -744,10 +755,11 @@ export class UsageLogsView {
                MIN(created_at) AS first_at,
                COUNT(*) AS requests,
                SUM(IFNULL(input_tokens, 0) + IFNULL(output_tokens, 0) + IFNULL(cache_read_tokens, 0) + IFNULL(cache_creation_tokens, 0)) AS tokens,
-               COALESCE(SUM(total_cost), 0) AS cost
+               COALESCE(SUM(total_cost), 0) AS cost,
+               CASE WHEN COUNT(*) = 1 AND SUM(IFNULL(has_tools, 0)) = 0 THEN 1 ELSE 0 END AS one_off
         FROM usage_logs ${cond}
         GROUP BY ${CONVERSATION_KEY_SQL}
-        ORDER BY last_at DESC
+        ORDER BY one_off ASC, last_at DESC
         LIMIT ?
       )
       SELECT s.*, l.session_id AS client_session_id, l.user_id, l.api_key_id, l.vm_id, l.model, l.status, l.duration_ms,
@@ -758,7 +770,7 @@ export class UsageLogsView {
         WHERE ${CONVERSATION_KEY_SQL} = s.sid AND created_at = s.last_at${own.sql ? ` AND ${own.sql}` : ''}
         ORDER BY id DESC LIMIT 1
       )
-      ORDER BY s.last_at DESC
+      ORDER BY s.one_off ASC, s.last_at DESC
     `)
       .all(...params, n, ...own.params)
     const names = lookupNames(this.db, {
@@ -770,8 +782,10 @@ export class UsageLogsView {
     return {
       minutes: mins,
       total: num(total),
+      oneOffTotal: num(counts.one_off),
       sessions: rows.map((r) => ({
         sessionId: r.sid,
+        oneOff: r.one_off === 1,
         clientSessionId: r.client_session_id ?? null,
         userName: r.user_id ? (names.users.get(r.user_id) ?? null) : null,
         keyName: r.api_key_id ? (names.keys.get(r.api_key_id) ?? null) : null,
