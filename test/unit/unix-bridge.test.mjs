@@ -8,6 +8,7 @@ function fakeClient({ streamlocal, tools = '', failExec = [] }) {
   const calls = []
   return {
     calls,
+    failExec,
     openssh_forwardOutStreamLocal(path, cb) {
       calls.push(['streamlocal', path])
       streamlocal ? cb(null, chan()) : cb(new Error('administratively prohibited'))
@@ -41,7 +42,9 @@ test('falls back to docker dial-stdio when streamlocal is refused', async () => 
 test('non-docker sockets use socat before nc, and docker is not used for them', async () => {
   const c = fakeClient({ streamlocal: false, tools: '/usr/bin/docker\n/usr/bin/socat\n' })
   await connectUnixSocket(c, '/run/x.sock')
-  assert.equal(unixTransportOf(c), 'socat')
+  const execs = c.calls.filter((x) => x[0] === 'exec').map((x) => x[1])
+  assert.ok(execs.some((x) => x.startsWith('exec socat -')))
+  assert.ok(!execs.includes('docker system dial-stdio'))
 })
 test('moves to the next bridge when one exits immediately, rethrows if none work', async () => {
   const c = fakeClient({ streamlocal: false, tools: '/usr/bin/docker\n/usr/bin/nc\n', failExec: ['dial-stdio'] })
@@ -49,4 +52,31 @@ test('moves to the next bridge when one exits immediately, rethrows if none work
   assert.equal(unixTransportOf(c), 'nc')
   const d = fakeClient({ streamlocal: false, tools: '' })
   await assert.rejects(connectUnixSocket(d, '/var/run/docker.sock', { docker: true }), { code: 'streamlocal_failed' })
+})
+
+test('a Docker bridge is never reused for another socket (relay after Docker op)', async () => {
+  const c = fakeClient({ streamlocal: false, tools: '/usr/bin/docker\n' })
+  await connectUnixSocket(c, '/var/run/docker.sock', { docker: true })
+  assert.equal(unixTransportOf(c), 'docker-dial-stdio')
+  // docker-only node: relay to another socket has no usable bridge and must fail, not hit Docker
+  await assert.rejects(connectUnixSocket(c, '/run/kin/kernel.sock'), { code: 'streamlocal_failed' })
+  assert.equal(c.calls.filter((x) => x[0] === 'exec' && x[1] === 'docker system dial-stdio').length, 1)
+})
+test('relay and Docker keep separate transports; paths are remembered independently', async () => {
+  const c = fakeClient({ streamlocal: false, tools: '/usr/bin/docker\n/usr/bin/socat\n' })
+  await connectUnixSocket(c, '/var/run/docker.sock', { docker: true })
+  await connectUnixSocket(c, '/run/a.sock')
+  await connectUnixSocket(c, '/run/b.sock')
+  const execs = c.calls.filter((x) => x[0] === 'exec').map((x) => x[1])
+  assert.ok(execs.includes('docker system dial-stdio'))
+  assert.ok(execs.some((x) => x.includes("UNIX-CONNECT:'/run/a.sock'")))
+  assert.ok(execs.some((x) => x.includes("UNIX-CONNECT:'/run/b.sock'")))
+  assert.equal(unixTransportOf(c), 'docker-dial-stdio')
+})
+test('a remembered bridge that stops working is dropped and re-probed', async () => {
+  const c = fakeClient({ streamlocal: false, tools: '/usr/bin/socat\n/usr/bin/nc\n' })
+  await connectUnixSocket(c, '/run/a.sock')
+  c.failExec.push('socat')
+  await connectUnixSocket(c, '/run/a.sock')
+  assert.ok(c.calls.some((x) => x[0] === 'exec' && x[1].startsWith('exec nc -U')))
 })

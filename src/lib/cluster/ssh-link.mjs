@@ -145,23 +145,41 @@ export function forwardOutStreamLocal(client, socketPath) {
   })
 }
 
+// link -> Map("docker|generic:<socketPath>" -> transport). A bridge that works for one
+// socket says nothing about another (permissions differ, and dial-stdio only reaches
+// Docker's own socket), so memory is per purpose and per path.
 const unixTransport = new WeakMap()
 
 const shQuote = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`
+const transportKey = (socketPath, docker) => `${docker ? 'docker' : 'generic'}:${socketPath}`
+
+function rememberTransport(client, key, name) {
+  let byKey = unixTransport.get(client)
+  if (!byKey) unixTransport.set(client, (byKey = new Map()))
+  byKey.set(key, name)
+}
 
 /**
  * Open a stream to a unix socket on the node. Prefers the SSH `direct-streamlocal`
  * channel; sshd builds that refuse it (OpenSSH 7.4 on CentOS 7, AllowStreamLocalForwarding no,
  * restricted keys) fall back to an exec channel that bridges the socket with tools the
- * node already has: `docker system dial-stdio` for the Docker socket, else socat / nc -U.
- * The first working transport is remembered per link so later calls skip the failed probe.
+ * node already has: `docker system dial-stdio` (only for `docker: true`, i.e. the Docker
+ * socket), else socat / nc -U. The first working transport is remembered per link, purpose
+ * and socket path.
  */
 export async function connectUnixSocket(client, socketPath, { docker = false } = {}) {
-  const cached = unixTransport.get(client)
-  if (cached && cached !== 'streamlocal') return execUnixStream(client, cached, socketPath)
+  const key = transportKey(socketPath, docker)
+  const cached = unixTransport.get(client)?.get(key)
+  if (cached && cached !== 'streamlocal') {
+    try {
+      return await execUnixStream(client, cached, socketPath)
+    } catch {
+      unixTransport.get(client)?.delete(key) // stale (tool removed, socket gone): re-probe below
+    }
+  }
   try {
     const stream = await forwardOutStreamLocal(client, socketPath)
-    unixTransport.set(client, 'streamlocal')
+    rememberTransport(client, key, 'streamlocal')
     return stream
   } catch (err) {
     if (err.code !== 'streamlocal_failed') throw err
@@ -170,7 +188,7 @@ export async function connectUnixSocket(client, socketPath, { docker = false } =
     for (const name of order) {
       try {
         const stream = await execUnixStream(client, name, socketPath)
-        unixTransport.set(client, name)
+        rememberTransport(client, key, name)
         return stream
       } catch {
         /* try next bridge */
@@ -180,9 +198,9 @@ export async function connectUnixSocket(client, socketPath, { docker = false } =
   }
 }
 
-/** Name of the transport last selected for this link (null before first use). */
-export function unixTransportOf(client) {
-  return unixTransport.get(client) ?? null
+/** Transport last selected for the Docker socket on this link (null before first use). */
+export function unixTransportOf(client, socketPath = '/var/run/docker.sock') {
+  return unixTransport.get(client)?.get(transportKey(socketPath, true)) ?? null
 }
 
 async function probeBridgeTools(client) {
