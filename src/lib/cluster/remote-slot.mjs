@@ -660,10 +660,17 @@ export function canReuseRemoteEgress(existing, digest) {
  * so this has to go over SSH. Both barriers between VMs sharing the folded
  * bridge live in iptables, and with br_netfilter off they are inert at once —
  * every VM on that node could reach every other, with nothing in any log.
+ *
+ * runRemote resolves to stdout itself, not to a result object. Reading a
+ * `.stdout` off that string yields undefined, which made a correctly
+ * configured node look like one with the switch off and refused shared egress
+ * outright. A failed read still refuses, since a node whose state cannot be
+ * established is not one to fold a bridge on.
  */
-async function remoteBridgeNetfilter(session) {
-  const r = await runRemote(session.client, `cat ${BRIDGE_NF_CALL_IPTABLES} 2>/dev/null || true`).catch(() => null)
-  return String(r?.stdout || '').trim() === '1'
+export async function remoteBridgeNetfilter(session) {
+  const stdout = await runRemote(session.client, `cat ${BRIDGE_NF_CALL_IPTABLES}`).catch(() => null)
+  if (stdout === null) return false
+  return String(stdout).trim() === '1'
 }
 
 /** Addresses currently held by endpoints on the node's shared network. */

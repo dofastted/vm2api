@@ -41,6 +41,7 @@ import { parseCidr } from '../../src/lib/vm/subnet-pool.mjs'
 import {
   applyRuntime,
   exitOf,
+  remoteBridgeNetfilter,
   remoteEgressIpam,
   sharedRemoteNames,
   slotContainerBody,
@@ -630,4 +631,68 @@ test('a cluster refresh carries a shared VM\u2019s mode and address through', ()
   applyRuntime(perVm, { ...common, name: 'kin-vm-03', network: 'kin-eg-px-abc', info: null })
   assert.equal(perVm.runtime.egress_mode, 'per-vm')
   assert.equal(perVm.runtime.shared_ip, null)
+})
+
+/**
+ * An ssh client whose exec emits what a real node emits. The fake is at the
+ * transport, not at runRemote, deliberately: a stub returning `{stdout: '1'}`
+ * would encode the very mistake this covers — runRemote resolves to stdout
+ * itself, so reading `.stdout` off it yields undefined and every node looks
+ * misconfigured. Only a double that speaks the real protocol catches that.
+ */
+function fakeSshClient({ stdout = '', stderr = '', code = 0, failExec = false } = {}) {
+  const commands = []
+  return {
+    commands,
+    exec(command, cb) {
+      commands.push(command)
+      if (failExec) return cb(new Error('channel open failure'))
+      const listeners = { data: [], exit: [], close: [] }
+      const errListeners = []
+      const stream = {
+        on(event, fn) {
+          if (listeners[event]) listeners[event].push(fn)
+          return stream
+        },
+        stderr: {
+          on(event, fn) {
+            if (event === 'data') errListeners.push(fn)
+            return stream.stderr
+          },
+        },
+        close() {},
+      }
+      cb(null, stream)
+      setImmediate(() => {
+        if (stdout) for (const fn of listeners.data) fn(Buffer.from(stdout))
+        if (stderr) for (const fn of errListeners) fn(Buffer.from(stderr))
+        for (const fn of listeners.exit) fn(code)
+        for (const fn of listeners.close) fn()
+      })
+    },
+  }
+}
+
+test('a node reports its bridge filtering through the real remote call', async () => {
+  // `1\n` is what `cat /proc/sys/net/bridge/bridge-nf-call-iptables` prints on
+  // a correctly configured node. Reading it wrongly refused shared egress on
+  // every such node, which is the failure direction that hurts most: the
+  // feature simply could not be enabled anywhere.
+  const on = fakeSshClient({ stdout: '1\n' })
+  assert.equal(await remoteBridgeNetfilter({ client: on }), true)
+  assert.ok(on.commands.some((c) => c.includes('bridge-nf-call-iptables')))
+
+  // Off: both barriers between VMs on the folded bridge are inert, so folding
+  // is refused.
+  assert.equal(await remoteBridgeNetfilter({ client: fakeSshClient({ stdout: '0\n' }) }), false)
+
+  // Unreadable, in each of the shapes a node produces it: br_netfilter not
+  // loaded (cat exits non-zero), and the channel itself failing. A node whose
+  // state cannot be established is not one to fold a bridge on.
+  const missing = fakeSshClient({ stdout: '', stderr: 'No such file or directory', code: 1 })
+  assert.equal(await remoteBridgeNetfilter({ client: missing }), false)
+  assert.equal(await remoteBridgeNetfilter({ client: fakeSshClient({ failExec: true }) }), false)
+
+  // An unexpected payload is not a pass either.
+  assert.equal(await remoteBridgeNetfilter({ client: fakeSshClient({ stdout: 'enabled\n' }) }), false)
 })
