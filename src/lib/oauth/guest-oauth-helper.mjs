@@ -14,7 +14,10 @@ import { runSlotProcess } from '../transport/slot-oauth.mjs'
 import { OAUTH_REQUEST_TIMEOUT_MS } from './oauth-contract.mjs'
 
 const pendingAttempt = Symbol('guestOAuthAttempt')
-const safeCode = (value, fallback) => (/^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : fallback)
+// `test` stringifies its argument, so undefined/null match the pattern as "undefined"/"null"
+// and were returned as the code. Require a string, like every other code guard in the tree.
+const safeCode = (value, fallback) =>
+  typeof value === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : fallback
 
 function fail(code, message) {
   return Object.assign(new Error(message), { code })
