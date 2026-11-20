@@ -44,20 +44,7 @@ export function LoginPage() {
       signIn(result.token, result.user)
       // The route guard reads this cache; drop the previous account's views.
       queryClient.removeQueries({ queryKey: meQueryOptions().queryKey })
-      let needsWelcome = false
-      try {
-        const onboarding = await queryClient.fetchQuery(
-          onboardingQueryOptions(true)
-        )
-        needsWelcome = Boolean(onboarding.needs_welcome)
-      } catch {
-        needsWelcome = false
-      }
       toast.success('登录成功')
-      if (needsWelcome) {
-        await navigate({ to: '/welcome', search: { setup: true } })
-        return
-      }
       // `redirect` is a router href (`/vm/x?tab=y`); never bounce back into the public pages.
       const next = search.redirect
       if (
@@ -67,6 +54,19 @@ export function LoginPage() {
         !/^\/(welcome|login)\b/.test(next)
       ) {
         await navigate({ href: next })
+        return
+      }
+      let needsWelcome = false
+      try {
+        const onboarding = await queryClient.fetchQuery(
+          onboardingQueryOptions(true)
+        )
+        needsWelcome = Boolean(onboarding.needs_welcome)
+      } catch {
+        needsWelcome = false
+      }
+      if (needsWelcome) {
+        await navigate({ to: '/welcome', search: { setup: true } })
         return
       }
       await navigate({ to: '/overview' })
