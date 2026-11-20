@@ -13,7 +13,11 @@ vi.mock('@tanstack/react-query', async (importOriginal) => {
 
 function renderTable() {
   return renderToStaticMarkup(
-    <VirtualizedLogsTable filters={{}} isAdmin={false} />
+    <VirtualizedLogsTable
+      filters={{}}
+      autoRefreshEnabled={false}
+      onOpenDetail={() => {}}
+    />
   )
 }
 
