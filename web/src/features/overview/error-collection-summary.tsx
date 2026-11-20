@@ -41,7 +41,7 @@ export function ErrorCollectionSummary({
       meta={
         <span className='tabular-nums'>
           {visibleTotal ? fmtNum(visibleTotal) : null}
-          {mutedTotal ? ` · 已屏蔽 ${fmtNum(mutedTotal)}` : null}
+          {mutedTotal ? ` · 已屏蔽 ${fmtNum(mutedTotal)} 条` : null}
         </span>
       }
       action={
@@ -80,7 +80,7 @@ export function ErrorCollectionSummary({
               ))
             ) : (
               <span className='text-xs text-muted-foreground'>
-                可见错误已全部屏蔽
+                本摘要中的错误均来自已屏蔽的错误类
               </span>
             )}
           </div>
