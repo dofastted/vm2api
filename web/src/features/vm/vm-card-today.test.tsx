@@ -44,6 +44,10 @@ describe('VM card today cost wording', () => {
       expect(html).toContain('今日 · 北京时间')
       expect(html).toContain('$1.25')
     }
+    expect(card).toContain('7 天窗口请求')
+    expect(card).toContain('7 天窗口 · 成功 / 失败')
+    expect(card).not.toContain('7D 请求')
+    expect(card).not.toContain('7D 窗口')
     expect(row).toContain('近 7 天')
     expect(row).toContain('7 天额度窗口')
     expect(row).toContain('7 天额度窗口 · 成功 / 失败')
