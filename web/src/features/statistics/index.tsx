@@ -106,7 +106,7 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
         />
         <BentoMetricCard
           title='平均响应时间'
-          value={overview?.todayAvgDurationMs ?? 0}
+          value={overview?.todayAvgDurationMs ?? null}
           formatter={(v) => formatDuration(Math.round(v))}
           icon={Clock}
           accentColor='purple'
