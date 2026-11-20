@@ -1403,8 +1403,8 @@ export function createHandleProtocol(deps) {
       )
     }
     const isProbe = isParentSessionCompanion(inbound) || isParentSessionCompanion(ctx.body)
-    // One-shot test calls (sub2api account test, new-api channel test) keep their
-    // sticky identity but never hold a session seat the main conversation needs.
+    // One-shot account and channel tests keep their sticky identity without
+    // holding a session seat the main conversation needs.
     const seatless = isProbe || isShortProbeRequest(inbound)
     // Seat = this client session. Same device, other session = other slot.
     const seatKey = seatless

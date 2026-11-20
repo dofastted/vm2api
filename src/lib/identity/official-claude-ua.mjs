@@ -1,5 +1,5 @@
 /**
- * Official Claude Code User-Agent, aligned with sub2api:
+ * Official Claude Code User-Agent prefix:
  *   `(?i)^claude-cli/\d+\.\d+\.\d+`
  *
  * VS Code (`claude-vscode`), Cowork (`local-agent`), Desktop, and Agent SDK

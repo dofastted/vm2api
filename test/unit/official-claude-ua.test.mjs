@@ -6,7 +6,7 @@ import {
   isUnofficialClaudeEntrypointUa,
 } from '../../src/lib/identity/official-claude-ua.mjs'
 
-test('matches sub2api claude-cli semver prefix only', () => {
+test('matches only user agents with a claude-cli semver prefix', () => {
   assert.equal(CLAUDE_CLI_UA_RE.test('claude-cli/2.1.241 (external, claude-vscode, agent-sdk/0.3.241)'), true)
   assert.equal(isOfficialClaudeUa('CLAUDE-CLI/2.1.241 (external, local-agent, agent-sdk/0.3.241)'), true)
   assert.equal(isOfficialClaudeUa('claude-cli/2.1.241'), true)

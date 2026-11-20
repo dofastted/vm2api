@@ -1,10 +1,9 @@
 /**
- * SQLite database layer — sub2api data-layer inspired, on node:sqlite.
+ * SQLite database layer built on `node:sqlite`.
  *
- * - Single-process gateway → embedded SQLite (WAL) instead of sub2api's
- *   PostgreSQL+Redis. Same patterns: versioned SQL migrations with SHA-256
- *   checksum verification (sub2api migrations_runner), repository modules,
- *   settings table, backup records.
+ * - The single-process gateway uses embedded SQLite in WAL mode, versioned
+ *   SQL migrations with SHA-256 checksum verification, repository modules,
+ *   a settings table, and backup records.
  * - Zero new dependencies: uses the built-in `node:sqlite` DatabaseSync.
  *
  * Env:
@@ -225,7 +224,7 @@ export function closeDatabase() {
 }
 
 /**
- * Versioned SQL migrations with checksum verification (sub2api-style).
+ * Versioned SQL migrations with SHA-256 checksum verification.
  * Files: migrations/NNN_name.sql, applied in filename order inside a
  * transaction each. `schema_migrations` records version+checksum; a
  * checksum mismatch on an already-applied migration is a hard error.

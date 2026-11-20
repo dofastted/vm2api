@@ -4,7 +4,7 @@ import { defaultMaxTokensForModel } from './model-policy.mjs'
 /**
  * Sanitize Anthropic Messages body for official API.
  *
- * Credential-forwarding (sub2api-style): drop client-private / OpenAI leftover
+ * Credential forwarding: drop client-private and leftover OpenAI
  * keys, pass through unknown official fields such as output_config.
  */
 const DROP_TOP = new Set([
@@ -302,7 +302,7 @@ export function sanitizeAnthropicBody(
 }
 
 /**
- * Sub2API-style Messages repair before the Anthropic hop:
+ * Messages repair before the Anthropic hop:
  *   - leading system / developer turns (before the first user) lift into top-level system
  *   - mid-conversation role:system after a user turn is kept when the model/beta allow it
  *   - unknown roles (admin, tool, function, …) become user

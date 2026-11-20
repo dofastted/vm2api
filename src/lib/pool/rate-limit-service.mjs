@@ -1,5 +1,5 @@
 /**
- * Account scheduling state from upstream results (sub2api RateLimitService).
+ * Account scheduling state from upstream results.
  *
  * One writer for the hard columns the scheduler gates on:
  *   429 → rate_limit_reset_at (+ session_window rejected)
@@ -7,7 +7,7 @@
  * An incomplete hop is a request failure. It does not park the account.
  * Passive Extra utilization stays in account-quota for the panel; it never
  * clears these columns. Only a live `5h-status=allowed` header or the reset
- * passing lifts a rate limit (sub2api UpdateSessionWindow → ClearRateLimit).
+ * passing lifts a rate limit.
  */
 import { extraHeadersFromLimitError, parseResetMs, WINDOW_5H_MS } from './quota-window.mjs'
 
@@ -70,7 +70,6 @@ function futureReset(raw, now) {
 
 /**
  * 429 reset: exhausted 7d → exhausted 5h → aggregate → soonest window → null.
- * sub2api calculateAnthropic429ResetTime / selectAnthropicExhaustedWindow.
  */
 export function anthropic429Reset(headers = {}, now = Date.now()) {
   const reset5h = futureReset(header(headers, 'anthropic-ratelimit-unified-5h-reset'), now)
@@ -101,7 +100,7 @@ export class RateLimitService {
   }
 
   /**
-   * sub2api HandleUpstreamError: writes the hard column for this failure. Returns the block, or null.
+   * Write the hard scheduling column for this failure. Return the block, or null.
    * The classifier decides the scope; a model / Fable / RPM 429 stays a short cooldown.
    * An unknown bare 429 writes no hard block: the scope is unproven.
    * A 429 not scoped to the request asks the official usage probe (throttled per account)
@@ -175,7 +174,7 @@ export class RateLimitService {
   }
 
   /**
-   * sub2api UpdateSessionWindow: every response with live headers.
+   * Update the session window on every response with live headers.
    * An out-of-range reset is ignored. `allowed` is the only early unblock.
    */
   updateSessionWindow({ accountId, vmId = null, headers = {}, now = Date.now() } = {}) {
@@ -203,7 +202,7 @@ export class RateLimitService {
   }
 }
 
-/** Hard scheduling block from runtime columns (sub2api Account.IsSchedulable). */
+/** Hard scheduling block from runtime columns. */
 export function hardBlockOf(state = null, now = Date.now()) {
   if (!state) return null
   const rateLimit = Number(state.rate_limit_reset_at) || 0

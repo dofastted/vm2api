@@ -101,7 +101,7 @@ test('migration 005 adds protocol usage alignment columns', () => {
     assert.ok(cols('accounts').includes(c), `accounts missing ${c}`)
     assert.ok(cols('api_keys').includes(c), `api_keys missing ${c}`)
   }
-  // scheduling window columns now live on accounts (sub2api SSOT merge)
+  // The accounts table is the source of truth for scheduling windows.
   const accCols = cols('accounts')
   for (const c of [
     'rate_limited_at',

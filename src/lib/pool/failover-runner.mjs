@@ -1118,7 +1118,7 @@ export class FailoverRunner {
           this.searchRepairs.delete(repairKey)
           policy = { ...policy, action: 'stop' }
         }
-        // One writer for rate_limit_reset_at / overload_until (sub2api HandleUpstreamError).
+        // The rate limit service is the sole writer of rate_limit_reset_at / overload_until.
         const hardBlock =
           !result?.committed && !pinVmId
             ? this.rateLimitService?.handleUpstreamError?.({

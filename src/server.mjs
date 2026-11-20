@@ -203,7 +203,7 @@ const allowRate = createRateLimiter({
   refillPerSec: cfg.limits.rate_refill,
 })
 
-// --- Persistent store (SQLite, sub2api-inspired) ---
+// --- Persistent store (SQLite) ---
 const dataDir = cfg.paths.data || path.join(cfg.paths.root, 'data')
 openDatabase({ dataDir, pooled: true })
 armWriteBehind(getDb())
@@ -843,7 +843,7 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
     return true
   }
 
-  // Managed multi-keys (sub2api-style)
+  // Authenticate with the managed key store when the master key did not match.
   const managed = apiKeyStore.authenticate(token)
   if (!managed.ok) {
     return rejectAuth(
@@ -1330,7 +1330,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 404, { error: { message: 'console not found; run pnpm -C web build' } })
     }
 
-    // CLIProxyAPI-style liveness: no auth, no inference.
+    // Liveness check: no authentication or inference.
     if ((req.method === 'GET' || req.method === 'HEAD') && p === '/healthz') {
       if (req.method === 'HEAD') {
         res.writeHead(200)

@@ -1,6 +1,6 @@
 /**
  * Optional at-rest encryption for credential fields in the DB
- * (sub2api AESEncryptor counterpart, zero-dependency node:crypto).
+ * using the built-in `node:crypto` module.
  *
  * Enabled when VM2API_DB_SECRET (or KIN_DB_SECRET) is set: AES-256-GCM, key = SHA-256(secret).
  * Format: enc:v1:<iv_b64>:<tag_b64>:<ciphertext_b64>

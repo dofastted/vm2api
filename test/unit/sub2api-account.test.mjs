@@ -36,7 +36,7 @@ const exportDoc = {
   ],
 }
 
-test('detects sub2api export and ignores token-less wrappers', () => {
+test('detects account exports and ignores token-less wrappers', () => {
   assert.equal(isSub2apiAccountExport(exportDoc), true)
   assert.equal(isSub2apiAccountExport(exportDoc.accounts[0]), true)
   assert.equal(isSub2apiAccountExport({ vm_id: 'vm-30', access_token: 'x' }), false)

@@ -1,6 +1,5 @@
 /**
- * backup_records repository — ledger of local backup archives
- * (sub2api backup_records counterpart).
+ * backup_records repository — ledger of local backup archives.
  */
 
 import { getDb } from '../database.mjs'

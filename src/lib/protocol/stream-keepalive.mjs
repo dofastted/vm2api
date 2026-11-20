@@ -1,5 +1,5 @@
 /**
- * Downstream SSE keepalive aligned with sub2api:
+ * Downstream SSE keepalive:
  *   - default: event: ping
  *   - official Claude Code ≥ 2.1.193: empty content_block_delta so the CLI
  *     parser does not treat comment/ping as a dead stream

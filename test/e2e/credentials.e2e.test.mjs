@@ -98,7 +98,7 @@ test('reset destroys home and recreates the same slot without oauth', async () =
   }
 })
 
-test('panel exports and replaces slot credential as sub2api JSON', async () => {
+test('panel exports and replaces slot credentials using account JSON', async () => {
   const gw = await startGateway()
   try {
     const empty = await api(gw, 'GET', '/api/panel/vms/vm-sim-01/oauth/credential')

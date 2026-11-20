@@ -11,7 +11,7 @@ export { isOfficialClaudeUa, isUnofficialClaudeEntrypointUa, CLAUDE_CLI_UA_RE } 
  * and never come from inbound — only VM fingerprint + defaults.
  * Never stores Authorization / x-api-key / cookies.
  *
- * context-1m-2025-08-07 (sub2api OAuth):
+ * context-1m-2025-08-07 (OAuth):
  *   - Official Claude Code: pass if matrix betas.pass_context_1m or fallback whitelist
  *   - Inbound trailing [1m] (e.g. claude-sonnet-5[1m]) injects the beta when allowed
  *   - Bare unofficial/mimic: never inject or replay
@@ -115,7 +115,6 @@ function lowerHeaders(h = {}) {
 
 /**
  * Remove specific beta tokens from a comma-separated anthropic-beta header.
- * Mirrors sub2api stripBetaToken.
  */
 export function stripBetaTokens(header, dropSet = REPLAY_DROP_BETAS) {
   if (!header || typeof header !== 'string') return header

@@ -1,14 +1,12 @@
 /**
- * Multi API-key store (sub2api-inspired, SQLite-backed).
+ * Multi-key API key store (SQLite-backed).
  *
- * Fields aligned to sub2api basics:
- *   name, status, expires_at, quota (+ used), rate windows → rpm,
- *   concurrency (per-key, sub2api puts this on User).
+ * Managed keys have a name, status, expiry, spend quota and windows, an RPM
+ * limit, and a per-key concurrency limit.
  *
  * Master env key KIN_API_KEY is separate and unlimited.
  * Managed keys live in the `api_keys` table (see lib/db/).
- * Transient state (inflight concurrency, RPM buckets) stays in memory,
- * mirroring sub2api's Redis-transient split.
+ * Transient state (inflight concurrency, RPM buckets) stays in memory.
  *
  * Auth always goes through `key_hash` (HMAC). `key_secret` is a separate
  * at-rest copy of the plaintext — encrypted with KIN_DB_SECRET when set — so
@@ -27,7 +25,7 @@ import { UsersRepo } from '../db/repos/users-repo.mjs'
 
 const KEY_PREFIX = 'sk-vm-'
 const HASH_MARKER = 'hmac:'
-// sub2api USD rate windows; ApiKeysRepo opens one at the first spend.
+// USD spend windows open on the first spend recorded by ApiKeysRepo.
 const RATE_WINDOWS = [
   { name: '5h', limit: 'rate_limit_5h', usage: 'usage_5h', start: 'window_5h_start', ms: 5 * 3600_000 },
   { name: '1d', limit: 'rate_limit_1d', usage: 'usage_1d', start: 'window_1d_start', ms: 24 * 3600_000 },
@@ -168,7 +166,7 @@ export class ApiKeyStore {
     this.users = new UsersRepo(this.db)
   }
 
-  /** sub2api: an api key of a disabled/deleted user must not authenticate. */
+  /** Keys owned by disabled or deleted users cannot authenticate. */
   _ownerActive(rec) {
     if (!rec?.user_id) return true // legacy unowned keys keep working
     try {
@@ -441,7 +439,7 @@ export class ApiKeyStore {
         detail: { quota: rec.quota, quota_used: rec.quota_used },
       }
     }
-    // sub2api rate windows: limit > 0 and the current window is still open
+    // Enforce spend limits only for open windows with a positive limit.
     for (const win of RATE_WINDOWS) {
       const w = rateWindow(rec, win, now)
       if (w.limit > 0 && w.open && w.used >= w.limit) {
@@ -476,7 +474,7 @@ export class ApiKeyStore {
         detail: { inflight, max: rec.max_concurrency },
       }
     }
-    // sub2api user-level cap: sum of inflight across all of the owner's keys.
+    // The user-level cap counts inflight requests across all of the owner's keys.
     // The operator (admin) is never capped: its traffic is the platform's own.
     if (rec.user_id) {
       const cap = this._userConcurrencyCap(rec.user_id)
@@ -597,7 +595,7 @@ export class ApiKeyStore {
       } catch {}
     }
     if (billed == null) billed = Number(usage.cost ?? usage.actual_cost) || 0
-    // key quota/windows track actual (group-rated) spend, sub2api-style
+    // Key quotas and spend windows track the cost after applying the group rate.
     const rate = Number.isFinite(Number(rateMultiplier)) ? Number(rateMultiplier) : 1
     const cost = billed * rate
     const rec = this.repo.recordUsage(id, {
@@ -607,7 +605,7 @@ export class ApiKeyStore {
       cache_creation_tokens: Number(normalized.cache_creation_input_tokens ?? normalized.cache_creation_tokens) || 0,
       cost,
     })
-    // sub2api: the billing write flips the key when the USD quota runs out
+    // Mark the key as quota-exhausted when recorded spend reaches its USD quota.
     if (rec && rec.status === 'active' && (rec.quota ?? 0) > 0 && (rec.quota_used ?? 0) >= rec.quota) {
       this.repo.update({ ...rec, status: 'quota_exhausted', updated_at: nowIso() })
     }

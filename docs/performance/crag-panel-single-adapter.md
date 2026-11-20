@@ -7,7 +7,7 @@
 1. **只省重复整流。** 认证 health 同时声明 `generation_controls_v3` 和 `linux_tui_native_queue`、入口已是规范历史且保持工具原名时，`toStandardAnthropicBody` 从两次降到一次，取消该分支的末次客户端文案与工具名整流。非规范历史、兼容槽、修复重试、官方 body 透传、cwd 投影和摘要保留旧整流。原生图片别名处理、槽位 system 策略、缓存和起始预算仍生效；运输前仍检查块结构及嵌套工具结果，并将结构验证与可复用判断合并。无远程图时不再给每个块创建异步任务。这里的一次指标准化函数，不是整条链只遍历一次请求。
 2. **只省旧信封头。** 通过认证 health 识别的原生队列，在普通 `cliHop` 的 Worker POST 中省略整个 `headers` 对象及其构造、协议 beta 扫描。受信 classifier、thread、标记为 `repaired` 的重试、旧槽及预构建信封保留原路径。真实 HTTP 的内部 token、可信租户和内容类型不变；日志仍分别记录面板 envelope 与最后实测出站头，不用缺省值冒充出站值。CRAG `79c73d5` 仅在 classifier 解析该头包，普通推理由 CC 构造上游头。
 
-参考 Magpie 的 Claude TUI `renderClaudeTurn` / `renderCachedParts`：工具结果边界由 typed parts 确定，缓存依靠稳定的块边界。vm2api 保留结构化调用 ID、结果、结果后用户正文和图片，不搬运 Magpie 的文本拼接或补充提示。
+vm2api 根据 typed blocks 确定工具结果边界，并保持块边界稳定以便复用缓存。结构化调用 ID、结果、结果后的用户正文和图片均原样保留，不拼接成文本或补充提示。
 
 ## 认证回环等价
 

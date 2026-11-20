@@ -157,9 +157,9 @@ export function isParentSessionCompanion(body = {}) {
 export const SHORT_PROBE_MAX_CHARS = 64
 
 /**
- * One-shot test calls: sub2api account test, new-api channel test, verify
- * scripts. One short text user turn, no tools, any max_tokens. They carry no
- * conversation, so they must not hold a session seat or move a sticky pin.
+ * One-shot account tests, channel tests, and verification scripts use one short
+ * user text turn and no tools, regardless of max_tokens. Because they carry no
+ * conversation, they must not hold a session seat or move a sticky pin.
  */
 export function isShortProbeRequest(body = {}) {
   const msgs = Array.isArray(body?.messages) ? body.messages : []

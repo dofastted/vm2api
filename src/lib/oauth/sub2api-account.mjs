@@ -1,5 +1,5 @@
 /**
- * Convert a sub2api account export into KIN OAuth import fields.
+ * Convert an account export into KIN OAuth import fields.
  * Secrets stay on the returned object; callers must not log them.
  * Device / Windows profile / headers are ignored — official Claude Code
  * on the slot writes those after import.
@@ -104,7 +104,7 @@ function oauthScopes(cred = {}, n = {}) {
         .filter(Boolean)
 }
 
-/** Build a sub2api account export that import/parse can round-trip. */
+/** Build an account export that the import parser can round-trip. */
 export function oauthToSub2apiExport(vm = {}, cred = {}, { now = new Date() } = {}) {
   const n = normalizeOauth({
     ...cred,
