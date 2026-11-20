@@ -883,6 +883,10 @@ function responsesToClaude(body, opts) {
     if (body[key] == null) continue
     if (typeof body[key] !== 'number' || !(body[key] >= 0 && body[key] <= 1))
       invalidResponses(key, 'must be between 0 and 1 for Claude')
+    // `between_tools` above is ours, not the caller's: effort `off` asked for no
+    // reasoning at all. Upstream still rejects non-default sampling under it, so
+    // the value is dropped silently instead of blaming the caller for our shape.
+    if (out.thinking?.type === 'between_tools') continue
     if (['adaptive', 'enabled'].includes(out.thinking?.type)) {
       if (body[key] !== 1 && !(key === 'top_p' && body[key] === 0.99))
         invalidResponses(key, 'non-default sampling is not supported with Claude thinking')
