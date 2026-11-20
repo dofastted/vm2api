@@ -218,7 +218,8 @@ export function OverviewPage() {
             />
             <KpiCard
               icon={Gauge}
-              label='5h 峰值'
+              label='5h 额度使用率'
+              hint='取账号最高值'
               value={
                 <>
                   {peak5.toFixed(0)}
