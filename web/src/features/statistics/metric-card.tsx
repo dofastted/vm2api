@@ -105,6 +105,26 @@ function useAnimatedNumber(value: number) {
   return { display, animating }
 }
 
+function AnimatedMetric({
+  value,
+  formatter,
+}: {
+  value: number
+  formatter: (value: number) => string
+}) {
+  const { display, animating } = useAnimatedNumber(value)
+  return (
+    <span
+      className={cn(
+        'transition-opacity duration-200',
+        animating && 'opacity-80'
+      )}
+    >
+      {formatter(display)}
+    </span>
+  )
+}
+
 export function BentoMetricCard({
   title,
   value,
@@ -115,14 +135,13 @@ export function BentoMetricCard({
   className,
 }: {
   title: string
-  value: number
+  value: number | null
   formatter: (value: number) => string
   icon: LucideIcon
   comparisons?: MetricComparison[]
   accentColor?: Accent
   className?: string
 }) {
-  const { display, animating } = useAnimatedNumber(value)
   const colors = ACCENTS[accentColor]
 
   return (
@@ -169,14 +188,12 @@ export function BentoMetricCard({
         </div>
 
         <div className='mt-3'>
-          <h3
-            className={cn(
-              'text-2xl font-bold tracking-tight text-foreground tabular-nums md:text-3xl',
-              'transition-opacity duration-200',
-              animating && 'opacity-80'
+          <h3 className='text-2xl font-bold tracking-tight text-foreground tabular-nums md:text-3xl'>
+            {value == null ? (
+              '—'
+            ) : (
+              <AnimatedMetric value={value} formatter={formatter} />
             )}
-          >
-            {formatter(display)}
           </h3>
         </div>
       </div>
