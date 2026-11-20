@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import {
   queryOptions,
   useMutation,
@@ -11,6 +11,8 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Progress } from '@/components/ui/progress'
+import { WsTerminal } from '@/components/ws-terminal-lazy'
+import { GeminiRedeemDialog } from '@/features/billing/gemini-redeem-dialog'
 
 const ROOT = '/api/panel/gemini'
 const QUERY_KEY = ['panel', 'gemini-environments'] as const
@@ -56,8 +58,14 @@ export type GeminiInventory = {
   available: boolean
   host_message?: string
   payload_state?:
-    'installed' | 'install_on_create' | 'not_configured' | 'invalid' | 'unknown'
+    | 'installed'
+    | 'install_on_create'
+    | 'awaiting_redemption'
+    | 'not_configured'
+    | 'invalid'
+    | 'unknown'
   payload_issue?: keyof typeof PAYLOAD_ISSUES | null
+  release_activated?: boolean | null
   oauth_runtime_issue?: keyof typeof OAUTH_ISSUES | null
   environments: GeminiEnvironment[]
 }
@@ -86,6 +94,10 @@ const PAYLOAD_ISSUES = {
   gemini_payload_source_missing: '缺少 Antigravity 签名载荷安装源。',
   gemini_payload_incomplete: 'Antigravity 签名载荷不完整或不可执行。',
   gemini_payload_invalid: 'Gemini 载荷校验失败，请检查宿主服务日志。',
+  gemini_payload_not_installed: '请先在宿主机安装签名载荷。',
+  gemini_release_not_configured: '缺少 CRAGGemini 发行授权配置。',
+  gemini_release_invalid: 'CRAGGemini 发行授权配置无效，请联系部署管理员。',
+  gemini_release_payload_mismatch: 'CRAGGemini 发行授权配置与签名载荷不匹配。',
 }
 
 const OAUTH_ISSUES = {
@@ -125,6 +137,9 @@ export function GeminiStartupStatus({
   return (
     <div className='space-y-1 text-sm'>
       {payloadIssue ? <p role='status'>{payloadIssue}</p> : null}
+      {inventory.payload_state === 'awaiting_redemption' ? (
+        <p role='status'>CRAGGemini 内核已安装，等待兑换。</p>
+      ) : null}
       {inventory.payload_state === 'install_on_create' ? (
         <p role='status'>首次创建时自动校验并安装 Gemini 内核和官方 CLI。</p>
       ) : null}
@@ -343,6 +358,51 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
   )
 }
 
+function GeminiTerminal({
+  environmentId,
+  busy,
+}: {
+  environmentId: string
+  busy: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const resource = `${ROOT}/environments/${encodeURIComponent(environmentId)}`
+  const terminalId = `gemini-terminal-${environmentId}`
+
+  return (
+    <div className='min-w-0 space-y-2 border-t pt-3'>
+      <div className='flex flex-wrap items-center gap-x-3 gap-y-2'>
+        <Button
+          type='button'
+          variant='outline'
+          disabled={busy && !open}
+          aria-expanded={open}
+          aria-controls={open ? terminalId : undefined}
+          onClick={() => setOpen((current) => !current)}
+        >
+          {open ? '关闭 Gemini 终端' : '启动 Gemini'}
+        </Button>
+        <p className='text-sm text-muted-foreground'>
+          通过绑定代理以 Plan 模式运行 Antigravity CLI，不启用 API 推理。
+        </p>
+      </div>
+      {open ? (
+        <div
+          id={terminalId}
+          role='region'
+          aria-label='Gemini 终端'
+          className='h-[min(420px,65dvh)]'
+        >
+          <WsTerminal
+            ticketPath={`${resource}/terminal-ticket`}
+            socketPath={`${resource}/terminal/ws`}
+          />
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 export function geminiInventoryOptions() {
   return queryOptions({
     queryKey: QUERY_KEY,
@@ -391,6 +451,7 @@ export function GeminiEnvironments({
   const [code, setCode] = useState('')
   const [deleteId, setDeleteId] = useState<string | null>(null)
   const [createdId, setCreatedId] = useState<string | null>(null)
+  const nameInput = useRef<HTMLInputElement>(null)
 
   const operation = useMutation({
     mutationFn: async (action: {
@@ -461,15 +522,26 @@ export function GeminiEnvironments({
   if (!inventory.data) return null
   if (!inventory.data.available)
     return <GeminiStartupStatus inventory={inventory.data} />
-  const payloadState = inventory.data.payload_state
+  const awaitingRedemption =
+    inventory.data.payload_state === 'awaiting_redemption'
+  const payloadReady =
+    inventory.data.payload_state === 'installed' &&
+    inventory.data.release_activated !== false
   const canInstall =
-    payloadState === 'installed' ||
-    payloadState === 'install_on_create' ||
-    payloadState === 'invalid'
+    payloadReady || inventory.data.payload_state === 'install_on_create'
   const selectedId = environmentId || createdId
   const environment = inventory.data.environments.find(
     (item) => item.id === selectedId
   )
+  const terminalUnavailable =
+    environment?.proxy_ready === false
+      ? '绑定的 IPv4 SOCKS5 代理不可用。'
+      : geminiPayloadIssue(inventory.data) ||
+        (inventory.data.oauth_runtime_issue
+          ? OAUTH_ISSUES[inventory.data.oauth_runtime_issue]
+          : awaitingRedemption
+            ? '请先兑换 CRAGGemini 内核。'
+            : null)
 
   return (
     <section className='max-w-3xl space-y-4' aria-label='Gemini 宿主环境'>
@@ -484,11 +556,30 @@ export function GeminiEnvironments({
       ) : null}
       <GeminiStartupStatus inventory={inventory.data} />
       {isImport ? (
+        <GeminiRedeemDialog
+          triggerVisible={awaitingRedemption}
+          returnFocusTo={nameInput}
+          onRedeemed={() => {
+            client.setQueryData<GeminiInventory>(
+              QUERY_KEY,
+              (current) =>
+                current && {
+                  ...current,
+                  payload_state: 'installed',
+                  payload_issue: null,
+                  release_activated: true,
+                }
+            )
+            void client.invalidateQueries({ queryKey: QUERY_KEY })
+          }}
+        />
+      ) : null}
+      {isImport ? (
         <form
           className='space-y-3'
           onSubmit={(event) => {
             event.preventDefault()
-            operation.mutate({ type: 'create' })
+            if (canInstall) operation.mutate({ type: 'create' })
           }}
         >
           <fieldset className='space-y-2'>
@@ -520,6 +611,7 @@ export function GeminiEnvironments({
           <div className='space-y-2'>
             <Label htmlFor='gemini-name'>环境名称</Label>
             <Input
+              ref={nameInput}
               id='gemini-name'
               required
               maxLength={80}
@@ -619,7 +711,9 @@ export function GeminiEnvironments({
                 type='button'
                 variant='outline'
                 disabled={
-                  operation.isPending || environment.proxy_ready === false
+                  operation.isPending ||
+                  !payloadReady ||
+                  environment.proxy_ready === false
                 }
                 onClick={() =>
                   operation.mutate({ type: 'refresh', id: environment.id })
@@ -662,7 +756,22 @@ export function GeminiEnvironments({
               </Button>
             )}
           </div>
-          {challenge?.id === environment.id &&
+          {environment.auth_method === 'oauth' &&
+          environment.auth_state === 'authorized' ? (
+            terminalUnavailable ? (
+              <p role='status' className='text-sm text-muted-foreground'>
+                暂时无法启动 Gemini：{terminalUnavailable}
+              </p>
+            ) : (
+              <GeminiTerminal
+                key={environment.id}
+                environmentId={environment.id}
+                busy={operation.isPending}
+              />
+            )
+          ) : null}
+          {payloadReady &&
+          challenge?.id === environment.id &&
           environment.auth_state === 'authorizing' ? (
             <form
               className='space-y-2'

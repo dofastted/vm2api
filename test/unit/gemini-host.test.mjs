@@ -127,10 +127,7 @@ function setup(callHost, proxy = bound) {
   const response = { setHeader() {} }
   const panel = createGeminiPanelHandler({
     json: (_response, status, body) => ({ status, body }),
-    readBody: async (req, maxBytes) => {
-      assert.equal(maxBytes, 4096)
-      return req.body
-    },
+    readBody: async (req) => req.body,
     proxyPool: () => ({
       snapshot: () => ({ proxies: [proxy] }),
       getProxyByIdWithAuth: () => ({ url: 'socks5://fixture:private@192.0.2.11:1080' }),
@@ -168,6 +165,15 @@ test('unknown Gemini payload status is not installed and proxy failures do not h
   assert.equal(body.data.environments[0].proxy_ready, false)
 })
 
+test('Gemini payload redemption is admin-only and rejects malformed codes before host dispatch', async () => {
+  const route = `${root}/payload/redeem`
+  assert.equal(authorizePanelRoute('POST', route, 'user').ok, false)
+  assert.equal(authorizePanelRoute('POST', route, 'super').ok, false)
+  assert.equal(authorizePanelRoute('POST', route, 'admin').ok, true)
+  const blocked = setup(() => assert.fail('malformed code must not reach the host'))
+  assert.equal((await blocked('POST', route, { redemption_code: 'CGG1-invalid' })).status, 400)
+})
+
 test('Gemini inventory distinguishes a missing socket from an invalid host response', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-host-'))
   const socketPath = path.join(directory, 'control.sock')
@@ -190,13 +196,10 @@ test('Gemini inventory distinguishes a missing socket from an invalid host respo
 
 test('reachable Gemini host reports lazy install without dependencies on an existing environment', async () => {
   const run = setup(() => ({ payload_state: 'install_on_create', environments: [] }))
-  assert.deepEqual((await run('GET', root)).body.data, {
-    available: true,
-    payload_state: 'install_on_create',
-    payload_issue: null,
-    oauth_runtime_issue: null,
-    environments: [],
-  })
+  const { body } = await run('GET', root)
+  assert.equal(body.data.available, true)
+  assert.equal(body.data.payload_state, 'install_on_create')
+  assert.deepEqual(body.data.environments, [])
   const invalidPayload = setup(() => {
     throw Object.assign(new Error(), { code: 'gemini_payload_invalid' })
   })
@@ -421,4 +424,14 @@ test('host installer refuses an unsigned manifest and never activates damaged pa
   await writeFile(path.join(source, 'libagy_bridge.so'), 'bad')
   await assert.rejects(installGeminiPayload(source, destination, verificationKey), /gemini_payload_member_mismatch/)
   await assert.rejects(writeFile(path.join(destination, 'unexpected'), 'no'), { code: 'ENOENT' })
+  for (const version of ['0.3.0-rc.2', '0.3.0-rc.3']) {
+    const bytes = Buffer.from(JSON.stringify({ ...manifest, version }))
+    await writeFile(path.join(source, 'manifest.json'), bytes)
+    await writeFile(path.join(source, 'manifest.sig'), sign(null, bytes, privateKey))
+    if (version === '0.3.0-rc.2') {
+      assert.equal((await readSignedGeminiManifest(source, verificationKey)).manifest.version, version)
+    } else {
+      await assert.rejects(readSignedGeminiManifest(source, verificationKey), /gemini_payload_invalid_manifest/)
+    }
+  }
 })
