@@ -1154,8 +1154,12 @@ export function createPanelHandler(ctx) {
     } catch {
       vms = []
     }
+    // One snapshot for every slot in the inventory: the risk page only reads each
+    // slot's quota, and resolving them one at a time re-read the account table
+    // once per slot (#1043).
+    const accountSnap = panel.readAccountSnapshot(accountQuota)
     const inventory = buildScopeInventory(
-      vms.map((vm) => ({ ...vm, quota: panel.findAccount(accountQuota, vm)?.unified || null })),
+      vms.map((vm) => ({ ...vm, quota: panel.findAccount(accountQuota, vm, accountSnap)?.unified || null })),
       selectedKeys,
     )
     return {
