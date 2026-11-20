@@ -282,7 +282,12 @@ function CostCard({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
     cost: number
     total?: boolean
   }> = [
-    { label: '今日', req: today.req, tokens: today.tok, cost: today.today },
+    {
+      label: '今日 · 北京时间',
+      req: today.req,
+      tokens: today.tok,
+      cost: today.today,
+    },
     {
       label: '5H',
       req: Number(acc.window_5h_requests ?? 0) || null,
