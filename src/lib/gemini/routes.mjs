@@ -7,6 +7,9 @@ const PANEL_PATH = '/api/panel/gemini'
 const PUBLIC_PATH = '/v1/gemini/sessions'
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const MODEL = /^[a-z0-9][a-z0-9._-]{0,99}$/
+const RUN_ID = /^[a-f0-9]{32}$/
+const MAX_PROMPT_BYTES = 4096
+const MAX_TEST_TEXT = 16 * 1024
 const AUTH_CODE = /^[A-Za-z0-9._~/-]{1,2048}$/
 const AUTH_STATE = /^[A-Za-z0-9._~-]{1,512}$/
 const API_KEY = /^[A-Za-z0-9_-]{20,256}$/
@@ -14,6 +17,23 @@ const RELEASE_CODE = /^CGG1-[A-Za-z0-9_-]{43}$/
 const STATES = new Set(['unverified', 'authorizing', 'authorized', 'reauth_required', 'disabled'])
 const ACCOUNT_STATES = new Set(['ok', 'partial', 'error', 'reauth_required'])
 const PAYLOAD_STATES = new Set(['installed', 'install_on_create', 'awaiting_redemption', 'not_configured', 'invalid'])
+const RUN_STATES = new Set(['running', 'completed', 'failed'])
+const RUN_ERRORS = {
+  gemini_oauth_required: [409, '请重新完成 Google OAuth 授权'],
+  gemini_location_unsupported: [403, 'Google 判定当前账号所在地区不支持 Antigravity；拉取模型成功不代表可对话'],
+  gemini_proxy_error: [502, '无法通过绑定代理连接 Gemini，请检查代理'],
+  gemini_model_unavailable: [409, '当前环境不支持所选模型，请重新获取模型列表'],
+  gemini_models_empty: [502, 'Gemini 未返回可用模型'],
+  gemini_api_key_invalid: [400, '当前 Gemini API Key 无效'],
+  gemini_quota_exhausted: [429, 'Gemini 额度已用尽，请稍后重试'],
+  gemini_inference_timeout: [503, 'Gemini 请求超时，请稍后重试'],
+  gemini_inference_invalid_output: [502, 'Gemini 返回了无法解析的响应'],
+  gemini_inference_start_failed: [503, '无法启动 Gemini 测试进程'],
+  gemini_inference_cancelled: [409, 'Gemini 测试已取消'],
+  gemini_inference_output_limit: [502, 'Gemini 响应超过测试输出上限'],
+  gemini_inference_tool_blocked: [502, '此测试仅支持文本，不支持工具调用'],
+  gemini_inference_failed: [502, 'Gemini 请求失败，请检查环境状态'],
+}
 const FAILURE = 'gemini_host_unavailable'
 const PROTOCOL_ERROR = 'gemini_host_protocol_error'
 const SOCKET_ERRORS = new Map([
@@ -39,6 +59,10 @@ const OAUTH_ISSUES = new Set([
   'gemini_ipv4_forwarding_unavailable',
 ])
 const HOST_ERRORS = {
+  ...RUN_ERRORS,
+  gemini_operation_busy: [409, '此 Gemini 环境正在执行其他操作，请稍后重试'],
+  gemini_run_not_found: [404, '测试会话不存在或已过期'],
+  gemini_proxy_probe_failed: [502, '无法通过绑定代理连接 Gemini'],
   gemini_host_socket_missing: [503, '找不到 Gemini 控制 socket，请检查宿主服务和容器挂载'],
   gemini_host_socket_refused: [503, 'Gemini 控制 socket 拒绝连接，请检查宿主服务状态'],
   gemini_host_socket_denied: [503, '控制面无权访问 Gemini 控制 socket，请检查 vm2api 组和目录权限'],
@@ -115,6 +139,8 @@ function hostRequest(socketPath, operation, payload) {
   if (process.platform !== 'linux' || process.arch !== 'x64') throw hostError('gemini_host_unsupported_platform')
   if (!path.isAbsolute(socketPath || '')) throw hostError('gemini_host_invalid_socket')
   const terminal = operation.startsWith('terminal-')
+  const timeout =
+    operation === 'models' ? 40000 : ['create', 'redeem', 'terminal-start'].includes(operation) ? 60000 : 30000
   const body = JSON.stringify(payload)
   return new Promise((resolve, reject) => {
     const request = http.request(
@@ -123,7 +149,7 @@ function hostRequest(socketPath, operation, payload) {
         method: 'POST',
         path: `/${operation}`,
         headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-        signal: AbortSignal.timeout(['create', 'redeem', 'terminal-start'].includes(operation) ? 60000 : 30000),
+        signal: AbortSignal.timeout(timeout),
       },
       async (response) => {
         try {
@@ -135,7 +161,8 @@ function hostRequest(socketPath, operation, payload) {
             chunks.push(chunk)
           }
           const data = JSON.parse(Buffer.concat(chunks))
-          if (Object.hasOwn(HOST_ERRORS, data?.code)) throw hostError(data.code, response.statusCode)
+          if (response.statusCode !== 200 && typeof data?.code === 'string' && Object.hasOwn(HOST_ERRORS, data.code))
+            throw hostError(data.code, response.statusCode)
           if (!terminal && operation !== 'redeem' && response.statusCode === 404)
             throw hostError('gemini_environment_not_found', 404)
           if (!terminal && operation !== 'redeem' && response.statusCode === 409)
@@ -154,8 +181,12 @@ function hostRequest(socketPath, operation, payload) {
   })
 }
 
+function redactProxyAuth(value) {
+  return value.replace(/socks5h?:\/\/[^\s/?#<>"`]*@[^\s<>"`]*/gi, '[redacted proxy URL]')
+}
+
 function text(value, size = 128) {
-  return typeof value === 'string' && value.length ? value.slice(0, size) : null
+  return typeof value === 'string' && value.length ? redactProxyAuth(value).slice(0, size) : null
 }
 
 function items(value, size, project) {
@@ -164,6 +195,51 @@ function items(value, size, project) {
 
 function modelName(model) {
   return typeof model === 'string' && MODEL.test(model) ? model : null
+}
+
+function validId(value) {
+  return typeof value === 'string' && ID.test(value)
+}
+
+function validRunId(value) {
+  return typeof value === 'string' && RUN_ID.test(value)
+}
+
+function validPrompt(value) {
+  return (
+    typeof value === 'string' &&
+    value.length <= MAX_PROMPT_BYTES &&
+    Buffer.byteLength(value, 'utf8') <= MAX_PROMPT_BYTES &&
+    value.trim().length > 0 &&
+    !/[\uD800-\uDFFF]/u.test(value)
+  )
+}
+
+function probeView(result) {
+  if (typeof result?.ok !== 'boolean') throw hostError(PROTOCOL_ERROR)
+  return {
+    ok: result.ok,
+    latency_ms: Number.isFinite(result.latency_ms) && result.latency_ms >= 0 ? result.latency_ms : null,
+    ...(result.ok ? {} : { code: 'gemini_proxy_probe_failed' }),
+  }
+}
+
+function runView(result) {
+  if (!RUN_STATES.has(result?.state) || typeof result.text !== 'string') throw hostError(PROTOCOL_ERROR)
+  const view = { state: result.state, text: redactProxyAuth(result.text).slice(0, MAX_TEST_TEXT) }
+  const usage = {}
+  for (const key of ['input_tokens', 'output_tokens', 'total_tokens']) {
+    const count = result.usage?.[key]
+    if (Number.isSafeInteger(count) && count >= 0) usage[key] = count
+  }
+  if (Object.keys(usage).length) view.usage = usage
+  if (result.state === 'failed') {
+    const supplied = result.error?.code
+    const code =
+      typeof supplied === 'string' && Object.hasOwn(RUN_ERRORS, supplied) ? supplied : 'gemini_inference_failed'
+    view.error = { code, message: RUN_ERRORS[code][1] }
+  }
+  return view
 }
 
 function isFraction(value) {
@@ -213,19 +289,26 @@ function accountView(account) {
   }
 }
 
-function environmentView(value) {
-  if (!ID.test(value?.id ?? '') || !ID.test(value?.proxy_id ?? '') || !STATES.has(value?.auth_state)) {
+function environmentView(value, { id, proxyId } = {}) {
+  if (
+    !validId(value?.id) ||
+    !validId(value.proxy_id) ||
+    !STATES.has(value.auth_state) ||
+    (id !== undefined && value.id !== id) ||
+    (proxyId !== undefined && value.proxy_id !== proxyId)
+  ) {
     throw hostError(PROTOCOL_ERROR)
   }
   return {
     id: value.id,
     proxy_id: value.proxy_id,
-    name: String(value.name || '').slice(0, 80),
+    name: text(value.name, 80) || '',
     auth_state: value.auth_state,
     auth_method: value.auth_method === 'api_key' ? 'api_key' : 'oauth',
     kernel_version: text(value.kernel_version),
     runtime_ready: value.runtime_ready === true,
     models: items(value.models, 128, modelName),
+    ...(value.models_discovered === true && { models_discovered: true }),
     account: accountView(value.account),
     created_at: text(value.created_at),
     updated_at: text(value.updated_at),
@@ -258,12 +341,12 @@ function authorizationInput(body) {
   }
 }
 
-function proxyFor(proxyPool, proxyId) {
+function proxyFor(proxyPool, proxyId, { allowUnhealthy = false } = {}) {
+  if (!validId(proxyId)) throw hostError('gemini_proxy_unavailable', 409)
   const proxy = proxyPool?.snapshot({ ownerUserId: null }).proxies.find((entry) => entry.id === proxyId)
   if (
     !proxy?.enabled ||
-    proxy.status === 'dead' ||
-    proxy.status === 'fail' ||
+    (!allowUnhealthy && (proxy.status === 'dead' || proxy.status === 'fail')) ||
     proxy.owner_user_id ||
     proxy.blocked_reason
   ) {
@@ -286,6 +369,14 @@ function proxyFor(proxyPool, proxyId) {
     throw hostError('gemini_proxy_unavailable', 409)
   }
   throw hostError('gemini_proxy_unavailable', 409)
+}
+
+async function readEnvironment(callHost, id) {
+  return environmentView(await callHost('get', { id }), { id })
+}
+
+function boundProxy(proxyPool, environment, options) {
+  return { proxy_id: environment.proxy_id, proxy_url: proxyFor(proxyPool(), environment.proxy_id, options) }
 }
 
 const defaultCallHost = (operation, payload) =>
@@ -374,13 +465,7 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
         const body = await readBody(req, 4096)
         const name = typeof body?.name === 'string' ? body.name.trim() : ''
         const method = body?.auth_method ?? 'oauth'
-        if (
-          !name ||
-          name.length > 80 ||
-          typeof body?.proxy_id !== 'string' ||
-          !ID.test(body.proxy_id) ||
-          !['oauth', 'api_key'].includes(method)
-        ) {
+        if (!name || name.length > 80 || !validId(body?.proxy_id) || !['oauth', 'api_key'].includes(method)) {
           return fail(400, 'gemini_invalid_environment')
         }
         const apiKey = typeof body?.api_key === 'string' ? body.api_key.trim() : ''
@@ -400,11 +485,59 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
         )
       }
       const match =
-        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|disable|refresh|terminal-ticket))?$/.exec(
+        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|disable|refresh|terminal-ticket|proxy\/probe|proxy|models|test-chat)(?:\/([^/]+))?)?$/.exec(
           pathname,
         )
-      if (!match || !ID.test(match[1])) return fail(404, 'not_found')
-      const [, id, action] = match
+      if (!match || !validId(match[1])) return fail(404, 'not_found')
+      const [, id, action, runId] = match
+      if (runId !== undefined) {
+        if (action !== 'test-chat' || !['GET', 'DELETE'].includes(req.method)) return fail(404, 'not_found')
+        if (!validRunId(runId)) return fail(400, 'gemini_invalid_run_id')
+        const payload = { id, run_id: runId }
+        if (req.method === 'GET') return ok(runView(await callHost('test-chat-status', payload)))
+        const result = await callHost('test-chat-cancel', payload)
+        if (result?.cancelled !== true) throw hostError(PROTOCOL_ERROR)
+        return ok({ cancelled: true })
+      }
+      if (req.method === 'PUT' && action === 'proxy') {
+        const body = await readBody(req, 4096)
+        const proxyId = body?.proxy_id
+        if (!validId(proxyId)) return fail(400, 'gemini_invalid_proxy_id')
+        const environment = await readEnvironment(callHost, id)
+        const result = await callHost('proxy-bind', {
+          id,
+          previous_proxy_id: environment.proxy_id,
+          proxy_id: proxyId,
+          proxy_url: proxyFor(proxyPool(), proxyId),
+        })
+        return ok(environmentView(result, { id, proxyId }))
+      }
+      if (req.method === 'POST' && action === 'proxy/probe') {
+        const environment = await readEnvironment(callHost, id)
+        // Only probing the existing binding may bypass stored health. Scope,
+        // enablement, policy, and valid IPv4 SOCKS5 still apply.
+        const target = boundProxy(proxyPool, environment, { allowUnhealthy: true })
+        return ok(probeView(await callHost('proxy-probe', { id, ...target })))
+      }
+      if (req.method === 'POST' && action === 'models') {
+        const environment = await readEnvironment(callHost, id)
+        const result = await callHost('models', { id, ...boundProxy(proxyPool, environment) })
+        const view = environmentView(result, { id, proxyId: environment.proxy_id })
+        if (!view.models.length) throw hostError('gemini_models_empty')
+        return ok(view)
+      }
+      if (req.method === 'POST' && action === 'test-chat') {
+        // A JSON string may need six wire bytes per decoded byte.
+        const body = await readBody(req, 32 * 1024)
+        const model = modelName(body?.model)
+        const prompt = body?.prompt
+        if (!model) return fail(400, 'gemini_invalid_model')
+        if (!validPrompt(prompt)) return fail(400, 'gemini_invalid_prompt')
+        const environment = await readEnvironment(callHost, id)
+        const result = await callHost('test-chat', { id, ...boundProxy(proxyPool, environment), model, prompt })
+        if (!validRunId(result?.run_id)) throw hostError(PROTOCOL_ERROR)
+        return ok({ run_id: result.run_id })
+      }
       if (req.method === 'POST' && action === 'terminal-ticket') {
         if (!terminal) throw hostError('gemini_terminal_unavailable')
         return ok(await terminal.issueTicket(id))

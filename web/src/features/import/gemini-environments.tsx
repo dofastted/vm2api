@@ -1,21 +1,24 @@
 import { useRef, useState } from 'react'
-import {
-  queryOptions,
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from '@tanstack/react-query'
+import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Progress } from '@/components/ui/progress'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { WsTerminal } from '@/components/ws-terminal-lazy'
 import { GeminiRedeemDialog } from '@/features/billing/gemini-redeem-dialog'
-
-const ROOT = '/api/panel/gemini'
-const QUERY_KEY = ['panel', 'gemini-environments'] as const
+import {
+  GEMINI_INVENTORY_KEY as QUERY_KEY,
+  GEMINI_ROOT as ROOT,
+  geminiProxyOptions,
+  isGeminiProxy,
+  useGeminiBusy,
+  useGeminiMutation,
+} from './gemini-operations'
+import { GeminiProxyPanel } from './gemini-proxy-panel'
+import { GeminiTestPanel } from './gemini-test-panel'
 
 type QuotaReading = {
   remaining_fraction: number | null
@@ -36,6 +39,7 @@ export type GeminiEnvironment = {
   created_at: string | null
   updated_at: string | null
   models: string[]
+  models_discovered?: boolean
   account: {
     state: 'ok' | 'partial' | 'error' | 'reauth_required'
     checked_at: string | null
@@ -70,16 +74,6 @@ export type GeminiInventory = {
   environments: GeminiEnvironment[]
 }
 type Authorization = { url: string; attempt_id: string }
-type Proxy = {
-  id: string
-  label?: string
-  enabled: boolean
-  kind: string
-  address_family?: number | null
-  status: string
-  owner_user_id?: string
-  blocked_reason?: string
-}
 
 const AUTH_LABELS: Record<GeminiEnvironment['auth_state'], string> = {
   unverified: '未授权',
@@ -301,8 +295,8 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
         </dd>
       </div>
       <div>
-        <dt className='text-muted-foreground'>推理</dt>
-        <dd>{environment.runtime_ready ? '就绪' : '当前载荷未启用推理'}</dd>
+        <dt className='text-muted-foreground'>公共 API 推理</dt>
+        <dd>{environment.runtime_ready ? '就绪' : '未启用'}</dd>
       </div>
       <div>
         <dt className='text-muted-foreground'>付费调用</dt>
@@ -406,7 +400,7 @@ function GeminiTerminal({
 export function geminiInventoryOptions() {
   return queryOptions({
     queryKey: QUERY_KEY,
-    queryFn: () => api<GeminiInventory>(ROOT),
+    queryFn: ({ signal }) => api<GeminiInventory>(ROOT, { signal }),
     retry: false,
     refetchInterval: (query) =>
       query.state.data?.environments.some(
@@ -415,6 +409,50 @@ export function geminiInventoryOptions() {
         ? 1500
         : false,
   })
+}
+
+function GeminiDetails({
+  environment,
+  children,
+}: {
+  environment: GeminiEnvironment
+  children: React.ReactNode
+}) {
+  const [tab, setTab] = useState('account')
+  return (
+    <Tabs value={tab} onValueChange={setTab} className='min-w-0'>
+      <TabsList aria-label='Gemini 环境详情'>
+        <TabsTrigger value='account'>账号</TabsTrigger>
+        <TabsTrigger value='proxy'>代理</TabsTrigger>
+        <TabsTrigger value='test'>测试</TabsTrigger>
+      </TabsList>
+      {/* Keep the terminal and the active test attached when inspecting another tab. */}
+      <TabsContent
+        forceMount
+        value='account'
+        className='pt-2 data-[state=inactive]:hidden'
+      >
+        {children}
+      </TabsContent>
+      <TabsContent
+        forceMount
+        value='proxy'
+        className='pt-2 data-[state=inactive]:hidden'
+      >
+        <GeminiProxyPanel environment={environment} active={tab === 'proxy'} />
+      </TabsContent>
+      <TabsContent
+        forceMount
+        value='test'
+        className='pt-2 data-[state=inactive]:hidden'
+      >
+        <GeminiTestPanel
+          key={JSON.stringify([environment.id, environment.proxy_id])}
+          environment={environment}
+        />
+      </TabsContent>
+    </Tabs>
+  )
 }
 
 export function GeminiEnvironments({
@@ -426,20 +464,11 @@ export function GeminiEnvironments({
   const client = useQueryClient()
   const inventory = useQuery(geminiInventoryOptions())
   const proxies = useQuery({
-    queryKey: ['panel', 'gemini-egress-options'],
-    queryFn: () => api<{ proxies: Proxy[] }>('/api/panel/proxies'),
+    ...geminiProxyOptions,
     enabled: isImport && inventory.data?.available === true,
   })
-  const exits = (proxies.data?.proxies ?? []).filter(
-    (proxy) =>
-      proxy.enabled &&
-      proxy.kind === 'socks5' &&
-      proxy.address_family === 4 &&
-      !proxy.owner_user_id &&
-      !proxy.blocked_reason &&
-      proxy.status !== 'dead' &&
-      proxy.status !== 'fail'
-  )
+  const exits = (proxies.data?.proxies ?? []).filter(isGeminiProxy)
+  const busy = useGeminiBusy()
   const [name, setName] = useState('')
   const [proxyId, setProxyId] = useState('')
   const [authMethod, setAuthMethod] =
@@ -453,7 +482,7 @@ export function GeminiEnvironments({
   const [createdId, setCreatedId] = useState<string | null>(null)
   const nameInput = useRef<HTMLInputElement>(null)
 
-  const operation = useMutation({
+  const operation = useGeminiMutation({
     mutationFn: async (action: {
       type:
         'create' | 'authorize' | 'complete' | 'disable' | 'delete' | 'refresh'
@@ -518,7 +547,8 @@ export function GeminiEnvironments({
 
   if (inventory.isPending)
     return <p role='status'>正在检测 Gemini 宿主机服务…</p>
-  if (inventory.isError) return <p role='alert'>读取 Gemini 环境失败。</p>
+  if (inventory.isError && !inventory.data)
+    return <p role='alert'>读取 Gemini 环境失败。</p>
   if (!inventory.data) return null
   if (!inventory.data.available)
     return <GeminiStartupStatus inventory={inventory.data} />
@@ -543,8 +573,135 @@ export function GeminiEnvironments({
             ? '请先兑换 CRAGGemini 内核。'
             : null)
 
+  const account = environment ? (
+    <div className='space-y-4'>
+      {isImport ? <h3 className='font-medium'>{environment.name}</h3> : null}
+      {!isImport ? <AntigravityUsage environment={environment} /> : null}
+      <EnvironmentData environment={environment} />
+      <div className='flex flex-wrap gap-2'>
+        {environment.auth_method !== 'api_key' ? (
+          <Button
+            type='button'
+            variant='outline'
+            disabled={
+              busy ||
+              !canInstall ||
+              Boolean(inventory.data.oauth_runtime_issue) ||
+              environment.proxy_ready === false
+            }
+            onClick={() =>
+              operation.mutate({ type: 'authorize', id: environment.id })
+            }
+          >
+            {environment.auth_state === 'authorized'
+              ? '重新授权'
+              : 'Google 授权'}
+          </Button>
+        ) : null}
+        {environment.auth_state === 'authorized' ||
+        environment.auth_state === 'reauth_required' ? (
+          <Button
+            type='button'
+            variant='outline'
+            disabled={
+              busy || !payloadReady || environment.proxy_ready === false
+            }
+            onClick={() =>
+              operation.mutate({ type: 'refresh', id: environment.id })
+            }
+          >
+            刷新数据
+          </Button>
+        ) : null}
+        <Button
+          type='button'
+          variant='outline'
+          disabled={busy || environment.auth_state === 'disabled'}
+          onClick={() =>
+            operation.mutate({ type: 'disable', id: environment.id })
+          }
+        >
+          停用
+        </Button>
+        {deleteId === environment.id ? (
+          <Button
+            type='button'
+            variant='destructive'
+            disabled={busy}
+            onClick={() =>
+              operation.mutate({ type: 'delete', id: environment.id })
+            }
+          >
+            确认删除
+          </Button>
+        ) : (
+          <Button
+            type='button'
+            variant='outline'
+            disabled={busy}
+            onClick={() => setDeleteId(environment.id)}
+          >
+            删除
+          </Button>
+        )}
+      </div>
+      {environment.auth_method === 'oauth' &&
+      environment.auth_state === 'authorized' ? (
+        terminalUnavailable ? (
+          <p role='status' className='text-sm text-muted-foreground'>
+            暂时无法启动 Gemini：{terminalUnavailable}
+          </p>
+        ) : (
+          <GeminiTerminal
+            key={environment.id}
+            environmentId={environment.id}
+            busy={busy}
+          />
+        )
+      ) : null}
+      {payloadReady &&
+      challenge?.id === environment.id &&
+      environment.auth_state === 'authorizing' ? (
+        <form
+          className='space-y-2'
+          onSubmit={(event) => {
+            event.preventDefault()
+            operation.mutate({ type: 'complete', id: environment.id })
+          }}
+        >
+          <a
+            className='block text-sm text-primary underline'
+            href={challenge.url}
+            target='_blank'
+            rel='noreferrer'
+          >
+            打开 Google 授权页
+          </a>
+          <Label htmlFor={`gemini-code-${environment.id}`}>
+            浏览器显示的授权码或完整回调链接
+          </Label>
+          <Input
+            id={`gemini-code-${environment.id}`}
+            type='password'
+            autoComplete='off'
+            required
+            maxLength={3500}
+            value={code}
+            onChange={(event) => setCode(event.target.value)}
+          />
+          <Button type='submit' disabled={busy || !code.trim()}>
+            提交授权码
+          </Button>
+        </form>
+      ) : null}
+    </div>
+  ) : null
+
   return (
-    <section className='max-w-3xl space-y-4' aria-label='Gemini 宿主环境'>
+    <section
+      className='max-w-3xl min-w-0 space-y-4'
+      aria-label='Gemini 宿主环境'
+    >
       {isImport ? (
         <p className='text-sm text-muted-foreground'>
           在宿主机创建环境，不创建虚拟机。必须绑定 IPv4 SOCKS5 代理。已有账号在{' '}
@@ -658,7 +815,7 @@ export function GeminiEnvironments({
           <Button
             type='submit'
             disabled={
-              operation.isPending ||
+              busy ||
               !canInstall ||
               !name.trim() ||
               (authMethod === 'api_key' && !apiKey.trim()) ||
@@ -678,138 +835,11 @@ export function GeminiEnvironments({
           {operation.error.message}
         </p>
       ) : null}
-      {environment ? (
-        <div className='space-y-4'>
-          {isImport ? (
-            <h3 className='font-medium'>{environment.name}</h3>
-          ) : null}
-          {!isImport ? <AntigravityUsage environment={environment} /> : null}
-          <EnvironmentData environment={environment} />
-          <div className='flex flex-wrap gap-2'>
-            {environment.auth_method !== 'api_key' ? (
-              <Button
-                type='button'
-                variant='outline'
-                disabled={
-                  operation.isPending ||
-                  !canInstall ||
-                  Boolean(inventory.data.oauth_runtime_issue) ||
-                  environment.proxy_ready === false
-                }
-                onClick={() =>
-                  operation.mutate({ type: 'authorize', id: environment.id })
-                }
-              >
-                {environment.auth_state === 'authorized'
-                  ? '重新授权'
-                  : 'Google 授权'}
-              </Button>
-            ) : null}
-            {environment.auth_state === 'authorized' ||
-            environment.auth_state === 'reauth_required' ? (
-              <Button
-                type='button'
-                variant='outline'
-                disabled={
-                  operation.isPending ||
-                  !payloadReady ||
-                  environment.proxy_ready === false
-                }
-                onClick={() =>
-                  operation.mutate({ type: 'refresh', id: environment.id })
-                }
-              >
-                刷新数据
-              </Button>
-            ) : null}
-            <Button
-              type='button'
-              variant='outline'
-              disabled={
-                operation.isPending || environment.auth_state === 'disabled'
-              }
-              onClick={() =>
-                operation.mutate({ type: 'disable', id: environment.id })
-              }
-            >
-              停用
-            </Button>
-            {deleteId === environment.id ? (
-              <Button
-                type='button'
-                variant='destructive'
-                disabled={operation.isPending}
-                onClick={() =>
-                  operation.mutate({ type: 'delete', id: environment.id })
-                }
-              >
-                确认删除
-              </Button>
-            ) : (
-              <Button
-                type='button'
-                variant='outline'
-                disabled={operation.isPending}
-                onClick={() => setDeleteId(environment.id)}
-              >
-                删除
-              </Button>
-            )}
-          </div>
-          {environment.auth_method === 'oauth' &&
-          environment.auth_state === 'authorized' ? (
-            terminalUnavailable ? (
-              <p role='status' className='text-sm text-muted-foreground'>
-                暂时无法启动 Gemini：{terminalUnavailable}
-              </p>
-            ) : (
-              <GeminiTerminal
-                key={environment.id}
-                environmentId={environment.id}
-                busy={operation.isPending}
-              />
-            )
-          ) : null}
-          {payloadReady &&
-          challenge?.id === environment.id &&
-          environment.auth_state === 'authorizing' ? (
-            <form
-              className='space-y-2'
-              onSubmit={(event) => {
-                event.preventDefault()
-                operation.mutate({ type: 'complete', id: environment.id })
-              }}
-            >
-              <a
-                className='block text-sm text-primary underline'
-                href={challenge.url}
-                target='_blank'
-                rel='noreferrer'
-              >
-                打开 Google 授权页
-              </a>
-              <Label htmlFor={`gemini-code-${environment.id}`}>
-                浏览器显示的授权码或完整回调链接
-              </Label>
-              <Input
-                id={`gemini-code-${environment.id}`}
-                type='password'
-                autoComplete='off'
-                required
-                maxLength={3500}
-                value={code}
-                onChange={(event) => setCode(event.target.value)}
-              />
-              <Button
-                type='submit'
-                disabled={operation.isPending || !code.trim()}
-              >
-                提交授权码
-              </Button>
-            </form>
-          ) : null}
-        </div>
-      ) : null}
+      {environment && !isImport ? (
+        <GeminiDetails environment={environment}>{account}</GeminiDetails>
+      ) : (
+        account
+      )}
     </section>
   )
 }

@@ -6,6 +6,7 @@ import fcntl
 import grp
 import hashlib
 import hmac
+import importlib.util
 from http.server import BaseHTTPRequestHandler
 import ipaddress
 import json
@@ -72,6 +73,19 @@ PAYLOAD_FILES = (
     "craggemini",
     "libagy_bridge.so",
 )
+INFERENCE_MODULE = ROOT / "scripts/gemini_host_inference.py"
+MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
+RUN_TTL = 90
+
+
+def invocation_module():
+    check_root_owned(INFERENCE_MODULE)
+    spec = importlib.util.spec_from_file_location(
+        "gemini_host_inference", INFERENCE_MODULE
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class Failure(Exception):
@@ -84,26 +98,30 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def account_command(uid, method, profile=None):
+    return [
+        "setpriv",
+        "--reuid",
+        str(uid),
+        "--regid",
+        str(uid),
+        "--clear-groups",
+        "--no-new-privs",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--bounding-set=-all",
+        sys.executable,
+        "-I",
+        str(ROOT / "scripts/gemini_host_account.py"),
+        method,
+        *([str(profile)] if profile is not None else []),
+    ]
+
+
 def read_account(uid, proxy_url, method, api_key=None, profile=None):
     try:
         result = subprocess.run(
-            [
-                "setpriv",
-                "--reuid",
-                str(uid),
-                "--regid",
-                str(uid),
-                "--clear-groups",
-                "--no-new-privs",
-                "--inh-caps=-all",
-                "--ambient-caps=-all",
-                "--bounding-set=-all",
-                sys.executable,
-                "-I",
-                str(ROOT / "scripts/gemini_host_account.py"),
-                method,
-                *([str(profile)] if profile is not None else []),
-            ],
+            account_command(uid, method, profile),
             input=json.dumps({"proxy_url": proxy_url, "api_key": api_key}).encode(),
             check=True,
             timeout=17,
@@ -199,7 +217,7 @@ def proxy_config(value):
     return str(address), str(port)
 
 
-def profile_secrets(profile, uid):
+def profile_secrets(profile, uid, *, include_raw=False):
     """Open only beneath a root-owned profile, without traversing symlinks."""
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     fd = None
@@ -236,7 +254,7 @@ def profile_secrets(profile, uid):
         access = credential.get("access_token")
         if not isinstance(access, str) or not ACCESS_TOKEN.fullmatch(access):
             return None
-        return tuple(
+        secrets = tuple(
             value
             for value in (
                 access,
@@ -245,6 +263,7 @@ def profile_secrets(profile, uid):
             )
             if isinstance(value, str) and 1 <= len(value) <= 16384 and value.isascii()
         )
+        return (secrets, raw) if include_raw else secrets
     except (OSError, ValueError, RecursionError):
         return None
     finally:
@@ -314,12 +333,7 @@ class Agy:
         work.mkdir(mode=0o700)
         os.chown(work, self.uid, self.uid)
         if self.profile is None:
-            settings = home / ".gemini" / "antigravity-cli"
-            for private in (home, home / ".gemini", settings):
-                private.mkdir(mode=0o700)
-                os.chown(private, self.uid, self.uid)
-            private_json(settings / "settings.json", CLI_SETTINGS)
-            os.chown(settings / "settings.json", self.uid, self.uid)
+            self.initialize_home(home)
         config = self.directory / "egress.json"
         private_json(
             config,
@@ -454,6 +468,19 @@ class Agy:
             "--setenv",
             "AGY_CLI_DISABLE_AUTO_UPDATE",
             "true",
+        ]
+        self.launch_cli(self.launch_args(self.uid) + sandbox, size)
+
+    def initialize_home(self, home):
+        settings = home / ".gemini" / "antigravity-cli"
+        for private in (home, home / ".gemini", settings):
+            private.mkdir(mode=0o700)
+            os.chown(private, self.uid, self.uid)
+        private_json(settings / "settings.json", CLI_SETTINGS)
+        os.chown(settings / "settings.json", self.uid, self.uid)
+
+    def launch_cli(self, argv, size):
+        argv += [
             "--setenv",
             "SSH_TTY",
             "/dev/tty",
@@ -461,15 +488,10 @@ class Agy:
             "SSH_CONNECTION",
             "127.0.0.1 12345 127.0.0.1 22",
             "--",
-            *(
-                ["/usr/bin/python3", "-I", "-c", TERMINAL_EXEC]
-                if self.profile is not None
-                else []
-            ),
-            "/opt/agy",
-            "--mode",
-            "plan",
         ]
+        if self.profile is not None:
+            argv += ["/usr/bin/python3", "-I", "-c", TERMINAL_EXEC]
+        argv += ["/opt/agy", "--mode", "plan"]
         self.pid, self.terminal = pty.fork()
         if self.pid == 0:
             try:
@@ -480,7 +502,6 @@ class Agy:
                 if self.profile is not None:
                     with open(os.devnull, "wb") as quiet:
                         os.dup2(quiet.fileno(), 2)
-                argv = self.launch_args(self.uid) + sandbox
                 os.execvpe(argv[0], argv, SYSTEM_ENV)
             finally:
                 os._exit(125)
@@ -579,6 +600,66 @@ class Agy:
             else:
                 shutil.rmtree(self.directory)
             self.owns_directory = False
+
+
+class Headless(Agy):
+    def __init__(self, host, environment, proxy_url, auth, args, prompt):
+        self.invocation = None
+        self.credentials, self.token_bytes = auth
+        self.args, self.prompt = args, prompt
+        super().__init__(host, environment, proxy_url)
+
+    def initialize_home(self, home):
+        super().initialize_home(home)
+        settings = home / ".gemini" / "antigravity-cli"
+        private_json(
+            settings / "settings.json",
+            {
+                **CLI_SETTINGS,
+                "permissions": {
+                    "deny": [
+                        "read_file(*)",
+                        "write_file(*)",
+                        "command(*)",
+                        "mcp(*)",
+                        "read_url(*)",
+                        "execute_url(*)",
+                    ]
+                },
+            },
+        )
+        os.chown(settings / "settings.json", self.uid, self.uid)
+        token = settings / TOKEN_NAME
+        token.write_bytes(self.token_bytes)
+        os.chown(token, self.uid, self.uid)
+        self.token_bytes = None
+
+    def launch_cli(self, argv, size):
+        self.invocation = invocation_module().Invocation(
+            argv + ["--", "/opt/agy", *self.args],
+            SYSTEM_ENV,
+            self.prompt,
+            secrets=self.credentials,
+        )
+
+    def poll(self):
+        if self.egress.poll() is not None:
+            return {
+                "state": "failed",
+                "text": "",
+                "error": {
+                    "code": "gemini_proxy_error",
+                    "message": "Gemini egress stopped",
+                },
+            }
+        return self.invocation.poll()
+
+    def close(self, preserve=False):
+        try:
+            if self.invocation is not None:
+                self.invocation.close()
+        finally:
+            super().close(preserve)
 
 
 class Login(Agy):
@@ -868,6 +949,7 @@ class Host:
         self.state_file = self.directory / "environments.json"
         self.pending = {}
         self.terminals = {}
+        self.runs = {}
         self.network_scope = os.stat("/proc/self/ns/net").st_ino
         self.environments = (
             json.loads(self.state_file.read_bytes()) if self.state_file.exists() else {}
@@ -1288,6 +1370,195 @@ class Host:
         if terminal:
             terminal.close()
 
+    def stop_run(self, identifier):
+        entry = self.runs.pop(identifier, None)
+        if entry and entry["process"] is not None:
+            entry["process"].close()
+
+    def running(self, identifier):
+        entry = self.runs.get(identifier)
+        return bool(entry and entry["process"] is not None)
+
+    def update_run(self, entry):
+        if entry["process"] is None:
+            return entry["result"]
+        result = entry["process"].poll()
+        if result["state"] != "running" or time.monotonic() >= entry["deadline"]:
+            entry["process"].close()
+            entry["process"] = None
+            entry["result"] = (
+                result
+                if result["state"] != "running"
+                else {
+                    "state": "failed",
+                    "text": "",
+                    "error": {
+                        "code": "gemini_inference_timeout",
+                        "message": "Gemini request timed out",
+                    },
+                }
+            )
+            entry["deadline"] = time.monotonic() + RUN_TTL
+            return entry["result"]
+        return result
+
+    def operation_account(self, env):
+        self.ensure_payload(legacy_install=False)
+        if env["auth_state"] != "authorized":
+            code = (
+                "gemini_api_key_invalid"
+                if env.get("auth_method") == "api_key"
+                else "gemini_oauth_required"
+            )
+            raise Failure(409, code)
+        identifier = env["id"]
+        if (
+            self.running(identifier)
+            or identifier in self.terminals
+            or identifier in self.pending
+        ):
+            raise Failure(409, "gemini_operation_busy")
+        uid = self.uid_base + env["slot"]
+        directory = self.directory / identifier
+        if env.get("auth_method") == "api_key":
+            key = json.loads(read_root_file(directory / "credential.json", 1024)).get(
+                "api_key"
+            )
+            if isinstance(key, str) and API_KEY.fullmatch(key):
+                return uid, key, None
+            raise Failure(409, "gemini_api_key_invalid")
+        profile = env.get("profile")
+        auth = profile and profile_secrets(directory / profile, uid, include_raw=True)
+        if not auth:
+            raise Failure(409, "gemini_oauth_required")
+        issue = self.oauth_runtime_issue()
+        if issue:
+            raise Failure(503, issue)
+        return uid, None, auth
+
+    def pull_models(self, env, proxy_url):
+        uid, key, auth = self.operation_account(env)
+        if key:
+            data = read_account(uid, proxy_url, "api-key-models", api_key=key)
+            if data.get("state") == "reauth_required":
+                raise Failure(409, "gemini_api_key_invalid")
+            if data.get("state") not in ("ok", "partial"):
+                raise Failure(502, "gemini_proxy_error")
+            models = data.get("models", [])
+        else:
+            run = Headless(
+                self, env, proxy_url, auth, invocation_module().MODEL_ARGS, None
+            )
+            try:
+                deadline = time.monotonic() + 19
+                while True:
+                    result = run.poll()
+                    if result["state"] != "running":
+                        break
+                    if time.monotonic() >= deadline:
+                        raise Failure(504, "gemini_inference_timeout")
+                    time.sleep(0.05)
+                if result["state"] != "completed":
+                    raise Failure(502, result["error"]["code"])
+                models = result.get("models", [])
+            finally:
+                run.close()
+        if not models:
+            raise Failure(502, "gemini_models_empty")
+        self.save_environment(env, {**env, "call_models": models, "updated_at": now()})
+        return self.view(env)
+
+    def start_run(self, env, proxy_url, body):
+        model, prompt = body.get("model"), body.get("prompt")
+        if (
+            not isinstance(model, str)
+            or not MODEL.fullmatch(model)
+            or not isinstance(prompt, str)
+            or not prompt.strip()
+            or len(prompt.encode()) > 4096
+        ):
+            raise Failure(400)
+        uid, key, auth = self.operation_account(env)
+        if model not in env.get("call_models", []):
+            raise Failure(409, "gemini_model_unavailable")
+        identifier = env["id"]
+        self.stop_run(identifier)
+        module = invocation_module()
+        if key:
+            process = module.Invocation(
+                account_command(uid, "api-key-chat"),
+                SYSTEM_ENV,
+                prompt,
+                input_bytes=json.dumps(
+                    {
+                        "api_key": key,
+                        "proxy_url": proxy_url,
+                        "prompt": prompt,
+                        "model": model,
+                    }
+                ).encode(),
+                secrets=(key,),
+            )
+        else:
+            process = Headless(
+                self, env, proxy_url, auth, module.chat_args(model), prompt
+            )
+        run_id = secrets.token_hex(16)
+        self.runs[identifier] = {
+            "id": run_id,
+            "process": process,
+            "deadline": time.monotonic() + RUN_TTL,
+        }
+        return {"run_id": run_id}
+
+    def run_request(self, operation, identifier, body):
+        entry = self.runs.get(identifier)
+        if not entry or entry["id"] != body.get("run_id"):
+            raise Failure(404, "gemini_run_not_found")
+        if operation == "test-chat-cancel":
+            self.stop_run(identifier)
+            return {"cancelled": True}
+        try:
+            self.ensure_payload(legacy_install=False)
+        except Failure:
+            self.stop_run(identifier)
+            raise
+        return self.update_run(entry)
+
+    def probe_proxy(self, env, proxy_url):
+        started = time.monotonic()
+        result = read_account(self.uid_base + env["slot"], proxy_url, "proxy-probe")
+        return {
+            "ok": result.get("ok") is True,
+            "latency_ms": round((time.monotonic() - started) * 1000),
+        }
+
+    def save_environment(self, env, updated):
+        private_json(self.state_file, {**self.environments, env["id"]: updated})
+        env.clear()
+        env.update(updated)
+
+    def bind_proxy(self, env, body):
+        new_id = body.get("proxy_id")
+        if not isinstance(new_id, str) or not ID.fullmatch(new_id):
+            raise Failure(400)
+        proxy_config(body.get("proxy_url"))
+        identifier = env["id"]
+        if (
+            body.get("previous_proxy_id") != env["proxy_id"]
+            or self.running(identifier)
+            or identifier in self.terminals
+            or identifier in self.pending
+        ):
+            raise Failure(409, "gemini_operation_busy")
+        if new_id != env["proxy_id"]:
+            self.stop_run(identifier)
+            updated = {**env, "proxy_id": new_id, "updated_at": now()}
+            updated.pop("call_models", None)
+            updated.pop("account", None)
+            self.save_environment(env, updated)
+        return self.view(env)
+
     def terminal_request(self, operation, env, body):
         identifier = env["id"]
         session_id = body.get("session_id")
@@ -1329,6 +1600,7 @@ class Host:
         if (
             terminal
             or identifier in self.pending
+            or self.running(identifier)
             or any(other.session_id == session_id for other in self.terminals.values())
         ):
             raise Failure(409, "gemini_terminal_conflict")
@@ -1368,6 +1640,7 @@ class Host:
     def close(self):
         failed = False
         for stop, active in (
+            (self.stop_run, self.runs),
             (self.stop_terminal, self.terminals),
             (self.cancel, self.pending),
         ):
@@ -1380,10 +1653,17 @@ class Host:
             raise RuntimeError("Gemini child cleanup failed")
 
     def cleanup(self):
-        if self.terminals or self.pending:
+        for identifier, entry in list(self.runs.items()):
+            if entry["process"] is None and time.monotonic() >= entry["deadline"]:
+                self.stop_run(identifier)
+            else:
+                self.update_run(entry)
+        if self.terminals or self.pending or self.runs:
             try:
                 self.ensure_payload(legacy_install=False)
             except Failure:
+                for identifier in list(self.runs):
+                    self.stop_run(identifier)
                 for identifier in list(self.terminals):
                     self.stop_terminal(identifier)
                 for identifier in list(self.pending):
@@ -1418,6 +1698,7 @@ class Host:
                     auth_state="authorized", profile=login.attempt, updated_at=now()
                 )
                 env.pop("account", None)
+                env.pop("call_models", None)
                 self.save()
                 del self.pending[identifier]
                 if old_profile:
@@ -1439,7 +1720,8 @@ class Host:
             "auth_method": env.get("auth_method", "oauth"),
             "runtime_ready": False,
             "kernel_version": self.payload_version,
-            "models": account.get("models", []),
+            "models": env.get("call_models", account.get("models", [])),
+            "models_discovered": bool(env.get("call_models")),
             "account": account,
             "created_at": env.get("created_at"),
             "updated_at": env.get("updated_at"),
@@ -1471,6 +1753,8 @@ class Host:
         else:
             env["account"] = account
         if account.get("state") == "reauth_required":
+            self.stop_run(env["id"])
+            env.pop("call_models", None)
             self.stop_terminal(env["id"])
             env["auth_state"] = "reauth_required"
         elif account.get("state") in ("ok", "partial"):
@@ -1568,11 +1852,16 @@ class Host:
                 "payload_state": self.payload_state,
                 "payload_issue": self.payload_issue,
             }
+        if operation == "proxy-bind":
+            return self.bind_proxy(env, body)
+        if operation in ("test-chat-status", "test-chat-cancel"):
+            return self.run_request(operation, identifier, body)
         if operation in ("terminal-start", "terminal-io", "terminal-stop"):
             return self.terminal_request(operation, env, body)
         if operation == "logout":
             if env.get("auth_method", "oauth") != "oauth":
                 raise Failure(409)
+            self.stop_run(identifier)
             self.stop_terminal(identifier)
             self.cancel(identifier)
             self.recover_network(self.directory / identifier, env["slot"])
@@ -1583,12 +1872,14 @@ class Host:
                 except FileNotFoundError:
                     pass
             env.pop("account", None)
+            env.pop("call_models", None)
             if env["auth_state"] != "disabled":
                 env["auth_state"] = "reauth_required"
             env["updated_at"] = now()
             self.save()
             return {}
         if operation in ("delete", "disable"):
+            self.stop_run(identifier)
             self.stop_terminal(identifier)
             self.cancel(identifier)
             self.recover_network(self.directory / identifier, env["slot"])
@@ -1604,6 +1895,12 @@ class Host:
             raise Failure(409)
         proxy_url = body.get("proxy_url")
         proxy_config(proxy_url)
+        if operation == "proxy-probe":
+            return self.probe_proxy(env, proxy_url)
+        if operation == "models":
+            return self.pull_models(env, proxy_url)
+        if operation == "test-chat":
+            return self.start_run(env, proxy_url, body)
         if operation == "refresh":
             self.ensure_payload(legacy_install=False)
             if env["auth_state"] not in ("authorized", "reauth_required") or (
@@ -1614,10 +1911,11 @@ class Host:
         if env.get("auth_method", "oauth") != "oauth":
             raise Failure(409)
         if operation == "authorize":
-            if identifier in self.terminals:
+            if identifier in self.terminals or self.running(identifier):
                 raise Failure(409, "gemini_terminal_conflict")
             self.ensure_oauth_runtime()
             self.cancel(identifier)
+            self.stop_run(identifier)
             env["auth_state"] = "authorizing"
             env["updated_at"] = now()
             self.save()
@@ -1663,9 +1961,9 @@ class ControlHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             length = int(self.headers.get("Content-Length", 0))
-            if length < 1 or length > 8192:
-                raise Failure(400)
             operation = self.path[1:] if self.path.startswith("/") else self.path
+            if length < 1 or length > (32768 if operation == "test-chat" else 8192):
+                raise Failure(400)
             if operation not in {
                 "list",
                 "redeem",
@@ -1681,6 +1979,12 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "terminal-io",
                 "terminal-stop",
                 "install-payload",
+                "proxy-probe",
+                "proxy-bind",
+                "models",
+                "test-chat",
+                "test-chat-status",
+                "test-chat-cancel",
             }:
                 raise Failure(404)
             body = json.loads(self.rfile.read(length))
@@ -1784,6 +2088,7 @@ def main():
         ROOT / "scripts/gemini-host-egress.sh",
         ROOT / "scripts/install-gemini-payload.mjs",
         ROOT / "scripts/gemini_host_account.py",
+        INFERENCE_MODULE,
         ROOT / "src/lib/gemini/payload.mjs",
         args.state,
         args.socket.parent,

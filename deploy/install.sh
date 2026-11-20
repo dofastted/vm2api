@@ -729,6 +729,7 @@ prepare_gemini_host() (
   fi
 
   local -a files=(deploy/gemini-host.service.example scripts/gemini-host.py scripts/gemini_host_account.py
+    scripts/gemini_host_inference.py
     scripts/gemini-host-egress.sh scripts/install-gemini-payload.mjs src/lib/gemini/payload.mjs)
   for file in "${files[@]}"; do
     if ! fetch_gemini_host_file "$tag" "$mode" "$file" "${staging}/${file}"; then

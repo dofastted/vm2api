@@ -16,11 +16,28 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 - **Google OAuth**：打开 CLI 生成的官方链接，回填授权码或完整回调链接。完整链接的 `state` 必须匹配当前授权尝试。CLI 持有凭据；不在面板填写 Google 密码、访问令牌或刷新令牌。尝试最多 5 分钟；停用或删除可取消等待中的授权。
 - **启动 Gemini**：从已完成 Google 授权的账号详情打开 `agy` 终端，沿用该账号的隔离 HOME 和 SOCKS5 代理。终端仅在启动阶段把 CLI 的 Google OAuth 菜单视为需要重新授权；会话中的同名文本正常显示，不改变账号授权状态。终端使用计划模式启动，关闭终端即结束进程；不创建 VM，不启用公共推理或计费。反代须为该终端透传 WebSocket，见 [nginx 终端配置](nginx-shell.md)。
 - **Gemini API Key**：经绑定代理调用 Google 模型列表验证凭据，再以仅宿主服务可读的权限保存。模型列表不是推理验收；该凭据通道不返回账号邮箱、订阅或按模型使用配额。
+- **虚拟机 → Gemini → 详情 → 代理**：可查看、测通或换绑 IPv4 SOCKS5。测通请求只检查能否经绑定代理连接 Google，不发送账号凭据。换绑会清除已有模型和账号数据快照，不删除登录；授权、CLI 终端或测试运行时不得换绑。
+- **详情 → 测试**：先拉取模型，再选择模型发送单条纯文本。OAuth 走隔离的官方 `agy models` 和 CLI 无界面模式；API Key 只把目录中声明支持 `generateContent` 的模型加入测试列表。请求只用当前账号及绑定代理，不切换账号、不回落直连。回复确认成功后显示；可取消。测试不计入 vm2api 密钥扣费，但可能消耗 Google 侧用量。
 - 两种方式都在 VM 页显示环境、代理绑定、授权状态、载荷版本和可读取的数据。「刷新数据」经绑定代理读取 Google 响应：OAuth 按可用权限读取账号、项目、订阅、模型、配额及 Credits，API Key 读取模型。展开 OAuth 账号可看共享额度的 5 小时和每周窗口、使用比例、剩余比例和重置时间；共享窗口未返回仍可看逐模型额度。两类读数不叠加，未返回比例不显示为零，旧数据标明读取失败后的快照时间。额度和 Credits 不代表本地调用量或费用。凭据失效时需重新授权或导入；尚未启用 OAuth 自动续票。宿主服务的状态目录不纳入 VM 包或面板备份。
-- `0.3.0-rc.1` 已用真实 `agy` 验证受管 PTY 和隔离回环上游 SSE。自动安装和数据读取可用本地夹具验证；真实 Google 换票和 OAuth 推理未验收，不标记推理就绪。
+- OAuth 授权、拉取模型和推理是不同检查。Google 若拒绝当前账号所在地区的 Antigravity 调用，测试返回 `gemini_location_unsupported`，不会触发重新授权、换号或换代理；不要把有模型列表当作推理就绪。
 - 可使用非 root 账号运行 `bash test/deploy/gemini-host-egress-smoke.sh /absolute/path/kin-egress`，在一次性 Linux 命名空间用 `iptables` 模拟 Docker 的默认转发丢弃策略，检查选定 SOCKS5 的透明转发、转发器退出后失败和网络清理。该测试不访问 Google 或主机代理池。
 - 有签名产物时，可在带 Node 和 Python 的一次性 Linux amd64 容器内以 root 运行 `bash test/deploy/gemini-host-install-smoke.sh /path/to/signed-payload /path/to/public-key`。断网烟测覆盖验签、传统手工安装、默认预装后锁定、拒绝无效兑换码和激活重启持久化。
 - 管理员可生成 `Gemini · CRAGAnti` 专用密钥，只能访问 Gemini 会话入口及密钥查询，不会落入 Claude、Codex 或 API 直连。当前二进制的推理桥仅验收过 Gemini API Key provider；即使 Google OAuth 已授权，`/v1/gemini/sessions` 也会返回 `gemini_runtime_not_supported`，不会分配会话或扣费。对外推理还需支持 OAuth 的载荷及逐回合可核销的官方结算；不把订阅等级、Token 数或余额变化当成实扣凭证。
+
+### 管理员诊断接口
+
+前缀 `/api/panel/gemini/environments/:id`，使用面板管理员鉴权。下面列出响应的 `data` 字段；错误使用 `error.code` 和 `error.message`。
+
+| 方法与路径 | 请求 | 响应 |
+| --- | --- | --- |
+| `POST /proxy/probe` | 无 | `ok`、`latency_ms`，失败附 `code` |
+| `PUT /proxy` | `{proxy_id}` | 环境视图 |
+| `POST /models` | 无 | 环境视图，含 `models` 和 `models_discovered` |
+| `POST /test-chat` | `{model,prompt}`，限现拉模型和 4096 UTF-8 字节提示词 | `{run_id}` |
+| `GET /test-chat/:run_id` | 无 | `{state,text,usage?,error?}`，状态为 `running`、`completed` 或 `failed` |
+| `DELETE /test-chat/:run_id` | 无 | `{cancelled:true}` |
+
+`run_id` 绑定环境，结果只在宿主内存短暂保留。这不是公开模型网关，不接收工具、多轮历史或多模态请求。上游未返回计数时不推算用量。
 
 ## 协议参考与原生边界
 

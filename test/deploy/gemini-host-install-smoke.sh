@@ -15,7 +15,7 @@ stop() {
 }
 trap 'stop; rm -rf -- "$fixture"' EXIT
 mkdir -m 755 -p "$fixture"/{scripts,src/lib/gemini,source,payload}
-install -m 644 "$root"/scripts/{gemini-host.py,gemini-host-egress.sh,gemini_host_account.py,install-gemini-payload.mjs} "$fixture/scripts/"
+install -m 644 "$root"/scripts/{gemini-host.py,gemini-host-egress.sh,gemini_host_account.py,gemini_host_inference.py,install-gemini-payload.mjs} "$fixture/scripts/"
 install -m 644 "$root/src/lib/gemini/payload.mjs" "$fixture/src/lib/gemini/"
 install -m 644 "$public_key" "$fixture/public-key"
 for member in manifest.json manifest.sig agy craggemini libagy_bridge.so; do
@@ -274,7 +274,12 @@ def google(proxy_url, url, header, body=None):
     assert proxy_url == proxy
     if url == module["GEMINI_MODELS"]:
         assert header == "x-goog-api-key: fixture"
-        return 200, {"models": [{"name": "models/gemini-3.1-pro"}], "nextPageToken": "page"}
+        return 200, {"models": [
+            {"name": "models/gemini-3.1-pro", "supportedGenerationMethods": ["countTokens", "generateContent"]},
+            {"name": "models/gemini-embedding-001", "supportedGenerationMethods": ["embedContent"]},
+            {"name": "models/gemini-unsupported", "supportedGenerationMethods": "generateContent"},
+            {"name": "models/gemini-unknown-capabilities"},
+        ], "nextPageToken": "page"}
     assert header == "Authorization: Bearer fixture"
     if url == module["GOOGLE_USERINFO"]:
         return 200, {"email": "test@example.invalid", "access_token": "never expose"}
@@ -310,7 +315,10 @@ with patch.dict(probe.__globals__, {
     assert info["region"] == "fixture-region" and info["expires_at"] == "2030-01-01T00:00:00Z"
     assert "never expose" not in str(info) and proxy not in str(info)
     api = module["probe_api_key"](proxy, "fixture")
-    assert api["state"] == "partial" and api["models"] == ["gemini-3.1-pro"] and "email" not in api and "quota_groups" not in api
+    assert api["state"] == "partial" and "email" not in api and "quota_groups" not in api
+    assert api["models"] == ["gemini-3.1-pro", "gemini-embedding-001", "gemini-unknown-capabilities", "gemini-unsupported"]
+    chat_catalog = module["probe_api_key"](proxy, "fixture", chat_only=True)
+    assert chat_catalog["models"] == ["gemini-3.1-pro"]
 
     def summary_unavailable(proxy_url, url, header, body=None):
         if url.endswith("retrieveUserQuotaSummary"):
