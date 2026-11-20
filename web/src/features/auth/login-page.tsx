@@ -2,18 +2,25 @@ import { useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useSearch } from '@tanstack/react-router'
 import { DOCS_URL } from '@/config/repo'
-import { Eye, EyeOff, LogIn } from 'lucide-react'
+import { Eye, EyeOff, LogIn, ShieldCheck } from 'lucide-react'
 import { toast } from 'sonner'
 import { Logo } from '@/assets/logo'
 import { useAuthStore } from '@/stores/auth-store'
-import { loginRequest } from '@/lib/api'
+import { ApiError, loginRequest, loginTotpRequest } from '@/lib/api'
 import { apiBase, sameOriginPanel, setApiBase } from '@/lib/session'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import {
+  InputOTP,
+  InputOTPGroup,
+  InputOTPSlot,
+} from '@/components/ui/input-otp'
 import { Label } from '@/components/ui/label'
 import { ThemeSwitch } from '@/components/theme-switch'
 import { onboardingQueryOptions } from '@/features/welcome/queries'
 import { meQueryOptions } from './queries'
+
+const OTP_SLOTS = [0, 1, 2, 3, 4, 5]
 
 /** Standalone sign-in page. */
 export function LoginPage() {
@@ -27,7 +34,44 @@ export function LoginPage() {
   const [base, setBase] = useState(apiBase())
   const [error, setError] = useState('')
   const [pending, setPending] = useState(false)
+  // 两步验证：密码通过后留在本页输验证码，密码不再重发。
+  const [challenge, setChallenge] = useState('')
+  const [code, setCode] = useState('')
+  const [recoveryMode, setRecoveryMode] = useState(false)
   const hideBase = sameOriginPanel()
+  const needsCode = !!challenge
+
+  async function completeSignIn(result: { token: string; user: string }) {
+    signIn(result.token, result.user)
+    // The route guard reads this cache; drop the previous account's views.
+    queryClient.removeQueries({ queryKey: meQueryOptions().queryKey })
+    let needsWelcome = false
+    try {
+      const onboarding = await queryClient.fetchQuery(
+        onboardingQueryOptions(true)
+      )
+      needsWelcome = Boolean(onboarding.needs_welcome)
+    } catch {
+      needsWelcome = false
+    }
+    toast.success('登录成功')
+    if (needsWelcome) {
+      await navigate({ to: '/welcome', search: { setup: true } })
+      return
+    }
+    // `redirect` is a router href (`/vm/x?tab=y`); never bounce back into the public pages.
+    const next = search.redirect
+    if (
+      next &&
+      next.startsWith('/') &&
+      !next.startsWith('//') &&
+      !/^\/(welcome|login)\b/.test(next)
+    ) {
+      await navigate({ href: next })
+      return
+    }
+    await navigate({ to: '/overview' })
+  }
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault()
@@ -41,40 +85,56 @@ export function LoginPage() {
         password,
         base: hideBase ? '' : base.trim().replace(/\/$/, '') || apiBase(),
       })
-      signIn(result.token, result.user)
-      // The route guard reads this cache; drop the previous account's views.
-      queryClient.removeQueries({ queryKey: meQueryOptions().queryKey })
-      let needsWelcome = false
-      try {
-        const onboarding = await queryClient.fetchQuery(
-          onboardingQueryOptions(true)
-        )
-        needsWelcome = Boolean(onboarding.needs_welcome)
-      } catch {
-        needsWelcome = false
-      }
-      toast.success('登录成功')
-      if (needsWelcome) {
-        await navigate({ to: '/welcome', search: { setup: true } })
+      if (result.kind === 'totp') {
+        setChallenge(result.challenge)
+        setCode('')
+        setRecoveryMode(false)
         return
       }
-      // `redirect` is a router href (`/vm/x?tab=y`); never bounce back into the public pages.
-      const next = search.redirect
-      if (
-        next &&
-        next.startsWith('/') &&
-        !next.startsWith('//') &&
-        !/^\/(welcome|login)\b/.test(next)
-      ) {
-        await navigate({ href: next })
-        return
-      }
-      await navigate({ to: '/overview' })
+      await completeSignIn(result)
     } catch (err) {
       setError(err instanceof Error ? err.message : '登录失败')
     } finally {
       setPending(false)
     }
+  }
+
+  async function submitCode(value: string) {
+    const entered = value.trim()
+    if (!entered || pending) return
+    setError('')
+    setPending(true)
+    try {
+      await completeSignIn(
+        await loginTotpRequest({
+          challenge,
+          code: entered,
+          username: username.trim(),
+        })
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '验证失败')
+      setCode('')
+      // A spent or expired challenge can never succeed: go back to the
+      // password step instead of leaving the user typing into a dead one.
+      if (
+        err instanceof ApiError &&
+        (err.code === 'totp_challenge_expired' ||
+          err.code === 'totp_challenge_invalid')
+      ) {
+        setChallenge('')
+        setRecoveryMode(false)
+      }
+    } finally {
+      setPending(false)
+    }
+  }
+
+  function backToPassword() {
+    setChallenge('')
+    setCode('')
+    setRecoveryMode(false)
+    setError('')
   }
 
   return (
@@ -105,98 +165,195 @@ export function LoginPage() {
 
       <main className='relative flex flex-1 items-center justify-center px-6 pb-20'>
         <div className='welcome-fade-up w-full max-w-[22rem]'>
-          <h1 className='text-xl font-semibold tracking-tight'>登录控制台</h1>
-          <p className='mt-2 text-sm text-muted-foreground'>
-            第一次使用？看
-            <a
-              href={`${DOCS_URL}guide/install`}
-              target='_blank'
-              rel='noreferrer'
-              className='text-foreground underline underline-offset-4'
-            >
-              安装文档
-            </a>
-            ，或回到
-            <Link
-              to='/welcome'
-              className='text-foreground underline underline-offset-4'
-            >
-              欢迎页
-            </Link>
-            。
-          </p>
-          <Link
-            to='/crag-purchase'
-            className='mt-3 inline-block text-sm underline underline-offset-4'
-          >
-            免登录购买 CRAG 订阅
-          </Link>
+          <h1 className='text-xl font-semibold tracking-tight'>
+            {needsCode ? '两步验证' : '登录控制台'}
+          </h1>
+          {needsCode ? (
+            <p className='mt-2 text-sm text-muted-foreground'>
+              密码已通过，再输入{' '}
+              <span className='font-medium'>{username.trim() || '该账号'}</span>{' '}
+              的验证码。
+            </p>
+          ) : (
+            <>
+              <p className='mt-2 text-sm text-muted-foreground'>
+                第一次使用？看
+                <a
+                  href={`${DOCS_URL}guide/install`}
+                  target='_blank'
+                  rel='noreferrer'
+                  className='text-foreground underline underline-offset-4'
+                >
+                  安装文档
+                </a>
+                ，或回到
+                <Link
+                  to='/welcome'
+                  className='text-foreground underline underline-offset-4'
+                >
+                  欢迎页
+                </Link>
+                。
+              </p>
+              <Link
+                to='/crag-purchase'
+                className='mt-3 inline-block text-sm underline underline-offset-4'
+              >
+                免登录购买 CRAG 订阅
+              </Link>
+            </>
+          )}
 
-          <form className='mt-8 space-y-4' onSubmit={onSubmit}>
-            <div className='space-y-2'>
-              <Label htmlFor='login-username'>用户名</Label>
-              <Input
-                id='login-username'
-                className='h-10 rounded-lg'
-                autoComplete='username'
-                placeholder='输入面板用户名'
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-              />
-            </div>
-            <div className='space-y-2'>
-              <Label htmlFor='login-password'>密码</Label>
-              <div className='relative'>
-                <Input
-                  id='login-password'
-                  type={showPassword ? 'text' : 'password'}
-                  className='h-10 rounded-lg pe-10'
-                  autoComplete='current-password'
-                  placeholder='输入密码'
-                  autoFocus
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                />
+          {needsCode ? (
+            <form
+              className='mt-8 space-y-4'
+              onSubmit={(event) => {
+                event.preventDefault()
+                void submitCode(code)
+              }}
+            >
+              <div className='space-y-2'>
+                <Label htmlFor='login-totp'>
+                  {recoveryMode ? '恢复码' : '验证器验证码'}
+                </Label>
+                {recoveryMode ? (
+                  <>
+                    <Input
+                      id='login-totp'
+                      className='h-10 rounded-lg font-mono tracking-widest'
+                      autoComplete='one-time-code'
+                      placeholder='XXXXX-XXXXX'
+                      autoFocus
+                      value={code}
+                      onChange={(e) => setCode(e.target.value)}
+                    />
+                    <p className='text-xs text-muted-foreground'>
+                      输入绑定时保存的一次性恢复码，用掉后即失效。
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <InputOTP
+                      id='login-totp'
+                      maxLength={6}
+                      autoFocus
+                      value={code}
+                      onChange={setCode}
+                      onComplete={(value) => void submitCode(value)}
+                    >
+                      <InputOTPGroup>
+                        {OTP_SLOTS.map((index) => (
+                          <InputOTPSlot key={index} index={index} />
+                        ))}
+                      </InputOTPGroup>
+                    </InputOTP>
+                    <p className='text-xs text-muted-foreground'>
+                      打开验证器 App，输入当前的 6 位数字。
+                    </p>
+                  </>
+                )}
+              </div>
+              {error ? (
+                <p className='text-sm text-destructive' role='alert'>
+                  {error}
+                </p>
+              ) : null}
+              <Button
+                className='mt-2 h-10 w-full rounded-lg font-medium'
+                type='submit'
+                disabled={pending || (!recoveryMode && code.length < 6)}
+              >
+                <ShieldCheck aria-hidden className='size-4' />
+                {pending ? '验证中…' : '验证并登录'}
+              </Button>
+              <div className='flex items-center justify-between text-sm'>
                 <button
                   type='button'
-                  aria-label={showPassword ? '隐藏密码' : '显示密码'}
-                  onClick={() => setShowPassword((v) => !v)}
-                  className='absolute inset-y-0 end-0 flex w-10 items-center justify-center rounded-e-lg text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
+                  className='underline underline-offset-4'
+                  onClick={() => {
+                    setRecoveryMode((v) => !v)
+                    setCode('')
+                    setError('')
+                  }}
                 >
-                  {showPassword ? (
-                    <EyeOff aria-hidden className='size-4' />
-                  ) : (
-                    <Eye aria-hidden className='size-4' />
-                  )}
+                  {recoveryMode ? '用验证器验证码' : '丢了手机？用恢复码'}
+                </button>
+                <button
+                  type='button'
+                  className='text-muted-foreground underline underline-offset-4'
+                  onClick={backToPassword}
+                >
+                  返回
                 </button>
               </div>
-            </div>
-            {hideBase ? null : (
+            </form>
+          ) : (
+            <form className='mt-8 space-y-4' onSubmit={onSubmit}>
               <div className='space-y-2'>
-                <Label htmlFor='login-api-base'>API Base</Label>
+                <Label htmlFor='login-username'>用户名</Label>
                 <Input
-                  id='login-api-base'
-                  placeholder='http://127.0.0.1:8787'
+                  id='login-username'
                   className='h-10 rounded-lg'
-                  value={base}
-                  onChange={(e) => setBase(e.target.value)}
+                  autoComplete='username'
+                  placeholder='输入面板用户名'
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
                 />
               </div>
-            )}
-            {error ? (
-              <p className='text-sm text-destructive' role='alert'>
-                {error}
-              </p>
-            ) : null}
-            <Button
-              className='mt-2 h-10 w-full rounded-lg font-medium'
-              type='submit'
-              disabled={pending}
-            >
-              <LogIn aria-hidden className='size-4' />
-              {pending ? '登录中…' : '登录'}
-            </Button>
-          </form>
+              <div className='space-y-2'>
+                <Label htmlFor='login-password'>密码</Label>
+                <div className='relative'>
+                  <Input
+                    id='login-password'
+                    type={showPassword ? 'text' : 'password'}
+                    className='h-10 rounded-lg pe-10'
+                    autoComplete='current-password'
+                    placeholder='输入密码'
+                    autoFocus
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                  />
+                  <button
+                    type='button'
+                    aria-label={showPassword ? '隐藏密码' : '显示密码'}
+                    onClick={() => setShowPassword((v) => !v)}
+                    className='absolute inset-y-0 end-0 flex w-10 items-center justify-center rounded-e-lg text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
+                  >
+                    {showPassword ? (
+                      <EyeOff aria-hidden className='size-4' />
+                    ) : (
+                      <Eye aria-hidden className='size-4' />
+                    )}
+                  </button>
+                </div>
+              </div>
+              {hideBase ? null : (
+                <div className='space-y-2'>
+                  <Label htmlFor='login-api-base'>API Base</Label>
+                  <Input
+                    id='login-api-base'
+                    placeholder='http://127.0.0.1:8787'
+                    className='h-10 rounded-lg'
+                    value={base}
+                    onChange={(e) => setBase(e.target.value)}
+                  />
+                </div>
+              )}
+              {error ? (
+                <p className='text-sm text-destructive' role='alert'>
+                  {error}
+                </p>
+              ) : null}
+              <Button
+                className='mt-2 h-10 w-full rounded-lg font-medium'
+                type='submit'
+                disabled={pending}
+              >
+                <LogIn aria-hidden className='size-4' />
+                {pending ? '登录中…' : '登录'}
+              </Button>
+            </form>
+          )}
         </div>
       </main>
     </div>

@@ -2,7 +2,7 @@
 
 基址 `/api/panel`。需要**面板登录会话**或 Master `VM2API_API_KEY`。协议密钥不能调面板。信封 `{ ok, data }` / `{ ok: false, error }`。调用方应从 `data` 取业务体。
 
-登录：`POST /api/panel/login` `{ username, password }` → token + Cookie `kin_panel_token`（7 天，HttpOnly）。`POST /api/panel/logout` 撤销。`GET /api/panel/me` → `{ user, role, views, capabilities, version }`。`GET/PUT /onboarding` 为首配进度（见「引导」）。
+登录：`POST /api/panel/login` `{ username, password }` → token + Cookie `kin_panel_token`（7 天，HttpOnly）。账号开了两步验证时返回 401 `{ totp_required: true, challenge }`，需再调 `POST /api/panel/login/totp`（见「两步验证」）。`POST /api/panel/logout` 撤销。`GET /api/panel/me` → `{ user, role, views, capabilities, version }`。`GET/PUT /onboarding` 为首配进度（见「引导」）。
 
 管理台前端固定 `credentials: include`。页面与 API **不同源** 时，须在 API 侧配置受信 Origin：`PANEL_CORS_ORIGINS`（空格或逗号分隔，如 `https://panel.example.com`）和/或 `PUBLIC_BASE_URL` 的 origin。匹配时响应回显该 `Origin`、`Access-Control-Allow-Credentials: true` 与 `Vary: Origin`；未列入的 Origin 仍为 `Access-Control-Allow-Origin: *` 且**不带** credentials（浏览器会拒绝跨源 Cookie 登录）。预检与 JSON/SSE 共用同一 methods/headers 列表（含 `PATCH`）。
 
@@ -19,6 +19,33 @@
 环境变量 `VM2API_ADMIN_USER` / `VM2API_ADMIN_PASSWORD` 只在库里还没有同名用户时灌进第一个 admin；之后以 SQLite `users` 为准，面板「用户」页可增删改、改密码。密码 scrypt。不能删/停用最后一个 admin。
 
 `vms/*.json` 的 `owner_user_id` / `origin`（`platform` \| `admin_assigned` \| `user_created`）是属主 SSOT。`PATCH /vms/:id/owner` 仅 admin。自建 VM 不能收回进平台池。
+
+## 两步验证
+
+可选的 TOTP（RFC 6238：SHA1 / 6 位 / 30 秒 / 前后各容 1 步漂移），**所有角色各自可选开启**，只影响面板登录，API 密钥调用不受影响。状态按用户名存在 SQLite `settings` 键 `panel_2fa:<username>`（小写，与 `users` 表的大小写无关比较一致），没有新表或新列。密钥与恢复码哈希经 `db/secure.mjs`，设了 `VM2API_DB_SECRET` 即为 AES-256-GCM 落盘；轮换过密钥导致无法解密时登录**失败关闭**（500 `totp_secret_unreadable`），不会退化成只要密码。
+
+登录两步：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/login` | `{ username, password, code? }`。密码对但缺第二因素 → 401 `{ ok:false, totp_required:true, challenge, expires_in:300, error:{ code:"totp_required" } }`，**不发**会话。直接带 `code` 可一次完成。 |
+| POST | `/login/totp` | `{ challenge, code }` → 同 `/login` 的成功体。`code` 接受 6 位动态码或一次性恢复码。challenge 是对 `{用户名, 到期}` 的 HMAC 签名（密钥存 `settings` 键 `panel_2fa_challenge_secret`），无服务端会话、重启和多进程都可验；篡改 401 `totp_challenge_invalid`，超时 401 `totp_challenge_expired`。第二步会重读账号，期间被改角色或停用以最新为准（停用 403 `user_disabled`）。 |
+
+自助管理（需面板会话，master API key 不是账号故 403 `panel_session_required`；排在 RBAC 门禁之前，所以 `user` / `super` 也能管自己的）：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/2fa` | `{ enabled, pending, confirmed_at, recovery_total, recovery_remaining, digits, period }`。`pending` = 已生成密钥但未确认，此时登录**不拦**。 |
+| POST | `/2fa/setup` | `{ password }` → `{ secret, uri, digits, period, algorithm }`。`uri` 是 `otpauth://totp/...`。密钥此时未生效，放弃绑定不影响现有登录方式。 |
+| POST | `/2fa/enable` | `{ code }` → 状态 + `recovery_codes[10]`（`XXXXX-XXXXX`，**仅此一次返回**，库里只存哈希）。开启后该账号的其它会话被登出。 |
+| POST | `/2fa/disable` | `{ password, code }` → 清除密钥与恢复码。 |
+| POST | `/2fa/recovery` | `{ password }` → 新的 `recovery_codes[10]`，旧的全部失效。 |
+
+改动第二因素一律要求重新验证密码（`password_required` / `password_invalid`）。
+
+管理员兜底：`DELETE /users/:id/2fa` 仅 admin，清掉目标账号的密钥与恢复码（下次登录只要密码）并登出其会话，用于用户同时丢失验证器与恢复码。`GET /users` 每项附 `two_factor`。
+
+防滥用：同一验证码不能复用——通过记录已用时间步实现，窗口内重放返回 400 `totp_code_reused`；恢复码用后标记失效。验证码连续错 5 次锁 15 分钟（429 `totp_too_many_attempts`，进程内计数）。
 
 ## 引导
 
