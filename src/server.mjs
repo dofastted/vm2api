@@ -20,7 +20,6 @@ import {
   geminiKeyAllowsPath,
   geminiProxyFor,
   callGeminiHost,
-  geminiTurnFromBody,
   isGeminiPublicPath,
 } from './lib/gemini/routes.mjs'
 import {
@@ -947,21 +946,10 @@ const handleKeySelf = createKeySelfHandler({
 })
 
 const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
-  handleGeminiMessages: async (req, res) => {
-    let body
-    try {
-      body = await readBody(req, 256 * 1024)
-    } catch (error) {
-      return json(res, error?.status || 400, error?.body || { error: { code: 'invalid_json', message: 'Invalid JSON body.' } })
-    }
-    const turn = geminiTurnFromBody(body)
-    if (!turn) {
-      return json(res, 400, {
-        error: { code: 'gemini_unsupported_turn', message: 'Send one plain-text turn and a Gemini model id.' },
-      })
-    }
-    return handleGeminiPublic(Object.assign(req, { method: 'POST', url: '/v1/gemini/sessions/messages', body: { model: turn.model, input: turn.text } }), res)
-  },
+  // The public handler routes `/v1/messages` itself and answers in the Anthropic
+  // shape. Rewriting req.url into the session path made the response carry
+  // `id: "messages"` and changed the path the request log attributes.
+  handleGeminiMessages: (req, res) => handleGeminiPublic(req, res),
   admitCragInference: (input) => cragSubscription.admitInference(input),
   json,
   writeSSEHeaders,
@@ -1415,7 +1403,10 @@ const server = http.createServer(async (req, res) => {
           return json(res, 200, { object: 'list', data: catalog.models })
         } catch (error) {
           return json(res, error.status || 503, {
-            error: { code: error.code || 'gemini_host_unavailable', message: error.message || 'Gemini host is not available.' },
+            error: {
+              code: error.code || 'gemini_host_unavailable',
+              message: error.message || 'Gemini host is not available.',
+            },
           })
         }
       }

@@ -583,7 +583,12 @@ test('Gemini public routes schedule one plain-text turn and reject other keys', 
       },
       async complete(request) {
         calls.push(request)
-        return { text: 'ok', usage: { input_tokens: 1, output_tokens: 1 }, account_id: 'gemini-fixture', model: request.model }
+        return {
+          text: 'ok',
+          usage: { input_tokens: 1, output_tokens: 1 },
+          account_id: 'gemini-fixture',
+          model: request.model,
+        }
       },
     },
   })
@@ -595,25 +600,62 @@ test('Gemini public routes schedule one plain-text turn and reject other keys', 
   }
   assert.equal((await handle({ apiKeyKind: 'master', once() {} }, res)).status, 403)
   const listed = await handle(
-    { method: 'GET', url: '/v1/gemini/sessions', apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' }, once() {} },
+    {
+      method: 'GET',
+      url: '/v1/gemini/sessions',
+      apiKeyKind: 'managed',
+      apiKeyRecord: { group_type: 'gemini' },
+      once() {},
+    },
     res,
   )
   assert.equal(listed.status, 200)
   assert.equal(listed.body.data[0].id, 'gemini-3-pro')
   const result = await handle(
-    { method: 'POST', url: '/v1/gemini/sessions/turn-1', apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' }, once() {} },
+    {
+      method: 'POST',
+      url: '/v1/gemini/sessions/turn-1',
+      apiKeyKind: 'managed',
+      apiKeyRecord: { group_type: 'gemini' },
+      once() {},
+    },
     res,
   )
   assert.equal(result.status, 200)
   assert.equal(result.body.output_text, 'ok')
   assert.equal(calls.length, 1)
+  // A Gemini key may also call the Anthropic entry point. That one must answer in the
+  // Anthropic Messages shape, or an Anthropic client cannot read the reply: `output_text`
+  // with no `type` / `role` / `content` is unparseable, and the id must not be the path.
+  for (const url of ['/v1/messages', '/messages']) {
+    const anthropic = await handle(
+      { method: 'POST', url, apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' }, once() {} },
+      res,
+    )
+    assert.equal(anthropic.status, 200)
+    assert.match(anthropic.body.id, /^msg_[0-9a-f]{24}$/)
+    assert.equal(anthropic.body.type, 'message')
+    assert.equal(anthropic.body.role, 'assistant')
+    assert.equal(anthropic.body.model, 'gemini-3-pro')
+    assert.deepEqual(anthropic.body.content, [{ type: 'text', text: 'ok' }])
+    assert.equal(anthropic.body.stop_reason, 'end_turn')
+    assert.deepEqual(anthropic.body.usage, { input_tokens: 1, output_tokens: 1 })
+    assert.equal(anthropic.body.output_text, undefined)
+  }
+  assert.equal(calls.length, 3)
   const bad = createGeminiPublicHandler({
     json: respond,
     readBody: async () => ({ model: 'gemini-3-pro', input: ['not text'] }),
     scheduler: { catalog() {}, complete() {} },
   })
   const rejected = await bad(
-    { method: 'POST', url: '/v1/gemini/sessions/turn-2', apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' }, once() {} },
+    {
+      method: 'POST',
+      url: '/v1/gemini/sessions/turn-2',
+      apiKeyKind: 'managed',
+      apiKeyRecord: { group_type: 'gemini' },
+      once() {},
+    },
     res,
   )
   assert.equal(rejected.status, 400)
@@ -623,17 +665,28 @@ test('Gemini public routes schedule one plain-text turn and reject other keys', 
 test('the public scheduler completes one turn through the host socket', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-public-'))
   const socketPath = path.join(directory, 'control.sock')
-  const account = { id: 'gemini-fixture', auth_state: 'authorized', proxy_id: 'px-fixture', models_discovered: true, models: ['gemini-3-pro'] }
+  const account = {
+    id: 'gemini-fixture',
+    auth_state: 'authorized',
+    proxy_id: 'px-fixture',
+    models_discovered: true,
+    models: ['gemini-3-pro'],
+  }
   const server = http.createServer((request, response) => {
     const chunks = []
     request.on('data', (chunk) => chunks.push(chunk))
     request.on('end', () => {
       const body = JSON.parse(Buffer.concat(chunks).toString() || '{}')
-      const payload = request.url === '/list' ? { environments: [account] }
-        : request.url === '/get' ? account
-        : request.url === '/test-chat' && body.prompt === 'hello' ? { run_id: runId }
-        : request.url === '/test-chat-status' ? { state: 'completed', text: 'ready', usage: { input_tokens: 1, output_tokens: 1 } }
-        : null
+      const payload =
+        request.url === '/list'
+          ? { environments: [account] }
+          : request.url === '/get'
+            ? account
+            : request.url === '/test-chat' && body.prompt === 'hello'
+              ? { run_id: runId }
+              : request.url === '/test-chat-status'
+                ? { state: 'completed', text: 'ready', usage: { input_tokens: 1, output_tokens: 1 } }
+                : null
       response.writeHead(payload ? 200 : 404, { 'Content-Type': 'application/json' })
       response.end(JSON.stringify(payload || { code: 'gemini_host_protocol_error' }))
     })
@@ -648,9 +701,16 @@ test('the public scheduler completes one turn through the host socket', async ()
   })
   try {
     await new Promise((resolve, reject) => server.once('error', reject).listen(socketPath, resolve))
-    const result = await handle({
-      method: 'POST', url: '/v1/gemini/sessions/turn-1', apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' }, once() {},
-    }, { setHeader() {}, once() {} })
+    const result = await handle(
+      {
+        method: 'POST',
+        url: '/v1/gemini/sessions/turn-1',
+        apiKeyKind: 'managed',
+        apiKeyRecord: { group_type: 'gemini' },
+        once() {},
+      },
+      { setHeader() {}, once() {} },
+    )
     assert.equal(result.status, 200)
     assert.equal(result.body.output_text, 'ready')
     assert.equal(result.body.account_id, account.id)

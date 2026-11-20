@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import http from 'node:http'
 import { isIP } from 'node:net'
 import path from 'node:path'
@@ -651,6 +652,24 @@ export function geminiTurnFromBody(body) {
   return MODEL.test(model) && text.trim() ? { model, text } : null
 }
 
+/**
+ * `/v1/messages` answers in the Anthropic Messages shape so an Anthropic client
+ * can read it. Only `input_tokens` / `output_tokens` exist there, so the host's
+ * `total_tokens` is dropped rather than returned under a field the clients ignore.
+ */
+function anthropicMessage(turn) {
+  return {
+    id: `msg_${crypto.randomBytes(12).toString('hex')}`,
+    type: 'message',
+    role: 'assistant',
+    model: turn.model,
+    content: turn.text ? [{ type: 'text', text: turn.text }] : [],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: { input_tokens: turn.usage?.input_tokens || 0, output_tokens: turn.usage?.output_tokens || 0 },
+  }
+}
+
 export function createGeminiPublicHandler({ json, readBody, scheduler }) {
   return async function handleGeminiPublic(req, res) {
     res.setHeader('Cache-Control', 'no-store')
@@ -674,7 +693,12 @@ export function createGeminiPublicHandler({ json, readBody, scheduler }) {
       }
     }
     const session = /^\/v1\/gemini\/sessions\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/.exec(url.pathname)
-    if (req.method !== 'POST' || !session) return json(res, 404, { error: { code: 'not_found', message: 'not found' } })
+    // A Gemini key may also call the Anthropic entry point; that one answers in the
+    // Anthropic Messages shape, not in this route's own session shape.
+    const messages = url.pathname === '/v1/messages' || url.pathname === '/messages'
+    if (req.method !== 'POST' || !(session || messages)) {
+      return json(res, 404, { error: { code: 'not_found', message: 'not found' } })
+    }
     let body = req.body
     if (body == null) {
       try {
@@ -695,7 +719,13 @@ export function createGeminiPublicHandler({ json, readBody, scheduler }) {
       if (!res.writableEnded) controller.abort()
     })
     try {
-      const turn = await scheduler.complete({ model: requested.model, text: requested.text, signal: controller.signal, apiKeyRecord: req.apiKeyRecord })
+      const turn = await scheduler.complete({
+        model: requested.model,
+        text: requested.text,
+        signal: controller.signal,
+        apiKeyRecord: req.apiKeyRecord,
+      })
+      if (messages) return json(res, 200, anthropicMessage(turn))
       return json(res, 200, {
         id: session[1],
         model: turn.model,
