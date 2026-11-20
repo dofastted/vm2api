@@ -38,14 +38,12 @@ function snapshot(name: string): StatisticsData {
       { id: 'model-b', name: `${name}-对照`, dataKey: 'model-b' },
     ],
     metrics: {
-      cost: [
-        { bucket: '2026-11-21T00:00:00.000Z', 'model-a': 2, 'model-b': 1 },
-      ],
+      cost: [{ date: '2026-11-21T00:00:00.000Z', 'model-a': 2, 'model-b': 1 }],
       requests: [
-        { bucket: '2026-11-21T00:00:00.000Z', 'model-a': 1, 'model-b': 1 },
+        { date: '2026-11-21T00:00:00.000Z', 'model-a': 1, 'model-b': 1 },
       ],
       tokens: [
-        { bucket: '2026-11-21T00:00:00.000Z', 'model-a': 10, 'model-b': 4 },
+        { date: '2026-11-21T00:00:00.000Z', 'model-a': 10, 'model-b': 4 },
       ],
     },
     seriesTotals: {
