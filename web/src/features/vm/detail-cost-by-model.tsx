@@ -37,7 +37,7 @@ export function VmCostByModel({
       <CardHeader className={compact ? 'px-3.5' : undefined}>
         <CardTitle className='text-sm'>按模型费用</CardTitle>
         <p className='text-xs text-muted-foreground'>
-          官方价 · 累计 · 按计费档位拆分
+          官方价 · 保留日志 · 按计费档位拆分
         </p>
       </CardHeader>
       <CardContent

@@ -7,6 +7,7 @@ import {
   usageAccountForVm,
   vmTotalCost,
 } from '@/lib/vm-usage'
+import { vmCostLedger } from './vm-usage'
 
 describe('billingRowSlot', () => {
   const byId = new Map<string, Vm>([
@@ -81,5 +82,16 @@ describe('GPT vm-id usage rows are live when the slot has no uuid', () => {
     }
     expect(isLeftoverUsageRow(leftover, claude)).toBe(true)
     expect(usageAccountForVm(claude, [leftover])).toBeNull()
+  })
+})
+
+describe('vm cost ledger labels', () => {
+  it('names the account total separately from retained model costs', () => {
+    const rows = vmCostLedger({
+      id: 'vm-1',
+      total_cost: 4,
+      total_tokens: 9,
+    } as never)
+    expect(rows.map((row) => row.label)).toEqual(['5H', '7D', '账号总计'])
   })
 })
