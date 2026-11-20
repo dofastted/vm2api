@@ -312,6 +312,76 @@ test('egress_down does not mark a live SOCKS proxy dead', async () => {
   }
 })
 
+function holdFixture(t) {
+  const root = tmpDir()
+  const vms = path.join(root, 'vms')
+  fs.mkdirSync(vms)
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  return {
+    root,
+    save: (record) => fs.writeFileSync(path.join(vms, `${record.id}.json`), JSON.stringify(record)),
+    get: (id) => JSON.parse(fs.readFileSync(path.join(vms, `${id}.json`), 'utf8')),
+    held: (id, detail) => ({
+      id,
+      status: 'running',
+      schedulable: false,
+      proxy: { id: 'proxy-b' },
+      schedule_hold: { reason: 'proxy_cooldown', detail, at: new Date().toISOString() },
+    }),
+  }
+}
+
+for (const [label, message] of [
+  ['a probe failure', 'proxy_probe_failed:proxy_auth_failed'],
+  ['an egress outage', 'egress_down'],
+  ['a legacy marker', 'slot stopped |proxy=proxy-a'],
+]) {
+  test(`a stale ${label} hold from a previous binding is lifted by the current proxy (#1395)`, (t) => {
+    const f = holdFixture(t)
+    // The hold was written while the slot was bound to proxy-a; it is on proxy-b now.
+    f.save(f.held('vm-rebound', { tag: 'proxy-a', message }))
+    reconcileProxyScheduleHold(f.root, 'vm-rebound', 'proxy-b')
+    const after = f.get('vm-rebound')
+    assert.equal(after.schedule_hold, undefined, `${message} must not outlive its proxy`)
+    assert.equal(after.schedulable, true)
+  })
+}
+
+test('a stale proxy hold survives when it was manual or belongs to another reason (#1395)', (t) => {
+  const f = holdFixture(t)
+  // Manual intent is not a probe verdict, so no probe may lift it.
+  f.save(f.held('vm-manual', { tag: 'proxy-a', message: 'proxy_manually_disabled' }))
+  reconcileProxyScheduleHold(f.root, 'vm-manual', 'proxy-b')
+  assert.equal(f.get('vm-manual').schedule_hold?.detail.message, 'proxy_manually_disabled')
+  assert.equal(f.get('vm-manual').schedulable, false)
+
+  // A hold owned by another subsystem stays untouched.
+  f.save({
+    id: 'vm-maint',
+    status: 'running',
+    schedulable: false,
+    proxy: { id: 'proxy-b' },
+    schedule_hold: { reason: 'maintenance', detail: { tag: 'migration:1' }, at: new Date().toISOString() },
+  })
+  reconcileProxyScheduleHold(f.root, 'vm-maint', 'proxy-b')
+  assert.equal(f.get('vm-maint').schedule_hold?.reason, 'maintenance')
+
+  // An unrecognised automatic message is not assumed liftable either.
+  f.save(f.held('vm-opaque', { tag: 'proxy-a', message: 'something_else' }))
+  reconcileProxyScheduleHold(f.root, 'vm-opaque', 'proxy-b')
+  assert.equal(f.get('vm-opaque').schedule_hold?.detail.message, 'something_else')
+})
+
+test('a hold left by a previous proxy is retagged when the current one also fails (#1395)', (t) => {
+  const f = holdFixture(t)
+  f.save(f.held('vm-failing', { tag: 'proxy-a', message: 'proxy_probe_failed:proxy_auth_failed' }))
+  reconcileProxyScheduleHold(f.root, 'vm-failing', 'proxy-b', 'proxy_probe_failed:not_listening')
+  const hold = f.get('vm-failing').schedule_hold
+  assert.equal(hold.detail.tag, 'proxy-b', 'the hold must describe the binding it now applies to')
+  assert.equal(hold.detail.message, 'proxy_probe_failed:not_listening')
+  assert.equal(f.get('vm-failing').schedulable, false)
+})
+
 test('a failed host helper only restricts its local consumers and healthy probes clear persisted holds', async (t) => {
   const a = await listenSocks()
   const b = await listenSocks()
