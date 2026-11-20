@@ -271,6 +271,46 @@ test('resolveSlotState: unschedulable > off > restricted > on', () => {
   assert.equal(resolveSlotState({ vm: { schedulable: true }, availability: { key: 'ok' } }).schedule_state, 'on')
 })
 
+test('resolveSlotState paints a spent kernel-recovery budget as 受限 · 内核故障', () => {
+  const now = Date.now()
+  const fault = resolveSlotState({
+    vm: { schedulable: true, status: 'running' },
+    availability: { key: 'ok', accept: true },
+    kernelFaulted: true,
+    now,
+  })
+  assert.equal(fault.schedule_state, 'restricted')
+  assert.equal(fault.restriction_reason, 'kernel_faulted')
+  assert.equal(fault.restriction_text, '内核故障')
+  assert.equal(fault.restriction_until, null, 'no wall-clock promise: the watchdog clears it by itself')
+  // Stronger verdicts keep their own reason.
+  const revoked = resolveSlotState({
+    vm: { schedulable: true, status: 'running', unschedulable: { reason: 'oauth_revoked', detail: null, at: now } },
+    availability: { key: 'ok' },
+    kernelFaulted: true,
+    now,
+  })
+  assert.equal(revoked.schedule_state, 'unschedulable')
+  assert.equal(revoked.unschedulable_reason, 'oauth_revoked')
+  const off = resolveSlotState({
+    vm: { schedulable: true, status: 'running', schedule_off: true },
+    availability: { key: 'ok' },
+    kernelFaulted: true,
+    now,
+  })
+  assert.equal(off.schedule_state, 'off', 'operator intent is kept; the fault only matters while scheduling')
+  // Seats still outrank the fault in the new_session band.
+  const seats = resolveSlotState({
+    vm: { schedulable: true, status: 'running' },
+    availability: { key: 'ok' },
+    kernelFaulted: true,
+    seats: { used: 4, max: 4 },
+    now,
+  })
+  assert.equal(seats.schedule_state, 'restricted')
+  assert.equal(seats.restriction_reason, 'kernel_faulted', 'the kernel fault is the stronger verdict: seated or not, the CLI is down')
+})
+
 test('resolveSlotState does not call a down slot 调度开', () => {
   const stopped = resolveSlotState({
     vm: { schedulable: true, status: 'stopped' },

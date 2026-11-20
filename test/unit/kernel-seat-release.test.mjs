@@ -478,7 +478,13 @@ for (const all of [false, true]) {
 linuxTest('install API can release a seat without granting subscription authorization privileges', async (t) => {
   const { root, vm } = fixture(t)
   const life = operations(root)
-  life.subscription.authorizeInstall = () => assert.fail('API key requests cannot authorize a new subscription binding')
+  // Deploy (fix/crag-master-bind): the master key may bind a seat, so the CRAG
+  // install reaches authorizeInstall; the fixture refuses it there.
+  let authorized = 0
+  life.subscription.authorizeInstall = () => {
+    authorized += 1
+    throw Object.assign(new Error('fixture refuses the binding'), { code: 'license_required' })
+  }
   const response = await panel(root, life)('POST', '/kernels/install', { targets: [{ id: vm.id, kernel: 'cli-node' }] })
   assert.equal(response.body.data.ok, true, JSON.stringify(response.body))
   assert.deepEqual(life.events, ['stop', 'release', 'start'])
@@ -489,6 +495,7 @@ linuxTest('install API can release a seat without granting subscription authoriz
   })
   assert.equal(unauthorized.body.data.ok, false)
   assert.equal(unauthorized.body.data.items[0].code, 'license_required')
+  assert.equal(authorized, 1)
   assert.deepEqual(life.events, ['stop', 'release', 'start'])
 })
 
