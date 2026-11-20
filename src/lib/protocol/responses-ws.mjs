@@ -615,7 +615,10 @@ export function createResponsesWsHandler({
           }
           if (bridge.terminal === 'completed') {
             const snap = bridge.snapshot()
-            if (snap && !isProtocolWarmup(decoded.body)) {
+            // A warmup settles with an id the client may continue from, so it
+            // enters the replay cache like any other hop. The cache still lives
+            // only on this connection: `store` never turns into persistence.
+            if (snap) {
               replay.remember(snap.id, { input: hopBody.input, output: snap.output })
             }
             continue
