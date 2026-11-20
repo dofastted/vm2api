@@ -39,7 +39,7 @@ export const TOKEN_UA_AXIOS = 'axios/1.15.2'
 export const BETA_OAUTH = 'oauth-2025-04-20'
 /** Per-request ceiling for every exchange hop; one slow hop must not time out the flow. */
 export const OAUTH_REQUEST_TIMEOUT_MS = 60_000
-/** claude.ai app origin + referer the cookie stages are opened from (sub2api style). */
+/** claude.ai app origin and referer used for the cookie-based authorization steps. */
 export const CLAUDE_AI_ORIGIN = 'https://claude.ai'
 export const CLAUDE_AI_REFERER = 'https://claude.ai/new'
 /**

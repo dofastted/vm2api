@@ -280,7 +280,7 @@ function withUpstreamStream(claude) {
 
 /**
  * Downstream SSE only when the caller asked for it.
- * Anthropic / OpenAI default: omitted `stream` is JSON. NewAPI health probes
+ * Anthropic / OpenAI default: omitted `stream` is JSON. Some health probes
  * omit the field (Go omitempty) and then json.Unmarshal the body — SSE
  * (`event:…`) becomes `invalid character 'e' looking for beginning of value`.
  * An omitted `stream` streams only when Accept prefers SSE over JSON. Claude
@@ -934,8 +934,8 @@ export function fromClaudeToOpenAIChat(claude, requestedModel, vmId, mode = 'con
 }
 
 /**
- * Claude usage → OpenAI Chat usage with cache detail
- * (sub2api apicompat ChatTokenDetails counterpart: cached_tokens / cache_creation_tokens).
+ * Convert Claude usage to OpenAI Chat usage with cache details
+ * (`cached_tokens` / `cache_creation_tokens`).
  * Anthropic input is uncached; details are added to form inclusive prompt_tokens.
  * OpenAI-inclusive usage is passed through without adding cache again.
  * reasoning_tokens is a subset of completion_tokens and is never added to it.

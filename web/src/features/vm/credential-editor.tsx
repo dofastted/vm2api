@@ -118,8 +118,8 @@ function CredentialDialog({
         <DialogHeader>
           <DialogTitle>编辑槽位凭证</DialogTitle>
           <DialogDescription>
-            sub2api 账号 JSON，至少含 access_token 或
-            refresh_token。写入只换票， 不会触发官方 Claude Code 初装。
+            账号导出的 JSON，至少含 access_token 或 refresh_token。写入只换票，
+            不会触发官方 Claude Code 初装。
           </DialogDescription>
         </DialogHeader>
 

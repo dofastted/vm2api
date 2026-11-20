@@ -4,11 +4,10 @@
 
 ## 1. 证据身份
 
-- 参考目录：`D:\AgentDock\deliverables\redact-analysis`，WSL 路径 `/mnt/d/AgentDock/deliverables/redact-analysis`。
 - ZIP：`redact-source-and-roadmap.zip`，355 个成员，SHA-256 `b1ce4b6fcdad1096dcf914394b008e60a990451204aafc36ef2690eefc4c81c2`，与原 `ARCHIVE.sha256` 一致。
-- 本轮验证 ZIP CRC、成员唯一性与路径安全；`internal/redact`、`internal/masking`、`internal/gwmw`、`plugins/redact` 范围共 54 个归档文件与 AgentDock 当前对应文件逐字节相同。
+- 本轮验证 ZIP CRC、成员唯一性与路径安全；`internal/redact`、`internal/masking`、`internal/gwmw`、`plugins/redact` 范围共 54 个归档文件与对应参考源码逐字节相同。
 - 原 `README.zh-CN.md`、`TECHNICAL-ROUTE.zh-CN.md`、`verification.txt` 及归档保持原样。本轮运行记录在本目录 `verification.md`，不借用上轮测试结果。权威设计在 vm2api 的 `docs/redaction/`，本轮原外部设计副本已移除。
-- 下文 `engine/...` 相对于 `/mnt/d/AgentDock`；`src/...`、`web/...` 相对于 `/mnt/x/vm2api`。
+- 下文 `engine/...` 是来源快照中的历史路径，不是仓库内 Go 脱敏引擎的路径。仓库内引擎位于 `redact/internal/engine`；`src/...`、`web/...` 相对于 vm2api 仓库根目录。
 - 代码图用于导航，事实以源码读取为准。Rust codegraph 本轮返回 `Session terminated`；CGC 可用，但有旧行号与同名函数误关联。LSP 已用于查询配置工厂引用，返回只含声明，因此没有以该结果声称调用链完整。
 
 ## 2. 可复用 Go 核心

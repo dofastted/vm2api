@@ -109,7 +109,7 @@ test('officialMessagesBody drops annotations after role remap', () => {
   assert.equal(out.messages[1].content[0].annotations, undefined)
 })
 
-test('sanitize remaps unknown Anthropic roles to user (sub2api admin→user)', () => {
+test('sanitize remaps unknown Anthropic roles such as admin to user', () => {
   const out = sanitizeAnthropicBody({
     model: 'claude-sonnet-5',
     max_tokens: 1024,

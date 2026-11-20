@@ -1,13 +1,13 @@
 /**
- * Account runtime state — facade over two tables (sub2api SSOT split).
+ * Account runtime state — facade over persistent and transient state tables.
  *
  * Persistent scheduling fields (priority, cooldown → temp_unschedulable_*,
  * rate_limited_at / rate_limit_reset_at / overload_until, session_window_*,
- * last_used_at, load_factor) live on `accounts` as ISO-8601 TEXT, matching
- * the sub2api Account columns. High-frequency worker transients (heartbeat,
- * worker status, per-model cooldowns, credential generation) live in the thin
- * `account_runtime` table. Callers keep the historical merged-state shape
- * with ms-epoch numbers; conversion happens here.
+ * last_used_at, load_factor) live on `accounts` as ISO-8601 TEXT.
+ * High-frequency worker transients (heartbeat, worker status, per-model
+ * cooldowns, credential generation) live in the thin `account_runtime` table.
+ * Callers keep the historical merged-state shape with ms-epoch numbers;
+ * conversion happens here.
  */
 
 import { getDb } from '../database.mjs'
@@ -217,9 +217,9 @@ export class AccountRuntimeRepo {
   }
 
   /**
-   * Structured rate-limit / session-window write-through
-   * (sub2api account.rate_limited_at / rate_limit_reset_at / overload_until /
-   *  session_window_* counterpart). Only provided fields are updated.
+   * Write through structured rate-limit and session-window fields on `accounts`
+   * (rate_limited_at / rate_limit_reset_at / overload_until / session_window_*).
+   * Only provided fields are updated.
    */
   updateWindow(
     accountId,
@@ -267,7 +267,7 @@ export class AccountRuntimeRepo {
       current.status = status
       current.cooldown_until = Number(until) || null
       current.cooldown_reason = reason || null
-      // Structured mirror of the protocol-level limit (sub2api account columns).
+      // Mirror the protocol-level limit in the account's rate-limit fields.
       // overload_until is only the 529 hard column (RateLimitService.handle529).
       // A 502 failover also uses reason provider_overloaded for 15s; writing it
       // here paints every hopped VM as 过载冷却 and removes them from the pool.

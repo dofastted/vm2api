@@ -114,7 +114,7 @@ const DUMMY_THINKING_SIGNATURES = new Set(['', 'skip_thought_signature_validator
 
 export function hasUsableThinkingSignature(signature) {
   const value = String(signature || '').trim()
-  // Truncated SSE signatures look present but fail Anthropic checksum (sub2api pre-filter).
+  // Truncated SSE signatures look present but fail the Anthropic checksum.
   if (!value || value.length < 24) return false
   return !DUMMY_THINKING_SIGNATURES.has(value)
 }
@@ -242,7 +242,7 @@ export function alignSamplingWithThinking(body = {}, { drop = false } = {}) {
 
 /**
  * Drop history thinking blocks Anthropic would reject.
- * Opus / Sonnet / Haiku 5.5 follow sub2api: one invalid block drops the whole
+ * For Opus / Sonnet / Haiku 5.5, one invalid block drops the whole
  * signed chain, including later valid thinking and redacted_thinking. Turns
  * left with no content are dropped. redacted_thinking stays when it carries
  * data on 5.5, otherwise when its signature is usable. The preserve path
@@ -476,7 +476,7 @@ export function sanitizeAnthropicBodyForBetaTokens(body = {}, anthropicBetaHeade
   return downgradeUngatedThinkingDisplay(out, anthropicBetaHeader)
 }
 
-/** sub2api normalizeClaudeOAuthRequestBody defaults (temperature / empty tools). */
+/** Fill missing Claude OAuth body defaults for temperature and tools. */
 export function ensureClaudeOAuthBodyDefaults(body = {}, { dropSampling = false } = {}) {
   const out = body && typeof body === 'object' ? body : {}
   // A drop retry must not refill what the upstream just refused.

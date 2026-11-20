@@ -31,7 +31,7 @@ export function thinkingDisplayMode(routing) {
  * Official (Aug 2026):
  *   Adaptive: Opus 4.6+, Sonnet 4.6+, Opus 4.7/4.8/5, Sonnet 5, Fable 5, Mythos
  *   Manual enabled+budget only: Haiku 4.5, Sonnet/Opus 4.5 and earlier
- *   OAuth (sub2api): Claude 5 / Fable / Opus 4.7+ keep thinking.enabled as-is.
+ *   OAuth: Claude 5 / Fable / Opus 4.7+ keep thinking.enabled as-is.
  * Client RikkaHub etc. send adaptive even on Haiku -> 400; convert only there.
  */
 

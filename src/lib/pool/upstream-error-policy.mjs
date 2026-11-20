@@ -527,7 +527,7 @@ function classifyUpstreamResultRaw(
     }
   }
   // Plan limit arrives as 429, as a kernel 502 provider_error, or (pre-restore)
-  // as 200 + SSE error. The text decides, not the status (sub2api handle429).
+  // as 200 + SSE error. The text decides, not the status.
   if (isPlanLimitMessage(message)) {
     return {
       scope: 'account',
@@ -875,7 +875,7 @@ function rectifyMessageContent(content, role) {
   return next.length ? next : placeholderContent(role)
 }
 
-/** Convert every thinking block to text and disable top-level thinking (sub2api retry). */
+/** Convert every thinking block to text and disable top-level thinking before retrying. */
 export function repairAnthropicRequest(body = {}, policy = {}) {
   if (policy.action !== 'repair-and-retry') return body
   const reason = String(policy.reason || '')

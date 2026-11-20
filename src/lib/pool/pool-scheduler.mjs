@@ -1637,7 +1637,7 @@ export class PoolScheduler extends EventEmitter {
     workerStatus: knownHealth = undefined,
     admission = false,
   }) {
-    // sub2api IsSchedulable: rate_limit_reset_at / overload_until gate before any
+    // rate_limit_reset_at / overload_until gate scheduling before any
     // passive Extra reading or health hop. Pins are diagnostics and still reach the slot.
     const hardBlock = pinned ? null : hardBlockOf(state, now)
     if (hardBlock) return { ok: false, reason: hardBlock.reason, until: hardBlock.until }
@@ -2753,7 +2753,7 @@ export class PoolScheduler extends EventEmitter {
   clearQuotaRestriction(vm, accountId, file, state = undefined) {
     if (state === undefined) state = this.runtimeRepo?.get?.(accountId)
     // A live 429 block lifts only on its reset or an `allowed` header, never
-    // from a passive Extra re-read (sub2api ClearRateLimit via UpdateSessionWindow).
+    // from re-reading passive usage data.
     if (hardBlockOf(state)) return false
     const reason = state?.cooldown_reason || vm.claude?.temp_unschedulable_reason || vm.temp_unschedulable_reason
     if (reason && !isAccountRestrictionReason(reason) && !isQuotaWindowReason(reason)) return false

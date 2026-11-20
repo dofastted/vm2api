@@ -39,7 +39,7 @@ test('account runtime state persists account and model cooldowns', () => {
   }
 })
 
-test('account cooldown mirrors structured rate-limit columns (sub2api style)', () => {
+test('account cooldown mirrors structured rate-limit columns', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-runtime-repo-'))
   const db = createDatabase({ dataDir: dir })
   try {

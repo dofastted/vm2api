@@ -1,5 +1,5 @@
 /**
- * Claude Code 1M context selector — sub2api OAuth judgments.
+ * Claude Code 1M context selection for OAuth requests.
  *
  * [1m] is a client-side suffix (not an upstream model id).
  * Official Claude Code passes context-1m-2025-08-07 when:
@@ -15,7 +15,7 @@
 export const CONTEXT_1M_BETA = 'context-1m-2025-08-07'
 export const CLAUDE_CODE_1M_SUFFIX = '[1m]'
 
-/** Seed / reset default. Same as sub2api: sonnet-5 exact + dated/thinking suffix. */
+/** Seed / reset default: exact Sonnet 5 ID plus dated and thinking variants. */
 export const DEFAULT_CONTEXT_1M_WHITELIST = Object.freeze(['claude-sonnet-5', 'claude-sonnet-5-*'])
 
 export function stripClaudeCode1mSuffix(model = '') {

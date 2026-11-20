@@ -14,7 +14,7 @@ import {
 import { mergeGuestFingerprint } from '../../src/lib/vm/guest-identity.mjs'
 import { loadVmIdentity } from '../../src/lib/identity/vm-identity.mjs'
 
-test('sub2api-style prefix treats vscode / cowork / desktop as official UA', () => {
+test('claude-cli prefix treats vscode / cowork / desktop as official UA', () => {
   assert.equal(isOfficialClaudeUa('claude-cli/2.1.234 (external, cli)'), true)
   assert.equal(isOfficialClaudeUa('claude-cli/2.1.234 (external, sdk-cli)'), true)
   assert.equal(isOfficialClaudeUa('claude-cli/2.1.241 (external, claude-vscode, agent-sdk/0.3.241)'), true)
@@ -142,7 +142,7 @@ test('official sonnet-5 keeps context-1m; others and unofficial drop it', () => 
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('official empty beta uses sub2api DefaultBetaHeader; unofficial uses full mimicry set', () => {
+test('empty beta uses the default header for official clients and the full set for unofficial clients', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-def-'))
   const official = resolveCrsHeaders(
     {

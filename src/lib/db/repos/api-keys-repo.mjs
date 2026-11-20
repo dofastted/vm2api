@@ -2,7 +2,7 @@
  * api_keys repository — persistence for managed client API keys.
  * Pure SQL layer; business rules stay in lib/api-keys.mjs (ApiKeyStore).
  *
- * sub2api-shaped: user_id/group_id ownership, USD quota (quota/quota_used)
+ * Keys have user_id/group_id ownership and a USD quota (quota/quota_used)
  * plus 5h/1d/7d USD rate-limit windows. The legacy request-count quota pair
  * is quota_requests / quota_requests_used. Soft delete via deleted_at.
  */
@@ -158,7 +158,7 @@ export class ApiKeysRepo {
   }
 
   /**
-   * Sub2api APIKey window semantics: a window opens at first spend; once
+   * An API key's spending window opens at first spend; once
    * now - start >= size the window resets (usage=cost, start=now).
    */
   _rollWindow(rec, key, cost, nowMs) {

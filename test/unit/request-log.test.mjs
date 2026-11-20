@@ -887,7 +887,7 @@ test('windowStats treats 429 quota/rate-limit as SLA success', () => {
   assert.equal(w.error_collection.by_class[0].id, 'rate_limit')
 })
 
-test('windowStats treats ingress auth failures as SLA success like sub2api', () => {
+test('windowStats treats ingress auth failures as SLA success', () => {
   const store = tmpStore('normal')
   logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
   logOne(store, {
@@ -912,7 +912,7 @@ test('windowStats treats ingress auth failures as SLA success like sub2api', () 
   assert.equal(w.error_collection.by_class[0].owner, 'client')
 })
 
-test('windowStats ignores client abort like sub2api ignore_context_canceled', () => {
+test('windowStats excludes client aborts from error counts', () => {
   const store = tmpStore('normal')
   logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
   logOne(store, { status: 200, error_code: 'client_cancelled', error_message: 'ECONNRESET', model: 'claude-sonnet-5' })

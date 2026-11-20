@@ -335,7 +335,7 @@ export function evaluateAccount({
     )
   }
 
-  // sub2api IsSchedulable: live rate_limit_reset_at / overload_until win over passive Extra.
+  // Live rate_limit_reset_at / overload_until take precedence over passive usage data.
   if (hardBlock?.until > now) {
     const overloaded = hardBlock.reason === 'overloaded'
     return finish(base, {

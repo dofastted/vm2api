@@ -408,7 +408,7 @@ export function assistantStopReason(result = {}) {
 }
 
 /**
- * sub2api: message_stop ends the stream even when the body has no visible text.
+ * message_stop ends the stream even when the body has no visible text.
  * Without that terminal event, stop_reason plus visible text/tool/refusal is required.
  * Thinking-only and a bare stop_reason are not complete.
  */

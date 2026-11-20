@@ -502,7 +502,7 @@ attempts：每次选中的 VM/账号、错误域、cooldown、提交边界、终
 
 仅 admin。POST/PATCH 字段：`name`（1–40）、`enabled`、`vm_ids`（整表替换；省略则不动成员）。槽不存在 400 `vm_pool_vm_unknown`；槽已在别的池 409 `vm_in_other_pool`；重名 409 `vm_pool_name_taken`。仍有密钥绑定时 DELETE 409 `vm_pool_in_use`，不会把这些密钥放开成全局。
 
-### 协议字段（对齐 Sub2API usage_logs）
+### 协议字段
 
 | 字段 | 说明 |
 |------|------|

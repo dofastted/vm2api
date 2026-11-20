@@ -73,7 +73,7 @@ test('generateAuthUrl setup_token mints an inference-only token on the CLI conse
   assert.equal(session.source, 'oauth-setup-token')
 })
 
-test('buildAuthorizationURL matches sub2api parameter order', () => {
+test('buildAuthorizationURL starts with code, client_id, and response_type in order', () => {
   const url = buildAuthorizationURL('st', 'ch')
   assert.ok(url.startsWith(`${AUTHORIZE_URL}?code=true&client_id=${CLIENT_ID}&response_type=code`))
 })

@@ -1,5 +1,5 @@
 /**
- * users repository — sub2api-shaped users table.
+ * Repository for console user records.
  *
  * Superset of the old PanelUsersRepo contract: console operators are now
  * first-class users with balance/concurrency. `enabled` is projected from
@@ -117,7 +117,7 @@ export class UsersRepo {
     return this.getById(rec.id)
   }
 
-  /** Soft delete (sub2api SoftDeleteMixin semantics). */
+  /** Soft-delete the user by setting `deleted_at`. */
   remove(id) {
     const now = new Date().toISOString()
     return this._softDelete.run(now, now, id).changes > 0

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # vm2api 一键安装 / 更新
-# 参考 sub2api deploy/install.sh 与 CLIProxyAPI installer：
+# 更新流程：
 #   查 GitHub Release → 停服务 → 换版本 → 保留配置 → 拉起。
 #
 # 安装:

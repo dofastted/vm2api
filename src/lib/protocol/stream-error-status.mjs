@@ -5,9 +5,9 @@ const AUTH_ERROR_TEXT =
 const PERMISSION_ERROR_TEXT = /organization does not have access to claude/i
 
 /**
- * The kernel cli-hop answers 200 and then streams `event: error` (sub2api
- * sseStreamErrorEventError). Before any downstream byte, restore the HTTP
- * status the upstream meant so the pool classifies it like a real response.
+ * The kernel cli-hop returns 200 and then streams `event: error`. Restore the
+ * intended upstream HTTP status before sending any downstream bytes so the
+ * pool classifies the failure like a real response.
  */
 export function semanticStatusForStreamError(errorBody) {
   const type = String(errorBody?.error?.type || errorBody?.type || '')

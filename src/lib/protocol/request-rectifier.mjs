@@ -1,5 +1,5 @@
 /**
- * Unofficial Anthropic request rectifier (sub2api FilterThinking / retry-filter analog).
+ * Request repair for unofficial Anthropic clients.
  *
  * Official Claude Code may send assistant prefill and incomplete tool turns on purpose.
  * These fixes run on unofficial clients, plus always-on output_config schema fill.
@@ -293,7 +293,7 @@ export function rectifyUnofficialRequest(body = {}) {
   return flattenUndeclaredSearchHistory(ensureOutputConfigSchema(stripIllegalCacheControlFields(clone(body))))
 }
 
-/** Retry-only (upstream 400 prefill / unpaired tool_use). sub2api does not do this on first hop. */
+/** Retry-only after an upstream 400 for prefill or unpaired tool_use. */
 export function rectifyUnofficialRequestForRetry(body = {}) {
   let out = clone(body)
   out = stripIllegalCacheControlFields(out)

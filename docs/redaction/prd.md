@@ -2,11 +2,11 @@
 
 ## Goal
 
-为 **vm2api 当前仓库**设计可开启/关闭的脱敏插件：在 **Node 请求清洗阶段**处理关键敏感元素，提供 **Web 控制面板**管理开关、类别和规则，并完成必要的响应还原。复用 AgentDock/magpie 的 Go 核心行为，不另造正则体系或通用插件平台。本轮交付设计，不实现、不部署。
+为 **vm2api 当前仓库**设计可开启/关闭的脱敏插件：在 **Node 请求清洗阶段**处理关键敏感元素，提供 **Web 控制面板**管理开关、类别和规则，并完成必要的响应还原。由本机 helper 运行仓库内置的 Go 脱敏引擎，不另造正则体系或通用插件平台。本轮交付设计，不实现、不部署。
 
 ## Confirmed facts
 
-- 用户明确要求放在当前 vm2api 仓库，接在 Node 清洗链路，并包含 Web 控制面板；`D:\AgentDock\deliverables\redact-analysis` 仅为参考材料目录，不是交付/安装位置。
+- 交付位置是当前 vm2api 仓库；功能接入 Node 清洗链路，并包含 Web 控制面板。
 - 参考材料包含可逆文本/JSON 脱敏、工具参数/签名保护、SSE 还原及可选模型；Go `internal` 限制、进程全局映射和 40-bit 标签等行为不能直接视为多租户安全契约。
 - vm2api 的 Claude native、API backend、Codex HTTP/WS、auto 分类请求需要逐路径核对；不能把 Node 中间对象当成最终厂商 wire 的证据。
 - 权威资料统一位于 `docs/redaction/`；本地 Trellis 任务仅记录状态并链接到这里。参考源码、ZIP、原校验清单保持原样。

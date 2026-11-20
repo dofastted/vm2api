@@ -103,7 +103,7 @@ export const IGNORED_ERROR_CODES = new Set([
 
 /**
  * Client ingress auth (missing / unknown / disabled / expired sk-kin).
- * Same cut as sub2api MarkIngressRejected: visible in logs, not an ops/SLA failure.
+ * Log these rejections without counting them as operational or SLA failures.
  */
 export const INGRESS_AUTH_ERROR_CODES = new Set([
   'auth_failed',
