@@ -148,7 +148,7 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
       <VmMemoryBlock vm={vm} />
 
       <div className='grid gap-2 sm:grid-cols-2'>
-        <Section title='今日'>
+        <Section title='今日 · 北京时间'>
           <div className='flex items-baseline justify-between'>
             <span className='text-lg leading-tight font-semibold tabular-nums'>
               {fmtUsd(today.today, 2)}
