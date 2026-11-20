@@ -1,7 +1,7 @@
 {
   "repo": "dofastted/vm2api",
   "release": "payload-2026.11.20-native-stdin",
-  "crag_release": "payload-2026.11.20-crag-3.1.9",
+  "crag_release": "payload-2026.11.20-crag-3.1.10",
   "crag_authorization": {
     "family": "crag",
     "product": "crag-v2",
@@ -119,15 +119,15 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2",
-      "asset": "crag-v2-amd64-v3.1.9-crag-v2",
+      "asset": "crag-v2-amd64-v3.1.10-crag-v2",
       "size": 894472,
-      "sha256": "1e88aedd731100b502715c4132536fdd52855245f289b9bf52e3004d2dbf0065"
+      "sha256": "5621c9417748160ee6844c42f8dda3e011770eb211468ada91a25424b25431c6"
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2.payload.enc",
-      "asset": "crag-v2-amd64-v3.1.9-crag-v2.payload.enc",
-      "size": 13164836,
-      "sha256": "3aa8e01068f5f0ae783932f2399c5a747b3ba6284cb16014300fb1990a6cbbcb"
+      "asset": "crag-v2-amd64-v3.1.10-crag-v2.payload.enc",
+      "size": 13224460,
+      "sha256": "5030eb4409f7ee48eaefbd367c1cc740f451f0d15bb19a8002117611d64a094c"
     },
     {
       "path": "share/crag/kernels/v2/amd64/kernel.json.example",
@@ -137,9 +137,9 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/manifest.json",
-      "asset": "crag-v2-amd64-v3.1.9-manifest.json",
-      "size": 2720,
-      "sha256": "aa67bb6214d3931a73cfbcfcdb8327d510cacb7ed8a83c006464a41563fa6c2c"
+      "asset": "crag-v2-amd64-v3.1.10-manifest.json",
+      "size": 2721,
+      "sha256": "1e78af225e07e2b4adf0ba6074f32c313b725f5a15ae7156735622bf5ecbd71b"
     },
     {
       "path": "share/crag/kernels/v2/amd64/unpack-note.md",
@@ -150,8 +150,8 @@
     {
       "path": "dist/crag-v2-licensed-amd64.tar.gz",
       "asset": "crag-v2-licensed-amd64.tar.gz",
-      "size": 170999424,
-      "sha256": "68fe21ab5f1f19cb3482749a63a37d71328eaad967ede3ccff03337a54291614"
+      "size": 171058868,
+      "sha256": "faafd0011dbfd8d4d136eaf3056b57520d5e00777f37bd2d864edc81b4c49026"
     }
   ]
 }
