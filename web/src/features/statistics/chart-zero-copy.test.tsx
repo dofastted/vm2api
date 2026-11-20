@@ -34,9 +34,9 @@ function data(series: StatisticsData['series']): StatisticsData {
     until: '2026-11-22T00:00:00+08:00',
     series,
     metrics: {
-      cost: [{ time: '00:00', alpha: 0 }],
-      requests: [{ time: '00:00', alpha: 0 }],
-      tokens: [{ time: '00:00', alpha: 0 }],
+      cost: [{ date: '2026-11-20T16:00:00.000Z', alpha: 0 }],
+      requests: [{ date: '2026-11-20T16:00:00.000Z', alpha: 0 }],
+      tokens: [{ date: '2026-11-20T16:00:00.000Z', alpha: 0 }],
     },
     seriesTotals: {
       alpha: { cost: 0, requests: 0, tokens: 0 },
@@ -57,8 +57,7 @@ function data(series: StatisticsData['series']): StatisticsData {
       avgDurationMs: null,
       avgTtftMs: null,
     },
-    previousTotals: null,
-    changes: null,
+    deltas: { requests: null, cost: null, tokens: null },
   }
 }
 
