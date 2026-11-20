@@ -2,10 +2,17 @@
 
 ## Unreleased
 
-- 管理员可在「订阅 CRAG」右上角兑换本机 CRAGGemini 签名载荷。只接受当前签名清单对应的授权码；载荷激活与 Google 授权、推理支持和 Claude CRAG 订阅独立。
-- Gemini 环境详情新增「测试对话」，复用其他平台的结果卡。使用环境已保存的 API Key 经绑定代理发送测试；不开放 OAuth 或对外付费调用。
+## 1.4.168 — 2026-11-20 · Gemini 宿主诊断与协议修复
+
+- 管理员可在「订阅 CRAG」右上角兑换本机 CRAGGemini 签名载荷。只接受当前签名清单对应的授权码；载荷激活与 Google 授权、推理支持和 Claude CRAG 订阅独立。授权码在发行机用 `scripts/issue-gemini-release-code.mjs` 签发，同一签名清单在同一私有发行目录只生成一个；只有对应的 `.json` 校验配置装到宿主，明文码不入库（#1340）。
+- Gemini 环境详情新增代理与测试诊断。「代理」可查看、测通或换绑 IPv4 SOCKS5，换绑会清除模型与账号快照但不删登录，授权、终端或测试运行时不得换绑；「测试」先拉取模型再发单条纯文本，提交返回 `run_id`，由 `GET`／`DELETE /test-chat/:run_id` 轮询或取消，结果只在宿主内存短暂保留。OAuth 走隔离的官方 `agy`，API Key 只列目录中声明支持 `generateContent` 的模型。请求只用当前账号及绑定代理，不切换账号、不回落直连；不计入 vm2api 密钥扣费，但可能消耗 Google 侧用量（#1374）。
 - Gemini 宿主部署支持签名的 `0.3.0-rc.2`；配置安装源时，安装命令会先验证并落地载荷，再报告成功。已授权的 Google 账号可从详情页点「启动 Gemini」，打开走绑定代理的 Antigravity CLI 终端，不影响公共推理和计费。
 - Gemini 终端仅在启动时识别 Google OAuth 菜单；会话中的同样文本不再断开终端或改写账号授权状态。
+- 默认 CRAG 标准载荷升级到 `3.1.10`：修正原生 TUI 遥测的入口绑定，并补上供应商账号切换后工具结果的恢复。不自动重启现有槽位（#1371）。
+- 上游拒收采样字段本身时，剥掉参数重试一次。此前这类 400 被归到 `invalid_request` 直接失败：中转或厂商模型压根不接受 `temperature`，或只在 thinking 下接受 `temperature=1`。现在归为 `sampling_repairable`，给一次不带采样参数的重试。repair 不改请求体——它跑在组装之前，删掉的字段会被 `ensureClaudeOAuthBodyDefaults` 补回——而是把 `dropSampling` 送到组装层，由 HTTP／cli-hop 与 CRAG print 两条出站路径各自落实。`temperature: 1` 作为真实 Claude Code 的行为仿真仍然保留，只在上游明确拒绝时才省略（#1370）。
+- 修复 cookie 导入在浏览器段之后报 `upstream transport failed`。`kin-worker oauth session-code` 需要的是 `worker.json`（含 `vm_id`、`proxy_url`、`egress_mode`），桥接却传了 `kernel.json`——后者没有 `egress_mode`、`proxy_url` 又是空串，于是构造出一个拒绝所有连接的 client，拨号报 `slot proxy is required`，而错误分类只匹配 `proxy required`（少个 `is`），最终落到默认分支显示成传输失败。授权链接那条走浏览器，不受影响（#1375）。
+- Responses WebSocket 上，`generate: false` 预热返回的 `response.id` 可在同一条连接上续接。此前完成分支把预热跳排除在连接回放缓存之外，下一跳必然 miss 并返回 `previous_response_not_found`，Codex 的 `thread/sample` 走这条路径时不显示后续提示词建议。缓存仍是连接内的，`store: false` 不变成持久化，跨连接引用该 ID 仍然拒绝（#1378）。
+- 文档、CHANGELOG、源码注释与面板文案去掉第三方项目的归因，保留运行标识、导入路径、账号导出类型字符串和脱敏声明；迁移 SQL 一个字节未动，避免改变 migration checksum（#1377）。
 
 ## 1.4.167 — 2026-11-20 · 共享出口产物修正
 
