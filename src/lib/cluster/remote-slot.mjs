@@ -18,11 +18,16 @@ import {
   boundProxyUrl,
   bridgeName,
   chainName,
+  BRIDGE_NF_CALL_IPTABLES,
+  claimSharedIp,
   configuredDnsUpstream,
   configuredDnsEmptyTypes,
   egressConfigBody,
   egressConfigFor,
   gatewayFromSubnet,
+  readSharedClaims,
+  runExclusiveProxyEgress,
+  sharedIptablesPlan,
   iptablesPlan,
   isLocalEgressProxy,
   LOCAL_EGRESS_ID,
@@ -33,7 +38,13 @@ import {
 } from '../vm/egress.mjs'
 import { parseCidr, parseRouteSubnets, createSubnetAllocator, gatewayOf, subnetPoolConfig } from '../vm/subnet-pool.mjs'
 import {
+  DEFAULT_SHARED_PREFIX,
+  assignSharedIp,
+  isSharedModeVm,
   isSharedNetwork,
+  networkModeOf,
+  mergeSharedRoute,
+  pruneSharedRoutes,
   sharedBridgeName,
   sharedChainName,
   sharedEgressId,
@@ -104,6 +115,7 @@ import { openSftp, readRemoteFileNoFollow, runRemote, shellQuote, writeRemoteFil
 
 import {
   pushCragSlot,
+  pushSharedEgressBinary,
   pushSlotBinaries,
   pushSlotFiles,
   reconcileSlotCredentials,
@@ -641,10 +653,216 @@ export function canReuseRemoteEgress(existing, digest) {
  * kin-egress (host-network container from the slot image) + iptables REDIRECT,
  * exactly like egress.mjs does on the control plane.
  */
-export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest = '' }) {
+/**
+ * Whether bridged traffic reaches iptables **on the node**.
+ *
+ * The control-plane helper reads its own /proc; a node is a different machine,
+ * so this has to go over SSH. Both barriers between VMs sharing the folded
+ * bridge live in iptables, and with br_netfilter off they are inert at once —
+ * every VM on that node could reach every other, with nothing in any log.
+ */
+async function remoteBridgeNetfilter(session) {
+  const r = await runRemote(session.client, `cat ${BRIDGE_NF_CALL_IPTABLES} 2>/dev/null || true`).catch(() => null)
+  return String(r?.stdout || '').trim() === '1'
+}
+
+/** Addresses currently held by endpoints on the node's shared network. */
+function remoteSharedEndpointIps(info) {
+  const out = []
+  for (const entry of Object.values(info?.Containers || {})) {
+    const ip = String(entry?.IPv4Address || '')
+      .split('/')[0]
+      .trim()
+    if (ip) out.push(ip)
+  }
+  return out
+}
+
+/** The route table the node's shared helper is currently configured with. */
+async function remoteSharedRoutes(session, dir) {
+  try {
+    const raw = await readRemoteFileNoFollow(session.client, `${dir}/egress.json`)
+    if (!raw) return []
+    const cfg = JSON.parse(raw.toString('utf8'))
+    return Array.isArray(cfg?.routes) ? cfg.routes : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Make one VM on a cluster node routable through that node's shared helper.
+ *
+ * Remote twin of ensureSharedEgressForVm, and it inherits that function's
+ * reason for existing: the whole table is rebuilt from the addresses the node's
+ * shared network holds, the addresses promised to slots still starting, and the
+ * table the helper already has. All of it under one acquisition of the node's
+ * lock, because computing a whole-table replacement outside it lets two slots
+ * start from one snapshot and the later publish drop the earlier slot's route.
+ *
+ * The lock and the claims live on the control plane, which is the only writer
+ * to any node, so the same process-local serialisation covers a remote node as
+ * it does the local host. What cannot be shared is anything that reads the
+ * machine: the bridge check and the current route table go over SSH, since the
+ * local versions would inspect the control plane instead of the node.
+ */
+export async function ensureRemoteSharedEgress(session, vm, projectRoot, { imageRef, binaryDigest = '' } = {}) {
   const proxy = vm.proxy
   const blocked = proxyBlockedReason(proxy)
   if (blocked) return { ok: false, code: blocked, error: blocked }
+  const proxyUrl = boundProxyUrl(proxy)
+  const vmId = String(vm?.id || '')
+  if (!proxyUrl) {
+    return { ok: false, code: 'proxy_required', error: 'bound SOCKS5 url required; refusing fallback' }
+  }
+  if (!vmId) return { ok: false, code: 'vm_required', error: 'vm id required for a shared address claim' }
+  if (session.host.uid !== 0 && !session.host.sudo) {
+    return { ok: false, code: 'egress_sudo_required', error: '节点需要 root 或免密 sudo 才能为 SOCKS5 出口写 iptables' }
+  }
+  const nodeId = session.nodeId || ''
+  const names = sharedRemoteNames(nodeId, session.host)
+
+  return runExclusiveProxyEgress(projectRoot, sharedEgressId(nodeId), async () => {
+    if (!(await remoteBridgeNetfilter(session))) {
+      return {
+        ok: false,
+        code: 'bridge_netfilter_disabled',
+        error:
+          '节点需要加载 br_netfilter 并设置 net.bridge.bridge-nf-call-iptables=1，否则共享网桥上的 VM 之间没有隔离',
+      }
+    }
+    // The container binds <root>/egress/slot-bin as its executable directory,
+    // and the per-slot push only ever fills a VM's own slot-bin, so without
+    // this the helper has no binary to start from.
+    const pushed = await pushSharedEgressBinary(session, projectRoot)
+    if (!pushed.ok) return { ok: false, code: pushed.code || 'egress_binary_missing', error: pushed.error }
+    // Sized for the whole node rather than for one VM.
+    const net = await ensureRemoteNetwork(session.docker, {
+      name: names.network,
+      bridge: names.bridge,
+      masquerade: false,
+      prefix: DEFAULT_SHARED_PREFIX,
+      runIp: () => runRemote(session.client, 'ip route'),
+    })
+    const info = await inspectNetworkOrNull(session.docker, names.network)
+    const ipv4 = ipv4ConfigOf(info)
+    if (!ipv4)
+      return { ok: false, code: 'egress_network_failed', error: `shared network ${names.network} has no IPv4 range` }
+    const live = remoteSharedEndpointIps(info)
+
+    const at = Date.now()
+    const claims = readSharedClaims(projectRoot, nodeId, at)
+    const others = Object.entries(claims)
+      .filter(([id]) => id !== vmId)
+      .map(([, c]) => c.ip)
+    let ip
+    try {
+      ip = assignSharedIp(vm, { subnet: ipv4.subnet, taken: [...live, ...others] }).ip
+    } catch (e) {
+      return { ok: false, code: 'shared_subnet_full', error: e?.message || 'shared address allocation failed' }
+    }
+    claimSharedIp(projectRoot, nodeId, vmId, ip, at)
+
+    const ports = await resolveRemoteEgressPorts(session, sharedEgressId(nodeId), names.dir)
+    const existing = await remoteSharedRoutes(session, names.dir)
+    const pruned = pruneSharedRoutes(existing, live, { keep: [ip, ...others] })
+    const routes = mergeSharedRoute(pruned, { vmId, ip, proxyUrl })
+    const cfg = egressConfigFor({
+      proxyId: sharedEgressId(nodeId),
+      // No default exit: every VM leaves through the upstream its route names.
+      proxyUrl: '',
+      listenTcp: `${net.gateway}:${ports.tcp}`,
+      listenDns: `${net.gateway}:${ports.dns}`,
+      dnsUpstream: configuredDnsUpstream(),
+      dnsEmptyTypes: configuredDnsEmptyTypes(),
+      routes,
+    })
+    const body = egressConfigBody(cfg)
+    const { digest, spec } = remoteEgressContainer({
+      vmId: sharedEgressId(nodeId),
+      proxyId: sharedEgressId(nodeId),
+      dir: names.dir,
+      imageRef,
+      body,
+      host: session.host,
+      binaryDigest,
+    })
+
+    const container = await inspectContainerOrNull(session.docker, names.egress)
+    const cfgFile = `${names.dir}/egress.json`
+    let reuse = canReuseRemoteEgress(container, digest) && canReloadRemoteEgress(container)
+    let reloaded = false
+    if (reuse) {
+      const current = await readRemoteFileNoFollow(session.client, cfgFile).catch(() => null)
+      if (current == null) reuse = false
+      else if (current.toString('utf8') !== body) {
+        // Membership change: keep the container and every established splice.
+        await writeRemoteFile(await openSftp(session.client), cfgFile, body, { mode: 0o600 })
+        await signalContainer(session.docker, names.egress, 'HUP')
+        reloaded = true
+      }
+    }
+    if (!reuse) {
+      await runRemote(
+        session.client,
+        `umask 077 && mkdir -p ${shellQuote(names.dir)} && chmod 700 ${shellQuote(names.dir)}`,
+      )
+      await writeRemoteFile(await openSftp(session.client), cfgFile, body, { mode: 0o600 })
+      if (container) await removeContainer(session.docker, names.egress)
+      await createContainerRaw(session.docker, names.egress, spec)
+      await containerAction(session.docker, names.egress, 'start')
+    }
+
+    const tcp = ports.tcp
+    const probe = `for i in $(seq 1 40); do ss -H -ltn 'sport = :${tcp}' | awk '{print $4}' | grep -qxF -e '${net.gateway}:${tcp}' -e '0.0.0.0:${tcp}' -e '*:${tcp}' && exit 0; sleep 0.2; done; exit 1`
+    await runRemote(session.client, `bash -c ${shellQuote(probe)}`, { timeoutMs: 20_000, code: 'egress_not_listening' })
+
+    // The shared variant, so inter-VM traffic on the folded bridge is dropped.
+    const plan = sharedIptablesPlan({
+      chain: names.chain,
+      bridge: net.bridge,
+      subnet: ipv4.subnet,
+      tcpPort: tcp,
+      dnsPort: ports.dns,
+    })
+    await runRemote(session.client, remoteIptablesScript(plan, { sudo: session.host.uid !== 0 }), {
+      code: 'egress_iptables_failed',
+    })
+
+    return {
+      ok: true,
+      mode: 'shared',
+      network: net.name,
+      bridge: net.bridge,
+      subnet: ipv4.subnet,
+      gateway: net.gateway,
+      egress: names.egress,
+      ip,
+      routes: routes.length,
+      reused: reuse,
+      reloaded,
+      ports: { tcp: ports.tcp, dns: ports.dns },
+    }
+  })
+}
+
+export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest = '', projectRoot = '' } = {}) {
+  const proxy = vm.proxy
+  const blocked = proxyBlockedReason(proxy)
+  if (blocked) return { ok: false, code: blocked, error: blocked }
+  // Dispatched here rather than at each call site: a site left unconverted
+  // would bring a shared-mode VM up on a per-VM bridge, where the shared
+  // helper has no route for it.
+  if (isSharedModeVm(vm) && !isLocalEgressProxy(proxy)) {
+    if (!projectRoot) {
+      return {
+        ok: false,
+        code: 'project_root_required',
+        error: 'shared egress needs projectRoot for its address claims',
+      }
+    }
+    return ensureRemoteSharedEgress(session, vm, projectRoot, { imageRef, binaryDigest })
+  }
   if (isLocalEgressProxy(proxy)) {
     const id = proxy?.id || LOCAL_EGRESS_ID
     const net = await ensureRemoteNetwork(session.docker, {
@@ -765,7 +983,7 @@ export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
       }
       const image = slotImageSpec(projectRoot, vm.kernel || 'ubuntu-24.04')
       const binaries = await pushSlotBinaries(vm, projectRoot, session)
-      return ensureRemoteEgress(session, vm, { imageRef: image.ref, binaryDigest: binaries.digest })
+      return ensureRemoteEgress(session, vm, { imageRef: image.ref, binaryDigest: binaries.digest, projectRoot })
     }
     for (const name of new Set([current, legacy])) {
       const existing = await inspectContainerOrNull(session.docker, name)
@@ -1052,9 +1270,15 @@ export function slotContainerBody(
   }
 }
 
-function applyRuntime(
+/**
+ * Rebuild vm.runtime for a remote slot. Exported so the fields it must carry
+ * across a refresh are testable without a node: this object is replaced
+ * wholesale each time, so a field missing here is a field that silently
+ * disappears on first start.
+ */
+export function applyRuntime(
   vm,
-  { nodeId, name, info, image, network, user, relays, slotDir, egress, egressContainer, routing, accel },
+  { nodeId, name, info, image, network, user, relays, slotDir, egress, egressContainer, routing, accel, sharedIp },
 ) {
   vm.runtime = {
     ...(vm.runtime || {}),
@@ -1079,6 +1303,13 @@ function applyRuntime(
     worker_token_file: path.join(slotDir, 'run', 'internal.token'),
     egress,
     egress_container: egressContainer || null,
+    // Carried across every refresh, like the worker paths above. This object is
+    // rebuilt from scratch each time, and these two decide which network the
+    // slot attaches to and at which address: dropping them would leave a VM on
+    // the shared bridge while the control plane looked for a per-VM one that
+    // was never created for it. Same reason runtimePatch carries them locally.
+    egress_mode: networkModeOf(vm),
+    shared_ip: sharedIp || vm.runtime?.shared_ip || null,
     stopped: false,
     ...(accel ? { accel } : {}),
   }
@@ -1435,7 +1666,11 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
     }
     const binaries =
       typeof pushSlotBinaries === 'function' ? await pushSlotBinaries(vm, projectRoot, session) : { digest: '' }
-    const eg = await ensureRemoteEgress(session, vm, { imageRef: egressImage || image, binaryDigest: binaries.digest })
+    const eg = await ensureRemoteEgress(session, vm, {
+      imageRef: egressImage || image,
+      binaryDigest: binaries.digest,
+      projectRoot,
+    })
     if (!eg.ok) return eg
     const name = containerName(vm.id)
     const relays = await clusterManager().ensureSlotRelays(nodeId, vm.id)
@@ -1477,7 +1712,7 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
     if (matches && existing.State?.Running) {
       if (subscription) await publishClusterSubscription(projectRoot, vm, session)
       await reconcileSlotCredentials(vm, slotDir, session)
-      applyRuntime(vm, { ...common, info: existing })
+      applyRuntime(vm, { ...common, info: existing, sharedIp: eg.ip })
       return { ok: true, action: 'already-running', runtime: vm.runtime }
     }
     let previousNetwork = null
@@ -1505,13 +1740,22 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
       await createContainerRaw(
         session.docker,
         name,
-        slotContainerBody(vm, { image, network: eg.network, remoteDir, user, routing, accel, subscription }),
+        slotContainerBody(vm, {
+          image,
+          network: eg.network,
+          ip: eg.ip || '',
+          remoteDir,
+          user,
+          routing,
+          accel,
+          subscription,
+        }),
       )
       action = 'created'
     }
     await containerAction(session.docker, name, 'start')
     await chownRemoteKvmBinds(session, name, vm)
-    applyRuntime(vm, { ...common, info: await inspectContainerOrNull(session.docker, name) })
+    applyRuntime(vm, { ...common, info: await inspectContainerOrNull(session.docker, name), sharedIp: eg.ip })
     return { ok: true, action, runtime: vm.runtime }
   } catch (err) {
     return failure(err)
@@ -1541,6 +1785,7 @@ async function reloadRemoteSlotAdmitted(vm, projectRoot, { routing }) {
     const eg = await ensureRemoteEgress(session, vm, {
       imageRef: p.egressImage || image,
       binaryDigest: binaries.digest,
+      projectRoot,
     })
     if (!eg.ok) return eg
     const name = containerName(vm.id)
@@ -1584,6 +1829,7 @@ async function reloadRemoteSlotAdmitted(vm, projectRoot, { routing }) {
       name,
       image,
       network: eg.network,
+      ...(eg.ip ? { sharedIp: eg.ip } : {}),
       user,
       relays,
       slotDir,

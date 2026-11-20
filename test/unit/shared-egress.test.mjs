@@ -31,13 +31,20 @@ import {
   egressConfigFor,
   ensureSharedEgressForVm,
   iptablesPlan,
+  sharedIpOf,
   sharedIptablesPlan,
   slotNetworkArgs,
   slotNetworkForVm,
   startSharedEgress,
 } from '../../src/lib/vm/egress.mjs'
 import { parseCidr } from '../../src/lib/vm/subnet-pool.mjs'
-import { exitOf, remoteEgressIpam, sharedRemoteNames, slotContainerBody } from '../../src/lib/cluster/remote-slot.mjs'
+import {
+  applyRuntime,
+  exitOf,
+  remoteEgressIpam,
+  sharedRemoteNames,
+  slotContainerBody,
+} from '../../src/lib/cluster/remote-slot.mjs'
 import { patchVmRecord } from '../../src/lib/vm/vm-registry.mjs'
 import { slotContainerNetworkMismatch } from '../../src/lib/vm/vm-runtime.mjs'
 
@@ -579,4 +586,48 @@ test('a remote shared slot is pinned to its address, a per-VM slot is not', () =
   const perVm = slotContainerBody(vm, { ...base, network: 'kin-eg-px-abc' })
   assert.equal(perVm.NetworkingConfig, undefined)
   assert.equal(perVm.HostConfig.NetworkMode, 'kin-eg-px-abc')
+})
+
+test('a cluster refresh carries a shared VM\u2019s mode and address through', () => {
+  // applyRuntime replaces vm.runtime wholesale on every refresh, keeping only
+  // the fields it names — the shape that dropped these two locally until
+  // runtimePatch carried them. A field missing here disappears on first start,
+  // and the control plane then looks for a per-VM bridge that was never
+  // created for this VM.
+  const vm = {
+    id: 'vm-01',
+    kernel: 'ubuntu-24.04',
+    node_id: 'node-a',
+    runtime: { egress_mode: 'shared', shared_ip: '100.64.16.7', container: 'kin-vm-01' },
+  }
+  const common = {
+    nodeId: 'node-a',
+    name: 'kin-vm-01',
+    image: 'kin:test',
+    network: sharedNetworkName('node-a'),
+    user: '1000:1000',
+    relays: { worker: '/run/w.sock', kernel: '/run/k.sock' },
+    slotDir: '/srv/kin/vms/vm-01',
+    egress: 'shared',
+    egressContainer: 'kin-egress-eg-shared-node-a',
+    routing: {},
+  }
+
+  // A refresh that passes no address keeps the one already recorded.
+  applyRuntime(vm, { ...common, info: null })
+  assert.equal(vm.runtime.egress_mode, 'shared')
+  assert.equal(vm.runtime.shared_ip, '100.64.16.7')
+  // And the slot still resolves to the node's shared network afterwards.
+  assert.equal(slotNetworkForVm(vm), sharedNetworkName('node-a'))
+
+  // A freshly allocated address is recorded for a VM that had none.
+  const fresh = { id: 'vm-02', kernel: 'ubuntu-24.04', node_id: 'node-a', runtime: { egress_mode: 'shared' } }
+  applyRuntime(fresh, { ...common, name: 'kin-vm-02', info: null, sharedIp: '100.64.16.9' })
+  assert.equal(fresh.runtime.shared_ip, '100.64.16.9')
+
+  // A per-vm VM is unaffected: no address, and its own bridge.
+  const perVm = { id: 'vm-03', kernel: 'ubuntu-24.04', node_id: 'node-a', proxy: { id: 'px-abc' }, runtime: {} }
+  applyRuntime(perVm, { ...common, name: 'kin-vm-03', network: 'kin-eg-px-abc', info: null })
+  assert.equal(perVm.runtime.egress_mode, 'per-vm')
+  assert.equal(perVm.runtime.shared_ip, null)
 })

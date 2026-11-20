@@ -1578,7 +1578,7 @@ export async function startProxyEgress(
   }
 }
 
-const BRIDGE_NF_CALL_IPTABLES = '/proc/sys/net/bridge/bridge-nf-call-iptables'
+export const BRIDGE_NF_CALL_IPTABLES = '/proc/sys/net/bridge/bridge-nf-call-iptables'
 
 /**
  * Whether bridged traffic reaches iptables at all.
