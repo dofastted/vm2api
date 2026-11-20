@@ -132,6 +132,11 @@ func sessionCodeClient(cfg config.Config) (*http.Client, error) {
 	if cfg.EgressMode == "transparent" {
 		return upstream.NewTransparentOAuthHTTPClient(sessionCodeTimeout)
 	}
+	if strings.TrimSpace(cfg.ProxyURL) == "" {
+		// NewOAuthHTTPClient would hand back a client that refuses every dial,
+		// which reads as "upstream transport failed"; name the real reason.
+		return nil, errors.New("slot proxy is required")
+	}
 	return upstream.NewOAuthHTTPClient(cfg.ProxyURL, cfg.ProxyRequired, sessionCodeTimeout)
 }
 
