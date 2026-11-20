@@ -162,8 +162,15 @@ export function ExportDialog({
           </div>
           <div className='grid grid-cols-2 gap-3'>
             <div className='space-y-2'>
-              <div className='text-xs font-medium text-muted-foreground'>
-                时间窗
+              <div className='space-y-1'>
+                <div className='text-xs font-medium text-muted-foreground'>
+                  时间窗
+                </div>
+                {scope === 'current' && window ? (
+                  <p className='text-[11px] leading-snug text-muted-foreground'>
+                    选择后替换当前筛选的开始时间（结束时间不变）
+                  </p>
+                ) : null}
               </div>
               <Select
                 value={window || 'all'}
@@ -177,7 +184,9 @@ export function ExportDialog({
                 <SelectContent>
                   {WINDOWS.map((w) => (
                     <SelectItem key={w.value || 'all'} value={w.value || 'all'}>
-                      {w.label}
+                      {scope === 'current' && !w.value
+                        ? '沿用当前筛选时间'
+                        : w.label}
                     </SelectItem>
                   ))}
                 </SelectContent>
