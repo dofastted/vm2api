@@ -30,6 +30,11 @@ import { ChipGroup, PaneSection, StepperSetting } from './scheduler-controls'
 
 type Block = Record<string, unknown>
 
+/** Mirrors BLOCKABLE_CLIENTS in src/lib/identity/blocked-clients.mjs. */
+const BLOCKABLE_CLIENTS: [string, string, string][] = [
+  ['openclaw', 'OpenClaw', 'system 自述 OpenClaw 或带 mcp__openclaw__ 工具'],
+]
+
 /** Mirrors `hasClaudeCodeClientHeaders` + body checks in src/lib/identity/claude-code-only.mjs. */
 const CLAUDE_CODE_FINGERPRINT: [string, string][] = [
   ['UA', 'claude-cli/x.y.z'],
@@ -62,6 +67,12 @@ export function ProtocolPane({
   const strict = compat.claude_code_only === true
   const relay = detectProxiedOfficialCcFromCompat(compat)
   const cch = cchEnabledFromCompat(compat)
+  const blockedClients =
+    compat.blocked_clients &&
+    typeof compat.blocked_clients === 'object' &&
+    !Array.isArray(compat.blocked_clients)
+      ? (compat.blocked_clients as Record<string, unknown>)
+      : {}
   return (
     <div className='space-y-4'>
       <PaneSection
@@ -123,6 +134,31 @@ export function ProtocolPane({
               aria-label='官方 Claude Code 家族透传'
             />
           </SettingRow>
+          {BLOCKABLE_CLIENTS.map(([id, label, signature]) => {
+            const on = blockedClients[id] === true
+            return (
+              <SettingRow
+                key={id}
+                label={`拦截 ${label}`}
+                desc={
+                  on
+                    ? `开：识别为 ${label}（${signature}）的 Claude 请求一律 403，不选号、不上游。与上面的开关无关。`
+                    : `已关：${label} 按普通请求放行。它借官方 CLI 发请求，会被上游认成第三方应用而 400。`
+                }
+              >
+                <Switch
+                  checked={on}
+                  onCheckedChange={(next) =>
+                    onCompatChange({
+                      ...compat,
+                      blocked_clients: { ...blockedClients, [id]: next },
+                    })
+                  }
+                  aria-label={`拦截 ${label}`}
+                />
+              </SettingRow>
+            )
+          })}
         </div>
         <div
           className={cn(
