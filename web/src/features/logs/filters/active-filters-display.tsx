@@ -65,6 +65,21 @@ export function ActiveFiltersDisplay({
       label: '日期范围',
       value: start === end ? start : `${start} - ${end}`,
     })
+  } else if (filters.startTime != null) {
+    chips.push({
+      key: 'time',
+      label: '起始时间',
+      value: format(new Date(filters.startTime), 'yyyy-MM-dd HH:mm:ss'),
+    })
+  } else if (filters.endTime != null) {
+    chips.push({
+      key: 'time',
+      label: '截止时间',
+      value: format(
+        new Date(inclusiveEndFromExclusive(filters.endTime)),
+        'yyyy-MM-dd HH:mm:ss'
+      ),
+    })
   }
   if (filters.model)
     chips.push({ key: 'model', label: '模型', value: filters.model })
