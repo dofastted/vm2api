@@ -480,7 +480,7 @@ const COLS: Col[] = [
     cell: (r) => (r.perReq == null ? '—' : `$${r.perReq.toFixed(3)}`),
   },
   {
-    label: '累计',
+    label: '总费用',
     sort: 'total',
     num: true,
     dim: true,
