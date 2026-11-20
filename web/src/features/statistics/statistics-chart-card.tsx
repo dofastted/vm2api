@@ -293,12 +293,19 @@ export function StatisticsChartCard({
           >
             获取统计数据失败
           </div>
-        ) : series.length === 0 || visibleTotal === 0 ? (
+        ) : series.length === 0 ? (
           <div
             className='grid place-items-center text-sm text-muted-foreground'
             style={{ height: chartHeight }}
           >
             暂无统计数据
+          </div>
+        ) : visibleTotal === 0 ? (
+          <div
+            className='grid place-items-center text-sm text-muted-foreground'
+            style={{ height: chartHeight }}
+          >
+            当前显示的系列在所选时段内此指标为 0
           </div>
         ) : (
           <ResponsiveContainer width='100%' height={chartHeight}>
@@ -451,7 +458,7 @@ export function StatisticsChartCard({
               全选
             </LegendAction>
             <LegendAction disabled={oneVisible} onClick={keepFirstWithUsage}>
-              清空
+              仅保留一项
             </LegendAction>
           </div>
           <div className='max-h-[72px] overflow-y-auto pr-36'>

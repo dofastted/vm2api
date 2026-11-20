@@ -66,7 +66,7 @@ export function UsageLogsFilters({
           description='按日期和时间筛选'
           icon={Clock}
           defaultOpen
-          activeCount={draft.startTime != null && draft.endTime != null ? 1 : 0}
+          activeCount={draft.startTime != null || draft.endTime != null ? 1 : 0}
         >
           <TimeFilters filters={draft} onChange={setDraft} />
         </FilterSection>
