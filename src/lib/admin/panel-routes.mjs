@@ -17,6 +17,19 @@ import {
   revokePanelSessionsForUser,
   getPanelAdmin,
 } from '../core/security.mjs'
+import {
+  TwoFactorError,
+  beginTwoFactorSetup,
+  confirmTwoFactorSetup,
+  consumeTwoFactorChallenge,
+  disableTwoFactor,
+  isTwoFactorEnabled,
+  issueTwoFactorChallenge,
+  regenerateRecoveryCodes,
+  twoFactorEnabledFor,
+  twoFactorStatus,
+  verifyTwoFactorCode,
+} from '../core/panel-2fa.mjs'
 import { loadDistillRules, saveDistillRules, validateDistillPatch } from '../core/distill-detect.mjs'
 import { applyRefusalGuardPatch, refusalGuardPolicy } from '../core/refusal-guard.mjs'
 import {
@@ -1834,16 +1847,11 @@ export function createPanelHandler(ctx) {
     }
 
     // ========== Panel login (public) ==========
-    if (req.method === 'POST' && p === '/api/panel/login') {
-      const body = await readBody(req, 4096)
-      const username = body.username || body.user || body.u || ''
-      const password = body.password || body.pass || body.p || ''
-      const authed = verifyPanelLogin(username, password)
+    // Hands out the session cookie. Shared by the password-only path and by the
+    // second step of two-factor sign-in, which has no password to replay.
+    const grantPanelSession = (authed, { password = '' } = {}) => {
       let buyerId = authed?.id
-      if (!authed) {
-        return json(res, 401, { ok: false, error: { message: '用户名或密码错误', type: 'auth' } })
-      }
-      if (authed.source === 'env') {
+      if (authed.source === 'env' && password) {
         try {
           buyerId = panelUsers.bootstrapFromEnv({ username: authed.username, password })?.id
         } catch {}
@@ -1861,6 +1869,82 @@ export function createPanelHandler(ctx) {
         views: mePayload({ panelUser: me.user, panelRole: me.role }).views,
         capabilities: mePayload({ panelUser: me.user, panelRole: me.role }).capabilities,
         expires_in: 7 * 24 * 3600,
+      })
+    }
+    const twoFactorFailure = (err) =>
+      json(res, err instanceof TwoFactorError ? err.status : 400, {
+        ok: false,
+        error: {
+          message: String(err?.message || '验证失败'),
+          code: err instanceof TwoFactorError ? err.code : 'totp_failed',
+          type: 'auth',
+        },
+      })
+
+    if (req.method === 'POST' && p === '/api/panel/login') {
+      const body = await readBody(req, 4096)
+      const username = body.username || body.user || body.u || ''
+      const password = body.password || body.pass || body.p || ''
+      const authed = verifyPanelLogin(username, password)
+      if (!authed) {
+        return json(res, 401, { ok: false, error: { message: '用户名或密码错误', type: 'auth' } })
+      }
+      let needsCode = false
+      try {
+        needsCode = isTwoFactorEnabled(authed.username)
+      } catch (e) {
+        return twoFactorFailure(e)
+      }
+      if (needsCode) {
+        // A client may post the code up front; otherwise it gets a challenge
+        // and posts it to /api/panel/login/totp. No session until a code lands.
+        const code = body.code || body.totp || body.otp || ''
+        if (!code) {
+          const challenge = issueTwoFactorChallenge(authed.username, {
+            claims: { role: authed.role, id: authed.id || null, source: authed.source || 'db' },
+          })
+          return json(res, 401, {
+            ok: false,
+            totp_required: true,
+            challenge: challenge.challenge,
+            expires_in: challenge.expires_in,
+            error: { message: '请输入两步验证码', code: 'totp_required', type: 'auth' },
+          })
+        }
+        try {
+          verifyTwoFactorCode(authed.username, code)
+        } catch (e) {
+          return twoFactorFailure(e)
+        }
+      }
+      return grantPanelSession(authed, { password })
+    }
+    if (req.method === 'POST' && p === '/api/panel/login/totp') {
+      const body = await readBody(req, 4096)
+      let name = ''
+      let claims = {}
+      try {
+        const opened = consumeTwoFactorChallenge(body.challenge || body.token || '')
+        name = opened.username
+        claims = opened.claims
+      } catch (e) {
+        return twoFactorFailure(e)
+      }
+      // Re-read the account: a role change or a disable since the password step wins.
+      const fresh = panelUsers.getByUsername(name)
+      if (fresh && fresh.enabled === false) {
+        return json(res, 403, { ok: false, error: { message: '账号已停用', code: 'user_disabled', type: 'auth' } })
+      }
+      try {
+        verifyTwoFactorCode(name, body.code || body.totp || body.otp || '')
+      } catch (e) {
+        return twoFactorFailure(e)
+      }
+      return grantPanelSession({
+        username: fresh?.username || name,
+        role: fresh?.role || claims.role || 'admin',
+        id: fresh?.id || claims.id || null,
+        source: fresh ? 'db' : claims.source === 'env' ? 'env' : 'db',
       })
     }
     if (req.method === 'POST' && p === '/api/panel/logout') {
@@ -1910,6 +1994,58 @@ export function createPanelHandler(ctx) {
         const version = runningVersion
         const payload = { ...me, version }
         return json(res, 200, { ok: true, ...payload, data: payload })
+      }
+      // ========== Two-factor for the signed-in account ==========
+      // Before the RBAC gate on purpose: every role manages its own 2FA. A
+      // master API key is not an account, so it has nothing to manage here.
+      if (p === '/api/panel/2fa' || p.startsWith('/api/panel/2fa/')) {
+        const self = String(req.panelUser || '')
+        if (!self) {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'panel_session_required', message: '请使用面板账号登录后再管理两步验证' },
+          })
+        }
+        // Changing a second factor must prove the first one again, so a
+        // hijacked session cannot silently rebind or remove it.
+        const reauth = (body) => {
+          const password = body?.password || body?.pass || ''
+          if (!password) throw new TwoFactorError('请输入当前密码', 'password_required', 400)
+          if (!verifyPanelLogin(self, password)) throw new TwoFactorError('当前密码不正确', 'password_invalid', 403)
+        }
+        try {
+          if (req.method === 'GET' && p === '/api/panel/2fa') {
+            return json(res, 200, panel.ok(twoFactorStatus(self)))
+          }
+          if (req.method === 'POST' && p === '/api/panel/2fa/setup') {
+            const body = await readBody(req, 4096).catch(() => ({}))
+            reauth(body)
+            return json(res, 200, panel.ok(beginTwoFactorSetup(self, { issuer: 'vm2api', account: self })))
+          }
+          if (req.method === 'POST' && p === '/api/panel/2fa/enable') {
+            const body = await readBody(req, 4096).catch(() => ({}))
+            const result = confirmTwoFactorSetup(self, body?.code || body?.totp || body?.otp || '')
+            // Other sessions were opened without a second factor; make them re-authenticate.
+            revokePanelSessionsForUser(self, { exceptToken: extractPanelToken(req) })
+            return json(res, 200, panel.ok({ ...twoFactorStatus(self), ...result }))
+          }
+          if (req.method === 'POST' && p === '/api/panel/2fa/disable') {
+            const body = await readBody(req, 4096).catch(() => ({}))
+            reauth(body)
+            verifyTwoFactorCode(self, body?.code || body?.totp || body?.otp || '')
+            disableTwoFactor(self)
+            return json(res, 200, panel.ok({ ...twoFactorStatus(self), disabled: true }))
+          }
+          if (req.method === 'POST' && p === '/api/panel/2fa/recovery') {
+            const body = await readBody(req, 4096).catch(() => ({}))
+            reauth(body)
+            const result = regenerateRecoveryCodes(self)
+            return json(res, 200, panel.ok({ ...twoFactorStatus(self), ...result }))
+          }
+        } catch (e) {
+          return twoFactorFailure(e)
+        }
+        return json(res, 404, { ok: false, error: { code: 'not_found', message: 'Not found' } })
       }
       const gate = authorizePanelRoute(req.method, p, panelIdentity(req).role)
       if (!gate.ok) {
@@ -2124,7 +2260,13 @@ export function createPanelHandler(ctx) {
         return json(res, result.status, panel.ok(result.data))
       }
       if (req.method === 'GET' && p === '/api/panel/users') {
-        return json(res, 200, panel.ok({ items: panelUsers.list() }))
+        const items = panelUsers.list()
+        const twoFactor = twoFactorEnabledFor(items.map((item) => item.username))
+        return json(
+          res,
+          200,
+          panel.ok({ items: items.map((item) => ({ ...item, two_factor: !!twoFactor.get(item.username) })) }),
+        )
       }
       if (req.method === 'POST' && p === '/api/panel/users') {
         const body = await readBody(req, 8192).catch(() => ({}))
@@ -2183,6 +2325,18 @@ export function createPanelHandler(ctx) {
             error: { message: String(e.message || e), code: e.code || 'delete_failed' },
           })
         }
+      }
+      if (req.method === 'DELETE' && /^\/api\/panel\/users\/[^/]+\/2fa$/.test(p)) {
+        // Admin unlock for a user who lost both the authenticator and the
+        // recovery codes. 2FA is cleared, so the next sign-in is password-only.
+        const id = p.split('/')[4]
+        const target = panelUsers.getById(id)
+        if (!target) return json(res, 404, { ok: false, error: { message: 'user not found', code: 'not_found' } })
+        const reset = disableTwoFactor(target.username)
+        // Sessions predating the reset keep a second factor the account no
+        // longer has; make the user sign in again.
+        revokePanelSessionsForUser(target.username)
+        return json(res, 200, panel.ok({ username: target.username, reset }))
       }
       if (req.method === 'GET' && p === '/api/panel/vm-pools') {
         return json(res, 200, panel.ok({ pools: vmPoolsFor(apiKeyStore.db).list() }))
