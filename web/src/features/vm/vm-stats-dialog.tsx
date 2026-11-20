@@ -835,7 +835,7 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             <InfoCard
               tone='bg-lime-500/15 text-lime-600 dark:text-lime-400'
               icon={<ClipboardList />}
-              title='7D 请求'
+              title='7 天额度窗口请求'
               rows={[
                 {
                   label: '成功',
