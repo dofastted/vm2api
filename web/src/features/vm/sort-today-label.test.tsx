@@ -45,5 +45,7 @@ describe('VM today sort wording', () => {
 
     expect(html).toContain('今日花费 · 北京时间')
     expect(html).not.toContain('>今日花费<')
+    expect(html).toContain('7 天窗口费用')
+    expect(html).not.toContain('7D 费用')
   })
 })
