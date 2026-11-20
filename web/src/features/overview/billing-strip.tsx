@@ -65,7 +65,7 @@ export function BillingStrip({
         <StatCell
           label='累计费用'
           value={fmtUsd(total)}
-          hint='当前日志保留窗口内'
+          hint='日志窗口内全部请求'
         />
         <StatCell
           label='Claude'
