@@ -88,8 +88,9 @@ test('thinking-only foreign turn is dropped', () => {
   assert.equal(res.droppedTurns, 1)
   assert.deepEqual(
     res.body.messages.map((m) => m.role),
-    ['user', 'user'],
+    ['user'],
   )
+  assert.equal(res.body.messages[0].content, 'a\nb')
 })
 
 test('open tool loop touched: loop thinking wiped and thinking turned off', () => {

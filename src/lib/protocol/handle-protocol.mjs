@@ -1999,7 +1999,9 @@ export function createHandleProtocol(deps) {
                   preparedHop,
                   transportRouting,
                   requestContext,
-                  repaired,
+                  // thinking was dropped for this hop: skip ensureOfficialPrintThinking, which
+                  // would otherwise re-add adaptive thinking to a body whose loop lost its blocks.
+                  repaired: repaired || cragOwned.thinkingOff === true,
                   dropSampling,
                 },
               }

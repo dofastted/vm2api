@@ -15,6 +15,7 @@
 import crypto from 'node:crypto'
 import { getDb } from '../db/database.mjs'
 import { mapThinkingBlocks } from '../protocol/anthropic-policy.mjs'
+import { mergeConsecutiveAnthropicMessages, messageHasTurnControls } from '../protocol/sanitize.mjs'
 
 const EDGE = 100
 const MIN_SIGNATURE = 24
@@ -185,7 +186,9 @@ function isPureToolResultTurn(message) {
  * thinking and breaks the prompt cache.
  *
  * - Only signed blocks this account did not mint go; its own stay byte-identical.
- * - A turn left with no blocks is dropped (it has no tool_use to orphan).
+ * - A turn left with no blocks is dropped (it has no tool_use to orphan) unless it
+ *   carries turn controls (output_config / clear_at); neighbours it leaves behind
+ *   with the same role are merged.
  * - If the open tool loop (after the last user turn that is not pure
  *   tool_result) loses a block, every thinking block in the loop goes and
  *   thinking is off for this hop: the shape signature repair already sends.
@@ -251,13 +254,14 @@ export function dropForeignThinkingForCrag(body, accountId, store = thinkingOwne
       return
     }
     counts.dropped += removed
-    if (!content.length) {
+    if (!content.length && !messageHasTurnControls(message)) {
       counts.droppedTurns += 1
       return
     }
     out.push({ ...message, content })
   })
-  const next = { ...body, messages: out }
+  // Dropping a whole turn can leave same-role neighbours; merge them (never across turn controls).
+  const next = { ...body, messages: counts.droppedTurns ? mergeConsecutiveAnthropicMessages(out) : out }
   if (counts.openLoop) {
     if (next.thinking) {
       delete next.thinking
