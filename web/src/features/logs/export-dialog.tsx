@@ -35,7 +35,7 @@ export type ExportOptions = {
 }
 
 const WINDOWS: { value: ExportWindow; label: string }[] = [
-  { value: '', label: '全部时间' },
+  { value: '', label: '不覆盖起始时间' },
   { value: '1h', label: '近 1 小时' },
   { value: '6h', label: '近 6 小时' },
   { value: '24h', label: '近 24 小时' },
@@ -131,8 +131,8 @@ export function ExportDialog({
               />
               <ScopeOption
                 value='all'
-                title='全部日志'
-                desc='忽略页面筛选与屏蔽，导出全量'
+                title='不按页面筛选'
+                desc='包含已屏蔽的错误类，仍受时间和条数限制'
               />
               <ScopeOption value='errors' title='仅错误'>
                 {scope === 'errors' ? (
@@ -166,11 +166,11 @@ export function ExportDialog({
                 <div className='text-xs font-medium text-muted-foreground'>
                   时间窗
                 </div>
-                {scope === 'current' && window ? (
-                  <p className='text-[11px] leading-snug text-muted-foreground'>
-                    选择后替换当前筛选的开始时间（结束时间不变）
-                  </p>
-                ) : null}
+                <p className='text-[11px] leading-snug text-muted-foreground'>
+                  {scope === 'current'
+                    ? '预设只替换起始时间，不改截止'
+                    : '预设只设置起始时间，不设置截止'}
+                </p>
               </div>
               <Select
                 value={window || 'all'}

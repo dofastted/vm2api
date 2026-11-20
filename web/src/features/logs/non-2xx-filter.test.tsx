@@ -1,5 +1,7 @@
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
+import { ActiveFiltersDisplay } from './filters/active-filters-display'
+import { QuickFiltersBar } from './filters/quick-filters-bar'
 import { StatusFilters } from './filters/status-filters'
 import type { LogsFilterState } from './search'
 
@@ -31,5 +33,23 @@ describe('non-2xx log filter wording', () => {
     expect(html).toContain('value="!200"')
     expect(html).toContain('>仅非 2xx（含无状态码）</option>')
     expect(html).not.toContain('非 200')
+  })
+  it('uses the same name on the quick action and active chip', () => {
+    const quick = renderToStaticMarkup(
+      <QuickFiltersBar filters={filters} onChange={() => {}} />
+    )
+    const active = renderToStaticMarkup(
+      <ActiveFiltersDisplay
+        isAdmin={false}
+        filters={filters}
+        options={undefined}
+        onRemove={() => {}}
+        onClearAll={() => {}}
+      />
+    )
+    expect(quick).toContain('>仅非 2xx<')
+    expect(quick).not.toContain('仅错误')
+    expect(active).toContain('仅非 2xx')
+    expect(active).not.toContain('!200')
   })
 })
