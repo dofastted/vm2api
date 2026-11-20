@@ -145,6 +145,85 @@ export function forwardOutStreamLocal(client, socketPath) {
   })
 }
 
+const unixTransport = new WeakMap()
+
+const shQuote = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`
+
+/**
+ * Open a stream to a unix socket on the node. Prefers the SSH `direct-streamlocal`
+ * channel; sshd builds that refuse it (OpenSSH 7.4 on CentOS 7, AllowStreamLocalForwarding no,
+ * restricted keys) fall back to an exec channel that bridges the socket with tools the
+ * node already has: `docker system dial-stdio` for the Docker socket, else socat / nc -U.
+ * The first working transport is remembered per link so later calls skip the failed probe.
+ */
+export async function connectUnixSocket(client, socketPath, { docker = false } = {}) {
+  const cached = unixTransport.get(client)
+  if (cached && cached !== 'streamlocal') return execUnixStream(client, cached, socketPath)
+  try {
+    const stream = await forwardOutStreamLocal(client, socketPath)
+    unixTransport.set(client, 'streamlocal')
+    return stream
+  } catch (err) {
+    if (err.code !== 'streamlocal_failed') throw err
+    const tools = await probeBridgeTools(client)
+    const order = [docker && tools.docker && 'docker-dial-stdio', tools.socat && 'socat', tools.nc && 'nc'].filter(Boolean)
+    for (const name of order) {
+      try {
+        const stream = await execUnixStream(client, name, socketPath)
+        unixTransport.set(client, name)
+        return stream
+      } catch {
+        /* try next bridge */
+      }
+    }
+    throw err
+  }
+}
+
+/** Name of the transport last selected for this link (null before first use). */
+export function unixTransportOf(client) {
+  return unixTransport.get(client) ?? null
+}
+
+async function probeBridgeTools(client) {
+  const r = await execCollect(client, 'command -v docker socat nc 2>/dev/null', { timeoutMs: 8000 }).catch(() => null)
+  const out = r?.stdout ?? ''
+  const has = (n) => new RegExp(`(^|/)${n}$`, 'm').test(out)
+  return { docker: has('docker'), socat: has('socat'), nc: has('nc') }
+}
+
+function execUnixStream(client, transport, socketPath) {
+  const q = shQuote(socketPath)
+  const command =
+    transport === 'docker-dial-stdio'
+      ? 'docker system dial-stdio'
+      : transport === 'socat'
+        ? `exec socat - UNIX-CONNECT:${q}`
+        : `exec nc -U ${q}`
+  return new Promise((resolve, reject) => {
+    client.exec(command, (err, stream) => {
+      if (err) return reject(new ClusterError(502, 'unix_bridge_failed', `远端桥接失败：${err.message}`))
+      let settled = false
+      const fail = (msg) => {
+        if (settled) return
+        settled = true
+        stream.close()
+        reject(new ClusterError(502, 'unix_bridge_failed', msg))
+      }
+      // A missing tool / refused socket exits at once; a healthy bridge stays open waiting for input.
+      stream.once('exit', (code) => fail(`桥接命令提前退出(${code})`))
+      stream.once('close', () => fail('桥接通道提前关闭'))
+      setTimeout(() => {
+        if (settled) return
+        settled = true
+        stream.removeAllListeners('exit')
+        stream.removeAllListeners('close')
+        resolve(stream)
+      }, 250)
+    })
+  })
+}
+
 /** Run a command, collect output. Rejects only on channel failure; non-zero exit is data. */
 export function execCollect(client, command, { timeoutMs = 30_000, maxBytes = 1 << 20 } = {}) {
   return new Promise((resolve, reject) => {

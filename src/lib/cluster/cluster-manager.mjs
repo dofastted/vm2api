@@ -39,7 +39,8 @@ import {
   connectSsh,
   execCollect,
   forwardOut,
-  forwardOutStreamLocal,
+  connectUnixSocket,
+  unixTransportOf,
   privateKeyProblem,
   READY_TIMEOUT_MS,
   SshLink,
@@ -263,7 +264,7 @@ export class ClusterManager {
     const t0 = performance.now()
     let latencyMs = null
     try {
-      const probe = await forwardOutStreamLocal(client, DOCKER_SOCKET_PATH)
+      const probe = await connectUnixSocket(client, DOCKER_SOCKET_PATH, { docker: true })
       latencyMs = performance.now() - t0
       probe.close()
     } catch (err) {
@@ -280,7 +281,7 @@ export class ClusterManager {
     } else {
       try {
         const info = await dockerInfo(sshDocker(client))
-        docker = { ok: true, error: null }
+        docker = { ok: true, error: null, transport: unixTransportOf(client) }
         containers = { total: info.containers, running: info.running }
       } catch (err) {
         docker = { ok: false, error: err.message }

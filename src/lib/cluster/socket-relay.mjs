@@ -15,7 +15,7 @@
 import fs from 'node:fs'
 import net from 'node:net'
 import path from 'node:path'
-import { forwardOutStreamLocal } from './ssh-link.mjs'
+import { connectUnixSocket } from './ssh-link.mjs'
 
 export class SocketRelay {
   /**
@@ -108,7 +108,7 @@ export class SocketRelay {
     let remote
     try {
       const target = typeof this.remotePath === 'function' ? await this.remotePath() : this.remotePath
-      remote = await forwardOutStreamLocal(client, target)
+      remote = await connectUnixSocket(client, target)
     } catch {
       // A missing remote socket (kernel restarting) is the normal "not ready" answer;
       // the caller's health poll sees a reset, same as a local ECONNREFUSED.
