@@ -132,7 +132,13 @@ export function GeminiStartupStatus({
     <div className='space-y-1 text-sm'>
       {payloadIssue ? <p role='status'>{payloadIssue}</p> : null}
       {inventory.payload_state === 'awaiting_redemption' ? (
-        <p role='status'>CRAGGemini 内核已安装，等待兑换。</p>
+        <p role='status'>
+          CRAGGemini 内核已安装，等待兑换。请前往{' '}
+          <Link to='/crag-subscription' className='text-primary underline'>
+            订阅 CRAG
+          </Link>{' '}
+          兑换当前版本的 CRAGGemini 内核。
+        </p>
       ) : null}
       {inventory.payload_state === 'install_on_create' ? (
         <p role='status'>首次创建时自动校验并安装 Gemini 内核和官方 CLI。</p>

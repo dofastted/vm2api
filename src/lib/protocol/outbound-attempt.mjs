@@ -473,6 +473,7 @@ export function prepareOutboundAttempt({
   firstUserIdentity = '',
   authScheme,
   credentialMode,
+  dropSampling = false,
 } = {}) {
   const inferenceOnly = isAnySetupTokenMode(credentialMode) || isApiKeyMode(credentialMode)
   const keepCallerSession = officialClient === true || (officialClient == null && !unofficial)
@@ -525,6 +526,7 @@ export function prepareOutboundAttempt({
     cacheTtl: cacheTtl || undefined,
     inbound,
     preserveThinkingBlocks,
+    dropSampling,
   })
   cleaned = stripIllegalCacheControlFields(cleaned)
   cleaned = enforceCacheTtlOrder(cleaned, cacheTtl || DEFAULT_CACHE_TTL)
@@ -590,6 +592,7 @@ export function prepareOutboundEnvelope({
   authScheme,
   credentialMode,
   want1m,
+  dropSampling = false,
 } = {}) {
   const prepared = prepareOutboundAttempt({
     requestContext,
@@ -623,6 +626,7 @@ export function prepareOutboundEnvelope({
     firstUserIdentity,
     authScheme,
     credentialMode,
+    dropSampling,
   })
   const headers = {
     ...prepareOutboundHeaders(

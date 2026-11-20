@@ -85,7 +85,9 @@ if (opts.pin) {
   for (const file of manifest.files) {
     const target = path.join(opts.dest, file.path)
     if (matches(readLocal(file), file)) continue
-    const url = `${base}/${manifest.release}/${file.asset}`
+    const isCrag = file.path.startsWith('share/crag/') || file.path === 'dist/crag-v2-licensed-amd64.tar.gz'
+    const release = isCrag ? manifest.crag_release || manifest.release : manifest.release
+    const url = `${base}/${release}/${file.asset}`
     if (!downloads.has(url)) {
       let res
       for (let attempt = 1; attempt <= 4; attempt++) {

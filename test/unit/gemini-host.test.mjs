@@ -141,7 +141,7 @@ function setup(callHost, proxy = bound) {
     }),
     callHost,
   })
-  return (method, pathname, body) => panel({ method, body }, response, pathname)
+  return (method, pathname, body) => panel({ method, pathname, body }, response, pathname)
 }
 
 test('Gemini import is admin-only and unavailable without the host service', async () => {
@@ -229,6 +229,40 @@ test('reachable Gemini host reports lazy install without dependencies on an exis
   const result = await invalidPayload('POST', `${root}/environments`, { name: record.name, proxy_id: record.proxy_id })
   assert.equal(result.status, 503)
   assert.equal(result.body.error.code, 'gemini_payload_invalid')
+})
+
+test('Gemini host reports an unredeemed installation source separately from runtime', async () => {
+  const run = setup(() => ({ payload_state: 'awaiting_redemption', release_activated: false, environments: [] }))
+  assert.deepEqual((await run('GET', root)).body.data, {
+    available: true,
+    payload_state: 'awaiting_redemption',
+    payload_issue: null,
+    release_activated: false,
+    oauth_runtime_issue: null,
+    environments: [],
+  })
+  const invalidPayload = setup(() => {
+    throw Object.assign(new Error(), { code: 'gemini_payload_invalid' })
+  })
+  const result = await invalidPayload('POST', `${root}/environments`, { name: record.name, proxy_id: record.proxy_id })
+  assert.equal(result.status, 503)
+  assert.equal(result.body.error.code, 'gemini_payload_invalid')
+})
+
+test('Gemini redemption rejects Google codes and reports a different signed release as conflict', async () => {
+  let count = 0
+  const run = setup(() => {
+    count++
+    throw Object.assign(new Error('private information'), { code: 'gemini_release_payload_mismatch' })
+  })
+  const endpoint = `${root}/payload/redeem`
+  const invalid = await run('POST', endpoint, { redemption_code: '4/google-oauth-code' })
+  assert.equal(invalid.status, 400)
+  assert.equal(invalid.body.error.code, 'gemini_release_code_invalid')
+  assert.equal(count, 0)
+  const mismatch = await run('POST', endpoint, { redemption_code: `CGG1-${'A'.repeat(43)}` })
+  assert.equal(mismatch.status, 409)
+  assert.doesNotMatch(JSON.stringify(mismatch), /private information/)
 })
 
 test('only explicit platform SOCKS5 environments are created and credentials stay private', async () => {

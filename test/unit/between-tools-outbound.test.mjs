@@ -11,6 +11,7 @@ import {
 import { finalizeWorkerPayload } from '../../src/lib/transport/go-worker-client.mjs'
 import { outboundShape } from '../../src/lib/protocol/outbound-shape.mjs'
 import { prepareAnthropicRequest } from '../../src/lib/protocol/anthropic-policy.mjs'
+import { toClaudeMessages } from '../../src/lib/protocol/convert.mjs'
 import {
   applyThinkingDisplay,
   ensureOfficialPrintThinking,
@@ -84,5 +85,24 @@ test('display helpers and unofficial assembly never add fields to between_tools'
   ]) {
     assert.deepEqual(out.thinking, { type: 'between_tools' })
     assert.equal(out.max_tokens, 64)
+  }
+})
+
+test('Responses effort off drops the caller sampling it silently injects between_tools over', () => {
+  for (const effort of ['none', 'off']) {
+    const { claude } = toClaudeMessages(
+      'openai.responses',
+      {
+        model: 'claude-sonnet-5-5',
+        input: [{ role: 'user', content: 'Hi' }],
+        reasoning: { effort },
+        temperature: 0.3,
+        top_p: 0.5,
+      },
+      {},
+    )
+    assert.deepEqual(claude.thinking, { type: 'between_tools' })
+    assert.equal(Object.hasOwn(claude, 'temperature'), false)
+    assert.equal(Object.hasOwn(claude, 'top_p'), false)
   }
 })

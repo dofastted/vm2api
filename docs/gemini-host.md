@@ -9,6 +9,14 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 3. Google OAuth 和交互终端还需要 `ip`、`nft`、`setpriv`、支持非特权用户命名空间的 `bwrap`、vm2api 自带的 `kin-egress`、IPv4 转发和绑定的 SOCKS5 代理。预留服务配置中的 UID/GID 区间与 `198.18.252.0/27`；不要为此开放直连或调整全局转发策略。
 4. 安装器不覆盖已有载荷（包括旧 `rc.1`），也不覆盖 `/etc/vm2api` 的手工信任设置。自管载荷仍可使用 `prepare-gemini --gemini-payload-source DIR`，并在 `/etc/vm2api/gemini-ed25519.pub` 配置该载荷的受信公钥；已有手工兑换校验配置仍适用。载荷源目录及其父路径须由 root 所有且不可由非 root 写入，不可放在 `/tmp`。
 5. `--no-start` 跳过服务及默认载荷准备。Gemini 失败不阻断控制面安装或升级，可用 `sudo bash deploy/install.sh prepare-gemini` 单独重试，并通过 `journalctl -u vm2api-gemini.service` 查看原因。独立 Node 网关须加入 `vm2api` 组并重启以访问 `/run/vm2api-gemini/control.sock`；已有自定义 unit 要先迁移，避免争用 socket。
+6. 第 2 步的授权码在发行机对已签名、已解包的载荷签发：
+
+   ```sh
+   node scripts/issue-gemini-release-code.mjs --source /path/to/signed-payload \
+     --public-key /path/to/trusted-public-key --release-dir /path/to/private-release-records
+   ```
+
+   同一签名清单在同一私有发行目录只生成一个授权码。保留 `.code` 文件并私下交付授权码；仅将对应 `.json` 校验配置以 root 所有、`0600` 权限安装到宿主 `/etc/vm2api/gemini-release.json`，不提交明文授权码，也不要把签发私钥放到部署机。更换校验配置不会沿用旧版激活。
 
 ## 导入与验收边界
 

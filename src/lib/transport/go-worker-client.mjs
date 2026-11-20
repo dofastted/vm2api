@@ -559,9 +559,9 @@ function dumpSessionEnvelope(envelope) {
   } catch {}
 }
 
-function gateCragBody(body, print, health, isolated = false) {
+function gateCragBody(body, print, health, isolated = false, dropSampling = false) {
   if (!body || typeof body !== 'object') return body
-  if (print) alignSamplingWithThinking(body)
+  if (print) alignSamplingWithThinking(body, { drop: dropSampling })
   const caps = print && Array.isArray(health?.capabilities) ? health.capabilities : []
   const prompt = body.crag_prompt
   const model =
@@ -603,6 +603,7 @@ export function prepareWorkerPayload({
   cragPrint = null,
   requestContext = null,
   repaired = false,
+  dropSampling = false,
 } = {}) {
   const health = exec?.workerStatus
   const print = nativeCragRequest(exec, cragPrint)
@@ -644,7 +645,7 @@ export function prepareWorkerPayload({
     if (!cliHop) gated = sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
     else if (!officialBetas) gated = { ...main, betas: thread.betas }
   }
-  const directed = gateCragBody(gated, print, health, requestContext?.purpose === 'auto_mode_classifier')
+  const directed = gateCragBody(gated, print, health, requestContext?.purpose === 'auto_mode_classifier', dropSampling)
   return {
     headers,
     gated: directed,
@@ -687,6 +688,7 @@ async function workerEnvelope({
   cragPrint = null,
   callerCwd = null,
   repaired = false,
+  dropSampling = false,
   redactionPrincipal = '',
   redactionSession = '',
 } = {}) {
@@ -701,6 +703,7 @@ async function workerEnvelope({
     cragPrint,
     requestContext,
     repaired,
+    dropSampling,
   })
   const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
   // Mask the separated path with the same policy as the original system text.
