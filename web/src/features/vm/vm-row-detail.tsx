@@ -82,7 +82,7 @@ function HealthCard({ vm }: { vm: Vm }) {
                     : 'text-muted-foreground hover:bg-muted'
                 )}
               >
-                {r === '24h' ? '24h' : '7D'}
+                {r === '24h' ? '24h' : '近 7 天'}
               </button>
             ))}
           </span>
@@ -295,7 +295,7 @@ function CostCard({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
       cost: ledger[0].cost,
     },
     {
-      label: '7D',
+      label: '7 天额度窗口',
       req: week.req || null,
       tokens: ledger[1].tokens,
       cost: ledger[1].cost,
@@ -349,7 +349,7 @@ function CostCard({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
       </table>
       <div className='mt-3 grid grid-cols-3 gap-2 border-t pt-2.5'>
         <div>
-          <span className={KV_LABEL}>7D 成功 / 失败</span>
+          <span className={KV_LABEL}>7 天额度窗口 · 成功 / 失败</span>
           <b className={KV_VALUE}>
             <span className='text-[color:var(--status-ok)]'>
               {fmtNum(week.success)}
@@ -365,7 +365,7 @@ function CostCard({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
           </b>
         </div>
         <div>
-          <span className={KV_LABEL}>每请求 · 7D</span>
+          <span className={KV_LABEL}>每请求 · 7 天额度窗口</span>
           <b className={KV_VALUE}>
             {perReq == null ? '—' : `$${perReq.toFixed(3)}`}
           </b>
