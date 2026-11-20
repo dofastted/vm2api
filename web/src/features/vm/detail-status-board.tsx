@@ -413,7 +413,9 @@ export function VmStatusBoard(props: Props) {
           <h3 className='text-sm font-medium'>运行</h3>
           <div className='mt-3 grid grid-cols-2 gap-3'>
             <div>
-              <div className='text-xs text-muted-foreground'>今日</div>
+              <div className='text-xs text-muted-foreground'>
+                今日 · 北京时间
+              </div>
               <div className='mt-0.5 text-lg font-semibold tabular-nums'>
                 {fmtUsd(
                   Number(acc.today_cost ?? vm.today_cost ?? cost.today),
