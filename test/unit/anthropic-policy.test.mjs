@@ -465,6 +465,29 @@ test('legal sampling survives when thinking is off', () => {
   assert.equal(body.top_k, 10)
 })
 
+test('a drop retry sends no sampling instead of pinning temperature=1', () => {
+  const locked = { model: 'claude-opus-5-5', thinking: { type: 'adaptive' }, temperature: 1, top_p: 0.9, top_k: 40 }
+  const stripped = alignSamplingWithThinking(locked, { drop: true })
+  assert.equal(Object.hasOwn(stripped, 'temperature'), false)
+  assert.equal(Object.hasOwn(stripped, 'top_p'), false)
+  assert.equal(Object.hasOwn(stripped, 'top_k'), false)
+  // Thinking is a separate concern; a sampling refusal must not disturb it.
+  assert.deepEqual(stripped.thinking, { type: 'adaptive' })
+})
+
+test('dropSampling keeps the OAuth defaults from refilling temperature', () => {
+  const request = () => ({
+    model: 'claude-opus-5-5',
+    temperature: 0.7,
+    max_tokens: 1024,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  })
+  assert.equal(prepareAnthropicRequest(request()).temperature, 1)
+  const dropped = prepareAnthropicRequest(request(), { dropSampling: true })
+  assert.equal(Object.hasOwn(dropped, 'temperature'), false)
+  assert.equal(dropped.thinking?.type, 'adaptive')
+})
+
 test('sanitize is a no-op when the body has no context_management', () => {
   const body = { model: 'claude-haiku-4-5', messages: [] }
   assert.equal(sanitizeAnthropicBodyForBetaTokens(body, ''), body)
