@@ -38,6 +38,8 @@ import {
 } from '../../src/lib/vm/egress.mjs'
 import { parseCidr } from '../../src/lib/vm/subnet-pool.mjs'
 import { exitOf, remoteEgressIpam } from '../../src/lib/cluster/remote-slot.mjs'
+import { patchVmRecord } from '../../src/lib/vm/vm-registry.mjs'
+import { slotContainerNetworkMismatch } from '../../src/lib/vm/vm-runtime.mjs'
 
 /**
  * The behaviour this feature exists for was verified on a real cluster node
@@ -460,4 +462,85 @@ test('a claim expires so a slot that died starting cannot hold an address', () =
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+/**
+ * The switch entry point writes the mode and nothing else. These pin the parts
+ * an operator depends on when moving one VM at a time: that a VM the helper
+ * would refuse is stopped before the record changes, that the ordinary start
+ * path then recreates the slot onto the right network, and that rolling back
+ * leaves no address behind.
+ */
+function switchFixture(t, vms) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-switch-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  for (const vm of vms) {
+    fs.writeFileSync(path.join(root, 'vms', `${vm.id}.json`), `${JSON.stringify(vm, null, 2)}\n`)
+  }
+  return root
+}
+
+const perVmRecord = (id, proxyId, extra = {}) => ({
+  id,
+  status: 'running',
+  created_at: '2026-01-01T00:00:00.000Z',
+  ...(proxyId
+    ? { proxy: { id: proxyId, scheme: 'socks5h', host: `${proxyId}.example`, port: 1080, enabled: true } }
+    : {}),
+  runtime: { container: `kin-${id}`, network_mode: proxyId ? `kin-eg-${proxyId}` : 'bridge' },
+  ...extra,
+})
+
+test('switching a VM to shared makes the start path move it, and leaves others alone', (t) => {
+  const root = switchFixture(t, [perVmRecord('vm-01', 'px-aaaa1111'), perVmRecord('vm-03', 'px-aaaa1111')])
+  const file = path.join(root, 'vms', 'vm-01.json')
+
+  // What the switch writes: the mode, and no address — the boot path allocates
+  // that under the node lock, where it can reserve against slots starting
+  // beside it.
+  patchVmRecord(root, 'vm-01', (record) => ({ runtime: { ...record.runtime, egress_mode: 'shared' } }))
+  const switched = JSON.parse(fs.readFileSync(file, 'utf8'))
+  assert.equal(networkModeOf(switched), 'shared')
+  assert.equal(switched.runtime.shared_ip, undefined)
+
+  // The slot now resolves to the shared network, and the existing container is
+  // on the old one — which is what makes the ordinary start path recreate it.
+  assert.equal(slotNetworkForVm(switched), sharedNetworkName(''))
+  assert.equal(slotContainerNetworkMismatch({ networkMode: switched.runtime.network_mode }, switched), true)
+  // Until the address is allocated the slot refuses to start rather than
+  // letting docker pick one the route table does not name.
+  assert.equal(slotNetworkArgs(switched).error, 'shared_ip_missing')
+
+  // A VM sharing the same proxy is untouched: switching is one VM at a time.
+  const other = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-03.json'), 'utf8'))
+  assert.equal(networkModeOf(other), 'per-vm')
+  assert.equal(slotContainerNetworkMismatch({ networkMode: other.runtime.network_mode }, other), false)
+})
+
+test('rolling a VM back to per-vm drops the shared address', (t) => {
+  const root = switchFixture(t, [
+    perVmRecord('vm-01', 'px-aaaa1111', {
+      runtime: {
+        container: 'kin-vm-01',
+        network_mode: sharedNetworkName(''),
+        egress_mode: 'shared',
+        shared_ip: '100.64.16.7',
+      },
+    }),
+  ])
+  patchVmRecord(root, 'vm-01', (record) => {
+    const runtime = { ...record.runtime, egress_mode: 'per-vm' }
+    delete runtime.shared_ip
+    return { runtime }
+  })
+  const back = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-01.json'), 'utf8'))
+  assert.equal(networkModeOf(back), 'per-vm')
+  // Left behind, the address would still look like a member to the next prune,
+  // and the VM would hold a slot on a bridge it has left.
+  assert.equal(back.runtime.shared_ip, undefined)
+  assert.equal(slotNetworkForVm(back), 'kin-eg-px-aaaa1111')
+  // The container is on the shared network, so the start path recreates it.
+  assert.equal(slotContainerNetworkMismatch({ networkMode: back.runtime.network_mode }, back), true)
+  assert.deepEqual(slotNetworkArgs(back).args, ['--network', 'kin-eg-px-aaaa1111'])
 })
