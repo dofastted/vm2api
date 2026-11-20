@@ -459,7 +459,7 @@ const COLS: Col[] = [
     cell: (r) => (r.inflight ? r.inflight : <span className={TERT}>0</span>),
   },
   {
-    label: '近 7 天花费',
+    label: '7 天窗口花费',
     sort: 'spend',
     num: true,
     cell: (r) =>
@@ -675,7 +675,7 @@ function SummaryBar({ a }: { a: Agg }) {
         x={`北京时间今日 ${fmtNum(a.today)}`}
       />
       <Kpi
-        k='近 7 天花费'
+        k='7 天窗口花费'
         v={a.spend ? fmtUsd(a.spend, 2) : '—'}
         x={a.top ? `最高 ${a.top.vm.id} ${fmtUsd(a.top.spend, 0)}` : ''}
       />
@@ -946,7 +946,7 @@ export function VmTable({
                         </b>
                       </span>
                       <span>
-                        近 7 天花费{' '}
+                        7 天窗口花费{' '}
                         <b className='font-mono text-foreground'>
                           {sec.agg.spend ? fmtUsd(sec.agg.spend, 2) : '—'}
                         </b>
