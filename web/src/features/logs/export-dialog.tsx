@@ -132,7 +132,7 @@ export function ExportDialog({
               <ScopeOption
                 value='all'
                 title='不按页面筛选'
-                desc='仍受所选时间窗和条数上限限制'
+                desc='包含已屏蔽的错误类，仍受时间和条数限制'
               />
               <ScopeOption value='errors' title='仅错误'>
                 {scope === 'errors' ? (

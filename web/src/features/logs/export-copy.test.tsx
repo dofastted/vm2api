@@ -49,7 +49,7 @@ describe('log export wording', () => {
       />
     )
     expect(html).toContain('不按页面筛选')
-    expect(html).toContain('仍受所选时间窗和条数上限限制')
+    expect(html).toContain('包含已屏蔽的错误类，仍受时间和条数限制')
     expect(html).toContain('沿用当前筛选时间')
     expect(html).toContain('预设只替换起始时间，不改截止')
     expect(html).not.toContain('导出全量')
