@@ -13,9 +13,14 @@ import (
 	"time"
 )
 
-// srcConn fixes the peer address the helper sees. On a shared bridge that
-// address is the VM's own IP and it is the only thing that selects an upstream,
-// so every routing test has to be able to state it.
+// Per-source routing and fail-closed refusal were verified on a real cluster
+// node (aws-jp, 2026-11-20): two VMs on one shared bridge reached their own
+// SOCKS exits, and an unrouted source was refused with `no route for source`.
+// What is left here is what that node could not show — the shapes of a bad
+// route table, a dual-stack peer address, concurrency, and reload.
+
+// srcConn fixes the peer address the helper sees. On a shared bridge that is
+// the VM's own address and the only thing that selects an upstream.
 type srcConn struct {
 	net.Conn
 	remote net.Addr
@@ -47,9 +52,8 @@ func routeEcho(t *testing.T) net.Listener {
 	return ln
 }
 
-// clientFrom returns the test's end of a connection plus the end ForwardTCP
-// serves, which reports src as its peer. A src of "" leaves net.Pipe's own
-// unparsable "pipe" address in place.
+// clientFrom returns the test's end plus the end ForwardTCP serves, reporting
+// src as its peer. A src of "" leaves net.Pipe's unparsable "pipe" address.
 func clientFrom(t *testing.T, src string) (net.Conn, net.Conn) {
 	t.Helper()
 	mine, theirs := net.Pipe()
@@ -70,9 +74,9 @@ func routeRoundTrip(t *testing.T, client net.Conn, msg string) {
 }
 
 // refusal returns how ForwardTCP ended, insisting the answer arrives promptly.
-// A helper that forwards an unrouted conn instead of refusing it would sit in a
-// splice until IdleClose, so without a deadline here a wrong decision hangs the
-// test for seven minutes instead of failing it.
+// A helper that forwards an unrouted conn instead of refusing it would sit in
+// a splice until IdleClose, hanging the test for seven minutes rather than
+// failing it.
 func refusal(t *testing.T, srv *Server, served net.Conn, dest string) error {
 	t.Helper()
 	done := make(chan error, 1)
@@ -88,9 +92,19 @@ func refusal(t *testing.T, srv *Server, served net.Conn, dest string) error {
 	}
 }
 
-func TestForwardTCPRoutesEachSourceToItsOwnUpstream(t *testing.T) {
+func assertNoRoute(t *testing.T, err error, label string) {
+	t.Helper()
+	var se *spliceError
+	if !errors.As(err, &se) || se.class != classNoRoute {
+		t.Fatalf("%s: got %v, want a %s spliceError", label, err, classNoRoute)
+	}
+}
+
+func TestForwardTCPSelectsTheExitForTheSourceAddress(t *testing.T) {
 	echo := routeEcho(t)
 	var hitsDefault, hitsA, hitsB atomic.Int32
+	// proxy_url is set here only so the test can prove it stays unused; a real
+	// shared helper leaves it empty (see TestSharedHelperNeedsNoDefaultExit).
 	srv, err := New(Config{
 		ListenTCP: "127.0.0.1:0",
 		ProxyURL:  countingSOCKS(t, &hitsDefault),
@@ -108,197 +122,179 @@ func TestForwardTCPRoutesEachSourceToItsOwnUpstream(t *testing.T) {
 	for _, tc := range []struct{ src, msg string }{
 		{"100.64.0.10:51000", "from-a"},
 		{"100.64.0.11:51000", "from-b"},
+		// A helper on a dual-stack socket sees the same VM as ::ffff:a.b.c.d,
+		// while the route table is keyed on the plain form.
+		{"[::ffff:100.64.0.10]:51001", "mapped"},
 	} {
 		client, served := clientFrom(t, tc.src)
 		go func() { _ = srv.ForwardTCP(ctx, served, echo.Addr().String()) }()
 		routeRoundTrip(t, client, tc.msg)
 	}
-
-	if hitsA.Load() != 1 || hitsB.Load() != 1 {
-		t.Fatalf("per-route hits a=%d b=%d, want 1 each", hitsA.Load(), hitsB.Load())
+	if hitsA.Load() != 2 || hitsB.Load() != 1 {
+		t.Fatalf("per-route hits a=%d b=%d, want 2 and 1", hitsA.Load(), hitsB.Load())
 	}
-	// ProxyURL stays unused while routes are configured: a shared helper that
-	// quietly falls back to it sends one VM's traffic out of another's exit.
+
+	// An address not in the table, and one that cannot be read, are refused
+	// the same way. Falling back to ProxyURL would send an unauthorised VM's
+	// traffic out through someone else's exit.
+	for _, src := range []string{"100.64.0.99:51000", ""} {
+		_, served := clientFrom(t, src)
+		assertNoRoute(t, refusal(t, srv, served, echo.Addr().String()), fmt.Sprintf("source %q", src))
+	}
 	if hitsDefault.Load() != 0 {
 		t.Fatalf("configured ProxyURL took %d conns while routes are set", hitsDefault.Load())
 	}
 }
 
-func TestForwardTCPRefusesASourceWithNoRoute(t *testing.T) {
-	echo := routeEcho(t)
-	var hitsDefault, hitsA atomic.Int32
-	srv, err := New(Config{
-		ListenTCP: "127.0.0.1:0",
-		ProxyURL:  countingSOCKS(t, &hitsDefault),
-		Routes:    []Route{{VMIP: "100.64.0.10", ProxyURL: countingSOCKS(t, &hitsA)}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, served := clientFrom(t, "100.64.0.99:51000")
-	err = refusal(t, srv, served, echo.Addr().String())
-	var se *spliceError
-	if !errors.As(err, &se) || se.class != classNoRoute {
-		t.Fatalf("got %v, want a %s spliceError", err, classNoRoute)
-	}
-	if !strings.Contains(err.Error(), "100.64.0.99") {
-		t.Fatalf("error %q does not name the refused source", err)
-	}
-	// Fail-closed: no upstream at all saw the connection.
-	if hitsDefault.Load() != 0 || hitsA.Load() != 0 {
-		t.Fatalf("refused conn still reached an upstream: default=%d a=%d", hitsDefault.Load(), hitsA.Load())
-	}
-}
-
-func TestForwardTCPRefusesAnUnparsableSourceWhenRoutesAreConfigured(t *testing.T) {
-	echo := routeEcho(t)
-	var hitsDefault, hitsA atomic.Int32
-	srv, err := New(Config{
-		ListenTCP: "127.0.0.1:0",
-		ProxyURL:  countingSOCKS(t, &hitsDefault),
-		Routes:    []Route{{VMIP: "100.64.0.10", ProxyURL: countingSOCKS(t, &hitsA)}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// A peer address the helper cannot read is not a reason to pick an exit for
-	// it: unreadable has to fail the same way unknown does.
-	_, served := clientFrom(t, "")
-	err = refusal(t, srv, served, echo.Addr().String())
-	var se *spliceError
-	if !errors.As(err, &se) || se.class != classNoRoute {
-		t.Fatalf("got %v, want a %s spliceError", err, classNoRoute)
-	}
-	if hitsDefault.Load() != 0 || hitsA.Load() != 0 {
-		t.Fatalf("refused conn still reached an upstream: default=%d a=%d", hitsDefault.Load(), hitsA.Load())
-	}
-}
-
-func TestForwardTCPMatchesAnIPv4MappedSource(t *testing.T) {
-	echo := routeEcho(t)
-	var hitsDefault, hitsA atomic.Int32
-	srv, err := New(Config{
-		ListenTCP: "127.0.0.1:0",
-		ProxyURL:  countingSOCKS(t, &hitsDefault),
-		Routes:    []Route{{VMIP: "100.64.0.10", ProxyURL: countingSOCKS(t, &hitsA)}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	// A helper on a dual-stack socket sees the same VM as ::ffff:100.64.0.10.
-	client, served := clientFrom(t, "[::ffff:100.64.0.10]:51000")
-	go func() { _ = srv.ForwardTCP(ctx, served, echo.Addr().String()) }()
-	routeRoundTrip(t, client, "mapped")
-	if hitsA.Load() != 1 || hitsDefault.Load() != 0 {
-		t.Fatalf("mapped source hits a=%d default=%d, want 1 and 0", hitsA.Load(), hitsDefault.Load())
-	}
-}
-
 func TestForwardTCPWithoutRoutesKeepsTheSingleExit(t *testing.T) {
 	echo := routeEcho(t)
-	var hitsDefault atomic.Int32
-	srv, err := New(Config{ListenTCP: "127.0.0.1:0", ProxyURL: countingSOCKS(t, &hitsDefault)})
+	var hits atomic.Int32
+	srv, err := New(Config{ListenTCP: "127.0.0.1:0", ProxyURL: countingSOCKS(t, &hits)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// A per-VM helper has no route table and its peer address is never read, so
-	// an address that routing could not parse must still be forwarded.
+	// A per-VM helper reads no source address, so one it could not parse must
+	// still be forwarded.
 	client, served := clientFrom(t, "")
 	go func() { _ = srv.ForwardTCP(ctx, served, echo.Addr().String()) }()
 	routeRoundTrip(t, client, "single-exit")
-	if hitsDefault.Load() != 1 {
-		t.Fatalf("single-exit hits=%d, want 1", hitsDefault.Load())
+	if hits.Load() != 1 {
+		t.Fatalf("single-exit hits=%d, want 1", hits.Load())
 	}
 }
 
-func TestNewRejectsAnInvalidRouteTable(t *testing.T) {
+func TestSharedHelperNeedsNoDefaultExit(t *testing.T) {
+	echo := routeEcho(t)
+	var hitsA, hitsB atomic.Int32
+	// No proxy_url at all: there is no default exit to reach even by mistake.
+	// A placeholder would read as a sanctioned default in the config and logs.
+	// Verified on a real node, where an empty one started cleanly on the new
+	// binary and was refused by the old one with `unsupported proxy scheme ""`.
+	srv, err := New(Config{
+		ListenTCP: "127.0.0.1:0",
+		Routes: []Route{
+			{VMIP: "100.64.0.10", ProxyURL: countingSOCKS(t, &hitsA)},
+			{VMIP: "100.64.0.11", ProxyURL: countingSOCKS(t, &hitsB)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("shared helper without proxy_url rejected: %v", err)
+	}
+	if srv.rt().def != nil {
+		t.Fatal("a helper configured without proxy_url still built a default exit")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client, served := clientFrom(t, "100.64.0.11:51000")
+	go func() { _ = srv.ForwardTCP(ctx, served, echo.Addr().String()) }()
+	routeRoundTrip(t, client, "shared-only")
+
+	// The refusal path must not depend on a default exit being present.
+	_, servedUnknown := clientFrom(t, "100.64.0.99:51000")
+	assertNoRoute(t, refusal(t, srv, servedUnknown, echo.Addr().String()), "unrouted source")
+	if hitsB.Load() != 1 || hitsA.Load() != 0 {
+		t.Fatalf("hits a=%d b=%d, want 0 and 1", hitsA.Load(), hitsB.Load())
+	}
+}
+
+func TestNewRejectsAnUnusableConfig(t *testing.T) {
 	// Each of these would otherwise become a VM refused at dial time by a
 	// reload that reported success.
 	for _, tc := range []struct {
-		name   string
-		routes []Route
-		want   string
+		name string
+		cfg  Config
+		want string
 	}{
 		{
-			name:   "duplicate vm ip",
-			routes: []Route{{VMIP: "100.64.0.10", ProxyURL: "socks5h://127.0.0.1:1"}, {VMIP: "100.64.0.10", ProxyURL: "socks5h://127.0.0.1:2"}},
-			want:   "duplicate",
+			name: "duplicate vm ip",
+			cfg:  Config{Routes: []Route{{VMIP: "100.64.0.10", ProxyURL: "socks5h://127.0.0.1:1"}, {VMIP: "100.64.0.10", ProxyURL: "socks5h://127.0.0.1:2"}}},
+			want: "duplicate",
 		},
 		{
-			name:   "duplicate across mapped form",
-			routes: []Route{{VMIP: "100.64.0.10", ProxyURL: "socks5h://127.0.0.1:1"}, {VMIP: "::ffff:100.64.0.10", ProxyURL: "socks5h://127.0.0.1:2"}},
-			want:   "duplicate",
+			name: "duplicate across the mapped form",
+			cfg:  Config{Routes: []Route{{VMIP: "100.64.0.10", ProxyURL: "socks5h://127.0.0.1:1"}, {VMIP: "::ffff:100.64.0.10", ProxyURL: "socks5h://127.0.0.1:2"}}},
+			want: "duplicate",
 		},
 		{
-			name:   "unparsable vm ip",
-			routes: []Route{{VMIP: "100.64.0.10/28", ProxyURL: "socks5h://127.0.0.1:1"}},
-			want:   "unparsable vm_ip",
+			name: "unparsable vm ip",
+			cfg:  Config{Routes: []Route{{VMIP: "100.64.0.10/28", ProxyURL: "socks5h://127.0.0.1:1"}}},
+			want: "unparsable vm_ip",
 		},
 		{
-			name:   "empty vm ip",
-			routes: []Route{{VMIP: "", ProxyURL: "socks5h://127.0.0.1:1"}},
-			want:   "unparsable vm_ip",
+			name: "missing proxy url",
+			cfg:  Config{Routes: []Route{{VMIP: "100.64.0.10", ProxyURL: "   "}}},
+			want: "proxy_url is required",
 		},
 		{
-			name:   "missing proxy url",
-			routes: []Route{{VMIP: "100.64.0.10", ProxyURL: "   "}},
-			want:   "proxy_url is required",
+			// Neither routes nor proxy_url: a helper with nowhere to send
+			// anything, which has to fail at load rather than accept conns.
+			name: "nothing to serve",
+			cfg:  Config{},
+			want: "proxy_url is required",
 		},
 		{
-			name:   "unsupported proxy scheme",
-			routes: []Route{{VMIP: "100.64.0.10", ProxyURL: "ftp://127.0.0.1:1"}},
-			want:   "100.64.0.10",
+			// The observed-domain table is one per helper, so sharing it would
+			// let one VM's lookups rewrite another VM's destinations.
+			name: "domain forward with routes",
+			cfg:  Config{ProxyURL: "socks5h://127.0.0.1:1", DomainForward: true, Routes: []Route{{VMIP: "100.64.0.10", ProxyURL: "socks5h://127.0.0.1:2"}}},
+			want: "domain_forward",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := New(Config{ListenTCP: "127.0.0.1:0", ProxyURL: "socks5h://127.0.0.1:1", Routes: tc.routes})
+			cfg := tc.cfg
+			cfg.ListenTCP = "127.0.0.1:0"
+			_, err := New(cfg)
 			if err == nil {
-				t.Fatalf("invalid route table accepted: %+v", tc.routes)
+				t.Fatalf("accepted an unusable config: %+v", cfg)
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error %q does not mention %q", err, tc.want)
 			}
 		})
 	}
+	// domain_forward alone stays valid: it is only shared mode it conflicts with.
+	if _, err := New(Config{ListenTCP: "127.0.0.1:0", ProxyURL: "socks5h://127.0.0.1:1", DomainForward: true}); err != nil {
+		t.Fatalf("domain_forward alone rejected: %v", err)
+	}
 }
 
-func TestReloadSwapsRoutesAndKeepsRunningOnABadTable(t *testing.T) {
+func TestReloadSwitchesBetweenShapesAndKeepsEstablishedConns(t *testing.T) {
 	echo := routeEcho(t)
-	var hitsSingle, hitsA, hitsB atomic.Int32
+	var hitsSingle, hitsA atomic.Int32
 	single := countingSOCKS(t, &hitsSingle)
+	routeA := countingSOCKS(t, &hitsA)
 	srv, err := New(Config{ListenTCP: "127.0.0.1:0", ProxyURL: single})
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Opened before the switch, and must survive it. (Verified on a real node
+	// too: a VM joining by SIGHUP left an established conn intact.)
+	old, oldPeer := net.Pipe()
+	defer old.Close()
+	go func() { _ = srv.ForwardTCP(ctx, oldPeer, echo.Addr().String()) }()
+	routeRoundTrip(t, old, "before")
 
-	// Single exit -> shared: the same helper starts selecting by source.
-	shared := Config{
-		ListenTCP: "127.0.0.1:0",
-		ProxyURL:  single,
-		Routes: []Route{
-			{VMIP: "100.64.0.10", ProxyURL: countingSOCKS(t, &hitsA)},
-			{VMIP: "100.64.0.11", ProxyURL: countingSOCKS(t, &hitsB)},
-		},
-	}
+	// per-VM -> shared: the default exit is dropped along with proxy_url.
+	shared := Config{ListenTCP: "127.0.0.1:0", Routes: []Route{{VMIP: "100.64.0.10", ProxyURL: routeA}}}
 	if err := srv.Reload(shared); err != nil {
 		t.Fatal(err)
 	}
-	client, served := clientFrom(t, "100.64.0.11:51000")
-	go func() { _ = srv.ForwardTCP(ctx, served, echo.Addr().String()) }()
-	routeRoundTrip(t, client, "after-reload")
-	if hitsB.Load() != 1 || hitsSingle.Load() != 0 {
-		t.Fatalf("after reload b=%d single=%d, want 1 and 0", hitsB.Load(), hitsSingle.Load())
+	if srv.rt().def != nil {
+		t.Fatal("reload to shared kept a default exit")
 	}
+	routeRoundTrip(t, old, "still-connected")
+	client, served := clientFrom(t, "100.64.0.10:51000")
+	go func() { _ = srv.ForwardTCP(ctx, served, echo.Addr().String()) }()
+	routeRoundTrip(t, client, "to-shared")
 
+	// A rejected reload leaves the running table untouched.
 	before := srv.rt()
 	bad := shared
-	bad.Routes = append(append([]Route(nil), shared.Routes...), Route{VMIP: "100.64.0.11", ProxyURL: "socks5h://127.0.0.1:9"})
+	bad.Routes = append(append([]Route(nil), shared.Routes...), Route{VMIP: "100.64.0.10", ProxyURL: "socks5h://127.0.0.1:9"})
 	if err := srv.Reload(bad); err == nil {
 		t.Fatal("reload accepted a duplicate route")
 	}
@@ -306,22 +302,21 @@ func TestReloadSwapsRoutesAndKeepsRunningOnABadTable(t *testing.T) {
 		t.Fatal("a rejected reload replaced the running routes")
 	}
 
-	// Shared -> single exit is the rollback path: routes gone, ProxyURL serves
-	// every source again.
+	// shared -> per-VM is the rollback: proxy_url returns and serves everyone.
 	if err := srv.Reload(Config{ListenTCP: "127.0.0.1:0", ProxyURL: single}); err != nil {
 		t.Fatal(err)
 	}
-	rollback, servedBack := clientFrom(t, "100.64.0.99:51000")
+	back, servedBack := clientFrom(t, "100.64.0.99:51000")
 	go func() { _ = srv.ForwardTCP(ctx, servedBack, echo.Addr().String()) }()
-	routeRoundTrip(t, rollback, "rolled-back")
-	if hitsSingle.Load() != 1 {
-		t.Fatalf("after rollback single=%d, want 1", hitsSingle.Load())
+	routeRoundTrip(t, back, "rolled-back")
+	if hitsA.Load() != 1 || hitsSingle.Load() != 2 {
+		t.Fatalf("hits route=%d single=%d, want 1 and 2", hitsA.Load(), hitsSingle.Load())
 	}
 }
 
 func TestForwardTCPRoutesConcurrentlyAcrossSources(t *testing.T) {
 	echo := routeEcho(t)
-	const vms = 8
+	const vms = 6
 	const perVM = 4
 	var hitsDefault atomic.Int32
 	hits := make([]*atomic.Int32, vms)
@@ -368,11 +363,10 @@ func TestForwardTCPRoutesConcurrentlyAcrossSources(t *testing.T) {
 		wg.Add(1)
 		go func(j int) {
 			defer wg.Done()
-			_, served := clientFrom(t, fmt.Sprintf("100.64.1.%d:%d", j, 51000))
-			fErr := refusal(t, srv, served, echo.Addr().String())
+			_, served := clientFrom(t, fmt.Sprintf("100.64.1.%d:51000", j))
 			var se *spliceError
-			if !errors.As(fErr, &se) || se.class != classNoRoute {
-				errCh <- fmt.Errorf("unrouted source under load: got %v, want a %s spliceError", fErr, classNoRoute)
+			if fErr := refusal(t, srv, served, echo.Addr().String()); !errors.As(fErr, &se) || se.class != classNoRoute {
+				errCh <- fmt.Errorf("unrouted source under load: got %v, want %s", fErr, classNoRoute)
 			}
 		}(j)
 	}
@@ -388,111 +382,5 @@ func TestForwardTCPRoutesConcurrentlyAcrossSources(t *testing.T) {
 	}
 	if hitsDefault.Load() != 0 {
 		t.Errorf("configured ProxyURL took %d conns under load", hitsDefault.Load())
-	}
-}
-
-// A shared helper is configured with routes and no proxy_url at all: there is
-// no default exit to serve a source the table does not cover, not even by
-// mistake.
-func sharedOnlyHelper(t *testing.T, hitsA, hitsB *atomic.Int32) *Server {
-	t.Helper()
-	srv, err := New(Config{
-		ListenTCP: "127.0.0.1:0",
-		Routes: []Route{
-			{VMIP: "100.64.0.10", ProxyURL: countingSOCKS(t, hitsA)},
-			{VMIP: "100.64.0.11", ProxyURL: countingSOCKS(t, hitsB)},
-		},
-	})
-	if err != nil {
-		t.Fatalf("shared helper without proxy_url rejected: %v", err)
-	}
-	return srv
-}
-
-func TestSharedHelperNeedsNoDefaultExit(t *testing.T) {
-	echo := routeEcho(t)
-	var hitsA, hitsB atomic.Int32
-	srv := sharedOnlyHelper(t, &hitsA, &hitsB)
-	if srv.rt().def != nil {
-		t.Fatal("a helper configured without proxy_url still built a default exit")
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	client, served := clientFrom(t, "100.64.0.11:51000")
-	go func() { _ = srv.ForwardTCP(ctx, served, echo.Addr().String()) }()
-	routeRoundTrip(t, client, "shared-only")
-	if hitsB.Load() != 1 || hitsA.Load() != 0 {
-		t.Fatalf("hits a=%d b=%d, want 0 and 1", hitsA.Load(), hitsB.Load())
-	}
-}
-
-func TestSharedHelperWithoutADefaultExitStillRefusesCleanly(t *testing.T) {
-	echo := routeEcho(t)
-	var hitsA, hitsB atomic.Int32
-	srv := sharedOnlyHelper(t, &hitsA, &hitsB)
-	// The refusal path must not depend on a default exit being present.
-	for _, src := range []string{"100.64.0.99:51000", ""} {
-		_, served := clientFrom(t, src)
-		err := refusal(t, srv, served, echo.Addr().String())
-		var se *spliceError
-		if !errors.As(err, &se) || se.class != classNoRoute {
-			t.Fatalf("source %q: got %v, want a %s spliceError", src, err, classNoRoute)
-		}
-	}
-	if hitsA.Load() != 0 || hitsB.Load() != 0 {
-		t.Fatalf("refused conns reached an upstream: a=%d b=%d", hitsA.Load(), hitsB.Load())
-	}
-}
-
-func TestNewRejectsAHelperThatCanServeNothing(t *testing.T) {
-	// No routes and no proxy_url is a helper with nowhere to send anything; it
-	// has to fail at load rather than accept connections it cannot serve.
-	for _, cfg := range []Config{
-		{ListenTCP: "127.0.0.1:0"},
-		{ListenTCP: "127.0.0.1:0", ProxyURL: "   "},
-	} {
-		if _, err := New(cfg); err == nil {
-			t.Fatalf("accepted a helper with neither routes nor proxy_url: %+v", cfg)
-		} else if !strings.Contains(err.Error(), "proxy_url is required") {
-			t.Fatalf("error %q does not explain what is missing", err)
-		}
-	}
-}
-
-func TestReloadSwitchesBetweenSharedAndPerVmShapes(t *testing.T) {
-	echo := routeEcho(t)
-	var hitsSingle, hitsA atomic.Int32
-	single := countingSOCKS(t, &hitsSingle)
-	routeA := countingSOCKS(t, &hitsA)
-	srv, err := New(Config{ListenTCP: "127.0.0.1:0", ProxyURL: single})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// per-VM -> shared: the default exit is dropped along with proxy_url.
-	if err := srv.Reload(Config{ListenTCP: "127.0.0.1:0", Routes: []Route{{VMIP: "100.64.0.10", ProxyURL: routeA}}}); err != nil {
-		t.Fatal(err)
-	}
-	if srv.rt().def != nil {
-		t.Fatal("reload to shared kept a default exit")
-	}
-	client, served := clientFrom(t, "100.64.0.10:51000")
-	go func() { _ = srv.ForwardTCP(ctx, served, echo.Addr().String()) }()
-	routeRoundTrip(t, client, "to-shared")
-
-	// shared -> per-VM is the rollback: proxy_url returns and serves everyone.
-	if err := srv.Reload(Config{ListenTCP: "127.0.0.1:0", ProxyURL: single}); err != nil {
-		t.Fatal(err)
-	}
-	if srv.rt().def == nil {
-		t.Fatal("rollback to per-VM left no default exit")
-	}
-	back, servedBack := clientFrom(t, "100.64.0.99:51000")
-	go func() { _ = srv.ForwardTCP(ctx, servedBack, echo.Addr().String()) }()
-	routeRoundTrip(t, back, "rolled-back")
-	if hitsA.Load() != 1 || hitsSingle.Load() != 1 {
-		t.Fatalf("hits route=%d single=%d, want 1 each", hitsA.Load(), hitsSingle.Load())
 	}
 }

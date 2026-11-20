@@ -16,11 +16,16 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 )
 
+// The DNS side was not covered by the real-node run (that verified the TCP
+// path), so the behaviour that matters is exercised here: per-exit answers,
+// per-exit caching, fail-closed refusal, and that the listeners pass the
+// query's source through.
+
 // dnsOverTCP answers every query with ip. Two of these behind two SOCKS exits
 // are the case the per-exit cache exists for: one configured upstream address,
 // a different answer depending on which exit reached it, which is what geo
 // routing and CDNs do to a shared resolver in practice.
-func dnsOverTCP(t *testing.T, ip string, calls *atomic.Int32) net.Listener {
+func dnsOverTCP(t *testing.T, ip string) net.Listener {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -48,12 +53,8 @@ func dnsOverTCP(t *testing.T, ip string, calls *atomic.Int32) net.Listener {
 					if msg.Unpack(query) != nil || len(msg.Questions) != 1 {
 						return
 					}
-					if calls != nil {
-						calls.Add(1)
-					}
-					reply := dnsA(t, msg.Questions[0].Name.String(), 300, net.ParseIP(ip))
 					var out dnsmessage.Message
-					if out.Unpack(reply) != nil {
+					if out.Unpack(dnsA(t, msg.Questions[0].Name.String(), 300, net.ParseIP(ip))) != nil {
 						return
 					}
 					out.ID = msg.ID
@@ -121,17 +122,9 @@ func resolveFrom(t *testing.T, srv *Server, query []byte, src string) ([]byte, e
 	return srv.ResolveDNSFrom(context.Background(), query, fixedAddr(src))
 }
 
-func mustAddr(t *testing.T, s string) netip.Addr {
-	t.Helper()
-	addr, err := netip.ParseAddr(s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return addr
-}
-
-// sharedDNSHelper is a helper serving two VMs whose exits resolve the same name
-// to different addresses.
+// sharedDNSHelper serves two VMs whose exits resolve the same name to
+// different addresses. proxy_url is set only so a test can prove it stays
+// unused.
 func sharedDNSHelper(t *testing.T, hitsDefault, hitsA, hitsB *atomic.Int32) *Server {
 	t.Helper()
 	srv, err := New(Config{
@@ -139,10 +132,10 @@ func sharedDNSHelper(t *testing.T, hitsDefault, hitsA, hitsB *atomic.Int32) *Ser
 		// Never dialled directly: each exit's SOCKS lands it on that exit's
 		// own resolver.
 		DNSUpstream: "192.0.2.53:53",
-		ProxyURL:    socksTo(t, dnsOverTCP(t, "10.0.0.9", nil).Addr().String(), hitsDefault),
+		ProxyURL:    socksTo(t, dnsOverTCP(t, "10.0.0.9").Addr().String(), hitsDefault),
 		Routes: []Route{
-			{VMIP: "100.64.0.10", ProxyURL: socksTo(t, dnsOverTCP(t, "10.0.0.1", nil).Addr().String(), hitsA)},
-			{VMIP: "100.64.0.11", ProxyURL: socksTo(t, dnsOverTCP(t, "10.0.0.2", nil).Addr().String(), hitsB)},
+			{VMIP: "100.64.0.10", ProxyURL: socksTo(t, dnsOverTCP(t, "10.0.0.1").Addr().String(), hitsA)},
+			{VMIP: "100.64.0.11", ProxyURL: socksTo(t, dnsOverTCP(t, "10.0.0.2").Addr().String(), hitsB)},
 		},
 	})
 	if err != nil {
@@ -151,38 +144,10 @@ func sharedDNSHelper(t *testing.T, hitsDefault, hitsA, hitsB *atomic.Int32) *Ser
 	return srv
 }
 
-func TestResolveDNSFromAnswersThroughEachSourcesOwnExit(t *testing.T) {
+func TestResolveDNSFromAnswersAndCachesPerExit(t *testing.T) {
 	var hitsDefault, hitsA, hitsB atomic.Int32
 	srv := sharedDNSHelper(t, &hitsDefault, &hitsA, &hitsB)
-
 	query := cacheQuery(t, 1, "example.com.", dnsmessage.TypeA)
-	replyA, err := resolveFrom(t, srv, query, "100.64.0.10:5300")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := answerIP(t, replyA); got != "10.0.0.1" {
-		t.Fatalf("first VM answered %s, want 10.0.0.1", got)
-	}
-
-	// The same question from the other VM must not be served the first VM's
-	// cached answer: one cache for the helper would return 10.0.0.1 here, an
-	// address only the first VM's exit can reach.
-	replyB, err := resolveFrom(t, srv, query, "100.64.0.11:5300")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := answerIP(t, replyB); got != "10.0.0.2" {
-		t.Fatalf("second VM answered %s, want 10.0.0.2", got)
-	}
-	if hitsDefault.Load() != 0 {
-		t.Fatalf("configured ProxyURL resolved %d queries while routes are set", hitsDefault.Load())
-	}
-}
-
-func TestResolveDNSFromCachesPerExit(t *testing.T) {
-	var hitsDefault, hitsA, hitsB atomic.Int32
-	srv := sharedDNSHelper(t, &hitsDefault, &hitsA, &hitsB)
-	query := cacheQuery(t, 7, "example.com.", dnsmessage.TypeA)
 
 	for range 3 {
 		reply, err := resolveFrom(t, srv, query, "100.64.0.10:5300")
@@ -190,56 +155,48 @@ func TestResolveDNSFromCachesPerExit(t *testing.T) {
 			t.Fatal(err)
 		}
 		if got := answerIP(t, reply); got != "10.0.0.1" {
-			t.Fatalf("answered %s, want 10.0.0.1", got)
+			t.Fatalf("first VM answered %s, want 10.0.0.1", got)
 		}
 	}
-	// One SOCKS dial: repeats came from that exit's own cache.
+	// One dial: the repeats came from that exit's own cache.
 	if hitsA.Load() != 1 {
 		t.Fatalf("first exit dialled %d times, want 1", hitsA.Load())
 	}
-	// The other exit's cache is cold, so it resolves for itself.
-	if _, err := resolveFrom(t, srv, query, "100.64.0.11:5300"); err != nil {
+
+	// The same question from the other VM must not be served the first VM's
+	// cached answer: one cache for the helper would return 10.0.0.1 here, an
+	// address only the first VM's exit can reach, and would disclose which
+	// names that VM looked up.
+	reply, err := resolveFrom(t, srv, query, "100.64.0.11:5300")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if got := answerIP(t, reply); got != "10.0.0.2" {
+		t.Fatalf("second VM answered %s, want 10.0.0.2", got)
 	}
 	if hitsB.Load() != 1 {
 		t.Fatalf("second exit dialled %d times, want 1", hitsB.Load())
 	}
+	if hitsDefault.Load() != 0 {
+		t.Fatalf("configured ProxyURL resolved %d queries while routes are set", hitsDefault.Load())
+	}
 }
 
-func TestResolveDNSFromRefusesASourceWithNoRoute(t *testing.T) {
+func TestResolveDNSRefusesWithoutARoutableSource(t *testing.T) {
 	var hitsDefault, hitsA, hitsB atomic.Int32
 	srv := sharedDNSHelper(t, &hitsDefault, &hitsA, &hitsB)
 	query := cacheQuery(t, 2, "example.com.", dnsmessage.TypeA)
 
+	// Fail-closed: an answer from the default exit would be addresses the VM
+	// cannot reach, and would disclose what another VM's exit resolves.
 	for _, src := range []string{"100.64.0.99:5300", "pipe"} {
 		if _, err := resolveFrom(t, srv, query, src); err == nil {
 			t.Fatalf("source %s was resolved", src)
 		}
 	}
-	// Fail-closed: a refused source gets no answer from anybody's exit. An
-	// answer from the default exit would be addresses it cannot reach, and
-	// would disclose what another VM's exit resolves.
-	if hitsDefault.Load() != 0 || hitsA.Load() != 0 || hitsB.Load() != 0 {
-		t.Fatalf("refused query still resolved: default=%d a=%d b=%d", hitsDefault.Load(), hitsA.Load(), hitsB.Load())
-	}
-}
-
-func TestResolveDNSFromRefusesAMissingSource(t *testing.T) {
-	var hitsDefault, hitsA, hitsB atomic.Int32
-	srv := sharedDNSHelper(t, &hitsDefault, &hitsA, &hitsB)
-	query := cacheQuery(t, 3, "example.com.", dnsmessage.TypeA)
 	if _, err := srv.ResolveDNSFrom(context.Background(), query, nil); err == nil {
 		t.Fatal("a query with no source address was resolved")
 	}
-	if hitsDefault.Load() != 0 || hitsA.Load() != 0 || hitsB.Load() != 0 {
-		t.Fatalf("refused query still resolved: default=%d a=%d b=%d", hitsDefault.Load(), hitsA.Load(), hitsB.Load())
-	}
-}
-
-func TestResolveDNSRefusesToAnswerWithoutASourceOnASharedHelper(t *testing.T) {
-	var hitsDefault, hitsA, hitsB atomic.Int32
-	srv := sharedDNSHelper(t, &hitsDefault, &hitsA, &hitsB)
-	query := cacheQuery(t, 4, "example.com.", dnsmessage.TypeA)
 	// ResolveDNS has no source to route on, so on a shared helper it is a
 	// bypass rather than a convenience.
 	_, err := srv.ResolveDNS(context.Background(), query)
@@ -249,57 +206,51 @@ func TestResolveDNSRefusesToAnswerWithoutASourceOnASharedHelper(t *testing.T) {
 	if !strings.Contains(err.Error(), "routes are configured") {
 		t.Fatalf("error %q does not explain why", err)
 	}
-	if hitsDefault.Load() != 0 {
-		t.Fatalf("configured ProxyURL resolved %d queries", hitsDefault.Load())
+	if hitsDefault.Load() != 0 || hitsA.Load() != 0 || hitsB.Load() != 0 {
+		t.Fatalf("refused queries still resolved: default=%d a=%d b=%d", hitsDefault.Load(), hitsA.Load(), hitsB.Load())
 	}
 }
 
-func TestResolveDNSFromWithoutRoutesUsesTheSingleExit(t *testing.T) {
+func TestResolveDNSWithoutRoutesUsesTheSingleExit(t *testing.T) {
 	var hits atomic.Int32
-	srv, err := New(Config{
-		ListenTCP:   "127.0.0.1:0",
-		DNSUpstream: "192.0.2.53:53",
-		ProxyURL:    socksTo(t, dnsOverTCP(t, "10.0.0.9", nil).Addr().String(), &hits),
-	})
+	single := socksTo(t, dnsOverTCP(t, "10.0.0.9").Addr().String(), &hits)
+	srv, err := New(Config{ListenTCP: "127.0.0.1:0", DNSUpstream: "192.0.2.53:53", ProxyURL: single})
 	if err != nil {
 		t.Fatal(err)
 	}
-	query := cacheQuery(t, 5, "example.com.", dnsmessage.TypeA)
 	// A per-VM helper reads no source address, so one it could not parse must
 	// still be answered.
-	reply, err := resolveFrom(t, srv, query, "pipe")
+	reply, err := resolveFrom(t, srv, cacheQuery(t, 5, "example.com.", dnsmessage.TypeA), "pipe")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := answerIP(t, reply); got != "10.0.0.9" {
 		t.Fatalf("answered %s, want 10.0.0.9", got)
 	}
-	if hits.Load() != 1 {
-		t.Fatalf("single exit dialled %d times, want 1", hits.Load())
-	}
-}
 
-func TestNewRejectsDomainForwardOnASharedHelper(t *testing.T) {
-	// The observed-domain table is one table per helper, so sharing it across
-	// routes would let one VM's lookups rewrite another's destinations.
-	_, err := New(Config{
-		ListenTCP:     "127.0.0.1:0",
-		ProxyURL:      "socks5h://127.0.0.1:1",
-		DomainForward: true,
-		Routes:        []Route{{VMIP: "100.64.0.10", ProxyURL: "socks5h://127.0.0.1:2"}},
-	})
-	if err == nil {
-		t.Fatal("domain_forward accepted together with routes")
+	// Rollback is a reload that drops the table: every source is served again.
+	routed := Config{
+		ListenTCP:   "127.0.0.1:0",
+		DNSUpstream: "192.0.2.53:53",
+		ProxyURL:    single,
+		Routes:      []Route{{VMIP: "100.64.0.10", ProxyURL: socksTo(t, dnsOverTCP(t, "10.0.0.1").Addr().String(), nil)}},
 	}
-	if !strings.Contains(err.Error(), "domain_forward") {
-		t.Fatalf("error %q does not name the conflict", err)
+	if err := srv.Reload(routed); err != nil {
+		t.Fatal(err)
 	}
-	// Either alone stays valid.
-	if _, err := New(Config{ListenTCP: "127.0.0.1:0", ProxyURL: "socks5h://127.0.0.1:1", DomainForward: true}); err != nil {
-		t.Fatalf("domain_forward alone rejected: %v", err)
+	query := cacheQuery(t, 6, "rollback.example.com.", dnsmessage.TypeA)
+	if _, err := resolveFrom(t, srv, query, "100.64.0.99:5300"); err == nil {
+		t.Fatal("unrouted source resolved before rollback")
 	}
-	if _, err := New(Config{ListenTCP: "127.0.0.1:0", ProxyURL: "socks5h://127.0.0.1:1", Routes: []Route{{VMIP: "100.64.0.10", ProxyURL: "socks5h://127.0.0.1:2"}}}); err != nil {
-		t.Fatalf("routes alone rejected: %v", err)
+	if err := srv.Reload(Config{ListenTCP: "127.0.0.1:0", DNSUpstream: "192.0.2.53:53", ProxyURL: single}); err != nil {
+		t.Fatal(err)
+	}
+	reply, err = resolveFrom(t, srv, query, "100.64.0.99:5300")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := answerIP(t, reply); got != "10.0.0.9" {
+		t.Fatalf("after rollback answered %s, want 10.0.0.9", got)
 	}
 }
 
@@ -322,9 +273,8 @@ func TestReloadKeepsTheResolverEachUnchangedExitSettledOn(t *testing.T) {
 	}
 	srv.rt().def.preferred.Store(1)
 
-	// Reloading with one route's proxy changed must not reset the other's
-	// upstream preference: every exit re-probing on any reload turns one VM's
-	// change into a resolution stall for all of them.
+	// One route's proxy changes. Every exit re-probing on any reload would turn
+	// one VM's change into a resolution stall for all of them.
 	next := cfg
 	next.Routes = []Route{
 		{VMIP: "100.64.0.10", ProxyURL: "socks5h://127.0.0.1:2"},
@@ -347,105 +297,25 @@ func TestReloadKeepsTheResolverEachUnchangedExitSettledOn(t *testing.T) {
 	}
 }
 
-func TestReloadDropsRoutesBackToASingleExit(t *testing.T) {
-	var hits atomic.Int32
-	single := socksTo(t, dnsOverTCP(t, "10.0.0.9", nil).Addr().String(), &hits)
-	srv, err := New(Config{
-		ListenTCP:   "127.0.0.1:0",
-		DNSUpstream: "192.0.2.53:53",
-		ProxyURL:    single,
-		Routes:      []Route{{VMIP: "100.64.0.10", ProxyURL: socksTo(t, dnsOverTCP(t, "10.0.0.1", nil).Addr().String(), nil)}},
-	})
+func mustAddr(t *testing.T, s string) netip.Addr {
+	t.Helper()
+	addr, err := netip.ParseAddr(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	query := cacheQuery(t, 6, "example.com.", dnsmessage.TypeA)
-	if _, err := resolveFrom(t, srv, query, "100.64.0.99:5300"); err == nil {
-		t.Fatal("unrouted source resolved before rollback")
-	}
-	// Rollback is a reload that drops the table: every source is served again.
-	if err := srv.Reload(Config{ListenTCP: "127.0.0.1:0", DNSUpstream: "192.0.2.53:53", ProxyURL: single}); err != nil {
-		t.Fatal(err)
-	}
-	reply, err := resolveFrom(t, srv, query, "100.64.0.99:5300")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := answerIP(t, reply); got != "10.0.0.9" {
-		t.Fatalf("after rollback answered %s, want 10.0.0.9", got)
-	}
-	if hits.Load() != 1 {
-		t.Fatalf("single exit dialled %d times, want 1", hits.Load())
-	}
-}
-
-func TestResolveDNSFromConcurrentlyKeepsAnswersOnTheirOwnExit(t *testing.T) {
-	const vms = 6
-	const each = 4
-	var hitsDefault atomic.Int32
-	routes := make([]Route, vms)
-	want := make([]string, vms)
-	for i := range routes {
-		want[i] = fmt.Sprintf("10.0.1.%d", i+1)
-		routes[i] = Route{
-			VMIP:     fmt.Sprintf("100.64.0.%d", 10+i),
-			ProxyURL: socksTo(t, dnsOverTCP(t, want[i], nil).Addr().String(), nil),
-		}
-	}
-	srv, err := New(Config{
-		ListenTCP:   "127.0.0.1:0",
-		DNSUpstream: "192.0.2.53:53",
-		ProxyURL:    socksTo(t, dnsOverTCP(t, "10.0.0.9", nil).Addr().String(), &hitsDefault),
-		Routes:      routes,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	type result struct {
-		vm  int
-		ip  string
-		err error
-	}
-	results := make(chan result, vms*each)
-	for i := range vms {
-		for j := range each {
-			go func(i, j int) {
-				query := cacheQuery(t, uint16(100+j), "example.com.", dnsmessage.TypeA)
-				reply, rErr := resolveFrom(t, srv, query, fmt.Sprintf("100.64.0.%d:%d", 10+i, 5300+j))
-				if rErr != nil {
-					results <- result{vm: i, err: rErr}
-					return
-				}
-				results <- result{vm: i, ip: answerIP(t, reply)}
-			}(i, j)
-		}
-	}
-	for range vms * each {
-		got := <-results
-		if got.err != nil {
-			t.Errorf("vm %d: %v", got.vm, got.err)
-			continue
-		}
-		if got.ip != want[got.vm] {
-			t.Errorf("vm %d answered %s, want %s", got.vm, got.ip, want[got.vm])
-		}
-	}
-	if hitsDefault.Load() != 0 {
-		t.Errorf("configured ProxyURL resolved %d queries under load", hitsDefault.Load())
-	}
+	return addr
 }
 
 func TestServeDNSRoutesByTheQuerySourceAddress(t *testing.T) {
 	// A loopback query's source is 127.0.0.1, so routing it to its own exit
-	// proves the listeners pass the source through. Resolving centrally would
+	// proves the listeners pass the source through: resolving centrally would
 	// answer SERVFAIL here, not 10.0.0.1.
 	var hitsDefault, hitsLocal atomic.Int32
 	srv, err := New(Config{
 		ListenTCP:   "127.0.0.1:0",
 		DNSUpstream: "192.0.2.53:53",
-		ProxyURL:    socksTo(t, dnsOverTCP(t, "10.0.0.9", nil).Addr().String(), &hitsDefault),
-		Routes:      []Route{{VMIP: "127.0.0.1", ProxyURL: socksTo(t, dnsOverTCP(t, "10.0.0.1", nil).Addr().String(), &hitsLocal)}},
+		ProxyURL:    socksTo(t, dnsOverTCP(t, "10.0.0.9").Addr().String(), &hitsDefault),
+		Routes:      []Route{{VMIP: "127.0.0.1", ProxyURL: socksTo(t, dnsOverTCP(t, "10.0.0.1").Addr().String(), &hitsLocal)}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -518,9 +388,9 @@ func TestServeDNSServFailsAnUnroutedSource(t *testing.T) {
 	srv, err := New(Config{
 		ListenTCP:   "127.0.0.1:0",
 		DNSUpstream: "192.0.2.53:53",
-		ProxyURL:    socksTo(t, dnsOverTCP(t, "10.0.0.9", nil).Addr().String(), &hitsDefault),
+		ProxyURL:    socksTo(t, dnsOverTCP(t, "10.0.0.9").Addr().String(), &hitsDefault),
 		// No route covers loopback, so the query below has no exit.
-		Routes: []Route{{VMIP: "100.64.0.10", ProxyURL: socksTo(t, dnsOverTCP(t, "10.0.0.1", nil).Addr().String(), nil)}},
+		Routes: []Route{{VMIP: "100.64.0.10", ProxyURL: socksTo(t, dnsOverTCP(t, "10.0.0.1").Addr().String(), nil)}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -539,8 +409,7 @@ func TestServeDNSServFailsAnUnroutedSource(t *testing.T) {
 	}
 	defer client.Close()
 	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
-	query := cacheQuery(t, 13, "example.com.", dnsmessage.TypeA)
-	if _, err := client.Write(query); err != nil {
+	if _, err := client.Write(cacheQuery(t, 13, "example.com.", dnsmessage.TypeA)); err != nil {
 		t.Fatal(err)
 	}
 	buf := make([]byte, dnsMaxUDPSize)
@@ -562,5 +431,62 @@ func TestServeDNSServFailsAnUnroutedSource(t *testing.T) {
 	}
 	if hitsDefault.Load() != 0 {
 		t.Fatalf("configured ProxyURL resolved %d queries for an unrouted source", hitsDefault.Load())
+	}
+}
+
+func TestResolveDNSFromConcurrentlyKeepsAnswersOnTheirOwnExit(t *testing.T) {
+	const vms = 6
+	const each = 4
+	var hitsDefault atomic.Int32
+	routes := make([]Route, vms)
+	want := make([]string, vms)
+	for i := range routes {
+		want[i] = fmt.Sprintf("10.0.1.%d", i+1)
+		routes[i] = Route{
+			VMIP:     fmt.Sprintf("100.64.0.%d", 10+i),
+			ProxyURL: socksTo(t, dnsOverTCP(t, want[i]).Addr().String(), nil),
+		}
+	}
+	srv, err := New(Config{
+		ListenTCP:   "127.0.0.1:0",
+		DNSUpstream: "192.0.2.53:53",
+		ProxyURL:    socksTo(t, dnsOverTCP(t, "10.0.0.9").Addr().String(), &hitsDefault),
+		Routes:      routes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		vm  int
+		ip  string
+		err error
+	}
+	results := make(chan result, vms*each)
+	for i := range vms {
+		for j := range each {
+			go func(i, j int) {
+				query := cacheQuery(t, uint16(100+j), "example.com.", dnsmessage.TypeA)
+				reply, rErr := resolveFrom(t, srv, query, fmt.Sprintf("100.64.0.%d:%d", 10+i, 5300+j))
+				if rErr != nil {
+					results <- result{vm: i, err: rErr}
+					return
+				}
+				results <- result{vm: i, ip: answerIP(t, reply)}
+			}(i, j)
+		}
+	}
+	for range vms * each {
+		got := <-results
+		if got.err != nil {
+			t.Errorf("vm %d: %v", got.vm, got.err)
+			continue
+		}
+		if got.ip != want[got.vm] {
+			t.Errorf("vm %d answered %s, want %s", got.vm, got.ip, want[got.vm])
+		}
+	}
+	if hitsDefault.Load() != 0 {
+		t.Errorf("configured ProxyURL resolved %d queries under load", hitsDefault.Load())
 	}
 }

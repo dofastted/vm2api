@@ -13,6 +13,8 @@ cat /proc/sys/net/bridge/bridge-nf-call-iptables   # 必须是 1
 lsmod | grep br_netfilter                          # 必须已加载
 ```
 
+实测一台 AWS Ubuntu 节点为 `1` 且 `br_netfilter` 已加载（Docker 创建桥接网络时会自己加载并打开）。
+
 这不是性能项，是**隔离前提**。共享网桥上 VM 之间的隔离有两道，都在 iptables 里：
 
 - 我们自己在 `FORWARD` 里的 `-i <bridge> -o <bridge> -j DROP`
@@ -33,12 +35,21 @@ echo 'net.bridge.bridge-nf-call-iptables = 1' > /etc/sysctl.d/99-kin-bridge.conf
 ## 首要项：邻居表 `gc_thresh`
 
 ```
-net.ipv4.neigh.default.gc_thresh1   默认 128
-net.ipv4.neigh.default.gc_thresh2   默认 512
-net.ipv4.neigh.default.gc_thresh3   默认 1024
+net.ipv4.neigh.default.gc_thresh1   内核默认 128
+net.ipv4.neigh.default.gc_thresh2   内核默认 512
+net.ipv4.neigh.default.gc_thresh3   内核默认 1024
 ```
 
-**为什么它在 per-VM 架构下没出过问题**：不是机制上不会撞，而是**地址池先耗尽，规模根本到不了那里**。每 VM 一个 `/28` 网络，Docker 默认地址池在几十个网络就见底，车队卡在 200 台左右——离 1024 条邻居表项还有距离。折叠之后地址池不再是瓶颈，规模可以到几千台，于是 `gc_thresh3` 成为下一个会撞上的墙。
+**先看实际值，不要照抄「默认」**。云镜像常常已经调过：
+
+```bash
+sysctl net.ipv4.neigh.default.gc_thresh1 net.ipv4.neigh.default.gc_thresh2 net.ipv4.neigh.default.gc_thresh3
+grep -rn gc_thresh /etc/sysctl.conf /etc/sysctl.d/ 2>/dev/null
+```
+
+实测一台 AWS Ubuntu 节点（2026-11-20）：`gc_thresh1=128 gc_thresh2=15360 gc_thresh3=16384`，由镜像自带的 `/etc/sysctl.d/50-cloudimg-settings.conf` 设置，**不是** vm2api 装的。这类机器单节点 4093 台 VM 不会撞上。裸装的 Debian / Ubuntu Server 没有这个文件，仍是 1024，必须调。
+
+**为什么 per-VM 架构下没出过问题**：不是机制上不会撞，而是**地址池先耗尽，规模根本到不了那里**。实测同一台节点**没有** `/etc/docker/daemon.json`，Docker 用默认池 `172.17.0.0/12` 切 /16，整机只有 16 个 /16 可用（已占 2 个：`bridge` 和一台 VM 的出口网络）。每 VM 一个网络的话，单节点十几个 VM 就见底了。折叠之后地址池不再是瓶颈，规模可以到几千台，`gc_thresh3` 才成为下一个会撞上的墙。
 
 **依据**：宿主为共享网桥上每个 VM 保留一条邻居表项（IP → MAC），加上网关自身。所以条目数约等于节点上的 VM 数。`gc_thresh3` 是硬上限，超过之后内核直接丢弃新表项，表现为**新 VM 网络不通、已有 VM 间歇丢包**，并在 `dmesg` 里留下：
 
@@ -71,9 +82,11 @@ ip -s neigh show | wc -l
 ## 连接跟踪 `nf_conntrack_max`
 
 ```
-net.netfilter.nf_conntrack_max        默认随内存，常见 262144
+net.netfilter.nf_conntrack_max        内核默认随内存，常见 262144
 net.netfilter.nf_conntrack_buckets    建议 = max / 4
 ```
+
+同样先看实际值：实测那台 AWS 节点已是 `1048576`（也来自镜像的 `50-cloudimg-settings.conf`），无需再调。
 
 **依据**：出网走 `nat` 表 REDIRECT，每条连接都会建一个 conntrack 条目；helper 到上游 SOCKS 的连接再占一条。所以每个 VM 的每条并发连接大约消耗 2 条。按每 VM 50 条并发估：
 
@@ -117,6 +130,7 @@ sysctl -w net.ipv4.ip_local_port_range="10240 65535"   # 约 55k
 helper 容器已经由控制面带上 `--ulimit nofile=1048576:1048576`，**不需要手工配**。记在这里是为了说明依据和它的边界：
 
 - 每条 splice 连接占两个描述符（客户端侧 + 上游侧），再加 DNS 与 DoH 连接
+- 实测真实节点上该上限已按 `nofile=1048576` 生效
 - 它是**固定值**，不随 VM 数变化：这是容器参数，跟着成员数变会导致每次有 VM 加入就要重建容器，把热重载的意义抵消掉。描述符表是惰性增长的，用不到的上限不花成本
 
 宿主侧需要允许这个值：
@@ -148,6 +162,17 @@ sysctl --system
 ```bash
 echo 'options nf_conntrack hashsize=262144' > /etc/modprobe.d/nf_conntrack.conf
 ```
+
+## 子网必须对齐前缀边界
+
+不是 sysctl，但同属「节点上才会暴露」的约束，记在这里：Docker 拒绝未对齐到前缀边界的子网。
+
+```
+docker network create --subnet 100.64.200.0/20 ...
+Error response from daemon: invalid subnet 100.64.200.0/20: it should be 100.64.192.0/20
+```
+
+控制面的分配器按「索引 × 步长」计算，产出天然对齐，不需要额外处理。手工创建网络时要注意：`/20` 的第三段必须是 16 的倍数。
 
 ## 撞上了怎么判断
 

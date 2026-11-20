@@ -1761,7 +1761,11 @@ export function persistedEgressRoutes(projectRoot, proxyId) {
  * Returns the address to record on the VM. The caller persists it, since the
  * boot path owns the VM object.
  */
-export async function ensureSharedEgressForVm(projectRoot, vm, { runDocker = docker, runIp = ipRoute, ...opts } = {}) {
+export async function ensureSharedEgressForVm(
+  projectRoot,
+  vm,
+  { runDocker = docker, runIp = ipRoute, readRoutes = persistedEgressRoutes, ...opts } = {},
+) {
   const nodeId = sharedNodeIdForVm(vm)
   const proxyUrl = boundProxyUrl(vm?.proxy)
   if (!proxyUrl) return { ok: false, error: 'bound SOCKS5 url required; refusing fallback' }
@@ -1775,7 +1779,7 @@ export async function ensureSharedEgressForVm(projectRoot, vm, { runDocker = doc
   } catch (e) {
     return { ok: false, error: e?.message || 'shared_ip_allocation_failed', code: 'shared_subnet_full' }
   }
-  const existing = persistedEgressRoutes(projectRoot, sharedEgressId(nodeId))
+  const existing = readRoutes(projectRoot, sharedEgressId(nodeId))
   const pruned = pruneSharedRoutes(existing, live.items)
   const routes = mergeSharedRoute(pruned, { vmId: vm?.id || '', ip, proxyUrl })
   const started = await ensureSharedEgress(projectRoot, {
