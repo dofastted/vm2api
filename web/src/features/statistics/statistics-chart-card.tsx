@@ -451,7 +451,7 @@ export function StatisticsChartCard({
               全选
             </LegendAction>
             <LegendAction disabled={oneVisible} onClick={keepFirstWithUsage}>
-              清空
+              仅保留一项
             </LegendAction>
           </div>
           <div className='max-h-[72px] overflow-y-auto pr-36'>
