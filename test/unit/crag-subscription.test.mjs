@@ -27,6 +27,127 @@ import { createCragSubscriptionHandler, cragSubscriptionRoute } from '../../src/
 
 const voucher = () => `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
 
+function deferred() {
+  let resolve
+  const promise = new Promise((settle) => (resolve = settle))
+  return { promise, resolve }
+}
+
+/**
+ * A running KVM CRAG slot bound to a host subscription, whose next redeem parks
+ * inside the exclusive work body until the test releases it (#1307).
+ */
+async function parkedRedeemHost(t, vm) {
+  let service, rights
+  let mutations = 0
+  let copy
+  const entered = deferred()
+  const park = deferred()
+  const nested = {}
+  let parkNext = false
+  const { root, connect } = standaloneHost(t, async (url, { body }) => {
+    const request = JSON.parse(body)
+    if (url.endsWith('/redeem')) {
+      if (parkNext) {
+        parkNext = false
+        // Still inside exclusive(): a nested admission must not wait on us.
+        nested.denial = await service.admitInference({ vm })
+        entered.resolve()
+        await park.promise
+      }
+      mutations++
+      rights = issueHostEntitlement(root, request.host_id, { slot_limit: 1, revision: mutations })
+    }
+    const data = { entitlement: rights.code, ...rights.claims, used_slots: 1 }
+    if (url.endsWith('/bind')) {
+      const permit = issueSlotPermit(root, request.machine_code, request.host_id, { seat: 1 })
+      return Response.json({ ok: true, data: { ...data, seat: 1, slot_permit: permit.code } })
+    }
+    return Response.json({ ok: true, data })
+  })
+  seedEncryptedPackage(root)
+  fs.mkdirSync(path.join(root, 'vms', vm.id), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', vm.id, 'machine-id'), `${vm.fingerprint.guest_machine_id}\n`)
+  service = connect({
+    listTargets: () => [vm],
+    assertReady: () => true,
+    blockKvmBinding: async () => true,
+    publishKvmBinding: async () => {
+      copy = readCragSubscriptionFiles(root, vm)
+      assert.ok(copy)
+      return true
+    },
+  })
+  await service.redeem(voucher())
+  await service.bind(vm)
+  assert.equal(await service.admitInference({ vm }), null, 'a settled host admits the bound slot')
+  return {
+    root,
+    service,
+    nested,
+    entered: entered.promise,
+    release: park.resolve,
+    /** Starts a redeem that parks inside the work body; resolve `release` to finish it. */
+    startParkedRedeem: () => {
+      parkNext = true
+      return service.redeem(voucher(), true)
+    },
+  }
+}
+
+test('an in-flight subscription operation is awaited, not turned into a denial (#1307)', async (t) => {
+  const vm = {
+    id: 'vm-57',
+    dataplane: 'crag',
+    status: 'running',
+    runtime: { type: 'kvm' },
+    fingerprint: { guest_machine_id: crypto.randomBytes(16).toString('hex') },
+  }
+  const host = await parkedRedeemHost(t, vm)
+  const redeeming = host.startParkedRedeem()
+  await host.entered
+
+  // The nested admission ran inside the work body: it is denied at once, with no
+  // retryable hint, because waiting there would wait on the operation itself.
+  assert.equal(host.nested.denial.body.error.code, 'license_crag_host_usage_unverified')
+  assert.equal(host.nested.denial.body.error.details?.retryable, undefined)
+
+  let settled = false
+  const admitting = host.service.admitInference({ vm }).then((result) => {
+    settled = true
+    return result
+  })
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  assert.equal(settled, false, 'admission waits for the operation instead of denying immediately')
+
+  host.release()
+  await redeeming
+  assert.equal(await admitting, null, 'the slot is admitted once the host settled')
+})
+
+test('an operation outlasting the slot budget yields a retryable denial (#1307)', async (t) => {
+  const vm = {
+    id: 'vm-58',
+    dataplane: 'crag',
+    status: 'running',
+    runtime: { type: 'kvm' },
+    fingerprint: { guest_machine_id: crypto.randomBytes(16).toString('hex') },
+  }
+  const host = await parkedRedeemHost(t, vm)
+  const redeeming = host.startParkedRedeem()
+  await host.entered
+
+  const denial = await host.service.admitInference({ vm, slotWaitDeadlineMs: Date.now() + 50 })
+  assert.equal(denial.body.error.code, 'license_crag_host_usage_unverified')
+  assert.equal(denial.body.error.details.retryable, true, 'a transient denial is marked retryable')
+  assert.ok(denial.retryAfterSec >= 1, 'the client is told how long to wait')
+  assert.equal(denial.status, 403)
+
+  host.release()
+  await redeeming
+  assert.equal(await host.service.admitInference({ vm }), null)
+})
+
 function standaloneHost(t, fetchImpl) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-host-standalone-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

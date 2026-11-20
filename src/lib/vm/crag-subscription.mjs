@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -59,16 +60,58 @@ const invalidRights = () => fail('crag_subscription_invalid_entitlement', 502)
 const hostPackageUnready = () => fail('crag_subscription_host_package_unready', 409)
 const hostIdentityUnavailable = () => fail('crag_subscription_host_identity_unavailable')
 const hostIdentityChanged = () => fail('crag_subscription_host_identity_changed', 409)
-const usageUnverified = () =>
-  cragLicenseDeniedResult({
+const USAGE_UNVERIFIED_MESSAGE = '暂时无法核对宿主机 CRAG 运行额度，请刷新订阅或确认槽位状态后重试。'
+/**
+ * A denial while the host rights are being changed is transient, not a verdict on
+ * the credential: `retryable` lets a fronting gateway retry or pick another slot
+ * instead of reading it as an authorization failure.
+ */
+const usageUnverified = ({ retryable = false, retryAfterSeconds = 0 } = {}) => {
+  const denial = cragLicenseDeniedResult({
     code: 'license_crag_host_usage_unverified',
-    error: '暂时无法核对宿主机 CRAG 运行额度，请刷新订阅或确认槽位状态后重试。',
+    error: USAGE_UNVERIFIED_MESSAGE,
   })
+  if (!retryable) return denial
+  denial.body.error.details = { ...denial.body.error.details, retryable: true }
+  if (retryAfterSeconds > 0) denial.retryAfterSec = retryAfterSeconds
+  return denial
+}
 const overQuota = () =>
   cragLicenseDeniedResult({
     code: 'license_crag_host_over_quota',
     error: '宿主订阅的运行槽位已满，无法启动此 CRAG 槽位。请释放运行名额或增加订阅额度。',
   })
+
+/** `admitOnce` hit an in-flight exclusive operation; only the caller decides whether to wait. */
+const EXCLUSIVE_BUSY = Symbol('crag_exclusive_busy')
+const MAX_EXCLUSIVE_WAIT_MS = 15_000
+
+/**
+ * Cap the wait by the request's own slot budget so admission never outlives it.
+ * `hopSlotWaitDeadline` yields "now" when no slot wait is configured, which would
+ * leave those deployments with no wait at all, so an absent or spent budget still
+ * gets the ceiling rather than zero.
+ */
+function exclusiveWaitBudgetMs(slotWaitDeadlineMs) {
+  if (!Number.isFinite(slotWaitDeadlineMs)) return MAX_EXCLUSIVE_WAIT_MS
+  const remaining = slotWaitDeadlineMs - Date.now()
+  return remaining > 0 ? Math.min(MAX_EXCLUSIVE_WAIT_MS, remaining) : MAX_EXCLUSIVE_WAIT_MS
+}
+
+/** Resolves true if the operation finished in time. Never holds a lock, never polls. */
+function settledWithin(pending, budgetMs) {
+  if (!pending?.done) return Promise.resolve(true)
+  if (!(budgetMs > 0)) return Promise.resolve(false)
+  let timer
+  return Promise.race([
+    pending.done.then(() => true),
+    // Not unref'd on purpose: an unref'd timer never fires once the loop has
+    // nothing else to do, which would leave this await pending forever.
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), budgetMs)
+    }),
+  ]).finally(() => clearTimeout(timer))
+}
 
 function runtimeDenial(denial) {
   const { code, message } = denial.body.error
@@ -319,7 +362,12 @@ export function createCragSubscription({
   const rosterIntentFile = path.join(privateDir, 'roster.json')
   const deferredReleaseFile = path.join(privateDir, 'deleted-slots.json')
   const marker = path.join(publicDir, 'sync-pending')
-  let busy = false
+  /** null = idle. Otherwise the in-flight exclusive operation: `done` settles once
+   * its guest re-delivery finished, so a waiter that wakes on it sees a settled host. */
+  let exclusiveState = null
+  /** Set inside an exclusive work body. A nested admission must not wait on the
+   * operation it is itself running under. */
+  const exclusiveScope = new AsyncLocalStorage()
   const runtimeReservations = new Set()
   let admissionWaiters = 0
   let admissionQueue = Promise.resolve()
@@ -491,7 +539,8 @@ export function createCragSubscription({
     if (!previous || previous.claims.expires_at * 1000 > Date.now()) return previous
     const remote = await authority('status', hostId, credential(hostId))
     const confirmed = verifyRights(hostId, remote, previous)
-    if (background && (busy || !unchangedRights({ hostId, pending: false, previous }, readLocalRights()))) return
+    if (background && (exclusiveState || !unchangedRights({ hostId, pending: false, previous }, readLocalRights())))
+      return
     if (confirmed.code === previous.code) return confirmed
     if (current(hostId)?.code !== previous.code) throw invalidRights()
     checkNoIntent()
@@ -501,7 +550,7 @@ export function createCragSubscription({
 
   async function refreshExpiredEntitlement() {
     if (expiryProbe) return expiryProbe
-    if (busy || !fs.existsSync(entitlementFile)) return
+    if (exclusiveState || !fs.existsSync(entitlementFile)) return
     const { hostId, claims, pending, previous } = readLocalRights()
     const now = Date.now()
     if (pending || !claims || claims.expires_at * 1000 > now) return
@@ -617,7 +666,7 @@ export function createCragSubscription({
       })
   }
 
-  async function admitInference({ vm, routing, health } = {}) {
+  async function admitOnce({ vm, routing, health } = {}) {
     if (!vm?.id) return null
     const liveCrag = health?.runtime_variant === 'crag-v2' || (!health?.runtime_variant && health?.dataplane === 'crag')
     if (!liveCrag && resolveKernelDataplane(vm, routing) !== 'crag') return null
@@ -636,7 +685,8 @@ export function createCragSubscription({
         return null
       }
       const rights = readLocalRights()
-      if (!rights.claims || (localKvm && busy)) return usageUnverified()
+      if (!rights.claims) return usageUnverified()
+      if (localKvm && exclusiveState) return EXCLUSIVE_BUSY
       const { license } = getCragLicense(projectRoot, vm)
       if (!license.valid) {
         if (localKvm) {
@@ -677,6 +727,27 @@ export function createCragSubscription({
       // A malformed host permit or unreadable local quota cannot authorize a new hop.
     }
     return usageUnverified()
+  }
+
+  /**
+   * Any roster change republishes the single host entitlement every slot's grant
+   * is derived from, so an in-flight exclusive operation cannot be narrowed to the
+   * slot it names. Rather than deny every local KVM slot for the whole operation
+   * (#1307: 27 slots, ~25 minutes of rolling 403s during a per-slot migration),
+   * wait for it to finish and re-run the same checks against the settled host.
+   */
+  async function admitInference({ vm, routing, health, slotWaitDeadlineMs } = {}) {
+    const first = await admitOnce({ vm, routing, health })
+    if (first !== EXCLUSIVE_BUSY) return first
+    // Running inside the work body itself: waiting here would wait on us.
+    if (exclusiveScope.getStore()) return usageUnverified()
+    const pending = exclusiveState
+    const budgetMs = exclusiveWaitBudgetMs(slotWaitDeadlineMs)
+    const retryable = { retryable: true, retryAfterSeconds: Math.max(1, Math.ceil(budgetMs / 1000)) }
+    if (!(await settledWithin(pending, budgetMs))) return usageUnverified(retryable)
+    // One retry only: back-to-back operations must not chain a request forever.
+    const second = await admitOnce({ vm, routing, health })
+    return second === EXCLUSIVE_BUSY ? usageUnverified(retryable) : second
   }
 
   async function status(confirmed, mayRetry = true) {
@@ -892,13 +963,16 @@ export function createCragSubscription({
   }
 
   async function exclusive(work, { blockBefore = false } = {}) {
-    if (busy) throw fail('crag_subscription_busy', 409)
-    busy = true
+    if (exclusiveState) throw fail('crag_subscription_busy', 409)
+    let settle
+    exclusiveState = { since: Date.now(), done: new Promise((resolve) => (settle = resolve)) }
     const release = holdKvmCragSubscriptionPublications(projectRoot)
     let result, failure
     try {
       if (blockBefore) await blockKvmBindings()
-      result = await work()
+      // The scope marks every async branch started by this body, so a nested
+      // admission can tell it is running under the very operation it would wait for.
+      result = await exclusiveScope.run(true, () => work())
     } catch (error) {
       failure = error
     } finally {
@@ -908,7 +982,10 @@ export function createCragSubscription({
       } catch (error) {
         failure ??= error
       }
-      busy = false
+      // Clear before settling: a waiter wakes to an idle host with its guests
+      // already re-delivered, never to a state that is still winding down.
+      exclusiveState = null
+      settle()
     }
     if (failure) throw failure
     return result
