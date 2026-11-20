@@ -1,5 +1,6 @@
 import { CLAUDE_OFFICIAL_URL, OPENAI_OFFICIAL_URL, normalizeProtocol, trimBaseUrl } from './api-presets.mjs'
 import {
+  canonicalizeDottedClaudeId,
   isCatalogModelId,
   isCodexCatalogModel,
   listGptPublicModels,
@@ -102,7 +103,9 @@ export function resolveUpstreamPool(ep, requestedModel) {
     const raw = stripPrefix(requestedModel, ep?.prefix)
     const resolved = resolveCatalogModel(raw)
     if (resolved?.ok && resolved.model) return [resolved.model]
-    if (isCatalogModelId(raw)) return [raw]
+    // Catalog unavailable: still hand upstream the hyphenated id it accepts.
+    const canonical = canonicalizeDottedClaudeId(raw)
+    if (isCatalogModelId(canonical)) return [canonical]
   } else if (isOfficialOpenAI(ep)) {
     const raw = stripPrefix(requestedModel, ep?.prefix)
     if (isGptSeriesId(raw) || isCodexCatalogModel(raw)) return [raw]
