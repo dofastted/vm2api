@@ -56,6 +56,7 @@ import { guardUsageTier, inferClaudeTier } from '../pool/claude-tier.mjs'
 import { listQuotaFromHeaders, isOfficialWindowLimited } from '../pool/quota-window.mjs'
 import { lastClosedWindow } from '../pool/window-history.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
+import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { codexMaxSessions, codexScheduleLevel } from '../pool/codex-slot-pool.mjs'
@@ -2015,6 +2016,11 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     v.cooldown_until ||
     availability.until ||
     null
+  // 内核故障（watchdog 恢复预算耗尽）只在内存里：调度器跳过该槽，但列表/
+  // 卡片如果只看持久化字段，一台内核已死的槽仍显示「开 · 可用」。这里把
+  // fault 抬进受限归因，让面板与调度器看到同一台坏槽。Stronger verdicts
+  // (revoke, unschedulable, off) already win inside resolveScheduleState.
+  const kernelFault = kernelFaults.get(v.id) || null
   const restrictionReason =
     liveHardBlock?.reason ||
     runtime?.cooldown_reason ||
@@ -2030,6 +2036,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     availability,
     restrictionUntil,
     restrictionReason,
+    kernelFaulted: !!kernelFault,
     circuit,
     seats: isCodex ? null : { used: Number(seatRow?.seats_used) || 0, max: seatsMax },
     sessions: isCodex ? { active: codexSessions?.active, max: codexSessions?.max } : null,

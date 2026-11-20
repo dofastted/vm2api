@@ -516,6 +516,26 @@ describe('fleetGroup splits 受限 from 在池 and 关闭调用', () => {
     })
     expect(fleetGroup(fallback7d)).toBe('pool')
   })
+
+  it('paints a spent kernel-recovery budget as a red restriction, not quota', () => {
+    const vm = liveVm({
+      schedulable: true,
+      schedule_state: 'restricted',
+      restriction_reason: 'kernel_faulted',
+      restriction_text: '内核故障',
+      availability: { key: 'ok', usable: true, text: '可用' },
+    })
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'kernel_fault',
+      text: '内核故障',
+      cls: 'bad',
+    })
+    expect(fleetGroup(vm)).toBe('restricted')
+    expect(scheduleStateLabel(vm)).toBe('受限')
+    expect(restrictionCopy(vm)).toBe('内核故障')
+    // 与额度限制区分：不是让人等窗口，而是叫人去诊断。
+    expect(poolStatus(vm).cls).not.toBe('warn')
+  })
 })
 
 describe('unit circuit', () => {
