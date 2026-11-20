@@ -26,7 +26,7 @@ export function GeneralError({
         <span className='font-medium'>
           {asset
             ? 'This page could not finish loading'
-            : `Oops! Something went wrong {:')`}
+            : `Oops! Something went wrong :')`}
         </span>
         <p className='text-center text-muted-foreground'>
           {asset ? (
