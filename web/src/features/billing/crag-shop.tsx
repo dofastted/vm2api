@@ -175,6 +175,10 @@ function hostRedemptionError(error: unknown) {
       return '尚无法确认原兑换结果。原记录已保留，请联系管理员核对原订单，不要重复购买或重置凭据。'
     case 'crag_subscription_invalid_redemption_receipt':
       return '本机保存的兑换确认记录未通过校验。请联系管理员核对原订单和订阅数据，不要删除记录或重新购买。'
+    case 'payload_key_unknown':
+      return '授权服务已不再提供原兑换记录的 CRAG 发行包密钥。原记录已保留，请核对原订单，不要重复兑换或重置凭据。'
+    case 'issuer_mismatch':
+      return '原兑换记录的 CRAG 签发者与授权服务不一致。请恢复匹配的可信发行包后再重试。'
     case 'auth_forbidden': {
       const details = isApiError(error) ? error.details : undefined
       const id = (details as { authority_request_id?: unknown } | undefined)
@@ -216,6 +220,12 @@ function applicationError(
   } else if (code === 'redeem_unavailable') {
     text =
       '授权服务未接受原订单的使用券。请联系管理员或供应方核对该订单，不要重新购买。'
+  } else if (code === 'payload_key_unknown') {
+    text =
+      '授权服务已不再提供原兑换记录的 CRAG 发行包密钥。原记录已保留，请联系管理员核对原订单，不要重复购买或重置凭据。'
+  } else if (code === 'issuer_mismatch') {
+    text =
+      '原兑换记录的 CRAG 签发者与授权服务不一致。请让管理员恢复匹配的可信发行包后，再重试应用原订单。'
   } else if (code === 'shop_redemption_changed') {
     text =
       '供应方为同一订单返回了不同的使用券，应用已停止。请联系管理员核对原订单，不要另行兑换或重新购买。'

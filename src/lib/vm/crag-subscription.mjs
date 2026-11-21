@@ -820,7 +820,7 @@ export function createCragSubscription({
       }
       let rights = claims ? { reclaim_supported: claims.version === 2 } : {}
       if (claims && !pending) {
-        if (confirmed?.code === previous.code) {
+        if (confirmed?.code === previous.code && confirmed.rights) {
           rights = confirmed.rights
         } else if (!needsRefresh) {
           try {
@@ -950,7 +950,10 @@ export function createCragSubscription({
         (installed.claims.revision === proof.revision && installed.code !== receipt.entitlement)
       )
         throw invalidRights()
-      return { ...installed, rights: { reclaim_supported: installed.claims.version === 2 } }
+      // A receipt proves this voucher was applied; it carries no remote metadata.
+      // Leaving rights unset lets status() read the current plan and usage instead
+      // of reporting a replay as a subscription with no quota information.
+      return installed
     } catch {
       throw fail('crag_subscription_invalid_redemption_receipt', 409)
     }

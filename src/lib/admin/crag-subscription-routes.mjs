@@ -30,6 +30,10 @@ const messages = {
     'Existing host rights cannot confirm this voucher. Keep the original order and ask the administrator to reconcile it.',
   crag_subscription_invalid_redemption_receipt:
     'The saved redemption receipt could not be verified. Keep the original order and check the host subscription data.',
+  payload_key_unknown:
+    'The authorization service no longer offers the CRAG package key this redemption recorded. Keep the original record and contact the administrator with the request ID.',
+  issuer_mismatch:
+    'The CRAG issuer this redemption recorded does not match the authorization service. Restore the matching trusted package before retrying.',
   auth_forbidden:
     'The authorization service rejected this host request. Contact the administrator with the request ID; do not reset the host credential.',
   vm_not_found: 'VM not found.',

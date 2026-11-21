@@ -734,6 +734,7 @@ test('device order recovery projects only a matching durable redemption receipt,
   let claimed = 0
   let claimResponse
   let errorCode = 'crag_subscription_host_package_changed'
+  let receiptError
   const requestId = randomUUID()
   const makeHandler = () =>
     createCragShopHandler({
@@ -746,6 +747,7 @@ test('device order recovery projects only a matching durable redemption receipt,
         purchaseDeviceId: () => hostId,
         isRedemptionApplied(expectedHost, actualDigest) {
           assert.equal(expectedHost, hostId)
+          if (receiptError && actualDigest === digest) throw Object.assign(new Error('damaged'), { code: receiptError })
           return proof && actualDigest === digest
         },
         async redeemDeviceOrder(expectedHost, code) {
@@ -828,6 +830,21 @@ test('device order recovery projects only a matching durable redemption receipt,
   db.prepare("UPDATE crag_shop_orders SET activation_phase = 'waiting' WHERE order_id = ?").run(id)
   assert.equal((await call('GET', '/orders')).data.orders.find((o) => o.order_id === id).activation.state, 'active')
 
+  // One order's unverifiable receipt must not hide the rest of the list. The listing
+  // keeps that row's stored state, the order's own route still reports the reason,
+  // and a repaired receipt converges again without another redemption.
+  db.prepare("UPDATE crag_shop_orders SET activation_phase = 'waiting' WHERE order_id = ?").run(id)
+  receiptError = 'crag_subscription_invalid_redemption_receipt'
+  const tolerated = (await call('GET', '/orders')).data.orders
+  assert.equal(tolerated.length, 2)
+  assert.equal(tolerated.find((o) => o.order_id === id).activation.state, 'ready_to_apply')
+  assert.equal(tolerated.find((o) => o.order_id === otherId).activation.state, 'ready_to_apply')
+  const damaged = await call('GET', `/orders/${id}`)
+  assert.equal(damaged.http, 409)
+  assert.equal(damaged.error.code, 'crag_subscription_invalid_redemption_receipt')
+  receiptError = undefined
+  assert.equal((await call('GET', '/orders')).data.orders.find((o) => o.order_id === id).activation.state, 'active')
+
   // Two requests read the same unassociated row before either claim completes.
   // A changed supplier voucher must not bypass the atomic digest association.
   proof = false
@@ -858,6 +875,19 @@ test('device order recovery projects only a matching durable redemption receipt,
     db.prepare('SELECT redemption_sha256 FROM crag_shop_orders WHERE order_id = ?').get(id).redemption_sha256,
     digest,
   )
+
+  // A package key the Authority no longer offers, and a mismatched issuer, are
+  // actionable reasons of their own: never the generic "retry the same order".
+  claimResponse = undefined
+  for (const code of ['payload_key_unknown', 'issuer_mismatch']) {
+    errorCode = code
+    const rejected = await call('POST', `/orders/${id}/apply`)
+    assert.equal(rejected.http, 409)
+    assert.equal(rejected.error.code, code)
+    assert.notEqual(rejected.error.code, 'shop_device_apply_failed')
+    assert.equal(JSON.stringify(rejected).includes(CODE), false)
+  }
+  assert.equal(applied, 5)
 })
 
 test('device order package recovery converges through subscription recovery and a read-only order refresh', {

@@ -141,6 +141,20 @@ const deviceApplyErrors = new Map([
     [409, 'This voucher does not match the host subscription. Ask the administrator to check this order.'],
   ],
   ['redeem_unavailable', [409, 'The original voucher could not be redeemed. Check this order with the supplier.']],
+  [
+    'payload_key_unknown',
+    [
+      409,
+      'The authorization service no longer offers the CRAG package key this redemption recorded. Ask the administrator to reconcile this order.',
+    ],
+  ],
+  [
+    'issuer_mismatch',
+    [
+      409,
+      'The CRAG issuer this redemption recorded does not match the authorization service. Ask the administrator to reconcile this order.',
+    ],
+  ],
 ])
 const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
 
@@ -445,7 +459,7 @@ export function createCragShopHandler({
     }
   }
 
-  function reconcileDeviceOrder(db, row, hostId) {
+  function reconcileDeviceOrder(db, row, hostId, { tolerant = false } = {}) {
     if (
       !row.owner.startsWith('device:') ||
       row.status !== 'fulfilled' ||
@@ -457,6 +471,9 @@ export function createCragShopHandler({
     try {
       if (!subscription.isRedemptionApplied(hostId, row.redemption_sha256)) return row
     } catch (error) {
+      // One order's unverifiable receipt must not hide every other order. A listing
+      // keeps the stored state; the order's own routes still report the exact reason.
+      if (tolerant) return row
       throw hostCheckoutError(error) ?? deviceApplyFailure(error) ?? error
     }
     durable(db, () =>
@@ -727,7 +744,9 @@ export function createCragShopHandler({
           .all(owner, PAGE_SIZE + 1, Number(offset))
         const next_offset = rows.length > PAGE_SIZE ? Number(offset) + PAGE_SIZE : null
         return ok({
-          orders: rows.slice(0, PAGE_SIZE).map((row) => view(device ? reconcileDeviceOrder(db, row, hostId) : row)),
+          orders: rows
+            .slice(0, PAGE_SIZE)
+            .map((row) => view(device ? reconcileDeviceOrder(db, row, hostId, { tolerant: true }) : row)),
           next_offset,
         })
       }

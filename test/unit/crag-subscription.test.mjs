@@ -1080,6 +1080,36 @@ test('a saved redemption receipt recovers the order after a crash without redeem
   })
 })
 
+test('a receipt replay reports the plan from host status instead of an empty projection', async (t) => {
+  const redemptionCode = voucher()
+  let calls = 0
+  let issued
+  const { root, connect } = standaloneHost(t, async (url, { body }) => {
+    if (url.endsWith('/redeem')) {
+      calls++
+      issued = issueHostEntitlement(root, JSON.parse(body).host_id)
+    }
+    return Response.json({
+      ok: true,
+      data: { entitlement: issued.code, ...issued.claims, sku: 'host-sub', months: 3 },
+    })
+  })
+  seedEncryptedPackage(root)
+  const first = await connect().redeem(redemptionCode)
+  assert.equal(calls, 1)
+  assert.equal(first.sku, 'host-sub')
+  assert.equal(first.months, 3)
+  // The durable receipt suppresses a second redemption. A receipt proves only that
+  // this voucher was applied; it carries no remote metadata, so the reported status
+  // has to come from host status rather than degrade to "no quota information".
+  const replayed = await connect().redeem(redemptionCode)
+  assert.equal(calls, 1, 'the receipt replay never redeems again')
+  assert.equal(replayed.sku, 'host-sub')
+  assert.equal(replayed.months, 3)
+  assert.equal(replayed.state, first.state)
+  assert.equal(replayed.available_seats, first.available_seats)
+})
+
 test('a crash before the receipt is durable replays the original voucher and records proof', async (t) => {
   const redemptionCode = voucher()
   let issued
