@@ -103,6 +103,29 @@ test('Opus 5.5 official: $4 / $20 / cache read $0.20 per MTok', () => {
   assert.equal(c.cache_creation_1h_cost, 8)
 })
 
+test('Mythos 5.2 bills input, output, both cache TTLs and search at the Fable 5.2 rates', () => {
+  const usage = {
+    input_tokens: 1_000_000,
+    output_tokens: 1_000_000,
+    cache_read_tokens: 1_000_000,
+    cache_creation_5m_tokens: 1_000_000,
+    cache_creation_1h_tokens: 1_000_000,
+    web_search_requests: 1,
+  }
+  for (const model of ['claude-mythos-5-2', 'claude-mythos-5.2']) {
+    const c = calculateCost(usage, model)
+    assert.equal(c.known, true)
+    assert.equal(c.pricing_key, 'claude-mythos-5-2')
+    assert.equal(c.input_cost, 8)
+    assert.equal(c.output_cost, 40)
+    assert.equal(c.cache_read_cost, 0.2)
+    assert.equal(c.cache_creation_5m_cost, 10)
+    assert.equal(c.cache_creation_1h_cost, 16)
+    assert.equal(c.web_search_cost, 0.01)
+    assert.equal(c.total_cost, calculateCost(usage, 'claude-fable-5-2').total_cost)
+  }
+})
+
 test('Sonnet 5 official: $2 / $10 (standard, not the old $3/$15 intro)', () => {
   const c = calculateCost({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, 'claude-sonnet-5')
   assert.equal(c.input_cost, 2)

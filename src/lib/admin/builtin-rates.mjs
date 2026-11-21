@@ -66,6 +66,7 @@ const ANTHROPIC = {
   'claude-fable-5-2': claude(8, 40, 0.2, 10, 16),
   'claude-mythos-5': claude(10, 50, 1, 12.5, 20),
   'claude-mythos-5-1': claude(10, 50, 0.25, 12.5, 20),
+  'claude-mythos-5-2': claude(8, 40, 0.2, 10, 16),
   'claude-opus-5-5': claude(4, 20, 0.2, 5, 8, {
     modes: { fast: tokenPrice(8, 40, 0.4, 10, 16) },
   }),
@@ -295,6 +296,7 @@ export const BUILTIN_ALIASES = {
   'claude-fable-5.1': 'claude-fable-5-1',
   'claude-fable-5.2': 'claude-fable-5-2',
   'claude-mythos-5.1': 'claude-mythos-5-1',
+  'claude-mythos-5.2': 'claude-mythos-5-2',
   'claude-opus-5.5': 'claude-opus-5-5',
   'claude-sonnet-5.5': 'claude-sonnet-5-5',
   'claude-haiku-5.5': 'claude-haiku-5-5',

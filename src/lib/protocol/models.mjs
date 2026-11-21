@@ -125,7 +125,7 @@ export function isCatalogModelId(id) {
   if (s.endsWith('-') || s.endsWith('.')) return false
   if (/\.md$/i.test(s)) return false
   if (/^(gpt-[a-z0-9.-]+|codex-[a-z0-9.-]+)$/i.test(s)) return s.split(/[-.]/).length >= 2
-  if (!/^claude-(opus|sonnet|haiku|fable|3)[a-z0-9.-]*$/i.test(s) && s !== 'auto') return false
+  if (!/^claude-(opus|sonnet|haiku|fable|mythos|3)[a-z0-9.-]*$/i.test(s) && s !== 'auto') return false
   if (s === 'auto') return true
   return s.split('-').length >= 3
 }
@@ -140,7 +140,7 @@ export const SEED_MODEL_IDS = Object.freeze(
 )
 
 function modelRank(id) {
-  const body = String(id).replace(/^claude-(opus|sonnet|haiku|fable|3)-/i, '')
+  const body = String(id).replace(/^claude-(opus|sonnet|haiku|fable|mythos|3)-/i, '')
   return body.split(/[-.]/).map((p) => {
     if (/^\d{8}$/.test(p)) return Number(p)
     if (/^\d+$/.test(p)) return Number(p)
