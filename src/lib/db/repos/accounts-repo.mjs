@@ -56,6 +56,7 @@ export function rowToAccount(row) {
     last_blocked: extra.last_blocked ?? null,
     last_cli_rate_limit: extra.last_cli_rate_limit ?? null,
     window_history: extra.window_history ?? null,
+    created_at: row.created_at ?? null,
     updated_at: row.updated_at,
   }
 }
