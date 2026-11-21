@@ -35,6 +35,8 @@ const RUN_ERRORS = {
   gemini_inference_output_limit: [502, 'Gemini 响应超过测试输出上限'],
   gemini_inference_tool_blocked: [502, '此测试仅支持文本，不支持工具调用'],
   gemini_inference_failed: [502, 'Gemini 请求失败，请检查环境状态'],
+  gemini_native_tty_unavailable: [503, '没有可用的 Linux 虚拟控制台运行 CRAGGemini'],
+  gemini_native_worker_unavailable: [503, 'Gemini 原生 TUI worker 未就绪，请检查宿主机控制台和 CRAGGemini 载荷'],
 }
 const FAILURE = 'gemini_host_unavailable'
 const PROTOCOL_ERROR = 'gemini_host_protocol_error'
@@ -89,9 +91,14 @@ const HOST_ERRORS = {
   gemini_release_payload_mismatch: [409, '宿主机的 CRAGGemini 授权配置与签名载荷不匹配'],
   gemini_release_redemption_required: [403, '请先兑换 CRAGGemini 内核'],
   gemini_egress_unavailable: [503, '缺少可用的 Gemini 出口组件，请检查宿主 kin-egress 安装'],
-  gemini_oauth_tools_missing: [503, '缺少 Google 授权所需工具，请检查宿主 ip、nft、setpriv、bwrap 和 curl'],
+  gemini_oauth_tools_missing: [
+    503,
+    '缺少 Gemini OAuth/TUI 所需工具，请检查宿主 ip、nft、setpriv、bwrap、openvt 和 curl',
+  ],
   gemini_ipv4_forwarding_unavailable: [503, '宿主 IPv4 转发未就绪，无法经绑定代理启动 Google 授权'],
-  gemini_authorization_unavailable: [503, 'Gemini 服务已连接，但未能启动 Google 授权，请检查代理与宿主日志'],
+  gemini_native_tty_unavailable: [503, '没有可供 CRAGGemini 使用的空闲 Linux 虚拟控制台'],
+  gemini_native_worker_unavailable: [503, 'CRAGGemini 原生 worker 未就绪，请检查宿主服务日志'],
+  gemini_native_bridge_timeout: [503, 'CRAGGemini TUI 未能在时限内连接 native worker'],
   gemini_account_read_failed: [502, '无法通过所选代理读取 Google 账号数据'],
   gemini_api_key_rejected: [400, 'Google 未接受该 Gemini API Key，请检查密钥和项目权限'],
   gemini_terminal_unavailable: [503, '无法启动 Gemini 终端，请检查宿主服务、Antigravity 安装和绑定代理'],
