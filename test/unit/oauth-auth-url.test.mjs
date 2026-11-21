@@ -12,6 +12,7 @@ import {
   REDIRECT_URI,
   SCOPE_OAUTH,
   OAUTH_FLAVORS,
+  linkCredentialFromToken,
 } from '../../src/lib/oauth/oauth-auth-url.mjs'
 
 test('generateAuthUrl refuses an unbound VM but accepts local egress as direct', () => {
@@ -114,4 +115,52 @@ test('fake exchange writes tokens without network', async () => {
   assert.match(cred.access_token, /^sk-ant-oat01-FAKE-AUTH-URL/)
   assert.equal(peekAuthUrlSession(out.session_id), null)
   delete process.env.KIN_FAKE_SESSION_OAUTH
+})
+
+test('link exchange keeps every field the helper collected', () => {
+  // The helper runs the README's post-token sequence; roles, first-token date
+  // and bootstrap must survive the panel's mapping, not just the token body.
+  const token = {
+    access_token: 'oat-access',
+    refresh_token: '',
+    token_type: 'Bearer',
+    expires_in: 31_536_000,
+    scope: FULL_OAUTH_SCOPE,
+    type: 'setup-token',
+    mode: 'setup-token',
+    email: 'link@example.test',
+    account_uuid: 'acct-1',
+    org_uuid: 'org-1',
+    subscription_type: 'max',
+    rate_limit_tier: 'default_claude_max_20x',
+    organization_role: 'admin',
+    subscription_created_at: '2020-01-01T00:00:00.000Z',
+    oauth_account: { account_uuid: 'acct-1', account_email: 'link@example.test' },
+  }
+  const credential = linkCredentialFromToken(token, { flavor: 'setup_token', scope: FULL_OAUTH_SCOPE })
+  for (const key of [
+    'organization_role',
+    'subscription_created_at',
+    'oauth_account',
+    'type',
+    'mode',
+    'subscription_type',
+    'rate_limit_tier',
+  ]) {
+    assert.deepEqual(credential[key], token[key], key)
+  }
+  assert.equal(credential.email, 'link@example.test')
+  assert.equal(credential.email_address, 'link@example.test')
+  assert.equal(credential.flavor, 'setup_token')
+  assert.equal(credential.expires_at, Math.floor(Date.now() / 1000) + 31_536_000)
+})
+
+test('link exchange derives identity from the token when the helper sent none', () => {
+  const credential = linkCredentialFromToken(
+    { access_token: 'oat', scope: 'user:profile', email: 'x@example.test' },
+    { flavor: 'cai' },
+  )
+  assert.equal(credential.email, 'x@example.test')
+  assert.equal(credential.refresh_token, '')
+  assert.equal(credential.flavor, 'cai')
 })
