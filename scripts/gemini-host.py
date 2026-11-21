@@ -56,6 +56,7 @@ STARTUP_DA = {"\x1b[c": b"\x1b[?1;2c", "\x1b[>c": b"\x1b[>0;276;0c"}
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 CODE = re.compile(r"[A-Za-z0-9._~/-]{1,2048}\Z")
 API_KEY = re.compile(r"[A-Za-z0-9_-]{20,256}\Z")
+OAUTH_ACCESS_TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{1,4096}={0,2}\Z")
 RELEASE_CODE = re.compile(r"CGG1-[A-Za-z0-9_-]{43}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 MANUAL_RELEASE = Path("/etc/vm2api/gemini-release.json")
@@ -1693,6 +1694,7 @@ class Host:
                 if not login.finished():
                     continue
                 old_profile = env.get("profile")
+                imported = env.pop("oauth_imported", False)
                 login.close(preserve=True)
                 env.update(
                     auth_state="authorized", profile=login.attempt, updated_at=now()
@@ -1700,6 +1702,10 @@ class Host:
                 env.pop("account", None)
                 env.pop("call_models", None)
                 self.save()
+                if imported:
+                    (self.directory / identifier / "oauth-import.json").unlink(
+                        missing_ok=True
+                    )
                 del self.pending[identifier]
                 if old_profile:
                     shutil.rmtree(self.directory / identifier / old_profile)
@@ -1718,6 +1724,7 @@ class Host:
             "proxy_id": env["proxy_id"],
             "auth_state": env["auth_state"],
             "auth_method": env.get("auth_method", "oauth"),
+            **({"oauth_imported": True} if env.get("oauth_imported") else {}),
             "runtime_ready": False,
             "kernel_version": self.payload_version,
             "models": env.get("call_models", account.get("models", [])),
@@ -1726,6 +1733,13 @@ class Host:
             "created_at": env.get("created_at"),
             "updated_at": env.get("updated_at"),
         }
+
+    def probe_imported_account(self, slot, proxy_url, credential):
+        if credential["expiry"] <= time.time():
+            return {"state": "reauth_required", "checked_at": now()}
+        return read_account(
+            self.uid_base + slot, proxy_url, "oauth_import", oauth_token=credential
+        )
 
     def refresh_account(self, env, proxy_url):
         directory = self.directory / env["id"]
@@ -1736,6 +1750,9 @@ class Host:
             account = read_account(
                 self.uid_base + env["slot"], proxy_url, "api_key", api_key=api_key
             )
+        elif env.get("oauth_imported"):
+            credential = json.loads((directory / "oauth-import.json").read_bytes())
+            account = self.probe_imported_account(env["slot"], proxy_url, credential)
         else:
             account = read_account(
                 self.uid_base + env["slot"],
@@ -1800,6 +1817,21 @@ class Host:
                 or (method == "oauth" and api_key is not None)
             ):
                 raise Failure(400)
+            imported = body.get("oauth_account")
+            credential = None
+            if imported is not None:
+                if method != "oauth" or not isinstance(imported, dict):
+                    raise Failure(400, "gemini_oauth_import_invalid")
+                access = imported.get("access_token")
+                expiry = imported.get("expiry_timestamp")
+                if (
+                    not isinstance(access, str)
+                    or not OAUTH_ACCESS_TOKEN.fullmatch(access)
+                    or type(expiry) is not int
+                    or not 0 < expiry < 253402300800
+                ):
+                    raise Failure(400, "gemini_oauth_import_invalid")
+                credential = {"access_token": access, "expiry": expiry}
             taken = {env["slot"] for env in self.environments.values()}
             slot = next(
                 (slot for slot in range(MAX_ENVIRONMENTS) if slot not in taken), None
@@ -1816,6 +1848,12 @@ class Host:
                     raise Failure(400, "gemini_api_key_rejected")
                 if account["state"] not in ("ok", "partial"):
                     raise Failure(502, "gemini_account_read_failed")
+            if credential:
+                account = self.probe_imported_account(slot, proxy_url, credential)
+                if account["state"] == "reauth_required":
+                    raise Failure(400, "gemini_oauth_import_rejected")
+                if account["state"] not in ("ok", "partial"):
+                    raise Failure(502, "gemini_account_read_failed")
             identifier = f"gemini-{secrets.token_hex(12)}"
             directory = self.directory / identifier
             directory.mkdir(mode=0o711)
@@ -1826,7 +1864,10 @@ class Host:
                 "proxy_id": proxy_id,
                 "slot": slot,
                 "auth_method": method,
-                "auth_state": "authorized" if method == "api_key" else "unverified",
+                "auth_state": (
+                    "authorized" if method == "api_key" or credential else "unverified"
+                ),
+                **({"oauth_imported": True} if credential else {}),
                 "account": account,
                 "created_at": timestamp,
                 "updated_at": timestamp,
@@ -1834,6 +1875,8 @@ class Host:
             try:
                 if method == "api_key":
                     private_json(directory / "credential.json", {"api_key": api_key})
+                if credential:
+                    private_json(directory / "oauth-import.json", credential)
                 self.environments[identifier] = env
                 self.save()
             except OSError:
@@ -1904,7 +1947,8 @@ class Host:
         if operation == "refresh":
             self.ensure_payload(legacy_install=False)
             if env["auth_state"] not in ("authorized", "reauth_required") or (
-                env.get("auth_method") != "api_key" and not env.get("profile")
+                env.get("auth_method") != "api_key"
+                and not (env.get("profile") or env.get("oauth_imported"))
             ):
                 raise Failure(409)
             return self.refresh_account(env, proxy_url)
@@ -1962,7 +2006,9 @@ class ControlHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
             operation = self.path[1:] if self.path.startswith("/") else self.path
-            if length < 1 or length > (32768 if operation == "test-chat" else 8192):
+            if length < 1 or length > (
+                32768 if operation in ("create", "test-chat") else 8192
+            ):
                 raise Failure(400)
             if operation not in {
                 "list",

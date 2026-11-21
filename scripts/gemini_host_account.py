@@ -208,6 +208,10 @@ def probe_oauth(proxy_url, profile):
     token = read_token(profile)
     if token is None:
         return checked("error")
+    return probe_oauth_token(proxy_url, token)
+
+
+def probe_oauth_token(proxy_url, token, *, imported=False):
     credential = token.get("token")
     if not isinstance(credential, dict):
         return checked("error")
@@ -225,6 +229,12 @@ def probe_oauth(proxy_url, profile):
         )
         user_status, user_data = user.result()
         assist_status, assist_data = assist.result()
+    if imported:
+        email = user_data.get("email")
+        if user_status in (401, 403) or assist_status in (401, 403):
+            return checked("reauth_required")
+        if user_status != 200 or assist_status != 200 or not text(email, 254):
+            return checked("error")
     project = text(assist_data.get("cloudaicompanionProject")) or text(
         token.get("project_id")
     )
@@ -394,6 +404,10 @@ if __name__ == "__main__":
             )
         print(json.dumps({"event": "result", "result": result}))
         sys.exit(0 if result["status"] == "SUCCESS" else 1)
+    elif sys.argv[1] == "oauth_import":
+        result = probe_oauth_token(
+            request["proxy_url"], {"token": request["oauth_token"]}, imported=True
+        )
     else:
         result = checked("error")
     print(json.dumps(result))

@@ -719,6 +719,10 @@ export function createHandleProtocol(deps) {
       return
     }
 
+    if (protocol === 'anthropic.messages' && req.apiKeyRecord?.group_type === 'gemini') {
+      return deps.handleGeminiMessages(req, res)
+    }
+
     let inbound
     try {
       inbound = await readBody(req, inboundBodyLimit(getRouting(), cfg.limits.max_body_bytes))
