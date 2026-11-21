@@ -3,7 +3,11 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { connectUnixSocket, unixTransportOf } from '../../src/lib/cluster/ssh-link.mjs'
 
-function chan() { const c = new EventEmitter(); c.close = () => c.emit('close'); return c }
+function chan() {
+  const c = new EventEmitter()
+  c.close = () => c.emit('close')
+  return c
+}
 function fakeClient({ streamlocal, tools = '', failExec = [], refuseReason = 'ADMINISTRATIVELY_PROHIBITED' }) {
   const calls = []
   return {
@@ -11,13 +15,22 @@ function fakeClient({ streamlocal, tools = '', failExec = [], refuseReason = 'AD
     failExec,
     openssh_forwardOutStreamLocal(path, cb) {
       calls.push(['streamlocal', path])
-      streamlocal ? cb(null, chan()) : cb(Object.assign(new Error('administratively prohibited'), { reason: refuseReason }))
+      streamlocal
+        ? cb(null, chan())
+        : cb(Object.assign(new Error('administratively prohibited'), { reason: refuseReason }))
     },
     exec(cmd, cb) {
       calls.push(['exec', cmd])
-      const c = chan(); c.stderr = new EventEmitter()
+      const c = chan()
+      c.stderr = new EventEmitter()
       if (cmd.startsWith('command -v')) {
-        cb(null, c); setImmediate(() => { c.emit('data', Buffer.from(tools)); c.emit('exit', 0); c.emit('close') }); return
+        cb(null, c)
+        setImmediate(() => {
+          c.emit('data', Buffer.from(tools))
+          c.emit('exit', 0)
+          c.emit('close')
+        })
+        return
       }
       cb(null, c)
       if (failExec.some((f) => cmd.includes(f))) setImmediate(() => c.emit('exit', 127))
@@ -44,7 +57,7 @@ test('non-docker sockets use socat before nc, and docker is not used for them', 
   await connectUnixSocket(c, '/run/x.sock')
   const execs = c.calls.filter((x) => x[0] === 'exec').map((x) => x[1])
   assert.ok(execs.some((x) => x.startsWith('exec socat -')))
-  assert.ok(!execs.includes('docker system dial-stdio'))
+  assert.ok(!execs.includes('exec docker system dial-stdio'))
 })
 test('moves to the next bridge when one exits immediately, rethrows if none work', async () => {
   const c = fakeClient({ streamlocal: false, tools: '/usr/bin/docker\n/usr/bin/nc\nnc-N\n', failExec: ['dial-stdio'] })
@@ -60,7 +73,7 @@ test('a Docker bridge is never reused for another socket (relay after Docker op)
   assert.equal(unixTransportOf(c), 'docker-dial-stdio')
   // docker-only node: relay to another socket has no usable bridge and must fail, not hit Docker
   await assert.rejects(connectUnixSocket(c, '/run/kin/kernel.sock'), { code: 'streamlocal_failed' })
-  assert.equal(c.calls.filter((x) => x[0] === 'exec' && x[1] === 'docker system dial-stdio').length, 1)
+  assert.equal(c.calls.filter((x) => x[0] === 'exec' && x[1] === 'exec docker system dial-stdio').length, 1)
 })
 test('relay and Docker keep separate transports; paths are remembered independently', async () => {
   const c = fakeClient({ streamlocal: false, tools: '/usr/bin/docker\n/usr/bin/socat\n' })
@@ -68,7 +81,7 @@ test('relay and Docker keep separate transports; paths are remembered independen
   await connectUnixSocket(c, '/run/a.sock')
   await connectUnixSocket(c, '/run/b.sock')
   const execs = c.calls.filter((x) => x[0] === 'exec').map((x) => x[1])
-  assert.ok(execs.includes('docker system dial-stdio'))
+  assert.ok(execs.includes('exec docker system dial-stdio'))
   assert.ok(execs.some((x) => x.includes("UNIX-CONNECT:'/run/a.sock'")))
   assert.ok(execs.some((x) => x.includes("UNIX-CONNECT:'/run/b.sock'")))
   assert.equal(unixTransportOf(c), 'docker-dial-stdio')
@@ -82,7 +95,11 @@ test('a remembered bridge that stops working is dropped and re-probed', async ()
 })
 
 test('a missing socket (CONNECT_FAILED) is reported as is, without burning a bridge session', async () => {
-  const c = fakeClient({ streamlocal: false, tools: '/usr/bin/docker\n/usr/bin/socat\n', refuseReason: 'CONNECT_FAILED' })
+  const c = fakeClient({
+    streamlocal: false,
+    tools: '/usr/bin/docker\n/usr/bin/socat\n',
+    refuseReason: 'CONNECT_FAILED',
+  })
   await assert.rejects(connectUnixSocket(c, '/run/kin/kernel.sock'), { code: 'streamlocal_failed' })
   assert.equal(c.calls.filter((x) => x[0] === 'exec').length, 0)
 })
