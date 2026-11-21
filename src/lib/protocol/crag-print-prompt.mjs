@@ -421,6 +421,49 @@ function foldSummarySystemTurns(messages) {
   return { messages: [...folded.messages, ...tail], outputConfig }
 }
 
+const MAX_CACHE_BREAKPOINTS = 4
+
+function countCacheMarkers(body) {
+  let n = body.cache_control ? 1 : 0
+  for (const tool of Array.isArray(body.tools) ? body.tools : []) if (tool?.cache_control) n++
+  if (Array.isArray(body.system)) for (const block of body.system) if (block?.cache_control) n++
+  for (const message of Array.isArray(body.messages) ? body.messages : []) {
+    if (!Array.isArray(message?.content)) continue
+    for (const block of message.content) if (block?.cache_control) n++
+  }
+  return n
+}
+
+/**
+ * The CRAG kernel rejects a top-level cache_control ("unsupported request
+ * field"). Project the caller's automatic caching onto the last cacheable
+ * message block instead, which the kernel accepts. When the tail already
+ * carries a marker, or the four-marker budget is spent, the field is dropped.
+ */
+export function projectAutomaticCacheForCrag(body) {
+  if (!body || !Object.prototype.hasOwnProperty.call(body, 'cache_control')) return body
+  const { cache_control: control, ...out } = body
+  if (!control || typeof control !== 'object' || countCacheMarkers(body) > MAX_CACHE_BREAKPOINTS) return out
+  const messages = Array.isArray(out.messages) ? out.messages : []
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (!message || typeof message !== 'object') continue
+    const content = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content
+    if (!Array.isArray(content)) continue
+    for (let j = content.length - 1; j >= 0; j--) {
+      const block = content[j]
+      if (!block || typeof block !== 'object' || ['thinking', 'redacted_thinking'].includes(block.type)) continue
+      if (block.cache_control != null) return out
+      const next = content.slice()
+      next[j] = { ...block, cache_control: { ...control } }
+      out.messages = messages.slice()
+      out.messages[i] = { ...message, content: next }
+      return out
+    }
+  }
+  return out
+}
+
 /**
  * @param {object} body caller body, before cli-node persona injection
  * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[], agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
@@ -456,6 +499,11 @@ export function prepareCragPrintBody(
         ...(out.output_config || {}),
         ...folded.outputConfig,
       }
+  }
+  const projected = projectAutomaticCacheForCrag(out)
+  if (projected !== out) {
+    delete out.cache_control
+    out.messages = projected.messages
   }
   const mode = preset === 'zero' ? 'replace' : 'append'
   delete out.system

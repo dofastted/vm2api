@@ -10,6 +10,7 @@ import {
   cragV2KernelActive,
   foldHistorySystemMessages,
   prepareCragPrintBody,
+  projectAutomaticCacheForCrag,
   projectCallerSystem,
   readSlotKernelConfig,
   resolveCragPrintPersona,
@@ -644,4 +645,49 @@ test('summary cleanup turns ToolSearch tool_reference results into text', () => 
   assert.deepEqual(body, before)
   // Outside a summary fork the live tool_reference continuation is untouched.
   assert.deepEqual(prepareCragPrintBody(body, { foldSystemMessages: false }).messages, before.messages)
+})
+
+test('CRAG print body moves top-level cache_control onto the last message block', () => {
+  const body = {
+    model: 'claude-opus-5-5',
+    cache_control: { type: 'ephemeral', ttl: '1h' },
+    tools: [{ name: 't', input_schema: { type: 'object' }, cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'a' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'b' }] },
+      { role: 'user', content: 'c' },
+    ],
+  }
+  const out = prepareCragPrintBody(body, { capabilities: [] })
+  assert.equal('cache_control' in out, false)
+  assert.deepEqual(out.messages[2].content, [{ type: 'text', text: 'c', cache_control: { type: 'ephemeral', ttl: '1h' } }])
+  assert.equal(body.cache_control.ttl, '1h')
+  assert.equal(typeof body.messages[2].content, 'string')
+  assert.ok(out.tools[0].cache_control)
+})
+
+test('CRAG automatic cache projection drops the field when the tail is marked or the budget is spent', () => {
+  const mark = { type: 'ephemeral' }
+  const tailMarked = {
+    cache_control: mark,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }] }],
+  }
+  const a = projectAutomaticCacheForCrag(tailMarked)
+  assert.equal('cache_control' in a, false)
+  assert.equal(a.messages, tailMarked.messages)
+  const full = {
+    cache_control: mark,
+    tools: [1, 2, 3, 4].map((n) => ({ name: `t${n}`, cache_control: mark })),
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }],
+  }
+  const b = projectAutomaticCacheForCrag(full)
+  assert.equal('cache_control' in b, false)
+  assert.equal(b.messages[0].content[0].cache_control, undefined)
+  const noThinkingTail = {
+    cache_control: mark,
+    messages: [{ role: 'assistant', content: [{ type: 'text', text: 'x' }, { type: 'thinking', thinking: 't' }] }],
+  }
+  assert.deepEqual(projectAutomaticCacheForCrag(noThinkingTail).messages[0].content[0].cache_control, mark)
+  const untouched = { messages: [] }
+  assert.equal(projectAutomaticCacheForCrag(untouched), untouched)
 })
