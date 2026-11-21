@@ -1,6 +1,6 @@
 import { memoryBytes } from '@/features/cluster/model'
 
-const MEMORY = ['256m', '512m', '1g', '2g', '4g', '8g', '16g']
+const MEMORY = ['256m', '512m', '1g', '1536m', '2g', '4g', '8g', '16g']
 
 export function migrationMemoryOptions(current: unknown): string[] {
   const bytes = memoryBytes(current) || 2 * 1024 ** 3
