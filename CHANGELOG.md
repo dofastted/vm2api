@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.4.172 — 2026-11-21 · Gemini OAuth 共享调度与协议适配
+
+- Gemini OAuth 推理接入共享 PoolScheduler 的账号平衡、并发预留与 unit-circuit；继续使用各自的 CRAGGemini worker、私有 HOME 和绑定 SOCKS5 出口。
+- Gemini 专用密钥增加受限纯文本的 Gemini、OpenAI Chat/Responses、Anthropic Messages 入口及协议形状的响应和错误；客户端断连按中性取消处理。
+
 ## 1.4.171 — 2026-11-20 · CRAG 一键升级到锁定版本、CRAG 3.1.12 与面板文案续修
 
 - wrap 内核页新增「升级到锁定版本」一键动作。此前升级 CRAG 只能登宿主跑 `scripts/update-crag.mjs`，而 version-switch 的 overlay 从不投递 `scripts/`，宿主上那份可能停在旧代次；面板侧也没有任何地方调用 `/api/panel/kernels/crag-update`，运维没有可走的路径。现在按钮先按 `deploy/payload.json` 的 `crag_release` 拉取锁定载荷，跳过 `payload_tag` 已等于该 pin 的槽位，其余复用既有确认框、任务进度与逐槽结果；全部已达标时直接告知并且不重启任何槽位。`GET /api/panel/kernels` 新增 `crag_pin`，与描述已缓存包的字段分开放，避免被读成「已安装版本」；拉取路由开始接受 `latest`，默认仍为最新版，手动两步流程行为不变（#1513）。
