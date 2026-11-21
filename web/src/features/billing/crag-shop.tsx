@@ -655,6 +655,7 @@ function HostOverview({
             id='crag-host-redeem-help'
             className='text-sm text-muted-foreground'
           >
+            每张码从兑换时独立计时，未到期额度相加；不绑定、不启动 VM。
             Claude 订阅码增加本机槽位；以 CGG1- 开头的码兑换 CRAGGemini，不占用
             Claude 槽位。
           </p>
