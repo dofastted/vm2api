@@ -10,6 +10,7 @@ codex 企业级防封二开的唯一权威文档目录。**规则：每个迭代
 | [02-fingerprint-checklist.md](02-fingerprint-checklist.md) | 五维防封清单 → 控制点 → 验证 | v0.1 |
 | [03-m1-helper.md](03-m1-helper.md) | M1 交付：codex-tui-helper 组件表、接线、turn 生命周期、验证与限制 | v0.1 |
 | [04-ops.md](04-ops.md) | 出口门禁、TZ/GeoIP、usage 端点、巡检清单 | v0.1 |
+| [05-dataflow.md](05-dataflow.md) | 数据流全景：首次进入 codex、单/多轮时序、长对话、异常路径 | v0.1 |
 | decisions/ | ADR 决策记录 | — |
 
 ## 背景资料
@@ -27,4 +28,5 @@ codex 企业级防封二开的唯一权威文档目录。**规则：每个迭代
 | 2d | 2026-11-21 | M2d：`GET /internal/v1/codex/usage`（account_id + 每 worker rollout 最新 token_usage_record）；04-ops 文档：出网白名单审计、TZ/GeoIP 接线、巡检清单 | 03/04 |
 | 2a | 2026-11-21 | M2a：TUI 进程池——常驻 worker + `/new` 会话隔离 + session 亲和 + `codex resume` 兜底；turn 超时 Esc 中断保进程；按 model 分池驱逐 | 03 追加 |
 | 1a | 2026-11-21 | 对照 openai/codex 最新源码（ddfaef9）复核：修正 rollout 类型为 `token_usage_record`（usage 嵌套 payload.usage）、补 `stream_error` 终态、spawn 加 `--no-daemon`（新版 TUI 默认探测共享 app-server daemon，内嵌后端保证进程级 kill 语义）；确认 `›` composer、`[Pasted` chip、`codex resume <id>`+标志合并、auth.json 结构、project trust 祖先查找 | 03 修订 |
+| 3a | 2026-11-21 | 05-dataflow 新建：端到端数据流图（首次 spawn 序列、会话亲和多轮、长对话/上下文溢出、异常路径） | 05 新建 |
 | 3 | 2026-11-21 | **真机冒烟通过**：真实 codex 0.171.0 TUI + ChatGPT OAuth(auth.json) + socks5h 固定出口（75.37.237.55），`POST /internal/v1/codex/responses` 端到端 `response.completed`（回复 pong），rollout 落盘 `codex-home/sessions/`，env context 时区=America/Los_Angeles 与出口 IP 属地一致。配套修复：路径归一化为绝对路径（codex 拒绝相对 CODEX_HOME）、非 overload 错误透传 `response.failed`、`proxy_url`→spawn 注入 HTTPS_PROXY/ALL_PROXY、composer 检测改用 `›`/`for shortcuts`（vt10x 散布渲染致行锚定失配） | 03/04 修订 |
