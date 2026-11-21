@@ -5,10 +5,11 @@
  * Slot start still attaches a masquerade net so the container is not on a
  * redirected SOCKS bridge.
  */
-import { execFileSync, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { promisify } from 'node:util'
 import { getDb, isDbOpen } from '../db/database.mjs'
 import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
@@ -317,6 +318,37 @@ function ipRoute(args) {
 
 function docker(args, timeout = 30_000) {
   return sh(['docker', ...args], { timeout })
+}
+
+const runFile = promisify(execFile)
+
+/**
+ * `sh` off the event loop. Same `{ ok, stdout, stderr }` contract, so anything
+ * taking an injectable runner can use either. The docker CLI costs tens to
+ * hundreds of milliseconds per start, and on the watchdog path that was an
+ * event-loop stall per bound proxy per tick (#1495).
+ */
+async function shAsync(argv, { timeout = 15_000 } = {}) {
+  const command = [...commandPrefix(argv[0]), ...argv]
+  try {
+    const { stdout } = await runFile(command[0], command.slice(1), {
+      encoding: 'utf8',
+      timeout,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    return { ok: true, stdout: String(stdout || '').trim(), stderr: '' }
+  } catch (e) {
+    return {
+      ok: false,
+      stdout: String(e.stdout || '').trim(),
+      stderr: String(e.stderr || e.message || '').trim(),
+      code: e.code,
+    }
+  }
+}
+
+function dockerAsync(args, timeout = 30_000) {
+  return shAsync(['docker', ...args], { timeout })
 }
 
 /**
@@ -1020,10 +1052,11 @@ export function egressBinFingerprint(bin) {
 }
 
 /** null when the container does not exist. */
-export function inspectEgressContainer(name, runDocker = docker) {
-  const format =
-    '{{.State.Running}}|{{.State.Restarting}}|{{.State.Pid}}|{{index .Config.Labels "kin.egress.cfg"}}|{{index .Config.Labels "kin.egress.bin"}}|{{index .Config.Labels "kin.egress.reload"}}'
-  const r = runDocker(['inspect', '-f', format, name])
+const EGRESS_INSPECT_FORMAT =
+  '{{.State.Running}}|{{.State.Restarting}}|{{.State.Pid}}|{{index .Config.Labels "kin.egress.cfg"}}|{{index .Config.Labels "kin.egress.bin"}}|{{index .Config.Labels "kin.egress.reload"}}'
+
+/** One parse for both runners, so the sync and async probes cannot disagree. */
+function parseEgressInspect(name, r) {
   if (!r.ok) {
     if (/no such (?:object|container)/i.test(r.stderr || '')) return null
     return { name, error: 'egress_container_inspect_unavailable' }
@@ -1040,6 +1073,14 @@ export function inspectEgressContainer(name, runDocker = docker) {
     bin: String(bin || '').trim(),
     reload: String(reload || '').trim(),
   }
+}
+
+export function inspectEgressContainer(name, runDocker = docker) {
+  return parseEgressInspect(name, runDocker(['inspect', '-f', EGRESS_INSPECT_FORMAT, name]))
+}
+
+export async function inspectEgressContainerAsync(name, runDocker = dockerAsync) {
+  return parseEgressInspect(name, await runDocker(['inspect', '-f', EGRESS_INSPECT_FORMAT, name]))
 }
 
 /**
@@ -1344,6 +1385,43 @@ async function stopOwnedEgress(pid) {
   return waitEgressExit(pid)
 }
 
+/** One verdict for both probes, given container info either runner fetched. */
+function egressContainerVerdict(projectRoot, proxyId, container, info, bin) {
+  if (info?.error) return { ok: false, pending: true, reason: info.error, container }
+  if (!egressContainerHealthy(info)) return { ok: false, pid: info?.pid || null, reason: 'not_running', container }
+  // A surviving helper keeps executing the replaced inode; report it down so probe and watchdog repair it,
+  // as the process runtime does for a deleted executable.
+  const current = egressBinFingerprint(bin)
+  if (info.bin && current && info.bin !== current)
+    return { ok: false, pid: info.pid, reason: 'stale_binary', container }
+  return { ok: true, pid: info.pid, listen_tcp: readEgressListenTcp(projectRoot, proxyId), container }
+}
+
+/**
+ * Liveness of a slot's kin-egress, off the event loop.
+ *
+ * Same verdict as `inspectEgressProcess`; only the container probe differs, and
+ * both share `egressContainerVerdict` so the two cannot drift. Callers already
+ * inside an async function should prefer this: the sync probe shells out to the
+ * docker CLI, which stalled the loop once per bound proxy per watchdog tick and
+ * pushed direct-link dials past their deadline (#1495).
+ */
+export async function inspectEgressProcessAsync(
+  projectRoot,
+  proxyId,
+  { runtime = egressRuntime(), runDocker = dockerAsync, bin = EGRESS_BIN } = {},
+) {
+  if (runtime !== 'container') return inspectEgressProcess(projectRoot, proxyId, { runtime, bin })
+  const container = egressContainerName(proxyId)
+  return egressContainerVerdict(
+    projectRoot,
+    proxyId,
+    container,
+    await inspectEgressContainerAsync(container, runDocker),
+    bin,
+  )
+}
+
 export function inspectEgressProcess(
   projectRoot,
   proxyId,
@@ -1351,15 +1429,7 @@ export function inspectEgressProcess(
 ) {
   if (runtime === 'container') {
     const container = egressContainerName(proxyId)
-    const info = inspectEgressContainer(container, runDocker)
-    if (info?.error) return { ok: false, pending: true, reason: info.error, container }
-    if (!egressContainerHealthy(info)) return { ok: false, pid: info?.pid || null, reason: 'not_running', container }
-    // A surviving helper keeps executing the replaced inode; report it down so probe and watchdog repair it,
-    // as the process runtime does for a deleted executable.
-    const current = egressBinFingerprint(bin)
-    if (info.bin && current && info.bin !== current)
-      return { ok: false, pid: info.pid, reason: 'stale_binary', container }
-    return { ok: true, pid: info.pid, listen_tcp: readEgressListenTcp(projectRoot, proxyId), container }
+    return egressContainerVerdict(projectRoot, proxyId, container, inspectEgressContainer(container, runDocker), bin)
   }
   const dir = egressRunDir(projectRoot, proxyId)
   const pid = readPid(path.join(dir, 'egress.pid'))
