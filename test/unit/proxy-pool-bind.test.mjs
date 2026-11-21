@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 import { ProxyPool, MAX_VMS_PER_PROXY, clampBindLimit } from '../../src/lib/vm/proxy-pool.mjs'
-import { reconcileProxyScheduleHold } from '../../src/lib/vm/vm-registry.mjs'
+import { reconcileProxyScheduleHold, bindVmProxy } from '../../src/lib/vm/vm-registry.mjs'
 
 function tmpDir(prefix = 'kin-px-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
@@ -797,4 +797,62 @@ test('the pool-level config switch reports which proxies it flipped', (t) => {
   // An unrelated config key touches no proxy.
   const other = pool.updateConfig({ probe_interval_min: 30 })
   assert.deepEqual(other.dns_disable_svcb_https_changed, [])
+})
+
+test('re-binding lifts a stale hold without waiting for the next probe (#1395)', (t) => {
+  const f = holdFixture(t)
+  // Held while bound to proxy-a and still bound to it. The operator now moves
+  // the slot onto a proxy that was already healthy, so no probe transition is
+  // coming to notice the hold -- only the next scheduled probe would, up to a
+  // full probe interval later.
+  f.save({
+    id: 'vm-rebind',
+    status: 'running',
+    schedulable: false,
+    proxy: { id: 'proxy-a' },
+    schedule_hold: {
+      reason: 'proxy_cooldown',
+      detail: { tag: 'proxy-a', message: 'proxy_probe_failed:proxy_auth_failed' },
+      at: new Date().toISOString(),
+    },
+  })
+  const summary = bindVmProxy(f.root, 'vm-rebind', { id: 'proxy-b', host: '10.0.0.2', port: 1080 })
+  const after = f.get('vm-rebind')
+  assert.equal(after.proxy.id, 'proxy-b')
+  assert.equal(after.schedule_hold, undefined, 'the previous proxy must not keep holding the slot')
+  assert.equal(after.schedulable, true)
+  assert.equal(summary.schedulable, true, 'the summary the bind returns must already reflect the lift')
+})
+
+test('re-binding preserves a manual proxy hold and another subsystem hold (#1395)', (t) => {
+  const f = holdFixture(t)
+  const bind = (id) => bindVmProxy(f.root, id, { id: 'proxy-b', host: '10.0.0.2', port: 1080 })
+
+  // Manual intent is an operator decision, not a stale probe verdict.
+  f.save({
+    id: 'vm-manual',
+    status: 'running',
+    schedulable: false,
+    proxy: { id: 'proxy-a' },
+    schedule_hold: {
+      reason: 'proxy_cooldown',
+      detail: { tag: 'proxy-a', message: 'proxy_manually_disabled' },
+      at: new Date().toISOString(),
+    },
+  })
+  bind('vm-manual')
+  assert.equal(f.get('vm-manual').schedule_hold?.detail.message, 'proxy_manually_disabled')
+  assert.equal(f.get('vm-manual').schedulable, false)
+
+  // A hold owned by another subsystem is not a proxy verdict either.
+  f.save({
+    id: 'vm-maint',
+    status: 'running',
+    schedulable: false,
+    proxy: { id: 'proxy-a' },
+    schedule_hold: { reason: 'maintenance', detail: { tag: 'migration:1' }, at: new Date().toISOString() },
+  })
+  bind('vm-maint')
+  assert.equal(f.get('vm-maint').schedule_hold?.reason, 'maintenance')
+  assert.equal(f.get('vm-maint').schedulable, false)
 })

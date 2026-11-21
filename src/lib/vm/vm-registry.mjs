@@ -823,7 +823,15 @@ export function bindVmProxy(projectRoot, id, proxyInfo) {
   vm.proxy_cli_enabled = hasBoundExit(vm.proxy)
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm)
-  return summarizeVm(vm)
+  // Re-binding changes the premise of an automatic proxy hold: the proxy it was
+  // written for is no longer this slot's exit. Every clearing path is tag-guarded,
+  // so without reconciling here the slot stayed restricted until the new proxy's
+  // next scheduled probe -- a full probe interval, and never at all when that
+  // proxy was already healthy before the probe that follows (#1395). A manual
+  // hold and another subsystem's hold are preserved inside the reconcile, and a
+  // new exit that turns out to be broken gets a fresh hold from its own probe.
+  const reconciled = vm.proxy?.id ? reconcileProxyScheduleHold(projectRoot, id, vm.proxy.id) : null
+  return reconciled || summarizeVm(vm)
 }
 
 /**
