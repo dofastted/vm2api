@@ -8,7 +8,7 @@ codex 企业级防封二开的唯一权威文档目录。**规则：每个迭代
 |---|---|---|
 | [01-architecture.md](01-architecture.md) | 总体架构、组件、里程碑 | v0.1 |
 | [02-fingerprint-checklist.md](02-fingerprint-checklist.md) | 五维防封清单 → 控制点 → 验证 | v0.1 |
-| [03-m1-helper.md](03-m1-helper.md) | M1 交付：kin-codex-tui 组件表、接线、turn 生命周期、验证与限制 | v0.1 |
+| [03-m1-helper.md](03-m1-helper.md) | M1 交付：codex-tui-helper 组件表、接线、turn 生命周期、验证与限制 | v0.1 |
 | 04-ops.md | 槽位/代理/时区/升级运维手册（M2） | — |
 | decisions/ | ADR 决策记录 | — |
 
@@ -23,5 +23,5 @@ codex 企业级防封二开的唯一权威文档目录。**规则：每个迭代
 | 迭代 | 日期 | 内容 | 文档更新 |
 |---|---|---|---|
 | 0 | 2026-11-21 | 差距分析 + RFC-01 总体架构定稿 | 01/02 新建，v0.1 |
-| 1 | 2026-11-21 | M1：worker/internal/codextui + cmd/kin-codex-tui；supervisor 增加 KIN_CODEX_TUI_BIN/同级查找切换；单测 + fake-codex 端到端冒烟通过 | 03 新建 |
+| 1 | 2026-11-21 | M1：worker/internal/codextui + cmd/codex-tui-helper；supervisor 增加 CODEX_TUI_BIN/同级查找切换；单测 + fake-codex 端到端冒烟通过 | 03 新建 |
 | 1a | 2026-11-21 | 对照 openai/codex 最新源码（ddfaef9）复核：修正 rollout 类型为 `token_usage_record`（usage 嵌套 payload.usage）、补 `stream_error` 终态、spawn 加 `--no-daemon`（新版 TUI 默认探测共享 app-server daemon，内嵌后端保证进程级 kill 语义）；确认 `›` composer、`[Pasted` chip、`codex resume <id>`+标志合并、auth.json 结构、project trust 祖先查找 | 03 修订 |

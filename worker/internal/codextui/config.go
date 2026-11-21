@@ -58,7 +58,7 @@ func envMs(key string, fallback time.Duration) time.Duration {
 }
 
 // LoadConfig reads the kernel JSON and overlays helper env knobs.
-// KIN_CODEX_TUI_* vars are honored before KIN_CODEX_BIN etc.
+// CODEX_TUI_* vars are honored before KIN_CODEX_BIN etc.
 func LoadConfig(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -69,13 +69,13 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	runDir := filepath.Dir(path)
-	cfg.CodexBin = envStr("KIN_CODEX_TUI_BIN", envStr("KIN_CODEX_BIN", "codex"))
-	cfg.CodexHome = envStr("KIN_CODEX_TUI_HOME", filepath.Join(runDir, "codex-home"))
-	cfg.WorkspaceRoot = envStr("KIN_CODEX_TUI_WORKSPACE", filepath.Join(runDir, "codex-work"))
-	cfg.MaxParallel = envInt("KIN_CODEX_TUI_MAX_PARALLEL", 4)
-	cfg.ReadyTimeout = envMs("KIN_CODEX_TUI_READY_TIMEOUT_MS", 45*time.Second)
-	cfg.PasteTimeout = envMs("KIN_CODEX_TUI_PASTE_TIMEOUT_MS", 20*time.Second)
-	cfg.IdleTimeout = envMs("KIN_CODEX_TUI_IDLE_TIMEOUT_MS", 180*time.Second)
-	cfg.TurnTimeout = envMs("KIN_CODEX_TUI_TURN_TIMEOUT_MS", 600*time.Second)
+	cfg.CodexBin = envStr("CODEX_TUI_BIN", envStr("CODEX_BIN", "codex"))
+	cfg.CodexHome = envStr("CODEX_TUI_HOME", filepath.Join(runDir, "codex-home"))
+	cfg.WorkspaceRoot = envStr("CODEX_TUI_WORKSPACE", filepath.Join(runDir, "codex-work"))
+	cfg.MaxParallel = envInt("CODEX_TUI_MAX_PARALLEL", 4)
+	cfg.ReadyTimeout = envMs("CODEX_TUI_READY_TIMEOUT_MS", 45*time.Second)
+	cfg.PasteTimeout = envMs("CODEX_TUI_PASTE_TIMEOUT_MS", 20*time.Second)
+	cfg.IdleTimeout = envMs("CODEX_TUI_IDLE_TIMEOUT_MS", 180*time.Second)
+	cfg.TurnTimeout = envMs("CODEX_TUI_TURN_TIMEOUT_MS", 600*time.Second)
 	return cfg, nil
 }

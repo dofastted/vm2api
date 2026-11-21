@@ -78,7 +78,7 @@ func ensureHome(cfg *Config) error {
 // workspace root covers every per-turn child directory — no per-turn rewrite.
 func writeConfigToml(cfg *Config, trustDir string) error {
 	cfgPath := filepath.Join(cfg.CodexHome, "config.toml")
-	base := fmt.Sprintf(`# managed by kin-codex-tui; do not edit by hand
+	base := fmt.Sprintf(`# managed by codex-tui-helper; do not edit by hand
 approval_policy = "never"
 sandbox_mode = "read-only"
 check_for_update_on_startup = false

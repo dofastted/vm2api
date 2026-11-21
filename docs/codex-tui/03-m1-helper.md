@@ -1,4 +1,4 @@
-# 03 — M1：kin-codex-tui-helper 最小闭环
+# 03 — M1：codex-tui-helper-helper 最小闭环
 
 > Iteration 1 · 2026-11-21 · branch `devin/codex-tui`
 
@@ -12,7 +12,7 @@ M1 交付可用 PTY 驱动真实 `codex` TUI 的槽内 helper，对外维持既�
 
 | 路径 | 职责 |
 | --- | --- |
-| `worker/internal/codextui/config.go` | 读取 `run/codex-kernel.json` + `KIN_CODEX_TUI_*` 环境旋钮 |
+| `worker/internal/codextui/config.go` | 读取 `run/codex-kernel.json` + `CODEX_TUI_*` 环境旋钮 |
 | `worker/internal/codextui/home.go` | 槽级 CODEX_HOME：`auth.json`（凭证文件→ChatGPT auth 形态）与 `config.toml`（`approval_policy="never"`、`sandbox_mode="read-only"`、per-turn trust） |
 | `worker/internal/codextui/prompt.go` | envelope 解码；instructions+input items → 单段纯文本 |
 | `worker/internal/codextui/tui.go` | 200×50 PTY（creack/pty）+ vt10x 屏幕渲染；composer 检测、bracketed paste、Enter 提交 |
@@ -20,18 +20,18 @@ M1 交付可用 PTY 驱动真实 `codex` TUI 的槽内 helper，对外维持既�
 | `worker/internal/codextui/responses.go` | rollout → 上游 `response.*` SSE 词表翻译（created/output_item/output_text/completed/failed + usage） |
 | `worker/internal/codextui/engine.go` | 单请求单进程 turn 执行：并发信号量、cancel 表、idle/turn 超时 |
 | `worker/internal/codextui/server.go` | unix socket HTTP：health / responses / cancel，`x-kin-internal-token` 常量时间校验 |
-| `worker/cmd/kin-codex-tui/main.go` | 入口；兼容 supervisor 的 `<bin> <config-path>` 位置参数 |
+| `worker/cmd/codex-tui-helper/main.go` | 入口；兼容 supervisor 的 `<bin> <config-path>` 位置参数 |
 
 ## 控制面接线
 
 `codexKernelBinPath()`（`src/lib/transport/codex-kernel-supervisor.mjs`）查找顺序改为：
 
-1. `KIN_CODEX_TUI_BIN` 环境变量（显式切换开关）
-2. `KIN_KERNEL_BIN` 同级 `kin-codex-tui`（镜像内共存自动优先）
-3. `bin/kin-codex-tui`
+1. `CODEX_TUI_BIN` 环境变量（显式切换开关）
+2. `KIN_KERNEL_BIN` 同级 `codex-tui-helper`（镜像内共存自动优先）
+3. `bin/codex-tui-helper`
 4. 原 `kin-codex-kernel` 回退
 
-部署侧只要把 `kin-codex-tui` 放进槽镜像并置 `KIN_CODEX_TUI_BIN`，整槽
+部署侧只要把 `codex-tui-helper` 放进槽镜像并置 `CODEX_TUI_BIN`，整槽
 codex 出口即切换为真实 CLI 的 TLS/身份/行为特征；socket 契约不变。
 
 ## turn 生命周期

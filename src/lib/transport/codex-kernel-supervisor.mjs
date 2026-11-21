@@ -34,21 +34,21 @@ function existingBin(candidate) {
 }
 
 export function codexKernelBinPath() {
-  // kin-codex-tui drives the real codex TUI over a PTY; selecting it switches
+  // codex-tui-helper drives the real codex TUI over a PTY; selecting it switches
   // the slot's codex egress to the genuine binary's TLS/identity profile.
-  const tui = existingBin(process.env.KIN_CODEX_TUI_BIN)
+  const tui = existingBin(process.env.CODEX_TUI_BIN)
   if (tui) return tui
   const env = existingBin(process.env.KIN_CODEX_KERNEL_BIN)
   if (env) return env
   const kernel = String(process.env.KIN_KERNEL_BIN || process.env.KIN_API_KERNEL_BIN || '').trim()
   if (kernel) {
     const dir = path.dirname(kernel)
-    const tuiSibling = existingBin(path.join(dir, 'kin-codex-tui'))
+    const tuiSibling = existingBin(path.join(dir, 'codex-tui-helper'))
     if (tuiSibling) return tuiSibling
     const sibling = existingBin(path.join(dir, 'kin-codex-kernel'))
     if (sibling) return sibling
   }
-  const defaultTui = existingBin(path.resolve('bin/kin-codex-tui'))
+  const defaultTui = existingBin(path.resolve('bin/codex-tui-helper'))
   if (defaultTui) return defaultTui
   return existingBin(path.resolve('bin/kin-codex-kernel'))
 }

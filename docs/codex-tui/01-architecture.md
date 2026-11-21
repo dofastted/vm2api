@@ -36,7 +36,7 @@ Node 控制面 (vm2api 既有)
    │ 封控前置 (RISK 门禁) / 调度 / 配额
    ▼ Unix socket  /internal/v1/codex/responses  ← 契约不变
 slot-N Docker 容器（每账号一个）
-   ├─ kin-codex-tui-helper (新组件，替代 kin-codex-kernel)
+   ├─ codex-tui-helper-helper (新组件，替代 kin-codex-kernel)
    │    ├─ PTY (200×50) → 真实官方 codex TUI 二进制 ×M 个热进程
    │    ├─ bracketed-paste 注入用户消息 + Enter
    │    ├─ vterm 屏幕解析 → 增量流式
@@ -54,7 +54,7 @@ slot-N Docker 容器（每账号一个）
 
 ## 2. 核心组件
 
-### 2.1 `kin-codex-tui-helper`（替代 `kin-codex-kernel`）
+### 2.1 `codex-tui-helper-helper`（替代 `kin-codex-kernel`）
 
 部署在槽容器内，监听同一 Unix socket，对 Node 暴露**与现有 kernel 完全相同的**
 `/internal/v1/codex/responses` 契约，因此池化调度、配额、风控、计费零改动。
