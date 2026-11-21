@@ -445,7 +445,7 @@ export function VirtualizedLogsTable({
           ([key, value]) => key !== 'excludeErrorClass' && Boolean(value)
         )
           ? '没有符合当前筛选条件的日志'
-          : '暂无数据'}
+          : '本次查询未返回日志'}
       </div>
     )
   }

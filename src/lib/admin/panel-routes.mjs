@@ -217,7 +217,13 @@ import {
   startHostUpgrade,
 } from './release.mjs'
 import { downloadReleaseKernel, kernelReleaseHttpStatus, listKernelReleaseVersions } from './release-kernel.mjs'
-import { describeKernelCatalog, listKernelReleases, pullKernelRelease, selectKernelRelease } from './kernel-catalog.mjs'
+import {
+  cragReleasePin,
+  describeKernelCatalog,
+  listKernelReleases,
+  pullKernelRelease,
+  selectKernelRelease,
+} from './kernel-catalog.mjs'
 import {
   hasKernelInstallSafetyHold,
   installKernelTargets,
@@ -3210,6 +3216,7 @@ export function createPanelHandler(ctx) {
           200,
           panel.ok({
             kernels: describeKernelCatalog(cfg.paths.project),
+            crag_pin: cragReleasePin(cfg.paths.project),
             licenses,
             install_licenses: installLicenses,
             installations,
@@ -3258,7 +3265,8 @@ export function createPanelHandler(ctx) {
         if (
           !body ||
           !['cli-node', 'crag'].includes(body.kernel) ||
-          (body.tag != null && typeof body.tag !== 'string')
+          (body.tag != null && typeof body.tag !== 'string') ||
+          (body.latest != null && typeof body.latest !== 'boolean')
         ) {
           return json(res, 400, {
             ok: false,
@@ -3267,7 +3275,9 @@ export function createPanelHandler(ctx) {
         }
         const result = await pullKernelRelease(
           cfg.paths.project,
-          { kernel: body.kernel, tag: body.tag || '', latest: true },
+          // The manual two-step flow still tracks the newest release. Only a
+          // caller that explicitly asks for `latest: false` gets the pin.
+          { kernel: body.kernel, tag: body.tag || '', latest: body.latest !== false },
           { fetchImpl: ctx.fetchImpl },
         )
         if (!result.ok)

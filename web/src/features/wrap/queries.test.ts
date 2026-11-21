@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { ApiError, api } from '@/lib/api'
-import { installKernelTargets } from './queries'
+import { installKernelTargets, updateCragTargets } from './queries'
 
 vi.mock('@/lib/api', async (original) => ({
   ...(await original<typeof import('@/lib/api')>()),
@@ -89,4 +89,41 @@ it('does not accept a completed status without an installation report', async ()
     code: 'kernel_install_unconfirmed',
   })
   expect(apiMock).toHaveBeenCalledTimes(2)
+})
+
+it('submits a CRAG update to its own endpoint but polls the shared install job', async () => {
+  const pinned = [
+    {
+      id: 'vm-03',
+      kernel: 'crag' as const,
+      payload_tag: 'payload-2026.11.21-crag-3.1.12',
+    },
+  ]
+  const report = {
+    ok: true,
+    total: 1,
+    ok_count: 1,
+    failed_count: 0,
+    items: [{ ...pinned[0], ok: true, stopped: false, restarted: true }],
+  }
+  apiMock
+    .mockResolvedValueOnce({ job_id: 'job-9' })
+    .mockResolvedValueOnce({ state: 'completed', report })
+  await expect(updateCragTargets(pinned)).resolves.toEqual(report)
+  expect(apiMock.mock.calls[0]).toEqual([
+    '/api/panel/kernels/crag-update',
+    expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ targets: pinned, background: true }),
+    }),
+  ])
+  expect(apiMock.mock.calls[1][0]).toBe(`${endpoint}?job_id=job-9`)
+})
+
+it('does not retry a CRAG update whose receipt is lost', async () => {
+  apiMock.mockRejectedValueOnce(new TypeError('connection lost'))
+  await expect(updateCragTargets(targets)).rejects.toMatchObject({
+    code: 'kernel_install_unconfirmed',
+  })
+  expect(apiMock).toHaveBeenCalledTimes(1)
 })

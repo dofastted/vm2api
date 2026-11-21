@@ -65,6 +65,7 @@ import {
   type VmKindFilter,
   type VmSortKey,
 } from '@/features/vm/vm-table'
+import { resetNotice } from './reset-start-copy'
 
 const SORT_CHIPS = [
   ['status', '状态'],
@@ -173,8 +174,9 @@ export function VmListPage() {
         method: 'POST',
         body: JSON.stringify({ mode }),
       }),
-    onSuccess: async (_data, { mode }) => {
-      toast.success(mode === 'keep' ? '已保留原数据重建' : '已按新特征重建')
+    onSuccess: async (data, { mode }) => {
+      const notice = resetNotice(mode, undefined, data)
+      toast[notice.level](notice.message)
       setResetTarget(null)
       setResetInput('')
       await qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey })

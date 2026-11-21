@@ -32,7 +32,7 @@ describe('filtered log empty wording', () => {
         onOpenDetail={() => {}}
       />
     )
-    expect(unfiltered).toContain('暂无数据')
+    expect(unfiltered).toContain('本次查询未返回日志')
     expect(unfiltered).not.toContain('没有符合当前筛选条件的日志')
     const mutedOnly = renderToStaticMarkup(
       <VirtualizedLogsTable
@@ -41,6 +41,6 @@ describe('filtered log empty wording', () => {
         onOpenDetail={() => {}}
       />
     )
-    expect(mutedOnly).toContain('暂无数据')
+    expect(mutedOnly).toContain('本次查询未返回日志')
   })
 })
