@@ -65,6 +65,7 @@ export const ErrorCode = {
   UPSTREAM_INVALID: 'upstream_invalid_request',
   UPSTREAM_OVERLOADED: 'upstream_overloaded',
   UPSTREAM_TIMEOUT: 'upstream_timeout',
+  REQUEST_QUARANTINED: 'request_quarantined',
   UPSTREAM_ERROR: 'upstream_error',
   UPSTREAM_NETWORK: 'upstream_network_error',
   UPSTREAM_STREAM_INTERRUPTED: 'upstream_stream_interrupted',

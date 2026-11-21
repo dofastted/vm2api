@@ -2674,3 +2674,124 @@ test('keep_pin_on_model_gate: a borrowed account never takes the session, family
   assert.equal(result.accountId, 'account-2')
   assert.deepEqual(binds, [])
 })
+
+// --- poison request quarantine ---------------------------------------------
+
+function silentTimeout() {
+  return {
+    ok: false,
+    status: 504,
+    committed: false,
+    terminalState: 'rejected',
+    body: {
+      error: { type: 'upstream_timeout', code: 'upstream_timeout', message: 'job idle timeout: no CLI frame for 180s' },
+    },
+  }
+}
+
+const turnBody = (...extra) => ({
+  model: 'claude-opus-test',
+  messages: [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/x' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+    ...extra,
+  ],
+})
+
+function poisonHarness(config = {}) {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler, config: { max_same_account_retries: 0, ...config } })
+  runner.poisonGuard.logger = { warn() {} }
+  const calls = { n: 0 }
+  const send = (body, { stickyKey = 'sess:client-1', outcome = silentTimeout() } = {}) =>
+    runner.run({
+      requestId: `req-${calls.n + 1}`,
+      canonicalBody: body,
+      model: 'claude-opus-test',
+      stream: false,
+      stickyKey,
+      stickyKeys: [stickyKey],
+      callAttempt: () => {
+        calls.n += 1
+        return typeof outcome === 'function' ? outcome() : outcome
+      },
+    })
+  return { runner, scheduler, calls, send }
+}
+
+test('after two silent timeouts the third identical request is refused without touching a seat', async () => {
+  const { scheduler, calls, send } = poisonHarness()
+  await send(turnBody())
+  await send(turnBody())
+  assert.equal(calls.n, 2)
+  const selectBefore = scheduler.selectCalls
+  const started = Date.now()
+  const out = await send(turnBody())
+  assert.equal(calls.n, 2, 'no kernel job for the quarantined request')
+  assert.equal(scheduler.selectCalls, selectBefore, 'no seat reserved')
+  assert.ok(Date.now() - started < 500)
+  assert.equal(out.status, 400)
+  assert.equal(out.body.error.type, 'invalid_request_error')
+  assert.equal(out.body.error.code, 'request_quarantined')
+  assert.match(out.body.error.message, /rewind|new conversation|new session/i)
+  assert.equal(out.finalState, 'rejected')
+  assert.equal(out.attemptCount, 0)
+})
+
+test('a quarantined conversation that only grew is still refused, a rewound one goes through', async () => {
+  const { calls, send } = poisonHarness()
+  await send(turnBody())
+  await send(turnBody())
+  const grown = await send(turnBody({ role: 'assistant', content: 'x' }, { role: 'user', content: 'continue' }))
+  assert.equal(grown.body.error.code, 'request_quarantined')
+  const rewound = turnBody()
+  rewound.messages.pop()
+  const out = await send(rewound, { outcome: success() })
+  assert.equal(out.ok, true)
+  assert.equal(calls.n, 3)
+})
+
+test('another session on the same seat is unaffected', async () => {
+  const { send } = poisonHarness()
+  await send(turnBody())
+  await send(turnBody())
+  const other = await send(turnBody(), { stickyKey: 'sess:client-2', outcome: success() })
+  assert.equal(other.ok, true)
+})
+
+test('ordinary timeouts and other failures never quarantine', async () => {
+  const { calls, send } = poisonHarness()
+  const plain = () => ({
+    ...silentTimeout(),
+    body: { error: { type: 'upstream_timeout', message: 'upstream request timed out' } },
+  })
+  await send(turnBody(), { outcome: plain })
+  await send(turnBody(), { outcome: plain })
+  const out = await send(turnBody(), { outcome: plain })
+  assert.equal(calls.n, 3)
+  assert.notEqual(out.body?.error?.code, 'request_quarantined')
+})
+
+test('a success on the session lifts the record', async () => {
+  const { calls, send } = poisonHarness()
+  await send(turnBody())
+  await send(turnBody(), { outcome: success() })
+  const out = await send(turnBody())
+  assert.equal(calls.n, 3)
+  assert.notEqual(out.body?.error?.code, 'request_quarantined')
+})
+
+test('the guard can be turned off from config', async () => {
+  const { calls, send } = poisonHarness({ poison_request_threshold: 0 })
+  for (let i = 0; i < 4; i += 1) await send(turnBody())
+  assert.equal(calls.n, 4)
+})
+
+test('a quarantined session is not counted toward the per-VM kernel circuit', async () => {
+  const { vmTimeoutTracker } = await import('../../src/lib/pool/failover-runner.mjs')
+  vmTimeoutTracker.reset()
+  const { send } = poisonHarness()
+  for (let i = 0; i < 6; i += 1) await send(turnBody())
+  assert.ok((vmTimeoutTracker.counts.get('vm-01')?.count || 0) < 3, 'refused requests never reach the tracker')
+})
