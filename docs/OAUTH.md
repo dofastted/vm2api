@@ -62,6 +62,7 @@ CAI 粘贴码换票规则：`code#state` 只将 `#` 后的上游返回值作为 
 - 不保存响应 Cookie：整个流程只主动带 `Cookie: sessionKey`，`Set-Cookie` 一律不落盘。
 - profile / roles / eval / first-token / bootstrap 都是尽力而为：票据已经绑定该账号，不因为后续一跳失败丢掉一次换票。profile 和 bootstrap 都空时身份留空。
 - 出口仍是 fail closed：`proxy_url=""` 是本地出口（直连），`null` 是未绑定（`proxy_required`），不因为上游直连就放开。
+- **helper 自报能力**：`{"operation":"capabilities"}` 返回 `session-code-bridge`、`setup-token-inference`、`proxy-fallback-local`。e2e 按二进制声明选择断言，避免「行为改了但发行二进制还没换」时 CI 必然变红；策略本身放在入库的 `src/lib/oauth/profile-policy.mjs`，由单测直接覆盖。
 - **代理无效时的去向可配**：`KIN_OAUTH_PROXY_FALLBACK=local` 时，浏览器段（organizations + authorize）在出口被拒/不可达后改用本地出口重试一次；其它取值（默认 `off`）直接把代理失败抛给面板。只重试不消耗授权码的阶段，token 那一步永不重放。
 - authorize 的来源头会按序回退：上游按调用方 `Origin` 做允许列表，来源不对时是 `403 permission_error: Origin not allowed`（与 sessionKey 失效无关）。`claude.com/cai/oauth/authorize` 已 307 到 `claude.ai/oauth/authorize`，官方 CLI 的 `CLAUDE_AI_ORIGIN` 也是 `https://claude.ai`，所以 `auth.js` 依次尝试「profile 参考来源 → 同一主机的另一来源 → 不带 Origin」；只有这条 Origin 拒绝才换下一组，其它 403 立即失败，全被拒时错误列出尝试过的来源（面板映射成 `origin_rejected`，502）。
 - token 端点两种边缘拒绝单独归类，不再和授权码问题混在一起：`429 rate_limit_error` → `token_exchange_rate_limited`（面板 429，提示等 1 分钟再交同一个码，别连点；持续出现说明该出口 IP 被限速）；`403 Request not allowed` → `token_exchange_forbidden`（面板 502，提示换出口，通常是地区不支持）。
