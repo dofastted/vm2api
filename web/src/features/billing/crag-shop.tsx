@@ -579,7 +579,7 @@ function HostOverview({
           if (!action) setConfirmRecovery(open)
         }}
         title='使用当前发行包恢复原兑换？'
-        desc='将核对同一张使用券。仅当授权服务确认本机尚无订阅，且当前发行包可信时才继续兑换；结果不确定时保留原记录并报错。无需重新购买。'
+        desc='将核对原兑换和当前发行包，再继续同一张使用券的兑换。无法安全恢复时会保留原记录并显示具体原因，无需重新购买。'
         confirmText='确认恢复原兑换'
         cancelBtnText='取消'
         isLoading={action === 'recover'}
