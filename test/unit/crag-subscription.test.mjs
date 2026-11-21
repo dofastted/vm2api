@@ -404,6 +404,69 @@ test('redemption accepts the device UUID the panel shows, as well as the hashed 
   assert.throws(() => connect().redeemDeviceOrder('neither', voucher()))
 })
 
+test('retiring a host drops its local rights and reports what can be carried over', async (t) => {
+  let issued
+  const seen = []
+  const { root, publicDir, connect } = standaloneHost(t, async (url, { body }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    seen.push(action)
+    if (action === 'unbind') {
+      return Response.json({
+        ok: true,
+        data: {
+          released_codes: ['code-a', 'code-b'],
+          expires_at: issued.claims.expires_at,
+          cooldown_until: Math.floor(Date.now() / 1000) + 604800,
+        },
+      })
+    }
+    issued ??= issueHostEntitlement(root, JSON.parse(body).host_id, { slot_limit: 2 })
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+  })
+  seedEncryptedPackage(root)
+  const before = await connect().redeem(voucher())
+  assert.equal(before.state, 'active')
+  const entitlement = path.join(publicDir, 'entitlement.code')
+  assert.equal(fs.existsSync(entitlement), true)
+
+  const retired = await connect().unbind()
+  assert.ok(seen.includes('unbind'))
+  assert.deepEqual(retired.released.released_codes, ['code-a', 'code-b'])
+  // The signed rights have to go with it. Keeping them would have status()
+  // report a subscription the Authority has just deleted -- the one kind of
+  // stale local truth this module never shows.
+  assert.equal(fs.existsSync(entitlement), false)
+  assert.equal(retired.state, 'unredeemed')
+  assert.equal((await connect().status()).state, 'unredeemed')
+})
+
+test('a retirement refused by the transfer cooldown says so instead of looking unconfirmed', async (t) => {
+  let issued
+  const { root, connect } = standaloneHost(t, async (url, { body }) => {
+    if (url.endsWith('/unbind')) {
+      return Response.json({ ok: false, error: { code: 'host_transfer_cooldown' } }, { status: 409 })
+    }
+    issued ??= issueHostEntitlement(root, JSON.parse(body).host_id, { slot_limit: 2 })
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+  })
+  seedEncryptedPackage(root)
+  await connect().redeem(voucher())
+
+  // Without this code in the recognized set it degrades to
+  // crag_subscription_authority_unavailable (502), which reads as "result
+  // unconfirmed, retry" and sends the operator retrying something not yet due.
+  const refused = await connect()
+    .unbind()
+    .then(
+      () => null,
+      (error) => error,
+    )
+  assert.equal(refused.code, 'host_transfer_cooldown')
+  assert.equal(refused.status, 409)
+  // Refused means nothing moved: the subscription is still here.
+  assert.equal((await connect().status()).state, 'active')
+})
+
 function postSubscription(subscription) {
   return (action, body) =>
     createCragSubscriptionHandler({
@@ -1872,6 +1935,11 @@ test('a lost renewal response suspends real control admission until restart repl
   const service = connect()
   assert.deepEqual(await service.status(), {
     ready: true,
+    // Identity travels with every status: the panel shows it, and an identity
+    // fault is only diagnosable with its source. Derived here rather than
+    // hardcoded because the fixture's machine-id is random per run.
+    device_uuid: service.deviceIdentity().uuid,
+    identity_source: 'override',
     state: 'unredeemed',
     available_seats: 0,
     reclaim_pending_count: 0,

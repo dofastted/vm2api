@@ -45,6 +45,11 @@ const authorityErrors = new Map([
   ['renewal_unavailable', 409],
   ['request_conflict', 409],
   ['payload_key_conflict', 409],
+  // Without this, a retirement refused by the cooldown degrades into
+  // `crag_subscription_authority_unavailable` (502) -- which reads as "result
+  // unconfirmed, retry" and sends the operator retrying something that is
+  // simply not due yet.
+  ['host_transfer_cooldown', 409],
 ])
 const fail = (code = 'crag_subscription_unavailable', status = 503) => Object.assign(new Error(code), { code, status })
 const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
@@ -754,7 +759,9 @@ export function createCragSubscription({
   }
 
   function readLocalRights() {
-    const hostId = identity()
+    // One resolution yields all three: the identity is resolved here anyway, so
+    // carrying the displayable form and its source along costs nothing.
+    const { hostId, uuid, source } = deviceIdentity()
     const previous = current(hostId)
     const pending =
       load(marker, 0o644, 32) != null ||
@@ -762,7 +769,7 @@ export function createCragSubscription({
       load(rosterIntentFile, 0o600, 1024) != null
     const claims = previous?.claims ?? null
     if (claims && (!safeTime(claims.expires_at) || !safeTime(claims.revision))) throw fail()
-    return { hostId, claims, pending, previous }
+    return { hostId, uuid, source, claims, pending, previous }
   }
 
   function unchangedRights(before, after) {
@@ -1014,7 +1021,7 @@ export function createCragSubscription({
     }
     try {
       const local = readLocalRights()
-      const { hostId, claims, pending, previous } = local
+      const { hostId, uuid, source, claims, pending, previous } = local
       const reclaim_pending_count = readDeferredReleases(hostId).filter((entry) => entry.proven).length
       try {
         await ensureCredential(hostId)
@@ -1075,6 +1082,11 @@ export function createCragSubscription({
       if (runtime === null && mayRetry) return status(confirmed, false)
       return {
         ready: targetReady,
+        // The identity itself, so the panel can show what to quote in a support
+        // request and which source it came from. `uuid` is null on an install
+        // whose original source is gone (see `storedUuid`).
+        ...(uuid && { device_uuid: uuid }),
+        identity_source: source,
         ...(target_probe_failed && { target_probe_failed }),
         ...(credential_recovery && { credential_recovery }),
         state: pending ? 'sync_pending' : claims ? (expired ? 'expired' : 'active') : 'unredeemed',
@@ -2022,6 +2034,39 @@ export function createCragSubscription({
         },
         { blockBefore: false },
       )
+    },
+    /** Retire this machine's subscription at the Authority.
+     *
+     * Every live voucher is released carrying its remaining window, seats are
+     * cleared, and the host row is deleted. Those vouchers can then be redeemed
+     * on a replacement machine, where they inherit the window rather than
+     * restarting the term -- so replacing hardware neither loses paid time nor
+     * grants free time.
+     *
+     * The voucher code is the secret that authorizes the move, and the Authority
+     * never echoes it back (not even to its holder), so the operator has to
+     * still have it. There is no way around that: the device UUID is shown in
+     * the panel, so if it were sufficient on its own, anyone who saw it could
+     * claim the subscription.
+     *
+     * Deliberately destructive -- this is the operator saying the machine is
+     * done. Local signed rights are dropped once the Authority confirms:
+     * keeping them would have `status()` go on reporting a subscription that no
+     * longer exists, which is exactly the stale-local-truth this module refuses
+     * to show anywhere else.
+     */
+    unbind() {
+      return exclusive(async () => {
+        const hostId = identity()
+        checkNoIntent()
+        if (!current(hostId)) throw fail('crag_subscription_target_unready', 409)
+        const released = await authority('unbind', hostId, credential(hostId))
+        // Only after the Authority confirmed. Dropping them first would strand a
+        // machine whose request never landed: rights gone locally, still held
+        // remotely, and no way to prove either.
+        for (const file of [entitlementFile, marker, deferredReleaseFile]) remove(file)
+        return { ...(await status()), released }
+      })
     },
     async releaseStoppedBinding(vm, { stop } = {}) {
       const unchanged = (supported = false) => ({ released: false, stopped: false, reclaim_supported: supported })
