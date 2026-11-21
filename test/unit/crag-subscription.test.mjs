@@ -1170,6 +1170,123 @@ test('the exact pending voucher can resume after a lost response, even when an i
   assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
 })
 
+test('a credential that was lost outright is re-established from the signed entitlement', async (t) => {
+  let issued
+  let honoured
+  const seen = []
+  const { root, privateDir, connect } = standaloneHost(t, async (url, { body, headers }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    const { host_id, entitlement } = JSON.parse(body)
+    seen.push(action)
+    if (action === 'redeem') {
+      issued = issueHostEntitlement(root, host_id, { slot_limit: 2 })
+      honoured = headers.authorization
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    if (action === 'recover') {
+      assert.equal(entitlement, issued.code)
+      honoured = headers.authorization
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    return headers.authorization === honoured
+      ? Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+      : Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+  })
+  seedEncryptedPackage(root)
+  const before = await connect().redeem(voucher())
+  const keyFile = path.join(privateDir, 'credential')
+
+  // The data directory was rebuilt and took the private credential with it.
+  // The public entitlement survived, which is enough to prove ownership.
+  fs.rmSync(keyFile)
+
+  const after = await connect().status()
+  assert.ok(seen.includes('recover'), 'a lost credential is recovered, not reported as unavailable')
+  assert.notEqual(after.state, 'unavailable')
+  assert.equal(after.state, before.state)
+  assert.ok(fs.existsSync(keyFile), 'the recovered credential is persisted')
+  assert.equal(after.available_seats, before.available_seats)
+  assert.equal(after.credential_recovery, undefined, 'a recovery that succeeded reports no fault')
+})
+
+test('a credential the Authority no longer recognizes is replaced using the signed entitlement', async (t) => {
+  let issued
+  let honoured
+  const seen = []
+  const { root, privateDir, connect } = standaloneHost(t, async (url, { body, headers }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    const { host_id, entitlement } = JSON.parse(body)
+    const bearer = headers.authorization.slice('Bearer '.length)
+    seen.push(action)
+    if (action === 'redeem') {
+      issued = issueHostEntitlement(root, host_id, { slot_limit: 2 })
+      honoured = bearer
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    if (action === 'recover') {
+      // Ownership is proven by the entitlement this authority signed. The
+      // bearer token is the *replacement* credential, not a proof of anything.
+      assert.equal(entitlement, issued.code)
+      honoured = bearer
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    return bearer === honoured
+      ? Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+      : Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+  })
+  seedEncryptedPackage(root)
+  const before = await connect().redeem(voucher())
+  const keyFile = path.join(privateDir, 'credential')
+  const accepted = fs.readFileSync(keyFile, 'utf8')
+
+  // The stored credential is no longer the one the Authority has: a rolled-back
+  // data directory, or a host id shared with the machine that registered first.
+  const stale = crypto.randomBytes(32).toString('base64url')
+  fs.writeFileSync(keyFile, stale, { mode: 0o600 })
+
+  const after = await connect().status()
+  assert.deepEqual(seen, ['redeem', 'status', 'recover', 'status'], 'recovery retries the call once')
+  const replacement = fs.readFileSync(keyFile, 'utf8')
+  assert.notEqual(replacement, stale, 'the rejected credential is replaced')
+  assert.notEqual(replacement, accepted, 'the replacement is freshly generated')
+  assert.equal(replacement, honoured, 'the Authority now honours what is on disk')
+  // Recovery swaps a secret; it must not move anything that was paid for.
+  assert.equal(after.state, before.state)
+  assert.equal(after.available_seats, before.available_seats)
+})
+
+test('recovery is refused for a host id shared with another machine, and is not retried', async (t) => {
+  let issued
+  const seen = []
+  const { root, privateDir, connect } = standaloneHost(t, async (url, { body }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    seen.push(action)
+    if (action === 'redeem') {
+      issued = issueHostEntitlement(root, JSON.parse(body).host_id, { slot_limit: 2 })
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    // The rightful device holds this host id. Letting this machine recover
+    // would hand it the subscription and lock the other one out, so the
+    // Authority refuses -- and the client must not grind on it.
+    return Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+  })
+  seedEncryptedPackage(root)
+  await connect().redeem(voucher())
+  const keyFile = path.join(privateDir, 'credential')
+  const stale = crypto.randomBytes(32).toString('base64url')
+  fs.writeFileSync(keyFile, stale, { mode: 0o600 })
+
+  const degraded = await connect().status()
+  assert.deepEqual(seen, ['redeem', 'status', 'recover'], 'a refused recovery is attempted once, never in a loop')
+  assert.equal(fs.readFileSync(keyFile, 'utf8'), stale, 'a refused recovery must not install a new credential')
+  // Locally signed rights still apply: being unable to reach the Authority --
+  // or being refused by it -- is not grounds for locking the operator out.
+  assert.ok(degraded.state)
+  // But the refusal itself must reach the panel. Swallowing it would leave the
+  // operator with a subscription that looks fine until a redemption fails.
+  assert.equal(degraded.credential_recovery, 'host_id_collision')
+})
+
 test('an Authority denial is not retried or installed, and only a valid correlation ID is exposed', async (t) => {
   const redemption_code = voucher()
   const requestId = crypto.randomUUID()

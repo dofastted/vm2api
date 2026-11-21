@@ -785,6 +785,7 @@ export function createCragSubscription({
     let targets
     let inventory = {}
     let target_probe_failed = false
+    let credential_recovery
     try {
       targets = await listTargets()
       if (isLocalCragSlot) {
@@ -808,6 +809,14 @@ export function createCragSubscription({
       const local = readLocalRights()
       const { hostId, claims, pending, previous } = local
       const reclaim_pending_count = readDeferredReleases(hostId).filter((entry) => entry.proven).length
+      try {
+        await ensureCredential(hostId)
+      } catch (error) {
+        // A lost credential that cannot be re-established is reported through
+        // the local check below, which is the one that decides what the panel
+        // shows. Recovery is an attempt to avoid that, not a new failure mode.
+        if (error.recovery && error.recovery !== 'unavailable') credential_recovery = error.recovery
+      }
       if (load(hostFile, 0o644, 64)) credential(hostId)
       const needsRefresh = claims && claims.expires_at * 1000 <= Date.now()
       if (needsRefresh && !pending && !confirmed && mayRetry) {
@@ -826,8 +835,14 @@ export function createCragSubscription({
           try {
             const remote = await authority('status', hostId, credential(hostId))
             if (remote.entitlement === previous.code) rights = projection(remote, claims)
-          } catch {
+          } catch (error) {
             // Signed local rights still apply during an Authority outage. Do not guess remote metadata.
+            // A refused credential recovery is not an outage though: it is a
+            // durable fault only the operator can clear -- most often this host
+            // id being shared with another machine. Surfacing it here is the
+            // difference between "the panel looks normal until a redemption
+            // mysteriously fails" and being told what to fix.
+            if (error.recovery && error.recovery !== 'unavailable') credential_recovery = error.recovery
           }
         }
       }
@@ -854,6 +869,7 @@ export function createCragSubscription({
       return {
         ready: targetReady,
         ...(target_probe_failed && { target_probe_failed }),
+        ...(credential_recovery && { credential_recovery }),
         state: pending ? 'sync_pending' : claims ? (expired ? 'expired' : 'active') : 'unredeemed',
         ...(claims && { slot_limit: claims.slot_limit, expires_at: claims.expires_at, revision: claims.revision }),
         ...rights,
@@ -879,7 +895,49 @@ export function createCragSubscription({
     }
   }
 
-  async function authority(action, hostId, key, extra) {
+  /** One recovery is shared by every caller that races into the same 403.
+   * Each one replacing the credential in turn would invalidate the one before
+   * it, so concurrent attempts would take turns locking each other out. */
+  let credentialRecovery = null
+
+  /** The Authority knows this host but rejected our credential -- the usual
+   * cause is a rebuilt data directory that lost `<private>/credential`.
+   *
+   * The stored entitlement is what proves ownership in its place: the Authority
+   * signed it itself and bound it to this host id, so presenting it is enough
+   * to have the credential replaced without touching a single right. Returns
+   * the replacement, or null when this machine has nothing to prove ownership
+   * with (it never activated successfully, so this is not a recovery case). */
+  async function recoverCredential(hostId) {
+    credentialRecovery ??= (async () => {
+      const entitlement = load(entitlementFile, 0o644, MAX_CRAG_HOST_ENTITLEMENT_BYTES)
+      if (!entitlement) return null
+      const replacement = randomBytes(32).toString('base64url')
+      // Only persist once the Authority accepted it: writing first would leave
+      // a credential the Authority never saw. Either order self-heals, since
+      // recovery does not depend on the local credential, but this one keeps
+      // the stored secret meaningful at every point.
+      await authority('recover', hostId, replacement, { entitlement }, false)
+      publish(keyFile, replacement, 0o600)
+      return replacement
+    })().finally(() => {
+      credentialRecovery = null
+    })
+    return credentialRecovery
+  }
+
+  /** A credential that is simply *gone* never reaches the Authority at all:
+   * `credential()` refuses to mint a second one for a host that is already
+   * bound, so the call fails locally and the subscription reads as unavailable.
+   * That is the right default -- minting one silently would orphan the host --
+   * but when the signed entitlement is still on disk, ownership can be proven
+   * and the credential re-established instead of stranding the operator. */
+  async function ensureCredential(hostId) {
+    if (load(keyFile, 0o600, 43) || !load(hostFile, 0o644, 64)) return
+    await recoverCredential(hostId)
+  }
+
+  async function authority(action, hostId, key, extra, allowRecovery = true) {
     let requestId
     let status
     let code
@@ -906,6 +964,29 @@ export function createCragSubscription({
     }
     const error = code ? fail(code, status) : fail('crag_subscription_authority_unavailable', 502)
     if (requestId) error.authorityRequestId = requestId
+    if (code === 'auth_forbidden' && allowRecovery) {
+      let replacement
+      try {
+        replacement = await recoverCredential(hostId)
+      } catch (recoveryError) {
+        // Recovery is deliberately refused when this host id is shared with
+        // another machine -- a cloned VPS image that kept its machine-id --
+        // because otherwise the two would take the subscription from each
+        // other. Report the original rejection, but record which case it is so
+        // the panel can say what to do instead of showing a bare 403.
+        error.recovery =
+          recoveryError.code === 'auth_forbidden'
+            ? 'host_id_collision'
+            : recoveryError.code === 'crag_subscription_authority_unavailable'
+              ? 'unavailable'
+              : 'failed'
+        throw error
+      }
+      // Retry once, never in a loop: a replacement the Authority just accepted
+      // that is rejected again is a real failure, not something to grind on.
+      if (replacement) return await authority(action, hostId, replacement, extra, false)
+      error.recovery = 'not_activated'
+    }
     throw error
   }
 
