@@ -54,7 +54,8 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
   const boardScopes = cards.map((card) => card.scope)
   const [boardScope, setBoardScope] = useState<LeaderboardScope>(boardScopes[0])
   const boardRef = useRef<HTMLDivElement>(null)
-  const overview = useQuery(usageOverviewQueryOptions(tz)).data
+  const overviewQuery = useQuery(usageOverviewQueryOptions(tz))
+  const overview = overviewQuery.data
 
   const openBoard = (scope: LeaderboardScope) => {
     setBoardScope(scope)
@@ -73,18 +74,20 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
       <BentoGrid>
         <BentoMetricCard
           title='活跃 Session'
-          value={overview?.activeSessions ?? 0}
+          value={overview ? overview.activeSessions : null}
           formatter={(v) => Math.round(v).toLocaleString()}
           icon={Activity}
           accentColor='emerald'
           className='min-h-[120px]'
-          comparisons={[
-            { value: overview?.rpm ?? 0, label: 'RPM', isPercentage: false },
-          ]}
+          comparisons={
+            overview?.rpm == null
+              ? undefined
+              : [{ value: overview.rpm, label: 'RPM', isPercentage: false }]
+          }
         />
         <BentoMetricCard
           title='今日请求'
-          value={overview?.todayRequests ?? 0}
+          value={overview ? overview.todayRequests : null}
           formatter={(v) => Math.round(v).toLocaleString()}
           icon={TrendingUp}
           accentColor='blue'
@@ -95,7 +98,7 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
         />
         <BentoMetricCard
           title='今日消费 · 官方价'
-          value={overview?.todayCost ?? 0}
+          value={overview ? overview.todayCost : null}
           formatter={(v) => formatCurrency(v)}
           icon={DollarSign}
           accentColor='amber'
@@ -106,7 +109,7 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
         />
         <BentoMetricCard
           title='平均响应时间'
-          value={overview?.todayAvgDurationMs ?? 0}
+          value={overview?.todayAvgDurationMs ?? null}
           formatter={(v) => formatDuration(Math.round(v))}
           icon={Clock}
           accentColor='purple'
