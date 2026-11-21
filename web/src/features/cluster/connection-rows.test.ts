@@ -76,7 +76,7 @@ describe('local connection details', () => {
       nodes: [node()],
     })
     const by = Object.fromEntries(rows.map((r) => [r.label, r]))
-    expect(by['公网'].value).toBe('192.0.2.10 · 外网连不进 8787（正常）')
+    expect(by['公网'].value).toBe('192.0.2.10 · 观测节点回连未连通 8787')
     expect(by['公网'].tone).toBe('ok')
     expect(by['内网'].value).toBe('10.10.0.10（连集群节点）')
     expect(by['Docker'].value).toContain('其中槽 6 个')
@@ -84,7 +84,7 @@ describe('local connection details', () => {
     expect(by['控制面进程'].value).toBe('内存 394MB · 已运行 10 小时')
     expect(by['集群出站'].value).toBe('1 / 1 个节点已连上')
     expect(localDetailSummary(status)).toBe(
-      '控制面 host 网络 · 外网连不进 · Docker 正常 · KVM 可用'
+      '控制面 host 网络 · 观测节点回连未连通 · Docker 正常 · KVM 可用'
     )
   })
 
