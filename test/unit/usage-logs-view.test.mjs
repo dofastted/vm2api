@@ -443,3 +443,23 @@ test('tenant error collection hides other users and anonymous ingress failures',
   assert.equal(all.recent.length, 3)
   assert.deepEqual(all.ingress_hits.map((h) => h.ip).sort(), ['198.51.100.7', '203.0.113.9'])
 })
+
+test('active sessions flag one-off (single request, no tools) apart without merging, and list them last', () => {
+  const db = freshDb()
+  const now = Date.now()
+  const iso = (ago) => new Date(now - ago).toISOString()
+  seed(db, [
+    { created_at: iso(1_000), outbound_session_id: 'side-1', api_key_id: 'k1', has_tools: 0 },
+    { created_at: iso(2_000), outbound_session_id: 'side-2', api_key_id: 'k1', has_tools: 0 },
+    { created_at: iso(50_000), outbound_session_id: 'main-1', api_key_id: 'k1', has_tools: 1 },
+    { created_at: iso(40_000), outbound_session_id: 'two-1', api_key_id: 'k1', has_tools: 0 },
+    { created_at: iso(30_000), outbound_session_id: 'two-1', api_key_id: 'k1', has_tools: 0 },
+  ])
+  const active = new UsageLogsView(db).activeSessions({ now })
+  assert.equal(active.total, 4)
+  assert.equal(active.oneOffTotal, 2)
+  assert.deepEqual(
+    active.sessions.map((s) => [s.sessionId, s.oneOff]),
+    [['two-1', false], ['main-1', false], ['side-1', true], ['side-2', true]],
+  )
+})
