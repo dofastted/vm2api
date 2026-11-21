@@ -61,21 +61,21 @@ function inboundRow(s: ClusterLocalStatus): DetailRow {
     case 'closed':
       return {
         label: '公网',
-        value: `${ip} · 外网连不进 ${control.listen_port}（正常）`,
+        value: `${ip} · 观测节点回连未连通 ${control.listen_port}`,
         tone: 'ok',
         hint,
       }
     case 'loopback':
       return {
         label: '公网',
-        value: `${ip} · 面板只监听本机（正常）`,
+        value: `${ip} · 面板仅监听本机`,
         tone: 'ok',
         hint,
       }
     case 'open':
       return {
         label: '公网',
-        value: `${ip} · 外网能直接连 ${control.listen_port}`,
+        value: `${ip} · 观测节点回连成功 ${control.listen_port}`,
         tone: 'caution',
         hint: `建议只监听内网或加防火墙${hint ? `；${hint}` : ''}`,
       }
@@ -154,13 +154,17 @@ export function localDetailSummary(status: ClusterLocalStatus): string {
       ? '控制面本机进程'
       : `控制面 ${net === 'host' ? 'host 网络' : net || '容器'}`
   )
-  if (status.nat.inbound === 'closed' || status.nat.inbound === 'loopback') {
-    parts.push('外网连不进')
-  } else if (status.nat.inbound === 'open') parts.push('外网能直接连')
+  if (status.nat.inbound === 'closed') parts.push('观测节点回连未连通')
+  else if (status.nat.inbound === 'loopback') parts.push('面板仅监听本机')
+  else if (status.nat.inbound === 'open') parts.push('观测节点回连成功')
   parts.push(status.docker.ok ? 'Docker 正常' : 'Docker 不可用')
   if (status.kvm)
     parts.push(
-      status.kvm.ok && status.kvm.accel === 'kvm' ? 'KVM 可用' : 'KVM 不可用'
+      status.kvm.ok && status.kvm.accel === 'kvm'
+        ? 'KVM 可用'
+        : status.kvm.ok
+          ? '仅支持软件模拟'
+          : 'KVM 不可用'
     )
   return parts.join(' · ')
 }
