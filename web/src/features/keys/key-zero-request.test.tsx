@@ -17,6 +17,7 @@ async function render(requests: number, errors: number) {
   })
   const usage = {
     days: 30,
+    since: null,
     history: [
       {
         day: shanghaiDay(Date.now()),

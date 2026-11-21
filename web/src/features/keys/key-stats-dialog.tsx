@@ -122,17 +122,11 @@ function StatsBody({ item, vms }: { item: ApiKeyItem; vms: Vm[] }) {
               label={`${view.summary.days} 天请求`}
               value={fmtNum(view.summary.requests)}
               hint={
-                view.summary.errors > 0
-                  ? view.summary.requests === 0
-                    ? '此期间无请求'
-                    : view.summary.errors > 0
-                      ? `含 ${view.summary.errors} 次失败`
-                      : '全部成功'
-                  : view.summary.requests === 0
-                    ? '此期间无请求'
-                    : view.summary.errors > 0
-                      ? `含 ${view.summary.errors} 次失败`
-                      : '全部成功'
+                view.summary.requests === 0
+                  ? '此期间无请求'
+                  : view.summary.errors > 0
+                    ? `含 ${fmtNum(view.summary.errors)} 次失败`
+                    : '全部成功'
               }
             />
             <MetricCard
