@@ -70,6 +70,15 @@ export type CragRuntime = {
 export type CragHostStatus = {
   ready: boolean
   target_probe_failed?: true
+  /** 本机的设备标识，面板展示用。授权协议里走的仍是它派生出的 64 位 host id；
+   * 这个 UUID 是同一标识的可读形式，供运维复制、报障时引用。
+   *
+   * 缺失表示这台机器的原始标识来源已不在（见 crag-subscription.mjs 的
+   * `storedUuid`），此时不编一个出来 —— 编出来的 UUID 推不回本机 host id。 */
+  device_uuid?: string
+  /** 标识取自哪里：已保存的绑定、环境覆盖、网卡、挂载或 machine-id。
+   * 标识类故障只有带上来源才诊断得动。 */
+  identity_source?: 'saved' | 'override' | 'mac' | 'mount' | 'machine-id'
   /** The Authority rejected this host's credential and the automatic recovery
    * did not clear it. Unlike an outage, this needs the operator: most often
    * `host_id_collision`, where another machine -- typically a VPS cloned from

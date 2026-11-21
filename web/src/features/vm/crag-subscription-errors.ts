@@ -36,6 +36,8 @@ export const cragSubscriptionErrors: Record<string, string> = {
   host_redeem_conflict: '此订阅兑换码已在其他宿主机兑换，不能用于本机。',
   not_found: '授权服务找不到当前宿主机的订阅或槽位。',
   auth_forbidden: '授权服务不接受当前宿主机的订阅凭据。',
+  host_transfer_cooldown:
+    '本机上次注销的时间太近，兑换券还不能再次转移。请等冷却期结束后重试。',
 }
 
 /**
