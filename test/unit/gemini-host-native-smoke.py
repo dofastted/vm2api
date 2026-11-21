@@ -20,8 +20,14 @@ frames = [
     b'data: {"candidates":[{"content":{"parts":[{"text":"hello "}]}}]}\n\n',
     b'data: {"candidates":[{"content":{"parts":[{"text":"world"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":12,"cachedContentTokenCount":4,"candidatesTokenCount":3,"thoughtsTokenCount":2,"totalTokenCount":17}}\n\n',
 ]
-result = native.parse_sse(frames)
-assert result == {
+wrapped_frames = [
+    b": keepalive\r\n\r\n",
+    b'data: {"response":{"candidates":[{"content":{"parts":[{"text":"hello "}]}}]}}\n\n',
+    b'data: {"response":{"candidates":[{"content":{"parts":[{"text":"world"}]},"finishReason":"STOP"}],'
+    b'"usageMetadata":{"promptTokenCount":12,"cachedContentTokenCount":4,"candidatesTokenCount":3,'
+    b'"thoughtsTokenCount":2,"totalTokenCount":17}}}\n\n',
+]
+expected = {
     "state": "completed",
     "text": "hello world",
     "usage": {
@@ -31,10 +37,14 @@ assert result == {
         "total_tokens": 17,
     },
 }
+assert native.parse_sse(frames) == expected
 for invalid in (
     [b'data: {"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}\n\n'],
     [b"data: not-json\n\n"],
     [b"event: error\ndata: upstream failure\n\n"],
+    wrapped_frames[:-1],
+    [*wrapped_frames, b'data: {"response":null}\n\n'],
+    [*wrapped_frames, b'data: {"response":{"error":{"code":500}}}\n\n'],
 ):
     try:
         native.parse_sse(invalid)
@@ -76,7 +86,7 @@ class Handler(socketserver.StreamRequestHandler):
         assert request["request_id"] == "turn-native-01"
         assert request["body"]["model"] == "gemini-test"
         assert request["body"]["contents"][0]["parts"][0]["text"] == "native prompt"
-        body = b"".join(frames)
+        body = b"".join(wrapped_frames)
         self.wfile.write(
             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: "
             + str(len(body)).encode()
@@ -112,16 +122,7 @@ with tempfile.TemporaryDirectory(prefix="gemini-native-fixture-") as temporary:
             if time.monotonic() >= deadline:
                 raise AssertionError("native request helper did not complete")
             time.sleep(0.01)
-        assert result == {
-            "state": "completed",
-            "text": "hello world",
-            "usage": {
-                "input_tokens": 8,
-                "output_tokens": 5,
-                "cache_read_tokens": 4,
-                "total_tokens": 17,
-            },
-        }, result
+        assert result == expected, result
     finally:
         invocation.close()
         server.shutdown()

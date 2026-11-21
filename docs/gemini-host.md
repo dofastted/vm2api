@@ -66,4 +66,4 @@ OAuth 公共推理使用 CRAGGemini 原生 TUI/`LD_PRELOAD` worker 路径；不�
 
 内部适配器 [`native-turn.mjs`](../src/lib/gemini/native-turn.mjs) 把 Gemini `streamGenerateContent` 请求体、Anthropic Messages、OpenAI Chat Completions 和 Responses 的单条文本输入收敛为 `{ request_id, stream: true, body: { model, contents } }`，保留文本顺序和空白。由受信服务端选定固定模型和每回合独立的 `kernel.sock`，经 `/internal/v1/messages` 调用 CRAGGemini worker；worker 的 `native.sock` 与 `LD_PRELOAD` 桥接到 `agy` TUI 原生输入队列。历史由原生会话持有，不接收外部历史、系统指令、工具、生成参数、多模态或非流式选项；不支持的字段明确拒绝，不静默丢弃。适配器保留原生 Gemini SSE，不把首个 HTTP 200 当作回合成功，也不自动重试。
 
-Linux VT 和 signed `agy` 在开发环境不可用，因此本地回归只覆盖 worker Unix socket、鉴权、Gemini SSE 完成帧及 usage 归一化；真实 OAuth/TUI 推理仍须在具备空闲 VT 的 Linux amd64 宿主验收。
+宿主解析 Gemini SSE 时同时接受顶层 `candidates`／`usageMetadata` 和 Code Assist 的 `response` 包装；无有效结束帧仍按失败处理。Unix socket 回归覆盖包装帧的文本、结束原因与用量。CRAGGemini 独立 worker 的真实 OAuth 验证不等于 vm2api 验收：还需将含 Code Assist 捕获修复的签名载荷接入 vm2api，再从网关端发起真实 OAuth 回合。

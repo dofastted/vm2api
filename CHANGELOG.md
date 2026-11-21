@@ -5,6 +5,7 @@
 - 「导入 → Gemini」支持导入单个 Antigravity 账号 JSON，只验证并保存短期访问凭据；文件导入不代替 CLI OAuth 登录。
 - Linux amd64 一键安装继续预装签名的 CRAGGemini `0.3.0-rc.2`；「设置 → Gemini」可在不升级控制面的情况下重试宿主准备。
 - Gemini 专用密钥可调度已激活、已授权且已拉取模型的宿主账号。OAuth 推理经 CRAGGemini 原生 TUI/`LD_PRELOAD` worker（需空闲 Linux VT），API Key 经 Google `generateContent`；`GET /v1/models` 遵守密钥模型白名单，两个 POST 入口支持单轮非流式纯文本并按限额计次。
+- Gemini 宿主可解析 Code Assist 的 `response` 包装 SSE，正确读取回复、结束帧和用量。
 
 ## 1.4.170 — 2026-11-20 · 面板缺失语义修正、TOTP 两步验证与 CRAG 3.1.11
 

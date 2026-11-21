@@ -68,9 +68,13 @@ def parse_sse(frames):
             )
         except (UnicodeDecodeError, ValueError, RecursionError):
             raise NativeFailure("gemini_inference_invalid_output") from None
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or "error" in payload:
             raise NativeFailure("gemini_inference_invalid_output")
-        candidates = payload.get("candidates", [])
+        # The worker forwards raw SSE from both Gemini and Code Assist.
+        response = payload.get("response", payload)
+        if not isinstance(response, dict) or "error" in response:
+            raise NativeFailure("gemini_inference_invalid_output")
+        candidates = response.get("candidates", [])
         if not isinstance(candidates, list):
             raise NativeFailure("gemini_inference_invalid_output")
         for candidate in candidates:
@@ -91,7 +95,7 @@ def parse_sse(frames):
             finish = candidate.get("finishReason")
             if finish not in (None, "", "FINISH_REASON_UNSPECIFIED"):
                 saw_finish = finish in ("STOP", "MAX_TOKENS")
-        metadata = payload.get("usageMetadata")
+        metadata = response.get("usageMetadata")
         if isinstance(metadata, dict):
             input_tokens = _integer(metadata.get("promptTokenCount"))
             cached = min(
