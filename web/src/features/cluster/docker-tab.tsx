@@ -119,7 +119,9 @@ export function DockerTab({ node }: { node: ClusterApiNode }) {
     return (
       <div className='space-y-3 text-sm'>
         <p className='text-muted-foreground'>
-          远端 Docker 不可用：{node.health?.docker.error || '检测中'}
+          {node.health?.docker.ok === false
+            ? `远端 Docker 不可用${node.health.docker.error ? `：${node.health.docker.error}` : ''}`
+            : '正在检测远端 Docker'}
         </p>
         <Button
           onClick={() => install.mutate()}
