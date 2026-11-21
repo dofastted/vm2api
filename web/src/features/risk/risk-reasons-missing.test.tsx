@@ -22,7 +22,11 @@ vi.mock('@tanstack/react-query', async (importOriginal) => {
 function renderStatus() {
   return renderToStaticMarkup(
     <QueryClientProvider client={new QueryClient()}>
-      <RiskStatus />
+      <RiskStatus
+        onOpen={() => {}}
+        onOpenSource={() => {}}
+        onLocateRule={() => {}}
+      />
     </QueryClientProvider>
   )
 }
