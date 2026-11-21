@@ -976,7 +976,8 @@ export function PoolPane({
                 />
                 <SliderSetting
                   id='failover-same-hop'
-                  label='同 VM 单次重试最长占用'
+                  label='同 VM 重试的上一轮耗时上限'
+                  desc='仅限制按耗时判定的重试；设为 0 时不进行这类重试。'
                   value={numOf(
                     failoverDraft,
                     'same_account_retry_max_hop_ms',
@@ -985,7 +986,7 @@ export function PoolPane({
                   min={0}
                   max={30000}
                   step={500}
-                  format={(ms) => (ms ? fmtDuration(ms) : '不限')}
+                  format={(ms) => (ms ? fmtDuration(ms) : '0 ms')}
                   fallback={FAILOVER_DEFAULTS.same_account_retry_max_hop_ms}
                   presets={[0, 5000, 10000, 20000, 30000]}
                   onChange={(value) =>
