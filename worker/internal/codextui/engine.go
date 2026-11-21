@@ -99,7 +99,9 @@ func (e *Engine) RunTurn(ctx context.Context, env *envelope, emit func(string, a
 	}
 
 	spawnAt := time.Now()
-	args := []string{"--ask-for-approval", "never", "--sandbox", "read-only", "-m", body.modelOr("")}
+	// --no-daemon pins the TUI to an embedded app-server backend so the turn
+	// lives and dies with this process (a shared daemon would leak sessions).
+	args := []string{"--no-daemon", "--ask-for-approval", "never", "--sandbox", "read-only", "-m", body.modelOr("")}
 	if body.modelOr("") == "" {
 		args = args[:len(args)-2]
 	}

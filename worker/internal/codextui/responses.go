@@ -55,7 +55,7 @@ func (t *translate) feed(l rolloutLine, emit func(event string, payload any)) bo
 		t.onItem(l.Payload, emit)
 	case "event_msg":
 		return t.onEvent(l.Payload, emit)
-	case "token_usage":
+	case "token_usage", "token_usage_record":
 		t.onUsage(l.Payload)
 	}
 	return !t.done
@@ -129,7 +129,7 @@ func (t *translate) onEvent(raw json.RawMessage, emit func(string, any)) bool {
 		emit("response.completed", map[string]any{
 			"response": t.finalResponse("completed"),
 		})
-	case "error", "turn_aborted":
+	case "error", "stream_error", "turn_aborted":
 		t.done, t.failed = true, true
 		msg := ev.Error
 		if msg == "" {
@@ -144,8 +144,20 @@ func (t *translate) onEvent(raw json.RawMessage, emit func(string, any)) bool {
 }
 
 func (t *translate) onUsage(raw json.RawMessage) {
+	// Wire shape (history/src/rollout_payload.rs → protocol.rs TokenUsageRecord):
+	// {type:"token_usage_record", payload:{usage:{input_tokens,...},
+	// turn_token_usage, thread_token_usage}}. `usage` is the per-response usage
+	// the Responses API expects on response.completed.
 	var u struct {
 		Payload struct {
+			Usage struct {
+				InputTokens       int `json:"input_tokens"`
+				CachedInputTokens int `json:"cached_input_tokens"`
+				OutputTokens      int `json:"output_tokens"`
+				ReasoningTokens   int `json:"reasoning_output_tokens"`
+				TotalTokens       int `json:"total_tokens"`
+			} `json:"usage"`
+			// Legacy flat shape (older rollouts) kept for tolerance.
 			InputTokens       int `json:"input_tokens"`
 			CachedInputTokens int `json:"cached_input_tokens"`
 			OutputTokens      int `json:"output_tokens"`
@@ -156,12 +168,21 @@ func (t *translate) onUsage(raw json.RawMessage) {
 	if json.Unmarshal(raw, &u) != nil {
 		return
 	}
+	p := u.Payload
+	usage := p.Usage
+	if usage.TotalTokens == 0 && p.TotalTokens != 0 {
+		usage.InputTokens = p.InputTokens
+		usage.CachedInputTokens = p.CachedInputTokens
+		usage.OutputTokens = p.OutputTokens
+		usage.ReasoningTokens = p.ReasoningTokens
+		usage.TotalTokens = p.TotalTokens
+	}
 	t.lastUsage = map[string]any{
-		"input_tokens":          u.Payload.InputTokens,
-		"output_tokens":         u.Payload.OutputTokens,
-		"total_tokens":          u.Payload.TotalTokens,
-		"input_tokens_details":  map[string]any{"cached_tokens": u.Payload.CachedInputTokens},
-		"output_tokens_details": map[string]any{"reasoning_tokens": u.Payload.ReasoningTokens},
+		"input_tokens":          usage.InputTokens,
+		"output_tokens":         usage.OutputTokens,
+		"total_tokens":          usage.TotalTokens,
+		"input_tokens_details":  map[string]any{"cached_tokens": usage.CachedInputTokens},
+		"output_tokens_details": map[string]any{"reasoning_tokens": usage.ReasoningTokens},
 	}
 }
 

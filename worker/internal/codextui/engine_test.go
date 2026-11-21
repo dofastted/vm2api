@@ -24,7 +24,7 @@ F="$SESSIONS/rollout-fake.jsonl"
 printf '{"timestamp":"t","type":"session_meta","payload":{"cwd":"%s","id":"sess-fake","originator":"codex_cli_rs","cli_version":"0.1"}}\n' "$PWD" > "$F"
 sleep 0.4
 printf '{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"assistant","id":"m1","content":[{"type":"output_text","text":"pong"}]}}\n' >> "$F"
-printf '{"timestamp":"t","type":"token_usage","payload":{"input_tokens":5,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":7}}\n' >> "$F"
+printf '{"timestamp":"t","type":"token_usage_record","payload":{"usage":{"input_tokens":5,"cached_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":0,"total_tokens":7}}}\n' >> "$F"
 printf '{"timestamp":"t","type":"event_msg","payload":{"type":"task_complete"}}\n' >> "$F"
 sleep 0.5
 `
