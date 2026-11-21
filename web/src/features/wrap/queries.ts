@@ -30,6 +30,7 @@ export type KernelCatalog = {
   /** The CRAG payload this deployment pins, or null when nothing is pinned. */
   crag_pin?: { tag: string; label?: string } | null
   licenses: Record<string, CragLicenseStatus>
+  install_licenses?: Record<string, CragLicenseStatus>
   installations?: Record<string, KernelInstallation>
 }
 
@@ -38,6 +39,8 @@ export type KernelTarget = {
   kernel: KernelId
   expected_tag?: string
   payload_tag?: string
+  /** Explicit operator approval to migrate an existing host grant to this package. */
+  reissue?: true
 }
 
 export type KernelInstallItem = KernelTarget & {

@@ -335,7 +335,7 @@ it('pauses a bulk installation when the first slot result is unconfirmed', async
 })
 
 it.each(['license_required', 'license_payload_key_mismatch'])(
-  'does not gate installation or recommend reissue based on the cached %s hint',
+  'does not gate ordinary installation based on the cached %s hint',
   (code) => {
     state.licenses['vm-old'] = {
       status: 'valid',
@@ -356,6 +356,123 @@ it.each(['license_required', 'license_payload_key_mismatch'])(
     )
   }
 )
+
+describe('explicit CRAG grant migration', () => {
+  it('offers migration for the selected package and sends reissue only after explicit confirmation', async () => {
+    const vm = { runtime_type: 'docker', resolved_dataplane: 'wrap' } as const
+    // A partial old install can make the installed license unconfigured while
+    // the candidate reports that its payload key differs from the old grant.
+    state.licenses['vm-old'] = {
+      status: 'unconfigured',
+      valid: false,
+      vm_id: 'vm-old',
+      code: 'license_unconfigured',
+    }
+    state.installLicenses = {
+      'vm-old': {
+        status: 'invalid',
+        valid: false,
+        vm_id: 'vm-old',
+        code: 'license_payload_key_mismatch',
+      },
+    }
+    render(vm)
+    state.values[2] = { 'vm-old': 'crag' }
+    const html = render(vm)
+    expect(html).toContain('所选发行包需要迁移现有授权')
+    const migrate = state.buttons.find(
+      (entry) => entry['aria-label'] === '迁移 vm-old 授权并安装 CRAG'
+    )
+    expect(migrate?.disabled).toBe(false)
+    migrate?.onClick?.({} as never)
+    render(vm)
+    expect(state.confirm?.open).toBe(true)
+    expect(state.confirm?.confirmText).toBe('确认迁移并安装')
+    expect(state.confirm?.title).toContain('迁移 vm-old 的授权')
+    expect(installKernelTargets).not.toHaveBeenCalled()
+    state.confirm?.handleConfirm?.()
+    await vi.waitFor(() =>
+      expect(installKernelTargets).toHaveBeenCalledExactlyOnceWith([
+        {
+          id: 'vm-old',
+          kernel: 'crag',
+          payload_tag: 'payload-2026.11.16-crag-3.0.8',
+          reissue: true,
+        },
+      ])
+    )
+  })
+
+  it('offers a migration action after the server requires it, without silently retrying', async () => {
+    vi.mocked(installKernelTargets).mockImplementationOnce(async (targets) => ({
+      ok: false,
+      total: 1,
+      ok_count: 0,
+      failed_count: 1,
+      items: targets.map((target) => ({
+        ...target,
+        ok: false,
+        stopped: false,
+        code: 'crag_subscription_migration_required',
+        error: '此槽已有宿主订阅绑定，请完成授权迁移。',
+      })),
+    }))
+    const vm = {
+      runtime_type: 'docker',
+      resolved_dataplane: 'crag',
+      resolved_crag_kernel_version: 'v2',
+    } as const
+    await reinstallCrag(vm)
+    const html = render(vm)
+    expect(html).toContain('此槽已有宿主订阅绑定')
+    expect(html).toContain('迁移授权并安装')
+    expect(installKernelTargets).toHaveBeenCalledTimes(1)
+    expect(
+      vi.mocked(installKernelTargets).mock.calls[0][0][0]
+    ).not.toHaveProperty('reissue')
+  })
+
+  it('does not turn an unconfigured or missing license into an automatic migration', () => {
+    state.licenses['vm-old'] = {
+      status: 'unconfigured',
+      valid: false,
+      vm_id: 'vm-old',
+      code: 'license_unconfigured',
+    }
+    state.installLicenses = {
+      'vm-old': {
+        status: 'unlicensed',
+        valid: false,
+        vm_id: 'vm-old',
+        code: 'license_required',
+      },
+    }
+    const html = render({ runtime_type: 'docker', resolved_dataplane: 'crag' })
+    expect(html).not.toContain('迁移授权并安装')
+    expect(installKernelTargets).not.toHaveBeenCalled()
+  })
+
+  it('disables migration for viewers and never offers it for cli-node or macOS', () => {
+    state.installLicenses = {
+      'vm-old': {
+        status: 'invalid',
+        valid: false,
+        vm_id: 'vm-old',
+        code: 'license_payload_key_mismatch',
+      },
+    }
+    expect(render({ runtime_type: 'docker' })).not.toContain('迁移授权并安装')
+    expect(
+      render({ node_platform: 'darwin', resolved_dataplane: 'crag' })
+    ).not.toContain('迁移授权并安装')
+    state.role = 'user'
+    render({ runtime_type: 'docker', resolved_dataplane: 'crag' })
+    const migrate = state.buttons.find(
+      (entry) => entry['aria-label'] === '迁移 vm-old 授权并安装 CRAG'
+    )
+    expect(migrate?.disabled).toBe(true)
+  })
+})
 
 describe('KVM CRAG repair on the kernel page', () => {
   it('offers explicit CRAG reinstall when the current kernel is cli-node', () => {

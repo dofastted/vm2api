@@ -727,17 +727,20 @@ test('standalone recovery waits for the original verified host package before re
   const backup = path.join(root, 'original-package')
   fs.renameSync(packageDir, backup)
   seedEncryptedPackage(root, { revision: 'other revision, same issuer and payload key' })
-  async function assertRecoveryBlocked(kind) {
+  async function assertRecoveryBlocked(kind, code = 'crag_subscription_host_package_unready') {
     const rejected = await recover('recover', {})
     assert.equal(rejected.status, 409, kind)
-    assert.equal(rejected.error.code, 'crag_subscription_host_package_unready', kind)
+    assert.equal(rejected.error.code, code, kind)
     assert.equal(requests.length, 1, kind)
     assert.equal(fs.readFileSync(intent, 'utf8'), originalIntent, kind)
     assert.equal(fs.readFileSync(marker, 'utf8'), pending, kind)
     assert.equal(fs.existsSync(entitlement), false, kind)
   }
 
-  await assertRecoveryBlocked('changed package with the same authority and key')
+  await assertRecoveryBlocked(
+    'changed package with the same authority and key',
+    'crag_subscription_host_package_changed',
+  )
   fs.rmSync(packageDir, { recursive: true })
   await assertRecoveryBlocked('missing package')
   fs.renameSync(backup, packageDir)
@@ -759,6 +762,347 @@ test('standalone recovery waits for the original verified host package before re
   assert.equal(fs.existsSync(intent), false)
   assert.equal(fs.existsSync(marker), false)
   assert.equal(fs.readFileSync(entitlement, 'utf8'), issued.code)
+})
+
+test('legacy current-package recovery only repins an absent initial subscription', async (t) => {
+  const redemptionCode = voucher()
+  const requests = []
+  let issued
+  let failRedeem = true
+  let statusMode = 'missing'
+  const { root, privateDir, publicDir, connect } = standaloneHost(t, async (url, { body }) => {
+    const request = JSON.parse(body)
+    if (url.endsWith('/status')) {
+      if (issued) return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+      if (statusMode === 'offline') throw Error('status unavailable')
+      if (statusMode === 'active') {
+        const rights = issueHostEntitlement(root, request.host_id)
+        return Response.json({ ok: true, data: { entitlement: rights.code, ...rights.claims } })
+      }
+      return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+    }
+    requests.push(request)
+    if (failRedeem) throw Error('request did not reach Authority')
+    issued = issueHostEntitlement(root, request.host_id, { slot_limit: 1 })
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+  })
+  seedEncryptedPackage(root)
+  const submit = postSubscription(connect())
+  assert.equal((await submit('redeem', { redemption_code: redemptionCode })).status, 502)
+  const intentFile = path.join(privateDir, 'redeem.json')
+  const legacy = JSON.parse(fs.readFileSync(intentFile, 'utf8'))
+  delete legacy.enrollment
+  delete legacy.issuer_public_key_id
+  fs.writeFileSync(intentFile, JSON.stringify(legacy))
+  const original = fs.readFileSync(intentFile, 'utf8')
+  seedEncryptedPackage(root, { revision: 'new trusted package', payloadKey: crypto.randomBytes(32) })
+  assert.equal((await submit('recover', {})).error.code, 'crag_subscription_host_package_changed')
+  assert.equal(fs.readFileSync(intentFile, 'utf8'), original)
+  assert.equal((await submit('recover', { use_current_package: false })).status, 400)
+  assert.equal((await submit('recover', { use_current_package: true, extra: true })).status, 400)
+  statusMode = 'offline'
+  assert.equal(
+    (await submit('recover', { use_current_package: true })).error.code,
+    'crag_subscription_authority_unavailable',
+  )
+  assert.equal(fs.readFileSync(intentFile, 'utf8'), original)
+  statusMode = 'active'
+  assert.equal(
+    (await submit('recover', { use_current_package: true })).error.code,
+    'crag_subscription_recovery_unverified',
+  )
+  assert.equal(fs.readFileSync(intentFile, 'utf8'), original)
+  assert.equal(requests.length, 1, 'uncertain or unrelated rights never replay the voucher')
+  statusMode = 'missing'
+  failRedeem = false
+  const recovered = await submit('recover', { use_current_package: true })
+  assert.equal(recovered.status, 200)
+  assert.equal(recovered.data.state, 'active')
+  assert.equal(recovered.data.slot_limit, 1)
+  assert.equal(requests.length, 2)
+  assert.equal(requests[1].redemption_code, redemptionCode)
+  assert.equal(requests[1].host_id, requests[0].host_id)
+  assert.equal(fs.existsSync(intentFile), false)
+  assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
+  const digest = crypto.createHash('sha256').update(redemptionCode).digest('hex')
+  assert.equal(connect().isRedemptionApplied(requests[0].host_id, digest), true)
+})
+
+for (const boundary of ['lost committed response', 'rights before receipt', 'recovery reply interrupted']) {
+  test(`recorded enrollment recovers across a payload update after ${boundary}`, async (t) => {
+    const redemptionCode = voucher()
+    const requests = []
+    let issued
+    let originalIntent
+    const { root, privateDir, publicDir, connect } = standaloneHost(t, async (url, { body, headers }) => {
+      assert.ok(url.endsWith('/redeem'), 'a generic status response cannot prove which voucher committed')
+      const request = JSON.parse(body)
+      requests.push({ request, authorization: headers.authorization })
+      originalIntent ??= fs.readFileSync(path.join(privateDir, 'redeem.json'))
+      issued ??= issueHostEntitlement(root, request.host_id, { slot_limit: 1 })
+      if (
+        (requests.length === 1 && boundary !== 'rights before receipt') ||
+        (requests.length === 2 && boundary === 'recovery reply interrupted')
+      )
+        throw Error('committed response interrupted')
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    })
+    const packageDir = seedEncryptedPackage(root)
+    const writeDeployment = () => {
+      const { issuerId, payloadKeyId } = cragTargetIds(root)
+      fs.mkdirSync(path.join(root, 'deploy'), { recursive: true })
+      fs.writeFileSync(
+        path.join(root, 'deploy/payload.json'),
+        JSON.stringify({
+          crag_authorization: { issuer_public_key_id: issuerId, payload_key_id: payloadKeyId },
+        }),
+      )
+    }
+    writeDeployment()
+    const service = connect()
+    const hostId = service.purchaseDeviceId()
+    const digest = crypto.createHash('sha256').update(redemptionCode).digest('hex')
+    const intentFile = path.join(privateDir, 'redeem.json')
+    if (boundary === 'rights before receipt') {
+      await service.redeemDeviceOrder(hostId, redemptionCode)
+      fs.renameSync(path.join(privateDir, `redeemed-${digest}.json`), path.join(root, 'receipt-after-crash'))
+      fs.writeFileSync(intentFile, originalIntent, { mode: 0o600 })
+      fs.writeFileSync(path.join(publicDir, 'sync-pending'), 'pending\n', { mode: 0o644 })
+    } else {
+      await assert.rejects(service.redeemDeviceOrder(hostId, redemptionCode), {
+        code: 'crag_subscription_authority_unavailable',
+      })
+    }
+    const recorded = JSON.parse(originalIntent)
+    assert.deepEqual(recorded.enrollment, {
+      issuer_public_key_id: requests[0].request.issuer_public_key_id,
+      payload_key_id: requests[0].request.payload_key_id,
+    })
+    seedEncryptedPackage(root, { revision: 'new payload after lost response', payloadKey: crypto.randomBytes(32) })
+    writeDeployment()
+    assert.notEqual(cragTargetIds(root).payloadKeyId, recorded.enrollment.payload_key_id)
+    await assert.rejects(connect().recover(), { code: 'crag_subscription_host_package_changed' })
+    assert.deepEqual(fs.readFileSync(intentFile), originalIntent)
+    if (boundary === 'recovery reply interrupted') {
+      await assert.rejects(connect().recover({ useCurrentPackage: true }), {
+        code: 'crag_subscription_authority_unavailable',
+      })
+      const repinned = JSON.parse(fs.readFileSync(intentFile))
+      assert.deepEqual(repinned.enrollment, recorded.enrollment)
+      assert.equal(repinned.issuer_public_key_id, recorded.issuer_public_key_id)
+      assert.equal(
+        repinned.host_package_sha256,
+        crypto
+          .createHash('sha256')
+          .update(fs.readFileSync(path.join(packageDir, 'manifest.json')))
+          .digest('hex'),
+      )
+      await connect().recover()
+    } else {
+      await connect().recover({ useCurrentPackage: true })
+    }
+    assert.equal(requests.length, boundary === 'recovery reply interrupted' ? 3 : 2)
+    for (const replay of requests.slice(1))
+      assert.deepEqual(replay, requests[0], 'recovery preserves voucher, host, credential and enrollment')
+    assert.equal(connect().isRedemptionApplied(hostId, digest), true)
+    assert.equal(fs.existsSync(intentFile), false)
+    assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
+    assert.equal(fs.readFileSync(path.join(publicDir, 'entitlement.code'), 'utf8'), issued.code)
+  })
+}
+
+test('recorded enrollment rejects malformed selectors and a different current issuer before replay', async (t) => {
+  let calls = 0
+  const { root, privateDir, connect } = standaloneHost(t, async () => {
+    calls++
+    throw Error('response lost')
+  })
+  const packageDir = seedEncryptedPackage(root)
+  await assert.rejects(connect().redeem(voucher()), { code: 'crag_subscription_authority_unavailable' })
+  const intentFile = path.join(privateDir, 'redeem.json')
+  const intent = JSON.parse(fs.readFileSync(intentFile))
+  assert.deepEqual(intent.enrollment, {}, 'no deployment selectors is an explicit original request')
+  seedEncryptedPackage(root, { revision: 'new trusted payload' })
+  for (const invalid of [
+    { ...intent, enrollment: { payload_key_id: 'a'.repeat(64) } },
+    { ...intent, enrollment: { issuer_public_key_id: intent.issuer_public_key_id } },
+    { ...intent, enrollment: { extra: true } },
+    { ...intent, enrollment: { issuer_public_key_id: 'a'.repeat(64), payload_key_id: 'b'.repeat(64) } },
+    { ...intent, extra: true },
+  ]) {
+    const raw = JSON.stringify(invalid)
+    fs.writeFileSync(intentFile, raw)
+    await assert.rejects(connect().recover({ useCurrentPackage: true }), {
+      code: 'crag_subscription_recovery_unverified',
+    })
+    assert.equal(fs.readFileSync(intentFile, 'utf8'), raw)
+  }
+  fs.writeFileSync(intentFile, JSON.stringify(intent))
+  const foreign = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-foreign-recovery-'))
+  t.after(() => fs.rmSync(foreign, { recursive: true, force: true }))
+  const foreignPackage = seedEncryptedPackage(foreign)
+  fs.renameSync(packageDir, path.join(root, 'original-package'))
+  fs.cpSync(foreignPackage, packageDir, { recursive: true })
+  await assert.rejects(connect().recover({ useCurrentPackage: true }), {
+    code: 'crag_subscription_recovery_unverified',
+  })
+  assert.equal(calls, 1, 'neither malformed evidence nor another issuer can authorize a replay')
+  assert.deepEqual(JSON.parse(fs.readFileSync(intentFile)), intent)
+})
+
+test('recovery preserves malformed and foreign-host transaction evidence', async (t) => {
+  let calls = 0
+  const { root, privateDir, publicDir, connect } = standaloneHost(t, async () => {
+    calls++
+    throw Error('original response lost')
+  })
+  seedEncryptedPackage(root)
+  await assert.rejects(connect().redeem(voucher()), { code: 'crag_subscription_authority_unavailable' })
+  const intentFile = path.join(privateDir, 'redeem.json')
+  const markerFile = path.join(publicDir, 'sync-pending')
+  const original = JSON.parse(fs.readFileSync(intentFile))
+  const marker = fs.readFileSync(markerFile, 'utf8')
+  const without = (key) => Object.fromEntries(Object.entries(original).filter(([name]) => name !== key))
+  const malformed = [
+    'null',
+    '[]',
+    '"not an intent"',
+    '1',
+    '{broken',
+    JSON.stringify(without('host_id')),
+    JSON.stringify(without('redemption_code')),
+    JSON.stringify({ ...original, redemption_code: 'invalid' }),
+    JSON.stringify({ ...original, host_id: 12 }),
+    JSON.stringify({ ...original, host_id: 'invalid' }),
+    JSON.stringify({ host_package_sha256: original.host_package_sha256, redemption_code: original.redemption_code }),
+    JSON.stringify({ host_id: original.host_id }),
+    JSON.stringify({ host_id: original.host_id, redemption_code: original.redemption_code, extra: true }),
+  ]
+  for (const raw of malformed) {
+    fs.writeFileSync(intentFile, raw)
+    await assert.rejects(connect().recover({ useCurrentPackage: true }), {
+      code: 'crag_subscription_recovery_unverified',
+    })
+    assert.equal(fs.readFileSync(intentFile, 'utf8'), raw)
+    assert.equal(fs.readFileSync(markerFile, 'utf8'), marker)
+  }
+  const foreignHost = (original.host_id[0] === 'a' ? 'b' : 'a') + original.host_id.slice(1)
+  for (const intent of [
+    { ...original, host_id: foreignHost },
+    { host_id: foreignHost, redemption_code: original.redemption_code },
+  ]) {
+    const raw = JSON.stringify(intent)
+    fs.writeFileSync(intentFile, raw)
+    await assert.rejects(connect().recover({ useCurrentPackage: true }), {
+      code: 'crag_subscription_host_identity_changed',
+    })
+    assert.equal(fs.readFileSync(intentFile, 'utf8'), raw)
+    assert.equal(fs.readFileSync(markerFile, 'utf8'), marker)
+  }
+  assert.equal(calls, 1, 'invalid local evidence is never submitted to Authority')
+})
+
+test('a rejected same-voucher replay retains the unresolved original transaction', async (t) => {
+  let calls = 0
+  const { root, privateDir, publicDir, connect } = standaloneHost(t, async (url) => {
+    assert.ok(url.endsWith('/redeem'))
+    if (++calls === 1) throw Error('committed response lost')
+    return Response.json({ ok: false, error: { code: 'payload_key_unknown' } }, { status: 400 })
+  })
+  seedEncryptedPackage(root)
+  await assert.rejects(connect().redeem(voucher()), { code: 'crag_subscription_authority_unavailable' })
+  const intentFile = path.join(privateDir, 'redeem.json')
+  const original = JSON.parse(fs.readFileSync(intentFile))
+  seedEncryptedPackage(root, { revision: 'package after authority key rotation', payloadKey: crypto.randomBytes(32) })
+  await assert.rejects(connect().recover({ useCurrentPackage: true }), { code: 'payload_key_unknown' })
+  const unresolved = JSON.parse(fs.readFileSync(intentFile))
+  assert.equal(unresolved.redemption_code, original.redemption_code)
+  assert.deepEqual(unresolved.enrollment, original.enrollment)
+  assert.equal(unresolved.issuer_public_key_id, original.issuer_public_key_id)
+  assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), true)
+  assert.equal(fs.existsSync(path.join(publicDir, 'entitlement.code')), false)
+  assert.equal(calls, 2)
+})
+
+test('a saved redemption receipt recovers the order after a crash without redeeming twice', async (t) => {
+  const redemptionCode = voucher()
+  let calls = 0
+  let issued
+  const { root, privateDir, publicDir, connect } = standaloneHost(t, async (url, { body }) => {
+    if (url.endsWith('/redeem')) {
+      calls++
+      issued = issueHostEntitlement(root, JSON.parse(body).host_id)
+    }
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+  })
+  const packageDir = seedEncryptedPackage(root)
+  const service = connect()
+  const hostId = service.purchaseDeviceId()
+  const originalDigest = crypto
+    .createHash('sha256')
+    .update(fs.readFileSync(path.join(packageDir, 'manifest.json')))
+    .digest('hex')
+  const digest = crypto.createHash('sha256').update(redemptionCode).digest('hex')
+  assert.equal(service.isRedemptionApplied(hostId, digest), false)
+  await service.redeemDeviceOrder(hostId, redemptionCode)
+  const receiptFile = path.join(privateDir, `redeemed-${digest}.json`)
+  const receipt = fs.readFileSync(receiptFile, 'utf8')
+  assert.equal(receipt.includes(redemptionCode), false)
+  assert.equal(fs.statSync(receiptFile).mode & 0o777, 0o600)
+  // Recreate the crash boundary after receipt fsync and before intent removal.
+  fs.writeFileSync(
+    path.join(privateDir, 'redeem.json'),
+    JSON.stringify({
+      host_id: hostId,
+      redemption_code: redemptionCode,
+      host_package_sha256: originalDigest,
+    }),
+    { mode: 0o600 },
+  )
+  fs.writeFileSync(path.join(publicDir, 'sync-pending'), 'pending\n', { mode: 0o644 })
+  seedEncryptedPackage(root, { revision: 'package updated after successful redemption' })
+  await connect().recover()
+  assert.equal(calls, 1)
+  assert.equal(connect().isRedemptionApplied(hostId, digest), true)
+  await connect().redeemDeviceOrder(hostId, redemptionCode)
+  assert.equal(calls, 1, 'a repeated applied order uses its durable verified receipt')
+  assert.equal(fs.existsSync(path.join(privateDir, 'redeem.json')), false)
+  const tampered = { ...JSON.parse(receipt), voucher_sha256: '0'.repeat(64) }
+  fs.writeFileSync(receiptFile, JSON.stringify(tampered))
+  assert.throws(() => connect().isRedemptionApplied(hostId, digest), {
+    code: 'crag_subscription_invalid_redemption_receipt',
+  })
+  fs.writeFileSync(receiptFile, receipt)
+  const unsigned = { ...JSON.parse(receipt), entitlement: issued.code.slice(0, -3) + 'bad' }
+  fs.writeFileSync(receiptFile, JSON.stringify(unsigned))
+  assert.throws(() => connect().isRedemptionApplied(hostId, digest), {
+    code: 'crag_subscription_invalid_redemption_receipt',
+  })
+})
+
+test('a crash before the receipt is durable replays the original voucher and records proof', async (t) => {
+  const redemptionCode = voucher()
+  let issued
+  let calls = 0
+  let pending
+  const { root, privateDir, publicDir, connect } = standaloneHost(t, async (url, { body }) => {
+    if (url.endsWith('/redeem')) {
+      calls++
+      issued ??= issueHostEntitlement(root, JSON.parse(body).host_id)
+      pending = fs.readFileSync(path.join(privateDir, 'redeem.json'))
+    }
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+  })
+  seedEncryptedPackage(root)
+  await connect().redeem(redemptionCode)
+  const digest = crypto.createHash('sha256').update(redemptionCode).digest('hex')
+  // Simulate the preceding crash boundary: rights published, receipt not published.
+  fs.renameSync(path.join(privateDir, `redeemed-${digest}.json`), path.join(root, 'receipt-after-crash'))
+  fs.writeFileSync(path.join(privateDir, 'redeem.json'), pending, { mode: 0o600 })
+  fs.writeFileSync(path.join(publicDir, 'sync-pending'), 'pending\n', { mode: 0o644 })
+  await connect().recover()
+  assert.equal(calls, 2)
+  assert.equal(connect().isRedemptionApplied(issued.claims.host_id, digest), true)
 })
 
 test('the exact pending voucher can resume after a lost response, even when an intermediate attempt is denied', async (t) => {
@@ -946,7 +1290,7 @@ test('a package changed during redemption cannot publish rights and recovery kee
   assert.equal(JSON.parse(intent).host_package_sha256, originalDigest)
   assert.equal(JSON.parse(intent).redemption_code, replacement)
   assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), true)
-  await assert.rejects(connect().recover(), { code: 'crag_subscription_host_package_unready' })
+  await assert.rejects(connect().recover(), { code: 'crag_subscription_host_package_changed' })
   assert.equal(requests.length, 2)
   assert.equal(fs.readFileSync(intentFile, 'utf8'), intent)
   fs.rmSync(packageDir, { recursive: true })
@@ -976,6 +1320,8 @@ test('legacy unpinned initial intents still require a trusted package without in
   const intentFile = path.join(privateDir, 'redeem.json')
   const intent = JSON.parse(fs.readFileSync(intentFile, 'utf8'))
   delete intent.host_package_sha256
+  delete intent.enrollment
+  delete intent.issuer_public_key_id
   fs.writeFileSync(intentFile, JSON.stringify(intent))
   fs.renameSync(packageDir, path.join(root, 'original-package'))
   await assert.rejects(connect().recover(), { code: 'crag_subscription_host_package_unready' })
@@ -1515,6 +1861,72 @@ test('an active host subscription can authorize a new download when the old devi
   assert.equal(next.ok, true)
   assert.equal(next.license.scope, 'host')
   assert.equal(next.license.seat, 1)
+})
+
+test('explicit host-seat migration repairs a partial installed tree using the trusted candidate', async (t) => {
+  const payload = crypto.randomBytes(32)
+  let rights
+  let binds = 0
+  const { root, connect } = standaloneHost(t, async (url, { body }) => {
+    const request = JSON.parse(body)
+    if (url.endsWith('/status')) return Response.json({ ok: true, data: rights })
+    const { claims } = issueHostEntitlement(root, request.host_id, { slot_limit: 1, revision: binds + 1 })
+    let slotPermit
+    if (url.endsWith('/bind')) {
+      binds++
+      assert.equal(request.reissue, binds > 1 ? true : undefined)
+      slotPermit = issueSlotPermit(
+        root,
+        request.machine_code,
+        request.host_id,
+        { seat: 1 },
+        binds > 1 ? { payload, keyId: request.payload_key_id } : {},
+      ).code
+    }
+    const roster = slotPermit
+      ? [{ seat: 1, permit_sha256: crypto.createHash('sha256').update(slotPermit).digest('hex') }]
+      : []
+    rights = {
+      ...claims,
+      revision: binds + 1,
+      used_slots: roster.length,
+      available_slots: 1 - roster.length,
+      entitlement: signSubscriptionBytes(
+        root,
+        'CRAGH2',
+        JSON.stringify({ ...claims, revision: binds + 1, version: 2, roster }),
+      ),
+    }
+    return Response.json({ ok: true, data: { ...rights, ...(slotPermit && { seat: 1, slot_permit: slotPermit }) } })
+  })
+  seedEncryptedPackage(root)
+  const vm = { id: 'vm-partial', dataplane: 'wrap', runtime_type: 'docker' }
+  const directory = path.join(root, 'vms', vm.id)
+  fs.mkdirSync(directory, { recursive: true })
+  fs.writeFileSync(path.join(directory, 'machine-id'), crypto.randomBytes(16).toString('hex'))
+  const service = connect({ listTargets: () => [vm], assertReady: () => true })
+  await service.redeem(voucher())
+  await service.bind(vm)
+  fs.mkdirSync(path.join(directory, 'cli-home/.kin/crag-v2/claude-code-2.1.321'), { recursive: true })
+  seedEncryptedPackage(root, { payloadKey: payload })
+  assert.equal(
+    checkCragLicense(root, { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' }).code,
+    'license_unconfigured',
+  )
+  await assert.rejects(service.authorizeInstall(vm), { code: 'crag_subscription_migration_required' })
+  assert.equal(binds, 1)
+  await service.authorizeInstall(vm, { allowLegacyReissue: true })
+  assert.equal(binds, 2)
+  const next = checkCragLicense(
+    root,
+    { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' },
+    {},
+    { preferInstalled: false },
+  )
+  assert.equal(next.ok, true)
+  assert.equal(next.license.scope, 'host')
+  assert.equal(next.license.seat, 1)
+  assert.equal((await service.status()).used_slots, 1)
 })
 
 for (const runtime of ['docker', 'kvm']) {
