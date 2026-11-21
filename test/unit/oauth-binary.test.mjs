@@ -72,6 +72,9 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
   const sessionKey = 'sk-ant-sid-unit-cookie'
   const requests = []
   let authorizeMode = 'success'
+  // The token response echoes the scope the authorize request named, so a
+  // narrowed mint is observable end-to-end instead of always granting FULL.
+  let grantedScope = null
   const upstream = https.createServer({ key: fs.readFileSync(key), cert: fs.readFileSync(cert) }, async (req, res) => {
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
@@ -93,11 +96,13 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
         res.end(JSON.stringify({ error: 'invalid_grant' }))
         return
       }
+      const scope = grantedScope || FULL_OAUTH_SCOPE
+      grantedScope = null
       const token = JSON.stringify({
         access_token: accessToken,
         refresh_token: refreshToken,
         expires_in: 28800,
-        scope: FULL_OAUTH_SCOPE,
+        scope,
       })
       res.write(token.slice(0, 20))
       res.end(token.slice(20))
@@ -180,6 +185,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
         )
         return
       }
+      grantedScope = payload.scope || null
       expectedExchange = {
         code: 'cookie-auth-code',
         challenge: payload.code_challenge,
@@ -376,6 +382,31 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
     })
   }
   assert.equal(tokenRequests, 3)
+  // A released helper advertises what it implements; a PR that changes policy
+  // must not turn CI red before the binary carrying it exists. Probed straight
+  // from the binary: runGuestOAuthAuthService only returns credential payloads.
+  const capabilities = await new Promise((resolve) => {
+    const child = spawn(binary, [], { env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 })
+    let out = ''
+    child.stdout.on('data', (chunk) => {
+      out += chunk.toString('utf8')
+    })
+    child.on('error', () => resolve([]))
+    child.on('close', () => {
+      try {
+        const line = out
+          .split(/\r?\n/)
+          .map((value) => value.trim())
+          .filter(Boolean)
+          .at(-1)
+        resolve(JSON.parse(line || '{}')?.credential?.capabilities || [])
+      } catch {
+        resolve([])
+      }
+    })
+    child.stdin.end('{"operation":"capabilities"}\n')
+  })
+  const narrowsSetup = capabilities.includes('setup-token-inference')
   for (const runtimeMode of ['oauth', 'setup-token']) {
     await t.test(`session cookie: ${runtimeMode}`, async () => {
       const requestStart = requests.length
@@ -387,7 +418,8 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       })
       assert.equal(credential.access_token, accessToken)
       assert.equal(credential.refresh_token, refreshToken)
-      assert.equal(credential.scope, FULL_OAUTH_SCOPE)
+      const minted = narrowsSetup && runtimeMode === 'setup-token'
+      assert.equal(credential.scope, minted ? INFERENCE_ONLY_SCOPE : FULL_OAUTH_SCOPE)
       assert.equal(credential.type, runtimeMode)
       assert.equal(credential.mode, runtimeMode)
       assert.equal(credential.email, 'exchange@example.test')
@@ -425,7 +457,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       )
       assert.equal(token.headers['user-agent'], 'axios/1.15.2')
       assert.equal(token.headers['sec-ch-ua'], undefined)
-      assert.equal(Object.hasOwn(token.payload, 'expires_in'), false)
+      assert.equal(token.payload.expires_in, minted ? SETUP_TOKEN_TTL_SECONDS : undefined)
       assert.equal(profile.headers['user-agent'], `claude-code/${OFFICIAL_CLI_VERSION}`)
       assert.match(evalBefore.payload.attributes.sdkCachePartition, /^served-to-bearer:/)
       assert.equal(roles.headers['content-type'], undefined)
@@ -439,7 +471,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       assert.equal(authorize.payload.response_type, 'code')
       assert.equal(authorize.payload.client_id, CLIENT_ID)
       assert.equal(authorize.payload.redirect_uri, REDIRECT_URI)
-      assert.equal(authorize.payload.scope, FULL_OAUTH_SCOPE)
+      assert.equal(authorize.payload.scope, minted ? INFERENCE_ONLY_SCOPE : FULL_OAUTH_SCOPE)
       assert.equal(authorize.payload.code_challenge_method, 'S256')
       assert.ok(authorize.payload.state)
       assert.equal(token.payload.state, authorize.payload.state)
