@@ -3689,6 +3689,8 @@ test('shared scheduler reserves host-managed Gemini accounts under the same conc
   const balanced = pool.reserveExternalCandidates(candidates)
   assert.equal(balanced.selected.accountId, second.selected.accountId)
   balanced.reservation.release()
+})
+
 test('fresh_account_isolation_ms: a pinned conversation never spills onto a freshly onboarded account', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
