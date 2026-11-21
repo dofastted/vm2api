@@ -279,6 +279,10 @@ export const MAX_LONG_BRIDGE_SESSIONS = MAX_BRIDGE_SESSIONS - 1
 export const MAX_BRIDGE_WAITERS = 6
 export const BRIDGE_WAIT_MS = 10_000
 const BRIDGE_WAIT_CODES = new Set(['bridge_busy', 'bridge_wait_timeout', 'bridge_wait_aborted', 'bridge_link_closed'])
+// Keyed by the ssh2 Client, and `closed` never goes back to false. That holds only because
+// SshLink._open builds a new Client for every connection and never reuses one after a drop, so
+// bridgeSlots, bridgeTools and unixTransport all start fresh with it. Reusing a Client across
+// reconnects would leave its bridges refused for good: reset this state there first.
 const bridgeSlots = new WeakMap()
 
 function bridgeState(client) {
