@@ -1,5 +1,4 @@
 import { readFileSync } from 'node:fs'
-import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 
 describe('wrap template wording', () => {
@@ -12,10 +11,5 @@ describe('wrap template wording', () => {
     expect(source).toContain("aria-describedby='wrap-template-help'")
     expect(source).toContain('用此槽的 Wrap CLI 文件替换现有模板。')
     expect(source).not.toContain('晋升母本')
-    expect(
-      renderToStaticMarkup(
-        <p id='wrap-template-help'>用此槽的 Wrap CLI 文件替换现有模板。</p>
-      )
-    ).toContain('替换现有模板')
   })
 })
