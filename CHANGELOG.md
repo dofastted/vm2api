@@ -3,6 +3,7 @@
 ## Unreleased
 
 - codex TUI 专项（devin/codex-tui 分支，迭代 1）：新增 `worker/internal/codextui` 与 `cmd/codex-tui-helper`——槽内 helper 以 200×50 PTY 驱动真实 `codex` TUI，bracketed paste 注入、`session_meta.cwd` 关联 rollout JSONL 并翻译为上游 `response.*` SSE，socket 契约不变。`codexKernelBinPath()` 新增 `CODEX_TUI_BIN` 与同级 `codex-tui-helper` 优先查找；详见 `docs/codex-tui/`。
+- codex TUI 专项（迭代 2/3）：TUI 进程池（常驻 worker + `/new` 会话隔离 + `codex resume` 亲和/兜底）、`GET /internal/v1/codex/usage`、`proxy_url`→spawn 注入 `HTTPS_PROXY/ALL_PROXY` 固定出口、路径归一化为绝对路径、非 overload 错误透传 `response.failed`。**真机冒烟通过**：codex 0.171.0 + ChatGPT OAuth + socks5h 出口端到端 `response.completed`。
 - 标准 CRAG 载荷升级至 `3.1.12`：原生 TUI 不再向 Datadog 发送日志镜像和错误批次，Anthropic 第一方遥测仍按原字段白名单过滤。授权身份、官方 Claude Code `2.1.321` 和其他组件载荷不变（#1387）。
 
 ## 1.4.170 — 2026-11-20 · 面板缺失语义修正、TOTP 两步验证与 CRAG 3.1.11
