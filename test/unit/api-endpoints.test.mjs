@@ -75,6 +75,49 @@ test('endpoint risk review defaults off and preserves explicit toggles across re
   }
 })
 
+test('endpoint body policy defaults to persona and survives reloads (#1321)', () => {
+  const dataDir = tmpDir()
+  let store = new ApiEndpointStore({ dataDir })
+  try {
+    const rec = store.create({ kind: 'claude' })
+    assert.equal(rec.body_policy, 'persona')
+    assert.equal(store.listRaw()[0].body_policy, 'persona')
+    assert.equal(store.update(rec.id, { body_policy: 'caller' }).body_policy, 'caller')
+    store.db.close()
+    store = new ApiEndpointStore({ dataDir })
+    assert.equal(store.list()[0].body_policy, 'caller')
+    // An unrelated patch must not reset the policy.
+    assert.equal(store.update(rec.id, { name: 'renamed' }).body_policy, 'caller')
+    assert.equal(store.update(rec.id, { body_policy: 'persona' }).body_policy, 'persona')
+    const opted = store.create({ kind: 'claude', body_policy: 'caller' })
+    assert.equal(opted.body_policy, 'caller')
+    store.db.close()
+    store = new ApiEndpointStore({ dataDir })
+    assert.equal(store.getRaw(rec.id).body_policy, 'persona')
+    assert.equal(store.getRaw(opted.id).body_policy, 'caller')
+  } finally {
+    store.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('endpoint body policy rejects unknown values without changing the stored setting (#1321)', () => {
+  const dataDir = tmpDir()
+  const store = new ApiEndpointStore({ dataDir })
+  try {
+    const rec = store.create({ kind: 'claude', body_policy: 'caller' })
+    assert.throws(() => store.update(rec.id, { body_policy: 'nope' }), { code: 'invalid_body_policy' })
+    assert.throws(() => store.update(rec.id, { body_policy: true }), { code: 'invalid_body_policy' })
+    assert.equal(store.getRaw(rec.id).body_policy, 'caller')
+    assert.throws(() => store.create({ kind: 'claude', body_policy: 'persona_full' }), {
+      code: 'invalid_body_policy',
+    })
+  } finally {
+    store.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
 test('endpoint risk review rejects nonboolean values without changing the stored setting', () => {
   const dataDir = tmpDir()
   const store = new ApiEndpointStore({ dataDir })

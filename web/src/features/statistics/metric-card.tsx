@@ -4,6 +4,37 @@ import { cn } from '@/lib/utils'
 
 type Accent = 'primary' | 'emerald' | 'blue' | 'amber' | 'purple' | 'rose'
 
+function MetricComparisonBadge({
+  value,
+  label,
+  isPercentage = true,
+  invertSentiment = false,
+}: MetricComparison & { invertSentiment?: boolean }) {
+  const Icon = value > 0 ? ArrowUp : value < 0 ? ArrowDown : ArrowRight
+  const favorable = invertSentiment ? value < 0 : value > 0
+  const unfavorable = invertSentiment ? value > 0 : value < 0
+  return (
+    <div className='flex items-center gap-1.5'>
+      <div
+        className={cn(
+          'flex items-center gap-0.5 text-xs font-medium',
+          favorable && 'text-emerald-500 dark:text-emerald-400',
+          unfavorable && 'text-rose-500 dark:text-rose-400',
+          value === 0 && 'text-muted-foreground'
+        )}
+      >
+        <Icon className='h-3 w-3' />
+        <span>
+          {value > 0 ? '+' : value < 0 ? '−' : ''}
+          {Math.abs(value)}
+          {isPercentage && '%'}
+        </span>
+      </div>
+      <span className='text-[10px] text-muted-foreground'>{label}</span>
+    </div>
+  )
+}
+
 const ACCENTS: Record<Accent, { glow: string; iconBg: string; text: string }> =
   {
     primary: {
@@ -44,34 +75,6 @@ export type MetricComparison = {
   isPercentage?: boolean
 }
 
-function ComparisonBadge({
-  value,
-  label,
-  isPercentage = true,
-}: MetricComparison) {
-  const Icon = value > 0 ? ArrowUp : value < 0 ? ArrowDown : ArrowRight
-  return (
-    <div className='flex items-center gap-1.5'>
-      <div
-        className={cn(
-          'flex items-center gap-0.5 text-xs font-medium',
-          value > 0 && 'text-emerald-500 dark:text-emerald-400',
-          value < 0 && 'text-rose-500 dark:text-rose-400',
-          value === 0 && 'text-muted-foreground'
-        )}
-      >
-        <Icon className='h-3 w-3' />
-        <span>
-          {value > 0 ? '+' : ''}
-          {value}
-          {isPercentage && '%'}
-        </span>
-      </div>
-      <span className='text-[10px] text-muted-foreground'>{label}</span>
-    </div>
-  )
-}
-
 const ANIMATION_MS = 400
 
 /** 数值变化时按 ease-out-cubic 在 400ms 内滚动到新值（hub BentoMetricCard）。 */
@@ -105,24 +108,45 @@ function useAnimatedNumber(value: number) {
   return { display, animating }
 }
 
+function AnimatedMetric({
+  value,
+  formatter,
+}: {
+  value: number
+  formatter: (value: number) => string
+}) {
+  const { display, animating } = useAnimatedNumber(value)
+  return (
+    <span
+      className={cn(
+        'transition-opacity duration-200',
+        animating && 'opacity-80'
+      )}
+    >
+      {formatter(display)}
+    </span>
+  )
+}
+
 export function BentoMetricCard({
   title,
   value,
   formatter,
   icon: Icon,
   comparisons,
+  invertSentiment = false,
   accentColor = 'primary',
   className,
 }: {
   title: string
-  value: number
+  value: number | null
   formatter: (value: number) => string
   icon: LucideIcon
   comparisons?: MetricComparison[]
+  invertSentiment?: boolean
   accentColor?: Accent
   className?: string
 }) {
-  const { display, animating } = useAnimatedNumber(value)
   const colors = ACCENTS[accentColor]
 
   return (
@@ -169,14 +193,12 @@ export function BentoMetricCard({
         </div>
 
         <div className='mt-3'>
-          <h3
-            className={cn(
-              'text-2xl font-bold tracking-tight text-foreground tabular-nums md:text-3xl',
-              'transition-opacity duration-200',
-              animating && 'opacity-80'
+          <h3 className='text-2xl font-bold tracking-tight text-foreground tabular-nums md:text-3xl'>
+            {value == null ? (
+              '—'
+            ) : (
+              <AnimatedMetric value={value} formatter={formatter} />
             )}
-          >
-            {formatter(display)}
           </h3>
         </div>
       </div>
@@ -184,7 +206,11 @@ export function BentoMetricCard({
       {comparisons && comparisons.length > 0 ? (
         <div className='relative z-10 mt-auto flex flex-wrap gap-x-4 gap-y-1 pt-3'>
           {comparisons.map((comparison) => (
-            <ComparisonBadge key={comparison.label} {...comparison} />
+            <MetricComparisonBadge
+              key={comparison.label}
+              {...comparison}
+              invertSentiment={invertSentiment}
+            />
           ))}
         </div>
       ) : null}

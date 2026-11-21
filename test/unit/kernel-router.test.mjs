@@ -351,7 +351,12 @@ test('explicit CRAG checks the host quota before license and readiness', async (
     routing,
     ensureRust: () => assert.fail('quota denial must precede readiness'),
     admitCragInference: (input) => {
-      assert.deepEqual(input, { vm, routing })
+      const { slotWaitDeadlineMs, ...rest } = input
+      assert.deepEqual(rest, { vm, routing })
+      // Admission also carries the hop's wait budget so a busy subscription
+      // operation can be waited out instead of denying the slot (#1307). The
+      // deadline is read off the clock, so pin the contract, not the instant.
+      assert.equal(Number.isFinite(slotWaitDeadlineMs), true)
       return hostQuotaDenial
     },
   })

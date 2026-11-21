@@ -55,7 +55,12 @@ function LogsDateRangePicker({
 
   return (
     <div className='flex flex-wrap items-center gap-2'>
-      <div className='flex items-center gap-1'>
+      <div
+        className='flex items-center gap-1'
+        role='group'
+        aria-label='按浏览器时区的自然日'
+        title='按浏览器时区的自然日'
+      >
         {QUICK_PERIODS.map((period) => (
           <Button
             key={period}
@@ -71,6 +76,9 @@ function LogsDateRangePicker({
             }
           >
             {PERIOD_LABELS[period]}
+            {period === 'last7days' || period === 'last30days'
+              ? '（含今天）'
+              : ''}
           </Button>
         ))}
       </div>

@@ -11,6 +11,19 @@ function runtimeFor(file) {
   return createRoutingRuntime({ routingConfigPath: file })
 }
 
+test('routing persistence rejects invalid bot URLs before applying other changes', async () => {
+  const routingConfig = { sticky: { enabled: true } }
+  const runtime = createRoutingRuntime({ routingConfig })
+  await assert.rejects(
+    runtime.persistRoutingPatch({
+      sticky: { enabled: false },
+      notify: { feishu: { webhook: 'https://example.test/webhook' } },
+    }),
+    { code: 'invalid_feishu_webhook' },
+  )
+  assert.deepEqual(routingConfig, { sticky: { enabled: true } })
+})
+
 test('successful model access clears its denial without promoting a Pro account to Max', async () => {
   const { openDatabase, closeDatabase } = await import('../../src/lib/db/database.mjs')
   const { AccountQuota } = await import('../../src/lib/pool/account-quota.mjs')

@@ -105,6 +105,67 @@ const unavailableDevice = () =>
 const unavailableStorage = () =>
   failure(503, 'shop_private_storage_unavailable', 'CRAG shop private storage is unavailable')
 
+// Only public, actionable subscription failures may cross the anonymous device
+// checkout boundary. Never expose the vendor response, voucher, or local paths.
+const deviceApplyErrors = new Map([
+  [
+    'crag_subscription_invalid_redemption_receipt',
+    [409, 'The local redemption confirmation could not be verified. Ask the administrator to reconcile this order.'],
+  ],
+  [
+    'crag_subscription_host_package_changed',
+    [409, 'The CRAG package changed during redemption. Ask the administrator to recover the original redemption.'],
+  ],
+  [
+    'crag_subscription_recovery_unverified',
+    [409, 'The original redemption result is not confirmed. Ask the administrator to reconcile it.'],
+  ],
+  [
+    'crag_subscription_sync_pending',
+    [409, 'A host redemption is pending. Continue the original redemption from host subscriptions.'],
+  ],
+  [
+    'crag_subscription_busy',
+    [409, 'Another host subscription operation is in progress. Check this order again shortly.'],
+  ],
+  [
+    'crag_subscription_authority_unavailable',
+    [503, 'The authorization service did not confirm the result. Check this order before retrying.'],
+  ],
+  [
+    'auth_forbidden',
+    [502, 'The authorization service rejected this host credential. Ask the administrator to check the request ID.'],
+  ],
+  [
+    'host_redeem_conflict',
+    [409, 'This voucher does not match the host subscription. Ask the administrator to check this order.'],
+  ],
+  ['redeem_unavailable', [409, 'The original voucher could not be redeemed. Check this order with the supplier.']],
+  [
+    'payload_key_unknown',
+    [
+      409,
+      'The authorization service no longer offers the CRAG package key this redemption recorded. Ask the administrator to reconcile this order.',
+    ],
+  ],
+  [
+    'issuer_mismatch',
+    [
+      409,
+      'The CRAG issuer this redemption recorded does not match the authorization service. Ask the administrator to reconcile this order.',
+    ],
+  ],
+])
+const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
+
+function deviceApplyFailure(error) {
+  const publicError = deviceApplyErrors.get(error?.code)
+  if (!publicError) return null
+  const result = failure(publicError[0], error.code, publicError[1])
+  if (authorityRequestId.test(error.authorityRequestId ?? '')) result.authorityRequestId = error.authorityRequestId
+  return result
+}
+
 function hostCheckoutError(error) {
   switch (error?.code) {
     case 'crag_subscription_host_identity_unavailable':
@@ -398,6 +459,33 @@ export function createCragShopHandler({
     }
   }
 
+  function reconcileDeviceOrder(db, row, hostId, { tolerant = false } = {}) {
+    if (
+      !row.owner.startsWith('device:') ||
+      row.status !== 'fulfilled' ||
+      row.activation_phase === 'active' ||
+      !row.redemption_sha256 ||
+      isClosed(row)
+    )
+      return row
+    try {
+      if (!subscription.isRedemptionApplied(hostId, row.redemption_sha256)) return row
+    } catch (error) {
+      // One order's unverifiable receipt must not hide every other order. A listing
+      // keeps the stored state; the order's own routes still report the exact reason.
+      if (tolerant) return row
+      throw hostCheckoutError(error) ?? deviceApplyFailure(error) ?? error
+    }
+    durable(db, () =>
+      db
+        .prepare(`UPDATE crag_shop_orders SET activation_phase = 'active'
+      WHERE owner = ? AND order_id = ? AND redemption_sha256 = ? AND status = 'fulfilled'
+        AND closed_at IS NULL`)
+        .run(row.owner, row.order_id, row.redemption_sha256),
+    )
+    return findOrder(db, row.owner, row.order_id)
+  }
+
   function requireAdmin(req) {
     if (!buyerOwner(req) || !isCurrentAdmin(req))
       throw failure(403, 'shop_admin_required', 'Sign in as a panel administrator to renew the host subscription')
@@ -655,7 +743,12 @@ export function createCragShopHandler({
                                  ORDER BY reserved_at DESC, order_id DESC LIMIT ? OFFSET ?`)
           .all(owner, PAGE_SIZE + 1, Number(offset))
         const next_offset = rows.length > PAGE_SIZE ? Number(offset) + PAGE_SIZE : null
-        return ok({ orders: rows.slice(0, PAGE_SIZE).map(view), next_offset })
+        return ok({
+          orders: rows
+            .slice(0, PAGE_SIZE)
+            .map((row) => view(device ? reconcileDeviceOrder(db, row, hostId, { tolerant: true }) : row)),
+          next_offset,
+        })
       }
       if (route === 'create') {
         const input = createInput(await readInput(req, readRawBody, false))
@@ -710,8 +803,9 @@ export function createCragShopHandler({
       }
       const orderId = ORDER_PATH.exec(url.pathname)?.[1]
       if (!orderId || !isOrderId(orderId)) throw missingOrder()
-      const row = findOrder(db, owner, orderId)
+      let row = findOrder(db, owner, orderId)
       if (!row) throw missingOrder()
+      if (device) row = reconcileDeviceOrder(db, row, hostId)
       if (['claim', 'resume', 'cancel', 'apply', 'apply-renewal', 'retry-activation'].includes(route)) {
         const input = await readInput(req, readRawBody, true)
         if (Object.keys(input).length !== 0) throw badBody()
@@ -764,6 +858,25 @@ export function createCragShopHandler({
         if (current.status !== 'fulfilled')
           throw failure(409, 'shop_claim_not_ready', 'The CRAG shop order has not been fulfilled')
         const { redemption_code } = await supplier.claim(row, receipt)
+        const digest = createHash('sha256').update(redemption_code).digest('hex')
+        if (row.redemption_sha256 && row.redemption_sha256 !== digest)
+          throw failure(
+            409,
+            'shop_redemption_changed',
+            'The supplier returned a different voucher for this order. Ask the administrator to reconcile it.',
+          )
+        const associated = durable(db, () =>
+          db
+            .prepare(`UPDATE crag_shop_orders SET redemption_sha256 = ?
+          WHERE owner = ? AND order_id = ? AND (redemption_sha256 IS NULL OR redemption_sha256 = ?)`)
+            .run(digest, owner, row.order_id, digest),
+        )
+        if (associated.changes !== 1)
+          throw failure(
+            409,
+            'shop_redemption_changed',
+            'The voucher association changed while applying this order. Check the original order before retrying.',
+          )
         try {
           await subscription.redeemDeviceOrder(hostId, redemption_code)
         } catch (error) {
@@ -775,12 +888,16 @@ export function createCragShopHandler({
             )
           throw (
             hostCheckoutError(error) ??
+            deviceApplyFailure(error) ??
             failure(409, 'shop_device_apply_failed', 'Could not apply this order to the host; retry the same order')
           )
         }
-        db.prepare("UPDATE crag_shop_orders SET activation_phase = 'active' WHERE owner = ? AND order_id = ?").run(
-          owner,
-          row.order_id,
+        durable(db, () =>
+          db
+            .prepare(
+              "UPDATE crag_shop_orders SET activation_phase = 'active' WHERE owner = ? AND order_id = ? AND redemption_sha256 = ?",
+            )
+            .run(owner, row.order_id, digest),
         )
         return ok(view(findOrder(db, owner, row.order_id)))
       }
@@ -806,6 +923,7 @@ export function createCragShopHandler({
         requireAdmin(req)
         if (row.sku !== 'renewal') throw failure(409, 'shop_not_renewal', 'Order is not a host subscription renewal')
       }
+      if (device && route === 'status' && row.activation_phase === 'active') return ok(view(row))
       // A queued order advances in the background. A paused unpaid order still supports manual refresh.
       if (
         route === 'status' &&
@@ -856,7 +974,14 @@ export function createCragShopHandler({
     } catch (err) {
       const error =
         err instanceof ShopError ? err : failure(503, 'shop_unavailable', 'CRAG shop unavailable; try again later')
-      return json(res, error.status, { ok: false, error: { code: error.code, message: error.message } })
+      return json(res, error.status, {
+        ok: false,
+        error: {
+          code: error.code,
+          message: error.message,
+          ...(error.authorityRequestId && { details: { authority_request_id: error.authorityRequestId } }),
+        },
+      })
     }
   }
 

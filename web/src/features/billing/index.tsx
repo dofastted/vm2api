@@ -52,6 +52,7 @@ export function BillingPage() {
   return (
     <PageHeader
       title={VIEW_TITLES.billing}
+      description='当前日志保留窗口内的请求、成功、失败和费用。保留时间在设置的日志保留页调整。'
       extra={
         <div className='flex flex-wrap gap-2'>
           <CragShopLink />
@@ -105,28 +106,42 @@ export function BillingPage() {
         error={q.error}
         skeleton={<TableSkeleton rows={8} columns={6} />}
       >
-        <div className='mb-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4'>
-          <StatCard label='请求' value={fmtNum(totals.requests || 0)} />
-          <StatCard label='成功' value={fmtNum(totals.ok || 0)} />
-          <StatCard label='失败' value={fmtNum(totals.fail || 0)} />
-          <StatCard label='费用' value={fmtUsd(totals.cost_usd || 0)} />
-        </div>
-        {groupBy === 'vm' ? (
-          <div className='mb-4 grid gap-3 sm:grid-cols-2'>
-            <StatCard
-              label='Claude 费用'
-              value={fmtUsd(split.claude.cost_usd)}
-              hint={`${fmtNum(split.claude.requests)} 请求`}
-            />
-            <StatCard
-              label='GPT 费用'
-              value={fmtUsd(split.gpt.cost_usd)}
-              hint={`${fmtNum(split.gpt.requests)} 请求`}
-            />
+        <section aria-label='当前筛选汇总'>
+          <h2 className='mb-2 text-sm font-medium'>当前筛选汇总</h2>
+          <div className='mb-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4'>
+            <StatCard label='请求' value={fmtNum(totals.requests || 0)} />
+            <StatCard label='成功' value={fmtNum(totals.ok || 0)} />
+            <StatCard label='失败' value={fmtNum(totals.fail || 0)} />
+            <StatCard label='费用' value={fmtUsd(totals.cost_usd || 0)} />
           </div>
+        </section>
+        {groupBy === 'vm' ? (
+          <section className='mb-4' aria-label='平台费用对比'>
+            <h2 className='mb-2 text-sm font-medium'>
+              平台费用对比（不受平台筛选影响）
+            </h2>
+            <div className='grid gap-3 sm:grid-cols-2'>
+              <StatCard
+                label='Claude 费用'
+                value={fmtUsd(split.claude.cost_usd)}
+                hint={`${fmtNum(split.claude.requests)} 请求`}
+              />
+              <StatCard
+                label='GPT 费用'
+                value={fmtUsd(split.gpt.cost_usd)}
+                hint={`${fmtNum(split.gpt.requests)} 请求`}
+              />
+            </div>
+          </section>
         ) : null}
         {visible.length === 0 ? (
-          <EmptyState reason='暂无计费数据' />
+          <EmptyState
+            reason={
+              groupBy === 'vm' && platform !== 'all'
+                ? '当前筛选未显示计费明细'
+                : '暂无计费数据'
+            }
+          />
         ) : (
           <Table>
             <TableHeader>

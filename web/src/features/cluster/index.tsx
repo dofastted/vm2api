@@ -54,11 +54,13 @@ function MiniStat({
   value,
   hint,
   tone,
+  wrapHint = false,
 }: {
   label: string
   value: string
   hint?: React.ReactNode
   tone?: 'caution' | 'bad'
+  wrapHint?: boolean
 }) {
   return (
     <Card
@@ -74,7 +76,12 @@ function MiniStat({
         {value}
       </div>
       {hint ? (
-        <div className='mt-0.5 truncate text-[11.5px] text-muted-foreground/90'>
+        <div
+          className={cn(
+            'mt-0.5 text-[11.5px] text-muted-foreground/90',
+            wrapHint ? 'break-words' : 'truncate'
+          )}
+        >
           {hint}
         </div>
       ) : null}
@@ -267,9 +274,12 @@ ANTI-PATTERN: Local board vs remote table, lifetime spend per host, one-sample l
               tone={summary.fit === 0 ? 'caution' : undefined}
             />
             <MiniStat
-              label='今日花费'
+              label='今日花费 · 北京时间'
               value={fmtUsd(today, 2)}
-              hint={total != null ? `累计 ${fmtUsd(total, 2)}` : undefined}
+              wrapHint
+              hint={
+                total != null ? `保留日志合计 ${fmtUsd(total, 2)}` : undefined
+              }
             />
           </div>
 

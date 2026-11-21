@@ -233,14 +233,17 @@ export function rackTotals(
       : vm.account_uuid || vm.id
     const countTotal = !vm.lifetime_usage || !seenAccounts.has(accountKey)
     if (vm.lifetime_usage) seenAccounts.add(accountKey)
+    const mixed = rows.map((r) =>
+      r.key === 'total' ? { ...r, label: '总费用' } : r
+    )
     t.ledger = t.ledger.length
       ? t.ledger.map((r, i) => ({
           ...r,
-          cost: r.cost + (r.key === 'total' && !countTotal ? 0 : rows[i].cost),
+          cost: r.cost + (r.key === 'total' && !countTotal ? 0 : mixed[i].cost),
           tokens:
-            r.tokens + (r.key === 'total' && !countTotal ? 0 : rows[i].tokens),
+            r.tokens + (r.key === 'total' && !countTotal ? 0 : mixed[i].tokens),
         }))
-      : rows
+      : mixed
   }
   return t
 }

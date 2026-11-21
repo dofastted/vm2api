@@ -42,7 +42,7 @@ export function QuickFiltersBar({
   const statusGroup: Preset[] = [
     {
       id: 'errors-only',
-      label: '仅错误',
+      label: '仅非 2xx',
       icon: AlertCircle,
       active: !!filters.excludeStatus200,
       toggle: () =>

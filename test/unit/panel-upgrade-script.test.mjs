@@ -124,6 +124,11 @@ async function runUpgrade({ source = true, arch = 'amd64', override, env = {} } 
             BOOT_VERSION: bootVersion,
             PORT: String(server.address().port),
             VM2API_API_KEY: 'test-key',
+            // The probe paces itself to `KIN_RATE_REFILL` requests per second,
+            // one by default. The fake-bin `sleep` shim only removes the retry
+            // loop's own wait, so a verification that exhausts all 45 attempts
+            // spent ~52s inside that pacing alone and blew the timeout below.
+            KIN_RATE_REFILL: '1000',
             ...env,
           },
           timeout: 20000,

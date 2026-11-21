@@ -56,6 +56,8 @@ export type VmProxySnap = {
   scheme?: string
   /** 透明 TCP 把唯一 DNS 应答改写成 SOCKS 主机名。默认关。 */
   domain_forward?: boolean
+  /** 让 SVCB(64)/HTTPS(65) 返回空答案，屏蔽 HTTP/3 与加密 SNI 探测。按条生效，默认关。 */
+  dns_disable_svcb_https?: boolean
   /** 出口地理位置（IPv4）；从未检测过为 null。 */
   geo?: ProxyGeo | null
   /** 公网 IPv6 出口地理位置；从未检测过为 null。 */

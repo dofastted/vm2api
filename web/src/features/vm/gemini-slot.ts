@@ -17,10 +17,10 @@ export function geminiSlot(
       : geminiPayloadIssue(inventory) ||
         (environment.proxy_ready === false
           ? '绑定代理不可用'
-          : !environment.runtime_ready
-            ? '载荷未启用推理'
-            : !environment.billing_ready
-              ? '付费调用未开放'
+          : environment.models_discovered !== true
+            ? '尚未拉取模型，不能调度'
+            : !environment.models?.length
+              ? '没有可调度模型'
               : null)
   return {
     id: environment.id,

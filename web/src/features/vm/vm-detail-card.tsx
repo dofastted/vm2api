@@ -148,7 +148,7 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
       <VmMemoryBlock vm={vm} />
 
       <div className='grid gap-2 sm:grid-cols-2'>
-        <Section title='今日'>
+        <Section title='今日 · 北京时间'>
           <div className='flex items-baseline justify-between'>
             <span className='text-lg leading-tight font-semibold tabular-nums'>
               {fmtUsd(today.today, 2)}
@@ -163,7 +163,7 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             {fmtHitPct(today.hit)}
           </div>
         </Section>
-        <Section title='7D 请求'>
+        <Section title='7 天窗口请求'>
           <div className='flex items-baseline justify-between'>
             <span className='text-lg leading-tight font-semibold tabular-nums'>
               {fmtNum(week.known ? week.success + week.fail : week.req)}
@@ -179,7 +179,7 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             </span>
           </div>
           <div className='mt-1 text-[11px] text-muted-foreground'>
-            7D 窗口 · 成功 / 失败
+            7 天窗口 · 成功 / 失败
           </div>
         </Section>
       </div>

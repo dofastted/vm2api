@@ -270,6 +270,65 @@ test('DNS 64/65 suppression is visible in proxy config and can be toggled', asyn
   }
 })
 
+test('the SVCB/HTTPS override is per proxy, and the pool switch writes through to every row', async () => {
+  const gw = await startGateway()
+  try {
+    const added = await api(gw, 'POST', '/api/panel/proxies/import', {
+      body: { text: '10.9.8.1:1080\n10.9.8.2:1080' },
+    })
+    assert.equal(added.status, 200, added.text)
+    const [first, second] = (added.json.data || added.json).items
+    assert.equal(first.dns_disable_svcb_https, false)
+
+    const listed = async () => {
+      const get = await api(gw, 'GET', '/api/panel/proxies')
+      const rows = (get.json.data || get.json).proxies
+      return new Map(rows.map((p) => [p.id, p.dns_disable_svcb_https]))
+    }
+
+    // The pool switch is a bulk action over the rows, not an inherited value.
+    const all = await api(gw, 'PUT', '/api/panel/proxies/config', {
+      body: { dns_disable_svcb_https: true },
+    })
+    assert.equal(all.status, 200, all.text)
+    const afterBulk = await listed()
+    assert.equal(afterBulk.get(first.id), true)
+    assert.equal(afterBulk.get(second.id), true)
+
+    // One outlet can differ from the pool, and the pool key keeps its value.
+    const one = await api(gw, 'PUT', `/api/panel/proxies/${first.id}`, {
+      body: { dns_disable_svcb_https: false },
+    })
+    assert.equal(one.status, 200, one.text)
+    assert.equal((one.json.data || one.json).proxy.dns_disable_svcb_https, false)
+    const afterOne = await listed()
+    assert.equal(afterOne.get(first.id), false)
+    assert.equal(afterOne.get(second.id), true)
+    const cfg = await api(gw, 'GET', '/api/panel/proxies/config')
+    assert.equal((cfg.json.data || cfg.json).dns_disable_svcb_https, true)
+
+    // A rename must not disturb the override.
+    const renamed = await api(gw, 'PUT', `/api/panel/proxies/${first.id}`, { body: { label: 'tokyo-1' } })
+    assert.equal(renamed.status, 200, renamed.text)
+    assert.equal((renamed.json.data || renamed.json).proxy.dns_disable_svcb_https, false)
+
+    const bad = await api(gw, 'PUT', `/api/panel/proxies/${first.id}`, {
+      body: { dns_disable_svcb_https: 'yes' },
+    })
+    assert.equal(bad.status, 400, bad.text)
+    assert.equal(bad.json.error.code, 'invalid_dns_disable_svcb_https')
+
+    // The local row has no helper of its own to carry the override.
+    const local = await api(gw, 'PUT', '/api/panel/proxies/px-local', {
+      body: { dns_disable_svcb_https: true },
+    })
+    assert.equal(local.status, 400, local.text)
+    assert.equal(local.json.error.code, 'dns_disable_svcb_https_unsupported')
+  } finally {
+    await gw.stop()
+  }
+})
+
 test('generate-auth-url requires bound SOCKS5', async () => {
   const gw = await startGateway()
   try {

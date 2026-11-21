@@ -21,7 +21,8 @@ import {
   BRIDGE_NF_CALL_IPTABLES,
   claimSharedIp,
   configuredDnsUpstream,
-  configuredDnsEmptyTypes,
+  configuredSharedDnsEmptyTypes,
+  proxyDnsEmptyTypes,
   egressConfigBody,
   egressConfigFor,
   gatewayFromSubnet,
@@ -793,7 +794,8 @@ export async function ensureRemoteSharedEgress(session, vm, projectRoot, { image
       listenTcp: `${net.gateway}:${ports.tcp}`,
       listenDns: `${net.gateway}:${ports.dns}`,
       dnsUpstream: configuredDnsUpstream(),
-      dnsEmptyTypes: configuredDnsEmptyTypes(),
+      // Intersection over this node's membership — one helper, many outlets.
+      dnsEmptyTypes: configuredSharedDnsEmptyTypes(routes),
       routes,
     })
     const body = egressConfigBody(cfg)
@@ -928,7 +930,8 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
     listenTcp: `${net.gateway}:${ports.tcp}`,
     listenDns: `${net.gateway}:${ports.dns}`,
     dnsUpstream: configuredDnsUpstream(),
-    dnsEmptyTypes: configuredDnsEmptyTypes(),
+    // Per outlet: this helper serves exactly this proxy.
+    dnsEmptyTypes: proxyDnsEmptyTypes(proxy),
   })
   const body = egressConfigBody(cfg)
   const { digest, spec } = remoteEgressContainer({

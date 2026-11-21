@@ -141,6 +141,8 @@ export function TrafficOps({
     )
   }
 
+  const hasRequests = o.requests != null && o.requests > 0
+  const noRequests = o.requests === 0
   const cells: {
     label: string
     value: string
@@ -149,15 +151,23 @@ export function TrafficOps({
   }[] = [
     {
       label: '成功率',
-      value: sla == null ? '—' : `${sla.toFixed(1)}%`,
-      hint: `${fmtNum(o.success || 0)} / ${fmtNum(o.requests || 0)} · 错 ${fmtNum(o.errors || 0)}`,
-      tone: slaTone(o.sla),
+      value: !hasRequests || sla == null ? '—' : `${sla.toFixed(1)}%`,
+      hint: hasRequests
+        ? `${fmtNum(o.success || 0)} / ${fmtNum(o.requests || 0)} · 错 ${fmtNum(o.errors || 0)}`
+        : noRequests
+          ? '所选时段无请求'
+          : undefined,
+      tone: hasRequests ? slaTone(o.sla) : undefined,
     },
     {
       label: '错误率',
-      value: err == null ? '—' : `${err.toFixed(1)}%`,
-      hint: `429 ${fmtNum(o.status_429 || 0)} · 503 ${fmtNum(o.status_503 || 0)} · 529 ${fmtNum(o.status_529 || 0)}`,
-      tone: errTone(o.error_rate),
+      value: !hasRequests || err == null ? '—' : `${err.toFixed(1)}%`,
+      hint: hasRequests
+        ? `429 ${fmtNum(o.status_429 || 0)} · 503 ${fmtNum(o.status_503 || 0)} · 529 ${fmtNum(o.status_529 || 0)}`
+        : noRequests
+          ? '所选时段无请求'
+          : undefined,
+      tone: hasRequests ? errTone(o.error_rate) : undefined,
     },
     {
       label: '首字 p50',
@@ -177,14 +187,14 @@ export function TrafficOps({
       hint: `p95 ${fmtMs(dur.p95_ms)} · avg ${fmtMs(dur.avg_ms)}`,
     },
     {
-      label: 'QPS',
+      label: '平均 QPS',
       value: fmtRate(o.qps?.avg),
-      hint: `当前 ${fmtRate(o.qps?.current)} · 峰值 ${fmtRate(o.qps?.peak)}`,
+      hint: `最近有请求的分钟 ${fmtRate(o.qps?.current)} · 分钟峰值 ${fmtRate(o.qps?.peak)}`,
     },
     {
-      label: 'TPS',
+      label: '平均 TPS',
       value: fmtRate(o.tps?.avg, 1),
-      hint: `入 ${fmtNum(o.input_tokens || 0)} / 出 ${fmtNum(o.output_tokens || 0)}`,
+      hint: `入 ${fmtNum(o.input_tokens || 0)} / 出 ${fmtNum(o.output_tokens || 0)} · TPS 另计缓存读写`,
     },
     {
       label: '流式占比',

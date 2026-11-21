@@ -4,10 +4,25 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import type { NodeGone } from '@/features/vm/delete-vm'
 
-export function DeleteActiveVmHint({ target, vms }: { target: Vm; vms: Vm[] }) {
+export function DeleteActiveVmHint({
+  target,
+  vms,
+  force = false,
+}: {
+  target: Vm
+  vms: Vm[]
+  force?: boolean
+}) {
   const plan = planDeleteActiveVm(target, vms)
+  const forceNote = force ? (
+    <p className='mt-2 text-destructive'>
+      删除面板侧槽位数据；不清理远端节点上的容器和文件。
+    </p>
+  ) : null
   if (plan.kind === 'normal' || plan.kind === 'sole_active') {
-    return (
+    return force ? (
+      forceNote
+    ) : (
       <p className='mt-2 text-destructive'>
         删除槽位不可恢复：容器、家目录、凭证与代理绑定一并清除。
       </p>
@@ -22,6 +37,7 @@ export function DeleteActiveVmHint({ target, vms }: { target: Vm; vms: Vm[] }) {
         <p className='mt-2 text-sm text-muted-foreground'>
           请先在列表或详情中使用「设为活跃」切换到其它槽位，再删除；或恢复至少一个可调度槽后再试。
         </p>
+        {forceNote}
       </>
     )
   }
@@ -37,6 +53,7 @@ export function DeleteActiveVmHint({ target, vms }: { target: Vm; vms: Vm[] }) {
           · {plan.replacement.id}
         </span>
       </p>
+      {forceNote}
     </>
   )
 }

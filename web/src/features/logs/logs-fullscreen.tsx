@@ -56,7 +56,8 @@ export function LogsFullscreen({
 }) {
   const [hideProvider, setHideProvider] = useState(false)
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
-  const { data } = useQuery(usageLogsOverviewQueryOptions(tz, 3000))
+  const overview = useQuery(usageLogsOverviewQueryOptions(tz, 3000))
+  const data = overview.data
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -89,11 +90,35 @@ export function LogsFullscreen({
             退出全屏
           </Button>
           <div className='hidden h-full items-stretch divide-x divide-border/50 md:flex'>
-            <Metric label='活跃 Session 数' value={data?.activeSessions ?? 0} />
-            <Metric label='今日请求' value={data?.todayRequests ?? 0} />
             <Metric
-              label='今日消费'
-              value={formatCurrency(data?.todayActualCost ?? 0, 2)}
+              label='活跃 Session 数'
+              value={
+                overview.isError && !data
+                  ? '概览加载失败'
+                  : data
+                    ? data.activeSessions
+                    : '—'
+              }
+            />
+            <Metric
+              label='今日请求'
+              value={
+                overview.isError && !data
+                  ? '概览加载失败'
+                  : data
+                    ? data.todayRequests
+                    : '—'
+              }
+            />
+            <Metric
+              label='今日消费 · 实际计费'
+              value={
+                overview.isError && !data
+                  ? '概览加载失败'
+                  : data
+                    ? formatCurrency(data.todayActualCost ?? 0, 2)
+                    : '—'
+              }
             />
             <Metric
               label='平均响应时间'
@@ -108,11 +133,11 @@ export function LogsFullscreen({
         <div className='mt-4 h-16 w-1.5 rounded-l-sm bg-primary/20 group-hover:bg-primary/50' />
         <div className='flex w-72 flex-col gap-3 rounded-l-lg border border-r-0 bg-popover p-4 shadow-xl'>
           <div className='flex items-center justify-between gap-3'>
-            <div className='text-sm font-medium'>隐藏供应商列</div>
+            <div className='text-sm font-medium'>隐藏虚拟机列</div>
             <Switch
               checked={hideProvider}
               onCheckedChange={setHideProvider}
-              aria-label='隐藏供应商列'
+              aria-label='隐藏虚拟机列'
             />
           </div>
         </div>

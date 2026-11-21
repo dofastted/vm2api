@@ -137,6 +137,7 @@ const MEMORY_SHORT: Record<VmMemoryOption, string> = {
   '256m': '256M',
   '512m': '512M',
   '1g': '1G',
+  '1536m': '1.5G',
   '2g': '2G',
   '4g': '4G',
   '8g': '8G',
@@ -804,11 +805,16 @@ export function CreateVmForm({
       <Section title='名称'>
         <Input
           aria-label='槽位名称'
+          aria-describedby='slot-name-help'
           value={d.name}
           onChange={(e) => d.setName(e.target.value)}
           placeholder='留空自动编号，如 vm-08'
           className='max-w-sm'
         />
+        <p id='slot-name-help' className='text-xs text-muted-foreground'>
+          名称会显示在列表中；可用的字母或数字也会用于生成槽位
+          ID。留空或只填中文时自动编号。
+        </p>
         <p className='text-xs text-muted-foreground'>
           并发跟随设置里的全局默认（创建后可在槽位详情钉住单槽值）。
         </p>
