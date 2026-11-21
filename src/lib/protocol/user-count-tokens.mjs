@@ -37,6 +37,7 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot } from '../vm/codex-slot.mjs'
 import { pickCodexSlots } from '../pool/codex-slot-pool.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
+import { blockedClientError, blockedClientFor } from '../identity/blocked-clients.mjs'
 import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
 export function usageUnsupportedError() {
   return makeError({
@@ -277,6 +278,12 @@ export async function handleUserCountTokens(req, res, deps) {
     !isClaudeCodeFamilyRequest(req?.headers || {}, inbound, { countTokens: true })
   ) {
     const err = claudeCodeOnlyError()
+    return json(res, err.status, err.body)
+  }
+  const blockedClient =
+    detectInboundPlatform(parsed.body.model).platform === 'anthropic' ? blockedClientFor(inbound, routing) : null
+  if (blockedClient) {
+    const err = blockedClientError(blockedClient)
     return json(res, err.status, err.body)
   }
   const gate = await blockCountTokensBeforeHop(req, parsed.body, { ...deps, rawInbound: inbound })

@@ -59,6 +59,7 @@ export const ErrorCode = {
   VM_POOL_UNAVAILABLE: 'vm_pool_unavailable',
   API_BACKEND_FORBIDDEN: 'api_backend_forbidden',
   CLAUDE_CODE_ONLY: 'claude_code_only',
+  CLIENT_BLOCKED: 'client_blocked',
   // upstream
   UPSTREAM_AUTH: 'upstream_auth_error',
   UPSTREAM_RATE_LIMIT: 'upstream_rate_limit',
