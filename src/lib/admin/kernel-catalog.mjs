@@ -40,6 +40,13 @@ const baseFor = (root, kernel) =>
 const archFor = (kernel) => (kernel === 'crag' ? cragV2Arch() : 'amd64')
 const CRAG_PINNED_RELEASES = [
   {
+    tag: 'payload-2026.11.21-crag-3.1.12',
+    label: '3.1.12 Datadog 遥测修复',
+    size: 171069832,
+    manifestSha256: 'f5c00bd6fdafd23a9ef01ba0c449177da630235121b1f96eef2dc3abb74ef670',
+    sha256: '222a323858fe60f4092f10ebbef391db86e9cbb14212199578303a33e9ce1eba',
+  },
+  {
     tag: 'payload-2026.11.21-crag-3.1.11',
     label: '3.1.11 MCP 等待与恢复',
     size: 171061071,
@@ -840,6 +847,21 @@ function releasePayload(projectRoot) {
     if (error.code === 'ENOENT') return null
     throw error
   }
+}
+
+// The deployed release pins one CRAG payload. `pullKernelRelease` already
+// resolves it when `latest` is false; expose only the tag and its label so the
+// panel can offer that exact version instead of whatever GitHub published last.
+export function cragReleasePin(projectRoot) {
+  let tag
+  try {
+    tag = releasePayload(projectRoot)?.crag_release
+  } catch {
+    return null
+  }
+  if (!isCragPayloadTag(tag)) return null
+  const pinned = CRAG_PINNED_RELEASES.find((entry) => entry.tag === tag)
+  return { tag, ...(pinned?.label ? { label: pinned.label } : {}) }
 }
 
 export async function pullKernelRelease(

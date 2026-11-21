@@ -34,7 +34,12 @@ function fixture(t) {
   }
   seedEncryptedPackage(root, { revision: 'new' })
   const calls = []
+  // Mirrors a `requireInternalToken` probe: CRAG identity is only trusted from
+  // an authenticated internal response.
   const health = async () => ({
+    status: 200,
+    ok: true,
+    internalTokenAuthenticated: true,
     healthy: true,
     license_valid: true,
     runtime_variant: 'crag-v2',
@@ -233,6 +238,35 @@ test('matching installed files cannot hide a stale running memfd core', async (t
   assert.deepEqual(
     f.calls[0].body.targets.map(({ id }) => id),
     ['vm-live'],
+  )
+})
+
+test('a slot that has not spawned a core yet is reported pending, not failed', async (t) => {
+  // v2 cores spawn lazily, so a slot that has just restarted can run none.
+  // Treating that as a stale core failed a whole update whose unchanged re-run
+  // then passed, leaving the operator nothing to act on.
+  const f = fixture(t)
+  const result = await updateCrag(f.root, {
+    ...f,
+    coreHashes: async () => [],
+    coreWait: { timeoutMs: 0 },
+  })
+  assert.equal(result.ok, true)
+  const live = result.items.find((item) => item.id === 'vm-live')
+  assert.equal(live.ok, true)
+  assert.equal(live.core_pending, true)
+  assert.equal(live.running_core_sha256, undefined)
+})
+
+test('a core left over from another tree still fails the update', async (t) => {
+  const f = fixture(t)
+  await assert.rejects(
+    updateCrag(f.root, {
+      ...f,
+      coreHashes: async () => ['0'.repeat(64)],
+      coreWait: { timeoutMs: 0 },
+    }),
+    /crag_running_core_mismatch:vm-live/,
   )
 })
 
