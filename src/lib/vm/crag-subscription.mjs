@@ -55,6 +55,83 @@ const validVoucher = (code) =>
   Buffer.from(code.slice(7), 'base64url').toString('base64url') === code.slice(7)
 const safeTime = (value) => Number.isSafeInteger(value) && value >= 0
 const isDigest = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+
+const HOST_DOMAIN = 'crag-host-v1:'
+const MAC_DOMAIN = 'crag-host-mac-v1:'
+const NET_DIRECTORY = '/sys/class/net'
+
+/** The 32 hex digits a host id has always been derived from are exactly a
+ * UUID's payload, so the identity this service already computes can be shown to
+ * the operator and typed back in without inventing a second identifier -- and
+ * without touching the wire format, which stays a 64 hex host id. */
+const formatDeviceUuid = (raw) =>
+  `${raw.slice(0, 8)}-${raw.slice(8, 12)}-${raw.slice(12, 16)}-${raw.slice(16, 20)}-${raw.slice(20)}`
+
+const hostIdFromRaw = (raw) => createHash('sha256').update(`${HOST_DOMAIN}${raw}`).digest('hex')
+
+/** Accepts what a person would actually paste: any case, dashes or not. */
+function normalizeDeviceUuid(input) {
+  if (typeof input !== 'string') return null
+  const raw = input.trim().toLowerCase().replaceAll('-', '')
+  if (!/^[a-f0-9]{32}$/.test(raw) || /^(0{32}|f{32})$/.test(raw)) return null
+  return formatDeviceUuid(raw)
+}
+
+/** The one path from a device UUID to the identity the protocol speaks. */
+function uuidToHostId(uuid) {
+  const normalized = normalizeDeviceUuid(uuid)
+  return normalized && hostIdFromRaw(normalized.replaceAll('-', ''))
+}
+
+/** A MAC is a worse identifier than a machine-id in one respect -- replacing a
+ * NIC changes it -- but better in the one that actually bites: it is unique.
+ * Cloud images routinely ship without resetting `/etc/machine-id`, so every
+ * instance cloned from such an image derives the same host id, and the second
+ * one to register is refused with 403 for the rest of its life. A hypervisor
+ * hands each instance its own MAC. The instability costs nothing here because
+ * hardware is only ever sampled when no identity has been stored yet.
+ */
+function macDeviceRaw(netDirectory) {
+  let names
+  try {
+    names = fs.readdirSync(netDirectory)
+  } catch {
+    return null
+  }
+  let best
+  for (const name of names) {
+    const base = path.join(netDirectory, name)
+    try {
+      // Virtual interfaces -- lo, docker0, veth*, bridges, tap* -- have no
+      // backing device. Matching on names instead would misfire the moment a
+      // container renames a physical interface.
+      if (!fs.existsSync(path.join(base, 'device'))) continue
+      // Anything other than a permanent address (randomized, locally assigned,
+      // or copied from another interface) is not an identity.
+      if (fs.readFileSync(path.join(base, 'addr_assign_type'), 'utf8').trim() !== '0') continue
+      const mac = fs.readFileSync(path.join(base, 'address'), 'utf8').trim().toLowerCase()
+      if (!/^([a-f0-9]{2}:){5}[a-f0-9]{2}$/.test(mac) || mac === '00:00:00:00:00:00') continue
+      // Only the multicast bit disqualifies an address, because a multicast
+      // address is not an interface's own. The locally administered bit must not:
+      // hypervisors set it as a matter of course (QEMU's 52:54:00 prefix has it),
+      // so rejecting it would discard the NIC on most virtual machines -- exactly
+      // the hosts this is meant to identify. Whether an address is permanent is
+      // already settled authoritatively by `addr_assign_type` above.
+      if (Number.parseInt(mac.slice(0, 2), 16) & 0b1) continue
+      // Lowest address wins. Kernel enumeration order and interface naming both
+      // shift between boots, so neither of them may decide who this machine is.
+      if (best === undefined || mac < best) best = mac
+    } catch {
+      continue
+    }
+  }
+  if (best === undefined) return null
+  // Hash rather than pad out to 32 digits: the operator copies this value into
+  // support tickets and migration forms, so the hardware address should not
+  // travel with it. The separate domain also keeps MAC-derived values from ever
+  // colliding with machine-id-derived ones.
+  return createHash('sha256').update(`${MAC_DOMAIN}${best}`).digest('hex').slice(0, 32)
+}
 const validSku = (value) => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value)
 const validMonths = (value) => Number.isSafeInteger(value) && value >= 1 && value <= 4294967295
 const invalidRights = () => fail('crag_subscription_invalid_entitlement', 502)
@@ -380,6 +457,7 @@ export function createCragSubscription({
   fetchImpl = globalThis.fetch,
   origin = AUTHORITY,
   machineIdFile = process.env.KIN_CRAG_HOST_ID_FILE,
+  netDirectory = NET_DIRECTORY,
 } = {}) {
   if (origin !== AUTHORITY && !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(origin)) throw fail()
   const publicDir = cragSubscriptionPublicDirectory(projectRoot)
@@ -387,6 +465,7 @@ export function createCragSubscription({
   const dataDir = path.dirname(base)
   const privateDir = path.join(base, 'private')
   const hostFile = path.join(publicDir, 'host_id')
+  const uuidFile = path.join(publicDir, 'device_uuid')
   const keyFile = path.join(privateDir, 'credential')
   const entitlementFile = path.join(publicDir, 'entitlement.code')
   const intentFile = path.join(privateDir, 'redeem.json')
@@ -405,14 +484,72 @@ export function createCragSubscription({
   let expiryProbe
   let lastExpiryProbe
 
-  function identity() {
+  function machineIdRaw(file, native) {
+    let raw
+    try {
+      const resolved = native ? fs.realpathSync(file) : file
+      if (native) checkParents(path.dirname(resolved))
+      raw = load(resolved, null, 64, machineIdFile ? null : 0)
+        ?.trim()
+        .toLowerCase()
+    } catch {
+      return null
+    }
+    if (/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(raw || '')) raw = raw.replaceAll('-', '')
+    if (!/^[a-f0-9]{32}$/.test(raw || '') || /^(0{32}|f{32})$/.test(raw)) return null
+    return raw
+  }
+
+  /** Where this machine's identity can be sampled from, best first. The MAC
+   * comes before the machine-id because it is the one that is actually unique;
+   * see `macDeviceRaw`. */
+  function* candidateRaws() {
+    if (machineIdFile) {
+      for (const file of [machineIdFile].flat()) yield ['override', machineIdRaw(file, false)]
+      return
+    }
+    yield ['mac', macDeviceRaw(netDirectory)]
+    if (!fs.existsSync(HOST_ID_MOUNT) && !isContainerized()) {
+      for (const file of ['/etc/machine-id', '/var/lib/dbus/machine-id']) yield ['machine-id', machineIdRaw(file, true)]
+    } else {
+      yield ['mount', machineIdRaw(HOST_ID_MOUNT, false)]
+    }
+  }
+
+  /** The displayable form of a stored identity. The host id stays the single
+   * authority: a `device_uuid` that does not derive it was tampered with or
+   * belongs to another install, and is dropped rather than allowed to speak for
+   * this host. */
+  function storedUuid(hostId, sources) {
+    let stored
+    try {
+      stored = load(uuidFile, 0o644, 36)
+    } catch {
+      stored = null
+    }
+    if (stored && normalizeDeviceUuid(stored) === stored && uuidToHostId(stored) === hostId) return stored
+    // An install that predates this file still has its original source around in
+    // the usual case, so the UUID can be recovered and written out once.
+    for (const [, raw] of sources) {
+      if (hostIdFromRaw(raw) !== hostId) continue
+      const uuid = formatDeviceUuid(raw)
+      try {
+        publish(uuidFile, uuid, 0o644)
+      } catch {
+        // Being able to display the identity is not worth failing a request over.
+      }
+      return uuid
+    }
+    // A machine whose machine-id has since changed cannot have its UUID
+    // reconstructed -- sha256 does not run backwards. Reporting null is honest.
+    // A fabricated one would not derive this host id, and would silently aim a
+    // migration at a device that does not exist.
+    return null
+  }
+
+  /** Resolves this machine's identity as `{ hostId, uuid, source }`. */
+  function deviceIdentity() {
     if (process.platform !== 'linux') throw hostIdentityUnavailable()
-    const native = !machineIdFile && !fs.existsSync(HOST_ID_MOUNT) && !isContainerized()
-    const files = machineIdFile
-      ? [machineIdFile].flat()
-      : native
-        ? ['/etc/machine-id', '/var/lib/dbus/machine-id']
-        : [HOST_ID_MOUNT]
     let saved
     try {
       storage()
@@ -420,25 +557,47 @@ export function createCragSubscription({
     } catch {
       throw fail('crag_subscription_storage_unavailable')
     }
-    let changed = false
-    for (const file of files) {
-      let raw
-      try {
-        const resolved = native ? fs.realpathSync(file) : file
-        if (native) checkParents(path.dirname(resolved))
-        raw = load(resolved, null, 64, machineIdFile ? null : 0)
-          ?.trim()
-          .toLowerCase()
-      } catch {
-        continue
-      }
-      if (/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(raw || '')) raw = raw.replaceAll('-', '')
-      if (!/^[a-f0-9]{32}$/.test(raw || '') || /^(0{32}|f{32})$/.test(raw)) continue
-      const hostId = createHash('sha256').update(`crag-host-v1:${raw}`).digest('hex')
-      if (saved == null || saved === hostId) return hostId
-      changed = true
-    }
-    throw changed ? hostIdentityChanged() : hostIdentityUnavailable()
+    // Sources are still required to be sound even once an identity is stored.
+    // A source being gone, unreadable, or replaced by something unsafe is a
+    // different matter from it having changed value, and only the latter is
+    // tolerated below.
+    const sources = [...candidateRaws()].filter(([, raw]) => raw)
+    if (!sources.length) throw hostIdentityUnavailable()
+    // A stored identity is then returned exactly as it stands, with no value
+    // comparison. This machine has already paid; a regenerated machine-id, a
+    // rebuilt container or a swapped NIC must not turn it into a stranger. This
+    // is what used to raise `crag_subscription_host_identity_changed`, and what
+    // left paid hosts wedged after ordinary maintenance.
+    if (saved) return { hostId: saved, uuid: storedUuid(saved, sources), source: 'saved' }
+    const [source, raw] = sources[0]
+    return { hostId: hostIdFromRaw(raw), uuid: formatDeviceUuid(raw), source }
+  }
+
+  function identity() {
+    return deviceIdentity().hostId
+  }
+
+  /** Discard the stored identity and re-derive it from the NIC.
+   *
+   * Reserved for the credential-recovery flow, once recovery has been refused
+   * and this host id is judged to be shared with another machine -- without
+   * this, such a machine is stuck for good: its stored host id answers 403
+   * forever, recovery must keep refusing it, and "a stored identity is
+   * permanent" would otherwise mean permanently broken. Doing it on the ordinary
+   * path instead would make every identity drift by itself, which is the exact
+   * guarantee `deviceIdentity` exists to provide. */
+  function rebuildDeviceIdentity({ reason } = {}) {
+    if (!reason) throw fail()
+    storage()
+    const raw = macDeviceRaw(netDirectory)
+    // Without a usable NIC the rebuild would land right back on the machine-id
+    // it is trying to escape, destroying the stored identity for nothing.
+    if (!raw) throw hostIdentityUnavailable()
+    const uuid = formatDeviceUuid(raw)
+    const hostId = hostIdFromRaw(raw)
+    publish(hostFile, hostId, 0o644)
+    publish(uuidFile, uuid, 0o644)
+    return { hostId, uuid, source: 'mac' }
   }
 
   function storage(create = false) {
@@ -1732,6 +1891,12 @@ export function createCragSubscription({
     admitInference,
     withRuntimeAdmission,
     purchaseDeviceId: identity,
+    /** `{ hostId, uuid, source }`. The panel shows `uuid` (null on an install
+     * whose original source is gone, see `storedUuid`) and `source` says where
+     * the identity came from, which is what makes an identity fault diagnosable
+     * instead of just "unavailable". */
+    deviceIdentity: () => deviceIdentity(),
+    rebuildDeviceIdentity,
     redeemDeviceOrder(hostId, voucher) {
       if (!isDigest(hostId)) throw fail()
       return redeem(voucher, false, hostId)

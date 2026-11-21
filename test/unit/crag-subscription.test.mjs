@@ -191,10 +191,145 @@ test('host checkout falls back to the D-Bus machine ID without changing an exist
   assert.equal(service.purchaseDeviceId(), expected)
 
   fs.rmSync(alternate)
-  assert.throws(() => service.purchaseDeviceId(), { code: 'crag_subscription_host_identity_changed' })
+  // The machine-id now reads differently from the one this host was bound with.
+  // That used to raise `crag_subscription_host_identity_changed`, which wedged
+  // paid hosts after ordinary maintenance -- a regenerated machine-id, a
+  // rebuilt container, a replaced NIC. A stored identity is permanent instead.
+  //
+  // What this gives up is a local heuristic, not a boundary: whoever can copy
+  // the data directory onto another machine already has the credential sitting
+  // in it and can speak to the Authority directly, and `slot_limit` still caps
+  // what a duplicate can consume.
+  assert.equal(service.purchaseDeviceId(), expected)
+  // Tolerating a changed value is not tolerating an unsound source: with the
+  // only remaining source replaced by a symlink, the identity is unavailable
+  // rather than quietly trusted.
   fs.rmSync(machineIdFile)
   fs.symlinkSync(path.join(publicDir, 'host_id'), machineIdFile)
   assert.throws(() => service.purchaseDeviceId(), { code: 'crag_subscription_host_identity_unavailable' })
+})
+
+/** Fake a `/sys/class/net` tree. `device` present means a real NIC;
+ * `addr_assign_type` 0 means the address is permanent. */
+function fakeNet(root, interfaces) {
+  const dir = fs.mkdtempSync(path.join(root, 'net-'))
+  for (const [name, { mac, assign = '0', virtual = false }] of Object.entries(interfaces)) {
+    const base = path.join(dir, name)
+    fs.mkdirSync(base)
+    if (!virtual) fs.writeFileSync(path.join(base, 'device'), '')
+    fs.writeFileSync(path.join(base, 'addr_assign_type'), `${assign}\n`)
+    fs.writeFileSync(path.join(base, 'address'), `${mac}\n`)
+  }
+  return dir
+}
+
+test('a device UUID is just the host id it derives, in a form an operator can copy and type back', (t) => {
+  const { machineIdFile, connect } = standaloneHost(t)
+  const raw = '1234567890abcdef1234567890abcdef'
+  fs.writeFileSync(machineIdFile, `${raw}\n`, { mode: 0o600 })
+  const { hostId, uuid, source } = connect().deviceIdentity()
+
+  // The 32 hex digits the host id has always been derived from are exactly a
+  // UUID payload, so nothing about the wire format moves.
+  assert.equal(uuid, '12345678-90ab-cdef-1234-567890abcdef')
+  assert.equal(hostId, crypto.createHash('sha256').update(`crag-host-v1:${raw}`).digest('hex'))
+  assert.equal(hostId.length, 64)
+  assert.equal(source, 'override')
+})
+
+test('host identity comes from the NIC, so machines cloned from one image do not collide', (t) => {
+  const { root, connect } = standaloneHost(t)
+  // Two instances of the same image: identical machine-id, distinct MACs. Under
+  // a machine-id baseline both derive one host id and the second to register is
+  // refused for good.
+  const first = connect({ machineIdFile: null, netDirectory: fakeNet(root, { eth0: { mac: '52:54:00:12:34:56' } }) })
+  const second = connect({ machineIdFile: null, netDirectory: fakeNet(root, { eth0: { mac: '52:54:00:ab:cd:ef' } }) })
+  assert.notEqual(first.deviceIdentity().hostId, second.deviceIdentity().hostId)
+  assert.equal(first.deviceIdentity().source, 'mac')
+
+  // The hardware address must not travel inside the identity the operator
+  // copies around.
+  assert.ok(!first.deviceIdentity().uuid.includes('525400'))
+
+  // Enumeration order and interface naming both shift between boots, so the
+  // lowest address decides and the result is order-independent.
+  const forward = fakeNet(root, { eth0: { mac: '52:54:00:12:34:56' }, eth1: { mac: '02:00:00:00:00:01' } })
+  const reverse = fakeNet(root, { enp3s0: { mac: '52:54:00:12:34:56' }, aaa0: { mac: '02:00:00:00:00:01' } })
+  assert.equal(
+    connect({ machineIdFile: null, netDirectory: forward }).deviceIdentity().hostId,
+    connect({ machineIdFile: null, netDirectory: reverse }).deviceIdentity().hostId,
+  )
+
+  // Virtual interfaces and non-permanent addresses are not identity. With only
+  // those present there is no NIC to use at all.
+  const unusable = fakeNet(root, {
+    lo: { mac: '00:00:00:00:00:00', virtual: true },
+    docker0: { mac: '02:42:ac:11:00:02', virtual: true },
+    eth9: { mac: '52:54:00:99:99:99', assign: '1' },
+  })
+  const only = fs.readdirSync(unusable)
+  assert.equal(only.length, 3, 'the fixture really does contain three interfaces')
+  assert.notEqual(connect({ machineIdFile: null, netDirectory: unusable }).deviceIdentity().source, 'mac')
+})
+
+test('a stored identity survives maintenance, and its UUID is backfilled then verified', (t) => {
+  const { machineIdFile, publicDir, connect } = standaloneHost(t)
+  const raw = 'abcdef0123456789abcdef0123456789'
+  fs.writeFileSync(machineIdFile, `${raw}\n`, { mode: 0o600 })
+  const service = connect()
+  const original = service.deviceIdentity()
+  fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
+  fs.writeFileSync(path.join(publicDir, 'host_id'), original.hostId, { mode: 0o644 })
+
+  // Backfilled once for an install that predates the file, and self-verified on
+  // every later read.
+  const uuidFile = path.join(publicDir, 'device_uuid')
+  const backfilled = service.deviceIdentity()
+  assert.equal(backfilled.source, 'saved')
+  assert.equal(backfilled.uuid, original.uuid)
+  assert.equal(fs.readFileSync(uuidFile, 'utf8'), original.uuid)
+
+  // Maintenance replaced the machine-id. The host id does not move with it.
+  fs.writeFileSync(machineIdFile, `${'b'.repeat(32)}\n`, { mode: 0o600 })
+  assert.equal(service.deviceIdentity().hostId, original.hostId)
+
+  // The host id is the only authority: a device_uuid that does not derive it is
+  // discarded rather than allowed to speak for this host. With the original
+  // source now gone, no UUID can be reconstructed, and reporting none is honest
+  // -- a fabricated one would aim a migration at a device that does not exist.
+  fs.writeFileSync(uuidFile, '00000000-0000-4000-8000-000000000001', { mode: 0o644 })
+  const tampered = service.deviceIdentity()
+  assert.equal(tampered.hostId, original.hostId)
+  assert.equal(tampered.uuid, null)
+})
+
+test('the identity rebuild escape hatch is never taken by the ordinary path', (t) => {
+  const { root, publicDir, connect } = standaloneHost(t)
+  const service = connect({
+    machineIdFile: null,
+    netDirectory: fakeNet(root, { eth0: { mac: '52:54:00:12:34:56' } }),
+  })
+  const before = service.deviceIdentity()
+  fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
+  fs.writeFileSync(path.join(publicDir, 'host_id'), 'c'.repeat(64), { mode: 0o644 })
+
+  // A stored identity stays put no matter how often it is resolved. If resolving
+  // could rebuild, "a stored identity is permanent" would mean nothing.
+  assert.equal(service.deviceIdentity().hostId, 'c'.repeat(64))
+  assert.equal(service.deviceIdentity().hostId, 'c'.repeat(64))
+
+  // Only an explicit call rebuilds, and it has to say why.
+  assert.throws(() => service.rebuildDeviceIdentity(), { code: 'crag_subscription_unavailable' })
+  const rebuilt = service.rebuildDeviceIdentity({ reason: 'host_id_collision' })
+  assert.equal(rebuilt.hostId, before.hostId)
+  assert.equal(service.deviceIdentity().hostId, before.hostId)
+
+  // Without a usable NIC a rebuild would land back on the machine-id it is
+  // escaping, so it refuses rather than destroying the stored identity.
+  const stuck = connect({ machineIdFile: null, netDirectory: path.join(root, 'absent') })
+  assert.throws(() => stuck.rebuildDeviceIdentity({ reason: 'host_id_collision' }), {
+    code: 'crag_subscription_host_identity_unavailable',
+  })
 })
 
 function postSubscription(subscription) {
