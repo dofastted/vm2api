@@ -464,11 +464,20 @@ function classifyParts(previous, current) {
  * the block list changed: a tool_result body edit, an extra key, or key order
  * also land here.
  */
-export function firstHistoryDiff(inbound, outbound) {
+/**
+ * Where the gateway's rewrite first diverges from what the client sent.
+ *
+ * Diagnostics only. `ctx` is the request's body context: passing it reuses the
+ * digests `prepareCachePrefix` just computed for the outbound body instead of
+ * hashing every message, content block and `valueStamp` level again, twice per
+ * level, on every attempt (#1497). The memo returns what the direct call
+ * returns, so the reported break is the same either way.
+ */
+export function firstHistoryDiff(inbound, outbound, { ctx = null } = {}) {
   if (!inbound || !outbound || typeof inbound !== 'object' || typeof outbound !== 'object') {
     return { section: null, index: null, kind: null, sections: [] }
   }
-  const sections = sectionDiffs(snapshotBody(inbound), snapshotBody(outbound))
+  const sections = sectionDiffs(snapshotBody(inbound, { ctx }), snapshotBody(outbound, { ctx }))
   if (!sections.length) return { section: null, index: null, kind: null, sections: [] }
   return { ...sections[0], sections }
 }
@@ -504,9 +513,10 @@ export function describeCacheContinuity({
   vmId = null,
   accountId = null,
   requestId = null,
+  ctx = null,
 } = {}) {
   const observed = layer === 'cli_final_wire'
-  const inboundToNode = firstHistoryDiff(inbound, outbound)
+  const inboundToNode = firstHistoryDiff(inbound, outbound, { ctx })
   return {
     layer,
     wire_observed: observed,
