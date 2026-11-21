@@ -68,10 +68,26 @@ func LoadConfig(path string) (*Config, error) {
 	if err := json.Unmarshal(raw, cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	runDir := filepath.Dir(path)
+	// codex requires absolute CODEX_HOME (it refuses relative paths), and
+	// the config may itself be passed as a relative path — normalize every
+	// derived/fs path against the config's directory.
+	runDir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	abs := func(p string) string {
+		if filepath.IsAbs(p) {
+			return p
+		}
+		return filepath.Join(runDir, p)
+	}
 	cfg.CodexBin = envStr("CODEX_TUI_BIN", envStr("CODEX_BIN", "codex"))
 	cfg.CodexHome = envStr("CODEX_TUI_HOME", filepath.Join(runDir, "codex-home"))
 	cfg.WorkspaceRoot = envStr("CODEX_TUI_WORKSPACE", filepath.Join(runDir, "codex-work"))
+	cfg.SocketPath = abs(cfg.SocketPath)
+	cfg.CredentialPath = abs(cfg.CredentialPath)
+	cfg.CodexHome = abs(cfg.CodexHome)
+	cfg.WorkspaceRoot = abs(cfg.WorkspaceRoot)
 	cfg.MaxParallel = envInt("CODEX_TUI_MAX_PARALLEL", 4)
 	cfg.ReadyTimeout = envMs("CODEX_TUI_READY_TIMEOUT_MS", 45*time.Second)
 	cfg.PasteTimeout = envMs("CODEX_TUI_PASTE_TIMEOUT_MS", 20*time.Second)

@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -87,7 +88,12 @@ func (s *Server) Handler() http.Handler {
 			})
 			return
 		}
-		_ = err
+		if err != nil {
+			log.Printf("turn %s failed: %v", env.RequestID, err)
+			sse.event("response.failed", map[string]any{
+				"error": map[string]any{"type": "server_error", "message": err.Error()},
+			})
+		}
 	})
 	mux.HandleFunc("POST /internal/v1/cancel", func(w http.ResponseWriter, r *http.Request) {
 		if !s.authOK(r) {

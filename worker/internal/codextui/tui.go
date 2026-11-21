@@ -32,9 +32,10 @@ const (
 )
 
 // startTUI spawns `codex` with CODEX_HOME pointed at the slot home and cwd at
-// the per-turn workspace. No proxy env is passed: egress rides the slot's
-// transparent SOCKS5/CONNECT path so the binary's real TLS fingerprint exits
-// on the fixed slot IP.
+// the worker's workspace. When cfg.ProxyURL is set the process egress is
+// pinned to that proxy (per-account fixed exit IP); otherwise egress rides
+// the slot's transparent SOCKS5/CONNECT path. Either way the binary's real
+// TLS fingerprint exits on the slot IP — never direct.
 func startTUI(ctx context.Context, cfg *Config, dir string, extraArgs []string) (*tui, error) {
 	args := append([]string{}, extraArgs...)
 	cmd := exec.CommandContext(ctx, cfg.CodexBin, args...)
@@ -48,6 +49,17 @@ func startTUI(ctx context.Context, cfg *Config, dir string, extraArgs []string) 
 		"NO_COLOR=",
 		"PATH=" + os.Getenv("PATH"),
 		"USER=kincli",
+	}
+	// Per-account egress: reqwest honors standard proxy env vars; socks5h
+	// keeps DNS on the proxy so the exit IP and its Geo stay the only
+	// identity the upstream sees.
+	if cfg.ProxyURL != "" {
+		env = append(env,
+			"HTTPS_PROXY="+cfg.ProxyURL,
+			"https_proxy="+cfg.ProxyURL,
+			"ALL_PROXY="+cfg.ProxyURL,
+			"all_proxy="+cfg.ProxyURL,
+		)
 	}
 	// TZ must come through so codex timestamps (and any tz-derived upstream
 	// metadata) match the slot's GeoIP-consistent zone (checklist dimension 2).
@@ -119,17 +131,12 @@ func (t *tui) waitReady(ctx context.Context, timeout time.Duration) error {
 }
 
 // composerVisible detects the codex TUI input prompt glyph. Onboarding and
-// login screens are reported through classifyScreen, never as ready.
+// login screens are reported through classifyScreen, never as ready. The
+// composer prompt is a single `›` (U+203A); the vt10x-rendered text may
+// scatter it inside a line, so match the glyph itself rather than a
+// line-anchored marker.
 func composerVisible(s string) bool {
-	// The composer renders a bordered box whose prompt line starts with ›.
-	for _, line := range splitLines(s) {
-		for _, marker := range []string{"› Ask", "› /", "› "} {
-			if len(line) >= len(marker) && contains(line, marker) {
-				return true
-			}
-		}
-	}
-	return false
+	return contains(s, "›") || contains(s, "for shortcuts")
 }
 
 // classifyScreen names blocking states that must not be pasted into.
