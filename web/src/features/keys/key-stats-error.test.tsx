@@ -26,10 +26,9 @@ describe('key stats error wording', () => {
     state.data = undefined
     const failed = renderToStaticMarkup(
       <KeyStatsDialog
-        open
         item={{ id: 'key', group_type: 'openai' } as never}
         vms={[]}
-        onClose={() => {}}
+        onOpenChange={() => {}}
       />
     )
     expect(failed).toContain('密钥统计加载失败')
@@ -39,10 +38,9 @@ describe('key stats error wording', () => {
     state.data = { usage_stats: null }
     const empty = renderToStaticMarkup(
       <KeyStatsDialog
-        open
         item={{ id: 'key', group_type: 'openai' } as never}
         vms={[]}
-        onClose={() => {}}
+        onOpenChange={() => {}}
       />
     )
     expect(empty).toContain('暂无统计数据')
