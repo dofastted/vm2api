@@ -8,7 +8,7 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 2. 面板显示「已安装，等待兑换」后，在「导入 → Gemini → 兑换 CRAGGemini」或「订阅 CRAG」输入 `CGG1-…`。激活绑定到宿主安装的清单；错误码不会解锁，服务重启保留激活。明文码不入库、不持久化。激活不代替 Google OAuth，不启用公共推理或付费调用。
 3. Google OAuth 和交互终端还需要 `ip`、`nft`、`setpriv`、支持非特权用户命名空间的 `bwrap`、vm2api 自带的 `kin-egress`、IPv4 转发和绑定的 SOCKS5 代理。预留服务配置中的 UID/GID 区间与 `198.18.252.0/27`；不要为此开放直连或调整全局转发策略。
 4. 安装器不覆盖已有载荷（包括旧 `rc.1`），也不覆盖 `/etc/vm2api` 的手工信任设置。自管载荷仍可使用 `prepare-gemini --gemini-payload-source DIR`，并在 `/etc/vm2api/gemini-ed25519.pub` 配置该载荷的受信公钥；已有手工兑换校验配置仍适用。载荷源目录及其父路径须由 root 所有且不可由非 root 写入，不可放在 `/tmp`。
-5. `--no-start` 跳过服务及默认载荷准备。Gemini 失败不阻断控制面安装或升级，可用 `sudo bash deploy/install.sh prepare-gemini` 单独重试，并通过 `journalctl -u vm2api-gemini.service` 查看原因。独立 Node 网关须加入 `vm2api` 组并重启以访问 `/run/vm2api-gemini/control.sock`；已有自定义 unit 要先迁移，避免争用 socket。
+5. `--no-start` 跳过服务及默认载荷准备。Gemini 失败不阻断控制面安装或升级，可用 `sudo bash deploy/install-gemini.sh` 单独重试。面板「设置 → Gemini」复制同一条命令，并通过 `journalctl -u vm2api-gemini.service` 查看原因。独立 Node 网关须加入 `vm2api` 组并重启以访问 `/run/vm2api-gemini/control.sock`；已有自定义 unit 要先迁移，避免争用 socket。
 6. 第 2 步的授权码在发行机对已签名、已解包的载荷签发：
 
    ```sh
@@ -30,7 +30,7 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 - OAuth 授权、拉取模型和推理是不同检查。Google 若拒绝当前账号所在地区的 Antigravity 调用，测试返回 `gemini_location_unsupported`，不会触发重新授权、换号或换代理；不要把有模型列表当作推理就绪。
 - 可使用非 root 账号运行 `bash test/deploy/gemini-host-egress-smoke.sh /absolute/path/kin-egress`，在一次性 Linux 命名空间用 `iptables` 模拟 Docker 的默认转发丢弃策略，检查选定 SOCKS5 的透明转发、转发器退出后失败和网络清理。该测试不访问 Google 或主机代理池。
 - 有签名产物时，可在带 Node 和 Python 的一次性 Linux amd64 容器内以 root 运行 `bash test/deploy/gemini-host-install-smoke.sh /path/to/signed-payload /path/to/public-key`。断网烟测覆盖验签、传统手工安装、默认预装后锁定、拒绝无效兑换码和激活重启持久化。
-- 管理员可生成 `Gemini · CRAGAnti` 专用密钥，只能访问 Gemini 会话入口及密钥查询，不会落入 Claude、Codex 或 API 直连。当前二进制的推理桥仅验收过 Gemini API Key provider；即使 Google OAuth 已授权，`/v1/gemini/sessions` 也会返回 `gemini_runtime_not_supported`，不会分配会话或扣费。对外推理还需支持 OAuth 的载荷及逐回合可核销的官方结算；不把订阅等级、Token 数或余额变化当成实扣凭证。
+- 管理员可生成 `Gemini · CRAGAnti` 专用密钥。该密钥可列出已授权且已拉取模型的账号模型，并用 `POST /v1/gemini/sessions/:id` 或 `POST /v1/messages` 发送单条纯文本。控制面在这些账号之间调度，沿用账号绑定代理，按密钥限额计次。不会落入 Claude、Codex 或 API 直连。没有可调度账号时返回 `gemini_no_account`。
 
 ### 管理员诊断接口
 

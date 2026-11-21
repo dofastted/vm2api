@@ -302,7 +302,7 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
       </div>
       <div>
         <dt className='text-muted-foreground'>公共 API 推理</dt>
-        <dd>{environment.runtime_ready ? '就绪' : '未启用'}</dd>
+        <dd>{environment.models_discovered ? '可调度' : '先拉取模型'}</dd>
       </div>
       <div>
         <dt className='text-muted-foreground'>付费调用</dt>

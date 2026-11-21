@@ -13,10 +13,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { loadConfig, reloadActiveVm, routingConfigFile } from './lib/core/config.mjs'
+import { createGeminiScheduler } from './lib/gemini/scheduler.mjs'
 import {
+  createGeminiPublicHandler,
   createGeminiTerminal,
   geminiKeyAllowsPath,
-  handleGeminiPublic,
+  geminiProxyFor,
+  callGeminiHost,
   isGeminiPublicPath,
 } from './lib/gemini/routes.mjs'
 import {
@@ -943,6 +946,10 @@ const handleKeySelf = createKeySelfHandler({
 })
 
 const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
+  // The public handler routes `/v1/messages` itself and answers in the Anthropic
+  // shape. Rewriting req.url into the session path made the response carry
+  // `id: "messages"` and changed the path the request log attributes.
+  handleGeminiMessages: (req, res) => handleGeminiPublic(req, res),
   admitCragInference: (input) => cragSubscription.admitInference(input),
   json,
   writeSSEHeaders,
@@ -1137,6 +1144,13 @@ const handleCragShop = createCragShopHandler({
 })
 
 const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })
+const geminiScheduler = createGeminiScheduler({
+  callHost: callGeminiHost,
+  resolveProxy: (proxyId) => geminiProxyFor(proxyPool, proxyId),
+  apiKeyStore,
+  groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
+})
+const handleGeminiPublic = createGeminiPublicHandler({ json, readBody, scheduler: geminiScheduler })
 const handlePanel = createPanelHandler({
   getDb,
   cragSubscription,
@@ -1383,7 +1397,19 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
-      if (groupType === 'gemini') return json(res, 200, { object: 'list', data: [] })
+      if (groupType === 'gemini') {
+        try {
+          const catalog = await geminiScheduler.catalog()
+          return json(res, 200, { object: 'list', data: catalog.models })
+        } catch (error) {
+          return json(res, error.status || 503, {
+            error: {
+              code: error.code || 'gemini_host_unavailable',
+              message: error.message || 'Gemini host is not available.',
+            },
+          })
+        }
+      }
       if (resolveInferenceBackend(req) === 'api') {
         return json(res, 200, filterModelCatalogForKey(apiScheduler.catalog(apiScheduleScope(req, groupType)), req))
       }
@@ -1415,7 +1441,7 @@ const server = http.createServer(async (req, res) => {
 
     if (isGeminiPublicPath(p)) {
       if (!requireAuth(req, res)) return
-      return handleGeminiPublic(req, res, json)
+      return handleGeminiPublic(req, res)
     }
 
     if (req.method === 'POST' && (p === '/v1/chat/completions' || p === '/chat/completions')) {
