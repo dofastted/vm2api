@@ -1,7 +1,7 @@
 {
   "repo": "dofastted/vm2api",
   "release": "payload-2026.11.20-shared-egress",
-  "crag_release": "payload-2026.11.21-crag-3.1.11",
+  "crag_release": "payload-2026.11.21-crag-3.1.12",
   "crag_authorization": {
     "family": "crag",
     "product": "crag-v2",
@@ -148,15 +148,15 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2",
-      "asset": "crag-v2-amd64-v3.1.11-crag-v2",
+      "asset": "crag-v2-amd64-v3.1.12-crag-v2",
       "size": 894488,
-      "sha256": "6f074ab89d54f9115614efa21e275390498e78d57d42b24ca58e80bdca7fe6d6"
+      "sha256": "92d2e75813b5549fa99de06a80b9b7606e6f864b521da4b2e9254c87a61b4860"
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2.payload.enc",
-      "asset": "crag-v2-amd64-v3.1.11-crag-v2.payload.enc",
-      "size": 13226788,
-      "sha256": "124cb13b08218afb65c4f1f3b8595a153e76abc07a0a24f950c2010e87e05c6f"
+      "asset": "crag-v2-amd64-v3.1.12-crag-v2.payload.enc",
+      "size": 13234980,
+      "sha256": "73045623f28cf6717b25cd1c81b39db9a4c817cb866cf53c07ebabd0f587143e"
     },
     {
       "path": "share/crag/kernels/v2/amd64/kernel.json.example",
@@ -166,21 +166,21 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/manifest.json",
-      "asset": "crag-v2-amd64-v3.1.11-manifest.json",
+      "asset": "crag-v2-amd64-v3.1.12-manifest.json",
       "size": 2721,
-      "sha256": "433bf13fe6cd188af60e152d3a60971372cfabb11168e46641c23870269f0279"
+      "sha256": "f5c00bd6fdafd23a9ef01ba0c449177da630235121b1f96eef2dc3abb74ef670"
     },
     {
       "path": "share/crag/kernels/v2/amd64/unpack-note.md",
       "asset": "crag-v2-amd64-unpack-note.md",
-      "size": 15748,
-      "sha256": "ee7ca2fce548bc4b35ad4236c9a36d76d38e55315cb5175faec454952582e731"
+      "size": 15874,
+      "sha256": "1f5cce1c9491f03ceeeffcafa80db4bcbff8f5042fa86ef344c97bcf3b62062d"
     },
     {
       "path": "dist/crag-v2-licensed-amd64.tar.gz",
       "asset": "crag-v2-licensed-amd64.tar.gz",
-      "size": 171061071,
-      "sha256": "ad1cdc6483f71e5c47eb0fa7abb2d1486e19ee705640d6be5139566d1a1db602"
+      "size": 171069832,
+      "sha256": "222a323858fe60f4092f10ebbef391db86e9cbb14212199578303a33e9ce1eba"
     }
   ]
 }

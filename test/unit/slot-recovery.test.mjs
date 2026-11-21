@@ -580,3 +580,27 @@ test('a relay whose socket file vanished is dead until restarted', async () => {
     await relay.stop()
   }
 })
+
+test('bridge healer waits for an async liveness answer before deciding (#1495)', async () => {
+  // The default probe runs `docker inspect`, which blocked the event loop once
+  // per bound proxy every watchdog tick and got amplified into false direct-link
+  // failures. Awaiting it means a promise must be resolved, not just truthy.
+  const started = []
+  const heal = createSlotBridgeHealer({
+    projectRoot: '/unused',
+    minIntervalMs: 60_000,
+    now: () => 0,
+    logger: quiet,
+    ops: {
+      getVm: () => ({ id: 'vm-a', proxy: SOCKS }),
+      egressAlive: async () => false,
+      ensureProxyEgress: (proxy) => {
+        started.push(proxy.id)
+        return { ok: true }
+      },
+      cluster: () => null,
+    },
+  })
+  await heal([{ id: 'vm-a', status: 'running' }])
+  assert.deepEqual(started, ['px-a'], 'a pending promise is truthy; the answer has to be awaited')
+})

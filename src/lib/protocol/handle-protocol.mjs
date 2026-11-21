@@ -97,7 +97,7 @@ import {
 import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { canReuseCanonicalHistory } from './sanitize.mjs'
-import { relocateThirdPartySystem, thirdPartyRelocateEnabled } from './third-party-system.mjs'
+import { hasForeignSystemBlock, relocateThirdPartySystem, thirdPartyRelocateEnabled } from './third-party-system.mjs'
 import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
 import {
   callerCwdDeclaration,
@@ -1497,15 +1497,23 @@ export function createHandleProtocol(deps) {
       inferenceBackend !== 'api' &&
       !requestContext &&
       !officialPassthrough &&
-      !officialTraffic &&
+      (!officialTraffic || hasForeignSystemBlock(ctx.body.system)) &&
       thirdPartyRelocateEnabled(getRouting())
     ) {
-      const relocated = relocateThirdPartySystem(ctx.body)
+      // Official traffic only gets here because the gate found a positively
+      // foreign block, so move just that block: the real official envelope has
+      // standalone harness/boundary/guidance blocks that the greedy predicate
+      // would strip along with it.
+      const relocated = relocateThirdPartySystem(ctx.body, { onlyForeign: officialTraffic === true })
       if (relocated.moved) {
         // A CRAG hop sends cragSystem (the caller system without its <cwd>
         // declaration) instead of personaIn.system. Relocate that projection
         // too, or the hop would put the third-party prompt back into system.
-        if (hasCragSystem) cragRelocated = relocateThirdPartySystem({ ...ctx.body, system: cragSystem }).body
+        if (hasCragSystem)
+          cragRelocated = relocateThirdPartySystem(
+            { ...ctx.body, system: cragSystem },
+            { onlyForeign: officialTraffic === true },
+          ).body
         ctx.body = relocated.body
       }
     }
@@ -2075,6 +2083,7 @@ export function createHandleProtocol(deps) {
               vmId: selected.vmId,
               accountId: selected.accountId,
               requestId: logCtx.request_id,
+              ctx: bodyCtx,
             })
             logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
             return {
@@ -2165,6 +2174,7 @@ export function createHandleProtocol(deps) {
             vmId: selected.vmId,
             accountId: selected.accountId,
             requestId: logCtx.request_id,
+            ctx: bodyCtx,
           })
           logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(outbound) || attemptSessionId)
           return {

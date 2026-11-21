@@ -308,7 +308,11 @@ test('resolveSlotState paints a spent kernel-recovery budget as 受限 · 内核
     now,
   })
   assert.equal(seats.schedule_state, 'restricted')
-  assert.equal(seats.restriction_reason, 'kernel_faulted', 'the kernel fault is the stronger verdict: seated or not, the CLI is down')
+  assert.equal(
+    seats.restriction_reason,
+    'kernel_faulted',
+    'the kernel fault is the stronger verdict: seated or not, the CLI is down',
+  )
 })
 
 test('resolveSlotState does not call a down slot 调度开', () => {
@@ -356,4 +360,33 @@ test('host memory pressure stays on the host, not on each slot', async (t) => {
   // Admission already filters by host memory in pool-scheduler; the slot row must not inherit it.
   assert.equal(resolveSlotState({ vm: { schedulable: true } }).schedule_state, 'on')
   assert.equal(resolveSlotState({ vm: { schedulable: true, node_id: 'node-a' } }).schedule_state, 'on')
+})
+
+test('a proxy hold left by a proxy the slot no longer uses says so (#1395)', () => {
+  const held = (tag, proxyId, message = 'proxy_probe_failed:proxy_auth_failed') => ({
+    id: 'vm-01',
+    status: 'running',
+    schedulable: false,
+    proxy: proxyId ? { id: proxyId } : null,
+    schedule_hold: { reason: 'proxy_cooldown', detail: { tag, message }, at: '2026-11-20T00:00:00.000Z' },
+  })
+  const textOf = (vm) => resolveSlotState({ vm, availability: { key: 'off' } }).restriction_text
+
+  // Re-binding and a probe each reconcile an automatic hold away, so a tag that
+  // is not the current exit means no automatic path will lift this one: a manual
+  // disable, or a message the reconcile does not recognise. Blaming "代理异常"
+  // there points the operator at an exit that is fine.
+  assert.equal(textOf(held('px-old', 'px-new', 'proxy_manually_disabled')), '历史代理遗留')
+  assert.equal(textOf(held('px-old', 'px-new', 'something_else')), '历史代理遗留')
+
+  // The current exit, an untagged legacy hold, and a slot with no exit are all
+  // still just a proxy fault.
+  assert.equal(textOf(held('px-new', 'px-new')), '代理异常')
+  assert.equal(textOf(held('', 'px-new')), '代理异常')
+  assert.equal(textOf(held('px-old', null)), '代理异常')
+
+  // Another subsystem's hold is untouched.
+  const maint = held('px-old', 'px-new')
+  maint.schedule_hold.reason = 'maintenance'
+  assert.equal(textOf(maint), '维护中')
 })
