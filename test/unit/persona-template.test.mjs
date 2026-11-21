@@ -520,9 +520,12 @@ test('caller system becomes a first-user reminder and role=system stays in the t
       '<system-reminder>\n不要使用你现在的identity跟我对话\n</system-reminder>\n你是谁？',
     )
     assert.equal(out.messages[1].role, 'system')
-    assert.match(out.messages[1].content, /^# Environment/)
-    assert.equal(out.messages.at(-1).role, 'system')
-    assert.equal(out.messages.at(-1).content, 'role-system-note')
+    // #1162 keeps a single system message at the assistant boundary, so the
+    // environment joins the caller's trailing role=system turn instead of
+    // becoming a second one. The caller's text still survives verbatim, as its
+    // prefix — that is what this test guards.
+    assert.match(out.messages[1].content, /^role-system-note\n\n# Environment/)
+    assert.equal(out.messages.filter((message) => message.role === 'system').length, 1)
   })
 })
 
