@@ -624,3 +624,51 @@ test('persona Environment injection does not break the prefix when each turn end
     history.push({ role: 'assistant', content: [{ type: 'text', text: `answer ${turn}` }] })
   }
 })
+
+test('the continuity diagnostic reuses the request body digests (#1497)', async () => {
+  const { createRequestBodyContext, requestBodyContextStats, resetRequestBodyContextStats } = await import(
+    '../../src/lib/protocol/request-body-context.mjs'
+  )
+  const inbound = body('you are a cli', 'turn one', 'answer one', 'turn two')
+  // The outbound body shares the untouched messages and rewrites the system
+  // block, which is what the gateway's persona injection does.
+  const outbound = { ...inbound, system: [{ type: 'text', text: 'you are claude code' }] }
+
+  const misses = () => requestBodyContextStats.valueDigestMisses + requestBodyContextStats.messageIdentityMisses
+  // Without a context `snapshotBody` hashes directly and the counters never see
+  // it, so the only meaningful probe is whether the work routes through the
+  // context and whether a second pass over the same bodies is free.
+  const ctx = createRequestBodyContext(inbound)
+  resetRequestBodyContextStats()
+  firstHistoryDiff(inbound, outbound, { ctx })
+  const cold = misses()
+  resetRequestBodyContextStats()
+  firstHistoryDiff(inbound, outbound, { ctx })
+  const warm = misses()
+  assert.ok(cold > 0, 'the diagnostic must hash through the request context')
+  // Not zero: the context memoizes the tools/system digests and each message's
+  // identity, while `messageRecord`'s part and valueStamp digests are rebuilt.
+  assert.ok(warm < cold, `a second pass must reuse the warmed digests, saw ${warm} of ${cold}`)
+  resetRequestBodyContextStats()
+})
+
+test('passing a body context never changes the reported break (#1497)', async () => {
+  const { createRequestBodyContext } = await import('../../src/lib/protocol/request-body-context.mjs')
+  const base = body('you are a cli', 'turn one', 'answer one', 'turn two')
+  const shapes = {
+    identical: { ...base },
+    system: { ...base, system: [{ type: 'text', text: 'rewritten' }] },
+    tools: { ...base, tools: [{ name: 'Read' }, { name: 'Write' }] },
+    'message text': { ...base, messages: base.messages.map((m, i) => (i ? m : { ...m, content: 'edited' })) },
+    'message count': { ...base, messages: base.messages.slice(0, 2) },
+    'message structure': {
+      ...base,
+      messages: base.messages.map((m, i) => (i ? m : { ...m, content: [{ type: 'text', text: 'turn one' }] })),
+    },
+    'tools and system': { ...base, tools: [{ name: 'Bash' }], system: [{ type: 'text', text: 'rewritten' }] },
+  }
+  for (const [label, outbound] of Object.entries(shapes)) {
+    const ctx = createRequestBodyContext(base)
+    assert.deepEqual(firstHistoryDiff(base, outbound, { ctx }), firstHistoryDiff(base, outbound), label)
+  }
+})

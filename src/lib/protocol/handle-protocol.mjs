@@ -2071,6 +2071,7 @@ export function createHandleProtocol(deps) {
               vmId: selected.vmId,
               accountId: selected.accountId,
               requestId: logCtx.request_id,
+              ctx: bodyCtx,
             })
             logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
             return {
@@ -2161,6 +2162,7 @@ export function createHandleProtocol(deps) {
             vmId: selected.vmId,
             accountId: selected.accountId,
             requestId: logCtx.request_id,
+            ctx: bodyCtx,
           })
           logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(outbound) || attemptSessionId)
           return {
