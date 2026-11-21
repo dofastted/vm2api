@@ -139,6 +139,9 @@ export async function runGuestOAuthAuthService(
       // The worker config (`worker.json`) carries vm_id/proxy_url/egress_mode and
       // is what `kin-worker oauth session-code` needs; the kernel config does not.
       KIN_WORKER_CONFIG: '/run/kin/worker.json',
+      // 'local' retries the browser stage on the local egress when the bound
+      // proxy is invalid; anything else reports proxy_invalid to the panel.
+      KIN_OAUTH_PROXY_FALLBACK: String(process.env.KIN_OAUTH_PROXY_FALLBACK || ''),
       KERNEL_CONFIG: '/run/kin/kernel.json',
       HTTP_PROXY: '',
       HTTPS_PROXY: '',
