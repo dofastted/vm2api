@@ -1,7 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
-import { canReloadRemoteEgress, canReuseRemoteEgress, remoteEgressContainer } from '../../src/lib/cluster/remote-slot.mjs'
+import {
+  canReloadRemoteEgress,
+  canReuseRemoteEgress,
+  remoteEgressContainer,
+} from '../../src/lib/cluster/remote-slot.mjs'
 
 const base = {
   vmId: 'vm-01',

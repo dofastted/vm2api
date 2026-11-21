@@ -547,15 +547,14 @@ const vmTestSchedule = new VmTestScheduleRunner({
       if (!vm) return { hasCredential: false, schedulable: false, windowLive: false }
       const hasCredential = !!(vm.has_token || vm.claude?.has_access || vm.codex?.has_access)
       const schedulable = vm.schedulable !== false
-      const acc = accountQuota?.snapshot?.().accounts?.find(
-        (row) => row.vm_id === vmId || row.account_id === (vm.claude?.account_uuid || vm.account_uuid),
-      )
+      const acc = accountQuota
+        ?.snapshot?.()
+        .accounts?.find((row) => row.vm_id === vmId || row.account_id === (vm.claude?.account_uuid || vm.account_uuid))
       if (!acc) return { hasCredential, schedulable, windowLive: false }
       const w5 = acc.unified?.headers?.['5h'] || acc.unified?.['5h'] || {}
       const resetMs = parseResetMs(w5.reset)
       const windowLive =
-        extraIsLiveOpen(w5) ||
-        (Number.isFinite(resetMs) && resetMs > Date.now() && Number(w5.utilization) > 0)
+        extraIsLiveOpen(w5) || (Number.isFinite(resetMs) && resetMs > Date.now() && Number(w5.utilization) > 0)
       return { hasCredential, schedulable, windowLive }
     } catch {
       return null
@@ -565,9 +564,9 @@ const vmTestSchedule = new VmTestScheduleRunner({
     try {
       const vm = getVm(cfg.paths.project, vmId)
       if (!vm) return null
-      const acc = accountQuota?.snapshot?.().accounts?.find(
-        (row) => row.vm_id === vmId || row.account_id === (vm.claude?.account_uuid || vm.account_uuid),
-      )
+      const acc = accountQuota
+        ?.snapshot?.()
+        .accounts?.find((row) => row.vm_id === vmId || row.account_id === (vm.claude?.account_uuid || vm.account_uuid))
       const w5 = acc?.unified?.headers?.['5h'] || acc?.unified?.['5h'] || {}
       const resetMs = parseResetMs(w5.reset)
       return Number.isFinite(resetMs) ? resetMs : null
