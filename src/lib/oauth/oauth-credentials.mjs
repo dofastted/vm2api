@@ -860,6 +860,21 @@ export function refreshErrorCodeOf(result) {
   return code || 'credential_refresh_failed'
 }
 
+/**
+ * A slot was parked as `worker_upgrade_required` because its node's worker could not guard refresh retries.
+ * Once that worker is replaced, drop exactly that code so the normal guarded refresh can run again.
+ */
+export function clearUpgradeRequired(vmPath) {
+  if (!vmPath || !fs.existsSync(vmPath)) return false
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  if (vm?.claude?.refresh_error !== 'worker_upgrade_required') return false
+  vm.claude = stripCredentialSecrets({ ...vm.claude })
+  vm.claude.refresh_error = null
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(vmPath, vm, { mode: 0o600 })
+  return true
+}
+
 /** Persist a fatal/failed refresh onto vm.json. Dead tickets leave the pool even if 调度 was manually on. */
 export function markVmRefreshError(vmPath, result) {
   if (!vmPath || !fs.existsSync(vmPath)) return null

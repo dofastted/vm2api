@@ -121,12 +121,17 @@ import {
 import {
   PROACTIVE_REFRESH_SKEW_MS,
   classifyCredentialRefresh,
+  clearUpgradeRequired,
   markVmRefreshError,
   refreshErrorCodeOf,
   mirrorWorkerCredentialsToVm,
 } from './lib/oauth/oauth-credentials.mjs'
 import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
-import { ensureWorkerCredential, repairLocalCredentialLink } from './lib/transport/go-worker-client.mjs'
+import {
+  ensureWorkerCredential,
+  probeWorkerAttemptGuard,
+  repairLocalCredentialLink,
+} from './lib/transport/go-worker-client.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
 import { corsHeadersForRequest } from './lib/http/cors.mjs'
@@ -590,6 +595,15 @@ credentialRefreshMonitor = createCredentialRefreshMonitor({
       } catch {}
       return { ...vm, last_probe: lastProbe }
     }),
+  reviveOne: async (vm) => {
+    const vmPath = path.join(cfg.paths.project, 'vms', `${vm.id}.json`)
+    const homeDir = path.join(cfg.paths.project, 'vms', vm.id, 'cli-home')
+    const exec = { vmId: vm.id, vmPath, homeDir, vm: getVm(cfg.paths.project, vm.id) || vm }
+    if (!(await probeWorkerAttemptGuard(exec))) return { revived: false }
+    const cleared = clearUpgradeRequired(vmPath)
+    if (cleared) invalidateLiveCredentialCache()
+    return { revived: cleared }
+  },
   refreshOne: (vm) =>
     refreshWorkerCredentialForVm({
       vmId: vm.id,

@@ -8,7 +8,16 @@ import { slotExecArgv } from '../vm/slot-exec.mjs'
 
 const WORKER_CONFIG = '/run/kin/worker.json'
 const WORKER_BIN = '/usr/local/bin/kin-worker'
-const OPS = new Set(['refresh', 'usage', 'profile', 'models', 'count-tokens', 'reset-status', 'reset-redeem'])
+const OPS = new Set([
+  'refresh',
+  'usage',
+  'profile',
+  'models',
+  'count-tokens',
+  'reset-status',
+  'reset-redeem',
+  'guard-probe',
+])
 
 function failure(code, message = undefined) {
   const error = { code }
@@ -107,6 +116,20 @@ function lastJsonLine(stdout) {
     return JSON.parse(lines.at(-1))
   } catch {
     return null
+  }
+}
+
+/**
+ * Does the worker on this node keep the refresh attempt journal? Asked with an operation that reads no
+ * config, no credential and does not touch the network. A worker built before the journal does not know
+ * it and answers invalid_arguments, so only an explicit yes counts.
+ */
+export async function probeAttemptGuard(exec, opts = {}) {
+  try {
+    const result = await runSlotOauth(exec, 'guard-probe', { timeoutMs: 15000, ...opts })
+    return result?.ok === true && result?.body?.attempt_guard === true
+  } catch {
+    return false
   }
 }
 

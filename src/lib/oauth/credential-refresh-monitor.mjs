@@ -91,6 +91,11 @@ export function needsScheduledRefresh(vm, now = Date.now(), skewMs = PROACTIVE_R
   return needsRefresh(vm?.expires_at || vm?.claude?.expires_at, now, skewMs)
 }
 
+/** Parked because the node's worker could not guard refresh retries; only a worker upgrade ends that. */
+export function isUpgradeParked(vm) {
+  return [vm?.refresh_error, vm?.claude?.refresh_error].includes('worker_upgrade_required')
+}
+
 /**
  * Local Claude slots whose `.credentials.json` alias must stay a symlink. The CLI
  * saves by write-then-rename, which turns the alias back into a regular file;
@@ -151,6 +156,20 @@ export function createCredentialRefreshMonitor(opts = {}) {
           }
         })
       }
+      // Slots parked on an old worker: ask the node whether it has been upgraded. A yes clears the park and
+      // the next pass refreshes through the guarded path; nothing is sent to the upstream here.
+      const revived = []
+      if (typeof opts.reviveOne === 'function') {
+        const waiting = vms.filter((vm) => isCredentialRefreshTarget(vm) && isUpgradeParked(vm))
+        await mapPool(waiting, config.concurrency, async (vm) => {
+          try {
+            const result = await opts.reviveOne(vm)
+            if (result?.revived) revived.push(vm.id)
+          } catch {
+            /* probe failed: stay parked, try again next pass */
+          }
+        })
+      }
       const linkFailures = []
       if (opts.ensureLocalLink) {
         // Refresh above relinks the slots it touched; this keeps idle slots on one store too.
@@ -185,6 +204,7 @@ export function createCredentialRefreshMonitor(opts = {}) {
         at: new Date(nowFn()).toISOString(),
         duration_ms: nowFn() - started,
         due: due.length,
+        revived,
         link_failures: linkFailures,
         items,
       }

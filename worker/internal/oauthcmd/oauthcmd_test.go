@@ -325,3 +325,25 @@ func TestAttemptGuardFlagAndUnknownOutcome(t *testing.T) {
 		t.Fatalf("an upstream rejection keeps its existing code, got %q", got)
 	}
 }
+
+// The control plane uses this to learn, without touching any token or the network, whether a
+// node's worker keeps the refresh-attempt journal. An older worker has no such operation (and
+// rejects --attempt-guard) so it answers invalid_arguments instead.
+func TestGuardProbeReportsJournalSupportWithoutConfigOrNetwork(t *testing.T) {
+	var out bytes.Buffer
+	code := Run([]string{"guard-probe", "--config", "/definitely/not/there.json"}, strings.NewReader(""), &out)
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out.String())
+	}
+	var response struct {
+		OK     bool           `json:"ok"`
+		Status int            `json:"status"`
+		Body   map[string]any `json:"body"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatalf("decode %q: %v", out.String(), err)
+	}
+	if !response.OK || response.Status != 200 || response.Body["attempt_guard"] != true {
+		t.Fatalf("unexpected probe answer: %s", out.String())
+	}
+}

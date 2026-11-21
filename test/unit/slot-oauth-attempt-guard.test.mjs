@@ -96,3 +96,35 @@ test('an unknown refresh outcome is parked for re-authorization, never retried a
   assert.equal(needsScheduledRefresh({ ...expired, claude: { refresh_error: 'worker_output_invalid' } }), true)
   assert.equal(needsScheduledRefresh({ ...expired, claude: { refresh_error: 'invalid_grant' } }), false)
 })
+
+test('guard probe asks the node worker, never refreshes, and only an explicit yes counts', async () => {
+  const { probeAttemptGuard } = await import('../../src/lib/transport/slot-oauth.mjs')
+  const seen = []
+  const answer =
+    (stdout, extra = {}) =>
+    async (argv) => {
+      seen.push(argv)
+      return { code: 0, stdout, stderr: '', timed_out: false, ...extra }
+    }
+  const yes = '{"ok":true,"status":200,"body":{"attempt_guard":true},"headers":{}}'
+  assert.equal(await probeAttemptGuard(exec, { runDocker: answer(yes) }), true)
+  assert.ok(seen[0].includes('guard-probe'))
+  assert.ok(!seen[0].includes('refresh') && !seen[0].includes('--force'))
+  // A worker without the journal does not know the operation.
+  assert.equal(await probeAttemptGuard(exec, { runDocker: answer(invalidArguments) }), false)
+  // Anything other than a clear yes leaves the slot parked.
+  assert.equal(
+    await probeAttemptGuard(exec, { runDocker: answer('{"ok":true,"status":200,"body":{},"headers":{}}') }),
+    false,
+  )
+  assert.equal(await probeAttemptGuard(exec, { runDocker: answer('', { code: null, timed_out: true }) }), false)
+  assert.equal(await probeAttemptGuard(exec, { runDocker: answer('not json') }), false)
+  assert.equal(
+    await probeAttemptGuard(exec, {
+      runDocker: async () => {
+        throw new Error('docker gone')
+      },
+    }),
+    false,
+  )
+})
