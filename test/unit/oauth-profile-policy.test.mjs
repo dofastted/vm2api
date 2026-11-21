@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { FULL_OAUTH_SCOPE, SETUP_TOKEN_TTL_SECONDS } from '../../src/lib/oauth/oauth-contract.mjs'
+import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
 import {
   OAUTH_CAPABILITIES,
   expiresInForProfile,
@@ -14,12 +14,12 @@ test('normal login keeps the full scope and sends no lifetime', () => {
   assert.equal(expiresInForProfile('oauth'), undefined)
 })
 
-test('setup token shares the login scope and asks for a year', () => {
-  // Identity (profile/roles/bootstrap) needs user:profile, so the mint is not
-  // narrowed; the only difference is the one-year lifetime.
+test('setup token runs the README flow: login scope, no lifetime requested', () => {
+  // Identity (profile/roles/bootstrap) needs user:profile, and the minted token
+  // is the upstream's short-lived one — a long-lived token is not fabricated.
   assert.equal(profilePolicy('setup-token').scope, FULL_OAUTH_SCOPE)
   assert.equal(scopeForProfile('setup-token'), FULL_OAUTH_SCOPE)
-  assert.equal(expiresInForProfile('setup-token'), SETUP_TOKEN_TTL_SECONDS)
+  assert.equal(expiresInForProfile('setup-token'), undefined)
 })
 
 test('a caller may narrow the login scope but never change the mint', () => {
@@ -37,5 +37,5 @@ test('unknown profiles fall back to the normal login', () => {
 })
 
 test('capabilities name every behavior the e2e probes', () => {
-  assert.deepEqual([...OAUTH_CAPABILITIES], ['session-code-bridge', 'setup-token-long-lived', 'proxy-fallback-local'])
+  assert.deepEqual([...OAUTH_CAPABILITIES], ['session-code-bridge', 'setup-token-short-lived', 'proxy-fallback-local'])
 })

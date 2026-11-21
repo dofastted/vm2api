@@ -31,6 +31,33 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
   const binary =
     process.env.KIN_TEST_OAUTH_AUTH_BIN || fileURLToPath(new URL('../../bin/kin-oauth-auth', import.meta.url))
   fs.accessSync(binary, fs.constants.X_OK)
+  // A released helper advertises what it implements; a PR that changes policy
+  // must not turn CI red before the binary carrying it exists. Probed straight
+  // from the binary: runGuestOAuthAuthService only returns credential payloads.
+  const capabilities = await new Promise((resolve) => {
+    const child = spawn(binary, [], { env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 })
+    let out = ''
+    child.stdout.on('data', (chunk) => {
+      out += chunk.toString('utf8')
+    })
+    child.on('error', () => resolve([]))
+    child.on('close', () => {
+      try {
+        const line = out
+          .split(/\r?\n/)
+          .map((value) => value.trim())
+          .filter(Boolean)
+          .at(-1)
+        resolve(JSON.parse(line || '{}')?.credential?.capabilities || [])
+      } catch {
+        resolve([])
+      }
+    })
+    child.stdin.end('{"operation":"capabilities"}\n')
+  })
+  // Two binary generations are in the wild: the released one still asks for a
+  // one-year mint, the current source asks for nothing (short-lived oauth).
+  const mintsYear = capabilities.includes('setup-token-long-lived')
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-authorize-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   t.after(resetAuthUrlSessions)
@@ -352,7 +379,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       assert.equal(token.payload.grant_type, 'authorization_code')
       assert.equal(token.payload.client_id, CLIENT_ID)
       assert.equal(token.headers.cookie, undefined)
-      assert.equal(token.payload.expires_in, setup ? SETUP_TOKEN_TTL_SECONDS : undefined)
+      assert.equal(token.payload.expires_in, mintsYear && setup ? SETUP_TOKEN_TTL_SECONDS : undefined)
       assert.equal(token.headers['user-agent'], 'axios/1.15.2')
       assert.equal(token.headers['sec-ch-ua'], undefined)
       assert.equal(profile.headers.authorization, `Bearer ${accessToken}`)
@@ -379,31 +406,6 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
     })
   }
   assert.equal(tokenRequests, 3)
-  // A released helper advertises what it implements; a PR that changes policy
-  // must not turn CI red before the binary carrying it exists. Probed straight
-  // from the binary: runGuestOAuthAuthService only returns credential payloads.
-  const capabilities = await new Promise((resolve) => {
-    const child = spawn(binary, [], { env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 })
-    let out = ''
-    child.stdout.on('data', (chunk) => {
-      out += chunk.toString('utf8')
-    })
-    child.on('error', () => resolve([]))
-    child.on('close', () => {
-      try {
-        const line = out
-          .split(/\r?\n/)
-          .map((value) => value.trim())
-          .filter(Boolean)
-          .at(-1)
-        resolve(JSON.parse(line || '{}')?.credential?.capabilities || [])
-      } catch {
-        resolve([])
-      }
-    })
-    child.stdin.end('{"operation":"capabilities"}\n')
-  })
-  const longLived = capabilities.includes('setup-token-long-lived')
   for (const runtimeMode of ['oauth', 'setup-token']) {
     await t.test(`session cookie: ${runtimeMode}`, async () => {
       const requestStart = requests.length
@@ -415,7 +417,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       })
       assert.equal(credential.access_token, accessToken)
       assert.equal(credential.refresh_token, refreshToken)
-      const minted = longLived && runtimeMode === 'setup-token'
+      const minted = runtimeMode === 'setup-token'
       // Both paths ask for the login scope; only the mint carries a lifetime.
       assert.equal(credential.scope, FULL_OAUTH_SCOPE)
       assert.equal(credential.type, runtimeMode)
@@ -455,7 +457,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       )
       assert.equal(token.headers['user-agent'], 'axios/1.15.2')
       assert.equal(token.headers['sec-ch-ua'], undefined)
-      assert.equal(token.payload.expires_in, minted ? SETUP_TOKEN_TTL_SECONDS : undefined)
+      assert.equal(token.payload.expires_in, mintsYear && minted ? SETUP_TOKEN_TTL_SECONDS : undefined)
       assert.equal(profile.headers['user-agent'], `claude-code/${OFFICIAL_CLI_VERSION}`)
       assert.match(evalBefore.payload.attributes.sdkCachePartition, /^served-to-bearer:/)
       assert.equal(roles.headers['content-type'], undefined)
