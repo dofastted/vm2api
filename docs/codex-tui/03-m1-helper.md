@@ -67,3 +67,21 @@ codex 出口即切换为真实 CLI 的 TLS/身份/行为特征；socket 契约�
 - 共享 CODEX_HOME 的 refresh token 轮换存在竞态窗口（M2：按
   `last_refresh` 漂移检测后序列化重注入）。
 - 未做真实 `codex` + 真实账号冒烟（需要 ChatGPT 凭证；测试钩子已就绪）。
+
+## M2a：进程池（替代「每请求一进程」）
+
+- `codex-work/proc-<n>`：worker 常驻，每 worker 一个固定 cwd；rollout
+  按 `session_meta.cwd == dir` 关联一次后按字节偏移增量尾随。
+- 逻辑会话隔离：复用 worker 时先 `/new`（slash 命令，见
+  `tui/src/slash_command.rs`）开新 thread —— 第二个 vm2api 会话不继承
+  前一个的上下文；新 thread 产生新 rollout 文件，按 modtime 重新关联。
+- `session_id`/`previous_response_id` 亲和：请求带已知 sid 直接路由到
+  持有该会话的 worker；未知 sid 起 `codex resume <id>` 专用 worker
+  （`codex-work/resume-<sid>`，也计入池容量）。
+- 池满时驱逐「idle 且 model 不匹配」的 worker，再驱逐任意 idle；
+  全部 busy → `overloaded_error`（控制面语义不变）。
+- 死 worker 惰性剔除并在下一次 acquire 补位；`Shutdown` 停全池。
+- 超时语义变化：turn 超时 `Esc` 中断 turn 但**进程保留在池内**
+  （`--no-daemon` 内嵌后端保证 kill 仍等价杀 turn）。
+- `/model` 是交互式选择器不能传参 → 池按 spawn 时 `-m` 分池，
+  模型不匹配优先驱逐重 spawn。

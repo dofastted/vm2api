@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -139,6 +140,30 @@ func tailRollout(path string, off int64, onLine func(rolloutLine) bool) (int64, 
 func fileOffset(f *os.File, r *bufio.Reader) int64 {
 	pos, _ := f.Seek(0, 1)
 	return pos - int64(r.Buffered())
+}
+
+// tailOf returns the last ~60 runes of s, matching the suffix the TUI shows
+// as the pasted-text echo for long prompts.
+func tailOf(s string) string {
+	r := []rune(s)
+	if len(r) <= 60 {
+		return s
+	}
+	return string(r[len(r)-60:])
+}
+
+// sanitize keeps alnum/_/- so a session or request id can be a dir name.
+func sanitize(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "x"
+	}
+	return b.String()
 }
 
 // listRolloutFiles is a test/debug helper: all rollout files by mod time.

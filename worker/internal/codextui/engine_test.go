@@ -73,12 +73,46 @@ func TestRunTurnEndToEndWithFakeCodex(t *testing.T) {
 
 func TestOverloadedReturnsQueueFull(t *testing.T) {
 	cfg := &Config{MaxParallel: 1}
-	_ = cfg
-	e := &Engine{cfg: cfg, sem: make(chan struct{}, 1), cancels: map[string]context.CancelFunc{}}
-	e.sem <- struct{}{}
+	e := NewEngine(cfg)
+	e.workers = []*worker{{busy: true}} // pool full, the one worker is busy
 	err := e.RunTurn(context.Background(), &envelope{RequestID: "x"}, func(string, any) {})
 	if err != errOverloaded {
 		t.Fatalf("want overloaded, got %v", err)
 	}
 	fmt.Sscan("") // silence
+}
+
+func TestPoolReuseAndSessionAffinity(t *testing.T) {
+	e := NewEngine(&Config{MaxParallel: 2, WorkspaceRoot: t.TempDir()})
+
+	w1, spawn, err := e.acquire(&envelope{RequestID: "a"}, "m1")
+	if err != nil || !spawn {
+		t.Fatalf("first acquire: spawn=%v err=%v", spawn, err)
+	}
+	e.release(w1) // released workers are alive only if a tui runs; dead → dropped
+	if len(e.workers) != 0 {
+		t.Fatalf("dead worker should be dropped, got %d", len(e.workers))
+	}
+
+	// Fake a live worker with a session, then confirm affinity.
+	w := &worker{dir: "d", sessionID: "sess-1", t: &tui{done: make(chan struct{})}}
+	e.workers = []*worker{w}
+	e.sessions["sess-1"] = w
+	got, spawn, err := e.acquire(&envelope{RequestID: "b", Session: struct {
+		SessionID          string `json:"session_id"`
+		PreviousResponseID string `json:"previous_response_id"`
+	}{SessionID: "sess-1"}}, "other")
+	if err != nil || spawn || got != w {
+		t.Fatalf("affinity acquire: w=%p spawn=%v err=%v", got, spawn, err)
+	}
+	w.busy = false
+
+	// Unknown session reserves a `codex resume` worker.
+	rw, spawn, err := e.acquire(&envelope{RequestID: "c", Session: struct {
+		SessionID          string `json:"session_id"`
+		PreviousResponseID string `json:"previous_response_id"`
+	}{SessionID: "sess-9"}}, "m1")
+	if err != nil || !spawn || rw.resumeID != "sess-9" {
+		t.Fatalf("resume acquire: spawn=%v resume=%q err=%v", spawn, rw.resumeID, err)
+	}
 }

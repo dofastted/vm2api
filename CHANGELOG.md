@@ -3496,3 +3496,9 @@ gateway-worker 对齐源仓：local_cli 走 wrap CLI，不再 HTTP hop 到 Anthr
 - 文档：技术路线图、部署说明、版本构建
 
 交流：[t.me/VM2API](https://t.me/VM2API)
+
+## devin/codex-tui — M2a — 2026-11-21
+
+- `codex-tui-helper` 引擎改为进程池：常驻 TUI worker、`/new` 逻辑会话隔离、`codex resume <id>` 会话恢复、model 分池驱逐、超时 Esc 中断保进程
+- 重命名 `kin-codex-tui` → `codex-tui-helper`，env `CODEX_TUI_*`
+- spawn 透传 `TZ`/`LC_*`（GeoIP 一致性）

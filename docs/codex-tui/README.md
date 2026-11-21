@@ -24,4 +24,5 @@ codex 企业级防封二开的唯一权威文档目录。**规则：每个迭代
 |---|---|---|---|
 | 0 | 2026-11-21 | 差距分析 + RFC-01 总体架构定稿 | 01/02 新建，v0.1 |
 | 1 | 2026-11-21 | M1：worker/internal/codextui + cmd/codex-tui-helper；supervisor 增加 CODEX_TUI_BIN/同级查找切换；单测 + fake-codex 端到端冒烟通过 | 03 新建 |
+| 2a | 2026-11-21 | M2a：TUI 进程池——常驻 worker + `/new` 会话隔离 + session 亲和 + `codex resume` 兜底；turn 超时 Esc 中断保进程；按 model 分池驱逐 | 03 追加 |
 | 1a | 2026-11-21 | 对照 openai/codex 最新源码（ddfaef9）复核：修正 rollout 类型为 `token_usage_record`（usage 嵌套 payload.usage）、补 `stream_error` 终态、spawn 加 `--no-daemon`（新版 TUI 默认探测共享 app-server daemon，内嵌后端保证进程级 kill 语义）；确认 `›` composer、`[Pasted` chip、`codex resume <id>`+标志合并、auth.json 结构、project trust 祖先查找 | 03 修订 |
