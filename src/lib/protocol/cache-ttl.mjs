@@ -116,6 +116,47 @@ export function validateCacheBreakpoints(body) {
 }
 
 /**
+ * Claude Code 2.1.328+ asks for automatic caching with a top-level
+ * `cache_control`. Our kernels read block markers only, so convert it to the
+ * standard shape: the same policy on the current message tail.
+ *
+ * The conversion is count neutral — the root marker becomes a block marker, it
+ * is not added alongside one — so a body that was inside the four-breakpoint
+ * budget stays inside it. Validation is the caller's business: a native
+ * passthrough validates the caller's markers first, while a hop that rewrites
+ * system blocks must not be judged on markers it is about to drop.
+ *
+ * Safe to call on any body: one without the field is returned unchanged.
+ */
+export function materializeAutomaticCache(body) {
+  if (!body || typeof body !== 'object') return body
+  if (!Object.prototype.hasOwnProperty.call(body, 'cache_control')) return body
+  const { cache_control: control, ...out } = body
+  if (!control || typeof control !== 'object') return out
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (!message || typeof message !== 'object') continue
+    // Supported mid-conversation system turns are also in the cache prefix.
+    // Skipping them could put this 5m marker before their explicit 1h marker.
+    const content = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content
+    if (!Array.isArray(content)) continue
+    for (let j = content.length - 1; j >= 0; j--) {
+      const block = content[j]
+      if (!block || ['thinking', 'redacted_thinking'].includes(block.type)) continue
+      // An explicit tail policy already caches the entire eligible prefix.
+      if (block.cache_control != null) return out
+      const next = content.slice()
+      next[j] = { ...block, cache_control: { ...control } }
+      out.messages = messages.slice()
+      out.messages[i] = { ...message, content: next }
+      return out
+    }
+  }
+  return out
+}
+
+/**
  * Only call for a rewritten native body: every surviving marker is Node-owned.
  * Explicit TTLs stay. A missing TTL takes `ttl`, or 5m once a short marker
  * precedes it, so filling never puts a 1h after a 5m. Anthropic reads tools,

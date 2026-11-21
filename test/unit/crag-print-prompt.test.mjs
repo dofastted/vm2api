@@ -645,3 +645,62 @@ test('summary cleanup turns ToolSearch tool_reference results into text', () => 
   // Outside a summary fork the live tool_reference continuation is untouched.
   assert.deepEqual(prepareCragPrintBody(body, { foldSystemMessages: false }).messages, before.messages)
 })
+
+test('the CRAG print body hands the kernel automatic caching as a block marker', () => {
+  const mark = { type: 'ephemeral', ttl: '1h' }
+  const body = {
+    model: 'claude-opus-5-5',
+    cache_control: mark,
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'a' }] },
+      { role: 'assistant', content: [{ type: 'thinking', thinking: 't', signature: 's' }] },
+      { role: 'user', content: [{ type: 'text', text: 'b' }] },
+    ],
+  }
+  const out = prepareCragPrintBody(body, { foldSystemMessages: false })
+  // The kernel 400s on the top-level field, so no path may forward it.
+  assert.equal('cache_control' in out, false)
+  // Same policy, on the current message tail, skipping the thinking block.
+  assert.deepEqual(out.messages[2].content, [{ type: 'text', text: 'b', cache_control: mark }])
+  // The caller's body is never mutated.
+  assert.deepEqual(body.cache_control, mark)
+  assert.equal(body.messages[2].content[0].cache_control, undefined)
+})
+
+test('automatic caching is converted before the provider-compatibility early return', () => {
+  const out = prepareCragPrintBody(
+    {
+      model: 'claude-opus-5-5',
+      cache_control: { type: 'ephemeral' },
+      thread: { id: 'th_1' },
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'a' }] }],
+    },
+    { capabilities: ['message_threads_beta'] },
+  )
+  // This path returns early; it still must not carry the field to the kernel.
+  assert.equal('cache_control' in out, false)
+  assert.deepEqual(out.messages[0].content[0].cache_control, { type: 'ephemeral' })
+})
+
+test('automatic caching still converts at the four-breakpoint budget', () => {
+  const mark = { type: 'ephemeral' }
+  // Conversion is count neutral: the root marker becomes the tail block marker
+  // rather than joining the others, so a body at the budget stays at it. A
+  // guard that counted the root as an addition would drop caching here — and
+  // tools carrying a marker is the common shape for official traffic.
+  const out = prepareCragPrintBody(
+    {
+      model: 'claude-opus-5-5',
+      cache_control: mark,
+      tools: [{ name: 'Bash', input_schema: { type: 'object' }, cache_control: mark }],
+      system: [
+        { type: 'text', text: 'one', cache_control: mark },
+        { type: 'text', text: 'two', cache_control: mark },
+      ],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'a' }] }],
+    },
+    { foldSystemMessages: false },
+  )
+  assert.equal('cache_control' in out, false)
+  assert.deepEqual(out.messages[0].content[0].cache_control, mark)
+})
