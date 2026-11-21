@@ -10,7 +10,9 @@ require (
 
 require (
 	github.com/andybalholm/brotli v1.2.2 // indirect
+	github.com/creack/pty v1.1.24 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
+	github.com/hinshun/vt10x v0.0.0-20220301184237-5011da428d02 // indirect
 	github.com/icholy/digest v1.2.0 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
