@@ -58,7 +58,7 @@ func envMs(key string, fallback time.Duration) time.Duration {
 }
 
 // LoadConfig reads the kernel JSON and overlays helper env knobs.
-// CODEX_TUI_* vars are honored before KIN_CODEX_BIN etc.
+// CODEX_TUI_* vars override the defaults derived from the kernel JSON.
 func LoadConfig(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
