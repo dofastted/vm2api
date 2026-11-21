@@ -298,7 +298,7 @@ export function LeaderboardSection({
         ))}
       </div>
 
-      {board.isLoading ? (
+      {board.isLoading || board.isPlaceholderData ? (
         <Card>
           <CardContent className='space-y-4 py-6'>
             <div className='space-y-2'>
