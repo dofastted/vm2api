@@ -78,6 +78,7 @@ import {
   isCodexVm,
   syncCodexQuotaSchedule,
 } from './lib/vm/vm-registry.mjs'
+import { extraIsLiveOpen, parseResetMs } from './lib/pool/quota-window.mjs'
 import { createCragSubscription } from './lib/vm/crag-subscription.mjs'
 import { createCragRuntimeInventory } from './lib/vm/crag-runtime-inventory.mjs'
 import { configureCragRuntimeAdmission } from './lib/vm/slot-runtime-admission.mjs'
@@ -537,6 +538,43 @@ const vmTestSchedule = new VmTestScheduleRunner({
       apiKey: cfg.api_key,
       accountQuota,
     }),
+  // #979 preheat gates: read the same Extra/official windows the scheduler
+  // gates on, so a preheat never fires into a live window and never retries
+  // a slot the pool already parked.
+  windowState: (vmId) => {
+    try {
+      const vm = getVm(cfg.paths.project, vmId)
+      if (!vm) return { hasCredential: false, schedulable: false, windowLive: false }
+      const hasCredential = !!(vm.has_token || vm.claude?.has_access || vm.codex?.has_access)
+      const schedulable = vm.schedulable !== false
+      const acc = accountQuota?.snapshot?.().accounts?.find(
+        (row) => row.vm_id === vmId || row.account_id === (vm.claude?.account_uuid || vm.account_uuid),
+      )
+      if (!acc) return { hasCredential, schedulable, windowLive: false }
+      const w5 = acc.unified?.headers?.['5h'] || acc.unified?.['5h'] || {}
+      const resetMs = parseResetMs(w5.reset)
+      const windowLive =
+        extraIsLiveOpen(w5) ||
+        (Number.isFinite(resetMs) && resetMs > Date.now() && Number(w5.utilization) > 0)
+      return { hasCredential, schedulable, windowLive }
+    } catch {
+      return null
+    }
+  },
+  nextWindowEnd: (vmId) => {
+    try {
+      const vm = getVm(cfg.paths.project, vmId)
+      if (!vm) return null
+      const acc = accountQuota?.snapshot?.().accounts?.find(
+        (row) => row.vm_id === vmId || row.account_id === (vm.claude?.account_uuid || vm.account_uuid),
+      )
+      const w5 = acc?.unified?.headers?.['5h'] || acc?.unified?.['5h'] || {}
+      const resetMs = parseResetMs(w5.reset)
+      return Number.isFinite(resetMs) ? resetMs : null
+    } catch {
+      return null
+    }
+  },
 })
 credentialRefreshMonitor = createCredentialRefreshMonitor({
   config: normalizeCredentialRefreshConfig(routingConfig.credential_refresh),
