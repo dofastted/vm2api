@@ -37,3 +37,19 @@ export const cragSubscriptionErrors: Record<string, string> = {
   not_found: '授权服务找不到当前宿主机的订阅或槽位。',
   auth_forbidden: '授权服务不接受当前宿主机的订阅凭据。',
 }
+
+/**
+ * 自助恢复凭据失败后的成因说明（`CragHostStatus.credential_recovery`）。
+ *
+ * 和上表分开：这些不是某次请求的错误码，而是一个持续存在、只能由运维清除的
+ * 状态 —— 授权服务不认本机凭据，而本机又没能自行换回来。不说明的话，面板会
+ * 一直显示正常，直到某次兑换莫名失败。
+ *
+ * 按同一条约定：只陈述事实与可查的线索，不提及当前不存在的用户动作。
+ */
+export const cragCredentialRecoveryFaults: Record<string, string> = {
+  host_id_collision:
+    '本机的设备标识与另一台设备相同，授权服务因此不接受本机凭据。常见于从同一镜像克隆、未重置 /etc/machine-id 的 VPS。',
+  failed: '本机凭据未能自动换回，授权服务仍不接受。已运行的槽不受影响。',
+  not_activated: '本机没有可用于证明归属的授权记录，请先完成兑换。',
+}

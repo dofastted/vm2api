@@ -2,8 +2,12 @@ import { useId, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
+import { CragQuotaGrants } from './crag-quota-grants'
 import { CragRuntimeCounts } from './crag-runtime-counts'
-import { cragSubscriptionErrors } from './crag-subscription-errors'
+import {
+  cragCredentialRecoveryFaults,
+  cragSubscriptionErrors,
+} from './crag-subscription-errors'
 import {
   cragHostStatusQueryOptions,
   vmCragLicenseQueryOptions,
@@ -86,6 +90,12 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
         </Button>
       </div>
       <CragRuntimeCounts status={host.isError ? undefined : status} />
+      {status?.credential_recovery ? (
+        <p role='alert' className='text-sm text-destructive'>
+          {cragCredentialRecoveryFaults[status.credential_recovery] ??
+            cragSubscriptionErrors.auth_forbidden}
+        </p>
+      ) : null}
       {host.isError ? (
         <p role='alert' className='text-sm text-destructive'>
           读取失败。请刷新订阅后重试。
@@ -104,6 +114,7 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
           ? '上次订阅变更尚未同步。已在运行的槽不受影响；请点「继续同步」完成后，再进行新的绑定或兑换。'
           : '切换到 CRAG 内核不占槽位。只有绑定订阅且正在运行调度的 CRAG 槽计入使用中的槽位；本机与集群的 Docker、KVM 槽共用同一份充值可用槽位，用满后继续充值即可。绑定不会自动启动或重启槽位。'}
       </p>
+      <CragQuotaGrants status={host.isError ? undefined : status} />
       {status?.state === 'active' ? (
         <Button
           type='button'
