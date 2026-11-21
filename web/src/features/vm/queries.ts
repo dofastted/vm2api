@@ -92,6 +92,22 @@ export type CragHostStatus = {
   }>
   available_slots?: number | null
   available_seats?: number | 'unlimited' | null
+  /** The purchased windows behind the aggregate, soonest expiry first. Each
+   * voucher runs its own term and its seats add to the total, so a host holds
+   * one entry per redemption plus, on an H1 host, an unlabelled baseline with
+   * no `code_id`.
+   *
+   * Only present when it reconciles with the signed aggregate (see
+   * `quotaGrants` in crag-subscription.mjs), and absent once the subscription
+   * has lapsed. Note `expires_at` on the subscription is where the *soonest*
+   * window ends, i.e. when the entitlement is re-signed -- not when access
+   * stops: the remaining windows stay valid, the seat total just drops. */
+  quota_grants?: Array<{
+    code_id?: string
+    expires_at: number
+    /** Absent means this window is unlimited. */
+    slot_limit?: number
+  }>
   reclaim_pending_count?: number
   reclaim_supported?: boolean
   upgrade_available?: boolean

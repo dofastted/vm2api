@@ -59,6 +59,8 @@ const isDigest = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(v
 const HOST_DOMAIN = 'crag-host-v1:'
 const MAC_DOMAIN = 'crag-host-mac-v1:'
 const NET_DIRECTORY = '/sys/class/net'
+/** Must match the Authority's own cap; unsigned detail must not grow unbounded. */
+const MAX_QUOTA_GRANTS = 256
 
 /** The 32 hex digits a host id has always been derived from are exactly a
  * UUID's payload, so the identity this service already computes can be shown to
@@ -239,7 +241,53 @@ function projection(data, claims) {
     result.available_slots = available
   }
   if (Object.hasOwn(data, 'reclaim_supported') && data.reclaim_supported !== reclaim) throw invalidRights()
+  if (Object.hasOwn(data, 'quota_grants')) result.quota_grants = quotaGrants(data.quota_grants, claims)
   return result
+}
+
+/** Per-voucher windows behind the signed aggregate, for display only.
+ *
+ * The entitlement signs `revision`, `expires_at` and `slot_limit` -- nothing
+ * else -- so this detail arrives unsigned and cannot be taken on trust: a wrong
+ * one would have the panel state a confident, false expiry date. What makes it
+ * usable is that the Authority derives it in the same transaction, from the same
+ * `now`, as the aggregate it explains, so it must reconcile exactly. Anything
+ * that does not is rejected like any other malformed rights payload.
+ *
+ * It never participates in admission; `slot_limit` is still enforced solely
+ * against the signed aggregate.
+ */
+function quotaGrants(grants, claims) {
+  if (!Array.isArray(grants) || !grants.length || grants.length > MAX_QUOTA_GRANTS) throw invalidRights()
+  let total = 0
+  let unlimited = false
+  let soonest = Infinity
+  const clean = grants.map((grant) => {
+    if (!safeTime(grant.expires_at) || grant.expires_at < 1) throw invalidRights()
+    soonest = Math.min(soonest, grant.expires_at)
+    if (Object.hasOwn(grant, 'slot_limit')) {
+      if (!safeTime(grant.slot_limit) || grant.slot_limit < 1 || grant.slot_limit > 4294967295) throw invalidRights()
+      total += grant.slot_limit
+    } else {
+      unlimited = true
+    }
+    if (Object.hasOwn(grant, 'code_id') && (typeof grant.code_id !== 'string' || grant.code_id.length > 64))
+      throw invalidRights()
+    // Rebuilt rather than passed through, so only fields that were checked here
+    // can reach the panel.
+    return {
+      ...(Object.hasOwn(grant, 'code_id') && { code_id: grant.code_id }),
+      expires_at: grant.expires_at,
+      ...(Object.hasOwn(grant, 'slot_limit') && { slot_limit: grant.slot_limit }),
+    }
+  })
+  // Seats are the sum of the active windows, and one unlimited window makes the
+  // whole subscription unlimited.
+  if (claims.slot_limit === 'unlimited' ? !unlimited : unlimited || total !== claims.slot_limit) throw invalidRights()
+  // The signed window ends at the window that lapses first: after that the total
+  // drops, so the entitlement has to be re-signed rather than outlive it.
+  if (soonest !== claims.expires_at) throw invalidRights()
+  return clean
 }
 
 function availableSeats(claims, rights, active) {
@@ -1897,8 +1945,18 @@ export function createCragSubscription({
      * instead of just "unavailable". */
     deviceIdentity: () => deviceIdentity(),
     rebuildDeviceIdentity,
-    redeemDeviceOrder(hostId, voucher) {
-      if (!isDigest(hostId)) throw fail()
+    /** Normalize a device UUID a person typed or pasted, then resolve it to the
+     * host id the protocol speaks. Returns null when it is not a UUID. The one
+     * path from typed-in identity to protocol identity, shared by redemption
+     * and by migrating to a replacement machine. */
+    resolveDeviceUuid: (input) => (normalizeDeviceUuid(input) ? uuidToHostId(input) : null),
+    /** `target` is this machine's identity: either the 64 hex host id, which
+     * existing callers and scripts already pass, or the device UUID the panel
+     * displays. Accepting the UUID is what lets an operator redeem by copying
+     * what is on screen, instead of having to find the hashed form. */
+    redeemDeviceOrder(target, voucher) {
+      const hostId = isDigest(target) ? target : uuidToHostId(target)
+      if (!hostId) throw fail()
       return redeem(voucher, false, hostId)
     },
     async listOrderTargets() {

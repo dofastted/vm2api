@@ -332,6 +332,78 @@ test('the identity rebuild escape hatch is never taken by the ordinary path', (t
   })
 })
 
+test('per-voucher detail is shown only when it reconciles with the signed aggregate', async (t) => {
+  let issued
+  let grants
+  const { root, connect } = standaloneHost(t, async (_, { body }) => {
+    issued ??= issueHostEntitlement(root, JSON.parse(body).host_id, { slot_limit: 3 })
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims, quota_grants: grants } })
+  })
+  seedEncryptedPackage(root)
+  const signed = () => issued.claims
+
+  // Two windows that add up to the signed limit, the soonest ending exactly
+  // where the signed window ends.
+  await connect().redeem(voucher())
+  grants = [
+    { code_id: 'c0ffee', expires_at: signed().expires_at, slot_limit: 1 },
+    { expires_at: signed().expires_at + 86400, slot_limit: 2 },
+  ]
+  const shown = await connect().status()
+  assert.deepEqual(shown.quota_grants, grants)
+
+  // The entitlement signs only the aggregate, so detail that contradicts it
+  // would let a confident, false expiry date onto the panel. Seats that do not
+  // add up to the signed limit are refused...
+  grants = [{ expires_at: signed().expires_at, slot_limit: 2 }]
+  assert.equal((await connect().status()).quota_grants, undefined)
+
+  // ...as is detail whose soonest window disagrees with the signed one, even
+  // though the seats add up.
+  grants = [
+    { expires_at: signed().expires_at + 1, slot_limit: 1 },
+    { expires_at: signed().expires_at + 86400, slot_limit: 2 },
+  ]
+  assert.equal((await connect().status()).quota_grants, undefined)
+
+  // Unknown fields never reach the panel: entries are rebuilt from what was
+  // checked, not passed through.
+  grants = [
+    { expires_at: signed().expires_at, slot_limit: 1, injected: 'ignore me' },
+    { expires_at: signed().expires_at + 86400, slot_limit: 2 },
+  ]
+  const rebuilt = await connect().status()
+  assert.deepEqual(Object.keys(rebuilt.quota_grants[0]), ['expires_at', 'slot_limit'])
+})
+
+test('redemption accepts the device UUID the panel shows, as well as the hashed host id', async (t) => {
+  let issued
+  const seen = []
+  const { root, machineIdFile, connect } = standaloneHost(t, async (_, { body }) => {
+    const { host_id } = JSON.parse(body)
+    seen.push(host_id)
+    issued ??= issueHostEntitlement(root, host_id, { slot_limit: 2 })
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+  })
+  seedEncryptedPackage(root)
+  fs.writeFileSync(machineIdFile, `${'1234567890abcdef'.repeat(2)}\n`, { mode: 0o600 })
+  const service = connect()
+  const { hostId, uuid } = service.deviceIdentity()
+
+  // Typed or pasted in any case, with or without the dashes -- an operator
+  // copying what is on screen must not have to find the hashed form.
+  assert.equal(service.resolveDeviceUuid(uuid.toUpperCase()), hostId)
+  assert.equal(service.resolveDeviceUuid(uuid.replaceAll('-', '')), hostId)
+  assert.equal(service.resolveDeviceUuid('not-a-uuid'), null)
+
+  await service.redeemDeviceOrder(uuid, voucher())
+  assert.deepEqual(seen, [hostId], 'the UUID resolves to the same host id on the wire')
+  // The hashed form keeps working for existing callers and scripts.
+  await connect().redeemDeviceOrder(hostId, voucher())
+  assert.deepEqual(seen, [hostId, hostId])
+  assert.throws(() => connect().redeemDeviceOrder('neither', voucher()))
+})
+
 function postSubscription(subscription) {
   return (action, body) =>
     createCragSubscriptionHandler({
