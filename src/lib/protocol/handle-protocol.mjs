@@ -191,6 +191,7 @@ import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { formatPoolSelectionSummary } from '../pool/pool-scheduler.mjs'
 import { extraHeadersFromLimitError, isAccountQuotaExhausted } from '../pool/quota-window.mjs'
 import {
+  dropForeignThinkingForCrag,
   filterThinkingForAccount,
   recordThinkingOwners,
   thinkingOwners as defaultThinkingOwners,
@@ -1930,6 +1931,30 @@ export function createHandleProtocol(deps) {
               // The CRAG kernel fingerprints the public stream it already sent,
               // including thinking. Rewriting an unrecorded signature into text
               // makes the tool continuation fail with tool_result history mismatch.
+              // routing.compatibility.crag_drop_foreign_thinking (default off): signed
+              // blocks this account did not mint (another account's, or never
+              // recorded) never came from this kernel; drop them before the hop
+              // instead of waiting for the 400.
+              const cragOwned =
+                routingNow?.compatibility?.crag_drop_foreign_thinking === true
+                  ? dropForeignThinkingForCrag(source, selected.accountId, thinkingOwnerStore)
+                  : { body: source }
+              source = cragOwned.body
+              if (cragOwned.dropped || cragOwned.bailed) {
+                const { kept, dropped, droppedTurns, openLoop, thinkingOff, bailed } = cragOwned
+                logBag.hop_meta = {
+                  ...logBag.hop_meta,
+                  thinking_owner_crag: {
+                    account_id: selected.accountId,
+                    kept,
+                    dropped,
+                    dropped_turns: droppedTurns,
+                    open_loop: openLoop,
+                    thinking_off: thinkingOff,
+                    bailed,
+                  },
+                }
+              }
               for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
               hopBody = prepareCragPrintBody(source, {
                 preset: cragPersona,
@@ -1993,7 +2018,9 @@ export function createHandleProtocol(deps) {
                   preparedHop,
                   transportRouting,
                   requestContext,
-                  repaired,
+                  // thinking was dropped for this hop: skip ensureOfficialPrintThinking, which
+                  // would otherwise re-add adaptive thinking to a body whose loop lost its blocks.
+                  repaired: repaired || cragOwned.thinkingOff === true,
                   dropSampling,
                 },
               }
