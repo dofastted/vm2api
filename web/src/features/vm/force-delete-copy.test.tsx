@@ -3,12 +3,13 @@ import { describe, expect, it } from 'vitest'
 import { DeleteActiveVmHint } from './delete-active-hint'
 
 const target = { id: 'slot-1', node_id: 'node-1', active: true } as never
-const replacement = {
+const replacementFields = {
   id: 'slot-2',
   node_id: 'node-1',
   has_token: true,
-} as never
-const unschedulable = { ...replacement, schedulable: false } as never
+}
+const replacement = replacementFields as never
+const unschedulable = { ...replacementFields, schedulable: false } as never
 
 describe('force delete wording', () => {
   it('keeps takeover and blocked reasons while explaining skipped cleanup', () => {
