@@ -3659,6 +3659,38 @@ test('keep_pin_on_model_gate: a model the pinned slot does not allow borrows ano
   }
 })
 
+test('shared scheduler reserves host-managed Gemini accounts under the same concurrency cap', (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root)
+  const candidates = ['acc-1', 'acc-2'].map((id, index) => ({
+    accountId: `gemini:${id}`,
+    vmId: `gemini:${id}`,
+    model: 'gemini-3.8-flash-low',
+    maxConcurrency: 1,
+    priority: 0,
+    weight: 1,
+    lastUsedAt: index,
+  }))
+  const first = pool.reserveExternalCandidates(candidates)
+  const second = pool.reserveExternalCandidates(candidates)
+  assert.ok(first)
+  assert.ok(second)
+  assert.notEqual(second.selected.accountId, first.selected.accountId)
+  assert.equal(pool.inflight.get(first.selected.accountId), 1)
+  assert.equal(pool.inflight.get(second.selected.accountId), 1)
+  assert.equal(pool.reserveExternalCandidates(candidates), null)
+  first.reservation.release()
+  const next = pool.reserveExternalCandidates(candidates)
+  assert.equal(next.selected.accountId, first.selected.accountId)
+  next.reservation.release()
+  second.reservation.release()
+  pool.lastUsed.set(first.selected.accountId, 100)
+  const balanced = pool.reserveExternalCandidates(candidates)
+  assert.equal(balanced.selected.accountId, second.selected.accountId)
+  balanced.reservation.release()
+})
+
 test('fresh_account_isolation_ms: a pinned conversation never spills onto a freshly onboarded account', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

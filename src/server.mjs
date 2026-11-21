@@ -1184,6 +1184,7 @@ const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })
 const geminiScheduler = createGeminiScheduler({
   callHost: callGeminiHost,
   resolveProxy: (proxyId) => geminiProxyFor(proxyPool, proxyId),
+  poolScheduler,
   apiKeyStore,
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
 })
@@ -1431,7 +1432,7 @@ const server = http.createServer(async (req, res) => {
       })
     }
 
-    if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
+    if (req.method === 'GET' && (p === '/v1/models' || p === '/models' || p === '/v1beta/models')) {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
       if (groupType === 'gemini') return handleGeminiPublic(req, res)

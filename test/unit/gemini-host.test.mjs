@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { authorizePanelRoute } from '../../src/lib/admin/panel-acl.mjs'
+import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
 import { dispatchGeminiNativeTurn, prepareGeminiNativeTurn } from '../../src/lib/gemini/native-turn.mjs'
 import { AGY_SHA256, installGeminiPayload, readSignedGeminiManifest } from '../../src/lib/gemini/payload.mjs'
@@ -684,7 +685,6 @@ test('Gemini public routes schedule one plain-text turn and reject other keys', 
   const scoped = { apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini', allowed_models: [model] }, once() {} }
   for (const body of [
     { model: 'gemini-other', input: 'hello' },
-    { model, input: 'hello', stream: true },
     { model, input: 'hello', tools: [{ name: 'lookup' }] },
     { model, input: '测'.repeat(1366) },
   ]) {
@@ -752,7 +752,19 @@ test('the public scheduler completes one turn through the host socket', async ()
   })
   const previous = process.env.KIN_GEMINI_HOST_SOCKET
   process.env.KIN_GEMINI_HOST_SOCKET = socketPath
-  const scheduler = createGeminiScheduler({ callHost: callGeminiHost, resolveProxy: () => proxyUrl })
+  const reservation = { release() {} }
+  const scheduler = createGeminiScheduler({
+    callHost: callGeminiHost,
+    resolveProxy: () => proxyUrl,
+    poolScheduler: {
+      reserveExternalCandidates: (candidates) => ({
+        selected: { ...candidates[0], accountId: `gemini:${account.id}` },
+        reservation,
+      }),
+      unitCircuit: { recordSuccess() {}, recordFailure() {}, releaseProbe() {} },
+      lastUsed: new Map(),
+    },
+  })
   const handle = createGeminiPublicHandler({
     json: (_response, status, body) => ({ status, body }),
     readBody: async () => ({ model, input: 'hello' }),
@@ -781,17 +793,338 @@ test('the public scheduler completes one turn through the host socket', async ()
   }
 })
 
-test('Gemini keys cannot reach other inference endpoints via HTTP or WebSocket', () => {
-  for (const route of [
-    '/v1/responses',
-    '/responses',
-    '/v1/chat/completions',
-    '/v1/images/edits',
-    '/admin/models/refresh',
-  ]) {
+test('Gemini gateway uses shared account reservations and each selected environment proxy', async () => {
+  const environments = ['1', '2'].map((digit, index) => ({
+    id: `gemini-${digit.repeat(24)}`,
+    auth_state: 'authorized',
+    proxy_id: `px-${digit}`,
+    models_discovered: true,
+    models: [model],
+    index,
+  }))
+  const started = []
+  let finish = false
+  let resolveFirst
+  let resolveBoth
+  const firstStarted = new Promise((resolve) => {
+    resolveFirst = resolve
+  })
+  const bothStarted = new Promise((resolve) => {
+    resolveBoth = resolve
+  })
+  const pool = new PoolScheduler()
+  const scheduler = createGeminiScheduler({
+    poolScheduler: pool,
+    resolveProxy: (proxyId) => `socks5h://192.0.2.${proxyId === 'px-1' ? '11' : '12'}:1080`,
+    callHost: async (operation, input) => {
+      if (operation === 'list') return { payload_state: 'installed', environments }
+      if (operation === 'get') return environments.find((environment) => environment.id === input.id)
+      if (operation === 'test-chat') {
+        started.push(input)
+        if (started.length === 1) resolveFirst()
+        if (started.length === 2) resolveBoth()
+        return { run_id: started.length === 1 ? 'a'.repeat(32) : 'b'.repeat(32) }
+      }
+      if (operation === 'test-chat-status')
+        return finish
+          ? {
+              state: 'completed',
+              text: input.run_id[0] === 'a' ? 'reply one' : 'reply two',
+              usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 },
+            }
+          : { state: 'running' }
+      throw new Error(`unexpected Gemini host operation: ${operation}`)
+    },
+  })
+  const first = scheduler.complete({ model, text: 'hello' })
+  await firstStarted
+  const second = scheduler.complete({ model, text: 'hello' })
+  await bothStarted
+  assert.notEqual(started[0].id, started[1].id)
+  assert.deepEqual(started.map(({ proxy_id, proxy_url }) => [proxy_id, proxy_url]).sort(), [
+    ['px-1', 'socks5h://192.0.2.11:1080'],
+    ['px-2', 'socks5h://192.0.2.12:1080'],
+  ])
+  assert.equal(pool.inflight.size, 2)
+  finish = true
+  const results = await Promise.all([first, second])
+  assert.deepEqual(new Set(results.map((result) => result.text)), new Set(['reply one', 'reply two']))
+  assert.equal(pool.inflight.size, 0)
+})
+
+test('client disconnect cancels the Gemini run without recording a circuit failure', async () => {
+  const account = {
+    id: 'gemini-abort-0123456789abcdef01234567',
+    auth_state: 'authorized',
+    proxy_id: 'px-abort',
+    models_discovered: true,
+    models: [model],
+  }
+  const events = { failures: 0, probeAccountIds: [], hostCancelled: 0, reservationReleased: 0 }
+  let resolveStatusPoll
+  const statusPolled = new Promise((resolve) => {
+    resolveStatusPoll = resolve
+  })
+  const scheduler = createGeminiScheduler({
+    resolveProxy: () => proxyUrl,
+    poolScheduler: {
+      reserveExternalCandidates(candidates) {
+        return {
+          selected: candidates[0],
+          reservation: {
+            release() {
+              events.reservationReleased += 1
+            },
+          },
+        }
+      },
+      unitCircuit: {
+        recordFailure() {
+          events.failures += 1
+        },
+        releaseProbe(id) {
+          events.probeAccountIds.push(id)
+        },
+      },
+    },
+    callHost: async (operation) => {
+      if (operation === 'list') return { payload_state: 'installed', environments: [account] }
+      if (operation === 'get') return account
+      if (operation === 'test-chat') return { run_id: runId }
+      if (operation === 'test-chat-status') {
+        resolveStatusPoll()
+        return { state: 'running' }
+      }
+      if (operation === 'test-chat-cancel') {
+        events.hostCancelled += 1
+        return { cancelled: true }
+      }
+      throw new Error(`unexpected Gemini host operation: ${operation}`)
+    },
+  })
+  const handle = createGeminiPublicHandler({
+    json: (_res, status, body) => ({ status, body }),
+    readBody: async (req) => req.body,
+    scheduler,
+  })
+  let onClose
+  const req = {
+    method: 'POST',
+    url: '/v1/gemini/sessions/disconnect',
+    body: { model, input: 'hello' },
+    apiKeyKind: 'managed',
+    apiKeyRecord: { group_type: 'gemini' },
+    once() {},
+  }
+  const res = {
+    writableEnded: false,
+    setHeader() {},
+    once(event, handler) {
+      if (event === 'close') onClose = handler
+    },
+  }
+  const response = handle(req, res)
+  await statusPolled
+  onClose()
+  assert.equal(await response, undefined)
+  assert.equal(events.failures, 0)
+  assert.deepEqual(events.probeAccountIds, [`gemini:${account.id}`])
+  assert.equal(events.hostCancelled, 1)
+  assert.equal(events.reservationReleased, 1)
+})
+
+test('Google API route uses shared pool reservation and returns Google response wire shape', async () => {
+  const account = {
+    id: 'gemini-0123456789abcdef01234567',
+    auth_state: 'authorized',
+    proxy_id: 'px-gemini',
+    models_discovered: true,
+    models: [model],
+  }
+  const pool = new PoolScheduler()
+  const testChat = []
+  const scheduler = createGeminiScheduler({
+    poolScheduler: pool,
+    resolveProxy: () => proxyUrl,
+    callHost: async (operation, payload) => {
+      if (operation === 'list') return { payload_state: 'installed', environments: [account] }
+      if (operation === 'get') return account
+      if (operation === 'test-chat') {
+        testChat.push(payload)
+        return { run_id: runId }
+      }
+      if (operation === 'test-chat-status')
+        return {
+          state: 'completed',
+          text: 'actual shared route',
+          usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8 },
+        }
+      throw new Error(`unexpected host request: ${operation}`)
+    },
+  })
+  const handle = createGeminiPublicHandler({
+    json: (_res, status, body) => ({ status, body }),
+    readBody: async () => ({ contents: [{ role: 'user', parts: [{ text: 'hello' }] }] }),
+    scheduler,
+  })
+  const response = await handle(
+    {
+      method: 'POST',
+      url: '/v1beta/models/gemini-3-pro:generateContent',
+      apiKeyKind: 'managed',
+      apiKeyRecord: { group_type: 'gemini' },
+      once() {},
+    },
+    { setHeader() {}, once() {} },
+  )
+  assert.equal(response.status, 200)
+  assert.equal(response.body.candidates[0].content.parts[0].text, 'actual shared route')
+  assert.equal(response.body.usageMetadata.totalTokenCount, 8)
+  assert.equal(testChat.length, 1)
+  assert.equal(testChat[0].id, account.id)
+  assert.equal(testChat[0].proxy_id, account.proxy_id)
+  assert.equal(pool.inflight.size, 0)
+})
+
+test('Gemini protocol adapters preserve stream framing and native Google errors', async () => {
+  const scheduler = {
+    async complete({ model: requested }) {
+      return { text: 'converted', model: requested, usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 } }
+    },
+  }
+  const handle = createGeminiPublicHandler({
+    json: (_res, status, body) => ({ status, body }),
+    readBody: async (req) => req.body,
+    scheduler,
+  })
+  const makeResponse = () => ({
+    setHeader() {},
+    once() {},
+    writeHead(status, headers) {
+      this.status = status
+      this.headers = headers
+    },
+    write(chunk) {
+      this.chunks = [...(this.chunks || []), chunk]
+    },
+    end() {
+      this.writableEnded = true
+    },
+  })
+  const request = (url, body, response = makeResponse()) =>
+    handle(
+      { method: 'POST', url, body, apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' }, once() {} },
+      response,
+    )
+
+  const openaiRes = makeResponse()
+  await request('/v1/responses', { model, input: 'hello', stream: true }, openaiRes)
+  assert.match(openaiRes.headers['Content-Type'], /text\/event-stream/)
+  assert.match(openaiRes.chunks.join(''), /event: response\.output_text\.delta/)
+  assert.match(openaiRes.chunks.join(''), /event: response\.completed/)
+
+  const anthropicRes = makeResponse()
+  await request('/v1/messages', { model, messages: [{ role: 'user', content: 'hello' }], stream: true }, anthropicRes)
+  assert.match(anthropicRes.chunks.join(''), /event: message_start/)
+  assert.match(anthropicRes.chunks.join(''), /event: message_stop/)
+
+  const invalid = await request('/v1beta/models/gemini-3-pro:generateContent', {
+    contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
+    generationConfig: { maxOutputTokens: 32 },
+  })
+  assert.equal(invalid.status, 400)
+  assert.deepEqual(invalid.body.error.status, 'INVALID_ARGUMENT')
+  assert.equal(invalid.body.error.details[0].reason, 'gemini_unsupported_turn')
+
+  const anthropicError = await request('/v1/messages', {
+    model,
+    max_tokens: 32,
+    messages: [{ role: 'user', content: 'hello' }],
+  })
+  assert.equal(anthropicError.status, 400)
+  assert.equal(anthropicError.body.type, 'error')
+  assert.equal(anthropicError.body.error.type, 'invalid_request_error')
+})
+
+test('Gemini-compatible routes convert requests and results across supported protocols', async () => {
+  const calls = []
+  const handle = createGeminiPublicHandler({
+    json: (_res, status, body) => ({ status, body }),
+    readBody: async (req) => req.body,
+    scheduler: {
+      async catalog() {
+        return { models: [{ id: model, object: 'model', owned_by: 'google' }] }
+      },
+      async complete(input) {
+        calls.push(input)
+        return {
+          text: 'hello from CRAGGemini',
+          usage: { input_tokens: 7, output_tokens: 4, total_tokens: 11 },
+          account_id: 'gemini-a',
+          model: input.model,
+        }
+      },
+    },
+  })
+  const response = {
+    setHeader() {},
+    once() {},
+    writeHead(status, headers) {
+      this.status = status
+      this.headers = headers
+    },
+    write(chunk) {
+      this.chunks = [...(this.chunks || []), chunk]
+    },
+    end() {
+      this.writableEnded = true
+    },
+  }
+  const request = (url, body) =>
+    handle(
+      { method: 'POST', url, body, apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' }, once() {} },
+      response,
+    )
+
+  const google = await request('/v1beta/models/gemini-3-pro:generateContent', {
+    contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+  })
+  assert.equal(google.status, 200)
+  assert.deepEqual(google.body.candidates[0].content.parts, [{ text: 'hello from CRAGGemini' }])
+  assert.deepEqual(google.body.usageMetadata, { promptTokenCount: 7, candidatesTokenCount: 4, totalTokenCount: 11 })
+
+  const chat = await request('/v1/chat/completions', { model, messages: [{ role: 'user', content: 'hi' }] })
+  assert.equal(chat.body.choices[0].message.content, 'hello from CRAGGemini')
+  assert.equal(chat.body.usage.total_tokens, 11)
+
+  const responses = await request('/v1/responses', { model, input: 'hi' })
+  assert.equal(responses.body.object, 'response')
+  assert.equal(responses.body.output[0].content[0].text, 'hello from CRAGGemini')
+
+  const sse = await request('/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse', {
+    contents: [{ parts: [{ text: 'hi' }] }],
+  })
+  assert.equal(sse, undefined)
+  assert.equal(response.status, 200)
+  assert.match(response.headers['Content-Type'], /text\/event-stream/)
+  assert.match(response.chunks.join(''), /"finishReason":"STOP"/)
+  assert.equal(calls.length, 4)
+  assert.deepEqual(
+    calls.map(({ model: id, text }) => [id, text]),
+    Array.from({ length: 4 }, () => [model, 'hi']),
+  )
+})
+
+test('Gemini keys allow supported protocol adapters and deny other inference surfaces', () => {
+  for (const route of ['/v1/responses/compact', '/v1/completions', '/v1/images/edits', '/admin/models/refresh']) {
     assert.equal(geminiKeyAllowsPath(route, 'POST'), false)
     assert.equal(geminiKeyAllowsPath(route, 'GET'), false)
   }
+  assert.equal(geminiKeyAllowsPath('/v1/responses', 'POST'), true)
+  assert.equal(geminiKeyAllowsPath('/responses', 'POST'), true)
+  assert.equal(geminiKeyAllowsPath('/v1/chat/completions', 'POST'), true)
+  assert.equal(geminiKeyAllowsPath('/v1beta/models/gemini-3.8-flash:generateContent', 'POST'), true)
+  assert.equal(geminiKeyAllowsPath('/v1beta/models', 'GET'), true)
   assert.equal(geminiKeyAllowsPath('/v1/gemini/sessions', 'POST'), true)
   assert.equal(geminiKeyAllowsPath('/v1/messages', 'POST'), true)
   assert.equal(geminiKeyAllowsPath('/messages', 'POST'), true)

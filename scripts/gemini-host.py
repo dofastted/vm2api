@@ -74,9 +74,10 @@ PAYLOAD_FILES = (
     "craggemini",
     "libagy_bridge.so",
 )
+AGY_SHA256 = "39816d49d5ab92229952987225c23ea3fed7580699dcb4a444e0388e0ac1ce43"
 INFERENCE_MODULE = ROOT / "scripts/gemini_host_inference.py"
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
-RUN_TTL = 90
+RUN_TTL = 150
 
 
 def invocation_module():
@@ -97,6 +98,17 @@ class Failure(Exception):
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+NATIVE_MODULE = ROOT / "scripts/gemini_host_native.py"
+
+
+def native_module():
+    check_root_owned(NATIVE_MODULE)
+    spec = importlib.util.spec_from_file_location("gemini_host_native", NATIVE_MODULE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def account_command(uid, method, profile=None):
@@ -295,6 +307,13 @@ TERMINAL_EXEC = """\
 import os, sys
 os.write(1, b'\\x02agy-start\\x03')
 os.execv(sys.argv[1], sys.argv[1:])
+"""
+
+VT_EXEC = """import os,sys
+fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+os.write(fd,str(os.getpid()).encode('ascii'))
+os.close(fd)
+os.execvpe(sys.argv[2],sys.argv[2:],os.environ)
 """
 
 
@@ -661,6 +680,231 @@ class Headless(Agy):
                 self.invocation.close()
         finally:
             super().close(preserve)
+
+
+def native_process_identity(pid):
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    tty = int(fields[4])
+    start = int(fields[19])
+    pgid = int(fields[2])
+    if tty == 0 or ((tty >> 8) & 0xFFF) in (2, 3, *range(128, 144)):
+        raise Failure(503, "gemini_native_tty_unavailable")
+    return pgid, start
+
+
+def read_native_tui_pid(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_nlink != 1
+            or info.st_mode & 0o077
+            or not 1 <= info.st_size <= 16
+        ):
+            raise Failure(503, "gemini_native_tty_unavailable")
+        raw = os.read(descriptor, 17)
+        if len(raw) != info.st_size or not raw.isdigit():
+            raise Failure(503, "gemini_native_tty_unavailable")
+        return int(raw)
+    finally:
+        os.close(descriptor)
+
+
+class NativeAgy(Agy):
+    def __init__(self, host, environment, proxy_url, auth, model, prompt):
+        self.credentials, self.token_bytes = auth
+        self.model, self.prompt = model, prompt
+        self.native_dir = None
+        self.native_token = None
+        self.native_tui = None
+        self.native_tui_pid = None
+        self.native_tui_pgid = None
+        self.native_tui_start = None
+        self.native_invocation = None
+        super().__init__(host, environment, proxy_url)
+
+    def initialize_home(self, home):
+        super().initialize_home(home)
+        settings = home / ".gemini" / "antigravity-cli"
+        token = settings / TOKEN_NAME
+        token.write_bytes(self.token_bytes)
+        os.chown(token, self.uid, self.uid)
+        self.token_bytes = None
+
+    def launch_cli(self, argv, size):
+        self.native_dir = self.directory / "native"
+        self.native_dir.mkdir(mode=0o700)
+        os.chown(self.native_dir, self.uid, self.uid)
+        self.native_token = secrets.token_hex(32)
+        config = self.native_dir / "kernel.json"
+        private_json(
+            config,
+            {
+                "run_dir": "/tmp/craggemini",
+                "internal_token": self.native_token,
+                "session_id": self.attempt,
+                "model": self.model,
+                "agy_sha256": AGY_SHA256,
+                "timeout_ms": 120000,
+                "first_byte_timeout_ms": 90000,
+                "idle_timeout_ms": 15000,
+                "queue_timeout_ms": 1000,
+                "max_queue": 1,
+            },
+        )
+        os.chown(config, self.uid, self.uid)
+
+        argv.extend(
+            [
+                "--ro-bind",
+                str(self.host.payload / "craggemini"),
+                "/opt/craggemini",
+                "--ro-bind",
+                str(self.host.payload / "libagy_bridge.so"),
+                "/opt/libagy_bridge.so",
+                "--dir",
+                "/tmp/craggemini",
+                "--bind",
+                str(self.native_dir),
+                "/tmp/craggemini",
+                "--setenv",
+                "SSH_CONNECTION",
+                "127.0.0.1 12345 127.0.0.1 22",
+                "--setenv",
+                "CRAGGEMINI_SESSION_ID",
+                self.attempt,
+                "--ro-bind",
+                str(NATIVE_MODULE),
+                "/opt/gemini_host_native.py",
+                "--",
+                "/usr/bin/python3",
+                "-I",
+                "/opt/gemini_host_native.py",
+                "--launch-native",
+                "/opt/agy",
+                "--mode",
+                "plan",
+                "--model",
+                self.model,
+            ]
+        )
+        native_module_impl = native_module()
+        try:
+            lock, vt = native_module_impl.query_free_vt(
+                self.host.directory / "native-vt.lock"
+            )
+        except (native_module_impl.NativeFailure, OSError) as error:
+            code = getattr(error, "code", "gemini_native_tty_unavailable")
+            raise Failure(503, code) from None
+        try:
+            self.native_tui = subprocess.Popen(
+                [
+                    "openvt",
+                    "-c",
+                    str(vt),
+                    "-w",
+                    "--",
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    VT_EXEC,
+                    str(self.directory / "tui.pid"),
+                    *argv,
+                ],
+                env=SYSTEM_ENV,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            pid_path = self.directory / "tui.pid"
+            pid_deadline = time.monotonic() + 5
+            while not pid_path.exists() and self.native_tui.poll() is None:
+                if time.monotonic() >= pid_deadline:
+                    raise Failure(503, "gemini_native_tty_unavailable")
+                time.sleep(0.02)
+            if self.native_tui.poll() is not None or not pid_path.exists():
+                raise Failure(503, "gemini_native_tty_unavailable")
+            self.native_tui_pid = read_native_tui_pid(pid_path)
+            self.native_tui_pgid, self.native_tui_start = native_process_identity(
+                self.native_tui_pid
+            )
+        except OSError:
+            raise Failure(503, "gemini_native_tty_unavailable") from None
+        finally:
+            os.close(lock)
+        self.pid = self.native_tui_pid
+        self.native_invocation = native_module_impl.NativeInvocation(
+            {
+                "socket": str(self.native_dir / "kernel.sock"),
+                "token": self.native_token,
+                "model": self.model,
+                "request_id": self.attempt,
+                "prompt": self.prompt,
+                "startup_timeout": 45,
+            },
+            secrets=self.credentials,
+        )
+        self.token_bytes = None
+        self.prompt = None
+        self.credentials = ()
+
+    def poll(self):
+        if self.egress.poll() is not None:
+            return {
+                "state": "failed",
+                "text": "",
+                "error": {
+                    "code": "gemini_proxy_error",
+                    "message": "Gemini egress stopped",
+                },
+            }
+        if self.native_tui is None or self.native_tui.poll() is not None:
+            return {
+                "state": "failed",
+                "text": "",
+                "error": {"code": "gemini_native_worker_unavailable"},
+            }
+        return self.native_invocation.poll()
+
+    def close(self, preserve=False):
+        try:
+            if self.native_invocation is not None:
+                self.native_invocation.close()
+        finally:
+            try:
+                if self.native_tui_pid and self.native_tui_start is not None:
+                    try:
+                        current = native_process_identity(self.native_tui_pid)
+                        if current == (self.native_tui_pgid, self.native_tui_start):
+                            os.killpg(self.native_tui_pgid, signal.SIGKILL)
+                    except (OSError, ValueError, Failure):
+                        pass
+                if self.native_tui is not None:
+                    self._stop_process_group(self.native_tui)
+                    self.native_tui = None
+            finally:
+                self.pid = None
+                self.native_tui_pid = None
+                self.token_bytes = None
+                self.credentials = ()
+                self.prompt = None
+                super().close(preserve)
+
+    @staticmethod
+    def _stop_process_group(process):
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
 
 class Login(Agy):
@@ -1202,7 +1446,7 @@ class Host:
     def oauth_runtime_issue(self):
         if any(
             not shutil.which(tool, path=SYSTEM_ENV["PATH"])
-            for tool in ("ip", "nft", "setpriv", "bwrap", "curl")
+            for tool in ("ip", "nft", "setpriv", "bwrap", "curl", "openvt")
         ):
             return "gemini_oauth_tools_missing"
         try:
@@ -1484,9 +1728,8 @@ class Host:
             raise Failure(409, "gemini_model_unavailable")
         identifier = env["id"]
         self.stop_run(identifier)
-        module = invocation_module()
         if key:
-            process = module.Invocation(
+            process = invocation_module().Invocation(
                 account_command(uid, "api-key-chat"),
                 SYSTEM_ENV,
                 prompt,
@@ -1501,9 +1744,7 @@ class Host:
                 secrets=(key,),
             )
         else:
-            process = Headless(
-                self, env, proxy_url, auth, module.chat_args(model), prompt
-            )
+            process = NativeAgy(self, env, proxy_url, auth, model, prompt)
         run_id = secrets.token_hex(16)
         self.runs[identifier] = {
             "id": run_id,
@@ -2135,6 +2376,7 @@ def main():
         ROOT / "scripts/install-gemini-payload.mjs",
         ROOT / "scripts/gemini_host_account.py",
         INFERENCE_MODULE,
+        NATIVE_MODULE,
         ROOT / "src/lib/gemini/payload.mjs",
         args.state,
         args.socket.parent,
