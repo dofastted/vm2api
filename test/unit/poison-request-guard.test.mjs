@@ -164,3 +164,82 @@ test('each failure logs one structured line without content', () => {
   assert.equal(parsed.failures, 1)
   assert.equal(parsed.quarantined, false)
 })
+
+// --- per-VM size ceiling ----------------------------------------------------
+
+const sized = (kb) => body(user('x'.repeat(kb * 1024)))
+const fail = (g, session, kb, vm = 'vm-03') => g.recordSilentTimeout(session, sized(kb), { vm_id: vm })
+
+test('one session going silent never sets a VM ceiling; two different sessions do', () => {
+  const { g } = guard()
+  fail(g, 'sess:a', 60)
+  fail(g, 'sess:a', 62)
+  assert.deepEqual(g.refusedVms(sized(200)), [], 'a single conversation is handled by its own quarantine')
+  fail(g, 'sess:b', 70)
+  const refused = g.refusedVms(sized(200))
+  assert.equal(refused.length, 1)
+  assert.equal(refused[0].vmId, 'vm-03')
+})
+
+test('the ceiling is the smallest size that went silent: bigger requests are refused, smaller ones pass', () => {
+  const { g } = guard()
+  fail(g, 'sess:a', 60)
+  fail(g, 'sess:b', 70)
+  assert.equal(g.refusedVms(sized(59)).length, 0)
+  assert.equal(g.refusedVms(sized(61)).length, 1, 'a conversation that only grew is above the ceiling')
+  assert.ok(g.refusedVms(sized(61))[0].retryAfterSec > 0)
+})
+
+test('a ceiling belongs to its VM only', () => {
+  const { g } = guard()
+  fail(g, 'sess:a', 60)
+  fail(g, 'sess:b', 70)
+  fail(g, 'sess:c', 80, 'vm-04')
+  assert.deepEqual(
+    g.refusedVms(sized(100)).map((r) => r.vmId),
+    ['vm-03'],
+  )
+})
+
+test('a success at or above the ceiling on that VM lifts it; a success below does not', () => {
+  const { g } = guard()
+  fail(g, 'sess:a', 60)
+  fail(g, 'sess:b', 70)
+  g.recordSuccess('sess:z', { vmId: 'vm-03', bytes: sized(40) && Buffer.byteLength(JSON.stringify(sized(40))) })
+  assert.equal(g.refusedVms(sized(100)).length, 1)
+  g.recordSuccess('sess:z', { vmId: 'vm-04', bytes: Buffer.byteLength(JSON.stringify(sized(100))) })
+  assert.equal(g.refusedVms(sized(100)).length, 1, 'other VM does not count')
+  g.recordSuccess('sess:z', { vmId: 'vm-03', bytes: Buffer.byteLength(JSON.stringify(sized(90))) })
+  assert.equal(g.refusedVms(sized(100)).length, 0)
+})
+
+test('after the quarantine a probe is let through and a further failure refuses again at once', () => {
+  const { g, t } = guard({ quarantineMs: 60_000 })
+  fail(g, 'sess:a', 60)
+  fail(g, 'sess:b', 70)
+  t.now += 61_000
+  assert.equal(g.refusedVms(sized(100)).length, 0, 'probe allowed')
+  fail(g, 'sess:c', 80) // one session is enough to confirm a ceiling that is already known
+  assert.equal(g.refusedVms(sized(100)).length, 1)
+})
+
+test('failures that are far apart in time are not combined into a ceiling', () => {
+  const { g, t } = guard({ windowMs: 60_000 })
+  fail(g, 'sess:a', 60)
+  t.now += 120_000
+  fail(g, 'sess:b', 70)
+  assert.equal(g.refusedVms(sized(200)).length, 0)
+})
+
+test('the VM table is bounded and the guard can be switched off', () => {
+  const { g } = guard({ maxEntries: 2 })
+  for (const vm of ['vm-1', 'vm-2', 'vm-3']) {
+    fail(g, `sess:${vm}a`, 60, vm)
+    fail(g, `sess:${vm}b`, 60, vm)
+  }
+  assert.ok(g.refusedVms(sized(100)).length <= 2)
+  const off = guard({ threshold: 0 }).g
+  fail(off, 'sess:a', 60)
+  fail(off, 'sess:b', 60)
+  assert.deepEqual(off.refusedVms(sized(100)), [])
+})

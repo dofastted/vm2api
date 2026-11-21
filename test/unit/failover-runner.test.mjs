@@ -2795,3 +2795,79 @@ test('a quarantined session is not counted toward the per-VM kernel circuit', as
   for (let i = 0; i < 6; i += 1) await send(turnBody())
   assert.ok((vmTimeoutTracker.counts.get('vm-01')?.count || 0) < 3, 'refused requests never reach the tracker')
 })
+
+// --- per-VM size ceiling in the runner --------------------------------------
+
+const bigBody = (kb) => ({ model: 'claude-opus-test', messages: [{ role: 'user', content: 'x'.repeat(kb * 1024) }] })
+
+function ceilingHarness(candidates) {
+  const scheduler = new Scheduler(candidates)
+  const runner = new FailoverRunner({ scheduler, config: { max_same_account_retries: 0 } })
+  runner.poisonGuard.logger = { warn() {} }
+  const served = []
+  const send = (kb, session, { outcome = success(), extra = {} } = {}) =>
+    runner.run({
+      requestId: `req-${served.length + 1}`,
+      canonicalBody: bigBody(kb),
+      model: 'claude-opus-test',
+      stream: false,
+      stickyKey: `sess:${session}`,
+      stickyKeys: [`sess:${session}`],
+      callAttempt: ({ candidate }) => {
+        served.push(candidate.vmId)
+        return typeof outcome === 'function' ? outcome(candidate) : outcome
+      },
+      ...extra,
+    })
+  return { send, served, scheduler, runner }
+}
+
+test('once two sessions went silent on a VM, a larger request is served by another seat', async () => {
+  const { send, served } = ceilingHarness([candidate(1), candidate(2)])
+  // Only vm-01 goes quiet; its failed requests are answered by vm-02 within the same call.
+  const onlyVm01Silent = (seat) => (seat.vmId === 'vm-01' ? silentTimeout() : success())
+  await send(60, 'a', { outcome: onlyVm01Silent })
+  await send(70, 'b', { outcome: onlyVm01Silent })
+  served.length = 0
+  const out = await send(80, 'c')
+  assert.equal(out.ok, true)
+  assert.deepEqual(served, ['vm-02'], 'the VM that went silent is skipped for requests this large')
+  served.length = 0
+  await send(10, 'd')
+  assert.deepEqual(served, ['vm-01'], 'small requests still use it')
+})
+
+test('with no other seat the oversized request is refused with a clear 400 and sends nothing', async () => {
+  const { send, served } = ceilingHarness([candidate(1)])
+  await send(60, 'a', { outcome: silentTimeout })
+  await send(70, 'b', { outcome: silentTimeout })
+  served.length = 0
+  const out = await send(80, 'c')
+  assert.deepEqual(served, [])
+  assert.equal(out.status, 400)
+  assert.equal(out.body.error.type, 'invalid_request_error')
+  assert.equal(out.body.error.code, 'request_too_large_for_slot')
+  assert.match(out.body.error.message, /rewind|new session|new conversation/i)
+  assert.match(out.body.error.message, /compact/i, 'warns that compacting sends the whole conversation')
+  assert.equal(out.attemptCount, 0)
+})
+
+test('an operator pin to the VM still reaches it, for diagnosis', async () => {
+  const { send, served } = ceilingHarness([candidate(1)])
+  await send(60, 'a', { outcome: silentTimeout })
+  await send(70, 'b', { outcome: silentTimeout })
+  served.length = 0
+  await send(80, 'c', { extra: { pinVmId: 'vm-01' } })
+  assert.deepEqual(served, ['vm-01'])
+})
+
+test('while a ceiling is active a small request is still sent and a large one is still refused', async () => {
+  const { send, served } = ceilingHarness([candidate(1)])
+  await send(60, 'a', { outcome: silentTimeout })
+  await send(70, 'b', { outcome: silentTimeout })
+  served.length = 0
+  await send(10, 'd')
+  const still = await send(80, 'c')
+  assert.equal(still.body.error.code, 'request_too_large_for_slot')
+  assert.deepEqual(served, ['vm-01'], 'only the small request was sent')
+})

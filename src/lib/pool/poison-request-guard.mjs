@@ -13,6 +13,14 @@
  * the failing turn or starting a new conversation changes the prefix and passes.
  * Nothing here depends on knowing why the request hangs. Each failure also logs the
  * request's structure (kinds and sizes, never content) so the cause can be found.
+ *
+ * The same silence can be a property of the slot rather than of one conversation: on one
+ * slot every session went quiet once its prompt passed roughly 54k tokens, on both Opus and
+ * Sonnet, while other slots served far larger prompts. So failures are also tracked per VM.
+ * When `vmSessions` different sessions went silent on one VM within the window, the smallest
+ * request size that did becomes that VM's ceiling: larger requests are kept off it (served by
+ * another seat, or refused when there is none) until a request at that size succeeds there or
+ * the quarantine time passes and a probe is let through.
  */
 
 import crypto from 'node:crypto'
@@ -30,6 +38,10 @@ const digest = (value) =>
     .slice(0, 16)
 
 /** One short hash per message, so a longer conversation can be matched by its prefix. */
+export function requestBytes(body) {
+  return Buffer.byteLength(JSON.stringify(body) ?? '')
+}
+
 export function messageDigests(body) {
   const messages = Array.isArray(body?.messages) ? body.messages : null
   return messages?.length ? messages.map(digest) : null
@@ -110,6 +122,7 @@ export class PoisonRequestGuard {
     threshold = 2,
     windowMs = 30 * 60_000,
     quarantineMs = 10 * 60_000,
+    vmSessions = 2,
     maxEntries = 256,
     now = Date.now,
     logger = console,
@@ -117,10 +130,12 @@ export class PoisonRequestGuard {
     this.threshold = Number(threshold) || 0
     this.windowMs = Number(windowMs) || 0
     this.quarantineMs = Number(quarantineMs) || 0
+    this.vmSessions = Math.max(1, Number(vmSessions) || 2)
     this.maxEntries = Math.max(1, Number(maxEntries) || 256)
     this.now = now
     this.logger = logger
     this.entries = new Map()
+    this.vms = new Map()
   }
 
   get enabled() {
@@ -155,6 +170,7 @@ export class PoisonRequestGuard {
     const digests = messageDigests(body)
     if (!digests) return null
     const now = this.now()
+    const vmCeiling = this.recordVmFailure(context.vm_id, sessionKey, body, now)
     const prev = this.entries.get(sessionKey)
     const related = !!prev && now - prev.lastAt <= this.windowMs && startsWith(digests, prev.digests)
     const count = related ? prev.count + 1 : 1
@@ -176,6 +192,7 @@ export class PoisonRequestGuard {
         failures: count,
         quarantined,
         quarantine_ms: quarantined ? this.quarantineMs : 0,
+        ...(vmCeiling ? { vm_ceiling_bytes: vmCeiling } : {}),
         ...context,
         request,
       })}`,
@@ -183,8 +200,55 @@ export class PoisonRequestGuard {
     return { count, quarantined }
   }
 
-  recordSuccess(sessionKey) {
+  /** Track a silent timeout against its VM; returns the VM's ceiling in bytes when one is in force. */
+  recordVmFailure(vmId, sessionKey, body, now) {
+    if (!vmId) return null
+    const bytes = requestBytes(body)
+    const prev = this.vms.get(vmId)
+    const recent = (prev?.failures || []).filter((f) => now - f.at <= this.windowMs)
+    recent.push({ session: sessionKey, bytes, at: now })
+    const known = prev?.ceiling && prev.until <= now && bytes >= prev.ceiling // a ceiling already learned, confirmed again
+    const sessions = new Set(recent.map((f) => f.session))
+    let ceiling = prev?.ceiling || 0
+    let until = prev?.until || 0
+    if (known || sessions.size >= this.vmSessions) {
+      ceiling = known ? prev.ceiling : Math.min(...recent.map((f) => f.bytes))
+      until = now + this.quarantineMs
+    }
+    this.vms.delete(vmId)
+    this.vms.set(vmId, { failures: recent.slice(-16), ceiling, until, lastAt: now })
+    while (this.vms.size > this.maxEntries) this.vms.delete(this.vms.keys().next().value)
+    return until > now ? ceiling : null
+  }
+
+  /** VMs that should not receive a request of this size right now. */
+  refusedVms(body) {
+    if (!this.enabled || !this.vms.size) return []
+    const now = this.now()
+    let bytes = null
+    const out = []
+    for (const [vmId, entry] of this.vms) {
+      if (!entry.ceiling || entry.until <= now) continue
+      bytes ??= requestBytes(body)
+      if (bytes >= entry.ceiling) {
+        out.push({
+          vmId,
+          ceilingBytes: entry.ceiling,
+          requestBytes: bytes,
+          retryAfterSec: Math.max(1, Math.ceil((entry.until - now) / 1000)),
+        })
+      }
+    }
+    return out
+  }
+
+  /** A hop succeeded. On a VM with a ceiling, a success at or above it proves the VM can answer again. */
+  recordSuccess(sessionKey, { vmId = null, bytes = null, body = null } = {}) {
     if (sessionKey) this.entries.delete(sessionKey)
+    const entry = vmId ? this.vms.get(vmId) : null
+    if (!entry?.ceiling) return
+    const size = bytes ?? (body ? requestBytes(body) : null)
+    if (size != null && size >= entry.ceiling) this.vms.delete(vmId)
   }
 
   snapshot() {
