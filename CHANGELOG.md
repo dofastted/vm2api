@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 1.4.173 — 2026-11-21 · 修复 Gemini OAuth 账号文件导入
+
+- 将短期 OAuth 访问令牌传入隔离的账号探测进程，修复 Gemini 账号文件导入时宿主调用参数不匹配的问题（#1544）。
+
 ## 1.4.172 — 2026-11-21 · Gemini OAuth 共享调度与协议适配
 
 - Gemini OAuth 宿主保留签名 CRAGGemini 原生 worker、隔离 HOME 和绑定 SOCKS5；在共享 PoolScheduler 上增加账号平衡、并发预留及 unit-circuit，并提供受限纯文本 Gemini、OpenAI Chat/Responses、Anthropic Messages 适配，客户端断连按中性取消处理（#1397、#1536）。
