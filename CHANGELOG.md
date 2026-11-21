@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.174 — 2026-11-21 · Setup Token 不再伪造一年期票，授权链接保留 helper 身份
+
+- Setup Token 换票不再请求 `31536000` 的有效期。授权链接导入走的就是 README 的普通换票流程，长效票是宿主用短效票本地派生的东西，面板没有理由铸造它；两条路现在都只申请完整 5 项 scope（身份链需要 `user:profile`）、都不发 `expires_in`，拿到的是上游给的短效票。能力名随之由 `setup-token-long-lived` 改为 `setup-token-short-lived`，profile 的 scope 仍锁定、不接受调用方覆盖（#1550、#1551）。
+- 授权链接换票保留 helper 在 token 之后采集到的身份字段，修复链接导入丢失该身份的问题（#1549）。
+- `deploy/payload.json` 指向重建后的短效 OAuth helper（#1551）。
+
 ## 1.4.173 — 2026-11-21 · 修复 Gemini OAuth 账号文件导入
 
 - 将短期 OAuth 访问令牌传入隔离的账号探测进程，修复 Gemini 账号文件导入时宿主调用参数不匹配的问题（#1544）。
