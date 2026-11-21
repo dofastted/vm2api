@@ -461,7 +461,7 @@ export function NotifyPane({
       </Card>
       <Card>
         <CardHeader className='flex flex-row items-center justify-between gap-3'>
-          <CardTitle>飞书群自定义机器人</CardTitle>
+          <CardTitle>飞书 / Lark 群自定义机器人</CardTitle>
           <Button
             variant='outline'
             size='sm'
@@ -484,7 +484,7 @@ export function NotifyPane({
             desc={
               feishu.webhook_set
                 ? '已保存，留空保留'
-                : '从飞书群自定义机器人复制完整 Webhook 地址'
+                : '填写飞书或 Lark 群自定义机器人的完整 Webhook 地址'
             }
           >
             <Input
@@ -502,7 +502,7 @@ export function NotifyPane({
               onChange={(event) => patchFeishu({ webhook: event.target.value })}
             />
           </SettingRow>
-          <SettingRow label='签名密钥' desc='飞书机器人启用签名校验时填写'>
+          <SettingRow label='签名密钥' desc='群机器人启用签名校验时填写'>
             <Input
               aria-label='飞书签名密钥'
               className='w-full min-w-56 sm:w-80'

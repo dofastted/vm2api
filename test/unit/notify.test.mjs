@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import {
   normalizeNotifyConfig,
+  validateNotifyRoutingPatch,
   mergeNotifyConfig,
   publicNotifyConfig,
   publicRoutingNotify,
@@ -76,6 +77,23 @@ test('publicRoutingNotify redacts notify secrets and keeps routing fields', () =
 })
 
 const feishuWebhook = 'https://open.feishu.cn/open-apis/bot/v2/hook/test-webhook'
+const larkWebhook = 'https://open.larksuite.com/open-apis/bot/v2/hook/test-webhook'
+
+test('notification settings accept only official Feishu and Lark robot addresses', () => {
+  for (const webhook of ['', SECRET_KEEP, feishuWebhook, larkWebhook]) {
+    assert.doesNotThrow(() => validateNotifyRoutingPatch({ notify: { feishu: { webhook } } }))
+  }
+  for (const webhook of [
+    'http://open.larksuite.com/open-apis/bot/v2/hook/test-webhook',
+    'https://open.larksuite.com.example.test/open-apis/bot/v2/hook/test-webhook',
+    larkWebhook + '?extra=1',
+    larkWebhook + '/extra',
+  ]) {
+    assert.throws(() => validateNotifyRoutingPatch({ notify: { feishu: { webhook } } }), {
+      code: 'invalid_feishu_webhook',
+    })
+  }
+})
 
 test('Feishu settings keep and redact credentials and allow removing the signature secret', () => {
   const config = mergeNotifyConfig(
@@ -139,7 +157,68 @@ test('Feishu regular dispatch recognizes provider errors and omits secrets from 
     results: [{ ok: false, channel: 'feishu', error: '飞书机器人拒绝请求，请检查关键词设置' }],
   })
   await assert.rejects(sendNotifyTest(config, 'feishu', { fetch: async () => Response.json({}) }), /无效响应/)
-  await assert.rejects(sendNotifyTest({ feishu: { webhook: 'https://example.test/' } }, 'feishu'), /飞书群自定义机器人/)
+  await assert.rejects(sendNotifyTest({ feishu: { webhook: 'https://example.test/' } }, 'feishu'), /飞书或 Lark/)
+})
+
+test('Lark receives the same card payload and can render metrics without pool details', async () => {
+  const config = normalizeNotifyConfig({ feishu: { enabled: true, webhook: larkWebhook } })
+  assert.equal(notifyChannelsReady(config).feishu, true)
+  const result = await dispatchNotify(
+    config,
+    { title: '账号池汇报', metrics: [['可用', 3]] },
+    {
+      fetch: async (url, options) => {
+        assert.equal(url, larkWebhook)
+        const { card } = JSON.parse(options.body)
+        assert.equal(card.body.elements[0].columns[0].elements[0].content, '**3**\n可用')
+        return Response.json({ code: 0 })
+      },
+    },
+  )
+  assert.deepEqual(result, { ok: true, results: [{ ok: true, channel: 'feishu' }] })
+})
+
+test('Feishu delivery exposes safe DNS, TLS, and timeout diagnostics', async () => {
+  const config = normalizeNotifyConfig({ feishu: { enabled: true, webhook: feishuWebhook } })
+  for (const [code, message] of [
+    ['ENOTFOUND', 'DNS 解析失败'],
+    ['CERT_HAS_EXPIRED', 'TLS 校验失败'],
+    ['UND_ERR_CONNECT_TIMEOUT', '请求超时'],
+  ]) {
+    const result = await dispatchNotify(
+      config,
+      { text: 'test' },
+      {
+        fetch: async () => {
+          throw new TypeError(feishuWebhook, { cause: Object.assign(new Error(feishuWebhook), { code }) })
+        },
+      },
+    )
+    assert.deepEqual(result.results, [{ ok: false, channel: 'feishu', error: `飞书 / Lark Webhook ${message}` }])
+  }
+})
+
+test('Feishu delivery propagates caller cancellation during the response body', async () => {
+  const config = normalizeNotifyConfig({ feishu: { enabled: true, webhook: feishuWebhook } })
+  const controller = new AbortController()
+  const reason = new DOMException('test aborted', 'AbortError')
+  await assert.rejects(
+    dispatchNotify(
+      config,
+      { text: 'test' },
+      {
+        signal: controller.signal,
+        fetch: async (_url, { signal }) => ({
+          ok: true,
+          text: async () => {
+            controller.abort(reason)
+            signal.throwIfAborted()
+          },
+        }),
+      },
+    ),
+    (error) => error === reason,
+  )
 })
 
 test('Feishu outage cards put incident details ahead of metrics and link to the console', async () => {

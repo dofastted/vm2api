@@ -2,7 +2,8 @@
  * Account-pool notifications over email and group robots.
  * Watches the same availability口径 as the overview KPI
  * (has token and cred_status is not 不可用/吊销).
- * Secrets stay on disk; GET/public views expose only whether they are set.
+ * Public views expose only presence flags for email passwords, Telegram tokens,
+ * WeCom Webhooks, and Feishu/Lark Webhooks and signing secrets.
  */
 import { createHmac } from 'node:crypto'
 import net from 'node:net'
@@ -59,7 +60,9 @@ export const DEFAULT_NOTIFY = Object.freeze({
 
 const WECOM_WEBHOOK_BASE = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key='
 const WECOM_TEXT_MAX_BYTES = 2048
-const FEISHU_WEBHOOK = /^https:\/\/open\.feishu\.cn\/open-apis\/bot\/v2\/hook\/[A-Za-z0-9_-]{8,128}$/
+const FEISHU_WEBHOOK =
+  /^https:\/\/(?:open\.feishu\.cn|open\.larksuite\.com)\/open-apis\/bot\/v2\/hook\/[A-Za-z0-9_-]{8,128}$/
+const FEISHU_WEBHOOK_FORMAT_ERROR = '请填写飞书或 Lark 群自定义机器人的 HTTPS Webhook 地址'
 const FEISHU_TEXT_MAX_BYTES = 3000
 
 const EVENT_TITLES = {
@@ -93,6 +96,12 @@ function clampInt(value, min, max, fallback) {
 function isSecretKeep(value) {
   const s = String(value ?? '').trim()
   return !s || s === SECRET_KEEP || s === '••••' || /^•+$/.test(s)
+}
+
+export function validateNotifyRoutingPatch(body) {
+  const webhook = body?.notify?.feishu?.webhook
+  if (isSecretKeep(webhook) || (typeof webhook === 'string' && FEISHU_WEBHOOK.test(webhook.trim()))) return
+  throw Object.assign(new TypeError(FEISHU_WEBHOOK_FORMAT_ERROR), { code: 'invalid_feishu_webhook' })
 }
 
 function normalizeEmails(input) {
@@ -920,6 +929,8 @@ function feishuCard(message) {
           elements: [{ tag: 'markdown', content: `**${Number(count) || 0}**\n${label}` }],
         })),
       })
+    }
+    if (message.pool) {
       const pool = message.pool
       elements.push(paragraph(`已配置凭证 ${pool.with_token} / ${pool.total} 个槽位`))
       const flags = [
@@ -981,7 +992,7 @@ function feishuCard(message) {
 async function sendFeishuNotify(cfg, message, opts = {}) {
   const { webhook, secret } = cfg?.feishu || {}
   if (!webhook) throw new Error('飞书 Webhook 未配置')
-  if (!FEISHU_WEBHOOK.test(webhook)) throw new Error('请填写飞书群自定义机器人的 HTTPS Webhook 地址')
+  if (!FEISHU_WEBHOOK.test(webhook)) throw new Error(FEISHU_WEBHOOK_FORMAT_ERROR)
   const payload = {
     msg_type: 'interactive',
     card: feishuCard(message),
@@ -996,7 +1007,9 @@ async function sendFeishuNotify(cfg, message, opts = {}) {
   const timeout = AbortSignal.timeout(10_000)
   const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout
   let response
+  let raw
   try {
+    signal.throwIfAborted()
     response = await fetchFn(webhook, {
       method: 'POST',
       headers: { 'content-type': 'application/json; charset=utf-8' },
@@ -1004,11 +1017,27 @@ async function sendFeishuNotify(cfg, message, opts = {}) {
       redirect: 'error',
       signal,
     })
-  } catch {
-    throw new Error('飞书 Webhook 请求失败')
+    if (response.ok) raw = await response.text()
+  } catch (error) {
+    opts.signal?.throwIfAborted()
+    if (error?.name === 'AbortError' && !timeout.aborted) throw error
+    const code = error?.cause?.code ?? error?.code ?? ''
+    if (timeout.aborted || error?.name === 'TimeoutError' || ['ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT'].includes(code)) {
+      throw new Error('飞书 / Lark Webhook 请求超时')
+    }
+    if (['ENOTFOUND', 'EAI_AGAIN'].includes(code)) throw new Error('飞书 / Lark Webhook DNS 解析失败')
+    if (/^(?:ERR_TLS_|ERR_SSL_|CERT_|DEPTH_ZERO_|SELF_SIGNED_|UNABLE_TO_)/.test(code)) {
+      throw new Error('飞书 / Lark Webhook TLS 校验失败')
+    }
+    throw new Error('飞书 / Lark Webhook 连接失败')
   }
-  if (!response.ok) throw new Error(`飞书 Webhook HTTP ${response.status}`)
-  const data = await response.json().catch(() => null)
+  if (!response.ok) throw new Error(`飞书 / Lark Webhook HTTP ${response.status}`)
+  let data
+  try {
+    data = JSON.parse(raw)
+  } catch {
+    throw new Error('飞书 Webhook 返回了无效响应')
+  }
   const code = data?.code ?? data?.StatusCode
   if (code === 0) return { ok: true, channel: 'feishu' }
   if (code === 19021) throw new Error('飞书签名校验失败，请检查机器人签名密钥')
@@ -1033,6 +1062,7 @@ export function isNotifyChannel(channel) {
 }
 
 export async function dispatchNotify(cfg, message, opts = {}) {
+  opts.signal?.throwIfAborted()
   const ready = notifyChannelsReady(cfg)
   if (!ready.any) return { ok: false, error: 'no_channel', results: [] }
   const results = []
@@ -1041,6 +1071,8 @@ export async function dispatchNotify(cfg, message, opts = {}) {
     try {
       results.push(await send(cfg, message, opts))
     } catch (err) {
+      opts.signal?.throwIfAborted()
+      if (err?.name === 'AbortError') throw err
       results.push({ ok: false, channel, error: String(err?.message || err).slice(0, 180) })
     }
   }
@@ -1166,6 +1198,7 @@ export function createNotifyMonitor(opts = {}) {
             }
             dispatched.push({ type: event.type, ok: result?.ok !== false && !failedChannels.length, result })
           } catch (err) {
+            if (err?.name === 'AbortError') break
             deliveryError = String(err?.message || err).slice(0, 180)
             dispatched.push({ type: event.type, ok: false, error: deliveryError })
           }

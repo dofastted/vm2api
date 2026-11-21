@@ -327,6 +327,7 @@ import {
   publicNotifyConfig,
   publicRoutingNotify,
   sendNotifyTest,
+  validateNotifyRoutingPatch,
 } from './notify.mjs'
 import { UsageLogsView } from '../db/repos/usage-logs-view.mjs'
 import {
@@ -6736,6 +6737,7 @@ export function createPanelHandler(ctx) {
         if (body?.compatibility) body.compatibility = canonicalPersonaCompat(body.compatibility)
         const previousRoutingConfig = structuredClone(ctx.routingConfig)
         try {
+          validateNotifyRoutingPatch(body)
           if (body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')) {
             validateOpenAIQuotaPatch(body.codex.quota)
           }
