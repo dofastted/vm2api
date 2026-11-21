@@ -296,16 +296,26 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
       setAction('redeem')
       setNotice(undefined)
       try {
-        const result = await api<{ kernel_version: string }>('/api/panel/gemini/payload/redeem', {
-          method: 'POST',
-          body: JSON.stringify({ redemption_code: redemptionCode }),
-        })
+        const result = await api<{ kernel_version: string }>(
+          '/api/panel/gemini/payload/redeem',
+          {
+            method: 'POST',
+            body: JSON.stringify({ redemption_code: redemptionCode }),
+          }
+        )
         setCode('')
-        setNotice({ text: `CRAGGemini ${result.kernel_version} 已激活。Google 账号仍需单独授权。` })
-        await qc.invalidateQueries({ queryKey: geminiInventoryOptions().queryKey })
+        setNotice({
+          text: `CRAGGemini ${result.kernel_version} 已激活。Google 账号仍需单独授权。`,
+        })
+        await qc.invalidateQueries({
+          queryKey: geminiInventoryOptions().queryKey,
+        })
       } catch (error) {
         setNotice({
-          text: isApiError(error) && error.code?.startsWith('gemini_') ? error.message : '无法确认 CRAGGemini 兑换结果，请重试。',
+          text:
+            isApiError(error) && error.code?.startsWith('gemini_')
+              ? error.message
+              : '无法确认 CRAGGemini 兑换结果，请重试。',
           error: true,
         })
       } finally {
@@ -533,7 +543,8 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
             id='crag-host-redeem-help'
             className='text-sm text-muted-foreground'
           >
-            Claude 订阅码增加本机槽位；以 CGG1- 开头的码兑换 CRAGGemini，不占用 Claude 槽位。
+            Claude 订阅码增加本机槽位；以 CGG1- 开头的码兑换 CRAGGemini，不占用
+            Claude 槽位。
           </p>
           <Button type='submit' size='sm' disabled={!code.trim() || !!action}>
             {action === 'redeem' ? '正在兑换…' : '兑换到本机'}

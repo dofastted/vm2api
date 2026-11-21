@@ -52,7 +52,9 @@ async function readOAuthAccount(file: File | null) {
       expiry_timestamp: token.expiry_timestamp,
     }
   } catch {
-    throw new Error('文件格式无效，请选择 Antigravity Tools 导出的单个账号 JSON。')
+    throw new Error(
+      '文件格式无效，请选择 Antigravity Tools 导出的单个账号 JSON。'
+    )
   }
 }
 

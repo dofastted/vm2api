@@ -1,4 +1,5 @@
 import crypto from 'node:crypto'
+import { setTimeout as sleep } from 'node:timers/promises'
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const MODEL = /^[a-z0-9][a-z0-9._-]{0,99}$/
@@ -46,40 +47,20 @@ function known(error) {
   return null
 }
 
-function sleep(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(Object.assign(new Error('aborted'), { code: 'ABORT_ERR' }))
-    const timer = setTimeout(resolve, ms)
-    signal?.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(timer)
-        reject(Object.assign(new Error('aborted'), { code: 'ABORT_ERR' }))
-      },
-      { once: true },
-    )
-  })
-}
-
-function pickAccount(accounts, model) {
+function modelAccounts(accounts, model) {
   const ready = accounts.filter((account) => account.models.includes(model))
-  if (!ready.length) return null
-  return ready[crypto.randomInt(ready.length)]
+  const start = ready.length ? crypto.randomInt(ready.length) : 0
+  return [...ready.slice(start), ...ready.slice(0, start)]
 }
 
 async function readRun(callHost, id, runId, signal) {
   const deadline = Date.now() + TURN_MS
   while (Date.now() < deadline) {
-    if (signal?.aborted) throw Object.assign(new Error('aborted'), { code: 'ABORT_ERR' })
+    signal?.throwIfAborted()
     const result = await callHost('test-chat-status', { id, run_id: runId })
     if (result?.state === 'completed' || result?.state === 'failed') return result
     if (result?.state !== 'running') throw fail(502, 'gemini_host_protocol_error')
-    await sleep(POLL_MS, signal)
-  }
-  try {
-    await callHost('test-chat-cancel', { id, run_id: runId })
-  } catch {
-    // The host reaps the run on its own deadline if cancel misses.
+    await sleep(POLL_MS, undefined, { signal })
   }
   throw fail(504, 'gemini_inference_timeout')
 }
@@ -89,11 +70,21 @@ export function createGeminiScheduler({ callHost, resolveProxy, apiKeyStore, gro
     async catalog() {
       const view = await callHost('list', {})
       if (!Array.isArray(view?.environments)) throw fail(502, 'gemini_host_protocol_error')
+      if (view.payload_state !== 'installed') return { models: [], accounts: [] }
       const accounts = []
       for (const environment of view.environments) {
-        if (environment?.auth_state !== 'authorized' || typeof environment.id !== 'string' || !ID.test(environment.id)) {
+        if (
+          environment?.auth_state !== 'authorized' ||
+          environment.oauth_imported === true ||
+          (environment.auth_method === 'oauth' && view.oauth_runtime_issue) ||
+          typeof environment.id !== 'string' ||
+          !ID.test(environment.id) ||
+          typeof environment.proxy_id !== 'string' ||
+          !ID.test(environment.proxy_id) ||
+          environment.models_discovered !== true ||
+          !Array.isArray(environment.models)
+        )
           continue
-        }
         if (resolveProxy) {
           try {
             resolveProxy(environment.proxy_id)
@@ -106,7 +97,7 @@ export function createGeminiScheduler({ callHost, resolveProxy, apiKeyStore, gro
         for (const model of environment.models || []) {
           if (typeof model === 'string' && MODEL.test(model)) models.push(model)
         }
-        if (environment.models_discovered === true && models.length) accounts.push({ id: environment.id, models })
+        if (models.length) accounts.push({ id: environment.id, models })
       }
       return {
         models: [...new Set(accounts.flatMap((account) => account.models))].map((id) => ({
@@ -123,36 +114,51 @@ export function createGeminiScheduler({ callHost, resolveProxy, apiKeyStore, gro
       if (gate && !gate.ok) throw fail(gate.status || 429, gate.code, gate.message)
       let run = null
       try {
+        signal?.throwIfAborted()
         const catalog = await this.catalog()
-        const account = pickAccount(catalog.accounts, model)
-        if (!account) {
+        const candidates = modelAccounts(catalog.accounts, model)
+        if (!candidates.length) {
           throw fail(
             catalog.accounts.length ? 404 : 503,
             catalog.accounts.length ? 'gemini_model_unavailable' : 'gemini_no_account',
           )
         }
-        const listed = await callHost('get', { id: account.id })
-        const proxyId = listed?.proxy_id
-        if (typeof proxyId !== 'string' || !ID.test(proxyId)) throw fail(502, 'gemini_host_protocol_error')
-        const proxyUrl = resolveProxy ? resolveProxy(proxyId) : undefined
-        const started = await callHost('test-chat', {
-          id: account.id,
-          proxy_id: proxyId,
-          ...(proxyUrl ? { proxy_url: proxyUrl } : {}),
-          model,
-          prompt: text,
-        })
-        if (typeof started?.run_id !== 'string' || !RUN_ID.test(started.run_id)) {
-          throw fail(502, 'gemini_host_protocol_error')
+        for (const account of candidates) {
+          const listed = await callHost('get', { id: account.id })
+          const proxyId = listed?.proxy_id
+          if (typeof proxyId !== 'string' || !ID.test(proxyId)) throw fail(502, 'gemini_host_protocol_error')
+          const proxyUrl = resolveProxy ? resolveProxy(proxyId) : undefined
+          signal?.throwIfAborted()
+          let started
+          try {
+            started = await callHost('test-chat', {
+              id: account.id,
+              proxy_id: proxyId,
+              proxy_url: proxyUrl,
+              model,
+              prompt: text,
+            })
+          } catch (error) {
+            // Busy is a host admission refusal before any upstream work starts.
+            if (error?.code === 'gemini_operation_busy') continue
+            throw error
+          }
+          if (typeof started?.run_id !== 'string' || !RUN_ID.test(started.run_id)) {
+            throw fail(502, 'gemini_host_protocol_error')
+          }
+          run = { id: account.id, run_id: started.run_id }
+          break
         }
-        run = { id: account.id, run_id: started.run_id }
-        const result = await readRun(callHost, account.id, started.run_id, signal)
+        if (!run) throw fail(503, 'gemini_operation_busy')
+        const { id: accountId, run_id: runId } = run
+        const result = await readRun(callHost, accountId, runId, signal)
+        run = null
         if (result.state === 'failed') {
           const code = typeof result.error?.code === 'string' ? result.error.code : 'gemini_inference_failed'
-          const mapped = FAILURES[code]
+          const mapped = Object.hasOwn(FAILURES, code) ? FAILURES[code] : null
           throw fail(mapped?.[0] || 502, mapped ? code : 'gemini_inference_failed')
         }
-        const textOut = typeof result.text === 'string' ? result.text : ''
+        if (typeof result.text !== 'string') throw fail(502, 'gemini_host_protocol_error')
         const usage = {}
         for (const key of ['input_tokens', 'output_tokens', 'total_tokens']) {
           const count = result.usage?.[key]
@@ -166,9 +172,9 @@ export function createGeminiScheduler({ callHost, resolveProxy, apiKeyStore, gro
             { model, rateMultiplier: multiplier },
           )
         }
-        return { text: textOut, usage, account_id: account.id, model }
+        return { text: result.text, usage, account_id: accountId, model }
       } catch (error) {
-        if (signal?.aborted && run) {
+        if (run) {
           try {
             await callHost('test-chat-cancel', run)
           } catch {

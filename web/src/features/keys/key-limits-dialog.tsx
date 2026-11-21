@@ -410,7 +410,8 @@ export function KeyLimitsDialog({
               </Field>
             ) : draft.group_type === 'gemini' ? (
               <p className='text-xs text-muted-foreground sm:col-span-2'>
-                仅用于 Gemini 宿主机账号，不使用 VM 或直连渠道。请求会在已授权且已拉取模型的账号之间调度。
+                仅用于 Gemini 宿主机账号，不使用 VM
+                或直连渠道。请求会在已授权且已拉取模型的账号之间调度。
               </p>
             ) : draft.group_type === 'all' ? (
               <p className='text-xs text-muted-foreground sm:col-span-2'>

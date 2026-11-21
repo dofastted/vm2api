@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import http from 'node:http'
 import { isIP } from 'node:net'
 import path from 'node:path'
+import { filterModelCatalogForKey, keyModelError } from '../admin/key-models.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
@@ -43,6 +44,11 @@ const SOCKET_ERRORS = new Map([
   ['EACCES', 'gemini_host_socket_denied'],
   ['EPERM', 'gemini_host_socket_denied'],
   ['ABORT_ERR', 'gemini_host_timeout'],
+])
+const HOST_INFRASTRUCTURE_CODES = new Set([
+  ...SOCKET_ERRORS.values(),
+  'gemini_host_invalid_socket',
+  'gemini_host_unsupported_platform',
 ])
 const PAYLOAD_ISSUES = new Set([
   'gemini_public_key_missing',
@@ -640,6 +646,12 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
 
 function publicError(error) {
   const code = typeof error?.code === 'string' ? error.code : FAILURE
+  if (code === FAILURE || HOST_INFRASTRUCTURE_CODES.has(code)) {
+    return {
+      status: 503,
+      body: { error: { type: 'api_error', code: FAILURE, message: 'Gemini host is not available.' } },
+    }
+  }
   const known = HOST_ERRORS[code]
   const status = Number.isInteger(error?.status) ? error.status : known?.[0] || 503
   return {
@@ -660,16 +672,19 @@ function anthropicText(content) {
   return typeof content[0].text === 'string' ? content[0].text : ''
 }
 
-export function geminiTurnFromBody(body) {
+export function geminiTurnFromBody(body, messages) {
   const model = typeof body?.model === 'string' ? body.model : ''
-  let text = ''
-  if (typeof body?.input === 'string') text = body.input
-  else if (Array.isArray(body?.messages) && body.messages.length === 1) text = anthropicText(body.messages[0]?.content)
-  else if (Array.isArray(body?.contents) && body.contents.length === 1) {
-    const parts = body.contents[0]?.parts
-    text = Array.isArray(parts) && parts.length === 1 && typeof parts[0]?.text === 'string' ? parts[0].text : ''
+  const fields = messages ? ['model', 'messages', 'stream'] : ['model', 'input', 'stream']
+  if (!MODEL.test(model) || Object.keys(body).some((key) => !fields.includes(key))) return null
+  if (body.stream !== undefined && body.stream !== false) return null
+  let text = body.input
+  if (messages) {
+    if (!Array.isArray(body.messages) || body.messages.length !== 1) return null
+    const message = body.messages[0]
+    if (message?.role !== 'user' || Object.keys(message).some((key) => !['role', 'content'].includes(key))) return null
+    text = anthropicText(message.content)
   }
-  return MODEL.test(model) && text.trim() ? { model, text } : null
+  return validPrompt(text) ? { model, text } : null
 }
 
 /**
@@ -703,10 +718,10 @@ export function createGeminiPublicHandler({ json, readBody, scheduler }) {
       })
     }
     const url = new URL(req.url || PUBLIC_PATH, 'http://127.0.0.1')
-    if (req.method === 'GET' && url.pathname === PUBLIC_PATH) {
+    if (req.method === 'GET' && [PUBLIC_PATH, '/v1/models', '/models'].includes(url.pathname)) {
       try {
         const catalog = await scheduler.catalog()
-        return json(res, 200, { object: 'list', data: catalog.models })
+        return json(res, 200, filterModelCatalogForKey({ object: 'list', data: catalog.models }, req))
       } catch (error) {
         const mapped = publicError(error)
         return json(res, mapped.status, mapped.body)
@@ -727,12 +742,15 @@ export function createGeminiPublicHandler({ json, readBody, scheduler }) {
         return json(res, error?.status || 400, { error: { code: 'invalid_json', message: 'Invalid JSON body.' } })
       }
     }
-    const requested = geminiTurnFromBody(body)
+    const requested = geminiTurnFromBody(body, messages)
     if (!requested) {
       return json(res, 400, {
         error: { code: 'gemini_unsupported_turn', message: 'Send one plain-text turn and a Gemini model id.' },
       })
     }
+    const denied = keyModelError(req, requested.model, { anthropic: messages })
+    if (denied) return json(res, denied.status, denied.body)
+
     const controller = new AbortController()
     req.once('aborted', () => controller.abort())
     res.once('close', () => {

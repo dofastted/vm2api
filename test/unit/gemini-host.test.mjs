@@ -660,7 +660,14 @@ test('Gemini public routes schedule one plain-text turn and reject other keys', 
   // with no `type` / `role` / `content` is unparseable, and the id must not be the path.
   for (const url of ['/v1/messages', '/messages']) {
     const anthropic = await handle(
-      { method: 'POST', url, apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini' }, once() {} },
+      {
+        method: 'POST',
+        url,
+        apiKeyKind: 'managed',
+        apiKeyRecord: { group_type: 'gemini' },
+        body: { model, messages: [{ role: 'user', content: 'hello' }] },
+        once() {},
+      },
       res,
     )
     assert.equal(anthropic.status, 200)
@@ -673,6 +680,27 @@ test('Gemini public routes schedule one plain-text turn and reject other keys', 
     assert.deepEqual(anthropic.body.usage, { input_tokens: 1, output_tokens: 1 })
     assert.equal(anthropic.body.output_text, undefined)
   }
+  assert.equal(calls.length, 3)
+  const scoped = { apiKeyKind: 'managed', apiKeyRecord: { group_type: 'gemini', allowed_models: [model] }, once() {} }
+  for (const body of [
+    { model: 'gemini-other', input: 'hello' },
+    { model, input: 'hello', stream: true },
+    { model, input: 'hello', tools: [{ name: 'lookup' }] },
+    { model, input: '测'.repeat(1366) },
+  ]) {
+    const result = await handle({ ...scoped, method: 'POST', url: '/v1/gemini/sessions/reject', body }, res)
+    assert.equal(result.status, 400)
+  }
+  const filtered = await handle(
+    {
+      ...scoped,
+      apiKeyRecord: { ...scoped.apiKeyRecord, allowed_models: ['gemini-other'] },
+      method: 'GET',
+      url: '/v1/models',
+    },
+    res,
+  )
+  assert.deepEqual(filtered.body.data, [])
   assert.equal(calls.length, 3)
   const bad = createGeminiPublicHandler({
     json: respond,
@@ -710,7 +738,7 @@ test('the public scheduler completes one turn through the host socket', async ()
       const body = JSON.parse(Buffer.concat(chunks).toString() || '{}')
       const payload =
         request.url === '/list'
-          ? { environments: [account] }
+          ? { payload_state: 'installed', environments: [account] }
           : request.url === '/get'
             ? account
             : request.url === '/test-chat' && body.prompt === 'hello'

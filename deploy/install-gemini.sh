@@ -5,8 +5,8 @@ if [[ $# -ne 0 ]]; then
   echo "install-gemini.sh does not take arguments; it always runs prepare-gemini" >&2
   exit 2
 fi
-url="${VM2API_INSTALL_URL:-https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install.sh}"
+url=https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install.sh
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
-curl -fsSL "$url" -o "$tmp"
-exec bash "$tmp" prepare-gemini
+curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 "$url" -o "$tmp"
+bash "$tmp" prepare-gemini

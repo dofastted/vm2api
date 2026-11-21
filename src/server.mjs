@@ -1397,19 +1397,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
-      if (groupType === 'gemini') {
-        try {
-          const catalog = await geminiScheduler.catalog()
-          return json(res, 200, { object: 'list', data: catalog.models })
-        } catch (error) {
-          return json(res, error.status || 503, {
-            error: {
-              code: error.code || 'gemini_host_unavailable',
-              message: error.message || 'Gemini host is not available.',
-            },
-          })
-        }
-      }
+      if (groupType === 'gemini') return handleGeminiPublic(req, res)
       if (resolveInferenceBackend(req) === 'api') {
         return json(res, 200, filterModelCatalogForKey(apiScheduler.catalog(apiScheduleScope(req, groupType)), req))
       }

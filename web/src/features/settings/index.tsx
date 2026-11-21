@@ -200,7 +200,8 @@ export function SettingsPage() {
     serverJson !== null &&
     Object.keys(draft).length > 0 &&
     JSON.stringify(draft) !== serverJson
-  const hideSave = tab === 'socks5' || tab === 'backup' || tab === 'about' || tab === 'gemini'
+  const hideSave =
+    tab === 'socks5' || tab === 'backup' || tab === 'about' || tab === 'gemini'
   const showSaveBar = dirty && !hideSave
 
   const discard = () => {
