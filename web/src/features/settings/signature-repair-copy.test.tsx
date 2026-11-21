@@ -8,6 +8,7 @@ describe('signature repair wording', () => {
     const html = renderToStaticMarkup(
       <QueryClientProvider client={new QueryClient()}>
         <HealthPane
+          title='探测'
           failover={{}}
           healthProbe={{}}
           compatibility={{ min_max_tokens: {} }}
