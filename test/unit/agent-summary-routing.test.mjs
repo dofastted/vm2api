@@ -39,9 +39,9 @@ function success() {
   }
 }
 
-function harness({ mode = 'rebuild', capacity = 2, agentId = '', crag = false } = {}) {
+function harness({ mode = 'rebuild', capacity = 2, agentId = '', crag = false, compatibility = {} } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-summary-'))
-  const routing = { compatibility: {}, failover: {}, sticky: { enabled: true, outbound_session: mode } }
+  const routing = { compatibility, failover: {}, sticky: { enabled: true, outbound_session: mode } }
   const routingFile = path.join(root, 'routing.json')
   fs.writeFileSync(routingFile, JSON.stringify(routing))
   const sticky = new StickyRouter({ dataDir: root, config: routing })
@@ -382,3 +382,32 @@ test('cancelling a queued summary removes its ticket without releasing the paren
     h.close()
   }
 })
+
+for (const enabled of [false, true]) {
+  test(`CRAG print ${enabled ? 'drops' : 'keeps'} unrecorded thinking when crag_drop_foreign_thinking is ${enabled}`, async () => {
+    const h = harness({ crag: true, compatibility: { crag_drop_foreign_thinking: enabled } })
+    const body = agentBody()
+    body.messages = [
+      { role: 'user', content: 'First question.' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'from another account', signature: 'sig-never-recorded-0123456789abcd' },
+          { type: 'text', text: 'First answer.' },
+        ],
+      },
+      { role: 'user', content: 'Second question.' },
+    ]
+    try {
+      const response = await h.invoke('foreign', body)
+      assert.equal(response.statusCode, 200, JSON.stringify(response.body))
+      const sent = h.calls.find((call) => call.id === 'foreign').body
+      const turn = sent.messages.find((message) => message.role === 'assistant')
+      const types = turn.content.map((block) => block.type)
+      assert.equal(types.includes('thinking'), !enabled, JSON.stringify(turn.content))
+      assert.ok(turn.content.some((block) => block.type === 'text' && block.text === 'First answer.'))
+    } finally {
+      h.close()
+    }
+  })
+}

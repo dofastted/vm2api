@@ -13,6 +13,7 @@ import {
   isAllowedSkeletonDiff,
   outboundShape,
 } from '../../src/lib/protocol/outbound-shape.mjs'
+import { hasForeignSystemBlock, relocateThirdPartySystem } from '../../src/lib/protocol/third-party-system.mjs'
 import { sealClaudeCodeCch } from '../../src/lib/identity/cch.mjs'
 import { OFFICIAL_303_MAIN_PROMPT } from '../../src/lib/identity/official-profiles.mjs'
 
@@ -69,6 +70,15 @@ test('shape keeps structure only: no prompt text, ids or secrets', () => {
   assert.equal(shape.messages[0].blocks[0].kind, 'reminder')
   assert.equal(shape.messages[1].kind, 'env')
   assert.equal(shape.markers.total, 3)
+})
+
+test('the official 2.1.321 system envelope does not open the relocation gate', () => {
+  // The gate is what keeps official traffic out of relocation: handle-protocol
+  // only calls the mover when this is true, so a false here means the envelope
+  // is never relocated. The mover itself is greedy by default (third-party
+  // callers reach it through `!officialTraffic`) and narrow only when asked.
+  assert.equal(hasForeignSystemBlock(SECRET_BODY.system), false)
+  assert.equal(relocateThirdPartySystem(SECRET_BODY, { onlyForeign: true }).moved, false)
 })
 
 test('diff ignores lengths and reports structural changes by path', () => {

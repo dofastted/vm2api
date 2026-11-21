@@ -97,7 +97,7 @@ import {
 import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { canReuseCanonicalHistory } from './sanitize.mjs'
-import { relocateThirdPartySystem, thirdPartyRelocateEnabled } from './third-party-system.mjs'
+import { hasForeignSystemBlock, relocateThirdPartySystem, thirdPartyRelocateEnabled } from './third-party-system.mjs'
 import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
 import {
   callerCwdDeclaration,
@@ -191,6 +191,7 @@ import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { formatPoolSelectionSummary } from '../pool/pool-scheduler.mjs'
 import { extraHeadersFromLimitError, isAccountQuotaExhausted } from '../pool/quota-window.mjs'
 import {
+  dropForeignThinkingForCrag,
   filterThinkingForAccount,
   recordThinkingOwners,
   thinkingOwners as defaultThinkingOwners,
@@ -1497,15 +1498,23 @@ export function createHandleProtocol(deps) {
       inferenceBackend !== 'api' &&
       !requestContext &&
       !officialPassthrough &&
-      !officialTraffic &&
+      (!officialTraffic || hasForeignSystemBlock(ctx.body.system)) &&
       thirdPartyRelocateEnabled(getRouting())
     ) {
-      const relocated = relocateThirdPartySystem(ctx.body)
+      // Official traffic only gets here because the gate found a positively
+      // foreign block, so move just that block: the real official envelope has
+      // standalone harness/boundary/guidance blocks that the greedy predicate
+      // would strip along with it.
+      const relocated = relocateThirdPartySystem(ctx.body, { onlyForeign: officialTraffic === true })
       if (relocated.moved) {
         // A CRAG hop sends cragSystem (the caller system without its <cwd>
         // declaration) instead of personaIn.system. Relocate that projection
         // too, or the hop would put the third-party prompt back into system.
-        if (hasCragSystem) cragRelocated = relocateThirdPartySystem({ ...ctx.body, system: cragSystem }).body
+        if (hasCragSystem)
+          cragRelocated = relocateThirdPartySystem(
+            { ...ctx.body, system: cragSystem },
+            { onlyForeign: officialTraffic === true },
+          ).body
         ctx.body = relocated.body
       }
     }
@@ -1922,6 +1931,30 @@ export function createHandleProtocol(deps) {
               // The CRAG kernel fingerprints the public stream it already sent,
               // including thinking. Rewriting an unrecorded signature into text
               // makes the tool continuation fail with tool_result history mismatch.
+              // routing.compatibility.crag_drop_foreign_thinking (default off): signed
+              // blocks this account did not mint (another account's, or never
+              // recorded) never came from this kernel; drop them before the hop
+              // instead of waiting for the 400.
+              const cragOwned =
+                routingNow?.compatibility?.crag_drop_foreign_thinking === true
+                  ? dropForeignThinkingForCrag(source, selected.accountId, thinkingOwnerStore)
+                  : { body: source }
+              source = cragOwned.body
+              if (cragOwned.dropped || cragOwned.bailed) {
+                const { kept, dropped, droppedTurns, openLoop, thinkingOff, bailed } = cragOwned
+                logBag.hop_meta = {
+                  ...logBag.hop_meta,
+                  thinking_owner_crag: {
+                    account_id: selected.accountId,
+                    kept,
+                    dropped,
+                    dropped_turns: droppedTurns,
+                    open_loop: openLoop,
+                    thinking_off: thinkingOff,
+                    bailed,
+                  },
+                }
+              }
               for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
               hopBody = prepareCragPrintBody(source, {
                 preset: cragPersona,
@@ -1985,7 +2018,9 @@ export function createHandleProtocol(deps) {
                   preparedHop,
                   transportRouting,
                   requestContext,
-                  repaired,
+                  // thinking was dropped for this hop: skip ensureOfficialPrintThinking, which
+                  // would otherwise re-add adaptive thinking to a body whose loop lost its blocks.
+                  repaired: repaired || cragOwned.thinkingOff === true,
                   dropSampling,
                 },
               }
@@ -2075,6 +2110,7 @@ export function createHandleProtocol(deps) {
               vmId: selected.vmId,
               accountId: selected.accountId,
               requestId: logCtx.request_id,
+              ctx: bodyCtx,
             })
             logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
             return {
@@ -2165,6 +2201,7 @@ export function createHandleProtocol(deps) {
             vmId: selected.vmId,
             accountId: selected.accountId,
             requestId: logCtx.request_id,
+            ctx: bodyCtx,
           })
           logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(outbound) || attemptSessionId)
           return {

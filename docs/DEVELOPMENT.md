@@ -75,9 +75,25 @@ git push origin --delete feat/<slug>             # 远端分支未被自动删�
 
 `ci` 始终会启动，再由 `changes` 决定跳过哪些步骤。它是必过检查，所以不能用 `paths-ignore` 跳过整个工作流，否则 PR 会一直挂着等待检查结果。
 
+## CHANGELOG
+
+**PR 不要改 `CHANGELOG.md`。** 版本记录在发版时统一写。
+
+`## Unreleased` 是个单点：每个 PR 都往同一处追加 bullet，所以任意两个这种 PR 之间互相冲突，而一次发版把该小节收进版本号之后，所有挂着的 PR 同时失效——1.4.171 发版一次性作废了三个本来干净的 PR（#1397、#1361、#1354），它们的代码都能自动合并，只冲突 CHANGELOG。
+
+它也没真正起到作用：1.4.171 的 30 个 PR 里只有 1 个在 Unreleased 留了记录，小节终究是从合并提交列表反查重建的。所以把反查写成正式步骤：
+
+```
+git log --format='%s' v<上一版>..origin/dev --merges | grep -oP '#\d+ from \S+'
+```
+
+拿到 PR 列表后逐个核对各分支的提交信息再落条目，不要只凭 PR 描述——描述可能停在首个提交，后续提交会改掉设计。
+
+想让某个改动的说明不丢，写在 PR 描述和提交信息里即可。
+
 ## 发版
 
-1. 在 `dev` 上开一个 `chore/release-v<VERSION>` 分支，更新 `VERSION`、`CHANGELOG.md`，需要时更新 `deploy/payload.json`，PR 合入 `dev`。
+1. 在 `dev` 上开一个 `chore/release-v<VERSION>` 分支，更新 `VERSION` 与 `CHANGELOG.md`（按上一节反查重建本版小节），需要时更新 `deploy/payload.json`，PR 合入 `dev`。
 2. 开 PR `dev → main`，用普通 merge（不 squash），保持两条分支历史一致。
 3. 在 `main` 的合并提交上打 tag `v<VERSION>` 并推送，`release` 自动执行。
 4. 核对附件和镜像，再按部署流程上线。发布与部署是两件事，见 [BUILD.md](BUILD.md)、[DEPLOY.md](DEPLOY.md)。

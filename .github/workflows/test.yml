@@ -37,6 +37,7 @@ jobs:
       oauth: ${{ inputs.full || steps.filter.outputs.oauth == 'true' }}
       unit_tests: ${{ steps.filter.outputs.unit_tests_files || '[]' }}
       web_tests: ${{ steps.filter.outputs.web_tests_files || '[]' }}
+      web_src: ${{ steps.filter.outputs.web_src_files || '[]' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -87,6 +88,9 @@ jobs:
             web_tests:
               - added|modified: 'web/src/**/*.test.ts'
               - added|modified: 'web/src/**/*.test.tsx'
+            web_src:
+              - added|modified: 'web/src/**/*.ts'
+              - added|modified: 'web/src/**/*.tsx'
 
   ci:
     needs: changes
@@ -155,7 +159,9 @@ jobs:
             (cd worker && CGO_ENABLED=0 go build -o ../bin/kin-egress ./cmd/kin-egress)
           fi
           if [ "$FULL" = true ]; then
-            npm run test:unit
+            # Four workers for the four vCPUs a standard runner has. The suite is
+            # 412 files and over a quarter of an hour one at a time.
+            VM2API_TEST_CONCURRENCY=4 npm run test:unit
           else
             tests=$(jq -r '.[] | split("/")[-1] | select(. != "oauth-binary.test.mjs")' <<< "$CHANGED_TESTS")
             changed=()
@@ -182,6 +188,7 @@ jobs:
         env:
           FULL: ${{ inputs.full }}
           CHANGED_TESTS: ${{ needs.changes.outputs.web_tests }}
+          CHANGED_SRC: ${{ needs.changes.outputs.web_src }}
         run: |
           pnpm install --frozen-lockfile
           if [ "$FULL" = true ]; then
@@ -191,6 +198,18 @@ jobs:
             changed=()
             if [ -n "$tests" ]; then
               mapfile -t changed <<< "$tests"
+            fi
+            # A changed source file is covered by its sibling test, which the
+            # changed-test filter alone never selects. Without this a PR can
+            # break a test it does not touch and still go green.
+            while IFS= read -r src; do
+              [ -n "$src" ] || continue
+              for candidate in "${src%.*}.test.tsx" "${src%.*}.test.ts"; do
+                [ -f "$candidate" ] && changed+=("$candidate")
+              done
+            done <<< "$(jq -r '.[] | ltrimstr("web/")' <<< "$CHANGED_SRC")"
+            if [ ${#changed[@]} -gt 0 ]; then
+              mapfile -t changed < <(printf '%s\n' "${changed[@]}" | sort -u)
             fi
             pnpm test:ci "${changed[@]}"
           fi
