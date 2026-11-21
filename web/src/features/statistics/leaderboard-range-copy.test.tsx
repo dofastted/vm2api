@@ -37,6 +37,6 @@ describe('leaderboard range wording', () => {
     expect(html).toContain('>今日暂无数据<')
     expect(html).not.toContain('>7天<')
     expect(html).not.toContain('>30天<')
-    expect(html).toContain("class=\"mb-6 flex flex-wrap items-center gap-1\"")
+    expect(html).toContain('class="mb-6 flex flex-wrap items-center gap-1"')
   })
 })

@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import os from 'node:os'
 import { startGateway, api } from '../harness.mjs'
 
 const MODEL = 'claude-haiku-4-5-20251001'
@@ -112,8 +113,10 @@ test('panel creates managed key; key can call /v1/messages', async () => {
   }
 })
 
-test('Gemini keys persist, remain isolated and fail closed without an OAuth runtime', async () => {
-  const gw = await startGateway()
+test('Gemini keys persist, remain isolated and fail closed without the host service', async () => {
+  const gw = await startGateway({
+    env: { KIN_GEMINI_HOST_SOCKET: `${os.tmpdir()}/missing-gemini-${process.pid}.sock` },
+  })
   try {
     const created = await api(gw, 'POST', '/api/panel/api-keys', { body: { name: 'host-oauth', group_type: 'gemini' } })
     assert.equal(created.status, 201, created.text)
@@ -130,15 +133,24 @@ test('Gemini keys persist, remain isolated and fail closed without an OAuth runt
     const wrongKey = await api(gw, 'POST', '/v1/gemini/sessions', { body: {} })
     assert.equal(wrongKey.status, 403, wrongKey.text)
     assert.equal(wrongKey.json.error.code, 'gemini_key_required')
-    const unavailable = await api(gw, 'POST', '/v1/gemini/sessions', { headers, body: {} })
+    const unavailable = await api(gw, 'POST', '/v1/gemini/sessions/turn-1', {
+      headers,
+      body: { model: 'gemini-3-pro', input: 'hello' },
+    })
     assert.equal(unavailable.status, 503, unavailable.text)
-    assert.equal(unavailable.json.error.code, 'gemini_runtime_not_supported')
+    assert.equal(unavailable.json.error.code, 'gemini_host_unavailable')
     const models = await api(gw, 'GET', '/v1/models', { headers })
-    assert.equal(models.status, 200, models.text)
-    assert.deepEqual(models.json.data, [])
-    const messages = await api(gw, 'POST', '/v1/messages', { headers, body: {} })
-    assert.equal(messages.status, 403, messages.text)
-    assert.equal(messages.json.error.code, 'key_group_mismatch')
+    assert.equal(models.status, 503, models.text)
+    assert.equal(models.json.error.code, 'gemini_host_unavailable')
+    const messages = await api(gw, 'POST', '/v1/messages', {
+      headers,
+      body: { model: 'gemini-3-pro', messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] },
+    })
+    assert.equal(messages.status, 503, messages.text)
+    assert.equal(messages.json.error.code, 'gemini_host_unavailable')
+    const isolated = await api(gw, 'POST', '/v1/chat/completions', { headers, body: {} })
+    assert.equal(isolated.status, 403, isolated.text)
+    assert.equal(isolated.json.error.code, 'key_group_mismatch')
   } finally {
     await gw.stop()
   }

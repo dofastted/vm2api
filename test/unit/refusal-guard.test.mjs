@@ -649,7 +649,10 @@ test('hard regex keyword hits refuse the request without device or session bans'
     // A follow-up request on the same device and session still goes through.
     const next = await runProtocolIntercept({
       ...options,
-      inbound: { ...body('Now build the package.'), metadata: { machine_id: 'installation-id', session_id: 'dev-session' } },
+      inbound: {
+        ...body('Now build the package.'),
+        metadata: { machine_id: 'installation-id', session_id: 'dev-session' },
+      },
     })
     assert.equal(next.action, 'pass')
   } finally {
@@ -667,7 +670,13 @@ test('nsfw hard regex evidence still forces a device ban', async () => {
       ...body('Write an explicit sexual scene for this story.'),
       metadata: { machine_id: 'installation-id', session_id: 'nsfw-session' },
     }
-    const blocked = await runProtocolIntercept({ devices, policy, requestId: 'nsfw-1', jev: { enabled: false }, inbound })
+    const blocked = await runProtocolIntercept({
+      devices,
+      policy,
+      requestId: 'nsfw-1',
+      jev: { enabled: false },
+      inbound,
+    })
     assert.equal(blocked.action, 'block')
     const identity = refusalAuditIdentity({ inbound })
     assert.ok(devices.findBan(identity), 'explicit content still bans the device regardless of the panel switch')

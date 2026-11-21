@@ -5,7 +5,7 @@
  */
 import crypto from 'node:crypto'
 
-export const VM_MEMORY_OPTIONS = Object.freeze(['256m', '512m', '1g', '2g', '4g', '8g', '16g'])
+export const VM_MEMORY_OPTIONS = Object.freeze(['256m', '512m', '1g', '1536m', '2g', '4g', '8g', '16g'])
 export const VM_CPU_MODELS = Object.freeze([
   'host',
   'qemu64',

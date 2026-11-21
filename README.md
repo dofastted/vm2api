@@ -410,7 +410,9 @@ VM 页「总计」按当前账号累计本平台已记录的官方价费用和 t
 
 ## 开发验证与 CI
 
-分支、工作树与发版流程见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)：日常开发合入 `dev`，`main` 只用于发布。CI 配置以 [`.github/workflows/test.yml`](.github/workflows/test.yml) 为准，使用 Node.js 22、pnpm 10 和 Go 1.25。日常验证优先运行本次改动涉及的核心测试或指定测试文件，完整回归按需运行。
+**提 PR 前先确认目标分支（base）是 `dev`。** 功能与修复 PR 一律指向 `dev`，分支从 `origin/dev` 切出；`main` 只接受 `dev → main` 的发版 PR 或 `hotfix/<slug>`，tag 只打在 `main` 上。base 选错不用重开 PR，在 PR 页面标题下方的 base 下拉框改成 `dev` 即可。分支、工作树与发版流程见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
+
+CI 配置以 [`.github/workflows/test.yml`](.github/workflows/test.yml) 为准，使用 Node.js 22、pnpm 10 和 Go 1.25。日常验证优先运行本次改动涉及的核心测试或指定测试文件，完整回归按需运行。
 
 先按需安装依赖：后端 `npm ci`，前端 `pnpm -C web install --frozen-lockfile`。以下命令均在仓库根目录执行：
 
@@ -437,7 +439,7 @@ VM 页「总计」按当前账号累计本平台已记录的官方价费用和 t
 
 原有 `npm test` / `npm run test:all` 仍执行后端全量单测和 `worker` race 测试，不包含前端、`api-kernel`、`redact` 或 E2E。CI 绿灯只表示该次实际执行的检查通过；日常 CI 不代表全量、ARM 或生产验证已经完成。
 
-Daily CI runs core tests plus added or modified test files for affected components. Full regression and formatting checks are available with `full=true`; native ARM packaging is enabled separately with `arm64=true`.
+Open pull requests against `dev`, branched from `origin/dev`; `main` only takes release PRs from `dev` or `hotfix/<slug>`. If you opened one against `main`, switch the base with the dropdown — no need to reopen. Daily CI runs core tests plus added or modified test files for affected components. Full regression and formatting checks are available with `full=true`; native ARM packaging is enabled separately with `arm64=true`.
 
 ---
 

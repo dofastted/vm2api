@@ -315,14 +315,16 @@ test('purchase activation binds the slot and pinned installs reuse or preserve i
   assert.equal(activated.body.data.license.valid, true)
   assert.equal(activated.body.data.license.scope, 'host')
   assert.equal(getCragLicense(root, vm).license.valid, true)
-  assert.deepEqual(calls, ['resolve', 'redeem', 'bind', 'resolve', 'redeem', 'bind'])
+  // The first redeem was confirmed before binding failed. Its durable receipt
+  // must suppress a second redemption while allowing the same slot to bind.
+  assert.deepEqual(calls, ['resolve', 'redeem', 'bind', 'resolve', 'bind'])
   assert.doesNotMatch(JSON.stringify(activated.body), /CRAGR1|CRAGS1|CRAGH2|wrapped_key/)
   seedEncryptedPackage(root, { payloadKey: crypto.randomBytes(32) })
   const snapshot = await route(root, 'GET', '/kernels')
   assert.equal(snapshot.body.data.licenses[vm.id].scope, 'host', JSON.stringify(snapshot.body.data.licenses[vm.id]))
   assert.equal(snapshot.body.data.licenses[vm.id].valid, true)
   assert.equal(snapshot.body.data.install_licenses[vm.id].code, 'license_payload_key_mismatch')
-  assert.deepEqual(calls, ['resolve', 'redeem', 'bind', 'resolve', 'redeem', 'bind'])
+  assert.deepEqual(calls, ['resolve', 'redeem', 'bind', 'resolve', 'bind'])
 
   const payload_tag = 'payload-2026.11.16-crag-3.0.8'
   let stops = 0

@@ -57,7 +57,10 @@ export async function prepareSlotOAuth({
   }
   const boot = await startReady(vm, projectRoot, { routing, allowMissingCredential: true, timeoutMs })
   if (!boot?.ok || boot.rust_ok === false || !boot.rust?.ok || boot.rust.skipped) {
-    throw fail(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'Target VM native CLI is not ready')
+    // One sanitized code feeds both err.code and the message, so they cannot disagree.
+    // The default inside keeps a missing code from being stringified to "undefined" by safeCode.
+    const code = safeCode(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'oauth_runtime_not_ready')
+    throw fail(code, `Target VM native CLI is not ready (${code})`)
   }
   const patch = { ...(boot.runtime ? { runtime: boot.runtime } : {}), status: 'running' }
   const stored = patchVmRecord(projectRoot, vm.id, patch)

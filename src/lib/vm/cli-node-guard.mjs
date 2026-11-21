@@ -102,7 +102,11 @@ export function createCliNodeGuard({
             user: isKvmRuntime(vm) ? '0' : undefined,
           })
           await exec(connect, container, Cmd, { user: User })
-          if (host.bakedKernel && !isKvmRuntime(vm) && Date.now() - (setupAt.get(vm.id) || 0) >= NODE_SETUP_INTERVAL_MS) {
+          if (
+            host.bakedKernel &&
+            !isKvmRuntime(vm) &&
+            Date.now() - (setupAt.get(vm.id) || 0) >= NODE_SETUP_INTERVAL_MS
+          ) {
             const setup = slotExecCmd(vm, ['python3', '-c', NODE_CLAUDE_SETUP_PY], {
               detach: true,
               user: host.execUser(vm),

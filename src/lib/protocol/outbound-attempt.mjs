@@ -49,6 +49,7 @@ import {
   enforceCacheTtlOrder,
   normalizeCacheTtl,
   listCacheMarkers,
+  materializeAutomaticCache,
   stripIllegalCacheControlFields,
   validateCacheBreakpoints,
 } from './cache-ttl.mjs'
@@ -271,33 +272,6 @@ export function prepareCliPersonaInput(body, preset) {
   return out
 }
 
-/** CLI needs a block marker: project automatic caching onto the current message tail. */
-function materializeAutomaticCache(body) {
-  validateCacheBreakpoints(body)
-  const { cache_control: control, ...out } = body
-  const messages = Array.isArray(body.messages) ? body.messages : []
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i]
-    if (!message || typeof message !== 'object') continue
-    // Supported mid-conversation system turns are also in the cache prefix.
-    // Skipping them could put this 5m marker before their explicit 1h marker.
-    const content = typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content
-    if (!Array.isArray(content)) continue
-    for (let j = content.length - 1; j >= 0; j--) {
-      const block = content[j]
-      if (!block || ['thinking', 'redacted_thinking'].includes(block.type)) continue
-      // An explicit tail policy already caches the entire eligible prefix.
-      if (block.cache_control != null) return out
-      const next = content.slice()
-      next[j] = { ...block, cache_control: { ...control } }
-      out.messages = messages.slice()
-      out.messages[i] = { ...message, content: next }
-      return out
-    }
-  }
-  return out
-}
-
 /**
  * Caller fields plus Node-owned message breakpoints.
  * CLI owns persona layout and system/tools markers; kernel only forwards.
@@ -372,6 +346,8 @@ export function prepareCliHopBody(
   body = ensureOutputConfigSchema(body)
 
   if (preparedZero && !preserveSystem && !requestContext && body.cache_control != null) {
+    // Native passthrough judges the caller's markers before rewriting them.
+    validateCacheBreakpoints(body)
     body = materializeAutomaticCache(body)
   } else if (Object.prototype.hasOwnProperty.call(body, 'cache_control')) {
     delete body.cache_control

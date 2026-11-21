@@ -213,9 +213,16 @@ describe('kvm availability', () => {
 
 describe('memory raise', () => {
   it('only offers sizes above the configured one', () => {
-    expect(memoryRaiseOptions('1g')).toEqual(['2g', '4g', '8g', '16g'])
+    expect(memoryRaiseOptions('1g')).toEqual(['1536m', '2g', '4g', '8g', '16g'])
     expect(memoryRaiseOptions('16g')).toEqual([])
-    expect(memoryRaiseOptions('weird')).toEqual(['1g', '2g', '4g', '8g', '16g'])
+    expect(memoryRaiseOptions('weird')).toEqual([
+      '1g',
+      '1536m',
+      '2g',
+      '4g',
+      '8g',
+      '16g',
+    ])
   })
 
   it('drops a stale target after a successful raise', () => {

@@ -50,6 +50,9 @@ function runner({
   settings = new MemorySettings(),
   list = () => [claudeVm],
   runTest = async () => ({ ok: true }),
+  windowState = null,
+  nextWindowEnd = null,
+  now = () => Date.parse('2026-10-16T00:00:00.000Z'),
 } = {}) {
   return {
     settings,
@@ -58,7 +61,9 @@ function runner({
       settings: () => settings,
       list,
       runTest,
-      now: () => Date.parse('2026-10-16T00:00:00.000Z'),
+      windowState,
+      nextWindowEnd,
+      now,
     }),
   }
 }
@@ -295,4 +300,154 @@ test('sync with an invalid test writes nothing', () => {
     )
   }
   assert.deepEqual(settings.all(), before)
+})
+
+// ---------------------------------------------------------------------------
+// #979 preheat mode: tiny real request on a schedule, gated on window liveness.
+
+const preheatConfig = {
+  ...claudeConfig,
+  mode: 'preheat',
+}
+
+test('preheat mode normalizes and round-trips through the store', () => {
+  const { settings, schedule } = runner()
+  const saved = schedule.save('vm-01', preheatConfig)
+  assert.equal(saved.mode, 'preheat')
+  assert.equal(saved.auto_renew, false)
+  assert.equal(saved.last_skipped, null)
+  const stored = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-01`)
+  assert.equal(stored.mode, 'preheat')
+  assert.equal(stored.auto_renew, false)
+  // Unknown mode rejects; auto_renew requires preheat.
+  assert.throws(() => schedule.save('vm-01', { ...preheatConfig, mode: 'both' }), /mode/)
+  assert.throws(() => schedule.save('vm-01', { ...claudeConfig, auto_renew: true }), /auto_renew/)
+})
+
+test('preheat fires only when the window is not live and the slot is healthy', async () => {
+  let calls = 0
+  const states = []
+  const { settings, schedule } = runner({
+    runTest: async () => {
+      calls += 1
+      return { ok: true, duration_ms: 5 }
+    },
+    windowState: (vmId) => states[vmId],
+  })
+  schedule.save('vm-01', { ...preheatConfig, enabled: true })
+  schedule.start()
+
+  // Live window: skip, no request.
+  states['vm-01'] = { hasCredential: true, schedulable: true, windowLive: true }
+  await schedule.jobs.get('vm-01').trigger()
+  let stored = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-01`)
+  assert.equal(calls, 0, 'a live window must not be preheated')
+  assert.equal(stored.last_ok, null)
+  assert.equal(stored.last_skipped, 'window_live')
+
+  // Dead window: fire once.
+  states['vm-01'] = { hasCredential: true, schedulable: true, windowLive: false }
+  await schedule.jobs.get('vm-01').trigger()
+  stored = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-01`)
+  assert.equal(calls, 1)
+  assert.equal(stored.last_ok, true)
+  assert.equal(stored.last_skipped, null)
+
+  // Parked slot (no credential / unschedulable): skip, never retry in a loop.
+  states['vm-01'] = { hasCredential: false, schedulable: true, windowLive: false }
+  await schedule.jobs.get('vm-01').trigger()
+  stored = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-01`)
+  assert.equal(calls, 1)
+  assert.equal(stored.last_skipped, 'no_credential')
+  states['vm-01'] = { hasCredential: true, schedulable: false, windowLive: false }
+  await schedule.jobs.get('vm-01').trigger()
+  stored = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-01`)
+  assert.equal(calls, 1)
+  assert.equal(stored.last_skipped, 'slot_not_schedulable')
+  schedule.stop()
+})
+
+test('preheat gates are optional: without a probe the request always fires', async () => {
+  let calls = 0
+  const { schedule } = runner({ runTest: async () => (calls++, { ok: true }) })
+  schedule.save('vm-01', { ...preheatConfig, enabled: true })
+  schedule.start()
+  await schedule.jobs.get('vm-01').trigger()
+  assert.equal(calls, 1)
+  schedule.stop()
+})
+
+test('a preheat gate crash is not a scheduling failure', async () => {
+  let calls = 0
+  const { schedule } = runner({
+    runTest: async () => (calls++, { ok: true }),
+    windowState: () => {
+      throw new Error('probe exploded')
+    },
+  })
+  schedule.save('vm-01', { ...preheatConfig, enabled: true })
+  schedule.start()
+  await schedule.jobs.get('vm-01').trigger()
+  assert.equal(calls, 1, 'unknown liveness reads as not-live; the tiny request still goes out')
+  schedule.stop()
+})
+
+test('auto-renew fires once per elapsed window and re-arms on the next window', async () => {
+  let calls = 0
+  const NOW = Date.parse('2026-10-16T00:00:00.000Z')
+  let windowEnd = NOW - 60_000 // already elapsed
+  const { settings, schedule } = runner({
+    runTest: async () => (calls++, { ok: true }),
+    nextWindowEnd: () => windowEnd,
+    now: () => NOW,
+  })
+  schedule.save('vm-01', { ...preheatConfig, enabled: true, auto_renew: true })
+  schedule.start()
+
+  await schedule._sweepElapsedWindows()
+  assert.equal(calls, 1, 'elapsed window fires one preheat')
+
+  // Same window, sweep again: no double fire.
+  await schedule._sweepElapsedWindows()
+  assert.equal(calls, 1)
+
+  // A new window elapsed: re-arm and fire again.
+  windowEnd = NOW + 5 * 3600_000
+  await schedule._sweepElapsedWindows()
+  assert.equal(calls, 1, 'a future window does not fire')
+  windowEnd = NOW - 1_000
+  await schedule._sweepElapsedWindows()
+  assert.equal(calls, 2)
+  schedule.stop()
+})
+
+test('auto-renew never fires for plain test schedules or disabled plans', async () => {
+  let calls = 0
+  const { settings, schedule } = runner({
+    runTest: async () => (calls++, { ok: true }),
+    nextWindowEnd: () => Date.now() - 1,
+  })
+  // Plain test mode rejects auto_renew outright.
+  assert.throws(() => schedule.save('vm-01', { ...claudeConfig, enabled: true, auto_renew: true }), /auto_renew/)
+  // A disabled preheat plan never fires even with an elapsed window.
+  schedule.save('vm-01', { ...preheatConfig, enabled: false, auto_renew: true })
+  schedule.start()
+  await schedule._sweepElapsedWindows()
+  assert.equal(calls, 0)
+  assert.equal(settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-01`).enabled, false)
+  schedule.stop()
+})
+
+test('a skipped preheat is visible on the public read, a fired one clears it', async () => {
+  const { settings, schedule } = runner({
+    windowState: () => ({ hasCredential: true, schedulable: true, windowLive: true }),
+  })
+  schedule.save('vm-01', { ...preheatConfig, enabled: true })
+  schedule.start()
+  await schedule.jobs.get('vm-01').trigger()
+  const pub = schedule.get('vm-01')
+  assert.equal(pub.last_skipped, 'window_live')
+  assert.equal(pub.last_ok, null)
+  assert.match(pub.last_error, /skipped: window_live/)
+  schedule.stop()
 })
