@@ -98,6 +98,10 @@ function StatsBody({ item, vms }: { item: ApiKeyItem; vms: Vm[] }) {
           </div>
           <Skeleton className='h-64 rounded-xl' />
         </div>
+      ) : q.isError && !view ? (
+        <div className='grid h-40 place-items-center rounded-xl border text-sm text-destructive'>
+          密钥统计加载失败
+        </div>
       ) : !view ? (
         <div className='grid h-40 place-items-center rounded-xl border text-sm text-muted-foreground'>
           暂无统计数据
