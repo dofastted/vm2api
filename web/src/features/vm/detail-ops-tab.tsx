@@ -223,15 +223,24 @@ export function VmOpsTab(props: VmOpsTabProps) {
         <>
           <Separator />
           <div className='flex flex-wrap items-center gap-2'>
-            <Button
-              size='sm'
-              variant='outline'
-              disabled={remote}
-              loading={busy('/wrap-cli/promote')}
-              onClick={() => onAction('/wrap-cli/promote')}
-            >
-              晋升母本
-            </Button>
+            <div className='space-y-1'>
+              <Button
+                size='sm'
+                variant='outline'
+                disabled={remote}
+                loading={busy('/wrap-cli/promote')}
+                aria-describedby='wrap-template-help'
+                onClick={() => onAction('/wrap-cli/promote')}
+              >
+                设为 Wrap CLI 模板
+              </Button>
+              <p
+                id='wrap-template-help'
+                className='text-xs text-muted-foreground'
+              >
+                用此槽的 Wrap CLI 文件替换现有模板。
+              </p>
+            </div>
             <Button
               size='sm'
               variant='outline'
