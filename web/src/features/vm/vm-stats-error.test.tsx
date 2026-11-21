@@ -21,9 +21,8 @@ function renderDialog() {
   return renderToStaticMarkup(
     <QueryClientProvider client={new QueryClient()}>
       <VmStatsDialog
-        open
         vm={{ id: 'vm-a', name: 'VM A' } as never}
-        onClose={() => {}}
+        onOpenChange={() => {}}
       />
     </QueryClientProvider>
   )
