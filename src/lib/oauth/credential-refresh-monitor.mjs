@@ -93,7 +93,9 @@ export function needsScheduledRefresh(vm, now = Date.now(), skewMs = PROACTIVE_R
 
 /** Parked because the node's worker could not guard refresh retries; only a worker upgrade ends that. */
 export function isUpgradeParked(vm) {
-  return [vm?.refresh_error, vm?.claude?.refresh_error].includes('worker_upgrade_required')
+  // Only where clearUpgradeRequired can clear it: markVmRefreshError writes claude.refresh_error and nothing
+  // writes the top-level field. Looking at both would probe a slot every pass that could never be released.
+  return vm?.claude?.refresh_error === 'worker_upgrade_required'
 }
 
 /**

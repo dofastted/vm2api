@@ -359,3 +359,20 @@ test('a failing probe never breaks the monitor pass', async () => {
   const run = await monitor.runOnce()
   assert.deepEqual(run.revived, ['vm-b'])
 })
+
+test('a slot is parked for the upgrade exactly where clearUpgradeRequired looks, never somewhere it cannot clear', async () => {
+  const { isUpgradeParked } = await import('../../src/lib/oauth/credential-refresh-monitor.mjs')
+  const { clearUpgradeRequired } = await import('../../src/lib/oauth/oauth-credentials.mjs')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'parked-'))
+  const onDisk = (vm) => {
+    const p = path.join(dir, `${vm.id}.json`)
+    fs.writeFileSync(p, JSON.stringify(vm))
+    return p
+  }
+  const nested = { id: 'nested', claude: { refresh_error: 'worker_upgrade_required' } }
+  const topOnly = { id: 'top', refresh_error: 'worker_upgrade_required', claude: {} }
+  // What the monitor decides to probe must be what a successful probe can then clear.
+  assert.equal(isUpgradeParked(nested), true)
+  assert.equal(clearUpgradeRequired(onDisk(nested)), true)
+  assert.equal(isUpgradeParked(topOnly), false, 'a top-level code is not something clearUpgradeRequired can clear')
+})
