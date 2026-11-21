@@ -21,6 +21,12 @@
  * request size that did becomes that VM's ceiling: larger requests are kept off it (served by
  * another seat, or refused when there is none) until a request at that size succeeds there or
  * the quarantine time passes and a probe is let through.
+ *
+ * The ceiling is evidence, so it is bounded by evidence in both directions. It is the smallest size
+ * that went silent, but never below the largest request this VM answered inside the window: two
+ * sessions that go quiet for a size-independent reason (an upstream incident) must not close the VM
+ * to traffic it has just been shown to serve. And once learned it is fixed for the quarantine; later
+ * failures do not push it further down.
  */
 
 import crypto from 'node:crypto'
@@ -136,6 +142,9 @@ export class PoisonRequestGuard {
     this.logger = logger
     this.entries = new Map()
     this.vms = new Map()
+    // Largest request each VM answered recently. Kept apart from the failure records because the proof
+    // usually comes first: the VM served a 50 KB request, then went quiet.
+    this.served = new Map()
   }
 
   get enabled() {
@@ -207,18 +216,35 @@ export class PoisonRequestGuard {
     const prev = this.vms.get(vmId)
     const recent = (prev?.failures || []).filter((f) => now - f.at <= this.windowMs)
     recent.push({ session: sessionKey, bytes, at: now })
-    const known = prev?.ceiling && prev.until <= now && bytes >= prev.ceiling // a ceiling already learned, confirmed again
+    const floor = this.provenBytes(vmId, now)
+    const quarantined = !!prev?.ceiling && prev.until > now
+    const confirmed = !!prev?.ceiling && prev.until <= now && bytes >= prev.ceiling // a learned ceiling, confirmed again
     const sessions = new Set(recent.map((f) => f.session))
     let ceiling = prev?.ceiling || 0
     let until = prev?.until || 0
-    if (known || sessions.size >= this.vmSessions) {
-      ceiling = known ? prev.ceiling : Math.min(...recent.map((f) => f.bytes))
+    if (quarantined) {
+      // Already refusing at this size: more failures do not move the ceiling, and do not extend the quarantine.
+    } else if (confirmed) {
+      until = now + this.quarantineMs
+    } else if (sessions.size >= this.vmSessions) {
+      ceiling = Math.max(floor, Math.min(...recent.map((f) => f.bytes)))
       until = now + this.quarantineMs
     }
     this.vms.delete(vmId)
-    this.vms.set(vmId, { failures: recent.slice(-16), ceiling, until, lastAt: now })
+    this.vms.set(vmId, {
+      failures: recent.slice(-16),
+      ceiling,
+      until,
+      lastAt: now,
+    })
     while (this.vms.size > this.maxEntries) this.vms.delete(this.vms.keys().next().value)
     return until > now ? ceiling : null
+  }
+
+  /** Largest request this VM answered inside the window, 0 when there is no recent proof. */
+  provenBytes(vmId, now = this.now()) {
+    const served = this.served.get(vmId)
+    return served && now - served.at <= this.windowMs ? served.bytes : 0
   }
 
   /** VMs that should not receive a request of this size right now. */
@@ -245,10 +271,20 @@ export class PoisonRequestGuard {
   /** A hop succeeded. On a VM with a ceiling, a success at or above it proves the VM can answer again. */
   recordSuccess(sessionKey, { vmId = null, bytes = null, body = null } = {}) {
     if (sessionKey) this.entries.delete(sessionKey)
-    const entry = vmId ? this.vms.get(vmId) : null
-    if (!entry?.ceiling) return
+    if (!vmId) return
     const size = bytes ?? (body ? requestBytes(body) : null)
-    if (size != null && size >= entry.ceiling) this.vms.delete(vmId)
+    if (size == null) return
+    const now = this.now()
+    const entry = this.vms.get(vmId)
+    if (entry?.ceiling && size >= entry.ceiling) this.vms.delete(vmId)
+    // The floor for any ceiling learned later. A bigger success replaces it; a smaller one only refreshes
+    // it when the old proof has already aged out, so a lone small request cannot erase a larger proof.
+    const keep = this.provenBytes(vmId, now)
+    if (size >= keep) {
+      this.served.delete(vmId)
+      this.served.set(vmId, { bytes: size, at: now })
+      while (this.served.size > this.maxEntries) this.served.delete(this.served.keys().next().value)
+    }
   }
 
   snapshot() {

@@ -243,3 +243,60 @@ test('the VM table is bounded and the guard can be switched off', () => {
   fail(off, 'sess:b', 60)
   assert.deepEqual(off.refusedVms(sized(100)), [])
 })
+
+// --- the ceiling never drops below what the VM has been shown to serve -------
+
+const ok = (g, session, kb, vm = 'vm-03') =>
+  g.recordSuccess(session, { vmId: vm, bytes: Buffer.byteLength(JSON.stringify(sized(kb))) })
+
+test('two sessions silent for a size-independent reason cannot close the VM below its largest recent success', () => {
+  const { g } = guard()
+  ok(g, 'sess:z', 50) // the VM served a 50 KB request a moment ago
+  fail(g, 'sess:a', 8) // an incident: a tiny request and a huge one both go quiet
+  fail(g, 'sess:b', 300)
+  assert.equal(g.refusedVms(sized(10)).length, 0, 'a 10 KB request is below what the VM has served and must pass')
+  assert.equal(g.refusedVms(sized(49)).length, 0)
+  assert.equal(g.refusedVms(sized(60)).length, 1, 'only what was never shown to work is kept off')
+})
+
+test('the real incident shape still sets the ceiling at the smallest failure', () => {
+  const { g } = guard()
+  ok(g, 'sess:z', 52)
+  fail(g, 'sess:a', 60)
+  fail(g, 'sess:b', 70)
+  assert.equal(g.refusedVms(sized(55)).length, 0, 'between the largest success and the first failure is not refused')
+  assert.equal(g.refusedVms(sized(61)).length, 1)
+})
+
+test('a ceiling does not keep sliding down as more failures arrive during the quarantine', () => {
+  const { g } = guard()
+  ok(g, 'sess:z', 50)
+  fail(g, 'sess:a', 80)
+  fail(g, 'sess:b', 90)
+  const first = g.refusedVms(sized(200))[0].ceilingBytes
+  fail(g, 'sess:c', 30) // a small request goes quiet while the VM is already quarantined
+  fail(g, 'sess:d', 20)
+  assert.ok(
+    g.refusedVms(sized(200))[0].ceilingBytes >= first - 1,
+    'it may not fall below the evidence-backed floor either',
+  )
+  assert.equal(g.refusedVms(sized(45)).length, 0, 'still above nothing the VM proved it can serve')
+})
+
+test('a success older than the window no longer counts as proof', () => {
+  const { g, t } = guard({ windowMs: 60_000, quarantineMs: 30_000 })
+  ok(g, 'sess:z', 50)
+  t.now += 120_000
+  fail(g, 'sess:a', 8)
+  fail(g, 'sess:b', 300)
+  assert.equal(g.refusedVms(sized(10)).length, 1, 'no recent proof, so the smallest failure sets the ceiling')
+})
+
+test('a success below the ceiling is remembered as the floor but does not lift the quarantine', () => {
+  const { g } = guard()
+  fail(g, 'sess:a', 60)
+  fail(g, 'sess:b', 70)
+  ok(g, 'sess:z', 40)
+  assert.equal(g.refusedVms(sized(65)).length, 1)
+  assert.equal(g.refusedVms(sized(41)).length, 0, 'a request the VM has been seen to serve is not refused')
+})

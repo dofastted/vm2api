@@ -2871,3 +2871,16 @@ test('while a ceiling is active a small request is still sent and a large one is
   assert.equal(still.body.error.code, 'request_too_large_for_slot')
   assert.deepEqual(served, ['vm-01'], 'only the small request was sent')
 })
+
+test('successes that pass through the runner raise the floor, so an incident cannot close the VM below them', async () => {
+  const { send, served } = ceilingHarness([candidate(1)])
+  await send(50, 'z') // the VM answers a 50 KB request
+  await send(8, 'a', { outcome: silentTimeout }) // then two sessions go quiet for an unrelated reason
+  await send(300, 'b', { outcome: silentTimeout })
+  served.length = 0
+  const small = await send(10, 'c')
+  assert.equal(small.ok, true, 'a 10 KB request is below what the VM has just served')
+  assert.deepEqual(served, ['vm-01'])
+  const big = await send(120, 'd')
+  assert.equal(big.body.error.code, 'request_too_large_for_slot', 'what was never shown to work is still kept off')
+})
