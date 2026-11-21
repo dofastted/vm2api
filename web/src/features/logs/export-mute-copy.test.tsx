@@ -14,8 +14,9 @@ describe('export mute wording', () => {
       <ExportDialog
         open
         currentErrorClass='auth'
-        filters={{ status: 'error' } as never}
-        onClose={() => {}}
+        currentSummary='当前筛选'
+        onOpenChange={() => {}}
+        onExport={async () => {}}
       />
     )
     expect(explicit).toContain('按所选错误类导出，不受屏蔽设置影响')
@@ -23,8 +24,9 @@ describe('export mute wording', () => {
     const normal = renderToStaticMarkup(
       <ExportDialog
         open
-        filters={{ status: 'error' } as never}
-        onClose={() => {}}
+        currentSummary='当前筛选'
+        onOpenChange={() => {}}
+        onExport={async () => {}}
       />
     )
     expect(normal).toContain('>包含已屏蔽的错误类<')

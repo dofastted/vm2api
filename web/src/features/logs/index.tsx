@@ -363,6 +363,7 @@ export function LogsPage() {
         open={exportOpen}
         onOpenChange={setExportOpen}
         currentSummary={currentSummary}
+        currentErrorClass={errorClass}
         onExport={handleExport}
       />
       {isFullscreen ? (
