@@ -15,6 +15,8 @@ import {
   callGeminiHost,
   createGeminiPublicHandler,
   geminiKeyAllowsPath,
+  isGeminiPublicPath,
+  isGeminiSharedPath,
   officialGeminiAuthUrl,
 } from '../../src/lib/gemini/routes.mjs'
 
@@ -1129,6 +1131,32 @@ test('Gemini keys allow supported protocol adapters and deny other inference sur
   assert.equal(geminiKeyAllowsPath('/v1/messages', 'POST'), true)
   assert.equal(geminiKeyAllowsPath('/messages', 'POST'), true)
   assert.equal(geminiKeyAllowsPath('/v1/me/quota', 'GET'), true)
+})
+
+test('only Gemini-exclusive paths dispatch by path alone', () => {
+  // Claiming a shared path here makes the OpenAI handlers in server.mjs
+  // unreachable — they sit after this check — and every non-Gemini caller gets
+  // gemini_key_required. Keep the two sets apart.
+  for (const shared of ['/v1/chat/completions', '/chat/completions', '/v1/responses', '/responses']) {
+    assert.equal(isGeminiPublicPath(shared), false, `${shared} must not route by path alone`)
+    assert.equal(isGeminiSharedPath(shared), true)
+    // A Gemini key still reaches them.
+    assert.equal(geminiKeyAllowsPath(shared, 'POST'), true)
+  }
+  for (const exclusive of [
+    '/v1/gemini/sessions',
+    '/v1/gemini/sessions/abc',
+    '/v1beta/models/gemini-3.8-flash:generateContent',
+    '/v1beta/models/gemini-3.8-flash:streamGenerateContent',
+  ]) {
+    assert.equal(isGeminiPublicPath(exclusive), true)
+    assert.equal(isGeminiSharedPath(exclusive), false)
+  }
+  // Neither set may swallow a sibling the OpenAI side owns outright.
+  for (const other of ['/v1/completions', '/completions', '/v1/responses/compact', '/v1/messages']) {
+    assert.equal(isGeminiPublicPath(other), false)
+    assert.equal(isGeminiSharedPath(other), false)
+  }
 })
 
 test('host installer refuses an unsigned manifest and never activates damaged payload members', async (t) => {

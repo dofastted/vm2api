@@ -21,6 +21,7 @@ import {
   geminiProxyFor,
   callGeminiHost,
   isGeminiPublicPath,
+  isGeminiSharedPath,
 } from './lib/gemini/routes.mjs'
 import {
   extractApiKey,
@@ -1468,6 +1469,14 @@ const server = http.createServer(async (req, res) => {
     if (isGeminiPublicPath(p)) {
       if (!requireAuth(req, res)) return
       return handleGeminiPublic(req, res)
+    }
+    // A shared path only belongs to Gemini when the key does. Dispatching on
+    // the path alone would make the OpenAI handlers below unreachable, and
+    // every other caller would get gemini_key_required. requireAuth has to run
+    // first: it is what populates the key record this reads.
+    if (isGeminiSharedPath(p)) {
+      if (!requireAuth(req, res)) return
+      if (keyScopeFromRequest(req).group_type === 'gemini') return handleGeminiPublic(req, res)
     }
 
     if (req.method === 'POST' && (p === '/v1/chat/completions' || p === '/chat/completions')) {

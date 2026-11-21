@@ -131,11 +131,11 @@ def account_command(uid, method, profile=None):
     ]
 
 
-def read_account(uid, proxy_url, method, api_key=None, profile=None):
+def read_account(uid, proxy_url, method, api_key=None, profile=None, oauth_token=None):
     try:
         result = subprocess.run(
             account_command(uid, method, profile),
-            input=json.dumps({"proxy_url": proxy_url, "api_key": api_key}).encode(),
+            input=json.dumps({"proxy_url": proxy_url, "api_key": api_key, "oauth_token": oauth_token}).encode(),
             check=True,
             timeout=17,
             capture_output=True,

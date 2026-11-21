@@ -116,21 +116,35 @@ export function isGeminiPanelPath(value) {
   return value === PANEL_PATH || value.startsWith(`${PANEL_PATH}/`)
 }
 
+/** Paths only Gemini serves. These route by path alone. */
 export function isGeminiPublicPath(value) {
   return (
     value === PUBLIC_PATH ||
     value.startsWith(`${PUBLIC_PATH}/`) ||
+    /^\/v1beta\/models\/[^/]+:(?:generateContent|streamGenerateContent)$/.test(value)
+  )
+}
+
+/**
+ * Paths Gemini shares with the OpenAI protocol handlers. Routing these by path
+ * alone would shadow those handlers for every other caller, so the dispatch
+ * must also require a Gemini-group key — the same way /v1/models does.
+ */
+export function isGeminiSharedPath(value) {
+  return (
     value === '/v1/chat/completions' ||
     value === '/chat/completions' ||
     value === '/v1/responses' ||
-    value === '/responses' ||
-    /^\/v1beta\/models\/[^/]+:(?:generateContent|streamGenerateContent)$/.test(value)
+    value === '/responses'
   )
 }
 
 export function geminiKeyAllowsPath(pathname, method) {
   return (
     isGeminiPublicPath(pathname) ||
+    // A Gemini key still reaches the shared OpenAI paths; only the dispatch
+    // for other callers is path-independent.
+    isGeminiSharedPath(pathname) ||
     (method === 'POST' && (pathname === '/v1/messages' || pathname === '/messages')) ||
     (method === 'GET' &&
       ['/models', '/v1/models', '/v1beta/models', '/v1/usage', '/v1/me/quota', '/v1/me/usage'].includes(pathname))
