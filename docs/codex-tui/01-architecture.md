@@ -70,13 +70,18 @@ slot-N Docker 容器（每账号一个）
   - 图片/文件先落临时目录再粘贴路径。
 - **输出采集双通道**：
   - **流式**：vterm 屏幕解析取 assistant 增量（TUI 渲染区）；
-  - **权威结果**：tail `~/.codex/sessions/<date>/rollout-<ts>-<uuid>.jsonl`，
-    得到结构化 `response_item`（含 reasoning、tool calls、token usage、错误）；
+  - **权威结果**：tail `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<thread_id>[_<rollout_id>].jsonl`，
+    得到结构化 `response_item`（含 reasoning、tool calls）与 `token_usage_record`
+    （usage 嵌套 `payload.usage`）、`event_msg` 终态（`task_complete`/`error`/`stream_error`/`turn_aborted`）；
   - rollout 是延迟/截断仲裁的最终依据；屏幕流仅用于低延迟增量交付。
 - **会话续接**：控制面会话 ↔ codex session id 映射；热进程直接复用；
   冷会话通过 `codex` TUI 的 resume 能力或新建 session + 重放历史（二选一，见 §4 决策点）。
 - **usage 查询**：容器内以同一 `auth.json` 调用官方 usage 端点，结果经 socket
   回传控制面；**绝不**从宿主机发起，保证请求-IP 与推理-IP 同源。
+- **app-server 后端**（源码演进备注，ddfaef9）：新版 TUI 默认探测共享
+  app-server daemon socket，命中后会话挂在 daemon 上、杀 TUI 不等于杀 turn。
+  helper spawn 一律带 `--no-daemon` 走内嵌后端，保证进程级生命周期；M2 进程池
+  若改常驻 worker，可评估复用 daemon 的可行性（此时 kill 语义需重新设计）。
 - **登录/刷新**：`codex login`（ChatGPT OAuth 走容器内 loopback 回调），
   access token 过期由 codex 自身刷新机制完成；控制面只负责注入/导出
   `auth.json` 与触发 `codex login status` 探测。
