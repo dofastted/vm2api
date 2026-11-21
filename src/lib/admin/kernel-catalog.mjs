@@ -849,6 +849,21 @@ function releasePayload(projectRoot) {
   }
 }
 
+// The deployed release pins one CRAG payload. `pullKernelRelease` already
+// resolves it when `latest` is false; expose only the tag and its label so the
+// panel can offer that exact version instead of whatever GitHub published last.
+export function cragReleasePin(projectRoot) {
+  let tag
+  try {
+    tag = releasePayload(projectRoot)?.crag_release
+  } catch {
+    return null
+  }
+  if (!isCragPayloadTag(tag)) return null
+  const pinned = CRAG_PINNED_RELEASES.find((entry) => entry.tag === tag)
+  return { tag, ...(pinned?.label ? { label: pinned.label } : {}) }
+}
+
 export async function pullKernelRelease(
   projectRoot,
   { kernel, tag = '', latest = false } = {},
