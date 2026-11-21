@@ -1,7 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHmac } from 'node:crypto'
 import {
   normalizeNotifyConfig,
+  validateNotifyRoutingPatch,
   mergeNotifyConfig,
   publicNotifyConfig,
   publicRoutingNotify,
@@ -72,6 +74,193 @@ test('publicRoutingNotify redacts notify secrets and keeps routing fields', () =
   assert.equal(pub.notify.email.pass_set, true)
   assert.equal(pub.notify.telegram.bot_token, '')
   assert.equal(pub.notify.telegram.bot_token_set, true)
+})
+
+const feishuWebhook = 'https://open.feishu.cn/open-apis/bot/v2/hook/test-webhook'
+const larkWebhook = 'https://open.larksuite.com/open-apis/bot/v2/hook/test-webhook'
+
+test('notification settings accept only official Feishu and Lark robot addresses', () => {
+  for (const webhook of ['', SECRET_KEEP, feishuWebhook, larkWebhook]) {
+    assert.doesNotThrow(() => validateNotifyRoutingPatch({ notify: { feishu: { webhook } } }))
+  }
+  for (const webhook of [
+    'http://open.larksuite.com/open-apis/bot/v2/hook/test-webhook',
+    'https://open.larksuite.com.example.test/open-apis/bot/v2/hook/test-webhook',
+    larkWebhook + '?extra=1',
+    larkWebhook + '/extra',
+  ]) {
+    assert.throws(() => validateNotifyRoutingPatch({ notify: { feishu: { webhook } } }), {
+      code: 'invalid_feishu_webhook',
+    })
+  }
+})
+
+test('Feishu settings keep and redact credentials and allow removing the signature secret', () => {
+  const config = mergeNotifyConfig(
+    { feishu: { enabled: true, webhook: feishuWebhook, secret: 'test-secret' } },
+    { feishu: { webhook: '', secret: SECRET_KEEP } },
+  )
+  assert.equal(config.feishu.webhook, feishuWebhook)
+  assert.equal(config.feishu.secret, 'test-secret')
+  assert.deepEqual(publicRoutingNotify({ notify: config }).notify.feishu, {
+    enabled: true,
+    webhook: '',
+    webhook_set: true,
+    secret: '',
+    secret_set: true,
+  })
+  assert.equal(mergeNotifyConfig(config, { feishu: { clear_secret: true } }).feishu.secret, '')
+  assert.equal(notifyChannelsReady(config).feishu, true)
+  assert.equal(notifyChannelsReady({ feishu: { enabled: true, webhook: feishuWebhook + '?extra=1' } }).any, false)
+})
+
+test('Feishu manual test can use unsaved settings and sends a compact signed card', async () => {
+  const config = normalizeNotifyConfig({ feishu: { webhook: feishuWebhook, secret: 'test-secret' } })
+  const result = await sendNotifyTest(config, 'feishu', {
+    title: '飞书测试',
+    fetch: async (url, options) => {
+      assert.equal(url, feishuWebhook)
+      assert.equal(options.method, 'POST')
+      assert.equal(options.redirect, 'error')
+      const payload = JSON.parse(options.body)
+      assert.equal(payload.msg_type, 'interactive')
+      assert.equal(payload.card.schema, '2.0')
+      assert.equal(payload.card.header.title.content, '飞书测试')
+      assert.equal(payload.card.header.template, 'blue')
+      assert.match(payload.card.body.elements[0].text.content, /测试通知/)
+      assert.doesNotMatch(JSON.stringify(payload.card), /凭证 0|429 0|今日 \$0/)
+      assert.match(payload.timestamp, /^\d+$/)
+      assert.equal(payload.sign, createHmac('sha256', `${payload.timestamp}\ntest-secret`).digest('base64'))
+      return Response.json({ code: 0 })
+    },
+  })
+  assert.deepEqual(result, { ok: true, channel: 'feishu' })
+})
+
+test('Feishu regular dispatch recognizes provider errors and omits secrets from the result', async () => {
+  const config = normalizeNotifyConfig({ feishu: { enabled: true, webhook: feishuWebhook } })
+  const result = await dispatchNotify(
+    config,
+    { text: 'a'.repeat(5000) },
+    {
+      channels: ['feishu'],
+      fetch: async (_url, options) => {
+        const payload = JSON.parse(options.body)
+        assert.equal(payload.sign, undefined)
+        assert.ok(Buffer.byteLength(payload.card.body.elements[0].text.content) <= 3000)
+        return Response.json({ code: 19024, msg: feishuWebhook })
+      },
+    },
+  )
+  assert.deepEqual(result, {
+    ok: false,
+    results: [{ ok: false, channel: 'feishu', error: '飞书机器人拒绝请求，请检查关键词设置' }],
+  })
+  await assert.rejects(sendNotifyTest(config, 'feishu', { fetch: async () => Response.json({}) }), /无效响应/)
+  await assert.rejects(sendNotifyTest({ feishu: { webhook: 'https://example.test/' } }, 'feishu'), /飞书或 Lark/)
+})
+
+test('Lark receives the same card payload and can render metrics without pool details', async () => {
+  const config = normalizeNotifyConfig({ feishu: { enabled: true, webhook: larkWebhook } })
+  assert.equal(notifyChannelsReady(config).feishu, true)
+  const result = await dispatchNotify(
+    config,
+    { title: '账号池汇报', metrics: [['可用', 3]] },
+    {
+      fetch: async (url, options) => {
+        assert.equal(url, larkWebhook)
+        const { card } = JSON.parse(options.body)
+        assert.equal(card.body.elements[0].columns[0].elements[0].content, '**3**\n可用')
+        return Response.json({ code: 0 })
+      },
+    },
+  )
+  assert.deepEqual(result, { ok: true, results: [{ ok: true, channel: 'feishu' }] })
+})
+
+test('Feishu delivery exposes safe DNS, TLS, and timeout diagnostics', async () => {
+  const config = normalizeNotifyConfig({ feishu: { enabled: true, webhook: feishuWebhook } })
+  for (const [code, message] of [
+    ['ENOTFOUND', 'DNS 解析失败'],
+    ['CERT_HAS_EXPIRED', 'TLS 校验失败'],
+    ['UND_ERR_CONNECT_TIMEOUT', '请求超时'],
+  ]) {
+    const result = await dispatchNotify(
+      config,
+      { text: 'test' },
+      {
+        fetch: async () => {
+          throw new TypeError(feishuWebhook, { cause: Object.assign(new Error(feishuWebhook), { code }) })
+        },
+      },
+    )
+    assert.deepEqual(result.results, [{ ok: false, channel: 'feishu', error: `飞书 / Lark Webhook ${message}` }])
+  }
+})
+
+test('Feishu delivery propagates caller cancellation during the response body', async () => {
+  const config = normalizeNotifyConfig({ feishu: { enabled: true, webhook: feishuWebhook } })
+  const controller = new AbortController()
+  const reason = new DOMException('test aborted', 'AbortError')
+  await assert.rejects(
+    dispatchNotify(
+      config,
+      { text: 'test' },
+      {
+        signal: controller.signal,
+        fetch: async (_url, { signal }) => ({
+          ok: true,
+          text: async () => {
+            controller.abort(reason)
+            signal.throwIfAborted()
+          },
+        }),
+      },
+    ),
+    (error) => error === reason,
+  )
+})
+
+test('Feishu outage cards put incident details ahead of metrics and link to the console', async () => {
+  const config = normalizeNotifyConfig({
+    console_url: 'https://panel.example/cc/',
+    feishu: { enabled: true, webhook: feishuWebhook },
+  })
+  const message = formatNotifyMessage(
+    { type: 'vm_down', id: 'vm-01', node_id: 'node-01', reason: 'node_offline' },
+    {
+      available: 2,
+      online: 2,
+      unavailable: 1,
+      with_token: 3,
+      total: 3,
+      today: { requests: 128, tokens: 92000, cost: 2.48, sla: 0.992, errors: 1, status_429: 1 },
+    },
+    config,
+  )
+  const result = await dispatchNotify(config, message, {
+    fetch: async (_url, options) => {
+      const { card } = JSON.parse(options.body)
+      const elements = card.body.elements
+      assert.equal(card.header.template, 'red')
+      assert.equal(elements[0].content, '**事件详情**')
+      assert.match(elements[1].text.content, /vm-01\n节点 node-01\n原因 node_offline/)
+      assert.equal(elements[2].tag, 'hr')
+      assert.equal(elements[3].columns.length, 3)
+      const tables = elements.filter(({ tag }) => tag === 'table')
+      assert.equal(tables.length, 2)
+      assert.equal(tables[0].header_style.bold, true)
+      assert.deepEqual(
+        tables[0].columns.map(({ display_name }) => display_name),
+        ['请求量', 'Token', '费用'],
+      )
+      assert.deepEqual(tables[0].rows, [{ value_0: '128', value_1: '92.0k', value_2: '$2.48' }])
+      assert.deepEqual(tables[1].rows, [{ value_0: '99.2%', value_1: '1', value_2: '1 / 0' }])
+      assert.equal(elements.at(-1).behaviors[0].default_url, 'https://panel.example/cc/#/cluster')
+      return Response.json({ StatusCode: 0 })
+    },
+  })
+  assert.deepEqual(result, { ok: true, results: [{ ok: true, channel: 'feishu' }] })
 })
 
 test('summarize matches overview usable口径', () => {
