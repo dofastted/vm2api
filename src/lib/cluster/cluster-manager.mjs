@@ -9,7 +9,14 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import net from 'node:net'
 import path from 'node:path'
-import { DOCKER_SOCKET_PATH, dockerInfo, dockerPing, sshDocker } from './docker-remote.mjs'
+import {
+  DOCKER_SOCKET_PATH,
+  dockerInfo,
+  dockerPing,
+  localDocker,
+  sshDocker,
+  withDockerDeadline,
+} from './docker-remote.mjs'
 import { collectLocalStatus } from './local-status.mjs'
 import {
   mergeNodeEdit,
@@ -39,13 +46,18 @@ import {
   connectSsh,
   execCollect,
   forwardOut,
-  forwardOutStreamLocal,
+  connectUnixSocket,
+  unixTransportOf,
   privateKeyProblem,
   READY_TIMEOUT_MS,
   SshLink,
 } from './ssh-link.mjs'
 
 export const HEALTH_INTERVAL_MS = 30_000
+// Two missed cycles: a snapshot this old says nothing about the node right now.
+export const HEALTH_STALE_MS = 2 * HEALTH_INTERVAL_MS
+// One check must finish inside its own cycle, channel opens and queueing included.
+export const HEALTH_DEADLINE_MS = 25_000
 // Outlasts one SSH handshake, so a slow node settles before it is called gone.
 export const NODE_GONE_CHECK_MS = READY_TIMEOUT_MS + 5_000
 export const SHELL_TICKET_TTL_MS = 30_000
@@ -220,6 +232,7 @@ export class ClusterManager {
     const bridge = new SocketRelay({
       socketPath: this.bridgeSocketPath(node.id),
       remotePath: DOCKER_SOCKET_PATH,
+      docker: true,
       getClient: () => (link.state === 'ready' ? link.client : null),
       logger: this.logger,
     })
@@ -255,46 +268,62 @@ export class ClusterManager {
     }
   }
 
-  async _checkHealth(id) {
+  /** At most one check per node in flight; overlapping callers share it. */
+  _checkHealth(id) {
+    this._healthRuns ??= new Map()
+    const running = this._healthRuns.get(id)
+    if (running) return running
+    const run = this._runHealth(id).finally(() => {
+      if (this._healthRuns.get(id) === run) this._healthRuns.delete(id)
+    })
+    this._healthRuns.set(id, run)
+    return run
+  }
+
+  async _runHealth(id) {
     const link = this.links.get(id)
     const client = link?.state === 'ready' ? link.client : null
     if (!client) return
+    const abort = new AbortController()
+    const deadline = setTimeout(() => abort.abort(), HEALTH_DEADLINE_MS)
+    deadline.unref?.()
+    try {
+      await this._collectHealth(id, link, client, abort.signal)
+    } finally {
+      clearTimeout(deadline)
+      abort.abort()
+    }
+  }
+
+  async _collectHealth(id, link, client, signal) {
     // One channel-open round trip = SSH RTT; a refusal (no docker.sock) is still a server reply.
     const t0 = performance.now()
+    const remaining = () => Math.max(1, HEALTH_DEADLINE_MS - (performance.now() - t0))
     let latencyMs = null
     try {
-      const probe = await forwardOutStreamLocal(client, DOCKER_SOCKET_PATH)
+      const probe = await connectUnixSocket(client, DOCKER_SOCKET_PATH, { docker: true, signal })
       latencyMs = performance.now() - t0
-      probe.close()
+      probe.destroy() // drains too: an undrained channel never gives its bridge slot back
     } catch (err) {
       if (err.code === 'streamlocal_failed') latencyMs = performance.now() - t0
     }
     const platform = this.nodePlatform(id)
-    const hostRead = execCollect(client, nodeHostCommand(platform), { timeoutMs: NODE_HOST_TIMEOUT_MS }).catch(
-      () => null,
-    )
+    const hostRead = execCollect(client, nodeHostCommand(platform), {
+      timeoutMs: Math.min(NODE_HOST_TIMEOUT_MS, remaining()),
+    }).catch(() => null)
     let docker
     let containers = null
     if (platform === 'darwin') {
       docker = { ok: false, error: NATIVE_NO_DOCKER, native: true }
     } else {
-      try {
-        const info = await dockerInfo(sshDocker(client))
-        docker = { ok: true, error: null }
-        containers = { total: info.containers, running: info.running }
-      } catch (err) {
-        docker = { ok: false, error: err.message }
-      }
+      docker = await this._dockerHealth(id, client, signal, remaining)
+      containers = docker.containers ?? null
+      delete docker.containers
     }
     const hostOut = await hostRead
     const host = hostOut?.code === 0 ? parseNodeHost(hostOut.stdout) : null
+    // A result from a connection that has since been replaced must not overwrite the new one.
     if (link.client !== client) return
-    if (docker.ok && !configuredIpv6Enabled()) {
-      const exits = await syncIpv6ProxyEgress(null, null, { nodeId: id, vms: this.vmsOnNode(id) })
-      for (const exit of exits.filter((item) => !item.ok)) {
-        this.logger.warn('[ipv6-policy] exit not blocked', exit.vm_id, exit.error)
-      }
-    }
     this.health.set(id, {
       latency_ms: latencyMs == null ? null : Math.round(latencyMs),
       docker,
@@ -302,6 +331,61 @@ export class ClusterManager {
       host,
       checked_at: new Date().toISOString(),
     })
+    if (docker.ok && !configuredIpv6Enabled()) {
+      // Off the snapshot path: a slow egress sync must not hold back the node's health.
+      syncIpv6ProxyEgress(null, null, { nodeId: id, vms: this.vmsOnNode(id) })
+        .then((exits) => {
+          for (const exit of exits.filter((item) => !item.ok)) {
+            this.logger.warn('[ipv6-policy] exit not blocked', exit.vm_id, exit.error)
+          }
+        })
+        .catch((err) => this.logger.warn('[ipv6-policy] sync failed', id, err?.message || err))
+    }
+  }
+
+  /**
+   * Docker is healthy only when both paths answer: the management API (SSH channel) and the
+   * local relay socket the docker CLI — and so every slot worker call — actually dials.
+   */
+  async _dockerHealth(id, client, signal, remaining) {
+    let info
+    try {
+      info = await withDockerDeadline(sshDocker(client, { signal }), (connect) => dockerInfo(connect), remaining())
+    } catch (err) {
+      return { ok: false, error: err.message, stage: 'api', code: err.code || null }
+    }
+    const containers = { total: info.containers, running: info.running }
+    const bridge = this.bridges?.get(id)
+    if (bridge) {
+      try {
+        if (!bridge.alive())
+          throw new ClusterError(502, 'relay_not_listening', bridge.error || '本地 Docker 中继未监听')
+        await withDockerDeadline(localDocker(this.bridgeSocketPath(id)), (connect) => dockerPing(connect), remaining())
+      } catch (err) {
+        return {
+          ok: false,
+          error: `Docker CLI 中继不可用：${err.message}`,
+          stage: 'relay',
+          code: err.code || null,
+          containers,
+        }
+      }
+    }
+    return { ok: true, error: null, transport: unixTransportOf(client), containers }
+  }
+
+  /** Snapshot as served: an old success no longer vouches for the node. */
+  _healthView(id) {
+    const health = this.health.get(id)
+    if (!health) return null
+    const age = Date.now() - Date.parse(health.checked_at)
+    if (!(age > HEALTH_STALE_MS) || !health.docker?.ok) return health
+    const at = new Date(health.checked_at).toLocaleTimeString('zh-CN', { hour12: false })
+    return {
+      ...health,
+      stale: true,
+      docker: { ...health.docker, ok: false, error: `健康检查已过期（上次成功 ${at}）`, stale: true },
+    }
   }
 
   _view(node, directLinks = this.repo.directLinks()) {
@@ -310,7 +394,7 @@ export class ClusterManager {
       ...node,
       platform: this.nodePlatform(node.id),
       link: link ? { ...link.snapshot(), host_key: link.hostKey } : { state: 'idle' },
-      health: this.health.get(node.id) || null,
+      health: this._healthView(node.id),
       memory_pressure: hostMemoryPressureOf(node.id),
       bridge: this.bridges.get(node.id)?.snapshot() || null,
       install: this.installs.get(node.id) || null,
