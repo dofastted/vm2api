@@ -7,6 +7,7 @@ function render(proxy: unknown) {
     <VmEnvironmentCard
       vm={{ timezone: 'UTC' } as never}
       proxy={proxy as never}
+      saving={false}
       onSave={() => {}}
       onFollowProxy={() => {}}
     />
