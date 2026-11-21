@@ -674,7 +674,7 @@ function PasswordFields({
   )
 }
 
-function RoleFields({
+export function RoleFields({
   role,
   setRole,
   enabled,
@@ -718,16 +718,22 @@ function RoleFields({
         </Select>
       </Field>
       <Field id='user-quota' label='自建 VM 配额 (0–100)'>
-        <Input
-          id='user-quota'
-          type='number'
-          min={0}
-          max={100}
-          value={quota}
-          onChange={(e) =>
-            setQuota(Math.max(0, Math.min(100, Number(e.target.value) || 0)))
-          }
-        />
+        <div className='space-y-1'>
+          <Input
+            id='user-quota'
+            aria-describedby='user-quota-help'
+            type='number'
+            min={0}
+            max={100}
+            value={quota}
+            onChange={(e) =>
+              setQuota(Math.max(0, Math.min(100, Number(e.target.value) || 0)))
+            }
+          />
+          <p id='user-quota-help' className='text-xs text-muted-foreground'>
+            仅租户受此配额限制；0 表示禁止自建 VM
+          </p>
+        </div>
       </Field>
       <Field
         id='user-concurrency'
