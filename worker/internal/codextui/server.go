@@ -52,6 +52,14 @@ func (s *Server) Handler() http.Handler {
 			"codex_home": s.cfg.CodexHome, "max_parallel": s.cfg.MaxParallel,
 		})
 	})
+	mux.HandleFunc("GET /internal/v1/codex/usage", func(w http.ResponseWriter, r *http.Request) {
+		if !s.authOK(r) {
+			http.Error(w, `{"type":"error","error":{"type":"authentication_error","message":"invalid internal token"}}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(s.engine.Usage())
+	})
 	mux.HandleFunc("POST /internal/v1/codex/responses", func(w http.ResponseWriter, r *http.Request) {
 		if !s.authOK(r) {
 			http.Error(w, `{"type":"error","error":{"type":"authentication_error","message":"invalid internal token"}}`, http.StatusUnauthorized)

@@ -3502,3 +3502,4 @@ gateway-worker 对齐源仓：local_cli 走 wrap CLI，不再 HTTP hop 到 Anthr
 - `codex-tui-helper` 引擎改为进程池：常驻 TUI worker、`/new` 逻辑会话隔离、`codex resume <id>` 会话恢复、model 分池驱逐、超时 Esc 中断保进程
 - 重命名 `kin-codex-tui` → `codex-tui-helper`，env `CODEX_TUI_*`
 - spawn 透传 `TZ`/`LC_*`（GeoIP 一致性）
+- M2d：`/internal/v1/codex/usage` 端点 + `docs/codex-tui/04-ops.md`（出口门禁、TZ/GeoIP、巡检清单）

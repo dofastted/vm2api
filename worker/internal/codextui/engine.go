@@ -379,6 +379,50 @@ func (e *Engine) spawnTUI(ctx context.Context, w *worker) error {
 	return nil
 }
 
+// Usage reports the slot's codex-side state for
+// /internal/v1/codex/usage: the account id from auth.json and, for every
+// pooled worker that has a session, the last token_usage_record snapshot
+// from its rollout (per-response usage + cumulative thread totals).
+// Account rate limits only live in the upstream session's headers — codex
+// does not persist them to CODEX_HOME — so they are left out here (M3).
+func (e *Engine) Usage() map[string]any {
+	type snap struct{ dir, rollout, sessionID, model string; busy bool }
+	e.mu.Lock()
+	snaps := make([]snap, 0, len(e.workers))
+	for _, w := range e.workers {
+		snaps = append(snaps, snap{w.dir, w.rollout, w.sessionID, w.model, w.busy})
+	}
+	n := len(e.workers)
+	e.mu.Unlock()
+
+	accountID := ""
+	if creds, err := loadCredentials(e.cfg.CredentialPath); err == nil {
+		accountID = creds.AccountID
+	}
+	sessions := []any{}
+	for _, w := range snaps {
+		if w.rollout == "" || w.sessionID == "" {
+			continue
+		}
+		entry := map[string]any{
+			"session_id": w.sessionID,
+			"dir":        w.dir,
+			"busy":       w.busy,
+			"model":      w.model,
+		}
+		if u := readLastUsage(w.rollout); u != nil {
+			entry["usage_record"] = u
+		}
+		sessions = append(sessions, entry)
+	}
+	return map[string]any{
+		"kernel":     "codex-tui",
+		"account_id": accountID,
+		"workers":    n,
+		"sessions":   sessions,
+	}
+}
+
 // Cancel interrupts the turn bound to requestID, if any.
 func (e *Engine) Cancel(requestID string) {
 	e.mu.Lock()

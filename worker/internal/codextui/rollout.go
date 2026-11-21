@@ -166,6 +166,28 @@ func sanitize(s string) string {
 	return b.String()
 }
 
+// readLastUsage scans a rollout file and returns the payload of its last
+// token_usage_record line (per-response `usage` + cumulative
+// turn/thread_token_usage), or nil when the session has no usage yet.
+func readLastUsage(path string) json.RawMessage {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var last json.RawMessage
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		var l rolloutLine
+		if json.Unmarshal(sc.Bytes(), &l) != nil || l.Type != "token_usage_record" {
+			continue
+		}
+		last = append(last[:0], l.Payload...)
+	}
+	return last
+}
+
 // listRolloutFiles is a test/debug helper: all rollout files by mod time.
 func listRolloutFiles(home string) []string {
 	var paths []string
