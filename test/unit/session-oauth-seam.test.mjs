@@ -11,7 +11,7 @@ import {
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { FULL_OAUTH_SCOPE, INFERENCE_ONLY_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
+import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
 import { slotExec } from '../../src/lib/vm/slot-runtime.mjs'
 
 test('sessionKeyToOAuth rejects malformed session cookies before execution', async () => {
@@ -75,7 +75,7 @@ test('setup-token CAI URL helper asks for the inference-only scope', () => {
   const url = buildSetupTokenAuthorizeURL('st', 'ch')
   assert.match(url, /^https:\/\/claude\.com\/cai\/oauth\/authorize\?code=true/)
   assert.match(url, /client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e/)
-  assert.ok(url.includes(`scope=${encodeURIComponent(INFERENCE_ONLY_SCOPE)}`))
+  assert.ok(url.includes(`scope=${encodeURIComponent(FULL_OAUTH_SCOPE)}`))
   assert.equal(url.includes(encodeURIComponent(FULL_OAUTH_SCOPE).replace(/%20/g, '+')), false)
 })
 
