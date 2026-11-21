@@ -612,6 +612,7 @@ prepare_gemini_dependencies() {
   command -v ip >/dev/null || packages+=(iproute2)
   command -v nft >/dev/null || packages+=(nftables)
   command -v setpriv >/dev/null || packages+=(util-linux)
+  command -v openvt >/dev/null || packages+=(kbd)
   command -v bwrap >/dev/null || packages+=(bubblewrap)
   command -v curl >/dev/null || packages+=(curl)
   if [ "${#packages[@]}" -gt 0 ]; then
@@ -729,7 +730,7 @@ prepare_gemini_host() (
   fi
 
   local -a files=(deploy/gemini-host.service.example scripts/gemini-host.py scripts/gemini_host_account.py
-    scripts/gemini_host_inference.py
+    scripts/gemini_host_inference.py scripts/gemini_host_native.py
     scripts/gemini-host-egress.sh scripts/install-gemini-payload.mjs src/lib/gemini/payload.mjs)
   for file in "${files[@]}"; do
     if ! fetch_gemini_host_file "$tag" "$mode" "$file" "${staging}/${file}"; then
