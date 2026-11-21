@@ -389,6 +389,48 @@ class NativeInvocation:
         self._process = None
 
 
+def _launch_native(argv):
+    # Both children must use the same PID namespace and procfs: the worker
+    # compares SO_PEERCRED with the PID reported by the in-process adapter.
+    directory = "/tmp/craggemini"
+    worker = subprocess.Popen(
+        ["/opt/craggemini", "--gateway-worker", "--config", directory + "/kernel.json"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    tui = None
+    try:
+        deadline = time.monotonic() + 5
+        while worker.poll() is None and time.monotonic() < deadline:
+            if all(
+                os.path.exists(f"{directory}/{name}")
+                for name in ("kernel.sock", "native.sock")
+            ):
+                break
+            time.sleep(0.025)
+        else:
+            return 1
+        tui = subprocess.Popen(
+            argv,
+            env={
+                **os.environ,
+                "CRAGGEMINI_NATIVE_SOCKET": directory + "/native.sock",
+                "CRAGGEMINI_SESSION_ID": os.environ["CRAGGEMINI_SESSION_ID"],
+                "LD_PRELOAD": "/opt/libagy_bridge.so",
+            },
+        )
+        pid, status = os.wait()
+        child = worker if pid == worker.pid else tui
+        child.returncode = os.waitstatus_to_exitcode(status)
+        return child.returncode if child.returncode >= 0 else 128 - child.returncode
+    finally:
+        for child in (tui, worker):
+            if child is not None:
+                child.kill()
+                child.wait()
+
+
 def _worker_main():
     try:
         raw = sys.stdin.buffer.read(16 * 1024 + 1)
@@ -409,5 +451,8 @@ def _worker_main():
     return 0
 
 
-if __name__ == "__main__" and sys.argv[1:] == ["--request-worker"]:
-    raise SystemExit(_worker_main())
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--request-worker"]:
+        raise SystemExit(_worker_main())
+    if sys.argv[1:2] == ["--launch-native"] and len(sys.argv) > 2:
+        raise SystemExit(_launch_native(sys.argv[2:]))

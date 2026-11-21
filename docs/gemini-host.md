@@ -31,6 +31,7 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 - OAuth 授权、拉取模型和推理是不同检查。Google 若拒绝当前账号所在地区的 Antigravity 调用，测试返回 `gemini_location_unsupported`，不会触发重新授权、换号或换代理；不要把有模型列表当作推理就绪。
 - 可使用非 root 账号运行 `bash test/deploy/gemini-host-egress-smoke.sh /absolute/path/kin-egress`，在一次性 Linux 命名空间用 `iptables` 模拟 Docker 的默认转发丢弃策略，检查选定 SOCKS5 的透明转发、转发器退出后失败和网络清理。该测试不访问 Google 或主机代理池。
 - 有签名产物时，可在带 Node 和 Python 的一次性 Linux amd64 容器内以 root 运行 `bash test/deploy/gemini-host-install-smoke.sh /path/to/signed-payload /path/to/public-key`。断网烟测覆盖验签、传统手工安装、默认预装后锁定、拒绝无效兑换码和激活重启持久化。
+- 原生 worker 和 `agy` 必须在同一个沙箱 PID 命名空间和 `/proc` 内运行，以便 worker 用 Unix socket 对端 PID 核对 `agy` 的控制台与二进制摘要。可在有空闲 VT、装有 `openvt`、`bwrap`、`setpriv` 的一次性 Linux amd64 客机内断网运行 `sudo python3 -B test/deploy/gemini-host-native-launch-smoke.py /path/to/verified-payload`，验证真实 launcher 握手及模拟上游回合完成。
 
 ## 使用专用密钥调度
 

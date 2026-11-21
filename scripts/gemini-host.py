@@ -718,7 +718,6 @@ class NativeAgy(Agy):
         self.model, self.prompt = model, prompt
         self.native_dir = None
         self.native_token = None
-        self.native_worker = None
         self.native_tui = None
         self.native_tui_pid = None
         self.native_tui_pgid = None
@@ -743,7 +742,7 @@ class NativeAgy(Agy):
         private_json(
             config,
             {
-                "run_dir": str(self.native_dir),
+                "run_dir": "/tmp/craggemini",
                 "internal_token": self.native_token,
                 "session_id": self.attempt,
                 "model": self.model,
@@ -756,33 +755,6 @@ class NativeAgy(Agy):
             },
         )
         os.chown(config, self.uid, self.uid)
-        worker = self.launch_args(self.uid) + [
-            str(self.host.payload / "craggemini"),
-            "--gateway-worker",
-            "--config",
-            str(config),
-        ]
-        try:
-            self.native_worker = subprocess.Popen(
-                worker,
-                env=SYSTEM_ENV,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except OSError:
-            raise Failure(503, "gemini_native_worker_unavailable") from None
-        wait_deadline = time.monotonic() + 5
-        while self.native_worker.poll() is None and time.monotonic() < wait_deadline:
-            if (self.native_dir / "kernel.sock").exists():
-                break
-            time.sleep(0.025)
-        if (
-            self.native_worker.poll() is not None
-            or not (self.native_dir / "kernel.sock").exists()
-        ):
-            raise Failure(503, "gemini_native_worker_unavailable")
 
         argv.extend(
             [
@@ -798,15 +770,19 @@ class NativeAgy(Agy):
                 str(self.native_dir),
                 "/tmp/craggemini",
                 "--setenv",
-                "CRAGGEMINI_NATIVE_SOCKET",
-                "/tmp/craggemini/native.sock",
+                "SSH_CONNECTION",
+                "127.0.0.1 12345 127.0.0.1 22",
                 "--setenv",
                 "CRAGGEMINI_SESSION_ID",
                 self.attempt,
-                "--setenv",
-                "LD_PRELOAD",
-                "/opt/libagy_bridge.so",
+                "--ro-bind",
+                str(NATIVE_MODULE),
+                "/opt/gemini_host_native.py",
                 "--",
+                "/usr/bin/python3",
+                "-I",
+                "/opt/gemini_host_native.py",
+                "--launch-native",
                 "/opt/agy",
                 "--mode",
                 "plan",
@@ -834,7 +810,7 @@ class NativeAgy(Agy):
                     "-I",
                     "-c",
                     VT_EXEC,
-                    str(self.native_dir / "tui.pid"),
+                    str(self.directory / "tui.pid"),
                     *argv,
                 ],
                 env=SYSTEM_ENV,
@@ -843,7 +819,7 @@ class NativeAgy(Agy):
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            pid_path = self.native_dir / "tui.pid"
+            pid_path = self.directory / "tui.pid"
             pid_deadline = time.monotonic() + 5
             while not pid_path.exists() and self.native_tui.poll() is None:
                 if time.monotonic() >= pid_deadline:
@@ -885,12 +861,6 @@ class NativeAgy(Agy):
                     "message": "Gemini egress stopped",
                 },
             }
-        if self.native_worker is None or self.native_worker.poll() is not None:
-            return {
-                "state": "failed",
-                "text": "",
-                "error": {"code": "gemini_native_worker_unavailable"},
-            }
         if self.native_tui is None or self.native_tui.poll() is not None:
             return {
                 "state": "failed",
@@ -916,17 +886,12 @@ class NativeAgy(Agy):
                     self._stop_process_group(self.native_tui)
                     self.native_tui = None
             finally:
-                try:
-                    if self.native_worker is not None:
-                        self._stop_process_group(self.native_worker)
-                        self.native_worker = None
-                finally:
-                    self.pid = None
-                    self.native_tui_pid = None
-                    self.token_bytes = None
-                    self.credentials = ()
-                    self.prompt = None
-                    super().close(preserve)
+                self.pid = None
+                self.native_tui_pid = None
+                self.token_bytes = None
+                self.credentials = ()
+                self.prompt = None
+                super().close(preserve)
 
     @staticmethod
     def _stop_process_group(process):
