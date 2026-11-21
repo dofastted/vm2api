@@ -460,6 +460,11 @@ test('active sessions flag one-off (single request, no tools) apart without merg
   assert.equal(active.oneOffTotal, 2)
   assert.deepEqual(
     active.sessions.map((s) => [s.sessionId, s.oneOff]),
-    [['two-1', false], ['main-1', false], ['side-1', true], ['side-2', true]],
+    [
+      ['two-1', false],
+      ['main-1', false],
+      ['side-1', true],
+      ['side-2', true],
+    ],
   )
 })

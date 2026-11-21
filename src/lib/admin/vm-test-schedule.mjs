@@ -658,8 +658,10 @@ export class VmTestScheduleRunner {
   _startRenewSweep() {
     this._stopRenewSweep()
     if (!this.nextWindowEnd) return
-    this.renewSweep = new Cron(`*/${PREHEAT_RENEW_SWEEP_SEC} * * * * *`, { mode: '6-part', catch: true, unref: true }, () =>
-      this._sweepElapsedWindows().catch(() => {}),
+    this.renewSweep = new Cron(
+      `*/${PREHEAT_RENEW_SWEEP_SEC} * * * * *`,
+      { mode: '6-part', catch: true, unref: true },
+      () => this._sweepElapsedWindows().catch(() => {}),
     )
   }
 

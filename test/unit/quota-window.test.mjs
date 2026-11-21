@@ -267,7 +267,10 @@ test('isAccountQuotaExhausted needs evidence: a bare provider 429 names no spent
 
 test('isAccountQuotaExhausted keeps provider 429s with evidence and plan-limit text', () => {
   const rejected = { 'anthropic-ratelimit-unified-5h-status': 'rejected' }
-  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429, via: 'go-worker-stream', headers: rejected }, ''), true)
+  assert.equal(
+    isAccountQuotaExhausted({ ok: false, status: 429, via: 'go-worker-stream', headers: rejected }, ''),
+    true,
+  )
   const rejected7 = { 'Anthropic-Ratelimit-Unified-7d-Status': 'rate_limited' }
   assert.equal(isAccountQuotaExhausted({ ok: false, status: 429, headers: rejected7 }, ''), true)
   const allowed = { 'anthropic-ratelimit-unified-5h-status': 'allowed' }

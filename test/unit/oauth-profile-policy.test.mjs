@@ -37,9 +37,5 @@ test('unknown profiles fall back to the normal login', () => {
 })
 
 test('capabilities name every behavior the e2e probes', () => {
-  assert.deepEqual([...OAUTH_CAPABILITIES], [
-    'session-code-bridge',
-    'setup-token-long-lived',
-    'proxy-fallback-local',
-  ])
+  assert.deepEqual([...OAUTH_CAPABILITIES], ['session-code-bridge', 'setup-token-long-lived', 'proxy-fallback-local'])
 })

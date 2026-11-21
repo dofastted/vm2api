@@ -6,7 +6,6 @@ import path from 'node:path'
 import { applyCrsUnofficialPersona, stripSubagentBilling } from '../../src/lib/identity/crs-persona.mjs'
 import { writeKernelConfig } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 
-
 test('a literal after the billing header line keeps cc_is_subagent', () => {
   const note = '\nDocument the field cc_is_subagent=true; do not send it.'
   const body = {
