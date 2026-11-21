@@ -10,8 +10,10 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/dofastted/kin-gateway/worker/internal/credential"
@@ -131,17 +133,32 @@ func (r *Refresher) ensureLocked(ctx context.Context, force bool) (Result, error
 		if strings.TrimSpace(current.RefreshToken) == "" {
 			return &RefreshError{Code: "refresh_token_missing", Message: "credential has no refresh token"}
 		}
-		if r.OnAttempt != nil {
-			var id [16]byte
-			if _, err := cryptorand.Read(id[:]); err != nil {
-				return err
+		pending, journalErr := pendingAttempt(r.Store, current.RefreshToken)
+		if journalErr != nil {
+			return &RefreshError{Code: "refresh_journal_failed", Message: "read refresh attempt journal failed", Retryable: true}
+		}
+		if pending {
+			return &RefreshError{Code: CodeOutcomeUnknown, Message: "an earlier refresh with this token has no recorded result; re-authorize the slot"}
+		}
+		attemptID, idErr := newAttemptID()
+		if idErr != nil {
+			return idErr
+		}
+		if err := writeAttemptJournal(r.Store, current.RefreshToken, attemptID); err != nil {
+			return &RefreshError{Code: "refresh_journal_failed", Message: "write refresh attempt journal failed", Retryable: true}
+		}
+		// Every exit below either resolves the attempt or leaves it on disk as unknown.
+		resolved := false
+		defer func() {
+			if resolved {
+				_ = clearAttemptJournal(r.Store)
 			}
-			id[6] = (id[6] & 0x0f) | 0x40
-			id[8] = (id[8] & 0x3f) | 0x80
-			attemptID := fmt.Sprintf("%x-%x-%x-%x-%x", id[:4], id[4:6], id[6:8], id[8:10], id[10:])
+		}()
+		var attemptErr error
+		if r.OnAttempt != nil {
 			r.OnAttempt(Attempt{Type: "oauth_attempt", AttemptID: attemptID, Phase: "start"})
 			defer func() {
-				phase, code := "failure", "refresh_failed"
+				phase, code := "failure", attemptErrorCode(attemptErr)
 				if result.Refreshed {
 					phase, code = "success", ""
 				}
@@ -150,6 +167,9 @@ func (r *Refresher) ensureLocked(ctx context.Context, force bool) (Result, error
 		}
 		refreshed, refreshErr := r.requestWithRetry(ctx, current)
 		if refreshErr != nil {
+			attemptErr = refreshErr
+			unknown := isOutcomeUnknown(refreshErr)
+			resolved = !unknown
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -161,19 +181,50 @@ func (r *Refresher) ensureLocked(ctx context.Context, force bool) (Result, error
 			}
 			return refreshErr
 		}
+		// From here the old token is spent upstream: losing the answer leaves the attempt unknown.
 		if ctx.Err() != nil {
+			attemptErr = ctx.Err()
 			return ctx.Err()
 		}
 		refreshed.Generation = current.Generation
 		saved, saveErr := r.Store.Save(refreshed, document)
 		if saveErr != nil {
-			return saveErr
+			attemptErr = &RefreshError{Code: CodeOutcomeUnknown, Message: "refreshed credential could not be saved"}
+			return fmt.Errorf("%w: %v", attemptErr, saveErr)
 		}
+		resolved = true
 		result.Credential = saved
 		result.Refreshed = true
 		return nil
 	})
 	return result, err
+}
+
+func newAttemptID() (string, error) {
+	var id [16]byte
+	if _, err := cryptorand.Read(id[:]); err != nil {
+		return "", err
+	}
+	id[6] = (id[6] & 0x0f) | 0x40
+	id[8] = (id[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", id[:4], id[4:6], id[6:8], id[8:10], id[10:]), nil
+}
+
+func isOutcomeUnknown(err error) bool {
+	var refreshErr *RefreshError
+	return errors.As(err, &refreshErr) && refreshErr.Code == CodeOutcomeUnknown
+}
+
+// attemptErrorCode is what the attempt event reports; only the upstream can say invalid_grant.
+func attemptErrorCode(err error) string {
+	var refreshErr *RefreshError
+	if errors.As(err, &refreshErr) {
+		switch refreshErr.Code {
+		case CodeOutcomeUnknown, "invalid_grant", "invalid_refresh_token":
+			return refreshErr.Code
+		}
+	}
+	return "refresh_failed"
 }
 
 func (r *Refresher) requestWithRetry(ctx context.Context, current credential.Credential) (credential.Credential, error) {
@@ -201,7 +252,7 @@ func (r *Refresher) requestWithRetry(ctx context.Context, current credential.Cre
 		lastErr = err
 		var refreshErr *RefreshError
 		if errors.As(err, &refreshErr) && !refreshErr.Retryable {
-			break
+			break // includes an unknown outcome: the same token must not go out twice
 		}
 	}
 	return credential.Credential{}, lastErr
@@ -224,17 +275,32 @@ func (r *Refresher) request(ctx context.Context, current credential.Credential) 
 	request.Header.Set("Accept", "application/json, text/plain, */*")
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("User-Agent", "axios/1.13.6")
+	// Once the request is written the token endpoint may have rotated the token, answer or not.
+	var wrote atomic.Bool
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) { wrote.Store(true) },
+	}))
+	unknown := func(message string) error {
+		return &RefreshError{Code: CodeOutcomeUnknown, Message: message}
+	}
 	response, err := r.Client.Do(request)
 	if err != nil {
+		if wrote.Load() {
+			return credential.Credential{}, unknown("refresh request was sent but no response arrived")
+		}
 		return credential.Credential{}, fmt.Errorf("OAuth refresh transport: %w", err)
 	}
 	defer response.Body.Close()
+	success := response.StatusCode >= 200 && response.StatusCode < 300
 	data, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {
+		if success {
+			return credential.Credential{}, unknown("refresh succeeded upstream but the response was cut short")
+		}
 		return credential.Credential{}, fmt.Errorf("read OAuth refresh response: %w", err)
 	}
 	var decoded tokenResponse
-	_ = json.Unmarshal(data, &decoded)
+	decodeErr := json.Unmarshal(data, &decoded)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		code := strings.TrimSpace(decoded.Error)
 		message := strings.TrimSpace(decoded.Description)
@@ -255,8 +321,9 @@ func (r *Refresher) request(ctx context.Context, current credential.Credential) 
 			Retryable: retryable,
 		}
 	}
-	if strings.TrimSpace(decoded.AccessToken) == "" {
-		return credential.Credential{}, &RefreshError{Status: response.StatusCode, Code: "missing_access_token", Message: "refresh response has no access_token"}
+	if decodeErr != nil || strings.TrimSpace(decoded.AccessToken) == "" {
+		// A 2xx means the exchange happened; without a token in hand its result is lost.
+		return credential.Credential{}, unknown("refresh response has no usable access_token")
 	}
 	refreshToken := strings.TrimSpace(decoded.RefreshToken)
 	if refreshToken == "" {

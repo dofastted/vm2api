@@ -178,6 +178,9 @@ func parseArgs(args []string) (string, string, bool, bool) {
 	fs.SetOutput(io.Discard)
 	configPath := fs.String("config", "", "path to worker JSON config")
 	force := fs.Bool("force", false, "force OAuth refresh")
+	// Accepted so the control plane can require this worker's attempt journal: an older
+	// worker rejects the unknown flag with invalid_arguments before touching any token.
+	_ = fs.Bool("attempt-guard", false, "require the refresh attempt journal")
 	if err := fs.Parse(args[1:]); err != nil {
 		return "", "", false, false
 	}
@@ -356,8 +359,11 @@ func classifyError(err error) string {
 	}
 	var refreshErr *kinoauth.RefreshError
 	if errors.As(err, &refreshErr) {
-		if refreshErr.Code == "api_key_missing" {
+		switch refreshErr.Code {
+		case "api_key_missing":
 			return "credential_required"
+		case kinoauth.CodeOutcomeUnknown:
+			return kinoauth.CodeOutcomeUnknown
 		}
 		return "refresh_failed"
 	}
@@ -396,6 +402,8 @@ func errorMessage(code string) string {
 		return "slot SOCKS5 is required"
 	case "refresh_failed":
 		return "OAuth refresh failed"
+	case kinoauth.CodeOutcomeUnknown:
+		return "an earlier OAuth refresh has no recorded result; re-authorize the slot"
 	case "credential_required":
 		return "credential is required"
 	case "upstream_transport_error":
