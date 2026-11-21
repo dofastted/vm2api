@@ -160,7 +160,11 @@ export function localDetailSummary(status: ClusterLocalStatus): string {
   parts.push(status.docker.ok ? 'Docker 正常' : 'Docker 不可用')
   if (status.kvm)
     parts.push(
-      status.kvm.ok && status.kvm.accel === 'kvm' ? 'KVM 可用' : 'KVM 不可用'
+      status.kvm.ok && status.kvm.accel === 'kvm'
+        ? 'KVM 可用'
+        : status.kvm.ok
+          ? '仅支持软件模拟'
+          : 'KVM 不可用'
     )
   return parts.join(' · ')
 }
