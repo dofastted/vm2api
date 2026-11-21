@@ -735,10 +735,10 @@ function subscriptionDevice(storage, ctx) {
   if (Object.keys(device).some((key) => device[key] !== ctx.device[key])) fail('license_binding_mismatch')
 }
 
-export function prepareCragSubscriptionBinding(projectRoot, vm) {
+export function prepareCragSubscriptionBinding(projectRoot, vm, { preferInstalled = true } = {}) {
   try {
     subscriptionSlot(vm)
-    slotAuthority(projectRoot, vm)
+    slotAuthority(projectRoot, vm, preferInstalled)
     if (isKvmRuntime(vm) && !vm.node_id) {
       kvmSubscriptionMachineId(vm)
       const machineFile = path.join(projectRoot, 'vms', vm.id, 'machine-id')
@@ -903,12 +903,19 @@ export function activateCragSubscriptionBinding(
   }
 }
 
-export function readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId) {
+export function readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId, { preferInstalled = true } = {}) {
   if (process.platform !== 'linux' || isCodexVm(vm)) return null
   const registration = storedRegistration(cragLicenseDirectory(projectRoot, vm))
   if (!selectsSubscription(registration)) return null
   subscriptionSlot(vm)
-  const permit = authenticateSubscription(registration, 'CRAGS1', slotAuthority(projectRoot, vm).publicKey)
+  // An explicit installation authenticates the old permit with the selected trusted
+  // issuer even when the installed tree is incomplete. Normal reads stay pinned to
+  // the installed package; callers must still match this digest to the signed roster.
+  const permit = authenticateSubscription(
+    registration,
+    'CRAGS1',
+    slotAuthority(projectRoot, vm, preferInstalled).publicKey,
+  )
   if (permit.version !== 1 || permit.product !== 'crag-v2' || permit.host_id !== hostId || permit.vm_id !== vm.id)
     fail('license_binding_mismatch')
   return sha(registration)

@@ -185,6 +185,9 @@ export function WrapSamplePage() {
   const confirmedCragTag =
     confirmedCrag?.payload_tag ?? confirmedCrag?.expected_tag
   const confirmedCragLabel = cragReleaseLabel(confirmedCragTag)
+  const confirmedMigration = confirmTargets?.some(
+    (target) => target.reissue === true
+  )
 
   function requestInstall(targets: KernelTarget[]) {
     if (!canEdit || busy || !targets.length) return
@@ -229,6 +232,15 @@ export function WrapSamplePage() {
           : { expected_tag: product?.release_tag }),
       }
     })
+    if (
+      pinned.some(
+        (target) =>
+          target.reissue && !(target.payload_tag || target.expected_tag)
+      )
+    ) {
+      toast.error('迁移授权前请先拉取并确认 CRAG 发行版本')
+      return
+    }
     setConfirm({ targets: pinned, mode: 'install' })
   }
 
@@ -750,11 +762,19 @@ export function WrapSamplePage() {
                 <div role='rowgroup' className='divide-y'>
                   {rows.map(({ vm, kernel }) => {
                     const license = catalog.data?.licenses[vm.id]
+                    const installLicense =
+                      catalog.data?.install_licenses?.[vm.id]
                     const installed = catalog.data?.installations?.[vm.id]
                     const result = job?.results[vm.id]
                     const runtime = cragStatus?.runtime?.vms[vm.id]
                     const active = installing && job?.activeId === vm.id
                     const macNative = vm.node_platform === 'darwin'
+                    const migrationRequired =
+                      kernel === 'crag' &&
+                      !macNative &&
+                      (installLicense?.code ===
+                        'license_payload_key_mismatch' ||
+                        result?.code === 'crag_subscription_migration_required')
                     const kvm = ['kvm', 'qemu', 'libvirt'].includes(
                       String(vm.runtime?.type || vm.runtime_type || '')
                         .trim()
@@ -933,6 +953,11 @@ export function WrapSamplePage() {
                                 <KeyRound aria-hidden='true' />
                                 {license?.valid ? '续期' : '激活'}
                               </Button>
+                              {migrationRequired ? (
+                                <p className='w-full text-sm text-muted-foreground'>
+                                  所选发行包需要迁移现有授权。请确认迁移后再安装，服务端将核对本机订阅和目标槽位。
+                                </p>
+                              ) : null}
                             </>
                           ) : (
                             <span className='text-base text-muted-foreground sm:text-sm'>
@@ -944,6 +969,21 @@ export function WrapSamplePage() {
                           role='cell'
                           className='flex flex-wrap items-center justify-end gap-2'
                         >
+                          {migrationRequired ? (
+                            <Button
+                              variant='outline'
+                              className='h-auto min-h-11 w-full whitespace-normal sm:w-auto'
+                              disabled={!canEdit || busy}
+                              aria-label={`迁移 ${vm.name || vm.id} 授权并安装 CRAG`}
+                              onClick={() =>
+                                requestInstall([
+                                  { id: vm.id, kernel: 'crag', reissue: true },
+                                ])
+                              }
+                            >
+                              迁移授权并安装
+                            </Button>
+                          ) : null}
                           {repairCrag ? (
                             <Button
                               variant='outline'
@@ -993,17 +1033,21 @@ export function WrapSamplePage() {
           if (!open) setConfirm(null)
         }}
         title={
-          confirm?.mode === 'crag-update'
-            ? `把 ${confirmTargets?.length || 0} 个 CRAG 槽位升级到锁定版本并重启？`
-            : confirmTargets?.length === 1
-              ? `重装 ${vmById.get(confirmTargets[0].id)?.name || confirmTargets[0].id} 并重启？`
-              : `重装全部 ${confirmTargets?.length || 0} 台 VM 并重启？`
+          confirmedMigration
+            ? `迁移 ${vmById.get(confirmTargets?.[0]?.id || '')?.name || confirmTargets?.[0]?.id} 的授权并安装 CRAG？`
+            : confirm?.mode === 'crag-update'
+              ? `把 ${confirmTargets?.length || 0} 个 CRAG 槽位升级到锁定版本并重启？`
+              : confirmTargets?.length === 1
+                ? `重装 ${vmById.get(confirmTargets[0].id)?.name || confirmTargets[0].id} 并重启？`
+                : `重装全部 ${confirmTargets?.length || 0} 台 VM 并重启？`
         }
         desc={
           <>
-            {confirm?.mode === 'crag-update'
-              ? '只替换 CRAG 发行包并重启，内核类型、凭据和工作数据不变；已是锁定版本的槽位已跳过。'
-              : '按所选内核安装并重启，健康检查完成后恢复调度；手动关闭和凭证限制保留。凭据和工作数据不变。'}
+            {confirmedMigration
+              ? '确认使用本机有效订阅，为此槽位换签所选发行包的授权，再安装并重启 CRAG。校验失败会明确报错；不会自动改用其他发行包。'
+              : confirm?.mode === 'crag-update'
+                ? '只替换 CRAG 发行包并重启，内核类型、凭据和工作数据不变；已是锁定版本的槽位已跳过。'
+                : '按所选内核安装并重启，健康检查完成后恢复调度；手动关闭和凭证限制保留。凭据和工作数据不变。'}
             {confirmedCrag ? (
               <>
                 <p className='mt-2'>
@@ -1020,7 +1064,11 @@ export function WrapSamplePage() {
           </>
         }
         confirmText={
-          confirm?.mode === 'crag-update' ? '升级并重启' : '重装并重启'
+          confirmedMigration
+            ? '确认迁移并安装'
+            : confirm?.mode === 'crag-update'
+              ? '升级并重启'
+              : '重装并重启'
         }
         cancelBtnText='取消'
         disabled={!canEdit || busy}

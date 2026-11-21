@@ -102,6 +102,7 @@ test('shop migration numbering preserves applied schemas and orders from either 
     assert.equal(saved.activation_phase, legacy ? 'redeemed' : 'waiting')
     assert.equal(saved.activation_attempts, legacy ? 2 : 0)
     assert.equal(saved.dispatch_state, 'submitted')
+    assert.equal(saved.redemption_sha256, null)
   }
 })
 
@@ -584,6 +585,7 @@ test('device checkout skips panel login, scopes orders to browser and host, and 
   let host = deviceId
   let created = 0
   let applied = 0
+  let confirmed = false
   let status = 'pending'
   const handler = createPanelHandler({
     cfg: { base_url: PANEL },
@@ -605,6 +607,12 @@ test('device checkout skips panel login, scopes orders to browser and host, and 
           assert.equal(expectedHost, deviceId)
           assert.equal(code, CODE)
           applied++
+          confirmed = true
+        },
+        isRedemptionApplied(expectedHost, digest) {
+          assert.equal(expectedHost, deviceId)
+          assert.equal(digest, createHash('sha256').update(CODE).digest('hex'))
+          return confirmed
         },
       },
       supplier: {
@@ -699,6 +707,278 @@ test('device checkout skips panel login, scopes orders to browser and host, and 
   assert.equal(JSON.stringify(activation).includes(CODE), false)
   assert.equal((await call('POST', `/orders/${id}/apply`, {})).data.activation.state, 'active')
   assert.equal(applied, 1)
+})
+
+test('device order recovery projects only a matching durable redemption receipt, including after restart', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-device-recovery-'))
+  const dbPath = path.join(root, 'kin.db')
+  let db = createDatabase({ dbPath })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const hostId = 'a'.repeat(64)
+  const token = Buffer.alloc(32, 17).toString('base64url')
+  const owner = `device:${createHash('sha256').update(`${hostId}:${token}`).digest('hex')}`
+  loadOrderReceiptKey(root, () => false)
+  const id = randomUUID()
+  const otherId = randomUUID()
+  const insert = db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, created_at, term, amount_minor, slot_limit)
+    VALUES (?, ?, ?, 'quarter', 'alipay', 1, 'fulfilled', 1800000000, '3m', 59900, 10)`)
+  insert.run(id, owner, 'paid-original')
+  insert.run(otherId, owner, 'different-order')
+  const digest = createHash('sha256').update(CODE).digest('hex')
+  let applied = 0
+  let proof = false
+  let claimed = 0
+  let claimResponse
+  let errorCode = 'crag_subscription_host_package_changed'
+  let receiptError
+  const requestId = randomUUID()
+  const makeHandler = () =>
+    createCragShopHandler({
+      getDb: () => db,
+      dataDir: root,
+      publicBaseUrl: PANEL,
+      json: (_, http, body) => ({ http, ...body }),
+      readRawBody: (req) => req.raw,
+      subscription: {
+        purchaseDeviceId: () => hostId,
+        isRedemptionApplied(expectedHost, actualDigest) {
+          assert.equal(expectedHost, hostId)
+          if (receiptError && actualDigest === digest) throw Object.assign(new Error('damaged'), { code: receiptError })
+          return proof && actualDigest === digest
+        },
+        async redeemDeviceOrder(expectedHost, code) {
+          assert.equal(expectedHost, hostId)
+          assert.equal(code, CODE)
+          assert.equal(
+            db.prepare('SELECT redemption_sha256 FROM crag_shop_orders WHERE order_id = ?').get(id).redemption_sha256,
+            digest,
+          )
+          applied++
+          throw Object.assign(new Error(`private: ${CODE} /opt/private`), {
+            code: errorCode,
+            authorityRequestId: requestId,
+          })
+        },
+      },
+      supplier: {
+        async claim(row) {
+          claimed++
+          if (claimResponse) return claimResponse(row)
+          return { order_id: row.order_id, redemption_code: CODE }
+        },
+        async status(row) {
+          return order(row.order_id, 'fulfilled')
+        },
+      },
+    })
+  let handler = makeHandler()
+  const call = (method, suffix) => {
+    const url = new URL(`${PANEL}${BASE}/device${suffix}`)
+    return handler(
+      {
+        method,
+        raw: Buffer.from('{}'),
+        headers: {
+          host: 'panel.example.test',
+          origin: PANEL,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+          cookie: `kin_crag_device_checkout=${token}`,
+        },
+      },
+      { setHeader() {} },
+      url,
+      cragShopRoute(method, url.pathname),
+    )
+  }
+  const failed = await call('POST', `/orders/${id}/apply`)
+  assert.equal(failed.http, 409)
+  assert.equal(failed.error.code, errorCode)
+  assert.equal(failed.error.details.authority_request_id, requestId)
+  assert.equal(JSON.stringify(failed).includes(CODE), false)
+  assert.equal(JSON.stringify(failed).includes('/opt/private'), false)
+  assert.equal((await call('GET', `/orders/${id}`)).data.activation.state, 'ready_to_apply')
+  errorCode = 'crag_subscription_authority_unavailable'
+  const uncertain = await call('POST', `/orders/${id}/apply`)
+  assert.equal(uncertain.http, 503)
+  assert.equal(uncertain.error.code, errorCode)
+  assert.equal(
+    (await call('GET', '/orders')).data.orders.every((o) => o.activation.state === 'ready_to_apply'),
+    true,
+  )
+
+  // The administrator finishes the same voucher via subscription recovery, then
+  // the process exits before the shop gets a chance to project that confirmation.
+  proof = true
+  db.close()
+  db = createDatabase({ dbPath })
+  handler = makeHandler()
+  assert.equal((await call('GET', `/orders/${id}`)).data.activation.state, 'active')
+  assert.equal((await call('POST', `/orders/${id}/apply`)).data.activation.state, 'active')
+  const orders = (await call('GET', '/orders')).data.orders
+  assert.equal(orders.find((o) => o.order_id === id).activation.state, 'active')
+  assert.equal(orders.find((o) => o.order_id === otherId).activation.state, 'ready_to_apply')
+  assert.equal(applied, 2)
+  assert.equal(claimed, 2)
+  assert.equal(JSON.stringify(orders).includes(digest), false)
+  assert.equal(JSON.stringify(orders).includes(CODE), false)
+  // Listing also repairs a lost shop projection, without contacting the supplier.
+  db.prepare("UPDATE crag_shop_orders SET activation_phase = 'waiting' WHERE order_id = ?").run(id)
+  assert.equal((await call('GET', '/orders')).data.orders.find((o) => o.order_id === id).activation.state, 'active')
+
+  // One order's unverifiable receipt must not hide the rest of the list. The listing
+  // keeps that row's stored state, the order's own route still reports the reason,
+  // and a repaired receipt converges again without another redemption.
+  db.prepare("UPDATE crag_shop_orders SET activation_phase = 'waiting' WHERE order_id = ?").run(id)
+  receiptError = 'crag_subscription_invalid_redemption_receipt'
+  const tolerated = (await call('GET', '/orders')).data.orders
+  assert.equal(tolerated.length, 2)
+  assert.equal(tolerated.find((o) => o.order_id === id).activation.state, 'ready_to_apply')
+  assert.equal(tolerated.find((o) => o.order_id === otherId).activation.state, 'ready_to_apply')
+  const damaged = await call('GET', `/orders/${id}`)
+  assert.equal(damaged.http, 409)
+  assert.equal(damaged.error.code, 'crag_subscription_invalid_redemption_receipt')
+  receiptError = undefined
+  assert.equal((await call('GET', '/orders')).data.orders.find((o) => o.order_id === id).activation.state, 'active')
+
+  // Two requests read the same unassociated row before either claim completes.
+  // A changed supplier voucher must not bypass the atomic digest association.
+  proof = false
+  db.prepare(
+    "UPDATE crag_shop_orders SET activation_phase = 'waiting', redemption_sha256 = NULL WHERE order_id = ?",
+  ).run(id)
+  const claims = []
+  let bothEntered
+  const entered = new Promise((resolve) => {
+    bothEntered = resolve
+  })
+  claimResponse = (row) =>
+    new Promise((resolve) => {
+      claims.push((code) => resolve({ order_id: row.order_id, redemption_code: code }))
+      if (claims.length === 2) bothEntered()
+    })
+  const first = call('POST', `/orders/${id}/apply`)
+  const second = call('POST', `/orders/${id}/apply`)
+  await entered
+  claims[0](CODE)
+  assert.equal((await first).error.code, errorCode)
+  claims[1](`CRAGR1.${Buffer.alloc(32, 43).toString('base64url')}`)
+  const conflicting = await second
+  assert.equal(conflicting.http, 409)
+  assert.equal(conflicting.error.code, 'shop_redemption_changed')
+  assert.equal(applied, 3)
+  assert.equal(
+    db.prepare('SELECT redemption_sha256 FROM crag_shop_orders WHERE order_id = ?').get(id).redemption_sha256,
+    digest,
+  )
+
+  // A package key the Authority no longer offers, and a mismatched issuer, are
+  // actionable reasons of their own: never the generic "retry the same order".
+  claimResponse = undefined
+  for (const code of ['payload_key_unknown', 'issuer_mismatch']) {
+    errorCode = code
+    const rejected = await call('POST', `/orders/${id}/apply`)
+    assert.equal(rejected.http, 409)
+    assert.equal(rejected.error.code, code)
+    assert.notEqual(rejected.error.code, 'shop_device_apply_failed')
+    assert.equal(JSON.stringify(rejected).includes(CODE), false)
+  }
+  assert.equal(applied, 5)
+})
+
+test('device order package recovery converges through subscription recovery and a read-only order refresh', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-device-integrated-'))
+  const db = createDatabase({ dbPath: path.join(root, 'kin.db') })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const source = path.join(root, 'host-machine-id')
+  fs.writeFileSync(source, randomBytes(16).toString('hex'), { mode: 0o600 })
+  fs.mkdirSync(path.dirname(path.dirname(cragSubscriptionPublicDirectory(root))), { recursive: true })
+  seedEncryptedPackage(root)
+  const token = Buffer.alloc(32, 19).toString('base64url')
+  let rejectRedeem = true
+  let redeemCalls = 0
+  let rights
+  const connect = () =>
+    createCragSubscription({
+      projectRoot: root,
+      machineIdFile: source,
+      listTargets: () => [],
+      fetchImpl: async (url, { body }) => {
+        const input = JSON.parse(body)
+        if (url.endsWith('/redeem')) {
+          redeemCalls++
+          assert.equal(input.redemption_code, CODE)
+          if (rejectRedeem) throw new Error('transport interrupted before commit')
+          rights ??= issueHostEntitlement(root, input.host_id, { slot_limit: 1 })
+        }
+        if (!rights) return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+        return Response.json({ ok: true, data: { entitlement: rights.code, ...rights.claims, used_slots: 0 } })
+      },
+    })
+  let subscription = connect()
+  const hostId = subscription.purchaseDeviceId()
+  const owner = `device:${createHash('sha256').update(`${hostId}:${token}`).digest('hex')}`
+  loadOrderReceiptKey(root, () => false)
+  const id = randomUUID()
+  db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, created_at, term, amount_minor, slot_limit)
+    VALUES (?, ?, 'integrated', 'quarter', 'alipay', 1, 'fulfilled', 1800000000, '3m', 59900, 10)`).run(id, owner)
+  const handler = () =>
+    createCragShopHandler({
+      getDb: () => db,
+      dataDir: root,
+      publicBaseUrl: PANEL,
+      json: (_, http, body) => ({ http, ...body }),
+      readRawBody: (req) => req.raw,
+      subscription,
+      supplier: {
+        claim: async (row) => ({ order_id: row.order_id, redemption_code: CODE }),
+        status: async (row) => order(row.order_id, 'fulfilled'),
+      },
+    })
+  const call = async (method, suffix) => {
+    const url = new URL(`${PANEL}${BASE}/device/orders/${id}${suffix}`)
+    return handler()(
+      {
+        method,
+        raw: Buffer.from('{}'),
+        headers: {
+          host: 'panel.example.test',
+          origin: PANEL,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+          cookie: `kin_crag_device_checkout=${token}`,
+        },
+      },
+      { setHeader() {} },
+      url,
+      cragShopRoute(method, url.pathname),
+    )
+  }
+  assert.equal((await call('POST', '/apply')).error.code, 'crag_subscription_authority_unavailable')
+  seedEncryptedPackage(root, { payloadKey: randomBytes(32) })
+  assert.equal((await call('POST', '/apply')).error.code, 'crag_subscription_host_package_changed')
+  assert.equal(redeemCalls, 1)
+  rejectRedeem = false
+  await subscription.recover({ useCurrentPackage: true })
+  // A fresh process has no in-memory knowledge of the completed recovery.
+  subscription = connect()
+  const refreshed = await call('GET', '')
+  assert.equal(refreshed.http, 200)
+  assert.equal(refreshed.data.activation.state, 'active')
+  assert.equal((await call('POST', '/apply')).data.activation.state, 'active')
+  assert.equal(redeemCalls, 2)
+  assert.equal((await subscription.status()).slot_limit, 1)
+  assert.equal(JSON.stringify(refreshed).includes(CODE), false)
 })
 
 test('pinned fulfillment survives lost redeem and H2 bind replies without reapplying or rebinding another slot', {
