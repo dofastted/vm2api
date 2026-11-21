@@ -4,8 +4,12 @@
 
 ## 1.4.172 — 2026-11-21 · Gemini OAuth 共享调度与协议适配
 
-- Gemini OAuth 推理接入共享 PoolScheduler 的账号平衡、并发预留与 unit-circuit；继续使用各自的 CRAGGemini worker、私有 HOME 和绑定 SOCKS5 出口。
-- Gemini 专用密钥增加受限纯文本的 Gemini、OpenAI Chat/Responses、Anthropic Messages 入口及协议形状的响应和错误；客户端断连按中性取消处理。
+- Gemini OAuth 宿主保留签名 CRAGGemini 原生 worker、隔离 HOME 和绑定 SOCKS5；在共享 PoolScheduler 上增加账号平衡、并发预留及 unit-circuit，并提供受限纯文本 Gemini、OpenAI Chat/Responses、Anthropic Messages 适配，客户端断连按中性取消处理（#1397、#1536）。
+- 兼容性与调度修正：将 Anthropic 顶层自动缓存字段归一化为标准块（#1535），规范官方 CLI 请求中追加的第三方 system 内容（#1521），可选丢弃非本账号签发的 thinking（#1361），正确标记不可重播的 409 并更新强制工具选择说明（#1529），保护固定会话不向新账号溢出（#1383）。
+- 新增额度窗口定时预热与到期续热（#1354）、1.5 GiB 槽位规格（#1389）、一次性活跃会话统计（#1390）和飞书群机器人通知（#1376）；OAuth 未就绪错误增加可操作原因（#1386）。
+- Setup Token 使用完整 OAuth profile scope（#1530）；将 OAuth helper 的 scope/TTL 能力策略移入可验证契约并修正相应测试边界（#1528）。
+- CRAG 已付款订单可恢复，增加明确的槽授权迁移入口（#1517）。
+- 改进按改动源文件选择 Web 兄弟测试及手动全量测试修复（#1534、#1537），完善 PR 目标分支提示与发版时维护 changelog 的流程（#1527、#1522）。
 
 ## 1.4.171 — 2026-11-20 · CRAG 一键升级到锁定版本、CRAG 3.1.12 与面板文案续修
 
