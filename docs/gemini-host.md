@@ -37,11 +37,11 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 
 激活内核后，用 Gemini API Key 或通过官方 CLI 完成 Google OAuth，再在账号「详情 → 测试」拉取模型并试聊。用账号文件导入的短期凭据只能查看已验证的账号数据，不能调度推理；需完成官方 CLI OAuth 后再拉取模型。
 
-管理员创建 Gemini 专用密钥后，可通过 `GET /v1/models` 查看密钥允许且宿主账号已发现的模型。`POST /v1/gemini/sessions/:id` 接受 `{ "model": "<模型 ID>", "input": "你好" }`；路径 ID 只用于回传，不保留历史。`POST /v1/messages` 接受 `model` 和单条用户 `messages`，返回 Anthropic Messages 形状的 JSON。两个入口仅支持单轮、非流式纯文本（最多 4096 UTF-8 字节），不接收生成参数、工具或多模态。
+管理员创建的 Gemini 专用密钥可以通过 `GET /v1/models` 查询模型，并使用已授权且已拉取该模型的 Google OAuth 环境。协议入口包括 OpenAI Chat Completions、OpenAI Responses、Anthropic Messages、Google `generateContent` / `streamGenerateContent`，以及兼容旧客户端的 `/v1/gemini/sessions/:id`。
 
-调度沿用账号绑定的 SOCKS5 代理，遵守密钥模型白名单和限额，不落入 Claude、Codex 或通用 API 后端。宿主在出站前拒绝繁忙账号时可改选；一旦开始推理，不跨账号重试。无候选返回 `gemini_no_account`，账号均繁忙返回 `gemini_operation_busy`。计次不代表 Google 已结算费用。
+当前原生适配只接受每回合一条纯文本 user 输入；system、历史对话、工具、多模态及 Gemini generation settings 会明确拒绝。CRAGGemini 原生 worker 内部使用 SSE，但面向 JSON 请求的公开协议先等完整回合后再生成对应 JSON；流式端点以 SSE 帧返回完整回合，不承诺首 token 延迟流式。Google API 错误和 OpenAI/Anthropic 错误按各自协议形状映射。
 
-OAuth 公共推理使用 CRAGGemini 原生 TUI/`LD_PRELOAD` worker 路径；不走 ACP 或 headless `agy` 推理。API Key 仍通过 Google `generateContent`。`native-turn.mjs` 将 Gemini、Anthropic Messages、OpenAI Chat Completions 和 Responses 的单条文本输入收敛到原生 worker 请求格式。账号 UID、私有 OAuth HOME、绑定 SOCKS5 出口、模型白名单与密钥限额不变。
+OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进入复用的 `PoolScheduler` 账号平衡、in-flight 并发预留和 unit-circuit 状态。每个环境同时只接受一个原生回合；繁忙时在其他符合模型和代理条件的环境中选择。一次回合一旦由 CRAGGemini host 接受，后续推理失败不自动重放到另一账号；客户端应按错误码决定是否重试。每个环境使用自身已绑定 SOCKS5 与独立网络命名空间；模型白名单及 Gemini API key 限额照常执行。
 
 ### 管理员诊断接口
 

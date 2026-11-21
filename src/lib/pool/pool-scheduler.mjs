@@ -2144,12 +2144,48 @@ export class PoolScheduler extends EventEmitter {
     }
     const minLoad = Math.min(...pool.map((candidate) => candidate.loadRatio))
     pool = pool.filter((candidate) => candidate.loadRatio === minLoad)
+    if (pool.every((candidate) => candidate.external)) {
+      pool.sort(
+        (left, right) =>
+          Number(left.lastUsedAt || 0) - Number(right.lastUsedAt || 0) || left.accountId.localeCompare(right.accountId),
+      )
+      return {
+        ...pool[0],
+        selectionReason: reasonFor(pool.length === 1 ? 'priority-load' : 'external-least-recently-used'),
+      }
+    }
     if (pool.length === 1) return { ...pool[0], selectionReason: reasonFor('priority-load') }
     const [balanced] = rankSeatCandidates(pool, {
       strategy: 'balanced',
       openOf: (vmId) => this.planner.openCount(vmId),
     })
     return { ...balanced, selectionReason: reasonFor('balanced') }
+  }
+
+  /** Reserve host-managed accounts with the same balancing, concurrency and circuit state. */
+  reserveExternalCandidates(candidates = [], { excluded = new Set() } = {}) {
+    let remaining = candidates
+      .filter(
+        (candidate) => candidate?.accountId && candidate?.maxConcurrency > 0 && !excluded.has(candidate.accountId),
+      )
+      .map((candidate) => {
+        const lastUsedAt = this.lastUsed.get(candidate.accountId) || Number(candidate.lastUsedAt) || 0
+        return {
+          ...candidate,
+          external: true,
+          inflight: this.inflight.get(candidate.accountId) || 0,
+          loadRatio: (this.inflight.get(candidate.accountId) || 0) / candidate.maxConcurrency,
+          lastUsedAt,
+        }
+      })
+    while (remaining.length) {
+      const selected = this.pick(remaining)
+      if (!selected) return null
+      const reservation = this.reserve(selected)
+      if (reservation) return { selected, reservation }
+      remaining = remaining.filter((candidate) => candidate.accountId !== selected.accountId)
+    }
+    return null
   }
 
   peekRank(candidates = []) {
@@ -2348,12 +2384,14 @@ export class PoolScheduler extends EventEmitter {
     ) {
       return null
     }
-    const quotaReservation = this.accountQuota?.tryAcquire?.(accountId, {
-      skipGate: !!skipQuota,
-      tier: vmTierOf(candidate.vm),
-      quotaRequest: candidate.quotaRequest,
-      account: snapshot.account,
-    })
+    const quotaReservation = candidate.external
+      ? null
+      : this.accountQuota?.tryAcquire?.(accountId, {
+          skipGate: !!skipQuota,
+          tier: vmTierOf(candidate.vm),
+          quotaRequest: candidate.quotaRequest,
+          account: snapshot.account,
+        })
     if (quotaReservation && !quotaReservation.ok) return null
     const releaseQuota = () => {
       if (quotaReservation?.release) quotaReservation.release()

@@ -1,4 +1,3 @@
-import crypto from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
@@ -50,12 +49,6 @@ function known(error) {
   return null
 }
 
-function modelAccounts(accounts, model) {
-  const ready = accounts.filter((account) => account.models.includes(model))
-  const start = ready.length ? crypto.randomInt(ready.length) : 0
-  return [...ready.slice(start), ...ready.slice(0, start)]
-}
-
 async function readRun(callHost, id, runId, signal) {
   const deadline = Date.now() + TURN_MS
   while (Date.now() < deadline) {
@@ -68,7 +61,7 @@ async function readRun(callHost, id, runId, signal) {
   throw fail(504, 'gemini_inference_timeout')
 }
 
-export function createGeminiScheduler({ callHost, resolveProxy, apiKeyStore, groupsRepo }) {
+export function createGeminiScheduler({ callHost, resolveProxy, poolScheduler, apiKeyStore, groupsRepo }) {
   return {
     async catalog() {
       const view = await callHost('list', {})
@@ -115,46 +108,65 @@ export function createGeminiScheduler({ callHost, resolveProxy, apiKeyStore, gro
     async complete({ model, text, signal, apiKeyRecord }) {
       const gate = apiKeyStore?.acquire?.(apiKeyRecord)
       if (gate && !gate.ok) throw fail(gate.status || 429, gate.code, gate.message)
+      const excluded = new Set()
+      let reservation = null
+      let selected = null
       let run = null
       try {
         signal?.throwIfAborted()
         const catalog = await this.catalog()
-        const candidates = modelAccounts(catalog.accounts, model)
-        if (!candidates.length) {
+        const accounts = catalog.accounts.filter((account) => account.models.includes(model))
+        if (!accounts.length) {
           throw fail(
             catalog.accounts.length ? 404 : 503,
             catalog.accounts.length ? 'gemini_model_unavailable' : 'gemini_no_account',
           )
         }
-        for (const account of candidates) {
-          const listed = await callHost('get', { id: account.id })
-          const proxyId = listed?.proxy_id
-          if (typeof proxyId !== 'string' || !ID.test(proxyId)) throw fail(502, 'gemini_host_protocol_error')
-          const proxyUrl = resolveProxy ? resolveProxy(proxyId) : undefined
+        const candidates = accounts.map((account) => ({
+          accountId: `gemini:${account.id}`,
+          vmId: `gemini:${account.id}`,
+          model,
+          maxConcurrency: 1,
+          priority: 0,
+          weight: 1,
+          lastUsedAt: 0,
+        }))
+        while (!reservation && excluded.size < candidates.length) {
           signal?.throwIfAborted()
-          let started
+          const grant = poolScheduler?.reserveExternalCandidates(candidates, { excluded })
+          if (!grant) break
+          reservation = grant.reservation
+          selected = { ...grant.selected, id: grant.selected.accountId.slice('gemini:'.length) }
           try {
-            started = await callHost('test-chat', {
-              id: account.id,
+            const listed = await callHost('get', { id: selected.id })
+            const proxyId = listed?.proxy_id
+            if (typeof proxyId !== 'string' || !ID.test(proxyId)) throw fail(502, 'gemini_host_protocol_error')
+            const proxyUrl = resolveProxy ? resolveProxy(proxyId) : undefined
+            signal?.throwIfAborted()
+            const started = await callHost('test-chat', {
+              id: selected.id,
               proxy_id: proxyId,
               proxy_url: proxyUrl,
               model,
               prompt: text,
             })
+            if (typeof started?.run_id !== 'string' || !RUN_ID.test(started.run_id)) {
+              throw fail(502, 'gemini_host_protocol_error')
+            }
+            run = { id: selected.id, run_id: started.run_id }
           } catch (error) {
-            // Busy is a host admission refusal before any upstream work starts.
-            if (error?.code === 'gemini_operation_busy') continue
+            reservation.release()
+            reservation = null
+            if (error?.code === 'gemini_operation_busy' || error?.code === 'gemini_proxy_unavailable') {
+              excluded.add(selected.accountId)
+              selected = null
+              continue
+            }
             throw error
           }
-          if (typeof started?.run_id !== 'string' || !RUN_ID.test(started.run_id)) {
-            throw fail(502, 'gemini_host_protocol_error')
-          }
-          run = { id: account.id, run_id: started.run_id }
-          break
         }
-        if (!run) throw fail(503, 'gemini_operation_busy')
-        const { id: accountId, run_id: runId } = run
-        const result = await readRun(callHost, accountId, runId, signal)
+        if (!run || !selected || !reservation) throw fail(503, 'gemini_operation_busy')
+        const result = await readRun(callHost, run.id, run.run_id, signal)
         run = null
         if (result.state === 'failed') {
           const code = typeof result.error?.code === 'string' ? result.error.code : 'gemini_inference_failed'
@@ -175,7 +187,9 @@ export function createGeminiScheduler({ callHost, resolveProxy, apiKeyStore, gro
             { model, rateMultiplier: multiplier },
           )
         }
-        return { text: result.text, usage, account_id: accountId, model }
+        poolScheduler?.unitCircuit?.recordSuccess?.(selected.accountId)
+        poolScheduler?.lastUsed?.set?.(selected.accountId, Date.now())
+        return { text: result.text, usage, account_id: selected.id, model }
       } catch (error) {
         if (run) {
           try {
@@ -184,8 +198,27 @@ export function createGeminiScheduler({ callHost, resolveProxy, apiKeyStore, gro
             // Host idle cleanup releases the account.
           }
         }
-        throw known(error) || error
+        const failure = known(error) || error
+        const cancelled = signal?.aborted || failure?.name === 'AbortError' || failure?.code === 'ABORT_ERR'
+        if (selected && cancelled) {
+          poolScheduler?.unitCircuit?.releaseProbe?.(selected.accountId)
+        } else if (
+          selected &&
+          ![
+            'gemini_quota_exhausted',
+            'gemini_oauth_required',
+            'gemini_api_key_invalid',
+            'gemini_location_unsupported',
+            'gemini_model_unavailable',
+          ].includes(code)
+        ) {
+          poolScheduler?.unitCircuit?.recordFailure?.(selected.accountId)
+        } else if (selected) {
+          poolScheduler?.unitCircuit?.releaseProbe?.(selected.accountId)
+        }
+        throw failure
       } finally {
+        reservation?.release()
         try {
           apiKeyStore?.release?.(apiKeyRecord)
         } catch {
