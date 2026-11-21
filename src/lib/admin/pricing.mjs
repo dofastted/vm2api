@@ -112,6 +112,11 @@ function round8(v) {
   return Math.round((Number(v) || 0) * 1e8) / 1e8
 }
 
+// The usage-logs billing aggregation sums cost rows itself instead of building
+// an intermediate row object per event (#1497). It has to keep the exact per-row
+// coercion and rounding sumCostBuckets applies, so both come from here.
+export { n as positiveAmount, round8 }
+
 function cacheSplit(u) {
   let cache5m = n(u.cache_creation_5m_tokens ?? u.cache_creation?.ephemeral_5m_input_tokens)
   let cache1h = n(u.cache_creation_1h_tokens ?? u.cache_creation?.ephemeral_1h_input_tokens)
