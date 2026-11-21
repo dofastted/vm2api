@@ -76,6 +76,7 @@ function ScopeOption({
  * 后端 `GET /request-logs/export` 上限 5000 条，超出按最新截断（响应头回报）。
  */
 export function ExportDialog({
+  currentErrorClass,
   open,
   onOpenChange,
   currentSummary,
@@ -85,6 +86,8 @@ export function ExportDialog({
   onOpenChange: (open: boolean) => void
   /** 「跟随当前筛选」的说明文案，由页面根据当前筛选态拼出。 */
   currentSummary: string
+  /** 当前筛选已选定的错误类，由页面传入；没有选定时为 undefined。 */
+  currentErrorClass?: string
   onExport: (opts: ExportOptions) => Promise<void>
 }) {
   const [format, setFormat] = useState<'jsonl' | 'csv'>('jsonl')
@@ -214,13 +217,23 @@ export function ExportDialog({
             </div>
           </div>
           {scope !== 'all' ? (
-            <Label className='flex cursor-pointer items-center justify-between gap-3 font-normal'>
-              <span className='text-sm'>包含已屏蔽的错误类</span>
-              <Switch
-                checked={includeMuted}
-                onCheckedChange={setIncludeMuted}
-              />
-            </Label>
+            (
+              scope === 'current'
+                ? !!currentErrorClass
+                : scope === 'errors' && !!errorClass
+            ) ? (
+              <p className='text-sm text-muted-foreground'>
+                按所选错误类导出，不受屏蔽设置影响
+              </p>
+            ) : (
+              <Label className='flex cursor-pointer items-center justify-between gap-3 font-normal'>
+                <span className='text-sm'>包含已屏蔽的错误类</span>
+                <Switch
+                  checked={includeMuted}
+                  onCheckedChange={setIncludeMuted}
+                />
+              </Label>
+            )
           ) : null}
           <div className='space-y-2'>
             <div className='text-xs font-medium text-muted-foreground'>
