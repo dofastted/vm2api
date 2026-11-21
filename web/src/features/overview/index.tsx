@@ -197,6 +197,7 @@ export function OverviewPage() {
                   </small>
                 </>
               }
+              hint='分母：有凭证的账号'
               ringPct={
                 withToken ? (available / Math.max(withToken, 1)) * 100 : 0
               }
@@ -204,7 +205,7 @@ export function OverviewPage() {
             />
             <KpiCard
               icon={Server}
-              label='在线'
+              label='判定为运行的虚拟机'
               value={
                 <>
                   {running}
@@ -213,6 +214,7 @@ export function OverviewPage() {
                   </small>
                 </>
               }
+              hint='分母：全部虚拟机'
               ringPct={vms.length ? (running / vms.length) * 100 : 0}
               tone='good'
             />
