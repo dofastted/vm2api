@@ -624,3 +624,38 @@ test('persona Environment injection does not break the prefix when each turn end
     history.push({ role: 'assistant', content: [{ type: 'text', text: `answer ${turn}` }] })
   }
 })
+
+test('a candidate without this session is answered without snapshotting the body (#1496)', () => {
+  clearCachePrefixSessions()
+  // Scheduling asks this for every candidate account. Only the one holding the
+  // session has a previous turn to compare against; for the rest the snapshot is
+  // built and then dropped, so the cost scaled with candidates x body size.
+  let reads = 0
+  const counted = {
+    model: 'claude-sonnet-5-5',
+    get tools() {
+      reads++
+      return [{ name: 'Read' }]
+    },
+    get system() {
+      reads++
+      return [{ type: 'text', text: 'you are a cli' }]
+    },
+    get messages() {
+      reads++
+      return [{ role: 'user', content: 'x'.repeat(4096) }]
+    },
+  }
+  const cold = peekCachePrefix('no-such-account:sess-1', counted, 1)
+  assert.deepEqual(cold, { turn: 1, break: null, confirmed: false, intercept: null })
+  assert.equal(reads, 0, 'nothing may read the body when there is no previous turn to compare')
+
+  // The account that does hold the session still gets the real comparison.
+  const warm = body('you are a cli', 'first')
+  prepareCachePrefix('holder:sess-1', warm, 1)
+  confirmCachePrefix('holder:sess-1', 1)
+  const second = peekCachePrefix('holder:sess-1', body('you are a cli', 'first', 'reply', 'again'), 2)
+  assert.equal(second.turn, 2)
+  assert.equal(second.confirmed, true)
+  assert.equal(second.break, null)
+})
