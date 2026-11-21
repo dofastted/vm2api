@@ -736,7 +736,11 @@ function VmDetailBody({
           desc={
             <>
               <p>删除槽位不可恢复。</p>
-              <DeleteActiveVmHint target={vm} vms={slotList} />
+              <DeleteActiveVmHint
+                target={vm}
+                vms={slotList}
+                force={forceDel && !!nodeGone}
+              />
             </>
           }
           confirmText={deletePlan.kind === 'switch' ? '切换活跃并删除' : '删除'}
