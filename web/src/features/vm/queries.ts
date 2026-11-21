@@ -70,6 +70,11 @@ export type CragRuntime = {
 export type CragHostStatus = {
   ready: boolean
   target_probe_failed?: true
+  /** The Authority rejected this host's credential and the automatic recovery
+   * did not clear it. Unlike an outage, this needs the operator: most often
+   * `host_id_collision`, where another machine -- typically a VPS cloned from
+   * the same image, keeping its machine-id -- holds the same host id. */
+  credential_recovery?: 'host_id_collision' | 'failed' | 'not_activated'
   state: 'unavailable' | 'unredeemed' | 'active' | 'expired' | 'sync_pending'
   slot_limit?: number | 'unlimited'
   expires_at?: number
