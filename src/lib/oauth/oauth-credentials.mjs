@@ -811,9 +811,21 @@ export function clearVmAuthCooldown(vmPath) {
   return vm
 }
 
+// The control plane lost track of the worker: the refresh may or may not have run.
+const WORKER_TRANSPORT_CODES =
+  /^(worker_output_invalid|worker_exec_failed|worker_timeout|worker_output_limit|credential_pull_failed)$/i
+
+/** Lost answers are retryable only when the worker's attempt journal guards the refresh token. */
+const unguardedTransportFailure = (result) =>
+  result?.attempt_guard === false &&
+  WORKER_TRANSPORT_CODES.test(String(result?.error?.code || result?.error_code || ''))
+
 export function classifyCredentialRefresh(result) {
   if (result?.ok) return result.refreshed ? 'refreshed' : 'already_fresh'
   const code = String(result?.error?.code || result?.error_code || '')
+  // The worker sent this token once without a usable answer; only re-authorization resolves it.
+  if (code === 'refresh_outcome_unknown') return 'failed'
+  if (unguardedTransportFailure(result)) return 'failed'
   const message = String(result?.error?.message || result?.message || result?.error || '')
   const status = Number(result?.status) || 0
   const blob = `${code} ${message}`.toLowerCase()
@@ -827,6 +839,7 @@ export function classifyCredentialRefresh(result) {
   if (
     status === 429 ||
     status >= 500 ||
+    WORKER_TRANSPORT_CODES.test(code) ||
     /timeout|transport|network|temporar|worker_unavailable|worker_timeout|worker_socket/.test(blob)
   ) {
     return 'retryable'
@@ -835,6 +848,8 @@ export function classifyCredentialRefresh(result) {
 }
 
 export function refreshErrorCodeOf(result) {
+  // A worker without the attempt journal cannot be retried safely after a lost answer.
+  if (unguardedTransportFailure(result)) return 'worker_upgrade_required'
   const code = String(result?.error?.code || result?.error_code || '').trim()
   const message = String(result?.error?.message || result?.message || '')
   const blob = `${code} ${message}`

@@ -127,6 +127,56 @@ test('classify reads invalid_grant from worker message', () => {
   )
 })
 
+test('worker execution and output failures are retryable without weakening fatal grant errors', () => {
+  for (const code of ['worker_output_invalid', 'worker_exec_failed', 'worker_output_limit', 'credential_pull_failed']) {
+    assert.equal(classifyCredentialRefresh({ ok: false, status: 0, error: { code } }), 'retryable', code)
+  }
+  assert.equal(classifyCredentialRefresh({ ok: false, error: { code: 'config_failed' } }), 'failed')
+  assert.equal(
+    classifyCredentialRefresh({
+      ok: false,
+      error: { code: 'worker_output_invalid', message: 'invalid_grant' },
+    }),
+    'fatal',
+  )
+})
+
+test('stored transient refresh errors retry when due but fatal and fresh grants stay protected', () => {
+  for (const code of ['worker_output_invalid', 'worker_exec_failed', 'worker_output_limit', 'credential_pull_failed']) {
+    assert.equal(needsScheduledRefresh({ ...offSlot, refresh_error: code }), true, code)
+    assert.equal(needsScheduledRefresh({ ...offSlot, claude: { refresh_error: code } }), true, code)
+    assert.equal(needsScheduledRefresh({ ...offSlot, refresh_error: code, expires_at: Date.now() + 3600_000 }), false)
+    assert.equal(
+      needsScheduledRefresh({ ...offSlot, refresh_error: code, claude: { refresh_error: 'invalid_grant' } }),
+      false,
+    )
+  }
+  for (const code of ['invalid_grant', 'oauth_revoked', 'refresh_token_missing', 'config_failed']) {
+    assert.equal(needsScheduledRefresh({ ...offSlot, refresh_error: code }), false, code)
+  }
+})
+
+test('a slot with a historical worker output error remains eligible on the next monitor run', async () => {
+  const vm = { ...offSlot, refresh_error: 'worker_output_invalid' }
+  let attempts = 0
+  const monitor = createCredentialRefreshMonitor({
+    listTargets: () => [vm],
+    refreshOne: async () => {
+      attempts++
+      if (attempts === 1) return { ok: false, refresh_class: 'retryable' }
+      delete vm.refresh_error
+      vm.expires_at = Date.now() + 3600_000
+      return { ok: true, refresh_class: 'refreshed' }
+    },
+  })
+  assert.equal((await monitor.runOnce()).due, 1)
+  const recovered = await monitor.runOnce()
+  assert.equal(recovered.due, 1)
+  assert.equal(recovered.items[0].ok, true)
+  assert.equal(attempts, 2)
+  assert.equal((await monitor.runOnce()).due, 0)
+})
+
 test('markVmRefreshError writes refresh_error and persist clears it', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-refresh-'))
   const vmPath = path.join(dir, 'vm-09.json')

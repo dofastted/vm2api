@@ -121,6 +121,7 @@ import {
   PROACTIVE_REFRESH_SKEW_MS,
   classifyCredentialRefresh,
   markVmRefreshError,
+  refreshErrorCodeOf,
   mirrorWorkerCredentialsToVm,
 } from './lib/oauth/oauth-credentials.mjs'
 import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
@@ -760,14 +761,20 @@ function publicCredentialRefreshResult(vmId, result, { force = false } = {}) {
     },
   }
   if (!result?.ok) {
+    const derived = refreshErrorCodeOf(result)
+    const code = derived === 'worker_upgrade_required' ? derived : result?.error?.code || 'credential_refresh_failed'
     out.error = {
-      code: result?.error?.code || 'credential_refresh_failed',
+      code,
       message:
-        refreshClass === 'fatal'
-          ? 'OAuth credential was rejected'
-          : refreshClass === 'retryable'
-            ? 'OAuth credential refresh is temporarily unavailable'
-            : 'OAuth credential refresh failed',
+        code === 'refresh_outcome_unknown'
+          ? 'An earlier refresh with this credential has no recorded result; re-authorize the slot'
+          : code === 'worker_upgrade_required'
+            ? 'The slot worker cannot guard refresh retries; update kin-worker on this node'
+            : refreshClass === 'fatal'
+              ? 'OAuth credential was rejected'
+              : refreshClass === 'retryable'
+                ? 'OAuth credential refresh is temporarily unavailable'
+                : 'OAuth credential refresh failed',
     }
   }
   return out
