@@ -187,9 +187,9 @@ export function TrafficOps({
       hint: `p95 ${fmtMs(dur.p95_ms)} · avg ${fmtMs(dur.avg_ms)}`,
     },
     {
-      label: 'QPS',
+      label: '平均 QPS',
       value: fmtRate(o.qps?.avg),
-      hint: `当前 ${fmtRate(o.qps?.current)} · 峰值 ${fmtRate(o.qps?.peak)}`,
+      hint: `最近有请求的分钟 ${fmtRate(o.qps?.current)} · 分钟峰值 ${fmtRate(o.qps?.peak)}`,
     },
     {
       label: 'TPS',
