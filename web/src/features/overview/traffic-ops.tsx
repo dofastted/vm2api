@@ -141,6 +141,8 @@ export function TrafficOps({
     )
   }
 
+  const hasRequests = o.requests != null && o.requests > 0
+  const noRequests = o.requests === 0
   const cells: {
     label: string
     value: string
@@ -149,15 +151,23 @@ export function TrafficOps({
   }[] = [
     {
       label: '成功率',
-      value: sla == null ? '—' : `${sla.toFixed(1)}%`,
-      hint: `${fmtNum(o.success || 0)} / ${fmtNum(o.requests || 0)} · 错 ${fmtNum(o.errors || 0)}`,
-      tone: slaTone(o.sla),
+      value: !hasRequests || sla == null ? '—' : `${sla.toFixed(1)}%`,
+      hint: hasRequests
+        ? `${fmtNum(o.success || 0)} / ${fmtNum(o.requests || 0)} · 错 ${fmtNum(o.errors || 0)}`
+        : noRequests
+          ? '所选时段无请求'
+          : undefined,
+      tone: hasRequests ? slaTone(o.sla) : undefined,
     },
     {
       label: '错误率',
-      value: err == null ? '—' : `${err.toFixed(1)}%`,
-      hint: `429 ${fmtNum(o.status_429 || 0)} · 503 ${fmtNum(o.status_503 || 0)} · 529 ${fmtNum(o.status_529 || 0)}`,
-      tone: errTone(o.error_rate),
+      value: !hasRequests || err == null ? '—' : `${err.toFixed(1)}%`,
+      hint: hasRequests
+        ? `429 ${fmtNum(o.status_429 || 0)} · 503 ${fmtNum(o.status_503 || 0)} · 529 ${fmtNum(o.status_529 || 0)}`
+        : noRequests
+          ? '所选时段无请求'
+          : undefined,
+      tone: hasRequests ? errTone(o.error_rate) : undefined,
     },
     {
       label: '首字 p50',
