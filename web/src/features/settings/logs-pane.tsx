@@ -18,7 +18,7 @@ export function LogsPane({ value: logging, onChange }: LogsPaneProps) {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>日志</CardTitle>
+        <CardTitle>日志保留</CardTitle>
       </CardHeader>
       <CardContent className='divide-y'>
         <SettingRow label='记录模式'>

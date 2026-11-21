@@ -109,6 +109,7 @@ import {
   vmDetailTabs,
 } from '@/features/vm/vm-perms'
 import { VmTestSchedule } from '@/features/vm/vm-test-schedule'
+import { resetNotice } from './reset-start-copy'
 
 function postVm<T = unknown>(id: string, path: string, body?: unknown) {
   return api<T>(`/api/panel/vms/${encodeURIComponent(id)}${path}`, {
@@ -365,10 +366,9 @@ function VmDetailBody({
   })
   const resetVm = useMutation({
     mutationFn: (mode: 'keep' | 'traits') => postVm(id, '/reset', { mode }),
-    onSuccess: async (_data, mode) => {
-      toast.success(
-        mode === 'keep' ? `已保留原数据重建 ${id}` : `已按新特征重建 ${id}`
-      )
+    onSuccess: async (data, mode) => {
+      const notice = resetNotice(mode, id, data)
+      toast[notice.level](notice.message)
       setConfirmReset(false)
       setResetInput('')
       await refreshAll()
@@ -736,7 +736,11 @@ function VmDetailBody({
           desc={
             <>
               <p>删除槽位不可恢复。</p>
-              <DeleteActiveVmHint target={vm} vms={slotList} />
+              <DeleteActiveVmHint
+                target={vm}
+                vms={slotList}
+                force={forceDel && !!nodeGone}
+              />
             </>
           }
           confirmText={deletePlan.kind === 'switch' ? '切换活跃并删除' : '删除'}

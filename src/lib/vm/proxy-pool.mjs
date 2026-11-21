@@ -601,6 +601,7 @@ export class ProxyPool extends EventEmitter {
       node_id: isLocalEgressProxy(p) ? localEgressNodeId(p.id) : undefined,
       scheme: isLocalEgressProxy(p) ? 'local' : p.scheme || 'socks5',
       domain_forward: !!p.domain_forward,
+      dns_disable_svcb_https: !!p.dns_disable_svcb_https,
       geo: proxyGeoOf(p),
       geo_v6: proxyGeoV6Of(p),
     }
@@ -823,6 +824,10 @@ export class ProxyPool extends EventEmitter {
         last_probe_at: null,
         last_error: null,
         created_at: new Date().toISOString(),
+        // The pool key is the default for rows added later: without this a
+        // pool set to block SVCB/HTTPS would silently stop applying to
+        // anything imported after the switch was turned on.
+        dns_disable_svcb_https: this.state.config.dns_disable_svcb_https === true,
       }
       this.state.proxies.push(proxy)
       added.push(this.publicProxy(proxy))
@@ -991,7 +996,7 @@ export class ProxyPool extends EventEmitter {
     if (!p) return { ok: false, error: 'proxy_not_found' }
     const has = (k) => Object.prototype.hasOwnProperty.call(patch, k)
     const connection = ['scheme', 'host', 'port', 'username', 'password'].some(has)
-    if (!connection && !has('label') && !has('domain_forward')) {
+    if (!connection && !has('label') && !has('domain_forward') && !has('dns_disable_svcb_https')) {
       return { ok: false, error: 'no_editable_fields' }
     }
     let label = p.label || null
@@ -1007,11 +1012,32 @@ export class ProxyPool extends EventEmitter {
       domainForward = patch.domain_forward
     }
     const domainChanged = domainForward !== !!p.domain_forward
+    // The DNS override is written into the helper's egress.json, and a local
+    // row has no helper of its own — accepting it there would store a switch
+    // nothing reads. Same shape as domain_forward above.
+    let dnsDisable = !!p.dns_disable_svcb_https
+    if (has('dns_disable_svcb_https')) {
+      if (typeof patch.dns_disable_svcb_https !== 'boolean') {
+        return { ok: false, error: 'invalid_dns_disable_svcb_https' }
+      }
+      if (patch.dns_disable_svcb_https && isLocalEgressProxy(p)) {
+        return { ok: false, error: 'dns_disable_svcb_https_unsupported' }
+      }
+      dnsDisable = patch.dns_disable_svcb_https
+    }
+    const dnsDisableChanged = dnsDisable !== !!p.dns_disable_svcb_https
     if (!connection) {
       p.label = label
       p.domain_forward = domainForward
+      p.dns_disable_svcb_https = dnsDisable
       this.save()
-      return { ok: true, proxy: this.publicProxy(p), connection_changed: false, domain_forward_changed: domainChanged }
+      return {
+        ok: true,
+        proxy: this.publicProxy(p),
+        connection_changed: false,
+        domain_forward_changed: domainChanged,
+        dns_disable_svcb_https_changed: dnsDisableChanged,
+      }
     }
     let scheme = p.scheme || 'socks5'
     if (has('scheme')) {
@@ -1051,6 +1077,7 @@ export class ProxyPool extends EventEmitter {
     updated.raw = socksEndpoint(next.host, next.port)
     updated.label = label
     updated.domain_forward = domainForward
+    updated.dns_disable_svcb_https = dnsDisable
     this.state.proxies[this.state.proxies.indexOf(p)] = updated
     this.save()
     return {
@@ -1058,7 +1085,47 @@ export class ProxyPool extends EventEmitter {
       proxy: this.publicProxy(updated),
       connection_changed: true,
       domain_forward_changed: domainChanged,
+      dns_disable_svcb_https_changed: dnsDisableChanged,
     }
+  }
+
+  /**
+   * Core of the bulk apply, without a save.
+   *
+   * `updateConfig()` already saves once at the end, so it uses this directly
+   * rather than `setDnsDisableSvcbHttpsAll()` — two writes for one request
+   * would be the only difference.
+   */
+  _applyDnsDisableSvcbHttps(value) {
+    const changed = []
+    let eligible = 0
+    for (const p of this.state.proxies) {
+      if (isLocalEgressProxy(p)) continue
+      eligible += 1
+      if (!!p.dns_disable_svcb_https === value) continue
+      p.dns_disable_svcb_https = value
+      changed.push(p.id)
+    }
+    this.state.config.dns_disable_svcb_https = value
+    return { changed, eligible }
+  }
+
+  /**
+   * Set the SVCB/HTTPS DNS override on every proxy that can carry it.
+   *
+   * The pool-level key is no longer what a helper reads at start — it is the
+   * initial value for proxies added later, and the record of this bulk intent.
+   * Local rows are skipped: they have no kin-egress helper of their own, which
+   * is the same reason `update()` rejects the field for them.
+   *
+   * Returns the ids actually flipped so the caller reloads only those helpers
+   * rather than every bound proxy in the pool.
+   */
+  setDnsDisableSvcbHttpsAll(value) {
+    if (typeof value !== 'boolean') return { ok: false, error: 'invalid_dns_disable_svcb_https' }
+    const applied = this._applyDnsDisableSvcbHttps(value)
+    this.save()
+    return { ok: true, value, ...applied }
   }
 
   updateConfig(patch = {}) {
@@ -1079,7 +1146,14 @@ export class ProxyPool extends EventEmitter {
       }
     }
     if (patch.dns_primary != null) this.state.config.dns_primary = patch.dns_primary
-    if (patch.dns_disable_svcb_https != null) this.state.config.dns_disable_svcb_https = patch.dns_disable_svcb_https
+    // The pool-level switch is now a bulk action over the rows: a helper reads
+    // the value off its own proxy, so writing only the config key would store
+    // an intent nothing acts on. The flipped ids go back to the caller so it
+    // reloads just those helpers.
+    let dnsDisableChanged = []
+    if (patch.dns_disable_svcb_https != null) {
+      dnsDisableChanged = this._applyDnsDisableSvcbHttps(patch.dns_disable_svcb_https).changed
+    }
     if (patch.probe_interval_min != null) {
       const n = Number(patch.probe_interval_min)
       if (!allowed.includes(n)) {
@@ -1116,7 +1190,7 @@ export class ProxyPool extends EventEmitter {
       }
     }
     this.restartScheduler()
-    return { ok: true, config: this.state.config }
+    return { ok: true, config: this.state.config, dns_disable_svcb_https_changed: dnsDisableChanged }
   }
 
   disconnectOnErrorEnabled() {
@@ -1862,6 +1936,10 @@ export class ProxyPool extends EventEmitter {
       // startProxyEgress reads this to write kin-egress domain_forward; without
       // it the toggle is stored but every helper keeps forwarding IP literals.
       domain_forward: p.domain_forward === true,
+      // Same contract for the DNS override: startProxyEgress derives
+      // `dns_empty_types` from this row, so leaving it out of the trimmed shape
+      // would store the switch and start every helper without it.
+      dns_disable_svcb_https: p.dns_disable_svcb_https === true,
     }
   }
 }

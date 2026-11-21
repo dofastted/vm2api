@@ -112,15 +112,23 @@ curl -sS http://127.0.0.1:8787/v1/messages \
 
 非官方入站会被改写成配置选定的 persona system 再发给上游；**回包不带改写后的 system**。`persona_preset=official` 保留 billing、identity、调用方 agent prompt（若有）和调用方 system；`persona_preset=official_full` 才固定追加完整 Claude Code agent prompt。非官方 `usage` 按「没有 persona system、没有注入 tools」估算。官方 Claude Code 四闸全过则体不改、usage 不藏。
 
+上面这套改写对每个 Anthropic API 地址可单独关掉：地址的 `body_policy` 为 `persona`（缺省）时照上述执行；设为 `caller` 则原样转发调用方自带的 `system`、计费标记与工具身份，不注入人设、persona 隐藏用量记 0。只有运维能在面板「API 渠道」里改它，请求头和请求体都无法开启。它**只影响人设注入** —— 风控审查、Key 配额、模型映射、预算下限、代理与认证照旧，上游的拒绝也照旧透出。适用于上游自己读取这些块的地址（例如上游按调用方计费标记判断额度）。
+
+注意本页的「API 渠道测试」不走上述人设链路，它自建一个最简 Messages 请求。所以**面板测试通过不能推断托管 Key 正式入口的请求形状**；要比对两者，先确认该地址的 `body_policy`。
+
 支持的 Messages 字段原样进入清洗层：`system`、`tools`、`tool_choice`、`thinking`、`output_config`、`metadata`、`stop_sequences`、图片块、`cache_control`。非法 `role` 会洗掉。OpenAI 形态 tools 出现在本口时先转成 Anthropic tools，但仍判非官方。
 
 native cli-hop 开启官方家族透传时，调用方 `cache_control` 的位置、显式 TTL 与缺失 TTL 保留。超过四个 breakpoint、thinking 上打点、非法 TTL，或 `5m`（含缺失 TTL）之后出现 `1h`，返回 `400 invalid_cache_control`，不静默裁剪或降级、不执行上游。非透传仍按协议重写规则生成自产点；kernel 不再替前置层修复 TTL 顺序。
 
 ### Sonnet 5.5 兼容边界
 
-`claude-sonnet-5-5` 不支持原生强制工具调用。Node 沿用 Opus 5.5 策略：`tool_choice=any/tool/required` 转成 `{type:auto}`；指定名称的客户端工具设置 `strict:true`，服务端工具不加该字段。不注入提示词，也不把普通文本伪造成工具调用。**strict 只约束实际工具调用的参数，不保证一定调用或只调用指定工具。** 需要原生强制调用时继续使用支持该能力的模型，例如 `claude-sonnet-5`；其行为不变。
+`claude-sonnet-5-5` 不支持原生强制工具调用，请求**直接拒绝，不做自动改写**：`tool_choice` 为 `any` 或 `tool` 时返回 `400 tool_choice_incompatible`。同一规则适用于其他只支持 adaptive thinking 的模型——`claude-opus-5-5`、`claude-fable-5`、`claude-fable-5-1`、`claude-fable-5-2`，以及路由别名 `auto`。校验在模型与 persona 重写之前执行，且与 `thinking` 无关：**没有传 `thinking` 同样会被拒，移除它不能绕过**。
 
-规则覆盖 Messages、Chat Completions、Responses 的出站清洗。`auto` / `none` 保持；不支持的 disabled/enabled thinking 转为 adaptive，保留 display。结构化输出转换保留 `output_config.effort`，已有 `output_config.format` 优先，否则从 `response_format` / `text.format` 合并，cli-hop 与普通出站路径均补齐对象 schema 的 `additionalProperties:false`（不覆盖显式值）。
+允许模型自行选择时显式传 `tool_choice={type:auto}` 或 `{type:none}`；必须强制指定工具时改用支持该能力的模型，例如 `claude-sonnet-5`、`claude-opus-5`、`claude-opus-4-8`、`claude-haiku-5-5`。客户端工具的 `strict` 按调用方所传原样透传，不再自动注入。
+
+强制工具调用另有两条与模型无关的限制，同样返回 `400 tool_choice_incompatible`：与 `thinking.type` 为 `enabled` 或 `adaptive` 同时出现；在 Haiku 5.5 上 effort 高于 `high`，或带 `thinking.budget_tokens`。
+
+出站清洗覆盖 Messages、Chat Completions、Responses。`auto` / `none` 保持；不支持的 disabled/enabled thinking 转为 adaptive，保留 display。结构化输出转换保留 `output_config.effort`，已有 `output_config.format` 优先，否则从 `response_format` / `text.format` 合并，cli-hop 与普通出站路径均补齐对象 schema 的 `additionalProperties:false`（不覆盖显式值）。
 
 
 ## Chat Completions
@@ -443,7 +451,9 @@ Claude Code Usage Policy `API Error`（含内核报成 400 的）不换号、不
 4. 内核不可达或 CLI 恢复已耗尽：Node watchdog 才重启容器，1 小时内最多 3 次，每次先等待 1 / 5 / 15 分钟。
 5. 容器恢复仍失败：停止自动重启，排除该 VM（粘性与诊断 pin 都不能绕过），经配置的通知渠道告警。观察到内核恢复健康后解除故障；运行中的 cc-node/crag 保留原有不重启例外。
 
-VM / 节点下线通知由「设置 → 通知」的 `notify.events.vm_down` 控制，默认开启，并遵循通知总开关及各通道开关。通知监控按 `notify.interval_sec`（默认 60 秒）读取调度器使用的节点 SSH 连通状态、watchdog 终止故障及 VM 运行状态；节点失联、内核恢复预算耗尽，或运行中的 VM 变为 stopped/dead/error 时，经已配置的 Telegram、企业微信群机器人及邮件通道发送 VM ID、节点 ID 和原因。它不额外发起模型推理探测。
+VM / 节点下线通知由「设置 → 通知」的 `notify.events.vm_down` 控制，默认开启，并遵循通知总开关及各通道开关。通知监控按 `notify.interval_sec`（默认 60 秒）读取调度器使用的节点 SSH 连通状态、watchdog 终止故障及 VM 运行状态；节点失联、内核恢复预算耗尽，或运行中的 VM 变为 stopped/dead/error 时，经已配置的 Telegram、企业微信群机器人、飞书群自定义机器人及邮件通道发送 VM ID、节点 ID 和原因。它不额外发起模型推理探测。
+
+管理员可在「设置 → 通知 → 飞书 / Lark 群自定义机器人」填写完整 HTTPS Webhook，支持飞书 `open.feishu.cn` 和 Lark `open.larksuite.com` 的群机器人 v2 地址。保存和发送时均校验地址。机器人启用签名校验时填写签名密钥。「发送测试」可使用尚未保存的配置发送简版卡片。启用并保存后，群机器人会接收已开启的通知事件，卡片包含颜色、事件详情、用量及健康表格。面板仅显示凭据是否已保存。
 
 同一次下线只通知一次，不同 VM 不共享告警冷却；发送失败在后续检查中仅重试失败通道，VM 恢复、删除、进入人工停调或维护状态后取消待发告警。投递状态保存在内存中；控制面重启后重新建立基线，已失联的节点和内核终止故障会重新告警，原已停止的 VM 不补发。此事件独立于按凭证可用性判断的 `account_down`；额度冷却、人工停调、维护及未知运行状态不直接触发下线通知。
 

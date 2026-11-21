@@ -161,7 +161,11 @@ export function ModelRow({
               <OpenaiCardMetrics facts={facts} />
             ) : (
               <div className='grid gap-2 text-xs sm:grid-cols-3'>
-                <Metric label='上下文' value={win.text} strong />
+                <Metric
+                  label='上下文'
+                  value={win.native1m ? `${win.text} 能力` : win.text}
+                  strong
+                />
                 <Metric
                   label='输出上限'
                   value={`${formatK(params.max_tokens_cap ?? 64000)}`}
@@ -263,7 +267,7 @@ export function ModelRow({
               </EditorRow>
               {claude ? (
                 <>
-                  <EditorRow label='上下文窗口'>
+                  <EditorRow label='配置的上下文窗口'>
                     <NumberInput
                       value={Number(caps.context_window || 0)}
                       onChange={(value) =>
@@ -489,7 +493,10 @@ export function ModelRow({
                 <OpenaiCapabilityFacts facts={facts} live={live} />
               ) : (
                 <>
-                  <Fact label='上下文' value={win.text} />
+                  <Fact
+                    label='上下文'
+                    value={win.native1m ? `${win.text} 能力` : win.text}
+                  />
                   <Fact label='Thinking' value={thinkingPolicyLabel(model)} />
                   <Fact
                     label='目录状态'

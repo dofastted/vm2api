@@ -20,6 +20,44 @@ import {
 import { GeminiProxyPanel } from './gemini-proxy-panel'
 import { GeminiTestPanel } from './gemini-test-panel'
 
+const ACCOUNT_FILE_LIMIT = 128 * 1024
+
+async function readOAuthAccount(file: File | null) {
+  if (!file || file.size > ACCOUNT_FILE_LIMIT) {
+    throw new Error('请选择不超过 128 KiB 的单个账号 JSON 文件。')
+  }
+  try {
+    const data: unknown = JSON.parse(await file.text())
+    if (!data || typeof data !== 'object' || !('token' in data))
+      throw new Error()
+    const token = data.token
+    if (
+      !token ||
+      typeof token !== 'object' ||
+      !('access_token' in token) ||
+      !('expiry_timestamp' in token)
+    ) {
+      throw new Error()
+    }
+    if (
+      typeof token.access_token !== 'string' ||
+      !token.access_token ||
+      typeof token.expiry_timestamp !== 'number' ||
+      !Number.isSafeInteger(token.expiry_timestamp)
+    ) {
+      throw new Error()
+    }
+    return {
+      access_token: token.access_token,
+      expiry_timestamp: token.expiry_timestamp,
+    }
+  } catch {
+    throw new Error(
+      '文件格式无效，请选择 Antigravity Tools 导出的单个账号 JSON。'
+    )
+  }
+}
+
 type QuotaReading = {
   remaining_fraction: number | null
   reset_at: string | null
@@ -35,6 +73,7 @@ export type GeminiEnvironment = {
   billing_ready: boolean
   proxy_ready?: boolean
   auth_method: 'oauth' | 'api_key'
+  oauth_imported?: boolean
   kernel_version: string | null
   created_at: string | null
   updated_at: string | null
@@ -302,7 +341,7 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
       </div>
       <div>
         <dt className='text-muted-foreground'>公共 API 推理</dt>
-        <dd>{environment.runtime_ready ? '就绪' : '未启用'}</dd>
+        <dd>{environment.models_discovered ? '可调度' : '先拉取模型'}</dd>
       </div>
       <div>
         <dt className='text-muted-foreground'>付费调用</dt>
@@ -477,9 +516,11 @@ export function GeminiEnvironments({
   const busy = useGeminiBusy()
   const [name, setName] = useState('')
   const [proxyId, setProxyId] = useState('')
-  const [authMethod, setAuthMethod] =
-    useState<GeminiEnvironment['auth_method']>('oauth')
+  const [authMethod, setAuthMethod] = useState<
+    GeminiEnvironment['auth_method'] | 'oauth_file'
+  >('oauth')
   const [apiKey, setApiKey] = useState('')
+  const [accountFile, setAccountFile] = useState<File | null>(null)
   const [challenge, setChallenge] = useState<
     (Authorization & { id: string }) | null
   >(null)
@@ -496,12 +537,17 @@ export function GeminiEnvironments({
     }) => {
       const resource = `${ROOT}/environments${action.id ? `/${encodeURIComponent(action.id)}` : ''}`
       if (action.type === 'create') {
+        const imported =
+          authMethod === 'oauth_file'
+            ? await readOAuthAccount(accountFile)
+            : null
         const environment = await api<GeminiEnvironment>(resource, {
           method: 'POST',
           body: JSON.stringify({
             name,
             proxy_id: proxyId,
-            auth_method: authMethod,
+            auth_method: imported ? 'oauth' : authMethod,
+            ...(imported ? { oauth_account: imported } : {}),
             ...(authMethod === 'api_key' ? { api_key: apiKey.trim() } : {}),
           }),
         })
@@ -516,6 +562,7 @@ export function GeminiEnvironments({
         )
         setName('')
         setApiKey('')
+        setAccountFile(null)
         setCreatedId(environment.id)
         return
       }
@@ -756,6 +803,7 @@ export function GeminiEnvironments({
                   onChange={() => {
                     setAuthMethod('oauth')
                     setApiKey('')
+                    setAccountFile(null)
                   }}
                 />
                 Google 授权
@@ -765,9 +813,24 @@ export function GeminiEnvironments({
                   type='radio'
                   name='gemini-auth-method'
                   checked={authMethod === 'api_key'}
-                  onChange={() => setAuthMethod('api_key')}
+                  onChange={() => {
+                    setAuthMethod('api_key')
+                    setAccountFile(null)
+                  }}
                 />
                 Gemini API Key
+              </label>
+              <label className='flex items-center gap-2'>
+                <input
+                  type='radio'
+                  name='gemini-auth-method'
+                  checked={authMethod === 'oauth_file'}
+                  onChange={() => {
+                    setAuthMethod('oauth_file')
+                    setApiKey('')
+                  }}
+                />
+                导入 Antigravity 账号文件
               </label>
             </div>
           </fieldset>
@@ -782,6 +845,30 @@ export function GeminiEnvironments({
               onChange={(event) => setName(event.target.value)}
             />
           </div>
+          {authMethod === 'oauth_file' ? (
+            <div className='space-y-2'>
+              <Label htmlFor='gemini-account-file'>账号 JSON 文件</Label>
+              <Input
+                id='gemini-account-file'
+                key={createdId}
+                type='file'
+                accept='.json,application/json'
+                required
+                disabled={operation.isPending}
+                aria-describedby='gemini-account-file-help'
+                onChange={(event) =>
+                  setAccountFile(event.target.files?.item(0) ?? null)
+                }
+              />
+              <p
+                id='gemini-account-file-help'
+                className='text-sm text-muted-foreground'
+              >
+                一次导入一个账号。凭据通过所选代理验证，过期后请重新进行 Google
+                授权。
+              </p>
+            </div>
+          ) : null}
           {authMethod === 'api_key' ? (
             <div className='space-y-2'>
               <Label htmlFor='gemini-api-key'>Gemini API Key</Label>
@@ -795,11 +882,11 @@ export function GeminiEnvironments({
                 onChange={(event) => setApiKey(event.target.value)}
               />
             </div>
-          ) : (
+          ) : authMethod === 'oauth' ? (
             <p className='text-sm text-muted-foreground'>
               创建后打开 Google 授权页，再粘贴授权码或回调链接。
             </p>
-          )}
+          ) : null}
           <div className='space-y-2'>
             <Label htmlFor='gemini-proxy'>SOCKS5 代理</Label>
             <select
@@ -825,10 +912,13 @@ export function GeminiEnvironments({
               !canInstall ||
               !name.trim() ||
               (authMethod === 'api_key' && !apiKey.trim()) ||
+              (authMethod === 'oauth_file' && !accountFile) ||
               !exits.some((proxy) => proxy.id === proxyId)
             }
           >
-            创建 Gemini 环境
+            {authMethod === 'oauth_file'
+              ? '验证并导入账号'
+              : '创建 Gemini 环境'}
           </Button>
         </form>
       ) : !environment ? (

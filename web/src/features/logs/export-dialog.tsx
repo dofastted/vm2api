@@ -35,7 +35,7 @@ export type ExportOptions = {
 }
 
 const WINDOWS: { value: ExportWindow; label: string }[] = [
-  { value: '', label: '全部时间' },
+  { value: '', label: '不覆盖起始时间' },
   { value: '1h', label: '近 1 小时' },
   { value: '6h', label: '近 6 小时' },
   { value: '24h', label: '近 24 小时' },
@@ -76,6 +76,7 @@ function ScopeOption({
  * 后端 `GET /request-logs/export` 上限 5000 条，超出按最新截断（响应头回报）。
  */
 export function ExportDialog({
+  currentErrorClass,
   open,
   onOpenChange,
   currentSummary,
@@ -85,6 +86,8 @@ export function ExportDialog({
   onOpenChange: (open: boolean) => void
   /** 「跟随当前筛选」的说明文案，由页面根据当前筛选态拼出。 */
   currentSummary: string
+  /** 当前筛选已选定的错误类，由页面传入；没有选定时为 undefined。 */
+  currentErrorClass?: string
   onExport: (opts: ExportOptions) => Promise<void>
 }) {
   const [format, setFormat] = useState<'jsonl' | 'csv'>('jsonl')
@@ -131,8 +134,8 @@ export function ExportDialog({
               />
               <ScopeOption
                 value='all'
-                title='全部日志'
-                desc='忽略页面筛选与屏蔽，导出全量'
+                title='不按页面筛选'
+                desc='包含已屏蔽的错误类，仍受时间和条数限制'
               />
               <ScopeOption value='errors' title='仅错误'>
                 {scope === 'errors' ? (
@@ -162,8 +165,15 @@ export function ExportDialog({
           </div>
           <div className='grid grid-cols-2 gap-3'>
             <div className='space-y-2'>
-              <div className='text-xs font-medium text-muted-foreground'>
-                时间窗
+              <div className='space-y-1'>
+                <div className='text-xs font-medium text-muted-foreground'>
+                  时间窗
+                </div>
+                <p className='text-[11px] leading-snug text-muted-foreground'>
+                  {scope === 'current'
+                    ? '预设只替换起始时间，不改截止'
+                    : '预设只设置起始时间，不设置截止'}
+                </p>
               </div>
               <Select
                 value={window || 'all'}
@@ -177,7 +187,9 @@ export function ExportDialog({
                 <SelectContent>
                   {WINDOWS.map((w) => (
                     <SelectItem key={w.value || 'all'} value={w.value || 'all'}>
-                      {w.label}
+                      {scope === 'current' && !w.value
+                        ? '沿用当前筛选时间'
+                        : w.label}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -205,13 +217,23 @@ export function ExportDialog({
             </div>
           </div>
           {scope !== 'all' ? (
-            <Label className='flex cursor-pointer items-center justify-between gap-3 font-normal'>
-              <span className='text-sm'>包含已屏蔽的错误类</span>
-              <Switch
-                checked={includeMuted}
-                onCheckedChange={setIncludeMuted}
-              />
-            </Label>
+            (
+              scope === 'current'
+                ? !!currentErrorClass
+                : scope === 'errors' && !!errorClass
+            ) ? (
+              <p className='text-sm text-muted-foreground'>
+                按所选错误类导出，不受屏蔽设置影响
+              </p>
+            ) : (
+              <Label className='flex cursor-pointer items-center justify-between gap-3 font-normal'>
+                <span className='text-sm'>包含已屏蔽的错误类</span>
+                <Switch
+                  checked={includeMuted}
+                  onCheckedChange={setIncludeMuted}
+                />
+              </Label>
+            )
           ) : null}
           <div className='space-y-2'>
             <div className='text-xs font-medium text-muted-foreground'>

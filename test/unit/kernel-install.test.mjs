@@ -30,6 +30,7 @@ import { cragV2PackageRoot, materializeResolvedKernel } from '../../src/lib/vm/w
 import { writeKernelConfig } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 import {
   activateFixture,
+  fixtureAuthority,
   issueFixtureCode,
   issueHostEntitlement,
   issueSlotPermit,
@@ -705,6 +706,103 @@ for (const [label, reissue, expected] of [
     assert.equal(result.ok, true, JSON.stringify(result))
     // Compare the opt-in itself, not whether it arrived as false or undefined.
     assert.equal(seen === true, expected)
+  })
+}
+
+for (const partialInstall of [false, true]) {
+  test(`explicit pinned reissue replaces a mismatched signed grant before stopping (${partialInstall ? 'partial tree' : 'no installed tree'})`, async (t) => {
+    const { root, vm, home } = fixture(t)
+    const old = activateFixture(root, vm)
+    const registration = path.join(cragLicenseDirectory(root, vm), 'registration.code')
+    const oldGrant = fs.readFileSync(registration)
+    const identity = fs.readFileSync(path.join(cragLicenseDirectory(root, vm), 'device.json'))
+    if (partialInstall) {
+      fs.mkdirSync(path.join(home, '.kin', 'crag-v2', 'claude-code-2.1.321'), { recursive: true })
+      assert.equal(getCragLicense(root, vm).license.code, 'license_unconfigured')
+    }
+    fixtureAuthority(root).payloadKey = randomBytes(32)
+    seedEncryptedPackage(root)
+    assert.equal(getCragLicense(root, vm, { preferInstalled: false }).license.code, 'license_payload_key_mismatch')
+    const events = []
+    const life = lifecycle(root, {
+      stopSlot() {
+        events.push('stop')
+        assert.equal(getCragLicense(root, vm, { preferInstalled: false }).license.valid, true)
+        return { ok: true }
+      },
+    })
+    const result = await installKernelTargets({
+      projectRoot: root,
+      targets: [{ ...target()[0], expected_tag: 'v1.4.104', reissue: true }],
+      cragSubscription: {
+        authorizeInstall(desired, options) {
+          assert.equal(desired.id, vm.id)
+          assert.equal(options.allowLegacyReissue, true)
+          events.push('authorize')
+          // Simulate the issuer returning a signature for this exact candidate;
+          // the installer must verify it before stopping the old runtime.
+          fs.writeFileSync(registration, issueFixtureCode(root, old.machine_code).code)
+        },
+      },
+      ops: {
+        ...life.ops,
+        describeKernelCatalog: () => [{ id: 'crag', ready: true, release_tag: 'v1.4.104' }],
+      },
+    })
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.deepEqual(events, ['authorize', 'stop'])
+    assert.notDeepEqual(fs.readFileSync(registration), oldGrant)
+    assert.deepEqual(fs.readFileSync(path.join(cragLicenseDirectory(root, vm), 'device.json')), identity)
+    assert.equal(getCragLicense(root, getVm(root, vm.id)).license.valid, true)
+    assert.equal(getVm(root, vm.id).dataplane, 'crag')
+  })
+}
+
+for (const scenario of ['no-reissue', 'no-pin', 'no-authorizer', 'issuer-unavailable', 'permit-not-replaced']) {
+  test(`payload migration rejects ${scenario} before stopping and preserves the old grant`, async (t) => {
+    const { root, vm } = fixture(t)
+    activateFixture(root, vm)
+    fixtureAuthority(root).payloadKey = randomBytes(32)
+    seedEncryptedPackage(root)
+    const registration = path.join(cragLicenseDirectory(root, vm), 'registration.code')
+    const before = fs.readFileSync(registration)
+    let authorizations = 0
+    const result = await installKernelTargets({
+      projectRoot: root,
+      targets: [
+        {
+          ...target()[0],
+          ...(scenario !== 'no-pin' && { expected_tag: 'v1.4.104' }),
+          ...(scenario !== 'no-reissue' && { reissue: true }),
+        },
+      ],
+      ...(scenario !== 'no-authorizer' && {
+        cragSubscription: {
+          authorizeInstall() {
+            authorizations++
+            if (scenario === 'issuer-unavailable') {
+              throw Object.assign(new Error('issuer unavailable'), { code: 'crag_subscription_authority_unavailable' })
+            }
+          },
+        },
+      }),
+      ops: {
+        describeKernelCatalog: () => [{ id: 'crag', ready: true, release_tag: 'v1.4.104' }],
+        stopSlot: () => assert.fail('unconfirmed migration must not stop the slot'),
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.items[0].stopped, false)
+    assert.equal(authorizations, ['issuer-unavailable', 'permit-not-replaced'].includes(scenario) ? 1 : 0)
+    assert.equal(
+      result.items[0].code,
+      scenario === 'issuer-unavailable'
+        ? 'crag_subscription_authority_unavailable'
+        : 'crag_subscription_migration_required',
+    )
+    assert.deepEqual(fs.readFileSync(registration), before)
+    assert.equal(getVm(root, vm.id).status, 'running')
+    assert.equal(getVm(root, vm.id).dataplane, 'wrap')
   })
 }
 

@@ -129,7 +129,7 @@ describe('VM account column kernel label', () => {
         'CRAGAnti',
         '宿主机',
         '已授权',
-        '载荷未启用推理',
+        '尚未拉取模型，不能调度',
         'px-011f7746',
       ]) {
         expect(html).toContain(label)
@@ -231,6 +231,15 @@ describe('VM list summary and toggles', () => {
     const html = render({ health_24h: buckets, seats_used: 1, seats_max: 4 })
     expect(html).toContain('aria-label="全局汇总"')
     expect(html).toContain('>在池</div>')
+    expect(html).toContain('>今日请求数</button>')
+    expect(html).toContain('>近 24h 请求</div>')
+    expect(html).not.toContain('>24h 请求')
+    expect(html).toContain('北京时间今日 0')
+    expect(html).toContain('>7 天窗口花费</button>')
+    expect(html).toContain('>7 天窗口花费</div>')
+    expect(html.match(/7 天窗口花费/g)).toHaveLength(2)
+    expect(html).not.toContain('7D 花费')
+    expect(html).not.toContain('>今日</div>')
     expect(html).toContain('>90.0%</b>')
     expect(html).toContain('失败 1')
     expect(html).toMatch(/aria-pressed="false"[^>]*>.*按状态分组/)

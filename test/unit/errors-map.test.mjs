@@ -412,6 +412,73 @@ test('tool continuation conflicts and expiry retain their native client status',
   }
 })
 
+test('a terminal upstream verdict survives the relay so clients stop retrying (#1215)', () => {
+  // respond.mjs turns `details.retryable === false` into `x-should-retry: false`.
+  // The relay used to rebuild `details` from scratch, so the kernel's own verdict
+  // never reached the client and SDKs retried an expired continuation for hours.
+  const flagged = mapUpstreamError(410, {
+    error: {
+      type: 'invalid_request_error',
+      code: 'tool_turn_expired',
+      message: 'tool turn expired',
+      details: { retryable: false },
+    },
+  })
+  assert.equal(flagged.status, 410)
+  assert.equal(flagged.body.error.details.retryable, false)
+  assert.equal(flagged.body.error.details.upstream_status, 410)
+
+  // 410 Gone is terminal on its own: a continuation the kernel reports as gone
+  // never comes back, so the hint holds even when the body omits the flag.
+  for (const body of [
+    { error: { type: 'invalid_request_error', message: 'MCP continuation is no longer available' } },
+    { error: { message: 'MCP continuation is no longer available' } },
+  ]) {
+    const bare = mapUpstreamError(410, body)
+    assert.equal(bare.status, 410)
+    assert.equal(bare.body.error.details.retryable, false)
+  }
+
+  // A 409 conflict is not declared terminal by the panel, but an explicit
+  // upstream flag on one is still carried through.
+  const conflict = mapUpstreamError(409, { error: { type: 'invalid_request_error', message: 'tool_result replayed' } })
+  assert.equal(conflict.status, 409)
+  assert.equal(conflict.body.error.details.retryable, undefined)
+  const flaggedConflict = mapUpstreamError(409, {
+    error: { type: 'invalid_request_error', message: 'tool_result replayed', details: { retryable: false } },
+  })
+  assert.equal(flaggedConflict.body.error.details.retryable, false)
+
+  // The one 409 that is terminal on its own: CRAG says this submission's partial
+  // output cannot be replayed. The type alone carries the verdict, so the hint
+  // holds without a message or an explicit flag (#1518).
+  for (const body of [
+    {
+      error: {
+        type: 'partial_provider_output_nonretryable',
+        message: 'Provider output for this continuation was interrupted and cannot be replayed.',
+      },
+    },
+    { error: { type: 'partial_provider_output_nonretryable' } },
+  ]) {
+    const nonretryable = mapUpstreamError(409, body)
+    assert.equal(nonretryable.status, 409)
+    assert.equal(nonretryable.body.error.details.retryable, false)
+  }
+
+  // Capacity errors keep the panel's own Retry-After policy: a client must still
+  // retry a 429/529, so no terminal hint is attached there.
+  const limited = mapUpstreamError(429, {
+    error: { type: 'rate_limit_error', message: 'slow down', details: { retryable: false } },
+  })
+  assert.equal(limited.status, 429)
+  assert.equal(limited.body.error.details.retryable, undefined)
+  const overloaded = mapUpstreamError(529, {
+    error: { type: 'overloaded_error', message: 'busy', details: { retryable: false } },
+  })
+  assert.equal(overloaded.body.error.details.retryable, undefined)
+})
+
 test('retryAfterSeconds reads delta seconds and HTTP dates', () => {
   const now = Date.parse('2026-10-06T00:00:00Z')
   assert.equal(retryAfterSeconds('2.2', now), 3)

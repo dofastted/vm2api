@@ -221,7 +221,11 @@ export function RiskStatus({
           )}
         </Panel>
         <Panel title='放行原因'>
-          <PassReasons stats={stats.data} />
+          <PassReasons
+            stats={stats.data}
+            loading={stats.isLoading}
+            error={stats.isError}
+          />
         </Panel>
       </div>
 
@@ -324,7 +328,15 @@ function AuditFeed({
   )
 }
 
-function PassReasons({ stats }: { stats: GateStats | undefined }) {
+function PassReasons({
+  stats,
+  loading,
+  error,
+}: {
+  stats: GateStats | undefined
+  loading: boolean
+  error: boolean
+}) {
   const counts = new Map<string, number>()
   for (const row of stats?.passes ?? [])
     counts.set(row.by, (counts.get(row.by) ?? 0) + row.count)
@@ -333,7 +345,13 @@ function PassReasons({ stats }: { stats: GateStats | undefined }) {
   )
   if (!reasons.length)
     return (
-      <p className='px-4 py-6 text-sm text-muted-foreground'>暂无放行原因。</p>
+      <p className='px-4 py-6 text-sm text-muted-foreground'>
+        {loading
+          ? '读取中'
+          : error && !stats
+            ? '放行原因读取失败'
+            : '暂无放行原因。'}
+      </p>
     )
   return (
     <ul className='divide-y'>

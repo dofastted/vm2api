@@ -62,7 +62,7 @@ export function StatusFilters({
           </SelectTrigger>
           <SelectContent>
             <SelectItem value={ALL}>全部状态码</SelectItem>
-            <SelectItem value={NOT_200}>非 200（全部非成功请求）</SelectItem>
+            <SelectItem value={NOT_200}>仅非 2xx（含无状态码）</SelectItem>
             {COMMON_STATUS_CODES.map(([code, label]) => (
               <SelectItem key={code} value={String(code)}>
                 {label}

@@ -57,7 +57,10 @@ export async function prepareSlotOAuth({
   }
   const boot = await startReady(vm, projectRoot, { routing, allowMissingCredential: true, timeoutMs })
   if (!boot?.ok || boot.rust_ok === false || !boot.rust?.ok || boot.rust.skipped) {
-    throw fail(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'Target VM native CLI is not ready')
+    // One sanitized code feeds both err.code and the message, so they cannot disagree.
+    // The default inside keeps a missing code from being stringified to "undefined" by safeCode.
+    const code = safeCode(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'oauth_runtime_not_ready')
+    throw fail(code, `Target VM native CLI is not ready (${code})`)
   }
   const patch = { ...(boot.runtime ? { runtime: boot.runtime } : {}), status: 'running' }
   const stored = patchVmRecord(projectRoot, vm.id, patch)
@@ -139,6 +142,9 @@ export async function runGuestOAuthAuthService(
       // The worker config (`worker.json`) carries vm_id/proxy_url/egress_mode and
       // is what `kin-worker oauth session-code` needs; the kernel config does not.
       KIN_WORKER_CONFIG: '/run/kin/worker.json',
+      // 'local' retries the browser stage on the local egress when the bound
+      // proxy is invalid; anything else reports proxy_invalid to the panel.
+      KIN_OAUTH_PROXY_FALLBACK: String(process.env.KIN_OAUTH_PROXY_FALLBACK || ''),
       KERNEL_CONFIG: '/run/kin/kernel.json',
       HTTP_PROXY: '',
       HTTPS_PROXY: '',

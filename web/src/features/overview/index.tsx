@@ -197,6 +197,7 @@ export function OverviewPage() {
                   </small>
                 </>
               }
+              hint='分母：有凭证的账号'
               ringPct={
                 withToken ? (available / Math.max(withToken, 1)) * 100 : 0
               }
@@ -204,7 +205,7 @@ export function OverviewPage() {
             />
             <KpiCard
               icon={Server}
-              label='在线'
+              label='判定为运行的虚拟机'
               value={
                 <>
                   {running}
@@ -213,12 +214,14 @@ export function OverviewPage() {
                   </small>
                 </>
               }
+              hint='分母：全部虚拟机'
               ringPct={vms.length ? (running / vms.length) * 100 : 0}
               tone='good'
             />
             <KpiCard
               icon={Gauge}
-              label='5h 峰值'
+              label='5h 额度使用率'
+              hint='取账号最高值'
               value={
                 <>
                   {peak5.toFixed(0)}
@@ -231,9 +234,9 @@ export function OverviewPage() {
             />
             <KpiCard
               icon={Activity}
-              label={`请求 · 缓存 ${cachePct == null ? '—' : `${cachePct.toFixed(0)}%`}`}
+              label={`请求 · 缓存命中率 ${cachePct == null ? '—' : `${cachePct.toFixed(0)}%`}`}
               value={fmtNum(reqs)}
-              hint={`Tokens ${fmtNum(tokensIn)}/${fmtNum(tokensOut)}`}
+              hint={`输入 ${fmtNum(tokensIn)} / 输出 ${fmtNum(tokensOut)} Token`}
               ringPct={cachePct}
               tone='good'
             />

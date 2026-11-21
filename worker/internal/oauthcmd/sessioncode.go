@@ -38,6 +38,9 @@ type sessionCodeInput struct {
 	Scope         string `json:"scope"`
 	State         string `json:"state"`
 	CodeChallenge string `json:"code_challenge"`
+	// Optional exit override. Present-but-empty means the local egress (direct
+	// dial), which is how the caller falls back when the bound proxy is invalid.
+	ProxyURL *string `json:"proxy_url"`
 }
 
 type claudeOrganization struct {
@@ -60,7 +63,7 @@ func runSessionCode(cfg config.Config, stdin io.Reader, stdout io.Writer) int {
 	if err != nil {
 		return writeAndReturn(stdout, errorEnvelope(0, "invalid_arguments", "invalid session-code input"), 2)
 	}
-	client, err := sessionCodeClient(cfg)
+	client, err := sessionCodeClient(cfg, input.ProxyURL)
 	if err != nil {
 		code := classifyError(err)
 		return writeAndReturn(stdout, errorEnvelope(0, code, errorMessage(code)), 0)
@@ -119,6 +122,10 @@ func decodeSessionCode(reader io.Reader) (sessionCodeInput, error) {
 	input.Scope = strings.TrimSpace(input.Scope)
 	input.State = strings.TrimSpace(input.State)
 	input.CodeChallenge = strings.TrimSpace(input.CodeChallenge)
+	if input.ProxyURL != nil {
+		trimmed := strings.TrimSpace(*input.ProxyURL)
+		input.ProxyURL = &trimmed
+	}
 	if input.SessionKey == "" || input.Scope == "" || input.State == "" || input.CodeChallenge == "" {
 		return input, errors.New("session-code input is incomplete")
 	}
@@ -128,7 +135,13 @@ func decodeSessionCode(reader io.Reader) (sessionCodeInput, error) {
 	return input, nil
 }
 
-func sessionCodeClient(cfg config.Config) (*http.Client, error) {
+func sessionCodeClient(cfg config.Config, override *string) (*http.Client, error) {
+	if override != nil {
+		if url := strings.TrimSpace(*override); url != "" {
+			return upstream.NewOAuthHTTPClient(url, false, sessionCodeTimeout)
+		}
+		return upstream.NewTransparentOAuthHTTPClient(sessionCodeTimeout)
+	}
 	if cfg.EgressMode == "transparent" {
 		return upstream.NewTransparentOAuthHTTPClient(sessionCodeTimeout)
 	}

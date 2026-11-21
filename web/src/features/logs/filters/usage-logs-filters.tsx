@@ -66,14 +66,14 @@ export function UsageLogsFilters({
           description='按日期和时间筛选'
           icon={Clock}
           defaultOpen
-          activeCount={draft.startTime != null && draft.endTime != null ? 1 : 0}
+          activeCount={draft.startTime != null || draft.endTime != null ? 1 : 0}
         >
           <TimeFilters filters={draft} onChange={setDraft} />
         </FilterSection>
         <FilterSection
           title='身份信息'
           description={
-            isAdmin ? '按用户、密钥、供应商和会话筛选' : '按密钥和会话筛选'
+            isAdmin ? '按用户、密钥、虚拟机和会话筛选' : '按密钥和会话筛选'
           }
           icon={User}
           defaultOpen
@@ -114,6 +114,9 @@ export function UsageLogsFilters({
         </FilterSection>
       </div>
       <div className='flex flex-wrap items-center gap-2 pt-2'>
+        <p className='w-full text-xs text-muted-foreground'>
+          单项修改需应用；清空全部立即生效
+        </p>
         <Button type='button' onClick={() => onApply(draft)}>
           应用筛选
         </Button>
