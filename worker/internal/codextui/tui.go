@@ -49,7 +49,9 @@ func startTUI(ctx context.Context, cfg *Config, dir string, extraArgs []string) 
 		"PATH=" + os.Getenv("PATH"),
 		"USER=kincli",
 	}
-	for _, k := range []string{"TMPDIR"} {
+	// TZ must come through so codex timestamps (and any tz-derived upstream
+	// metadata) match the slot's GeoIP-consistent zone (checklist dimension 2).
+	for _, k := range []string{"TMPDIR", "TZ", "LC_ALL", "LC_TIME"} {
 		if v := os.Getenv(k); v != "" {
 			env = append(env, k+"="+v)
 		}
