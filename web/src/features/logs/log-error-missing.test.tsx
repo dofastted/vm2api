@@ -15,8 +15,8 @@ vi.mock('@tanstack/react-query', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@tanstack/react-query')>()
   return {
     ...actual,
-    useQuery: (options: { queryKey?: unknown[] }) =>
-      options.queryKey?.[1] === 'request-logs-stats'
+    useQuery: (options: Parameters<typeof actual.useQuery>[0]) =>
+      options.queryKey[1] === 'request-logs-stats'
         ? state
         : actual.useQuery(options),
   }
