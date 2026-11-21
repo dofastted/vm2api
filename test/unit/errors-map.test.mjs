@@ -449,6 +449,23 @@ test('a terminal upstream verdict survives the relay so clients stop retrying (#
   })
   assert.equal(flaggedConflict.body.error.details.retryable, false)
 
+  // The one 409 that is terminal on its own: CRAG says this submission's partial
+  // output cannot be replayed. The type alone carries the verdict, so the hint
+  // holds without a message or an explicit flag (#1518).
+  for (const body of [
+    {
+      error: {
+        type: 'partial_provider_output_nonretryable',
+        message: 'Provider output for this continuation was interrupted and cannot be replayed.',
+      },
+    },
+    { error: { type: 'partial_provider_output_nonretryable' } },
+  ]) {
+    const nonretryable = mapUpstreamError(409, body)
+    assert.equal(nonretryable.status, 409)
+    assert.equal(nonretryable.body.error.details.retryable, false)
+  }
+
   // Capacity errors keep the panel's own Retry-After policy: a client must still
   // retry a 429/529, so no terminal hint is attached there.
   const limited = mapUpstreamError(429, {
