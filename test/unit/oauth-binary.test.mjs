@@ -18,7 +18,6 @@ import { sessionKeyToOAuth } from '../../src/lib/oauth/cookie-auth.mjs'
 import {
   CLIENT_ID,
   FULL_OAUTH_SCOPE,
-  INFERENCE_ONLY_SCOPE,
   REDIRECT_URI,
   SETUP_TOKEN_TTL_SECONDS,
 } from '../../src/lib/oauth/oauth-contract.mjs'
@@ -319,10 +318,8 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
     await t.test(`${scenario.flavor}: ${scenario.returnedState || 'no state suffix'}`, async () => {
       const generated = generateAuthUrl({ vmId: vm.id, proxyUrl, flavor: scenario.flavor })
       const url = new URL(generated.auth_url)
-      assert.equal(
-        url.searchParams.get('scope'),
-        scenario.flavor === 'setup_token' ? INFERENCE_ONLY_SCOPE : FULL_OAUTH_SCOPE,
-      )
+      // Both flavors ask for the login scope; only the lifetime differs.
+      assert.equal(url.searchParams.get('scope'), FULL_OAUTH_SCOPE)
       const session = peekAuthUrlSession(generated.session_id)
       const state = scenario.returnedState === 'session' ? url.searchParams.get('state') : scenario.returnedState
       expectedExchange = {
@@ -406,7 +403,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
     })
     child.stdin.end('{"operation":"capabilities"}\n')
   })
-  const narrowsSetup = capabilities.includes('setup-token-inference')
+  const longLived = capabilities.includes('setup-token-long-lived')
   for (const runtimeMode of ['oauth', 'setup-token']) {
     await t.test(`session cookie: ${runtimeMode}`, async () => {
       const requestStart = requests.length
@@ -418,8 +415,9 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       })
       assert.equal(credential.access_token, accessToken)
       assert.equal(credential.refresh_token, refreshToken)
-      const minted = narrowsSetup && runtimeMode === 'setup-token'
-      assert.equal(credential.scope, minted ? INFERENCE_ONLY_SCOPE : FULL_OAUTH_SCOPE)
+      const minted = longLived && runtimeMode === 'setup-token'
+      // Both paths ask for the login scope; only the mint carries a lifetime.
+      assert.equal(credential.scope, FULL_OAUTH_SCOPE)
       assert.equal(credential.type, runtimeMode)
       assert.equal(credential.mode, runtimeMode)
       assert.equal(credential.email, 'exchange@example.test')
@@ -471,7 +469,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       assert.equal(authorize.payload.response_type, 'code')
       assert.equal(authorize.payload.client_id, CLIENT_ID)
       assert.equal(authorize.payload.redirect_uri, REDIRECT_URI)
-      assert.equal(authorize.payload.scope, minted ? INFERENCE_ONLY_SCOPE : FULL_OAUTH_SCOPE)
+      assert.equal(authorize.payload.scope, FULL_OAUTH_SCOPE)
       assert.equal(authorize.payload.code_challenge_method, 'S256')
       assert.ok(authorize.payload.state)
       assert.equal(token.payload.state, authorize.payload.state)
