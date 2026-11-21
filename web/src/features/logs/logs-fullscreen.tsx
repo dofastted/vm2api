@@ -56,7 +56,8 @@ export function LogsFullscreen({
 }) {
   const [hideProvider, setHideProvider] = useState(false)
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
-  const { data } = useQuery(usageLogsOverviewQueryOptions(tz, 3000))
+  const overview = useQuery(usageLogsOverviewQueryOptions(tz, 3000))
+  const data = overview.data
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -89,11 +90,35 @@ export function LogsFullscreen({
             退出全屏
           </Button>
           <div className='hidden h-full items-stretch divide-x divide-border/50 md:flex'>
-            <Metric label='活跃 Session 数' value={data?.activeSessions ?? 0} />
-            <Metric label='今日请求' value={data?.todayRequests ?? 0} />
+            <Metric
+              label='活跃 Session 数'
+              value={
+                overview.isError && !data
+                  ? '概览加载失败'
+                  : data
+                    ? data.activeSessions
+                    : '—'
+              }
+            />
+            <Metric
+              label='今日请求'
+              value={
+                overview.isError && !data
+                  ? '概览加载失败'
+                  : data
+                    ? data.todayRequests
+                    : '—'
+              }
+            />
             <Metric
               label='今日消费 · 实际计费'
-              value={formatCurrency(data?.todayActualCost ?? 0, 2)}
+              value={
+                overview.isError && !data
+                  ? '概览加载失败'
+                  : data
+                    ? formatCurrency(data.todayActualCost ?? 0, 2)
+                    : '—'
+              }
             />
             <Metric
               label='平均响应时间'
