@@ -167,7 +167,7 @@ test('KVM preflight refreshes via the slot guest and rechecks the saved grant', 
   assert.equal(result.ok, true)
   assert.equal(result.refreshed, true)
   assert.ok(argvSeen.includes('/usr/local/bin/kin-guest-exec'))
-  assert.deepEqual(argvSeen.slice(-4), ['oauth', 'refresh', '--config', '/run/kin/worker.json'])
+  assert.deepEqual(argvSeen.slice(-5), ['oauth', 'refresh', '--config', '/run/kin/worker.json', '--attempt-guard'])
   assert.equal(readWorkerCredentialFile(homeDir).refresh_token, 'new-refresh')
   assert.doesNotMatch(JSON.stringify(result), /new-access|new-refresh/)
 })

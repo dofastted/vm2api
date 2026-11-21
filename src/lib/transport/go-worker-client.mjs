@@ -1822,6 +1822,7 @@ export async function ensureWorkerCredential(exec, { force = false, skewMs = REF
       refresh_class: result?.ok ? (body.refreshed ? 'rotated' : 'already_fresh') : undefined,
       credential: result?.ok ? credentialSummary({ ...(refreshedCredential || {}), ...body }, Date.now()) : undefined,
       error: result?.ok ? undefined : body.error,
+      attempt_guard: result?.attempt_guard,
     }
     if (!mapped.ok) mapped.refresh_class = classifyCredentialRefresh(mapped)
     return mapped

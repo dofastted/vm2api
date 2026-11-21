@@ -9,6 +9,7 @@ import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import {
   PROACTIVE_REFRESH_SKEW_MS,
+  classifyCredentialRefresh,
   hasCredentialPresence,
   hasRefreshPresence,
   needsRefresh,
@@ -83,7 +84,10 @@ export function shouldForceRefresh(vm) {
 
 /** Due 15 minutes ahead so the host refresh always beats the in-slot CLI's 5-minute refresh. */
 export function needsScheduledRefresh(vm, now = Date.now(), skewMs = PROACTIVE_REFRESH_SKEW_MS) {
-  if (vm?.refresh_error || vm?.claude?.refresh_error) return false
+  // Older versions persisted transport failures as credential errors. Retry
+  // those at the ordinary monitor cadence; actual grant rejection stays parked.
+  const errors = [vm?.refresh_error, vm?.claude?.refresh_error].filter(Boolean)
+  if (errors.some((code) => classifyCredentialRefresh({ error: { code } }) !== 'retryable')) return false
   return needsRefresh(vm?.expires_at || vm?.claude?.expires_at, now, skewMs)
 }
 

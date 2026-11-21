@@ -3,6 +3,7 @@ package oauthcmd
 import (
 	"bytes"
 	"encoding/json"
+	kinoauth "github.com/dofastted/kin-gateway/worker/internal/oauth"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -308,5 +309,19 @@ func decodeOutput(t *testing.T, output *bytes.Buffer, envelope *responseEnvelope
 	lines := bytes.Split(bytes.TrimSpace(output.Bytes()), []byte("\n"))
 	if err := json.Unmarshal(lines[len(lines)-1], envelope); err != nil {
 		t.Fatalf("decode output: %v; output=%s", err, output.String())
+	}
+}
+
+func TestAttemptGuardFlagAndUnknownOutcome(t *testing.T) {
+	op, configPath, force, ok := parseArgs([]string{"refresh", "--config", "/run/kin/worker.json", "--attempt-guard"})
+	if !ok || op != "refresh" || configPath != "/run/kin/worker.json" || force {
+		t.Fatalf("--attempt-guard must be accepted: %q %q %v %v", op, configPath, force, ok)
+	}
+	unknown := &kinoauth.RefreshError{Code: kinoauth.CodeOutcomeUnknown, Message: "lost"}
+	if got := classifyError(unknown); got != kinoauth.CodeOutcomeUnknown {
+		t.Fatalf("unknown outcome must reach the control plane as itself, got %q", got)
+	}
+	if got := classifyError(&kinoauth.RefreshError{Status: 400, Code: "invalid_grant"}); got != "refresh_failed" {
+		t.Fatalf("an upstream rejection keeps its existing code, got %q", got)
 	}
 }
