@@ -134,6 +134,9 @@ export function normalizeInferenceConfig(raw = {}) {
     strict: raw.strict === true,
     eager_start: optionalBool(raw.eager_start, true),
     health_ttl_ms: optionalTtlMs(raw.health_ttl_ms, 2000),
+    // Consumed by rustHealthTimeoutMs (gateway dial budget); without this entry
+    // the key is stripped on save and can never be configured from the panel.
+    health_timeout_ms: optionalTtlMs(raw.health_timeout_ms, 800),
     tcp_nodelay: optionalBool(raw.tcp_nodelay, true),
     session_slots: normalizeSessionSlots(raw.session_slots),
     prewarm_enabled: raw.prewarm_enabled === true,

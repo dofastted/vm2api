@@ -14,6 +14,7 @@ import {
   rustKernelBusy,
 } from './rust-kernel-client.mjs'
 import { maxRequestBytes, readRoutingConfigFile, streamIdleTimeoutMs } from '../core/config.mjs'
+import { vmNodeId } from '../cluster/placement.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { resolveWorkstationProfile } from '../identity/workstation-profile.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
@@ -410,11 +411,21 @@ function runDocker(args, { timeoutMs = 5000, env, input } = {}) {
   })
 }
 
+/**
+ * Cluster slots reach their container over one SSH relay hop, so a probe that
+ * fits the local docker-exec budget (400ms) times out on the wire long before
+ * the kernel is down. Keep the local budget for local slots and floor cluster
+ * probes at 3s. The same applies to process checks inside the container.
+ */
+export function clusterProbeMs(exec, baseMs) {
+  return vmNodeId(exec?.vm) ? Math.max(Number(baseMs) || 0, 3000) : baseMs
+}
+
 async function waitForHealth(exec, timeoutMs, allowMissingCredential = false) {
   const deadline = Date.now() + Math.max(200, Number(timeoutMs) || 8000)
   let last = { ok: false, reason: 'not_ready' }
   while (Date.now() < deadline) {
-    last = await rustKernelHealth(exec, { timeoutMs: 400 })
+    last = await rustKernelHealth(exec, { timeoutMs: clusterProbeMs(exec, 400) })
     if (runtimeReady(last, allowMissingCredential)) return { ok: true, reason: 'started_in_vm', health: last }
     await new Promise((resolve) => setTimeout(resolve, 80))
   }
@@ -436,7 +447,7 @@ async function kernelProcessAlive(exec, runDockerExec) {
           'exit 1',
         ].join('\n')
       : 'pgrep -f /home/kincli/.kin/kin-kernel.bin >/dev/null || pgrep -f /home/kincli/.kin/kin-kernel >/dev/null || pidof kin-kernel >/dev/null'
-  const result = await runDockerExec(execArgv(exec, ['sh', '-c', probe]), { timeoutMs: 1500 })
+  const result = await runDockerExec(execArgv(exec, ['sh', '-c', probe]), { timeoutMs: clusterProbeMs(exec, 1500) })
   return result?.ok === true
 }
 
@@ -447,7 +458,7 @@ async function waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, 
   let checkedProcess = false
   while (Date.now() < deadline) {
     if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
-    last = await rustKernelHealth(exec, { timeoutMs: 400 })
+    last = await rustKernelHealth(exec, { timeoutMs: clusterProbeMs(exec, 400) })
     if (runtimeReady(last, allowMissingCredential)) return { ok: true, reason: 'started_in_vm', health: last }
     // KVM guest boot is minutes under TCG; a missing process at 1.2s is not failure.
     if (!isKvmRuntime(exec?.vm) && !checkedProcess && Date.now() - started >= 1200 && container) {
