@@ -758,6 +758,10 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
           </div>
           <Skeleton className='h-64 rounded-xl' />
         </div>
+      ) : detail.isError && !view ? (
+        <div className='grid h-40 place-items-center rounded-xl border text-sm text-destructive'>
+          VM 统计加载失败
+        </div>
       ) : !view ? (
         <div className='grid h-40 place-items-center rounded-xl border text-sm text-muted-foreground'>
           暂无统计数据
