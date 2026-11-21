@@ -7,21 +7,23 @@
  * 「发布出去的二进制是否实现了这套策略」——事务性契约由 capabilities 声明，
  * 避免「改了行为但二进制还没发」时 CI 必然变红的结构性死锁。
  */
-import { FULL_OAUTH_SCOPE, INFERENCE_ONLY_SCOPE, SETUP_TOKEN_TTL_SECONDS } from './oauth-contract.mjs'
+import { FULL_OAUTH_SCOPE, SETUP_TOKEN_TTL_SECONDS } from './oauth-contract.mjs'
 
 /** 二进制在 `operation: "capabilities"` 里回报这些能力名。 */
 export const OAUTH_CAPABILITIES = Object.freeze([
   // 浏览器段交给 kin-worker oauth session-code（Chrome TLS 指纹）。
   'session-code-bridge',
-  // setup-token profile 收窄 scope 到 user:inference 并带一年期 expires_in。
-  'setup-token-inference',
+  // setup-token profile 与普通登录同 scope，只把有效期放成一年。
+  'setup-token-long-lived',
   // KIN_OAUTH_PROXY_FALLBACK=local：出口被拒时用本地出口重试浏览器段。
   'proxy-fallback-local',
 ])
 
 export const OAUTH_PROFILES = Object.freeze({
   oauth: Object.freeze({ scope: FULL_OAUTH_SCOPE, expiresIn: null }),
-  'setup-token': Object.freeze({ scope: INFERENCE_ONLY_SCOPE, expiresIn: SETUP_TOKEN_TTL_SECONDS }),
+  // 与普通登录同一套 5 项 scope，身份链（profile/roles/bootstrap）才能跑完；
+  // 区别只在有效期：一是 mint 一年，二是运行模式按 setup-token 落库。
+  'setup-token': Object.freeze({ scope: FULL_OAUTH_SCOPE, expiresIn: SETUP_TOKEN_TTL_SECONDS }),
 })
 
 /** 未知 profile 一律按普通登录处理，和 `normalizeProfile` 的口径一致。 */
@@ -30,8 +32,8 @@ export function profilePolicy(profile) {
 }
 
 /**
- * 调用方可以**收窄**普通登录的 scope，但永远不能把 setup token 放宽：
- * mint 的权限集合由 profile 独占。
+ * 调用方可以**收窄**普通登录的 scope；mint 的 scope 由 profile 独占，
+ * 调用方传什么都不改变它。
  */
 export function scopeForProfile(profile, requested) {
   const policy = profilePolicy(profile)
