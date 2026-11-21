@@ -283,7 +283,7 @@ export function vmCostLedger(
     { key: '7d', label: '7D', cost: cost.d7, tokens: tok.d7 },
     {
       key: 'total',
-      label: '总计',
+      label: vm.lifetime_usage ? '账号总计' : '保留日志合计',
       cost: vmTotalCost(vm, accounts),
       tokens: vmTotalTokens(vm, accounts),
     },

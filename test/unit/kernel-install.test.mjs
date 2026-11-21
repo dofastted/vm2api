@@ -674,6 +674,40 @@ test('a pinned CRAG install verifies runtime admission before authorizing, stopp
   assert.deepEqual(events, ['verify', 'admit', 'verify', 'bind', 'verify', 'stop', 'health', 'release'])
 })
 
+for (const [label, reissue, expected] of [
+  ['an admin-confirmed reissue reaches authorizeInstall', true, true],
+  ['a plain install does not ask for a legacy reissue', undefined, false],
+]) {
+  test(`${label} (#1263)`, async (t) => {
+    const { root, vm: _vm } = fixture(t)
+    let seen = 'never-called'
+    let authorized = false
+    const life = lifecycle(root)
+    const result = await installKernelTargets({
+      projectRoot: root,
+      targets: [{ ...target()[0], expected_tag: 'v1.4.104', ...(reissue === undefined ? {} : { reissue }) }],
+      routing: {},
+      cragSubscription: {
+        // The allowLegacyReissue branches themselves are covered in
+        // crag-subscription.test.mjs; this layer only has to pass the flag on.
+        authorizeInstall(desired, options) {
+          seen = options?.allowLegacyReissue
+          activateFixture(root, desired)
+          authorized = true
+        },
+      },
+      ops: {
+        ...life.ops,
+        describeKernelCatalog: () => [{ id: 'crag', ready: true, release_tag: 'v1.4.104' }],
+        checkCragLicense: () => (authorized ? { ok: true } : { ok: false, code: 'license_required' }),
+      },
+    })
+    assert.equal(result.ok, true, JSON.stringify(result))
+    // Compare the opt-in itself, not whether it arrived as false or undefined.
+    assert.equal(seen === true, expected)
+  })
+}
+
 for (const node_id of [undefined, 'remote-kvm']) {
   test(`a confirmed ${node_id ? 'remote' : 'local'} KVM reinstall verifies a signed host permit before stopping`, async (t) => {
     const machineId = randomBytes(16).toString('hex')

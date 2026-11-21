@@ -130,7 +130,7 @@ export function ModelDisplayWithRedirect({
             </div>
           </TooltipTrigger>
           <TooltipContent className='max-w-xs'>
-            上游供应商实际返回的模型与请求的模型不一致。计费仍然基于请求模型。
+            上游实际返回的模型与请求的模型不一致。计费仍然基于请求模型。
           </TooltipContent>
         </Tooltip>
       ) : null}

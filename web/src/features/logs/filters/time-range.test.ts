@@ -1,4 +1,7 @@
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
+import { TimeFilters } from './time-filters'
 import {
   dateWithClockToTimestamp,
   detectQuickPeriod,
@@ -30,5 +33,20 @@ describe('time range helpers', () => {
 
   it('rejects impossible calendar dates', () => {
     expect(dateWithClockToTimestamp('2026-02-30', '00:00:00')).toBeUndefined()
+  })
+})
+
+describe('log date preset wording', () => {
+  it('names presets as browser calendar days including today', () => {
+    const html = renderToStaticMarkup(
+      createElement(TimeFilters, {
+        filters: {},
+        onChange: () => undefined,
+      })
+    )
+    expect(html).toContain('按浏览器时区的自然日')
+    expect(html).toContain('近7天（含今天）')
+    expect(html).toContain('近30天（含今天）')
+    expect(html).toContain('>昨天<')
   })
 })

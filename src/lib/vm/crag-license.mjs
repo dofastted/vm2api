@@ -1071,7 +1071,16 @@ function universalCodeFromLocalSlots(projectRoot) {
 function sharedUniversalLicense(projectRoot, authority) {
   const stored = readUniversalCode(projectRoot)
   if (!stored) return null
-  return verifyCragUniversal(stored, authority())
+  try {
+    return verifyCragUniversal(stored, authority())
+  } catch (error) {
+    // A grant signed for another payload is not this installation's grant. Letting
+    // it propagate brands every slot that has no registration of its own with a
+    // failure that slot never had. Expiry and revocation are returned rather than
+    // thrown, so they still reach the caller with their real reason.
+    if (error?.code === 'license_payload_key_mismatch') return null
+    throw error
+  }
 }
 
 function withMachineCode(projectRoot, vm, license, initialize) {

@@ -443,6 +443,17 @@ export function VirtualizedLogsTable({
       <div className='py-8 text-center text-muted-foreground'>暂无数据</div>
     )
   }
+  if (!allLogs.length && hasNextPage) {
+    return (
+      <div
+        role='status'
+        className='flex items-center justify-center py-12 text-muted-foreground'
+      >
+        <Loader2 className='h-6 w-6 animate-spin' />
+        <span className='ml-2'>正在查找符合条件的日志…</span>
+      </div>
+    )
+  }
 
   return (
     <div className='space-y-4'>
@@ -454,7 +465,11 @@ export function VirtualizedLogsTable({
               <Loader2 className='h-3 w-3 animate-spin' />
               加载更多中...
             </span>
-          ) : !hasNextPage && allLogs.length > 0 ? (
+          ) : hasNextPage ? (
+            <span>
+              {lastPageEmpty ? '正在自动查找下一页…' : '向下滚动以继续查找'}
+            </span>
+          ) : allLogs.length > 0 ? (
             <span>已加载全部记录</span>
           ) : null}
         </div>
@@ -485,7 +500,7 @@ export function VirtualizedLogsTable({
                 <HeadCell className='min-w-[90px] flex-[0.8]'>IP</HeadCell>
               )}
               {isHidden('provider') ? null : (
-                <HeadCell className='min-w-[100px] flex-[1.5]'>供应商</HeadCell>
+                <HeadCell className='min-w-[100px] flex-[1.5]'>虚拟机</HeadCell>
               )}
               <HeadCell className='min-w-[100px] flex-[1.3]'>计费模型</HeadCell>
               {isHidden('reasoningEffort') ? null : (

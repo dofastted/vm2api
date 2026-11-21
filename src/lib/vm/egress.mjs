@@ -10,9 +10,10 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { getDb, isDbOpen } from '../db/database.mjs'
+import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { toHostPath } from './host-path.mjs'
-import { socksProxyUrl } from './socks-address.mjs'
+import { socksEndpoint, socksProxyUrl } from './socks-address.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 import { collectTakenSubnets, createSubnetAllocator, gatewayOf, parseCidr, subnetPoolConfig } from './subnet-pool.mjs'
 import {
@@ -756,9 +757,90 @@ export function configuredDnsUpstream() {
   }
 }
 
+/**
+ * The DNS record types a helper answers empty, read off the proxy it serves.
+ *
+ * SVCB (64) and HTTPS (65) carry the alternative-service and ECH hints a
+ * browser needs to pick HTTP/3 or encrypted SNI; emptying them pins traffic to
+ * ordinary HTTPS without touching A/AAAA. It is a per-outlet decision, so the
+ * value comes from the proxy row rather than the pool.
+ *
+ * Takes either shape the pool hands out — the public snapshot or the trimmed
+ * `getProxyByIdWithAuth()` object — because both reach `startProxyEgress`.
+ */
+export function proxyDnsEmptyTypes(proxy) {
+  return proxy?.dns_disable_svcb_https === true ? [64, 65] : []
+}
+
+/**
+ * The pool-level default, kept for the rows added after the switch was flipped
+ * and for callers with no proxy in hand. NOT the value a helper starts with:
+ * `startProxyEgress` derives that from its own proxy via
+ * `proxyDnsEmptyTypes()`, so a per-outlet override is not overwritten by the
+ * pool on the next restart.
+ */
 export function configuredDnsEmptyTypes() {
   if (!isDbOpen()) return []
   return new SettingsRepo(getDb()).get('proxy_pool_config')?.dns_disable_svcb_https === true ? [64, 65] : []
+}
+
+/**
+ * One shared helper serves several outlets, and kin-egress takes
+ * `dns_empty_types` per helper (`Config.DNSEmptyTypes` in
+ * worker/internal/egress/server.go), not per route — a `Route` is an address
+ * and a proxy_url, nothing more. So a shared node cannot honour the outlets
+ * separately, and the choice is which way to be wrong.
+ *
+ * Intersection: only block when every member wants it. A proxy showing the
+ * switch off is then never blocked behind someone else's choice, which is the
+ * invariant worth keeping — the other direction ("any member blocks") would
+ * quietly strip HTTP/3 from outlets an operator left alone, and no amount of UI
+ * can make that read correctly. The cost is that a single outlet's switch does
+ * not take effect while it shares a node with one that is off; the panel says
+ * so rather than leaving it to be discovered.
+ *
+ * Members are matched to proxies by `host:port`, not by the whole URL: that
+ * pair is the pool's own uniqueness key, while the URL a member carries went
+ * through a serialize/parse round trip that need not reproduce the stored
+ * credentials byte for byte.
+ */
+export function sharedDnsEmptyTypes(members = [], blockedEndpoints = new Set()) {
+  // The local side passes members (`proxyUrl`), the node side passes the route
+  // table it already built (`proxy_url`). Both describe the same membership.
+  const endpoints = members.map((m) => memberEndpoint(m?.proxyUrl ?? m?.proxy_url)).filter(Boolean)
+  if (!endpoints.length) return []
+  return endpoints.every((endpoint) => blockedEndpoints.has(endpoint)) ? [64, 65] : []
+}
+
+/** `host:port` of a member's upstream, normalized the way the pool stores it. */
+export function memberEndpoint(proxyUrl) {
+  const raw = String(proxyUrl || '').trim()
+  if (!raw) return ''
+  try {
+    const url = new URL(raw)
+    // URL keeps IPv6 literals bracketed in `hostname`; socksEndpoint re-adds
+    // the brackets itself, so hand it the bare address.
+    const host = url.hostname.replace(/^\[|\]$/g, '')
+    return socksEndpoint(host, url.port || 1080)
+  } catch {
+    return ''
+  }
+}
+
+/** The shared-helper value for this node's membership, read from the pool table. */
+export function configuredSharedDnsEmptyTypes(members = []) {
+  if (!isDbOpen()) return []
+  try {
+    const blocked = new Set()
+    for (const p of new ProxiesRepo(getDb()).loadAll()) {
+      if (p?.dns_disable_svcb_https !== true) continue
+      const endpoint = socksEndpoint(p.host, p.port)
+      if (endpoint) blocked.add(endpoint)
+    }
+    return sharedDnsEmptyTypes(members, blocked)
+  } catch {
+    return []
+  }
 }
 
 const EGRESS_POLL_MS = 50
@@ -1539,7 +1621,9 @@ export async function startProxyEgress(
     runDocker = docker,
     runIptables = iptables,
     dnsUpstream = configuredDnsUpstream(),
-    dnsEmptyTypes = configuredDnsEmptyTypes(),
+    // Per outlet, off this proxy's own row. An explicit value still wins so
+    // callers that already resolved it (bulk apply, tests) do not re-read.
+    dnsEmptyTypes = proxyDnsEmptyTypes(proxy),
     bin,
     ports,
     listenHost: listenHostOverride,
@@ -1641,7 +1725,8 @@ export async function startSharedEgress(
     runIptables = iptables,
     runIp = ipRoute,
     dnsUpstream = configuredDnsUpstream(),
-    dnsEmptyTypes = configuredDnsEmptyTypes(),
+    // Intersection over this node's membership — see sharedDnsEmptyTypes().
+    dnsEmptyTypes = configuredSharedDnsEmptyTypes(members),
     bin,
     ports,
     listenHost: listenHostOverride,

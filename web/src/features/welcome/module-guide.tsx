@@ -15,7 +15,7 @@ type GuideTo =
   | '/risk'
   | '/system'
   | '/keys'
-  | '/anthropic'
+  | '/api'
   | '/wrap'
   | '/database'
   | '/settings/$tab'
@@ -42,7 +42,7 @@ const GROUPS: { title: string; items: GuideItem[] }[] = [
         title: '统计',
         view: 'statistics',
         to: '/statistics',
-        summary: '请求、消费、耗时，以及用户、供应商和模型排行。',
+        summary: '请求、消费、耗时，以及用户、虚拟机和模型排行。',
       },
       {
         title: '日志',
@@ -120,12 +120,12 @@ const GROUPS: { title: string; items: GuideItem[] }[] = [
         detail: '不要把主控密钥写进环境变量。可按槽、模型和并发收口。',
       },
       {
-        title: 'Anthropic',
-        view: 'anthropic',
-        to: '/anthropic',
-        summary: '直接调用 Anthropic Messages，不经过虚拟机。',
+        title: 'API',
+        view: 'api',
+        to: '/api',
+        summary: '配置 Anthropic 与 OpenAI 的上游 API 渠道。',
         detail:
-          '默认为官方地址和 x-api-key。地址、认证和代理都能改，也可以按已配置的 API 地址调度。',
+          '保存地址、密钥和模型后，渠道选择 API 的客户端密钥从这里调用，不使用 OAuth 虚拟机。客户端密钥本身在密钥页。',
       },
     ],
   },
