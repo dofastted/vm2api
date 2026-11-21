@@ -20,7 +20,7 @@ describe('filtered log empty wording', () => {
     const filtered = renderToStaticMarkup(
       <VirtualizedLogsTable
         filters={{ status: 'error' } as never}
-        draft={{}}
+        autoRefreshEnabled={false}
         onOpenDetail={() => {}}
       />
     )
@@ -28,7 +28,7 @@ describe('filtered log empty wording', () => {
     const unfiltered = renderToStaticMarkup(
       <VirtualizedLogsTable
         filters={{}}
-        draft={{ status: 'error' } as never}
+        autoRefreshEnabled={false}
         onOpenDetail={() => {}}
       />
     )
@@ -37,6 +37,7 @@ describe('filtered log empty wording', () => {
     const mutedOnly = renderToStaticMarkup(
       <VirtualizedLogsTable
         filters={{ excludeErrorClass: 'auth' } as never}
+        autoRefreshEnabled={false}
         onOpenDetail={() => {}}
       />
     )
