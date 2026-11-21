@@ -995,7 +995,7 @@ export function PoolPane({
                     })
                   }
                 />
-                <p
+                <StepperSetting
                   id='failover-switches'
                   label='切号上限'
                   value={numOf(
