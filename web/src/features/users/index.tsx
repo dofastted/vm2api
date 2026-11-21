@@ -106,7 +106,7 @@ export function UsersPage() {
                 <TableHead>状态</TableHead>
                 <TableHead>两步验证</TableHead>
                 <TableHead>自建配额</TableHead>
-                <TableHead>并发</TableHead>
+                <TableHead>用户并发上限</TableHead>
                 <TableHead>最近登录</TableHead>
                 <TableHead className='text-end'>操作</TableHead>
               </TableRow>
