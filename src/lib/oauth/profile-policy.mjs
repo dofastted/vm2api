@@ -7,23 +7,24 @@
  * 「发布出去的二进制是否实现了这套策略」——事务性契约由 capabilities 声明，
  * 避免「改了行为但二进制还没发」时 CI 必然变红的结构性死锁。
  */
-import { FULL_OAUTH_SCOPE, SETUP_TOKEN_TTL_SECONDS } from './oauth-contract.mjs'
+import { FULL_OAUTH_SCOPE } from './oauth-contract.mjs'
 
 /** 二进制在 `operation: "capabilities"` 里回报这些能力名。 */
 export const OAUTH_CAPABILITIES = Object.freeze([
   // 浏览器段交给 kin-worker oauth session-code（Chrome TLS 指纹）。
   'session-code-bridge',
-  // setup-token profile 与普通登录同 scope，只把有效期放成一年。
-  'setup-token-long-lived',
+  // setup-token profile 走 README 的换票流程：同 scope、同短效票，不再伪造一年期。
+  'setup-token-short-lived',
   // KIN_OAUTH_PROXY_FALLBACK=local：出口被拒时用本地出口重试浏览器段。
   'proxy-fallback-local',
 ])
 
 export const OAUTH_PROFILES = Object.freeze({
-  oauth: Object.freeze({ scope: FULL_OAUTH_SCOPE, expiresIn: null }),
-  // 与普通登录同一套 5 项 scope，身份链（profile/roles/bootstrap）才能跑完；
-  // 区别只在有效期：一是 mint 一年，二是运行模式按 setup-token 落库。
-  'setup-token': Object.freeze({ scope: FULL_OAUTH_SCOPE, expiresIn: SETUP_TOKEN_TTL_SECONDS }),
+  oauth: Object.freeze({ scope: FULL_OAUTH_SCOPE, expiresIn: null, locked: false }),
+  // setup-token 就是 README 的换票流程：与普通登录同 scope、同样不发 expires_in，
+  // 换回来的是短效票（带上游给的 refresh）。长效票不在这里铸造——需要时由本地
+  // 用短效票换（`claude setup-token` / to-setup-token 运行模式），面板不伪造。
+  'setup-token': Object.freeze({ scope: FULL_OAUTH_SCOPE, expiresIn: null, locked: true }),
 })
 
 /** 未知 profile 一律按普通登录处理，和 `normalizeProfile` 的口径一致。 */
@@ -37,7 +38,7 @@ export function profilePolicy(profile) {
  */
 export function scopeForProfile(profile, requested) {
   const policy = profilePolicy(profile)
-  if (policy.expiresIn) return policy.scope
+  if (policy.locked) return policy.scope
   return String(requested || '').trim() || policy.scope
 }
 
