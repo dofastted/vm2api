@@ -67,6 +67,8 @@ type AuthenticatedPath<T = keyof FileRoutesById> =
  */
 export const ROUTE_VIEWS = {
   '/': null,
+  // 账号安全（两步验证）对任何已登录账号开放，不受角色视图限制。
+  '/account': null,
   '/overview': 'overview',
   '/statistics': 'statistics',
   '/logs': 'logs',

@@ -1,4 +1,10 @@
 import type {
+  LoginOutcome,
+  TwoFactorCodes,
+  TwoFactorSetup,
+  TwoFactorStatus,
+} from '@/types/panel-auth'
+import type {
   CragLicenseResponse,
   VmActiveHours,
   VmQuotaOverride,
@@ -225,46 +231,147 @@ export function getVmCragLicense(id: string) {
   )
 }
 
-export async function loginRequest(input: {
-  username: string
-  password: string
-  base?: string
-}): Promise<{ token: string; user: string }> {
-  const base = input.base ?? apiBase()
-  const url = `${base || ''}/api/panel/login`
+type LoginPayload = {
+  token?: string
+  user?: string
+  data?: { token?: string; user?: string }
+  totp_required?: boolean
+  challenge?: string
+  expires_in?: number
+  error?: { message?: string; code?: string }
+  message?: string
+}
+
+/** 登录与验证码两步都是公开端点：不带会话、不触发会话过期。 */
+async function postLogin(
+  base: string,
+  path: string,
+  body: Record<string, unknown>
+): Promise<{ res: Response; json: LoginPayload; url: string }> {
+  const url = `${base || ''}${path}`
   let res: Response
   try {
     res = await fetch(url, {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        username: input.username,
-        password: input.password,
-      }),
+      body: JSON.stringify(body),
     })
   } catch {
     throw new ApiError(`无法连接鉴权服务: ${url}`)
   }
   if (res.status === 405)
     throw new ApiError(`405 Method Not Allowed: ${url}`, 405)
-  const json = (await res.json().catch(() => ({}))) as {
-    token?: string
-    user?: string
-    data?: { token?: string; user?: string }
-    error?: { message?: string }
-    message?: string
-  }
+  const json = (await res.json().catch(() => ({}))) as LoginPayload
+  return { res, json, url }
+}
+
+type PanelSessionResult = Extract<LoginOutcome, { kind: 'session' }>
+
+function sessionFrom(
+  res: Response,
+  json: LoginPayload,
+  url: string,
+  fallbackUser: string
+): PanelSessionResult {
   const token = json.token || json.data?.token || ''
   if (!res.ok || !token) {
     throw new ApiError(
       json.error?.message ||
         json.message ||
         `登录失败 HTTP ${res.status} @ ${url}`,
-      res.status
+      res.status,
+      { code: json.error?.code || '' }
     )
   }
-  return { token, user: json.user || json.data?.user || input.username }
+  return {
+    kind: 'session',
+    token,
+    user: json.user || json.data?.user || fallbackUser,
+  }
+}
+
+/**
+ * 第一步：用户名 + 密码。账号开了两步验证时返回 `kind: 'totp'` 和
+ * challenge，调用方再用 {@link loginTotpRequest} 带验证码换会话。
+ */
+export async function loginRequest(input: {
+  username: string
+  password: string
+  /** 可选：一次性提交验证码，省掉第二步往返。 */
+  code?: string
+  base?: string
+}): Promise<LoginOutcome> {
+  const base = input.base ?? apiBase()
+  const { res, json, url } = await postLogin(base, '/api/panel/login', {
+    username: input.username,
+    password: input.password,
+    ...(input.code ? { code: input.code } : {}),
+  })
+  if (json.totp_required && json.challenge) {
+    return {
+      kind: 'totp',
+      challenge: json.challenge,
+      expiresIn: Number(json.expires_in) || 300,
+    }
+  }
+  return sessionFrom(res, json, url, input.username)
+}
+
+/** 第二步：challenge + 验证码（或恢复码）换会话。 */
+export async function loginTotpRequest(input: {
+  challenge: string
+  code: string
+  username?: string
+  base?: string
+}): Promise<PanelSessionResult> {
+  const base = input.base ?? apiBase()
+  const { res, json, url } = await postLogin(base, '/api/panel/login/totp', {
+    challenge: input.challenge,
+    code: input.code,
+  })
+  return sessionFrom(res, json, url, input.username || '')
+}
+
+export function twoFactorStatusRequest() {
+  return api<TwoFactorStatus>('/api/panel/2fa')
+}
+
+/** 生成待确认的密钥。改动第二因素要重新验证密码。 */
+export function twoFactorSetupRequest(password: string) {
+  return api<TwoFactorSetup>('/api/panel/2fa/setup', {
+    method: 'POST',
+    body: JSON.stringify({ password }),
+  })
+}
+
+export function twoFactorEnableRequest(code: string) {
+  return api<TwoFactorCodes>('/api/panel/2fa/enable', {
+    method: 'POST',
+    body: JSON.stringify({ code }),
+  })
+}
+
+export function twoFactorDisableRequest(password: string, code: string) {
+  return api<TwoFactorStatus>('/api/panel/2fa/disable', {
+    method: 'POST',
+    body: JSON.stringify({ password, code }),
+  })
+}
+
+export function twoFactorRecoveryRequest(password: string) {
+  return api<TwoFactorCodes>('/api/panel/2fa/recovery', {
+    method: 'POST',
+    body: JSON.stringify({ password }),
+  })
+}
+
+/** 管理员解锁：清掉目标账号的两步验证，下次登录只要密码。 */
+export function resetUserTwoFactorRequest(id: string) {
+  return api<{ username: string; reset: boolean }>(
+    `/api/panel/users/${encodeURIComponent(id)}/2fa`,
+    { method: 'DELETE' }
+  )
 }
 
 export function logoutRequest() {

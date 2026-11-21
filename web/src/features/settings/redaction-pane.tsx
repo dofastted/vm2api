@@ -331,7 +331,7 @@ export function RedactionPane({
       <PaneSection
         icon={Ban}
         title='这里不做'
-        desc='AgentDock 隐私页还有三项。这个网关的 helper 固定关掉它们，所以页面上没有开关。'
+        desc='此网关的脱敏助手始终关闭以下三项额外的隐私选项，因此这里不提供开关。'
       >
         <ul className='space-y-1 text-sm leading-6 text-muted-foreground'>
           <li>保留密钥格式：不会把密钥换成同形的虚构值，仍然用占位符。</li>

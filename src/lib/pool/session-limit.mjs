@@ -1,6 +1,6 @@
 /**
- * Per-slot conversation window for the Codex/GPT pool (sub2api-style,
- * in-memory). The Claude pool uses the seat planner instead.
+ * In-memory per-slot conversation window for the Codex/GPT pool.
+ * The Claude pool uses the seat planner instead.
  * Existing keys renew; a new key is refused once active >= max.
  * max_sessions = 0 means off.
  *

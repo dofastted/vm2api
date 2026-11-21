@@ -16,7 +16,7 @@ import (
 // matches it. Matched as cur().known, it goes as the same placeholder again.
 //
 // What is cur().known is what cur().values holds (in memory only, bounded by
-// maxValues): the cur().values of the placeholders made since magpie started,
+// maxValues): the cur().values of the placeholders made since this process started,
 // for every request alike, since a placeholder is the same for the same
 // value whichever conversation it is in.
 
@@ -217,7 +217,7 @@ func standsAlone(kind, s string, a, b int) bool {
 //
 // What is remembered is a hash of the text and of what o covers, and the
 // places of the cur().known cur().values in it; nothing of a value. A text no longer
-// remembered (sentEntries, or magpie started again) is masked with what is
+// remembered (sentEntries, or this process restarted) is masked with what is
 // cur().known then.
 const sentEntries = 1 << 16
 

@@ -25,7 +25,7 @@
 
 | 条件 | 实现 |
 |------|------|
-| UA | `^claude-cli/\d+\.\d+\.\d+`（sub2api 同款前缀；vscode / cowork / desktop 都算） |
+| UA | `^claude-cli/\d+\.\d+\.\d+`（vscode / cowork / desktop 都算） |
 | `metadata.user_id` | 合法官方 user id |
 | tools | 不能是 OpenAI `{type:function}` / `tool_choice.type=function`。`/v1/messages` 上这种 tools 会先转 Anthropic，但仍判非官方 |
 | system | 含 `x-anthropic-billing-header:`、官方 `cc_entrypoint`（`cli` / `sdk-cli` / `vscode` / `cowork` / `desktop`）、或官方身份行（含 `You are Claude Code` / `Claude Agent SDK` 变体）。`local-agent` 仅在 UA 含对应入口和 Agent SDK、平台为 `desktop_app` 且客户端版本有效时继续原有官方校验；OMP 专属特征仍优先排除 |
@@ -158,7 +158,7 @@ CRAG 声明 `provider_managed_tools_v1` 且支持对应工具时使用独立的 
 
 `sanitizeInboundBody` / `request-rectifier`：
 
-- 非法 Anthropic `role` 按 Sub2API 清洗
+- 清洗非法 Anthropic `role`
 - 非官方补 tool 对、短签名预过滤
 - OpenAI `response_format` → `output_config`；`refusal` → `content_filter`
 - 空 refusal 记 `content_filter_refusal`
@@ -176,7 +176,7 @@ CRAG 声明 `provider_managed_tools_v1` 且支持对应工具时使用独立的 
 出站前 `stripInvalidThinkingBlocks` 保留可回放的历史思维块：
 
 1. `thinking` 即使文本为空，只要有完整签名也保留；这是 `display: omitted` 的正常响应形态。
-2. Opus / Sonnet / Haiku 5.5 按 sub2api：非空且非 dummy 的签名都算有效，不看长度；`redacted_thinking` 有 `data` 就留，没有 `data` 时再看签名。历史里只要有一块无效，整段 thinking / `redacted_thinking` 都拆掉，只留正文；拆完没有内容的轮删掉。全部有效时不拆。
+2. Opus / Sonnet / Haiku 5.5：非空且非 dummy 的签名都算有效，不看长度；`redacted_thinking` 有 `data` 就留，没有 `data` 时再看签名。历史里只要有一块无效，整段 thinking / `redacted_thinking` 都拆掉，只留正文；拆完没有内容的轮删掉。全部有效时不拆。
 3. 更早的型号仍逐块过滤：签名短于 24、空签名、dummy 签名删掉，合法签名块留下。`redacted_thinking` 不看 `data`，只在签名达到 24 字符时留。
 4. 保留路径（cli-hop 首跳，以及默认 HTTP hop）不走上面的拆链，只在 `stripInvalidThinkingBlocks` 的这一支里处理：`redacted_thinking` 不看 `data` 和签名，原样留。`thinking` 只有签名可用（非空、不少于 24、非 dummy）才留，空正文也留；缺失、空、短于 24、dummy 的删掉，不再补 `signature: ""`。不走保留路径时，`redacted_thinking` 仍按上面第 2、3 条删。当前没有按账号归属过滤签名的步骤。
 

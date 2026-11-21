@@ -155,7 +155,6 @@ for (const personaPreset of ['official', 'official_full']) {
 }
 
 for (const options of [
-  { outboundShape: 'lean' },
   { preserveSystem: true },
   { requestContext: { purpose: 'auto_mode_classifier' } },
 ]) {

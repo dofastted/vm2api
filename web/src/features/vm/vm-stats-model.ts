@@ -34,7 +34,7 @@ export type VmStatsSummary = {
 
 /**
  * 把后端的稀疏日桶补成连续 N 天。日均只按「有请求的天」算，
- * 与 sub2api 的 `actual_days_used` 同一口径——空闲天不稀释均值。
+ * 空闲天不计入日均分母。
  */
 export function summarizeUsageStats(
   stats: { days: number; history: VmUsageStatsDay[] } | null | undefined,

@@ -14,7 +14,10 @@ import { runSlotProcess } from '../transport/slot-oauth.mjs'
 import { OAUTH_REQUEST_TIMEOUT_MS } from './oauth-contract.mjs'
 
 const pendingAttempt = Symbol('guestOAuthAttempt')
-const safeCode = (value, fallback) => (/^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : fallback)
+// `test` stringifies its argument, so undefined/null match the pattern as "undefined"/"null"
+// and were returned as the code. Require a string, like every other code guard in the tree.
+const safeCode = (value, fallback) =>
+  typeof value === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : fallback
 
 function fail(code, message) {
   return Object.assign(new Error(message), { code })
@@ -54,7 +57,10 @@ export async function prepareSlotOAuth({
   }
   const boot = await startReady(vm, projectRoot, { routing, allowMissingCredential: true, timeoutMs })
   if (!boot?.ok || boot.rust_ok === false || !boot.rust?.ok || boot.rust.skipped) {
-    throw fail(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'Target VM native CLI is not ready')
+    // One sanitized code feeds both err.code and the message, so they cannot disagree.
+    // The default inside keeps a missing code from being stringified to "undefined" by safeCode.
+    const code = safeCode(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'oauth_runtime_not_ready')
+    throw fail(code, `Target VM native CLI is not ready (${code})`)
   }
   const patch = { ...(boot.runtime ? { runtime: boot.runtime } : {}), status: 'running' }
   const stored = patchVmRecord(projectRoot, vm.id, patch)
@@ -89,13 +95,15 @@ export async function finishOAuthImport(oauth, ok) {
 }
 
 /**
- * A controller-side exchange has no KERNEL_CONFIG env of its own: hand the
- * helper the slot's kernel config so `kin-worker oauth session-code` picks the
- * same exit (proxy, or transparent egress) the slot would use.
+ * A controller-side exchange has no env of its own: hand the helper the slot's
+ * **worker** config (`worker.json`), which is what carries `vm_id`, `proxy_url`
+ * and `egress_mode`. `kernel.json` lacks `egress_mode`, and an empty proxy there
+ * made the worker refuse every dial ("upstream transport failed").
  */
 function workerConfig(exec) {
   try {
-    const configPath = rustKernelPaths(exec).configPath
+    const runDir = rustKernelPaths(exec).runDir
+    const configPath = runDir ? path.join(runDir, 'worker.json') : null
     return configPath && fs.existsSync(configPath) ? { worker_config_path: configPath } : {}
   } catch {
     return {}
@@ -131,6 +139,12 @@ export async function runGuestOAuthAuthService(
     env: {
       HOME: home,
       CLAUDE_CONFIG_DIR: configDir,
+      // The worker config (`worker.json`) carries vm_id/proxy_url/egress_mode and
+      // is what `kin-worker oauth session-code` needs; the kernel config does not.
+      KIN_WORKER_CONFIG: '/run/kin/worker.json',
+      // 'local' retries the browser stage on the local egress when the bound
+      // proxy is invalid; anything else reports proxy_invalid to the panel.
+      KIN_OAUTH_PROXY_FALLBACK: String(process.env.KIN_OAUTH_PROXY_FALLBACK || ''),
       KERNEL_CONFIG: '/run/kin/kernel.json',
       HTTP_PROXY: '',
       HTTPS_PROXY: '',

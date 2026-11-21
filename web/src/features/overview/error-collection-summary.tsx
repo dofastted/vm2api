@@ -27,8 +27,8 @@ export function ErrorCollectionSummary({
   collection: ErrorCollection | undefined
   serverMuted?: string[]
 }) {
-  const bag = collection || {}
-  const classes = bag.by_class || []
+  const bag = collection ?? null
+  const classes = bag?.by_class || []
   const muted = new Set(resolveMutedClasses(serverMuted))
   const visible = classes.filter((c) => !muted.has(c.id))
   const hidden = classes.filter((c) => muted.has(c.id))
@@ -41,7 +41,7 @@ export function ErrorCollectionSummary({
       meta={
         <span className='tabular-nums'>
           {visibleTotal ? fmtNum(visibleTotal) : null}
-          {mutedTotal ? ` · 已屏蔽 ${fmtNum(mutedTotal)}` : null}
+          {mutedTotal ? ` · 已屏蔽 ${fmtNum(mutedTotal)} 条` : null}
         </span>
       }
       action={
@@ -53,7 +53,9 @@ export function ErrorCollectionSummary({
       }
     >
       <div className='px-4 py-3'>
-        {!visible.length && !hidden.length ? (
+        {bag == null ? (
+          <EmptyState reason='错误统计暂不可用' />
+        ) : !visible.length && !hidden.length ? (
           <EmptyState reason='该窗口无错误' />
         ) : (
           <div className='flex flex-wrap gap-2'>
@@ -80,7 +82,7 @@ export function ErrorCollectionSummary({
               ))
             ) : (
               <span className='text-xs text-muted-foreground'>
-                可见错误已全部屏蔽
+                本摘要中的错误均来自已屏蔽的错误类
               </span>
             )}
           </div>

@@ -31,6 +31,24 @@ function riskReviewEnabled(value) {
   return value === true
 }
 
+const BODY_POLICIES = ['persona', 'caller']
+
+/**
+ * How an API endpoint treats the caller's request body.
+ * `persona` (default) keeps the historical behaviour: the configured subscription
+ * persona replaces the caller's identity and billing blocks. `caller` forwards the
+ * caller's own body instead, for upstreams that read those blocks themselves (#1321).
+ */
+function bodyPolicy(value) {
+  if (value === undefined) return BODY_POLICIES[0]
+  if (typeof value !== 'string' || !BODY_POLICIES.includes(value)) {
+    throw Object.assign(new Error(`body_policy must be one of ${BODY_POLICIES.join(', ')}`), {
+      code: 'invalid_body_policy',
+    })
+  }
+  return value
+}
+
 function maskUpstreamKey(key) {
   const s = String(key || '')
   if (s.length <= 8) return s.slice(0, 2) + '…'
@@ -72,6 +90,7 @@ export function publicEndpointView(ep, { reveal = false } = {}) {
     kind: resolvePreset(ep.kind, ep).kind,
     protocol: resolvePreset(ep.kind, ep).protocol,
     risk_review_enabled: ep.risk_review_enabled === true,
+    body_policy: BODY_POLICIES.includes(ep.body_policy) ? ep.body_policy : BODY_POLICIES[0],
     base_url: resolvePreset(ep.kind, ep).base_url || ep.base_url,
     headers: stripAuthSchemeHeader(ep.headers),
     auth_scheme: endpointAuthScheme(ep),
@@ -139,6 +158,7 @@ export class ApiEndpointStore {
       kind: preset.kind,
       protocol: preset.protocol,
       risk_review_enabled: riskReviewEnabled(input.risk_review_enabled),
+      body_policy: bodyPolicy(input.body_policy),
       headers: headersWithAuthScheme(
         input.headers && typeof input.headers === 'object' ? input.headers : {},
         input.auth_scheme || input.authScheme,
@@ -162,6 +182,7 @@ export class ApiEndpointStore {
     if (patch.name != null) rec.name = String(patch.name).trim().slice(0, 80) || rec.name
     if (patch.disabled != null) rec.disabled = !!patch.disabled
     if (patch.risk_review_enabled !== undefined) rec.risk_review_enabled = riskReviewEnabled(patch.risk_review_enabled)
+    if (patch.body_policy !== undefined) rec.body_policy = bodyPolicy(patch.body_policy)
     if (patch.prefix != null) rec.prefix = String(patch.prefix).trim()
     if (patch.kind != null || patch.protocol != null || patch.base_url != null) {
       const preset = resolvePreset(patch.kind ?? rec.kind, {

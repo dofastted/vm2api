@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 import { ProxyPool, MAX_VMS_PER_PROXY, clampBindLimit } from '../../src/lib/vm/proxy-pool.mjs'
-import { reconcileProxyScheduleHold } from '../../src/lib/vm/vm-registry.mjs'
+import { reconcileProxyScheduleHold, bindVmProxy } from '../../src/lib/vm/vm-registry.mjs'
 
 function tmpDir(prefix = 'kin-px-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
@@ -310,6 +310,76 @@ test('egress_down does not mark a live SOCKS proxy dead', async () => {
     pool.stopScheduler()
     socks.server.close()
   }
+})
+
+function holdFixture(t) {
+  const root = tmpDir()
+  const vms = path.join(root, 'vms')
+  fs.mkdirSync(vms)
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  return {
+    root,
+    save: (record) => fs.writeFileSync(path.join(vms, `${record.id}.json`), JSON.stringify(record)),
+    get: (id) => JSON.parse(fs.readFileSync(path.join(vms, `${id}.json`), 'utf8')),
+    held: (id, detail) => ({
+      id,
+      status: 'running',
+      schedulable: false,
+      proxy: { id: 'proxy-b' },
+      schedule_hold: { reason: 'proxy_cooldown', detail, at: new Date().toISOString() },
+    }),
+  }
+}
+
+for (const [label, message] of [
+  ['a probe failure', 'proxy_probe_failed:proxy_auth_failed'],
+  ['an egress outage', 'egress_down'],
+  ['a legacy marker', 'slot stopped |proxy=proxy-a'],
+]) {
+  test(`a stale ${label} hold from a previous binding is lifted by the current proxy (#1395)`, (t) => {
+    const f = holdFixture(t)
+    // The hold was written while the slot was bound to proxy-a; it is on proxy-b now.
+    f.save(f.held('vm-rebound', { tag: 'proxy-a', message }))
+    reconcileProxyScheduleHold(f.root, 'vm-rebound', 'proxy-b')
+    const after = f.get('vm-rebound')
+    assert.equal(after.schedule_hold, undefined, `${message} must not outlive its proxy`)
+    assert.equal(after.schedulable, true)
+  })
+}
+
+test('a stale proxy hold survives when it was manual or belongs to another reason (#1395)', (t) => {
+  const f = holdFixture(t)
+  // Manual intent is not a probe verdict, so no probe may lift it.
+  f.save(f.held('vm-manual', { tag: 'proxy-a', message: 'proxy_manually_disabled' }))
+  reconcileProxyScheduleHold(f.root, 'vm-manual', 'proxy-b')
+  assert.equal(f.get('vm-manual').schedule_hold?.detail.message, 'proxy_manually_disabled')
+  assert.equal(f.get('vm-manual').schedulable, false)
+
+  // A hold owned by another subsystem stays untouched.
+  f.save({
+    id: 'vm-maint',
+    status: 'running',
+    schedulable: false,
+    proxy: { id: 'proxy-b' },
+    schedule_hold: { reason: 'maintenance', detail: { tag: 'migration:1' }, at: new Date().toISOString() },
+  })
+  reconcileProxyScheduleHold(f.root, 'vm-maint', 'proxy-b')
+  assert.equal(f.get('vm-maint').schedule_hold?.reason, 'maintenance')
+
+  // An unrecognised automatic message is not assumed liftable either.
+  f.save(f.held('vm-opaque', { tag: 'proxy-a', message: 'something_else' }))
+  reconcileProxyScheduleHold(f.root, 'vm-opaque', 'proxy-b')
+  assert.equal(f.get('vm-opaque').schedule_hold?.detail.message, 'something_else')
+})
+
+test('a hold left by a previous proxy is retagged when the current one also fails (#1395)', (t) => {
+  const f = holdFixture(t)
+  f.save(f.held('vm-failing', { tag: 'proxy-a', message: 'proxy_probe_failed:proxy_auth_failed' }))
+  reconcileProxyScheduleHold(f.root, 'vm-failing', 'proxy-b', 'proxy_probe_failed:not_listening')
+  const hold = f.get('vm-failing').schedule_hold
+  assert.equal(hold.detail.tag, 'proxy-b', 'the hold must describe the binding it now applies to')
+  assert.equal(hold.detail.message, 'proxy_probe_failed:not_listening')
+  assert.equal(f.get('vm-failing').schedulable, false)
 })
 
 test('a failed host helper only restricts its local consumers and healthy probes clear persisted holds', async (t) => {
@@ -646,4 +716,143 @@ test('local egress probe stays direct when kin-egress is down', async () => {
   assert.equal(row.status, 'ok')
   assert.equal(row.enabled, true)
   assert.equal(disabled.length, 0)
+})
+
+test('the SVCB/HTTPS override lives on each proxy and the pool switch applies it in bulk', (t) => {
+  const dir = tmpDir()
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pool = new ProxyPool({ dataDir: dir })
+  pool.stopScheduler()
+  pool.ensureLocal()
+  pool.importLines('10.0.0.1:1080\n10.0.0.2:1080')
+  const [a, b] = pool.snapshot().proxies.filter((p) => p.id !== 'px-local')
+
+  // Default is off, and the pool switch writes through to every eligible row.
+  assert.equal(a.dns_disable_svcb_https, false)
+  const on = pool.setDnsDisableSvcbHttpsAll(true)
+  assert.equal(on.ok, true)
+  assert.deepEqual(on.changed.sort(), [a.id, b.id].sort())
+  // The local row has no helper of its own, so it is not eligible.
+  assert.equal(on.eligible, 2)
+  assert.equal(pool.state.proxies.find((p) => p.id === 'px-local').dns_disable_svcb_https, undefined)
+  for (const p of pool.snapshot().proxies.filter((p) => p.id !== 'px-local')) {
+    assert.equal(p.dns_disable_svcb_https, true)
+  }
+
+  // A second apply of the same value flips nothing: the caller must not reload
+  // helpers that already carry it.
+  assert.deepEqual(pool.setDnsDisableSvcbHttpsAll(true).changed, [])
+  assert.equal(pool.setDnsDisableSvcbHttpsAll('true').error, 'invalid_dns_disable_svcb_https')
+
+  // startProxyEgress reads the trimmed shape, so the field has to survive it.
+  assert.equal(pool.getProxyByIdWithAuth(a.id).dns_disable_svcb_https, true)
+
+  // One proxy can differ from the pool.
+  const off = pool.update(a.id, { dns_disable_svcb_https: false })
+  assert.equal(off.ok, true)
+  assert.equal(off.dns_disable_svcb_https_changed, true)
+  assert.equal(off.connection_changed, false)
+  assert.equal(off.proxy.dns_disable_svcb_https, false)
+  assert.equal(pool.getProxyByIdWithAuth(a.id).dns_disable_svcb_https, false)
+  assert.equal(pool.getProxyByIdWithAuth(b.id).dns_disable_svcb_https, true)
+  // Setting the value it already has is still ok, just not a change.
+  assert.equal(pool.update(a.id, { dns_disable_svcb_https: false }).dns_disable_svcb_https_changed, false)
+  assert.equal(pool.update(a.id, { dns_disable_svcb_https: 1 }).error, 'invalid_dns_disable_svcb_https')
+  assert.equal(pool.update('px-local', { dns_disable_svcb_https: true }).error, 'dns_disable_svcb_https_unsupported')
+
+  // A connection edit must carry the switch through the rebuilt record.
+  const moved = pool.update(b.id, { host: '10.0.0.9', port: 1081 })
+  assert.equal(moved.ok, true)
+  assert.equal(moved.connection_changed, true)
+  assert.equal(moved.proxy.dns_disable_svcb_https, true)
+
+  // The pool key is the default for rows added later.
+  pool.importLines('10.0.0.3:1080')
+  const added = pool.snapshot().proxies.find((p) => p.host === '10.0.0.3')
+  assert.equal(added.dns_disable_svcb_https, true)
+
+  const reopened = new ProxyPool({ dataDir: dir })
+  reopened.stopScheduler()
+  assert.equal(reopened.getProxyByIdWithAuth(a.id).dns_disable_svcb_https, false)
+  assert.equal(reopened.getProxyByIdWithAuth(b.id).dns_disable_svcb_https, true)
+})
+
+test('the pool-level config switch reports which proxies it flipped', (t) => {
+  const dir = tmpDir()
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const pool = new ProxyPool({ dataDir: dir })
+  pool.stopScheduler()
+  pool.importLines('10.0.0.1:1080\n10.0.0.2:1080')
+  const ids = pool
+    .snapshot()
+    .proxies.map((p) => p.id)
+    .sort()
+
+  const result = pool.updateConfig({ dns_disable_svcb_https: true })
+  assert.equal(result.ok, true)
+  assert.equal(result.config.dns_disable_svcb_https, true)
+  assert.deepEqual([...result.dns_disable_svcb_https_changed].sort(), ids)
+  for (const p of pool.snapshot().proxies) assert.equal(p.dns_disable_svcb_https, true)
+
+  // An unrelated config key touches no proxy.
+  const other = pool.updateConfig({ probe_interval_min: 30 })
+  assert.deepEqual(other.dns_disable_svcb_https_changed, [])
+})
+
+test('re-binding lifts a stale hold without waiting for the next probe (#1395)', (t) => {
+  const f = holdFixture(t)
+  // Held while bound to proxy-a and still bound to it. The operator now moves
+  // the slot onto a proxy that was already healthy, so no probe transition is
+  // coming to notice the hold -- only the next scheduled probe would, up to a
+  // full probe interval later.
+  f.save({
+    id: 'vm-rebind',
+    status: 'running',
+    schedulable: false,
+    proxy: { id: 'proxy-a' },
+    schedule_hold: {
+      reason: 'proxy_cooldown',
+      detail: { tag: 'proxy-a', message: 'proxy_probe_failed:proxy_auth_failed' },
+      at: new Date().toISOString(),
+    },
+  })
+  const summary = bindVmProxy(f.root, 'vm-rebind', { id: 'proxy-b', host: '10.0.0.2', port: 1080 })
+  const after = f.get('vm-rebind')
+  assert.equal(after.proxy.id, 'proxy-b')
+  assert.equal(after.schedule_hold, undefined, 'the previous proxy must not keep holding the slot')
+  assert.equal(after.schedulable, true)
+  assert.equal(summary.schedulable, true, 'the summary the bind returns must already reflect the lift')
+})
+
+test('re-binding preserves a manual proxy hold and another subsystem hold (#1395)', (t) => {
+  const f = holdFixture(t)
+  const bind = (id) => bindVmProxy(f.root, id, { id: 'proxy-b', host: '10.0.0.2', port: 1080 })
+
+  // Manual intent is an operator decision, not a stale probe verdict.
+  f.save({
+    id: 'vm-manual',
+    status: 'running',
+    schedulable: false,
+    proxy: { id: 'proxy-a' },
+    schedule_hold: {
+      reason: 'proxy_cooldown',
+      detail: { tag: 'proxy-a', message: 'proxy_manually_disabled' },
+      at: new Date().toISOString(),
+    },
+  })
+  bind('vm-manual')
+  assert.equal(f.get('vm-manual').schedule_hold?.detail.message, 'proxy_manually_disabled')
+  assert.equal(f.get('vm-manual').schedulable, false)
+
+  // A hold owned by another subsystem is not a proxy verdict either.
+  f.save({
+    id: 'vm-maint',
+    status: 'running',
+    schedulable: false,
+    proxy: { id: 'proxy-a' },
+    schedule_hold: { reason: 'maintenance', detail: { tag: 'migration:1' }, at: new Date().toISOString() },
+  })
+  bind('vm-maint')
+  assert.equal(f.get('vm-maint').schedule_hold?.reason, 'maintenance')
+  assert.equal(f.get('vm-maint').schedulable, false)
 })

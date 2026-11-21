@@ -2,16 +2,71 @@
 
 ## Unreleased
 
-- 定时测试计划新增 `mode=preheat` 额度窗口预热（默认关闭，#979）：到点发一次极小真实请求启动所选账号的 5h 窗口；窗口仍活、无凭证、槽位不可调度时跳过并记录 `last_skipped`，不持续重试。`auto_renew` 开启后在记录的窗口重置时刻过期后自动预热下一窗，每窗只发一次；最近执行结果与跳过原因在计划读数里可见。`mode=test` 与旧版行为完全一致，存量的无 mode 计划照旧。
+## 1.4.171 — 2026-11-20 · CRAG 一键升级到锁定版本、CRAG 3.1.12 与面板文案续修
+
+- wrap 内核页新增「升级到锁定版本」一键动作。此前升级 CRAG 只能登宿主跑 `scripts/update-crag.mjs`，而 version-switch 的 overlay 从不投递 `scripts/`，宿主上那份可能停在旧代次；面板侧也没有任何地方调用 `/api/panel/kernels/crag-update`，运维没有可走的路径。现在按钮先按 `deploy/payload.json` 的 `crag_release` 拉取锁定载荷，跳过 `payload_tag` 已等于该 pin 的槽位，其余复用既有确认框、任务进度与逐槽结果；全部已达标时直接告知并且不重启任何槽位。`GET /api/panel/kernels` 新增 `crag_pin`，与描述已缓存包的字段分开放，避免被读成「已安装版本」；拉取路由开始接受 `latest`，默认仍为最新版，手动两步流程行为不变（#1513）。
+- 修正 CRAG 升级把「槽位尚未启动 core」判成「仍跑着旧 core」。v2 的 core 是懒启动的，刚重启的槽位合法地可能一个都没有，而最终校验要求恰好一个且匹配新 manifest，于是一次六槽升级以 `crag_running_core_mismatch` 整单失败，原地零改动重跑却全部通过——这个失败不携带任何可操作信息。现在跑着别的树的 core 仍立刻失败，一个都没有则在已装树通过哈希校验的前提下记为待定；该判定搬进随部署走的 `src/lib/vm/crag-core-check.mjs`，面板因此可以复用，健康闸门同时收敛为必须通过已认证的内部探测才采信 `runtime_variant` 与 `license_valid`（#1513）。
+- 标准 CRAG 载荷升级至 `3.1.12`：原生 TUI 不再向 Datadog 发送日志镜像和错误批次，Anthropic 第一方遥测仍按原字段白名单过滤。授权身份、官方 Claude Code `2.1.321` 和其他组件载荷不变（#1387、#1508）。
+- 重新绑定代理会清掉上一条绑定留下的 hold，面板也不再把它显示成「代理异常」。hold 的 tag 指向槽位已不再使用的出口时，没有任何自动路径会解除它，而照旧显示会把运维引去排查一个健康的出口（#1489、#1510）。
+- 日志导出的「仅导出当前错误类」此前不可达：对话框解构了一个自己没有声明的 prop，唯一的调用方也从未传入，于是开关永远读到 `undefined`。补上 prop 声明并由页面传入已校验的筛选值（#1481）。
+- 响应时间徽标不再把下降显示成上升。真实的 20% 下降此前渲染成 `+20%` 并带向上箭头，现在只反转配色、不反转数值（#1492）。
+- 按窗口聚合账户用量改为单遍求和，不再为每个事件构造中间行对象；无上一轮会话的候选不再快照请求体；连续性诊断复用请求级摘要缓存而不是重复哈希；kin-egress 存活探测移出事件循环，不再按绑定代理数在每个 watchdog tick 上造成停顿（#1506、#1507、#1509、#1511）。
+- 面板文案与语义续修，接上 1.4.170 的同一条线：空日志查询不再暗示采集缺失，零请求的密钥统计不再读成成功，重建槽位启动失败会给出警告，Wrap CLI 模板替换、远端内核修复、强制删除跳过远端清理、槽位名影响 ID、公网可达性为节点探测、软件 KVM 模拟与 KVM 不可用、代理时区数据缺失与无效、签名修复不再承诺最终 200、用户并发列为配置上限、零 VM 配额会阻断租户自助、导入改名与失败原因并列显示、重试跳数上限为零时显示为零（#1479、#1480、#1482—#1487、#1491、#1494、#1498—#1505）。
+- 补上 CI 盲区里的测试并让隔离跑机支持多文件并发：路由覆盖守卫的正则、出口重启守卫、以及因文案改名而失效的面板断言；手动全量单测改为四 worker（#1493、#1512）。
+
+## 1.4.170 — 2026-11-20 · 面板缺失语义修正、TOTP 两步验证与 CRAG 3.1.11
+
+- 可选的 TOTP 两步验证登录。新增「账号安全」页，对任何已登录账号开放，不受角色视图限制（#1417）。
+- Anthropic API 端点新增 body 策略：端点可以转发调用方的请求体，而不是套用人格；面板 API 控制台可以查看与切换（#1398）。
+- 标准 CRAG 载荷升级至 `3.1.11`：修复慢 MCP 工具等待及已过期回调导致的对话恢复 410。未认领的迟到结果可凭完整匹配的历史恢复；已认领的过期批次不会因回执淘汰或 worker 重启再次推理。授权身份、官方 Claude Code 2.1.321 和其他组件载荷不变。
+- 屏蔽 SVCB(64)/HTTPS(65) 的 DNS 覆写改为按单条代理生效。此前它只存在 `proxy_pool_config` 里，`configuredDnsEmptyTypes()` 读的是池级值，整个池只能一起开关；而 kin-egress 的 `dns_empty_types` 本来就是按 helper 下发的，per-VM helper 恰好只服务一条代理，这个开关本该长在代理行上。现在 `proxies` 表有自己的 `dns_disable_svcb_https` 列，`startProxyEgress` 与集群 per-VM 出口都从各自的代理取值，单条代理可以和池里其他代理不同。池设置里那个开关语义改为批量动作：写入全部非本地代理，并作为此后新增代理的初始值，不再是运行时的继承来源；保存后只重载被这次动作真正改变且已绑定的出口，不再把整池拉下来重载一遍。迁移 `064` 把原池级值写进每一条代理，升级后行为不变。共享出口模式下一个 helper 带多条上游、Go 侧 `DNSEmptyTypes` 又是 helper 级的，取交集：该节点全部成员代理都开启才下发覆写，这样界面显示「关」的代理绝不会被别人的选择连带屏蔽。本地直连行没有自己的 helper，拒绝该字段（`dns_disable_svcb_https_unsupported`）。
+- 代理页的弹出层改掉工程口径文案，并补上确认步骤。池设置此前点一下就直接写库，没有确认也无从反悔，现在改为草稿提交：改动先留在本地并标「未保存」，底部常驻确认栏统一保存，带着未保存改动关抽屉会被拦住。批量开关这种一次改全部代理的动作单独走二次确认，并说明会影响多少条。抽屉窄屏不再 `95vw` 糊满整屏。文案按运维视角重写，例如「关闭 DNS type 64 / 65」改为「屏蔽 HTTP/3 与加密 SNI 探测」，技术细节降到说明行；单条代理的同一开关在「编辑」里，与「按域名连接」并列。
+- 透传时保留上游的终态判定，停止对 410 续接做无效重试（#1413，refs #1215）。
+- 当前代理可以解除上一条绑定留下的 hold（#1400）。
+- 每次响应只读一份账户快照，消除按槽位放大的账户查询（#1415，refs #1043）；端点密钥状态不再附带用量聚合即可读取（#1409）。
+- 移除未使用的 official 303 渲染器（#1399）。
+- 页面分块加载失败不再显示成 500（#1404）。
+- 面板不再把「缺失」显示成真实的零或已确认的空。统计总览、日志总览、密钥与槽位统计、错误汇总、风险放行原因、Docker 探测、响应时间等处，加载失败与数据缺失各有独立文案；零请求的统计窗口不再显示 100% 成功并带健康绿标（#1432、#1445、#1457、#1466、#1471、#1473、#1474、#1475、#1476、#1477、#1478）。
+- 面板时间与窗口口径统一。「今日」明确标为北京时间，统计区间标为含当前时刻，日期预设标出浏览器时区，七天值统一称作额度窗口，五小时峰值说明为账户额度用量；QPS、平均 TPS、缓存率与各比率分别说明统计窗口和分母（#1411、#1412、#1414、#1416、#1418、#1420、#1422、#1424—#1426、#1429、#1430、#1434、#1435、#1440、#1463、#1464、#1467—#1469）。
+- 日志筛选与导出的描述与实际行为对齐：非 2xx 的命名在快捷筛选与生效筛选上统一，单边日期筛选显示实际边界，仍在翻页扫描时明确说明，手动与自动翻页分开，被截断的导出不再称作完整，草稿筛选需要单独应用（#1433、#1447—#1449、#1451、#1453、#1456、#1459）。
+- 图表与榜单在查询切换期间不再展示上一次的结果（#1441、#1442、#1452）；只保留单条序列的图表动作改名（#1458）。
+- 请求健康改为按活跃时间槽计数与定位，中段健康带不再与 5% 重叠（#1437—#1439、#1454）。
+- 面板口径与命名修正：账户合计与留存模型成本分开，滚动与自然日请求数分开，日志留存与请求日志分开，在线 VM 说明为按状态推导的运行中 VM，已配置的模型窗口与 1M 能力分开，以及计费留存窗口、API 渠道归属、虚拟机命名、实时会话计数与日志跳转等文案更正（#1401—#1403、#1405—#1408、#1410、#1444、#1446、#1455、#1460—#1462、#1470、#1472）。
+- 补上 CI 盲区里的红测试：代理连接字段更新后重读存储行、用户路由的进程级数据库句柄、出口复用检查的完整配置 body、升级校验阶段的探测限速、切核用例的槽凭证、路由入参断言，以及两处因文案改名而失效的面板断言（#1419、#1421、#1427、#1428、#1431、#1436、#1450、#1465）。
+
+## 1.4.169 — 2026-11-20 · 订阅操作不再拒绝全部槽位
+
+- 订阅操作期间不再拒绝无关槽位。任何名册变更都会重新发布所有槽位授权共用的那一份主机 entitlement，准入因此分不清被操作的槽位和其他槽位，整个操作期间把本机 KVM 槽位全部拒掉；逐槽迁移于是表现为滚动 403（27 个槽位约 25 分钟，而全部槽位都跑 CRAG 时没有可回落的对象）。现在准入会等待该操作结束，再对已稳定的主机重跑同一套检查：`exclusive()` 只在 `restoreKvmBindings()` 把每个运行中的客户机重新投递之后才清状态，等待者醒来面对的是真正就绪的主机。等待时长受请求自身的槽位预算约束（15 秒上限、重试一次），超出预算的拒绝会标为可重试并带上 retry-after，前置网关可以重试或改选槽位，而不是把它读成授权失败。用 `AsyncLocalStorage` 标记独占工作体，从其中发起的嵌套准入仍然立即拒绝，不会等待自己所处的那个操作。按槽位加锁的方案已评估后否决：`publish(entitlementFile)` 在每条独占路径上都会走到，没有真正只影响单个槽位的操作（#1384，refs #1307）。
+- 修正准入等待计时器被 `unref` 导致的挂起。事件循环空闲后 unref 的计时器不再触发，`settledWithin` 里的竞态会永久 pending 而不是超时；`finally` 里的 `clearTimeout` 本就负责清理，`unref` 没有带来任何好处（#1384）。
+- OAuth 错误码守卫要求必须是字符串。`RegExp.test` 会先把参数转成字符串，`undefined` 与 `null` 变成 `"undefined"` / `"null"` 后都能匹配码的格式，于是守卫返回原值而不是兜底值。可达路径是 helper 自身的失败分支：OAuth helper 以 `{"ok":false}` 退出且没有 `error.code` 时，抛出的错误带着 `code: undefined`，面板看到一个没有错误码的失败，尝试记录里也是空 —— 而错误码正是判断授权为何失败的唯一线索。改为与仓库里另外四处码守卫一致，先判类型再跑正则（#1388）。
+
+## 1.4.168 — 2026-11-20 · Gemini 宿主诊断与协议修复
+
+- 管理员可在「订阅 CRAG」右上角兑换本机 CRAGGemini 签名载荷。只接受当前签名清单对应的授权码；载荷激活与 Google 授权、推理支持和 Claude CRAG 订阅独立。授权码在发行机用 `scripts/issue-gemini-release-code.mjs` 签发，同一签名清单在同一私有发行目录只生成一个；只有对应的 `.json` 校验配置装到宿主，明文码不入库（#1340）。
+- Gemini 环境详情新增代理与测试诊断。「代理」可查看、测通或换绑 IPv4 SOCKS5，换绑会清除模型与账号快照但不删登录，授权、终端或测试运行时不得换绑；「测试」先拉取模型再发单条纯文本，提交返回 `run_id`，由 `GET`／`DELETE /test-chat/:run_id` 轮询或取消，结果只在宿主内存短暂保留。OAuth 走隔离的官方 `agy`，API Key 只列目录中声明支持 `generateContent` 的模型。请求只用当前账号及绑定代理，不切换账号、不回落直连；不计入 vm2api 密钥扣费，但可能消耗 Google 侧用量（#1374）。
+- Gemini 宿主部署支持签名的 `0.3.0-rc.2`；配置安装源时，安装命令会先验证并落地载荷，再报告成功。已授权的 Google 账号可从详情页点「启动 Gemini」，打开走绑定代理的 Antigravity CLI 终端，不影响公共推理和计费。
+- Gemini 终端仅在启动时识别 Google OAuth 菜单；会话中的同样文本不再断开终端或改写账号授权状态。
+- 默认 CRAG 标准载荷升级到 `3.1.10`：修正原生 TUI 遥测的入口绑定，并补上供应商账号切换后工具结果的恢复。不自动重启现有槽位（#1371）。
+- 上游拒收采样字段本身时，剥掉参数重试一次。此前这类 400 被归到 `invalid_request` 直接失败：中转或厂商模型压根不接受 `temperature`，或只在 thinking 下接受 `temperature=1`。现在归为 `sampling_repairable`，给一次不带采样参数的重试。repair 不改请求体——它跑在组装之前，删掉的字段会被 `ensureClaudeOAuthBodyDefaults` 补回——而是把 `dropSampling` 送到组装层，由 HTTP／cli-hop 与 CRAG print 两条出站路径各自落实。`temperature: 1` 作为真实 Claude Code 的行为仿真仍然保留，只在上游明确拒绝时才省略（#1370）。
+- 修复 cookie 导入在浏览器段之后报 `upstream transport failed`。`kin-worker oauth session-code` 需要的是 `worker.json`（含 `vm_id`、`proxy_url`、`egress_mode`），桥接却传了 `kernel.json`——后者没有 `egress_mode`、`proxy_url` 又是空串，于是构造出一个拒绝所有连接的 client，拨号报 `slot proxy is required`，而错误分类只匹配 `proxy required`（少个 `is`），最终落到默认分支显示成传输失败。授权链接那条走浏览器，不受影响（#1375）。
+- Responses WebSocket 上，`generate: false` 预热返回的 `response.id` 可在同一条连接上续接。此前完成分支把预热跳排除在连接回放缓存之外，下一跳必然 miss 并返回 `previous_response_not_found`，Codex 的 `thread/sample` 走这条路径时不显示后续提示词建议。缓存仍是连接内的，`store: false` 不变成持久化，跨连接引用该 ID 仍然拒绝（#1378）。
+- 文档、CHANGELOG、源码注释与面板文案去掉第三方项目的归因，保留运行标识、导入路径、账号导出类型字符串和脱敏声明；迁移 SQL 一个字节未动，避免改变 migration checksum（#1377）。
+
+## 1.4.167 — 2026-11-20 · 共享出口产物修正
+
+- 修正 amd64 `kin-egress` 的锁定产物。`release.yml` 只在 ARM64 分支从 `worker/` 源码编 Go helper，amd64 的 helper 取自 `deploy/payload.json` 锁定的产物，因此 1.4.166 发出的是「控制面带共享出口、helper 还是改动之前的版本」这一组合：第一台 VM 折叠时 helper 在 `unsupported proxy scheme ""` 上崩溃循环。锁定改为 `payload-2026.11.20-shared-egress`，只换 `bin/kin-egress` 一项，其余 23 个文件重算后字节一致。判断主机上的产物是否够新：`strings -a /opt/vm2api/bin/kin-egress | grep -c 'no route for source'`，0 即为旧产物（#1369）。
+- 默认 CRAG 标准载荷升级到 `3.1.9`：有请求排队且槽位耗尽时，等待工具结果的父会话可让出进程槽，子代理完成后仍可按已验证的历史续接。不自动重启现有槽位。
+- 普通硬正则的关键词命中只拒绝本次请求，不再封设备或会话。此前文档里引用 `keygen` 这类子命令名就会把设备打进封禁阶梯，被拦请求还会留下永久的会话封禁行；与系统提示词改写规则（cd14409c）同理，真实越狱仍会被上游拒绝并进入拒答缓存。NSFW 类别证据确凿（显式内容而非歧义关键词），维持强制封禁，且面板关闭设备封禁开关也不放松。升级后请一并清理既有误封记录（`DELETE /api/panel/refusal-device-blocks`），该修复只拦截新的写入。
+- 出站采样参数与思考模式对齐补齐两种 shape 并加值域校验。`between_tools` 是 effort `off` 时由控制面自己注入的思考模式，此前调用方的 `temperature` 原样送到上游而被 400；`requires_adaptive` 的模型即使请求体不带 `thinking` 也在思考，现在按模型 shape 锁定采样参数。非法值（`temperature: 2.5`、`top_k: -1`）就地纠正而不是透传（#1368）。
 
 ## 1.4.166 — 2026-11-20 · 并发请求内核修复与共享出口
 
 - 重编 `wrap` / `cc` 的 Linux amd64 `kin-kernel`。共享 stdin 的 10 秒超时仅计算实际写入，避免并发请求等待写锁时误触发 CLI 重启；半写失败会关闭旧管道，防止下一条请求接到残缺帧后。
-- 默认 CRAG 标准载荷升级到 `3.1.9`：有请求排队且槽位耗尽时，等待工具结果的父会话可让出进程槽，子代理完成后仍可按已验证的历史续接。不自动重启现有槽位。
 - 新增按槽位可选的「共享出口」：同一节点的多个槽位共用一个 `kin-egress` 与一张 `/20` 网桥，取代一槽一张网络一个 helper。路由表以槽位在网桥内的源地址为键，每条路由自带出口（dialer、DoH 客户端、首选上游、DNS 缓存），因此共享 helper 不等于共享出口身份。槽间互访由 `enable_icc=false` 与 FORWARD 链上的同网桥 DROP 双重拦住，两道屏障都以节点的 `bridge-nf-call-iptables` 为前提，缺失时不进入共享模式。集群侧的地址申领与路由发布在节点锁内完成，复用槽位已记录的地址前先核对该地址当前的持有者，避免把正在运行的槽改号（#1351）。
 - master API key 可以兑换许可并绑定宿主订阅席位。该 key 是运营者自己的自动化、不经浏览器会话，同源校验对它不适用；安装、开机与在线兑换三个入口放开，绑定目标仍只有宿主订阅，面板会话与受管密钥的判定不变（#1360）。
 - 点分 Claude 模型 id 统一规范化。此前是 `fable-5.1`、`fable-5.2`、`opus-5.5` 三个硬编码，每个新 x.y 版本都要手工补，`claude-sonnet-5.5` 与 `claude-haiku-5.5` 一直没补上——直连被判 `model_not_supported`，api 后端把点分 id 原样发给上游。改为在请求入口、目录写入、目录未就绪的透传和 api 调度回落四处统一改写，只处理 `claude-` id 里的 `数字.数字`，`gpt-` / `codex-` 与带日期的 id 不动（#1357）。
 - 内核恢复预算耗尽的槽位在列表与卡片上直接显示「受限 · 内核故障」，不再伪装成「开 · 可用」。此前该故障只存在于内存表里，调度器跳过该槽而面板照常亮绿灯，只能逐台打开「检查连线」才能看到 `kernel_faulted`；现在面板三态判定与调度器看到同一台坏槽，watchdog 恢复后自动回到「开」，更强的死因（吊销、关机、调度关）仍保留自己的文案（#981）。
+- Linux amd64 安装默认准备签名 CRAGGemini 和官方 Antigravity CLI，由管理员兑换激活。Gemini 的 `/vm` 详情可检测和切换代理、拉取模型、发起或取消单轮文本测试。OAuth 使用绑定代理和官方 CLI；公共推理与计费不变。
 
 ## 1.4.165 — 2026-11-20 · 集群 CRAG 更新与出口维护
 
@@ -1068,7 +1123,7 @@
 
 ## 1.4.024 — 2026-10-28
 - #804：准入钩子期间释放后按实时 inflight 递增，避免占位复活。
-- #805：修复请求体省略 `stream`、`Accept: application/json, text/event-stream` 时 `/v1/messages` 等入口返回 SSE：Claude Code 2.1.311 起 auto 模式分类器以非流式发出、按 JSON 解析，SSE 回包让非流式网关（如 Sub2API）判为空消息 502，子代理工具调用全部失败。省略 `stream` 时仅当 `Accept` 对 `text/event-stream` 的偏好高于 `application/json`（q 值，同值算 JSON）才流式；只写 `text/event-stream` 及显式 `stream` 行为不变。
+- #805：修复请求体省略 `stream`、`Accept: application/json, text/event-stream` 时 `/v1/messages` 等入口返回 SSE：Claude Code 2.1.311 起 auto 模式分类器以非流式发出、按 JSON 解析，SSE 回包让非流式网关判为空消息 502，子代理工具调用全部失败。省略 `stream` 时仅当 `Accept` 对 `text/event-stream` 的偏好高于 `application/json`（q 值，同值算 JSON）才流式；只写 `text/event-stream` 及显式 `stream` 行为不变。
 - #809：ARM64 本机推理 CLI 改为原生运行（镜像内建 arm64 CLI overlay，`deploy/arm64-cli.json` 钉 cli-node），修复大请求 stdin 写入超时 / `native stdin write blocked`；Fixes #808。仅本机 ARM64 Docker Claude 槽；共享 amd64 模板、远程节点、KVM、Codex 不变。
 
 已部署机升级：更新 Node 控制面与 web/dist 后重启；无迁移。ARM64 控制镜像主机须拉含本版原生 CLI 的新控制面镜像并重建（随镜像内 `deploy/arm64-cli.json`）；若曾手工挂载原生 CLI，升级时移除旧覆盖改用镜像内置。cli-node / kernel 的 payload.json 哈希未变，不必仅为 #809 做 `fetch:payload` / `wrap-cli/sync`。不要覆盖 routing.json、vms/、data/、.env。
@@ -1643,7 +1698,7 @@
 
 ## 1.3.183 — 2026-10-17
 
-- Opus / Sonnet / Haiku 5.5 的出站过滤对齐 sub2api：历史里出现一块无效 thinking，整段 thinking 与 `redacted_thinking` 都拆掉，只留正文；拆完没有内容的轮删掉。没有 `type` 但带 `thinking` 字段的块也算无效。`redacted_thinking` 有 `data` 就留，否则看签名；非空且非 dummy 的签名不再按 24 字符丢弃。全部有效时不拆。cli-hop 首跳和默认 HTTP 保留路径不变。更早型号仍逐块过滤，`redacted_thinking` 只在签名达到 24 字符时留。
+- Opus / Sonnet / Haiku 5.5 的出站过滤：历史里出现一块无效 thinking，整段 thinking 与 `redacted_thinking` 都拆掉，只留正文；拆完没有内容的轮删掉。没有 `type` 但带 `thinking` 字段的块也算无效。`redacted_thinking` 有 `data` 就留，否则看签名；非空且非 dummy 的签名不再按 24 字符丢弃。全部有效时不拆。cli-hop 首跳和默认 HTTP 保留路径不变。更早型号仍逐块过滤，`redacted_thinking` 只在签名达到 24 字符时留。
 
 已部署机升级：更新 Node 控制面，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`，不必重建槽位容器。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
@@ -1889,9 +1944,9 @@
 - 设置 → 协议 重排为两块：「入站准入」（Claude / GPT 两侧客户端放行，「识别中转来的官方 Claude Code」也移到这里）与「GPT 链路」（总开关在标题栏）。「仅允许 Claude Code 家族请求」原来是页面最底下第六张卡片，容易漏看，现在放在第一块入站准入里，并列出放行条件。
 - 协议页不再提供 Claude 链路的修改：去掉数据面、缓存 TTL、缓存断点。数据面在「内核」页切换；`cache_ttl`、`cache_breakpoints` 只能直接改 `routing.json`，保存协议页时原值保留。
 - 去掉「用量」页：侧栏不再显示，`#/usage` 路由删除，`super` 角色的可见页不再含 `usage`。账号 5h / 7d 限额看「虚拟机」列表的用量窗口；总览的「警告 / 限制」提示改为跳到虚拟机页。`GET /api/panel/usage` 仍保留，总览、集群和虚拟机列表在用。
-- 「仅允许 Claude Code 家族请求」改严：只认 UA 已不够，直连须同时带 Claude Code 的整组请求头（`x-app: cli`、`anthropic-beta` 含 `claude-code-20250219`、Stainless SDK 头、`x-claude-code-session-id`），Messages 还要官方 system + user_id、会话头与 user_id 会话一致、计费块版本与 UA 一致。count_tokens 只验请求头。CLI 自身的 quota 探测只放行固定原样（`max_tokens: 1`、无 system/tools、单条 user 文本 `quota`、会话头与 user_id 一致）；其他 `max_tokens: 1` 的请求按普通请求判，因为输出下限会把它抬成真实补全。健康探测形状（含 sub2api 账号测试）一律 403，不再由探测缓存回答。中转流量跟随「识别中转来的官方 Claude Code」。面板测试对话和内部健康探测（master key 钉槽）不受影响。
-- 蒸馏默认规则不再把 `Respond in the following format: <think>` 当模板。NewAPI 等中转用 `Go-http-client` 转发时带这句正常系统提示，`skip_official` 对不上，之前整段 403 `不允许蒸馏`。已保存的规则加载时也会丢掉这句，和裸 `<think>` 一样。收割针、指纹和「提取思维链」这类规则不变。
-- 「识别中转来的官方 Claude Code」加强：系统里有官方计费块（`x-anthropic-billing-header` 和 `cc_entrypoint`，且不是 oh-my-pi）就按官方处理，不再同时要求 `user_id`。NewAPI 用 `Go-http-client` 转发时留着计费块、丢掉 metadata，之前不算官方，蒸馏和其他官方绕过都没走。没有计费块的中转仍要客户端 beta、官方 system 和合法 user_id。`local-agent` 仍不算官方。
+- 「仅允许 Claude Code 家族请求」改严：只认 UA 已不够，直连须同时带 Claude Code 的整组请求头（`x-app: cli`、`anthropic-beta` 含 `claude-code-20250219`、Stainless SDK 头、`x-claude-code-session-id`），Messages 还要官方 system + user_id、会话头与 user_id 会话一致、计费块版本与 UA 一致。count_tokens 只验请求头。CLI 自身的 quota 探测只放行固定原样（`max_tokens: 1`、无 system/tools、单条 user 文本 `quota`、会话头与 user_id 一致）；其他 `max_tokens: 1` 的请求按普通请求判，因为输出下限会把它抬成真实补全。健康探测形状（含账号连通性测试）一律 403，不再由探测缓存回答。中转流量跟随「识别中转来的官方 Claude Code」。面板测试对话和内部健康探测（master key 钉槽）不受影响。
+- 蒸馏默认规则不再把 `Respond in the following format: &lt;think&gt;` 当模板。中转用 `Go-http-client` 转发时带这句正常系统提示，`skip_official` 对不上，之前整段 403 `不允许蒸馏`。已保存的规则加载时也会丢掉这句，和裸 `&lt;think&gt;` 一样。收割针、指纹和「提取思维链」这类规则不变。
+- 「识别中转来的官方 Claude Code」加强：系统里有官方计费块（`x-anthropic-billing-header` 和 `cc_entrypoint`，且不是 oh-my-pi）就按官方处理，不再同时要求 `user_id`。有的中转用 `Go-http-client` 转发时留着计费块、丢掉 metadata，之前不算官方，蒸馏和其他官方绕过都没走。没有计费块的中转仍要客户端 beta、官方 system 和合法 user_id。`local-agent` 仍不算官方。
 
 已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。开着该开关、又依赖第三方健康检查或只带 UA 的客户端的部署，升级后这些请求会变成 403。
 
@@ -1921,7 +1976,7 @@
 
 ## 1.3.149 — 2026-10-12
 
-- 控制台入口（`/cc`、`/console`）改为公开欢迎页 `#/welcome`：介绍、能力、三步快速开始和 Claude Code / Codex / curl 接入片段，版式参照 new-api 新版首页，配色只作用于欢迎页和登录页，控制台主题不变。登录改为独立页面 `#/login`，右上角「登录」进入；`/cc#/login`、`/console/#/login` 旧地址照常可用，未登录打开受保护页面会带 `redirect` 到登录页，登录后回原页面。
+- 控制台入口（`/cc`、`/console`）改为公开欢迎页 `#/welcome`：介绍、能力、三步快速开始和 Claude Code / Codex / curl 接入片段，配色只作用于欢迎页和登录页，控制台主题不变。登录改为独立页面 `#/login`，右上角「登录」进入；`/cc#/login`、`/console/#/login` 旧地址照常可用，未登录打开受保护页面会带 `redirect` 到登录页，登录后回原页面。
 - 登录后欢迎页显示首配清单：修改默认密码、出口代理、槽位账号、可调度槽位、`sk-vm-` 密钥、首个成功请求，完成态全部来自网关真实数据，按角色裁剪（租户只算自己的槽和密钥）。首次登录且未完成时落在欢迎页；「跳过引导」或「完成引导」后登录直接进总览，用户菜单「欢迎与引导」可重新打开。
 - 新增 `GET/PUT /api/panel/onboarding`：返回各步完成态、`needs_welcome` 和 `base_url`（仅 `PUBLIC_BASE_URL` 设置时），`PUT { action: complete | dismiss | reset }` 按用户写 SQLite `settings.onboarding_state`。admin / super / user 都可调用。
 
@@ -1990,7 +2045,7 @@
 
 ## 1.3.140 — 2026-10-11
 
-- 设置 → 协议新增「仅允许 Claude Code 家族请求」（`routing.compatibility.claude_code_only`，默认关）。开启后，Claude 模型的请求只放行官方 Claude Code：识别与人设/拦截路径共用 `isOfficialClaudeCodeTraffic`，「识别中转来的官方 Claude Code」开启时也放行被中转的官方流量；官方 `claude-cli` UA 的 `max_tokens=1` 探测与 `count_tokens` 同 sub2api 放行。其余（第三方客户端、`/v1/chat/completions` 等 OpenAI 格式入口调 Claude）在选号前返回 403 `claude_code_only`，`count_tokens` 同样拦截。GPT 模型与 Codex 搜索不受影响。该错误归「请求格式」，不计 SLA 失败；非布尔值 PUT 400。
+- 设置 → 协议新增「仅允许 Claude Code 家族请求」（`routing.compatibility.claude_code_only`，默认关）。开启后，Claude 模型的请求只放行官方 Claude Code：识别与人设/拦截路径共用 `isOfficialClaudeCodeTraffic`，「识别中转来的官方 Claude Code」开启时也放行被中转的官方流量；放行带官方 `claude-cli` UA 的 `max_tokens=1` 探测与 `count_tokens` 请求。其余（第三方客户端、`/v1/chat/completions` 等 OpenAI 格式入口调 Claude）在选号前返回 403 `claude_code_only`，`count_tokens` 同样拦截。GPT 模型与 Codex 搜索不受影响。该错误归「请求格式」，不计 SLA 失败；非布尔值 PUT 400。
 - 仓库只保留源码：`web/dist`、`bin/kin-*`、`share/wrap-cli` 的 ELF / glibc、`share/crag` 不再进 git，并已从全部历史中清除（所有 tag 的提交号随之改变）。控制台与 `kin-worker` / `kin-egress` 在镜像构建与 CI 中由源码编译；闭源 kernel、`kin-oauth-auth`、`cli-node`、`cc-node`、crag kernel 与 glibc shim 放在独立的 payload Release，由 `deploy/payload.json` 按 sha256 钉住，`npm run fetch:payload` 下载并校验。镜像额外带上 crag kernel，入口写进 `share/crag`。版本 Release 附件名不变。
 - amd64 源码安装（`install.sh --from-source` / 目录有 `.git`）此前只按 `docker-compose.yml` 拉 ghcr 镜像，并没有构建本机 checkout。现在安装 / 升级会在 `.env` 写 `COMPOSE_FILE=docker-compose.yml:docker-compose.build.yml`（已有值不覆盖），按 checkout 构建；面板一键更新不再重复叠加同一个构建文件。
 
@@ -2573,7 +2628,7 @@
 
 ## 1.3.72 — 2026-09-28
 
-- 预热拦截改为照搬 sub2api `detectInterceptType`：haiku `max_tokens=1` 探测需 `claude-cli` UA；messages/system 必须是 `{type,text}` 数组，含字符串 content 的请求不拦截；模拟响应（含流式）与 sub2api 一致。
+- 预热拦截规则：haiku `max_tokens=1` 探测需 `claude-cli` UA；messages/system 必须是 `{type,text}` 数组，含字符串 content 的请求不拦截；命中后直接返回模拟响应，支持流式和非流式。
 - 额外一条保护：带 tools 的请求一律不拦截，避免长对话里提到 `Warmup` 或标题生成句被误回 "New Conversation"。
 
 已部署机升级：覆盖控制面并重启 Node 一次。不必 `wrap-cli/sync`。不要 `docker rm` 槽。不要覆盖 live `routing.json`。
@@ -2587,10 +2642,10 @@
 
 ## 1.3.70 — 2026-09-28
 
-- 探测/测试请求不再占主会话席位：单条短 user、无 tools 的一次性请求（sub2api 账号测试、new-api 渠道测试、验证脚本）跳过 session seat，只占并发。粘性身份不变。
+- 探测/测试请求不再占主会话席位：单条短 user、无 tools 的一次性请求（如账号连通性测试、渠道测试、验证脚本）跳过 session seat，只占并发。粘性身份不变。
 - 新增「拦截预热请求」全局开关（设置 → 探测，默认关）：仅 Claude 模型 `/v1/messages`，Claude Code 的 Warmup、标题生成、SUGGESTION MODE、haiku `max_tokens=1` 连通性检查在选号前直接返回模拟响应。流式 haiku 探测与非流式一致返回 `#` / `max_tokens`。
 - 新增 `max_tokens` 下限（默认开，128，可关、可改）：所有 Claude 出站路径（含 chat/responses 转换）生效；开启 thinking 时保证 `max_tokens` 大于 `budget_tokens`。cli-hop 原有 ≤64→1024 保留。
-- 健康缓存兼容 new-api / sub2api / CLIProxyAPI：识别 new-api 不带 max_tokens 的 chat/responses 测试和 sub2api 账号测试载荷；Claude 与 GPT 分开快照（GPT 探测模型留空则不缓存 GPT）；Chat 流式末块带 usage 与 `[DONE]`，Responses 流式补 `response.created` / `response.completed`。
+- 健康缓存识别不带 `max_tokens` 的 Chat / Responses 测试和账号连通性测试载荷；Claude 与 GPT 分开快照（GPT 探测模型留空则不缓存 GPT）；Chat 流式末块带 usage 与 `[DONE]`，Responses 流式补 `response.created` / `response.completed`。
 - 新增 `GET/HEAD /healthz`（无鉴权，`{"status":"ok"}`）。
 - 设置「探测」页改为结构化开关与快照状态。
 
@@ -2842,7 +2897,7 @@
 
 ## 1.3.38 — 2026-09-24
 
-- 额度用尽现在会挡住调度（对齐 sub2api `RateLimitService`）。kernel cli-hop 先回 200 再流出 `event: error`，也会把额度用尽包成 502 `provider_error`。传输层按报错内容还原成 429 / 529 / 401，不再落进 `http_200` 直接停止。
+- 额度用尽现在会挡住调度。kernel cli-hop 先回 200 再流出 `event: error`，也会把额度用尽包成 502 `provider_error`。传输层按报错内容还原成 429 / 529 / 401，不再落进 `http_200` 直接停止。
 - `You've hit your limit · resets 11am (America/New_York)` 按原文时区解析出 reset，写进 `rate_limit_reset_at`。解析不出就冷却 30 分钟，并触发一次 `/usage` 探测。529 写 `overload_until`，10 分钟。不再沿用已过期的旧 reset。
 - 调度先看 `rate_limit_reset_at` / `overload_until`。被动用量、选号时的额度同步、成功请求都不能提前解除。只有到了 reset，或上游再回 `5h-status=allowed`，才解除。被挡住的号会解掉会话绑定。
 - 空跳（没有任何可见输出）先同号重试一次，仍然失败就暂停该号 60 秒并切号，不再直接回 502。诊断固定 vm 时保持原来的行为。额度用尽、过载、鉴权错误不再 SIGKILL 槽内 CLI。
@@ -2866,7 +2921,7 @@
 
 ## 1.3.35 — 2026-09-23
 
-- 加强经中继转发的官方 Claude Code 识别。sub2api 只在 body 还带着 billing 块时认 `Go-http-client`；有的中继会把 billing 头剥掉，只留下 `anthropic-beta: claude-code-20250219`、官方 `user_id` 和官方 system 正文。这类请求现在也算官方流量：不注入 persona、不改 system 前缀。只有身份那一行、没有这个 beta 的第三方请求仍然不认。
+- 加强经中继转发的官方 Claude Code 识别。有的中继会把 billing 头剥掉，只留下 `anthropic-beta: claude-code-20250219`、官方 `user_id` 和官方 system 正文。通过 `Go-http-client` 转发、具备这些特征的请求现在也算官方流量：不注入 persona、不改 system 前缀。只有身份那一行、没有这个 beta 的第三方请求仍然不认。
 
 已部署机升级：只覆盖控制面并重启 Node 一次，不需要 `wrap-cli/sync`。二进制未变。不要 `docker rm` 槽。
 
@@ -2941,7 +2996,7 @@
 
 ## 1.3.24 — 2026-09-22
 
-- cli-hop 对齐 sub2api 默认：不再改写 messages 上的 `cache_control`，system 断点也保留。只给最后一个非延迟工具补 5m 断点
+- cli-hop 默认不再改写 messages 上的 `cache_control`，system 断点也保留。只给最后一个非延迟工具补 5m 断点
 - 仍钉住 `<total_tokens>`。kernel 继续 `preserve_cache_breakpoints`，不重打断点
 
 已部署机升级：只更新控制面并重启 Node 一次。不必 `wrap-cli/sync`。不要 `docker rm` 槽。
@@ -3287,7 +3342,7 @@ thinking-only 残包不再当 HTTP 200；一键安装与 HTTP 面板登录加固
 
 控制面：版本检查与一键更新。不必换槽内 kernel。
 
-- `deploy/install.sh`：安装 / 更新 / 检查 / changelog / 状态（参考 sub2api 与 CLIProxyAPI）
+- `deploy/install.sh`：安装 / 更新 / 检查 / changelog / 状态
 - 面板 `GET /api/panel/version`、`GET /api/panel/changelog`、`POST /api/panel/update`；`GET /me` 带 `version`
 - 设置页「关于」：当前版本、GitHub 最新 Release、changelog、复制一键命令
 - 镜像 COPY `VERSION` / `CHANGELOG.md`；已挂 `docker.sock` 时可由面板拉起宿主机升级助手
@@ -3345,7 +3400,7 @@ thinking-only 残包不再当 HTTP 200；一键安装与 HTTP 面板登录加固
 
 ## 1.2.0 — 2026-09-19
 
-messages 缓存断点对齐 sub2api/Parrot。
+messages 缓存断点规则：
 
 - 最后一条 + 仅当 messages≥4 打倒数第二个 user
 - cli-hop 丢掉 last 后留下倒数第二个 user，wrap CLI 重打当前 last user，不再重复

@@ -179,7 +179,7 @@ export function ProviderChainPopover({
         <div className='border-b p-3'>
           <div className='flex items-center justify-between'>
             <h4 className='flex items-center gap-1.5 text-sm font-semibold'>
-              供应商决策链
+              虚拟机决策链
             </h4>
             <Badge variant='outline' className='text-[10px]'>
               {chain.length} 次

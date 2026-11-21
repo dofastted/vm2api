@@ -912,7 +912,7 @@ export function normalizeThinkingByPolicy(body = {}) {
   }
 
   if (type === 'enabled') {
-    // OAuth (sub2api): keep thinking.enabled. convert_to_adaptive is ignored.
+    // OAuth: keep thinking.enabled. convert_to_adaptive is ignored.
     const action = params.on_enabled || 'passthrough'
     if (action === 'strip') {
       delete body.thinking

@@ -11,7 +11,6 @@ import {
   CAI_AUTHORIZE_URL,
   CLIENT_ID,
   FULL_OAUTH_SCOPE,
-  INFERENCE_ONLY_SCOPE,
   OAUTH_REQUEST_TIMEOUT_MS,
   REDIRECT_URI,
   SETUP_TOKEN_TTL_SECONDS,
@@ -89,7 +88,8 @@ async function loadLocalAuthForTest() {
  */
 export function buildSetupTokenAuthorizeURL(state, codeChallenge) {
   const encodedRedirectURI = encodeURIComponent(REDIRECT_URI)
-  const encodedScope = encodeURIComponent(INFERENCE_ONLY_SCOPE)
+  // Identity needs user:profile, so the mint link carries the login scope too.
+  const encodedScope = encodeURIComponent(FULL_OAUTH_SCOPE)
   return `${CAI_AUTHORIZE_URL}?code=true&client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodedRedirectURI}&scope=${encodedScope}&code_challenge=${codeChallenge}&code_challenge_method=S256&state=${state}`
 }
 
@@ -215,13 +215,13 @@ export function publicImportError(raw, code = '') {
   }
   if (/state_mismatch/i.test(s)) return 'OAuth state 校验失败，请重新生成授权链接后再导入。'
   if (isClientAttestationRequired(s)) {
-    return '上游拒绝了这次 authorize 的客户端指纹（missing_client_attestation）：闸门量的是 TLS/HTTP2 指纹，cookie 段必须经 kin-worker 的 Chrome 传输（oauth session-code）。请确认槽位里的 kin-worker 是本次构建、kernel config 可读；临时也可改用「授权链接」在浏览器完成授权。'
+    return '上游拒绝了这次 authorize 的客户端指纹（missing_client_attestation）：闸门量的是 TLS/HTTP2 指纹，cookie 段必须经 kin-worker 的 Chrome 传输（oauth session-code）。请确认槽位里的 kin-worker 是本次构建、/run/kin/worker.json 可读；临时也可改用「授权链接」在浏览器完成授权。'
   }
   if (/worker_session_code_unsupported/i.test(s)) {
     return '槽位里的 kin-worker 太旧，没有 oauth session-code 操作（cookie 段要靠它的 Chrome TLS 指纹才能过 authorize）。请把 kin-worker 更新到本次构建后重试。'
   }
   if (/worker_session_code_config/i.test(s)) {
-    return '槽位里的 kernel config 读不到，cookie 段没法用它选出口（Chrome TLS 传输需要这一步）。请检查槽位 /run/kin/kernel.json 是否可读，或改用「授权链接」。'
+    return '槽位里的 worker.json 读不到或字段不全（需要 vm_id、绝对的 socket/credential 路径），cookie 段没法用它选出口。请检查槽位 /run/kin/worker.json，或改用「授权链接」。'
   }
   if (isOriginRejected(s)) {
     return '授权端点拒绝了来源头（Origin not allowed）：claude.ai 与 claude.com 两套来源都被拒。上游前端域名可能再次变更，请更新 src/lib/oauth/oauth-contract.mjs 里的授权来源常量。'

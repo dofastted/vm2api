@@ -17,6 +17,19 @@ import {
   revokePanelSessionsForUser,
   getPanelAdmin,
 } from '../core/security.mjs'
+import {
+  TwoFactorError,
+  beginTwoFactorSetup,
+  confirmTwoFactorSetup,
+  consumeTwoFactorChallenge,
+  disableTwoFactor,
+  isTwoFactorEnabled,
+  issueTwoFactorChallenge,
+  regenerateRecoveryCodes,
+  twoFactorEnabledFor,
+  twoFactorStatus,
+  verifyTwoFactorCode,
+} from '../core/panel-2fa.mjs'
 import { loadDistillRules, saveDistillRules, validateDistillPatch } from '../core/distill-detect.mjs'
 import { applyRefusalGuardPatch, refusalGuardPolicy } from '../core/refusal-guard.mjs'
 import {
@@ -204,7 +217,13 @@ import {
   startHostUpgrade,
 } from './release.mjs'
 import { downloadReleaseKernel, kernelReleaseHttpStatus, listKernelReleaseVersions } from './release-kernel.mjs'
-import { describeKernelCatalog, listKernelReleases, pullKernelRelease, selectKernelRelease } from './kernel-catalog.mjs'
+import {
+  cragReleasePin,
+  describeKernelCatalog,
+  listKernelReleases,
+  pullKernelRelease,
+  selectKernelRelease,
+} from './kernel-catalog.mjs'
 import {
   hasKernelInstallSafetyHold,
   installKernelTargets,
@@ -321,7 +340,14 @@ import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
-import { mergeNotifyConfig, publicNotifyConfig, publicRoutingNotify, sendNotifyTest } from './notify.mjs'
+import {
+  isNotifyChannel,
+  mergeNotifyConfig,
+  publicNotifyConfig,
+  publicRoutingNotify,
+  sendNotifyTest,
+  validateNotifyRoutingPatch,
+} from './notify.mjs'
 import { UsageLogsView } from '../db/repos/usage-logs-view.mjs'
 import {
   applyOnboardingAction,
@@ -719,6 +745,7 @@ export function createPanelHandler(ctx) {
     json: ctx.json,
     readBody: ctx.readBody,
     proxyPool: () => ctx.proxyPool,
+    terminal: ctx.geminiTerminal,
   })
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
@@ -1140,8 +1167,12 @@ export function createPanelHandler(ctx) {
     } catch {
       vms = []
     }
+    // One snapshot for every slot in the inventory: the risk page only reads each
+    // slot's quota, and resolving them one at a time re-read the account table
+    // once per slot (#1043).
+    const accountSnap = panel.readAccountSnapshot(accountQuota)
     const inventory = buildScopeInventory(
-      vms.map((vm) => ({ ...vm, quota: panel.findAccount(accountQuota, vm)?.unified || null })),
+      vms.map((vm) => ({ ...vm, quota: panel.findAccount(accountQuota, vm, accountSnap)?.unified || null })),
       selectedKeys,
     )
     return {
@@ -1155,7 +1186,7 @@ export function createPanelHandler(ctx) {
     const keys = (config.endpoints || []).flatMap((endpoint) => endpoint.keys || [])
     if (!keys.length) return config
     try {
-      const rows = new JevUsageRepo().configuredKeys(keys)
+      const rows = new JevUsageRepo().configuredKeyStatuses(keys)
       const byFp = new Map(rows.map((row) => [row.key_fingerprint, row]))
       return {
         ...config,
@@ -1833,16 +1864,11 @@ export function createPanelHandler(ctx) {
     }
 
     // ========== Panel login (public) ==========
-    if (req.method === 'POST' && p === '/api/panel/login') {
-      const body = await readBody(req, 4096)
-      const username = body.username || body.user || body.u || ''
-      const password = body.password || body.pass || body.p || ''
-      const authed = verifyPanelLogin(username, password)
+    // Hands out the session cookie. Shared by the password-only path and by the
+    // second step of two-factor sign-in, which has no password to replay.
+    const grantPanelSession = (authed, { password = '' } = {}) => {
       let buyerId = authed?.id
-      if (!authed) {
-        return json(res, 401, { ok: false, error: { message: '用户名或密码错误', type: 'auth' } })
-      }
-      if (authed.source === 'env') {
+      if (authed.source === 'env' && password) {
         try {
           buyerId = panelUsers.bootstrapFromEnv({ username: authed.username, password })?.id
         } catch {}
@@ -1860,6 +1886,82 @@ export function createPanelHandler(ctx) {
         views: mePayload({ panelUser: me.user, panelRole: me.role }).views,
         capabilities: mePayload({ panelUser: me.user, panelRole: me.role }).capabilities,
         expires_in: 7 * 24 * 3600,
+      })
+    }
+    const twoFactorFailure = (err) =>
+      json(res, err instanceof TwoFactorError ? err.status : 400, {
+        ok: false,
+        error: {
+          message: String(err?.message || '验证失败'),
+          code: err instanceof TwoFactorError ? err.code : 'totp_failed',
+          type: 'auth',
+        },
+      })
+
+    if (req.method === 'POST' && p === '/api/panel/login') {
+      const body = await readBody(req, 4096)
+      const username = body.username || body.user || body.u || ''
+      const password = body.password || body.pass || body.p || ''
+      const authed = verifyPanelLogin(username, password)
+      if (!authed) {
+        return json(res, 401, { ok: false, error: { message: '用户名或密码错误', type: 'auth' } })
+      }
+      let needsCode = false
+      try {
+        needsCode = isTwoFactorEnabled(authed.username)
+      } catch (e) {
+        return twoFactorFailure(e)
+      }
+      if (needsCode) {
+        // A client may post the code up front; otherwise it gets a challenge
+        // and posts it to /api/panel/login/totp. No session until a code lands.
+        const code = body.code || body.totp || body.otp || ''
+        if (!code) {
+          const challenge = issueTwoFactorChallenge(authed.username, {
+            claims: { role: authed.role, id: authed.id || null, source: authed.source || 'db' },
+          })
+          return json(res, 401, {
+            ok: false,
+            totp_required: true,
+            challenge: challenge.challenge,
+            expires_in: challenge.expires_in,
+            error: { message: '请输入两步验证码', code: 'totp_required', type: 'auth' },
+          })
+        }
+        try {
+          verifyTwoFactorCode(authed.username, code)
+        } catch (e) {
+          return twoFactorFailure(e)
+        }
+      }
+      return grantPanelSession(authed, { password })
+    }
+    if (req.method === 'POST' && p === '/api/panel/login/totp') {
+      const body = await readBody(req, 4096)
+      let name = ''
+      let claims = {}
+      try {
+        const opened = consumeTwoFactorChallenge(body.challenge || body.token || '')
+        name = opened.username
+        claims = opened.claims
+      } catch (e) {
+        return twoFactorFailure(e)
+      }
+      // Re-read the account: a role change or a disable since the password step wins.
+      const fresh = panelUsers.getByUsername(name)
+      if (fresh && fresh.enabled === false) {
+        return json(res, 403, { ok: false, error: { message: '账号已停用', code: 'user_disabled', type: 'auth' } })
+      }
+      try {
+        verifyTwoFactorCode(name, body.code || body.totp || body.otp || '')
+      } catch (e) {
+        return twoFactorFailure(e)
+      }
+      return grantPanelSession({
+        username: fresh?.username || name,
+        role: fresh?.role || claims.role || 'admin',
+        id: fresh?.id || claims.id || null,
+        source: fresh ? 'db' : claims.source === 'env' ? 'env' : 'db',
       })
     }
     if (req.method === 'POST' && p === '/api/panel/logout') {
@@ -1909,6 +2011,58 @@ export function createPanelHandler(ctx) {
         const version = runningVersion
         const payload = { ...me, version }
         return json(res, 200, { ok: true, ...payload, data: payload })
+      }
+      // ========== Two-factor for the signed-in account ==========
+      // Before the RBAC gate on purpose: every role manages its own 2FA. A
+      // master API key is not an account, so it has nothing to manage here.
+      if (p === '/api/panel/2fa' || p.startsWith('/api/panel/2fa/')) {
+        const self = String(req.panelUser || '')
+        if (!self) {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'panel_session_required', message: '请使用面板账号登录后再管理两步验证' },
+          })
+        }
+        // Changing a second factor must prove the first one again, so a
+        // hijacked session cannot silently rebind or remove it.
+        const reauth = (body) => {
+          const password = body?.password || body?.pass || ''
+          if (!password) throw new TwoFactorError('请输入当前密码', 'password_required', 400)
+          if (!verifyPanelLogin(self, password)) throw new TwoFactorError('当前密码不正确', 'password_invalid', 403)
+        }
+        try {
+          if (req.method === 'GET' && p === '/api/panel/2fa') {
+            return json(res, 200, panel.ok(twoFactorStatus(self)))
+          }
+          if (req.method === 'POST' && p === '/api/panel/2fa/setup') {
+            const body = await readBody(req, 4096).catch(() => ({}))
+            reauth(body)
+            return json(res, 200, panel.ok(beginTwoFactorSetup(self, { issuer: 'vm2api', account: self })))
+          }
+          if (req.method === 'POST' && p === '/api/panel/2fa/enable') {
+            const body = await readBody(req, 4096).catch(() => ({}))
+            const result = confirmTwoFactorSetup(self, body?.code || body?.totp || body?.otp || '')
+            // Other sessions were opened without a second factor; make them re-authenticate.
+            revokePanelSessionsForUser(self, { exceptToken: extractPanelToken(req) })
+            return json(res, 200, panel.ok({ ...twoFactorStatus(self), ...result }))
+          }
+          if (req.method === 'POST' && p === '/api/panel/2fa/disable') {
+            const body = await readBody(req, 4096).catch(() => ({}))
+            reauth(body)
+            verifyTwoFactorCode(self, body?.code || body?.totp || body?.otp || '')
+            disableTwoFactor(self)
+            return json(res, 200, panel.ok({ ...twoFactorStatus(self), disabled: true }))
+          }
+          if (req.method === 'POST' && p === '/api/panel/2fa/recovery') {
+            const body = await readBody(req, 4096).catch(() => ({}))
+            reauth(body)
+            const result = regenerateRecoveryCodes(self)
+            return json(res, 200, panel.ok({ ...twoFactorStatus(self), ...result }))
+          }
+        } catch (e) {
+          return twoFactorFailure(e)
+        }
+        return json(res, 404, { ok: false, error: { code: 'not_found', message: 'Not found' } })
       }
       const gate = authorizePanelRoute(req.method, p, panelIdentity(req).role)
       if (!gate.ok) {
@@ -2123,7 +2277,13 @@ export function createPanelHandler(ctx) {
         return json(res, result.status, panel.ok(result.data))
       }
       if (req.method === 'GET' && p === '/api/panel/users') {
-        return json(res, 200, panel.ok({ items: panelUsers.list() }))
+        const items = panelUsers.list()
+        const twoFactor = twoFactorEnabledFor(items.map((item) => item.username))
+        return json(
+          res,
+          200,
+          panel.ok({ items: items.map((item) => ({ ...item, two_factor: !!twoFactor.get(item.username) })) }),
+        )
       }
       if (req.method === 'POST' && p === '/api/panel/users') {
         const body = await readBody(req, 8192).catch(() => ({}))
@@ -2182,6 +2342,18 @@ export function createPanelHandler(ctx) {
             error: { message: String(e.message || e), code: e.code || 'delete_failed' },
           })
         }
+      }
+      if (req.method === 'DELETE' && /^\/api\/panel\/users\/[^/]+\/2fa$/.test(p)) {
+        // Admin unlock for a user who lost both the authenticator and the
+        // recovery codes. 2FA is cleared, so the next sign-in is password-only.
+        const id = p.split('/')[4]
+        const target = panelUsers.getById(id)
+        if (!target) return json(res, 404, { ok: false, error: { message: 'user not found', code: 'not_found' } })
+        const reset = disableTwoFactor(target.username)
+        // Sessions predating the reset keep a second factor the account no
+        // longer has; make the user sign in again.
+        revokePanelSessionsForUser(target.username)
+        return json(res, 200, panel.ok({ username: target.username, reset }))
       }
       if (req.method === 'GET' && p === '/api/panel/vm-pools') {
         return json(res, 200, panel.ok({ pools: vmPoolsFor(apiKeyStore.db).list() }))
@@ -3051,6 +3223,7 @@ export function createPanelHandler(ctx) {
           200,
           panel.ok({
             kernels: describeKernelCatalog(cfg.paths.project),
+            crag_pin: cragReleasePin(cfg.paths.project),
             licenses,
             install_licenses: installLicenses,
             installations,
@@ -3099,7 +3272,8 @@ export function createPanelHandler(ctx) {
         if (
           !body ||
           !['cli-node', 'crag'].includes(body.kernel) ||
-          (body.tag != null && typeof body.tag !== 'string')
+          (body.tag != null && typeof body.tag !== 'string') ||
+          (body.latest != null && typeof body.latest !== 'boolean')
         ) {
           return json(res, 400, {
             ok: false,
@@ -3108,7 +3282,9 @@ export function createPanelHandler(ctx) {
         }
         const result = await pullKernelRelease(
           cfg.paths.project,
-          { kernel: body.kernel, tag: body.tag || '', latest: true },
+          // The manual two-step flow still tracks the newest release. Only a
+          // caller that explicitly asks for `latest: false` gets the pin.
+          { kernel: body.kernel, tag: body.tag || '', latest: body.latest !== false },
           { fetchImpl: ctx.fetchImpl },
         )
         if (!result.ok)
@@ -4384,7 +4560,7 @@ export function createPanelHandler(ctx) {
         return await handleVmTestScheduleSync(req, res)
       }
 
-      // POST /api/panel/vms/:id/test-chat — sub2api-style model connectivity test
+      // POST /api/panel/vms/:id/test-chat — test model connectivity through this VM
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/test-chat$/.test(p)) {
         const id = p.split('/')[4]
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
@@ -4448,7 +4624,7 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok({ restored: restored.length }))
       }
 
-      // POST /api/panel/vms/:id/schedulable — sub2api-style schedule toggle
+      // POST /api/panel/vms/:id/schedulable — enable or disable scheduling for this VM
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/schedulable$/.test(p)) {
         const id = p.split('/')[4]
         if (!getVm(cfg.paths.project, id)) {
@@ -6269,7 +6445,7 @@ export function createPanelHandler(ctx) {
         if (!oauth?.access_token && !oauth?.refresh_token && !oauth?.api_key) {
           return json(res, 400, {
             ok: false,
-            error: { code: 'credential_required', message: 'sub2api JSON 需要 access_token、refresh_token 或 api_key' },
+            error: { code: 'credential_required', message: '账号 JSON 需要 access_token、refresh_token 或 api_key' },
           })
         }
         const committed = await commitImportedOauth({
@@ -6729,6 +6905,7 @@ export function createPanelHandler(ctx) {
         if (body?.compatibility) body.compatibility = canonicalPersonaCompat(body.compatibility)
         const previousRoutingConfig = structuredClone(ctx.routingConfig)
         try {
+          validateNotifyRoutingPatch(body)
           if (body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')) {
             validateOpenAIQuotaPatch(body.codex.quota)
           }
@@ -7046,22 +7223,18 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && p === '/api/panel/notify/test') {
         const body = await readBody(req, 64 * 1024)
         const channel = String(body.channel || '').toLowerCase()
-        if (channel !== 'email' && channel !== 'telegram' && channel !== 'wecom') {
+        if (!isNotifyChannel(channel)) {
           return json(res, 400, {
             ok: false,
             error: {
               type: 'invalid_request_error',
               code: 'missing_field',
-              message: 'channel must be email, telegram or wecom',
+              message: '请选择有效的通知渠道',
               param: 'channel',
             },
           })
         }
-        const trial = mergeNotifyConfig(ctx.routingConfig.notify, {
-          email: body.email,
-          telegram: body.telegram,
-          wecom: body.wecom,
-        })
+        const trial = mergeNotifyConfig(ctx.routingConfig.notify, { [channel]: body[channel] })
         try {
           const result = await sendNotifyTest(trial, channel, {
             baseUrl: cfg.base_url,
@@ -7190,20 +7363,21 @@ export function createPanelHandler(ctx) {
           })
         // DNS changes must reach running egress helpers; slots stay intact.
         const egress = []
-        if (
-          ((body.dns_primary != null && body.dns_primary !== previousConfig.dns_primary) ||
-            (body.dns_disable_svcb_https != null &&
-              body.dns_disable_svcb_https !== previousConfig.dns_disable_svcb_https)) &&
-          egressEnabled() &&
-          process.env.KIN_CRS_MOCK !== '1'
-        ) {
+        const upstreamChanged = body.dns_primary != null && body.dns_primary !== previousConfig.dns_primary
+        // The pool-level SVCB/HTTPS switch is a bulk write over the proxy rows,
+        // so only the outlets it actually flipped need a new helper config —
+        // reloading the whole pool for a no-op would cut exits for nothing.
+        const flipped = new Set(result.dns_disable_svcb_https_changed || [])
+        if ((upstreamChanged || flipped.size) && egressEnabled() && process.env.KIN_CRS_MOCK !== '1') {
           const dnsUpstream = dnsUpstreamChain(result.config.dns_primary)
-          const dnsEmptyTypes = result.config.dns_disable_svcb_https ? [64, 65] : []
           for (const proxy of proxyPool.snapshot().proxies) {
             if (isLocalEgressProxy(proxy) || !proxy.bound_vm_ids?.length) continue
+            if (!upstreamChanged && !flipped.has(proxy.id)) continue
+            // dnsEmptyTypes is deliberately NOT passed: startProxyEgress reads
+            // it off each proxy, so changing the shared upstream cannot flatten
+            // every outlet onto one override.
             const r = await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(proxy.id), {
               dnsUpstream,
-              dnsEmptyTypes,
             })
             egress.push({ proxy_id: proxy.id, ok: r.ok, error: r.ok ? null : r.error })
           }
@@ -7222,7 +7396,16 @@ export function createPanelHandler(ctx) {
         // Forward only the keys the caller actually sent — update() reads
         // presence, not value, to tell "leave alone" from "clear".
         const patch = {}
-        for (const key of ['scheme', 'host', 'port', 'username', 'password', 'label', 'domain_forward']) {
+        for (const key of [
+          'scheme',
+          'host',
+          'port',
+          'username',
+          'password',
+          'label',
+          'domain_forward',
+          'dns_disable_svcb_https',
+        ]) {
           if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
         }
         const result = proxyPool.update(id, patch)
@@ -7231,14 +7414,17 @@ export function createPanelHandler(ctx) {
           const type = status === 404 ? 'not_found_error' : 'invalid_request_error'
           return json(res, status, { ok: false, error: { type, code: result.error, message: result.error } })
         }
-        // Hostname mode and SOCKS upstream both live inside kin-egress.
+        // Hostname mode, SOCKS upstream and the SVCB/HTTPS DNS override all
+        // live inside kin-egress.
         // Domain-forward-only: restart the helper; slots keep the same bridge.
         // Same-id connection change: network name is unchanged so reload would
         // only docker restart — the helper must pick up the new proxy_url or
         // transparent traffic keeps the old exit.
+        // DNS-override-only: the helper's egress.json changes, but worker.json
+        // does not carry the field, so the bound slots below stay untouched.
         let egress = null
         if (
-          (result.domain_forward_changed || result.connection_changed) &&
+          (result.domain_forward_changed || result.dns_disable_svcb_https_changed || result.connection_changed) &&
           egressEnabled() &&
           process.env.KIN_CRS_MOCK !== '1' &&
           (result.proxy.bound_vm_ids || []).length

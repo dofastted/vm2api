@@ -71,7 +71,11 @@ export function VmEnvironmentCard({
           <span className='text-xs text-muted-foreground'>
             {proxyZone
               ? `${proxyZone}${geoText ? ` · ${geoText}` : ''}`
-              : '未检测（到代理池点「地理」）'}
+              : !proxy
+                ? '暂无代理出口信息'
+                : proxy.geo
+                  ? `代理出口时区不可用${geoText ? ` · ${geoText}` : ''}`
+                  : '未检测（到代理池点「地理」）'}
           </span>
         </Field>
         <Field label='设置时区'>
@@ -97,7 +101,11 @@ export function VmEnvironmentCard({
                 title={
                   proxyZone
                     ? `改为 ${proxyZone}`
-                    : '代理还没有地理位置，先在代理池检测'
+                    : !proxy
+                      ? '暂无代理出口信息'
+                      : proxy.geo
+                        ? '代理出口时区不可用'
+                        : '代理还没有地理位置，先在代理池检测'
                 }
                 onClick={onFollowProxy}
               >

@@ -1,23 +1,19 @@
 /**
- * Port of sub2api detectInterceptType / sendMockIntercept*
- * (backend/internal/handler/gateway_handler.go). Answered before any account
- * is selected, so these never take a seat, a sticky pin, quota, or an
- * upstream call. One addition: requests with tools are never intercepted.
+ * Answer warmup and related probes before account selection, without using a
+ * session seat, a sticky pin, quota, or an upstream call.
  */
 import crypto from 'node:crypto'
 import { isOfficialClaudeUa } from '../identity/official-claude-ua.mjs'
 
 const TITLE_PROMPT = 'Please write a 5-10 word title for the following conversation:'
-// Real CLI text starts with "Analyze"; sub2api matches without the first letter.
+// The CLI text starts with "Analyze"; the matcher omits the first letter.
 const TOPIC_SYSTEM = 'nalyze if this message indicates a new conversation topic. If it does, extract a 2-3 word title'
 const SUGGESTION_PREFIX = '[SUGGESTION MODE:'
 
 /**
- * sub2api decodes into typed structs: messages[].content and system must be
- * arrays of {type,text} objects. Any other shape (a string content turn, a
- * string system) fails json.Unmarshal and the request is not intercepted.
- * Real Claude Code sessions carry string-content system turns, which is what
- * keeps long conversations out.
+ * The parser expects `messages[].content` and `system` as arrays of blocks.
+ * A string in either position prevents interception, keeping sessions with
+ * string-content system turns out of this path.
  */
 function typedParse(body) {
   const isStr = (v) => v == null || typeof v === 'string'
@@ -55,8 +51,8 @@ function typedParse(body) {
 
 /**
  * @param {object} body inbound Messages body
- * @param {{ userAgent?: string }} [opts] sub2api isClaudeCodeClient; a
- *   max_tokens=1 body passes its validator on the claude-cli UA alone.
+ * @param {{ userAgent?: string }} [opts] A Haiku request with `max_tokens=1`
+ *   needs only the official CLI User-Agent to match the ping probe.
  * @returns {null | 'haiku_ping' | 'suggestion' | 'warmup'}
  */
 export function detectWarmupIntercept(body = {}, { userAgent = '' } = {}) {
@@ -65,8 +61,7 @@ export function detectWarmupIntercept(body = {}, { userAgent = '' } = {}) {
   if (isOfficialClaudeUa(userAgent) && Number(body.max_tokens) === 1 && model.toLowerCase().includes('haiku')) {
     return 'haiku_ping'
   }
-  // vm2api guard beyond sub2api: warmup / title / suggestion side calls never
-  // carry tools, while a real turn that quotes these texts always does.
+  // Do not treat turns carrying tools as warmup, title, or suggestion probes.
   if (Array.isArray(body.tools) ? body.tools.length : body.tools) return null
   const raw = JSON.stringify(body)
   const hasSuggestionMode = raw.includes(SUGGESTION_PREFIX)
@@ -101,7 +96,7 @@ export function detectWarmupIntercept(body = {}, { userAgent = '' } = {}) {
   return null
 }
 
-/** sub2api generateRealisticMsgID: msg_01 + 22 Base62 chars. */
+/** Message ID: `msg_01` followed by 22 Base62 characters. */
 function messageId() {
   const charset = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
   const bytes = crypto.randomBytes(22)
@@ -110,7 +105,6 @@ function messageId() {
   return `msg_01${id}`
 }
 
-/** sub2api sendMockInterceptResponse. */
 export function warmupMockMessage(kind, model) {
   let text = 'New Conversation'
   let outputTokens = 2
@@ -143,8 +137,8 @@ export function warmupMockMessage(kind, model) {
 }
 
 /**
- * sub2api sendMockInterceptStream. Its switch only knows SuggestionMode vs
- * default, so a streamed haiku ping gets "New Conversation" / end_turn.
+ * Streaming distinguishes suggestions from the default response, so a Haiku
+ * ping gets "New Conversation" with an `end_turn` stop reason.
  */
 export function formatWarmupSse(kind, model) {
   const suggestion = kind === 'suggestion'

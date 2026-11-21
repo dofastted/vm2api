@@ -1,10 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { isClaudeCodeFamilyRequest } from '../../src/lib/identity/claude-code-only.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { handleUserCountTokens } from '../../src/lib/protocol/user-count-tokens.mjs'
 import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
 import {
+  CRS_OFFICIAL_AGENT_PROMPT,
+  CRS_OFFICIAL_CLI_SYSTEM,
   applyCrsUnofficialPersona,
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
@@ -172,7 +177,7 @@ test('Claude Code family recognition: max_tokens 1 is not a bypass for arbitrary
 
 const REACHED = new Error('reached-scheduler')
 
-function protocolHarness({ routing, body, healthMonitor, logs = [], users = null, onRun = null }) {
+function protocolHarness({ routing, body, healthMonitor, logs = [], users = null, onRun = null, routingConfigPath }) {
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
   const stats = { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 }
   const handler = createHandleProtocol({
@@ -214,6 +219,7 @@ function protocolHarness({ routing, body, healthMonitor, logs = [], users = null
     apiEndpointStore: {},
     stats,
     getRoutingConfig: () => routing,
+    routingConfigPath,
     groupsRepo: { rateMultiplier: () => 1 },
     getHealthMonitor: () => healthMonitor,
   })
@@ -228,8 +234,10 @@ async function runProtocol({
   healthMonitor,
   apiKeyKind = 'managed',
   apiKeyRecord = { category: 'api' },
+  routingConfigPath,
+  onRun,
 }) {
-  const { handler, response } = protocolHarness({ routing, body, healthMonitor })
+  const { handler, response } = protocolHarness({ routing, body, healthMonitor, routingConfigPath, onRun })
   const req = {
     method: 'POST',
     url: '/v1/messages',
@@ -308,7 +316,7 @@ test('switch on: health probes are refused, never answered from the probe cache'
     },
   }
   assert.deepEqual(await runProtocol({ routing: ON, body: THIRD_PARTY_BODY, headers: AXIOS, healthMonitor }), BLOCKED)
-  // sub2api's account test carries the CLI banner; even with a full CLI header set it is a probe.
+  // The account probe carries the CLI banner but is still a probe with a full CLI header set.
   const accountTest = {
     model: 'claude-sonnet-5',
     max_tokens: 1024,
@@ -337,6 +345,54 @@ test('switch on: local-agent desktop reaches the scheduler without relay detecti
   const body = { ...DESKTOP_BODY, system: [...DESKTOP_BODY.system, { type: 'text', text: 'Oh My Pi coding harness' }] }
   assert.deepEqual(await runProtocol({ routing, body, headers: DESKTOP_HEADERS }), BLOCKED)
 })
+
+const OPENCLAW_SYSTEM =
+  'You are a personal assistant running inside OpenClaw.\n\n## OpenClaw Control\nUse the configured workspace.'
+const DRIFTED_AGENT = `${CRS_OFFICIAL_AGENT_PROMPT}\n\n# New Section\nVerify the result before replying.`
+const sdkBilling = { type: 'text', text: BILLING.replace('cc_entrypoint=cli', 'cc_entrypoint=sdk-cli') }
+const identity = { type: 'text', text: CRS_OFFICIAL_CLI_SYSTEM }
+
+for (const [name, texts, relocated] of [
+  ['a separate OpenClaw block', [DRIFTED_AGENT, OPENCLAW_SYSTEM], true],
+  ['an official prompt with a new section', [DRIFTED_AGENT], false],
+  ['a suffix combined with the official prompt', [`${CRS_OFFICIAL_AGENT_PROMPT}\n\n${OPENCLAW_SYSTEM}`], false],
+]) {
+  test(`handleProtocol with official CLI headers: ${name}`, async (t) => {
+    // Zero preserves non-billing system blocks without bypassing the relocation gate.
+    const routing = { compatibility: { persona_preset: 'zero', detect_proxied_official_cc: false } }
+    const dir = mkdtempSync(join(tmpdir(), 'cc-system-relocation-'))
+    t.after(() => rmSync(dir, { recursive: true, force: true }))
+    const routingConfigPath = join(dir, 'routing.json')
+    writeFileSync(routingConfigPath, JSON.stringify(routing))
+
+    const contentBlocks = texts.map((text) => ({ type: 'text', text }))
+    const body = {
+      ...OFFICIAL_BODY,
+      system: [sdkBilling, identity, ...contentBlocks],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    }
+    assert.equal(isOfficialClaudeCodeTraffic(CLI_HEADERS, body), true)
+    let outbound
+    const result = await runProtocol({
+      routing,
+      routingConfigPath,
+      body,
+      headers: CLI_HEADERS,
+      apiKeyKind: 'master',
+      onRun: ({ canonicalBody }) => {
+        outbound = canonicalBody
+      },
+    })
+    assert.equal(result.reached, true)
+    // Persona rendering still replaces the billing block.
+    assert.match(outbound.system[0].text, /^x-anthropic-billing-header:/)
+    assert.deepEqual(outbound.system.slice(1), relocated ? [identity] : body.system.slice(1))
+    const expectedContent = relocated
+      ? [{ type: 'text', text: OPENCLAW_SYSTEM }, ...body.messages[0].content]
+      : body.messages[0].content
+    assert.deepEqual(outbound.messages, [{ role: 'user', content: expectedContent }])
+  })
+}
 
 test('switch on: master-key pinned panel diagnostics are not inbound clients', async () => {
   const result = await runProtocol({

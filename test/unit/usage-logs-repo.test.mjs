@@ -570,3 +570,93 @@ test('billingStats attaches health_24h per account row', () => {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// Locks the arithmetic of the per-window accumulator (#1497): it sums rows in a
+// single pass instead of building an intermediate row object per event, and the
+// edges below are where a rewrite would silently change a number.
+test('aligned windows keep boundary, sign, unpriced and Fable rules per row', () => {
+  const { dir, db, repo } = freshDb()
+  try {
+    const now = Date.parse('2026-11-20T12:00:00.000Z')
+    const H = 3600_000
+    const DAY = 24 * H
+    const at = (ms) => new Date(now - ms).toISOString()
+    const row = (created_at, extra) => ({
+      vm_id: 'vm-a',
+      account_id: 'acc-1',
+      created_at,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+      // An explicit pricing_model keeps the maintenance backfill, which repairs
+      // rows with pricing_model IS NULL, from rewriting the costs seeded below.
+      pricing_model: 'claude-sonnet-4',
+      ...extra,
+    })
+    seed(repo, [
+      // exactly on the 5h window start: inside
+      row(at(4 * H), { input_tokens: 10, total_cost: 0.01 }),
+      // one millisecond earlier: outside the 5h window, inside 7d
+      row(at(4 * H + 1), { input_tokens: 20, total_cost: 0.02 }),
+      // a negative cost contributes nothing to cost but still counts its tokens
+      row(at(H), { input_tokens: 7, total_cost: -5 }),
+      // unpriced with tokens counts; unpriced without tokens does not
+      row(at(2 * H), { input_tokens: 5, pricing_model: 'unpriced' }),
+      row(at(3 * H), { input_tokens: 0, pricing_model: 'unpriced' }),
+      // Fable rows: one inside the 7d_oi window, one a millisecond before it
+      row(at(2 * DAY), { input_tokens: 100, total_cost: 0.5, upstream_model: 'claude-fable-5-2' }),
+      row(at(4 * DAY + 1), { input_tokens: 1000, total_cost: 9, upstream_model: 'claude-fable-5-2' }),
+    ])
+    // An unparseable timestamp must drop out of every window, not land in all of them.
+    db.prepare(
+      `INSERT INTO usage_logs (id, request_id, created_at, account_id, vm_id, status, input_tokens, total_cost)
+       VALUES ('log_bad', 'req-bad', 'not-a-date', 'acc-1', 'vm-a', 200, 999, 7)`,
+    ).run()
+
+    const stats = repo.billingStats({
+      now,
+      accountWindows: [
+        {
+          account_id: 'acc-1',
+          vm_id: 'vm-a',
+          reset_5h: new Date(now + H).toISOString(),
+          reset_7d: new Date(now + 2 * DAY).toISOString(),
+          reset_7d_oi: new Date(now + 3 * DAY).toISOString(),
+        },
+        // An account with no rows at all: the empty bucket carries no prompt_tokens.
+        { account_id: 'acc-2', vm_id: 'vm-b', reset_5h: new Date(now + H).toISOString() },
+      ],
+    })
+    const acc = stats.accounts.find((a) => a.account_id === 'acc-1')
+    assert.deepEqual(
+      {
+        requests: acc.window_5h.requests,
+        prompt_tokens: acc.window_5h.prompt_tokens,
+        total_cost: acc.window_5h.total_cost,
+        unpriced: acc.window_5h.unpriced,
+      },
+      { requests: 4, prompt_tokens: 22, total_cost: 0.01, unpriced: 1 },
+    )
+    assert.deepEqual(
+      {
+        requests: acc.window_7d.requests,
+        prompt_tokens: acc.window_7d.prompt_tokens,
+        total_cost: acc.window_7d.total_cost,
+      },
+      { requests: 7, prompt_tokens: 1142, total_cost: 9.53 },
+    )
+    // Only the Fable row inside the 7d_oi window, so the filter and the window start compose.
+    assert.deepEqual(acc.window_fable, {
+      cost: 0.5,
+      tokens: 100,
+      requests: 1,
+      unpriced: 0,
+      start: new Date(now - 4 * DAY).toISOString(),
+    })
+    const empty = stats.accounts.find((a) => a.account_id === 'acc-2')
+    assert.equal(empty, undefined, 'an account with no usage rows has no account row')
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

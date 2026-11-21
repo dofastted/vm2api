@@ -1,5 +1,5 @@
 /**
- * Local backup service — sub2api BackupService counterpart (no S3, per user).
+ * Local backup service for the database, VM files, and configuration.
  *
  * Backup artifact: data/backups/kin-backup-<stamp>.tar.gz (0600) containing
  *   manifest.json   {version, created_at, kind, includes, sha256s}

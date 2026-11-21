@@ -1,10 +1,10 @@
 /**
- * Codex usage contract aligned with sub2api OpenAICodexUsageSnapshot.
+ * Codex usage and rate-limit windows.
  *
  * extra keys (direct used %, never inverted):
  *   codex_5h_used_percent / codex_7d_used_percent
  *   codex_primary_* (7d by default) / codex_secondary_* (5h by default)
- * Normalize() maps primary/secondary by window_minutes like sub2api.
+ * Normalization maps primary and secondary to the 5h and 7d windows by `window_minutes`.
  */
 
 function num(value) {

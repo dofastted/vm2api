@@ -88,6 +88,11 @@ function SessionListItem({
           <span className='text-muted-foreground'>
             {session.requests} 次 · {formatTokenAmount(session.totalTokens)}
           </span>
+          {session.oneOff ? (
+            <span className='rounded bg-muted px-1 text-[10px] text-muted-foreground'>
+              一次性
+            </span>
+          ) : null}
           {session.totalCost > 0 ? (
             <span className='font-medium'>
               {formatCurrency(session.totalCost, 4)}
@@ -119,7 +124,9 @@ export function ActiveSessionsList({
           <Activity className='h-4 w-4 text-primary' />
           <h3 className='text-sm font-semibold'>活跃 Session</h3>
           <span className='text-xs text-muted-foreground'>
-            {data?.total ?? 0} 个 Session，{data?.minutes ?? 5} 分钟内
+            {(data?.total ?? 0) - (data?.oneOffTotal ?? 0)} 个 Session
+            {data?.oneOffTotal ? ` + ${data.oneOffTotal} 个一次性` : ''}，
+            {data?.minutes ?? 5} 分钟内
           </span>
         </div>
       </div>

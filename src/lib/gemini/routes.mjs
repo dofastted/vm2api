@@ -1,17 +1,41 @@
+import crypto from 'node:crypto'
 import http from 'node:http'
 import { isIP } from 'node:net'
 import path from 'node:path'
+import { filterModelCatalogForKey, keyModelError } from '../admin/key-models.mjs'
+import { createGeminiTerminalBridge } from './terminal.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
 const PUBLIC_PATH = '/v1/gemini/sessions'
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const MODEL = /^[a-z0-9][a-z0-9._-]{0,99}$/
+const RUN_ID = /^[a-f0-9]{32}$/
+const MAX_PROMPT_BYTES = 4096
+const MAX_TEST_TEXT = 16 * 1024
 const AUTH_CODE = /^[A-Za-z0-9._~/-]{1,2048}$/
 const AUTH_STATE = /^[A-Za-z0-9._~-]{1,512}$/
 const API_KEY = /^[A-Za-z0-9_-]{20,256}$/
+const RELEASE_CODE = /^CGG1-[A-Za-z0-9_-]{43}$/
 const STATES = new Set(['unverified', 'authorizing', 'authorized', 'reauth_required', 'disabled'])
 const ACCOUNT_STATES = new Set(['ok', 'partial', 'error', 'reauth_required'])
-const PAYLOAD_STATES = new Set(['installed', 'install_on_create', 'not_configured', 'invalid'])
+const PAYLOAD_STATES = new Set(['installed', 'install_on_create', 'awaiting_redemption', 'not_configured', 'invalid'])
+const RUN_STATES = new Set(['running', 'completed', 'failed'])
+const RUN_ERRORS = {
+  gemini_oauth_required: [409, '请重新完成 Google OAuth 授权'],
+  gemini_location_unsupported: [403, 'Google 判定当前账号所在地区不支持 Antigravity；拉取模型成功不代表可对话'],
+  gemini_proxy_error: [502, '无法通过绑定代理连接 Gemini，请检查代理'],
+  gemini_model_unavailable: [409, '当前环境不支持所选模型，请重新获取模型列表'],
+  gemini_models_empty: [502, 'Gemini 未返回可用模型'],
+  gemini_api_key_invalid: [400, '当前 Gemini API Key 无效'],
+  gemini_quota_exhausted: [429, 'Gemini 额度已用尽，请稍后重试'],
+  gemini_inference_timeout: [503, 'Gemini 请求超时，请稍后重试'],
+  gemini_inference_invalid_output: [502, 'Gemini 返回了无法解析的响应'],
+  gemini_inference_start_failed: [503, '无法启动 Gemini 测试进程'],
+  gemini_inference_cancelled: [409, 'Gemini 测试已取消'],
+  gemini_inference_output_limit: [502, 'Gemini 响应超过测试输出上限'],
+  gemini_inference_tool_blocked: [502, '此测试仅支持文本，不支持工具调用'],
+  gemini_inference_failed: [502, 'Gemini 请求失败，请检查环境状态'],
+}
 const FAILURE = 'gemini_host_unavailable'
 const PROTOCOL_ERROR = 'gemini_host_protocol_error'
 const SOCKET_ERRORS = new Map([
@@ -21,11 +45,20 @@ const SOCKET_ERRORS = new Map([
   ['EPERM', 'gemini_host_socket_denied'],
   ['ABORT_ERR', 'gemini_host_timeout'],
 ])
+const HOST_INFRASTRUCTURE_CODES = new Set([
+  ...SOCKET_ERRORS.values(),
+  'gemini_host_invalid_socket',
+  'gemini_host_unsupported_platform',
+])
 const PAYLOAD_ISSUES = new Set([
   'gemini_public_key_missing',
   'gemini_payload_source_missing',
   'gemini_payload_incomplete',
   'gemini_payload_invalid',
+  'gemini_payload_not_installed',
+  'gemini_release_not_configured',
+  'gemini_release_invalid',
+  'gemini_release_payload_mismatch',
 ])
 const OAUTH_ISSUES = new Set([
   'gemini_oauth_tools_missing',
@@ -33,6 +66,10 @@ const OAUTH_ISSUES = new Set([
   'gemini_ipv4_forwarding_unavailable',
 ])
 const HOST_ERRORS = {
+  ...RUN_ERRORS,
+  gemini_operation_busy: [409, '此 Gemini 环境正在执行其他操作，请稍后重试'],
+  gemini_run_not_found: [404, '测试会话不存在或已过期'],
+  gemini_proxy_probe_failed: [502, '无法通过绑定代理连接 Gemini'],
   gemini_host_socket_missing: [503, '找不到 Gemini 控制 socket，请检查宿主服务和容器挂载'],
   gemini_host_socket_refused: [503, 'Gemini 控制 socket 拒绝连接，请检查宿主服务状态'],
   gemini_host_socket_denied: [503, '控制面无权访问 Gemini 控制 socket，请检查 vm2api 组和目录权限'],
@@ -45,12 +82,27 @@ const HOST_ERRORS = {
   gemini_payload_source_missing: [503, '缺少 Gemini 签名载荷，请配置已解包的安装源'],
   gemini_payload_incomplete: [503, 'Gemini 签名载荷不完整，请检查 agy、CRAGGemini 和清单文件'],
   gemini_payload_invalid: [503, 'Gemini 载荷安装或校验失败，请检查宿主服务日志'],
+  gemini_payload_not_installed: [503, '请先在宿主机安装 Gemini 签名载荷，再兑换内核'],
+  gemini_release_not_configured: [503, '此宿主机尚未配置当前版本的 CRAGGemini 授权'],
+  gemini_release_invalid: [503, '宿主机的 CRAGGemini 授权配置无效，请联系部署管理员'],
+  gemini_release_code_invalid: [400, '兑换码无效，或不适用于当前版本'],
+  gemini_release_payload_mismatch: [409, '宿主机的 CRAGGemini 授权配置与签名载荷不匹配'],
+  gemini_release_redemption_required: [403, '请先兑换 CRAGGemini 内核'],
   gemini_egress_unavailable: [503, '缺少可用的 Gemini 出口组件，请检查宿主 kin-egress 安装'],
   gemini_oauth_tools_missing: [503, '缺少 Google 授权所需工具，请检查宿主 ip、nft、setpriv、bwrap 和 curl'],
   gemini_ipv4_forwarding_unavailable: [503, '宿主 IPv4 转发未就绪，无法经绑定代理启动 Google 授权'],
   gemini_authorization_unavailable: [503, 'Gemini 服务已连接，但未能启动 Google 授权，请检查代理与宿主日志'],
   gemini_account_read_failed: [502, '无法通过所选代理读取 Google 账号数据'],
   gemini_api_key_rejected: [400, 'Google 未接受该 Gemini API Key，请检查密钥和项目权限'],
+  gemini_terminal_unavailable: [503, '无法启动 Gemini 终端，请检查宿主服务、Antigravity 安装和绑定代理'],
+  gemini_terminal_conflict: [409, '此 Gemini 环境已有终端会话或正在执行其他操作，请稍后重试'],
+  gemini_terminal_requires_oauth: [409, 'Antigravity CLI 需要有效的 Google OAuth 凭据，请重新授权后再启动'],
+  gemini_terminal_limit: [429, '终端会话或连接票据已达上限，请关闭现有终端或稍后重试'],
+  gemini_oauth_import_invalid: [400, 'Google 账号文件中的凭据格式无效'],
+  gemini_oauth_import_rejected: [400, 'Google 凭据已过期或未获授权，请导出新文件或进行 Google 授权'],
+  gemini_test_oauth_unsupported: [503, '当前签名载荷不支持 Google OAuth 推理测试'],
+  gemini_test_auth_required: [409, '请先为 Gemini 环境完成授权'],
+  gemini_test_invalid_input: [400, '请选择此环境的 Gemini 模型并输入有效的测试内容'],
 }
 
 export function isGeminiPanelPath(value) {
@@ -64,8 +116,13 @@ export function isGeminiPublicPath(value) {
 export function geminiKeyAllowsPath(pathname, method) {
   return (
     isGeminiPublicPath(pathname) ||
+    (method === 'POST' && (pathname === '/v1/messages' || pathname === '/messages')) ||
     (method === 'GET' && ['/models', '/v1/models', '/v1/usage', '/v1/me/quota', '/v1/me/usage'].includes(pathname))
   )
+}
+
+export function geminiProxyFor(proxyPool, proxyId) {
+  return proxyFor(proxyPool, proxyId)
 }
 
 function hostError(code, status = 503) {
@@ -98,6 +155,9 @@ export function officialGeminiAuthUrl(value) {
 function hostRequest(socketPath, operation, payload) {
   if (process.platform !== 'linux' || process.arch !== 'x64') throw hostError('gemini_host_unsupported_platform')
   if (!path.isAbsolute(socketPath || '')) throw hostError('gemini_host_invalid_socket')
+  const terminal = operation.startsWith('terminal-')
+  const timeout =
+    operation === 'models' ? 40000 : ['create', 'redeem', 'terminal-start'].includes(operation) ? 60000 : 30000
   const body = JSON.stringify(payload)
   return new Promise((resolve, reject) => {
     const request = http.request(
@@ -106,7 +166,7 @@ function hostRequest(socketPath, operation, payload) {
         method: 'POST',
         path: `/${operation}`,
         headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-        signal: AbortSignal.timeout(operation === 'create' ? 60000 : 30000),
+        signal: AbortSignal.timeout(timeout),
       },
       async (response) => {
         try {
@@ -117,10 +177,14 @@ function hostRequest(socketPath, operation, payload) {
             if (total > 512 * 1024) throw hostError(PROTOCOL_ERROR)
             chunks.push(chunk)
           }
-          if (response.statusCode === 404) throw hostError('gemini_environment_not_found', 404)
-          if (response.statusCode === 409) throw hostError('gemini_environment_conflict', 409)
           const data = JSON.parse(Buffer.concat(chunks))
-          if (Object.hasOwn(HOST_ERRORS, data?.code)) throw hostError(data.code)
+          if (response.statusCode !== 200 && typeof data?.code === 'string' && Object.hasOwn(HOST_ERRORS, data.code))
+            throw hostError(data.code, response.statusCode)
+          if (!terminal && operation !== 'redeem' && response.statusCode === 404)
+            throw hostError('gemini_environment_not_found', 404)
+          if (!terminal && operation !== 'redeem' && response.statusCode === 409)
+            throw hostError('gemini_environment_conflict', 409)
+          if (terminal && response.statusCode === 404) throw hostError('gemini_terminal_unavailable')
           if (response.statusCode !== 200) throw hostError(FAILURE)
           resolve(data)
         } catch (error) {
@@ -134,8 +198,12 @@ function hostRequest(socketPath, operation, payload) {
   })
 }
 
+function redactProxyAuth(value) {
+  return value.replace(/socks5h?:\/\/[^\s/?#<>"`]*@[^\s<>"`]*/gi, '[redacted proxy URL]')
+}
+
 function text(value, size = 128) {
-  return typeof value === 'string' && value.length ? value.slice(0, size) : null
+  return typeof value === 'string' && value.length ? redactProxyAuth(value).slice(0, size) : null
 }
 
 function items(value, size, project) {
@@ -144,6 +212,51 @@ function items(value, size, project) {
 
 function modelName(model) {
   return typeof model === 'string' && MODEL.test(model) ? model : null
+}
+
+function validId(value) {
+  return typeof value === 'string' && ID.test(value)
+}
+
+function validRunId(value) {
+  return typeof value === 'string' && RUN_ID.test(value)
+}
+
+function validPrompt(value) {
+  return (
+    typeof value === 'string' &&
+    value.length <= MAX_PROMPT_BYTES &&
+    Buffer.byteLength(value, 'utf8') <= MAX_PROMPT_BYTES &&
+    value.trim().length > 0 &&
+    !/[\uD800-\uDFFF]/u.test(value)
+  )
+}
+
+function probeView(result) {
+  if (typeof result?.ok !== 'boolean') throw hostError(PROTOCOL_ERROR)
+  return {
+    ok: result.ok,
+    latency_ms: Number.isFinite(result.latency_ms) && result.latency_ms >= 0 ? result.latency_ms : null,
+    ...(result.ok ? {} : { code: 'gemini_proxy_probe_failed' }),
+  }
+}
+
+function runView(result) {
+  if (!RUN_STATES.has(result?.state) || typeof result.text !== 'string') throw hostError(PROTOCOL_ERROR)
+  const view = { state: result.state, text: redactProxyAuth(result.text).slice(0, MAX_TEST_TEXT) }
+  const usage = {}
+  for (const key of ['input_tokens', 'output_tokens', 'total_tokens']) {
+    const count = result.usage?.[key]
+    if (Number.isSafeInteger(count) && count >= 0) usage[key] = count
+  }
+  if (Object.keys(usage).length) view.usage = usage
+  if (result.state === 'failed') {
+    const supplied = result.error?.code
+    const code =
+      typeof supplied === 'string' && Object.hasOwn(RUN_ERRORS, supplied) ? supplied : 'gemini_inference_failed'
+    view.error = { code, message: RUN_ERRORS[code][1] }
+  }
+  return view
 }
 
 function isFraction(value) {
@@ -193,19 +306,27 @@ function accountView(account) {
   }
 }
 
-function environmentView(value) {
-  if (!ID.test(value?.id ?? '') || !ID.test(value?.proxy_id ?? '') || !STATES.has(value?.auth_state)) {
+function environmentView(value, { id, proxyId } = {}) {
+  if (
+    !validId(value?.id) ||
+    !validId(value.proxy_id) ||
+    !STATES.has(value.auth_state) ||
+    (id !== undefined && value.id !== id) ||
+    (proxyId !== undefined && value.proxy_id !== proxyId)
+  ) {
     throw hostError(PROTOCOL_ERROR)
   }
   return {
     id: value.id,
     proxy_id: value.proxy_id,
-    name: String(value.name || '').slice(0, 80),
+    name: text(value.name, 80) || '',
     auth_state: value.auth_state,
     auth_method: value.auth_method === 'api_key' ? 'api_key' : 'oauth',
+    ...(value.oauth_imported === true && value.auth_method === 'oauth' ? { oauth_imported: true } : {}),
     kernel_version: text(value.kernel_version),
     runtime_ready: value.runtime_ready === true,
     models: items(value.models, 128, modelName),
+    ...(value.models_discovered === true && { models_discovered: true }),
     account: accountView(value.account),
     created_at: text(value.created_at),
     updated_at: text(value.updated_at),
@@ -238,12 +359,12 @@ function authorizationInput(body) {
   }
 }
 
-function proxyFor(proxyPool, proxyId) {
+function proxyFor(proxyPool, proxyId, { allowUnhealthy = false } = {}) {
+  if (!validId(proxyId)) throw hostError('gemini_proxy_unavailable', 409)
   const proxy = proxyPool?.snapshot({ ownerUserId: null }).proxies.find((entry) => entry.id === proxyId)
   if (
     !proxy?.enabled ||
-    proxy.status === 'dead' ||
-    proxy.status === 'fail' ||
+    (!allowUnhealthy && (proxy.status === 'dead' || proxy.status === 'fail')) ||
     proxy.owner_user_id ||
     proxy.blocked_reason
   ) {
@@ -268,13 +389,54 @@ function proxyFor(proxyPool, proxyId) {
   throw hostError('gemini_proxy_unavailable', 409)
 }
 
-export function createGeminiPanelHandler({
-  json,
-  readBody,
-  proxyPool,
-  callHost = (operation, payload) =>
-    hostRequest(process.env.KIN_GEMINI_HOST_SOCKET ?? '/run/vm2api-gemini/control.sock', operation, payload),
-}) {
+async function readEnvironment(callHost, id) {
+  return environmentView(await callHost('get', { id }), { id })
+}
+
+function boundProxy(proxyPool, environment, options) {
+  return { proxy_id: environment.proxy_id, proxy_url: proxyFor(proxyPool(), environment.proxy_id, options) }
+}
+
+export const callGeminiHost = (operation, payload) =>
+  hostRequest(process.env.KIN_GEMINI_HOST_SOCKET ?? '/run/vm2api-gemini/control.sock', operation, payload)
+
+export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
+  return createGeminiTerminalBridge({
+    callHost,
+    async resolveTarget(id) {
+      const environment = await callHost('get', { id })
+      if (environment?.id !== id) throw hostError(PROTOCOL_ERROR)
+      if (environment.payload_state === 'awaiting_redemption') {
+        throw hostError('gemini_release_redemption_required', 403)
+      }
+      if (PAYLOAD_ISSUES.has(environment.payload_issue)) {
+        throw hostError(environment.payload_issue, HOST_ERRORS[environment.payload_issue][0])
+      }
+      if (environment.auth_method !== 'oauth' || environment.auth_state !== 'authorized') {
+        throw hostError('gemini_terminal_requires_oauth', 409)
+      }
+      if (typeof environment.proxy_id !== 'string' || !ID.test(environment.proxy_id)) {
+        throw hostError('gemini_proxy_unavailable', 409)
+      }
+      return { proxy_id: environment.proxy_id, proxy_url: proxyFor(proxyPool(), environment.proxy_id) }
+    },
+    errorMessage(code, stage) {
+      if (code === 'gemini_proxy_unavailable') return '需要绑定可用的 IPv4 SOCKS5 代理'
+      if (code === 'gemini_environment_not_found') return 'Gemini 环境不存在'
+      if (code === 'gemini_environment_conflict') return 'Gemini 环境状态已变化，请刷新后重试'
+      return (
+        (Object.hasOwn(HOST_ERRORS, code) && HOST_ERRORS[code][1]) ||
+        (stage === 'resolve'
+          ? '无法读取 Gemini 环境，请检查宿主服务'
+          : stage === 'io'
+            ? 'Gemini 终端连接中断，请检查宿主服务或重新打开终端'
+            : HOST_ERRORS.gemini_terminal_unavailable[1])
+      )
+    },
+  })
+}
+
+export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, callHost = callGeminiHost }) {
   return async function handleGeminiPanel(req, res, pathname) {
     const ok = (data) => json(res, 200, { ok: true, data })
     const fail = (status, code, message = code) => json(res, status, { ok: false, error: { code, message } })
@@ -287,6 +449,7 @@ export function createGeminiPanelHandler({
           available: true,
           payload_state: PAYLOAD_STATES.has(view.payload_state) ? view.payload_state : 'unknown',
           payload_issue: PAYLOAD_ISSUES.has(view.payload_issue) ? view.payload_issue : null,
+          release_activated: typeof view.release_activated === 'boolean' ? view.release_activated : null,
           oauth_runtime_issue: OAUTH_ISSUES.has(view.oauth_runtime_issue) ? view.oauth_runtime_issue : null,
           environments: view.environments.map((value) => {
             const environment = environmentView(value)
@@ -302,22 +465,41 @@ export function createGeminiPanelHandler({
           }),
         })
       }
+      // All Gemini panel routes pass through the existing admin-only panel ACL.
+      if (req.method === 'POST' && pathname === `${PANEL_PATH}/payload/redeem`) {
+        const body = await readBody(req, 1024)
+        const code = typeof body?.redemption_code === 'string' ? body.redemption_code.trim() : ''
+        if (!RELEASE_CODE.test(code)) {
+          const [status, message] = HOST_ERRORS.gemini_release_code_invalid
+          return fail(status, 'gemini_release_code_invalid', message)
+        }
+        const result = await callHost('redeem', { redemption_code: code })
+        if (typeof result?.kernel_version !== 'string' || !/^[a-zA-Z0-9.-]{1,64}$/.test(result.kernel_version)) {
+          throw hostError(PROTOCOL_ERROR)
+        }
+        return ok({ kernel_version: result.kernel_version })
+      }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/environments`) {
-        const body = await readBody(req, 4096)
+        const body = await readBody(req, 8192)
         const name = typeof body?.name === 'string' ? body.name.trim() : ''
         const method = body?.auth_method ?? 'oauth'
-        if (
-          !name ||
-          name.length > 80 ||
-          typeof body?.proxy_id !== 'string' ||
-          !ID.test(body.proxy_id) ||
-          !['oauth', 'api_key'].includes(method)
-        ) {
+        if (!name || name.length > 80 || !validId(body?.proxy_id) || !['oauth', 'api_key'].includes(method)) {
           return fail(400, 'gemini_invalid_environment')
         }
         const apiKey = typeof body?.api_key === 'string' ? body.api_key.trim() : ''
         if ((method === 'api_key' && !API_KEY.test(apiKey)) || (method === 'oauth' && body?.api_key != null)) {
           return fail(400, 'gemini_invalid_api_key', '请提供有效格式的 Gemini API Key')
+        }
+        const imported = body?.oauth_account
+        if (
+          imported != null &&
+          (method !== 'oauth' ||
+            typeof imported.access_token !== 'string' ||
+            !/^[A-Za-z0-9._~+/-]{1,4096}={0,2}$/.test(imported.access_token) ||
+            !Number.isSafeInteger(imported.expiry_timestamp) ||
+            imported.expiry_timestamp <= 0)
+        ) {
+          return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
         }
         const proxyUrl = proxyFor(proxyPool(), body.proxy_id)
         return ok(
@@ -327,16 +509,71 @@ export function createGeminiPanelHandler({
               proxy_id: body.proxy_id,
               proxy_url: proxyUrl,
               ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
+              ...(imported != null && {
+                oauth_account: { access_token: imported.access_token, expiry_timestamp: imported.expiry_timestamp },
+              }),
             }),
           ),
         )
       }
       const match =
-        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|disable|refresh))?$/.exec(
+        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|disable|refresh|terminal-ticket|proxy\/probe|proxy|models|test-chat)(?:\/([^/]+))?)?$/.exec(
           pathname,
         )
-      if (!match || !ID.test(match[1])) return fail(404, 'not_found')
-      const [, id, action] = match
+      if (!match || !validId(match[1])) return fail(404, 'not_found')
+      const [, id, action, runId] = match
+      if (runId !== undefined) {
+        if (action !== 'test-chat' || !['GET', 'DELETE'].includes(req.method)) return fail(404, 'not_found')
+        if (!validRunId(runId)) return fail(400, 'gemini_invalid_run_id')
+        const payload = { id, run_id: runId }
+        if (req.method === 'GET') return ok(runView(await callHost('test-chat-status', payload)))
+        const result = await callHost('test-chat-cancel', payload)
+        if (result?.cancelled !== true) throw hostError(PROTOCOL_ERROR)
+        return ok({ cancelled: true })
+      }
+      if (req.method === 'PUT' && action === 'proxy') {
+        const body = await readBody(req, 4096)
+        const proxyId = body?.proxy_id
+        if (!validId(proxyId)) return fail(400, 'gemini_invalid_proxy_id')
+        const environment = await readEnvironment(callHost, id)
+        const result = await callHost('proxy-bind', {
+          id,
+          previous_proxy_id: environment.proxy_id,
+          proxy_id: proxyId,
+          proxy_url: proxyFor(proxyPool(), proxyId),
+        })
+        return ok(environmentView(result, { id, proxyId }))
+      }
+      if (req.method === 'POST' && action === 'proxy/probe') {
+        const environment = await readEnvironment(callHost, id)
+        // Only probing the existing binding may bypass stored health. Scope,
+        // enablement, policy, and valid IPv4 SOCKS5 still apply.
+        const target = boundProxy(proxyPool, environment, { allowUnhealthy: true })
+        return ok(probeView(await callHost('proxy-probe', { id, ...target })))
+      }
+      if (req.method === 'POST' && action === 'models') {
+        const environment = await readEnvironment(callHost, id)
+        const result = await callHost('models', { id, ...boundProxy(proxyPool, environment) })
+        const view = environmentView(result, { id, proxyId: environment.proxy_id })
+        if (!view.models.length) throw hostError('gemini_models_empty')
+        return ok(view)
+      }
+      if (req.method === 'POST' && action === 'test-chat') {
+        // A JSON string may need six wire bytes per decoded byte.
+        const body = await readBody(req, 32 * 1024)
+        const model = modelName(body?.model)
+        const prompt = body?.prompt
+        if (!model) return fail(400, 'gemini_invalid_model')
+        if (!validPrompt(prompt)) return fail(400, 'gemini_invalid_prompt')
+        const environment = await readEnvironment(callHost, id)
+        const result = await callHost('test-chat', { id, ...boundProxy(proxyPool, environment), model, prompt })
+        if (!validRunId(result?.run_id)) throw hostError(PROTOCOL_ERROR)
+        return ok({ run_id: result.run_id })
+      }
+      if (req.method === 'POST' && action === 'terminal-ticket') {
+        if (!terminal) throw hostError('gemini_terminal_unavailable')
+        return ok(await terminal.issueTicket(id))
+      }
       if (req.method === 'DELETE' && !action) {
         await callHost('delete', { id })
         return ok({ deleted: true })
@@ -407,22 +644,137 @@ export function createGeminiPanelHandler({
   }
 }
 
-export function handleGeminiPublic(req, res, json) {
-  res.setHeader('Cache-Control', 'no-store')
-  if (req.apiKeyKind !== 'managed' || req.apiKeyRecord?.group_type !== 'gemini') {
-    return json(res, 403, {
-      error: {
-        type: 'permission_error',
-        code: 'gemini_key_required',
-        message: 'This endpoint requires a dedicated Gemini API key.',
-      },
-    })
+function publicError(error) {
+  const code = typeof error?.code === 'string' ? error.code : FAILURE
+  if (code === FAILURE || HOST_INFRASTRUCTURE_CODES.has(code)) {
+    return {
+      status: 503,
+      body: { error: { type: 'api_error', code: FAILURE, message: 'Gemini host is not available.' } },
+    }
   }
-  return json(res, 503, {
-    error: {
-      type: 'service_unavailable',
-      code: 'gemini_runtime_not_supported',
-      message: 'The current CRAGAnti payload does not support Google OAuth inference.',
+  const known = HOST_ERRORS[code]
+  const status = Number.isInteger(error?.status) ? error.status : known?.[0] || 503
+  return {
+    status,
+    body: {
+      error: {
+        type: status === 429 ? 'rate_limit_error' : status >= 500 ? 'api_error' : 'invalid_request_error',
+        code,
+        message: known?.[1] || error?.message || 'Gemini request failed.',
+      },
     },
-  })
+  }
+}
+
+function anthropicText(content) {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content) || content.length !== 1 || content[0]?.type !== 'text') return ''
+  return typeof content[0].text === 'string' ? content[0].text : ''
+}
+
+export function geminiTurnFromBody(body, messages) {
+  const model = typeof body?.model === 'string' ? body.model : ''
+  const fields = messages ? ['model', 'messages', 'stream'] : ['model', 'input', 'stream']
+  if (!MODEL.test(model) || Object.keys(body).some((key) => !fields.includes(key))) return null
+  if (body.stream !== undefined && body.stream !== false) return null
+  let text = body.input
+  if (messages) {
+    if (!Array.isArray(body.messages) || body.messages.length !== 1) return null
+    const message = body.messages[0]
+    if (message?.role !== 'user' || Object.keys(message).some((key) => !['role', 'content'].includes(key))) return null
+    text = anthropicText(message.content)
+  }
+  return validPrompt(text) ? { model, text } : null
+}
+
+/**
+ * `/v1/messages` answers in the Anthropic Messages shape so an Anthropic client
+ * can read it. Only `input_tokens` / `output_tokens` exist there, so the host's
+ * `total_tokens` is dropped rather than returned under a field the clients ignore.
+ */
+function anthropicMessage(turn) {
+  return {
+    id: `msg_${crypto.randomBytes(12).toString('hex')}`,
+    type: 'message',
+    role: 'assistant',
+    model: turn.model,
+    content: turn.text ? [{ type: 'text', text: turn.text }] : [],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: { input_tokens: turn.usage?.input_tokens || 0, output_tokens: turn.usage?.output_tokens || 0 },
+  }
+}
+
+export function createGeminiPublicHandler({ json, readBody, scheduler }) {
+  return async function handleGeminiPublic(req, res) {
+    res.setHeader('Cache-Control', 'no-store')
+    if (req.apiKeyKind !== 'managed' || req.apiKeyRecord?.group_type !== 'gemini') {
+      return json(res, 403, {
+        error: {
+          type: 'permission_error',
+          code: 'gemini_key_required',
+          message: 'This endpoint requires a dedicated Gemini API key.',
+        },
+      })
+    }
+    const url = new URL(req.url || PUBLIC_PATH, 'http://127.0.0.1')
+    if (req.method === 'GET' && [PUBLIC_PATH, '/v1/models', '/models'].includes(url.pathname)) {
+      try {
+        const catalog = await scheduler.catalog()
+        return json(res, 200, filterModelCatalogForKey({ object: 'list', data: catalog.models }, req))
+      } catch (error) {
+        const mapped = publicError(error)
+        return json(res, mapped.status, mapped.body)
+      }
+    }
+    const session = /^\/v1\/gemini\/sessions\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/.exec(url.pathname)
+    // A Gemini key may also call the Anthropic entry point; that one answers in the
+    // Anthropic Messages shape, not in this route's own session shape.
+    const messages = url.pathname === '/v1/messages' || url.pathname === '/messages'
+    if (req.method !== 'POST' || !(session || messages)) {
+      return json(res, 404, { error: { code: 'not_found', message: 'not found' } })
+    }
+    let body = req.body
+    if (body == null) {
+      try {
+        body = await readBody(req, 256 * 1024)
+      } catch (error) {
+        return json(res, error?.status || 400, { error: { code: 'invalid_json', message: 'Invalid JSON body.' } })
+      }
+    }
+    const requested = geminiTurnFromBody(body, messages)
+    if (!requested) {
+      return json(res, 400, {
+        error: { code: 'gemini_unsupported_turn', message: 'Send one plain-text turn and a Gemini model id.' },
+      })
+    }
+    const denied = keyModelError(req, requested.model, { anthropic: messages })
+    if (denied) return json(res, denied.status, denied.body)
+
+    const controller = new AbortController()
+    req.once('aborted', () => controller.abort())
+    res.once('close', () => {
+      if (!res.writableEnded) controller.abort()
+    })
+    try {
+      const turn = await scheduler.complete({
+        model: requested.model,
+        text: requested.text,
+        signal: controller.signal,
+        apiKeyRecord: req.apiKeyRecord,
+      })
+      if (messages) return json(res, 200, anthropicMessage(turn))
+      return json(res, 200, {
+        id: session[1],
+        model: turn.model,
+        account_id: turn.account_id,
+        output_text: turn.text,
+        usage: turn.usage,
+      })
+    } catch (error) {
+      if (controller.signal.aborted) return
+      const mapped = publicError(error)
+      return json(res, mapped.status, mapped.body)
+    }
+  }
 }

@@ -159,6 +159,31 @@ describe('rackTotals', () => {
     )
     expect(t.ledger[0].tokens).toBe(70)
   })
+
+  it('keeps the mixed total label and amount stable across row order', () => {
+    const archived = vm({
+      id: 'archived',
+      account_uuid: 'acct-1',
+      lifetime_usage: { cost: 30, tokens: 300 },
+      total_cost: 8,
+      total_tokens: 80,
+    })
+    const retained = vm({
+      id: 'retained',
+      account_uuid: 'acct-2',
+      total_cost: 12,
+      total_tokens: 120,
+    })
+    const forward = rackTotals([archived, retained])
+    const reverse = rackTotals([retained, archived])
+    expect(forward.ledger[2]).toMatchObject({
+      key: 'total',
+      label: '总费用',
+      cost: 42,
+      tokens: 420,
+    })
+    expect(reverse.ledger[2]).toEqual(forward.ledger[2])
+  })
 })
 
 describe('vmWindows', () => {

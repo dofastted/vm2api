@@ -133,7 +133,7 @@ export function MachineTable({
             '磁盘',
             '槽位',
             '还能放',
-            '今日',
+            '今日花费 · 北京时间',
           ].map((h, i) => (
             <div
               key={h}

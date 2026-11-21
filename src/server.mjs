@@ -11,8 +11,17 @@ import { spawnSync } from 'node:child_process'
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { loadConfig, reloadActiveVm, routingConfigFile } from './lib/core/config.mjs'
-import { geminiKeyAllowsPath, handleGeminiPublic, isGeminiPublicPath } from './lib/gemini/routes.mjs'
+import { createGeminiScheduler } from './lib/gemini/scheduler.mjs'
+import {
+  createGeminiPublicHandler,
+  createGeminiTerminal,
+  geminiKeyAllowsPath,
+  geminiProxyFor,
+  callGeminiHost,
+  isGeminiPublicPath,
+} from './lib/gemini/routes.mjs'
 import {
   extractApiKey,
   timingSafeEqualStr,
@@ -198,7 +207,7 @@ const allowRate = createRateLimiter({
   refillPerSec: cfg.limits.rate_refill,
 })
 
-// --- Persistent store (SQLite, sub2api-inspired) ---
+// --- Persistent store (SQLite) ---
 const dataDir = cfg.paths.data || path.join(cfg.paths.root, 'data')
 openDatabase({ dataDir, pooled: true })
 armWriteBehind(getDb())
@@ -875,7 +884,7 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
     return true
   }
 
-  // Managed multi-keys (sub2api-style)
+  // Authenticate with the managed key store when the master key did not match.
   const managed = apiKeyStore.authenticate(token)
   if (!managed.ok) {
     return rejectAuth(
@@ -975,6 +984,10 @@ const handleKeySelf = createKeySelfHandler({
 })
 
 const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
+  // The public handler routes `/v1/messages` itself and answers in the Anthropic
+  // shape. Rewriting req.url into the session path made the response carry
+  // `id: "messages"` and changed the path the request log attributes.
+  handleGeminiMessages: (req, res) => handleGeminiPublic(req, res),
   admitCragInference: (input) => cragSubscription.admitInference(input),
   json,
   writeSSEHeaders,
@@ -1168,6 +1181,14 @@ const handleCragShop = createCragShopHandler({
   activationEnabled: cragShopActivationEnabled,
 })
 
+const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })
+const geminiScheduler = createGeminiScheduler({
+  callHost: callGeminiHost,
+  resolveProxy: (proxyId) => geminiProxyFor(proxyPool, proxyId),
+  apiKeyStore,
+  groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
+})
+const handleGeminiPublic = createGeminiPublicHandler({ json, readBody, scheduler: geminiScheduler })
 const handlePanel = createPanelHandler({
   getDb,
   cragSubscription,
@@ -1241,10 +1262,13 @@ const handlePanel = createPanelHandler({
   clusterManager,
   slotShell,
   slotDesktop,
+  geminiTerminal,
 })
 
+let geminiTerminalDrain
 const gracefulShutdown = createGracefulShutdown({
   beforeDrain: async () => {
+    geminiTerminalDrain = geminiTerminal.close()
     installJevUsageRecorder(null)
     try {
       vmTestSchedule.stop()
@@ -1282,6 +1306,8 @@ const gracefulShutdown = createGracefulShutdown({
     } catch {}
   },
   afterDrain: async () => {
+    // Let host cleanup finish without extending shutdown to the launch deadline.
+    await Promise.race([geminiTerminalDrain, delay(2000, undefined, { ref: false })])
     try {
       stopVmWatch()
     } catch {}
@@ -1356,7 +1382,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 404, { error: { message: 'console not found; run pnpm -C web build' } })
     }
 
-    // CLIProxyAPI-style liveness: no auth, no inference.
+    // Liveness check: no authentication or inference.
     if ((req.method === 'GET' || req.method === 'HEAD') && p === '/healthz') {
       if (req.method === 'HEAD') {
         res.writeHead(200)
@@ -1409,7 +1435,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
-      if (groupType === 'gemini') return json(res, 200, { object: 'list', data: [] })
+      if (groupType === 'gemini') return handleGeminiPublic(req, res)
       if (resolveInferenceBackend(req) === 'api') {
         return json(res, 200, filterModelCatalogForKey(apiScheduler.catalog(apiScheduleScope(req, groupType)), req))
       }
@@ -1441,7 +1467,7 @@ const server = http.createServer(async (req, res) => {
 
     if (isGeminiPublicPath(p)) {
       if (!requireAuth(req, res)) return
-      return handleGeminiPublic(req, res, json)
+      return handleGeminiPublic(req, res)
     }
 
     if (req.method === 'POST' && (p === '/v1/chat/completions' || p === '/chat/completions')) {
@@ -1493,6 +1519,7 @@ server.on('upgrade', (req, socket, head) => {
     socket.destroy()
     return
   }
+  if (geminiTerminal.handleUpgrade(req, socket, head)) return
   if (responsesWs.handleUpgrade(req, socket, head)) return
   if (clusterRoutes.handleUpgrade(req, socket, head)) return
   if (slotDesktop.handleUpgrade(req, socket, head)) return

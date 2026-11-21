@@ -24,7 +24,7 @@ VM2API_DB_SECRET='再一串'
 |---|---|
 | `vm2api` | 控制面。Compose **只起这一个** |
 | `kin-<槽>` | 每个**已启动**的槽 1 个 |
-| 没有 | 未启动的槽；同机其它项目的 postgres / newapi 等 |
+| 没有 | 未启动的槽；同机其它项目的 postgres 等 |
 
 不是一个父容器里多个子进程。
 
@@ -89,6 +89,8 @@ sudo bash /opt/vm2api/deploy/install.sh changelog
 ```
 
 保留 `.env` / `vms/` / `data/`。一键更新会把新版 `share/wrap-cli`（包括 `kin-kernel.bin`、`cli-node`、`cc-node`）同步到本机槽并重启槽内 dataplane；集群槽使用同一份二进制加上当前 Go `kin-worker` 遥测重建槽位镜像，再换容器，不改凭证和指纹。如需暂时跳过可加 `--no-sync-wrap`。管理台 **设置 → 关于** 可复制同一条命令、看 changelog。指定版本：`--version v1.2.22`。槽位重建可选「保留原数据」或「重建新特征」。
+
+在 Ubuntu 24.04 等使用 apt 的 Linux amd64 宿主上，一键安装和升级会补齐缺少的 Gemini 宿主依赖，并自动准备 [Gemini 默认组件](gemini-host.md)。管理员在「导入 → Gemini」输入兑换码激活；已有 Gemini 载荷不会被替换。`--no-start` 不安装依赖，也不下载或启动 Gemini。
 
 首次登录后，在「用户」中找到当前管理员，点击「改密码」设置至少 8 位的新密码。默认密码管理员也会写入用户列表；修改后数据库密码优先，重启或更新不会被 `.env` 中的旧密码覆盖。
 
@@ -217,8 +219,8 @@ docker exec kin-<槽> curl -sS -o /dev/null -w '%{http_code}\n' --max-time 10 ht
 Node 听 `:8787`。HTTPS 放在 nginx。
 
 ```nginx
-# 集群页 / 槽位运维终端是 WebSocket：必须透传 Upgrade，并直连 Node（前面若有会丢 Upgrade 的网关，也要绕过）。
-location ~ ^/api/panel/(cluster/nodes|vms)/[^/]+/shell$ {
+# 集群、槽位和 Gemini 终端是 WebSocket：必须透传 Upgrade，并直连 Node。
+location ~ ^/api/panel/((cluster/nodes|vms)/[^/]+/shell|gemini/environments/[^/]+/terminal/ws)$ {
   proxy_pass http://127.0.0.1:8787;
   proxy_http_version 1.1;
   proxy_set_header Host $host;
@@ -251,7 +253,7 @@ location / {
 }
 ```
 
-`Connection ""` 会剥掉 Upgrade，终端或 Responses WS 握手拿不到 101，所以 shell / responses 路径单独放在前面。生产机的 Go 前门在 `:8787`、Node 在 `:8788` 时，这些 location 必须 `proxy_pass` 到 Node。终端症状和核对命令见 [nginx-shell.md](nginx-shell.md)。
+`Connection ""` 会剥掉 Upgrade，终端或 Responses WS 握手拿不到 101。生产机的 Go 前门在 `:8787`、Node 在 `:8788` 时，上述两个 WebSocket location 必须 `proxy_pass` 到 Node。终端症状和核对命令见 [nginx-shell.md](nginx-shell.md)。
 
 ## 本机 Node（备选）
 

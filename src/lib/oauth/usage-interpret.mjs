@@ -1,8 +1,7 @@
 /**
- * Official Claude Code `/usage` and sub2api both read GET /api/oauth/usage.
+ * Official Claude Code `/usage` reads GET /api/oauth/usage.
  * Official Settings Usage treats `utilization` as a 0–100 percent
  * (`Math.floor(utilization)% used`, bar ratio = utilization / 100).
- * sub2api copies the same number onto 0–100 progress bars.
  * KIN used to treat values ≤ 1.5 as a 0–1 fraction, so `1` became 100% used.
  */
 
@@ -12,7 +11,7 @@ export function rawNumber(v) {
   return Number.isFinite(n) ? n : null
 }
 
-/** Official /usage + sub2api: utilization is percent 0–100. */
+/** OAuth usage reports utilization as a percentage from 0 to 100. */
 export function normUsagePercent(v) {
   const n = rawNumber(v)
   if (n == null || n < 0) return null
@@ -149,7 +148,7 @@ export function interpretOfficialUsage(data = {}) {
   }
 }
 
-/** sub2api AccountUsageService.buildUsageInfo. */
+/** Read the supported usage windows without rescaling their percentages. */
 export function interpretSub2apiUsage(data = {}) {
   const fiveHour = viewWindow(data.five_hour, 'percent')
   const sevenDay = viewWindow(data.seven_day, 'percent')

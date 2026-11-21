@@ -48,12 +48,19 @@ const COLUMNS = [
   'created_at',
   'updated_at',
   'domain_forward',
+  'dns_disable_svcb_https',
 ]
 
 function rowToProxy(row) {
   if (!row) return null
-  // ProxyPool still speaks `scheme`; the column is sub2api's `protocol`.
-  return { ...row, scheme: row.protocol, enabled: !!row.enabled, domain_forward: !!row.domain_forward }
+  // ProxyPool uses `scheme`; the stored column is `protocol`.
+  return {
+    ...row,
+    scheme: row.protocol,
+    enabled: !!row.enabled,
+    domain_forward: !!row.domain_forward,
+    dns_disable_svcb_https: !!row.dns_disable_svcb_https,
+  }
 }
 
 export class ProxiesRepo {
@@ -80,6 +87,7 @@ export class ProxiesRepo {
           ...COLUMNS.map((c) => {
             if (c === 'enabled') return p.enabled === false ? 0 : 1
             if (c === 'domain_forward') return p.domain_forward ? 1 : 0
+            if (c === 'dns_disable_svcb_https') return p.dns_disable_svcb_https ? 1 : 0
             if (c === 'protocol') return p.scheme ?? p.protocol ?? 'socks5'
             if (c === 'name') return p.name ?? (p.host && p.port != null ? `${p.host}:${p.port}` : p.id)
             return p[c] ?? null

@@ -49,14 +49,22 @@ export function LiveSessionsPanel({ className }: { className?: string }) {
         }}
       />
 
-      <div className='flex items-center justify-between border-b border-slate-200 bg-slate-100/50 p-3 dark:border-white/[0.06] dark:bg-white/[0.02]'>
-        <div className='flex items-center gap-2'>
-          <Activity className='h-3.5 w-3.5 text-slate-500 dark:text-muted-foreground' />
-          <span className='font-mono text-xs font-medium tracking-wider text-slate-700 uppercase dark:text-foreground/80'>
-            活跃 Session
-          </span>
+      <div className='flex items-start justify-between gap-3 border-b border-slate-200 bg-slate-100/50 p-3 dark:border-white/[0.06] dark:bg-white/[0.02]'>
+        <div className='min-w-0'>
+          <div className='flex items-center gap-2'>
+            <Activity className='h-3.5 w-3.5 text-slate-500 dark:text-muted-foreground' />
+            <span className='font-mono text-xs font-medium tracking-wider text-slate-700 uppercase dark:text-foreground/80'>
+              活跃 Session
+            </span>
+          </div>
+          {query.data ? (
+            <p className='mt-1 font-mono text-xs font-medium text-primary'>
+              近 5 分钟 · 共 {total} 个
+              {total > sessions.length ? ` · 显示 ${sessions.length} 个` : ''}
+            </p>
+          ) : null}
         </div>
-        <div className='flex gap-1.5'>
+        <div className='flex shrink-0 gap-1.5'>
           <div className='h-2 w-2 rounded-full bg-rose-400/30 dark:bg-rose-500/20' />
           <div className='h-2 w-2 rounded-full bg-amber-400/30 dark:bg-amber-500/20' />
           <div className='h-2 w-2 rounded-full bg-emerald-400/30 dark:bg-emerald-500/20' />
@@ -154,8 +162,7 @@ export function LiveSessionsPanel({ className }: { className?: string }) {
           onClick={() => navigate({ to: '/logs' })}
           className='flex cursor-pointer items-center justify-center gap-1 border-t border-slate-200 bg-slate-100/50 p-2 text-xs text-slate-600 transition-colors hover:text-slate-900 dark:border-white/[0.06] dark:bg-white/[0.02] dark:text-muted-foreground dark:hover:text-foreground'
         >
-          <span>查看全部</span>
-          <span className='font-medium text-primary'>({total})</span>
+          <span>查看请求日志</span>
         </button>
       ) : null}
     </BentoCard>

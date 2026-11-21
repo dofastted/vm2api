@@ -280,7 +280,7 @@ function withUpstreamStream(claude) {
 
 /**
  * Downstream SSE only when the caller asked for it.
- * Anthropic / OpenAI default: omitted `stream` is JSON. NewAPI health probes
+ * Anthropic / OpenAI default: omitted `stream` is JSON. Some health probes
  * omit the field (Go omitempty) and then json.Unmarshal the body — SSE
  * (`event:…`) becomes `invalid character 'e' looking for beginning of value`.
  * An omitted `stream` streams only when Accept prefers SSE over JSON. Claude
@@ -883,6 +883,10 @@ function responsesToClaude(body, opts) {
     if (body[key] == null) continue
     if (typeof body[key] !== 'number' || !(body[key] >= 0 && body[key] <= 1))
       invalidResponses(key, 'must be between 0 and 1 for Claude')
+    // `between_tools` above is ours, not the caller's: effort `off` asked for no
+    // reasoning at all. Upstream still rejects non-default sampling under it, so
+    // the value is dropped silently instead of blaming the caller for our shape.
+    if (out.thinking?.type === 'between_tools') continue
     if (['adaptive', 'enabled'].includes(out.thinking?.type)) {
       if (body[key] !== 1 && !(key === 'top_p' && body[key] === 0.99))
         invalidResponses(key, 'non-default sampling is not supported with Claude thinking')
@@ -930,8 +934,8 @@ export function fromClaudeToOpenAIChat(claude, requestedModel, vmId, mode = 'con
 }
 
 /**
- * Claude usage → OpenAI Chat usage with cache detail
- * (sub2api apicompat ChatTokenDetails counterpart: cached_tokens / cache_creation_tokens).
+ * Convert Claude usage to OpenAI Chat usage with cache details
+ * (`cached_tokens` / `cache_creation_tokens`).
  * Anthropic input is uncached; details are added to form inclusive prompt_tokens.
  * OpenAI-inclusive usage is passed through without adding cache again.
  * reasoning_tokens is a subset of completion_tokens and is never added to it.

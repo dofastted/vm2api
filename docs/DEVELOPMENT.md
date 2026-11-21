@@ -33,22 +33,22 @@ git worktree add ../vm2api-wt-<slug> -b feat/<slug> origin/dev
 
 ```sh
 git -C ../vm2api-wt-<slug> status --porcelain    # 必须为空，有改动先确认去留
-git worktree remove ../vm2api-wt-<slug>
+git worktree remove ../vm2api-wt-<slug>          # 同时删目录并注销注册，不需要再 prune
 git branch -d feat/<slug>                        # 未合并的分支 -d 会拒绝，先确认再 -D
 git push origin --delete feat/<slug>             # 远端分支未被自动删除时
-git worktree prune
 ```
 
 - 有未提交改动、未推送提交或打开中的 PR，不删；先问清楚。
 - 不是工作树的残留目录（`git worktree list` 里没有）只在确认无用后删除。
 - 不删除别人的工作树，不在别人正在使用的工作树里切分支。
+- **不要执行 `git worktree prune`**（`git` 与 `git.exe` 都不要）。本仓库会被 WSL 与 Windows 两侧的 git 操作，各自把对方注册的路径读成"不存在"：WSL 注册的 `/mnt/x/...` 在 `git.exe` 看来是 prunable，`X:/...` 在 WSL `git` 看来也是 prunable。一次 prune 会删掉另一侧的工作树注册，让其中未提交的改动失联。`worktree remove` 已经注销注册；它失败（如 `node_modules` 路径过长）时留着目录并说明，不要退回 `rm -rf` 加 prune。工作树路径按建它的 git 写：WSL 侧 git 用 `/mnt/x/...`，`git.exe` 用 `X:/...`；需要两侧长期并存就改用独立 `git clone`。
 
 ## 环境清理
 
 | 时机 | 清理什么 | 保留什么 |
 |---|---|---|
 | PR 合并后 | 该任务的工作树、本地与远端任务分支 | 主工作区 |
-| 每周或磁盘紧张时 | `git worktree prune`、`git fetch --prune`，删除已合并的本地分支 | `dev`、`main`、有未合并改动的分支 |
+| 每周或磁盘紧张时 | `git fetch --prune`，删除已合并的本地分支（不要 `git worktree prune`，见上） | `dev`、`main`、有未合并改动的分支 |
 | 构建验证完成后 | 临时产物（`/tmp` 下的打包、校验目录，`dist/` 暂存） | 已钉进 `deploy/payload.json` 的发布资产、部署备份 |
 
 清理前先看目标内容；不删 `vms/`、`data/`、设备授权和部署备份。
@@ -75,9 +75,25 @@ git worktree prune
 
 `ci` 始终会启动，再由 `changes` 决定跳过哪些步骤。它是必过检查，所以不能用 `paths-ignore` 跳过整个工作流，否则 PR 会一直挂着等待检查结果。
 
+## CHANGELOG
+
+**PR 不要改 `CHANGELOG.md`。** 版本记录在发版时统一写。
+
+`## Unreleased` 是个单点：每个 PR 都往同一处追加 bullet，所以任意两个这种 PR 之间互相冲突，而一次发版把该小节收进版本号之后，所有挂着的 PR 同时失效——1.4.171 发版一次性作废了三个本来干净的 PR（#1397、#1361、#1354），它们的代码都能自动合并，只冲突 CHANGELOG。
+
+它也没真正起到作用：1.4.171 的 30 个 PR 里只有 1 个在 Unreleased 留了记录，小节终究是从合并提交列表反查重建的。所以把反查写成正式步骤：
+
+```
+git log --format='%s' v<上一版>..origin/dev --merges | grep -oP '#\d+ from \S+'
+```
+
+拿到 PR 列表后逐个核对各分支的提交信息再落条目，不要只凭 PR 描述——描述可能停在首个提交，后续提交会改掉设计。
+
+想让某个改动的说明不丢，写在 PR 描述和提交信息里即可。
+
 ## 发版
 
-1. 在 `dev` 上开一个 `chore/release-v<VERSION>` 分支，更新 `VERSION`、`CHANGELOG.md`，需要时更新 `deploy/payload.json`，PR 合入 `dev`。
+1. 在 `dev` 上开一个 `chore/release-v<VERSION>` 分支，更新 `VERSION` 与 `CHANGELOG.md`（按上一节反查重建本版小节），需要时更新 `deploy/payload.json`，PR 合入 `dev`。
 2. 开 PR `dev → main`，用普通 merge（不 squash），保持两条分支历史一致。
 3. 在 `main` 的合并提交上打 tag `v<VERSION>` 并推送，`release` 自动执行。
 4. 核对附件和镜像，再按部署流程上线。发布与部署是两件事，见 [BUILD.md](BUILD.md)、[DEPLOY.md](DEPLOY.md)。

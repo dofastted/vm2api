@@ -239,9 +239,8 @@ function HealthCacheCard({
       <CardHeader>
         <CardTitle>健康缓存</CardTitle>
         <p className='text-xs text-muted-foreground'>
-          定时用真实槽位跑一次对话并缓存结果。new-api 渠道测试、sub2api
-          账号测试这类 hi / ping 请求直接回放缓存，覆盖
-          Messages、Chat、Responses 的流式和非流式。
+          定时用真实槽位跑一次对话并缓存结果。渠道或账号测试发出的简短 hi / ping
+          探测请求直接回放缓存，覆盖 Messages、Chat、Responses 的流式和非流式。
         </p>
       </CardHeader>
       <CardContent className='divide-y'>
@@ -361,8 +360,8 @@ function SignatureRepairCard({
       <CardContent className='flex items-start justify-between gap-4'>
         <div className='space-y-1 text-sm text-muted-foreground'>
           <p>
-            上游因思考签名返回 400 时，剥掉思考历史后重试一次，客户端最终看到
-            200。
+            上游因思考签名返回 400
+            时，清理思考历史后重试一次；最终结果取决于重试。
           </p>
           <p>
             关闭则保留同账号的 thinking / signature

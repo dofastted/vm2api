@@ -440,8 +440,8 @@ export function highestInboundCacheTtl(body, fallback = DEFAULT_CACHE_TTL) {
 
 /**
  * The caller's own system breakpoint, which persona drops when it rebuilds the
- * array. sub2api keeps the last original marker as the closest equivalent
- * boundary; the outbound tail block is that boundary here.
+ * array. Keep the last original marker on the outbound tail block, the closest
+ * equivalent boundary.
  */
 export function callerSystemCacheControl(body) {
   if (!body || typeof body !== 'object' || !Array.isArray(body.system)) return null

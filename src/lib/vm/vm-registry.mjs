@@ -613,21 +613,39 @@ export function clearScheduleHold(projectRoot, id, reason, { tag = null } = {}) 
   })
 }
 
-/** A probe may only change its current binding's automatic proxy hold. */
+/**
+ * Automatic proxy holds: probe failures, egress outages, and the legacy
+ * `|proxy=` markers. `proxy_manually_disabled` is operator intent and is never
+ * lifted by a probe.
+ */
+const AUTOMATIC_PROXY_HOLD = /^(egress_down|proxy_probe_failed)(:|$)|\|proxy=/
+
+/**
+ * Reconcile the slot's automatic proxy hold against its current binding.
+ *
+ * A hold carries the proxy it was written for. Re-binding the slot leaves that
+ * tag pointing at a proxy the slot no longer uses, and every clearing path is
+ * tag-guarded, so the slot stayed restricted forever while the panel blamed a
+ * proxy that was already healthy (#1395). A tag that is not the current binding
+ * therefore no longer protects the hold -- it only limits which holds a probe is
+ * allowed to interpret.
+ */
 export function reconcileProxyScheduleHold(projectRoot, id, proxyId, failure = null) {
   return writeSchedule(projectRoot, id, (vm) => {
     if (vm.proxy?.id !== proxyId) return false
     const hold = vm.schedule_hold
     const tag = hold?.detail?.tag
-    if (hold && (hold.reason !== HOLD_PROXY || (tag != null && tag !== proxyId))) return false
+    if (hold && hold.reason !== HOLD_PROXY) return false
+    const manual = hold?.detail?.message === 'proxy_manually_disabled'
     if (failure != null) {
-      if (hold?.detail?.message === 'proxy_manually_disabled' || (tag === proxyId && hold?.detail?.message === failure))
-        return false
+      if (manual || (tag === proxyId && hold?.detail?.message === failure)) return false
+      // Retag: the hold has to describe the binding it now applies to.
       return applyHold(vm, HOLD_PROXY, { tag: proxyId, message: failure })
     }
-    if (!hold || hold.detail?.message === 'proxy_manually_disabled') return false
-    // Pre-tag migration only emitted these automatic failure reasons.
-    if (tag == null && !/^(egress_down|proxy_probe_failed)(:|$)/.test(hold.detail?.message || '')) return false
+    if (!hold || manual) return false
+    // A hold tagged for another proxy (or an untagged pre-migration one) is only
+    // liftable when a probe wrote it; an unrecognised message keeps its hold.
+    if (tag !== proxyId && !AUTOMATIC_PROXY_HOLD.test(hold.detail?.message || '')) return false
     return applyClearHold(vm, HOLD_PROXY, { tag })
   })
 }
@@ -805,7 +823,15 @@ export function bindVmProxy(projectRoot, id, proxyInfo) {
   vm.proxy_cli_enabled = hasBoundExit(vm.proxy)
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm)
-  return summarizeVm(vm)
+  // Re-binding changes the premise of an automatic proxy hold: the proxy it was
+  // written for is no longer this slot's exit. Every clearing path is tag-guarded,
+  // so without reconciling here the slot stayed restricted until the new proxy's
+  // next scheduled probe -- a full probe interval, and never at all when that
+  // proxy was already healthy before the probe that follows (#1395). A manual
+  // hold and another subsystem's hold are preserved inside the reconcile, and a
+  // new exit that turns out to be broken gets a fresh hold from its own probe.
+  const reconciled = vm.proxy?.id ? reconcileProxyScheduleHold(projectRoot, id, vm.proxy.id) : null
+  return reconciled || summarizeVm(vm)
 }
 
 /**

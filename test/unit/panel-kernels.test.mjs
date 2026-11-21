@@ -331,6 +331,71 @@ test('pull route updates cache only and returns actionable paid asset failure wi
   }
 })
 
+test('catalog reports the deployed CRAG pin and omits an unusable one', async (t) => {
+  const { root } = fixture(t)
+  const deploy = path.join(root, 'deploy')
+  const pin = async () => (await route(root, 'GET', '')).body.data.crag_pin
+  assert.equal(await pin(), null, '没有 deploy/payload.json 时不应编造 pin')
+  fs.mkdirSync(deploy)
+  // A release tag is not a CRAG payload tag and must not be offered as one.
+  fs.writeFileSync(path.join(deploy, 'payload.json'), JSON.stringify({ crag_release: 'v1.2.3' }))
+  assert.equal(await pin(), null)
+  fs.writeFileSync(path.join(deploy, 'payload.json'), JSON.stringify({ crag_release: 'payload-2026.11.14-crag-1.2.1' }))
+  assert.deepEqual(await pin(), { tag: 'payload-2026.11.14-crag-1.2.1' }, '未收录的载荷仍要给出 tag')
+  fs.writeFileSync(
+    path.join(deploy, 'payload.json'),
+    JSON.stringify({ crag_release: 'payload-2026.11.21-crag-3.1.12' }),
+  )
+  const known = await pin()
+  assert.equal(known.tag, 'payload-2026.11.21-crag-3.1.12')
+  assert.match(known.label, /3\.1\.12/)
+  // The pin describes the release, never the cached package.
+  const body = (await route(root, 'GET', '')).body.data
+  assert.equal(body.kernels[1].id, 'crag')
+  assert.equal(body.kernels[1].payload_tag, undefined)
+})
+
+test('pull route follows the release pin only when the caller asks for it', async (t) => {
+  const { root } = fixture(t)
+  fs.mkdirSync(path.join(root, 'deploy'))
+  fs.writeFileSync(
+    path.join(root, 'deploy/payload.json'),
+    JSON.stringify({ crag_release: 'payload-2026.11.14-crag-1.2.1' }),
+  )
+  const asked = []
+  const options = {
+    ctx: {
+      fetchImpl: async (url) => {
+        asked.push(String(url))
+        return Response.json([])
+      },
+    },
+  }
+  const pinned = await route(root, 'POST', '/pull', { kernel: 'crag', latest: false }, options)
+  assert.notEqual(pinned.status, 200)
+  assert.ok(
+    asked.some((href) => href.endsWith('/releases/tags/payload-2026.11.14-crag-1.2.1')),
+    `应请求被 pin 的载荷，实际为 ${JSON.stringify(asked)}`,
+  )
+  asked.length = 0
+  // Omitting the flag keeps the existing two-step behaviour: newest release.
+  await route(root, 'POST', '/pull', { kernel: 'crag' }, options)
+  assert.equal(
+    asked.some((href) => href.includes('payload-2026.11.14-crag-1.2.1')),
+    false,
+    '默认不应走 pin',
+  )
+  for (const latest of ['false', 0, null]) {
+    const rejected = await route(root, 'POST', '/pull', { kernel: 'crag', latest }, options)
+    if (latest === null) {
+      assert.notEqual(rejected.body.error?.code, 'kernel_target_invalid', 'null 视为未提供')
+      continue
+    }
+    assert.equal(rejected.status, 400)
+    assert.equal(rejected.body.error.code, 'kernel_target_invalid')
+  }
+})
+
 test('cached route lists every cached release and select switches back without downloading', async (t) => {
   const { root } = fixture(t)
   let downloads = 0

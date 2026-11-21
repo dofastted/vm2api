@@ -1,5 +1,5 @@
 /**
- * Request logging — sub2api UsageLog + access-log inspired (SQLite-backed).
+ * SQLite-backed request logs for access, usage, and billing.
  *
  * Modes:
  *   off    — no writes
@@ -82,10 +82,48 @@ function safeIp(req) {
   return String(raw).slice(0, 45)
 }
 
+/**
+ * Catalog size as the model sees it. `tools.length` alone cannot tell four
+ * top-level entries from the ~1400 callable functions a namespaced plugin
+ * catalog expands to, which is the shape that reaches an output-token limit
+ * (#1310). Also records whether the caller already asked for deferred loading,
+ * so a request that handles its own catalog is distinguishable from one that
+ * does not.
+ */
+function summarizeTools(tools) {
+  const empty = { count: 0, functions: 0, bytes: 0, deferred: 0, search: false }
+  if (!Array.isArray(tools) || !tools.length) return empty
+  let functions = 0
+  let deferred = 0
+  let search = false
+  const visit = (tool) => {
+    if (!tool || typeof tool !== 'object') return
+    const type = typeof tool.type === 'string' ? tool.type.trim() : ''
+    if (type.startsWith('tool_search')) search = true
+    if (tool.defer_loading === true || tool.custom?.defer_loading === true) deferred += 1
+    const members = Array.isArray(tool.tools) ? tool.tools : null
+    if (members) {
+      // A namespace is a container; only its members are callable.
+      for (const member of members) visit(member)
+      return
+    }
+    if (type === 'function' || type === 'custom' || (!type && typeof tool.name === 'string')) functions += 1
+  }
+  for (const tool of tools) visit(tool)
+  let bytes = 0
+  try {
+    bytes = Buffer.byteLength(JSON.stringify(tools))
+  } catch {
+    // An unserializable catalog still reports its counts.
+  }
+  return { count: tools.length, functions, bytes, deferred, search }
+}
+
 function summarizeBody(body) {
   if (!body || typeof body !== 'object') return { empty: true }
   const messages = Array.isArray(body.messages) ? body.messages : null
   const roles = messages ? messages.map((m) => m?.role).filter(Boolean) : []
+  const toolStats = summarizeTools(body.tools)
   let systemLen = 0
   if (typeof body.system === 'string') systemLen = body.system.length
   else if (Array.isArray(body.system)) {
@@ -98,6 +136,10 @@ function summarizeBody(body) {
     messages_count: messages ? messages.length : body.input != null ? 1 : 0,
     roles,
     tools_count: Array.isArray(body.tools) ? body.tools.length : 0,
+    tool_functions_count: toolStats.functions,
+    tools_bytes: toolStats.bytes,
+    tools_deferred_count: toolStats.deferred,
+    tools_search_declared: toolStats.search,
     has_thinking: body.thinking != null,
     system_len: systemLen,
     top_level_keys: Object.keys(body).sort(),
@@ -600,7 +642,7 @@ export class RequestLogStore {
       image_usage: extra.image_usage ? JSON.stringify(extra.image_usage) : null,
       image_input_tokens: imageTokenCount(extra.image_usage?.input_tokens),
       image_output_tokens: imageTokenCount(extra.image_usage?.output_tokens),
-      // sub2api ownership + billing columns
+      // Ownership and billing columns
       user_id: extra.user_id ?? null,
       vm_owner_user_id: null,
       group_id: extra.group_id ?? 1,
@@ -608,7 +650,7 @@ export class RequestLogStore {
       ...costColumnsForLog(billedUsage, extra.upstream_model || extra.model || extra.requested_model, extra),
       upstream_service_tier: extra.upstream_service_tier || null,
     }
-    // sub2api actual_cost: official cost × group rate multiplier (0 is a valid rate)
+    // Unless supplied, actual_cost is the official cost × group rate (0 is valid).
     if (summary.total_cost != null) {
       summary.actual_cost = extra.actual_cost ?? summary.total_cost * summary.rate_multiplier
     }

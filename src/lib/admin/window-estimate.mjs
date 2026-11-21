@@ -1,12 +1,12 @@
 /**
- * Subscription window capacity estimate (magpie window_holds): the vendor
- * reports only used%, so the whole window ≈ official spend logged in it ÷ used%.
+ * The vendor reports only the share of the subscription window used, so
+ * estimated capacity ≈ official spend logged in the window ÷ used fraction.
  * Every input must cover the same window, otherwise the ratio is meaningless
  * and the status says why instead of showing a number.
  */
 import { parseResetMs, toPercentUsed } from '../pool/quota-window.mjs'
 
-/** Below this the vendor's rounding dominates the ratio (magpie HoldsFloor). */
+/** Below 5% used, the vendor's rounding dominates the estimate. */
 export const ESTIMATE_MIN_USED_RATIO = 0.05
 
 function round(v, digits) {

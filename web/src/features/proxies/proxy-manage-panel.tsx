@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import type { VmProxySnap } from '@/types/panel-vm'
 import { toast } from 'sonner'
@@ -14,29 +14,50 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { ProxyPanel } from './proxy-panel'
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { SeatCells } from './proxy-seats'
-import { proxyBoundIds } from './proxy-sort'
+import { proxyBoundIds, proxyIsLocal } from './proxy-sort'
 import { useRefreshProxies } from './queries'
 
 const BIND_LIMITS = [1, 2, 3, 4, 5, 8, 10, 16, 20, 32]
 const PROBE_MINS = [5, 10, 30, 60]
-// The chosen upstream is tried first; the existing automatic fallback order
-// is unchanged, including when a domain or custom HTTPS endpoint is selected.
+// 选中的那个排第一，其余内置上游仍按原顺序排在后面做 fallback；
+// 选域名或自定义 HTTPS 时这个 fallback 顺序也不变。
 const DNS_CHOICES = [
-  { value: 'auto', label: '自动（默认顺序）' },
-  { value: 'https://1.1.1.1/dns-query', label: 'Cloudflare DoH' },
+  { value: 'auto', label: '自动挑最快的' },
+  { value: 'https://1.1.1.1/dns-query', label: 'Cloudflare（加密）' },
   {
     value: 'https://cloudflare-dns.com/dns-query',
-    label: 'Cloudflare DoH（域名）',
+    label: 'Cloudflare（加密，走域名）',
   },
-  { value: 'https://8.8.8.8/dns-query', label: 'Google DoH' },
-  { value: '8.8.8.8:53', label: 'Google TCP 53（明文）' },
-  { value: '1.1.1.1:53', label: 'Cloudflare TCP 53（明文）' },
+  { value: 'https://8.8.8.8/dns-query', label: 'Google（加密）' },
+  { value: '8.8.8.8:53', label: 'Google（不加密）' },
+  { value: '1.1.1.1:53', label: 'Cloudflare（不加密）' },
 ]
 
 type ConfigResult = {
   egress?: { proxy_id: string; ok: boolean; error?: string | null }[]
+}
+
+/** 本次能改的池级字段。DNS 屏蔽开关不在其中：它是逐条写入的批量动作。 */
+type Draft = {
+  bind_limit: number
+  probe_interval_min: number
+  dns_primary: string
+  follow_proxy_timezone: boolean
+}
+
+function reportEgress(data: ConfigResult, okText: string) {
+  const failed = (data.egress || []).filter((entry) => !entry.ok)
+  if (failed.length) {
+    toast.warning(
+      `已保存，但 ${failed.length} 条代理的出口没重载成功：${failed
+        .map((entry) => entry.proxy_id)
+        .join('、')}`
+    )
+    return
+  }
+  toast.success(okText)
 }
 
 export function ProxyManagePanel({
@@ -44,123 +65,181 @@ export function ProxyManagePanel({
   bindLimit,
   probeMin,
   dnsPrimary,
-  dnsDisableSvcbHttps,
   followProxyTimezone,
+  onDirtyChange,
 }: {
   proxies: VmProxySnap[]
   bindLimit: number
   probeMin: number
   dnsPrimary: string
-  dnsDisableSvcbHttps: boolean
   followProxyTimezone: boolean
+  /** 有未保存改动时上报，抽屉据此拦住关闭。 */
+  onDirtyChange?: (dirty: boolean) => void
 }) {
   const refresh = useRefreshProxies()
-  const [customDnsDraft, setCustomDnsDraft] = useState<string | null>(null)
+  const saved: Draft = useMemo(
+    () => ({
+      bind_limit: bindLimit,
+      probe_interval_min: probeMin,
+      dns_primary: dnsPrimary,
+      follow_proxy_timezone: followProxyTimezone,
+    }),
+    [bindLimit, probeMin, dnsPrimary, followProxyTimezone]
+  )
+  const [draft, setDraft] = useState<Draft>(saved)
+  // 自定义 DoH 的输入框是否展开。null = 跟随 draft 判断，避免一边输入一边
+  // 被「这个值不在预设里」的推断反复开合。
+  const [customOpen, setCustomOpen] = useState<boolean | null>(null)
+
+  const dirtyKeys = useMemo(
+    () =>
+      (Object.keys(saved) as (keyof Draft)[]).filter(
+        (k) => draft[k] !== saved[k]
+      ),
+    [draft, saved]
+  )
+  const dirty = dirtyKeys.length > 0
+
+  useEffect(() => {
+    onDirtyChange?.(dirty)
+  }, [dirty, onDirtyChange])
+
+  // 外部值变了（别处保存、后台刷新）且本地没在改，就跟上。
+  useEffect(() => {
+    if (!dirty) setDraft(saved)
+    // dirty 变化本身不该触发同步：只在 saved 变动时对齐。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [saved])
+
+  // 本地代理没有自己的 kin-egress helper，带不了这个开关。判定与后端
+  // isLocalEgressProxy 对齐：节点那几条 px-local-<node> 也要排除。
+  const outlets = useMemo(
+    () => proxies.filter((p) => !proxyIsLocal(p)),
+    [proxies]
+  )
+  const blocked = outlets.filter((p) => p.dns_disable_svcb_https === true)
+  const blockedBound = blocked.filter((p) => proxyBoundIds(p).length).length
+  const allBlocked = outlets.length > 0 && blocked.length === outlets.length
+  const [bulkTarget, setBulkTarget] = useState<boolean | null>(null)
+
   const maxUsed = proxies.reduce(
     (n, p) => Math.max(n, proxyBoundIds(p).length),
     0
   )
 
-  const saveConfig = useMutation({
-    mutationFn: (patch: Record<string, unknown>) =>
-      api<ConfigResult>('/api/panel/proxies/config', {
+  const save = useMutation({
+    mutationFn: () => {
+      const patch: Record<string, unknown> = {}
+      for (const key of dirtyKeys) patch[key] = draft[key]
+      return api<ConfigResult>('/api/panel/proxies/config', {
         method: 'PUT',
         body: JSON.stringify(patch),
-      }),
-    onSuccess: async (data, patch) => {
-      const failed = (data.egress || []).filter((entry) => !entry.ok)
-      if (failed.length) {
-        toast.warning(
-          `DNS 已保存，但 ${failed.length} 个出口重载失败：${failed.map((entry) => entry.proxy_id).join('、')}`
-        )
-      } else if (
-        patch.dns_primary != null ||
-        patch.dns_disable_svcb_https != null
-      ) {
-        toast.success('出口 DNS 已保存，本机出口已同步')
-      } else if (patch.bind_limit != null) {
-        toast.success(`每条最多绑 ${String(patch.bind_limit)} 台`)
-      } else if (patch.probe_interval_min != null) {
-        toast.success(`探测间隔 ${String(patch.probe_interval_min)} 分钟`)
-      } else {
-        toast.success('已保存')
-      }
+      })
+    },
+    onSuccess: async (data) => {
+      reportEgress(data, '代理池设置已保存')
+      setCustomOpen(null)
       await refresh()
-      if (patch.dns_primary != null) setCustomDnsDraft(null)
     },
     onError: (error: Error) => toast.error(error.message),
   })
 
-  // 保存中的值先行显示，避免选中后按钮跳回旧值再跳到新值。
-  const pending = saveConfig.isPending ? saveConfig.variables : undefined
-  const limitShown = Number(pending?.bind_limit ?? bindLimit)
-  const probeShown = Number(pending?.probe_interval_min ?? probeMin)
-  const dnsShown = String(pending?.dns_primary ?? dnsPrimary)
-  const dnsDisableShown = Boolean(
-    pending?.dns_disable_svcb_https ?? dnsDisableSvcbHttps
-  )
-  const customDnsShown =
-    customDnsDraft !== null ||
-    !DNS_CHOICES.some((choice) => choice.value === dnsShown)
-  const over = proxies.filter((p) => proxyBoundIds(p).length > limitShown)
+  // 批量动作不进草稿：它逐条写入每个代理，确认后立即执行。
+  const applyAll = useMutation({
+    mutationFn: (value: boolean) =>
+      api<ConfigResult>('/api/panel/proxies/config', {
+        method: 'PUT',
+        body: JSON.stringify({ dns_disable_svcb_https: value }),
+      }),
+    onSuccess: async (data, value) => {
+      reportEgress(
+        data,
+        value
+          ? `已对 ${outlets.length} 条代理开启屏蔽`
+          : `已对 ${outlets.length} 条代理关闭屏蔽`
+      )
+      setBulkTarget(null)
+      await refresh()
+    },
+    onError: (error: Error) => {
+      toast.error(error.message)
+      setBulkTarget(null)
+    },
+  })
+
+  const busy = save.isPending || applyAll.isPending
+  const customShown =
+    customOpen ??
+    !DNS_CHOICES.some((choice) => choice.value === draft.dns_primary)
+  const over = proxies.filter((p) => proxyBoundIds(p).length > draft.bind_limit)
+  const dnsInvalid = customShown && !/^https:\/\/.+/.test(draft.dns_primary)
 
   return (
-    <ProxyPanel title='池设置' plain>
-      <div className='space-y-5'>
+    <div className='flex min-h-0 flex-1 flex-col'>
+      <div className='min-h-0 flex-1 space-y-5 overflow-y-auto p-4'>
         <fieldset>
           <legend className='flex w-full items-baseline justify-between text-xs font-medium'>
-            每条代理最多绑
+            <span>
+              每条代理最多带几台机器
+              <Unsaved on={dirtyKeys.includes('bind_limit')} />
+            </span>
             <span className='text-muted-foreground tabular-nums'>
-              容量 {proxies.length} × {limitShown} ={' '}
+              总共能带 {proxies.length} × {draft.bind_limit} ={' '}
               <b className='font-semibold text-foreground'>
-                {proxies.length * limitShown}
+                {proxies.length * draft.bind_limit}
               </b>
             </span>
           </legend>
           <div className='mt-2 flex items-center gap-3'>
             <span className='inline-flex w-14 items-baseline gap-0.5 tabular-nums'>
               <span className='text-2xl leading-none font-[620] tracking-[-0.03em]'>
-                {limitShown}
+                {draft.bind_limit}
               </span>
               <span className='text-xs text-muted-foreground'>台</span>
             </span>
             <SeatCells
               used={maxUsed}
-              limit={limitShown}
+              limit={draft.bind_limit}
               color='var(--status-ok-solid)'
               className='min-w-0 flex-1'
             />
           </div>
           <Segmented
-            label='每条代理最多绑定台数'
+            label='每条代理最多带几台机器'
             options={BIND_LIMITS}
-            value={limitShown}
-            disabled={saveConfig.isPending}
-            onChange={(value) => saveConfig.mutate({ bind_limit: value })}
+            value={draft.bind_limit}
+            disabled={busy}
+            onChange={(value) => setDraft((d) => ({ ...d, bind_limit: value }))}
             className='mt-2 grid-cols-5'
           />
           <p className='mt-1.5 text-[11px] text-muted-foreground'>
             {over.length
-              ? `${over.length} 条代理已绑超过 ${limitShown} 台：现有绑定保留，只是不再接新槽位。`
+              ? `有 ${over.length} 条代理已经带超过 ${draft.bind_limit} 台：已经带着的不会被踢掉，只是不再接新的。`
               : maxUsed
-                ? `亮格为当前绑得最多的一条（${maxUsed} 台）。`
-                : '调低不会踢掉已绑的槽位。'}
+                ? `亮起来的格子是目前带得最多的那条（${maxUsed} 台）。`
+                : '改小不会踢掉已经带着的机器。'}
           </p>
         </fieldset>
 
         <fieldset>
-          <legend className='text-xs font-medium'>自动探测间隔</legend>
+          <legend className='text-xs font-medium'>
+            多久自动测一次通不通
+            <Unsaved on={dirtyKeys.includes('probe_interval_min')} />
+          </legend>
           <Segmented
-            label='自动探测间隔（分钟）'
+            label='多久自动测一次通不通'
             options={PROBE_MINS}
-            value={probeShown}
+            value={draft.probe_interval_min}
             suffix='分'
-            disabled={saveConfig.isPending}
+            disabled={busy}
             onChange={(value) =>
-              saveConfig.mutate({ probe_interval_min: value })
+              setDraft((d) => ({ ...d, probe_interval_min: value }))
             }
             className='mt-2 grid-cols-4'
           />
+          <p className='mt-1.5 text-[11px] text-muted-foreground'>
+            测不通的代理会自动停用，带着的机器也会暂停派活。
+          </p>
         </fieldset>
 
         <div>
@@ -168,20 +247,31 @@ export function ProxyManagePanel({
             htmlFor='proxy-dns'
             className='flex items-baseline justify-between text-xs font-medium'
           >
-            出口 DNS
+            <span>
+              域名解析走哪里
+              <Unsaved on={dirtyKeys.includes('dns_primary')} />
+            </span>
             <span className='font-normal text-muted-foreground'>
-              失败自动换下一个
+              这个不通会自动换下一个
             </span>
           </label>
           <Select
-            value={customDnsShown ? 'custom' : dnsShown}
-            disabled={saveConfig.isPending}
+            value={customShown ? 'custom' : draft.dns_primary}
+            disabled={busy}
             onValueChange={(value) => {
               if (value === 'custom') {
-                setCustomDnsDraft(customDnsShown ? dnsShown : '')
+                setCustomOpen(true)
+                setDraft((d) => ({
+                  ...d,
+                  dns_primary: DNS_CHOICES.some(
+                    (c) => c.value === d.dns_primary
+                  )
+                    ? ''
+                    : d.dns_primary,
+                }))
               } else {
-                setCustomDnsDraft(null)
-                saveConfig.mutate({ dns_primary: value })
+                setCustomOpen(false)
+                setDraft((d) => ({ ...d, dns_primary: value }))
               }
             }}
           >
@@ -194,31 +284,23 @@ export function ProxyManagePanel({
                   {choice.label}
                 </SelectItem>
               ))}
-              <SelectItem value='custom'>自定义 HTTPS DoH</SelectItem>
+              <SelectItem value='custom'>填自己的加密 DNS</SelectItem>
             </SelectContent>
           </Select>
-          {customDnsShown && (
-            <form
-              className='mt-2 space-y-2'
-              onSubmit={(event) => {
-                event.preventDefault()
-                if (!saveConfig.isPending) {
-                  saveConfig.mutate({ dns_primary: customDnsDraft ?? dnsShown })
-                }
-              }}
-            >
+          {customShown && (
+            <div className='mt-2 space-y-2'>
               <label htmlFor='proxy-dns-url' className='text-xs font-medium'>
-                自定义 DoH URL
+                你的加密 DNS 地址
               </label>
               <Input
                 id='proxy-dns-url'
                 type='url'
-                required
-                title='请输入完整的 HTTPS DoH URL，例如 https://dns.example.com/dns-query'
-                pattern='https://.+'
-                value={customDnsDraft ?? dnsShown}
-                onChange={(event) => setCustomDnsDraft(event.target.value)}
-                disabled={saveConfig.isPending}
+                value={draft.dns_primary}
+                onChange={(event) =>
+                  setDraft((d) => ({ ...d, dns_primary: event.target.value }))
+                }
+                disabled={busy}
+                aria-invalid={dnsInvalid}
                 placeholder='https://dns.example.com/dns-query'
                 aria-describedby='proxy-dns-url-help'
                 className='h-8 text-xs'
@@ -227,47 +309,44 @@ export function ProxyManagePanel({
                 id='proxy-dns-url-help'
                 className='text-[11px] text-muted-foreground'
               >
-                输入完整 HTTPS URL，支持域名或 IP（IPv6
-                地址需加方括号）；不能包含用户名、密码、片段（#）或逗号。
+                要完整的 https:// 地址，域名或 IP 都行（IPv6
+                要用方括号括起来）。不能带用户名、密码、井号和逗号。
               </p>
-              <Button
-                type='submit'
-                size='sm'
-                variant='outline'
-                disabled={saveConfig.isPending}
-                loading={saveConfig.isPending}
-              >
-                保存 DNS
-              </Button>
-            </form>
+            </div>
           )}
         </div>
 
         <div className='flex items-start justify-between gap-3'>
           <div className='space-y-0.5'>
             <label
-              htmlFor='proxy-dns-empty-types'
+              htmlFor='proxy-dns-block-all'
               className='block text-xs font-medium'
             >
-              关闭 DNS type 64 / 65
+              屏蔽 HTTP/3 与加密 SNI 探测
             </label>
             <p
-              id='proxy-dns-empty-types-help'
+              id='proxy-dns-block-all-help'
               className='text-[11px] text-muted-foreground'
             >
-              通过 DNS 覆写让 SVCB（64）、HTTPS（65）返回空答案；A / AAAA
-              解析不受影响。 仅用于 SOCKS5
-              出口，集群出口在下次启动或重载槽位时生效。
+              让浏览器查不到 HTTP/3 和加密 SNI 的线路，只走普通
+              HTTPS。网站照样打得开，正常域名解析不受影响。
+            </p>
+            <p className='text-[11px] text-muted-foreground'>
+              {outlets.length === 0
+                ? '现在还没有代理可以设置。'
+                : allBlocked
+                  ? `已对全部 ${outlets.length} 条代理开启。`
+                  : blocked.length === 0
+                    ? `全部 ${outlets.length} 条代理都没开启。`
+                    : `${outlets.length} 条代理里有 ${blocked.length} 条开着。这个开关一次改全部，想只改一条请到那条代理的「编辑」里。`}
             </p>
           </div>
           <Switch
-            id='proxy-dns-empty-types'
-            checked={dnsDisableShown}
-            disabled={saveConfig.isPending}
-            onCheckedChange={(value) =>
-              saveConfig.mutate({ dns_disable_svcb_https: value })
-            }
-            aria-describedby='proxy-dns-empty-types-help'
+            id='proxy-dns-block-all'
+            checked={allBlocked}
+            disabled={busy || outlets.length === 0}
+            onCheckedChange={(value) => setBulkTarget(value)}
+            aria-describedby='proxy-dns-block-all-help'
             className='mt-0.5'
           />
         </div>
@@ -275,23 +354,88 @@ export function ProxyManagePanel({
         <label className='flex cursor-pointer items-start justify-between gap-3'>
           <span className='space-y-0.5'>
             <span className='block text-xs font-medium'>
-              绑定后跟随代理时区
+              机器时间跟着代理所在地走
+              <Unsaved on={dirtyKeys.includes('follow_proxy_timezone')} />
             </span>
             <span className='block text-[11px] text-muted-foreground'>
-              手动钉过时区的槽位不受影响
+              手动设过时区的机器不受影响
             </span>
           </span>
           <Switch
-            checked={followProxyTimezone}
+            checked={draft.follow_proxy_timezone}
+            disabled={busy}
             onCheckedChange={(value) =>
-              saveConfig.mutate({ follow_proxy_timezone: value })
+              setDraft((d) => ({ ...d, follow_proxy_timezone: value }))
             }
-            aria-label='绑定后跟随代理时区'
+            aria-label='机器时间跟着代理所在地走'
             className='mt-0.5'
           />
         </label>
       </div>
-    </ProxyPanel>
+
+      <div className='flex items-center justify-end gap-2 border-t bg-background p-4'>
+        <p
+          className='me-auto text-[11px] text-muted-foreground'
+          aria-live='polite'
+        >
+          {dirty ? `有 ${dirtyKeys.length} 项还没保存` : '没有待保存的改动'}
+        </p>
+        <Button
+          variant='outline'
+          size='sm'
+          disabled={!dirty || busy}
+          onClick={() => {
+            setDraft(saved)
+            setCustomOpen(null)
+          }}
+        >
+          放弃改动
+        </Button>
+        <Button
+          size='sm'
+          disabled={!dirty || busy || dnsInvalid}
+          loading={save.isPending}
+          onClick={() => save.mutate()}
+        >
+          保存
+        </Button>
+      </div>
+
+      <ConfirmDialog
+        open={bulkTarget !== null}
+        onOpenChange={(open) => !open && setBulkTarget(null)}
+        title={bulkTarget ? '对所有代理开启屏蔽' : '对所有代理关闭屏蔽'}
+        desc={
+          bulkTarget
+            ? `会把全部 ${outlets.length} 条代理都设为屏蔽，包括现在没开的那些。`
+            : `会把全部 ${outlets.length} 条代理都设为不屏蔽，包括现在开着的 ${blocked.length} 条。`
+        }
+        confirmText={bulkTarget ? '全部开启' : '全部关闭'}
+        cancelBtnText='取消'
+        isLoading={applyAll.isPending}
+        handleConfirm={() => {
+          if (bulkTarget !== null) applyAll.mutate(bulkTarget)
+        }}
+      >
+        {blockedBound ||
+        (bulkTarget && outlets.some((p) => proxyBoundIds(p).length)) ? (
+          <p className='text-xs text-[color:var(--status-caution)]'>
+            带着机器的代理会重启出口，期间它们的网络会断一下。
+          </p>
+        ) : null}
+      </ConfirmDialog>
+    </div>
+  )
+}
+
+/** 未保存标记：圆点之外还有文字，不靠颜色单独承载信息。 */
+function Unsaved({ on }: { on: boolean }) {
+  if (!on) return null
+  return (
+    <span className='ms-1.5 inline-flex items-center gap-1 align-middle text-[10px] font-normal text-[color:var(--status-caution)]'>
+      <span aria-hidden='true' className='size-1.5 rounded-full bg-current' />
+      未保存
+    </span>
   )
 }
 

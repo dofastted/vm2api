@@ -16,7 +16,11 @@ type ImportResult = {
   probe?: { ok?: boolean; error?: string } | null
 }
 
-function progressOf(result: ImportResult | null, busy: boolean, tick: number) {
+export function progressOf(
+  result: ImportResult | null,
+  busy: boolean,
+  tick: number
+) {
   if (busy) {
     return {
       value: Math.min(88, 12 + tick),
@@ -36,12 +40,15 @@ function progressOf(result: ImportResult | null, busy: boolean, tick: number) {
       : !probed
         ? `${result.vm.id} 初装已排队，探测未完成`
         : `${result.vm.id} 已创建`
-  const detail = result.renamed_from
+  const renamed = result.renamed_from
     ? `${result.renamed_from} 已占用，落到 ${result.vm.id}`
-    : result.start_error ||
-      result.probe?.error ||
-      result.official_cc_bootstrap?.reason ||
-      ''
+    : ''
+  const failure =
+    result.start_error ||
+    result.probe?.error ||
+    result.official_cc_bootstrap?.reason ||
+    ''
+  const detail = [renamed, failure].filter(Boolean).join('；')
   return { value, label, detail }
 }
 

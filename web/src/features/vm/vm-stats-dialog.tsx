@@ -758,6 +758,10 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
           </div>
           <Skeleton className='h-64 rounded-xl' />
         </div>
+      ) : detail.isError && !view ? (
+        <div className='grid h-40 place-items-center rounded-xl border text-sm text-destructive'>
+          VM 统计加载失败
+        </div>
       ) : !view ? (
         <div className='grid h-40 place-items-center rounded-xl border text-sm text-muted-foreground'>
           暂无统计数据
@@ -778,9 +782,11 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
               label={`${view.summary.days} 天请求`}
               value={fmtNum(view.summary.requests)}
               hint={
-                view.summary.errors > 0
-                  ? `含 ${fmtNum(view.summary.errors)} 次失败`
-                  : '全部成功'
+                view.summary.requests === 0
+                  ? '窗口内无请求'
+                  : view.summary.errors > 0
+                    ? `含 ${fmtNum(view.summary.errors)} 次失败`
+                    : '全部成功'
               }
             />
             <MetricCard
@@ -835,7 +841,7 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             <InfoCard
               tone='bg-lime-500/15 text-lime-600 dark:text-lime-400'
               icon={<ClipboardList />}
-              title='7D 请求'
+              title='7 天额度窗口请求'
               rows={[
                 {
                   label: '成功',
@@ -875,7 +881,7 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
   )
 }
 
-/** 查看统计：近 30 天用量的可视化面板，版式参照 sub2api 的 AccountStatsModal。 */
+/** 查看近 30 天用量的可视化面板。 */
 export function VmStatsDialog({
   vm,
   accounts,

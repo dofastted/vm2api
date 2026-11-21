@@ -3,13 +3,11 @@ import assert from 'node:assert/strict'
 import { detectWarmupIntercept, formatWarmupSse, warmupMockMessage } from '../../src/lib/protocol/warmup-intercept.mjs'
 import { normalizeHealthProbeConfig } from '../../src/lib/admin/health-probe.mjs'
 
-// Expected values below were produced by running sub2api's detectInterceptType
-// (backend/internal/handler/gateway_handler.go) on the same bodies.
 const CC = { userAgent: 'claude-cli/2.1.281 (external, cli)' }
 const text = (t) => [{ type: 'text', text: t }]
 const user = (content) => ({ role: 'user', content })
 
-test('haiku max_tokens=1 needs a claude-cli UA, like sub2api isClaudeCodeClient', () => {
+test('Haiku ping with max_tokens=1 requires a claude-cli UA', () => {
   const body = { model: 'claude-haiku-4-5', max_tokens: 1, messages: [user(text('quota'))] }
   assert.equal(detectWarmupIntercept(body, CC), 'haiku_ping')
   assert.equal(detectWarmupIntercept(body, { userAgent: 'Go-http-client/1.1' }), null)
@@ -23,14 +21,14 @@ test('suggestion mode on the last message', () => {
   assert.equal(detectWarmupIntercept(body), 'suggestion')
 })
 
-test('a turn with tools is never intercepted, even when sub2api would', () => {
+test('tools prevent Warmup interception but not Haiku pings', () => {
   const body = {
     tools: [{ name: 'Bash' }],
     messages: [user(text('why Warmup?')), { role: 'assistant', content: text('ok') }, user(text('Warmup'))],
   }
   assert.equal(detectWarmupIntercept(body), null)
   assert.equal(detectWarmupIntercept({ ...body, tools: [] }), 'warmup')
-  // haiku ping check runs before the tools guard, same order as sub2api.
+  // The Haiku ping check runs before the tools guard.
   assert.equal(
     detectWarmupIntercept(
       { model: 'claude-haiku-4-5', max_tokens: 1, tools: [{ name: 'x' }], messages: [user(text('q'))] },
@@ -40,7 +38,7 @@ test('a turn with tools is never intercepted, even when sub2api would', () => {
   )
 })
 
-test('Warmup and title prompt match anywhere in all-array history (sub2api returns Warmup)', () => {
+test('Warmup and title prompts match anywhere in all-array history', () => {
   const body = {
     messages: [
       user(text('why does the gateway answer Warmup?')),
@@ -68,7 +66,7 @@ test('Warmup and title prompt match anywhere in all-array history (sub2api retur
   )
 })
 
-test('string content anywhere fails sub2api typed decode, so real CC sessions pass through', () => {
+test('string content anywhere bypasses warmup interception', () => {
   const body = {
     messages: [
       user(text('Warmup')),

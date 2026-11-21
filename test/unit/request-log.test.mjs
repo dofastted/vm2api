@@ -49,6 +49,57 @@ test('summarizeBody counts messages and tools', () => {
   assert.equal(s.system_len, 10)
 })
 
+test('summarizeBody measures a namespaced tool catalog beyond its top level (#1310)', () => {
+  const filler = 'Synthetic catalog documentation. '.repeat(4)
+  const members = (count, from) =>
+    Array.from({ length: count }, (_, i) => ({
+      type: 'function',
+      name: `fn_${from + i}`,
+      description: filler,
+    }))
+  const body = {
+    model: 'gpt-6.2-astra',
+    input: [{ role: 'user', content: 'go' }],
+    tools: [
+      { type: 'function', name: 'exec_command', description: 'top level' },
+      { type: 'namespace', name: 'ns_a', tools: members(30, 0) },
+      { type: 'namespace', name: 'ns_b', tools: members(20, 30) },
+      { type: 'web_search' },
+    ],
+  }
+  const s = summarizeBody(body)
+  // The top-level count alone cannot tell 4 entries from 1400 callable functions.
+  assert.equal(s.tools_count, 4)
+  assert.equal(s.tool_functions_count, 51)
+  assert.equal(s.tools_bytes, Buffer.byteLength(JSON.stringify(body.tools)))
+  assert.equal(s.tools_deferred_count, 0)
+  assert.equal(s.tools_search_declared, false)
+})
+
+test('summarizeBody records a caller that already defers loading (#1310)', () => {
+  const s = summarizeBody({
+    model: 'gpt-6.2-astra',
+    tools: [
+      { type: 'namespace', name: 'ns', tools: [{ type: 'function', name: 'a', defer_loading: true }] },
+      { type: 'function', name: 'b', defer_loading: true },
+      { type: 'function', name: 'c' },
+      { type: 'tool_search' },
+    ],
+  })
+  assert.equal(s.tool_functions_count, 3)
+  assert.equal(s.tools_deferred_count, 2)
+  assert.equal(s.tools_search_declared, true)
+})
+
+test('summarizeBody leaves tool metrics at zero without a catalog (#1310)', () => {
+  const s = summarizeBody({ model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'hi' }] })
+  assert.equal(s.tools_count, 0)
+  assert.equal(s.tool_functions_count, 0)
+  assert.equal(s.tools_bytes, 0)
+  assert.equal(s.tools_deferred_count, 0)
+  assert.equal(s.tools_search_declared, false)
+})
+
 test('normal mode writes jsonl without body', () => {
   const store = tmpStore('normal')
   const ctx = store.start(
@@ -887,7 +938,7 @@ test('windowStats treats 429 quota/rate-limit as SLA success', () => {
   assert.equal(w.error_collection.by_class[0].id, 'rate_limit')
 })
 
-test('windowStats treats ingress auth failures as SLA success like sub2api', () => {
+test('windowStats treats ingress auth failures as SLA success', () => {
   const store = tmpStore('normal')
   logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
   logOne(store, {
@@ -912,7 +963,7 @@ test('windowStats treats ingress auth failures as SLA success like sub2api', () 
   assert.equal(w.error_collection.by_class[0].owner, 'client')
 })
 
-test('windowStats ignores client abort like sub2api ignore_context_canceled', () => {
+test('windowStats excludes client aborts from error counts', () => {
   const store = tmpStore('normal')
   logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
   logOne(store, { status: 200, error_code: 'client_cancelled', error_message: 'ECONNRESET', model: 'claude-sonnet-5' })

@@ -408,7 +408,7 @@ export function assistantStopReason(result = {}) {
 }
 
 /**
- * sub2api: message_stop ends the stream even when the body has no visible text.
+ * message_stop ends the stream even when the body has no visible text.
  * Without that terminal event, stop_reason plus visible text/tool/refusal is required.
  * Thinking-only and a bare stop_reason are not complete.
  */
@@ -488,6 +488,29 @@ export function incompleteAssistantClientError(result = {}) {
       },
     },
   }
+}
+
+/**
+ * The terminal hint to carry on a relayed upstream error, if any.
+ *
+ * `respond.mjs` turns `details.retryable === false` into `x-should-retry: false`,
+ * which is the only thing that stops an SDK client from retrying. Relaying used to
+ * rebuild `details` from scratch, so a verdict the kernel had already issued never
+ * reached the client (#1215). Capacity errors are excluded on purpose: a 429/529
+ * carries the panel's own Retry-After and a client is meant to come back.
+ */
+function terminalRelayDetails(status, body) {
+  if (body?.error?.details?.retryable === false) return { retryable: false }
+  // 410 Gone is terminal by definition. An expired tool continuation cannot be
+  // revived, so every retry of the same hop can only answer 410 again; saying so
+  // does not infer *why* it expired, which stays the kernel's to report.
+  if (status === 410) return { retryable: false }
+  // CRAG names a submission whose partial output cannot be replayed with this
+  // exact type. The verdict is the kernel's own, so the 409 carrying it is as
+  // terminal as a 410 even when the body omits the flag (#1518). Other 409s stay
+  // untouched: a conflict the panel has not declared terminal may well clear.
+  if (status === 409 && body?.error?.type === 'partial_provider_output_nonretryable') return { retryable: false }
+  return {}
 }
 
 export function mapUpstreamError(status, body, headers = {}) {
@@ -722,6 +745,7 @@ export function mapUpstreamError(status, body, headers = {}) {
         upstream_type: upType,
         upstream_status: status,
         ...(body?.error?.upstream_code ? { upstream_code: body.error.upstream_code } : {}),
+        ...terminalRelayDetails(status, body),
       },
       request_id,
     })
@@ -786,6 +810,7 @@ export function mapUpstreamError(status, body, headers = {}) {
       upstream_type: upType,
       upstream_status: status,
       ...(body?.error?.upstream_code ? { upstream_code: body.error.upstream_code } : {}),
+      ...terminalRelayDetails(status, body),
     },
     request_id,
   })

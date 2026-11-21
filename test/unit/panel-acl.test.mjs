@@ -252,3 +252,11 @@ test('ACL schedule POSTs have matching server handlers', () => {
   assert.match(serverSrc, /cooldown\\\/clear/)
   assert.match(serverSrc, /\/schedulable\$/)
 })
+
+test('resetting another account 2FA is admin-only', () => {
+  // Self-service /api/panel/2fa runs before this gate (every role manages its
+  // own); clearing someone else's second factor is user administration.
+  assert.equal(authorizePanelRoute('DELETE', '/api/panel/users/u-1/2fa', 'admin').ok, true)
+  assert.equal(authorizePanelRoute('DELETE', '/api/panel/users/u-1/2fa', 'super').ok, false)
+  assert.equal(authorizePanelRoute('DELETE', '/api/panel/users/u-1/2fa', 'user').ok, false)
+})

@@ -8,7 +8,7 @@
 import crypto from 'node:crypto'
 import { exchangeTokenViaCookieAuth } from './cookie-auth.mjs'
 import { flattenOauthIdentity } from './oauth-identity.mjs'
-import { FULL_OAUTH_SCOPE, INFERENCE_ONLY_SCOPE } from './oauth-contract.mjs'
+import { FULL_OAUTH_SCOPE } from './oauth-contract.mjs'
 import { carryOAuthAttempt } from './guest-oauth-helper.mjs'
 
 export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
@@ -25,12 +25,13 @@ export const OAUTH_FLAVORS = Object.freeze({
   },
   setup_token: {
     flavor: 'setup_token',
-    // Same consent page as CAI (the CLI's CLAUDE_AI_AUTHORIZE_URL), but the
-    // mint authorizes `inferenceOnly`, exactly like `claude setup-token`.
+    // Same consent page and same grant as CAI: identity (profile/roles/
+    // bootstrap) needs `user:profile`, so the mint is not narrowed. The only
+    // difference is the one-year lifetime requested at exchange time.
     authorizeUrl: 'https://claude.com/cai/oauth/authorize',
     redirectUri: 'https://platform.claude.com/oauth/code/callback',
     tokenUrls: ['https://platform.claude.com/v1/oauth/token', 'https://api.anthropic.com/v1/oauth/token'],
-    scope: INFERENCE_ONLY_SCOPE,
+    scope: FULL_OAUTH_SCOPE,
     source: 'oauth-setup-token',
   },
 })
@@ -166,8 +167,8 @@ async function exchangeCodeForToken(authCode, codeVerifier, state, session, opti
     state,
     redirectUri: session.redirectUri,
     tokenUrls: session.tokenUrls,
-    // The setup-token flavor is the README mint; CAI paste codes exchange as
-    // sub2api does. The runtime mode is what picks the transport profile.
+    // Runtime mode selects the transport profile: setup-token for the README
+    // mint flow, OAuth for pasted CAI authorization codes.
     runtimeMode: session.flavor === 'setup_token' ? 'setup-token' : 'oauth',
     ...options,
   })

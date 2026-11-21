@@ -20,7 +20,7 @@ import (
 // transport (`upstream.NewOAuthHTTPClient`): claude.ai answers a Node/undici
 // request that only *claims* to be Chrome with
 // `400 invalid_request_error: missing_client_attestation`, while the same
-// request over Sub2API's ImpersonateChrome transport is accepted.
+// request over the Chrome TLS transport is accepted.
 const (
 	sessionCodeTimeout  = 60 * time.Second
 	sessionCodeMaxBody  = 4 << 20
@@ -38,6 +38,9 @@ type sessionCodeInput struct {
 	Scope         string `json:"scope"`
 	State         string `json:"state"`
 	CodeChallenge string `json:"code_challenge"`
+	// Optional exit override. Present-but-empty means the local egress (direct
+	// dial), which is how the caller falls back when the bound proxy is invalid.
+	ProxyURL *string `json:"proxy_url"`
 }
 
 type claudeOrganization struct {
@@ -60,7 +63,7 @@ func runSessionCode(cfg config.Config, stdin io.Reader, stdout io.Writer) int {
 	if err != nil {
 		return writeAndReturn(stdout, errorEnvelope(0, "invalid_arguments", "invalid session-code input"), 2)
 	}
-	client, err := sessionCodeClient(cfg)
+	client, err := sessionCodeClient(cfg, input.ProxyURL)
 	if err != nil {
 		code := classifyError(err)
 		return writeAndReturn(stdout, errorEnvelope(0, code, errorMessage(code)), 0)
@@ -119,6 +122,10 @@ func decodeSessionCode(reader io.Reader) (sessionCodeInput, error) {
 	input.Scope = strings.TrimSpace(input.Scope)
 	input.State = strings.TrimSpace(input.State)
 	input.CodeChallenge = strings.TrimSpace(input.CodeChallenge)
+	if input.ProxyURL != nil {
+		trimmed := strings.TrimSpace(*input.ProxyURL)
+		input.ProxyURL = &trimmed
+	}
 	if input.SessionKey == "" || input.Scope == "" || input.State == "" || input.CodeChallenge == "" {
 		return input, errors.New("session-code input is incomplete")
 	}
@@ -128,9 +135,20 @@ func decodeSessionCode(reader io.Reader) (sessionCodeInput, error) {
 	return input, nil
 }
 
-func sessionCodeClient(cfg config.Config) (*http.Client, error) {
+func sessionCodeClient(cfg config.Config, override *string) (*http.Client, error) {
+	if override != nil {
+		if url := strings.TrimSpace(*override); url != "" {
+			return upstream.NewOAuthHTTPClient(url, false, sessionCodeTimeout)
+		}
+		return upstream.NewTransparentOAuthHTTPClient(sessionCodeTimeout)
+	}
 	if cfg.EgressMode == "transparent" {
 		return upstream.NewTransparentOAuthHTTPClient(sessionCodeTimeout)
+	}
+	if strings.TrimSpace(cfg.ProxyURL) == "" {
+		// NewOAuthHTTPClient would hand back a client that refuses every dial,
+		// which reads as "upstream transport failed"; name the real reason.
+		return nil, errors.New("slot proxy is required")
 	}
 	return upstream.NewOAuthHTTPClient(cfg.ProxyURL, cfg.ProxyRequired, sessionCodeTimeout)
 }
@@ -228,7 +246,7 @@ func doOAuthRequest(ctx context.Context, client *http.Client, method, target, se
 	if err != nil {
 		return 0, nil, err
 	}
-	// Sub2API's browser headers. The Chrome UA/H2 fingerprint comes from the
+	// Browser headers. The Chrome UA/H2 fingerprint comes from the
 	// transport; a hand-written UA is what got the attestation gate.
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")

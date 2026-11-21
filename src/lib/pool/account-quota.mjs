@@ -823,7 +823,7 @@ export class AccountQuota {
     return { ok: true, release: () => this.release(accountId, token), token }
   }
 
-  /** sub2api 7d_oi: Fable-only window. Does not unschedulable the account. */
+  /** The `7d_oi` window limits Fable only; it does not block account scheduling. */
   fableWindowLimited(accountId, now = Date.now(), account = undefined) {
     const oi = (account === undefined ? this.repo.get(accountId) : account)?.unified?.['7d_oi']
     if (!oi) return false
@@ -1087,6 +1087,7 @@ export class AccountQuota {
       tiers: this.tiers,
       accounts: this.repo.list().map((a) => {
         const lastUsedAt = this._lastUsedAt(a.account_id)
+        const rpm = this._rpmCount(a.account_id)
         const official = applyEffectiveWindows(a.unified, { lastUsedAt, source: a.unified?.source })
         const listed = listQuotaFromHeaders(a.unified)
         return {
@@ -1095,9 +1096,9 @@ export class AccountQuota {
           email: a.email,
           inflight: this.inflight.get(a.account_id) || 0,
           max_concurrency: a.max_concurrency,
-          rpm: this._rpmCount(a.account_id).n,
+          rpm: rpm.n,
           max_rpm: a.max_rpm ?? 0,
-          rpm_reset_at: this._rpmCount(a.account_id).resetAt,
+          rpm_reset_at: rpm.resetAt,
           requests: a.requests,
           tokens_in: a.tokens_in,
           tokens_out: a.tokens_out,

@@ -396,6 +396,98 @@ test('thinking forces temperature=1 and drops top_p/top_k', () => {
   assert.equal(left.temperature, 0.2)
 })
 
+test('between_tools thinking locks sampling the same way adaptive does', () => {
+  const body = prepareAnthropicRequest({
+    model: 'claude-sonnet-5-5',
+    thinking: { type: 'between_tools' },
+    temperature: 0,
+    top_p: 0.5,
+    top_k: 40,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  })
+  assert.equal(body.temperature, 1)
+  assert.equal(body.top_p, undefined)
+  assert.equal(body.top_k, undefined)
+})
+
+test('a requires_adaptive model locks sampling even with no thinking field', () => {
+  const body = prepareAnthropicRequest({
+    model: 'claude-opus-5-5',
+    temperature: 0.7,
+    top_p: 0.9,
+    top_k: 40,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  })
+  assert.equal(body.temperature, 1)
+  assert.equal(body.top_p, undefined)
+  assert.equal(body.top_k, undefined)
+})
+
+test('out-of-range sampling values are corrected, not forwarded', () => {
+  const high = alignSamplingWithThinking({ model: 'claude-sonnet-5', temperature: 2.5, top_p: 7 })
+  assert.equal(high.temperature, 1)
+  assert.equal(high.top_p, 1)
+  const low = alignSamplingWithThinking({ model: 'claude-sonnet-5', temperature: -1, top_p: -0.5 })
+  assert.equal(low.temperature, 0)
+  assert.equal(low.top_p, 0)
+  const counts = alignSamplingWithThinking({ model: 'claude-sonnet-5', top_k: -1 })
+  assert.equal(counts.top_k, undefined)
+  assert.equal(alignSamplingWithThinking({ model: 'claude-sonnet-5', top_k: 12.7 }).top_k, 12)
+})
+
+test('non-numeric sampling values are dropped so OAuth defaults refill them', () => {
+  const body = prepareAnthropicRequest({
+    model: 'claude-sonnet-5',
+    thinking: { type: 'disabled' },
+    temperature: 'abc',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  })
+  assert.equal(body.temperature, 1)
+  const numeric = alignSamplingWithThinking({ model: 'claude-sonnet-5', temperature: '0.5', top_p: '0.25' })
+  assert.equal(numeric.temperature, 0.5)
+  assert.equal(numeric.top_p, 0.25)
+  const dropped = alignSamplingWithThinking({ model: 'claude-sonnet-5', temperature: null, top_p: '' })
+  assert.equal(Object.hasOwn(dropped, 'temperature'), false)
+  assert.equal(Object.hasOwn(dropped, 'top_p'), false)
+})
+
+test('legal sampling survives when thinking is off', () => {
+  const body = prepareAnthropicRequest({
+    model: 'claude-sonnet-5',
+    thinking: { type: 'disabled' },
+    temperature: 0.2,
+    top_p: 0.8,
+    top_k: 10,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  })
+  assert.equal(body.temperature, 0.2)
+  assert.equal(body.top_p, 0.8)
+  assert.equal(body.top_k, 10)
+})
+
+test('a drop retry sends no sampling instead of pinning temperature=1', () => {
+  const locked = { model: 'claude-opus-5-5', thinking: { type: 'adaptive' }, temperature: 1, top_p: 0.9, top_k: 40 }
+  const stripped = alignSamplingWithThinking(locked, { drop: true })
+  assert.equal(Object.hasOwn(stripped, 'temperature'), false)
+  assert.equal(Object.hasOwn(stripped, 'top_p'), false)
+  assert.equal(Object.hasOwn(stripped, 'top_k'), false)
+  // Thinking is a separate concern; a sampling refusal must not disturb it.
+  assert.deepEqual(stripped.thinking, { type: 'adaptive' })
+})
+
+test('dropSampling keeps the OAuth defaults from refilling temperature', () => {
+  const request = () => ({
+    model: 'claude-opus-5-5',
+    temperature: 0.7,
+    max_tokens: 1024,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  })
+  assert.equal(prepareAnthropicRequest(request()).temperature, 1)
+  const dropped = prepareAnthropicRequest(request(), { dropSampling: true })
+  assert.equal(Object.hasOwn(dropped, 'temperature'), false)
+  assert.equal(dropped.thinking?.type, 'adaptive')
+})
+
 test('sanitize is a no-op when the body has no context_management', () => {
   const body = { model: 'claude-haiku-4-5', messages: [] }
   assert.equal(sanitizeAnthropicBodyForBetaTokens(body, ''), body)

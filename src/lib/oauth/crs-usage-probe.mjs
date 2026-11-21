@@ -19,7 +19,7 @@ import {
 export const FABLE_TIER_MODELS = Object.freeze(['claude-fable-5-2', 'claude-fable-5-1', 'claude-fable-5'])
 export const FABLE_PROBE_MODEL = FABLE_TIER_MODELS[0]
 export const OAUTH_USAGE_PATH = '/api/oauth/usage'
-/** sub2api Extra / Messages 响应头被动采样，不打 GET /api/oauth/usage。 */
+/** 从 Messages 响应头被动采样用量，不发送 GET /api/oauth/usage 请求。 */
 export const PASSIVE_HEADER_SOURCE = 'messages-headers'
 
 export function probeFromPassiveHeaders(unified = {}, nowIso = new Date().toISOString()) {

@@ -17,6 +17,7 @@ import {
   hasBoundExit,
   inspectEgressNetwork,
   inspectEgressProcess,
+  inspectEgressProcessAsync,
   iptablesPlan,
   isLocalEgressProxy,
   localEgressProxyUrl,
@@ -35,6 +36,9 @@ import {
   startProxyEgress,
   runExclusiveProxyEgress,
   waitPortReleased,
+  proxyDnsEmptyTypes,
+  sharedDnsEmptyTypes,
+  memberEndpoint,
 } from '../../src/lib/vm/egress.mjs'
 import { hostProxyUrlForVm } from '../../src/lib/vm/slot-host.mjs'
 
@@ -297,7 +301,16 @@ test('redundant separators in an egress config path do not change its owner', {
   const fx = egressFixture(t)
   fs.writeFileSync(
     fx.configPath,
-    JSON.stringify({ proxy_url: fx.base.proxyUrl, listen_tcp: '127.0.0.1:0', listen_dns: '127.0.0.1:0' }),
+    // The reuse check compares this against the config `startEgressProcess`
+    // would generate, `proxy_id` included, so seed the whole body. Leaving a
+    // field out makes the helper look misconfigured and tests config drift
+    // instead of the separator this case is about.
+    JSON.stringify({
+      proxy_id: fx.base.proxyId,
+      proxy_url: fx.base.proxyUrl,
+      listen_tcp: '127.0.0.1:0',
+      listen_dns: '127.0.0.1:0',
+    }),
   )
   const child = spawn(egressBin, ['-config', fx.dir + '//egress.json'], { stdio: 'ignore' })
   const closed = once(child, 'close')
@@ -782,4 +795,108 @@ test('waitPortReleased returns at once for a free port without blocking the even
 test('egress wait loops do not shell out to python3', () => {
   const src = fs.readFileSync(path.join(import.meta.dirname, '../../src/lib/vm/egress.mjs'), 'utf8')
   assert.equal(src.includes('python3'), false)
+})
+
+test('the SVCB/HTTPS override is read off the proxy a helper serves', () => {
+  assert.deepEqual(proxyDnsEmptyTypes({ id: 'px-1', dns_disable_svcb_https: true }), [64, 65])
+  assert.deepEqual(proxyDnsEmptyTypes({ id: 'px-1', dns_disable_svcb_https: false }), [])
+  // Anything other than a real `true` leaves DNS alone: a row predating the
+  // column, a missing proxy, a truthy-but-not-boolean value.
+  for (const proxy of [{ id: 'px-1' }, null, undefined, { dns_disable_svcb_https: 1 }]) {
+    assert.deepEqual(proxyDnsEmptyTypes(proxy), [], JSON.stringify(proxy ?? null))
+  }
+})
+
+test('a member upstream is matched by host:port, however its URL was serialized', () => {
+  assert.equal(memberEndpoint('socks5h://10.0.0.1:1080'), '10.0.0.1:1080')
+  // Scheme and credentials must not change the key: the same outlet reaches
+  // this code both as socks5:// from the store and socks5h:// from a binding.
+  assert.equal(memberEndpoint('socks5://user:pass@10.0.0.1:1080'), '10.0.0.1:1080')
+  assert.equal(memberEndpoint('socks5h://10.0.0.1'), '10.0.0.1:1080')
+  assert.equal(memberEndpoint('socks5h://[2001:db8::1]:1080'), '[2001:db8::1]:1080')
+  for (const bad of ['', '   ', null, undefined, 'not a url']) {
+    assert.equal(memberEndpoint(bad), '', JSON.stringify(bad ?? null))
+  }
+})
+
+test('a shared helper blocks SVCB/HTTPS only when every outlet on the node asks for it', () => {
+  const a = 'socks5h://10.0.0.1:1080'
+  const b = 'socks5h://10.0.0.2:1080'
+  const both = new Set(['10.0.0.1:1080', '10.0.0.2:1080'])
+  const onlyA = new Set(['10.0.0.1:1080'])
+
+  assert.deepEqual(sharedDnsEmptyTypes([{ proxyUrl: a }, { proxyUrl: b }], both), [64, 65])
+  // One outlet left alone keeps the whole helper off — it must never have
+  // HTTP/3 stripped because a co-tenant asked for it.
+  assert.deepEqual(sharedDnsEmptyTypes([{ proxyUrl: a }, { proxyUrl: b }], onlyA), [])
+  assert.deepEqual(sharedDnsEmptyTypes([{ proxyUrl: a }], onlyA), [64, 65])
+
+  // The node side hands over the route table it already built.
+  assert.deepEqual(sharedDnsEmptyTypes([{ proxy_url: a }, { proxy_url: b }], both), [64, 65])
+  assert.deepEqual(sharedDnsEmptyTypes([{ proxy_url: a }, { proxy_url: b }], onlyA), [])
+
+  // No routable member: nothing to decide, so no override.
+  assert.deepEqual(sharedDnsEmptyTypes([], both), [])
+  assert.deepEqual(sharedDnsEmptyTypes([{ proxyUrl: '' }], both), [])
+})
+
+test('startProxyEgress derives dns_empty_types from its proxy unless told otherwise', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-dns-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const runDocker = (args) =>
+    args[0] === 'network' && args[1] === 'inspect' ? { ok: true, stdout: '172.31.251.0/24|127.0.0.1' } : { ok: true }
+  const opts = { runDocker, runIptables: () => ({ ok: true }), dnsUpstream: '', bin: egressBin }
+
+  const started = []
+  for (const [id, blocked] of [
+    ['px-dns-on', true],
+    ['px-dns-off', false],
+  ]) {
+    const proxy = { id, url: 'socks5h://192.0.2.3:1080', dns_disable_svcb_https: blocked }
+    const result = await startProxyEgress(root, proxy, opts)
+    if (result.pid) started.push(result.pid)
+    assert.equal(result.ok, true, JSON.stringify(result))
+    const cfg = JSON.parse(fs.readFileSync(path.join(egressRunDir(root, id), 'egress.json'), 'utf8'))
+    // The key is omitted entirely when nothing is blocked, which is how
+    // kin-egress tells "leave DNS alone" from "empty these types".
+    assert.deepEqual(cfg.dns_empty_types, blocked ? [64, 65] : undefined, id)
+  }
+  for (const pid of started) {
+    t.after(() => {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {}
+    })
+  }
+  for (const id of ['px-dns-on', 'px-dns-off']) stopEgressProcess(root, id)
+})
+
+test('the async egress probe returns the same verdict as the sync one (#1495)', async () => {
+  // The watchdog probe moved off the event loop, so there are now two paths to
+  // the same health rules. Pin that they agree: a drift here would make the
+  // watchdog restart helpers the panel calls healthy, or vice versa.
+  const reply = (stdout, ok = true, stderr = '') => ({ ok, stdout, stderr })
+  const cases = [
+    ['running', reply('true|false|4242|cfgsha|binsha|')],
+    ['restarting', reply('false|true|4242|cfgsha|binsha|')],
+    ['stopped', reply('false|false|0|cfgsha|binsha|')],
+    ['absent', reply('', false, 'Error: No such object: kin-cp-egress-px-a')],
+    ['inspect broken', reply('', false, 'Cannot connect to the Docker daemon')],
+  ]
+  for (const [label, r] of cases) {
+    const opts = { runtime: 'container', bin: '/nonexistent/kin-egress' }
+    const sync = inspectEgressProcess('/unused', 'px-a', { ...opts, runDocker: () => r })
+    const async_ = await inspectEgressProcessAsync('/unused', 'px-a', {
+      ...opts,
+      runDocker: async () => r,
+    })
+    assert.deepEqual(async_, sync, label)
+  }
+  // The process runtime has no docker call to move, so it is shared outright.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-eg-async-'))
+  const sync = inspectEgressProcess(dir, 'px-none', { runtime: 'process' })
+  assert.deepEqual(await inspectEgressProcessAsync(dir, 'px-none', { runtime: 'process' }), sync)
+  fs.rmSync(dir, { recursive: true, force: true })
 })

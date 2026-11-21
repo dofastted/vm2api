@@ -300,7 +300,7 @@ export async function prepareInferenceHop({
 } = {}) {
   const deadline = hopSlotWaitDeadline({ slotWaitDeadlineMs, slotWaitMs })
   if (resolveKernelDataplane(exec?.vm, routing) === 'crag') {
-    const rejection = await admitCragInference?.({ vm: exec?.vm, routing })
+    const rejection = await admitCragInference?.({ vm: exec?.vm, routing, slotWaitDeadlineMs: deadline })
     if (rejection) return { rejection }
   }
   const projectRoot = exec?.projectRoot || (exec?.homeDir ? path.resolve(exec.homeDir, '../../..') : '')

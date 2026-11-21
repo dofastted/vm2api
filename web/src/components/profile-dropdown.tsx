@@ -39,6 +39,9 @@ export function ProfileDropdown() {
           </DropdownMenuLabel>
           <DropdownMenuSeparator />
           <DropdownMenuItem asChild>
+            <Link to='/account'>账号安全</Link>
+          </DropdownMenuItem>
+          <DropdownMenuItem asChild>
             <Link to='/settings/$tab' params={{ tab: 'sticky' }}>
               设置
             </Link>

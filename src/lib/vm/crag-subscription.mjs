@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -27,6 +28,7 @@ const SHARED_HOST_ID_FILESYSTEMS = new Set([0x01021997, 0x65735546])
 const localFilesystems = new Set([0xef53, 0x794c7630, 0x58465342, 0x9123683e, 0x2fc12fc1, 0xf2f52010])
 const MAX_DEFERRED_RELEASES = 10000
 const MAX_DEFERRED_RELEASE_BYTES = 4 * 1024 * 1024
+const MAX_REDEEM_INTENT_BYTES = 1024
 const terminalRedeem = new Map([
   ['redeem_unavailable', 404],
   ['host_redeem_conflict', 409],
@@ -57,18 +59,61 @@ const validSku = (value) => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9
 const validMonths = (value) => Number.isSafeInteger(value) && value >= 1 && value <= 4294967295
 const invalidRights = () => fail('crag_subscription_invalid_entitlement', 502)
 const hostPackageUnready = () => fail('crag_subscription_host_package_unready', 409)
+const hostPackageChanged = () => fail('crag_subscription_host_package_changed', 409)
 const hostIdentityUnavailable = () => fail('crag_subscription_host_identity_unavailable')
 const hostIdentityChanged = () => fail('crag_subscription_host_identity_changed', 409)
-const usageUnverified = () =>
-  cragLicenseDeniedResult({
+const USAGE_UNVERIFIED_MESSAGE = '暂时无法核对宿主机 CRAG 运行额度，请刷新订阅或确认槽位状态后重试。'
+/**
+ * A denial while the host rights are being changed is transient, not a verdict on
+ * the credential: `retryable` lets a fronting gateway retry or pick another slot
+ * instead of reading it as an authorization failure.
+ */
+const usageUnverified = ({ retryable = false, retryAfterSeconds = 0 } = {}) => {
+  const denial = cragLicenseDeniedResult({
     code: 'license_crag_host_usage_unverified',
-    error: '暂时无法核对宿主机 CRAG 运行额度，请刷新订阅或确认槽位状态后重试。',
+    error: USAGE_UNVERIFIED_MESSAGE,
   })
+  if (!retryable) return denial
+  denial.body.error.details = { ...denial.body.error.details, retryable: true }
+  if (retryAfterSeconds > 0) denial.retryAfterSec = retryAfterSeconds
+  return denial
+}
 const overQuota = () =>
   cragLicenseDeniedResult({
     code: 'license_crag_host_over_quota',
     error: '宿主订阅的运行槽位已满，无法启动此 CRAG 槽位。请释放运行名额或增加订阅额度。',
   })
+
+/** `admitOnce` hit an in-flight exclusive operation; only the caller decides whether to wait. */
+const EXCLUSIVE_BUSY = Symbol('crag_exclusive_busy')
+const MAX_EXCLUSIVE_WAIT_MS = 15_000
+
+/**
+ * Cap the wait by the request's own slot budget so admission never outlives it.
+ * `hopSlotWaitDeadline` yields "now" when no slot wait is configured, which would
+ * leave those deployments with no wait at all, so an absent or spent budget still
+ * gets the ceiling rather than zero.
+ */
+function exclusiveWaitBudgetMs(slotWaitDeadlineMs) {
+  if (!Number.isFinite(slotWaitDeadlineMs)) return MAX_EXCLUSIVE_WAIT_MS
+  const remaining = slotWaitDeadlineMs - Date.now()
+  return remaining > 0 ? Math.min(MAX_EXCLUSIVE_WAIT_MS, remaining) : MAX_EXCLUSIVE_WAIT_MS
+}
+
+/** Resolves true if the operation finished in time. Never holds a lock, never polls. */
+function settledWithin(pending, budgetMs) {
+  if (!pending?.done) return Promise.resolve(true)
+  if (!(budgetMs > 0)) return Promise.resolve(false)
+  let timer
+  return Promise.race([
+    pending.done.then(() => true),
+    // Not unref'd on purpose: an unref'd timer never fires once the loop has
+    // nothing else to do, which would leave this await pending forever.
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(false), budgetMs)
+    }),
+  ]).finally(() => clearTimeout(timer))
+}
 
 function runtimeDenial(denial) {
   const { code, message } = denial.body.error
@@ -234,6 +279,35 @@ function hostEnrollmentIdentity(projectRoot, digest) {
   return standardEnrollment(projectRoot, cragTargetIds(projectRoot, undefined), true)
 }
 
+function pinnedIntentKind(intent) {
+  const invalid = () => fail('crag_subscription_recovery_unverified', 409)
+  if (!intent || typeof intent !== 'object' || Array.isArray(intent)) throw invalid()
+  if (!isDigest(intent.host_id) || !validVoucher(intent.redemption_code) || !isDigest(intent.host_package_sha256))
+    throw invalid()
+  const keys = Object.keys(intent).sort().join(',')
+  if (keys === 'host_id,host_package_sha256,redemption_code') return 'legacy'
+  if (keys !== 'enrollment,host_id,host_package_sha256,issuer_public_key_id,redemption_code') throw invalid()
+  const selectors = intent.enrollment
+  if (!selectors || typeof selectors !== 'object' || Array.isArray(selectors) || !isDigest(intent.issuer_public_key_id))
+    throw invalid()
+  const selectorKeys = Object.keys(selectors).sort().join(',')
+  if (
+    selectorKeys !== '' &&
+    (selectorKeys !== 'issuer_public_key_id,payload_key_id' ||
+      selectors.issuer_public_key_id !== intent.issuer_public_key_id ||
+      !isDigest(selectors.payload_key_id))
+  )
+    throw invalid()
+  return 'recorded'
+}
+
+function recordedEnrollment(projectRoot, intent) {
+  if (pinnedIntentKind(intent) !== 'recorded') throw fail('crag_subscription_recovery_unverified', 409)
+  if (cragTargetIds(projectRoot, undefined).issuerId !== intent.issuer_public_key_id)
+    throw fail('crag_subscription_recovery_unverified', 409)
+  return intent.enrollment
+}
+
 function sync(dir) {
   const handle = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW)
   try {
@@ -319,7 +393,12 @@ export function createCragSubscription({
   const rosterIntentFile = path.join(privateDir, 'roster.json')
   const deferredReleaseFile = path.join(privateDir, 'deleted-slots.json')
   const marker = path.join(publicDir, 'sync-pending')
-  let busy = false
+  /** null = idle. Otherwise the in-flight exclusive operation: `done` settles once
+   * its guest re-delivery finished, so a waiter that wakes on it sees a settled host. */
+  let exclusiveState = null
+  /** Set inside an exclusive work body. A nested admission must not wait on the
+   * operation it is itself running under. */
+  const exclusiveScope = new AsyncLocalStorage()
   const runtimeReservations = new Set()
   let admissionWaiters = 0
   let admissionQueue = Promise.resolve()
@@ -411,7 +490,7 @@ export function createCragSubscription({
       if (
         !initialize ||
         prior ||
-        load(intentFile, 0o600, 512) ||
+        load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES) ||
         load(entitlementFile, 0o644, 8192) ||
         load(marker, 0o644, 32)
       )
@@ -472,7 +551,7 @@ export function createCragSubscription({
     const previous = current(hostId)
     const pending =
       load(marker, 0o644, 32) != null ||
-      load(intentFile, 0o600, 512) != null ||
+      load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES) != null ||
       load(rosterIntentFile, 0o600, 1024) != null
     const claims = previous?.claims ?? null
     if (claims && (!safeTime(claims.expires_at) || !safeTime(claims.revision))) throw fail()
@@ -491,7 +570,8 @@ export function createCragSubscription({
     if (!previous || previous.claims.expires_at * 1000 > Date.now()) return previous
     const remote = await authority('status', hostId, credential(hostId))
     const confirmed = verifyRights(hostId, remote, previous)
-    if (background && (busy || !unchangedRights({ hostId, pending: false, previous }, readLocalRights()))) return
+    if (background && (exclusiveState || !unchangedRights({ hostId, pending: false, previous }, readLocalRights())))
+      return
     if (confirmed.code === previous.code) return confirmed
     if (current(hostId)?.code !== previous.code) throw invalidRights()
     checkNoIntent()
@@ -501,7 +581,7 @@ export function createCragSubscription({
 
   async function refreshExpiredEntitlement() {
     if (expiryProbe) return expiryProbe
-    if (busy || !fs.existsSync(entitlementFile)) return
+    if (exclusiveState || !fs.existsSync(entitlementFile)) return
     const { hostId, claims, pending, previous } = readLocalRights()
     const now = Date.now()
     if (pending || !claims || claims.expires_at * 1000 > now) return
@@ -617,7 +697,7 @@ export function createCragSubscription({
       })
   }
 
-  async function admitInference({ vm, routing, health } = {}) {
+  async function admitOnce({ vm, routing, health } = {}) {
     if (!vm?.id) return null
     const liveCrag = health?.runtime_variant === 'crag-v2' || (!health?.runtime_variant && health?.dataplane === 'crag')
     if (!liveCrag && resolveKernelDataplane(vm, routing) !== 'crag') return null
@@ -636,7 +716,8 @@ export function createCragSubscription({
         return null
       }
       const rights = readLocalRights()
-      if (!rights.claims || (localKvm && busy)) return usageUnverified()
+      if (!rights.claims) return usageUnverified()
+      if (localKvm && exclusiveState) return EXCLUSIVE_BUSY
       const { license } = getCragLicense(projectRoot, vm)
       if (!license.valid) {
         if (localKvm) {
@@ -679,6 +760,27 @@ export function createCragSubscription({
     return usageUnverified()
   }
 
+  /**
+   * Any roster change republishes the single host entitlement every slot's grant
+   * is derived from, so an in-flight exclusive operation cannot be narrowed to the
+   * slot it names. Rather than deny every local KVM slot for the whole operation
+   * (#1307: 27 slots, ~25 minutes of rolling 403s during a per-slot migration),
+   * wait for it to finish and re-run the same checks against the settled host.
+   */
+  async function admitInference({ vm, routing, health, slotWaitDeadlineMs } = {}) {
+    const first = await admitOnce({ vm, routing, health })
+    if (first !== EXCLUSIVE_BUSY) return first
+    // Running inside the work body itself: waiting here would wait on us.
+    if (exclusiveScope.getStore()) return usageUnverified()
+    const pending = exclusiveState
+    const budgetMs = exclusiveWaitBudgetMs(slotWaitDeadlineMs)
+    const retryable = { retryable: true, retryAfterSeconds: Math.max(1, Math.ceil(budgetMs / 1000)) }
+    if (!(await settledWithin(pending, budgetMs))) return usageUnverified(retryable)
+    // One retry only: back-to-back operations must not chain a request forever.
+    const second = await admitOnce({ vm, routing, health })
+    return second === EXCLUSIVE_BUSY ? usageUnverified(retryable) : second
+  }
+
   async function status(confirmed, mayRetry = true) {
     let targets
     let inventory = {}
@@ -718,7 +820,7 @@ export function createCragSubscription({
       }
       let rights = claims ? { reclaim_supported: claims.version === 2 } : {}
       if (claims && !pending) {
-        if (confirmed?.code === previous.code) {
+        if (confirmed?.code === previous.code && confirmed.rights) {
           rights = confirmed.rights
         } else if (!needsRefresh) {
           try {
@@ -823,10 +925,89 @@ export function createCragSubscription({
     return { code: data.entitlement, claims: next, rights: projection(data, next) }
   }
 
+  const voucherDigest = (voucher) => createHash('sha256').update(voucher).digest('hex')
+  const redemptionReceiptFile = (digest) => path.join(privateDir, `redeemed-${digest}.json`)
+
+  function appliedRedemption(hostId, digest) {
+    if (!isDigest(digest)) throw fail('crag_subscription_invalid_request', 400)
+    if (identity() !== hostId) throw hostIdentityChanged()
+    const raw = load(redemptionReceiptFile(digest), 0o600, MAX_CRAG_HOST_ENTITLEMENT_BYTES + 512)
+    if (raw === null) return null
+    try {
+      const receipt = JSON.parse(raw)
+      if (
+        Object.keys(receipt).sort().join(',') !== 'entitlement,host_id,version,voucher_sha256' ||
+        receipt.version !== 1 ||
+        receipt.host_id !== hostId ||
+        receipt.voucher_sha256 !== digest
+      )
+        throw invalidRights()
+      const proof = verifyCragHostEntitlement(projectRoot, receipt.entitlement, hostId, { allowExpired: true })
+      const installed = current(hostId)
+      if (
+        !installed ||
+        installed.claims.revision < proof.revision ||
+        (installed.claims.revision === proof.revision && installed.code !== receipt.entitlement)
+      )
+        throw invalidRights()
+      // A receipt proves this voucher was applied; it carries no remote metadata.
+      // Leaving rights unset lets status() read the current plan and usage instead
+      // of reporting a replay as a subscription with no quota information.
+      return installed
+    } catch {
+      throw fail('crag_subscription_invalid_redemption_receipt', 409)
+    }
+  }
+
+  async function prepareRecovery(hostId, intent, previous, useCurrentPackage) {
+    if (!Object.hasOwn(intent, 'host_package_sha256')) return intent
+    const kind = pinnedIntentKind(intent)
+    const digest = hostPackageDigest(projectRoot)
+    if (digest === intent.host_package_sha256) return intent
+    if (!useCurrentPackage) throw hostPackageChanged()
+    if (kind === 'recorded') {
+      // A changed package can replay only the exact original selectors, against
+      // the same trusted issuer. Only the same-voucher response proves payment.
+      recordedEnrollment(projectRoot, intent)
+    } else {
+      // Old records lack request selectors. Host status cannot identify which
+      // voucher produced existing rights, so only a confirmed absent first
+      // subscription permits replacing these records' package pin.
+      if (previous) throw fail('crag_subscription_recovery_unverified', 409)
+      try {
+        await authority('status', hostId, credential(hostId))
+        throw fail('crag_subscription_recovery_unverified', 409)
+      } catch (error) {
+        if (error.code !== 'not_found') throw error
+      }
+      hostEnrollmentIdentity(projectRoot, digest)
+    }
+    if (identity() !== hostId) throw hostIdentityChanged()
+    assertHostPackage(projectRoot, digest)
+    const next = { ...intent, host_package_sha256: digest }
+    // Replace atomically: a crash leaves either the original request or its
+    // explicitly authorized replacement, never an empty transaction window.
+    publish(intentFile, JSON.stringify(next), 0o600)
+    return next
+  }
+
   async function finish(hostId, intent, previous, asserted = {}, replay = false) {
-    const enrollment = Object.hasOwn(intent, 'host_package_sha256')
-      ? hostEnrollmentIdentity(projectRoot, intent.host_package_sha256)
-      : asserted
+    const digest = voucherDigest(intent.redemption_code)
+    const applied = appliedRedemption(hostId, digest)
+    if (applied) {
+      remove(marker)
+      remove(intentFile)
+      return applied
+    }
+    let enrollment = asserted
+    if (Object.hasOwn(intent, 'host_package_sha256')) {
+      const kind = pinnedIntentKind(intent)
+      assertHostPackage(projectRoot, intent.host_package_sha256)
+      enrollment =
+        kind === 'recorded'
+          ? recordedEnrollment(projectRoot, intent)
+          : hostEnrollmentIdentity(projectRoot, intent.host_package_sha256)
+    }
     publish(marker, 'pending\n', 0o644)
     let data
     try {
@@ -836,7 +1017,7 @@ export function createCragSubscription({
       })
     } catch (error) {
       // A denial on replay does not tell us whether the original request committed.
-      if (error?.code !== 'crag_subscription_authority_unavailable' && !(replay && error?.code === 'auth_forbidden')) {
+      if (!replay && error?.code !== 'crag_subscription_authority_unavailable') {
         remove(marker)
         remove(intentFile)
       }
@@ -845,6 +1026,13 @@ export function createCragSubscription({
     if (Object.hasOwn(intent, 'host_package_sha256')) assertHostPackage(projectRoot, intent.host_package_sha256)
     const confirmed = verifyRights(hostId, data, previous)
     publish(entitlementFile, confirmed.code, 0o644)
+    // This private receipt links a successful same-voucher redeem response to
+    // signed rights. A generic host status response must never create it.
+    publish(
+      redemptionReceiptFile(digest),
+      JSON.stringify({ version: 1, host_id: hostId, voucher_sha256: digest, entitlement: confirmed.code }),
+      0o600,
+    )
     remove(marker)
     remove(intentFile)
     return confirmed
@@ -892,13 +1080,16 @@ export function createCragSubscription({
   }
 
   async function exclusive(work, { blockBefore = false } = {}) {
-    if (busy) throw fail('crag_subscription_busy', 409)
-    busy = true
+    if (exclusiveState) throw fail('crag_subscription_busy', 409)
+    let settle
+    exclusiveState = { since: Date.now(), done: new Promise((resolve) => (settle = resolve)) }
     const release = holdKvmCragSubscriptionPublications(projectRoot)
     let result, failure
     try {
       if (blockBefore) await blockKvmBindings()
-      result = await work()
+      // The scope marks every async branch started by this body, so a nested
+      // admission can tell it is running under the very operation it would wait for.
+      result = await exclusiveScope.run(true, () => work())
     } catch (error) {
       failure = error
     } finally {
@@ -908,7 +1099,10 @@ export function createCragSubscription({
       } catch (error) {
         failure ??= error
       }
-      busy = false
+      // Clear before settling: a waiter wakes to an idle host with its guests
+      // already re-delivered, never to a state that is still winding down.
+      exclusiveState = null
+      settle()
     }
     if (failure) throw failure
     return result
@@ -979,7 +1173,7 @@ export function createCragSubscription({
   }
 
   function checkNoIntent() {
-    if (readRosterIntent() || load(intentFile, 0o600, 512) || load(marker, 0o644, 32))
+    if (readRosterIntent() || load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES) || load(marker, 0o644, 32))
       throw fail('crag_subscription_sync_pending', 409)
   }
 
@@ -1040,7 +1234,7 @@ export function createCragSubscription({
           cragTargetIds(projectRoot, target, { preferInstalled: false }).payloadKeyId !== payload_key_id
         )
           throw changed()
-        const machine_code = prepareCragSubscriptionBinding(projectRoot, target)
+        const machine_code = prepareCragSubscriptionBinding(projectRoot, target, { preferInstalled: false })
         if (createHash('sha256').update(machine_code).digest('hex') !== machine_sha256) throw changed()
         const binding = await authority('bind', hostId, credential(hostId), { machine_code, payload_key_id })
         if (binding.seat !== seat || binding.entitlement !== confirmed.code) throw invalidRights()
@@ -1162,7 +1356,7 @@ export function createCragSubscription({
   }
 
   async function bindForStart(vm, previous, hostId, payloadKeyId, options, runtime) {
-    const machineCode = prepareCragSubscriptionBinding(projectRoot, vm)
+    const machineCode = prepareCragSubscriptionBinding(projectRoot, vm, { preferInstalled: !options?.install })
     const bind = (rights) =>
       bindTarget(vm, hostId, rights, machineCode, payloadKeyId, { ...options, allowReissue: true })
     try {
@@ -1191,17 +1385,22 @@ export function createCragSubscription({
         storage(!renewal)
         const previous = current(hostId)
         if (renewal && !previous) throw fail('host_subscription_inactive', 409)
-        const rawIntent = load(intentFile, 0o600, 512)
+        const rawIntent = load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES)
         if (rawIntent != null) {
           const saved = JSON.parse(rawIntent)
           if (
             !renewal &&
             saved.host_id === hostId &&
             saved.redemption_code === redemption_code &&
-            saved.host_package_sha256 === packageDigest &&
-            Object.keys(saved).length === 3 &&
+            Object.hasOwn(saved, 'host_package_sha256') &&
             !readRosterIntent()
           ) {
+            pinnedIntentKind(saved)
+            if (
+              saved.host_package_sha256 !== packageDigest &&
+              !appliedRedemption(hostId, voucherDigest(redemption_code))
+            )
+              throw hostPackageChanged()
             const confirmed = await finish(hostId, saved, previous, {}, true)
             return expectedHost ? undefined : status(confirmed)
           }
@@ -1225,7 +1424,11 @@ export function createCragSubscription({
         const intent = {
           host_id: hostId,
           redemption_code,
-          ...(packageDigest && { host_package_sha256: packageDigest }),
+          ...(packageDigest && {
+            host_package_sha256: packageDigest,
+            enrollment: hostEnrollmentIdentity(projectRoot, packageDigest),
+            issuer_public_key_id: cragTargetIds(projectRoot, undefined).issuerId,
+          }),
         }
         publish(intentFile, JSON.stringify(intent), 0o600, true)
         const confirmed = await finish(hostId, intent, previous, asserted)
@@ -1256,7 +1459,7 @@ export function createCragSubscription({
     if (roster) {
       const intent = { host_id: hostId, action: 'bind' }
       if (reissue) {
-        const permit_sha256 = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
+        const permit_sha256 = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId, targetOptions)
         if (
           !previous.claims.roster.some((entry) => entry.seat === reissueSeat && entry.permit_sha256 === permit_sha256)
         )
@@ -1383,7 +1586,7 @@ export function createCragSubscription({
           const standard = standardEnrollment(projectRoot, resolved)
           const staleRoster = readRosterIntent()
           if (staleRoster?.action === 'bind' && !staleRoster.reissue) clearRosterIntent()
-          let raw = load(intentFile, 0o600, 512)
+          let raw = load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES)
           const binding = orderId ? { order_id: orderId } : { target_fingerprint: target.fingerprint }
           let intent = { host_id: hostId, redemption_code, ...binding }
           if (raw != null) {
@@ -1444,6 +1647,7 @@ export function createCragSubscription({
 
   return {
     status: () => status(),
+    isRedemptionApplied: (hostId, digest) => Boolean(appliedRedemption(hostId, digest)),
     admitInference,
     withRuntimeAdmission,
     purchaseDeviceId: identity,
@@ -1632,7 +1836,7 @@ export function createCragSubscription({
         { blockBefore: false },
       )
     },
-    recover() {
+    recover({ useCurrentPackage = false } = {}) {
       return exclusive(async () => {
         if (!fs.existsSync(intentFile) && !fs.existsSync(rosterIntentFile)) {
           if (fs.existsSync(marker)) remove(marker)
@@ -1653,20 +1857,39 @@ export function createCragSubscription({
           await replayDeferredReleases(hostId, confirmed)
           return
         }
-        const raw = load(intentFile, 0o600, 512)
+        const raw = load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES)
         if (raw == null) return
-        const intent = JSON.parse(raw)
-        if (intent.host_id !== hostId || !validVoucher(intent.redemption_code)) {
-          remove(marker)
-          remove(intentFile)
-          return
+        let intent
+        try {
+          intent = JSON.parse(raw)
+        } catch {
+          throw fail('crag_subscription_recovery_unverified', 409)
         }
+        if (
+          !intent ||
+          typeof intent !== 'object' ||
+          Array.isArray(intent) ||
+          !isDigest(intent.host_id) ||
+          !validVoucher(intent.redemption_code)
+        )
+          throw fail('crag_subscription_recovery_unverified', 409)
+        const orderIntent = Object.hasOwn(intent, 'order_id') || Object.hasOwn(intent, 'target_fingerprint')
+        const pinned = Object.hasOwn(intent, 'host_package_sha256')
+        if (
+          pinned ||
+          Object.hasOwn(intent, 'enrollment') ||
+          (!orderIntent && Object.hasOwn(intent, 'issuer_public_key_id'))
+        )
+          pinnedIntentKind(intent)
+        else if (!orderIntent && Object.keys(intent).sort().join(',') !== 'host_id,redemption_code')
+          throw fail('crag_subscription_recovery_unverified', 409)
+        if (intent.host_id !== hostId) throw hostIdentityChanged()
         // An order may only resume redemption after re-authorizing its checkout pin;
         // keep order_id / target_fingerprint intact for shop polling (it no longer blocks existing slots or new orders).
-        if (Object.hasOwn(intent, 'order_id') || Object.hasOwn(intent, 'target_fingerprint')) return
-        const pinned = Object.hasOwn(intent, 'host_package_sha256')
-        if (pinned) assertHostPackage(projectRoot, intent.host_package_sha256)
+        if (orderIntent) return
         const previous = current(hostId)
+        const applied = appliedRedemption(hostId, voucherDigest(intent.redemption_code))
+        if (!applied) intent = await prepareRecovery(hostId, intent, previous, useCurrentPackage)
         // Old intents without local rights have no original digest, but still require a trusted package.
         if (!pinned && !previous) hostPackageDigest(projectRoot)
         const confirmed = await finish(hostId, intent, previous, {}, true)
@@ -1716,18 +1939,25 @@ export function createCragSubscription({
         ) {
           throw fail('crag_subscription_target_unready', 409)
         }
-        const permitDigest = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
+        if (!allowLegacyReissue && candidate.code === 'license_payload_key_mismatch')
+          throw fail('crag_subscription_migration_required', 409)
+        const permitDigest = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId, {
+          preferInstalled: !allowLegacyReissue,
+        })
         const reissueSeat =
           previous.claims.roster?.find((entry) => entry.permit_sha256 === permitDigest)?.seat ??
           (license.valid && license.scope === 'host' ? license.seat : undefined)
-        if (!allowLegacyReissue && (reissueSeat !== undefined || candidate.code === 'license_payload_key_mismatch'))
-          throw fail('crag_subscription_migration_required', 409)
+        if (!allowLegacyReissue && reissueSeat !== undefined) throw fail('crag_subscription_migration_required', 409)
         const { payloadKeyId } = cragTargetIds(projectRoot, vm, { preferInstalled: false })
         if (allowLegacyReissue) {
-          return bindTarget(vm, hostId, previous, prepareCragSubscriptionBinding(projectRoot, vm), payloadKeyId, {
-            install: true,
-            reissueSeat,
-          })
+          return bindTarget(
+            vm,
+            hostId,
+            previous,
+            prepareCragSubscriptionBinding(projectRoot, vm, { preferInstalled: false }),
+            payloadKeyId,
+            { install: true, reissueSeat },
+          )
         }
         await bindForStart(vm, previous, hostId, payloadKeyId, { install: true })
       })

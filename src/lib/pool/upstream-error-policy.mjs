@@ -56,6 +56,16 @@ const SEARCH_HISTORY_PATTERNS = [/encrypted_content/i, /`?search_result`?\s+bloc
 
 const ADAPTIVE_PATTERNS = [/adaptive thinking/i, /thinking\.type.*adaptive/i, /does not support adaptive/i]
 
+// The upstream refuses the sampling fields themselves, not their values: a
+// relay or vendor model that rejects `temperature` outright, or one that only
+// accepts temperature=1 under thinking. Pinning the mimicry value again would
+// be refused the same way, so the retry carries no sampling at all.
+const SAMPLING_PATTERNS = [
+  /`?(?:temperature|top_p|top_k)`?\s+(?:is|are)\s+(?:deprecated|not supported)/i,
+  /`?(?:temperature|top_p|top_k)`?\s+may only be set to/i,
+  /(?:does not support|unsupported)[^.]*\b(?:temperature|top_p|top_k)\b/i,
+]
+
 const ORGANIZATION_DISABLED_PATTERNS = [
   /organization has been disabled/i,
   /oauth authentication is currently not allowed/i,
@@ -517,7 +527,7 @@ function classifyUpstreamResultRaw(
     }
   }
   // Plan limit arrives as 429, as a kernel 502 provider_error, or (pre-restore)
-  // as 200 + SSE error. The text decides, not the status (sub2api handle429).
+  // as 200 + SSE error. The text decides, not the status.
   if (isPlanLimitMessage(message)) {
     return {
       scope: 'account',
@@ -625,6 +635,14 @@ function classifyUpstreamResultRaw(
         scope: 'request',
         action: 'repair-and-retry',
         reason: 'schema_repairable',
+        cooldownUntil: null,
+      }
+    }
+    if (!repaired && SAMPLING_PATTERNS.some((pattern) => pattern.test(hay))) {
+      return {
+        scope: 'request',
+        action: 'repair-and-retry',
+        reason: 'sampling_repairable',
         cooldownUntil: null,
       }
     }
@@ -857,7 +875,7 @@ function rectifyMessageContent(content, role) {
   return next.length ? next : placeholderContent(role)
 }
 
-/** Convert every thinking block to text and disable top-level thinking (sub2api retry). */
+/** Convert every thinking block to text and disable top-level thinking before retrying. */
 export function repairAnthropicRequest(body = {}, policy = {}) {
   if (policy.action !== 'repair-and-retry') return body
   const reason = String(policy.reason || '')
@@ -872,6 +890,10 @@ export function repairAnthropicRequest(body = {}, policy = {}) {
     normalizeThinkingForModel(next)
     return next
   }
+  // Sampling is owned by the outbound assembly, which rebuilds from caller input
+  // after this repair runs; `dropSampling` there strips the fields. Removing them
+  // here would only be refilled, and falling through would drop thinking as well.
+  if (reason === 'sampling_repairable') return body
   const out = structuredClone(body)
   if (out.thinking) delete out.thinking
   if (Array.isArray(out.context_management?.edits)) {

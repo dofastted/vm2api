@@ -1,7 +1,7 @@
 /**
- * redeem_codes repository — balance top-up codes (sub2api baseline shape).
+ * redeem_codes repository — balance top-up codes.
  * Redeem is transactional: code flips unused→used and the user's balance is
- * credited in the same transaction (sub2api RedeemService counterpart).
+ * credited in the same transaction.
  */
 
 import crypto from 'node:crypto'

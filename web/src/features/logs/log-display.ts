@@ -22,11 +22,18 @@ export async function copyText(text: string) {
 // ---------- 状态码 ----------
 
 /** 状态 badge 配色（hub `getStatusBadgeClassName`）。null = 无状态码。 */
-const INCOMPLETE_SUCCESS_BADGE =
+const COMMITTED_FAILURE_BADGE =
   'bg-orange-100 text-orange-800 border-orange-300 dark:bg-orange-900/30 dark:text-orange-300 dark:border-orange-700'
 
-/** Downstream already committed HTTP 2xx, but the stream/body did not finish. */
-export function isIncompleteCommitted(
+/**
+ * Downstream already committed HTTP 2xx, but the stream ended in a failed
+ * terminal — `incomplete`, or a `rejected` the gateway only learned about
+ * mid-stream (a local kernel queue timeout, say). Same success/failure cut as
+ * `chainItemStatus`: `verified` passes, any other recorded terminal does not.
+ * An unrecorded terminal keeps the plain status colour, so older rows that
+ * never stored one are not reclassified as failures.
+ */
+export function isCommittedFailure(
   statusCode: number | null,
   finalState: string | null | undefined
 ): boolean {
@@ -34,7 +41,9 @@ export function isIncompleteCommitted(
     statusCode != null &&
     statusCode >= 200 &&
     statusCode < 300 &&
-    finalState === 'incomplete'
+    finalState != null &&
+    finalState !== '' &&
+    finalState !== 'verified'
   )
 }
 
@@ -42,8 +51,7 @@ export function statusBadgeClass(
   statusCode: number | null,
   finalState: string | null | undefined = null
 ): string {
-  if (isIncompleteCommitted(statusCode, finalState))
-    return INCOMPLETE_SUCCESS_BADGE
+  if (isCommittedFailure(statusCode, finalState)) return COMMITTED_FAILURE_BADGE
   if (statusCode != null) {
     if (statusCode >= 200 && statusCode < 300)
       return 'bg-green-100 text-green-700 border-green-300 dark:bg-green-900/30 dark:text-green-400 dark:border-green-700'
@@ -62,7 +70,7 @@ export function statusBadgeTooltip(
   finalState: string | null | undefined,
   errorCode: string | null | undefined
 ): string | null {
-  if (!isIncompleteCommitted(statusCode, finalState)) return null
+  if (!isCommittedFailure(statusCode, finalState)) return null
   const state = terminalStateLabel(finalState ?? null) || '响应未完整结束'
   return errorCode ? `${state}（${errorCode}）` : state
 }

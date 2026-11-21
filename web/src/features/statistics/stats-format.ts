@@ -21,8 +21,8 @@ export function seriesColor(index: number): string {
 
 export const STATS_RANGES: { id: StatsRange; label: string }[] = [
   { id: 'today', label: '今天' },
-  { id: '7days', label: '过去 7 天' },
-  { id: '30days', label: '过去 30 天' },
+  { id: '7days', label: '近 7 天（含今天）' },
+  { id: '30days', label: '近 30 天（含今天）' },
   { id: 'thisMonth', label: '本月' },
 ]
 

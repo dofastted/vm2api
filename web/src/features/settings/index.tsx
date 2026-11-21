@@ -23,6 +23,7 @@ import { QueryGate } from '@/components/query-gate'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { AboutPane } from '@/features/settings/about-pane'
 import { BackupPane } from '@/features/settings/backup-pane'
+import { GeminiInstallPane } from '@/features/settings/gemini-install-pane'
 import { HealthPane } from '@/features/settings/health-pane'
 import { LogsPane } from '@/features/settings/logs-pane'
 import {
@@ -199,7 +200,8 @@ export function SettingsPage() {
     serverJson !== null &&
     Object.keys(draft).length > 0 &&
     JSON.stringify(draft) !== serverJson
-  const hideSave = tab === 'socks5' || tab === 'backup' || tab === 'about'
+  const hideSave =
+    tab === 'socks5' || tab === 'backup' || tab === 'about' || tab === 'gemini'
   const showSaveBar = dirty && !hideSave
 
   const discard = () => {
@@ -230,7 +232,9 @@ export function SettingsPage() {
           ? 'Claude 配额闸线、并发、RPM，以及请求体上限。GPT 配额在 OpenAI 页。个人自用引导会把闸关掉并拉到上限；这里仍可再改。'
           : tab === 'openai'
             ? 'GPT 传输、准入、配额与客户端画像。全局 WebSocket 只作用于推理，不影响终端或集群。'
-            : undefined
+            : tab === 'logs'
+              ? '设置请求日志的记录模式、保留时间和存储上限。逐条记录在日志页查看。'
+              : undefined
       }
     >
       <div className='@2xl/content:grid @2xl/content:grid-cols-[10.5rem_1fr] @2xl/content:gap-8'>
@@ -515,6 +519,7 @@ export function SettingsPage() {
               {tab === 'socks5' ? <Socks5Pane /> : null}
               {tab === 'backup' ? <BackupPane /> : null}
               {tab === 'about' ? <AboutPane /> : null}
+              {tab === 'gemini' ? <GeminiInstallPane /> : null}
             </div>
           </QueryGate>
         </div>

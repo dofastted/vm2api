@@ -252,7 +252,7 @@ export function LogicTraceTab({
                 </Badge>
               ) : null}
               <Badge variant='outline' className='text-[10px]'>
-                {vmCount} 个供应商
+                {vmCount} 台虚拟机
               </Badge>
             </div>
           </div>
