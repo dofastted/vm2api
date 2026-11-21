@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -72,23 +73,30 @@ func ensureHome(cfg *Config) error {
 	return writeConfigToml(cfg, "")
 }
 
-// writeConfigToml (re)writes the slot config; trustedPaths registers per-turn
-// working directories so the TUI does not stop on the trust prompt.
+// writeConfigToml writes the slot config once. Project-trust lookup walks
+// ancestor paths (config/src/project_trust_tests.rs), so trusting the
+// workspace root covers every per-turn child directory — no per-turn rewrite.
 func writeConfigToml(cfg *Config, trustDir string) error {
 	cfgPath := filepath.Join(cfg.CodexHome, "config.toml")
-	existing, _ := os.ReadFile(cfgPath)
-	if len(existing) == 0 {
-		existing = []byte(`# managed by kin-codex-tui; do not edit by hand
+	base := fmt.Sprintf(`# managed by kin-codex-tui; do not edit by hand
 approval_policy = "never"
 sandbox_mode = "read-only"
 check_for_update_on_startup = false
 hide_agent_reasoning = false
 notify = []
-`)
+
+[projects.%q]
+trust_level = "trusted"
+`, cfg.WorkspaceRoot)
+	existing, _ := os.ReadFile(cfgPath)
+	if trustDir == "" || len(existing) == 0 {
+		return os.WriteFile(cfgPath, []byte(base), 0o600)
 	}
-	if trustDir == "" {
-		return os.WriteFile(cfgPath, existing, 0o600)
+	// A per-turn dir is already trusted via the root entry above; only an
+	// out-of-tree dir would need its own entry.
+	if filepath.IsAbs(trustDir) && !strings.HasPrefix(trustDir, cfg.WorkspaceRoot) {
+		entry := fmt.Sprintf("\n[projects.%q]\ntrust_level = \"trusted\"\n", trustDir)
+		return os.WriteFile(cfgPath, append(existing, []byte(entry)...), 0o600)
 	}
-	entry := fmt.Sprintf("\n[projects.%q]\ntrust_level = \"trusted\"\n", trustDir)
-	return os.WriteFile(cfgPath, append(existing, []byte(entry)...), 0o600)
+	return nil
 }

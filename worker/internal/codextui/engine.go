@@ -94,9 +94,6 @@ func (e *Engine) RunTurn(ctx context.Context, env *envelope, emit func(string, a
 		return err
 	}
 	defer os.RemoveAll(turnDir)
-	if err := writeConfigToml(e.cfg, turnDir); err != nil {
-		return err
-	}
 
 	spawnAt := time.Now()
 	// --no-daemon pins the TUI to an embedded app-server backend so the turn
@@ -116,6 +113,11 @@ func (e *Engine) RunTurn(ctx context.Context, env *envelope, emit func(string, a
 			return fmt.Errorf("codex stuck on onboarding screen %q: %w", state, err)
 		}
 		return err
+	}
+	// A leading / ! # is parsed by the composer as a slash command or shell
+	// escape on submit (chat_composer.rs); a leading newline keeps it literal.
+	if c := prompt[0]; c == '/' || c == '!' || c == '#' {
+		prompt = "\n" + prompt
 	}
 	if err := t.paste(prompt); err != nil {
 		return err
