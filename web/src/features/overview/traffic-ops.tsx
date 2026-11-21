@@ -192,9 +192,9 @@ export function TrafficOps({
       hint: `最近有请求的分钟 ${fmtRate(o.qps?.current)} · 分钟峰值 ${fmtRate(o.qps?.peak)}`,
     },
     {
-      label: 'TPS',
+      label: '平均 TPS',
       value: fmtRate(o.tps?.avg, 1),
-      hint: `入 ${fmtNum(o.input_tokens || 0)} / 出 ${fmtNum(o.output_tokens || 0)}`,
+      hint: `入 ${fmtNum(o.input_tokens || 0)} / 出 ${fmtNum(o.output_tokens || 0)} · TPS 另计缓存读写`,
     },
     {
       label: '流式占比',
