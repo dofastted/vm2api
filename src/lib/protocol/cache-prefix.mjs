@@ -532,6 +532,12 @@ export function peekCachePrefix(sessionKey, body, now = Date.now(), { preserveMe
   const key = String(sessionKey || '').trim()
   if (!key || !body || typeof body !== 'object') return null
   const previous = liveSession(key, now)
+  // Scheduling asks this for every candidate account, and only the one holding
+  // the session has a previous turn. Without one `comparePrefix` answers
+  // `{ turn: 1, break: null }` and never looks at the snapshot, so building it
+  // cost candidates x body size in JSON.stringify and SHA-256 for nothing
+  // (#1496). The shape below is what the full path returns in that case.
+  if (!previous) return { turn: 1, break: null, confirmed: false, intercept: null }
   // Compare what prepareCachePrefix would send, not the client's raw images.
   const images = liveImageState(previous?.image_key || key, now)
   const preserve = preserveMessageCache ?? previous?.preserve_message_cache ?? false
