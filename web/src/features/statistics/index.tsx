@@ -114,10 +114,9 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
           icon={Clock}
           accentColor='purple'
           className='min-h-[120px]'
-          // 响应时间变短是好事：取反让下降显示为绿色上箭头（与 hub 一致）。
-          comparisons={vsYesterday(
-            durationChange == null ? null : -durationChange
-          )}
+          // 响应时间变短是好事：保留下降箭头，只把颜色反过来。
+          comparisons={vsYesterday(durationChange)}
+          invertSentiment
         />
       </BentoGrid>
 

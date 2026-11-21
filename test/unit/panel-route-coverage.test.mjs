@@ -187,5 +187,8 @@ test('settings save imports public routing notify helpers', () => {
 
 test('PUT proxy restarts kin-egress when connection or domain_forward changes', () => {
   const routes = fs.readFileSync(path.join(root, 'src/lib/admin/panel-routes.mjs'), 'utf8')
-  assert.match(routes, /result\.domain_forward_changed \|\| result\.connection_changed/)
+  // Both flags have to reach the same restart guard. Other change flags may sit
+  // between them -- `dns_disable_svcb_https_changed` already does -- so match the
+  // disjunction rather than pinning the two to be neighbours.
+  assert.match(routes, /result\.domain_forward_changed(?:\s*\|\|\s*result\.\w+)*\s*\|\|\s*result\.connection_changed/)
 })

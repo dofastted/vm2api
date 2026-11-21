@@ -440,7 +440,13 @@ export function VirtualizedLogsTable({
   }
   if (!allLogs.length && !hasNextPage) {
     return (
-      <div className='py-8 text-center text-muted-foreground'>暂无数据</div>
+      <div className='py-8 text-center text-muted-foreground'>
+        {Object.entries(filters).some(
+          ([key, value]) => key !== 'excludeErrorClass' && Boolean(value)
+        )
+          ? '没有符合当前筛选条件的日志'
+          : '本次查询未返回日志'}
+      </div>
     )
   }
   if (!allLogs.length && hasNextPage) {

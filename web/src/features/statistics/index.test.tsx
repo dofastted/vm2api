@@ -4,6 +4,7 @@ import { StatisticsPage } from './index'
 
 const overviewState = vi.hoisted(() => ({
   todayAvgDurationMs: null as number | null,
+  yesterdayAvgDurationMs: null as number | null,
 }))
 
 const EMPTY_STATISTICS = {
@@ -30,7 +31,10 @@ vi.mock('@tanstack/react-query', async (importOriginal) => {
       }
       if (queryKey[0] === 'panel' && queryKey[1] === 'usage-logs-overview') {
         return {
-          data: { todayAvgDurationMs: overviewState.todayAvgDurationMs },
+          data: {
+            todayAvgDurationMs: overviewState.todayAvgDurationMs,
+            yesterdayAvgDurationMs: overviewState.yesterdayAvgDurationMs,
+          },
           isLoading: false,
           error: null,
         }
@@ -64,6 +68,7 @@ function responseCard(html: string) {
 describe('statistics duration card', () => {
   it('shows a dash when today has no duration sample', () => {
     overviewState.todayAvgDurationMs = null
+    overviewState.yesterdayAvgDurationMs = null
     const card = responseCard(renderToStaticMarkup(<StatisticsPage />))
     expect(card).toContain('>—</h3>')
     expect(card).not.toContain('0ms')
@@ -71,8 +76,23 @@ describe('statistics duration card', () => {
 
   it('shows a measured zero duration', () => {
     overviewState.todayAvgDurationMs = 0
+    overviewState.yesterdayAvgDurationMs = null
     const card = responseCard(renderToStaticMarkup(<StatisticsPage />))
     expect(card).toContain('>0ms<')
     expect(card).not.toContain('>—</h3>')
+  })
+
+  it('keeps a real decrease pointed down', () => {
+    overviewState.todayAvgDurationMs = 80
+    overviewState.yesterdayAvgDurationMs = 100
+    const html = renderToStaticMarkup(<StatisticsPage />)
+    const start = html.indexOf('平均响应时间')
+    const card = html.slice(start, start + 1200)
+    expect(card).toContain('>−20%<')
+    expect(card).toContain('较昨日同期')
+    expect(card).toContain('lucide-arrow-down')
+    expect(card).toContain('text-emerald-500')
+    expect(card).not.toContain('>+20%<')
+    expect(card).not.toContain('lucide-arrow-up')
   })
 })

@@ -17,6 +17,7 @@ import {
   hasBoundExit,
   inspectEgressNetwork,
   inspectEgressProcess,
+  inspectEgressProcessAsync,
   iptablesPlan,
   isLocalEgressProxy,
   localEgressProxyUrl,
@@ -870,4 +871,32 @@ test('startProxyEgress derives dns_empty_types from its proxy unless told otherw
     })
   }
   for (const id of ['px-dns-on', 'px-dns-off']) stopEgressProcess(root, id)
+})
+
+test('the async egress probe returns the same verdict as the sync one (#1495)', async () => {
+  // The watchdog probe moved off the event loop, so there are now two paths to
+  // the same health rules. Pin that they agree: a drift here would make the
+  // watchdog restart helpers the panel calls healthy, or vice versa.
+  const reply = (stdout, ok = true, stderr = '') => ({ ok, stdout, stderr })
+  const cases = [
+    ['running', reply('true|false|4242|cfgsha|binsha|')],
+    ['restarting', reply('false|true|4242|cfgsha|binsha|')],
+    ['stopped', reply('false|false|0|cfgsha|binsha|')],
+    ['absent', reply('', false, 'Error: No such object: kin-cp-egress-px-a')],
+    ['inspect broken', reply('', false, 'Cannot connect to the Docker daemon')],
+  ]
+  for (const [label, r] of cases) {
+    const opts = { runtime: 'container', bin: '/nonexistent/kin-egress' }
+    const sync = inspectEgressProcess('/unused', 'px-a', { ...opts, runDocker: () => r })
+    const async_ = await inspectEgressProcessAsync('/unused', 'px-a', {
+      ...opts,
+      runDocker: async () => r,
+    })
+    assert.deepEqual(async_, sync, label)
+  }
+  // The process runtime has no docker call to move, so it is shared outright.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-eg-async-'))
+  const sync = inspectEgressProcess(dir, 'px-none', { runtime: 'process' })
+  assert.deepEqual(await inspectEgressProcessAsync(dir, 'px-none', { runtime: 'process' }), sync)
+  fs.rmSync(dir, { recursive: true, force: true })
 })

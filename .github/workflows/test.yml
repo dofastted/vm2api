@@ -155,7 +155,9 @@ jobs:
             (cd worker && CGO_ENABLED=0 go build -o ../bin/kin-egress ./cmd/kin-egress)
           fi
           if [ "$FULL" = true ]; then
-            npm run test:unit
+            # Four workers for the four vCPUs a standard runner has. The suite is
+            # 412 files and over a quarter of an hour one at a time.
+            VM2API_TEST_CONCURRENCY=4 npm run test:unit
           else
             tests=$(jq -r '.[] | split("/")[-1] | select(. != "oauth-binary.test.mjs")' <<< "$CHANGED_TESTS")
             changed=()

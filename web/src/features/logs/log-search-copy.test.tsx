@@ -34,7 +34,7 @@ describe('filtered log search status', () => {
     const html = renderTable()
     expect(html).toContain('role="status"')
     expect(html).toContain('正在查找符合条件的日志…')
-    expect(html).not.toContain('暂无数据')
+    expect(html).not.toContain('本次查询未返回日志')
   })
 
   it('shows the empty result only after the scan ends', () => {
@@ -47,7 +47,7 @@ describe('filtered log search status', () => {
       fetchNextPage: () => {},
     }
     const html = renderTable()
-    expect(html).toContain('暂无数据')
+    expect(html).toContain('本次查询未返回日志')
     expect(html).not.toContain('正在查找符合条件的日志')
   })
 })

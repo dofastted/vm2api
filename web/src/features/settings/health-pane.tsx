@@ -360,8 +360,8 @@ function SignatureRepairCard({
       <CardContent className='flex items-start justify-between gap-4'>
         <div className='space-y-1 text-sm text-muted-foreground'>
           <p>
-            上游因思考签名返回 400 时，剥掉思考历史后重试一次，客户端最终看到
-            200。
+            上游因思考签名返回 400
+            时，清理思考历史后重试一次；最终结果取决于重试。
           </p>
           <p>
             关闭则保留同账号的 thinking / signature
