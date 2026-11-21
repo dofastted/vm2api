@@ -537,7 +537,11 @@ export function VmListPage() {
                   · {deleteTarget.id}
                 </span>
               </p>
-              <DeleteActiveVmHint target={deleteTarget} vms={vms} />
+              <DeleteActiveVmHint
+                target={deleteTarget}
+                vms={vms}
+                force={forceDelete && !!nodeGone}
+              />
             </>
           ) : (
             ''
