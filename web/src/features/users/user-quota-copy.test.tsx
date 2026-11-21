@@ -14,11 +14,14 @@ describe('user quota wording', () => {
     const html = renderToStaticMarkup(
       <RoleFields
         role='user'
+        enabled
+        setEnabled={() => {}}
         quota={0}
-        concurrency='0'
-        setRole={() => {}}
         setQuota={() => {}}
+        concurrency='0'
         setConcurrency={() => {}}
+        concurrencyInvalid={false}
+        setRole={() => {}}
       />
     )
     expect(html).toContain('aria-describedby="user-quota-help"')
