@@ -174,3 +174,37 @@ func TestSessionCodeNamesMissingExit(t *testing.T) {
 		t.Fatalf("error code = %v (%s)", errBody["code"], out.String())
 	}
 }
+
+// A caller can override the exit: `proxy_url: ""` means the local egress, which
+// is how the panel falls back when the bound proxy is invalid. It must work even
+// when the worker config itself has no exit.
+func TestSessionCodeProxyOverrideUsesLocalEgress(t *testing.T) {
+	fixture := &sessionCodeFixture{
+		orgsStatus:      http.StatusOK,
+		orgsBody:        `[{"uuid":"org-1"}]`,
+		authorizeStatus: http.StatusOK,
+		authorizeBody:   `{"redirect_uri":"https://platform.claude.com/oauth/code/callback?code=code-9&state=state-1"}`,
+	}
+	server := newSessionCodeServer(t, fixture)
+	t.Setenv(claudeOAuthBaseEnv, server.URL)
+	cfg := config.Config{TestEndpoints: true}
+	input := `{"session_key":"sk-ant-sid01-test","scope":"user:inference","state":"state-1","code_challenge":"challenge-1","proxy_url":""}`
+	var out bytes.Buffer
+	if code := runSessionCode(cfg, strings.NewReader(input), &out); code != 0 {
+		t.Fatalf("exit code = %d", code)
+	}
+	var envelope responseEnvelope
+	if err := json.Unmarshal(out.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode envelope: %v (%s)", err, out.String())
+	}
+	if !envelope.OK {
+		t.Fatalf("envelope = %s", out.String())
+	}
+	body, _ := envelope.Body.(map[string]any)
+	if body["code"] != "code-9" {
+		t.Fatalf("body = %+v", body)
+	}
+	if fixture.requests != 2 {
+		t.Fatalf("requests = %d", fixture.requests)
+	}
+}
