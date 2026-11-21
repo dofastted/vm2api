@@ -174,6 +174,40 @@ async function exchangeCodeForToken(authCode, codeVerifier, state, session, opti
   })
 }
 
+
+/**
+ * The helper already ran the README's post-token sequence (profile → eval →
+ * roles → first token date → eval → bootstrap), so its reply carries
+ * `organization_role`, `subscription_created_at` and `oauth_account` as well.
+ * Keep every field it returned; only the canonical ones are re-stated here.
+ */
+export function linkCredentialFromToken(token = {}, session = {}) {
+  const identity = flattenOauthIdentity(token)
+  const expiresIn = Number(token.expires_in || 0)
+  const now = Math.floor(Date.now() / 1000)
+  // kin-oauth-auth completes bootstrap through the same bound exit as the
+  // exchange, whether in the VM or on the controller. Do not bootstrap twice.
+  return carryOAuthAttempt(token, {
+    ...token,
+    access_token: token.access_token,
+    refresh_token: token.refresh_token || '',
+    token_type: token.token_type || 'Bearer',
+    expires_in: expiresIn,
+    expires_at: token.expires_at || now + expiresIn,
+    scope: token.scope || session.scope,
+    email: identity.email || token.email,
+    email_address: identity.email || token.email_address,
+    account_uuid: identity.account_uuid || token.account_uuid,
+    org_uuid: identity.org_uuid || token.org_uuid,
+    subscription_type: identity.subscription_type || token.subscription_type,
+    rate_limit_tier: identity.rate_limit_tier || token.rate_limit_tier,
+    organization_role: identity.organization_role || token.organization_role,
+    subscription_created_at: identity.subscription_created_at || token.subscription_created_at,
+    source: session.source || 'oauth-auth-url',
+    flavor: session.flavor || 'cai',
+  })
+}
+
 export async function exchangeAuthCode({
   sessionId,
   code,
@@ -235,25 +269,5 @@ export async function exchangeAuthCode({
     fetchImpl,
   })
   sessions.delete(sessionId)
-  const expiresIn = Number(token.expires_in || 0)
-  const now = Math.floor(Date.now() / 1000)
-  const identity = flattenOauthIdentity(token)
-  // kin-oauth-auth completes bootstrap through the same bound exit as the
-  // exchange, whether in the VM or on the controller. Do not bootstrap twice.
-  return carryOAuthAttempt(token, {
-    access_token: token.access_token,
-    refresh_token: token.refresh_token || '',
-    token_type: token.token_type || 'Bearer',
-    expires_in: expiresIn,
-    expires_at: token.expires_at || now + expiresIn,
-    scope: token.scope || session.scope,
-    email: identity.email,
-    email_address: identity.email,
-    account_uuid: identity.account_uuid,
-    org_uuid: identity.org_uuid,
-    subscription_type: identity.subscription_type,
-    rate_limit_tier: identity.rate_limit_tier,
-    source: session.source || 'oauth-auth-url',
-    flavor: session.flavor || 'cai',
-  })
+  return linkCredentialFromToken(token, session)
 }
