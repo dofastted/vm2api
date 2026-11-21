@@ -72,6 +72,9 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
   const sessionKey = 'sk-ant-sid-unit-cookie'
   const requests = []
   let authorizeMode = 'success'
+  // The authorize request names the scope the token will carry; the mock token
+  // response echoes it instead of always granting the full set.
+  let grantedScope = null
   const upstream = https.createServer({ key: fs.readFileSync(key), cert: fs.readFileSync(cert) }, async (req, res) => {
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
@@ -93,11 +96,13 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
         res.end(JSON.stringify({ error: 'invalid_grant' }))
         return
       }
+      const scope = grantedScope || FULL_OAUTH_SCOPE
+      grantedScope = null
       const token = JSON.stringify({
         access_token: accessToken,
         refresh_token: refreshToken,
         expires_in: 28800,
-        scope: FULL_OAUTH_SCOPE,
+        scope,
       })
       res.write(token.slice(0, 20))
       res.end(token.slice(20))
@@ -180,6 +185,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
         )
         return
       }
+      grantedScope = payload.scope || null
       expectedExchange = {
         code: 'cookie-auth-code',
         challenge: payload.code_challenge,
@@ -387,7 +393,9 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       })
       assert.equal(credential.access_token, accessToken)
       assert.equal(credential.refresh_token, refreshToken)
-      assert.equal(credential.scope, FULL_OAUTH_SCOPE)
+      // Granted scope when upstream sends it, otherwise the profile's own scope:
+      // the setup-token mint is inference-only.
+      assert.equal(credential.scope, runtimeMode === 'setup-token' ? INFERENCE_ONLY_SCOPE : FULL_OAUTH_SCOPE)
       assert.equal(credential.type, runtimeMode)
       assert.equal(credential.mode, runtimeMode)
       assert.equal(credential.email, 'exchange@example.test')
@@ -425,7 +433,8 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       )
       assert.equal(token.headers['user-agent'], 'axios/1.15.2')
       assert.equal(token.headers['sec-ch-ua'], undefined)
-      assert.equal(Object.hasOwn(token.payload, 'expires_in'), false)
+      // The mint asks for a year; the normal login never sends a lifetime.
+      assert.equal(token.payload.expires_in, setup ? SETUP_TOKEN_TTL_SECONDS : undefined)
       assert.equal(profile.headers['user-agent'], `claude-code/${OFFICIAL_CLI_VERSION}`)
       assert.match(evalBefore.payload.attributes.sdkCachePartition, /^served-to-bearer:/)
       assert.equal(roles.headers['content-type'], undefined)
@@ -439,7 +448,9 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       assert.equal(authorize.payload.response_type, 'code')
       assert.equal(authorize.payload.client_id, CLIENT_ID)
       assert.equal(authorize.payload.redirect_uri, REDIRECT_URI)
-      assert.equal(authorize.payload.scope, FULL_OAUTH_SCOPE)
+      // The setup-token mint never widens to the full login scope, even when the
+      // payload still carries it.
+      assert.equal(authorize.payload.scope, setup ? INFERENCE_ONLY_SCOPE : FULL_OAUTH_SCOPE)
       assert.equal(authorize.payload.code_challenge_method, 'S256')
       assert.ok(authorize.payload.state)
       assert.equal(token.payload.state, authorize.payload.state)
