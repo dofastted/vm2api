@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 商城对供应商的调用失败会留下一行日志。此前一次失败的结账什么都不留:vm2api 不记录 API 请求日志（6822 行 journal 里零条 `/api/panel`），而 `crag-shop-supplier.mjs` 里 `send()` 的 catch 把一切非 `ShopError` 的异常压成同一个 `shop_unavailable`——超时、DNS 失败、TLS 错误、回复体畸形全都长成一样。代价是具体的:生产上 11-16 到 11-20 的 15 笔订单零付款成功，其中 5 笔的 `amount_minor` 与 `subtotal_minor` 仍是 NULL，而这两列由 `reflectOrder` 在 `supplier.create` 成功返回后回填——所以那 5 笔是 create 抛了异常、买家从未拿到付款页，而原因已经永久丢失。`send()` 是所有供应商调用的唯一出口，日志记在那里，两个字段为区分而选:`status` 为 0 表示没有收到响应，把「供应商拒绝了」与「我们没到达它」分开；`cause` 是错误类名，把超时、网络故障、解析故障分开。只记失败，成功不记（#1603）。
+- 那行日志不带任何凭据。receipt 与 pilot token 是凭据，请求体带购买明细，而 path 里的**订单号是买家对这笔订单的凭据**——签发侧的 `claim-by-order` 认它作为迁移订阅的依据——所以 `auditPath` 把订单号截到 8 位十六进制:够用来在 `crag_shop_orders` 里定位那一行，远不够猜出其余部分。断言加在已有的 pilot 凭据测试里，因为那个测试同时持有 pilot token、receipt 和一个订单号，能同时验证「日志可用」与「不泄露凭据」，并覆盖无响应（`status: 0`、订单号被截断）与有响应（`status: 200`）两种形态。它**不会**追溯解释已经发生的那 5 笔，那些原因没有留下任何记录（#1603）。
+
 ## 1.4.179 — 2026-11-22 · Arch KVM 槽不再卡在时间同步，KVM 容器 pids 跟随槽位容量，缓存断点自保 TTL 序
 
 - Arch 云镜像建出来的 KVM 槽不再卡死在时间同步上。Arch 官方云镜像默认启用 `systemd-time-wait-sync.service`（`TimeoutStartSec=infinity`），而 `pacman-init.service` 把自己排在 `After=time-sync.target`、`Before=sshd.service cloud-final.service`；KVM 槽经 SOCKS5 出口（只过 TCP），UDP 的 NTP 123 永远完不成，于是 `sshd` 与 `cloud-final`（`runcmd` → `install-guest.sh` → `kin-kernel`）一个都起不来，新槽表现为 `guest ssh unavailable` / `Connection reset by peer` 并反复触发看门狗重启。现在 `docker/kin-kvm/guest/user-data` 里加一条 `bootcmd`，在 cloud-init 的 Network 阶段（早于 `cloud-final` / `runcmd`）把这个 unit mask 掉，用 `command -v systemctl` 守卫，所以没有这个 unit 的发行版（Ubuntu / Debian / Fedora）不受影响；`bootcmd` 是 per-always 模块，不受 user-data 里「instance-id 稳定所以 datasource 只跑一次」的影响，而 `mask` 本身幂等（#1595）。
