@@ -78,3 +78,88 @@ test('a handed-over relay leaves the socket path to the new leader', async () =>
   assert.equal(fs.existsSync(socketPath), false)
   fs.rmSync(dir, { recursive: true, force: true })
 })
+
+import { SeatPlanner } from '../../src/lib/pool/seat-planner.mjs'
+import {
+  createForeignLoad,
+  exportLiveLoad,
+  startLoadReader,
+  startLoadWriter,
+} from '../../src/lib/pool/foreign-load.mjs'
+
+function fakeScheduler() {
+  const notified = []
+  return {
+    inflight: new Map(),
+    inflightFamily: new Map(),
+    vmInflight: new Map(),
+    planner: new SeatPlanner(),
+    notified,
+    notifyCapacity: (id) => notified.push(id),
+    signalChange() {},
+  }
+}
+
+test('the new leader counts the draining peer load and takes it out again', () => {
+  const peer = fakeScheduler()
+  peer.inflight.set('acct-1', 2)
+  peer.inflightFamily.set('acct-1', new Map([['opus', 2]]))
+  peer.vmInflight.set('vm-1', 2)
+  const peerSeat = peer.planner.open('sess:a', { vmId: 'vm-1', accountId: 'acct-1', cap: 4 })
+  peer.planner.hold(peerSeat)
+  const quota = { inflight: new Map([['acct-1', 2]]) }
+  const snap = exportLiveLoad({ scheduler: peer, accountQuota: quota })
+
+  const me = fakeScheduler()
+  me.inflight.set('acct-1', 1)
+  const myQuota = { inflight: new Map([['acct-1', 1]]) }
+  const foreign = createForeignLoad({ scheduler: me, accountQuota: myQuota })
+  foreign.apply(snap)
+  assert.equal(me.inflight.get('acct-1'), 3)
+  assert.equal(me.inflightFamily.get('acct-1').get('opus'), 2)
+  assert.equal(me.vmInflight.get('vm-1'), 2)
+  assert.equal(myQuota.inflight.get('acct-1'), 3)
+  assert.equal(me.planner.openCount('vm-1'), 1, 'peer seat occupies a slot here')
+
+  // One peer request finished.
+  foreign.apply({ ...snap, accounts: { 'acct-1': 1 }, vms: { 'vm-1': 1 }, quota: { 'acct-1': 1 }, families: { 'acct-1': { opus: 1 } } })
+  assert.equal(me.inflight.get('acct-1'), 2)
+  assert.equal(me.planner.openCount('vm-1'), 1)
+
+  foreign.clear()
+  assert.equal(me.inflight.get('acct-1'), 1, 'own load is untouched')
+  assert.equal(me.vmInflight.has('vm-1'), false)
+  assert.equal(myQuota.inflight.get('acct-1'), 1)
+  assert.equal(me.inflightFamily.has('acct-1'), false)
+  assert.equal(me.planner.openCount('vm-1'), 0, 'idle ghost seat is freed')
+  assert.ok(me.notified.includes('acct-1'))
+})
+
+test('a ghost seat the session continued on here is kept when the peer lets go', () => {
+  const me = fakeScheduler()
+  const foreign = createForeignLoad({ scheduler: me })
+  foreign.apply({ seats: [{ seatKey: 'sess:b', vmId: 'vm-2', accountId: 'acct-2', index: 0 }] })
+  const seat = me.planner.seatOf('sess:b')
+  me.planner.hold(seat)
+  foreign.clear()
+  assert.equal(me.planner.seatOf('sess:b'), seat)
+  assert.equal(me.planner.openCount('vm-2'), 1)
+})
+
+test('load file round trip; a stale file counts as no load', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-load-'))
+  const file = path.join(dir, 'run', 'handover-load.json')
+  let load = { accounts: { a: 3 } }
+  const writer = startLoadWriter({ file, read: () => load, intervalMs: 20 })
+  const me = fakeScheduler()
+  const reader = startLoadReader({ file, foreign: createForeignLoad({ scheduler: me }), intervalMs: 20, staleMs: 200 })
+  assert.equal(me.inflight.get('a'), 3)
+  load = { accounts: { a: 1 } }
+  await new Promise((r) => setTimeout(r, 120))
+  assert.equal(me.inflight.get('a'), 1)
+  writer.stop()
+  await new Promise((r) => setTimeout(r, 120))
+  assert.equal(me.inflight.has('a'), false)
+  reader.stop()
+  fs.rmSync(dir, { recursive: true, force: true })
+})

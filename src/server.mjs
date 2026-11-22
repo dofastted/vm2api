@@ -9,6 +9,13 @@
  */
 import { spawn, spawnSync } from 'node:child_process'
 import { handoverRole, setHandoverRole, setOverlap, markExclusive, deferredKeys } from './lib/core/handover.mjs'
+import {
+  createForeignLoad,
+  exportLiveLoad,
+  foreignLoadPath,
+  startLoadReader,
+  startLoadWriter,
+} from './lib/pool/foreign-load.mjs'
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -207,6 +214,8 @@ function runAtActivation(name, fn) {
   return undefined
 }
 let activating = false
+let foreignLoadReader = null
+let foreignLoadWriter = null
 async function activateStandby(reason = 'signal') {
   if (standbyActive || activating) return false
   activating = true
@@ -219,8 +228,17 @@ async function activateStandby(reason = 'signal') {
   }
   standbyActive = true
   setHandoverRole('leader')
-  // The old controller is still finishing its streams: hold back anything that would cut them.
+  // The old controller is still finishing its streams: hold back anything that would cut them,
+  // and count its live requests and seats against capacity until it has gone.
   setOverlap(true)
+  try {
+    foreignLoadReader = startLoadReader({
+      file: foreignLoadPath(dataDir),
+      foreign: createForeignLoad({ scheduler: poolScheduler, accountQuota }),
+    })
+  } catch (e) {
+    console.warn('[handover] foreign load reader failed', e?.message || e)
+  }
   console.log(JSON.stringify({ event: 'standby-activate', reason, tasks: standbyTasks.map((t) => t.name) }))
   for (const { name, fn } of standbyTasks.splice(0)) {
     try {
@@ -1445,6 +1463,15 @@ async function handoverLeadership() {
   if (handoverRole() !== 'leader' || !standbyActive) return false
   stopLeaderJobs()
   setHandoverRole('draining')
+  // Publish our live load first, so the new leader counts it from its first scheduling decision.
+  try {
+    foreignLoadWriter = startLoadWriter({
+      file: foreignLoadPath(dataDir),
+      read: () => exportLiveLoad({ scheduler: poolScheduler, accountQuota }),
+    })
+  } catch (e) {
+    console.warn('[handover] foreign load writer failed', e?.message || e)
+  }
   const unlocked = await controlPlaneFlock(['-u'])
   console.log(JSON.stringify({ event: 'handover-released', ok: unlocked.status === 0, inflight: gracefulShutdown.getActiveCount() }))
   return unlocked.status === 0
@@ -1458,6 +1485,7 @@ const gracefulShutdown = createGracefulShutdown({
     stopLeaderJobs()
   },
   afterDrain: async () => {
+    foreignLoadWriter?.stop()
     // Let host cleanup finish without extending shutdown to the launch deadline.
     await Promise.race([geminiTerminalDrain, delay(2000, undefined, { ref: false })])
     try {
@@ -1779,6 +1807,8 @@ function runExclusivePass() {
   if (handoverRole() !== 'leader' || exclusivePass) return exclusivePass
   exclusivePass = (async () => {
     const keys = deferredKeys()
+    foreignLoadReader?.stop()
+    foreignLoadReader = null
     const synced = spawnSync('/usr/local/bin/vm2api-entrypoint', ['sync'], { encoding: 'utf8', timeout: 120_000 })
     const wrapChanged = /WRAP_CHANGED=1/.test(synced.stdout || '')
     if (synced.status !== 0) console.error(`[handover] shared sync failed: ${(synced.stderr || '').trim().slice(-300)}`)
