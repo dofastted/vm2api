@@ -837,7 +837,7 @@ backupService.onRestored((db) => {
 // that one may still be mid-run, and two full snapshots of a large DB would run side by side.
 runAtActivation('backup', () =>
   deferUntilExclusive('backup', () => {
-    backupService.cleanStaging()
+    void backupService.cleanStaging()
     backupService.startScheduler()
   }),
 )

@@ -236,13 +236,13 @@ test('remove deletes record + file', async () => {
   assert.equal(svc.get(rec.id), null)
 })
 
-test('cleanStaging removes unfinished backup staging dirs and nothing else', () => {
+test('cleanStaging removes unfinished backup staging dirs and nothing else', async () => {
   const tmp = path.join(dataDir, 'tmp')
   fs.mkdirSync(path.join(tmp, 'kin-backup-AbC123', 'db'), { recursive: true })
   fs.writeFileSync(path.join(tmp, 'kin-backup-AbC123', 'db', 'kin.db'), 'snapshot')
   fs.mkdirSync(path.join(tmp, 'kin-restore-XyZ789'), { recursive: true })
   fs.writeFileSync(path.join(tmp, 'kin-backup-notes.txt'), 'keep')
-  const removed = svc.cleanStaging()
+  const removed = await svc.cleanStaging()
   assert.deepEqual(removed, [path.join(tmp, 'kin-backup-AbC123')])
   assert.equal(fs.existsSync(path.join(tmp, 'kin-restore-XyZ789')), true)
   assert.equal(fs.existsSync(path.join(tmp, 'kin-backup-notes.txt')), true)

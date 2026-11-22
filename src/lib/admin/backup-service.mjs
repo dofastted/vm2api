@@ -218,15 +218,15 @@ export class BackupService {
     }
   }
 
-  /**
-   * Stop a backup in progress (blue/green handover, shutdown): the worker holds a minutes-long VACUUM +
-   * tar and keeps a draining controller alive. Its staging dir is removed by the next cleanStaging().
-   */
   /** True while a backup worker thread is alive; it can outlive abortRunning() while VACUUM INTO runs. */
   get busy() {
     return !!this._worker
   }
 
+  /**
+   * Stop a backup in progress (blue/green handover, shutdown): the worker holds a minutes-long VACUUM +
+   * tar and keeps a draining controller alive. Its staging dir is removed by the next cleanStaging().
+   */
   async abortRunning() {
     const worker = this._worker
     if (!worker) return false
@@ -239,9 +239,11 @@ export class BackupService {
   /**
    * Remove staging dirs left by backups that never finished (process killed mid-run). Each is a full
    * DB snapshot (tens of GB). Only the leader backs up, so at leader start none of them is live.
+   * The dirs are picked synchronously (a backup started right after is never among them) and removed
+   * off the main thread: unlinking a tens-of-GB file on ext4 blocks for seconds.
    */
-  cleanStaging() {
-    const removed = []
+  async cleanStaging() {
+    const stale = []
     for (const base of new Set([process.env.KIN_BACKUP_TMPDIR, this.tmpDir].filter(Boolean))) {
       let names = []
       try {
@@ -253,11 +255,16 @@ export class BackupService {
         if (!/^kin-backup-[A-Za-z0-9]{6}$/.test(name)) continue
         const dir = path.join(base, name)
         try {
-          if (!fs.lstatSync(dir).isDirectory()) continue
-          fs.rmSync(dir, { recursive: true, force: true })
-          removed.push(dir)
+          if (fs.lstatSync(dir).isDirectory()) stale.push(dir)
         } catch {}
       }
+    }
+    const removed = []
+    for (const dir of stale) {
+      try {
+        await fs.promises.rm(dir, { recursive: true, force: true })
+        removed.push(dir)
+      } catch {}
     }
     if (removed.length) console.log(`[backup] removed ${removed.length} unfinished staging dir(s)`)
     return removed
