@@ -312,6 +312,30 @@ function listCragV2Files(dir, prefix = '') {
   return rows
 }
 
+/**
+ * Member digests keyed by inode identity, size, mtime and ctime. Rehashing the ~100 MB package on every
+ * check blocked the event loop for seconds at a time (slot-image warm runs it per kernel per node, license
+ * checks per slot). Any write changes ctime, so a modified member is always rehashed.
+ */
+const memberDigestCache = new Map()
+const MEMBER_HEAD_BYTES = 64
+
+function memberDigest(file) {
+  const st = fs.lstatSync(file)
+  const key = `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`
+  const hit = memberDigestCache.get(file)
+  if (hit?.key === key) return hit
+  const body = fs.readFileSync(file)
+  const entry = {
+    key,
+    size: body.length,
+    head: Buffer.from(body.subarray(0, MEMBER_HEAD_BYTES)),
+    digest: crypto.createHash('sha256').update(body).digest('hex'),
+  }
+  memberDigestCache.set(file, entry)
+  return entry
+}
+
 export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude = false } = {}) {
   try {
     const root = fs.lstatSync(dir)
@@ -396,8 +420,7 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
       return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 package has unlisted file ${rel}` }
     }
     const file = path.join(dir, rel)
-    const body = fs.readFileSync(file)
-    const digest = crypto.createHash('sha256').update(body).digest('hex')
+    const { digest, head: body, size } = memberDigest(file)
     if (digest !== manifest.sha256[rel]) {
       return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 hash mismatch: ${rel}` }
     }
@@ -410,6 +433,7 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
           error: 'CRAG v2 may only ship the native bootstrap and separate official Claude executables',
         }
       if (
+        size < 64 ||
         body.length < 64 ||
         body.readUInt32BE(0) !== 0x7f454c46 ||
         body[4] !== 2 ||
@@ -455,8 +479,9 @@ export function verifyCragV2Tree(dir, { arch = cragV2Arch(), allowPreviousClaude
       payload.ciphertext_sha256 !== manifest.sha256[payload.path]
     )
       throw new Error('metadata')
-    const bytes = fs.readFileSync(path.join(dir, payload.path))
-    if (bytes.length <= 36 || bytes.subarray(0, 8).toString('ascii') !== 'CRAGV2E1') throw new Error('payload')
+    // Header only: the member loop above already hashed it against the manifest.
+    const { head, size } = memberDigest(path.join(dir, payload.path))
+    if (size <= 36 || head.subarray(0, 8).toString('ascii') !== 'CRAGV2E1') throw new Error('payload')
     const signed = {
       product: 'crag-v2',
       format: payload.format,

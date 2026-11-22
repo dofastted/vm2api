@@ -998,3 +998,28 @@ test('slot runtime arch resolves x86_64 Docker/KVM/cluster targets on ARM64 host
     'arm64',
   )
 })
+
+test('a re-verified CRAG v2 tree reuses member digests but still catches a same-size rewrite', (t) => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-digest-cache-'))
+  t.after(() => fs.rmSync(project, { recursive: true, force: true }))
+  seedTemplate(project)
+  const pkg = seedEncryptedPackage(project)
+  assert.equal(verifyCragV2Tree(pkg).ok, true)
+  const reads = []
+  const readFileSync = fs.readFileSync
+  t.mock.method(fs, 'readFileSync', function (file, ...rest) {
+    reads.push(String(file))
+    return readFileSync.call(this, file, ...rest)
+  })
+  assert.equal(verifyCragV2Tree(pkg).ok, true)
+  const payload = path.join(pkg, 'crag-v2.payload.enc')
+  assert.equal(reads.includes(payload), false, 'unchanged members are not re-read')
+  t.mock.restoreAll()
+  // Same size, new bytes: the ctime moves, so the cached digest must not be trusted.
+  const body = fs.readFileSync(payload)
+  body[body.length - 1] ^= 0xff
+  fs.writeFileSync(payload, body)
+  const verified = verifyCragV2Tree(pkg)
+  assert.equal(verified.ok, false)
+  assert.equal(verified.code, 'crag_v2_hash_mismatch')
+})

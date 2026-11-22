@@ -119,6 +119,8 @@ import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egr
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
 import { createSlotDesktop } from './lib/vm/slot-desktop.mjs'
 import { vmLockBusy } from './lib/vm/vm-file.mjs'
+import { slotImageSpec } from './lib/cluster/slot-image.mjs'
+import { OS_CATALOG } from './lib/vm/os-catalog.mjs'
 import { isKvmRuntime } from './lib/vm/runtime-kind.mjs'
 import { resolveKernelDataplane } from './lib/vm/slot-engine.mjs'
 import {
@@ -1203,7 +1205,18 @@ const clusterManager = new ClusterManager({
 localEgressCluster = clusterManager
 bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
 await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
-if (STANDBY) clusterManager.prewarmLinks()
+if (STANDBY) {
+  clusterManager.prewarmLinks()
+  // Hash the slot image payloads now (read-only CPU). Otherwise the new leader does it on the event loop
+  // as each node link comes up after activation (warmNodeSlotImages), stalling requests for seconds.
+  setTimeout(() => {
+    for (const kernel of Object.keys(OS_CATALOG)) {
+      try {
+        slotImageSpec(cfg.paths.project, kernel)
+      } catch {}
+    }
+  }, 1000).unref()
+}
 runAtActivation('cluster', () => {
   clusterManager.start()
   return clusterManager.restoreSlotRelays()
