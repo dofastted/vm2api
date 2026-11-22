@@ -2,6 +2,10 @@
 # SSH key and first-boot install only. Per-boot identity/mounts are
 # kin-guest-setup.service (instance-id is stable per overlay, so this
 # datasource runs once).
+# Mask systemd-time-wait-sync before cloud-final/sshd so distros that enable it
+# (e.g. Arch cloud images) do not stall waiting for UDP NTP behind SOCKS5 egress.
+bootcmd:
+  - [sh, -c, "if command -v systemctl >/dev/null 2>&1; then systemctl mask --now --no-block systemd-time-wait-sync.service 2>/dev/null || true; fi"]
 hostname: {{HOSTNAME}}
 manage_etc_hosts: true
 fqdn: {{HOSTNAME}}

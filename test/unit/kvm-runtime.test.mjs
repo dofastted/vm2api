@@ -384,3 +384,10 @@ test('kvm docker run honors slotCreationLimits pids instead of hardcoding 256', 
   const planArgs = argsFor('kvm', max20, {})
   assert.equal(planArgs[planArgs.indexOf('--pids-limit') + 1], '640')
 })
+
+test('kvm cloud-init user-data masks systemd-time-wait-sync in bootcmd', () => {
+  const userData = fs.readFileSync(path.resolve('docker/kin-kvm/guest/user-data'), 'utf8')
+  assert.match(userData, /^#cloud-config\b/m)
+  assert.match(userData, /^bootcmd:/m)
+  assert.match(userData, /systemctl mask --now --no-block systemd-time-wait-sync\.service/)
+})
