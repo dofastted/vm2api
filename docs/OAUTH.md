@@ -28,11 +28,11 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
 
 | 入口 | 路径 | 说明 |
 |------|------|------|
-| Setup Token + Cookie | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | `sk-ant-sid*` 经槽位出口申请完整 OAuth scope（profile、inference、sessions、MCP、文件），采集身份；落盘后以 Setup Token 运行模式执行，不跑官方初装。浏览器段（organizations + authorize）由 `kin-worker oauth session-code` 发出，走 Chrome TLS 指纹。 |
+| Setup Token + Cookie | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | `sk-ant-sid*` 经槽位出口取 code，采集身份；落盘后以 Setup Token 运行模式执行，不跑官方初装。浏览器段（organizations + authorize）由 `kin-worker oauth session-code` 发出，走 Chrome TLS 指纹。**scope 由 `runtime_mode` 决定，有效期不由我们伪造**：两条路都申请完整 5 项（身份链要 `user:profile`），也都不发 `expires_in`，换回来的是上游的短效票；一年期 mint 不在这里铸造（需要时由本地用短效票换）。 |
 | 已有 OAuth → Setup Token | `POST /api/panel/vms/:id/oauth/to-setup-token` | 读 worker 活票，仅切换运行模式；保留 access、refresh、真实过期时间和全部实际 scope。不会凭空增加权限，也不会删 scope。官方一年期 token（`official-setup-token`）不能转。 |
 | 官方 `claude setup-token` | 槽内 PTY / 粘贴一年期 oat | 只有 `user:inference`、无 refresh。落盘 `credential_mode=official-setup-token`，与面板转换的完整 Setup Token 区分。 |
-| Claude Code OAuth（默认） | 账号面板 → OAuth → Claude Code 授权 | 打开专用终端，VM 内原生 `claude auth login` 生成链接并处理回调；面板保存并同步结果。 |
-| 通用授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | CAI 与 Setup Token 都走面板 PKCE 的 CAI 授权链接（`claude.com/cai/oauth/authorize`）；CAI 用完整 OAuth scope，Setup Token 用 `user:inference` 的一年期 mint（与 `claude setup-token` 一致）。要求绑定可用出口。 |
+| Claude Code OAuth（默认） | 账号面板 → OAuth → Claude Code 授权 | 打开专用终端，VM 内原生 `claude auth login` 生成链接并处理回调；面板保存并同步结果。登录本身不再设 wall-clock 上限（用户节奏），凭证落盘由 180 秒 commit deadline 兜底（`KIN_LOGIN_COMMIT_DEADLINE_MS`）。 |
+| 通用授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | CAI 与 Setup Token 都走面板 PKCE 的 CAI 授权链接（`claude.com/cai/oauth/authorize`）；两个 flavor 都用完整 OAuth scope（身份信息需要 `user:profile`），换票都不请求 `expires_in`，拿到的是上游短效票。要求绑定可用出口。 |
 
 正式凭证的 access/refresh 写入 `credentials.json`；导入时文档顶层和 `claudeAiOauth` 都写 `kinGeneration`，文件仍是 `0444`。`vm.json` / DB 只留 `has_access` / `has_refresh` / email / expiry / generation。
 
@@ -62,6 +62,8 @@ CAI 粘贴码换票规则：`code#state` 只将 `#` 后的上游返回值作为 
 - 不保存响应 Cookie：整个流程只主动带 `Cookie: sessionKey`，`Set-Cookie` 一律不落盘。
 - profile / roles / eval / first-token / bootstrap 都是尽力而为：票据已经绑定该账号，不因为后续一跳失败丢掉一次换票。profile 和 bootstrap 都空时身份留空。
 - 出口仍是 fail closed：`proxy_url=""` 是本地出口（直连），`null` 是未绑定（`proxy_required`），不因为上游直连就放开。
+- **helper 自报能力**：`{"operation":"capabilities"}` 返回 `session-code-bridge`、`setup-token-inference`、`proxy-fallback-local`。e2e 按二进制声明选择断言，避免「行为改了但发行二进制还没换」时 CI 必然变红；策略本身放在入库的 `src/lib/oauth/profile-policy.mjs`，由单测直接覆盖。
+- **代理无效时的去向可配**：`KIN_OAUTH_PROXY_FALLBACK=local` 时，浏览器段（organizations + authorize）在出口被拒/不可达后改用本地出口重试一次；其它取值（默认 `off`）直接把代理失败抛给面板。只重试不消耗授权码的阶段，token 那一步永不重放。
 - authorize 的来源头会按序回退：上游按调用方 `Origin` 做允许列表，来源不对时是 `403 permission_error: Origin not allowed`（与 sessionKey 失效无关）。`claude.com/cai/oauth/authorize` 已 307 到 `claude.ai/oauth/authorize`，官方 CLI 的 `CLAUDE_AI_ORIGIN` 也是 `https://claude.ai`，所以 `auth.js` 依次尝试「profile 参考来源 → 同一主机的另一来源 → 不带 Origin」；只有这条 Origin 拒绝才换下一组，其它 403 立即失败，全被拒时错误列出尝试过的来源（面板映射成 `origin_rejected`，502）。
 - token 端点两种边缘拒绝单独归类，不再和授权码问题混在一起：`429 rate_limit_error` → `token_exchange_rate_limited`（面板 429，提示等 1 分钟再交同一个码，别连点；持续出现说明该出口 IP 被限速）；`403 Request not allowed` → `token_exchange_forbidden`（面板 502，提示换出口，通常是地区不支持）。
 - authorize 的**客户端指纹**才是门槛：claude.ai 前端会给每个改动型请求补 `client_attestation: { hcaptcha_token }`，但闸门量的是传输层——同样的 body/Cookie/出口，Chrome TLS + HTTP/2 客户端能通过，Node/undici 只写 Chrome 头会被判 `400 missing_client_attestation`。因此 cookie 段改由 `kin-worker oauth session-code`（`worker/internal/oauthcmd/sessioncode.go`，客户端 = `upstream.NewOAuthHTTPClient`，与 `claude_oauth_service.go` 对齐）取 code，`auth.js` 拿回 code 后照旧换票。缺 kin-worker / worker.json 时退回内置 fetch，那条会报 `authorize_client_attestation` / 面板 `client_attestation_required`（502），立即失败不试来源头。授权链接那条完全在浏览器里发生，页面自己铸证明，不受影响。

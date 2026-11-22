@@ -3,9 +3,8 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { execFile, execFileSync } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import { setTimeout as delay } from 'node:timers/promises'
-import { promisify } from 'node:util'
 import { pullKernelRelease } from '../src/lib/admin/kernel-catalog.mjs'
 import { listVmRecordFiles } from '../src/lib/vm/vm-file.mjs'
 import { isCodexVm } from '../src/lib/vm/vm-kind.mjs'
@@ -13,27 +12,16 @@ import { resolveKernelDataplane, resolveCragKernelVersion } from '../src/lib/vm/
 import { cragV2PackageRoot, stageCragV2Tree, verifyCragV2Tree } from '../src/lib/vm/wrap-cli-runtime.mjs'
 import { rustKernelHealth } from '../src/lib/transport/rust-kernel-client.mjs'
 import { slotExec } from '../src/lib/vm/slot-runtime.mjs'
-import { slotExecArgv } from '../src/lib/vm/slot-exec.mjs'
-import { isKvmRuntime } from '../src/lib/vm/runtime-kind.mjs'
+import {
+  cragSlotHealthy,
+  matchingCragTree,
+  runningCragCoreHashes,
+  waitForCragCore,
+} from '../src/lib/vm/crag-core-check.mjs'
 
-const execute = promisify(execFile)
-
-export async function runningCragHashes(vm, { execute: run = execute } = {}) {
-  const command =
-    'for p in /proc/[0-9]*/exe; do case "$(readlink "$p" 2>/dev/null)" in *memfd:crag-v2-core*) sha256sum "$p" || exit 1;; esac; done'
-  // Guest root can inspect memfds across guest users. A capability-dropped Docker
-  // root cannot inspect kincli's processes, so keep that container's default user.
-  const argv = slotExecArgv(vm, ['sh', '-c', command], isKvmRuntime(vm) ? { user: '0' } : {})
-  const { stdout } = await run('docker', argv, { timeout: 10_000, maxBuffer: 64 * 1024 })
-  return stdout
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => {
-      if (!/^[a-f0-9]{64}\s+\/proc\/\d+\/exe$/.test(line)) throw new Error('crag_process_hash_invalid')
-      return line.slice(0, 64)
-    })
-}
+// Kept as a named export for callers and tests; the implementation now ships
+// with the control plane under src/lib so the panel can reuse it.
+export const runningCragHashes = runningCragCoreHashes
 
 function records(root) {
   return listVmRecordFiles(path.join(root, 'vms'))
@@ -81,7 +69,14 @@ function refreshCachedPackage(src, dest) {
 
 export async function updateCrag(
   root,
-  { tag = '', api, pull = pullKernelRelease, health = rustKernelHealth, coreHashes = runningCragHashes } = {},
+  {
+    tag = '',
+    api,
+    pull = pullKernelRelease,
+    health = rustKernelHealth,
+    coreHashes = runningCragCoreHashes,
+    coreWait = {},
+  } = {},
 ) {
   const base = path.join(root, 'share/crag/kernels/v2')
   fs.mkdirSync(base, { recursive: true })
@@ -97,8 +92,7 @@ export async function updateCrag(
     if (!verified.ok) throw new Error(verified.code)
     const manifest = fs.readFileSync(path.join(src, 'manifest.json'))
     const expectedCore = verified.manifest.payload.plaintext_sha256
-    const matchingTree = (dir) =>
-      verifyCragV2Tree(dir).ok && fs.readFileSync(path.join(dir, 'manifest.json')).equals(manifest)
+    const matchingTree = (dir) => matchingCragTree(dir, manifest)
     const matchingCore = (hashes) => hashes.length === 1 && hashes[0] === expectedCore
 
     const targets = []
@@ -160,12 +154,14 @@ export async function updateCrag(
       } else if (action === 'sync' && status === 'running') {
         const current = JSON.parse(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`), 'utf8'))
         if (current.node_id) throw new Error(`crag_inventory_changed:${vm.id}`)
-        const hashes = await coreHashes(current)
-        if (!matchingCore(hashes)) throw new Error(`crag_running_core_mismatch:${vm.id}`)
-        const h = await health(slotExec(root, current), { timeoutMs: 3000 })
-        if (h?.healthy !== true || h.runtime_variant !== 'crag-v2' || h.license_valid !== true)
+        const core = await waitForCragCore(current, expectedCore, { coreHashes, sleep: delay, ...coreWait })
+        if (!core.ok) throw new Error(`${core.code}:${vm.id}`)
+        if (!(await cragSlotHealthy(slotExec(root, current), { health })))
           throw new Error(`crag_slot_not_healthy:${vm.id}`)
-        item.running_core_sha256 = hashes[0]
+        // Cores spawn lazily. With the installed tree already hash-verified,
+        // a slot that has none up yet is pending, not inconsistent.
+        if (core.state === 'verified') item.running_core_sha256 = core.sha
+        else item.core_pending = true
       }
       items.push(item)
     }

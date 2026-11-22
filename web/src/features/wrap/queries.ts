@@ -27,7 +27,10 @@ export type KernelInstallation = {
 
 export type KernelCatalog = {
   kernels: KernelProduct[]
+  /** The CRAG payload this deployment pins, or null when nothing is pinned. */
+  crag_pin?: { tag: string; label?: string } | null
   licenses: Record<string, CragLicenseStatus>
+  install_licenses?: Record<string, CragLicenseStatus>
   installations?: Record<string, KernelInstallation>
 }
 
@@ -36,6 +39,8 @@ export type KernelTarget = {
   kernel: KernelId
   expected_tag?: string
   payload_tag?: string
+  /** Explicit operator approval to migrate an existing host grant to this package. */
+  reissue?: true
 }
 
 export type KernelInstallItem = KernelTarget & {
@@ -76,7 +81,12 @@ export function kernelVersionsQueryOptions() {
   })
 }
 
-export function pullKernelRelease(body: { kernel: KernelId; tag?: string }) {
+export function pullKernelRelease(body: {
+  kernel: KernelId
+  tag?: string
+  /** Pass false to fetch the payload this deployment pins instead of the newest release. */
+  latest?: boolean
+}) {
   return api<{
     kernel: KernelProduct
     release?: {
@@ -91,8 +101,7 @@ export function pullKernelRelease(body: { kernel: KernelId; tag?: string }) {
   })
 }
 
-export async function installKernelTargets(targets: KernelTarget[]) {
-  const endpoint = '/api/panel/kernels/install'
+async function runKernelJob(endpoint: string, targets: KernelTarget[]) {
   const unknown = () =>
     new ApiError(
       '无法确认安装结果，请先核对槽位状态，不要重复提交。',
@@ -115,7 +124,8 @@ export async function installKernelTargets(targets: KernelTarget[]) {
     throw unknown()
   })
   if (!receipt?.job_id) throw unknown()
-  const statusUrl = `${endpoint}?${new URLSearchParams({ job_id: receipt.job_id })}`
+  // Both endpoints report progress through the shared install job.
+  const statusUrl = `/api/panel/kernels/install?${new URLSearchParams({ job_id: receipt.job_id })}`
   const deadline = Date.now() + 15 * 60_000
   while (Date.now() < deadline) {
     const job = await api<{
@@ -142,6 +152,18 @@ export async function installKernelTargets(targets: KernelTarget[]) {
     await new Promise((resolve) => setTimeout(resolve, 1000))
   }
   throw unknown()
+}
+
+export function installKernelTargets(targets: KernelTarget[]) {
+  return runKernelJob('/api/panel/kernels/install', targets)
+}
+
+/**
+ * Replaces the CRAG payload on slots that already run it. Every target must
+ * carry the release pin; the endpoint rejects the batch otherwise.
+ */
+export function updateCragTargets(targets: KernelTarget[]) {
+  return runKernelJob('/api/panel/kernels/crag-update', targets)
 }
 
 /** Abandons one VM's in-flight install and frees the kernel cache for other VMs. */

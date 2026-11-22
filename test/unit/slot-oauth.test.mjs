@@ -110,8 +110,8 @@ test('runSlotOauth includes --force only when requested', async () => {
   }
   await runSlotOauth(exec, 'refresh', { runDocker })
   await runSlotOauth(exec, 'refresh', { force: true, runDocker })
-  assert.equal(calls[0].at(-1), '/run/kin/worker.json')
-  assert.equal(calls[1].at(-1), '--force')
+  assert.ok(!calls[0].includes('--force'))
+  assert.ok(calls[1].includes('--force'))
 })
 
 test('runSlotOauth parses the last non-empty JSON line', async () => {

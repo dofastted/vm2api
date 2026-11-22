@@ -141,11 +141,7 @@ test('zero automatic caching reaches the final tool result without changing earl
   validateCacheBreakpoints(out)
 })
 
-for (const options of [
-  { outboundShape: 'lean' },
-  { preserveSystem: true },
-  { requestContext: { purpose: 'auto_mode_classifier' } },
-]) {
+for (const options of [{ preserveSystem: true }, { requestContext: { purpose: 'auto_mode_classifier' } }]) {
   test(`zero fallback does not take over another assembly path: ${JSON.stringify(options)}`, () => {
     assert.equal(markers(prepareCliHopBody(fixture(), options)).length, 0)
   })

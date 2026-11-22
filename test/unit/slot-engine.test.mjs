@@ -41,6 +41,11 @@ test('session slots default to native capacity and clamp persisted values', () =
   assert.equal(normalizeInferenceConfig({}).session_slots, 20)
   assert.equal(normalizeInferenceConfig({}).prewarm_enabled, false)
   assert.equal(normalizeInferenceConfig({ prewarm_enabled: true }).prewarm_enabled, true)
+  // health_timeout_ms is consumed by rustHealthTimeoutMs; normalization must
+  // keep it or the panel can never configure it (silent dead key).
+  assert.equal(normalizeInferenceConfig({}).health_timeout_ms, 800)
+  assert.equal(normalizeInferenceConfig({ health_timeout_ms: 5000 }).health_timeout_ms, 5000)
+  assert.equal(normalizeInferenceConfig({ health_timeout_ms: -1 }).health_timeout_ms, 800)
   assert.deepEqual(validateInferenceRoutingPatch({ inference: { prewarm_enabled: false } }), [])
   assert.ok(validateInferenceRoutingPatch({ inference: { prewarm_enabled: 'false' } }).length)
 })

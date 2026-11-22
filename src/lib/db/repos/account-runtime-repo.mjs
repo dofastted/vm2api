@@ -68,7 +68,7 @@ export class AccountRuntimeRepo {
       a.status, a.schedulable, a.priority, a.rate_multiplier, a.concurrency,
       a.concurrency_override, a.max_rpm, a.rpm_override, a.requests,
       a.tokens_in, a.tokens_out, a.cache_read_tokens, a.cache_creation_tokens,
-      a.extra, a.updated_at, a.load_factor, a.last_used_at,
+      a.extra, a.updated_at, a.load_factor, a.last_used_at, a.created_at,
       a.temp_unschedulable_until, a.temp_unschedulable_reason, a.rate_limited_at,
       a.rate_limit_reset_at, a.overload_until, a.session_window_start,
       a.session_window_end, a.session_window_status,

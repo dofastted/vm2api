@@ -811,9 +811,21 @@ export function clearVmAuthCooldown(vmPath) {
   return vm
 }
 
+// The control plane lost track of the worker: the refresh may or may not have run.
+const WORKER_TRANSPORT_CODES =
+  /^(worker_output_invalid|worker_exec_failed|worker_timeout|worker_output_limit|credential_pull_failed)$/i
+
+/** Lost answers are retryable only when the worker's attempt journal guards the refresh token. */
+const unguardedTransportFailure = (result) =>
+  result?.attempt_guard === false &&
+  WORKER_TRANSPORT_CODES.test(String(result?.error?.code || result?.error_code || ''))
+
 export function classifyCredentialRefresh(result) {
   if (result?.ok) return result.refreshed ? 'refreshed' : 'already_fresh'
   const code = String(result?.error?.code || result?.error_code || '')
+  // The worker sent this token once without a usable answer; only re-authorization resolves it.
+  if (code === 'refresh_outcome_unknown') return 'failed'
+  if (unguardedTransportFailure(result)) return 'failed'
   const message = String(result?.error?.message || result?.message || result?.error || '')
   const status = Number(result?.status) || 0
   const blob = `${code} ${message}`.toLowerCase()
@@ -827,6 +839,7 @@ export function classifyCredentialRefresh(result) {
   if (
     status === 429 ||
     status >= 500 ||
+    WORKER_TRANSPORT_CODES.test(code) ||
     /timeout|transport|network|temporar|worker_unavailable|worker_timeout|worker_socket/.test(blob)
   ) {
     return 'retryable'
@@ -835,6 +848,8 @@ export function classifyCredentialRefresh(result) {
 }
 
 export function refreshErrorCodeOf(result) {
+  // A worker without the attempt journal cannot be retried safely after a lost answer.
+  if (unguardedTransportFailure(result)) return 'worker_upgrade_required'
   const code = String(result?.error?.code || result?.error_code || '').trim()
   const message = String(result?.error?.message || result?.message || '')
   const blob = `${code} ${message}`
@@ -843,6 +858,21 @@ export function refreshErrorCodeOf(result) {
   if (/refresh_token_missing|refresh token not found/i.test(blob)) return 'refresh_token_missing'
   if (/token has been revoked|oauth_revoked/i.test(blob)) return 'oauth_revoked'
   return code || 'credential_refresh_failed'
+}
+
+/**
+ * A slot was parked as `worker_upgrade_required` because its node's worker could not guard refresh retries.
+ * Once that worker is replaced, drop exactly that code so the normal guarded refresh can run again.
+ */
+export function clearUpgradeRequired(vmPath) {
+  if (!vmPath || !fs.existsSync(vmPath)) return false
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  if (vm?.claude?.refresh_error !== 'worker_upgrade_required') return false
+  vm.claude = stripCredentialSecrets({ ...vm.claude })
+  vm.claude.refresh_error = null
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(vmPath, vm, { mode: 0o600 })
+  return true
 }
 
 /** Persist a fatal/failed refresh onto vm.json. Dead tickets leave the pool even if 调度 was manually on. */

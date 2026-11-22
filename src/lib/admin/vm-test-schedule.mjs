@@ -18,6 +18,11 @@ const FREQUENCIES = new Set(['hourly', 'daily', 'weekly'])
 const DEFAULT_PROMPT = 'hello'
 const DEFAULT_MAX_TOKENS = 64
 const DEFAULT_REASONING_EFFORT = 'medium'
+/** #979: a preheat keeps its own small defaults; the dialog stays optional. */
+export const SCHEDULE_MODES = new Set(['test', 'preheat'])
+const PREHEAT_MAX_TOKENS = 64
+/** How often the auto-renew sweep looks for elapsed 5h windows (Croner unref'd). */
+const PREHEAT_RENEW_SWEEP_SEC = 60
 
 export class VmTestScheduleError extends Error {
   constructor(message, code = 'invalid_test_schedule', status = 400) {
@@ -186,6 +191,15 @@ export function normalizeVmTestSchedule(input, vm) {
   const enabled = input.enabled == null ? false : input.enabled
   if (typeof enabled !== 'boolean') throw new VmTestScheduleError('enabled must be a boolean')
 
+  // #979: 'test' keeps the old behaviour; 'preheat' sends the same tiny real
+  // request but skips when the window is already live. Unknown values reject.
+  const mode = input.mode == null ? 'test' : String(input.mode)
+  if (!SCHEDULE_MODES.has(mode)) throw new VmTestScheduleError('mode must be test or preheat')
+  const autoRenew = input.auto_renew === true
+  if (autoRenew && mode !== 'preheat') {
+    throw new VmTestScheduleError('auto_renew requires mode=preheat')
+  }
+
   let structure
   if (input.frequency != null) {
     structure = normalizeScheduleStructure(input)
@@ -235,6 +249,8 @@ export function normalizeVmTestSchedule(input, vm) {
 
   return {
     enabled,
+    mode,
+    auto_renew: autoRenew,
     ...structure,
     cron,
     model,
@@ -290,6 +306,15 @@ function nullableIso(value) {
   return new Date(value).toISOString()
 }
 
+/** A preheat gate must never crash scheduling; probe failures read as unknown. */
+function safeCall(fn) {
+  try {
+    return fn()
+  } catch {
+    return null
+  }
+}
+
 function savedResult(raw = {}) {
   return {
     last_run_at: nullableIso(raw.last_run_at),
@@ -302,6 +327,7 @@ function savedResult(raw = {}) {
         : String(raw.last_error)
             .replace(/[\r\n\t]/g, ' ')
             .slice(0, MAX_ERROR_LENGTH),
+    last_skipped: raw.last_skipped == null ? null : String(raw.last_skipped).slice(0, 64),
   }
 }
 
@@ -345,15 +371,28 @@ export class VmTestScheduleRunner {
     runTest,
     list = () => listVms(projectRoot),
     now = () => Date.now(),
+    /**
+     * #979 preheat gates. Both are optional; without them a preheat plan
+     * behaves like a plain scheduled test (always fires).
+     *   windowState(vmId) -> { hasCredential, schedulable, windowLive, reason }
+     *   nextWindowEnd(vmId) -> ms epoch of the recorded 5h reset, or null
+     */
+    windowState = null,
+    nextWindowEnd = null,
   } = {}) {
     this.projectRoot = projectRoot
     this.settingsFactory = typeof settings === 'function' ? settings : () => settings
     this.runTest = runTest
     this.listVms = list
     this.now = now
+    this.windowState = typeof windowState === 'function' ? windowState : null
+    this.nextWindowEnd = typeof nextWindowEnd === 'function' ? nextWindowEnd : null
     this.jobs = new Map()
     this.running = new Set()
     this.started = false
+    this.renewSweep = null
+    /** vmId -> ms, when the auto-renew sweep last fired this slot. */
+    this.renewFiredAt = new Map()
   }
 
   _settings() {
@@ -380,6 +419,8 @@ export class VmTestScheduleRunner {
       assertCron(cron, structure.timezone)
       return {
         enabled: raw.enabled === true,
+        mode: SCHEDULE_MODES.has(String(raw.mode)) ? String(raw.mode) : 'test',
+        auto_renew: raw.auto_renew === true,
         ...structure,
         cron,
         model: String(raw.model || ''),
@@ -441,6 +482,8 @@ export class VmTestScheduleRunner {
         parse_error: !!structure.parse_error,
         ...publicStructure(structure),
         enabled: raw.enabled === true,
+        mode: SCHEDULE_MODES.has(String(raw.mode)) ? String(raw.mode) : 'test',
+        auto_renew: raw.auto_renew === true,
         model: String(raw.model || ''),
         prompt: String(raw.prompt || ''),
         max_tokens: raw.max_tokens ?? null,
@@ -450,6 +493,7 @@ export class VmTestScheduleRunner {
         last_duration_ms:
           Number.isSafeInteger(raw.last_duration_ms) && raw.last_duration_ms >= 0 ? raw.last_duration_ms : null,
         last_error: raw.last_error ?? null,
+        last_skipped: raw.last_skipped || null,
         next_run_at: null,
         running: this.running.has(vmId),
       }
@@ -459,6 +503,7 @@ export class VmTestScheduleRunner {
     return {
       ...rest,
       parse_error: false,
+      last_skipped: schedule.last_skipped || null,
       next_run_at: this._nextRun({ ...schedule, vm_id: vmId }),
       running: this.running.has(vmId),
     }
@@ -594,12 +639,57 @@ export class VmTestScheduleRunner {
   start() {
     this.started = true
     this.reload()
+    this._startRenewSweep()
   }
 
   stop() {
     this.started = false
     for (const job of this.jobs.values()) job.stop()
     this.jobs.clear()
+    this._stopRenewSweep()
+  }
+
+  /**
+   * #979 auto-renew: once the recorded 5h window has elapsed, fire one
+   * preheat so the next window starts instead of waiting for the first
+   * business request. The sweep itself is cheap (settings scan + probe);
+   * the fired request reuses the same runTest path and window gates.
+   */
+  _startRenewSweep() {
+    this._stopRenewSweep()
+    if (!this.nextWindowEnd) return
+    this.renewSweep = new Cron(
+      `*/${PREHEAT_RENEW_SWEEP_SEC} * * * * *`,
+      { mode: '6-part', catch: true, unref: true },
+      () => this._sweepElapsedWindows().catch(() => {}),
+    )
+  }
+
+  _stopRenewSweep() {
+    this.renewSweep?.stop?.()
+    this.renewSweep = null
+    this.renewFiredAt.clear()
+  }
+
+  async _sweepElapsedWindows() {
+    if (!this.started) return
+    const all = this._settings().all?.() || {}
+    const now = this.now()
+    for (const key of Object.keys(all)) {
+      if (!key.startsWith(VM_TEST_SCHEDULE_PREFIX)) continue
+      const vmId = key.slice(VM_TEST_SCHEDULE_PREFIX.length)
+      const raw = all[key]
+      if (!raw || raw.enabled !== true || raw.auto_renew !== true) continue
+      const endMs = safeCall(() => this.nextWindowEnd(vmId))
+      if (!Number.isFinite(endMs) || endMs <= 0) continue
+      // Fire once per elapsed window: arm again only after a fresh end is seen.
+      const firedAt = this.renewFiredAt.get(vmId) || 0
+      if (firedAt >= endMs) continue
+      if (endMs > now) continue
+      if (!this._vm(vmId)) continue
+      this.renewFiredAt.set(vmId, endMs)
+      await this._run(vmId)
+    }
   }
 
   reload() {
@@ -637,8 +727,17 @@ export class VmTestScheduleRunner {
     }
     const schedule = this._stored(vmId)
     if (!schedule?.enabled) return
-    this.running.add(vmId)
     const startedAt = this.now()
+    // #979: a preheat never fires into a live window, and never retries a
+    // slot the pool already parked (no ticket, dead grant, 不可调度).
+    if (schedule.mode === 'preheat') {
+      const gate = this._preheatGate(vmId)
+      if (!gate.fire) {
+        this._recordRun(vmId, schedule, startedAt, { ok: null, skipped: gate.reason })
+        return
+      }
+    }
+    this.running.add(vmId)
     let result
     try {
       result = await this.runTest(vmId, {
@@ -653,19 +752,34 @@ export class VmTestScheduleRunner {
       this.running.delete(vmId)
     }
     if (!this.started) return
+    this._recordRun(vmId, schedule, startedAt, result)
+  }
 
+  /** Why a preheat did not fire: { fire: false, reason } or { fire: true }. */
+  _preheatGate(vmId) {
+    const probe = this.windowState ? safeCall(() => this.windowState(vmId)) : null
+    if (probe && probe.hasCredential === false) return { fire: false, reason: 'no_credential' }
+    if (probe && probe.schedulable === false) return { fire: false, reason: 'slot_not_schedulable' }
+    if (probe && probe.windowLive === true) return { fire: false, reason: 'window_live' }
+    return { fire: true }
+  }
+
+  /** Persist last_run_* fields. A skipped preheat keeps ok=null + reason. */
+  _recordRun(vmId, schedule, startedAt, result) {
     const current = this._settings().get(keyFor(vmId))
     if (!current || String(current.revision || '') !== schedule.revision || !this._vm(vmId)) return
     const duration = Number(result?.duration_ms)
     const lastDuration =
       Number.isSafeInteger(duration) && duration >= 0 ? duration : Math.max(0, this.now() - startedAt)
-    const lastOk = result?.ok === true
+    const skipped = result?.skipped || null
+    const lastOk = skipped ? null : result?.ok === true
     this._settings().set(keyFor(vmId), {
       ...current,
       last_run_at: new Date(startedAt).toISOString(),
       last_ok: lastOk,
       last_duration_ms: lastDuration,
-      last_error: lastOk ? null : compactError(result?.error),
+      last_error: lastOk === false ? compactError(result?.error) : skipped ? `skipped: ${skipped}` : null,
+      last_skipped: skipped,
     })
   }
 }

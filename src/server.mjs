@@ -13,11 +13,15 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { loadConfig, reloadActiveVm, routingConfigFile } from './lib/core/config.mjs'
+import { createGeminiScheduler } from './lib/gemini/scheduler.mjs'
 import {
+  createGeminiPublicHandler,
   createGeminiTerminal,
   geminiKeyAllowsPath,
-  handleGeminiPublic,
+  geminiProxyFor,
+  callGeminiHost,
   isGeminiPublicPath,
+  isGeminiSharedPath,
 } from './lib/gemini/routes.mjs'
 import {
   extractApiKey,
@@ -75,6 +79,7 @@ import {
   isCodexVm,
   syncCodexQuotaSchedule,
 } from './lib/vm/vm-registry.mjs'
+import { extraIsLiveOpen, parseResetMs } from './lib/pool/quota-window.mjs'
 import { createCragSubscription } from './lib/vm/crag-subscription.mjs'
 import { createCragRuntimeInventory } from './lib/vm/crag-runtime-inventory.mjs'
 import { configureCragRuntimeAdmission } from './lib/vm/slot-runtime-admission.mjs'
@@ -116,11 +121,17 @@ import {
 import {
   PROACTIVE_REFRESH_SKEW_MS,
   classifyCredentialRefresh,
+  clearUpgradeRequired,
   markVmRefreshError,
+  refreshErrorCodeOf,
   mirrorWorkerCredentialsToVm,
 } from './lib/oauth/oauth-credentials.mjs'
 import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
-import { ensureWorkerCredential, repairLocalCredentialLink } from './lib/transport/go-worker-client.mjs'
+import {
+  ensureWorkerCredential,
+  probeWorkerAttemptGuard,
+  repairLocalCredentialLink,
+} from './lib/transport/go-worker-client.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
 import { corsHeadersForRequest } from './lib/http/cors.mjs'
@@ -534,6 +545,42 @@ const vmTestSchedule = new VmTestScheduleRunner({
       apiKey: cfg.api_key,
       accountQuota,
     }),
+  // #979 preheat gates: read the same Extra/official windows the scheduler
+  // gates on, so a preheat never fires into a live window and never retries
+  // a slot the pool already parked.
+  windowState: (vmId) => {
+    try {
+      const vm = getVm(cfg.paths.project, vmId)
+      if (!vm) return { hasCredential: false, schedulable: false, windowLive: false }
+      const hasCredential = !!(vm.has_token || vm.claude?.has_access || vm.codex?.has_access)
+      const schedulable = vm.schedulable !== false
+      const acc = accountQuota
+        ?.snapshot?.()
+        .accounts?.find((row) => row.vm_id === vmId || row.account_id === (vm.claude?.account_uuid || vm.account_uuid))
+      if (!acc) return { hasCredential, schedulable, windowLive: false }
+      const w5 = acc.unified?.headers?.['5h'] || acc.unified?.['5h'] || {}
+      const resetMs = parseResetMs(w5.reset)
+      const windowLive =
+        extraIsLiveOpen(w5) || (Number.isFinite(resetMs) && resetMs > Date.now() && Number(w5.utilization) > 0)
+      return { hasCredential, schedulable, windowLive }
+    } catch {
+      return null
+    }
+  },
+  nextWindowEnd: (vmId) => {
+    try {
+      const vm = getVm(cfg.paths.project, vmId)
+      if (!vm) return null
+      const acc = accountQuota
+        ?.snapshot?.()
+        .accounts?.find((row) => row.vm_id === vmId || row.account_id === (vm.claude?.account_uuid || vm.account_uuid))
+      const w5 = acc?.unified?.headers?.['5h'] || acc?.unified?.['5h'] || {}
+      const resetMs = parseResetMs(w5.reset)
+      return Number.isFinite(resetMs) ? resetMs : null
+    } catch {
+      return null
+    }
+  },
 })
 credentialRefreshMonitor = createCredentialRefreshMonitor({
   config: normalizeCredentialRefreshConfig(routingConfig.credential_refresh),
@@ -548,6 +595,15 @@ credentialRefreshMonitor = createCredentialRefreshMonitor({
       } catch {}
       return { ...vm, last_probe: lastProbe }
     }),
+  reviveOne: async (vm) => {
+    const vmPath = path.join(cfg.paths.project, 'vms', `${vm.id}.json`)
+    const homeDir = path.join(cfg.paths.project, 'vms', vm.id, 'cli-home')
+    const exec = { vmId: vm.id, vmPath, homeDir, vm: getVm(cfg.paths.project, vm.id) || vm }
+    if (!(await probeWorkerAttemptGuard(exec))) return { revived: false }
+    const cleared = clearUpgradeRequired(vmPath)
+    if (cleared) invalidateLiveCredentialCache()
+    return { revived: cleared }
+  },
   refreshOne: (vm) =>
     refreshWorkerCredentialForVm({
       vmId: vm.id,
@@ -719,14 +775,20 @@ function publicCredentialRefreshResult(vmId, result, { force = false } = {}) {
     },
   }
   if (!result?.ok) {
+    const derived = refreshErrorCodeOf(result)
+    const code = derived === 'worker_upgrade_required' ? derived : result?.error?.code || 'credential_refresh_failed'
     out.error = {
-      code: result?.error?.code || 'credential_refresh_failed',
+      code,
       message:
-        refreshClass === 'fatal'
-          ? 'OAuth credential was rejected'
-          : refreshClass === 'retryable'
-            ? 'OAuth credential refresh is temporarily unavailable'
-            : 'OAuth credential refresh failed',
+        code === 'refresh_outcome_unknown'
+          ? 'An earlier refresh with this credential has no recorded result; re-authorize the slot'
+          : code === 'worker_upgrade_required'
+            ? 'The slot worker cannot guard refresh retries; update kin-worker on this node'
+            : refreshClass === 'fatal'
+              ? 'OAuth credential was rejected'
+              : refreshClass === 'retryable'
+                ? 'OAuth credential refresh is temporarily unavailable'
+                : 'OAuth credential refresh failed',
     }
   }
   return out
@@ -943,6 +1005,10 @@ const handleKeySelf = createKeySelfHandler({
 })
 
 const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
+  // The public handler routes `/v1/messages` itself and answers in the Anthropic
+  // shape. Rewriting req.url into the session path made the response carry
+  // `id: "messages"` and changed the path the request log attributes.
+  handleGeminiMessages: (req, res) => handleGeminiPublic(req, res),
   admitCragInference: (input) => cragSubscription.admitInference(input),
   json,
   writeSSEHeaders,
@@ -1137,6 +1203,14 @@ const handleCragShop = createCragShopHandler({
 })
 
 const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })
+const geminiScheduler = createGeminiScheduler({
+  callHost: callGeminiHost,
+  resolveProxy: (proxyId) => geminiProxyFor(proxyPool, proxyId),
+  poolScheduler,
+  apiKeyStore,
+  groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
+})
+const handleGeminiPublic = createGeminiPublicHandler({ json, readBody, scheduler: geminiScheduler })
 const handlePanel = createPanelHandler({
   getDb,
   cragSubscription,
@@ -1380,10 +1454,10 @@ const server = http.createServer(async (req, res) => {
       })
     }
 
-    if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
+    if (req.method === 'GET' && (p === '/v1/models' || p === '/models' || p === '/v1beta/models')) {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
-      if (groupType === 'gemini') return json(res, 200, { object: 'list', data: [] })
+      if (groupType === 'gemini') return handleGeminiPublic(req, res)
       if (resolveInferenceBackend(req) === 'api') {
         return json(res, 200, filterModelCatalogForKey(apiScheduler.catalog(apiScheduleScope(req, groupType)), req))
       }
@@ -1415,7 +1489,15 @@ const server = http.createServer(async (req, res) => {
 
     if (isGeminiPublicPath(p)) {
       if (!requireAuth(req, res)) return
-      return handleGeminiPublic(req, res, json)
+      return handleGeminiPublic(req, res)
+    }
+    // A shared path only belongs to Gemini when the key does. Dispatching on
+    // the path alone would make the OpenAI handlers below unreachable, and
+    // every other caller would get gemini_key_required. requireAuth has to run
+    // first: it is what populates the key record this reads.
+    if (isGeminiSharedPath(p)) {
+      if (!requireAuth(req, res)) return
+      if (keyScopeFromRequest(req).group_type === 'gemini') return handleGeminiPublic(req, res)
     }
 
     if (req.method === 'POST' && (p === '/v1/chat/completions' || p === '/chat/completions')) {

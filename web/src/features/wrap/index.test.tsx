@@ -6,7 +6,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '@/lib/api'
 import type { CragHostStatus } from '@/features/vm/queries'
 import { WrapSamplePage } from './index'
-import { installKernelTargets, type KernelInstallation } from './queries'
+import {
+  installKernelTargets,
+  pullKernelRelease,
+  updateCragTargets,
+  type KernelInstallation,
+} from './queries'
 
 type ConfirmProps = ComponentProps<
   typeof import('@/components/confirm-dialog').ConfirmDialog
@@ -25,6 +30,7 @@ const state = vi.hoisted(() => ({
   hostError: false,
   hostEnabled: false,
   hostInterval: undefined as number | false | undefined,
+  cragPin: undefined as { tag: string; label?: string } | null | undefined,
   values: [] as unknown[],
   cursor: 0,
   buttons: [] as ButtonProps[],
@@ -83,6 +89,7 @@ vi.mock('@tanstack/react-query', async (importOriginal) => ({
               },
               { id: 'cli-node', paid: false, ready: true, version: '1.4.131' },
             ],
+            crag_pin: state.cragPin,
             licenses: state.licenses,
             install_licenses: state.installLicenses,
             installations: state.installations,
@@ -121,6 +128,8 @@ vi.mock('@/components/ui/button', async (importOriginal) => {
 vi.mock('./queries', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./queries')>()),
   installKernelTargets: vi.fn(),
+  updateCragTargets: vi.fn(),
+  pullKernelRelease: vi.fn(),
 }))
 vi.mock('sonner', () => ({
   toast: { success: vi.fn(), warning: vi.fn(), error: vi.fn() },
@@ -147,6 +156,7 @@ beforeEach(() => {
   state.hostError = false
   state.hostEnabled = false
   state.hostInterval = undefined
+  state.cragPin = { tag: 'payload-2026.11.21-crag-3.1.12' }
   state.values = []
   state.cursor = 0
   state.buttons = []
@@ -165,6 +175,30 @@ beforeEach(() => {
       restarted: true,
     })),
   }))
+  vi.mocked(updateCragTargets).mockReset()
+  vi.mocked(updateCragTargets).mockImplementation(async (targets) => ({
+    ok: true,
+    total: targets.length,
+    ok_count: targets.length,
+    failed_count: 0,
+    items: targets.map((target) => ({
+      ...target,
+      ok: true,
+      stopped: true,
+      restarted: true,
+    })),
+  }))
+  vi.mocked(pullKernelRelease).mockReset()
+  vi.mocked(pullKernelRelease).mockResolvedValue({
+    kernel: {
+      id: 'crag',
+      name: 'CRAG',
+      paid: true,
+      ready: true,
+      version: '3.1.12',
+      updated_at: null,
+    },
+  })
 })
 
 async function reinstallCrag(vm: Partial<Vm>) {
@@ -301,7 +335,7 @@ it('pauses a bulk installation when the first slot result is unconfirmed', async
 })
 
 it.each(['license_required', 'license_payload_key_mismatch'])(
-  'does not gate installation or recommend reissue based on the cached %s hint',
+  'does not gate ordinary installation based on the cached %s hint',
   (code) => {
     state.licenses['vm-old'] = {
       status: 'valid',
@@ -322,6 +356,123 @@ it.each(['license_required', 'license_payload_key_mismatch'])(
     )
   }
 )
+
+describe('explicit CRAG grant migration', () => {
+  it('offers migration for the selected package and sends reissue only after explicit confirmation', async () => {
+    const vm = { runtime_type: 'docker', resolved_dataplane: 'wrap' } as const
+    // A partial old install can make the installed license unconfigured while
+    // the candidate reports that its payload key differs from the old grant.
+    state.licenses['vm-old'] = {
+      status: 'unconfigured',
+      valid: false,
+      vm_id: 'vm-old',
+      code: 'license_unconfigured',
+    }
+    state.installLicenses = {
+      'vm-old': {
+        status: 'invalid',
+        valid: false,
+        vm_id: 'vm-old',
+        code: 'license_payload_key_mismatch',
+      },
+    }
+    render(vm)
+    state.values[2] = { 'vm-old': 'crag' }
+    const html = render(vm)
+    expect(html).toContain('所选发行包需要迁移现有授权')
+    const migrate = state.buttons.find(
+      (entry) => entry['aria-label'] === '迁移 vm-old 授权并安装 CRAG'
+    )
+    expect(migrate?.disabled).toBe(false)
+    migrate?.onClick?.({} as never)
+    render(vm)
+    expect(state.confirm?.open).toBe(true)
+    expect(state.confirm?.confirmText).toBe('确认迁移并安装')
+    expect(state.confirm?.title).toContain('迁移 vm-old 的授权')
+    expect(installKernelTargets).not.toHaveBeenCalled()
+    state.confirm?.handleConfirm?.()
+    await vi.waitFor(() =>
+      expect(installKernelTargets).toHaveBeenCalledExactlyOnceWith([
+        {
+          id: 'vm-old',
+          kernel: 'crag',
+          payload_tag: 'payload-2026.11.16-crag-3.0.8',
+          reissue: true,
+        },
+      ])
+    )
+  })
+
+  it('offers a migration action after the server requires it, without silently retrying', async () => {
+    vi.mocked(installKernelTargets).mockImplementationOnce(async (targets) => ({
+      ok: false,
+      total: 1,
+      ok_count: 0,
+      failed_count: 1,
+      items: targets.map((target) => ({
+        ...target,
+        ok: false,
+        stopped: false,
+        code: 'crag_subscription_migration_required',
+        error: '此槽已有宿主订阅绑定，请完成授权迁移。',
+      })),
+    }))
+    const vm = {
+      runtime_type: 'docker',
+      resolved_dataplane: 'crag',
+      resolved_crag_kernel_version: 'v2',
+    } as const
+    await reinstallCrag(vm)
+    const html = render(vm)
+    expect(html).toContain('此槽已有宿主订阅绑定')
+    expect(html).toContain('迁移授权并安装')
+    expect(installKernelTargets).toHaveBeenCalledTimes(1)
+    expect(
+      vi.mocked(installKernelTargets).mock.calls[0][0][0]
+    ).not.toHaveProperty('reissue')
+  })
+
+  it('does not turn an unconfigured or missing license into an automatic migration', () => {
+    state.licenses['vm-old'] = {
+      status: 'unconfigured',
+      valid: false,
+      vm_id: 'vm-old',
+      code: 'license_unconfigured',
+    }
+    state.installLicenses = {
+      'vm-old': {
+        status: 'unlicensed',
+        valid: false,
+        vm_id: 'vm-old',
+        code: 'license_required',
+      },
+    }
+    const html = render({ runtime_type: 'docker', resolved_dataplane: 'crag' })
+    expect(html).not.toContain('迁移授权并安装')
+    expect(installKernelTargets).not.toHaveBeenCalled()
+  })
+
+  it('disables migration for viewers and never offers it for cli-node or macOS', () => {
+    state.installLicenses = {
+      'vm-old': {
+        status: 'invalid',
+        valid: false,
+        vm_id: 'vm-old',
+        code: 'license_payload_key_mismatch',
+      },
+    }
+    expect(render({ runtime_type: 'docker' })).not.toContain('迁移授权并安装')
+    expect(
+      render({ node_platform: 'darwin', resolved_dataplane: 'crag' })
+    ).not.toContain('迁移授权并安装')
+    state.role = 'user'
+    render({ runtime_type: 'docker', resolved_dataplane: 'crag' })
+    const migrate = state.buttons.find(
+      (entry) => entry['aria-label'] === '迁移 vm-old 授权并安装 CRAG'
+    )
+    expect(migrate?.disabled).toBe(true)
+  })
+})
 
 describe('KVM CRAG repair on the kernel page', () => {
   it('offers explicit CRAG reinstall when the current kernel is cli-node', () => {
@@ -449,5 +600,133 @@ describe('CRAG runtime on the kernel page', () => {
     expect(errorHtml).toContain('重装 vm-old 的 CRAG 并重启')
     expect(errorHtml).toContain('CRAG：运行状态未知')
     expect(errorHtml).toMatch(/使用中的槽位<\/span><span[^>]*>待核对<\/span>/)
+  })
+})
+
+describe('one-click CRAG upgrade to the pinned payload', () => {
+  const cragVm = {
+    id: 'slot-a',
+    resolved_dataplane: 'crag',
+    resolved_crag_kernel_version: 'v2',
+    status: 'running',
+  } as const
+  const pin = 'payload-2026.11.21-crag-3.1.12'
+  const upgradeButton = () =>
+    state.buttons.find((entry) =>
+      String(entry['aria-label'] || '').startsWith(
+        '把全部 CRAG 槽位升级到锁定版本'
+      )
+    )
+
+  it('is absent when the deployment pins nothing', () => {
+    state.cragPin = null
+    render(cragVm)
+    expect(upgradeButton()).toBeUndefined()
+  })
+
+  it('names the pinned version, not the payload date', () => {
+    // A payload tag reads payload-<date>-crag-<version>; showing 2026.11.21 as
+    // the version is what a naive match produces.
+    const html = render(cragVm)
+    expect(html).toContain('升级到锁定版本 3.1.12')
+    expect(html).not.toContain('升级到锁定版本 2026.11.21')
+    expect(upgradeButton()?.['aria-label']).toBe(
+      `把全部 CRAG 槽位升级到锁定版本 ${pin}`
+    )
+  })
+
+  it('upgrades only the slots that are not already on the pin', async () => {
+    state.installations = {
+      'slot-b': {
+        kernel: 'crag',
+        version: '3.1.12',
+        installed_at: 'x',
+        payload_tag: pin,
+      },
+    }
+    const others = [
+      { ...cragVm, id: 'slot-b' },
+      { ...cragVm, id: 'slot-c' },
+    ] as Vm[]
+    render(cragVm, others)
+    const button = upgradeButton()
+    expect(button?.disabled).toBe(false)
+    button?.onClick?.({} as Parameters<NonNullable<ButtonProps['onClick']>>[0])
+    render(cragVm, others)
+    expect(state.confirm?.open).toBe(true)
+    // slot-b is already pinned, so it is never stopped.
+    expect(String(state.confirm?.title)).toContain('2 个 CRAG 槽位')
+    state.confirm?.handleConfirm?.()
+    await vi.waitFor(() => expect(updateCragTargets).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(updateCragTargets).mock.calls.flat(2)).toEqual([
+      { id: 'slot-a', kernel: 'crag', payload_tag: pin },
+      { id: 'slot-c', kernel: 'crag', payload_tag: pin },
+    ])
+    expect(installKernelTargets).not.toHaveBeenCalled()
+    expect(toast.success).toHaveBeenCalledWith(
+      '2 个 CRAG 槽位已升级到锁定版本并重启'
+    )
+  })
+
+  it('pulls the pinned payload before the first slot stops', async () => {
+    render(cragVm)
+    upgradeButton()?.onClick?.(
+      {} as Parameters<NonNullable<ButtonProps['onClick']>>[0]
+    )
+    render(cragVm)
+    state.confirm?.handleConfirm?.()
+    await vi.waitFor(() => expect(updateCragTargets).toHaveBeenCalled())
+    expect(pullKernelRelease).toHaveBeenCalledExactlyOnceWith({
+      kernel: 'crag',
+      latest: false,
+    })
+  })
+
+  it('leaves every slot untouched when the pinned payload cannot be pulled', async () => {
+    vi.mocked(pullKernelRelease).mockRejectedValueOnce(
+      new Error('发布源没有该载荷')
+    )
+    render(cragVm)
+    upgradeButton()?.onClick?.(
+      {} as Parameters<NonNullable<ButtonProps['onClick']>>[0]
+    )
+    render(cragVm)
+    state.confirm?.handleConfirm?.()
+    await vi.waitFor(() => expect(toast.error).toHaveBeenCalled())
+    expect(updateCragTargets).not.toHaveBeenCalled()
+    expect(toast.error).toHaveBeenCalledWith('发布源没有该载荷', {
+      description: '槽位未改动，请确认发布源后重试。',
+    })
+  })
+
+  it('reports an already current fleet instead of restarting it', () => {
+    state.installations = {
+      'slot-a': {
+        kernel: 'crag',
+        version: '3.1.12',
+        installed_at: 'x',
+        payload_tag: pin,
+      },
+    }
+    render(cragVm)
+    upgradeButton()?.onClick?.(
+      {} as Parameters<NonNullable<ButtonProps['onClick']>>[0]
+    )
+    render(cragVm)
+    expect(state.confirm?.open).toBe(false)
+    expect(updateCragTargets).not.toHaveBeenCalled()
+    expect(toast.success).toHaveBeenCalledWith(
+      `1 个 CRAG 槽位已是锁定版本 3.1.12，无需升级`
+    )
+  })
+
+  it('refuses a fleet that runs no CRAG slot', () => {
+    render({ id: 'slot-a', resolved_dataplane: 'wrap' })
+    upgradeButton()?.onClick?.(
+      {} as Parameters<NonNullable<ButtonProps['onClick']>>[0]
+    )
+    render({ id: 'slot-a', resolved_dataplane: 'wrap' })
+    expect(state.confirm?.open).toBe(false)
+    expect(toast.error).toHaveBeenCalledWith('没有正在运行 CRAG 的槽位')
   })
 })

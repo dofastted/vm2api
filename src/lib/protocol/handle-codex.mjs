@@ -926,7 +926,7 @@ export async function handleCodexProtocol({
           attemptKind = 'succeeded'
           bindSticky(outboundSessionId)
           // Billing follows the tier actually sent (codex-proxy-rs contract). The upstream
-          // echo is kept apart: `priority` answered with `default` is a Fast downgrade (#777).
+          // echo is kept apart because it may differ from the requested tier.
           const serviceTier = normalizeServiceTier(outboundBody.service_tier)
           logBag.upstream_service_tier = responseServiceTier
           const logged = disjointOpenaiUsage(usage ? { ...usage, service_tier: serviceTier } : usage)

@@ -11,7 +11,6 @@ import {
   CAI_AUTHORIZE_URL,
   CLIENT_ID,
   FULL_OAUTH_SCOPE,
-  INFERENCE_ONLY_SCOPE,
   OAUTH_REQUEST_TIMEOUT_MS,
   REDIRECT_URI,
   SETUP_TOKEN_TTL_SECONDS,
@@ -89,7 +88,8 @@ async function loadLocalAuthForTest() {
  */
 export function buildSetupTokenAuthorizeURL(state, codeChallenge) {
   const encodedRedirectURI = encodeURIComponent(REDIRECT_URI)
-  const encodedScope = encodeURIComponent(INFERENCE_ONLY_SCOPE)
+  // Identity needs user:profile, so the mint link carries the login scope too.
+  const encodedScope = encodeURIComponent(FULL_OAUTH_SCOPE)
   return `${CAI_AUTHORIZE_URL}?code=true&client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodedRedirectURI}&scope=${encodedScope}&code_challenge=${codeChallenge}&code_challenge_method=S256&state=${state}`
 }
 

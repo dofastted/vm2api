@@ -46,6 +46,7 @@ export function ProxyEditDialog({
   const [clearAuth, setClearAuth] = useState(false)
   const [label, setLabel] = useState('')
   const [domainForward, setDomainForward] = useState(false)
+  const [dnsBlock, setDnsBlock] = useState(false)
 
   const boundCount = proxyBoundIds(proxy || undefined).length
   // 代理名称只影响显示：只改名称时网关不会重载已绑槽位的 worker。
@@ -66,6 +67,7 @@ export function ProxyEditDialog({
     setClearAuth(false)
     setLabel(String(proxy?.label || ''))
     setDomainForward(proxy?.domain_forward === true)
+    setDnsBlock(proxy?.dns_disable_svcb_https === true)
     // proxy 的其余字段刻意不入依赖：只有换了目标才该重置表单。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [proxyId])
@@ -89,6 +91,12 @@ export function ProxyEditDialog({
       if (labelChanged) patch.label = label.trim()
       if (!localProxy && domainForward !== (proxy?.domain_forward === true)) {
         patch.domain_forward = domainForward
+      }
+      if (
+        !localProxy &&
+        dnsBlock !== (proxy?.dns_disable_svcb_https === true)
+      ) {
+        patch.dns_disable_svcb_https = dnsBlock
       }
       return api<EditResult>(
         `/api/panel/proxies/${encodeURIComponent(String(proxy?.id || ''))}`,
@@ -129,7 +137,10 @@ export function ProxyEditDialog({
   )
   const domainChanged =
     !localProxy && domainForward !== (proxy?.domain_forward === true)
-  const nothingChanged = !connectionChanged && !labelChanged && !domainChanged
+  const dnsBlockChanged =
+    !localProxy && dnsBlock !== (proxy?.dns_disable_svcb_https === true)
+  const nothingChanged =
+    !connectionChanged && !labelChanged && !domainChanged && !dnsBlockChanged
 
   return (
     <Dialog open={!!proxy} onOpenChange={onOpenChange}>
@@ -155,7 +166,7 @@ export function ProxyEditDialog({
               </div>
               {schemeChanged ? (
                 <p className='text-xs text-muted-foreground'>
-                  只换协议，主机、端口与账密保持不变；请确认该端口确实提供{' '}
+                  只改协议，主机、端口和账密都不动。先确认这个端口真的提供{' '}
                   {scheme === 'http' ? 'HTTP CONNECT' : 'SOCKS5'} 服务。
                 </p>
               ) : null}
@@ -225,31 +236,60 @@ export function ProxyEditDialog({
                   }
                 }}
               />
-              清除账密（改为免认证）
+              清除账密（改成不需要账号密码）
             </label>
           ) : null}
 
           <p className='text-xs text-muted-foreground'>
-            账密不会回显。留空表示保持原值。
+            账密不会显示出来。留空就是不改。
           </p>
           {localProxy ? null : (
-            <label className='flex items-center gap-2 text-sm'>
-              <input
-                type='checkbox'
-                checked={domainForward}
-                onChange={(e) => setDomainForward(e.target.checked)}
-              />
-              域名转发（IPv6-only 出口按主机名 CONNECT，不回落 IPv4）
-            </label>
+            <div className='space-y-2'>
+              <label className='flex items-start gap-2 text-sm'>
+                <input
+                  type='checkbox'
+                  className='mt-0.5'
+                  checked={domainForward}
+                  onChange={(e) => setDomainForward(e.target.checked)}
+                />
+                <span>
+                  按域名连接
+                  <span className='block text-xs text-muted-foreground'>
+                    给只有 IPv6 的出口用，不退回 IPv4。
+                  </span>
+                </span>
+              </label>
+              <label className='flex items-start gap-2 text-sm'>
+                <input
+                  type='checkbox'
+                  className='mt-0.5'
+                  checked={dnsBlock}
+                  onChange={(e) => setDnsBlock(e.target.checked)}
+                />
+                <span>
+                  屏蔽 HTTP/3 与加密 SNI 探测（只影响这条代理）
+                  <span className='block text-xs text-muted-foreground'>
+                    让浏览器查不到 HTTP/3 和加密 SNI 的线路，只走普通
+                    HTTPS。网站照样打得开，正常域名解析不受影响。
+                  </span>
+                </span>
+              </label>
+              {dnsBlock && proxy?.dns_disable_svcb_https !== true ? (
+                <p className='text-xs text-muted-foreground'>
+                  如果这条代理带的机器所在节点开了共享出口，需要同节点的代理都开启才会生效——共享出口一个节点只有一份
+                  DNS 设置。
+                </p>
+              ) : null}
+            </div>
           )}
           {passwordWithoutUser ? (
             <p className='text-xs text-[color:var(--status-bad)]'>
-              只填密码不生效，代理认证需要同时有用户名。
+              只填密码没用，代理认证得有用户名才行。
             </p>
           ) : null}
           {boundCount && connectionChanged ? (
             <p className='text-xs text-[color:var(--status-caution)]'>
-              该代理已绑 {boundCount} 台槽位，保存后会重载它们的 worker。
+              这条代理正带着 {boundCount} 台机器，保存后它们会重连一次。
             </p>
           ) : null}
         </div>

@@ -86,6 +86,14 @@ export const DEFAULT_POOL_ROUTING = Object.freeze({
    * returning to the original pin and rebuilding the prompt cache again.
    */
   session_affinity_first: false,
+  /**
+   * Fresh-account isolation window. Within N ms after an account first enters
+   * the pool, a conversation already pinned to another VM must not spill its
+   * transcript onto the fresh account: replaying another account's full
+   * conversation history onto a brand-new account is a strong ban signal at
+   * the provider. 0 disables the guard (upstream behaviour).
+   */
+  fresh_account_isolation_ms: 0,
 })
 
 const DEFAULT_CONFIG = {
@@ -94,6 +102,15 @@ const DEFAULT_CONFIG = {
   heartbeat_stale_ms: 15000,
   fable_max_per_account: 4,
   default_max_per_account: 2,
+}
+
+/** Epoch-ms of an ISO string or epoch number; 0 when unknown. */
+function toEpochMs(value) {
+  if (value == null) return 0
+  const n = Number(value)
+  if (Number.isFinite(n)) return n > 0 ? n : 0
+  const t = Date.parse(String(value))
+  return Number.isFinite(t) ? t : 0
 }
 
 function clampNumber(value, fallback, min, max, { round = true } = {}) {
@@ -118,6 +135,13 @@ export function normalizePoolRouting(pool = {}) {
   delete next.max_waiters_per_account
   next.strategy = next.strategy === 'fill' ? 'fill' : 'balanced'
   next.session_affinity_first = next.session_affinity_first === true
+  // Fresh-account isolation window (see DEFAULT_POOL_ROUTING). 0 disables.
+  next.fresh_account_isolation_ms = clampNumber(
+    next.fresh_account_isolation_ms,
+    DEFAULT_POOL_ROUTING.fresh_account_isolation_ms,
+    0,
+    Number.MAX_SAFE_INTEGER,
+  )
   // Off by default: Pro may carry Fable. Turn on when Pro accounts only answer
   // Fable with 'usage credits required'.
   next.fable_requires_max = next.fable_requires_max === true
@@ -1497,6 +1521,7 @@ export class PoolScheduler extends EventEmitter {
     quotaRequest = null,
     onlyVmIds = null,
     continuingVmIds = null,
+    isolationSuspended = false,
   } = {}) {
     const now = Date.now()
     const summaries = listVms(this.projectRoot)
@@ -1510,6 +1535,37 @@ export class PoolScheduler extends EventEmitter {
       offline: new Map(),
     })
     const pin = pinVmId ? String(pinVmId).trim() : ''
+    // Bootstrap detection runs over the whole platform pool (not the filtered
+    // entries): a pool where every account is inside the isolation window is
+    // brand new. Excluded / failed homes must not shrink it into one. Lazy: the
+    // scan costs nothing when the isolation window is disabled.
+    const isolationMs = Number(this.config.fresh_account_isolation_ms) || 0
+    let allFresh = true
+    if (isolationMs > 0) {
+      const platformEntries = []
+      for (const summary of summaries) {
+        if (signal?.aborted) throw makeAbortError()
+        const vm = getVm(this.projectRoot, summary.id)
+        if (!vm || platformMismatch(model, vm)) continue
+        const accountId = accountIdOf(vm, this.projectRoot)
+        if (!accountId) continue
+        platformEntries.push({ vm, accountId })
+      }
+      const platformSnapshots = this.runtimeRepo
+        ? this.runtimeRepo.schedulingSnapshot(platformEntries.map((entry) => entry.accountId))
+        : new Map()
+      if (platformEntries.length === 0) {
+        allFresh = false
+      } else {
+        for (const { accountId } of platformEntries) {
+          const createdAt = toEpochMs(platformSnapshots.get(accountId)?.account?.created_at)
+          if (!(createdAt > 0 && now - createdAt < isolationMs)) {
+            allFresh = false
+            break
+          }
+        }
+      }
+    }
     const entries = []
     for (const summary of summaries) {
       if (onlyVmIds && !onlyVmIds.has(summary.id)) continue
@@ -1546,6 +1602,28 @@ export class PoolScheduler extends EventEmitter {
           continue
         }
         if (guard.level === 'continuing' && continuingVmIds && !continuingVmIds.has(vm.id)) continue
+      }
+      // Fresh-account isolation: a conversation already pinned to another VM
+      // must not spill its transcript onto a freshly onboarded account.
+      // Replaying another account's full history onto a brand-new account is
+      // a strong ban signal at the provider. Size alone is NOT the signal: a
+      // legitimate user resuming a long conversation after a cache-expiry gap
+      // submits the whole transcript cold too, and that is normal traffic. What
+      // separates the two is prefix ownership — the transcript was recently
+      // served by a different account — and that is exactly what a sticky row
+      // on another VM records.
+      // Bootstrap escape: when every account in the platform pool is inside
+      // the window the pool is brand new; a continuing conversation then has
+      // no home to wait for, so the pin is released to keep the pool usable.
+      if (!pin && isolationMs > 0 && !isolationSuspended) {
+        // created_at may be an ISO string (DB row) or an epoch-ms number.
+        const createdAt = toEpochMs(account?.created_at)
+        const continuingElsewhere = continuingVmIds && continuingVmIds.size > 0 && !continuingVmIds.has(vm.id)
+        if (continuingElsewhere && createdAt > 0 && now - createdAt < isolationMs) {
+          candidates.freshWindow ??= new Set()
+          candidates.freshWindow.add(accountId)
+          continue
+        }
       }
       // Admission re-reads the guard; it needs to know whether this request continues here.
       const quotaContinuing = continuingVmIds ? continuingVmIds.has(vm.id) : null
@@ -1620,6 +1698,25 @@ export class PoolScheduler extends EventEmitter {
         ownerScope,
         keyScope,
         exec: this.executionContext(vm, accountId),
+      })
+    }
+    // Bootstrap escape: a pool whose every account is inside the isolation
+    // window is brand new — a continuing conversation has no window-exempt
+    // home to wait for there, so the pin is released to keep the pool usable.
+    const freshBlocked = (candidates.freshWindow || new Set()).size
+    if (!isolationSuspended && allFresh && freshBlocked > 0 && candidates.length === 0) {
+      candidates.freshWindow = undefined
+      return this.eligibleCandidates({
+        model,
+        excluded,
+        signal,
+        pinVmId,
+        ownerScope,
+        keyScope,
+        quotaRequest,
+        onlyVmIds,
+        continuingVmIds,
+        isolationSuspended: true,
       })
     }
     return candidates
@@ -2144,12 +2241,48 @@ export class PoolScheduler extends EventEmitter {
     }
     const minLoad = Math.min(...pool.map((candidate) => candidate.loadRatio))
     pool = pool.filter((candidate) => candidate.loadRatio === minLoad)
+    if (pool.every((candidate) => candidate.external)) {
+      pool.sort(
+        (left, right) =>
+          Number(left.lastUsedAt || 0) - Number(right.lastUsedAt || 0) || left.accountId.localeCompare(right.accountId),
+      )
+      return {
+        ...pool[0],
+        selectionReason: reasonFor(pool.length === 1 ? 'priority-load' : 'external-least-recently-used'),
+      }
+    }
     if (pool.length === 1) return { ...pool[0], selectionReason: reasonFor('priority-load') }
     const [balanced] = rankSeatCandidates(pool, {
       strategy: 'balanced',
       openOf: (vmId) => this.planner.openCount(vmId),
     })
     return { ...balanced, selectionReason: reasonFor('balanced') }
+  }
+
+  /** Reserve host-managed accounts with the same balancing, concurrency and circuit state. */
+  reserveExternalCandidates(candidates = [], { excluded = new Set() } = {}) {
+    let remaining = candidates
+      .filter(
+        (candidate) => candidate?.accountId && candidate?.maxConcurrency > 0 && !excluded.has(candidate.accountId),
+      )
+      .map((candidate) => {
+        const lastUsedAt = this.lastUsed.get(candidate.accountId) || Number(candidate.lastUsedAt) || 0
+        return {
+          ...candidate,
+          external: true,
+          inflight: this.inflight.get(candidate.accountId) || 0,
+          loadRatio: (this.inflight.get(candidate.accountId) || 0) / candidate.maxConcurrency,
+          lastUsedAt,
+        }
+      })
+    while (remaining.length) {
+      const selected = this.pick(remaining)
+      if (!selected) return null
+      const reservation = this.reserve(selected)
+      if (reservation) return { selected, reservation }
+      remaining = remaining.filter((candidate) => candidate.accountId !== selected.accountId)
+    }
+    return null
   }
 
   peekRank(candidates = []) {
@@ -2348,12 +2481,14 @@ export class PoolScheduler extends EventEmitter {
     ) {
       return null
     }
-    const quotaReservation = this.accountQuota?.tryAcquire?.(accountId, {
-      skipGate: !!skipQuota,
-      tier: vmTierOf(candidate.vm),
-      quotaRequest: candidate.quotaRequest,
-      account: snapshot.account,
-    })
+    const quotaReservation = candidate.external
+      ? null
+      : this.accountQuota?.tryAcquire?.(accountId, {
+          skipGate: !!skipQuota,
+          tier: vmTierOf(candidate.vm),
+          quotaRequest: candidate.quotaRequest,
+          account: snapshot.account,
+        })
     if (quotaReservation && !quotaReservation.ok) return null
     const releaseQuota = () => {
       if (quotaReservation?.release) quotaReservation.release()

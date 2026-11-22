@@ -13,6 +13,8 @@ import { collectErrors, enrichLogRow, excludeErrorClassSql, ingressAuthSql } fro
 import {
   costColumnsFromUsage,
   emptyCostBucket,
+  positiveAmount,
+  round8,
   shanghaiDayStartIso,
   sumCostBuckets as sumCostColumns,
   UNPRICED_MODEL,
@@ -226,9 +228,18 @@ function resolveAccountWindow(windows, row) {
   )
 }
 
+/**
+ * Each account's rows are bucketed up to three times below (5h, 7d, fable), and
+ * `Date.parse` on an ISO string is not free. Parse once while grouping and hang
+ * the result off the row under a symbol: internal to _computeBillingStats, so it
+ * never reaches JSON or a spread (#1497).
+ */
+const EVENT_AT = Symbol('cost_event_at_ms')
+
 function groupCostEvents(rows = []) {
   const map = new Map()
   for (const row of rows) {
+    row[EVENT_AT] = Date.parse(row.created_at)
     const key = accountEventKey(row)
     const list = map.get(key) || []
     list.push(row)
@@ -237,43 +248,55 @@ function groupCostEvents(rows = []) {
   return map
 }
 
+/** Both flags are decided by _costEventsSince; see the comment on that query. */
 function isFableRow(row) {
-  const upstream = String(row?.upstream_model ?? '').trim()
-  const model = String(row?.model ?? '').trim()
-  return (upstream || model).toLowerCase().includes('fable')
+  return row?.fable === 1
 }
 
-function unpricedWithTokens(row) {
-  return row?.pricing_model === UNPRICED_MODEL && totalTokens(row) > 0
-}
-
-function bucketEventsSince(rows = [], sinceMs) {
+/**
+ * Sum one account's rows for one window in a single pass.
+ *
+ * The previous shape was `filter` -> `map` to a 13-field object per row ->
+ * `sumCostBuckets` -> `filter` again for the unpriced count: three arrays and a
+ * row-shaped object per event, repeated for every window of every account while
+ * three settings pages poll `/api/panel/vms` every 5s (#1497). Nothing here is
+ * materialised but the bucket itself.
+ *
+ * Accumulation order, the per-row coercions and the per-row `round8` on costs
+ * are unchanged, so the sums are identical -- including the empty bucket, which
+ * carries no `prompt_tokens` key.
+ *
+ * @param {object[]} rows      one account's cost events, in query order
+ * @param {number} sinceMs     window start; a non-finite value takes every row
+ * @param {((row: object) => boolean)|null} keep extra row test (the Fable window)
+ */
+function bucketEventsSince(rows = [], sinceMs, keep = null) {
   const since = Number(sinceMs)
-  const picked = rows.filter((row) => {
-    const at = Date.parse(row.created_at)
-    return Number.isFinite(at) && (!Number.isFinite(since) || at >= since)
-  })
-  if (!picked.length) return { ...emptyCostBucket(), unpriced: 0 }
-  return {
-    ...sumCostBuckets(
-      picked.map((row) => ({
-        requests: 1,
-        success: Number(row.success || 0),
-        errors: Number(row.errors || 0),
-        input_tokens: Number(row.input_tokens || 0),
-        output_tokens: Number(row.output_tokens || 0),
-        cache_read_tokens: Number(row.cache_read_tokens || 0),
-        cache_creation_tokens: Number(row.cache_creation_tokens || 0),
-        prompt_tokens: Number(row.prompt_tokens || 0),
-        input_cost: Number(row.input_cost || 0),
-        output_cost: Number(row.output_cost || 0),
-        cache_read_cost: Number(row.cache_read_cost || 0),
-        cache_creation_cost: Number(row.cache_creation_cost || 0),
-        total_cost: Number(row.total_cost || 0),
-      })),
-    ),
-    unpriced: picked.filter(unpricedWithTokens).length,
+  const openEnded = !Number.isFinite(since)
+  const out = { ...emptyCostBucket(), prompt_tokens: 0, unpriced: 0 }
+  let picked = 0
+  for (const row of rows) {
+    const at = row[EVENT_AT] ?? Date.parse(row.created_at)
+    if (!Number.isFinite(at)) continue
+    if (!openEnded && at < since) continue
+    if (keep && !keep(row)) continue
+    picked += 1
+    out.requests += 1
+    out.success += positiveAmount(Number(row.success || 0))
+    out.errors += positiveAmount(Number(row.errors || 0))
+    out.input_tokens += positiveAmount(Number(row.input_tokens || 0))
+    out.output_tokens += positiveAmount(Number(row.output_tokens || 0))
+    out.cache_read_tokens += positiveAmount(Number(row.cache_read_tokens || 0))
+    out.cache_creation_tokens += positiveAmount(Number(row.cache_creation_tokens || 0))
+    out.input_cost = round8(out.input_cost + positiveAmount(Number(row.input_cost || 0)))
+    out.output_cost = round8(out.output_cost + positiveAmount(Number(row.output_cost || 0)))
+    out.cache_read_cost = round8(out.cache_read_cost + positiveAmount(Number(row.cache_read_cost || 0)))
+    out.cache_creation_cost = round8(out.cache_creation_cost + positiveAmount(Number(row.cache_creation_cost || 0)))
+    out.total_cost = round8(out.total_cost + positiveAmount(Number(row.total_cost || 0)))
+    out.prompt_tokens += Number(row.prompt_tokens) || 0
+    if (row.unpriced === 1) out.unpriced += 1
   }
+  return picked ? out : { ...emptyCostBucket(), unpriced: 0 }
 }
 
 function filterCond({ since = null, until = null, vmId = null, accountId = null, apiKeyId = null } = {}) {
@@ -655,7 +678,12 @@ export class UsageLogsRepo {
     try {
       for (const r of rows) {
         const model = r.upstream_model || r.model || r.requested_model
-        const priced = costColumnsFromUsage(this._usageForPrice(r), model, this._imageForPrice(r))
+        const priced = costColumnsFromUsage(
+          this._usageForPrice(r),
+          model,
+          this._imageForPrice(r),
+          Date.parse(r.created_at),
+        )
         const same =
           (r.input_cost ?? null) === (priced.input_cost ?? null) &&
           (r.output_cost ?? null) === (priced.output_cost ?? null) &&
@@ -729,7 +757,7 @@ export class UsageLogsRepo {
   backfillMissingCosts({ limit = 4000 } = {}) {
     const rows = this.db
       .prepare(`
-      SELECT id, model, upstream_model, requested_model,
+      SELECT id, created_at, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
              rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
@@ -749,7 +777,7 @@ export class UsageLogsRepo {
     const where = cond ? `${cond} AND rowid > ?` : 'WHERE rowid > ?'
     // Keyset pages keep a month-long range from loading every row at once.
     const page = this.db.prepare(`
-      SELECT rowid AS _rowid, id, model, upstream_model, requested_model,
+      SELECT rowid AS _rowid, id, created_at, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
              rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
@@ -1292,7 +1320,7 @@ export class UsageLogsRepo {
       let window_fable = null
       if (aligned && win?.reset_7d_oi) {
         const sinceFable = extraWindowSince(win.reset_7d_oi, WINDOW_7D_MS, now) ?? Date.parse(sevenDStart)
-        const fable = bucketEventsSince((eventsByKey.get(keyOf(a)) || []).filter(isFableRow), sinceFable)
+        const fable = bucketEventsSince(eventsByKey.get(keyOf(a)) || [], sinceFable, isFableRow)
         window_fable = {
           cost: Number(fable.total_cost || 0),
           tokens: totalTokens(fable),
@@ -1459,6 +1487,13 @@ export class UsageLogsRepo {
       }))
   }
 
+  /**
+   * Cost events for the aligned per-account windows. `fable` and `unpriced` are
+   * the two row tests the JS buckets used to run themselves; deciding them here
+   * keeps three model/pricing strings per row out of the heap, which matters at
+   * ~7 days of detail rows (#1497). `unpriced` is the same expression
+   * costByAccount already uses.
+   */
   _costEventsSince(since) {
     return this.db
       .prepare(
@@ -1467,9 +1502,11 @@ export class UsageLogsRepo {
         COALESCE(NULLIF(final_account_id, ''), NULLIF(account_id, ''), vm_id, '—') AS account_id,
         vm_id,
         created_at,
-        model,
-        upstream_model,
-        pricing_model,
+        CASE
+          WHEN LOWER(COALESCE(NULLIF(TRIM(upstream_model), ''), TRIM(model), '')) LIKE '%fable%' THEN 1
+          ELSE 0
+        END AS fable,
+        CASE WHEN pricing_model = '${UNPRICED_MODEL}' AND (${TOTAL_TOKENS_SQL}) > 0 THEN 1 ELSE 0 END AS unpriced,
         CASE WHEN ${SLA_SUCCESS_PRED} THEN 1 ELSE 0 END AS success,
         CASE WHEN ${SLA_ERROR_PRED} THEN 1 ELSE 0 END AS errors,
         COALESCE(input_tokens, 0) AS input_tokens,

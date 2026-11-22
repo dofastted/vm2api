@@ -64,29 +64,34 @@ function HeadCell({
 }
 
 function CostBadges({ row }: { row: UsageLogRow }) {
-  const fast = hasFastMode(row)
+  const speed =
+    row.serviceTier === 'ultrafast'
+      ? 'Ultrafast'
+      : hasFastMode(row)
+        ? 'fast'
+        : null
   const context1m = Boolean(row.context1mApplied)
-  if (fast && context1m) {
+  if (speed && context1m) {
     return (
       <Badge
         variant='outline'
         className='gap-0 px-0.5 text-[9px] leading-3'
-        title='fast + 1M 上下文'
+        title={`${speed} + 1M 上下文`}
       >
-        <span className='text-orange-700 dark:text-orange-300'>fast</span>
+        <span className='text-orange-700 dark:text-orange-300'>{speed}</span>
         <span className='text-muted-foreground'>·</span>
         <span className='text-purple-700 dark:text-purple-300'>1M</span>
       </Badge>
     )
   }
-  if (fast) {
+  if (speed) {
     return (
       <Badge
         variant='outline'
         className={FAST_BADGE}
-        title='优先服务等级（fast 模式）'
+        title={`发送档位 ${speed}`}
       >
-        fast
+        {speed}
       </Badge>
     )
   }
@@ -440,7 +445,24 @@ export function VirtualizedLogsTable({
   }
   if (!allLogs.length && !hasNextPage) {
     return (
-      <div className='py-8 text-center text-muted-foreground'>暂无数据</div>
+      <div className='py-8 text-center text-muted-foreground'>
+        {Object.entries(filters).some(
+          ([key, value]) => key !== 'excludeErrorClass' && Boolean(value)
+        )
+          ? '没有符合当前筛选条件的日志'
+          : '本次查询未返回日志'}
+      </div>
+    )
+  }
+  if (!allLogs.length && hasNextPage) {
+    return (
+      <div
+        role='status'
+        className='flex items-center justify-center py-12 text-muted-foreground'
+      >
+        <Loader2 className='h-6 w-6 animate-spin' />
+        <span className='ml-2'>正在查找符合条件的日志…</span>
+      </div>
     )
   }
 
@@ -454,7 +476,11 @@ export function VirtualizedLogsTable({
               <Loader2 className='h-3 w-3 animate-spin' />
               加载更多中...
             </span>
-          ) : !hasNextPage && allLogs.length > 0 ? (
+          ) : hasNextPage ? (
+            <span>
+              {lastPageEmpty ? '正在自动查找下一页…' : '向下滚动以继续查找'}
+            </span>
+          ) : allLogs.length > 0 ? (
             <span>已加载全部记录</span>
           ) : null}
         </div>
@@ -485,7 +511,7 @@ export function VirtualizedLogsTable({
                 <HeadCell className='min-w-[90px] flex-[0.8]'>IP</HeadCell>
               )}
               {isHidden('provider') ? null : (
-                <HeadCell className='min-w-[100px] flex-[1.5]'>供应商</HeadCell>
+                <HeadCell className='min-w-[100px] flex-[1.5]'>虚拟机</HeadCell>
               )}
               <HeadCell className='min-w-[100px] flex-[1.3]'>计费模型</HeadCell>
               {isHidden('reasoningEffort') ? null : (

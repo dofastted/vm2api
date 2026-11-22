@@ -1,6 +1,8 @@
+import crypto from 'node:crypto'
 import http from 'node:http'
 import { isIP } from 'node:net'
 import path from 'node:path'
+import { filterModelCatalogForKey, keyModelError } from '../admin/key-models.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
@@ -33,6 +35,8 @@ const RUN_ERRORS = {
   gemini_inference_output_limit: [502, 'Gemini 响应超过测试输出上限'],
   gemini_inference_tool_blocked: [502, '此测试仅支持文本，不支持工具调用'],
   gemini_inference_failed: [502, 'Gemini 请求失败，请检查环境状态'],
+  gemini_native_tty_unavailable: [503, '没有可用的 Linux 虚拟控制台运行 CRAGGemini'],
+  gemini_native_worker_unavailable: [503, 'Gemini 原生 TUI worker 未就绪，请检查宿主机控制台和 CRAGGemini 载荷'],
 }
 const FAILURE = 'gemini_host_unavailable'
 const PROTOCOL_ERROR = 'gemini_host_protocol_error'
@@ -42,6 +46,11 @@ const SOCKET_ERRORS = new Map([
   ['EACCES', 'gemini_host_socket_denied'],
   ['EPERM', 'gemini_host_socket_denied'],
   ['ABORT_ERR', 'gemini_host_timeout'],
+])
+const HOST_INFRASTRUCTURE_CODES = new Set([
+  ...SOCKET_ERRORS.values(),
+  'gemini_host_invalid_socket',
+  'gemini_host_unsupported_platform',
 ])
 const PAYLOAD_ISSUES = new Set([
   'gemini_public_key_missing',
@@ -82,30 +91,68 @@ const HOST_ERRORS = {
   gemini_release_payload_mismatch: [409, '宿主机的 CRAGGemini 授权配置与签名载荷不匹配'],
   gemini_release_redemption_required: [403, '请先兑换 CRAGGemini 内核'],
   gemini_egress_unavailable: [503, '缺少可用的 Gemini 出口组件，请检查宿主 kin-egress 安装'],
-  gemini_oauth_tools_missing: [503, '缺少 Google 授权所需工具，请检查宿主 ip、nft、setpriv、bwrap 和 curl'],
+  gemini_oauth_tools_missing: [
+    503,
+    '缺少 Gemini OAuth/TUI 所需工具，请检查宿主 ip、nft、setpriv、bwrap、openvt 和 curl',
+  ],
   gemini_ipv4_forwarding_unavailable: [503, '宿主 IPv4 转发未就绪，无法经绑定代理启动 Google 授权'],
-  gemini_authorization_unavailable: [503, 'Gemini 服务已连接，但未能启动 Google 授权，请检查代理与宿主日志'],
+  gemini_native_tty_unavailable: [503, '没有可供 CRAGGemini 使用的空闲 Linux 虚拟控制台'],
+  gemini_native_worker_unavailable: [503, 'CRAGGemini 原生 worker 未就绪，请检查宿主服务日志'],
+  gemini_native_bridge_timeout: [503, 'CRAGGemini TUI 未能在时限内连接 native worker'],
   gemini_account_read_failed: [502, '无法通过所选代理读取 Google 账号数据'],
   gemini_api_key_rejected: [400, 'Google 未接受该 Gemini API Key，请检查密钥和项目权限'],
   gemini_terminal_unavailable: [503, '无法启动 Gemini 终端，请检查宿主服务、Antigravity 安装和绑定代理'],
   gemini_terminal_conflict: [409, '此 Gemini 环境已有终端会话或正在执行其他操作，请稍后重试'],
   gemini_terminal_requires_oauth: [409, 'Antigravity CLI 需要有效的 Google OAuth 凭据，请重新授权后再启动'],
   gemini_terminal_limit: [429, '终端会话或连接票据已达上限，请关闭现有终端或稍后重试'],
+  gemini_oauth_import_invalid: [400, 'Google 账号文件中的凭据格式无效'],
+  gemini_oauth_import_rejected: [400, 'Google 凭据已过期或未获授权，请导出新文件或进行 Google 授权'],
+  gemini_test_oauth_unsupported: [503, '当前签名载荷不支持 Google OAuth 推理测试'],
+  gemini_test_auth_required: [409, '请先为 Gemini 环境完成授权'],
+  gemini_test_invalid_input: [400, '请选择此环境的 Gemini 模型并输入有效的测试内容'],
 }
 
 export function isGeminiPanelPath(value) {
   return value === PANEL_PATH || value.startsWith(`${PANEL_PATH}/`)
 }
 
+/** Paths only Gemini serves. These route by path alone. */
 export function isGeminiPublicPath(value) {
-  return value === PUBLIC_PATH || value.startsWith(`${PUBLIC_PATH}/`)
+  return (
+    value === PUBLIC_PATH ||
+    value.startsWith(`${PUBLIC_PATH}/`) ||
+    /^\/v1beta\/models\/[^/]+:(?:generateContent|streamGenerateContent)$/.test(value)
+  )
+}
+
+/**
+ * Paths Gemini shares with the OpenAI protocol handlers. Routing these by path
+ * alone would shadow those handlers for every other caller, so the dispatch
+ * must also require a Gemini-group key — the same way /v1/models does.
+ */
+export function isGeminiSharedPath(value) {
+  return (
+    value === '/v1/chat/completions' ||
+    value === '/chat/completions' ||
+    value === '/v1/responses' ||
+    value === '/responses'
+  )
 }
 
 export function geminiKeyAllowsPath(pathname, method) {
   return (
     isGeminiPublicPath(pathname) ||
-    (method === 'GET' && ['/models', '/v1/models', '/v1/usage', '/v1/me/quota', '/v1/me/usage'].includes(pathname))
+    // A Gemini key still reaches the shared OpenAI paths; only the dispatch
+    // for other callers is path-independent.
+    isGeminiSharedPath(pathname) ||
+    (method === 'POST' && (pathname === '/v1/messages' || pathname === '/messages')) ||
+    (method === 'GET' &&
+      ['/models', '/v1/models', '/v1beta/models', '/v1/usage', '/v1/me/quota', '/v1/me/usage'].includes(pathname))
   )
+}
+
+export function geminiProxyFor(proxyPool, proxyId) {
+  return proxyFor(proxyPool, proxyId)
 }
 
 function hostError(code, status = 503) {
@@ -305,6 +352,7 @@ function environmentView(value, { id, proxyId } = {}) {
     name: text(value.name, 80) || '',
     auth_state: value.auth_state,
     auth_method: value.auth_method === 'api_key' ? 'api_key' : 'oauth',
+    ...(value.oauth_imported === true && value.auth_method === 'oauth' ? { oauth_imported: true } : {}),
     kernel_version: text(value.kernel_version),
     runtime_ready: value.runtime_ready === true,
     models: items(value.models, 128, modelName),
@@ -379,10 +427,10 @@ function boundProxy(proxyPool, environment, options) {
   return { proxy_id: environment.proxy_id, proxy_url: proxyFor(proxyPool(), environment.proxy_id, options) }
 }
 
-const defaultCallHost = (operation, payload) =>
+export const callGeminiHost = (operation, payload) =>
   hostRequest(process.env.KIN_GEMINI_HOST_SOCKET ?? '/run/vm2api-gemini/control.sock', operation, payload)
 
-export function createGeminiTerminal({ proxyPool, callHost = defaultCallHost }) {
+export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
   return createGeminiTerminalBridge({
     callHost,
     async resolveTarget(id) {
@@ -418,7 +466,7 @@ export function createGeminiTerminal({ proxyPool, callHost = defaultCallHost }) 
   })
 }
 
-export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, callHost = defaultCallHost }) {
+export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, callHost = callGeminiHost }) {
   return async function handleGeminiPanel(req, res, pathname) {
     const ok = (data) => json(res, 200, { ok: true, data })
     const fail = (status, code, message = code) => json(res, status, { ok: false, error: { code, message } })
@@ -462,7 +510,7 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
         return ok({ kernel_version: result.kernel_version })
       }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/environments`) {
-        const body = await readBody(req, 4096)
+        const body = await readBody(req, 8192)
         const name = typeof body?.name === 'string' ? body.name.trim() : ''
         const method = body?.auth_method ?? 'oauth'
         if (!name || name.length > 80 || !validId(body?.proxy_id) || !['oauth', 'api_key'].includes(method)) {
@@ -472,6 +520,17 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
         if ((method === 'api_key' && !API_KEY.test(apiKey)) || (method === 'oauth' && body?.api_key != null)) {
           return fail(400, 'gemini_invalid_api_key', '请提供有效格式的 Gemini API Key')
         }
+        const imported = body?.oauth_account
+        if (
+          imported != null &&
+          (method !== 'oauth' ||
+            typeof imported.access_token !== 'string' ||
+            !/^[A-Za-z0-9._~+/-]{1,4096}={0,2}$/.test(imported.access_token) ||
+            !Number.isSafeInteger(imported.expiry_timestamp) ||
+            imported.expiry_timestamp <= 0)
+        ) {
+          return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
+        }
         const proxyUrl = proxyFor(proxyPool(), body.proxy_id)
         return ok(
           environmentView(
@@ -480,6 +539,9 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
               proxy_id: body.proxy_id,
               proxy_url: proxyUrl,
               ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
+              ...(imported != null && {
+                oauth_account: { access_token: imported.access_token, expiry_timestamp: imported.expiry_timestamp },
+              }),
             }),
           ),
         )
@@ -612,22 +674,401 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
   }
 }
 
-export function handleGeminiPublic(req, res, json) {
-  res.setHeader('Cache-Control', 'no-store')
-  if (req.apiKeyKind !== 'managed' || req.apiKeyRecord?.group_type !== 'gemini') {
-    return json(res, 403, {
-      error: {
-        type: 'permission_error',
-        code: 'gemini_key_required',
-        message: 'This endpoint requires a dedicated Gemini API key.',
-      },
-    })
+function publicError(error) {
+  const code = typeof error?.code === 'string' ? error.code : FAILURE
+  if (code === FAILURE || HOST_INFRASTRUCTURE_CODES.has(code)) {
+    return {
+      status: 503,
+      body: { error: { type: 'api_error', code: FAILURE, message: 'Gemini host is not available.' } },
+    }
   }
-  return json(res, 503, {
-    error: {
-      type: 'service_unavailable',
-      code: 'gemini_runtime_not_supported',
-      message: 'The current CRAGAnti payload does not support Google OAuth inference.',
+  const known = HOST_ERRORS[code]
+  const status = Number.isInteger(error?.status) ? error.status : known?.[0] || 503
+  return {
+    status,
+    body: {
+      error: {
+        type: status === 429 ? 'rate_limit_error' : status >= 500 ? 'api_error' : 'invalid_request_error',
+        code,
+        message: known?.[1] || error?.message || 'Gemini request failed.',
+      },
     },
+  }
+}
+
+function plainParts(parts, { typed = false } = {}) {
+  if (!Array.isArray(parts) || parts.length === 0) return null
+  const text = []
+  for (const part of parts) {
+    const allowed = typed ? ['type', 'text'] : ['text']
+    if (
+      !part ||
+      typeof part !== 'object' ||
+      Array.isArray(part) ||
+      Object.keys(part).some((key) => !allowed.includes(key)) ||
+      (typed && part.type !== 'text') ||
+      typeof part.text !== 'string'
+    )
+      return null
+    text.push(part.text)
+  }
+  return text.join('')
+}
+
+function userMessage(message, { response = false } = {}) {
+  const allowed = response ? ['type', 'role', 'content'] : ['role', 'content']
+  if (
+    !message ||
+    typeof message !== 'object' ||
+    Array.isArray(message) ||
+    Object.keys(message).some((key) => !allowed.includes(key))
+  )
+    return null
+  if (message.role !== 'user' || (response && message.type != null && message.type !== 'message')) return null
+  return typeof message.content === 'string' ? message.content : plainParts(message.content, { typed: true })
+}
+
+export function geminiTurnFromBody(body, protocol = 'gemini-session', routeModel = null) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null
+  const model = routeModel || (typeof body.model === 'string' ? body.model : '')
+  if (!MODEL.test(model) || (body.model != null && body.model !== model)) return null
+  let text
+  let stream = false
+  if (protocol === 'gemini') {
+    if (Object.keys(body).some((key) => !['model', 'contents'].includes(key))) return null
+    const content = Array.isArray(body.contents) && body.contents.length === 1 ? body.contents[0] : null
+    if (
+      !content ||
+      !['user', undefined].includes(content.role) ||
+      Object.keys(content).some((key) => !['role', 'parts'].includes(key))
+    )
+      return null
+    text = plainParts(content.parts)
+  } else if (protocol === 'openai-chat' || protocol === 'openai-responses' || protocol === 'anthropic') {
+    const response = protocol === 'openai-responses'
+    const field = response ? 'input' : 'messages'
+    const allowed = response ? ['model', 'input', 'stream'] : ['model', 'messages', 'stream']
+    if (Object.keys(body).some((key) => !allowed.includes(key))) return null
+    if (body.stream != null && typeof body.stream !== 'boolean') return null
+    stream = body.stream === true
+    if (response) {
+      text =
+        typeof body.input === 'string'
+          ? body.input
+          : Array.isArray(body.input) && body.input.length === 1
+            ? userMessage(body.input[0], { response: true })
+            : null
+    } else {
+      const message = Array.isArray(body[field]) && body[field].length === 1 ? body[field][0] : null
+      text = userMessage(message)
+    }
+  } else if (protocol === 'gemini-session') {
+    if (Object.keys(body).some((key) => !['model', 'input', 'stream'].includes(key))) return null
+    if (body.stream != null && typeof body.stream !== 'boolean') return null
+    stream = body.stream === true
+    text = body.input
+  } else {
+    return null
+  }
+  if (!validPrompt(text)) return null
+  return { model, text, stream }
+}
+
+/**
+ * `/v1/messages` answers in the Anthropic Messages shape so an Anthropic client
+ * can read it. Only `input_tokens` / `output_tokens` exist there, so the host's
+ * `total_tokens` is dropped rather than returned under a field the clients ignore.
+ */
+function anthropicMessage(turn) {
+  return {
+    id: `msg_${crypto.randomBytes(12).toString('hex')}`,
+    type: 'message',
+    role: 'assistant',
+    model: turn.model,
+    content: turn.text ? [{ type: 'text', text: turn.text }] : [],
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: { input_tokens: turn.usage?.input_tokens || 0, output_tokens: turn.usage?.output_tokens || 0 },
+  }
+}
+
+function anthropicStream(turn) {
+  const message = anthropicMessage(turn)
+  const events = [
+    { type: 'message_start', message: { ...message, content: [], stop_reason: null } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: turn.text } },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: { output_tokens: turn.usage?.output_tokens || 0 },
+    },
+    { type: 'message_stop' },
+  ]
+  return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+}
+
+function responsesStream(turn) {
+  const response = responsesOutput(turn)
+  const item = response.output[0]
+  const content = item.content[0]
+  const events = [
+    ['response.created', { response: { ...response, status: 'in_progress', output: [] } }],
+    ['response.output_item.added', { output_index: 0, item: { ...item, status: 'in_progress', content: [] } }],
+    ['response.content_part.added', { output_index: 0, content_index: 0, part: { ...content, text: '' } }],
+    ['response.output_text.delta', { output_index: 0, content_index: 0, delta: turn.text }],
+    ['response.output_text.done', { output_index: 0, content_index: 0, text: turn.text }],
+    ['response.content_part.done', { output_index: 0, content_index: 0, part: content }],
+    ['response.output_item.done', { output_index: 0, item }],
+    ['response.completed', { response }],
+  ]
+  return events.map(([type, data]) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
+}
+
+function googleUsage(usage = {}) {
+  const input = usage.input_tokens || 0
+  const output = usage.output_tokens || 0
+  return {
+    promptTokenCount: input,
+    candidatesTokenCount: output,
+    totalTokenCount: usage.total_tokens || input + output,
+  }
+}
+
+function chatCompletion(turn) {
+  return {
+    id: `chatcmpl_${crypto.randomBytes(12).toString('hex')}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: turn.model,
+    choices: [{ index: 0, message: { role: 'assistant', content: turn.text }, finish_reason: 'stop' }],
+    usage: {
+      prompt_tokens: turn.usage?.input_tokens || 0,
+      completion_tokens: turn.usage?.output_tokens || 0,
+      total_tokens: turn.usage?.total_tokens || 0,
+    },
+  }
+}
+
+function responsesOutput(turn) {
+  return {
+    id: `resp_${crypto.randomBytes(12).toString('hex')}`,
+    object: 'response',
+    status: 'completed',
+    model: turn.model,
+    output: [
+      {
+        id: `msg_${crypto.randomBytes(12).toString('hex')}`,
+        type: 'message',
+        role: 'assistant',
+        status: 'completed',
+        content: [{ type: 'output_text', text: turn.text, annotations: [] }],
+      },
+    ],
+    usage: {
+      input_tokens: turn.usage?.input_tokens || 0,
+      output_tokens: turn.usage?.output_tokens || 0,
+      total_tokens: turn.usage?.total_tokens || 0,
+    },
+  }
+}
+
+function googleOutput(turn) {
+  return {
+    candidates: [{ content: { role: 'model', parts: [{ text: turn.text }] }, finishReason: 'STOP', index: 0 }],
+    usageMetadata: googleUsage(turn.usage),
+    modelVersion: turn.model,
+  }
+}
+
+function writeStream(res, events) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
   })
+  for (const event of events) res.write(event)
+  res.end()
+}
+
+function protocolError(protocol, status, code, message) {
+  if (protocol === 'gemini') {
+    const statusName =
+      status === 400
+        ? 'INVALID_ARGUMENT'
+        : status === 401 || status === 403
+          ? 'PERMISSION_DENIED'
+          : status === 429
+            ? 'RESOURCE_EXHAUSTED'
+            : status >= 500
+              ? 'UNAVAILABLE'
+              : 'NOT_FOUND'
+    return {
+      code: status,
+      message,
+      status: statusName,
+      details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: code }],
+    }
+  }
+  return {
+    type: status === 429 ? 'rate_limit_error' : status >= 500 ? 'api_error' : 'invalid_request_error',
+    code,
+    message,
+  }
+}
+
+function protocolErrorBody(protocol, status, code, message) {
+  const error = protocolError(protocol, status, code, message)
+  if (protocol === 'gemini') return { error }
+  if (protocol === 'anthropic')
+    return { type: 'error', error: { type: error.type, message: error.message, code: error.code } }
+  return { error }
+}
+
+function publicModels(catalog, req) {
+  return filterModelCatalogForKey({ object: 'list', data: catalog.models }, req)
+}
+
+function googleModelList(catalog, req) {
+  const models = publicModels(catalog, req).data
+  return {
+    models: models.map((model) => ({
+      name: `models/${model.id}`,
+      displayName: model.id,
+      supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
+    })),
+  }
+}
+
+export function createGeminiPublicHandler({ json, readBody, scheduler }) {
+  return async function handleGeminiPublic(req, res) {
+    res.setHeader('Cache-Control', 'no-store')
+    if (req.apiKeyKind !== 'managed' || req.apiKeyRecord?.group_type !== 'gemini') {
+      return json(res, 403, {
+        error: {
+          type: 'permission_error',
+          code: 'gemini_key_required',
+          message: 'This endpoint requires a dedicated Gemini API key.',
+        },
+      })
+    }
+    const url = new URL(req.url || PUBLIC_PATH, 'http://127.0.0.1')
+    const googleModels = url.pathname === '/v1beta/models'
+    if (req.method === 'GET' && [PUBLIC_PATH, '/v1/models', '/models', '/v1beta/models'].includes(url.pathname)) {
+      try {
+        const catalog = await scheduler.catalog()
+        return json(res, 200, googleModels ? googleModelList(catalog, req) : publicModels(catalog, req))
+      } catch (error) {
+        const mapped = publicError(error)
+        return json(
+          res,
+          mapped.status,
+          protocolErrorBody(
+            googleModels ? 'gemini' : 'openai-chat',
+            mapped.status,
+            mapped.body.error.code,
+            mapped.body.error.message,
+          ),
+        )
+      }
+    }
+    const session = /^\/v1\/gemini\/sessions\/([A-Za-z0-9][A-Za-z0-9._-]{0,127})$/.exec(url.pathname)
+    const messages = url.pathname === '/v1/messages' || url.pathname === '/messages'
+    const chat = url.pathname === '/v1/chat/completions' || url.pathname === '/chat/completions'
+    const responses = url.pathname === '/v1/responses' || url.pathname === '/responses'
+    const google = /^\/v1beta\/models\/([^/:]+):(generateContent|streamGenerateContent)$/.exec(url.pathname)
+    if (req.method !== 'POST' || !(session || messages || chat || responses || google)) {
+      return json(res, 404, { error: { code: 'not_found', message: 'not found' } })
+    }
+    const protocol = google
+      ? 'gemini'
+      : messages
+        ? 'anthropic'
+        : chat
+          ? 'openai-chat'
+          : responses
+            ? 'openai-responses'
+            : 'gemini-session'
+    const stream = google ? google[2] === 'streamGenerateContent' : false
+    const modelFromPath = google ? decodeURIComponent(google[1]) : null
+    let body = req.body
+    if (body == null) {
+      try {
+        body = await readBody(req, 256 * 1024)
+      } catch (error) {
+        const status = error?.status || 400
+        return json(res, status, protocolErrorBody(protocol, status, 'invalid_json', 'Invalid JSON request body.'))
+      }
+    }
+    const requested = geminiTurnFromBody(body, protocol, modelFromPath)
+    if (!requested) {
+      const status = 400
+      return json(
+        res,
+        status,
+        protocolErrorBody(
+          protocol,
+          status,
+          'gemini_unsupported_turn',
+          'This CRAGGemini route accepts one plain-text user turn without tools or generation settings.',
+        ),
+      )
+    }
+    const denied = keyModelError(req, requested.model, { anthropic: messages })
+    if (denied) {
+      return json(
+        res,
+        denied.status,
+        protocolErrorBody(protocol, denied.status, denied.body.error.code, denied.body.error.message),
+      )
+    }
+
+    const controller = new AbortController()
+    req.once('aborted', () => controller.abort())
+    res.once('close', () => {
+      if (!res.writableEnded) controller.abort()
+    })
+    try {
+      const turn = await scheduler.complete({
+        model: requested.model,
+        text: requested.text,
+        signal: controller.signal,
+        apiKeyRecord: req.apiKeyRecord,
+      })
+      if (messages)
+        return requested.stream ? writeStream(res, anthropicStream(turn)) : json(res, 200, anthropicMessage(turn))
+      if (protocol === 'openai-chat') {
+        if (!requested.stream) return json(res, 200, chatCompletion(turn))
+        const id = `chatcmpl_${crypto.randomBytes(12).toString('hex')}`
+        return writeStream(res, [
+          `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', model: turn.model, choices: [{ index: 0, delta: { role: 'assistant', content: turn.text }, finish_reason: null }] })}\n\n`,
+          `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', model: turn.model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: turn.usage?.input_tokens || 0, completion_tokens: turn.usage?.output_tokens || 0, total_tokens: turn.usage?.total_tokens || 0 } })}\n\n`,
+          'data: [DONE]\n\n',
+        ])
+      }
+      if (protocol === 'openai-responses') {
+        return requested.stream ? writeStream(res, responsesStream(turn)) : json(res, 200, responsesOutput(turn))
+      }
+      if (protocol === 'gemini') {
+        const response = googleOutput(turn)
+        return stream ? writeStream(res, [`data: ${JSON.stringify(response)}\n\n`]) : json(res, 200, response)
+      }
+      return json(res, 200, {
+        id: session[1],
+        model: turn.model,
+        account_id: turn.account_id,
+        output_text: turn.text,
+        usage: turn.usage,
+      })
+    } catch (error) {
+      if (controller.signal.aborted) return
+      const mapped = publicError(error)
+      return json(
+        res,
+        mapped.status,
+        protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
+      )
+    }
+  }
 }

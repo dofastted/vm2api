@@ -103,6 +103,29 @@ test('Opus 5.5 official: $4 / $20 / cache read $0.20 per MTok', () => {
   assert.equal(c.cache_creation_1h_cost, 8)
 })
 
+test('Mythos 5.2 bills input, output, both cache TTLs and search at the Fable 5.2 rates', () => {
+  const usage = {
+    input_tokens: 1_000_000,
+    output_tokens: 1_000_000,
+    cache_read_tokens: 1_000_000,
+    cache_creation_5m_tokens: 1_000_000,
+    cache_creation_1h_tokens: 1_000_000,
+    web_search_requests: 1,
+  }
+  for (const model of ['claude-mythos-5-2', 'claude-mythos-5.2']) {
+    const c = calculateCost(usage, model)
+    assert.equal(c.known, true)
+    assert.equal(c.pricing_key, 'claude-mythos-5-2')
+    assert.equal(c.input_cost, 8)
+    assert.equal(c.output_cost, 40)
+    assert.equal(c.cache_read_cost, 0.2)
+    assert.equal(c.cache_creation_5m_cost, 10)
+    assert.equal(c.cache_creation_1h_cost, 16)
+    assert.equal(c.web_search_cost, 0.01)
+    assert.equal(c.total_cost, calculateCost(usage, 'claude-fable-5-2').total_cost)
+  }
+})
+
 test('Sonnet 5 official: $2 / $10 (standard, not the old $3/$15 intro)', () => {
   const c = calculateCost({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, 'claude-sonnet-5')
   assert.equal(c.input_cost, 2)
@@ -410,9 +433,49 @@ test('GPT service_tier flex / priority pick the published band', () => {
   assert.equal(calculateCost({ input_tokens: 300_000, service_tier: 'priority' }, 'gpt-5.5').known, false)
 })
 
+test('Ultrafast bills the sent tier even when Codex echoes default', () => {
+  const usage = {
+    input_tokens: 100_000,
+    output_tokens: 100_000,
+    service_tier: 'ultrafast',
+    upstream_service_tier: 'default',
+  }
+  const at = Date.parse('2027-03-01T07:59:59.999Z')
+  const promo = calculateCost(usage, 'gpt-6.2-sol', at)
+  assert.equal(promo.mode, 'ultrafast')
+  assert.equal(promo.total_cost, 3.6)
+  assert.equal(costColumnsFromUsage(usage, 'gpt-6.2-sol', null, at).service_tier, 'ultrafast')
+  assert.equal(calculateCost(usage, 'gpt-6.2-sol', at + 1).total_cost, 7.2)
+  assert.equal(calculateCost(usage, 'gpt-6.1-sol', at).total_cost, 7.2)
+  assert.equal(calculateCost(usage, 'gpt-6-luna', at).known, false)
+})
+
+test('Ultrafast selects long rates above 272K including cached input', () => {
+  const usage = {
+    input_tokens: 272_000,
+    output_tokens: 100_000,
+    input_tokens_details: { cached_tokens: 100_000 },
+    service_tier: 'ultrafast',
+  }
+  const at = Date.parse('2026-11-22T00:00:00Z')
+  assert.equal(calculateCost(usage, 'gpt-6.2-sol', at).long_context, false)
+  const long = calculateCost({ ...usage, input_tokens: 300_000 }, 'gpt-6.2-sol', at)
+  assert.equal(long.long_context, true)
+  assert.equal(long.input_cost, 2.4)
+  assert.equal(long.cache_read_cost, 0.06)
+  assert.equal(long.output_cost, 4.5)
+})
+
 test('GPT tier the model does not offer, or unknown tier, stays unpriced', () => {
   assert.equal(calculateCost({ input_tokens: 10, service_tier: 'flex' }, 'gpt-5.3-codex').known, false)
   assert.equal(calculateCost({ input_tokens: 10, service_tier: 'scale' }, 'gpt-5.5').known, false)
+  // GPT-6.2 has no published Flex price and is not getting one. The older models' Flex happens to
+  // sit at half of standard, so a derived band would look plausible and bill at half rate forever.
+  assert.equal(calculateCost({ input_tokens: 10, service_tier: 'flex' }, 'gpt-6.2-astra').known, false)
+  assert.equal(calculateCost({ input_tokens: 10, service_tier: 'flex' }, 'gpt-6.2-sol').known, false)
+  assert.equal(calculateCost({ input_tokens: 300_000, service_tier: 'flex' }, 'gpt-6.2-sol').known, false)
+  // The tiers it does publish stay priced, so this is not the whole mode table going missing.
+  assert.equal(calculateCost({ input_tokens: 100_000, service_tier: 'priority' }, 'gpt-6.2-sol').total_cost, 0.4)
 })
 
 test('GPT-5.6-sol fast long context keeps 1.25x cache write on the long-fast input', () => {

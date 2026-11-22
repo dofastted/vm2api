@@ -162,6 +162,36 @@ describe('anthropic console endpoint save', () => {
     ).toMatchObject({ risk_review_enabled: true })
   })
 
+  it('saves body policy on creation and sends only changed stored values', () => {
+    const row = draftFromStored({ id: 'policy', body_policy: 'caller' })
+    expect(row.bodyPolicy).toBe('caller')
+    expect(endpointSaveRequest(row, 'm').body).not.toHaveProperty('body_policy')
+    expect(
+      endpointSaveRequest({ ...row, bodyPolicy: 'persona' }, 'm').body
+    ).toMatchObject({ body_policy: 'persona' })
+    expect(
+      endpointSaveRequest({ ...stored, bodyPolicy: 'caller' }, 'm').body
+    ).toMatchObject({ body_policy: 'caller' })
+    expect(
+      endpointSaveRequest({ ...row, storedId: undefined }, 'm').body
+    ).toMatchObject({ body_policy: 'caller' })
+  })
+
+  it('defaults body policy to persona and keeps OpenAI endpoints out of it', () => {
+    expect(draftFromStored({ id: 'plain' }).bodyPolicy).toBe('persona')
+    const oai = draftFromStored({
+      id: 'oai',
+      protocol: 'openai',
+      body_policy: 'caller',
+    })
+    expect(
+      endpointSaveRequest({ ...oai, bodyPolicy: 'persona' }, 'm').body
+    ).not.toHaveProperty('body_policy')
+    expect(
+      endpointSaveRequest({ ...oai, storedId: undefined }, 'm').body
+    ).not.toHaveProperty('body_policy')
+  })
+
   it('does not enroll OpenAI endpoints in the Anthropic risk toggle', () => {
     const row = draftFromStored({
       id: 'oai',

@@ -88,7 +88,8 @@ test('classifyRequestError maps known codes and statuses', () => {
     classifyRequestError({
       status: 400,
       error_code: 'refusal_guard',
-      error_message: 'Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going.',
+      error_message:
+        'Third-party apps now draw from your extra usage, not your plan limits. Add more at claude.ai/settings/usage and keep going.',
     }).error_class,
     'request',
   )

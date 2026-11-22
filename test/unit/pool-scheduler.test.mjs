@@ -3658,3 +3658,175 @@ test('keep_pin_on_model_gate: a model the pinned slot does not allow borrows ano
     }
   }
 })
+
+test('shared scheduler reserves host-managed Gemini accounts under the same concurrency cap', (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root)
+  const candidates = ['acc-1', 'acc-2'].map((id, index) => ({
+    accountId: `gemini:${id}`,
+    vmId: `gemini:${id}`,
+    model: 'gemini-3.8-flash-low',
+    maxConcurrency: 1,
+    priority: 0,
+    weight: 1,
+    lastUsedAt: index,
+  }))
+  const first = pool.reserveExternalCandidates(candidates)
+  const second = pool.reserveExternalCandidates(candidates)
+  assert.ok(first)
+  assert.ok(second)
+  assert.notEqual(second.selected.accountId, first.selected.accountId)
+  assert.equal(pool.inflight.get(first.selected.accountId), 1)
+  assert.equal(pool.inflight.get(second.selected.accountId), 1)
+  assert.equal(pool.reserveExternalCandidates(candidates), null)
+  first.reservation.release()
+  const next = pool.reserveExternalCandidates(candidates)
+  assert.equal(next.selected.accountId, first.selected.accountId)
+  next.reservation.release()
+  second.reservation.release()
+  pool.lastUsed.set(first.selected.accountId, 100)
+  const balanced = pool.reserveExternalCandidates(candidates)
+  assert.equal(balanced.selected.accountId, second.selected.accountId)
+  balanced.reservation.release()
+})
+
+test('fresh_account_isolation_ms: a pinned conversation never spills onto a freshly onboarded account', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  sticky.bind('sess:conv', { vmId: 'vm-01', accountId: 'account-1' })
+  const now = Date.now()
+  // scheduler() 会用 accountQuota.repo 覆盖 runtime.accounts，先建 pool 再注入账号行
+  const runtime = new RuntimeRepo()
+  const pool = scheduler(root, {
+    stickyRouter: sticky,
+    runtimeRepo: runtime,
+    config: { fresh_account_isolation_ms: 48 * 3600_000 },
+  })
+  runtime.accounts = new Map([
+    // 旧号：入池已久，隔离不生效
+    ['account-1', { created_at: new Date(now - 30 * 86400_000).toISOString() }],
+    // 新号：10 分钟前入池，处于保护窗口内
+    ['account-2', { created_at: new Date(now - 10 * 60_000).toISOString() }],
+  ])
+  const args = {
+    model: 'claude-test',
+    stickyKey: 'sess:conv',
+    stickyKeys: ['sess:conv'],
+    excluded: new Set(['account-1']),
+    allowWait: false,
+  }
+  // home 被排除（模拟 home 打满/故障），续跑会话只能落新号——被隔离门拦下
+  const blocked = await pool.selectAndReserve(args)
+  assert.equal(blocked.ok, false)
+  assert.equal(blocked.reason, 'no_eligible_accounts')
+
+  // 新号过了保护窗口：正常承接 spill
+  runtime.accounts.set('account-2', { created_at: new Date(now - 49 * 3600_000).toISOString() })
+  const allowed = await pool.selectAndReserve(args)
+  assert.equal(allowed.ok, true)
+  assert.equal(allowed.vmId, 'vm-02')
+  allowed.release()
+
+  // 无会话上下文（全新对话）：新号照常可选，不受隔离影响
+  const freshConv = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-1']),
+    allowWait: false,
+  })
+  assert.equal(freshConv.ok, true)
+  assert.equal(freshConv.vmId, 'vm-02')
+  freshConv.release()
+})
+
+test('fresh_account_isolation_ms: default off keeps upstream spill behaviour', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  sticky.bind('sess:conv', { vmId: 'vm-01', accountId: 'account-1' })
+  const now = Date.now()
+  const runtime = new RuntimeRepo()
+  const pool = scheduler(root, { stickyRouter: sticky, runtimeRepo: runtime })
+  runtime.accounts = new Map([
+    ['account-1', { created_at: new Date(now - 30 * 86400_000).toISOString() }],
+    ['account-2', { created_at: new Date(now - 60_000).toISOString() }],
+  ])
+  const spill = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'sess:conv',
+    stickyKeys: ['sess:conv'],
+    excluded: new Set(['account-1']),
+    allowWait: false,
+  })
+  assert.equal(spill.ok, true)
+  assert.equal(spill.vmId, 'vm-02')
+  spill.release()
+})
+
+test('normalizePoolRouting clamps fresh_account_isolation_ms', () => {
+  assert.equal(normalizePoolRouting({ fresh_account_isolation_ms: 0 }).fresh_account_isolation_ms, 0)
+  assert.equal(normalizePoolRouting({}).fresh_account_isolation_ms, 0)
+  assert.equal(normalizePoolRouting({ fresh_account_isolation_ms: 7200000 }).fresh_account_isolation_ms, 7200000)
+  assert.equal(normalizePoolRouting({ fresh_account_isolation_ms: -5 }).fresh_account_isolation_ms, 0)
+  assert.equal(normalizePoolRouting({ fresh_account_isolation_ms: 'junk' }).fresh_account_isolation_ms, 0)
+})
+
+test('fresh_account_isolation_ms: a huge cold first prompt is normal traffic and lands on a fresh account', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const now = Date.now()
+  const runtime = new RuntimeRepo()
+  const pool = scheduler(root, {
+    runtimeRepo: runtime,
+    accountQuota: { canAccept: () => ({ ok: true }), config: {} },
+    config: { fresh_account_isolation_ms: 48 * 3600_000 },
+  })
+  runtime.accounts = new Map([
+    // home（vm-01）不在隔离窗口内的意义：防止 bootstrap escape 把池当全新池
+    ['account-1', { created_at: new Date(now - 30 * 86400_000).toISOString() }],
+    ['account-2', { created_at: new Date(now - 10 * 60_000).toISOString() }],
+  ])
+  // 用户离开对话数小时后回来，缓存早已过期，整段历史冷提交 —— 正常流量，
+  // 不是跨号关联信号：新开长会话（无 sticky 行）不受隔离门影响
+  const bigText = 'x'.repeat(900_000)
+  const served = await pool.selectAndReserve({
+    model: 'claude-test',
+    quotaRequest: { body: { model: 'claude-test', messages: [{ role: 'user', content: bigText }] } },
+    excluded: new Set(['account-1']),
+    allowWait: false,
+  })
+  assert.equal(served.ok, true, 'a huge new conversation is legitimate and must be served')
+  assert.equal(served.vmId, 'vm-02')
+  served.release()
+})
+
+test('fresh_account_isolation_ms: bootstrap escape releases a continuing conversation when the whole pool is fresh', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const now = Date.now()
+  const runtime = new RuntimeRepo()
+  // 全池都是窗口内新号（全新部署）：续入会话的 home 已不存在（槽已删），
+  // 没有可等待的老号 —— 逃生门必须放行，否则全新池不可用
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  sticky.bind('sess:conv', { vmId: 'vm-gone', accountId: 'account-gone' })
+  const pool = scheduler(root, {
+    stickyRouter: sticky,
+    runtimeRepo: runtime,
+    accountQuota: { canAccept: () => ({ ok: true }), config: {} },
+    config: { fresh_account_isolation_ms: 48 * 3600_000 },
+  })
+  runtime.accounts = new Map([
+    ['account-1', { created_at: new Date(now - 5 * 60_000).toISOString() }],
+    ['account-2', { created_at: new Date(now - 10 * 60_000).toISOString() }],
+  ])
+  const served = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'sess:conv',
+    stickyKeys: ['sess:conv'],
+    allowWait: false,
+  })
+  assert.equal(served.ok, true, 'a brand-new pool must stay schedulable even for continuing conversations')
+  assert.ok(served.vmId === 'vm-01' || served.vmId === 'vm-02')
+  served.release()
+})

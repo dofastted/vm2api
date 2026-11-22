@@ -65,13 +65,14 @@ import {
   type VmKindFilter,
   type VmSortKey,
 } from '@/features/vm/vm-table'
+import { resetNotice } from './reset-start-copy'
 
 const SORT_CHIPS = [
   ['status', '状态'],
   ['name', '名称'],
   ['remain', '5H 剩余'],
-  ['today', '今日花费'],
-  ['cost7', '7D 费用'],
+  ['today', '今日花费 · 北京时间'],
+  ['cost7', '7 天窗口费用'],
   ['total', '总计费用'],
   ['cache', '缓存命中'],
 ] as const
@@ -173,8 +174,9 @@ export function VmListPage() {
         method: 'POST',
         body: JSON.stringify({ mode }),
       }),
-    onSuccess: async (_data, { mode }) => {
-      toast.success(mode === 'keep' ? '已保留原数据重建' : '已按新特征重建')
+    onSuccess: async (data, { mode }) => {
+      const notice = resetNotice(mode, undefined, data)
+      toast[notice.level](notice.message)
       setResetTarget(null)
       setResetInput('')
       await qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey })
@@ -537,7 +539,11 @@ export function VmListPage() {
                   · {deleteTarget.id}
                 </span>
               </p>
-              <DeleteActiveVmHint target={deleteTarget} vms={vms} />
+              <DeleteActiveVmHint
+                target={deleteTarget}
+                vms={vms}
+                force={forceDelete && !!nodeGone}
+              />
             </>
           ) : (
             ''

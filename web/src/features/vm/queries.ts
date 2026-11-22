@@ -70,6 +70,20 @@ export type CragRuntime = {
 export type CragHostStatus = {
   ready: boolean
   target_probe_failed?: true
+  /** 本机的设备标识，面板展示用。授权协议里走的仍是它派生出的 64 位 host id；
+   * 这个 UUID 是同一标识的可读形式，供运维复制、报障时引用。
+   *
+   * 缺失表示这台机器的原始标识来源已不在（见 crag-subscription.mjs 的
+   * `storedUuid`），此时不编一个出来 —— 编出来的 UUID 推不回本机 host id。 */
+  device_uuid?: string
+  /** 标识取自哪里：已保存的绑定、环境覆盖、网卡、挂载或 machine-id。
+   * 标识类故障只有带上来源才诊断得动。 */
+  identity_source?: 'saved' | 'override' | 'mac' | 'mount' | 'machine-id'
+  /** The Authority rejected this host's credential and the automatic recovery
+   * did not clear it. Unlike an outage, this needs the operator: most often
+   * `host_id_collision`, where another machine -- typically a VPS cloned from
+   * the same image, keeping its machine-id -- holds the same host id. */
+  credential_recovery?: 'host_id_collision' | 'failed' | 'not_activated'
   state: 'unavailable' | 'unredeemed' | 'active' | 'expired' | 'sync_pending'
   slot_limit?: number | 'unlimited'
   expires_at?: number
@@ -87,6 +101,22 @@ export type CragHostStatus = {
   }>
   available_slots?: number | null
   available_seats?: number | 'unlimited' | null
+  /** The purchased windows behind the aggregate, soonest expiry first. Each
+   * voucher runs its own term and its seats add to the total, so a host holds
+   * one entry per redemption plus, on an H1 host, an unlabelled baseline with
+   * no `code_id`.
+   *
+   * Only present when it reconciles with the signed aggregate (see
+   * `quotaGrants` in crag-subscription.mjs), and absent once the subscription
+   * has lapsed. Note `expires_at` on the subscription is where the *soonest*
+   * window ends, i.e. when the entitlement is re-signed -- not when access
+   * stops: the remaining windows stay valid, the seat total just drops. */
+  quota_grants?: Array<{
+    code_id?: string
+    expires_at: number
+    /** Absent means this window is unlimited. */
+    slot_limit?: number
+  }>
   reclaim_pending_count?: number
   reclaim_supported?: boolean
   upgrade_available?: boolean

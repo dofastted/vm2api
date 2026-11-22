@@ -416,7 +416,7 @@ const COLS: Col[] = [
     cell: (r, now) => <QuotaCell vm={r.vm} w={r.win.fable} now={now} />,
   },
   {
-    label: '今日',
+    label: '今日请求数',
     sort: 'today',
     num: true,
     cell: (r) => (r.today ? fmtNum(r.today) : <span className={TERT}>0</span>),
@@ -459,7 +459,7 @@ const COLS: Col[] = [
     cell: (r) => (r.inflight ? r.inflight : <span className={TERT}>0</span>),
   },
   {
-    label: '7D 花费',
+    label: '7 天窗口花费',
     sort: 'spend',
     num: true,
     cell: (r) =>
@@ -480,7 +480,7 @@ const COLS: Col[] = [
     cell: (r) => (r.perReq == null ? '—' : `$${r.perReq.toFixed(3)}`),
   },
   {
-    label: '累计',
+    label: '总费用',
     sort: 'total',
     num: true,
     dim: true,
@@ -669,9 +669,13 @@ function SummaryBar({ a }: { a: Agg }) {
         x={`失败 ${fmtNum(a.req - a.ok)}`}
         tone={HEALTH_FG[healthTone(pct)]}
       />
-      <Kpi k='24h 请求' v={fmtNum(a.req)} x={`今日 ${fmtNum(a.today)}`} />
       <Kpi
-        k='7D 花费'
+        k='近 24h 请求'
+        v={fmtNum(a.req)}
+        x={`北京时间今日 ${fmtNum(a.today)}`}
+      />
+      <Kpi
+        k='7 天窗口花费'
         v={a.spend ? fmtUsd(a.spend, 2) : '—'}
         x={a.top ? `最高 ${a.top.vm.id} ${fmtUsd(a.top.spend, 0)}` : ''}
       />
@@ -936,13 +940,13 @@ export function VmTable({
                         </b>
                       </span>
                       <span>
-                        24h 请求{' '}
+                        近 24h 请求{' '}
                         <b className='font-mono text-foreground'>
                           {fmtNum(sec.agg.req)}
                         </b>
                       </span>
                       <span>
-                        7D 花费{' '}
+                        7 天窗口花费{' '}
                         <b className='font-mono text-foreground'>
                           {sec.agg.spend ? fmtUsd(sec.agg.spend, 2) : '—'}
                         </b>

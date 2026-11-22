@@ -5,14 +5,16 @@
  * Slot start still attaches a masquerade net so the container is not on a
  * redirected SOCKS bridge.
  */
-import { execFileSync, spawn } from 'node:child_process'
+import { execFile, execFileSync, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { promisify } from 'node:util'
 import { getDb, isDbOpen } from '../db/database.mjs'
+import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { toHostPath } from './host-path.mjs'
-import { socksProxyUrl } from './socks-address.mjs'
+import { socksEndpoint, socksProxyUrl } from './socks-address.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 import { collectTakenSubnets, createSubnetAllocator, gatewayOf, parseCidr, subnetPoolConfig } from './subnet-pool.mjs'
 import {
@@ -316,6 +318,37 @@ function ipRoute(args) {
 
 function docker(args, timeout = 30_000) {
   return sh(['docker', ...args], { timeout })
+}
+
+const runFile = promisify(execFile)
+
+/**
+ * `sh` off the event loop. Same `{ ok, stdout, stderr }` contract, so anything
+ * taking an injectable runner can use either. The docker CLI costs tens to
+ * hundreds of milliseconds per start, and on the watchdog path that was an
+ * event-loop stall per bound proxy per tick (#1495).
+ */
+async function shAsync(argv, { timeout = 15_000 } = {}) {
+  const command = [...commandPrefix(argv[0]), ...argv]
+  try {
+    const { stdout } = await runFile(command[0], command.slice(1), {
+      encoding: 'utf8',
+      timeout,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    return { ok: true, stdout: String(stdout || '').trim(), stderr: '' }
+  } catch (e) {
+    return {
+      ok: false,
+      stdout: String(e.stdout || '').trim(),
+      stderr: String(e.stderr || e.message || '').trim(),
+      code: e.code,
+    }
+  }
+}
+
+function dockerAsync(args, timeout = 30_000) {
+  return shAsync(['docker', ...args], { timeout })
 }
 
 /**
@@ -756,9 +789,90 @@ export function configuredDnsUpstream() {
   }
 }
 
+/**
+ * The DNS record types a helper answers empty, read off the proxy it serves.
+ *
+ * SVCB (64) and HTTPS (65) carry the alternative-service and ECH hints a
+ * browser needs to pick HTTP/3 or encrypted SNI; emptying them pins traffic to
+ * ordinary HTTPS without touching A/AAAA. It is a per-outlet decision, so the
+ * value comes from the proxy row rather than the pool.
+ *
+ * Takes either shape the pool hands out — the public snapshot or the trimmed
+ * `getProxyByIdWithAuth()` object — because both reach `startProxyEgress`.
+ */
+export function proxyDnsEmptyTypes(proxy) {
+  return proxy?.dns_disable_svcb_https === true ? [64, 65] : []
+}
+
+/**
+ * The pool-level default, kept for the rows added after the switch was flipped
+ * and for callers with no proxy in hand. NOT the value a helper starts with:
+ * `startProxyEgress` derives that from its own proxy via
+ * `proxyDnsEmptyTypes()`, so a per-outlet override is not overwritten by the
+ * pool on the next restart.
+ */
 export function configuredDnsEmptyTypes() {
   if (!isDbOpen()) return []
   return new SettingsRepo(getDb()).get('proxy_pool_config')?.dns_disable_svcb_https === true ? [64, 65] : []
+}
+
+/**
+ * One shared helper serves several outlets, and kin-egress takes
+ * `dns_empty_types` per helper (`Config.DNSEmptyTypes` in
+ * worker/internal/egress/server.go), not per route — a `Route` is an address
+ * and a proxy_url, nothing more. So a shared node cannot honour the outlets
+ * separately, and the choice is which way to be wrong.
+ *
+ * Intersection: only block when every member wants it. A proxy showing the
+ * switch off is then never blocked behind someone else's choice, which is the
+ * invariant worth keeping — the other direction ("any member blocks") would
+ * quietly strip HTTP/3 from outlets an operator left alone, and no amount of UI
+ * can make that read correctly. The cost is that a single outlet's switch does
+ * not take effect while it shares a node with one that is off; the panel says
+ * so rather than leaving it to be discovered.
+ *
+ * Members are matched to proxies by `host:port`, not by the whole URL: that
+ * pair is the pool's own uniqueness key, while the URL a member carries went
+ * through a serialize/parse round trip that need not reproduce the stored
+ * credentials byte for byte.
+ */
+export function sharedDnsEmptyTypes(members = [], blockedEndpoints = new Set()) {
+  // The local side passes members (`proxyUrl`), the node side passes the route
+  // table it already built (`proxy_url`). Both describe the same membership.
+  const endpoints = members.map((m) => memberEndpoint(m?.proxyUrl ?? m?.proxy_url)).filter(Boolean)
+  if (!endpoints.length) return []
+  return endpoints.every((endpoint) => blockedEndpoints.has(endpoint)) ? [64, 65] : []
+}
+
+/** `host:port` of a member's upstream, normalized the way the pool stores it. */
+export function memberEndpoint(proxyUrl) {
+  const raw = String(proxyUrl || '').trim()
+  if (!raw) return ''
+  try {
+    const url = new URL(raw)
+    // URL keeps IPv6 literals bracketed in `hostname`; socksEndpoint re-adds
+    // the brackets itself, so hand it the bare address.
+    const host = url.hostname.replace(/^\[|\]$/g, '')
+    return socksEndpoint(host, url.port || 1080)
+  } catch {
+    return ''
+  }
+}
+
+/** The shared-helper value for this node's membership, read from the pool table. */
+export function configuredSharedDnsEmptyTypes(members = []) {
+  if (!isDbOpen()) return []
+  try {
+    const blocked = new Set()
+    for (const p of new ProxiesRepo(getDb()).loadAll()) {
+      if (p?.dns_disable_svcb_https !== true) continue
+      const endpoint = socksEndpoint(p.host, p.port)
+      if (endpoint) blocked.add(endpoint)
+    }
+    return sharedDnsEmptyTypes(members, blocked)
+  } catch {
+    return []
+  }
 }
 
 const EGRESS_POLL_MS = 50
@@ -938,10 +1052,11 @@ export function egressBinFingerprint(bin) {
 }
 
 /** null when the container does not exist. */
-export function inspectEgressContainer(name, runDocker = docker) {
-  const format =
-    '{{.State.Running}}|{{.State.Restarting}}|{{.State.Pid}}|{{index .Config.Labels "kin.egress.cfg"}}|{{index .Config.Labels "kin.egress.bin"}}|{{index .Config.Labels "kin.egress.reload"}}'
-  const r = runDocker(['inspect', '-f', format, name])
+const EGRESS_INSPECT_FORMAT =
+  '{{.State.Running}}|{{.State.Restarting}}|{{.State.Pid}}|{{index .Config.Labels "kin.egress.cfg"}}|{{index .Config.Labels "kin.egress.bin"}}|{{index .Config.Labels "kin.egress.reload"}}'
+
+/** One parse for both runners, so the sync and async probes cannot disagree. */
+function parseEgressInspect(name, r) {
   if (!r.ok) {
     if (/no such (?:object|container)/i.test(r.stderr || '')) return null
     return { name, error: 'egress_container_inspect_unavailable' }
@@ -958,6 +1073,14 @@ export function inspectEgressContainer(name, runDocker = docker) {
     bin: String(bin || '').trim(),
     reload: String(reload || '').trim(),
   }
+}
+
+export function inspectEgressContainer(name, runDocker = docker) {
+  return parseEgressInspect(name, runDocker(['inspect', '-f', EGRESS_INSPECT_FORMAT, name]))
+}
+
+export async function inspectEgressContainerAsync(name, runDocker = dockerAsync) {
+  return parseEgressInspect(name, await runDocker(['inspect', '-f', EGRESS_INSPECT_FORMAT, name]))
 }
 
 /**
@@ -1262,6 +1385,43 @@ async function stopOwnedEgress(pid) {
   return waitEgressExit(pid)
 }
 
+/** One verdict for both probes, given container info either runner fetched. */
+function egressContainerVerdict(projectRoot, proxyId, container, info, bin) {
+  if (info?.error) return { ok: false, pending: true, reason: info.error, container }
+  if (!egressContainerHealthy(info)) return { ok: false, pid: info?.pid || null, reason: 'not_running', container }
+  // A surviving helper keeps executing the replaced inode; report it down so probe and watchdog repair it,
+  // as the process runtime does for a deleted executable.
+  const current = egressBinFingerprint(bin)
+  if (info.bin && current && info.bin !== current)
+    return { ok: false, pid: info.pid, reason: 'stale_binary', container }
+  return { ok: true, pid: info.pid, listen_tcp: readEgressListenTcp(projectRoot, proxyId), container }
+}
+
+/**
+ * Liveness of a slot's kin-egress, off the event loop.
+ *
+ * Same verdict as `inspectEgressProcess`; only the container probe differs, and
+ * both share `egressContainerVerdict` so the two cannot drift. Callers already
+ * inside an async function should prefer this: the sync probe shells out to the
+ * docker CLI, which stalled the loop once per bound proxy per watchdog tick and
+ * pushed direct-link dials past their deadline (#1495).
+ */
+export async function inspectEgressProcessAsync(
+  projectRoot,
+  proxyId,
+  { runtime = egressRuntime(), runDocker = dockerAsync, bin = EGRESS_BIN } = {},
+) {
+  if (runtime !== 'container') return inspectEgressProcess(projectRoot, proxyId, { runtime, bin })
+  const container = egressContainerName(proxyId)
+  return egressContainerVerdict(
+    projectRoot,
+    proxyId,
+    container,
+    await inspectEgressContainerAsync(container, runDocker),
+    bin,
+  )
+}
+
 export function inspectEgressProcess(
   projectRoot,
   proxyId,
@@ -1269,15 +1429,7 @@ export function inspectEgressProcess(
 ) {
   if (runtime === 'container') {
     const container = egressContainerName(proxyId)
-    const info = inspectEgressContainer(container, runDocker)
-    if (info?.error) return { ok: false, pending: true, reason: info.error, container }
-    if (!egressContainerHealthy(info)) return { ok: false, pid: info?.pid || null, reason: 'not_running', container }
-    // A surviving helper keeps executing the replaced inode; report it down so probe and watchdog repair it,
-    // as the process runtime does for a deleted executable.
-    const current = egressBinFingerprint(bin)
-    if (info.bin && current && info.bin !== current)
-      return { ok: false, pid: info.pid, reason: 'stale_binary', container }
-    return { ok: true, pid: info.pid, listen_tcp: readEgressListenTcp(projectRoot, proxyId), container }
+    return egressContainerVerdict(projectRoot, proxyId, container, inspectEgressContainer(container, runDocker), bin)
   }
   const dir = egressRunDir(projectRoot, proxyId)
   const pid = readPid(path.join(dir, 'egress.pid'))
@@ -1539,7 +1691,9 @@ export async function startProxyEgress(
     runDocker = docker,
     runIptables = iptables,
     dnsUpstream = configuredDnsUpstream(),
-    dnsEmptyTypes = configuredDnsEmptyTypes(),
+    // Per outlet, off this proxy's own row. An explicit value still wins so
+    // callers that already resolved it (bulk apply, tests) do not re-read.
+    dnsEmptyTypes = proxyDnsEmptyTypes(proxy),
     bin,
     ports,
     listenHost: listenHostOverride,
@@ -1641,7 +1795,8 @@ export async function startSharedEgress(
     runIptables = iptables,
     runIp = ipRoute,
     dnsUpstream = configuredDnsUpstream(),
-    dnsEmptyTypes = configuredDnsEmptyTypes(),
+    // Intersection over this node's membership — see sharedDnsEmptyTypes().
+    dnsEmptyTypes = configuredSharedDnsEmptyTypes(members),
     bin,
     ports,
     listenHost: listenHostOverride,

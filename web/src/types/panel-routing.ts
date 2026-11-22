@@ -277,6 +277,15 @@ export type NotifyWecomConfig = {
   mention_all: boolean
 }
 
+export type NotifyFeishuConfig = {
+  enabled: boolean
+  webhook: string
+  webhook_set?: boolean
+  secret: string
+  secret_set?: boolean
+  clear_secret?: boolean
+}
+
 /** `GET /routing -> notify` 与 `GET /notify -> config` 的脱敏通知配置。 */
 export type NotifyConfig = {
   enabled: boolean
@@ -289,6 +298,7 @@ export type NotifyConfig = {
   events: NotifyEvents
   telegram: NotifyTelegramConfig
   wecom: NotifyWecomConfig
+  feishu: NotifyFeishuConfig
   email?: Record<string, unknown>
 }
 
@@ -302,6 +312,7 @@ export type NotifyStatus = {
     email?: boolean
     telegram?: boolean
     wecom?: boolean
+    feishu?: boolean
     any?: boolean
   }
 }

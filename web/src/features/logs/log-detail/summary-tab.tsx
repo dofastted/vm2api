@@ -198,7 +198,7 @@ export function SummaryTab({
           <p className='text-sm text-muted-foreground'>
             {success
               ? '请求成功完成'
-              : '请求失败，以下是详细的错误信息和供应商决策链'}
+              : '请求失败，以下是详细的错误信息和虚拟机决策链'}
           </p>
         </div>
       </div>
@@ -540,7 +540,7 @@ export function SummaryTab({
                 <InfoIcon className='h-3.5 w-3.5 text-muted-foreground' />
               </TooltipTrigger>
               <TooltipContent className='max-w-xs'>
-                上游供应商实际返回的模型与请求的模型不一致。计费仍然基于请求模型。
+                上游实际返回的模型与请求的模型不一致。计费仍然基于请求模型。
               </TooltipContent>
             </Tooltip>
           ) : null}

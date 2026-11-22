@@ -65,8 +65,9 @@ export function nativeLoginLaunch(bin, configDir) {
     cmd: [
       '/bin/sh',
       '-c',
-      'umask 077; mkdir -- "$CLAUDE_CONFIG_DIR" || exit; ' +
-        'timeout --foreground -k 5s 30m "$1" auth login && : > "$CLAUDE_CONFIG_DIR/complete"',
+      // User-paced: no wall clock on the login itself. The panel's 180 s commit
+      // deadline covers the credential write, and closing the terminal ends it.
+      'umask 077; mkdir -- "$CLAUDE_CONFIG_DIR" || exit; ' + '"$1" auth login && : > "$CLAUDE_CONFIG_DIR/complete"',
       'auth-login',
       bin,
     ],

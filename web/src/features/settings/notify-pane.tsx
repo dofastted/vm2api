@@ -2,6 +2,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import type {
   NotifyConfig,
   NotifyEvents,
+  NotifyFeishuConfig,
   NotifyTelegramConfig,
   NotifyWecomConfig,
 } from '@/types/panel-routing'
@@ -71,6 +72,12 @@ function notifyConfig(value: NotifyConfig | undefined): NotifyConfig {
       mention_all: false,
       ...(value?.wecom || {}),
     },
+    feishu: {
+      enabled: false,
+      webhook: '',
+      secret: '',
+      ...(value?.feishu || {}),
+    },
   }
 }
 
@@ -110,6 +117,7 @@ export function NotifyPane({
   const config = notifyConfig(value)
   const telegram = config.telegram
   const wecom = config.wecom
+  const feishu = config.feishu
   const status = useQuery(notifyQueryOptions())
 
   const testTelegram = useMutation({
@@ -153,12 +161,28 @@ export function NotifyPane({
     onError: (error: Error) => toast.error(error.message),
   })
 
+  const testFeishu = useMutation({
+    mutationFn: () => {
+      if (!feishu.webhook.trim() && !feishu.webhook_set) {
+        throw new Error('先填写飞书 Webhook 地址')
+      }
+      return api('/api/panel/notify/test', {
+        method: 'POST',
+        body: JSON.stringify({ channel: 'feishu', feishu }),
+      })
+    },
+    onSuccess: () => toast.success('测试飞书已发送'),
+    onError: (error: Error) => toast.error(error.message),
+  })
+
   const patch = (next: Partial<NotifyConfig>) =>
     onChange({ ...config, ...next })
   const patchTelegram = (next: Partial<NotifyTelegramConfig>) =>
     patch({ telegram: { ...telegram, ...next } })
   const patchWecom = (next: Partial<NotifyWecomConfig>) =>
     patch({ wecom: { ...wecom, ...next } })
+  const patchFeishu = (next: Partial<NotifyFeishuConfig>) =>
+    patch({ feishu: { ...feishu, ...next } })
   const patchEvent = (key: keyof NotifyEvents, enabled: boolean) =>
     patch({ events: { ...config.events, [key]: enabled } })
 
@@ -203,6 +227,14 @@ export function NotifyPane({
                       cls: 'none',
                       text: '企业微信未就绪',
                     }
+              }
+              variant='pill'
+            />
+            <StatusMark
+              tone={
+                status.data?.channels?.feishu
+                  ? { key: 'feishu-ready', cls: 'ok', text: '飞书已就绪' }
+                  : { key: 'feishu-missing', cls: 'none', text: '飞书未就绪' }
               }
               variant='pill'
             />
@@ -425,6 +457,78 @@ export function NotifyPane({
               onCheckedChange={(mention_all) => patchWecom({ mention_all })}
             />
           </SettingRow>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className='flex flex-row items-center justify-between gap-3'>
+          <CardTitle>飞书 / Lark 群自定义机器人</CardTitle>
+          <Button
+            variant='outline'
+            size='sm'
+            loading={testFeishu.isPending}
+            onClick={() => testFeishu.mutate()}
+          >
+            发送测试
+          </Button>
+        </CardHeader>
+        <CardContent className='divide-y'>
+          <SettingRow label='启用飞书' desc='保存后发送已启用的通知事件'>
+            <Switch
+              checked={feishu.enabled}
+              aria-label='启用飞书'
+              onCheckedChange={(enabled) => patchFeishu({ enabled })}
+            />
+          </SettingRow>
+          <SettingRow
+            label='Webhook'
+            desc={
+              feishu.webhook_set
+                ? '已保存，留空保留'
+                : '填写飞书或 Lark 群自定义机器人的完整 Webhook 地址'
+            }
+          >
+            <Input
+              aria-label='飞书 Webhook'
+              className='w-full min-w-56 sm:w-80'
+              type='password'
+              autoComplete='new-password'
+              maxLength={500}
+              placeholder={
+                feishu.webhook_set
+                  ? '已保存，留空保留'
+                  : 'https://open.feishu.cn/open-apis/bot/v2/hook/…'
+              }
+              value={feishu.webhook}
+              onChange={(event) => patchFeishu({ webhook: event.target.value })}
+            />
+          </SettingRow>
+          <SettingRow label='签名密钥' desc='群机器人启用签名校验时填写'>
+            <Input
+              aria-label='飞书签名密钥'
+              className='w-full min-w-56 sm:w-80'
+              type='password'
+              autoComplete='new-password'
+              placeholder={
+                feishu.secret_set && !feishu.clear_secret
+                  ? '已保存，留空保留'
+                  : '选填'
+              }
+              value={feishu.secret}
+              disabled={feishu.clear_secret}
+              onChange={(event) => patchFeishu({ secret: event.target.value })}
+            />
+          </SettingRow>
+          {feishu.secret_set ? (
+            <SettingRow label='移除已保存的签名密钥'>
+              <Switch
+                checked={feishu.clear_secret === true}
+                aria-label='移除飞书签名密钥'
+                onCheckedChange={(clear_secret) =>
+                  patchFeishu({ clear_secret, secret: '' })
+                }
+              />
+            </SettingRow>
+          ) : null}
         </CardContent>
       </Card>
     </>

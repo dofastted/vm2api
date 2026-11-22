@@ -277,20 +277,22 @@ test('row badges: via only when non-default, context1m from long_context, fast/p
   assert.equal(logs.find((r) => r.id === plain.id).context1mApplied, null)
 })
 
-test('#777 badge: sent priority with a non-priority upstream echo is a Fast downgrade', () => {
+test('request settings show sent Priority or Ultrafast and the upstream echo separately', () => {
   const db = freshDb()
-  const [downgraded, honored, unechoed] = seed(db, [
-    { protocol: 'openai.responses', service_tier: 'priority', upstream_service_tier: 'default' },
+  const [ultrafast, priority, unechoed] = seed(db, [
+    { protocol: 'openai.responses', service_tier: 'ultrafast', upstream_service_tier: 'default' },
     { protocol: 'openai.responses', service_tier: 'priority', upstream_service_tier: 'priority' },
     { protocol: 'openai.responses', service_tier: 'priority' },
   ])
   const logs = new UsageLogsView(db).listBatch({}).logs
   const row = (id) => logs.find((r) => r.id === id)
-  const downgrade = (id) => row(id).specialSettings.find((s) => s.key === 'tier_downgrade')
-  assert.equal(downgrade(downgraded.id)?.value, 'priority → default')
-  assert.equal(row(downgraded.id).upstreamServiceTier, 'default')
-  assert.equal(downgrade(honored.id), undefined)
-  assert.equal(downgrade(unechoed.id), undefined)
+  const echo = (id) => row(id).specialSettings.find((s) => s.key === 'upstream_service_tier')
+  assert.equal(row(ultrafast.id).specialSettings.find((s) => s.key === 'ultrafast')?.label, 'Ultrafast')
+  assert.equal(row(ultrafast.id).upstreamServiceTier, 'default')
+  assert.equal(echo(ultrafast.id)?.label, '上游档位回显')
+  assert.equal(echo(ultrafast.id)?.value, 'default')
+  assert.equal(echo(priority.id)?.value, 'priority')
+  assert.equal(echo(unechoed.id), undefined)
 })
 
 test('overview splits today/yesterday-same-time in the requested zone', () => {
@@ -442,4 +444,29 @@ test('tenant error collection hides other users and anonymous ingress failures',
   const all = repo.windowStats().error_collection
   assert.equal(all.recent.length, 3)
   assert.deepEqual(all.ingress_hits.map((h) => h.ip).sort(), ['198.51.100.7', '203.0.113.9'])
+})
+
+test('active sessions flag one-off (single request, no tools) apart without merging, and list them last', () => {
+  const db = freshDb()
+  const now = Date.now()
+  const iso = (ago) => new Date(now - ago).toISOString()
+  seed(db, [
+    { created_at: iso(1_000), outbound_session_id: 'side-1', api_key_id: 'k1', has_tools: 0 },
+    { created_at: iso(2_000), outbound_session_id: 'side-2', api_key_id: 'k1', has_tools: 0 },
+    { created_at: iso(50_000), outbound_session_id: 'main-1', api_key_id: 'k1', has_tools: 1 },
+    { created_at: iso(40_000), outbound_session_id: 'two-1', api_key_id: 'k1', has_tools: 0 },
+    { created_at: iso(30_000), outbound_session_id: 'two-1', api_key_id: 'k1', has_tools: 0 },
+  ])
+  const active = new UsageLogsView(db).activeSessions({ now })
+  assert.equal(active.total, 4)
+  assert.equal(active.oneOffTotal, 2)
+  assert.deepEqual(
+    active.sessions.map((s) => [s.sessionId, s.oneOff]),
+    [
+      ['two-1', false],
+      ['main-1', false],
+      ['side-1', true],
+      ['side-2', true],
+    ],
+  )
 })

@@ -66,4 +66,17 @@ describe('log export query', () => {
     expect(errors.get('error_class')).toBe('timeout')
     expect(errors.has('session_id')).toBe(false)
   })
+
+  it('replaces only the current filter start when a window is selected', () => {
+    const qs = exportQuery(
+      { ...base, window: '7d' },
+      {
+        startTime: Date.UTC(2026, 0, 1),
+        endTime: Date.UTC(2026, 0, 2),
+      },
+      []
+    )
+    expect(qs.get('start_time')).not.toBe('2026-01-01T00:00:00.000Z')
+    expect(qs.get('end_time')).toBe('2026-01-02T00:00:00.000Z')
+  })
 })

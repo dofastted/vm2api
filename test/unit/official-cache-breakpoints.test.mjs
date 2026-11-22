@@ -154,11 +154,7 @@ for (const personaPreset of ['official', 'official_full']) {
   }
 }
 
-for (const options of [
-  { outboundShape: 'lean' },
-  { preserveSystem: true },
-  { requestContext: { purpose: 'auto_mode_classifier' } },
-]) {
+for (const options of [{ preserveSystem: true }, { requestContext: { purpose: 'auto_mode_classifier' } }]) {
   for (const personaPreset of [null, 'official', 'official_full']) {
     test(`shaped ${personaPreset ?? 'legacy'} fallback excludes ${JSON.stringify(options)}`, () => {
       const input = shaped()

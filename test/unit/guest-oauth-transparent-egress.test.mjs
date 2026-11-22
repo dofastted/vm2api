@@ -200,3 +200,61 @@ test('guest OAuth takes the version from the locked crag entrypoint, without an 
   assert.equal(JSON.parse(calls[1].stdin).claude_version, '0.0.0')
   assert.equal(calls.length, 2)
 })
+
+test('a slot that is not ready reports why in the OAuth error message', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-notready-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, 'vms'))
+  const vm = {
+    id: 'vm-01',
+    runtime: { type: 'docker' },
+    status: 'running',
+    proxy: { id: 'px-bound', host: '127.0.0.1', port: 20881 },
+  }
+  fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify(vm))
+  const prepare = (boot) =>
+    prepareSlotOAuth({
+      exec: { projectRoot: root, vmId: vm.id, vm },
+      readHealth: async () => ({ vm_telemetry: true, telemetry_ready: true }),
+      startReady: async () => boot,
+    })
+  await assert.rejects(prepare({ ok: false, code: 'cluster_unavailable' }), {
+    code: 'cluster_unavailable',
+    message: 'Target VM native CLI is not ready (cluster_unavailable)',
+  })
+  await assert.rejects(prepare({ ok: false }), {
+    message: 'Target VM native CLI is not ready (oauth_runtime_not_ready)',
+  })
+})
+
+test('the readiness error code and message stay consistent for odd codes', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-notready2-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, 'vms'))
+  const vm = {
+    id: 'vm-01',
+    runtime: { type: 'docker' },
+    status: 'running',
+    proxy: { id: 'px-bound', host: '127.0.0.1', port: 20881 },
+  }
+  fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify(vm))
+  const prepare = (boot) =>
+    prepareSlotOAuth({
+      exec: { projectRoot: root, vmId: vm.id, vm },
+      readHealth: async () => ({ vm_telemetry: true, telemetry_ready: true }),
+      startReady: async () => boot,
+    })
+  const fallback = {
+    code: 'oauth_runtime_not_ready',
+    message: 'Target VM native CLI is not ready (oauth_runtime_not_ready)',
+  }
+  // not a safe code: err.code is sanitized too, not only the text
+  await assert.rejects(prepare({ ok: false, code: 'Bad Code: /etc/passwd' }), fallback)
+  await assert.rejects(prepare({ ok: false, code: '9starts_with_digit' }), fallback)
+  await assert.rejects(prepare({ ok: false, code: null }), fallback)
+  // nested rust code wins over the outer one
+  await assert.rejects(prepare({ ok: false, code: 'outer_code', rust: { ok: false, code: 'kernel_faulted' } }), {
+    code: 'kernel_faulted',
+    message: 'Target VM native CLI is not ready (kernel_faulted)',
+  })
+})

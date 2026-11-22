@@ -624,3 +624,86 @@ test('persona Environment injection does not break the prefix when each turn end
     history.push({ role: 'assistant', content: [{ type: 'text', text: `answer ${turn}` }] })
   }
 })
+
+test('the continuity diagnostic reuses the request body digests (#1497)', async () => {
+  const { createRequestBodyContext, requestBodyContextStats, resetRequestBodyContextStats } = await import(
+    '../../src/lib/protocol/request-body-context.mjs'
+  )
+  const inbound = body('you are a cli', 'turn one', 'answer one', 'turn two')
+  // The outbound body shares the untouched messages and rewrites the system
+  // block, which is what the gateway's persona injection does.
+  const outbound = { ...inbound, system: [{ type: 'text', text: 'you are claude code' }] }
+
+  const misses = () => requestBodyContextStats.valueDigestMisses + requestBodyContextStats.messageIdentityMisses
+  // Without a context `snapshotBody` hashes directly and the counters never see
+  // it, so the only meaningful probe is whether the work routes through the
+  // context and whether a second pass over the same bodies is free.
+  const ctx = createRequestBodyContext(inbound)
+  resetRequestBodyContextStats()
+  firstHistoryDiff(inbound, outbound, { ctx })
+  const cold = misses()
+  resetRequestBodyContextStats()
+  firstHistoryDiff(inbound, outbound, { ctx })
+  const warm = misses()
+  assert.ok(cold > 0, 'the diagnostic must hash through the request context')
+  // Not zero: the context memoizes the tools/system digests and each message's
+  // identity, while `messageRecord`'s part and valueStamp digests are rebuilt.
+  assert.ok(warm < cold, `a second pass must reuse the warmed digests, saw ${warm} of ${cold}`)
+  resetRequestBodyContextStats()
+})
+
+test('passing a body context never changes the reported break (#1497)', async () => {
+  const { createRequestBodyContext } = await import('../../src/lib/protocol/request-body-context.mjs')
+  const base = body('you are a cli', 'turn one', 'answer one', 'turn two')
+  const shapes = {
+    identical: { ...base },
+    system: { ...base, system: [{ type: 'text', text: 'rewritten' }] },
+    tools: { ...base, tools: [{ name: 'Read' }, { name: 'Write' }] },
+    'message text': { ...base, messages: base.messages.map((m, i) => (i ? m : { ...m, content: 'edited' })) },
+    'message count': { ...base, messages: base.messages.slice(0, 2) },
+    'message structure': {
+      ...base,
+      messages: base.messages.map((m, i) => (i ? m : { ...m, content: [{ type: 'text', text: 'turn one' }] })),
+    },
+    'tools and system': { ...base, tools: [{ name: 'Bash' }], system: [{ type: 'text', text: 'rewritten' }] },
+  }
+  for (const [label, outbound] of Object.entries(shapes)) {
+    const ctx = createRequestBodyContext(base)
+    assert.deepEqual(firstHistoryDiff(base, outbound, { ctx }), firstHistoryDiff(base, outbound), label)
+  }
+})
+
+test('a candidate without this session is answered without snapshotting the body (#1496)', () => {
+  clearCachePrefixSessions()
+  // Scheduling asks this for every candidate account. Only the one holding the
+  // session has a previous turn to compare against; for the rest the snapshot is
+  // built and then dropped, so the cost scaled with candidates x body size.
+  let reads = 0
+  const counted = {
+    model: 'claude-sonnet-5-5',
+    get tools() {
+      reads++
+      return [{ name: 'Read' }]
+    },
+    get system() {
+      reads++
+      return [{ type: 'text', text: 'you are a cli' }]
+    },
+    get messages() {
+      reads++
+      return [{ role: 'user', content: 'x'.repeat(4096) }]
+    },
+  }
+  const cold = peekCachePrefix('no-such-account:sess-1', counted, 1)
+  assert.deepEqual(cold, { turn: 1, break: null, confirmed: false, intercept: null })
+  assert.equal(reads, 0, 'nothing may read the body when there is no previous turn to compare')
+
+  // The account that does hold the session still gets the real comparison.
+  const warm = body('you are a cli', 'first')
+  prepareCachePrefix('holder:sess-1', warm, 1)
+  confirmCachePrefix('holder:sess-1', 1)
+  const second = peekCachePrefix('holder:sess-1', body('you are a cli', 'first', 'reply', 'again'), 2)
+  assert.equal(second.turn, 2)
+  assert.equal(second.confirmed, true)
+  assert.equal(second.break, null)
+})

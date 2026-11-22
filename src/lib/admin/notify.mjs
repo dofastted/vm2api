@@ -1,9 +1,11 @@
 /**
- * Account-pool notify: SMTP email + Telegram bot + WeCom group robot.
+ * Account-pool notifications over email and group robots.
  * Watches the same availability口径 as the overview KPI
  * (has token and cred_status is not 不可用/吊销).
- * Secrets stay on disk; GET/public views never return pass / bot_token / webhook.
+ * Public views expose only presence flags for email passwords, Telegram tokens,
+ * WeCom Webhooks, and Feishu/Lark Webhooks and signing secrets.
  */
+import { createHmac } from 'node:crypto'
 import net from 'node:net'
 import tls from 'node:tls'
 import { CREDENTIAL_REFRESH_FAIL } from '../pool/availability.mjs'
@@ -49,10 +51,19 @@ export const DEFAULT_NOTIFY = Object.freeze({
     webhook: '',
     mention_all: false,
   }),
+  feishu: Object.freeze({
+    enabled: false,
+    webhook: '',
+    secret: '',
+  }),
 })
 
 const WECOM_WEBHOOK_BASE = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key='
 const WECOM_TEXT_MAX_BYTES = 2048
+const FEISHU_WEBHOOK =
+  /^https:\/\/(?:open\.feishu\.cn|open\.larksuite\.com)\/open-apis\/bot\/v2\/hook\/[A-Za-z0-9_-]{8,128}$/
+const FEISHU_WEBHOOK_FORMAT_ERROR = '请填写飞书或 Lark 群自定义机器人的 HTTPS Webhook 地址'
+const FEISHU_TEXT_MAX_BYTES = 3000
 
 const EVENT_TITLES = {
   pool_empty: '账号池无可用账号',
@@ -87,6 +98,12 @@ function isSecretKeep(value) {
   return !s || s === SECRET_KEEP || s === '••••' || /^•+$/.test(s)
 }
 
+export function validateNotifyRoutingPatch(body) {
+  const webhook = body?.notify?.feishu?.webhook
+  if (isSecretKeep(webhook) || (typeof webhook === 'string' && FEISHU_WEBHOOK.test(webhook.trim()))) return
+  throw Object.assign(new TypeError(FEISHU_WEBHOOK_FORMAT_ERROR), { code: 'invalid_feishu_webhook' })
+}
+
 function normalizeEmails(input) {
   const raw = Array.isArray(input) ? input : String(input || '').split(/[,;\s]+/)
   const out = []
@@ -105,6 +122,7 @@ export function normalizeNotifyConfig(raw = {}) {
   const emailSrc = src.email && typeof src.email === 'object' ? src.email : {}
   const tgSrc = src.telegram && typeof src.telegram === 'object' ? src.telegram : {}
   const wecomSrc = src.wecom && typeof src.wecom === 'object' ? src.wecom : {}
+  const feishuSrc = src.feishu && typeof src.feishu === 'object' ? src.feishu : {}
   const evSrc = src.events && typeof src.events === 'object' ? src.events : {}
   const port = clampInt(emailSrc.port, 1, 65535, DEFAULT_NOTIFY.email.port)
   return {
@@ -159,6 +177,13 @@ export function normalizeNotifyConfig(raw = {}) {
         .slice(0, 500),
       mention_all: asBool(wecomSrc.mention_all, false),
     },
+    feishu: {
+      enabled: asBool(feishuSrc.enabled, false),
+      webhook: String(feishuSrc.webhook || '')
+        .trim()
+        .slice(0, 500),
+      secret: String(feishuSrc.secret || '').trim(),
+    },
   }
 }
 
@@ -168,6 +193,7 @@ export function mergeNotifyConfig(previous = {}, patch = {}) {
   const emailPatch = nextSrc.email && typeof nextSrc.email === 'object' ? nextSrc.email : {}
   const tgPatch = nextSrc.telegram && typeof nextSrc.telegram === 'object' ? nextSrc.telegram : {}
   const wecomPatch = nextSrc.wecom && typeof nextSrc.wecom === 'object' ? nextSrc.wecom : {}
+  const feishuPatch = nextSrc.feishu && typeof nextSrc.feishu === 'object' ? nextSrc.feishu : {}
   const merged = normalizeNotifyConfig({
     ...prev,
     ...nextSrc,
@@ -175,10 +201,14 @@ export function mergeNotifyConfig(previous = {}, patch = {}) {
     email: { ...prev.email, ...emailPatch },
     telegram: { ...prev.telegram, ...tgPatch },
     wecom: { ...prev.wecom, ...wecomPatch },
+    feishu: { ...prev.feishu, ...feishuPatch },
   })
   if (isSecretKeep(emailPatch.pass)) merged.email.pass = prev.email.pass
   if (isSecretKeep(tgPatch.bot_token)) merged.telegram.bot_token = prev.telegram.bot_token
   if (isSecretKeep(wecomPatch.webhook)) merged.wecom.webhook = prev.wecom.webhook
+  if (isSecretKeep(feishuPatch.webhook)) merged.feishu.webhook = prev.feishu.webhook
+  if (feishuPatch.clear_secret === true) merged.feishu.secret = ''
+  else if (isSecretKeep(feishuPatch.secret)) merged.feishu.secret = prev.feishu.secret
   return merged
 }
 
@@ -200,6 +230,13 @@ export function publicNotifyConfig(raw = {}) {
       ...cfg.wecom,
       webhook: '',
       webhook_set: !!cfg.wecom.webhook,
+    },
+    feishu: {
+      enabled: cfg.feishu.enabled,
+      webhook: '',
+      webhook_set: !!cfg.feishu.webhook,
+      secret: '',
+      secret_set: !!cfg.feishu.secret,
     },
   }
 }
@@ -458,59 +495,90 @@ function fmtTok(n) {
 export function formatNotifyMessage(event, snap, cfg = DEFAULT_NOTIFY, baseUrl = '') {
   const title = event?.title || EVENT_TITLES[event?.type] || '账号池汇报'
   const lines = [`【KIN】${title}`]
+  const summary = []
   if (snap) {
     lines.push('')
     lines.push(
       `凭证 ${snap.with_token ?? 0} · 可用 ${snap.available ?? 0} · 在线 ${snap.online ?? 0} · 不可用 ${snap.unavailable ?? 0}`,
     )
-    lines.push(
+    summary.push(
       `吊销 ${snap.revoked ?? 0} · 今日吊销 ${snap.today_revoked ?? 0} · 失效 ${snap.invalid ?? 0} · 今日失效 ${snap.today_invalid ?? 0}`,
     )
     if (snap.limited || 0 || snap.warned || 0 || snap.no_token || 0) {
-      lines.push(
+      summary.push(
         `限制 ${snap.limited || 0} · 警告 ${snap.warned || 0} · 无凭证 ${snap.no_token || 0} · 槽 ${snap.total ?? 0}`,
       )
     } else {
-      lines.push(`槽 ${snap.total ?? 0}`)
+      summary.push(`槽 ${snap.total ?? 0}`)
     }
     const today = snap.today || {}
-    lines.push(`今日 ${fmtUsd(today.cost)} · ${today.requests || 0} req · ${fmtTok(today.tokens)} tok`)
+    summary.push(`今日 ${fmtUsd(today.cost)} · ${today.requests || 0} req · ${fmtTok(today.tokens)} tok`)
     const sla = today.sla == null ? '' : ` · SLA ${(Number(today.sla) * 100).toFixed(1)}%`
-    lines.push(`错误 ${today.errors || 0} · 429 ${today.status_429 || 0} · 529 ${today.status_529 || 0}${sla}`)
+    summary.push(`错误 ${today.errors || 0} · 429 ${today.status_429 || 0} · 529 ${today.status_529 || 0}${sla}`)
+    lines.push(...summary)
   }
+  const details = []
   if (event?.type === 'pool_low' && event.min_available) {
-    lines.push(`阈值 ${event.min_available}`)
+    details.push(`阈值 ${event.min_available}`)
   }
   if (event?.id) {
-    lines.push(`${event.id}${event.email ? ' ' + event.email : ''} ${event.status || ''}`.trim())
+    details.push(`${event.id}${event.email ? ' ' + event.email : ''} ${event.status || ''}`.trim())
   }
   if (event?.type === 'vm_down') {
-    lines.push(`节点 ${event.node_id || '本机'}`)
-    lines.push(`原因 ${event.reason}${event.detail ? ': ' + event.detail : ''}`)
-    lines.push('该 VM 当前不可连通，已退出调度。')
+    details.push(`节点 ${event.node_id || '本机'}`)
+    details.push(`原因 ${event.reason}${event.detail ? ': ' + event.detail : ''}`)
+    details.push('该 VM 当前不可连通，已退出调度。')
   }
   if (event?.ids?.length) {
-    lines.push(`新增 ${event.count || event.ids.length} 个`)
+    details.push(`新增 ${event.count || event.ids.length} 个`)
   }
+  lines.push(...details)
   const todayIssues = todayIssueAccounts(snap)
   const preview = todayIssues.slice(0, 5)
-  if (preview.length) {
+  const issues = preview.map((row) => `· ${accountLine(row)}`)
+  if (issues.length) {
     lines.push('')
     lines.push('今日不可用 / 失效')
-    for (const row of preview) lines.push(`· ${accountLine(row)}`)
     const more = todayIssues.length - preview.length
-    if (more > 0) lines.push(`· 另有 ${more} 个`)
+    if (more > 0) issues.push(`· 另有 ${more} 个`)
+    lines.push(...issues)
   }
+  const time = snap?.at ? shanghaiClock(snap.at) : ''
   if (snap?.at) {
     lines.push('')
-    lines.push(shanghaiClock(snap.at))
+    lines.push(time)
   }
   const url = String(cfg.console_url || baseUrl || '').replace(/\/$/, '')
-  if (url) lines.push(`${url}/#/cluster`)
+  const consoleLink = url ? `${url}/#/cluster` : ''
+  if (consoleLink) lines.push(consoleLink)
   return {
     title,
     text: lines.join('\n'),
     subject: `KIN · ${title}`,
+    eventType: event?.type,
+    details,
+    issues,
+    metrics: snap
+      ? [
+          ['可用', snap.available ?? 0],
+          ['在线', snap.online ?? 0],
+          ['不可用', snap.unavailable ?? 0],
+        ]
+      : [],
+    pool: snap && {
+      with_token: snap.with_token ?? 0,
+      total: snap.total ?? 0,
+      limited: snap.limited,
+      warned: snap.warned,
+      no_token: snap.no_token,
+      revoked: snap.revoked,
+      today_revoked: snap.today_revoked,
+      invalid: snap.invalid,
+      today_invalid: snap.today_invalid,
+    },
+    today: snap?.today,
+    time,
+    consoleLink,
   }
 }
 
@@ -541,10 +609,10 @@ export function wecomChannelReady(cfg) {
 }
 
 export function notifyChannelsReady(cfg) {
-  const email = emailChannelReady(cfg)
-  const telegram = telegramChannelReady(cfg)
-  const wecom = wecomChannelReady(cfg)
-  return { email, telegram, wecom, any: email || telegram || wecom }
+  const ready = Object.fromEntries(
+    Object.entries(NOTIFY_CHANNELS).map(([channel, adapter]) => [channel, adapter.ready(cfg)]),
+  )
+  return { ...ready, any: Object.values(ready).some(Boolean) }
 }
 
 function smtpExpectOk(reply, allowed) {
@@ -807,29 +875,205 @@ export async function sendWecomNotify(cfg, message, opts = {}) {
   return { ok: true, channel: 'wecom' }
 }
 
+const FEISHU_EVENT_COLORS = {
+  pool_empty: 'red',
+  vm_down: 'red',
+  revoked: 'red',
+  invalid: 'orange',
+  pool_low: 'orange',
+  account_down: 'orange',
+  pool_recovered: 'green',
+  account_up: 'green',
+}
+
+function feishuSummaryTable(cells) {
+  const columns = cells.map(([label], index) => ({
+    name: `value_${index}`,
+    display_name: label,
+    data_type: 'text',
+    width: index === 0 ? '34%' : '33%',
+    horizontal_align: 'center',
+  }))
+  return {
+    tag: 'table',
+    page_size: 1,
+    row_height: 'low',
+    header_style: { bold: true, text_align: 'center' },
+    columns,
+    rows: [Object.fromEntries(columns.map(({ name }, index) => [name, String(cells[index][1])]))],
+  }
+}
+
+function feishuCard(message) {
+  const plainText = (content) => ({ tag: 'plain_text', content })
+  const paragraph = (content) => ({ tag: 'div', text: plainText(content) })
+  const textBlock = (lines) => paragraph(truncateUtf8(lines.join('\n'), FEISHU_TEXT_MAX_BYTES))
+  const elements = []
+  const section = (title, ...content) => {
+    if (elements.length) elements.push({ tag: 'hr' })
+    elements.push({ tag: 'markdown', content: `**${title}**` }, ...content)
+  }
+  if (message.eventType === 'test') {
+    elements.push(paragraph('飞书群机器人已收到 VM2API 的测试通知。'))
+  } else {
+    if (message.details?.length) section('事件详情', textBlock(message.details))
+    if (message.metrics?.length) {
+      if (elements.length) elements.push({ tag: 'hr' })
+      elements.push({
+        tag: 'column_set',
+        flex_mode: 'none',
+        columns: message.metrics.map(([label, count]) => ({
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          elements: [{ tag: 'markdown', content: `**${Number(count) || 0}**\n${label}` }],
+        })),
+      })
+    }
+    if (message.pool) {
+      const pool = message.pool
+      elements.push(paragraph(`已配置凭证 ${pool.with_token} / ${pool.total} 个槽位`))
+      const flags = [
+        ['限额', pool.limited],
+        ['告警', pool.warned],
+        ['无凭证', pool.no_token],
+        ['吊销', pool.revoked],
+        ['今日吊销', pool.today_revoked],
+        ['失效', pool.invalid],
+        ['今日失效', pool.today_invalid],
+      ].filter(([, count]) => Number(count) > 0)
+      if (flags.length) elements.push(paragraph(flags.map(([label, count]) => `${label} ${count}`).join(' · ')))
+    }
+    if (message.today) {
+      const today = message.today
+      section(
+        '今日用量',
+        feishuSummaryTable([
+          ['请求量', Number(today.requests || 0).toLocaleString('zh-CN')],
+          ['Token', fmtTok(today.tokens)],
+          ['费用', fmtUsd(today.cost)],
+        ]),
+      )
+      section(
+        '今日请求健康',
+        feishuSummaryTable([
+          ['SLA', today.sla == null ? '—' : `${(Number(today.sla) * 100).toFixed(1)}%`],
+          ['失败请求', today.errors || 0],
+          ['429 / 529', `${today.status_429 || 0} / ${today.status_529 || 0}`],
+        ]),
+      )
+    }
+    if (message.issues?.length) {
+      section('今日不可用 / 失效', textBlock(message.issues))
+    }
+  }
+  if (!elements.length) elements.push(textBlock([String(message.text || message.title || 'VM2API')]))
+  if (message.eventType !== 'test' && (message.time || message.consoleLink)) elements.push({ tag: 'hr' })
+  if (message.time) elements.push(paragraph(`${message.time} · 北京时间`))
+  if (/^https?:\/\//i.test(message.consoleLink || '')) {
+    elements.push({
+      tag: 'button',
+      type: 'default',
+      text: plainText('打开集群控制台'),
+      behaviors: [{ type: 'open_url', default_url: message.consoleLink }],
+    })
+  }
+  return {
+    schema: '2.0',
+    header: {
+      template: FEISHU_EVENT_COLORS[message.eventType] || 'blue',
+      title: plainText(truncateUtf8(String(message.title || 'VM2API 通知'), 180)),
+      subtitle: plainText('VM2API · 通知'),
+    },
+    body: { direction: 'vertical', padding: '12px 16px 12px 16px', elements },
+  }
+}
+
+async function sendFeishuNotify(cfg, message, opts = {}) {
+  const { webhook, secret } = cfg?.feishu || {}
+  if (!webhook) throw new Error('飞书 Webhook 未配置')
+  if (!FEISHU_WEBHOOK.test(webhook)) throw new Error(FEISHU_WEBHOOK_FORMAT_ERROR)
+  const payload = {
+    msg_type: 'interactive',
+    card: feishuCard(message),
+  }
+  if (secret) {
+    const timestamp = String(Math.floor(Date.now() / 1000))
+    payload.timestamp = timestamp
+    payload.sign = createHmac('sha256', `${timestamp}\n${secret}`).digest('base64')
+  }
+
+  const fetchFn = opts.fetch || globalThis.fetch
+  const timeout = AbortSignal.timeout(10_000)
+  const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout
+  let response
+  let raw
+  try {
+    signal.throwIfAborted()
+    response = await fetchFn(webhook, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json; charset=utf-8' },
+      body: JSON.stringify(payload),
+      redirect: 'error',
+      signal,
+    })
+    if (response.ok) raw = await response.text()
+  } catch (error) {
+    opts.signal?.throwIfAborted()
+    if (error?.name === 'AbortError' && !timeout.aborted) throw error
+    const code = error?.cause?.code ?? error?.code ?? ''
+    if (timeout.aborted || error?.name === 'TimeoutError' || ['ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT'].includes(code)) {
+      throw new Error('飞书 / Lark Webhook 请求超时')
+    }
+    if (['ENOTFOUND', 'EAI_AGAIN'].includes(code)) throw new Error('飞书 / Lark Webhook DNS 解析失败')
+    if (/^(?:ERR_TLS_|ERR_SSL_|CERT_|DEPTH_ZERO_|SELF_SIGNED_|UNABLE_TO_)/.test(code)) {
+      throw new Error('飞书 / Lark Webhook TLS 校验失败')
+    }
+    throw new Error('飞书 / Lark Webhook 连接失败')
+  }
+  if (!response.ok) throw new Error(`飞书 / Lark Webhook HTTP ${response.status}`)
+  let data
+  try {
+    data = JSON.parse(raw)
+  } catch {
+    throw new Error('飞书 Webhook 返回了无效响应')
+  }
+  const code = data?.code ?? data?.StatusCode
+  if (code === 0) return { ok: true, channel: 'feishu' }
+  if (code === 19021) throw new Error('飞书签名校验失败，请检查机器人签名密钥')
+  if (code === 19022) throw new Error('飞书机器人拒绝请求，请检查 IP 白名单')
+  if (code === 19024) throw new Error('飞书机器人拒绝请求，请检查关键词设置')
+  if (Number.isInteger(code)) throw new Error(`飞书 Webhook 错误码 ${code}`)
+  throw new Error('飞书 Webhook 返回了无效响应')
+}
+
+const NOTIFY_CHANNELS = Object.freeze({
+  email: { ready: emailChannelReady, send: sendEmailNotify },
+  telegram: { ready: telegramChannelReady, send: sendTelegramNotify },
+  wecom: { ready: wecomChannelReady, send: sendWecomNotify },
+  feishu: {
+    ready: (cfg) => !!(cfg?.feishu?.enabled && FEISHU_WEBHOOK.test(cfg.feishu.webhook)),
+    send: sendFeishuNotify,
+  },
+})
+
+export function isNotifyChannel(channel) {
+  return Object.hasOwn(NOTIFY_CHANNELS, channel)
+}
+
 export async function dispatchNotify(cfg, message, opts = {}) {
+  opts.signal?.throwIfAborted()
   const ready = notifyChannelsReady(cfg)
   if (!ready.any) return { ok: false, error: 'no_channel', results: [] }
   const results = []
-  if (ready.email && (!opts.channels || opts.channels.includes('email'))) {
+  for (const [channel, { send }] of Object.entries(NOTIFY_CHANNELS)) {
+    if (!ready[channel] || (opts.channels && !opts.channels.includes(channel))) continue
     try {
-      results.push(await sendEmailNotify(cfg, message, opts))
+      results.push(await send(cfg, message, opts))
     } catch (err) {
-      results.push({ ok: false, channel: 'email', error: String(err?.message || err).slice(0, 180) })
-    }
-  }
-  if (ready.telegram && (!opts.channels || opts.channels.includes('telegram'))) {
-    try {
-      results.push(await sendTelegramNotify(cfg, message, opts))
-    } catch (err) {
-      results.push({ ok: false, channel: 'telegram', error: String(err?.message || err).slice(0, 180) })
-    }
-  }
-  if (ready.wecom && (!opts.channels || opts.channels.includes('wecom'))) {
-    try {
-      results.push(await sendWecomNotify(cfg, message, opts))
-    } catch (err) {
-      results.push({ ok: false, channel: 'wecom', error: String(err?.message || err).slice(0, 180) })
+      opts.signal?.throwIfAborted()
+      if (err?.name === 'AbortError') throw err
+      results.push({ ok: false, channel, error: String(err?.message || err).slice(0, 180) })
     }
   }
   return {
@@ -839,10 +1083,11 @@ export async function dispatchNotify(cfg, message, opts = {}) {
 }
 
 export async function sendNotifyTest(cfg, channel, extra = {}) {
+  const want = String(channel || '').toLowerCase()
   const message = formatNotifyMessage(
     {
       type: 'test',
-      title: extra.title || EVENT_TITLES.test,
+      title: extra.title || (want === 'feishu' ? '飞书通知测试' : EVENT_TITLES.test),
     },
     extra.snapshot || {
       at: new Date().toISOString(),
@@ -854,10 +1099,7 @@ export async function sendNotifyTest(cfg, channel, extra = {}) {
     cfg,
     extra.baseUrl,
   )
-  const want = String(channel || '').toLowerCase()
-  if (want === 'email') return sendEmailNotify(cfg, message, extra)
-  if (want === 'telegram') return sendTelegramNotify(cfg, message, extra)
-  if (want === 'wecom') return sendWecomNotify(cfg, message, extra)
+  if (isNotifyChannel(want)) return NOTIFY_CHANNELS[want].send(cfg, message, extra)
   return dispatchNotify(cfg, message, extra)
 }
 
@@ -956,6 +1198,7 @@ export function createNotifyMonitor(opts = {}) {
             }
             dispatched.push({ type: event.type, ok: result?.ok !== false && !failedChannels.length, result })
           } catch (err) {
+            if (err?.name === 'AbortError') break
             deliveryError = String(err?.message || err).slice(0, 180)
             dispatched.push({ type: event.type, ok: false, error: deliveryError })
           }

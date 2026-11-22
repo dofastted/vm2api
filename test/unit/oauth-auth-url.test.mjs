@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
 import {
   generateAuthUrl,
   exchangeAuthCode,
@@ -11,6 +12,7 @@ import {
   REDIRECT_URI,
   SCOPE_OAUTH,
   OAUTH_FLAVORS,
+  linkCredentialFromToken,
 } from '../../src/lib/oauth/oauth-auth-url.mjs'
 
 test('generateAuthUrl refuses an unbound VM but accepts local egress as direct', () => {
@@ -53,7 +55,7 @@ test('Claude Code flavors cannot create a separate panel PKCE session', () => {
   }
 })
 
-test('generateAuthUrl setup_token mints an inference-only token on the CLI consent page', () => {
+test('generateAuthUrl setup_token asks for the login scope on the CLI consent page', () => {
   resetAuthUrlSessions()
   const spec = OAUTH_FLAVORS.setup_token
   const out = generateAuthUrl({
@@ -63,10 +65,12 @@ test('generateAuthUrl setup_token mints an inference-only token on the CLI conse
   })
   assert.equal(out.flavor, 'setup_token')
   assert.match(out.auth_url, /^https:\/\/claude\.com\/cai\/oauth\/authorize\?code=true/)
-  // `claude setup-token` authorizes `inferenceOnly`, not the full login set.
-  assert.equal(spec.scope, 'user:inference')
-  assert.ok(out.auth_url.includes(encodeURIComponent('user:inference')))
-  assert.equal(out.auth_url.includes('user%3Aprofile'), false)
+  // Identity (profile/roles/bootstrap) needs user:profile, so the mint asks for
+  // the same five scopes as the normal login; only the lifetime differs.
+  assert.equal(spec.scope, FULL_OAUTH_SCOPE)
+  // Spaces are encoded as '+' by buildAuthorizationURL.
+  assert.ok(out.auth_url.includes(encodeURIComponent(FULL_OAUTH_SCOPE).replace(/%20/g, '+')))
+  assert.ok(out.auth_url.includes('user%3Aprofile'))
   const session = peekAuthUrlSession(out.session_id)
   assert.equal(session.flavor, 'setup_token')
   assert.equal(session.scope, spec.scope)
@@ -111,4 +115,52 @@ test('fake exchange writes tokens without network', async () => {
   assert.match(cred.access_token, /^sk-ant-oat01-FAKE-AUTH-URL/)
   assert.equal(peekAuthUrlSession(out.session_id), null)
   delete process.env.KIN_FAKE_SESSION_OAUTH
+})
+
+test('link exchange keeps every field the helper collected', () => {
+  // The helper runs the README's post-token sequence; roles, first-token date
+  // and bootstrap must survive the panel's mapping, not just the token body.
+  const token = {
+    access_token: 'oat-access',
+    refresh_token: '',
+    token_type: 'Bearer',
+    expires_in: 31_536_000,
+    scope: FULL_OAUTH_SCOPE,
+    type: 'setup-token',
+    mode: 'setup-token',
+    email: 'link@example.test',
+    account_uuid: 'acct-1',
+    org_uuid: 'org-1',
+    subscription_type: 'max',
+    rate_limit_tier: 'default_claude_max_20x',
+    organization_role: 'admin',
+    subscription_created_at: '2020-01-01T00:00:00.000Z',
+    oauth_account: { account_uuid: 'acct-1', account_email: 'link@example.test' },
+  }
+  const credential = linkCredentialFromToken(token, { flavor: 'setup_token', scope: FULL_OAUTH_SCOPE })
+  for (const key of [
+    'organization_role',
+    'subscription_created_at',
+    'oauth_account',
+    'type',
+    'mode',
+    'subscription_type',
+    'rate_limit_tier',
+  ]) {
+    assert.deepEqual(credential[key], token[key], key)
+  }
+  assert.equal(credential.email, 'link@example.test')
+  assert.equal(credential.email_address, 'link@example.test')
+  assert.equal(credential.flavor, 'setup_token')
+  assert.equal(credential.expires_at, Math.floor(Date.now() / 1000) + 31_536_000)
+})
+
+test('link exchange derives identity from the token when the helper sent none', () => {
+  const credential = linkCredentialFromToken(
+    { access_token: 'oat', scope: 'user:profile', email: 'x@example.test' },
+    { flavor: 'cai' },
+  )
+  assert.equal(credential.email, 'x@example.test')
+  assert.equal(credential.refresh_token, '')
+  assert.equal(credential.flavor, 'cai')
 })

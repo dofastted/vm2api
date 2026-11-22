@@ -446,7 +446,8 @@ export async function installKernelTargets({
           const checkTargetLicense = () => licenseCheck(projectRoot, desired, routing, { preferInstalled: false })
           const grant = target.kernel === 'crag' ? checkTargetLicense() : null
           const canAuthorizeInstall = (check) =>
-            ['license_required', 'license_crag_host_over_quota', 'license_binding_mismatch'].includes(check?.code) &&
+            (['license_required', 'license_crag_host_over_quota', 'license_binding_mismatch'].includes(check?.code) ||
+              (check?.code === 'license_payload_key_mismatch' && target.reissue === true)) &&
             !!(target.expected_tag || target.payload_tag) &&
             !resumeId &&
             typeof cragSubscription?.authorizeInstall === 'function'
@@ -526,7 +527,10 @@ export async function installKernelTargets({
             if (pendingGrant && !pendingGrant.ok) {
               if (!canAuthorizeInstall(pendingGrant)) return installLicenseFailure(target, pendingGrant)
               try {
-                await cragSubscription.authorizeInstall(desired)
+                // The panel already authorized this intent (`mayBindSubscription`);
+                // without passing it on, migrating a slot that holds an old grant
+                // is unreachable.
+                await cragSubscription.authorizeInstall(desired, { allowLegacyReissue: target.reissue === true })
               } catch (error) {
                 const code = error?.code || 'crag_subscription_install_failed'
                 const messages = {
