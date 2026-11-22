@@ -569,20 +569,22 @@ export function createCragSubscription({
     }
   }
 
-  /** The displayable form of a stored identity. The host id stays the single
-   * authority: a `device_uuid` that does not derive it was tampered with or
-   * belongs to another install, and is dropped rather than allowed to speak for
-   * this host. */
-  function storedUuid(hostId, sources) {
+  /** The stored readable form, if it is there and really does derive `hostId`.
+   * The host id stays the single authority: a `device_uuid` that does not
+   * derive it was tampered with or belongs to another install. */
+  function readStoredUuid(hostId) {
     let stored
     try {
       stored = load(uuidFile, 0o644, 36)
     } catch {
-      stored = null
+      return null
     }
-    if (stored && normalizeDeviceUuid(stored) === stored && uuidToHostId(stored) === hostId) return stored
-    // An install that predates this file still has its original source around in
-    // the usual case, so the UUID can be recovered and written out once.
+    return stored && normalizeDeviceUuid(stored) === stored && uuidToHostId(stored) === hostId ? stored : null
+  }
+
+  /** Recover the readable form for an install that predates `device_uuid`, and
+   * write it out once. Returns null when it cannot be reconstructed. */
+  function backfillUuid(hostId, sources) {
     for (const [, raw] of sources) {
       if (hostIdFromRaw(raw) !== hostId) continue
       const uuid = formatDeviceUuid(raw)
@@ -610,18 +612,31 @@ export function createCragSubscription({
     } catch {
       throw fail('crag_subscription_storage_unavailable')
     }
-    // Sources are still required to be sound even once an identity is stored.
-    // A source being gone, unreadable, or replaced by something unsafe is a
-    // different matter from it having changed value, and only the latter is
-    // tolerated below.
-    const sources = [...candidateRaws()].filter(([, raw]) => raw)
-    if (!sources.length) throw hostIdentityUnavailable()
-    // A stored identity is then returned exactly as it stands, with no value
+    // A stored identity is returned exactly as it stands, with no value
     // comparison. This machine has already paid; a regenerated machine-id, a
     // rebuilt container or a swapped NIC must not turn it into a stranger. This
     // is what used to raise `crag_subscription_host_identity_changed`, and what
     // left paid hosts wedged after ordinary maintenance.
-    if (saved) return { hostId: saved, uuid: storedUuid(saved, sources), source: 'saved' }
+    //
+    // Sources are still required to be sound: one that is missing or replaced by
+    // something unsafe is a different matter from one whose value changed, and
+    // only the latter is tolerated. In the settled case any single sound source
+    // settles that, and `candidateRaws` is lazy, so this path does not sample
+    // every source -- it runs on slot-start admission.
+    if (saved) {
+      const stored = readStoredUuid(saved)
+      if (stored) {
+        for (const [, raw] of candidateRaws()) {
+          if (raw) return { hostId: saved, uuid: stored, source: 'saved' }
+        }
+        throw hostIdentityUnavailable()
+      }
+      const sources = [...candidateRaws()].filter(([, raw]) => raw)
+      if (!sources.length) throw hostIdentityUnavailable()
+      return { hostId: saved, uuid: backfillUuid(saved, sources), source: 'saved' }
+    }
+    const sources = [...candidateRaws()].filter(([, raw]) => raw)
+    if (!sources.length) throw hostIdentityUnavailable()
     const [source, raw] = sources[0]
     return { hostId: hostIdFromRaw(raw), uuid: formatDeviceUuid(raw), source }
   }
