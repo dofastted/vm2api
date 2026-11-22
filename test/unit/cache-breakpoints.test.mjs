@@ -24,6 +24,7 @@ import {
   minCacheableTokens,
   normalizeCacheBreakpoints,
   normalizeMessagesBreakpointMode,
+  validateCacheBreakpoints,
 } from '../../src/lib/protocol/cache-ttl.mjs'
 import { prepareAnthropicRequest } from '../../src/lib/protocol/anthropic-policy.mjs'
 import { prepareOutboundEnvelope } from '../../src/lib/protocol/outbound-attempt.mjs'
@@ -673,4 +674,40 @@ test('probe and admin paths that pass no config are unchanged', () => {
     messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
   })
   assert.equal(breakpoints(out).length, 0)
+})
+
+test('applyCacheBreakpoints and prepareAnthropicRequest do not emit 1h after an implicit-5m caller tool marker', () => {
+  const inbound = {
+    model: 'claude-sonnet-5',
+    max_tokens: 256,
+    tools: [
+      { name: 'read_file', input_schema: { type: 'object' } },
+      { name: 'user_ask', input_schema: { type: 'object' }, cache_control: { type: 'ephemeral' } },
+    ],
+    system: [{ type: 'text', text: 'caller prompt '.repeat(300), cache_control: { type: 'ephemeral' } }],
+    messages: [{ role: 'user', content: 'hello' }],
+  }
+  const rebuilt = {
+    ...inbound,
+    system: [{ type: 'text', text: 'rebuilt prompt '.repeat(300) }],
+  }
+
+  const out = applyCacheBreakpoints(rebuilt, {
+    ttl: '1h',
+    config: DEFAULT_CACHE_BREAKPOINTS,
+    inbound,
+  })
+  assert.doesNotThrow(() => validateCacheBreakpoints(out))
+  assert.deepEqual(out.tools.at(-1).cache_control, { type: 'ephemeral' })
+  assert.equal(out.system[0].cache_control.ttl, '5m')
+  assert.equal(out.messages[0].content[0].cache_control.ttl, '5m')
+
+  const prepared = prepareAnthropicRequest(rebuilt, {
+    unofficial: true,
+    cacheTtl: '1h',
+    cacheBreakpoints: DEFAULT_CACHE_BREAKPOINTS,
+    inbound,
+  })
+  assert.doesNotThrow(() => validateCacheBreakpoints(prepared))
+  assert.equal(prepared.system[0].cache_control.ttl, '5m')
 })

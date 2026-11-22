@@ -369,3 +369,25 @@ test('writeKernelConfig uses guest socket path and runtime_kind kvm', () => {
   assert.equal(written.socketPath, path.join(root, 'vms', 'vm-02', 'run', 'kernel.sock'))
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+test('kvm docker run honors slotCreationLimits pids instead of hardcoding 256', () => {
+  const highPids = { ...vm, machine: { ...vm.machine, memory: '4g', pids_limit: 640 } }
+  const args = argsFor('kvm', highPids, { slot_capacity: { enabled: false } })
+  assert.equal(args[args.indexOf('--pids-limit') + 1], '640')
+
+  const max20 = {
+    ...vm,
+    machine: { ...vm.machine, memory: '4g' },
+    claude: { rate_limit_tier: 'default_claude_max_20x' },
+    policy: { sessionSlots: 8, sessionSlotsOverride: true },
+  }
+  const planArgs = argsFor('kvm', max20, {})
+  assert.equal(planArgs[planArgs.indexOf('--pids-limit') + 1], '640')
+})
+
+test('kvm cloud-init user-data masks systemd-time-wait-sync in bootcmd', () => {
+  const userData = fs.readFileSync(path.resolve('docker/kin-kvm/guest/user-data'), 'utf8')
+  assert.match(userData, /^#cloud-config\b/m)
+  assert.match(userData, /^bootcmd:/m)
+  assert.match(userData, /systemctl mask --now --no-block systemd-time-wait-sync\.service/)
+})

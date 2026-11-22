@@ -797,7 +797,7 @@ export function applyCacheBreakpoints(body, { ttl = DEFAULT_CACHE_TTL, config, i
   }
   const mode = cfg.preserve_client && hasMessageBreakpoint(out.messages) ? 'fill' : cfg.messages
   out = applyMessageBreakpoints(out, target, mode)
-  return out
+  return enforceCacheTtlOrder(out, target)
 }
 
 function n(v) {
