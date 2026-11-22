@@ -65,6 +65,7 @@ export function ProtocolPane({
   onInferenceChange: (patch: Block) => void
 }) {
   const strict = compat.claude_code_only === true
+  const countTokens = compat.count_tokens === true
   const relay = detectProxiedOfficialCcFromCompat(compat)
   const cch = cchEnabledFromCompat(compat)
   const blockedClients =
@@ -159,6 +160,22 @@ export function ProtocolPane({
               </SettingRow>
             )
           })}
+          <SettingRow
+            label='开放 count_tokens 入口'
+            desc={
+              countTokens
+                ? '开：POST /v1/messages/count_tokens 与面板按槽位的计数探测可用。只算 token，不绑定 sticky、不计费。'
+                : '已关：上述两个入口返回 404。实现一直在，这个开关只决定是否放行。'
+            }
+          >
+            <Switch
+              checked={countTokens}
+              onCheckedChange={(on) =>
+                onCompatChange({ ...compat, count_tokens: on })
+              }
+              aria-label='开放 count_tokens 入口'
+            />
+          </SettingRow>
         </div>
         <div
           className={cn(

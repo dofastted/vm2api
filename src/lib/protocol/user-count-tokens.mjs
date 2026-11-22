@@ -39,6 +39,18 @@ import { pickCodexSlots } from '../pool/codex-slot-pool.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
 import { blockedClientError, blockedClientFor } from '../identity/blocked-clients.mjs'
 import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
+
+/** routing.compatibility.count_tokens — whether the count_tokens entries are served.
+ *
+ * Both entries (public `/v1/messages/count_tokens` and the panel's per-VM probe) were
+ * stubbed to 404 by 94b6f728 with the implementations left in place. Default off keeps
+ * that: these are a public API surface and a panel route, so turning them on is the
+ * operator's decision, not something a routing file gains by omission.
+ */
+export function countTokensEnabled(routing) {
+  return routing?.compatibility?.count_tokens === true
+}
+
 export function usageUnsupportedError() {
   return makeError({
     type: ErrorType.INVALID_REQUEST,

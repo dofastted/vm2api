@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- count_tokens 的两个入口可在面板开启。`94b6f728` 当初把公开的 `POST /v1/messages/count_tokens`（含 `/messages/count_tokens`）和面板按槽位的 `POST /api/panel/vms/:id/count-tokens` 都 stub 成 404，但实现本体一直完整保留——`handleUserCountTokens` 有 11 个测试直接驱动（oauth / setup-token / 跨平台 key / distill 拦截 / 拒答缓存 / 设备封禁），经槽位 Go worker 的 `countTokensViaWorker` 也在，所以这次只是把路由接回去，加一个 `routing.compatibility.count_tokens` 开关（面板「设置 → 协议 → 入站准入 → 开放 count_tokens 入口」）。**默认关**，关态行为与现在逐字一致：这是一个公开 API 面和一个面板路由，打开它应当是运维的明确决定，而不是某个 routing 文件因为缺字段而默认获得的能力；开关只接受 `true`，routing.json 里误写成字符串不会把端点打开。`/health` 与 `/v1/meta` 的 `features` 在开启时多一项 `count_tokens`，而启动时写出的 `config/gateway-v2.public.json` 保持静态清单——一个在 boot 产出的文件无法描述运行期可翻的开关，两种写法都会有一半时间是错的（#1394）。
+
 - 按客户端拦截的开关（`blocked_clients`）改掉三处与现状不符的地方。它的检测不再读 `messages` 里 `role: 'system'/'developer'` 的轮次：闸门只要求**模型**是 Anthropic，而本网关也服务 OpenAI 形状打 Claude 模型的请求，在那条路上这些轮次是调用方自由书写的内容，读它会让一个只在 system 消息里写了「running inside OpenClaw」的用户吃 403——而该模块注释承诺的恰恰是「只提名字不会被拦」。改后不损失真实覆盖：这类客户端跑的是官方 CLI，请求一律是 Anthropic 形状、带真的 `system`。校验对未知客户端 id 改为忽略而非拒绝，与 `blockedClientsFromRouting` 的读法一致；此前一旦某个 id 被退役或改名，存量 `routing.json` 里留下的键会让**任何**协议设置保存都失败，只能手改文件恢复。模块注释与面板文案也随之更正：`78223cdf1` 之后第三方 system 搬移已按 `system` 内容判定，这类请求会被搬移后正常服务，不再因第三方应用判定被上游拒绝，所以打开开关等于在搬移之前主动放弃一条本来能成功的请求（#1394）。
 - 去掉 GPT-6.2 Astra / Sol 凭公式推出的 Flex 档。官方价目表的 Flex 一节里没有任何 GPT-6.2 条目，并明确写着不会再给新模型加 Flex；较早的几个模型的 Flex 恰好是标准价的一半（`gpt-6-astra` 10/50/1 → 5/25/0.5，`gpt-6.1-sol` 2/10/0.1 → 1/5/0.05），所以按这个比例推出来的数看着合理，却是一份自称「官方价快照」的文件里凭空生成的价格，并且会让一条回显 flex 的 GPT-6.2 记录按标准价的一半结算。`selectBand` 本来就有正确答案——某档位没有公开价时它把该行报为未计价，而不是按猜测计费（#1560）。
 
