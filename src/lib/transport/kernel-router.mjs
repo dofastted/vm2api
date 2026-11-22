@@ -59,6 +59,17 @@ export function rustHealthTimeoutMs(routing = {}) {
   return Math.min(30_000, Math.max(800, Math.round(n)))
 }
 
+/** How long a local slot whose kernel looks down is re-probed before the request fails (0 = off). */
+export const RUST_DOWN_REPROBE_MS = 2500
+const RUST_DOWN_REPROBE_GAP_MS = 250
+export function rustDownReprobeMs(routing = {}) {
+  const raw = routing?.inference?.kernel_down_reprobe_ms
+  if (raw == null || raw === '') return RUST_DOWN_REPROBE_MS
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) return RUST_DOWN_REPROBE_MS
+  return Math.min(10_000, Math.round(n))
+}
+
 export function rustSlotWaitMs(routing = {}) {
   const raw = routing?.inference?.slot_wait_ms
   if (raw == null || raw === '') return DEFAULT_SLOT_WAIT_MS
@@ -271,22 +282,93 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs, slotWaitDeadline
       error: health?.unhealthy_reason || 'rust kernel unhealthy',
     }
   }
-  if (rustShouldWaitForSlot(health, wrapHopInflight(exec))) {
-    const managed = supportsGatewayPolicy(health)
+  const waitForSlotFrom = async (seen) => {
+    const managed = supportsGatewayPolicy(seen)
     const remainingBudgetMs =
       managed && Number.isFinite(slotWaitDeadlineMs) ? Math.max(0, slotWaitDeadlineMs - Date.now()) : slotWaitMs
     const waited = await waitForReadySlot(
       exec,
       resolveHopSlotWaitMs({ remainingBudgetMs, routing }),
       DEFAULT_SLOT_POLL_MS,
-      managed ? health : null,
+      managed ? seen : null,
     )
     if (vmNodeDataPath(exec?.vm) === 'offline') return CLUSTER_RECONNECTING
     if (waited?.ok && dataPath === vmNodeDataPath(exec?.vm)) rememberRustHealth(exec, waited)
     return waited
   }
+  if (rustShouldWaitForSlot(health, wrapHopInflight(exec))) return waitForSlotFrom(health)
+  // A single health probe that is neither ready nor busy (no request in flight,
+  // not unhealthy) is often a kernel that is still settling after the slot's
+  // previous request; the next probe a moment later is ready. On a local slot,
+  // re-probe briefly instead of failing the request at once, and log what the
+  // kernel reported when it really stays down.
+  let last = health
+  if (dataPath === 'local') {
+    // Same budget rule as the slot wait above: a managed (gateway-policy) kernel
+    // honours the request's slot deadline, the others the remaining slot wait.
+    const planBudget =
+      supportsGatewayPolicy(health) && Number.isFinite(slotWaitDeadlineMs)
+        ? Math.max(0, slotWaitDeadlineMs - Date.now())
+        : Number.isFinite(slotWaitMs)
+          ? Math.max(0, slotWaitMs)
+          : Infinity
+    const deadline = Date.now() + Math.min(rustDownReprobeMs(routing), planBudget)
+    let probes = 0
+    while (Date.now() + RUST_DOWN_REPROBE_GAP_MS < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, RUST_DOWN_REPROBE_GAP_MS))
+      last = await rustKernelHealth(exec, { timeoutMs: rustHealthTimeoutMs(routing) })
+      probes++
+      if (vmNodeDataPath(exec?.vm) !== dataPath) break
+      if (rustHopReady(last)) {
+        const ready = { ok: true, reason: 'ready_after_reprobe', health: last }
+        rememberRustHealth(exec, ready)
+        return ready
+      }
+      if (last?.healthy === false) {
+        return { ok: false, reason: 'kernel_unavailable', error: last?.unhealthy_reason || 'rust kernel unhealthy' }
+      }
+      if (rustShouldWaitForSlot(last, wrapHopInflight(exec))) return waitForSlotFrom(last)
+    }
+    console.warn(
+      '[kernel] ' +
+        JSON.stringify({
+          event: 'rust_kernel_down',
+          vm: cacheKey(exec),
+          probes,
+          first: healthSnapshot(health),
+          last: healthSnapshot(last),
+        }),
+    )
+  }
   clearRustHealthCache(cacheKey(exec))
   return { ok: false, reason: 'kernel_unavailable', error: 'rust kernel is down; watchdog recovery pending' }
+}
+
+const HEALTH_SNAPSHOT_KEYS = [
+  'ok',
+  'status',
+  'code',
+  'error',
+  'healthy',
+  'ready',
+  'ready_slots',
+  'closed_slots',
+  'active',
+  'waiting',
+  'queued',
+  'recovering',
+  'cleaning',
+  'cli_pid',
+  'unhealthy_reason',
+  'runtime_variant',
+]
+function healthSnapshot(health) {
+  if (!health || typeof health !== 'object') return null
+  const out = {}
+  for (const key of HEALTH_SNAPSHOT_KEYS) {
+    if (health[key] !== undefined) out[key] = typeof health[key] === 'string' ? health[key].slice(0, 160) : health[key]
+  }
+  return out
 }
 
 // Resolve before shaping the attempt; the same worker report gates serialization.
