@@ -17,12 +17,16 @@ export type VmSortKey =
 /**
  * 状态优先级：在池 → 受限 → 关闭调用 → 未使用 → 无效凭证 → revoke。
  * cool / quota 是受限，不与在池同级。
+ * Gemini 的推理证据单独排列，不参与在池或坏凭证的排序口径。
  */
 function statusRank(vm: Vm): number {
   return (
     {
       pool: 0,
+      host_verified: 0.25,
+      pending: 0.5,
       restricted: 1,
+      host_failed: 1.5,
       off: 2,
       none: 3,
       unschedulable: 4,

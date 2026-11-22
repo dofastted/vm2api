@@ -3,9 +3,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
+import { FleetPulse } from './fleet-pulse'
 import { geminiSlot } from './gemini-slot'
 import { VmTable } from './vm-list-table'
 import { VmRack } from './vm-rack'
+import { zoneCounts } from './vm-rack-model'
 import { VmSchedulingBlock, VmSchedulingEditor } from './vm-scheduling'
 import { filterVms } from './vm-table'
 
@@ -128,7 +130,7 @@ describe('VM account column kernel label', () => {
         'Gemini account',
         'CRAGAnti',
         '宿主机',
-        '已授权',
+        '已完成官方 Google 授权',
         '尚未拉取模型，不能调度',
         'px-011f7746',
       ]) {
@@ -139,6 +141,87 @@ describe('VM account column kernel label', () => {
     const hostOnly = renderSlots(<VmTable vms={[gemini]} />)
     expect(hostOnly).not.toContain('role="switch"')
     expect(hostOnly).not.toContain('24h 无请求')
+  })
+
+  it('keeps pending, cancelled, failed and verified turns out of generic 在池 counts', () => {
+    const candidate: NonNullable<Vm['gemini']> = {
+      id: 'pending-gemini',
+      name: 'Pending Gemini',
+      proxy_id: 'px-011f7746',
+      auth_state: 'authorized',
+      auth_method: 'api_key',
+      runtime_ready: false,
+      billing_ready: false,
+      kernel_version: '0.3.0',
+      created_at: null,
+      updated_at: null,
+      models_discovered: true,
+      models: ['gemini-2.5-pro'],
+      account: null,
+    }
+    const pending = geminiSlot(candidate)
+    const states = ['cancelled', 'failed', 'completed'] as const
+    const [cancelled, failed, verified] = states.map((state) =>
+      geminiSlot({
+        ...candidate,
+        id: `${state}-gemini`,
+        name: `${state} Gemini`,
+        last_inference: {
+          state,
+          model: candidate.models[0],
+          started_at: '2026-11-22T09:00:00Z',
+          finished_at: '2026-11-22T09:00:05Z',
+          error_code: state === 'failed' ? 'gemini_location_unsupported' : null,
+        },
+      })
+    )
+    const vms = [pending, cancelled, failed, verified]
+    expect(zoneCounts(vms)).toMatchObject({
+      pool: 0,
+      pending: 2,
+      host_failed: 1,
+      host_verified: 1,
+      dead: 0,
+    })
+    expect(filterVms(vms, '', 'pool', 'gemini')).toEqual([])
+    expect(filterVms(vms, '', 'pending', 'gemini')).toEqual([
+      pending,
+      cancelled,
+    ])
+    expect(filterVms(vms, '', 'host_failed', 'gemini')).toEqual([failed])
+    expect(filterVms(vms, '', 'host_verified', 'gemini')).toEqual([verified])
+
+    for (const view of [
+      <VmTable vms={vms} />,
+      <VmRack vms={vms} size='l' filter='all' />,
+      <VmRack vms={vms} size='s' filter='all' />,
+    ]) {
+      const html = renderToStaticMarkup(
+        <QueryClientProvider client={new QueryClient()}>
+          {view}
+        </QueryClientProvider>
+      )
+      expect(html).toContain('已配置 API Key')
+      expect(html).toContain('已发现 1 个模型')
+      expect(html).toContain('候选条件已满足')
+      expect(html).toContain('待验证')
+      expect(html).toContain('尚无宿主推理记录')
+      expect(html).toContain('上次宿主推理已取消')
+      expect(html).toContain('上次宿主推理成功')
+      expect(html).toContain('上次宿主推理失败')
+      expect(html).toContain('Google 地区资格受限')
+      expect(html).toContain('gemini-2.5-pro')
+      expect(html).not.toContain('无效凭证')
+      expect(html).not.toContain('role="switch"')
+    }
+
+    const pulse = renderToStaticMarkup(
+      <FleetPulse vms={vms} filter='pending' onFilter={() => undefined} />
+    )
+    expect(pulse).toContain('待验证')
+    expect(pulse).toContain('宿主推理失败')
+    expect(pulse).toContain('宿主推理成功')
+    expect(pulse).not.toContain('在池')
   })
 
   it.each(['wrap', 'cc'] as const)(

@@ -12,7 +12,15 @@ import { fableRow } from '@/features/vm/usage-meter'
  * `bad`、`revoke` 与其余「不可调度」合成一区：都要人工处理后再调度开，
  * 分开只会让运维多扫一段。
  */
-export type VmZone = 'pool' | 'restricted' | 'off' | 'none' | 'dead'
+export type VmZone =
+  | 'pool'
+  | 'host_verified'
+  | 'pending'
+  | 'host_failed'
+  | 'restricted'
+  | 'off'
+  | 'none'
+  | 'dead'
 export type VmZoneFilter = VmZone | 'all'
 
 export type ZoneDef = {
@@ -24,6 +32,30 @@ export type ZoneDef = {
   color: string
 }
 
+export const GEMINI_EVIDENCE_ZONES = [
+  {
+    key: 'host_verified',
+    label: '宿主推理成功',
+    hint: '最近一次宿主推理成功，不代表公共 API 端到端验证',
+    tone: 'ok',
+    color: 'var(--status-ok-solid)',
+  },
+  {
+    key: 'pending',
+    label: '待验证',
+    hint: '授权中，或候选条件已满足但未观察到宿主推理成功',
+    tone: 'none',
+    color: 'var(--status-none)',
+  },
+  {
+    key: 'host_failed',
+    label: '宿主推理失败',
+    hint: '最近一次宿主推理失败，不代表已配置凭证失效',
+    tone: 'warn',
+    color: 'var(--status-warn-solid)',
+  },
+] as const satisfies readonly ZoneDef[]
+
 export const ZONES: readonly ZoneDef[] = [
   {
     key: 'pool',
@@ -32,6 +64,7 @@ export const ZONES: readonly ZoneDef[] = [
     tone: 'ok',
     color: 'var(--status-ok-solid)',
   },
+  ...GEMINI_EVIDENCE_ZONES,
   {
     key: 'restricted',
     label: '受限',
@@ -72,14 +105,21 @@ export function zoneOf(vm: Vm): VmZone {
   return zoneOfGroup(fleetGroup(vm))
 }
 
-export function zoneCounts(vms: Vm[]): Record<VmZone, number> {
-  const c: Record<VmZone, number> = {
+export function emptyZoneCounts(): Record<VmZone, number> {
+  return {
     pool: 0,
     restricted: 0,
     off: 0,
     none: 0,
     dead: 0,
+    host_verified: 0,
+    pending: 0,
+    host_failed: 0,
   }
+}
+
+export function zoneCounts(vms: Vm[]): Record<VmZone, number> {
+  const c = emptyZoneCounts()
   for (const vm of vms) c[zoneOf(vm)] += 1
   return c
 }
@@ -215,6 +255,9 @@ export function rackTotals(
       bad: 0,
       revoke: 0,
       unschedulable: 0,
+      host_verified: 0,
+      pending: 0,
+      host_failed: 0,
     },
     seatsUsed: 0,
     seatsMax: 0,

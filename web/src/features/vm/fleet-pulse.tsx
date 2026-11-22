@@ -11,6 +11,7 @@ import {
 } from '@/components/ui/tooltip'
 import {
   ZONES,
+  emptyZoneCounts,
   zoneOf,
   type VmZone,
   type VmZoneFilter,
@@ -43,13 +44,7 @@ type Pulse = {
 }
 
 function computePulse(vms: Vm[], accounts?: UsageAccountRow[]): Pulse {
-  const counts: Record<VmZone, number> = {
-    pool: 0,
-    restricted: 0,
-    off: 0,
-    none: 0,
-    dead: 0,
-  }
+  const counts = emptyZoneCounts()
   const headroom = [0, 0, 0, 0, 0]
   const remains: number[] = []
   let todayCost = 0
@@ -158,6 +153,7 @@ export function FleetPulse({
   className?: string
 }) {
   const pulse = useMemo(() => computePulse(vms, accounts), [vms, accounts])
+  const hasGemini = vms.some((vm) => !!vm.gemini)
   const segments = ZONES.filter((z) => pulse.counts[z.key] > 0)
   const focused = filter !== 'all'
   const headroomMax = Math.max(...pulse.headroom, 1)
@@ -226,7 +222,7 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title='7 天窗口余量'
+        title={hasGemini ? '普通槽 7 天窗口余量' : '7 天窗口余量'}
         className='xl:col-span-2'
         meta={
           <span className='text-[13px] leading-none font-[590] tracking-[-0.01em] tabular-nums'>
@@ -283,7 +279,7 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title='今日消耗 · 北京时间'
+        title={hasGemini ? '普通槽今日消耗 · 北京时间' : '今日消耗 · 北京时间'}
         className='xl:col-span-2'
         meta={
           <span className='text-[11px] text-muted-foreground tabular-nums'>
@@ -311,7 +307,7 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title='7 天窗口成败'
+        title={hasGemini ? '普通槽 7 天窗口成败' : '7 天窗口成败'}
         className='sm:col-span-2 xl:col-span-2'
         meta={
           <span className='text-[11px] text-muted-foreground tabular-nums'>
