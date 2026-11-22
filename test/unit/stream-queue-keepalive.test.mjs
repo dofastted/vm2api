@@ -106,11 +106,15 @@ function createHandler({ root, routing, run, stream = true }) {
   })
 }
 
-async function invoke(handler, res) {
+async function invoke(handler, res, extraHeaders = {}) {
   const req = {
     method: 'POST',
     url: '/v1/messages',
-    headers: { authorization: 'Bearer master', 'user-agent': 'claude-cli/2.1.187 (external, cli)' },
+    headers: {
+      authorization: 'Bearer master',
+      'user-agent': 'claude-cli/2.1.187 (external, cli)',
+      ...extraHeaders,
+    },
     apiKeyKind: 'master',
     once() {},
     off() {},
@@ -421,6 +425,30 @@ test('a Claude stream that fails before the queue delay keeps the HTTP status', 
     assert.equal(res.statusCode, 529)
     assert.equal(res.body.error.type, 'overloaded_error')
     assert.equal(res.body.error.code, 'pool_overloaded')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('x-kin-queue: off reaches the runner as allowQueue:false; without it the request may queue', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-queue-hint-'))
+  const seen = []
+  const handler = createHandler({
+    root,
+    routing: { compatibility: {}, failover: { stream_keepalive_ms: 1000, queue_keepalive_delay_ms: 5_000 } },
+    run: async (opts) => {
+      seen.push(opts.allowQueue)
+      return overloaded()
+    },
+  })
+  try {
+    const off = createResponse()
+    await invoke(handler, off, { 'x-kin-queue': 'off' })
+    assert.equal(off.statusCode, 529)
+    assert.equal(off.body.error.code, 'pool_overloaded')
+    assert.equal(off.chunks.length, 0)
+    await invoke(handler, createResponse())
+    assert.deepEqual(seen, [false, true])
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
