@@ -30,7 +30,7 @@ import {
   ensureOfficialCredentialLink,
   slotUidGidFromHomeDir,
 } from '../oauth/oauth-credentials.mjs'
-import { runSlotOauth } from './slot-oauth.mjs'
+import { probeAttemptGuard, runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { ensureRemoteOfficialCredentialLink } from '../cluster/remote-slot-files.mjs'
 import { normalizeSessionIdleTtlSeconds } from '../vm/slot-engine.mjs'
@@ -1746,6 +1746,11 @@ function relinkKeepingRotation(homeDir) {
   return ensureOfficialCredentialLink(homeDir, { ...slotUidGidFromHomeDir(homeDir), adoptOfficial: 'rotation' })
 }
 
+/** Whether the worker on this slot's node keeps the refresh attempt journal (no token, no network). */
+export function probeWorkerAttemptGuard(exec, opts = {}) {
+  return probeAttemptGuard(exec, opts)
+}
+
 export async function ensureWorkerCredential(exec, { force = false, skewMs = REFRESH_SKEW_MS } = {}) {
   if (isCrsMock()) {
     return {
@@ -1822,6 +1827,7 @@ export async function ensureWorkerCredential(exec, { force = false, skewMs = REF
       refresh_class: result?.ok ? (body.refreshed ? 'rotated' : 'already_fresh') : undefined,
       credential: result?.ok ? credentialSummary({ ...(refreshedCredential || {}), ...body }, Date.now()) : undefined,
       error: result?.ok ? undefined : body.error,
+      attempt_guard: result?.attempt_guard,
     }
     if (!mapped.ok) mapped.refresh_class = classifyCredentialRefresh(mapped)
     return mapped
