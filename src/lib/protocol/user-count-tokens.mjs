@@ -37,7 +37,20 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot } from '../vm/codex-slot.mjs'
 import { pickCodexSlots } from '../pool/codex-slot-pool.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
+import { blockedClientError, blockedClientFor } from '../identity/blocked-clients.mjs'
 import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
+
+/** routing.compatibility.count_tokens — whether the count_tokens entries are served.
+ *
+ * Both entries (public `/v1/messages/count_tokens` and the panel's per-VM probe) were
+ * stubbed to 404 by 94b6f728 with the implementations left in place. Default off keeps
+ * that: these are a public API surface and a panel route, so turning them on is the
+ * operator's decision, not something a routing file gains by omission.
+ */
+export function countTokensEnabled(routing) {
+  return routing?.compatibility?.count_tokens === true
+}
+
 export function usageUnsupportedError() {
   return makeError({
     type: ErrorType.INVALID_REQUEST,
@@ -277,6 +290,12 @@ export async function handleUserCountTokens(req, res, deps) {
     !isClaudeCodeFamilyRequest(req?.headers || {}, inbound, { countTokens: true })
   ) {
     const err = claudeCodeOnlyError()
+    return json(res, err.status, err.body)
+  }
+  const blockedClient =
+    detectInboundPlatform(parsed.body.model).platform === 'anthropic' ? blockedClientFor(inbound, routing) : null
+  if (blockedClient) {
+    const err = blockedClientError(blockedClient)
     return json(res, err.status, err.body)
   }
   const gate = await blockCountTokensBeforeHop(req, parsed.body, { ...deps, rawInbound: inbound })

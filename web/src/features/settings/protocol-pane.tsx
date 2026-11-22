@@ -30,6 +30,11 @@ import { ChipGroup, PaneSection, StepperSetting } from './scheduler-controls'
 
 type Block = Record<string, unknown>
 
+/** Mirrors BLOCKABLE_CLIENTS in src/lib/identity/blocked-clients.mjs. */
+const BLOCKABLE_CLIENTS: [string, string, string][] = [
+  ['openclaw', 'OpenClaw', 'system 自述 OpenClaw 或带 mcp__openclaw__ 工具'],
+]
+
 /** Mirrors `hasClaudeCodeClientHeaders` + body checks in src/lib/identity/claude-code-only.mjs. */
 const CLAUDE_CODE_FINGERPRINT: [string, string][] = [
   ['UA', 'claude-cli/x.y.z'],
@@ -60,8 +65,15 @@ export function ProtocolPane({
   onInferenceChange: (patch: Block) => void
 }) {
   const strict = compat.claude_code_only === true
+  const countTokens = compat.count_tokens === true
   const relay = detectProxiedOfficialCcFromCompat(compat)
   const cch = cchEnabledFromCompat(compat)
+  const blockedClients =
+    compat.blocked_clients &&
+    typeof compat.blocked_clients === 'object' &&
+    !Array.isArray(compat.blocked_clients)
+      ? (compat.blocked_clients as Record<string, unknown>)
+      : {}
   return (
     <div className='space-y-4'>
       <PaneSection
@@ -121,6 +133,47 @@ export function ProtocolPane({
                 onCompatChange({ ...compat, official_cc_passthrough: on })
               }
               aria-label='官方 Claude Code 家族透传'
+            />
+          </SettingRow>
+          {BLOCKABLE_CLIENTS.map(([id, label, signature]) => {
+            const on = blockedClients[id] === true
+            return (
+              <SettingRow
+                key={id}
+                label={`拦截 ${label}`}
+                desc={
+                  on
+                    ? `开：识别为 ${label}（${signature}）的 Claude 请求在选号之前一律 403。注意这发生在第三方 system 搬移之前，等于主动放弃一条本来能成功的请求。`
+                    : `已关（推荐）：${label} 按普通请求放行。它追加的 system 块会被搬到首个 user 轮次后正常服务，不会因第三方应用判定被上游拒绝。`
+                }
+              >
+                <Switch
+                  checked={on}
+                  onCheckedChange={(next) =>
+                    onCompatChange({
+                      ...compat,
+                      blocked_clients: { ...blockedClients, [id]: next },
+                    })
+                  }
+                  aria-label={`拦截 ${label}`}
+                />
+              </SettingRow>
+            )
+          })}
+          <SettingRow
+            label='开放 count_tokens 入口'
+            desc={
+              countTokens
+                ? '开：POST /v1/messages/count_tokens 与面板按槽位的计数探测可用。只算 token，不绑定 sticky、不计费。'
+                : '已关：上述两个入口返回 404。实现一直在，这个开关只决定是否放行。'
+            }
+          >
+            <Switch
+              checked={countTokens}
+              onCheckedChange={(on) =>
+                onCompatChange({ ...compat, count_tokens: on })
+              }
+              aria-label='开放 count_tokens 入口'
             />
           </SettingRow>
         </div>
