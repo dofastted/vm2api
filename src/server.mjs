@@ -1519,6 +1519,20 @@ function endPanelStreams() {
 }
 
 const gracefulShutdown = createGracefulShutdown({
+  // A backup worker stuck in VACUUM INTO keeps process.exit() waiting on its thread; the database is
+  // closed by now and the snapshot is a scratch copy, so after a short grace exit hard.
+  exit: (code) => {
+    const deadline = Date.now() + 5_000
+    const tick = () => {
+      if (!backupService.busy) return process.exit(code)
+      if (Date.now() > deadline) {
+        console.warn('[shutdown] backup worker still busy; forcing exit')
+        return process.kill(process.pid, 'SIGKILL')
+      }
+      setTimeout(tick, 100)
+    }
+    tick()
+  },
   beforeDrain: async () => {
     endPanelStreams()
     geminiTerminalDrain = geminiTerminal.close()

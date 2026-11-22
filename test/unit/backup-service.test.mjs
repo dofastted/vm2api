@@ -257,3 +257,26 @@ test('abortRunning stops a backup in progress and frees the service for the next
   assert.equal(svc._running, false)
   assert.equal(await svc.abortRunning(), false, 'nothing left to stop')
 })
+
+test('killChildArchivers stops a tar this process spawned and leaves other children alone', { skip: process.platform !== 'linux' }, async () => {
+  const { killChildArchivers } = await import('../../src/lib/admin/backup-service.mjs')
+  const { spawn } = await import('node:child_process')
+  const bin = path.join(root, 'fakebin')
+  fs.mkdirSync(bin, { recursive: true })
+  fs.copyFileSync('/bin/sleep', path.join(bin, 'tar'))
+  fs.chmodSync(path.join(bin, 'tar'), 0o755)
+  const tar = spawn(path.join(bin, 'tar'), ['30'], { stdio: 'ignore' })
+  const other = spawn('/bin/sleep', ['30'], { stdio: 'ignore' })
+  const exited = (child) => new Promise((resolve) => child.once('exit', (code, signal) => resolve(signal)))
+  const tarExit = exited(tar)
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  try {
+    assert.equal(killChildArchivers(), 1)
+    assert.equal(await tarExit, 'SIGTERM')
+    assert.equal(other.exitCode, null)
+    assert.equal(other.signalCode, null)
+  } finally {
+    tar.kill('SIGKILL')
+    other.kill('SIGKILL')
+  }
+})
