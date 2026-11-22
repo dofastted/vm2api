@@ -11,6 +11,7 @@ const render = (status?: Partial<CragHostStatus>) =>
       status={status as CragHostStatus}
       busy={false}
       onUnbind={() => {}}
+      onClaim={() => {}}
     />
   )
 
@@ -43,6 +44,21 @@ describe('CragDeviceIdentity', () => {
     ] as const) {
       expect(render({ ready: true, state, device_uuid: UUID })).not.toContain(
         '注销本机订阅'
+      )
+    }
+  })
+
+  it('offers migration even with nothing here yet, because that is the normal case', () => {
+    // Replacing hardware means arriving at an empty machine. Gating the entry on
+    // having a subscription would hide it from exactly the host that needs it.
+    for (const state of [
+      'unredeemed',
+      'unavailable',
+      'active',
+      'expired',
+    ] as const) {
+      expect(render({ ready: true, state, device_uuid: UUID })).toContain(
+        '从其他设备迁移'
       )
     }
   })
