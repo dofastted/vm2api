@@ -7,6 +7,8 @@ export const BUILTIN_SOURCE = 'builtin-2026-10-14'
 
 const WEB_SEARCH = 0.01
 const OPENAI_LONG = 272_000
+// OpenAI uses Pacific time for the GPT-6.2 Ultrafast introductory rate.
+export const ULTRAFAST_PROMOTION_END = Date.parse('2027-03-01T00:00:00-08:00')
 
 function claude(input, output, cache_read, cache_5m, cache_1h, extra = {}) {
   return {
@@ -103,7 +105,22 @@ function gptImage() {
   return { ...tokenPrice(5, 0, 1.25, 0, 0), image: { input: 8, output: 30, cache_read: 2 } }
 }
 
+function openai62(input, output, cacheRead) {
+  return openaiFrom(
+    { input, output, cache_read: cacheRead, cache_write: input * 1.25 },
+    {
+      flex: [input * 0.5, output * 0.5, cacheRead * 0.5],
+      fast: [input * 2, output * 2, cacheRead * 2],
+      long_standard: [input * 2, output * 1.5, cacheRead * 2],
+      long_flex: [input, output * 0.75, cacheRead],
+      long_fast: [input * 4, output * 3, cacheRead * 4],
+    },
+  )
+}
+
 const OPENAI = {
+  'gpt-6.2-astra': openai62(8, 40, 0.4),
+  'gpt-6.2-sol': openai62(2, 10, 0.1),
   'gpt-6-astra': openaiFrom(
     { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
     {
@@ -338,6 +355,30 @@ export const BUILTIN_ALIASES = {
 }
 
 export const BUILTIN_RATES = { anthropic: ANTHROPIC, openai: OPENAI }
+
+// https://developers.openai.com/api/docs/pricing?latest-pricing=ultrafast
+const ULTRAFAST_MODELS = new Set(['gpt-6.2-astra', 'gpt-6.2-sol', 'gpt-6-astra', 'gpt-6.1-sol'])
+
+function scaleRates(band, multiplier) {
+  return tokenPrice(
+    band.input * multiplier,
+    band.output * multiplier,
+    band.cache_read * multiplier,
+    band.cache_5m * multiplier,
+    band.cache_1h * multiplier,
+  )
+}
+
+export function builtinRate(platform, id, at) {
+  const price = BUILTIN_RATES[platform]?.[id] || null
+  if (platform !== 'openai' || !ULTRAFAST_MODELS.has(id)) return price
+  const multiplier = id.startsWith('gpt-6.2-') && at < ULTRAFAST_PROMOTION_END ? 3 : 6
+  const ultrafast = {
+    ...scaleRates(price, multiplier),
+    tiers: price.tiers.map((tier) => ({ above: tier.above, ...scaleRates(tier, multiplier) })),
+  }
+  return { ...price, modes: { ...price.modes, ultrafast } }
+}
 
 export function builtinOf(id) {
   if (ANTHROPIC[id]) return { platform: 'anthropic', id, price: ANTHROPIC[id] }

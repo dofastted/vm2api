@@ -106,6 +106,19 @@ test('layer precedence: override provider/model > provider/* > */model > models.
   assert.equal(resolvePrice(id).source, 'override')
 })
 
+test('Ultrafast price overrides are resolved independently of the builtin promotion', () => {
+  const model = 'gpt-6.2-sol'
+  const during = Date.parse('2027-03-01T07:59:59.999Z')
+  assert.equal(resolvePrice(model, during).price.modes.ultrafast.output, 30)
+  assert.equal(resolvePrice(model, during + 1).price.modes.ultrafast.output, 60)
+  assert.equal(setPriceOverride(`openai/${model}`, FULL).ok, true)
+  assert.equal(resolvePrice(model, during).mode_sources.ultrafast, 'builtin')
+  assert.equal(resolvePrice(model, during).price.modes.ultrafast.output, 30)
+  assert.equal(setPriceOverride(`openai/${model}`, { ...FULL, modes: { ultrafast: FULL } }).ok, true)
+  assert.equal(resolvePrice(model, during + 1).mode_sources.ultrafast, 'override')
+  assert.equal(resolvePrice(model, during + 1).price.modes.ultrafast.output, FULL.output)
+})
+
 test('a provider/* override on a dated id keeps the canonical model builtin fast mode', () => {
   assert.equal(setPriceOverride('anthropic/*', FULL).ok, true)
   const hit = resolvePrice('claude-opus-5-5-20261001')
