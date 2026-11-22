@@ -228,6 +228,20 @@ export class ClusterManager {
     }
   }
 
+  /** Resolves once every pre-dialled link is ready, or at the timeout: `{ ready, total }`. */
+  async prewarmReady({ timeoutMs = 20_000, pollMs = 200 } = {}) {
+    const deadline = Date.now() + timeoutMs
+    const count = () => {
+      const links = [...this.prewarmed.values(), ...this.links.values()]
+      return { ready: links.filter((link) => link.state === 'ready').length, total: links.length }
+    }
+    for (;;) {
+      const now = count()
+      if (now.ready === now.total || Date.now() >= deadline) return now
+      await new Promise((resolve) => setTimeout(resolve, pollMs).unref?.())
+    }
+  }
+
   _attach(node) {
     const warm = this.prewarmed.get(node.id)
     this.prewarmed.delete(node.id)

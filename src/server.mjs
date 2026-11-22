@@ -1209,13 +1209,18 @@ if (STANDBY) {
   clusterManager.prewarmLinks()
   // Hash the slot image payloads now (read-only CPU). Otherwise the new leader does it on the event loop
   // as each node link comes up after activation (warmNodeSlotImages), stalling requests for seconds.
-  setTimeout(() => {
+  // `standby-warm` tells the deploy that activating now costs the first requests nothing.
+  setImmediate(async () => {
+    const startedAt = Date.now()
     for (const kernel of Object.keys(OS_CATALOG)) {
       try {
         slotImageSpec(cfg.paths.project, kernel)
       } catch {}
+      await new Promise((resolve) => setImmediate(resolve))
     }
-  }, 1000).unref()
+    const links = await clusterManager.prewarmReady({ timeoutMs: 20_000 })
+    console.log(JSON.stringify({ event: 'standby-warm', ms: Date.now() - startedAt, links }))
+  })
 }
 runAtActivation('cluster', () => {
   clusterManager.start()

@@ -189,6 +189,8 @@ test('standby pre-dials node links and activation adopts them instead of diallin
   assert.equal(manager.bridges.size, 0, 'standby binds no relay sockets')
   manager.prewarmLinks()
   assert.equal(manager.prewarmed.get('n1'), warm, 'idempotent')
+  const early = await manager.prewarmReady({ timeoutMs: 50, pollMs: 10 })
+  assert.deepEqual(early, { ready: 0, total: 1 }, 'an unreachable node is reported, not waited on forever')
   manager.start()
   assert.equal(manager.links.get('n1'), warm, 'activation adopts the pre-dialled link')
   assert.equal(manager.prewarmed.size, 0)
