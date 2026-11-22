@@ -1474,12 +1474,27 @@ async function handoverLeadership() {
     console.warn('[handover] foreign load writer failed', e?.message || e)
   }
   const unlocked = await controlPlaneFlock(['-u'])
+  endPanelStreams()
   console.log(JSON.stringify({ event: 'handover-released', ok: unlocked.status === 0, inflight: gracefulShutdown.getActiveCount() }))
   return unlocked.status === 0
 }
 
+// Panel live streams (/api/panel/pool/stream) never end on their own. A controller that is handing over or
+// shutting down ends them, so an open panel tab does not hold the drain for its whole timeout; the browser
+// reconnects (through haproxy, to the leader) and polls meanwhile.
+const panelStreams = new Set()
+function endPanelStreams() {
+  for (const res of panelStreams) {
+    try {
+      res.end()
+    } catch {}
+  }
+  panelStreams.clear()
+}
+
 const gracefulShutdown = createGracefulShutdown({
   beforeDrain: async () => {
+    endPanelStreams()
     geminiTerminalDrain = geminiTerminal.close()
     // A handed-over controller keeps recording usage for the streams it is still finishing.
     if (handoverRole() !== 'draining') installJevUsageRecorder(null)
@@ -1530,6 +1545,10 @@ const server = http.createServer(async (req, res) => {
       return json(res, 503, {
         error: { type: 'overloaded_error', code: `controller_${role}`, message: 'Gateway is switching versions; retry shortly' },
       })
+    }
+    if (p === '/api/panel/pool/stream' || (p.startsWith('/api/panel/') && String(req.headers.accept || '').includes('text/event-stream'))) {
+      panelStreams.add(res)
+      res.once('close', () => panelStreams.delete(res))
     }
     if (gracefulShutdown.isShuttingDown()) {
       res.setHeader('Connection', 'close')
