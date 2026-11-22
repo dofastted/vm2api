@@ -714,7 +714,7 @@ def read_native_tui_pid(path):
 
 class NativeAgy(Agy):
     def __init__(self, host, environment, proxy_url, auth, model, prompt):
-        self.credentials, self.token_bytes = auth
+        self.credentials, _ = auth
         self.model, self.prompt = model, prompt
         self.native_dir = None
         self.native_token = None
@@ -723,15 +723,9 @@ class NativeAgy(Agy):
         self.native_tui_pgid = None
         self.native_tui_start = None
         self.native_invocation = None
-        super().__init__(host, environment, proxy_url)
-
-    def initialize_home(self, home):
-        super().initialize_home(home)
-        settings = home / ".gemini" / "antigravity-cli"
-        token = settings / TOKEN_NAME
-        token.write_bytes(self.token_bytes)
-        os.chown(token, self.uid, self.uid)
-        self.token_bytes = None
+        # CLI onboarding and project state belong to the authorized profile, not the token alone.
+        profile = host.directory / environment["id"] / environment["profile"]
+        super().__init__(host, environment, proxy_url, profile=profile)
 
     def launch_cli(self, argv, size):
         self.native_dir = self.directory / "native"
@@ -788,6 +782,8 @@ class NativeAgy(Agy):
                 "plan",
                 "--model",
                 self.model,
+                "--settings",
+                json.dumps(CLI_SETTINGS, separators=(",", ":")),
             ]
         )
         native_module_impl = native_module()
@@ -848,7 +844,6 @@ class NativeAgy(Agy):
             },
             secrets=self.credentials,
         )
-        self.token_bytes = None
         self.prompt = None
         self.credentials = ()
 
@@ -909,7 +904,6 @@ class NativeAgy(Agy):
             finally:
                 self.pid = None
                 self.native_tui_pid = None
-                self.token_bytes = None
                 self.credentials = ()
                 self.prompt = None
                 super().close(preserve)
