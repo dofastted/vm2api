@@ -98,6 +98,7 @@ import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.m
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { canReuseCanonicalHistory } from './sanitize.mjs'
 import { hasForeignSystemBlock, relocateThirdPartySystem, thirdPartyRelocateEnabled } from './third-party-system.mjs'
+import { blockedClientError, blockedClientFor } from '../identity/blocked-clients.mjs'
 import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
 import {
   callerCwdDeclaration,
@@ -809,6 +810,21 @@ export function createHandleProtocol(deps) {
       const errorResult = claudeCodeOnlyError()
       logBag.final_state = 'claude_code_only'
       logBag.error_code = ErrorCode.CLAUDE_CODE_ONLY
+      logBag.error_message = errorResult.body?.error?.message || null
+      res.statusCode = errorResult.status
+      return json(res, errorResult.status, errorResult.body)
+    }
+    // Per-client switches, independent of claude_code_only: some clients run the official
+    // CLI and append their own agent prompt, which Anthropic bills as a third-party app.
+    const blockedClient =
+      !panelDiagnostics && detectInboundPlatform(inbound?.model).platform === 'anthropic'
+        ? blockedClientFor(inbound, routingNow)
+        : null
+    if (blockedClient) {
+      stats.errors++
+      const errorResult = blockedClientError(blockedClient)
+      logBag.final_state = 'client_blocked'
+      logBag.error_code = ErrorCode.CLIENT_BLOCKED
       logBag.error_message = errorResult.body?.error?.message || null
       res.statusCode = errorResult.status
       return json(res, errorResult.status, errorResult.body)
