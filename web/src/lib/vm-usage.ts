@@ -267,6 +267,8 @@ export function vmTotalTokens(vm: Vm, accounts?: UsageAccountRow[]): number {
 export type VmLedgerRow = {
   key: '5h' | '7d' | 'total'
   label: string
+  /** 总计行的口径说明（账号总计 / 保留日志合计），作为悬停提示。 */
+  note?: string
   cost: number
   tokens: number
 }
@@ -283,7 +285,8 @@ export function vmCostLedger(
     { key: '7d', label: '7D', cost: cost.d7, tokens: tok.d7 },
     {
       key: 'total',
-      label: vm.lifetime_usage ? '账号总计' : '保留日志合计',
+      label: '总计',
+      note: vm.lifetime_usage ? '账号总计' : '保留日志合计',
       cost: vmTotalCost(vm, accounts),
       tokens: vmTotalTokens(vm, accounts),
     },

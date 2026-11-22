@@ -94,7 +94,8 @@ describe('vm cost ledger labels', () => {
       lifetime_usage: { cost: 12, tokens: 30 },
     } as never)
     expect(archived[2]).toMatchObject({
-      label: '账号总计',
+      label: '总计',
+      note: '账号总计',
       cost: 12,
       tokens: 30,
     })
@@ -104,7 +105,8 @@ describe('vm cost ledger labels', () => {
       [{ account_id: 'vm-2', vm_id: 'vm-2', total_cost: 19, total_tokens: 41 }]
     )
     expect(retained[2]).toMatchObject({
-      label: '保留日志合计',
+      label: '总计',
+      note: '保留日志合计',
       cost: 19,
       tokens: 41,
     })
