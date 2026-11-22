@@ -2992,3 +2992,88 @@ test('native V2 idle reload distinguishes runnable ceiling from live tool waits'
     resetWrapRecycleState()
   }
 })
+
+// One health probe that is neither ready nor busy is re-probed briefly before the
+// request fails; a kernel that really stays down still fails and is logged.
+
+function withFakeKernelBin(t) {
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  t.after(() => {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  })
+}
+
+unixTest('a local kernel that is briefly neither ready nor busy is re-probed before failing', async (t) => {
+  withFakeKernelBin(t)
+  let probes = 0
+  const fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    probes++
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: probes < 3 ? 0 : 1 }))
+  })
+  t.after(() => fx.close())
+  const prepared = await prepareInferenceHop({
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    routing: { inference: { health_ttl_ms: 0, kernel_down_reprobe_ms: 2000 } },
+  })
+  assert.equal(prepared.ready?.ok, true)
+  assert.equal(prepared.ready?.reason, 'ready_after_reprobe')
+  assert.equal(probes, 3)
+})
+
+unixTest('a local kernel that stays down still fails, and what it reported is logged', async (t) => {
+  withFakeKernelBin(t)
+  const fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0 }))
+  })
+  t.after(() => fx.close())
+  const warn = t.mock.method(console, 'warn', () => {})
+  const started = Date.now()
+  const prepared = await prepareInferenceHop({
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    routing: { inference: { health_ttl_ms: 0, kernel_down_reprobe_ms: 700 } },
+  })
+  assert.equal(prepared.ready?.ok, false)
+  assert.equal(prepared.ready?.reason, 'kernel_unavailable')
+  assert.match(prepared.ready?.error || '', /rust kernel is down/)
+  assert.ok(Date.now() - started < 3000)
+  const logged = warn.mock.calls
+    .map((call) => String(call.arguments[0]))
+    .find((line) => line.includes('rust_kernel_down'))
+  assert.ok(logged, 'outage logged')
+  assert.match(logged, /"ready_slots":0/)
+  assert.match(logged, /"probes":[1-9]/)
+})
+
+unixTest('re-probe off (kernel_down_reprobe_ms: 0) keeps the immediate failure', async (t) => {
+  withFakeKernelBin(t)
+  let probes = 0
+  const fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    probes++
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0 }))
+  })
+  t.after(() => fx.close())
+  t.mock.method(console, 'warn', () => {})
+  const prepared = await prepareInferenceHop({
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    routing: { inference: { health_ttl_ms: 0, kernel_down_reprobe_ms: 0 } },
+  })
+  assert.equal(prepared.ready?.reason, 'kernel_unavailable')
+  assert.equal(probes, 1)
+})
