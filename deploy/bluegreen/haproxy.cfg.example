@@ -1,0 +1,35 @@
+# vm2api 蓝绿前置：公网端口 → blue / green，同一时刻只有一个 ready。
+# bg-deploy.sh 通过 admin socket 切换（set server app/<color> state ready|drain|maint；drain 不断已有连接），
+# 状态存 server-state-file，reload 不丢。把 127.0.0.1 / 端口换成 bg.env 里的 BG_HOST / BG_*_PORT。
+# 不做健康检查：控制面意外重启时 haproxy 按 retries 重试（约 30s）而不是立刻 503。
+global
+    log /dev/log local0
+    maxconn 20000
+    stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+    server-state-file /var/lib/haproxy/server-state
+
+defaults
+    mode http
+    log global
+    option dontlognull
+    option http-keep-alive
+    option redispatch
+    load-server-state-from-file global
+    retries 30
+    timeout connect 1s
+    timeout client 3700s
+    timeout server 3700s
+    timeout http-request 120s
+    timeout http-keep-alive 130s
+    timeout queue 60s
+    timeout tunnel 3700s
+
+frontend fe
+    # 对外端口（PUBLIC_BASE_URL 指向这里）
+    bind :8787
+    default_backend app
+
+backend app
+    default-server maxconn 4000
+    server blue  127.0.0.1:8788
+    server green 127.0.0.1:8789 disabled
