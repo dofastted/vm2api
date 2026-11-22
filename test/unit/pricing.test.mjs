@@ -410,6 +410,39 @@ test('GPT service_tier flex / priority pick the published band', () => {
   assert.equal(calculateCost({ input_tokens: 300_000, service_tier: 'priority' }, 'gpt-5.5').known, false)
 })
 
+test('Ultrafast bills the sent tier even when Codex echoes default', () => {
+  const usage = {
+    input_tokens: 100_000,
+    output_tokens: 100_000,
+    service_tier: 'ultrafast',
+    upstream_service_tier: 'default',
+  }
+  const at = Date.parse('2027-03-01T07:59:59.999Z')
+  const promo = calculateCost(usage, 'gpt-6.2-sol', at)
+  assert.equal(promo.mode, 'ultrafast')
+  assert.equal(promo.total_cost, 3.6)
+  assert.equal(costColumnsFromUsage(usage, 'gpt-6.2-sol', null, at).service_tier, 'ultrafast')
+  assert.equal(calculateCost(usage, 'gpt-6.2-sol', at + 1).total_cost, 7.2)
+  assert.equal(calculateCost(usage, 'gpt-6.1-sol', at).total_cost, 7.2)
+  assert.equal(calculateCost(usage, 'gpt-6-luna', at).known, false)
+})
+
+test('Ultrafast selects long rates above 272K including cached input', () => {
+  const usage = {
+    input_tokens: 272_000,
+    output_tokens: 100_000,
+    input_tokens_details: { cached_tokens: 100_000 },
+    service_tier: 'ultrafast',
+  }
+  const at = Date.parse('2026-11-22T00:00:00Z')
+  assert.equal(calculateCost(usage, 'gpt-6.2-sol', at).long_context, false)
+  const long = calculateCost({ ...usage, input_tokens: 300_000 }, 'gpt-6.2-sol', at)
+  assert.equal(long.long_context, true)
+  assert.equal(long.input_cost, 2.4)
+  assert.equal(long.cache_read_cost, 0.06)
+  assert.equal(long.output_cost, 4.5)
+})
+
 test('GPT tier the model does not offer, or unknown tier, stays unpriced', () => {
   assert.equal(calculateCost({ input_tokens: 10, service_tier: 'flex' }, 'gpt-5.3-codex').known, false)
   assert.equal(calculateCost({ input_tokens: 10, service_tier: 'scale' }, 'gpt-5.5').known, false)

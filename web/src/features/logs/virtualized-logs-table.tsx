@@ -64,29 +64,34 @@ function HeadCell({
 }
 
 function CostBadges({ row }: { row: UsageLogRow }) {
-  const fast = hasFastMode(row)
+  const speed =
+    row.serviceTier === 'ultrafast'
+      ? 'Ultrafast'
+      : hasFastMode(row)
+        ? 'fast'
+        : null
   const context1m = Boolean(row.context1mApplied)
-  if (fast && context1m) {
+  if (speed && context1m) {
     return (
       <Badge
         variant='outline'
         className='gap-0 px-0.5 text-[9px] leading-3'
-        title='fast + 1M 上下文'
+        title={`${speed} + 1M 上下文`}
       >
-        <span className='text-orange-700 dark:text-orange-300'>fast</span>
+        <span className='text-orange-700 dark:text-orange-300'>{speed}</span>
         <span className='text-muted-foreground'>·</span>
         <span className='text-purple-700 dark:text-purple-300'>1M</span>
       </Badge>
     )
   }
-  if (fast) {
+  if (speed) {
     return (
       <Badge
         variant='outline'
         className={FAST_BADGE}
-        title='优先服务等级（fast 模式）'
+        title={`发送档位 ${speed}`}
       >
-        fast
+        {speed}
       </Badge>
     )
   }

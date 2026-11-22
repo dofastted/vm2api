@@ -143,18 +143,9 @@ function specialSettings(row) {
     out.push({ key: 'mismatch', label: '模型重定向', value: `${row.requested_model} → ${row.upstream_model}` })
   if (row.speed === 'fast') out.push({ key: 'fast', label: 'Fast 模式', value: row.speed })
   if (row.service_tier === 'priority') out.push({ key: 'priority', label: 'Priority', value: row.service_tier })
-  // Sent priority, upstream echoed another tier: Codex did not serve it as Fast (#777).
-  if (
-    (row.service_tier === 'priority' || row.service_tier === 'fast') &&
-    row.upstream_service_tier &&
-    row.upstream_service_tier !== 'priority' &&
-    row.upstream_service_tier !== 'fast'
-  )
-    out.push({
-      key: 'tier_downgrade',
-      label: 'Fast 未生效',
-      value: `${row.service_tier} → ${row.upstream_service_tier}`,
-    })
+  if (row.service_tier === 'ultrafast') out.push({ key: 'ultrafast', label: 'Ultrafast', value: row.service_tier })
+  if (['priority', 'fast', 'ultrafast'].includes(row.service_tier) && row.upstream_service_tier)
+    out.push({ key: 'upstream_service_tier', label: '上游档位回显', value: row.upstream_service_tier })
   if (row.long_context === 1) out.push({ key: 'context1m', label: '1M 上下文' })
   if (row.via && row.via !== DEFAULT_VIA) out.push({ key: 'via', label: '路由', value: row.via })
   return out

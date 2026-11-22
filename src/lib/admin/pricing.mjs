@@ -25,7 +25,7 @@ export function normalizeOpenaiServiceTier(raw) {
     .trim()
     .toLowerCase()
   if (!t || t === 'default' || t === 'standard' || t === 'auto') return 'standard'
-  if (t === 'flex') return 'flex'
+  if (t === 'flex' || t === 'ultrafast') return t
   if (t === 'fast' || t === 'priority') return 'fast'
   return null
 }
@@ -155,9 +155,7 @@ function emptyCost(extra = {}) {
 function openaiBillingMode(usage) {
   const tier = normalizeOpenaiServiceTier(usage.service_tier)
   if (!tier) return { tier: null, mode: null }
-  if (tier === 'flex') return { tier, mode: 'flex' }
-  if (tier === 'fast') return { tier, mode: 'priority' }
-  return { tier, mode: 'standard' }
+  return { tier, mode: tier === 'fast' ? 'priority' : tier }
 }
 
 function selectBand(price, mode, prompt) {
@@ -187,10 +185,10 @@ function selectBand(price, mode, prompt) {
  * Official standard cost for one request's usage object.
  * After normalizeUsage, input_tokens is the uncached bucket for every vendor.
  */
-export function calculateCost(usage = {}, model = null) {
+export function calculateCost(usage = {}, model = null, at) {
   const u = normalizeUsage(usage)
   const mid = model || u.model || u.upstream_model || u.requested_model || ''
-  const resolved = resolvePrice(mid)
+  const resolved = resolvePrice(mid, at)
   const outputTokens = n(u.output_tokens)
   const cacheRead = n(u.cache_read_tokens)
   const { cache5m, cache1h } = cacheSplit(u)
@@ -366,7 +364,7 @@ export function imageCostFromUsage(usage, imageModel = null) {
  * `image` = `{ usage, model, only }`: image generation usage on the same row. `only` marks an
  * Images endpoint row, which has no text-model usage. Either part unpriced → the whole row is.
  */
-export function costColumnsFromUsage(usage, model, image = null) {
+export function costColumnsFromUsage(usage, model, image = null, at) {
   const img = image ? imageCostFromUsage(image.usage, image.model) : null
   const band = billingBandFromUsage(normalizeUsage(usage))
   if (image?.only) {
@@ -386,7 +384,7 @@ export function costColumnsFromUsage(usage, model, image = null) {
       long_context: known ? 0 : null,
     }
   }
-  const c = calculateCost(usage, model)
+  const c = calculateCost(usage, model, at)
   const known = c.known && (!img || img.known)
   return {
     input_cost: known ? c.input_cost : null,

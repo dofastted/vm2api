@@ -3,10 +3,16 @@
  * ID matching is exact / alias / Claude date-strip — no fuzzy family regex.
  */
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { BUILTIN_ALIASES, BUILTIN_RATES, BUILTIN_SOURCE } from './builtin-rates.mjs'
+import {
+  BUILTIN_ALIASES,
+  BUILTIN_RATES,
+  BUILTIN_SOURCE,
+  ULTRAFAST_PROMOTION_END,
+  builtinRate,
+} from './builtin-rates.mjs'
 
 export const PRICE_FIELDS = ['input', 'output', 'cache_read', 'cache_5m', 'cache_1h']
-export const MODE_NAMES = ['fast', 'flex', 'priority']
+export const MODE_NAMES = ['fast', 'flex', 'priority', 'ultrafast']
 export const MODELS_DEV_URL = 'https://models.dev/api.json'
 export const MODELS_DEV_TIMEOUT_MS = 30_000
 export const MODELS_DEV_MAX_BYTES = 64 * 1024 * 1024
@@ -454,11 +460,11 @@ function pickOverride(platform, id, overrides) {
   return null
 }
 
-function resolveLayers(platform, id, catalog) {
+function resolveLayers(platform, id, catalog, at) {
   if (!platform || !id) return null
   const ov = pickOverride(platform, id, catalog.overrides)
   const md = catalog.snap?.[platform]?.[id]
-  const builtin = BUILTIN_RATES[platform]?.[id] || null
+  const builtin = builtinRate(platform, id, at)
   let base = null
   let source = null
   let version = null
@@ -505,9 +511,9 @@ function pricesDiffer(a, b) {
   return false
 }
 
-function makeEntry(platform, id, catalog) {
-  const resolved = resolveLayers(platform, id, catalog)
-  const builtin = BUILTIN_RATES[platform]?.[id] || null
+function makeEntry(platform, id, catalog, at) {
+  const resolved = resolveLayers(platform, id, catalog, at)
+  const builtin = builtinRate(platform, id, at)
   const md = catalog.snap?.[platform]?.[id] || null
   const ov = pickOverride(platform, id, catalog.overrides)
   return {
@@ -529,7 +535,9 @@ function makeEntry(platform, id, catalog) {
 }
 
 function loadCatalog() {
-  if (catalogMemo) return catalogMemo
+  const now = Date.now()
+  const promotionActive = now < ULTRAFAST_PROMOTION_END
+  if (catalogMemo?.promotionActive === promotionActive) return catalogMemo
   const overrides = readOverrides()
   const snap = readSnapshot() || {}
   const seen = new Set()
@@ -539,7 +547,7 @@ function loadCatalog() {
     const key = `${platform}/${id}`
     if (seen.has(key)) return
     seen.add(key)
-    entries.push(makeEntry(platform, id, { overrides, snap }))
+    entries.push(makeEntry(platform, id, { overrides, snap }, now))
   }
   for (const platform of ['anthropic', 'openai']) {
     for (const id of Object.keys(BUILTIN_RATES[platform] || {})) add(platform, id)
@@ -554,7 +562,7 @@ function loadCatalog() {
     add(platform, id)
   }
   entries.sort((a, b) => a.platform.localeCompare(b.platform) || a.id.localeCompare(b.id))
-  catalogMemo = { entries, overrides, snap }
+  catalogMemo = { entries, overrides, snap, promotionActive }
   return catalogMemo
 }
 
@@ -567,7 +575,7 @@ function hasExactLayer(platform, id, catalog) {
   )
 }
 
-export function resolvePrice(rawModel) {
+export function resolvePrice(rawModel, at = Date.now()) {
   const platform = platformOfModel(rawModel)
   const candidates = catalogIdCandidates(rawModel, platform)
   const catalog = loadCatalog()
@@ -578,10 +586,10 @@ export function resolvePrice(rawModel) {
   const hasOverride = (p, c) => !!(catalog.overrides[`${p}/${c}`] || catalog.overrides[`*/${c}`])
   for (const p of plats) {
     const id = candidates.find((c) => hasOverride(p, c)) || candidates.find((c) => hasExactLayer(p, c, catalog))
-    if (id) return resolveLayers(p, id, catalog)
+    if (id) return resolveLayers(p, id, catalog, at)
   }
   for (const p of plats) {
-    const got = candidates.length ? resolveLayers(p, candidates[0], catalog) : null
+    const got = candidates.length ? resolveLayers(p, candidates[0], catalog, at) : null
     if (got) return got
   }
   maybeRefreshModelsDev()
