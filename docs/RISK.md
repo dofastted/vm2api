@@ -1,6 +1,6 @@
 # 风险审计
 
-适用于 Messages、Chat Completions、Completions 和 Responses 的文本推理。面板入口是「风险审计」。本地 `count_tokens` 处理器也复用前置关卡，但生产 HTTP 路由当前仍返回 404。
+适用于 Messages、Chat Completions、Completions 和 Responses 的文本推理。面板入口是「风险审计」。`count_tokens` 入口（受 `routing.compatibility.count_tokens` 控制，默认关时返回 404）开启后也复用同一套前置关卡。
 
 - **前置**：配置蒸馏、硬正则、拒答缓存、封禁和禁用工具。账号范围在这里设置，同时作用于适用的前置规则和 Jev。
 - **Jev**：配置决策模型、评分和降级放行，查看模型调用用量。

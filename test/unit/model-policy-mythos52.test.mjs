@@ -16,7 +16,12 @@ import {
   isCatalogModelId,
   validateOfficialModel,
 } from '../../src/lib/protocol/models.mjs'
-import { prepareAnthropicRequest } from '../../src/lib/protocol/anthropic-policy.mjs'
+import {
+  modelSupportsMidConversationSystem,
+  prepareAnthropicRequest,
+} from '../../src/lib/protocol/anthropic-policy.mjs'
+import { officialModelLine } from '../../src/lib/identity/official-profiles.mjs'
+import { loggedReasoningEffort } from '../../src/lib/protocol/thinking.mjs'
 import { officialMessagesBody } from '../../src/lib/protocol/anthropic-messages.mjs'
 import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
 import { withRequestProtocolBetas } from '../../src/lib/protocol/claude-code-betas.mjs'
@@ -117,4 +122,16 @@ test('API and CRAG assembly keep the Mythos id and use the Fable 5.2 protocol pa
       assert.deepEqual(body.crag_model.capabilities, finalize(fable).crag_model.capabilities)
     }
   }
+})
+
+test('Mythos 5.2 and Fable 5.2 align on mid-conversation system, official model sentence, and catalog effort', () => {
+  for (const id of [model, dotted, fable, 'claude-fable-5.2']) {
+    assert.equal(modelSupportsMidConversationSystem(id), true, id)
+  }
+  assert.equal(
+    officialModelLine(model),
+    'You are powered by the model named Mythos 5.2. The exact model ID is claude-mythos-5-2. Assistant knowledge cutoff is June 2026.',
+  )
+  assert.equal(loggedReasoningEffort({ model }), 'medium')
+  assert.equal(loggedReasoningEffort({ model: fable }), 'medium')
 })

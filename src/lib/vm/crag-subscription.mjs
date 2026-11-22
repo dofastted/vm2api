@@ -1327,11 +1327,12 @@ export function createCragSubscription({
   // migrate it by order id -- the only handle that survives losing this machine.
   //
   // Degrades instead of failing: the Authority's redeem request rejects unknown
-  // fields, so an instance newer than the Authority would have every redemption die
-  // on `order_id` alone. Worse, that 400 is not in `authorityErrors` and so arrives
-  // as `crag_subscription_authority_unavailable`, which reads as "result unconfirmed,
-  // retry" and would never resolve. Recording the order only matters for a migration
-  // that has not happened yet; it must never block the redemption in front of us.
+  // fields with `invalid_request` (400), so an instance newer than the Authority
+  // would have every redemption die on `order_id` alone. Mapping `invalid_request`
+  // in `authorityErrors` lets us tell that shape rejection apart from a 502
+  // transport/availability failure and retry once without `order_id`. Recording
+  // the order only matters for a migration that has not happened yet; it must
+  // never block the redemption in front of us.
   async function redeemAtAuthority(hostId, intent, enrollment) {
     const body = { redemption_code: intent.redemption_code, ...enrollment }
     // Both paths carry a real shop order id: `order_id` on an order-driven activation

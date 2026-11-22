@@ -407,7 +407,6 @@ function isCredentialDeath(policy) {
   return policy?.action === 'disable' || policy?.reason === 'oauth_no_refresh' || policy?.reason === 'oauth_revoked'
 }
 
-/** Empty / thinking-only hop: replayable on another seat. Never a restart signal. */
 /**
  * The kernel's job watchdog gave up after 180s without one CLI frame. The slot itself may be fine,
  * so this says something about the request rather than the seat.
@@ -473,6 +472,7 @@ function oversizeForSlotResult({ requestBytes, ceilingBytes, retryAfterSec }) {
   }
 }
 
+/** Empty / thinking-only hop: replayable on another seat. Never a restart signal. */
 function isRetryableEmptyHop(policy) {
   return policy?.reason === 'incomplete_assistant' || policy?.reason === 'empty_response'
 }
