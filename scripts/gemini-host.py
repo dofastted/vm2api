@@ -791,6 +791,7 @@ class NativeAgy(Agy):
             ]
         )
         native_module_impl = native_module()
+        self.native_exit_reader = native_module_impl.read_launcher_exit
         try:
             lock, vt = native_module_impl.query_free_vt(
                 self.host.directory / "native-vt.lock"
@@ -885,6 +886,14 @@ class NativeAgy(Agy):
                 if self.native_tui is not None:
                     self._stop_process_group(self.native_tui)
                     self.native_tui = None
+                    outcome = self.native_exit_reader(self.native_dir, self.uid)
+                    if outcome is not None:
+                        child, status = outcome
+                        kind = "exit_code" if status >= 0 else "signal"
+                        print(
+                            f"Gemini native child={child} {kind}={abs(status)}",
+                            file=sys.stderr,
+                        )
             finally:
                 self.pid = None
                 self.native_tui_pid = None

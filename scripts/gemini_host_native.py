@@ -23,6 +23,8 @@ TURN_TIMEOUT = 125
 TOKEN = re.compile(r"[!-~]{24,4096}\Z")
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+LAUNCHER_EXIT_FILE = "launcher-exit"
+LAUNCHER_EXIT = re.compile(rb"(craggemini|agy) (-?[0-9]{1,3})\n")
 
 
 class NativeFailure(Exception):
@@ -389,6 +391,39 @@ class NativeInvocation:
         self._process = None
 
 
+def read_launcher_exit(directory, uid):
+    try:
+        descriptor = os.open(
+            directory / LAUNCHER_EXIT_FILE,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != uid
+                or info.st_nlink != 1
+            ):
+                return None
+            match = LAUNCHER_EXIT.fullmatch(stream.read(32))
+    except OSError:
+        return None
+    if match is not None:
+        status = int(match[2])
+        if -signal.NSIG < status <= 255:
+            return match[1].decode("ascii"), status
+    return None
+
+
+def _record_launcher_exit(directory, name, returncode):
+    try:
+        with open(f"{directory}/{LAUNCHER_EXIT_FILE}", "x", encoding="ascii") as stream:
+            stream.write(f"{name} {returncode}\n")
+    except OSError:
+        # Diagnostic I/O must not replace the child's exit or bypass cleanup.
+        pass
+
+
 def _launch_native(argv):
     # Both children must use the same PID namespace and procfs: the worker
     # compares SO_PEERCRED with the PID reported by the in-process adapter.
@@ -410,6 +445,8 @@ def _launch_native(argv):
                 break
             time.sleep(0.025)
         else:
+            if worker.returncode is not None:
+                _record_launcher_exit(directory, "craggemini", worker.returncode)
             return 1
         tui = subprocess.Popen(
             argv,
@@ -423,6 +460,9 @@ def _launch_native(argv):
         pid, status = os.wait()
         child = worker if pid == worker.pid else tui
         child.returncode = os.waitstatus_to_exitcode(status)
+        _record_launcher_exit(
+            directory, "craggemini" if child is worker else "agy", child.returncode
+        )
         return child.returncode if child.returncode >= 0 else 128 - child.returncode
     finally:
         for child in (tui, worker):
