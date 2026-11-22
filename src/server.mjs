@@ -7,7 +7,8 @@
  * OAuth import it may spawn official Claude Code once (slot SOCKS5) to seed
  * ~/.claude.json and complete a plan turn.
  */
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
+import { handoverRole, setHandoverRole, setOverlap, markExclusive, deferredKeys } from './lib/core/handover.mjs'
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -135,7 +136,7 @@ import {
   probeWorkerAttemptGuard,
   repairLocalCredentialLink,
 } from './lib/transport/go-worker-client.mjs'
-import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
+import { requestKernelReloadWhenIdle, stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
 import { corsHeadersForRequest } from './lib/http/cors.mjs'
 import { isConsoleEntry, tryServeWebDist } from './lib/http/web-dist.mjs'
@@ -188,6 +189,50 @@ if (!getPanelAdmin().password) {
 // Egress state lives under the project root even when SQLite uses KIN_DATA_DIR.
 const stateDir = path.join(cfg.paths.project, 'data')
 const inheritedLockFd = process.env.VM2API_BOOTSTRAP_LOCK_FD
+// Blue/green deploys: KIN_STANDBY=1 boots the HTTP server, DB and api-kernel but defers every
+// background job that mutates shared state (credential refresh, watchdogs, cluster links,
+// restart-policy sync ...) until SIGUSR2. Two live controllers would otherwise race on token
+// rotation. The old controller stops its jobs in beforeDrain, so activate the new one after SIGTERM.
+// KIN_STANDBY_ACTIVE_FILE: written by the deploy script once this controller was activated, so a
+// container restart after cutover boots straight into the active role instead of waiting for SIGUSR2.
+const STANDBY =
+  process.env.KIN_STANDBY === '1' &&
+  !(process.env.KIN_STANDBY_ACTIVE_FILE && fs.existsSync(process.env.KIN_STANDBY_ACTIVE_FILE))
+const standbyTasks = []
+let standbyActive = !STANDBY
+if (STANDBY) setHandoverRole('standby')
+function runAtActivation(name, fn) {
+  if (!STANDBY || standbyActive) return fn()
+  standbyTasks.push({ name, fn })
+  return undefined
+}
+let activating = false
+async function activateStandby(reason = 'signal') {
+  if (standbyActive || activating) return false
+  activating = true
+  // The leader released the lock on SIGUSR1; wait briefly in case its release is still in flight.
+  const lock = await controlPlaneFlock(['-w', String(Number(process.env.KIN_STANDBY_LOCK_WAIT_SEC) || 30), '-E', '75'])
+  activating = false
+  if (lock.status !== 0) {
+    console.error(JSON.stringify({ event: 'standby-activate-failed', reason: lock.status === 75 ? 'lock_busy' : lock.stderr }))
+    return false
+  }
+  standbyActive = true
+  setHandoverRole('leader')
+  // The old controller is still finishing its streams: hold back anything that would cut them.
+  setOverlap(true)
+  console.log(JSON.stringify({ event: 'standby-activate', reason, tasks: standbyTasks.map((t) => t.name) }))
+  for (const { name, fn } of standbyTasks.splice(0)) {
+    try {
+      const out = fn()
+      if (out && typeof out.catch === 'function') out.catch((e) => console.warn(`[standby] ${name} failed`, e?.message || e))
+    } catch (e) {
+      console.warn(`[standby] ${name} failed`, e?.message || e)
+    }
+  }
+  console.log(JSON.stringify({ event: 'standby-activated' }))
+  return true
+}
 const syncWrapAtStartup =
   inheritedLockFd !== undefined &&
   process.env.VM2API_BOOTSTRAP_WRAP_CHANGED === '1' &&
@@ -208,14 +253,29 @@ if (inheritedLockFd !== undefined) {
     throw new Error('vm2api_control_plane_lock_failed: bootstrap fd does not identify project data')
   }
 }
-const lock = spawnSync('flock', ['-n', '-E', '75', '3'], {
-  stdio: ['ignore', 'ignore', 'pipe', controlPlaneFd],
-  encoding: 'utf8',
-})
-if (lock.status !== 0) {
-  fs.closeSync(controlPlaneFd)
-  if (lock.status === 75) throw new Error('vm2api_control_plane_already_running: stop the other controller first')
-  throw new Error(`vm2api_control_plane_lock_failed: ${lock.error?.message || lock.stderr?.trim() || lock.signal}`)
+// A standby boots next to the leader and takes the lock only at activation (after the leader's SIGUSR1).
+if (!STANDBY) {
+  const lock = spawnSync('flock', ['-n', '-E', '75', '3'], {
+    stdio: ['ignore', 'ignore', 'pipe', controlPlaneFd],
+    encoding: 'utf8',
+  })
+  if (lock.status !== 0) {
+    fs.closeSync(controlPlaneFd)
+    if (lock.status === 75) throw new Error('vm2api_control_plane_already_running: stop the other controller first')
+    throw new Error(`vm2api_control_plane_lock_failed: ${lock.error?.message || lock.stderr?.trim() || lock.signal}`)
+  }
+}
+// flock(1) on fd 3 acts on our open file description, so the lock stays with this process.
+function controlPlaneFlock(args) {
+  return new Promise((resolve) => {
+    const child = spawn('flock', [...args, '3'], { stdio: ['ignore', 'ignore', 'pipe', controlPlaneFd] })
+    let stderr = ''
+    child.stderr.on('data', (d) => {
+      stderr += d
+    })
+    child.on('error', (e) => resolve({ status: -1, stderr: e.message }))
+    child.on('exit', (status) => resolve({ status, stderr: stderr.trim() }))
+  })
 }
 fs.mkdirSync(cfg.paths.captures, { recursive: true })
 
@@ -418,10 +478,12 @@ if (routingConfig?.logging) {
     mutedErrorClasses: routingConfig.logging.muted_error_classes,
   })
 }
-try {
-  requestLog.cleanup()
-} catch {}
-requestLog.startCleanupScheduler()
+runAtActivation('request-log-cleanup', () => {
+  try {
+    requestLog.cleanup()
+  } catch {}
+  requestLog.startCleanupScheduler()
+})
 
 // Set once the cluster manager exists; node local rows probe through it.
 let localEgressCluster = null
@@ -453,12 +515,16 @@ proxyPool = new ProxyPool({
   repairEgress: (proxy, shouldStart) => ensureProxyEgress(cfg.paths.project, proxy, { shouldStart }),
 })
 // An upgrade replaces bin/ files; slots mounting data/run/slot-guest-bin must see the new ones.
-try {
-  refreshSlotGuestBinDir(cfg.paths.project)
-} catch (err) {
-  console.warn('[bootstrap] slot-guest-bin refresh failed:', err?.message || err)
+// A blue/green standby has not refreshed bin/ yet: the exclusive pass does this after the sync.
+function refreshGuestBin() {
+  try {
+    refreshSlotGuestBinDir(cfg.paths.project)
+  } catch (err) {
+    console.warn('[bootstrap] slot-guest-bin refresh failed:', err?.message || err)
+  }
 }
-proxyPool.startScheduler()
+if (!STANDBY) refreshGuestBin()
+runAtActivation('proxy-pool', () => proxyPool.startScheduler())
 
 // 首次安装的出口池是空的，槽没有可绑出口就起不来。本机出口永远成立，先补上。
 try {
@@ -747,7 +813,7 @@ backupService.onRestored((db) => {
   reloadActiveVm(cfg)
   vmTestSchedule.reload()
 })
-backupService.startScheduler()
+runAtActivation('backup', () => backupService.startScheduler())
 
 const stats = {
   requests: 0,
@@ -1119,8 +1185,10 @@ const clusterManager = new ClusterManager({
 localEgressCluster = clusterManager
 bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
 await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
-clusterManager.start()
-clusterManager.restoreSlotRelays()
+runAtActivation('cluster', () => {
+  clusterManager.start()
+  return clusterManager.restoreSlotRelays()
+})
 // Live memory pressure per machine: new conversations avoid hosts low on MemAvailable (overcommit guard).
 const hostMemoryPressure = installHostMemoryPressure(
   createHostMemoryPressure({
@@ -1129,14 +1197,18 @@ const hostMemoryPressure = installHostMemoryPressure(
     readNode: (id) => clusterManager.nodeHostMemory(id),
   }),
 )
-hostMemoryPressure.start()
-syncNodeLocalEgress()
-if (proxyPool.snapshot().config.ipv6_enabled !== true) {
-  const exits = await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)
-  for (const exit of exits.filter((item) => !item.ok)) {
-    console.warn('[ipv6-policy] exit not blocked', exit.vm_id || exit.proxy_id, exit.error)
+runAtActivation('host-memory', () => hostMemoryPressure.start())
+async function syncBootEgress() {
+  syncNodeLocalEgress()
+  if (proxyPool.snapshot().config.ipv6_enabled !== true) {
+    const exits = await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)
+    for (const exit of exits.filter((item) => !item.ok)) {
+      console.warn('[ipv6-policy] exit not blocked', exit.vm_id || exit.proxy_id, exit.error)
+    }
   }
 }
+if (STANDBY) runAtActivation('egress-sync', syncBootEgress)
+else await syncBootEgress()
 const clusterRoutes = createClusterRoutes({ manager: clusterManager, json, readBody, ok: panel.ok })
 const slotShell = createSlotShell({
   projectRoot: cfg.paths.project,
@@ -1317,12 +1389,22 @@ const handlePanel = createPanelHandler({
 })
 
 let geminiTerminalDrain
-const gracefulShutdown = createGracefulShutdown({
-  beforeDrain: async () => {
-    geminiTerminalDrain = geminiTerminal.close()
-    installJevUsageRecorder(null)
+// Timers started in the leader-only background block; stopped at handover or on server close.
+const leaderStoppers = []
+function onLeaderStop(fn) {
+  leaderStoppers.push(fn)
+}
+let leaderJobsStopped = false
+function stopLeaderJobs() {
+  if (leaderJobsStopped) return
+  leaderJobsStopped = true
+  for (const fn of leaderStoppers.splice(0)) {
     try {
-      vmTestSchedule.stop()
+      fn()
+    } catch {}
+  }
+  try {
+    vmTestSchedule.stop()
     } catch {}
     try {
       backupService.stopScheduler()
@@ -1355,6 +1437,25 @@ const gracefulShutdown = createGracefulShutdown({
     try {
       notifyMonitor?.stop?.()
     } catch {}
+}
+
+// Blue/green step 2 (SIGUSR1): stop every leader job and hand the data-dir lock to the standby.
+// The listener stays open, so requests arriving before haproxy switches over are still served.
+async function handoverLeadership() {
+  if (handoverRole() !== 'leader' || !standbyActive) return false
+  stopLeaderJobs()
+  setHandoverRole('draining')
+  const unlocked = await controlPlaneFlock(['-u'])
+  console.log(JSON.stringify({ event: 'handover-released', ok: unlocked.status === 0, inflight: gracefulShutdown.getActiveCount() }))
+  return unlocked.status === 0
+}
+
+const gracefulShutdown = createGracefulShutdown({
+  beforeDrain: async () => {
+    geminiTerminalDrain = geminiTerminal.close()
+    // A handed-over controller keeps recording usage for the streams it is still finishing.
+    if (handoverRole() !== 'draining') installJevUsageRecorder(null)
+    stopLeaderJobs()
   },
   afterDrain: async () => {
     // Let host cleanup finish without extending shutdown to the launch deadline.
@@ -1366,7 +1467,8 @@ const gracefulShutdown = createGracefulShutdown({
       stopAllRustKernels()
     } catch {}
     try {
-      await clusterManager.stop()
+      // After a handover the relay socket paths belong to the new leader: close ours, leave the files.
+      await clusterManager.stop({ unlink: handoverRole() !== 'draining' })
     } catch {}
     try {
       closeDatabase()
@@ -1388,6 +1490,18 @@ const server = http.createServer(async (req, res) => {
       return json(res, 400, { error: { message: 'Invalid URL', type: 'invalid_request' } })
     }
     const p = url.pathname
+    const role = handoverRole()
+    if (role !== 'leader' && (p === '/health' || p === '/healthz')) {
+      // haproxy keeps a standby/draining server out of rotation by state, not by health.
+      if (!(role === 'draining' && gracefulShutdown.isShuttingDown())) return json(res, 200, { status: 'ok', role })
+    }
+    if (role === 'standby' || (role === 'draining' && (p.startsWith('/admin') || p.startsWith('/api/panel')))) {
+      // Admin writes go only to the leader; a standby serves nothing until it holds the lock.
+      res.setHeader('Connection', 'close')
+      return json(res, 503, {
+        error: { type: 'overloaded_error', code: `controller_${role}`, message: 'Gateway is switching versions; retry shortly' },
+      })
+    }
     if (gracefulShutdown.isShuttingDown()) {
       res.setHeader('Connection', 'close')
       if (p === '/health' || p === '/healthz') {
@@ -1655,9 +1769,39 @@ process.on('unhandledRejection', (e) => console.error('[unhandled]', e))
 // Graceful shutdown on termination signals (Issue #376).
 process.on('SIGTERM', () => gracefulShutdown.shutdown('SIGTERM'))
 process.on('SIGINT', () => gracefulShutdown.shutdown('SIGINT'))
+process.on('SIGUSR2', () => void activateStandby('SIGUSR2'))
+process.on('SIGUSR1', () => void handoverLeadership())
+// Blue/green step 6 (SIGHUP to the new leader): the old controller has exited. Now refresh the
+// shared binaries this image ships (the standby skipped that), then run what the overlap held back.
+// Kernels pick up a new wrap only when idle, so this leader's own streams are not cut.
+let exclusivePass = null
+function runExclusivePass() {
+  if (handoverRole() !== 'leader' || exclusivePass) return exclusivePass
+  exclusivePass = (async () => {
+    const keys = deferredKeys()
+    const synced = spawnSync('/usr/local/bin/vm2api-entrypoint', ['sync'], { encoding: 'utf8', timeout: 120_000 })
+    const wrapChanged = /WRAP_CHANGED=1/.test(synced.stdout || '')
+    if (synced.status !== 0) console.error(`[handover] shared sync failed: ${(synced.stderr || '').trim().slice(-300)}`)
+    refreshGuestBin()
+    const done = await markExclusive()
+    if (process.env.KIN_CRS_MOCK !== '1') await clusterManager.refreshGates().catch(() => {})
+    if (wrapChanged && process.env.KIN_AUTO_SYNC_WRAP === '1') {
+      const summary = await syncInstalledKernels({
+        project: cfg.paths.project,
+        routingConfig,
+        body: { restart: true },
+        restartKernel: (exec) => requestKernelReloadWhenIdle(exec),
+      }).catch((e) => ({ ok: false, error: e?.message || String(e) }))
+      console.log(JSON.stringify({ event: 'handover-wrap-sync', ok: summary?.ok !== false }))
+    }
+    console.log(JSON.stringify({ event: 'handover-exclusive', synced: synced.status === 0, wrapChanged, deferred: keys, done }))
+  })()
+  return exclusivePass
+}
+process.on('SIGHUP', () => void runExclusivePass())
 
 if (process.env.KIN_CRS_MOCK !== '1') {
-  syncLocalSlotRestartPolicies(listVms(cfg.paths.project), { routing: routingConfig })
+  runAtActivation('restart-policies', () => syncLocalSlotRestartPolicies(listVms(cfg.paths.project), { routing: routingConfig }))
 }
 await bootApiKernel(cfg)
 server.keepAliveTimeout = 120_000
@@ -1665,6 +1809,7 @@ server.headersTimeout = 125_000
 server.timeout = 0
 
 server.listen(cfg.port, cfg.host, () => {
+  runAtActivation('background', () => {
   if (process.env.KIN_CRS_MOCK !== '1') {
     void cragSubscription.recover().catch(() => {
       console.warn('[crag-subscription] startup recovery failed; use the administrator panel to retry')
@@ -1674,7 +1819,7 @@ server.listen(cfg.port, cfg.host, () => {
         console.warn('[crag-subscription] expired quota refresh deferred')
       })
     const timer = setInterval(refresh, 1_000).unref()
-    server.once('close', () => clearInterval(timer))
+    onLeaderStop(() => clearInterval(timer))
     refresh()
   }
   if (cragShopActivationEnabled) {
@@ -1683,7 +1828,7 @@ server.listen(cfg.port, cfg.host, () => {
         console.warn('[crag-shop] activation polling deferred')
       })
     const timer = setInterval(poll, 2_000).unref()
-    server.once('close', () => clearInterval(timer))
+    onLeaderStop(() => clearInterval(timer))
     poll()
   }
   // An unpaid checkout link outliving its payment window is part of the order
@@ -1695,7 +1840,7 @@ server.listen(cfg.port, cfg.host, () => {
         console.warn('[crag-shop] order expiry deferred')
       })
     const timer = setInterval(expireOrders, 60_000).unref()
-    server.once('close', () => clearInterval(timer))
+    onLeaderStop(() => clearInterval(timer))
     expireOrders()
   }
   // Installation intent is durable; reconnecting nodes must not depend on a lost HTTP callback.
@@ -1724,7 +1869,7 @@ server.listen(cfg.port, cfg.host, () => {
     void resume()
     const timer = setInterval(resume, 15_000)
     timer.unref()
-    server.once('close', () => clearInterval(timer))
+    onLeaderStop(() => clearInterval(timer))
   }
   // Keep authorized CRAGGemini native kernels & resident agy slots warm across restarts.
   if (process.env.KIN_CRS_MOCK !== '1') {
@@ -1805,6 +1950,7 @@ server.listen(cfg.port, cfg.host, () => {
   } catch (e) {
     console.warn('[notify] start failed', e?.message || e)
   }
+  })
   const addr = server.address()
   const boundPort = typeof addr === 'object' && addr ? addr.port : cfg.port
   try {
@@ -1829,9 +1975,10 @@ server.listen(cfg.port, cfg.host, () => {
       features: pub.features,
       capabilities: GATEWAY_CAPABILITIES,
       rewrite: cfg.rewrite.enabled,
+      standby: STANDBY,
     }),
   )
-  if (syncWrapAtStartup) {
+  if (syncWrapAtStartup) runAtActivation('wrap-sync', () => {
     // Stay in the owning process: an HTTP request could hit a different controller after a failed start.
     void Promise.resolve()
       .then(() => syncInstalledKernels({ project: cfg.paths.project, routingConfig, body: { restart: true } }))
@@ -1841,5 +1988,5 @@ server.listen(cfg.port, cfg.host, () => {
         else console.error(`vm2api: wrap-cli slot sync failed (${summary})`)
       })
       .catch((error) => console.error(`vm2api: wrap-cli slot sync failed: ${error?.message || error}`))
-  }
+  })
 })

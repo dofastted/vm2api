@@ -5,6 +5,7 @@
  */
 
 import { hostMemoryPressureOf } from './host-memory-pressure.mjs'
+import { deferUntilExclusive } from '../core/handover.mjs'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import net from 'node:net'
@@ -190,7 +191,7 @@ export class ClusterManager {
     this._directTimer.unref?.()
   }
 
-  async stop() {
+  async stop({ unlink = true } = {}) {
     clearInterval(this._healthTimer)
     this._healthTimer = null
     clearInterval(this._directTimer)
@@ -199,7 +200,7 @@ export class ClusterManager {
     this.directState.clear()
     for (const link of this.links.values()) link.stop()
     const relays = [...this.bridges.values(), ...[...this.slotRelays.values()].flatMap((r) => [r.kernel, r.worker])]
-    await Promise.all(relays.map((r) => r.stop().catch(() => {})))
+    await Promise.all(relays.map((r) => r.stop({ unlink }).catch(() => {})))
     this.links.clear()
     this.bridges.clear()
     this.slotRelays.clear()
@@ -518,6 +519,11 @@ export class ClusterManager {
     }
   }
 
+  /** Re-check every connected node's gate (after a deploy refreshed bin/kin-slot-gate). */
+  async refreshGates() {
+    for (const id of [...this.links.keys()]) await this._ensureGate(id).catch(() => {})
+  }
+
   async _ensureGate(id, { strict = false } = {}) {
     if (this.nodePlatform(id) === 'darwin') return
     const cfg = this.repo.getDirectLink(id)
@@ -528,6 +534,7 @@ export class ClusterManager {
       const host = await this.remoteHost(id)
       const result = await ensureNodeGate({ client, host, docker: sshDocker(client) }, cfg, this.gateBin)
       if (link.client !== client || !this._directConfigMatches(id, cfg)) return
+      if (result.deferred) deferUntilExclusive(`gate:${id}`, () => this._ensureGate(id))
       if (result.certSha256 !== cfg.certSha256) {
         this.repo.setDirectLinkCert(id, result.certSha256)
         this.directProbes.delete(id)
