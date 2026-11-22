@@ -684,6 +684,7 @@ export class RequestLogStore {
             ? clampBody(extra.inbound_body, this.maxDebugBodyChars)
             : null,
         hop_meta: extra.hop_meta || null,
+        batch_member: extra.batch_member || null,
         via: extra.via || extra.hop_meta?.via || null,
         outbound_summary: extra.outbound_summary || null,
         cache_prefix: extra.cache_prefix || null,

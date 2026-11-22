@@ -130,7 +130,15 @@ import {
   explicitParentSessionId,
   isParentSessionCompanion,
   isShortProbeRequest,
+  scopeStickyKey,
 } from '../pool/sticky-router.mjs'
+import {
+  BatchGroups,
+  batchGroupAppliesToKey,
+  batchGroupKey,
+  batchMemberSeatKey,
+  mergeBatchGroupConfig,
+} from '../pool/batch-group.mjs'
 import {
   applyCrsUnofficialPersona,
   detectProxiedOfficialCcFromRoutingFile,
@@ -246,6 +254,10 @@ export function createHandleProtocol(deps) {
   const cfg = deps.cfg
   const requestLog = deps.requestLog
   const stickyRouter = deps.stickyRouter
+  const getBatchGroups = () =>
+    (deps.batchGroups ||= new BatchGroups({
+      onExpire: (memberKey) => stickyRouter?.unbind?.(scopeStickyKey(memberKey, 'anthropic')),
+    }))
   const accountQuota = deps.accountQuota
   const apiKeyStore = deps.apiKeyStore
   const apiScheduler = deps.apiScheduler
@@ -1456,7 +1468,7 @@ export function createHandleProtocol(deps) {
     // holding a session seat the main conversation needs.
     const seatless = isProbe || isShortProbeRequest(inbound)
     // Seat = this client session. Same device, other session = other slot.
-    const seatKey = seatless
+    let seatKey = seatless
       ? null
       : summarySession
         ? `seat:sess:${summarySession}`
@@ -1475,8 +1487,38 @@ export function createHandleProtocol(deps) {
           stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
           stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
         }
-    const stickyKey = sessionKeys.stickyKey || null
-    const stickyKeys = sessionKeys.stickyKeys || []
+    // Sessionless batch traffic: stick (key, workload) to a small elastic group
+    // of accounts instead of fanning out over the pool. See pool/batch-group.mjs.
+    let batchPick = null
+    let batchApplied = false
+    const batchCfg = mergeBatchGroupConfig(getRouting()?.batch_group)
+    if (
+      batchGroupAppliesToKey(batchCfg, req.apiKeyRecord?.id) &&
+      !seatless &&
+      !summarySession &&
+      !callerSession &&
+      !stickyDeviceId &&
+      seatKey
+    ) {
+      const workload = String(req.headers['x-heyroute-user'] || '').trim()
+      const groupKey = batchGroupKey({
+        keyId: req.apiKeyRecord?.id,
+        seatKey,
+        workloadId: /^[A-Za-z0-9_-]{8,128}$/.test(workload) ? workload : '',
+      })
+      if (groupKey) {
+        batchPick = getBatchGroups().acquire(groupKey, batchCfg)
+        res.once('close', batchPick.release)
+        logBag.batch_member = `${groupKey}#${batchPick.index}${batchCfg.observe ? ' (observe)' : ''}`
+        if (!batchCfg.observe) {
+          batchApplied = true
+          seatKey = batchMemberSeatKey(groupKey, batchPick.index)
+        }
+      }
+    }
+    const batchStickyKey = batchApplied ? scopeStickyKey(batchPick.memberKey, 'anthropic') : null
+    const stickyKey = batchStickyKey || sessionKeys.stickyKey || null
+    const stickyKeys = batchStickyKey ? [batchStickyKey] : sessionKeys.stickyKeys || []
     const deviceKey = stickyDeviceId ? stickyRouter?.canonicalDeviceKey?.(stickyDeviceId) || null : null
     const parentSession = explicitParentSessionId(inbound, req.headers)
     const familySession = parentSession || callerSession

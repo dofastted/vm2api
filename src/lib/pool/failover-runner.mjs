@@ -1,3 +1,4 @@
+import { isBatchMemberKey } from './batch-group.mjs'
 import {
   classifyUpstreamResult,
   isFableModel,
@@ -996,7 +997,7 @@ export class FailoverRunner {
     let avoid = null
     // keep_session_home: the continuing conversation's account for this
     // request is the one its first attempt ran on.
-    const keepHome = this.config.keep_session_home === true && !pinVmId && !!stickyKey
+    const keepHome = this.config.keep_session_home === true && !pinVmId && !!stickyKey && !isBatchMemberKey(stickyKey)
     const continuing = !subagent && keepHome && !!this.stickyRouter?.resolve?.(stickyKey)?.accountId
     let homeAccountId = null
     let homeRetryPending = false
