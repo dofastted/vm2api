@@ -1,12 +1,18 @@
 """Run in a disposable Linux amd64 guest with a free VT, bwrap and openvt.
 
-Usage: sudo python3 -B test/deploy/gemini-host-native-launch-smoke.py PAYLOAD_DIR
+Usage: sudo python3 -B test/deploy/gemini-host-native-launch-smoke.py PAYLOAD_DIR [--fifo-backpressure]
 PAYLOAD_DIR is an already verified payload with pinned agy and the native adapter.
 The test uses loopback only and must run with external egress disabled.
+The FIFO option limits the pipe to 4 KiB and blocks a real host HTTP request;
+the pinned CLI must still finish the native fixture turn before it is released.
 """
 
+import fcntl
+import http.client
 import importlib.util
 import os
+import socket
+import socketserver
 import sys
 import tempfile
 import threading
@@ -46,11 +52,74 @@ class Upstream(BaseHTTPRequestHandler):
         )
 
 
-def main(payload):
+def block_host_request(host, run):
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+    endpoint = str(run.directory / "blocked.sock")
+
+    class Blocker:
+        def request(self, operation, body):
+            assert operation == "get"
+            entered.set()
+            assert release.wait(15)
+            return {}
+
+    def client():
+        try:
+            with socket.socket(socket.AF_UNIX) as transport:
+                transport.settimeout(18)
+                transport.connect(endpoint)
+                connection = http.client.HTTPConnection("localhost")
+                connection.sock = transport
+                connection.request("POST", "/get", "{}")
+                assert connection.getresponse().status == 200
+        except BaseException as error:
+            errors.append(repr(error))
+
+    def observe():
+        try:
+            assert entered.wait(3)
+            run.native_invocation._process.wait(timeout=12)
+            result = run.native_invocation.poll()
+            assert result["state"] == "completed", result
+            assert result["text"] == "launcher smoke", result
+            capacity = fcntl.fcntl(run.native_diagnostic.descriptor, fcntl.F_GETPIPE_SZ)
+            print(f"CLI completed while host request blocked; FIFO capacity={capacity}")
+        except BaseException as error:
+            errors.append(repr(error))
+        finally:
+            release.set()
+
+    with socketserver.UnixStreamServer(endpoint, host.ControlHandler) as server:
+        server.host = Blocker()
+        server.timeout = 20
+        caller, observer = threading.Thread(target=client), threading.Thread(
+            target=observe
+        )
+        observer.start()
+        caller.start()
+        server.handle_request()
+        caller.join(timeout=20)
+        observer.join(timeout=20)
+    assert not errors, errors
+
+
+def main(payload, fifo_backpressure=False):
     source = Path(__file__).resolve().parents[2] / "scripts/gemini-host.py"
     spec = importlib.util.spec_from_file_location("gemini_host", source)
     host = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(host)
+    if fifo_backpressure:
+        native = host.native_module()
+        original = native.EligibilityDiagnostic
+
+        class SmallPipe(original):
+            def __init__(self, directory, uid):
+                super().__init__(directory, uid)
+                fcntl.fcntl(self.descriptor, fcntl.F_SETPIPE_SZ, 4096)
+
+        native.EligibilityDiagnostic = SmallPipe
+        host.native_module = lambda: native
     with tempfile.TemporaryDirectory(dir="/run", prefix="gemini-launch-") as root:
         directory = Path(root)
         directory.chmod(0o711)
@@ -70,6 +139,7 @@ def main(payload):
             run.prompt = "Say hello"
             run.credentials = ()
             run.native_tui = run.native_invocation = run.pid = None
+            run.native_diagnostic = None
             run.native_tui_pid = run.native_tui_pgid = run.native_tui_start = None
             run.egress = SimpleNamespace(poll=lambda: None)
             run.terminal = run.network_lock = None
@@ -132,6 +202,8 @@ def main(payload):
                     ],
                     (80, 25),
                 )
+                if fifo_backpressure:
+                    block_host_request(host, run)
                 deadline = time.monotonic() + 50
                 while time.monotonic() < deadline:
                     result = run.poll()
@@ -152,4 +224,6 @@ def main(payload):
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]).resolve())
+    if sys.argv[2:] not in ([], ["--fifo-backpressure"]):
+        raise SystemExit("expected PAYLOAD_DIR [--fifo-backpressure]")
+    main(Path(sys.argv[1]).resolve(), bool(sys.argv[2:]))

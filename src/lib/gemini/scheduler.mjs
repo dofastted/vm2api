@@ -210,7 +210,7 @@ export function createGeminiScheduler({ callHost, resolveProxy, poolScheduler, a
             'gemini_api_key_invalid',
             'gemini_location_unsupported',
             'gemini_model_unavailable',
-          ].includes(code)
+          ].includes(failure?.code)
         ) {
           poolScheduler?.unitCircuit?.recordFailure?.(selected.accountId)
         } else if (selected) {

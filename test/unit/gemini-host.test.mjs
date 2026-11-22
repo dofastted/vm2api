@@ -854,6 +854,60 @@ test('Gemini gateway uses shared account reservations and each selected environm
   assert.equal(pool.inflight.size, 0)
 })
 
+test('a selected Gemini location rejection stays HTTP 403 and releases the half-open probe', async () => {
+  const account = {
+    id: 'gemini-location',
+    auth_state: 'authorized',
+    auth_method: 'oauth',
+    proxy_id: 'px-location',
+    models_discovered: true,
+    models: [model],
+  }
+  const pool = new PoolScheduler()
+  const accountId = `gemini:${account.id}`
+  let now = 1000
+  pool.unitCircuit.now = () => now
+  pool.unitCircuit.configure({ failureThreshold: 1, openMs: 1000 })
+  pool.unitCircuit.recordFailure(accountId)
+  now = 2001
+  const scheduler = createGeminiScheduler({
+    poolScheduler: pool,
+    resolveProxy: () => proxyUrl,
+    callHost: async (operation, input) => {
+      if (operation === 'list') return { payload_state: 'installed', environments: [account] }
+      assert.equal(input.id, account.id)
+      if (operation === 'get') return account
+      if (operation === 'test-chat') return { run_id: runId }
+      if (operation === 'test-chat-status') {
+        assert.equal(pool.unitCircuit.inspect(accountId).reason, 'circuit_probe')
+        return { state: 'failed', text: '', error: { code: 'gemini_location_unsupported' } }
+      }
+      assert.fail(`unexpected Gemini host operation: ${operation}`)
+    },
+  })
+  const handle = createGeminiPublicHandler({
+    json: (_res, status, body) => ({ status, body }),
+    readBody: async (req) => req.body,
+    scheduler,
+  })
+  const result = await handle(
+    {
+      method: 'POST',
+      url: '/v1/chat/completions',
+      body: { model, messages: [{ role: 'user', content: 'hello' }] },
+      apiKeyKind: 'managed',
+      apiKeyRecord: { group_type: 'gemini' },
+      once() {},
+    },
+    { setHeader() {}, once() {} },
+  )
+  assert.equal(result.status, 403)
+  assert.equal(result.body.error.code, 'gemini_location_unsupported')
+  assert.deepEqual(pool.unitCircuit.inspect(accountId), { ok: true, state: 'half_open', probeAvailable: true })
+  assert.equal(pool.unitCircuit.snapshot(accountId).failures, 1)
+  assert.equal(pool.inflight.size, 0)
+})
+
 test('client disconnect cancels the Gemini run without recording a circuit failure', async () => {
   const account = {
     id: 'gemini-abort-0123456789abcdef01234567',
@@ -1189,11 +1243,11 @@ test('host installer refuses an unsigned manifest and never activates damaged pa
   await writeFile(path.join(source, 'libagy_bridge.so'), 'bad')
   await assert.rejects(installGeminiPayload(source, destination, verificationKey), /gemini_payload_member_mismatch/)
   await assert.rejects(writeFile(path.join(destination, 'unexpected'), 'no'), { code: 'ENOENT' })
-  for (const version of ['0.3.0-rc.2', '0.3.0-rc.3']) {
+  for (const version of ['0.3.0-rc.2', '0.3.0-rc.3', '0.3.0-rc.4']) {
     const bytes = Buffer.from(JSON.stringify({ ...manifest, version }))
     await writeFile(path.join(source, 'manifest.json'), bytes)
     await writeFile(path.join(source, 'manifest.sig'), sign(null, bytes, privateKey))
-    if (version === '0.3.0-rc.2') {
+    if (version !== '0.3.0-rc.4') {
       assert.equal((await readSignedGeminiManifest(source, verificationKey)).manifest.version, version)
     } else {
       await assert.rejects(readSignedGeminiManifest(source, verificationKey), /gemini_payload_invalid_manifest/)
