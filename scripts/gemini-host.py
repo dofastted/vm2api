@@ -866,7 +866,10 @@ class NativeAgy(Agy):
         result = self.native_invocation.poll()
         if result["state"] == "completed":
             return result
-        diagnostic = self.native_diagnostic.poll()
+        wrapper_exited = self.native_tui is None or self.native_tui.poll() is not None
+        diagnostic = self.native_diagnostic.poll(
+            final=wrapper_exited or result["state"] != "running"
+        )
         if diagnostic is not None:
             return {
                 "state": "failed",
@@ -875,7 +878,7 @@ class NativeAgy(Agy):
             }
         if result["state"] != "running":
             return result
-        if self.native_tui is None or self.native_tui.poll() is not None:
+        if wrapper_exited:
             return {
                 "state": "failed",
                 "text": "",
@@ -924,9 +927,11 @@ class NativeAgy(Agy):
                 self.native_tui_pid = None
                 self.credentials = ()
                 self.prompt = None
-                if self.native_diagnostic is not None:
-                    self.native_diagnostic.close()
-                super().close(preserve)
+                try:
+                    if self.native_diagnostic is not None:
+                        self.native_diagnostic.close()
+                finally:
+                    super().close(preserve)
 
     @staticmethod
     def _stop_process_group(process):

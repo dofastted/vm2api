@@ -11,6 +11,7 @@ import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
 from http.client import HTTPResponse
 
@@ -29,7 +30,7 @@ ELIGIBILITY_LOG_FILE = "cli-diagnostic"
 
 
 class EligibilityDiagnostic:
-    """One run's CLI log stream; retain no raw diagnostic on disk."""
+    """One run's bounded CLI stream, independent of the host request loop."""
 
     def __init__(self, directory, uid):
         path = directory / ELIGIBILITY_LOG_FILE
@@ -39,42 +40,89 @@ class EligibilityDiagnostic:
         self.pending = bytearray()
         self.discard_line = False
         self.code = None
-
-    def poll(self):
-        # Bound both memory and work on each host poll, including oversized lines.
-        remaining = 64 * 1024
-        while self.descriptor is not None and remaining:
-            try:
-                chunk = os.read(self.descriptor, min(4096, remaining))
-            except BlockingIOError:
-                break
-            if not chunk:
-                break
-            remaining -= len(chunk)
-            for piece in chunk.splitlines(keepends=True):
-                ended = piece.endswith(b"\n")
-                if not self.discard_line:
-                    if len(self.pending) + len(piece) > 4096:
-                        self.pending.clear()
-                        self.discard_line = True
-                    else:
-                        self.pending.extend(piece)
-                if ended:
-                    if not self.discard_line and re.fullmatch(
-                        rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
-                        rb"Account ineligible: [^\r\n]{0,256}not eligible for Antigravity, "
-                        rb"because it is not currently available in your location\.\r?\n",
-                        self.pending,
-                    ):
-                        self.code = "gemini_location_unsupported"
-                    self.pending.clear()
-                    self.discard_line = False
-        return self.code
-
-    def close(self):
-        if self.descriptor is not None:
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._snapshot_requested = threading.Event()
+        self._snapshot_ready = threading.Event()
+        self._thread = threading.Thread(
+            target=self._drain, name="gemini-cli-diagnostic", daemon=True
+        )
+        try:
+            self._thread.start()
+        except BaseException:
             os.close(self.descriptor)
             self.descriptor = None
+            raise
+
+    def _consume(self, chunk):
+        for piece in chunk.splitlines(keepends=True):
+            ended = piece.endswith(b"\n")
+            if not self.discard_line:
+                if len(self.pending) + len(piece) > 4096:
+                    self.pending.clear()
+                    self.discard_line = True
+                else:
+                    self.pending.extend(piece)
+            if ended:
+                if not self.discard_line and re.fullmatch(
+                    rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
+                    rb"Account ineligible: [^\r\n]{0,256}not eligible for Antigravity, "
+                    rb"because it is not currently available in your location\.\r?\n",
+                    self.pending,
+                ):
+                    with self._lock:
+                        self.code = "gemini_location_unsupported"
+                self.pending.clear()
+                self.discard_line = False
+
+    def _drain(self):
+        descriptor = self.descriptor
+        try:
+            while not self._stop.is_set():
+                readable, _, _ = select.select([descriptor], [], [], 0.1)
+                if not readable:
+                    if self._snapshot_requested.is_set():
+                        self._snapshot_requested.clear()
+                        self._snapshot_ready.set()
+                    continue
+                # Limit each batch so a continuous writer cannot starve shutdown.
+                remaining = 64 * 1024
+                while remaining and not self._stop.is_set():
+                    try:
+                        chunk = os.read(descriptor, min(4096, remaining))
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    self._consume(chunk)
+                if remaining and self._snapshot_requested.is_set():
+                    self._snapshot_requested.clear()
+                    self._snapshot_ready.set()
+        finally:
+            os.close(descriptor)
+            self._snapshot_ready.set()
+
+    def poll(self, *, final=False):
+        with self._lock:
+            code = self.code
+        if final and code is None and self.descriptor is not None:
+            # Do not miss a terminal line already queued as the child exits.
+            self._snapshot_ready.clear()
+            self._snapshot_requested.set()
+            self._snapshot_ready.wait(timeout=0.25)
+        with self._lock:
+            return self.code
+
+    def close(self):
+        if self.descriptor is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=2)
+        if self._thread.is_alive():
+            raise RuntimeError("Gemini diagnostic drainer did not stop")
+        # The reader owns the descriptor until it exits; never race fd reuse.
+        self.descriptor = None
         self.pending.clear()
 
 

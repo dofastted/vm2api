@@ -79,4 +79,6 @@ OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进�
 
 对已选中环境的失败回合，调度器必须保留宿主错误码；`gemini_location_unsupported` 应返回 HTTP 403，并释放半开熔断探针而不记为基础设施失败。排查公网 `503 gemini_host_unavailable` 时应单独跟踪该请求，不能仅凭另一回合的地区拒绝日志归因。
 
-原生 CLI 通过 `--log-file` 写入当前回合私有目录的 FIFO，不写入或读取共享 profile 的 `cli.log`。宿主每次最多读取 64 KiB，单行最多保留 4 KiB，只识别 `server_oauth.go` 的明确地区资格拒绝并转成 `gemini_location_unsupported`；未知、超长或跨回合文本不用于归因，原始日志不落盘、不返回客户端。已完成的模型结果优先；否则当前回合白名单诊断优先于 wrapper 或 worker 的通用错误。离线联测覆盖真实子进程写入、宿主终态、Unix socket、公开 HTTP 403 和探针释放，不代表生产请求已经验证通过。
+原生 CLI 通过 `--log-file` 写入当前回合私有目录的 FIFO，不写入或读取共享 profile 的 `cli.log`。每回合有独立排空线程，每批最多读取 64 KiB，单行最多保留 4 KiB；不依赖同步宿主请求循环，避免另一条请求阻塞时卡住 CLI 日志写入。线程只保留 `server_oauth.go` 明确地区资格拒绝的固定错误码 `gemini_location_unsupported`；未知、超长或跨回合文本不用于归因，原始日志不落盘、不返回客户端。失败终态最多等待 250 ms 获取已经排入 FIFO 的诊断快照；清理时停止并等待线程退出，再回收描述符，避免与 fd 复用竞争。已完成的模型结果优先；否则本回合白名单诊断优先于通用错误。
+
+在一次性 Linux amd64 环境、禁止外部网络的条件下，运行 `sudo python3 -B test/deploy/gemini-host-native-launch-smoke.py PAYLOAD_DIR --fifo-backpressure`。它把 FIFO 缩至 4 KiB，使用固定官方 CLI、`openvt`、`bwrap` 和 loopback 上游，并阻塞真实宿主 HTTP 请求；原生 fixture 回合必须在该请求释放前完成。单元联测另覆盖 256 KiB 日志突发、线程停止、资格错误到公开 HTTP 403 及探针释放；这些测试不代表生产 OAuth 推理已经验收。

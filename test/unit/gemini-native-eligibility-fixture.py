@@ -34,6 +34,8 @@ LOCATION = (
 if sys.argv[1] == "--cli":
     assert sys.argv[2] == "--log-file"
     with open(sys.argv[3], "wb", buffering=0) as stream:
+        # Larger than a pipe: this host request waits without ever polling the run.
+        stream.write(b"x" * (256 * 1024) + b"\n")
         stream.write(b"unrecognized fixture-secret log\n")
         stream.write(LOCATION[:97])
         stream.write(LOCATION[97:])
@@ -50,20 +52,23 @@ current = native.EligibilityDiagnostic(root / "current", os.getuid())
 other = native.EligibilityDiagnostic(root / "other", os.getuid())
 try:
     assert current.poll() is None
-    os.write(current.descriptor, b"prefix " + LOCATION)
+    current._consume(b"prefix " + LOCATION)
     assert current.poll() is None
-    os.write(current.descriptor, b"x" * 4096)
+    current._consume(b"x" * 4096)
     assert current.poll() is None and len(current.pending) == 4096
-    os.write(current.descriptor, LOCATION)
+    current._consume(LOCATION)
     assert current.poll() is None and not current.pending
-    os.write(current.descriptor, LOCATION[:97])
+    current._consume(LOCATION[:97])
     assert current.poll() is None
-    os.write(current.descriptor, LOCATION[97:])
+    current._consume(LOCATION[97:])
     assert current.poll() == "gemini_location_unsupported"
     assert other.poll() is None
 finally:
     current.close()
     other.close()
+assert not current._thread.is_alive() and not other._thread.is_alive()
+current.close()
+other.close()
 
 
 class Worker(BaseHTTPRequestHandler):
@@ -152,8 +157,11 @@ class Fixture:
             return {"run_id": run_id}
         if operation == "test-chat-status":
             assert body["run_id"] == run_id
+            diagnostic = runs[0]["process"].native_diagnostic
             result = host.Host.update_run(self, runs[0])
             assert runs[0]["process"] is None
+            assert diagnostic.descriptor is None
+            assert not diagnostic._thread.is_alive()
             return result
         raise AssertionError("unexpected host operation")
 
