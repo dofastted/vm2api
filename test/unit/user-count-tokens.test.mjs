@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
+  countTokensEnabled,
   parseCountTokensBody,
   buildUsageView,
   handleUserCountTokens,
@@ -539,4 +540,52 @@ test('usage platform filter picks one side and rejects unknown values', async (t
   assert.equal(cap.calls[2].status, 400)
   assert.equal(cap.calls[2].body.error.code, 'invalid_platform')
   assert.equal(peeks(), 0)
+})
+
+test('count_tokens is off unless routing says exactly true', () => {
+  assert.equal(countTokensEnabled(undefined), false)
+  assert.equal(countTokensEnabled({}), false)
+  assert.equal(countTokensEnabled({ compatibility: {} }), false)
+  assert.equal(countTokensEnabled({ compatibility: { count_tokens: true } }), true)
+  // Off for anything truthy-but-not-true, so a stray string in routing.json cannot
+  // open a public endpoint by accident.
+  for (const value of ['true', 1, {}, [], 'yes'])
+    assert.equal(countTokensEnabled({ compatibility: { count_tokens: value } }), false)
+})
+
+test('routing patch requires count_tokens to be boolean', async () => {
+  const { validatePersonaRoutingPatch } = await import('../../src/lib/admin/panel-api.mjs')
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { count_tokens: true } }), [])
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { count_tokens: false } }), [])
+  assert.match(JSON.stringify(validatePersonaRoutingPatch({ compatibility: { count_tokens: 'on' } })), /count_tokens/)
+})
+
+test('panel count-tokens route is gated by the switch, not removed', async () => {
+  const { createPanelHandler } = await import('../../src/lib/admin/panel-routes.mjs')
+  const call = async (routingConfig) => {
+    let response
+    const panel = createPanelHandler({
+      cfg: { paths: { project: os.tmpdir() } },
+      routingConfig,
+      requireAuth(req) {
+        req.panelUser = 'operator'
+        req.panelRole = 'admin'
+        return true
+      },
+      json(_res, status, body) {
+        response = { status, body }
+      },
+    })
+    await panel({ method: 'POST' }, {}, new URL('/api/panel/vms/vm-nope/count-tokens', 'http://localhost'))
+    return response
+  }
+  // Switch off: the generic not_found the stub returned.
+  const off = await call({})
+  assert.equal(off.status, 404)
+  assert.equal(off.body.error.code, 'not_found')
+  // Switch on: past the gate and into the restored body, which is why the code is now
+  // the route's own vm_not_found rather than the gate's not_found.
+  const on = await call({ compatibility: { count_tokens: true } })
+  assert.equal(on.status, 404)
+  assert.equal(on.body.error.code, 'vm_not_found')
 })

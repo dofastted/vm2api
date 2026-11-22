@@ -532,6 +532,9 @@ export function validatePersonaRoutingPatch(body = {}) {
   if (compat.claude_code_only != null && typeof compat.claude_code_only !== 'boolean') {
     problems.push('claude_code_only 必须是布尔')
   }
+  if (compat.count_tokens != null && typeof compat.count_tokens !== 'boolean') {
+    problems.push('count_tokens 必须是布尔')
+  }
   if (compat.blocked_clients != null) {
     const map = compat.blocked_clients
     if (typeof map !== 'object' || Array.isArray(map)) problems.push('blocked_clients 必须是对象')
