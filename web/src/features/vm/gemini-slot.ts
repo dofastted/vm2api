@@ -1,4 +1,5 @@
 import type { Vm } from '@/types/panel-vm'
+import { geminiHostBlocker } from '@/lib/gemini-account-status'
 import {
   geminiPayloadIssue,
   type GeminiEnvironment,
@@ -10,18 +11,6 @@ export function geminiSlot(
   inventory?: GeminiInventory
 ): Vm {
   const { auth_state: auth, account } = environment
-  const authorized = auth === 'authorized'
-  const reason =
-    auth === 'reauth_required'
-      ? '凭证失效'
-      : geminiPayloadIssue(inventory) ||
-        (environment.proxy_ready === false
-          ? '绑定代理不可用'
-          : environment.models_discovered !== true
-            ? '尚未拉取模型，不能调度'
-            : !environment.models?.length
-              ? '没有可调度模型'
-              : null)
   return {
     id: environment.id,
     name: environment.name,
@@ -30,21 +19,12 @@ export function geminiSlot(
     proxy_id: environment.proxy_id,
     proxy_configured: true,
     credential_mode: environment.auth_method === 'oauth' ? 'oauth' : 'apikey',
-    has_token: authorized || (auth === 'disabled' && !!account),
-    unschedulable_reason:
-      auth === 'reauth_required' ? 'oauth_reauth_required' : undefined,
-    schedule_state:
-      auth === 'disabled'
-        ? 'off'
-        : auth === 'reauth_required' || (authorized && reason)
-          ? 'unschedulable'
-          : authorized
-            ? 'on'
-            : undefined,
-    unschedulable_text: reason,
-    availability:
-      !authorized && auth !== 'reauth_required' && auth !== 'disabled'
-        ? { key: 'none', usable: false }
-        : undefined,
+    has_token: auth === 'authorized' || (auth === 'disabled' && !!account),
+    // The host prerequisite is display context, not an inferred scheduler state.
+    unschedulable_text: geminiHostBlocker(
+      environment,
+      inventory,
+      geminiPayloadIssue(inventory)
+    ),
   }
 }

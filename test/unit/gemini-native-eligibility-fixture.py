@@ -103,6 +103,8 @@ runs = []
 
 
 class Fixture:
+    finish_inference = staticmethod(host.Host.finish_inference)
+
     def request(self, operation, body):
         if operation == "list":
             return {"payload_state": "installed", "environments": [account]}
@@ -153,13 +155,27 @@ class Fixture:
             run.owns_directory = False
             run.credentials = ()
             run.prompt = None
-            runs.append({"process": run, "deadline": time.monotonic() + 120})
+            runs.append(
+                {
+                    "process": run,
+                    "deadline": time.monotonic() + 120,
+                    "evidence": {
+                        "state": "running",
+                        "model": "gemini-test",
+                        "started_at": host.now(),
+                        "finished_at": None,
+                        "error_code": None,
+                    },
+                }
+            )
             return {"run_id": run_id}
         if operation == "test-chat-status":
             assert body["run_id"] == run_id
             diagnostic = runs[0]["process"].native_diagnostic
             result = host.Host.update_run(self, runs[0])
             assert runs[0]["process"] is None
+            assert runs[0]["evidence"]["state"] == "failed"
+            assert runs[0]["evidence"]["error_code"] == "gemini_location_unsupported"
             assert diagnostic.descriptor is None
             assert not diagnostic._thread.is_alive()
             return result

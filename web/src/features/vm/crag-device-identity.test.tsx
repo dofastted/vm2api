@@ -48,23 +48,17 @@ describe('CragDeviceIdentity', () => {
     }
   })
 
-  it('keeps the migration entry out of sight until the Authority route exists', () => {
-    // `claim-by-order` ships with crag#14, which is neither merged nor deployed, so
-    // production has no such route and every attempt would fail without reaching a
-    // voucher. Asserted across every state on purpose: the entry is withheld by the
-    // `CLAIM_BY_ORDER_AVAILABLE` gate, not by anything about this host's subscription.
-    //
-    // When that route is deployed and the gate flips, this becomes the assertion it
-    // replaced — `toContain` in all four states, because replacing hardware means
-    // arriving at an empty machine and gating the entry on already having a
-    // subscription would hide it from exactly the host that needs it.
+  it('offers the migration entry whatever this host currently holds', () => {
+    // Asserted across every state on purpose: replacing hardware means arriving at
+    // an empty machine, so gating the entry on already having a subscription would
+    // hide it from exactly the host that needs it.
     for (const state of [
       'unredeemed',
       'unavailable',
       'active',
       'expired',
     ] as const) {
-      expect(render({ ready: true, state, device_uuid: UUID })).not.toContain(
+      expect(render({ ready: true, state, device_uuid: UUID })).toContain(
         '从其他设备迁移'
       )
     }

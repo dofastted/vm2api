@@ -39,6 +39,13 @@ const RUN_ERRORS = {
   gemini_native_tty_unavailable: [503, '没有可用的 Linux 虚拟控制台运行 CRAGGemini'],
   gemini_native_worker_unavailable: [503, 'Gemini 原生 TUI worker 未就绪，请检查宿主机控制台和 CRAGGemini 载荷'],
 }
+const INFERENCE_STATES = new Set([...RUN_STATES, 'cancelled'])
+const INFERENCE_ERROR_CODES = new Set([
+  ...Object.keys(RUN_ERRORS),
+  'gemini_inference_bad_input',
+  'gemini_native_bridge_timeout',
+])
+const INFERENCE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/
 const FAILURE = 'gemini_host_unavailable'
 const PROTOCOL_ERROR = 'gemini_host_protocol_error'
 const SOCKET_ERRORS = new Map([
@@ -338,7 +345,32 @@ function accountView(account) {
   }
 }
 
-function environmentView(value, { id, proxyId } = {}) {
+function inferenceTimestamp(value) {
+  return typeof value === 'string' && INFERENCE_TIMESTAMP.test(value) && Number.isFinite(Date.parse(value))
+    ? value
+    : null
+}
+
+function lastInferenceView(value) {
+  if (!INFERENCE_STATES.has(value?.state)) return null
+  const { state } = value
+  const model = modelName(value.model)
+  const startedAt = inferenceTimestamp(value.started_at)
+  const finishedAt = state === 'running' ? null : inferenceTimestamp(value.finished_at)
+  if (!model || !startedAt || (state !== 'running' && !finishedAt)) return null
+  return {
+    state,
+    model,
+    started_at: startedAt,
+    finished_at: finishedAt,
+    error_code:
+      (state === 'failed' || state === 'cancelled') && INFERENCE_ERROR_CODES.has(value.error_code)
+        ? value.error_code
+        : null,
+  }
+}
+
+function environmentView(value, { id, proxyId, proxyPool, withProxyReady = false } = {}) {
   if (
     !validId(value?.id) ||
     !validId(value.proxy_id) ||
@@ -348,9 +380,24 @@ function environmentView(value, { id, proxyId } = {}) {
   ) {
     throw hostError(PROTOCOL_ERROR)
   }
+  let proxyUrl
+  if (proxyPool && (withProxyReady || value.last_inference != null)) {
+    try {
+      proxyUrl = proxyFor(proxyPool(), value.proxy_id)
+    } catch (error) {
+      if (error?.code !== 'gemini_proxy_unavailable') throw error
+    }
+  }
+  // Compare with the current configured endpoint and credentials, not only the ID.
+  // The digest is private to the host/control plane and is not projected out.
+  const matchesProxy =
+    proxyUrl &&
+    value.last_inference != null &&
+    crypto.createHash('sha256').update(proxyUrl).digest('hex') === value.last_inference_proxy_sha256
   return {
     id: value.id,
     proxy_id: value.proxy_id,
+    ...(withProxyReady && proxyPool && { proxy_ready: Boolean(proxyUrl) }),
     name: text(value.name, 80) || '',
     auth_state: value.auth_state,
     auth_method: value.auth_method === 'api_key' ? 'api_key' : 'oauth',
@@ -360,6 +407,9 @@ function environmentView(value, { id, proxyId } = {}) {
     models: items(value.models, 128, modelName),
     ...(value.models_discovered === true && { models_discovered: true }),
     account: accountView(value.account),
+    ...(Object.hasOwn(value, 'last_inference') && {
+      last_inference: matchesProxy ? lastInferenceView(value.last_inference) : null,
+    }),
     created_at: text(value.created_at),
     updated_at: text(value.updated_at),
     billing_ready: false,
@@ -487,18 +537,7 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
           payload_issue: PAYLOAD_ISSUES.has(view.payload_issue) ? view.payload_issue : null,
           release_activated: typeof view.release_activated === 'boolean' ? view.release_activated : null,
           oauth_runtime_issue: OAUTH_ISSUES.has(view.oauth_runtime_issue) ? view.oauth_runtime_issue : null,
-          environments: view.environments.map((value) => {
-            const environment = environmentView(value)
-            if (!proxyPool) return environment
-            try {
-              proxyFor(proxyPool(), environment.proxy_id)
-              environment.proxy_ready = true
-            } catch (error) {
-              if (error?.code !== 'gemini_proxy_unavailable') throw error
-              environment.proxy_ready = false
-            }
-            return environment
-          }),
+          environments: view.environments.map((value) => environmentView(value, { proxyPool, withProxyReady: true })),
         })
       }
       // All Gemini panel routes pass through the existing admin-only panel ACL.
@@ -549,6 +588,7 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
                 oauth_account: { access_token: imported.access_token, expiry_timestamp: imported.expiry_timestamp },
               }),
             }),
+            { proxyPool },
           ),
         )
       }
@@ -578,7 +618,7 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
           proxy_id: proxyId,
           proxy_url: proxyFor(proxyPool(), proxyId),
         })
-        return ok(environmentView(result, { id, proxyId }))
+        return ok(environmentView(result, { id, proxyId, proxyPool }))
       }
       if (req.method === 'POST' && action === 'proxy/probe') {
         const environment = await readEnvironment(callHost, id)
@@ -590,7 +630,7 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
       if (req.method === 'POST' && action === 'models') {
         const environment = await readEnvironment(callHost, id)
         const result = await callHost('models', { id, ...boundProxy(proxyPool, environment) })
-        const view = environmentView(result, { id, proxyId: environment.proxy_id })
+        const view = environmentView(result, { id, proxyId: environment.proxy_id, proxyPool })
         if (!view.models.length) throw hostError('gemini_models_empty')
         return ok(view)
       }
@@ -622,7 +662,9 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
         const environment = environmentView(await callHost('get', { id }))
         const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
         return ok(
-          environmentView(await callHost('refresh', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl })),
+          environmentView(await callHost('refresh', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl }), {
+            proxyPool,
+          }),
         )
       }
       if (action !== 'authorization') return fail(404, 'not_found')
@@ -651,6 +693,7 @@ export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, 
               attempt_id: body.attempt_id,
               ...authorization,
             }),
+            { proxyPool },
           ),
         )
       }

@@ -77,6 +77,9 @@ describe('zones', () => {
       off: 1,
       none: 0,
       dead: 2,
+      host_verified: 0,
+      pending: 0,
+      host_failed: 0,
     })
   })
 })

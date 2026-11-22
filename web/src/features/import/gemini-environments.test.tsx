@@ -153,8 +153,6 @@ test('Gemini import only displays eligible platform SOCKS5 and leaves inventory 
 test('VM page renders Gemini inventory and measured data without treating the host as a VM slot', () => {
   const html = showGemini(true, 'vm')
   expect(html).toContain('Gemini 宿主环境')
-  expect(html).toContain('已授权')
-  expect(html).toContain('缺少官方逐回合结算')
   expect(html).toContain('fixture@example.test')
   expect(html).toContain('fixture-project')
   expect(html).toContain('Google AI Pro')
