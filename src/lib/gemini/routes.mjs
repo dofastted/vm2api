@@ -4,6 +4,7 @@ import { isIP } from 'node:net'
 import path from 'node:path'
 import { filterModelCatalogForKey, keyModelError } from '../admin/key-models.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
+import { createGeminiMaintenanceHandler } from './maintenance.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
 const PUBLIC_PATH = '/v1/gemini/sessions'
@@ -110,6 +111,7 @@ const HOST_ERRORS = {
   gemini_test_oauth_unsupported: [503, '当前签名载荷不支持 Google OAuth 推理测试'],
   gemini_test_auth_required: [409, '请先为 Gemini 环境完成授权'],
   gemini_test_invalid_input: [400, '请选择此环境的 Gemini 模型并输入有效的测试内容'],
+  gemini_maintenance_lock_invalid: [503, 'Gemini 维护锁不受信，请联系宿主管理员修复属主和权限'],
 }
 
 export function isGeminiPanelPath(value) {
@@ -467,10 +469,14 @@ export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
 }
 
 export function createGeminiPanelHandler({ json, readBody, proxyPool, terminal, callHost = callGeminiHost }) {
+  const maintenance = createGeminiMaintenanceHandler({ json, readBody })
   return async function handleGeminiPanel(req, res, pathname) {
     const ok = (data) => json(res, 200, { ok: true, data })
     const fail = (status, code, message = code) => json(res, status, { ok: false, error: { code, message } })
     res.setHeader('Cache-Control', 'no-store')
+    if (pathname === `${PANEL_PATH}/maintenance` || pathname.startsWith(`${PANEL_PATH}/maintenance/`)) {
+      return maintenance(req, res, pathname)
+    }
     try {
       if (req.method === 'GET' && pathname === PANEL_PATH) {
         const view = await callHost('list', {})

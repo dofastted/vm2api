@@ -2062,6 +2062,50 @@ class Host:
         return self.view(env)
 
     def request(self, operation, body):
+        if operation in {
+            "list",
+            "get",
+            "maintenance-status",
+            "test-chat-status",
+            "test-chat-cancel",
+            "terminal-io",
+            "terminal-stop",
+        }:
+            return self._request(operation, body)
+        descriptor = os.open(
+            self.directory / "maintenance.lock",
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            0o600,
+        )
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != 0
+                or info.st_nlink != 1
+                or info.st_mode & 0o077
+            ):
+                raise Failure(503, "gemini_maintenance_lock_invalid")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Failure(409, "gemini_operation_busy") from None
+            pending = self.directory / "maintenance.pending"
+            if pending.exists() or pending.is_symlink():
+                raise Failure(409, "gemini_operation_busy")
+            return self._request(operation, body)
+        finally:
+            os.close(descriptor)
+
+    def _request(self, operation, body):
+        if operation == "maintenance-status":
+            return {
+                "busy": bool(
+                    self.pending
+                    or self.terminals
+                    or any(self.running(key) for key in self.runs)
+                )
+            }
         if operation == "install-payload":
             self.load_payload(materialize=True, verify_again=True)
             return {
@@ -2306,6 +2350,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "terminal-io",
                 "terminal-stop",
                 "install-payload",
+                "maintenance-status",
                 "proxy-probe",
                 "proxy-bind",
                 "models",
@@ -2317,7 +2362,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise Failure(400)
-            if operation == "install-payload":
+            if operation in ("install-payload", "maintenance-status"):
                 _, uid, _ = struct.unpack(
                     "3i",
                     self.request.getsockopt(
