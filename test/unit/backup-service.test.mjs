@@ -235,3 +235,25 @@ test('remove deletes record + file', async () => {
   assert.equal(fs.existsSync(rec.file_path), false)
   assert.equal(svc.get(rec.id), null)
 })
+
+test('cleanStaging removes unfinished backup staging dirs and nothing else', () => {
+  const tmp = path.join(dataDir, 'tmp')
+  fs.mkdirSync(path.join(tmp, 'kin-backup-AbC123', 'db'), { recursive: true })
+  fs.writeFileSync(path.join(tmp, 'kin-backup-AbC123', 'db', 'kin.db'), 'snapshot')
+  fs.mkdirSync(path.join(tmp, 'kin-restore-XyZ789'), { recursive: true })
+  fs.writeFileSync(path.join(tmp, 'kin-backup-notes.txt'), 'keep')
+  const removed = svc.cleanStaging()
+  assert.deepEqual(removed, [path.join(tmp, 'kin-backup-AbC123')])
+  assert.equal(fs.existsSync(path.join(tmp, 'kin-restore-XyZ789')), true)
+  assert.equal(fs.existsSync(path.join(tmp, 'kin-backup-notes.txt')), true)
+})
+
+test('abortRunning stops a backup in progress and frees the service for the next run', { skip: !tarAvailable() }, async () => {
+  const run = svc.createBackup({ kind: 'manual' })
+  // Let the worker start before stopping it.
+  while (!svc._worker) await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(await svc.abortRunning(), true)
+  await assert.rejects(run)
+  assert.equal(svc._running, false)
+  assert.equal(await svc.abortRunning(), false, 'nothing left to stop')
+})

@@ -833,7 +833,14 @@ backupService.onRestored((db) => {
   reloadActiveVm(cfg)
   vmTestSchedule.reload()
 })
-runAtActivation('backup', () => backupService.startScheduler())
+// A just-activated leader waits for the draining controller to exit before its catch-up backup:
+// that one may still be mid-run, and two full snapshots of a large DB would run side by side.
+runAtActivation('backup', () =>
+  deferUntilExclusive('backup', () => {
+    backupService.cleanStaging()
+    backupService.startScheduler()
+  }),
+)
 
 const stats = {
   requests: 0,
@@ -1445,6 +1452,7 @@ function stopLeaderJobs() {
     } catch {}
     try {
       backupService.stopScheduler()
+      void backupService.abortRunning()
     } catch {}
     try {
       proxyPool.stopScheduler()

@@ -194,6 +194,45 @@ export class BackupService {
     }
   }
 
+  /**
+   * Stop a backup in progress (blue/green handover, shutdown): the worker holds a minutes-long VACUUM +
+   * tar and keeps a draining controller alive. Its staging dir is removed by the next cleanStaging().
+   */
+  async abortRunning() {
+    const worker = this._worker
+    if (!worker) return false
+    this._worker = null
+    await worker.terminate().catch(() => {})
+    return true
+  }
+
+  /**
+   * Remove staging dirs left by backups that never finished (process killed mid-run). Each is a full
+   * DB snapshot (tens of GB). Only the leader backs up, so at leader start none of them is live.
+   */
+  cleanStaging() {
+    const removed = []
+    for (const base of new Set([process.env.KIN_BACKUP_TMPDIR, this.tmpDir].filter(Boolean))) {
+      let names = []
+      try {
+        names = fs.readdirSync(base)
+      } catch {
+        continue
+      }
+      for (const name of names) {
+        if (!/^kin-backup-[A-Za-z0-9]{6}$/.test(name)) continue
+        const dir = path.join(base, name)
+        try {
+          if (!fs.lstatSync(dir).isDirectory()) continue
+          fs.rmSync(dir, { recursive: true, force: true })
+          removed.push(dir)
+        } catch {}
+      }
+    }
+    if (removed.length) console.log(`[backup] removed ${removed.length} unfinished staging dir(s)`)
+    return removed
+  }
+
   _runBackupWorker(job) {
     return new Promise((resolve, reject) => {
       const worker = new Worker(new URL('./backup-worker.mjs', import.meta.url), {
@@ -208,8 +247,10 @@ export class BackupService {
           job,
         },
       })
+      this._worker = worker
       let settled = false
       const finish = (fn, arg) => {
+        if (this._worker === worker) this._worker = null
         if (settled) return
         settled = true
         fn(arg)
@@ -225,7 +266,8 @@ export class BackupService {
       })
       worker.once('error', (e) => finish(reject, e))
       worker.once('exit', (code) => {
-        if (code !== 0) finish(reject, new Error(`backup worker exited with code ${code}`))
+        if (code !== 0) finish(reject, Object.assign(new Error(`backup worker exited with code ${code}`), { code: 'backup_aborted' }))
+        else finish(reject, new Error('backup worker exited without a result'))
       })
     })
   }
