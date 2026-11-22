@@ -3077,3 +3077,33 @@ unixTest('re-probe off (kernel_down_reprobe_ms: 0) keeps the immediate failure',
   assert.equal(prepared.ready?.reason, 'kernel_unavailable')
   assert.equal(probes, 1)
 })
+
+unixTest('a re-probe of a kernel that stops answering stays inside the window it was given', async (t) => {
+  withFakeKernelBin(t)
+  let probes = 0
+  const fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    probes++
+    // The first probe answers at once, so what this measures is the re-probe loop
+    // and not the health check that precedes it. Every later probe never answers,
+    // which is what a kernel too wedged to reply looks like from here.
+    if (probes === 1) res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0 }))
+  })
+  t.after(() => fx.close())
+  t.mock.method(console, 'warn', () => {})
+  const started = Date.now()
+  const prepared = await prepareInferenceHop({
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    // A health timeout far wider than the re-probe window. The loop condition only
+    // reserves the 250ms gap, so an unclamped probe spends the whole 8s here and
+    // hands 8s of latency to a request that was told it could wait 700ms.
+    routing: { inference: { health_ttl_ms: 0, kernel_down_reprobe_ms: 700, health_timeout_ms: 8000 } },
+  })
+  const elapsed = Date.now() - started
+  assert.equal(prepared.ready?.reason, 'kernel_unavailable')
+  assert.ok(elapsed < 2000, `re-probe overran its window: ${elapsed}ms`)
+})
