@@ -232,7 +232,7 @@ GPT 模型以账号返回的 `/backend-api/codex/models` 为准，新增 ID 不�
 | 头 | 作用 |
 |----|------|
 | `x-kin-delivery: verified` | 缓冲到终态 |
-| `x-kin-queue: off` | 不排队等席位：有空席位照常接，号池满立即回 529 `pool_overloaded`（会话轮次串行不受影响） |
+| `x-kin-queue: off` | 不排队等席位：能立刻拿到席位就照常接；席位被占（含自己会话的席位、回原号时内核无空槽）即回 529 `pool_overloaded`，不换号、不等待（会话轮次串行不受影响） |
 | `x-kin-cache-ttl: 1h` | Node 重写模式的首次会话 TTL 选择；不覆盖 native 透传 caller / 模板显式 TTL |
 | `x-kin-vm` | 仅 master：钉槽（虚拟机测试 loopback） |
 | `x-session-id` 等 | sticky 键，见 `routing.sticky` |

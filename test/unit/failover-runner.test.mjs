@@ -2648,6 +2648,40 @@ test('keep_session_home: a home kernel with no free slot is retried instead of s
   assert.deepEqual(seen, ['account-1', 'account-1', 'account-1'])
 })
 
+test('keep_session_home with allowQueue:false: a home kernel with no free slot answers 529 at once', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: pinnedStickyRouter(),
+    // A real wait would show up as a slow test; the old path slept and retried home.
+    config: { same_account_retry_delay_ms: 0, home_slot_busy_retry_ms: 60000, keep_session_home: true },
+  })
+  const seen = []
+  const startedAt = Date.now()
+  const result = await runner.run({
+    requestId: 'req-home-slot-busy-no-queue',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    stickyKey: 'sess:home',
+    allowQueue: false,
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return {
+        ok: false,
+        status: 503,
+        upstreamExecutions: 0,
+        body: { error: { type: 'api_error', code: 'slot_busy', message: 'no free slot' } },
+      }
+    },
+  })
+  assert.deepEqual(seen, ['account-1'], 'neither retried home nor spilled the transcript')
+  assert.ok(Date.now() - startedAt < 5000)
+  assert.equal(result.status, 529)
+  assert.equal(result.body.error.code, 'pool_overloaded')
+  assert.equal(result.body.error.details.reason, 'session_home_slot_busy')
+  assert.equal(result.accountId, 'account-1')
+})
+
 test('keep_pin_on_model_gate: a borrowed account never takes the session, family or device pin', async () => {
   const binds = []
   const scheduler = new Scheduler([{ ...candidate(2), stickyBorrowed: true }])

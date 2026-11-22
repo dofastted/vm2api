@@ -3,9 +3,11 @@
  *
  * A caller that load-balances across several upstreams (vm2api plus others) would
  * rather hear "busy" at once and send the request elsewhere than have it wait here
- * for a seat. `x-kin-queue: off` asks for exactly that: a free seat (the pinned one or
- * any other) is taken as usual, and when none is free the request fails right away
- * with 529 `pool_overloaded` instead of joining the seat queue.
+ * for a seat. `x-kin-queue: off` asks for exactly that: a seat that can be had right
+ * now is taken as usual; otherwise the request fails right away with 529
+ * `pool_overloaded` instead of joining the seat queue. A conversation whose own seat
+ * is held (or whose home account's kernel has no free slot) is not moved to another
+ * account either: it loses its prompt cache either way, so the caller decides.
  *
  * Only the seat queue is skipped. A conversation's turns still run one at a time
  * (`session_queue_timeout_ms`), since that queue orders turns rather than waiting

@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { queueAllowedByHeaders } from '../../src/lib/protocol/queue-hint.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { CORS_ALLOW_HEADERS } from '../../src/lib/http/cors.mjs'
 
 test('x-kin-queue: off and its synonyms turn the seat queue off; anything else keeps it', () => {
   for (const value of ['off', 'OFF', ' off ', 'none', 'no', 'false', '0', ['off']]) {
@@ -43,30 +44,30 @@ function ok() {
   }
 }
 
-for (const stickyKey of [null, 'session-a']) {
-  test(`allowQueue:false fails a busy pool at once with 529 and never dispatches (stickyKey=${stickyKey})`, async () => {
-    const scheduler = new BusyScheduler()
-    const runner = new FailoverRunner({ scheduler })
-    let dispatched = 0
-    const result = await runner.run({
-      requestId: 'no-queue',
-      model: 'claude-sonnet-test',
-      canonicalBody: { model: 'claude-sonnet-test' },
-      stickyKey,
-      allowQueue: false,
-      callAttempt: () => {
-        dispatched++
-        return ok()
-      },
-    })
-    assert.equal(dispatched, 0)
-    assert.deepEqual(scheduler.calls, [false])
-    assert.equal(result.ok, false)
-    assert.equal(result.status, 529)
-    assert.equal(result.body.error.code, 'pool_overloaded')
-    assert.equal(result.body.error.details.reason, 'all_accounts_busy')
+// The stub ignores stickyKey: which seat a session may take without waiting is the
+// scheduler's call (pool-scheduler.mjs fails a held sticky seat with
+// all_accounts_busy); this only pins how the runner treats that answer.
+test('allowQueue:false fails a busy pool at once with 529 and never dispatches', async () => {
+  const scheduler = new BusyScheduler()
+  const runner = new FailoverRunner({ scheduler })
+  let dispatched = 0
+  const result = await runner.run({
+    requestId: 'no-queue',
+    model: 'claude-sonnet-test',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    allowQueue: false,
+    callAttempt: () => {
+      dispatched++
+      return ok()
+    },
   })
-}
+  assert.equal(dispatched, 0)
+  assert.deepEqual(scheduler.calls, [false])
+  assert.equal(result.ok, false)
+  assert.equal(result.status, 529)
+  assert.equal(result.body.error.code, 'pool_overloaded')
+  assert.equal(result.body.error.details.reason, 'all_accounts_busy')
+})
 
 test('without allowQueue the runner still waits for a seat (default unchanged)', async () => {
   const scheduler = new BusyScheduler()
@@ -79,4 +80,12 @@ test('without allowQueue the runner still waits for a seat (default unchanged)',
   })
   assert.deepEqual(scheduler.calls, [true])
   assert.equal(result.ok, true)
+})
+
+test('browsers may send x-kin-queue cross-origin', () => {
+  assert.ok(
+    CORS_ALLOW_HEADERS.split(',')
+      .map((h) => h.trim())
+      .includes('x-kin-queue'),
+  )
 })
