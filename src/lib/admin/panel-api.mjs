@@ -537,8 +537,13 @@ export function validatePersonaRoutingPatch(body = {}) {
     if (typeof map !== 'object' || Array.isArray(map)) problems.push('blocked_clients 必须是对象')
     else {
       for (const [id, on] of Object.entries(map)) {
-        if (!isBlockableClientId(id)) problems.push(`blocked_clients.${id} 不是已知客户端`)
-        else if (typeof on !== 'boolean') problems.push(`blocked_clients.${id} 必须是布尔`)
+        // An unknown id is ignored rather than rejected, matching how
+        // blockedClientsFromRouting reads the same map. Rejecting it would mean that
+        // retiring or renaming an entry in BLOCKABLE_CLIENTS leaves a key in the
+        // stored routing.json that makes *every* later protocol-settings save fail,
+        // recoverable only by hand-editing that file.
+        if (!isBlockableClientId(id)) continue
+        if (typeof on !== 'boolean') problems.push(`blocked_clients.${id} 必须是布尔`)
       }
     }
   }

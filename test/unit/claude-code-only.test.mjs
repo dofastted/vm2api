@@ -687,7 +687,10 @@ const OPENCLAW_BODY = {
   ...OFFICIAL_BODY,
   system: [
     ...OFFICIAL_BODY.system,
-    { type: 'text', text: 'You are a personal assistant running inside OpenClaw.\n## OpenClaw Control\nDo not invent commands.' },
+    {
+      type: 'text',
+      text: 'You are a personal assistant running inside OpenClaw.\n## OpenClaw Control\nDo not invent commands.',
+    },
   ],
 }
 const OPENCLAW_TOOLS_BODY = {
@@ -701,13 +704,26 @@ test('blocked_clients: OpenClaw is recognised by its system prompt or tool names
   const { detectBlockableClient } = await import('../../src/lib/identity/blocked-clients.mjs')
   assert.equal(detectBlockableClient(OPENCLAW_BODY)?.id, 'openclaw')
   assert.equal(detectBlockableClient(OPENCLAW_TOOLS_BODY)?.id, 'openclaw')
+  // A system/developer *turn* is not read, even though it is where an OpenAI-shaped
+  // caller puts its system prompt. The gate upstream only checks that the model is
+  // Anthropic, and this gateway serves OpenAI-shaped requests against Claude models,
+  // so on that path this text is authored by whoever is calling -- indistinguishable
+  // from the user message below. Nothing real is lost: these clients drive the
+  // official CLI, so they arrive Anthropic-shaped with a true `system`.
   assert.equal(
-    detectBlockableClient({ messages: [{ role: 'system', content: 'Docs: https://docs.openclaw.ai' }] })?.id,
-    'openclaw',
+    detectBlockableClient({ messages: [{ role: 'system', content: 'Docs: https://docs.openclaw.ai' }] }),
+    null,
+  )
+  assert.equal(
+    detectBlockableClient({ messages: [{ role: 'developer', content: 'You are running inside OpenClaw' }] }),
+    null,
   )
   // Talking about OpenClaw in the conversation is not being OpenClaw.
   assert.equal(
-    detectBlockableClient({ ...OFFICIAL_BODY, messages: [{ role: 'user', content: 'how do I install openclaw? running inside OpenClaw' }] }),
+    detectBlockableClient({
+      ...OFFICIAL_BODY,
+      messages: [{ role: 'user', content: 'how do I install openclaw? running inside OpenClaw' }],
+    }),
     null,
   )
   assert.equal(detectBlockableClient(OFFICIAL_BODY), null)
@@ -716,16 +732,31 @@ test('blocked_clients: OpenClaw is recognised by its system prompt or tool names
 test('blocked_clients: off by default, OpenClaw on blocks it before any account is picked', async () => {
   assert.equal((await runProtocol({ routing: {}, body: OPENCLAW_BODY, headers: CLI_HEADERS })).reached, true)
   assert.equal(
-    (await runProtocol({ routing: { compatibility: { blocked_clients: { openclaw: false } } }, body: OPENCLAW_BODY, headers: CLI_HEADERS }))
-      .reached,
+    (
+      await runProtocol({
+        routing: { compatibility: { blocked_clients: { openclaw: false } } },
+        body: OPENCLAW_BODY,
+        headers: CLI_HEADERS,
+      })
+    ).reached,
     true,
   )
-  assert.deepEqual(await runProtocol({ routing: BLOCK_OPENCLAW, body: OPENCLAW_BODY, headers: CLI_HEADERS }), CLIENT_BLOCKED)
-  assert.deepEqual(await runProtocol({ routing: BLOCK_OPENCLAW, body: OPENCLAW_TOOLS_BODY, headers: AXIOS }), CLIENT_BLOCKED)
+  assert.deepEqual(
+    await runProtocol({ routing: BLOCK_OPENCLAW, body: OPENCLAW_BODY, headers: CLI_HEADERS }),
+    CLIENT_BLOCKED,
+  )
+  assert.deepEqual(
+    await runProtocol({ routing: BLOCK_OPENCLAW, body: OPENCLAW_TOOLS_BODY, headers: AXIOS }),
+    CLIENT_BLOCKED,
+  )
   // Official Claude Code and GPT models are untouched.
-  assert.equal((await runProtocol({ routing: BLOCK_OPENCLAW, body: OFFICIAL_BODY, headers: CLI_HEADERS })).reached, true)
   assert.equal(
-    (await runProtocol({ routing: BLOCK_OPENCLAW, body: { ...OPENCLAW_BODY, model: 'gpt-5.5' }, headers: AXIOS })).reached,
+    (await runProtocol({ routing: BLOCK_OPENCLAW, body: OFFICIAL_BODY, headers: CLI_HEADERS })).reached,
+    true,
+  )
+  assert.equal(
+    (await runProtocol({ routing: BLOCK_OPENCLAW, body: { ...OPENCLAW_BODY, model: 'gpt-5.5' }, headers: AXIOS }))
+      .reached,
     true,
   )
 })
@@ -766,15 +797,18 @@ test('blocked_clients: count_tokens follows the same switch', async () => {
   assert.equal(open.seen.status, 200)
 })
 
-test('routing patch validates blocked_clients', () => {
+test('routing patch validates blocked_clients', async () => {
+  const { blockedClientsFromRouting } = await import('../../src/lib/identity/blocked-clients.mjs')
   const problems = (compat) => validatePersonaRoutingPatch({ compatibility: compat })
-  const ok = problems({ blocked_clients: { openclaw: true } })
-  const bad = [
-    problems({ blocked_clients: { openclaw: 'yes' } }),
-    problems({ blocked_clients: { nope: true } }),
-    problems({ blocked_clients: [] }),
-  ]
   const text = (r) => JSON.stringify(r)
-  assert.doesNotMatch(text(ok), /blocked_clients/)
-  for (const r of bad) assert.match(text(r), /blocked_clients/)
+  assert.doesNotMatch(text(problems({ blocked_clients: { openclaw: true } })), /blocked_clients/)
+  for (const r of [problems({ blocked_clients: { openclaw: 'yes' } }), problems({ blocked_clients: [] })])
+    assert.match(text(r), /blocked_clients/)
+  // An unknown id is ignored, not rejected, the same way blockedClientsFromRouting
+  // reads it. Rejecting it would mean that once an entry is retired or renamed, the
+  // key left behind in routing.json fails every later protocol-settings save --
+  // including saves that have nothing to do with blocked_clients.
+  assert.doesNotMatch(text(problems({ blocked_clients: { nope: true } })), /blocked_clients/)
+  assert.doesNotMatch(text(problems({ claude_code_only: true, blocked_clients: { retired: true } })), /blocked_clients/)
+  assert.deepEqual(blockedClientsFromRouting({ compatibility: { blocked_clients: { nope: true } } }), [])
 })
