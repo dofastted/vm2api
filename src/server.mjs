@@ -1203,6 +1203,7 @@ const clusterManager = new ClusterManager({
 localEgressCluster = clusterManager
 bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
 await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
+if (STANDBY) clusterManager.prewarmLinks()
 runAtActivation('cluster', () => {
   clusterManager.start()
   return clusterManager.restoreSlotRelays()

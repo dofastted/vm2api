@@ -163,6 +163,8 @@ export class ClusterManager {
     this.vmsOnNode = vmsOnNode
     this.logger = logger
     this.links = new Map()
+    /** Blue/green standby: SSH links dialled before activation, adopted by _attach. */
+    this.prewarmed = new Map()
     this.bridges = new Map()
     this.slotRelays = new Map()
     this.hosts = new WeakMap()
@@ -199,6 +201,8 @@ export class ClusterManager {
     this.directProbes.clear()
     this.directState.clear()
     for (const link of this.links.values()) link.stop()
+    for (const link of this.prewarmed.values()) link.stop()
+    this.prewarmed.clear()
     const relays = [...this.bridges.values(), ...[...this.slotRelays.values()].flatMap((r) => [r.kernel, r.worker])]
     await Promise.all(relays.map((r) => r.stop({ unlink }).catch(() => {})))
     this.links.clear()
@@ -210,10 +214,26 @@ export class ClusterManager {
     return path.join(this.socketDir, id, 'docker.sock')
   }
 
+  /**
+   * Blue/green standby: dial the node SSH links ahead of activation. Without this every node slot reads
+   * "node not connected" for the ~10s the links take after activation, and the first requests after the
+   * switch wait in scheduling. Only the links: no relays, gates, health checks, timers or state writes.
+   */
+  prewarmLinks() {
+    for (const node of this.repo.list()) {
+      if (this.links.has(node.id) || this.prewarmed.has(node.id)) continue
+      const link = new SshLink({ id: node.id, resolveTarget: () => this._targetFor(node.id) })
+      this.prewarmed.set(node.id, link)
+      link.start()
+    }
+  }
+
   _attach(node) {
-    const link = new SshLink({ id: node.id, resolveTarget: () => this._targetFor(node.id) })
+    const warm = this.prewarmed.get(node.id)
+    this.prewarmed.delete(node.id)
+    const link = warm || new SshLink({ id: node.id, resolveTarget: () => this._targetFor(node.id) })
     let sshWasReady = false
-    link.on('state', (state) => {
+    const onState = (state) => {
       this.logger.log(JSON.stringify({ event: 'cluster-link', node: node.id, state, error: link.error?.code || null }))
       if (state === 'ready') {
         // Host facts first: they carry the platform the health check branches on.
@@ -228,7 +248,8 @@ export class ClusterManager {
         this.health.delete(node.id)
         this._linkState(node.id, state)
       }
-    })
+    }
+    link.on('state', onState)
     this.links.set(node.id, link)
     const bridge = new SocketRelay({
       socketPath: this.bridgeSocketPath(node.id),
@@ -239,7 +260,9 @@ export class ClusterManager {
     })
     this.bridges.set(node.id, bridge)
     bridge.start().catch((err) => this.logger.warn(`[cluster] bridge ${node.id} failed: ${err.message}`))
-    link.start()
+    if (!warm) link.start()
+    // A pre-dialled link may already be up: replay its state so health, gate and link state run now.
+    else if (link.state !== 'idle') onState(link.state)
   }
 
   async _jumpSock(jumpNodeId, host, port) {

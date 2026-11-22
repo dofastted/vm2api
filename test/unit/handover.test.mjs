@@ -163,3 +163,36 @@ test('load file round trip; a stale file counts as no load', async () => {
   reader.stop()
   fs.rmSync(dir, { recursive: true, force: true })
 })
+
+import { ClusterManager } from '../../src/lib/cluster/cluster-manager.mjs'
+
+test('standby pre-dials node links and activation adopts them instead of dialling again', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-prewarm-'))
+  const repo = {
+    list: () => [{ id: 'n1' }],
+    get: () => null,
+    getSecrets: () => null,
+    directLinks: () => new Map(),
+  }
+  const states = []
+  const manager = new ClusterManager({
+    repo,
+    dataDir: dir,
+    vmsOnNode: () => [],
+    logger: { log: (line) => states.push(line), warn() {} },
+  })
+  manager.prewarmLinks()
+  const warm = manager.prewarmed.get('n1')
+  assert.ok(warm, 'link dialled during standby')
+  assert.notEqual(warm.state, 'idle')
+  assert.equal(manager.links.size, 0, 'standby attaches nothing')
+  assert.equal(manager.bridges.size, 0, 'standby binds no relay sockets')
+  manager.prewarmLinks()
+  assert.equal(manager.prewarmed.get('n1'), warm, 'idempotent')
+  manager.start()
+  assert.equal(manager.links.get('n1'), warm, 'activation adopts the pre-dialled link')
+  assert.equal(manager.prewarmed.size, 0)
+  assert.ok(states.some((l) => l.includes('"node":"n1"')), 'adopted link state is replayed')
+  await manager.stop()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
