@@ -316,7 +316,17 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs, slotWaitDeadline
     let probes = 0
     while (Date.now() + RUST_DOWN_REPROBE_GAP_MS < deadline) {
       await new Promise((resolve) => setTimeout(resolve, RUST_DOWN_REPROBE_GAP_MS))
-      last = await rustKernelHealth(exec, { timeoutMs: rustHealthTimeoutMs(routing) })
+      // Bound each probe by what is left of the window rather than by the full
+      // health timeout. The loop condition only reserves the gap, while
+      // `rustHealthTimeoutMs` has a floor of 800ms and a ceiling of 30s, so an
+      // unbounded probe overruns both `kernel_down_reprobe_ms` and the request's
+      // own slot budget by up to a whole timeout -- the very budget computed
+      // above. Clipping it cannot manufacture a failure: `workerHealth` reports a
+      // timeout as `{ ok: false, status: 0 }` with no `healthy: false`, so a
+      // clipped probe reads as not-ready and leaves the verdict below unchanged.
+      last = await rustKernelHealth(exec, {
+        timeoutMs: Math.max(1, Math.min(rustHealthTimeoutMs(routing), deadline - Date.now())),
+      })
       probes++
       if (vmNodeDataPath(exec?.vm) !== dataPath) break
       if (rustHopReady(last)) {
