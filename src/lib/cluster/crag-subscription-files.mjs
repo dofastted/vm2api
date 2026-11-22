@@ -17,6 +17,30 @@ export function hasClusterSubscriptionBinds(container, remoteDir) {
   return clusterSubscriptionBinds(remoteDir).every((bind) => container?.HostConfig?.Binds?.includes(bind))
 }
 
+const SEP = '--kin-subscription-file--'
+
+/** The node already holds exactly these files and no sync is pending. Any read failure means "no". */
+export async function publishedMatches(client, hostDir, licenseDir, files, { run = runRemote } = {}) {
+  const paths = [
+    `${licenseDir}/device.json`,
+    `${licenseDir}/registration.code`,
+    `${hostDir}/host_id`,
+    `${hostDir}/entitlement.code`,
+  ]
+  const script = [
+    `test ! -e ${shellQuote(`${hostDir}/sync-pending`)}`,
+    ...paths.map((file) => `printf '%s\\n' ${shellQuote(SEP)} && cat ${shellQuote(file)}`),
+  ].join(' && ')
+  let out
+  try {
+    out = await run(client, script, { timeoutMs: 8000 })
+  } catch {
+    return false
+  }
+  const expected = [files.device, files.permit, files.hostId, files.entitlement].map((data) => `${SEP}\n${data}\n`).join('')
+  return out === expected
+}
+
 export async function publishClusterSubscription(projectRoot, vm, session = null, { force = false } = {}) {
   session ??= await nodeSession(vm.node_id)
   const root = remoteSlotDir(session.host, vm.id)
@@ -35,6 +59,13 @@ export async function publishClusterSubscription(projectRoot, vm, session = null
       if (!files) return false
       const digest = createHash('sha256').update(JSON.stringify(files)).digest('hex')
       if (!force && record.digest === digest) return true
+      // A controller that just started (restart, or a blue/green handover) has no record yet. Rewriting
+      // unchanged files raises sync-pending on the slot, and a stream finishing in that window fails
+      // with a license 403, so first check what the node already holds.
+      if (!force && record.digest === undefined && (await publishedMatches(session.client, hostDir, licenseDir, files))) {
+        record.digest = digest
+        return true
+      }
       record.digest = undefined
       await runRemote(
         session.client,
