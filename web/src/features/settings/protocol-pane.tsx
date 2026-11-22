@@ -142,8 +142,8 @@ export function ProtocolPane({
                 label={`拦截 ${label}`}
                 desc={
                   on
-                    ? `开：识别为 ${label}（${signature}）的 Claude 请求一律 403，不选号、不上游。与上面的开关无关。`
-                    : `已关：${label} 按普通请求放行。它借官方 CLI 发请求，会被上游认成第三方应用而 400。`
+                    ? `开：识别为 ${label}（${signature}）的 Claude 请求在选号之前一律 403。注意这发生在第三方 system 搬移之前，等于主动放弃一条本来能成功的请求。`
+                    : `已关（推荐）：${label} 按普通请求放行。它追加的 system 块会被搬到首个 user 轮次后正常服务，不会因第三方应用判定被上游拒绝。`
                 }
               >
                 <Switch

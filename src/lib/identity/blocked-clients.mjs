@@ -2,15 +2,22 @@
  * routing.compatibility.blocked_clients — one switch per known third-party client.
  *
  * Some clients drive the official Claude Code CLI (Agent SDK) and append their own
- * agent prompt to its system, so they pass every Claude Code family check and the
- * third-party system relocation never runs. Anthropic still recognises the appended
- * prompt and answers 400 "Third-party apps now draw from your extra usage". A switch
- * here rejects that client at the gate, before any account is picked, independent of
- * claude_code_only. Every switch defaults off.
+ * agent prompt to its system, so they pass every Claude Code family check. That used
+ * to reach the upstream as-is and come back 400 "Third-party apps now draw from your
+ * extra usage", because system relocation was gated on `!officialTraffic`. It is not
+ * anymore: relocation keys on the content of `system` (`hasForeignSystemBlock`,
+ * 78223cdf1), so such a request now has its appended block moved to the first user
+ * turn and is served normally.
  *
- * Detection reads only what the client itself writes: system text and tool names.
- * Conversation messages are never inspected, so a user who merely mentions a client
- * by name is not blocked.
+ * So a switch here is not the fix for that 400 — it is the operator saying they do
+ * not want to carry this client's traffic even though it would now be served. It
+ * rejects at the gate, before any account is picked and before relocation, which
+ * means turning one on gives up a request that would otherwise succeed. Independent
+ * of claude_code_only. Every switch defaults off.
+ *
+ * Detection reads only what the client itself writes: its own `system` prompt and
+ * tool names. Conversation messages are never inspected, so a user who merely
+ * mentions a client by name is not blocked.
  */
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { eachSystemText } from './crs-persona.mjs'
@@ -46,21 +53,24 @@ export function blockedClientsFromRouting(routing) {
   return BLOCKABLE_CLIENTS.filter((client) => map[client.id] === true).map((client) => client.id)
 }
 
-/** Anthropic `system` plus OpenAI-shaped system/developer turns. */
+/** The client's own system prompt, and nothing a user can author.
+ *
+ * Deliberately only the Anthropic `system` field. The gate above this only
+ * checks that the *model* is Anthropic, and this gateway serves OpenAI-shaped
+ * requests against Claude models too -- on that path a `role: 'system'` or
+ * `'developer'` turn is caller-written conversation content, so reading it
+ * would 403 a user who merely says "running inside OpenClaw" in a system
+ * message, which is the one thing the header comment promises cannot happen.
+ * Nothing real is lost: the clients this detects drive the official Claude
+ * Code CLI, so they always arrive Anthropic-shaped with a true `system`.
+ */
 function systemTexts(body) {
-  const texts = [...eachSystemText(body?.system)]
-  for (const message of Array.isArray(body?.messages) ? body.messages : []) {
-    if (message?.role !== 'system' && message?.role !== 'developer') continue
-    texts.push(...eachSystemText(message.content))
-  }
-  return texts
+  return [...eachSystemText(body?.system)]
 }
 
 function toolNames(body) {
   const tools = Array.isArray(body?.tools) ? body.tools : []
-  return tools
-    .map((tool) => tool?.name ?? tool?.function?.name)
-    .filter((name) => typeof name === 'string')
+  return tools.map((tool) => tool?.name ?? tool?.function?.name).filter((name) => typeof name === 'string')
 }
 
 /** The known client this request comes from, or null. */
