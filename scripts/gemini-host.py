@@ -871,6 +871,7 @@ class NativeAgy(Agy):
         return self.native_invocation.poll()
 
     def close(self, preserve=False):
+        wrapper_status = self.native_tui.poll() if self.native_tui is not None else None
         try:
             if self.native_invocation is not None:
                 self.native_invocation.close()
@@ -892,6 +893,17 @@ class NativeAgy(Agy):
                         kind = "exit_code" if status >= 0 else "signal"
                         print(
                             f"Gemini native child={child} {kind}={abs(status)}",
+                            file=sys.stderr,
+                        )
+                    elif wrapper_status is not None:
+                        kind = "exit_code" if wrapper_status >= 0 else "signal"
+                        print(
+                            f"Gemini native wrapper=openvt {kind}={abs(wrapper_status)} child_record=missing",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            "Gemini native wrapper=openvt status=running_before_cleanup child_record=missing",
                             file=sys.stderr,
                         )
             finally:

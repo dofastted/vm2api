@@ -71,6 +71,8 @@ OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进�
 
 如果原生回合返回 `gemini_native_worker_unavailable`，在 `journalctl -u vm2api-gemini.service` 查找 `Gemini native child=`。启动器只报告先观测到退出的 `craggemini` 或 `agy`，以及退出码或信号编号，不收集子进程输出、请求内容或凭据。没有记录不代表子进程正常退出，例如启动器自身先中止时可能来不及记录。
 
+缺少子进程退出记录时，日志会退回输出 `wrapper=openvt` 在清理前观测到的退出码或信号；如果当时仍在运行则明确标记 `running_before_cleanup`，不把清理发送的 SIGKILL 当成原故障。
+
 `0.3.0-rc.3` 原生候选纳入独立仓 Code Assist CCPA 响应捕获修复（`369c209`），保持官方 `agy 1.5.9` 摘要不变。它需要独立签名清单和与该清单匹配的兑换校验文件；使用同一发行公钥并不代表可继承旧清单的激活。既有 rc.1、rc.2 验签仍受支持。
 
 对已选中环境的失败回合，调度器必须保留宿主错误码；`gemini_location_unsupported` 应返回 HTTP 403，并释放半开熔断探针而不记为基础设施失败。排查公网 `503 gemini_host_unavailable` 时应单独跟踪该请求，不能仅凭另一回合的地区拒绝日志归因。
