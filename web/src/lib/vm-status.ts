@@ -1,6 +1,7 @@
 import type { Vm } from '@/types/panel-vm'
 import type { StatusTone } from '@/types/status'
 import { pct } from '@/lib/format'
+import { geminiAccountStatus } from '@/lib/gemini-account-status'
 import { isCodexVm } from '@/lib/vm-kind'
 
 function credTextOf(vm: Vm): { text: string; key: string; tone: string } {
@@ -321,6 +322,8 @@ export function vmCooldownTitle(vm: Vm): string {
 }
 
 export function accountStatus(vm: Vm | undefined): StatusTone {
+  if (vm?.gemini)
+    return geminiAccountStatus(vm.gemini, vm.unschedulable_text).tone
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
   const unschedulable = unschedulableTone(vm)
   if (unschedulable) return { ...unschedulable, label: unschedulable.text }
@@ -447,6 +450,7 @@ export function accountStatus(vm: Vm | undefined): StatusTone {
  * `accountStatus` 的 revoke 分支截走了，不会走到这里。
  */
 export function credentialStatus(vm: Vm | undefined): StatusTone {
+  if (vm?.gemini) return geminiAccountStatus(vm.gemini).authorization
   const base = accountStatus(vm)
   // 休息时段同理是调度意图（排班），不是凭证状态。
   if (base.key !== 'off' && base.key !== 'rest') return base
@@ -601,6 +605,8 @@ function seatsFullTone(vm: Vm | undefined): StatusTone | null {
  * 受限、不可调度与调度关互斥（后端先判调度关）。
  */
 export function poolStatus(vm: Vm | undefined): StatusTone {
+  if (vm?.gemini)
+    return geminiAccountStatus(vm.gemini, vm.unschedulable_text).tone
   // 吊销 / 废票先判：它可能同时带着 off / quota 的 availability.key，照 key
   // 判会显示成「调度关」，把真正的死因盖掉。
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
@@ -691,6 +697,8 @@ export function poolStatus(vm: Vm | undefined): StatusTone {
  * 完整判定链（revoke 先于一切）。号池额度卡与本口径共用同一谓词。
  */
 export function accountUsable(vm: Vm | undefined): boolean {
+  // Gemini host evidence does not establish generic pool availability.
+  if (vm?.gemini) return false
   return Boolean(vm?.has_token) && credentialStatus(vm).cls !== 'bad'
 }
 
@@ -809,10 +817,21 @@ export function vmBuckets(vms: Vm[]) {
 }
 
 export type FleetGroup =
-  'pool' | 'restricted' | 'off' | 'none' | 'bad' | 'revoke' | 'unschedulable'
+  | 'pool'
+  | 'restricted'
+  | 'off'
+  | 'none'
+  | 'bad'
+  | 'revoke'
+  | 'unschedulable'
+  | 'pending'
+  | 'host_failed'
+  | 'host_verified'
 
 /** Coarse fleet grouping for the VM list. 受限 is the triad, not 5h/7d warning. */
 export function fleetGroup(vm: Vm): FleetGroup {
+  if (vm.gemini)
+    return geminiAccountStatus(vm.gemini, vm.unschedulable_text).group
   const status = poolStatus(vm)
   const k = status.key
   if (k === 'revoke') return 'revoke'
@@ -837,6 +856,9 @@ export function fleetCounts(vms: Vm[]): Record<FleetGroup | 'all', number> {
     bad: 0,
     revoke: 0,
     unschedulable: 0,
+    pending: 0,
+    host_failed: 0,
+    host_verified: 0,
   }
   for (const vm of vms) c[fleetGroup(vm)] += 1
   return c
@@ -849,6 +871,7 @@ export function fleetCounts(vms: Vm[]): Record<FleetGroup | 'all', number> {
  * 都得沉到列表底部，不该混在还能用的槽位中间。
  */
 export function vmCredDead(vm: Vm): boolean {
+  if (vm.gemini) return vm.gemini.auth_state === 'reauth_required'
   const g = fleetGroup(vm)
   return g === 'bad' || g === 'revoke' || g === 'unschedulable'
 }

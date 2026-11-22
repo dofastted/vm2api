@@ -11,14 +11,16 @@ import { VmBlade, type RackSize } from '@/features/vm/vm-rack-blade'
 import {
   buildRacks,
   rackTotals,
+  GEMINI_EVIDENCE_ZONES,
   type Rack,
   type VmZoneFilter,
 } from '@/features/vm/vm-rack-model'
 import { VmUnit } from '@/features/vm/vm-rack-unit'
 
-/** 机架头的构成条按六档细分（吊销与无效分开着色），分区段落才合并。 */
+/** 机架头保留细分的凭证状态，分区段落才合并。 */
 const GROUP_SWATCH: { key: FleetGroup; label: string; color: string }[] = [
   { key: 'pool', label: '在池', color: 'var(--status-ok-solid)' },
+  ...GEMINI_EVIDENCE_ZONES,
   { key: 'restricted', label: '受限', color: 'var(--status-warn-solid)' },
   { key: 'off', label: '关闭调用', color: 'var(--status-none)' },
   {

@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { authorizePanelRoute } from '../../src/lib/admin/panel-acl.mjs'
 import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
@@ -132,7 +134,7 @@ test('the native transport uses the internal Unix socket and returns Gemini SSE 
   assert.deepEqual(received, [['POST', '/internal/v1/messages', internalToken, prepareGeminiNativeTurn(turn)]])
 })
 
-function setup(callHost, proxy = bound) {
+function setup(callHost, proxy = bound, getProxyUrl = () => proxyUrl) {
   const response = { setHeader() {} }
   const panel = createGeminiPanelHandler({
     json: (_response, status, body) => ({ status, body }),
@@ -142,7 +144,7 @@ function setup(callHost, proxy = bound) {
         assert.equal(ownerUserId, null)
         return { proxies: [proxy] }
       },
-      getProxyByIdWithAuth: (id) => (id === proxy.id ? { url: proxyUrl } : null),
+      getProxyByIdWithAuth: (id) => (id === proxy.id ? { url: getProxyUrl() } : null),
     }),
     callHost,
   })
@@ -191,6 +193,117 @@ test('unknown Gemini payload status is not installed and proxy failures do not h
   assert.equal(body.data.payload_state, 'unknown')
   assert.equal(body.data.payload_issue, null)
   assert.equal(body.data.environments[0].proxy_ready, false)
+})
+
+test('Gemini inventory projects only scoped host inference metadata and does not dispatch work', async () => {
+  const started = '2030-01-01T00:00:00+00:00'
+  const finished = '2030-01-01T00:00:01.000Z'
+  const evidence = {
+    state: 'failed',
+    model,
+    started_at: started,
+    finished_at: finished,
+    error_code: 'gemini_location_unsupported',
+  }
+  const secret = 'fixture-private-data'
+  const digest = createHash('sha256').update(proxyUrl).digest('hex')
+  const values = [
+    { ...evidence, prompt: secret, text: secret, profile: secret, usage: { total_tokens: 42 } },
+    { ...evidence, error_code: secret, error: { message: secret } },
+    { ...evidence, state: 'cancelled', error_code: 'gemini_inference_cancelled' },
+    { ...evidence, state: 'running', finished_at: secret },
+    { ...evidence, state: 'completed' },
+    { ...evidence, state: secret },
+    { ...evidence, model: proxyUrl },
+    { ...evidence, started_at: secret },
+    { ...evidence, finished_at: null },
+    null,
+  ]
+  const operations = []
+  const run = setup((operation, payload) => {
+    operations.push([operation, payload])
+    return {
+      environments: [
+        { ...record, id: 'old-host-record' },
+        ...values.map((last_inference, i) => ({
+          ...record,
+          auth_state: 'authorized',
+          id: `env-${i}`,
+          runtime_ready: false,
+          last_inference,
+          last_inference_proxy_sha256: digest,
+        })),
+      ],
+    }
+  })
+  const result = await run('GET', root)
+  assert.equal(result.status, 200)
+  assert.equal(result.body.data.available, true)
+  assert.deepEqual(operations, [['list', {}]])
+  const [oldHost, ...environments] = result.body.data.environments
+  assert.equal(Object.hasOwn(oldHost, 'last_inference'), false)
+  assert.ok(environments.every((environment) => environment.runtime_ready === false))
+  assert.deepEqual(
+    environments.map((environment) => environment.last_inference),
+    [
+      evidence,
+      { ...evidence, error_code: null },
+      { ...evidence, state: 'cancelled', error_code: 'gemini_inference_cancelled' },
+      { ...evidence, state: 'running', finished_at: null, error_code: null },
+      { ...evidence, state: 'completed', error_code: null },
+      null,
+      null,
+      null,
+      null,
+      null,
+    ],
+  )
+  assert.doesNotMatch(JSON.stringify(result), /fixture-private-data|192\.0\.2\.11|total_tokens/)
+  assert.ok(!JSON.stringify(result).includes(digest))
+  assert.ok(!JSON.stringify(result).includes('last_inference_proxy_sha256'))
+})
+
+test('Gemini inventory hides evidence after same-ID endpoint or credential edits', async () => {
+  let current = proxyUrl
+  const evidence = {
+    state: 'completed',
+    model,
+    started_at: '2030-01-01T00:00:00+00:00',
+    finished_at: '2030-01-01T00:00:01+00:00',
+    error_code: null,
+  }
+  const environment = { ...record, auth_state: 'authorized', last_inference: evidence }
+  const recordEvidence = (url) => {
+    environment.last_inference_proxy_sha256 = createHash('sha256').update(url).digest('hex')
+  }
+  const run = setup(
+    (operation) => {
+      assert.equal(operation, 'list')
+      return { environments: [environment] }
+    },
+    bound,
+    () => current,
+  )
+  const read = async () => (await run('GET', root)).body.data.environments[0]
+  assert.equal((await read()).last_inference, null) // An unbound record cannot verify this proxy.
+  recordEvidence(proxyUrl)
+  assert.deepEqual((await read()).last_inference, evidence)
+  for (const next of [proxyUrl.replace('192.0.2.11', '192.0.2.12'), proxyUrl.replace('private', 'rotated')]) {
+    current = next
+    const projected = await read()
+    assert.equal(projected.proxy_id, environment.proxy_id)
+    assert.equal(projected.proxy_ready, true)
+    assert.equal(projected.last_inference, null)
+  }
+  recordEvidence(current)
+  assert.deepEqual((await read()).last_inference, evidence)
+})
+
+test('Gemini host inference evidence follows admitted runs and their bindings', { timeout: 15_000 }, () => {
+  execFileSync('python3', ['-B', fileURLToPath(new URL('./gemini-host-evidence.py', import.meta.url))], {
+    stdio: 'pipe',
+    timeout: 12_000,
+  })
 })
 
 test('Gemini payload redemption is admin-only and rejects malformed codes before host dispatch', async () => {

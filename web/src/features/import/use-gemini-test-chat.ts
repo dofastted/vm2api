@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { api, isApiError } from '@/lib/api'
 import {
+  GEMINI_INVENTORY_KEY,
   type GeminiError,
   geminiError,
   useGeminiMutation,
@@ -44,6 +46,7 @@ function nextPoll(signal: AbortSignal) {
 }
 
 export function useGeminiTestChat(resource: string) {
+  const client = useQueryClient()
   const mounted = useRef(false)
   const active = useRef<Run | null>(null)
   const [result, setResult] = useState<TestResult | null>(null)
@@ -89,6 +92,7 @@ export function useGeminiTestChat(resource: string) {
             body: JSON.stringify(input),
           }
         )
+        void client.invalidateQueries({ queryKey: GEMINI_INVENTORY_KEY })
         const statusPath = `${resource}/test-chat/${encodeURIComponent(run_id)}`
         const cancel = async () => {
           const ended = await api<{ cancelled: boolean }>(statusPath, {
@@ -173,6 +177,8 @@ export function useGeminiTestChat(resource: string) {
         active.current = null
       }
     },
+    onSettled: () =>
+      client.invalidateQueries({ queryKey: GEMINI_INVENTORY_KEY }),
   })
 
   function cancel() {

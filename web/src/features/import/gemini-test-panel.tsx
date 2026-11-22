@@ -75,9 +75,11 @@ export function GeminiTestPanel({
   const unavailable =
     environment.auth_state !== 'authorized'
       ? authorizationHint
-      : !environment.proxy_id || environment.proxy_ready === false
-        ? '请在「代理」绑定可用的 IPv4 SOCKS5 代理。'
-        : null
+      : isOAuth && environment.oauth_imported
+        ? '已导入 OAuth 凭据，仍需在「账号」完成官方 Google 授权后再测试。'
+        : !environment.proxy_id || environment.proxy_ready === false
+          ? '请在「代理」绑定可用的 IPv4 SOCKS5 代理。'
+          : null
   const pull = useGeminiMutation({
     mutationFn: () =>
       api<GeminiEnvironment>(`${resource}/models`, { method: 'POST' }),

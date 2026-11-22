@@ -49,6 +49,7 @@ import {
 import { vmCostLedger, vmTodayStats, vmWeekOutcome } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
 import { Button } from '@/components/ui/button'
+import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
 import {
   SchedulableSwitch,
@@ -60,6 +61,8 @@ import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
 import { GeminiSlotStatus } from '@/features/vm/vm-rack-blade'
 import {
+  emptyZoneCounts,
+  GEMINI_EVIDENCE_ZONES,
   vmWindows,
   type WindowKey,
   type WindowReadout,
@@ -561,6 +564,7 @@ function ProdCell({ vm }: { vm: Vm }) {
 
 type Agg = {
   n: number
+  gemini: number
   ok: number
   req: number
   today: number
@@ -576,6 +580,7 @@ type Agg = {
 function aggregate(rows: RowData[]): Agg {
   const a: Agg = {
     n: rows.length,
+    gemini: 0,
     ok: 0,
     req: 0,
     today: 0,
@@ -584,10 +589,11 @@ function aggregate(rows: RowData[]): Agg {
     cap: 0,
     queue: 0,
     queued: 0,
-    by: { pool: 0, restricted: 0, off: 0, none: 0, dead: 0 },
+    by: emptyZoneCounts(),
     top: null,
   }
   for (const r of rows) {
+    if (r.vm.gemini) a.gemini++
     a.ok += r.hOk
     a.req += r.hReq
     a.today += r.today
@@ -648,39 +654,48 @@ function Kpi({
 
 function SummaryBar({ a }: { a: Agg }) {
   const pct = aggPct(a)
+  const geminiZones = GEMINI_EVIDENCE_ZONES.filter((z) => a.by[z.key] > 0)
   return (
     <section
       aria-label='全局汇总'
       className='flex flex-wrap gap-y-2 rounded-lg border border-border/60 bg-card py-2'
     >
       <Kpi
-        k='在池'
+        k={a.gemini ? '账号总数' : '在池'}
         v={
-          <>
-            {a.by.pool}
-            <span className='text-muted-foreground'>/{a.n}</span>
-          </>
+          a.gemini ? (
+            a.n
+          ) : (
+            <>
+              {a.by.pool}
+              <span className='text-muted-foreground'>/{a.n}</span>
+            </>
+          )
         }
-        x={`受限 ${a.by.restricted} · 关闭 ${a.by.off} · 未使用 ${a.by.none} · 不可调度 ${a.by.dead}`}
+        x={
+          a.gemini
+            ? `Gemini ${a.gemini} · 普通槽 ${a.n - a.gemini}`
+            : `受限 ${a.by.restricted} · 关闭 ${a.by.off} · 未使用 ${a.by.none} · 不可调度 ${a.by.dead}`
+        }
       />
       <Kpi
-        k='24h 成功率'
+        k={a.gemini ? '普通槽 24h 成功率' : '24h 成功率'}
         v={fmtHealthPct(pct)}
         x={`失败 ${fmtNum(a.req - a.ok)}`}
         tone={HEALTH_FG[healthTone(pct)]}
       />
       <Kpi
-        k='近 24h 请求'
+        k={a.gemini ? '普通槽近 24h 请求' : '近 24h 请求'}
         v={fmtNum(a.req)}
         x={`北京时间今日 ${fmtNum(a.today)}`}
       />
       <Kpi
-        k='7 天窗口花费'
+        k={a.gemini ? '普通槽 7 天花费' : '7 天窗口花费'}
         v={a.spend ? fmtUsd(a.spend, 2) : '—'}
         x={a.top ? `最高 ${a.top.vm.id} ${fmtUsd(a.top.spend, 0)}` : ''}
       />
       <Kpi
-        k='席位占用'
+        k={a.gemini ? '普通槽席位占用' : '席位占用'}
         v={
           <>
             {a.used}
@@ -690,11 +705,25 @@ function SummaryBar({ a }: { a: Agg }) {
         x={a.cap ? `${Math.round((a.used / a.cap) * 100)}%` : ''}
       />
       <Kpi
-        k='排队'
+        k={a.gemini ? '普通槽排队' : '排队'}
         v={a.queue}
         x={a.queued ? `${a.queued} 台有排队` : '无排队'}
         tone={a.queue ? 'text-[color:var(--status-warn)]' : undefined}
       />
+      {geminiZones.length > 0 ? (
+        <div className='flex w-full flex-wrap items-center gap-x-3 gap-y-1 border-t px-3 pt-2 text-xs'>
+          {geminiZones.map(({ key, label, tone, hint }) => (
+            <span
+              key={key}
+              title={hint}
+              className='inline-flex items-center gap-1.5'
+            >
+              <StatusMark tone={{ key, text: label, cls: tone }} />
+              <b className='font-mono tabular-nums'>{a.by[key]}</b>
+            </span>
+          ))}
+        </div>
+      ) : null}
     </section>
   )
 }
@@ -863,7 +892,7 @@ export function VmTable({
             >
               槽位
             </div>
-            {COLS.map((c) => {
+            {COLS.map((c, i) => {
               const active = sort && c.sort === sort.key
               return (
                 <div
@@ -898,6 +927,12 @@ export function VmTable({
                         )
                       ) : null}
                     </button>
+                  ) : i === 0 && total.gemini > 0 ? (
+                    total.gemini === total.n ? (
+                      'Gemini 状态'
+                    ) : (
+                      '调度 · 优先级 / Gemini 状态'
+                    )
                   ) : (
                     c.label
                   )}
@@ -970,8 +1005,12 @@ export function VmTable({
                   : sec.rows.map((r) => {
                       const vm = r.vm
                       const open = expanded.has(vm.id)
-                      const label = scheduleStateLabel(vm)
-                      const dim = label === '关'
+                      const label = vm.gemini
+                        ? poolStatus(vm).text
+                        : scheduleStateLabel(vm)
+                      const dim = vm.gemini
+                        ? vm.gemini.auth_state === 'disabled'
+                        : label === '关'
                       const detailId = `vm-row-detail-${vm.id}`
                       const max = claudeTier(vm).key === 'max'
                       return (
@@ -983,7 +1022,8 @@ export function VmTable({
                             aria-expanded={open}
                             aria-label={`${vm.id}，${label}。Enter 展开明细，Shift+Enter 打开详情`}
                             className={cn(
-                              'group relative grid h-[38px] cursor-pointer border-b border-[color:var(--hairline)] bg-[var(--row-bg)] outline-none [--row-bg:var(--card)] hover:[--row-bg:color-mix(in_oklab,var(--muted)_55%,var(--card))] focus-visible:after:pointer-events-none focus-visible:after:absolute focus-visible:after:inset-0 focus-visible:after:z-[4] focus-visible:after:border-2 focus-visible:after:border-ring',
+                              'group relative grid cursor-pointer border-b border-[color:var(--hairline)] bg-[var(--row-bg)] outline-none [--row-bg:var(--card)] hover:[--row-bg:color-mix(in_oklab,var(--muted)_55%,var(--card))] focus-visible:after:pointer-events-none focus-visible:after:absolute focus-visible:after:inset-0 focus-visible:after:z-[4] focus-visible:after:border-2 focus-visible:after:border-ring',
+                              vm.gemini ? 'min-h-[38px]' : 'h-[38px]',
                               open &&
                                 '[--row-bg:color-mix(in_oklab,var(--muted)_75%,var(--card))]'
                             )}
@@ -1028,6 +1068,7 @@ export function VmTable({
                                 role='cell'
                                 className={cn(
                                   'flex min-w-0 items-center gap-[7px] overflow-hidden px-2 whitespace-nowrap',
+                                  vm.gemini && i === 0 && 'py-1.5',
                                   c.num && NUM,
                                   c.dim && 'text-muted-foreground',
                                   // 调度列（第一列）保持可读，其余在关闭时淡出。
