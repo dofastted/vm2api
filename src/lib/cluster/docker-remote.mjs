@@ -7,16 +7,19 @@
 
 import http from 'node:http'
 import net from 'node:net'
-import { ClusterError, forwardOutStreamLocal } from './ssh-link.mjs'
+import { ClusterError, connectUnixSocket, DOCKER_SOCKET_PATH } from './ssh-link.mjs'
 
-export const DOCKER_SOCKET_PATH = '/var/run/docker.sock'
+export { DOCKER_SOCKET_PATH }
 const MAX_RESPONSE_BYTES = 8 << 20
 
 /** @typedef {() => Promise<import('node:stream').Duplex>} DockerConnector */
 
-/** @returns {DockerConnector} */
-export function sshDocker(client) {
-  return () => forwardOutStreamLocal(client, DOCKER_SOCKET_PATH)
+/**
+ * @param {{ signal?: AbortSignal, long?: boolean }} [opts] passed to the bridge slot queue
+ * @returns {DockerConnector}
+ */
+export function sshDocker(client, opts = {}) {
+  return () => connectUnixSocket(client, DOCKER_SOCKET_PATH, { ...opts, docker: true })
 }
 
 /** @returns {DockerConnector} */
@@ -78,6 +81,8 @@ export async function dockerRequest(
       })
       res.on('end', () => {
         clearTimeout(timer)
+        // Done with this one-shot connection: close it rather than wait for the daemon to.
+        stream.destroy?.()
         resolve({ status: res.statusCode || 0, headers: res.headers, body: Buffer.concat(chunks) })
       })
       res.on('error', (err) => {
