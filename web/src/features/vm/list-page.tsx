@@ -33,8 +33,10 @@ import { meQueryOptions } from '@/features/auth/queries'
 import {
   GeminiStartupStatus,
   geminiInventoryOptions,
+  geminiPayloadIssue,
 } from '@/features/import/gemini-environments'
 import { usageQueryOptions } from '@/features/overview/queries'
+import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-link'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import {
@@ -216,6 +218,12 @@ export function VmListPage() {
   })
   const vms: Vm[] = vmsQ.data?.items || []
   const geminiInventory = isAdmin ? gemini.data : undefined
+  const geminiNeedsMaintenance =
+    gemini.isError ||
+    (geminiInventory &&
+      (!geminiInventory.available ||
+        !!geminiPayloadIssue(geminiInventory) ||
+        !!geminiInventory.oauth_runtime_issue))
   const slots = geminiInventory?.available
     ? [
         ...vms,
@@ -246,7 +254,7 @@ export function VmListPage() {
       fluid
       extra={
         poolQueue || canCreate ? (
-          <div className='flex items-center gap-3'>
+          <div className='flex flex-wrap items-center gap-3'>
             {poolQueue ? (
               <span
                 className={cn(
@@ -266,6 +274,9 @@ export function VmListPage() {
                 </Link>
               </Button>
             ) : null}
+            {isAdmin && kind !== 'gemini' && geminiNeedsMaintenance ? (
+              <GeminiMaintenanceLink />
+            ) : null}
             {canCreate ? (
               <Button onClick={() => setCreateOpen(true)}>创建</Button>
             ) : null}
@@ -278,7 +289,14 @@ export function VmListPage() {
         error={vmsQ.error}
         skeleton={<VmListSkeleton />}
       >
-        {kind === 'gemini' && geminiInventory ? (
+        {isAdmin && kind === 'gemini' && gemini.isError ? (
+          <div className='mb-3 space-y-1'>
+            <p role='alert' className='text-sm text-destructive'>
+              读取 Gemini 环境失败，可前往设置诊断宿主服务。
+            </p>
+            <GeminiMaintenanceLink />
+          </div>
+        ) : kind === 'gemini' && geminiInventory ? (
           <div className='mb-3'>
             <GeminiStartupStatus inventory={geminiInventory} />
           </div>

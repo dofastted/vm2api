@@ -7,6 +7,7 @@ import {
   type RefObject,
 } from 'react'
 import { api, isApiError } from '@/lib/api'
+import { isGeminiHostIssue } from '@/lib/gemini-recovery'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -20,6 +21,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-link'
 
 export function GeminiRedeemDialog({
   triggerVisible = true,
@@ -33,7 +35,9 @@ export function GeminiRedeemDialog({
   const [open, setOpen] = useState(false)
   const [code, setCode] = useState('')
   const [version, setVersion] = useState<string>()
-  const [error, setError] = useState('')
+  const [error, setError] = useState<{ message: string; code?: string } | null>(
+    null
+  )
   const [pending, setPending] = useState(false)
   const redeeming = useRef(false)
   const done = useRef<HTMLButtonElement>(null)
@@ -49,7 +53,7 @@ export function GeminiRedeemDialog({
     if (redeeming.current || !trimmed || version) return
     redeeming.current = true
     setPending(true)
-    setError('')
+    setError(null)
     try {
       const result = await api<{ kernel_version: string }>(
         '/api/panel/gemini/payload/redeem',
@@ -59,11 +63,13 @@ export function GeminiRedeemDialog({
       setVersion(result.kernel_version)
       onRedeemed()
     } catch (failure) {
-      setError(
-        isApiError(failure) && failure.code?.startsWith('gemini_')
-          ? failure.message
-          : '无法确认兑换结果，请重试。'
-      )
+      setError({
+        message:
+          isApiError(failure) && failure.code?.startsWith('gemini_')
+            ? failure.message
+            : '无法确认兑换结果，请重试。',
+        code: isApiError(failure) ? failure.code : undefined,
+      })
     } finally {
       redeeming.current = false
       setPending(false)
@@ -77,7 +83,7 @@ export function GeminiRedeemDialog({
         if (redeeming.current) return
         if (!next) {
           setCode('')
-          setError('')
+          setError(null)
           setVersion(undefined)
         }
         setOpen(next)
@@ -136,13 +142,18 @@ export function GeminiRedeemDialog({
                 required
               />
               {error ? (
-                <p
-                  id={`${codeId}-error`}
-                  role='alert'
-                  className='text-sm text-destructive'
-                >
-                  {error}
-                </p>
+                <div className='space-y-1'>
+                  <p
+                    id={`${codeId}-error`}
+                    role='alert'
+                    className='text-sm text-destructive'
+                  >
+                    {error.message}
+                  </p>
+                  {isGeminiHostIssue(error.code) ? (
+                    <GeminiMaintenanceLink />
+                  ) : null}
+                </div>
               ) : null}
             </div>
             <DialogFooter>
