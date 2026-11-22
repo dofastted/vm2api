@@ -16,7 +16,7 @@ export type Price = {
       }
     | { above: number; unpriced: true }
   >
-  modes?: { fast?: Price; flex?: Price; priority?: Price }
+  modes?: { fast?: Price; flex?: Price; priority?: Price; ultrafast?: Price }
   per_call?: { web_search?: number }
   /** GPT Image: image-token rates; the base fields price the text tokens. */
   image?: { input: number; output: number; cache_read: number }
@@ -43,6 +43,7 @@ export type PricingEntry = {
     fast?: PriceSource
     flex?: PriceSource
     priority?: PriceSource
+    ultrafast?: PriceSource
   }
   builtin: Price | null
   models_dev: Price | null

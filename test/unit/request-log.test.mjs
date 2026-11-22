@@ -618,6 +618,36 @@ test('finish persists web_search_requests from server_tool_use', () => {
   assert.equal(row.web_search_requests, 3)
 })
 
+test('repricing Ultrafast rows uses their request dates and preserves actual cost', () => {
+  const store = tmpStore('normal')
+  const before = '2027-03-01T07:59:59.999Z'
+  const after = '2027-03-01T08:00:00.000Z'
+  store.db
+    .prepare(`
+    INSERT INTO usage_logs (
+      id, request_id, created_at, model, status, input_tokens,
+      output_tokens, service_tier, pricing_model, actual_cost
+    ) VALUES
+      ('ultra_promo', 'rid_ultra_promo', ?, 'gpt-6.2-sol', 200, 100000, 100000, 'ultrafast', 'unpriced', NULL),
+      ('ultra_list', 'rid_ultra_list', ?, 'gpt-6.2-sol', 200, 100000, 100000, 'ultrafast', 'unpriced', 4)
+  `)
+    .run(before, after)
+
+  assert.equal(store.repo.repriceRange({ since: before, until: after }).changed, 2)
+  const rows = store.db
+    .prepare(
+      "SELECT total_cost, actual_cost FROM usage_logs WHERE id IN ('ultra_promo', 'ultra_list') ORDER BY created_at",
+    )
+    .all()
+  assert.deepEqual(
+    rows.map((row) => [row.total_cost, row.actual_cost]),
+    [
+      [3.6, null],
+      [7.2, 4],
+    ],
+  )
+})
+
 test('repriceRange rewrites total_cost and fills unpriced rows while actual_cost stays put', () => {
   const store = tmpStore('normal')
   const now = new Date().toISOString()

@@ -101,7 +101,7 @@ test('Haiku rejects explicit effort that would turn thinking back on with a forc
 })
 
 test('Fable uses its adaptive default without changing compatible caller tool choices', () => {
-  for (const model of ['fable', 'claude-fable-5.1', 'claude-fable-5-2']) {
+  for (const model of ['fable', 'claude-fable-5.1', 'claude-fable-5-2', 'claude-mythos-5-2']) {
     for (const thinking of [undefined, { type: 'disabled' }]) {
       const body = { ...fixture(), model, tool_choice: { type: 'auto' }, thinking }
       const before = structuredClone(body)
@@ -126,7 +126,14 @@ test('Fable uses its adaptive default without changing compatible caller tool ch
 })
 
 test('unsupported thinking and malformed choices fail explicitly', () => {
-  for (const model of ['claude-opus-5-5', 'claude-opus-5.5', 'claude-sonnet-5-5', 'fable', 'claude-fable-5-2']) {
+  for (const model of [
+    'claude-opus-5-5',
+    'claude-opus-5.5',
+    'claude-sonnet-5-5',
+    'fable',
+    'claude-fable-5-2',
+    'claude-mythos-5-2',
+  ]) {
     const input = { ...fixture(), model }
     const before = structuredClone(input)
     assert.throws(

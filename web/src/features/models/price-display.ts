@@ -90,16 +90,20 @@ export function tiersSummary(price: Price | null | undefined): string {
     .join(' · ')
 }
 
-/** OpenAI service tiers with their own price (flex / priority); `fast` is the Anthropic mode. */
+/** OpenAI service tiers with their own price (flex / priority / ultrafast); `fast` is the Anthropic mode. */
 export function openaiServiceModes(
   price: Price | null | undefined
-): Array<'flex' | 'priority'> {
-  return (['flex', 'priority'] as const).filter((k) => price?.modes?.[k])
+): Array<'flex' | 'priority' | 'ultrafast'> {
+  return (['flex', 'priority', 'ultrafast'] as const).filter(
+    (k) => price?.modes?.[k]
+  )
 }
 
 export function modeKeys(
   price: Price | null | undefined
-): Array<'fast' | 'flex' | 'priority'> {
+): Array<'fast' | 'flex' | 'priority' | 'ultrafast'> {
   if (!price?.modes) return []
-  return (['fast', 'flex', 'priority'] as const).filter((k) => price.modes?.[k])
+  return (['fast', 'flex', 'priority', 'ultrafast'] as const).filter(
+    (k) => price.modes?.[k]
+  )
 }

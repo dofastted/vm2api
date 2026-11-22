@@ -2,10 +2,15 @@ import type { ReactNode } from 'react'
 import { Badge } from '@/components/ui/badge'
 import type { CragHostStatus, CragRuntimeVm } from './queries'
 
-const numberLabel = (value: number | 'unlimited' | null | undefined) =>
+/**
+ * 槽位数的统一写法。导出理由同 `cragHostStatusVariant`：同一个「不限」在两处
+ * 写成不同字样，和同一数字叫两个名字是同一类问题。
+ */
+export const numberLabel = (value: number | 'unlimited' | null | undefined) =>
   value === 'unlimited' ? '不限' : (value ?? '待核对')
 
-const dateTime = new Intl.DateTimeFormat('zh-CN', {
+/** 时刻的统一格式。导出理由同上 —— 同一个时间不该在两处长得不一样。 */
+export const dateTime = new Intl.DateTimeFormat('zh-CN', {
   dateStyle: 'medium',
   timeStyle: 'short',
 })

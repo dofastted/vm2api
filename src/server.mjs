@@ -121,11 +121,17 @@ import {
 import {
   PROACTIVE_REFRESH_SKEW_MS,
   classifyCredentialRefresh,
+  clearUpgradeRequired,
   markVmRefreshError,
+  refreshErrorCodeOf,
   mirrorWorkerCredentialsToVm,
 } from './lib/oauth/oauth-credentials.mjs'
 import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
-import { ensureWorkerCredential, repairLocalCredentialLink } from './lib/transport/go-worker-client.mjs'
+import {
+  ensureWorkerCredential,
+  probeWorkerAttemptGuard,
+  repairLocalCredentialLink,
+} from './lib/transport/go-worker-client.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
 import { corsHeadersForRequest } from './lib/http/cors.mjs'
@@ -589,6 +595,15 @@ credentialRefreshMonitor = createCredentialRefreshMonitor({
       } catch {}
       return { ...vm, last_probe: lastProbe }
     }),
+  reviveOne: async (vm) => {
+    const vmPath = path.join(cfg.paths.project, 'vms', `${vm.id}.json`)
+    const homeDir = path.join(cfg.paths.project, 'vms', vm.id, 'cli-home')
+    const exec = { vmId: vm.id, vmPath, homeDir, vm: getVm(cfg.paths.project, vm.id) || vm }
+    if (!(await probeWorkerAttemptGuard(exec))) return { revived: false }
+    const cleared = clearUpgradeRequired(vmPath)
+    if (cleared) invalidateLiveCredentialCache()
+    return { revived: cleared }
+  },
   refreshOne: (vm) =>
     refreshWorkerCredentialForVm({
       vmId: vm.id,
@@ -760,14 +775,20 @@ function publicCredentialRefreshResult(vmId, result, { force = false } = {}) {
     },
   }
   if (!result?.ok) {
+    const derived = refreshErrorCodeOf(result)
+    const code = derived === 'worker_upgrade_required' ? derived : result?.error?.code || 'credential_refresh_failed'
     out.error = {
-      code: result?.error?.code || 'credential_refresh_failed',
+      code,
       message:
-        refreshClass === 'fatal'
-          ? 'OAuth credential was rejected'
-          : refreshClass === 'retryable'
-            ? 'OAuth credential refresh is temporarily unavailable'
-            : 'OAuth credential refresh failed',
+        code === 'refresh_outcome_unknown'
+          ? 'An earlier refresh with this credential has no recorded result; re-authorize the slot'
+          : code === 'worker_upgrade_required'
+            ? 'The slot worker cannot guard refresh retries; update kin-worker on this node'
+            : refreshClass === 'fatal'
+              ? 'OAuth credential was rejected'
+              : refreshClass === 'retryable'
+                ? 'OAuth credential refresh is temporarily unavailable'
+                : 'OAuth credential refresh failed',
     }
   }
   return out

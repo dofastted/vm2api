@@ -19,6 +19,7 @@ import { Label } from '@/components/ui/label'
 import { ThemeSwitch } from '@/components/theme-switch'
 import { onboardingQueryOptions } from '@/features/welcome/queries'
 import { meQueryOptions } from './queries'
+import { resolveSignInDestination } from './sign-in-destination'
 
 const OTP_SLOTS = [0, 1, 2, 3, 4, 5]
 
@@ -45,29 +46,28 @@ export function LoginPage() {
     signIn(result.token, result.user)
     // The route guard reads this cache; drop the previous account's views.
     queryClient.removeQueries({ queryKey: meQueryOptions().queryKey })
-    let needsWelcome = false
-    try {
-      const onboarding = await queryClient.fetchQuery(
-        onboardingQueryOptions(true)
-      )
-      needsWelcome = Boolean(onboarding.needs_welcome)
-    } catch {
-      needsWelcome = false
-    }
+    // Before anything is awaited: a deep link navigates away right below, so the toast has to come first.
     toast.success('登录成功')
-    if (needsWelcome) {
-      await navigate({ to: '/welcome', search: { setup: true } })
+    // A usable `redirect` wins over the welcome guide, so it never waits for the onboarding request.
+    const destination = await resolveSignInDestination(
+      search.redirect,
+      async () => {
+        try {
+          const onboarding = await queryClient.fetchQuery(
+            onboardingQueryOptions(true)
+          )
+          return Boolean(onboarding.needs_welcome)
+        } catch {
+          return false
+        }
+      }
+    )
+    if (destination.kind === 'redirect') {
+      await navigate({ href: destination.href })
       return
     }
-    // `redirect` is a router href (`/vm/x?tab=y`); never bounce back into the public pages.
-    const next = search.redirect
-    if (
-      next &&
-      next.startsWith('/') &&
-      !next.startsWith('//') &&
-      !/^\/(welcome|login)\b/.test(next)
-    ) {
-      await navigate({ href: next })
+    if (destination.kind === 'welcome') {
+      await navigate({ to: '/welcome', search: { setup: true } })
       return
     }
     await navigate({ to: '/overview' })

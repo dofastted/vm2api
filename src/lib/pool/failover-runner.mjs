@@ -23,6 +23,7 @@ import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { attachFailureDecision, AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
+import { PoisonRequestGuard } from './poison-request-guard.mjs'
 
 // Seat wait for the one-shot repair hop when the rejected hop already spent the deadline.
 const REPAIR_HOP_WAIT_MS = 30_000
@@ -57,6 +58,13 @@ const DEFAULTS = {
   // so the queue cannot sit forever. 0 disables the cap. Long enough that a
   // normal generation still runs serially; keepalive covers the Cloudflare wait.
   session_queue_timeout_ms: 900_000,
+  // A conversation whose request keeps hitting the kernel's silent-CLI watchdog is refused for a while
+  // instead of being replayed every few minutes. 0 disables it.
+  poison_request_threshold: 2,
+  poison_request_window_ms: 30 * 60_000,
+  poison_request_quarantine_ms: 10 * 60_000,
+  // Different sessions that must go silent on one VM before requests that large are kept off it.
+  poison_request_vm_sessions: 2,
   delivery_mode: 'realtime',
   max_same_account_retries: 1,
   same_account_retry_delay_ms: 500,
@@ -400,6 +408,71 @@ function isCredentialDeath(policy) {
 }
 
 /** Empty / thinking-only hop: replayable on another seat. Never a restart signal. */
+/**
+ * The kernel's job watchdog gave up after 180s without one CLI frame. The slot itself may be fine,
+ * so this says something about the request rather than the seat.
+ */
+function isSilentCliTimeout(policy, result) {
+  if ((policy?.reason !== 'provider_timeout' && policy?.reason !== 'worker_timeout') || result?.committed) return false
+  const text = `${result?.error?.message || ''} ${result?.body?.error?.message || ''} ${result?.message || ''}`
+  return /no CLI frame/i.test(text)
+}
+
+function quarantinedResult({ failures, retryAfterSec }) {
+  const minutes = Math.max(1, Math.ceil(retryAfterSec / 60))
+  return {
+    ok: false,
+    status: 400,
+    via: 'pool-failover',
+    terminalState: 'rejected',
+    finalState: 'rejected',
+    attemptCount: 0,
+    body: {
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        code: ErrorCode.REQUEST_QUARANTINED,
+        message:
+          `This conversation's last request made the worker go silent ${failures} times in a row (no output for 180s), ` +
+          `so it is refused for about ${minutes} min instead of waiting again. ` +
+          'Rewind to before the last tool result (Esc Esc or /rewind) or start a new session. ' +
+          `此对话的最近一次请求已让 worker 连续 ${failures} 次无输出（180 秒），约 ${minutes} 分钟内不再重试；` +
+          '请回退到上一次工具调用之前（Esc Esc 或 /rewind），或新开会话。',
+        details: { failures },
+      },
+    },
+  }
+}
+
+const kb = (bytes) => Math.round(bytes / 1024)
+
+/** Every seat that could serve this request has been silent at this size; say so instead of waiting 180s again. */
+function oversizeForSlotResult({ requestBytes, ceilingBytes, retryAfterSec }) {
+  const minutes = Math.max(1, Math.ceil(retryAfterSec / 60))
+  return {
+    ok: false,
+    status: 400,
+    via: 'pool-failover',
+    terminalState: 'rejected',
+    finalState: 'rejected',
+    attemptCount: 0,
+    body: {
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        code: ErrorCode.REQUEST_TOO_LARGE_FOR_SLOT,
+        message:
+          `Requests of this size (about ${kb(requestBytes)} KB) are currently not answered by the worker that serves this key: ` +
+          `smaller ones were, larger ones went silent for 180s. It will be tried again in about ${minutes} min. ` +
+          'Rewind to an earlier point (Esc Esc or /rewind) or start a new session; /compact sends the whole conversation, so it is refused too. ' +
+          `当前为此 key 服务的 worker 不应答这个体积（约 ${kb(requestBytes)} KB）的请求：更小的请求正常，更大的会静默 180 秒。` +
+          `约 ${minutes} 分钟后再试；请回退到更早的位置（Esc Esc 或 /rewind）或新开会话，/compact 会发送整段对话，同样会被拒绝。`,
+        details: { request_kb: kb(requestBytes), silent_from_kb: kb(ceilingBytes), retry_after_sec: retryAfterSec },
+      },
+    },
+  }
+}
+
 function isRetryableEmptyHop(policy) {
   return policy?.reason === 'incomplete_assistant' || policy?.reason === 'empty_response'
 }
@@ -535,10 +608,29 @@ export class FailoverRunner {
     this.onSchedulePause = onSchedulePause
     this.sessionTails = new Map()
     this.searchRepairs = new Map()
+    this.poisonGuard = new PoisonRequestGuard()
+    this.applyPoisonConfig()
   }
 
   reloadConfig(config = {}) {
     this.config = { ...DEFAULTS, ...(config || {}) }
+    this.applyPoisonConfig()
+  }
+
+  applyPoisonConfig() {
+    this.poisonGuard.threshold = Number(this.config.poison_request_threshold) || 0
+    this.poisonGuard.windowMs = Number(this.config.poison_request_window_ms) || 0
+    this.poisonGuard.quarantineMs = Number(this.config.poison_request_quarantine_ms) || 0
+    this.poisonGuard.vmSessions = Math.max(1, Number(this.config.poison_request_vm_sessions) || 2)
+  }
+
+  /** A hop ended in the kernel's silent-CLI watchdog: remember the request so its retries can be refused. */
+  noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result) {
+    if (!stickyKey || !isSilentCliTimeout(policy, result)) return
+    this.poisonGuard.recordSilentTimeout(stickyKey, canonicalBody, {
+      vm_id: selected?.vmId,
+      account_id: selected?.accountId,
+    })
   }
 
   noteUnitHealth(selected, policy, result) {
@@ -645,6 +737,9 @@ export class FailoverRunner {
 
   async run(args = {}) {
     const sessionKey = String(args.stickyKey || '')
+    // Before queueing behind the session's hung turn: a refused retry must cost nothing.
+    const quarantined = args.pinVmId ? null : this.poisonGuard.check(sessionKey, args.canonicalBody)
+    if (quarantined) return quarantinedResult(quarantined)
     if (!sessionKey) return this.runOnce(args)
     const previous = this.sessionTails.get(sessionKey) || Promise.resolve()
     let releaseTurn
@@ -883,6 +978,8 @@ export class FailoverRunner {
         )
       }
       let selected = null
+      // Seats that stopped answering requests of this size: skip them, unless an operator pinned one for diagnosis.
+      const sizeRefused = pinVmId ? [] : this.poisonGuard.refusedVms(canonicalBody)
       try {
         currentDeviceVmId = deviceKey ? this.stickyRouter?.resolve?.(deviceKey)?.vmId || null : null
         const selectArgs = {
@@ -890,7 +987,7 @@ export class FailoverRunner {
           stickyKey,
           stickyKeys: bindKeys,
           seatKey,
-          excluded,
+          excluded: sizeRefused.length ? new Set([...excluded, ...sizeRefused.map((r) => r.vmId)]) : excluded,
           spilled,
           signal,
           deadline: repairPending ? Math.max(deadline, Date.now() + REPAIR_HOP_WAIT_MS) : deadline,
@@ -988,6 +1085,14 @@ export class FailoverRunner {
             }),
             ...attribution(),
           }
+        }
+        if (
+          !selected?.ok &&
+          sizeRefused.length &&
+          !CAPACITY_SELECTION_REASONS.has(selected?.reason) &&
+          selected?.reason !== 'pool_rate_limited'
+        ) {
+          return { ...oversizeForSlotResult(sizeRefused[0]), ...attribution() }
         }
         if (!selected?.ok) {
           const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
@@ -1135,6 +1240,7 @@ export class FailoverRunner {
         lastResult = result
         lastPolicy = policy
         this.noteUnitHealth(selected, policy, result)
+        this.noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result)
         if (attemptMeta?.sessionId) {
           bindAll(
             { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
@@ -1187,6 +1293,7 @@ export class FailoverRunner {
           }
         }
         if (verifiedSuccess(result)) {
+          this.poisonGuard.recordSuccess(stickyKey, { vmId: selected.vmId, body: canonicalBody })
           if (repairKey && (knownSearchRepair || searchRepair?.key === repairKey)) {
             this.searchRepairs.delete(repairKey)
             while (this.searchRepairs.size >= SEARCH_REPAIR_LIMIT) {
@@ -1338,6 +1445,7 @@ export class FailoverRunner {
         lastResult = result
         lastPolicy = policy
         this.noteUnitHealth(selected, policy, result)
+        this.noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result)
         notifyProxyFailure(this.onProxyFailure, selected, policy)
         this.attemptsRepo?.complete?.(requestId, attemptNo, {
           upstreamStatus: 0,
