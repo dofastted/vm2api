@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 「从其他设备迁移」入口放出来了。签发侧的 `claim-by-order` 已部署到生产（crag#14，账本 schema 15→16、`voucher_orders` 建表、账本计数前后逐项一致），1.4.176 里挡着这个入口的那个理由不存在了。路由可达是用能区分两种 404 的办法验证的，而不是看它是否返回 404：格式非法的订单号返 400 `invalid_request`，说明请求走到了签发侧的 `validate_order_id`；而一条确实不存在的路由返 404 `not_found`，那是 `.fallback(not_found)`。迁移本体先在生产数据副本上演练过一次（生产机上独立 state-dir，不碰生产账本），行数逐项对齐、`integrity_check` 通过（#1589）。
+- 注意与 1.4.176 的描述有一处不同：那里写的是「等那条路由部署完翻一个常量即可」，实际做法是把 `CLAIM_BY_ORDER_AVAILABLE` 连同它那段注释一起删掉，按钮回到加开关之前的无条件渲染。翻成 `true` 会留下一个恒真的三元（死代码），而那段注释讲的是一个已经过去的状态——留着会让下一个人以为它还有切换的意图，或者以为那条路由仍然可能不存在。要再关掉的话 revert 即可，不需要那个常量存在。「迁入不要求本机已有订阅」那条注释留在原处，它在恢复后依然成立；测试相应改回被它替换掉的断言，四个状态都 `toContain`——换机的常态是新机器还是空的，按订阅状态设门会把入口从最需要它的宿主机上藏掉（#1589）。
+
 ## 1.4.177 — 2026-11-22 · Gemini 集中运维与故障恢复入口，费用总计行的口径区分
 
 - Gemini 宿主的诊断与修复收进面板，不必再登服务器敲命令。新增一个宿主侧维护代理（`scripts/gemini-maintenance.py`，systemd 单元 `vm2api-gemini-maintenance`，走 `/run/vm2api-gemini-maintenance/control.sock`），面板「设置 → Gemini：诊断与维护」可提交 `diagnose` / `install` / `repair` / `recover` / `update_cli` / `update_native` / `rollback`，并展示宿主状态、受信签名版本清单与回滚目标。各处宿主不可用的提示改为指向这个入口（`GeminiMaintenanceLink`），取代原先那句「请在宿主检查 `systemctl status vm2api-gemini`」——让运维点进一个能读状态、能提交修复的界面，比让他照抄一条命令更有用。管理员拿到可点的链接，普通用户拿到「请联系管理员」的说明（#1574）。
