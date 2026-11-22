@@ -2674,3 +2674,213 @@ test('keep_pin_on_model_gate: a borrowed account never takes the session, family
   assert.equal(result.accountId, 'account-2')
   assert.deepEqual(binds, [])
 })
+
+// --- poison request quarantine ---------------------------------------------
+
+function silentTimeout() {
+  return {
+    ok: false,
+    status: 504,
+    committed: false,
+    terminalState: 'rejected',
+    body: {
+      error: { type: 'upstream_timeout', code: 'upstream_timeout', message: 'job idle timeout: no CLI frame for 180s' },
+    },
+  }
+}
+
+const turnBody = (...extra) => ({
+  model: 'claude-opus-test',
+  messages: [
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/x' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+    ...extra,
+  ],
+})
+
+function poisonHarness(config = {}) {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler, config: { max_same_account_retries: 0, ...config } })
+  runner.poisonGuard.logger = { warn() {} }
+  const calls = { n: 0 }
+  const send = (body, { stickyKey = 'sess:client-1', outcome = silentTimeout() } = {}) =>
+    runner.run({
+      requestId: `req-${calls.n + 1}`,
+      canonicalBody: body,
+      model: 'claude-opus-test',
+      stream: false,
+      stickyKey,
+      stickyKeys: [stickyKey],
+      callAttempt: () => {
+        calls.n += 1
+        return typeof outcome === 'function' ? outcome() : outcome
+      },
+    })
+  return { runner, scheduler, calls, send }
+}
+
+test('after two silent timeouts the third identical request is refused without touching a seat', async () => {
+  const { scheduler, calls, send } = poisonHarness()
+  await send(turnBody())
+  await send(turnBody())
+  assert.equal(calls.n, 2)
+  const selectBefore = scheduler.selectCalls
+  const started = Date.now()
+  const out = await send(turnBody())
+  assert.equal(calls.n, 2, 'no kernel job for the quarantined request')
+  assert.equal(scheduler.selectCalls, selectBefore, 'no seat reserved')
+  assert.ok(Date.now() - started < 500)
+  assert.equal(out.status, 400)
+  assert.equal(out.body.error.type, 'invalid_request_error')
+  assert.equal(out.body.error.code, 'request_quarantined')
+  assert.match(out.body.error.message, /rewind|new conversation|new session/i)
+  assert.equal(out.finalState, 'rejected')
+  assert.equal(out.attemptCount, 0)
+})
+
+test('a quarantined conversation that only grew is still refused, a rewound one goes through', async () => {
+  const { calls, send } = poisonHarness()
+  await send(turnBody())
+  await send(turnBody())
+  const grown = await send(turnBody({ role: 'assistant', content: 'x' }, { role: 'user', content: 'continue' }))
+  assert.equal(grown.body.error.code, 'request_quarantined')
+  const rewound = turnBody()
+  rewound.messages.pop()
+  const out = await send(rewound, { outcome: success() })
+  assert.equal(out.ok, true)
+  assert.equal(calls.n, 3)
+})
+
+test('another session on the same seat is unaffected', async () => {
+  const { send } = poisonHarness()
+  await send(turnBody())
+  await send(turnBody())
+  const other = await send(turnBody(), { stickyKey: 'sess:client-2', outcome: success() })
+  assert.equal(other.ok, true)
+})
+
+test('ordinary timeouts and other failures never quarantine', async () => {
+  const { calls, send } = poisonHarness()
+  const plain = () => ({
+    ...silentTimeout(),
+    body: { error: { type: 'upstream_timeout', message: 'upstream request timed out' } },
+  })
+  await send(turnBody(), { outcome: plain })
+  await send(turnBody(), { outcome: plain })
+  const out = await send(turnBody(), { outcome: plain })
+  assert.equal(calls.n, 3)
+  assert.notEqual(out.body?.error?.code, 'request_quarantined')
+})
+
+test('a success on the session lifts the record', async () => {
+  const { calls, send } = poisonHarness()
+  await send(turnBody())
+  await send(turnBody(), { outcome: success() })
+  const out = await send(turnBody())
+  assert.equal(calls.n, 3)
+  assert.notEqual(out.body?.error?.code, 'request_quarantined')
+})
+
+test('the guard can be turned off from config', async () => {
+  const { calls, send } = poisonHarness({ poison_request_threshold: 0 })
+  for (let i = 0; i < 4; i += 1) await send(turnBody())
+  assert.equal(calls.n, 4)
+})
+
+test('a quarantined session is not counted toward the per-VM kernel circuit', async () => {
+  const { vmTimeoutTracker } = await import('../../src/lib/pool/failover-runner.mjs')
+  vmTimeoutTracker.reset()
+  const { send } = poisonHarness()
+  for (let i = 0; i < 6; i += 1) await send(turnBody())
+  assert.ok((vmTimeoutTracker.counts.get('vm-01')?.count || 0) < 3, 'refused requests never reach the tracker')
+})
+
+// --- per-VM size ceiling in the runner --------------------------------------
+
+const bigBody = (kb) => ({ model: 'claude-opus-test', messages: [{ role: 'user', content: 'x'.repeat(kb * 1024) }] })
+
+function ceilingHarness(candidates) {
+  const scheduler = new Scheduler(candidates)
+  const runner = new FailoverRunner({ scheduler, config: { max_same_account_retries: 0 } })
+  runner.poisonGuard.logger = { warn() {} }
+  const served = []
+  const send = (kb, session, { outcome = success(), extra = {} } = {}) =>
+    runner.run({
+      requestId: `req-${served.length + 1}`,
+      canonicalBody: bigBody(kb),
+      model: 'claude-opus-test',
+      stream: false,
+      stickyKey: `sess:${session}`,
+      stickyKeys: [`sess:${session}`],
+      callAttempt: ({ candidate }) => {
+        served.push(candidate.vmId)
+        return typeof outcome === 'function' ? outcome(candidate) : outcome
+      },
+      ...extra,
+    })
+  return { send, served, scheduler, runner }
+}
+
+test('once two sessions went silent on a VM, a larger request is served by another seat', async () => {
+  const { send, served } = ceilingHarness([candidate(1), candidate(2)])
+  // Only vm-01 goes quiet; its failed requests are answered by vm-02 within the same call.
+  const onlyVm01Silent = (seat) => (seat.vmId === 'vm-01' ? silentTimeout() : success())
+  await send(60, 'a', { outcome: onlyVm01Silent })
+  await send(70, 'b', { outcome: onlyVm01Silent })
+  served.length = 0
+  const out = await send(80, 'c')
+  assert.equal(out.ok, true)
+  assert.deepEqual(served, ['vm-02'], 'the VM that went silent is skipped for requests this large')
+  served.length = 0
+  await send(10, 'd')
+  assert.deepEqual(served, ['vm-01'], 'small requests still use it')
+})
+
+test('with no other seat the oversized request is refused with a clear 400 and sends nothing', async () => {
+  const { send, served } = ceilingHarness([candidate(1)])
+  await send(60, 'a', { outcome: silentTimeout })
+  await send(70, 'b', { outcome: silentTimeout })
+  served.length = 0
+  const out = await send(80, 'c')
+  assert.deepEqual(served, [])
+  assert.equal(out.status, 400)
+  assert.equal(out.body.error.type, 'invalid_request_error')
+  assert.equal(out.body.error.code, 'request_too_large_for_slot')
+  assert.match(out.body.error.message, /rewind|new session|new conversation/i)
+  assert.match(out.body.error.message, /compact/i, 'warns that compacting sends the whole conversation')
+  assert.equal(out.attemptCount, 0)
+})
+
+test('an operator pin to the VM still reaches it, for diagnosis', async () => {
+  const { send, served } = ceilingHarness([candidate(1)])
+  await send(60, 'a', { outcome: silentTimeout })
+  await send(70, 'b', { outcome: silentTimeout })
+  served.length = 0
+  await send(80, 'c', { extra: { pinVmId: 'vm-01' } })
+  assert.deepEqual(served, ['vm-01'])
+})
+
+test('while a ceiling is active a small request is still sent and a large one is still refused', async () => {
+  const { send, served } = ceilingHarness([candidate(1)])
+  await send(60, 'a', { outcome: silentTimeout })
+  await send(70, 'b', { outcome: silentTimeout })
+  served.length = 0
+  await send(10, 'd')
+  const still = await send(80, 'c')
+  assert.equal(still.body.error.code, 'request_too_large_for_slot')
+  assert.deepEqual(served, ['vm-01'], 'only the small request was sent')
+})
+
+test('successes that pass through the runner raise the floor, so an incident cannot close the VM below them', async () => {
+  const { send, served } = ceilingHarness([candidate(1)])
+  await send(50, 'z') // the VM answers a 50 KB request
+  await send(8, 'a', { outcome: silentTimeout }) // then two sessions go quiet for an unrelated reason
+  await send(300, 'b', { outcome: silentTimeout })
+  served.length = 0
+  const small = await send(10, 'c')
+  assert.equal(small.ok, true, 'a 10 KB request is below what the VM has just served')
+  assert.deepEqual(served, ['vm-01'])
+  const big = await send(120, 'd')
+  assert.equal(big.body.error.code, 'request_too_large_for_slot', 'what was never shown to work is still kept off')
+})
