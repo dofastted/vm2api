@@ -369,3 +369,10 @@ test('writeKernelConfig uses guest socket path and runtime_kind kvm', () => {
   assert.equal(written.socketPath, path.join(root, 'vms', 'vm-02', 'run', 'kernel.sock'))
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+test('kvm cloud-init user-data masks systemd-time-wait-sync in bootcmd', () => {
+  const userData = fs.readFileSync(path.resolve('docker/kin-kvm/guest/user-data'), 'utf8')
+  assert.match(userData, /^#cloud-config\b/m)
+  assert.match(userData, /^bootcmd:/m)
+  assert.match(userData, /systemctl mask --now --no-block systemd-time-wait-sync\.service/)
+})
