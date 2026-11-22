@@ -2,6 +2,7 @@ import { useRef, useState } from 'react'
 import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { api } from '@/lib/api'
+import { isGeminiHostIssue } from '@/lib/gemini-recovery'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -9,10 +10,12 @@ import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { WsTerminal } from '@/components/ws-terminal-lazy'
 import { GeminiRedeemDialog } from '@/features/billing/gemini-redeem-dialog'
+import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-link'
 import {
   GEMINI_INVENTORY_KEY as QUERY_KEY,
   GEMINI_ROOT as ROOT,
   geminiProxyOptions,
+  geminiError,
   isGeminiProxy,
   useGeminiBusy,
   useGeminiMutation,
@@ -160,11 +163,12 @@ export function GeminiStartupStatus({
 }) {
   if (!inventory.available)
     return (
-      <p role='status' className='text-sm'>
-        {inventory.host_message || '未检测到可用的 Gemini 宿主服务。'}{' '}
-        请在宿主检查 <code>systemctl status vm2api-gemini</code>；未安装时运行{' '}
-        <code>deploy/install.sh prepare-gemini</code>。
-      </p>
+      <div className='space-y-2'>
+        <p role='status' className='text-sm'>
+          {inventory.host_message || '未检测到可用的 Gemini 宿主服务。'}
+        </p>
+        <GeminiMaintenanceLink />
+      </div>
     )
   const payloadIssue = geminiPayloadIssue(inventory)
   return (
@@ -184,6 +188,9 @@ export function GeminiStartupStatus({
       ) : null}
       {inventory.oauth_runtime_issue ? (
         <p role='status'>{OAUTH_ISSUES[inventory.oauth_runtime_issue]}</p>
+      ) : null}
+      {payloadIssue || inventory.oauth_runtime_issue ? (
+        <GeminiMaintenanceLink />
       ) : null}
     </div>
   )
@@ -424,6 +431,7 @@ function GeminiTerminal({
         <p className='text-sm text-muted-foreground'>
           通过绑定代理以 Plan 模式运行 Antigravity CLI，不启用 API 推理。
         </p>
+        <GeminiMaintenanceLink />
       </div>
       {open ? (
         <div
@@ -601,7 +609,12 @@ export function GeminiEnvironments({
   if (inventory.isPending)
     return <p role='status'>正在检测 Gemini 宿主机服务…</p>
   if (inventory.isError && !inventory.data)
-    return <p role='alert'>读取 Gemini 环境失败。</p>
+    return (
+      <div className='space-y-2'>
+        <p role='alert'>读取 Gemini 环境失败。</p>
+        <GeminiMaintenanceLink />
+      </div>
+    )
   if (!inventory.data) return null
   if (!inventory.data.available)
     return <GeminiStartupStatus inventory={inventory.data} />
@@ -927,9 +940,14 @@ export function GeminiEnvironments({
         </p>
       ) : null}
       {operation.isError ? (
-        <p role='alert' className='text-sm text-destructive'>
-          {operation.error.message}
-        </p>
+        <div className='space-y-1'>
+          <p role='alert' className='text-sm text-destructive'>
+            {operation.error.message}
+          </p>
+          {isGeminiHostIssue(geminiError(operation.error, '').code) ? (
+            <GeminiMaintenanceLink />
+          ) : null}
+        </div>
       ) : null}
       {environment && !isImport ? (
         <GeminiDetails environment={environment}>{account}</GeminiDetails>
