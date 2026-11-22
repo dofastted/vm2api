@@ -3830,3 +3830,28 @@ test('fresh_account_isolation_ms: bootstrap escape releases a continuing convers
   assert.ok(served.vmId === 'vm-01' || served.vmId === 'vm-02')
   served.release()
 })
+
+test('a cold health cache is probed for every slot at once, not one slot after another', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let inflight = 0
+  let peak = 0
+  const calls = []
+  const pool = scheduler(root, {
+    workerHealth: async ({ vmId }) => {
+      calls.push(vmId)
+      inflight++
+      peak = Math.max(peak, inflight)
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      inflight--
+      return { ok: true, credential: { generation: 1, has_access: true } }
+    },
+  })
+  const candidates = await pool.eligibleCandidates({ model: 'claude-test' })
+  assert.ok(candidates.length >= 2)
+  assert.ok(peak >= 2, `health hops overlapped (peak ${peak})`)
+  assert.equal(new Set(calls).size, calls.length, 'each slot is probed once per scan')
+  // Warm cache: no further hops.
+  await pool.eligibleCandidates({ model: 'claude-test' })
+  assert.equal(calls.length, candidates.length)
+})

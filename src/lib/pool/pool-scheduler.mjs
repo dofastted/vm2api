@@ -1895,6 +1895,7 @@ export class PoolScheduler extends EventEmitter {
     const snapshots = this.runtimeRepo
       ? this.runtimeRepo.schedulingSnapshot(entries.map((entry) => entry.accountId))
       : new Map()
+    const healthFlights = this.prefetchWorkerHealth(entries, snapshots)
     for (const { vm, accountId } of entries) {
       if (signal?.aborted) throw makeAbortError()
       const snapshot = snapshots.get(accountId)
@@ -1949,6 +1950,7 @@ export class PoolScheduler extends EventEmitter {
         signal,
         pinned: !!pin,
         quotaRequest,
+        healthFlight: healthFlights.get(vm.id),
       })
       if (!eligibility.ok) {
         const kind = eligibility.reason
@@ -2051,6 +2053,7 @@ export class PoolScheduler extends EventEmitter {
     quotaRequest = null,
     workerStatus: knownHealth = undefined,
     admission = false,
+    healthFlight = null,
   }) {
     // rate_limit_reset_at / overload_until gate scheduling before any
     // passive Extra reading or health hop. Pins are diagnostics and still reach the slot.
@@ -2175,9 +2178,11 @@ export class PoolScheduler extends EventEmitter {
     const workerStatus =
       dataPath === 'offline'
         ? null
-        : knownHealth === undefined
-          ? await this.getWorkerHealth(this.executionContext(vm, accountId), { signal, state, dataPath })
-          : knownHealth
+        : knownHealth !== undefined
+          ? knownHealth
+          : healthFlight?.dataPath === dataPath
+            ? await this.awaitHealth(healthFlight.promise, signal)
+            : await this.getWorkerHealth(this.executionContext(vm, accountId), { signal, state, dataPath })
     if (!pinned && this.cragSeatOverQuota(vm, workerStatus))
       return { ok: false, reason: 'license_crag_host_over_quota' }
     // Health probing is asynchronous. Re-read time before applying cooldown
@@ -2306,6 +2311,49 @@ export class PoolScheduler extends EventEmitter {
       locale: vm.locale || 'en_US.UTF-8',
       kernel: vm.kernel || null,
     }
+  }
+
+  /**
+   * Start every stale health hop at once. The eligibility scan awaits them one slot at a time and joins
+   * these flights (healthFlights), so a cold cache costs one round trip instead of one per slot: on a
+   * freshly started or just-activated controller each hop opens a new relay channel (0.4–1.6s), and a
+   * sequential scan of ~26 slots held the first requests for ~10s. Not tied to one request's signal: an
+   * aborted request must not cancel a hop the next one will use.
+   */
+  prefetchWorkerHealth(entries, snapshots) {
+    /** vmId → { dataPath, promise }: the scan reuses this answer, even a failed one, instead of hopping again. */
+    const flights = new Map()
+    if (typeof this.workerHealth !== 'function') return flights
+    const now = Date.now()
+    for (const { vm, accountId } of entries) {
+      const dataPath = vmNodeDataPath(vm)
+      if (dataPath === 'offline') continue
+      const state = snapshots?.get?.(accountId)?.state || null
+      const cached = this.healthCache.get(vm.id)
+      if (
+        cached &&
+        cached.dataPath === dataPath &&
+        cached.accountId === accountId &&
+        Number(state?.credential_generation || 0) <= cached.generation &&
+        now - cached.at < this.config.worker_health_ttl_ms
+      )
+        continue
+      const promise = this.getWorkerHealth(this.executionContext(vm, accountId), { state, dataPath })
+      promise.catch(() => {})
+      flights.set(vm.id, { dataPath, promise })
+    }
+    return flights
+  }
+
+  /** Await a shared health flight without letting one request's abort cancel it for the others. */
+  async awaitHealth(promise, signal) {
+    if (signal?.aborted) throw makeAbortError()
+    if (!signal) return await promise
+    return await new Promise((resolve, reject) => {
+      const onAbort = () => reject(makeAbortError())
+      signal.addEventListener('abort', onAbort, { once: true })
+      promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+    })
   }
 
   async getWorkerHealth(exec, { signal = undefined, state = null, dataPath = vmNodeDataPath(exec.vm) } = {}) {
@@ -2459,12 +2507,15 @@ export class PoolScheduler extends EventEmitter {
       .map((summary) => getVm(this.projectRoot, summary.id))
       .filter((vm) => vm && vm.schedulable !== false && vm.status === 'running' && !isCodexVm(vm))
     const snapshots = await this.runtimeRepo.schedulingSnapshot(vms.map((vm) => accountIdOf(vm, this.projectRoot)))
-    for (const vm of vms) {
-      if (this.maintenanceStopped) return
-      if (vmNodeDataPath(vm) === 'offline') continue
-      const accountId = accountIdOf(vm, this.projectRoot)
-      await this.getWorkerHealth(this.executionContext(vm, accountId), { state: snapshots.get(accountId)?.state })
-    }
+    // In parallel: one sequential round over a cold relay outlasts worker_health_ttl_ms.
+    await Promise.allSettled(
+      vms.map((vm) => {
+        if (this.maintenanceStopped || vmNodeDataPath(vm) === 'offline') return null
+        const accountId = accountIdOf(vm, this.projectRoot)
+        return this.getWorkerHealth(this.executionContext(vm, accountId), { state: snapshots.get(accountId)?.state })
+      }),
+    )
+    if (this.maintenanceStopped) return
     await this.flushHealthWrites()
   }
 
