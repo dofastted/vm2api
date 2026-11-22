@@ -469,6 +469,13 @@ test('Ultrafast selects long rates above 272K including cached input', () => {
 test('GPT tier the model does not offer, or unknown tier, stays unpriced', () => {
   assert.equal(calculateCost({ input_tokens: 10, service_tier: 'flex' }, 'gpt-5.3-codex').known, false)
   assert.equal(calculateCost({ input_tokens: 10, service_tier: 'scale' }, 'gpt-5.5').known, false)
+  // GPT-6.2 has no published Flex price and is not getting one. The older models' Flex happens to
+  // sit at half of standard, so a derived band would look plausible and bill at half rate forever.
+  assert.equal(calculateCost({ input_tokens: 10, service_tier: 'flex' }, 'gpt-6.2-astra').known, false)
+  assert.equal(calculateCost({ input_tokens: 10, service_tier: 'flex' }, 'gpt-6.2-sol').known, false)
+  assert.equal(calculateCost({ input_tokens: 300_000, service_tier: 'flex' }, 'gpt-6.2-sol').known, false)
+  // The tiers it does publish stay priced, so this is not the whole mode table going missing.
+  assert.equal(calculateCost({ input_tokens: 100_000, service_tier: 'priority' }, 'gpt-6.2-sol').total_cost, 0.4)
 })
 
 test('GPT-5.6-sol fast long context keeps 1.25x cache write on the long-fast input', () => {
