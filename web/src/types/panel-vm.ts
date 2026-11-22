@@ -317,6 +317,8 @@ export type Vm = {
   unschedulable_reason?: string | null
   unschedulable_text?: string | null
   unschedulable_detail?: Record<string, unknown> | null
+  /** 进入不可调度（含吊销）的时刻，ISO 字符串 */
+  unschedulable_at?: string | null
   schedule_off?: boolean
   schedule_hold?: {
     reason: string

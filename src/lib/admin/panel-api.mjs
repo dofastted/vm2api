@@ -2194,6 +2194,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     unschedulable_reason: triad.unschedulable_reason,
     unschedulable_text: triad.unschedulable_text,
     unschedulable_detail: triad.unschedulable_detail,
+    unschedulable_at: v.unschedulable?.at || null,
     // Claude unit circuit (Codex has its own failover set and never trips it).
     circuit,
     refresh_error: v.refresh_error || v.claude?.refresh_error || runtime?.refresh_error || null,
