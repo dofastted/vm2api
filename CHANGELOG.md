@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 降级的订阅状态仍然报告本机设备标识。`status()` 的外层 catch 返回 `state: 'unavailable'` 时把 `device_uuid` 与 `identity_source` 一起丢掉了，而那两个值在抛错之前就已经从本机文件读出、与签发侧无关——丢掉它们只会让面板对最需要它们的宿主机隐藏身份：`CragDeviceIdentity` 在 `device_uuid` 缺失时整块返回 null，而「从其他设备迁移」是它里面唯一的出路入口。身份改为在 catch 里重新读取，而不是提到 `try` 之外：读取本身会抛，提出去会让整个 status 响应一起崩，而不是退化成这个分支原有的形状；重新读取拿到的是同一个值，`readLocalRights()` 的 uuid 就来自 `deviceIdentity()`（#1604）。
+- 需要说明它**不是**凭据失配那个场景的修复。落进外层 catch 的只有 `readLocalRights`、`readDeferredReleases`、`runtimeStatus` 抛错，其余调用各有自己的内层 catch；签发侧拒绝凭据不在其中——`authority('status', ...)` 的 403 被内层接住，那条路径继续返回本地权益，`device_uuid` 一直都在。1.4.176 那条「暂不放出迁入入口」才是当时宿主机看不到出路的原因，v1.4.178 起已可见。所以本条覆盖的是那几种更罕见的本地读取故障，不变量本身成立：降级响应也应当报告它本来就读到的身份。测试复用 `seatReleaseFixture`，写一个畸形的 `deleted-slots.json` 让 `readDeferredReleases` 抛错——该分支在实践中真正的样子——并断言降级响应里的身份与正常路径逐字相同（#1604）。
+
 ## 1.4.179 — 2026-11-22 · Arch KVM 槽不再卡在时间同步，KVM 容器 pids 跟随槽位容量，缓存断点自保 TTL 序
 
 - Arch 云镜像建出来的 KVM 槽不再卡死在时间同步上。Arch 官方云镜像默认启用 `systemd-time-wait-sync.service`（`TimeoutStartSec=infinity`），而 `pacman-init.service` 把自己排在 `After=time-sync.target`、`Before=sshd.service cloud-final.service`；KVM 槽经 SOCKS5 出口（只过 TCP），UDP 的 NTP 123 永远完不成，于是 `sshd` 与 `cloud-final`（`runcmd` → `install-guest.sh` → `kin-kernel`）一个都起不来，新槽表现为 `guest ssh unavailable` / `Connection reset by peer` 并反复触发看门狗重启。现在 `docker/kin-kvm/guest/user-data` 里加一条 `bootcmd`，在 cloud-init 的 Network 阶段（早于 `cloud-final` / `runcmd`）把这个 unit mask 掉，用 `command -v systemctl` 守卫，所以没有这个 unit 的发行版（Ubuntu / Debian / Fedora）不受影响；`bootcmd` 是 per-always 模块，不受 user-data 里「instance-id 稳定所以 datasource 只跑一次」的影响，而 `mask` 本身幂等（#1595）。
