@@ -716,7 +716,7 @@ test('device checkout skips panel login, scopes orders to browser and host, and 
   assert.equal(applied, 1)
 })
 
-test('a device order outlives its checkout cookie and is recoverable by id onto the host that bought it', async (t) => {
+test('a device order outlives its checkout cookie and is recoverable by its order id alone', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-device-reclaim-'))
   const db = createDatabase({ dbPath: path.join(root, 'kin.db') })
   t.after(() => {
@@ -724,7 +724,7 @@ test('a device order outlives its checkout cookie and is recoverable by id onto 
     fs.rmSync(root, { recursive: true, force: true })
   })
   const deviceId = 'a'.repeat(64)
-  let host = deviceId
+  const host = deviceId
   let status = 'pending'
   let confirmed = false
   let applied = 0
@@ -799,8 +799,9 @@ test('a device order outlives its checkout cookie and is recoverable by id onto 
   await call('GET', '/plans')
   const id = (await call('POST', '/orders', { ...INPUT, expected_amount_minor: PLAN.amount_minor })).data.order_id
   assert.equal((await call('GET', '/orders')).data.orders.length, 1)
-  // Recorded at purchase: without it a recovery could not tell which machine an order
-  // belongs to, since the owner is a digest of the host and the cookie together.
+  // Recorded at purchase as provenance. It is this installation's own machine id, so it is
+  // the same value for every device order in this database and cannot tell two buyers
+  // apart — what distinguishes them is the cookie token, already inside `owner`.
   assert.equal(deviceHost(id), deviceId)
 
   // Losing the cookie is what orphaned a paid order. The listing goes empty and, because
@@ -812,13 +813,16 @@ test('a device order outlives its checkout cookie and is recoverable by id onto 
   assert.notEqual(cookie, lost)
   assert.equal((await call('GET', '/orders')).data.orders.length, 0)
 
-  // An order bought for a different machine stays out of reach: its entitlement can only
-  // ever apply to the host it was bought for, so moving it would hand over something dead.
-  host = 'b'.repeat(64)
-  assert.equal((await call('POST', `/orders/${id}/recover`, {})).error.code, 'shop_order_other_host')
-  host = deviceId
+  // A row carrying some other host is still recoverable, and the column is refreshed to
+  // this machine. Since `device_host` is one constant per installation, a mismatch never
+  // means another buyer — it means this gateway's own identity changed, and that is the
+  // moment every device order's owner digest stops matching at once, leaving recovery as
+  // the only way back. Refusing it there turned a recoverable order into a permanently
+  // undeliverable one, which is the failure this route exists to prevent.
+  db.prepare('UPDATE crag_shop_orders SET device_host = ? WHERE order_id = ?').run('b'.repeat(64), id)
 
   assert.equal((await call('POST', `/orders/${id}/recover`, {})).data.order_id, id)
+  assert.equal(deviceHost(id), deviceId)
   assert.equal((await call('GET', '/orders')).data.orders.length, 1)
   // Recovery has to restore delivery, not just visibility.
   status = 'fulfilled'

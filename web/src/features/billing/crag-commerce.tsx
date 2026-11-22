@@ -83,8 +83,6 @@ export function quoteProblem(error: unknown) {
     return '订单私有存储不可用。请让管理员检查数据目录和原收据密钥，再操作原订单。'
   if (code === 'shop_device_checkout_required')
     return '请允许浏览器 Cookie，刷新设备购买页后重试。'
-  if (code === 'shop_order_other_host')
-    return '这笔订单是为另一台宿主机买的。它的权益只能应用到下单时那台机器，请在那台机器的面板上找回。'
   if (code === 'shop_order_recover_conflict')
     return '本浏览器已有一笔来自同一次结账的订单。请在另一个浏览器找回，或联系管理员核对这两笔订单。'
   if (code.includes('coupon'))

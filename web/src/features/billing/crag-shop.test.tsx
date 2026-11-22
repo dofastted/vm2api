@@ -435,7 +435,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     )
   })
 
-  it('says an order bought for another host cannot be recovered here', async () => {
+  it('says which recovery failure is worth acting on when one order id is already held', async () => {
     const id = '6945109e-80be-4d23-9793-68ba195765ce'
     state.values[3] = []
     render(true)
@@ -447,13 +447,13 @@ describe('CRAG buyer presentation and activation wire', () => {
     field?.props?.onChange?.({ target: { value: id } })
     render(true)
     vi.mocked(cragDeviceApi).mockRejectedValue(
-      new ApiError('refused', 409, { code: 'shop_order_other_host' })
+      new ApiError('refused', 409, { code: 'shop_order_recover_conflict' })
     )
     state.recoverConfirm?.handleConfirm?.()
     await settle()
-    // The entitlement only applies to the machine that bought it, so naming the host is
-    // the actionable part — retrying here never succeeds.
-    expect(render(true)).toContain('这笔订单是为另一台宿主机买的')
+    // The UNIQUE(owner, request_id) collision is the one recovery refusal left, and
+    // retrying in this browser never clears it — the actionable part is saying so.
+    expect(render(true)).toContain('本浏览器已有一笔来自同一次结账的订单')
   })
 
   it('keeps a safe actionable package error beside its order, including the authority request id', async () => {

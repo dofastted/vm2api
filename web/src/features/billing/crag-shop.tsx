@@ -235,7 +235,7 @@ function applicationError(
   ) {
     text = hostRedemptionError(error)
   } else if (
-    /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable|order_other_host|order_recover_conflict)$/.test(
+    /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable|order_recover_conflict)$/.test(
       code
     )
   ) {
@@ -1000,7 +1000,7 @@ function ShopOrders({
           : isApiError(error) && error.code === 'shop_device_package_unready'
             ? '本机缺少可用的 CRAG 发行包。请让管理员从内核页拉取后，重试应用原订单。'
             : isApiError(error) &&
-                /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable|order_other_host|order_recover_conflict)$/.test(
+                /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable|order_recover_conflict)$/.test(
                   error.code
                 )
               ? quoteProblem(error)
@@ -1453,7 +1453,7 @@ function ShopOrders({
             if (!open && !busy) setRecoverOpen(false)
           }}
           title='用订单号找回订单'
-          desc='免登录订单按浏览器保存，换浏览器或清除 Cookie 后就看不到了。输入下单时的订单号即可把它取回到这个浏览器，付款和已到账的权益都不受影响。订单只能找回到当初下单的那台宿主机。'
+          desc='免登录订单按浏览器保存，换浏览器或清除 Cookie 后就看不到了。输入下单时的订单号即可把它取回到这个浏览器，付款和已到账的权益都不受影响。订单号就是这笔订单的凭据——持有它的人就能把订单取到自己的浏览器，请妥善保存、不要外传。'
           confirmText='找回'
           cancelBtnText='返回'
           disabled={!isOrderId(recoverId.trim())}
