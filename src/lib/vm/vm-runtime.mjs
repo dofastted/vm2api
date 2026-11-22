@@ -1205,7 +1205,7 @@ export function buildKvmRunArgs({
     '--memory-swap',
     mem,
     '--pids-limit',
-    '256',
+    String(slotCreationLimits(vm, routing).pids),
     '--security-opt',
     'no-new-privileges',
     '--cap-drop',
