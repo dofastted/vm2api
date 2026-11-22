@@ -18,6 +18,7 @@ import {
   rememberRustHealth,
   peekRustHealth,
 } from '../../src/lib/transport/kernel-router.mjs'
+import { bindPlacement, unbindPlacement } from '../../src/lib/cluster/placement.mjs'
 import { rustKernelBusy, rustKernelHealth, rustKernelReachable } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { inferenceCodec } from '../../src/lib/transport/inference-codec.mjs'
 import {
@@ -3068,7 +3069,7 @@ unixTest('re-probe off (kernel_down_reprobe_ms: 0) keeps the immediate failure',
     res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0 }))
   })
   t.after(() => fx.close())
-  t.mock.method(console, 'warn', () => {})
+  const warn = t.mock.method(console, 'warn', () => {})
   const prepared = await prepareInferenceHop({
     exec: fx.exec,
     body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
@@ -3076,6 +3077,44 @@ unixTest('re-probe off (kernel_down_reprobe_ms: 0) keeps the immediate failure',
   })
   assert.equal(prepared.ready?.reason, 'kernel_unavailable')
   assert.equal(probes, 1)
+  // Off really is the old behaviour: no re-probe ran, so no down-kernel line either.
+  const logged = warn.mock.calls
+    .map((call) => String(call.arguments[0]))
+    .filter((line) => line.includes('rust_kernel_down'))
+  assert.deepEqual(logged, [])
+})
+
+unixTest('a slot that goes offline during the re-probe reports reconnecting, not a down kernel', async (t) => {
+  withFakeKernelBin(t)
+  bindPlacement({ manager: { slotDataPath: () => 'offline' } })
+  t.after(() => unbindPlacement())
+  let probes = 0
+  let fx = null
+  fx = await kernelFixture((req, res) => {
+    if (req.url !== '/internal/health') {
+      res.writeHead(500)
+      return res.end()
+    }
+    probes++
+    // The first probe sees a local slot that is not ready yet; while the second
+    // probe is in flight the slot moves onto a node whose link is down.
+    if (probes === 2) fx.exec.vm.node_id = 'node-gone'
+    res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0 }))
+  })
+  t.after(() => fx.close())
+  const warn = t.mock.method(console, 'warn', () => {})
+  const prepared = await prepareInferenceHop({
+    exec: fx.exec,
+    body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+    routing: { inference: { health_ttl_ms: 0, kernel_down_reprobe_ms: 2000 } },
+  })
+  assert.equal(prepared.ready?.ok, false)
+  assert.equal(prepared.ready?.reason, 'cluster_slot_reconnecting')
+  assert.equal(probes, 2)
+  const logged = warn.mock.calls
+    .map((call) => String(call.arguments[0]))
+    .filter((line) => line.includes('rust_kernel_down'))
+  assert.deepEqual(logged, [])
 })
 
 unixTest('a re-probe of a kernel that stops answering stays inside the window it was given', async (t) => {
