@@ -797,6 +797,8 @@ export class FailoverRunner {
     keyScope = null,
     countUsage = true,
     quotaRequest = null,
+    // false: never wait for a seat; a full pool fails at once (x-kin-queue: off).
+    allowQueue = true,
   } = {}) {
     if (!this.scheduler) throw new Error('FailoverRunner requires a scheduler')
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
@@ -1018,7 +1020,7 @@ export class FailoverRunner {
           if (elsewhere?.ok) selected = elsewhere
           else await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
         }
-        if (!selected) selected = await this.scheduler.selectAndReserve({ ...selectArgs, allowWait: true })
+        if (!selected) selected = await this.scheduler.selectAndReserve({ ...selectArgs, allowWait: allowQueue })
       } catch (error) {
         if (error?.code === 'selection_cancelled') {
           return { ...clientCancelledResult(), via: 'pool-failover', ...attribution() }
