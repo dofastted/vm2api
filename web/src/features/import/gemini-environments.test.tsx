@@ -11,9 +11,11 @@ function showGemini(
   available: boolean,
   view: 'import' | 'vm' = 'import',
   kind: 'oauth' | 'api_key' = 'oauth',
-  status: Partial<GeminiInventory> = {}
+  status: Partial<GeminiInventory> = {},
+  role: 'admin' | 'user' = 'user'
 ) {
   const client = new QueryClient()
+  client.setQueryData(['panel', 'me'], { role })
   client.setQueryData(['panel', 'gemini-environments'], {
     available,
     payload_state: 'awaiting_redemption',
@@ -100,12 +102,30 @@ function showGemini(
 }
 
 test('Gemini shows the socket failure without claiming the service is disabled', () => {
-  const html = showGemini(false, 'import', 'oauth', {
-    host_message: '控制面无权访问 Gemini 控制 socket',
-  })
-  expect(html).toContain('控制面无权访问 Gemini 控制 socket')
-  expect(html).toContain('systemctl status vm2api-gemini')
-  expect(html).not.toContain('创建 Gemini 环境')
+  // 补救手段已从「自己敲 systemctl」改成指向集中运维入口（`GeminiMaintenanceLink`），
+  // 所以这里断言的是那个入口而不是旧的命令文案。两条分支都要钉住：管理员拿到可点的
+  // 链接，普通用户拿到「找管理员」的说明——后者此前没有任何测试覆盖。
+  const asAdmin = showGemini(
+    false,
+    'import',
+    'oauth',
+    { host_message: '控制面无权访问 Gemini 控制 socket' },
+    'admin'
+  )
+  expect(asAdmin).toContain('控制面无权访问 Gemini 控制 socket')
+  expect(asAdmin).toContain('设置 → Gemini：诊断与维护')
+  expect(asAdmin).not.toContain('创建 Gemini 环境')
+
+  const asUser = showGemini(
+    false,
+    'import',
+    'oauth',
+    { host_message: '控制面无权访问 Gemini 控制 socket' },
+    'user'
+  )
+  expect(asUser).toContain('控制面无权访问 Gemini 控制 socket')
+  expect(asUser).toContain('请联系管理员在「设置 → Gemini」诊断与维护。')
+  expect(asUser).not.toContain('创建 Gemini 环境')
 })
 
 test('VM details distinguish missing Antigravity files from OAuth host prerequisites', () => {
