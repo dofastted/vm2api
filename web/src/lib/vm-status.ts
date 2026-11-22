@@ -861,6 +861,10 @@ export function vmCredDead(vm: Vm): boolean {
  * 谁更新谁代表这台槽最后一次「有动静」。都没有则回 0，排到本组最后。
  */
 export function vmFailedAt(vm: Vm): number {
+  // 已记录失效时刻（吊销/不可调度）就用它；否则 last_probe 每次探测都会刷新，
+  // 死号会一直显示「刚刚」。
+  const recorded = Date.parse(String(vm.unschedulable_at || ''))
+  if (Number.isFinite(recorded)) return recorded
   const stamps: unknown[] = [
     vm.last_probe?.at,
     vm.refreshed_at,
