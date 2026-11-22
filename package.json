@@ -10,6 +10,7 @@
     "test:unit": "node scripts/run-isolated-tests.mjs test/unit .test.mjs",
     "test:ci": "node scripts/run-isolated-tests.mjs test/unit .test.mjs security key-scope panel-acl api-channel-routing convert-stream pool-scheduler tenant-billing rate-limit-service errors-map proxy-http-scheme cache-prefix request-body-context",
     "test:e2e": "node scripts/run-isolated-tests.mjs test/e2e .e2e.test.mjs",
+    "verify:oauth-egress": "node scripts/verify-oauth-egress.mjs",
     "test:node": "npm run test:unit",
     "test:go": "cd worker && go test -race ./...",
     "test:all": "npm run test:unit && npm run test:go",
