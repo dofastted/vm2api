@@ -182,6 +182,18 @@ test('Claude missing 1h cache write fills 2× input', async () => {
   assert.equal(r.price.cache_1h, 4)
 })
 
+test('Mythos 5.2 has its own price row matching Fable 5.2', () => {
+  const fable = resolvePrice('claude-fable-5-2')
+  for (const model of ['claude-mythos-5-2', 'claude-mythos-5.2', 'anthropic/claude-mythos-5.2[1m]']) {
+    const resolved = resolvePrice(model)
+    assert.equal(resolved.id, 'claude-mythos-5-2')
+    assert.deepEqual(resolved.price, fable.price)
+  }
+  assert.equal(setPriceOverride('anthropic/claude-mythos-5-2', FULL).ok, true)
+  assert.deepEqual(resolvePrice('claude-mythos-5.2').price, { ...FULL, per_call: fable.price.per_call })
+  assert.deepEqual(resolvePrice('claude-fable-5-2').price, fable.price)
+})
+
 test('claude-fable-5.1 resolves to claude-fable-5-1 with $0.25 read', () => {
   const r = resolvePrice('claude-fable-5.1')
   assert.equal(r.id, 'claude-fable-5-1')
