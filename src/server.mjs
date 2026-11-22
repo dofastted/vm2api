@@ -8,7 +8,7 @@
  * ~/.claude.json and complete a plan turn.
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { handoverRole, setHandoverRole, setOverlap, markExclusive, deferredKeys } from './lib/core/handover.mjs'
+import { handoverRole, setHandoverRole, setOverlap, markExclusive, deferredKeys, deferUntilExclusive } from './lib/core/handover.mjs'
 import {
   createForeignLoad,
   exportLiveLoad,
