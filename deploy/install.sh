@@ -629,6 +629,134 @@ prepare_gemini_dependencies() {
   fi
 }
 
+prepare_gemini_maintenance() (
+  local tag="$1" mode="$2" root=/usr/local/lib/vm2api-gemini-maintenance
+  local state=/var/lib/vm2api-gemini config=/etc/vm2api/gemini-maintenance.json
+  local unit=/etc/systemd/system/vm2api-gemini-maintenance.service file bundle
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err "Gemini 维护组件需要固定发行标签"; return 1; }
+  command -v systemctl >/dev/null || { err "Gemini 维护组件需要 systemd"; return 1; }
+  if ! command -v python3 >/dev/null; then
+    command -v apt-get >/dev/null || { err "请先安装 python3"; return 1; }
+    DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 || return 1
+  fi
+  for file in "$INSTALL_DIR" "$root" "$root/scripts" "$root/bundles" "$state" /etc/vm2api; do
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+      install -d -m 755 "$file" || return 1
+      [ "$file" != "$state" ] || chmod 711 "$file" || return 1
+    fi
+    python3 - "$file" <<'PY' || return 1
+import os, stat, sys
+from pathlib import Path
+for path in (Path(sys.argv[1]), *Path(sys.argv[1]).parents):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise SystemExit("Gemini maintenance paths must be root-owned real directories")
+PY
+  done
+  file="$state/maintenance.lock"
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then (umask 077; set -C; : > "$file") || return 1; fi
+  [ ! -L "$file" ] && [ -f "$file" ] && [ "$(stat -c '%u:%a:%h' "$file")" = 0:600:1 ] || return 1
+  exec 9<>"$file" || return 1
+  flock -n 9 || { err "Gemini 正在维护或处理请求，请稍后重试"; return 1; }
+  if [ -e "$state/maintenance.pending" ] || [ -L "$state/maintenance.pending" ]; then
+    err "Gemini 上次维护未完成；请先通过既有维护服务恢复，再更新维护组件"
+    return 1
+  fi
+  bundle="$(mktemp -d "${root}/bundles/bundle-${tag}.XXXXXX")" || return 1
+  local -a files=(scripts/gemini-maintenance.py deploy/gemini-maintenance.service.example
+    scripts/gemini-host.py scripts/gemini_host_account.py scripts/gemini_host_inference.py
+    scripts/gemini_host_native.py scripts/gemini-host-egress.sh scripts/fetch-default-gemini.py
+    scripts/install-gemini-payload.mjs src/lib/gemini/payload.mjs deploy/payload.json deploy/gemini-host.service.example)
+  for file in "${files[@]}"; do
+    if [ "$mode" = source ]; then
+      python3 - "${INSTALL_DIR}/${file}" <<'PY' || return 1
+import stat, sys
+from pathlib import Path
+source = Path(sys.argv[1])
+for path in (source, *source.parents):
+    info = path.lstat()
+    expected = stat.S_ISREG if path == source else stat.S_ISDIR
+    if not expected(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise SystemExit('Gemini maintenance source code must be root-owned and not writable by other users')
+PY
+    fi
+    if ! fetch_gemini_host_file "$tag" "$mode" "$file" "${bundle}/${file}"; then
+      err "当前发行版不含完整 Gemini 维护组件: $file"
+      rm -rf -- "$bundle"
+      return 1
+    fi
+    chmod 644 "${bundle}/${file}" || return 1
+  done
+  python3 - "$bundle" "$INSTALL_DIR" <<'PY' || return 1
+import json, re, sys
+from pathlib import Path
+bundle, install = Path(sys.argv[1]), Path(sys.argv[2]).resolve(strict=True)
+descriptor = json.loads((bundle / 'deploy/payload.json').read_bytes())['geminiDefaultLinuxAmd64']
+tag = descriptor['tag']
+match = re.fullmatch(r'payload-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-gemini-([0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?)', tag)
+if not match:
+    raise SystemExit('Invalid pinned Gemini release')
+(bundle / 'catalog.json').write_text(json.dumps([{'id': tag, 'version': match[1], 'cli_version': '1.5.9'}]) + '\n')
+(bundle / 'maintenance-config.json').write_text(json.dumps({'install_dir': str(install), 'bundle_dir': str(bundle)}) + '\n')
+PY
+  for file in "$config" "$root/scripts/gemini-maintenance.py" "$unit"; do
+    if [ -e "$file" ] || [ -L "$file" ]; then
+      [ ! -L "$file" ] && [ -f "$file" ] && [ "$(stat -c '%u:%h' "$file")" = 0:1 ] || { err "拒绝覆盖不受信的维护文件"; return 1; }
+      local permissions
+      permissions="$(stat -c %a "$file")" || return 1
+      [ "$((0$permissions & 022))" -eq 0 ] || { err "拒绝覆盖可被其他用户写入的维护文件"; return 1; }
+    fi
+  done
+  getent group vm2api >/dev/null || groupadd --system vm2api || return 1
+  atomic_maintenance_file() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import os, shutil, sys, tempfile
+from pathlib import Path
+source, target, mode = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3], 8)
+fd, temporary = tempfile.mkstemp(prefix='.' + target.name + '.', dir=target.parent)
+try:
+    with os.fdopen(fd, 'wb') as output, source.open('rb') as input_file:
+        os.fchmod(output.fileno(), mode)
+        shutil.copyfileobj(input_file, output)
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, target)
+    directory = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    Path(temporary).unlink(missing_ok=True)
+PY
+  }
+  local backup was_active=0 was_enabled=0 restored=1
+  backup="$(mktemp -d "$root/.bootstrap-backup.XXXXXX")" || return 1
+  systemctl is-active --quiet vm2api-gemini-maintenance.service && was_active=1
+  systemctl is-enabled --quiet vm2api-gemini-maintenance.service && was_enabled=1
+  [ ! -f "$config" ] || install -m 600 "$config" "$backup/config.json" || return 1
+  [ ! -f "$root/scripts/gemini-maintenance.py" ] || install -m 644 "$root/scripts/gemini-maintenance.py" "$backup/daemon.py" || return 1
+  [ ! -f "$unit" ] || install -m 644 "$unit" "$backup/service" || return 1
+  if atomic_maintenance_file "$bundle/maintenance-config.json" "$config" 600 &&
+    atomic_maintenance_file "$bundle/scripts/gemini-maintenance.py" "$root/scripts/gemini-maintenance.py" 644 &&
+    atomic_maintenance_file "$bundle/deploy/gemini-maintenance.service.example" "$unit" 644 &&
+    systemctl daemon-reload && systemctl enable vm2api-gemini-maintenance.service && systemctl restart vm2api-gemini-maintenance.service; then
+    ok "Gemini 维护服务已就绪，可在设置 → Gemini 操作"
+    return 0
+  fi
+  systemctl stop vm2api-gemini-maintenance.service || warn "无法停止未就绪的维护服务"
+  if [ -f "$backup/config.json" ]; then atomic_maintenance_file "$backup/config.json" "$config" 600 || restored=0; else rm -f -- "$config" || restored=0; fi
+  if [ -f "$backup/daemon.py" ]; then atomic_maintenance_file "$backup/daemon.py" "$root/scripts/gemini-maintenance.py" 644 || restored=0; else rm -f -- "$root/scripts/gemini-maintenance.py" || restored=0; fi
+  if [ -f "$backup/service" ]; then atomic_maintenance_file "$backup/service" "$unit" 644 || restored=0; else rm -f -- "$unit" || restored=0; fi
+  systemctl daemon-reload || restored=0
+  [ "$was_enabled" = 1 ] || systemctl disable vm2api-gemini-maintenance.service || warn "无法恢复维护服务的启用状态"
+  if [ "$restored" = 1 ] && [ "$was_active" = 1 ]; then
+    systemctl restart vm2api-gemini-maintenance.service || warn "既有维护服务恢复失败，请检查 systemd 日志"
+  fi
+  err "Gemini 维护组件更新失败；恢复状态=${restored}，备份目录=${backup}"
+  return 1
+)
+
 prepare_gemini_host() (
   local PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
   local tag="$1" mode="$2"
@@ -648,6 +776,7 @@ prepare_gemini_host() (
     err "Gemini 需要 Linux amd64，安装目录和签名载荷目录必须为不含空格的绝对路径"
     return 1
   fi
+  prepare_gemini_maintenance "$tag" "$mode" || return 1
 
   local host_dir=/usr/local/lib/vm2api-gemini
   local default_source="${host_dir}/defaults/0.3.0-rc.2"
@@ -1392,7 +1521,7 @@ case "$COMMAND" in
   prepare-gemini)
     need_root
     resolve_host_arch
-    if [ ! -f "${INSTALL_DIR}/.env" ] || [ "$(local_version)" = not_installed ]; then
+    if ! [[ "$(local_version)" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       err "请先安装 vm2api"
       exit 1
     fi
