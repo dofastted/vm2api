@@ -11,10 +11,14 @@ const validOrderId = (value: string) => /^[0-9a-zA-Z_-]{1,64}$/.test(value)
  *
  * 它打的 `claim-by-order` 由授权服务侧的 crag#14 提供，而那个 PR **还没合、也没部署**
  * —— 生产跑的是它之前的版本（schema 15），那条路由不存在。所以入口一旦放出，用户会
- * 看见它、输入订单号，然后每一次都失败：`authority()` 只在响应体带 `ok: false`、
- * `error.code` 在 `authorityErrors` 里、且 HTTP 状态与表中登记值相等时才采纳该码，
- * 缺路由的 404 若不带这个信封就落到 `crag_subscription_authority_unavailable`（502），
- * 读起来是「结果未确认，请重试」——邀请用户反复重试一件永不成功的事。
+ * 看见它、输入订单号，然后每一次都失败，而且**失败的样子是在怪用户**：
+ *
+ * crag 的 `http.rs` 把未匹配路由接到 `.fallback(not_found)`，那个处理器走的是
+ * `failure(AuthError::NotFound, scope)`，产出与正常错误完全一样的信封
+ * （`{ok:false,error:{code:"not_found"}}` + HTTP 404）。于是 `authority()` 采纳错误码
+ * 的三个条件同时成立（`ok:false`、`not_found` 在 `authorityErrors` 里、状态等于表中
+ * 登记的 404），用户拿到的是 `cragOrderClaimErrors.not_found`：「没有找到这个订单号
+ * 对应的兑换券」——他会以为自己订单号抄错了，反复核对一个根本没问题的数字。
  *
  * 实现全部保留，等那条路由部署完，把这里翻成 `true` 即可（连同下面那条测试）。入口
  * **不**以本机已有订阅为条件：换机的常态恰恰是新机器还是空的，所以恢复时别加那个条件。
