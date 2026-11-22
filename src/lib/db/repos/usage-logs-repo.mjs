@@ -678,7 +678,12 @@ export class UsageLogsRepo {
     try {
       for (const r of rows) {
         const model = r.upstream_model || r.model || r.requested_model
-        const priced = costColumnsFromUsage(this._usageForPrice(r), model, this._imageForPrice(r))
+        const priced = costColumnsFromUsage(
+          this._usageForPrice(r),
+          model,
+          this._imageForPrice(r),
+          Date.parse(r.created_at),
+        )
         const same =
           (r.input_cost ?? null) === (priced.input_cost ?? null) &&
           (r.output_cost ?? null) === (priced.output_cost ?? null) &&
@@ -752,7 +757,7 @@ export class UsageLogsRepo {
   backfillMissingCosts({ limit = 4000 } = {}) {
     const rows = this.db
       .prepare(`
-      SELECT id, model, upstream_model, requested_model,
+      SELECT id, created_at, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
              rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
@@ -772,7 +777,7 @@ export class UsageLogsRepo {
     const where = cond ? `${cond} AND rowid > ?` : 'WHERE rowid > ?'
     // Keyset pages keep a month-long range from loading every row at once.
     const page = this.db.prepare(`
-      SELECT rowid AS _rowid, id, model, upstream_model, requested_model,
+      SELECT rowid AS _rowid, id, created_at, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
              rate_multiplier, service_tier, speed, protocol, image_model, image_usage,

@@ -31,7 +31,7 @@ function isCatalogModelId(id) {
   if (s.endsWith('-') || s.endsWith('.')) return false
   if (/\.md$/i.test(s)) return false
   if (/^(gpt-[a-z0-9.-]+|codex-[a-z0-9.-]+)$/i.test(s)) return s.split(/[-.]/).length >= 2
-  if (!/^claude-(opus|sonnet|haiku|fable|3)[a-z0-9.-]*$/i.test(s) && s !== 'auto') return false
+  if (!/^claude-(opus|sonnet|haiku|fable|mythos|3)[a-z0-9.-]*$/i.test(s) && s !== 'auto') return false
   if (s === 'auto') return true
   return s.split('-').length >= 3
 }
@@ -40,6 +40,7 @@ const SETTINGS_KEY = 'model_policy'
 const CONTEXT_1M = CONTEXT_1M_BETA
 const FABLE_51_ID = 'claude-fable-5-1'
 const FABLE_52_ID = 'claude-fable-5-2'
+const MYTHOS_52_ID = 'claude-mythos-5-2'
 const FABLE_51_LEGACY_ID = 'claude-fable-5.1'
 const OPUS_55_ID = 'claude-opus-5-5'
 const OPUS_55_LEGACY_ID = 'claude-opus-5.5'
@@ -404,6 +405,14 @@ export function seedDefaultPolicy() {
     aliases: ['claude-fable-5.2'],
   })
 
+  add(MYTHOS_52_ID, {
+    ...structuredClone(models[FABLE_52_ID]),
+    display_name: 'Mythos 5.2',
+    family: 'mythos',
+    sort: 43,
+    aliases: ['claude-mythos-5.2'],
+  })
+
   add('auto', {
     display_name: 'Auto',
     family: 'auto',
@@ -442,6 +451,7 @@ export function seedDefaultPolicy() {
       'claude-3-5-haiku-latest': 'claude-haiku-4-5-20251001',
       fable: 'claude-fable-5',
       'claude-fable-5.2': FABLE_52_ID,
+      'claude-mythos-5.2': MYTHOS_52_ID,
       [FABLE_51_LEGACY_ID]: FABLE_51_ID,
       [OPUS_55_LEGACY_ID]: OPUS_55_ID,
     },
@@ -492,7 +502,9 @@ export function normalizePolicy(raw) {
               ? 'opus'
               : id.includes('fable')
                 ? 'fable'
-                : 'sonnet',
+                : id.includes('mythos')
+                  ? 'mythos'
+                  : 'sonnet',
           capabilities: heuristicCapabilities(id),
           params: {},
         })
@@ -573,6 +585,7 @@ export function familyOfModelId(id = '') {
   if (s.includes('haiku')) return 'haiku'
   if (s.includes('opus')) return 'opus'
   if (s.includes('fable')) return 'fable'
+  if (s.includes('mythos')) return 'mythos'
   if (s.includes('sonnet')) return 'sonnet'
   return 'other'
 }

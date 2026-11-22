@@ -37,6 +37,7 @@ const PER_TURN_MODELS = {
   'claude-opus-5-5': true,
   'claude-fable-5-1': true,
   'claude-fable-5-2': true,
+  'claude-mythos-5-2': true,
 }
 const MID_TOOL_CHANGE_MODELS = {
   'claude-haiku-5-5': true,
@@ -47,6 +48,7 @@ const MID_TOOL_CHANGE_MODELS = {
   'claude-fable-5': true,
   'claude-fable-5-1': true,
   'claude-fable-5-2': true,
+  'claude-mythos-5-2': true,
   'claude-mythos-5-1': true,
 }
 const FAST_MODE_MODELS = {
@@ -61,6 +63,7 @@ const MID_OUTPUT_CONFIG_MODELS = {
   'claude-opus-5-5': true,
   'claude-fable-5-1': true,
   'claude-fable-5-2': true,
+  'claude-mythos-5-2': true,
   'claude-mythos-5-1': true,
 }
 

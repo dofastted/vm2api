@@ -127,6 +127,56 @@ test('classify reads invalid_grant from worker message', () => {
   )
 })
 
+test('worker execution and output failures are retryable without weakening fatal grant errors', () => {
+  for (const code of ['worker_output_invalid', 'worker_exec_failed', 'worker_output_limit', 'credential_pull_failed']) {
+    assert.equal(classifyCredentialRefresh({ ok: false, status: 0, error: { code } }), 'retryable', code)
+  }
+  assert.equal(classifyCredentialRefresh({ ok: false, error: { code: 'config_failed' } }), 'failed')
+  assert.equal(
+    classifyCredentialRefresh({
+      ok: false,
+      error: { code: 'worker_output_invalid', message: 'invalid_grant' },
+    }),
+    'fatal',
+  )
+})
+
+test('stored transient refresh errors retry when due but fatal and fresh grants stay protected', () => {
+  for (const code of ['worker_output_invalid', 'worker_exec_failed', 'worker_output_limit', 'credential_pull_failed']) {
+    assert.equal(needsScheduledRefresh({ ...offSlot, refresh_error: code }), true, code)
+    assert.equal(needsScheduledRefresh({ ...offSlot, claude: { refresh_error: code } }), true, code)
+    assert.equal(needsScheduledRefresh({ ...offSlot, refresh_error: code, expires_at: Date.now() + 3600_000 }), false)
+    assert.equal(
+      needsScheduledRefresh({ ...offSlot, refresh_error: code, claude: { refresh_error: 'invalid_grant' } }),
+      false,
+    )
+  }
+  for (const code of ['invalid_grant', 'oauth_revoked', 'refresh_token_missing', 'config_failed']) {
+    assert.equal(needsScheduledRefresh({ ...offSlot, refresh_error: code }), false, code)
+  }
+})
+
+test('a slot with a historical worker output error remains eligible on the next monitor run', async () => {
+  const vm = { ...offSlot, refresh_error: 'worker_output_invalid' }
+  let attempts = 0
+  const monitor = createCredentialRefreshMonitor({
+    listTargets: () => [vm],
+    refreshOne: async () => {
+      attempts++
+      if (attempts === 1) return { ok: false, refresh_class: 'retryable' }
+      delete vm.refresh_error
+      vm.expires_at = Date.now() + 3600_000
+      return { ok: true, refresh_class: 'refreshed' }
+    },
+  })
+  assert.equal((await monitor.runOnce()).due, 1)
+  const recovered = await monitor.runOnce()
+  assert.equal(recovered.due, 1)
+  assert.equal(recovered.items[0].ok, true)
+  assert.equal(attempts, 2)
+  assert.equal((await monitor.runOnce()).due, 0)
+})
+
 test('markVmRefreshError writes refresh_error and persist clears it', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-refresh-'))
   const vmPath = path.join(dir, 'vm-09.json')
@@ -237,4 +287,92 @@ test('monitor includes 调度关 and calls refreshOne', async () => {
   assert.equal(snap.due, 1)
   assert.equal(snap.items[0].schedulable, false)
   assert.equal(snap.items[0].ok, false)
+})
+
+// --- slots parked behind an old worker --------------------------------------
+
+const parked = (id, error = 'worker_upgrade_required') => ({
+  ...offSlot,
+  id,
+  status: 'running',
+  schedulable: true,
+  claude: { has_refresh: true, refresh_error: error },
+})
+
+test('clearUpgradeRequired only clears that exact parked code', async () => {
+  const { clearUpgradeRequired } = await import('../../src/lib/oauth/oauth-credentials.mjs')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'parked-'))
+  const file = (name, error) => {
+    const p = path.join(dir, `${name}.json`)
+    fs.writeFileSync(p, JSON.stringify({ id: name, claude: { has_refresh: true, refresh_error: error } }))
+    return p
+  }
+  const a = file('a', 'worker_upgrade_required')
+  const b = file('b', 'invalid_grant')
+  const c = file('c', 'refresh_outcome_unknown')
+  assert.equal(clearUpgradeRequired(a), true)
+  assert.equal(JSON.parse(fs.readFileSync(a, 'utf8')).claude.refresh_error, null)
+  for (const keep of [b, c]) {
+    const before = fs.readFileSync(keep, 'utf8')
+    assert.equal(clearUpgradeRequired(keep), false)
+    assert.equal(fs.readFileSync(keep, 'utf8'), before)
+  }
+  assert.equal(clearUpgradeRequired(path.join(dir, 'missing.json')), false)
+})
+
+test('monitor probes slots parked on an old worker and leaves every other parked slot alone', async () => {
+  const probed = []
+  const refreshed = []
+  const monitor = createCredentialRefreshMonitor({
+    config: { enabled: true, interval_sec: 60, concurrency: 2 },
+    listTargets: () => [
+      parked('vm-a'),
+      parked('vm-b', 'invalid_grant'),
+      parked('vm-c', 'refresh_outcome_unknown'),
+      parked('vm-d'),
+    ],
+    refreshOne: async (vm) => {
+      refreshed.push(vm.id)
+      return { ok: true }
+    },
+    reviveOne: async (vm) => {
+      probed.push(vm.id)
+      return vm.id === 'vm-a' ? { revived: true } : { revived: false }
+    },
+  })
+  const run = await monitor.runOnce()
+  assert.deepEqual(probed.sort(), ['vm-a', 'vm-d'])
+  assert.deepEqual(refreshed, [], 'a parked slot is never refreshed in the same pass')
+  assert.deepEqual(run.revived, ['vm-a'])
+})
+
+test('a failing probe never breaks the monitor pass', async () => {
+  const monitor = createCredentialRefreshMonitor({
+    config: { enabled: true, interval_sec: 60, concurrency: 1 },
+    listTargets: () => [parked('vm-a'), parked('vm-b')],
+    refreshOne: async () => ({ ok: true }),
+    reviveOne: async (vm) => {
+      if (vm.id === 'vm-a') throw new Error('docker exec failed')
+      return { revived: true }
+    },
+  })
+  const run = await monitor.runOnce()
+  assert.deepEqual(run.revived, ['vm-b'])
+})
+
+test('a slot is parked for the upgrade exactly where clearUpgradeRequired looks, never somewhere it cannot clear', async () => {
+  const { isUpgradeParked } = await import('../../src/lib/oauth/credential-refresh-monitor.mjs')
+  const { clearUpgradeRequired } = await import('../../src/lib/oauth/oauth-credentials.mjs')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'parked-'))
+  const onDisk = (vm) => {
+    const p = path.join(dir, `${vm.id}.json`)
+    fs.writeFileSync(p, JSON.stringify(vm))
+    return p
+  }
+  const nested = { id: 'nested', claude: { refresh_error: 'worker_upgrade_required' } }
+  const topOnly = { id: 'top', refresh_error: 'worker_upgrade_required', claude: {} }
+  // What the monitor decides to probe must be what a successful probe can then clear.
+  assert.equal(isUpgradeParked(nested), true)
+  assert.equal(clearUpgradeRequired(onDisk(nested)), true)
+  assert.equal(isUpgradeParked(topOnly), false, 'a top-level code is not something clearUpgradeRequired can clear')
 })

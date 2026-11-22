@@ -8,7 +8,16 @@ import { slotExecArgv } from '../vm/slot-exec.mjs'
 
 const WORKER_CONFIG = '/run/kin/worker.json'
 const WORKER_BIN = '/usr/local/bin/kin-worker'
-const OPS = new Set(['refresh', 'usage', 'profile', 'models', 'count-tokens', 'reset-status', 'reset-redeem'])
+const OPS = new Set([
+  'refresh',
+  'usage',
+  'profile',
+  'models',
+  'count-tokens',
+  'reset-status',
+  'reset-redeem',
+  'guard-probe',
+])
 
 function failure(code, message = undefined) {
   const error = { code }
@@ -110,26 +119,56 @@ function lastJsonLine(stdout) {
   }
 }
 
-export async function runSlotOauth(
+/**
+ * Does the worker on this node keep the refresh attempt journal? Asked with an operation that reads no
+ * config, no credential and does not touch the network. A worker built before the journal does not know
+ * it and answers invalid_arguments, so only an explicit yes counts.
+ */
+export async function probeAttemptGuard(exec, opts = {}) {
+  try {
+    const result = await runSlotOauth(exec, 'guard-probe', { timeoutMs: 15000, ...opts })
+    return result?.ok === true && result?.body?.attempt_guard === true
+  } catch {
+    return false
+  }
+}
+
+const isInvalidArguments = (result) => lastJsonLine(result?.stdout)?.body?.error?.code === 'invalid_arguments'
+
+export async function runSlotOauth(exec, op, opts = {}) {
+  if (process.env.KIN_CRS_MOCK === '1') return null
+  if (!OPS.has(op)) return failure('worker_op_invalid', `unsupported oauth operation: ${op}`)
+  if (op !== 'refresh') return (await runSlotOauthProcess(exec, op, opts)).response
+  // The worker's attempt journal is what makes a refresh safe to retry after a lost answer:
+  // it refuses to send a refresh token whose last send never resolved. A worker built before
+  // the journal rejects the flag as invalid_arguments before touching any token, so asking it
+  // again without the flag is still its first real attempt.
+  const guarded = await runSlotOauthProcess(exec, op, { ...opts, attemptGuard: true })
+  if (!isInvalidArguments(guarded.raw)) return { ...guarded.response, attempt_guard: true }
+  const legacy = await runSlotOauthProcess(exec, op, opts)
+  return { ...legacy.response, attempt_guard: false }
+}
+
+/** One worker run: `raw` is the process result, `response` the mapped answer. */
+async function runSlotOauthProcess(
   exec,
   op,
   {
     body,
     headers,
     force = false,
+    attemptGuard = false,
     timeoutMs = 45000,
     runDocker = runSlotProcess,
     postTelemetry = postRustKernelTelemetryEvent,
   } = {},
 ) {
-  if (process.env.KIN_CRS_MOCK === '1') return null
-  if (!OPS.has(op)) return failure('worker_op_invalid', `unsupported oauth operation: ${op}`)
-
   const host = slotHost(exec?.vm)
   const vm = { ...(exec?.vm || {}), id: exec?.vmId || exec?.vm?.id }
   const user = host.execUser(vm)
   const argv = slotExecArgv(vm, [WORKER_BIN, 'oauth', op, '--config', WORKER_CONFIG], { interactive: true, user })
   if (force) argv.push('--force')
+  if (attemptGuard) argv.push('--attempt-guard')
 
   const stdin =
     op === 'count-tokens'
@@ -194,7 +233,8 @@ export async function runSlotOauth(
           type: 'oauth_attempt',
           attempt_id,
           phase: 'failure',
-          error_code: result?.timed_out ? 'worker_timeout' : 'worker_exec_failed',
+          // Started but never reported back: the worker may or may not have sent the token.
+          error_code: 'refresh_outcome_unknown',
         }),
       )
   }
@@ -203,21 +243,24 @@ export async function runSlotOauth(
     ...failure(code, message),
     ...(telemetryError ? { telemetry_error: telemetryError } : {}),
   })
-  if (result?.execError) return failed('worker_exec_failed', result.execError)
-  if (result?.timed_out) return failed('worker_timeout')
-  if (result?.output_limit) return failed('worker_output_limit')
+  const done = (response) => ({ raw: result, response })
+  if (result?.execError) return done(failed('worker_exec_failed', result.execError))
+  if (result?.timed_out) return done(failed('worker_timeout'))
+  if (result?.output_limit) return done(failed('worker_output_limit'))
+  // An older worker rejecting --attempt-guard did nothing; there is nothing to pull back.
+  if (attemptGuard && isInvalidArguments(result)) return done(failed('invalid_arguments'))
   // A refresh rotates the RT where the slot keeps its credential; the local mirror must follow before anyone reads it.
   if (op === 'refresh' && exec.homeDir) {
     try {
       await host.afterRefresh(exec.vm, path.dirname(exec.homeDir))
     } catch (error) {
-      return failed('credential_pull_failed', String(error?.message || error).slice(0, 300))
+      return done(failed('credential_pull_failed', String(error?.message || error).slice(0, 300)))
     }
   }
 
   const payload = lastJsonLine(result?.stdout)
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    return failed('worker_output_invalid', String(result?.stderr || '').slice(0, 300))
+    return done(failed('worker_output_invalid', String(result?.stderr || '').slice(0, 300)))
   }
 
   const status = Number.isInteger(payload.status) ? payload.status : Number(payload.status) || 0
@@ -230,5 +273,5 @@ export async function runSlotOauth(
   }
   if (telemetryError) response.telemetry_error = telemetryError
   if (status === 0) response.transportError = true
-  return response
+  return done(response)
 }

@@ -106,6 +106,19 @@ test('layer precedence: override provider/model > provider/* > */model > models.
   assert.equal(resolvePrice(id).source, 'override')
 })
 
+test('Ultrafast price overrides are resolved independently of the builtin promotion', () => {
+  const model = 'gpt-6.2-sol'
+  const during = Date.parse('2027-03-01T07:59:59.999Z')
+  assert.equal(resolvePrice(model, during).price.modes.ultrafast.output, 30)
+  assert.equal(resolvePrice(model, during + 1).price.modes.ultrafast.output, 60)
+  assert.equal(setPriceOverride(`openai/${model}`, FULL).ok, true)
+  assert.equal(resolvePrice(model, during).mode_sources.ultrafast, 'builtin')
+  assert.equal(resolvePrice(model, during).price.modes.ultrafast.output, 30)
+  assert.equal(setPriceOverride(`openai/${model}`, { ...FULL, modes: { ultrafast: FULL } }).ok, true)
+  assert.equal(resolvePrice(model, during + 1).mode_sources.ultrafast, 'override')
+  assert.equal(resolvePrice(model, during + 1).price.modes.ultrafast.output, FULL.output)
+})
+
 test('a provider/* override on a dated id keeps the canonical model builtin fast mode', () => {
   assert.equal(setPriceOverride('anthropic/*', FULL).ok, true)
   const hit = resolvePrice('claude-opus-5-5-20261001')
@@ -180,6 +193,18 @@ test('Claude missing 1h cache write fills 2× input', async () => {
   assert.equal(r.source, 'models.dev')
   assert.equal(r.price.cache_5m, 2.5)
   assert.equal(r.price.cache_1h, 4)
+})
+
+test('Mythos 5.2 has its own price row matching Fable 5.2', () => {
+  const fable = resolvePrice('claude-fable-5-2')
+  for (const model of ['claude-mythos-5-2', 'claude-mythos-5.2', 'anthropic/claude-mythos-5.2[1m]']) {
+    const resolved = resolvePrice(model)
+    assert.equal(resolved.id, 'claude-mythos-5-2')
+    assert.deepEqual(resolved.price, fable.price)
+  }
+  assert.equal(setPriceOverride('anthropic/claude-mythos-5-2', FULL).ok, true)
+  assert.deepEqual(resolvePrice('claude-mythos-5.2').price, { ...FULL, per_call: fable.price.per_call })
+  assert.deepEqual(resolvePrice('claude-fable-5-2').price, fable.price)
 })
 
 test('claude-fable-5.1 resolves to claude-fable-5-1 with $0.25 read', () => {
