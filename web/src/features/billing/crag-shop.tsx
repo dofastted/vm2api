@@ -1676,7 +1676,6 @@ function ShopOrders({
                           </Button>
                         ) : null}
                         {order.status === 'fulfilled' &&
-                        !device &&
                         order.sku !== 'renewal' &&
                         !automaticOrder(order) ? (
                           <Button
@@ -1686,7 +1685,10 @@ function ShopOrders({
                             onClick={() =>
                               void run(async () => {
                                 setClaim(undefined)
-                                const code = await api<{
+                                // `request`, not `api`: on the device page there is no
+                                // panel session, so `api` would reject this locally with
+                                // a 401 before it was ever sent.
+                                const code = await request<{
                                   order_id: string
                                   redemption_code: string
                                 }>(
@@ -1699,7 +1701,7 @@ function ShopOrders({
                               }, '暂时无法领取，请刷新订单后重试。')
                             }
                           >
-                            领取兑换码
+                            {device ? '导出迁移凭据' : '领取兑换码'}
                           </Button>
                         ) : null}
                         {device &&
@@ -1879,7 +1881,9 @@ function ShopOrders({
                       !automaticOrder(order) ? (
                         <div className='space-y-2'>
                           <p className='text-muted-foreground'>
-                            请勿公开分享，下方是本订单的完整兑换码。
+                            {device
+                              ? '请勿公开分享。保存这串凭据即可在新机器上迁移本订单的额度，剩余时长照旧带走。'
+                              : '请勿公开分享，下方是本订单的完整兑换码。'}
                           </p>
                           <code className='block rounded bg-muted px-2 py-1 break-all'>
                             {claim.redemption_code}

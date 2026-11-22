@@ -50,6 +50,12 @@ const authorityErrors = new Map([
   // unconfirmed, retry" and sends the operator retrying something that is
   // simply not due yet.
   ['host_transfer_cooldown', 409],
+  // A rejected request shape is final, so it must not read as "result unconfirmed,
+  // retry": without this it degrades to `crag_subscription_authority_unavailable`
+  // (502) and sends the caller retrying something that can never succeed. It is
+  // also what lets a redemption tell "this Authority predates a field we sent"
+  // apart from "the Authority is unreachable".
+  ['invalid_request', 400],
 ])
 const fail = (code = 'crag_subscription_unavailable', status = 503) => Object.assign(new Error(code), { code, status })
 const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
@@ -59,6 +65,8 @@ const validVoucher = (code) =>
   /^CRAGR1\.[A-Za-z0-9_-]{43}$/.test(code) &&
   Buffer.from(code.slice(7), 'base64url').toString('base64url') === code.slice(7)
 const safeTime = (value) => Number.isSafeInteger(value) && value >= 0
+/** Shape of a shop order id, matching the Authority's own CHECK on the column. */
+const validOrderId = (value) => typeof value === 'string' && /^[0-9a-zA-Z_-]{1,64}$/.test(value)
 const isDigest = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
 
 const HOST_DOMAIN = 'crag-host-v1:'
@@ -414,7 +422,16 @@ function pinnedIntentKind(intent) {
   if (!intent || typeof intent !== 'object' || Array.isArray(intent)) throw invalid()
   if (!isDigest(intent.host_id) || !validVoucher(intent.redemption_code) || !isDigest(intent.host_package_sha256))
     throw invalid()
-  const keys = Object.keys(intent).sort().join(',')
+  // `shop_order_id` records which order bought this voucher so the Authority can
+  // later move it by that id. It is deliberately not named `order_id`: that key
+  // already carries control flow -- `recover()` treats an intent holding it as one
+  // that may only resume through the shop, so reusing it here made recovery return
+  // without doing anything and left the order stuck at ready_to_apply.
+  if (Object.hasOwn(intent, 'shop_order_id') && !validOrderId(intent.shop_order_id)) throw invalid()
+  const keys = Object.keys(intent)
+    .filter((key) => key !== 'shop_order_id')
+    .sort()
+    .join(',')
   if (keys === 'host_id,host_package_sha256,redemption_code') return 'legacy'
   if (keys !== 'enrollment,host_id,host_package_sha256,issuer_public_key_id,redemption_code') throw invalid()
   const selectors = intent.enrollment
@@ -1306,6 +1323,35 @@ export function createCragSubscription({
     return next
   }
 
+  // Tell the Authority which shop order bought this voucher, so the buyer can later
+  // migrate it by order id -- the only handle that survives losing this machine.
+  //
+  // Degrades instead of failing: the Authority's redeem request rejects unknown
+  // fields, so an instance newer than the Authority would have every redemption die
+  // on `order_id` alone. Worse, that 400 is not in `authorityErrors` and so arrives
+  // as `crag_subscription_authority_unavailable`, which reads as "result unconfirmed,
+  // retry" and would never resolve. Recording the order only matters for a migration
+  // that has not happened yet; it must never block the redemption in front of us.
+  async function redeemAtAuthority(hostId, intent, enrollment) {
+    const body = { redemption_code: intent.redemption_code, ...enrollment }
+    // Both paths carry a real shop order id: `order_id` on an order-driven activation
+    // and `shop_order_id` on a device checkout. Shapes are kept in step with the
+    // Authority's own CHECK, so a malformed id is simply not sent rather than relying
+    // on the degrade path below to absorb it.
+    const candidate = intent.shop_order_id ?? intent.order_id
+    const orderId = validOrderId(candidate) ? candidate : undefined
+    if (!orderId) return authority('redeem', hostId, credential(hostId), body)
+    try {
+      return await authority('redeem', hostId, credential(hostId), { ...body, order_id: orderId })
+    } catch (error) {
+      // Only a rejected request shape means this Authority predates `order_id`. A
+      // 502 must keep its meaning -- the redemption may well have committed, and
+      // retrying here would resolve a sync that is supposed to stay pending.
+      if (error?.code !== 'invalid_request') throw error
+      return authority('redeem', hostId, credential(hostId), body)
+    }
+  }
+
   async function finish(hostId, intent, previous, asserted = {}, replay = false) {
     const digest = voucherDigest(intent.redemption_code)
     const applied = appliedRedemption(hostId, digest)
@@ -1326,10 +1372,7 @@ export function createCragSubscription({
     publish(marker, 'pending\n', 0o644)
     let data
     try {
-      data = await authority('redeem', hostId, credential(hostId), {
-        redemption_code: intent.redemption_code,
-        ...enrollment,
-      })
+      data = await redeemAtAuthority(hostId, intent, enrollment)
     } catch (error) {
       // A denial on replay does not tell us whether the original request committed.
       if (!replay && error?.code !== 'crag_subscription_authority_unavailable') {
@@ -1689,7 +1732,7 @@ export function createCragSubscription({
     return bind(await reclaimStoppedSeat(vm, rights, runtime))
   }
 
-  function redeem(value, renewal, expectedHost) {
+  function redeem(value, renewal, expectedHost, orderId) {
     return exclusive(
       async () => {
         const redemption_code = typeof value === 'string' && value.trim()
@@ -1739,6 +1782,7 @@ export function createCragSubscription({
         const intent = {
           host_id: hostId,
           redemption_code,
+          ...(orderId && { shop_order_id: orderId }),
           ...(packageDigest && {
             host_package_sha256: packageDigest,
             enrollment: hostEnrollmentIdentity(projectRoot, packageDigest),
@@ -1981,10 +2025,10 @@ export function createCragSubscription({
      * existing callers and scripts already pass, or the device UUID the panel
      * displays. Accepting the UUID is what lets an operator redeem by copying
      * what is on screen, instead of having to find the hashed form. */
-    redeemDeviceOrder(target, voucher) {
+    redeemDeviceOrder(target, voucher, orderId) {
       const hostId = isDigest(target) ? target : uuidToHostId(target)
       if (!hostId) throw fail()
-      return redeem(voucher, false, hostId)
+      return redeem(voucher, false, hostId, orderId)
     },
     async listOrderTargets() {
       try {
@@ -2070,6 +2114,43 @@ export function createCragSubscription({
      * longer exists, which is exactly the stale-local-truth this module refuses
      * to show anywhere else.
      */
+    // Claim the voucher a shop order bought onto this machine.
+    //
+    // This is the path for replacing hardware: the order id is the only handle that
+    // survives losing the old machine, because the voucher code lives at the
+    // supplier behind a receipt key that was stored there. The Authority releases
+    // the voucher from whatever host still holds it, so the old machine does not
+    // have to be reachable -- needing it to release first is what stranded a
+    // subscription whose machine was reinstalled or destroyed.
+    claimByOrder(orderId) {
+      return exclusive(async () => {
+        if (!validOrderId(orderId)) throw fail('crag_subscription_invalid_request', 400)
+        const hostId = identity()
+        checkNoIntent()
+        storage(true)
+        const previous = current(hostId)
+        // The Authority binds the voucher to this host's credential, so it has to
+        // exist before the request: a first claim on a fresh machine has none yet.
+        credential(hostId, true)
+        // Assert the package exactly as redemption does. Without payload_key_id the
+        // Authority records the voucher as an unlabelled baseline, and a baseline
+        // voucher shares one combined window with every other such voucher -- it can
+        // never be moved by order id again. `standardEnrollment` returns {} rather
+        // than throwing when deploy/payload.json is absent, so refuse here instead:
+        // migrating is explicit and low-frequency, and silently making this the last
+        // migration ever possible is not a trade worth taking. A host with no trusted
+        // package could not serve the entitlement being claimed anyway.
+        const enrollment = hostEnrollmentIdentity(projectRoot, hostPackageDigest(projectRoot))
+        if (!enrollment.payload_key_id || !enrollment.issuer_public_key_id) throw hostPackageUnready()
+        const data = await authority('claim-by-order', hostId, credential(hostId), {
+          order_id: orderId,
+          ...enrollment,
+        })
+        const confirmed = verifyRights(hostId, data, previous)
+        publish(entitlementFile, confirmed.code, 0o644)
+        return status(confirmed)
+      })
+    },
     unbind() {
       return exclusive(async () => {
         const hostId = identity()

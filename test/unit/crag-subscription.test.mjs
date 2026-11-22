@@ -3148,3 +3148,86 @@ test('runtime admission reclaims non-crag/orphaned seats and rebinds over-quota 
   assert.equal(blockedVm3.code, 'license_crag_host_over_quota')
   assert.equal(await service.admitInference({ vm: vm2 }), null)
 })
+
+test('recording the shop order never blocks the redemption it belongs to', async (t) => {
+  const { root, connect } = standaloneHost(t)
+  seedEncryptedPackage(root)
+  const sent = []
+  let rights
+  const service = connect({
+    fetchImpl: async (url, { body }) => {
+      const request = JSON.parse(body)
+      if (url.endsWith('/redeem')) {
+        sent.push(Object.hasOwn(request, 'order_id') ? request.order_id : null)
+        // An Authority older than this field rejects the whole request shape,
+        // because its redeem request denies unknown fields.
+        if (Object.hasOwn(request, 'order_id'))
+          return Response.json({ ok: false, error: { code: 'invalid_request' } }, { status: 400 })
+        rights ??= issueHostEntitlement(root, request.host_id, { slot_limit: 1 })
+      }
+      if (!rights) return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+      return Response.json({ ok: true, data: { entitlement: rights.code, ...rights.claims, used_slots: 0 } })
+    },
+  })
+  const hostId = service.purchaseDeviceId()
+  // The order id only matters for a migration that has not happened yet, so an
+  // Authority that cannot accept it must not cost the buyer the redemption in
+  // front of them. Degrading also keeps the rejection from arriving as
+  // `crag_subscription_authority_unavailable`, which reads as "retry later" and
+  // would never resolve.
+  const confirmed = await service.redeemDeviceOrder(hostId, voucher(), 'order-abc')
+  assert.deepEqual(sent, ['order-abc', null], 'retried exactly once, without the field')
+  assert.equal(confirmed, undefined, 'a device redemption reports through status, not a return value')
+  assert.equal((await service.status()).state, 'active')
+})
+
+test('claiming by order id asserts the package so the voucher stays individually movable', async (t) => {
+  const { root, connect } = standaloneHost(t)
+  seedEncryptedPackage(root)
+  let claim
+  let rights
+  const service = connect({
+    fetchImpl: async (url, { body }) => {
+      const request = JSON.parse(body)
+      if (url.endsWith('/claim-by-order')) {
+        claim = request
+        rights = issueHostEntitlement(root, request.host_id, { slot_limit: 2 })
+      }
+      if (!rights) return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+      return Response.json({ ok: true, data: { entitlement: rights.code, ...rights.claims, used_slots: 0 } })
+    },
+  })
+
+  // Refused while deploy/payload.json is absent: `standardEnrollment` returns {}
+  // there instead of throwing, so without this check the claim would go out with no
+  // payload_key_id and the Authority would record the voucher as an unlabelled
+  // baseline -- sharing one combined window with every other such voucher, and never
+  // movable by order id again. That is not recoverable, so it must not happen quietly.
+  await assert.rejects(
+    service.claimByOrder('order-xyz'),
+    /crag_subscription_host_package_unready/,
+    'a host with no trusted package cannot claim',
+  )
+  assert.equal(claim, undefined, 'nothing was sent')
+
+  const { issuerId, payloadKeyId } = cragTargetIds(root)
+  fs.mkdirSync(path.join(root, 'deploy'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'deploy/payload.json'),
+    JSON.stringify({ crag_authorization: { issuer_public_key_id: issuerId, payload_key_id: payloadKeyId } }),
+  )
+
+  const next = await service.claimByOrder('order-xyz')
+  assert.equal(claim.order_id, 'order-xyz')
+  assert.equal(claim.host_id, service.purchaseDeviceId())
+  // The package is asserted exactly as redemption does, which is what keeps this
+  // voucher individually addressable for the next migration.
+  assert.equal(claim.payload_key_id, payloadKeyId)
+  assert.equal(claim.issuer_public_key_id, issuerId)
+  assert.equal(next.state, 'active')
+
+  // Refused locally: the Authority could only answer 400 for this, and a shape
+  // check here keeps that from being reported as an unconfirmed result.
+  await assert.rejects(service.claimByOrder('not a valid id'), /crag_subscription_invalid_request/)
+  await assert.rejects(service.claimByOrder(''), /crag_subscription_invalid_request/)
+})

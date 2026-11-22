@@ -11,6 +11,7 @@ export function cragSubscriptionRoute(method, path) {
   if (path === `${ROOT}/recover`) return { action: 'recover' }
   if (path === `${ROOT}/upgrade`) return { action: 'upgrade' }
   if (path === `${ROOT}/unbind`) return { action: 'unbind' }
+  if (path === `${ROOT}/claim-by-order`) return { action: 'claim' }
   const match = BIND.exec(path)
   return match ? { action: 'bind', id: match[1] } : null
 }
@@ -39,6 +40,15 @@ const messages = {
     'The authorization service rejected this host request. Contact the administrator with the request ID; do not reset the host credential.',
   host_transfer_cooldown:
     'This host was retired too recently. Its vouchers become transferable again once the cooldown ends; see cooldown_until on the last retirement.',
+  // Claiming by order id. Each of these is final for the id as given, so the copy
+  // has to point at the one thing that can still change the outcome rather than
+  // inviting a retry that cannot succeed.
+  not_found:
+    'No voucher is recorded for that order id. Check the id on the original order; an order redeemed before order ids were recorded has to be migrated with its voucher code instead.',
+  redeem_unavailable:
+    'That order shares a combined quota window with other vouchers on its host and cannot be moved on its own. Retire the whole host instead.',
+  request_conflict:
+    'That order id is already recorded against a different voucher. Keep the original order and ask the administrator to reconcile it; do not redeem again.',
   vm_not_found: 'VM not found.',
   crag_subscription_failed: 'The host subscription operation failed. Refresh its status before retrying.',
 }
@@ -82,9 +92,11 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
       const valid =
         action === 'redeem'
           ? Object.keys(body).length === 1 && typeof body.redemption_code === 'string'
-          : action === 'recover'
-            ? Object.keys(body).length === 0 || (Object.keys(body).length === 1 && body.use_current_package === true)
-            : Object.keys(body).length === 0
+          : action === 'claim'
+            ? Object.keys(body).length === 1 && typeof body.order_id === 'string'
+            : action === 'recover'
+              ? Object.keys(body).length === 0 || (Object.keys(body).length === 1 && body.use_current_package === true)
+              : Object.keys(body).length === 0
       if (!valid) return reject(res, 400, 'crag_subscription_invalid_request')
     }
 
@@ -92,6 +104,7 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
       if (action === 'redeem') return ok(res, await subscription.redeem(body.redemption_code))
       if (action === 'upgrade') return ok(res, await subscription.upgrade())
       if (action === 'unbind') return ok(res, await subscription.unbind())
+      if (action === 'claim') return ok(res, await subscription.claimByOrder(body.order_id))
       if (action === 'bind') {
         const vm = getVm(id)
         if (!vm) return reject(res, 404, 'vm_not_found')
