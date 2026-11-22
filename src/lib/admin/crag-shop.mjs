@@ -332,19 +332,30 @@ function findOrder(db, owner, orderId) {
 // A device order's owner is sha256(host_id:cookie_token), so losing the checkout cookie
 // hid the order from its own buyer and blocked delivery — a paid order became permanently
 // undeliverable, because applying it also matches on owner. The order id is a randomUUID
-// the buyer was given, and it is what proves the order is theirs. The host still has to
-// match: an entitlement only ever applies to the machine the order was bought for, so
-// recovering onto a different machine would hand over something unusable there.
+// the buyer was given, and it is the whole of what proves the order is theirs: it is held
+// only by that buyer, and it never leaves this gateway, because every outbound reference
+// uses the HMAC from `deriveOrderReceipt` instead.
+//
+// `device_host` is a provenance record, not a second factor, and recovery deliberately
+// does not compare it. `deviceIdentity()` resolves this installation's own machine id, so
+// the column holds the same constant for every device order in one database: comparing it
+// can never tell two anonymous buyers apart — what distinguishes them is the cookie token,
+// which is already inside `owner`. The one thing a comparison did catch was this gateway's
+// own identity changing, and that is exactly when it must not refuse: an identity change
+// invalidates every device order's owner digest at once, leaving recovery as the only way
+// back, so rejecting the rows that happen to carry the older host turned "recoverable" into
+// "permanently undeliverable" for them while pre-column NULL rows stayed recoverable. It
+// was not guarding where the entitlement lands either — `apply` redeems against the live
+// `hostId` regardless of this column. Migration 066's own comment still describes the
+// stricter rule; it cannot be corrected in place, because `database.mjs` verifies applied
+// migrations by SHA-256 and editing the text would fail the checksum on every deployment
+// that has already run it. This comment is the correction.
 function recoverDeviceOrder(db, orderId, hostId, owner) {
   const row = db.prepare('SELECT * FROM crag_shop_orders WHERE order_id = ?').get(orderId)
   // A panel buyer's order belongs to their account and must never be pullable out of it
   // by an anonymous caller. Report it exactly like a missing order, so this route cannot
   // be used to learn which order ids exist.
   if (!row || !row.owner.startsWith('device:')) throw missingOrder()
-  // Orders created before device_host existed carry NULL; they are recovered on the order
-  // id alone, and the host is recorded now so any later recovery is bound to this machine.
-  if (row.device_host && row.device_host !== hostId)
-    throw failure(409, 'shop_order_other_host', 'This order was bought for a different host device')
   if (row.owner === owner) return row
   try {
     durable(db, () =>
