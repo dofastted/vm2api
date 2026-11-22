@@ -1243,11 +1243,11 @@ test('host installer refuses an unsigned manifest and never activates damaged pa
   await writeFile(path.join(source, 'libagy_bridge.so'), 'bad')
   await assert.rejects(installGeminiPayload(source, destination, verificationKey), /gemini_payload_member_mismatch/)
   await assert.rejects(writeFile(path.join(destination, 'unexpected'), 'no'), { code: 'ENOENT' })
-  for (const version of ['0.3.0-rc.2', '0.3.0-rc.3']) {
+  for (const version of ['0.3.0-rc.2', '0.3.0-rc.3', '0.3.0-rc.4']) {
     const bytes = Buffer.from(JSON.stringify({ ...manifest, version }))
     await writeFile(path.join(source, 'manifest.json'), bytes)
     await writeFile(path.join(source, 'manifest.sig'), sign(null, bytes, privateKey))
-    if (version === '0.3.0-rc.2') {
+    if (version !== '0.3.0-rc.4') {
       assert.equal((await readSignedGeminiManifest(source, verificationKey)).manifest.version, version)
     } else {
       await assert.rejects(readSignedGeminiManifest(source, verificationKey), /gemini_payload_invalid_manifest/)
