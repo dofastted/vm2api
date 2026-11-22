@@ -708,9 +708,20 @@ test('device checkout skips panel login, scopes orders to browser and host, and 
   assert.equal((await call('POST', `/orders/${id}/apply`, {})).http, 409)
   status = 'fulfilled'
   assert.equal((await call('GET', `/orders/${id}`)).data.activation.state, 'ready_to_apply')
-  assert.equal((await call('POST', `/orders/${id}/claim`, {})).http, 404)
+  // Exporting the voucher is now an explicit, deliberate action on the device side
+  // too: withholding it left a device buyer with no way to move a subscription whose
+  // order id the Authority never recorded, and the entitlement is theirs. It still
+  // needs the checkout cookie that owns the order.
+  const exported = await call('POST', `/orders/${id}/claim`, {})
+  assert.equal(exported.data.redemption_code, CODE)
+  // Without the checkout cookie there is nothing to prove ownership with, so this
+  // reads exactly like a missing order rather than admitting the id exists. Unlike
+  // 'recover', which mints an identity to re-bind to, exporting needs the cookie
+  // that already owns the order.
+  assert.equal((await call('POST', `/orders/${id}/claim`, {}, {}, false)).http, 404)
   const activation = await call('POST', `/orders/${id}/apply`, {})
   assert.equal(activation.data.activation.state, 'active')
+  // Applying still never carries the code: only the explicit export above does.
   assert.equal(JSON.stringify(activation).includes(CODE), false)
   assert.equal((await call('POST', `/orders/${id}/apply`, {})).data.activation.state, 'active')
   assert.equal(applied, 1)

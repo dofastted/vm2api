@@ -50,10 +50,19 @@ export function cragShopRoute(method, pathname) {
       // 'recover' re-binds a device order to the browser asking for it, so it only exists
       // on the anonymous side. A panel buyer's orders are owned by the account and are
       // never reachable from a different browser to begin with.
+      //
+      // 'claim' is now open to the device side too. It hands back a redeemable secret on
+      // an anonymous page, which is why it was withheld -- but withholding it left a
+      // device buyer with no way to move a subscription whose order id the Authority
+      // never recorded, and the entitlement is theirs. Reaching it still needs the
+      // checkout cookie that owns the order, a same-origin POST, and the per-device rate
+      // limit, so it is no more reachable than applying the order already was.
       if (
         action === 'resume' ||
         action === 'cancel' ||
-        (device ? action === 'apply' || action === 'recover' : action !== 'apply' && action !== 'recover')
+        (device
+          ? action === 'apply' || action === 'recover' || action === 'claim'
+          : action !== 'apply' && action !== 'recover')
       )
         return action
       return null
@@ -119,7 +128,10 @@ const unavailableStorage = () =>
   failure(503, 'shop_private_storage_unavailable', 'CRAG shop private storage is unavailable')
 
 // Only public, actionable subscription failures may cross the anonymous device
-// checkout boundary. Never expose the vendor response, voucher, or local paths.
+// checkout boundary. An error never carries the vendor response, the voucher, or
+// local paths -- exporting the voucher is a separate, deliberate request that has
+// to present the checkout cookie owning the order, so a failure path must not
+// become a second way to reach it.
 const deviceApplyErrors = new Map([
   [
     'crag_subscription_invalid_redemption_receipt',
@@ -973,7 +985,7 @@ export function createCragShopHandler({
             'The voucher association changed while applying this order. Check the original order before retrying.',
           )
         try {
-          await subscription.redeemDeviceOrder(hostId, redemption_code)
+          await subscription.redeemDeviceOrder(hostId, redemption_code, row.order_id)
         } catch (error) {
           if (error?.code === 'crag_subscription_host_package_unready')
             throw failure(
