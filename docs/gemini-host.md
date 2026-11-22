@@ -70,3 +70,5 @@ OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进�
 宿主解析 Gemini SSE 时同时接受顶层 `candidates`／`usageMetadata` 和 Code Assist 的 `response` 包装；无有效结束帧仍按失败处理。Unix socket 回归覆盖包装帧的文本、结束原因与用量。CRAGGemini 独立 worker 的真实 OAuth 验证不等于 vm2api 验收：还需将含 Code Assist 捕获修复的签名载荷接入 vm2api，再从网关端发起真实 OAuth 回合。
 
 如果原生回合返回 `gemini_native_worker_unavailable`，在 `journalctl -u vm2api-gemini.service` 查找 `Gemini native child=`。启动器只报告先观测到退出的 `craggemini` 或 `agy`，以及退出码或信号编号，不收集子进程输出、请求内容或凭据。没有记录不代表子进程正常退出，例如启动器自身先中止时可能来不及记录。
+
+对已选中环境的失败回合，调度器必须保留宿主错误码；`gemini_location_unsupported` 应返回 HTTP 403，并释放半开熔断探针而不记为基础设施失败。排查公网 `503 gemini_host_unavailable` 时应单独跟踪该请求，不能仅凭另一回合的地区拒绝日志归因。
