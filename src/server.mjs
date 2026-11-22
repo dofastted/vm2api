@@ -141,7 +141,7 @@ import { createRoutingRuntime } from './lib/admin/routing-runtime.mjs'
 import { createImportCommit } from './lib/oauth/import-commit.mjs'
 import { createHandleProtocol } from './lib/protocol/handle-protocol.mjs'
 import { createResponsesWsHandler } from './lib/protocol/responses-ws.mjs'
-import { handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
+import { countTokensEnabled, handleUserCountTokens, handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
 import { createKeySelfHandler, KEY_SELF_PATHS } from './lib/protocol/key-self.mjs'
 import { createPanelHandler, syncInstalledKernels } from './lib/admin/panel-routes.mjs'
 import { createCragShopHandler, isCragShopPath, sessionBuyerOwner } from './lib/admin/crag-shop.mjs'
@@ -158,6 +158,13 @@ const FEATURES = [
   'api-direct-kernel',
   'account_usage',
 ]
+/** FEATURES for a request, which is the only place the count_tokens switch can be read.
+ *
+ * `pub` below is written to config/gateway-v2.public.json once at startup, so it keeps
+ * the static list: a file produced at boot cannot describe a switch the operator flips
+ * at runtime, and advertising either answer there would be wrong half the time.
+ */
+const featuresNow = () => (countTokensEnabled(routingConfig) ? [...FEATURES, 'count_tokens'] : FEATURES)
 const LIMITATIONS = {
   client_tools: 'kept in native Messages and executed by the caller',
   images: 'all native Messages image blocks are forwarded by the Go slot worker',
@@ -1421,7 +1428,7 @@ const server = http.createServer(async (req, res) => {
         rewrite: cfg.rewrite.enabled ? 'on' : 'off',
         intercept_rules: cfg.intercept.rules.length,
         active_vm: getActiveVmId(cfg.paths.project),
-        features: FEATURES,
+        features: featuresNow(),
         capabilities: GATEWAY_CAPABILITIES,
         limitations: LIMITATIONS,
         stats,
@@ -1437,7 +1444,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         base_url: cfg.base_url,
         rewrite_default: cfg.rewrite.enabled,
-        features: FEATURES,
+        features: featuresNow(),
         capabilities: GATEWAY_CAPABILITIES,
         limitations: LIMITATIONS,
         endpoints: {
@@ -1484,7 +1491,20 @@ const server = http.createServer(async (req, res) => {
       return await handleKeySelf(req, res, url)
     }
     if (req.method === 'POST' && (p === '/v1/messages/count_tokens' || p === '/messages/count_tokens')) {
-      return json(res, 404, { error: { message: 'not found: ' + p } })
+      // Off by default: the handler and its Go-worker hop were kept when 94b6f728
+      // stubbed this entry, so the switch only decides whether to reach them.
+      if (!countTokensEnabled(routingConfig)) return json(res, 404, { error: { message: 'not found: ' + p } })
+      return await handleUserCountTokens(req, res, {
+        json,
+        readBody,
+        requireAuth,
+        apiKeyStore,
+        cfg,
+        stickyRouter,
+        accountQuota,
+        getPoolScheduler: () => poolScheduler,
+        getRoutingConfig: () => routingConfig,
+      })
     }
 
     if (isGeminiPublicPath(p)) {

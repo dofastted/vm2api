@@ -714,7 +714,7 @@ def read_native_tui_pid(path):
 
 class NativeAgy(Agy):
     def __init__(self, host, environment, proxy_url, auth, model, prompt):
-        self.credentials, self.token_bytes = auth
+        self.credentials, _ = auth
         self.model, self.prompt = model, prompt
         self.native_dir = None
         self.native_token = None
@@ -723,15 +723,10 @@ class NativeAgy(Agy):
         self.native_tui_pgid = None
         self.native_tui_start = None
         self.native_invocation = None
-        super().__init__(host, environment, proxy_url)
-
-    def initialize_home(self, home):
-        super().initialize_home(home)
-        settings = home / ".gemini" / "antigravity-cli"
-        token = settings / TOKEN_NAME
-        token.write_bytes(self.token_bytes)
-        os.chown(token, self.uid, self.uid)
-        self.token_bytes = None
+        self.native_diagnostic = None
+        # CLI onboarding and project state belong to the authorized profile, not the token alone.
+        profile = host.directory / environment["id"] / environment["profile"]
+        super().__init__(host, environment, proxy_url, profile=profile)
 
     def launch_cli(self, argv, size):
         self.native_dir = self.directory / "native"
@@ -755,6 +750,10 @@ class NativeAgy(Agy):
             },
         )
         os.chown(config, self.uid, self.uid)
+        native_module_impl = native_module()
+        self.native_diagnostic = native_module_impl.EligibilityDiagnostic(
+            self.native_dir, self.uid
+        )
 
         argv.extend(
             [
@@ -788,9 +787,13 @@ class NativeAgy(Agy):
                 "plan",
                 "--model",
                 self.model,
+                "--settings",
+                json.dumps(CLI_SETTINGS, separators=(",", ":")),
+                "--log-file",
+                "/tmp/craggemini/" + native_module_impl.ELIGIBILITY_LOG_FILE,
             ]
         )
-        native_module_impl = native_module()
+        self.native_exit_reader = native_module_impl.read_launcher_exit
         try:
             lock, vt = native_module_impl.query_free_vt(
                 self.host.directory / "native-vt.lock"
@@ -847,7 +850,6 @@ class NativeAgy(Agy):
             },
             secrets=self.credentials,
         )
-        self.token_bytes = None
         self.prompt = None
         self.credentials = ()
 
@@ -861,15 +863,31 @@ class NativeAgy(Agy):
                     "message": "Gemini egress stopped",
                 },
             }
-        if self.native_tui is None or self.native_tui.poll() is not None:
+        result = self.native_invocation.poll()
+        if result["state"] == "completed":
+            return result
+        wrapper_exited = self.native_tui is None or self.native_tui.poll() is not None
+        diagnostic = self.native_diagnostic.poll(
+            final=wrapper_exited or result["state"] != "running"
+        )
+        if diagnostic is not None:
+            return {
+                "state": "failed",
+                "text": "",
+                "error": {"code": diagnostic},
+            }
+        if result["state"] != "running":
+            return result
+        if wrapper_exited:
             return {
                 "state": "failed",
                 "text": "",
                 "error": {"code": "gemini_native_worker_unavailable"},
             }
-        return self.native_invocation.poll()
+        return result
 
     def close(self, preserve=False):
+        wrapper_status = self.native_tui.poll() if self.native_tui is not None else None
         try:
             if self.native_invocation is not None:
                 self.native_invocation.close()
@@ -885,13 +903,35 @@ class NativeAgy(Agy):
                 if self.native_tui is not None:
                     self._stop_process_group(self.native_tui)
                     self.native_tui = None
+                    outcome = self.native_exit_reader(self.native_dir, self.uid)
+                    if outcome is not None:
+                        child, status = outcome
+                        kind = "exit_code" if status >= 0 else "signal"
+                        print(
+                            f"Gemini native child={child} {kind}={abs(status)}",
+                            file=sys.stderr,
+                        )
+                    elif wrapper_status is not None:
+                        kind = "exit_code" if wrapper_status >= 0 else "signal"
+                        print(
+                            f"Gemini native wrapper=openvt {kind}={abs(wrapper_status)} child_record=missing",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            "Gemini native wrapper=openvt status=running_before_cleanup child_record=missing",
+                            file=sys.stderr,
+                        )
             finally:
                 self.pid = None
                 self.native_tui_pid = None
-                self.token_bytes = None
                 self.credentials = ()
                 self.prompt = None
-                super().close(preserve)
+                try:
+                    if self.native_diagnostic is not None:
+                        self.native_diagnostic.close()
+                finally:
+                    super().close(preserve)
 
     @staticmethod
     def _stop_process_group(process):

@@ -6,6 +6,7 @@
  *   { ok: false, error: { type, code, message, ... } }
  */
 
+import { isBlockableClientId } from '../identity/blocked-clients.mjs'
 import { hostMemoryPressureOf, LOCAL_HOST_KEY } from '../cluster/host-memory-pressure.mjs'
 import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
@@ -530,6 +531,24 @@ export function validatePersonaRoutingPatch(body = {}) {
   }
   if (compat.claude_code_only != null && typeof compat.claude_code_only !== 'boolean') {
     problems.push('claude_code_only 必须是布尔')
+  }
+  if (compat.count_tokens != null && typeof compat.count_tokens !== 'boolean') {
+    problems.push('count_tokens 必须是布尔')
+  }
+  if (compat.blocked_clients != null) {
+    const map = compat.blocked_clients
+    if (typeof map !== 'object' || Array.isArray(map)) problems.push('blocked_clients 必须是对象')
+    else {
+      for (const [id, on] of Object.entries(map)) {
+        // An unknown id is ignored rather than rejected, matching how
+        // blockedClientsFromRouting reads the same map. Rejecting it would mean that
+        // retiring or renaming an entry in BLOCKABLE_CLIENTS leaves a key in the
+        // stored routing.json that makes *every* later protocol-settings save fail,
+        // recoverable only by hand-editing that file.
+        if (!isBlockableClientId(id)) continue
+        if (typeof on !== 'boolean') problems.push(`blocked_clients.${id} 必须是布尔`)
+      }
+    }
   }
   if (compat.official_cc_passthrough != null && typeof compat.official_cc_passthrough !== 'boolean') {
     problems.push('official_cc_passthrough 必须是布尔')
@@ -2194,6 +2213,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     unschedulable_reason: triad.unschedulable_reason,
     unschedulable_text: triad.unschedulable_text,
     unschedulable_detail: triad.unschedulable_detail,
+    unschedulable_at: v.unschedulable?.at || null,
     // Claude unit circuit (Codex has its own failover set and never trips it).
     circuit,
     refresh_error: v.refresh_error || v.claude?.refresh_error || runtime?.refresh_error || null,

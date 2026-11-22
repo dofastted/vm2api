@@ -7,6 +7,7 @@ import { CragQuotaGrants } from './crag-quota-grants'
 import { CragRuntimeCounts } from './crag-runtime-counts'
 import {
   cragCredentialRecoveryFaults,
+  cragOrderClaimErrors,
   cragSubscriptionErrors,
 } from './crag-subscription-errors'
 import {
@@ -28,7 +29,10 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
   const pending = status?.state === 'sync_pending'
   const busy = host.isFetching || working
 
-  async function perform(action: 'bind' | 'recover' | 'unbind') {
+  async function perform(
+    action: 'bind' | 'recover' | 'unbind' | 'claim-by-order',
+    payload?: Record<string, unknown>
+  ) {
     if (busy) return
     setWorking(true)
     setNotice(undefined)
@@ -49,23 +53,33 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
           CragHostStatus & { released?: { released_codes?: string[] } }
         >(`${root}/${action}`, {
           method: 'POST',
-          body: '{}',
+          body: JSON.stringify(payload ?? {}),
         })
         qc.setQueryData(options.queryKey, next)
         if (action === 'unbind') {
-          // 说清被释放的张数，因为能迁走的恰好是这些 —— 而用户得自己有那些券码。
+          // 说清被释放的张数，因为能迁走的恰好是这些。
           const count = next.released?.released_codes?.length ?? 0
           setNotice({
             text: count
-              ? `本机订阅已注销，${count} 张兑换券已释放并保留剩余时长。在新机器上用原券码兑换即可继承。`
+              ? `本机订阅已注销，${count} 张兑换券已释放并保留剩余时长。在新机器上用购买时的订单号（或原券码）迁移即可继承。`
               : '本机订阅已注销。没有仍在有效期内的兑换券可供转移。',
+          })
+        }
+        if (action === 'claim-by-order') {
+          setNotice({
+            text: '已把该订单的兑换券迁到本机，剩余时长照旧。原机器上这张券的额度已同时失效。',
           })
         }
       }
     } catch (error) {
       setNotice({
         text:
-          (isApiError(error) && cragSubscriptionErrors[error.code]) ||
+          (isApiError(error) &&
+            // 迁移路径下 not_found / redeem_unavailable 的含义与别处不同，
+            // 先查它独有的文案，再回落到按码索引的通用表。
+            ((action === 'claim-by-order' &&
+              cragOrderClaimErrors[error.code]) ||
+              cragSubscriptionErrors[error.code])) ||
           '无法确认订阅操作，请检查连接后重试。',
         error: true,
       })
@@ -131,6 +145,9 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
         status={host.isError ? undefined : status}
         busy={busy}
         onUnbind={() => void perform('unbind')}
+        onClaim={(orderId) =>
+          void perform('claim-by-order', { order_id: orderId })
+        }
       />
       {status?.state === 'active' ? (
         <Button

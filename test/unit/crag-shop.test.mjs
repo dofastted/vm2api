@@ -44,6 +44,7 @@ const COMMERCE_MIGRATION = new URL('057_crag_shop_commerce.sql', MIGRATIONS)
 const ACTIVATION_MIGRATION = new URL('058_crag_shop_activation.sql', MIGRATIONS)
 const DISPATCH_MIGRATION = new URL('060_crag_shop_order_dispatch.sql', MIGRATIONS)
 const CLOSED_MIGRATION = new URL('062_crag_shop_order_closed.sql', MIGRATIONS)
+const DEVICE_HOST_MIGRATION = new URL('066_crag_shop_device_host.sql', MIGRATIONS)
 const PILOT_TOKEN_FILE_ENV = 'VM2API_CRAG_SHOP_PILOT_TOKEN_FILE'
 
 test.beforeEach((t) => {
@@ -148,6 +149,12 @@ test('shop ACL is limited to the buyer slice and session binding does not become
   }
   assert.equal(authorizePanelRoute('POST', `${BASE}/refund`, 'user').ok, false)
   assert.equal(cragShopRoute('GET', `${BASE}/orders/123/claim`), null)
+  // Recovery re-binds an order to the browser asking for it, which only makes sense on the
+  // anonymous side. A panel buyer's orders are owned by the account, so exposing it there
+  // would let one signed-in buyer pull another's order across accounts.
+  assert.equal(cragShopRoute('POST', `${BASE}/orders/123/recover`), null)
+  assert.equal(cragShopRoute('POST', `${BASE}/device/orders/123/recover`), 'recover')
+  assert.equal(cragShopRoute('GET', `${BASE}/device/orders/123/recover`), null)
 })
 
 test('mutations reject cross-origin and forwarded-header authority', () => {
@@ -701,12 +708,167 @@ test('device checkout skips panel login, scopes orders to browser and host, and 
   assert.equal((await call('POST', `/orders/${id}/apply`, {})).http, 409)
   status = 'fulfilled'
   assert.equal((await call('GET', `/orders/${id}`)).data.activation.state, 'ready_to_apply')
-  assert.equal((await call('POST', `/orders/${id}/claim`, {})).http, 404)
+  // Exporting the voucher is now an explicit, deliberate action on the device side
+  // too: withholding it left a device buyer with no way to move a subscription whose
+  // order id the Authority never recorded, and the entitlement is theirs. It still
+  // needs the checkout cookie that owns the order.
+  const exported = await call('POST', `/orders/${id}/claim`, {})
+  assert.equal(exported.data.redemption_code, CODE)
+  // Without the checkout cookie there is nothing to prove ownership with, so this
+  // reads exactly like a missing order rather than admitting the id exists. Unlike
+  // 'recover', which mints an identity to re-bind to, exporting needs the cookie
+  // that already owns the order.
+  assert.equal((await call('POST', `/orders/${id}/claim`, {}, {}, false)).http, 404)
   const activation = await call('POST', `/orders/${id}/apply`, {})
   assert.equal(activation.data.activation.state, 'active')
+  // Applying still never carries the code: only the explicit export above does.
   assert.equal(JSON.stringify(activation).includes(CODE), false)
   assert.equal((await call('POST', `/orders/${id}/apply`, {})).data.activation.state, 'active')
   assert.equal(applied, 1)
+})
+
+test('a device order outlives its checkout cookie and is recoverable by its order id alone', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-device-reclaim-'))
+  const db = createDatabase({ dbPath: path.join(root, 'kin.db') })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const deviceId = 'a'.repeat(64)
+  const host = deviceId
+  let status = 'pending'
+  let confirmed = false
+  let applied = 0
+  const handler = createPanelHandler({
+    cfg: { base_url: PANEL },
+    requireAuth() {
+      assert.fail('device checkout must not invoke panel auth')
+    },
+    handleCragShop: createCragShopHandler({
+      getDb: () => db,
+      dataDir: root,
+      publicBaseUrl: PANEL,
+      json: (_, http, body) => ({ http, ...body }),
+      readRawBody: (req) => req.raw,
+      subscription: {
+        purchaseDeviceId: () => host,
+        async redeemDeviceOrder() {
+          applied++
+          confirmed = true
+        },
+        isRedemptionApplied: () => confirmed,
+      },
+      supplier: {
+        async plans() {
+          return { plans: [PLAN], payment_methods: ['alipay'] }
+        },
+        async quote() {
+          return PLAN
+        },
+        async create(row) {
+          return { order: order(row.order_id) }
+        },
+        async resume(row) {
+          return { order: order(row.order_id) }
+        },
+        async status(row) {
+          return order(row.order_id, status)
+        },
+        async claim(row) {
+          return { order_id: row.order_id, redemption_code: CODE }
+        },
+      },
+    }),
+  })
+  let cookie
+  async function call(method, endpoint, body, sendCookie = true) {
+    const url = new URL(`${PANEL}${BASE}/device${endpoint}`)
+    const req = {
+      method,
+      raw: Buffer.from(body === undefined ? '' : JSON.stringify(body)),
+      headers: {
+        host: 'panel.example.test',
+        origin: PANEL,
+        'sec-fetch-site': 'same-origin',
+        'content-type': 'application/json',
+        ...(sendCookie && cookie ? { cookie } : {}),
+      },
+    }
+    return handler(
+      req,
+      {
+        setHeader(name, value) {
+          if (name === 'Set-Cookie') cookie = value.split(';')[0]
+        },
+      },
+      url,
+    )
+  }
+  const deviceHost = (orderId) =>
+    db.prepare('SELECT device_host FROM crag_shop_orders WHERE order_id = ?').get(orderId).device_host
+
+  await call('GET', '/plans')
+  const id = (await call('POST', '/orders', { ...INPUT, expected_amount_minor: PLAN.amount_minor })).data.order_id
+  assert.equal((await call('GET', '/orders')).data.orders.length, 1)
+  // Recorded at purchase as provenance. It is this installation's own machine id, so it is
+  // the same value for every device order in this database and cannot tell two buyers
+  // apart — what distinguishes them is the cookie token, already inside `owner`.
+  assert.equal(deviceHost(id), deviceId)
+
+  // Losing the cookie is what orphaned a paid order. The listing goes empty and, because
+  // applying also matches on owner, delivery became impossible rather than merely hidden.
+  const lost = cookie
+  cookie = undefined
+  assert.equal((await call('POST', `/orders/${id}/recover`, {})).error.code, 'shop_device_checkout_required')
+  await call('GET', '/plans')
+  assert.notEqual(cookie, lost)
+  assert.equal((await call('GET', '/orders')).data.orders.length, 0)
+
+  // A row carrying some other host is still recoverable, and the column is refreshed to
+  // this machine. Since `device_host` is one constant per installation, a mismatch never
+  // means another buyer — it means this gateway's own identity changed, and that is the
+  // moment every device order's owner digest stops matching at once, leaving recovery as
+  // the only way back. Refusing it there turned a recoverable order into a permanently
+  // undeliverable one, which is the failure this route exists to prevent.
+  db.prepare('UPDATE crag_shop_orders SET device_host = ? WHERE order_id = ?').run('b'.repeat(64), id)
+
+  assert.equal((await call('POST', `/orders/${id}/recover`, {})).data.order_id, id)
+  assert.equal(deviceHost(id), deviceId)
+  assert.equal((await call('GET', '/orders')).data.orders.length, 1)
+  // Recovery has to restore delivery, not just visibility.
+  status = 'fulfilled'
+  assert.equal((await call('POST', `/orders/${id}/apply`, {})).data.activation.state, 'active')
+  assert.equal(applied, 1)
+  assert.equal(JSON.stringify(await call('GET', '/orders')).includes(CODE), false)
+
+  // A panel buyer's order belongs to their account. An anonymous caller must not be able
+  // to pull it out, and must not learn that the id exists either.
+  const panelOrder = randomUUID()
+  db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, created_at, term, amount_minor, slot_limit)
+    VALUES (?, 'panel:alice-id', 'account-order', 'quarter', 'alipay', 1, 'fulfilled', 1, '3m', 59900, 10)`).run(
+    panelOrder,
+  )
+  const refused = await call('POST', `/orders/${panelOrder}/recover`, {})
+  assert.equal(refused.http, 404)
+  assert.equal(refused.error.code, (await call('POST', `/orders/${randomUUID()}/recover`, {})).error.code)
+  assert.equal(
+    db.prepare('SELECT owner FROM crag_shop_orders WHERE order_id = ?').get(panelOrder).owner,
+    'panel:alice-id',
+  )
+
+  // Orders predating device_host carry NULL. They are recovered on the order id alone —
+  // the only proof that still exists for them — and the host is recorded at that point.
+  const legacyOrder = randomUUID()
+  db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, created_at, term, amount_minor, slot_limit)
+    VALUES (?, 'device:forgotten-browser', 'legacy-order', 'quarter', 'alipay', 1, 'fulfilled', 1, '3m', 59900, 10)`).run(
+    legacyOrder,
+  )
+  assert.equal(deviceHost(legacyOrder), null)
+  assert.equal((await call('POST', `/orders/${legacyOrder}/recover`, {})).data.order_id, legacyOrder)
+  assert.equal(deviceHost(legacyOrder), deviceId)
+  assert.equal((await call('GET', '/orders')).data.orders.length, 2)
 })
 
 test('device order recovery projects only a matching durable redemption receipt, including after restart', async (t) => {
@@ -1004,6 +1166,7 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
   db.exec(fs.readFileSync(ACTIVATION_MIGRATION, 'utf8'))
   db.exec(fs.readFileSync(DISPATCH_MIGRATION, 'utf8'))
   db.exec(fs.readFileSync(CLOSED_MIGRATION, 'utf8'))
+  db.exec(fs.readFileSync(DEVICE_HOST_MIGRATION, 'utf8'))
   // The legacy row normally already has a receipt key from its original checkout.
   const receiptKey = loadOrderReceiptKey(root, () => false)
   const publicDir = cragSubscriptionPublicDirectory(root)

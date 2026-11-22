@@ -105,14 +105,17 @@ function gptImage() {
   return { ...tokenPrice(5, 0, 1.25, 0, 0), image: { input: 8, output: 30, cache_read: 2 } }
 }
 
+// No `flex` band: the GPT-6.2 models have no published Flex price, and the pricing page says
+// outright that Flex is not being added to new models. Deriving one from the 0.5x ratio the
+// older models happen to show would put an invented number in a file that claims to be a list
+// price snapshot, and `selectBand` already has the right answer for a tier with no published
+// price -- it reports the row unpriced rather than billing it at a guess.
 function openai62(input, output, cacheRead) {
   return openaiFrom(
     { input, output, cache_read: cacheRead, cache_write: input * 1.25 },
     {
-      flex: [input * 0.5, output * 0.5, cacheRead * 0.5],
       fast: [input * 2, output * 2, cacheRead * 2],
       long_standard: [input * 2, output * 1.5, cacheRead * 2],
-      long_flex: [input, output * 0.75, cacheRead],
       long_fast: [input * 4, output * 3, cacheRead * 4],
     },
   )

@@ -235,11 +235,15 @@ function applicationError(
   ) {
     text = hostRedemptionError(error)
   } else if (
-    /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable)$/.test(
+    /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable|order_recover_conflict)$/.test(
       code
     )
   ) {
     text = quoteProblem(error)
+  } else if (code === 'shop_session_stale') {
+    // Not the same as being signed out: the session is valid but predates the buyer
+    // binding, so "please sign in" would be advice the user is already following.
+    text = '登录状态需要刷新才能读取订单。请重新登录一次，不要重复购买。'
   } else if (isApiError(error) && error.status === 401) {
     text = '登录已过期，请重新登录后核对原订单。'
   } else {
@@ -257,6 +261,14 @@ function applicationError(
   )
     text += ` 请求 ID：${requestId}`
   return text
+}
+
+// Order ids are randomUUID v4, which is also what makes one usable as the buyer's own
+// proof when recovering an order: it cannot be guessed or enumerated.
+function isOrderId(value: string) {
+  return /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(
+    value
+  )
 }
 
 function quotaLabel(value: number | 'unlimited' | null | undefined) {
@@ -797,6 +809,10 @@ function ShopOrders({
     Record<string, ApplicationFeedback>
   >({})
   const [ordersProblem, setOrdersProblem] = useState('')
+  // Keep these last: the unit tests inject state by useState call order, so inserting a
+  // hook above shifts every index after it and silently rewires unrelated assertions.
+  const [recoverOpen, setRecoverOpen] = useState(false)
+  const [recoverId, setRecoverId] = useState('')
   // A cancelled or expired checkout is history, not work. It stays reachable, but the
   // order the buyer came for should not have to be found among closed ones.
   const activeOrders = orders?.filter((order) => order.status !== 'cancelled')
@@ -984,7 +1000,7 @@ function ShopOrders({
           : isApiError(error) && error.code === 'shop_device_package_unready'
             ? '本机缺少可用的 CRAG 发行包。请让管理员从内核页拉取后，重试应用原订单。'
             : isApiError(error) &&
-                /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable)$/.test(
+                /^shop_(device_(unavailable|checkout_required)|host_identity_changed|private_storage_unavailable|order_recover_conflict)$/.test(
                   error.code
                 )
               ? quoteProblem(error)
@@ -1431,6 +1447,42 @@ function ShopOrders({
             if (cancelTarget) cancelOrder(cancelTarget)
           }}
         />
+        <ConfirmDialog
+          open={recoverOpen}
+          onOpenChange={(open) => {
+            if (!open && !busy) setRecoverOpen(false)
+          }}
+          title='用订单号找回订单'
+          desc='免登录订单按浏览器保存，换浏览器或清除 Cookie 后就看不到了。输入下单时的订单号即可把它取回到这个浏览器，付款和已到账的权益都不受影响。订单号就是这笔订单的凭据——持有它的人就能把订单取到自己的浏览器，请妥善保存、不要外传。'
+          confirmText='找回'
+          cancelBtnText='返回'
+          disabled={!isOrderId(recoverId.trim())}
+          isLoading={busy}
+          handleConfirm={() => {
+            const id = recoverId.trim()
+            if (!isOrderId(id)) return
+            void run(async () => {
+              const recovered = await request<Order>(
+                `${root}/orders/${encodeURIComponent(id)}/recover`,
+                { method: 'POST', body: '{}' }
+              )
+              if (recovered.order_id !== id) throw new Error('order mismatch')
+              setRecoverOpen(false)
+              setRecoverId('')
+              refresh((n) => n + 1)
+              setNotice('已找回该订单，请在历史订单中核对支付与激活状态。')
+            }, '未能找回该订单，请核对订单号后重试。')
+          }}
+        >
+          <Input
+            value={recoverId}
+            onChange={(event) => setRecoverId(event.target.value)}
+            placeholder='订单号，例如 3f8a1c2e-...'
+            autoComplete='off'
+            spellCheck={false}
+            aria-label='订单号'
+          />
+        </ConfirmDialog>
         <div className='grid min-w-0 gap-6'>
           <section
             aria-label={presentation?.plans_title ?? '订阅套餐'}
@@ -1539,14 +1591,29 @@ function ShopOrders({
                 <h2 className='font-medium'>
                   {presentation?.orders_title ?? '历史订单'}
                 </h2>
-                <Button
-                  size='sm'
-                  variant='ghost'
-                  disabled={loading || busy}
-                  onClick={() => refresh((n) => n + 1)}
-                >
-                  刷新订单
-                </Button>
+                <div className='flex items-center gap-1'>
+                  {device ? (
+                    <Button
+                      size='sm'
+                      variant='ghost'
+                      disabled={busy}
+                      onClick={() => {
+                        setRecoverId('')
+                        setRecoverOpen(true)
+                      }}
+                    >
+                      找回订单
+                    </Button>
+                  ) : null}
+                  <Button
+                    size='sm'
+                    variant='ghost'
+                    disabled={loading || busy}
+                    onClick={() => refresh((n) => n + 1)}
+                  >
+                    刷新订单
+                  </Button>
+                </div>
               </div>
               {loading && !orders && !ordersFailed ? (
                 <Skeleton className='h-12 w-full' />
@@ -1565,8 +1632,10 @@ function ShopOrders({
                 <p className='text-sm text-muted-foreground'>
                   {closedOrders?.length
                     ? '没有进行中的订单。已关闭的订单在下方。'
-                    : (presentation?.empty_orders_text ??
-                      '还没有订阅订单。下单后可以在这里查看支付和激活状态。')}
+                    : device
+                      ? '这个浏览器没有订单记录。免登录订单按浏览器保存，换浏览器或清过 Cookie 后这里就是空的——用下单时的订单号点「找回订单」即可取回，已付款的订单不会丢。'
+                      : (presentation?.empty_orders_text ??
+                        '还没有订阅订单。下单后可以在这里查看支付和激活状态。')}
                 </p>
               ) : null}
               {activeOrders?.length ? (
@@ -1607,7 +1676,6 @@ function ShopOrders({
                           </Button>
                         ) : null}
                         {order.status === 'fulfilled' &&
-                        !device &&
                         order.sku !== 'renewal' &&
                         !automaticOrder(order) ? (
                           <Button
@@ -1617,7 +1685,10 @@ function ShopOrders({
                             onClick={() =>
                               void run(async () => {
                                 setClaim(undefined)
-                                const code = await api<{
+                                // `request`, not `api`: on the device page there is no
+                                // panel session, so `api` would reject this locally with
+                                // a 401 before it was ever sent.
+                                const code = await request<{
                                   order_id: string
                                   redemption_code: string
                                 }>(
@@ -1630,7 +1701,7 @@ function ShopOrders({
                               }, '暂时无法领取，请刷新订单后重试。')
                             }
                           >
-                            领取兑换码
+                            {device ? '导出迁移凭据' : '领取兑换码'}
                           </Button>
                         ) : null}
                         {device &&
@@ -1810,7 +1881,9 @@ function ShopOrders({
                       !automaticOrder(order) ? (
                         <div className='space-y-2'>
                           <p className='text-muted-foreground'>
-                            请勿公开分享，下方是本订单的完整兑换码。
+                            {device
+                              ? '请勿公开分享。保存这串凭据即可在新机器上迁移本订单的额度，剩余时长照旧带走。'
+                              : '请勿公开分享，下方是本订单的完整兑换码。'}
                           </p>
                           <code className='block rounded bg-muted px-2 py-1 break-all'>
                             {claim.redemption_code}

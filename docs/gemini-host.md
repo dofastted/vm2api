@@ -68,3 +68,17 @@ OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进�
 内部适配器 [`native-turn.mjs`](../src/lib/gemini/native-turn.mjs) 把 Gemini `streamGenerateContent` 请求体、Anthropic Messages、OpenAI Chat Completions 和 Responses 的单条文本输入收敛为 `{ request_id, stream: true, body: { model, contents } }`，保留文本顺序和空白。由受信服务端选定固定模型和每回合独立的 `kernel.sock`，经 `/internal/v1/messages` 调用 CRAGGemini worker；worker 的 `native.sock` 与 `LD_PRELOAD` 桥接到 `agy` TUI 原生输入队列。历史由原生会话持有，不接收外部历史、系统指令、工具、生成参数、多模态或非流式选项；不支持的字段明确拒绝，不静默丢弃。适配器保留原生 Gemini SSE，不把首个 HTTP 200 当作回合成功，也不自动重试。
 
 宿主解析 Gemini SSE 时同时接受顶层 `candidates`／`usageMetadata` 和 Code Assist 的 `response` 包装；无有效结束帧仍按失败处理。Unix socket 回归覆盖包装帧的文本、结束原因与用量。CRAGGemini 独立 worker 的真实 OAuth 验证不等于 vm2api 验收：还需将含 Code Assist 捕获修复的签名载荷接入 vm2api，再从网关端发起真实 OAuth 回合。
+
+如果原生回合返回 `gemini_native_worker_unavailable`，在 `journalctl -u vm2api-gemini.service` 查找 `Gemini native child=`。启动器只报告先观测到退出的 `craggemini` 或 `agy`，以及退出码或信号编号，不收集子进程输出、请求内容或凭据。没有记录不代表子进程正常退出，例如启动器自身先中止时可能来不及记录。
+
+缺少子进程退出记录时，日志会退回输出 `wrapper=openvt` 在清理前观测到的退出码或信号；如果当时仍在运行则明确标记 `running_before_cleanup`，不把清理发送的 SIGKILL 当成原故障。
+
+`0.3.0-rc.3` 原生候选纳入独立仓 Code Assist CCPA 响应捕获修复（`369c209`），保持官方 `agy 1.5.9` 摘要不变。它需要独立签名清单和与该清单匹配的兑换校验文件；使用同一发行公钥并不代表可继承旧清单的激活。既有 rc.1、rc.2 验签仍受支持。
+
+原生 OAuth 回合复用该环境已经完成官方 CLI 登录的私有 HOME，保留 CLI 的 onboarding、项目状态及令牌刷新；仅复制 token 到全新 HOME 不等价于复用登录环境。每回合仍有独立工作目录、原生 socket 和请求身份，并通过 CLI 的仅会话 `--settings` 保持严格工具权限及禁用额外 Credits。主题预览里的 `compilation failed` 是示例文案，不能据此判断运行故障。
+
+对已选中环境的失败回合，调度器必须保留宿主错误码；`gemini_location_unsupported` 应返回 HTTP 403，并释放半开熔断探针而不记为基础设施失败。排查公网 `503 gemini_host_unavailable` 时应单独跟踪该请求，不能仅凭另一回合的地区拒绝日志归因。
+
+原生 CLI 通过 `--log-file` 写入当前回合私有目录的 FIFO，不写入或读取共享 profile 的 `cli.log`。每回合有独立排空线程，每批最多读取 64 KiB，单行最多保留 4 KiB；不依赖同步宿主请求循环，避免另一条请求阻塞时卡住 CLI 日志写入。线程只保留 `server_oauth.go` 明确地区资格拒绝的固定错误码 `gemini_location_unsupported`；未知、超长或跨回合文本不用于归因，原始日志不落盘、不返回客户端。失败终态最多等待 250 ms 获取已经排入 FIFO 的诊断快照；清理时停止并等待线程退出，再回收描述符，避免与 fd 复用竞争。已完成的模型结果优先；否则本回合白名单诊断优先于通用错误。
+
+在一次性 Linux amd64 环境、禁止外部网络的条件下，运行 `sudo python3 -B test/deploy/gemini-host-native-launch-smoke.py PAYLOAD_DIR --fifo-backpressure`。它把 FIFO 缩至 4 KiB，使用固定官方 CLI、`openvt`、`bwrap` 和 loopback 上游，并阻塞真实宿主 HTTP 请求；原生 fixture 回合必须在该请求释放前完成。单元联测另覆盖 256 KiB 日志突发、线程停止、资格错误到公开 HTTP 403 及探针释放；这些测试不代表生产 OAuth 推理已经验收。
