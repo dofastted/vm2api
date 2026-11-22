@@ -723,6 +723,7 @@ class NativeAgy(Agy):
         self.native_tui_pgid = None
         self.native_tui_start = None
         self.native_invocation = None
+        self.native_diagnostic = None
         # CLI onboarding and project state belong to the authorized profile, not the token alone.
         profile = host.directory / environment["id"] / environment["profile"]
         super().__init__(host, environment, proxy_url, profile=profile)
@@ -749,6 +750,10 @@ class NativeAgy(Agy):
             },
         )
         os.chown(config, self.uid, self.uid)
+        native_module_impl = native_module()
+        self.native_diagnostic = native_module_impl.EligibilityDiagnostic(
+            self.native_dir, self.uid
+        )
 
         argv.extend(
             [
@@ -784,9 +789,10 @@ class NativeAgy(Agy):
                 self.model,
                 "--settings",
                 json.dumps(CLI_SETTINGS, separators=(",", ":")),
+                "--log-file",
+                "/tmp/craggemini/" + native_module_impl.ELIGIBILITY_LOG_FILE,
             ]
         )
-        native_module_impl = native_module()
         self.native_exit_reader = native_module_impl.read_launcher_exit
         try:
             lock, vt = native_module_impl.query_free_vt(
@@ -857,13 +863,25 @@ class NativeAgy(Agy):
                     "message": "Gemini egress stopped",
                 },
             }
+        result = self.native_invocation.poll()
+        if result["state"] == "completed":
+            return result
+        diagnostic = self.native_diagnostic.poll()
+        if diagnostic is not None:
+            return {
+                "state": "failed",
+                "text": "",
+                "error": {"code": diagnostic},
+            }
+        if result["state"] != "running":
+            return result
         if self.native_tui is None or self.native_tui.poll() is not None:
             return {
                 "state": "failed",
                 "text": "",
                 "error": {"code": "gemini_native_worker_unavailable"},
             }
-        return self.native_invocation.poll()
+        return result
 
     def close(self, preserve=False):
         wrapper_status = self.native_tui.poll() if self.native_tui is not None else None
@@ -906,6 +924,8 @@ class NativeAgy(Agy):
                 self.native_tui_pid = None
                 self.credentials = ()
                 self.prompt = None
+                if self.native_diagnostic is not None:
+                    self.native_diagnostic.close()
                 super().close(preserve)
 
     @staticmethod

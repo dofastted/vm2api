@@ -78,3 +78,5 @@ OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进�
 原生 OAuth 回合复用该环境已经完成官方 CLI 登录的私有 HOME，保留 CLI 的 onboarding、项目状态及令牌刷新；仅复制 token 到全新 HOME 不等价于复用登录环境。每回合仍有独立工作目录、原生 socket 和请求身份，并通过 CLI 的仅会话 `--settings` 保持严格工具权限及禁用额外 Credits。主题预览里的 `compilation failed` 是示例文案，不能据此判断运行故障。
 
 对已选中环境的失败回合，调度器必须保留宿主错误码；`gemini_location_unsupported` 应返回 HTTP 403，并释放半开熔断探针而不记为基础设施失败。排查公网 `503 gemini_host_unavailable` 时应单独跟踪该请求，不能仅凭另一回合的地区拒绝日志归因。
+
+原生 CLI 通过 `--log-file` 写入当前回合私有目录的 FIFO，不写入或读取共享 profile 的 `cli.log`。宿主每次最多读取 64 KiB，单行最多保留 4 KiB，只识别 `server_oauth.go` 的明确地区资格拒绝并转成 `gemini_location_unsupported`；未知、超长或跨回合文本不用于归因，原始日志不落盘、不返回客户端。已完成的模型结果优先；否则当前回合白名单诊断优先于 wrapper 或 worker 的通用错误。离线联测覆盖真实子进程写入、宿主终态、Unix socket、公开 HTTP 403 和探针释放，不代表生产请求已经验证通过。

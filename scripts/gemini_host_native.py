@@ -25,6 +25,57 @@ MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 LAUNCHER_EXIT_FILE = "launcher-exit"
 LAUNCHER_EXIT = re.compile(rb"(craggemini|agy) (-?[0-9]{1,3})\n")
+ELIGIBILITY_LOG_FILE = "cli-diagnostic"
+
+
+class EligibilityDiagnostic:
+    """One run's CLI log stream; retain no raw diagnostic on disk."""
+
+    def __init__(self, directory, uid):
+        path = directory / ELIGIBILITY_LOG_FILE
+        os.mkfifo(path, 0o600)
+        os.chown(path, uid, uid)
+        self.descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW)
+        self.pending = bytearray()
+        self.discard_line = False
+        self.code = None
+
+    def poll(self):
+        # Bound both memory and work on each host poll, including oversized lines.
+        remaining = 64 * 1024
+        while self.descriptor is not None and remaining:
+            try:
+                chunk = os.read(self.descriptor, min(4096, remaining))
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            for piece in chunk.splitlines(keepends=True):
+                ended = piece.endswith(b"\n")
+                if not self.discard_line:
+                    if len(self.pending) + len(piece) > 4096:
+                        self.pending.clear()
+                        self.discard_line = True
+                    else:
+                        self.pending.extend(piece)
+                if ended:
+                    if not self.discard_line and re.fullmatch(
+                        rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
+                        rb"Account ineligible: [^\r\n]{0,256}not eligible for Antigravity, "
+                        rb"because it is not currently available in your location\.\r?\n",
+                        self.pending,
+                    ):
+                        self.code = "gemini_location_unsupported"
+                    self.pending.clear()
+                    self.discard_line = False
+        return self.code
+
+    def close(self):
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+        self.pending.clear()
 
 
 class NativeFailure(Exception):
