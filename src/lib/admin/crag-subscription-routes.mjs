@@ -10,6 +10,7 @@ export function cragSubscriptionRoute(method, path) {
   if (path === `${ROOT}/redeem`) return { action: 'redeem' }
   if (path === `${ROOT}/recover`) return { action: 'recover' }
   if (path === `${ROOT}/upgrade`) return { action: 'upgrade' }
+  if (path === `${ROOT}/unbind`) return { action: 'unbind' }
   const match = BIND.exec(path)
   return match ? { action: 'bind', id: match[1] } : null
 }
@@ -36,6 +37,8 @@ const messages = {
     'The CRAG issuer this redemption recorded does not match the authorization service. Restore the matching trusted package before retrying.',
   auth_forbidden:
     'The authorization service rejected this host request. Contact the administrator with the request ID; do not reset the host credential.',
+  host_transfer_cooldown:
+    'This host was retired too recently. Its vouchers become transferable again once the cooldown ends; see cooldown_until on the last retirement.',
   vm_not_found: 'VM not found.',
   crag_subscription_failed: 'The host subscription operation failed. Refresh its status before retrying.',
 }
@@ -88,6 +91,7 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
     try {
       if (action === 'redeem') return ok(res, await subscription.redeem(body.redemption_code))
       if (action === 'upgrade') return ok(res, await subscription.upgrade())
+      if (action === 'unbind') return ok(res, await subscription.unbind())
       if (action === 'bind') {
         const vm = getVm(id)
         if (!vm) return reject(res, 404, 'vm_not_found')
