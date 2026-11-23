@@ -65,7 +65,7 @@ export function SlotIdentity({
   // 有自定义名称时优先展示名称（识别靠名称体系），账号地址放悬停提示
   const name = String(vm?.name || '').trim()
   const shown = name || (compact && full.includes('@') ? compactEmail(full) : full)
-  const tip = name && full.includes('@') ? `${name} · ${full}` : full.includes('@') ? full : undefined
+  const tip = name ? `${name} · ${full}` : full.includes('@') ? full : undefined
   return (
     <span
       className={cn(
