@@ -747,6 +747,7 @@ export function createPanelHandler(ctx) {
     readBody: ctx.readBody,
     proxyPool: () => ctx.proxyPool,
     terminal: ctx.geminiTerminal,
+    cragSubscription: ctx.geminiCragSubscription,
   })
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)

@@ -78,11 +78,54 @@ class Handler(socketserver.StreamRequestHandler):
                 + body
             )
             return
+        if request_line == "POST /internal/v1/cancel HTTP/1.1":
+            assert headers.get("x-kin-internal-token") == "a" * 64
+            length = int(headers["content-length"])
+            cancel_req = json.loads(self.rfile.read(length))
+            body = json.dumps({"cancelled": cancel_req.get("request_id") == "turn-cancel-01"}).encode("utf-8")
+            self.wfile.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\nConnection: close\r\n\r\n"
+                + body
+            )
+            return
         if request_line != "POST /internal/v1/messages HTTP/1.1":
             raise AssertionError(request_line)
         assert headers.get("x-kin-internal-token") == "a" * 64
         length = int(headers["content-length"])
         request = json.loads(self.rfile.read(length))
+        if request["request_id"] == "turn-err-429":
+            body = json.dumps(
+                {"error": "rate limited", "code": "upstream_http", "upstream_status": 429}
+            ).encode("utf-8")
+            self.wfile.write(
+                b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\nConnection: close\r\n\r\n"
+                + body
+            )
+            return
+        if request["request_id"] == "turn-err-unsupported":
+            body = json.dumps({"error": "plain text only", "code": "unsupported_turn"}).encode("utf-8")
+            self.wfile.write(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\nConnection: close\r\n\r\n"
+                + body
+            )
+            return
+        if request["request_id"] == "turn-stream-01":
+            assert request.get("gateway_policy") == {"first_byte_timeout_ms": 5000}
+            assert request["body"]["model"] == "gemini-test"
+            body = b"".join(wrapped_frames)
+            self.wfile.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\nConnection: close\r\n\r\n"
+                + body
+            )
+            return
         assert request["request_id"] == "turn-native-01"
         assert request["body"]["model"] == "gemini-test"
         assert request["body"]["contents"][0]["parts"][0]["text"] == "native prompt"
@@ -104,6 +147,40 @@ with tempfile.TemporaryDirectory(prefix="gemini-native-fixture-") as temporary:
         "ready": True,
         "native_pid": 12,
     }
+    assert native.cancel_worker_request(socket_path, "a" * 64, "turn-cancel-01", timeout=2) is True
+    assert native.cancel_worker_request(socket_path, "a" * 64, "other-id", timeout=2) is False
+    conn, resp = native.open_worker_stream(
+        socket_path,
+        "a" * 64,
+        "gemini-test",
+        "turn-stream-01",
+        {"model": "gemini-test", "contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+        startup_timeout=2,
+        gateway_policy={"first_byte_timeout_ms": 5000},
+    )
+    try:
+        streamed = resp.read()
+        assert streamed == b"".join(wrapped_frames)
+    finally:
+        conn.close()
+    for req_id, expected_code, expected_status in (
+        ("turn-err-429", "gemini_quota_exhausted", 429),
+        ("turn-err-unsupported", "gemini_unsupported_turn", 400),
+    ):
+        try:
+            native.open_worker_stream(
+                socket_path,
+                "a" * 64,
+                "gemini-test",
+                req_id,
+                {"model": "gemini-test", "contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+                startup_timeout=2,
+            )
+        except native.NativeFailure as err:
+            assert err.code == expected_code, (err.code, expected_code)
+            assert err.status == expected_status, (err.status, expected_status)
+        else:
+            raise AssertionError(f"expected NativeFailure for {req_id}")
     invocation = native.NativeInvocation(
         {
             "socket": socket_path,
@@ -129,6 +206,14 @@ with tempfile.TemporaryDirectory(prefix="gemini-native-fixture-") as temporary:
         server.server_close()
         thread.join(timeout=2)
 
+# Error mapping checks for all CRAG upstream_status codes
+assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status": 429}).code == "gemini_quota_exhausted"
+assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status": 403}).code == "gemini_location_unsupported"
+assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status": 401}).code == "gemini_oauth_required"
+assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status": 404}).code == "gemini_model_unavailable"
+assert native._map_worker_error(504, {"code": "first_byte_timeout"}).code == "gemini_inference_timeout"
+assert native._map_worker_error(503, {"code": "queue_full"}).code == "gemini_operation_busy"
+
 print(
-    "Native worker fixture: health, authenticated text turn, SSE completion and usage PASS"
+    "Native worker fixture: health, streaming, cancel, error mapping, SSE completion and usage PASS"
 )

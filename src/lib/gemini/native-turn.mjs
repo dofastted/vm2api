@@ -4,6 +4,7 @@ import path from 'node:path'
 const MAX_REQUEST_BYTES = 256 * 1024
 const MODEL = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const POLICY_KEYS = ['queue_wait_ms', 'first_byte_timeout_ms', 'stream_idle_timeout_ms']
 
 function unsupported() {
   throw Object.assign(new Error('The native Antigravity bridge accepts one new plain-text streaming turn.'), {
@@ -41,7 +42,33 @@ function textParts(parts, type) {
     .join('')
 }
 
-export function prepareGeminiNativeTurn({ protocol, body, model, requestId, stream }) {
+function normalizeGatewayPolicy(policy) {
+  if (policy == null) return undefined
+  if (!only(policy, POLICY_KEYS)) unsupported()
+  const out = {}
+  for (const key of POLICY_KEYS) {
+    if (policy[key] === undefined) continue
+    if (!Number.isSafeInteger(policy[key]) || policy[key] < 100 || policy[key] > 600_000) unsupported()
+    out[key] = policy[key]
+  }
+  return Object.keys(out).length ? out : undefined
+}
+
+function validateTransport(socketPath, internalToken) {
+  if (
+    typeof socketPath !== 'string' ||
+    !path.isAbsolute(socketPath) ||
+    typeof internalToken !== 'string' ||
+    !/^[!-~]{24,4096}$/.test(internalToken)
+  ) {
+    throw Object.assign(new Error('A trusted Antigravity worker socket is required.'), {
+      status: 503,
+      code: 'gemini_worker_unavailable',
+    })
+  }
+}
+
+export function prepareGeminiNativeTurn({ protocol, body, model, requestId, stream, gatewayPolicy }) {
   if (
     typeof model !== 'string' ||
     !MODEL.test(model) ||
@@ -91,9 +118,11 @@ export function prepareGeminiNativeTurn({ protocol, body, model, requestId, stre
   ) {
     unsupported()
   }
+  const normalizedPolicy = normalizeGatewayPolicy(gatewayPolicy)
   const envelope = {
     request_id: requestId,
     stream: true,
+    ...(normalizedPolicy ? { gateway_policy: normalizedPolicy } : {}),
     body: { model, contents: [{ role: 'user', parts: [{ text }] }] },
   }
   if (Buffer.byteLength(JSON.stringify(envelope)) > MAX_REQUEST_BYTES) {
@@ -104,18 +133,9 @@ export function prepareGeminiNativeTurn({ protocol, body, model, requestId, stre
   }
   return envelope
 }
+
 export async function dispatchGeminiNativeTurn({ socketPath, internalToken, signal, ...turn }) {
-  if (
-    typeof socketPath !== 'string' ||
-    !path.isAbsolute(socketPath) ||
-    typeof internalToken !== 'string' ||
-    !/^[!-~]{24,4096}$/.test(internalToken)
-  ) {
-    throw Object.assign(new Error('A trusted Antigravity worker socket is required.'), {
-      status: 503,
-      code: 'gemini_worker_unavailable',
-    })
-  }
+  validateTransport(socketPath, internalToken)
   const body = JSON.stringify(prepareGeminiNativeTurn(turn))
   const deadline = AbortSignal.timeout(1_210_000)
   const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline
@@ -149,5 +169,76 @@ export async function dispatchGeminiNativeTurn({ socketPath, internalToken, sign
       )
     })
     request.end(body)
+  })
+}
+
+export async function cancelGeminiNativeTurn({ socketPath, internalToken, requestId, signal }) {
+  validateTransport(socketPath, internalToken)
+  if (typeof requestId !== 'string' || !REQUEST_ID.test(requestId)) {
+    throw Object.assign(new Error('Invalid native turn request_id.'), { status: 400, code: 'gemini_invalid_request' })
+  }
+  const body = JSON.stringify({ request_id: requestId })
+  const deadline = AbortSignal.timeout(5_000)
+  const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      {
+        socketPath,
+        method: 'POST',
+        path: '/internal/v1/cancel',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          'X-Kin-Internal-Token': internalToken,
+        },
+        signal: requestSignal,
+      },
+      async (response) => {
+        try {
+          const chunks = []
+          for await (const chunk of response) chunks.push(chunk)
+          const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+          resolve({ status: response.statusCode, ...parsed })
+        } catch (error) {
+          reject(error)
+        }
+      },
+    )
+    request.once('error', reject)
+    request.end(body)
+  })
+}
+
+export async function readGeminiNativeHealth({ socketPath, internalToken, signal }) {
+  validateTransport(socketPath, internalToken)
+  const deadline = AbortSignal.timeout(3_000)
+  const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline
+  return new Promise((resolve, reject) => {
+    const request = http.request(
+      {
+        socketPath,
+        method: 'GET',
+        path: '/internal/health',
+        headers: { 'X-Kin-Internal-Token': internalToken },
+        signal: requestSignal,
+      },
+      async (response) => {
+        try {
+          const chunks = []
+          let total = 0
+          for await (const chunk of response) {
+            total += chunk.length
+            if (total > 64 * 1024) throw new Error('health response too large')
+            chunks.push(chunk)
+          }
+          const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+          resolve({ status: response.statusCode, ...parsed })
+        } catch (error) {
+          reject(error)
+        }
+      },
+    )
+    request.once('error', reject)
+    request.end()
   })
 }

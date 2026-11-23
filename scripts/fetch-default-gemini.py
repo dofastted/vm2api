@@ -18,16 +18,15 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "0.3.0-rc.2"
-TAG = f"payload-2026.11.20-gemini-{VERSION}"
+VERSION = "0.3.0"
+TAG = f"payload-2026.11.23-gemini-{VERSION}"
 NATIVE_RELEASE = f"https://github.com/dofastted/vm2api/releases/download/{TAG}"
 NATIVE_ASSETS = (
     "craggemini",
+    "craggemini.payload.enc",
     "libagy_bridge.so",
+    "crag-license-public.pem",
     "manifest.json",
-    "manifest.sig",
-    "gemini-ed25519.pub",
-    "gemini-release.json",
 )
 AGY_URL = (
     "https://storage.googleapis.com/antigravity-public/antigravity-cli/"
@@ -54,7 +53,7 @@ def read_pins(manifest):
         raise ValueError(f"{manifest} must pin Gemini release {TAG}")
     assets = default.get("assets")
     if not isinstance(assets, dict) or set(assets) != set(NATIVE_ASSETS):
-        raise ValueError(f"{manifest} must pin exactly the six Gemini release assets")
+        raise ValueError(f"{manifest} must pin exactly the five Gemini release assets")
     for name, pin in assets.items():
         if (
             not isinstance(pin, dict)
@@ -153,7 +152,7 @@ def verify_signed_payload(dest):
             "--source",
             str(dest),
             "--public-key",
-            str(dest / "gemini-ed25519.pub"),
+            str(dest / "crag-license-public.pem"),
         ],
         capture_output=True,
         text=True,
