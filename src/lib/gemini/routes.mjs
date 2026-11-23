@@ -592,6 +592,73 @@ export const callGeminiHostStream = (operation, payload, options) =>
     options,
   )
 
+/**
+ * Proactively warm resident CRAGGemini kernels (`craggemini` + `agy` min_warm_slots=1)
+ * for all authorized, licensed OAuth environments so inference starts hot and recovers
+ * automatically after control-plane or gemini-host restarts.
+ */
+export async function warmGeminiEnvironments({
+  callHost = callGeminiHost,
+  proxyPool,
+  environmentIds = null,
+} = {}) {
+  const report = { warmed: 0, warming: 0, skipped: 0 }
+  let view
+  try {
+    view = await callHost('list', {})
+  } catch {
+    return report
+  }
+  if (!Array.isArray(view?.environments) || view.payload_state !== 'installed' || view.oauth_runtime_issue) {
+    return report
+  }
+  const cragMode = view.payload_mode === 'crag_subscription'
+  const filter = Array.isArray(environmentIds) && environmentIds.length ? new Set(environmentIds) : null
+  const pool = typeof proxyPool === 'function' ? proxyPool() : proxyPool
+  if (!pool) return report
+  for (const env of view.environments) {
+    if (
+      !env ||
+      typeof env.id !== 'string' ||
+      !ID.test(env.id) ||
+      (filter && !filter.has(env.id)) ||
+      env.auth_method === 'api_key' ||
+      env.oauth_imported === true ||
+      env.auth_state !== 'authorized' ||
+      (cragMode && env.crag_license?.valid !== true)
+    ) {
+      report.skipped += 1
+      continue
+    }
+    if (env.runtime_ready === true) {
+      report.warmed += 1
+      continue
+    }
+    let proxyUrl
+    try {
+      proxyUrl = proxyFor(pool, env.proxy_id)
+    } catch {
+      report.skipped += 1
+      continue
+    }
+    const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
+    try {
+      const res = await callHost('warm', {
+        id: env.id,
+        proxy_id: env.proxy_id,
+        proxy_url: proxyUrl,
+        proxy_sha256: proxySha256,
+      })
+      if (res?.runtime_ready === true || res?.warmed === true) report.warmed += 1
+      else if (res?.warming === true) report.warming += 1
+      else report.skipped += 1
+    } catch {
+      report.skipped += 1
+    }
+  }
+  return report
+}
+
 export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
   return createGeminiTerminalBridge({
     callHost,
