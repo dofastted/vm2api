@@ -85,6 +85,11 @@ export function NoVncViewer({
   const onClipboardRef = useRef(onClipboard)
   onClipboardRef.current = onClipboard
   const remoteClipRef = useRef('')
+  // 最近一次远端复制（ServerCutText）到达的时间：桌面里刚复制过的话，
+  // 随后的 Cmd/Ctrl+V 应粘贴远端自己的内容（注入纯 Ctrl+V），
+  // 而不是用本地剪贴板旧值覆盖远端——否则「桌面内复制→桌面内粘贴」
+  // 会贴出本地旧内容。
+  const remoteClipAtRef = useRef(0)
   // 已拦下 Cmd/Ctrl+V、正等 paste 事件：若浏览器没派发 paste（极少数环境），
   // 超时后降级为直接注入 Ctrl+V，保证粘贴不失效
   const pendingPasteV = useRef(false)
@@ -146,9 +151,11 @@ export function NoVncViewer({
       pendingPasteV.current = false
       const text = e.clipboardData?.getData('text/plain') ?? ''
       e.preventDefault()
-      // 经典 RFB ClientCutText 只支持 Latin-1，中文会被截成 '?'；
-      // 验证码/链接/密码场景均为 ASCII，长中文仍可用「发送剪贴板」兜底输入。
-      if (text) rfb.clipboardPasteFrom(text)
+      // 分流：桌面内刚复制过（5s 内）→ 远端剪贴板就是用户要的内容，不覆盖；
+      // 否则用本地剪贴板内容写入远端（经典 RFB ClientCutText 只支持
+      // Latin-1，中文会被截成 '?'，验证码/链接/密码场景均为 ASCII）。
+      const remoteCopiedRecently = Date.now() - remoteClipAtRef.current < 5_000
+      if (text && !remoteCopiedRecently) rfb.clipboardPasteFrom(text)
       injectCtrlV()
     }
     const onDocCopy = (e: ClipboardEvent) => {
@@ -198,6 +205,7 @@ export function NoVncViewer({
           // 远端（x11vnc ServerCutText）剪贴板更新
           const text = (e as CustomEvent<{ text?: string }>).detail?.text ?? ''
           remoteClipRef.current = text
+          remoteClipAtRef.current = Date.now()
           onClipboardRef.current?.(text)
         })
         if (handleRef)
