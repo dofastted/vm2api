@@ -283,6 +283,32 @@ test('keep rebuild retains the account, fingerprint and credential file', () => 
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+test('keep rebuild strips legacy email from the kept credential file while keeping panel email', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-recreate-strip-email-'))
+  const id = 'vm-12'
+  const cred = path.join(root, 'vms', id, 'cli-home', '.claude', 'credentials.json')
+  fs.mkdirSync(path.dirname(cred), { recursive: true })
+  fs.writeFileSync(
+    cred,
+    JSON.stringify({
+      claudeAiOauth: { accessToken: 'keep', refreshToken: 'keep-rt', email: 'legacy@kin.test' },
+    }),
+  )
+  const prev = {
+    id,
+    name: '12',
+    kernel: 'ubuntu-24.04',
+    claude: { email: 'keep@kin.test', has_access: true },
+    fingerprint: { hostname: 'kept-host', device_id: 'a'.repeat(64), guest_machine_id: 'b'.repeat(32) },
+  }
+  const { vm } = recreateVmFiles(root, prev, { mode: 'keep' })
+  assert.equal(vm.claude.email, 'keep@kin.test')
+  const storedText = fs.readFileSync(cred, 'utf8')
+  assert.doesNotMatch(storedText, /legacy@kin\.test|"email"/)
+  assert.equal(JSON.parse(storedText).claudeAiOauth.accessToken, 'keep')
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
 test('destroy missing container is a no-op', () => {
   const r = destroyVmRuntime({ id: 'vm-missing-slot' })
   assert.equal(r.ok, true)

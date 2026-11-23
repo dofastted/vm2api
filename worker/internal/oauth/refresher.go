@@ -343,7 +343,6 @@ func (r *Refresher) request(ctx context.Context, current credential.Credential) 
 		RefreshToken: refreshToken,
 		ExpiresAt:    expiresAt,
 		Generation:   current.Generation,
-		Email:        current.Email,
 		AccountUUID:  current.AccountUUID,
 		OrgUUID:      current.OrgUUID,
 		Scopes:       scopes,

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -154,5 +155,35 @@ func TestEnsureDoesNotPersistAfterCancellation(t *testing.T) {
 	}
 	if current.Generation != original.Generation || current.AccessToken != original.AccessToken {
 		t.Fatalf("credential changed after cancellation: before=%#v after=%#v", original, current)
+	}
+}
+
+func TestEnsureStripsLegacyEmailOnRefresh(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"access_token":"access-new","refresh_token":"refresh-new","expires_in":28800}`))
+	}))
+	defer upstream.Close()
+	credPath := filepath.Join(t.TempDir(), "credentials.json")
+	seed := `{"email":"top@example.com","claudeAiOauth":{"accessToken":"access-old","refreshToken":"refresh-old","expiresAt":1,"email":"legacy@example.com","accountUuid":"acct-1","orgUuid":"org-1"}}`
+	if err := os.WriteFile(credPath, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := credential.NewStore(credPath)
+	refresher := &Refresher{Store: store, Client: upstream.Client(), TokenURL: upstream.URL, MaxTries: 1}
+	result, err := refresher.Ensure(context.Background(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Refreshed || result.Credential.AccessToken != "access-new" || result.Credential.Email != "" {
+		t.Fatalf("unexpected refresh result: %#v", result)
+	}
+	raw, err := os.ReadFile(credPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	if strings.Contains(text, "example.com") || strings.Contains(text, `"email"`) {
+		t.Fatalf("refreshed credentials still contain email: %s", text)
 	}
 }
