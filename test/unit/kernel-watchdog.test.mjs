@@ -681,3 +681,44 @@ test('stale-hold lift is pinned to the observed tag: a newer cutover keeps its h
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('a repeat silent-timeout trip stays faulted on a healthy kernel until its hold runs out', async () => {
+  const { vmTimeoutTracker, TIMEOUT_FAULT_PREFIX } = await import('../../src/lib/pool/failover-runner.mjs')
+  vmTimeoutTracker.reset()
+  let now = 1_000_000
+  const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
+    listTargets: () => [{ id: 'vm-hang', inference_engine: 'rust' }],
+    homeDirFor: () => '/tmp/vm-hang',
+    health: async () => ({ ok: true, healthy: true, ready_slots: 2, cli_pid: 7 }),
+    ensure: async () => ({ ok: true }),
+    now: () => now,
+  })
+  const trip = () => {
+    vmTimeoutTracker.recordTrip('vm-hang', now)
+    kernelFaults.set('vm-hang', `${TIMEOUT_FAULT_PREFIX} VM vm-hang had 3 consecutive silent inference timeouts`)
+  }
+  try {
+    trip()
+    await wd.tick()
+    assert.equal(kernelFaults.has('vm-hang'), false, 'a first trip clears on the next healthy tick')
+    now += 20 * 60_000
+    trip()
+    await wd.tick()
+    assert.ok(kernelFaults.has('vm-hang'), 'a repeat trip within 2h is held')
+    now += 14 * 60_000
+    await wd.tick()
+    assert.ok(kernelFaults.has('vm-hang'), 'still held inside 15 minutes')
+    now += 2 * 60_000
+    await wd.tick()
+    assert.equal(kernelFaults.has('vm-hang'), false, 'the hold runs out and health clears it')
+    trip()
+    assert.equal(vmTimeoutTracker.faultHoldUntil('vm-hang', now), now + 30 * 60_000, 'third trip doubles the hold')
+    kernelFaults.set('vm-hang', 'kernel unhealthy after 2 recovery attempts: x')
+    await wd.tick()
+    assert.equal(kernelFaults.has('vm-hang'), false, 'other faults still clear on health')
+  } finally {
+    kernelFaults.delete('vm-hang')
+    vmTimeoutTracker.reset()
+  }
+})
