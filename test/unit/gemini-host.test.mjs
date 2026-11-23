@@ -1533,6 +1533,16 @@ test('warmGeminiEnvironments proactively warms authorized licensed OAuth envs an
     auth_method: 'oauth',
     auth_state: 'authorized',
     runtime_ready: true,
+    models_discovered: true,
+    crag_license: { valid: true },
+  }
+  const envNeedModels = {
+    id: 'gemini-eeeeeeeeeeeeeeeeeeeeeeee',
+    proxy_id: 'px-1',
+    auth_method: 'oauth',
+    auth_state: 'authorized',
+    runtime_ready: true,
+    models_discovered: false,
     crag_license: { valid: true },
   }
   const envCold = {
@@ -1568,18 +1578,22 @@ test('warmGeminiEnvironments proactively warms authorized licensed OAuth envs an
         return {
           payload_state: 'installed',
           payload_mode: 'crag_subscription',
-          environments: [envReady, envCold, envUnlicensed, envApiKey],
+          environments: [envReady, envNeedModels, envCold, envUnlicensed, envApiKey],
         }
       }
       warmedCalls.push([op, payload])
-      return { warmed: false, runtime_ready: false, warming: true }
+      return payload.id === envNeedModels.id
+        ? { warmed: true, runtime_ready: true, warming: false }
+        : { warmed: false, runtime_ready: false, warming: true }
     },
   })
-  assert.deepEqual(report, { warmed: 1, warming: 1, skipped: 2 })
-  assert.equal(warmedCalls.length, 1)
+  assert.deepEqual(report, { warmed: 2, warming: 1, skipped: 2 })
+  assert.equal(warmedCalls.length, 2)
   assert.equal(warmedCalls[0][0], 'warm')
-  assert.equal(warmedCalls[0][1].id, envCold.id)
-  assert.equal(warmedCalls[0][1].proxy_id, 'px-1')
-  assert.equal(warmedCalls[0][1].proxy_url, proxyUrl)
-  assert.equal(warmedCalls[0][1].proxy_sha256, createHash('sha256').update(proxyUrl).digest('hex'))
+  assert.equal(warmedCalls[0][1].id, envNeedModels.id)
+  assert.equal(warmedCalls[1][0], 'warm')
+  assert.equal(warmedCalls[1][1].id, envCold.id)
+  assert.equal(warmedCalls[1][1].proxy_id, 'px-1')
+  assert.equal(warmedCalls[1][1].proxy_url, proxyUrl)
+  assert.equal(warmedCalls[1][1].proxy_sha256, createHash('sha256').update(proxyUrl).digest('hex'))
 })

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.186 — 2026-11-23 · 修复 CRAGGemini 加密 memfd 守卫派生与池就绪度误报（0.4.2）；存量 OAuth 自动补全模型与套餐
+
+- 升级锁定 `deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 至 [`payload-2026.11.23-gemini-0.4.2`](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.23-gemini-0.4.2)（`craggemini 0.4.2`，Debian 12 构建，最高符号要求 `GLIBC_2.34`）：修复加密启动器经 `memfd` 执行 `craggemini-core` 后 `current_exe()` 指向已删除内存描述符导致 `--internal-execution-guard` 派生失败（`slot_guard_error`）并阻断所有 `agy` 槽位拉起的问题；`craggemini` 引导器改为直接执行 `--internal-execution-guard` 并透传 `CRAGGEMINI_BOOTSTRAP_BIN`；修正 `pool.ready` 在 `min_warm_slots > 0` 且无活跃/空闲 `agy` 槽位时不再误报 `ready: true`，并在 `/internal/health` 暴露 `last_replenish_error`。
+- 修复存量已授权 OAuth 环境停留在「尚未拉取模型，不能调度」与缺失套餐信息的问题：`scripts/gemini-host.py` 的 `warm` 流程为缺少模型或套餐的已授权 OAuth 环境自动调度后台 `_post_auth_provision`（带冷却限流）；`src/lib/gemini/routes.mjs` 的 `warmGeminiEnvironments` 在 `models_discovered !== true` 时不再提前跳过预热。
+- 部署说明：本版涉及控制面、CRAGGemini 宿主脚本与 `geminiDefaultLinuxAmd64`（`0.4.2`）加密载荷，并在宿主机提供 `/usr/local/bin/agy` 符号链接；Claude/Codex 槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。
+
 ## 1.4.185 — 2026-11-23 · CRAGGemini 常驻内核池（0.4.1）与 OAuth 自动席位/模型初始化；池超时熔断分级保持
 
 - CRAGGemini 推理内核与 `agy` 进程全面常驻化：宿主 `scripts/gemini-host.py` 将 `max_concurrency >= 1` 统一走 `pool_mode`（移除 `openvt` 单轮拉起/拆毁），移除 180 秒空闲杀进程、模型切换杀进程与单次健康探测失误即撕毁会话逻辑；新增引用计数 `SlotNetworkLease` 管理 `vm2agy<slot>` 与 `kin-egress` 生命周期，面板 `test-chat` 改为通过 `ResidentTestChatRun` 复用常驻 `NativeSession`，新增 `warm` RPC 与非阻塞后台自愈，以及控制面 `src/server.mjs` 启动 + 每 30 秒 `warmGeminiEnvironments` 巡检预热（#1658）。
