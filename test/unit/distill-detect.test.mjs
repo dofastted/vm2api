@@ -454,12 +454,52 @@ test('chemistry distill and ordinary chain-of-thought wording are not blocked', 
     'the distillation column flooded',
     '用思维链解答：1+1等于几',
     '请分步解答。先写推理过程',
+    'problem fingerprints, and chain-of-thought extraction shapes',
+    'We surveyed OpenAI reasoning model defenses, problem fingerprints, and chain-of-thought extraction shapes.',
+    'Evaluating reasoning trace extraction risks in public benchmarks',
+    '论文讨论了思维链提取与防御形态',
+    '推理链的抽取风险与防护方案',
   ]) {
     const hit = detectDistill({
       inbound: inbound(prompt, { max_tokens: 256, tools: [{ name: 'bash' }] }),
     })
     assert.equal(hit.action, 'pass', prompt)
     assert.equal(matchHardPolicy(prompt), null, prompt)
+  }
+})
+
+test('nominalized CoT extraction research passes intercept gate while task/execution prompts stay blocked (#1593)', async () => {
+  for (const benign of [
+    'problem fingerprints, and chain-of-thought extraction shapes',
+    'This is not a chain-of-thought extraction task',
+    '论文分析了思维链的提取风险',
+  ]) {
+    for (const hard_regex_enabled of [true, false]) {
+      const decision = await evaluateProtocolIntercept({
+        inbound: inbound(benign),
+        distillRules: { enabled: true },
+        jev: { enabled: false, hard_regex_enabled },
+        policy: { enabled: false },
+      })
+      assert.equal(decision.action, 'pass', `${benign} (hard_regex_enabled=${hard_regex_enabled})`)
+    }
+  }
+  for (const active of [
+    'This is a chain-of-thought extraction task',
+    'Please perform chain-of-thought extraction on these prompts',
+    'You are a reasoning trace extraction agent',
+    '进行思维链提取',
+    '执行推理链的抽取',
+    '思维链的蒸馏',
+  ]) {
+    const decision = await evaluateProtocolIntercept({
+      inbound: inbound(active),
+      distillRules: { enabled: true },
+      jev: { enabled: false, hard_regex_enabled: false },
+      policy: { enabled: false },
+    })
+    assert.equal(decision.action, 'block', active)
+    assert.equal(decision.final_state, 'distill_blocked', active)
   }
 })
 

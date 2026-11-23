@@ -113,6 +113,13 @@ const PATTERN_LEN = 400
 const RULE_MAX = 60
 const SCOPE_LIST_MAX = 200
 
+const HARD_RULE_ZH_BYPASS = String.raw`(?<!(?:不要|不得|禁止|切勿|不是|并非))(?:解除|关闭|绕过|无视)(?:你的|所有|全部)?(?:安全|内容|道德|伦理)(?:限制|审查|过滤|策略)`
+const HARD_RULE_ZH_JAILBREAK_MODE = String.raw`(?<!(?:不要|不得|禁止|切勿|不是|并非|检测|识别|拦截|防止|防范))(?:(?:进入|开启|启用|打开|激活|切换(?:到|至)?|使用|执行|套用|运行|生成|编写|写(?:一个|一段|一条)?|给我(?:一个|一段|一条)?|提供(?:一个|一段|一条)?)(?:一个|一段|一条)?(?:越狱|破限)(?:模式|提示词|提示|指令)|(?:越狱|破限)模式(?:已)?(?:开启|启用|启动|激活))`
+const HARD_RULE_KEYGEN_WAREZ = String.raw`(?<![\w./<-])(?:warez|(?<=\b(?:(?:write|build|create|make|code|generate|download|need|want)\s+(?:a\s+|an\s+|the\s+)?|(?:crack|patch|serial|license|activation)\s+(?:and\s+|or\s+)?))keygen|keygen(?=\s+for\s+(?:[\w.-]+\s+){0,2}(?:software|app|program|game|license|activation|drm|serial)\b))(?![\w./>-])`
+const HARD_RULE_ZH_CRACK = String.raw`(?:破解补丁|注册机(?![构器制房型])|激活码生成器)`
+const HARD_RULE_EN_COT_EXTRACTION = String.raw`\b(?:perform(?:ing)?|do(?:ing)?|run(?:ning)?|execute|conduct|(?:this|it)\s+is\s+a|you\s+are\s+a|act\s+as\s+a)\s+(?:chain[- ]of[- ]thought|reasoning\s+trace)\s+extraction(?:\s+(?:task|agent|assistant|bot|mode|job|prompt))?\b`
+const HARD_RULE_ZH_COT_NOMINAL = String.raw`(?:(?:进行|执行|做(?:一次)?|完成|开启)\s*(?:思维链|思考链|推理链)\s*(?:的)?\s*(?:提取|导出|抽取)|(?:思维链|思考链|推理链)\s*(?:的)?\s*(?:蒸馏|收割))`
+
 /**
  * User-authored text, including the caller's own system / instructions prompt.
  * 官方提示词 and 官方完整提示词 are whitelisted and never sent. Tool results
@@ -130,11 +137,11 @@ export const HARD_POLICY_RULES = Object.freeze([
   },
   {
     category: 'jailbreak',
-    source: String.raw`(?:解除|关闭|绕过|无视)(?:你的|所有|全部)?(?:安全|内容)?(?:限制|审查|过滤|策略)`,
+    source: HARD_RULE_ZH_BYPASS,
   },
-  { category: 'jailbreak', source: String.raw`(?:越狱|破限)(?:模式|提示词|提示|指令)` },
-  { category: 'crack', source: String.raw`(?<![\w-])(?:keygen|warez)(?![\w-])` },
-  { category: 'crack', source: String.raw`(?:破解补丁|注册机|激活码生成器)` },
+  { category: 'jailbreak', source: HARD_RULE_ZH_JAILBREAK_MODE },
+  { category: 'crack', source: HARD_RULE_KEYGEN_WAREZ },
+  { category: 'crack', source: HARD_RULE_ZH_CRACK },
   {
     category: 'crack',
     source: String.raw`\bcrack(?:ing)?\s+(?:this\s+|the\s+)?(?:software|license|drm|activation)\b`,
@@ -152,7 +159,7 @@ export const HARD_POLICY_RULES = Object.freeze([
     category: 'distill',
     source: String.raw`\b(?:extract|export|dump|reveal|harvest|exfiltrate)(?:ing|ed|ion|s)?\s+(?:(?:the|your|a|an|full|hidden|internal|complete|raw|durable|entire)\s+){0,4}(?:chain[- ]of[- ]thoughts?|reasoning\s+traces?|hidden\s+reasoning|internal\s+reasoning|internal\s+monologues?)\b`,
   },
-  { category: 'distill', source: String.raw`\b(?:chain[- ]of[- ]thought|reasoning\s+trace)\s+extraction\b` },
+  { category: 'distill', source: HARD_RULE_EN_COT_EXTRACTION },
   { category: 'distill', source: String.raw`(?:思维链蒸馏|推理蒸馏|思考链蒸馏)` },
   {
     category: 'distill',
@@ -160,13 +167,33 @@ export const HARD_POLICY_RULES = Object.freeze([
   },
   {
     category: 'distill',
-    source: String.raw`(?:思维链|思考链|推理链)\s*(?:的)?\s*(?:提取|导出|抽取|蒸馏|收割)`,
+    source: HARD_RULE_ZH_COT_NOMINAL,
   },
   {
     category: 'distill',
     source: String.raw`(?:提取|导出|抽取)\s*(?:出)?\s*(?:隐藏|内部)\s*(?:的)?\s*(?:推理|思维|思考)`,
   },
   { category: 'custom', source: String.raw`\bphishing\s+kit\b` },
+])
+
+/** Unedited builtin regexes saved before #1593 upgrade in normalizeRules; edited sources or changed categories stay. */
+const LEGACY_BUILTIN_RULE_SOURCES = new Map([
+  [
+    String.raw`(?:解除|关闭|绕过|无视)(?:你的|所有|全部)?(?:安全|内容)?(?:限制|审查|过滤|策略)`,
+    { category: 'jailbreak', source: HARD_RULE_ZH_BYPASS },
+  ],
+  [String.raw`(?:越狱|破限)(?:模式|提示词|提示|指令)`, { category: 'jailbreak', source: HARD_RULE_ZH_JAILBREAK_MODE }],
+  [String.raw`\b(?:keygen|warez)\b`, { category: 'crack', source: HARD_RULE_KEYGEN_WAREZ }],
+  [String.raw`(?<![\w-])(?:keygen|warez)(?![\w-])`, { category: 'crack', source: HARD_RULE_KEYGEN_WAREZ }],
+  [String.raw`(?:破解补丁|注册机|激活码生成器)`, { category: 'crack', source: HARD_RULE_ZH_CRACK }],
+  [
+    String.raw`\b(?:chain[- ]of[- ]thought|reasoning\s+trace)\s+extraction\b`,
+    { category: 'distill', source: HARD_RULE_EN_COT_EXTRACTION },
+  ],
+  [
+    String.raw`(?:思维链|思考链|推理链)\s*(?:的)?\s*(?:提取|导出|抽取|蒸馏|收割)`,
+    { category: 'distill', source: HARD_RULE_ZH_COT_NOMINAL },
+  ],
 ])
 
 export const USAGE_POLICY_INSTRUCTION =
@@ -438,11 +465,17 @@ function normalizeRules(raw) {
   const seen = new Set()
   for (const item of raw) {
     if (!item || typeof item !== 'object') continue
-    const source = cleanPattern(item.source)
-    if (!source || seen.has(source) || out.length >= RULE_MAX) continue
+    const rawSource = cleanPattern(item.source)
+    if (!rawSource) continue
+    const hasCategory = allowed.has(item.category)
+    const legacy = LEGACY_BUILTIN_RULE_SOURCES.get(rawSource)
+    const migrated = legacy && (!hasCategory || item.category === legacy.category) ? legacy : null
+    const category = migrated ? migrated.category : hasCategory ? item.category : 'custom'
+    const source = migrated ? migrated.source : rawSource
+    if (seen.has(source) || out.length >= RULE_MAX) continue
     seen.add(source)
     out.push({
-      category: allowed.has(item.category) ? item.category : 'custom',
+      category,
       source,
       enabled: item.enabled !== false,
     })
