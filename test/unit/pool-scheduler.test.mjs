@@ -466,10 +466,12 @@ test('only the CRAG seat outside the signed quota leaves the pool, including a l
   const hostId = 'a'.repeat(64)
   const publicDir = cragSubscriptionPublicDirectory(root)
   fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
-  fs.writeFileSync(path.join(publicDir, 'host_id'), hostId)
+  // Explicit modes: crag-license rejects group-writable public files, and a
+  // developer umask of 0002 would otherwise create them that way.
+  fs.writeFileSync(path.join(publicDir, 'host_id'), hostId, { mode: 0o644 })
   const publish = (revision, slotLimit) => {
     const { code } = issueHostEntitlement(root, hostId, { revision, slot_limit: slotLimit })
-    fs.writeFileSync(path.join(publicDir, 'entitlement.code'), code)
+    fs.writeFileSync(path.join(publicDir, 'entitlement.code'), code, { mode: 0o644 })
   }
   publish(1, 2)
   for (const [index, id] of ['vm-01', 'vm-02'].entries()) {
