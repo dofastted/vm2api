@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import test from 'node:test'
+import { extractApiKey, redactSecrets } from '../../src/lib/core/security.mjs'
 import {
   cancelGeminiNativeTurn,
   prepareGeminiNativeTurn,
@@ -622,4 +623,72 @@ test('Codex and Claude route isolation invariants remain intact', async () => {
     assert.equal(res.statusCode, 403)
     assert.equal(res.jsonBody().error.code, 'gemini_key_required')
   }
+})
+
+test('Google Gemini native auth headers (x-goog-api-key and /v1beta ?key=) extract and redact safely', () => {
+  assert.equal(
+    extractApiKey({ headers: { 'x-goog-api-key': 'sk-kin-gem-123' }, url: '/v1beta/models' }),
+    'sk-kin-gem-123',
+  )
+  assert.equal(extractApiKey({ headers: { 'x-goog-api-key': 'kin-panel-secret' }, url: '/v1beta/models' }), '')
+  assert.equal(
+    extractApiKey({
+      headers: {},
+      url: '/v1beta/models/gemini-2.5-pro:generateContent?key=sk-kin-query-456&alt=sse',
+    }),
+    'sk-kin-query-456',
+  )
+  assert.equal(extractApiKey({ headers: {}, url: '/v1beta/models?key=kin-panel-secret' }), '')
+  // Query parameter ?key= is scoped strictly to /v1beta/models endpoints.
+  assert.equal(extractApiKey({ headers: {}, url: '/v1/chat/completions?key=sk-kin-query-456' }), '')
+  assert.equal(extractApiKey({ headers: {}, url: '/api/panel/gemini?key=sk-kin-query-456' }), '')
+  const redacted = redactSecrets({ url: '/v1beta/models?key=my-secret-gemini-key&alt=sse' })
+  assert.doesNotMatch(redacted, /my-secret-gemini-key/)
+  assert.match(redacted, /key=\*\*\*REDACTED\*\*\*/)
+})
+
+test('Google account verification ineligibility returns 403 without tripping circuit breaker', async () => {
+  const tracker = makeCircuitTracker()
+  const scheduler = createGeminiScheduler({
+    callHost: async (op) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-verify',
+              proxy_id: 'proxy-1',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-3-flash'],
+              capabilities: [...NATIVE_TUI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') return { id: 'env-verify', proxy_id: 'proxy-1', auth_method: 'oauth' }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: async () =>
+      sseResponse([JSON.stringify({ code: 'gemini_account_verification_required' })], {
+        statusCode: 403,
+        contentType: 'application/json',
+      }),
+    resolveProxy: () => 'socks5h://1.2.3.4:1080',
+    poolScheduler: tracker,
+  })
+  const handler = createGeminiPublicHandler({ json: jsonResponder, readBody: async () => ({}), scheduler })
+  const res = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1/chat/completions',
+      body: { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hello' }] },
+    }),
+    res,
+  )
+  assert.equal(res.statusCode, 403)
+  assert.equal(res.jsonBody().error.code, 'gemini_account_verification_required')
+  assert.equal(tracker.calls.failure.length, 0)
+  assert.equal(tracker.calls.probe.length, 1)
 })

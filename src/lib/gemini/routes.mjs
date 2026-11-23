@@ -33,6 +33,11 @@ const RUN_STATES = new Set(['running', 'completed', 'failed'])
 const RUN_ERRORS = {
   gemini_oauth_required: [409, '请重新完成 Google OAuth 授权'],
   gemini_location_unsupported: [403, 'Google 判定当前账号所在地区不支持 Antigravity；拉取模型成功不代表可对话'],
+  gemini_account_verification_required: [
+    403,
+    'Google 要求先在浏览器完成该账号的身份验证后才能使用 Antigravity；拉取模型成功不代表可对话',
+  ],
+  gemini_account_ineligible: [403, 'Google 判定当前账号暂不符合 Antigravity 使用资格，请检查账号状态或更换账号'],
   gemini_proxy_error: [502, '无法通过绑定代理连接 Gemini，请检查代理'],
   gemini_model_unavailable: [409, '当前环境不支持所选模型，请重新获取模型列表'],
   gemini_models_empty: [502, 'Gemini 未返回可用模型'],

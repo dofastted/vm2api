@@ -106,6 +106,15 @@ class Handler(socketserver.StreamRequestHandler):
                 + body
             )
             return
+        if request["request_id"] == "turn-err-license":
+            body = json.dumps({"error": "seat required", "code": "license_required"}).encode("utf-8")
+            self.wfile.write(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\nConnection: close\r\n\r\n"
+                + body
+            )
+            return
         if request["request_id"] == "turn-err-unsupported":
             body = json.dumps({"error": "plain text only", "code": "unsupported_turn"}).encode("utf-8")
             self.wfile.write(
@@ -202,9 +211,118 @@ with tempfile.TemporaryDirectory(prefix="gemini-native-fixture-") as temporary:
         assert result == expected, result
     finally:
         invocation.close()
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=2)
+    # run_request() must map worker error payloads via _map_worker_error instead of flattening to gemini_inference_failed.
+    for req_id, expected_code in (
+        ("turn-err-429", "gemini_quota_exhausted"),
+        ("turn-err-license", "license_required"),
+    ):
+        try:
+            native.run_request(
+                {
+                    "socket": socket_path,
+                    "token": "a" * 64,
+                    "model": "gemini-test",
+                    "request_id": req_id,
+                    "prompt": "native prompt",
+                    "startup_timeout": 2,
+                }
+            )
+        except native.NativeFailure as err:
+            assert err.code == expected_code, (err.code, expected_code)
+        else:
+            raise AssertionError(f"expected NativeFailure for run_request {req_id}")
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=2)
+
+# EligibilityDiagnostic must classify account verification & generic ineligibility without spoofing.
+with tempfile.TemporaryDirectory(prefix="gemini-diag-fixture-") as diag_tmp:
+    diag = native.EligibilityDiagnostic(Path(diag_tmp), os.getuid())
+    try:
+        verify_line = (
+            b"W1122 22:45:38.121837     330 server_oauth.go:133] Account ineligible: "
+            b"Your current account is not eligible for Antigravity. Verify your account to continue.\n"
+        )
+        diag._consume(b"spoofed " + verify_line)
+        assert diag.poll() is None
+        diag._consume(verify_line)
+        assert diag.poll() == "gemini_account_verification_required"
+    finally:
+        diag.close()
+
+with tempfile.TemporaryDirectory(prefix="gemini-diag-generic-") as diag_tmp:
+    diag = native.EligibilityDiagnostic(Path(diag_tmp), os.getuid())
+    try:
+        generic_line = (
+            b"W1122 22:45:38.121837     330 server_oauth.go:133] Account ineligible: "
+            b"Your organization administrator disabled Antigravity.\n"
+        )
+        diag._consume(generic_line)
+        assert diag.poll() == "gemini_account_ineligible"
+    finally:
+        diag.close()
+
+# Regression for dynamic re-import bug: native_module() must return the same module & NativeFailure class
+# across calls so _stream_native_infer catches NativeFailure and maps diagnostics cleanly.
+host_spec = spec_from_file_location("gemini_host_cached_test", ROOT / "scripts/gemini-host.py")
+host_mod = module_from_spec(host_spec)
+host_spec.loader.exec_module(host_mod)
+orig_check = host_mod.check_root_owned
+host_mod.check_root_owned = lambda _path: None
+try:
+    mod_a = host_mod.native_module()
+    mod_b = host_mod.native_module()
+    assert mod_a is mod_b
+    assert mod_a.NativeFailure is mod_b.NativeFailure
+    fake_host = host_mod.Host.__new__(host_mod.Host)
+    fake_host.lock = threading.Lock()
+    fake_host.native_sessions = {}
+
+    class FakeDiag:
+        def poll(self, *, final=False):
+            assert final is True
+            return "gemini_account_verification_required"
+
+    class FakeSession:
+        native_diagnostic = FakeDiag()
+
+        def open_stream(self, _request_id, _body_obj):
+            raise host_mod.native_module().NativeFailure("gemini_inference_failed", 502, "native turn failed")
+
+        def cancel_turn(self, _request_id):
+            return False
+
+        def is_ready(self):
+            return False
+
+        def close(self):
+            pass
+
+    class FakeHandler:
+        def __init__(self):
+            self.sent = None
+
+        def send_json_error(self, status, code=None, message=None):
+            self.sent = (status, code, message)
+
+    fake_session = FakeSession()
+    fake_host._acquire_native_session = lambda _ctx: fake_session
+    fake_host.stop_native_session = lambda _id: None
+    fake_handler = FakeHandler()
+    state, code = fake_host._stream_native_infer(
+        {
+            "identifier": "gemini-test-env",
+            "entry": {"cancel_event": threading.Event(), "cancel_fn": None},
+            "auth": ((), b""),
+            "request_id": "req-1",
+            "native_body": {"model": "gemini-test", "contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+        },
+        fake_handler,
+    )
+    assert (state, code) == ("failed", "gemini_account_verification_required"), (state, code)
+    assert fake_handler.sent == (403, "gemini_account_verification_required", None), fake_handler.sent
+finally:
+    host_mod.check_root_owned = orig_check
 
 # Error mapping checks for all CRAG upstream_status codes
 assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status": 429}).code == "gemini_quota_exhausted"

@@ -99,6 +99,34 @@ describe('Gemini account presentation', () => {
       group: 'unschedulable',
       blocker: '绑定代理不可用',
     })
+    expect(
+      geminiAccountStatus({
+        ...candidate,
+        crag_license: {
+          product: 'craggemini',
+          status: 'unlicensed',
+          valid: false,
+          code: 'license_required',
+        },
+      })
+    ).toMatchObject({
+      group: 'unschedulable',
+      blocker: '未绑定 CRAGGemini 订阅席位',
+    })
+    expect(
+      geminiAccountStatus({
+        ...candidate,
+        crag_license: {
+          product: 'craggemini',
+          status: 'valid',
+          valid: true,
+          seat: 1,
+        },
+      })
+    ).toMatchObject({
+      group: 'pending',
+      blocker: null,
+    })
   })
 
   it('shows known host blockers without treating them as credential failures', () => {
@@ -176,6 +204,15 @@ describe('Gemini account presentation', () => {
     ).toBe(true)
     expect(geminiInferenceErrorLabel('gemini_location_unsupported')).toBe(
       'Google 地区资格受限'
+    )
+    expect(
+      geminiInferenceErrorLabel('gemini_account_verification_required')
+    ).toBe('Google 账号需先完成浏览器验证')
+    expect(geminiInferenceErrorLabel('gemini_account_ineligible')).toBe(
+      'Google 账号不符合 Antigravity 资格'
+    )
+    expect(geminiInferenceErrorLabel('license_required')).toBe(
+      '未绑定 CRAGGemini 订阅席位'
     )
     expect(geminiInferenceErrorLabel('gemini_native_worker_unavailable')).toBe(
       '宿主运行环境故障'

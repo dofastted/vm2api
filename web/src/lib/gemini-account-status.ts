@@ -18,11 +18,22 @@ type LastInference = {
 
 type InferenceEvidence = { last_inference?: LastInference | null }
 
+type CragLicense = {
+  product?: string
+  valid: boolean
+  status?: string
+  code?: string | null
+  seat?: number | null
+  scope?: string | null
+  seat_required?: boolean
+}
+
 type Account = Authorization &
   InferenceEvidence & {
     models_discovered?: boolean
     models: readonly string[]
     proxy_ready?: boolean
+    crag_license?: CragLicense | null
   }
 
 type InventoryPrerequisites = {
@@ -99,6 +110,8 @@ export function geminiInferenceLabel(environment: InferenceEvidence): string {
 
 const INFERENCE_ERROR_LABELS: Readonly<Record<string, string>> = {
   gemini_location_unsupported: 'Google 地区资格受限',
+  gemini_account_verification_required: 'Google 账号需先完成浏览器验证',
+  gemini_account_ineligible: 'Google 账号不符合 Antigravity 资格',
   gemini_proxy_error: '代理连接错误',
   gemini_proxy_unavailable: '代理不可用',
   gemini_model_unavailable: '模型不可用',
@@ -112,6 +125,12 @@ const INFERENCE_ERROR_LABELS: Readonly<Record<string, string>> = {
   gemini_inference_invalid_output: '响应无法解析',
   gemini_inference_output_limit: '响应超过长度限制',
   gemini_inference_tool_blocked: '不支持工具调用',
+  license_required: '未绑定 CRAGGemini 订阅席位',
+  license_expired: 'CRAGGemini 订阅许可已过期',
+  license_not_yet_valid: 'CRAGGemini 许可尚未生效',
+  license_invalid: 'CRAGGemini 许可无效',
+  license_binding_mismatch: 'CRAGGemini 许可绑定不匹配',
+  license_unconfigured: 'CRAGGemini 订阅未配置',
 }
 
 export function geminiInferenceErrorLabel(code?: string | null): string {
@@ -135,6 +154,17 @@ function candidateBlocker(
   }
   if (environment.proxy_ready === false) return '绑定代理不可用'
   if (hostBlocker) return hostBlocker
+  if (
+    environment.auth_method === 'oauth' &&
+    environment.crag_license &&
+    environment.crag_license.valid === false
+  ) {
+    const code = environment.crag_license.code
+    return code &&
+      Object.prototype.hasOwnProperty.call(INFERENCE_ERROR_LABELS, code)
+      ? INFERENCE_ERROR_LABELS[code]
+      : '未绑定 CRAGGemini 订阅席位'
+  }
   if (environment.models_discovered !== true) return '尚未拉取模型，不能调度'
   if (!environment.models.length) return '未发现可调用模型'
   return null

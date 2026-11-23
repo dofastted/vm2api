@@ -48,3 +48,23 @@ test('discovery remains blocked by explicit authorization or proxy failures', ()
   expect(modelPullDisabled({ auth_state: 'reauth_required' })).toBe(true)
   expect(modelPullDisabled({ proxy_ready: false })).toBe(true)
 })
+
+test('unbound CRAGGemini seat warns before OAuth test chat without blocking model discovery', () => {
+  const unbound: GeminiEnvironment = {
+    ...environment,
+    crag_license: {
+      product: 'craggemini',
+      status: 'unlicensed',
+      valid: false,
+      seat_required: true,
+      code: 'license_required',
+    },
+  }
+  expect(modelPullDisabled({ crag_license: unbound.crag_license })).toBe(false)
+  const html = renderToStaticMarkup(
+    <QueryClientProvider client={new QueryClient()}>
+      <GeminiTestPanel environment={unbound} />
+    </QueryClientProvider>
+  )
+  expect(html).toContain('请先在「账号」绑定 CRAGGemini 订阅席位')
+})

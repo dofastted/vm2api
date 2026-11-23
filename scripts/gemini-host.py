@@ -116,6 +116,8 @@ NATIVE_CAPABILITIES = ("streaming", "native_tui")
 # Fixed categories only: process output and exception details are not inventory data.
 INFERENCE_ERROR_CODES = frozenset(
     {
+        "gemini_account_ineligible",
+        "gemini_account_verification_required",
         "gemini_api_key_invalid",
         "gemini_inference_bad_input",
         "gemini_inference_cancelled",
@@ -138,15 +140,33 @@ INFERENCE_ERROR_CODES = frozenset(
     }
 )
 
+_TRUSTED_MODULES = {}
+_TRUSTED_MODULES_LOCK = threading.Lock()
+
+
+def _load_trusted_module(name, path):
+    check_root_owned(path)
+    info = path.lstat()
+    identity = (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_ctime_ns,
+        info.st_mtime_ns,
+    )
+    with _TRUSTED_MODULES_LOCK:
+        cached = _TRUSTED_MODULES.get(name)
+        if cached is not None and cached[0] == identity:
+            return cached[1]
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _TRUSTED_MODULES[name] = (identity, module)
+        return module
+
 
 def invocation_module():
-    check_root_owned(INFERENCE_MODULE)
-    spec = importlib.util.spec_from_file_location(
-        "gemini_host_inference", INFERENCE_MODULE
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return _load_trusted_module("gemini_host_inference", INFERENCE_MODULE)
 
 
 class Failure(Exception):
@@ -163,11 +183,7 @@ NATIVE_MODULE = ROOT / "scripts/gemini_host_native.py"
 
 
 def native_module():
-    check_root_owned(NATIVE_MODULE)
-    spec = importlib.util.spec_from_file_location("gemini_host_native", NATIVE_MODULE)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return _load_trusted_module("gemini_host_native", NATIVE_MODULE)
 
 
 def account_command(uid, method, profile=None):
@@ -3280,6 +3296,7 @@ class Host:
             for v in (ctx["auth"][0] if ctx["auth"] else ())
             if isinstance(v, str) and v
         )
+        native_mod = native_module()
         session = self._acquire_native_session(ctx)
         conn = None
         recycle = False
@@ -3308,7 +3325,7 @@ class Host:
                 return "cancelled", "gemini_inference_cancelled"
             session.last_used = time.monotonic()
             return "completed", None
-        except native_module().NativeFailure as error:
+        except native_mod.NativeFailure as error:
             recycle = error.code != "gemini_unsupported_turn"
             diagnostic = (
                 session.native_diagnostic.poll(final=True)
@@ -3316,8 +3333,17 @@ class Host:
                 else None
             )
             code = diagnostic or error.code
-            status = 403 if code == "gemini_location_unsupported" else (error.status or 502)
-            handler.send_json_error(status, code, error.message)
+            if code in (
+                "gemini_location_unsupported",
+                "gemini_account_verification_required",
+                "gemini_account_ineligible",
+            ):
+                status = 403
+                message = None
+            else:
+                status = error.status or 502
+                message = error.message
+            handler.send_json_error(status, code, message)
             return "failed", code
         except (BrokenPipeError, ConnectionResetError):
             recycle = True
