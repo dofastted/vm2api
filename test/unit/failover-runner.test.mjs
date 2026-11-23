@@ -2003,6 +2003,41 @@ test('session queue timeout defaults to 15 minutes and reloads over the default'
   assert.equal(runner.config.session_queue_timeout_ms, 0)
 })
 
+test('batch member requests sharing a sticky key run concurrently, not serialized', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler })
+  const memberKey = 'p:anthropic:bg:key_1:s:abc#0'
+  let release
+  let entered
+  const holderEntered = new Promise((resolve) => {
+    entered = resolve
+  })
+  const holder = runner.run({
+    requestId: 'req-bg-1',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: memberKey,
+    callAttempt: () => {
+      entered()
+      return new Promise((resolve) => {
+        release = () => resolve(success())
+      })
+    },
+  })
+  await holderEntered
+  const second = await runner.run({
+    requestId: 'req-bg-2',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: memberKey,
+    callAttempt: () => success(),
+  })
+  assert.equal(second.ok, true)
+  release()
+  assert.equal((await holder).ok, true)
+  assert.equal(scheduler.selectCalls, 2)
+})
+
 test('a same-session waiter times out without starting or overlapping the holder', async () => {
   const scheduler = new Scheduler([candidate(1)])
   const runner = new FailoverRunner({ scheduler, config: { session_queue_timeout_ms: 40 } })

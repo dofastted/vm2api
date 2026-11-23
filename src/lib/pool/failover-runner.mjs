@@ -796,7 +796,10 @@ export class FailoverRunner {
     if (quarantined) return quarantinedResult(quarantined)
     const subagent = args.rootSessionId ? this.scheduler?.trackSubagent?.(args) : null
     if (args.rootSessionId) args = { ...args, subagent }
-    if (!sessionKey) return subagent ? this.runOnce(args).finally(subagent.close) : this.runOnce(args)
+    // A batch member key is a placement group, not a conversation: its requests
+    // are independent sessionless calls, so they run side by side up to the
+    // member's concurrency instead of queueing behind each other.
+    if (!sessionKey || isBatchMemberKey(sessionKey)) return subagent ? this.runOnce(args).finally(subagent.close) : this.runOnce(args)
     const previous = this.sessionTails.get(sessionKey) || Promise.resolve()
     let releaseTurn
     const turn = new Promise((resolve) => {
