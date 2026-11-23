@@ -126,6 +126,7 @@ import {
   markVmRefreshError,
   refreshErrorCodeOf,
   mirrorWorkerCredentialsToVm,
+  stripWorkerCredentialEmail,
 } from './lib/oauth/oauth-credentials.mjs'
 import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
 import {
@@ -1155,6 +1156,14 @@ cliNodeGuard = createCliNodeGuard({
   listTargets: () => listVms(cfg.paths.project),
   liveTokens: () => slotShell.liveShellTokens?.() || [],
 })
+for (const vm of listVms(cfg.paths.project)) {
+  if (isCodexVm(vm)) continue
+  try {
+    stripWorkerCredentialEmail(path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'))
+  } catch (error) {
+    console.warn('[credential-email-strip]', vm.id, error?.message || error)
+  }
+}
 
 const listCragTargets = () =>
   listVms(cfg.paths.project)

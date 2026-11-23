@@ -284,3 +284,103 @@ test('a refresh-only panel credential is recovered through the slot', async (con
   assert.equal(result.ok, true)
   assert.equal(result.credential.has_access, true)
 })
+
+test('sync strips legacy email from local credentials and excludes email from summary', async (context) => {
+  const { homeDir, official, worker, exec } = fixture(context)
+  fs.mkdirSync(path.dirname(worker), { recursive: true })
+  fs.writeFileSync(
+    worker,
+    JSON.stringify({
+      type: 'oauth',
+      email: 'top@example.com',
+      claudeAiOauth: {
+        accessToken: grant.access_token,
+        refreshToken: grant.refresh_token,
+        expiresAt: grant.expires_at * 1000,
+        email: 'legacy@example.com',
+        emailAddress: 'legacy-addr@example.com',
+        email_address: 'legacy-snake@example.com',
+        accountUuid: 'acct-1',
+        orgUuid: 'org-1',
+      },
+    }),
+  )
+  const result = await syncClaudeClientCredentials(exec)
+  assert.equal(result.ok, true)
+  assert.equal(fs.readlinkSync(official), 'credentials.json')
+  const text = fs.readFileSync(worker, 'utf8')
+  assert.doesNotMatch(text, /example\.com|"email"|emailAddress|email_address/)
+  const saved = JSON.parse(text)
+  assert.equal(saved.claudeAiOauth.accessToken, grant.access_token)
+  assert.equal(saved.claudeAiOauth.refreshToken, grant.refresh_token)
+  assert.equal(saved.claudeAiOauth.accountUuid, 'acct-1')
+  assert.equal(saved.claudeAiOauth.orgUuid, 'org-1')
+  assert.equal(Object.prototype.hasOwnProperty.call(result.credential, 'email'), false)
+  assert.equal(JSON.stringify(result).includes('example.com'), false)
+})
+
+test('cluster sync pushes back sanitized credentials when remote still holds legacy email', async (context) => {
+  const { homeDir, worker, exec } = fixture(context)
+  const calls = []
+  let pushedText = ''
+  const result = await syncClaudeClientCredentials(exec, {
+    host: {
+      kind: 'node',
+      afterRefresh: async () => {
+        calls.push('pull')
+        fs.mkdirSync(path.dirname(worker), { recursive: true })
+        fs.writeFileSync(
+          worker,
+          JSON.stringify({
+            claudeAiOauth: {
+              accessToken: grant.access_token,
+              refreshToken: 'rotated-refresh',
+              expiresAt: grant.expires_at * 1000,
+              email: 'remote-legacy@example.com',
+            },
+          }),
+        )
+        return { pulled: true }
+      },
+      onImport: async () => {
+        calls.push('push-sanitized')
+        pushedText = fs.readFileSync(worker, 'utf8')
+        return { pushed: true }
+      },
+    },
+    ensureRemoteLink: async () => {
+      calls.push('link')
+      return { linked: true }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.deepEqual(calls, ['pull', 'push-sanitized', 'link'])
+  assert.doesNotMatch(pushedText, /remote-legacy@example\.com|"email"/)
+  assert.equal(readWorkerCredentialFile(homeDir).refresh_token, 'rotated-refresh')
+})
+
+test('preflight strips legacy email written by an older slot refresher', async (context) => {
+  const { homeDir, worker, exec } = fixture(context)
+  writeWorkerCredentialFile(homeDir, dueGrant())
+  const result = await prepareClaudeClientCredentials(exec, {
+    refreshInSlot: async () => {
+      fs.chmodSync(worker, 0o600)
+      fs.writeFileSync(
+        worker,
+        JSON.stringify({
+          claudeAiOauth: {
+            accessToken: 'refreshed-access',
+            refreshToken: 'refreshed-refresh',
+            expiresAt: grant.expires_at * 1000,
+            email: 'old-worker@example.com',
+          },
+        }),
+      )
+      return { ok: true, body: { refreshed: true } }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.refreshed, true)
+  assert.doesNotMatch(fs.readFileSync(worker, 'utf8'), /old-worker@example\.com|"email"/)
+  assert.equal(Object.prototype.hasOwnProperty.call(result.credential, 'email'), false)
+})

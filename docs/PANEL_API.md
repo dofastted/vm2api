@@ -113,7 +113,7 @@
 | POST | `/vms/:id/oauth/to-setup-token` | 把当前完整 OAuth 活票改成 Setup Token（保留 refresh/过期）。已是 setup-token 则幂等 |
 | POST | `/vms/:id/oauth/generate-auth-url` | CAI / Setup Token PKCE 授权链接；要求绑定可用出口。`claude_code` 返回 409 `native_login_required`，请使用专用终端 |
 | POST | `/vms/:id/oauth/exchange-code` | CAI / Setup Token 提交会话 ID 和授权码；导入并同步后才返回成功。Claude Code 的回调由专用终端处理 |
-| POST | `/vms/:id/credentials/sync` | 管理员手动同步 Claude 客户端凭证，成功返回 `{ synced: true }`。无凭证返回 409，同步失败返回 502；不换票、不回传 token。远程槽保留节点已轮换凭证并修复客户端链接 |
+| POST | `/vms/:id/credentials/sync` | 管理员手动同步 Claude 客户端凭证，成功返回 `{ synced: true }`。无凭证返回 409，同步失败返回 502；不换票、不回传 token，并排除凭证内邮箱字段。远程槽保留节点已轮换凭证、剔除遗留邮箱并修复客户端链接 |
 | GET/POST | `/vms/:id/official-cc-bootstrap` | 初装进度 / `{ manual:true }` 再跑 |
 | GET/PUT | `/vms/:id/seed-settings` | 播种；面板默认锁定，解锁后改、播种前确认。`settings.json` 可编辑 env（经 `extra_env`）与 `theme`；`autoUpdates`/`grove_enabled` 与 TZ/LANG/LC_ALL、telemetry/bedrock/vertex 等契约 env 只读展示，TZ/LANG 经 PUT `timezone` / `timezone_follow_proxy` / `locale` 写入槽位后再播种，不经 `extra_env`；`claude_setting` 可编辑。`GET ?debug=1` 额外返回 `telemetry_log`（最近 40 行脱敏上传审计，默认不带） |
 | POST | `/vms/:id/collect-identity` | guest 采集（locale/tz/`guest_machine_id`、槽内 `/etc/os-release` 的 `VERSION_ID`、系统与架构）；Codex Analytics 只使用这次采集的运行环境 |

@@ -113,6 +113,7 @@ import {
   vmNodeId,
 } from './placement.mjs'
 import { openSftp, readRemoteFileNoFollow, runRemote, shellQuote, writeRemoteFile } from './remote-fs.mjs'
+import { stripSlotCredentialEmailBytes } from '../oauth/oauth-credentials.mjs'
 
 import {
   pushCragSlot,
@@ -389,7 +390,10 @@ async function migrateClaudeDir(session, vm, remoteDir) {
   const old = await readRemoteFileNoFollow(session.client, `${remoteDir}/${cred}`).catch(() => null)
   if (!old?.length) return
   const owner = session.host.uid === 0 ? remoteSlotOwner(session.host, vm) : null
-  await writeRemoteFile(await openSftp(session.client), dest, old, { mode: 0o600, owner })
+  await writeRemoteFile(await openSftp(session.client), dest, stripSlotCredentialEmailBytes(old).data, {
+    mode: 0o600,
+    owner,
+  })
 }
 
 /** iptables plan → one shell script; mirrors egress.mjs applyIptables (-N tolerant, -C guards the next row). */

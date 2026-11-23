@@ -37,6 +37,7 @@ import {
   writeGuestMachineIdFile,
 } from '../identity/workstation-fingerprint.mjs'
 import { assignComputerFingerprint } from '../identity/slot-computer.mjs'
+import { stripWorkerCredentialEmail } from '../oauth/oauth-credentials.mjs'
 
 const KEEP_HOME = [
   'cli-home/.claude.json',
@@ -98,6 +99,7 @@ export function wipeSlotHome(projectRoot, id, { keepData = false } = {}) {
       copyKept(src, dest)
     }
     fs.rmSync(stash, { recursive: true, force: true })
+    stripWorkerCredentialEmail(path.join(home, 'cli-home'))
   }
   const chat = path.join(projectRoot, 'vms', `${id}-chat.json`)
   try {
