@@ -122,7 +122,13 @@ test('the new leader counts the draining peer load and takes it out again', () =
   assert.equal(me.planner.openCount('vm-1'), 1, 'peer seat occupies a slot here')
 
   // One peer request finished.
-  foreign.apply({ ...snap, accounts: { 'acct-1': 1 }, vms: { 'vm-1': 1 }, quota: { 'acct-1': 1 }, families: { 'acct-1': { opus: 1 } } })
+  foreign.apply({
+    ...snap,
+    accounts: { 'acct-1': 1 },
+    vms: { 'vm-1': 1 },
+    quota: { 'acct-1': 1 },
+    families: { 'acct-1': { opus: 1 } },
+  })
   assert.equal(me.inflight.get('acct-1'), 2)
   assert.equal(me.planner.openCount('vm-1'), 1)
 
@@ -146,22 +152,102 @@ test('a ghost seat the session continued on here is kept when the peer lets go',
   assert.equal(me.planner.openCount('vm-2'), 1)
 })
 
-test('load file round trip; a stale file counts as no load', async () => {
+test('load file round trip; a removed file counts as no load, a stale one keeps its snapshot and is logged', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-load-'))
   const file = path.join(dir, 'run', 'handover-load.json')
   let load = { accounts: { a: 3 } }
   const writer = startLoadWriter({ file, read: () => load, intervalMs: 20 })
   const me = fakeScheduler()
-  const reader = startLoadReader({ file, foreign: createForeignLoad({ scheduler: me }), intervalMs: 20, staleMs: 200 })
+  const lines = []
+  const logger = { log: (line) => lines.push(JSON.parse(line).event) }
+  const reader = startLoadReader({
+    file,
+    foreign: createForeignLoad({ scheduler: me }),
+    intervalMs: 20,
+    staleMs: 200,
+    logger,
+  })
   assert.equal(me.inflight.get('a'), 3)
   load = { accounts: { a: 1 } }
   await new Promise((r) => setTimeout(r, 120))
   assert.equal(me.inflight.get('a'), 1)
-  writer.stop()
-  await new Promise((r) => setTimeout(r, 120))
+  // The writer stalls: the file stays, ages past staleMs, and its last snapshot is kept.
+  writer.stop({ remove: false })
+  await new Promise((r) => setTimeout(r, 320))
+  assert.equal(me.inflight.get('a'), 1, 'stale snapshot kept')
+  assert.deepEqual(lines, ['handover-load-stale'])
+  // It recovers.
+  const writer2 = startLoadWriter({ file, read: () => load, intervalMs: 20 })
+  await new Promise((r) => setTimeout(r, 80))
+  assert.deepEqual(lines, ['handover-load-stale', 'handover-load-fresh'])
+  // A clean exit removes the file: no load.
+  writer2.stop()
+  await new Promise((r) => setTimeout(r, 80))
   assert.equal(me.inflight.has('a'), false)
   reader.stop()
   fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('a family seat that left home while still streaming is exported and restored off-home', () => {
+  const peer = fakeScheduler()
+  const away = peer.planner.open('sess:f', { vmId: 'vm-1', accountId: 'acct-1', cap: 4 })
+  away.family = true
+  peer.planner.hold(away)
+  // The session moved to vm-2 while its subagent on vm-1 is still running (#1627).
+  peer.planner.leaveHome(away)
+  const home = peer.planner.open('sess:f', { vmId: 'vm-2', accountId: 'acct-2', cap: 4 })
+  home.family = true
+  peer.planner.hold(home)
+  assert.equal(peer.planner.seats.get('sess:f'), home)
+  const snap = exportLiveLoad({ scheduler: peer })
+  assert.deepEqual(snap.seats.map((s) => [s.vmId, s.home, s.family]).sort(), [
+    ['vm-1', false, true],
+    ['vm-2', true, true],
+  ])
+
+  const me = fakeScheduler()
+  const foreign = createForeignLoad({ scheduler: me })
+  foreign.apply(snap)
+  assert.equal(me.planner.openCount('vm-1'), 1, 'off-home seat occupies its cell')
+  assert.equal(me.planner.openCount('vm-2'), 1)
+  assert.equal(me.planner.seatOf('sess:f').vmId, 'vm-2', 'home stays the peer home')
+  // The subagent on vm-1 finishes on the peer: that cell frees, the home stays.
+  foreign.apply({ ...snap, seats: snap.seats.filter((s) => s.home) })
+  assert.equal(me.planner.openCount('vm-1'), 0)
+  assert.equal(me.planner.openCount('vm-2'), 1)
+  foreign.clear()
+  assert.equal(me.planner.openCount('vm-2'), 0)
+})
+
+test('a request the new leader finishes first does not free a seat the peer still streams on', () => {
+  const me = fakeScheduler()
+  const foreign = createForeignLoad({ scheduler: me })
+  const snap = { seats: [{ seatKey: 'sess:c', vmId: 'vm-3', accountId: 'acct-3', index: 0 }] }
+  foreign.apply(snap)
+  const seat = me.planner.seatOf('sess:c')
+  // The same session sends a request to the new leader, which finishes before the peer's.
+  me.planner.hold(seat)
+  me.planner.release(seat)
+  assert.equal(me.planner.seatOf('sess:c'), seat, 'peer hold keeps the seat')
+  assert.equal(me.planner.openCount('vm-3'), 1)
+  foreign.apply(snap)
+  assert.equal(me.planner.openCount('vm-3'), 1)
+  foreign.clear()
+  assert.equal(me.planner.openCount('vm-3'), 0, 'freed once the peer lets go')
+})
+
+test('managed-key concurrency of the draining peer counts here', () => {
+  const peerKeys = { inflight: new Map([['key-1', 1]]) }
+  const snap = exportLiveLoad({ scheduler: fakeScheduler(), apiKeys: peerKeys })
+  assert.deepEqual(snap.keys, { 'key-1': 1 })
+  const myKeys = { inflight: new Map([['key-1', 1]]) }
+  const foreign = createForeignLoad({ scheduler: fakeScheduler(), apiKeys: myKeys })
+  foreign.apply(snap)
+  assert.equal(myKeys.inflight.get('key-1'), 2)
+  foreign.apply({ ...snap, keys: {} })
+  assert.equal(myKeys.inflight.get('key-1'), 1)
+  foreign.clear()
+  assert.equal(myKeys.inflight.get('key-1'), 1, 'own load is untouched')
 })
 
 test('reader reports the peer gone once: file removed, heartbeat lost, or never written', async () => {
@@ -232,7 +318,10 @@ test('standby pre-dials node links and activation adopts them instead of diallin
   manager.start()
   assert.equal(manager.links.get('n1'), warm, 'activation adopts the pre-dialled link')
   assert.equal(manager.prewarmed.size, 0)
-  assert.ok(states.some((l) => l.includes('"node":"n1"')), 'adopted link state is replayed')
+  assert.ok(
+    states.some((l) => l.includes('"node":"n1"')),
+    'adopted link state is replayed',
+  )
   await manager.stop()
   fs.rmSync(dir, { recursive: true, force: true })
 })

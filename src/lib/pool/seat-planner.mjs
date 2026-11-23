@@ -261,11 +261,13 @@ export class SeatPlanner {
    * as a new open. `index` is kept when that cell is free. `heldUntil` is
    * only a restart race: the dialog already ended, so the slot frees unless
    * that session queues again before the timer. It is not sticky TTL.
+   * `home: false` books the cell only, like a family seat after leaveHome:
+   * the session's home is elsewhere and this cell frees with its last request.
    */
-  restore(seatKey, { vmId, accountId = null, index = null, heldUntil = null, cap = 0 } = {}) {
+  restore(seatKey, { vmId, accountId = null, index = null, heldUntil = null, cap = 0, home = true } = {}) {
     const key = String(seatKey || '')
     const id = String(vmId || '')
-    if (!key || !id || this.seats.has(key)) return null
+    if (!key || !id || (home && this.seats.has(key))) return null
     let book = this.byVm.get(id)
     if (!book) {
       book = new Map()
@@ -286,7 +288,7 @@ export class SeatPlanner {
       live: true,
     }
     book.set(slot, seat)
-    this.seats.set(key, seat)
+    if (home) this.seats.set(key, seat)
     if (cap) this.noteCap(id, cap)
     if (until) this.armHold(seat)
     this.changed()
