@@ -12,16 +12,16 @@
     "tag": "payload-2026.11.23-gemini-0.4.1",
     "assets": {
       "craggemini": {
-        "size": 1183368,
-        "sha256": "ec729ae147d55a4216ecf380a10f1212a441d6f7a1bd3a124cfafd9d449b2b7d"
+        "size": 1183128,
+        "sha256": "ca8c4accc99e07480931c3c91fbe2dfd6e87a07f2ed65fe7f0869aa8bb45d014"
       },
       "craggemini.payload.enc": {
-        "size": 6124500,
-        "sha256": "1a49c36879ed81bfeb3d1fd8ad5684a00d1f766bbdf6e290ca194d23d74b34f1"
+        "size": 6123084,
+        "sha256": "74e08d1fc4bb187ae03226e12508b33601a8e46eb312ba90b04793144dfa6888"
       },
       "libagy_bridge.so": {
-        "size": 966336,
-        "sha256": "125c7ca6d4879f769028f9a1c65b938a43d327bb2b1f678c185924710092df4f"
+        "size": 966200,
+        "sha256": "2dba142185be3688a13e5a93d03e7cc6441b6ca63fd3b9659a4b0f46255c2bfb"
       },
       "crag-license-public.pem": {
         "size": 113,
@@ -29,7 +29,7 @@
       },
       "manifest.json": {
         "size": 1913,
-        "sha256": "857daaa3b9fa864c773aa2a4b15d87e624493e4b6f18eb42a00e521f0fac0896"
+        "sha256": "f001b234ec75715b68089087a6acdd28c01791c33cd6f8cc67249af7174d0375"
       }
     }
   },
