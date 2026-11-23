@@ -19,6 +19,7 @@ import {
   readWorkerCredentialFile,
   readSlotCredentialIdentity,
   writeWorkerCredentialFile,
+  ensureOfficialCredentialLink,
   ensureSlotSubscriptionType,
   slotUidGidFromHomeDir,
   ensureSlotClaudeOwnership,
@@ -368,7 +369,7 @@ test('writeWorkerCredentialFile preserves full-scope setup-token metadata', () =
   fs.rmSync(home, { recursive: true, force: true })
 })
 
-test('writeWorkerCredentialFile stores claudeAiOauth and reads back', () => {
+test('writeWorkerCredentialFile stores claudeAiOauth without exposing email inside the VM', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-write-'))
   writeWorkerCredentialFile(home, {
     access_token: 'sk-ant-oat01-TEST',
@@ -376,21 +377,78 @@ test('writeWorkerCredentialFile stores claudeAiOauth and reads back', () => {
     expires_at: 1787486457,
     email: 'slot@example.com',
     account_uuid: 'acct-1',
+    org_uuid: 'org-1',
   })
   const cred = readWorkerCredentialFile(home)
   assert.equal(cred.access_token, 'sk-ant-oat01-TEST')
   assert.equal(cred.refresh_token, 'sk-ant-ort01-TEST')
-  assert.equal(cred.email, 'slot@example.com')
+  assert.equal(cred.email, null)
+  assert.equal(cred.account_uuid, 'acct-1')
+  assert.equal(cred.org_uuid, 'org-1')
   assert.equal(expiresAtToMs(cred.expires_at), 1787486457000)
   const official = path.join(home, '.claude', '.credentials.json')
   const stored = path.join(home, '.claude', 'credentials.json')
   assert.equal(fs.statSync(stored).mode & 0o777, 0o444)
-  const raw = JSON.parse(fs.readFileSync(stored, 'utf8'))
+  const text = fs.readFileSync(stored, 'utf8')
+  assert.equal(text.includes('slot@example.com'), false)
+  const raw = JSON.parse(text)
+  assert.equal(raw.email, undefined)
+  assert.equal(raw.claudeAiOauth.email, undefined)
   assert.equal(typeof raw.kinGeneration, 'number')
   assert.equal(raw.claudeAiOauth.kinGeneration, raw.kinGeneration)
   assert.equal(fs.lstatSync(official).isSymbolicLink(), true)
   assert.equal(fs.readlinkSync(official), 'credentials.json')
   fs.rmSync(home, { recursive: true, force: true })
+})
+
+test('ensureOfficialCredentialLink strips email when adopting or relinking slot credentials', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-strip-email-'))
+  try {
+    const claude = path.join(home, '.claude')
+    const worker = path.join(claude, 'credentials.json')
+    const official = path.join(claude, '.credentials.json')
+    fs.mkdirSync(claude, { recursive: true })
+    fs.writeFileSync(
+      official,
+      JSON.stringify({
+        email: 'top@example.com',
+        claudeAiOauth: {
+          accessToken: 'at-adopt',
+          refreshToken: 'rt-adopt',
+          expiresAt: 2_000,
+          email: 'oauth@example.com',
+          emailAddress: 'oauth-addr@example.com',
+          email_address: 'oauth-snake@example.com',
+          accountUuid: 'acct-adopt',
+        },
+      }),
+    )
+    const adopted = ensureOfficialCredentialLink(home, { adoptOfficial: true })
+    assert.equal(adopted.linked, true)
+    assert.equal(adopted.adopted, true)
+    const afterAdopt = fs.readFileSync(worker, 'utf8')
+    assert.doesNotMatch(afterAdopt, /example\.com|emailAddress|email_address|"email"/)
+    assert.equal(readWorkerCredentialFile(home).account_uuid, 'acct-adopt')
+
+    fs.writeFileSync(
+      worker,
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: 'at-legacy',
+          refreshToken: 'rt-legacy',
+          expiresAt: 3_000,
+          email: 'legacy@example.com',
+        },
+      }),
+    )
+    const relinked = ensureOfficialCredentialLink(home, { adoptOfficial: false })
+    assert.equal(relinked.linked, true)
+    const afterRelink = fs.readFileSync(worker, 'utf8')
+    assert.doesNotMatch(afterRelink, /legacy@example\.com|"email"/)
+    assert.equal(readWorkerCredentialFile(home).refresh_token, 'rt-legacy')
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
 })
 
 test('writeWorkerCredentialFile stores subscriptionType and falls back to the vm plan', () => {

@@ -21,7 +21,12 @@ import fs from 'node:fs'
 import crypto from 'node:crypto'
 import path from 'node:path'
 import { nodeSession, remoteSlotDir, remoteSlotOwner, vmNodeId } from './placement.mjs'
-import { hasCredentialPresence, mirrorWorkerCredentialsToVm } from '../oauth/oauth-credentials.mjs'
+import {
+  hasCredentialPresence,
+  mirrorWorkerCredentialsToVm,
+  stripSlotCredentialEmailBytes,
+  stripWorkerCredentialEmail,
+} from '../oauth/oauth-credentials.mjs'
 import { EGRESS_BIN } from '../vm/egress.mjs'
 import { readJsonCached } from '../vm/vm-file.mjs'
 import {
@@ -405,9 +410,11 @@ export async function pushSlotCredentials(vm, slotDir, session = null) {
   await prepareRemoteDir(s, vm)
   const local = path.join(slotDir, CREDENTIALS)
   if (!fs.existsSync(local)) return { pushed: false }
+  const sanitized = stripSlotCredentialEmailBytes(fs.readFileSync(local))
+  if (sanitized.changed) stripWorkerCredentialEmail(path.join(slotDir, 'cli-home'))
   const sftp = await openSftp(s.client)
   const remote = remoteSlotDir(s.host, vm.id)
-  await writeRemoteFile(sftp, `${remote}/${remoteSlotPath(CREDENTIALS)}`, fs.readFileSync(local), {
+  await writeRemoteFile(sftp, `${remote}/${remoteSlotPath(CREDENTIALS)}`, sanitized.data, {
     mode: REMOTE_FILE_MODE,
     owner: ownerFor(s, vm),
   })
@@ -419,25 +426,33 @@ export async function pushSlotCredentials(vm, slotDir, session = null) {
 /** Pull the node credential and repair its metadata even when local bytes already match. */
 export async function pullSlotCredentials(vm, slotDir, session = null) {
   const s = session || (await nodeSession(vmNodeId(vm)))
-  const remote = await readRemoteFileNoFollow(
-    s.client,
-    `${remoteSlotDir(s.host, vm.id)}/${remoteSlotPath(CREDENTIALS)}`,
-  )
+  const remotePath = `${remoteSlotDir(s.host, vm.id)}/${remoteSlotPath(CREDENTIALS)}`
+  const remote = await readRemoteFileNoFollow(s.client, remotePath)
   if (!remote) return { pulled: false, reason: 'remote_missing' }
+  const sanitized = stripSlotCredentialEmailBytes(remote)
+  const bytes = sanitized.data
   const local = path.join(slotDir, CREDENTIALS)
   let mode = 0o600
   let same = false
   try {
-    same = fs.readFileSync(local).equals(remote)
+    same = fs.readFileSync(local).equals(bytes)
     mode = fs.statSync(local).mode & 0o777
   } catch {}
   if (!same) {
     fs.mkdirSync(path.dirname(local), { recursive: true, mode: 0o700 })
     const tmp = `${local}.${process.pid}.${Date.now()}.tmp`
-    fs.writeFileSync(tmp, remote, { mode })
+    fs.writeFileSync(tmp, bytes, { mode })
     // The local seal must survive whatever umask Node runs with.
     fs.chmodSync(tmp, mode)
     fs.renameSync(tmp, local)
+  }
+  let sftp = null
+  if (sanitized.changed) {
+    sftp = await openSftp(s.client)
+    await writeRemoteFile(sftp, remotePath, bytes, {
+      mode: REMOTE_FILE_MODE,
+      owner: ownerFor(s, vm),
+    })
   }
   const vmPath = path.join(path.dirname(slotDir), `${vm.id}.json`)
   let record = readJsonCached(vmPath)
@@ -448,12 +463,12 @@ export async function pullSlotCredentials(vm, slotDir, session = null) {
   if (record) vm.claude = record.claude
   if (!isCodexVm(vm)) {
     await remoteSymlink(
-      await openSftp(s.client),
+      sftp || (await openSftp(s.client)),
       'credentials.json',
       `${remoteSlotDir(s.host, vm.id)}/claude/.credentials.json`,
     )
   }
-  return same ? { pulled: false, reason: 'same' } : { pulled: true }
+  return same && !sanitized.changed ? { pulled: false, reason: 'same' } : { pulled: true }
 }
 
 /**
