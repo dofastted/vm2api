@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 代理探活引入 boot 宽限窗，堵住「升级重启 → 整池连坐摘槽」的裸奔窗口。重启后的第一轮探活与 kernel 恢复大传输、cluster-link 建连、槽位二进制推送共享同一台还在冷启动的机器：此刻的探活超时描述的是 boot 风暴，不是代理本身。但 `consecutive_failures` 会跨重启持久化——升级前落盘的半截连败，加上 boot 后一轮失败即凑满 `max_failures`，代理被标 `dead` 并级联禁用全部绑定槽；而一条出口代理往往承载整个 codex 池，GPT 链路于是每次升级后都会 `no_codex_vm` 10~20 分钟，只能等下一轮探活成功自愈。新增 `boot_grace_min`（默认 10，0 关闭恢复旧行为）：宽限窗内的探活失败照记 `fail` 与 `last_error`（面板可见、计数保留），但连败计数被钳制在 `max_failures - 1`，不会跨进 `dead` 与级联禁用；成功路径（清零、resume、`proxy_recovered` 级联恢复）不受影响，宽限窗一过判定完全恢复旧语义。上一进程持久化的半截连败同样被钳制覆盖——重启后的进程无法为重启前的证据背书。
+
 ## 1.4.182 — 2026-11-23 · claude→responses 不再丢工具循环，槽位桌面 Mac 键盘与剪贴板直通，账号/桌面页签状态保活
 
 - claude→responses 转换不再丢掉多轮工具循环。旧实现只读 `message.content` 的字符串形态，`tool_calls` 一次都没被引用，`role=tool` 的消息又落进 `role = 'user'` 分支把 `tool_call_id` 一并丢掉，于是上游模型永远看不到工具输出、反复重发同一个调用，形成烧上游配额的死循环。改为复用 `chatMessageToItems`：assistant 的 `tool_calls` 变成 `function_call` 项，`role=tool` 变成 `function_call_output` 项。`call_id` 链路两端已逐一核对——`tool_use.id → toolCalls[].id → function_call.call_id` 与 `tool_result.tool_use_id → tool_call_id → function_call_output.call_id` 对得上，不会落到 `call_unknown` 兜底，循环因此能真正闭合（#1626）。
