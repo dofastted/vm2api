@@ -18,12 +18,15 @@ function sse(event, data) {
 }
 
 /** Anthropic streaming error. `type` is what clients branch on (`overloaded_error`, …). */
-export function buildAnthropicSseError(error = {}) {
+export function buildAnthropicSseError(error = {}, poolReason = null) {
   const body = {
     type: String(error.type || 'api_error'),
     message: String(error.message || 'An error occurred while processing the request'),
   }
   if (error.code) body.code = String(error.code)
+  if (error.code === ErrorCode.POOL_OVERLOADED && poolReason === 'subagent_limit') {
+    body.details = { reason: poolReason }
+  }
   return sse('error', { type: 'error', error: body })
 }
 
