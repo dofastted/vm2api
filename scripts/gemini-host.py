@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import pty
 import pwd
+import queue
 import re
 import secrets
 import select
@@ -375,6 +376,37 @@ os.execvpe(sys.argv[2],sys.argv[2:],os.environ)
 """
 
 
+class _Spawner:
+    """Single long-lived thread that forks managed child processes so Linux
+    PR_SET_PDEATHSIG fires only when gemini-host exits, never when an HTTP
+    worker thread from ThreadingUnixStreamServer terminates."""
+
+    def __init__(self):
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._loop, name="gemini-spawner", daemon=True
+        )
+        self._thread.start()
+
+    def _loop(self):
+        while True:
+            fn, result_q = self._queue.get()
+            try:
+                result_q.put((True, fn()))
+            except BaseException as exc:
+                result_q.put((False, exc))
+
+    def call(self, fn):
+        if threading.current_thread() is self._thread:
+            return fn()
+        result_q = queue.Queue(maxsize=1)
+        self._queue.put((fn, result_q))
+        ok, value = result_q.get()
+        if ok:
+            return value
+        raise value
+
+
 class Agy:
     def __init__(self, host, environment, proxy_url, profile=None, size=(180, 40)):
         self.host = host
@@ -455,22 +487,25 @@ class Agy:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        self.egress = subprocess.Popen(
-            self.launch_args(self.host.egress_uid)
-            + [
-                sys.executable,
-                "-I",
-                "-c",
-                EGRESS_EXEC,
-                str(os.getpid()),
-                str(self.host.egress),
-                "--config",
-                str(config),
-            ],
-            env=SYSTEM_ENV,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        spawn = getattr(self.host, "spawn", lambda fn: fn())
+        self.egress = spawn(
+            lambda: subprocess.Popen(
+                self.launch_args(self.host.egress_uid)
+                + [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    EGRESS_EXEC,
+                    str(os.getpid()),
+                    str(self.host.egress),
+                    "--config",
+                    str(config),
+                ],
+                env=SYSTEM_ENV,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         )
         self.wait_egress()
         sandbox = [
@@ -572,19 +607,24 @@ class Agy:
         if self.profile is not None:
             argv += ["/usr/bin/python3", "-I", "-c", TERMINAL_EXEC]
         argv += ["/opt/agy", "--mode", "plan"]
-        self.pid, self.terminal = pty.fork()
-        if self.pid == 0:
-            try:
-                os.umask(0o077)
-                fcntl.ioctl(
-                    0, termios.TIOCSWINSZ, struct.pack("HHHH", size[1], size[0], 0, 0)
-                )
-                if self.profile is not None:
-                    with open(os.devnull, "wb") as quiet:
-                        os.dup2(quiet.fileno(), 2)
-                os.execvpe(argv[0], argv, SYSTEM_ENV)
-            finally:
-                os._exit(125)
+        def _fork_pty():
+            pid, terminal = pty.fork()
+            if pid == 0:
+                try:
+                    os.umask(0o077)
+                    fcntl.ioctl(
+                        0, termios.TIOCSWINSZ, struct.pack("HHHH", size[1], size[0], 0, 0)
+                    )
+                    if self.profile is not None:
+                        with open(os.devnull, "wb") as quiet:
+                            os.dup2(quiet.fileno(), 2)
+                    os.execvpe(argv[0], argv, SYSTEM_ENV)
+                finally:
+                    os._exit(125)
+            return pid, terminal
+
+        spawn = getattr(self.host, "spawn", lambda fn: fn())
+        self.pid, self.terminal = spawn(_fork_pty)
         os.set_blocking(self.terminal, False)
 
     def wait_egress(self):
@@ -715,11 +755,14 @@ class Headless(Agy):
         self.token_bytes = None
 
     def launch_cli(self, argv, size):
-        self.invocation = invocation_module().Invocation(
-            argv + ["--", "/opt/agy", *self.args],
-            SYSTEM_ENV,
-            self.prompt,
-            secrets=self.credentials,
+        spawn = getattr(self.host, "spawn", lambda fn: fn())
+        self.invocation = spawn(
+            lambda: invocation_module().Invocation(
+                argv + ["--", "/opt/agy", *self.args],
+                SYSTEM_ENV,
+                self.prompt,
+                secrets=self.credentials,
+            )
         )
 
     def poll(self):
@@ -793,6 +836,7 @@ class NativeAgy(Agy):
         candidate = self.directory / "native"
         if len(str(candidate / "kernel.sock").encode("utf-8")) > 96:
             NATIVE_RUNTIME_ROOT.mkdir(mode=0o711, exist_ok=True)
+            os.chmod(NATIVE_RUNTIME_ROOT, 0o711)
             check_root_owned(NATIVE_RUNTIME_ROOT)
             self.native_dir = (
                 NATIVE_RUNTIME_ROOT / f"s{getattr(self, 'slot', 0)}-{self.attempt[:12]}"
@@ -913,26 +957,29 @@ class NativeAgy(Agy):
         except (native_module_impl.NativeFailure, OSError) as error:
             code = getattr(error, "code", "gemini_native_tty_unavailable")
             raise Failure(503, code) from None
+        spawn = getattr(self.host, "spawn", lambda fn: fn())
         try:
-            self.native_tui = subprocess.Popen(
-                [
-                    "openvt",
-                    "-c",
-                    str(vt),
-                    "-w",
-                    "--",
-                    sys.executable,
-                    "-I",
-                    "-c",
-                    VT_EXEC,
-                    str(self.directory / "tui.pid"),
-                    *argv,
-                ],
-                env=SYSTEM_ENV,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
+            self.native_tui = spawn(
+                lambda: subprocess.Popen(
+                    [
+                        "openvt",
+                        "-c",
+                        str(vt),
+                        "-w",
+                        "--",
+                        sys.executable,
+                        "-I",
+                        "-c",
+                        VT_EXEC,
+                        str(self.directory / "tui.pid"),
+                        *argv,
+                    ],
+                    env=SYSTEM_ENV,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
             )
             pid_path = self.directory / "tui.pid"
             pid_deadline = time.monotonic() + 5
@@ -1415,6 +1462,7 @@ class Host:
         self.egress_uid = args.uid_base + MAX_ENVIRONMENTS
         self.state_file = self.directory / "environments.json"
         self.lock = threading.RLock()
+        self._spawner = _Spawner()
         self.pending = {}
         self.terminals = {}
         self.runs = {}
@@ -1471,12 +1519,16 @@ class Host:
         if NATIVE_RUNTIME_ROOT.exists():
             try:
                 check_root_owned(NATIVE_RUNTIME_ROOT)
+                os.chmod(NATIVE_RUNTIME_ROOT, 0o711)
                 for stale in NATIVE_RUNTIME_ROOT.iterdir():
                     if stale.is_dir() and re.fullmatch(r"s[0-9]+-[a-f0-9]{8,16}", stale.name):
                         shutil.rmtree(stale, ignore_errors=True)
             except (OSError, RuntimeError):
                 pass
         self.inspect_payload()
+
+    def spawn(self, fn):
+        return self._spawner.call(fn)
 
     @staticmethod
     def is_crag_encrypted_payload(source):
