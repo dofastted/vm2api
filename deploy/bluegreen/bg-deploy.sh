@@ -16,6 +16,7 @@
 #   6 旧实例退出后给新实例 SIGHUP：同步共享二进制、补做推迟的维护
 #
 # 配置（环境变量，或写进 <状态目录>/bg.env）：
+#   （环境变量优先于 bg.env）
 #   BG_PROJECT_DIR      安装目录（默认本脚本上两级）
 #   BG_STATE_DIR        状态目录（默认 $BG_PROJECT_DIR/bluegreen：active、container、deploy.log）
 #   BG_HOST             探活和 haproxy 后端用的地址（默认 127.0.0.1）
@@ -23,7 +24,8 @@
 #   BG_HAPROXY_SOCK     haproxy admin socket（默认 /run/haproxy/admin.sock）
 #   BG_HAPROXY_BACKEND  haproxy backend 名（默认 app，里面要有 server blue / server green）
 #   BG_HAPROXY_STATE    server-state-file 路径（默认 /var/lib/haproxy/server-state）
-#   BG_HAPROXY_CFG      haproxy 配置文件（默认 /etc/haproxy/haproxy.cfg；--bootstrap 用它启动/重载 haproxy）
+#   BG_HAPROXY_CFG      haproxy 配置文件（默认 /etc/haproxy/haproxy.cfg；--bootstrap 先校验它）
+#   BG_HAPROXY_RELOAD   --bootstrap 启动/重载 haproxy 的命令（默认 systemctl reload-or-restart haproxy）
 #   BG_COMPOSE_FILES    基础 compose 文件，空格分隔（默认 docker-compose.yml [+ docker-compose.override.yml]）
 #   BG_SERVICE          compose 服务名（默认 vm2api）
 #   BG_NAME             容器/项目名前缀（默认 vm2api → vm2api-blue / vm2api-green）
@@ -33,8 +35,13 @@ set -euo pipefail
 
 BG_PROJECT_DIR=${BG_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 BG_STATE_DIR=${BG_STATE_DIR:-$BG_PROJECT_DIR/bluegreen}
-# shellcheck disable=SC1091
-[[ -f $BG_STATE_DIR/bg.env ]] && . "$BG_STATE_DIR/bg.env"
+# bg.env 只补环境里没给的：命令行临时 BG_X=... 优先
+if [[ -f $BG_STATE_DIR/bg.env ]]; then
+  bg_env_given=$(declare -p $(compgen -v BG_) 2>/dev/null || true)
+  # shellcheck disable=SC1091
+  . "$BG_STATE_DIR/bg.env"
+  eval "$bg_env_given"
+fi
 BG_HOST=${BG_HOST:-127.0.0.1}
 BG_BLUE_PORT=${BG_BLUE_PORT:-8788}
 BG_GREEN_PORT=${BG_GREEN_PORT:-8789}
@@ -42,6 +49,7 @@ BG_HAPROXY_SOCK=${BG_HAPROXY_SOCK:-/run/haproxy/admin.sock}
 BG_HAPROXY_BACKEND=${BG_HAPROXY_BACKEND:-app}
 BG_HAPROXY_STATE=${BG_HAPROXY_STATE:-/var/lib/haproxy/server-state}
 BG_HAPROXY_CFG=${BG_HAPROXY_CFG:-/etc/haproxy/haproxy.cfg}
+BG_HAPROXY_RELOAD=${BG_HAPROXY_RELOAD:-systemctl reload-or-restart haproxy}
 BG_SERVICE=${BG_SERVICE:-vm2api}
 BG_NAME=${BG_NAME:-vm2api}
 BG_DRAIN_MS=${BG_DRAIN_MS:-3600000}
@@ -172,7 +180,7 @@ case "$mode" in
   echo blue >"$BG_STATE_DIR/active"
   if ! hap_has_colors; then
     log "starting haproxy with $BG_HAPROXY_CFG"
-    systemctl reload-or-restart haproxy
+    $BG_HAPROXY_RELOAD
     for _ in $(seq 1 20); do hap_has_colors && break; sleep 0.5; done
     hap_has_colors || { log "FAILED: haproxy admin socket $BG_HAPROXY_SOCK has no blue/green servers"; exit 1; }
   fi
