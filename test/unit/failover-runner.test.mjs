@@ -3187,3 +3187,41 @@ test('#1562: CRAG pre-first-frame SOCKS5/transport_error 502 fails over across s
     assert.equal(scheduler.unitCircuit.snapshot('account-B').failures, 1)
   }
 })
+
+test('timeout tracker: repeat trips back off 15/30/60 minutes; success forgets them, reset does not', async () => {
+  const { vmTimeoutTracker } = await import('../../src/lib/pool/failover-runner.mjs')
+  vmTimeoutTracker.reset()
+  const m = 60_000
+  assert.equal(vmTimeoutTracker.recordTrip('vm-t', 0), 1)
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 0), 0, 'one trip: no hold')
+  vmTimeoutTracker.recordTrip('vm-t', 10 * m)
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 10 * m), 25 * m)
+  vmTimeoutTracker.reset('vm-t')
+  vmTimeoutTracker.recordTrip('vm-t', 30 * m)
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 30 * m), 60 * m, 'reset keeps trip history')
+  vmTimeoutTracker.recordTrip('vm-t', 70 * m)
+  vmTimeoutTracker.recordTrip('vm-t', 80 * m)
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 80 * m), 140 * m, 'capped at 60 minutes')
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 80 * m + 3 * 60 * m), 0, 'trips age out of the 2h window')
+  vmTimeoutTracker.recordSuccess('vm-t')
+  assert.equal(vmTimeoutTracker.trips.has('vm-t'), false)
+  vmTimeoutTracker.reset()
+})
+
+test('timeout tracker: tripCount only counts trips inside the window and prunes the rest', async () => {
+  const { vmTimeoutTracker } = await import('../../src/lib/pool/failover-runner.mjs')
+  vmTimeoutTracker.reset()
+  const m = 60_000
+  vmTimeoutTracker.recordTrip('vm-t', 0)
+  vmTimeoutTracker.recordTrip('vm-t', 10 * m)
+  vmTimeoutTracker.recordTrip('vm-t', 130 * m)
+  // The oldest two have left the 2h window by now: the circuit log must not
+  // claim them. recordTrip is the only other writer and it is skipped while the
+  // fault is already set, so tripCount has to do the pruning itself.
+  assert.equal(vmTimeoutTracker.tripCount('vm-t', 140 * m), 1, 'aged-out trips are not counted')
+  assert.deepEqual(vmTimeoutTracker.trips.get('vm-t'), [130 * m], 'and are dropped from the list')
+  assert.equal(vmTimeoutTracker.tripCount('vm-t', 400 * m), 0, 'an empty window counts nothing')
+  assert.equal(vmTimeoutTracker.trips.has('vm-t'), false, 'the VM leaves the map once nothing is left')
+  assert.equal(vmTimeoutTracker.tripCount(null), 0)
+  vmTimeoutTracker.reset()
+})

@@ -5,6 +5,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -12,6 +13,7 @@ from datetime import datetime, timezone
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
 GOOGLE_USERINFO = "https://www.googleapis.com/oauth2/v2/userinfo"
 CODE_ASSIST = "https://cloudcode-pa.googleapis.com/v1internal:"
+ANTIGRAVITY_USER_AGENT = "antigravity/1.15.8 linux/amd64"
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_MODELS = GEMINI_API + "/models?pageSize=1000"
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin", "LANG": "C.UTF-8"}
@@ -40,9 +42,16 @@ def read_token(profile):
 
 
 def get_json(proxy_url, url, header=None, body=None, *, timeout=6):
-    options = {"proxy": proxy_url, "noproxy": ""}
-    if header is not None:
-        options["header"] = header
+    config_lines = [
+        f"proxy = {json.dumps(proxy_url)}\n",
+        'noproxy = ""\n',
+    ]
+    if isinstance(header, str):
+        config_lines.append(f"header = {json.dumps(header)}\n")
+    elif isinstance(header, (list, tuple)):
+        for item in header:
+            if isinstance(item, str) and item:
+                config_lines.append(f"header = {json.dumps(item)}\n")
     args = [
         "curl",
         "--disable",
@@ -62,9 +71,11 @@ def get_json(proxy_url, url, header=None, body=None, *, timeout=6):
         url,
     ]
     if body is not None:
-        options["data-binary"] = json.dumps(body, ensure_ascii=True)
+        config_lines.append(
+            f"data-binary = {json.dumps(json.dumps(body, ensure_ascii=True))}\n"
+        )
         args += ["--header", "Content-Type: application/json"]
-    config = "".join(f"{key} = {json.dumps(value)}\n" for key, value in options.items())
+    config = "".join(config_lines)
     try:
         output = subprocess.run(
             args,
@@ -101,6 +112,47 @@ def tier(value):
     if isinstance(value, dict):
         return text(value.get("name")) or text(value.get("id"))
     return text(value)
+
+
+def project_id_of(value):
+    if isinstance(value, dict):
+        return text(value.get("id")) or text(value.get("projectId"))
+    return text(value)
+
+
+_BLOCKING_INELIGIBLE_REASONS = frozenset(
+    {"VALIDATION_REQUIRED", "UNSUPPORTED_REGION", "UNSUPPORTED_CLIENT"}
+)
+
+
+def select_onboard_tier(assist_data):
+    if not isinstance(assist_data, dict):
+        return None
+    if assist_data.get("paidTier") or assist_data.get("currentTier"):
+        return None
+    ineligible = assist_data.get("ineligibleTiers")
+    if isinstance(ineligible, list):
+        for entry in ineligible:
+            if (
+                isinstance(entry, dict)
+                and entry.get("reasonCode") in _BLOCKING_INELIGIBLE_REASONS
+            ):
+                return None
+    allowed = assist_data.get("allowedTiers")
+    if not isinstance(allowed, list):
+        return None
+    fallback = None
+    for entry in allowed:
+        if not isinstance(entry, dict):
+            continue
+        tier_id = text(entry.get("id"))
+        if not tier_id:
+            continue
+        if entry.get("isDefault") is True:
+            return tier_id
+        if fallback is None:
+            fallback = tier_id
+    return fallback
 
 
 def models(data, is_api_key=False, *, chat_only=False):
@@ -221,12 +273,17 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
         r"[A-Za-z0-9._~+/-]{1,4096}={0,2}", access_token
     ):
         return checked("error")
-    header = f"Authorization: Bearer {access_token}"
+    auth_header = f"Authorization: Bearer {access_token}"
+    code_assist_headers = [auth_header, f"User-Agent: {ANTIGRAVITY_USER_AGENT}"]
     metadata = {"metadata": {"ideType": "ANTIGRAVITY", "ideName": "antigravity"}}
     with ThreadPoolExecutor(max_workers=2) as executor:
-        user = executor.submit(get_json, proxy_url, GOOGLE_USERINFO, header)
+        user = executor.submit(get_json, proxy_url, GOOGLE_USERINFO, auth_header)
         assist = executor.submit(
-            get_json, proxy_url, CODE_ASSIST + "loadCodeAssist", header, metadata
+            get_json,
+            proxy_url,
+            CODE_ASSIST + "loadCodeAssist",
+            code_assist_headers,
+            metadata,
         )
         user_status, user_data = user.result()
         assist_status, assist_data = assist.result()
@@ -236,8 +293,47 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
             return checked("reauth_required")
         if user_status != 200 or assist_status != 200 or not text(email, 254):
             return checked("error")
-    project = text(assist_data.get("cloudaicompanionProject")) or text(
-        token.get("project_id")
+    onboard_project = None
+    if assist_status == 200 and not imported:
+        onboard_tier = select_onboard_tier(assist_data)
+        if onboard_tier:
+            onboard_body = {"tierId": onboard_tier, "metadata": metadata["metadata"]}
+            existing_project = project_id_of(
+                assist_data.get("cloudaicompanionProject")
+            ) or text(token.get("project_id"))
+            if existing_project:
+                onboard_body["cloudaicompanionProject"] = existing_project
+            onboard_status, onboard_data = get_json(
+                proxy_url,
+                CODE_ASSIST + "onboardUser",
+                code_assist_headers,
+                onboard_body,
+                timeout=10,
+            )
+            if onboard_status == 200 and isinstance(onboard_data, dict):
+                response_obj = onboard_data.get("response")
+                if isinstance(response_obj, dict):
+                    onboard_project = project_id_of(
+                        response_obj.get("cloudaicompanionProject")
+                    )
+                if not onboard_project:
+                    onboard_project = project_id_of(
+                        onboard_data.get("cloudaicompanionProject")
+                    )
+                if onboard_data.get("done") is False:
+                    time.sleep(0.5)
+                assist_status2, assist_data2 = get_json(
+                    proxy_url,
+                    CODE_ASSIST + "loadCodeAssist",
+                    code_assist_headers,
+                    metadata,
+                )
+                if assist_status2 == 200 and isinstance(assist_data2, dict):
+                    assist_data = assist_data2
+    project = (
+        project_id_of(assist_data.get("cloudaicompanionProject"))
+        or onboard_project
+        or text(token.get("project_id"))
     )
     expiry = credential.get("expiry")
     if type(expiry) in (int, float):
@@ -259,7 +355,10 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
         "expires_at": text(expiry),
     }
     paid = assist_data.get("paidTier")
+    current = assist_data.get("currentTier")
     credits = paid.get("availableCredits") if isinstance(paid, dict) else None
+    if not isinstance(credits, list) and isinstance(current, dict):
+        credits = current.get("availableCredits")
     if isinstance(credits, list):
         account["credits"] = [
             {
@@ -277,7 +376,7 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
                 get_json,
                 proxy_url,
                 CODE_ASSIST + "fetchAvailableModels",
-                header,
+                code_assist_headers,
                 project_body,
             )
             summary = (
@@ -285,7 +384,7 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
                     get_json,
                     proxy_url,
                     CODE_ASSIST + "retrieveUserQuotaSummary",
-                    header,
+                    code_assist_headers,
                     project_body,
                 )
                 if project

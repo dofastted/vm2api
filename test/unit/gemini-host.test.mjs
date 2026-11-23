@@ -307,6 +307,13 @@ test('Gemini host inference evidence follows admitted runs and their bindings', 
   })
 })
 
+test('Gemini host auto-provisions models, plan, onboarding, and token refresh', { timeout: 15_000 }, () => {
+  execFileSync('python3', ['-B', fileURLToPath(new URL('./gemini-account-and-auto-provision.py', import.meta.url))], {
+    stdio: 'pipe',
+    timeout: 12_000,
+  })
+})
+
 test('Gemini payload redemption is admin-only and rejects malformed codes before host dispatch', async () => {
   const route = `${root}/payload/redeem`
   assert.equal(authorizePanelRoute('POST', route, 'user').ok, false)
