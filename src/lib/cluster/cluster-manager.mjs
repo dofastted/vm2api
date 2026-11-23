@@ -5,6 +5,7 @@
  */
 
 import { hostMemoryPressureOf } from './host-memory-pressure.mjs'
+import { deferUntilExclusive } from '../core/handover.mjs'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import net from 'node:net'
@@ -162,6 +163,8 @@ export class ClusterManager {
     this.vmsOnNode = vmsOnNode
     this.logger = logger
     this.links = new Map()
+    /** Blue/green standby: SSH links dialled before activation, adopted by _attach. */
+    this.prewarmed = new Map()
     this.bridges = new Map()
     this.slotRelays = new Map()
     this.hosts = new WeakMap()
@@ -190,7 +193,7 @@ export class ClusterManager {
     this._directTimer.unref?.()
   }
 
-  async stop() {
+  async stop({ unlink = true } = {}) {
     clearInterval(this._healthTimer)
     this._healthTimer = null
     clearInterval(this._directTimer)
@@ -198,8 +201,10 @@ export class ClusterManager {
     this.directProbes.clear()
     this.directState.clear()
     for (const link of this.links.values()) link.stop()
+    for (const link of this.prewarmed.values()) link.stop()
+    this.prewarmed.clear()
     const relays = [...this.bridges.values(), ...[...this.slotRelays.values()].flatMap((r) => [r.kernel, r.worker])]
-    await Promise.all(relays.map((r) => r.stop().catch(() => {})))
+    await Promise.all(relays.map((r) => r.stop({ unlink }).catch(() => {})))
     this.links.clear()
     this.bridges.clear()
     this.slotRelays.clear()
@@ -209,10 +214,42 @@ export class ClusterManager {
     return path.join(this.socketDir, id, 'docker.sock')
   }
 
+  /**
+   * Blue/green standby: dial the node SSH links ahead of activation. Without this every node slot reads
+   * "node not connected" for the ~10s the links take after activation, and the first requests after the
+   * switch wait in scheduling. Only the links: no relays, gates, health checks, timers or state writes.
+   */
+  prewarmLinks() {
+    for (const node of this.repo.list()) {
+      if (this.links.has(node.id) || this.prewarmed.has(node.id)) continue
+      const link = new SshLink({ id: node.id, resolveTarget: () => this._targetFor(node.id) })
+      this.prewarmed.set(node.id, link)
+      link.start()
+    }
+  }
+
+  /** Resolves once every pre-dialled link is ready, or at the timeout: `{ ready, total }`. */
+  async prewarmReady({ timeoutMs = 20_000, pollMs = 200 } = {}) {
+    const deadline = Date.now() + timeoutMs
+    const count = () => {
+      const links = [...this.prewarmed.values(), ...this.links.values()]
+      return { ready: links.filter((link) => link.state === 'ready').length, total: links.length }
+    }
+    for (;;) {
+      const now = count()
+      if (now.ready === now.total || Date.now() >= deadline) return now
+      // Not unref'd: the wait is bounded, and an unref'd timer lets the process exit mid-wait when
+      // nothing else is pending (every link failed fast).
+      await new Promise((resolve) => setTimeout(resolve, pollMs))
+    }
+  }
+
   _attach(node) {
-    const link = new SshLink({ id: node.id, resolveTarget: () => this._targetFor(node.id) })
+    const warm = this.prewarmed.get(node.id)
+    this.prewarmed.delete(node.id)
+    const link = warm || new SshLink({ id: node.id, resolveTarget: () => this._targetFor(node.id) })
     let sshWasReady = false
-    link.on('state', (state) => {
+    const onState = (state) => {
       this.logger.log(JSON.stringify({ event: 'cluster-link', node: node.id, state, error: link.error?.code || null }))
       if (state === 'ready') {
         // Host facts first: they carry the platform the health check branches on.
@@ -227,7 +264,8 @@ export class ClusterManager {
         this.health.delete(node.id)
         this._linkState(node.id, state)
       }
-    })
+    }
+    link.on('state', onState)
     this.links.set(node.id, link)
     const bridge = new SocketRelay({
       socketPath: this.bridgeSocketPath(node.id),
@@ -238,7 +276,9 @@ export class ClusterManager {
     })
     this.bridges.set(node.id, bridge)
     bridge.start().catch((err) => this.logger.warn(`[cluster] bridge ${node.id} failed: ${err.message}`))
-    link.start()
+    if (!warm) link.start()
+    // A pre-dialled link may already be up: replay its state so health, gate and link state run now.
+    else if (link.state !== 'idle') onState(link.state)
   }
 
   async _jumpSock(jumpNodeId, host, port) {
@@ -518,6 +558,11 @@ export class ClusterManager {
     }
   }
 
+  /** Re-check every connected node's gate (after a deploy refreshed bin/kin-slot-gate). */
+  async refreshGates({ skip = null } = {}) {
+    for (const id of [...this.links.keys()]) if (!skip?.has(id)) await this._ensureGate(id).catch(() => {})
+  }
+
   async _ensureGate(id, { strict = false } = {}) {
     if (this.nodePlatform(id) === 'darwin') return
     const cfg = this.repo.getDirectLink(id)
@@ -528,6 +573,7 @@ export class ClusterManager {
       const host = await this.remoteHost(id)
       const result = await ensureNodeGate({ client, host, docker: sshDocker(client) }, cfg, this.gateBin)
       if (link.client !== client || !this._directConfigMatches(id, cfg)) return
+      if (result.deferred) deferUntilExclusive(`gate:${id}`, () => this._ensureGate(id))
       if (result.certSha256 !== cfg.certSha256) {
         this.repo.setDirectLinkCert(id, result.certSha256)
         this.directProbes.delete(id)
