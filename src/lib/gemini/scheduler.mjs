@@ -233,12 +233,38 @@ export function createGeminiScheduler({
 
   return {
     async catalog() {
-      const view = await callHost('list', {})
+      let view = await callHost('list', {})
       if (!Array.isArray(view?.environments)) throw fail(502, 'gemini_host_protocol_error')
       if (view.payload_state !== 'installed') return { models: [], accounts: [] }
+      const payloadMode = view.payload_mode === 'crag_subscription' ? 'crag_subscription' : 'legacy_release'
+      if (payloadMode === 'crag_subscription' && cragSubscription?.reconcileEnvironmentSeats) {
+        const needSeat = view.environments.filter(
+          (environment) =>
+            environment?.auth_state === 'authorized' &&
+            environment.oauth_imported !== true &&
+            environment.auth_method !== 'api_key' &&
+            !view.oauth_runtime_issue &&
+            typeof environment.id === 'string' &&
+            ID.test(environment.id) &&
+            environment.models_discovered === true &&
+            Array.isArray(environment.models) &&
+            environment.models.length > 0 &&
+            environment.crag_license?.valid !== true &&
+            (!environment.crag_license?.code || environment.crag_license.code === 'license_required'),
+        )
+        if (needSeat.length) {
+          const reconciled = await cragSubscription
+            .reconcileEnvironmentSeats(needSeat, { payloadMode })
+            .catch(() => ({ boundIds: [] }))
+          if (reconciled.boundIds?.length) {
+            view = await callHost('list', {})
+            if (!Array.isArray(view?.environments)) throw fail(502, 'gemini_host_protocol_error')
+            if (view.payload_state !== 'installed') return { models: [], accounts: [] }
+          }
+        }
+      }
       const accounts = []
       const unlicensedAccounts = []
-      const payloadMode = view.payload_mode === 'crag_subscription' ? 'crag_subscription' : 'legacy_release'
       for (const environment of view.environments) {
         if (
           environment?.auth_state !== 'authorized' ||

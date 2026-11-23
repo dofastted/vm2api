@@ -58,6 +58,18 @@ export const vmTimeoutTracker = {
     this.trips.set(vmId, recent)
     return recent.length
   },
+  /**
+   * Trips still inside the window. Prunes the aged-out ones so they cannot be
+   * counted later: only recordTrip writes the filtered list back, and it is not
+   * called while the circuit is already open.
+   */
+  tripCount(vmId, now = Date.now()) {
+    if (!vmId) return 0
+    const recent = (this.trips.get(vmId) || []).filter((at) => now - at < TIMEOUT_TRIP_WINDOW_MS)
+    if (recent.length) this.trips.set(vmId, recent)
+    else this.trips.delete(vmId)
+    return recent.length
+  },
   /** Until when a healthy kernel must not clear this VM's timeout fault (0 = no hold). */
   faultHoldUntil(vmId, now = Date.now()) {
     const recent = (this.trips.get(vmId) || []).filter((at) => now - at < TIMEOUT_TRIP_WINDOW_MS)
@@ -694,9 +706,7 @@ export class FailoverRunner {
           const tripped = vmTimeoutTracker.recordTimeout(vmId, 3)
           if (tripped) {
             // In-flight hangs that land after the circuit opened are the same incident.
-            const trips = kernelFaults.has(vmId)
-              ? (vmTimeoutTracker.trips.get(vmId) || []).length
-              : vmTimeoutTracker.recordTrip(vmId)
+            const trips = kernelFaults.has(vmId) ? vmTimeoutTracker.tripCount(vmId) : vmTimeoutTracker.recordTrip(vmId)
             const holdUntil = vmTimeoutTracker.faultHoldUntil(vmId)
             const fault = `${TIMEOUT_FAULT_PREFIX} VM ${vmId} had 3 consecutive silent inference timeouts`
             const hold = holdUntil ? `, trip ${trips} in 2h, held until ${new Date(holdUntil).toISOString()}` : ''

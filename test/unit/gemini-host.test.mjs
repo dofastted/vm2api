@@ -20,6 +20,7 @@ import {
   isGeminiPublicPath,
   isGeminiSharedPath,
   officialGeminiAuthUrl,
+  warmGeminiEnvironments,
 } from '../../src/lib/gemini/routes.mjs'
 
 const root = '/api/panel/gemini'
@@ -301,6 +302,13 @@ test('Gemini inventory hides evidence after same-ID endpoint or credential edits
 
 test('Gemini host inference evidence follows admitted runs and their bindings', { timeout: 15_000 }, () => {
   execFileSync('python3', ['-B', fileURLToPath(new URL('./gemini-host-evidence.py', import.meta.url))], {
+    stdio: 'pipe',
+    timeout: 12_000,
+  })
+})
+
+test('Gemini host auto-provisions models, plan, onboarding, and token refresh', { timeout: 15_000 }, () => {
+  execFileSync('python3', ['-B', fileURLToPath(new URL('./gemini-account-and-auto-provision.py', import.meta.url))], {
     stdio: 'pipe',
     timeout: 12_000,
   })
@@ -1515,4 +1523,63 @@ test('Gemini scheduler allows 10 concurrent slots on acc1 with strict per-accoun
   const results = await Promise.all(tasks)
   assert.equal(results.length, 10)
   assert.equal(pool.inflight.size, 0)
+})
+
+test('warmGeminiEnvironments proactively warms authorized licensed OAuth envs and skips ineligible ones', async () => {
+  const warmedCalls = []
+  const envReady = {
+    id: 'gemini-aaaaaaaaaaaaaaaaaaaaaaaa',
+    proxy_id: 'px-1',
+    auth_method: 'oauth',
+    auth_state: 'authorized',
+    runtime_ready: true,
+    crag_license: { valid: true },
+  }
+  const envCold = {
+    id: 'gemini-bbbbbbbbbbbbbbbbbbbbbbbb',
+    proxy_id: 'px-1',
+    auth_method: 'oauth',
+    auth_state: 'authorized',
+    runtime_ready: false,
+    crag_license: { valid: true },
+  }
+  const envUnlicensed = {
+    id: 'gemini-cccccccccccccccccccccccc',
+    proxy_id: 'px-1',
+    auth_method: 'oauth',
+    auth_state: 'authorized',
+    runtime_ready: false,
+    crag_license: { valid: false },
+  }
+  const envApiKey = {
+    id: 'gemini-dddddddddddddddddddddddd',
+    proxy_id: 'px-1',
+    auth_method: 'api_key',
+    auth_state: 'authorized',
+    runtime_ready: false,
+  }
+  const report = await warmGeminiEnvironments({
+    proxyPool: () => ({
+      snapshot: () => ({ proxies: [{ id: 'px-1', enabled: true, status: 'ok', owner_user_id: null }] }),
+      getProxyByIdWithAuth: (id) => (id === 'px-1' ? { url: proxyUrl } : null),
+    }),
+    callHost: async (op, payload) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          payload_mode: 'crag_subscription',
+          environments: [envReady, envCold, envUnlicensed, envApiKey],
+        }
+      }
+      warmedCalls.push([op, payload])
+      return { warmed: false, runtime_ready: false, warming: true }
+    },
+  })
+  assert.deepEqual(report, { warmed: 1, warming: 1, skipped: 2 })
+  assert.equal(warmedCalls.length, 1)
+  assert.equal(warmedCalls[0][0], 'warm')
+  assert.equal(warmedCalls[0][1].id, envCold.id)
+  assert.equal(warmedCalls[0][1].proxy_id, 'px-1')
+  assert.equal(warmedCalls[0][1].proxy_url, proxyUrl)
+  assert.equal(warmedCalls[0][1].proxy_sha256, createHash('sha256').update(proxyUrl).digest('hex'))
 })

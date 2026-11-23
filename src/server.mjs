@@ -23,6 +23,7 @@ import {
   callGeminiHost,
   isGeminiPublicPath,
   isGeminiSharedPath,
+  warmGeminiEnvironments,
 } from './lib/gemini/routes.mjs'
 import {
   extractApiKey,
@@ -1722,6 +1723,28 @@ server.listen(cfg.port, cfg.host, () => {
     }
     void resume()
     const timer = setInterval(resume, 15_000)
+    timer.unref()
+    server.once('close', () => clearInterval(timer))
+  }
+  // Keep authorized CRAGGemini native kernels & resident agy slots warm across restarts.
+  if (process.env.KIN_CRS_MOCK !== '1') {
+    let warmingGemini = false
+    const warmGemini = async () => {
+      if (warmingGemini) return
+      warmingGemini = true
+      try {
+        await warmGeminiEnvironments({
+          callHost: callGeminiHost,
+          proxyPool: () => proxyPool,
+        })
+      } catch {
+        // Host daemon may be absent on non-Gemini installs; stay silent.
+      } finally {
+        warmingGemini = false
+      }
+    }
+    void warmGemini()
+    const timer = setInterval(warmGemini, 30_000)
     timer.unref()
     server.once('close', () => clearInterval(timer))
   }

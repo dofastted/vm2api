@@ -592,6 +592,73 @@ export const callGeminiHostStream = (operation, payload, options) =>
     options,
   )
 
+/**
+ * Proactively warm resident CRAGGemini kernels (`craggemini` + `agy` min_warm_slots=1)
+ * for all authorized, licensed OAuth environments so inference starts hot and recovers
+ * automatically after control-plane or gemini-host restarts.
+ */
+export async function warmGeminiEnvironments({
+  callHost = callGeminiHost,
+  proxyPool,
+  environmentIds = null,
+} = {}) {
+  const report = { warmed: 0, warming: 0, skipped: 0 }
+  let view
+  try {
+    view = await callHost('list', {})
+  } catch {
+    return report
+  }
+  if (!Array.isArray(view?.environments) || view.payload_state !== 'installed' || view.oauth_runtime_issue) {
+    return report
+  }
+  const cragMode = view.payload_mode === 'crag_subscription'
+  const filter = Array.isArray(environmentIds) && environmentIds.length ? new Set(environmentIds) : null
+  const pool = typeof proxyPool === 'function' ? proxyPool() : proxyPool
+  if (!pool) return report
+  for (const env of view.environments) {
+    if (
+      !env ||
+      typeof env.id !== 'string' ||
+      !ID.test(env.id) ||
+      (filter && !filter.has(env.id)) ||
+      env.auth_method === 'api_key' ||
+      env.oauth_imported === true ||
+      env.auth_state !== 'authorized' ||
+      (cragMode && env.crag_license?.valid !== true)
+    ) {
+      report.skipped += 1
+      continue
+    }
+    if (env.runtime_ready === true) {
+      report.warmed += 1
+      continue
+    }
+    let proxyUrl
+    try {
+      proxyUrl = proxyFor(pool, env.proxy_id)
+    } catch {
+      report.skipped += 1
+      continue
+    }
+    const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
+    try {
+      const res = await callHost('warm', {
+        id: env.id,
+        proxy_id: env.proxy_id,
+        proxy_url: proxyUrl,
+        proxy_sha256: proxySha256,
+      })
+      if (res?.runtime_ready === true || res?.warmed === true) report.warmed += 1
+      else if (res?.warming === true) report.warming += 1
+      else report.skipped += 1
+    } catch {
+      report.skipped += 1
+    }
+  }
+  return report
+}
+
 export function createGeminiTerminal({ proxyPool, callHost = callGeminiHost }) {
   return createGeminiTerminalBridge({
     callHost,
@@ -659,8 +726,17 @@ export function createGeminiPanelHandler({
         return ok(await cragSubscription.upgrade())
       }
       if (req.method === 'GET' && pathname === PANEL_PATH) {
-        const view = await callHost('list', {})
+        let view = await callHost('list', {})
         if (!Array.isArray(view?.environments)) throw hostError(PROTOCOL_ERROR)
+        if (cragSubscription?.reconcileEnvironmentSeats && view.payload_mode === 'crag_subscription') {
+          const reconciled = await cragSubscription
+            .reconcileEnvironmentSeats(view.environments, { payloadMode: view.payload_mode })
+            .catch(() => ({ boundIds: [] }))
+          if (reconciled.boundIds?.length) {
+            view = await callHost('list', {})
+            if (!Array.isArray(view?.environments)) throw hostError(PROTOCOL_ERROR)
+          }
+        }
         const subscription = cragSubscription ? await cragSubscription.status().catch(() => null) : null
         return ok({
           available: true,
@@ -715,21 +791,25 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
         }
         const proxyUrl = proxyFor(proxyPool(), body.proxy_id)
-        return ok(
-          environmentView(
-            await callHost('create', {
-              name,
-              proxy_id: body.proxy_id,
-              proxy_url: proxyUrl,
-              ...(maxConcurrency != null ? { max_concurrency: maxConcurrency } : {}),
-              ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
-              ...(imported != null && {
-                oauth_account: { access_token: imported.access_token, expiry_timestamp: imported.expiry_timestamp },
-              }),
-            }),
-            { proxyPool },
-          ),
-        )
+        let created = await callHost('create', {
+          name,
+          proxy_id: body.proxy_id,
+          proxy_url: proxyUrl,
+          ...(maxConcurrency != null ? { max_concurrency: maxConcurrency } : {}),
+          ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
+          ...(imported != null && {
+            oauth_account: { access_token: imported.access_token, expiry_timestamp: imported.expiry_timestamp },
+          }),
+        })
+        if (method === 'oauth' && cragSubscription?.ensureEnvironmentSeat) {
+          const seat = await cragSubscription
+            .ensureEnvironmentSeat(created.id, { env: created })
+            .catch(() => ({ bound: false }))
+          if (seat.bound) {
+            created = await callHost('get', { id: created.id })
+          }
+        }
+        return ok(environmentView(created, { proxyPool }))
       }
       const match =
         /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|concurrency|disable|refresh|terminal-ticket|proxy\/probe|proxy|models|test-chat|crag-license(?:\/(?:bind|activate|release))?)(?:\/([^/]+))?)?$/.exec(
@@ -795,7 +875,15 @@ export function createGeminiPanelHandler({
       }
       if (req.method === 'POST' && action === 'models') {
         const environment = await readEnvironment(callHost, id)
-        const result = await callHost('models', { id, ...boundProxy(proxyPool, environment) })
+        let result = await callHost('models', { id, ...boundProxy(proxyPool, environment) })
+        if (environment.auth_method === 'oauth' && cragSubscription?.ensureEnvironmentSeat) {
+          const seat = await cragSubscription
+            .ensureEnvironmentSeat(id, { env: result })
+            .catch(() => ({ bound: false }))
+          if (seat.bound) {
+            result = await callHost('get', { id })
+          }
+        }
         const view = environmentView(result, { id, proxyId: environment.proxy_id, proxyPool })
         if (!view.models.length) throw hostError('gemini_models_empty')
         return ok(view)
@@ -831,11 +919,16 @@ export function createGeminiPanelHandler({
       if (req.method === 'POST' && action === 'refresh') {
         const environment = environmentView(await callHost('get', { id }))
         const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
-        return ok(
-          environmentView(await callHost('refresh', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl }), {
-            proxyPool,
-          }),
-        )
+        let refreshed = await callHost('refresh', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl })
+        if (environment.auth_method === 'oauth' && cragSubscription?.ensureEnvironmentSeat) {
+          const seat = await cragSubscription
+            .ensureEnvironmentSeat(id, { env: refreshed })
+            .catch(() => ({ bound: false }))
+          if (seat.bound) {
+            refreshed = await callHost('get', { id })
+          }
+        }
+        return ok(environmentView(refreshed, { proxyPool }))
       }
       if (action !== 'authorization') return fail(404, 'not_found')
       if (req.method === 'POST') {
@@ -861,19 +954,23 @@ export function createGeminiPanelHandler({
         const environment = environmentView(await callHost('get', { id }))
         const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
         const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
-        return ok(
-          environmentView(
-            await callHost('complete', {
-              id,
-              proxy_id: environment.proxy_id,
-              proxy_url: proxyUrl,
-              proxy_sha256: proxySha256,
-              attempt_id: body.attempt_id,
-              ...authorization,
-            }),
-            { proxyPool },
-          ),
-        )
+        let completed = await callHost('complete', {
+          id,
+          proxy_id: environment.proxy_id,
+          proxy_url: proxyUrl,
+          proxy_sha256: proxySha256,
+          attempt_id: body.attempt_id,
+          ...authorization,
+        })
+        if (cragSubscription?.ensureEnvironmentSeat) {
+          const seat = await cragSubscription
+            .ensureEnvironmentSeat(id, { env: completed })
+            .catch(() => ({ bound: false }))
+          if (seat.bound) {
+            completed = await callHost('get', { id })
+          }
+        }
+        return ok(environmentView(completed, { proxyPool }))
       }
       return fail(404, 'not_found')
     } catch (error) {
