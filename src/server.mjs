@@ -1210,9 +1210,13 @@ const handleCragShop = createCragShopHandler({
   activationEnabled: cragShopActivationEnabled,
 })
 
+// Runtime CRAGGemini trust root: uses KIN_GEMINI_PUBLIC_KEY_FILE when configured for
+// authority rotation, otherwise verifies against the SHA-256 pin in deploy/payload.json
+// (never self-attesting from share/gemini/current).
 const geminiCragSubscription = createGeminiCragSubscription({
   projectRoot: cfg.paths.project,
   dataDir: cfg.paths.data,
+  publicKeyFile: process.env.KIN_GEMINI_PUBLIC_KEY_FILE || null,
   callHost: callGeminiHost,
 })
 const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })

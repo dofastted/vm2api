@@ -9,6 +9,7 @@ import {
   CRAG_GEMINI_PRODUCT,
   installGeminiPayload,
   readCragGeminiPackageAuthority,
+  readPinnedCragGeminiPublicKeySha256,
   verifyCragGeminiPayload,
   verifyGeminiPayload,
 } from '../../src/lib/gemini/payload.mjs'
@@ -209,6 +210,162 @@ test('CRAG encrypted craggemini payload verification rejects tampering, wrong is
   })
 })
 
+test('readCragGeminiPackageAuthority enforces independent trust root and rejects symlinks', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-trust-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const wrongAuthority = makeAuthority()
+  const { dir } = seedCragGeminiPayloadDir(path.join(root, 'pkg'), authority, { agyDigestOverride: AGY_SHA256 })
+  const pinnedSha = sha256(Buffer.from(authority.publicPem))
+
+  // Never self-attest when neither explicit PEM nor SHA-256 pin is provided.
+  assert.throws(() => readCragGeminiPackageAuthority(dir), { code: 'gemini_payload_invalid_signature' })
+  assert.throws(() => readCragGeminiPackageAuthority(dir, ''), { code: 'gemini_payload_invalid_signature' })
+  assert.throws(() => readCragGeminiPackageAuthority(dir, null, { expectedPublicKeySha256: 'not-hex' }), {
+    code: 'gemini_payload_invalid_signature',
+  })
+
+  // Valid SHA-256 pin verifies manifest and returns package authority.
+  const pinned = readCragGeminiPackageAuthority(dir, null, { expectedPublicKeySha256: pinnedSha })
+  assert.equal(pinned.issuerId, authority.issuerId)
+  assert.equal(pinned.payloadKeyId, authority.payloadKeyId)
+  assert.equal(pinned.product, CRAG_GEMINI_PRODUCT)
+
+  // Mismatched SHA-256 pin rejected.
+  assert.throws(
+    () => readCragGeminiPackageAuthority(dir, null, { expectedPublicKeySha256: sha256(wrongAuthority.publicPem) }),
+    { code: 'gemini_payload_invalid_signature' },
+  )
+
+  // Tampered bundled PEM rejected even when expectedPublicKeyPem is supplied.
+  const swappedDir = seedCragGeminiPayloadDir(path.join(root, 'swapped-pem'), authority, {
+    agyDigestOverride: AGY_SHA256,
+  }).dir
+  fs.writeFileSync(path.join(swappedDir, 'crag-license-public.pem'), wrongAuthority.publicPem)
+  assert.throws(() => readCragGeminiPackageAuthority(swappedDir, authority.publicPem), {
+    code: 'gemini_payload_invalid_signature',
+  })
+
+  // deploy/payload.json pin extraction succeeds on valid pin and returns null otherwise.
+  const proj = path.join(root, 'proj')
+  fs.mkdirSync(path.join(proj, 'deploy'), { recursive: true })
+  assert.equal(readPinnedCragGeminiPublicKeySha256(proj), null)
+  fs.writeFileSync(
+    path.join(proj, 'deploy', 'payload.json'),
+    JSON.stringify({
+      geminiDefaultLinuxAmd64: {
+        assets: { 'crag-license-public.pem': { sha256: pinnedSha } },
+      },
+    }),
+  )
+  assert.equal(readPinnedCragGeminiPublicKeySha256(proj), pinnedSha)
+
+  // Symlinked manifest.json or crag-license-public.pem must be rejected via O_NOFOLLOW.
+  if (process.platform !== 'win32') {
+    const symManifest = seedCragGeminiPayloadDir(path.join(root, 'sym-manifest'), authority, {
+      agyDigestOverride: AGY_SHA256,
+    }).dir
+    const externalManifest = path.join(root, 'external-manifest.json')
+    fs.renameSync(path.join(symManifest, 'manifest.json'), externalManifest)
+    fs.symlinkSync(externalManifest, path.join(symManifest, 'manifest.json'))
+    assert.throws(() => readCragGeminiPackageAuthority(symManifest, authority.publicPem))
+
+    const symPem = seedCragGeminiPayloadDir(path.join(root, 'sym-pem'), authority, {
+      agyDigestOverride: AGY_SHA256,
+    }).dir
+    const externalPem = path.join(root, 'external-public.pem')
+    fs.renameSync(path.join(symPem, 'crag-license-public.pem'), externalPem)
+    fs.symlinkSync(externalPem, path.join(symPem, 'crag-license-public.pem'))
+    assert.throws(() => readCragGeminiPackageAuthority(symPem, null, { expectedPublicKeySha256: pinnedSha }))
+  }
+})
+
+test('createGeminiCragSubscription resolves trust root from deploy/payload.json or publicKeyFile and fails closed', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-root-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const wrongAuthority = makeAuthority()
+  const pinnedSha = sha256(Buffer.from(authority.publicPem))
+
+  const proj = path.join(root, 'proj')
+  const currentDir = path.join(proj, 'share', 'gemini', 'current')
+  const { dir: seeded } = seedCragGeminiPayloadDir(path.join(root, 'seed'), authority, {
+    agyDigestOverride: AGY_SHA256,
+  })
+  fs.mkdirSync(path.dirname(currentDir), { recursive: true })
+  fs.cpSync(seeded, currentDir, { recursive: true })
+  fs.mkdirSync(path.join(proj, 'deploy'), { recursive: true })
+  const payloadJsonPath = path.join(proj, 'deploy', 'payload.json')
+  const machineIdPath = path.join(root, 'machine-id')
+  fs.writeFileSync(machineIdPath, 'fedcba9876543210fedcba9876543210\n')
+  const callHost = async () => ({})
+
+  // Without deploy/payload.json pin or publicKeyFile, runtime fails closed (no self-attestation).
+  const unpinned = createGeminiCragSubscription({
+    projectRoot: proj,
+    dataDir: path.join(root, 'data-unpinned'),
+    callHost,
+    origin: 'http://127.0.0.1:18790',
+    machineIdFile: machineIdPath,
+  })
+  assert.equal((await unpinned.status()).configured, false)
+
+  // With valid deploy/payload.json SHA-256 pin, runtime resolves package authority.
+  fs.writeFileSync(
+    payloadJsonPath,
+    JSON.stringify({
+      geminiDefaultLinuxAmd64: { assets: { 'crag-license-public.pem': { sha256: pinnedSha } } },
+    }),
+  )
+  const pinnedStatus = await unpinned.status()
+  assert.equal(pinnedStatus.configured, true)
+  assert.equal(pinnedStatus.issuer_public_key_id, authority.issuerId)
+  assert.equal(pinnedStatus.payload_key_id, authority.payloadKeyId)
+
+  // Mismatched deploy/payload.json pin fails closed.
+  fs.writeFileSync(
+    payloadJsonPath,
+    JSON.stringify({
+      geminiDefaultLinuxAmd64: {
+        assets: { 'crag-license-public.pem': { sha256: sha256(Buffer.from(wrongAuthority.publicPem)) } },
+      },
+    }),
+  )
+  assert.equal((await unpinned.status()).configured, false)
+
+  // Operator-rotated publicKeyFile overrides deploy/payload.json pin cleanly.
+  const rotatedKeyFile = path.join(root, 'rotated-public.pem')
+  fs.writeFileSync(rotatedKeyFile, authority.publicPem)
+  const rotated = createGeminiCragSubscription({
+    projectRoot: proj,
+    dataDir: path.join(root, 'data-rotated'),
+    publicKeyFile: rotatedKeyFile,
+    callHost,
+    origin: 'http://127.0.0.1:18790',
+    machineIdFile: machineIdPath,
+  })
+  const rotatedStatus = await rotated.status()
+  assert.equal(rotatedStatus.configured, true)
+  assert.equal(rotatedStatus.issuer_public_key_id, authority.issuerId)
+
+  // Explicitly configured missing publicKeyFile fails closed (does not fall back to deploy/payload.json).
+  fs.writeFileSync(
+    payloadJsonPath,
+    JSON.stringify({
+      geminiDefaultLinuxAmd64: { assets: { 'crag-license-public.pem': { sha256: pinnedSha } } },
+    }),
+  )
+  const missingKeySub = createGeminiCragSubscription({
+    projectRoot: proj,
+    dataDir: path.join(root, 'data-missing'),
+    publicKeyFile: path.join(root, 'does-not-exist.pem'),
+    callHost,
+    origin: 'http://127.0.0.1:18790',
+    machineIdFile: machineIdPath,
+  })
+  assert.equal((await missingKeySub.status()).configured, false)
+})
+
 test('verifyCragGeminiHostEntitlement & verifyCragGeminiSlotPermit enforce CRAGH1/CRAGH2/CRAGH3 and product isolation', () => {
   const authority = makeAuthority()
   const hostId = 'a1'.repeat(32)
@@ -299,6 +456,34 @@ test('verifyCragGeminiHostEntitlement & verifyCragGeminiSlotPermit enforce CRAGH
       verifyCragGeminiSlotPermit(permit.code, h3Claims, authority.publicKey, { expectedVmId: vmId, now: now + 1500 }),
     {
       code: 'license_binding_mismatch',
+    },
+  )
+
+  // Malformed base64url tokens fail with license_invalid (403), never raw TypeError.
+  assert.throws(() => parseCragGeminiMachineCode('CRAGM1.not!valid+base64'), {
+    code: 'license_invalid',
+    status: 403,
+  })
+  assert.throws(() => verifyCragGeminiHostEntitlement('CRAGH1.bad+payload.bad+sig', hostId, authority.publicKey), {
+    code: 'license_invalid',
+    status: 403,
+  })
+
+  // CRAGH3 with expires_at <= issued_at must be rejected as license_invalid.
+  const h3InvalidWindow = signToken(authority, 'CRAGH3', {
+    version: 3,
+    product: CRAG_GEMINI_PRODUCT,
+    host_id: hostId,
+    revision: 5,
+    issued_at: now,
+    expires_at: now,
+    grants: [{ slots: 1, expires_at: now }],
+  })
+  assert.throws(
+    () => verifyCragGeminiHostEntitlement(h3InvalidWindow, hostId, authority.publicKey, { now, allowExpired: true }),
+    {
+      code: 'license_invalid',
+      status: 403,
     },
   )
 })
