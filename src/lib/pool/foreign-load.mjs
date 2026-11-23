@@ -148,15 +148,40 @@ export function startLoadWriter({ file, read, intervalMs = 1000, heartbeatMs = 5
   }
 }
 
-/** Leader side: fold the peer's file in; a stale or missing file counts as no load. */
-export function startLoadReader({ file, foreign, intervalMs = 1000, staleMs = 15000 } = {}) {
+/**
+ * Leader side: fold the peer's file in; a stale or missing file counts as no load.
+ *
+ * onGone fires once when the peer has evidently exited, so the overlap ends even if the deploy script
+ * never sends SIGHUP: the file was removed (a clean exit removes it after the drain), it has not been
+ * refreshed for goneMs (crash, kill), or it never appeared within goneMs of activation.
+ */
+export function startLoadReader({ file, foreign, intervalMs = 1000, staleMs = 15000, goneMs = 60000, onGone = null } = {}) {
+  const started = Date.now()
+  let seen = false
+  let lastFresh = 0
+  let gone = false
   const tick = () => {
+    const now = Date.now()
     let load = null
+    let missing = false
     try {
       const doc = JSON.parse(fs.readFileSync(file, 'utf8'))
-      if (Date.now() - Number(doc.at) <= staleMs) load = doc.load
-    } catch {}
+      if (now - Number(doc.at) <= staleMs) {
+        load = doc.load
+        seen = true
+        lastFresh = now
+      }
+    } catch (e) {
+      missing = e?.code === 'ENOENT'
+    }
     foreign.apply(load)
+    if (gone || !onGone) return
+    const peerGone = seen ? missing || now - lastFresh > goneMs : now - started > goneMs
+    if (!peerGone) return
+    gone = true
+    try {
+      onGone()
+    } catch {}
   }
   tick()
   const timer = setInterval(tick, intervalMs)

@@ -557,8 +557,8 @@ export class ClusterManager {
   }
 
   /** Re-check every connected node's gate (after a deploy refreshed bin/kin-slot-gate). */
-  async refreshGates() {
-    for (const id of [...this.links.keys()]) await this._ensureGate(id).catch(() => {})
+  async refreshGates({ skip = null } = {}) {
+    for (const id of [...this.links.keys()]) if (!skip?.has(id)) await this._ensureGate(id).catch(() => {})
   }
 
   async _ensureGate(id, { strict = false } = {}) {

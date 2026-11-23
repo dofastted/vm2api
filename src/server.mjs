@@ -207,6 +207,7 @@ const inheritedLockFd = process.env.VM2API_BOOTSTRAP_LOCK_FD
 const STANDBY =
   process.env.KIN_STANDBY === '1' &&
   !(process.env.KIN_STANDBY_ACTIVE_FILE && fs.existsSync(process.env.KIN_STANDBY_ACTIVE_FILE))
+const BLUEGREEN = process.env.KIN_STANDBY === '1'
 const standbyTasks = []
 let standbyActive = !STANDBY
 if (STANDBY) setHandoverRole('standby')
@@ -237,6 +238,11 @@ async function activateStandby(reason = 'signal') {
     foreignLoadReader = startLoadReader({
       file: foreignLoadPath(dataDir),
       foreign: createForeignLoad({ scheduler: poolScheduler, accountQuota }),
+      // Ends the overlap on its own if the deploy script never sends SIGHUP (watcher killed, host reboot).
+      onGone: () => {
+        console.log(JSON.stringify({ event: 'handover-peer-gone' }))
+        void runExclusivePass()
+      },
     })
   } catch (e) {
     console.warn('[handover] foreign load reader failed', e?.message || e)
@@ -1487,6 +1493,11 @@ function stopLeaderJobs() {
 // Blue/green step 2 (SIGUSR1): stop every leader job and hand the data-dir lock to the standby.
 // The listener stays open, so requests arriving before haproxy switches over are still served.
 async function handoverLeadership() {
+  // Only a blue/green controller has a successor; a plain one would stop its jobs and drop the lock for nobody.
+  if (!BLUEGREEN) {
+    console.warn('[handover] SIGUSR1 ignored: not started as a blue/green controller (KIN_STANDBY=1)')
+    return false
+  }
   if (handoverRole() !== 'leader' || !standbyActive) return false
   stopLeaderJobs()
   setHandoverRole('draining')
@@ -1869,12 +1880,15 @@ function runExclusivePass() {
     const keys = deferredKeys()
     foreignLoadReader?.stop()
     foreignLoadReader = null
-    const synced = spawnSync('/usr/local/bin/vm2api-entrypoint', ['sync'], { encoding: 'utf8', timeout: 120_000 })
+    // Async: copying a new image's binaries can take a while and must not hold the event loop.
+    const synced = await runCapture('/usr/local/bin/vm2api-entrypoint', ['sync'], { timeoutMs: 120_000 })
     const wrapChanged = /WRAP_CHANGED=1/.test(synced.stdout || '')
     if (synced.status !== 0) console.error(`[handover] shared sync failed: ${(synced.stderr || '').trim().slice(-300)}`)
     refreshGuestBin()
     const done = await markExclusive()
-    if (process.env.KIN_CRS_MOCK !== '1') await clusterManager.refreshGates().catch(() => {})
+    // Gates whose recreate was deferred were just ensured by markExclusive; re-check only the others.
+    const gatesDone = new Set(done.filter((k) => k.startsWith('gate:')).map((k) => k.slice(5)))
+    if (process.env.KIN_CRS_MOCK !== '1') await clusterManager.refreshGates({ skip: gatesDone }).catch(() => {})
     if (wrapChanged && process.env.KIN_AUTO_SYNC_WRAP === '1') {
       const summary = await syncInstalledKernels({
         project: cfg.paths.project,
@@ -1889,6 +1903,29 @@ function runExclusivePass() {
   return exclusivePass
 }
 process.on('SIGHUP', () => void runExclusivePass())
+function runCapture(cmd, args, { timeoutMs }) {
+  return new Promise((resolve) => {
+    let child
+    try {
+      child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    } catch (e) {
+      return resolve({ status: null, stdout: '', stderr: e?.message || String(e) })
+    }
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (d) => (stdout += d))
+    child.stderr.on('data', (d) => (stderr += d))
+    const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs)
+    child.on('error', (e) => {
+      clearTimeout(timer)
+      resolve({ status: null, stdout, stderr: stderr + (e?.message || '') })
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      resolve({ status: code, stdout, stderr })
+    })
+  })
+}
 
 if (process.env.KIN_CRS_MOCK !== '1') {
   runAtActivation('restart-policies', () => syncLocalSlotRestartPolicies(listVms(cfg.paths.project), { routing: routingConfig }))

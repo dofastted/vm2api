@@ -164,6 +164,44 @@ test('load file round trip; a stale file counts as no load', async () => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('reader reports the peer gone once: file removed, heartbeat lost, or never written', async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-gone-'))
+  const file = path.join(dir, 'run', 'handover-load.json')
+  const opts = { foreign: createForeignLoad({ scheduler: fakeScheduler() }), intervalMs: 20, staleMs: 100, goneMs: 300 }
+  // Clean exit: the writer removes its file.
+  let gone = 0
+  const writer = startLoadWriter({ file, read: () => ({}), intervalMs: 20 })
+  const r1 = startLoadReader({ ...opts, file, onGone: () => gone++ })
+  await sleep(100)
+  assert.equal(gone, 0)
+  writer.stop()
+  await sleep(100)
+  assert.equal(gone, 1)
+  await sleep(100)
+  assert.equal(gone, 1)
+  r1.stop()
+  // Crash: the file stays but stops being refreshed.
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, JSON.stringify({ at: Date.now(), load: {} }))
+  let gone2 = 0
+  const r2 = startLoadReader({ ...opts, file, onGone: () => gone2++ })
+  await sleep(200)
+  assert.equal(gone2, 0)
+  await sleep(300)
+  assert.equal(gone2, 1)
+  r2.stop()
+  // Never written at all.
+  let gone3 = 0
+  const r3 = startLoadReader({ ...opts, file: path.join(dir, 'none.json'), onGone: () => gone3++ })
+  await sleep(150)
+  assert.equal(gone3, 0)
+  await sleep(300)
+  assert.equal(gone3, 1)
+  r3.stop()
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 import { ClusterManager } from '../../src/lib/cluster/cluster-manager.mjs'
 
 test('standby pre-dials node links and activation adopts them instead of dialling again', async () => {
