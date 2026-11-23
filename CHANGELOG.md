@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.187 — 2026-11-24 · 修复 CRAGGemini 加密 memfd 守卫派生与池就绪度误报（0.4.2）；存量 OAuth 自动补全模型与套餐
+
+- 升级锁定 `deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 至 [`payload-2026.11.23-gemini-0.4.2`](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.23-gemini-0.4.2)（`craggemini 0.4.2`，Debian 12 构建，最高符号要求 `GLIBC_2.34`）：修复加密启动器经 `memfd` 执行 `craggemini-core` 后 `current_exe()` 指向已删除内存描述符导致 `--internal-execution-guard` 派生失败（`slot_guard_error`）并阻断所有 `agy` 槽位拉起的问题；`craggemini` 引导器改为直接执行 `--internal-execution-guard` 并透传 `CRAGGEMINI_BOOTSTRAP_BIN`；修正 `pool.ready` 在 `min_warm_slots > 0` 且无活跃/空闲 `agy` 槽位时不再误报 `ready: true`，并在 `/internal/health` 暴露 `last_replenish_error`。
+- 修复存量已授权 OAuth 环境停留在「尚未拉取模型，不能调度」与缺失套餐信息的问题：`scripts/gemini-host.py` 的 `warm` 流程为缺少模型或套餐的已授权 OAuth 环境自动调度后台 `_post_auth_provision`（带冷却限流）；`src/lib/gemini/routes.mjs` 的 `warmGeminiEnvironments` 在 `models_discovered !== true` 时不再提前跳过预热。
+- 部署说明：本版涉及控制面、CRAGGemini 宿主脚本与 `geminiDefaultLinuxAmd64`（`0.4.2`）加密载荷，并在宿主机提供 `/usr/local/bin/agy` 符号链接；Claude/Codex 槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。
+
 ## 1.4.186 — 2026-11-23 · 宿主身份改以采样设备为唯一真值，修复克隆镜像 host_id 相撞导致的永久 403
 
 - 修复从同一云镜像克隆的宿主互撞 `host_id` 后、后注册者永久 403 的缺陷：云镜像普遍不重置 `/etc/machine-id`，由它派生的 `host_id` 在多台实例上相同，而 `deviceIdentity()` 原先原样返回已存储的 `host_id`，使相撞的值被钉在宿主自己的文件里、升级也不会自愈。现在采样到的设备是唯一真值，`credential()` 在存储值与派生值不符时整套退役旧身份——`host_id`、`credential`、`device_uuid`、`entitlement.code` 与 `redeem.json` 一并移为 `*.legacy`，避免新身份继承旧权益或半完成的兑换，且退役值不再参与任何鉴权（#1664）。

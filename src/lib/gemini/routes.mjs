@@ -630,7 +630,7 @@ export async function warmGeminiEnvironments({
       report.skipped += 1
       continue
     }
-    if (env.runtime_ready === true) {
+    if (env.runtime_ready === true && env.models_discovered === true) {
       report.warmed += 1
       continue
     }

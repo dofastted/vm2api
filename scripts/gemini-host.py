@@ -2514,9 +2514,71 @@ class Host:
             with self.lock:
                 getattr(self, "_warming", set()).discard(identifier)
 
+    def _schedule_provision_locked(self, identifier, proxy_url):
+        env = self.environments.get(identifier)
+        if (
+            not env
+            or env.get("auth_method", "oauth") != "oauth"
+            or env.get("oauth_imported")
+            or env.get("auth_state") != "authorized"
+            or not env.get("profile")
+            or self.egress is None
+            or self.oauth_runtime_issue() is not None
+        ):
+            return False
+        has_models = bool(env.get("call_models"))
+        has_plan = isinstance(env.get("account"), dict) and bool(env["account"].get("plan"))
+        if has_models and has_plan:
+            return False
+        provisioning = getattr(self, "_provisioning", None)
+        if provisioning is None:
+            provisioning = set()
+            self._provisioning = provisioning
+        if identifier in provisioning:
+            return False
+        cooldowns = getattr(self, "_provision_next_at", None)
+        if cooldowns is None:
+            cooldowns = {}
+            self._provision_next_at = cooldowns
+        now = time.monotonic()
+        if now < cooldowns.get(identifier, 0.0):
+            return False
+        provisioning.add(identifier)
+        cooldowns[identifier] = now + (300.0 if has_models else 60.0)
+        worker = threading.Thread(
+            target=self._provision_worker,
+            args=(identifier, proxy_url),
+            name=f"gemini-prov-{identifier[-8:]}",
+            daemon=True,
+        )
+        worker.start()
+        return True
+
+    def _provision_worker(self, identifier, proxy_url):
+        try:
+            with self.lock:
+                env = self.environments.get(identifier)
+                if (
+                    not env
+                    or env.get("auth_method", "oauth") != "oauth"
+                    or env.get("oauth_imported")
+                    or env.get("auth_state") != "authorized"
+                    or not env.get("profile")
+                ):
+                    return
+                if env.get("call_models") and isinstance(env.get("account"), dict) and env["account"].get("plan"):
+                    return
+                self._post_auth_provision(env, proxy_url)
+        except BaseException:
+            pass
+        finally:
+            with self.lock:
+                getattr(self, "_provisioning", set()).discard(identifier)
+
     def warm_environment(self, env, proxy_url, model=None):
         identifier = env["id"]
         self._remember_runtime_proxy(env, proxy_url)
+        self._schedule_provision_locked(identifier, proxy_url)
         proxy_hash = hashlib.sha256(proxy_url.encode()).digest()
         existing = self.native_sessions.get(identifier)
         if existing is not None:
@@ -2528,7 +2590,8 @@ class Host:
                 self.stop_native_session(identifier)
                 existing = None
             elif same_binding and existing.is_alive() and not existing.is_severely_unhealthy():
-                return {"warmed": True, "runtime_ready": True, "warming": False}
+                ready = bool(existing.is_ready(timeout=0.5))
+                return {"warmed": ready, "runtime_ready": ready, "warming": not ready}
         scheduled = self._schedule_warm_locked(identifier, model=model, force=True)
         return {
             "warmed": False,
