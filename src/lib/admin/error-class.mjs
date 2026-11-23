@@ -36,6 +36,7 @@ const CODE_MAP = {
   third_party_client: 'request',
   invalid_json: 'request',
   body_too_large: 'request',
+  image_too_large: 'request',
   empty_body: 'request',
   missing_field: 'request',
   invalid_field: 'request',

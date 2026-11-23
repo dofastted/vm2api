@@ -1420,6 +1420,7 @@ export class FailoverRunner {
           [
             'invalid_cache_control',
             'crag_prompt_too_large',
+            'image_too_large',
             'invalid_image_url',
             'invalid_kernel_request',
             'invalid_tool_schema',
