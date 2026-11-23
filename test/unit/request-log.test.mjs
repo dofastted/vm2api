@@ -1403,3 +1403,39 @@ test('repriceRange re-prices image usage from the stored JSON and keeps actual_c
   assert.ok(Math.abs(rows.log_img_only.total_cost - 0.0321) < 1e-9)
   assert.equal(rows.log_img_only.actual_cost, 5)
 })
+
+// #1637 起 /v1beta/models 允许用 ?key= 携带凭据；start() 的 path 兜底必须剥掉查询串，
+// 否则漏传 pathName 的调用点会把真 key 写进 request-logs（redactSecrets 只作用于 body）。
+test('start(): path fallback strips the query string', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    {
+      method: 'POST',
+      headers: {},
+      socket: {},
+      url: '/v1beta/models/gemini-2.5-pro:generateContent?key=AIzaSyTESTKEYVALUE&alt=sse',
+    },
+    { protocol: 'gemini' },
+  )
+  assert.equal(ctx.path, '/v1beta/models/gemini-2.5-pro:generateContent')
+  assert.ok(!ctx.path.includes('AIzaSyTESTKEYVALUE'))
+  assert.ok(!ctx.path.includes('?'))
+})
+
+test('start(): explicit pathName is used verbatim', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {}, url: '/v1/messages?key=leak' },
+    {
+      protocol: 'anthropic.messages',
+      pathName: '/v1/messages',
+    },
+  )
+  assert.equal(ctx.path, '/v1/messages')
+})
+
+test('start(): missing url yields an empty path, not undefined', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { protocol: 'x' })
+  assert.equal(ctx.path, '')
+})
