@@ -1012,10 +1012,21 @@ class Maintenance:
                 options["--public-key"] = str(default / "crag-license-public.pem")
                 options.pop("--default-public-key", None)
                 options.pop("--default-release-verifier", None)
-                options.setdefault(
-                    "--crag-host-dir",
-                    str(self.install / "src/data/crag-gemini-subscription/public"),
+                default_crag_host_dir = (
+                    self.install / "data/crag-gemini-subscription/public"
+                    if (self.install / "data").is_dir()
+                    or not (self.install / "src/data/crag-gemini-subscription").is_dir()
+                    else self.install / "src/data/crag-gemini-subscription/public"
                 )
+                legacy_crag_host_dir = str(
+                    self.install / "src/data/crag-gemini-subscription/public"
+                )
+                if "--crag-host-dir" not in options or (
+                    options["--crag-host-dir"] == legacy_crag_host_dir
+                    and not Path(legacy_crag_host_dir).is_dir()
+                    and (self.install / "data").is_dir()
+                ):
+                    options["--crag-host-dir"] = str(default_crag_host_dir)
             else:
                 options["--default-public-key"] = str(default / "gemini-ed25519.pub")
                 options["--default-release-verifier"] = str(

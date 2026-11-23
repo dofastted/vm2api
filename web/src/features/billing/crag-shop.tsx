@@ -690,7 +690,8 @@ function HostOverview({
             className='text-sm text-muted-foreground'
           >
             每张码从兑换时独立计时，未到期额度相加；不绑定、不启动 VM。 Claude
-            订阅码增加本机槽位；以 CGG1- 开头的码兑换 CRAGGemini，不占用 Claude
+            订阅码增加本机槽位；CRAGGemini 订阅码（CRAGR1.…）请点击右上角「兑换
+            CRAGGemini」兑换，旧版 CGG1- 码也可直接在此兑换，不占用 Claude
             槽位。
           </p>
           <Button type='submit' size='sm' disabled={!code.trim() || !!action}>

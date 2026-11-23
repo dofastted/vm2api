@@ -244,7 +244,13 @@ function redactHeaders(headers = {}) {
   const out = {}
   for (const [k, v] of Object.entries(headers)) {
     const key = String(k).toLowerCase()
-    if (key === 'authorization' || key === 'x-api-key' || key === 'cookie' || key === 'set-cookie') {
+    if (
+      key === 'authorization' ||
+      key === 'x-api-key' ||
+      key === 'x-goog-api-key' ||
+      key === 'cookie' ||
+      key === 'set-cookie'
+    ) {
       out[key] = '***REDACTED***'
     } else if (key === 'x-panel-token') {
       out[key] = '***REDACTED***'

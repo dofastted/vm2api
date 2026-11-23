@@ -181,3 +181,88 @@ test('Gemini API key does not claim to expose Antigravity subscription quota', (
   expect(html).toContain('Gemini API Key 不提供 Antigravity 订阅额度')
   expect(html).not.toContain('已用 0%')
 })
+
+test('CRAGGemini subscription mode renders subscription status and seat bind/release controls', () => {
+  const unboundClient = new QueryClient()
+  unboundClient.setQueryData(['panel', 'me'], { role: 'admin' })
+  unboundClient.setQueryData(['panel', 'gemini-environments'], {
+    available: true,
+    payload_state: 'installed',
+    payload_mode: 'crag_subscription',
+    release_activated: true,
+    crag_subscription: {
+      configured: true,
+      active: true,
+      product: 'craggemini',
+      host_id: 'host-1',
+      sync_pending: false,
+      version: 2,
+      revision: 2,
+      issued_at: 1_800_000_000,
+      expires_at: 1_803_000_000,
+      slot_limit: 2,
+      used_slots: 1,
+      available_slots: 1,
+      reclaim_supported: true,
+    },
+    environments: [
+      {
+        id: 'gemini-unbound',
+        name: '未绑席位',
+        proxy_id: 'px-one',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        runtime_ready: false,
+        billing_ready: false,
+        kernel_version: '0.3.0',
+        models: ['gemini-3-flash'],
+        models_discovered: true,
+        crag_license: {
+          product: 'craggemini',
+          status: 'unlicensed',
+          valid: false,
+          seat_required: true,
+          code: 'license_required',
+        },
+        account: null,
+      },
+      {
+        id: 'gemini-bound',
+        name: '已绑席位',
+        proxy_id: 'px-one',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        runtime_ready: false,
+        billing_ready: false,
+        kernel_version: '0.3.0',
+        models: ['gemini-3-flash'],
+        models_discovered: true,
+        crag_license: {
+          product: 'craggemini',
+          status: 'valid',
+          valid: true,
+          seat_required: true,
+          scope: 'host',
+          seat: 1,
+        },
+        account: null,
+      },
+    ],
+  })
+  const unboundHtml = renderToStaticMarkup(
+    <QueryClientProvider client={unboundClient}>
+      <GeminiEnvironments environmentId='gemini-unbound' />
+    </QueryClientProvider>
+  )
+  expect(unboundHtml).toContain('CRAGGemini 宿主订阅已激活')
+  expect(unboundHtml).toContain('未绑定 CRAGGemini 订阅席位')
+  expect(unboundHtml).toContain('绑定 CRAG 席位')
+
+  const boundHtml = renderToStaticMarkup(
+    <QueryClientProvider client={unboundClient}>
+      <GeminiEnvironments environmentId='gemini-bound' />
+    </QueryClientProvider>
+  )
+  expect(boundHtml).toContain('已绑定席位 #1')
+  expect(boundHtml).toContain('释放 CRAG 席位')
+})

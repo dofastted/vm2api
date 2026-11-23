@@ -20,6 +20,13 @@ export function redactSecrets(obj) {
     .replace(/sk-ant-[a-z0-9-]{8,}/gi, (m) => m.slice(0, 14) + '***REDACTED***')
     .replace(/sk-(?:kin|vm)-[a-f0-9]{8,}/gi, (m) => m.slice(0, 10) + '***REDACTED***')
     .replace(/Bearer\s+[A-Za-z0-9._\-]+/gi, 'Bearer ***REDACTED***')
+    .replace(/([?&]key=)[^&"'\s\\]+/gi, '$1***REDACTED***')
+}
+
+function isGoogleGeminiApiPath(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl.startsWith('/v1beta/models')) return false
+  const pathname = rawUrl.split('?', 1)[0]
+  return pathname === '/v1beta/models' || pathname.startsWith('/v1beta/models/')
 }
 
 export function extractApiKey(req) {
@@ -31,6 +38,18 @@ export function extractApiKey(req) {
     return t
   }
   if (req.headers['x-api-key']) return String(req.headers['x-api-key']).trim()
+  if (req.headers['x-goog-api-key']) {
+    const t = String(req.headers['x-goog-api-key']).trim()
+    if (t.startsWith('kin-panel-')) return ''
+    return t
+  }
+  if (isGoogleGeminiApiPath(req.url)) {
+    try {
+      const q = new URL(req.url, 'http://127.0.0.1').searchParams.get('key')
+      const t = typeof q === 'string' ? q.trim() : ''
+      if (t && !t.startsWith('kin-panel-')) return t
+    } catch {}
+  }
   return ''
 }
 
