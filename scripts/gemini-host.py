@@ -44,6 +44,23 @@ ATTEMPT = re.compile(r"[a-f0-9]{32}\Z")
 TOKEN_NAME = "antigravity-oauth-token"
 ACCESS_TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{1,4096}={0,2}\Z")
 CLI_SETTINGS = {"toolPermission": "strict", "useG1Credits": False}
+NATIVE_CLI_SETTINGS = {
+    "allowNonWorkspaceAccess": True,
+    "useG1Credits": False,
+    "permissions": {
+        "allow": [
+            "read_file(/work/.craggemini-media)",
+            "read_file(/work/.craggemini-media/*)",
+            "read_file(/work/.craggemini-media/**)",
+            "read_file(/tmp/craggemini)",
+            "read_file(/tmp/craggemini/**)",
+        ],
+        "deny": [
+            "write_file(*)",
+            "command(*)",
+        ],
+    },
+}
 CLI_MARKER = b"\x02agy-start\x03"
 DISPLAY_CSI = re.compile(r"\x1b\[[?=>]?[0-9;:]*[A-HJKSTXcdfhlmnrsu]")
 TERMINAL_OAUTH = "gemini_terminal_requires_oauth"
@@ -109,7 +126,7 @@ NATIVE_HEALTH_POLL_INTERVAL = 15.0
 NATIVE_WARM_BACKOFF_MIN = 2.0
 NATIVE_WARM_BACKOFF_MAX = 60.0
 NATIVE_DEFAULT_MODEL = "gemini-3-flash"
-MAX_INFER_BODY = 4 * 1024 * 1024
+MAX_INFER_BODY = 12 * 1024 * 1024
 NATIVE_RUNTIME_ROOT = Path("/run/vm2api-gemini-native")
 FULL_CAPABILITIES = (
     "streaming",
@@ -121,7 +138,16 @@ FULL_CAPABILITIES = (
     "multimodal",
     "full_gemini_api",
 )
-NATIVE_CAPABILITIES = ("streaming", "native_tui")
+NATIVE_CAPABILITIES = (
+    "streaming",
+    "native_tui",
+    "multi_turn",
+    "system_instruction",
+    "tools",
+    "generation_config",
+    "thinking",
+    "multimodal",
+)
 # Fixed categories only: process output and exception details are not inventory data.
 INFERENCE_ERROR_CODES = frozenset(
     {
@@ -923,10 +949,13 @@ class NativeAgy(Agy):
         agy_args = [
             "--mode",
             "plan",
+            "--dangerously-skip-permissions",
+            "--add-dir",
+            "/work",
             "--model",
             self.model,
             "--settings",
-            json.dumps(CLI_SETTINGS, separators=(",", ":")),
+            json.dumps(NATIVE_CLI_SETTINGS, separators=(",", ":")),
             "--log-file",
             "/tmp/craggemini/" + native_module_impl.ELIGIBILITY_LOG_FILE,
         ]
@@ -2802,32 +2831,53 @@ class Host:
         finally:
             staging.unlink(missing_ok=True)
 
-    def _profile_token_state(self, env):
+    def _profile_credential_health(self, env, *, skew_seconds=300):
         profile_name = env.get("profile")
         if not profile_name or env.get("auth_method", "oauth") != "oauth":
-            return False, False
+            return None
         uid = self.uid_base + env["slot"]
         loaded = profile_secrets(
             self.directory / env["id"] / profile_name, uid, include_raw=True
         )
         if not loaded:
-            return False, False
+            return {
+                "present": False,
+                "state": "missing",
+                "has_access": False,
+                "has_refresh": False,
+                "needs_refresh": True,
+                "expires_at": None,
+            }
         try:
             data = json.loads(loaded[1])
         except (ValueError, UnicodeDecodeError):
-            return False, False
-        token = data.get("token") if isinstance(data, dict) else None
+            return {
+                "present": False,
+                "state": "missing",
+                "has_access": False,
+                "has_refresh": False,
+                "needs_refresh": True,
+                "expires_at": None,
+            }
+        token = data.get("token") if isinstance(data, dict) and isinstance(data.get("token"), dict) else data
         if not isinstance(token, dict):
-            return False, False
-        has_refresh = isinstance(token.get("refresh_token"), str) and bool(
-            token.get("refresh_token")
-        )
-        expiry = token.get("expiry")
-        expired = False
-        now_ts = time.time()
-        if isinstance(expiry, (int, float)):
-            expired = expiry <= now_ts + 30
-        elif isinstance(expiry, str) and expiry:
+            return {
+                "present": False,
+                "state": "missing",
+                "has_access": False,
+                "has_refresh": False,
+                "needs_refresh": True,
+                "expires_at": None,
+            }
+        access = token.get("access_token") or token.get("accessToken")
+        refresh = token.get("refresh_token") or token.get("refreshToken")
+        has_access = isinstance(access, str) and bool(access.strip())
+        has_refresh = isinstance(refresh, str) and bool(refresh.strip())
+        expiry = token.get("expiry") or token.get("expires_at") or token.get("expiresAt")
+        expires_at_ts = None
+        if isinstance(expiry, (int, float)) and expiry > 0:
+            expires_at_ts = expiry / 1000.0 if expiry >= 10_000_000_000 else float(expiry)
+        elif isinstance(expiry, str) and expiry.strip():
             normalized = re.sub(r"\.[0-9]+", "", expiry.strip())
             if normalized.endswith("Z"):
                 normalized = normalized[:-1] + "+00:00"
@@ -2835,10 +2885,36 @@ class Host:
                 parsed = datetime.fromisoformat(normalized)
                 if parsed.tzinfo is None:
                     parsed = parsed.replace(tzinfo=timezone.utc)
-                expired = parsed.timestamp() <= now_ts + 30
+                expires_at_ts = parsed.timestamp()
             except ValueError:
-                expired = False
-        return has_refresh, expired
+                expires_at_ts = None
+        now_ts = time.time()
+        if not has_access:
+            state = "refreshable" if has_refresh else "missing"
+            needs_refresh = True
+        elif expires_at_ts is not None and expires_at_ts <= now_ts:
+            state = "expired_refreshable" if has_refresh else "expired"
+            needs_refresh = True
+        elif expires_at_ts is not None and expires_at_ts <= now_ts + skew_seconds:
+            state = "refresh_window"
+            needs_refresh = True
+        else:
+            state = "fresh"
+            needs_refresh = False
+        return {
+            "present": True,
+            "state": state,
+            "has_access": has_access,
+            "has_refresh": has_refresh,
+            "needs_refresh": needs_refresh,
+            "expires_at": int(expires_at_ts * 1000) if expires_at_ts is not None else None,
+        }
+
+    def _profile_token_state(self, env):
+        health = self._profile_credential_health(env, skew_seconds=300)
+        if not health or not health.get("present"):
+            return False, False
+        return bool(health.get("has_refresh")), bool(health.get("needs_refresh"))
 
     def pull_models(self, env, proxy_url, *, allow_reauth_probe=False):
         uid, key, auth = self.operation_account(
@@ -3485,6 +3561,11 @@ class Host:
             if self.payload_mode == "crag_subscription"
             else None
         )
+        credential_state = (
+            self._profile_credential_health(env)
+            if method == "oauth" and not env.get("oauth_imported")
+            else None
+        )
         return {
             "id": env["id"],
             "name": env["name"],
@@ -3500,6 +3581,7 @@ class Host:
             "models": env.get("call_models", account.get("models", [])),
             "models_discovered": bool(env.get("call_models")),
             "account": account,
+            **({"credential_state": credential_state} if credential_state is not None else {}),
             **({"crag_license": crag_license} if crag_license is not None else {}),
             "created_at": env.get("created_at"),
             "updated_at": env.get("updated_at"),
@@ -3955,36 +4037,80 @@ class Host:
     def _extract_native_turn_body(model, body_obj):
         if not isinstance(body_obj, dict):
             return None
-        allowed_top = {"model", "contents", "stream"}
+        allowed_top = {
+            "model",
+            "contents",
+            "stream",
+            "systemInstruction",
+            "system_instruction",
+            "tools",
+            "toolConfig",
+            "tool_config",
+            "generationConfig",
+            "generation_config",
+            "safetySettings",
+            "safety_settings",
+            "conversation_id",
+            "conversationId",
+        }
         if any(k not in allowed_top for k in body_obj):
             return None
         contents = body_obj.get("contents")
-        if not isinstance(contents, list) or len(contents) != 1:
+        if not isinstance(contents, list) or not contents:
             return None
-        entry = contents[0]
-        if not isinstance(entry, dict) or any(k not in ("role", "parts") for k in entry):
-            return None
-        if entry.get("role") not in (None, "user"):
-            return None
-        parts = entry.get("parts")
-        if not isinstance(parts, list) or not parts:
-            return None
-        pieces = []
-        for part in parts:
-            if not isinstance(part, dict) or list(part.keys()) != ["text"] or not isinstance(part.get("text"), str):
-                return None
-            pieces.append(part["text"])
-        text = "".join(pieces)
-        if (
-            not text.strip()
-            or any(word.startswith("/") for word in text.split())
-            or any(ord(ch) < 32 and ch not in ("\n", "\r", "\t") for ch in text)
-        ):
-            return None
-        return {
-            "model": model,
-            "contents": [{"role": "user", "parts": [{"text": text}]}],
+        allowed_part_keys = {
+            "text",
+            "inlineData",
+            "inline_data",
+            "fileData",
+            "file_data",
+            "functionCall",
+            "function_call",
+            "functionResponse",
+            "function_response",
+            "thought",
+            "thoughtSignature",
+            "thought_signature",
         }
+        has_substantive_part = False
+        for entry in contents:
+            if not isinstance(entry, dict) or any(k not in ("role", "parts") for k in entry):
+                return None
+            if entry.get("role") not in (None, "user", "model"):
+                return None
+            parts = entry.get("parts")
+            if not isinstance(parts, list) or not parts:
+                return None
+            for part in parts:
+                if not isinstance(part, dict) or not part or any(k not in allowed_part_keys for k in part):
+                    return None
+                if "text" in part:
+                    text = part["text"]
+                    if not isinstance(text, str):
+                        return None
+                    if any(ord(ch) < 32 and ch not in ("\n", "\r", "\t") for ch in text):
+                        return None
+                    if text.strip():
+                        has_substantive_part = True
+                if any(
+                    k in part
+                    for k in (
+                        "inlineData",
+                        "inline_data",
+                        "fileData",
+                        "file_data",
+                        "functionCall",
+                        "function_call",
+                        "functionResponse",
+                        "function_response",
+                    )
+                ):
+                    has_substantive_part = True
+        if not has_substantive_part:
+            return None
+        forwarded = {k: v for k, v in body_obj.items() if k != "stream"}
+        forwarded["model"] = model
+        return forwarded
 
     @staticmethod
     def _redact_bytes(chunk, secret_values):

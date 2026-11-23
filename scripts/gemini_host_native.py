@@ -15,9 +15,9 @@ import threading
 import time
 from http.client import HTTPResponse
 
-MAX_BODY = 256 * 1024
+MAX_BODY = 12 * 1024 * 1024
 MAX_FRAME = 2 * 1024 * 1024
-MAX_SSE = 8 * 1024 * 1024
+MAX_SSE = 16 * 1024 * 1024
 MAX_TEXT = 16 * 1024
 MAX_RESULT = 64 * 1024
 TURN_TIMEOUT = 125
@@ -401,6 +401,9 @@ def open_worker_stream(
         "stream": True,
         "body": body_obj,
     }
+    conv_id = body_obj.get("conversation_id") or body_obj.get("conversationId")
+    if isinstance(conv_id, str) and REQUEST_ID.fullmatch(conv_id):
+        envelope["conversation_id"] = conv_id
     if isinstance(gateway_policy, dict) and gateway_policy:
         envelope["gateway_policy"] = gateway_policy
     payload = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

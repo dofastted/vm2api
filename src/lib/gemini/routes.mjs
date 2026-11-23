@@ -1294,7 +1294,7 @@ export function createGeminiPublicHandler({ json, readBody, scheduler }) {
             : 'gemini-session'
     const routeStream = google ? google[2] === 'streamGenerateContent' : undefined
     const modelFromPath = google ? decodeURIComponent(google[1]) : null
-    const bodyLimit = protocol === 'gemini-session' ? 256 * 1024 : 4 * 1024 * 1024
+    const bodyLimit = protocol === 'gemini-session' ? 256 * 1024 : 12 * 1024 * 1024
     let body = req.body
     if (body == null) {
       try {

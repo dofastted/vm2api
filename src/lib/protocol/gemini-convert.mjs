@@ -27,7 +27,16 @@ export const FULL_GEMINI_CAPABILITIES = Object.freeze([
   'multimodal',
   'full_gemini_api',
 ])
-export const NATIVE_TUI_CAPABILITIES = Object.freeze(['streaming', 'native_tui'])
+export const NATIVE_TUI_CAPABILITIES = Object.freeze([
+  'streaming',
+  'native_tui',
+  'multi_turn',
+  'system_instruction',
+  'tools',
+  'generation_config',
+  'thinking',
+  'multimodal',
+])
 
 const MODEL_RE = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const SIG_MARK = '__ts'
