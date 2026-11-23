@@ -17,6 +17,17 @@ if [ "$MODE" = run ] && [ "${KIN_STANDBY:-}" = 1 ]; then
     STANDBY=1
   fi
 fi
+# A blue/green install (an activation marker exists) runs only through deploy/bluegreen/bg-deploy.sh.
+# A container started the single-container way (plain `docker compose up -d`) would contend with the
+# active colour for the lock and the shared files, so it refuses to start.
+if [ "$MODE" = run ] && [ "${KIN_STANDBY:-}" != 1 ]; then
+  for marker in "$ROOT"/data/run/bg-active-*; do
+    [ -e "$marker" ] || continue
+    echo "vm2api_bluegreen_install: this install runs blue/green ($(basename "$marker")); deploy with deploy/bluegreen/bg-deploy.sh, not docker compose up." >&2
+    echo "vm2api_bluegreen_install: to go back to a single container, see docs/BLUEGREEN.md (rollback)." >&2
+    exit 78
+  done
+fi
 if [ "$MODE" = run ] && [ "$STANDBY" = 0 ]; then
   # Match the Node startup lock before replacing any shared binaries or configuration.
   exec 9<"$ROOT/data"

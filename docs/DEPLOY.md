@@ -263,6 +263,8 @@ location / {
 
 普通升级要重启控制面，期间请求挂住、长流可能被砍。单机可以改用蓝绿：haproxy 在前，两个颜色轮流接班，切换约 1 秒、旧实例在后台跑完长流。见 [BLUEGREEN.md](BLUEGREEN.md)。
 
+切到蓝绿后，升级一律用 `deploy/bluegreen/bg-deploy.sh`：`install.sh` 只更新文件、不再 `compose up`；直接 `docker compose up -d` 起来的单容器会拒绝启动（`vm2api_bluegreen_install`）。
+
 ## 一键安装 / 更新
 
 `deploy/install.sh` 默认拉 ghcr 预构建镜像，不在目标机编译，只下载 `docker-compose.yml`、`.env.example`、`VERSION`、`CHANGELOG.md`、`deploy/install.sh`（ARM64 另加 `deploy/prepare-arm64.py`）。`--from-source` 在目标机按 `Dockerfile` 多阶段构建：编 `web/dist` 与 Go helper，按 `deploy/payload.json` 下载 payload。不碰已有非空 `.env` 字段、`vms/`、`data/`，不 `docker rm` 槽。

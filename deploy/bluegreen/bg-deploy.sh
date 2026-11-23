@@ -5,6 +5,7 @@
 #   bg-deploy.sh               把 compose/.env 当前描述的版本部署到空闲颜色并切流量
 #   bg-deploy.sh --wait        同上，但前台等旧实例排空结束
 #   bg-deploy.sh --status      看颜色、角色、haproxy 状态
+#   bg-deploy.sh --restart     普通重启当前颜色（带新迁移的版本用；haproxy 挂住请求，会中断一次）
 #   bg-deploy.sh --cutover <old> <new>   新实例已激活但切 haproxy 失败时，修好 haproxy 后从第 4 步续做
 #
 # 顺序（见 src/lib/core/handover.mjs）：
@@ -30,6 +31,7 @@
 #   BG_SERVICE          compose 服务名（默认 vm2api）
 #   BG_NAME             容器/项目名前缀（默认 vm2api → vm2api-blue / vm2api-green）
 #   BG_DRAIN_MS         旧实例最长排空毫秒（默认 3600000）
+#   BG_RESTART_GRACE    --restart 时等旧容器退出的秒数，超时强杀（默认 100）
 # 站点自己的额外挂载/环境（补丁、调试开关）放 <状态目录>/override.yml，存在就叠在最后。
 set -euo pipefail
 
@@ -53,6 +55,7 @@ BG_HAPROXY_RELOAD=${BG_HAPROXY_RELOAD:-systemctl reload-or-restart haproxy}
 BG_SERVICE=${BG_SERVICE:-vm2api}
 BG_NAME=${BG_NAME:-vm2api}
 BG_DRAIN_MS=${BG_DRAIN_MS:-3600000}
+BG_RESTART_GRACE=${BG_RESTART_GRACE:-100}
 KIT_DIR=$BG_PROJECT_DIR/deploy/bluegreen
 
 cd "$BG_PROJECT_DIR"
@@ -151,6 +154,21 @@ case "$mode" in
   finish "$2" "$3"
   exit 0
   ;;
+--restart)
+  [[ $active == blue || $active == green ]] || { echo "no active color; run --bootstrap first" >&2; exit 1; }
+  other_c=$(other "$active")
+  alive "$other_c" && { echo "$(cname "$other_c") is still running (drain not finished); wait for it first" >&2; exit 1; }
+  dc "$active" config -q || { echo "compose config for $active does not render" >&2; exit 1; }
+  log "restart: $active in place (haproxy holds requests until it is back)"
+  dc "$active" pull -q "$BG_SERVICE" || true
+  # The colour's stop_grace_period is sized for a background drain; here clients are waiting, so cap it.
+  docker stop -t "$BG_RESTART_GRACE" "$(cname "$active")" >/dev/null 2>&1 || true
+  dc "$active" up -d --force-recreate
+  for _ in $(seq 1 180); do healthz "$active" >/dev/null && break; sleep 1; done
+  healthz "$active" >/dev/null || { log "FAILED: $active did not come back; see docker logs $(cname "$active")"; exit 1; }
+  log "restart done: $active on :$(port "$active")"
+  exit 0
+  ;;
 --cutover)
   [[ ${2:-} =~ ^(blue|green)$ && ${3:-} == "$(other "${2:-}")" ]] || { echo "usage: $0 --cutover <old> <new>" >&2; exit 1; }
   [[ $(role "$3") == "" ]] && healthz "$3" >/dev/null || { echo "$3 is not serving as leader" >&2; exit 1; }
@@ -192,7 +210,7 @@ case "$mode" in
   ;;
 "" | --wait) ;;
 *)
-  echo "usage: $0 [--bootstrap|--status|--wait]" >&2
+  echo "usage: $0 [--wait|--status|--restart|--bootstrap|--cutover <old> <new>]" >&2
   exit 1
   ;;
 esac
@@ -222,7 +240,7 @@ mig_new=$(dc "$new" run --rm --no-deps -T --entrypoint ls "$BG_SERVICE" /opt/vm2
 added=$(comm -13 <(echo "$mig_old") <(echo "$mig_new"))
 if [[ -n $added ]]; then
   log "new image adds migrations: $(echo "$added" | tr '\n' ' ')"
-  log "refusing blue/green; deploy this release with a plain restart (see docs/BLUEGREEN.md)"
+  log "refusing blue/green; deploy this release with: $0 --restart"
   exit 2
 fi
 
