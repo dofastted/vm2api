@@ -560,6 +560,38 @@ test('routing patch requires count_tokens to be boolean', async () => {
   assert.match(JSON.stringify(validatePersonaRoutingPatch({ compatibility: { count_tokens: 'on' } })), /count_tokens/)
 })
 
+test('handleUserCountTokens applies getRoutingConfig to inboundBodyLimit', async () => {
+  const cap = jsonCapture()
+  let seenLimit = null
+  await handleUserCountTokens(
+    {},
+    {},
+    {
+      json: cap.json,
+      requireAuth: () => true,
+      readBody: async (_req, limit) => {
+        seenLimit = limit
+        return { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] }
+      },
+      cfg: { limits: { max_body_bytes: 64 * 1024 * 1024 } },
+      getRoutingConfig: () => ({ failover: { max_request_mib: 12 } }),
+      stickyRouter: { extractPoolKey: () => null },
+      getPoolScheduler: () => ({
+        peekAccount: async () => ({
+          ok: true,
+          vmId: 'vm-01',
+          accountId: 'acc-1',
+          vm: { credential_mode: 'setup-token' },
+          exec: { vmId: 'vm-01' },
+        }),
+      }),
+      countTokensViaWorker: async () => ({ ok: true, status: 200, body: { input_tokens: 5 } }),
+    },
+  )
+  assert.equal(seenLimit, 12 * 1024 * 1024)
+  assert.equal(cap.calls[0].status, 200)
+})
+
 test('panel count-tokens route is gated by the switch, not removed', async () => {
   const { createPanelHandler } = await import('../../src/lib/admin/panel-routes.mjs')
   const call = async (routingConfig) => {

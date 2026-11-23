@@ -382,9 +382,3 @@ export function builtinRate(platform, id, at) {
   }
   return { ...price, modes: { ...price.modes, ultrafast } }
 }
-
-export function builtinOf(id) {
-  if (ANTHROPIC[id]) return { platform: 'anthropic', id, price: ANTHROPIC[id] }
-  if (OPENAI[id]) return { platform: 'openai', id, price: OPENAI[id] }
-  return null
-}

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { Check, Copy, RefreshCw } from 'lucide-react'
 import { isApiError } from '@/lib/api'
+import { geminiAuthorizationLabel } from '@/lib/gemini-account-status'
 import { GEMINI_MAINTENANCE_SECTION_ID } from '@/lib/gemini-recovery'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import {
@@ -26,10 +27,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  type GeminiEnvironment,
-  geminiInventoryOptions,
-} from '@/features/import/gemini-environments'
+import { geminiInventoryOptions } from '@/features/import/gemini-environments'
 import { useGeminiBusy } from '@/features/import/gemini-operations'
 import { GeminiTestPanel } from '@/features/import/gemini-test-panel'
 import {
@@ -71,18 +69,12 @@ const phaseLabels: Record<string, string> = {
   restoring: '恢复未完成的维护',
   downloading: '下载签名载荷',
   verifying: '验证载荷',
+  applying: '应用变更',
+  starting: '启动 Gemini 服务',
   installing: '安装运行环境',
   restarting: '重启 Gemini 服务',
   completed: '执行完成',
   failed: '执行失败',
-}
-
-const authStates: Record<GeminiEnvironment['auth_state'], string> = {
-  unverified: '未授权',
-  authorizing: '等待 Google 授权',
-  authorized: '已授权',
-  reauth_required: '需要重新授权',
-  disabled: '已停用',
 }
 
 const restartCopy =
@@ -381,13 +373,10 @@ function InferenceValidation({
       {environment ? (
         <>
           <p className='text-sm text-muted-foreground'>
-            {environment.auth_method === 'api_key'
-              ? 'Gemini API Key'
-              : environment.oauth_imported
-                ? '导入的 Google OAuth（不是官方 CLI 授权）'
-                : 'Antigravity 官方 CLI 授权'}
-            {' · '}
-            {authStates[environment.auth_state]}
+            {geminiAuthorizationLabel(environment)}
+            {environment.auth_method === 'oauth' && environment.oauth_imported
+              ? '（需完成官方 CLI 授权）'
+              : null}
           </p>
           <fieldset disabled={disabled} className='min-w-0'>
             <legend className='sr-only'>推理测试</legend>
