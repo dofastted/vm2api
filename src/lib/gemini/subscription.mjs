@@ -388,15 +388,16 @@ function readOptionalFile(file, limit) {
 }
 
 function resolveOrigin(origin) {
-  const value = origin || process.env.KIN_CRAG_GEMINI_AUTHORITY_URL || DEFAULT_AUTHORITY
+  const value = (origin || process.env.KIN_CRAG_GEMINI_AUTHORITY_URL || DEFAULT_AUTHORITY).trim()
+  const normalized = value.replace(/\/+$/, '')
   if (
-    value !== DEFAULT_AUTHORITY &&
-    !/^https:\/\/[A-Za-z0-9.-]+(?::[1-9][0-9]{0,4})?$/.test(value) &&
-    !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(value)
+    normalized !== DEFAULT_AUTHORITY &&
+    !/^https:\/\/[A-Za-z0-9.-]+(?::[1-9][0-9]{0,4})?(?:\/[A-Za-z0-9_-]+)*$/.test(normalized) &&
+    !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}(?:\/[A-Za-z0-9_-]+)*$/.test(normalized)
   ) {
     throw fail('license_unconfigured', 503)
   }
-  return value.replace(/\/$/, '')
+  return normalized
 }
 
 export function createGeminiCragSubscription({
@@ -635,6 +636,7 @@ export function createGeminiCragSubscription({
       used_slots: usedSlots,
       available_slots: availableSlots,
       reclaim_supported: claims.version === 2,
+      ...(Array.isArray(remote?.quota_grants) ? { quota_grants: remote.quota_grants } : {}),
     }
   }
 

@@ -185,6 +185,9 @@ function fixture({
     readCragClusterSubscription: () => subscription,
     hasClusterSubscriptionBinds,
     publishClusterSubscription: async () => calls.push('publish-subscription'),
+    clusterComputerPolicy: () => ({ computer: false, required: false }),
+    hasClusterComputerBinds: () => true,
+    pushClusterComputer: async () => false,
   }
   const boot = vmContext.runInNewContext(`${restartPolicy}; ${start.replace('export ', '')}; startRemoteSlot`, io)
   return { calls, target, boot: () => boot(target, '/fixture'), state: () => info?.State }

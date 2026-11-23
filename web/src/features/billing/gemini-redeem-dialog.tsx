@@ -28,6 +28,8 @@ type SubscriptionRedeemResult = {
   slot_limit: number | 'unlimited'
   used_slots?: number | null
   available_slots?: number | null
+  expires_at?: number | null
+  quota_grants?: Array<{ expires_at: number; slot_limit?: number | null }>
 }
 
 const KNOWN_REDEEM_ERROR_CODES = new Set([
@@ -97,9 +99,13 @@ export function GeminiRedeemDialog({
           result.slot_limit === 'unlimited' ? '不限' : String(result.slot_limit)
         const availableLabel =
           result.available_slots != null ? String(result.available_slots) : '—'
+        const stackedSuffix =
+          result.quota_grants && result.quota_grants.length > 1
+            ? `，当前已叠加 ${result.quota_grants.length} 张有效兑换码`
+            : ''
         setCode('')
         setSuccessMessage(
-          `CRAGGemini 宿主订阅已激活（席位额度 ${limitLabel}，可用席位 ${availableLabel}）。请为需要的 Google OAuth 环境绑定席位。`
+          `CRAGGemini 宿主订阅已激活（席位额度 ${limitLabel}，可用席位 ${availableLabel}${stackedSuffix}）。请为需要的 Google OAuth 环境绑定席位。`
         )
       } else {
         const result = await api<{ kernel_version: string }>(
@@ -162,8 +168,8 @@ export function GeminiRedeemDialog({
           </DialogTitle>
           <DialogDescription>
             {isSubscriptionMode
-              ? '输入 CRAGGemini 宿主机订阅码（CRAGR1.…）以开通或续期席位，不占用 Claude CRAG 槽位。'
-              : '支持 CRAGGemini 订阅码（CRAGR1.…）或旧版内核授权码（CGG1-…），不占用 Claude CRAG 槽位。'}
+              ? '输入 CRAGGemini 宿主机兑换码（CRAGR1.…，支持 1个月/10槽可叠加码与 7天/10槽测试码）以开通或叠加席位，不占用 Claude CRAG 槽位。'
+              : '支持 CRAGGemini 兑换码（CRAGR1.…，含 1个月/10槽可叠加码与 7天/10槽测试码）或旧版内核授权码（CGG1-…），不占用 Claude CRAG 槽位。'}
           </DialogDescription>
         </DialogHeader>
         {successMessage ? (

@@ -3187,3 +3187,23 @@ test('#1562: CRAG pre-first-frame SOCKS5/transport_error 502 fails over across s
     assert.equal(scheduler.unitCircuit.snapshot('account-B').failures, 1)
   }
 })
+
+test('timeout tracker: repeat trips back off 15/30/60 minutes; success forgets them, reset does not', async () => {
+  const { vmTimeoutTracker } = await import('../../src/lib/pool/failover-runner.mjs')
+  vmTimeoutTracker.reset()
+  const m = 60_000
+  assert.equal(vmTimeoutTracker.recordTrip('vm-t', 0), 1)
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 0), 0, 'one trip: no hold')
+  vmTimeoutTracker.recordTrip('vm-t', 10 * m)
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 10 * m), 25 * m)
+  vmTimeoutTracker.reset('vm-t')
+  vmTimeoutTracker.recordTrip('vm-t', 30 * m)
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 30 * m), 60 * m, 'reset keeps trip history')
+  vmTimeoutTracker.recordTrip('vm-t', 70 * m)
+  vmTimeoutTracker.recordTrip('vm-t', 80 * m)
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 80 * m), 140 * m, 'capped at 60 minutes')
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 80 * m + 3 * 60 * m), 0, 'trips age out of the 2h window')
+  vmTimeoutTracker.recordSuccess('vm-t')
+  assert.equal(vmTimeoutTracker.trips.has('vm-t'), false)
+  vmTimeoutTracker.reset()
+})

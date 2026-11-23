@@ -79,6 +79,14 @@ export function publicPlan(value) {
     if (typeof value.renewable !== 'boolean') throw invalidReply()
     plan.renewable = value.renewable
   }
+  if (value.product !== undefined) {
+    if (value.product !== 'crag-v2' && value.product !== 'craggemini') throw invalidReply()
+    plan.product = value.product
+  }
+  if (value.stackable !== undefined) {
+    if (typeof value.stackable !== 'boolean') throw invalidReply()
+    plan.stackable = value.stackable
+  }
   return plan
 }
 
