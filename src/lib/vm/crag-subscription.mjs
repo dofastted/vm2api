@@ -1134,9 +1134,28 @@ export function createCragSubscription({
         ...runtime,
       }
     } catch {
+      // Report this machine's identity even when nothing above succeeded. It is
+      // derived from local files and never needs the Authority, so withholding it
+      // here only hides it from the hosts that need it most: the panel drops the
+      // whole device-identity block -- and with it the only migration entry --
+      // whenever `device_uuid` is missing, and a host whose credential the
+      // Authority rejects lands in this branch on every single refresh. That is
+      // exactly the host whose way back in is to claim by order id.
+      //
+      // Re-read rather than hoisted out of the `try`: the read itself can throw,
+      // and hoisting it would take the whole status response down with it instead
+      // of degrading to the shape this returned before.
+      let identity
+      try {
+        identity = deviceIdentity()
+      } catch {
+        identity = undefined
+      }
       return {
         ready: false,
         state: 'unavailable',
+        ...(identity?.uuid && { device_uuid: identity.uuid }),
+        ...(identity && { identity_source: identity.source }),
         available_seats: null,
         ...(target_probe_failed && { target_probe_failed }),
         ...inventory,

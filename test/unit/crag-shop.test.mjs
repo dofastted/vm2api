@@ -356,6 +356,55 @@ test('pilot credential authorizes checkout operations but is never sent with rec
     await checkInvalidFile()
   }
   await checkReceiptOnlyRequests()
+
+  // The failure log is the only record a stalled checkout leaves behind, so what it
+  // carries is load-bearing in both directions: enough to tell the faults apart, and
+  // nothing that works as a credential. Checked here because this test already holds
+  // all three secrets at once — the pilot token, the receipt, and an order id.
+  const warnings = []
+  const warn = console.warn
+  console.warn = (line) => warnings.push(line)
+  try {
+    // A directory makes readPilotToken throw before any request goes out, which is
+    // the shape of every fault that never reaches the supplier.
+    process.env[PILOT_TOKEN_FILE_ENV] = root
+    await assert.rejects(supplier.resume(row, PROOF, { allowPilot: true }), unavailable)
+    // And one that does reach it: with a usable pilot token, a reply echoing that
+    // token is refused inside the transport, so the log sees a real status.
+    fs.writeFileSync(file, token, { mode: 0o600 })
+    process.env[PILOT_TOKEN_FILE_ENV] = file
+    plansReply = { ...catalog, plans: [{ ...PLAN, sku: token }] }
+    await assert.rejects(supplier.plans({ allowPilot: true }), { code: 'shop_invalid_reply' })
+  } finally {
+    console.warn = warn
+  }
+  assert.deepEqual(
+    warnings.map((line) => JSON.parse(line)),
+    [
+      {
+        event: 'crag-shop-supplier',
+        operation: 'resume',
+        // Truncated: a whole order id in a log is a credential, since the Authority's
+        // claim-by-order accepts one as grounds for moving a subscription.
+        path: `/shop/orders/${id.slice(0, 8)}~/resume`,
+        // Zero means no response arrived, which is what separates "the supplier
+        // refused" from "we never reached it".
+        status: 0,
+        code: 'shop_unavailable',
+        cause: 'Error',
+      },
+      {
+        event: 'crag-shop-supplier',
+        operation: 'plans',
+        path: '/shop/plans',
+        status: 200,
+        code: 'shop_invalid_reply',
+      },
+    ],
+  )
+  const logged = warnings.join('\n')
+  assert.ok(!logged.includes(id), 'a usable order id must not reach the log')
+  for (const secret of [token, PROOF]) assert.ok(!logged.includes(secret), 'no credential may reach the log')
 })
 
 test('SQLite reservation survives restart; owners isolate retries, list, status and explicit claim', {

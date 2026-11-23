@@ -2711,6 +2711,26 @@ test('H1 deletion preserves exact evidence until H2 upgrade releases the deleted
   )
 })
 
+test('a degraded status still reports the device identity it read locally', async (t) => {
+  const f = await seatReleaseFixture(t)
+  const healthy = await f.service.status()
+  assert.ok(healthy.device_uuid, 'the normal path carries the identity')
+
+  // `readDeferredReleases` throws on a malformed file and is one of the few calls
+  // in `status()` with no inner catch of its own, so this is what the degraded
+  // branch actually looks like. Note what it is *not*: an Authority that rejects
+  // our credential is caught one level in, and that path keeps returning rights.
+  fs.writeFileSync(f.deferredFile, '{"version":2}', { mode: 0o600 })
+  const degraded = await f.service.status()
+  assert.equal(degraded.state, 'unavailable')
+  // The identity is derived from this machine's own files and never needed the
+  // Authority, so dropping it here would hide the panel's device-identity block —
+  // and with it the only migration entry — from a host that is still migratable
+  // by order id.
+  assert.equal(degraded.device_uuid, healthy.device_uuid)
+  assert.equal(degraded.identity_source, healthy.identity_source)
+})
+
 test('H1 deletion stores unproven intent before destruction and never reclaims an unconfirmed delete', async (t) => {
   const f = await seatReleaseFixture(t)
   const vm = f.state.targets[0]
