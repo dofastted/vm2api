@@ -2,8 +2,15 @@
 
 ## Unreleased
 
-- 商城对供应商的调用失败会留下一行日志。此前一次失败的结账什么都不留:vm2api 不记录 API 请求日志（6822 行 journal 里零条 `/api/panel`），而 `crag-shop-supplier.mjs` 里 `send()` 的 catch 把一切非 `ShopError` 的异常压成同一个 `shop_unavailable`——超时、DNS 失败、TLS 错误、回复体畸形全都长成一样。代价是具体的:生产上 11-16 到 11-20 的 15 笔订单零付款成功，其中 5 笔的 `amount_minor` 与 `subtotal_minor` 仍是 NULL，而这两列由 `reflectOrder` 在 `supplier.create` 成功返回后回填——所以那 5 笔是 create 抛了异常、买家从未拿到付款页，而原因已经永久丢失。`send()` 是所有供应商调用的唯一出口，日志记在那里，两个字段为区分而选:`status` 为 0 表示没有收到响应，把「供应商拒绝了」与「我们没到达它」分开；`cause` 是错误类名，把超时、网络故障、解析故障分开。只记失败，成功不记（#1603）。
-- 那行日志不带任何凭据。receipt 与 pilot token 是凭据，请求体带购买明细，而 path 里的**订单号是买家对这笔订单的凭据**——签发侧的 `claim-by-order` 认它作为迁移订阅的依据——所以 `auditPath` 把订单号截到 8 位十六进制:够用来在 `crag_shop_orders` 里定位那一行，远不够猜出其余部分。断言加在已有的 pilot 凭据测试里，因为那个测试同时持有 pilot token、receipt 和一个订单号，能同时验证「日志可用」与「不泄露凭据」，并覆盖无响应（`status: 0`、订单号被截断）与有响应（`status: 200`）两种形态。它**不会**追溯解释已经发生的那 5 笔，那些原因没有留下任何记录（#1603）。
+## 1.4.180 — 2026-11-23 · Gemini 多协议适配与 CRAG 加密 0.3.0 订阅，Codex 额度续航与 CRAG 激活收敛
+
+- Gemini 宿主与网关接入独立多协议转换和原生流式推理桥，不改动既有 Claude / Codex 路径。新增 `src/lib/protocol/gemini-convert.mjs`，将 OpenAI Chat/Responses、Anthropic Messages 与原生 Gemini/Antigravity 载荷统一转换，支持工具调用、思考块 / `thoughtSignature` 往返与流式 SSE 封装；控制面与宿主之间新增 `/infer`、`/infer-cancel` 流式通道，对缺少 `stream_infer` 的旧版宿主夹具返回 HTTP 404 并平滑回落到既有 `/test-chat`（#1612）。
+- `craggemini` 接入 CRAG 宿主机订阅与按环境席位绑定，并锁定签名加密 `0.3.0` 载荷。新增 `src/lib/gemini/subscription.mjs` 与面板路由 `/api/panel/gemini/crag-subscription/*`、`/api/panel/gemini/environments/:id/crag-license/*`，按规范 `crag-auth` `v3.1.13`（`--product craggemini`）协议完成宿主机订阅兑换、席位绑定与离线本地验签；`deploy/payload.json`（`geminiDefaultLinuxAmd64`）、`scripts/fetch-default-gemini.py`、`scripts/gemini-maintenance.py` 与 `deploy/install.sh` 统一指向 `payload-2026.11.23-gemini-0.3.0` 五件套（`craggemini`、`craggemini.payload.enc`、`libagy_bridge.so`、`crag-license-public.pem`、`manifest.json`），同时兼容旧版载荷夹具校验（#1612）。
+- Codex 槽位在额度闸门处自动刷新已过期 credits 并在面板展示余额，默认 Codex 版本提升至 `codex_cli_rs/0.170.0`（#1608、#1606）。
+- `x-kin-queue` 不等待队列策略对齐槽位预算与零跳计数，重复请求头处理与文档口径收紧；补齐近期协议、CRAG 与 Gemini 改动与存量行为的审计对齐（#1594、#1602、#1605）。
+- CRAG 商城在遭遇 `auth_forbidden` 时停止无限激活重试循环，并向面板透出脱敏诊断信息（#1609）。
+- CRAG 首帧前 SOCKS5/传输 502 与 `empty_response` 分类解耦，并收紧风控 `HARD_POLICY_RULES` 的词边界与上下文约束（#1610、#1611）。
+- 部署说明：本版仅涉及控制面、前端与 Gemini 宿主及加密 `0.3.0` 载荷，槽位内核与 `wrap-cli` 字节未变，已部署机器升级后无需执行 `wrap-cli/sync`。
 
 ## 1.4.179 — 2026-11-22 · Arch KVM 槽不再卡在时间同步，KVM 容器 pids 跟随槽位容量，缓存断点自保 TTL 序
 
