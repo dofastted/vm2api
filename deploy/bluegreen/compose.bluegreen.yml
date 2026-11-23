@@ -1,0 +1,17 @@
+# 蓝绿：叠在 docker-compose.yml（+ docker-compose.override.yml）之后，由 bg-deploy.sh 带上。
+# BG_COLOR / BG_PORT / BG_DRAIN_MS 由脚本导出；不要直接 docker compose up 这个文件。
+services:
+  vm2api:
+    container_name: ${BG_NAME:-vm2api}-${BG_COLOR:?run deploy/bluegreen/bg-deploy.sh}
+    # 旧实例在后台排空，宽限要比排空长
+    stop_grace_period: 3700s
+    environment:
+      PORT: "${BG_PORT}"
+      VM2API_CONTAINER_NAME: ${BG_NAME:-vm2api}-${BG_COLOR}
+      KIN_SHUTDOWN_DRAIN_TIMEOUT_MS: "${BG_DRAIN_MS:-3600000}"
+      KIN_STANDBY: "1"
+      KIN_STANDBY_ACTIVE_FILE: /opt/vm2api/data/run/bg-active-${BG_COLOR}
+      # 两个控制面各起自己的 api-kernel；standby 还没同步 bin/，直接用镜像里的
+      KIN_API_KERNEL_SOCK: /opt/vm2api/data/run/api-kernel-${BG_COLOR}.sock
+      KIN_API_KERNEL_TOKEN: /opt/vm2api/data/run/api-kernel-${BG_COLOR}.token
+      KIN_API_KERNEL_BIN: /opt/vm2api/image-bin/kin-api-kernel

@@ -122,6 +122,10 @@ const DEFAULTS = {
   keep_session_home: false,
   // keep_session_home: pause between retries of a home kernel that had no free slot.
   home_slot_busy_retry_ms: 2000,
+  // keep_session_home: once the request has run this long, a busy home kernel
+  // answers 529 session_home_slot_busy instead of being retried until
+  // total_retry_deadline_ms. 0 keeps waiting until the deadline (upstream behaviour).
+  home_slot_busy_max_wait_ms: 0,
 }
 
 function clone(value) {
@@ -795,7 +799,12 @@ export class FailoverRunner {
     if (quarantined) return quarantinedResult(quarantined)
     const subagent = args.rootSessionId ? this.scheduler?.trackSubagent?.(args) : null
     if (args.rootSessionId) args = { ...args, subagent }
-    if (!sessionKey) return subagent ? this.runOnce(args).finally(subagent.close) : this.runOnce(args)
+    // A batch member key is a placement group, not a conversation: its requests
+    // are independent sessionless calls, so they run side by side up to the
+    // member's concurrency instead of queueing behind each other. Only the
+    // protocol layer says so (args.batchMember); the key text is caller-shaped.
+    if (!sessionKey || args.batchMember === true)
+      return subagent ? this.runOnce(args).finally(subagent.close) : this.runOnce(args)
     const previous = this.sessionTails.get(sessionKey) || Promise.resolve()
     let releaseTurn
     const turn = new Promise((resolve) => {
@@ -835,6 +844,7 @@ export class FailoverRunner {
     model,
     stickyKey = null,
     stickyKeys = null,
+    batchMember = false,
     seatKey = null,
     stickyDeviceId = null,
     stream = false,
@@ -996,7 +1006,7 @@ export class FailoverRunner {
     let avoid = null
     // keep_session_home: the continuing conversation's account for this
     // request is the one its first attempt ran on.
-    const keepHome = this.config.keep_session_home === true && !pinVmId && !!stickyKey
+    const keepHome = this.config.keep_session_home === true && !pinVmId && !!stickyKey && batchMember !== true
     const continuing = !subagent && keepHome && !!this.stickyRouter?.resolve?.(stickyKey)?.accountId
     let homeAccountId = null
     let homeRetryPending = false
@@ -1027,8 +1037,10 @@ export class FailoverRunner {
     }
     // x-kin-queue: off — the home kernel being full is the pool being full for this
     // conversation: answer 529 now rather than wait for the slot.
+    // home_slot_busy_max_wait_ms bounds the same wait for every request.
     const homeSlotRefused = (unit, policy) => {
       if (policy?.reason !== 'slot_busy') return null
+      this.scheduler?.noteKernelSlotBusy?.(unit)
       if (unit?.isSubagent) {
         subagentSlotDeadline ??= unit.slotWaitDeadlineMs
         if (allowQueue && Date.now() < subagentSlotDeadline) return null
@@ -1038,7 +1050,10 @@ export class FailoverRunner {
           ...attribution(),
         }
       }
-      if (allowQueue || !isHome(unit)) return null
+      if (!isHome(unit)) return null
+      const maxWait = Number(this.config.home_slot_busy_max_wait_ms) || 0
+      const waitedOut = maxWait > 0 && Date.now() - startedAt >= maxWait
+      if (allowQueue && !waitedOut) return null
       releaseStickySlots()
       return {
         ...poolOverloadedError({ reason: 'session_home_slot_busy', attempt_count: budget.hops }),

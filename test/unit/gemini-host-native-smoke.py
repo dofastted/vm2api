@@ -286,11 +286,17 @@ try:
     class FakeSession:
         native_diagnostic = FakeDiag()
 
-        def open_stream(self, _request_id, _body_obj):
+        def open_stream(self, _request_id, _body_obj, *, model=None, gateway_policy=None):
             raise host_mod.native_module().NativeFailure("gemini_inference_failed", 502, "native turn failed")
 
         def cancel_turn(self, _request_id):
             return False
+
+        def is_alive(self):
+            return False
+
+        def is_severely_unhealthy(self):
+            return True
 
         def is_ready(self):
             return False
@@ -314,6 +320,7 @@ try:
             "identifier": "gemini-test-env",
             "entry": {"cancel_event": threading.Event(), "cancel_fn": None},
             "auth": ((), b""),
+            "model": "gemini-test",
             "request_id": "req-1",
             "native_body": {"model": "gemini-test", "contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
         },

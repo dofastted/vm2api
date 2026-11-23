@@ -17,6 +17,7 @@
  */
 
 import crypto from 'node:crypto'
+import { isOverlap } from '../core/handover.mjs'
 import fs from 'node:fs'
 import net from 'node:net'
 import tls from 'node:tls'
@@ -247,9 +248,13 @@ export async function ensureNodeGate({ client, host, docker }, link, gateBin) {
   const { digest, spec } = gateContainer({ host, imageRef, body, binaryDigest })
   const existing = await inspectContainerOrNull(docker, GATE_CONTAINER)
   let changed = false
-  if (
-    !(existing?.State?.Running && !existing.State.Restarting && existing.Config?.Labels?.['kin.gate.cfg'] === digest)
-  ) {
+  const running = existing?.State?.Running && !existing.State.Restarting
+  if (running && existing.Config?.Labels?.['kin.gate.cfg'] !== digest && isOverlap()) {
+    // Blue/green overlap: recreating the gate would cut the draining controller's direct streams.
+    // The caller retries once the overlap ends.
+    return { changed: false, deferred: true, image: imageRef, certSha256: await readGateCert(client, host) }
+  }
+  if (!(running && existing.Config?.Labels?.['kin.gate.cfg'] === digest)) {
     const dir = `${host.root}/gate`
     await runRemote(
       client,

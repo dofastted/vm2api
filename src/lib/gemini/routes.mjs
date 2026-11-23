@@ -29,6 +29,7 @@ const API_KEY = /^[A-Za-z0-9_-]{20,256}$/
 const RELEASE_CODE = /^CGG1-[A-Za-z0-9_-]{43}$/
 const STATES = new Set(['unverified', 'authorizing', 'authorized', 'reauth_required', 'disabled'])
 const ACCOUNT_STATES = new Set(['ok', 'partial', 'error', 'reauth_required'])
+const ACCOUNT_ELIGIBILITIES = new Set(['verification_required', 'location_unsupported', 'ineligible'])
 const PAYLOAD_STATES = new Set(['installed', 'install_on_create', 'awaiting_redemption', 'not_configured', 'invalid'])
 const RUN_STATES = new Set(['running', 'completed', 'failed'])
 const RUN_ERRORS = {
@@ -344,9 +345,22 @@ function isFraction(value) {
   return Number.isFinite(value) && value >= 0 && value <= 1
 }
 
+function safeGoogleValidationUrl(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 2048) return null
+  try {
+    const url = new URL(value.trim())
+    if (url.origin !== 'https://accounts.google.com' || url.username || url.password || url.hash) return null
+    return url.href
+  } catch {
+    return null
+  }
+}
+
 function accountView(account) {
   if (!ACCOUNT_STATES.has(account?.state)) return null
   const current = account.state === 'ok' || account.state === 'partial'
+  const eligibility = ACCOUNT_ELIGIBILITIES.has(account?.eligibility) ? account.eligibility : null
+  const validationUrl = safeGoogleValidationUrl(account?.validation_url)
   return {
     state: account.state,
     checked_at: text(account.checked_at),
@@ -356,6 +370,8 @@ function accountView(account) {
     region: text(account.region),
     plan: text(account.plan),
     expires_at: text(account.expires_at),
+    ...(eligibility ? { eligibility } : {}),
+    ...(validationUrl ? { validation_url: validationUrl } : {}),
     quotas: items(account.quotas, 128, (quota) =>
       modelName(quota?.model) && isFraction(quota.remaining_fraction)
         ? { model: quota.model, remaining_fraction: quota.remaining_fraction, reset_at: text(quota.reset_at) }
@@ -630,7 +646,7 @@ export async function warmGeminiEnvironments({
       report.skipped += 1
       continue
     }
-    if (env.runtime_ready === true) {
+    if (env.runtime_ready === true && env.models_discovered === true) {
       report.warmed += 1
       continue
     }
@@ -1294,7 +1310,7 @@ export function createGeminiPublicHandler({ json, readBody, scheduler }) {
             : 'gemini-session'
     const routeStream = google ? google[2] === 'streamGenerateContent' : undefined
     const modelFromPath = google ? decodeURIComponent(google[1]) : null
-    const bodyLimit = protocol === 'gemini-session' ? 256 * 1024 : 4 * 1024 * 1024
+    const bodyLimit = protocol === 'gemini-session' ? 256 * 1024 : 12 * 1024 * 1024
     let body = req.body
     if (body == null) {
       try {

@@ -681,10 +681,13 @@ async function runKernelSync({
       if (resolveInferenceEngine(vm, routingConfig) !== 'rust') continue
       writeKernelConfig(project, vm, { routing: routingConfig, timezone: vm.timezone })
       const exec = slotExec(project, vm)
-      item.kernel = await restartKernel(exec).catch((e) => ({
-        ok: false,
-        error: String(e?.message || e).slice(0, 200),
-      }))
+      // A callback may return a plain result instead of a promise; neither may abort the loop.
+      item.kernel = await Promise.resolve()
+        .then(() => restartKernel(exec))
+        .catch((e) => ({
+          ok: false,
+          error: String(e?.message || e).slice(0, 200),
+        }))
       if (!item.kernel?.ok) {
         markKernelRestartPending(project, item.id, item.kernel?.reason || 'kernel_restart_failed')
         item.ok = false

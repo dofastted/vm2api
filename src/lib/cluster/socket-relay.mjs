@@ -166,12 +166,21 @@ export class SocketRelay {
     return true
   }
 
-  async stop() {
+  /**
+   * unlink:false is for a controller that handed over: the path now belongs to the new leader, and
+   * closing a listening unix server also unlinks its path in libuv. So leave the listener to die
+   * with the process instead of closing it.
+   */
+  async stop({ unlink = true } = {}) {
     const server = this.server
     this.server = null
     this.listening = false
     for (const sock of this.active) sock.destroy()
     this.active.clear()
+    if (!unlink) {
+      server?.unref?.()
+      return
+    }
     if (server) await new Promise((resolve) => server.close(() => resolve()))
     fs.rmSync(this.socketPath, { force: true })
   }
