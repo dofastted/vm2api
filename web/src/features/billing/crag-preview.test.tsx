@@ -290,4 +290,45 @@ describe('draft canvas shared presentation', () => {
     expect(html).not.toContain('contenteditable')
     expect(html).not.toMatch(/<button[^>]*>创建订单<\/button>/)
   })
+
+  it('renders CRAGGemini 1m/10-slot stackable plan and redemption preview on the canvas', () => {
+    const parsed = parseDraftMessage({
+      ...message,
+      draft: {
+        plans: [
+          {
+            sku: 'craggemini-1m-10',
+            term: '1m',
+            amount_minor: 10000,
+            slot_limit: 10,
+            product: 'craggemini',
+            stackable: true,
+            name: 'CRAGGemini 1个月兑换码 · 10 槽',
+          },
+        ],
+      },
+    })
+    expect(parsed).not.toBeNull()
+    expect(
+      parseDraftMessage({
+        ...message,
+        draft: { plans: [{ ...plan, product: 'unknown-product' }] },
+      })
+    ).toBeNull()
+
+    const defaultHtml = renderToStaticMarkup(
+      <PreviewCanvas
+        draft={{ plans: [plan] }}
+        selected={null}
+        onPick={vi.fn()}
+      />
+    )
+    expect(defaultHtml).toContain('兑换码兑换（CRAG / CRAGGemini）')
+    expect(defaultHtml).toContain('CRAGGemini 1个月兑换码 · 10 槽')
+    expect(defaultHtml).toContain('¥100')
+    expect(defaultHtml).toContain('¥10 / 槽')
+    expect(defaultHtml).toContain('可叠加')
+    expect(defaultHtml).toContain('7 天 / 10 槽')
+    expect(defaultHtml).toContain('100')
+  })
 })
