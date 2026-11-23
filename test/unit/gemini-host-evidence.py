@@ -134,7 +134,8 @@ with tempfile.TemporaryDirectory(prefix="gemini-evidence-") as temporary:
         ),
         patch.object(impl, "read_account") as upstream,
         patch.object(impl, "invocation_module") as invocation,
-        patch.object(impl, "NativeAgy") as native,
+        patch.object(impl, "NativeSession") as native_session,
+        patch.object(impl, "ResidentTestChatRun") as native,
         patch.object(impl, "Login") as login,
         patch.object(impl, "now", return_value=STARTED) as clock,
     ):
@@ -144,6 +145,13 @@ with tempfile.TemporaryDirectory(prefix="gemini-evidence-") as temporary:
         process.poll.return_value = {"state": "running", "text": ""}
         api_worker.return_value = process
         native.return_value = process
+        warm_session = Mock()
+        warm_session.max_concurrency = 1
+        warm_session.proxy_hash = sha256(PROXY.encode()).digest()
+        warm_session.is_alive.return_value = True
+        warm_session.is_severely_unhealthy.return_value = False
+        warm_session._last_health_at = float("inf")
+        native_session.return_value = warm_session
         initial = host.request("list", {})["environments"]
         assert all(
             e["runtime_ready"] is False and e["last_inference"] is None for e in initial
