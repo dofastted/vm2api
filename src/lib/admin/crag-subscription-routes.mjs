@@ -60,20 +60,35 @@ const claimMessages = {
     'That order id is already recorded against a different voucher. Keep the original order and ask the administrator to reconcile it; do not redeem again.',
 }
 
+const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
+const credentialRecoveries = new Set(['not_activated', 'host_id_collision', 'failed'])
+
 export function createCragSubscriptionHandler({ subscription, getVm, publicBaseUrl, json, readRawBody }) {
-  const reject = (res, status, code, authorityRequestId, action) => {
+  const reject = (res, status, code, error, action) => {
     const message =
       action === 'claim' && Object.hasOwn(claimMessages, code)
         ? claimMessages[code]
         : Object.hasOwn(messages, code)
           ? messages[code]
           : messages.crag_subscription_failed
+    const validRecovery = credentialRecoveries.has(error?.recovery) ? error.recovery : undefined
+    const validRequestId =
+      typeof error?.authorityRequestId === 'string' && authorityRequestId.test(error.authorityRequestId)
+        ? error.authorityRequestId
+        : undefined
+    const details =
+      validRecovery || validRequestId
+        ? {
+            ...(validRecovery && { recovery: validRecovery }),
+            ...(validRequestId && { authority_request_id: validRequestId }),
+          }
+        : undefined
     return json(res, status, {
       ok: false,
       error: {
         code,
         message,
-        ...(authorityRequestId && { details: { authority_request_id: authorityRequestId } }),
+        ...(details && { details }),
       },
     })
   }
@@ -136,7 +151,7 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
       ) {
         return reject(res, 500, 'crag_subscription_failed')
       }
-      return reject(res, error.status === 401 ? 502 : error.status, error.code, error.authorityRequestId, action)
+      return reject(res, error.status === 401 ? 502 : error.status, error.code, error, action)
     }
   }
 }
