@@ -1,7 +1,7 @@
 import { resolvePublicBaseUrl } from '../core/config.mjs'
+import { QUEUE_HINT_HEADER } from '../protocol/queue-hint.mjs'
 
-export const CORS_ALLOW_HEADERS =
-  'authorization, content-type, x-api-key, anthropic-version, anthropic-beta, x-session-id, x-kin-rewrite, x-panel-token, x-request-id, x-kin-debug, x-kin-log, x-kin-vm, x-kin-backend, idempotency-key'
+export const CORS_ALLOW_HEADERS = `authorization, content-type, x-api-key, anthropic-version, anthropic-beta, x-session-id, x-kin-rewrite, x-panel-token, x-request-id, x-kin-debug, x-kin-log, x-kin-vm, x-kin-backend, ${QUEUE_HINT_HEADER}, idempotency-key`
 
 export const CORS_ALLOW_METHODS = 'GET,POST,OPTIONS,PUT,DELETE,PATCH'
 

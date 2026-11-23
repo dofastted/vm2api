@@ -149,6 +149,10 @@ test('docker args always run packaged native Claude Code', () => {
     args.some((arg) => String(arg).startsWith('CLAUDE_CODE_VERSION=')),
     false,
   )
+  assert.equal(
+    args.some((arg) => String(arg).startsWith('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=')),
+    false,
+  )
   assert.ok(args.includes('USER_TYPE=external'))
   assert.equal(args.includes('CI=1'), false)
   assert.equal(args[args.indexOf('kin-30') + 1], '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')

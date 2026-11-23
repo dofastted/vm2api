@@ -45,6 +45,7 @@ const ACTIVATION_MIGRATION = new URL('058_crag_shop_activation.sql', MIGRATIONS)
 const DISPATCH_MIGRATION = new URL('060_crag_shop_order_dispatch.sql', MIGRATIONS)
 const CLOSED_MIGRATION = new URL('062_crag_shop_order_closed.sql', MIGRATIONS)
 const DEVICE_HOST_MIGRATION = new URL('066_crag_shop_device_host.sql', MIGRATIONS)
+const ACTIVATION_ERROR_MIGRATION = new URL('067_crag_shop_activation_error.sql', MIGRATIONS)
 const PILOT_TOKEN_FILE_ENV = 'VM2API_CRAG_SHOP_PILOT_TOKEN_FILE'
 
 test.beforeEach((t) => {
@@ -104,6 +105,9 @@ test('shop migration numbering preserves applied schemas and orders from either 
     assert.equal(saved.activation_attempts, legacy ? 2 : 0)
     assert.equal(saved.dispatch_state, 'submitted')
     assert.equal(saved.redemption_sha256, null)
+    assert.equal(saved.activation_error_code, null)
+    assert.equal(saved.activation_error_recovery, null)
+    assert.equal(saved.activation_request_id, null)
   }
 })
 
@@ -1216,6 +1220,7 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
   db.exec(fs.readFileSync(DISPATCH_MIGRATION, 'utf8'))
   db.exec(fs.readFileSync(CLOSED_MIGRATION, 'utf8'))
   db.exec(fs.readFileSync(DEVICE_HOST_MIGRATION, 'utf8'))
+  db.exec(fs.readFileSync(ACTIVATION_ERROR_MIGRATION, 'utf8'))
   // The legacy row normally already has a receipt key from its original checkout.
   const receiptKey = loadOrderReceiptKey(root, () => false)
   const publicDir = cragSubscriptionPublicDirectory(root)
@@ -1560,4 +1565,292 @@ test('an unpaid checkout link closes once its payment window passes, unless the 
   await shop.pollOrderExpiry()
   assert.equal(typeof stored(orphan).closed_at, 'number')
   assert.equal(reads, before)
+})
+
+test('migration 067 enforces sanitized activation failure columns and pollActivation stops on terminal auth_forbidden without leaking secrets', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-shop-auth-forbidden-'))
+  const db = createDatabase({ dbPath: path.join(root, 'kin.db') })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  loadOrderReceiptKey(root, () => false)
+
+  // Verify SQLite CHECK constraints directly on migration 067 columns.
+  const checkOrderId = randomUUID()
+  db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, dispatch_state,
+     created_at, term, amount_minor, slot_limit, activation_vm_id, activation_fingerprint)
+    VALUES (?, ?, 'check-row', 'quarter', 'alipay', 1, 'fulfilled', 'submitted',
+            1800000000, '3m', 59900, 10, 'vm-check', ?)`).run(checkOrderId, OTHER.panelBuyerOwner, 'f'.repeat(64))
+
+  for (const badCode of ['', 'a', '9bad', 'Auth_forbidden', CODE, 'auth-forbidden', 'bad\ncode', 'a'.repeat(65)]) {
+    assert.throws(() =>
+      db.prepare('UPDATE crag_shop_orders SET activation_error_code = ? WHERE order_id = ?').run(badCode, checkOrderId),
+    )
+  }
+  for (const badRecovery of ['', 'unavailable', 'unknown', CODE]) {
+    assert.throws(() =>
+      db
+        .prepare('UPDATE crag_shop_orders SET activation_error_recovery = ? WHERE order_id = ?')
+        .run(badRecovery, checkOrderId),
+    )
+  }
+  for (const badRequestId of [
+    '',
+    'not-a-uuid',
+    CODE,
+    '6945109e-80be-1d23-9793-68ba195765ce',
+    '6945109e-80be-4d23-0793-68ba195765ce',
+    '6945109e-80be-4d23-9793-68ba195765ce\n',
+  ]) {
+    assert.throws(() =>
+      db
+        .prepare('UPDATE crag_shop_orders SET activation_request_id = ? WHERE order_id = ?')
+        .run(badRequestId, checkOrderId),
+    )
+  }
+  const upperUuid = '6945109E-80BE-4D23-9793-68BA195765CE'
+  db.prepare(`UPDATE crag_shop_orders
+    SET activation_error_code = 'auth_forbidden',
+        activation_error_recovery = 'not_activated',
+        activation_request_id = ?
+    WHERE order_id = ?`).run(upperUuid, checkOrderId)
+  db.prepare('DELETE FROM crag_shop_orders WHERE order_id = ?').run(checkOrderId)
+
+  const fingerprint = 'c'.repeat(64)
+  const bearerSecret = 'secret_bearer_token_43_chars_long_abcdef123'
+  let activateBehavior = () => {
+    throw new Error('unexpected activateOrder call')
+  }
+  let activateCalls = 0
+  let claimCalls = 0
+  let statusCalls = 0
+  const remoteStatus = new Map()
+
+  const makeShop = (activationEnabled = true) =>
+    createCragShopHandler({
+      getDb: () => db,
+      dataDir: root,
+      publicBaseUrl: PANEL,
+      json: (_, http, body) => ({ http, ...body }),
+      readRawBody: (req) => req.raw,
+      isActivationAdmin: (owner) => owner === OTHER.panelBuyerOwner,
+      activationEnabled,
+      subscription: {
+        pinOrderTarget: async (vmId) => {
+          assert.equal(vmId, 'vm-slot')
+          return fingerprint
+        },
+        activateOrder: async (opts) => {
+          activateCalls++
+          return activateBehavior(opts)
+        },
+      },
+      supplier: {
+        create: async (row) => ({
+          order: order(row.order_id, remoteStatus.get(row.order_id) ?? 'fulfilled'),
+        }),
+        status: async (row) => {
+          statusCalls++
+          return order(row.order_id, remoteStatus.get(row.order_id) ?? 'fulfilled')
+        },
+        claim: async (row) => {
+          claimCalls++
+          return { order_id: row.order_id, redemption_code: CODE }
+        },
+      },
+    })
+
+  let shop = makeShop(true)
+  const call = (method, endpoint, body, handler = shop) => {
+    const url = new URL(`${PANEL}${BASE}${endpoint}`)
+    return handler(
+      {
+        ...OTHER,
+        method,
+        raw: Buffer.from(body === undefined ? '' : JSON.stringify(body)),
+        headers: {
+          host: 'panel.example.test',
+          origin: PANEL,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+        },
+      },
+      {},
+      url,
+      cragShopRoute(method, url.pathname),
+    )
+  }
+
+  const created = (
+    await call('POST', '/orders', {
+      ...INPUT,
+      request_id: 'issue-1600-order',
+      activation_target: { vm_id: 'vm-slot' },
+    })
+  ).data
+  const id = created.order_id
+  const due = (orderId = id) =>
+    db.prepare('UPDATE crag_shop_orders SET activation_next_at = 1 WHERE order_id = ?').run(orderId)
+
+  // 1. Transient auth_forbidden (recovery === 'unavailable') still reschedules and never stores 'unavailable'.
+  const transientReqId = randomUUID()
+  activateBehavior = async ({ claim }) => {
+    await claim()
+    throw Object.assign(new Error(`raw vendor error ${CODE} ${bearerSecret} /opt/private/credential`), {
+      code: 'auth_forbidden',
+      status: 403,
+      recovery: 'unavailable',
+      authorityRequestId: transientReqId,
+    })
+  }
+  due()
+  await shop.pollActivation()
+  assert.equal(activateCalls, 1)
+  assert.equal(claimCalls, 1)
+  const afterTransientRow = db.prepare('SELECT * FROM crag_shop_orders WHERE order_id = ?').get(id)
+  assert.equal(typeof afterTransientRow.activation_next_at, 'number')
+  assert.equal(afterTransientRow.activation_error_code, 'auth_forbidden')
+  assert.equal(afterTransientRow.activation_error_recovery, null)
+  assert.equal(afterTransientRow.activation_request_id, transientReqId)
+  const transientView = (await call('GET', `/orders/${id}`)).data
+  assert.deepEqual(transientView.activation, {
+    vm_id: 'vm-slot',
+    state: 'activating',
+    error_code: 'auth_forbidden',
+    authority_request_id: transientReqId,
+  })
+
+  // 2. Paused auto-activation (!activationEnabled) never falsely reports 'activating' on a fulfilled order,
+  //    and refreshes an unpaid order to fulfilled -> needs_attention.
+  const pausedShop = makeShop(false)
+  const pausedFulfilled = (await call('GET', `/orders/${id}`, undefined, pausedShop)).data
+  assert.equal(pausedFulfilled.activation.state, 'needs_attention')
+  assert.equal(pausedFulfilled.activation.error_code, 'auth_forbidden')
+  assert.equal(
+    (await call('GET', '/orders', undefined, pausedShop)).data.orders.find((o) => o.order_id === id).activation.state,
+    'needs_attention',
+  )
+  assert.equal(
+    (await call('POST', `/orders/${id}/retry-activation`, {}, pausedShop)).error.code,
+    'shop_activation_disabled',
+  )
+
+  const pendingWhilePausedId = randomUUID()
+  remoteStatus.set(pendingWhilePausedId, 'pending')
+  db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, dispatch_state,
+     created_at, term, amount_minor, slot_limit, activation_vm_id, activation_fingerprint,
+     activation_next_at, activation_deadline)
+    VALUES (?, ?, 'paused-pending', 'quarter', 'alipay', 1, 'pending', 'submitted',
+            1800000000, '3m', 59900, 10, 'vm-slot', ?, 1800000300, 1800086400)`).run(
+    pendingWhilePausedId,
+    OTHER.panelBuyerOwner,
+    fingerprint,
+  )
+  assert.equal(
+    (await call('GET', `/orders/${pendingWhilePausedId}`, undefined, pausedShop)).data.activation.state,
+    'awaiting_fulfillment',
+  )
+  remoteStatus.set(pendingWhilePausedId, 'fulfilled')
+  const refreshedWhilePaused = (await call('GET', `/orders/${pendingWhilePausedId}`, undefined, pausedShop)).data
+  assert.equal(refreshedWhilePaused.status, 'fulfilled')
+  assert.equal(refreshedWhilePaused.activation.state, 'needs_attention')
+
+  // 3. Terminal auth_forbidden ('not_activated' and 'host_id_collision') and other terminal codes stop polling immediately.
+  for (const [code, recovery] of [
+    ['auth_forbidden', 'not_activated'],
+    ['auth_forbidden', 'host_id_collision'],
+    ['host_subscription_inactive', undefined],
+    ['not_found', undefined],
+    ['request_conflict', undefined],
+    ['invalid_request', undefined],
+  ]) {
+    const reqId = randomUUID()
+    activateBehavior = async ({ claim }) => {
+      await claim()
+      throw Object.assign(new Error(`supplier leak: ${CODE} Bearer ${bearerSecret} /var/lib/kin/private`), {
+        code,
+        status: 403,
+        ...(recovery && { recovery }),
+        authorityRequestId: reqId,
+      })
+    }
+    due()
+    const beforeCalls = activateCalls
+    await shop.pollActivation()
+    assert.equal(activateCalls, beforeCalls + 1)
+    // A second poll must be a complete no-op because activation_next_at was cleared.
+    await shop.pollActivation()
+    assert.equal(activateCalls, beforeCalls + 1, `${code} (${recovery ?? 'no-recovery'}) must stop polling`)
+    assert.equal((await call('POST', `/orders/${id}/claim`, {})).error.code, 'shop_activation_pinned')
+
+    const viewed = (await call('GET', `/orders/${id}`)).data
+    assert.deepEqual(viewed.activation, {
+      vm_id: 'vm-slot',
+      state: 'needs_attention',
+      error_code: code,
+      ...(recovery && { recovery }),
+      authority_request_id: reqId,
+    })
+
+    // Retry-activation clears all stored error metadata immediately.
+    const retried = (await call('POST', `/orders/${id}/retry-activation`, {})).data
+    assert.deepEqual(retried.activation, { vm_id: 'vm-slot', state: 'activating' })
+    const clearedRow = db.prepare('SELECT * FROM crag_shop_orders WHERE order_id = ?').get(id)
+    assert.equal(clearedRow.activation_error_code, null)
+    assert.equal(clearedRow.activation_error_recovery, null)
+    assert.equal(clearedRow.activation_request_id, null)
+  }
+
+  // 4. Security check: untrusted/secret values in error fields are never persisted or returned.
+  for (const untrustedError of [
+    Object.assign(new Error(`leak ${CODE} ${bearerSecret} /etc/machine-id`), {
+      code: bearerSecret,
+      recovery: CODE,
+      authorityRequestId: `${randomUUID()} ${CODE}`,
+    }),
+    Object.assign(new Error(`leak ${CODE}`), {
+      code: CODE,
+      recovery: '/opt/private/credential',
+      authorityRequestId: bearerSecret,
+    }),
+  ]) {
+    activateBehavior = async () => {
+      throw untrustedError
+    }
+    due()
+    await shop.pollActivation()
+    const rawRow = JSON.stringify(db.prepare('SELECT * FROM crag_shop_orders WHERE order_id = ?').get(id))
+    const rawView = JSON.stringify(await call('GET', `/orders/${id}`))
+    const rawList = JSON.stringify(await call('GET', '/orders'))
+    for (const secret of [CODE, bearerSecret, '/etc/machine-id', '/opt/private', 'leak']) {
+      assert.equal(rawRow.includes(secret), false)
+      assert.equal(rawView.includes(secret), false)
+      assert.equal(rawList.includes(secret), false)
+    }
+  }
+
+  // 5. Transitioning to 'active' clears any prior activation_error_* fields.
+  const preActiveReqId = randomUUID()
+  db.prepare(`UPDATE crag_shop_orders
+    SET activation_error_code = 'crag_subscription_authority_unavailable',
+        activation_error_recovery = 'failed',
+        activation_request_id = ?,
+        activation_next_at = 1
+    WHERE order_id = ?`).run(preActiveReqId, id)
+  activateBehavior = async ({ onRedeemed }) => {
+    onRedeemed()
+  }
+  await shop.pollActivation()
+  const activeOrder = (await call('GET', `/orders/${id}`)).data
+  assert.deepEqual(activeOrder.activation, { vm_id: 'vm-slot', state: 'active' })
+  const activeRow = db.prepare('SELECT * FROM crag_shop_orders WHERE order_id = ?').get(id)
+  assert.equal(activeRow.activation_error_code, null)
+  assert.equal(activeRow.activation_error_recovery, null)
+  assert.equal(activeRow.activation_request_id, null)
+  assert.ok(statusCalls >= 1)
 })

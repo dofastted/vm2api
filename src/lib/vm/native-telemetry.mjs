@@ -27,12 +27,23 @@ export function telemetryDefaultEnabled(routing) {
   return routing?.telemetry?.default_enabled === true
 }
 
+/** routing.telemetry.disable_nonessential_traffic. Default false (keep unset so /usage works). */
+export function telemetryDisableNonessentialTraffic(routing) {
+  return routing?.telemetry?.disable_nonessential_traffic === true
+}
+
 export function validateTelemetryRoutingPatch(body = {}) {
   if (!body || typeof body !== 'object' || body.telemetry == null) return []
   if (typeof body.telemetry !== 'object' || Array.isArray(body.telemetry)) return ['telemetry 必须是对象']
   const problems = []
   if (Object.hasOwn(body.telemetry, 'default_enabled') && typeof body.telemetry.default_enabled !== 'boolean') {
     problems.push('telemetry.default_enabled 必须是布尔值')
+  }
+  if (
+    Object.hasOwn(body.telemetry, 'disable_nonessential_traffic') &&
+    typeof body.telemetry.disable_nonessential_traffic !== 'boolean'
+  ) {
+    problems.push('telemetry.disable_nonessential_traffic 必须是布尔值')
   }
   if (Object.hasOwn(body.telemetry, 'upload_interval_seconds')) {
     const n = body.telemetry.upload_interval_seconds

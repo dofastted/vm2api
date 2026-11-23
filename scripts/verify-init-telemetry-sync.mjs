@@ -136,12 +136,12 @@ async function fixtureFinalize() {
   record('native routing configured without identity payload', !!kernel.telemetry && !kernel.telemetry.identity)
   record('native seed retains explicit consent', seed.seed_policy?.telemetry_disabled === false)
   record('fixture write is not publication or activation', out.wrote && !out.published && !out.applied)
-  record('native telemetry keeps other traffic disabled', settings.env?.[NONESSENTIAL_TRAFFIC_ENV_KEY] === '1')
+  record('native telemetry keeps nonessential unset', settings.env?.[NONESSENTIAL_TRAFFIC_ENV_KEY] === undefined)
   record('controller fingerprint not overwritten', vm.fingerprint?.device_id === 'slot-preset')
   record(
     'native identity preserved',
     JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8')).userID === USER &&
-      fs.existsSync(path.join(home, '.claude', '.claude.json')),
+    fs.existsSync(path.join(home, '.claude', '.claude.json')),
   )
   record(
     'credentials preserved',

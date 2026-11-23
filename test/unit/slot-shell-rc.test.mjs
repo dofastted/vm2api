@@ -104,15 +104,25 @@ test('native shell routes usage and cc to native Claude and directs login to the
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-native-'))
   try {
     const bin = path.join(dir, 'claude')
-    fs.writeFileSync(bin, '#!/bin/sh\nprintf "native:%s:%s\\n" "$*" "${CLAUDE_CODE_VERSION-unset}"\n', { mode: 0o755 })
+    fs.writeFileSync(
+      bin,
+      '#!/bin/sh\nprintf "native:%s:%s:%s\\n" "$*" "${CLAUDE_CODE_VERSION-unset}" "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC-unset}"\n',
+      { mode: 0o755 },
+    )
     const { rc } = panelShellLaunch(bin, { native: true })
     const ran = spawnSync('bash', ['-c', `${rc}\nusage\n/usage\ncc --version\nclaude auth login`], {
       encoding: 'utf8',
-      env: { ...process.env, HOME: dir, CLAUDE_CODE_VERSION: 'stale', KIN_PANEL_RCFILE: path.join(dir, 'rc') },
+      env: {
+        ...process.env,
+        HOME: dir,
+        CLAUDE_CODE_VERSION: 'stale',
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '0',
+        KIN_PANEL_RCFILE: path.join(dir, 'rc'),
+      },
     })
     assert.equal(ran.status, 2, ran.stderr)
-    assert.match(ran.stdout, /native:\/usage:unset/)
-    assert.match(ran.stdout, /native:--version:unset/)
+    assert.match(ran.stdout, /native:\/usage:unset:unset/)
+    assert.match(ran.stdout, /native:--version:unset:unset/)
     assert.doesNotMatch(ran.stdout, /native:auth login/)
     assert.match(ran.stderr, /面板账号页/)
     const rcPath = path.join(dir, 'interactive-rc')
@@ -120,10 +130,15 @@ test('native shell routes usage and cc to native Claude and directs login to the
     const interactive = spawnSync('bash', ['--rcfile', rcPath, '-i'], {
       input: '/usage\nexit\n',
       encoding: 'utf8',
-      env: { ...process.env, HOME: dir, KIN_PANEL_RCFILE: rcPath },
+      env: {
+        ...process.env,
+        HOME: dir,
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '0',
+        KIN_PANEL_RCFILE: rcPath,
+      },
     })
     assert.equal(interactive.status, 0, interactive.stderr)
-    assert.match(interactive.stdout, /native:\/usage:unset/)
+    assert.match(interactive.stdout, /native:\/usage:unset:unset/)
     assert.match(interactive.stderr, /\x1b\]133;A\x07/)
     assert.match(interactive.stderr, /\x1b\]133;C\x07/)
   } finally {
@@ -257,14 +272,14 @@ test('an ops shell ticket cannot be upgraded into an official login', async () =
   fs.mkdirSync(path.join(root, 'vms', 'vm-02', 'cli-home', '.kin'), { recursive: true })
   fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02' }))
   fs.writeFileSync(path.join(root, 'vms', 'vm-02', 'cli-home', '.kin', 'cli-node'), '')
-  const shell = createSlotShell({ projectRoot: root, logger: { warn() {} } })
+  const shell = createSlotShell({ projectRoot: root, logger: { warn() { } } })
   const ops = await shell.issueTicket('vm-02')
   const seen = []
   const socket = {
     write(data) {
       seen.push(String(data))
     },
-    destroy() {},
+    destroy() { },
   }
   try {
     const handled = shell.handleUpgrade(

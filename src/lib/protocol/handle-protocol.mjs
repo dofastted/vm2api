@@ -213,6 +213,7 @@ import {
 import { materializeRemoteImageSources } from './images.mjs'
 import { applyMinMaxTokens } from './min-max-tokens.mjs'
 import { detectWarmupIntercept, formatWarmupSse, warmupMockMessage } from './warmup-intercept.mjs'
+import { queueAllowedByHeaders } from './queue-hint.mjs'
 
 /**
  * Which upstream refusals end the caller session. Claude Code's auto-mode
@@ -1740,6 +1741,7 @@ export function createHandleProtocol(deps) {
     // Worker hop stays realtime unless the caller asked for verified.
     // stream:false only changes the client response shape (assembled JSON).
     const deliveryMode = requestedDelivery === 'verified' ? 'verified' : 'realtime'
+    const allowQueue = queueAllowedByHeaders(req.headers)
     // A master-key pin is panel test-chat / diagnostics (manage). Everything else is dispatch.
     const ownerScope = panelDiagnostics ? { type: 'any' } : ownerScopeFromRequest(req, apiKeyStore?.users)
     // Cache bypass is a client hint; only authenticated master-key probes may skip accounting.
@@ -1817,6 +1819,7 @@ export function createHandleProtocol(deps) {
         },
         stream: upstreamStream,
         deliveryMode,
+        allowQueue,
         signal: clientAbort.signal,
         applyAttempt: async (body, selected, extra = {}) => {
           // Only this account's own thinking replays as thinking. Another
@@ -2430,8 +2433,8 @@ export function createHandleProtocol(deps) {
     }
     if (!observedHop && result?.attemptCount > 0) afterHop(result)
 
-    // This request never reached generation and supplies no account quota evidence.
-    if (result?.accountId && result.policy?.reason !== 'crag_opaque_429') {
+    // Zero-execution rejections (e.g. session_home_slot_busy) and opaque CRAG 429s never reached generation.
+    if (result?.accountId && result.attemptCount !== 0 && result.policy?.reason !== 'crag_opaque_429') {
       try {
         const limitText = [
           logBag.error_message,

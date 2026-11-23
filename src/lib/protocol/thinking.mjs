@@ -310,8 +310,10 @@ const CATALOG_EFFORT = [
   ['opus-4-8', 'high'],
   ['opus-4-7', 'xhigh'],
   ['opus-4-6', 'xhigh'],
+  ['fable-5-2', 'medium'],
   ['fable-5-1', 'high'],
   ['fable-5', 'high'],
+  ['mythos-5-2', 'medium'],
   ['mythos-5-1', 'high'],
 ]
 

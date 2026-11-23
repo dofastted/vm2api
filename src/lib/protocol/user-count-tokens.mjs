@@ -263,9 +263,15 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
 export async function handleUserCountTokens(req, res, deps) {
   const json = (...args) => deps.json(...args)
   if (!deps.requireAuth(req, res)) return
+  const routing =
+    typeof deps.getRoutingConfig === 'function'
+      ? deps.getRoutingConfig()
+      : typeof deps.getRouting === 'function'
+        ? deps.getRouting()
+        : null
   let inbound
   try {
-    inbound = await deps.readBody(req, inboundBodyLimit(deps.getRouting?.(), deps.cfg.limits.max_body_bytes))
+    inbound = await deps.readBody(req, inboundBodyLimit(routing, deps.cfg.limits.max_body_bytes))
   } catch (error) {
     if (error?.body?.error) return json(res, error.status || 400, error.body)
     return json(
@@ -283,7 +289,6 @@ export async function handleUserCountTokens(req, res, deps) {
   if (!parsed.ok) return json(res, parsed.error.status, parsed.error.body)
   const modelDenied = keyModelError(req, parsed.body.model, { anthropic: true })
   if (modelDenied) return json(res, modelDenied.status, modelDenied.body)
-  const routing = typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : null
   if (
     claudeCodeOnlyFromRouting(routing) &&
     detectInboundPlatform(parsed.body.model).platform === 'anthropic' &&

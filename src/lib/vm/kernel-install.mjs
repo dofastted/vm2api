@@ -637,7 +637,9 @@ export async function installKernelTargets({
               return failure(target, laid?.code || phase, laid?.error || '内核文件安装失败', true)
             }
             phase = 'kernel_seed_failed'
-            await (ops.initializeSlotSeedFiles || initializeSlotSeedFiles)(projectRoot, candidate, slotHost(candidate))
+            await (ops.initializeSlotSeedFiles || initializeSlotSeedFiles)(projectRoot, candidate, slotHost(candidate), {
+              routing,
+            })
             phase = 'kernel_config_failed'
             const config = (ops.writeKernelConfig || writeKernelConfig)(projectRoot, candidate, {
               routing,
