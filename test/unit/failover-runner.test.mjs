@@ -2760,6 +2760,49 @@ test('keep_session_home with allowQueue:false: a home kernel with no free slot a
   assert.equal(result.accountId, 'account-1')
 })
 
+test('keep_session_home: home_slot_busy_max_wait_ms bounds the home retry with 529', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const noted = []
+  scheduler.noteKernelSlotBusy = (unit) => noted.push(unit.accountId)
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: pinnedStickyRouter(),
+    config: {
+      same_account_retry_delay_ms: 0,
+      home_slot_busy_retry_ms: 20,
+      home_slot_busy_max_wait_ms: 120,
+      keep_session_home: true,
+    },
+  })
+  const seen = []
+  const startedAt = Date.now()
+  const result = await runner.run({
+    requestId: 'req-home-slot-busy-bounded',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    stickyKey: 'sess:home',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return {
+        ok: false,
+        status: 503,
+        upstreamExecutions: 0,
+        body: { error: { type: 'api_error', code: 'slot_busy', message: 'no free slot' } },
+      }
+    },
+  })
+  const elapsed = Date.now() - startedAt
+  assert.ok(seen.length >= 2, 'retried home before giving up')
+  assert.ok(
+    seen.every((id) => id === 'account-1'),
+    'never spilled the transcript',
+  )
+  assert.ok(elapsed >= 120 && elapsed < 2000, `bounded wait (${elapsed}ms)`)
+  assert.equal(result.status, 529)
+  assert.equal(result.body.error.details.reason, 'session_home_slot_busy')
+  assert.equal(noted.length, seen.length, 'every kernel slot_busy reaches the lease ledger')
+})
+
 test('keep_session_home with allowQueue:false: pre-hop kernel slot_busy stamps zero attemptCount and zero hops', async () => {
   const previous = process.env.KIN_KERNEL_BIN
   process.env.KIN_KERNEL_BIN = process.execPath

@@ -56,6 +56,7 @@ import { activeHoursOf, evaluateActiveHours } from './active-hours.mjs'
 import { vmNodeDataPath } from '../cluster/placement.mjs'
 import { GATE_DIAL_TIMEOUT_MS } from '../cluster/direct-link.mjs'
 import { ErrorCode } from '../core/errors.mjs'
+import { KernelLeaseStats, kernelCapacityOf, leaseVerdict, normalizeKernelLeaseMode } from './kernel-lease.mjs'
 import { HOST_PRESSURE_CRITICAL, HOST_PRESSURE_OK, hostMemoryLevelForVm } from '../cluster/host-memory-pressure.mjs'
 
 const WAIT_TIMEOUT_MIN_MS = 1000
@@ -67,6 +68,13 @@ export const SEAT_GRACE_MAX_MS = 120000
 export const SEAT_BUDGET_RESERVE_MAX = 0.5
 export const CIRCUIT_THRESHOLD_MAX = 20
 export const CIRCUIT_OPEN_MIN_MS = 1000
+
+const CONTENT_AFFINITY_MAX = 5000
+
+/** Seat keys derived from request content (cache text / fingerprint / batch member), not a client session. */
+function isContentSeatKey(seatKey) {
+  return /^seat:(h|bg):/.test(String(seatKey || ''))
+}
 
 /** A queued request re-reads eligibility this often, so cooldown lifts and new slots reach it. */
 const QUEUE_REFRESH_MS = 2000
@@ -96,6 +104,8 @@ export const DEFAULT_POOL_ROUTING = Object.freeze({
    * the provider. 0 disables the guard (upstream behaviour).
    */
   fresh_account_isolation_ms: 0,
+  /** kernel_lease enforce: kernel queue wait for a leased request (see kernelLeaseWaitDeadline). */
+  kernel_lease_queue_grace_ms: 5000,
 })
 
 const DEFAULT_CONFIG = {
@@ -164,6 +174,14 @@ export function normalizePoolRouting(pool = {}) {
   // Auto schedule level from the weekly reset (closer reset = higher level).
   // On by default; off flattens every auto-level slot so load spreads evenly.
   next.reset_priority = next.reset_priority !== false
+  // Kernel slot lease (kernel-lease.mjs): off | observe | enforce. Off by default.
+  next.kernel_lease = normalizeKernelLeaseMode(next.kernel_lease)
+  next.kernel_lease_queue_grace_ms = clampNumber(
+    next.kernel_lease_queue_grace_ms,
+    DEFAULT_POOL_ROUTING.kernel_lease_queue_grace_ms,
+    0,
+    WAIT_TIMEOUT_MAX_MS,
+  )
   next.queue_max = clampNumber(next.queue_max, DEFAULT_POOL_ROUTING.queue_max, QUEUE_MAX_MIN, QUEUE_MAX_MAX)
   next.seat_grace_ms = clampNumber(next.seat_grace_ms, DEFAULT_POOL_ROUTING.seat_grace_ms, 0, SEAT_GRACE_MAX_MS)
   next.seat_budget_reserve_pct = clampNumber(
@@ -593,6 +611,9 @@ export class PoolScheduler extends EventEmitter {
     this.inflightFamily = new Map()
     /** vmId → live reservations; mirrors `inflight` (per account) for the panel. */
     this.vmInflight = new Map()
+    this.kernelLeaseStats = new KernelLeaseStats()
+    // kernel_lease enforce: content-derived seat key -> VM it last ran on (ranking only).
+    this.contentAffinity = new Map()
     this.waiters = new Map()
     this.waiterSequence = 0
     this.dueWaiterRefreshes = new Set()
@@ -711,6 +732,13 @@ export class PoolScheduler extends EventEmitter {
       if (args.summarySession) seatKey = `seat:sess:${args.summarySession}`
     }
     if (!seatKey) return this.selectDirect(args)
+    // kernel_lease enforce: a seat derived from request content (no client
+    // session) is affinity, not a conversation. Each request takes its own
+    // kernel lease, preferring the VM the seat last ran on, so one batch
+    // cannot queue on a full kernel while other kernels sit idle.
+    if (this.config.kernel_lease === 'enforce' && !child && !fallback && isContentSeatKey(seatKey)) {
+      return this.selectContentSeat(args, scopedSeatKey(seatKey, args.ownerScope))
+    }
     const selected = await this.selectSeat({
       ...args,
       seatKey: scopedSeatKey(seatKey, args.ownerScope),
@@ -855,6 +883,19 @@ export class PoolScheduler extends EventEmitter {
     }
   }
 
+  async selectContentSeat(args, seatKey) {
+    const home = this.planner.seatOf(seatKey)?.vmId || this.contentAffinity.get(seatKey) || null
+    const selected = await this.selectDirect({ ...args, deviceVmId: home || args.deviceVmId || null })
+    if (selected?.ok && selected.vmId) {
+      this.contentAffinity.delete(seatKey)
+      this.contentAffinity.set(seatKey, selected.vmId)
+      if (this.contentAffinity.size > CONTENT_AFFINITY_MAX) {
+        this.contentAffinity.delete(this.contentAffinity.keys().next().value)
+      }
+    }
+    return selected
+  }
+
   async selectDirect(args = {}) {
     const {
       model,
@@ -921,12 +962,15 @@ export class PoolScheduler extends EventEmitter {
         sticky: selected.selectionReason === 'sticky',
         allowWait,
       }),
-      slotWaitDeadlineMs: this.slotWaitDeadlineMs({
-        startedAt,
-        loopDeadline: Math.min(loopDeadline, queuedDeadline),
-        sticky: selected.selectionReason === 'sticky',
-        allowWait,
-      }),
+      slotWaitDeadlineMs: this.kernelLeaseWaitDeadline(
+        reservation,
+        this.slotWaitDeadlineMs({
+          startedAt,
+          loopDeadline: Math.min(loopDeadline, queuedDeadline),
+          sticky: selected.selectionReason === 'sticky',
+          allowWait,
+        }),
+      ),
     })
     for (;;) {
       if (signal?.aborted) throw makeAbortError()
@@ -1239,6 +1283,7 @@ export class PoolScheduler extends EventEmitter {
             ? Math.min(failoverDeadline, phaseDeadline)
             : this.slotWaitDeadlineMs({ startedAt, loopDeadline: failoverDeadline, sticky, allowWait }),
       }
+      result.slotWaitDeadlineMs = this.kernelLeaseWaitDeadline(granted.reservation, result.slotWaitDeadlineMs)
       consumed = true
       return result
     }
@@ -1568,7 +1613,7 @@ export class PoolScheduler extends EventEmitter {
     }
     // A machine out of memory opens no seat for a new conversation (queued grants included).
     if (!current && selectionReason !== 'sticky' && candidate.hostPressure === HOST_PRESSURE_CRITICAL) return null
-    const reservation = this.reserve(candidate)
+    const reservation = this.reserve(candidate, { selectionReason })
     if (!reservation) return null
     // Quota/circuit admission can release another request and synchronously grant a queued ticket.
     if (limits.subagents != null) {
@@ -2793,7 +2838,7 @@ export class PoolScheduler extends EventEmitter {
   }
 
   /** Synchronous request permit; affinity seats and transport workers never own the counters. */
-  reserve(candidate, { skipQuota = false, pinned = false } = {}) {
+  reserve(candidate, { skipQuota = false, pinned = false, selectionReason = null } = {}) {
     const { accountId, vmId } = candidate
     const snapshot = candidate.exec ? this.admissionSnapshot(candidate, { pinned }) : {}
     if (!snapshot) return null
@@ -2809,6 +2854,8 @@ export class PoolScheduler extends EventEmitter {
     if (physicalFull()) return null
     const requestInflight = this.inflight.get(candidate.accountId) || 0
     if (!candidate.maxConcurrency || requestInflight >= candidate.maxConcurrency) return null
+    const lease = this.kernelLeaseCheck(candidate)
+    if (lease?.deny) return null
     const family = isFableModel(candidate.model) ? FABLE_FAMILY_KEY : null
     const fableCap = Number(this.config.fable_max_per_account)
     if (
@@ -2848,11 +2895,19 @@ export class PoolScheduler extends EventEmitter {
     this.inflight.set(accountId, (this.inflight.get(accountId) || 0) + 1)
     this.bumpFamily(accountId, family, 1)
     this.bumpVmInflight(vmId, 1)
+    if (lease)
+      this.kernelLeaseStats.noteGrant({
+        ...lease,
+        selectionReason: selectionReason || candidate.selectionReason || null,
+      })
     let released = false
     return {
       reserved: true,
       slotIndex: null,
       quotaToken: quotaReservation?.token,
+      kernelLease: lease
+        ? { verdict: lease.verdict, capacity: lease.capacity, inflight: lease.inflight, mode: lease.mode }
+        : null,
       release: (releaseSeat) => {
         if (released) return
         released = true
@@ -2868,6 +2923,49 @@ export class PoolScheduler extends EventEmitter {
         this.notifyCapacity(accountId)
       },
     }
+  }
+
+  /**
+   * Kernel slot lease ledger check for one more request on candidate's VM
+   * (see kernel-lease.mjs). null when the lease is off.
+   */
+  kernelLeaseCheck(candidate) {
+    const mode = this.config.kernel_lease
+    if (!mode || mode === 'off' || candidate.external) return null
+    const vmId = String(candidate.vmId || '')
+    const health = this.healthCache.get(vmId)?.value || candidate.workerStatus
+    const capacity = kernelCapacityOf(health)
+    const inflight = this.vmInflight.get(vmId) || 0
+    const verdict = leaseVerdict({ capacity, inflight })
+    const deny = mode === 'enforce' && verdict === 'over'
+    if (deny) this.kernelLeaseStats.bump('denied', vmId)
+    return { mode, vmId, capacity, inflight, verdict, deny }
+  }
+
+  /** The kernel answered slot_busy for a reservation; counts ledger desyncs. */
+  noteKernelSlotBusy(selected) {
+    const lease = selected?.kernelLease
+    if (!lease) return
+    this.kernelLeaseStats.noteSlotBusy({ ...lease, vmId: selected.vmId })
+  }
+
+  /**
+   * enforce: the ledger holds a free slot for this request, so the kernel
+   * queue wait (gateway_policy.queue_wait_ms) only has to cover a slot that is
+   * still being released (a native process exiting after the previous
+   * request): kernel_lease_queue_grace_ms, not the whole sticky wait. A kernel
+   * still full after that is a desync and answers instead of eating the budget.
+   * 0 means do not queue at all.
+   */
+  kernelLeaseWaitDeadline(reservation, deadline) {
+    const lease = reservation?.kernelLease
+    if (lease?.mode !== 'enforce' || lease.verdict !== 'ok') return deadline
+    const graceEnd = Date.now() + this.config.kernel_lease_queue_grace_ms
+    return Number.isFinite(deadline) ? Math.min(deadline, graceEnd) : graceEnd
+  }
+
+  kernelLeaseSnapshot() {
+    return { mode: this.config.kernel_lease || 'off', ...this.kernelLeaseStats.snapshot() }
   }
 
   /** Live request count per VM for the panel seat stream; every change pushes a frame. */

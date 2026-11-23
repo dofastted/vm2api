@@ -122,6 +122,10 @@ const DEFAULTS = {
   keep_session_home: false,
   // keep_session_home: pause between retries of a home kernel that had no free slot.
   home_slot_busy_retry_ms: 2000,
+  // keep_session_home: once the request has run this long, a busy home kernel
+  // answers 529 session_home_slot_busy instead of being retried until
+  // total_retry_deadline_ms. 0 keeps waiting until the deadline (upstream behaviour).
+  home_slot_busy_max_wait_ms: 0,
 }
 
 function clone(value) {
@@ -1033,8 +1037,10 @@ export class FailoverRunner {
     }
     // x-kin-queue: off — the home kernel being full is the pool being full for this
     // conversation: answer 529 now rather than wait for the slot.
+    // home_slot_busy_max_wait_ms bounds the same wait for every request.
     const homeSlotRefused = (unit, policy) => {
       if (policy?.reason !== 'slot_busy') return null
+      this.scheduler?.noteKernelSlotBusy?.(unit)
       if (unit?.isSubagent) {
         subagentSlotDeadline ??= unit.slotWaitDeadlineMs
         if (allowQueue && Date.now() < subagentSlotDeadline) return null
@@ -1044,7 +1050,10 @@ export class FailoverRunner {
           ...attribution(),
         }
       }
-      if (allowQueue || !isHome(unit)) return null
+      if (!isHome(unit)) return null
+      const maxWait = Number(this.config.home_slot_busy_max_wait_ms) || 0
+      const waitedOut = maxWait > 0 && Date.now() - startedAt >= maxWait
+      if (allowQueue && !waitedOut) return null
       releaseStickySlots()
       return {
         ...poolOverloadedError({ reason: 'session_home_slot_busy', attempt_count: budget.hops }),
