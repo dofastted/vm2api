@@ -71,7 +71,12 @@ const isDigest = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(v
 
 const HOST_DOMAIN = 'crag-host-v1:'
 const MAC_DOMAIN = 'crag-host-mac-v1:'
+const DMI_DOMAIN = 'crag-host-dmi-v1:'
+const CPU_DOMAIN = 'crag-host-cpu-v1:'
 const NET_DIRECTORY = '/sys/class/net'
+/** The hypervisor's per-instance UUID. Read when no NIC qualifies. */
+const DMI_UUID_FILE = '/sys/class/dmi/id/product_uuid'
+const CPU_INFO_FILE = '/proc/cpuinfo'
 /** Must match the Authority's own cap; unsigned detail must not grow unbounded. */
 const MAX_QUOTA_GRANTS = 256
 
@@ -147,6 +152,64 @@ function macDeviceRaw(netDirectory) {
   // colliding with machine-id-derived ones.
   return createHash('sha256').update(`${MAC_DOMAIN}${best}`).digest('hex').slice(0, 32)
 }
+/** The hypervisor's own per-instance identifier, for hosts where no NIC
+ * qualifies -- a container with only virtual interfaces, or a guest whose
+ * addresses are all locally assigned. SMBIOS carries a UUID that the platform
+ * generates per instance, which is what makes it a usable stand-in for the MAC.
+ * It is not a hash of anything the operator pastes around, so it goes through
+ * the same domain-separated digest as the MAC does.
+ */
+function dmiDeviceRaw(file = DMI_UUID_FILE) {
+  let raw
+  try {
+    raw = fs.readFileSync(file, 'utf8').trim().toLowerCase()
+  } catch {
+    return null
+  }
+  if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(raw)) return null
+  const flat = raw.replaceAll('-', '')
+  // Some boards ship a placeholder rather than leaving the field absent.
+  if (/^(0{32}|f{32})$/.test(flat)) return null
+  return createHash('sha256').update(`${DMI_DOMAIN}${flat}`).digest('hex').slice(0, 32)
+}
+
+/** Last resort, and a weak one: CPU details are identical across every instance
+ * of the same machine type, so this cannot tell two cloned guests apart. It is
+ * here only so that a host with neither a qualifying NIC nor an SMBIOS UUID gets
+ * *an* identity instead of being refused outright -- a host that reaches this
+ * source and collides is no worse off than it was before, since without it the
+ * request fails anyway. Only the fields that survive a reboot are read: model,
+ * physical topology and count, never the live frequency.
+ */
+function cpuDeviceRaw(file = CPU_INFO_FILE) {
+  let text
+  try {
+    text = fs.readFileSync(file, 'utf8')
+  } catch {
+    return null
+  }
+  const stable = []
+  let processors = 0
+  for (const line of text.split('\n')) {
+    const [rawKey, ...rest] = line.split(':')
+    const key = rawKey.trim().toLowerCase()
+    const value = rest.join(':').trim()
+    if (key === 'processor') {
+      processors += 1
+      continue
+    }
+    if (!value) continue
+    if (key === 'model name' || key === 'vendor_id' || key === 'physical id' || key === 'cpu cores')
+      stable.push(`${key}=${value}`)
+  }
+  if (!stable.length || !processors) return null
+  const unique = [...new Set(stable)].sort()
+  return createHash('sha256')
+    .update(`${CPU_DOMAIN}${processors}\n${unique.join('\n')}`)
+    .digest('hex')
+    .slice(0, 32)
+}
+
 const validSku = (value) => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value)
 const validMonths = (value) => Number.isSafeInteger(value) && value >= 1 && value <= 4294967295
 const invalidRights = () => fail('crag_subscription_invalid_entitlement', 502)
@@ -528,6 +591,8 @@ export function createCragSubscription({
   origin = AUTHORITY,
   machineIdFile = process.env.KIN_CRAG_HOST_ID_FILE,
   netDirectory = NET_DIRECTORY,
+  dmiUuidFile = DMI_UUID_FILE,
+  cpuInfoFile = CPU_INFO_FILE,
 } = {}) {
   if (origin !== AUTHORITY && !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}$/.test(origin)) throw fail()
   const publicDir = cragSubscriptionPublicDirectory(projectRoot)
@@ -570,92 +635,59 @@ export function createCragSubscription({
     return raw
   }
 
-  /** Where this machine's identity can be sampled from, best first. The MAC
-   * comes before the machine-id because it is the one that is actually unique;
-   * see `macDeviceRaw`. */
+  /** Where this machine's identity can be sampled from, best first.
+   *
+   * Uniqueness decides the order, because a source that repeats across cloned
+   * guests hands the second one to register a permanent 403. The MAC and the
+   * SMBIOS UUID are both per-instance, so they come first; `machine-id` ships
+   * unreset in cloud images and is exactly what collided, so it ranks below
+   * them rather than above. The CPU digest is last and is not unique at all --
+   * see `cpuDeviceRaw` -- it only keeps a host that has none of the others from
+   * being refused outright. */
   function* candidateRaws() {
     if (machineIdFile) {
       for (const file of [machineIdFile].flat()) yield ['override', machineIdRaw(file, false)]
       return
     }
     yield ['mac', macDeviceRaw(netDirectory)]
+    yield ['dmi', dmiDeviceRaw(dmiUuidFile)]
     if (!fs.existsSync(HOST_ID_MOUNT) && !isContainerized()) {
       for (const file of ['/etc/machine-id', '/var/lib/dbus/machine-id']) yield ['machine-id', machineIdRaw(file, true)]
     } else {
       yield ['mount', machineIdRaw(HOST_ID_MOUNT, false)]
     }
+    yield ['cpu', cpuDeviceRaw(cpuInfoFile)]
   }
 
-  /** The stored readable form, if it is there and really does derive `hostId`.
-   * The host id stays the single authority: a `device_uuid` that does not
-   * derive it was tampered with or belongs to another install. */
-  function readStoredUuid(hostId) {
-    let stored
-    try {
-      stored = load(uuidFile, 0o644, 36)
-    } catch {
-      return null
-    }
-    return stored && normalizeDeviceUuid(stored) === stored && uuidToHostId(stored) === hostId ? stored : null
-  }
-
-  /** Recover the readable form for an install that predates `device_uuid`, and
-   * write it out once. Returns null when it cannot be reconstructed. */
-  function backfillUuid(hostId, sources) {
-    for (const [, raw] of sources) {
-      if (hostIdFromRaw(raw) !== hostId) continue
-      const uuid = formatDeviceUuid(raw)
-      try {
-        publish(uuidFile, uuid, 0o644)
-      } catch {
-        // Being able to display the identity is not worth failing a request over.
-      }
-      return uuid
-    }
-    // A machine whose machine-id has since changed cannot have its UUID
-    // reconstructed -- sha256 does not run backwards. Reporting null is honest.
-    // A fabricated one would not derive this host id, and would silently aim a
-    // migration at a device that does not exist.
-    return null
-  }
-
-  /** Resolves this machine's identity as `{ hostId, uuid, source }`. */
+  /** Resolves this machine's identity as `{ hostId, uuid, source }`.
+   *
+   * The sampled hardware is the only truth. A stored `host_id` is no longer
+   * consulted for the answer -- it is retired by `credential()` once it stops
+   * matching -- because preferring it is what made a collision permanent: two
+   * guests cloned from one image derive the same id, and the second to register
+   * kept being refused for as long as that id stayed pinned in its own files.
+   *
+   * The cost is accepted deliberately: a host whose sampled identity changes
+   * through ordinary maintenance -- a swapped NIC, a rebuilt container -- now
+   * becomes a new host and has to migrate its subscription by order id. That is
+   * the trade this chose, and it is why `candidateRaws` is ordered by
+   * uniqueness: the fewer hosts whose identity moves, the fewer migrations.
+   *
+   * Sampling stays lazy. This runs on slot-start admission, so it stops at the
+   * first sound source instead of reading every one of them.
+   */
   function deviceIdentity() {
     if (process.platform !== 'linux') throw hostIdentityUnavailable()
-    let saved
     try {
       storage()
-      saved = load(hostFile, 0o644, 64)
     } catch {
       throw fail('crag_subscription_storage_unavailable')
     }
-    // A stored identity is returned exactly as it stands, with no value
-    // comparison. This machine has already paid; a regenerated machine-id, a
-    // rebuilt container or a swapped NIC must not turn it into a stranger. This
-    // is what used to raise `crag_subscription_host_identity_changed`, and what
-    // left paid hosts wedged after ordinary maintenance.
-    //
-    // Sources are still required to be sound: one that is missing or replaced by
-    // something unsafe is a different matter from one whose value changed, and
-    // only the latter is tolerated. In the settled case any single sound source
-    // settles that, and `candidateRaws` is lazy, so this path does not sample
-    // every source -- it runs on slot-start admission.
-    if (saved) {
-      const stored = readStoredUuid(saved)
-      if (stored) {
-        for (const [, raw] of candidateRaws()) {
-          if (raw) return { hostId: saved, uuid: stored, source: 'saved' }
-        }
-        throw hostIdentityUnavailable()
-      }
-      const sources = [...candidateRaws()].filter(([, raw]) => raw)
-      if (!sources.length) throw hostIdentityUnavailable()
-      return { hostId: saved, uuid: backfillUuid(saved, sources), source: 'saved' }
+    for (const [source, raw] of candidateRaws()) {
+      if (!raw) continue
+      return { hostId: hostIdFromRaw(raw), uuid: formatDeviceUuid(raw), source }
     }
-    const sources = [...candidateRaws()].filter(([, raw]) => raw)
-    if (!sources.length) throw hostIdentityUnavailable()
-    const [source, raw] = sources[0]
-    return { hostId: hostIdFromRaw(raw), uuid: formatDeviceUuid(raw), source }
+    throw hostIdentityUnavailable()
   }
 
   function identity() {
@@ -674,15 +706,22 @@ export function createCragSubscription({
   function rebuildDeviceIdentity({ reason } = {}) {
     if (!reason) throw fail()
     storage()
-    const raw = macDeviceRaw(netDirectory)
-    // Without a usable NIC the rebuild would land right back on the machine-id
-    // it is trying to escape, destroying the stored identity for nothing.
-    if (!raw) throw hostIdentityUnavailable()
+    // Same order as the ordinary path, so a rebuild cannot land on a source the
+    // ordinary path would have rejected -- and so a host with no qualifying NIC
+    // can still be rebuilt, which a MAC-only rebuild could not do.
+    let picked
+    for (const [source, raw] of candidateRaws()) {
+      if (!raw) continue
+      picked = [source, raw]
+      break
+    }
+    if (!picked) throw hostIdentityUnavailable()
+    const [source, raw] = picked
     const uuid = formatDeviceUuid(raw)
     const hostId = hostIdFromRaw(raw)
     publish(hostFile, hostId, 0o644)
     publish(uuidFile, uuid, 0o644)
-    return { hostId, uuid, source: 'mac' }
+    return { hostId, uuid, source }
   }
 
   function storage(create = false) {
@@ -726,9 +765,49 @@ export function createCragSubscription({
     return { code, claims: verifyCragHostEntitlement(projectRoot, code, hostId, { allowExpired: true, vm }) }
   }
 
+  /** Retire a stored identity so the freshly derived one can take over.
+   *
+   * Every file that belongs to the old identity moves aside together: leaving
+   * `entitlement.code` or `redeem.json` behind would hand the new host id the
+   * previous one's rights and half-finished redemption. The suffix keeps the old
+   * values readable for support and for a manual rollback, and nothing reads
+   * them back -- a retired identity never takes part in authentication again.
+   *
+   * The first group is load-bearing and a failure there aborts the rotation: a
+   * half-retired identity is worse than either end state, because `credential()`
+   * would then mint a second key for a host that still holds the first. The
+   * second group is bookkeeping, and losing it is not worth failing a request.
+   */
+  function retireIdentity() {
+    for (const file of [hostFile, keyFile, uuidFile, entitlementFile, intentFile]) {
+      try {
+        fs.renameSync(file, `${file}.legacy`)
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw fail('crag_subscription_storage_unavailable')
+      }
+    }
+    for (const file of [rosterIntentFile, deferredReleaseFile, marker]) {
+      try {
+        fs.renameSync(file, `${file}.legacy`)
+      } catch {
+        // Bookkeeping only; the identity has already moved.
+      }
+    }
+  }
+
   function credential(hostId, initialize = false) {
-    const prior = load(hostFile, 0o644, 64)
-    if (prior != null && prior !== hostId) throw fail()
+    let prior = load(hostFile, 0o644, 64)
+    // The derived identity is now the only truth. A stored value that no longer
+    // matches it belongs to hardware this machine no longer has, so it is
+    // retired rather than trusted -- and rather than refused, which is what used
+    // to happen here and what left a host whose id collided with another's
+    // wedged at 403 for good. Retiring clears the way for the fresh identity, so
+    // what follows runs exactly as it does on a first install.
+    if (prior != null && prior !== hostId) {
+      retireIdentity()
+      prior = null
+      initialize = true
+    }
     let key = load(keyFile, 0o600, 43)
     if (!key) {
       if (
