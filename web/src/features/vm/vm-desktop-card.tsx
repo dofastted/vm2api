@@ -42,8 +42,38 @@ export function VmDesktopCard({ vm }: { vm: Vm }) {
   const [open, setOpen] = useState(false)
   const [fullscreen, setFullscreen] = useState(false)
   const [clip, setClip] = useState('')
+  const [remoteClip, setRemoteClip] = useState('')
   const frameRef = useRef<HTMLDivElement>(null)
   const viewer = useRef<NoVncHandle | null>(null)
+
+  // 面板多为 HTTP 直连（非安全上下文），navigator.clipboard 不可用，
+  // 用隐藏 textarea + execCommand 在点击手势内写本机剪贴板
+  const copyToLocal = async (text: string) => {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text)
+        return true
+      }
+    } catch {
+      // 落入 execCommand 兜底
+    }
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    ta.remove()
+    return ok
+  }
+
+  // 工具栏按钮点击后自动把焦点还给桌面画面（输入框除外，用户可能要继续打字）
+  const refocusDesktop = () => {
+    const el = document.activeElement
+    if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return
+    viewer.current?.focus()
+  }
 
   const status = useQuery({
     queryKey: ['vm-desktop', id],
@@ -118,12 +148,16 @@ export function VmDesktopCard({ vm }: { vm: Vm }) {
                   if (p === 'open')
                     void qc.invalidateQueries({ queryKey: ['vm-desktop', id] })
                 }}
+                onClipboard={setRemoteClip}
               />
             </div>
-            <div className='flex flex-wrap items-center gap-2'>
+            <div
+              className='flex flex-wrap items-center gap-2'
+              onMouseUp={() => setTimeout(refocusDesktop, 0)}
+            >
               <Input
                 className='h-8 max-w-xs'
-                placeholder='粘贴到桌面剪贴板（验证码等）'
+                placeholder='发送到桌面剪贴板（长文本兜底）'
                 value={clip}
                 onChange={(e) => setClip(e.target.value)}
               />
@@ -134,11 +168,30 @@ export function VmDesktopCard({ vm }: { vm: Vm }) {
                 onClick={() => {
                   viewer.current?.paste(clip)
                   setClip('')
-                  toast.success('已写入桌面剪贴板，在浏览器内 Ctrl+V 粘贴')
+                  toast.success('已写入桌面剪贴板')
                 }}
               >
                 发送剪贴板
               </Button>
+              <Button
+                size='sm'
+                variant='outline'
+                disabled={!remoteClip}
+                title={remoteClip}
+                onClick={async () => {
+                  const ok = await copyToLocal(remoteClip)
+                  if (ok) toast.success('已复制到本机剪贴板')
+                  else toast.error('复制失败，请手动复制预览内容')
+                }}
+              >
+                带回桌面剪贴板
+              </Button>
+              <span
+                className='max-w-[16rem] truncate text-xs text-muted-foreground'
+                title={remoteClip}
+              >
+                桌面剪贴板：{remoteClip || '（空）'}
+              </span>
               <Button size='sm' variant='outline' onClick={goFullscreen}>
                 全屏
               </Button>
@@ -146,6 +199,9 @@ export function VmDesktopCard({ vm }: { vm: Vm }) {
                 关闭
               </Button>
             </div>
+            <p className='text-xs text-muted-foreground'>
+              Mac 直接用 Command+C / V：复制粘贴已与桌面双向直通（桌面内复制的内容点「带回桌面剪贴板」或在本面板页按 Command+C 取回）；Command+=/- 缩放会作用到桌面内网页。长中文文本请用上方输入框发送（直通通道对中文暂不生效）。
+            </p>
           </>
         ) : (
           <div className='flex flex-wrap items-center gap-3'>

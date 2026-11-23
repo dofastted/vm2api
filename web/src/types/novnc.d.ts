@@ -19,8 +19,10 @@ declare module '@novnc/novnc' {
     focusOnClick: boolean
     background: string
     disconnect(): void
-    focus(): void
+    focus(options?: { preventScroll?: boolean }): void
     sendCtrlAltDel(): void
+    /** 按键注入：keysym 为 X11 keysym（如 0xffe3=Control_L）；down 传 null 表示瞬时按下并释放 */
+    sendKey(keysym: number, code: string, down: boolean | null): void
     clipboardPasteFrom(text: string): void
   }
 }
