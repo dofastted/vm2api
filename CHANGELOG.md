@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 1.4.183 — 2026-11-23 · CRAGGemini 系列：运行时信任根、宿主崩溃与多并发池绑定；自适应 thinking 预算不再越过 max_tokens
+
+- CRAGGemini 的授权信任根不再自证。此前 `readCragGeminiPackageAuthority` 在没有独立锚点时会回落去读载荷目录自带的 `crag-license-public.pem`——等于让载荷为自己的密钥作证。现在无独立 PEM 或 64 位十六进制 SHA-256 pin 时直接 fail closed（`gemini_payload_invalid_signature`）；文件读取改用 `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` 并校验是常规文件与大小上界（`O_NONBLOCK` 让 FIFO 也能非阻塞打开，随后 `isFile()` 为假而被拒）；新增 `KIN_GEMINI_PUBLIC_KEY_FILE` 供运维轮换授权密钥而无需重新构建 vm2api，未配置时回落到 `deploy/payload.json` 里 git 跟踪的 SHA-256 pin（#1628）。
+- **这条的部署前提不在代码里，值得单独记。** `deploy/payload.json` 原先不在 overlay 的打包清单内，而 `remote-apply.sh` 是逐条显式拷贝，所以线上那份冻结在初装时刻（实测 11-18），而 gemini 的 pin 是 1.4.180（11-23）才加进去的——那个键在线上根本不存在。于是 fail closed 会让每一次订阅读取都退化成 409 `gemini_subscription_package_unready`。pin 的值本来是对的（`deploy/payload.json` 与线上实装 PEM 的 sha256 逐字相同，均为 `f6e3ef3a50fd…`），坏的只是投递，所以修法落在部署侧：overlay 带上 `deploy/payload.json`，apply 时安装并备份，rollback 时恢复。**这个修法在 gitignore 的本地 skill 脚本里、不随仓库留痕**，换机器或重建 skill 目录会丢，表现为 CRAGGemini 订阅静默 409；要让它不可丢需把「overlay 必须发布 `deploy/payload.json`」写进 `docs/DEPLOY.md`，本版未做（#1628）。
+- CRAGGemini 宿主的 `/infer` 不再因未捕获异常崩掉 socket handler。`native_module()` / `invocation_module()` 每次调用都 `spec.loader.exec_module()`，于是每次都产生**新的模块对象**，`except native_module().NativeFailure` 与 `NativeSession.open_stream()` 内部抛出的实例所属的类不是同一个类对象，捕获永远不匹配——异常穿出去导致响应被丢（503 `gemini_host_unavailable`）且跳过 `EligibilityDiagnostic` 轮询。改为按文件身份 `(dev, ino, size, ctime_ns, mtime_ns)` 缓存受信模块，且 `check_root_owned()` 仍在缓存检查**之前**执行（缓存命中时照样重验 root 属主，没有把信任校验一起缓存掉），并在 `_stream_native_infer()` 里先捕获模块引用再 `except`（#1637）。
+- Google 账号的验证与不合格诊断打通到面板。原先 `EligibilityDiagnostic` 只匹配地域性不合格，丢掉 `server_oauth.go` 的 `Account ineligible: … Verify your account to continue.`，运维只看到笼统的 `gemini_inference_failed`；现在新增 `gemini_account_verification_required` 与 `gemini_account_ineligible` 的有界分类，贯穿宿主脚本、`gemini/routes.mjs`、`gemini/scheduler.mjs`（HTTP 403、不计入熔断）与前端状态投影（#1637）。
+- 支持 Google 原生 Gemini API key 凭据：`x-goog-api-key` 头与 `/v1beta/models*?key=` 查询串。`?key=` 的提取严格限定在 `/v1beta/models` 路径（取 `?` 前的 pathname 后要求精确等于或以 `/v1beta/models/` 开头），两条路都拒绝 `kin-panel-` 令牌，并在 `security.mjs` / `request-log.mjs` 补了头与查询串脱敏（#1637）。
+- 请求日志的 `path` 兜底剥掉查询串。`start()` 里取值是 `pathName || req.url || ''`，而 `_appendJsonl` 会把 summary 直接 `JSON.stringify` 写进 `data/request-logs/*.jsonl`，`redactSecrets` 在本仓库只作用于 body 与 error message、没有一处作用于 URL 字段。这条兜底当前不可达（三个调用点都传 `pathName`，它来自 `server.mjs` 的 `const p = url.pathname`，不含查询串），**但上一条让它变得有害**：将来任何新调用点漏传 `pathName`，带真 key 的原始 URL 就会原样落盘。剥整个查询串而不是脱敏 `key=` 单个参数名，对将来其他查询串凭据同样成立且热路径零正则开销（#1642）。
+- CRAGGemini 接入多并发池绑定、代理校准与可复制授权链接（#1645）。
+- `--crag-host-dir` 的默认路径对齐 `KIN_DATA_DIR`：服务模板与维护脚本原先硬编码 `@INSTALL_DIR@/src/data/crag-gemini-subscription/public`，而 Docker 与原生部署按 `KIN_DATA_DIR` 把宿主权益存在 `@INSTALL_DIR@/data/...`（#1637）。
+- 自适应 thinking 回退时生成的预算不再越过 `max_tokens`。`on_adaptive: 'convert_to_enabled'` 的模型（如 `claude-haiku-4-5`）在调用方未给 `budget_tokens` 时，上游拒掉 adaptive 后的修复会注入静态 `thinking_fallback_budget`（4096）而无视 `max_tokens`，于是 `max_tokens <= 4096` 的重试必然 400 `thinking.budget_tokens must be less than max_tokens`。现在平台生成的预算被钳到 `min(fallback, max(1024, floor(max_tokens/2)))`，在 `max_tokens > 1024` 的全区间恒满足 `1024 <= budget < max_tokens`；`max_tokens <= 1024` 时没有任何合法预算存在，改为直接返回结构化 400 `thinking_incompatible` 而不是伪造一个非法值，并且不再发出注定失败的第二跳、不冷却账号。显式的调用方 `budget_tokens` 与首跳 `cli-hop` 透传不受影响（#1631）。
+- 注意 `1025..2047` 这一段：`floor(max_tokens/2)` 落在 1024 以下被钳到 1024，所以输出余量最少只有 1 个 token。合法性没问题，但 PR 描述里「with output headroom」这半句在这一段不成立——1024 是 API 的 thinking 下限，这一段里任何合法预算都只能是 1024，能服务优于直接拒（#1631）。
+- CRAG 的拉取与安装按**槽位运行时架构**判定，不再用宿主的 `process.arch`，混合架构机器上不会再拉错架构的内核（#1634）。
+- 超大入站图片在抵达上游之前被拦下（#1643）。
+- 审计对齐一批：桌面保活、混合架构 CRAG 更新、Codex 刷新冷却与遥测文档（#1641）。
+- 部署说明：本版仅涉及控制面、前端与宿主脚本，`deploy/payload.json` 的内容、`bin/`、`share/wrap-cli` 与 `worker/` 自 `v1.4.182` 起字节未变，`remote-apply.sh` 会报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync`，也无需重启槽位。本版新增一项：overlay 现在会把 `deploy/payload.json` 安装到 `/opt/vm2api/deploy/payload.json`（并备份到 `$BAK/deploy/`），这是上面 CRAGGemini 信任根生效的前提。
+
 ## 1.4.182 — 2026-11-23 · claude→responses 不再丢工具循环，槽位桌面 Mac 键盘与剪贴板直通，账号/桌面页签状态保活
 
 - claude→responses 转换不再丢掉多轮工具循环。旧实现只读 `message.content` 的字符串形态，`tool_calls` 一次都没被引用，`role=tool` 的消息又落进 `role = 'user'` 分支把 `tool_call_id` 一并丢掉，于是上游模型永远看不到工具输出、反复重发同一个调用，形成烧上游配额的死循环。改为复用 `chatMessageToItems`：assistant 的 `tool_calls` 变成 `function_call` 项，`role=tool` 变成 `function_call_output` 项。`call_id` 链路两端已逐一核对——`tool_use.id → toolCalls[].id → function_call.call_id` 与 `tool_result.tool_use_id → tool_call_id → function_call_output.call_id` 对得上，不会落到 `call_unknown` 兜底，循环因此能真正闭合（#1626）。
