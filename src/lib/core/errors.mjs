@@ -526,9 +526,17 @@ export function mapUpstreamError(status, body, headers = {}) {
       'classifier_invalid_cache',
       'invalid_request_context',
       'invalid_kernel_request',
+      'thinking_incompatible',
     ].includes(inboundCode)
   ) {
-    return makeError({ type: ErrorType.INVALID_REQUEST, code: inboundCode, message: body.error.message, status: 400 })
+    return makeError({
+      type: ErrorType.INVALID_REQUEST,
+      code: inboundCode,
+      message: body.error.message,
+      status: 400,
+      ...(inboundCode === 'thinking_incompatible' && body?.error?.param ? { param: body.error.param } : {}),
+      ...(inboundCode === 'thinking_incompatible' && body?.error?.details ? { details: body.error.details } : {}),
+    })
   }
   let msg =
     body?.error?.message ||
