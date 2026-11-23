@@ -175,7 +175,7 @@ function standaloneHost(t, fetchImpl) {
   }
 }
 
-test('host checkout falls back to the D-Bus machine ID without changing an existing binding', (t) => {
+test('host checkout falls back to the D-Bus machine ID and follows the live source', (t) => {
   const { root, machineIdFile, publicDir, connect } = standaloneHost(t)
   const alternate = path.join(root, 'dbus-machine-id')
   const service = connect({ machineIdFile: [machineIdFile, alternate] })
@@ -185,25 +185,32 @@ test('host checkout falls back to the D-Bus machine ID without changing an exist
   fs.writeFileSync(machineIdFile, 'uninitialized\n')
   assert.equal(service.purchaseDeviceId(), expected)
 
+  // A stored host id no longer freezes the answer. It used to, and that is what
+  // made a collision permanent: two guests cloned from one image derive the same
+  // id, and the second to register stayed pinned to it and refused forever. The
+  // sampled source is the only truth now, so the identity follows it.
   fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
   fs.writeFileSync(path.join(publicDir, 'host_id'), expected, { mode: 0o644 })
-  fs.writeFileSync(machineIdFile, 'b'.repeat(32))
-  assert.equal(service.purchaseDeviceId(), expected)
+  assert.equal(service.purchaseDeviceId(), expected, 'an unchanged source still answers the same')
 
+  const moved = 'b'.repeat(32)
+  fs.writeFileSync(machineIdFile, `${moved}\n`)
+  assert.equal(
+    service.purchaseDeviceId(),
+    crypto.createHash('sha256').update(`crag-host-v1:${moved}`).digest('hex'),
+    'the first sound source wins over the stored value',
+  )
+
+  // The price of that: a host whose source changes through ordinary maintenance
+  // becomes a new host and has to migrate its subscription by order id. This is
+  // the accepted trade, not an oversight -- `candidateRaws` is ordered by
+  // uniqueness precisely to keep the number of such hosts down.
   fs.rmSync(alternate)
-  // The machine-id now reads differently from the one this host was bound with.
-  // That used to raise `crag_subscription_host_identity_changed`, which wedged
-  // paid hosts after ordinary maintenance -- a regenerated machine-id, a
-  // rebuilt container, a replaced NIC. A stored identity is permanent instead.
-  //
-  // What this gives up is a local heuristic, not a boundary: whoever can copy
-  // the data directory onto another machine already has the credential sitting
-  // in it and can speak to the Authority directly, and `slot_limit` still caps
-  // what a duplicate can consume.
-  assert.equal(service.purchaseDeviceId(), expected)
-  // Tolerating a changed value is not tolerating an unsound source: with the
-  // only remaining source replaced by a symlink, the identity is unavailable
-  // rather than quietly trusted.
+  assert.equal(service.purchaseDeviceId(), crypto.createHash('sha256').update(`crag-host-v1:${moved}`).digest('hex'))
+
+  // Following a changed value is not trusting an unsound source: with the only
+  // remaining source replaced by a symlink, the identity is unavailable rather
+  // than quietly accepted.
   fs.rmSync(machineIdFile)
   fs.symlinkSync(path.join(publicDir, 'host_id'), machineIdFile)
   assert.throws(() => service.purchaseDeviceId(), { code: 'crag_subscription_host_identity_unavailable' })
@@ -272,7 +279,7 @@ test('host identity comes from the NIC, so machines cloned from one image do not
   assert.notEqual(connect({ machineIdFile: null, netDirectory: unusable }).deviceIdentity().source, 'mac')
 })
 
-test('a stored identity survives maintenance, and its UUID is backfilled then verified', (t) => {
+test('the sampled source outranks a stored identity, and the UUID always derives it', (t) => {
   const { machineIdFile, publicDir, connect } = standaloneHost(t)
   const raw = 'abcdef0123456789abcdef0123456789'
   fs.writeFileSync(machineIdFile, `${raw}\n`, { mode: 0o600 })
@@ -281,29 +288,31 @@ test('a stored identity survives maintenance, and its UUID is backfilled then ve
   fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
   fs.writeFileSync(path.join(publicDir, 'host_id'), original.hostId, { mode: 0o644 })
 
-  // Backfilled once for an install that predates the file, and self-verified on
-  // every later read.
-  const uuidFile = path.join(publicDir, 'device_uuid')
-  const backfilled = service.deviceIdentity()
-  assert.equal(backfilled.source, 'saved')
-  assert.equal(backfilled.uuid, original.uuid)
-  assert.equal(fs.readFileSync(uuidFile, 'utf8'), original.uuid)
+  // The readable form is computed from the same sample as the host id, so it is
+  // self-consistent by construction -- there is nothing left to backfill, and
+  // nothing to verify against a stored copy.
+  const settled = service.deviceIdentity()
+  assert.equal(settled.hostId, original.hostId)
+  assert.equal(settled.uuid, original.uuid)
+  assert.equal(service.resolveDeviceUuid(settled.uuid), settled.hostId)
+  assert.notEqual(settled.source, 'saved', 'a stored value is no longer a source')
 
-  // Maintenance replaced the machine-id. The host id does not move with it.
+  // Maintenance replaced the machine-id, so this is now a different host. That
+  // is the point: when it was *not*, a cloned guest stayed pinned to an id it
+  // shared with another machine and was refused for good.
   fs.writeFileSync(machineIdFile, `${'b'.repeat(32)}\n`, { mode: 0o600 })
-  assert.equal(service.deviceIdentity().hostId, original.hostId)
+  const moved = service.deviceIdentity()
+  assert.notEqual(moved.hostId, original.hostId)
+  assert.equal(service.resolveDeviceUuid(moved.uuid), moved.hostId)
 
-  // The host id is the only authority: a device_uuid that does not derive it is
-  // discarded rather than allowed to speak for this host. With the original
-  // source now gone, no UUID can be reconstructed, and reporting none is honest
-  // -- a fabricated one would aim a migration at a device that does not exist.
-  fs.writeFileSync(uuidFile, '00000000-0000-4000-8000-000000000001', { mode: 0o644 })
-  const tampered = service.deviceIdentity()
-  assert.equal(tampered.hostId, original.hostId)
-  assert.equal(tampered.uuid, null)
+  // A tampered `device_uuid` cannot speak for this host because it is never read
+  // back -- the file is a readable projection of the identity, not an input to it.
+  fs.writeFileSync(path.join(publicDir, 'device_uuid'), '00000000-0000-4000-8000-000000000001', { mode: 0o644 })
+  assert.equal(service.deviceIdentity().hostId, moved.hostId)
+  assert.equal(service.deviceIdentity().uuid, moved.uuid)
 })
 
-test('the identity rebuild escape hatch is never taken by the ordinary path', (t) => {
+test('the ordinary path re-derives the identity, and a rebuild still states its reason', (t) => {
   const { root, publicDir, connect } = standaloneHost(t)
   const service = connect({
     machineIdFile: null,
@@ -313,23 +322,41 @@ test('the identity rebuild escape hatch is never taken by the ordinary path', (t
   fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
   fs.writeFileSync(path.join(publicDir, 'host_id'), 'c'.repeat(64), { mode: 0o644 })
 
-  // A stored identity stays put no matter how often it is resolved. If resolving
-  // could rebuild, "a stored identity is permanent" would mean nothing.
-  assert.equal(service.deviceIdentity().hostId, 'c'.repeat(64))
-  assert.equal(service.deviceIdentity().hostId, 'c'.repeat(64))
+  // Resolving now re-derives rather than honouring the stored value. That used
+  // to be reserved for an explicit rebuild, and leaving it there is what kept a
+  // host whose id collided with another's refused at 403 for good.
+  assert.equal(service.deviceIdentity().hostId, before.hostId)
+  assert.equal(service.deviceIdentity().hostId, before.hostId)
 
-  // Only an explicit call rebuilds, and it has to say why.
+  // The explicit rebuild remains, and still has to say why: it also *writes*
+  // the derived values out, which resolving deliberately does not do.
   assert.throws(() => service.rebuildDeviceIdentity(), { code: 'crag_subscription_unavailable' })
   const rebuilt = service.rebuildDeviceIdentity({ reason: 'host_id_collision' })
   assert.equal(rebuilt.hostId, before.hostId)
-  assert.equal(service.deviceIdentity().hostId, before.hostId)
+  assert.equal(rebuilt.source, 'mac')
+  assert.equal(fs.readFileSync(path.join(publicDir, 'host_id'), 'utf8'), before.hostId)
 
-  // Without a usable NIC a rebuild would land back on the machine-id it is
-  // escaping, so it refuses rather than destroying the stored identity.
-  const stuck = connect({ machineIdFile: null, netDirectory: path.join(root, 'absent') })
-  assert.throws(() => stuck.rebuildDeviceIdentity({ reason: 'host_id_collision' }), {
-    code: 'crag_subscription_host_identity_unavailable',
-  })
+  // A host with no qualifying NIC is no longer stuck: the SMBIOS UUID is also
+  // per-instance, so a rebuild reaches it instead of refusing.
+  const dmi = path.join(root, 'product_uuid')
+  fs.writeFileSync(dmi, '7f1c9a52-3b84-4d61-9f2e-0a5d8c6b4e13\n')
+  const viaDmi = connect({ machineIdFile: null, netDirectory: path.join(root, 'absent'), dmiUuidFile: dmi })
+  assert.equal(viaDmi.rebuildDeviceIdentity({ reason: 'host_id_collision' }).source, 'dmi')
+
+  // With the per-instance sources gone it keeps descending rather than failing.
+  // `/etc/machine-id` and `/proc/cpuinfo` are not injectable and exist on any
+  // ordinary Linux host, so "every source unavailable" is no longer reachable
+  // from here -- which is what the CPU fallback is for: an identity that is
+  // merely weak beats no identity, because without one the request fails
+  // outright. Being unable to assert the refusal is the honest consequence, so
+  // this asserts the descent instead.
+  const descended = connect({
+    machineIdFile: null,
+    netDirectory: path.join(root, 'absent'),
+    dmiUuidFile: path.join(root, 'absent-dmi'),
+  }).rebuildDeviceIdentity({ reason: 'host_id_collision' })
+  assert.ok(['machine-id', 'mount', 'cpu'].includes(descended.source), `descended to ${descended.source}`)
+  assert.match(descended.hostId, /^[a-f0-9]{64}$/)
 })
 
 test('per-voucher detail is shown only when it reconciles with the signed aggregate', async (t) => {
