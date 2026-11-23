@@ -6,7 +6,7 @@ import { LOCAL_CRAG_CLAUDE, REMOTE_CRAG_CLAUDE } from '../vm/slot-engine.mjs'
 import { slotExecCmd, slotExecContainer } from '../vm/slot-exec.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { flattenOauthIdentity } from './oauth-identity.mjs'
-import { installedCragV2Root, materializeCragV2, verifyCragV2Tree } from '../vm/wrap-cli-runtime.mjs'
+import { cragSlotArch, installedCragV2Root, materializeCragV2, verifyCragV2Tree } from '../vm/wrap-cli-runtime.mjs'
 
 export const AUTH_LOGIN_SOURCE = 'claude-auth-login'
 export const AUTH_LOGIN_FLAVOR = 'claude_code'
@@ -23,9 +23,10 @@ export function resolveAuthLoginClaude(vm) {
 /** Stage a complete package without selecting CRAG as the slot's inference engine. */
 function stageBundledAuthClaude(projectRoot, vm) {
   if (slotHost(vm).bakedKernel) return
+  const slotArch = cragSlotArch(projectRoot, vm)
   const installed = installedCragV2Root(projectRoot, vm)
   if (installed && fs.existsSync(path.join(installed, 'manifest.json'))) {
-    const verified = verifyCragV2Tree(installed, { allowPreviousClaude: true })
+    const verified = verifyCragV2Tree(installed, { arch: slotArch, allowPreviousClaude: true })
     if (!verified.ok) throw fail(verified.code, verified.error)
     return
   }
@@ -92,8 +93,8 @@ export async function readNativeLoginOauth(run, configDir) {
     '/bin/sh',
     '-c',
     'read_json() { [ -f "$1" ] && dd if="$1" iflag=nofollow,nonblock bs=65537 count=1 status=none; }; ' +
-    '[ ! -L "$1" ] && [ -f "$1/complete" ] && read_json "$1/.credentials.json" || exit 1; ' +
-    'printf "\\n\\036\\n"; if [ -f "$1/.claude.json" ]; then read_json "$1/.claude.json"; fi',
+      '[ ! -L "$1" ] && [ -f "$1/complete" ] && read_json "$1/.credentials.json" || exit 1; ' +
+      'printf "\\n\\036\\n"; if [ -f "$1/.claude.json" ]; then read_json "$1/.claude.json"; fi',
     'native-oauth-result',
     configDir,
   ])
@@ -120,8 +121,8 @@ export function officialLoginCredentialToOauth(doc, profile) {
   const scopes = Array.isArray(oauth.scopes)
     ? oauth.scopes
     : String(oauth.scope || '')
-      .trim()
-      .split(/\s+/)
+        .trim()
+        .split(/\s+/)
   if (!scopes.includes('user:profile') || !scopes.includes('user:inference')) {
     throw fail('auth_login_scope', '官方登录没有拿到完整 OAuth 权限')
   }

@@ -6,6 +6,7 @@ import {
 } from './upstream-error-policy.mjs'
 import { listQuotaFromHeaders } from './quota-window.mjs'
 import { flattenSearchResultHistory, searchHistoryFingerprint } from '../protocol/request-rectifier.mjs'
+import { MIN_THINKING_BUDGET } from '../protocol/thinking.mjs'
 import {
   CLIENT_POOL_BUSY_MESSAGE,
   CLIENT_POOL_RATE_LIMITED_MESSAGE,
@@ -259,11 +260,12 @@ function selectedUsage(selected, accountQuota = null) {
 function classifyAttempt(
   result,
   selected,
-  { model, repaired, oauth401CooldownMs, signatureRepair },
+  { model, requestBody, repaired, oauth401CooldownMs, signatureRepair },
   accountQuota = null,
 ) {
   return classifyUpstreamResult(result, {
     model,
+    requestBody,
     repaired,
     hasRefresh: selectedHasRefresh(selected),
     oauth401CooldownMs,
@@ -1260,12 +1262,34 @@ export class FailoverRunner {
               selected,
               {
                 model,
+                requestBody,
                 repaired,
                 oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
                 signatureRepair: signatureRepairEnabled(this.config) || attemptMeta?.foreignThinking === true,
               },
               this.scheduler?.accountQuota,
             )
+        if (policy.reason === 'thinking_incompatible' && !result?.committed) {
+          const upstreamMessage = String(result?.body?.error?.message || '').trim()
+          const detail = `thinking.budget_tokens must be at least ${MIN_THINKING_BUDGET} and less than max_tokens (got max_tokens=${requestBody?.max_tokens})`
+          const message = upstreamMessage ? `${upstreamMessage}; ${detail}` : detail
+          result = {
+            ...result,
+            ok: false,
+            status: 400,
+            body: {
+              type: 'error',
+              error: {
+                ...(result?.body?.error || {}),
+                type: 'invalid_request_error',
+                code: 'thinking_incompatible',
+                param: 'max_tokens',
+                message,
+                details: { ...(result?.body?.error?.details || {}), retryable: false },
+              },
+            },
+          }
+        }
         if (
           !pinVmId &&
           selected.accountId &&
@@ -1375,13 +1399,36 @@ export class FailoverRunner {
           return { ...result, ...attribution(), finalState: 'verified' }
         }
         if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
+          let nextBody
+          try {
+            nextBody = repairAnthropicRequest(requestBody, policy)
+          } catch (repairError) {
+            if (repairError?.status === 400 && repairError?.body?.error) {
+              releaseStickySlots()
+              return {
+                ...result,
+                ok: false,
+                status: 400,
+                body: repairError.body,
+                ...attribution(),
+                finalState: 'invalid_request',
+                policy: attachFailureDecision({
+                  scope: 'request',
+                  action: 'stop',
+                  reason: repairError.body.error.code || 'invalid_request',
+                  cooldownUntil: null,
+                }),
+              }
+            }
+            throw repairError
+          }
           repaired = true
           repairPolicy = { action: policy.action, reason: policy.reason }
           repairPending = true
           if (policy.reason === 'search_repairable' && repairKey && fingerprint()) {
             searchRepair = { key: repairKey }
           }
-          requestBody = repairAnthropicRequest(requestBody, policy)
+          requestBody = nextBody
           continue
         }
         applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
@@ -1421,9 +1468,11 @@ export class FailoverRunner {
           [
             'invalid_cache_control',
             'crag_prompt_too_large',
+            'image_too_large',
             'invalid_image_url',
             'invalid_kernel_request',
             'invalid_tool_schema',
+            'thinking_incompatible',
           ].includes(error.body?.error?.code)
         noteHop(invalidRequest ? { upstreamExecutions: 0 } : null)
         if (error?.code === 'response_sent') {

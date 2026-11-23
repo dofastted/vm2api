@@ -37,9 +37,9 @@ export function VmAccountIdentity({ vm }: { vm: Vm }) {
         <PlatformMark vm={vm} />
         <span
           className='truncate font-mono font-medium'
-          title={vm.name || vm.id}
+          title={vm.name ? `${vm.name} · ${vm.id}` : vm.id}
         >
-          {clipLabel(vm.gemini ? vm.name || vm.id : vm.id)}
+          {clipLabel(vm.name || vm.id, 16)}
         </span>
       </div>
       <div className='flex min-w-0 items-center gap-1.5'>

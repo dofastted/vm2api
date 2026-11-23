@@ -928,3 +928,71 @@ test('CRAG cache keeps several releases and switches between them without downlo
   assert.equal(fs.existsSync(first), true)
   assert.equal(listKernelReleases(root, 'crag').releases.length, 3)
 })
+
+test('ARM64 control plane with x86_64 slot runtime pulls, indexes and stages amd64 CRAG packages', async (t) => {
+  const supplier = seedEncryptedPackage(fixture(t), { arch: 'amd64', revision: 'arm64-host-amd64-slot' })
+  const bytes = archive(supplier)
+  const issuerSha = createHash('sha256')
+    .update(fs.readFileSync(path.join(supplier, 'crag-license-public.pem')))
+    .digest('hex')
+
+  // Case 1: Official ARM64 container layout (DOCKER_DEFAULT_PLATFORM=linux/amd64), even with an empty fleet.
+  {
+    const root = fixture(t)
+    writeIssuerPins(root, [{ path: 'share/crag/kernels/v2/amd64/crag-license-public.pem', sha256: issuerSha }])
+    const arm64DockerSlotEnv = { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: 'linux/amd64' }
+    const pulled = await pullKernelRelease(
+      root,
+      { kernel: 'crag' },
+      { ...transport({ [CRAG_V2_RELEASE_ASSET]: bytes }), ...arm64DockerSlotEnv },
+    )
+    assert.equal(pulled.ok, true, pulled.error)
+    assert.equal(fs.existsSync(path.join(root, 'share/crag/kernels/v2/current-amd64.json')), true)
+    assert.equal(describeKernelCatalog(root, arm64DockerSlotEnv)[1].ready, true)
+    assert.equal(listKernelReleases(root, 'crag', arm64DockerSlotEnv).releases.length, 1)
+
+    const materialized = materializeCragV2(
+      root,
+      { id: 'vm-01', dataplane: 'wrap' },
+      { select: false, ...arm64DockerSlotEnv },
+    )
+    assert.equal(materialized.ok, true, materialized.error)
+    assert.equal(fs.existsSync(path.join(root, 'vms/vm-01/cli-home/.kin/crag-v2/claude-code-2.1.321/claude')), true)
+  }
+
+  // Case 2: ARM64 host without DOCKER_DEFAULT_PLATFORM, but existing Docker slot has an x86-64 staged cc-node ELF.
+  {
+    const root = fixture(t)
+    writeIssuerPins(root, [{ path: 'share/crag/kernels/v2/amd64/crag-license-public.pem', sha256: issuerSha }])
+    fs.mkdirSync(path.join(root, 'vms/vm-01/cli-home/.kin'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'vms/vm-01.json'), JSON.stringify({ id: 'vm-01', dataplane: 'wrap' }))
+    fs.writeFileSync(path.join(root, 'vms/vm-01/cli-home/.kin/cc-node'), elf('slot-x64'), { mode: 0o755 })
+    const bareArm64Env = { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: '' }
+    const pulled = await pullKernelRelease(
+      root,
+      { kernel: 'crag' },
+      { ...transport({ [CRAG_V2_RELEASE_ASSET]: bytes }), ...bareArm64Env },
+    )
+    assert.equal(pulled.ok, true, pulled.error)
+    assert.equal(describeKernelCatalog(root, bareArm64Env)[1].ready, true)
+    const staged = materializeCragV2(root, { id: 'vm-01', dataplane: 'wrap' }, { select: false, ...bareArm64Env })
+    assert.equal(staged.ok, true, staged.error)
+  }
+
+  // Case 3: Legitimate mismatch protection remains when slots are arm64 / non-amd64.
+  for (const runtimeEnv of [
+    { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: '' },
+    { arch: 'x64', platform: 'linux', dockerDefaultPlatform: 'linux/arm64' },
+  ]) {
+    const root = fixture(t)
+    writeIssuerPins(root, [{ path: 'share/crag/kernels/v2/amd64/crag-license-public.pem', sha256: issuerSha }])
+    const http = transport({ [CRAG_V2_RELEASE_ASSET]: bytes })
+    const rejected = await pullKernelRelease(root, { kernel: 'crag' }, { ...http, ...runtimeEnv })
+    assert.equal(rejected.ok, false)
+    assert.equal(rejected.code, 'crag_v2_arch_mismatch')
+    assert.equal(
+      http.seen.some((url) => url.includes('/assets/')),
+      false,
+    )
+  }
+})

@@ -23,7 +23,9 @@ export function isTelemetryEnabled(pol = {}) {
 /**
  * Official CLI kill switches. When telemetry is ON these keys must be
  * absent — GitHub #84631: the value "0" still disables.
- * NONESSENTIAL is not in this map; it is always written by the contract.
+ * NONESSENTIAL is not in this map: it stays unset by default and is only
+ * written as "1" when global routing.telemetry.disable_nonessential_traffic
+ * is explicitly enabled.
  * Bedrock and Vertex are not telemetry switches. A value of "1" makes the
  * official CLI fetch AWS credentials from 169.254.169.254 instead of
  * calling Anthropic. They are forced to "0" below.

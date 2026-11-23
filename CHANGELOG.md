@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.4.182 — 2026-11-23 · claude→responses 不再丢工具循环，槽位桌面 Mac 键盘与剪贴板直通，账号/桌面页签状态保活
+
+- claude→responses 转换不再丢掉多轮工具循环。旧实现只读 `message.content` 的字符串形态，`tool_calls` 一次都没被引用，`role=tool` 的消息又落进 `role = 'user'` 分支把 `tool_call_id` 一并丢掉，于是上游模型永远看不到工具输出、反复重发同一个调用，形成烧上游配额的死循环。改为复用 `chatMessageToItems`：assistant 的 `tool_calls` 变成 `function_call` 项，`role=tool` 变成 `function_call_output` 项。`call_id` 链路两端已逐一核对——`tool_use.id → toolCalls[].id → function_call.call_id` 与 `tool_result.tool_use_id → tool_call_id → function_call_output.call_id` 对得上，不会落到 `call_unknown` 兜底，循环因此能真正闭合（#1626）。
+- 复用带来两处行为差异，都是改善而非回归：空内容消息现在被丢弃（旧实现会产出一条 `text: ''` 的空 item），只有 `tool_calls` 的 assistant 轮次不再附带空的 `output_text` 消息。system 的特殊映射（`role: 'developer'` + `input_text`）在新路径上保持不变。另外 `chatMessageToItems` 从内部函数变成导出，消费方从 1 个变成 2 个（`chatToCodexResponses` 与 `claudeToOpenAIResponsesRequest`），文档注释已标注这一点，避免后续为 Codex 调整 `call_id` 兜底或空内容丢弃时意外改动 anthropic→responses 这条路（#1626、#1630）。
+- 槽位桌面补齐 Mac 键盘与剪贴板直通。Cmd 键映射、复制粘贴双向同步，粘贴改用内容比较而非时间窗去重，连按两次不再出现注入错位。中文等非 Latin-1 字符原先会被截成 `?`，现在经 `hasNonLatin1` 判定后走 keysym 逐字注入；超长文本降级到剪贴板通道并给出提示（#1621）。
+- **粘贴仍有一个窄交错边界，是已知且作者明确接受的。** 触发需要 paste 事件迟于 80ms 的兜底定时器、**且**用户在这个窗口内又按了一次 Cmd+V：迟到的 paste 无法分辨自己属于哪一次 keydown，会消费下一次的定时器，同时 keydown 上的 `pasteFallbackAtRef = 0` 擦掉了「刚刚兜底注入过」的记忆，结果多注入一次。比修复前「任意两次快速粘贴必错位」窄了一个量级，且自愈于下一次正常 paste。彻底消除需要给 keydown 配序号让 paste 精确配对消费，权衡后认为不值得这份机械复杂度——将来真有人报「偶尔多贴一次」，线索在这里（#1621）。
+- 账号与桌面页签的状态跨切换保活。radix Tabs 切换即卸载 `TabsContent`，原先会造成两个断点：账号页签生成的 OAuth 授权链接在切到桌面页签完成浏览器登录后丢失（而链接重生成即失效，授权被迫一次完成），以及 noVNC 连接随页签切换断开重连。两个 `TabsContent` 加 `forceMount` + `data-[state=inactive]:hidden` 后状态保活，授权可在两个页签间来回完成。配套把「Claude Code 授权」从全局 Dialog 改为账号页签内嵌面板——Dialog 是模态的，开着时根本点不到页签切换器，所以单靠保活达不到目的（#1623）。
+- 保活带来一处副作用已同版收口：`forceMount` 让 `VmDesktopCard` 在任意详情页打开时就挂载（默认页签是 `overview`，`desktop` 仅对 admin 可见），而它的状态 query 没有闸门，`refetchInterval: open ? false : 15_000` 于是变成常开——从未打开过桌面的页面也会一直打 `/api/panel/vms/<id>/desktop`。改为由详情页传入页签是否选中，未选中时不轮询；首次取值保留，切到桌面页签时状态是现成的。noVNC 连接本身由 `open` 门控，仍需点开才建立，保活语义不变（#1630）。
+- 槽位自定义名称在列表行、机架卡片、弹窗与详情页头部一致优先展示，悬停提示保留 VM id 作为出处，不会因为改了名就查不到真实标识（#1624）。
+- 部署说明：本版仅涉及控制面与前端，`deploy/payload.json`、`bin/`、`share/wrap-cli` 与 `worker/` 自 `v1.4.181` 起字节未变，`remote-apply.sh` 会报 `SLOT_SYNC=skip`，升级后无需执行 `wrap-cli/sync`，也无需重启槽位。
+
 ## 1.4.181 — 2026-11-23 · CRAG 3.1.14 修复 MCP 续接误报 410，终态后不再发迟到取消，降级订阅仍报设备标识
 
 - CRAG 内核升到 `3.1.14`（`payload-2026.11.23-crag-3.1.14`），解掉 MCP 续接误报 `410 MCP continuation is no longer available`。该版把 `tool-grants.idx` 的回调有效期与完整历史快照准入解耦，修复已认领批次过期后切支（Fork / AgentSummary / 追加文本）、256 条磁盘回执淘汰重发与工具参数规范化三类误报，并把工具发布与响应投递收敛为单锁原子临界区。面板内核目录新增 `3.1.14 MCP 续接恢复修复` 选项，旧版选择保留；授权身份（`9dbb4bc2…` / `835451e2…`）与官方 Claude Code `2.1.321` 沿用（#1613）。

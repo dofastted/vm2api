@@ -1684,3 +1684,29 @@ test('a start failure without runtime detail still reports the generic phase', a
   assert.equal(result.items[0].error, '内核重启或健康检查失败')
   assert.equal(getVm(root, vm.id).kernel_operation.failure.reason, null)
 })
+
+test('CRAG install preflight rejects a non-amd64 slot with crag_v2_arch_mismatch before stopping', async (t) => {
+  const { root, vm } = fixture(t)
+  fs.rmSync(path.join(root, 'share/crag/kernels/v2/arm64'), { recursive: true, force: true })
+  if (!fs.existsSync(path.join(root, 'share/crag/kernels/v2/amd64/manifest.json'))) {
+    seedEncryptedPackage(root, { arch: 'amd64' })
+  }
+  const armVmFile = path.join(root, 'vms', `${vm.id}.json`)
+  const armRecord = { ...JSON.parse(fs.readFileSync(armVmFile, 'utf8')), runtime: { type: 'docker', arch: 'arm64' } }
+  fs.writeFileSync(armVmFile, JSON.stringify(armRecord))
+  const before = fs.readFileSync(armVmFile)
+  const result = await installKernelTargets({
+    projectRoot: root,
+    targets: target('crag'),
+    ops: {
+      describeKernelCatalog: undefined,
+      stopSlot() {
+        assert.fail('arch mismatch preflight must not stop the slot')
+      },
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.items[0].code, 'crag_v2_arch_mismatch')
+  assert.equal(result.items[0].stopped, false)
+  assert.deepEqual(fs.readFileSync(armVmFile), before)
+})

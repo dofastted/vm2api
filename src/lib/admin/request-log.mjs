@@ -244,7 +244,13 @@ function redactHeaders(headers = {}) {
   const out = {}
   for (const [k, v] of Object.entries(headers)) {
     const key = String(k).toLowerCase()
-    if (key === 'authorization' || key === 'x-api-key' || key === 'cookie' || key === 'set-cookie') {
+    if (
+      key === 'authorization' ||
+      key === 'x-api-key' ||
+      key === 'x-goog-api-key' ||
+      key === 'cookie' ||
+      key === 'set-cookie'
+    ) {
       out[key] = '***REDACTED***'
     } else if (key === 'x-panel-token') {
       out[key] = '***REDACTED***'
@@ -494,7 +500,10 @@ export class RequestLogStore {
       mode,
       t0: Date.now(),
       protocol,
-      path: pathName || req.url || '',
+      // 兜底剥掉查询串：调用方都传 url.pathname，但 #1637 起 /v1beta/models 允许
+      // 用 ?key= 携带凭据，一旦有新调用点漏传 pathName，原始 req.url 会带着真 key
+      // 被 _appendJsonl 原样写进 request-logs（redactSecrets 只作用于 body）。
+      path: pathName || String(req.url || '').split('?', 1)[0],
       method: req.method || 'POST',
       ip: safeIp(req),
       user_agent: String(req.headers?.['user-agent'] || '').slice(0, 512),

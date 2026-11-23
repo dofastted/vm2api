@@ -35,6 +35,7 @@ export const ErrorCode = {
   // body
   INVALID_JSON: 'invalid_json',
   BODY_TOO_LARGE: 'body_too_large',
+  IMAGE_TOO_LARGE: 'image_too_large',
   EMPTY_BODY: 'empty_body',
   MISSING_FIELD: 'missing_field',
   INVALID_FIELD: 'invalid_field',
@@ -198,6 +199,26 @@ export function isThirdPartyClientMessage(message = '') {
 
 export const THIRD_PARTY_CLIENT_CLIENT_MESSAGE =
   '上游将此请求识别为第三方客户端调用，不按订阅额度计费，已拒绝。这不是内容拒答；原样重试会得到同样结果。'
+
+export const IMAGE_TOO_LARGE_MESSAGE = '图片过大,调整上传图片'
+
+const IMAGE_DIMENSIONS_TOO_LARGE_MESSAGE = /image dimensions? exceed max allowed size/i
+
+export function isImageDimensionsTooLargeMessage(message = '') {
+  return IMAGE_DIMENSIONS_TOO_LARGE_MESSAGE.test(String(message || ''))
+}
+
+export function makeImageTooLargeError({ param, details = {}, requestId } = {}) {
+  return makeError({
+    type: ErrorType.INVALID_REQUEST,
+    code: ErrorCode.IMAGE_TOO_LARGE,
+    message: IMAGE_TOO_LARGE_MESSAGE,
+    param,
+    status: 400,
+    details: { ...details, retryable: false },
+    request_id: requestId,
+  })
+}
 
 /** Non-retryable client error that keeps the upstream sentence. */
 export function makeThirdPartyClientError({ requestId, upstreamMessage, upstreamType, upstreamStatus } = {}) {
@@ -526,9 +547,22 @@ export function mapUpstreamError(status, body, headers = {}) {
       'classifier_invalid_cache',
       'invalid_request_context',
       'invalid_kernel_request',
+      'thinking_incompatible',
+      ErrorCode.IMAGE_TOO_LARGE,
     ].includes(inboundCode)
   ) {
-    return makeError({ type: ErrorType.INVALID_REQUEST, code: inboundCode, message: body.error.message, status: 400 })
+    return makeError({
+      type: ErrorType.INVALID_REQUEST,
+      code: inboundCode,
+      message: body.error.message,
+      status: 400,
+      ...(['thinking_incompatible', ErrorCode.IMAGE_TOO_LARGE].includes(inboundCode) && body?.error?.param
+        ? { param: body.error.param }
+        : {}),
+      ...(['thinking_incompatible', ErrorCode.IMAGE_TOO_LARGE].includes(inboundCode) && body?.error?.details
+        ? { details: body.error.details }
+        : {}),
+    })
   }
   let msg =
     body?.error?.message ||
@@ -732,6 +766,18 @@ export function mapUpstreamError(status, body, headers = {}) {
     }
   }
 
+  if (isImageDimensionsTooLargeMessage(msg)) {
+    return makeImageTooLargeError({
+      requestId: request_id,
+      param: body?.error?.param || undefined,
+      details: {
+        upstream_message: String(msg).slice(0, 300),
+        upstream_type: upType,
+        upstream_status: status,
+      },
+    })
+  }
+
   if (inboundCode === ErrorCode.UPSTREAM_INVALID || status === 400 || upType === 'invalid_request_error') {
     return makeError({
       type: ErrorType.INVALID_REQUEST,
@@ -739,8 +785,8 @@ export function mapUpstreamError(status, body, headers = {}) {
       message: String(msg),
       status:
         (inboundCode === ErrorCode.UPSTREAM_INVALID || upType === 'invalid_request_error') &&
-        status >= 400 &&
-        status < 500
+          status >= 400 &&
+          status < 500
           ? status
           : 400,
       param: body?.error?.param || undefined,

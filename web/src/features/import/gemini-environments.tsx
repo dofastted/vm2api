@@ -1,7 +1,10 @@
 import { useRef, useState } from 'react'
 import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
+import { Check, Copy, ExternalLink } from 'lucide-react'
+import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
 import {
   geminiAuthorizationLabel,
   geminiInferenceLabel,
@@ -79,6 +82,34 @@ export type GeminiInferenceStatus = {
   error_code: string | null
 }
 
+export type GeminiCragLicense = {
+  product: string
+  status: string
+  valid: boolean
+  seat_required?: boolean
+  scope?: string | null
+  seat?: number | null
+  expires_at?: number | null
+  code?: string | null
+  message?: string | null
+}
+
+export type GeminiCragSubscription = {
+  configured: boolean
+  active: boolean
+  product: string
+  host_id: string | null
+  sync_pending: boolean
+  version: number | null
+  revision: number | null
+  issued_at: number | null
+  expires_at: number | null
+  slot_limit: number | 'unlimited'
+  used_slots: number | null
+  available_slots: number | null
+  reclaim_supported: boolean
+}
+
 export type GeminiEnvironment = {
   id: string
   name: string
@@ -96,6 +127,7 @@ export type GeminiEnvironment = {
   models: string[]
   models_discovered?: boolean
   last_inference?: GeminiInferenceStatus | null
+  crag_license?: GeminiCragLicense | null
   account: {
     state: 'ok' | 'partial' | 'error' | 'reauth_required'
     checked_at: string | null
@@ -124,9 +156,11 @@ export type GeminiInventory = {
     | 'not_configured'
     | 'invalid'
     | 'unknown'
+  payload_mode?: 'legacy_release' | 'crag_subscription'
   payload_issue?: keyof typeof PAYLOAD_ISSUES | null
   release_activated?: boolean | null
   oauth_runtime_issue?: keyof typeof OAUTH_ISSUES | null
+  crag_subscription?: GeminiCragSubscription | null
   environments: GeminiEnvironment[]
 }
 type Authorization = { url: string; attempt_id: string }
@@ -191,6 +225,28 @@ export function GeminiStartupStatus({
       ) : null}
       {inventory.payload_state === 'install_on_create' ? (
         <p role='status'>首次创建时自动校验并安装 Gemini 内核和官方 CLI。</p>
+      ) : null}
+      {inventory.payload_mode === 'crag_subscription' ? (
+        inventory.crag_subscription?.active ? (
+          <p role='status'>
+            CRAGGemini 宿主订阅已激活（席位{' '}
+            {inventory.crag_subscription.used_slots ?? 0} /{' '}
+            {inventory.crag_subscription.slot_limit === 'unlimited'
+              ? '不限'
+              : inventory.crag_subscription.slot_limit}
+            ，剩余 {inventory.crag_subscription.available_slots ?? '—'}
+            {inventory.crag_subscription.expires_at
+              ? ` · 到期 ${localTime(new Date(inventory.crag_subscription.expires_at * 1000).toISOString())}`
+              : ''}
+            ）。
+          </p>
+        ) : (
+          <p role='status'>
+            CRAGGemini 宿主订阅未激活：OAuth
+            环境需先兑换订阅码并绑定席位后方可调度与测试（纯 API Key
+            模式无需席位）。
+          </p>
+        )
       ) : null}
       {inventory.oauth_runtime_issue ? (
         <p role='status'>{OAUTH_ISSUES[inventory.oauth_runtime_issue]}</p>
@@ -396,6 +452,20 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
         <dt className='text-muted-foreground'>内核</dt>
         <dd>{environment.kernel_version || '未上报版本'}</dd>
       </div>
+      {environment.auth_method === 'oauth' && environment.crag_license ? (
+        <div>
+          <dt className='text-muted-foreground'>CRAGGemini 席位</dt>
+          <dd>
+            {environment.crag_license.valid
+              ? environment.crag_license.seat
+                ? `已绑定席位 #${environment.crag_license.seat}`
+                : '许可有效'
+              : geminiInferenceErrorLabel(
+                  environment.crag_license.code ?? 'license_required'
+                )}
+          </dd>
+        </div>
+      ) : null}
       <div>
         <dt className='text-muted-foreground'>创建 / 更新</dt>
         <dd>
@@ -551,6 +621,97 @@ function GeminiDetails({
   )
 }
 
+export function GeminiAuthorizationChallenge({
+  environmentId,
+  url,
+  code,
+  busy,
+  onCodeChange,
+  onSubmit,
+}: {
+  environmentId: string
+  url: string
+  code: string
+  busy: boolean
+  onCodeChange: (value: string) => void
+  onSubmit: () => void
+}) {
+  const [copyState, setCopyState] = useState<'copied' | 'failed' | null>(null)
+
+  const handleCopy = async () => {
+    // 纯 HTTP 面板没有 navigator.clipboard（secure-context only），
+    // copyText 会回落到 execCommand；失败时给出可操作指引。
+    if (await copyText(url)) {
+      setCopyState('copied')
+      toast.success('已复制授权链接')
+    } else {
+      setCopyState('failed')
+      toast.error('复制失败，请选中输入框中的链接手动复制')
+    }
+  }
+
+  return (
+    <form
+      className='space-y-2'
+      onSubmit={(event) => {
+        event.preventDefault()
+        onSubmit()
+      }}
+    >
+      <Label htmlFor={`gemini-auth-url-${environmentId}`}>
+        Google 授权链接
+      </Label>
+      <Input
+        id={`gemini-auth-url-${environmentId}`}
+        readOnly
+        value={url}
+        className='font-mono text-xs'
+        onFocus={(event) => event.currentTarget.select()}
+      />
+      <div className='flex flex-wrap items-center gap-2'>
+        <Button type='button' size='sm' variant='outline' onClick={handleCopy}>
+          {copyState === 'copied' ? (
+            <Check className='size-4' aria-hidden='true' />
+          ) : (
+            <Copy className='size-4' aria-hidden='true' />
+          )}
+          {copyState === 'copied' ? '已复制链接' : '复制链接'}
+        </Button>
+        <Button asChild size='sm' variant='outline'>
+          <a href={url} target='_blank' rel='noreferrer'>
+            <ExternalLink className='size-4' aria-hidden='true' />
+            打开 Google 授权页
+          </a>
+        </Button>
+      </div>
+      {copyState === 'copied' ? (
+        <p role='status' className='text-xs text-muted-foreground'>
+          已复制授权链接，请在使用此环境绑定代理的浏览器中打开。
+        </p>
+      ) : copyState === 'failed' ? (
+        <p role='alert' className='text-xs text-destructive'>
+          复制失败，请选中上方输入框中的链接手动复制。
+        </p>
+      ) : null}
+      <Label htmlFor={`gemini-code-${environmentId}`}>
+        浏览器显示的授权码或完整回调链接
+      </Label>
+      <Input
+        id={`gemini-code-${environmentId}`}
+        type='password'
+        autoComplete='off'
+        required
+        maxLength={3500}
+        value={code}
+        onChange={(event) => onCodeChange(event.target.value)}
+      />
+      <Button type='submit' disabled={busy || !code.trim()}>
+        提交授权码
+      </Button>
+    </form>
+  )
+}
+
 export function GeminiEnvironments({
   environmentId,
 }: {
@@ -583,7 +744,14 @@ export function GeminiEnvironments({
   const operation = useGeminiMutation({
     mutationFn: async (action: {
       type:
-        'create' | 'authorize' | 'complete' | 'disable' | 'delete' | 'refresh'
+        | 'create'
+        | 'authorize'
+        | 'complete'
+        | 'disable'
+        | 'delete'
+        | 'refresh'
+        | 'bind_seat'
+        | 'release_seat'
       id?: string
     }) => {
       const resource = `${ROOT}/environments${action.id ? `/${encodeURIComponent(action.id)}` : ''}`
@@ -641,6 +809,10 @@ export function GeminiEnvironments({
         await api(`${resource}/disable`, { method: 'POST' })
       if (action.type === 'refresh')
         await api(`${resource}/refresh`, { method: 'POST' })
+      if (action.type === 'bind_seat')
+        await api(`${resource}/crag-license/bind`, { method: 'POST' })
+      if (action.type === 'release_seat')
+        await api(`${resource}/crag-license/release`, { method: 'POST' })
       if (action.type === 'delete') await api(resource, { method: 'DELETE' })
       setChallenge(null)
       setCode('')
@@ -663,6 +835,8 @@ export function GeminiEnvironments({
     return <GeminiStartupStatus inventory={inventory.data} />
   const awaitingRedemption =
     inventory.data.payload_state === 'awaiting_redemption'
+  const isCragSubscription = inventory.data.payload_mode === 'crag_subscription'
+  const cragSub = inventory.data.crag_subscription
   const payloadReady =
     inventory.data.payload_state === 'installed' &&
     inventory.data.release_activated !== false
@@ -725,6 +899,44 @@ export function GeminiEnvironments({
             刷新数据
           </Button>
         ) : null}
+        {isCragSubscription &&
+        environment.auth_method === 'oauth' &&
+        !environment.crag_license?.valid ? (
+          <Button
+            type='button'
+            variant='outline'
+            disabled={busy || !payloadReady || !cragSub?.active}
+            onClick={() =>
+              operation.mutate({ type: 'bind_seat', id: environment.id })
+            }
+          >
+            绑定 CRAG 席位
+          </Button>
+        ) : null}
+        {isCragSubscription &&
+        environment.auth_method === 'oauth' &&
+        environment.crag_license?.valid &&
+        environment.crag_license.scope === 'host' &&
+        cragSub?.reclaim_supported ? (
+          <Button
+            type='button'
+            variant='outline'
+            disabled={busy}
+            onClick={() =>
+              operation.mutate({ type: 'release_seat', id: environment.id })
+            }
+          >
+            释放 CRAG 席位
+          </Button>
+        ) : null}
+        {!isImport && isCragSubscription && !cragSub?.active ? (
+          <GeminiRedeemDialog
+            mode='crag_subscription'
+            onRedeemed={() => {
+              void client.invalidateQueries({ queryKey: QUERY_KEY })
+            }}
+          />
+        ) : null}
         <Button
           type='button'
           variant='outline'
@@ -774,37 +986,17 @@ export function GeminiEnvironments({
       {payloadReady &&
       challenge?.id === environment.id &&
       environment.auth_state === 'authorizing' ? (
-        <form
-          className='space-y-2'
-          onSubmit={(event) => {
-            event.preventDefault()
+        <GeminiAuthorizationChallenge
+          key={challenge.attempt_id}
+          environmentId={environment.id}
+          url={challenge.url}
+          code={code}
+          busy={busy}
+          onCodeChange={setCode}
+          onSubmit={() =>
             operation.mutate({ type: 'complete', id: environment.id })
-          }}
-        >
-          <a
-            className='block text-sm text-primary underline'
-            href={challenge.url}
-            target='_blank'
-            rel='noreferrer'
-          >
-            打开 Google 授权页
-          </a>
-          <Label htmlFor={`gemini-code-${environment.id}`}>
-            浏览器显示的授权码或完整回调链接
-          </Label>
-          <Input
-            id={`gemini-code-${environment.id}`}
-            type='password'
-            autoComplete='off'
-            required
-            maxLength={3500}
-            value={code}
-            onChange={(event) => setCode(event.target.value)}
-          />
-          <Button type='submit' disabled={busy || !code.trim()}>
-            提交授权码
-          </Button>
-        </form>
+          }
+        />
       ) : null}
     </div>
   ) : null
@@ -826,19 +1018,22 @@ export function GeminiEnvironments({
       <GeminiStartupStatus inventory={inventory.data} />
       {isImport ? (
         <GeminiRedeemDialog
-          triggerVisible={awaitingRedemption}
+          mode={isCragSubscription ? 'crag_subscription' : 'legacy_release'}
+          triggerVisible={awaitingRedemption || isCragSubscription}
           returnFocusTo={nameInput}
           onRedeemed={() => {
-            client.setQueryData<GeminiInventory>(
-              QUERY_KEY,
-              (current) =>
-                current && {
-                  ...current,
-                  payload_state: 'installed',
-                  payload_issue: null,
-                  release_activated: true,
-                }
-            )
+            if (!isCragSubscription) {
+              client.setQueryData<GeminiInventory>(
+                QUERY_KEY,
+                (current) =>
+                  current && {
+                    ...current,
+                    payload_state: 'installed',
+                    payload_issue: null,
+                    release_activated: true,
+                  }
+              )
+            }
             void client.invalidateQueries({ queryKey: QUERY_KEY })
           }}
         />

@@ -211,7 +211,7 @@ import {
   restoreToolNamesInSSELine,
   wantsFastMode,
 } from './anthropic-policy.mjs'
-import { materializeRemoteImageSources } from './images.mjs'
+import { materializeRemoteImageSources, validateImageDimensions } from './images.mjs'
 import { applyMinMaxTokens } from './min-max-tokens.mjs'
 import { detectWarmupIntercept, formatWarmupSse, warmupMockMessage } from './warmup-intercept.mjs'
 import { queueAllowedByHeaders } from './queue-hint.mjs'
@@ -281,7 +281,7 @@ export function createHandleProtocol(deps) {
         rateMultiplier,
         officialCost: priced.total_cost,
       })
-    } catch {}
+    } catch { }
   }
 
   function keyGateErrorBody(gate) {
@@ -325,7 +325,7 @@ export function createHandleProtocol(deps) {
         rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey.group_id ?? 1),
         officialCost: priced.total_cost,
       })
-    } catch {}
+    } catch { }
   }
 
   /** Codex handlers take the same managed-key acquire / release / spend as the Claude paths. */
@@ -344,7 +344,7 @@ export function createHandleProtocol(deps) {
     } finally {
       try {
         apiKeyStore.release(managedKey)
-      } catch {}
+      } catch { }
       billCodexKey(managedKey, logBag)
     }
   }
@@ -389,9 +389,9 @@ export function createHandleProtocol(deps) {
     const mapped = policyRefusal
       ? upstreamRiskClientError(logBag.risk_upstream_reason, logBag.risk_request_id)
       : rewritePoolErrorForClient(
-          mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
-          result?.body,
-        )
+        mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
+        result?.body,
+      )
     if (mapped.body.error.code === ErrorCode.POOL_OVERLOADED && result?.poolReason === 'subagent_limit') {
       mapped.body.error.details = { reason: result.poolReason }
     }
@@ -717,7 +717,7 @@ export function createHandleProtocol(deps) {
           rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
           ...logBag,
         })
-      } catch {}
+      } catch { }
     })
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
@@ -1017,6 +1017,19 @@ export function createHandleProtocol(deps) {
       return json(res, 403, errorResult.body)
     }
     if (imageModel) return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag })
+    if (platform.platform === 'anthropic') {
+      try {
+        validateImageDimensions(ctx.body)
+      } catch (error) {
+        if (!error.body?.error) throw error
+        stats.errors++
+        logBag.attempt_count = 0
+        logBag.final_state = 'invalid_request'
+        logBag.error_code = error.body.error.code
+        logBag.error_message = error.body.error.message
+        return json(res, error.status, error.body)
+      }
+    }
     // Codex returns before conversion. Distill does not apply to OpenAI platform models; the rest
     // of the gate scans them only when jev.openai_platform_enabled is on.
     if (
@@ -1165,12 +1178,12 @@ export function createHandleProtocol(deps) {
       const accountGate = !scopedRiskGate
         ? null
         : (account) =>
-            applyProtocolIntercept({
-              ...gateArgs,
-              body: auditBody,
-              account,
-              skipMandatory: true,
-            })
+          applyProtocolIntercept({
+            ...gateArgs,
+            body: auditBody,
+            account,
+            skipMandatory: true,
+          })
       if (protocol === 'anthropic.messages') {
         const codex = normalizeCodexRouting(routing.codex)
         return runWithCodexKey(req, res, logBag, () =>
@@ -1276,16 +1289,19 @@ export function createHandleProtocol(deps) {
         apiOpenAI && protocol === 'openai.responses'
           ? { claude: ctx.body, mode: 'passthrough' }
           : toClaudeMessages(protocol, ctx.body, {
-              rewrite: rewriteEnabled,
-              model_map: false,
-              preserve_content_shape: officialPassthrough,
-              onSystemBlock:
-                inferenceBackend !== 'api' && !officialPassthrough
-                  ? trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
-                  : undefined,
-            })
+            rewrite: rewriteEnabled,
+            model_map: false,
+            preserve_content_shape: officialPassthrough,
+            onSystemBlock:
+              inferenceBackend !== 'api' && !officialPassthrough
+                ? trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
+                : undefined,
+          })
     } catch (error) {
-      if (!['invalid_responses_conversion', 'invalid_messages_conversion'].includes(error.code)) throw error
+      if (
+        !['invalid_responses_conversion', 'invalid_messages_conversion', 'thinking_incompatible'].includes(error.code)
+      )
+        throw error
       stats.errors++
       logBag.error_code = error.code
       logBag.error_message = error.body.error.message
@@ -1451,14 +1467,14 @@ export function createHandleProtocol(deps) {
       ? { stickyKey: null, stickyKeys: [] }
       : stickyRouter?.sessionPoolKeys
         ? stickyRouter.sessionPoolKeys(req, inbound, {
-            sessionId: inboundIdentity.sessionId,
-            deviceId: stickyDeviceId,
-            migrate: !isProbe,
-          })
+          sessionId: inboundIdentity.sessionId,
+          deviceId: stickyDeviceId,
+          migrate: !isProbe,
+        })
         : {
-            stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
-            stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
-          }
+          stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
+          stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
+        }
     const stickyKey = sessionKeys.stickyKey || null
     const stickyKeys = sessionKeys.stickyKeys || []
     const deviceKey = stickyDeviceId ? stickyRouter?.canonicalDeviceKey?.(stickyDeviceId) || null : null
@@ -1567,11 +1583,11 @@ export function createHandleProtocol(deps) {
       requestContext || apiOpenAI || preserveApiCallerBody
         ? 0
         : personaHideForUnofficial(personaIn, ctx.body, {
-            officialClient: officialPassthrough,
-            mode: personaMode,
-            hides: personaHidesUsageFromRoutingFile(routingConfigPath),
-            standing: standingUsageFromRoutingFile(routingConfigPath),
-          })
+          officialClient: officialPassthrough,
+          mode: personaMode,
+          hides: personaHidesUsageFromRoutingFile(routingConfigPath),
+          standing: standingUsageFromRoutingFile(routingConfigPath),
+        })
 
     if (inferenceBackend === 'api') {
       const managedKey = req.apiKeyRecord || null
@@ -1637,7 +1653,7 @@ export function createHandleProtocol(deps) {
         if (managedKey) {
           try {
             apiKeyStore.release(managedKey)
-          } catch {}
+          } catch { }
         }
       }
       // The api backend forwards the converted body untouched: its session is the outbound one.
@@ -1727,15 +1743,15 @@ export function createHandleProtocol(deps) {
     const anthropicKeepalive =
       clientStream && protocol === 'anthropic.messages' && streamKeepaliveMs > 0
         ? createDownstreamKeepalive({
-            intervalMs: streamKeepaliveMs,
-            userAgent: req.headers['user-agent'] || req.headers['User-Agent'] || '',
-            protocol,
-            write: (chunk) => {
-              if (res.writableEnded || res.destroyed) return
-              if (!res.headersSent) writeSSEHeaders(res)
-              res.write(chunk)
-            },
-          })
+          intervalMs: streamKeepaliveMs,
+          userAgent: req.headers['user-agent'] || req.headers['User-Agent'] || '',
+          protocol,
+          write: (chunk) => {
+            if (res.writableEnded || res.destroyed) return
+            if (!res.headersSent) writeSSEHeaders(res)
+            res.write(chunk)
+          },
+        })
         : null
     anthropicKeepalive?.armAfter(queueKeepaliveDelay)
     const upstreamStream = true
@@ -1988,7 +2004,11 @@ export function createHandleProtocol(deps) {
                 agentSummary: !!summarySession,
                 foldSystemMessages: routingNow?.compatibility?.crag_fold_history_system !== false,
               })
-              hopBody = await materializeRemoteImageSources(hopBody)
+              const materialized = await materializeRemoteImageSources(hopBody)
+              if (materialized !== hopBody) {
+                validateImageDimensions(materialized)
+                hopBody = materialized
+              }
               if (identity) {
                 hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
                   officialClient: officialTraffic,
@@ -2091,7 +2111,11 @@ export function createHandleProtocol(deps) {
                 passthrough: officialPassthrough,
               })
             }
-            hopBody = await materializeRemoteImageSources(hopBody)
+            const materialized = await materializeRemoteImageSources(hopBody)
+            if (materialized !== hopBody) {
+              validateImageDimensions(materialized)
+              hopBody = materialized
+            }
             if (identity) {
               hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
                 officialClient: officialTraffic,
@@ -2373,7 +2397,7 @@ export function createHandleProtocol(deps) {
       if (managedKey) {
         try {
           apiKeyStore.release(managedKey)
-        } catch {}
+        } catch { }
       }
     }
 
@@ -2399,14 +2423,14 @@ export function createHandleProtocol(deps) {
           usage_complete: provider?.usage_complete === true,
           ...(provider?.schema_version === 2
             ? {
-                provider_complete: provider.provider_complete,
-                handoff_complete: provider.handoff_complete ?? null,
-                delivery_complete: provider.delivery_complete ?? null,
-                response_valid: provider.response_valid ?? null,
-                source: provider.source ?? null,
-                http_status: provider.http_status ?? null,
-                public_status: provider.public_status ?? null,
-              }
+              provider_complete: provider.provider_complete,
+              handoff_complete: provider.handoff_complete ?? null,
+              delivery_complete: provider.delivery_complete ?? null,
+              response_valid: provider.response_valid ?? null,
+              source: provider.source ?? null,
+              http_status: provider.http_status ?? null,
+              public_status: provider.public_status ?? null,
+            }
             : {}),
         },
       }
@@ -2470,7 +2494,7 @@ export function createHandleProtocol(deps) {
           const vm = getVm(cfg.paths.project, result.vmId)
           if (vm) pool.syncQuotaSchedule(vm)
         }
-      } catch {}
+      } catch { }
       attachPricing(logBag, {
         managedKey,
         rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
@@ -2602,7 +2626,7 @@ export function createHandleProtocol(deps) {
           rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
           ...logBag,
         })
-      } catch {}
+      } catch { }
     })
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
@@ -2693,14 +2717,14 @@ export function createHandleProtocol(deps) {
     const keepalive =
       stream && streamKeepaliveMs > 0
         ? createDownstreamKeepalive({
-            intervalMs: streamKeepaliveMs,
-            protocol,
-            write: (chunk) => {
-              if (responseClosed(res)) return
-              if (!res.headersSent) writeSSEHeaders(res)
-              res.write(chunk)
-            },
-          })
+          intervalMs: streamKeepaliveMs,
+          protocol,
+          write: (chunk) => {
+            if (responseClosed(res)) return
+            if (!res.headersSent) writeSSEHeaders(res)
+            res.write(chunk)
+          },
+        })
         : null
     let reply = null
     try {
@@ -2792,7 +2816,7 @@ export function createHandleProtocol(deps) {
           rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
           ...logBag,
         })
-      } catch {}
+      } catch { }
     })
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY

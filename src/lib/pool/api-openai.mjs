@@ -1,4 +1,4 @@
-import { responsesToolChoice } from '../protocol/codex-convert.mjs'
+import { chatMessageToItems, responsesToolChoice } from '../protocol/codex-convert.mjs'
 
 function flattenSystem(system) {
   if (!system) return ''
@@ -41,18 +41,12 @@ function contentToOpenAI(content) {
 
 export function claudeToOpenAIResponsesRequest(claude = {}) {
   const chat = claudeToOpenAIChatRequest(claude)
-  const input = (chat.messages || []).map((message) => {
-    const text = typeof message.content === 'string' ? message.content : ''
-    if (message.role === 'system') {
-      return { type: 'message', role: 'developer', content: [{ type: 'input_text', text }] }
-    }
-    const role = message.role === 'assistant' ? 'assistant' : 'user'
-    return {
-      type: 'message',
-      role,
-      content: [{ type: role === 'assistant' ? 'output_text' : 'input_text', text }],
-    }
-  })
+  // Reuse chatMessageToItems so multi-turn tool loops survive the conversion:
+  // assistant tool_calls become function_call items and role=tool messages become
+  // function_call_output items. The previous plain-text map silently dropped
+  // both, so a Claude-protocol caller looping tools against an OpenAI endpoint
+  // re-issued the same call forever (the model never saw the tool output).
+  const input = (chat.messages || []).flatMap(chatMessageToItems)
   const out = {
     model: chat.model,
     input,

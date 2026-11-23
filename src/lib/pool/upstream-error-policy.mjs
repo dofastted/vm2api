@@ -1,4 +1,4 @@
-import { normalizeThinkingForModel } from '../protocol/thinking.mjs'
+import { canRepairAdaptiveThinking, normalizeThinkingForModel } from '../protocol/thinking.mjs'
 import { flattenSearchResultHistory, rectifyUnofficialRequestForRetry } from '../protocol/request-rectifier.mjs'
 import {
   assistantStopReason,
@@ -391,6 +391,7 @@ function classifyUpstreamResultRaw(
   result = {},
   {
     model = null,
+    requestBody = null,
     now = Date.now(),
     repaired = false,
     hasRefresh = null,
@@ -623,8 +624,13 @@ function classifyUpstreamResultRaw(
     })
   }
   if (status === 400) {
-    if (code === 'invalid_kernel_request') {
-      return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null }
+    if (code === 'invalid_kernel_request' || code === 'thinking_incompatible') {
+      return {
+        scope: 'request',
+        action: 'stop',
+        reason: code === 'thinking_incompatible' ? 'thinking_incompatible' : 'invalid_request',
+        cooldownUntil: null,
+      }
     }
     const hay = `${code} ${message}`
     // Default off. Turning this on drops thinking history and retries, so the
@@ -680,6 +686,14 @@ function classifyUpstreamResultRaw(
       }
     }
     if (!repaired && ADAPTIVE_PATTERNS.some((pattern) => pattern.test(hay))) {
+      if (requestBody && !canRepairAdaptiveThinking(requestBody, model)) {
+        return {
+          scope: 'request',
+          action: 'stop',
+          reason: 'thinking_incompatible',
+          cooldownUntil: null,
+        }
+      }
       return {
         scope: 'request',
         action: 'repair-and-retry',

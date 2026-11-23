@@ -20,6 +20,7 @@ const PUBLIC_PATH = '/v1/gemini/sessions'
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const MODEL = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const RUN_ID = /^[a-f0-9]{32}$/
+const MAX_CONCURRENCY = 64
 const MAX_PROMPT_BYTES = 4096
 const MAX_TEST_TEXT = 16 * 1024
 const AUTH_CODE = /^[A-Za-z0-9._~/-]{1,2048}$/
@@ -33,6 +34,11 @@ const RUN_STATES = new Set(['running', 'completed', 'failed'])
 const RUN_ERRORS = {
   gemini_oauth_required: [409, '请重新完成 Google OAuth 授权'],
   gemini_location_unsupported: [403, 'Google 判定当前账号所在地区不支持 Antigravity；拉取模型成功不代表可对话'],
+  gemini_account_verification_required: [
+    403,
+    'Google 要求先在浏览器完成该账号的身份验证后才能使用 Antigravity；拉取模型成功不代表可对话',
+  ],
+  gemini_account_ineligible: [403, 'Google 判定当前账号暂不符合 Antigravity 使用资格，请检查账号状态或更换账号'],
   gemini_proxy_error: [502, '无法通过绑定代理连接 Gemini，请检查代理'],
   gemini_model_unavailable: [409, '当前环境不支持所选模型，请重新获取模型列表'],
   gemini_models_empty: [502, 'Gemini 未返回可用模型'],
@@ -93,6 +99,8 @@ const OAUTH_ISSUES = new Set([
 const HOST_ERRORS = {
   ...RUN_ERRORS,
   gemini_operation_busy: [409, '此 Gemini 环境正在执行其他操作，请稍后重试'],
+  gemini_invalid_concurrency: [400, '并发数必须为 1 到 64 的整数'],
+  gemini_proxy_calibration_mismatch: [409, '绑定代理校验摘要不匹配，请重新校准代理'],
   gemini_run_not_found: [404, '测试会话不存在或已过期'],
   gemini_proxy_probe_failed: [502, '无法通过绑定代理连接 Gemini'],
   gemini_host_socket_missing: [503, '找不到 Gemini 控制 socket，请检查宿主服务和容器挂载'],
@@ -291,6 +299,10 @@ function validRunId(value) {
   return typeof value === 'string' && RUN_ID.test(value)
 }
 
+function parseConcurrency(value) {
+  return Number.isSafeInteger(value) && value >= 1 && value <= MAX_CONCURRENCY ? value : null
+}
+
 function validPrompt(value) {
   return (
     typeof value === 'string' &&
@@ -454,6 +466,12 @@ function environmentView(value, { id, proxyId, proxyPool, withProxyReady = false
     ...(value.oauth_imported === true && value.auth_method === 'oauth' ? { oauth_imported: true } : {}),
     kernel_version: text(value.kernel_version),
     runtime_ready: value.runtime_ready === true,
+    ...(parseConcurrency(value.max_concurrency) != null
+      ? { max_concurrency: parseConcurrency(value.max_concurrency) }
+      : {}),
+    ...(Number.isSafeInteger(value.active_slots) && value.active_slots >= 0
+      ? { active_slots: value.active_slots }
+      : {}),
     models: items(value.models, 128, modelName),
     ...(value.models_discovered === true && { models_discovered: true }),
     ...(Array.isArray(value.capabilities)
@@ -680,6 +698,11 @@ export function createGeminiPanelHandler({
         if ((method === 'api_key' && !API_KEY.test(apiKey)) || (method === 'oauth' && body?.api_key != null)) {
           return fail(400, 'gemini_invalid_api_key', '请提供有效格式的 Gemini API Key')
         }
+        const hasConcurrency = body?.max_concurrency !== undefined
+        const maxConcurrency = hasConcurrency ? parseConcurrency(body.max_concurrency) : null
+        if (hasConcurrency && maxConcurrency == null) {
+          return fail(400, 'gemini_invalid_concurrency', HOST_ERRORS.gemini_invalid_concurrency[1])
+        }
         const imported = body?.oauth_account
         if (
           imported != null &&
@@ -698,6 +721,7 @@ export function createGeminiPanelHandler({
               name,
               proxy_id: body.proxy_id,
               proxy_url: proxyUrl,
+              ...(maxConcurrency != null ? { max_concurrency: maxConcurrency } : {}),
               ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
               ...(imported != null && {
                 oauth_account: { access_token: imported.access_token, expiry_timestamp: imported.expiry_timestamp },
@@ -708,7 +732,7 @@ export function createGeminiPanelHandler({
         )
       }
       const match =
-        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|disable|refresh|terminal-ticket|proxy\/probe|proxy|models|test-chat|crag-license(?:\/(?:bind|activate|release))?)(?:\/([^/]+))?)?$/.exec(
+        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|concurrency|disable|refresh|terminal-ticket|proxy\/probe|proxy|models|test-chat|crag-license(?:\/(?:bind|activate|release))?)(?:\/([^/]+))?)?$/.exec(
           pathname,
         )
       if (!match || !validId(match[1])) return fail(404, 'not_found')
@@ -739,6 +763,15 @@ export function createGeminiPanelHandler({
         const result = await callHost('test-chat-cancel', payload)
         if (result?.cancelled !== true) throw hostError(PROTOCOL_ERROR)
         return ok({ cancelled: true })
+      }
+      if (req.method === 'PUT' && action === 'concurrency') {
+        const body = await readBody(req, 1024)
+        const maxConcurrency = parseConcurrency(body?.max_concurrency)
+        if (maxConcurrency == null) {
+          return fail(400, 'gemini_invalid_concurrency', HOST_ERRORS.gemini_invalid_concurrency[1])
+        }
+        const result = await callHost('concurrency-set', { id, max_concurrency: maxConcurrency })
+        return ok(environmentView(result, { id, proxyPool }))
       }
       if (req.method === 'PUT' && action === 'proxy') {
         const body = await readBody(req, 4096)
@@ -808,7 +841,13 @@ export function createGeminiPanelHandler({
       if (req.method === 'POST') {
         const environment = environmentView(await callHost('get', { id }))
         const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
-        const auth = await callHost('authorize', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl })
+        const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
+        const auth = await callHost('authorize', {
+          id,
+          proxy_id: environment.proxy_id,
+          proxy_url: proxyUrl,
+          proxy_sha256: proxySha256,
+        })
         const url = officialGeminiAuthUrl(auth?.url)
         if (!url || !ID.test(auth?.attempt_id ?? '')) throw hostError(FAILURE)
         return ok({ url, attempt_id: auth.attempt_id })
@@ -821,12 +860,14 @@ export function createGeminiPanelHandler({
         }
         const environment = environmentView(await callHost('get', { id }))
         const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
+        const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
         return ok(
           environmentView(
             await callHost('complete', {
               id,
               proxy_id: environment.proxy_id,
               proxy_url: proxyUrl,
+              proxy_sha256: proxySha256,
               attempt_id: body.attempt_id,
               ...authorization,
             }),

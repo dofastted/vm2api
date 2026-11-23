@@ -9,12 +9,14 @@ import {
   getModelParams,
   hasForcedToolChoice,
   requiredAdaptiveThinking,
+  canRepairAdaptiveThinking,
   clampEnabledThinkingBudget,
+  resolvePlatformThinkingBudget,
   MIN_THINKING_BUDGET,
 } from './model-policy.mjs'
 import { anthropicContentIsEmpty, mergeConsecutiveAnthropicMessages, messageHasTurnControls } from './sanitize.mjs'
 
-export { clampEnabledThinkingBudget, MIN_THINKING_BUDGET }
+export { canRepairAdaptiveThinking, clampEnabledThinkingBudget, resolvePlatformThinkingBudget, MIN_THINKING_BUDGET }
 
 /** `routing.compatibility.thinking_display`：缺省 summarized，显式 passthrough 才保留调用方的值。 */
 export const THINKING_DISPLAY_MODES = ['summarized', 'passthrough']
@@ -109,7 +111,8 @@ export function normalizeThinkingForModel(body = {}) {
   // Prefer model-policy matrix; fall back to hardcoded heuristics if policy unavailable
   try {
     return normalizeThinkingByPolicy(body)
-  } catch {
+  } catch (error) {
+    if (error?.code === 'thinking_incompatible') throw error
     /* fall through */
   }
   if (!body || typeof body !== 'object') return body
@@ -119,7 +122,11 @@ export function normalizeThinkingForModel(body = {}) {
   const type = String(thinking.type || '').toLowerCase()
 
   if (type === 'adaptive' && !modelSupportsAdaptiveThinking(model)) {
-    const budget = Number(thinking.budget_tokens) > 0 ? Number(thinking.budget_tokens) : DEFAULT_FALLBACK_BUDGET
+    const explicitBudget = Number(thinking.budget_tokens)
+    const budget =
+      Number.isFinite(explicitBudget) && explicitBudget > 0
+        ? explicitBudget
+        : resolvePlatformThinkingBudget(body, DEFAULT_FALLBACK_BUDGET)
     body.thinking = { type: 'enabled', budget_tokens: budget }
     return clampEnabledThinkingBudget(body)
   }

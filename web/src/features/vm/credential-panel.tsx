@@ -4,6 +4,7 @@ import type { AuthScheme, Vm } from '@/types/panel-vm'
 import { Copy, ExternalLink } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
 import {
   authSchemeLabel,
   defaultAuthScheme,
@@ -421,13 +422,15 @@ function ClaudeCredentialPanel({
         <div className='space-y-2'>
           <div className='flex flex-wrap items-center gap-2'>
             <Button
+              type='button'
               size='sm'
               variant='outline'
-              onClick={() => {
-                void navigator.clipboard
-                  ?.writeText(link.authUrl)
-                  .then(() => toast.success('已复制授权链接'))
-                  .catch(() => toast.error('复制失败，请手动选中链接'))
+              onClick={async () => {
+                if (await copyText(link.authUrl)) {
+                  toast.success('已复制授权链接')
+                } else {
+                  toast.error('复制失败，请手动选中链接')
+                }
               }}
             >
               <Copy className='size-3.5' aria-hidden='true' />
