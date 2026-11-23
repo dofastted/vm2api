@@ -36,7 +36,8 @@ ROOT = Path(__file__).resolve().parents[1]
 MAX_ENVIRONMENTS = 8
 MAX_CONCURRENCY = 64
 AUTH_TTL = 300
-AUTH_SETTLE_SECONDS = 2.0
+AUTH_MIN_SETTLE_SECONDS = 3.0
+AUTH_SETTLE_SECONDS = 6.0
 TERMINAL_TTL = 300
 TERMINAL_READ = 16384
 TERMINAL_INPUT = 1024
@@ -44,6 +45,23 @@ ATTEMPT = re.compile(r"[a-f0-9]{32}\Z")
 TOKEN_NAME = "antigravity-oauth-token"
 ACCESS_TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{1,4096}={0,2}\Z")
 CLI_SETTINGS = {"toolPermission": "strict", "useG1Credits": False}
+NATIVE_CLI_SETTINGS = {
+    "allowNonWorkspaceAccess": True,
+    "useG1Credits": False,
+    "permissions": {
+        "allow": [
+            "read_file(/work/.craggemini-media)",
+            "read_file(/work/.craggemini-media/*)",
+            "read_file(/work/.craggemini-media/**)",
+            "read_file(/tmp/craggemini)",
+            "read_file(/tmp/craggemini/**)",
+        ],
+        "deny": [
+            "write_file(*)",
+            "command(*)",
+        ],
+    },
+}
 CLI_MARKER = b"\x02agy-start\x03"
 DISPLAY_CSI = re.compile(r"\x1b\[[?=>]?[0-9;:]*[A-HJKSTXcdfhlmnrsu]")
 TERMINAL_OAUTH = "gemini_terminal_requires_oauth"
@@ -109,7 +127,7 @@ NATIVE_HEALTH_POLL_INTERVAL = 15.0
 NATIVE_WARM_BACKOFF_MIN = 2.0
 NATIVE_WARM_BACKOFF_MAX = 60.0
 NATIVE_DEFAULT_MODEL = "gemini-3-flash"
-MAX_INFER_BODY = 4 * 1024 * 1024
+MAX_INFER_BODY = 12 * 1024 * 1024
 NATIVE_RUNTIME_ROOT = Path("/run/vm2api-gemini-native")
 FULL_CAPABILITIES = (
     "streaming",
@@ -121,7 +139,16 @@ FULL_CAPABILITIES = (
     "multimodal",
     "full_gemini_api",
 )
-NATIVE_CAPABILITIES = ("streaming", "native_tui")
+NATIVE_CAPABILITIES = (
+    "streaming",
+    "native_tui",
+    "multi_turn",
+    "system_instruction",
+    "tools",
+    "generation_config",
+    "thinking",
+    "multimodal",
+)
 # Fixed categories only: process output and exception details are not inventory data.
 INFERENCE_ERROR_CODES = frozenset(
     {
@@ -191,6 +218,14 @@ def now():
 def env_concurrency(env):
     value = env.get("max_concurrency") if isinstance(env, dict) else None
     return value if type(value) is int and 1 <= value <= MAX_CONCURRENCY else 1
+
+
+def env_hostname(env):
+    identifier = env.get("id") if isinstance(env, dict) else None
+    if not isinstance(identifier, str) or not identifier:
+        return "ws-default"
+    digest = hashlib.sha256(f"vm2api-gemini-host:{identifier}".encode("utf-8")).hexdigest()
+    return f"ws-{digest[:8]}"
 
 
 def verify_proxy_sha256(body, proxy_url):
@@ -488,12 +523,13 @@ class Agy:
         os.chown(work, self.uid, self.uid)
         if self.profile is None:
             self.initialize_home(home)
+        hostname = env_hostname(self.environment)
         files = {
             "resolv.conf": "nameserver 1.1.1.1\noptions timeout:2 attempts:2\n",
             "passwd": f"agy:x:{self.uid}:{self.uid}:Antigravity:/home/agy:/bin/sh\n",
             "group": f"agy:x:{self.uid}:\n",
             "nsswitch.conf": "passwd: files\ngroup: files\nhosts: files dns\n",
-            "hosts": "127.0.0.1 localhost agy\n::1 localhost\n",
+            "hosts": f"127.0.0.1 localhost {hostname}\n::1 localhost\n",
         }
         identity = []
         for name, contents in files.items():
@@ -572,7 +608,7 @@ class Agy:
             "--unshare-ipc",
             "--unshare-uts",
             "--hostname",
-            "agy",
+            hostname,
             "--die-with-parent",
             "--clearenv",
             "--ro-bind",
@@ -738,6 +774,18 @@ class Agy:
 
     def close(self, preserve=False):
         if self.pid:
+            if preserve and not self.exited():
+                for sig_fn in (
+                    lambda: os.killpg(self.pid, signal.SIGTERM),
+                    lambda: os.kill(self.pid, signal.SIGTERM),
+                ):
+                    try:
+                        sig_fn()
+                    except ProcessLookupError:
+                        pass
+                grace_deadline = time.monotonic() + 1.5
+                while time.monotonic() < grace_deadline and not self.exited():
+                    time.sleep(0.05)
             try:
                 os.killpg(self.pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -794,6 +842,28 @@ class Headless(Agy):
         self.args, self.prompt = args, prompt
         super().__init__(host, environment, proxy_url)
 
+    def _copy_profile_file(self, src, dst, mode=0o600):
+        try:
+            fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != self.uid
+                    or not 0 < info.st_size <= 4096
+                ):
+                    return
+                raw = stream.read(4097)
+            if not 0 < len(raw) <= 4096:
+                return
+            dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chown(dst.parent, self.uid, self.uid)
+            dst.write_bytes(raw)
+            os.chmod(dst, mode)
+            os.chown(dst, self.uid, self.uid)
+        except OSError:
+            pass
+
     def initialize_home(self, home):
         super().initialize_home(home)
         settings = home / ".gemini" / "antigravity-cli"
@@ -814,6 +884,25 @@ class Headless(Agy):
             },
         )
         os.chown(settings / "settings.json", self.uid, self.uid)
+        # Preserve the authorized profile's device installation_id & cached project
+        # so Google sees the exact same client device rather than a fresh blank install.
+        profile_name = self.environment.get("profile")
+        if isinstance(profile_name, str) and profile_name:
+            src_cli = (
+                self.host.directory
+                / self.environment["id"]
+                / profile_name
+                / "home"
+                / ".gemini"
+                / "antigravity-cli"
+            )
+            self._copy_profile_file(
+                src_cli / "installation_id", settings / "installation_id"
+            )
+            self._copy_profile_file(
+                src_cli / "cache" / "default_project_id.txt",
+                settings / "cache" / "default_project_id.txt",
+            )
         token = settings / TOKEN_NAME
         token.write_bytes(self.token_bytes)
         os.chown(token, self.uid, self.uid)
@@ -923,10 +1012,13 @@ class NativeAgy(Agy):
         agy_args = [
             "--mode",
             "plan",
+            "--dangerously-skip-permissions",
+            "--add-dir",
+            "/work",
             "--model",
             self.model,
             "--settings",
-            json.dumps(CLI_SETTINGS, separators=(",", ":")),
+            json.dumps(NATIVE_CLI_SETTINGS, separators=(",", ":")),
             "--log-file",
             "/tmp/craggemini/" + native_module_impl.ELIGIBILITY_LOG_FILE,
         ]
@@ -1248,6 +1340,7 @@ class NativeSession(NativeAgy):
         super().__init__(host, environment, proxy_url, auth, model, None)
         self.last_used = time.monotonic()
         self._health_failures = 0
+        self._ever_ready = False
         self._last_health = None
         self._last_health_at = 0.0
 
@@ -1279,6 +1372,7 @@ class NativeSession(NativeAgy):
             and status.get("needs_recovery") is not True
         ):
             self._health_failures = 0
+            self._ever_ready = True
         else:
             self._health_failures += 1
         return status
@@ -1442,6 +1536,25 @@ class Login(Agy):
             raise Failure(503)
         self.sent = True
 
+    def _project_cache_ready(self):
+        cache_file = (
+            self.directory
+            / "home"
+            / ".gemini"
+            / "antigravity-cli"
+            / "cache"
+            / "default_project_id.txt"
+        )
+        try:
+            fd = os.open(cache_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != self.uid:
+                    return False
+                return bool(stream.read(256).strip())
+        except OSError:
+            return False
+
     def finished(self):
         if self.sent and profile_secrets(self.directory, self.uid):
             now_mono = time.monotonic()
@@ -1451,10 +1564,15 @@ class Login(Agy):
                 self.read(0)
             except Failure:
                 return True
+            elapsed = now_mono - self.token_seen_at
+            # Let agy finish its official post-login initialization sequence
+            # (loadCodeAssist, fetchAvailableModels, FetchConfig/experiments, cache flush)
+            # before gracefully terminating it. Never cut it off on .config/antigravity,
+            # which agy already creates before OAuth login starts.
             if (
                 not self.alive()
-                or (self.directory / "home/.config/antigravity").is_dir()
-                or now_mono - self.token_seen_at >= AUTH_SETTLE_SECONDS
+                or elapsed >= AUTH_SETTLE_SECONDS
+                or (elapsed >= AUTH_MIN_SETTLE_SECONDS and self._project_cache_ready())
             ):
                 return True
             return False
@@ -2384,7 +2502,7 @@ class Host:
         identifier = env["id"]
         if identifier in self.terminals or identifier in self.pending:
             return False
-        if self.payload_state != "installed" or self.oauth_runtime_issue() is not None:
+        if getattr(self, "payload_state", None) != "installed" or self.oauth_runtime_issue() is not None:
             return False
         if self.payload_mode == "crag_subscription":
             candidate = self.license_release_candidate(env)
@@ -2443,6 +2561,73 @@ class Host:
         worker.start()
         return True
 
+    def _record_warm_failure_locked(self, identifier):
+        backoff = getattr(self, "_warm_backoff", None)
+        if backoff is None:
+            backoff = {}
+            self._warm_backoff = backoff
+        fails = backoff.get(identifier, (0, 0.0))[0] + 1
+        delay = min(
+            NATIVE_WARM_BACKOFF_MAX,
+            NATIVE_WARM_BACKOFF_MIN * (2 ** min(fails - 1, 5)),
+        )
+        backoff[identifier] = (fails, time.monotonic() + delay)
+        return fails, delay
+
+    def _schedule_reauth_check_locked(self, identifier):
+        env = self.environments.get(identifier)
+        if (
+            not env
+            or env.get("auth_method", "oauth") != "oauth"
+            or env.get("oauth_imported")
+            or env.get("auth_state") != "authorized"
+            or not env.get("profile")
+        ):
+            return False
+        cached = getattr(self, "_runtime_proxies", {}).get(identifier)
+        if not cached or cached[0] != env["proxy_id"]:
+            return False
+        proxy_url = cached[1]
+        health = self._profile_credential_health(env, skew_seconds=0)
+        if not health or health.get("state") not in (
+            "expired_refreshable",
+            "expired",
+            "missing",
+        ):
+            return False
+        checking = getattr(self, "_reauth_checking", None)
+        if checking is None:
+            checking = set()
+            self._reauth_checking = checking
+        if identifier in checking:
+            return False
+        cooldowns = getattr(self, "_reauth_check_next_at", None)
+        if cooldowns is None:
+            cooldowns = {}
+            self._reauth_check_next_at = cooldowns
+        now_mono = time.monotonic()
+        if now_mono < cooldowns.get(identifier, 0.0):
+            return False
+        checking.add(identifier)
+        cooldowns[identifier] = now_mono + 120.0
+
+        def _worker():
+            try:
+                with self.lock:
+                    cur = self.environments.get(identifier)
+                    if cur and cur.get("auth_state") == "authorized":
+                        self.refresh_account(cur, proxy_url, auto_pull_models=False)
+            except BaseException:
+                pass
+            finally:
+                with self.lock:
+                    getattr(self, "_reauth_checking", set()).discard(identifier)
+
+        threading.Thread(
+            target=_worker, name=f"gemini-reauth-{identifier[-8:]}", daemon=True
+        ).start()
+        return True
+
     def _warm_worker(self, identifier, model=None):
         try:
             with self._session_lock(identifier):
@@ -2496,20 +2681,13 @@ class Host:
                             if already is not None:
                                 self.stop_native_session(identifier)
                             self.native_sessions[identifier] = session
-                            getattr(self, "_warm_backoff", {}).pop(identifier, None)
                             keep = True
                 finally:
                     if not keep:
                         session.close()
         except BaseException:
             with self.lock:
-                backoff = getattr(self, "_warm_backoff", {})
-                fails = backoff.get(identifier, (0, 0.0))[0] + 1
-                delay = min(
-                    NATIVE_WARM_BACKOFF_MAX,
-                    NATIVE_WARM_BACKOFF_MIN * (2 ** min(fails - 1, 5)),
-                )
-                backoff[identifier] = (fails, time.monotonic() + delay)
+                self._record_warm_failure_locked(identifier)
         finally:
             with self.lock:
                 getattr(self, "_warming", set()).discard(identifier)
@@ -2802,32 +2980,53 @@ class Host:
         finally:
             staging.unlink(missing_ok=True)
 
-    def _profile_token_state(self, env):
+    def _profile_credential_health(self, env, *, skew_seconds=300):
         profile_name = env.get("profile")
         if not profile_name or env.get("auth_method", "oauth") != "oauth":
-            return False, False
+            return None
         uid = self.uid_base + env["slot"]
         loaded = profile_secrets(
             self.directory / env["id"] / profile_name, uid, include_raw=True
         )
         if not loaded:
-            return False, False
+            return {
+                "present": False,
+                "state": "missing",
+                "has_access": False,
+                "has_refresh": False,
+                "needs_refresh": True,
+                "expires_at": None,
+            }
         try:
             data = json.loads(loaded[1])
         except (ValueError, UnicodeDecodeError):
-            return False, False
-        token = data.get("token") if isinstance(data, dict) else None
+            return {
+                "present": False,
+                "state": "missing",
+                "has_access": False,
+                "has_refresh": False,
+                "needs_refresh": True,
+                "expires_at": None,
+            }
+        token = data.get("token") if isinstance(data, dict) and isinstance(data.get("token"), dict) else data
         if not isinstance(token, dict):
-            return False, False
-        has_refresh = isinstance(token.get("refresh_token"), str) and bool(
-            token.get("refresh_token")
-        )
-        expiry = token.get("expiry")
-        expired = False
-        now_ts = time.time()
-        if isinstance(expiry, (int, float)):
-            expired = expiry <= now_ts + 30
-        elif isinstance(expiry, str) and expiry:
+            return {
+                "present": False,
+                "state": "missing",
+                "has_access": False,
+                "has_refresh": False,
+                "needs_refresh": True,
+                "expires_at": None,
+            }
+        access = token.get("access_token") or token.get("accessToken")
+        refresh = token.get("refresh_token") or token.get("refreshToken")
+        has_access = isinstance(access, str) and bool(access.strip())
+        has_refresh = isinstance(refresh, str) and bool(refresh.strip())
+        expiry = token.get("expiry") or token.get("expires_at") or token.get("expiresAt")
+        expires_at_ts = None
+        if isinstance(expiry, (int, float)) and expiry > 0:
+            expires_at_ts = expiry / 1000.0 if expiry >= 10_000_000_000 else float(expiry)
+        elif isinstance(expiry, str) and expiry.strip():
             normalized = re.sub(r"\.[0-9]+", "", expiry.strip())
             if normalized.endswith("Z"):
                 normalized = normalized[:-1] + "+00:00"
@@ -2835,10 +3034,36 @@ class Host:
                 parsed = datetime.fromisoformat(normalized)
                 if parsed.tzinfo is None:
                     parsed = parsed.replace(tzinfo=timezone.utc)
-                expired = parsed.timestamp() <= now_ts + 30
+                expires_at_ts = parsed.timestamp()
             except ValueError:
-                expired = False
-        return has_refresh, expired
+                expires_at_ts = None
+        now_ts = time.time()
+        if not has_access:
+            state = "refreshable" if has_refresh else "missing"
+            needs_refresh = True
+        elif expires_at_ts is not None and expires_at_ts <= now_ts:
+            state = "expired_refreshable" if has_refresh else "expired"
+            needs_refresh = True
+        elif expires_at_ts is not None and expires_at_ts <= now_ts + skew_seconds:
+            state = "refresh_window"
+            needs_refresh = True
+        else:
+            state = "fresh"
+            needs_refresh = False
+        return {
+            "present": True,
+            "state": state,
+            "has_access": has_access,
+            "has_refresh": has_refresh,
+            "needs_refresh": needs_refresh,
+            "expires_at": int(expires_at_ts * 1000) if expires_at_ts is not None else None,
+        }
+
+    def _profile_token_state(self, env):
+        health = self._profile_credential_health(env, skew_seconds=300)
+        if not health or not health.get("present"):
+            return False, False
+        return bool(health.get("has_refresh")), bool(health.get("needs_refresh"))
 
     def pull_models(self, env, proxy_url, *, allow_reauth_probe=False):
         uid, key, auth = self.operation_account(
@@ -3127,14 +3352,28 @@ class Host:
             if run_entry and run_entry["process"] is not None:
                 continue
             if not session.is_alive():
+                ever_ready = bool(getattr(session, "_ever_ready", False))
                 self.stop_native_session(identifier)
+                if not ever_ready:
+                    self._record_warm_failure_locked(identifier)
+                    self._schedule_reauth_check_locked(identifier)
                 self._schedule_warm_locked(identifier)
                 continue
             last_probe = getattr(session, "_last_health_at", 0.0)
             if now_mono - last_probe >= NATIVE_HEALTH_POLL_INTERVAL:
-                session.health(timeout=0.5)
+                status = session.health(timeout=0.5)
+                if (
+                    isinstance(status, dict)
+                    and status.get("ready") is True
+                    and status.get("needs_recovery") is not True
+                ):
+                    getattr(self, "_warm_backoff", {}).pop(identifier, None)
                 if session.is_severely_unhealthy():
+                    ever_ready = bool(getattr(session, "_ever_ready", False))
                     self.stop_native_session(identifier)
+                    if not ever_ready:
+                        self._record_warm_failure_locked(identifier)
+                        self._schedule_reauth_check_locked(identifier)
                     self._schedule_warm_locked(identifier)
         for identifier, entry in list(self.runs.items()):
             if entry["process"] is None and time.monotonic() >= entry["deadline"]:
@@ -3485,6 +3724,11 @@ class Host:
             if self.payload_mode == "crag_subscription"
             else None
         )
+        credential_state = (
+            self._profile_credential_health(env)
+            if method == "oauth" and not env.get("oauth_imported")
+            else None
+        )
         return {
             "id": env["id"],
             "name": env["name"],
@@ -3500,6 +3744,7 @@ class Host:
             "models": env.get("call_models", account.get("models", [])),
             "models_discovered": bool(env.get("call_models")),
             "account": account,
+            **({"credential_state": credential_state} if credential_state is not None else {}),
             **({"crag_license": crag_license} if crag_license is not None else {}),
             "created_at": env.get("created_at"),
             "updated_at": env.get("updated_at"),
@@ -3955,36 +4200,80 @@ class Host:
     def _extract_native_turn_body(model, body_obj):
         if not isinstance(body_obj, dict):
             return None
-        allowed_top = {"model", "contents", "stream"}
+        allowed_top = {
+            "model",
+            "contents",
+            "stream",
+            "systemInstruction",
+            "system_instruction",
+            "tools",
+            "toolConfig",
+            "tool_config",
+            "generationConfig",
+            "generation_config",
+            "safetySettings",
+            "safety_settings",
+            "conversation_id",
+            "conversationId",
+        }
         if any(k not in allowed_top for k in body_obj):
             return None
         contents = body_obj.get("contents")
-        if not isinstance(contents, list) or len(contents) != 1:
+        if not isinstance(contents, list) or not contents:
             return None
-        entry = contents[0]
-        if not isinstance(entry, dict) or any(k not in ("role", "parts") for k in entry):
-            return None
-        if entry.get("role") not in (None, "user"):
-            return None
-        parts = entry.get("parts")
-        if not isinstance(parts, list) or not parts:
-            return None
-        pieces = []
-        for part in parts:
-            if not isinstance(part, dict) or list(part.keys()) != ["text"] or not isinstance(part.get("text"), str):
-                return None
-            pieces.append(part["text"])
-        text = "".join(pieces)
-        if (
-            not text.strip()
-            or any(word.startswith("/") for word in text.split())
-            or any(ord(ch) < 32 and ch not in ("\n", "\r", "\t") for ch in text)
-        ):
-            return None
-        return {
-            "model": model,
-            "contents": [{"role": "user", "parts": [{"text": text}]}],
+        allowed_part_keys = {
+            "text",
+            "inlineData",
+            "inline_data",
+            "fileData",
+            "file_data",
+            "functionCall",
+            "function_call",
+            "functionResponse",
+            "function_response",
+            "thought",
+            "thoughtSignature",
+            "thought_signature",
         }
+        has_substantive_part = False
+        for entry in contents:
+            if not isinstance(entry, dict) or any(k not in ("role", "parts") for k in entry):
+                return None
+            if entry.get("role") not in (None, "user", "model"):
+                return None
+            parts = entry.get("parts")
+            if not isinstance(parts, list) or not parts:
+                return None
+            for part in parts:
+                if not isinstance(part, dict) or not part or any(k not in allowed_part_keys for k in part):
+                    return None
+                if "text" in part:
+                    text = part["text"]
+                    if not isinstance(text, str):
+                        return None
+                    if any(ord(ch) < 32 and ch not in ("\n", "\r", "\t") for ch in text):
+                        return None
+                    if text.strip():
+                        has_substantive_part = True
+                if any(
+                    k in part
+                    for k in (
+                        "inlineData",
+                        "inline_data",
+                        "fileData",
+                        "file_data",
+                        "functionCall",
+                        "function_call",
+                        "functionResponse",
+                        "function_response",
+                    )
+                ):
+                    has_substantive_part = True
+        if not has_substantive_part:
+            return None
+        forwarded = {k: v for k, v in body_obj.items() if k != "stream"}
+        forwarded["model"] = model
+        return forwarded
 
     @staticmethod
     def _redact_bytes(chunk, secret_values):

@@ -302,4 +302,23 @@ with tempfile.TemporaryDirectory(prefix="gemini-resident-") as temporary:
             assert len(stop_calls) == 1
             fake_egress.kill.assert_called_once()
 
+        # 9. Unready NativeSession crash records exponential backoff (no 32s tight loop).
+        unready = make_fake_session()
+        unready._ever_ready = False
+        unready._health_failures = impl.NATIVE_HEALTH_FAIL_THRESHOLD
+        unready._last_health_at = 0.0
+        unready._fail_next_health = True
+        host.native_sessions[ENV_ID] = unready
+        host._warm_backoff = {}
+        with patch.object(impl.threading, "Thread") as thread_cls:
+            host.cleanup()
+            assert ENV_ID not in host.native_sessions
+            assert ENV_ID in host._warm_backoff
+            assert host._warm_backoff[ENV_ID][0] == 1
+            assert host._warm_backoff[ENV_ID][1] > time.monotonic()
+            spawned_names = [call.kwargs.get("name", "") for call in thread_cls.call_args_list]
+            # Backoff MUST block immediate re-warm spawn; missing/expired token schedules reauth check.
+            assert not any(n.startswith("gemini-warm-") for n in spawned_names), spawned_names
+            assert any(n.startswith("gemini-reauth-") for n in spawned_names), spawned_names
+
 print("gemini-host-resident: ALL PASS")
