@@ -101,7 +101,14 @@ function toolArguments(call) {
   return typeof raw === 'string' ? raw : JSON.stringify(raw ?? {})
 }
 
-/** Chat message → Responses items. Tool-only assistant turns stay function_call items, not empty text. */
+/**
+ * Chat message → Responses items. Tool-only assistant turns stay function_call items, not empty text.
+ *
+ * Two consumers: the Codex path (`chatToCodexResponses` below) and the
+ * api-endpoints path (`claudeToOpenAIResponsesRequest` in ../pool/api-openai.mjs,
+ * which reaches here after claude→chat normalization). Changes to the
+ * `call_id` fallbacks or the empty-content drop affect both.
+ */
 export function chatMessageToItems(message) {
   if (!message || typeof message !== 'object') return []
   if (message.role === 'tool') {

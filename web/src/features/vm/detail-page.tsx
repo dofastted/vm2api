@@ -700,7 +700,7 @@ function VmDetailBody({
                   forceMount
                   className='pt-4 data-[state=inactive]:hidden'
                 >
-                  <VmDesktopCard vm={vm} />
+                  <VmDesktopCard vm={vm} active={tab === 'desktop'} />
                 </TabsContent>
               ) : null}
               <TabsContent value='seed' className='pt-4'>
