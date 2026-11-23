@@ -35,7 +35,7 @@ def test_account_antigravity_ua_and_auto_onboard():
         if url.endswith("loadCodeAssist"):
             load_count += 1
             assert isinstance(header, list)
-            assert any(h.startswith("User-Agent: antigravity/") for h in header)
+            assert any(h.startswith("User-Agent: antigravity/hub/") for h in header)
             if load_count == 1:
                 return 200, {
                     "allowedTiers": [
@@ -53,10 +53,11 @@ def test_account_antigravity_ua_and_auto_onboard():
             }
         if url.endswith("onboardUser"):
             assert isinstance(header, list)
-            assert any(h.startswith("User-Agent: antigravity/") for h in header)
+            assert any(h.startswith("User-Agent: antigravity/hub/") for h in header)
             assert body["tierId"] == "free-tier"
             return 200, {"done": True, "response": {"cloudaicompanionProject": {"id": "proj-onboarded-1"}}}
         if url.endswith("fetchAvailableModels"):
+            assert url.startswith("https://daily-cloudcode-pa.googleapis.com/")
             assert body == {"project": "proj-onboarded-1"}
             return 200, {
                 "models": {
@@ -64,6 +65,7 @@ def test_account_antigravity_ua_and_auto_onboard():
                 }
             }
         if url.endswith("retrieveUserQuotaSummary"):
+            assert url.startswith("https://daily-cloudcode-pa.googleapis.com/")
             assert body == {"project": "proj-onboarded-1"}
             return 200, {
                 "groups": [
@@ -95,6 +97,7 @@ def test_account_antigravity_ua_and_auto_onboard():
 
 def test_account_skips_onboard_when_validation_required():
     calls = []
+    valid_url = "https://accounts.google.com/v3/signin/continue?plt=abc123&sarp=1"
 
     def fake_get_json(proxy_url, url, header=None, body=None, *, timeout=6):
         calls.append(url)
@@ -103,7 +106,13 @@ def test_account_skips_onboard_when_validation_required():
         if url.endswith("loadCodeAssist"):
             return 200, {
                 "allowedTiers": [{"id": "standard-tier", "isDefault": True}],
-                "ineligibleTiers": [{"reasonCode": "VALIDATION_REQUIRED", "tierId": "standard-tier"}],
+                "ineligibleTiers": [
+                    {
+                        "reasonCode": "VALIDATION_REQUIRED",
+                        "tierId": "standard-tier",
+                        "validationUrl": valid_url,
+                    }
+                ],
             }
         if url.endswith("fetchAvailableModels"):
             return 200, {"models": {"gemini-2.5-pro": {}}}
@@ -116,7 +125,86 @@ def test_account_skips_onboard_when_validation_required():
         )
     assert result["state"] == "ok"
     assert result["models"] == ["gemini-2.5-pro"]
+    assert result["eligibility"] == "verification_required"
+    assert result["validation_url"] == valid_url
     assert not any(url.endswith("onboardUser") for url in calls)
+    assert account_mod.safe_google_validation_url("https://evil.example/phish") is None
+
+
+def test_realistic_login_settlement_hostname_and_headless_device_inheritance():
+    # 1. Deterministic per-env hostname (never shared static "agy")
+    h1 = host_mod.env_hostname({"id": "gemini-111111111111111111111111"})
+    h2 = host_mod.env_hostname({"id": "gemini-222222222222222222222222"})
+    assert h1 != "agy" and h2 != "agy" and h1 != h2
+    assert h1 == host_mod.env_hostname({"id": "gemini-111111111111111111111111"})
+
+    # 2. Login.finished() must NOT kill agy at T+0ms just because .config/antigravity exists!
+    with tempfile.TemporaryDirectory(prefix="gemini-login-settle-") as tmp:
+        root = Path(tmp)
+        (root / "home" / ".config" / "antigravity").mkdir(parents=True)
+        cache_dir = root / "home" / ".gemini" / "antigravity-cli" / "cache"
+        cache_dir.mkdir(parents=True)
+
+        login = host_mod.Login.__new__(host_mod.Login)
+        login.directory = root
+        login.uid = os.getuid()
+        login.sent = True
+        login.token_seen_at = None
+        login.buffer = b""
+        login.read = lambda timeout: None
+        login.alive = lambda: True
+
+        clock = [100.0]
+        with (
+            patch.object(host_mod, "profile_secrets", return_value=("ya29.tok",)),
+            patch.object(host_mod.time, "monotonic", side_effect=lambda: clock[0]),
+        ):
+            # Even though .config/antigravity exists, T+0s and T+1.5s must keep settling!
+            assert login.finished() is False
+            clock[0] = 101.5
+            assert login.finished() is False
+            # Once min settle elapsed AND default_project_id.txt is populated, finish cleanly!
+            (cache_dir / "default_project_id.txt").write_text("proj-settled-1\n")
+            clock[0] = 100.0 + host_mod.AUTH_MIN_SETTLE_SECONDS + 0.1
+            assert login.finished() is True
+
+        # Without default_project_id.txt, settle until full AUTH_SETTLE_SECONDS.
+        (cache_dir / "default_project_id.txt").unlink()
+        login.token_seen_at = None
+        clock[0] = 200.0
+        with (
+            patch.object(host_mod, "profile_secrets", return_value=("ya29.tok",)),
+            patch.object(host_mod.time, "monotonic", side_effect=lambda: clock[0]),
+        ):
+            assert login.finished() is False
+            clock[0] = 200.0 + host_mod.AUTH_MIN_SETTLE_SECONDS + 0.5
+            assert login.finished() is False
+            clock[0] = 200.0 + host_mod.AUTH_SETTLE_SECONDS + 0.1
+            assert login.finished() is True
+
+    # 3. Headless.initialize_home() preserves profile's installation_id and cached project ID
+    with tempfile.TemporaryDirectory(prefix="gemini-headless-dev-") as tmp:
+        root = Path(tmp)
+        env_id = "gemini-" + "c" * 24
+        prof = "3" * 32
+        src_cli = root / env_id / prof / "home" / ".gemini" / "antigravity-cli"
+        (src_cli / "cache").mkdir(parents=True)
+        (src_cli / "installation_id").write_text("11111111-2222-3333-4444-555555555555")
+        (src_cli / "cache" / "default_project_id.txt").write_text("proj-cached-9")
+
+        headless = host_mod.Headless.__new__(host_mod.Headless)
+        headless.host = SimpleNamespace(directory=root)
+        headless.environment = {"id": env_id, "profile": prof}
+        headless.uid = os.getuid()
+        headless.token_bytes = b'{"token":{"access_token":"ya29.test"}}'
+        dst_home = root / "headless-run" / "home"
+        dst_home.parent.mkdir(parents=True)
+        with patch.object(host_mod.os, "chown"):
+            headless.initialize_home(dst_home)
+        dst_cli = dst_home / ".gemini" / "antigravity-cli"
+        assert (dst_cli / "installation_id").read_text() == "11111111-2222-3333-4444-555555555555"
+        assert (dst_cli / "cache" / "default_project_id.txt").read_text() == "proj-cached-9"
+        assert (dst_cli / host_mod.TOKEN_NAME).read_bytes() == b'{"token":{"access_token":"ya29.test"}}'
 
 
 def test_post_oauth_auto_pulls_models_and_refreshes_expired_token():
@@ -254,5 +342,6 @@ def test_post_oauth_auto_pulls_models_and_refreshes_expired_token():
 if __name__ == "__main__":
     test_account_antigravity_ua_and_auto_onboard()
     test_account_skips_onboard_when_validation_required()
+    test_realistic_login_settlement_hostname_and_headless_device_inheritance()
     test_post_oauth_auto_pulls_models_and_refreshes_expired_token()
     print("OK")

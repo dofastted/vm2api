@@ -36,7 +36,8 @@ ROOT = Path(__file__).resolve().parents[1]
 MAX_ENVIRONMENTS = 8
 MAX_CONCURRENCY = 64
 AUTH_TTL = 300
-AUTH_SETTLE_SECONDS = 2.0
+AUTH_MIN_SETTLE_SECONDS = 3.0
+AUTH_SETTLE_SECONDS = 6.0
 TERMINAL_TTL = 300
 TERMINAL_READ = 16384
 TERMINAL_INPUT = 1024
@@ -217,6 +218,14 @@ def now():
 def env_concurrency(env):
     value = env.get("max_concurrency") if isinstance(env, dict) else None
     return value if type(value) is int and 1 <= value <= MAX_CONCURRENCY else 1
+
+
+def env_hostname(env):
+    identifier = env.get("id") if isinstance(env, dict) else None
+    if not isinstance(identifier, str) or not identifier:
+        return "ws-default"
+    digest = hashlib.sha256(f"vm2api-gemini-host:{identifier}".encode("utf-8")).hexdigest()
+    return f"ws-{digest[:8]}"
 
 
 def verify_proxy_sha256(body, proxy_url):
@@ -514,12 +523,13 @@ class Agy:
         os.chown(work, self.uid, self.uid)
         if self.profile is None:
             self.initialize_home(home)
+        hostname = env_hostname(self.environment)
         files = {
             "resolv.conf": "nameserver 1.1.1.1\noptions timeout:2 attempts:2\n",
             "passwd": f"agy:x:{self.uid}:{self.uid}:Antigravity:/home/agy:/bin/sh\n",
             "group": f"agy:x:{self.uid}:\n",
             "nsswitch.conf": "passwd: files\ngroup: files\nhosts: files dns\n",
-            "hosts": "127.0.0.1 localhost agy\n::1 localhost\n",
+            "hosts": f"127.0.0.1 localhost {hostname}\n::1 localhost\n",
         }
         identity = []
         for name, contents in files.items():
@@ -598,7 +608,7 @@ class Agy:
             "--unshare-ipc",
             "--unshare-uts",
             "--hostname",
-            "agy",
+            hostname,
             "--die-with-parent",
             "--clearenv",
             "--ro-bind",
@@ -764,6 +774,18 @@ class Agy:
 
     def close(self, preserve=False):
         if self.pid:
+            if preserve and not self.exited():
+                for sig_fn in (
+                    lambda: os.killpg(self.pid, signal.SIGTERM),
+                    lambda: os.kill(self.pid, signal.SIGTERM),
+                ):
+                    try:
+                        sig_fn()
+                    except ProcessLookupError:
+                        pass
+                grace_deadline = time.monotonic() + 1.5
+                while time.monotonic() < grace_deadline and not self.exited():
+                    time.sleep(0.05)
             try:
                 os.killpg(self.pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -820,6 +842,28 @@ class Headless(Agy):
         self.args, self.prompt = args, prompt
         super().__init__(host, environment, proxy_url)
 
+    def _copy_profile_file(self, src, dst, mode=0o600):
+        try:
+            fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != self.uid
+                    or not 0 < info.st_size <= 4096
+                ):
+                    return
+                raw = stream.read(4097)
+            if not 0 < len(raw) <= 4096:
+                return
+            dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chown(dst.parent, self.uid, self.uid)
+            dst.write_bytes(raw)
+            os.chmod(dst, mode)
+            os.chown(dst, self.uid, self.uid)
+        except OSError:
+            pass
+
     def initialize_home(self, home):
         super().initialize_home(home)
         settings = home / ".gemini" / "antigravity-cli"
@@ -840,6 +884,25 @@ class Headless(Agy):
             },
         )
         os.chown(settings / "settings.json", self.uid, self.uid)
+        # Preserve the authorized profile's device installation_id & cached project
+        # so Google sees the exact same client device rather than a fresh blank install.
+        profile_name = self.environment.get("profile")
+        if isinstance(profile_name, str) and profile_name:
+            src_cli = (
+                self.host.directory
+                / self.environment["id"]
+                / profile_name
+                / "home"
+                / ".gemini"
+                / "antigravity-cli"
+            )
+            self._copy_profile_file(
+                src_cli / "installation_id", settings / "installation_id"
+            )
+            self._copy_profile_file(
+                src_cli / "cache" / "default_project_id.txt",
+                settings / "cache" / "default_project_id.txt",
+            )
         token = settings / TOKEN_NAME
         token.write_bytes(self.token_bytes)
         os.chown(token, self.uid, self.uid)
@@ -1277,6 +1340,7 @@ class NativeSession(NativeAgy):
         super().__init__(host, environment, proxy_url, auth, model, None)
         self.last_used = time.monotonic()
         self._health_failures = 0
+        self._ever_ready = False
         self._last_health = None
         self._last_health_at = 0.0
 
@@ -1308,6 +1372,7 @@ class NativeSession(NativeAgy):
             and status.get("needs_recovery") is not True
         ):
             self._health_failures = 0
+            self._ever_ready = True
         else:
             self._health_failures += 1
         return status
@@ -1471,6 +1536,25 @@ class Login(Agy):
             raise Failure(503)
         self.sent = True
 
+    def _project_cache_ready(self):
+        cache_file = (
+            self.directory
+            / "home"
+            / ".gemini"
+            / "antigravity-cli"
+            / "cache"
+            / "default_project_id.txt"
+        )
+        try:
+            fd = os.open(cache_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != self.uid:
+                    return False
+                return bool(stream.read(256).strip())
+        except OSError:
+            return False
+
     def finished(self):
         if self.sent and profile_secrets(self.directory, self.uid):
             now_mono = time.monotonic()
@@ -1480,10 +1564,15 @@ class Login(Agy):
                 self.read(0)
             except Failure:
                 return True
+            elapsed = now_mono - self.token_seen_at
+            # Let agy finish its official post-login initialization sequence
+            # (loadCodeAssist, fetchAvailableModels, FetchConfig/experiments, cache flush)
+            # before gracefully terminating it. Never cut it off on .config/antigravity,
+            # which agy already creates before OAuth login starts.
             if (
                 not self.alive()
-                or (self.directory / "home/.config/antigravity").is_dir()
-                or now_mono - self.token_seen_at >= AUTH_SETTLE_SECONDS
+                or elapsed >= AUTH_SETTLE_SECONDS
+                or (elapsed >= AUTH_MIN_SETTLE_SECONDS and self._project_cache_ready())
             ):
                 return True
             return False
@@ -2413,7 +2502,7 @@ class Host:
         identifier = env["id"]
         if identifier in self.terminals or identifier in self.pending:
             return False
-        if self.payload_state != "installed" or self.oauth_runtime_issue() is not None:
+        if getattr(self, "payload_state", None) != "installed" or self.oauth_runtime_issue() is not None:
             return False
         if self.payload_mode == "crag_subscription":
             candidate = self.license_release_candidate(env)
@@ -2472,6 +2561,73 @@ class Host:
         worker.start()
         return True
 
+    def _record_warm_failure_locked(self, identifier):
+        backoff = getattr(self, "_warm_backoff", None)
+        if backoff is None:
+            backoff = {}
+            self._warm_backoff = backoff
+        fails = backoff.get(identifier, (0, 0.0))[0] + 1
+        delay = min(
+            NATIVE_WARM_BACKOFF_MAX,
+            NATIVE_WARM_BACKOFF_MIN * (2 ** min(fails - 1, 5)),
+        )
+        backoff[identifier] = (fails, time.monotonic() + delay)
+        return fails, delay
+
+    def _schedule_reauth_check_locked(self, identifier):
+        env = self.environments.get(identifier)
+        if (
+            not env
+            or env.get("auth_method", "oauth") != "oauth"
+            or env.get("oauth_imported")
+            or env.get("auth_state") != "authorized"
+            or not env.get("profile")
+        ):
+            return False
+        cached = getattr(self, "_runtime_proxies", {}).get(identifier)
+        if not cached or cached[0] != env["proxy_id"]:
+            return False
+        proxy_url = cached[1]
+        health = self._profile_credential_health(env, skew_seconds=0)
+        if not health or health.get("state") not in (
+            "expired_refreshable",
+            "expired",
+            "missing",
+        ):
+            return False
+        checking = getattr(self, "_reauth_checking", None)
+        if checking is None:
+            checking = set()
+            self._reauth_checking = checking
+        if identifier in checking:
+            return False
+        cooldowns = getattr(self, "_reauth_check_next_at", None)
+        if cooldowns is None:
+            cooldowns = {}
+            self._reauth_check_next_at = cooldowns
+        now_mono = time.monotonic()
+        if now_mono < cooldowns.get(identifier, 0.0):
+            return False
+        checking.add(identifier)
+        cooldowns[identifier] = now_mono + 120.0
+
+        def _worker():
+            try:
+                with self.lock:
+                    cur = self.environments.get(identifier)
+                    if cur and cur.get("auth_state") == "authorized":
+                        self.refresh_account(cur, proxy_url, auto_pull_models=False)
+            except BaseException:
+                pass
+            finally:
+                with self.lock:
+                    getattr(self, "_reauth_checking", set()).discard(identifier)
+
+        threading.Thread(
+            target=_worker, name=f"gemini-reauth-{identifier[-8:]}", daemon=True
+        ).start()
+        return True
+
     def _warm_worker(self, identifier, model=None):
         try:
             with self._session_lock(identifier):
@@ -2525,20 +2681,13 @@ class Host:
                             if already is not None:
                                 self.stop_native_session(identifier)
                             self.native_sessions[identifier] = session
-                            getattr(self, "_warm_backoff", {}).pop(identifier, None)
                             keep = True
                 finally:
                     if not keep:
                         session.close()
         except BaseException:
             with self.lock:
-                backoff = getattr(self, "_warm_backoff", {})
-                fails = backoff.get(identifier, (0, 0.0))[0] + 1
-                delay = min(
-                    NATIVE_WARM_BACKOFF_MAX,
-                    NATIVE_WARM_BACKOFF_MIN * (2 ** min(fails - 1, 5)),
-                )
-                backoff[identifier] = (fails, time.monotonic() + delay)
+                self._record_warm_failure_locked(identifier)
         finally:
             with self.lock:
                 getattr(self, "_warming", set()).discard(identifier)
@@ -3203,14 +3352,28 @@ class Host:
             if run_entry and run_entry["process"] is not None:
                 continue
             if not session.is_alive():
+                ever_ready = bool(getattr(session, "_ever_ready", False))
                 self.stop_native_session(identifier)
+                if not ever_ready:
+                    self._record_warm_failure_locked(identifier)
+                    self._schedule_reauth_check_locked(identifier)
                 self._schedule_warm_locked(identifier)
                 continue
             last_probe = getattr(session, "_last_health_at", 0.0)
             if now_mono - last_probe >= NATIVE_HEALTH_POLL_INTERVAL:
-                session.health(timeout=0.5)
+                status = session.health(timeout=0.5)
+                if (
+                    isinstance(status, dict)
+                    and status.get("ready") is True
+                    and status.get("needs_recovery") is not True
+                ):
+                    getattr(self, "_warm_backoff", {}).pop(identifier, None)
                 if session.is_severely_unhealthy():
+                    ever_ready = bool(getattr(session, "_ever_ready", False))
                     self.stop_native_session(identifier)
+                    if not ever_ready:
+                        self._record_warm_failure_locked(identifier)
+                        self._schedule_reauth_check_locked(identifier)
                     self._schedule_warm_locked(identifier)
         for identifier, entry in list(self.runs.items()):
             if entry["process"] is None and time.monotonic() >= entry["deadline"]:

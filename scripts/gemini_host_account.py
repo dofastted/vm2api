@@ -13,7 +13,10 @@ from datetime import datetime, timezone
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
 GOOGLE_USERINFO = "https://www.googleapis.com/oauth2/v2/userinfo"
 CODE_ASSIST = "https://cloudcode-pa.googleapis.com/v1internal:"
-ANTIGRAVITY_USER_AGENT = "antigravity/1.15.8 linux/amd64"
+CODE_ASSIST_DAILY = "https://daily-cloudcode-pa.googleapis.com/v1internal:"
+ANTIGRAVITY_USER_AGENT = (
+    "antigravity/hub/2.34.0 (aidev_client; os_type=linux; arch=amd64; cl=1026637980)"
+)
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_MODELS = GEMINI_API + "/models?pageSize=1000"
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin", "LANG": "C.UTF-8"}
@@ -123,6 +126,40 @@ def project_id_of(value):
 _BLOCKING_INELIGIBLE_REASONS = frozenset(
     {"VALIDATION_REQUIRED", "UNSUPPORTED_REGION", "UNSUPPORTED_CLIENT"}
 )
+_GOOGLE_VALIDATION_URL = re.compile(
+    r"https://accounts\.google\.com/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{1,2000}\Z"
+)
+
+
+def safe_google_validation_url(value):
+    if not isinstance(value, str) or len(value) > 2048:
+        return None
+    candidate = value.strip()
+    if _GOOGLE_VALIDATION_URL.fullmatch(candidate):
+        return candidate
+    return None
+
+
+def parse_ineligibility(assist_data):
+    if not isinstance(assist_data, dict):
+        return None, None
+    ineligible = assist_data.get("ineligibleTiers")
+    if not isinstance(ineligible, list):
+        return None, None
+    fallback = None
+    for entry in ineligible:
+        if not isinstance(entry, dict):
+            continue
+        reason = entry.get("reasonCode")
+        if reason == "VALIDATION_REQUIRED":
+            return "verification_required", safe_google_validation_url(
+                entry.get("validationUrl")
+            )
+        if reason == "UNSUPPORTED_REGION" and fallback is None:
+            fallback = ("location_unsupported", None)
+        elif reason in _BLOCKING_INELIGIBLE_REASONS and fallback is None:
+            fallback = ("ineligible", None)
+    return fallback if fallback is not None else (None, None)
 
 
 def select_onboard_tier(assist_data):
@@ -275,7 +312,7 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
         return checked("error")
     auth_header = f"Authorization: Bearer {access_token}"
     code_assist_headers = [auth_header, f"User-Agent: {ANTIGRAVITY_USER_AGENT}"]
-    metadata = {"metadata": {"ideType": "ANTIGRAVITY", "ideName": "antigravity"}}
+    metadata = {"metadata": {"ideType": "ANTIGRAVITY"}}
     with ThreadPoolExecutor(max_workers=2) as executor:
         user = executor.submit(get_json, proxy_url, GOOGLE_USERINFO, auth_header)
         assist = executor.submit(
@@ -343,6 +380,7 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
             )
         except (ValueError, OverflowError, OSError):
             expiry = None
+    eligibility, validation_url = parse_ineligibility(assist_data)
     account = {
         "email": text(user_data.get("email"), 254)
         or text(token.get("id_token_email"), 254),
@@ -354,6 +392,10 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
         or text(token.get("user_tier")),
         "expires_at": text(expiry),
     }
+    if eligibility:
+        account["eligibility"] = eligibility
+    if validation_url:
+        account["validation_url"] = validation_url
     paid = assist_data.get("paidTier")
     current = assist_data.get("currentTier")
     credits = paid.get("availableCredits") if isinstance(paid, dict) else None
@@ -375,7 +417,7 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
             model_result = executor.submit(
                 get_json,
                 proxy_url,
-                CODE_ASSIST + "fetchAvailableModels",
+                CODE_ASSIST_DAILY + "fetchAvailableModels",
                 code_assist_headers,
                 project_body,
             )
@@ -383,7 +425,7 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
                 executor.submit(
                     get_json,
                     proxy_url,
-                    CODE_ASSIST + "retrieveUserQuotaSummary",
+                    CODE_ASSIST_DAILY + "retrieveUserQuotaSummary",
                     code_assist_headers,
                     project_body,
                 )
