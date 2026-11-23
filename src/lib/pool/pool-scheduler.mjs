@@ -1895,7 +1895,16 @@ export class PoolScheduler extends EventEmitter {
     const snapshots = this.runtimeRepo
       ? this.runtimeRepo.schedulingSnapshot(entries.map((entry) => entry.accountId))
       : new Map()
-    const healthFlights = this.prefetchWorkerHealth(entries, snapshots)
+    // Only hop slots the scan can reach: the same cheap gates it applies before its own health check.
+    const healthFlights = this.prefetchWorkerHealth(entries, snapshots, {
+      skip: ({ vm, snapshot }) => {
+        if (pin) return false
+        if (vm.schedulable === false) return true
+        if (snapshot?.account && snapshot.account.status !== 'active') return true
+        if (hardBlockOf(snapshot?.state || null, now)) return true
+        return quotaGuardLevel(snapshot?.account?.unified, guardConfig, now).level === 'stop'
+      },
+    })
     for (const { vm, accountId } of entries) {
       if (signal?.aborted) throw makeAbortError()
       const snapshot = snapshots.get(accountId)
@@ -2320,7 +2329,7 @@ export class PoolScheduler extends EventEmitter {
    * sequential scan of ~26 slots held the first requests for ~10s. Not tied to one request's signal: an
    * aborted request must not cancel a hop the next one will use.
    */
-  prefetchWorkerHealth(entries, snapshots) {
+  prefetchWorkerHealth(entries, snapshots, { skip = null } = {}) {
     /** vmId → { dataPath, promise }: the scan reuses this answer, even a failed one, instead of hopping again. */
     const flights = new Map()
     if (typeof this.workerHealth !== 'function') return flights
@@ -2328,7 +2337,9 @@ export class PoolScheduler extends EventEmitter {
     for (const { vm, accountId } of entries) {
       const dataPath = vmNodeDataPath(vm)
       if (dataPath === 'offline') continue
-      const state = snapshots?.get?.(accountId)?.state || null
+      const snapshot = snapshots?.get?.(accountId)
+      if (skip?.({ vm, accountId, snapshot })) continue
+      const state = snapshot?.state || null
       const cached = this.healthCache.get(vm.id)
       if (
         cached &&
