@@ -95,7 +95,13 @@ export function VmAccountTab(props: VmAccountTabProps) {
   )
 
   return (
-    <TabsContent value='account' className='space-y-3 pt-3'>
+    // forceMount：授权链接等面板状态跨 tab 保活——生成授权链接后可自由切到
+    // 「桌面」tab 完成浏览器登录，切回来链接与回调输入不丢
+    <TabsContent
+      value='account'
+      forceMount
+      className='space-y-3 pt-3 data-[state=inactive]:hidden'
+    >
       <div
         className={cn(
           'grid gap-3',

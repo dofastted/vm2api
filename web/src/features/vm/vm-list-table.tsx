@@ -501,13 +501,10 @@ function ProdCell({ vm }: { vm: Vm }) {
     <>
       <PlatformMark vm={vm} />
       <span
-        className={cn(
-          'font-mono font-semibold',
-          vm.gemini ? 'min-w-0 truncate' : 'shrink-0'
-        )}
-        title={vm.name || vm.id}
+        className='min-w-0 truncate font-mono font-semibold'
+        title={vm.name ? `${vm.name} · ${vm.id}` : vm.id}
       >
-        {clipLabel(vm.gemini ? vm.name || vm.id : vm.id)}
+        {clipLabel(vm.name || vm.id, 16)}
       </span>
       {plan && plan !== '—' ? (
         <span

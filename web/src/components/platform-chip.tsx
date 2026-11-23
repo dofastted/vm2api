@@ -62,7 +62,10 @@ export function SlotIdentity({
 }) {
   const kind = vm ? vmKindOf(vm) : kindFromModel(model, protocol)
   const full = slotAccountLabel(vm, { email, vmId, emptyLabel })
-  const shown = compact && full.includes('@') ? compactEmail(full) : full
+  // 有自定义名称时优先展示名称（识别靠名称体系），账号地址放悬停提示
+  const name = String(vm?.name || '').trim()
+  const shown = name || (compact && full.includes('@') ? compactEmail(full) : full)
+  const tip = name ? `${name} · ${full}` : full.includes('@') ? full : undefined
   return (
     <span
       className={cn(
@@ -70,7 +73,7 @@ export function SlotIdentity({
         compact && 'text-[12px] leading-[1.3] tracking-[-0.01em]',
         className
       )}
-      title={full.includes('@') ? full : undefined}
+      title={tip}
     >
       <PlatformChip kind={kind} />
       <span className='min-w-0 flex-1 truncate'>{shown}</span>
