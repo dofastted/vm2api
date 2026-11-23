@@ -1,7 +1,7 @@
 import { createHash, createPublicKey, randomBytes, randomUUID, verify } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { CRAG_GEMINI_PRODUCT, readCragGeminiPackageAuthority } from './payload.mjs'
+import { CRAG_GEMINI_PRODUCT, readCragGeminiPackageAuthority, readPinnedCragGeminiPublicKeySha256 } from './payload.mjs'
 
 const DEFAULT_AUTHORITY = 'https://www.vm2api.org'
 const HOST_DOMAIN = 'crag-gemini-host-v1:'
@@ -59,7 +59,7 @@ function fail(code, status = 500, extra = {}) {
 const sha256Hex = (data) => createHash('sha256').update(data).digest('hex')
 
 function decodeBase64Url(value, expectedLength = null) {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) fail('license_invalid', 403)
+  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) throw fail('license_invalid', 403)
   const bytes = Buffer.from(value, 'base64url')
   if ((expectedLength != null && bytes.length !== expectedLength) || bytes.toString('base64url') !== value) {
     throw fail('license_invalid', 403)
@@ -218,6 +218,8 @@ export function verifyCragGeminiHostEntitlement(
       claims.revision < 1 ||
       !Number.isSafeInteger(claims.issued_at) ||
       claims.issued_at < 0 ||
+      !Number.isSafeInteger(claims.expires_at) ||
+      claims.expires_at <= claims.issued_at ||
       !Array.isArray(claims.grants) ||
       claims.grants.length < 1 ||
       claims.grants.length > MAX_HOST_GRANTS
@@ -402,6 +404,8 @@ export function createGeminiCragSubscription({
   dataDir = null,
   payloadDir = null,
   publicKeyPem = null,
+  publicKeyFile = process.env.KIN_GEMINI_PUBLIC_KEY_FILE || null,
+  expectedPublicKeySha256 = null,
   resolveAuthority = null,
   callHost,
   fetchImpl = globalThis.fetch,
@@ -461,11 +465,28 @@ export function createGeminiCragSubscription({
     return generated
   }
 
+  // Trust root priority (never self-attest from payloadDir/crag-license-public.pem):
+  // 1. Explicit `publicKeyPem` option (in-process / test override).
+  // 2. Operator-configured `publicKeyFile` (`KIN_GEMINI_PUBLIC_KEY_FILE`, read with O_NOFOLLOW)
+  //    so authority key rotation works without rebuilding vm2api.
+  // 3. Explicit `expectedPublicKeySha256` or the git-tracked pin in `deploy/payload.json`.
   function packageAuthority() {
     if (resolveAuthority) return resolveAuthority()
     const dir = payloadDir || process.env.KIN_GEMINI_PAYLOAD_DIR || path.join(projectRoot, 'share', 'gemini', 'current')
+    const keyFile = typeof publicKeyFile === 'string' ? publicKeyFile.trim() : ''
     try {
-      return readCragGeminiPackageAuthority(dir, publicKeyPem)
+      let trustedPem = publicKeyPem
+      let pinnedSha = null
+      if (!trustedPem && keyFile) {
+        const filePem = readOptionalFile(keyFile, 4096)
+        if (!filePem || !filePem.trim()) throw fail('gemini_subscription_package_unready', 409)
+        trustedPem = filePem
+      }
+      if (!trustedPem) {
+        pinnedSha = expectedPublicKeySha256 ?? readPinnedCragGeminiPublicKeySha256(projectRoot)
+        if (!pinnedSha) throw fail('gemini_subscription_package_unready', 409)
+      }
+      return readCragGeminiPackageAuthority(dir, trustedPem, { expectedPublicKeySha256: pinnedSha })
     } catch {
       throw fail('gemini_subscription_package_unready', 409)
     }

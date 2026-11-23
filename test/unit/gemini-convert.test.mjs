@@ -533,3 +533,143 @@ test('error formatting produces protocol-native JSON and SSE errors', () => {
     429,
   )
 })
+
+test('hardened tool-call ID signing, data URLs, native thinking round-trip, and SSE error status', () => {
+  // Tool call ID containing an earlier false `__ts1__` marker still unpacks real signature suffix.
+  const sig = Buffer.from('sig-with-false-prefix').toString('base64')
+  const embedded = signedToolCallId('call__ts1__x', sig)
+  assert.deepEqual(unsignedToolCallId(embedded), { id: 'call__ts1__x', signature: sig })
+
+  // Zero-digit marker and non-canonical base64url must fail closed.
+  assert.deepEqual(unsignedToolCallId('call__ts__YWJj'), { id: 'call__ts__YWJj', signature: '' })
+  assert.deepEqual(unsignedToolCallId('call__ts4__YWJ='), { id: 'call__ts4__YWJ=', signature: '' })
+
+  // Malformed percent-encoding in non-base64 data URL does not throw uncaught URIError.
+  assert.throws(
+    () =>
+      parseInboundToGemini('openai-chat', {
+        model: 'gemini-2.5-flash',
+        messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:text/plain,%ZZ' } }] }],
+      }),
+    (err) => err.code === 'gemini_invalid_request' && err.status === 400,
+  )
+
+  // Native Gemini signed thinking parts round-trip on Gemini target, while unsigned/Claude drop them.
+  const nativeSig = Buffer.from('native-thought-sig').toString('base64')
+  const nativeIr = parseInboundToGemini(
+    'gemini',
+    {
+      contents: [
+        { role: 'user', parts: [{ text: 'Solve 2+2' }] },
+        {
+          role: 'model',
+          parts: [
+            { text: 'Signed thought', thought: true, thoughtSignature: nativeSig },
+            { text: 'Unsigned thought', thought: true },
+            { text: '4' },
+          ],
+        },
+        { role: 'user', parts: [{ text: 'Now +3' }] },
+      ],
+    },
+    { routeModel: 'gemini-2.5-pro' },
+  )
+  const gemOut = buildGeminiRequest(nativeIr, { target: 'gemini' })
+  assert.deepEqual(gemOut.contents[1].parts, [
+    { text: 'Signed thought', thought: true, thoughtSignature: nativeSig },
+    { text: '4' },
+  ])
+  const claudeOut = buildGeminiRequest(nativeIr, { target: 'antigravity', model: 'claude-sonnet-4-5' })
+  assert.deepEqual(claudeOut.contents[1].parts, [{ text: '4' }])
+
+  // `event: error` frames keep integer HTTP status even when `error.code` is a string.
+  const strCodeErr = parseGeminiSseFrame(
+    'event: error\ndata: {"error":{"code":"gemini_quota_exhausted","message":"limit"}}\n\n',
+  )
+  assert.equal(strCodeErr.kind, 'error')
+  assert.equal(strCodeErr.status, 502)
+  assert.equal(strCodeErr.code, 'gemini_quota_exhausted')
+
+  const explicitStatusErr = parseGeminiSseFrame(
+    'event: error\ndata: {"status":429,"error":{"code":"gemini_quota_exhausted","message":"limit"}}\n\n',
+  )
+  assert.equal(explicitStatusErr.status, 429)
+  assert.equal(explicitStatusErr.code, 'gemini_quota_exhausted')
+})
+
+test('SSE splitter preserves split multi-byte UTF-8 and Anthropic stream separates signed thinking + final usage', () => {
+  // Split raw UTF-8 bytes mid-character (3-byte CJK + 4-byte emoji).
+  const payload = Buffer.from('data: {"text":"你好世界🚀"}\n\n', 'utf8')
+  const frames = []
+  const splitter = createSseFrameSplitter((frame) => frames.push(frame))
+  for (let i = 0; i < payload.length; i += 2) {
+    splitter.push(payload.subarray(i, i + 2))
+  }
+  splitter.flush()
+  assert.equal(frames.length, 1)
+  assert.equal(JSON.parse(frames[0].slice(6).trim()).text, '你好世界🚀')
+
+  // Multiple signed thinking parts do not overwrite signatures in collector or merge blocks in Anthropic SSE.
+  const sig1 = Buffer.from('thought-sig-one').toString('base64')
+  const sig2 = Buffer.from('thought-sig-two').toString('base64')
+  const events = [
+    { kind: 'start', responseId: 'r_multi', model: 'gemini-2.5-pro' },
+    { kind: 'thinking', text: 'Part A' },
+    { kind: 'thinking_signature', signature: sig1 },
+    { kind: 'thinking', text: 'Part B' },
+    { kind: 'thinking_signature', signature: sig2 },
+    { kind: 'text', text: 'Final answer' },
+    {
+      kind: 'usage',
+      usage: { input_tokens: 120, output_tokens: 30, cache_read_tokens: 45, reasoning_tokens: 10, total_tokens: 195 },
+    },
+    { kind: 'stop', stopReason: 'stop', finishReason: 'STOP' },
+  ]
+  const collector = createGeminiCollector({ fallbackModel: 'gemini-2.5-pro' })
+  const encoder = createGeminiProtocolStreamEncoder('anthropic', { model: 'gemini-2.5-pro' })
+  let sseOut = ''
+  for (const ev of events) {
+    collector.push(ev)
+    sseOut += encoder.push(ev)
+  }
+  sseOut += encoder.finish()
+
+  const collected = collector.result()
+  const thinkingParts = collected.parts.filter((p) => p.kind === 'thinking')
+  assert.deepEqual(thinkingParts, [
+    { kind: 'thinking', text: 'Part A', signature: sig1 },
+    { kind: 'thinking', text: 'Part B', signature: sig2 },
+  ])
+
+  // Parse emitted Anthropic SSE frames to verify block boundaries and final message_delta usage.
+  const parsedSse = sseOut
+    .trim()
+    .split('\n\n')
+    .map((block) => {
+      const lines = block.split('\n')
+      return {
+        event: lines[0].replace(/^event:\s*/, ''),
+        data: JSON.parse(lines[1].replace(/^data:\s*/, '')),
+      }
+    })
+  const thinkingStarts = parsedSse.filter(
+    (e) => e.event === 'content_block_start' && e.data.content_block.type === 'thinking',
+  )
+  assert.equal(thinkingStarts.length, 2)
+  assert.equal(thinkingStarts[0].data.index, 0)
+  assert.equal(thinkingStarts[1].data.index, 1)
+
+  const sig1Idx = parsedSse.findIndex(
+    (e) => e.data?.delta?.type === 'signature_delta' && e.data.delta.signature === sig1,
+  )
+  const stop0Idx = parsedSse.findIndex((e) => e.event === 'content_block_stop' && e.data.index === 0)
+  const start1Idx = parsedSse.findIndex((e) => e.event === 'content_block_start' && e.data.index === 1)
+  assert.ok(sig1Idx > 0 && stop0Idx > sig1Idx && start1Idx > stop0Idx)
+
+  const msgDelta = parsedSse.find((e) => e.event === 'message_delta')
+  assert.deepEqual(msgDelta.data.usage, {
+    input_tokens: 120,
+    output_tokens: 30,
+    cache_read_input_tokens: 45,
+  })
+})
