@@ -29,7 +29,6 @@ export type CodexCreditsView = {
   statusText: string
   fetchedAtMs: number | null
   agoText: string
-  detailText: string
 }
 
 /**
@@ -105,7 +104,6 @@ export function describeCodexCredits(
       statusText: '上游限流',
       fetchedAtMs,
       agoText,
-      detailText: agoText ? `上游限流 · 最近查询 ${agoText}` : '上游限流',
     }
   }
 
@@ -116,7 +114,6 @@ export function describeCodexCredits(
       statusText: '未查询',
       fetchedAtMs: null,
       agoText: '',
-      detailText: '尚未查询积分余额',
     }
   }
 
@@ -130,7 +127,6 @@ export function describeCodexCredits(
       statusText: '可用于续跑',
       fetchedAtMs,
       agoText,
-      detailText: agoText ? `可用于续跑 · 最近查询 ${agoText}` : '可用于续跑',
     }
   }
 
@@ -141,9 +137,6 @@ export function describeCodexCredits(
       statusText: '余额待刷新',
       fetchedAtMs,
       agoText,
-      detailText: agoText
-        ? `上次查询余额，待刷新 · ${agoText}`
-        : '上次查询余额，待刷新',
     }
   }
 
@@ -153,7 +146,6 @@ export function describeCodexCredits(
     statusText: '无可用积分',
     fetchedAtMs,
     agoText,
-    detailText: agoText ? `无可用积分 · 最近查询 ${agoText}` : '无可用积分',
   }
 }
 

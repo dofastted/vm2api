@@ -678,4 +678,35 @@ test('refreshStaleCodexCreditsForVm deduplicates single-flight calls and throttl
   ac.abort()
   const abortedRes = await aborting
   assert.equal(abortedRes.aborted, true)
+
+  // 4. Replacing slot credentials drops the previous credential's cooldown immediately
+  resetStaleCodexCreditsRefreshState('vm-sf')
+  persistCodexQuotaSnapshot(root, 'vm-sf', {
+    extra: {
+      codex_5h_used_percent: 100,
+      codex_5h_window_minutes: 300,
+      codex_5h_reset_at: new Date(now + 3_600_000).toISOString(),
+    },
+    credits: {
+      has_credits: true,
+      unlimited: false,
+      balance: '10.00',
+      fetched_at: new Date(now - CODEX_CREDITS_TTL_MS - 60_000).toISOString(),
+    },
+    now: now - CODEX_CREDITS_TTL_MS - 60_000,
+  })
+  const firstCredFail = await refreshStaleCodexCreditsForVm(root, 'vm-sf', { fetchImpl: errorFetch, now })
+  assert.equal(firstCredFail.ok, false)
+  fs.writeFileSync(
+    path.join(root, 'vms', 'vm-sf', 'codex-credentials.json'),
+    JSON.stringify({
+      accounts: [{ id: 'codex', access_token: 'new-at', refresh_token: 'new-rt', chatgpt_account_id: 'acc-replaced' }],
+    }),
+  )
+  const afterReplace = await refreshStaleCodexCreditsForVm(root, 'vm-sf', {
+    fetchImpl: slowSuccessFetch,
+    now: now + 5_000,
+  })
+  assert.equal(afterReplace.skipped, undefined)
+  assert.equal(afterReplace.spendable, true)
 })

@@ -6,8 +6,10 @@ import { apiBase } from '@/lib/session'
 
 type Phase = 'connecting' | 'open' | 'closed' | 'error'
 
+export type NoVncPasteResult = 'sent' | 'fallback_clipboard' | false
+
 export type NoVncHandle = {
-  paste: (text: string) => void
+  paste: (text: string) => NoVncPasteResult
   focus: () => void
 }
 
@@ -29,8 +31,9 @@ const TYPE_TEXT_MAX = 1000
 // Mac 客户端需要把 Cmd 重映射为 Ctrl：noVNC 原生把 Cmd 键（XK_Super_L）映射成
 // 远端 Alt，导致 Mac 上 Cmd+C/V 在远端变成 Alt+C/V 完全无效。
 const IS_MAC =
-  /mac|iPhone|iPad|iPod/i.test(navigator.platform || '') ||
-  /Macintosh/.test(navigator.userAgent)
+  typeof navigator !== 'undefined' &&
+  (/mac|iPhone|iPad|iPod/i.test(navigator.platform || '') ||
+    /Macintosh/.test(navigator.userAgent || ''))
 
 // Cmd+=/-/0 等：焦点不在桌面时会被本地浏览器当缩放快捷键吃掉
 const LOCAL_ZOOM_CODES = new Set(['Equal', 'Minus', 'Digit0'])
@@ -39,9 +42,7 @@ const isEditable = (t: EventTarget | null): boolean => {
   const n = t as HTMLElement | null
   return (
     !!n &&
-    (n.tagName === 'INPUT' ||
-      n.tagName === 'TEXTAREA' ||
-      n.isContentEditable)
+    (n.tagName === 'INPUT' || n.tagName === 'TEXTAREA' || n.isContentEditable)
   )
 }
 
@@ -82,7 +83,11 @@ const overrideProp = (
 /** Mac：把 Cmd 组合键改写成 Ctrl 组合（修饰键本体与组合键都改） */
 const remapCmdToCtrl = (e: KeyboardEvent) => {
   if (e.code === 'MetaLeft' || e.code === 'MetaRight') {
-    overrideProp(e, 'code', e.code === 'MetaLeft' ? 'ControlLeft' : 'ControlRight')
+    overrideProp(
+      e,
+      'code',
+      e.code === 'MetaLeft' ? 'ControlLeft' : 'ControlRight'
+    )
     overrideProp(e, 'key', 'Control')
   }
   overrideProp(e, 'metaKey', false)
@@ -105,12 +110,15 @@ const remapCmdToCtrl = (e: KeyboardEvent) => {
 export function NoVncViewer({
   ticketPath,
   socketPath,
+  active = true,
   onPhase,
   onClipboard,
   handleRef,
 }: {
   ticketPath: string
   socketPath: string
+  /** 当前「桌面」页签是否可见；forceMount 隐藏期间不得劫持全局剪贴板与快捷键。 */
+  active?: boolean
   onPhase?: (phase: Phase, detail?: string) => void
   onClipboard?: (text: string) => void
   handleRef?: React.MutableRefObject<NoVncHandle | null>
@@ -118,6 +126,8 @@ export function NoVncViewer({
   const hostRef = useRef<HTMLDivElement>(null)
   const [phase, setPhase] = useState<Phase>('connecting')
   const [detail, setDetail] = useState('')
+  const activeRef = useRef(active)
+  activeRef.current = active
   const onPhaseRef = useRef(onPhase)
   onPhaseRef.current = onPhase
   const onClipboardRef = useRef(onClipboard)
@@ -128,6 +138,13 @@ export function NoVncViewer({
   // 兜底之后才迟到的 paste，避免二次注入）。
   const pasteTimerRef = useRef<number | null>(null)
   const pasteFallbackAtRef = useRef(0)
+
+  useEffect(() => {
+    if (!active && pasteTimerRef.current != null) {
+      clearTimeout(pasteTimerRef.current)
+      pasteTimerRef.current = null
+    }
+  }, [active])
 
   useEffect(() => {
     const host = hostRef.current
@@ -159,33 +176,35 @@ export function NoVncViewer({
         const cp = ch.codePointAt(0) ?? 0
         if (cp === 0x0a) rfb.sendKey(XK_Return, null)
         else if (cp === 0x09) rfb.sendKey(XK_Tab, null)
-        else if (cp < 0x20 || cp === 0x7f) continue // 控制字符无法键入，跳过
+        else if (cp < 0x20 || cp === 0x7f)
+          continue // 控制字符无法键入，跳过
         else rfb.sendKey(cp <= 0xff ? cp : UNICODE_KEYSYM_OFFSET | cp, null)
       }
     }
 
-    // 统一的远端粘贴入口（Cmd/Ctrl+V 与工具栏「发送剪贴板」共用）：
+    // 统一的远端粘贴入口（Cmd/Ctrl+V 与工具栏「发送到桌面」共用）：
     // 1. 与远端剪贴板内容相同（桌面内复制→粘贴）→ 只注入 Ctrl+V，让远端贴自己的；
     // 2. 含非 Latin-1 字符 → 逐字符注入（ClientCutText 会截成 '?'，不能用）；
     // 3. 其余（ASCII/Latin-1）→ 写远端剪贴板 + 注入 Ctrl+V。
-    const sendPaste = (text: string) => {
-      if (!rfb || !connected || !text) return
+    const sendPaste = (text: string): NoVncPasteResult => {
+      if (!rfb || !connected || !text) return false
       if (text === remoteClipRef.current) {
         injectCtrlV()
-        return
+        return 'sent'
       }
       if (hasNonLatin1(text)) {
         if (text.length > TYPE_TEXT_MAX) {
           toast.warning('文本过长，改走剪贴板通道，非 Latin-1 字符会变 ?')
           rfb.clipboardPasteFrom(text)
           injectCtrlV()
-        } else {
-          typeText(text)
+          return 'fallback_clipboard'
         }
-        return
+        typeText(text)
+        return 'sent'
       }
       rfb.clipboardPasteFrom(text)
       injectCtrlV()
+      return 'sent'
     }
 
     // —— host 捕获阶段拦截（host 是 canvas 祖先，先于 noVNC 在 canvas 上的监听）——
@@ -216,9 +235,9 @@ export function NoVncViewer({
     host.addEventListener('keydown', onHostKeyDown, true)
     host.addEventListener('keyup', onHostKeyUp, true)
 
-    // —— document 级：剪贴板直通与本地快捷键兜底 ——
+    // —— document 级：剪贴板直通与本地快捷键兜底（仅桌面页签可见时生效）——
     const onDocPaste = (e: ClipboardEvent) => {
-      if (!rfb || !connected) return
+      if (!activeRef.current || !rfb || !connected) return
       if (isEditable(e.target)) return // 面板输入框正常粘贴
       const text = e.clipboardData?.getData('text/plain') ?? ''
       e.preventDefault()
@@ -236,7 +255,7 @@ export function NoVncViewer({
       sendPaste(text) // 无对应按键的 paste（如右键菜单）：照常分流
     }
     const onDocCopy = (e: ClipboardEvent) => {
-      if (!rfb || !connected) return
+      if (!activeRef.current || !rfb || !connected) return
       if (isEditable(e.target)) return
       // 页面有选区时用户要复制的是面板文字（VM id、日志行等），不接管；
       // 无选区的 Cmd+C 才把桌面侧最近一次复制的内容带回本机
@@ -248,7 +267,7 @@ export function NoVncViewer({
     const onDocKeyDown = (e: KeyboardEvent) => {
       // 焦点在页面非输入区时，Cmd+=/-/0 不再缩放本地面板
       // （焦点在桌面画面时 noVNC 自己就会 stopEvent）
-      if (!rfb || !connected) return
+      if (!activeRef.current || !rfb || !connected) return
       if (!IS_MAC || !e.metaKey) return
       if (isEditable(e.target)) return
       if (LOCAL_ZOOM_CODES.has(e.code)) e.preventDefault()
@@ -274,8 +293,8 @@ export function NoVncViewer({
         rfb.addEventListener('connect', () => {
           connected = true
           report('open')
-          // 自动聚焦：打开桌面即可打字，无需先点击画面
-          rfb?.focus({ preventScroll: true })
+          // 自动聚焦：仅在桌面页签当前可见时聚焦画面，避免隐藏页签抢走其他页签焦点
+          if (activeRef.current) rfb?.focus({ preventScroll: true })
         })
         rfb.addEventListener('disconnect', (e) => {
           connected = false
@@ -292,10 +311,10 @@ export function NoVncViewer({
           const prev = remoteClipRef.current
           remoteClipRef.current = text
           onClipboardRef.current?.(text)
-          // 无感同步到本机（仅内容变化时）：安全上下文（HTTPS/localhost）且
-          // 页面聚焦时 Chrome 允许无手势 writeText——桌面里一复制，本机剪贴板
-          // 即更新。纯 HTTP 面板没有 navigator.clipboard，维持手动取回路径。
+          // 无感同步到本机（仅桌面页签可见且内容变化时）：切到账号/终端等其他页签
+          // 时不静默覆盖本机剪贴板（例如刚复制的授权链接），仍保留「带回」手动取回。
           if (
+            activeRef.current &&
             text &&
             text !== prev &&
             window.isSecureContext &&
@@ -321,6 +340,10 @@ export function NoVncViewer({
       )
     return () => {
       disposed = true
+      if (pasteTimerRef.current != null) {
+        clearTimeout(pasteTimerRef.current)
+        pasteTimerRef.current = null
+      }
       if (handleRef) handleRef.current = null
       host.removeEventListener('keydown', onHostKeyDown, true)
       host.removeEventListener('keyup', onHostKeyUp, true)
