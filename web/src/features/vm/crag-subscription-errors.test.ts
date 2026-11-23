@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   cragCredentialRecoveryFaults,
   cragSubscriptionErrors,
+  describeCragOrderActivationFailure,
 } from './crag-subscription-errors'
 
 const faults = Object.values(cragCredentialRecoveryFaults)
@@ -38,6 +39,24 @@ describe('cragCredentialRecoveryFaults', () => {
     // A third alias for either is how four names for one quantity happened before.
     for (const text of faults) {
       expect(text).not.toMatch(/剩余可用槽位|剩余可绑定槽位|订阅槽位额度/)
+    }
+  })
+
+  it('gives non-circular order-preservation guidance when automatic activation hits auth_forbidden', () => {
+    for (const recovery of [
+      'not_activated',
+      'host_id_collision',
+      'failed',
+    ] as const) {
+      const text = describeCragOrderActivationFailure({
+        errorCode: 'auth_forbidden',
+        recovery,
+        isAdmin: true,
+      })
+      expect(text).toContain('order_id')
+      expect(text).toContain('device_uuid')
+      expect(text).toContain('crag-shop-private/receipt.key')
+      expect(text).not.toContain('请先完成兑换')
     }
   })
 })

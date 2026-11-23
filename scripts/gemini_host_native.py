@@ -127,9 +127,11 @@ class EligibilityDiagnostic:
 
 
 class NativeFailure(Exception):
-    def __init__(self, code):
-        super().__init__(code)
+    def __init__(self, code, status=None, message=None):
+        super().__init__(message or code)
         self.code = code
+        self.status = status
+        self.message = message
 
 
 def _object(pairs):
@@ -265,6 +267,156 @@ def worker_status(socket_path, token, timeout=0.5):
         connection.close()
 
 
+def cancel_worker_request(socket_path, token, request_id, timeout=2.0):
+    if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
+        return False
+    body = json.dumps({"request_id": request_id}, separators=(",", ":")).encode("utf-8")
+    connection = _UnixHTTPConnection(socket_path, timeout)
+    try:
+        response = connection.request(
+            "POST",
+            "/internal/v1/cancel",
+            {
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+                "X-Kin-Internal-Token": token,
+            },
+            body,
+        )
+        response.begin()
+        raw = response.read(4096)
+        data = json.loads(raw) if raw else {}
+        return response.status == 200 and data.get("cancelled") is True
+    except (OSError, ValueError, RecursionError):
+        return False
+    finally:
+        connection.close()
+
+
+LICENSE_ERROR_CODES = frozenset(
+    {
+        "license_required",
+        "license_expired",
+        "license_not_yet_valid",
+        "license_invalid",
+        "license_binding_mismatch",
+        "license_unconfigured",
+    }
+)
+
+
+def _map_worker_error(http_status, payload):
+    code = payload.get("code") if isinstance(payload, dict) else None
+    upstream = payload.get("upstream_status") if isinstance(payload, dict) else None
+    message = payload.get("error") if isinstance(payload, dict) and isinstance(payload.get("error"), str) else None
+    if isinstance(code, str) and code in LICENSE_ERROR_CODES:
+        return NativeFailure(code, 403, message)
+    effective_status = upstream if isinstance(upstream, int) and 400 <= upstream <= 599 else http_status
+    if code == "unsupported_turn":
+        return NativeFailure("gemini_unsupported_turn", 400, message)
+    if code in ("invalid_envelope", "invalid_json"):
+        return NativeFailure("gemini_invalid_request", 400, message)
+    if code in ("queue_full", "native_unavailable", "kernel_stopping"):
+        return NativeFailure("gemini_operation_busy" if code == "queue_full" else "gemini_native_worker_unavailable", 503, message)
+    if code in ("first_byte_timeout", "turn_timeout", "idle_timeout", "queue_timeout"):
+        return NativeFailure("gemini_inference_timeout", 504, message)
+    if code == "cancelled":
+        return NativeFailure("gemini_inference_cancelled", 499, message)
+    if effective_status == 429:
+        return NativeFailure("gemini_quota_exhausted", 429, message)
+    if effective_status == 401:
+        return NativeFailure("gemini_oauth_required", 401, message)
+    if effective_status == 403:
+        return NativeFailure("gemini_location_unsupported", 403, message)
+    if effective_status == 404:
+        return NativeFailure("gemini_model_unavailable", 404, message)
+    return NativeFailure("gemini_inference_failed", effective_status if 400 <= effective_status <= 599 else 502, message)
+
+
+def open_worker_stream(
+    socket_path,
+    token,
+    model,
+    request_id,
+    body_obj,
+    *,
+    startup_timeout=45,
+    turn_timeout=TURN_TIMEOUT,
+    gateway_policy=None,
+):
+    if (
+        not isinstance(socket_path, str)
+        or not os.path.isabs(socket_path)
+        or not isinstance(token, str)
+        or not TOKEN.fullmatch(token)
+        or not isinstance(model, str)
+        or not MODEL.fullmatch(model)
+        or not isinstance(request_id, str)
+        or not REQUEST_ID.fullmatch(request_id)
+        or not isinstance(body_obj, dict)
+    ):
+        raise NativeFailure("gemini_inference_bad_input", 400)
+    start_deadline = time.monotonic() + startup_timeout
+    while time.monotonic() < start_deadline:
+        status = worker_status(socket_path, token, timeout=0.25)
+        native_pid = status.get("native_pid") if status else None
+        if status and status.get("license_valid") is False:
+            lic = status.get("license") if isinstance(status.get("license"), dict) else {}
+            lic_code = lic.get("code") if isinstance(lic.get("code"), str) and lic.get("code") in LICENSE_ERROR_CODES else "license_required"
+            raise NativeFailure(lic_code, 403, lic.get("message") if isinstance(lic.get("message"), str) else None)
+        if status and status.get("needs_recovery") is True:
+            raise NativeFailure("gemini_native_worker_unavailable", 503)
+        if (
+            status
+            and status.get("ready") is True
+            and type(native_pid) is int
+            and native_pid > 0
+        ):
+            break
+        time.sleep(0.05)
+    else:
+        raise NativeFailure("gemini_native_bridge_timeout", 503)
+    envelope = {
+        "request_id": request_id,
+        "stream": True,
+        "body": body_obj,
+    }
+    if isinstance(gateway_policy, dict) and gateway_policy:
+        envelope["gateway_policy"] = gateway_policy
+    payload = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(payload) > MAX_BODY:
+        raise NativeFailure("gemini_inference_output_limit", 413)
+    connection = _UnixHTTPConnection(socket_path, turn_timeout)
+    try:
+        response = connection.request(
+            "POST",
+            "/internal/v1/messages",
+            {
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+                "X-Kin-Internal-Token": token,
+            },
+            payload,
+        )
+        response.begin()
+        ct = (response.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if response.status != 200 or ct != "text/event-stream":
+            raw = response.read(64 * 1024)
+            err_payload = None
+            try:
+                err_payload = json.loads(raw) if raw else None
+            except ValueError:
+                err_payload = None
+            connection.close()
+            raise _map_worker_error(response.status, err_payload)
+        return connection, response
+    except NativeFailure:
+        raise
+    except (OSError, TimeoutError):
+        connection.close()
+        raise NativeFailure("gemini_inference_failed", 502) from None
+
+
 def query_free_vt(lock_path):
     descriptor = os.open(
         lock_path,
@@ -325,6 +477,10 @@ def run_request(request):
     while time.monotonic() < start_deadline:
         status = worker_status(socket_path, token, timeout=0.25)
         native_pid = status.get("native_pid") if status else None
+        if status and status.get("license_valid") is False:
+            lic = status.get("license") if isinstance(status.get("license"), dict) else {}
+            lic_code = lic.get("code") if isinstance(lic.get("code"), str) and lic.get("code") in LICENSE_ERROR_CODES else "license_required"
+            raise NativeFailure(lic_code, 403, lic.get("message") if isinstance(lic.get("message"), str) else None)
         if (
             status
             and status.get("ready") is True

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   CREDENTIAL_ENSURE_COOLDOWN_MS,
   classifyUpstreamResult,
+  isPreFirstFrameTransportFailure,
   repairAnthropicRequest,
   shouldContinue,
 } from '../../src/lib/pool/upstream-error-policy.mjs'
@@ -1147,4 +1148,154 @@ test('fable usage-credits 429 moves on and marks the account, not the request', 
     { model: 'claude-fable-5-2' },
   )
   assert.equal(fast.reason, 'entitlement_required')
+})
+
+function cragPreFirstFrame502(error, bodyError = error, overrides = {}) {
+  return {
+    ok: false,
+    status: 502,
+    upstreamStatus: 200,
+    via: 'rust-kernel-stream',
+    nativeHandoff: true,
+    committed: false,
+    firstByteAt: null,
+    firstByteMs: null,
+    ttftMs: null,
+    terminalState: 'incomplete',
+    transportError: false,
+    providerResult: {
+      type: 'kin_provider_result',
+      schema_version: 2,
+      source: 'crag',
+      provider_complete: false,
+      usage_complete: false,
+      http_status: null,
+      public_status: 502,
+      error,
+    },
+    body: {
+      type: 'error',
+      error: bodyError,
+    },
+    ...overrides,
+  }
+}
+
+test('#1562: CRAG nativeHandoff pre-first-frame 502 splice_rst cools proxy without same-account retry', () => {
+  const now = 1_700_000_000_000
+  const providerError = {
+    type: 'transport_error',
+    message:
+      'splice_rst dest=api.anthropic.com:443: read tcp 10.0.0.2:41234->198.51.100.9:1080: connection reset by peer',
+  }
+  for (const bodyError of [providerError, { type: 'api_error', message: 'provider error' }]) {
+    const result = cragPreFirstFrame502(providerError, bodyError)
+    assert.equal(isPreFirstFrameTransportFailure(result), true)
+    const policy = classifyUpstreamResult(result, { now })
+    assert.equal(policy.scope, 'proxy')
+    assert.equal(policy.action, 'continue-and-cooldown')
+    assert.equal(policy.reason, 'proxy_transport_failure')
+    assert.equal(policy.cooldownUntil, now + 60_000)
+    assert.equal(policy.retrySameAccount, false)
+    assert.equal(policy.decision.action, 'next_unit')
+    assert.equal(shouldContinue(policy), true)
+  }
+})
+
+test('#1562: CRAG pre-first-frame 502 SOCKS5 i/o timeout cools proxy instead of retrying as provider_timeout', () => {
+  const now = 1_700_000_000_000
+  const socksTimeout = {
+    type: 'transport_error',
+    message: 'socks_dial dest=api.anthropic.com:443: read SOCKS5 greeting: i/o timeout',
+  }
+  for (const model of ['claude-sonnet-4-5', 'claude-fable-5-2']) {
+    for (const bodyError of [socksTimeout, { type: 'api_error', message: 'provider error' }]) {
+      const result = cragPreFirstFrame502(socksTimeout, bodyError)
+      const policy = classifyUpstreamResult(result, { model, now })
+      assert.equal(policy.scope, 'proxy', model)
+      assert.equal(policy.action, 'continue-and-cooldown', model)
+      assert.equal(policy.reason, 'proxy_transport_failure', model)
+      assert.equal(policy.cooldownUntil, now + 60_000, model)
+      assert.equal(policy.retrySameAccount, false, model)
+      assert.equal(policy.decision.action, 'next_unit', model)
+      assert.equal(shouldContinue(policy), true, model)
+    }
+  }
+})
+
+test('#1562: pre-first-frame generic transport_error 502 switches units and counts toward circuit', () => {
+  const now = 1_700_000_000_000
+  const cases = [
+    [
+      'crag nativeHandoff transport_error',
+      cragPreFirstFrame502({ type: 'transport_error', message: 'unexpected EOF writing request body' }),
+    ],
+    [
+      'crag v2 provider_complete=false http_status=null',
+      cragPreFirstFrame502({ type: 'api_error', message: 'upstream HTTP/2 stream error' }),
+    ],
+    [
+      'non-nativeHandoff SSE code=transport_error',
+      {
+        ok: false,
+        status: 502,
+        nativeHandoff: false,
+        committed: false,
+        firstByteAt: null,
+        terminalState: 'incomplete',
+        transportError: false,
+        providerResult: null,
+        body: {
+          type: 'error',
+          error: { type: 'api_error', code: 'transport_error', message: 'unexpected EOF writing request body' },
+        },
+      },
+    ],
+  ]
+  for (const [label, result] of cases) {
+    assert.equal(isPreFirstFrameTransportFailure(result), true, label)
+    const policy = classifyUpstreamResult(result, { now })
+    assert.equal(policy.scope, 'worker', label)
+    assert.equal(policy.action, 'continue', label)
+    assert.equal(policy.reason, 'upstream_network_error', label)
+    assert.equal(policy.cooldownUntil, null, label)
+    assert.equal(policy.retrySameAccount, false, label)
+    assert.equal(policy.circuit, true, label)
+    assert.equal(policy.decision.scope, 'unit', label)
+    assert.equal(policy.decision.action, 'next_unit', label)
+    assert.equal(shouldContinue(policy), true, label)
+  }
+})
+
+test('#1562: committed or post-first-byte streams are not classified as pre-first-frame transport failures', () => {
+  const now = 1_700_000_000_000
+  const spliceError = {
+    type: 'transport_error',
+    message: 'splice_rst dest=api.anthropic.com:443: connection reset by peer',
+  }
+  const committedResult = cragPreFirstFrame502(spliceError, spliceError, {
+    committed: true,
+    firstByteAt: now - 50,
+  })
+  assert.equal(isPreFirstFrameTransportFailure(committedResult), false)
+  const committedPolicy = classifyUpstreamResult(committedResult, { now })
+  assert.equal(committedPolicy.action, 'stop')
+  assert.equal(committedPolicy.reason, 'downstream_committed_or_incomplete')
+
+  const verifiedPostFirstByte = cragPreFirstFrame502(spliceError, spliceError, {
+    committed: false,
+    firstByteAt: now - 50,
+    firstByteMs: 50,
+  })
+  assert.equal(isPreFirstFrameTransportFailure(verifiedPostFirstByte), false)
+  const postFirstBytePolicy = classifyUpstreamResult(verifiedPostFirstByte, { now })
+  assert.equal(postFirstBytePolicy.reason, 'empty_response')
+  assert.equal(postFirstBytePolicy.scope, 'stream')
+
+  const postFirstByteSocksTimeout = cragPreFirstFrame502(
+    { type: 'transport_error', message: 'socks_dial dest=api.anthropic.com:443: read SOCKS5 greeting: i/o timeout' },
+    { type: 'transport_error', message: 'socks_dial dest=api.anthropic.com:443: read SOCKS5 greeting: i/o timeout' },
+    { committed: false, firstByteAt: now - 50 },
+  )
+  assert.equal(classifyUpstreamResult(postFirstByteSocksTimeout, { now }).reason, 'provider_timeout')
 })

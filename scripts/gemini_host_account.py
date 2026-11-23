@@ -4,6 +4,7 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -370,6 +371,167 @@ def api_key_chat(request):
     return {"status": "SUCCESS", "response": answer[:16384], "usage": counts}
 
 
+def _read_http_status_and_type(stream):
+    """Consume curl --dump-header - response headers (including proxy CONNECT blocks)."""
+    status = 0
+    content_type = ""
+    while True:
+        line = stream.readline(8192)
+        if not line:
+            return status, content_type
+        if not line.startswith(b"HTTP/"):
+            return status, content_type
+        parts = line.decode("latin-1", errors="replace").strip().split(None, 2)
+        try:
+            code = int(parts[1]) if len(parts) >= 2 else 0
+        except ValueError:
+            code = 0
+        block_ct = ""
+        while True:
+            header = stream.readline(8192)
+            if not header or header in (b"\r\n", b"\n"):
+                break
+            text_header = header.decode("latin-1", errors="replace")
+            if ":" in text_header:
+                name, value = text_header.split(":", 1)
+                if name.strip().lower() == "content-type":
+                    block_ct = value.strip()
+        if code == 200 and len(parts) >= 3 and "connection established" in parts[2].lower():
+            continue
+        if 100 <= code < 200:
+            continue
+        return code, block_ct
+
+
+def api_key_stream(request):
+    model = request.get("model")
+    api_key = request.get("api_key")
+    proxy_url = request.get("proxy_url")
+    body = request.get("body")
+    if (
+        not isinstance(model, str)
+        or not MODEL.fullmatch(model)
+        or not isinstance(api_key, str)
+        or not isinstance(proxy_url, str)
+        or not isinstance(body, dict)
+    ):
+        sys.stdout.buffer.write(b"STATUS 400 application/json\n")
+        sys.stdout.buffer.flush()
+        return 1
+    body_bytes = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(body_bytes) > 4 * 1024 * 1024:
+        sys.stdout.buffer.write(b"STATUS 413 application/json\n")
+        sys.stdout.buffer.flush()
+        return 1
+    config = "".join(
+        f"{key} = {json.dumps(value)}\n"
+        for key, value in (
+            ("proxy", proxy_url),
+            ("noproxy", ""),
+            ("header", f"x-goog-api-key: {api_key}"),
+            ("header", "Content-Type: application/json"),
+            ("header", "Accept: text/event-stream"),
+        )
+    ).encode("utf-8")
+    read_fd, write_fd = os.pipe()
+    proc = None
+    writer = None
+    try:
+        args = [
+            "curl",
+            "--disable",
+            "--silent",
+            "--show-error",
+            "--no-buffer",
+            "--dump-header",
+            "-",
+            "--config",
+            "-",
+            "--proto",
+            "=https",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "300",
+            "--data-binary",
+            f"@/dev/fd/{read_fd}",
+            f"{GEMINI_API}/models/{model}:streamGenerateContent?alt=sse",
+        ]
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(read_fd,),
+            env=ENV,
+            bufsize=0,
+        )
+        os.close(read_fd)
+        read_fd = -1
+
+        def feed_body():
+            try:
+                view = memoryview(body_bytes)
+                offset = 0
+                while offset < len(view):
+                    written = os.write(write_fd, view[offset : offset + 65536])
+                    if written <= 0:
+                        break
+                    offset += written
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(write_fd)
+                except OSError:
+                    pass
+
+        writer = threading.Thread(target=feed_body, daemon=True)
+        writer.start()
+        write_fd = -1
+        try:
+            proc.stdin.write(config)
+            proc.stdin.close()
+        except OSError:
+            pass
+
+        status, content_type = _read_http_status_and_type(proc.stdout)
+        safe_ct = re.sub(r"[\r\n]+", "", content_type or "application/octet-stream")[:128]
+        sys.stdout.buffer.write(f"STATUS {status} {safe_ct}\n".encode("ascii"))
+        sys.stdout.buffer.flush()
+        while True:
+            chunk = proc.stdout.read1(16384) if hasattr(proc.stdout, "read1") else proc.stdout.read(16384)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+        proc.wait(timeout=5)
+        return 0 if status == 200 else 1
+    except (OSError, subprocess.SubprocessError):
+        try:
+            sys.stdout.buffer.write(b"STATUS 0 error\n")
+            sys.stdout.buffer.flush()
+        except OSError:
+            pass
+        return 1
+    finally:
+        if read_fd >= 0:
+            try:
+                os.close(read_fd)
+            except OSError:
+                pass
+        if write_fd >= 0:
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if writer is not None:
+            writer.join(timeout=1)
+
+
 if __name__ == "__main__":
     request = json.load(sys.stdin)
     if sys.argv[1] in ("api_key", "api-key-models") and re.fullmatch(
@@ -385,6 +547,10 @@ if __name__ == "__main__":
     elif sys.argv[1] == "proxy-probe":
         status, _ = get_json(request["proxy_url"], GOOGLE_USERINFO)
         result = {"ok": status == 401}
+    elif sys.argv[1] == "api-key-stream" and re.fullmatch(
+        r"[A-Za-z0-9_-]{20,256}", request["api_key"]
+    ):
+        raise SystemExit(api_key_stream(request))
     elif sys.argv[1] == "api-key-chat" and re.fullmatch(
         r"[A-Za-z0-9_-]{20,256}", request["api_key"]
     ):

@@ -779,7 +779,7 @@ prepare_gemini_host() (
   prepare_gemini_maintenance "$tag" "$mode" || return 1
 
   local host_dir=/usr/local/lib/vm2api-gemini
-  local default_source="${host_dir}/defaults/0.3.0-rc.2"
+  local default_source="${host_dir}/defaults/0.3.0"
   local unit=/etc/systemd/system/vm2api-gemini.service
   local current="${INSTALL_DIR}/share/gemini/current"
   if [ -z "$source" ] && command -v systemctl >/dev/null; then
@@ -800,6 +800,7 @@ prepare_gemini_host() (
     # Retain the trust inputs of an installed default payload, never replace current.
     if { [ -f "${current}/manifest.json" ] &&
       cmp -s -- "${current}/manifest.json" "${default_source}/manifest.json"; } ||
+      { [ -f "$unit" ] && grep -Fq -- "${default_source}/crag-license-public.pem" "$unit"; } ||
       { [ -f "$unit" ] && grep -Fq -- "--default-public-key ${default_source}/gemini-ed25519.pub" "$unit"; }; then
       want_default=1
     fi
@@ -890,7 +891,11 @@ prepare_gemini_host() (
       err "无法准备 Gemini 默认签名载荷；请检查上述错误后重新执行 prepare-gemini"
       return 1
     fi
-    default_args="--default-public-key ${default_source}/gemini-ed25519.pub --default-release-verifier ${default_source}/gemini-release.json"
+    if [ -f "${default_source}/crag-license-public.pem" ]; then
+      default_args=""
+    else
+      default_args="--default-public-key ${default_source}/gemini-ed25519.pub --default-release-verifier ${default_source}/gemini-release.json"
+    fi
     if [ -z "$source" ]; then
       source="$default_source"
     fi
@@ -902,8 +907,13 @@ prepare_gemini_host() (
     install -D -m 644 "${staging}/${file}" "${host_dir}/${file}" || return 1
   done
   local source_arg="${source:+--payload-source $source}"
+  local public_key_path=/etc/vm2api/gemini-ed25519.pub
+  if [ "$use_default" = 1 ] && [ -f "${default_source}/crag-license-public.pem" ]; then
+    public_key_path="${default_source}/crag-license-public.pem"
+  fi
   sed -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" -e "s|@PAYLOAD_SOURCE_ARG@|${source_arg}|g" \
     -e "s|@DEFAULT_PAYLOAD_ARGS@|${default_args}|g" \
+    -e "s|--public-key /etc/vm2api/gemini-ed25519.pub|--public-key ${public_key_path}|g" \
     "${staging}/${files[0]}" > "${staging}/vm2api-gemini.service" || return 1
   install -m 644 "${staging}/vm2api-gemini.service" "$unit" || return 1
   if ! (systemctl daemon-reload && systemctl enable vm2api-gemini.service && systemctl restart vm2api-gemini.service); then

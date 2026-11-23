@@ -2433,8 +2433,8 @@ export function createHandleProtocol(deps) {
     }
     if (!observedHop && result?.attemptCount > 0) afterHop(result)
 
-    // This request never reached generation and supplies no account quota evidence.
-    if (result?.accountId && result.policy?.reason !== 'crag_opaque_429') {
+    // Zero-execution rejections (e.g. session_home_slot_busy) and opaque CRAG 429s never reached generation.
+    if (result?.accountId && result.attemptCount !== 0 && result.policy?.reason !== 'crag_opaque_429') {
       try {
         const limitText = [
           logBag.error_message,
