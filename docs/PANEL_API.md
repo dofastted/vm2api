@@ -208,6 +208,10 @@
 
 ### 平台独立的槽位限额
 
+Claude 的 `PATCH /api/panel/vms/:id` 接受 `max_primary_sessions` (1-20) 和 `max_subagents_per_session` (0-20). 每项单独传 `null` 恢复继承, 非法值返回 400 `invalid_scheduling_value`. 全局默认由 `PUT /api/panel/routing` 的 `pool` 对象设置. 两项均默认 `null`, 前者跟随本 VM 物理席位上限, 后者关闭家族模式. 列表和详情返回两项生效值、对应的 `_override` 标记及 `scheduling_inherited` 中的继承值.
+
+家族模式下, `seats_used` 统计本 VM 占用的根席位, `seats_max` 为生效的主会话上限 n. 每个 `seat_sessions` 成员及 SSE 对应的 `sessions` 成员另带 `subagents_running` (含已放行请求), `subagents_queued` 和 `subagents_max`. 根迁移后, 当前根席位保留到整个家族的在跑和排队请求结束, 旧 VM 在本地最后一份预约结束时交还席位. 热更新的 n 和 m 用于新进调度的请求. 所有执行预约 (含旧票和免席位探测) 在放行时按 VM 当时的家族模式检查物理位. 关闭模式的快照显示最近观察到的物理容量.
+
 `max_concurrency` / `max_rpm` 传数字钉住本槽，传 `null` 清除覆盖并立即使用本平台全局值。Claude 跟随 `tiers`；OpenAI 跟随 `codex.quota`，不受 Claude 分档保存影响。
 
 `active_hours` 是本槽每日工作时段：`PATCH {"active_hours": {"start": "HH:MM", "end": "HH:MM", "timezone": "IANA", "days": [0-6]}}`，`null` 清除恢复 24h 接单。`start` 晚于 `end` 为跨夜班次（如 20:00–08:00）；`days` 约束窗口可开始的星期（0 = 周日，缺省每天），跨夜窗的下半段不受次日是否列出影响。时区取窗口自带值 → 槽位 `timezone` → UTC。窗口外该槽不参与调度：Claude 池返回 `rest_period`（模型/额度门禁之后才判，只有本可接单的槽才计入开窗时间）；Codex 池直接跳过，续接 `previous_response_id` 时绑定槽在休息返回 409 `response_not_portable`；两侧整池都在休息时均 503 `pool_unavailable` 并带 `Retry-After`（最近开窗时间）。pin 诊断不受影响，健康探测不挑休息中的槽。夏令时切换日按实际时刻判定：开窗落在被跳过的小时则在跳变时刻开窗，重复的小时不截断班次。导出包无窗口时写 `active_hours: null`，写回会清除窗口；面板 `availability.key` 显示 `rest`（仅当槽本可接单时；冷却/额度等真实原因优先）、`schedule_state` 为 `restricted`、`restriction_until` 为下次开窗。列表/详情另返回 `active_hours_timezone`（实际生效时区）与 `active_hours_active`（此刻是否在窗口内，未设为 `null`）。

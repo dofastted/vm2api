@@ -136,6 +136,7 @@ export function poolOverloadedError(details = {}) {
     status: 529,
     via: 'pool-failover',
     terminalState: 'exhausted',
+    ...(details.reason === 'subagent_limit' && { poolReason: details.reason }),
     retryAfterSec: Number.isFinite(retryMs) && retryMs > 0 ? Math.max(1, Math.ceil(retryMs / 1000)) : 1,
     body: {
       type: 'error',
@@ -153,6 +154,7 @@ const CAPACITY_SELECTION_REASONS = new Set([
   'all_accounts_busy',
   'pool_wait_queue_full',
   'pool_queue_timeout',
+  'subagent_limit',
   'pool_overload_cooldown',
 ])
 
@@ -528,6 +530,7 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
   const reason = selected?.reason || 'no_eligible_accounts'
   const details = {
     excluded_accounts: [...excluded],
+    ...(selected?.selectionReason === 'subagent-fallback' && { selection_reason: 'subagent-fallback' }),
     reason,
     wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
     soonest_available_ms: selected?.soonest_available_ms ?? null,
@@ -740,7 +743,9 @@ export class FailoverRunner {
     // Before queueing behind the session's hung turn: a refused retry must cost nothing.
     const quarantined = args.pinVmId ? null : this.poisonGuard.check(sessionKey, args.canonicalBody)
     if (quarantined) return quarantinedResult(quarantined)
-    if (!sessionKey) return this.runOnce(args)
+    const subagent = args.rootSessionId ? this.scheduler?.trackSubagent?.(args) : null
+    if (args.rootSessionId) args = { ...args, subagent }
+    if (!sessionKey) return subagent ? this.runOnce(args).finally(subagent.close) : this.runOnce(args)
     const previous = this.sessionTails.get(sessionKey) || Promise.resolve()
     let releaseTurn
     const turn = new Promise((resolve) => {
@@ -762,6 +767,7 @@ export class FailoverRunner {
       }
       throw error
     } finally {
+      subagent?.close()
       releaseTurn()
       // Drop the chain only after this tail settles. A timeout or cancel
       // releases our turn early, while the holder is still running; deleting
@@ -791,6 +797,9 @@ export class FailoverRunner {
     pinVmId = null,
     familyKey = null,
     familyVmId = null,
+    rootSessionId = null,
+    summarySession = null,
+    subagent,
     deviceKey = null,
     skipSessionSeat = false,
     ownerScope = null,
@@ -880,7 +889,7 @@ export class FailoverRunner {
           pinBaseline.set(key, this.stickyRouter.resolve?.(key) || null)
         }
       }
-      if (familyKey && account.vmId && !pinMoved(familyKey)) {
+      if (familyKey && account.vmId && lastSelected?.selectionReason !== 'subagent-fallback' && !pinMoved(familyKey)) {
         this.stickyRouter.bind?.(familyKey, { accountId: account.accountId, vmId: account.vmId }, { countHit: false })
         pinBaseline.set(familyKey, this.stickyRouter.resolve?.(familyKey) || null)
       }
@@ -938,12 +947,22 @@ export class FailoverRunner {
     // keep_session_home: the continuing conversation's account for this
     // request is the one its first attempt ran on.
     const keepHome = this.config.keep_session_home === true && !pinVmId && !!stickyKey
-    const continuing = keepHome && !!this.stickyRouter?.resolve?.(stickyKey)?.accountId
+    const continuing = !subagent && keepHome && !!this.stickyRouter?.resolve?.(stickyKey)?.accountId
     let homeAccountId = null
     let homeRetryPending = false
+    let subagentSlotDeadline = null
+    const switchUnit = (unit, policy) => {
+      budget.noteSwitch(unit.accountId, unit.vmId, { spill: policy.reason === 'slot_busy' })
+      if (unit.isSubagent) {
+        unit.release()
+        subagent?.close()
+        familyVmId = null
+        subagentSlotDeadline = null
+      }
+    }
     const isHome = (unit) => continuing && !!homeAccountId && unit?.accountId === homeAccountId
     const retryOrStay = (unit) => {
-      if (isHome(unit)) {
+      if (isHome(unit) || unit?.isSubagent) {
         homeRetryPending = true
         return null
       }
@@ -952,14 +971,24 @@ export class FailoverRunner {
     // The home kernel had no free slot: nothing ran, so wait for it instead of
     // spilling the transcript to another account. The request deadline bounds it.
     const waitHomeSlot = (unit, policy) => {
-      if (!isHome(unit) || policy?.reason !== 'slot_busy') return false
+      if ((!isHome(unit) && !unit?.isSubagent) || policy?.reason !== 'slot_busy') return false
       homeRetryPending = 'slot_busy'
       return true
     }
     // x-kin-queue: off — the home kernel being full is the pool being full for this
     // conversation: answer 529 now rather than wait for the slot.
     const homeSlotRefused = (unit, policy) => {
-      if (allowQueue || !isHome(unit) || policy?.reason !== 'slot_busy') return null
+      if (policy?.reason !== 'slot_busy') return null
+      if (unit?.isSubagent) {
+        subagentSlotDeadline ??= unit.slotWaitDeadlineMs
+        if (allowQueue && Date.now() < subagentSlotDeadline) return null
+        releaseStickySlots()
+        return {
+          ...poolOverloadedError({ reason: 'pool_queue_timeout', attempt_count: budget.hops }),
+          ...attribution(),
+        }
+      }
+      if (allowQueue || !isHome(unit)) return null
       releaseStickySlots()
       return {
         ...poolOverloadedError({ reason: 'session_home_slot_busy', attempt_count: budget.hops }),
@@ -1005,6 +1034,9 @@ export class FailoverRunner {
           deadline: repairPending ? Math.max(deadline, Date.now() + REPAIR_HOP_WAIT_MS) : deadline,
           pinVmId,
           familyVmId,
+          rootSessionId,
+          summarySession,
+          subagent,
           deviceVmId: currentDeviceVmId,
           deviceKey,
           skipSessionSlot: skipSessionSeat,
@@ -1022,7 +1054,17 @@ export class FailoverRunner {
               ? Number(this.config.home_slot_busy_retry_ms ?? 2000)
               : this.config.same_account_retry_delay_ms
           homeRetryPending = false
-          await sleepWithSignal(waitMs, signal)
+          await sleepWithSignal(Math.min(waitMs, (subagentSlotDeadline ?? Infinity) - Date.now()), signal)
+        }
+        if (subagentSlotDeadline != null) {
+          selectArgs.deadline = Math.min(selectArgs.deadline, subagentSlotDeadline)
+          if (Date.now() >= subagentSlotDeadline) {
+            releaseStickySlots()
+            return {
+              ...poolOverloadedError({ reason: 'pool_queue_timeout', attempt_count: budget.hops }),
+              ...attribution(),
+            }
+          }
         }
         if (avoid) {
           const elsewhere = await this.scheduler.selectAndReserve({ ...selectArgs, avoid, allowWait: false })
@@ -1078,7 +1120,7 @@ export class FailoverRunner {
           if (!homeAccountId) homeAccountId = selected.accountId
           else if (selected.accountId !== homeAccountId) return keptHome()
         }
-        if (selected?.familyGated && familyKey && familyVmId) {
+        if (selected?.familyGated && selected.selectionReason !== 'subagent-fallback' && familyKey && familyVmId) {
           // The family home left the pool (quota, credential): the family moves
           // with the next bind. An exclusion this request made itself is not proof.
           const home = this.stickyRouter?.resolve?.(familyKey)
@@ -1108,6 +1150,12 @@ export class FailoverRunner {
         }
         if (!selected?.ok) {
           const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
+          if (
+            selected?.reason === 'subagent_limit' ||
+            (selected?.isSubagent && selected.reason === 'pool_queue_timeout')
+          ) {
+            return { ...exhausted, ...attribution() }
+          }
           return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
         }
         repairPending = false
@@ -1340,7 +1388,7 @@ export class FailoverRunner {
         if (policy.pauseSchedule) this.pauseUnit(selected, policy, result)
         if (!pinVmId && isCredentialDeath(policy)) {
           this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
-          if (familyKey) {
+          if (familyKey && (!selected.isSubagent || result.committed)) {
             releaseStickySlots()
             return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
           }
@@ -1365,7 +1413,7 @@ export class FailoverRunner {
         }
         if (waitHomeSlot(selected, policy)) continue
         if (isHome(selected)) return keptHome()
-        budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
+        switchUnit(selected, policy)
       } catch (error) {
         if (attemptStarted === undefined) throw error
         const invalidRequest =
@@ -1477,7 +1525,7 @@ export class FailoverRunner {
         applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
         if (!pinVmId && isCredentialDeath(policy)) {
           this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
-          if (familyKey) {
+          if (familyKey && !selected.isSubagent) {
             releaseStickySlots()
             return { ...result, ...attribution(), finalState: result.terminalState, policy }
           }
@@ -1493,7 +1541,7 @@ export class FailoverRunner {
         }
         if (waitHomeSlot(selected, policy)) continue
         if (isHome(selected)) return keptHome()
-        budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
+        switchUnit(selected, policy)
       } finally {
         // Setup and attempt share the same permit lifetime.
         selected?.release?.()

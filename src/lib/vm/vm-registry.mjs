@@ -146,6 +146,11 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     max_sessions_override: kind.kind === 'codex' ? openAIPolicy.sessions_override : false,
     session_slots: kind.kind === 'codex' ? null : (vm.policy?.sessionSlots ?? null),
     session_slots_override: kind.kind === 'codex' ? false : vm.policy?.sessionSlotsOverride === true,
+    max_primary_sessions: kind.kind === 'codex' ? null : (vm.policy?.maxPrimarySessions ?? null),
+    max_primary_sessions_override: kind.kind === 'codex' ? false : vm.policy?.maxPrimarySessionsOverride === true,
+    max_subagents_per_session: kind.kind === 'codex' ? null : (vm.policy?.maxSubagentsPerSession ?? null),
+    max_subagents_per_session_override:
+      kind.kind === 'codex' ? false : vm.policy?.maxSubagentsPerSessionOverride === true,
     scheduling_inherited:
       kind.kind === 'codex'
         ? {

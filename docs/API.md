@@ -525,9 +525,14 @@ stateDiagram-v2
 - 流空闲上限：上游流连续无事件超过 `failover.stream_idle_timeout_ms`（默认 180 秒，面板「重试与切号」可调，30 秒–60 分钟）即判超时。网关、槽内 kernel 的流空闲上限和 job 看门狗（kernel 读的是不带前缀的环境变量 `JOB_IDLE_SECS`，由 kernel 启动脚本从 `kernel.json` 读取并导出；`KIN_JOB_IDLE_SECS` 不生效）共用这个值。保存后立即热写入各槽 `kernel.json`；job 看门狗只在 kernel 启动时读取，所以值变化后各运行中的 Claude 槽会在没有任务时自动重启 kernel（有任务则等它结束，另每 15 秒复查一次）。不带 `eager_input_streaming` 时，上游会把大工具入参（如长 `Write` 内容）整段缓冲，期间可能静默数分钟。未配置时用环境变量 `KIN_STREAM_IDLE_TIMEOUT`。
 - 排队保活（仅 Claude `stream: true`）：选席、同会话串行、失败重试都发生在上游尝试开始之前，这段时间原先不下发任何字节。Cloudflare 约 100 秒收不到响应会回 524。`failover.queue_keepalive_delay_ms`（默认 60 秒，上限 90 秒，也可用 `KIN_QUEUE_KEEPALIVE_DELAY`）过后开始写 SSE `event: ping`，间隔与 `stream_keepalive_ms` 相同，并一直持续到首个内容事件。延迟之内失败仍是 HTTP 429/529/503。一旦写出 ping，状态码不能再改，后续失败改为 SSE `event: error`（例如 `overloaded_error`）。同会话排队另有 `failover.session_queue_timeout_ms`（默认 15 分钟；`0` 表示不限制），超时按 529 `overloaded_error` 返回，不会和仍在跑的上一轮并发。Codex / OpenAI 路径不变。
 - 工具参数流式下发：`failover.eager_tool_streaming`（默认开，面板「重试与切号」开关；显式 `false` 关闭）。开启后给所有自定义工具加 `eager_input_streaming: true`（服务端工具不动），上游边生成边下发大参数，不再长时间静默。这与官方 Claude Code 开启细粒度工具流式时的形态一致：官方只在直连官方 base URL 且服务端开关 `tengu_fgts` 打开，或设置 `CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1` 时给全部工具加这个字段，所以经中转的客户端默认不带。客户端自己带了这个布尔值时以客户端为准。参数在 `max_tokens` 截断时可能是不完整的 JSON。OpenAI chat/responses 入口的 function 工具在转成 Anthropic 后同样加这个字段。
-- 子请求：带显式 `parent_session_id` / `root_session_id` 且父会话在本地已有绑定时，子请求跟随父会话所在 VM（family 粘性）。子会话有自己的 session id，单独占一个席位，不和父会话或同 device 的其它会话共用。没有显式父子字段时，同设备的新会话不会被当作子请求。
-- Claude Code 子 agent：请求头带 `x-claude-code-agent-id` 时，按上一条的子请求处理，父会话是 `metadata.user_id.session_id`，子会话 ID 由它和 agent ID 派生。每个 agent 单独串行，不等父会话当前这一轮。官方入站若带 `x-claude-code-agent-id` 或 `x-claude-code-parent-agent-id`，出站原样保留该值；没有则不添加，也不写入槽位头文件。非官方入站不转发这两个头。
+- 默认情况下, 带显式 `parent_session_id` / `root_session_id` 的子请求按父会话亲和选 VM, 每个子会话单独占席.
+- 家族模式下, 带 `x-claude-code-agent-id` 的请求沿用派生子会话 ID 时的根. 优先读 `metadata.user_id.session_id`, 其次是会话头 (如 `x-session-id`) 和请求体会话键 (如 `conversation_id`). 其他请求可用 `metadata.root_session_id` 或 `x-kin-root-session` 显式声明根. 仅有 `parent_session_id` 或 `x-kin-parent-session` 的请求按普通主会话占席. Agent summary 带 agent-id 时按同一顺序读根, 否则取 metadata 中的会话 ID. 已验证的摘要计入 m, 保留独立执行身份和空 `stickyKey`.
+- 开启家族模式的 VM 授予普通主会话席位时, 调度器同步在其 ownerScope 内登记根 VM. 登记有效期沿用 sticky TTL. 获准后即使客户端在取走前取消, 也只归还本次预约, 根登记本身不占容量. 子代理和 fallback 均不刷新登记. 热开启前尚未登记的根, 以及控制面重启后清空的根, 均在主会话下一次获准时登记. 此前到达的子代理按普通会话调度.
+- 子代理只在根 VM 重新占席或等待执行. 根迁移时, 旧 VM 仍在执行的子代理计入同一个 m. 等待根席位、m 和执行并发共用 `sticky_wait_timeout_ms`. 等 m 超时返回 529 `pool_overloaded`, 带 `Retry-After` 和 `error.details.reason="subagent_limit"`. 同一子会话的后续请求先走原有 `sessionTails` 串行队列, 进入家族调度时才排 FIFO 并开始粘性等待计时. 根 VM 失去资格或在提交响应前遇到需要换号的错误时, 子代理按普通会话重新选席, 记为 `subagent-fallback`.
+- Claude Code 子会话 ID 由根会话 ID 和 `x-claude-code-agent-id` 派生. 每个 agent 单独串行, 可以与父请求并行. 官方入站若带 `x-claude-code-agent-id` 或 `x-claude-code-parent-agent-id`, 出站原样保留该值. 没有则不添加, 也不写入槽位头文件. 非官方入站不转发这两个头.
 - 裸 429（没有 5h/7d 头、没有套餐文案）不按模型名定范围：当前执行单元短暂让位并触发一次 `/usage` 探测，由真实用量决定是否是账号额度。上游文本点名模型的才按模型冷却，每分钟限流按 RPM 短冷却。
+
+**家族调度的已知限制**. 根迁移期间若同时热改配置且节点离线, 已放行的请求仍留在原 VM. 排队请求逐个复核归属. 仍在根 VM 上排队的请求沿用首次进入家族队列时的截止时间, 到期返回 529. 进入普通回退的请求按普通选席规则等待, 并受本次请求总截止时间约束.
 
 ## 用量回包
 

@@ -59,6 +59,9 @@ function sameSessions(a: Vm['seat_sessions'], b: Vm['seat_sessions']) {
       seat.session_id === other?.session_id &&
       seat.state === other?.state &&
       seat.inflight === other?.inflight &&
+      seat.subagents_running === other?.subagents_running &&
+      seat.subagents_queued === other?.subagents_queued &&
+      seat.subagents_max === other?.subagents_max &&
       (seat.held_until ?? null) === (other?.held_until ?? null)
     )
   })

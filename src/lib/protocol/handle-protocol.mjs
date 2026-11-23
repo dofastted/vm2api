@@ -114,6 +114,7 @@ import { profileForPreset } from '../identity/official-profiles.mjs'
 import { loadVmIdentity, OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import {
   applyCrsIdentityReplace,
+  subagentRootSession,
   extractCallerSession,
   extractFirstUserIdentity,
   outboundSessionMode,
@@ -391,6 +392,9 @@ export function createHandleProtocol(deps) {
           mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
           result?.body,
         )
+    if (mapped.body.error.code === ErrorCode.POOL_OVERLOADED && result?.poolReason === 'subagent_limit') {
+      mapped.body.error.details = { reason: result.poolReason }
+    }
     // Do not turn this opaque rejection into advice to wait or switch accounts.
     if (opaqueCrag429) mapped.body.error.message = originalMessage
     const summary = formatPoolSelectionSummary(details)
@@ -1805,6 +1809,8 @@ export function createHandleProtocol(deps) {
         deviceKey,
         skipSessionSeat: seatless,
         familyKey: summarySession ? null : familyKey,
+        summarySession,
+        rootSessionId: seatless && !summarySession ? null : subagentRootSession(inbound, req.headers, !!summarySession),
         seatKey,
         familyVmId,
         pinVmId,
@@ -2520,7 +2526,7 @@ export function createHandleProtocol(deps) {
           // A strict handoff failure must remain an error even after partial
           // content. Legacy queue pings still receive the mapped SSE error.
           const mapped = mapProtocolClientError(result, logBag, logBag.error_code)
-          res.write(buildAnthropicSseError(mapped.body?.error || {}))
+          res.write(buildAnthropicSseError(mapped.body?.error || {}, result?.poolReason))
         } else if (protocol === 'anthropic.messages' && !res.writableEnded && !streamTracker?.isFinished()) {
           // Started but not closable: ask the client to retry instead of
           // dropping the connection. error_code/error_message keep the cause.

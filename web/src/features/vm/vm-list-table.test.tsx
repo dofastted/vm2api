@@ -1,6 +1,7 @@
 import { type ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
+import { readFileSync } from 'node:fs'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import { FleetPulse } from './fleet-pulse'
@@ -35,6 +36,24 @@ function render(over: Partial<Vm> = {}) {
 }
 
 describe('VM scheduling priority', () => {
+  it('groups the three Claude seat PATCH fields under one VM type check', () => {
+    const source = readFileSync(
+      new URL('./vm-scheduling.tsx', import.meta.url),
+      'utf8'
+    )
+    const guards = [...source.matchAll(/if \(!isCodexVm\(vm\)\) \{([^}]+)\}/g)]
+    const fields = [
+      'session_slots',
+      'max_primary_sessions',
+      'max_subagents_per_session',
+    ]
+    expect(
+      guards.some(([, block]) =>
+        fields.every((field) => block.includes(`knob('${field}',`))
+      )
+    ).toBe(true)
+  })
+
   it.each(['anthropic', 'openai'] as const)(
     'shows and edits the same %s priority throughout the panel',
     (platform) => {
@@ -72,6 +91,39 @@ describe('VM scheduling priority', () => {
 })
 
 describe('VM row interaction and health', () => {
+  it('shows family limits and the waiting children on a Claude root seat', () => {
+    const vm: Vm = {
+      id: 'vm-01',
+      seats_max: 2,
+      max_primary_sessions: 2,
+      max_subagents_per_session: 0,
+      max_subagents_per_session_override: true,
+      seat_sessions: [
+        {
+          index: 0,
+          session_id: 'root',
+          state: 'idle',
+          inflight: 0,
+          subagents_running: 0,
+          subagents_queued: 2,
+          subagents_max: 0,
+        },
+      ],
+    }
+    const block = renderToStaticMarkup(<VmSchedulingBlock vm={vm} />)
+    expect(block).toContain('主会话上限')
+    expect(block).toContain('子代理 0/0 · 排队 2')
+    expect(
+      renderToStaticMarkup(<VmSchedulingBlock vm={{ id: 'legacy' }} />)
+    ).toContain('关闭(子代理各占一个席位)')
+    const editor = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <VmSchedulingEditor vm={vm} />
+      </QueryClientProvider>
+    )
+    expect(editor).toMatch(/<select[^>]*aria-label="每会话子代理上限"/)
+    expect(editor).toContain('<option value="20">20</option>')
+  })
   it('opens detail from a left button and exposes a separate expand control', () => {
     const html = render()
     expect(html).toContain('aria-label="打开 vm-01 详情页"')
