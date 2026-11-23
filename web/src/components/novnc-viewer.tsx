@@ -85,6 +85,9 @@ export function NoVncViewer({
   const onClipboardRef = useRef(onClipboard)
   onClipboardRef.current = onClipboard
   const remoteClipRef = useRef('')
+  // 已拦下 Cmd/Ctrl+V、正等 paste 事件：若浏览器没派发 paste（极少数环境），
+  // 超时后降级为直接注入 Ctrl+V，保证粘贴不失效
+  const pendingPasteV = useRef(false)
 
   useEffect(() => {
     const host = hostRef.current
@@ -99,6 +102,15 @@ export function NoVncViewer({
       onPhaseRef.current?.(p, d)
     }
 
+    // 注入 Ctrl+V 键序（同一条 WebSocket 上必然排在剪贴板写入之后）
+    const injectCtrlV = () => {
+      if (!rfb) return
+      rfb.sendKey(XK_Control_L, 'ControlLeft', true)
+      rfb.sendKey(XK_v, 'KeyV', true)
+      rfb.sendKey(XK_v, 'KeyV', false)
+      rfb.sendKey(XK_Control_L, 'ControlLeft', false)
+    }
+
     // —— host 捕获阶段拦截（host 是 canvas 祖先，先于 noVNC 在 canvas 上的监听）——
     const onHostKeyDown = (e: KeyboardEvent) => {
       if (!rfb) return
@@ -108,6 +120,14 @@ export function NoVncViewer({
       // 不 preventDefault：paste 事件必须能派发。
       if ((e.metaKey || e.ctrlKey) && e.code === 'KeyV') {
         e.stopImmediatePropagation()
+        pendingPasteV.current = true
+        setTimeout(() => {
+          // paste 未派生（浏览器差异）：降级为直接转发，不让 V 键失效
+          if (pendingPasteV.current) {
+            pendingPasteV.current = false
+            injectCtrlV()
+          }
+        }, 80)
         return
       }
       if (IS_MAC && e.metaKey) remapCmdToCtrl(e)
@@ -123,16 +143,13 @@ export function NoVncViewer({
     const onDocPaste = (e: ClipboardEvent) => {
       if (!rfb || !connected) return
       if (isEditable(e.target)) return // 面板输入框正常粘贴
+      pendingPasteV.current = false
       const text = e.clipboardData?.getData('text/plain') ?? ''
       e.preventDefault()
       // 经典 RFB ClientCutText 只支持 Latin-1，中文会被截成 '?'；
       // 验证码/链接/密码场景均为 ASCII，长中文仍可用「发送剪贴板」兜底输入。
       if (text) rfb.clipboardPasteFrom(text)
-      // 同一条 WebSocket 上剪贴板写入必然先于按键到达，x11vnc 顺序处理
-      rfb.sendKey(XK_Control_L, 'ControlLeft', true)
-      rfb.sendKey(XK_v, 'KeyV', true)
-      rfb.sendKey(XK_v, 'KeyV', false)
-      rfb.sendKey(XK_Control_L, 'ControlLeft', false)
+      injectCtrlV()
     }
     const onDocCopy = (e: ClipboardEvent) => {
       // 把桌面侧最近一次复制的内容带回本机（ServerCutText 已到达的值）
