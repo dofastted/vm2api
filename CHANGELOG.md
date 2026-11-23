@@ -2,11 +2,18 @@
 
 ## Unreleased
 
-## 1.4.186 — 2026-11-23 · 修复 CRAGGemini 加密 memfd 守卫派生与池就绪度误报（0.4.2）；存量 OAuth 自动补全模型与套餐
+## 1.4.187 — 2026-11-24 · 修复 CRAGGemini 加密 memfd 守卫派生与池就绪度误报（0.4.2）；存量 OAuth 自动补全模型与套餐
 
 - 升级锁定 `deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 至 [`payload-2026.11.23-gemini-0.4.2`](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.23-gemini-0.4.2)（`craggemini 0.4.2`，Debian 12 构建，最高符号要求 `GLIBC_2.34`）：修复加密启动器经 `memfd` 执行 `craggemini-core` 后 `current_exe()` 指向已删除内存描述符导致 `--internal-execution-guard` 派生失败（`slot_guard_error`）并阻断所有 `agy` 槽位拉起的问题；`craggemini` 引导器改为直接执行 `--internal-execution-guard` 并透传 `CRAGGEMINI_BOOTSTRAP_BIN`；修正 `pool.ready` 在 `min_warm_slots > 0` 且无活跃/空闲 `agy` 槽位时不再误报 `ready: true`，并在 `/internal/health` 暴露 `last_replenish_error`。
 - 修复存量已授权 OAuth 环境停留在「尚未拉取模型，不能调度」与缺失套餐信息的问题：`scripts/gemini-host.py` 的 `warm` 流程为缺少模型或套餐的已授权 OAuth 环境自动调度后台 `_post_auth_provision`（带冷却限流）；`src/lib/gemini/routes.mjs` 的 `warmGeminiEnvironments` 在 `models_discovered !== true` 时不再提前跳过预热。
 - 部署说明：本版涉及控制面、CRAGGemini 宿主脚本与 `geminiDefaultLinuxAmd64`（`0.4.2`）加密载荷，并在宿主机提供 `/usr/local/bin/agy` 符号链接；Claude/Codex 槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。
+
+## 1.4.186 — 2026-11-23 · 宿主身份改以采样设备为唯一真值，修复克隆镜像 host_id 相撞导致的永久 403
+
+- 修复从同一云镜像克隆的宿主互撞 `host_id` 后、后注册者永久 403 的缺陷：云镜像普遍不重置 `/etc/machine-id`，由它派生的 `host_id` 在多台实例上相同，而 `deviceIdentity()` 原先原样返回已存储的 `host_id`，使相撞的值被钉在宿主自己的文件里、升级也不会自愈。现在采样到的设备是唯一真值，`credential()` 在存储值与派生值不符时整套退役旧身份——`host_id`、`credential`、`device_uuid`、`entitlement.code` 与 `redeem.json` 一并移为 `*.legacy`，避免新身份继承旧权益或半完成的兑换，且退役值不再参与任何鉴权（#1664）。
+- 身份来源按唯一性重排为 `mac → dmi → machine-id/mount → cpu`：新增 `dmi`（SMBIOS 每实例 UUID）排在 `machine-id` 之前——后者正是相撞的来源，置于其后将永远不被取用；新增 `cpu` 兜底并在代码中明示其**不唯一**（同机型读数相同），仅用于让既无合格网卡、也无 SMBIOS UUID 的宿主拿到身份而非直接被拒。`rebuildDeviceIdentity()` 改为复用同一条链，顺带解除其原本「无合格网卡即无法重建」的限制；`readStoredUuid` / `backfillUuid` 移除，可读 UUID 与 `host_id` 同源计算、天然自洽（#1664）。
+- 行为变更与迁移提示：宿主身份此后随采样来源变动，更换网卡或重建容器会使其成为新宿主，须用订单号迁移订阅（crag 的 claim-by-order）。这是本次有意接受的取舍，也是来源按唯一性而非稳定性排序的原因。放量前建议先扩大券的订单号登记覆盖面——订单号是该场景唯一的自助恢复通道，未登记的宿主只能人工逐台处理。
+- 部署说明：本版仅涉及控制面 `src/lib/vm/crag-subscription.mjs`，槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。
 
 ## 1.4.185 — 2026-11-23 · CRAGGemini 常驻内核池（0.4.1）与 OAuth 自动席位/模型初始化；池超时熔断分级保持
 
