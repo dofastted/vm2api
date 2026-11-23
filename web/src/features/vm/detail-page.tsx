@@ -424,7 +424,7 @@ function VmDetailBody({
 
   return (
     <PageHeader
-      title={vm.email ? compactEmail(vm.email, 28) : vm.name || vm.id}
+      title={vm.name || (vm.email ? compactEmail(vm.email, 28) : vm.id)}
       fluid
     >
       <QueryGate
