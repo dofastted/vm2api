@@ -26,6 +26,8 @@ import { resolveKernelDataplane } from './slot-engine.mjs'
 import { withCragRuntimeAdmission } from './slot-runtime-admission.mjs'
 import { inspectInstalledCragEntry, officialCcUidGid, suspendVmRuntimeRestart } from './vm-runtime.mjs'
 import {
+  cragSlotArch,
+  cragV2PackageRoot,
   installedCragV2Root,
   materializeResolvedKernel,
   stageCragV2Tree,
@@ -134,7 +136,8 @@ function manifestDigest(root) {
 function prepareCragRollback(projectRoot, vm, routing, licenseCheck) {
   const dest = installedCragV2Root(projectRoot, vm)
   if (!dest && vm.kernel_installation?.kernel !== 'crag') return null
-  const verified = dest && verifyCragV2Tree(dest, { allowPreviousClaude: true })
+  const slotArch = cragSlotArch(projectRoot, vm)
+  const verified = dest && verifyCragV2Tree(dest, { arch: slotArch, allowPreviousClaude: true })
   const grant = licenseCheck(projectRoot, vm, routing, { preferInstalled: true })
   if (!verified?.ok || !grant.ok || !inspectInstalledCragEntry(projectRoot, vm).ok) {
     throw Object.assign(new Error('Previous CRAG payload is not a verified rollback source'), {
@@ -151,7 +154,7 @@ function prepareCragRollback(projectRoot, vm, routing, licenseCheck) {
       fs.mkdirSync(path.dirname(out), { recursive: true })
       fs.copyFileSync(path.join(dest, rel), out)
     }
-    if (manifestDigest(pkg) !== digest || !verifyCragV2Tree(pkg).ok) {
+    if (manifestDigest(pkg) !== digest || !verifyCragV2Tree(pkg, { arch: slotArch }).ok) {
       throw Object.assign(new Error('CRAG rollback copy failed verification'), { code: 'crag_rollback_unverified' })
     }
     return { backup, pkg, dest, digest }
@@ -170,8 +173,10 @@ async function restoreCragRollback({ projectRoot, vm, rollback, routing, ops, bo
     const policy = await (ops.suspendVmRuntimeRestart || suspendVmRuntimeRestart)(current)
     if (!policy?.ok) return null
   }
-  if (!verifyCragV2Tree(rollback.pkg).ok || manifestDigest(rollback.pkg) !== rollback.digest) return null
-  const tree = stageCragV2Tree(rollback.pkg, rollback.dest)
+  const slotArch = cragSlotArch(projectRoot, vm)
+  if (!verifyCragV2Tree(rollback.pkg, { arch: slotArch }).ok || manifestDigest(rollback.pkg) !== rollback.digest)
+    return null
+  const tree = stageCragV2Tree(rollback.pkg, rollback.dest, { arch: slotArch })
   if (!tree.ok) return null
   tree.commit()
   const checked = (ops.checkCragLicense || checkCragLicense)(projectRoot, vm, routing, { preferInstalled: true })
@@ -422,6 +427,36 @@ export async function installKernelTargets({
           const product = catalog.find((item) => item.id === target.kernel)
           if (!product?.ready)
             return failure(target, product?.code || 'kernel_package_missing', product?.error || '请先拉取所选内核')
+          if (target.kernel === 'crag' && !ops.describeKernelCatalog) {
+            const slotArch = cragSlotArch(projectRoot, desired)
+            let slotRoot = ''
+            try {
+              slotRoot = cragV2PackageRoot(projectRoot, slotArch)
+            } catch (error) {
+              return failure(target, error.code || 'kernel_cache_invalid', error.message || '内核缓存选择无效')
+            }
+            if (!slotRoot) {
+              let hasAmd64 = false
+              if (slotArch !== 'amd64') {
+                try {
+                  hasAmd64 = Boolean(cragV2PackageRoot(projectRoot, 'amd64'))
+                } catch {}
+              }
+              return failure(
+                target,
+                hasAmd64 ? 'crag_v2_arch_mismatch' : 'crag_v2_package_missing',
+                hasAmd64 ? '当前发行包仅支持 amd64' : '请先拉取所选内核',
+              )
+            }
+            const verifiedSlot = verifyCragV2Tree(slotRoot, { arch: slotArch })
+            if (!verifiedSlot.ok) {
+              return failure(
+                target,
+                verifiedSlot.code,
+                verifiedSlot.code === 'crag_v2_arch_mismatch' ? '当前发行包仅支持 amd64' : verifiedSlot.error,
+              )
+            }
+          }
           if (isKvmRuntime(vm) && target.kernel !== 'crag') {
             const crag = catalog.find((item) => item.id === 'crag')
             if (!crag?.ready)
@@ -637,9 +672,14 @@ export async function installKernelTargets({
               return failure(target, laid?.code || phase, laid?.error || '内核文件安装失败', true)
             }
             phase = 'kernel_seed_failed'
-            await (ops.initializeSlotSeedFiles || initializeSlotSeedFiles)(projectRoot, candidate, slotHost(candidate), {
-              routing,
-            })
+            await (ops.initializeSlotSeedFiles || initializeSlotSeedFiles)(
+              projectRoot,
+              candidate,
+              slotHost(candidate),
+              {
+                routing,
+              },
+            )
             phase = 'kernel_config_failed'
             const config = (ops.writeKernelConfig || writeKernelConfig)(projectRoot, candidate, {
               routing,

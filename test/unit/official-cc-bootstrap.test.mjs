@@ -32,7 +32,9 @@ import {
   officialCcQuotaSucceeded,
   finalizeOfficialCcTelemetry,
   officialCcNativeReady,
+  ensureOfficialCcNativeCli,
 } from '../../src/lib/oauth/official-cc-bootstrap.mjs'
+import { seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 test('uid follows vm index', () => {
   assert.deepEqual(officialCcUidGid('vm-30'), { uid: 10030, gid: 987 })
@@ -740,6 +742,27 @@ test('completed native userID does not require a legacy machineID or another ini
     assert.equal(decision.reason, 'already_initialized')
     assert.equal(summarizeOfficialCcHome(home).has_machine_id, false)
     assert.equal(fs.readFileSync(file, 'utf8'), bytes)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('bootstrap stages native Claude Code from pulled CRAG on ARM64 hosts with x86_64 slots without switching wrapper', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-stage-crag-'))
+  try {
+    const vm = { id: 'vm-01', dataplane: 'wrap' }
+    const home = path.join(root, 'vms', vm.id, 'cli-home')
+    fs.mkdirSync(path.join(home, '.kin'), { recursive: true })
+    fs.writeFileSync(path.join(home, '.kin', 'kin-kernel'), '#!/bin/sh\nexec wrap\n', { mode: 0o755 })
+    const runtimeEnv = { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: 'linux/amd64' }
+
+    const missing = ensureOfficialCcNativeCli(root, vm, home, runtimeEnv)
+    assert.equal(fs.existsSync(missing), false)
+
+    seedEncryptedPackage(root, { arch: 'amd64' })
+    const staged = ensureOfficialCcNativeCli(root, vm, home, runtimeEnv)
+    assert.equal(fs.existsSync(staged), true)
+    assert.equal(fs.readFileSync(path.join(home, '.kin', 'kin-kernel'), 'utf8'), '#!/bin/sh\nexec wrap\n')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

@@ -9,7 +9,13 @@ import { pullKernelRelease } from '../src/lib/admin/kernel-catalog.mjs'
 import { listVmRecordFiles } from '../src/lib/vm/vm-file.mjs'
 import { isCodexVm } from '../src/lib/vm/vm-kind.mjs'
 import { resolveKernelDataplane, resolveCragKernelVersion } from '../src/lib/vm/slot-engine.mjs'
-import { cragV2PackageRoot, stageCragV2Tree, verifyCragV2Tree } from '../src/lib/vm/wrap-cli-runtime.mjs'
+import {
+  cragSlotArch,
+  cragTargetArch,
+  cragV2PackageRoot,
+  stageCragV2Tree,
+  verifyCragV2Tree,
+} from '../src/lib/vm/wrap-cli-runtime.mjs'
 import { rustKernelHealth } from '../src/lib/transport/rust-kernel-client.mjs'
 import { slotExec } from '../src/lib/vm/slot-runtime.mjs'
 import {
@@ -45,10 +51,10 @@ export function cragUpdateInventory(root, routing) {
 
 // Existing non-CRAG slots can retain a dormant package. Refresh only that
 // directory, never their kernel wrapper, configuration, identity or selection.
-function refreshCachedPackage(src, dest) {
+function refreshCachedPackage(src, dest, arch) {
   const parent = fs.lstatSync(path.dirname(dest))
   if (!parent.isDirectory() || fs.lstatSync(dest).isSymbolicLink()) throw new Error('crag_cache_path_invalid')
-  const staged = stageCragV2Tree(src, dest)
+  const staged = stageCragV2Tree(src, dest, { arch })
   if (!staged.ok) throw new Error(staged.code)
   try {
     const own = (dir) => {
@@ -87,12 +93,16 @@ export async function updateCrag(
     const inventory = cragUpdateInventory(root, routing)
     const pulled = await pull(root, { kernel: 'crag', tag, latest: true })
     if (!pulled.ok) throw new Error(pulled.code || 'crag_pull_failed')
-    const src = cragV2PackageRoot(root)
-    const verified = verifyCragV2Tree(src)
+    const targetArch = cragTargetArch(root)
+    const src = cragV2PackageRoot(root, targetArch)
+    const verified = verifyCragV2Tree(src, { arch: targetArch })
     if (!verified.ok) throw new Error(verified.code)
     const manifest = fs.readFileSync(path.join(src, 'manifest.json'))
     const expectedCore = verified.manifest.payload.plaintext_sha256
-    const matchingTree = (dir) => matchingCragTree(dir, manifest)
+    const matchingTree = (dir, vm) =>
+      matchingCragTree(dir, manifest, {
+        verify: (treeDir) => verifyCragV2Tree(treeDir, { arch: vm ? cragSlotArch(root, vm) : targetArch }),
+      })
     const matchingCore = (hashes) => hashes.length === 1 && hashes[0] === expectedCore
 
     const targets = []
@@ -100,7 +110,7 @@ export async function updateCrag(
       if (action !== 'sync') continue
       if (
         !vm.node_id &&
-        matchingTree(installed) &&
+        matchingTree(installed, vm) &&
         (vm.status === 'stopped' || (vm.status === 'running' && matchingCore(await coreHashes(vm))))
       )
         continue
@@ -146,8 +156,9 @@ export async function updateCrag(
       const result = results.get(vm.id)
       const status = result?.status ?? vm.status
       const item = { id: vm.id, action, status, node_id: vm.node_id || null, ok: true }
-      if (action === 'cache' && !matchingTree(installed)) refreshCachedPackage(src, installed)
-      if (action !== 'skip' && !vm.node_id && !matchingTree(installed))
+      const slotArch = cragSlotArch(root, vm)
+      if (action === 'cache' && !matchingTree(installed, vm)) refreshCachedPackage(src, installed, slotArch)
+      if (action !== 'skip' && !vm.node_id && !matchingTree(installed, vm))
         throw new Error(`crag_installed_hash_mismatch:${vm.id}`)
       if (action === 'sync' && vm.node_id) {
         item.verified_by = 'panel_install'

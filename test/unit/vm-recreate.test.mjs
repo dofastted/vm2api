@@ -326,3 +326,80 @@ test('KVM reset keeps machine sizing and always leaves a bootable identity (#108
 
   assert.equal(buildRecreatedVmRecord({ id: 'vm-32', name: '32', runtime: { type: 'docker' } }).machine, undefined)
 })
+
+test('bare ARM64 host with amd64 CRAG preflights unstaged slots and recreates slots while preserving runtime.arch', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-arm64-unstaged-recreate-'))
+  const keys = ['KIN_WRAP_CLI_ROOT', 'KIN_CRAG_V2_ROOT', 'KIN_KERNEL_BIN']
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+  for (const key of keys) delete process.env[key]
+  t.after(() => {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value == null) delete process.env[key]
+      else process.env[key] = value
+    }
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+
+  const bareArm64 = { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: '' }
+  const template = path.join(root, 'share/wrap-cli')
+  fs.mkdirSync(template, { recursive: true })
+  for (const name of ['kin-kernel.bin', 'cli-node']) fs.writeFileSync(path.join(template, name), name)
+
+  const freshWrapVm = { id: 'vm-21', dataplane: 'wrap', runtime: { type: 'docker' } }
+  assert.throws(() => preflightFreshClaudeKernels(root, freshWrapVm, bareArm64), { code: 'crag_v2_package_missing' })
+
+  seedEncryptedPackage(root, { arch: 'amd64' })
+  preflightFreshClaudeKernels(root, freshWrapVm, bareArm64)
+  assert.equal(fs.existsSync(path.join(root, 'vms', freshWrapVm.id)), false)
+
+  const seeded = seedFreshCliHome(root, freshWrapVm, { preinstallBoth: true, ...bareArm64 })
+  assert.equal(verifyCragV2Tree(path.join(seeded.homeDir, '.kin/crag-v2'), { arch: 'amd64' }).ok, true)
+  assert.doesNotMatch(fs.readFileSync(path.join(seeded.homeDir, '.kin/kin-kernel'), 'utf8'), /crag-v2/)
+
+  const prevCrag = {
+    id: 'vm-22',
+    name: '22',
+    kernel: 'ubuntu-24.04',
+    dataplane: 'crag',
+    crag_kernel_version: 'v2',
+    runtime: { type: 'docker', arch: 'amd64' },
+  }
+  fs.mkdirSync(path.join(root, 'vms', prevCrag.id, 'cli-home', '.kin'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', `${prevCrag.id}.json`), JSON.stringify(prevCrag))
+  const recreated = recreateVmFiles(root, prevCrag, { mode: 'traits', ...bareArm64 })
+  assert.equal(recreated.vm.runtime.arch, 'amd64')
+  assert.equal(
+    verifyCragV2Tree(path.join(root, 'vms', prevCrag.id, 'cli-home/.kin/crag-v2'), { arch: 'amd64' }).ok,
+    true,
+  )
+
+  const prevImplicitCrag = {
+    id: 'vm-23',
+    name: '23',
+    kernel: 'ubuntu-24.04',
+    dataplane: 'crag',
+    crag_kernel_version: 'v2',
+    runtime: { type: 'docker' },
+  }
+  fs.mkdirSync(path.join(root, 'vms', prevImplicitCrag.id, 'cli-home', '.kin'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', `${prevImplicitCrag.id}.json`), JSON.stringify(prevImplicitCrag))
+  const recreatedImplicit = recreateVmFiles(root, prevImplicitCrag, { mode: 'traits', ...bareArm64 })
+  assert.equal(recreatedImplicit.vm.runtime.arch, undefined)
+  assert.equal(
+    verifyCragV2Tree(path.join(root, 'vms', prevImplicitCrag.id, 'cli-home/.kin/crag-v2'), { arch: 'amd64' }).ok,
+    true,
+  )
+
+  const prevArmNative = {
+    id: 'vm-24',
+    name: '24',
+    kernel: 'ubuntu-24.04',
+    dataplane: 'crag',
+    crag_kernel_version: 'v2',
+    runtime: { type: 'docker', arch: 'arm64' },
+  }
+  assert.equal(buildRecreatedVmRecord(prevArmNative).runtime.arch, 'arm64')
+  assert.throws(() => recreateVmFiles(root, prevArmNative, { mode: 'traits', ...bareArm64 }), {
+    code: 'crag_v2_arch_mismatch',
+  })
+})
