@@ -6,7 +6,7 @@ import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { upstreamRiskClientError } from './intercept-gate.mjs'
 import { buildAnthropicSseError } from './stream-truncation.mjs'
 import { isClientStream, fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions } from './convert.mjs'
-import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
+import { getVm, listVms, persistCodexUsage, summarizeVm, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { listVmRecordFiles, readJsonCached } from '../vm/vm-file.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
@@ -29,6 +29,7 @@ import {
   codexQuotaPark,
   CODEX_DEFAULT_PARK_MS,
 } from './codex-usage.mjs'
+import { needsStaleCodexCreditsRefresh, refreshStaleCodexCreditsForVm } from '../oauth/openai-quota.mjs'
 import { disjointOpenaiUsage, mergeUsage, preferUsage } from './openai-usage.mjs'
 import { streamCodexKernel } from '../transport/codex-kernel-client.mjs'
 import { ensureRedaction, maskJson, restoreJsonValue } from '../redaction/runtime.mjs'
@@ -204,13 +205,7 @@ function applyCodexRebuildBody(body, sessionId, mode) {
   return out
 }
 
-/**
- * Current OpenAI candidates, re-read on every admission. A busy home keeps
- * its pin; only a home that left the pool for good releases the session.
- * A request that continues a stored response (`previous_response_id`) can
- * only run where that response lives.
- */
-export function pickCodexCandidates(
+function pickCodexCandidatesWithPool(
   projectRoot,
   req,
   {
@@ -231,19 +226,26 @@ export function pickCodexCandidates(
   const routingPolicy = normalizeCodexRouting(routing.codex || routing).quota
   const scope = keyScope || keyScopeFromRequest(req)
   const poolDenial = vmPoolDenial(scope)
-  if (poolDenial) return { error: 'vm_pool_unavailable', message: poolDenial.message, ids: [], candidates: [] }
-  if (scope.group_type === 'anthropic') return { error: 'key_group_mismatch', ids: [], candidates: [] }
+  if (poolDenial) {
+    return {
+      picked: { error: 'vm_pool_unavailable', message: poolDenial.message, ids: [], candidates: [] },
+      poolVms: [],
+    }
+  }
+  if (scope.group_type === 'anthropic') {
+    return { picked: { error: 'key_group_mismatch', ids: [], candidates: [] }, poolVms: [] }
+  }
   if (pin) {
     const vm = getVm(projectRoot, pin)
-    if (!vm || !isCodexVm(vm)) return { error: 'platform_mismatch', pin, ids: [] }
-    if (!keyAllowsVm(scope, vm)) return { error: 'key_group_mismatch', pin, ids: [] }
-    if (!codexSlotAllowsModel(vm, model)) return { error: 'model_not_allowed', pin, ids: [] }
+    if (!vm || !isCodexVm(vm)) return { picked: { error: 'platform_mismatch', pin, ids: [] }, poolVms: [] }
+    if (!keyAllowsVm(scope, vm)) return { picked: { error: 'key_group_mismatch', pin, ids: [] }, poolVms: [] }
+    if (!codexSlotAllowsModel(vm, model)) return { picked: { error: 'model_not_allowed', pin, ids: [] }, poolVms: [] }
     const ordered = orderCodexSessionSlots([vm], {
       pin,
       excluded,
       quotaPolicy: routingPolicy,
     })
-    return { ...ordered, pin, sticky: false, sessionKey: null, stickyKeys: [] }
+    return { picked: { ...ordered, pin, sticky: false, sessionKey: null, stickyKeys: [] }, poolVms: [] }
   }
   // Quota sync only needs the raw records; the summarized list is built once, after it.
   const vmDir = path.join(projectRoot, 'vms')
@@ -265,7 +267,10 @@ export function pickCodexCandidates(
   )
   const continuesResponse = !!body?.previous_response_id && !!bound?.vmId
   if (scope.vm_pool_id && vms.length === 0 && !continuesResponse) {
-    return { error: 'vm_pool_unavailable', message: '账号池没有可调度的 GPT 槽位', ids: [], candidates: [] }
+    return {
+      picked: { error: 'vm_pool_unavailable', message: '账号池没有可调度的 GPT 槽位', ids: [], candidates: [] },
+      poolVms: [],
+    }
   }
   const ordered = orderCodexSessionSlots(continuesResponse ? vms.filter((vm) => vm.id === bound.vmId) : vms, {
     boundVmId: bound?.vmId || null,
@@ -284,9 +289,22 @@ export function pickCodexCandidates(
     } catch {}
   }
   if (continuesResponse && (boundLeft || ordered.error === 'candidates_exhausted')) {
-    return { error: 'response_not_portable', ids: [], sessionKey, stickyKeys, boundVmId: bound.vmId }
+    return {
+      picked: { error: 'response_not_portable', ids: [], sessionKey, stickyKeys, boundVmId: bound.vmId },
+      poolVms: vms,
+    }
   }
-  return { ...ordered, sessionKey, stickyKeys }
+  return { picked: { ...ordered, sessionKey, stickyKeys }, poolVms: vms }
+}
+
+/**
+ * Current OpenAI candidates, re-read on every admission. A busy home keeps
+ * its pin; only a home that left the pool for good releases the session.
+ * A request that continues a stored response (`previous_response_id`) can
+ * only run where that response lives.
+ */
+export function pickCodexCandidates(projectRoot, req, opts = {}) {
+  return pickCodexCandidatesWithPool(projectRoot, req, opts).picked
 }
 
 function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = null) {
@@ -432,17 +450,126 @@ function clientGoneSignal(req, res) {
   }
 }
 
+function inspectCodexVmForRefresh(projectRoot, vmId, req, opts = {}, livePolicy = null) {
+  if (!vmId) return null
+  const scope = opts.keyScope || keyScopeFromRequest(req)
+  if (vmPoolDenial(scope) || scope.group_type === 'anthropic') return null
+  const owner = opts.ownerScope || ownerScopeFromRequest(req)
+  let raw
+  try {
+    raw = getVm(projectRoot, vmId)
+  } catch {
+    return null
+  }
+  if (!raw || !isCodexVm(raw)) return null
+  const summary = summarizeVm(raw, projectRoot, { codex: { quota: livePolicy } })
+  if (!vmMatchesOwnerScope(summary, owner) || !keyAllowsVm(scope, summary)) return null
+  return raw.codex ? { ...summary, codex: raw.codex } : summary
+}
+
+function enrichPoolVmWithRawCodex(projectRoot, vm) {
+  let raw
+  try {
+    raw = getVm(projectRoot, vm.id)
+  } catch {
+    raw = null
+  }
+  return raw?.codex ? { ...vm, codex: raw.codex } : vm
+}
+
+function resolveBoundCodexVmId(req, opts = {}) {
+  if (!opts.stickyRouter) return null
+  const stickyKeys = opts.stickyRouter?.collectPoolKeys?.(req, opts.body || {}, { platform: 'openai' }) || []
+  const sessionKey =
+    opts.stickyRouter?.extractPoolKey?.(req, opts.body || {}, { platform: 'openai' }) || stickyKeys[0] || null
+  const bound = sessionKey ? opts.stickyRouter?.resolve?.(sessionKey) : null
+  return bound?.vmId || null
+}
+
 /**
- * Admission = fresh candidates + one synchronous seat claim. Candidates are
- * re-read every round, so a seat taken while another request awaited kernel
- * init is never double-sold. All full: FIFO wait for a release on one of
- * this request's accounts or the RPM window, up to the pool wait deadline.
+ * Admission = fresh candidates + one synchronous seat claim.
+ * - Refreshes a sticky-bound slot with expired prior credits before selection
+ *   so `pickCodexCandidates` does not prematurely drop the sticky binding.
+ * - Refreshes eligible pool slots with expired prior credits when selection
+ *   yields no `normal` candidate (`quota_exhausted` / `capacity_unavailable`).
+ * - Triggers non-blocking background refresh for other idle stale-credit slots
+ *   when a healthy slot claims a seat immediately.
+ * - When all eligible accounts are at concurrency/RPM capacity, waits FIFO up
+ *   to `deadline`.
  */
-async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal }) {
+export async function admitCodexCandidate(
+  projectRoot,
+  req,
+  opts = {},
+  { deadline, signal, fetchImpl, now: fixedNow } = {},
+) {
   let woken = null
+  const evalNow = () => (Number.isFinite(fixedNow) ? Number(fixedNow) : Date.now())
   for (;;) {
-    const picked = pickCodexCandidates(projectRoot, req, opts)
     const livePolicy = normalizeCodexRouting(opts.routing?.codex || opts.routing).quota
+    const pin = opts.pinVmId === undefined ? pinnedVmIdFromRequest(req) : opts.pinVmId
+    const model = opts.body?.model || null
+
+    if (!pin) {
+      const boundVmId = resolveBoundCodexVmId(req, opts)
+      if (boundVmId && !opts.excluded?.has(boundVmId)) {
+        const boundVm = inspectCodexVmForRefresh(projectRoot, boundVmId, req, opts, livePolicy)
+        if (
+          boundVm &&
+          codexSlotAllowsModel(boundVm, model) &&
+          needsStaleCodexCreditsRefresh(boundVm, livePolicy, evalNow())
+        ) {
+          if (signal?.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
+          if (!Number.isFinite(deadline) || evalNow() < deadline) {
+            const refreshed = await refreshStaleCodexCreditsForVm(projectRoot, boundVm.id, {
+              policy: livePolicy,
+              fetchImpl,
+              now: fixedNow,
+              signal,
+              deadline,
+            })
+            if (signal?.aborted || refreshed?.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
+          }
+        }
+      }
+    }
+
+    let { picked, poolVms } = pickCodexCandidatesWithPool(projectRoot, req, opts)
+
+    if (
+      !pin &&
+      !(picked.candidates?.length > 0) &&
+      (picked.error === 'quota_exhausted' || picked.error === 'capacity_unavailable')
+    ) {
+      const checkNow = evalNow()
+      const staleVms = poolVms
+        .filter((vm) => !opts.excluded?.has(vm.id) && codexSlotAllowsModel(vm, model) && vm.codex_credits != null)
+        .map((vm) => enrichPoolVmWithRawCodex(projectRoot, vm))
+        .filter((vm) => needsStaleCodexCreditsRefresh(vm, livePolicy, checkNow))
+      if (staleVms.length > 0) {
+        if (signal?.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
+        if (!Number.isFinite(deadline) || checkNow < deadline) {
+          const results = await Promise.all(
+            staleVms.map((vm) =>
+              refreshStaleCodexCreditsForVm(projectRoot, vm.id, {
+                policy: livePolicy,
+                fetchImpl,
+                now: fixedNow,
+                signal,
+                deadline,
+              }),
+            ),
+          )
+          if (signal?.aborted || results.some((item) => item?.aborted)) {
+            return { picked: { error: 'client_cancelled', ids: [] } }
+          }
+          if (results.some((item) => item?.refreshed)) {
+            ;({ picked, poolVms } = pickCodexCandidatesWithPool(projectRoot, req, opts))
+          }
+        }
+      }
+    }
+
     if (picked.error && picked.error !== 'capacity_unavailable') return { picked }
     for (const candidate of picked.candidates || []) {
       const lease = tryAcquireOpenAISlot(candidate.id, {
@@ -450,7 +577,22 @@ async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal })
         maxRpm: candidate.maxRpm,
         quotaPolicy: livePolicy,
       })
-      if (lease) return { picked, vmId: candidate.id, lease }
+      if (lease) {
+        if (!pin) {
+          const bgNow = evalNow()
+          for (const vm of poolVms) {
+            if (vm.id === candidate.id || vm.codex_credits == null) continue
+            const enriched = enrichPoolVmWithRawCodex(projectRoot, vm)
+            if (!needsStaleCodexCreditsRefresh(enriched, livePolicy, bgNow)) continue
+            refreshStaleCodexCreditsForVm(projectRoot, vm.id, {
+              policy: livePolicy,
+              fetchImpl,
+              now: fixedNow,
+            }).catch(() => {})
+          }
+        }
+        return { picked, vmId: candidate.id, lease }
+      }
     }
     const waitIds = picked.candidates?.length ? picked.candidates.map((candidate) => candidate.id) : picked.waitIds
     // A woken waiter that missed a seat it can use lost it to a newer request;
@@ -459,7 +601,7 @@ async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal })
     if (woken && (woken.accountId == null || !waitIds?.includes(woken.accountId))) {
       wakeOpenAIWaiter(woken.accountId)
     }
-    const now = Date.now()
+    const now = evalNow()
     if (now >= deadline) return { picked: { ...picked, error: 'capacity_unavailable', ids: [] } }
     const retryAt = Number(picked.retryAt)
     const sliceDeadline = Number.isFinite(retryAt) && retryAt > now ? Math.min(deadline, retryAt) : deadline
@@ -676,7 +818,12 @@ export async function handleCodexProtocol({
   let counted = false
   try {
     for (;;) {
-      const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, { deadline, signal: gone.signal })
+      const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, {
+        deadline,
+        signal: gone.signal,
+        fetchImpl: ops.quotaFetchImpl || ops.fetchImpl,
+        now: ops.now,
+      })
       const picked = admitted.picked
       if (!admitted.lease) {
         if (picked.error === 'client_cancelled') {
@@ -1276,14 +1423,19 @@ export async function handleCodexSearch({
     : null
   if (redaction) Object.assign(outbound, await maskJson(outbound, redaction))
   const post = ops.postCodexSearch || postCodexSearch
-  const pickOpts = { stickyRouter, sessions: null, body: outbound, excluded: new Set(), ownerScope }
+  const pickOpts = { stickyRouter, sessions: null, body: outbound, excluded: new Set(), routing, ownerScope }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
   let last = null
   let attempts = 0
   try {
     for (;;) {
-      const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, { deadline, signal: gone.signal })
+      const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, {
+        deadline,
+        signal: gone.signal,
+        fetchImpl: ops.quotaFetchImpl || ops.fetchImpl,
+        now: ops.now,
+      })
       if (!admitted.lease) {
         if (admitted.picked.error === 'client_cancelled') {
           logBag.final_state = 'cancelled'
@@ -1439,14 +1591,19 @@ export async function handleCodexImages({
   const post = ops.postCodexJson || postCodexJson
   // Selection-only body: the turn id becomes the sticky session; the upstream body is untouched.
   const pickBody = { model: model || null, ...(imageTurnId ? { session_id: `codex-image-turn:${imageTurnId}` } : {}) }
-  const pickOpts = { stickyRouter, sessions: null, body: pickBody, excluded, ownerScope }
+  const pickOpts = { stickyRouter, sessions: null, body: pickBody, excluded, routing, ownerScope }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
   let last = null
   let attempts = 0
   try {
     for (;;) {
-      const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, { deadline, signal: gone.signal })
+      const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, {
+        deadline,
+        signal: gone.signal,
+        fetchImpl: ops.quotaFetchImpl || ops.fetchImpl,
+        now: ops.now,
+      })
       if (!admitted.lease) {
         if (admitted.picked.error === 'client_cancelled') {
           logBag.final_state = 'cancelled'
