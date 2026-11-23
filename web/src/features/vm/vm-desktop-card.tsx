@@ -200,7 +200,7 @@ export function VmDesktopCard({ vm }: { vm: Vm }) {
               </Button>
             </div>
             <p className='text-xs text-muted-foreground'>
-              Mac 直接用 Command+C / V：复制粘贴已与桌面双向直通（桌面内复制的内容点「带回桌面剪贴板」或在本面板页按 Command+C 取回）；Command+=/- 缩放会作用到桌面内网页。长中文文本请用上方输入框发送（直通通道对中文暂不生效）。
+              Mac 直接用 Command+C / V：复制粘贴与桌面双向直通（中文、链接、验证码均可直接粘贴；桌面内复制的内容点「带回桌面剪贴板」或在本面板页按 Command+C 取回）；Command+=/- 缩放会作用到桌面内网页。
             </p>
           </>
         ) : (
