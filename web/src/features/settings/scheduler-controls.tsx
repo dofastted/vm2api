@@ -199,6 +199,41 @@ export function ChipGroup<T extends string | number>({
   )
 }
 
+export function FamilyLimitSelect({
+  label,
+  value,
+  min,
+  emptyText,
+  onChange,
+  disabled,
+}: {
+  label: string
+  value: number | null
+  min: 0 | 1
+  emptyText?: string
+  onChange: (value: number | null) => void
+  disabled?: boolean
+}) {
+  return (
+    <select
+      className='max-w-full rounded-md border bg-background px-2 py-1.5 text-sm'
+      aria-label={label}
+      value={value ?? ''}
+      disabled={disabled}
+      onChange={(event) =>
+        onChange(event.target.value === '' ? null : Number(event.target.value))
+      }
+    >
+      {emptyText && <option value=''>{emptyText}</option>}
+      {Array.from({ length: 21 - min }, (_, i) => i + min).map((n) => (
+        <option key={n} value={n}>
+          {n}
+        </option>
+      ))}
+    </select>
+  )
+}
+
 /** 小整数用的步进器：- [n] +，范围外的输入按边界收回。 */
 export function StepperSetting({
   id,

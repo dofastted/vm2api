@@ -777,3 +777,66 @@ test('end-to-end Gemini CRAG subscription: redeem, bind OAuth seat, skip api_key
   assert.equal(fs.existsSync(path.join(subscription.publicDir, 'entitlement.code')), true)
   assert.equal(fs.existsSync(path.join(subscription.publicDir, 'sync-pending')), false)
 })
+
+test('createGeminiCragSubscription accepts path-prefixed authority URLs and surfaces stacked quota_grants', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-path-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const now = Math.floor(Date.now() / 1000)
+  const machineIdPath = path.join(root, 'machine-id')
+  fs.writeFileSync(machineIdPath, '22222222222222222222222222222222\n')
+
+  const seenUrls = []
+  const fetchImpl = async (url, options) => {
+    seenUrls.push(String(url))
+    const body = JSON.parse(options.body)
+    const ent = signToken(authority, 'CRAGH2', {
+      version: 2,
+      product: CRAG_GEMINI_PRODUCT,
+      host_id: body.host_id,
+      revision: 2,
+      issued_at: now - 5,
+      expires_at: now + 7 * 86400,
+      slot_limit: 20,
+      roster: [],
+    })
+    return {
+      ok: true,
+      status: 200,
+      headers: new Map([['x-request-id', 'req-stacked']]),
+      async json() {
+        return {
+          ok: true,
+          data: {
+            entitlement: ent,
+            slot_limit: 20,
+            expires_at: now + 7 * 86400,
+            quota_grants: [
+              { code_id: 'code-7d', expires_at: now + 7 * 86400, slot_limit: 10 },
+              { code_id: 'code-1m', expires_at: now + 30 * 86400, slot_limit: 10 },
+            ],
+          },
+        }
+      },
+    }
+  }
+
+  const sub = createGeminiCragSubscription({
+    projectRoot: root,
+    dataDir: path.join(root, 'data'),
+    resolveAuthority: () => ({
+      publicKey: authority.publicKey,
+      issuerId: authority.issuerId,
+      payloadKeyId: authority.payloadKeyId,
+    }),
+    callHost: async () => ({}),
+    fetchImpl,
+    origin: 'https://www.vm2api.org/gemini/',
+    machineIdFile: machineIdPath,
+  })
+  const voucher = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
+  const status = await sub.redeem(voucher)
+  assert.equal(seenUrls[0], 'https://www.vm2api.org/gemini/v1/host-subscriptions/redeem')
+  assert.equal(status.slot_limit, 20)
+  assert.equal(status.quota_grants.length, 2)
+})

@@ -25,7 +25,12 @@ import { Switch } from '@/components/ui/switch'
 import { SEAT_CAP_MAX, SeatCells } from '@/components/scheduler-viz'
 import { SEAT_CAP_STEPS, withCurrent } from '@/features/vm/scheduling-steps'
 import { PoolLivePanel } from './pool-live-panel'
-import { ChipGroup, SliderSetting, StepperSetting } from './scheduler-controls'
+import {
+  ChipGroup,
+  FamilyLimitSelect,
+  SliderSetting,
+  StepperSetting,
+} from './scheduler-controls'
 
 type Obj = Record<string, unknown>
 type PoolDialog = 'strategy' | 'seats' | 'queue' | 'retry' | 'circuit'
@@ -509,6 +514,8 @@ export function PoolPane({
       })
       onPoolChange({
         seat_grace_ms: poolDraft.seat_grace_ms,
+        max_primary_sessions: poolDraft.max_primary_sessions ?? null,
+        max_subagents_per_session: poolDraft.max_subagents_per_session ?? null,
         seat_budget_reserve_pct: poolDraft.seat_budget_reserve_pct,
       })
     } else if (open === 'queue') {
@@ -709,6 +716,38 @@ export function PoolPane({
                         numOf(inferenceDraft, 'session_slots', SEAT_CAP_MAX)
                       )
                     )}
+                  />
+                </div>
+                <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
+                  <Label>主会话上限</Label>
+                  <FamilyLimitSelect
+                    label='主会话上限'
+                    min={1}
+                    emptyText='跟随 VM 物理席位上限'
+                    value={
+                      typeof poolDraft.max_primary_sessions === 'number'
+                        ? poolDraft.max_primary_sessions
+                        : null
+                    }
+                    onChange={(value) =>
+                      updateDraft('pool', { max_primary_sessions: value })
+                    }
+                  />
+                </div>
+                <div className='flex flex-wrap items-center justify-between gap-2 rounded-md border px-3 py-2.5'>
+                  <Label>每会话子代理上限</Label>
+                  <FamilyLimitSelect
+                    label='每会话子代理上限'
+                    min={0}
+                    emptyText='关闭(子代理各占一个席位)'
+                    value={
+                      typeof poolDraft.max_subagents_per_session === 'number'
+                        ? poolDraft.max_subagents_per_session
+                        : null
+                    }
+                    onChange={(value) =>
+                      updateDraft('pool', { max_subagents_per_session: value })
+                    }
                   />
                 </div>
                 <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>

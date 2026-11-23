@@ -318,6 +318,15 @@ export function claudeCodeAgentRootSession({ inbound = {}, body = {}, headers = 
   return rootCallerSession({ inbound, body, headers })
 }
 
+/** Agents use the same root as their derived session; an unmarked summary carries its root in metadata. */
+export function subagentRootSession(body, headers, summary = false) {
+  const metadata = body?.metadata
+  const agentRoot = cleanIdentityValue(claudeCodeAgentRootSession({ inbound: body, headers }))
+  if (agentRoot) return agentRoot
+  if (summary) return cleanIdentityValue(parseUserId(metadata?.user_id)?.session_id) || null
+  return cleanIdentityValue(metadata?.root_session_id || headerValue(headers, 'x-kin-root-session')) || null
+}
+
 /**
  * Caller session, in official order: metadata.user_id → sticky headers → body keys.
  * A Claude Code sub-agent hop gets its own session under that root.

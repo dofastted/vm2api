@@ -68,6 +68,10 @@ function validPlan(value: unknown): value is DraftPlan {
     (value.months === undefined || integer(value.months, 1)) &&
     (value.enabled === undefined || typeof value.enabled === 'boolean') &&
     (value.renewable === undefined || typeof value.renewable === 'boolean') &&
+    (value.product === undefined ||
+      value.product === 'crag-v2' ||
+      value.product === 'craggemini') &&
+    (value.stackable === undefined || typeof value.stackable === 'boolean') &&
     (value.name === undefined || text(value.name, 120)) &&
     (value.description === undefined || text(value.description, 500))
   )

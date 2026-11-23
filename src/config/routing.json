@@ -65,6 +65,8 @@
   },
   "pool": {
     "strategy": "balanced",
+    "max_subagents_per_session": null,
+    "max_primary_sessions": null,
     "queue_max": 50,
     "seat_grace_ms": 30000,
     "seat_budget_reserve_pct": 0.02,
