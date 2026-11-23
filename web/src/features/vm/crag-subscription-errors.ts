@@ -74,3 +74,83 @@ export const cragCredentialRecoveryFaults: Record<string, string> = {
   failed: '本机凭据未能自动换回，授权服务仍不接受。已运行的槽不受影响。',
   not_activated: '本机没有可用于证明归属的授权记录，请先完成兑换。',
 }
+
+export type CragOrderActivationRecovery =
+  'not_activated' | 'host_id_collision' | 'failed'
+
+const cragOrderActivationAdminErrors: Record<string, string> = {
+  host_subscription_inactive:
+    '本机宿主订阅未生效或已到期，未能完成目标槽位绑定。请核对本机订阅状态后点「重试自动激活」；请保留 order_id 与 crag-shop-private/receipt.key，不要重复下单。',
+  crag_subscription_target_changed:
+    '目标槽位、所属用户或已安装的 CRAG 内核包与下单时不一致，自动激活已停止。恢复原目标槽位配置后可点「重试自动激活」，不要重复购买。',
+  slot_limit_reached:
+    '使用中的槽位已达到充值可用槽位，目标槽位暂未完成绑定。停止其他正在运行的 CRAG 槽或补充额度后，可点「重试自动激活」。',
+  host_redeem_conflict:
+    '原订单对应的兑换券已绑定其他宿主机，无法应用到本机。请保留 order_id、device_uuid 与 crag-shop-private/receipt.key 核对原订单，不要重复购买。',
+  redeem_unavailable:
+    '授权服务未接受原订单的兑换券。请保留 order_id 与 crag-shop-private/receipt.key 核对原订单，不要重复购买。',
+  host_binding_conflict:
+    '目标槽位的设备身份与原绑定记录不一致，自动绑定已停止。请核对目标槽位状态后重试，不要重复购买。',
+  payload_key_unknown:
+    '授权服务未登记目标槽位当前使用的 CRAG 内核载荷密钥。切换为兼容的受信发行包后可重试原订单，不要重复购买。',
+  payload_key_conflict:
+    '目标槽位或原兑换记录已绑定另一版 CRAG 内核包。请恢复原内核版本后点「重试自动激活」，不要重复购买。',
+  issuer_mismatch:
+    '本地 CRAG 发行包签发者与授权服务不一致。恢复匹配的受信发行包后可点「重试自动激活」，不要重复购买。',
+  not_found:
+    '授权服务未找到对应的宿主订阅或目标记录。请保留 order_id、device_uuid 与 crag-shop-private/receipt.key 核对本机订阅状态，不要重复购买。',
+  request_conflict:
+    '该订单号在授权服务的登记记录存在冲突，自动激活已停止。请保留 order_id 与 crag-shop-private/receipt.key 核对原订单，不要重复购买。',
+  invalid_request:
+    '授权服务拒绝了本次自动激活请求参数。确认控制面已升级后可点「重试自动激活」，不要重复购买。',
+  shop_admin_required:
+    '下单账号当前的管理员权限已变更，自动激活已暂停。恢复管理员权限后可重试原订单，不要重复购买。',
+}
+
+export function describeCragOrderActivationFailure({
+  errorCode,
+  recovery,
+  isAdmin,
+}: {
+  errorCode?: string
+  recovery?: CragOrderActivationRecovery
+  isAdmin: boolean
+}): string {
+  if (!errorCode) {
+    return isAdmin
+      ? '自动激活已暂停。确认原目标可用后，可重试原订单；无需重新购买或兑换。'
+      : '自动激活尚未完成，请联系管理员核查原订单；不要重复购买或另行兑换。'
+  }
+  if (errorCode === 'auth_forbidden') {
+    if (!isAdmin) {
+      return '授权服务拒绝了宿主机身份与凭据，自动激活已停止。请保留此订单号（order_id）并联系管理员，附上错误码与请求 ID 核对恢复；不要重复下单。'
+    }
+    if (recovery === 'host_id_collision') {
+      return '授权服务拒绝了本机宿主凭据：检测到本机设备标识与另一台机器冲突（常见于克隆镜像未重置 /etc/machine-id）。请妥善保留此订单的 order_id、本机 device_uuid 与数据目录中的 crag-shop-private/receipt.key；不要重复下单，也不要盲目删除 crag-shop-private/receipt.key 或 credential。请附上 order_id、device_uuid 与请求 ID 联系支持核对恢复。'
+    }
+    if (recovery === 'not_activated') {
+      return '授权服务拒绝了本机宿主身份与凭据（本机尚无已签名的宿主授权记录，可能因克隆镜像共用 /etc/machine-id 与其他机器冲突，或重建数据目录后丢失了原宿主凭据）。请妥善保留此订单的 order_id、本机 device_uuid 与数据目录中的 crag-shop-private/receipt.key；不要重复下单，也不要盲目删除 crag-shop-private/receipt.key 或 credential。若有本机原 credential 备份，恢复匹配的宿主凭据后可点「重试自动激活」；否则请附上 order_id、device_uuid 与请求 ID 联系支持核对恢复。'
+    }
+    return '授权服务拒绝了本机宿主凭据，且自动换回凭据未成功。请妥善保留此订单的 order_id、本机 device_uuid 与数据目录中的 crag-shop-private/receipt.key；不要重复下单，也不要盲目删除 crag-shop-private/receipt.key 或 credential。恢复匹配的宿主凭据后可点「重试自动激活」，或附上 order_id、device_uuid 与请求 ID 联系支持处理。'
+  }
+  if (!isAdmin) {
+    return '自动激活遇到故障已停止，请保留此订单号并联系管理员附上错误码核查原订单；不要重复购买或另行兑换。'
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(
+      cragOrderActivationAdminErrors,
+      errorCode
+    )
+  ) {
+    return cragOrderActivationAdminErrors[errorCode]
+  }
+  const known = Object.prototype.hasOwnProperty.call(
+    cragSubscriptionErrors,
+    errorCode
+  )
+    ? cragSubscriptionErrors[errorCode]
+    : undefined
+  return known
+    ? `${known} 请保留原订单（order_id 与 crag-shop-private/receipt.key），核对后可点「重试自动激活」，不要重复购买。`
+    : '自动激活未完成并已暂停。请保留原订单（order_id 与 crag-shop-private/receipt.key），确认目标与本机订阅正常后可点「重试自动激活」，不要重复购买。'
+}

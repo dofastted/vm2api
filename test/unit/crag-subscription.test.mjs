@@ -1580,7 +1580,7 @@ test('an Authority denial is not retried or installed, and only a valid correlat
   const blocked = await submit('redeem', { redemption_code })
   assert.equal(blocked.status, 403)
   assert.equal(blocked.error.code, 'auth_forbidden')
-  assert.deepEqual(blocked.error.details, { authority_request_id: requestId })
+  assert.deepEqual(blocked.error.details, { recovery: 'not_activated', authority_request_id: requestId })
   assert.equal(calls, 1, 'a refused request must not trigger automatic retries')
   assert.equal(fs.existsSync(path.join(publicDir, 'entitlement.code')), false)
   assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
@@ -1592,7 +1592,7 @@ test('an Authority denial is not retried or installed, and only a valid correlat
   replyId = `${requestId}, ${redemption_code}`
   const untrusted = await submit('redeem', { redemption_code })
   assert.equal(untrusted.status, 403)
-  assert.equal(untrusted.error.details, undefined)
+  assert.deepEqual(untrusted.error.details, { recovery: 'not_activated' })
   assert.equal(JSON.stringify(untrusted).includes(redemption_code), false)
   assert.equal(calls, 2)
 
@@ -1601,6 +1601,44 @@ test('an Authority denial is not retried or installed, and only a valid correlat
   assert.equal(applied.status, 200)
   assert.equal(applied.data.slot_limit, 2)
   assert.equal(fs.readFileSync(path.join(privateDir, 'credential'), 'utf8'), key)
+
+  // Subscription route handler strictly whitelists recovery and authority_request_id in error.details.
+  for (const [mockError, expectedDetails] of [
+    [
+      { status: 403, code: 'auth_forbidden', recovery: 'host_id_collision', authorityRequestId: requestId },
+      { recovery: 'host_id_collision', authority_request_id: requestId },
+    ],
+    [{ status: 403, code: 'auth_forbidden', recovery: 'unavailable' }, undefined],
+    [
+      {
+        status: 403,
+        code: 'auth_forbidden',
+        recovery: redemption_code,
+        authorityRequestId: `${requestId}-${redemption_code}`,
+      },
+      undefined,
+    ],
+  ]) {
+    const route = createCragSubscriptionHandler({
+      subscription: {
+        status: async () => {
+          throw Object.assign(new Error(`${redemption_code} /opt/private`), mockError)
+        },
+      },
+      publicBaseUrl: 'https://panel.example.test',
+      json: (_res, status, payload) => ({ status, ...payload }),
+      readRawBody: async () => Buffer.alloc(0),
+    })
+    const reply = await route(
+      { panelUser: 'admin', panelRole: 'admin', headers: {} },
+      { setHeader() {} },
+      cragSubscriptionRoute('GET', '/api/panel/crag-subscription'),
+    )
+    assert.equal(reply.status, 403)
+    assert.equal(reply.error.code, 'auth_forbidden')
+    assert.deepEqual(reply.error.details, expectedDetails)
+    assert.equal(JSON.stringify(reply).includes(redemption_code), false)
+  }
 })
 
 test('a failed slot probe does not hide signed host rights', async (t) => {
