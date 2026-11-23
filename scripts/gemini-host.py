@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_ENVIRONMENTS = 8
+MAX_CONCURRENCY = 64
 AUTH_TTL = 300
 TERMINAL_TTL = 300
 TERMINAL_READ = 16384
@@ -177,6 +178,24 @@ class Failure(Exception):
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def env_concurrency(env):
+    value = env.get("max_concurrency") if isinstance(env, dict) else None
+    return value if type(value) is int and 1 <= value <= MAX_CONCURRENCY else 1
+
+
+def verify_proxy_sha256(body, proxy_url):
+    if "proxy_sha256" not in body or body["proxy_sha256"] is None:
+        return
+    expected = body["proxy_sha256"]
+    actual = hashlib.sha256(proxy_url.encode()).hexdigest()
+    if (
+        not isinstance(expected, str)
+        or not SHA256.fullmatch(expected)
+        or not hmac.compare_digest(expected, actual)
+    ):
+        raise Failure(409, "gemini_proxy_calibration_mismatch")
 
 
 NATIVE_MODULE = ROOT / "scripts/gemini_host_native.py"
@@ -835,6 +854,8 @@ class NativeAgy(Agy):
     def __init__(self, host, environment, proxy_url, auth, model, prompt):
         self.credentials, _ = auth
         self.model, self.prompt = model, prompt
+        self.max_concurrency = env_concurrency(environment)
+        self.pool_mode = self.max_concurrency > 1 and prompt is None
         self.native_dir = None
         self._owns_native_dir = False
         self.native_token = None
@@ -865,27 +886,66 @@ class NativeAgy(Agy):
         os.chown(self.native_dir, self.uid, self.uid)
         self.native_token = secrets.token_hex(32)
         license_dir = self.host.ensure_env_license_dir(self.environment)
-        config = self.native_dir / "kernel.json"
-        private_json(
-            config,
-            {
-                "run_dir": "/tmp/craggemini",
-                "internal_token": self.native_token,
-                "session_id": self.attempt,
-                "model": self.model,
-                "agy_sha256": AGY_SHA256,
-                "timeout_ms": 120000,
-                "first_byte_timeout_ms": 90000,
-                "idle_timeout_ms": 15000,
-                "queue_timeout_ms": 1000,
-                "max_queue": 1,
-                "vm_id": self.environment["id"],
-                "license_dir": "/run/kin/crag-license",
-                "host_license_dir": "/run/kin/crag-host",
-            },
-        )
-        os.chown(config, self.uid, self.uid)
         native_module_impl = native_module()
+        agy_args = [
+            "--mode",
+            "plan",
+            "--model",
+            self.model,
+            "--settings",
+            json.dumps(CLI_SETTINGS, separators=(",", ":")),
+            "--log-file",
+            "/tmp/craggemini/" + native_module_impl.ELIGIBILITY_LOG_FILE,
+        ]
+        kernel_cfg = {
+            "run_dir": "/tmp/craggemini",
+            "internal_token": self.native_token,
+            "session_id": self.attempt,
+            "model": self.model,
+            "agy_sha256": AGY_SHA256,
+            "timeout_ms": 120000,
+            "first_byte_timeout_ms": 90000,
+            "idle_timeout_ms": 15000,
+            "queue_timeout_ms": 1000,
+            "max_queue": max(4, self.max_concurrency * 2) if self.pool_mode else 1,
+            "vm_id": self.environment["id"],
+            "license_dir": "/run/kin/crag-license",
+            "host_license_dir": "/run/kin/crag-host",
+        }
+        if self.pool_mode:
+            # Inside vm2agy<slot>, kin-egress enforces kernel-level fail-closed SOCKS5 routing
+            # under a separate UID; pass only the proxy_sha256 digest (never raw credentials).
+            kernel_cfg.update(
+                {
+                    "agy_bin": "/opt/agy",
+                    "bridge_so": "/opt/libagy_bridge.so",
+                    "verify_agy_sha256": True,
+                    "require_proxy_calibration": False,
+                    "accounts": [
+                        {
+                            "account_id": self.environment["id"],
+                            "env_id": self.environment["id"],
+                            "agy_home": "/home/agy",
+                            "work_dir": "/work",
+                            "run_dir": "/tmp/craggemini/acc",
+                            "proxy_id": self.environment["proxy_id"],
+                            "proxy_sha256": hashlib.sha256(
+                                self.proxy_url.encode()
+                            ).hexdigest(),
+                            "netns_transparent_egress": True,
+                            "max_concurrency": self.max_concurrency,
+                            "session_idle_ttl_secs": NATIVE_SESSION_TTL,
+                            "model": self.model,
+                            "agy_args": agy_args,
+                            "oauth_proxy_required": True,
+                            "enabled": True,
+                        }
+                    ],
+                }
+            )
+        config = self.native_dir / "kernel.json"
+        private_json(config, kernel_cfg)
+        os.chown(config, self.uid, self.uid)
         self.native_diagnostic = native_module_impl.EligibilityDiagnostic(
             self.native_dir, self.uid
         )
@@ -955,17 +1015,29 @@ class NativeAgy(Agy):
                 "/opt/gemini_host_native.py",
                 "--launch-native",
                 "/opt/agy",
-                "--mode",
-                "plan",
-                "--model",
-                self.model,
-                "--settings",
-                json.dumps(CLI_SETTINGS, separators=(",", ":")),
-                "--log-file",
-                "/tmp/craggemini/" + native_module_impl.ELIGIBILITY_LOG_FILE,
+                *agy_args,
             ]
         )
         self.native_exit_reader = native_module_impl.read_launcher_exit
+        spawn = getattr(self.host, "spawn", lambda fn: fn())
+        if self.pool_mode:
+            # Multi-process CRAGGemini pool allocates per-slot PTYs and pidfd execution guards
+            # inside the sandbox, so no host Linux virtual console is needed.
+            try:
+                self.native_tui = spawn(
+                    lambda: subprocess.Popen(
+                        argv,
+                        env=SYSTEM_ENV,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                )
+            except OSError:
+                raise Failure(503, "gemini_native_worker_unavailable") from None
+            self.pid = self.native_tui.pid
+            return
         try:
             lock, vt = native_module_impl.query_free_vt(
                 self.host.directory / "native-vt.lock"
@@ -973,7 +1045,6 @@ class NativeAgy(Agy):
         except (native_module_impl.NativeFailure, OSError) as error:
             code = getattr(error, "code", "gemini_native_tty_unavailable")
             raise Failure(503, code) from None
-        spawn = getattr(self.host, "spawn", lambda fn: fn())
         try:
             self.native_tui = spawn(
                 lambda: subprocess.Popen(
@@ -1483,6 +1554,7 @@ class Host:
         self.terminals = {}
         self.runs = {}
         self.native_sessions = {}
+        self._session_locks = {}
         self.active_infers = {}
         self.last_inference = {}
         self.network_scope = os.stat("/proc/self/ns/net").st_ino
@@ -2009,25 +2081,43 @@ class Host:
         self.last_inference.pop(env["id"], None)
         env["updated_at"] = now()
 
+    def _session_lock(self, identifier):
+        with self.lock:
+            locks = getattr(self, "_session_locks", None)
+            if locks is None:
+                locks = {}
+                self._session_locks = locks
+            lock = locks.get(identifier)
+            if lock is None:
+                lock = threading.Lock()
+                locks[identifier] = lock
+            return lock
+
     def stop_native_session(self, identifier):
         session = self.native_sessions.pop(identifier, None)
         if session is not None:
             session.close()
 
     def cancel_infer(self, identifier, request_id=None):
-        entry = self.active_infers.get(identifier)
-        if not entry:
+        slots = self.active_infers.get(identifier)
+        if not slots:
             return False
-        if request_id is not None and entry.get("request_id") != request_id:
-            return False
-        entry["cancel_event"].set()
-        cancel_fn = entry.get("cancel_fn")
-        if callable(cancel_fn):
-            try:
-                cancel_fn()
-            except Exception:
-                pass
-        return True
+        if request_id is not None:
+            entry = slots.get(request_id)
+            if not entry:
+                return False
+            targets = [entry]
+        else:
+            targets = list(slots.values())
+        for entry in targets:
+            entry["cancel_event"].set()
+            cancel_fn = entry.get("cancel_fn")
+            if callable(cancel_fn):
+                try:
+                    cancel_fn()
+                except Exception:
+                    pass
+        return bool(targets)
 
     def stop_run(self, identifier):
         entry = self.runs.pop(identifier, None)
@@ -2038,7 +2128,7 @@ class Host:
             entry["process"].close()
 
     def running(self, identifier):
-        if identifier in self.active_infers:
+        if self.active_infers.get(identifier):
             return True
         entry = self.runs.get(identifier)
         return bool(entry and entry["process"] is not None)
@@ -2073,7 +2163,7 @@ class Host:
             return entry["result"]
         return result
 
-    def operation_account(self, env):
+    def operation_account(self, env, *, allow_concurrent_infer=False):
         self.ensure_payload(legacy_install=False)
         if env["auth_state"] != "authorized":
             code = (
@@ -2083,8 +2173,17 @@ class Host:
             )
             raise Failure(409, code)
         identifier = env["id"]
+        run_entry = self.runs.get(identifier)
+        run_active = bool(run_entry and run_entry["process"] is not None)
+        active_slots = len(self.active_infers.get(identifier, {}))
+        infer_busy = (
+            active_slots >= env_concurrency(env)
+            if allow_concurrent_infer
+            else active_slots > 0
+        )
         if (
-            self.running(identifier)
+            run_active
+            or infer_busy
             or identifier in self.terminals
             or identifier in self.pending
         ):
@@ -2362,7 +2461,7 @@ class Host:
     def _cleanup_locked(self):
         now_mono = time.monotonic()
         for identifier, session in list(self.native_sessions.items()):
-            if identifier in self.active_infers:
+            if self.active_infers.get(identifier):
                 continue
             if (
                 not session.is_alive()
@@ -2684,6 +2783,8 @@ class Host:
             "auth_method": method,
             **({"oauth_imported": True} if env.get("oauth_imported") else {}),
             "runtime_ready": runtime_ready,
+            "max_concurrency": env_concurrency(env),
+            "active_slots": len(self.active_infers.get(env["id"], {})),
             "capabilities": list(FULL_CAPABILITIES if method == "api_key" else NATIVE_CAPABILITIES),
             "kernel_version": self.payload_version,
             "models": env.get("call_models", account.get("models", [])),
@@ -2789,7 +2890,7 @@ class Host:
                 "busy": bool(
                     self.pending
                     or self.terminals
-                    or self.active_infers
+                    or any(self.active_infers.values())
                     or any(self.running(key) for key in self.runs)
                 )
             }
@@ -2830,6 +2931,13 @@ class Host:
                 or (method == "oauth" and api_key is not None)
             ):
                 raise Failure(400)
+            raw_concurrency = body.get("max_concurrency")
+            if raw_concurrency is None:
+                max_concurrency = 1
+            elif type(raw_concurrency) is int and 1 <= raw_concurrency <= MAX_CONCURRENCY:
+                max_concurrency = raw_concurrency
+            else:
+                raise Failure(400, "gemini_invalid_concurrency")
             imported = body.get("oauth_account")
             credential = None
             if imported is not None:
@@ -2876,6 +2984,7 @@ class Host:
                 "name": name.strip(),
                 "proxy_id": proxy_id,
                 "slot": slot,
+                "max_concurrency": max_concurrency,
                 "auth_method": method,
                 "auth_state": (
                     "authorized" if method == "api_key" or credential else "unverified"
@@ -2926,6 +3035,23 @@ class Host:
             return self.license_clear(env)
         if operation == "proxy-bind":
             return self.bind_proxy(env, body)
+        if operation == "concurrency-set":
+            raw_concurrency = body.get("max_concurrency")
+            if type(raw_concurrency) is not int or not 1 <= raw_concurrency <= MAX_CONCURRENCY:
+                raise Failure(400, "gemini_invalid_concurrency")
+            if (
+                self.running(identifier)
+                or identifier in self.terminals
+                or identifier in self.pending
+            ):
+                raise Failure(409, "gemini_operation_busy")
+            if env_concurrency(env) != raw_concurrency:
+                self.stop_native_session(identifier)
+                self.save_environment(
+                    env,
+                    {**env, "max_concurrency": raw_concurrency, "updated_at": now()},
+                )
+            return self.view(env)
         if operation in ("test-chat-status", "test-chat-cancel"):
             return self.run_request(operation, identifier, body)
         if operation == "infer-cancel":
@@ -2978,6 +3104,7 @@ class Host:
             raise Failure(409)
         proxy_url = body.get("proxy_url")
         proxy_config(proxy_url)
+        verify_proxy_sha256(body, proxy_url)
         if operation == "proxy-probe":
             return self.probe_proxy(env, proxy_url)
         if operation == "models":
@@ -3088,6 +3215,7 @@ class Host:
             raise Failure(409)
         proxy_url = body.get("proxy_url")
         proxy_config(proxy_url)
+        verify_proxy_sha256(body, proxy_url)
         model = body.get("model")
         request_id = body.get("request_id")
         infer_body = body.get("body")
@@ -3114,7 +3242,9 @@ class Host:
         finally:
             os.close(descriptor)
 
-        uid, key, auth = self.operation_account(env)
+        uid, key, auth = self.operation_account(env, allow_concurrent_infer=True)
+        if request_id in self.active_infers.get(identifier, {}):
+            raise Failure(409, "gemini_operation_busy")
         if model not in env.get("call_models", []):
             raise Failure(409, "gemini_model_unavailable")
         native_body = None
@@ -3140,7 +3270,7 @@ class Host:
             "cancel_event": cancel_event,
             "cancel_fn": None,
         }
-        self.active_infers[identifier] = infer_entry
+        self.active_infers.setdefault(identifier, {})[request_id] = infer_entry
         return {
             "identifier": identifier,
             "env": dict(env),
@@ -3182,7 +3312,11 @@ class Host:
             handler.send_json_error(502, final_code)
         finally:
             with self.lock:
-                self.active_infers.pop(identifier, None)
+                slot_map = self.active_infers.get(identifier)
+                if slot_map is not None:
+                    slot_map.pop(ctx["request_id"], None)
+                    if not slot_map:
+                        self.active_infers.pop(identifier, None)
                 self.finish_inference(
                     evidence,
                     final_state,
@@ -3269,27 +3403,31 @@ class Host:
     def _acquire_native_session(self, ctx):
         identifier = ctx["identifier"]
         proxy_hash = hashlib.sha256(ctx["proxy_url"].encode()).digest()
-        with self.lock:
-            existing = self.native_sessions.get(identifier)
-            if (
-                existing is not None
-                and existing.model == ctx["model"]
-                and secrets.compare_digest(existing.proxy_hash, proxy_hash)
-                and existing.is_ready()
-            ):
-                existing.last_used = time.monotonic()
-                return existing
-            if existing is not None:
-                self.stop_native_session(identifier)
-        session = NativeSession(
-            self, ctx["env"], ctx["proxy_url"], ctx["auth"], ctx["model"]
-        )
-        with self.lock:
-            self.native_sessions[identifier] = session
-        return session
+        desired_concurrency = env_concurrency(ctx["env"])
+        with self._session_lock(identifier):
+            with self.lock:
+                existing = self.native_sessions.get(identifier)
+                if (
+                    existing is not None
+                    and existing.model == ctx["model"]
+                    and getattr(existing, "max_concurrency", 1) == desired_concurrency
+                    and secrets.compare_digest(existing.proxy_hash, proxy_hash)
+                    and existing.is_ready()
+                ):
+                    existing.last_used = time.monotonic()
+                    return existing
+                if existing is not None:
+                    self.stop_native_session(identifier)
+            session = NativeSession(
+                self, ctx["env"], ctx["proxy_url"], ctx["auth"], ctx["model"]
+            )
+            with self.lock:
+                self.native_sessions[identifier] = session
+            return session
 
     def _stream_native_infer(self, ctx, handler):
         identifier = ctx["identifier"]
+        multi_slot = env_concurrency(ctx.get("env", {})) > 1
         cancel_event = ctx["entry"]["cancel_event"]
         creds = tuple(
             v.encode("utf-8")
@@ -3321,12 +3459,12 @@ class Host:
                     break
                 handler.write_sse_chunk(self._redact_bytes(chunk, creds))
             if cancel_event.is_set():
-                recycle = True
+                recycle = not multi_slot
                 return "cancelled", "gemini_inference_cancelled"
             session.last_used = time.monotonic()
             return "completed", None
         except native_mod.NativeFailure as error:
-            recycle = error.code != "gemini_unsupported_turn"
+            recycle = (not multi_slot) and error.code != "gemini_unsupported_turn"
             diagnostic = (
                 session.native_diagnostic.poll(final=True)
                 if session.native_diagnostic is not None
@@ -3346,11 +3484,11 @@ class Host:
             handler.send_json_error(status, code, message)
             return "failed", code
         except (BrokenPipeError, ConnectionResetError):
-            recycle = True
+            recycle = not multi_slot
             stop_native()
             raise
         except (OSError, TimeoutError):
-            recycle = True
+            recycle = not multi_slot
             handler.send_json_error(502, "gemini_inference_failed")
             return "failed", "gemini_inference_failed"
         finally:
@@ -3452,6 +3590,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "maintenance-status",
                 "proxy-probe",
                 "proxy-bind",
+                "concurrency-set",
                 "models",
                 "test-chat",
                 "test-chat-status",

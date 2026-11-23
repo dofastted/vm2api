@@ -349,6 +349,16 @@ def _map_worker_error(http_status, payload):
     return NativeFailure("gemini_inference_failed", effective_status if 400 <= effective_status <= 599 else 502, message)
 
 
+def _worker_ready(status):
+    if not isinstance(status, dict) or status.get("ready") is not True:
+        return False
+    native_pid = status.get("native_pid")
+    if type(native_pid) is int and native_pid > 0:
+        return True
+    pool = status.get("pool")
+    return isinstance(pool, dict) and pool.get("enabled") is True and pool.get("ready") is True
+
+
 def open_worker_stream(
     socket_path,
     token,
@@ -375,19 +385,13 @@ def open_worker_stream(
     start_deadline = time.monotonic() + startup_timeout
     while time.monotonic() < start_deadline:
         status = worker_status(socket_path, token, timeout=0.25)
-        native_pid = status.get("native_pid") if status else None
         if status and status.get("license_valid") is False:
             lic = status.get("license") if isinstance(status.get("license"), dict) else {}
             lic_code = lic.get("code") if isinstance(lic.get("code"), str) and lic.get("code") in LICENSE_ERROR_CODES else "license_required"
             raise NativeFailure(lic_code, 403, lic.get("message") if isinstance(lic.get("message"), str) else None)
         if status and status.get("needs_recovery") is True:
             raise NativeFailure("gemini_native_worker_unavailable", 503)
-        if (
-            status
-            and status.get("ready") is True
-            and type(native_pid) is int
-            and native_pid > 0
-        ):
+        if _worker_ready(status):
             break
         time.sleep(0.05)
     else:
@@ -492,17 +496,11 @@ def run_request(request):
     start_deadline = time.monotonic() + startup_timeout
     while time.monotonic() < start_deadline:
         status = worker_status(socket_path, token, timeout=0.25)
-        native_pid = status.get("native_pid") if status else None
         if status and status.get("license_valid") is False:
             lic = status.get("license") if isinstance(status.get("license"), dict) else {}
             lic_code = lic.get("code") if isinstance(lic.get("code"), str) and lic.get("code") in LICENSE_ERROR_CODES else "license_required"
             raise NativeFailure(lic_code, 403, lic.get("message") if isinstance(lic.get("message"), str) else None)
-        if (
-            status
-            and status.get("ready") is True
-            and type(native_pid) is int
-            and native_pid > 0
-        ):
+        if _worker_ready(status):
             break
         time.sleep(0.1)
     else:
@@ -701,30 +699,46 @@ def _record_launcher_exit(directory, name, returncode):
         pass
 
 
+def _is_pool_mode_config(config_path):
+    try:
+        with open(config_path, "rb") as stream:
+            data = json.loads(stream.read(256 * 1024))
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        return isinstance(accounts, list) and len(accounts) > 0
+    except (OSError, ValueError):
+        return False
+
+
 def _launch_native(argv):
     # Both children must use the same PID namespace and procfs: the worker
     # compares SO_PEERCRED with the PID reported by the in-process adapter.
     directory = "/tmp/craggemini"
+    config_path = directory + "/kernel.json"
+    pool_mode = _is_pool_mode_config(config_path)
     worker = subprocess.Popen(
-        ["/opt/craggemini", "--gateway-worker", "--config", directory + "/kernel.json"],
+        ["/opt/craggemini", "--gateway-worker", "--config", config_path],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     tui = None
     try:
+        required_sockets = ("kernel.sock",) if pool_mode else ("kernel.sock", "native.sock")
         deadline = time.monotonic() + 5
         while worker.poll() is None and time.monotonic() < deadline:
-            if all(
-                os.path.exists(f"{directory}/{name}")
-                for name in ("kernel.sock", "native.sock")
-            ):
+            if all(os.path.exists(f"{directory}/{name}") for name in required_sockets):
                 break
             time.sleep(0.025)
         else:
             if worker.returncode is not None:
                 _record_launcher_exit(directory, "craggemini", worker.returncode)
             return 1
+        if pool_mode:
+            # In multi-process pool mode, craggemini spawns and guards up to
+            # max_concurrency agy processes with per-slot PTYs and memfd rings.
+            code = worker.wait()
+            _record_launcher_exit(directory, "craggemini", code)
+            return code if code >= 0 else 128 - code
         tui = subprocess.Popen(
             argv,
             env={
