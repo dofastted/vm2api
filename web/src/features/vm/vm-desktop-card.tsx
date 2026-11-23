@@ -35,7 +35,17 @@ const STATE_TEXT: Record<DesktopStatus['state'], string> = {
  * Browser desktop that shares this slot's egress. Admin-only (server ACL);
  * the companion container is started on slot start when enabled.
  */
-export function VmDesktopCard({ vm }: { vm: Vm }) {
+export function VmDesktopCard({
+  vm,
+  active,
+}: {
+  vm: Vm
+  /**
+   * 「桌面」页签当前是否选中。页签改为 forceMount 保活连接后本卡片在任意
+   * 详情页都已挂载，没有这个闸门状态轮询会在从未打开桌面的页面上常驻。
+   */
+  active: boolean
+}) {
   const id = vm.id
   const root = `/api/panel/vms/${encodeURIComponent(id)}`
   const qc = useQueryClient()
@@ -79,7 +89,9 @@ export function VmDesktopCard({ vm }: { vm: Vm }) {
     queryKey: ['vm-desktop', id],
     queryFn: () =>
       api<DesktopStatus>(`/api/panel/vms/${encodeURIComponent(id)}/desktop`),
-    refetchInterval: open ? false : 15_000,
+    // 打开 noVNC 后状态不再轮询（连接本身即活性信号）；页签未选中时也不轮询。
+    // 首次取值仍会发生，切到桌面页签时状态是现成的。
+    refetchInterval: active && !open ? 15_000 : false,
   })
   const toggle = useMutation({
     mutationFn: (enabled: boolean) =>
@@ -200,7 +212,9 @@ export function VmDesktopCard({ vm }: { vm: Vm }) {
               </Button>
             </div>
             <p className='text-xs text-muted-foreground'>
-              Mac 直接用 Command+C / V：复制粘贴与桌面双向直通（中文、链接、验证码均可直接粘贴；桌面内复制的内容点「带回桌面剪贴板」或在本面板页按 Command+C 取回）；Command+=/- 缩放会作用到桌面内网页。
+              Mac 直接用 Command+C /
+              V：复制粘贴与桌面双向直通（中文、链接、验证码均可直接粘贴；桌面内复制的内容点「带回桌面剪贴板」或在本面板页按
+              Command+C 取回）；Command+=/- 缩放会作用到桌面内网页。
             </p>
           </>
         ) : (
