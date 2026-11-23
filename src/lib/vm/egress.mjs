@@ -6,6 +6,7 @@
  * redirected SOCKS bridge.
  */
 import { execFile, execFileSync, spawn } from 'node:child_process'
+import { deferUntilExclusive, isOverlap } from '../core/handover.mjs'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -1166,6 +1167,13 @@ async function startEgressContainer({
     const hup = runDocker(['kill', '--signal', 'HUP', spec.name])
     if (hup.ok) return done(true, true)
     // Fall through and rebuild if the signal could not be delivered.
+  }
+  // Blue/green overlap: the draining controller still streams through this helper. Keep the
+  // running container and rebuild it once that controller has exited.
+  if (egressContainerHealthy(existing) && isOverlap()) {
+    const args = { projectRoot, proxyId, cfg, tcpPort, dnsPort, listenHost, bin, runDocker, hostPath, image }
+    deferUntilExclusive(`egress:${proxyId}`, () => startEgressContainer(args))
+    return { ...done(true), deferred: true }
   }
   // A helper spawned by an older control plane (process runtime) still holds the ports.
   for (const pid of egressPidsForProxyConfig(projectRoot, proxyId)) {
