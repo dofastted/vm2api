@@ -92,10 +92,10 @@ function WindowRow({
   )
 }
 
-/** GPT 槽：查询 / 重置券；Claude 完整 OAuth：原生限额查询 / 重置。 */
+/** GPT 槽：刷新额度和积分 / 使用重置券；Claude 完整 OAuth：原生限额查询 / 重置。 */
 export function VmQuotaActions({ vm, now }: { vm: Vm; now: number }) {
   return isCodexVm(vm) ? (
-    <OpenaiQuotaActions vm={vm} compact />
+    <OpenaiQuotaActions vm={vm} compact now={now} />
   ) : (
     <div className='flex flex-wrap items-center gap-1'>
       <ActiveUsageAction vm={vm} />

@@ -150,6 +150,7 @@ const MODEL_SENTENCE_CATALOG = Object.freeze({
   'claude-fable-5-2': ['Fable 5.2', 'June 2026'],
   'claude-mythos-5': ['Mythos 5', 'January 2026'],
   'claude-mythos-5-1': ['Mythos 5.1', 'June 2026'],
+  'claude-mythos-5-2': ['Mythos 5.2', 'June 2026'],
 })
 
 /** Official runtime sentence. `auto` names the selector and omits the cutoff. Unknown ids do the same. */

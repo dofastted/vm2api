@@ -1284,6 +1284,78 @@ describe('CRAG buyer presentation and activation wire', () => {
       state.buttons.some((button) => button.children === '重试自动激活')
     ).toBe(false)
   })
+
+  it('renders sanitized diagnostics and order-preservation guidance for auth_forbidden needs_attention while keeping pinned restrictions', () => {
+    const reqId = '6945109e-80be-4d23-9793-68ba195765ce'
+    state.values[3] = [
+      {
+        ...order,
+        activation: {
+          state: 'needs_attention',
+          vm_id: 'vm-a',
+          error_code: 'auth_forbidden',
+          recovery: 'not_activated',
+          authority_request_id: reqId,
+        },
+      },
+    ]
+    const html = render()
+    const history = html.slice(html.indexOf('<section aria-label="历史订单"'))
+    expect(history).toContain('激活待处理')
+    expect(history).toContain('错误码：auth_forbidden (not_activated)')
+    expect(history).toContain(`请求 ID：${reqId}`)
+    expect(history).toContain('order_id')
+    expect(history).toContain('device_uuid')
+    expect(history).toContain('crag-shop-private/receipt.key')
+    expect(history).toContain('credential')
+    expect(history).not.toContain('请先完成兑换')
+    expect(history).not.toContain('领取兑换码')
+    expect(
+      state.buttons.some((button) => button.children === '重试自动激活')
+    ).toBe(true)
+
+    // Non-admin buyer sees safe contact-admin guidance without retry or manual claim buttons.
+    state.role = 'user'
+    const userHtml = render()
+    const userHistory = userHtml.slice(
+      userHtml.indexOf('<section aria-label="历史订单"')
+    )
+    expect(userHistory).toContain('错误码：auth_forbidden (not_activated)')
+    expect(userHistory).toContain(`请求 ID：${reqId}`)
+    expect(userHistory).not.toContain('重试自动激活')
+    expect(userHistory).not.toContain('领取兑换码')
+
+    // Untrusted values are stripped on the client as defense-in-depth.
+    state.role = 'admin'
+    const voucherLeak = `CRAGR1.${'x'.repeat(43)}`
+    state.values[3] = [
+      {
+        ...order,
+        activation: {
+          state: 'needs_attention',
+          vm_id: 'vm-a',
+          error_code: voucherLeak,
+          recovery: 'not_activated',
+          authority_request_id: voucherLeak,
+        },
+      },
+    ]
+    const stripped = render()
+    expect(stripped).not.toContain(voucherLeak)
+  })
+
+  it('surfaces credential_recovery fault warning in HostOverview on /crag-subscription', () => {
+    state.hostStatus = {
+      state: 'active',
+      ready: true,
+      slot_limit: 2,
+      credential_recovery: 'host_id_collision',
+    }
+    const html = render()
+    const overview = html.slice(html.indexOf('id="crag-host-overview"'))
+    expect(overview).toContain('role="alert"')
+    expect(overview).toContain('/etc/machine-id')
+  })
 })
 
 const sideClass = 'xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]'

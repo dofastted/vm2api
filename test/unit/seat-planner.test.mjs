@@ -517,8 +517,14 @@ test('a granted global ticket keeps its original fallback deadline for native ad
   granted.release()
   const noWait = await seat(pool, 'no-wait', { allowWait: false })
   assert.equal(noWait.ok, true)
+  assert.equal(noWait.slotWaitMs, 0)
   assert.ok(noWait.slotWaitDeadlineMs <= Date.now())
   noWait.release()
+  const directNoWait = await pool.selectAndReserve({ model: MODEL, allowWait: false })
+  assert.equal(directNoWait.ok, true)
+  assert.equal(directNoWait.slotWaitMs, 0)
+  assert.ok(directNoWait.slotWaitDeadlineMs <= Date.now())
+  directNoWait.release()
 })
 
 test('queue timeout is pool_queue_timeout', async (t) => {

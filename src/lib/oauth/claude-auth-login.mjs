@@ -78,7 +78,6 @@ export function nativeLoginLaunch(bin, configDir) {
       'CLAUDE_CODE_USE_BEDROCK=0',
       'CLAUDE_CODE_USE_VERTEX=0',
       'CLAUDE_CODE_USE_FOUNDRY=0',
-      'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0',
       'ANTHROPIC_BASE_URL=',
       'ANTHROPIC_API_KEY=',
       'ANTHROPIC_AUTH_TOKEN=',
@@ -93,8 +92,8 @@ export async function readNativeLoginOauth(run, configDir) {
     '/bin/sh',
     '-c',
     'read_json() { [ -f "$1" ] && dd if="$1" iflag=nofollow,nonblock bs=65537 count=1 status=none; }; ' +
-      '[ ! -L "$1" ] && [ -f "$1/complete" ] && read_json "$1/.credentials.json" || exit 1; ' +
-      'printf "\\n\\036\\n"; if [ -f "$1/.claude.json" ]; then read_json "$1/.claude.json"; fi',
+    '[ ! -L "$1" ] && [ -f "$1/complete" ] && read_json "$1/.credentials.json" || exit 1; ' +
+    'printf "\\n\\036\\n"; if [ -f "$1/.claude.json" ]; then read_json "$1/.claude.json"; fi',
     'native-oauth-result',
     configDir,
   ])
@@ -121,8 +120,8 @@ export function officialLoginCredentialToOauth(doc, profile) {
   const scopes = Array.isArray(oauth.scopes)
     ? oauth.scopes
     : String(oauth.scope || '')
-        .trim()
-        .split(/\s+/)
+      .trim()
+      .split(/\s+/)
   if (!scopes.includes('user:profile') || !scopes.includes('user:inference')) {
     throw fail('auth_login_scope', '官方登录没有拿到完整 OAuth 权限')
   }

@@ -723,6 +723,7 @@ export class PoolScheduler extends EventEmitter {
         startedAt,
         loopDeadline,
         sticky: selected.selectionReason === 'sticky',
+        allowWait,
       }),
       slotWaitDeadlineMs: this.slotWaitDeadlineMs({
         startedAt,
@@ -1014,7 +1015,12 @@ export class PoolScheduler extends EventEmitter {
         stickyCleared,
         stickyBorrowed,
         ...timings(),
-        slotWaitMs: this.remainingSlotWaitMs({ startedAt: Date.now(), loopDeadline: failoverDeadline, sticky: true }),
+        slotWaitMs: this.remainingSlotWaitMs({
+          startedAt: Date.now(),
+          loopDeadline: failoverDeadline,
+          sticky: true,
+          allowWait,
+        }),
         slotWaitDeadlineMs:
           allowWait && phaseDeadline != null
             ? Math.min(failoverDeadline, phaseDeadline)
@@ -2658,7 +2664,8 @@ export class PoolScheduler extends EventEmitter {
     }
   }
 
-  remainingSlotWaitMs({ startedAt, loopDeadline, sticky = false } = {}) {
+  remainingSlotWaitMs({ startedAt, loopDeadline, sticky = false, allowWait = true } = {}) {
+    if (!allowWait) return 0
     const now = Date.now()
     const base = sticky ? this.config.sticky_wait_timeout_ms : this.config.fallback_wait_timeout_ms
     const failoverLeft = Number.isFinite(loopDeadline) ? loopDeadline - now : Infinity

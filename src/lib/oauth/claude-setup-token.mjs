@@ -180,7 +180,7 @@ export async function stopClaudeSetupTokenSession(projectRoot, vmId, { spawn = s
     if (pid && pidAlive(pid)) {
       try {
         process.kill(pid, 'SIGTERM')
-      } catch {}
+      } catch { }
     }
   }
   const vm = { ...(getVm(projectRoot, vmId) || {}), id: vmId }
@@ -195,7 +195,7 @@ export async function stopClaudeSetupTokenSession(projectRoot, vmId, { spawn = s
         ...(env ? { env } : {}),
       },
     )
-  } catch {}
+  } catch { }
 
   const deadline = Date.now() + 3000
   while (Date.now() < deadline) {
@@ -206,13 +206,13 @@ export async function stopClaudeSetupTokenSession(projectRoot, vmId, { spawn = s
     if (pid && pidAlive(pid)) {
       try {
         process.kill(pid, 'SIGKILL')
-      } catch {}
+      } catch { }
     }
   }
   for (const name of ['code.inbox', 'token', 'pty.pid', 'child.pid', 'pty.out', 'status.json']) {
     try {
       fs.unlinkSync(path.join(dir, name))
-    } catch {}
+    } catch { }
   }
   return { ok: true }
 }
@@ -286,7 +286,6 @@ export async function startClaudeSetupTokenSession({ vm, projectRoot, force = fa
       'KIN_SETUP_TOKEN=1',
       'CLAUDE_CODE_USE_BEDROCK=0',
       'CLAUDE_CODE_USE_VERTEX=0',
-      'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0',
       'DISABLE_TELEMETRY=1',
       'DO_NOT_TRACK=1',
       'ANTHROPIC_BASE_URL=',
@@ -371,7 +370,7 @@ export async function completeClaudeSetupToken({ projectRoot, vmId, sessionId, c
       fromPty = extractSetupTokenValue(
         fs.readFileSync(path.join(setupTokenSessionDir(projectRoot, vmId), 'token'), 'utf8'),
       )
-    } catch {}
+    } catch { }
     const found = pickPreferredSetupToken(fromDisk, fromPty)
     if (found) {
       await stopClaudeSetupTokenSession(projectRoot, vmId)
@@ -412,7 +411,7 @@ export async function completeClaudeSetupToken({ projectRoot, vmId, sessionId, c
   let fromPty = ''
   try {
     fromPty = extractSetupTokenValue(fs.readFileSync(path.join(dir, 'token'), 'utf8'))
-  } catch {}
+  } catch { }
   const latest = pickPreferredSetupToken(token, readFreshOfficialSetupToken(home, fedAt), fromPty)
   if (!latest) {
     const s = readSetupTokenSession(projectRoot, vmId)

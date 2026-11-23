@@ -555,6 +555,22 @@ test('native interval publication reports an unreachable remote VM as failed, no
       JSON.parse(fs.readFileSync(path.join(vms, 'vm-claude.json'), 'utf8')).seed_policy.telemetry_disabled,
       false,
     )
+    const suppressed = await runtime.persistRoutingPatch({ telemetry: { disable_nonessential_traffic: true } })
+    assert.equal(suppressed.telemetry_sync.updated, 1)
+    assert.equal(JSON.parse(fs.readFileSync(routingFile, 'utf8')).telemetry.disable_nonessential_traffic, true)
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'settings.json'), 'utf8')).env
+        .CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
+      '1',
+    )
+    const unsuppressed = await runtime.persistRoutingPatch({ telemetry: { disable_nonessential_traffic: false } })
+    assert.equal(unsuppressed.telemetry_sync.updated, 1)
+    assert.equal(JSON.parse(fs.readFileSync(routingFile, 'utf8')).telemetry.disable_nonessential_traffic, false)
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'settings.json'), 'utf8')).env
+        .CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
+      undefined,
+    )
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

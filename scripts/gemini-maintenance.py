@@ -69,6 +69,15 @@ ASSETS = (
     "gemini-ed25519.pub",
     "gemini-release.json",
 )
+CRAG_MEMBERS = (
+    "manifest.json",
+    "agy",
+    "craggemini",
+    "craggemini.payload.enc",
+    "libagy_bridge.so",
+    "crag-license-public.pem",
+)
+CRAG_ASSETS = tuple(name for name in CRAG_MEMBERS if name != "agy")
 SYSTEMD_UNIT = "vm2api-gemini.service"
 SYSTEM_ENV = {
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
@@ -567,6 +576,7 @@ class Maintenance:
         self.public_key = self.trust / "gemini-ed25519.pub"
         self.manual_release = self.trust / "gemini-release.json"
         self.descriptor = self.bundle / "deploy/payload.json"
+        self.crag_bundle = False
         self.release, self.pins, self.egress_pin = self.read_bundle()
         # Optional display metadata for manually signed manifests that use the
         # same CLI binary. The signed verifier, not this pattern, checks hashes.
@@ -620,10 +630,11 @@ class Maintenance:
         pins = default.get("assets")
         if (
             not isinstance(pins, dict)
-            or set(pins) != set(ASSETS)
+            or set(pins) not in (set(ASSETS), set(CRAG_ASSETS))
             or not all(map(valid_pin, pins.values()))
         ):
             raise ValueError("invalid Gemini asset pins")
+        self.crag_bundle = set(pins) == set(CRAG_ASSETS)
         files = descriptor.get("files")
         if not isinstance(files, list):
             raise ValueError("missing egress pin")
@@ -903,7 +914,7 @@ class Maintenance:
     def current_digest(self):
         try:
             return hashlib.sha256(
-                read_root(self.current / "manifest.json", 8192)
+                read_root(self.current / "manifest.json", 65536)
             ).hexdigest()
         except (OSError, ValueError):
             return None
@@ -940,6 +951,7 @@ class Maintenance:
             "--release-verifier",
             "--default-public-key",
             "--default-release-verifier",
+            "--crag-host-dir",
             "--egress",
             "--socket",
             "--gateway-group",
@@ -996,8 +1008,19 @@ class Maintenance:
             return before
         options["--egress"] = str(self.runtime / "bin/kin-egress")
         if default is not None:
-            options["--default-public-key"] = str(default / "gemini-ed25519.pub")
-            options["--default-release-verifier"] = str(default / "gemini-release.json")
+            if self.crag_bundle:
+                options["--public-key"] = str(default / "crag-license-public.pem")
+                options.pop("--default-public-key", None)
+                options.pop("--default-release-verifier", None)
+                options.setdefault(
+                    "--crag-host-dir",
+                    str(self.install / "src/data/crag-gemini-subscription/public"),
+                )
+            else:
+                options["--default-public-key"] = str(default / "gemini-ed25519.pub")
+                options["--default-release-verifier"] = str(
+                    default / "gemini-release.json"
+                )
             # Keep a manual source. An original default source is not needed for an
             # installed payload and must not reinstall the old default if current is lost.
             source = options.get("--payload-source")
@@ -1009,11 +1032,27 @@ class Maintenance:
         line += "".join(f" {name} {value}" for name, value in options.items())
         return re.sub(rb"(?m)^[ \t]*ExecStart=[^\r\n]*", line.encode(), before, count=1)
 
+    def is_crag_manifest(self, raw):
+        manifest = parse_json(raw)
+        return (
+            isinstance(manifest, dict)
+            and manifest.get("family") == "crag"
+            and manifest.get("encrypted") is True
+        )
+
     def payload_metadata(self, payload, unit):
         require_root(payload, stat.S_ISDIR)
-        raw = read_root(payload / "manifest.json", 8192)
+        raw = read_root(payload / "manifest.json", 65536)
+        crag = self.is_crag_manifest(raw)
+        if not crag and len(raw) > 8192:
+            raise ValueError("invalid file size")
         digest = hashlib.sha256(raw).hexdigest()
         options = self.unit_args(unit)
+        if crag:
+            key = Path(options.get("--public-key", self.public_key))
+            if not exists(key):
+                key = payload / "crag-license-public.pem"
+            return raw, digest, key, None
         verifier = None
         key = Path(options.get("--public-key", self.public_key))
         default = options.get("--default-release-verifier")
@@ -1033,8 +1072,9 @@ class Maintenance:
 
     def verification_key(self, payload, unit, runtime):
         raw, digest, key, verifier = self.payload_metadata(payload, unit)
+        members = CRAG_MEMBERS if self.is_crag_manifest(raw) else MEMBERS
         tuples = [digest, verifier, str(key)]
-        for name in (payload, key, *(payload / member for member in MEMBERS)):
+        for name in (payload, key, *(payload / member for member in members)):
             info = require_root(name, stat.S_ISDIR if name == payload else stat.S_ISREG)
             tuples.append(
                 (
@@ -1071,7 +1111,9 @@ class Maintenance:
     def verify(self, payload, key, verifier_root, *, dest=None):
         require_root(payload, stat.S_ISDIR)
         require_root(key, stat.S_ISREG)
-        for name in MEMBERS:
+        raw = read_root(payload / "manifest.json", 65536)
+        members = CRAG_MEMBERS if self.is_crag_manifest(raw) else MEMBERS
+        for name in members:
             require_root(payload / name, stat.S_ISREG)
         for relative in VERIFIER_FILES:
             require_root(verifier_root / relative, stat.S_ISREG)
@@ -1119,10 +1161,19 @@ class Maintenance:
         if self.verification_key(payload, unit, runtime)[0] != fingerprint:
             raise fail("payload_changed")
         manifest = parse_json(raw)
-        members = {
-            member["name"]: (member["size"], member["sha256"])
-            for member in manifest["files"]
-        }
+        if self.is_crag_manifest(raw):
+            members = {
+                name: (
+                    require_root(payload / name, stat.S_ISREG).st_size,
+                    sha_hex,
+                )
+                for name, sha_hex in manifest["sha256"].items()
+            }
+        else:
+            members = {
+                member["name"]: (member["size"], member["sha256"])
+                for member in manifest["files"]
+            }
         cli = (
             self.release["cli_version"]
             if digest == self.pins["manifest.json"]["sha256"]
@@ -1257,34 +1308,58 @@ class Maintenance:
             "fetch_failed",
         )
         self.phase("verifying")
-        if not all(hash_pin(source / name, self.pins[name]) for name in ASSETS):
+        expected_assets = CRAG_ASSETS if self.crag_bundle else ASSETS
+        if not all(hash_pin(source / name, self.pins[name]) for name in expected_assets):
             raise fail("payload_pin_mismatch")
-        key = source / "gemini-ed25519.pub"
-        lock = read_verifier(source / "gemini-release.json")
         digest = self.pins["manifest.json"]["sha256"]
-        if lock["manifest_sha256"] != digest:
-            raise fail("release_payload_mismatch")
+        if self.crag_bundle:
+            key = source / "crag-license-public.pem"
+        else:
+            key = source / "gemini-ed25519.pub"
+            lock = read_verifier(source / "gemini-release.json")
+            if lock["manifest_sha256"] != digest:
+                raise fail("release_payload_mismatch")
         candidate = self.transaction / "payload"
         if (
             self.verify(source, key, self.bundle, dest=candidate)
             != self.release["version"]
         ):
             raise fail("release_payload_mismatch")
-        manifest = parse_json(read_root(candidate / "manifest.json", 8192))
-        members = {
-            member["name"]: (member["size"], member["sha256"])
-            for member in manifest["files"]
-        }
+        manifest_raw = read_root(candidate / "manifest.json", 65536)
+        manifest = parse_json(manifest_raw)
+        if self.crag_bundle:
+            members = {
+                name: (
+                    require_root(candidate / name, stat.S_ISREG).st_size,
+                    sha_hex,
+                )
+                for name, sha_hex in manifest["sha256"].items()
+            }
+        else:
+            members = {
+                member["name"]: (member["size"], member["sha256"])
+                for member in manifest["files"]
+            }
         defaults = self.runtime / "defaults"
         root_dir(defaults, 0o700)
         default = defaults / digest
         root_dir(default, 0o700)
-        for name in ("gemini-ed25519.pub", "gemini-release.json"):
+        trust_files = (
+            ("crag-license-public.pem",)
+            if self.crag_bundle
+            else ("gemini-ed25519.pub", "gemini-release.json")
+        )
+        for name in trust_files:
             if exists(default / name):
                 if not hash_pin(default / name, self.pins[name]):
                     raise fail("default_trust_conflict")
             else:
-                copy_file(source / name, default / name, 0o600, pin=self.pins[name])
+                copy_file(
+                    source / name,
+                    default / name,
+                    0o644 if self.crag_bundle else 0o600,
+                    pin=self.pins[name],
+                )
         shutil.rmtree(source)
         return default, digest, members
 
@@ -1419,7 +1494,7 @@ class Maintenance:
             if current_id is not None:
                 try:
                     digest = hashlib.sha256(
-                        read_root(self.current / "manifest.json", 8192)
+                        read_root(self.current / "manifest.json", 65536)
                     ).hexdigest()
                     current = self.verify_existing(self.current, before)
                 except (Failure, OSError, ValueError, RecursionError):

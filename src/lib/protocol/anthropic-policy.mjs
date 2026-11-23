@@ -362,7 +362,7 @@ export function modelSupportsContextManagement(modelId = '') {
 }
 
 /**
- * Docs list: Fable 5 / 5.1, Mythos 5 / 5.1, Opus 5.5 / 5 / 4.8, Sonnet 5.5, Haiku 5.5.
+ * Docs list: Fable 5 / 5.1 / 5.2, Mythos 5 / 5.1 / 5.2, Opus 5.5 / 5 / 4.8, Sonnet 5.5, Haiku 5.5.
  * Sonnet 5, Haiku 4.5 and other Claude 4.x reject mid-conversation `role=system` (400).
  */
 export function modelSupportsMidConversationSystem(modelId = '') {
@@ -370,7 +370,9 @@ export function modelSupportsMidConversationSystem(modelId = '') {
     .trim()
     .toLowerCase()
     .replace(/\[1m\]$/i, '')
-  return /^claude-(?:(?:fable|mythos)-5(?:[-.]1)?|opus-(?:5(?:[-.]5)?|4[-.]8)|(?:sonnet|haiku)-5[-.]5)(?:-|$)/.test(id)
+  return /^claude-(?:(?:fable|mythos)-5(?:[-.](?:1|2))?|opus-(?:5(?:[-.]5)?|4[-.]8)|(?:sonnet|haiku)-5[-.]5)(?:-|$)/.test(
+    id,
+  )
 }
 
 /**

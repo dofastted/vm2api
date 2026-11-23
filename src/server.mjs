@@ -13,6 +13,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { loadConfig, reloadActiveVm, routingConfigFile } from './lib/core/config.mjs'
+import { createGeminiCragSubscription } from './lib/gemini/subscription.mjs'
 import { createGeminiScheduler } from './lib/gemini/scheduler.mjs'
 import {
   createGeminiPublicHandler,
@@ -1209,6 +1210,11 @@ const handleCragShop = createCragShopHandler({
   activationEnabled: cragShopActivationEnabled,
 })
 
+const geminiCragSubscription = createGeminiCragSubscription({
+  projectRoot: cfg.paths.project,
+  dataDir: cfg.paths.data,
+  callHost: callGeminiHost,
+})
 const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })
 const geminiScheduler = createGeminiScheduler({
   callHost: callGeminiHost,
@@ -1216,11 +1222,13 @@ const geminiScheduler = createGeminiScheduler({
   poolScheduler,
   apiKeyStore,
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
+  cragSubscription: geminiCragSubscription,
 })
 const handleGeminiPublic = createGeminiPublicHandler({ json, readBody, scheduler: geminiScheduler })
 const handlePanel = createPanelHandler({
   getDb,
   cragSubscription,
+  geminiCragSubscription,
   handleCragShop,
   json,
   writeSSEHeaders,

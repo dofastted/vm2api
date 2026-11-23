@@ -40,29 +40,58 @@ const messages = {
     'The authorization service rejected this host request. Contact the administrator with the request ID; do not reset the host credential.',
   host_transfer_cooldown:
     'This host was retired too recently. Its vouchers become transferable again once the cooldown ends; see cooldown_until on the last retirement.',
-  // Claiming by order id. Each of these is final for the id as given, so the copy
-  // has to point at the one thing that can still change the outcome rather than
-  // inviting a retry that cannot succeed.
+  not_found: 'No host subscription or slot was found at the authorization service.',
+  redeem_unavailable: 'This voucher code is invalid, expired, or already used. Check the code before retrying.',
+  vm_not_found: 'VM not found.',
+  crag_subscription_failed: 'The host subscription operation failed. Refresh its status before retrying.',
+}
+
+// Claiming by order id. Kept separate from `messages` because `not_found`,
+// `redeem_unavailable`, and `request_conflict` have different meanings on other
+// routes (mirroring `cragOrderClaimErrors` in the panel). Each of these is final
+// for the id as given, so the copy points at the one action that can still change
+// the outcome rather than inviting a retry that cannot succeed.
+const claimMessages = {
   not_found:
     'No voucher is recorded for that order id. Check the id on the original order; an order redeemed before order ids were recorded has to be migrated with its voucher code instead.',
   redeem_unavailable:
     'That order shares a combined quota window with other vouchers on its host and cannot be moved on its own. Retire the whole host instead.',
   request_conflict:
     'That order id is already recorded against a different voucher. Keep the original order and ask the administrator to reconcile it; do not redeem again.',
-  vm_not_found: 'VM not found.',
-  crag_subscription_failed: 'The host subscription operation failed. Refresh its status before retrying.',
 }
 
+const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
+const credentialRecoveries = new Set(['not_activated', 'host_id_collision', 'failed'])
+
 export function createCragSubscriptionHandler({ subscription, getVm, publicBaseUrl, json, readRawBody }) {
-  const reject = (res, status, code, authorityRequestId) =>
-    json(res, status, {
+  const reject = (res, status, code, error, action) => {
+    const message =
+      action === 'claim' && Object.hasOwn(claimMessages, code)
+        ? claimMessages[code]
+        : Object.hasOwn(messages, code)
+          ? messages[code]
+          : messages.crag_subscription_failed
+    const validRecovery = credentialRecoveries.has(error?.recovery) ? error.recovery : undefined
+    const validRequestId =
+      typeof error?.authorityRequestId === 'string' && authorityRequestId.test(error.authorityRequestId)
+        ? error.authorityRequestId
+        : undefined
+    const details =
+      validRecovery || validRequestId
+        ? {
+            ...(validRecovery && { recovery: validRecovery }),
+            ...(validRequestId && { authority_request_id: validRequestId }),
+          }
+        : undefined
+    return json(res, status, {
       ok: false,
       error: {
         code,
-        message: Object.hasOwn(messages, code) ? messages[code] : messages.crag_subscription_failed,
-        ...(authorityRequestId && { details: { authority_request_id: authorityRequestId } }),
+        message,
+        ...(details && { details }),
       },
     })
+  }
   const ok = (res, data) => json(res, 200, { ok: true, data })
 
   return async (req, res, { action, id }) => {
@@ -122,7 +151,7 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
       ) {
         return reject(res, 500, 'crag_subscription_failed')
       }
-      return reject(res, error.status === 401 ? 502 : error.status, error.code, error.authorityRequestId)
+      return reject(res, error.status === 401 ? 502 : error.status, error.code, error, action)
     }
   }
 }

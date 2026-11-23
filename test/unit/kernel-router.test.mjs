@@ -799,6 +799,7 @@ unixTest('recovering native worker does not poll beyond the original slot budget
       slotWaitDeadlineMs: Date.now() - 1,
     })
     assert.equal(result.body.error.code, 'slot_busy')
+    assert.equal(result.upstreamExecutions, 0)
     assert.equal(probes, 1)
   } finally {
     if (previous == null) delete process.env.KIN_KERNEL_BIN
@@ -806,6 +807,39 @@ unixTest('recovering native worker does not poll beyond the original slot budget
     await fx.close()
   }
 })
+
+unixTest(
+  'busy non-gateway-policy kernel honors zero slotWaitMs without polling and stamps upstreamExecutions:0',
+  async () => {
+    const previous = process.env.KIN_KERNEL_BIN
+    let probes = 0
+    const fx = await kernelFixture((req, res) => {
+      assert.equal(req.url, '/internal/health')
+      probes++
+      res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0, cli_pid: 4321 }))
+    })
+    process.env.KIN_KERNEL_BIN = '/bin/true'
+    try {
+      const started = Date.now()
+      const result = await dispatchCallInference({
+        exec: fx.exec,
+        body: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+        routing: { inference: { engine: 'rust', health_ttl_ms: 0, slot_wait_ms: 30_000 } },
+        slotWaitMs: 0,
+        slotWaitDeadlineMs: Date.now(),
+      })
+      assert.equal(result.status, 503)
+      assert.equal(result.body.error.code, 'slot_busy')
+      assert.equal(result.upstreamExecutions, 0)
+      assert.equal(probes, 2)
+      assert.ok(Date.now() - started < 500)
+    } finally {
+      if (previous == null) delete process.env.KIN_KERNEL_BIN
+      else process.env.KIN_KERNEL_BIN = previous
+      await fx.close()
+    }
+  },
+)
 
 linuxTest('managed timeout SSE remains a timeout before and after downstream commit', async () => {
   const previous = process.env.KIN_KERNEL_BIN

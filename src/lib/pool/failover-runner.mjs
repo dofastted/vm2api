@@ -407,7 +407,6 @@ function isCredentialDeath(policy) {
   return policy?.action === 'disable' || policy?.reason === 'oauth_no_refresh' || policy?.reason === 'oauth_revoked'
 }
 
-/** Empty / thinking-only hop: replayable on another seat. Never a restart signal. */
 /**
  * The kernel's job watchdog gave up after 180s without one CLI frame. The slot itself may be fine,
  * so this says something about the request rather than the seat.
@@ -473,6 +472,7 @@ function oversizeForSlotResult({ requestBytes, ceilingBytes, retryAfterSec }) {
   }
 }
 
+/** Empty / thinking-only hop: replayable on another seat. Never a restart signal. */
 function isRetryableEmptyHop(policy) {
   return policy?.reason === 'incomplete_assistant' || policy?.reason === 'empty_response'
 }
@@ -797,6 +797,8 @@ export class FailoverRunner {
     keyScope = null,
     countUsage = true,
     quotaRequest = null,
+    // false: never wait for a seat; a full pool fails at once (x-kin-queue: off).
+    allowQueue = true,
   } = {}) {
     if (!this.scheduler) throw new Error('FailoverRunner requires a scheduler')
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
@@ -954,6 +956,16 @@ export class FailoverRunner {
       homeRetryPending = 'slot_busy'
       return true
     }
+    // x-kin-queue: off — the home kernel being full is the pool being full for this
+    // conversation: answer 529 now rather than wait for the slot.
+    const homeSlotRefused = (unit, policy) => {
+      if (allowQueue || !isHome(unit) || policy?.reason !== 'slot_busy') return null
+      releaseStickySlots()
+      return {
+        ...poolOverloadedError({ reason: 'session_home_slot_busy', attempt_count: budget.hops }),
+        ...attribution(),
+      }
+    }
     const keptHome = () => {
       releaseStickySlots()
       return preferLastResult(lastResult, lastPolicy, null, { ...attribution(), session_home_kept: true })
@@ -1018,7 +1030,7 @@ export class FailoverRunner {
           if (elsewhere?.ok) selected = elsewhere
           else await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
         }
-        if (!selected) selected = await this.scheduler.selectAndReserve({ ...selectArgs, allowWait: true })
+        if (!selected) selected = await this.scheduler.selectAndReserve({ ...selectArgs, allowWait: allowQueue })
       } catch (error) {
         if (error?.code === 'selection_cancelled') {
           return { ...clientCancelledResult(), via: 'pool-failover', ...attribution() }
@@ -1344,6 +1356,8 @@ export class FailoverRunner {
           this.retireOutboundSession(selected, bindKeys)
           freshSlot = true
         }
+        const refusedHome = homeSlotRefused(selected, policy)
+        if (refusedHome) return refusedHome
         if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
           budget.noteSameUnit(selected.accountId)
           avoid = retryOrStay(selected)
@@ -1470,6 +1484,8 @@ export class FailoverRunner {
         }
         policy = await this.recoverCredential(selected, policy)
         const hopMs = Date.now() - attemptStarted
+        const refusedHome = homeSlotRefused(selected, policy)
+        if (refusedHome) return refusedHome
         if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
           budget.noteSameUnit(selected.accountId)
           avoid = retryOrStay(selected)

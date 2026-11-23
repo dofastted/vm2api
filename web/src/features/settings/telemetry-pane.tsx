@@ -105,56 +105,61 @@ async function refreshAfterWrite(qc: QueryClient, ids: string[]) {
   ])
 }
 
-const CONTRACT: { file: string; key: string; on: string; off: string }[] = [
-  {
-    file: 'settings.json · env',
-    key: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
-    on: 'CRAG 不写；其他 "1"',
-    off: '"0"',
-  },
-  {
-    file: 'settings.json · env',
-    key: 'DISABLE_TELEMETRY',
-    on: '不写',
-    off: '"1"',
-  },
-  {
-    file: 'settings.json · env',
-    key: 'CLAUDE_CODE_DISABLE_TELEMETRY（CRAG）',
-    on: '不写',
-    off: '"1"',
-  },
-  {
-    file: 'settings.json · env',
-    key: 'DO_NOT_TRACK',
-    on: '不写',
-    off: '"1"',
-  },
-  {
-    file: 'settings.json · env',
-    key: 'CLAUDE_CODE_USE_BEDROCK / VERTEX',
-    on: '"0"',
-    off: '"0"',
-  },
-  {
-    file: 'settings.json',
-    key: 'grove_enabled',
-    on: 'false',
-    off: 'false',
-  },
-  {
-    file: 'kin-seed.json',
-    key: 'telemetry',
-    on: 'enabled',
-    off: 'disabled',
-  },
-  {
-    file: 'kin-seed.json',
-    key: 'seed_policy.telemetry_disabled',
-    on: 'false',
-    off: 'true',
-  },
-]
+function contractRows(
+  disableNonessentialTraffic: boolean
+): { file: string; key: string; on: string; off: string }[] {
+  const nonessential = disableNonessentialTraffic ? '"1"' : '不写（unset）'
+  return [
+    {
+      file: 'settings.json · env',
+      key: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+      on: nonessential,
+      off: nonessential,
+    },
+    {
+      file: 'settings.json · env',
+      key: 'DISABLE_TELEMETRY',
+      on: '不写',
+      off: '"1"',
+    },
+    {
+      file: 'settings.json · env',
+      key: 'CLAUDE_CODE_DISABLE_TELEMETRY（CRAG）',
+      on: '不写',
+      off: '"1"',
+    },
+    {
+      file: 'settings.json · env',
+      key: 'DO_NOT_TRACK',
+      on: '不写',
+      off: '"1"',
+    },
+    {
+      file: 'settings.json · env',
+      key: 'CLAUDE_CODE_USE_BEDROCK / VERTEX',
+      on: '"0"',
+      off: '"0"',
+    },
+    {
+      file: 'settings.json',
+      key: 'grove_enabled',
+      on: 'false',
+      off: 'false',
+    },
+    {
+      file: 'kin-seed.json',
+      key: 'telemetry',
+      on: 'enabled',
+      off: 'disabled',
+    },
+    {
+      file: 'kin-seed.json',
+      key: 'seed_policy.telemetry_disabled',
+      on: 'false',
+      off: 'true',
+    },
+  ]
+}
 
 function pipeline(interval: number): { title: string; body: string }[] {
   return [
@@ -235,13 +240,17 @@ function IntervalSetting({
 export function TelemetryPane({
   interval,
   defaultEnabled,
+  disableNonessentialTraffic,
   onIntervalChange,
   onDefaultEnabledChange,
+  onDisableNonessentialTrafficChange,
 }: {
   interval: number
   defaultEnabled: boolean
+  disableNonessentialTraffic: boolean
   onIntervalChange: (seconds: number) => void
   onDefaultEnabledChange: (enabled: boolean) => void
+  onDisableNonessentialTrafficChange: (enabled: boolean) => void
 }) {
   const qc = useQueryClient()
   const dash = useQuery(dashboardQueryOptions())
@@ -491,6 +500,36 @@ export function TelemetryPane({
               aria-label='新建槽默认开启遥测'
             />
           </div>
+          <div className='flex items-center justify-between gap-3 border-t border-[var(--hairline)] pt-4'>
+            <div className='min-w-0'>
+              <Label
+                htmlFor='telemetry-disable-nonessential-traffic'
+                className='text-sm font-normal'
+              >
+                禁用非必要流量（
+                <code className='font-mono text-xs'>
+                  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+                </code>
+                ）
+              </Label>
+              <p className='text-xs text-muted-foreground'>
+                默认关闭（保持{' '}
+                <code className='font-mono text-[11px]'>unset</code>），原生{' '}
+                <code className='font-mono text-[11px]'>/usage</code>{' '}
+                用量查询与非必要请求正常可用；开启后统一向各 Claude 槽写入{' '}
+                <code className='font-mono text-[11px]'>&quot;1&quot;</code>
+                ，官方 CLI 将屏蔽{' '}
+                <code className='font-mono text-[11px]'>/usage</code>{' '}
+                等非必要请求。
+              </p>
+            </div>
+            <Switch
+              id='telemetry-disable-nonessential-traffic'
+              checked={disableNonessentialTraffic}
+              onCheckedChange={onDisableNonessentialTrafficChange}
+              aria-label='禁用非必要流量'
+            />
+          </div>
         </CardContent>
       </Card>
 
@@ -540,7 +579,7 @@ export function TelemetryPane({
               </tr>
             </thead>
             <tbody className='divide-y divide-[var(--hairline)]'>
-              {CONTRACT.map((row) => {
+              {contractRows(disableNonessentialTraffic).map((row) => {
                 const flips = row.on !== row.off
                 return (
                   <tr key={`${row.file}:${row.key}`}>

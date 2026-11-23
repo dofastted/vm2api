@@ -129,7 +129,10 @@ export function preflightFreshClaudeKernels(projectRoot, vm) {
 export function seedFreshCliHome(projectRoot, vm, { routing, preinstallBoth = false } = {}) {
   const host = slotHost(vm)
   const crag = resolveKernelDataplane(vm, routing) === 'crag'
-  const written = writeSlotSeedFiles(projectRoot, vm, null, { cragNativeTelemetry: crag && !host.native })
+  const written = writeSlotSeedFiles(projectRoot, vm, null, {
+    cragNativeTelemetry: crag && !host.native,
+    routing,
+  })
   // Cluster payloads go in slot-bin, not the control plane's .kin home.
   if (!host.bakedKernel) {
     if (preinstallBoth) {

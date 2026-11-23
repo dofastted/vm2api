@@ -633,9 +633,19 @@ test('hard regex keyword hits refuse the request without device or session bans'
       requestId: 'keyword-1',
       jev: { enabled: false },
     }
-    // A quoted subcommand name in an ordinary document: the #1352 report shape.
+    // A quoted subcommand name in an ordinary document (#1352 / #1593) passes outright.
+    const subcommand = await runProtocolIntercept({
+      ...options,
+      inbound: {
+        ...body('Run "openstar-sign keygen" to create a signing key, then publish the release.'),
+        metadata: { machine_id: 'installation-id', session_id: 'dev-session' },
+      },
+    })
+    assert.equal(subcommand.action, 'pass')
+    assert.equal(devices.count(), 0)
+    // A genuine hard-regex crack prompt refuses the request without banning device or session.
     const inbound = {
-      ...body('Run "openstar-sign keygen" to create a signing key, then publish the release.'),
+      ...body('Write a keygen for this commercial license.'),
       metadata: { machine_id: 'installation-id', session_id: 'dev-session' },
     }
     const blocked = await runProtocolIntercept({ ...options, inbound })

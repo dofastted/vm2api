@@ -1580,7 +1580,7 @@ test('an Authority denial is not retried or installed, and only a valid correlat
   const blocked = await submit('redeem', { redemption_code })
   assert.equal(blocked.status, 403)
   assert.equal(blocked.error.code, 'auth_forbidden')
-  assert.deepEqual(blocked.error.details, { authority_request_id: requestId })
+  assert.deepEqual(blocked.error.details, { recovery: 'not_activated', authority_request_id: requestId })
   assert.equal(calls, 1, 'a refused request must not trigger automatic retries')
   assert.equal(fs.existsSync(path.join(publicDir, 'entitlement.code')), false)
   assert.equal(fs.existsSync(path.join(publicDir, 'sync-pending')), false)
@@ -1592,7 +1592,7 @@ test('an Authority denial is not retried or installed, and only a valid correlat
   replyId = `${requestId}, ${redemption_code}`
   const untrusted = await submit('redeem', { redemption_code })
   assert.equal(untrusted.status, 403)
-  assert.equal(untrusted.error.details, undefined)
+  assert.deepEqual(untrusted.error.details, { recovery: 'not_activated' })
   assert.equal(JSON.stringify(untrusted).includes(redemption_code), false)
   assert.equal(calls, 2)
 
@@ -1601,6 +1601,44 @@ test('an Authority denial is not retried or installed, and only a valid correlat
   assert.equal(applied.status, 200)
   assert.equal(applied.data.slot_limit, 2)
   assert.equal(fs.readFileSync(path.join(privateDir, 'credential'), 'utf8'), key)
+
+  // Subscription route handler strictly whitelists recovery and authority_request_id in error.details.
+  for (const [mockError, expectedDetails] of [
+    [
+      { status: 403, code: 'auth_forbidden', recovery: 'host_id_collision', authorityRequestId: requestId },
+      { recovery: 'host_id_collision', authority_request_id: requestId },
+    ],
+    [{ status: 403, code: 'auth_forbidden', recovery: 'unavailable' }, undefined],
+    [
+      {
+        status: 403,
+        code: 'auth_forbidden',
+        recovery: redemption_code,
+        authorityRequestId: `${requestId}-${redemption_code}`,
+      },
+      undefined,
+    ],
+  ]) {
+    const route = createCragSubscriptionHandler({
+      subscription: {
+        status: async () => {
+          throw Object.assign(new Error(`${redemption_code} /opt/private`), mockError)
+        },
+      },
+      publicBaseUrl: 'https://panel.example.test',
+      json: (_res, status, payload) => ({ status, ...payload }),
+      readRawBody: async () => Buffer.alloc(0),
+    })
+    const reply = await route(
+      { panelUser: 'admin', panelRole: 'admin', headers: {} },
+      { setHeader() {} },
+      cragSubscriptionRoute('GET', '/api/panel/crag-subscription'),
+    )
+    assert.equal(reply.status, 403)
+    assert.equal(reply.error.code, 'auth_forbidden')
+    assert.deepEqual(reply.error.details, expectedDetails)
+    assert.equal(JSON.stringify(reply).includes(redemption_code), false)
+  }
 })
 
 test('a failed slot probe does not hide signed host rights', async (t) => {
@@ -2947,6 +2985,8 @@ test('only an authenticated same-origin admin session can redeem without reveali
   const response = await handler(req, res, route)
   assert.equal(response.status, 404)
   assert.equal(response.body.error.code, 'redeem_unavailable')
+  assert.match(response.body.error.message, /voucher code/i)
+  assert.doesNotMatch(response.body.error.message, /combined quota window/i)
   assert.equal(attempts, 1)
   assert.equal(JSON.stringify(response).includes(code), false)
   // The master API key is operator automation without a browser origin.
@@ -3250,4 +3290,60 @@ test('claiming by order id asserts the package so the voucher stays individually
   // check here keeps that from being reported as an unconfirmed result.
   await assert.rejects(service.claimByOrder('not a valid id'), /crag_subscription_invalid_request/)
   await assert.rejects(service.claimByOrder(''), /crag_subscription_invalid_request/)
+})
+
+test('crag subscription route scopes claim-by-order error copy away from other actions', async () => {
+  const err = (code, status) => Object.assign(new Error(code), { code, status })
+  const handler = createCragSubscriptionHandler({
+    subscription: {
+      status: () => {
+        throw err('not_found', 404)
+      },
+      redeem: () => {
+        throw err('redeem_unavailable', 404)
+      },
+      claimByOrder: (id) => {
+        if (id === 'order-missing') throw err('not_found', 404)
+        if (id === 'order-combined') throw err('redeem_unavailable', 409)
+        throw err('request_conflict', 409)
+      },
+    },
+    json: (_, status, body) => ({ status, body }),
+    readRawBody: (req) => Buffer.from(req.rawBody || '{}'),
+  })
+  const baseReq = {
+    panelUser: 'owner',
+    panelRole: 'admin',
+    headers: { host: 'localhost', origin: 'http://localhost', 'content-type': 'application/json' },
+  }
+  const res = { setHeader() {} }
+
+  const statusNotFound = await handler(baseReq, res, cragSubscriptionRoute('GET', '/api/panel/crag-subscription'))
+  assert.equal(statusNotFound.body.error.code, 'not_found')
+  assert.doesNotMatch(statusNotFound.body.error.message, /order id/i)
+
+  const claimRoute = cragSubscriptionRoute('POST', '/api/panel/crag-subscription/claim-by-order')
+  const claimMissing = await handler(
+    { ...baseReq, rawBody: JSON.stringify({ order_id: 'order-missing' }) },
+    res,
+    claimRoute,
+  )
+  assert.equal(claimMissing.body.error.code, 'not_found')
+  assert.match(claimMissing.body.error.message, /order id/i)
+
+  const claimCombined = await handler(
+    { ...baseReq, rawBody: JSON.stringify({ order_id: 'order-combined' }) },
+    res,
+    claimRoute,
+  )
+  assert.equal(claimCombined.body.error.code, 'redeem_unavailable')
+  assert.match(claimCombined.body.error.message, /combined quota window/i)
+
+  const claimConflict = await handler(
+    { ...baseReq, rawBody: JSON.stringify({ order_id: 'order-conflict' }) },
+    res,
+    claimRoute,
+  )
+  assert.equal(claimConflict.body.error.code, 'request_conflict')
+  assert.match(claimConflict.body.error.message, /already recorded/i)
 })

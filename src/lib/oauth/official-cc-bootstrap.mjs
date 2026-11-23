@@ -234,7 +234,7 @@ function readHostPid(pidFile) {
   try {
     const n = Number(String(fs.readFileSync(pidFile, 'utf8')).trim())
     if (Number.isFinite(n) && n > 1) return n
-  } catch {}
+  } catch { }
   return null
 }
 
@@ -252,11 +252,11 @@ export function stopHostPidFile(pidFile) {
   if (pid && hostPidAlive(pid)) {
     try {
       process.kill(pid, 'SIGTERM')
-    } catch {}
+    } catch { }
   }
   try {
     fs.unlinkSync(pidFile)
-  } catch {}
+  } catch { }
   return { pid }
 }
 
@@ -323,7 +323,6 @@ export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, ti
       OFFICIAL_CC_MARKER,
       'CLAUDE_CODE_USE_BEDROCK=0',
       'CLAUDE_CODE_USE_VERTEX=0',
-      'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0',
       'DISABLE_TELEMETRY=1',
       'DO_NOT_TRACK=1',
       'ANTHROPIC_BASE_URL=',
@@ -429,7 +428,7 @@ export async function restoreOfficialCcResident(
   let vm = {}
   try {
     vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-  } catch {}
+  } catch { }
   const { uid, gid } = officialCcUidGid(vmId)
   const started = await startResident({
     vmId,
@@ -548,7 +547,7 @@ export function dockerGatewayIp(vmId) {
       .trim()
       .split(/\s+/)[0]
     if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) return ip
-  } catch {}
+  } catch { }
   return '172.17.0.1'
 }
 
@@ -617,7 +616,7 @@ export function summarizeOfficialCcHome(homeDir) {
         doc = candidate
         break
       }
-    } catch {}
+    } catch { }
   }
   return {
     has_oauth_account: !!identity.account_uuid,
@@ -667,7 +666,7 @@ export function wipeOfficialFirstUseHome(homeDir, { uid, gid } = {}) {
     const target = path.join(homeDir, rel)
     try {
       fs.rmSync(target, { recursive: true, force: true })
-    } catch {}
+    } catch { }
   }
   const claudeDir = path.join(homeDir, '.claude')
   fs.mkdirSync(claudeDir, { recursive: true })
@@ -676,20 +675,20 @@ export function wipeOfficialFirstUseHome(homeDir, { uid, gid } = {}) {
     if (name.startsWith('kin-official-')) {
       try {
         fs.rmSync(path.join(claudeDir, name), { recursive: true, force: true })
-      } catch {}
+      } catch { }
     }
   }
   if (uid != null && gid != null) {
     try {
       fs.chownSync(homeDir, uid, gid)
-    } catch {}
+    } catch { }
     try {
       fs.chownSync(claudeDir, uid, gid)
-    } catch {}
+    } catch { }
     for (const name of KEEP_CREDENTIAL_NAMES) {
       try {
         fs.chownSync(path.join(claudeDir, name), uid, gid)
-      } catch {}
+      } catch { }
     }
   }
   return { wiped: true, kept_credentials: fs.existsSync(path.join(claudeDir, 'credentials.json')) }
@@ -777,7 +776,7 @@ function waitExit(child, timeoutMs) {
     const timer = setTimeout(() => {
       try {
         child.kill('SIGTERM')
-      } catch {}
+      } catch { }
       resolve({ timed_out: true, code: null })
     }, timeoutMs)
     child.once('exit', (code) => {
@@ -854,7 +853,6 @@ export function buildOfficialCcDockerArgs({
         'USER_TYPE=external',
         'CLAUDE_CODE_USE_BEDROCK=0',
         'CLAUDE_CODE_USE_VERTEX=0',
-        'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0',
         'DISABLE_TELEMETRY=1',
         'DO_NOT_TRACK=1',
         'ANTHROPIC_BASE_URL=',
@@ -924,16 +922,16 @@ export async function runOfficialCcTurn({
   const finished = await waitExit(child, timeoutMs)
   try {
     fs.closeSync(out)
-  } catch {}
+  } catch { }
   try {
     fs.closeSync(err)
-  } catch {}
+  } catch { }
   try {
     fs.chownSync(outFile, uid, gid)
-  } catch {}
+  } catch { }
   try {
     fs.chownSync(errFile, uid, gid)
-  } catch {}
+  } catch { }
   let parsed = null
   let raw = ''
   const slash = String(prompt || '')
@@ -942,7 +940,7 @@ export async function runOfficialCcTurn({
   try {
     raw = fs.readFileSync(outFile, 'utf8').trim()
     if (raw && !slash) parsed = JSON.parse(raw)
-  } catch {}
+  } catch { }
   const ok = officialCcTurnSucceeded({ code: finished.code, timedOut: finished.timed_out, raw, slash })
   return {
     ok,
@@ -1044,7 +1042,7 @@ export async function runOfficialCcUsage({
     let stats = null
     try {
       stats = parseOfficialCcStats(fs.readFileSync(outFile, 'utf8'))
-    } catch {}
+    } catch { }
     last = { turn: result, stats, attempts: attempt + 1 }
     if (stats?.ok && stats.limits_present) break
   }
@@ -1127,10 +1125,10 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     if (isSlotProxyDesynced(vm, projectRoot)) {
       try {
         await reloadSlotReady(vm, projectRoot, { routing })
-      } catch {}
+      } catch { }
       try {
         vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-      } catch {}
+      } catch { }
     }
     const needForceRefresh = officialCcShouldForceRefresh(homeDir, vm)
     if (needForceRefresh) {
@@ -1258,11 +1256,11 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     const nativeOauth = slotOauth || (await import('../transport/slot-oauth.mjs')).runSlotOauth
     const usageRun = hello.ok
       ? await runOfficialCcUsage({
-          turn,
-          homeDir,
-          retryDelayMs,
-          nativeUsage: nativeOauth ? () => nativeOauth({ vmId, homeDir, vm }, 'usage', { timeoutMs }) : null,
-        })
+        turn,
+        homeDir,
+        retryDelayMs,
+        nativeUsage: nativeOauth ? () => nativeOauth({ vmId, homeDir, vm }, 'usage', { timeoutMs }) : null,
+      })
       : { turn: { ok: false, code: null, timed_out: false, error: null }, stats: null, attempts: 0 }
     const statsTurn = usageRun.turn
     let stats = usageRun.stats
@@ -1304,7 +1302,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     if (typeof onStats === 'function' && stats) {
       try {
         await onStats(stats, { vmId, projectRoot, homeDir })
-      } catch {}
+      } catch { }
     }
 
     const usageOk = statsTurn.ok === true && officialCcQuotaSucceeded(usageRun.stats)
@@ -1339,7 +1337,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     if (typeof collectIdentity === 'function') {
       try {
         await collectIdentity(projectRoot, JSON.parse(fs.readFileSync(vmPath, 'utf8')))
-      } catch {}
+      } catch { }
     }
     writeOfficialCcStatus(homeDir, {
       status: 'running',
@@ -1361,14 +1359,14 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       syncTelemetry === true && hello.ok
         ? await finalizeOfficialCcTelemetry(projectRoot, vmId, { publish: true, routing })
         : {
-            wrote: false,
-            enabled: vm.seed_policy?.telemetry_disabled === false,
-            official: !!readOfficialCcIdentity(homeDir).user_id,
-            published: false,
-            applied: false,
-            seed_aligned: seed?.wrote === true,
-            error: seedError,
-          }
+          wrote: false,
+          enabled: vm.seed_policy?.telemetry_disabled === false,
+          official: !!readOfficialCcIdentity(homeDir).user_id,
+          published: false,
+          applied: false,
+          seed_aligned: seed?.wrote === true,
+          error: seedError,
+        }
 
     const homeAfter = summarizeOfficialCcHome(homeDir)
     const ok = !!(hello.ok && usageOk)
@@ -1417,9 +1415,9 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
           : statsTurn.timed_out
             ? 'official claude /usage timed out'
             : hello.error ||
-              (typeof usageError === 'string' ? usageError : null) ||
-              statsTurn.error ||
-              `official claude hello=${hello.code} usage=${usageOk ? 'ok' : 'fail'}`,
+            (typeof usageError === 'string' ? usageError : null) ||
+            statsTurn.error ||
+            `official claude hello=${hello.code} usage=${usageOk ? 'ok' : 'fail'}`,
     })
     let residentInfo = null
     if (keepResident && hello.ok) {
@@ -1465,7 +1463,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
           resident: false,
           resident_ok: false,
         })
-      } catch {}
+      } catch { }
     }
   }
 }
@@ -1508,7 +1506,7 @@ export function scheduleOfficialCcBootstrap(opts = {}) {
         force: merged.force !== false,
         step: 'queued',
       })
-    } catch {}
+    } catch { }
   }
   const job = Promise.resolve()
     .then(() => runOfficialCcBootstrap(merged))
@@ -1521,7 +1519,7 @@ export function scheduleOfficialCcBootstrap(opts = {}) {
           finished_at: new Date().toISOString(),
           error: String(error.message || error).slice(0, 300),
         })
-      } catch {}
+      } catch { }
       return { ok: false, error: String(error.message || error).slice(0, 300) }
     })
     .finally(() => {
