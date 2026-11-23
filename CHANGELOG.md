@@ -2,11 +2,19 @@
 
 ## Unreleased
 
-## 1.4.187 — 2026-11-24 · 修复 CRAGGemini 加密 memfd 守卫派生与池就绪度误报（0.4.2）；存量 OAuth 自动补全模型与套餐
+## 1.4.188 — 2026-11-24 · 修复 CRAGGemini 加密 memfd 守卫派生与池就绪度误报（0.4.2）；存量 OAuth 自动补全模型与套餐
 
 - 升级锁定 `deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 至 [`payload-2026.11.23-gemini-0.4.2`](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.23-gemini-0.4.2)（`craggemini 0.4.2`，Debian 12 构建，最高符号要求 `GLIBC_2.34`）：修复加密启动器经 `memfd` 执行 `craggemini-core` 后 `current_exe()` 指向已删除内存描述符导致 `--internal-execution-guard` 派生失败（`slot_guard_error`）并阻断所有 `agy` 槽位拉起的问题；`craggemini` 引导器改为直接执行 `--internal-execution-guard` 并透传 `CRAGGEMINI_BOOTSTRAP_BIN`；修正 `pool.ready` 在 `min_warm_slots > 0` 且无活跃/空闲 `agy` 槽位时不再误报 `ready: true`，并在 `/internal/health` 暴露 `last_replenish_error`。
 - 修复存量已授权 OAuth 环境停留在「尚未拉取模型，不能调度」与缺失套餐信息的问题：`scripts/gemini-host.py` 的 `warm` 流程为缺少模型或套餐的已授权 OAuth 环境自动调度后台 `_post_auth_provision`（带冷却限流）；`src/lib/gemini/routes.mjs` 的 `warmGeminiEnvironments` 在 `models_discovered !== true` 时不再提前跳过预热。
 - 部署说明：本版涉及控制面、CRAGGemini 宿主脚本与 `geminiDefaultLinuxAmd64`（`0.4.2`）加密载荷，并在宿主机提供 `/usr/local/bin/agy` 符号链接；Claude/Codex 槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。
+
+## 1.4.187 — 2026-11-24 · 热修：恢复宿主身份以存储值为准，并自动回收 1.4.186 误退役的身份
+
+- 热修 1.4.186 导致在用宿主鉴权失败（`license_crag_host_usage_unverified` / HTTP 403，「暂时无法核对宿主机 CRAG 运行额度」）。1.4.186 将采样硬件视为唯一真值，存储的 `host_id` 一旦与采样值不符即被整套退役；对采样值已漂移的宿主，这相当于把已付费的身份换成授权端从未签发过的新身份，`status` 随即返回 404、拿不到任何权益，槽位准入全部失败。生产日志确认 4 台宿主落入此状态（新 `host_id` 在账本中不存在）。
+- 恢复 `deviceIdentity()` 以存储身份为准、且不做值比较：宿主已针对该身份付费，重新生成的 machine-id、重建的容器或更换的网卡都不应使其变成陌生人。碰撞问题仍在零代价处解决——`candidateRaws` 依唯一性排序，**首次**安装改从 MAC 或 SMBIOS UUID 派生，不再落到云镜像共享的 `machine-id`；已相撞的宿主仍由显式 `rebuildDeviceIdentity({ reason })` 修复，而非让每台宿主的身份各自漂移。
+- 受损宿主自愈：`deviceIdentity()` 在准入时回收 1.4.186 留下的 `*.legacy` 身份文件（`host_id`、`credential`、`device_uuid`、`entitlement.code`、`redeem.json` 等整套移回），无需任何运维操作。无条件回收是安全的，理由唯一——被换上的新身份在授权端没有记录，不可能完成过兑换，这正是故障本身的症状。显式重建改用 `.retired` 后缀并先清除 `.legacy`，以免有意的重建在下次准入时被自愈撤销。
+- 保留 1.4.186 的两个 fallback 源：`dmi`（SMBIOS 每实例 UUID）排在 `machine-id` 之前，`cpu` 垫底且不唯一（同机型读数相同），仅用于让既无合格网卡也无 SMBIOS UUID 的宿主拿到身份而非直接被拒；`rebuildDeviceIdentity()` 复用同一条链，故不再因缺少合格网卡而拒绝重建。
+- 部署说明：本版仅涉及控制面 `src/lib/vm/crag-subscription.mjs`，槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。受影响宿主在升级后的首次槽位准入时自动恢复。
 
 ## 1.4.186 — 2026-11-23 · 宿主身份改以采样设备为唯一真值，修复克隆镜像 host_id 相撞导致的永久 403
 
