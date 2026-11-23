@@ -1,7 +1,11 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { expect, test, vi } from 'vitest'
-import { GeminiEnvironments, type GeminiInventory } from './gemini-environments'
+import {
+  GeminiAuthorizationChallenge,
+  GeminiEnvironments,
+  type GeminiInventory,
+} from './gemini-environments'
 
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ children }: { children: string }) => <a>{children}</a>,
@@ -265,4 +269,26 @@ test('CRAGGemini subscription mode renders subscription status and seat bind/rel
   )
   expect(boundHtml).toContain('已绑定席位 #1')
   expect(boundHtml).toContain('释放 CRAG 席位')
+})
+
+test('Gemini authorization challenge exposes copyable link alongside open action', () => {
+  const url =
+    'https://accounts.google.com/o/oauth2/auth?redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&code_challenge_method=S256&state=s1&code_challenge=c1'
+  const html = renderToStaticMarkup(
+    <GeminiAuthorizationChallenge
+      environmentId='gemini-one'
+      url={url}
+      code=''
+      busy={false}
+      onCodeChange={() => {}}
+      onSubmit={() => {}}
+    />
+  )
+  expect(html).toContain('Google 授权链接')
+  expect(html).toContain('复制链接')
+  expect(html).toContain('打开 Google 授权页')
+  expect(html).toContain('readOnly=""')
+  expect(html).toContain('accounts.google.com/o/oauth2/auth')
+  expect(html).toContain('target="_blank"')
+  expect(html).toContain('rel="noreferrer"')
 })

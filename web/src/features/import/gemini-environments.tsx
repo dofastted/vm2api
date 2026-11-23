@@ -1,7 +1,10 @@
 import { useRef, useState } from 'react'
 import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
+import { Check, Copy, ExternalLink } from 'lucide-react'
+import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
 import {
   geminiAuthorizationLabel,
   geminiInferenceLabel,
@@ -618,6 +621,97 @@ function GeminiDetails({
   )
 }
 
+export function GeminiAuthorizationChallenge({
+  environmentId,
+  url,
+  code,
+  busy,
+  onCodeChange,
+  onSubmit,
+}: {
+  environmentId: string
+  url: string
+  code: string
+  busy: boolean
+  onCodeChange: (value: string) => void
+  onSubmit: () => void
+}) {
+  const [copyState, setCopyState] = useState<'copied' | 'failed' | null>(null)
+
+  const handleCopy = async () => {
+    // 纯 HTTP 面板没有 navigator.clipboard（secure-context only），
+    // copyText 会回落到 execCommand；失败时给出可操作指引。
+    if (await copyText(url)) {
+      setCopyState('copied')
+      toast.success('已复制授权链接')
+    } else {
+      setCopyState('failed')
+      toast.error('复制失败，请选中输入框中的链接手动复制')
+    }
+  }
+
+  return (
+    <form
+      className='space-y-2'
+      onSubmit={(event) => {
+        event.preventDefault()
+        onSubmit()
+      }}
+    >
+      <Label htmlFor={`gemini-auth-url-${environmentId}`}>
+        Google 授权链接
+      </Label>
+      <Input
+        id={`gemini-auth-url-${environmentId}`}
+        readOnly
+        value={url}
+        className='font-mono text-xs'
+        onFocus={(event) => event.currentTarget.select()}
+      />
+      <div className='flex flex-wrap items-center gap-2'>
+        <Button type='button' size='sm' variant='outline' onClick={handleCopy}>
+          {copyState === 'copied' ? (
+            <Check className='size-4' aria-hidden='true' />
+          ) : (
+            <Copy className='size-4' aria-hidden='true' />
+          )}
+          {copyState === 'copied' ? '已复制链接' : '复制链接'}
+        </Button>
+        <Button asChild size='sm' variant='outline'>
+          <a href={url} target='_blank' rel='noreferrer'>
+            <ExternalLink className='size-4' aria-hidden='true' />
+            打开 Google 授权页
+          </a>
+        </Button>
+      </div>
+      {copyState === 'copied' ? (
+        <p role='status' className='text-xs text-muted-foreground'>
+          已复制授权链接，请在使用此环境绑定代理的浏览器中打开。
+        </p>
+      ) : copyState === 'failed' ? (
+        <p role='alert' className='text-xs text-destructive'>
+          复制失败，请选中上方输入框中的链接手动复制。
+        </p>
+      ) : null}
+      <Label htmlFor={`gemini-code-${environmentId}`}>
+        浏览器显示的授权码或完整回调链接
+      </Label>
+      <Input
+        id={`gemini-code-${environmentId}`}
+        type='password'
+        autoComplete='off'
+        required
+        maxLength={3500}
+        value={code}
+        onChange={(event) => onCodeChange(event.target.value)}
+      />
+      <Button type='submit' disabled={busy || !code.trim()}>
+        提交授权码
+      </Button>
+    </form>
+  )
+}
+
 export function GeminiEnvironments({
   environmentId,
 }: {
@@ -892,37 +986,17 @@ export function GeminiEnvironments({
       {payloadReady &&
       challenge?.id === environment.id &&
       environment.auth_state === 'authorizing' ? (
-        <form
-          className='space-y-2'
-          onSubmit={(event) => {
-            event.preventDefault()
+        <GeminiAuthorizationChallenge
+          key={challenge.attempt_id}
+          environmentId={environment.id}
+          url={challenge.url}
+          code={code}
+          busy={busy}
+          onCodeChange={setCode}
+          onSubmit={() =>
             operation.mutate({ type: 'complete', id: environment.id })
-          }}
-        >
-          <a
-            className='block text-sm text-primary underline'
-            href={challenge.url}
-            target='_blank'
-            rel='noreferrer'
-          >
-            打开 Google 授权页
-          </a>
-          <Label htmlFor={`gemini-code-${environment.id}`}>
-            浏览器显示的授权码或完整回调链接
-          </Label>
-          <Input
-            id={`gemini-code-${environment.id}`}
-            type='password'
-            autoComplete='off'
-            required
-            maxLength={3500}
-            value={code}
-            onChange={(event) => setCode(event.target.value)}
-          />
-          <Button type='submit' disabled={busy || !code.trim()}>
-            提交授权码
-          </Button>
-        </form>
+          }
+        />
       ) : null}
     </div>
   ) : null

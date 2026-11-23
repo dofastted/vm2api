@@ -332,6 +332,117 @@ assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status"
 assert native._map_worker_error(504, {"code": "first_byte_timeout"}).code == "gemini_inference_timeout"
 assert native._map_worker_error(503, {"code": "queue_full"}).code == "gemini_operation_busy"
 
+# Pool-mode readiness accepts ready=True + pool.enabled=True + pool.ready=True with native_pid=None
+assert native._worker_ready({"ready": True, "native_pid": 12}) is True
+assert native._worker_ready({"ready": True, "native_pid": None, "pool": {"enabled": True, "ready": True}}) is True
+assert native._worker_ready({"ready": True, "native_pid": None, "pool": {"enabled": True, "ready": False}}) is False
+assert native._worker_ready({"ready": True, "native_pid": None}) is False
+
+# Host multi-concurrency (acc1=10 slots), concurrency-set, selective cancel, and strict proxy_sha256 calibration
+with tempfile.TemporaryDirectory(prefix="gemini-multiproc-host-") as mp_tmp:
+    mp_dir = Path(mp_tmp)
+    (mp_dir / "maintenance.lock").touch(mode=0o600)
+    mp_env_id = "gemini-" + "a" * 24
+    mp_proxy = "socks5h://u1:p1@192.0.2.55:1080"
+    mp_sha = host_mod.hashlib.sha256(mp_proxy.encode()).hexdigest()
+    mp_host = host_mod.Host.__new__(host_mod.Host)
+    mp_host.directory = mp_dir
+    mp_host.state_file = mp_dir / "environments.json"
+    mp_host.lock = threading.RLock()
+    mp_host.pending = {}
+    mp_host.terminals = {}
+    mp_host.runs = {}
+    mp_host.native_sessions = {}
+    mp_host._session_locks = {}
+    mp_host.active_infers = {}
+    mp_host.last_inference = {}
+    mp_host.payload_version = "0.3.0"
+    mp_host.payload_mode = "legacy_release"
+    mp_host.uid_base = 10000
+    mp_host.environments = {
+        mp_env_id: {
+            "id": mp_env_id,
+            "name": "acc1",
+            "proxy_id": "px-1",
+            "slot": 0,
+            "max_concurrency": 1,
+            "auth_method": "oauth",
+            "auth_state": "authorized",
+            "profile": "p" * 32,
+            "call_models": ["gemini-test"],
+            "created_at": "2030-01-01T00:00:00+00:00",
+            "updated_at": "2030-01-01T00:00:00+00:00",
+        }
+    }
+    mp_host.ensure_payload = lambda **_kw: None
+    mp_host.oauth_runtime_issue = lambda: None
+    orig_secrets = host_mod.profile_secrets
+    host_mod.profile_secrets = lambda *_a, **_kw: (("tok",), b"tok")
+    try:
+        # Scale acc1 to concurrency=10 via concurrency-set
+        view = mp_host._request("concurrency-set", {"id": mp_env_id, "max_concurrency": 10})
+        assert view["max_concurrency"] == 10 and view["active_slots"] == 0, view
+
+        # Wrong proxy_sha256 MUST fail closed with 409 gemini_proxy_calibration_mismatch
+        try:
+            mp_host._begin_infer(
+                {
+                    "id": mp_env_id,
+                    "proxy_id": "px-1",
+                    "proxy_url": mp_proxy,
+                    "proxy_sha256": "0" * 64,
+                    "model": "gemini-test",
+                    "request_id": "req-bad-sha",
+                    "body": {"model": "gemini-test", "contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+                }
+            )
+        except host_mod.Failure as err:
+            assert (err.status, err.code) == (409, "gemini_proxy_calibration_mismatch"), (err.status, err.code)
+        else:
+            raise AssertionError("expected proxy calibration mismatch failure")
+
+        # Admit 10 concurrent infers simultaneously on acc1
+        for idx in range(10):
+            ctx = mp_host._begin_infer(
+                {
+                    "id": mp_env_id,
+                    "proxy_id": "px-1",
+                    "proxy_url": mp_proxy,
+                    "proxy_sha256": mp_sha,
+                    "model": "gemini-test",
+                    "request_id": f"req-slot-{idx}",
+                    "body": {"model": "gemini-test", "contents": [{"role": "user", "parts": [{"text": f"hi {idx}"}]}]},
+                }
+            )
+            assert ctx["request_id"] == f"req-slot-{idx}"
+        assert mp_host.view(mp_host.environments[mp_env_id])["active_slots"] == 10
+
+        # 11th concurrent infer on acc1 MUST fail with 409 gemini_operation_busy
+        try:
+            mp_host._begin_infer(
+                {
+                    "id": mp_env_id,
+                    "proxy_id": "px-1",
+                    "proxy_url": mp_proxy,
+                    "proxy_sha256": mp_sha,
+                    "model": "gemini-test",
+                    "request_id": "req-slot-overflow",
+                    "body": {"model": "gemini-test", "contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+                }
+            )
+        except host_mod.Failure as err:
+            assert (err.status, err.code) == (409, "gemini_operation_busy"), (err.status, err.code)
+        else:
+            raise AssertionError("expected 11th concurrent infer to fail with gemini_operation_busy")
+
+        # Selective cancel cancels ONLY req-slot-3 without cancelling sibling slots
+        assert mp_host.cancel_infer(mp_env_id, "req-slot-3") is True
+        assert mp_host.active_infers[mp_env_id]["req-slot-3"]["cancel_event"].is_set() is True
+        assert mp_host.active_infers[mp_env_id]["req-slot-0"]["cancel_event"].is_set() is False
+        assert mp_host.cancel_infer(mp_env_id, "req-missing") is False
+    finally:
+        host_mod.profile_secrets = orig_secrets
+
 print(
-    "Native worker fixture: health, streaming, cancel, error mapping, SSE completion and usage PASS"
+    "Native worker fixture: health, streaming, cancel, error mapping, pool concurrency, SSE completion and usage PASS"
 )
