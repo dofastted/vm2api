@@ -199,7 +199,11 @@ import {
   SESSION_SLOT_MIN,
   validateInferenceRoutingPatch,
 } from '../vm/slot-engine.mjs'
-import { telemetryDefaultEnabled, validateTelemetryRoutingPatch } from '../vm/native-telemetry.mjs'
+import {
+  telemetryDefaultEnabled,
+  telemetryDisableNonessentialTraffic,
+  validateTelemetryRoutingPatch,
+} from '../vm/native-telemetry.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import * as panel from './panel-api.mjs'
 import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
@@ -5098,7 +5102,9 @@ export function createPanelHandler(ctx) {
         const payload = {
           vm_id: id,
           seed_policy,
-          ...seedTelemetryContract(seed_policy),
+          ...seedTelemetryContract(seed_policy, {
+            disableNonessentialTraffic: telemetryDisableNonessentialTraffic(ctx.routingConfig),
+          }),
           ...observed,
         }
         if (debug) {
@@ -5236,6 +5242,7 @@ export function createPanelHandler(ctx) {
                   existingSettings:
                     existing.files['settings.json'] === null ? {} : JSON.parse(existing.files['settings.json']),
                   replaceEnv: Object.hasOwn(body, 'extra_env') || Object.hasOwn(body, 'settings_json_override'),
+                  routing: ctx.routingConfig,
                 })
                 outcome.wrote = outcome.seed.wrote === true
                 const result = await host.syncSeed(fresh, path.join(cfg.paths.project, 'vms', id))
@@ -5262,7 +5269,9 @@ export function createPanelHandler(ctx) {
           const data = {
             vm_id: id,
             seed_policy: next,
-            ...seedTelemetryContract(next),
+            ...seedTelemetryContract(next, {
+              disableNonessentialTraffic: telemetryDisableNonessentialTraffic(ctx.routingConfig),
+            }),
             saved: true,
             published: service.published === true,
             applied: service.applied === true,

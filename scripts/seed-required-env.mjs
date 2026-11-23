@@ -55,8 +55,8 @@ for (const id of ids) {
     const keysPresent = killKeys.filter((key) => Object.prototype.hasOwnProperty.call(env, key))
     const nonessential = env[NONESSENTIAL_TRAFFIC_ENV_KEY]
     const ok = enable
-      ? keysPresent.length === 0 && nonessential === '1'
-      : keysPresent.includes('DISABLE_TELEMETRY') && nonessential === '0'
+      ? keysPresent.length === 0 && nonessential === undefined
+      : keysPresent.includes('DISABLE_TELEMETRY') && nonessential === undefined
     if (!ok) {
       failed += 1
       missing.push(id)
