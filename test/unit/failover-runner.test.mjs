@@ -7,6 +7,7 @@ import path from 'node:path'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { resolveOutboundSessionId } from '../../src/lib/identity/identity-rewrite.mjs'
 import { prepareCragPrintBody } from '../../src/lib/protocol/crag-print-prompt.mjs'
+import { dispatchCallInference } from '../../src/lib/transport/kernel-router.mjs'
 
 class Scheduler {
   constructor(candidates) {
@@ -2680,6 +2681,46 @@ test('keep_session_home with allowQueue:false: a home kernel with no free slot a
   assert.equal(result.body.error.code, 'pool_overloaded')
   assert.equal(result.body.error.details.reason, 'session_home_slot_busy')
   assert.equal(result.accountId, 'account-1')
+})
+
+test('keep_session_home with allowQueue:false: pre-hop kernel slot_busy stamps zero attemptCount and zero hops', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = process.execPath
+  const home = { ...candidate(1), vmId: 'vm-home-01', exec: { vmId: 'vm-home-01', vm: { id: 'vm-home-01' } } }
+  const scheduler = new Scheduler([home, candidate(2)])
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: pinnedStickyRouter('account-1', 'vm-home-01'),
+    config: { same_account_retry_delay_ms: 0, home_slot_busy_retry_ms: 60000, keep_session_home: true },
+  })
+  try {
+    const result = await runner.run({
+      requestId: 'req-home-prehop-slot-busy-zero-attempts',
+      canonicalBody: { model: 'claude-sonnet-test' },
+      model: 'claude-sonnet-test',
+      stickyKey: 'sess:home',
+      allowQueue: false,
+      callAttempt: ({ candidate: selected, body }) =>
+        dispatchCallInference({
+          exec: selected.exec,
+          body,
+          routing: { inference: { engine: 'rust', health_ttl_ms: 0 } },
+          ensureRust: async () => ({ ok: false, reason: 'slot_busy', error: 'rust kernel has no free slot' }),
+        }),
+    })
+    assert.equal(scheduler.selectCalls, 1)
+    assert.equal(result.ok, false)
+    assert.equal(result.status, 529)
+    assert.equal(result.body.error.code, 'pool_overloaded')
+    assert.equal(result.body.error.details.reason, 'session_home_slot_busy')
+    assert.equal(result.body.error.details.attempt_count, 0)
+    assert.equal(result.attemptCount, 0)
+    assert.equal(result.accountId, 'account-1')
+    assert.equal(result.vmId, 'vm-home-01')
+  } finally {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  }
 })
 
 test('keep_pin_on_model_gate: a borrowed account never takes the session, family or device pin', async () => {

@@ -5,13 +5,27 @@ import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { CORS_ALLOW_HEADERS } from '../../src/lib/http/cors.mjs'
 
 test('x-kin-queue: off and its synonyms turn the seat queue off; anything else keeps it', () => {
-  for (const value of ['off', 'OFF', ' off ', 'none', 'no', 'false', '0', 'off, off', ['off']]) {
+  for (const value of [
+    'off',
+    'OFF',
+    ' off ',
+    'none',
+    'no',
+    'false',
+    '0',
+    'off, off',
+    'on, off',
+    'off, on',
+    ['off'],
+    ['on', 'off'],
+    ['off', 'on'],
+  ]) {
     assert.equal(queueAllowedByHeaders({ [QUEUE_HINT_HEADER]: value }), false, `value ${JSON.stringify(value)}`)
   }
   assert.equal(queueAllowedByHeaders({ 'X-Kin-Queue': 'off' }), false)
   assert.equal(queueAllowedByHeaders(new Headers({ 'X-Kin-Queue': 'off' })), false)
   assert.equal(queueAllowedByHeaders(new Headers({ 'X-Kin-Queue': 'on' })), true)
-  for (const value of [undefined, null, '', 'on', 'wait', '1', 'true']) {
+  for (const value of [undefined, null, '', 'on', 'on, wait', 'wait', '1', 'true']) {
     assert.equal(queueAllowedByHeaders({ [QUEUE_HINT_HEADER]: value }), true, `value ${JSON.stringify(value)}`)
   }
   assert.equal(queueAllowedByHeaders({}), true)

@@ -28,14 +28,13 @@ function readQueueHeader(headers) {
   return undefined
 }
 
-/** True unless the caller sent `x-kin-queue: off` (also none / no / false / 0). */
+/** True unless any `x-kin-queue` token disables queueing (`off` / `none` / `no` / `false` / `0`). */
 export function queueAllowedByHeaders(headers = {}) {
   const raw = readQueueHeader(headers)
   const items = Array.isArray(raw) ? raw : raw == null ? [] : String(raw).split(',')
   for (const item of items) {
     if (item == null) continue
-    const token = String(item).trim().toLowerCase()
-    if (token) return !NO_QUEUE_VALUES.has(token)
+    if (NO_QUEUE_VALUES.has(String(item).trim().toLowerCase())) return false
   }
   return true
 }
