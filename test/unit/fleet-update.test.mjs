@@ -190,6 +190,8 @@ test('CRAG telemetry publishes settings, uses authenticated apply, and restores 
   let active = 0
   let bootEnabled = false
   let nextError = null
+  let nextReason = null
+  let nextMessage = null
   const server = http.createServer(async (req, res) => {
     res.setHeader('content-type', 'application/json')
     if (req.headers['x-internal-token'] !== 'fixture-internal-token') {
@@ -218,7 +220,15 @@ test('CRAG telemetry publishes settings, uses authenticated apply, and restores 
     const { enabled } = JSON.parse(value)
     events.push(['apply', enabled])
     if (nextError || enabled !== bootEnabled) {
-      res.writeHead(409).end(JSON.stringify({ error: { type: nextError || 'telemetry_restart_required' } }))
+      res.writeHead(409).end(
+        JSON.stringify({
+          error: {
+            type: nextError || 'telemetry_restart_required',
+            ...(nextReason ? { reason: nextReason } : {}),
+            ...(nextMessage ? { message: nextMessage } : {}),
+          },
+        }),
+      )
       return
     }
     res.end(
@@ -329,9 +339,61 @@ test('CRAG telemetry publishes settings, uses authenticated apply, and restores 
   assert.deepEqual(events.splice(0), [['apply', false]])
 
   nextError = 'telemetry_native_settings_blocked'
-  assert.equal((await apply()).code, nextError)
+  nextReason = 'guest_source_invalid'
+  nextMessage = 'Native guest settings, telemetry allowlist or guest source prevent enabling telemetry'
+  const blocked = await apply()
+  assert.equal(blocked.code, nextError)
+  assert.equal(blocked.reason, 'guest_source_invalid')
+  assert.equal(blocked.upstream_message, nextMessage)
+  assert.match(blocked.error, /Claude Code 槽内设置或 OS 特征阻止开启遥测/)
+  assert.match(blocked.error, /guest_source_invalid/)
+  assert.match(blocked.error, /guest source prevent enabling telemetry/)
   assert.deepEqual(events.splice(0), [['apply', false]])
+
+  // Legacy cluster Docker container missing /etc/kin-computer mount: needsRecreate=true
+  // drains under maintenance, recreates the container (updating vm.runtime), and re-applies.
+  const recreateLifecycle = {
+    watchdog: {
+      hold: () => events.push(['hold']),
+      release: () => events.push(['release']),
+    },
+    poolScheduler: { vmInflight: new Map(), healthCache: new Map() },
+  }
+  const recreateResult = await applyNativeTelemetry({
+    projectRoot: root,
+    vm,
+    lifecycle: recreateLifecycle,
+    ops: {
+      retire: async () => ({ ok: true, running: true, needsRecreate: true }),
+      recreate: async () => {
+        events.push(['recreate'])
+        const latest = read(vmPath)
+        latest.runtime = { ...latest.runtime, container_id: 'new-cid-with-mounts' }
+        fs.writeFileSync(vmPath, JSON.stringify(latest))
+        nextError = null
+        nextReason = null
+        nextMessage = null
+        bootEnabled =
+          read(path.join(path.dirname(settingsPath), 'kin-seed.json')).seed_policy.telemetry_disabled === false
+        return { ok: true, action: 'reloaded' }
+      },
+    },
+  })
+  assert.equal(recreateResult.ok, true, recreateResult.error)
+  assert.equal(recreateResult.applied, true)
+  assert.equal(recreateResult.restarted, true)
+  assert.equal(read(vmPath).runtime.container_id, 'new-cid-with-mounts')
+  assert.deepEqual(events.splice(0), [
+    ['apply', false],
+    ['hold'],
+    ['apply', false],
+    ['recreate'],
+    ['apply', false],
+    ['release'],
+  ])
   nextError = null
+  nextReason = null
+  nextMessage = null
   capability = false
   assert.equal((await apply()).code, 'crag_telemetry_apply_unavailable')
   assert.equal((await probe()).telemetry.enabled, null)

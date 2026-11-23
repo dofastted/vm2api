@@ -107,6 +107,21 @@ const CRAG_TELEMETRY_ERRORS = {
   telemetry_restart_required: '槽内设置已发布；需排空并重启 CRAG 内核',
 }
 
+function cleanUpstreamTelemetryField(value, maxLen) {
+  if (typeof value !== 'string') return ''
+  return value.replace(/\s+/g, ' ').trim().slice(0, maxLen)
+}
+
+function formatTelemetryErrorMessage(summary, reason, upstreamMessage) {
+  let detail = ''
+  if (reason && upstreamMessage) {
+    detail = upstreamMessage.includes(reason) ? upstreamMessage : `${reason}: ${upstreamMessage}`
+  } else {
+    detail = reason || upstreamMessage
+  }
+  return detail ? `${summary} (${detail})` : summary
+}
+
 export async function verifyCragTelemetryPolicy(exec, enabled, timeoutMs) {
   const { status, body } = await callWorkerPost(
     withRustKernelExec(exec),
@@ -125,10 +140,34 @@ export async function verifyCragTelemetryPolicy(exec, enabled, timeoutMs) {
     return { ok: true, applied: true, action: 'applied', enabled, scope: body.scope, upload_confirmed: false }
   }
   const code = body?.error?.type
-  if (status === 409 && Object.hasOwn(CRAG_TELEMETRY_ERRORS, code)) {
-    return { ok: false, code, error: CRAG_TELEMETRY_ERRORS[code] }
+  const reason = cleanUpstreamTelemetryField(body?.error?.reason, 120)
+  const upstreamMessage = cleanUpstreamTelemetryField(body?.error?.message, 300)
+  const upstreamMeta = {
+    ...(reason ? { reason } : {}),
+    ...(upstreamMessage ? { upstream_message: upstreamMessage } : {}),
   }
-  return { ok: false, code: 'telemetry_observation_unavailable', error: 'CRAG 未确认原生遥测启动策略' }
+  if (status === 409 && Object.hasOwn(CRAG_TELEMETRY_ERRORS, code)) {
+    return {
+      ok: false,
+      code,
+      error: formatTelemetryErrorMessage(CRAG_TELEMETRY_ERRORS[code], reason, upstreamMessage),
+      ...upstreamMeta,
+    }
+  }
+  if (status === 409 && typeof code === 'string' && /^telemetry_[a-z0-9_]{1,64}$/.test(code)) {
+    return {
+      ok: false,
+      code,
+      error: formatTelemetryErrorMessage('CRAG 拒绝应用遥测策略', reason, upstreamMessage),
+      ...upstreamMeta,
+    }
+  }
+  return {
+    ok: false,
+    code: 'telemetry_observation_unavailable',
+    error: formatTelemetryErrorMessage('CRAG 未确认原生遥测启动策略', reason, upstreamMessage),
+    ...upstreamMeta,
+  }
 }
 
 export function withCragCredential(exec, health) {

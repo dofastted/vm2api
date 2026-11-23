@@ -162,6 +162,48 @@ export function clusterCragContainerReady(info) {
   return opts.some((opt) => String(opt).startsWith('seccomp=')) && opts.includes('apparmor=unconfined')
 }
 
+const FINGERPRINT_MOUNT_SPECS = Object.freeze([
+  ['', '/var/lib/kin-persona'],
+  ['/system/etc/hostname', '/etc/hostname'],
+  ['/system/etc/kin-computer', '/etc/kin-computer'],
+  ['/system/dmi/id', '/etc/kin-dmi'],
+  ['/system/hardware', '/etc/kin-hardware'],
+])
+
+export function clusterFingerprintBinds(remoteDir) {
+  return FINGERPRINT_MOUNT_SPECS.map(([suffix, dest]) => `${remoteDir}/fingerprint${suffix}:${dest}:ro`)
+}
+
+export function hasClusterFingerprintBinds(container, remoteDir = '') {
+  if (remoteDir) {
+    const binds = container?.HostConfig?.Binds || []
+    if (clusterFingerprintBinds(remoteDir).every((bind) => binds.includes(bind))) return true
+  }
+  if (Array.isArray(container?.Mounts) && container.Mounts.length > 0) {
+    return FINGERPRINT_MOUNT_SPECS.every(([suffix, dest]) =>
+      container.Mounts.some(
+        (mount) =>
+          mount.Destination === dest &&
+          mount.RW === false &&
+          (remoteDir
+            ? mount.Source === `${remoteDir}/fingerprint${suffix}`
+            : String(mount.Source || '').endsWith(`/fingerprint${suffix}`)),
+      ),
+    )
+  }
+  const binds = container?.HostConfig?.Binds || []
+  return FINGERPRINT_MOUNT_SPECS.every(([suffix, dest]) =>
+    binds.some((bind) => {
+      const parts = String(bind || '').split(':')
+      return (
+        parts[1] === dest &&
+        parts[2] === 'ro' &&
+        (remoteDir ? parts[0] === `${remoteDir}/fingerprint${suffix}` : parts[0].endsWith(`/fingerprint${suffix}`))
+      )
+    }),
+  )
+}
+
 function failure(err, fallbackCode = 'remote_slot_failed') {
   return { ok: false, code: err?.code || fallbackCode, error: String(err?.message || err) }
 }
@@ -1268,6 +1310,7 @@ export function slotContainerBody(
         `${remoteDir}/machine-id:/etc/machine-id:ro`,
         `${remoteDir}/machine-id:/var/lib/dbus/machine-id:ro`,
         `${remoteDir}/slot-bin:${LIVE_BIN}:ro`,
+        ...clusterFingerprintBinds(remoteDir),
         ...(subscription ? clusterSubscriptionBinds(remoteDir) : []),
       ],
       NetworkMode: network,
@@ -1712,6 +1755,7 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
       runtimeLabelOf(existing) === runtimeKind(vm) &&
       codexRoleMatches(existing, vm) &&
       clusterDockerCommandReady(vm, existing, routing) &&
+      (kvm || hasClusterFingerprintBinds(existing, remoteDir)) &&
       (!subscription || hasClusterSubscriptionBinds(existing, remoteDir)) &&
       // Running stays true during Docker restart-policy backoff. Recreate the
       // loop just like the local runtime; otherwise watchdog revival is a no-op.
@@ -1820,6 +1864,7 @@ async function reloadRemoteSlotAdmitted(vm, projectRoot, { routing }) {
       runtimeLabelOf(existing) !== runtimeKind(vm) ||
       !codexRoleMatches(existing, vm) ||
       !clusterDockerCommandReady(vm, existing, routing) ||
+      (!isKvmRuntime(vm) && !hasClusterFingerprintBinds(existing, remoteDir)) ||
       (subscription && !hasClusterSubscriptionBinds(existing, remoteDir))
     ) {
       return startRemoteSlotAdmitted(vm, projectRoot, { recreate: !!existing, routing })

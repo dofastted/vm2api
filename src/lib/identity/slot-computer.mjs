@@ -79,6 +79,42 @@ function containerComputer(dir) {
   return { hostname, guest_machine_id, mac, dir, kvm: false }
 }
 
+function ensureContainerComputerSourceFile(dir) {
+  const compFile = path.join(dir, 'system', 'etc', 'kin-computer')
+  try {
+    const stat = fs.lstatSync(compFile)
+    if (stat.isFile() && stat.size > 0) return
+    fs.rmSync(compFile, { recursive: true, force: true })
+  } catch {}
+  fs.mkdirSync(path.dirname(compFile), { recursive: true, mode: 0o755 })
+  fs.writeFileSync(compFile, 'source=linux-pc\n', { encoding: 'utf8', mode: 0o644 })
+}
+
+/**
+ * Normalize fingerprint directories to 0755 and regular files to 0644 so a
+ * restrictive host umask (077) never leaves /etc/kin-computer or DMI files
+ * unreadable (0600 root-only) for non-root container UID 10000+n.
+ */
+export function normalizeFingerprintModes(dir) {
+  let stat
+  try {
+    stat = fs.lstatSync(dir)
+  } catch {
+    return
+  }
+  if (stat.isSymbolicLink()) return
+  if (stat.isDirectory()) {
+    if ((stat.mode & 0o777) !== 0o755) fs.chmodSync(dir, 0o755)
+    for (const entry of fs.readdirSync(dir)) {
+      normalizeFingerprintModes(path.join(dir, entry))
+    }
+    return
+  }
+  if (stat.isFile() && (stat.mode & 0o777) !== 0o644) {
+    fs.chmodSync(dir, 0o644)
+  }
+}
+
 function runChecked(argv, timeout) {
   try {
     execFileSync(argv[0], argv.slice(1), {
@@ -101,11 +137,18 @@ export function ensureSlotComputer(projectRoot, vm) {
   const kvm = isKvmRuntime(vm)
   const dir = fingerprintDir(projectRoot, vm.id)
   const ready = kvm ? linuxComputer(dir) : containerComputer(dir)
-  if (ready) return { ...ready, created: false }
+  if (ready) {
+    if (!kvm) ensureContainerComputerSourceFile(dir)
+    normalizeFingerprintModes(dir)
+    return { ...ready, created: false }
+  }
   if (kvm && fs.existsSync(dir)) {
     repairKvmFingerprintUuid(dir)
     const repaired = linuxComputer(dir)
-    if (repaired) return { ...repaired, created: false }
+    if (repaired) {
+      normalizeFingerprintModes(dir)
+      return { ...repaired, created: false }
+    }
   }
   const bin = computerBin()
   if (!fs.existsSync(bin)) {
@@ -134,6 +177,8 @@ export function ensureSlotComputer(projectRoot, vm) {
     incomplete.code = 'computer_create_failed'
     throw incomplete
   }
+  if (!kvm) ensureContainerComputerSourceFile(dir)
+  normalizeFingerprintModes(dir)
   return { ...written, created: true }
 }
 

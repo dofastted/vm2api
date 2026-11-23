@@ -1687,6 +1687,46 @@ test('writeKernelConfig adds CRAG v2 fields for a local slot and a cluster Docke
     assert.equal(remote.claude_bin, '/opt/kin-live/crag-v2/claude-code-2.1.321/claude')
     assert.equal(remote.license_dir, '/run/kin/crag-license')
     assert.equal(remote.asset_dir, '/run/kin/crag-native-assets')
+    const remoteEnabled = JSON.parse(
+      fs.readFileSync(
+        writeKernelConfig(
+          root,
+          {
+            id: 'vm-09',
+            dataplane: 'crag',
+            crag_kernel_version: 'v2',
+            kernel: 'debian-12',
+            node_id: 'node-1',
+            seed_policy: { telemetry_disabled: false },
+          },
+          { token: 'tok', publish: false },
+        ).configPath,
+        'utf8',
+      ),
+    )
+    assert.equal(remoteEnabled.telemetry.enabled, true)
+    assert.equal(remoteEnabled.telemetry.dmi_dir, '/etc/kin-dmi')
+    assert.equal(remoteEnabled.telemetry.identity.enabled, true)
+    assert.equal(remoteEnabled.telemetry.identity.linux_distro_id, 'debian')
+    const remoteKvmEnabled = JSON.parse(
+      fs.readFileSync(
+        writeKernelConfig(
+          root,
+          {
+            id: 'vm-09-kvm',
+            dataplane: 'crag',
+            crag_kernel_version: 'v2',
+            kernel: 'debian-12',
+            node_id: 'node-1',
+            runtime: { type: 'kvm' },
+            seed_policy: { telemetry_disabled: false },
+          },
+          { token: 'tok', publish: false },
+        ).configPath,
+        'utf8',
+      ),
+    )
+    assert.equal(remoteKvmEnabled.telemetry.dmi_dir, undefined)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

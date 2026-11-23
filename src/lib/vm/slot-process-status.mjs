@@ -11,6 +11,8 @@ import { slotExec } from './slot-runtime.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 import { slotHost } from './slot-host.mjs'
 import { isCodexVm } from './vm-kind.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
+import { hasClusterFingerprintBinds } from '../cluster/remote-slot.mjs'
 import { runSlotProcess } from '../transport/slot-oauth.mjs'
 import { slotExecArgv, slotExecContainer } from './slot-exec.mjs'
 import { inspectContainerOrNull } from '../cluster/docker-remote.mjs'
@@ -52,18 +54,22 @@ export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect 
   if (host.native) return { ok: false, code: 'telemetry_unsupported' }
   let runtime
   try {
-    runtime = await inspect(host.dockerApi(), slotExecContainer(vm))
+    const docker = inspect === inspectContainerOrNull ? host.dockerApi() : null
+    runtime = await inspect(docker, slotExecContainer(vm))
   } catch {
     return { ok: false, code: 'telemetry_runtime_unavailable' }
   }
   if (!runtime?.State?.Running) return { ok: true, running: false, state: 'stopped' }
+  const needsRecreate = Boolean(vm.node_id) && !isKvmRuntime(vm) && !hasClusterFingerprintBinds(runtime)
+  const recreateMeta = needsRecreate ? { needsRecreate: true } : {}
+  const env = run === runSlotProcess ? host.dockerEnv() : undefined
   const attempt = () =>
     run(slotExecArgv(vm, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), {
       timeoutMs: 5000,
-      env: host.dockerEnv(),
+      env,
     })
   const result = await attempt()
-  if (result.code === 0 && !result.timed_out) return { ok: true, running: true }
+  if (result.code === 0 && !result.timed_out) return { ok: true, running: true, ...recreateMeta }
   // Only a numeric exit after the marker means the script really ran and the
   // sender survived; anything else (docker CLI transport error, null code,
   // timeout) is the slot exec never completing — node-link flap, not a dead
@@ -73,7 +79,7 @@ export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect 
     return { ok: false, code: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
   }
   const retry = await attempt()
-  if (retry.code === 0 && !retry.timed_out) return { ok: true, running: true }
+  if (retry.code === 0 && !retry.timed_out) return { ok: true, running: true, ...recreateMeta }
   if (retireScriptVerdict(retry)) {
     return { ok: false, code: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
   }
@@ -82,6 +88,7 @@ export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect 
     ok: true,
     running: true,
     unverified: true,
+    ...recreateMeta,
     code: 'legacy_telemetry_unverified',
     error: 'Legacy telemetry retire unverified (slot exec unavailable)',
   }
@@ -104,9 +111,16 @@ export async function readSlotProcessStatus({
   }
   let crag = resolveKernelDataplane(vm, routing) === 'crag'
   const unconfirmed = '未能核验 CRAG 启动策略'
-  const cragStatus = ({ enabled = null, error = null } = {}) => ({
+  const cragStatus = ({ enabled = null, error = null, reason = null, upstream_message = null } = {}) => ({
     ...unknown,
-    telemetry: { state: 'launch_policy', enabled, error, upload_confirmed: false },
+    telemetry: {
+      state: 'launch_policy',
+      enabled,
+      error,
+      upload_confirmed: false,
+      ...(reason ? { reason } : {}),
+      ...(upstream_message ? { upstream_message } : {}),
+    },
   })
   try {
     const exec = slotExec(projectRoot, vm)

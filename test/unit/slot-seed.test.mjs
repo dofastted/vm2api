@@ -279,3 +279,67 @@ test('writeSlotSeedFiles writes CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 only 
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('initializeSlotSeedFiles resolves CRAG native telemetry and KIN_ROUTING_FILE via SSOT', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-crag-reinstall-'))
+  const routingFile = path.join(root, 'custom-routing.json')
+  const prevRoutingFile = process.env.KIN_ROUTING_FILE
+  t.after(() => {
+    if (prevRoutingFile === undefined) delete process.env.KIN_ROUTING_FILE
+    else process.env.KIN_ROUTING_FILE = prevRoutingFile
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  process.env.KIN_ROUTING_FILE = routingFile
+  fs.writeFileSync(routingFile, JSON.stringify({ inference: { dataplane: 'crag' }, telemetry: {} }))
+
+  const host = {
+    native: false,
+    async seedFiles() {
+      return {
+        files: {
+          'settings.json': JSON.stringify({
+            env: {
+              CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+              DISABLE_TELEMETRY: '1',
+              CLAUDE_CODE_DISABLE_TELEMETRY: '1',
+              CUSTOM: 'preserved',
+            },
+          }),
+        },
+      }
+    },
+    async syncSeed() {
+      return { published: true }
+    },
+  }
+
+  const enabledVm = {
+    id: 'vm-crag-on',
+    node_id: 'node-a',
+    seed_policy: { telemetry_disabled: false, claude_setting: 'CUSTOM_SETTING=1' },
+  }
+  const onSeed = await initializeSlotSeedFiles(root, enabledVm, host)
+  assert.equal(onSeed.settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+  assert.equal(onSeed.settings.env.DISABLE_TELEMETRY, undefined)
+  assert.equal(onSeed.settings.env.CLAUDE_CODE_DISABLE_TELEMETRY, undefined)
+  assert.equal(onSeed.settings.env.DO_NOT_TRACK, undefined)
+  assert.equal(onSeed.settings.env.CUSTOM, 'preserved')
+  assert.equal(onSeed.claude_setting, 'CUSTOM_SETTING=1')
+
+  const disabledVm = {
+    id: 'vm-crag-off',
+    node_id: 'node-a',
+    seed_policy: { telemetry_disabled: true },
+  }
+  const offSeed = await initializeSlotSeedFiles(root, disabledVm, host)
+  assert.equal(offSeed.settings.env.DISABLE_TELEMETRY, '1')
+  assert.equal(offSeed.settings.env.CLAUDE_CODE_DISABLE_TELEMETRY, '1')
+  assert.equal(offSeed.settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+
+  fs.writeFileSync(
+    routingFile,
+    JSON.stringify({ inference: { dataplane: 'crag' }, telemetry: { disable_nonessential_traffic: true } }),
+  )
+  const globalSuppressed = await initializeSlotSeedFiles(root, enabledVm, host)
+  assert.equal(globalSuppressed.settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1')
+})

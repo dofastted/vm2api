@@ -1402,7 +1402,7 @@ export function createPanelHandler(ctx) {
     if (kernelSwitch && !isCodexVm(desired)) {
       try {
         const initialize = ctx.kernelPolicyOps?.initializeSlotSeedFiles || initializeSlotSeedFiles
-        await initialize(cfg.paths.project, desired, slotHost(desired))
+        await initialize(cfg.paths.project, desired, slotHost(desired), { routing: ctx.routingConfig })
       } catch {
         return { ok: false, id, code: 'kernel_seed_failed', error: 'Claude Code 初始化配置生成或发布失败' }
       }
@@ -3533,7 +3533,7 @@ export function createPanelHandler(ctx) {
                 const desired = targets.all ? vm : vmWithSlotPolicyPatch(vm, { dataplane: parsed.value })
                 if (resolveKernelDataplane(vm, previous) === resolveKernelDataplane(desired, nextRouting)) continue
                 if (checkCragLicense(cfg.paths.project, desired, nextRouting).ok)
-                  await initialize(cfg.paths.project, desired, slotHost(desired))
+                  await initialize(cfg.paths.project, desired, slotHost(desired), { routing: nextRouting })
               }
             } catch {
               return json(res, 503, {
@@ -5265,6 +5265,7 @@ export function createPanelHandler(ctx) {
               routing: ctx.routingConfig,
               lifecycle: { watchdog: ctx.kernelWatchdog, poolScheduler: ctx.poolScheduler },
               replaceEnv: Object.hasOwn(body, 'extra_env') || Object.hasOwn(body, 'settings_json_override'),
+              ...(ctx.telemetryOps ? { ops: ctx.telemetryOps } : {}),
             })
           }
           const { seed: written, ...publicService } = service
@@ -5285,7 +5286,12 @@ export function createPanelHandler(ctx) {
           if (!service.ok) {
             return json(res, 502, {
               ok: false,
-              error: { code: service.code || 'telemetry_not_applied', message: service.error || 'VM 原生配置尚未生效' },
+              error: {
+                code: service.code || 'telemetry_not_applied',
+                message: service.error || 'VM 原生配置尚未生效',
+                ...(service.reason ? { reason: service.reason } : {}),
+                ...(service.upstream_message ? { upstream_message: service.upstream_message } : {}),
+              },
               data,
             })
           }

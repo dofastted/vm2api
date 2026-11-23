@@ -20,7 +20,9 @@
 import fs from 'node:fs'
 import crypto from 'node:crypto'
 import path from 'node:path'
-import { nodeSession, remoteSlotDir, remoteSlotOwner, vmNodeId } from './placement.mjs'
+import { isNativeNodeVm, nodeSession, remoteSlotDir, remoteSlotOwner, vmNodeId } from './placement.mjs'
+import { ensureSlotComputer, rememberComputer } from '../identity/slot-computer.mjs'
+import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
 import { hasCredentialPresence, mirrorWorkerCredentialsToVm } from '../oauth/oauth-credentials.mjs'
 import { EGRESS_BIN } from '../vm/egress.mjs'
 import { readJsonCached } from '../vm/vm-file.mjs'
@@ -55,7 +57,9 @@ export const SLOT_FILE_SETS = Object.freeze({
   // Policy publication must not overwrite node-owned identity or OAuth files.
   seed_settings: SEED_SETTINGS_FILES,
   telemetry: ['run/kernel.json', ...SEED_SETTINGS_FILES, 'cli-home/.claude/telemetry/egress.json'],
+  fingerprint: [],
 })
+const FINGERPRINT_SYNC_SETS = new Set(['fingerprint', 'seed', 'seed_settings', 'telemetry'])
 const CREDENTIALS = 'cli-home/.claude/credentials.json'
 const SLOT_BINARIES = Object.freeze(['kin-worker', 'kin-egress'])
 
@@ -104,14 +108,85 @@ function ownerFor(session, vm) {
   return session.host.uid === 0 ? remoteSlotOwner(session.host, vm) : null
 }
 
+function collectLocalFingerprintTree(rootDir) {
+  const dirs = ['']
+  const files = []
+  const walk = (absDir, relDir) => {
+    for (const name of fs.readdirSync(absDir).sort()) {
+      const abs = path.join(absDir, name)
+      const rel = relDir ? `${relDir}/${name}` : name
+      const stat = fs.lstatSync(abs)
+      if (stat.isSymbolicLink()) continue
+      if (stat.isDirectory()) {
+        dirs.push(rel)
+        walk(abs, rel)
+      } else if (stat.isFile()) {
+        files.push({ rel, data: fs.readFileSync(abs) })
+      }
+    }
+  }
+  walk(rootDir, '')
+  return { dirs, files }
+}
+
+/**
+ * Ensure the slot computer fingerprint exists locally and SFTP-sync it to
+ * <remoteSlotDir>/fingerprint with 0755 directory modes and 0644 file modes so
+ * non-root container UID 10000+n can read /etc/kin-computer and /etc/kin-dmi/*.
+ */
+export async function pushSlotFingerprint(vm, projectRoot, session = null, { remember = true } = {}) {
+  if (isKvmRuntime(vm) || isNativeNodeVm(vm)) return { ok: true, pushed: false, skipped: 'not_docker', written: [] }
+  const computer = ensureSlotComputer(projectRoot, vm)
+  if (remember) rememberComputer(projectRoot, vm, computer)
+  const s = session || (await nodeSession(vmNodeId(vm)))
+  await prepareRemoteDir(s, vm)
+  const remote = `${remoteSlotDir(s.host, vm.id)}/fingerprint`
+  const owner = ownerFor(s, vm)
+  const tree = collectLocalFingerprintTree(computer.dir)
+  const remoteDirs = tree.dirs.map((rel) => (rel ? `${remote}/${rel}` : remote))
+  const remoteFiles = tree.files.map((file) => `${remote}/${file.rel}`)
+  const quotedDirs = remoteDirs.map(shellQuote).join(' ')
+  const cleanDirs = remoteDirs
+    .map((dir) => {
+      const quoted = shellQuote(dir)
+      return `if [ -L ${quoted} ] || { [ -e ${quoted} ] && [ ! -d ${quoted} ]; }; then rm -rf ${quoted}; fi`
+    })
+    .join('; ')
+  const cleanFiles = remoteFiles
+    .map((file) => {
+      const quoted = shellQuote(file)
+      return `if [ -L ${quoted} ] || [ -d ${quoted} ]; then rm -rf ${quoted}; fi`
+    })
+    .join('; ')
+  const chown = owner ? ` && chown ${owner.uid}:${owner.gid} ${quotedDirs}` : ''
+  const script = [cleanDirs, `umask 022 && mkdir -p ${quotedDirs} && chmod 755 ${quotedDirs}${chown}`, cleanFiles]
+    .filter(Boolean)
+    .join(' && ')
+  await runRemote(s.client, script, { timeoutMs: 20_000 })
+  const sftp = await openSftp(s.client)
+  const written = []
+  for (const file of tree.files) {
+    await writeRemoteFile(sftp, `${remote}/${file.rel}`, file.data, { mode: 0o644, owner })
+    written.push(`kvm/fingerprint/${file.rel}`)
+  }
+  return { ok: true, pushed: written.length > 0, computer, written }
+}
+
 /** Push the named sets (`run`, `seed`). Missing local files are skipped. */
 export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session = null) {
   const s = session || (await nodeSession(vmNodeId(vm)))
   await prepareRemoteDir(s, vm)
+  const projectRoot = path.dirname(path.dirname(slotDir))
+  const pushed = []
+  if (sets.some((name) => FINGERPRINT_SYNC_SETS.has(name)) && !isKvmRuntime(vm) && !isNativeNodeVm(vm)) {
+    const remember = sets.includes('seed') || sets.includes('fingerprint')
+    const fp = await pushSlotFingerprint(vm, projectRoot, s, { remember })
+    if (sets.includes('seed')) ensureGuestMachineIdFile(projectRoot, vm)
+    pushed.push(...fp.written)
+  }
   const sftp = await openSftp(s.client)
   const remote = remoteSlotDir(s.host, vm.id)
   const owner = ownerFor(s, vm)
-  const pushed = []
   for (const rel of sets.flatMap((name) => SLOT_FILE_SETS[name] || [])) {
     const local = path.join(slotDir, rel)
     let data
@@ -124,7 +199,7 @@ export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session
     // Config can select a newer official Claude without an explicit kernel install.
     // Publish its verified package first so the new claude_bin already exists on the node.
     const config = rel === 'run/kernel.json' ? JSON.parse(data.toString('utf8')) : null
-    if (config?.dataplane === 'crag') await pushCragSlot(vm, path.dirname(path.dirname(slotDir)), s)
+    if (config?.dataplane === 'crag') await pushCragSlot(vm, projectRoot, s)
     // Never mirror local modes: a drvfs / 0777 checkout would publish tokens world-readable on the node.
     await writeRemoteFile(sftp, `${remote}/${remoteSlotPath(rel)}`, data, { mode: REMOTE_FILE_MODE, owner })
     if (rel === 'run/kernel.json' && isKvmRuntime(vm) && !isCodexVm(vm)) {

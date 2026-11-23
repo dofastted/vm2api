@@ -1411,22 +1411,26 @@ export function writeKernelConfig(
         })
       }
       acceptNativeClaudeSetup(homeDir, '/run/kin/work', vm)
-      if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
-        const workstation = resolveWorkstationProfile(record)
-        config.telemetry = {
-          ...config.telemetry,
+    }
+    if (
+      config.telemetry &&
+      isTelemetryEnabled(defaultSeedPolicy(target.seed_policy || {})) &&
+      (!host.bakedKernel || kind !== 'kvm')
+    ) {
+      const workstation = resolveWorkstationProfile(target)
+      config.telemetry = {
+        ...config.telemetry,
+        enabled: true,
+        dmi_dir: '/etc/kin-dmi',
+        identity: {
           enabled: true,
-          dmi_dir: '/etc/kin-dmi',
-          identity: {
-            enabled: true,
-            linux_kernel: workstation.linux_kernel,
-            linux_distro_id: workstation.linux_distro_id,
-            linux_distro_version: workstation.linux_distro_version,
-            shell: workstation.shell,
-            terminal: workstation.terminal,
-            package_managers: workstation.package_managers,
-          },
-        }
+          linux_kernel: workstation.linux_kernel,
+          linux_distro_id: workstation.linux_distro_id,
+          linux_distro_version: workstation.linux_distro_version,
+          shell: workstation.shell,
+          terminal: workstation.terminal,
+          package_managers: workstation.package_managers,
+        },
       }
     }
   }
