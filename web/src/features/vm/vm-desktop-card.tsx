@@ -35,7 +35,7 @@ const STATE_TEXT: Record<DesktopStatus['state'], string> = {
  * Browser desktop that shares this slot's egress. Admin-only (server ACL);
  * the companion container is started on slot start when enabled.
  */
-export function VmDesktopCard({ vm }: { vm: Vm }) {
+export function VmDesktopCard({ vm, active = true }: { vm: Vm; active?: boolean }) {
   const id = vm.id
   const root = `/api/panel/vms/${encodeURIComponent(id)}`
   const qc = useQueryClient()
@@ -79,7 +79,9 @@ export function VmDesktopCard({ vm }: { vm: Vm }) {
     queryKey: ['vm-desktop', id],
     queryFn: () =>
       api<DesktopStatus>(`/api/panel/vms/${encodeURIComponent(id)}/desktop`),
-    refetchInterval: open ? false : 15_000,
+    // forceMount 保活后卡片在任何详情页都挂载；tab 不在 desktop 时不轮询
+    // （noVNC 连接本身仍由 open 门控，这里只收状态查询的常开后台请求）
+    refetchInterval: open ? false : active ? 15_000 : false,
   })
   const toggle = useMutation({
     mutationFn: (enabled: boolean) =>
