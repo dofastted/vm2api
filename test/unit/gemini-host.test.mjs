@@ -1367,3 +1367,152 @@ test('host installer refuses an unsigned manifest and never activates damaged pa
     }
   }
 })
+
+test('Gemini environment concurrency config and strict OAuth proxy calibration digest', async () => {
+  for (const [role, allowed] of [
+    ['user', false],
+    ['super', false],
+    ['admin', true],
+  ]) {
+    assert.equal(authorizePanelRoute('PUT', `${environmentPath}/concurrency`, role).ok, allowed)
+  }
+
+  const operations = []
+  const run = setup((operation, payload) => {
+    operations.push([operation, payload])
+    if (operation === 'create') {
+      return { ...record, max_concurrency: payload.max_concurrency, active_slots: 0 }
+    }
+    if (operation === 'concurrency-set') {
+      return { ...record, max_concurrency: payload.max_concurrency, active_slots: 2 }
+    }
+    if (operation === 'get') return { ...record, max_concurrency: 10, active_slots: 0 }
+    if (operation === 'authorize') return { url: official, attempt_id: 'attempt-calibrated' }
+    if (operation === 'complete') return { ...record, auth_state: 'authorized', max_concurrency: 10, active_slots: 0 }
+    throw new Error(`unexpected op ${operation}`)
+  })
+
+  for (const invalid of [0, -1, 65, '10', 1.5, null]) {
+    const badCreate = await run('POST', `${root}/environments`, {
+      name: record.name,
+      proxy_id: record.proxy_id,
+      max_concurrency: invalid,
+    })
+    assert.equal(badCreate.status, 400)
+    assert.equal(badCreate.body.error.code, 'gemini_invalid_concurrency')
+
+    const badPut = await run('PUT', `${environmentPath}/concurrency`, { max_concurrency: invalid })
+    assert.equal(badPut.status, 400)
+    assert.equal(badPut.body.error.code, 'gemini_invalid_concurrency')
+  }
+  assert.deepEqual(operations, [])
+
+  const created = await run('POST', `${root}/environments`, {
+    name: record.name,
+    proxy_id: record.proxy_id,
+    max_concurrency: 10,
+  })
+  assert.equal(created.status, 200)
+  assert.equal(created.body.data.max_concurrency, 10)
+  assert.equal(created.body.data.active_slots, 0)
+
+  const scaled = await run('PUT', `${environmentPath}/concurrency`, { max_concurrency: 12 })
+  assert.equal(scaled.status, 200)
+  assert.equal(scaled.body.data.max_concurrency, 12)
+  assert.equal(scaled.body.data.active_slots, 2)
+
+  const expectedDigest = createHash('sha256').update(proxyUrl).digest('hex')
+  const authStart = await run('POST', `${environmentPath}/authorization`)
+  assert.equal(authStart.status, 200)
+  const authDone = await run('PUT', `${environmentPath}/authorization`, {
+    attempt_id: 'attempt-calibrated',
+    code: 'calibrated-code',
+  })
+  assert.equal(authDone.status, 200)
+
+  const authorizeOp = operations.find(([op]) => op === 'authorize')
+  const completeOp = operations.find(([op]) => op === 'complete')
+  assert.equal(authorizeOp[1].proxy_sha256, expectedDigest)
+  assert.equal(completeOp[1].proxy_sha256, expectedDigest)
+})
+
+test('Gemini scheduler allows 10 concurrent slots on acc1 with strict per-account proxy calibration', async () => {
+  const environments = [
+    {
+      id: 'gemini-acc1',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      proxy_id: 'px-1',
+      max_concurrency: 10,
+      models_discovered: true,
+      models: [model],
+    },
+    {
+      id: 'gemini-acc2',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      proxy_id: 'px-2',
+      max_concurrency: 2,
+      models_discovered: true,
+      models: [model],
+    },
+  ]
+  const proxyMap = {
+    'px-1': 'socks5h://u1:p1@192.0.2.101:1080',
+    'px-2': 'socks5h://u2:p2@192.0.2.102:1080',
+  }
+  const pool = new PoolScheduler()
+  const inflightPayloads = []
+  const releases = []
+  let resolveAll10
+  const tenActive = new Promise((resolve) => {
+    resolveAll10 = resolve
+  })
+
+  const scheduler = createGeminiScheduler({
+    poolScheduler: pool,
+    resolveProxy: (pid) => proxyMap[pid],
+    callHost: async (op, input) => {
+      if (op === 'list') return { payload_state: 'installed', environments: [environments[0]] }
+      if (op === 'get') return environments.find((e) => e.id === input.id)
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async (op, payload) => {
+      assert.equal(op, 'infer')
+      assert.equal(payload.id, 'gemini-acc1')
+      assert.equal(payload.proxy_id, 'px-1')
+      assert.equal(
+        payload.proxy_sha256,
+        createHash('sha256').update(proxyMap['px-1']).digest('hex'),
+      )
+      inflightPayloads.push(payload)
+      if (inflightPayloads.length === 10) resolveAll10()
+      const gate = new Promise((resolve) => releases.push(resolve))
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        destroy() {},
+        async *[Symbol.asyncIterator]() {
+          await gate
+          yield Buffer.from(
+            `data: {"candidates":[{"content":{"parts":[{"text":"slot-${payload.request_id}"}]},"finishReason":"STOP"}]}\n\n`,
+          )
+        },
+      }
+    },
+  })
+
+  const tasks = Array.from({ length: 10 }, (_, i) =>
+    scheduler.stream({
+      model,
+      requestId: `req-${i}`,
+      geminiBody: { model, contents: [{ role: 'user', parts: [{ text: `hi ${i}` }] }] },
+    }),
+  )
+  await tenActive
+  assert.equal(pool.inflight.get('gemini:gemini-acc1'), 10)
+  for (const release of releases) release()
+  const results = await Promise.all(tasks)
+  assert.equal(results.length, 10)
+  assert.equal(pool.inflight.size, 0)
+})

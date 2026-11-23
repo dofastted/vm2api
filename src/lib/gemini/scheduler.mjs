@@ -13,9 +13,14 @@ import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const MODEL = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const RUN_ID = /^[a-f0-9]{32}$/
+const MAX_CONCURRENCY = 64
 const POLL_MS = 250
 const TURN_MS = 120_000
 const STREAM_TURN_MS = 300_000
+
+function normalizeConcurrency(value) {
+  return Number.isSafeInteger(value) && value >= 1 && value <= MAX_CONCURRENCY ? value : 1
+}
 
 const FAILURES = {
   gemini_host_unavailable: [503, 'Gemini host is not available.'],
@@ -23,6 +28,7 @@ const FAILURES = {
   gemini_no_account: [503, 'No authorized Gemini account is ready.'],
   gemini_model_unavailable: [404, 'This Gemini model is not available on an authorized account.'],
   gemini_proxy_unavailable: [503, 'The selected Gemini account has no usable proxy.'],
+  gemini_proxy_calibration_mismatch: [409, 'Bound Gemini proxy calibration digest mismatch.'],
   gemini_operation_busy: [503, 'Gemini accounts are busy. Retry shortly.'],
   gemini_oauth_required: [503, 'The selected Gemini account needs authorization again.'],
   gemini_api_key_invalid: [503, 'The selected Gemini API key is not valid.'],
@@ -71,6 +77,7 @@ const NON_CIRCUIT_FAILURES = new Set([
   'gemini_unsupported_turn',
   'gemini_invalid_request',
   'gemini_inference_tool_blocked',
+  'gemini_proxy_calibration_mismatch',
   'license_required',
   'license_expired',
   'license_not_yet_valid',
@@ -272,6 +279,7 @@ export function createGeminiScheduler({
           accounts.push({
             id: environment.id,
             auth_method: authMethod,
+            max_concurrency: normalizeConcurrency(environment.max_concurrency),
             capabilities: accountCapabilities(environment),
             models,
           })
@@ -340,7 +348,7 @@ export function createGeminiScheduler({
           vmId: `gemini:${account.id}`,
           model,
           authMethod: account.auth_method,
-          maxConcurrency: 1,
+          maxConcurrency: normalizeConcurrency(account.max_concurrency),
           priority: account.auth_method === 'api_key' && requiredCapabilities.length ? 1 : 0,
           weight: 1,
           lastUsedAt: 0,
@@ -371,12 +379,16 @@ export function createGeminiScheduler({
               : geminiBody
 
             if (streamHost) {
+              const proxySha256 = proxyUrl
+                ? crypto.createHash('sha256').update(proxyUrl).digest('hex')
+                : undefined
               const res = await streamHost(
                 'infer',
                 {
                   id,
                   proxy_id: proxyId,
                   proxy_url: proxyUrl,
+                  ...(proxySha256 ? { proxy_sha256: proxySha256 } : {}),
                   model,
                   request_id: requestId,
                   body: outboundBody,
