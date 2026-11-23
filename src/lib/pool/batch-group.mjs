@@ -60,11 +60,6 @@ export function batchGroupAppliesToKey(cfg, keyId) {
   return !!id && cfg.keys.includes(id)
 }
 
-/** True for a sticky key minted by a group member. */
-export function isBatchMemberKey(key) {
-  return typeof key === 'string' && key.includes(BATCH_MEMBER_MARK)
-}
-
 export class BatchGroups {
   /**
    * @param {{ now?: () => number, onExpire?: (memberKey: string) => void }} [opts]

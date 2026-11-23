@@ -5,7 +5,6 @@ import {
   batchGroupAppliesToKey,
   batchGroupKey,
   batchMemberSeatKey,
-  isBatchMemberKey,
   mergeBatchGroupConfig,
 } from '../../src/lib/pool/batch-group.mjs'
 
@@ -29,14 +28,9 @@ test('applies only to listed keys unless enabled_for_all', () => {
 
 test('group key comes from the cache seat hash or an explicit workload id', () => {
   assert.equal(batchGroupKey({ keyId: '1', seatKey: `seat:h:${HASH}` }), `k1:bg:s:${HASH}`)
-  assert.equal(
-    batchGroupKey({ keyId: '1', seatKey: `seat:h:${HASH}`, workloadId: 'u_abc12345' }),
-    'k1:bg:u:u_abc12345',
-  )
+  assert.equal(batchGroupKey({ keyId: '1', seatKey: `seat:h:${HASH}`, workloadId: 'u_abc12345' }), 'k1:bg:u:u_abc12345')
   assert.equal(batchGroupKey({ keyId: '1', seatKey: 'seat:sess:xyz' }), null)
   assert.equal(batchGroupKey({ keyId: '', seatKey: `seat:h:${HASH}` }), null)
-  assert.equal(isBatchMemberKey('p:anthropic:k1:bg:s:ab#0'), true)
-  assert.equal(isBatchMemberKey('k1:ch:ab'), false)
   assert.notEqual(batchMemberSeatKey('g', 0), batchMemberSeatKey('g', 1))
 })
 

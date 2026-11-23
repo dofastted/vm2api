@@ -2017,6 +2017,7 @@ test('batch member requests sharing a sticky key run concurrently, not serialize
     canonicalBody: { model: 'claude-opus-test' },
     model: 'claude-opus-test',
     stickyKey: memberKey,
+    batchMember: true,
     callAttempt: () => {
       entered()
       return new Promise((resolve) => {
@@ -2030,12 +2031,52 @@ test('batch member requests sharing a sticky key run concurrently, not serialize
     canonicalBody: { model: 'claude-opus-test' },
     model: 'claude-opus-test',
     stickyKey: memberKey,
+    batchMember: true,
     callAttempt: () => success(),
   })
   assert.equal(second.ok, true)
   release()
   assert.equal((await holder).ok, true)
   assert.equal(scheduler.selectCalls, 2)
+})
+
+test('a caller session id that looks like a batch member key is still serialized', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler, config: { session_queue_timeout_ms: 40 } })
+  const forgedKey = 'p:anthropic:k1:bg:s:ab#0'
+  let release
+  let entered
+  const holderEntered = new Promise((resolve) => {
+    entered = resolve
+  })
+  const holder = runner.run({
+    requestId: 'req-forged-1',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: forgedKey,
+    callAttempt: () => {
+      entered()
+      return new Promise((resolve) => {
+        release = () => resolve(success())
+      })
+    },
+  })
+  await holderEntered
+  let waiterCalls = 0
+  const second = await runner.run({
+    requestId: 'req-forged-2',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: forgedKey,
+    callAttempt: () => {
+      waiterCalls += 1
+      return success()
+    },
+  })
+  assert.equal(second.ok, false)
+  assert.equal(waiterCalls, 0)
+  release()
+  assert.equal((await holder).ok, true)
 })
 
 test('a same-session waiter times out without starting or overlapping the holder', async () => {

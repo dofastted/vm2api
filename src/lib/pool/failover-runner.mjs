@@ -1,4 +1,3 @@
-import { isBatchMemberKey } from './batch-group.mjs'
 import {
   classifyUpstreamResult,
   isFableModel,
@@ -798,8 +797,10 @@ export class FailoverRunner {
     if (args.rootSessionId) args = { ...args, subagent }
     // A batch member key is a placement group, not a conversation: its requests
     // are independent sessionless calls, so they run side by side up to the
-    // member's concurrency instead of queueing behind each other.
-    if (!sessionKey || isBatchMemberKey(sessionKey)) return subagent ? this.runOnce(args).finally(subagent.close) : this.runOnce(args)
+    // member's concurrency instead of queueing behind each other. Only the
+    // protocol layer says so (args.batchMember); the key text is caller-shaped.
+    if (!sessionKey || args.batchMember === true)
+      return subagent ? this.runOnce(args).finally(subagent.close) : this.runOnce(args)
     const previous = this.sessionTails.get(sessionKey) || Promise.resolve()
     let releaseTurn
     const turn = new Promise((resolve) => {
@@ -839,6 +840,7 @@ export class FailoverRunner {
     model,
     stickyKey = null,
     stickyKeys = null,
+    batchMember = false,
     seatKey = null,
     stickyDeviceId = null,
     stream = false,
@@ -1000,7 +1002,7 @@ export class FailoverRunner {
     let avoid = null
     // keep_session_home: the continuing conversation's account for this
     // request is the one its first attempt ran on.
-    const keepHome = this.config.keep_session_home === true && !pinVmId && !!stickyKey && !isBatchMemberKey(stickyKey)
+    const keepHome = this.config.keep_session_home === true && !pinVmId && !!stickyKey && batchMember !== true
     const continuing = !subagent && keepHome && !!this.stickyRouter?.resolve?.(stickyKey)?.accountId
     let homeAccountId = null
     let homeRetryPending = false

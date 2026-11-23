@@ -1863,6 +1863,8 @@ export function createHandleProtocol(deps) {
         model: canonicalBody.model,
         stickyKey: isProbe ? null : stickyKey,
         stickyKeys: isProbe ? [] : stickyKeys,
+        // Set only when a group member actually supplied the sticky key.
+        batchMember: !isProbe && batchApplied,
         stickyDeviceId,
         deviceKey,
         skipSessionSeat: seatless,
