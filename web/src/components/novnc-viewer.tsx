@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import RFB from '@novnc/novnc'
+import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { apiBase } from '@/lib/session'
 
@@ -207,6 +208,22 @@ export function NoVncViewer({
           remoteClipRef.current = text
           remoteClipAtRef.current = Date.now()
           onClipboardRef.current?.(text)
+          // 无感同步到本机：安全上下文（HTTPS/localhost）且页面聚焦时，
+          // Chrome 允许无手势 writeText——桌面里一复制，本机剪贴板即更新。
+          // 纯 HTTP 面板没有 navigator.clipboard，维持手动取回路径。
+          if (
+            text &&
+            window.isSecureContext &&
+            navigator.clipboard &&
+            document.hasFocus()
+          ) {
+            navigator.clipboard
+              .writeText(text)
+              .then(() => toast.success('桌面剪贴板已同步到本机'))
+              .catch(() => {
+                /* 无权限/失焦：静默，用「带回」按钮或 Cmd+C 取回 */
+              })
+          }
         })
         if (handleRef)
           handleRef.current = {
