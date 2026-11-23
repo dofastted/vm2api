@@ -72,15 +72,23 @@ export async function publishClusterSubscription(projectRoot, vm, session = null
         `umask 077 && ${privateDirectoriesScript([licenseDir], owner)} ${privateDirectoriesScript([hostDir])} chmod 755 ${shellQuote(hostDir)}`,
         { timeoutMs: 8000 },
       )
+      // Stage every file next to its target, then swap all four in one remote command: the slot sees
+      // sync-pending (and a mixed set) for milliseconds instead of four SFTP round trips.
       const sftp = await openSftp(session.client)
-      const write = (file, data, mode, fileOwner) =>
-        writeRemoteFile(sftp, file, `${data}\n`, { mode, owner: fileOwner, timeoutMs: 8000 })
-      await write(marker, 'pending', 0o644)
-      await write(`${licenseDir}/device.json`, files.device, 0o600, owner)
-      await write(`${licenseDir}/registration.code`, files.permit, 0o600, owner)
-      await write(`${hostDir}/host_id`, files.hostId, 0o644)
-      await write(`${hostDir}/entitlement.code`, files.entitlement, 0o644)
-      await runRemote(session.client, `rm -f ${shellQuote(marker)}`, { timeoutMs: 8000 })
+      const targets = [
+        [`${licenseDir}/device.json`, files.device, 0o600, owner],
+        [`${licenseDir}/registration.code`, files.permit, 0o600, owner],
+        [`${hostDir}/host_id`, files.hostId, 0o644, null],
+        [`${hostDir}/entitlement.code`, files.entitlement, 0o644, null],
+      ]
+      for (const [file, data, mode, fileOwner] of targets)
+        await writeRemoteFile(sftp, `${file}.new`, `${data}\n`, { mode, owner: fileOwner, timeoutMs: 8000 })
+      const swap = targets.map(([file]) => `mv -f ${shellQuote(`${file}.new`)} ${shellQuote(file)}`).join(' && ')
+      await runRemote(
+        session.client,
+        `printf 'pending\\n' > ${shellQuote(marker)} && chmod 644 ${shellQuote(marker)} && ${swap} && rm -f ${shellQuote(marker)}`,
+        { timeoutMs: 8000 },
+      )
       record.digest = digest
       return true
     })
