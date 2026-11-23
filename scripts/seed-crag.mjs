@@ -11,7 +11,7 @@ export function seedCragFactory(root, imageRoot, { arch = cragV2Arch() } = {}) {
   // An existing issuer and any downloaded selection belong to the installation.
   if (fs.existsSync(destination)) return { ok: true, seeded: false, reason: 'factory_exists' }
   fs.mkdirSync(path.dirname(destination), { recursive: true })
-  const staged = stageCragV2Tree(path.join(imageRoot, 'kernels/v2', arch), destination)
+  const staged = stageCragV2Tree(path.join(imageRoot, 'kernels/v2', arch), destination, { arch })
   if (!staged.ok) throw new Error(staged.code)
   staged.commit()
   return { ok: true, seeded: true }

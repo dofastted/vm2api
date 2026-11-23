@@ -81,3 +81,18 @@ test('unsupported architecture and explicit package override leave the installat
     delete process.env.KIN_CRAG_V2_ROOT
   }
 })
+
+test('ARM64 control plane with DOCKER_DEFAULT_PLATFORM=linux/amd64 seeds the amd64 factory package', (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-seed-arm64-amd64-slot-'))
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  const image = path.join(base, 'image')
+  const source = seedEncryptedPackage(image, { arch: 'amd64' })
+  const root = path.join(base, 'installation')
+  const imageRoot = path.join(image, 'share/crag')
+  const arch = cragV2Arch({ arch: 'arm64', platform: 'linux', dockerDefaultPlatform: 'linux/amd64' })
+  assert.equal(arch, 'amd64')
+  assert.equal(seedCragFactory(root, imageRoot, { arch }).seeded, true)
+  const destination = path.join(root, 'share/crag/kernels/v2/amd64')
+  assert.equal(verifyCragV2Tree(destination, { arch: 'amd64' }).ok, true)
+  assert.deepEqual(tree(destination), tree(source))
+})

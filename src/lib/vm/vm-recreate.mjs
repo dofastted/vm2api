@@ -18,6 +18,7 @@ import { isKvmRuntime } from './runtime-kind.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 import {
   WRAP_CLI_BIN,
+  cragSlotArch,
   cragV2PackageRoot,
   describeCliPayload,
   describeKernelPayload,
@@ -117,13 +118,14 @@ export function preflightFreshClaudeKernels(projectRoot, vm) {
     throw Object.assign(new Error('请先拉取 cli-node 内核'), { code: 'kernel_package_missing' })
   }
   if (slotHost(vm).bakedKernel) return
-  const root = cragV2PackageRoot(projectRoot, 'amd64')
+  const arch = cragSlotArch(projectRoot, vm)
+  const root = cragV2PackageRoot(projectRoot, arch)
   if (!root) {
-    throw Object.assign(new Error('CRAG v2 package missing (share/crag/kernels/v2/amd64 or KIN_CRAG_V2_ROOT)'), {
+    throw Object.assign(new Error(`CRAG v2 package missing (share/crag/kernels/v2/${arch} or KIN_CRAG_V2_ROOT)`), {
       code: 'crag_v2_package_missing',
     })
   }
-  requireKernelResult(verifyCragV2Tree(root, { arch: 'amd64' }))
+  requireKernelResult(verifyCragV2Tree(root, { arch }))
 }
 
 export function seedFreshCliHome(projectRoot, vm, { routing, preinstallBoth = false } = {}) {

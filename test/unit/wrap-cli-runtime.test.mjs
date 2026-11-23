@@ -9,6 +9,10 @@ import {
   WRAP_CLI_FILES,
   CC_NODE_BIN,
   captureWrapSample,
+  cragSlotArch,
+  cragTargetArch,
+  cragV2Arch,
+  dockerPlatformArch,
   inspectLinuxAmd64Elf,
   inspectWrapCliDir,
   makeWrapSample,
@@ -912,4 +916,69 @@ test('CRAG v2 restores the previous tree if staged directory promotion fails', (
     fs.renameSync = rename
     fs.rmSync(project, { recursive: true, force: true })
   }
+})
+
+test('slot runtime arch resolves x86_64 Docker/KVM/cluster targets on ARM64 hosts and rejects non-amd64 slots', (t) => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-slot-arch-'))
+  t.after(() => fs.rmSync(project, { recursive: true, force: true }))
+
+  assert.equal(dockerPlatformArch('linux/amd64', 'linux'), 'amd64')
+  assert.equal(dockerPlatformArch('linux/x86_64', 'linux'), 'amd64')
+  assert.equal(dockerPlatformArch('linux/arm64/v8', 'linux'), 'arm64')
+  assert.equal(cragV2Arch({ arch: 'arm64', platform: 'linux', dockerDefaultPlatform: 'linux/amd64' }), 'amd64')
+  assert.equal(cragV2Arch({ arch: 'arm64', platform: 'linux', dockerDefaultPlatform: '' }), 'arm64')
+
+  seedEncryptedPackage(project, { arch: 'amd64' })
+  assert.equal(
+    cragSlotArch(
+      project,
+      { id: 'vm-docker-emulated', dataplane: 'crag' },
+      { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: 'linux/amd64' },
+    ),
+    'amd64',
+  )
+  assert.equal(
+    cragSlotArch(
+      project,
+      { id: 'vm-cluster', node_id: 'node-1', dataplane: 'crag' },
+      { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: '' },
+    ),
+    'amd64',
+  )
+  assert.equal(
+    cragSlotArch(
+      project,
+      { id: 'vm-kvm', runtime: { type: 'kvm' }, dataplane: 'crag' },
+      { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: '' },
+    ),
+    'amd64',
+  )
+
+  const ok = materializeCragV2(
+    project,
+    { id: 'vm-docker-emulated', dataplane: 'wrap' },
+    { select: false, arch: 'arm64', platform: 'linux', dockerDefaultPlatform: 'linux/amd64' },
+  )
+  assert.equal(ok.ok, true, ok.error)
+
+  const armSlot = { id: 'vm-arm-native', dataplane: 'crag', crag_kernel_version: 'v2', runtime: { arch: 'arm64' } }
+  const rejected = materializeCragV2(project, armSlot, {
+    select: false,
+    arch: 'arm64',
+    platform: 'linux',
+    dockerDefaultPlatform: '',
+  })
+  assert.equal(rejected.ok, false)
+  assert.equal(rejected.code, 'crag_v2_arch_mismatch')
+  const inspected = inspectKernelChanges(project, [armSlot], {
+    arch: 'arm64',
+    platform: 'linux',
+    dockerDefaultPlatform: '',
+  })
+  assert.equal(inspected.ok, false)
+  assert.equal(inspected.items[0].code, 'crag_v2_arch_mismatch')
+  assert.equal(
+    cragTargetArch(project, { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: 'linux/arm64' }),
+    'arm64',
+  )
 })

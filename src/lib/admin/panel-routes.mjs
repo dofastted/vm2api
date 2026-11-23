@@ -302,6 +302,7 @@ import { assignComputerFingerprint } from '../identity/slot-computer.mjs'
 import { runFleetUpdate, fleetStatus } from '../vm/fleet-update.mjs'
 import {
   captureWrapSample,
+  cragTargetArch,
   describeWrapSample,
   makeWrapSample,
   materializeResolvedKernel,
@@ -3191,7 +3192,7 @@ export function createPanelHandler(ctx) {
           panel.ok({
             vm: normalizeVmConfig(ctx.routingConfig?.vm),
             kvm,
-            crag_supported: process.platform === 'linux' && process.arch === 'x64',
+            crag_supported: process.platform === 'linux' && cragTargetArch(cfg.paths.project) === 'amd64',
           }),
         )
       }
@@ -5581,7 +5582,7 @@ export function createPanelHandler(ctx) {
         const placementPolicy = normalizeAutoPlacement(ctx.routingConfig?.cluster?.auto_placement)
         const wanted = requestedPlacement(body, placementPolicy)
         const exitPinsHost = typeof body.proxy_id === 'string' && isLocalEgressId(body.proxy_id.trim())
-        const localCragSupported = process.platform === 'linux' && process.arch === 'x64'
+        const localCragSupported = process.platform === 'linux' && cragTargetArch(cfg.paths.project) === 'amd64'
         const cragCapableNodes = new Set()
         if (wanted.mode === 'auto' && ident.role === 'admin' && runtime !== RUNTIME_KVM && !exitPinsHost) {
           const picked = await (ctx.pickPlacement || pickPlacement)({
