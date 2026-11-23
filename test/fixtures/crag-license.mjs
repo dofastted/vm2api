@@ -122,9 +122,15 @@ export function issueSlotPermit(root, machineCode, hostId, overrides = {}, wrap 
   }
   return { claims, code: signSubscriptionBytes(root, 'CRAGS1', JSON.stringify(claims)) }
 }
-export function seedEncryptedPackage(root, { revision = '', payloadKey = fixtureAuthority(root).payloadKey } = {}) {
+export function seedEncryptedPackage(
+  root,
+  {
+    revision = '',
+    payloadKey = fixtureAuthority(root).payloadKey,
+    arch = process.arch === 'arm64' ? 'arm64' : 'amd64',
+  } = {},
+) {
   const authority = fixtureAuthority(root)
-  const arch = process.arch === 'arm64' ? 'arm64' : 'amd64'
   const dir = path.join(root, 'share/crag/kernels/v2', arch)
   fs.mkdirSync(path.join(dir, 'claude-code-2.1.321'), { recursive: true })
   const elf = Buffer.alloc(96 + Buffer.byteLength(revision))

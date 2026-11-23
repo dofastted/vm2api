@@ -194,11 +194,7 @@ export function OpenaiQuotaActions({
             <RotateCcw
               className={cn('size-3', resetQuota.isPending && 'animate-spin')}
             />
-            {resetQuota.isPending
-              ? '使用中'
-              : compact
-                ? '使用重置券'
-                : '使用重置券'}
+            {resetQuota.isPending ? '使用中' : '使用重置券'}
           </Button>
           <ConfirmDialog
             open={confirm}

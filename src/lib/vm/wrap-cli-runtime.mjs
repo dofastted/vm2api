@@ -20,7 +20,7 @@ import { isKvmRuntime } from './runtime-kind.mjs'
 import { nativeCliForVm, NATIVE_CLI_FILES } from './native-cli.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 import { checkCragLicense, decodeLicenseBytes } from './crag-license.mjs'
-import { isValidVmId } from './vm-file.mjs'
+import { isValidVmId, listVmRecordFiles } from './vm-file.mjs'
 
 export const WRAP_CLI_BIN = 'cli-node'
 export const CC_NODE_BIN = 'cc-node'
@@ -69,10 +69,121 @@ const CRAG_V2_ENTRY = 'crag-v2'
 const CRAG_V2_CLAUDE = 'claude-code-2.1.321/claude'
 const CRAG_V2_CAPS = Object.freeze(['official_full', 'zero', 'cancel', 'telemetry', 'unix_socket_envelope'])
 
-export function cragV2Arch() {
-  if (process.arch === 'x64') return 'amd64'
-  if (process.arch === 'arm64') return 'arm64'
-  return process.arch
+export function normalizeCragArch(raw) {
+  const value = String(raw || '')
+    .trim()
+    .toLowerCase()
+  if (value === 'x64' || value === 'x86_64' || value === 'amd64') return 'amd64'
+  if (value === 'arm64' || value === 'aarch64') return 'arm64'
+  return value
+}
+
+export function dockerPlatformArch(
+  platformSpec = process.env.DOCKER_DEFAULT_PLATFORM,
+  hostPlatform = process.platform,
+) {
+  const raw = String(platformSpec || '')
+    .trim()
+    .toLowerCase()
+  if (!raw) return ''
+  const parts = raw.split('/').filter(Boolean)
+  if (parts.length === 1) return hostPlatform === 'linux' ? normalizeCragArch(parts[0]) : raw
+  if (parts[0] !== 'linux') return raw
+  return normalizeCragArch(parts[1])
+}
+
+export function cragV2Arch({
+  arch = process.arch,
+  platform = process.platform,
+  dockerDefaultPlatform = process.env.DOCKER_DEFAULT_PLATFORM,
+} = {}) {
+  const slotArch = dockerPlatformArch(dockerDefaultPlatform, platform)
+  if (slotArch) return slotArch
+  return normalizeCragArch(arch)
+}
+
+function elfMachineArch(file) {
+  let fd
+  try {
+    const st = fs.lstatSync(file)
+    if (!st.isFile() || st.size < 64) return ''
+    fd = fs.openSync(file, 'r')
+    const head = Buffer.alloc(64)
+    if (fs.readSync(fd, head, 0, 64, 0) !== 64) return ''
+    if (head.readUInt32BE(0) !== 0x7f454c46 || head[4] !== 2 || head[5] !== 1) return ''
+    const machine = head.readUInt16LE(18)
+    if (machine === 62) return 'amd64'
+    if (machine === 183) return 'arm64'
+    return `elf-${machine}`
+  } catch {
+    return ''
+  } finally {
+    if (fd != null) fs.closeSync(fd)
+  }
+}
+
+function hasCragSelectionForArch(projectRoot, arch) {
+  if (!projectRoot || !arch) return false
+  const base = path.join(projectRoot, 'share', 'crag', 'kernels', 'v2')
+  return isFile(path.join(base, `current-${arch}.json`)) || isFile(path.join(base, arch, 'manifest.json'))
+}
+
+function stagedSlotBinaryArch(projectRoot, vmId) {
+  if (!projectRoot || !isValidVmId(vmId)) return ''
+  const dir = wrapCliHomeDir(projectRoot, vmId)
+  for (const name of [CC_NODE_BIN, WRAP_KERNEL_BIN, WRAP_CLI_BIN]) {
+    const detected = elfMachineArch(path.join(dir, name))
+    if (detected) return detected
+  }
+  return ''
+}
+
+/** Runtime architecture of a target slot, independent of the control-plane host CPU. */
+export function cragSlotArch(projectRoot, vm, options = {}) {
+  if (!vm) return cragTargetArch(projectRoot, options)
+  if (vm.node_platform === 'darwin') return 'darwin'
+  const explicit = normalizeCragArch(vm.runtime?.arch || vm.node_arch || vm.arch)
+  if (explicit) return explicit
+  const platformArch = dockerPlatformArch(options.dockerDefaultPlatform, options.platform)
+  if (platformArch) return platformArch
+  const hostArch = normalizeCragArch(options.arch ?? process.arch)
+  if (hostArch !== 'amd64' && hasCragSelectionForArch(projectRoot, hostArch)) return hostArch
+  if (clusterDockerSlot(vm) || isKvmRuntime(vm)) return 'amd64'
+  const staged = stagedSlotBinaryArch(projectRoot, vm.id)
+  if (staged) return staged
+  return cragTargetArch(projectRoot, options)
+}
+
+/** Runtime architecture targeted by this installation's CRAG cache/pull operations. */
+export function cragTargetArch(projectRoot = '', options = {}) {
+  const platformArch = dockerPlatformArch(options.dockerDefaultPlatform, options.platform)
+  if (platformArch) return platformArch
+  const hostArch = normalizeCragArch(options.arch ?? process.arch)
+  if (hostArch === 'amd64' || !projectRoot) return hostArch
+  if (hasCragSelectionForArch(projectRoot, hostArch)) return hostArch
+  if (hasCragSelectionForArch(projectRoot, 'amd64')) return 'amd64'
+  const vmsDir = path.join(projectRoot, 'vms')
+  let sawSlotArch = ''
+  for (const file of listVmRecordFiles(vmsDir)) {
+    let vm
+    try {
+      vm = JSON.parse(fs.readFileSync(path.join(vmsDir, file), 'utf8'))
+    } catch {
+      continue
+    }
+    if (!vm || isCodexVm(vm) || vm.node_platform === 'darwin') continue
+    const explicit = normalizeCragArch(vm.runtime?.arch || vm.node_arch || vm.arch)
+    if (explicit === 'amd64') return 'amd64'
+    if (explicit) {
+      sawSlotArch ||= explicit
+      continue
+    }
+    if (clusterDockerSlot(vm) || isKvmRuntime(vm)) return 'amd64'
+    const staged = stagedSlotBinaryArch(projectRoot, vm.id)
+    if (staged === 'amd64') return 'amd64'
+    if (staged) sawSlotArch ||= staged
+  }
+  return sawSlotArch || hostArch
 }
 
 // A cache pointer is data, never a symlink or an arbitrary filesystem path.
@@ -100,7 +211,7 @@ function cachedPackageRoot(base, arch) {
   }
 }
 /** Package location only. This does not select v2 for VMs that omitted the version. */
-export function cragV2PackageRoot(projectRoot, arch = cragV2Arch()) {
+export function cragV2PackageRoot(projectRoot, arch = cragTargetArch(projectRoot)) {
   const env = String(process.env.KIN_CRAG_V2_ROOT || '').trim()
   if (env && isFile(path.join(env, 'manifest.json'))) return env
   if (!projectRoot) return ''
@@ -115,8 +226,7 @@ export function cragV2PackageRoot(projectRoot, arch = cragV2Arch()) {
   return isFile(path.join(staged, 'manifest.json')) ? staged : ''
 }
 
-export function matchesCragIssuer(projectRoot, issuerId, pem) {
-  const arch = cragV2Arch()
+export function matchesCragIssuer(projectRoot, issuerId, pem, arch = cragTargetArch(projectRoot)) {
   const factory =
     String(process.env.KIN_CRAG_V2_ROOT || '').trim() || path.join(projectRoot, 'share/crag/kernels/v2', arch)
   try {
@@ -382,7 +492,7 @@ function restoreDirectoryContents(backup, dest) {
   }
 }
 
-export function stageCragV2Tree(src, dest) {
+export function stageCragV2Tree(src, dest, { arch } = {}) {
   const parent = path.dirname(dest)
   const staging = fs.mkdtempSync(path.join(parent, `.${path.basename(dest)}.new-`))
   let backup = ''
@@ -390,7 +500,7 @@ export function stageCragV2Tree(src, dest) {
     fs.cpSync(src, staging, { recursive: true, dereference: false })
     // mkdtemp is 0700. The slot user is not root, so it cannot exec the bootstrap inside it.
     fs.chmodSync(staging, 0o755)
-    const verified = verifyCragV2Tree(staging)
+    const verified = verifyCragV2Tree(staging, arch ? { arch } : undefined)
     if (!verified.ok) {
       fs.rmSync(staging, { recursive: true, force: true })
       return verified
@@ -444,10 +554,10 @@ function publishCragTree(src, dest) {
   }
 }
 
-function cragV2WouldChange(src, destDir, select = true) {
+function cragV2WouldChange(src, destDir, select = true, arch = cragV2Arch()) {
   const destRoot = path.join(destDir, CRAG_V2_DIR)
   if (!filesEqual(path.join(src, 'manifest.json'), path.join(destRoot, 'manifest.json'))) return true
-  if (verifyCragV2Tree(destRoot, { allowPreviousClaude: true }).ok !== true) return true
+  if (verifyCragV2Tree(destRoot, { arch, allowPreviousClaude: true }).ok !== true) return true
   if (!select) return false
   try {
     const wrapper = fs.lstatSync(path.join(destDir, WRAP_KERNEL_WRAPPER))
@@ -476,26 +586,42 @@ function writeCragV2Wrapper(destDir) {
   }
 }
 
-export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, select = true } = {}) {
+function missingCragPackageResult(projectRoot, slotArch) {
+  if (slotArch && slotArch !== 'amd64') {
+    try {
+      if (cragV2PackageRoot(projectRoot, 'amd64')) {
+        return {
+          ok: false,
+          code: 'crag_v2_arch_mismatch',
+          error: `CRAG v2 arch amd64 does not match ${slotArch}`,
+        }
+      }
+    } catch {}
+  }
+  return {
+    ok: false,
+    code: 'crag_v2_package_missing',
+    error: 'CRAG v2 package missing (share/crag/kernels/v2/<arch> or KIN_CRAG_V2_ROOT)',
+  }
+}
+
+export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, select = true, ...runtimeOptions } = {}) {
   if (!projectRoot || !vm?.id) {
     return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
   }
   const placement = cragV2PlacementError(vm)
   if (placement) return placement
+  const slotArch = cragSlotArch(projectRoot, vm, runtimeOptions)
   let src
   try {
-    src = cragV2PackageRoot(projectRoot)
+    src = cragV2PackageRoot(projectRoot, slotArch)
   } catch (error) {
     return { ok: false, code: error.code, error: error.message }
   }
   if (!src) {
-    return {
-      ok: false,
-      code: 'crag_v2_package_missing',
-      error: 'CRAG v2 package missing (share/crag/kernels/v2/<arch> or KIN_CRAG_V2_ROOT)',
-    }
+    return missingCragPackageResult(projectRoot, slotArch)
   }
-  const verified = verifyCragV2Tree(src)
+  const verified = verifyCragV2Tree(src, { arch: slotArch })
   if (!verified.ok) return verified
   // Preinstallation only copies encrypted distribution files; runtime admission
   // and the encrypted native binary itself enforce licensing on start. Keep refusing
@@ -529,7 +655,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, sel
   }
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
-  if (!cragV2WouldChange(src, dest, select)) {
+  if (!cragV2WouldChange(src, dest, select, slotArch)) {
     try {
       fs.chmodSync(path.join(dest, CRAG_V2_DIR), 0o755)
     } catch {}
@@ -548,7 +674,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, sel
       kernel_bin: true,
     }
   }
-  const tree = stageCragV2Tree(src, path.join(dest, CRAG_V2_DIR))
+  const tree = stageCragV2Tree(src, path.join(dest, CRAG_V2_DIR), { arch: slotArch })
   if (!tree.ok) return tree
   try {
     if (select) writeCragV2Wrapper(dest)
@@ -912,7 +1038,11 @@ function installKernelPayload(src, dest, projectRoot = '') {
   return kernelChanged
 }
 
-export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null, nativeCliOptions } = {}) {
+export function materializeWrapCli(
+  projectRoot,
+  vm,
+  { uid = null, gid = null, nativeCliOptions, ...runtimeOptions } = {},
+) {
   if (!projectRoot || !vm?.id) {
     return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
   }
@@ -927,7 +1057,7 @@ export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null, na
   const native = nativeCliForVm(vm, src, nativeCliOptions)
   if (native && !native.ok) return native
   if (isKvmRuntime(vm) && !isCodexVm(vm) && !clusterDockerSlot(vm)) {
-    const crag = materializeCragV2(projectRoot, vm, { uid, gid, select: false })
+    const crag = materializeCragV2(projectRoot, vm, { uid, gid, select: false, ...runtimeOptions })
     if (!crag.ok) return crag
   }
   const dest = wrapCliHomeDir(projectRoot, vm.id)
@@ -1228,7 +1358,7 @@ function payloadWouldChange(srcDir, destDir, projectRoot, native) {
   ]
   return pairs.some(([src, dest]) => kernelWouldChange(src, dest))
 }
-export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptions } = {}) {
+export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptions, ...runtimeOptions } = {}) {
   const sample = describeWrapSample(projectRoot)
   const items = []
   for (const vm of vms || []) {
@@ -1237,9 +1367,10 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
     const destDir = wrapCliHomeDir(projectRoot, vm.id)
     if (dataplane === 'crag') {
       const placement = cragV2PlacementError(vm)
+      const slotArch = cragSlotArch(projectRoot, vm, runtimeOptions)
       let src
       try {
-        src = cragV2PackageRoot(projectRoot)
+        src = cragV2PackageRoot(projectRoot, slotArch)
       } catch (error) {
         items.push({ id: vm.id, dataplane, kernel_version: 'v2', ok: false, code: error.code, kernel_changed: false })
         continue
@@ -1256,17 +1387,18 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
         continue
       }
       if (!src) {
+        const missing = missingCragPackageResult(projectRoot, slotArch)
         items.push({
           id: vm.id,
           dataplane,
           kernel_version: 'v2',
           ok: false,
-          code: 'crag_v2_package_missing',
+          code: missing.code,
           kernel_changed: false,
         })
         continue
       }
-      const verified = verifyCragV2Tree(src)
+      const verified = verifyCragV2Tree(src, { arch: slotArch })
       if (!verified.ok) {
         items.push({
           id: vm.id,
@@ -1280,7 +1412,7 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
       }
       const kernelChanged = clusterDockerSlot(vm)
         ? false
-        : cragV2WouldChange(src, destDir) || Boolean(vm?.kernel_restart_pending)
+        : cragV2WouldChange(src, destDir, true, slotArch) || Boolean(vm?.kernel_restart_pending)
       items.push({ id: vm.id, dataplane, kernel_version: 'v2', ok: true, kernel_changed: kernelChanged })
       continue
     }

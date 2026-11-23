@@ -305,3 +305,71 @@ test('native systemd update reads only existing service key/port when .env is ab
   assert.deepEqual(await localPanelApi(f.root)('/fixture'), { verified: true })
   assert.equal(fs.existsSync(path.join(f.root, '.env')), false)
 })
+
+test('mixed-arch dormant non-CRAG cache is skipped instead of failing with crag_v2_arch_mismatch', async (t) => {
+  const f = fixture(t)
+  const otherArch = process.arch === 'arm64' ? 'amd64' : 'arm64'
+  const activeArch = process.arch === 'arm64' ? 'arm64' : 'amd64'
+  for (const id of ['vm-live', 'vm-stop']) {
+    const file = path.join(f.root, 'vms', `${id}.json`)
+    const record = JSON.parse(fs.readFileSync(file, 'utf8'))
+    fs.writeFileSync(file, JSON.stringify({ ...record, runtime: { arch: activeArch } }))
+  }
+  const dormantPkg = seedEncryptedPackage(f.root, { revision: 'dormant-other-arch', arch: otherArch })
+  const dormantVm = { id: 'vm-other-cache', dataplane: 'wrap', status: 'stopped', runtime: { arch: otherArch } }
+  fs.writeFileSync(path.join(f.root, 'vms/vm-other-cache.json'), JSON.stringify(dormantVm))
+  const dormantDir = path.join(f.root, 'vms/vm-other-cache/cli-home/.kin')
+  fs.mkdirSync(dormantDir, { recursive: true })
+  fs.cpSync(dormantPkg, path.join(dormantDir, 'crag-v2'), { recursive: true })
+  const dormantManifestBefore = fs.readFileSync(path.join(dormantDir, 'crag-v2/manifest.json'))
+  // Remove the other-arch host cache so only activeArch exists in share/crag/kernels/v2.
+  fs.rmSync(dormantPkg, { recursive: true, force: true })
+
+  const result = await updateCrag(f.root, f)
+  assert.equal(result.ok, true)
+  const otherItem = result.items.find((row) => row.id === 'vm-other-cache')
+  assert.equal(otherItem.action, 'skip')
+  assert.deepEqual(fs.readFileSync(path.join(dormantDir, 'crag-v2/manifest.json')), dormantManifestBefore)
+})
+
+test('mixed-arch active local CRAG slots pull and verify each slot against its own architecture package', async (t) => {
+  const f = fixture(t)
+  const amdPkg = seedEncryptedPackage(f.root, { revision: 'amd-new', arch: 'amd64' })
+  const armPkg = seedEncryptedPackage(f.root, { revision: 'arm-new', arch: 'arm64' })
+  for (const [id, arch] of [
+    ['vm-live', 'amd64'],
+    ['vm-stop', 'arm64'],
+    ['vm-cache', 'arm64'],
+  ]) {
+    const file = path.join(f.root, 'vms', `${id}.json`)
+    const record = JSON.parse(fs.readFileSync(file, 'utf8'))
+    fs.writeFileSync(file, JSON.stringify({ ...record, runtime: { arch } }))
+  }
+  const pulledArchs = []
+  const pull = async (_root, _opts, runtimeOpts = {}) => {
+    pulledArchs.push(runtimeOpts.arch || 'primary')
+    return { ok: true, release: { tag: 'payload-2026.11.20-crag-3.1.8', payload_tag: 'payload-2026.11.20-crag-3.1.8' } }
+  }
+  let items
+  const api = async (endpoint, body) => {
+    if (endpoint === '/api/panel/kernels/crag-update') {
+      items = body.targets.map(({ id, payload_tag }) => {
+        const vm = JSON.parse(fs.readFileSync(path.join(f.root, 'vms', `${id}.json`), 'utf8'))
+        const dest = path.join(f.root, 'vms', id, 'cli-home/.kin/crag-v2')
+        fs.rmSync(dest, { recursive: true, force: true })
+        fs.cpSync(vm.runtime.arch === 'arm64' ? armPkg : amdPkg, dest, { recursive: true })
+        return { id, ok: true, status: vm.status, payload_tag }
+      })
+      return { job_id: 'install-job' }
+    }
+    return { state: 'completed', report: { ok: true, items } }
+  }
+  const coreHashes = async (vm) => {
+    const pkgDir = vm.runtime?.arch === 'arm64' ? armPkg : amdPkg
+    return [JSON.parse(fs.readFileSync(path.join(pkgDir, 'manifest.json'), 'utf8')).payload.plaintext_sha256]
+  }
+  const result = await updateCrag(f.root, { ...f, pull, api, coreHashes })
+  assert.equal(result.ok, true)
+  assert.deepEqual(pulledArchs, ['primary', 'arm64'])
+  assert.equal(verifyCragV2Tree(path.join(f.root, 'vms/vm-cache/cli-home/.kin/crag-v2'), { arch: 'arm64' }).ok, true)
+})

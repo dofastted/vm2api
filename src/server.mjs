@@ -1395,7 +1395,11 @@ const server = http.createServer(async (req, res) => {
 
     if (
       backupService.isRestoring &&
-      (p.startsWith('/v1/') || p === '/messages' || p === '/chat/completions' || p === '/responses')
+      (p.startsWith('/v1/') ||
+        p.startsWith('/v1beta/') ||
+        p === '/messages' ||
+        p === '/chat/completions' ||
+        p === '/responses')
     ) {
       return json(
         res,

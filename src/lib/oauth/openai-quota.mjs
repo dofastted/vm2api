@@ -352,6 +352,18 @@ function refreshStateKey(projectRoot, vmId) {
   return `${String(projectRoot || '')}\0${String(vmId || '')}`
 }
 
+function slotRefreshIdentity(projectRoot, vmId) {
+  const vm = getVm(projectRoot, vmId)
+  const first = readCodexAccounts(projectRoot, vmId)[0] || {}
+  const accountId = firstString(first.chatgpt_account_id, vm?.codex?.chatgpt_account_id)
+  const email = firstString(first.email, vm?.codex?.email)
+  const access = firstString(first.access_token, vm?.codex?.access_token)
+  const refresh = firstString(first.refresh_token, vm?.codex?.refresh_token)
+  const tokenHash =
+    access || refresh ? crypto.createHash('sha256').update(`${access}\0${refresh}`).digest('hex').slice(0, 16) : ''
+  return `${vm?.created_at || ''}\0${accountId}\0${email}\0${tokenHash}`
+}
+
 function clearRefreshCooldown(projectRoot, vmId) {
   const entry = staleCreditsRefreshState.get(refreshStateKey(projectRoot, vmId))
   if (entry) entry.cooldownUntil = 0
@@ -464,8 +476,13 @@ export async function refreshStaleCodexCreditsForVm(
   const key = refreshStateKey(projectRoot, vmId)
   let entry = staleCreditsRefreshState.get(key)
   if (!entry) {
-    entry = { inflight: null, cooldownUntil: 0 }
+    entry = { inflight: null, cooldownUntil: 0, identity: '' }
     staleCreditsRefreshState.set(key, entry)
+  }
+  const currentIdentity = slotRefreshIdentity(projectRoot, vmId)
+  if (!entry.inflight && entry.identity && entry.identity !== currentIdentity) {
+    entry.cooldownUntil = 0
+    entry.identity = currentIdentity
   }
   if (!entry.inflight && entry.cooldownUntil > startNow) {
     return {
@@ -492,6 +509,7 @@ export async function refreshStaleCodexCreditsForVm(
         const finishNow = currentNow()
         const vmAfter = getVm(projectRoot, vmId)
         const spendable = Boolean(result?.ok && hasSpendableCodexCredits(vmAfter, finishNow))
+        entry.identity = slotRefreshIdentity(projectRoot, vmId)
         if (spendable) {
           entry.cooldownUntil = 0
           return { ok: true, refreshed: true, spendable: true, cooldownUntil: 0, result }
@@ -511,6 +529,7 @@ export async function refreshStaleCodexCreditsForVm(
         }
       } catch (err) {
         const finishNow = currentNow()
+        entry.identity = slotRefreshIdentity(projectRoot, vmId)
         entry.cooldownUntil = finishNow + duration
         return {
           ok: false,

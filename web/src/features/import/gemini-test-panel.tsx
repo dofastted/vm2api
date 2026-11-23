@@ -80,6 +80,13 @@ export function GeminiTestPanel({
         : !environment.proxy_id || environment.proxy_ready === false
           ? '请在「代理」绑定可用的 IPv4 SOCKS5 代理。'
           : null
+  const licenseBlocked =
+    !unavailable &&
+    isOAuth &&
+    environment.crag_license &&
+    environment.crag_license.valid === false
+      ? '请先在「账号」绑定 CRAGGemini 订阅席位，再发起 OAuth 测试对话。'
+      : null
   const pull = useGeminiMutation({
     mutationFn: () =>
       api<GeminiEnvironment>(`${resource}/models`, { method: 'POST' }),
@@ -100,7 +107,11 @@ export function GeminiTestPanel({
     promptEncoder.encode(trimmedPrompt).length > MAX_PROMPT_BYTES
   const inputDisabled = busy || !!unavailable
   const startDisabled =
-    inputDisabled || !selected || !trimmedPrompt || promptTooLong
+    inputDisabled ||
+    Boolean(licenseBlocked) ||
+    !selected ||
+    !trimmedPrompt ||
+    promptTooLong
   const result = test.result
   const usage = result?.usage
 
@@ -125,9 +136,9 @@ export function GeminiTestPanel({
                 ? '使用此环境的 Google 授权。回复会在测试成功后显示。'
                 : '使用此环境的 Gemini API Key。回复会在测试成功后显示。'}
             </p>
-            {unavailable ? (
+            {unavailable || licenseBlocked ? (
               <p role='status' className='text-sm text-muted-foreground'>
-                {unavailable}
+                {unavailable || licenseBlocked}
               </p>
             ) : null}
             <div className='space-y-1.5'>

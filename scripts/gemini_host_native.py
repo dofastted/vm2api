@@ -64,14 +64,30 @@ class EligibilityDiagnostic:
                 else:
                     self.pending.extend(piece)
             if ended:
-                if not self.discard_line and re.fullmatch(
-                    rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
-                    rb"Account ineligible: [^\r\n]{0,256}not eligible for Antigravity, "
-                    rb"because it is not currently available in your location\.\r?\n",
-                    self.pending,
-                ):
-                    with self._lock:
-                        self.code = "gemini_location_unsupported"
+                if not self.discard_line:
+                    if re.fullmatch(
+                        rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
+                        rb"Account ineligible: [^\r\n]{0,256}not eligible for Antigravity, "
+                        rb"because it is not currently available in your location\.\r?\n",
+                        self.pending,
+                    ):
+                        with self._lock:
+                            self.code = "gemini_location_unsupported"
+                    elif re.fullmatch(
+                        rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
+                        rb"Account ineligible: [^\r\n]{0,256}[Vv]erify your account[^\r\n]{0,256}\r?\n",
+                        self.pending,
+                    ):
+                        with self._lock:
+                            self.code = "gemini_account_verification_required"
+                    elif re.fullmatch(
+                        rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
+                        rb"Account ineligible: [^\r\n]{1,512}\r?\n",
+                        self.pending,
+                    ):
+                        with self._lock:
+                            if self.code is None:
+                                self.code = "gemini_account_ineligible"
                 self.pending.clear()
                 self.discard_line = False
 
@@ -519,7 +535,13 @@ def run_request(request):
         )
         response.begin()
         if response.status != 200:
-            raise NativeFailure("gemini_inference_failed")
+            raw = response.read(64 * 1024)
+            err_payload = None
+            try:
+                err_payload = json.loads(raw) if raw else None
+            except ValueError:
+                err_payload = None
+            raise _map_worker_error(response.status, err_payload)
         frames = []
         pending = bytearray()
         total = 0
