@@ -248,7 +248,9 @@ test('cleanStaging removes unfinished backup staging dirs and nothing else', asy
   assert.equal(fs.existsSync(path.join(tmp, 'kin-backup-notes.txt')), true)
 })
 
-test('abortRunning stops a backup in progress and frees the service for the next run', { skip: !tarAvailable() }, async () => {
+test('abortRunning stops a backup in progress and frees the service for the next run', {
+  skip: !tarAvailable(),
+}, async () => {
   const run = svc.createBackup({ kind: 'manual' })
   // Let the worker start before stopping it.
   while (!svc._worker) await new Promise((resolve) => setImmediate(resolve))
@@ -258,20 +260,60 @@ test('abortRunning stops a backup in progress and frees the service for the next
   assert.equal(await svc.abortRunning(), false, 'nothing left to stop')
 })
 
-test('killChildArchivers stops a tar this process spawned and leaves other children alone', { skip: process.platform !== 'linux' }, async () => {
+test('killChildArchivers stops a tar this process spawned and leaves other children alone', {
+  skip: process.platform !== 'linux',
+}, async () => {
   const { killChildArchivers } = await import('../../src/lib/admin/backup-service.mjs')
   const { spawn } = await import('node:child_process')
   const bin = path.join(root, 'fakebin')
   fs.mkdirSync(bin, { recursive: true })
-  fs.copyFileSync('/bin/sleep', path.join(bin, 'tar'))
-  fs.chmodSync(path.join(bin, 'tar'), 0o755)
-  const tar = spawn(path.join(bin, 'tar'), ['30'], { stdio: 'ignore' })
+  // A script, not a renamed /bin/sleep: on uutils coreutils (Ubuntu 26.04) sleep is a multicall
+  // binary that picks the tool from its own file name, so a copy named tar exits at once. The
+  // kernel names a script's process after the script, so comm is still "tar".
+  const fake = path.join(bin, 'tar')
+  fs.writeFileSync(fake, '#!/bin/sh\nread line\n', { mode: 0o755 })
+  const tar = spawn(fake, [], { stdio: ['pipe', 'ignore', 'ignore'] })
   const other = spawn('/bin/sleep', ['30'], { stdio: 'ignore' })
+  const errors = []
+  for (const child of [tar, other]) child.once('error', (e) => errors.push(e.message))
   const exited = (child) => new Promise((resolve) => child.once('exit', (code, signal) => resolve(signal)))
   const tarExit = exited(tar)
-  await new Promise((resolve) => setTimeout(resolve, 100))
+  const comm = (pid) => {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+      return stat.slice(stat.indexOf('(') + 1, stat.lastIndexOf(')'))
+    } catch {
+      return null
+    }
+  }
+  // Wait until the exec is visible instead of sleeping a fixed time.
+  const deadline = Date.now() + 5000
+  while (comm(tar.pid) !== 'tar' && Date.now() < deadline && !errors.length && tar.exitCode == null) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  const children = () =>
+    fs
+      .readdirSync('/proc')
+      .filter((e) => /^\d+$/.test(e))
+      .map((pid) => {
+        try {
+          const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+          const close = stat.lastIndexOf(')')
+          return {
+            pid,
+            comm: stat.slice(stat.indexOf('(') + 1, close),
+            ppid: Number(stat.slice(close + 2).split(' ')[1]),
+          }
+        } catch {
+          return null
+        }
+      })
+      .filter((row) => row && row.ppid === process.pid)
   try {
-    assert.equal(killChildArchivers(), 1)
+    assert.deepEqual(errors, [], 'children spawned')
+    assert.equal(tar.exitCode, null, `fake tar is alive (exit ${tar.exitCode}, comm ${comm(tar.pid)})`)
+    const seen = children()
+    assert.equal(killChildArchivers(), 1, `children of ${process.pid}: ${JSON.stringify(seen)}`)
     assert.equal(await tarExit, 'SIGTERM')
     assert.equal(other.exitCode, null)
     assert.equal(other.signalCode, null)

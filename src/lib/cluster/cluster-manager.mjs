@@ -238,7 +238,9 @@ export class ClusterManager {
     for (;;) {
       const now = count()
       if (now.ready === now.total || Date.now() >= deadline) return now
-      await new Promise((resolve) => setTimeout(resolve, pollMs).unref?.())
+      // Not unref'd: the wait is bounded, and an unref'd timer lets the process exit mid-wait when
+      // nothing else is pending (every link failed fast).
+      await new Promise((resolve) => setTimeout(resolve, pollMs))
     }
   }
 
