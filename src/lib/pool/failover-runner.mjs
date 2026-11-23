@@ -31,8 +31,17 @@ const REPAIR_HOP_WAIT_MS = 30_000
 const SEARCH_REPAIR_IDLE_MS = 60 * 60 * 1000
 const SEARCH_REPAIR_LIMIT = 512
 
+// A slot whose kernel is healthy but whose inference keeps hanging trips the
+// timeout circuit again right after the watchdog clears it. The first trip
+// stays short (one watchdog tick) so a pool-wide upstream stall cannot park
+// every slot; a repeat within the window holds the fault 15/30/60 minutes.
+const TIMEOUT_TRIP_WINDOW_MS = 2 * 60 * 60_000
+const TIMEOUT_HOLD_BASE_MS = 15 * 60_000
+const TIMEOUT_HOLD_MAX_MS = 60 * 60_000
+
 export const vmTimeoutTracker = {
   counts: new Map(),
+  trips: new Map(),
   recordTimeout(vmId, threshold = 3) {
     if (!vmId) return false
     const entry = this.counts.get(vmId) || { count: 0, lastAt: 0 }
@@ -41,14 +50,37 @@ export const vmTimeoutTracker = {
     this.counts.set(vmId, entry)
     return entry.count >= threshold
   },
-  recordSuccess(vmId) {
-    if (vmId) this.counts.delete(vmId)
+  /** The circuit opened for this VM: remember when, for the repeat-trip hold. */
+  recordTrip(vmId, now = Date.now()) {
+    if (!vmId) return 0
+    const recent = (this.trips.get(vmId) || []).filter((at) => now - at < TIMEOUT_TRIP_WINDOW_MS)
+    recent.push(now)
+    this.trips.set(vmId, recent)
+    return recent.length
   },
+  /** Until when a healthy kernel must not clear this VM's timeout fault (0 = no hold). */
+  faultHoldUntil(vmId, now = Date.now()) {
+    const recent = (this.trips.get(vmId) || []).filter((at) => now - at < TIMEOUT_TRIP_WINDOW_MS)
+    if (recent.length < 2) return 0
+    const holdMs = Math.min(TIMEOUT_HOLD_MAX_MS, TIMEOUT_HOLD_BASE_MS * 2 ** (recent.length - 2))
+    return recent[recent.length - 1] + holdMs
+  },
+  recordSuccess(vmId) {
+    if (!vmId) return
+    this.counts.delete(vmId)
+    this.trips.delete(vmId)
+  },
+  /** Clears the consecutive count only: trip history survives a fault reset and ends on a real success. */
   reset(vmId) {
     if (vmId) this.counts.delete(vmId)
-    else this.counts.clear()
+    else {
+      this.counts.clear()
+      this.trips.clear()
+    }
   },
 }
+
+export const TIMEOUT_FAULT_PREFIX = 'consecutive_timeouts:'
 
 const DEFAULTS = {
   max_account_switches: 10,
@@ -661,8 +693,14 @@ export class FailoverRunner {
         if (isTimeout && ttft == null) {
           const tripped = vmTimeoutTracker.recordTimeout(vmId, 3)
           if (tripped) {
-            const fault = `consecutive_timeouts: VM ${vmId} had 3 consecutive silent inference timeouts`
-            console.error(`[vm-circuit] ${fault}; marking kernel fault to prevent routing`)
+            // In-flight hangs that land after the circuit opened are the same incident.
+            const trips = kernelFaults.has(vmId)
+              ? (vmTimeoutTracker.trips.get(vmId) || []).length
+              : vmTimeoutTracker.recordTrip(vmId)
+            const holdUntil = vmTimeoutTracker.faultHoldUntil(vmId)
+            const fault = `${TIMEOUT_FAULT_PREFIX} VM ${vmId} had 3 consecutive silent inference timeouts`
+            const hold = holdUntil ? `, trip ${trips} in 2h, held until ${new Date(holdUntil).toISOString()}` : ''
+            console.error(`[vm-circuit] ${fault}; marking kernel fault to prevent routing${hold}`)
             kernelFaults.set(vmId, fault)
           }
         }
