@@ -102,7 +102,7 @@ function toolArguments(call) {
 }
 
 /** Chat message → Responses items. Tool-only assistant turns stay function_call items, not empty text. */
-function chatMessageToItems(message) {
+export function chatMessageToItems(message) {
   if (!message || typeof message !== 'object') return []
   if (message.role === 'tool') {
     const output = typeof message.content === 'string' ? message.content : textParts(message.content)
