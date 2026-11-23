@@ -14,6 +14,10 @@
  * with deferUntilExclusive() and runs once the peer has exited (markExclusive()).
  */
 
+/** 503 codes a non-leader returns (docs/BLUEGREEN.md). */
+export const CONTROLLER_STANDBY = 'controller_standby'
+export const CONTROLLER_DRAINING = 'controller_draining'
+
 let role = 'leader'
 let overlap = false
 const deferred = new Map()

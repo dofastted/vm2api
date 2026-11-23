@@ -8,7 +8,16 @@
  * ~/.claude.json and complete a plan turn.
  */
 import { spawn, spawnSync } from 'node:child_process'
-import { handoverRole, setHandoverRole, setOverlap, markExclusive, deferredKeys, deferUntilExclusive } from './lib/core/handover.mjs'
+import {
+  CONTROLLER_DRAINING,
+  CONTROLLER_STANDBY,
+  handoverRole,
+  setHandoverRole,
+  setOverlap,
+  markExclusive,
+  deferredKeys,
+  deferUntilExclusive,
+} from './lib/core/handover.mjs'
 import {
   createForeignLoad,
   exportLiveLoad,
@@ -93,7 +102,12 @@ import { extraIsLiveOpen, parseResetMs } from './lib/pool/quota-window.mjs'
 import { createCragSubscription } from './lib/vm/crag-subscription.mjs'
 import { createCragRuntimeInventory } from './lib/vm/crag-runtime-inventory.mjs'
 import { configureCragRuntimeAdmission } from './lib/vm/slot-runtime-admission.mjs'
-import { syncRemoteSlotRestartPolicy } from './lib/cluster/remote-slot.mjs'
+import {
+  inspectClusterPayloadChanges,
+  refreshClusterSlotPayloads,
+  refreshNodeSlotPayload,
+  syncRemoteSlotRestartPolicy,
+} from './lib/cluster/remote-slot.mjs'
 import { installedCragV2Root } from './lib/vm/wrap-cli-runtime.mjs'
 import { makeError, ErrorType, ErrorCode } from './lib/core/errors.mjs'
 import * as panel from './lib/admin/panel-api.mjs'
@@ -226,7 +240,9 @@ async function activateStandby(reason = 'signal') {
   const lock = await controlPlaneFlock(['-w', String(Number(process.env.KIN_STANDBY_LOCK_WAIT_SEC) || 30), '-E', '75'])
   activating = false
   if (lock.status !== 0) {
-    console.error(JSON.stringify({ event: 'standby-activate-failed', reason: lock.status === 75 ? 'lock_busy' : lock.stderr }))
+    console.error(
+      JSON.stringify({ event: 'standby-activate-failed', reason: lock.status === 75 ? 'lock_busy' : lock.stderr }),
+    )
     return false
   }
   standbyActive = true
@@ -237,7 +253,7 @@ async function activateStandby(reason = 'signal') {
   try {
     foreignLoadReader = startLoadReader({
       file: foreignLoadPath(dataDir),
-      foreign: createForeignLoad({ scheduler: poolScheduler, accountQuota }),
+      foreign: createForeignLoad({ scheduler: poolScheduler, accountQuota, apiKeys: apiKeyStore }),
       // Ends the overlap on its own if the deploy script never sends SIGHUP (watcher killed, host reboot).
       onGone: () => {
         console.log(JSON.stringify({ event: 'handover-peer-gone' }))
@@ -251,7 +267,8 @@ async function activateStandby(reason = 'signal') {
   for (const { name, fn } of standbyTasks.splice(0)) {
     try {
       const out = fn()
-      if (out && typeof out.catch === 'function') out.catch((e) => console.warn(`[standby] ${name} failed`, e?.message || e))
+      if (out && typeof out.catch === 'function')
+        out.catch((e) => console.warn(`[standby] ${name} failed`, e?.message || e))
     } catch (e) {
       console.warn(`[standby] ${name} failed`, e?.message || e)
     }
@@ -1455,39 +1472,39 @@ function stopLeaderJobs() {
   }
   try {
     vmTestSchedule.stop()
-    } catch {}
-    try {
-      backupService.stopScheduler()
-      void backupService.abortRunning()
-    } catch {}
-    try {
-      proxyPool.stopScheduler()
-    } catch {}
-    try {
-      healthMonitor?.stop?.()
-    } catch {}
-    try {
-      credentialRefreshMonitor?.stop?.()
-    } catch {}
-    try {
-      kernelWatchdog?.stop?.()
-      slotCapacityReconciler.stop()
-    } catch {}
-    try {
-      hostMemoryPressure?.stop?.()
-    } catch {}
-    try {
-      cliNodeGuard?.stop?.()
-    } catch {}
-    try {
-      usageProbeMonitor?.stop?.()
-    } catch {}
-    try {
-      catalogMonitor?.stop?.()
-    } catch {}
-    try {
-      notifyMonitor?.stop?.()
-    } catch {}
+  } catch {}
+  try {
+    backupService.stopScheduler()
+    void backupService.abortRunning()
+  } catch {}
+  try {
+    proxyPool.stopScheduler()
+  } catch {}
+  try {
+    healthMonitor?.stop?.()
+  } catch {}
+  try {
+    credentialRefreshMonitor?.stop?.()
+  } catch {}
+  try {
+    kernelWatchdog?.stop?.()
+    slotCapacityReconciler.stop()
+  } catch {}
+  try {
+    hostMemoryPressure?.stop?.()
+  } catch {}
+  try {
+    cliNodeGuard?.stop?.()
+  } catch {}
+  try {
+    usageProbeMonitor?.stop?.()
+  } catch {}
+  try {
+    catalogMonitor?.stop?.()
+  } catch {}
+  try {
+    notifyMonitor?.stop?.()
+  } catch {}
 }
 
 // Blue/green step 2 (SIGUSR1): stop every leader job and hand the data-dir lock to the standby.
@@ -1505,14 +1522,20 @@ async function handoverLeadership() {
   try {
     foreignLoadWriter = startLoadWriter({
       file: foreignLoadPath(dataDir),
-      read: () => exportLiveLoad({ scheduler: poolScheduler, accountQuota }),
+      read: () => exportLiveLoad({ scheduler: poolScheduler, accountQuota, apiKeys: apiKeyStore }),
     })
   } catch (e) {
     console.warn('[handover] foreign load writer failed', e?.message || e)
   }
   const unlocked = await controlPlaneFlock(['-u'])
   endPanelStreams()
-  console.log(JSON.stringify({ event: 'handover-released', ok: unlocked.status === 0, inflight: gracefulShutdown.getActiveCount() }))
+  console.log(
+    JSON.stringify({
+      event: 'handover-released',
+      ok: unlocked.status === 0,
+      inflight: gracefulShutdown.getActiveCount(),
+    }),
+  )
   return unlocked.status === 0
 }
 
@@ -1594,10 +1617,17 @@ const server = http.createServer(async (req, res) => {
       // Admin writes go only to the leader; a standby serves nothing until it holds the lock.
       res.setHeader('Connection', 'close')
       return json(res, 503, {
-        error: { type: 'overloaded_error', code: `controller_${role}`, message: 'Gateway is switching versions; retry shortly' },
+        error: {
+          type: 'overloaded_error',
+          code: role === 'standby' ? CONTROLLER_STANDBY : CONTROLLER_DRAINING,
+          message: 'Gateway is switching versions; retry shortly',
+        },
       })
     }
-    if (p === '/api/panel/pool/stream' || (p.startsWith('/api/panel/') && String(req.headers.accept || '').includes('text/event-stream'))) {
+    if (
+      p === '/api/panel/pool/stream' ||
+      (p.startsWith('/api/panel/') && String(req.headers.accept || '').includes('text/event-stream'))
+    ) {
       panelStreams.add(res)
       res.once('close', () => panelStreams.delete(res))
     }
@@ -1894,15 +1924,59 @@ function runExclusivePass() {
         project: cfg.paths.project,
         routingConfig,
         body: { restart: true },
-        restartKernel: (exec) => requestKernelReloadWhenIdle(exec),
+        // Settles when the kernel actually reloaded, so the summary does not report a pending reload as done.
+        restartKernel: async (exec) => {
+          const r = requestKernelReloadWhenIdle(exec)
+          return r?.done ? await r.done : r
+        },
+        refreshCluster: (project, vms, opts) =>
+          refreshClusterSlotPayloads(project, vms, { ...opts, refreshFn: refreshClusterSlotWhenIdle }),
       }).catch((e) => ({ ok: false, error: e?.message || String(e) }))
-      console.log(JSON.stringify({ event: 'handover-wrap-sync', ok: summary?.ok !== false }))
+      const failed = (summary?.items || []).filter((item) => !item.ok)
+      console.log(
+        JSON.stringify({
+          event: 'handover-wrap-sync',
+          ok: summary?.ok !== false,
+          error: summary?.error || null,
+          failed: failed
+            .slice(0, 20)
+            .map((item) => ({ id: item.id, code: item.code || null, error: item.error || null })),
+        }),
+      )
     }
-    console.log(JSON.stringify({ event: 'handover-exclusive', synced: synced.status === 0, wrapChanged, deferred: keys, done }))
+    console.log(
+      JSON.stringify({ event: 'handover-exclusive', synced: synced.status === 0, wrapChanged, deferred: keys, done }),
+    )
   })()
   return exclusivePass
 }
 process.on('SIGHUP', () => void runExclusivePass())
+// A cluster slot takes a new payload by recreating its container, which would cut this leader's
+// streams on it. Build the image first, then recreate once the slot has no request here; a slot
+// that stays busy is left on its current payload for the next kernel sync.
+async function refreshClusterSlotWhenIdle(vm, projectRoot, opts = {}, { timeoutMs = 10 * 60_000, pollMs = 1000 } = {}) {
+  const check = await inspectClusterPayloadChanges(projectRoot, [vm], { routing: opts.routing }).catch(() => null)
+  const item = check?.items?.[0]
+  if (item && item.ok && item.kernel_changed === false) return refreshNodeSlotPayload(vm, projectRoot, opts)
+  if (!item?.native && vm.status === 'running') {
+    const built = await refreshNodeSlotPayload(vm, projectRoot, { ...opts, recreate: false })
+    if (!built?.ok) return built
+  }
+  const deadline = Date.now() + timeoutMs
+  while ((poolScheduler.vmInflight.get(vm.id) || 0) > 0) {
+    if (Date.now() >= deadline) {
+      return {
+        id: vm.id,
+        node_id: item?.node_id || null,
+        ok: false,
+        code: 'slot_busy',
+        error: 'slot stayed busy; payload left for the next kernel sync',
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs))
+  }
+  return refreshNodeSlotPayload(vm, projectRoot, opts)
+}
 function runCapture(cmd, args, { timeoutMs }) {
   return new Promise((resolve) => {
     let child
@@ -1928,7 +2002,9 @@ function runCapture(cmd, args, { timeoutMs }) {
 }
 
 if (process.env.KIN_CRS_MOCK !== '1') {
-  runAtActivation('restart-policies', () => syncLocalSlotRestartPolicies(listVms(cfg.paths.project), { routing: routingConfig }))
+  runAtActivation('restart-policies', () =>
+    syncLocalSlotRestartPolicies(listVms(cfg.paths.project), { routing: routingConfig }),
+  )
 }
 await bootApiKernel(cfg)
 server.keepAliveTimeout = 120_000
@@ -1937,146 +2013,146 @@ server.timeout = 0
 
 server.listen(cfg.port, cfg.host, () => {
   runAtActivation('background', () => {
-  if (process.env.KIN_CRS_MOCK !== '1') {
-    void cragSubscription.recover().catch(() => {
-      console.warn('[crag-subscription] startup recovery failed; use the administrator panel to retry')
-    })
-    const refresh = () =>
-      void cragSubscription.refreshExpiredEntitlement().catch(() => {
-        console.warn('[crag-subscription] expired quota refresh deferred')
+    if (process.env.KIN_CRS_MOCK !== '1') {
+      void cragSubscription.recover().catch(() => {
+        console.warn('[crag-subscription] startup recovery failed; use the administrator panel to retry')
       })
-    const timer = setInterval(refresh, 1_000).unref()
-    onLeaderStop(() => clearInterval(timer))
-    refresh()
-  }
-  if (cragShopActivationEnabled) {
-    const poll = () =>
-      void handleCragShop.pollActivation().catch(() => {
-        console.warn('[crag-shop] activation polling deferred')
-      })
-    const timer = setInterval(poll, 2_000).unref()
-    onLeaderStop(() => clearInterval(timer))
-    poll()
-  }
-  // An unpaid checkout link outliving its payment window is part of the order
-  // lifecycle, so this runs whether or not activation polling is enabled. One order
-  // per tick, so a backlog drains without bursting requests at the supplier.
-  {
-    const expireOrders = () =>
-      void handleCragShop.pollOrderExpiry().catch(() => {
-        console.warn('[crag-shop] order expiry deferred')
-      })
-    const timer = setInterval(expireOrders, 60_000).unref()
-    onLeaderStop(() => clearInterval(timer))
-    expireOrders()
-  }
-  // Installation intent is durable; reconnecting nodes must not depend on a lost HTTP callback.
-  if (process.env.KIN_CRS_MOCK !== '1') {
-    let resuming = false
-    const resume = async () => {
-      if (resuming) return
-      resuming = true
-      try {
-        const report = await resumePendingKernelInstalls({
-          projectRoot: cfg.paths.project,
-          routing: routingConfig,
-          watchdog: kernelWatchdog,
-          poolScheduler,
-          releaseStoppedBinding: cragSubscription.releaseStoppedBinding.bind(cragSubscription),
+      const refresh = () =>
+        void cragSubscription.refreshExpiredEntitlement().catch(() => {
+          console.warn('[crag-subscription] expired quota refresh deferred')
         })
-        for (const item of report.items) {
-          if (!item.ok) console.warn(`[kernel-install] ${item.id} recovery failed (${item.code})`)
+      const timer = setInterval(refresh, 1_000).unref()
+      onLeaderStop(() => clearInterval(timer))
+      refresh()
+    }
+    if (cragShopActivationEnabled) {
+      const poll = () =>
+        void handleCragShop.pollActivation().catch(() => {
+          console.warn('[crag-shop] activation polling deferred')
+        })
+      const timer = setInterval(poll, 2_000).unref()
+      onLeaderStop(() => clearInterval(timer))
+      poll()
+    }
+    // An unpaid checkout link outliving its payment window is part of the order
+    // lifecycle, so this runs whether or not activation polling is enabled. One order
+    // per tick, so a backlog drains without bursting requests at the supplier.
+    {
+      const expireOrders = () =>
+        void handleCragShop.pollOrderExpiry().catch(() => {
+          console.warn('[crag-shop] order expiry deferred')
+        })
+      const timer = setInterval(expireOrders, 60_000).unref()
+      onLeaderStop(() => clearInterval(timer))
+      expireOrders()
+    }
+    // Installation intent is durable; reconnecting nodes must not depend on a lost HTTP callback.
+    if (process.env.KIN_CRS_MOCK !== '1') {
+      let resuming = false
+      const resume = async () => {
+        if (resuming) return
+        resuming = true
+        try {
+          const report = await resumePendingKernelInstalls({
+            projectRoot: cfg.paths.project,
+            routing: routingConfig,
+            watchdog: kernelWatchdog,
+            poolScheduler,
+            releaseStoppedBinding: cragSubscription.releaseStoppedBinding.bind(cragSubscription),
+          })
+          for (const item of report.items) {
+            if (!item.ok) console.warn(`[kernel-install] ${item.id} recovery failed (${item.code})`)
+          }
+        } catch (error) {
+          console.warn(`[kernel-install] recovery pass failed (${error?.code || 'unknown'})`)
+        } finally {
+          resuming = false
         }
-      } catch (error) {
-        console.warn(`[kernel-install] recovery pass failed (${error?.code || 'unknown'})`)
-      } finally {
-        resuming = false
       }
+      void resume()
+      const timer = setInterval(resume, 15_000)
+      timer.unref()
+      onLeaderStop(() => clearInterval(timer))
     }
-    void resume()
-    const timer = setInterval(resume, 15_000)
-    timer.unref()
-    onLeaderStop(() => clearInterval(timer))
-  }
-  // Keep authorized CRAGGemini native kernels & resident agy slots warm across restarts.
-  if (process.env.KIN_CRS_MOCK !== '1') {
-    let warmingGemini = false
-    const warmGemini = async () => {
-      if (warmingGemini) return
-      warmingGemini = true
-      try {
-        await warmGeminiEnvironments({
-          callHost: callGeminiHost,
-          proxyPool: () => proxyPool,
-        })
-      } catch {
-        // Host daemon may be absent on non-Gemini installs; stay silent.
-      } finally {
-        warmingGemini = false
+    // Keep authorized CRAGGemini native kernels & resident agy slots warm across restarts.
+    if (process.env.KIN_CRS_MOCK !== '1') {
+      let warmingGemini = false
+      const warmGemini = async () => {
+        if (warmingGemini) return
+        warmingGemini = true
+        try {
+          await warmGeminiEnvironments({
+            callHost: callGeminiHost,
+            proxyPool: () => proxyPool,
+          })
+        } catch {
+          // Host daemon may be absent on non-Gemini installs; stay silent.
+        } finally {
+          warmingGemini = false
+        }
       }
+      void warmGemini()
+      const timer = setInterval(warmGemini, 30_000)
+      timer.unref()
+      server.once('close', () => clearInterval(timer))
     }
-    void warmGemini()
-    const timer = setInterval(warmGemini, 30_000)
-    timer.unref()
-    server.once('close', () => clearInterval(timer))
-  }
-  try {
-    vmTestSchedule.start()
-  } catch (e) {
-    console.warn('[vm-test-schedule] start failed', e?.message || e)
-  }
-  try {
-    healthMonitor?.start?.({ immediate: true })
-  } catch (e) {
-    console.warn('[health-probe] start failed', e?.message || e)
-  }
-  try {
-    credentialRefreshMonitor?.start?.({ immediate: true })
-  } catch (e) {
-    console.warn('[credential-refresh] start failed', e?.message || e)
-  }
-  try {
-    // Size slots before the watchdog compares kernel slot counts: otherwise a slot
-    // still recorded at its old small limits is reloaded down, then up again.
-    slotCapacityReconciler
-      .tick()
-      .catch(() => {})
-      .finally(() => {
-        slotCapacityReconciler.start()
-        kernelWatchdog?.start?.({ immediate: true })
-      })
-  } catch (e) {
-    console.warn('[kernel-watchdog] start failed', e?.message || e)
-  }
-  // Proxy slots do not auto-start with Docker: boot restores egress before starting recorded-running slots.
-  if (process.env.KIN_CRS_MOCK !== '1' && normalizeKernelWatchdogConfig(routingConfig.kernel_watchdog).enabled) {
-    reviveDownSlots({ vms: listVms(cfg.paths.project), powerOn: bootSlot, watchdog: kernelWatchdog }).catch((e) =>
-      console.warn('[slot-revive] boot pass failed', e?.message || e),
-    )
-  }
-  try {
-    cliNodeGuard?.start?.({ immediate: true })
-  } catch (e) {
-    console.warn('[cli-node-guard] start failed', e?.message || e)
-  }
-  try {
-    usageProbeMonitor?.start?.({ immediate: true })
-  } catch (e) {
-    console.warn('[usage-probe] start failed', e?.message || e)
-  }
-  // The KIN_CRS_MOCK harness promises no outbound network; catalogs stay on builtin data there.
-  if (process.env.KIN_CRS_MOCK !== '1') {
     try {
-      catalogMonitor?.start?.()
+      vmTestSchedule.start()
     } catch (e) {
-      console.warn('[catalog-sync] start failed', e?.message || e)
+      console.warn('[vm-test-schedule] start failed', e?.message || e)
     }
-  }
-  try {
-    notifyMonitor?.start?.({ immediate: true })
-  } catch (e) {
-    console.warn('[notify] start failed', e?.message || e)
-  }
+    try {
+      healthMonitor?.start?.({ immediate: true })
+    } catch (e) {
+      console.warn('[health-probe] start failed', e?.message || e)
+    }
+    try {
+      credentialRefreshMonitor?.start?.({ immediate: true })
+    } catch (e) {
+      console.warn('[credential-refresh] start failed', e?.message || e)
+    }
+    try {
+      // Size slots before the watchdog compares kernel slot counts: otherwise a slot
+      // still recorded at its old small limits is reloaded down, then up again.
+      slotCapacityReconciler
+        .tick()
+        .catch(() => {})
+        .finally(() => {
+          slotCapacityReconciler.start()
+          kernelWatchdog?.start?.({ immediate: true })
+        })
+    } catch (e) {
+      console.warn('[kernel-watchdog] start failed', e?.message || e)
+    }
+    // Proxy slots do not auto-start with Docker: boot restores egress before starting recorded-running slots.
+    if (process.env.KIN_CRS_MOCK !== '1' && normalizeKernelWatchdogConfig(routingConfig.kernel_watchdog).enabled) {
+      reviveDownSlots({ vms: listVms(cfg.paths.project), powerOn: bootSlot, watchdog: kernelWatchdog }).catch((e) =>
+        console.warn('[slot-revive] boot pass failed', e?.message || e),
+      )
+    }
+    try {
+      cliNodeGuard?.start?.({ immediate: true })
+    } catch (e) {
+      console.warn('[cli-node-guard] start failed', e?.message || e)
+    }
+    try {
+      usageProbeMonitor?.start?.({ immediate: true })
+    } catch (e) {
+      console.warn('[usage-probe] start failed', e?.message || e)
+    }
+    // The KIN_CRS_MOCK harness promises no outbound network; catalogs stay on builtin data there.
+    if (process.env.KIN_CRS_MOCK !== '1') {
+      try {
+        catalogMonitor?.start?.()
+      } catch (e) {
+        console.warn('[catalog-sync] start failed', e?.message || e)
+      }
+    }
+    try {
+      notifyMonitor?.start?.({ immediate: true })
+    } catch (e) {
+      console.warn('[notify] start failed', e?.message || e)
+    }
   })
   const addr = server.address()
   const boundPort = typeof addr === 'object' && addr ? addr.port : cfg.port
@@ -2105,15 +2181,16 @@ server.listen(cfg.port, cfg.host, () => {
       standby: STANDBY,
     }),
   )
-  if (syncWrapAtStartup) runAtActivation('wrap-sync', () => {
-    // Stay in the owning process: an HTTP request could hit a different controller after a failed start.
-    void Promise.resolve()
-      .then(() => syncInstalledKernels({ project: cfg.paths.project, routingConfig, body: { restart: true } }))
-      .then((report) => {
-        const summary = `${report.ok_count}/${report.total}, failed=${report.failed_count}`
-        if (report.ok) console.log(`vm2api: wrap-cli slot sync complete (${summary})`)
-        else console.error(`vm2api: wrap-cli slot sync failed (${summary})`)
-      })
-      .catch((error) => console.error(`vm2api: wrap-cli slot sync failed: ${error?.message || error}`))
-  })
+  if (syncWrapAtStartup)
+    runAtActivation('wrap-sync', () => {
+      // Stay in the owning process: an HTTP request could hit a different controller after a failed start.
+      void Promise.resolve()
+        .then(() => syncInstalledKernels({ project: cfg.paths.project, routingConfig, body: { restart: true } }))
+        .then((report) => {
+          const summary = `${report.ok_count}/${report.total}, failed=${report.failed_count}`
+          if (report.ok) console.log(`vm2api: wrap-cli slot sync complete (${summary})`)
+          else console.error(`vm2api: wrap-cli slot sync failed (${summary})`)
+        })
+        .catch((error) => console.error(`vm2api: wrap-cli slot sync failed: ${error?.message || error}`))
+    })
 })

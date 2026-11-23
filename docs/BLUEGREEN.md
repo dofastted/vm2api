@@ -36,7 +36,7 @@ deploy/bluegreen/bg-deploy.sh --restart  # 普通重启当前颜色：带新迁�
 重叠期间的保证：
 
 - **锁**：只有 leader 持有数据目录锁；draining 实例的面板/管理接口返回 503 `controller_draining`。`SIGUSR1` 只对蓝绿实例（`KIN_STANDBY=1`）生效。
-- **容量**：draining 实例把在途请求占用的槽、账号、席位写进 `data/run/handover-load.json`，新 leader 调度时算进去，不会把一个槽超发到两倍。
+- **容量**：draining 实例把在途请求占用的槽、账号、席位（含已离开原槽、子代理还在跑的 family 席位）和托管 key 的并发写进 `data/run/handover-load.json`，新 leader 调度时算进去，不会把一个槽超发到两倍。文件超过 15 秒没刷新时保留最后一份快照（日志 `handover-load-stale`，恢复时 `handover-load-fresh`），旧实例退出、文件被删或 60 秒无刷新才撤掉。
 - **共享资源**：每个颜色有自己的 api-kernel socket；draining 实例关停时不删节点 relay socket；出口容器、gate、内核重启、备份都等旧实例退出后再做。
 - **CRAG 授权文件**：新控制面先比对节点上已发布的订阅文件，相同就不重写；确实要更新时整组一次换上。
 - **数据库**：SQLite WAL，两个进程可以并发读写；结构变化由迁移护栏挡住。
@@ -117,5 +117,7 @@ docker compose up -d
 - 只支持单机。
 - 重叠期间内存约翻倍，长流越多重叠越久。
 - 旧实例退出前，新实例的出口/gate 重建、内核重启、备份都在排队；`BG_DRAIN_MS` 不宜比最长请求长太多。
+- 收尾时（`KIN_AUTO_SYNC_WRAP=1` 且 wrap 有变化）本机槽内核等空闲再重载；集群槽先建好镜像，等新 leader 在该槽上没有请求再重建容器，10 分钟内一直忙的槽留到下次内核同步（`handover-wrap-sync` 的 `failed` 里是 `slot_busy`）。
+- 新镜像改了 `kin-slot-gate` 时，收尾阶段重建节点 gate 会断开新 leader 经该 gate 的连接；gate 没有按连接排空的升级方式。
 - 带新迁移的版本不能蓝绿，只能 `--restart`。
 - 首次 `--bootstrap` 会中断一次。
