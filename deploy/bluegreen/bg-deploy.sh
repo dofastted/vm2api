@@ -5,6 +5,7 @@
 #   bg-deploy.sh               把 compose/.env 当前描述的版本部署到空闲颜色并切流量
 #   bg-deploy.sh --wait        同上，但前台等旧实例排空结束
 #   bg-deploy.sh --status      看颜色、角色、haproxy 状态
+#   bg-deploy.sh --cutover <old> <new>   新实例已激活但切 haproxy 失败时，修好 haproxy 后从第 4 步续做
 #
 # 顺序（见 src/lib/core/handover.mjs）：
 #   1 新颜色以 standby 启动（不拿锁、不跑后台任务、不改共享文件），预热完报 standby-warm
@@ -22,6 +23,7 @@
 #   BG_HAPROXY_SOCK     haproxy admin socket（默认 /run/haproxy/admin.sock）
 #   BG_HAPROXY_BACKEND  haproxy backend 名（默认 app，里面要有 server blue / server green）
 #   BG_HAPROXY_STATE    server-state-file 路径（默认 /var/lib/haproxy/server-state）
+#   BG_HAPROXY_CFG      haproxy 配置文件（默认 /etc/haproxy/haproxy.cfg；--bootstrap 用它启动/重载 haproxy）
 #   BG_COMPOSE_FILES    基础 compose 文件，空格分隔（默认 docker-compose.yml [+ docker-compose.override.yml]）
 #   BG_SERVICE          compose 服务名（默认 vm2api）
 #   BG_NAME             容器/项目名前缀（默认 vm2api → vm2api-blue / vm2api-green）
@@ -39,6 +41,7 @@ BG_GREEN_PORT=${BG_GREEN_PORT:-8789}
 BG_HAPROXY_SOCK=${BG_HAPROXY_SOCK:-/run/haproxy/admin.sock}
 BG_HAPROXY_BACKEND=${BG_HAPROXY_BACKEND:-app}
 BG_HAPROXY_STATE=${BG_HAPROXY_STATE:-/var/lib/haproxy/server-state}
+BG_HAPROXY_CFG=${BG_HAPROXY_CFG:-/etc/haproxy/haproxy.cfg}
 BG_SERVICE=${BG_SERVICE:-vm2api}
 BG_NAME=${BG_NAME:-vm2api}
 BG_DRAIN_MS=${BG_DRAIN_MS:-3600000}
@@ -57,6 +60,11 @@ LOG=$BG_STATE_DIR/deploy.log
 log() { echo "[bg $(date -u +%FT%TZ)] $*" | tee -a "$LOG" >&2; }
 hap() { echo "$1" | socat - "UNIX-CONNECT:$BG_HAPROXY_SOCK"; }
 hap_set() { hap "set server $BG_HAPROXY_BACKEND/$1 state $2" >/dev/null; }
+hap_has_colors() { # admin socket answers and the backend has servers blue and green
+  local s
+  s=$(hap "show servers state $BG_HAPROXY_BACKEND" 2>/dev/null) || return 1
+  grep -q " blue " <<<"$s" && grep -q " green " <<<"$s"
+}
 hap_save() { hap "show servers state" >"$BG_HAPROXY_STATE"; }
 port() { if [[ $1 == blue ]]; then echo "$BG_BLUE_PORT"; else echo "$BG_GREEN_PORT"; fi; }
 cname() { echo "$BG_NAME-$1"; }
@@ -94,6 +102,28 @@ finish() { # finish <old> <new>
   log "$old exited; $new exclusive pass started"
 }
 
+# 4–5 切流量并让旧实例开始排空。haproxy 切不过去时不动旧实例（它还在接流量），留给 --cutover 续做。
+cutover() { # cutover <old> <new>
+  local old=$1 new=$2 i
+  for ((i = 1; i <= 5; i++)); do
+    hap_set "$new" ready && hap_set "$old" drain && break
+    log "haproxy switch attempt $i failed"
+    ((i == 5)) && {
+      log "FAILED: $new is leader but haproxy still sends traffic to $old (draining, still serving)."
+      log "fix haproxy ($BG_HAPROXY_SOCK), then run: $0 --cutover $old $new"
+      exit 3
+    }
+    sleep 1
+  done
+  hap_save || log "could not save haproxy server state to $BG_HAPROXY_STATE"
+  echo "$new" >"$BG_STATE_DIR/active"
+  point_container "$new"
+  rm -f "data/run/bg-active-$old"
+  log "traffic on $new (:$(port "$new")); $old draining"
+  docker update --restart=no "$(cname "$old")" >/dev/null
+  docker kill --signal=TERM "$(cname "$old")" >/dev/null
+}
+
 active=$(cat "$BG_STATE_DIR/active" 2>/dev/null || echo none)
 mode=${1:-}
 
@@ -113,14 +143,24 @@ case "$mode" in
   finish "$2" "$3"
   exit 0
   ;;
+--cutover)
+  [[ ${2:-} =~ ^(blue|green)$ && ${3:-} == "$(other "${2:-}")" ]] || { echo "usage: $0 --cutover <old> <new>" >&2; exit 1; }
+  [[ $(role "$3") == "" ]] && healthz "$3" >/dev/null || { echo "$3 is not serving as leader" >&2; exit 1; }
+  cutover "$2" "$3"
+  nohup setsid "${BASH_SOURCE[0]}" --finish "$2" "$3" >/dev/null 2>&1 &
+  log "drain watcher running in background (pid $!); see $LOG"
+  exit 0
+  ;;
 --bootstrap)
   [[ $active == none ]] || { echo "already bootstrapped (active=$active)" >&2; exit 1; }
   command -v socat >/dev/null || { echo "socat is required (apt install socat)" >&2; exit 1; }
-  hap "show servers state $BG_HAPROXY_BACKEND" | grep -q " blue " &&
-    hap "show servers state $BG_HAPROXY_BACKEND" | grep -q " green " || {
-    echo "haproxy backend $BG_HAPROXY_BACKEND needs servers blue and green; install deploy/bluegreen/haproxy.cfg.example first" >&2
+  # haproxy 可能还没跑（对外端口还被单容器占着）：先只校验配置，单容器停掉后再启动/重载
+  grep -qE "^[[:space:]]*server[[:space:]]+blue[[:space:]]" "$BG_HAPROXY_CFG" 2>/dev/null &&
+    grep -qE "^[[:space:]]*server[[:space:]]+green[[:space:]]" "$BG_HAPROXY_CFG" || {
+    echo "$BG_HAPROXY_CFG needs servers blue and green in backend $BG_HAPROXY_BACKEND; copy deploy/bluegreen/haproxy.cfg.example first" >&2
     exit 1
   }
+  haproxy -c -q -f "$BG_HAPROXY_CFG" || { echo "$BG_HAPROXY_CFG does not validate" >&2; exit 1; }
   log "bootstrap: replacing the single $BG_NAME container with $(cname blue)"
   mkdir -p "$(dirname "$BG_HAPROXY_STATE")" data/run
   touch data/run/bg-active-blue
@@ -130,6 +170,12 @@ case "$mode" in
   for _ in $(seq 1 180); do healthz blue >/dev/null && break; sleep 1; done
   healthz blue >/dev/null || { log "FAILED: blue did not come up"; exit 1; }
   echo blue >"$BG_STATE_DIR/active"
+  if ! hap_has_colors; then
+    log "starting haproxy with $BG_HAPROXY_CFG"
+    systemctl reload-or-restart haproxy
+    for _ in $(seq 1 20); do hap_has_colors && break; sleep 0.5; done
+    hap_has_colors || { log "FAILED: haproxy admin socket $BG_HAPROXY_SOCK has no blue/green servers"; exit 1; }
+  fi
   hap_set blue ready
   hap_set green maint
   hap_save
@@ -191,7 +237,16 @@ fi
 # 2 旧实例让出领导权
 since=$(date -u +%Y-%m-%dT%H:%M:%S)
 docker kill --signal=USR1 "$(cname "$old")" >/dev/null
-wait_log "$(cname "$old")" "$since" '"event":"handover-released","ok":true' 20 || abort "$old did not release the lock"
+if ! wait_log "$(cname "$old")" "$since" '"event":"handover-released","ok":true' 20; then
+  # 收到 USR1 后它已经停了后台任务；无论锁放没放，都要重启才能重新做完整的 leader（会中断一次）
+  if [[ $(role "$old") == draining ]] || docker logs --since "$since" "$(cname "$old")" 2>&1 | grep -q '"event":"handover-released"'; then
+    log "FAILED: $old did not release the lock cleanly; removing $new and restarting $old as leader"
+    dc "$new" down --timeout 5 || true
+    docker restart -t 100 "$(cname "$old")"
+    exit 1
+  fi
+  abort "$old did not react to SIGUSR1"
+fi
 
 # 3 新实例激活（marker 先写：之后新容器若重启，直接以 leader 启动）
 touch "data/run/bg-active-$new"
@@ -207,18 +262,8 @@ if ! wait_log "$(cname "$new")" "$since" '"event":"standby-activated"' 40; then
 fi
 log "$new is leader"
 
-# 4 切流量
-hap_set "$new" ready
-hap_set "$old" drain
-hap_save
-echo "$new" >"$BG_STATE_DIR/active"
-point_container "$new"
-rm -f "data/run/bg-active-$old"
-log "traffic on $new (:$(port "$new")); $old draining"
-
-# 5 旧实例长排空（不阻塞）
-docker update --restart=no "$(cname "$old")" >/dev/null
-docker kill --signal=TERM "$(cname "$old")" >/dev/null
+# 4 切流量；5 旧实例长排空（不阻塞）
+cutover "$old" "$new"
 
 if [[ $mode == --wait ]]; then
   finish "$old" "$new"

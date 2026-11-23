@@ -33,8 +33,9 @@
 ```bash
 sudo apt install haproxy socat
 sudo cp deploy/bluegreen/haproxy.cfg.example /etc/haproxy/haproxy.cfg   # 按需改地址/端口
-sudo mkdir -p /var/lib/haproxy && sudo systemctl restart haproxy
 ```
+
+先**不要**重启 haproxy：单容器现在还占着对外端口（默认 8787），haproxy 绑不上。`--bootstrap` 会先校验这份配置，停掉单容器、起 blue 之后再启动（或重载）haproxy。已经有 haproxy 在前面转发的部署也一样，脚本发现 admin socket 里没有 `blue` / `green` 时会重载配置。
 
 控制面监听的不是 `127.0.0.1`（例如 `.env` 或 override 里 `HOST` 是公网 IP）时，haproxy 的后端地址和 `BG_HOST` 都要写这个地址：
 
@@ -48,7 +49,7 @@ echo 'BG_HOST=203.0.113.10' > bluegreen/bg.env
 deploy/bluegreen/bg-deploy.sh --bootstrap
 ```
 
-它停掉单容器 `vm2api`，以 `vm2api-blue` 启动，haproxy 指向 blue。此后**不要再直接 `docker compose up -d`**：两个颜色是独立的 compose 项目（`-p vm2api-blue` / `-p vm2api-green`），手工操作请照脚本里的 `dc()` 带齐 `-p` 和 `-f`。
+它停掉单容器 `vm2api`，以 `vm2api-blue` 启动，再启动/重载 haproxy 并指向 blue。此后**不要再直接 `docker compose up -d`**：两个颜色是独立的 compose 项目（`-p vm2api-blue` / `-p vm2api-green`），手工操作请照脚本里的 `dc()` 带齐 `-p` 和 `-f`。
 
 ## 部署
 
@@ -67,7 +68,7 @@ deploy/bluegreen/bg-deploy.sh
 5. **新实例激活**（`SIGUSR2`）：拿锁、跑后台任务。和旧实例重叠期间，会破坏旧实例在途请求的维护先记下不做：重建出口容器/远端 gate、因 wrap 变化重启槽内核、备份。
 6. **切流量**：haproxy 新 `ready`、旧 `drain`（不断已有连接）。
 7. **旧实例排空**（`SIGTERM`）：在后台跑完剩下的流后退出；正在跑的备份会被中止。
-8. **收尾**：旧容器退出后，后台的 watcher 删掉它、把 haproxy 里的旧 server 设为 `maint`，给新实例 `SIGHUP`；新实例同步共享二进制、补做第 5 步推迟的维护，打日志 `handover-exclusive`。
+8. **收尾**：旧容器退出后，后台的 watcher 删掉它、把 haproxy 里的旧 server 设为 `maint`，给新实例 `SIGHUP`；新实例同步共享二进制、补做第 5 步推迟的维护，打日志 `handover-exclusive`。新实例也会自己发现旧实例走了（它的负载文件被删掉，或 60 秒没更新），打 `handover-peer-gone` 后做同样的事，所以 watcher 没跑完（被杀、宿主重启）也不会一直卡在重叠期。
 
 `--wait` 在前台等到第 8 步做完；默认 watcher 在后台跑，结果写进 `deploy.log`。旧实例还没退出时再次部署会被拒绝（`still running`）。
 
@@ -75,8 +76,10 @@ deploy/bluegreen/bg-deploy.sh
 
 ### 失败时
 
-- 第 3–4 步失败：删掉新颜色，旧实例原样服务。
-- 第 5 步失败（新实例没激活）：删掉新颜色，**重启**旧实例让它重新做 leader，这一次会像普通重启一样挂住请求。
+- 第 3 步失败、或旧实例对 `SIGUSR1` 没反应：删掉新颜色，旧实例原样服务。
+- 第 4 步旧实例已开始让权但没按时报告释放锁：删掉新颜色，**重启**旧实例让它重新做 leader。
+- 第 5 步失败（新实例没激活）：同上，删掉新颜色并重启旧实例。这两种重启会像普通重启一样挂住请求。
+- 第 6 步 haproxy 切不过去（admin socket 不通等，重试 5 次）：新实例已是 leader，旧实例还在 draining 状态接流量，脚本 `exit 3` 不动它。修好 haproxy 后运行 `deploy/bluegreen/bg-deploy.sh --cutover <旧色> <新色>` 从第 6 步续做。
 
 ### 带新迁移的版本
 
@@ -93,10 +96,10 @@ BG_COLOR=$c BG_PORT=$([ "$c" = blue ] && echo 8788 || echo 8789) \
 
 ## 重叠期的保证
 
-- **锁**：同一时刻只有 leader 持有数据目录 flock；draining 实例的面板/管理接口返回 503 `controller_draining`。
+- **锁**：同一时刻只有 leader 持有数据目录 flock；draining 实例的面板/管理接口返回 503 `controller_draining`。`SIGUSR1` 只对以 `KIN_STANDBY=1` 启动的蓝绿实例生效，普通单容器收到会忽略。
 - **调度容量**：draining 实例把在途请求的槽、账号、席位写进 `data/run/handover-load.json`，新 leader 调度时把它算进占用，不会把一个槽超发到两倍。
 - **共享资源**：每个颜色有自己的 api-kernel socket；draining 实例关停时不删节点 relay socket；出口容器、远端 gate、内核重启、备份都等旧实例退出后才做。
-- **CRAG 授权文件**：控制面启动后第一次准入会先比对节点上已发布的订阅文件，内容相同就不重写（重写期间完成的流会被槽判授权无效）。
+- **CRAG 授权文件**：控制面启动后第一次准入会先比对节点上已发布的订阅文件，内容相同就不重写（重写期间完成的流会被槽判授权无效）。确实要更新时，先把四个文件写成旁边的 `.new`，再一条命令换上，窗口只有毫秒级。
 - **数据库**：WAL，两个进程并发读写；迁移护栏挡住结构变化。
 
 ## 回滚到单容器
