@@ -266,7 +266,7 @@ export function panelShellLaunch(cliBin) {
     // session there and expose the nested account file at the home path.
     'export HOME="${HOME:-/home/kincli}"',
     'export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"',
-    'unset CLAUDE_CODE_VERSION ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN',
+    'unset CLAUDE_CODE_VERSION CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_REFRESH_TOKEN',
     'export USER_TYPE=external',
     'mkdir -p "$CLAUDE_CONFIG_DIR"',
     'if [ ! -e "$HOME/.claude.json" ] && [ -f "$CLAUDE_CONFIG_DIR/.claude.json" ]; then ln -s .claude/.claude.json "$HOME/.claude.json" 2>/dev/null || true; fi',
@@ -433,7 +433,7 @@ export function createSlotShell({
       }
     }
     const resize = (cols, rows) => {
-      resizeExec(connect, session.execId, { cols, rows }).catch(() => {})
+      resizeExec(connect, session.execId, { cols, rows }).catch(() => { })
     }
     // Listen before the exec opens: input/resize sent during the Docker round
     // trip would otherwise be dropped (ws does not buffer unhandled messages).

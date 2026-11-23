@@ -60,6 +60,10 @@ test('only successful native login exposes its fresh private grant', async () =>
   const bin = path.join(root, 'claude')
   const config = path.join(root, 'login')
   const launch = nativeLoginLaunch(bin, config)
+  assert.equal(
+    launch.env.some((pair) => pair.startsWith('CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=')),
+    false,
+  )
   const grant = JSON.stringify({
     claudeAiOauth: {
       accessToken: 'new-access',

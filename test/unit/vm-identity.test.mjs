@@ -53,7 +53,7 @@ test('loadVmIdentity builds settings from seed + timezone', () => {
   assert.equal(id.settings.theme, 'dark')
   assert.equal(id.settings.env.TZ, 'America/Los_Angeles')
   assert.equal(id.settings.env.DISABLE_TELEMETRY, '1')
-  assert.equal(id.settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '0')
+  assert.equal(id.settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
   assert.equal(id.settings.env.CLAUDE_CODE_USE_BEDROCK, '0')
   assert.equal(id.settings.env.CLAUDE_CODE_USE_VERTEX, '0')
   assert.equal(id.sessionId, 'sess-1')
@@ -84,11 +84,12 @@ test('identity replace uses the slot device_id', () => {
 test('telemetry off writes kill-switch keys; telemetry on deletes them', () => {
   const pinned = applyRequiredSeedEnv({
     DISABLE_TELEMETRY: '0',
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '0',
     CLAUDE_CODE_USE_BEDROCK: '',
     extra: 'keep',
   })
   assert.equal(pinned.DISABLE_TELEMETRY, '1')
-  assert.equal(pinned.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '0')
+  assert.equal(pinned.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
   assert.equal(pinned.CLAUDE_CODE_USE_BEDROCK, '0')
   assert.equal(pinned.CLAUDE_CODE_USE_VERTEX, '0')
   assert.equal(pinned.extra, 'keep')
@@ -99,7 +100,7 @@ test('telemetry off writes kill-switch keys; telemetry on deletes them', () => {
     extra_env: { DISABLE_TELEMETRY: '0', CLAUDE_CODE_USE_VERTEX: '0' },
   })
   assert.equal(open.DO_NOT_TRACK, undefined)
-  assert.equal(open.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1')
+  assert.equal(open.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
   for (const k of Object.keys(TELEMETRY_KILL_ENV)) assert.equal(open[k], undefined)
   const id = loadVmIdentity({
     vmId: 'vm-1',
@@ -111,7 +112,7 @@ test('telemetry off writes kill-switch keys; telemetry on deletes them', () => {
     vm: { fingerprint: { device_id: 'dev', session_id: 'sess-1' } },
   })
   assert.equal(id.settings.env.DISABLE_TELEMETRY, undefined)
-  assert.equal(id.settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1')
+  assert.equal(id.settings.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
   assert.equal(id.settings.env.CLAUDE_CODE_USE_BEDROCK, '0')
   assert.equal(id.settings.env.CLAUDE_CODE_USE_VERTEX, '0')
   assert.equal(id.settings.env.DO_NOT_TRACK, undefined)
