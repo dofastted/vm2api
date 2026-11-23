@@ -896,13 +896,13 @@ export async function pullKernelRelease(
       if (payload.assets.filter((asset) => asset?.name === spec.asset).length !== 1)
         throw coded('kernel_asset_duplicate', 'Release 内核附件重复')
     }
-    const targetArch = archFor(projectRoot, kernel, runtimeOptions)
-    if (kernel === 'crag' && targetArch !== 'amd64') throw coded('crag_v2_arch_mismatch', '当前发行包仅支持 amd64')
     if (
       String(process.env[kernel === 'crag' ? 'KIN_CRAG_V2_ROOT' : 'KIN_WRAP_CLI_ROOT'] || '').trim() ||
       (kernel === 'cli-node' && hasCustomKernelOverride(projectRoot))
     )
       throw coded('kernel_override_active', '已配置显式内核路径，请先移除覆盖配置再拉取')
+    const targetArch = archFor(projectRoot, kernel, runtimeOptions)
+    if (kernel === 'crag' && targetArch !== 'amd64') throw coded('crag_v2_arch_mismatch', '当前发行包仅支持 amd64')
     const pinned = kernel === 'crag' ? pinnedAuthority(projectRoot, targetArch) : null
     const base = baseFor(projectRoot, kernel)
     lock = acquireKernelCacheLock(projectRoot, kernel)

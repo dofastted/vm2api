@@ -113,12 +113,12 @@ function requireKernelResult(result) {
 }
 
 /** Read-only create preflight for CRAG-capable placements. Nodes verify their CRAG payload via cragSlotPayload. */
-export function preflightFreshClaudeKernels(projectRoot, vm) {
+export function preflightFreshClaudeKernels(projectRoot, vm, runtimeOptions = {}) {
   if (!describeKernelPayload(projectRoot).path || !describeCliPayload(projectRoot, WRAP_CLI_BIN).path) {
     throw Object.assign(new Error('请先拉取 cli-node 内核'), { code: 'kernel_package_missing' })
   }
   if (slotHost(vm).bakedKernel) return
-  const arch = cragSlotArch(projectRoot, vm)
+  const arch = cragSlotArch(projectRoot, vm, runtimeOptions)
   const root = cragV2PackageRoot(projectRoot, arch)
   if (!root) {
     throw Object.assign(new Error(`CRAG v2 package missing (share/crag/kernels/v2/${arch} or KIN_CRAG_V2_ROOT)`), {
@@ -128,7 +128,7 @@ export function preflightFreshClaudeKernels(projectRoot, vm) {
   requireKernelResult(verifyCragV2Tree(root, { arch }))
 }
 
-export function seedFreshCliHome(projectRoot, vm, { routing, preinstallBoth = false } = {}) {
+export function seedFreshCliHome(projectRoot, vm, { routing, preinstallBoth = false, ...runtimeOptions } = {}) {
   const host = slotHost(vm)
   const crag = resolveKernelDataplane(vm, routing) === 'crag'
   const written = writeSlotSeedFiles(projectRoot, vm, null, {
@@ -138,18 +138,19 @@ export function seedFreshCliHome(projectRoot, vm, { routing, preinstallBoth = fa
   // Cluster payloads go in slot-bin, not the control plane's .kin home.
   if (!host.bakedKernel) {
     if (preinstallBoth) {
-      const wrap = materializeWrapCli(projectRoot, vm)
+      const wrap = materializeWrapCli(projectRoot, vm, runtimeOptions)
       requireKernelResult(wrap)
       const cli = fs.statSync(path.join(wrap.dest, WRAP_CLI_BIN), { throwIfNoEntry: false })
       if (!wrap.kernel_bin || !wrap.wrapper || !cli?.isFile()) {
         throw Object.assign(new Error('cli-node 安装不完整'), { code: 'kernel_materialize_failed' })
       }
       // Wrap already stages the encrypted CRAG package for local KVM slots.
-      if (!isKvmRuntime(vm)) requireKernelResult(materializeCragV2(projectRoot, vm, { select: false }))
+      if (!isKvmRuntime(vm))
+        requireKernelResult(materializeCragV2(projectRoot, vm, { select: false, ...runtimeOptions }))
     } else {
       const required = crag || (isKvmRuntime(vm) && !isCodexVm(vm))
       try {
-        const laid = materializeResolvedKernel(projectRoot, vm, { routing })
+        const laid = materializeResolvedKernel(projectRoot, vm, { routing, ...runtimeOptions })
         if (required) requireKernelResult(laid)
       } catch (error) {
         if (required) throw error
@@ -236,7 +237,10 @@ export function buildRecreatedVmRecord(prev, generated, { mode = 'traits' } = {}
     updated_at: now,
     proxy_cli_enabled: hasBoundExit(prev.proxy),
     seed_policy: defaultSeedPolicy(prev.seed_policy || {}),
-    runtime: { type: prev.runtime?.type === 'kvm' ? 'kvm' : 'docker' },
+    runtime: {
+      type: prev.runtime?.type === 'kvm' ? 'kvm' : 'docker',
+      ...(prev.runtime?.arch ? { arch: prev.runtime.arch } : {}),
+    },
     // Sizing survives a reset; traits draws a new MAC / SMBIOS / disk serial. KVM cannot boot without them.
     ...recreatedMachine(prev, keep),
     proxy_required: prev.proxy_required,
@@ -258,7 +262,7 @@ export function buildRecreatedVmRecord(prev, generated, { mode = 'traits' } = {}
   return next
 }
 
-export function recreateVmFiles(projectRoot, prev, { mode = 'traits' } = {}) {
+export function recreateVmFiles(projectRoot, prev, { mode = 'traits', ...runtimeOptions } = {}) {
   if (!projectRoot || !prev?.id) throw new Error('projectRoot and vm id required')
   const keep = mode === 'keep'
   wipeSlotHome(projectRoot, prev.id, { keepData: keep })
@@ -271,6 +275,6 @@ export function recreateVmFiles(projectRoot, prev, { mode = 'traits' } = {}) {
   const vmPath = path.join(projectRoot, 'vms', `${prev.id}.json`)
   atomicWriteJson(vmPath, vm, { mode: 0o600 })
   if (vm.fingerprint?.guest_machine_id) writeGuestMachineIdFile(projectRoot, vm.id, vm.fingerprint.guest_machine_id)
-  seedFreshCliHome(projectRoot, vm)
+  seedFreshCliHome(projectRoot, vm, runtimeOptions)
   return { vm, vmPath, mode: keep ? 'keep' : 'traits' }
 }

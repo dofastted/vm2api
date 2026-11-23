@@ -1687,7 +1687,10 @@ test('a start failure without runtime detail still reports the generic phase', a
 
 test('CRAG install preflight rejects a non-amd64 slot with crag_v2_arch_mismatch before stopping', async (t) => {
   const { root, vm } = fixture(t)
-  if (process.arch === 'arm64') seedEncryptedPackage(root, { arch: 'amd64' })
+  fs.rmSync(path.join(root, 'share/crag/kernels/v2/arm64'), { recursive: true, force: true })
+  if (!fs.existsSync(path.join(root, 'share/crag/kernels/v2/amd64/manifest.json'))) {
+    seedEncryptedPackage(root, { arch: 'amd64' })
+  }
   const armVmFile = path.join(root, 'vms', `${vm.id}.json`)
   const armRecord = { ...JSON.parse(fs.readFileSync(armVmFile, 'utf8')), runtime: { type: 'docker', arch: 'arm64' } }
   fs.writeFileSync(armVmFile, JSON.stringify(armRecord))

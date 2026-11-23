@@ -144,15 +144,14 @@ export function cragSlotArch(projectRoot, vm, options = {}) {
   if (vm.node_platform === 'darwin') return 'darwin'
   const explicit = normalizeCragArch(vm.runtime?.arch || vm.node_arch || vm.arch)
   if (explicit) return explicit
-  if (clusterDockerSlot(vm)) return 'amd64'
   const platformArch = dockerPlatformArch(options.dockerDefaultPlatform, options.platform)
   if (platformArch) return platformArch
   const hostArch = normalizeCragArch(options.arch ?? process.arch)
   if (hostArch !== 'amd64' && hasCragSelectionForArch(projectRoot, hostArch)) return hostArch
-  if (isKvmRuntime(vm)) return 'amd64'
+  if (clusterDockerSlot(vm) || isKvmRuntime(vm)) return 'amd64'
   const staged = stagedSlotBinaryArch(projectRoot, vm.id)
   if (staged) return staged
-  return hostArch
+  return cragTargetArch(projectRoot, options)
 }
 
 /** Runtime architecture targeted by this installation's CRAG cache/pull operations. */
@@ -1039,7 +1038,11 @@ function installKernelPayload(src, dest, projectRoot = '') {
   return kernelChanged
 }
 
-export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null, nativeCliOptions } = {}) {
+export function materializeWrapCli(
+  projectRoot,
+  vm,
+  { uid = null, gid = null, nativeCliOptions, ...runtimeOptions } = {},
+) {
   if (!projectRoot || !vm?.id) {
     return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
   }
@@ -1054,7 +1057,7 @@ export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null, na
   const native = nativeCliForVm(vm, src, nativeCliOptions)
   if (native && !native.ok) return native
   if (isKvmRuntime(vm) && !isCodexVm(vm) && !clusterDockerSlot(vm)) {
-    const crag = materializeCragV2(projectRoot, vm, { uid, gid, select: false })
+    const crag = materializeCragV2(projectRoot, vm, { uid, gid, select: false, ...runtimeOptions })
     if (!crag.ok) return crag
   }
   const dest = wrapCliHomeDir(projectRoot, vm.id)

@@ -927,8 +927,24 @@ test('slot runtime arch resolves x86_64 Docker/KVM/cluster targets on ARM64 host
   assert.equal(dockerPlatformArch('linux/arm64/v8', 'linux'), 'arm64')
   assert.equal(cragV2Arch({ arch: 'arm64', platform: 'linux', dockerDefaultPlatform: 'linux/amd64' }), 'amd64')
   assert.equal(cragV2Arch({ arch: 'arm64', platform: 'linux', dockerDefaultPlatform: '' }), 'arm64')
+  assert.equal(
+    cragSlotArch(
+      project,
+      { id: 'vm-unstaged-before-pull', dataplane: 'wrap' },
+      { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: '' },
+    ),
+    'arm64',
+  )
 
   seedEncryptedPackage(project, { arch: 'amd64' })
+  assert.equal(
+    cragSlotArch(
+      project,
+      { id: 'vm-unstaged-after-pull', dataplane: 'wrap' },
+      { arch: 'arm64', platform: 'linux', dockerDefaultPlatform: '' },
+    ),
+    'amd64',
+  )
   assert.equal(
     cragSlotArch(
       project,
