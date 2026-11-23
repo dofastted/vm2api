@@ -5,15 +5,15 @@
  * Telemetry has one read: `telemetry_disabled === false` means on
  * (`isTelemetryEnabled`). Everything else is a mirror of that bit.
  *   on  → delete managed kill-switch keys; native 1P policy on
- *         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
  *         do_not_track = false
  *   off → kill-switch keys = "1"; native collection/sending off and queue cleared
- *         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "0"
  *         do_not_track = true (DO_NOT_TRACK=1)
  * grove_enabled is always false (Help improve Claude off).
- * Official CLI treats any set NONESSENTIAL value, including "0", as
- * essential-traffic (GitHub #84631). The seed still writes the requested
- * literal. Other kill switches must be absent when telemetry is on.
+ * CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is unset by default (never written,
+ * and stripped from legacy env) because official CLI treats any set value,
+ * including "0", as essential-traffic (GitHub #84631), which blocks /usage.
+ * Only written as "1" when global routing.telemetry.disable_nonessential_traffic
+ * is explicitly enabled.
  */
 
 export function isTelemetryEnabled(pol = {}) {
@@ -75,18 +75,15 @@ export function stripLegacyScriptEnv(env = {}) {
   return next
 }
 
-export function nonessentialTrafficValue(pol = {}) {
-  return isTelemetryEnabled(pol) ? '1' : '0'
-}
-
-export function applyRequiredSeedEnv(env = {}, pol = {}) {
+export function applyRequiredSeedEnv(env = {}, pol = {}, { disableNonessentialTraffic = false } = {}) {
   const next = { ...env }
   if (isTelemetryEnabled(pol)) {
     for (const key of TELEMETRY_KILL_ENV_KEYS) delete next[key]
   } else {
     Object.assign(next, TELEMETRY_KILL_ENV)
   }
-  next[NONESSENTIAL_TRAFFIC_ENV_KEY] = nonessentialTrafficValue(pol)
+  if (disableNonessentialTraffic === true) next[NONESSENTIAL_TRAFFIC_ENV_KEY] = '1'
+  else delete next[NONESSENTIAL_TRAFFIC_ENV_KEY]
   for (const key of Object.keys(CLOUD_PROVIDER_OFF_ENV)) delete next[key]
   Object.assign(next, CLOUD_PROVIDER_OFF_ENV)
   return next
@@ -96,7 +93,7 @@ export function applyRequiredSeedEnv(env = {}, pol = {}) {
  * Authoritative slot settings.env. Extra / leftover script keys are
  * stripped; TZ/LANG come from the slot, then the telemetry contract.
  */
-export function buildSlotSettingsEnv(pol = {}, { timezone, locale, extra } = {}) {
+export function buildSlotSettingsEnv(pol = {}, { timezone, locale, extra, disableNonessentialTraffic = false } = {}) {
   const merged = {
     ...(typeof extra === 'object' && extra ? extra : {}),
     ...(pol.extra_env && typeof pol.extra_env === 'object' ? pol.extra_env : {}),
@@ -109,7 +106,7 @@ export function buildSlotSettingsEnv(pol = {}, { timezone, locale, extra } = {})
   }
   if (!isTelemetryEnabled(pol)) env.DO_NOT_TRACK = '1'
   else delete env.DO_NOT_TRACK
-  const out = applyRequiredSeedEnv(env, pol)
+  const out = applyRequiredSeedEnv(env, pol, { disableNonessentialTraffic })
   // 2.1.283+ sends x-claude-code-prompt-id only when this is set. Default on.
   out.CLAUDE_CODE_GATEWAY_HINT_HEADERS = '1'
   if (out.CLAUDE_CODE_ATTRIBUTION_HEADER == null) out.CLAUDE_CODE_ATTRIBUTION_HEADER = '0'
@@ -126,25 +123,28 @@ export function callerAutoCompactWindow(body = {}) {
   return null
 }
 
-export function buildSeedSettingsEnv(pol = {}, extra = {}) {
-  return buildSlotSettingsEnv(pol, { extra })
+export function buildSeedSettingsEnv(pol = {}, extra = {}, opts = {}) {
+  return buildSlotSettingsEnv(pol, { extra, ...opts })
 }
 
-export function seedTelemetryContract(pol = {}) {
+export function seedTelemetryContract(pol = {}, { disableNonessentialTraffic = false } = {}) {
   const enabled = isTelemetryEnabled(pol)
+  const suppressNonessential = disableNonessentialTraffic === true
+  const nonessentialNote = suppressNonessential ? 'NONESSENTIAL=1' : 'NONESSENTIAL deleted'
   return {
     telemetry_enabled: enabled,
     telemetry_disabled: !enabled,
+    disable_nonessential_traffic: suppressNonessential,
     kill_keys: [...TELEMETRY_KILL_ENV_KEYS],
     required_env: {
       ...(enabled ? {} : TELEMETRY_KILL_ENV),
-      [NONESSENTIAL_TRAFFIC_ENV_KEY]: enabled ? '1' : '0',
+      ...(suppressNonessential ? { [NONESSENTIAL_TRAFFIC_ENV_KEY]: '1' } : {}),
       ...CLOUD_PROVIDER_OFF_ENV,
     },
     grove_enabled: false,
     note: enabled
-      ? 'telemetry on: kill-switch keys deleted; NONESSENTIAL=1; Bedrock and Vertex forced off; grove_enabled false'
-      : 'telemetry off: DISABLE_TELEMETRY=1; NONESSENTIAL=0; Bedrock and Vertex forced off; grove_enabled false',
+      ? `telemetry on: kill-switch keys deleted; ${nonessentialNote}; Bedrock and Vertex forced off; grove_enabled false`
+      : `telemetry off: DISABLE_TELEMETRY=1; ${nonessentialNote}; Bedrock and Vertex forced off; grove_enabled false`,
   }
 }
 

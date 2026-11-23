@@ -5,6 +5,7 @@ import {
   standardSeedPolicy,
   buildSlotSettingsEnv,
   buildSeedSettingsEnv,
+  seedTelemetryContract,
   stripLegacyScriptEnv,
   LEGACY_SCRIPT_ENV_KEYS,
   DEFAULT_CLAUDE_SETTING,
@@ -78,12 +79,30 @@ test('buildSlotSettingsEnv is TZ/LANG plus contract, leftover extra cannot win',
 test('buildSeedSettingsEnv delegates to slot env', () => {
   const off = buildSeedSettingsEnv({ telemetry_disabled: true })
   assert.equal(off.DISABLE_TELEMETRY, '1')
-  assert.equal(off.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '0')
+  assert.equal(off.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
   assert.equal(off.CLAUDE_CODE_USE_BEDROCK, '0')
   assert.equal(off.CLAUDE_CODE_USE_VERTEX, '0')
   const on = buildSeedSettingsEnv({ telemetry_disabled: false })
   assert.equal(on.DISABLE_TELEMETRY, undefined)
-  assert.equal(on.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1')
+  assert.equal(on.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
   assert.equal(on.CLAUDE_CODE_USE_BEDROCK, '0')
   assert.equal(on.CLAUDE_CODE_USE_VERTEX, '0')
+})
+
+test('disableNonessentialTraffic toggle writes "1" when enabled and leaves unset by default', () => {
+  const unset = buildSlotSettingsEnv({ telemetry_disabled: false }, { extra: { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '0' } })
+  assert.equal(unset.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+  const suppressed = buildSlotSettingsEnv({ telemetry_disabled: false }, { disableNonessentialTraffic: true })
+  assert.equal(suppressed.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1')
+  assert.equal(seedTelemetryContract({ telemetry_disabled: false }).required_env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+  assert.equal(seedTelemetryContract({ telemetry_disabled: false }).disable_nonessential_traffic, false)
+  assert.equal(
+    seedTelemetryContract({ telemetry_disabled: false }, { disableNonessentialTraffic: true }).required_env
+      .CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
+    '1',
+  )
+  assert.equal(
+    seedTelemetryContract({ telemetry_disabled: false }, { disableNonessentialTraffic: true }).disable_nonessential_traffic,
+    true,
+  )
 })

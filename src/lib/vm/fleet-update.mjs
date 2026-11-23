@@ -172,6 +172,7 @@ export async function applyNativeTelemetry({
         existingSettings: existing.files['settings.json'] === null ? {} : JSON.parse(existing.files['settings.json']),
         replaceEnv,
         cragNativeTelemetry: supportsApply || (selectedCrag && !retired.running),
+        routing,
       })
       result.wrote = result.seed.wrote === true
       if (crag) {
