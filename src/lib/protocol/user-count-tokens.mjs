@@ -33,6 +33,7 @@ import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-ow
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
 import { keyModelError } from '../admin/key-models.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
+import { validateImageDimensions } from './images.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot } from '../vm/codex-slot.mjs'
 import { pickCodexSlots } from '../pool/codex-slot-pool.mjs'
@@ -302,6 +303,14 @@ export async function handleUserCountTokens(req, res, deps) {
   if (blockedClient) {
     const err = blockedClientError(blockedClient)
     return json(res, err.status, err.body)
+  }
+  if (detectInboundPlatform(parsed.body.model).platform === 'anthropic') {
+    try {
+      validateImageDimensions(parsed.body)
+    } catch (error) {
+      if (!error.body?.error) throw error
+      return json(res, error.status, error.body)
+    }
   }
   const gate = await blockCountTokensBeforeHop(req, parsed.body, { ...deps, rawInbound: inbound })
   if (gate?.error) return json(res, gate.error.status, gate.error.body)
