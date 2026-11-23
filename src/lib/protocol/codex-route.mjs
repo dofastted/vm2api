@@ -7,7 +7,7 @@ import { normalizeCodexModelMappings, validateCodexModelMappingsPatch } from './
 
 export { isCodexVm, normalizeVmKind } from '../vm/vm-kind.mjs'
 
-export const DEFAULT_CODEX_USER_AGENT = 'codex_cli_rs/0.167.1 (linux x86_64)'
+export const DEFAULT_CODEX_USER_AGENT = 'codex_cli_rs/0.170.0 (linux x86_64)'
 export const CODEX_UPSTREAM_TRANSPORTS = Object.freeze(['prefer_websocket', 'http'])
 
 export const DEFAULT_CODEX_ROUTING = Object.freeze({
