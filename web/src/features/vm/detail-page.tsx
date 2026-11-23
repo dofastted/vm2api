@@ -693,7 +693,13 @@ function VmDetailBody({
                 onDelete={() => setConfirmDel(true)}
               />
               {tabs.includes('desktop') ? (
-                <TabsContent value='desktop' className='pt-4'>
+                // forceMount：桌面连接跨 tab 保活，配合账号 tab 可在授权与
+                // 桌面浏览器之间来回切换而不重连
+                <TabsContent
+                  value='desktop'
+                  forceMount
+                  className='pt-4 data-[state=inactive]:hidden'
+                >
                   <VmDesktopCard vm={vm} />
                 </TabsContent>
               ) : null}
