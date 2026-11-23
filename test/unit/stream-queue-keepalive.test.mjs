@@ -454,6 +454,99 @@ test('x-kin-queue: off reaches the runner as allowQueue:false; without it the re
   }
 })
 
+test('zero-execution session_home_slot_busy 529 logs attribution without ingesting quota or billing key requests', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-home-slot-busy-no-bill-'))
+  const routingFile = path.join(root, 'routing.json')
+  fs.writeFileSync(routingFile, JSON.stringify({ compatibility: {}, failover: {} }))
+  let ingested = 0
+  let recorded = 0
+  let finished = null
+  const handler = createHandleProtocol({
+    json(res, status, body) {
+      res.statusCode = status
+      res.body = body
+      res.headersSent = true
+      return body
+    },
+    writeSSEHeaders(res) {
+      res.writeHead(200)
+    },
+    readBody: async () => ({ ...MESSAGE, stream: false }),
+    requireAuth(req) {
+      req.apiKeyKind = 'managed'
+      req.apiKeyRecord = { id: 'key_1', group_id: 1, group_type: 'all' }
+      return true
+    },
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000, stream_idle_timeout_ms: 2000 },
+      paths: { data: root, project: root },
+    },
+    requestLog: {
+      start: () => ({ request_id: 'home-slot-busy', mode: 'normal', t0: Date.now() }),
+      finish(_ctx, bag) {
+        finished = bag
+      },
+    },
+    stickyRouter: {},
+    accountQuota: {
+      ingestHeaders() {
+        ingested++
+      },
+    },
+    apiKeyStore: {
+      acquire: () => ({ ok: true }),
+      release() {},
+      recordUsage() {
+        recorded++
+      },
+    },
+    apiScheduler: {},
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfigPath: routingFile,
+    routingConfig: { compatibility: {}, failover: {} },
+    groupsRepo: { rateMultiplier: () => 1 },
+    failoverRunner: {
+      run: async () => ({
+        ok: false,
+        status: 529,
+        via: 'pool-failover',
+        terminalState: 'exhausted',
+        retryAfterSec: 1,
+        accountId: 'account-1',
+        vmId: 'vm-01',
+        attemptCount: 0,
+        body: {
+          type: 'error',
+          error: {
+            type: 'overloaded_error',
+            code: 'pool_overloaded',
+            message: '号池负载过高，稍后再试',
+            details: { reason: 'session_home_slot_busy', attempt_count: 0 },
+          },
+        },
+      }),
+    },
+  })
+  try {
+    const res = createResponse()
+    await invoke(handler, res, { 'x-kin-queue': 'off' })
+    assert.equal(res.statusCode, 529)
+    assert.equal(res.body.error.code, 'pool_overloaded')
+    assert.equal(ingested, 0)
+    assert.equal(recorded, 0)
+    assert.equal(finished.account_id, 'account-1')
+    assert.equal(finished.vm_id, 'vm-01')
+    assert.equal(finished.attempt_count, 0)
+    assert.equal(finished.upstream_status, null)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('a non-stream Claude request does not emit queue pings', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-queue-keepalive-json-'))
   const res = createResponse()

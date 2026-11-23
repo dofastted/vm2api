@@ -191,7 +191,8 @@ function rustUnavailableResult(ready) {
       },
     },
     headers: {},
-    ...(reconnecting ? { upstreamExecutions: 0, retryAfterSec: 1 } : {}),
+    ...(rejected ? { upstreamExecutions: 0 } : {}),
+    ...(reconnecting ? { retryAfterSec: 1 } : {}),
     terminalState: rejected ? 'rejected' : 'transport_error',
     transportError: !rejected,
   }
