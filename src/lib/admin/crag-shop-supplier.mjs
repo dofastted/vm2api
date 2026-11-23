@@ -222,6 +222,18 @@ const commerceErrors = new Map([
   ['renewal_unavailable', [409, 'shop_renewal_unavailable', 'Current plan cannot be renewed']],
 ])
 
+/** Shorten any order id in a path so a log line cannot carry a usable one.
+ *
+ * The order id is what the buyer holds as proof of a purchase: it is never sent
+ * outbound, and the Authority's `claim-by-order` accepts it as grounds for moving
+ * a subscription. A readable log must not hand one out. Eight hex digits are kept
+ * because that is enough to match a row in `crag_shop_orders` while querying it,
+ * and far too little to guess the rest.
+ */
+function auditPath(path) {
+  return path.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, (id) => `${id.slice(0, 8)}~`)
+}
+
 function supplierError(status, operation) {
   if (status === 404 && ['create', 'quote'].includes(operation)) {
     return new ShopError(404, 'shop_item_unavailable', 'Plan or payment method unavailable')
@@ -321,7 +333,32 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
       }
       return value
     } catch (err) {
-      if (err instanceof ShopError) throw err
+      const shop = err instanceof ShopError ? err : null
+      // Every supplier failure collapses into one of a handful of codes, and the
+      // catch below flattens anything unrecognised into a single `shop_unavailable`
+      // -- a timeout, a DNS failure, a TLS error and a malformed reply all arrive
+      // looking identical. Without a line here a failed checkout leaves nothing at
+      // all: five orders stalled between 2026-11-16 and 11-20 with their amount
+      // columns still NULL, proving `create` threw, and the reason is gone for good
+      // because nothing recorded it.
+      //
+      // `status` is 0 when no response arrived, which is what separates "the
+      // supplier refused" from "we never reached it"; `cause` is the error's class
+      // name, which separates a timeout from a network fault from a parse fault.
+      // Nothing else is logged: the receipt and the pilot token are credentials, the
+      // body carries purchase details, and the path's order id is the buyer's proof
+      // for that order -- `claim-by-order` accepts it -- so it is truncated.
+      console.warn(
+        JSON.stringify({
+          event: 'crag-shop-supplier',
+          operation,
+          path: auditPath(path),
+          status: response?.status ?? 0,
+          code: shop?.code ?? 'shop_unavailable',
+          ...(shop ? {} : { cause: err?.name ?? 'Error' }),
+        }),
+      )
+      if (shop) throw shop
       throw new ShopError(503, 'shop_unavailable', 'CRAG shop unavailable; try again later')
     } finally {
       if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {})
