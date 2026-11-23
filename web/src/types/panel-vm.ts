@@ -73,6 +73,13 @@ export type VmProxySnap = {
 
 export type InferenceEngine = 'auto' | 'go' | 'rust'
 
+export type VmCodexCredits = {
+  has_credits?: boolean
+  unlimited?: boolean
+  balance?: string | number | null
+  fetched_at?: string | number | null
+}
+
 export type CragLicenseStatus = {
   status:
     | 'unlicensed'
@@ -360,6 +367,7 @@ export type Vm = {
     credits?: Array<{ expires_at?: string }>
     fetched_at?: string
   } | null
+  codex_credits?: VmCodexCredits | null
   /** 限额重置按钮。setup-token 标签但 scope 含 user:profile 时也为 true。 */
   can_claude_reset?: boolean
   claude_reset_credits?: {
