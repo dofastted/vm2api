@@ -36,6 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MAX_ENVIRONMENTS = 8
 MAX_CONCURRENCY = 64
 AUTH_TTL = 300
+AUTH_SETTLE_SECONDS = 2.0
 TERMINAL_TTL = 300
 TERMINAL_READ = 16384
 TERMINAL_INPUT = 1024
@@ -1267,6 +1268,7 @@ class Login(Agy):
         self.sent = False
         self.state = None
         self.buffer = b""
+        self.token_seen_at = None
         super().__init__(host, environment, proxy_url)
 
     def read(self, timeout):
@@ -1324,7 +1326,20 @@ class Login(Agy):
 
     def finished(self):
         if self.sent and profile_secrets(self.directory, self.uid):
-            return True
+            now_mono = time.monotonic()
+            if self.token_seen_at is None:
+                self.token_seen_at = now_mono
+            try:
+                self.read(0)
+            except Failure:
+                return True
+            if (
+                not self.alive()
+                or (self.directory / "home/.config/antigravity").is_dir()
+                or now_mono - self.token_seen_at >= AUTH_SETTLE_SECONDS
+            ):
+                return True
+            return False
         self.read(0)
         if self.sent and AUTH_FAILURE.search(self.buffer):
             raise Failure(409)
@@ -2163,9 +2178,16 @@ class Host:
             return entry["result"]
         return result
 
-    def operation_account(self, env, *, allow_concurrent_infer=False):
+    def operation_account(
+        self, env, *, allow_concurrent_infer=False, allow_reauth_probe=False
+    ):
         self.ensure_payload(legacy_install=False)
-        if env["auth_state"] != "authorized":
+        allowed_states = (
+            ("authorized", "reauth_required")
+            if allow_reauth_probe
+            else ("authorized",)
+        )
+        if env["auth_state"] not in allowed_states:
             code = (
                 "gemini_api_key_invalid"
                 if env.get("auth_method") == "api_key"
@@ -2206,8 +2228,80 @@ class Host:
             raise Failure(503, issue)
         return uid, None, auth
 
-    def pull_models(self, env, proxy_url):
-        uid, key, auth = self.operation_account(env)
+    def _sync_profile_token(self, env, run):
+        profile_name = env.get("profile")
+        if not profile_name or env.get("auth_method", "oauth") != "oauth":
+            return False
+        uid = self.uid_base + env["slot"]
+        updated = profile_secrets(run.directory, uid, include_raw=True)
+        if not updated:
+            return False
+        _, new_bytes = updated
+        profile_dir = self.directory / env["id"] / profile_name
+        current = profile_secrets(profile_dir, uid, include_raw=True)
+        if current and current[1] == new_bytes:
+            return False
+        token_dir = profile_dir / "home" / ".gemini" / "antigravity-cli"
+        target = token_dir / TOKEN_NAME
+        staging = token_dir / f".{TOKEN_NAME}.{secrets.token_hex(8)}"
+        try:
+            with os.fdopen(
+                os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
+            ) as out:
+                out.write(new_bytes)
+                out.flush()
+                os.fsync(out.fileno())
+            os.chown(staging, uid, uid)
+            os.chmod(staging, 0o600)
+            staging.replace(target)
+            return True
+        except OSError:
+            return False
+        finally:
+            staging.unlink(missing_ok=True)
+
+    def _profile_token_state(self, env):
+        profile_name = env.get("profile")
+        if not profile_name or env.get("auth_method", "oauth") != "oauth":
+            return False, False
+        uid = self.uid_base + env["slot"]
+        loaded = profile_secrets(
+            self.directory / env["id"] / profile_name, uid, include_raw=True
+        )
+        if not loaded:
+            return False, False
+        try:
+            data = json.loads(loaded[1])
+        except (ValueError, UnicodeDecodeError):
+            return False, False
+        token = data.get("token") if isinstance(data, dict) else None
+        if not isinstance(token, dict):
+            return False, False
+        has_refresh = isinstance(token.get("refresh_token"), str) and bool(
+            token.get("refresh_token")
+        )
+        expiry = token.get("expiry")
+        expired = False
+        now_ts = time.time()
+        if isinstance(expiry, (int, float)):
+            expired = expiry <= now_ts + 30
+        elif isinstance(expiry, str) and expiry:
+            normalized = re.sub(r"\.[0-9]+", "", expiry.strip())
+            if normalized.endswith("Z"):
+                normalized = normalized[:-1] + "+00:00"
+            try:
+                parsed = datetime.fromisoformat(normalized)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                expired = parsed.timestamp() <= now_ts + 30
+            except ValueError:
+                expired = False
+        return has_refresh, expired
+
+    def pull_models(self, env, proxy_url, *, allow_reauth_probe=False):
+        uid, key, auth = self.operation_account(
+            env, allow_reauth_probe=allow_reauth_probe
+        )
         if key:
             data = read_account(uid, proxy_url, "api-key-models", api_key=key)
             if data.get("state") == "reauth_required":
@@ -2232,6 +2326,7 @@ class Host:
                     raise Failure(502, result["error"]["code"])
                 models = result.get("models", [])
             finally:
+                self._sync_profile_token(env, run)
                 run.close()
         if not models:
             raise Failure(502, "gemini_models_empty")
@@ -2506,6 +2601,7 @@ class Host:
                     self.stop_terminal(identifier)
         for identifier, login in list(self.pending.items()):
             env = self.environments[identifier]
+            completed_proxy_url = None
             try:
                 if time.monotonic() > login.deadline:
                     raise Failure(409)
@@ -2513,6 +2609,7 @@ class Host:
                     continue
                 old_profile = env.get("profile")
                 imported = env.pop("oauth_imported", False)
+                completed_proxy_url = login.proxy_url
                 login.close(preserve=True)
                 env.update(auth_state="authorized", profile=login.attempt)
                 self.touch_environment(env)
@@ -2526,12 +2623,42 @@ class Host:
                 del self.pending[identifier]
                 if old_profile:
                     shutil.rmtree(self.directory / identifier / old_profile)
-                self.refresh_account(env, login.proxy_url)
             except Failure:
                 self.cancel(identifier)
                 env["auth_state"] = "reauth_required"
                 self.touch_environment(env)
                 self.save()
+                continue
+            if completed_proxy_url:
+                self._post_auth_provision(env, completed_proxy_url)
+
+    def _post_auth_provision(self, env, proxy_url):
+        if (
+            env.get("auth_method", "oauth") == "oauth"
+            and not env.get("oauth_imported")
+            and self.egress is not None
+            and self.oauth_runtime_issue() is None
+        ):
+            try:
+                self.pull_models(env, proxy_url)
+            except (
+                Failure,
+                OSError,
+                subprocess.SubprocessError,
+                ValueError,
+                RuntimeError,
+            ):
+                pass
+        try:
+            self.refresh_account(env, proxy_url, auto_pull_models=False)
+        except (
+            Failure,
+            OSError,
+            subprocess.SubprocessError,
+            ValueError,
+            RuntimeError,
+        ):
+            pass
 
     def ensure_env_machine_id(self, env):
         env_dir = self.directory / env["id"]
@@ -2803,7 +2930,7 @@ class Host:
             self.uid_base + slot, proxy_url, "oauth_import", oauth_token=credential
         )
 
-    def refresh_account(self, env, proxy_url):
+    def refresh_account(self, env, proxy_url, *, auto_pull_models=True):
         directory = self.directory / env["id"]
         if env.get("auth_method") == "api_key":
             api_key = json.loads((directory / "credential.json").read_bytes())[
@@ -2816,12 +2943,70 @@ class Host:
             credential = json.loads((directory / "oauth-import.json").read_bytes())
             account = self.probe_imported_account(env["slot"], proxy_url, credential)
         else:
+            has_refresh, is_expired = self._profile_token_state(env)
+            can_run_agy = (
+                self.egress is not None
+                and self.oauth_runtime_issue() is None
+                and not self.running(env["id"])
+                and env["id"] not in self.terminals
+                and env["id"] not in self.pending
+            )
+            agy_refreshed = False
+            agy_non_auth_error = False
+            if has_refresh and is_expired and can_run_agy:
+                agy_refreshed = True
+                try:
+                    self.pull_models(env, proxy_url, allow_reauth_probe=True)
+                except Failure as error:
+                    if error.code != "gemini_oauth_required":
+                        agy_non_auth_error = True
+                except (OSError, subprocess.SubprocessError, ValueError, RuntimeError):
+                    agy_non_auth_error = True
             account = read_account(
                 self.uid_base + env["slot"],
                 proxy_url,
                 "oauth",
                 profile=directory / env["profile"],
             )
+            if (
+                account.get("state") == "reauth_required"
+                and has_refresh
+                and not agy_refreshed
+                and can_run_agy
+            ):
+                agy_refreshed = True
+                try:
+                    self.pull_models(env, proxy_url, allow_reauth_probe=True)
+                    account = read_account(
+                        self.uid_base + env["slot"],
+                        proxy_url,
+                        "oauth",
+                        profile=directory / env["profile"],
+                    )
+                except Failure as error:
+                    if error.code != "gemini_oauth_required":
+                        agy_non_auth_error = True
+                except (OSError, subprocess.SubprocessError, ValueError, RuntimeError):
+                    agy_non_auth_error = True
+            if account.get("state") == "reauth_required" and agy_non_auth_error:
+                account["state"] = "error"
+            if (
+                account.get("state") in ("ok", "partial")
+                and auto_pull_models
+                and not env.get("call_models")
+                and not agy_refreshed
+                and can_run_agy
+            ):
+                try:
+                    self.pull_models(env, proxy_url, allow_reauth_probe=True)
+                except (
+                    Failure,
+                    OSError,
+                    subprocess.SubprocessError,
+                    ValueError,
+                    RuntimeError,
+                ):
+                    pass
         if account.get("state") in ("error", "reauth_required") and env.get("account"):
             previous = env["account"]
             if previous.get("state") in ("ok", "partial") and not previous.get(
@@ -2961,6 +3146,7 @@ class Host:
                 raise Failure(409)
             self.ensure_payload()
             account = {}
+            call_models = None
             if method == "api_key":
                 account = read_account(
                     self.uid_base + slot, proxy_url, "api_key", api_key=api_key
@@ -2969,6 +3155,13 @@ class Host:
                     raise Failure(400, "gemini_api_key_rejected")
                 if account["state"] not in ("ok", "partial"):
                     raise Failure(502, "gemini_account_read_failed")
+                chat_data = read_account(
+                    self.uid_base + slot, proxy_url, "api-key-models", api_key=api_key
+                )
+                if chat_data.get("state") in ("ok", "partial") and chat_data.get(
+                    "models"
+                ):
+                    call_models = chat_data["models"]
             if credential:
                 account = self.probe_imported_account(slot, proxy_url, credential)
                 if account["state"] == "reauth_required":
@@ -2990,6 +3183,7 @@ class Host:
                     "authorized" if method == "api_key" or credential else "unverified"
                 ),
                 **({"oauth_imported": True} if credential else {}),
+                **({"call_models": call_models} if call_models else {}),
                 "account": account,
                 "created_at": timestamp,
                 "updated_at": timestamp,

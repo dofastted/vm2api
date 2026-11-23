@@ -420,6 +420,8 @@ export function createGeminiCragSubscription({
   const entitlementFile = path.join(publicDir, 'entitlement.code')
   const syncMarkerFile = path.join(publicDir, 'sync-pending')
   const credentialFile = path.join(privateDir, 'credential')
+  const AUTO_BIND_BACKOFF_MS = 30_000
+  const autoBindBackoff = new Map()
   let busy = false
 
   function ensureStorage() {
@@ -543,6 +545,46 @@ export function createGeminiCragSubscription({
     }
   }
 
+  function canAutoBindLocal() {
+    if (fs.existsSync(syncMarkerFile)) return null
+    let authority
+    try {
+      authority = packageAuthority()
+    } catch {
+      return null
+    }
+    let local
+    try {
+      local = readLocalEntitlement(authority)
+    } catch {
+      return null
+    }
+    if (!local) return null
+    const now = Math.floor(Date.now() / 1000)
+    const { claims } = local
+    if (now < claims.issued_at || now >= claims.expires_at) return null
+    if (claims.version === 2) {
+      const cap = claims.slot_limit === 'unlimited' ? 10_000 : Math.min(claims.slot_limit, 10_000)
+      if (claims.roster.length >= cap) return null
+    } else if (claims.version === 3) {
+      if (!effectiveGrantedSlots(claims.grants, now)) return null
+    }
+    return { authority, local }
+  }
+
+  function needsAutoSeatBind(env, { payloadMode = null } = {}) {
+    if (!env || typeof env.id !== 'string' || !env.id) return false
+    if (env.auth_method === 'api_key' || env.auth_state === 'disabled') return false
+    const isCragSub =
+      payloadMode === 'crag_subscription' ||
+      env.payload_mode === 'crag_subscription' ||
+      env.crag_license?.seat_required === true
+    if (!isCragSub) return false
+    if (env.crag_license?.valid === true) return false
+    if (env.crag_license?.code && env.crag_license.code !== 'license_required') return false
+    return true
+  }
+
   function formatStatus({ hostId, authority, local, remote = null }) {
     const now = Math.floor(Date.now() / 1000)
     const syncPending = fs.existsSync(syncMarkerFile)
@@ -648,6 +690,7 @@ export function createGeminiCragSubscription({
           }
           publishFile(entitlementFile, `${data.entitlement}\n`, 0o644)
           removeFile(syncMarkerFile)
+          autoBindBackoff.clear()
           return formatStatus({ hostId, authority, local: { hostId, code: data.entitlement, claims }, remote: data })
         } catch (error) {
           if (error?.code !== 'gemini_subscription_authority_unavailable') {
@@ -676,6 +719,7 @@ export function createGeminiCragSubscription({
           }
           publishFile(entitlementFile, `${data.entitlement}\n`, 0o644)
           removeFile(syncMarkerFile)
+          autoBindBackoff.clear()
           return formatStatus({ hostId, authority, local: { hostId, code: data.entitlement, claims }, remote: data })
         } catch (error) {
           if (error?.code !== 'gemini_subscription_authority_unavailable') removeFile(syncMarkerFile)
@@ -720,6 +764,7 @@ export function createGeminiCragSubscription({
           publishFile(entitlementFile, `${bound.entitlement}\n`, 0o644)
           removeFile(syncMarkerFile)
           const activated = await callHost('license-activate', { id: envId, code: bound.slot_permit })
+          autoBindBackoff.delete(envId)
           return {
             vm_id: envId,
             seat: bound.seat,
@@ -801,6 +846,7 @@ export function createGeminiCragSubscription({
           publishFile(entitlementFile, `${data.entitlement}\n`, 0o644)
           removeFile(syncMarkerFile)
           await callHost('license-clear', { id: envId })
+          autoBindBackoff.clear()
           return {
             released: true,
             vm_id: envId,
@@ -816,6 +862,49 @@ export function createGeminiCragSubscription({
           throw error
         }
       })
+    },
+
+    async ensureEnvironmentSeat(envId, { env = null, payloadMode = null } = {}) {
+      if (busy) return { attempted: false, bound: false, reason: 'busy' }
+      const until = autoBindBackoff.get(envId)
+      if (until && Date.now() < until) return { attempted: false, bound: false, reason: 'backoff' }
+      if (!canAutoBindLocal()) return { attempted: false, bound: false, reason: 'inactive_or_full' }
+      const target = env ?? (await callHost('get', { id: envId }).catch(() => null))
+      if (!needsAutoSeatBind(target, { payloadMode })) {
+        return { attempted: false, bound: false, reason: 'not_needed' }
+      }
+      try {
+        const result = await this.bindEnvironment(envId)
+        return { attempted: true, bound: true, seat: result.seat, result }
+      } catch (error) {
+        const code = typeof error?.code === 'string' ? error.code : 'bind_failed'
+        autoBindBackoff.set(envId, Date.now() + AUTO_BIND_BACKOFF_MS)
+        return { attempted: true, bound: false, error_code: code }
+      }
+    },
+
+    async reconcileEnvironmentSeats(environments, { payloadMode = null } = {}) {
+      if (busy || !Array.isArray(environments) || !environments.length) return { boundIds: [] }
+      if (!canAutoBindLocal()) return { boundIds: [] }
+      const boundIds = []
+      for (const env of environments) {
+        if (!needsAutoSeatBind(env, { payloadMode })) continue
+        const outcome = await this.ensureEnvironmentSeat(env.id, { env, payloadMode })
+        if (outcome.bound) {
+          boundIds.push(env.id)
+          continue
+        }
+        if (
+          outcome.reason === 'inactive_or_full' ||
+          outcome.reason === 'busy' ||
+          outcome.error_code === 'slot_limit_reached' ||
+          outcome.error_code === 'host_subscription_inactive' ||
+          outcome.error_code === 'gemini_subscription_authority_unavailable'
+        ) {
+          break
+        }
+      }
+      return { boundIds }
     },
 
     async environmentStatus(envId) {

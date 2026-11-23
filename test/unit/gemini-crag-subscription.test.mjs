@@ -777,3 +777,241 @@ test('end-to-end Gemini CRAG subscription: redeem, bind OAuth seat, skip api_key
   assert.equal(fs.existsSync(path.join(subscription.publicDir, 'entitlement.code')), true)
   assert.equal(fs.existsSync(path.join(subscription.publicDir, 'sync-pending')), false)
 })
+
+test('auto-binds CRAGGemini seats on create, panel inventory reconcile, and scheduler catalog', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-autobind-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const now = Math.floor(Date.now() / 1000)
+
+  let revision = 0
+  let nextSeat = 1
+  const seatMap = new Map()
+  const buildH2 = (hostId) => {
+    const roster = [...seatMap.values()]
+      .sort((a, b) => a.seat - b.seat)
+      .map(({ seat, permitSha }) => ({ seat, permit_sha256: permitSha }))
+    const claims = {
+      version: 2,
+      product: CRAG_GEMINI_PRODUCT,
+      host_id: hostId,
+      revision,
+      issued_at: now - 60,
+      expires_at: now + 86400,
+      slot_limit: 'unlimited',
+      roster,
+    }
+    return {
+      entitlement: signToken(authority, 'CRAGH2', claims),
+      expires_at: claims.expires_at,
+      slot_limit: claims.slot_limit,
+      revision: claims.revision,
+      used_slots: roster.length,
+      available_slots: 10_000 - roster.length,
+      reclaim_supported: true,
+    }
+  }
+
+  const fetchImpl = async (url, options) => {
+    const action = url.split('/').pop()
+    const body = JSON.parse(options.body)
+    if (action === 'redeem') {
+      revision += 1
+      return new Response(JSON.stringify({ ok: true, data: buildH2(body.host_id) }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    if (action === 'bind') {
+      const identity = parseCragGeminiMachineCode(body.machine_code)
+      if (!seatMap.has(identity.vm_id)) {
+        const seat = nextSeat++
+        const permit = issuePermit(authority, body.machine_code, body.host_id, seat)
+        seatMap.set(identity.vm_id, { seat, permitCode: permit.code, permitSha: permit.permit_sha256 })
+        revision += 1
+      }
+      const entry = seatMap.get(identity.vm_id)
+      const h2 = buildH2(body.host_id)
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          data: { entitlement: h2.entitlement, slot_permit: entry.permitCode, seat: entry.seat },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    throw new Error(`unexpected authority action: ${action}`)
+  }
+
+  const machines = {}
+  const activePermits = new Map()
+  const environments = new Map()
+  const addEnv = (env) => {
+    environments.set(env.id, env)
+    if (env.auth_method !== 'api_key') machines[env.id] = makeMachineCode(env.id)
+  }
+
+  const envLicenseView = (env) => {
+    if (env.auth_method === 'api_key') {
+      return { product: CRAG_GEMINI_PRODUCT, status: 'not_required', valid: true, seat_required: false, vm_id: env.id }
+    }
+    const seat = activePermits.get(env.id)
+    if (!seat) {
+      return {
+        product: CRAG_GEMINI_PRODUCT,
+        status: 'unlicensed',
+        valid: false,
+        seat_required: true,
+        vm_id: env.id,
+        code: 'license_required',
+      }
+    }
+    return {
+      product: CRAG_GEMINI_PRODUCT,
+      status: 'valid',
+      valid: true,
+      seat_required: true,
+      vm_id: env.id,
+      scope: 'host',
+      seat,
+    }
+  }
+
+  let createCounter = 0
+  const callHost = async (op, body) => {
+    if (op === 'list') {
+      return {
+        payload_state: 'installed',
+        payload_mode: 'crag_subscription',
+        release_activated: true,
+        environments: [...environments.values()].map((env) => ({ ...env, crag_license: envLicenseView(env) })),
+      }
+    }
+    if (op === 'get') {
+      const env = environments.get(body.id)
+      if (!env) throw Object.assign(new Error('not found'), { code: 'gemini_environment_not_found', status: 404 })
+      return { ...env, payload_mode: 'crag_subscription', crag_license: envLicenseView(env) }
+    }
+    if (op === 'create') {
+      const id = `gemini-auto-${++createCounter}`
+      const env = {
+        id,
+        name: body.name,
+        proxy_id: body.proxy_id,
+        auth_state: body.auth_method === 'api_key' ? 'authorized' : 'unverified',
+        auth_method: body.auth_method === 'api_key' ? 'api_key' : 'oauth',
+        models_discovered: body.auth_method === 'api_key',
+        models: body.auth_method === 'api_key' ? ['gemini-2.5-pro'] : [],
+      }
+      addEnv(env)
+      return { ...env, payload_mode: 'crag_subscription', crag_license: envLicenseView(env) }
+    }
+    if (op === 'license-machine-code') return { machine_code: machines[body.id].machine_code, vm_id: body.id }
+    if (op === 'license-activate') {
+      const claims = JSON.parse(Buffer.from(body.code.split('.')[1], 'base64url'))
+      activePermits.set(body.id, claims.seat)
+      return envLicenseView(environments.get(body.id))
+    }
+    throw new Error(`unexpected host op: ${op}`)
+  }
+
+  const machineIdPath = path.join(root, 'host-machine-id')
+  fs.writeFileSync(machineIdPath, 'fedcba9876543210fedcba9876543210\n')
+  const subscription = createGeminiCragSubscription({
+    projectRoot: root,
+    dataDir: path.join(root, 'data'),
+    resolveAuthority: () => ({
+      product: CRAG_GEMINI_PRODUCT,
+      publicKey: authority.publicKey,
+      publicKeyBytes: authority.publicBytes,
+      issuerId: authority.issuerId,
+      payloadKeyId: authority.payloadKeyId,
+      softwareVersion: '0.3.0',
+    }),
+    callHost,
+    fetchImpl,
+    origin: 'http://127.0.0.1:18790',
+    machineIdFile: machineIdPath,
+  })
+
+  const responses = []
+  const panel = createGeminiPanelHandler({
+    json: (_res, status, payload) => responses.push({ status, payload }),
+    readBody: async (req) => req.body,
+    proxyPool: () => ({
+      snapshot: () => ({ proxies: [{ id: 'px-1', enabled: true, status: 'ok', owner_user_id: null }] }),
+      getProxyByIdWithAuth: () => ({ url: 'socks5h://192.0.2.10:1080' }),
+    }),
+    cragSubscription: subscription,
+    callHost,
+  })
+  const res = { setHeader() {} }
+
+  // 1. Activate host subscription
+  const voucher = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
+  await panel({ method: 'POST', body: { redemption_code: voucher } }, res, '/api/panel/gemini/crag-subscription/redeem')
+  assert.equal(responses.pop().status, 200)
+
+  // 2. Creating an OAuth env auto-binds seat #1 immediately
+  await panel({ method: 'POST', body: { name: 'Fresh OAuth', proxy_id: 'px-1' } }, res, '/api/panel/gemini/environments')
+  const createdOAuth = responses.pop()
+  assert.equal(createdOAuth.status, 200)
+  assert.equal(createdOAuth.payload.data.crag_license.valid, true)
+  assert.equal(createdOAuth.payload.data.crag_license.seat, 1)
+
+  // 3. Creating an API Key env never consumes a seat
+  await panel(
+    {
+      method: 'POST',
+      body: { name: 'Key Env', proxy_id: 'px-1', auth_method: 'api_key', api_key: 'AIzaSyTestKeyValue1234567890' },
+    },
+    res,
+    '/api/panel/gemini/environments',
+  )
+  const createdKey = responses.pop()
+  assert.equal(createdKey.status, 200)
+  assert.equal(seatMap.size, 1)
+
+  // 4. Existing unlicensed OAuth env is auto-bound on GET /api/panel/gemini; disabled env is skipped
+  addEnv({
+    id: 'gemini-existing-oauth',
+    name: 'Existing OAuth',
+    proxy_id: 'px-1',
+    auth_state: 'authorized',
+    auth_method: 'oauth',
+    models_discovered: true,
+    models: ['gemini-3-flash'],
+  })
+  addEnv({
+    id: 'gemini-disabled-oauth',
+    name: 'Disabled OAuth',
+    proxy_id: 'px-1',
+    auth_state: 'disabled',
+    auth_method: 'oauth',
+    models_discovered: true,
+    models: ['gemini-3-flash'],
+  })
+  await panel({ method: 'GET' }, res, '/api/panel/gemini')
+  const listed = responses.pop()
+  assert.equal(listed.status, 200)
+  const existingView = listed.payload.data.environments.find((e) => e.id === 'gemini-existing-oauth')
+  const disabledView = listed.payload.data.environments.find((e) => e.id === 'gemini-disabled-oauth')
+  assert.equal(existingView.crag_license.valid, true)
+  assert.equal(existingView.crag_license.seat, 2)
+  assert.equal(disabledView.crag_license.valid, false)
+
+  // 5. Headless scheduler.catalog() also auto-binds an unlicensed ready OAuth env
+  addEnv({
+    id: 'gemini-sched-oauth',
+    name: 'Scheduler OAuth',
+    proxy_id: 'px-1',
+    auth_state: 'authorized',
+    auth_method: 'oauth',
+    models_discovered: true,
+    models: ['gemini-3-pro'],
+  })
+  const scheduler = createGeminiScheduler({ callHost, cragSubscription: subscription })
+  const catalog = await scheduler.catalog()
+  assert.ok(catalog.accounts.some((a) => a.id === 'gemini-sched-oauth'))
+  assert.equal(activePermits.get('gemini-sched-oauth'), 3)
+})
