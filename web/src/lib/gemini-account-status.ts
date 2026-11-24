@@ -348,7 +348,10 @@ export function geminiEligibilityNotice(
   if (lastInference?.state === 'completed' && lastInference.finished_at) {
     const checked = account?.checked_at ? Date.parse(account.checked_at) : NaN
     const finished = Date.parse(lastInference.finished_at)
-    if (!Number.isFinite(checked) || finished >= checked) return null
+    // 抑制提示需要证明这次推理比资格结论更新。缺失或无法解析的 checked_at
+    // 不是证明（面板的 checked_at 没有兜底，缺字段就下发 null），而误抑制会
+    // 连一键验证链接一起藏掉，此时后端仍按 eligibility 冷却该账号。
+    if (Number.isFinite(checked) && Number.isFinite(finished) && finished >= checked) return null
   }
   switch (account?.eligibility) {
     case 'verification_required':
