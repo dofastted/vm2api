@@ -195,6 +195,14 @@ const HOST_ERRORS = {
   host_binding_conflict: [409, GEMINI_LICENSE_MESSAGES.host_binding_conflict],
   redeem_unavailable: [404, GEMINI_LICENSE_MESSAGES.redeem_unavailable],
   host_redeem_conflict: [409, GEMINI_LICENSE_MESSAGES.host_redeem_conflict],
+  issuer_mismatch: [409, GEMINI_LICENSE_MESSAGES.issuer_mismatch],
+  payload_key_unknown: [400, GEMINI_LICENSE_MESSAGES.payload_key_unknown],
+  payload_key_conflict: [409, GEMINI_LICENSE_MESSAGES.payload_key_conflict],
+  renewal_unavailable: [409, GEMINI_LICENSE_MESSAGES.renewal_unavailable],
+  host_transfer_cooldown: [409, GEMINI_LICENSE_MESSAGES.host_transfer_cooldown],
+  request_conflict: [409, GEMINI_LICENSE_MESSAGES.request_conflict],
+  invalid_request: [400, GEMINI_LICENSE_MESSAGES.invalid_request],
+  not_found: [404, GEMINI_LICENSE_MESSAGES.not_found],
   auth_forbidden: [403, GEMINI_LICENSE_MESSAGES.auth_forbidden],
 }
 

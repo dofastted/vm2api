@@ -38,6 +38,14 @@ const KNOWN_REDEEM_ERROR_CODES = new Set([
   'host_binding_conflict',
   'redeem_unavailable',
   'host_redeem_conflict',
+  'issuer_mismatch',
+  'payload_key_unknown',
+  'payload_key_conflict',
+  'renewal_unavailable',
+  'host_transfer_cooldown',
+  'request_conflict',
+  'invalid_request',
+  'not_found',
   'auth_forbidden',
 ])
 
