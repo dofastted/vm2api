@@ -1203,6 +1203,8 @@ function publicError(error) {
   const status = Number.isInteger(error?.status) ? error.status : known?.[0] || 503
   return {
     status,
+    details: error?.details,
+    retryAfter: error?.retryAfter,
     body: {
       error: {
         type: status === 429 ? 'rate_limit_error' : status >= 500 ? 'api_error' : 'invalid_request_error',
@@ -1409,8 +1411,8 @@ function writeStream(res, events) {
   res.end()
 }
 
-function protocolErrorBody(protocol, status, code, message) {
-  return formatGeminiProtocolError(protocol, status, code, message)
+function protocolErrorBody(protocol, status, code, message, details = null) {
+  return formatGeminiProtocolError(protocol, status, code, message, details)
 }
 
 export function googleModelEntry(model) {
@@ -1942,9 +1944,12 @@ export function createGeminiPublicHandler({
         logBag.error_code = mapped.body.error.code
         logBag.error_message = mapped.body.error.message
         logBag.final_state = 'failed'
+        if (Number.isFinite(Number(mapped.retryAfter)) && Number(mapped.retryAfter) > 0) {
+          res.setHeader?.('Retry-After', String(Math.max(1, Math.ceil(Number(mapped.retryAfter)))))
+        }
         return respondJson(
           mapped.status,
-          protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
+          protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message, mapped.details),
         )
       }
     }
@@ -2094,9 +2099,12 @@ export function createGeminiPublicHandler({
         if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
         return
       }
+      if (Number.isFinite(Number(mapped.retryAfter)) && Number(mapped.retryAfter) > 0) {
+        res.setHeader?.('Retry-After', String(Math.max(1, Math.ceil(Number(mapped.retryAfter)))))
+      }
       return respondJson(
         mapped.status,
-        protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
+        protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message, mapped.details),
       )
     }
   }
