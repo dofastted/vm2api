@@ -479,6 +479,39 @@ def smoke(root, broker):
     assert not old_daemon.can_update(OLDER, "99.0.0")
     assert old_daemon.can_update(OLDER, "1.5.8")
 
+    # A payload installed outside this daemon has no verifier assets beside it, so
+    # verification yields nothing and the version used to stay None -- which made
+    # can_update refuse and reported every release incompatible, leaving no upgrade
+    # path at all. The version is now read from the manifest it declares.
+    declared_root = root / "declared"
+    declared_root.mkdir()
+
+    def declared(manifest):
+        target = declared_root / "payload"
+        shutil.rmtree(target, ignore_errors=True)
+        target.mkdir()
+        write_json(target / "manifest.json", manifest)
+        return old_daemon.declared_payload_version(target)
+
+    crag = {
+        "family": "crag",
+        "encrypted": True,
+        "software_version": OLDER,
+        "sha256": {"agy": old_daemon.known_cli},
+    }
+    assert declared(crag) == (OLDER, "1.5.8")
+    # The declared pair is exactly what unblocks the ordering check.
+    assert old_daemon.can_update(*declared(crag))
+    # An agy the release does not pin leaves the CLI unknown rather than assumed.
+    assert declared({**crag, "sha256": {"agy": "0" * 64}}) == (OLDER, None)
+    # An explicit cli_version is taken as declared.
+    assert declared({**crag, "cli_version": "1.5.8", "sha256": {}}) == (OLDER, "1.5.8")
+    # Nothing usable stays None instead of guessing.
+    assert declared({**crag, "software_version": "not a version!"}) == (None, None)
+    assert declared({"family": "crag"}) == (None, None)
+    assert declared([1, 2, 3]) == (None, None)
+    shutil.rmtree(declared_root, ignore_errors=True)
+
     with fixture.serve(fixture.daemon(bad_bundle)):
         fixture.job("install", bad_id, "fetch_failed")
         assert not fixture.current.exists() and not fixture.unit.exists()

@@ -1283,6 +1283,45 @@ class Maintenance:
             entry = self.verified.get(str(payload))
         return entry[1] if entry and entry[0] == fingerprint else None
 
+    def declared_payload_version(self, payload):
+        """Read the version an installed payload claims, without verifying it.
+
+        can_update refuses to move forward when it cannot order the installed
+        payload against the target, and payload_status only learns a version as a
+        by-product of verification. A payload installed outside this daemon has no
+        verifier assets next to it (no manifest.sig, no gemini-ed25519.pub, no
+        gemini-release.json), so verification yields nothing, the version stays
+        None, and every release is reported incompatible: the host can no longer
+        be upgraded through the only path that offers a backup and a rollback.
+
+        The manifest is still read through the root-owned size-capped primitives,
+        and the value only ever feeds the ordering comparison that blocks a
+        downgrade. The target payload continues to be verified in full before it
+        replaces anything, so trusting this value does not install anything the
+        signature checks would have rejected.
+        """
+        try:
+            manifest = parse_json(read_root(payload / "manifest.json", 65536))
+        except (Failure, OSError, ValueError, RecursionError):
+            return None, None
+        if not isinstance(manifest, dict):
+            return None, None
+
+        def field(name):
+            value = manifest.get(name)
+            return value if isinstance(value, str) and SAFE_VERSION.fullmatch(value) else None
+
+        version = field("software_version")
+        cli = field("cli_version")
+        if version is not None and cli is None and self.known_cli is not None:
+            # A schema-1 or crag manifest carries no CLI version field. Order against
+            # the pinned CLI only when the payload records the agy this release pins,
+            # read from the same manifest map the verified crag path uses for members.
+            digests = manifest.get("sha256")
+            if isinstance(digests, dict) and digests.get("agy") == self.known_cli:
+                cli = self.release["cli_version"]
+        return version, cli
+
     def payload_status(self, pending):
         result = {
             "state": "not_configured",
@@ -1304,9 +1343,17 @@ class Maintenance:
         except (OSError, ValueError):
             verified = "gemini_maintenance_payload_invalid"
         if verified is None:
+            # Keep reporting the payload as unverified -- nothing here makes it
+            # trusted -- but surface the version it declares so can_update can still
+            # order it against the target. Without this the host is stuck: every
+            # release reads as incompatible and the only upgrade path that takes a
+            # backup and can roll back refuses to run.
+            declared, declared_cli = self.declared_payload_version(self.current)
             return {
                 **result,
                 "state": "unverified",
+                "version": declared,
+                "cli_version": declared_cli,
                 "issue": "gemini_maintenance_payload_unverified",
             }
         if isinstance(verified, str):
