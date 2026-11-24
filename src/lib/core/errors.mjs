@@ -133,6 +133,7 @@ export const KERNEL_FAILURE_STATUS = Object.freeze({
 export const CLIENT_POOL_BUSY_MESSAGE = '号池负载过高，稍后再试'
 export const CLIENT_POOL_UNAVAILABLE_MESSAGE = '号池当前没有可用账号'
 export const CLIENT_POOL_RATE_LIMITED_MESSAGE = '号池账号均被上游限流，稍后再试'
+export const CLIENT_POOL_FABLE_RATE_LIMITED_MESSAGE = '号池中暂无可用 Fable 额度，请等待额度重置'
 
 /**
  * Capacity: every eligible seat stayed busy until the bounded wait ran out, the
@@ -280,6 +281,7 @@ export function makeRefusalGuardError({
  */
 export function poolErrorKind(code, message = '') {
   const key = String(code || '').trim()
+  if (key === 'pool_fable_rate_limited') return 'fable_rate_limited'
   if (POOL_OVERLOADED_CODES.has(key)) return 'overloaded'
   if (POOL_RATE_LIMITED_CODES.has(key)) return 'rate_limited'
   if (POOL_UNAVAILABLE_CODES.has(key)) return 'unavailable'
@@ -303,12 +305,13 @@ function poolClientError(kind) {
       retryAfterSec: 1,
     }
   }
-  if (kind === 'rate_limited') {
+  if (kind === 'rate_limited' || kind === 'fable_rate_limited') {
     return {
       ...makeError({
         type: ErrorType.RATE_LIMIT,
         code: ErrorCode.UPSTREAM_RATE_LIMIT,
-        message: CLIENT_POOL_RATE_LIMITED_MESSAGE,
+        message:
+          kind === 'fable_rate_limited' ? CLIENT_POOL_FABLE_RATE_LIMITED_MESSAGE : CLIENT_POOL_RATE_LIMITED_MESSAGE,
         status: 429,
       }),
       // The caller raises it to the earliest rate-limit reset.
@@ -815,8 +818,8 @@ export function mapUpstreamError(status, body, headers = {}) {
       message: String(msg),
       status:
         (inboundCode === ErrorCode.UPSTREAM_INVALID || upType === 'invalid_request_error') &&
-          status >= 400 &&
-          status < 500
+        status >= 400 &&
+        status < 500
           ? status
           : 400,
       param: body?.error?.param || undefined,

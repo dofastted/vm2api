@@ -134,6 +134,23 @@ test('#163: a bare 429 is unknown for every model; the model name never decides 
   }
 })
 
+test('a long Retry-After alone never parks an account or model', () => {
+  for (const model of ['claude-fable-5-2', 'claude-opus-5-5']) {
+    const policy = classifyUpstreamResult(
+      {
+        status: 429,
+        headers: { 'retry-after': '109005' },
+        body: { error: { type: 'rate_limit_error', message: "This request would exceed your account's rate limit." } },
+      },
+      { model, now: 1000 },
+    )
+    assert.equal(policy.reason, 'rate_limited_unknown')
+    assert.equal(policy.action, 'continue')
+    assert.equal(policy.cooldownUntil, null)
+    assert.equal(policy.decision.cooldownUntilMs, null)
+  }
+})
+
 test('#1139: only a proven Fable window cools the Fable family', () => {
   const error = { type: 'rate_limit_error', message: 'Error' }
   const body = { type: 'error', error }
@@ -155,12 +172,7 @@ test('#1139: only a proven Fable window cools the Fable family', () => {
       'fable_rate_limited',
       'continue-and-cooldown',
     ],
-    [
-      'forwarded Retry-After',
-      { ...result, headers: { 'Retry-After': '7' } },
-      'rate_limited_unknown',
-      'continue-and-cooldown',
-    ],
+    ['forwarded Retry-After', { ...result, headers: { 'Retry-After': '7' } }, 'rate_limited_unknown', 'continue'],
     ['no native facts', { status: 429, body }, 'rate_limited_unknown', 'continue'],
     [
       'different error text',

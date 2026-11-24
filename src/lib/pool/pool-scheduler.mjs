@@ -421,14 +421,20 @@ function selectionSnapshot(candidates = [], available = [], extras = {}) {
   const waitPool = extras.waitPool || candidates
   const waitReasons = [...new Set((waitPool || []).map((candidate) => candidate.waitReason).filter(Boolean))]
   const soonest = (waitPool || []).map((candidate) => Number(candidate.availableAt) || 0).filter((value) => value > now)
+  const fableLimited =
+    extras.reason === 'all_accounts_busy' &&
+    waitPool.length > 0 &&
+    waitPool.every((candidate) => candidate.waitReason === 'fable_quota')
   const quotaLimited =
     extras.reason === 'all_accounts_busy' &&
     waitPool.length > 0 &&
     waitPool.every(
-      (candidate) => candidate.waitReason === 'account_cooldown' && isQuotaWindowReason(candidate.cooldownReason),
+      (candidate) =>
+        candidate.waitReason === 'fable_quota' ||
+        (candidate.waitReason === 'account_cooldown' && isQuotaWindowReason(candidate.cooldownReason)),
     )
   return {
-    reason: quotaLimited ? 'pool_rate_limited' : extras.reason,
+    reason: fableLimited ? 'pool_fable_rate_limited' : quotaLimited ? 'pool_rate_limited' : extras.reason,
     wait_ms: extras.waitMs ?? 0,
     soonest_available_ms: soonest.length ? Math.min(...soonest) - now : null,
     wait_reasons: waitReasons,
@@ -2292,7 +2298,13 @@ export class PoolScheduler extends EventEmitter {
     for (const key of modelCooldownKeys(modelKey)) {
       const modelState = state?.model_states?.[key]
       if (modelState && cooldownActive(modelState.cooldown_until, eligibilityNow)) {
-        markWait(key === FABLE_FAMILY_KEY ? 'fable_cooldown' : 'model_cooldown', modelState.cooldown_until)
+        const reason =
+          modelState.reason === 'fable_rate_limited'
+            ? 'fable_quota'
+            : key === FABLE_FAMILY_KEY
+              ? 'fable_cooldown'
+              : 'model_cooldown'
+        markWait(reason, modelState.cooldown_until)
       }
     }
     if (isFableModel(modelKey) && this.accountQuota?.fableWindowLimited?.(accountId, eligibilityNow, account)) {
