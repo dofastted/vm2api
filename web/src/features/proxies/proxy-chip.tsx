@@ -89,21 +89,6 @@ export function ProxyChip({
           ? named
           : label
 
-  if (vm.gemini) {
-    return (
-      <span
-        className={cn(
-          'inline-flex min-w-0 items-center gap-1 text-xs text-muted-foreground',
-          className
-        )}
-        title={`绑定的 SOCKS5 代理 · ${vm.gemini.proxy_id}`}
-      >
-        <Globe className='size-3 shrink-0' aria-hidden />
-        <span className='truncate'>{vm.gemini.proxy_id}</span>
-      </span>
-    )
-  }
-
   return (
     <div
       role={canProbe ? 'button' : undefined}
