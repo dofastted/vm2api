@@ -1408,13 +1408,24 @@ function extractGeminiSessionId(req, body, sessionPathId = '') {
     'x-claude-code-session-id',
     'x-opencode-session',
     'x-opencode-session-id',
+    'session-id',
+    'thread-id',
   ]) {
     if (typeof headers[key] === 'string' && headers[key].trim()) return headers[key].trim()
   }
-  if (typeof body?.conversation_id === 'string' && body.conversation_id.trim()) return body.conversation_id.trim()
-  if (typeof body?.session_id === 'string' && body.session_id.trim()) return body.session_id.trim()
+  for (const field of ['conversation_id', 'conversationId', 'session_id', 'thread_id', 'prompt_cache_key']) {
+    if (typeof body?.[field] === 'string' && body[field].trim()) return body[field].trim()
+  }
   if (typeof body?.metadata?.user_id === 'string' && body.metadata.user_id.trim()) {
     const rawUser = body.metadata.user_id.trim()
+    if (rawUser.startsWith('{')) {
+      try {
+        const parsedUid = JSON.parse(rawUser)
+        if (typeof parsedUid?.session_id === 'string' && parsedUid.session_id.trim()) {
+          return parsedUid.session_id.trim()
+        }
+      } catch {}
+    }
     const match = /_session_([A-Za-z0-9._-]+)$/.exec(rawUser)
     return match ? match[1] : rawUser
   }
@@ -1831,7 +1842,21 @@ export function createGeminiPublicHandler({
     }
 
     let headersSent = false
-    const encoder = wantStream ? createGeminiProtocolStreamEncoder(protocol, { model: parsed.model }) : null
+    const encoder = wantStream
+      ? createGeminiProtocolStreamEncoder(protocol, { model: parsed.model, restoreContext: parsed.restoreContext })
+      : null
+    const continuationCallIds = []
+    const parsedMsgs = Array.isArray(parsed.messages) ? parsed.messages : []
+    for (let i = parsedMsgs.length - 1; i >= 0; i -= 1) {
+      const msgResults = []
+      for (const part of parsedMsgs[i]?.parts || []) {
+        if (part?.kind === 'tool_result' && typeof part.callId === 'string' && part.callId) {
+          msgResults.push(part.callId)
+        }
+      }
+      if (!msgResults.length) break
+      continuationCallIds.unshift(...msgResults)
+    }
     const writeChunk = (text) => {
       if (!text || controller.signal.aborted) return
       if (!headersSent) {
@@ -1841,7 +1866,31 @@ export function createGeminiPublicHandler({
       res.write(text)
     }
 
-    const stickyKey = stickyHeader ? `${req.apiKeyRecord?.id || 'anon'}:${stickyHeader.slice(0, 128)}` : null
+    const deriveFirstUserFingerprint = () => {
+      const msgs = Array.isArray(parsed?.messages) ? parsed.messages : []
+      const firstUser = msgs.find((m) => m?.role === 'user') || msgs[0]
+      if (!firstUser || !Array.isArray(firstUser.parts)) return ''
+      const text = firstUser.parts
+        .filter((p) => p?.kind === 'text' && typeof p.text === 'string' && p.text.trim())
+        .map((p) => p.text)
+        .join('\n')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 4000)
+      if (text) return `ch:${crypto.createHash('sha256').update(text).digest('hex').slice(0, 24)}`
+      const firstMedia = firstUser.parts.find((p) => p?.data || p?.url)
+      if (firstMedia) {
+        const seed = firstMedia.data ? String(firstMedia.data).slice(0, 512) : String(firstMedia.url)
+        return `ch:${crypto.createHash('sha256').update(seed).digest('hex').slice(0, 24)}`
+      }
+      return ''
+    }
+    const stickySeed =
+      stickyHeader ||
+      deriveFirstUserFingerprint() ||
+      (typeof body?.previous_response_id === 'string' && body.previous_response_id.trim()) ||
+      ''
+    const stickyKey = stickySeed ? `${req.apiKeyRecord?.id || 'anon'}:${stickySeed.slice(0, 128)}` : null
 
     try {
       const promptPolicy =
@@ -1851,9 +1900,15 @@ export function createGeminiPublicHandler({
         ...(activeLogCtx?.request_id ? { requestId: activeLogCtx.request_id } : {}),
         startedAt,
         targetBodyFor: (target, meta) => {
-          const reqBody = buildGeminiRequest(meta?.upstreamModel ? { ...parsed, model: meta.upstreamModel } : parsed, {
-            target,
-          })
+          const irForTarget = {
+            ...parsed,
+            ...(meta?.upstreamModel ? { model: meta.upstreamModel } : {}),
+            // On CRAGGemini (`antigravity`), always apply the scheduler's account-scoped
+            // outbound conversation_id so switching accounts never reuses the prior account's
+            // or raw caller's conversation_id.
+            ...(target === 'antigravity' && meta?.conversationId ? { conversationId: meta.conversationId } : {}),
+          }
+          const reqBody = buildGeminiRequest(irForTarget, { target })
           const finalBody =
             target === 'antigravity' && promptPolicy ? applyCragGeminiPromptPolicy(reqBody, promptPolicy) : reqBody
           lastOutboundBody = finalBody
@@ -1864,6 +1919,9 @@ export function createGeminiPublicHandler({
           }
           return finalBody
         },
+        restoreContext: parsed.restoreContext,
+        continuationCallIds,
+        inboundConversationId: parsed.conversationId || null,
         requiredCapabilities: parsed.requiredCapabilities,
         unsupportedFields: parsed.unsupportedFields,
         plainText: parsed.plainText,
@@ -1900,6 +1958,7 @@ export function createGeminiPublicHandler({
           model: turn.model || parsed.model,
           sessionId: session?.[1],
           accountId: turn.account_id,
+          restoreContext: parsed.restoreContext,
         }),
       )
     } catch (error) {
