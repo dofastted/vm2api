@@ -740,7 +740,7 @@ export function createHandleProtocol(deps) {
     }
 
     if (protocol === 'anthropic.messages' && req.apiKeyRecord?.group_type === 'gemini') {
-      return deps.handleGeminiMessages(req, res, { logBag })
+      return deps.handleGeminiMessages(req, res, { logBag, logCtx })
     }
 
     let inbound
@@ -796,7 +796,7 @@ export function createHandleProtocol(deps) {
       typeof (deps.handleGeminiPublic || deps.handleGeminiMessages) === 'function'
     ) {
       req.body = inbound
-      return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, { logBag })
+      return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, { logBag, logCtx })
     }
 
     const fp = fingerprintRequest(req, inbound)
@@ -1752,6 +1752,18 @@ export function createHandleProtocol(deps) {
       }
       // The api backend forwards the converted body untouched: its session is the outbound one.
       logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(ctx.body) || logBag.session_id)
+      if (result?.outboundBody != null) {
+        logBag.outbound_summary = summarizeBody(result.outboundBody)
+        if (logCtx.capture_outbound) {
+          logBag.outbound_body = result.outboundBody
+          if (result.outboundBodySource) logBag.outbound_body_source = result.outboundBodySource
+        }
+      }
+      if (apiGemini && logBag.outbound_headers_source === 'unavailable') {
+        logBag.outbound_headers_source = null
+      }
+      if (result?.reasoningEffort) logBag.reasoning_effort = result.reasoningEffort
+      if (result?.stopReason) logBag.stop_reason = result.stopReason
       logBag.account_id = result?.accountId || null
       logBag.final_account_id = result?.accountId || null
       logBag.upstream_status = result?.upstreamStatus ?? null

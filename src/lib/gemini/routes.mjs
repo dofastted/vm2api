@@ -3,6 +3,7 @@ import http from 'node:http'
 import { isIP } from 'node:net'
 import path from 'node:path'
 import { filterModelCatalogForKey, keyModelError } from '../admin/key-models.mjs'
+import { summarizeBody } from '../admin/request-log.mjs'
 import {
   buildGeminiRequest,
   createGeminiProtocolStreamEncoder,
@@ -11,6 +12,7 @@ import {
   parseInboundToGemini,
   renderGeminiProtocolResponse,
 } from '../protocol/gemini-convert.mjs'
+import { resolveGeminiReasoningEffort, sessionIdForLog } from '../protocol/log-fields.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
 import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
@@ -1398,6 +1400,27 @@ function logProtocolName(protocol) {
   }
 }
 
+function extractGeminiSessionId(req, body, sessionPathId = '') {
+  const headers = req?.headers || {}
+  for (const key of [
+    'x-session-id',
+    'x-conversation-id',
+    'x-claude-code-session-id',
+    'x-opencode-session',
+    'x-opencode-session-id',
+  ]) {
+    if (typeof headers[key] === 'string' && headers[key].trim()) return headers[key].trim()
+  }
+  if (typeof body?.conversation_id === 'string' && body.conversation_id.trim()) return body.conversation_id.trim()
+  if (typeof body?.session_id === 'string' && body.session_id.trim()) return body.session_id.trim()
+  if (typeof body?.metadata?.user_id === 'string' && body.metadata.user_id.trim()) {
+    const rawUser = body.metadata.user_id.trim()
+    const match = /_session_([A-Za-z0-9._-]+)$/.exec(rawUser)
+    return match ? match[1] : rawUser
+  }
+  return typeof sessionPathId === 'string' ? sessionPathId.trim() : ''
+}
+
 export function createGeminiPublicHandler({
   json,
   readBody,
@@ -1406,7 +1429,11 @@ export function createGeminiPublicHandler({
   groupsRepo = null,
   getRoutingConfig = null,
 }) {
-  return async function handleGeminiPublic(req, res, { logBag: externalLogBag = null } = {}) {
+  return async function handleGeminiPublic(
+    req,
+    res,
+    { logBag: externalLogBag = null, logCtx: externalLogCtx = null } = {},
+  ) {
     res.setHeader('Cache-Control', 'no-store')
     const keyGroupType = req.apiKeyKind === 'managed' ? req.apiKeyRecord?.group_type || 'all' : null
     if (keyGroupType !== 'gemini' && keyGroupType !== 'all') {
@@ -1489,21 +1516,28 @@ export function createGeminiPublicHandler({
     const modelFromPath = google ? google.model : null
     const bodyLimit = protocol === 'gemini-session' ? 256 * 1024 : 12 * 1024 * 1024
 
-    const startedAt = Date.now()
     const ownLogCtx =
       !externalLogBag && requestLog?.start
-        ? requestLog.start(req, { protocol: logProtocolName(protocol), route: url.pathname })
+        ? requestLog.start(req, { protocol: logProtocolName(protocol), pathName: url.pathname })
         : null
-    if (ownLogCtx) requestLog?.tapResponse?.(ownLogCtx, res)
+    const activeLogCtx = externalLogCtx || ownLogCtx
+    const startedAt = activeLogCtx?.t0 || Date.now()
     const logBag = externalLogBag || {}
+    if (logBag.outbound_headers_source === 'unavailable') logBag.outbound_headers_source = null
+    if (ownLogCtx) {
+      res._kinRequestId = ownLogCtx.request_id
+      // Register tapResponse before our finish listener so ctx.response has final status/headers/body.
+      requestLog?.tapResponse?.(ownLogCtx, res)
+    }
     let ownLogFlushed = false
+    let ownLogStatusOverride = null
     const finishOwnLog = (statusCode) => {
       if (!ownLogCtx || ownLogFlushed) return
       ownLogFlushed = true
       try {
         const groupId = req.apiKeyRecord?.group_id ?? 1
         requestLog.finish(ownLogCtx, {
-          status: statusCode ?? (res.statusCode || 0),
+          status: statusCode ?? ownLogStatusOverride ?? (res.statusCode || 0),
           api_key_kind: req.apiKeyKind || null,
           api_key_id: req.apiKeyRecord?.id || null,
           user_id: req.apiKeyRecord?.user_id ?? null,
@@ -1512,6 +1546,15 @@ export function createGeminiPublicHandler({
           ...logBag,
         })
       } catch {}
+    }
+    const hasFinishHook = typeof res?.once === 'function'
+    if (ownLogCtx && hasFinishHook) {
+      res.once('finish', () => finishOwnLog(ownLogStatusOverride ?? (res.statusCode || 0)))
+    }
+    const respondJson = (statusCode, payload) => {
+      const out = json(res, statusCode, payload)
+      if (ownLogCtx && !hasFinishHook) finishOwnLog(statusCode)
+      return out
     }
 
     let body = req.body
@@ -1523,12 +1566,15 @@ export function createGeminiPublicHandler({
         logBag.error_code = 'invalid_json'
         logBag.error_message = 'Invalid JSON request body.'
         logBag.final_state = 'failed'
-        finishOwnLog(status)
-        return json(res, status, protocolErrorBody(protocol, status, 'invalid_json', 'Invalid JSON request body.'))
+        logBag.attempt_count = 0
+        return respondJson(status, protocolErrorBody(protocol, status, 'invalid_json', 'Invalid JSON request body.'))
       }
     }
-    if (ownLogCtx?.mode === 'debug' && logBag.inbound_body == null) {
+    if (activeLogCtx?.mode === 'debug' && logBag.inbound_body == null) {
       logBag.inbound_body = body
+    }
+    if (logBag.inbound_summary == null) {
+      logBag.inbound_summary = summarizeBody(body)
     }
 
     const supportsStream = typeof scheduler.stream === 'function'
@@ -1548,8 +1594,8 @@ export function createGeminiPublicHandler({
         logBag.error_code = code
         logBag.error_message = msg
         logBag.final_state = 'failed'
-        finishOwnLog(status)
-        return json(res, status, protocolErrorBody(protocol, status, code, msg))
+        logBag.attempt_count = 0
+        return respondJson(status, protocolErrorBody(protocol, status, code, msg))
       }
     } else {
       requested = geminiTurnFromBody(body, protocol, modelFromPath)
@@ -1559,9 +1605,8 @@ export function createGeminiPublicHandler({
         logBag.error_message =
           'This CRAGGemini route accepts one plain-text user turn without tools or generation settings.'
         logBag.final_state = 'failed'
-        finishOwnLog(status)
-        return json(
-          res,
+        logBag.attempt_count = 0
+        return respondJson(
           status,
           protocolErrorBody(
             protocol,
@@ -1576,19 +1621,29 @@ export function createGeminiPublicHandler({
     const targetModel = supportsStream ? parsed.model : requested.model
     const wantStream =
       protocol === 'gemini-session' ? false : (supportsStream ? parsed.stream : requested.stream) === true
+    const stickyHeader = extractGeminiSessionId(req, body, session?.[1])
     logBag.model = targetModel
     logBag.requested_model = targetModel
     logBag.stream = wantStream
-    logBag.has_tools = Boolean(supportsStream ? parsed?.requiredCapabilities?.includes('tools') : false)
-    logBag.attempt_count = 1
+    logBag.has_tools = Boolean(
+      supportsStream
+        ? parsed?.tools?.length > 0 ||
+            parsed?.webSearch ||
+            parsed?.googleTools?.length > 0 ||
+            parsed?.requiredCapabilities?.includes('tools')
+        : false,
+    )
+    logBag.attempt_count = 0
+    logBag.reasoning_effort = resolveGeminiReasoningEffort({ inbound: body, parsed, model: targetModel })
+    if (!logBag.session_id) logBag.session_id = sessionIdForLog(stickyHeader)
+    logBag.outbound_session_id = sessionIdForLog(stickyHeader)
 
     if (keyGroupType === 'all' && !isAntigravityRoutedModel(targetModel)) {
       const msg = 'All-access keys must address Antigravity non-Gemini models with the ag- prefix.'
       logBag.error_code = 'gemini_model_unavailable'
       logBag.error_message = msg
       logBag.final_state = 'failed'
-      finishOwnLog(404)
-      return json(res, 404, protocolErrorBody(protocol, 404, 'gemini_model_unavailable', msg))
+      return respondJson(404, protocolErrorBody(protocol, 404, 'gemini_model_unavailable', msg))
     }
 
     const denied = keyModelError(req, targetModel, { anthropic: messages })
@@ -1596,22 +1651,29 @@ export function createGeminiPublicHandler({
       logBag.error_code = denied.body.error.code
       logBag.error_message = denied.body.error.message
       logBag.final_state = 'failed'
-      finishOwnLog(denied.status)
-      return json(
-        res,
+      return respondJson(
         denied.status,
         protocolErrorBody(protocol, denied.status, denied.body.error.code, denied.body.error.message),
       )
     }
 
     const controller = new AbortController()
-    req.once('aborted', () => controller.abort())
-    res.once('close', () => {
+    req.once?.('aborted', () => controller.abort())
+    res.once?.('close', () => {
       if (!res.writableEnded) controller.abort()
     })
 
+    let lastOutboundBody = null
     const applyTurnLog = (turn) => {
       const usage = turn?.usage || {}
+      const cacheRead = usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? 0
+      const reasoning = usage.reasoning_tokens ?? 0
+      const webSearches =
+        Number.isSafeInteger(usage.web_search_requests) && usage.web_search_requests > 0
+          ? usage.web_search_requests
+          : Array.isArray(turn?.searches) && turn.searches.length > 0
+            ? turn.searches.length
+            : 0
       logBag.model = turn?.model || targetModel
       logBag.requested_model = targetModel
       logBag.upstream_model = turn?.upstream_model || turn?.model || targetModel
@@ -1621,13 +1683,75 @@ export function createGeminiPublicHandler({
       logBag.via = turn?.auth_method === 'api_key' ? 'gemini_api_key' : 'craggemini'
       logBag.stop_reason = turn?.stopReason || 'end_turn'
       logBag.final_state = 'verified'
+      logBag.attempt_count = Number.isInteger(turn?.attempt_count) ? turn.attempt_count : 1
+      logBag.upstream_status = turn?.upstream_status ?? 200
+      logBag.reasoning_effort = resolveGeminiReasoningEffort({
+        inbound: body,
+        parsed,
+        outboundBody: lastOutboundBody,
+        model: targetModel,
+        upstreamModel: turn?.upstream_model || turn?.model || targetModel,
+      })
       logBag.usage = {
         input_tokens: usage.input_tokens || 0,
         output_tokens: usage.output_tokens || 0,
-        ...(usage.cache_read_tokens ? { cache_read_tokens: usage.cache_read_tokens } : {}),
-        ...(usage.reasoning_tokens ? { reasoning_tokens: usage.reasoning_tokens } : {}),
+        ...(cacheRead > 0 ? { cache_read_input_tokens: cacheRead, cache_read_tokens: cacheRead } : {}),
+        ...(reasoning > 0 ? { reasoning_tokens: reasoning } : {}),
+        ...(webSearches > 0 ? { web_search_requests: webSearches } : {}),
       }
-      if (logBag.first_token_ms == null) logBag.first_token_ms = Math.max(0, Date.now() - startedAt)
+      const timing = turn?.timing
+      if (timing) {
+        logBag.first_byte_ms = Number.isFinite(timing.firstByteAt)
+          ? Math.max(0, timing.firstByteAt - startedAt)
+          : (timing.firstByteMs ?? logBag.first_byte_ms ?? null)
+        logBag.first_token_ms = Number.isFinite(timing.firstTokenAt)
+          ? Math.max(0, timing.firstTokenAt - startedAt)
+          : (timing.ttftMs ?? logBag.first_token_ms ?? null)
+        logBag.generation_ms = timing.generationMs ?? null
+      } else if (logBag.first_token_ms == null) {
+        logBag.first_token_ms = Math.max(0, Date.now() - startedAt)
+      }
+    }
+
+    const applyErrorLog = (error) => {
+      if (!error || typeof error !== 'object') return
+      if (Number.isInteger(error.attemptCount)) logBag.attempt_count = error.attemptCount
+      if (Number.isInteger(error.upstreamStatus)) logBag.upstream_status = error.upstreamStatus
+      if (error.accountId) {
+        logBag.account_id = error.accountId
+        logBag.final_account_id = error.accountId
+        logBag.vm_id = `gemini:${error.accountId}`
+      }
+      if (error.authMethod) logBag.via = error.authMethod === 'api_key' ? 'gemini_api_key' : 'craggemini'
+      if (error.upstreamModel) logBag.upstream_model = error.upstreamModel
+      const timing = error.timing
+      if (timing) {
+        if (Number.isFinite(timing.firstByteAt)) logBag.first_byte_ms = Math.max(0, timing.firstByteAt - startedAt)
+        else if (timing.firstByteMs != null) logBag.first_byte_ms = timing.firstByteMs
+        if (Number.isFinite(timing.firstTokenAt)) logBag.first_token_ms = Math.max(0, timing.firstTokenAt - startedAt)
+        else if (timing.ttftMs != null) logBag.first_token_ms = timing.ttftMs
+        if (timing.generationMs != null) logBag.generation_ms = timing.generationMs
+      }
+      const usage = error.usage
+      if (usage && (usage.input_tokens || usage.output_tokens || usage.cache_read_tokens || usage.reasoning_tokens)) {
+        const cacheRead = usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? 0
+        const reasoning = usage.reasoning_tokens ?? 0
+        logBag.usage = {
+          input_tokens: usage.input_tokens || 0,
+          output_tokens: usage.output_tokens || 0,
+          ...(cacheRead > 0 ? { cache_read_input_tokens: cacheRead, cache_read_tokens: cacheRead } : {}),
+          ...(reasoning > 0 ? { reasoning_tokens: reasoning } : {}),
+        }
+      }
+      if (lastOutboundBody) {
+        logBag.reasoning_effort = resolveGeminiReasoningEffort({
+          inbound: body,
+          parsed,
+          outboundBody: lastOutboundBody,
+          model: targetModel,
+          upstreamModel: error.upstreamModel || targetModel,
+        })
+      }
     }
 
     if (!supportsStream) {
@@ -1635,31 +1759,51 @@ export function createGeminiPublicHandler({
         const turn = await scheduler.complete({
           model: requested.model,
           text: requested.text,
+          requestId: activeLogCtx?.request_id,
+          startedAt,
+          stickyKey: stickyHeader ? `${req.apiKeyRecord?.id || 'anon'}:${stickyHeader.slice(0, 128)}` : null,
           signal: controller.signal,
           apiKeyRecord: req.apiKeyRecord,
           allowUnprefixedNonGemini: keyGroupType === 'gemini',
         })
         applyTurnLog(turn)
-        finishOwnLog(200)
-        if (messages)
-          return requested.stream ? writeStream(res, anthropicStream(turn)) : json(res, 200, anthropicMessage(turn))
+        if (messages) {
+          if (requested.stream) {
+            const out = writeStream(res, anthropicStream(turn))
+            if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
+            return out
+          }
+          return respondJson(200, anthropicMessage(turn))
+        }
         if (protocol === 'openai-chat') {
-          if (!requested.stream) return json(res, 200, chatCompletion(turn))
+          if (!requested.stream) return respondJson(200, chatCompletion(turn))
           const id = `chatcmpl_${crypto.randomBytes(12).toString('hex')}`
-          return writeStream(res, [
+          const out = writeStream(res, [
             `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', model: turn.model, choices: [{ index: 0, delta: { role: 'assistant', content: turn.text }, finish_reason: null }] })}\n\n`,
             `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', model: turn.model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: turn.usage?.input_tokens || 0, completion_tokens: turn.usage?.output_tokens || 0, total_tokens: turn.usage?.total_tokens || 0 } })}\n\n`,
             'data: [DONE]\n\n',
           ])
+          if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
+          return out
         }
         if (protocol === 'openai-responses') {
-          return requested.stream ? writeStream(res, responsesStream(turn)) : json(res, 200, responsesOutput(turn))
+          if (requested.stream) {
+            const out = writeStream(res, responsesStream(turn))
+            if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
+            return out
+          }
+          return respondJson(200, responsesOutput(turn))
         }
         if (protocol === 'gemini') {
           const response = googleOutput(turn)
-          return routeStream ? writeStream(res, [`data: ${JSON.stringify(response)}\n\n`]) : json(res, 200, response)
+          if (routeStream) {
+            const out = writeStream(res, [`data: ${JSON.stringify(response)}\n\n`])
+            if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
+            return out
+          }
+          return respondJson(200, response)
         }
-        return json(res, 200, {
+        return respondJson(200, {
           id: session[1],
           model: turn.model,
           account_id: turn.account_id,
@@ -1667,9 +1811,11 @@ export function createGeminiPublicHandler({
           usage: turn.usage,
         })
       } catch (error) {
+        applyErrorLog(error)
         if (controller.signal.aborted) {
           logBag.error_code = 'gemini_inference_cancelled'
-          logBag.final_state = 'aborted'
+          logBag.final_state = 'cancelled'
+          ownLogStatusOverride = 499
           finishOwnLog(499)
           return
         }
@@ -1677,9 +1823,7 @@ export function createGeminiPublicHandler({
         logBag.error_code = mapped.body.error.code
         logBag.error_message = mapped.body.error.message
         logBag.final_state = 'failed'
-        finishOwnLog(mapped.status)
-        return json(
-          res,
+        return respondJson(
           mapped.status,
           protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
         )
@@ -1693,18 +1837,10 @@ export function createGeminiPublicHandler({
       if (!headersSent) {
         beginSse(res)
         headersSent = true
-        if (logBag.first_token_ms == null) logBag.first_token_ms = Math.max(0, Date.now() - startedAt)
       }
       res.write(text)
     }
 
-    const stickyHeader =
-      (typeof req.headers?.['x-session-id'] === 'string' && req.headers['x-session-id'].trim()) ||
-      (typeof req.headers?.['x-conversation-id'] === 'string' && req.headers['x-conversation-id'].trim()) ||
-      (typeof body?.conversation_id === 'string' && body.conversation_id.trim()) ||
-      (typeof body?.session_id === 'string' && body.session_id.trim()) ||
-      session?.[1] ||
-      ''
     const stickyKey = stickyHeader ? `${req.apiKeyRecord?.id || 'anon'}:${stickyHeader.slice(0, 128)}` : null
 
     try {
@@ -1712,13 +1848,17 @@ export function createGeminiPublicHandler({
         typeof getRoutingConfig === 'function' ? resolveCragGeminiPromptPolicy(getRoutingConfig()) : null
       const turn = await scheduler.stream({
         model: parsed.model,
+        ...(activeLogCtx?.request_id ? { requestId: activeLogCtx.request_id } : {}),
+        startedAt,
         targetBodyFor: (target, meta) => {
           const reqBody = buildGeminiRequest(meta?.upstreamModel ? { ...parsed, model: meta.upstreamModel } : parsed, {
             target,
           })
           const finalBody =
             target === 'antigravity' && promptPolicy ? applyCragGeminiPromptPolicy(reqBody, promptPolicy) : reqBody
-          if (ownLogCtx?.capture_outbound) {
+          lastOutboundBody = finalBody
+          logBag.outbound_summary = summarizeBody(finalBody)
+          if (activeLogCtx?.capture_outbound) {
             logBag.outbound_body = finalBody
             logBag.outbound_body_source = target === 'antigravity' ? 'craggemini' : 'gemini_api'
           }
@@ -1739,21 +1879,22 @@ export function createGeminiPublicHandler({
           : null,
       })
       if (controller.signal.aborted) {
+        applyTurnLog(turn)
         logBag.error_code = 'gemini_inference_cancelled'
-        logBag.final_state = 'aborted'
+        logBag.final_state = 'cancelled'
+        ownLogStatusOverride = 499
         finishOwnLog(499)
         return
       }
       applyTurnLog(turn)
-      finishOwnLog(200)
       if (wantStream) {
         writeChunk(encoder.finish())
         if (!headersSent) beginSse(res)
         res.end()
+        if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
         return
       }
-      return json(
-        res,
+      return respondJson(
         200,
         renderGeminiProtocolResponse(protocol, turn, {
           model: turn.model || parsed.model,
@@ -1762,9 +1903,11 @@ export function createGeminiPublicHandler({
         }),
       )
     } catch (error) {
+      applyErrorLog(error)
       if (controller.signal.aborted) {
         logBag.error_code = 'gemini_inference_cancelled'
-        logBag.final_state = 'aborted'
+        logBag.final_state = 'cancelled'
+        ownLogStatusOverride = 499
         finishOwnLog(499)
         return
       }
@@ -1772,18 +1915,18 @@ export function createGeminiPublicHandler({
       logBag.error_code = mapped.body.error.code
       logBag.error_message = mapped.body.error.message
       logBag.final_state = 'failed'
-      finishOwnLog(headersSent ? 200 : mapped.status)
       if (headersSent) {
+        ownLogStatusOverride = 200
         try {
           res.write(
             formatGeminiProtocolStreamError(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
           )
           res.end()
         } catch {}
+        if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
         return
       }
-      return json(
-        res,
+      return respondJson(
         mapped.status,
         protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
       )
