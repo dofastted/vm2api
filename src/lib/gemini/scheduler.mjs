@@ -1,3 +1,4 @@
+import { apiKeyGateDetails } from '../admin/api-keys.mjs'
 import crypto from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 import {
@@ -826,7 +827,13 @@ export function createGeminiScheduler({
     }) {
       const turnStartedAt = Number.isFinite(startedAt) ? startedAt : now()
       const gate = apiKeyStore?.acquire?.(apiKeyRecord)
-      if (gate && !gate.ok) throw fail(gate.status || 429, gate.code, gate.message)
+      if (gate && !gate.ok) {
+        const err = fail(gate.status || 429, gate.code, gate.message)
+        const details = apiKeyGateDetails(gate)
+        if (details) err.details = details
+        if (gate.retry_after != null) err.retryAfter = gate.retry_after
+        throw err
+      }
       const allowUnprefixed = allowUnprefixedNonGemini ?? apiKeyRecord?.group_type !== 'all'
       const excluded = new Set()
       let reservation = null

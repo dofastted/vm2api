@@ -20,6 +20,7 @@ import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.
 import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
+import { makeApiKeyGateError } from '../admin/api-keys.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { observeUpstreamRisk, runProtocolIntercept, upstreamRiskClientError } from './intercept-gate.mjs'
 import {
@@ -304,14 +305,14 @@ export function createHandleProtocol(deps) {
     } catch {}
   }
 
-  function keyGateErrorBody(gate) {
-    return makeError({
-      type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
-      code: gate.code,
-      message: gate.message,
-      status: gate.status,
-      details: gate.detail || undefined,
-    }).body
+  function respondKeyGateError(res, gate) {
+    const err = makeApiKeyGateError(gate)
+    if (err.headers) {
+      for (const [header, value] of Object.entries(err.headers)) {
+        if (value != null) res.setHeader?.(header, value)
+      }
+    }
+    return json(res, err.status, err.body)
   }
 
   /** Key allowlist on the model the client named, before any mapping: 400 in the caller's protocol. */
@@ -357,7 +358,7 @@ export function createHandleProtocol(deps) {
       stats.errors++
       logBag.error_code = gate.code
       logBag.error_message = gate.message
-      return json(res, gate.status, keyGateErrorBody(gate))
+      return respondKeyGateError(res, gate)
     }
     try {
       return await run()
@@ -1787,7 +1788,7 @@ export function createHandleProtocol(deps) {
         const gate = apiKeyStore.acquire(managedKey)
         if (!gate.ok) {
           stats.errors++
-          return json(res, gate.status, keyGateErrorBody(gate))
+          return respondKeyGateError(res, gate)
         }
       }
       const clientAbort = bindClientAbort(req, res)
@@ -1944,7 +1945,7 @@ export function createHandleProtocol(deps) {
       const gate = apiKeyStore.acquire(managedKey)
       if (!gate.ok) {
         stats.errors++
-        return json(res, gate.status, keyGateErrorBody(gate))
+        return respondKeyGateError(res, gate)
       }
     }
 

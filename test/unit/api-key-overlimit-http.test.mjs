@@ -1,0 +1,123 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import { startGateway, api } from '../harness.mjs'
+import { formatGeminiProtocolError } from '../../src/lib/protocol/gemini-convert.mjs'
+
+const MODEL = 'claude-haiku-4-5-20251001'
+
+async function gateway(t) {
+  const gw = await startGateway({ env: { KIN_KERNEL_BIN: process.execPath } })
+  t.after(async () => {
+    await gw.stop()
+    fs.rmSync(gw.project, { recursive: true, force: true })
+  })
+  return gw
+}
+
+test('HTTP /v1/messages returns 402 with quota_error & limit_type on USD quota exhaustion (#911)', async (t) => {
+  const gw = await gateway(t)
+  const created = await api(gw, 'POST', '/api/panel/api-keys', {
+    body: { name: 'usd-cap', quota_usd: 0.000001, rpm: 0 },
+  })
+  assert.equal(created.status, 201, created.text)
+  const headers = { authorization: `Bearer ${created.json.item.key}` }
+  const body = { model: MODEL, max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] }
+
+  const first = await api(gw, 'POST', '/v1/messages', { headers, body })
+  assert.equal(first.status, 200, first.text)
+
+  const second = await api(gw, 'POST', '/v1/messages', { headers, body })
+  assert.equal(second.status, 402, second.text)
+  assert.equal(second.json.error.type, 'quota_error')
+  assert.equal(second.json.error.code, 'api_key_quota_exhausted')
+  assert.equal(second.json.error.details.limit_type, 'usd_quota')
+  assert.equal(second.json.error.details.limit, 0.000001)
+  assert.ok(second.json.error.details.current >= 0.000001)
+  assert.equal(second.json.error.details.remaining, 0)
+  assert.equal(second.json.error.details.reset_at, null)
+  assert.equal(second.headers.get('retry-after'), null)
+})
+
+test('HTTP /v1/messages returns 402 + Retry-After + reset_at on 5h spend window exhaustion (#911)', async (t) => {
+  const gw = await gateway(t)
+  const created = await api(gw, 'POST', '/api/panel/api-keys', {
+    body: { name: 'spend-5h', rate_limit_5h: 0.000001, rpm: 0 },
+  })
+  assert.equal(created.status, 201, created.text)
+  const headers = { authorization: `Bearer ${created.json.item.key}` }
+  const body = { model: MODEL, max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] }
+
+  const first = await api(gw, 'POST', '/v1/messages', { headers, body })
+  assert.equal(first.status, 200, first.text)
+
+  const second = await api(gw, 'POST', '/v1/messages', { headers, body })
+  assert.equal(second.status, 402, second.text)
+  assert.equal(second.json.error.type, 'rate_limit_error')
+  assert.equal(second.json.error.code, 'api_key_rate_limit')
+  assert.equal(second.json.error.details.limit_type, 'spend_5h')
+  assert.equal(second.json.error.details.limit, 0.000001)
+  assert.equal(second.json.error.details.remaining, 0)
+  assert.ok(Date.parse(second.json.error.details.reset_at) > Date.now())
+  const retryAfter = Number(second.headers.get('retry-after'))
+  assert.ok(Number.isInteger(retryAfter) && retryAfter > 0 && retryAfter <= 5 * 3600)
+})
+
+test('HTTP /v1/messages returns 429 + Retry-After + reset_at on RPM exhaustion (#911)', async (t) => {
+  const gw = await gateway(t)
+  const created = await api(gw, 'POST', '/api/panel/api-keys', {
+    body: { name: 'rpm-1', rpm: 1, max_concurrency: 0 },
+  })
+  assert.equal(created.status, 201, created.text)
+  const headers = { authorization: `Bearer ${created.json.item.key}` }
+  const body = { model: MODEL, max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] }
+
+  const first = await api(gw, 'POST', '/v1/messages', { headers, body })
+  assert.equal(first.status, 200, first.text)
+
+  const second = await api(gw, 'POST', '/v1/messages', { headers, body })
+  assert.equal(second.status, 429, second.text)
+  assert.equal(second.json.error.type, 'rate_limit_error')
+  assert.equal(second.json.error.code, 'api_key_rate_limit')
+  assert.equal(second.json.error.details.limit_type, 'rpm')
+  assert.equal(second.json.error.details.current, 1)
+  assert.equal(second.json.error.details.limit, 1)
+  assert.equal(second.json.error.details.remaining, 0)
+  assert.ok(Date.parse(second.json.error.details.reset_at) > Date.now())
+  const retryAfter = Number(second.headers.get('retry-after'))
+  assert.ok(Number.isInteger(retryAfter) && retryAfter >= 1 && retryAfter <= 60)
+})
+
+test('formatGeminiProtocolError preserves quota_error/rate_limit_error types and details on 402/429', () => {
+  const details = { limit_type: 'usd_quota', current: 2, limit: 2, remaining: 0, reset_at: null }
+  const openai = formatGeminiProtocolError(
+    'openai-chat',
+    402,
+    'api_key_quota_exhausted',
+    'API key USD quota exhausted',
+    details,
+  )
+  assert.equal(openai.error.type, 'quota_error')
+  assert.deepEqual(openai.error.details, details)
+
+  const anth = formatGeminiProtocolError('anthropic', 402, 'api_key_rate_limit', 'API key 5h spend limit exceeded', {
+    limit_type: 'spend_5h',
+    current: 1,
+    limit: 1,
+    remaining: 0,
+    reset_at: '2026-11-24T17:00:00.000Z',
+  })
+  assert.equal(anth.error.type, 'rate_limit_error')
+  assert.equal(anth.error.details.limit_type, 'spend_5h')
+
+  const gem = formatGeminiProtocolError(
+    'gemini',
+    402,
+    'api_key_quota_exhausted',
+    'API key USD quota exhausted',
+    details,
+  )
+  assert.equal(gem.error.code, 402)
+  assert.equal(gem.error.status, 'RESOURCE_EXHAUSTED')
+  assert.equal(gem.error.details[0].metadata.limit_type, 'usd_quota')
+})

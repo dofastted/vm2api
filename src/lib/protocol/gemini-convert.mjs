@@ -4440,7 +4440,8 @@ export function renderGeminiProtocolResponse(
   }
 }
 
-export function formatGeminiProtocolError(protocol, status, code, message) {
+export function formatGeminiProtocolError(protocol, status, code, message, details = null) {
+  const hasDetails = Boolean(details && typeof details === 'object' && Object.keys(details).length)
   if (protocol === 'gemini') {
     const grpcStatus =
       status === 400
@@ -4453,17 +4454,25 @@ export function formatGeminiProtocolError(protocol, status, code, message) {
               ? 'NOT_FOUND'
               : status === 409
                 ? 'ABORTED'
-                : status === 429
+                : status === 402 || status === 429
                   ? 'RESOURCE_EXHAUSTED'
                   : status === 504
                     ? 'DEADLINE_EXCEEDED'
                     : 'UNAVAILABLE'
+    const info = { '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: code }
+    if (hasDetails) {
+      const metadata = {}
+      for (const [k, v] of Object.entries(details)) {
+        if (v != null) metadata[k] = String(v)
+      }
+      if (Object.keys(metadata).length) info.metadata = metadata
+    }
     return {
       error: {
         code: status,
         message,
         status: grpcStatus,
-        details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: code }],
+        details: [info],
       },
     }
   }
@@ -4474,15 +4483,20 @@ export function formatGeminiProtocolError(protocol, status, code, message) {
         ? 'permission_error'
         : status === 404
           ? 'not_found_error'
-          : status === 429
-            ? 'rate_limit_error'
-            : status >= 500
-              ? 'api_error'
-              : 'invalid_request_error'
+          : code === 'api_key_quota_exhausted'
+            ? 'quota_error'
+            : code === 'api_key_rate_limit' ||
+                code === 'api_key_concurrency_limit' ||
+                code === 'user_concurrency_limit' ||
+                status === 429
+              ? 'rate_limit_error'
+              : status >= 500
+                ? 'api_error'
+                : 'invalid_request_error'
   if (protocol === 'anthropic') {
-    return { type: 'error', error: { type, message, code } }
+    return { type: 'error', error: hasDetails ? { type, message, code, details } : { type, message, code } }
   }
-  return { error: { type, code, message } }
+  return { error: hasDetails ? { type, code, message, details } : { type, code, message } }
 }
 
 export function formatGeminiProtocolStreamError(protocol, status, code, message) {

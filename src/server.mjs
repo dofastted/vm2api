@@ -82,7 +82,7 @@ import { VmTestScheduleRunner } from './lib/admin/vm-test-schedule.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
-import { ApiKeyStore } from './lib/admin/api-keys.mjs'
+import { ApiKeyStore, makeApiKeyGateError } from './lib/admin/api-keys.mjs'
 import { keyScopeFromRequest, keyTierPolicyFromRecord } from './lib/admin/key-scope.mjs'
 import { ownerScopeFromRequest } from './lib/admin/resource-owner.mjs'
 import { filterModelCatalogForKey } from './lib/admin/key-models.mjs'
@@ -977,6 +977,11 @@ function rejectAuth(req, res, error) {
     message: error?.body?.error?.message || 'Invalid credentials',
     status: error?.status || 401,
   }
+  if (error?.headers) {
+    for (const [header, value] of Object.entries(error.headers)) {
+      if (value != null) res.setHeader?.(header, value)
+    }
+  }
   json(res, error.status, error.body)
   return false
 }
@@ -1080,23 +1085,7 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
   }
   const gate = keyGate ? apiKeyStore.canAccept(managed.record) : { ok: true }
   if (!gate.ok) {
-    const type =
-      gate.status === 429
-        ? gate.code.includes('quota')
-          ? ErrorType.QUOTA
-          : ErrorType.RATE_LIMIT
-        : ErrorType.PERMISSION
-    return rejectAuth(
-      req,
-      res,
-      makeError({
-        type,
-        code: gate.code,
-        message: gate.message,
-        status: gate.status,
-        details: gate.detail || undefined,
-      }),
-    )
+    return rejectAuth(req, res, makeApiKeyGateError(gate))
   }
   if (keyGate && !allowRate(token)) {
     return rejectAuth(
