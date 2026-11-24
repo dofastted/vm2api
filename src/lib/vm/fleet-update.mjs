@@ -128,9 +128,9 @@ async function restartForCragTelemetry({
           if (!recreated?.ok) return { ok: false, code: 'telemetry_restart_failed', error: 'CRAG 重启未确认' }
           expectedRevision = publicationRevision(current())
         } else {
-          if (!ops.restart) {
-            writeKernelConfig(projectRoot, current(), { routing, publish: false })
-          }
+          // The restarted kernel reads its config at boot, so it is written first, always.
+          const writeConfig = ops.writeKernelConfig || writeKernelConfig
+          writeConfig(projectRoot, current(), { routing, publish: false })
           const restarted = await (ops.restart || restartRustKernel)(exec)
           if (!restarted?.ok) return { ok: false, code: 'telemetry_restart_failed', error: 'CRAG 重启未确认' }
         }
