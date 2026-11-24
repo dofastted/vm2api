@@ -420,6 +420,7 @@ INFERENCE_ERROR_CODES = frozenset(
         "gemini_model_unavailable",
         "gemini_models_empty",
         "gemini_native_bridge_timeout",
+        "gemini_native_config_invalid",
         "gemini_native_tty_unavailable",
         "gemini_native_worker_unavailable",
         "gemini_oauth_required",
@@ -1574,7 +1575,7 @@ class NativeAgy(Agy):
                 *agy_args,
             ]
         )
-        self.native_exit_reader = native_module_impl.read_launcher_exit
+        self.native_exit_reader = native_module_impl.read_launcher_exit_detail
         spawn = getattr(self.host, "spawn", lambda fn: fn())
         if self.pool_mode:
             # Multi-process CRAGGemini pool allocates per-slot PTYs and pidfd execution guards
@@ -1651,6 +1652,7 @@ class NativeAgy(Agy):
                         "request_id": self.attempt,
                         "prompt": self.prompt,
                         "startup_timeout": 45,
+                        "launcher_uid": self.uid,
                     },
                     secrets=self.credentials,
                 )
@@ -1688,9 +1690,38 @@ class NativeAgy(Agy):
             return {
                 "state": "failed",
                 "text": "",
-                "error": {"code": "gemini_native_worker_unavailable"},
+                "error": {"code": self.early_exit_code()},
             }
         return result
+
+    def read_exit_detail(self):
+        if self.native_dir is None:
+            return None
+        reader = getattr(self, "native_exit_reader", None)
+        if reader is None:
+            reader = native_module().read_launcher_exit_detail
+        outcome = reader(self.native_dir, self.uid)
+        if outcome is None:
+            return None
+        return (
+            (outcome[0], outcome[1], outcome[2])
+            if len(outcome) >= 3
+            else (outcome[0], outcome[1], None)
+        )
+
+    def early_exit_code(self):
+        outcome = self.read_exit_detail()
+        if outcome is None:
+            return "gemini_native_worker_unavailable"
+        reason = outcome[2] if len(outcome) >= 3 else None
+        if reason == "invalid_config":
+            return "gemini_native_config_invalid"
+        if reason is None:
+            return "gemini_native_worker_unavailable"
+        try:
+            return native_module().launcher_exit_code(outcome)
+        except Failure:
+            return "gemini_native_worker_unavailable"
 
     def close(self, preserve=False):
         wrapper_status = self.native_tui.poll() if self.native_tui is not None else None
@@ -1709,12 +1740,13 @@ class NativeAgy(Agy):
                 if self.native_tui is not None:
                     self._stop_process_group(self.native_tui)
                     self.native_tui = None
-                    outcome = self.native_exit_reader(self.native_dir, self.uid)
+                    outcome = self.read_exit_detail()
                     if outcome is not None:
-                        child, status = outcome
+                        child, status, reason = outcome
                         kind = "exit_code" if status >= 0 else "signal"
+                        reason_text = f" reason={reason}" if reason else ""
                         print(
-                            f"Gemini native child={child} {kind}={abs(status)}",
+                            f"Gemini native child={child} {kind}={abs(status)}{reason_text}",
                             file=sys.stderr,
                         )
                     elif wrapper_status is not None:
@@ -1835,10 +1867,11 @@ class NativeSession(NativeAgy):
         return self._health_failures >= NATIVE_HEALTH_FAIL_THRESHOLD
 
     def open_stream(self, request_id, body_obj, *, model=None, gateway_policy=None):
+        native_mod = native_module()
         if not self.is_alive():
-            raise native_module().NativeFailure("gemini_native_worker_unavailable", 503)
+            raise native_mod.launcher_exit_failure(self.read_exit_detail())
         effective_model = model or self.model
-        return native_module().open_worker_stream(
+        return native_mod.open_worker_stream(
             self.socket_path,
             self.native_token,
             effective_model,
@@ -1847,6 +1880,8 @@ class NativeSession(NativeAgy):
             startup_timeout=45,
             gateway_policy=gateway_policy,
             diagnostic=self.native_diagnostic,
+            is_alive=self.is_alive,
+            exit_reader=self.read_exit_detail,
         )
 
     def cancel_turn(self, request_id):
@@ -2375,14 +2410,23 @@ class CragDaemonShard:
         )
         return data if status == 200 else None
 
+    def read_exit_detail(self):
+        if self.native_dir is None:
+            return None
+        return native_module().read_launcher_exit_detail(self.native_dir, self.uid)
+
+    def early_exit_code(self):
+        return native_module().launcher_exit_code(self.read_exit_detail())
+
     def open_stream(
         self, env_id, request_id, body_obj, *, model=None, gateway_policy=None
     ):
+        native_mod = native_module()
         if not self.is_alive():
-            raise native_module().NativeFailure("gemini_native_worker_unavailable", 503)
+            raise native_mod.launcher_exit_failure(self.read_exit_detail())
         self.last_used = time.monotonic()
         effective_model = model or NATIVE_DEFAULT_MODEL
-        return native_module().open_worker_stream(
+        return native_mod.open_worker_stream(
             self.socket_path,
             self.native_token,
             effective_model,
@@ -2391,6 +2435,8 @@ class CragDaemonShard:
             startup_timeout=45,
             gateway_policy=gateway_policy,
             account_id=env_id,
+            is_alive=self.is_alive,
+            exit_reader=self.read_exit_detail,
         )
 
     def cancel_turn(self, env_id, request_id):
@@ -2428,14 +2474,27 @@ class CragDaemonShard:
 
     def close(self):
         with self._lock:
-            if self.process is not None:
-                NativeAgy._stop_process_group(self.process)
-                self.process = None
-            if getattr(self, "_owns_native_dir", False) and self.native_dir is not None:
-                shutil.rmtree(self.native_dir, ignore_errors=True)
-                self._owns_native_dir = False
-            if self.directory.exists():
-                shutil.rmtree(self.directory, ignore_errors=True)
+            try:
+                if self.process is not None:
+                    NativeAgy._stop_process_group(self.process)
+                    self.process = None
+                    outcome = self.read_exit_detail()
+                    if outcome is not None:
+                        child, status, reason = outcome
+                        kind = "exit_code" if status >= 0 else "signal"
+                        reason_text = f" reason={reason}" if reason else ""
+                        print(
+                            f"Gemini native shard={self.shard_id} child={child} {kind}={abs(status)}{reason_text}",
+                            file=sys.stderr,
+                        )
+            finally:
+                try:
+                    if getattr(self, "_owns_native_dir", False) and self.native_dir is not None:
+                        shutil.rmtree(self.native_dir, ignore_errors=True)
+                        self._owns_native_dir = False
+                finally:
+                    if self.directory.exists():
+                        shutil.rmtree(self.directory, ignore_errors=True)
 
 
 class ResidentTestChatRun:
@@ -2446,14 +2505,18 @@ class ResidentTestChatRun:
         self.model = model
         self._request_id = f"test-{secrets.token_hex(12)}"
         self._done = False
+        invocation_request = {
+            "socket": session.socket_path,
+            "token": session.native_token,
+            "model": model,
+            "request_id": self._request_id,
+            "prompt": prompt,
+        }
+        session_uid = getattr(session, "uid", None)
+        if type(session_uid) is int and session_uid >= 0:
+            invocation_request["launcher_uid"] = session_uid
         self._invocation = native_module().NativeInvocation(
-            {
-                "socket": session.socket_path,
-                "token": session.native_token,
-                "model": model,
-                "request_id": self._request_id,
-                "prompt": prompt,
-            },
+            invocation_request,
             secrets=credentials,
         )
 
@@ -2477,10 +2540,15 @@ class ResidentTestChatRun:
             return result
         if not self.session.is_alive():
             self._done = True
+            code = (
+                self.session.early_exit_code()
+                if hasattr(self.session, "early_exit_code")
+                else "gemini_native_worker_unavailable"
+            )
             return {
                 "state": "failed",
                 "text": "",
-                "error": {"code": "gemini_native_worker_unavailable"},
+                "error": {"code": code},
             }
         return result
 

@@ -391,9 +391,17 @@ describe('Gemini account presentation', () => {
         'gpt-oss-120b-medium',
       ],
       [
-        { id: 'claude-sonnet-4-6-high', provider: 'anthropic', quota_group: '3p' },
+        {
+          id: 'claude-sonnet-4-6-high',
+          provider: 'anthropic',
+          quota_group: '3p',
+        },
         { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
-        { id: 'gemini-4-argon', provider: 'google', quota_group: 'gemini-argon-wtu' },
+        {
+          id: 'gemini-4-argon',
+          provider: 'google',
+          quota_group: 'gemini-argon-wtu',
+        },
         { id: 'gpt-oss-120b-medium', provider: 'openai', quota_group: '3p' },
       ]
     )
@@ -416,5 +424,16 @@ describe('Gemini account presentation', () => {
       publicId: 'ag-gpt-oss-120b-medium',
       quotaGroup: '3p',
     })
+  })
+})
+
+describe('gemini_native_config_invalid status copy', () => {
+  it('renders dedicated label and alignment action', () => {
+    expect(geminiInferenceErrorLabel('gemini_native_config_invalid')).toBe(
+      'CRAGGemini 配置被载荷拒绝'
+    )
+    expect(
+      geminiInferenceErrorAction('gemini_native_config_invalid')
+    ).toContain('对齐宿主脚本与签名载荷版本')
   })
 })
