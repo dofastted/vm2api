@@ -329,16 +329,30 @@ function safeGoogleValidationUrl(value?: string | null): string | null {
   }
 }
 
+/**
+ * 上游资格提示。`lastInference` 是比账号检查更新的成功宿主推理时，
+ * 说明验证已完成，旧的资格结论不再提示。
+ */
 export function geminiEligibilityNotice(
   account?: {
     eligibility?: string | null
     validation_url?: string | null
-  } | null
+    checked_at?: string | null
+  } | null,
+  lastInference?: Pick<LastInference, 'state' | 'finished_at'> | null
 ): {
   label: string
   action: string
   validationUrl: string | null
 } | null {
+  if (lastInference?.state === 'completed' && lastInference.finished_at) {
+    const checked = account?.checked_at ? Date.parse(account.checked_at) : NaN
+    const finished = Date.parse(lastInference.finished_at)
+    // 抑制提示需要证明这次推理比资格结论更新。缺失或无法解析的 checked_at
+    // 不是证明（面板的 checked_at 没有兜底，缺字段就下发 null），而误抑制会
+    // 连一键验证链接一起藏掉，此时后端仍按 eligibility 冷却该账号。
+    if (Number.isFinite(checked) && Number.isFinite(finished) && finished >= checked) return null
+  }
   switch (account?.eligibility) {
     case 'verification_required':
       return {

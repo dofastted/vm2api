@@ -58,6 +58,10 @@ class UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer)
     daemon_threads = True
 
 
+cancelled_requests = []
+hang_release = threading.Event()
+
+
 class Handler(socketserver.StreamRequestHandler):
     def handle(self):
         request_line = self.rfile.readline().decode("ascii").strip()
@@ -82,7 +86,11 @@ class Handler(socketserver.StreamRequestHandler):
             assert headers.get("x-kin-internal-token") == "a" * 64
             length = int(headers["content-length"])
             cancel_req = json.loads(self.rfile.read(length))
-            body = json.dumps({"cancelled": cancel_req.get("request_id") == "turn-cancel-01"}).encode("utf-8")
+            req_id = cancel_req.get("request_id")
+            cancelled_requests.append(req_id)
+            if req_id == "turn-hang-diag":
+                hang_release.set()
+            body = json.dumps({"cancelled": req_id in ("turn-cancel-01", "turn-hang-diag")}).encode("utf-8")
             self.wfile.write(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
                 + str(len(body)).encode()
@@ -95,6 +103,9 @@ class Handler(socketserver.StreamRequestHandler):
         assert headers.get("x-kin-internal-token") == "a" * 64
         length = int(headers["content-length"])
         request = json.loads(self.rfile.read(length))
+        if request["request_id"] == "turn-hang-diag":
+            hang_release.wait(timeout=3.0)
+            return
         if request["request_id"] == "turn-err-429":
             body = json.dumps(
                 {"error": "rate limited", "code": "upstream_http", "upstream_status": 429}
@@ -231,6 +242,66 @@ with tempfile.TemporaryDirectory(prefix="gemini-native-fixture-") as temporary:
             assert err.code == expected_code, (err.code, expected_code)
         else:
             raise AssertionError(f"expected NativeFailure for run_request {req_id}")
+    # open_worker_stream() must fast-fail on EligibilityDiagnostic before or while awaiting headers.
+    with tempfile.TemporaryDirectory(prefix="gemini-stream-diag-") as sdiag_tmp:
+        sdiag = native.EligibilityDiagnostic(Path(sdiag_tmp), os.getuid())
+        try:
+            verify_line = (
+                b"W1124 02:15:09.215562     504 server_oauth.go:133] Account ineligible: "
+                b"Your current account is not eligible for Antigravity. Verify your account to continue.\n"
+            )
+            hang_release.clear()
+            cancelled_requests.clear()
+
+            def _emit_late():
+                time.sleep(0.1)
+                sdiag._consume(verify_line)
+
+            emitter = threading.Thread(target=_emit_late, daemon=True)
+            emitter.start()
+            t0 = time.monotonic()
+            try:
+                native.open_worker_stream(
+                    socket_path,
+                    "a" * 64,
+                    "gemini-test",
+                    "turn-hang-diag",
+                    {"model": "gemini-test", "contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+                    startup_timeout=2,
+                    turn_timeout=5,
+                    diagnostic=sdiag,
+                )
+            except native.NativeFailure as err:
+                elapsed = time.monotonic() - t0
+                assert (err.code, err.status) == ("gemini_account_verification_required", 403), (
+                    err.code,
+                    err.status,
+                )
+                assert elapsed < 1.5, f"expected fast-fail <1.5s, took {elapsed:.2f}s"
+                assert "turn-hang-diag" in cancelled_requests, cancelled_requests
+            else:
+                raise AssertionError("expected NativeFailure for turn-hang-diag")
+            emitter.join(timeout=2)
+
+            # Already-latched diagnostic fails immediately before opening any HTTP stream.
+            t1 = time.monotonic()
+            try:
+                native.open_worker_stream(
+                    socket_path,
+                    "a" * 64,
+                    "gemini-test",
+                    "turn-stream-01",
+                    {"model": "gemini-test", "contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+                    startup_timeout=2,
+                    diagnostic=sdiag,
+                )
+            except native.NativeFailure as err:
+                assert (err.code, err.status) == ("gemini_account_verification_required", 403)
+                assert time.monotonic() - t1 < 0.5
+            else:
+                raise AssertionError("expected immediate NativeFailure for latched diagnostic")
+        finally:
+            sdiag.close()
     server.shutdown()
     server.server_close()
     thread.join(timeout=2)

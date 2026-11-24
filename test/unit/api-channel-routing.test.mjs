@@ -358,3 +358,127 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
     }
   })
 }
+
+for (const [protocol, inboundBody, routeMeta, assertOutput] of [
+  [
+    'google.gemini',
+    { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+    { routeModel: 'gemini-4-neon-low', routeStream: false },
+    (out) => assert.equal(out.candidates[0].content.parts[0].text, 'gemini-pong'),
+  ],
+  [
+    'openai.chat',
+    { model: 'gemini-4-neon-low', messages: [{ role: 'user', content: 'hello' }], stream: false },
+    null,
+    (out) => assert.equal(out.choices[0].message.content, 'gemini-pong'),
+  ],
+  [
+    'openai.responses',
+    { model: 'gemini-4-neon-low', input: 'hello', stream: false },
+    null,
+    (out) => assert.equal(out.output[0].content[0].text, 'gemini-pong'),
+  ],
+  [
+    'anthropic.messages',
+    { model: 'gemini-4-neon-low', max_tokens: 32, messages: [{ role: 'user', content: 'hello' }], stream: false },
+    null,
+    (out) => assert.equal(out.content[0].text, 'gemini-pong'),
+  ],
+]) {
+  test(`Gemini API channel routes ${protocol} to native Gemini upstream with /v1beta -> /v1 fallback`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'api-gemini-channel-'))
+    fs.mkdirSync(path.join(root, 'run'))
+    const routingFile = path.join(root, 'routing.json')
+    fs.writeFileSync(routingFile, JSON.stringify({}))
+    const captured = []
+    const kernel = http.createServer(async (req, res) => {
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      const env = JSON.parse(Buffer.concat(chunks))
+      captured.push(env)
+      // Simulate a split nginx rejecting /v1beta with 405 on the first attempt for google.gemini
+      if (protocol === 'google.gemini' && env.url.includes('/v1beta/')) {
+        res.writeHead(405, { 'content-type': 'text/html' })
+        res.end('<html>405 Not Allowed</html>')
+        return
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(
+        `data: ${JSON.stringify({
+          candidates: [{ content: { role: 'model', parts: [{ text: 'gemini-pong' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2, totalTokenCount: 6 },
+        })}\n\n`,
+      )
+    })
+    await new Promise((resolve) => kernel.listen(path.join(root, 'run/api-kernel.sock'), resolve))
+    const scheduler = new ApiScheduler()
+    scheduler.reload([
+      {
+        id: 'ep-gem',
+        kind: 'custom',
+        protocol: 'gemini',
+        base_url: 'https://gem-relay.invalid',
+        models: [{ name: 'gemini-upstream', alias: 'gemini-4-neon-low' }],
+        api_key_entries: [{ id: 'ek-gem', api_key: 'sk-gem-upstream', proxy_url: '' }],
+      },
+    ])
+    const response = { headersSent: false, on() {}, once() {}, off() {}, end() {}, write() {} }
+    const handler = createHandleProtocol({
+      json: (_res, status, out) => {
+        response.status = status
+        response.body = out
+      },
+      writeSSEHeaders() {},
+      readBody: async () => inboundBody,
+      requireAuth: () => true,
+      cfg: {
+        rewrite: { enabled: false },
+        intercept: { rules: [] },
+        distill: { enabled: false },
+        limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+        paths: { data: root, project: root },
+      },
+      requestLog: { start: () => ({ request_id: 'api-gem', t0: Date.now() }), finish() {} },
+      stickyRouter: {},
+      accountQuota: {},
+      apiKeyStore: { acquire: () => ({ ok: true }), release: () => {}, recordUsage() {} },
+      apiScheduler: scheduler,
+      apiEndpointStore: { listRaw: () => scheduler.endpoints },
+      groupsRepo: { rateMultiplier: () => 1 },
+      getRoutingConfig: () => ({}),
+      routingConfigPath: routingFile,
+      stats: { requests: 0, errors: 0, passthrough: 0, rewrite: 0, convert: 0, by_route: {} },
+    })
+    try {
+      await handler.handleProtocol(
+        {
+          headers: {},
+          apiKeyKind: 'managed',
+          apiKeyRecord: { id: 'key-gem', category: 'api', api_endpoint_id: 'ep-gem', group_type: 'all' },
+          on() {},
+          once() {},
+          off() {},
+        },
+        response,
+        protocol,
+        protocol === 'google.gemini' ? '/v1beta/models/gemini-4-neon-low:generateContent' : '/v1/messages',
+        routeMeta,
+      )
+      assert.equal(response.status, 200, JSON.stringify(response.body))
+      assertOutput(response.body)
+      const lastCall = captured[captured.length - 1]
+      assert.equal(lastCall.headers['x-goog-api-key'], 'sk-gem-upstream')
+      assert.equal(
+        lastCall.url,
+        protocol === 'google.gemini'
+          ? 'https://gem-relay.invalid/v1/models/gemini-upstream:streamGenerateContent?alt=sse'
+          : 'https://gem-relay.invalid/v1beta/models/gemini-upstream:streamGenerateContent?alt=sse',
+      )
+      const outbound = JSON.parse(lastCall.body)
+      assert.equal(outbound.contents[0].parts[0].text, 'hello')
+    } finally {
+      await new Promise((resolve) => kernel.close(resolve))
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+}

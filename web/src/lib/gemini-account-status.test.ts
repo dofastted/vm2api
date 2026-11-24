@@ -339,6 +339,47 @@ describe('Gemini account presentation', () => {
       })?.validationUrl
     ).toBeNull()
     expect(geminiEligibilityNotice({ eligibility: null })).toBeNull()
+
+    const stale = {
+      eligibility: 'verification_required',
+      checked_at: '2026-11-24T01:00:00Z',
+    }
+    const run = (state: 'completed' | 'failed', finished_at: string) => ({
+      state,
+      finished_at,
+    })
+    // 验证后重新推理成功：旧资格结论不再提示。
+    expect(
+      geminiEligibilityNotice(stale, run('completed', '2026-11-24T02:00:00Z'))
+    ).toBeNull()
+    // 推理早于这次账号检查，或推理失败：仍要提示。
+    expect(
+      geminiEligibilityNotice(stale, run('completed', '2026-11-24T00:00:00Z'))
+    ).not.toBeNull()
+    expect(
+      geminiEligibilityNotice(stale, run('failed', '2026-11-24T02:00:00Z'))
+    ).not.toBeNull()
+    // 账号没有检查时间戳（面板的 checked_at 无兜底，缺字段就下发 null）时，
+    // 无法证明这次推理比资格结论更新，必须保留提示——否则后端仍按
+    // eligibility 冷却该账号，面板却不再显示验证入口。
+    expect(
+      geminiEligibilityNotice(
+        { eligibility: 'verification_required' },
+        run('completed', '2026-11-24T02:00:00Z')
+      )
+    ).not.toBeNull()
+    expect(
+      geminiEligibilityNotice(
+        { eligibility: 'verification_required', checked_at: null },
+        run('completed', '2026-11-24T02:00:00Z')
+      )
+    ).not.toBeNull()
+    expect(
+      geminiEligibilityNotice(
+        { eligibility: 'verification_required', checked_at: 'not-a-date' },
+        run('completed', '2026-11-24T02:00:00Z')
+      )
+    ).not.toBeNull()
   })
 
   it('groups Antigravity models into Google Gemini vs ag- prefixed Anthropic and OpenAI', () => {

@@ -513,7 +513,10 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
         </dd>
       </div>
       {(() => {
-        const notice = geminiEligibilityNotice(account)
+        const notice = geminiEligibilityNotice(
+          account,
+          environment.last_inference
+        )
         if (!notice) return null
         return (
           <div className='space-y-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 sm:col-span-2 lg:col-span-3'>

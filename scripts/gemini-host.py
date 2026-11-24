@@ -127,6 +127,14 @@ NATIVE_HEALTH_POLL_INTERVAL = 15.0
 NATIVE_WARM_BACKOFF_MIN = 2.0
 NATIVE_WARM_BACKOFF_MAX = 60.0
 NATIVE_DEFAULT_MODEL = "gemini-3-flash"
+BLOCKING_ACCOUNT_ELIGIBILITIES = frozenset(
+    {"verification_required", "location_unsupported", "ineligible"}
+)
+
+
+def session_diagnostic(session, *, final=False):
+    diag = getattr(session, "native_diagnostic", None)
+    return diag.poll(final=final) if diag is not None else None
 MAX_INFER_BODY = 12 * 1024 * 1024
 NATIVE_RUNTIME_ROOT = Path("/run/vm2api-gemini-native")
 FULL_CAPABILITIES = (
@@ -1378,15 +1386,18 @@ class NativeSession(NativeAgy):
         return status
 
     def is_ready(self, *, timeout=0.5):
+        if session_diagnostic(self) is not None:
+            return False
         status = self.health(timeout=timeout)
         return bool(
             status
             and status.get("ready") is True
             and status.get("needs_recovery") is not True
+            and session_diagnostic(self) is None
         )
 
     def is_severely_unhealthy(self):
-        if not self.is_alive():
+        if not self.is_alive() or session_diagnostic(self) is not None:
             return True
         if isinstance(self._last_health, dict):
             if self._last_health.get("needs_recovery") is True:
@@ -1407,6 +1418,7 @@ class NativeSession(NativeAgy):
             body_obj,
             startup_timeout=45,
             gateway_policy=gateway_policy,
+            diagnostic=self.native_diagnostic,
         )
 
     def cancel_turn(self, request_id):
@@ -2499,6 +2511,8 @@ class Host:
             return False
         if not env.get("profile"):
             return False
+        if (env.get("account") or {}).get("eligibility") in BLOCKING_ACCOUNT_ELIGIBILITIES:
+            return False
         identifier = env["id"]
         if identifier in self.terminals or identifier in self.pending:
             return False
@@ -3369,12 +3383,14 @@ class Host:
                 ):
                     getattr(self, "_warm_backoff", {}).pop(identifier, None)
                 if session.is_severely_unhealthy():
+                    diag_code = session_diagnostic(session)
                     ever_ready = bool(getattr(session, "_ever_ready", False))
                     self.stop_native_session(identifier)
-                    if not ever_ready:
+                    if not ever_ready or diag_code is not None:
                         self._record_warm_failure_locked(identifier)
                         self._schedule_reauth_check_locked(identifier)
-                    self._schedule_warm_locked(identifier)
+                    if diag_code is None:
+                        self._schedule_warm_locked(identifier)
         for identifier, entry in list(self.runs.items()):
             if entry["process"] is None and time.monotonic() >= entry["deadline"]:
                 self.stop_run(identifier)
@@ -3717,6 +3733,7 @@ class Host:
                 session is not None
                 and session.is_alive()
                 and not session.is_severely_unhealthy()
+                and session_diagnostic(session) is None
             )
         )
         crag_license = (
@@ -3835,6 +3852,7 @@ class Host:
                     RuntimeError,
                 ):
                     pass
+        prev_eligibility = (env.get("account") or {}).get("eligibility")
         if account.get("state") in ("error", "reauth_required") and env.get("account"):
             previous = env["account"]
             if previous.get("state") in ("ok", "partial") and not previous.get(
@@ -3855,6 +3873,22 @@ class Host:
             env["auth_state"] = "authorized"
         self.touch_environment(env)
         self.save()
+        new_eligibility = (env.get("account") or {}).get("eligibility")
+        existing_session = self.native_sessions.get(env["id"])
+        session_poisoned = (
+            existing_session is not None
+            and session_diagnostic(existing_session) is not None
+        )
+        if (
+            (prev_eligibility != new_eligibility or session_poisoned)
+            and not self.running(env["id"])
+        ):
+            self.stop_native_session(env["id"])
+            if (
+                new_eligibility not in BLOCKING_ACCOUNT_ELIGIBILITIES
+                and env.get("auth_state") == "authorized"
+            ):
+                self._schedule_warm_locked(env["id"], force=True)
         return self.view(env)
 
     def request(self, operation, body):
@@ -4571,15 +4605,21 @@ class Host:
         finally:
             if conn is not None:
                 conn.close()
+            diag_code = None
             unhealthy = not session.is_alive()
-            if not unhealthy and had_error:
-                session.health(timeout=0.5)
-                unhealthy = session.is_severely_unhealthy()
+            if not unhealthy:
+                diag_code = session_diagnostic(session)
+                if diag_code is not None:
+                    unhealthy = True
+                elif had_error:
+                    session.health(timeout=0.5)
+                    unhealthy = session.is_severely_unhealthy()
             if unhealthy:
                 with self.lock:
                     if self.native_sessions.get(identifier) is session:
                         self.stop_native_session(identifier)
-                        self._schedule_warm_locked(identifier, force=True)
+                        if diag_code is None:
+                            self._schedule_warm_locked(identifier, force=True)
 
 
 class ThreadingUnixStreamServer(

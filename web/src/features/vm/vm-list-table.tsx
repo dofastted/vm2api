@@ -109,7 +109,7 @@ const STATE_ICON_FG: Partial<Record<ScheduleStateLabel, string>> = {
 }
 
 function SchedCell({ vm }: { vm: Vm }) {
-  if (vm.gemini) return <GeminiSlotStatus vm={vm} />
+  if (vm.gemini) return <GeminiSlotStatus vm={vm} inline />
   const level = Number(vm.schedule_level)
   const levelOk = Number.isInteger(level) && level >= 1 && level <= 10
   const manual = vm.schedule_level_mode === 'manual'
@@ -1019,8 +1019,7 @@ export function VmTable({
                             aria-expanded={open}
                             aria-label={`${vm.id}，${label}。Enter 展开明细，Shift+Enter 打开详情`}
                             className={cn(
-                              'group relative grid cursor-pointer border-b border-[color:var(--hairline)] bg-[var(--row-bg)] outline-none [--row-bg:var(--card)] hover:[--row-bg:color-mix(in_oklab,var(--muted)_55%,var(--card))] focus-visible:after:pointer-events-none focus-visible:after:absolute focus-visible:after:inset-0 focus-visible:after:z-[4] focus-visible:after:border-2 focus-visible:after:border-ring',
-                              vm.gemini ? 'min-h-[38px]' : 'h-[38px]',
+                              'group relative grid h-[38px] cursor-pointer border-b border-[color:var(--hairline)] bg-[var(--row-bg)] outline-none [--row-bg:var(--card)] hover:[--row-bg:color-mix(in_oklab,var(--muted)_55%,var(--card))] focus-visible:after:pointer-events-none focus-visible:after:absolute focus-visible:after:inset-0 focus-visible:after:z-[4] focus-visible:after:border-2 focus-visible:after:border-ring',
                               open &&
                                 '[--row-bg:color-mix(in_oklab,var(--muted)_75%,var(--card))]'
                             )}
@@ -1065,7 +1064,6 @@ export function VmTable({
                                 role='cell'
                                 className={cn(
                                   'flex min-w-0 items-center gap-[7px] overflow-hidden px-2 whitespace-nowrap',
-                                  vm.gemini && i === 0 && 'py-1.5',
                                   c.num && NUM,
                                   c.dim && 'text-muted-foreground',
                                   // 调度列（第一列）保持可读，其余在关闭时淡出。
