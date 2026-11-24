@@ -11,7 +11,7 @@
 ```bash
 deploy/bluegreen/bg-deploy.sh            # 部署 compose/.env 当前描述的版本（改 VM2API_IMAGE_TAG 或挂载后运行）
 deploy/bluegreen/bg-deploy.sh --status   # 两个颜色是否在跑、角色、haproxy 状态
-deploy/bluegreen/bg-deploy.sh --restart  # 普通重启当前颜色：带新迁移的版本用，会中断一次
+deploy/bluegreen/bg-deploy.sh --restart  # 普通重启当前颜色：带需要停机的新迁移时用，会中断一次
 ```
 
 - 部署命令在旧实例开始排空后就返回，收尾在后台进行，结果写进 `bluegreen/deploy.log`。要在前台等到收尾完成，加 `--wait`。
@@ -25,7 +25,7 @@ deploy/bluegreen/bg-deploy.sh --restart  # 普通重启当前颜色：带新迁�
 | 步骤 | 做什么 |
 |---|---|
 | 1 预检 | compose 能渲染；挂进来的项目内文件都在；挂载的入口脚本可执行 |
-| 2 迁移护栏 | 新镜像带新数据库迁移时 `exit 2`（两个版本不能共用一个库），改用 `--restart` |
+| 2 迁移护栏 | 新镜像带新数据库迁移时，用 `migration-guard.mjs` 检查：SQLite 部署上只加不改的迁移照常蓝绿；其余情况 `exit 2`，改用 `--restart`（见下文「新迁移」） |
 | 3 standby | 新颜色以 `KIN_STANDBY=1` 启动：不拿锁、不跑后台任务、不改共享文件；预先连好节点链路、算好槽镜像摘要后报 `standby-warm` |
 | 4 让权 | 旧实例收到 `SIGUSR1`：停后台任务、结束面板实时流、释放锁；监听不关 |
 | 5 激活 | 新实例收到 `SIGUSR2`：拿锁、跑后台任务。重叠期间会破坏旧实例在途请求的维护先推迟（重建出口容器/远端 gate、重启槽内核、备份） |
@@ -39,7 +39,7 @@ deploy/bluegreen/bg-deploy.sh --restart  # 普通重启当前颜色：带新迁�
 - **容量**：draining 实例把在途请求占用的槽、账号、席位（含已离开原槽、子代理还在跑的 family 席位）和托管 key 的并发写进 `data/run/handover-load.json`，新 leader 调度时算进去，不会把一个槽超发到两倍。文件超过 15 秒没刷新时保留最后一份快照（日志 `handover-load-stale`，恢复时 `handover-load-fresh`），旧实例退出、文件被删或 60 秒无刷新才撤掉。
 - **共享资源**：每个颜色有自己的 api-kernel socket；draining 实例关停时不删节点 relay socket；出口容器、gate、内核重启、备份都等旧实例退出后再做。
 - **CRAG 授权文件**：新控制面先比对节点上已发布的订阅文件，相同就不重写；确实要更新时整组一次换上。
-- **数据库**：SQLite WAL，两个进程可以并发读写；结构变化由迁移护栏挡住。
+- **数据库**：SQLite WAL，两个进程可以并发读写；新颜色启动时执行的迁移只允许只加不改，其余由迁移护栏挡住。
 
 ## 安装（一次性）
 
@@ -73,6 +73,8 @@ deploy/bluegreen/bg-deploy.sh --bootstrap
 | `BG_BLUE_PORT` / `BG_GREEN_PORT` | `8788` / `8789` | 两个颜色的监听端口 |
 | `BG_DRAIN_MS` | `3600000` | 旧实例最长排空时间 |
 | `BG_RESTART_GRACE` | `100` | `--restart` 等旧容器退出的秒数 |
+| `BG_ADDITIVE_MIGRATIONS` | `1` | `0` = 有新迁移就要求 `--restart`，不做只加不改判断 |
+| `BG_MIGRATION_INDEX_MAX_ROWS` | `100000` | 新迁移给已有表建索引时允许的最大行数 |
 | `BG_NAME` | `vm2api` | 容器/项目名前缀（`vm2api-blue` / `vm2api-green`） |
 | `BG_SERVICE` | `vm2api` | compose 服务名 |
 | `BG_COMPOSE_FILES` | `docker-compose.yml` [+ `docker-compose.override.yml`] | 基础 compose 文件 |
@@ -94,7 +96,7 @@ deploy/bluegreen/bg-deploy.sh --bootstrap
 | 旧实例开始让权但没按时报告释放锁 | 删掉新颜色，**重启**旧实例做回 leader（中断一次） | 看旧实例日志 |
 | 新实例没激活 | 同上 | 看新实例日志里的 `standby-activate-failed` |
 | haproxy 切不过去（重试 5 次） | `exit 3`：新实例已是 leader，旧实例 draining 但照常接流量（面板 503） | 修好 haproxy 后 `bg-deploy.sh --cutover <旧色> <新色>` |
-| 带新迁移的版本 | `exit 2`，什么都不动 | `bg-deploy.sh --restart` |
+| 带需要停机的新迁移 | `exit 2`，什么都不动；日志写明是哪条语句 | `bg-deploy.sh --restart` |
 
 排查时看 `bluegreen/deploy.log`、`--status`，以及两个颜色日志里的事件：`standby-warm`、`handover-released`、`standby-activated`、`handover-peer-gone`、`handover-exclusive`。
 
@@ -119,5 +121,24 @@ docker compose up -d
 - 旧实例退出前，新实例的出口/gate 重建、内核重启、备份都在排队；`BG_DRAIN_MS` 不宜比最长请求长太多。
 - 收尾时（`KIN_AUTO_SYNC_WRAP=1` 且 wrap 有变化）本机槽内核等空闲再重载；集群槽先建好镜像，等新 leader 在该槽上没有请求再重建容器，10 分钟内一直忙的槽留到下次内核同步（`handover-wrap-sync` 的 `failed` 里是 `slot_busy`）。
 - 新镜像改了 `kin-slot-gate` 时，收尾阶段重建节点 gate 会断开新 leader 经该 gate 的连接；gate 没有按连接排空的升级方式。
-- 带新迁移的版本不能蓝绿，只能 `--restart`。
+- 带需要停机的新迁移（见下文「新迁移」）不能蓝绿，只能 `--restart`。
 - 首次 `--bootstrap` 会中断一次。
+
+## 新迁移
+
+新颜色以 standby 启动时就会执行迁移，此时旧颜色还在用同一个库服务。`bg-deploy.sh` 发现新镜像多了迁移文件时，在新镜像的一次性容器里运行 `deploy/bluegreen/migration-guard.mjs`（同一份 compose 配置），逐条检查本部署会执行的迁移：
+
+| 语句 | 蓝绿 |
+|---|---|
+| `CREATE TABLE`（不是 `AS SELECT`） | 可以 |
+| `ALTER TABLE … ADD COLUMN`，默认值是常量；`NOT NULL` 带默认值；不带 `PRIMARY KEY`、`UNIQUE`、`CHECK`、`REFERENCES`、`GENERATED`、`COLLATE` | 可以 |
+| `CREATE INDEX` 建在本批新建的表上，或建在行数不超过 `BG_MIGRATION_INDEX_MAX_ROWS` 的已有表上 | 可以 |
+| `CREATE UNIQUE INDEX` 建在已有表上 | 不可以 |
+| 其他语句：`DROP`、`RENAME`、改列、`UPDATE`/`INSERT`/`DELETE` 回填、触发器、视图、`PRAGMA` 等 | 不可以 |
+
+- 只加不改时旧代码不受影响：SQLite 的 `ADD COLUMN` 只改表结构定义、不重写表，小表建索引的写锁也很短（旧颜色写入有 5 秒 `busy_timeout`）。
+- 新增的只有 PostgreSQL 迁移、而本部署用 SQLite 时，这些迁移不会执行，照常蓝绿。
+- PostgreSQL 部署有新迁移一律 `--restart`：迁移执行器没有 `lock_timeout`，`ADD COLUMN` 要等 `ACCESS EXCLUSIVE` 锁，会排在长查询后面，把旧颜色的请求一起堵住。
+- 检查本身出错（检查容器起不来、读不了库）时按「需要停机」处理。
+- 回滚：旧版本只按自己的迁移文件执行，多出来的列、表和 `schema_migrations` 记录不影响它。
+
