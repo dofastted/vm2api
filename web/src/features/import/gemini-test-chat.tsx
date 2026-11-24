@@ -14,6 +14,10 @@ import {
 import { Textarea } from '@/components/ui/textarea'
 import { TestChatResultCard } from '@/features/vm/test-chat-result-card'
 import type { TestChatResult } from '@/features/vm/test-chat-types'
+import {
+  DEFAULT_GEMINI_TEST_PROMPT,
+  defaultGeminiTestModel,
+} from '@/lib/gemini-account-status'
 import type { GeminiEnvironment } from './gemini-environments'
 
 export function GeminiTestChat({
@@ -27,11 +31,13 @@ export function GeminiTestChat({
   const promptId = useId()
   const [open, setOpen] = useState(false)
   const [choice, setChoice] = useState('')
-  const [prompt, setPrompt] = useState('请回复 pong。')
+  const [prompt, setPrompt] = useState(DEFAULT_GEMINI_TEST_PROMPT)
   const models = environment.models.filter((model) =>
     model.startsWith('gemini-')
   )
-  const model = models.includes(choice) ? choice : (models[0] ?? '')
+  const model = models.includes(choice)
+    ? choice
+    : defaultGeminiTestModel(models)
   const blocked =
     environment.auth_state !== 'authorized'
       ? '请先完成此环境的账号授权。'

@@ -1,6 +1,13 @@
 import { useId, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
+import { ExternalLink } from 'lucide-react'
 import { api } from '@/lib/api'
+import {
+  DEFAULT_GEMINI_TEST_PROMPT,
+  defaultGeminiTestModel,
+  geminiEligibilityNotice,
+  geminiInferenceErrorAction,
+} from '@/lib/gemini-account-status'
 import { isGeminiHostIssue } from '@/lib/gemini-recovery'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -44,12 +51,16 @@ const resultLabels = {
 }
 
 function ErrorMessage({ error }: { error: GeminiError }) {
+  const action = geminiInferenceErrorAction(error.code)
   return (
     <div className='space-y-1'>
       <p role='alert' className='text-sm text-destructive'>
         {error.message}
         {error.code ? ` (${error.code})` : ''}
       </p>
+      {action ? (
+        <p className='text-xs text-muted-foreground'>{action}</p>
+      ) : null}
       {isGeminiHostIssue(error.code) ? <GeminiMaintenanceLink /> : null}
     </div>
   )
@@ -65,10 +76,11 @@ export function GeminiTestPanel({
   const modelId = useId()
   const promptId = useId()
   const [model, setModel] = useState('')
-  const [prompt, setPrompt] = useState('')
+  const [prompt, setPrompt] = useState(DEFAULT_GEMINI_TEST_PROMPT)
   const resource = geminiResource(environment.id)
   const test = useGeminiTestChat(resource)
   const isOAuth = environment.auth_method === 'oauth'
+  const eligibilityNotice = geminiEligibilityNotice(environment.account)
   const authorizationHint = isOAuth
     ? '请在「账号」完成 Google 授权后再试。'
     : '此 API Key 未处于已授权状态。'
@@ -101,7 +113,9 @@ export function GeminiTestPanel({
     modelError?.code !== 'gemini_models_empty'
       ? [...new Set(environment.models.filter(Boolean))]
       : []
-  const selected = models.includes(model) ? model : ''
+  const selected = models.includes(model)
+    ? model
+    : defaultGeminiTestModel(models)
   const trimmedPrompt = prompt.trim()
   const promptTooLong =
     promptEncoder.encode(trimmedPrompt).length > MAX_PROMPT_BYTES
@@ -140,6 +154,30 @@ export function GeminiTestPanel({
               <p role='status' className='text-sm text-muted-foreground'>
                 {unavailable || licenseBlocked}
               </p>
+            ) : null}
+            {eligibilityNotice ? (
+              <div
+                role='status'
+                className='space-y-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm'
+              >
+                <p className='font-medium text-amber-700 dark:text-amber-300'>
+                  {eligibilityNotice.label}
+                </p>
+                <p className='text-xs text-muted-foreground'>
+                  {eligibilityNotice.action}
+                </p>
+                {eligibilityNotice.validationUrl ? (
+                  <a
+                    href={eligibilityNotice.validationUrl}
+                    target='_blank'
+                    rel='noopener noreferrer'
+                    className='inline-flex items-center gap-1 text-xs font-medium text-primary underline underline-offset-4'
+                  >
+                    打开 Google 验证页
+                    <ExternalLink className='size-3' />
+                  </a>
+                ) : null}
+              </div>
             ) : null}
             <div className='space-y-1.5'>
               <Label htmlFor={modelId}>模型</Label>
