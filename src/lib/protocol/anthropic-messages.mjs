@@ -12,10 +12,13 @@ import {
 import { sanitizeAnthropicTools } from './web-search.mjs'
 import { defaultMaxTokensForModel } from './model-policy.mjs'
 
-export function officialMessagesBody(body = {}, { stream = undefined, preserveContentShape = false } = {}) {
+export function officialMessagesBody(
+  body = {},
+  { stream = undefined, preserveContentShape = false, preserveConsecutiveUser = false } = {},
+) {
   const out = copyOfficialAnthropicFields(body)
   applyStructuredOutput(out, body)
-  normalizeAnthropicMessages(out)
+  normalizeAnthropicMessages(out, { preserveConsecutiveUser })
   stripIllegalBodyContentFields(out)
   if (Array.isArray(out.tools)) out.tools = sanitizeAnthropicTools(out.tools)
   if (stream !== undefined) out.stream = !!stream

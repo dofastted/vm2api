@@ -1659,28 +1659,33 @@ export function createHandleProtocol(deps) {
         personaIn.messages.some(
           (message) => Array.isArray(message?.content) && message.content.some((block) => block?.cache_control != null),
         ))
-    if (!preserveApiCallerBody && !apiNonAnthropic && !requestContext)
-      ctx.body = applyCrsUnofficialPersona(ctx.body, {
-        officialClient: officialPassthrough,
-        forceConfigured: !officialPassthrough,
-        routingFile: routingConfigPath,
-        cacheTtl: requestedCacheTtl,
-        headers: req.headers,
-        sessionId: outboundSessionId,
-        model: ctx.body?.model,
-        cliVersion: OFFICIAL_CLI_VERSION,
-      })
-    if (!officialPassthrough && !requestContext && !apiGemini)
-      ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
-    let personaHideTokens =
-      requestContext || apiNonAnthropic || preserveApiCallerBody
-        ? 0
-        : personaHideForUnofficial(personaIn, ctx.body, {
-            officialClient: officialPassthrough,
-            mode: personaMode,
-            hides: personaHidesUsageFromRoutingFile(routingConfigPath),
-            standing: standingUsageFromRoutingFile(routingConfigPath),
-          })
+    let personaHideTokens = 0
+    if (inferenceBackend === 'api') {
+      if (!preserveApiCallerBody && !apiNonAnthropic && !requestContext) {
+        ctx.body = applyCrsUnofficialPersona(ctx.body, {
+          officialClient: officialPassthrough,
+          forceConfigured: !officialPassthrough,
+          routingFile: routingConfigPath,
+          cacheTtl: requestedCacheTtl,
+          headers: req.headers,
+          sessionId: outboundSessionId,
+          model: ctx.body?.model,
+          cliVersion: OFFICIAL_CLI_VERSION,
+        })
+      }
+      if (!officialPassthrough && !requestContext && !apiGemini) {
+        ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
+      }
+      personaHideTokens =
+        requestContext || apiNonAnthropic || preserveApiCallerBody
+          ? 0
+          : personaHideForUnofficial(personaIn, ctx.body, {
+              officialClient: officialPassthrough,
+              mode: personaMode,
+              hides: personaHidesUsageFromRoutingFile(routingConfigPath),
+              standing: standingUsageFromRoutingFile(routingConfigPath),
+            })
+    }
 
     if (inferenceBackend === 'api') {
       const managedKey = req.apiKeyRecord || null
@@ -2143,7 +2148,8 @@ export function createHandleProtocol(deps) {
                 validateImageDimensions(materialized)
                 hopBody = materialized
               }
-              if (identity) {
+              const nativeCragV3 = caps?.includes('generation_controls_v3') && caps?.includes('linux_tui_native_queue')
+              if (identity && !nativeCragV3) {
                 hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
                   officialClient: officialTraffic,
                   sessionId: attemptSessionId,
@@ -2154,11 +2160,6 @@ export function createHandleProtocol(deps) {
                   vmId: selected.vmId,
                   epoch: attemptStartedAt,
                 })
-              }
-              if (!reuseIngress) {
-                const scrubbed = scrubUpstreamClientBody(hopBody, scrubOptions)
-                hopBody = scrubbed.body
-                toolNames = composeToolNames(toolNames, scrubbed.reverse)
               }
               if (
                 caps?.includes('generation_controls_v3') &&
@@ -2177,6 +2178,7 @@ export function createHandleProtocol(deps) {
                 transport: preparedHop.ready.health?.transport,
                 persona: cragPersona,
                 prompt_mode: hopBody.crag_prompt?.mode || 'default',
+                safeguards_stripped: Boolean(personaIn.safeguards != null && hopBody.safeguards == null),
               }
               logBag.official_cc_inference = 'crag-print'
               logBag.provider = 'local_cli'
@@ -2313,19 +2315,23 @@ export function createHandleProtocol(deps) {
           }
 
           cacheTtl = requestedCacheTtl
-          if (!requestContext && !officialPassthrough && (modeOverride || officialTraffic)) {
+          if (!requestContext && !officialPassthrough) {
             const configuredMode = modeOverride || resolveSlotPersonaPreset(selected.vm, routingNow)
-            const rewritten = applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
-              officialClient: false,
-              forceConfigured: true,
-              routingFile: routingConfigPath,
-              cacheTtl: requestedCacheTtl,
-              mode: configuredMode,
-              sessionId: attemptSessionId,
-              model: personaIn?.model,
-              cliVersion: OFFICIAL_CLI_VERSION,
-              identity,
-            })
+            const rewritten = enforceCacheTtlOrder(
+              applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
+                officialClient: false,
+                forceConfigured: true,
+                routingFile: routingConfigPath,
+                cacheTtl: requestedCacheTtl,
+                mode: configuredMode,
+                headers: req.headers,
+                sessionId: attemptSessionId,
+                model: personaIn?.model,
+                cliVersion: OFFICIAL_CLI_VERSION,
+                identity,
+              }),
+              requestedCacheTtl,
+            )
             hopBody = officialMessagesBody(rewritten)
             for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
             personaHideTokens = personaHideForUnofficial(personaIn, rewritten, {
