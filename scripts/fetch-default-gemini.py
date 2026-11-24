@@ -34,6 +34,11 @@ NATIVE_ASSETS = (
     "crag-license-public.pem",
     "manifest.json",
 )
+REMOTE_MEMBER_ASSETS = (
+    "craggemini",
+    "craggemini.payload.enc",
+    "libagy_bridge.so",
+)
 AGY_URL = (
     "https://storage.googleapis.com/antigravity-public/antigravity-cli/"
     "1.5.9-4515810895593472/linux-x64/cli_linux_x64.tar.gz"
@@ -345,11 +350,11 @@ def prepare_remote_tag(dest, tag, pubkey_pin, *, reuse_agy=None, opener=None, ve
                 or not all(
                     isinstance(sha_map.get(name), str)
                     and re.fullmatch(r"[a-f0-9]{64}", sha_map[name])
-                    for name in NATIVE_ASSETS
+                    for name in REMOTE_MEMBER_ASSETS
                 )
             ):
                 raise RuntimeError("remote Gemini manifest failed pinned trust checks")
-            for name in ("craggemini", "craggemini.payload.enc", "libagy_bridge.so"):
+            for name in REMOTE_MEMBER_ASSETS:
                 download_bounded(
                     active_opener,
                     f"{release}/{name}",
