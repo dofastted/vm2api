@@ -62,13 +62,18 @@ for (const location of ['system', 'tools', 'messages']) {
   })
 }
 
-test('zero leaves a full caller breakpoint budget intact', () => {
+test('zero leaves a full caller breakpoint budget intact while filling omitted TTLs', () => {
   const input = fixture()
   input.system.push(
     ...Array.from({ length: 4 }, () => ({ type: 'text', text: 'anchor', cache_control: { type: 'ephemeral' } })),
   )
   const out = prepareCliHopBody(input)
-  assert.deepEqual(out.system, input.system)
+  assert.deepEqual(
+    out.system,
+    input.system.map((block) =>
+      block.cache_control ? { ...block, cache_control: { type: 'ephemeral', ttl: '1h' } } : block,
+    ),
+  )
   assert.equal(markers({ messages: out.messages }).length, 0)
   validateCacheBreakpoints(out)
 })
@@ -86,7 +91,7 @@ test('zero does not place a breakpoint on thinking blocks', () => {
   validateCacheBreakpoints(out)
 })
 
-test('zero automatic caching skips a trailing thinking block and keeps the original implicit TTL', () => {
+test('zero automatic caching skips a trailing thinking block and fills omitted TTL from config', () => {
   const input = fixture(1, 'claude-opus-5-5')
   input.cache_control = { type: 'ephemeral' }
   input.messages.push({
@@ -98,7 +103,7 @@ test('zero automatic caching skips a trailing thinking block and keeps the origi
   })
   const before = structuredClone(input)
   const out = prepareCliHopBody(input, { personaPreset: 'zero', preserveThinkingBlocks: true, cacheTtl: '1h' })
-  assert.deepEqual(out.messages[1].content[0].cache_control, input.cache_control)
+  assert.deepEqual(out.messages[1].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
   assert.equal(out.messages[1].content[1].type, 'thinking')
   assert.equal(out.messages[1].content[1].cache_control, undefined)
   assert.equal(out.cache_control, undefined)

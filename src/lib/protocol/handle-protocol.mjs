@@ -186,6 +186,7 @@ import {
 import {
   applyCacheTtlToUsage,
   enforceCacheTtlOrder,
+  fillMissingCacheTtl,
   cacheBreakpointsFromRoutingFile,
   pinConversationCacheTtl,
   resolveCacheTtl,
@@ -1508,7 +1509,7 @@ export function createHandleProtocol(deps) {
     let inboundToolReverse = {}
     const deferToolNameRewrite =
       (protocol === 'anthropic.messages' && inferenceBackend !== 'api') || protocol === 'openai.responses'
-    const cragSystem = projectCallerSystem(ctx.body.system, callerEnvironment)
+    let cragSystem = projectCallerSystem(ctx.body.system, callerEnvironment)
     const hasCragSystem = cragSystem !== ctx.body.system
     try {
       if (!preserveApiCallerBody && !apiNonAnthropic && !requestContext && !officialPassthrough) {
@@ -1685,9 +1686,19 @@ export function createHandleProtocol(deps) {
       vmId: stickyBound?.vmId || '',
       epoch: 'pending',
     })
+    let routingForCacheTtl = getRouting()
+    try {
+      const disk = routingConfigPath ? readJsonParsedCached(routingConfigPath) : null
+      if (disk) routingForCacheTtl = disk
+    } catch {}
     const requestedCacheTtl = pinConversationCacheTtl(
       stickyKey || callerSession || outboundSessionId,
-      resolveCacheTtl({ headers: req.headers, body: inbound, routing: getRouting(), routingFile: routingConfigPath }),
+      resolveCacheTtl({
+        headers: req.headers,
+        body: apiNonAnthropic ? inbound : ctx.body,
+        routing: routingForCacheTtl,
+        routingFile: routingConfigPath,
+      }),
     )
     let cacheTtl = requestedCacheTtl
     let preserveCacheBreakpoints = false
@@ -1708,10 +1719,21 @@ export function createHandleProtocol(deps) {
     // After OpenAI→Anthropic conversion so function tools already have input_schema;
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
     if (!apiNonAnthropic) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
-    // Repair TTL order before rendering, retaining valid caller omissions and
-    // mixed TTLs. The session default only governs platform-created markers.
+    // Fill omitted TTLs from the resolved Web/session default before rendering,
+    // retaining explicit caller 5m/1h (and legal 1h → 5m). Official passthrough
+    // and caller-policy API endpoints leave caller omissions untouched.
     if (!apiNonAnthropic && !requestContext && !officialPassthrough) {
-      ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
+      if (!preserveApiCallerBody) {
+        ctx.body = enforceCacheTtlOrder(fillMissingCacheTtl(ctx.body, requestedCacheTtl), requestedCacheTtl)
+        if (hasCragSystem) {
+          cragSystem = enforceCacheTtlOrder(
+            fillMissingCacheTtl({ tools: ctx.body.tools, system: cragSystem }, requestedCacheTtl),
+            requestedCacheTtl,
+          ).system
+        }
+      } else {
+        ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
+      }
     }
     // Anthropic 400s a subscription request whose system field carries a third-party
     // agent prompt; the same text in the first user message is accepted.
@@ -1768,7 +1790,9 @@ export function createHandleProtocol(deps) {
         })
       }
       if (!officialPassthrough && !requestContext && !apiGemini) {
-        ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
+        ctx.body = preserveApiCallerBody
+          ? enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
+          : enforceCacheTtlOrder(fillMissingCacheTtl(ctx.body, requestedCacheTtl), requestedCacheTtl)
       }
       personaHideTokens =
         requestContext || apiNonAnthropic || preserveApiCallerBody
@@ -2263,7 +2287,7 @@ export function createHandleProtocol(deps) {
                 // Carry the resolved session/menu default separately from usage accounting.
                 hopBody.cache_ttl = requestedCacheTtl
               }
-              preserveCacheBreakpoints = true
+              preserveCacheBreakpoints = officialPassthrough
               cacheTtl = null
               personaHideTokens = 0
               logBag.inference_engine = resolveInferenceEngine(selected.vm, routingNow)
@@ -2325,6 +2349,7 @@ export function createHandleProtocol(deps) {
               cacheTtl: requestedCacheTtl,
               requestContext,
               preserveSystem: false,
+              preserveCacheTtl: officialPassthrough,
               preserveThinkingBlocks: preserveCliHopThinkingBlocks,
               preserveCallerEnvironment,
               autoCompactWindow: ctx.autoCompactWindow,
@@ -2408,22 +2433,26 @@ export function createHandleProtocol(deps) {
             }
           }
 
+          preserveCacheBreakpoints = officialPassthrough
           cacheTtl = requestedCacheTtl
           if (!requestContext && !officialPassthrough) {
             const configuredMode = modeOverride || resolveSlotPersonaPreset(selected.vm, routingNow)
             const rewritten = enforceCacheTtlOrder(
-              applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
-                officialClient: false,
-                forceConfigured: true,
-                routingFile: routingConfigPath,
-                cacheTtl: requestedCacheTtl,
-                mode: configuredMode,
-                headers: req.headers,
-                sessionId: attemptSessionId,
-                model: personaIn?.model,
-                cliVersion: OFFICIAL_CLI_VERSION,
-                identity,
-              }),
+              fillMissingCacheTtl(
+                applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
+                  officialClient: false,
+                  forceConfigured: true,
+                  routingFile: routingConfigPath,
+                  cacheTtl: requestedCacheTtl,
+                  mode: configuredMode,
+                  headers: req.headers,
+                  sessionId: attemptSessionId,
+                  model: personaIn?.model,
+                  cliVersion: OFFICIAL_CLI_VERSION,
+                  identity,
+                }),
+                requestedCacheTtl,
+              ),
               requestedCacheTtl,
             )
             hopBody = officialMessagesBody(rewritten)

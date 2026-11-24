@@ -41,7 +41,7 @@
 | `persona_preset` | `official_full` | 使用独立的完整官方模板；`official` 保留原有官方提示词 |
 | `overlay_preset` | `off` | 不向首条 user 注入 overlay |
 | `persona_park` | `false` | 与 `overlay_preset=off` 对齐 |
-| `cache_ttl` | `1h` | 平台新增 marker 的缺省 TTL；`x-kin-cache-ttl` 参与首次会话选择。调用方合法 `1h`、`5m`、`1h → 5m` 及省略 TTL 均保留，不按菜单值统一改写 |
+| `cache_ttl` | `1h` | 非透传请求缺失 TTL 与平台新增 marker 的缺省 TTL；`x-kin-cache-ttl` 参与首次会话选择。调用方显式 `1h`、`5m`、`1h → 5m` 保留；官方透传保留调用方缺失 TTL |
 
 **official / official_full 模板**统一采用 2.1.303 OAuth 抓包中的 harness + guidance；顶层 `system` 只装提示词与调用方 `caller_system`。Environment 放入 `messages[].role=system`，不打缓存点，不混入顶层提示词。身份和 billing 入口跟随 `cc_entrypoint`。所有档位均使用 2.1.303，不再提供单独的 `official_303` 选项；旧值读写时归一为 `official_full`，旧开关和模板迁移到完整版，已有明确的完整版配置优先。
 
@@ -184,11 +184,11 @@ CRAG 声明 `provider_managed_tools_v1` 且支持对应工具时使用独立的 
 
 HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但缓存职责不同。cli-hop 首跳保留签名可用的 thinking 指纹，没有可用签名的删掉；签名修复重试才清除其余块。官方家族开启 `official_cc_passthrough` 时，Node 保留 system/tools/messages 的 caller marker、显式 TTL、缺失 TTL 和位置，不添点、不裁剪；超过四点、thinking marker、非法 TTL 或 5m（含缺失）后出现 1h，在调度前返回 `400 invalid_cache_control`。
 
-关闭透传或非官方请求仍按所选人设组装。保留的 caller marker 不再统一改写 TTL：显式 `1h` 保留 `1h`，显式 `5m` 保留 `5m`，合法的 `1h → 5m` 各自保留；省略 TTL 的已有 marker 保持省略，语义为隐式 `5m`。HTTP hop 的 `preserve_client=true` 也保留已有 message marker；无 message marker 时，才按配置补最后消息及 `messages.length>=4` 时倒数第二 user 的点。
+关闭透传或非官方请求仍按所选人设组装。调用方显式 TTL 保留：显式 `1h` 保留 `1h`，显式 `5m` 保留 `5m`，合法的 `1h → 5m` 各自保留；省略 `ttl` 的缺省 marker 在渲染与入核前按 Web `compatibility.cache_ttl`（会话 pin 值）补齐（前面已有显式 `5m` 时补 `5m`，避免 `5m → 1h` 逆序）。HTTP hop 的 `preserve_client=true` 保留已有 message marker 位置并补齐缺失 TTL；无 message marker 时，才按配置补最后消息及 `messages.length>=4` 时倒数第二 user 的点。
 
-平台新增的缺省 marker 使用入站会话 pin 值（菜单选 `5m` 且请求没有另选时，新增点使用 `5m`），不覆盖 caller 或模板显式 TTL。按 `tools → system → messages → 顶层自动缓存` 检查顺序；Node 整流只把非法 TTL 修正为本次缺省值，并把 `5m`（含省略 TTL）之后非法出现的 `1h` 降为 `5m`，此前合法 marker 不动。模板自产点仍遵守剩余预算；非法模板返回 request-scoped 400，零上游执行，不换号、不冷却。
+平台新增的缺省 marker 使用入站会话 pin 值（菜单选 `5m` 且请求没有另选时，新增点使用 `5m`），不覆盖 caller 或模板显式 TTL。按 `tools → system → messages → 顶层自动缓存` 检查顺序；Node 整流将缺失或非法 TTL 补为本次缺省值，并把 `5m` 之后非法出现的 `1h` 降为 `5m`，此前合法显式 marker 不动。模板自产点仍遵守剩余预算；非法模板返回 request-scoped 400，零上游执行，不换号、不冷却。
 
-识别为官方 Claude Code 家族但未开 `official_cc_passthrough` 时，请求与第三方一样先剥离成标准 Anthropic 结构，再按槽位档重写 system；识别本身不再保留入站 system。人设组装保留下来的 caller marker 适用上述 TTL 规则，不再把缺失 TTL 当作菜单选择后补齐。只有协议页打开透传，官方家族才跳过剥离与重写，按前文 `official_cc_passthrough` 的规则处理。入站请求头不能跳过剥离。
+识别为官方 Claude Code 家族但未开 `official_cc_passthrough` 时，请求与第三方一样先剥离成标准 Anthropic 结构，再按槽位档重写 system；识别本身不再保留入站 system。凡经重写的入站（官方家族与第三方客户端一样），不写 `ttl` 的 marker 都表示未选择，渲染前按会话 pin 值（Web `compatibility.cache_ttl`）补齐，CRAG V3 同时发送 `preserve_cache_breakpoints: false` 与 `cache_ttl`，cli-hop、CRAG、HTTP hop 与 API 直连一致。只有协议页打开透传（或 API 端点显式启用 `body_policy=caller`），才跳过补齐并按 `official_cc_passthrough` 保留调用方缺失 TTL。入站请求头不能跳过剥离。
 
 native CLI 对已有缓存 marker 的 wire system 直接保留块边界、显式 TTL 和省略 TTL，wire tools / messages 同样保留。仅对 CLI 自有 marker 补 TTL，优先请求显式 TTL（混合时 5m）→ slot `kernel.json.default_cache_ttl` → 1h，并按保留内容占用后的剩余预算裁剪。Rust kernel 不增删 marker、不重打 last、不自动降级 TTL。HTTP hop 与 native envelope 的日志/计费保留上游真实 5m/1h 分桶；仅缺少分桶的用量或 message_delta 超过既有分桶的增量使用缺省 TTL 归类。Node 对象不等于最终 wire，源码验证也不等于已发布或部署新 CLI 二进制。
 

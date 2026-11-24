@@ -13,7 +13,7 @@ import {
 } from '../../src/lib/identity/crs-persona.mjs'
 import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/official-cc-system-2.1.241.mjs'
 
-test('CLI zero preserves caller TTLs against a different platform default', () => {
+test('CLI zero preserves explicit caller TTLs and fills omitted TTLs from platform default', () => {
   for (const controls of [
     [{ type: 'ephemeral', ttl: '1h' }],
     [{ type: 'ephemeral', ttl: '5m' }],
@@ -33,7 +33,7 @@ test('CLI zero preserves caller TTLs against a different platform default', () =
       const body = prepareCliHopBody(input, { personaPreset: 'zero', cacheTtl })
       assert.deepEqual(
         body.system.map((block) => block.cache_control),
-        controls,
+        controls.map((control) => (control.ttl ? control : { ...control, ttl: cacheTtl })),
       )
     }
     assert.deepEqual(input, before)

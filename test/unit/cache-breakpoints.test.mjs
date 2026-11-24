@@ -73,7 +73,7 @@ function withRoutingFile(compatibility, fn) {
   }
 }
 
-test('HTTP assembly preserves explicit mixed TTLs and caller omissions with default injection enabled', () => {
+test('HTTP assembly preserves explicit mixed TTLs and fills omitted TTLs from config', () => {
   for (const tailControl of [{ type: 'ephemeral', ttl: '5m' }, { type: 'ephemeral' }]) {
     const input = {
       model: 'claude-sonnet-5',
@@ -93,7 +93,10 @@ test('HTTP assembly preserves explicit mixed TTLs and caller omissions with defa
         cacheBreakpoints: DEFAULT_CACHE_BREAKPOINTS,
       })
       assert.deepEqual(body.system[0].cache_control, input.system[0].cache_control)
-      assert.deepEqual(body.messages[0].content.at(-1).cache_control, tailControl)
+      assert.deepEqual(
+        body.messages[0].content.at(-1).cache_control,
+        tailControl.ttl ? tailControl : { type: 'ephemeral', ttl: '1h' },
+      )
     }
     assert.deepEqual(input, before)
   }
@@ -222,11 +225,25 @@ test('an existing 5m is not overwritten when injecting 1h', () => {
   assert.equal(injectToolsTailBreakpoint(body, '1h'), body)
 })
 
-test('an existing cache_control without ttl keeps its implicit 5m', () => {
+test('a cache_control without ttl is filled in place from default TTL', () => {
   const out = injectSystemTailBreakpoint({
     system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }],
   })
-  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral' })
+  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_TTL })
+})
+
+test('a cache_control with ttl but missing type receives ephemeral while keeping its ttl', () => {
+  const sysOut = injectSystemTailBreakpoint(
+    { system: [{ type: 'text', text: 'x', cache_control: { ttl: '5m' } }] },
+    '1h',
+  )
+  assert.deepEqual(sysOut.system[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+
+  const toolOut = injectToolsTailBreakpoint(
+    { tools: [{ name: 'Read', input_schema: {}, cache_control: { ttl: '5m', scope: 'org' } }] },
+    '1h',
+  )
+  assert.deepEqual(toolOut.tools[0].cache_control, { type: 'ephemeral', ttl: '5m', scope: 'org' })
 })
 
 test('tools tail skips server tools and deferred tools', () => {
@@ -676,7 +693,7 @@ test('probe and admin paths that pass no config are unchanged', () => {
   assert.equal(breakpoints(out).length, 0)
 })
 
-test('applyCacheBreakpoints and prepareAnthropicRequest do not emit 1h after an implicit-5m caller tool marker', () => {
+test('applyCacheBreakpoints and prepareAnthropicRequest fill omitted tool TTLs from 1h config while respecting explicit 5m', () => {
   const inbound = {
     model: 'claude-sonnet-5',
     max_tokens: 256,
@@ -698,9 +715,9 @@ test('applyCacheBreakpoints and prepareAnthropicRequest do not emit 1h after an 
     inbound,
   })
   assert.doesNotThrow(() => validateCacheBreakpoints(out))
-  assert.deepEqual(out.tools.at(-1).cache_control, { type: 'ephemeral' })
-  assert.equal(out.system[0].cache_control.ttl, '5m')
-  assert.equal(out.messages[0].content[0].cache_control.ttl, '5m')
+  assert.deepEqual(out.tools.at(-1).cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.equal(out.system[0].cache_control.ttl, '1h')
+  assert.equal(out.messages[0].content[0].cache_control.ttl, '1h')
 
   const prepared = prepareAnthropicRequest(rebuilt, {
     unofficial: true,
@@ -709,5 +726,19 @@ test('applyCacheBreakpoints and prepareAnthropicRequest do not emit 1h after an 
     inbound,
   })
   assert.doesNotThrow(() => validateCacheBreakpoints(prepared))
-  assert.equal(prepared.system[0].cache_control.ttl, '5m')
+  assert.equal(prepared.system[0].cache_control.ttl, '1h')
+
+  // An explicit 5m tool marker still keeps subsequent breakpoints at 5m.
+  const explicitFive = structuredClone(inbound)
+  explicitFive.tools[1].cache_control = { type: 'ephemeral', ttl: '5m' }
+  const rebuiltFive = { ...explicitFive, system: [{ type: 'text', text: 'rebuilt prompt '.repeat(300) }] }
+  const outFive = applyCacheBreakpoints(rebuiltFive, {
+    ttl: '1h',
+    config: DEFAULT_CACHE_BREAKPOINTS,
+    inbound: explicitFive,
+  })
+  assert.doesNotThrow(() => validateCacheBreakpoints(outFive))
+  assert.deepEqual(outFive.tools.at(-1).cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.equal(outFive.system[0].cache_control.ttl, '5m')
+  assert.equal(outFive.messages[0].content[0].cache_control.ttl, '5m')
 })
