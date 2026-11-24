@@ -321,4 +321,60 @@ with tempfile.TemporaryDirectory(prefix="gemini-resident-") as temporary:
             assert not any(n.startswith("gemini-warm-") for n in spawned_names), spawned_names
             assert any(n.startswith("gemini-reauth-") for n in spawned_names), spawned_names
 
+        # 10. Blocking account.eligibility prevents resident pre-warming and reports runtime_ready=False.
+        host.environments[ENV_ID]["account"] = {
+            "state": "ok",
+            "eligibility": "verification_required",
+        }
+        host.native_sessions.clear()
+        host._warm_backoff = {}
+        assert host._can_keep_resident(host.environments[ENV_ID]) is False
+        warm_blocked = host._request(
+            "warm",
+            {
+                "id": ENV_ID,
+                "proxy_id": "px-1",
+                "proxy_url": PROXY,
+                "proxy_sha256": PROXY_SHA,
+            },
+        )
+        assert warm_blocked == {"warmed": False, "runtime_ready": False, "warming": False}
+        assert ENV_ID not in host.native_sessions
+
+        # 11. Poisoned native_diagnostic marks live session not ready and cleanup() stops it without re-warming.
+        poisoned_diag = SimpleNamespace(
+            poll=lambda *, final=False: "gemini_account_verification_required"
+        )
+        poisoned = make_fake_session()
+        poisoned.native_diagnostic = poisoned_diag
+        poisoned.is_severely_unhealthy.side_effect = lambda: True
+        poisoned._last_health_at = 0.0
+        host.environments[ENV_ID]["account"] = {"state": "ok"}
+        host.native_sessions[ENV_ID] = poisoned
+        assert host.view(host.environments[ENV_ID])["runtime_ready"] is False
+        with patch.object(impl.threading, "Thread") as thread_cls:
+            host.cleanup()
+            poisoned.close.assert_called_once()
+            assert ENV_ID not in host.native_sessions
+            spawned_names = [call.kwargs.get("name", "") for call in thread_cls.call_args_list]
+            assert not any(n.startswith("gemini-warm-") for n in spawned_names), spawned_names
+
+        # 12. refresh_account() recycles a stale/poisoned NativeSession when eligibility clears and re-warms.
+        stale = make_fake_session()
+        stale.native_diagnostic = poisoned_diag
+        host.environments[ENV_ID]["account"] = {
+            "state": "ok",
+            "eligibility": "verification_required",
+        }
+        host.native_sessions[ENV_ID] = stale
+        host._warm_backoff = {}
+        with (
+            patch.object(impl, "read_account", return_value={"state": "ok", "email": "u@example.com"}),
+            patch.object(host, "_schedule_warm_locked") as sched_warm,
+        ):
+            host.refresh_account(host.environments[ENV_ID], PROXY, auto_pull_models=False)
+            stale.close.assert_called_once()
+            assert ENV_ID not in host.native_sessions
+            sched_warm.assert_called_once_with(ENV_ID, force=True)
+
 print("gemini-host-resident: ALL PASS")
