@@ -394,9 +394,10 @@ def invocation_module():
 
 
 class Failure(Exception):
-    def __init__(self, status, code=None):
+    def __init__(self, status, code=None, message=None):
         self.status = status
         self.code = code
+        self.message = message
 
 
 def now():
@@ -2699,9 +2700,12 @@ class Host:
         private_json(self.policy_file, self.runtime_policy)
 
     def _use_sharded_daemon(self):
+        policy = getattr(self, "runtime_policy", None)
+        if not isinstance(policy, dict):
+            return False
         return (
             int(
-                self.runtime_policy.get(
+                policy.get(
                     "accounts_per_daemon", DEFAULT_ACCOUNTS_PER_DAEMON
                 )
             )
@@ -5746,6 +5750,30 @@ class Host:
     def _extract_native_turn_body(model, body_obj):
         if not isinstance(body_obj, dict):
             return None
+        for safety_key in ("safetySettings", "safety_settings"):
+            if safety_key in body_obj and body_obj[safety_key] is not None:
+                safety_val = body_obj[safety_key]
+                if not isinstance(safety_val, list) or any(
+                    not isinstance(item, dict) for item in safety_val
+                ):
+                    raise Failure(
+                        400,
+                        "gemini_invalid_request",
+                        "Gemini safetySettings must be an array of objects.",
+                    )
+                if safety_val:
+                    raise Failure(
+                        400,
+                        "gemini_unsupported_turn",
+                        "Gemini OAuth environments do not support safetySettings; omit safetySettings or use a Gemini API key environment.",
+                    )
+        for cache_key in ("cachedContent", "cached_content"):
+            if cache_key in body_obj and body_obj[cache_key] not in (None, ""):
+                raise Failure(
+                    400,
+                    "gemini_unsupported_turn",
+                    "Gemini OAuth environments do not support cachedContent; omit cachedContent or use a Gemini API key environment.",
+                )
         allowed_top = {
             "model",
             "contents",
@@ -5760,6 +5788,8 @@ class Host:
             "generation_config",
             "safetySettings",
             "safety_settings",
+            "cachedContent",
+            "cached_content",
             "conversation_id",
             "conversationId",
         }
@@ -5821,7 +5851,18 @@ class Host:
                     has_substantive_part = True
         if not has_substantive_part:
             return None
-        forwarded = {k: v for k, v in body_obj.items() if k != "stream"}
+        forwarded = {
+            k: v
+            for k, v in body_obj.items()
+            if k
+            not in (
+                "stream",
+                "safetySettings",
+                "safety_settings",
+                "cachedContent",
+                "cached_content",
+            )
+        }
         forwarded["model"] = model
         return forwarded
 
@@ -5932,7 +5973,7 @@ class Host:
         except Failure as error:
             final_state = "cancelled" if cancel_event.is_set() else "failed"
             final_code = error.code or "gemini_inference_failed"
-            handler.send_json_error(error.status, final_code)
+            handler.send_json_error(error.status, final_code, error.message)
         except (BrokenPipeError, ConnectionResetError):
             final_state = "cancelled"
             final_code = "gemini_inference_cancelled"
@@ -6336,7 +6377,12 @@ class ControlHandler(BaseHTTPRequestHandler):
                     raise Failure(400)
             status, payload = 200, self.server.host.request(operation, body)
         except Failure as error:
-            status, payload = error.status, {"code": error.code} if error.code else {}
+            payload = {}
+            if error.code:
+                payload["code"] = error.code
+            if error.message:
+                payload["message"] = error.message
+            status = error.status
         except (ValueError, TimeoutError, RecursionError):
             status, payload = 400, {}
         except (OSError, subprocess.SubprocessError):

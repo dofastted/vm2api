@@ -890,6 +890,14 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
     }
   }
 
+  let safetySettings = null
+  if (body.safetySettings != null) {
+    if (!Array.isArray(body.safetySettings) || body.safetySettings.some((item) => !isPlainObject(item))) {
+      throw makeProtocolError(400, 'gemini_invalid_request', 'Gemini safetySettings must be an array of objects.')
+    }
+    safetySettings = body.safetySettings
+  }
+
   return {
     model,
     stream,
@@ -903,7 +911,7 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
     extraGenConfig,
     thinking,
     responseFormat,
-    safetySettings: Array.isArray(body.safetySettings) ? body.safetySettings : null,
+    safetySettings,
     cachedContent: typeof body.cachedContent === 'string' ? body.cachedContent : null,
   }
 }
@@ -1561,6 +1569,11 @@ function isValidNativeTuiText(text) {
  */
 export function classifyGeminiCapabilities(ir) {
   const required = new Set()
+  const unsupportedNativeFields = []
+  const hasSafetySettings = Array.isArray(ir.safetySettings) && ir.safetySettings.length > 0
+  const hasCachedContent = Boolean(ir.cachedContent)
+  if (hasSafetySettings) unsupportedNativeFields.push('safetySettings')
+  if (hasCachedContent) unsupportedNativeFields.push('cachedContent')
   if (ir.system && ir.system.trim()) required.add('system_instruction')
   if (ir.messages.length !== 1 || ir.messages[0]?.role !== 'user') required.add('multi_turn')
   if (ir.tools.length > 0 || ir.webSearch || ir.googleTools.length > 0 || ir.toolChoice) required.add('tools')
@@ -1569,10 +1582,13 @@ export function classifyGeminiCapabilities(ir) {
     Object.keys(ir.extraGenConfig || {}).length > 0 ||
     ir.thinking != null ||
     ir.responseFormat != null ||
-    ir.safetySettings != null ||
-    ir.cachedContent != null
+    hasSafetySettings ||
+    hasCachedContent
   ) {
     required.add('generation_config')
+  }
+  if (hasSafetySettings || hasCachedContent) {
+    required.add('full_gemini_api')
   }
   let plainText = ''
   if (ir.messages.length === 1 && ir.messages[0].role === 'user') {
@@ -1595,6 +1611,7 @@ export function classifyGeminiCapabilities(ir) {
   }
   return {
     requiredCapabilities: [...required],
+    unsupportedNativeFields,
     nativeTuiCompatible: required.size === 0,
     plainText: required.size === 0 ? plainText : null,
   }
@@ -1832,7 +1849,7 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
     }
   }
   if (Object.keys(gen).length) req.generationConfig = gen
-  if (ir.safetySettings) req.safetySettings = ir.safetySettings
+  if (ir.safetySettings && (!ag || ir.safetySettings.length > 0)) req.safetySettings = ir.safetySettings
   if (ir.cachedContent) req.cachedContent = ir.cachedContent
   return req
 }

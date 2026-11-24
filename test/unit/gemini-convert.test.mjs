@@ -673,3 +673,60 @@ test('SSE splitter preserves split multi-byte UTF-8 and Anthropic stream separat
     cache_read_input_tokens: 45,
   })
 })
+
+test('safetySettings handling: empty array is native-compatible on antigravity while non-empty requires full_gemini_api', () => {
+  const emptyIr = parseInboundToGemini(
+    'gemini',
+    {
+      contents: [{ role: 'user', parts: [{ text: 'Reply exactly: CONTROL_OK' }] }],
+      safetySettings: [],
+    },
+    { routeModel: 'gemini-4-hydrogen-high', routeStream: true },
+  )
+  assert.deepEqual(emptyIr.safetySettings, [])
+  assert.equal(emptyIr.nativeTuiCompatible, true)
+  assert.deepEqual(emptyIr.requiredCapabilities, [])
+  assert.deepEqual(emptyIr.unsupportedNativeFields, [])
+
+  // Official Gemini API target preserves explicit empty array; Antigravity OAuth omits it.
+  const emptyGemReq = buildGeminiRequest(emptyIr, { target: 'gemini' })
+  assert.deepEqual(emptyGemReq.safetySettings, [])
+  const emptyAgReq = buildGeminiRequest(emptyIr, { target: 'antigravity' })
+  assert.equal(Object.hasOwn(emptyAgReq, 'safetySettings'), false)
+
+  // Non-empty safetySettings (including snake_case safety_settings) requires full_gemini_api and names safetySettings.
+  const rules = [{ category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' }]
+  const nonEmptyIr = parseInboundToGemini(
+    'gemini',
+    {
+      contents: [{ role: 'user', parts: [{ text: 'Reply exactly: CONTROL_OK' }] }],
+      safety_settings: rules,
+    },
+    { routeModel: 'gemini-4-hydrogen-high', routeStream: true },
+  )
+  assert.deepEqual(nonEmptyIr.safetySettings, rules)
+  assert.equal(nonEmptyIr.nativeTuiCompatible, false)
+  assert.ok(nonEmptyIr.requiredCapabilities.includes('generation_config'))
+  assert.ok(nonEmptyIr.requiredCapabilities.includes('full_gemini_api'))
+  assert.deepEqual(nonEmptyIr.unsupportedNativeFields, ['safetySettings'])
+
+  // Non-empty safetySettings is never silently dropped in buildGeminiRequest.
+  assert.deepEqual(buildGeminiRequest(nonEmptyIr, { target: 'gemini' }).safetySettings, rules)
+  assert.deepEqual(buildGeminiRequest(nonEmptyIr, { target: 'antigravity' }).safetySettings, rules)
+
+  // Malformed safetySettings fails closed with 400 gemini_invalid_request.
+  for (const bad of ['BLOCK_NONE', {}, [null], ['not-an-object']]) {
+    assert.throws(
+      () =>
+        parseInboundToGemini(
+          'gemini',
+          {
+            contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+            safetySettings: bad,
+          },
+          { routeModel: 'gemini-2.5-flash' },
+        ),
+      (err) => err.status === 400 && err.code === 'gemini_invalid_request' && /safetySettings/.test(err.message),
+    )
+  }
+})

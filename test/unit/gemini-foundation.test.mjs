@@ -832,3 +832,147 @@ test('Gemini public ports support /v1 native generateContent, single-model GET, 
   assert.equal(resGenV1.statusCode, 200)
   assert.equal(resGenV1.jsonBody().candidates[0].content.parts[0].text, 'v1-ok')
 })
+
+test('issue #1703: safetySettings on OAuth vs API Key environments', async () => {
+  const inferCalls = []
+  let envs = [
+    {
+      id: 'env-oauth',
+      proxy_id: 'proxy-1',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      models_discovered: true,
+      models: ['gemini-4-hydrogen-high', 'gemini-2.5-pro'],
+      capabilities: [...NATIVE_TUI_CAPABILITIES],
+    },
+  ]
+
+  const scheduler = createGeminiScheduler({
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') {
+        const found = envs.find((e) => e.id === payload.id)
+        return { id: found.id, proxy_id: found.proxy_id, auth_method: found.auth_method }
+      }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: async (_op, payload) => {
+      inferCalls.push(payload)
+      return sseResponse([
+        `data: ${JSON.stringify({
+          candidates: [{ content: { role: 'model', parts: [{ text: 'CONTROL_OK' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 8, candidatesTokenCount: 2, totalTokenCount: 10 },
+        })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://1.2.3.4:1080',
+    poolScheduler: makeCircuitTracker(),
+  })
+  const handler = createGeminiPublicHandler({ json: jsonResponder, readBody: async () => ({}), scheduler })
+
+  // 1. OAuth-only environment + safetySettings: [] (plain text & PNG multimodal) succeeds and omits empty safetySettings.
+  const resEmptyText = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-hydrogen-high:streamGenerateContent?alt=sse',
+      body: {
+        contents: [{ role: 'user', parts: [{ text: 'Reply exactly: CONTROL_OK' }] }],
+        safetySettings: [],
+      },
+    }),
+    resEmptyText,
+  )
+  assert.equal(resEmptyText.statusCode, 200)
+  assert.match(resEmptyText.bodyText(), /"text":"CONTROL_OK"/)
+  assert.equal(inferCalls.length, 1)
+  assert.equal(inferCalls[0].id, 'env-oauth')
+  assert.equal(Object.hasOwn(inferCalls[0].body, 'safetySettings'), false)
+
+  const resEmptyPng = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-hydrogen-high:streamGenerateContent?alt=sse',
+      body: {
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: 'Read code in image' }, { inlineData: { mimeType: 'image/png', data: 'iVBORw0KGgo=' } }],
+          },
+        ],
+        generationConfig: { temperature: 0.1 },
+        safetySettings: [],
+      },
+    }),
+    resEmptyPng,
+  )
+  assert.equal(resEmptyPng.statusCode, 200)
+  assert.equal(inferCalls.length, 2)
+  assert.equal(Object.hasOwn(inferCalls[1].body, 'safetySettings'), false)
+
+  // 2. OAuth-only environment + non-empty safetySettings fails before dispatch with 400 naming safetySettings.
+  const rules = [{ category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' }]
+  const resNonEmptyOAuth = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-hydrogen-high:streamGenerateContent?alt=sse',
+      body: {
+        contents: [{ role: 'user', parts: [{ text: 'Reply exactly: CONTROL_OK' }] }],
+        safetySettings: rules,
+      },
+    }),
+    resNonEmptyOAuth,
+  )
+  assert.equal(resNonEmptyOAuth.statusCode, 400)
+  const errPayload = resNonEmptyOAuth.jsonBody()
+  assert.equal(errPayload.error.status, 'INVALID_ARGUMENT')
+  assert.equal(errPayload.error.details[0].reason, 'gemini_unsupported_turn')
+  assert.match(errPayload.error.message, /safetySettings/)
+  assert.equal(inferCalls.length, 2) // Zero host /infer calls dispatched!
+
+  // 3. Mixed OAuth + API Key pool routes non-empty safetySettings to API Key and preserves safetySettings.
+  envs = [
+    ...envs,
+    {
+      id: 'env-apikey',
+      proxy_id: 'proxy-1',
+      auth_state: 'authorized',
+      auth_method: 'api_key',
+      models_discovered: true,
+      models: ['gemini-2.5-pro'],
+      capabilities: [...FULL_GEMINI_CAPABILITIES],
+    },
+  ]
+  const resMixed = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
+      body: {
+        contents: [{ role: 'user', parts: [{ text: 'Reply exactly: CONTROL_OK' }] }],
+        safetySettings: rules,
+      },
+    }),
+    resMixed,
+  )
+  assert.equal(resMixed.statusCode, 200)
+  assert.equal(inferCalls.length, 3)
+  assert.equal(inferCalls[2].id, 'env-apikey')
+  assert.deepEqual(inferCalls[2].body.safetySettings, rules)
+
+  // 4. API Key environment also preserves explicit empty safetySettings: [] pass-through.
+  envs = [envs[1]]
+  const resApiKeyEmpty = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-2.5-pro:generateContent',
+      body: {
+        contents: [{ role: 'user', parts: [{ text: 'Reply exactly: CONTROL_OK' }] }],
+        safetySettings: [],
+      },
+    }),
+    resApiKeyEmpty,
+  )
+  assert.equal(resApiKeyEmpty.statusCode, 200)
+  assert.equal(inferCalls.length, 4)
+  assert.equal(inferCalls[3].id, 'env-apikey')
+  assert.deepEqual(inferCalls[3].body.safetySettings, [])
+})

@@ -1699,7 +1699,8 @@ export function createGeminiPublicHandler({
       (typeof req.headers?.['x-conversation-id'] === 'string' && req.headers['x-conversation-id'].trim()) ||
       (typeof body?.conversation_id === 'string' && body.conversation_id.trim()) ||
       (typeof body?.session_id === 'string' && body.session_id.trim()) ||
-      (session?.[1] || '')
+      session?.[1] ||
+      ''
     const stickyKey = stickyHeader ? `${req.apiKeyRecord?.id || 'anon'}:${stickyHeader.slice(0, 128)}` : null
 
     try {
@@ -1708,15 +1709,13 @@ export function createGeminiPublicHandler({
       const turn = await scheduler.stream({
         model: parsed.model,
         targetBodyFor: (target, meta) => {
-          const reqBody = buildGeminiRequest(
-            meta?.upstreamModel ? { ...parsed, model: meta.upstreamModel } : parsed,
-            { target },
-          )
-          return target === 'antigravity' && promptPolicy
-            ? applyCragGeminiPromptPolicy(reqBody, promptPolicy)
-            : reqBody
+          const reqBody = buildGeminiRequest(meta?.upstreamModel ? { ...parsed, model: meta.upstreamModel } : parsed, {
+            target,
+          })
+          return target === 'antigravity' && promptPolicy ? applyCragGeminiPromptPolicy(reqBody, promptPolicy) : reqBody
         },
         requiredCapabilities: parsed.requiredCapabilities,
+        unsupportedNativeFields: parsed.unsupportedNativeFields,
         plainText: parsed.plainText,
         stickyKey,
         signal: controller.signal,

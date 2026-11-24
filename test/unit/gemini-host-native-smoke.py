@@ -432,6 +432,9 @@ with tempfile.TemporaryDirectory(prefix="gemini-multiproc-host-") as mp_tmp:
     mp_host.runs = {}
     mp_host.native_sessions = {}
     mp_host._session_locks = {}
+    mp_host._account_shard_map = {}
+    mp_host.daemon_shards = {}
+    mp_host.runtime_policy = dict(host_mod.DEFAULT_RUNTIME_POLICY)
     mp_host.active_infers = {}
     mp_host.last_inference = {}
     mp_host.payload_version = "0.3.0"
@@ -518,6 +521,76 @@ with tempfile.TemporaryDirectory(prefix="gemini-multiproc-host-") as mp_tmp:
         assert mp_host.active_infers[mp_env_id]["req-slot-3"]["cancel_event"].is_set() is True
         assert mp_host.active_infers[mp_env_id]["req-slot-0"]["cancel_event"].is_set() is False
         assert mp_host.cancel_infer(mp_env_id, "req-missing") is False
+
+        # Issue #1703: OAuth _extract_native_turn_body & _begin_infer handle safetySettings cleanly
+        mp_host.active_infers.clear()
+        empty_ctx = mp_host._begin_infer(
+            {
+                "id": mp_env_id,
+                "proxy_id": "px-1",
+                "proxy_url": mp_proxy,
+                "proxy_sha256": mp_sha,
+                "model": "gemini-test",
+                "request_id": "req-safety-empty",
+                "body": {
+                    "model": "gemini-test",
+                    "contents": [{"role": "user", "parts": [{"text": "CONTROL_OK"}]}],
+                    "safetySettings": [],
+                },
+            }
+        )
+        assert "safetySettings" not in empty_ctx["native_body"], empty_ctx["native_body"]
+        mp_host.active_infers.clear()
+
+        for field_name in ("safetySettings", "safety_settings"):
+            try:
+                mp_host._begin_infer(
+                    {
+                        "id": mp_env_id,
+                        "proxy_id": "px-1",
+                        "proxy_url": mp_proxy,
+                        "proxy_sha256": mp_sha,
+                        "model": "gemini-test",
+                        "request_id": f"req-safety-{field_name}",
+                        "body": {
+                            "model": "gemini-test",
+                            "contents": [{"role": "user", "parts": [{"text": "CONTROL_OK"}]}],
+                            field_name: [
+                                {
+                                    "category": "HARM_CATEGORY_HARASSMENT",
+                                    "threshold": "BLOCK_MEDIUM_AND_ABOVE",
+                                }
+                            ],
+                        },
+                    }
+                )
+            except host_mod.Failure as err:
+                assert (err.status, err.code) == (400, "gemini_unsupported_turn"), (err.status, err.code)
+                assert err.message and "safetySettings" in err.message, err.message
+            else:
+                raise AssertionError(f"expected non-empty {field_name} on OAuth to fail with gemini_unsupported_turn")
+
+        try:
+            mp_host._begin_infer(
+                {
+                    "id": mp_env_id,
+                    "proxy_id": "px-1",
+                    "proxy_url": mp_proxy,
+                    "proxy_sha256": mp_sha,
+                    "model": "gemini-test",
+                    "request_id": "req-safety-malformed",
+                    "body": {
+                        "model": "gemini-test",
+                        "contents": [{"role": "user", "parts": [{"text": "CONTROL_OK"}]}],
+                        "safetySettings": "invalid",
+                    },
+                }
+            )
+        except host_mod.Failure as err:
+            assert (err.status, err.code) == (400, "gemini_invalid_request"), (err.status, err.code)
+            assert err.message and "safetySettings" in err.message, err.message
+        else:
+            raise AssertionError("expected malformed safetySettings to fail with gemini_invalid_request")
     finally:
         host_mod.profile_secrets = orig_secrets
 

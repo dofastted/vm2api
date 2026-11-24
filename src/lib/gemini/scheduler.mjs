@@ -7,11 +7,7 @@ import {
   createGeminiEventDecoder,
   createSseFrameSplitter,
 } from '../protocol/gemini-convert.mjs'
-import {
-  classifyAntigravityModel,
-  indexAccountModelCatalog,
-  resolveUpstreamModel,
-} from './model-catalog.mjs'
+import { classifyAntigravityModel, indexAccountModelCatalog, resolveUpstreamModel } from './model-catalog.mjs'
 import { callGeminiHost, callGeminiHostStream } from './routes.mjs'
 import { DEFAULT_GEMINI_ROUTING, normalizeGeminiRouting } from './routing-config.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
@@ -173,8 +169,7 @@ function proactiveCooldownUntil(account, upstreamModel, quotaGroup, ts) {
       for (const w of windows) {
         const bucketGroup = quotaGroupKeyOfBucket(g?.name, w?.id)
         if (!bucketGroup) continue
-        const matches =
-          bucketGroup === quotaGroup || (quotaGroup === 'gemini-argon-wtu' && bucketGroup === 'gemini')
+        const matches = bucketGroup === quotaGroup || (quotaGroup === 'gemini-argon-wtu' && bucketGroup === 'gemini')
         if (!matches) continue
         if (w.remaining_fraction === 0) {
           const parsed = w.reset_at ? Date.parse(w.reset_at) : NaN
@@ -341,8 +336,7 @@ export function createGeminiScheduler({
   }
 
   function pickCandidateWithPolicy(candidates, excluded, { strategy, stickyAccountId }) {
-    const inflightOf = (id) =>
-      poolScheduler ? poolScheduler.inflight?.get?.(id) || 0 : localInflight.get(id) || 0
+    const inflightOf = (id) => (poolScheduler ? poolScheduler.inflight?.get?.(id) || 0 : localInflight.get(id) || 0)
     const reserve = (list) =>
       poolScheduler
         ? poolScheduler.reserveExternalCandidates(list, { excluded })
@@ -447,8 +441,14 @@ export function createGeminiScheduler({
           ? failure.retryAfterMs
           : effectiveQuotaCooldown
       const until = ts + retryMs
-      groupCooldowns.set(`${accountId}:${quotaGroup}`, Math.max(groupCooldowns.get(`${accountId}:${quotaGroup}`) || 0, until))
-      modelCooldowns.set(`${accountId}:${upstreamModel}`, Math.max(modelCooldowns.get(`${accountId}:${upstreamModel}`) || 0, until))
+      groupCooldowns.set(
+        `${accountId}:${quotaGroup}`,
+        Math.max(groupCooldowns.get(`${accountId}:${quotaGroup}`) || 0, until),
+      )
+      modelCooldowns.set(
+        `${accountId}:${upstreamModel}`,
+        Math.max(modelCooldowns.get(`${accountId}:${upstreamModel}`) || 0, until),
+      )
       return
     }
     if (ACCOUNT_WIDE_COOLDOWN_ERRORS.has(code)) {
@@ -499,8 +499,7 @@ export function createGeminiScheduler({
   return {
     cooldownSnapshot() {
       const ts = now()
-      const active = (map) =>
-        Object.fromEntries([...map.entries()].filter(([, until]) => until > ts))
+      const active = (map) => Object.fromEntries([...map.entries()].filter(([, until]) => until > ts))
       return {
         groups: active(groupCooldowns),
         models: active(modelCooldowns),
@@ -623,6 +622,7 @@ export function createGeminiScheduler({
       geminiBody,
       targetBodyFor = null,
       requiredCapabilities = [],
+      unsupportedNativeFields = [],
       plainText = null,
       requestId = `gem_${crypto.randomBytes(12).toString('hex')}`,
       stickyKey = null,
@@ -633,7 +633,7 @@ export function createGeminiScheduler({
     }) {
       const gate = apiKeyStore?.acquire?.(apiKeyRecord)
       if (gate && !gate.ok) throw fail(gate.status || 429, gate.code, gate.message)
-      const allowUnprefixed = allowUnprefixedNonGemini ?? (apiKeyRecord?.group_type !== 'all')
+      const allowUnprefixed = allowUnprefixedNonGemini ?? apiKeyRecord?.group_type !== 'all'
       const excluded = new Set()
       let reservation = null
       let selected = null
@@ -676,6 +676,18 @@ export function createGeminiScheduler({
           requiredCapabilities.every((cap) => account.capabilities.has(cap)),
         )
         if (!capableAccounts.length) {
+          if (
+            Array.isArray(unsupportedNativeFields) &&
+            unsupportedNativeFields.length > 0 &&
+            matchedAccounts.some(({ account }) => account.auth_method !== 'api_key')
+          ) {
+            const fields = unsupportedNativeFields.join(', ')
+            throw fail(
+              400,
+              'gemini_unsupported_turn',
+              `Gemini OAuth environments do not support ${fields}; omit ${fields} or use a Gemini API key environment.`,
+            )
+          }
           throw fail(
             400,
             'gemini_unsupported_turn',
@@ -718,9 +730,7 @@ export function createGeminiScheduler({
         const uncooled = scored.filter((item) => item.cooldownUntil === 0)
         // Prefer uncooled accounts; if every account is currently in cooldown, fall back to
         // probing the earliest-expiring one so single-account pools and post-reset slots recover.
-        const activeList = uncooled.length
-          ? uncooled
-          : [...scored].sort((a, b) => a.cooldownUntil - b.cooldownUntil)
+        const activeList = uncooled.length ? uncooled : [...scored].sort((a, b) => a.cooldownUntil - b.cooldownUntil)
         const candidates = activeList.map((item) => item.candidate)
         const resolvedByAccountId = new Map(activeList.map((item) => [item.candidate.accountId, item.resolved]))
 
@@ -753,16 +763,40 @@ export function createGeminiScheduler({
                   publicModel: resolved.publicId,
                 })
               : geminiBody
-            const outboundBody =
+            let outboundBody =
               rawOutboundBody && typeof rawOutboundBody === 'object' && 'model' in rawOutboundBody
                 ? { ...rawOutboundBody, model: resolved.upstreamModel }
                 : rawOutboundBody
+            if (
+              authMethod !== 'api_key' &&
+              outboundBody &&
+              typeof outboundBody === 'object' &&
+              !Array.isArray(outboundBody)
+            ) {
+              for (const safetyKey of ['safetySettings', 'safety_settings']) {
+                if (!Object.hasOwn(outboundBody, safetyKey) || outboundBody[safetyKey] == null) continue
+                const rawSafety = outboundBody[safetyKey]
+                if (
+                  !Array.isArray(rawSafety) ||
+                  rawSafety.some((item) => !item || typeof item !== 'object' || Array.isArray(item))
+                ) {
+                  throw fail(400, 'gemini_invalid_request', 'Gemini safetySettings must be an array of objects.')
+                }
+                if (rawSafety.length > 0) {
+                  throw fail(
+                    400,
+                    'gemini_unsupported_turn',
+                    'Gemini OAuth environments do not support safetySettings; omit safetySettings or use a Gemini API key environment.',
+                  )
+                }
+                const { [safetyKey]: _omitted, ...rest } = outboundBody
+                outboundBody = rest
+              }
+            }
 
             let streamResponse = null
             if (streamHost) {
-              const proxySha256 = proxyUrl
-                ? crypto.createHash('sha256').update(proxyUrl).digest('hex')
-                : undefined
+              const proxySha256 = proxyUrl ? crypto.createHash('sha256').update(proxyUrl).digest('hex') : undefined
               const gatewayPolicy =
                 typeof getRoutingConfig === 'function'
                   ? {
