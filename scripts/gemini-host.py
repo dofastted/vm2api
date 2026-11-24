@@ -1419,7 +1419,7 @@ class NativeAgy(Agy):
                 *agy_args,
             ]
         )
-        self.native_exit_reader = native_module_impl.read_launcher_exit
+        self.native_exit_reader = native_module_impl.read_launcher_exit_detail
         spawn = getattr(self.host, "spawn", lambda fn: fn())
         if self.pool_mode:
             # Multi-process CRAGGemini pool allocates per-slot PTYs and pidfd execution guards
@@ -1541,17 +1541,31 @@ class NativeAgy(Agy):
     def read_exit_detail(self):
         if self.native_dir is None:
             return None
-        native_mod = native_module()
         reader = getattr(self, "native_exit_reader", None)
-        if reader is not None and reader is not native_mod.read_launcher_exit:
-            outcome = reader(self.native_dir, self.uid)
-            if outcome is None:
-                return None
-            return outcome if len(outcome) >= 3 else (outcome[0], outcome[1], None)
-        return native_mod.read_launcher_exit_detail(self.native_dir, self.uid)
+        if reader is None:
+            reader = native_module().read_launcher_exit_detail
+        outcome = reader(self.native_dir, self.uid)
+        if outcome is None:
+            return None
+        return (
+            (outcome[0], outcome[1], outcome[2])
+            if len(outcome) >= 3
+            else (outcome[0], outcome[1], None)
+        )
 
     def early_exit_code(self):
-        return native_module().launcher_exit_code(self.read_exit_detail())
+        outcome = self.read_exit_detail()
+        if outcome is None:
+            return "gemini_native_worker_unavailable"
+        reason = outcome[2] if len(outcome) >= 3 else None
+        if reason == "invalid_config":
+            return "gemini_native_config_invalid"
+        if reason is None:
+            return "gemini_native_worker_unavailable"
+        try:
+            return native_module().launcher_exit_code(outcome)
+        except Failure:
+            return "gemini_native_worker_unavailable"
 
     def close(self, preserve=False):
         wrapper_status = self.native_tui.poll() if self.native_tui is not None else None
@@ -2302,23 +2316,27 @@ class CragDaemonShard:
 
     def close(self):
         with self._lock:
-            if self.process is not None:
-                NativeAgy._stop_process_group(self.process)
-                self.process = None
-                outcome = self.read_exit_detail()
-                if outcome is not None:
-                    child, status, reason = outcome
-                    kind = "exit_code" if status >= 0 else "signal"
-                    reason_text = f" reason={reason}" if reason else ""
-                    print(
-                        f"Gemini native shard={self.shard_id} child={child} {kind}={abs(status)}{reason_text}",
-                        file=sys.stderr,
-                    )
-            if getattr(self, "_owns_native_dir", False) and self.native_dir is not None:
-                shutil.rmtree(self.native_dir, ignore_errors=True)
-                self._owns_native_dir = False
-            if self.directory.exists():
-                shutil.rmtree(self.directory, ignore_errors=True)
+            try:
+                if self.process is not None:
+                    NativeAgy._stop_process_group(self.process)
+                    self.process = None
+                    outcome = self.read_exit_detail()
+                    if outcome is not None:
+                        child, status, reason = outcome
+                        kind = "exit_code" if status >= 0 else "signal"
+                        reason_text = f" reason={reason}" if reason else ""
+                        print(
+                            f"Gemini native shard={self.shard_id} child={child} {kind}={abs(status)}{reason_text}",
+                            file=sys.stderr,
+                        )
+            finally:
+                try:
+                    if getattr(self, "_owns_native_dir", False) and self.native_dir is not None:
+                        shutil.rmtree(self.native_dir, ignore_errors=True)
+                        self._owns_native_dir = False
+                finally:
+                    if self.directory.exists():
+                        shutil.rmtree(self.directory, ignore_errors=True)
 
 
 class ResidentTestChatRun:

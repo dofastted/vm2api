@@ -933,7 +933,7 @@ def _launch_native(argv, *, worker_bin="/opt/craggemini", directory="/tmp/cragge
                 break
             time.sleep(0.025)
         else:
-            if worker.returncode is not None:
+            if worker.poll() is not None:
                 stderr_drain.join(timeout=0.5)
                 reason = _classify_worker_stderr(bytes(stderr_buf))
                 _record_launcher_exit(directory, "craggemini", worker.returncode, reason=reason)

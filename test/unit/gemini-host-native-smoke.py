@@ -705,6 +705,72 @@ with tempfile.TemporaryDirectory(prefix="gemini-native-early-exit-") as early_di
     else:
         raise AssertionError("open_worker_stream should fast-fail when worker is dead")
 
+# Regression: NativeAgy.read_exit_detail()/early_exit_code() must honor injected native_exit_reader
+# without invoking native_module() (which checks root ownership on non-root checkouts), and
+# CragDaemonShard.close() must still remove directories if read_exit_detail() raises.
+with tempfile.TemporaryDirectory(prefix="gemini-native-reader-inject-") as inj_tmp:
+    inj_dir = Path(inj_tmp)
+    orig_native_module = host_mod.native_module
+    host_mod.native_module = lambda: (_ for _ in ()).throw(
+        host_mod.Failure(500, "unexpected_native_module_call")
+    )
+    try:
+        run_2 = host_mod.NativeAgy.__new__(host_mod.NativeAgy)
+        run_2.native_dir = inj_dir
+        run_2.uid = os.getuid()
+        run_2.native_exit_reader = lambda _d, _u: ("craggemini", 1)
+        assert run_2.read_exit_detail() == ("craggemini", 1, None)
+        assert run_2.early_exit_code() == "gemini_native_worker_unavailable"
+
+        run_3 = host_mod.NativeAgy.__new__(host_mod.NativeAgy)
+        run_3.native_dir = inj_dir
+        run_3.uid = os.getuid()
+        run_3.native_exit_reader = lambda _d, _u: ("craggemini", 1, "invalid_config")
+        assert run_3.read_exit_detail() == ("craggemini", 1, "invalid_config")
+        assert run_3.early_exit_code() == "gemini_native_config_invalid"
+
+        run_other = host_mod.NativeAgy.__new__(host_mod.NativeAgy)
+        run_other.native_dir = inj_dir
+        run_other.uid = os.getuid()
+        run_other.native_exit_reader = lambda _d, _u: ("craggemini", 1, "bind_failed")
+        assert run_other.early_exit_code() == "gemini_native_worker_unavailable"
+
+        run_none = host_mod.NativeAgy.__new__(host_mod.NativeAgy)
+        run_none.native_dir = inj_dir
+        run_none.uid = os.getuid()
+        run_none.native_exit_reader = lambda _d, _u: None
+        assert run_none.read_exit_detail() is None
+        assert run_none.early_exit_code() == "gemini_native_worker_unavailable"
+    finally:
+        host_mod.native_module = orig_native_module
+
+    shard = host_mod.CragDaemonShard.__new__(host_mod.CragDaemonShard)
+    shard._lock = threading.RLock()
+    shard.shard_id = "shard-close-test"
+    shard.directory = inj_dir / "shard-dir"
+    shard.native_dir = inj_dir / "shard-native"
+    shard.directory.mkdir()
+    shard.native_dir.mkdir()
+    shard._owns_native_dir = True
+
+    class _DoneProc:
+        def poll(self):
+            return 1
+
+        def wait(self, timeout=None):
+            return 1
+
+    shard.process = _DoneProc()
+    shard.read_exit_detail = lambda: (_ for _ in ()).throw(RuntimeError("diag boom"))
+    try:
+        shard.close()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected RuntimeError from shard.read_exit_detail()")
+    assert not shard.native_dir.exists()
+    assert not shard.directory.exists()
+
 print(
     "Native worker fixture: health, streaming, cancel, error mapping, pool concurrency, SSE completion and usage PASS"
 )
