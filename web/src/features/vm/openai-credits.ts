@@ -10,6 +10,13 @@ export type OpenaiQuotaPayload = {
     utilization_5h?: number | null
     utilization_7d?: number | null
   } | null
+  windows?: Array<{
+    id?: string
+    label?: string
+    used_percent?: number | null
+    window_minutes?: number | null
+    reset_at?: string | null
+  }> | null
   credits?: VmCodexCredits | null
   reset_credits?: {
     available_count?: number
@@ -155,14 +162,24 @@ export function formatOpenaiQuotaRefreshToast(
   if (!data) return '已刷新额度和积分'
   const parts: string[] = []
 
-  const u5 = data.quota?.utilization_5h
-  const u7 = data.quota?.utilization_7d
   const quotaBits: string[] = []
-  if (u5 != null && Number.isFinite(Number(u5))) {
-    quotaBits.push(`5h ${Math.round(Number(u5) * 100)}%`)
+  const windows = Array.isArray(data.windows) ? data.windows : []
+  for (const w of windows) {
+    if (w?.used_percent == null || !Number.isFinite(Number(w.used_percent)))
+      continue
+    const tag = String(w.label || w.id || '').trim()
+    if (!tag) continue
+    quotaBits.push(`${tag} ${Math.round(Number(w.used_percent))}%`)
   }
-  if (u7 != null && Number.isFinite(Number(u7))) {
-    quotaBits.push(`7d ${Math.round(Number(u7) * 100)}%`)
+  if (!quotaBits.length) {
+    const u5 = data.quota?.utilization_5h
+    const u7 = data.quota?.utilization_7d
+    if (u5 != null && Number.isFinite(Number(u5))) {
+      quotaBits.push(`5h ${Math.round(Number(u5) * 100)}%`)
+    }
+    if (u7 != null && Number.isFinite(Number(u7))) {
+      quotaBits.push(`7d ${Math.round(Number(u7) * 100)}%`)
+    }
   }
   parts.push(
     quotaBits.length

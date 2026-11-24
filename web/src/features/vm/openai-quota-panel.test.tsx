@@ -260,3 +260,44 @@ describe('OpenaiQuotaPanel and OpenaiQuotaActions', () => {
     )
   })
 })
+
+describe('OpenAI 24h window rendering (#1744)', () => {
+  it('renders 24 小时已用 in OpenaiQuotaPanel without fabricating 5h/7d meters', () => {
+    const html = renderToStaticMarkup(
+      <OpenaiQuotaPanel
+        vm={makeVm({
+          utilization_5h: null,
+          utilization_7d: null,
+          codex_usage: {
+            windows: [
+              {
+                id: '24h',
+                label: '24h',
+                used_percent: 1,
+                window_minutes: 1440,
+                reset_at: new Date(NOW + 3600_000).toISOString(),
+              },
+            ],
+          },
+        })}
+        u5={0}
+        u7={0}
+        now={NOW}
+      />
+    )
+    expect(html).toContain('24 小时已用')
+    expect(html).toContain('24h 重置')
+    expect(html).not.toContain('5 小时已用')
+    expect(html).not.toContain('7 天已用')
+  })
+
+  it('formats 24h window in refresh toast from windows payload', () => {
+    const msg = formatOpenaiQuotaRefreshToast({
+      quota: { utilization_5h: null, utilization_7d: null },
+      windows: [
+        { id: '24h', label: '24h', used_percent: 1, window_minutes: 1440 },
+      ],
+    })
+    expect(msg).toContain('已刷新额度（24h 1%）')
+  })
+})

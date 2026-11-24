@@ -52,6 +52,7 @@ const HOLD_REASONS = Object.freeze({
 const RESTRICTED_SLOT = [
   { match: /^quota_5h/, text: '5h 限制' },
   { match: /^quota_7d/, text: '7d 限制' },
+  { match: /^quota_(\d+[mhd])/, text: (reason) => `${reason.match(/^quota_(\d+[mhd])/)[1]} 限制` },
   { match: /^(account_quota_exhausted|rate_limited|rate_limited_unknown|rpm_limited)$/, text: '限流中' },
   { match: /^[a-z]+_rate_limited$/, text: '限流中' },
   { match: /^(weekly_split_|fable_split|regular_split|fable_quota)/, text: '周额度切分' },
@@ -114,7 +115,10 @@ export function stateOfReason(reason) {
     return { state: 'restricted', scope: 'slot', soft: false, text: HOLD_REASONS[code] }
   }
   for (const row of RESTRICTED_SLOT) {
-    if (row.match.test(code)) return { state: 'restricted', scope: 'slot', soft: false, text: row.text }
+    if (row.match.test(code)) {
+      const text = typeof row.text === 'function' ? row.text(code) : row.text
+      return { state: 'restricted', scope: 'slot', soft: false, text }
+    }
   }
   for (const row of RESTRICTED_NEW_SESSION) {
     if (row.match.test(code)) return { state: 'restricted', scope: 'new_session', soft: row.soft, text: row.text }
@@ -240,7 +244,7 @@ export function applyClearHold(vm, reason, { tag = null, now = Date.now() } = {}
 
 const LEGACY_HOLD = /^(kernel_update|[a-z_]*_worker_reload)$/
 const LEGACY_PROXY_HOLD = /(egress_down|proxy_probe_failed|\|proxy=)/
-const LEGACY_DROP = /^(quota_5h|quota_7d|account_quota_exhausted|rate_limited|quota_refresh_failed)/
+const LEGACY_DROP = /^(quota_\d+[mhd]|account_quota_exhausted|rate_limited|quota_refresh_failed)/
 const LEGACY_START_FAILED = /runtime start failed|start|boot|container|docker|kernel/i
 
 /**

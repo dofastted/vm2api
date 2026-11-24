@@ -94,26 +94,67 @@ export function OpenaiQuotaPanel({
   })
 
   const busy = queryQuota.isPending || resetQuota.isPending
+  const rawWindows = Array.isArray(vm.codex_usage?.windows)
+    ? vm.codex_usage.windows
+    : []
+  const hasCustomWindow = rawWindows.some(
+    (w) => w?.id && w.id !== '5h' && w.id !== '7d'
+  )
 
   return (
     <div className='grid gap-3'>
       <p className='m-0 text-xs text-muted-foreground'>Codex 额度 · 短时窗口</p>
-      <Meter
-        label='5 小时已用'
-        value={u5}
-        hint={quotaHint(vm.status_5h, cost5, vm.estimate_5h)}
-      />
-      <div className='text-[11px] text-muted-foreground'>
-        5h 重置 <ResetAt value={vm.reset_5h} now={now} />
-      </div>
-      <Meter
-        label='7 天已用'
-        value={u7}
-        hint={quotaHint(vm.status_7d, cost7, vm.estimate_7d)}
-      />
-      <div className='text-[11px] text-muted-foreground'>
-        7d 重置 <ResetAt value={vm.reset_7d} now={now} />
-      </div>
+      {hasCustomWindow ? (
+        rawWindows.map((w) => {
+          const id = String(w.id || w.label || 'window')
+          const value =
+            w.used_percent != null && Number.isFinite(Number(w.used_percent))
+              ? Math.max(0, Math.min(100, Number(w.used_percent)))
+              : 0
+          const reset =
+            w.reset_at ??
+            (id === '5h' ? vm.reset_5h : id === '7d' ? vm.reset_7d : null)
+          const hint =
+            id === '5h'
+              ? quotaHint(vm.status_5h, cost5, vm.estimate_5h)
+              : id === '7d'
+                ? quotaHint(vm.status_7d, cost7, vm.estimate_7d)
+                : w.used_percent == null
+                  ? '未探测'
+                  : undefined
+          return (
+            <div key={id} className='grid gap-1.5'>
+              <Meter
+                label={codexWindowMeterLabel(id, w.window_minutes)}
+                value={value}
+                hint={hint}
+              />
+              <div className='text-[11px] text-muted-foreground'>
+                {w.label || id} 重置 <ResetAt value={reset} now={now} />
+              </div>
+            </div>
+          )
+        })
+      ) : (
+        <>
+          <Meter
+            label='5 小时已用'
+            value={u5}
+            hint={quotaHint(vm.status_5h, cost5, vm.estimate_5h)}
+          />
+          <div className='text-[11px] text-muted-foreground'>
+            5h 重置 <ResetAt value={vm.reset_5h} now={now} />
+          </div>
+          <Meter
+            label='7 天已用'
+            value={u7}
+            hint={quotaHint(vm.status_7d, cost7, vm.estimate_7d)}
+          />
+          <div className='text-[11px] text-muted-foreground'>
+            7d 重置 <ResetAt value={vm.reset_7d} now={now} />
+          </div>
+        </>
+      )}
 
       <div className='grid gap-1.5 rounded-md border bg-muted/20 px-3 py-2 text-xs'>
         <div className='flex flex-wrap items-baseline justify-between gap-2'>
@@ -190,6 +231,27 @@ export function OpenaiQuotaPanel({
       />
     </div>
   )
+}
+
+function codexWindowMeterLabel(
+  id: string,
+  windowMinutes?: number | null
+): string {
+  const m = id.match(/^(\d+)([mhd])$/)
+  if (m) {
+    const unit = m[2] === 'd' ? '天' : m[2] === 'h' ? '小时' : '分钟'
+    return `${m[1]} ${unit}已用`
+  }
+  if (windowMinutes != null && windowMinutes > 0) {
+    if (windowMinutes > 1440 && windowMinutes % 1440 === 0) {
+      return `${windowMinutes / 1440} 天已用`
+    }
+    if (windowMinutes % 60 === 0) {
+      return `${windowMinutes / 60} 小时已用`
+    }
+    return `${windowMinutes} 分钟已用`
+  }
+  return `${id} 已用`
 }
 
 function quotaHint(
