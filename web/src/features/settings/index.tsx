@@ -243,7 +243,7 @@ export function SettingsPage() {
           : tab === 'openai'
             ? 'GPT 传输、准入、配额与客户端画像。全局 WebSocket 只作用于推理，不影响终端或集群。'
             : tab === 'gemini-config'
-              ? 'Gemini 入口准入、CRAGGemini 单进程分片接管、并发调度、共享内存（AGYSHM02）与故障保护。宿主安装与升级在「Gemini 维护」页。'
+              ? 'Gemini 入口准入、CRAGGemini 单进程分片接管、并发调度、性能配置与故障保护。宿主安装与升级在「Gemini 维护」页。'
               : tab === 'logs'
               ? '设置请求日志的记录模式、保留时间和存储上限。逐条记录在日志页查看。'
               : undefined
