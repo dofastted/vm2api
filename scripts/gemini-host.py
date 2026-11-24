@@ -3126,8 +3126,9 @@ class Host:
                 run.close()
         if not models:
             raise Failure(502, "gemini_models_empty")
-        self.save_environment(env, {**env, "call_models": models, "updated_at": now()})
-        return self.view(env)
+        with self.lock:
+            self.save_environment(env, {**env, "call_models": models, "updated_at": now()})
+            return self.view(env)
 
     def _start_oauth_test_chat(self, env, proxy_url, auth, model, prompt):
         identifier = env["id"]
@@ -3804,13 +3805,14 @@ class Host:
             account = self.probe_imported_account(env["slot"], proxy_url, credential)
         else:
             has_refresh, is_expired = self._profile_token_state(env)
-            can_run_agy = (
-                self.egress is not None
-                and self.oauth_runtime_issue() is None
-                and not self.running(env["id"])
-                and env["id"] not in self.terminals
-                and env["id"] not in self.pending
-            )
+            with self.lock:
+                can_run_agy = (
+                    self.egress is not None
+                    and self.oauth_runtime_issue() is None
+                    and not self.running(env["id"])
+                    and env["id"] not in self.terminals
+                    and env["id"] not in self.pending
+                )
             agy_refreshed = False
             agy_non_auth_error = False
             if has_refresh and is_expired and can_run_agy:
@@ -3867,44 +3869,50 @@ class Host:
                     RuntimeError,
                 ):
                     pass
-        prev_eligibility = (env.get("account") or {}).get("eligibility")
-        if account.get("state") in ("error", "reauth_required") and env.get("account"):
-            previous = env["account"]
-            if previous.get("state") in ("ok", "partial") and not previous.get(
-                "data_at"
-            ):
-                previous["data_at"] = previous.get("checked_at")
-            previous.update(state=account["state"], checked_at=account["checked_at"])
-        else:
-            env["account"] = account
-        if account.get("state") == "reauth_required":
-            self.stop_run(env["id"])
-            self.stop_native_session(env["id"])
-            self._clear_runtime_proxy(env["id"])
-            env.pop("call_models", None)
-            self.stop_terminal(env["id"])
-            env["auth_state"] = "reauth_required"
-        elif account.get("state") in ("ok", "partial"):
-            env["auth_state"] = "authorized"
-        self.touch_environment(env)
-        self.save()
-        new_eligibility = (env.get("account") or {}).get("eligibility")
-        existing_session = self.native_sessions.get(env["id"])
-        session_poisoned = (
-            existing_session is not None
-            and session_diagnostic(existing_session) is not None
-        )
-        if (
-            (prev_eligibility != new_eligibility or session_poisoned)
-            and not self.running(env["id"])
-        ):
-            self.stop_native_session(env["id"])
+        # The probes above may run without host.lock (the background re-auth
+        # check keeps network I/O and agy outside it, #1674). Every shared-state
+        # change below needs the lock; RLock keeps locked callers unaffected.
+        with self.lock:
+            if self.environments.get(env["id"]) is not env:
+                return self.view(env)
+            prev_eligibility = (env.get("account") or {}).get("eligibility")
+            if account.get("state") in ("error", "reauth_required") and env.get("account"):
+                previous = env["account"]
+                if previous.get("state") in ("ok", "partial") and not previous.get(
+                    "data_at"
+                ):
+                    previous["data_at"] = previous.get("checked_at")
+                previous.update(state=account["state"], checked_at=account["checked_at"])
+            else:
+                env["account"] = account
+            if account.get("state") == "reauth_required":
+                self.stop_run(env["id"])
+                self.stop_native_session(env["id"])
+                self._clear_runtime_proxy(env["id"])
+                env.pop("call_models", None)
+                self.stop_terminal(env["id"])
+                env["auth_state"] = "reauth_required"
+            elif account.get("state") in ("ok", "partial"):
+                env["auth_state"] = "authorized"
+            self.touch_environment(env)
+            self.save()
+            new_eligibility = (env.get("account") or {}).get("eligibility")
+            existing_session = self.native_sessions.get(env["id"])
+            session_poisoned = (
+                existing_session is not None
+                and session_diagnostic(existing_session) is not None
+            )
             if (
-                new_eligibility not in BLOCKING_ACCOUNT_ELIGIBILITIES
-                and env.get("auth_state") == "authorized"
+                (prev_eligibility != new_eligibility or session_poisoned)
+                and not self.running(env["id"])
             ):
-                self._schedule_warm_locked(env["id"], force=True)
-        return self.view(env)
+                self.stop_native_session(env["id"])
+                if (
+                    new_eligibility not in BLOCKING_ACCOUNT_ELIGIBILITIES
+                    and env.get("auth_state") == "authorized"
+                ):
+                    self._schedule_warm_locked(env["id"], force=True)
+            return self.view(env)
 
     def request(self, operation, body):
         with self.lock:

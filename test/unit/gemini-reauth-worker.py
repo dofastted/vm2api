@@ -95,7 +95,7 @@ def make_host():
 
 
 def test_lock_not_held_during_refresh_account():
-    """host.lock must be released before refresh_account runs so slow I/O cannot stall other callers."""
+    """The worker does not hold host.lock across refresh_account, so slow I/O cannot stall other callers."""
     with make_host() as host:
         entered = threading.Event()
         release_refresh = threading.Event()
@@ -126,8 +126,6 @@ def test_lock_not_held_during_refresh_account():
             assert len(spawned) == 1
             assert entered.wait(timeout=3.0), "re-auth worker did not enter refresh_account"
 
-            # From a different thread (the test thread), RLock.acquire(blocking=False) succeeds
-            # if and only if the worker thread is NOT holding host.lock during refresh_account.
             acquired = host.lock.acquire(blocking=False)
             assert acquired is True, "re-auth worker held host.lock across refresh_account"
             try:
@@ -143,6 +141,67 @@ def test_lock_not_held_during_refresh_account():
         assert calls == [(host.environments[ENV_ID], PROXY, False)]
         assert ENV_ID not in host._reauth_checking
         assert host._reauth_check_next_at[ENV_ID] > time.monotonic()
+
+
+def test_refresh_account_probes_without_lock_and_applies_under_lock():
+    """Network I/O runs lock-free; every state change and the save happen under host.lock."""
+    with make_host() as host:
+        env = host.environments[ENV_ID]
+        probing = threading.Event()
+        release_probe = threading.Event()
+        saved_under_lock = []
+        real_save = host.save
+
+        def slow_read_account(uid, proxy_url, mode, **kwargs):
+            assert not host.lock._is_owned(), "read_account ran under host.lock"
+            probing.set()
+            assert release_probe.wait(timeout=5.0)
+            return {"state": "ok", "checked_at": "2030-01-02T00:00:00+00:00"}
+
+        def checked_save():
+            saved_under_lock.append(host.lock._is_owned())
+            real_save()
+
+        worker = threading.Thread(target=host.refresh_account, args=(env, PROXY), kwargs={"auto_pull_models": False})
+        with (
+            patch.object(impl, "read_account", side_effect=slow_read_account),
+            patch.object(host, "_profile_token_state", return_value=(False, False)),
+            patch.object(host, "save", side_effect=checked_save),
+        ):
+            worker.start()
+            assert probing.wait(timeout=3.0)
+            acquired = host.lock.acquire(blocking=False)
+            assert acquired is True, "host.lock was held during the network probe"
+            host.lock.release()
+            release_probe.set()
+            worker.join(timeout=3.0)
+            assert not worker.is_alive()
+
+        assert saved_under_lock == [True]
+        assert env["account"]["checked_at"] == "2030-01-02T00:00:00+00:00"
+        assert env["auth_state"] == "authorized"
+
+
+def test_refresh_account_skips_apply_when_environment_was_removed_during_probe():
+    """An environment deleted while its probe ran is not written back or saved."""
+    with make_host() as host:
+        env = host.environments[ENV_ID]
+
+        def read_then_delete(uid, proxy_url, mode, **kwargs):
+            with host.lock:
+                del host.environments[ENV_ID]
+            return {"state": "reauth_required", "checked_at": "2030-01-02T00:00:00+00:00"}
+
+        with (
+            patch.object(impl, "read_account", side_effect=read_then_delete),
+            patch.object(host, "_profile_token_state", return_value=(False, False)),
+            patch.object(host, "save") as save,
+        ):
+            host.refresh_account(env, PROXY, auto_pull_models=False)
+
+        save.assert_not_called()
+        assert env["auth_state"] == "authorized"
+        assert ENV_ID not in host.environments
 
 
 def test_exception_logged_checking_cleaned_and_base_exceptions_propagate():
