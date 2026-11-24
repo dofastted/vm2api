@@ -51,6 +51,7 @@ import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { pickScheduleFields } from '../pool/schedule-state.mjs'
 import { socksProxyFamily, normalizeSocksHost } from '../vm/socks-address.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
+import { mergeBatchGroupConfig } from '../pool/batch-group.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy, vmQuotaOverrideOf, vmQuotaView } from '../pool/vm-quota-override.mjs'
 import { GATE_OPEN, gatePolicyFields, gateZone, quotaGateOf } from '../pool/quota-gate.mjs'
 import { guardUsageTier, inferClaudeTier } from '../pool/claude-tier.mjs'
@@ -1576,6 +1577,7 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     tiers,
     logging: routingConfig?.logging || {},
     pool: normalizePoolRouting(routingConfig?.pool),
+    batch_group: mergeBatchGroupConfig(routingConfig?.batch_group),
     failover: routingConfig?.failover || {},
     compatibility: presentCompatibility(routingConfig?.compatibility),
     inference: presentInference(routingConfig?.inference),

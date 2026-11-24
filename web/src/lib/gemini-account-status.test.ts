@@ -221,6 +221,9 @@ describe('Gemini account presentation', () => {
     expect(geminiInferenceErrorLabel('gemini_native_worker_unavailable')).toBe(
       '宿主运行环境故障'
     )
+    expect(geminiInferenceErrorLabel('gemini_authorization_unavailable')).toBe(
+      '宿主运行环境故障'
+    )
     expect(geminiInferenceErrorLabel('gemini_inference_failed')).toBe(
       '未知原因'
     )
@@ -290,9 +293,9 @@ describe('Gemini account presentation', () => {
     expect(
       geminiInferenceErrorAction('gemini_account_verification_required')
     ).toContain('验证链接')
-    expect(
-      geminiInferenceErrorAction('gemini_location_unsupported')
-    ).toContain('代理')
+    expect(geminiInferenceErrorAction('gemini_location_unsupported')).toContain(
+      '代理'
+    )
     expect(geminiInferenceErrorAction('gemini_quota_exhausted')).toContain(
       '配额'
     )
@@ -306,6 +309,15 @@ describe('Gemini account presentation', () => {
     expect(
       geminiInferenceErrorAction('gemini_native_worker_unavailable')
     ).toContain('Gemini 维护')
+    expect(
+      geminiInferenceErrorAction('gemini_authorization_unavailable')
+    ).toContain('授权进程')
+    expect(geminiInferenceErrorAction('license_unconfigured')).toContain(
+      '订阅 CRAG'
+    )
+    expect(geminiInferenceErrorAction('license_unconfigured')).not.toContain(
+      '设置 → CRAG 订阅'
+    )
     expect(geminiInferenceErrorAction('unknown_raw_code')).toBeNull()
 
     const validUrl =

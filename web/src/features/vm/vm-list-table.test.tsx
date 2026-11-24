@@ -94,8 +94,10 @@ describe('VM row interaction and health', () => {
   it('shows family limits and the waiting children on a Claude root seat', () => {
     const vm: Vm = {
       id: 'vm-01',
+      session_slots: 6,
       seats_max: 2,
       max_primary_sessions: 2,
+      max_primary_sessions_override: true,
       max_subagents_per_session: 0,
       max_subagents_per_session_override: true,
       seat_sessions: [
@@ -113,6 +115,7 @@ describe('VM row interaction and health', () => {
     const block = renderToStaticMarkup(<VmSchedulingBlock vm={vm} />)
     expect(block).toContain('主会话上限')
     expect(block).toContain('子代理 0/0 · 排队 2')
+    expect(block).toContain('本槽钉住；全局 关闭')
     expect(
       renderToStaticMarkup(<VmSchedulingBlock vm={{ id: 'legacy' }} />)
     ).toContain('关闭(子代理各占一个席位)')
@@ -121,6 +124,8 @@ describe('VM row interaction and health', () => {
         <VmSchedulingEditor vm={vm} />
       </QueryClientProvider>
     )
+    expect(editor).toContain('默认控制同时占用的客户端会话席位数')
+    expect(editor).toContain('跟随 · 6')
     expect(editor).toMatch(/<select[^>]*aria-label="每会话子代理上限"/)
     expect(editor).toContain('<option value="20">20</option>')
   })

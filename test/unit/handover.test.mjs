@@ -325,3 +325,17 @@ test('standby pre-dials node links and activation adopts them instead of diallin
   await manager.stop()
   fs.rmSync(dir, { recursive: true, force: true })
 })
+
+test('every leader background setInterval in server.mjs stops on handover instead of waiting for server close', () => {
+  const src = fs.readFileSync(new URL('../../src/server.mjs', import.meta.url), 'utf8')
+  const start = src.indexOf("runAtActivation('background'")
+  const end = src.indexOf('const addr = server.address()', start)
+  assert.ok(start > 0 && end > start, 'background activation block must exist in src/server.mjs')
+  const block = src.slice(start, end)
+  assert.equal(
+    block.includes("server.once('close'"),
+    false,
+    'background intervals must register with onLeaderStop so SIGUSR1 handover stops them while draining',
+  )
+  assert.ok(block.includes('const timer = setInterval(warmGemini, 30_000)'))
+})
