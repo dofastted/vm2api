@@ -31,14 +31,20 @@ const CRAG_PROVIDER_NAMES = new Set([
   'text_editor_code_execution',
 ])
 
-function invalid(param, reason) {
+function invalid(param, reason, code = 'invalid_kernel_request', details = null) {
   const message = `${param}: ${reason}`
   const error = new Error(message)
   error.status = 400
-  error.code = 'invalid_kernel_request'
+  error.code = code
   error.body = {
     type: 'error',
-    error: { type: 'invalid_request_error', code: error.code, message, param, details: { retryable: false } },
+    error: {
+      type: 'invalid_request_error',
+      code,
+      message,
+      param,
+      details: { retryable: false, ...(details || {}) },
+    },
   }
   throw error
 }
@@ -173,6 +179,19 @@ function canonicalRequest(body, { reuseCanonicalHistory = false, preserveConsecu
 
 /** Structured native_messages: the CLI owns system layout and cache policy. */
 export function prepareCliNodeRequest(body, { requestContext = null } = {}) {
+  if (body?.service_tier != null) {
+    if (body.service_tier !== 'auto' && body.service_tier !== 'standard_only') {
+      invalid('service_tier', 'must be "auto" or "standard_only"')
+    }
+    if (body.service_tier === 'standard_only') {
+      invalid(
+        'service_tier',
+        'service_tier="standard_only" is not supported on the Claude VM / cli-node execution path; omit service_tier or use "auto" if default capacity is acceptable',
+        'unsupported_capability',
+        { field: 'service_tier', value: body.service_tier, execution_path: 'claude_vm' },
+      )
+    }
+  }
   const out = canonicalRequest(body, {
     preserveConsecutiveUser: requestContext?.purpose === 'auto_mode_classifier',
   })
@@ -183,6 +202,7 @@ export function prepareCliNodeRequest(body, { requestContext = null } = {}) {
   delete out.cacheTtl
   delete out.session_slots
   delete out.effort
+  if (out.service_tier === 'auto') delete out.service_tier
   return out
 }
 

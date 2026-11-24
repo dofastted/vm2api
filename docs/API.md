@@ -121,6 +121,14 @@ curl -sS http://127.0.0.1:8787/v1/messages \
 
 native cli-hop 开启官方家族透传时，调用方 `cache_control` 的位置、显式 TTL 与缺失 TTL 保留。超过四个 breakpoint、thinking 上打点、非法 TTL，或 `5m`（含缺失 TTL）之后出现 `1h`，返回 `400 invalid_cache_control`，不静默裁剪或降级、不执行上游。非透传仍按协议重写规则生成自产点；kernel 不再替前置层修复 TTL 顺序。
 
+### Claude VM / CRAG 的 `service_tier` 能力边界
+
+Claude VM（`cli-node`）与当前 CRAG 内核默认无法保证 Anthropic Messages 的 `service_tier: "standard_only"` 标准容量约束：
+
+- 传入 `service_tier: "standard_only"` 时，若所选 CRAG 内核未声明 `request_service_tier` 能力（以及所有 `cli-node` 路径），网关在预检阶段直接返回 `400 unsupported_capability`（`error.param = "service_tier"`，`error.details.execution_path` 标明 `crag` 或 `claude_vm`，`retryable: false`，零上游执行），**不会静默移除或改写为 `auto`**。
+- 若未来 CRAG 运行时在健康能力里声明了 `request_service_tier`，网关会原样透传 `service_tier`。
+- 仅当调用方接受默认容量时，请省略 `service_tier` 或显式传 `"auto"`。
+
 ### Sonnet 5.5 兼容边界
 
 `claude-sonnet-5-5` 不支持原生强制工具调用，请求**直接拒绝，不做自动改写**：`tool_choice` 为 `any` 或 `tool` 时返回 `400 tool_choice_incompatible`。同一规则适用于其他只支持 adaptive thinking 的模型——`claude-opus-5-5`、`claude-fable-5`、`claude-fable-5-1`、`claude-fable-5-2`，以及路由别名 `auto`。校验在模型与 persona 重写之前执行，且与 `thinking` 无关：**没有传 `thinking` 同样会被拒，移除它不能绕过**。

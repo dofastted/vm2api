@@ -1368,7 +1368,7 @@ function googleOutput(turn) {
   return {
     candidates: [{ content: { role: 'model', parts: [{ text: turn.text }] }, finishReason: 'STOP', index: 0 }],
     usageMetadata: googleUsage(turn.usage),
-    modelVersion: turn.model,
+    modelVersion: turn.response_model || turn.model,
   }
 }
 
@@ -1751,7 +1751,7 @@ export function createGeminiPublicHandler({
             : 0
       logBag.model = turn?.model || targetModel
       logBag.requested_model = targetModel
-      logBag.upstream_model = turn?.upstream_model || turn?.model || targetModel
+      logBag.upstream_model = turn?.response_model || turn?.upstream_model || turn?.model || targetModel
       logBag.account_id = turn?.account_id || null
       logBag.final_account_id = turn?.account_id || null
       logBag.vm_id = turn?.account_id ? `gemini:${turn.account_id}` : null
@@ -1765,7 +1765,7 @@ export function createGeminiPublicHandler({
         parsed,
         outboundBody: lastOutboundBody,
         model: targetModel,
-        upstreamModel: turn?.upstream_model || turn?.model || targetModel,
+        upstreamModel: turn?.dispatched_model || turn?.upstream_model || turn?.model || targetModel,
       })
       logBag.usage = {
         input_tokens: usage.input_tokens || 0,
@@ -2021,7 +2021,7 @@ export function createGeminiPublicHandler({
       return respondJson(
         200,
         renderGeminiProtocolResponse(protocol, turn, {
-          model: turn.model || parsed.model,
+          model: turn.response_model || turn.model || parsed.model,
           sessionId: session?.[1],
           accountId: turn.account_id,
           restoreContext: parsed.restoreContext,

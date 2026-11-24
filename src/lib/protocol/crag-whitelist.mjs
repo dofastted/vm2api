@@ -42,6 +42,7 @@ export const CRAG_CAPABILITY_GATED_TOP_KEYS = Object.freeze(
     ['safeguards', 'request_safeguards'],
     ['speed', 'request_speed'],
     ['thread', 'message_threads_beta'],
+    ['service_tier', 'request_service_tier'],
   ]),
 )
 
@@ -55,7 +56,6 @@ export const CRAG_SILENT_STRIP_TOP_KEYS = Object.freeze(
     'betas',
     'diagnostics',
     'auto_compact_window',
-    'service_tier',
     'fallbacks',
     'fallback_credit_token',
     'caller_cwd',
@@ -134,14 +134,20 @@ function isPlainObject(value) {
   return value != null && typeof value === 'object' && !Array.isArray(value)
 }
 
-function invalid(param, reason, code = 'invalid_kernel_request') {
+function invalid(param, reason, code = 'invalid_kernel_request', details = null) {
   const message = `${param}: ${reason}`
   const error = new Error(message)
   error.status = 400
   error.code = code
   error.body = {
     type: 'error',
-    error: { type: 'invalid_request_error', code, message, param, details: { retryable: false } },
+    error: {
+      type: 'invalid_request_error',
+      code,
+      message,
+      param,
+      details: { retryable: false, ...(details || {}) },
+    },
   }
   throw error
 }
@@ -697,6 +703,24 @@ export function sanitizeCragBodyWhitelist(
       strippedFields.push('thread')
     } else {
       out.thread = materialized.thread
+    }
+  }
+
+  if (materialized.service_tier != null) {
+    if (materialized.service_tier !== 'auto' && materialized.service_tier !== 'standard_only') {
+      invalid('service_tier', 'must be "auto" or "standard_only"')
+    }
+    if (caps?.includes('request_service_tier')) {
+      out.service_tier = materialized.service_tier
+    } else if (materialized.service_tier === 'auto') {
+      strippedFields.push('service_tier')
+    } else {
+      invalid(
+        'service_tier',
+        'service_tier="standard_only" is not supported on the Claude VM / CRAG execution path; omit service_tier or use "auto" if default capacity is acceptable',
+        'unsupported_capability',
+        { field: 'service_tier', value: materialized.service_tier, execution_path: 'crag' },
+      )
     }
   }
 

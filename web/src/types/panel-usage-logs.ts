@@ -239,6 +239,8 @@ export type UsageLogFilters = {
   statusCode?: number
   /** (`exclude_status_200=1`) 只看非 2xx；与 statusCode 互斥，后者优先。 */
   excludeStatus200?: boolean
+  /** (`failed_only=1`) 所有失败请求，包含非 2xx 与外层 2xx 但流内终态失败（如 rejected/incomplete/failed）。 */
+  failedOnly?: boolean
   /** (`model_mismatch=1`) */
   modelMismatch?: boolean
   /** (`min_attempt_count`) 只看 `attempt_count >= n`，「有重试」= 2。 */

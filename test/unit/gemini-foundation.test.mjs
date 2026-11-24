@@ -1625,3 +1625,190 @@ test('CRAGGemini suspended MCP tool continuation remints conversation_id and cle
   assert.equal(t3Call.id, 'env-b', 'follow-up turn after tool failover must stay sticky on env-b')
   assert.equal(t3Call.convId, envBConvId, 'follow-up turn on env-b must resume envBConvId')
 })
+
+test('Gemini mode=ANY rejects plain-text STOP without functionCall while keeping AUTO and valid ANY calls working (#1732)', async () => {
+  const hostPayloads = []
+  let nextChunks = []
+  let circuitFailures = 0
+  let circuitProbesReleased = 0
+
+  const scheduler = createGeminiScheduler({
+    callHost: async (op) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-any-1',
+              proxy_id: 'px-1',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-4-hydrogen-high'],
+              capabilities: [...FULL_GEMINI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') return { id: 'env-any-1', proxy_id: 'px-1', auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async (_op, payload) => {
+      hostPayloads.push(payload)
+      return sseResponse(nextChunks)
+    },
+    resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    poolScheduler: {
+      inflight: new Map(),
+      reserveExternalCandidates: (list) => ({ selected: list[0], reservation: { release() {} } }),
+      unitCircuit: {
+        recordSuccess() {},
+        recordFailure() {
+          circuitFailures += 1
+        },
+        releaseProbe() {
+          circuitProbesReleased += 1
+        },
+      },
+      lastUsed: new Map(),
+    },
+  })
+
+  const logs = []
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async (r) => r.body || {},
+    scheduler,
+    requestLog: {
+      start: () => ({ request_id: `req-${logs.length + 1}` }),
+      finish: (_ctx, extra) => logs.push(extra),
+    },
+  })
+
+  const tools = [
+    {
+      functionDeclarations: [
+        {
+          name: 'reply',
+          parameters: {
+            type: 'OBJECT',
+            properties: { content: { type: 'STRING' } },
+            required: ['content'],
+          },
+        },
+        {
+          name: 'tool_search',
+          parameters: { type: 'OBJECT', properties: { q: { type: 'STRING' } } },
+        },
+      ],
+    },
+  ]
+
+  const callRoute = async (url, body) => {
+    const req = makeReq({ url, body, groupType: 'gemini' })
+    const res = makeRes()
+    await handler(req, res)
+    return res
+  }
+
+  // 1. Streaming ANY (with allowedFunctionNames) + plain-text STOP -> SSE error frame, NO normal STOP.
+  nextChunks = [
+    `data: ${JSON.stringify({
+      candidates: [{ content: { role: 'model', parts: [{ text: 'plain text only' }] }, finishReason: 'STOP' }],
+    })}\n\n`,
+  ]
+  const r1 = await callRoute('/v1beta/models/gemini-4-hydrogen-high:streamGenerateContent?alt=sse', {
+    contents: [{ role: 'user', parts: [{ text: 'Call reply.' }] }],
+    tools: [{ functionDeclarations: [tools[0].functionDeclarations[0]] }],
+    toolConfig: { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['reply'] } },
+  })
+  assert.equal(hostPayloads[0].body.toolConfig.functionCallingConfig.mode, 'ANY')
+  assert.deepEqual(hostPayloads[0].body.toolConfig.functionCallingConfig.allowedFunctionNames, ['reply'])
+  assert.doesNotMatch(r1.bodyText(), /"finishReason"\s*:\s*"STOP"/)
+  assert.match(r1.bodyText(), /gemini_tool_call_required/)
+  assert.equal(logs.at(-1).error_code, 'gemini_tool_call_required')
+  assert.equal(logs.at(-1).final_state, 'failed')
+
+  // 2. Streaming ANY (without allowedFunctionNames) + plain-text STOP -> SSE error frame, NO normal STOP.
+  const r2 = await callRoute('/v1beta/models/gemini-4-hydrogen-high:streamGenerateContent?alt=sse', {
+    contents: [{ role: 'user', parts: [{ text: 'Call any tool.' }] }],
+    tools,
+    toolConfig: { functionCallingConfig: { mode: 'ANY' } },
+  })
+  assert.equal(hostPayloads[1].body.toolConfig.functionCallingConfig.mode, 'ANY')
+  assert.doesNotMatch(r2.bodyText(), /"finishReason"\s*:\s*"STOP"/)
+  assert.match(r2.bodyText(), /gemini_tool_call_required/)
+
+  // 3. Non-streaming generateContent ANY + plain-text STOP -> HTTP 502 error.
+  const r3 = await callRoute('/v1beta/models/gemini-4-hydrogen-high:generateContent', {
+    contents: [{ role: 'user', parts: [{ text: 'Call reply.' }] }],
+    tools: [{ functionDeclarations: [tools[0].functionDeclarations[0]] }],
+    toolConfig: { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['reply'] } },
+  })
+  assert.equal(r3.statusCode, 502)
+  assert.equal(r3.jsonBody().error.details[0].reason, 'gemini_tool_call_required')
+  assert.equal(logs.at(-1).final_state, 'failed')
+
+  // 4. ANY + disallowed functionCall filtered out by restoreTransform -> 0 allowed tool calls -> error.
+  nextChunks = [
+    `data: ${JSON.stringify({
+      candidates: [
+        {
+          content: { role: 'model', parts: [{ functionCall: { name: 'tool_search', args: { q: 'x' } } }] },
+          finishReason: 'STOP',
+        },
+      ],
+    })}\n\n`,
+  ]
+  const r4 = await callRoute('/v1beta/models/gemini-4-hydrogen-high:generateContent', {
+    contents: [{ role: 'user', parts: [{ text: 'Call reply only.' }] }],
+    tools,
+    toolConfig: { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['reply'] } },
+  })
+  assert.equal(r4.statusCode, 502)
+  assert.equal(r4.jsonBody().error.details[0].reason, 'gemini_tool_call_required')
+
+  // Contract violations must NOT trip the account's infrastructure circuit breaker.
+  assert.equal(circuitFailures, 0)
+  assert.equal(circuitProbesReleased, 4)
+
+  // 5. Positive control: ANY + valid functionCall -> HTTP 200 with functionCall preserved.
+  nextChunks = [
+    `data: ${JSON.stringify({
+      candidates: [
+        {
+          content: {
+            role: 'model',
+            parts: [{ functionCall: { name: 'reply', args: { content: 'probe' } } }],
+          },
+          finishReason: 'STOP',
+        },
+      ],
+    })}\n\n`,
+  ]
+  const r5 = await callRoute('/v1beta/models/gemini-4-hydrogen-high:streamGenerateContent?alt=sse', {
+    contents: [{ role: 'user', parts: [{ text: 'Call reply.' }] }],
+    tools: [{ functionDeclarations: [tools[0].functionDeclarations[0]] }],
+    toolConfig: { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['reply'] } },
+  })
+  assert.equal(r5.statusCode, 200)
+  assert.match(r5.bodyText(), /"functionCall"/)
+  assert.match(r5.bodyText(), /"finishReason":"STOP"/)
+  assert.equal(logs.at(-1).final_state, 'verified')
+
+  // 6. Positive control: AUTO + plain-text STOP -> HTTP 200 normal STOP preserved.
+  nextChunks = [
+    `data: ${JSON.stringify({
+      candidates: [{ content: { role: 'model', parts: [{ text: 'plain text ok' }] }, finishReason: 'STOP' }],
+    })}\n\n`,
+  ]
+  const r6 = await callRoute('/v1beta/models/gemini-4-hydrogen-high:streamGenerateContent?alt=sse', {
+    contents: [{ role: 'user', parts: [{ text: 'Just say hi.' }] }],
+    tools,
+    toolConfig: { functionCallingConfig: { mode: 'AUTO' } },
+  })
+  assert.equal(r6.statusCode, 200)
+  assert.match(r6.bodyText(), /plain text ok/)
+  assert.match(r6.bodyText(), /"finishReason":"STOP"/)
+  assert.equal(logs.at(-1).final_state, 'verified')
+})

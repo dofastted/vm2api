@@ -44,6 +44,7 @@ export function UsageLogsFilters({
     (draft.protocol ? 1 : 0)
   const statusCount =
     (draft.statusCode != null || draft.excludeStatus200 ? 1 : 0) +
+    (draft.failedOnly ? 1 : 0) +
     ((draft.minRetry ?? 0) > 0 ? 1 : 0) +
     (draft.errorClass ? 1 : 0)
 

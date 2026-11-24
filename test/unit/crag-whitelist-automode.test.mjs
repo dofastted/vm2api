@@ -587,3 +587,71 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
   assert.equal(withoutSg.sent.body.safeguards, undefined)
   assert.equal(withoutSg.log.crag_print.safeguards_stripped, true)
 })
+
+test('Claude VM / CRAG fails closed with 400 unsupported_capability on service_tier=standard_only instead of silently stripping (#1520)', async () => {
+  const { prepareCliNodeRequest } = await import('../../src/lib/protocol/kernel-request.mjs')
+  const { mapUpstreamError } = await import('../../src/lib/core/errors.mjs')
+  const { classifyUpstreamResult } = await import('../../src/lib/pool/upstream-error-policy.mjs')
+
+  const base = {
+    model: 'claude-haiku-5-5',
+    max_tokens: 64,
+    stream: false,
+    messages: [{ role: 'user', content: 'hello' }],
+    service_tier: 'standard_only',
+  }
+
+  // 1. CRAG without request_service_tier capability rejects standard_only instead of stripping.
+  let cragErr = null
+  try {
+    prepareCragRequest(base, { capabilities: V3_CAPS })
+  } catch (err) {
+    cragErr = err
+  }
+  assert.ok(cragErr, 'CRAG must reject service_tier=standard_only when capability is absent')
+  assert.equal(cragErr.status, 400)
+  assert.equal(cragErr.code, 'unsupported_capability')
+  assert.equal(cragErr.body.error.code, 'unsupported_capability')
+  assert.equal(cragErr.body.error.param, 'service_tier')
+  assert.equal(cragErr.body.error.details.execution_path, 'crag')
+  assert.equal(cragErr.body.error.details.retryable, false)
+
+  // 2. mapUpstreamError and upstream-error-policy preserve 400 unsupported_capability + param/details and stop without cooldown.
+  const mapped = mapUpstreamError(400, cragErr.body)
+  assert.equal(mapped.status, 400)
+  assert.equal(mapped.body.error.code, 'unsupported_capability')
+  assert.equal(mapped.body.error.param, 'service_tier')
+  assert.equal(mapped.body.error.details.execution_path, 'crag')
+  const policy = classifyUpstreamResult({ status: 400, body: cragErr.body })
+  assert.equal(policy.scope, 'request')
+  assert.equal(policy.action, 'stop')
+  assert.equal(policy.reason, 'unsupported_capability')
+  assert.equal(policy.cooldownUntil, null)
+
+  // 3. CRAG with explicit request_service_tier capability forwards standard_only intact.
+  const forwarded = prepareCragRequest(base, { capabilities: [...V3_CAPS, 'request_service_tier'] })
+  assert.equal(forwarded.service_tier, 'standard_only')
+
+  // 4. Default service_tier=auto strips cleanly on CRAG and cli-node.
+  const autoCrag = prepareCragRequest({ ...base, service_tier: 'auto' }, { capabilities: V3_CAPS })
+  assert.equal('service_tier' in autoCrag, false)
+  const autoCli = prepareCliNodeRequest({ ...base, service_tier: 'auto' })
+  assert.equal('service_tier' in autoCli, false)
+
+  // 5. Claude VM (cli-node) also rejects standard_only explicitly and rejects invalid values.
+  let cliErr = null
+  try {
+    prepareCliNodeRequest(base)
+  } catch (err) {
+    cliErr = err
+  }
+  assert.ok(cliErr)
+  assert.equal(cliErr.status, 400)
+  assert.equal(cliErr.code, 'unsupported_capability')
+  assert.equal(cliErr.body.error.details.execution_path, 'claude_vm')
+
+  assert.throws(
+    () => prepareCragRequest({ ...base, service_tier: 'priority' }, { capabilities: V3_CAPS }),
+    (err) => err.status === 400 && err.code === 'invalid_kernel_request',
+  )
+})

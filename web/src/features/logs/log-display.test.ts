@@ -353,3 +353,21 @@ describe('scheduler versus capacity queue timings', () => {
     ])
   })
 })
+
+describe('failedOnly filter search & query serialization (#1213)', () => {
+  it('round-trips failedOnly through URL search and serializes failed_only=1', () => {
+    const search = validateLogsSearch({ failedOnly: '1', statusCode: '200' })
+    expect(search.failedOnly).toBe(true)
+    expect(search.statusCode).toBe(200)
+    const filters = searchToFilters(search)
+    expect(filters.failedOnly).toBe(true)
+    expect(filtersToSearch(filters)).toEqual({
+      failedOnly: true,
+      statusCode: 200,
+    })
+    expect(activeFilterCount(filters)).toBe(2)
+    const qs = usageLogFiltersQuery(filtersToApi(filters, []))
+    expect(qs.get('failed_only')).toBe('1')
+    expect(qs.get('status_code')).toBe('200')
+  })
+})

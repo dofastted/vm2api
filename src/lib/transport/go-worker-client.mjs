@@ -1072,7 +1072,8 @@ async function callGoWorkerRaw({
   } catch (error) {
     const blocked = redactionResult(error)
     if (blocked) return { ...blocked, ...nativeMetadata() }
-    if (error.code === 'invalid_kernel_request') return { ...invalidKernelResult(error), ...nativeMetadata() }
+    if (error.code === 'invalid_kernel_request' || error.code === 'unsupported_capability')
+      return { ...invalidKernelResult(error), ...nativeMetadata() }
     if (hopSignal.signal?.aborted) return clientCancelledResult({ via: 'go-worker', ...nativeMetadata() })
     if (error instanceof InferencePostDenied) return error.result
     return {
@@ -1671,7 +1672,7 @@ async function streamGoWorkerRaw({
   } catch (error) {
     const blocked = redactionResult(error)
     if (blocked) return { ...blocked, ...timing.snapshot(), committed, ...nativeMetadata() }
-    if (error.code === 'invalid_kernel_request')
+    if (error.code === 'invalid_kernel_request' || error.code === 'unsupported_capability')
       return { ...invalidKernelResult(error), ...timing.snapshot(), committed, ...nativeMetadata() }
     if (hopSignal.signal?.aborted) {
       return clientCancelledResult({
