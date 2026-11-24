@@ -72,7 +72,14 @@ import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/re
 import { loggedReasoningEffort } from './thinking.mjs'
 import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
 import { ownerScopeFromRequest, pinnedVmIdFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
-import { applyVmPool, keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
+import {
+  applyVmPool,
+  keyAllowsVm,
+  keyScopeFromRequest,
+  keyTierPolicyFromRecord,
+  vmGroupType,
+  vmPoolDenial,
+} from '../admin/key-scope.mjs'
 import { keyModelError } from '../admin/key-models.mjs'
 import {
   resolveInferenceEngine,
@@ -207,7 +214,7 @@ import {
   recordThinkingOwners,
   thinkingOwners as defaultThinkingOwners,
 } from '../pool/thinking-owner.mjs'
-import { getVm } from '../vm/vm-registry.mjs'
+import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { credentialModeFromOauth, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import {
   prepareAnthropicRequest,
@@ -785,18 +792,59 @@ export function createHandleProtocol(deps) {
     logBag.inbound_device_id = sessionIdForLog(auditIdentity.deviceId)
     logBag.reasoning_effort = reasoningEffortOf(inbound)
 
+    const rawInboundBackend = resolveInferenceBackend(req)
+    const inboundKeyPolicy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(req.apiKeyRecord) : null
     if (
       req.apiKeyKind === 'managed' &&
       keyScopeFromRequest(req).group_type === 'all' &&
-      String(req.apiKeyRecord?.category || '')
-        .trim()
-        .toLowerCase() !== 'api' &&
+      rawInboundBackend !== 'api' &&
       isAntigravityRoutedModel(inbound?.model) &&
       (protocol === 'openai.chat' || protocol === 'openai.responses' || protocol === 'anthropic.messages') &&
       typeof (deps.handleGeminiPublic || deps.handleGeminiMessages) === 'function'
     ) {
-      req.body = inbound
-      return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, { logBag, logCtx })
+      let preferGeminiApiChannel = false
+      if (rawInboundBackend === 'all') {
+        const hasPinnedEndpoints =
+          Boolean(inboundKeyPolicy?.api_endpoint_id) || (inboundKeyPolicy?.allowed_endpoints?.length || 0) > 0
+        if (
+          inboundKeyPolicy?.permission_tier === 'resource' &&
+          inboundKeyPolicy.allowed_gemini_envs.length === 0 &&
+          hasPinnedEndpoints
+        ) {
+          preferGeminiApiChannel = true
+        } else if (apiScheduler?.pick) {
+          const gemScope = {
+            ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+            allowedEnvIds:
+              inboundKeyPolicy?.permission_tier === 'resource'
+                ? inboundKeyPolicy.allowed_gemini_envs
+                : inboundKeyPolicy?.allowed_gemini_envs?.length
+                  ? inboundKeyPolicy.allowed_gemini_envs
+                  : null,
+          }
+          let hasOwnedGeminiEnv = false
+          if (typeof deps.geminiScheduler?.catalog === 'function') {
+            try {
+              const cat = await deps.geminiScheduler.catalog(gemScope)
+              hasOwnedGeminiEnv = Array.isArray(cat?.accounts) && cat.accounts.length > 0
+            } catch {
+              hasOwnedGeminiEnv = false
+            }
+          }
+          if (!hasOwnedGeminiEnv) {
+            const probe = apiScheduler.pick(
+              inbound?.model,
+              Date.now(),
+              apiScheduleScope(req, 'all', apiKeyStore?.users),
+            )
+            if (probe?.ok) preferGeminiApiChannel = true
+          }
+        }
+      }
+      if (!preferGeminiApiChannel) {
+        req.body = inbound
+        return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, { logBag, logCtx })
+      }
     }
 
     const fp = fingerprintRequest(req, inbound)
@@ -943,18 +991,57 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, errorResult.status, errorResult.body)
     }
-    const inferenceBackend = resolveInferenceBackend(req)
-    if (inferenceBackend === 'api' && ownerScopeFromRequest(req, apiKeyStore?.users).type !== 'platform') {
-      stats.errors++
-      const errorResult = makeError({
-        type: ErrorType.PERMISSION,
-        code: ErrorCode.API_BACKEND_FORBIDDEN,
-        message: '租户密钥只能调用自己名下的槽位',
-        status: 403,
-      })
-      logBag.error_code = ErrorCode.API_BACKEND_FORBIDDEN
-      logBag.error_message = errorResult.body?.error?.message || null
-      return json(res, 403, errorResult.body)
+    const rawBackend = resolveInferenceBackend(req)
+    const reqOwnerScope = panelDiagnostics ? { type: 'any' } : ownerScopeFromRequest(req, apiKeyStore?.users)
+    let keyScope = keyScopeFromRequest(req)
+    if (inboundKeyPolicy) {
+      keyScope = { ...keyScope, permission_tier: inboundKeyPolicy.permission_tier }
+    }
+    let inferenceBackend = rawBackend === 'api' ? 'api' : 'oauth'
+    let apiScope = rawBackend === 'api' ? apiScheduleScope(req, keyScope.group_type, apiKeyStore?.users) : null
+    if (rawBackend === 'api') {
+      if (reqOwnerScope.type !== 'platform' && !apiScheduler?.hasOwnedEndpoints?.(reqOwnerScope, apiScope)) {
+        stats.errors++
+        const errorResult = makeError({
+          type: ErrorType.PERMISSION,
+          code: ErrorCode.API_BACKEND_FORBIDDEN,
+          message: '租户密钥只能调用自己名下的槽位或 API 渠道',
+          status: 403,
+        })
+        logBag.error_code = ErrorCode.API_BACKEND_FORBIDDEN
+        logBag.error_message = errorResult.body?.error?.message || null
+        return json(res, 403, errorResult.body)
+      }
+    } else if (rawBackend === 'all') {
+      const candidateApiScope = apiScheduleScope(req, keyScope.group_type, apiKeyStore?.users)
+      if (protocol === 'google.gemini') {
+        inferenceBackend = 'api'
+        apiScope = candidateApiScope
+      } else if (apiScheduler?.hasOwnedEndpoints?.(reqOwnerScope, candidateApiScope)) {
+        const detected = detectInboundPlatform(ctx.body?.model)
+        const targetPlatform = detected?.ok ? detected.platform : null
+        let hasOwnedVm = false
+        const vmDeniedByResourcePin =
+          keyScope.permission_tier === 'resource' && !keyScope.vm_pool_id && (keyScope.allowed_vms?.length || 0) === 0
+        if (!vmDeniedByResourcePin && keyScope.group_type !== 'gemini' && cfg.paths?.project) {
+          try {
+            hasOwnedVm = listVms(cfg.paths.project).some(
+              (vm) =>
+                !vm.disabled &&
+                vm.schedulable !== false &&
+                vmMatchesOwnerScope(vm, reqOwnerScope) &&
+                keyAllowsVm(keyScope, vm) &&
+                (!targetPlatform || vmGroupType(vm) === targetPlatform),
+            )
+          } catch {
+            hasOwnedVm = false
+          }
+        }
+        if (!hasOwnedVm) {
+          inferenceBackend = 'api'
+          apiScope = candidateApiScope
+        }
+      }
     }
     let want1m = hasClaudeCode1mSuffix(inbound?.model) || hasClaudeCode1mSuffix(ctx.body?.model)
     const modelRewrite =
@@ -982,8 +1069,6 @@ export function createHandleProtocol(deps) {
     // API endpoint protocols own routing; apply model overrides before choosing the channel.
     if (inferenceBackend === 'api') ctx = applyIntercept(cfg.intercept.rules, 'before_upstream', ctx)
     let apiInbound = inferenceBackend === 'api' ? ctx.body : null
-    let keyScope = keyScopeFromRequest(req)
-    const apiScope = inferenceBackend === 'api' ? apiScheduleScope(req, keyScope.group_type) : null
     let apiPicked = apiScope ? apiScheduler.pick(ctx.body?.model, Date.now(), apiScope) : null
     if (apiPicked && !apiPicked.ok) {
       stats.errors++
@@ -1211,10 +1296,19 @@ export function createHandleProtocol(deps) {
       if (inferenceBackend === 'api') {
         if (apiScope.endpointId && route.kind === 'endpoint' && route.target !== apiScope.endpointId)
           return unavailable()
+        if (
+          route.kind === 'endpoint' &&
+          Array.isArray(apiScope.allowedEndpointIds) &&
+          !apiScope.allowedEndpointIds.includes(route.target)
+        ) {
+          return unavailable()
+        }
         apiInbound = ctx.body
         apiPicked = apiScheduler.pick(ctx.body.model, Date.now(), {
           groupType: platform.platform,
           endpointId: route.kind === 'endpoint' ? route.target : apiScope.endpointId,
+          ownerScope: apiScope.ownerScope,
+          allowedEndpointIds: apiScope.allowedEndpointIds,
         })
         if (!apiPicked.ok) return unavailable()
         if (apiOpenAI && validateApiOpenAIRequest(protocol, apiInbound)) return unavailable()

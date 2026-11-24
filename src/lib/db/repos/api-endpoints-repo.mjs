@@ -13,6 +13,7 @@ const EP_COLS = [
   'protocol',
   'risk_review_enabled',
   'body_policy',
+  'owner_user_id',
   'created_at',
   'updated_at',
 ]
@@ -44,6 +45,7 @@ function rowEp(row) {
     protocol: row.protocol || 'anthropic',
     risk_review_enabled: !!row.risk_review_enabled,
     body_policy: row.body_policy === 'caller' ? 'caller' : 'persona',
+    owner_user_id: row.owner_user_id ? String(row.owner_user_id).trim() || null : null,
     created_at: row.created_at,
     updated_at: row.updated_at,
   }
@@ -140,6 +142,7 @@ export class ApiEndpointsRepo {
       protocol: rec.protocol || 'anthropic',
       risk_review_enabled: bool01(rec.risk_review_enabled),
       body_policy: rec.body_policy === 'caller' ? 'caller' : 'persona',
+      owner_user_id: rec.owner_user_id ? String(rec.owner_user_id).trim() || null : null,
       created_at: rec.created_at,
       updated_at: rec.updated_at,
     }

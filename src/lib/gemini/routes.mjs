@@ -4,6 +4,8 @@ import { isIP } from 'node:net'
 import path from 'node:path'
 import { filterModelCatalogForKey, keyModelError } from '../admin/key-models.mjs'
 import { summarizeBody } from '../admin/request-log.mjs'
+import { keyTierPolicyFromRecord } from '../admin/key-scope.mjs'
+import { PLATFORM_SCOPE, normalizeOwnerId, ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import {
   buildGeminiRequest,
   createGeminiProtocolStreamEncoder,
@@ -275,8 +277,8 @@ export function geminiKeyAllowsPath(pathname, method) {
   )
 }
 
-export function geminiProxyFor(proxyPool, proxyId) {
-  return proxyFor(proxyPool, proxyId)
+export function geminiProxyFor(proxyPool, proxyId, opts) {
+  return proxyFor(proxyPool, proxyId, opts)
 }
 
 function hostError(code, status = 503) {
@@ -532,7 +534,10 @@ function cragLicenseView(value) {
   }
 }
 
-function environmentView(value, { id, proxyId, proxyPool, withProxyReady = false, billingReady = false } = {}) {
+function environmentView(
+  value,
+  { id, proxyId, proxyPool, withProxyReady = false, billingReady = false, ownerUserId = null } = {},
+) {
   if (
     !validId(value?.id) ||
     !validId(value.proxy_id) ||
@@ -542,10 +547,11 @@ function environmentView(value, { id, proxyId, proxyPool, withProxyReady = false
   ) {
     throw hostError(PROTOCOL_ERROR)
   }
+  const normalizedOwner = normalizeOwnerId(ownerUserId)
   let proxyUrl
   if (proxyPool && (withProxyReady || value.last_inference != null)) {
     try {
-      proxyUrl = proxyFor(proxyPool(), value.proxy_id)
+      proxyUrl = proxyFor(proxyPool(), value.proxy_id, { ownerUserId: normalizedOwner })
     } catch (error) {
       if (error?.code !== 'gemini_proxy_unavailable') throw error
     }
@@ -559,6 +565,7 @@ function environmentView(value, { id, proxyId, proxyPool, withProxyReady = false
   return {
     id: value.id,
     proxy_id: value.proxy_id,
+    ...(normalizedOwner ? { owner_user_id: normalizedOwner } : {}),
     ...(withProxyReady && proxyPool && { proxy_ready: Boolean(proxyUrl) }),
     name: text(value.name, 80) || '',
     auth_state: value.auth_state,
@@ -617,13 +624,22 @@ function authorizationInput(body) {
   }
 }
 
-function proxyFor(proxyPool, proxyId, { allowUnhealthy = false } = {}) {
+function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, ownerUserId = null } = {}) {
   if (!validId(proxyId)) throw hostError('gemini_proxy_unavailable', 409)
-  const proxy = proxyPool?.snapshot({ ownerUserId: null }).proxies.find((entry) => entry.id === proxyId)
+  const targetOwner = normalizeOwnerId(ownerUserId)
+  const scopedList = proxyPool?.snapshot({ ownerUserId: targetOwner || null })?.proxies || []
+  let proxy = scopedList.find((entry) => entry.id === proxyId)
+  if (!proxy && targetOwner) {
+    // Tenant-owned Gemini environments may use either their own proxy or a platform proxy, never another tenant's proxy.
+    const platformList = proxyPool?.snapshot({ ownerUserId: null })?.proxies || []
+    proxy = platformList.find((entry) => entry.id === proxyId)
+  }
+  const pOwner = normalizeOwnerId(proxy?.owner_user_id)
+  const ownerAllowed = targetOwner ? !pOwner || pOwner === targetOwner : !pOwner
   if (
     !proxy?.enabled ||
     (!allowUnhealthy && (proxy.status === 'dead' || proxy.status === 'fail')) ||
-    proxy.owner_user_id ||
+    !ownerAllowed ||
     proxy.blocked_reason
   ) {
     throw hostError('gemini_proxy_unavailable', 409)
@@ -800,11 +816,19 @@ export function createGeminiPanelHandler({
   proxyPool,
   terminal,
   cragSubscription = null,
+  geminiOwnersRepo = null,
   callHost = callGeminiHost,
   billingReady = false,
 }) {
   const maintenance = createGeminiMaintenanceHandler({ json, readBody })
-  const toEnvView = (value, opts = {}) => environmentView(value, { proxyPool, billingReady, ...opts })
+  const envOwnerOf = (envId) => geminiOwnersRepo?.getOwner?.(envId) ?? null
+  const toEnvView = (value, opts = {}) =>
+    environmentView(value, {
+      proxyPool,
+      billingReady,
+      ownerUserId: Object.hasOwn(opts, 'ownerUserId') ? opts.ownerUserId : envOwnerOf(value?.id),
+      ...opts,
+    })
   return async function handleGeminiPanel(req, res, pathname) {
     const ok = (data) => json(res, 200, { ok: true, data })
     const fail = (status, code, message = code) => json(res, status, { ok: false, error: { code, message } })
@@ -862,6 +886,12 @@ export function createGeminiPanelHandler({
           }
         }
         const subscription = cragSubscription ? await cragSubscription.status().catch(() => null) : null
+        const reqUrl = new URL(req.url || PANEL_PATH, 'http://127.0.0.1')
+        const filterOwnerRaw = reqUrl.searchParams.get('owner_user_id')
+        const filterOwner = filterOwnerRaw != null && filterOwnerRaw !== '' ? normalizeOwnerId(filterOwnerRaw) : null
+        const visibleEnvs = filterOwner
+          ? view.environments.filter((env) => envOwnerOf(env.id) === filterOwner)
+          : view.environments
         return ok({
           available: true,
           payload_state: PAYLOAD_STATES.has(view.payload_state) ? view.payload_state : 'unknown',
@@ -870,7 +900,7 @@ export function createGeminiPanelHandler({
           release_activated: typeof view.release_activated === 'boolean' ? view.release_activated : null,
           oauth_runtime_issue: OAUTH_ISSUES.has(view.oauth_runtime_issue) ? view.oauth_runtime_issue : null,
           ...(subscription ? { crag_subscription: subscription } : {}),
-          environments: view.environments.map((value) => toEnvView(value, { withProxyReady: true })),
+          environments: visibleEnvs.map((value) => toEnvView(value, { withProxyReady: true })),
         })
       }
       // All Gemini panel routes pass through the existing admin-only panel ACL.
@@ -914,7 +944,8 @@ export function createGeminiPanelHandler({
         ) {
           return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
         }
-        const proxyUrl = proxyFor(proxyPool(), body.proxy_id)
+        const ownerUserId = normalizeOwnerId(body?.owner_user_id)
+        const proxyUrl = proxyFor(proxyPool(), body.proxy_id, { ownerUserId })
         let created = await callHost('create', {
           name,
           proxy_id: body.proxy_id,
@@ -925,6 +956,9 @@ export function createGeminiPanelHandler({
             oauth_account: { access_token: imported.access_token, expiry_timestamp: imported.expiry_timestamp },
           }),
         })
+        if (ownerUserId && geminiOwnersRepo?.setOwner) {
+          geminiOwnersRepo.setOwner(created.id, ownerUserId)
+        }
         if (method === 'oauth' && cragSubscription?.ensureEnvironmentSeat) {
           const seat = await cragSubscription
             .ensureEnvironmentSeat(created.id, { env: created })
@@ -933,7 +967,7 @@ export function createGeminiPanelHandler({
             created = await callHost('get', { id: created.id })
           }
         }
-        return ok(toEnvView(created))
+        return ok(toEnvView(created, { ownerUserId }))
       }
       const match =
         /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|concurrency|disable|refresh|terminal-ticket|proxy\/probe|proxy|models|test-chat|crag-license(?:\/(?:bind|activate|release))?)(?:\/([^/]+))?)?$/.exec(
@@ -982,24 +1016,28 @@ export function createGeminiPanelHandler({
         const proxyId = body?.proxy_id
         if (!validId(proxyId)) return fail(400, 'gemini_invalid_proxy_id')
         const environment = await readEnvironment(callHost, id)
+        const envOwner = envOwnerOf(id)
         const result = await callHost('proxy-bind', {
           id,
           previous_proxy_id: environment.proxy_id,
           proxy_id: proxyId,
-          proxy_url: proxyFor(proxyPool(), proxyId),
+          proxy_url: proxyFor(proxyPool(), proxyId, { ownerUserId: envOwner }),
         })
-        return ok(toEnvView(result, { id, proxyId }))
+        return ok(toEnvView(result, { id, proxyId, ownerUserId: envOwner }))
       }
       if (req.method === 'POST' && action === 'proxy/probe') {
         const environment = await readEnvironment(callHost, id)
         // Only probing the existing binding may bypass stored health. Scope,
         // enablement, policy, and valid IPv4 SOCKS5 still apply.
-        const target = boundProxy(proxyPool, environment, { allowUnhealthy: true })
+        const target = boundProxy(proxyPool, environment, { allowUnhealthy: true, ownerUserId: envOwnerOf(id) })
         return ok(probeView(await callHost('proxy-probe', { id, ...target })))
       }
       if (req.method === 'POST' && action === 'models') {
         const environment = await readEnvironment(callHost, id)
-        let result = await callHost('models', { id, ...boundProxy(proxyPool, environment) })
+        let result = await callHost('models', {
+          id,
+          ...boundProxy(proxyPool, environment, { ownerUserId: envOwnerOf(id) }),
+        })
         if (environment.auth_method === 'oauth' && cragSubscription?.ensureEnvironmentSeat) {
           const seat = await cragSubscription.ensureEnvironmentSeat(id, { env: result }).catch(() => ({ bound: false }))
           if (seat.bound) {
@@ -1018,7 +1056,12 @@ export function createGeminiPanelHandler({
         if (!model) return fail(400, 'gemini_invalid_model')
         if (!validPrompt(prompt)) return fail(400, 'gemini_invalid_prompt')
         const environment = await readEnvironment(callHost, id)
-        const result = await callHost('test-chat', { id, ...boundProxy(proxyPool, environment), model, prompt })
+        const result = await callHost('test-chat', {
+          id,
+          ...boundProxy(proxyPool, environment, { ownerUserId: envOwnerOf(id) }),
+          model,
+          prompt,
+        })
         if (!validRunId(result?.run_id)) throw hostError(PROTOCOL_ERROR)
         return ok({ run_id: result.run_id })
       }
@@ -1032,6 +1075,7 @@ export function createGeminiPanelHandler({
           seatRelease = await cragSubscription.releaseEnvironment(id, { ignoreMissing: true })
         }
         await callHost('delete', { id })
+        geminiOwnersRepo?.remove?.(id)
         return ok({ deleted: true, ...(seatRelease ? { seat_released: seatRelease.released === true } : {}) })
       }
       if (req.method === 'POST' && action === 'disable') {
@@ -1040,7 +1084,7 @@ export function createGeminiPanelHandler({
       }
       if (req.method === 'POST' && action === 'refresh') {
         const environment = environmentView(await callHost('get', { id }))
-        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
+        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id, { ownerUserId: envOwnerOf(id) })
         let refreshed = await callHost('refresh', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl })
         if (environment.auth_method === 'oauth' && cragSubscription?.ensureEnvironmentSeat) {
           const seat = await cragSubscription
@@ -1055,7 +1099,7 @@ export function createGeminiPanelHandler({
       if (action !== 'authorization') return fail(404, 'not_found')
       if (req.method === 'POST') {
         const environment = environmentView(await callHost('get', { id }))
-        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
+        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id, { ownerUserId: envOwnerOf(id) })
         const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
         const auth = await callHost('authorize', {
           id,
@@ -1074,7 +1118,7 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_invalid_authorization_code', '请输入 Google 授权码或完整回调链接')
         }
         const environment = environmentView(await callHost('get', { id }))
-        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
+        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id, { ownerUserId: envOwnerOf(id) })
         const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
         let completed = await callHost('complete', {
           id,
@@ -1427,8 +1471,27 @@ export function createGeminiPublicHandler({
   scheduler,
   requestLog = null,
   groupsRepo = null,
+  apiKeyStore = null,
   getRoutingConfig = null,
 }) {
+  const geminiScopeFromReq = (req) => {
+    const rec = req?.apiKeyRecord || null
+    const policy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(rec) : null
+    // In production `apiKeyStore.users` resolves whether `user_id` is an admin or tenant.
+    // When invoked standalone without a users repo, a `gemini`-group key without an explicit
+    // `owner_id` or `tenant` tier defaults to `PLATFORM_SCOPE` (only admins can create `gemini` keys).
+    const ownerScope =
+      !apiKeyStore?.users && !policy?.owner_id && policy?.permission_tier !== 'tenant' && rec?.group_type === 'gemini'
+        ? PLATFORM_SCOPE
+        : ownerScopeFromRequest(req, apiKeyStore?.users)
+    const allowedEnvIds =
+      policy?.permission_tier === 'resource'
+        ? policy.allowed_gemini_envs
+        : policy?.allowed_gemini_envs?.length
+          ? policy.allowed_gemini_envs
+          : null
+    return { ownerScope, allowedEnvIds }
+  }
   return async function handleGeminiPublic(
     req,
     res,
@@ -1445,6 +1508,7 @@ export function createGeminiPublicHandler({
         },
       })
     }
+    const geminiScope = geminiScopeFromReq(req)
     const url = new URL(req.url || PUBLIC_PATH, 'http://127.0.0.1')
     const googleModels = url.pathname === '/v1beta/models'
     const singleModelGet = req.method === 'GET' ? parseGeminiModelGetPath(url.pathname) : null
@@ -1453,7 +1517,7 @@ export function createGeminiPublicHandler({
       ([PUBLIC_PATH, '/v1/models', '/models', '/v1beta/models'].includes(url.pathname) || singleModelGet)
     ) {
       try {
-        const catalog = await scheduler.catalog()
+        const catalog = await scheduler.catalog(geminiScope)
         if (singleModelGet) {
           const hit = findCatalogModel(publicModels(catalog, req).data, singleModelGet.model)
           if (!hit) {
@@ -1765,6 +1829,7 @@ export function createGeminiPublicHandler({
           signal: controller.signal,
           apiKeyRecord: req.apiKeyRecord,
           allowUnprefixedNonGemini: keyGroupType === 'gemini',
+          ...geminiScope,
         })
         applyTurnLog(turn)
         if (messages) {
@@ -1871,6 +1936,7 @@ export function createGeminiPublicHandler({
         signal: controller.signal,
         apiKeyRecord: req.apiKeyRecord,
         allowUnprefixedNonGemini: keyGroupType === 'gemini',
+        ...geminiScope,
         onEvent: wantStream
           ? (event) => {
               if (event?.kind === 'error') return

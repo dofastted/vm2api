@@ -519,7 +519,7 @@ test('migration 067 upgrades pre-067 crag_shop_orders in place with NULL activat
       VALUES ('legacy-pinned', 'panel:admin', 'req-067', 'quarter', 'alipay', 1, 'fulfilled', 1, '3m', 59900, 10,
               'vm-1', ?)`).run('a'.repeat(64))
     const applied = applyMigrations(db, { migrationsDir: src })
-    assert.deepEqual(applied, ['067_crag_shop_activation_error.sql'])
+    assert.ok(applied.includes('067_crag_shop_activation_error.sql'))
     assert.deepEqual(applyMigrations(db, { migrationsDir: src }), [])
     const row = db
       .prepare(

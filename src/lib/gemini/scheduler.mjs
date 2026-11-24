@@ -8,14 +8,11 @@ import {
   createSseFrameSplitter,
 } from '../protocol/gemini-convert.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
-import {
-  classifyAntigravityModel,
-  indexAccountModelCatalog,
-  resolveUpstreamModel,
-} from './model-catalog.mjs'
+import { classifyAntigravityModel, indexAccountModelCatalog, resolveUpstreamModel } from './model-catalog.mjs'
 import { callGeminiHost, callGeminiHostStream } from './routes.mjs'
 import { DEFAULT_GEMINI_ROUTING, normalizeGeminiRouting } from './routing-config.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
+import { PLATFORM_SCOPE, geminiEnvMatchesOwnerScope } from '../admin/resource-owner.mjs'
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const MODEL = /^[a-z0-9][a-z0-9._-]{0,99}$/
@@ -174,8 +171,7 @@ function proactiveCooldownUntil(account, upstreamModel, quotaGroup, ts) {
       for (const w of windows) {
         const bucketGroup = quotaGroupKeyOfBucket(g?.name, w?.id)
         if (!bucketGroup) continue
-        const matches =
-          bucketGroup === quotaGroup || (quotaGroup === 'gemini-argon-wtu' && bucketGroup === 'gemini')
+        const matches = bucketGroup === quotaGroup || (quotaGroup === 'gemini-argon-wtu' && bucketGroup === 'gemini')
         if (!matches) continue
         if (w.remaining_fraction === 0) {
           const parsed = w.reset_at ? Date.parse(w.reset_at) : NaN
@@ -302,12 +298,19 @@ export function createGeminiScheduler({
   poolScheduler,
   apiKeyStore,
   groupsRepo,
+  geminiOwnersRepo = null,
+  getEnvOwner = null,
   cragSubscription = null,
   getRoutingConfig = null,
   quotaCooldownMs = null,
   accountCooldownMs = null,
   now = () => Date.now(),
 }) {
+  const envOwnerOf = (envId) => {
+    if (typeof getEnvOwner === 'function') return getEnvOwner(envId) ?? null
+    if (geminiOwnersRepo?.getOwner) return geminiOwnersRepo.getOwner(envId) ?? null
+    return null
+  }
   const streamHost = callHostStream ?? (callHost === callGeminiHost ? callGeminiHostStream : null)
   const groupCooldowns = new Map()
   const modelCooldowns = new Map()
@@ -372,8 +375,7 @@ export function createGeminiScheduler({
   }
 
   function pickCandidateWithPolicy(candidates, excluded, { strategy, stickyAccountId }) {
-    const inflightOf = (id) =>
-      poolScheduler ? poolScheduler.inflight?.get?.(id) || 0 : localInflight.get(id) || 0
+    const inflightOf = (id) => (poolScheduler ? poolScheduler.inflight?.get?.(id) || 0 : localInflight.get(id) || 0)
     const reserve = (list) =>
       poolScheduler
         ? poolScheduler.reserveExternalCandidates(list, { excluded })
@@ -478,8 +480,14 @@ export function createGeminiScheduler({
           ? failure.retryAfterMs
           : effectiveQuotaCooldown
       const until = ts + retryMs
-      groupCooldowns.set(`${accountId}:${quotaGroup}`, Math.max(groupCooldowns.get(`${accountId}:${quotaGroup}`) || 0, until))
-      modelCooldowns.set(`${accountId}:${upstreamModel}`, Math.max(modelCooldowns.get(`${accountId}:${upstreamModel}`) || 0, until))
+      groupCooldowns.set(
+        `${accountId}:${quotaGroup}`,
+        Math.max(groupCooldowns.get(`${accountId}:${quotaGroup}`) || 0, until),
+      )
+      modelCooldowns.set(
+        `${accountId}:${upstreamModel}`,
+        Math.max(modelCooldowns.get(`${accountId}:${upstreamModel}`) || 0, until),
+      )
       return
     }
     if (ACCOUNT_WIDE_COOLDOWN_ERRORS.has(code)) {
@@ -530,8 +538,7 @@ export function createGeminiScheduler({
   return {
     cooldownSnapshot() {
       const ts = now()
-      const active = (map) =>
-        Object.fromEntries([...map.entries()].filter(([, until]) => until > ts))
+      const active = (map) => Object.fromEntries([...map.entries()].filter(([, until]) => until > ts))
       return {
         groups: active(groupCooldowns),
         models: active(modelCooldowns),
@@ -539,7 +546,7 @@ export function createGeminiScheduler({
       }
     },
 
-    async catalog() {
+    async catalog({ ownerScope = PLATFORM_SCOPE, allowedEnvIds = null } = {}) {
       let view = await callHost('list', {})
       if (!Array.isArray(view?.environments)) throw fail(502, 'gemini_host_protocol_error')
       if (view.payload_state !== 'installed') return { models: [], accounts: [] }
@@ -585,9 +592,12 @@ export function createGeminiScheduler({
           !Array.isArray(environment.models)
         )
           continue
+        const envOwner = envOwnerOf(environment.id)
+        if (!geminiEnvMatchesOwnerScope(envOwner, ownerScope)) continue
+        if (Array.isArray(allowedEnvIds) && !allowedEnvIds.includes(environment.id)) continue
         if (resolveProxy) {
           try {
-            resolveProxy(environment.proxy_id)
+            resolveProxy(environment.proxy_id, envOwner)
           } catch (error) {
             if (error?.code === 'gemini_proxy_unavailable') continue
             throw error
@@ -662,12 +672,14 @@ export function createGeminiScheduler({
       signal,
       apiKeyRecord,
       allowUnprefixedNonGemini = null,
+      ownerScope = PLATFORM_SCOPE,
+      allowedEnvIds = null,
       onEvent = null,
     }) {
       const turnStartedAt = Number.isFinite(startedAt) ? startedAt : now()
       const gate = apiKeyStore?.acquire?.(apiKeyRecord)
       if (gate && !gate.ok) throw fail(gate.status || 429, gate.code, gate.message)
-      const allowUnprefixed = allowUnprefixedNonGemini ?? (apiKeyRecord?.group_type !== 'all')
+      const allowUnprefixed = allowUnprefixedNonGemini ?? apiKeyRecord?.group_type !== 'all'
       const excluded = new Set()
       let reservation = null
       let selected = null
@@ -696,7 +708,7 @@ export function createGeminiScheduler({
 
       try {
         signal?.throwIfAborted()
-        const catalog = await this.catalog()
+        const catalog = await this.catalog({ ownerScope, allowedEnvIds })
         const matchedAccounts = []
         for (const account of catalog.accounts) {
           const resolved = resolveUpstreamModel(model, account.models, {
@@ -777,9 +789,7 @@ export function createGeminiScheduler({
         const uncooled = scored.filter((item) => item.cooldownUntil === 0)
         // Prefer uncooled accounts; if every account is currently in cooldown, fall back to
         // probing the earliest-expiring one so single-account pools and post-reset slots recover.
-        const activeList = uncooled.length
-          ? uncooled
-          : [...scored].sort((a, b) => a.cooldownUntil - b.cooldownUntil)
+        const activeList = uncooled.length ? uncooled : [...scored].sort((a, b) => a.cooldownUntil - b.cooldownUntil)
         const candidates = activeList.map((item) => item.candidate)
         const resolvedByAccountId = new Map(activeList.map((item) => [item.candidate.accountId, item.resolved]))
 
@@ -803,10 +813,17 @@ export function createGeminiScheduler({
           let emittedOutput = false
 
           try {
+            const envOwner = envOwnerOf(id)
+            if (
+              !geminiEnvMatchesOwnerScope(envOwner, ownerScope) ||
+              (Array.isArray(allowedEnvIds) && !allowedEnvIds.includes(id))
+            ) {
+              throw fail(403, 'gemini_model_unavailable')
+            }
             const listed = await callHost('get', { id })
             const proxyId = listed?.proxy_id
             if (typeof proxyId !== 'string' || !ID.test(proxyId)) throw fail(502, 'gemini_host_protocol_error')
-            const proxyUrl = resolveProxy ? resolveProxy(proxyId) : undefined
+            const proxyUrl = resolveProxy ? resolveProxy(proxyId, envOwner) : undefined
             signal?.throwIfAborted()
             const authMethod = listed?.auth_method === 'api_key' ? 'api_key' : selected.authMethod || 'oauth'
             lastAuthMethod = authMethod
@@ -823,9 +840,7 @@ export function createGeminiScheduler({
 
             let streamResponse = null
             if (streamHost) {
-              const proxySha256 = proxyUrl
-                ? crypto.createHash('sha256').update(proxyUrl).digest('hex')
-                : undefined
+              const proxySha256 = proxyUrl ? crypto.createHash('sha256').update(proxyUrl).digest('hex') : undefined
               const gatewayPolicy =
                 typeof getRoutingConfig === 'function'
                   ? {
@@ -1061,6 +1076,8 @@ export function createGeminiScheduler({
       signal,
       apiKeyRecord,
       allowUnprefixedNonGemini = null,
+      ownerScope = PLATFORM_SCOPE,
+      allowedEnvIds = null,
     }) {
       const result = await this.stream({
         model,
@@ -1073,6 +1090,8 @@ export function createGeminiScheduler({
         signal,
         apiKeyRecord,
         allowUnprefixedNonGemini,
+        ownerScope,
+        allowedEnvIds,
       })
       return {
         text: result.text,
