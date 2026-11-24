@@ -95,7 +95,7 @@ describe('settings Gemini entry & scheduling config pane', () => {
     )
   })
 
-  it('renders live sharded CRAGGemini daemon status, SHM ring controls, and scheduling options', () => {
+  it('renders live sharded CRAGGemini daemon status, performance tiers, and scheduling options', () => {
     const html = renderToStaticMarkup(
       <GeminiConfigPane
         value={{
@@ -108,7 +108,7 @@ describe('settings Gemini entry & scheduling config pane', () => {
       />
     )
 
-    expect(html).toContain('CRAGGemini 守护进程与共享内存')
+    expect(html).toContain('CRAGGemini 守护进程与运行状态')
     expect(html).toContain('分片接管 · 50/进程')
     expect(html).toContain('shard-0')
     expect(html).toContain('入口与协议准入')
@@ -116,8 +116,41 @@ describe('settings Gemini entry & scheduling config pane', () => {
     expect(html).toContain('单 CRAGGemini 多账号接管与并发')
     expect(html).toContain('单账号默认会话上限')
     expect(html).toContain('资格警告定时探测间隔')
-    expect(html).toContain('共享内存传输（AGYSHM02）')
+    expect(html).toContain('CRAGGemini 性能配置')
+    expect(html).toContain('aria-label="CRAGGemini 性能配置"')
+    expect(html).toContain('>初<')
+    expect(html).toContain('>中<')
+    expect(html).toContain('>高<')
+    expect(html).not.toContain('AGYSHM02')
+    expect(html).not.toContain('memfd')
+    expect(html).not.toContain('强制启用共享内存数据面')
     expect(html).toContain('故障切号与熔断保护')
     expect(html).toContain('50 (推荐)')
+  })
+
+  it('selects low / medium / high performance radio based on shm buffer sizes', () => {
+    const selectedTitleFor = (request_mb: number, response_mb: number) => {
+      const html = renderToStaticMarkup(
+        <GeminiConfigPane
+          value={{
+            enabled: true,
+            shm: { require_shm: true, request_mb, response_mb },
+          }}
+          onChange={vi.fn()}
+        />
+      )
+      const groupStart = html.indexOf('aria-label="CRAGGemini 性能配置"')
+      const groupHtml = html.slice(groupStart)
+      const match = groupHtml.match(
+        /role="radio" aria-checked="true"[\s\S]*?<span class="text-sm font-semibold">([^<]+)<\/span>/
+      )
+      return match?.[1]
+    }
+
+    expect(selectedTitleFor(2, 8)).toBe('初')
+    expect(selectedTitleFor(4, 16)).toBe('中')
+    expect(selectedTitleFor(16, 64)).toBe('高')
+    expect(selectedTitleFor(1, 4)).toBe('初')
+    expect(selectedTitleFor(8, 32)).toBe('高')
   })
 })
