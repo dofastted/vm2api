@@ -2,16 +2,27 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 import test from 'node:test'
+import { keyAllowsModel } from '../../src/lib/admin/key-models.mjs'
 import { calculateCost } from '../../src/lib/admin/pricing.mjs'
 import { resolvePrice, setPriceCatalogTestHooks } from '../../src/lib/admin/price-catalog.mjs'
 import {
   classifyAntigravityModel,
   isAntigravityRoutedModel,
+  parseGeminiModelSpec,
   resolveUpstreamModel,
 } from '../../src/lib/gemini/model-catalog.mjs'
-import { createGeminiPanelHandler, createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
+import {
+  createGeminiPanelHandler,
+  createGeminiPublicHandler,
+  parseGeminiGeneratePath,
+} from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
-import { FULL_GEMINI_CAPABILITIES, NATIVE_TUI_CAPABILITIES } from '../../src/lib/protocol/gemini-convert.mjs'
+import {
+  FULL_GEMINI_CAPABILITIES,
+  NATIVE_TUI_CAPABILITIES,
+  buildGeminiRequest,
+  parseInboundToGemini,
+} from '../../src/lib/protocol/gemini-convert.mjs'
 
 function makeRes() {
   const res = new EventEmitter()
@@ -473,4 +484,159 @@ test('Gemini public handler records requestLog once on direct calls and populate
   assert.deepEqual(listed.body.data.environments[0].account.model_catalog, [
     { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
   ])
+})
+
+test('Gemini model routing & thinking-suffix normalization accepts display names like Gemini 4 Neon (high) without hijacking Claude/GPT', async () => {
+  const neonHigh = parseGeminiModelSpec('Gemini 4 Neon (high)')
+  assert.equal(neonHigh.valid, true)
+  assert.equal(neonHigh.baseSlug, 'gemini-4-neon')
+  assert.equal(neonHigh.canonicalSlug, 'gemini-4-neon-high')
+  assert.equal(neonHigh.thinkingEffort, 'high')
+  assert.equal(neonHigh.hasExplicitThinkingSuffix, true)
+  assert.equal(neonHigh.isGeminiFamily, true)
+  assert.deepEqual(neonHigh.candidateSlugs, ['gemini-4-neon-high', 'gemini-4-neon'])
+
+  // Accurate routing boundary: Gemini display names & thinking suffixes route to Antigravity; Claude/GPT do not.
+  for (const okModel of [
+    'Gemini 4 Neon (high)',
+    'gemini-4-neon (high)',
+    'gemini-4-neon(low)',
+    'gemini-4-neon [medium]',
+    'gemini-4-neon:high',
+    'models/Gemini 4 Neon (high)',
+    'Gemini 3.1 Pro (high)',
+    'Gemini 2.5 Flash Thinking',
+    'ag-claude-sonnet-4-6 (high)',
+  ]) {
+    assert.equal(isAntigravityRoutedModel(okModel), true, `expected Antigravity route for ${okModel}`)
+  }
+  for (const nonAg of ['Claude Sonnet 4.6 (high)', 'claude-sonnet-4-6', 'gpt-5.4', 'gpt-5.4 (high)']) {
+    assert.equal(isAntigravityRoutedModel(nonAg), false, `must not hijack ${nonAg}`)
+  }
+
+  // Upstream resolution: matches suffixed variant first, falls back to base slug while preserving thinkingEffort.
+  const hitExactVariant = resolveUpstreamModel('Gemini 4 Neon (high)', ['gemini-4-neon-high', 'gemini-4-neon'])
+  assert.equal(hitExactVariant.upstreamModel, 'gemini-4-neon-high')
+  assert.equal(hitExactVariant.matchedSuffixInModel, true)
+  assert.equal(hitExactVariant.thinkingEffort, 'high')
+
+  const hitBaseFallback = resolveUpstreamModel('Gemini 4 Neon (high)', ['gemini-4-neon'])
+  assert.equal(hitBaseFallback.upstreamModel, 'gemini-4-neon')
+  assert.equal(hitBaseFallback.matchedSuffixInModel, false)
+  assert.equal(hitBaseFallback.thinkingEffort, 'high')
+
+  const hitVariantFallback = resolveUpstreamModel('Gemini 3.1 Pro', ['gemini-3.1-pro-high', 'gemini-3.1-pro-low'])
+  assert.equal(hitVariantFallback.upstreamModel, 'gemini-3.1-pro-high')
+
+  const hitAgPrefixed = resolveUpstreamModel('ag-claude-sonnet-4-6 (high)', ['claude-sonnet-4-6-high'])
+  assert.equal(hitAgPrefixed.upstreamModel, 'claude-sonnet-4-6-high')
+  assert.equal(hitAgPrefixed.publicId, 'ag-claude-sonnet-4-6-high')
+
+  assert.equal(
+    resolveUpstreamModel('Claude Sonnet 4.6 (high)', ['claude-sonnet-4.6-high'], { allowUnprefixedNonGemini: false }),
+    null,
+  )
+
+  // Key allowlist matches canonical/base Gemini slug when display name + suffix is requested.
+  assert.equal(keyAllowsModel(['gemini-4-neon'], 'Gemini 4 Neon (high)'), true)
+  assert.equal(keyAllowsModel(['gemini-4-neon'], 'Claude Sonnet 4.6 (high)'), false)
+
+  // Path parsing handles URL-encoded display names and colon thinking suffixes.
+  const genPath = parseGeminiGeneratePath('/v1beta/models/Gemini%204%20Neon%20(high):streamGenerateContent')
+  assert.deepEqual(genPath, {
+    version: 'v1beta',
+    model: 'Gemini 4 Neon (high)',
+    action: 'streamGenerateContent',
+    stream: true,
+  })
+  const colonPath = parseGeminiGeneratePath('/v1beta/models/gemini-4-neon:high:generateContent')
+  assert.equal(colonPath?.model, 'gemini-4-neon:high')
+
+  // All 4 protocols parse `Gemini 4 Neon (high)` cleanly and inject thinking effort.
+  const chatIr = parseInboundToGemini('openai-chat', {
+    model: 'Gemini 4 Neon (high)',
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'internal' },
+          { type: 'text', text: 'prev' },
+        ],
+      },
+      { role: 'user', content: 'hello\x00world' },
+    ],
+  })
+  assert.equal(chatIr.model, 'gemini-4-neon-high')
+  assert.equal(chatIr.thinking?.effort, 'high')
+
+  const geminiIr = parseInboundToGemini(
+    'gemini',
+    {
+      contents: [
+        { role: 'user', parts: [{ text: 'hi' }, { fileData: { mimeType: 'application/pdf', fileUri: 'https://example.com/a.pdf' } }] },
+      ],
+      safetySettings: [{ category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' }],
+      cachedContent: 'cachedContents/123',
+      tools: [{ codeExecution: {} }],
+    },
+    { routeModel: 'Gemini 4 Neon (high)', routeStream: false },
+  )
+  const agBody = buildGeminiRequest({ ...geminiIr, model: 'gemini-4-neon' }, { target: 'antigravity' })
+  assert.equal(agBody.safetySettings, undefined)
+  assert.equal(agBody.cachedContent, undefined)
+  assert.equal(agBody.tools, undefined)
+  assert.equal(agBody.generationConfig?.thinkingConfig?.thinkingLevel, 'high')
+  assert.equal(agBody.contents[0].parts.some((p) => 'fileData' in p), false)
+
+  // End-to-end public handler with `all` key sending `Gemini 4 Neon (high)` to an account exposing `gemini-4-neon`.
+  let capturedBody = null
+  let capturedModel = null
+  const env = {
+    id: 'env-neon',
+    proxy_id: 'px-1',
+    auth_state: 'authorized',
+    auth_method: 'oauth',
+    models_discovered: true,
+    models: ['gemini-4-neon'],
+    capabilities: [...NATIVE_TUI_CAPABILITIES],
+    account: {
+      state: 'ok',
+      model_catalog: [{ id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' }],
+    },
+  }
+  const scheduler = createGeminiScheduler({
+    callHost: async (op) => (op === 'list' ? { payload_state: 'installed', environments: [env] } : env),
+    callHostStream: async (_op, payload) => {
+      capturedModel = payload.model
+      capturedBody = payload.body
+      return sseResponse([
+        `data: ${JSON.stringify({
+          candidates: [{ content: { role: 'model', parts: [{ text: 'neon ok' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+        })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://192.0.2.10:1080',
+  })
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async (r) => r.body,
+    scheduler,
+  })
+  const res = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1/chat/completions',
+      groupType: 'all',
+      body: {
+        model: 'Gemini 4 Neon (high)',
+        messages: [{ role: 'user', content: 'ping' }],
+      },
+    }),
+    res,
+  )
+  assert.equal(res.statusCode, 200)
+  assert.equal(capturedModel, 'gemini-4-neon')
+  assert.equal(capturedBody.generationConfig?.thinkingConfig?.thinkingLevel, 'high')
+  assert.equal(res.jsonBody().choices[0].message.content, 'neon ok')
 })

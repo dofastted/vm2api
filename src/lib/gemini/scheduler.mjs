@@ -213,7 +213,7 @@ async function consumeStreamResponse(response, { model, onEvent, signal }) {
   const onAbort = () => {
     try {
       response.destroy()
-    } catch {}
+    } catch { }
   }
   signal?.addEventListener('abort', onAbort, { once: true })
   try {
@@ -347,25 +347,25 @@ export function createGeminiScheduler({
       poolScheduler
         ? poolScheduler.reserveExternalCandidates(list, { excluded })
         : (() => {
-            const found = list.find(
-              (c) => !excluded.has(c.accountId) && inflightOf(c.accountId) < Math.max(1, c.maxConcurrency),
-            )
-            if (!found) return null
-            localInflight.set(found.accountId, inflightOf(found.accountId) + 1)
-            let released = false
-            return {
-              selected: found,
-              reservation: {
-                release() {
-                  if (released) return
-                  released = true
-                  const next = Math.max(0, (localInflight.get(found.accountId) || 1) - 1)
-                  if (next === 0) localInflight.delete(found.accountId)
-                  else localInflight.set(found.accountId, next)
-                },
+          const found = list.find(
+            (c) => !excluded.has(c.accountId) && inflightOf(c.accountId) < Math.max(1, c.maxConcurrency),
+          )
+          if (!found) return null
+          localInflight.set(found.accountId, inflightOf(found.accountId) + 1)
+          let released = false
+          return {
+            selected: found,
+            reservation: {
+              release() {
+                if (released) return
+                released = true
+                const next = Math.max(0, (localInflight.get(found.accountId) || 1) - 1)
+                if (next === 0) localInflight.delete(found.accountId)
+                else localInflight.set(found.accountId, next)
               },
-            }
-          })()
+            },
+          }
+        })()
 
     const available = candidates.filter((c) => !excluded.has(c.accountId))
     if (!available.length) return null
@@ -411,7 +411,7 @@ export function createGeminiScheduler({
       const loadB = inflightOf(b.accountId) / Math.max(1, b.maxConcurrency)
       if (loadA !== loadB) return loadA - loadB
       if (a.priority !== b.priority) return b.priority - a.priority
-      return a.accountId.localeCompare(b.accountId)
+      return 0
     })
     return reserve(balancedOrdered)
   }
@@ -749,9 +749,11 @@ export function createGeminiScheduler({
             const authMethod = listed?.auth_method === 'api_key' ? 'api_key' : selected.authMethod || 'oauth'
             const rawOutboundBody = targetBodyFor
               ? targetBodyFor(authMethod === 'api_key' ? 'gemini' : 'antigravity', {
-                  upstreamModel: resolved.upstreamModel,
-                  publicModel: resolved.publicId,
-                })
+                upstreamModel: resolved.upstreamModel,
+                publicModel: resolved.publicId,
+                thinkingEffort: resolved.thinkingEffort || '',
+                matchedSuffixInModel: resolved.matchedSuffixInModel === true,
+              })
               : geminiBody
             const outboundBody =
               rawOutboundBody && typeof rawOutboundBody === 'object' && 'model' in rawOutboundBody
@@ -766,10 +768,10 @@ export function createGeminiScheduler({
               const gatewayPolicy =
                 typeof getRoutingConfig === 'function'
                   ? {
-                      queue_wait_ms: policy.pool.queue_timeout_ms,
-                      first_byte_timeout_ms: policy.pool.first_byte_timeout_ms,
-                      stream_idle_timeout_ms: policy.pool.idle_timeout_ms,
-                    }
+                    queue_wait_ms: policy.pool.queue_timeout_ms,
+                    first_byte_timeout_ms: policy.pool.first_byte_timeout_ms,
+                    stream_idle_timeout_ms: policy.pool.idle_timeout_ms,
+                  }
                   : undefined
               const res = await streamHost(
                 'infer',
@@ -909,13 +911,13 @@ export function createGeminiScheduler({
             if (legacyRun) {
               try {
                 await callHost('test-chat-cancel', legacyRun)
-              } catch {}
+              } catch { }
               legacyRun = null
             }
             if (activeInfer) {
               try {
                 await callHost('infer-cancel', activeInfer)
-              } catch {}
+              } catch { }
               activeInfer = null
             }
             reservation?.release()
@@ -954,7 +956,7 @@ export function createGeminiScheduler({
         reservation?.release()
         try {
           apiKeyStore?.release?.(apiKeyRecord)
-        } catch {}
+        } catch { }
       }
     },
 

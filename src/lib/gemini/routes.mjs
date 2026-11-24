@@ -10,10 +10,16 @@ import {
   formatGeminiProtocolStreamError,
   parseInboundToGemini,
   renderGeminiProtocolResponse,
+  thinkingFromModelEffort,
 } from '../protocol/gemini-convert.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
-import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
+import {
+  ANTIGRAVITY_PROVIDERS,
+  ANTIGRAVITY_QUOTA_GROUPS,
+  isAntigravityRoutedModel,
+  parseGeminiModelSpec,
+} from './model-catalog.mjs'
 import { isGeminiProtocolAllowed } from './routing-config.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 import { applyCragGeminiPromptPolicy, resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
@@ -208,8 +214,8 @@ export function isGeminiPanelPath(value) {
   return value === PANEL_PATH || value.startsWith(`${PANEL_PATH}/`)
 }
 
-const GEMINI_GENERATE_PATH_RE = /^\/(v1beta|v1)\/models\/([^/:]+):(generateContent|streamGenerateContent)$/
-const GEMINI_MODEL_GET_PATH_RE = /^\/(v1beta|v1)\/models\/([^/:]+)$/
+const GEMINI_GENERATE_PATH_RE = /^\/(v1beta|v1)\/models\/([^/]+):(generateContent|streamGenerateContent)$/
+const GEMINI_MODEL_GET_PATH_RE = /^\/(v1beta|v1)\/models\/([^/]+)$/
 
 export function parseGeminiGeneratePath(pathname) {
   const match = GEMINI_GENERATE_PATH_RE.exec(String(pathname || ''))
@@ -217,7 +223,7 @@ export function parseGeminiGeneratePath(pathname) {
   let model = match[2]
   try {
     model = decodeURIComponent(match[2])
-  } catch {}
+  } catch { }
   return {
     version: match[1],
     model,
@@ -232,7 +238,7 @@ export function parseGeminiModelGetPath(pathname) {
   let model = match[2]
   try {
     model = decodeURIComponent(match[2])
-  } catch {}
+  } catch { }
   return { version: match[1], model }
 }
 
@@ -242,7 +248,7 @@ export function isGeminiPublicPath(value) {
     value === PUBLIC_PATH ||
     value.startsWith(`${PUBLIC_PATH}/`) ||
     Boolean(parseGeminiGeneratePath(value)) ||
-    /^\/v1beta\/models\/[^/:]+$/.test(value)
+    (typeof value === 'string' && value.startsWith('/v1beta/models/') && Boolean(parseGeminiModelGetPath(value)))
   )
 }
 
@@ -363,7 +369,8 @@ function items(value, size, project) {
 }
 
 function modelName(model) {
-  return typeof model === 'string' && MODEL.test(model) ? model : null
+  const spec = parseGeminiModelSpec(model)
+  return spec.valid ? spec.canonicalSlug : null
 }
 
 function validId(value) {
@@ -437,8 +444,8 @@ function accountView(account) {
   const validationUrl = safeGoogleValidationUrl(account?.validation_url)
   const modelCatalog = items(account.model_catalog, 128, (entry) =>
     modelName(entry?.id) &&
-    ANTIGRAVITY_PROVIDERS.has(entry?.provider) &&
-    ANTIGRAVITY_QUOTA_GROUPS.has(entry?.quota_group)
+      ANTIGRAVITY_PROVIDERS.has(entry?.provider) &&
+      ANTIGRAVITY_QUOTA_GROUPS.has(entry?.quota_group)
       ? { id: entry.id, provider: entry.provider, quota_group: entry.quota_group }
       : null,
   )
@@ -574,10 +581,10 @@ function environmentView(value, { id, proxyId, proxyPool, withProxyReady = false
     ...(value.models_discovered === true && { models_discovered: true }),
     ...(Array.isArray(value.capabilities)
       ? {
-          capabilities: items(value.capabilities, 32, (c) =>
-            typeof c === 'string' && /^[a-z0-9_]{1,40}$/.test(c) ? c : null,
-          ),
-        }
+        capabilities: items(value.capabilities, 32, (c) =>
+          typeof c === 'string' && /^[a-z0-9_]{1,40}$/.test(c) ? c : null,
+        ),
+      }
       : {}),
     account: accountView(value.account),
     ...(Object.hasOwn(value, 'last_inference') && {
@@ -1174,8 +1181,14 @@ function userMessage(message, { response = false } = {}) {
 
 export function geminiTurnFromBody(body, protocol = 'gemini-session', routeModel = null) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return null
-  const model = routeModel || (typeof body.model === 'string' ? body.model : '')
-  if (!MODEL.test(model) || (body.model != null && body.model !== model)) return null
+  const rawModel = routeModel || (typeof body.model === 'string' ? body.model : '')
+  const modelSpec = parseGeminiModelSpec(rawModel)
+  if (!modelSpec.valid) return null
+  if (body.model != null) {
+    const bodySpec = parseGeminiModelSpec(body.model)
+    if (!bodySpec.valid || bodySpec.canonicalSlug !== modelSpec.canonicalSlug) return null
+  }
+  const model = modelSpec.canonicalSlug
   let text
   let stream = false
   if (protocol === 'gemini') {
@@ -1367,12 +1380,20 @@ function googleModelList(catalog, req) {
 }
 
 function findCatalogModel(models, requestedId) {
+  const list = Array.isArray(models) ? models : []
+  const spec = parseGeminiModelSpec(requestedId)
+  if (spec.valid) {
+    for (const candidate of spec.candidateSlugs) {
+      const hit = list.find((m) => String(m?.id || '').toLowerCase() === candidate)
+      if (hit) return hit
+    }
+  }
   const want = String(requestedId || '')
     .trim()
     .replace(/^models\//i, '')
     .toLowerCase()
   if (!want) return null
-  return (Array.isArray(models) ? models : []).find((m) => String(m?.id || '').toLowerCase() === want) || null
+  return list.find((m) => String(m?.id || '').toLowerCase() === want) || null
 }
 
 function beginSse(res) {
@@ -1510,7 +1531,7 @@ export function createGeminiPublicHandler({
           rate_multiplier: groupsRepo?.rateMultiplier?.(groupId) ?? 1,
           ...logBag,
         })
-      } catch {}
+      } catch { }
     }
 
     let body = req.body
@@ -1708,10 +1729,19 @@ export function createGeminiPublicHandler({
       const turn = await scheduler.stream({
         model: parsed.model,
         targetBodyFor: (target, meta) => {
-          const reqBody = buildGeminiRequest(
-            meta?.upstreamModel ? { ...parsed, model: meta.upstreamModel } : parsed,
-            { target },
-          )
+          const inferredThinking =
+            !parsed.thinking && meta?.thinkingEffort && !meta?.matchedSuffixInModel
+              ? thinkingFromModelEffort(meta.thinkingEffort)
+              : null
+          const effectiveIr =
+            meta?.upstreamModel || inferredThinking
+              ? {
+                  ...parsed,
+                  ...(meta?.upstreamModel ? { model: meta.upstreamModel } : {}),
+                  ...(inferredThinking ? { thinking: inferredThinking } : {}),
+                }
+              : parsed
+          const reqBody = buildGeminiRequest(effectiveIr, { target })
           return target === 'antigravity' && promptPolicy
             ? applyCragGeminiPromptPolicy(reqBody, promptPolicy)
             : reqBody
@@ -1724,9 +1754,9 @@ export function createGeminiPublicHandler({
         allowUnprefixedNonGemini: keyGroupType === 'gemini',
         onEvent: wantStream
           ? (event) => {
-              if (event?.kind === 'error') return
-              writeChunk(encoder.push(event))
-            }
+            if (event?.kind === 'error') return
+            writeChunk(encoder.push(event))
+          }
           : null,
       })
       if (controller.signal.aborted) {
@@ -1770,7 +1800,7 @@ export function createGeminiPublicHandler({
             formatGeminiProtocolStreamError(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
           )
           res.end()
-        } catch {}
+        } catch { }
         return
       }
       return json(

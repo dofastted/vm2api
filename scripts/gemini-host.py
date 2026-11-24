@@ -5753,6 +5753,7 @@ class Host:
             "systemInstruction",
             "system_instruction",
             "system_prompt_mode",
+            "crag_prompt",
             "tools",
             "toolConfig",
             "tool_config",
@@ -5760,8 +5761,12 @@ class Host:
             "generation_config",
             "safetySettings",
             "safety_settings",
+            "cachedContent",
+            "cached_content",
             "conversation_id",
             "conversationId",
+            "reasoning_effort",
+            "labels",
         }
         if any(k not in allowed_top for k in body_obj):
             return None
@@ -5785,7 +5790,14 @@ class Host:
             "thoughtSignature",
             "thought_signature",
         }
+
+        def _strip_ctrl(val):
+            return "".join(
+                ch for ch in val if ord(ch) >= 32 or ch in ("\n", "\r", "\t")
+            )
+
         has_substantive_part = False
+        cleaned_contents = []
         for entry in contents:
             if not isinstance(entry, dict) or any(k not in ("role", "parts") for k in entry):
                 return None
@@ -5794,24 +5806,35 @@ class Host:
             parts = entry.get("parts")
             if not isinstance(parts, list) or not parts:
                 return None
+            cleaned_parts = []
             for part in parts:
                 if not isinstance(part, dict) or not part or any(k not in allowed_part_keys for k in part):
                     return None
-                if "text" in part:
-                    text = part["text"]
+                cleaned_part = dict(part)
+                if "text" in cleaned_part:
+                    text = cleaned_part["text"]
                     if not isinstance(text, str):
                         return None
-                    if any(ord(ch) < 32 and ch not in ("\n", "\r", "\t") for ch in text):
-                        return None
+                    text = _strip_ctrl(text)
+                    cleaned_part["text"] = text
                     if text.strip():
                         has_substantive_part = True
+                if "fileData" in cleaned_part or "file_data" in cleaned_part:
+                    fd = cleaned_part.pop("fileData", None) or cleaned_part.pop("file_data", None)
+                    if isinstance(fd, dict):
+                        uri = fd.get("fileUri") or fd.get("file_uri") or ""
+                        if isinstance(uri, str) and uri.strip():
+                            note = f"[Attached file: {_strip_ctrl(uri.strip())}]"
+                            if "text" in cleaned_part and cleaned_part["text"]:
+                                cleaned_part["text"] = f"{cleaned_part['text']}\n{note}"
+                            else:
+                                cleaned_part["text"] = note
+                            has_substantive_part = True
                 if any(
-                    k in part
+                    k in cleaned_part
                     for k in (
                         "inlineData",
                         "inline_data",
-                        "fileData",
-                        "file_data",
                         "functionCall",
                         "function_call",
                         "functionResponse",
@@ -5819,9 +5842,72 @@ class Host:
                     )
                 ):
                     has_substantive_part = True
+                elif "text" not in cleaned_part:
+                    # Ensure thoughtSignature-only parts carry an empty text field so craggemini accepts them.
+                    cleaned_part["text"] = ""
+                cleaned_parts.append(cleaned_part)
+            cleaned_entry = {"parts": cleaned_parts}
+            if entry.get("role") is not None:
+                cleaned_entry["role"] = entry["role"]
+            cleaned_contents.append(cleaned_entry)
         if not has_substantive_part:
             return None
-        forwarded = {k: v for k, v in body_obj.items() if k != "stream"}
+        strip_for_native = {
+            "stream",
+            "safetySettings",
+            "safety_settings",
+            "cachedContent",
+            "cached_content",
+            "reasoning_effort",
+            "labels",
+        }
+        forwarded = {}
+        for k, v in body_obj.items():
+            if k in strip_for_native:
+                continue
+            if k == "conversationId":
+                if "conversation_id" not in body_obj and isinstance(v, str) and v.strip():
+                    forwarded["conversation_id"] = v
+                continue
+            if k in ("systemInstruction", "system_instruction"):
+                if isinstance(v, str):
+                    cleaned_sys = _strip_ctrl(v).strip()
+                    if cleaned_sys:
+                        forwarded[k] = cleaned_sys
+                elif isinstance(v, dict) and isinstance(v.get("parts"), list):
+                    sys_parts = []
+                    for sp in v["parts"]:
+                        if isinstance(sp, dict) and isinstance(sp.get("text"), str):
+                            st = _strip_ctrl(sp["text"])
+                            if st.strip():
+                                sys_parts.append({"text": st})
+                    if sys_parts:
+                        forwarded[k] = {"parts": sys_parts}
+                continue
+            if k == "tools" and isinstance(v, list):
+                supported_tools = []
+                unsupported_google_only = {
+                    "codeExecution",
+                    "code_execution",
+                    "googleMaps",
+                    "google_maps",
+                    "fileSearch",
+                    "file_search",
+                    "enterpriseWebSearch",
+                    "enterprise_web_search",
+                    "computerUse",
+                    "computer_use",
+                    "retrieval",
+                }
+                for item in v:
+                    if isinstance(item, dict) and item and all(tk in unsupported_google_only for tk in item):
+                        continue
+                    supported_tools.append(item)
+                if supported_tools:
+                    forwarded[k] = supported_tools
+                continue
+            forwarded[k] = v
+        forwarded["contents"] = cleaned_contents
         forwarded["model"] = model
         return forwarded
 

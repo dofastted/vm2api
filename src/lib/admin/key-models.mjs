@@ -7,6 +7,7 @@
  * policy.allowed_models (pool/slot-model-gate.mjs) is separate and unchanged.
  */
 import { ErrorCode, ErrorType, makeError } from '../core/errors.mjs'
+import { parseGeminiModelSpec } from '../gemini/model-catalog.mjs'
 import { stripClaudeCode1mSuffix } from '../protocol/context-1m.mjs'
 
 export const KEY_ALLOWED_MODELS_MAX = 200
@@ -69,7 +70,20 @@ export function keyAllowsModel(allowed, model) {
   if (!list.length) return true
   const base = (name) => stripClaudeCode1mSuffix(name.trim()).toLowerCase()
   const want = typeof model === 'string' ? base(model) : ''
-  return !!want && list.some((name) => base(name) === want)
+  if (!want) return false
+  if (list.some((name) => base(name) === want)) return true
+  const spec = parseGeminiModelSpec(model)
+  if (spec.valid && (spec.isGeminiFamily || spec.isAntigravityPrefixed)) {
+    const candidates = new Set(spec.candidateSlugs)
+    return list.some((name) => {
+      const entrySpec = parseGeminiModelSpec(name)
+      if (entrySpec.valid && (entrySpec.isGeminiFamily || entrySpec.isAntigravityPrefixed)) {
+        return entrySpec.candidateSlugs.some((slug) => candidates.has(slug))
+      }
+      return candidates.has(base(name))
+    })
+  }
+  return false
 }
 
 function managedAllowlist(req) {

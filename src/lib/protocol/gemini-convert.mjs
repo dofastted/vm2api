@@ -13,6 +13,7 @@
  * never silently drop unsupported fields on restricted native-TUI slots.
  */
 import crypto from 'node:crypto'
+import { parseGeminiModelSpec } from '../gemini/model-catalog.mjs'
 import { isClientStream } from './convert.mjs'
 import { buildAnthropicSseError } from './stream-truncation.mjs'
 
@@ -649,12 +650,50 @@ function formatExecutableCodePart(part) {
   return ''
 }
 
-function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
-  const body = geminiCamelCase(rawBody)
-  const model = routeModel || (typeof body.model === 'string' ? body.model : '')
-  if (!MODEL_RE.test(model) || (body.model != null && body.model !== model)) {
+const ANTIGRAVITY_CONTROL_CHARS_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g
+const ANTIGRAVITY_SUPPORTED_GOOGLE_TOOLS = new Set(['googleSearch', 'googleSearchRetrieval', 'urlContext'])
+
+function sanitizeAntigravityText(text) {
+  if (typeof text !== 'string') return ''
+  return text.replace(ANTIGRAVITY_CONTROL_CHARS_RE, '')
+}
+
+function parseInboundModelSpec(rawModel) {
+  const spec = parseGeminiModelSpec(rawModel)
+  if (!spec.valid) {
     throw makeProtocolError(400, 'gemini_invalid_model', 'A valid Gemini model is required.')
   }
+  return spec
+}
+
+export function thinkingFromModelEffort(effort) {
+  const value = String(effort || '')
+    .trim()
+    .toLowerCase()
+  if (!value) return null
+  if (value === 'none') {
+    return { enabled: false, disabled: true, effort: '', includeThoughts: false }
+  }
+  if (value === 'thinking') {
+    return { enabled: true, disabled: false, effort: 'medium', includeThoughts: true }
+  }
+  if (['minimal', 'low', 'medium', 'high'].includes(value)) {
+    return { enabled: true, disabled: false, effort: value, includeThoughts: true }
+  }
+  return null
+}
+
+function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
+  const body = geminiCamelCase(rawBody)
+  const rawModel = routeModel || (typeof body.model === 'string' ? body.model : '')
+  const modelSpec = parseInboundModelSpec(rawModel)
+  if (body.model != null) {
+    const bodySpec = parseGeminiModelSpec(body.model)
+    if (!bodySpec.valid || bodySpec.canonicalSlug !== modelSpec.canonicalSlug) {
+      throw makeProtocolError(400, 'gemini_invalid_model', 'A valid Gemini model is required.')
+    }
+  }
+  const model = modelSpec.canonicalSlug
   if (!Array.isArray(body.contents) || body.contents.length === 0) {
     throw makeProtocolError(400, 'gemini_invalid_request', 'Gemini contents must be a non-empty array.')
   }
@@ -890,8 +929,13 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
     }
   }
 
+  const effectiveThinking =
+    thinking || (modelSpec.hasExplicitThinkingSuffix ? thinkingFromModelEffort(modelSpec.thinkingEffort) : null)
+
   return {
     model,
+    requestedModel: modelSpec.raw,
+    modelThinkingEffort: modelSpec.thinkingEffort,
     stream,
     system,
     messages,
@@ -901,7 +945,7 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
     googleTools,
     generationConfig,
     extraGenConfig,
-    thinking,
+    thinking: effectiveThinking,
     responseFormat,
     safetySettings: Array.isArray(body.safetySettings) ? body.safetySettings : null,
     cachedContent: typeof body.cachedContent === 'string' ? body.cachedContent : null,
@@ -909,8 +953,8 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
 }
 
 function parseOpenAIChatInbound(body, { headers }) {
-  const model = typeof body.model === 'string' ? body.model : ''
-  if (!MODEL_RE.test(model)) throw makeProtocolError(400, 'gemini_invalid_model', 'A valid Gemini model is required.')
+  const modelSpec = parseInboundModelSpec(typeof body.model === 'string' ? body.model : '')
+  const model = modelSpec.canonicalSlug
   if (body.stream != null && typeof body.stream !== 'boolean') {
     throw makeProtocolError(400, 'gemini_invalid_request', 'stream must be a boolean.')
   }
@@ -951,6 +995,12 @@ function parseOpenAIChatInbound(body, { headers }) {
         const media = mediaPartFromUrl(fileData, part.file.media_type || 'application/pdf')
         if (!media) throw makeProtocolError(400, 'gemini_invalid_request', 'file part requires file_data.')
         out.push(media)
+      } else if (part.type === 'thinking' || part.type === 'reasoning' || part.type === 'redacted_thinking') {
+        // Ignore replayed foreign thinking/reasoning blocks in chat history.
+      } else if (part.type === 'refusal') {
+        if (typeof part.refusal === 'string' && part.refusal) {
+          out.push({ kind: 'text', text: part.refusal, signature: '' })
+        }
       } else {
         throw makeProtocolError(400, 'gemini_invalid_request', `Unsupported content part type: ${String(part.type)}`)
       }
@@ -1099,8 +1149,13 @@ function parseOpenAIChatInbound(body, { headers }) {
     }
   }
 
+  const effectiveThinking =
+    thinking || (modelSpec.hasExplicitThinkingSuffix ? thinkingFromModelEffort(modelSpec.thinkingEffort) : null)
+
   return {
     model,
+    requestedModel: modelSpec.raw,
+    modelThinkingEffort: modelSpec.thinkingEffort,
     stream,
     system: systemParts.join('\n\n'),
     messages,
@@ -1110,7 +1165,7 @@ function parseOpenAIChatInbound(body, { headers }) {
     googleTools,
     generationConfig,
     extraGenConfig: {},
-    thinking,
+    thinking: effectiveThinking,
     responseFormat,
     safetySettings: null,
     cachedContent: null,
@@ -1118,8 +1173,8 @@ function parseOpenAIChatInbound(body, { headers }) {
 }
 
 function parseOpenAIResponsesInbound(body, { headers }) {
-  const model = typeof body.model === 'string' ? body.model : ''
-  if (!MODEL_RE.test(model)) throw makeProtocolError(400, 'gemini_invalid_model', 'A valid Gemini model is required.')
+  const modelSpec = parseInboundModelSpec(typeof body.model === 'string' ? body.model : '')
+  const model = modelSpec.canonicalSlug
   if (body.stream != null && typeof body.stream !== 'boolean') {
     throw makeProtocolError(400, 'gemini_invalid_request', 'stream must be a boolean.')
   }
@@ -1154,6 +1209,12 @@ function parseOpenAIResponsesInbound(body, { headers }) {
         const media = mediaPartFromUrl(part.file_data || part.file_url, part.media_type || 'application/pdf')
         if (!media) throw makeProtocolError(400, 'gemini_invalid_request', 'input_file requires file_data or file_url.')
         out.push(media)
+      } else if (part.type === 'thinking' || part.type === 'reasoning' || part.type === 'redacted_thinking') {
+        // Ignore replayed foreign thinking/reasoning blocks.
+      } else if (part.type === 'refusal') {
+        if (typeof part.refusal === 'string' && part.refusal) {
+          out.push({ kind: 'text', text: part.refusal, signature: '' })
+        }
       } else {
         throw makeProtocolError(400, 'gemini_invalid_request', `Unsupported Responses part type: ${String(part.type)}`)
       }
@@ -1281,8 +1342,13 @@ function parseOpenAIResponsesInbound(body, { headers }) {
     }
   }
 
+  const effectiveThinking =
+    thinking || (modelSpec.hasExplicitThinkingSuffix ? thinkingFromModelEffort(modelSpec.thinkingEffort) : null)
+
   return {
     model,
+    requestedModel: modelSpec.raw,
+    modelThinkingEffort: modelSpec.thinkingEffort,
     stream,
     system: systemParts.join('\n\n'),
     messages,
@@ -1292,7 +1358,7 @@ function parseOpenAIResponsesInbound(body, { headers }) {
     googleTools: [],
     generationConfig,
     extraGenConfig: {},
-    thinking,
+    thinking: effectiveThinking,
     responseFormat,
     safetySettings: null,
     cachedContent: null,
@@ -1300,8 +1366,8 @@ function parseOpenAIResponsesInbound(body, { headers }) {
 }
 
 function parseAnthropicInbound(body, { headers }) {
-  const model = typeof body.model === 'string' ? body.model : ''
-  if (!MODEL_RE.test(model)) throw makeProtocolError(400, 'gemini_invalid_model', 'A valid Gemini model is required.')
+  const modelSpec = parseInboundModelSpec(typeof body.model === 'string' ? body.model : '')
+  const model = modelSpec.canonicalSlug
   if (body.stream != null && typeof body.stream !== 'boolean') {
     throw makeProtocolError(400, 'gemini_invalid_request', 'stream must be a boolean.')
   }
@@ -1486,8 +1552,13 @@ function parseAnthropicInbound(body, { headers }) {
     }
   }
 
+  const effectiveThinking =
+    thinking || (modelSpec.hasExplicitThinkingSuffix ? thinkingFromModelEffort(modelSpec.thinkingEffort) : null)
+
   return {
     model,
+    requestedModel: modelSpec.raw,
+    modelThinkingEffort: modelSpec.thinkingEffort,
     stream,
     system,
     messages,
@@ -1497,7 +1568,7 @@ function parseAnthropicInbound(body, { headers }) {
     googleTools: [],
     generationConfig,
     extraGenConfig: {},
-    thinking,
+    thinking: effectiveThinking,
     responseFormat,
     safetySettings: null,
     cachedContent: null,
@@ -1508,8 +1579,8 @@ function parseGeminiSessionInbound(body) {
   if (Object.keys(body).some((key) => !['model', 'input', 'stream'].includes(key))) {
     throw makeProtocolError(400, 'gemini_unsupported_turn', 'Gemini session accepts only model, input, and stream.')
   }
-  const model = typeof body.model === 'string' ? body.model : ''
-  if (!MODEL_RE.test(model)) throw makeProtocolError(400, 'gemini_invalid_model', 'A valid Gemini model is required.')
+  const modelSpec = parseInboundModelSpec(typeof body.model === 'string' ? body.model : '')
+  const model = modelSpec.canonicalSlug
   if (body.stream != null && typeof body.stream !== 'boolean') {
     throw makeProtocolError(400, 'gemini_unsupported_turn', 'stream must be a boolean.')
   }
@@ -1527,6 +1598,8 @@ function parseGeminiSessionInbound(body) {
   }
   return {
     model,
+    requestedModel: modelSpec.raw,
+    modelThinkingEffort: modelSpec.thinkingEffort,
     stream: body.stream === true,
     system: '',
     messages: [{ role: 'user', parts: [{ kind: 'text', text: body.input, signature: '' }] }],
@@ -1536,7 +1609,7 @@ function parseGeminiSessionInbound(body) {
     googleTools: [],
     generationConfig: {},
     extraGenConfig: {},
-    thinking: null,
+    thinking: modelSpec.hasExplicitThinkingSuffix ? thinkingFromModelEffort(modelSpec.thinkingEffort) : null,
     responseFormat: null,
     safetySettings: null,
     cachedContent: null,
@@ -1722,17 +1795,25 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
     for (const p of msg.parts) {
       if (p.kind === 'thinking') {
         if (p.signature && !claude) {
-          parts.push({ text: p.text || '', thought: true, thoughtSignature: p.signature })
+          parts.push({
+            text: ag ? sanitizeAntigravityText(p.text || '') : p.text || '',
+            thought: true,
+            thoughtSignature: p.signature,
+          })
         }
       } else if (p.kind === 'text') {
-        if (p.text || (p.signature && !claude)) {
-          const part = { text: p.text || '' }
+        const textVal = ag ? sanitizeAntigravityText(p.text || '') : p.text || ''
+        if (textVal || (p.signature && !claude)) {
+          const part = { text: textVal }
           if (p.signature && !claude) part.thoughtSignature = p.signature
           parts.push(part)
         }
       } else if (p.kind === 'image' || p.kind === 'file') {
         if (p.data) parts.push({ inlineData: { mimeType: p.mediaType, data: p.data } })
-        else if (p.url) parts.push({ fileData: { mimeType: p.mediaType, fileUri: p.url } })
+        else if (p.url) {
+          if (ag) parts.push({ text: `[Attached ${p.kind}: ${sanitizeAntigravityText(p.url)}]` })
+          else parts.push({ fileData: { mimeType: p.mediaType, fileUri: p.url } })
+        }
       } else if (p.kind === 'tool_call') {
         const safeName = geminiFuncName(p.name)
         if (p.id) callNames.set(p.id, safeName)
@@ -1792,7 +1873,8 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
   }
 
   const req = { contents: paired }
-  const cleanedSystem = stripAnthropicBillingLines(ir.system || '')
+  const rawSystem = stripAnthropicBillingLines(ir.system || '')
+  const cleanedSystem = ag ? sanitizeAntigravityText(rawSystem).trim() : rawSystem
   if (cleanedSystem) {
     req.systemInstruction = { parts: [{ text: cleanedSystem }] }
   }
@@ -1818,8 +1900,14 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
   } else if (ir.webSearch || ir.googleTools.length > 0) {
     const tools = []
     if (ir.webSearch) tools.push({ googleSearch: {} })
-    for (const gt of ir.googleTools) tools.push(gt)
-    req.tools = tools
+    for (const gt of ir.googleTools) {
+      if (ag) {
+        const supported = Object.keys(gt || {}).some((k) => ANTIGRAVITY_SUPPORTED_GOOGLE_TOOLS.has(k))
+        if (!supported) continue
+      }
+      tools.push(gt)
+    }
+    if (tools.length) req.tools = tools
   }
 
   const gen = { ...ir.extraGenConfig, ...ir.generationConfig }
@@ -1832,8 +1920,8 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
     }
   }
   if (Object.keys(gen).length) req.generationConfig = gen
-  if (ir.safetySettings) req.safetySettings = ir.safetySettings
-  if (ir.cachedContent) req.cachedContent = ir.cachedContent
+  if (!ag && ir.safetySettings) req.safetySettings = ir.safetySettings
+  if (!ag && ir.cachedContent) req.cachedContent = ir.cachedContent
   return req
 }
 
