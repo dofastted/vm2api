@@ -46,9 +46,10 @@ WORK_DROPIN_PATH = '/etc/systemd/system/kin-kernel.service.d/45-vm2api-crag-work
 WORK_DROPIN = (MARKER + '\n'
                '# CRAG tap files stay on guest tmpfs: stat during 9p writeback can wedge a session.\n'
                '[Service]\n'
-               "ExecStartPre=-+/bin/sh -c 'mountpoint -q /run/kin/work || { mkdir -p /run/kin/work && "
-               "mount -t tmpfs -o mode=0700,size=256m,nosuid,nodev vm2api-crag-work /run/kin/work && "
-               "chown kincli: /run/kin/work; }'\n").encode()
+               "ExecStartPre=-+/bin/sh -c '[ ! -L /run/kin/work ] && { mountpoint -q /run/kin/work || "
+               "{ mkdir -p /run/kin/work && [ ! -L /run/kin/work ] && "
+               "mount -t tmpfs -o mode=0700,uid=$(id -u kincli),gid=$(id -g kincli),size=256m,nosuid,nodev "
+               "vm2api-crag-work /run/kin/work; }; }'\n").encode()
 
 
 def result(status, reason, profile=PROFILE_NAME):

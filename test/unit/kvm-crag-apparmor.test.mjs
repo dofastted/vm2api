@@ -430,12 +430,50 @@ unixTest('CRAG v2 mounts guest tmpfs over its work directory before the kernel r
   const line = dropin.split('\n').find((entry) => entry.startsWith('ExecStartPre='))
   // "-+": runs as root despite User=kincli, and a failed mount never keeps the kernel down.
   assert.match(line, /^ExecStartPre=-\+\/bin\/sh -c '/)
-  assert.match(line, /mountpoint -q \/run\/kin\/work \|\| /)
-  assert.match(line, /mount -t tmpfs -o mode=0700,size=256m,nosuid,nodev vm2api-crag-work \/run\/kin\/work/)
-  assert.match(line, /chown kincli: \/run\/kin\/work/)
+  assert.match(line, /\[ ! -L \/run\/kin\/work \] && \{ mountpoint -q \/run\/kin\/work \|\| /)
+  assert.match(
+    line,
+    /mkdir -p \/run\/kin\/work && \[ ! -L \/run\/kin\/work \] && mount -t tmpfs -o mode=0700,uid=\$\(id -u kincli\),gid=\$\(id -g kincli\),size=256m,nosuid,nodev vm2api-crag-work \/run\/kin\/work/,
+  )
+  assert.doesNotMatch(line, /\bchown\b/)
   const inner = line.replace(/^ExecStartPre=-\+\/bin\/sh -c '/, '').replace(/'$/, '')
   const syntax = spawnSync('sh', ['-n', '-c', inner], { encoding: 'utf8' })
   assert.equal(syntax.status, 0, syntax.stderr)
+  // Symlink at /run/kin/work must be refused before mountpoint/mkdir/mount run.
+  const target = fx.file('/symlink-target')
+  fs.mkdirSync(target, { recursive: true })
+  const workLink = fx.file('/run/kin/work')
+  fs.symlinkSync(target, workLink)
+  const stubLog = fx.file('/work-hook-calls.log')
+  const spy = `#!/bin/sh\necho "$0 $*" >> '${stubLog}'\nexit 0\n`
+  fx.write('/work-bin/mountpoint', spy, 0o755)
+  fx.write('/work-bin/mount', spy, 0o755)
+  const rewritten = inner.replaceAll('/run/kin/work', workLink)
+  const refused = spawnSync('sh', ['-c', rewritten], {
+    env: { ...process.env, PATH: `${fx.file('/work-bin')}:${process.env.PATH}` },
+    encoding: 'utf8',
+  })
+  assert.notEqual(refused.status, 0)
+  assert.equal(fx.exists('/work-hook-calls.log'), false)
+  // Non-symlink path creates /run/kin/work and sets ownership atomically via mount options.
+  fs.unlinkSync(workLink)
+  fx.write('/work-bin/mountpoint', '#!/bin/sh\nexit 1\n', 0o755)
+  fx.write(
+    '/work-bin/id',
+    '#!/bin/sh\n[ "$2" = "kincli" ] || exit 1\nif [ "$1" = "-u" ]; then echo 1001; elif [ "$1" = "-g" ]; then echo 1002; else exit 1; fi\n',
+    0o755,
+  )
+  const mounted = spawnSync('sh', ['-c', rewritten], {
+    env: { ...process.env, PATH: `${fx.file('/work-bin')}:${process.env.PATH}` },
+    encoding: 'utf8',
+  })
+  assert.equal(mounted.status, 0, mounted.stderr)
+  assert.equal(fs.statSync(workLink).isDirectory(), true)
+  assert.ok(
+    fx
+      .read('/work-hook-calls.log')
+      .includes(`mount -t tmpfs -o mode=0700,uid=1001,gid=1002,size=256m,nosuid,nodev vm2api-crag-work ${workLink}`),
+  )
   assert.equal(fs.statSync(fx.file(workDropinPath)).mode & 0o777, 0o644)
   const calls = fx.calls()
   const lastReload = calls.findLastIndex((call) => call.command === 'systemctl' && call.args[0] === 'daemon-reload')
