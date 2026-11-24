@@ -1597,3 +1597,38 @@ test('warmGeminiEnvironments proactively warms authorized licensed OAuth envs an
   assert.equal(warmedCalls[1][1].proxy_url, proxyUrl)
   assert.equal(warmedCalls[1][1].proxy_sha256, createHash('sha256').update(proxyUrl).digest('hex'))
 })
+test('a host error code the control plane knows survives, and only an unknown one collapses (#1622)', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-authcode-'))
+  const socketPath = path.join(directory, 'control.sock')
+  const previous = process.env.KIN_GEMINI_HOST_SOCKET
+  process.env.KIN_GEMINI_HOST_SOCKET = socketPath
+  let code = 'gemini_authorization_unavailable'
+  const server = http.createServer(async (request, response) => {
+    for await (const chunk of request) void chunk
+    response.writeHead(503, { 'Content-Type': 'application/json' })
+    response.end(JSON.stringify({ code }))
+  })
+  t.after(async () => {
+    if (previous === undefined) delete process.env.KIN_GEMINI_HOST_SOCKET
+    else process.env.KIN_GEMINI_HOST_SOCKET = previous
+    await new Promise((resolve) => server.close(resolve))
+    await rm(directory, { recursive: true, force: true })
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, resolve)
+  })
+
+  // The socket answered, so the host service is up and it is the authorization
+  // launch that failed. Reporting 'no host service' instead sent #1622 auditing
+  // the service and its socket while the real fault was on the egress path.
+  await assert.rejects(callGeminiHost('authorization', { id: record.id }), {
+    code: 'gemini_authorization_unavailable',
+    status: 503,
+  })
+
+  // The allow-list itself still holds: a code this version does not know stays
+  // collapsed rather than being forwarded to the panel unvetted.
+  code = 'gemini_not_a_real_code'
+  await assert.rejects(callGeminiHost('authorization', { id: record.id }), { code: 'gemini_host_unavailable' })
+})

@@ -128,6 +128,14 @@ const HOST_ERRORS = {
     '缺少 Gemini OAuth/TUI 所需工具，请检查宿主 ip、nft、setpriv、bwrap、openvt 和 curl',
   ],
   gemini_ipv4_forwarding_unavailable: [503, '宿主 IPv4 转发未就绪，无法经绑定代理启动 Google 授权'],
+  // Unregistered codes fall through to FAILURE, which reads as "no host service at
+  // all" -- the one answer this is not. The socket answered, so the host is up and
+  // it is the authorization launch that failed; losing that sent #1622 looking at
+  // the service and its socket instead of the egress path.
+  gemini_authorization_unavailable: [
+    503,
+    'Gemini 宿主服务在线，但 Google 授权流程未能启动，请检查宿主服务日志与绑定代理的出口连通性',
+  ],
   gemini_native_tty_unavailable: [503, '没有可供 CRAGGemini 使用的空闲 Linux 虚拟控制台'],
   gemini_native_worker_unavailable: [503, 'CRAGGemini 原生 worker 未就绪，请检查宿主服务日志'],
   gemini_native_bridge_timeout: [503, 'CRAGGemini TUI 未能在时限内连接 native worker'],
