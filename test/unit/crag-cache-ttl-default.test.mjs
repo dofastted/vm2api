@@ -316,3 +316,16 @@ unixTest('CRAG V3 keeps omitted caller TTLs untouched when official_cc_passthrou
   assert.equal(envelope.preserve_cache_breakpoints, true)
   assert.equal(envelope.body.messages[0].content[0].cache_control.ttl, undefined)
 })
+
+unixTest(
+  'CRAG V3 envelope cache_ttl respects caller crag_options.cache_ttl when body.cache_ttl is skipped',
+  async (t) => {
+    const envelope = await runCragHop(t, {
+      compatibility: { cache_ttl: '1h', official_cc_passthrough: false },
+      input: officialBody({ crag_options: { cache_ttl: '5m' } }),
+    })
+    assert.equal(envelope.body.cache_ttl, undefined)
+    assert.equal(envelope.body.crag_options?.cache_ttl, '5m')
+    assert.equal(envelope.cache_ttl, '5m')
+  },
+)

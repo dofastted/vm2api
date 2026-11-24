@@ -488,8 +488,9 @@ export function callerSystemCacheControl(body) {
 function politeEphemeral(control, ttl) {
   if (!control || typeof control !== 'object') return { type: 'ephemeral', ttl }
   if (control.type && control.type !== 'ephemeral') return null
-  if (String(control.ttl || '').trim()) return control
-  return { ...control, type: 'ephemeral', ttl }
+  const existingTtl = String(control.ttl || '').trim()
+  if (control.type === 'ephemeral' && existingTtl) return control
+  return { ...control, type: 'ephemeral', ttl: existingTtl || ttl }
 }
 
 function stampNode(node, ttl) {

@@ -293,6 +293,7 @@ export function prepareCliHopBody(
     cacheTtl = DEFAULT_CACHE_TTL,
     requestContext = null,
     preserveSystem = false,
+    preserveCacheTtl = false,
     preserveThinkingBlocks = false,
     preserveCallerEnvironment = false,
     autoCompactWindow = null,
@@ -378,7 +379,7 @@ export function prepareCliHopBody(
     }
     // Rewritten hops fill omitted TTLs from the configured default so an
     // unmarked ttl does not fall back to implicit 5m and shorten later anchors.
-    if (!preserveSystem) body = fillMissingCacheTtl(body, cacheTtl)
+    if (!preserveSystem && !preserveCacheTtl) body = fillMissingCacheTtl(body, cacheTtl)
     // Assembled official templates own their system markers, not the growing
     // conversation. Fill missing message anchors without moving caller markers.
     const shapedFallback = shaped && !preserveSystem

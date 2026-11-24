@@ -232,6 +232,20 @@ test('a cache_control without ttl is filled in place from default TTL', () => {
   assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_TTL })
 })
 
+test('a cache_control with ttl but missing type receives ephemeral while keeping its ttl', () => {
+  const sysOut = injectSystemTailBreakpoint(
+    { system: [{ type: 'text', text: 'x', cache_control: { ttl: '5m' } }] },
+    '1h',
+  )
+  assert.deepEqual(sysOut.system[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+
+  const toolOut = injectToolsTailBreakpoint(
+    { tools: [{ name: 'Read', input_schema: {}, cache_control: { ttl: '5m', scope: 'org' } }] },
+    '1h',
+  )
+  assert.deepEqual(toolOut.tools[0].cache_control, { type: 'ephemeral', ttl: '5m', scope: 'org' })
+})
+
 test('tools tail skips server tools and deferred tools', () => {
   const out = injectToolsTailBreakpoint({
     tools: [

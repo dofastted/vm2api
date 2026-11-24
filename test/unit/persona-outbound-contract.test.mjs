@@ -1003,6 +1003,27 @@ unixTest('API official passthrough keeps the caller marker without a TTL', async
   assert.deepEqual(out.messages.at(-1).content.at(-1).cache_control, control())
 })
 
+test('CLI official passthrough with dynamic boundary keeps omitted caller TTLs intact', async (t) => {
+  const input = {
+    ...officialInput(officialHistory(undefined)),
+    system: [
+      text('x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=cli; cch=0f0f0;', null),
+      text("You are Claude Code, Anthropic's official CLI for Claude.", undefined),
+      text('__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__', null),
+    ],
+  }
+  const out = await outbound(t, {
+    preset: 'official_full',
+    backend: 'cli',
+    headers: officialHeaders,
+    compatibility: { official_cc_passthrough: true, cache_ttl: '1h' },
+    input,
+  })
+  assert.ok(JSON.stringify(out).includes('cch=0f0f0'))
+  assert.deepEqual(out.system[1].cache_control, control())
+  assert.deepEqual(out.messages.at(-1).content.at(-1).cache_control, control())
+})
+
 // Third-party callers retain explicit TTLs and resolve omitted TTLs from Web config.
 for (const backend of ['cli', 'api']) {
   const run = backend === 'api' ? unixTest : test

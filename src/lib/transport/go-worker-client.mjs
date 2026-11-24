@@ -698,7 +698,7 @@ export function finalizeWorkerPayload(args = {}) {
   return sealPreparedPayload(prepared, prepared.gated)
 }
 
-async function workerEnvelope({
+export async function workerEnvelope({
   requestContext = null,
   body,
   reqHeaders,
@@ -742,7 +742,10 @@ async function workerEnvelope({
     nativeCragRequest(exec, cragPrint) && exec?.workerStatus?.capabilities?.includes('generation_controls_v3')
   // Resolve execution defaults even when cacheTtl is null for mixed-TTL accounting.
   const defaultCacheTtl =
-    cacheTtl ?? finalized.body?.cache_ttl ?? (nativeV3 && routing != null ? cacheTtlFromRouting(routing) : null)
+    cacheTtl ??
+    finalized.body?.cache_ttl ??
+    finalized.body?.crag_options?.cache_ttl ??
+    (nativeV3 && routing != null ? cacheTtlFromRouting(routing) : null)
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
     ...(typeof outgoingCwd === 'string' ? { caller_cwd: outgoingCwd } : {}),

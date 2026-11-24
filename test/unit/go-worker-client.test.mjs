@@ -8,6 +8,7 @@ import {
   callGoWorker,
   finalizeWorkerPayload,
   streamGoWorker,
+  workerEnvelope,
   workerHealth,
   usageFromSseEvent,
   isDownstreamCommitEvent,
@@ -2218,6 +2219,55 @@ unixTest('kernel preparation isolates controls without rewriting tool continuati
       assert.equal(result.transportError, false)
     }
   }
+})
+
+test('workerEnvelope falls back to body.crag_options.cache_ttl before routing default', async () => {
+  const exec = {
+    vmId: 'vm-crag',
+    vm: { id: 'vm-crag', dataplane: 'crag', crag_kernel_version: 'v2' },
+    workerStatus: {
+      runtime_variant: 'crag-v2',
+      capabilities: ['generation_controls_v3', 'linux_tui_native_queue'],
+    },
+  }
+  const routing = { compatibility: { cache_ttl: '1h' } }
+  const baseBody = {
+    model: 'claude-opus-4-6',
+    max_tokens: 128,
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+
+  const fromOptions = await workerEnvelope({
+    exec,
+    cliHop: true,
+    cragPrint: true,
+    routing,
+    cacheTtl: null,
+    body: { ...baseBody, crag_options: { cache_ttl: '5m' } },
+  })
+  assert.equal(fromOptions.envelope.cache_ttl, '5m')
+  assert.equal(fromOptions.envelope.body.cache_ttl, undefined)
+  assert.equal(fromOptions.envelope.body.crag_options?.cache_ttl, '5m')
+
+  const fromBody = await workerEnvelope({
+    exec,
+    cliHop: true,
+    cragPrint: true,
+    routing,
+    cacheTtl: null,
+    body: { ...baseBody, cache_ttl: '5m', crag_options: { cache_ttl: '1h' } },
+  })
+  assert.equal(fromBody.envelope.cache_ttl, '5m')
+
+  const fromRouting = await workerEnvelope({
+    exec,
+    cliHop: true,
+    cragPrint: true,
+    routing,
+    cacheTtl: null,
+    body: baseBody,
+  })
+  assert.equal(fromRouting.envelope.cache_ttl, '1h')
 })
 
 unixTest('streamGoWorker preserves refusal details when an empty response becomes an error', async () => {
