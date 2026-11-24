@@ -672,8 +672,13 @@ export function createGeminiScheduler({
             catalog.accounts.length ? 'gemini_model_unavailable' : 'gemini_no_account',
           )
         }
+        const canTransformForNative = Boolean(streamHost && targetBodyFor)
         const capableAccounts = matchedAccounts.filter(({ account }) =>
-          requiredCapabilities.every((cap) => account.capabilities.has(cap)),
+          requiredCapabilities.every(
+            (cap) =>
+              account.capabilities.has(cap) ||
+              (cap === 'full_gemini_api' && canTransformForNative && account.capabilities.has('multi_turn')),
+          ),
         )
         if (!capableAccounts.length) {
           throw fail(

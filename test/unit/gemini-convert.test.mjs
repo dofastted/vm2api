@@ -8,6 +8,7 @@ import {
   createGeminiEventDecoder,
   createGeminiProtocolStreamEncoder,
   createSseFrameSplitter,
+  escapeNativeTuiSlashes,
   formatGeminiProtocolError,
   formatGeminiProtocolStreamError,
   geminiCamelCase,
@@ -18,7 +19,9 @@ import {
   parseInboundToGemini,
   renderGeminiProtocolResponse,
   sanitizeGeminiSchema,
+  sanitizeNativeTuiText,
   signedToolCallId,
+  stripIllegalControlChars,
   toAnthropicUsage,
   toGoogleUsageMetadata,
   toOpenAIChatUsage,
@@ -672,4 +675,98 @@ test('SSE splitter preserves split multi-byte UTF-8 and Anthropic stream separat
     output_tokens: 30,
     cache_read_input_tokens: 45,
   })
+})
+
+function passesCragValidText(text) {
+  if (typeof text !== 'string' || !text.trim() || !text.isWellFormed()) return false
+  if (/[^\P{Cc}\n\r\t]/u.test(text)) return false
+  return !text.split(/\p{White_Space}+/u).some((word) => word.startsWith('/'))
+}
+
+test('antigravity target sanitizes CLI slash tokens, control chars, billing headers, and empty turns', () => {
+  assert.equal(stripIllegalControlChars('\x1b[31mFAIL\x1b[0m\x00\x08\x7f\u0085\nok\t!'), 'FAIL\nok\t!')
+  assert.equal(escapeNativeTuiSlashes('https://example.test/a foo/bar'), 'https://example.test/a foo/bar')
+  assert.ok(passesCragValidText(sanitizeNativeTuiText('/quit\n/clear a / b // comment /mnt/x/vm2api \x1b[32mOK\x1b[0m')))
+
+  // Claude Code multi-turn payload with slash paths, ANSI logs, billing headers,
+  // server_tool_use/web_search_tool_result, mid-conversation system, empty tool_result, and trailing empty assistant.
+  const anthIr = parseInboundToGemini('anthropic', {
+    model: 'gemini-3.8-flash-high',
+    max_tokens: 1024,
+    system: [
+      { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1; cch=abc' },
+      { type: 'text', text: 'Inspect /etc/hosts\x1b[33m carefully\x1b[0m.\n```\nx-anthropic-billing-header: keep-in-code\n```' },
+    ],
+    messages: [
+      { role: 'system', content: 'Leading system rule.' },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: '(no content)' },
+          { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1; cch=abc\nRead /mnt/x/vm2api/src/server.mjs and check a / b\x00' },
+        ],
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'server_tool_use', id: 'srv_1', name: 'web_search', input: { query: 'test' } },
+          { type: 'web_search_tool_result', tool_use_id: 'srv_1', content: [] },
+          { type: 'tool_use', id: 'toolu_1', name: 'read_file', input: { path: '/mnt/x/vm2api/src/server.mjs', stale: '[undefined]' } },
+          { type: 'tool_use', id: 'toolu_2', name: 'run_cmd', input: {} },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_1', content: '\x1b[32mOK\x1b[0m at /mnt/x/vm2api/src/server.mjs' },
+          { type: 'tool_result', tool_use_id: 'toolu_2', content: '', is_error: true },
+        ],
+      },
+      { role: 'system', content: 'Mid-turn reminder for /tmp/work' },
+      { role: 'assistant', content: [{ type: 'text', text: '   ' }] },
+    ],
+  })
+
+  const agReq = buildGeminiRequest(anthIr, { target: 'antigravity' })
+
+  // System instruction strips billing header & ANSI/control chars, keeps fenced code & legitimate `/` paths.
+  assert.ok(agReq.systemInstruction.parts[0].text.includes('Inspect /etc/hosts carefully.'))
+  assert.ok(agReq.systemInstruction.parts[0].text.includes('Leading system rule.'))
+  assert.ok(agReq.systemInstruction.parts[0].text.includes('x-anthropic-billing-header: keep-in-code'))
+  assert.ok(!agReq.systemInstruction.parts[0].text.includes('cc_version=2.1'))
+  assert.equal(/[^\P{Cc}\n\r\t]/u.test(agReq.systemInstruction.parts[0].text), false)
+
+  // Trailing empty assistant turn popped; final turn is user with valid CRAGGemini text.
+  assert.equal(agReq.contents[agReq.contents.length - 1].role, 'user')
+
+  // Tool call args preserve literal absolute path and strip `[undefined]` keys.
+  const fcTurn = agReq.contents.find((c) => c.parts.some((p) => p.functionCall))
+  assert.deepEqual(fcTurn.parts[0].functionCall.args, { path: '/mnt/x/vm2api/src/server.mjs' })
+
+  // Every text part and functionResponse string passes CRAGGemini's valid_text check.
+  for (const turn of agReq.contents) {
+    for (const part of turn.parts) {
+      if (typeof part.text === 'string') {
+        assert.ok(passesCragValidText(part.text), `Expected CRAGGemini-safe text, got: ${JSON.stringify(part.text)}`)
+      }
+      if (part.functionResponse) {
+        const serialized = JSON.stringify(part.functionResponse.response)
+        assert.ok(
+          passesCragValidText(`[Tool Result \`${part.functionResponse.name}\`]: ${serialized}`),
+          `Expected CRAGGemini-safe tool response, got: ${serialized}`,
+        )
+      }
+    }
+  }
+  const frTurn = agReq.contents.find((c) => c.parts.some((p) => p.functionResponse))
+  assert.equal(frTurn.parts[1].functionResponse.response.result, 'Tool execution failed with no output.')
+
+  // Billing-only or whitespace/placeholder-only user turn normalizes to fallback '.' instead of empty text.
+  const emptyIr = parseInboundToGemini('anthropic', {
+    model: 'gemini-3.8-flash-high',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'x-anthropic-billing-header: cc_version=2; cch=1' }] }],
+  })
+  const emptyAg = buildGeminiRequest(emptyIr, { target: 'antigravity' })
+  assert.deepEqual(emptyAg.contents, [{ role: 'user', parts: [{ text: '.' }] }])
+  assert.ok(passesCragValidText(emptyAg.contents[0].parts[0].text))
 })
