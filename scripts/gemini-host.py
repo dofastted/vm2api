@@ -2629,10 +2629,25 @@ class Host:
             try:
                 with self.lock:
                     cur = self.environments.get(identifier)
-                    if cur and cur.get("auth_state") == "authorized":
-                        self.refresh_account(cur, proxy_url, auto_pull_models=False)
-            except BaseException:
-                pass
+                    if not cur or cur.get("auth_state") != "authorized":
+                        return
+                self.refresh_account(cur, proxy_url, auto_pull_models=False)
+            except Exception as exc:
+                detail = (
+                    f"{exc.status} {exc.code}"
+                    if isinstance(exc, Failure) and exc.code
+                    else str(exc.status)
+                    if isinstance(exc, Failure)
+                    else str(exc)
+                )
+                if proxy_url and proxy_url in detail:
+                    detail = detail.replace(proxy_url, "[redacted]")
+                detail = " ".join(detail.splitlines()).strip()
+                err = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+                print(
+                    f"Gemini re-auth check failed env={identifier} error={err}",
+                    file=sys.stderr,
+                )
             finally:
                 with self.lock:
                     getattr(self, "_reauth_checking", set()).discard(identifier)
