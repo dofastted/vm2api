@@ -177,6 +177,15 @@ EOF
   fi
 fi
 
+# Protect existing SQLite deployments when upgrading to PG-capable releases:
+# do not let docker-compose.yml's default DATABASE_HOST flip an unmigrated kin.db onto PostgreSQL.
+if [ -f data/kin.db ]; then
+  touch .env
+  if ! grep -qE '^(VM2API_DB_DRIVER|DATABASE_URL|VM2API_DATABASE_URL)=' .env; then
+    printf '\nVM2API_DB_DRIVER=sqlite\n' >> .env
+  fi
+fi
+
 compose up -d --no-deps --force-recreate vm2api
 CURRENT_ID=$(docker inspect --format '{{.Id}}' "$CONTAINER")
 if [ "$CURRENT_ID" = "$PREVIOUS_ID" ]; then

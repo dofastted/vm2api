@@ -42,6 +42,20 @@ HOST_ARCH=""
 REQUESTED_ARCH=""
 GEMINI_PAYLOAD_SOURCE=""
 PREV_IMAGE_TAG=""
+DB_DRIVER_ARG=""
+DATABASE_URL_ARG=""
+REDIS_URL_ARG=""
+NO_REDIS=0
+PG_PORT_ARG=""
+REDIS_PORT_ARG=""
+LOCAL_DATA=0
+PG_DATA_DIR_ARG=""
+REDIS_DATA_DIR_ARG=""
+AUTO_MIGRATE=0
+AUTO_INSTALL_DEPS=1
+PG_PORT_EXPLICIT=0
+REDIS_PORT_EXPLICIT=0
+APT_UPDATED=0
 
 info() { echo -e "${BLUE}[信息]${NC} $*"; }
 ok() { echo -e "${GREEN}[成功]${NC} $*"; }
@@ -70,9 +84,10 @@ usage() {
   prepare-native       仅准备 Docker CRAG 的宿主 AppArmor userns 权限
   prepare-crag-host    仅准备 CRAG 订阅宿主 ID，不重启服务
   prepare-gemini       启用宿主 Gemini 服务并安装签名载荷（amd64 默认自动获取）
+  prepare-deps         检查并自动补装宿主基础/Docker/PostgreSQL 客户端依赖
   check                对比当前版本与最新 Release，打印 changelog
   changelog            打印本地 CHANGELOG.md
-  status               当前版本、容器、探活
+  status               当前版本、容器、数据库引擎、探活
   db-migrate           将现有 SQLite 数据库平滑迁移替换为 PostgreSQL（调用 replace-db-to-pg.sh）
   db-status            查看当前数据库引擎、PG/Redis 容器与迁移状态
   db-rollback          一键回滚回原 SQLite 配置并重启控制面
@@ -83,6 +98,17 @@ usage() {
   --crag-version TAG   指定 CRAG Release：vX.Y.Z 或 payload-YYYY.MM.DD-crag-X.Y.Z[-legacy]（省略为最新正式版）
   --gemini-payload-source DIR  已解包的 Gemini 签名载荷目录（Linux amd64，需独立配置发行公钥）
   --dir PATH           安装目录（默认 ${INSTALL_DIR}）
+  --db postgres|sqlite 指定数据库引擎（全新安装默认 postgres；升级存量 SQLite 默认保留 sqlite）
+  --database-url URL   使用外部/云端 PostgreSQL 连接串（自动跳过本地 PG 容器）
+  --redis-url URL      使用外部/云端 Redis 连接串（自动跳过本地 Redis 容器）
+  --no-redis           禁用 Redis L2 缓存，仅用 L1 + PG LISTEN/NOTIFY（不启本地 Redis 容器）
+  --pg-port PORT       本地 PostgreSQL 监听端口（仅 127.0.0.1，默认 5432，冲突自动顺延）
+  --redis-port PORT    本地 Redis 监听端口（仅 127.0.0.1，默认 6379，冲突自动顺延）
+  --local-data         启用 docker-compose.local.yml 将 PG/Redis 持久化到宿主机目录
+  --pg-data-dir DIR    指定本地 PG 数据目录（隐含 --local-data）
+  --redis-data-dir DIR 指定本地 Redis 数据目录（隐含 --local-data）
+  --auto-migrate       升级存量 SQLite 部署后，自动执行无缝迁移切换至 PostgreSQL
+  --no-install-deps    不自动安装缺失的系统依赖，仅检查并报错
   --yes                非交互
   --no-start           只拉代码，不启动控制面或准备 Gemini
   --no-sync-wrap       跳过 CRAG 获取及槽内 kernel 检查、调度与同步
@@ -177,14 +203,152 @@ compose() {
   fi
 }
 
+detect_pkg_mgr() {
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "apt"
+  elif command -v dnf >/dev/null 2>&1; then
+    echo "dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    echo "yum"
+  elif command -v apk >/dev/null 2>&1; then
+    echo "apk"
+  else
+    echo ""
+  fi
+}
+
+install_host_pkgs() {
+  local mgr
+  mgr="$(detect_pkg_mgr)"
+  [ $# -gt 0 ] || return 0
+  if [ "$AUTO_INSTALL_DEPS" != 1 ]; then
+    err "缺少宿主依赖软件包: $*（已启用 --no-install-deps，请手动安装后重试）"
+    return 1
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    err "自动安装依赖需要 root 权限: $*"
+    return 1
+  fi
+  case "$mgr" in
+    apt)
+      if [ "$APT_UPDATED" = 0 ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        APT_UPDATED=1
+      fi
+      info "自动安装宿主依赖 (apt): $*"
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@"
+      ;;
+    dnf)
+      info "自动安装宿主依赖 (dnf): $*"
+      dnf install -y "$@"
+      ;;
+    yum)
+      info "自动安装宿主依赖 (yum): $*"
+      yum install -y "$@"
+      ;;
+    apk)
+      info "自动安装宿主依赖 (apk): $*"
+      apk add --no-cache "$@"
+      ;;
+    *)
+      err "未识别系统包管理器，请手动安装: $*"
+      return 1
+      ;;
+  esac
+}
+
+ensure_host_dependencies() {
+  local mgr
+  mgr="$(detect_pkg_mgr)"
+  local -a missing_pkgs=()
+
+  command -v git >/dev/null 2>&1 || missing_pkgs+=(git)
+  command -v curl >/dev/null 2>&1 || missing_pkgs+=(curl)
+  command -v python3 >/dev/null 2>&1 || missing_pkgs+=(python3)
+  command -v openssl >/dev/null 2>&1 || missing_pkgs+=(openssl)
+  if ! command -v psql >/dev/null 2>&1 || ! command -v pg_dump >/dev/null 2>&1 || ! command -v pg_isready >/dev/null 2>&1; then
+    case "$mgr" in
+      apt|apk) missing_pkgs+=(postgresql-client) ;;
+      dnf|yum) missing_pkgs+=(postgresql) ;;
+      *) missing_pkgs+=(postgresql-client) ;;
+    esac
+  fi
+
+  if [ "${#missing_pkgs[@]}" -gt 0 ]; then
+    if [ "$AUTO_INSTALL_DEPS" = 1 ] && [ "$(id -u)" -eq 0 ] && [ -n "$mgr" ]; then
+      install_host_pkgs "${missing_pkgs[@]}" || exit 1
+    else
+      err "缺少依赖: ${missing_pkgs[*]}"
+      info "Ubuntu/Debian: apt-get update && apt-get install -y git curl ca-certificates python3 openssl postgresql-client"
+      exit 1
+    fi
+  fi
+
+  # Optional redis-cli for Redis diagnostics (best-effort, non-fatal)
+  if [ "$NO_REDIS" = 0 ] && ! command -v redis-cli >/dev/null 2>&1 && [ "$AUTO_INSTALL_DEPS" = 1 ] && [ "$(id -u)" -eq 0 ]; then
+    case "$mgr" in
+      apt)
+        [ "$APT_UPDATED" = 1 ] || { DEBIAN_FRONTEND=noninteractive apt-get update -qq || true; APT_UPDATED=1; }
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends redis-tools >/dev/null 2>&1 || true
+        ;;
+      dnf) dnf install -y redis >/dev/null 2>&1 || true ;;
+      yum) yum install -y redis >/dev/null 2>&1 || true ;;
+      apk) apk add --no-cache redis >/dev/null 2>&1 || true ;;
+    esac
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    if [ "$AUTO_INSTALL_DEPS" = 1 ] && [ "$(id -u)" -eq 0 ] && [ -n "$mgr" ]; then
+      info "未检测到 Docker，正在自动安装 Docker Engine 与 Compose 插件..."
+      case "$mgr" in
+        apt)
+          install_host_pkgs ca-certificates curl gnupg || exit 1
+          if ! (curl -fsSL https://get.docker.com | sh); then
+            install_host_pkgs docker.io docker-compose-v2 || install_host_pkgs docker.io docker-compose || exit 1
+          fi
+          ;;
+        dnf|yum)
+          install_host_pkgs ca-certificates curl || exit 1
+          if ! (curl -fsSL https://get.docker.com | sh); then
+            install_host_pkgs docker docker-compose-plugin || exit 1
+          fi
+          ;;
+        apk)
+          install_host_pkgs docker docker-cli-compose || exit 1
+          ;;
+      esac
+    else
+      err "缺少依赖: docker"
+      info "Ubuntu: apt-get update && apt-get install -y git curl ca-certificates docker.io"
+      exit 1
+    fi
+  fi
+
+  if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+    if [ "$AUTO_INSTALL_DEPS" = 1 ] && [ "$(id -u)" -eq 0 ] && [ -n "$mgr" ]; then
+      info "未检测到 Docker Compose 插件，正在自动安装..."
+      case "$mgr" in
+        apt) install_host_pkgs docker-compose-plugin || install_host_pkgs docker-compose-v2 || install_host_pkgs docker-compose || exit 1 ;;
+        dnf|yum) install_host_pkgs docker-compose-plugin || install_host_pkgs docker-compose || exit 1 ;;
+        apk) install_host_pkgs docker-cli-compose || exit 1 ;;
+      esac
+    fi
+  fi
+
+  if ! docker info >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+    systemctl enable --now docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1 || true
+  fi
+}
+
 require_cmds() {
+  ensure_host_dependencies
   local missing=()
   for c in git curl docker; do
     command -v "$c" >/dev/null 2>&1 || missing+=("$c")
   done
   if [ ${#missing[@]} -gt 0 ]; then
     err "缺少依赖: ${missing[*]}"
-    info "Ubuntu: apt-get update && apt-get install -y git curl ca-certificates docker.io"
+    info "Ubuntu: apt-get update && apt-get install -y git curl ca-certificates docker.io postgresql-client"
     exit 1
   fi
   if ! docker info >/dev/null 2>&1; then
@@ -310,12 +474,34 @@ env_get() {
 env_set() {
   local name="$1"
   local value="$2"
-  local envf="${INSTALL_DIR}/.env"
-  if grep -qE "^${name}=" "$envf" 2>/dev/null; then
-    sed -i.bak "s|^${name}=.*|${name}=${value}|" "$envf"
-    rm -f "${envf}.bak"
-  else
-    printf '%s=%s\n' "$name" "$value" >>"$envf"
+  local envf="${3:-${INSTALL_DIR}/.env}"
+  local tmp
+  touch "$envf"
+  tmp="$(mktemp "${envf}.XXXXXX")"
+  _VM2API_ENV_KEY="$name" _VM2API_ENV_VAL="$value" awk '
+    BEGIN { key = ENVIRON["_VM2API_ENV_KEY"]; val = ENVIRON["_VM2API_ENV_VAL"]; done = 0 }
+    {
+      idx = index($0, "=")
+      if (idx > 0 && substr($0, 1, idx - 1) == key) {
+        print key "=" val
+        done = 1
+        next
+      }
+      print
+    }
+    END { if (!done) print key "=" val }
+  ' "$envf" >"$tmp"
+  mv -f "$tmp" "$envf"
+}
+
+ensure_compose_file_includes() {
+  local extra="$1" cur
+  [ -f "${INSTALL_DIR}/${extra}" ] || return 0
+  cur="$(env_get COMPOSE_FILE)"
+  if [ -z "$cur" ]; then
+    env_set COMPOSE_FILE "docker-compose.yml:${extra}"
+  elif ! printf ':%s:' "$cur" | grep -Fq ":${extra}:"; then
+    env_set COMPOSE_FILE "${cur}:${extra}"
   fi
 }
 
@@ -443,9 +629,54 @@ ensure_env() {
   env_set_if_empty VM2API_PG_PORT "5432" || true
   env_set_if_empty REDIS_PASSWORD "$(gen_secret)" || true
   env_set_if_empty VM2API_REDIS_PORT "6379" || true
+
+  # Apply explicit PostgreSQL / Redis CLI overrides when provided.
+  # When upgrading an existing unmigrated SQLite install with --auto-migrate, defer writing
+  # DATABASE_URL / REDIS_URL until replace-db-to-pg.sh backs up .env and completes data cutover.
+  local defer_pg_cutover=0
+  if [ "$AUTO_MIGRATE" = 1 ] && [ -f "${INSTALL_DIR}/data/kin.db" ] && [ "$(env_get VM2API_DB_DRIVER)" != "postgres" ]; then
+    defer_pg_cutover=1
+  fi
+
+  if [ "$defer_pg_cutover" = 0 ]; then
+    if [ -n "$PG_PORT_ARG" ]; then
+      env_set VM2API_PG_PORT "$PG_PORT_ARG"
+    fi
+    if [ -n "$REDIS_PORT_ARG" ]; then
+      env_set VM2API_REDIS_PORT "$REDIS_PORT_ARG"
+    fi
+    if [ -n "$DATABASE_URL_ARG" ]; then
+      env_set DATABASE_URL "$DATABASE_URL_ARG"
+      if [ -z "$DB_DRIVER_ARG" ] && [ ! -f "${INSTALL_DIR}/data/kin.db" ]; then
+        DB_DRIVER_ARG="postgres"
+      fi
+    fi
+    if [ "$NO_REDIS" = 1 ]; then
+      env_set VM2API_REDIS_DISABLED "1"
+    elif [ -n "$REDIS_URL_ARG" ]; then
+      env_set REDIS_URL "$REDIS_URL_ARG"
+      env_set VM2API_REDIS_DISABLED "0"
+    fi
+    if [ "$LOCAL_DATA" = 1 ]; then
+      [ -n "$PG_DATA_DIR_ARG" ] && env_set VM2API_PG_DATA_DIR "$PG_DATA_DIR_ARG"
+      [ -n "$REDIS_DATA_DIR_ARG" ] && env_set VM2API_REDIS_DATA_DIR "$REDIS_DATA_DIR_ARG"
+      ensure_compose_file_includes "docker-compose.local.yml"
+    fi
+  fi
+
   # 升级保护：若检测到既有 SQLite (data/kin.db) 且 .env 尚未声明 VM2API_DB_DRIVER / DATABASE_URL，
-  # 先保持 sqlite 防止误启空 PG 库，待运维执行 db-migrate / replace-db-to-pg.sh 完成迁移切换。
-  if [ -z "$(env_get VM2API_DB_DRIVER)" ]; then
+  # 先保持 sqlite 防止误启空 PG 库，待运维执行 db-migrate / --auto-migrate 完成迁移切换。
+  if [ "$defer_pg_cutover" = 1 ]; then
+    env_set VM2API_DB_DRIVER "sqlite"
+    info "检测到既有 SQLite (${INSTALL_DIR}/data/kin.db)，升级控制面完成后将自动执行无缝迁移切换至 PostgreSQL"
+  elif [ -n "$DB_DRIVER_ARG" ]; then
+    if [ "$DB_DRIVER_ARG" = "postgres" ] && [ -f "${INSTALL_DIR}/data/kin.db" ] && [ "$(env_get VM2API_DB_DRIVER)" != "postgres" ]; then
+      env_set VM2API_DB_DRIVER "sqlite"
+      warn "检测到既有 SQLite (${INSTALL_DIR}/data/kin.db)，暂保持 sqlite 防止误启空 PG 库；请加 --auto-migrate 或运行 replace-db-to-pg.sh 完成迁移"
+    else
+      env_set VM2API_DB_DRIVER "$DB_DRIVER_ARG"
+    fi
+  elif [ -z "$(env_get VM2API_DB_DRIVER)" ]; then
     if [ -f "${INSTALL_DIR}/data/kin.db" ] && [ -z "$(env_get DATABASE_URL)" ] && [ -z "$(env_get VM2API_DATABASE_URL)" ]; then
       env_set VM2API_DB_DRIVER "sqlite"
       warn "检测到已有 SQLite 数据库 (${INSTALL_DIR}/data/kin.db)，暂保持 VM2API_DB_DRIVER=sqlite 以防数据切换丢失"
@@ -594,8 +825,9 @@ fetch_release_files() {
   fetch_file "$tag" VERSION "${INSTALL_DIR}/VERSION"
   fetch_file "$tag" CHANGELOG.md "${INSTALL_DIR}/CHANGELOG.md" 1
   fetch_file "$tag" deploy/install.sh "${INSTALL_DIR}/deploy/install.sh" 1
+  fetch_file "$tag" deploy/install-pg.sh "${INSTALL_DIR}/deploy/install-pg.sh" 1
   fetch_file "$tag" deploy/replace-db-to-pg.sh "${INSTALL_DIR}/deploy/replace-db-to-pg.sh" 1
-  chmod +x "${INSTALL_DIR}/deploy/install.sh" "${INSTALL_DIR}/deploy/replace-db-to-pg.sh" 2>/dev/null || true
+  chmod +x "${INSTALL_DIR}/deploy/install.sh" "${INSTALL_DIR}/deploy/install-pg.sh" "${INSTALL_DIR}/deploy/replace-db-to-pg.sh" 2>/dev/null || true
   if [ "$HOST_ARCH" = arm64 ]; then
     fetch_file "$tag" deploy/prepare-arm64.py "${INSTALL_DIR}/deploy/prepare-arm64.py" 1
     if [ ! -f "${INSTALL_DIR}/deploy/prepare-arm64.py" ]; then
@@ -1201,8 +1433,187 @@ prepare_docker_crag_apparmor() {
   ok "Docker CRAG userns profile 已加载并保存: $profile"
 }
 
+need_local_pg() {
+  local driver db_url db_host
+  driver="$(env_get VM2API_DB_DRIVER)"
+  if [ "$driver" = "sqlite" ] || [ "$driver" = "sqlite3" ]; then
+    return 1
+  fi
+  db_url="$(env_get DATABASE_URL)"
+  db_url="${db_url:-$(env_get VM2API_DATABASE_URL)}"
+  if [ -n "$db_url" ]; then
+    return 1
+  fi
+  db_host="$(env_get DATABASE_HOST)"
+  if [ -n "$db_host" ] && [ "$db_host" != "127.0.0.1" ] && [ "$db_host" != "localhost" ]; then
+    return 1
+  fi
+  return 0
+}
+
+need_local_redis() {
+  local driver redis_disabled redis_url redis_host
+  driver="$(env_get VM2API_DB_DRIVER)"
+  if [ "$driver" = "sqlite" ] || [ "$driver" = "sqlite3" ]; then
+    return 1
+  fi
+  redis_disabled="$(env_get VM2API_REDIS_DISABLED)"
+  if [ "$redis_disabled" = "1" ] || [ "$redis_disabled" = "true" ]; then
+    return 1
+  fi
+  redis_url="$(env_get REDIS_URL)"
+  redis_url="${redis_url:-$(env_get VM2API_REDIS_URL)}"
+  if [ -n "$redis_url" ]; then
+    return 1
+  fi
+  redis_host="$(env_get REDIS_HOST)"
+  if [ -n "$redis_host" ] && [ "$redis_host" != "127.0.0.1" ] && [ "$redis_host" != "localhost" ]; then
+    return 1
+  fi
+  return 0
+}
+
+is_local_port_busy() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnH "sport = :${port}" 2>/dev/null | grep -q . && return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import socket,sys
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.settimeout(0.3)
+rc=s.connect_ex(("127.0.0.1",int(sys.argv[1])))
+s.close()
+sys.exit(0 if rc==0 else 1)' "$port" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+container_owns_port() {
+  local cname="$1" port="$2"
+  command -v docker >/dev/null 2>&1 || return 1
+  docker ps --filter "name=^/${cname}$" --format '{{.Ports}}' 2>/dev/null | grep -qE "127\.0\.0\.1:${port}->|:${port}->"
+}
+
+resolve_local_db_ports() {
+  local want_pg="$1" want_redis="$2"
+  # Only check real host ports when docker-compose.yml exists and Docker daemon is reachable.
+  [ -f "${INSTALL_DIR}/docker-compose.yml" ] || return 0
+  command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || return 0
+
+  if [ "$want_pg" = 1 ]; then
+    local pg_port pg_cname p found=0
+    pg_port="$(env_get VM2API_PG_PORT)"
+    pg_port="${pg_port:-5432}"
+    pg_cname="$(env_get VM2API_PG_CONTAINER_NAME)"
+    pg_cname="${pg_cname:-vm2api-postgres}"
+    if is_local_port_busy "$pg_port" && ! container_owns_port "$pg_cname" "$pg_port"; then
+      if [ "$PG_PORT_EXPLICIT" = 1 ]; then
+        err "PostgreSQL 指定端口 127.0.0.1:${pg_port} 已被本机其他服务占用，请更换 --pg-port"
+        exit 1
+      fi
+      for p in $(seq 5433 5460); do
+        if ! is_local_port_busy "$p"; then
+          warn "PostgreSQL 默认端口 127.0.0.1:${pg_port} 已被其他服务占用，自动改用空闲端口 ${p}"
+          env_set VM2API_PG_PORT "$p"
+          found=1
+          break
+        fi
+      done
+      if [ "$found" != 1 ]; then
+        err "PostgreSQL 端口 ${pg_port} 及 5433-5460 均被占用，请用 --pg-port 指定空闲端口"
+        exit 1
+      fi
+    fi
+  fi
+
+  if [ "$want_redis" = 1 ]; then
+    local r_port r_cname p found=0
+    r_port="$(env_get VM2API_REDIS_PORT)"
+    r_port="${r_port:-6379}"
+    r_cname="$(env_get VM2API_REDIS_CONTAINER_NAME)"
+    r_cname="${r_cname:-vm2api-redis}"
+    if is_local_port_busy "$r_port" && ! container_owns_port "$r_cname" "$r_port"; then
+      if [ "$REDIS_PORT_EXPLICIT" = 1 ]; then
+        err "Redis 指定端口 127.0.0.1:${r_port} 已被本机其他服务占用，请更换 --redis-port"
+        exit 1
+      fi
+      for p in $(seq 6380 6409); do
+        if ! is_local_port_busy "$p"; then
+          warn "Redis 默认端口 127.0.0.1:${r_port} 已被其他服务占用，自动改用空闲端口 ${p}"
+          env_set VM2API_REDIS_PORT "$p"
+          found=1
+          break
+        fi
+      done
+      if [ "$found" != 1 ]; then
+        err "Redis 端口 ${r_port} 及 6380-6409 均被占用，请用 --redis-port 指定空闲端口"
+        exit 1
+      fi
+    fi
+  fi
+}
+
+wait_local_service_ready() {
+  local svc="$1" cname cid i
+  if [ "$svc" = "postgres" ]; then
+    cname="$(env_get VM2API_PG_CONTAINER_NAME)"
+    cname="${cname:-vm2api-postgres}"
+    local pg_user pg_db
+    pg_user="$(env_get POSTGRES_USER)"; pg_user="${pg_user:-vm2api}"
+    pg_db="$(env_get POSTGRES_DB)"; pg_db="${pg_db:-vm2api}"
+    for i in $(seq 1 45); do
+      cid="$(compose ps -q postgres 2>/dev/null | head -n1 || true)"
+      [ -n "$cid" ] || cid="$(docker ps -q --filter "name=^/${cname}$" 2>/dev/null | head -n1 || true)"
+      if [ -n "$cid" ] && docker exec "$cid" pg_isready -U "$pg_user" -d "$pg_db" >/dev/null 2>&1; then
+        ok "本地 PostgreSQL 容器已就绪"
+        return 0
+      fi
+      sleep 2
+    done
+    err "本地 PostgreSQL 容器启动超时，请检查 docker logs ${cname}"
+    return 1
+  elif [ "$svc" = "redis" ]; then
+    cname="$(env_get VM2API_REDIS_CONTAINER_NAME)"
+    cname="${cname:-vm2api-redis}"
+    local r_pass
+    r_pass="$(env_get REDIS_PASSWORD)"
+    for i in $(seq 1 25); do
+      cid="$(compose ps -q redis 2>/dev/null | head -n1 || true)"
+      [ -n "$cid" ] || cid="$(docker ps -q --filter "name=^/${cname}$" 2>/dev/null | head -n1 || true)"
+      if [ -n "$cid" ] && docker exec "$cid" redis-cli -a "$r_pass" --no-auth-warning ping 2>/dev/null | grep -qx PONG; then
+        ok "本地 Redis 容器已就绪"
+        return 0
+      fi
+      sleep 1
+    done
+    warn "本地 Redis 容器探活超时（vm2api 将自动降级至 L1 + PG LISTEN/NOTIFY）"
+    return 0
+  fi
+}
+
+verify_db_runtime() {
+  local key port metrics
+  key="$(env_get VM2API_API_KEY)"
+  key="${key:-$(env_get KIN_API_KEY)}"
+  [ -n "$key" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  port="$(env_get PORT)"
+  port="${port:-$DEFAULT_PORT}"
+  metrics="$(curl -fsS --noproxy '*' -H "Authorization: Bearer ${key}" "http://127.0.0.1:${port}/api/panel/database/metrics" 2>/dev/null || true)"
+  [ -n "$metrics" ] || return 0
+  printf '%s' "$metrics" | python3 -c 'import json, sys
+try:
+    d = json.load(sys.stdin).get("data") or {}
+    db = d.get("database") or {}
+    cache = d.get("cache") or {}
+    print("数据库状态: engine=%s ok=%s pg_version=%s cache_mode=%s" % (db.get("engine"), db.get("ok"), db.get("pg_version"), cache.get("mode")))
+except Exception:
+    pass' || true
+}
+
 start_stack() {
-  local mode auto_sync_wrap log
+  local mode auto_sync_wrap log local_pg=0 local_redis=0
   mode="$(install_mode)"
   if [ "$NO_START" = 1 ]; then
     warn "--no-start：跳过 compose up"
@@ -1217,10 +1628,22 @@ start_stack() {
     info "切换到新版本：deploy/bluegreen/bg-deploy.sh（带新迁移时用 --restart），见 docs/BLUEGREEN.md"
     return
   fi
+  need_local_pg && local_pg=1 || local_pg=0
+  need_local_redis && local_redis=1 || local_redis=0
+  resolve_local_db_ports "$local_pg" "$local_redis"
+
   auto_sync_wrap="${KIN_AUTO_SYNC_WRAP:-0}"
   if [ "$mode" = image ]; then
-    info "docker compose pull && up -d（拉预构建镜像，本机不构建）"
-    if ! compose pull; then
+    local -a pull_services=()
+    if [ "$local_pg" = 1 ] && [ "$local_redis" = 1 ]; then
+      info "docker compose pull && up -d（拉预构建镜像 + 本地 PG/Redis，本机不构建）"
+    else
+      [ "$local_pg" = 1 ] && pull_services+=(postgres)
+      [ "$local_redis" = 1 ] && pull_services+=(redis)
+      pull_services+=("$SERVICE_NAME")
+      info "docker compose pull ${pull_services[*]} && up -d（按需拉取镜像，跳过未启用的本地数据库/缓存服务）"
+    fi
+    if ! compose pull "${pull_services[@]}"; then
       if [ "$HOST_ARCH" = arm64 ]; then
         err "拉取 ARM64 控制面镜像失败：检查网络，并确认该版本已发布 $(env_get VM2API_IMAGE_TAG) 镜像。"
       else
@@ -1229,10 +1652,26 @@ start_stack() {
       restore_image_tag
       exit 1
     fi
-    if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d; then
-      wait_health || true
-      refresh_slot_services
-      return
+    if [ "$local_pg" = 1 ] && [ "$local_redis" = 1 ]; then
+      if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d; then
+        wait_health || true
+        verify_db_runtime || true
+        refresh_slot_services
+        return
+      fi
+    else
+      if [ "$local_pg" = 1 ]; then
+        compose up -d postgres && wait_local_service_ready postgres
+      fi
+      if [ "$local_redis" = 1 ]; then
+        compose up -d redis && wait_local_service_ready redis
+      fi
+      if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d --no-deps "$SERVICE_NAME"; then
+        wait_health || true
+        verify_db_runtime || true
+        refresh_slot_services
+        return
+      fi
     fi
     err "docker compose 失败。日志: docker logs ${SERVICE_NAME}"
     exit 1
@@ -1240,10 +1679,23 @@ start_stack() {
   ensure_build_context
   info "docker compose up -d --build（源码模式；只重建控制面，不 docker rm 槽）"
   log="$(mktemp)"
-  if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d --build >"$log" 2>&1; then
+  local -a build_up_args=()
+  if [ "$local_pg" = 1 ] && [ "$local_redis" = 1 ]; then
+    build_up_args=(up -d --build)
+  else
+    if [ "$local_pg" = 1 ]; then
+      compose up -d postgres && wait_local_service_ready postgres
+    fi
+    if [ "$local_redis" = 1 ]; then
+      compose up -d redis && wait_local_service_ready redis
+    fi
+    build_up_args=(up -d --no-deps --build "$SERVICE_NAME")
+  fi
+  if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose "${build_up_args[@]}" >"$log" 2>&1; then
     cat "$log"
     rm -f "$log"
     wait_health || true
+    verify_db_runtime || true
     refresh_slot_services
     return
   fi
@@ -1251,9 +1703,10 @@ start_stack() {
   if grep -qE 'CHANGELOG\.md|"/CHANGELOG\.md": not found' "$log"; then
     warn "compose 因 CHANGELOG.md 失败，补 .dockerignore 后重试一次"
     ensure_build_context
-    if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d --build; then
+    if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose "${build_up_args[@]}"; then
       rm -f "$log"
       wait_health || true
+      verify_db_runtime || true
       refresh_slot_services
       return
     fi
@@ -1400,6 +1853,21 @@ cmd_upgrade() {
   else
     warn "--no-sync-wrap：已跳过槽内 CLI / kernel 同步"
   fi
+  if [ "$AUTO_MIGRATE" = 1 ] && [ "$NO_START" = 0 ] && [ -f "${INSTALL_DIR}/data/kin.db" ] && [ "$(env_get VM2API_DB_DRIVER)" != "postgres" ]; then
+    info "升级已完成，开始执行 --auto-migrate（SQLite → PostgreSQL 无缝迁移）..."
+    local -a margs=()
+    [ -n "$DATABASE_URL_ARG" ] && margs+=(--database-url "$DATABASE_URL_ARG")
+    [ -n "$REDIS_URL_ARG" ] && margs+=(--redis-url "$REDIS_URL_ARG")
+    [ "$NO_REDIS" = 1 ] && margs+=(--no-redis)
+    [ -n "$PG_PORT_ARG" ] && margs+=(--pg-port "$PG_PORT_ARG")
+    [ -n "$REDIS_PORT_ARG" ] && margs+=(--redis-port "$REDIS_PORT_ARG")
+    [ "$LOCAL_DATA" = 1 ] && margs+=(--local-data)
+    [ -n "$PG_DATA_DIR_ARG" ] && margs+=(--pg-data-dir "$PG_DATA_DIR_ARG")
+    [ -n "$REDIS_DATA_DIR_ARG" ] && margs+=(--redis-data-dir "$REDIS_DATA_DIR_ARG")
+    [ "$AUTO_INSTALL_DEPS" = 0 ] && margs+=(--no-install-deps)
+    [ "$ASSUME_YES" = 1 ] && margs+=(--yes)
+    cmd_db_migrate "${margs[@]}"
+  fi
   ok "已更新到 $(local_version)"
   print_login_banner
 }
@@ -1454,6 +1922,9 @@ cmd_status() {
   if [ -d "${INSTALL_DIR}/.git" ]; then
     echo "git:     $(git -C "${INSTALL_DIR}" describe --tags --always 2>/dev/null || echo unknown)"
   fi
+  if [ -f "${INSTALL_DIR}/.env" ] && [ -n "$(env_get VM2API_DB_DRIVER)" ]; then
+    echo "数据库:  $(env_get VM2API_DB_DRIVER)"
+  fi
   if command -v docker >/dev/null 2>&1; then
     docker ps --filter "name=${SERVICE_NAME}" --format '容器:    {{.Names}}  {{.Status}}' || true
   fi
@@ -1489,14 +1960,50 @@ cmd_uninstall() {
   info "若要整目录删除: rm -rf ${INSTALL_DIR}"
 }
 
+ensure_migrate_script() {
+  local script="${INSTALL_DIR}/deploy/replace-db-to-pg.sh"
+  if [ -f "$script" ]; then
+    echo "$script"
+    return 0
+  fi
+  local self_dir=""
+  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [ -f "${self_dir}/replace-db-to-pg.sh" ]; then
+      mkdir -p "${INSTALL_DIR}/deploy"
+      cp -f "${self_dir}/replace-db-to-pg.sh" "$script"
+      chmod +x "$script" 2>/dev/null || true
+      echo "$script"
+      return 0
+    fi
+  fi
+  local ref="${TARGET_VERSION:-main}"
+  mkdir -p "${INSTALL_DIR}/deploy"
+  info "未检测到本地迁移脚本，正在自动获取 ${ref}/deploy/replace-db-to-pg.sh ..."
+  fetch_file "$ref" deploy/replace-db-to-pg.sh "$script" 0
+  chmod +x "$script" 2>/dev/null || true
+  echo "$script"
+}
+
 cmd_db_migrate() {
   need_root
-  local script="${INSTALL_DIR}/deploy/replace-db-to-pg.sh"
-  if [ ! -f "$script" ]; then
-    err "缺少迁移脚本: ${script}，请先执行 upgrade 更新部署文件"
-    exit 1
+  local has_dir=0 i=1
+  while [ $i -le $# ]; do
+    if [ "${!i}" = "--dir" ] && [ $((i + 1)) -le $# ]; then
+      local next=$((i + 1))
+      INSTALL_DIR="${!next}"
+      has_dir=1
+      break
+    fi
+    i=$((i + 1))
+  done
+  local script
+  script="$(ensure_migrate_script)"
+  if [ "$has_dir" = 1 ]; then
+    bash "$script" "$@"
+  else
+    bash "$script" --dir "$INSTALL_DIR" "$@"
   fi
-  bash "$script" --dir "$INSTALL_DIR" "$@"
 }
 
 cmd_db_status() {
@@ -1510,11 +2017,8 @@ cmd_db_status() {
 
 cmd_db_rollback() {
   need_root
-  local script="${INSTALL_DIR}/deploy/replace-db-to-pg.sh"
-  if [ ! -f "$script" ]; then
-    err "缺少回滚脚本: ${script}"
-    exit 1
-  fi
+  local script
+  script="$(ensure_migrate_script)"
   bash "$script" --dir "$INSTALL_DIR" --rollback
 }
 
@@ -1522,7 +2026,7 @@ COMMAND="install"
 EXTRA_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    install|upgrade|update|crag-update|prepare-native|prepare-crag-host|prepare-gemini|check|changelog|status|db-migrate|db-status|db-rollback|uninstall)
+    install|upgrade|update|crag-update|prepare-native|prepare-crag-host|prepare-gemini|prepare-deps|check|changelog|status|db-migrate|db-status|db-rollback|uninstall)
       COMMAND="$1"
       shift
       if [ "$COMMAND" = "db-migrate" ]; then
@@ -1554,6 +2058,64 @@ while [ $# -gt 0 ]; do
     --dir)
       INSTALL_DIR="$2"
       shift 2
+      ;;
+    --db)
+      if [ $# -lt 2 ] || ! [[ "$2" =~ ^(postgres|sqlite)$ ]]; then
+        err "--db 仅支持 postgres 或 sqlite"
+        exit 1
+      fi
+      DB_DRIVER_ARG="$2"
+      shift 2
+      ;;
+    --database-url)
+      [ $# -ge 2 ] || { err "--database-url 需要 PostgreSQL 连接串"; exit 1; }
+      DATABASE_URL_ARG="$2"
+      shift 2
+      ;;
+    --redis-url)
+      [ $# -ge 2 ] || { err "--redis-url 需要 Redis 连接串"; exit 1; }
+      REDIS_URL_ARG="$2"
+      shift 2
+      ;;
+    --no-redis)
+      NO_REDIS=1
+      shift
+      ;;
+    --pg-port)
+      [ $# -ge 2 ] || { err "--pg-port 需要端口号"; exit 1; }
+      PG_PORT_ARG="$2"
+      PG_PORT_EXPLICIT=1
+      shift 2
+      ;;
+    --redis-port)
+      [ $# -ge 2 ] || { err "--redis-port 需要端口号"; exit 1; }
+      REDIS_PORT_ARG="$2"
+      REDIS_PORT_EXPLICIT=1
+      shift 2
+      ;;
+    --local-data)
+      LOCAL_DATA=1
+      shift
+      ;;
+    --pg-data-dir)
+      [ $# -ge 2 ] || { err "--pg-data-dir 需要路径"; exit 1; }
+      PG_DATA_DIR_ARG="$2"
+      LOCAL_DATA=1
+      shift 2
+      ;;
+    --redis-data-dir)
+      [ $# -ge 2 ] || { err "--redis-data-dir 需要路径"; exit 1; }
+      REDIS_DATA_DIR_ARG="$2"
+      LOCAL_DATA=1
+      shift 2
+      ;;
+    --auto-migrate)
+      AUTO_MIGRATE=1
+      shift
+      ;;
+    --no-install-deps)
+      AUTO_INSTALL_DEPS=0
+      shift
       ;;
     --gemini-payload-source)
       if [ "$#" -lt 2 ]; then
@@ -1614,6 +2176,7 @@ case "$COMMAND" in
     fi
     prepare_gemini_host "$(normalize_tag "$(local_version)")" "$(install_mode)" required
     ;;
+  prepare-deps) need_root; require_cmds; ok "全部宿主基础、Docker 与 PostgreSQL 客户端依赖已就绪" ;;
   check) cmd_check ;;
   changelog) cmd_changelog ;;
   status) cmd_status ;;

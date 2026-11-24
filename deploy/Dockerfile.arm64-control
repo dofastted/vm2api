@@ -60,7 +60,7 @@ RUN mkdir /out && cd /src && cp -L ld-linux-x86-64.so.2 libc.so.6 libm.so.6 libg
 FROM --platform=linux/arm64 docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c AS dockercli
 FROM --platform=linux/arm64 ${NODE_IMAGE}
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates iptables iproute2 python3 \
+    && apt-get install -y --no-install-recommends ca-certificates iptables iproute2 python3 postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /opt/vm2api

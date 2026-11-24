@@ -281,3 +281,65 @@ test('ARM64 source upgrade keeps the native override and rejects a missing one b
   assert.match(missing.stderr, /lacks docker-compose.arm64.yml/)
   assert.ok(!missing.calls.some((args) => args[0] === 'compose'))
 })
+
+test('panel upgrade preserves unmigrated SQLite installs instead of flipping them to default Postgres', async () => {
+  const origRun = runUpgrade
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-upgrade-sqlite-'))
+  const bin = path.join(root, 'fake-bin')
+  const log = path.join(root, 'calls.jsonl')
+  const bootVersion = path.join(root, 'boot-version')
+  const server = http.createServer((req, res) => {
+    res.setHeader('Content-Type', 'application/json')
+    if (req.url === '/health') res.end('{"status":"ok"}')
+    else if (req.url === '/api/panel/version')
+      res.end(JSON.stringify({ ok: true, data: { current_tag: fs.readFileSync(bootVersion, 'utf8') } }))
+    else if (req.url === '/api/panel/vms') res.end(JSON.stringify({ ok: true, data: { items: [] } }))
+    else res.writeHead(401).end('{}')
+  })
+  try {
+    assert.equal(typeof origRun, 'function')
+    fs.mkdirSync(bin)
+    fs.mkdirSync(path.join(root, 'data'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'data/kin.db'), 'sqlite-placeholder')
+    fs.writeFileSync(path.join(bin, 'docker'), FAKE_DOCKER, { mode: 0o755 })
+    fs.writeFileSync(path.join(bin, 'git'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    fs.writeFileSync(path.join(root, 'VERSION'), '1.4.180\n')
+    fs.writeFileSync(bootVersion, 'v1.4.180')
+    fs.writeFileSync(path.join(root, '.env'), 'VM2API_ADMIN_PASSWORD=keep-me\n')
+    fs.mkdirSync(path.join(root, '.git'))
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { stdout } = await exec(
+      'sh',
+      [
+        script,
+        root,
+        'stack',
+        'vm2api',
+        'old-id',
+        'v1.2.7',
+        'amd64',
+        path.join(root, 'docker-compose.yml'),
+        path.join(root, 'docker-compose.override.yml'),
+      ],
+      {
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          TEST_LOG: log,
+          BOOT_VERSION: bootVersion,
+          PORT: String(server.address().port),
+          VM2API_API_KEY: 'test-key',
+          KIN_RATE_REFILL: '1000',
+        },
+        timeout: 20000,
+      },
+    )
+    assert.match(stdout, /restarted and verified at v1\.2\.7/)
+    const envAfter = fs.readFileSync(path.join(root, '.env'), 'utf8')
+    assert.match(envAfter, /^VM2API_DB_DRIVER=sqlite$/m)
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
