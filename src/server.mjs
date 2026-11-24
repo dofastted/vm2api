@@ -1134,7 +1134,8 @@ const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
   // The public handler routes `/v1/messages` itself and answers in the Anthropic
   // shape. Rewriting req.url into the session path made the response carry
   // `id: "messages"` and changed the path the request log attributes.
-  handleGeminiMessages: (req, res) => handleGeminiPublic(req, res),
+  handleGeminiMessages: (req, res, opts) => handleGeminiPublic(req, res, opts),
+  handleGeminiPublic: (req, res, opts) => handleGeminiPublic(req, res, opts),
   admitCragInference: (input) => cragSubscription.admitInference(input),
   json,
   writeSSEHeaders,
@@ -1377,7 +1378,13 @@ const geminiScheduler = createGeminiScheduler({
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
   cragSubscription: geminiCragSubscription,
 })
-const handleGeminiPublic = createGeminiPublicHandler({ json, readBody, scheduler: geminiScheduler })
+const handleGeminiPublic = createGeminiPublicHandler({
+  json,
+  readBody,
+  scheduler: geminiScheduler,
+  requestLog,
+  groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
+})
 const handlePanel = createPanelHandler({
   getDb,
   cragSubscription,
@@ -1733,11 +1740,22 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (p === '/v1/models' || p === '/models' || p === '/v1beta/models')) {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
-      if (groupType === 'gemini') return handleGeminiPublic(req, res)
+      if (p === '/v1beta/models' || groupType === 'gemini') return handleGeminiPublic(req, res)
       if (resolveInferenceBackend(req) === 'api') {
         return json(res, 200, filterModelCatalogForKey(apiScheduler.catalog(apiScheduleScope(req, groupType)), req))
       }
       const result = await fetchWorkerModels({ groupType })
+      if (groupType === 'all') {
+        try {
+          const gemCatalog = await geminiScheduler.catalog()
+          if (Array.isArray(gemCatalog?.models) && gemCatalog.models.length) {
+            const existing = Array.isArray(result?.data) ? result.data : []
+            const seen = new Set(existing.map((m) => m?.id).filter(Boolean))
+            const extra = gemCatalog.models.filter((m) => m?.id && !seen.has(m.id))
+            if (extra.length) result.data = [...existing, ...extra]
+          }
+        } catch {}
+      }
       return json(res, 200, filterModelCatalogForKey(result, req))
     }
     if (req.method === 'POST' && p === '/admin/models/refresh') {
@@ -2094,7 +2112,7 @@ server.listen(cfg.port, cfg.host, () => {
       void warmGemini()
       const timer = setInterval(warmGemini, 30_000)
       timer.unref()
-      server.once('close', () => clearInterval(timer))
+      onLeaderStop(() => clearInterval(timer))
     }
     try {
       vmTestSchedule.start()

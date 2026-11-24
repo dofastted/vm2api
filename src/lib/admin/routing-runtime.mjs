@@ -24,6 +24,7 @@ import { slotExec } from '../vm/slot-runtime.mjs'
 import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 
 import { accountTierKey, mergeTierMaps, normalizeTiers } from '../pool/quota-tiers.mjs'
+import { mergeBatchGroupConfig } from '../pool/batch-group.mjs'
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
 import { PoolScheduler, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { FailoverRunner } from '../pool/failover-runner.mjs'
@@ -521,6 +522,12 @@ export function createRoutingRuntime(ctx) {
     if (body.pool) {
       routingConfig.pool = normalizePoolRouting({ ...(routingConfig.pool || {}), ...body.pool })
     }
+    if (body.batch_group && typeof body.batch_group === 'object' && !Array.isArray(body.batch_group)) {
+      routingConfig.batch_group = mergeBatchGroupConfig({
+        ...(routingConfig.batch_group || {}),
+        ...body.batch_group,
+      })
+    }
     if (body.failover) routingConfig.failover = { ...(routingConfig.failover || {}), ...body.failover }
     if (body.inference) {
       routingConfig.inference = normalizeInferenceConfig({
@@ -685,6 +692,7 @@ export function createRoutingRuntime(ctx) {
       doc.pool = normalizePoolRouting(doc.pool)
       doc.vm = normalizeVmConfig(doc.vm)
       if (!hasOpenAIQuota) migrateLegacyOpenAIPolicies(doc)
+      if (doc.batch_group != null) doc.batch_group = mergeBatchGroupConfig(doc.batch_group)
       if (doc.redaction != null) doc.redaction = normalizeRedaction(doc.redaction)
       return doc
     } catch (error) {

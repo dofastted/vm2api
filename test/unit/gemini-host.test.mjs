@@ -314,6 +314,17 @@ test('Gemini host auto-provisions models, plan, onboarding, and token refresh', 
   })
 })
 
+// The default-payload fetcher used to hardcode the release version alongside the
+// manifest pin, and the two drifted for three releases (#1677). Driven from here
+// because `test:ci`'s standing set is 13 keywords that do not include this file:
+// CI picks it up as a modified test, the same way every non-core test here runs.
+test('the default Gemini payload fetcher derives its release from the manifest pin', { timeout: 15_000 }, () => {
+  execFileSync('python3', ['-B', fileURLToPath(new URL('./fetch-default-gemini-pins.py', import.meta.url))], {
+    stdio: 'pipe',
+    timeout: 12_000,
+  })
+})
+
 test('Gemini payload redemption is admin-only and rejects malformed codes before host dispatch', async () => {
   const route = `${root}/payload/redeem`
   assert.equal(authorizePanelRoute('POST', route, 'user').ok, false)
@@ -748,12 +759,25 @@ test('Gemini public routes schedule one plain-text turn and reject other keys', 
     },
   })
   const res = { setHeader() {}, once() {} }
-  for (const group_type of ['all', 'anthropic', 'openai']) {
+  for (const group_type of ['anthropic', 'openai']) {
     const denied = await handle({ apiKeyKind: 'managed', apiKeyRecord: { group_type }, once() {} }, res)
     assert.equal(denied.status, 403)
     assert.equal(denied.body.error.code, 'gemini_key_required')
   }
   assert.equal((await handle({ apiKeyKind: 'master', once() {} }, res)).status, 403)
+  const allBareClaude = await handle(
+    {
+      method: 'POST',
+      url: '/v1/messages',
+      apiKeyKind: 'managed',
+      apiKeyRecord: { group_type: 'all' },
+      body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hello' }] },
+      once() {},
+    },
+    res,
+  )
+  assert.equal(allBareClaude.status, 404)
+  assert.equal(allBareClaude.body.error.code, 'gemini_model_unavailable')
   const listed = await handle(
     {
       method: 'GET',
@@ -1489,10 +1513,7 @@ test('Gemini scheduler allows 10 concurrent slots on acc1 with strict per-accoun
       assert.equal(op, 'infer')
       assert.equal(payload.id, 'gemini-acc1')
       assert.equal(payload.proxy_id, 'px-1')
-      assert.equal(
-        payload.proxy_sha256,
-        createHash('sha256').update(proxyMap['px-1']).digest('hex'),
-      )
+      assert.equal(payload.proxy_sha256, createHash('sha256').update(proxyMap['px-1']).digest('hex'))
       inflightPayloads.push(payload)
       if (inflightPayloads.length === 10) resolveAll10()
       const gate = new Promise((resolve) => releases.push(resolve))
@@ -1596,4 +1617,69 @@ test('warmGeminiEnvironments proactively warms authorized licensed OAuth envs an
   assert.equal(warmedCalls[1][1].proxy_id, 'px-1')
   assert.equal(warmedCalls[1][1].proxy_url, proxyUrl)
   assert.equal(warmedCalls[1][1].proxy_sha256, createHash('sha256').update(proxyUrl).digest('hex'))
+})
+test('a host error code the control plane knows survives, and only an unknown one collapses (#1622)', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-authcode-'))
+  const socketPath = path.join(directory, 'control.sock')
+  const previous = process.env.KIN_GEMINI_HOST_SOCKET
+  process.env.KIN_GEMINI_HOST_SOCKET = socketPath
+  let code = 'gemini_authorization_unavailable'
+  const server = http.createServer(async (request, response) => {
+    for await (const chunk of request) void chunk
+    response.writeHead(503, { 'Content-Type': 'application/json' })
+    response.end(JSON.stringify({ code }))
+  })
+  t.after(async () => {
+    if (previous === undefined) delete process.env.KIN_GEMINI_HOST_SOCKET
+    else process.env.KIN_GEMINI_HOST_SOCKET = previous
+    await new Promise((resolve) => server.close(resolve))
+    await rm(directory, { recursive: true, force: true })
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, resolve)
+  })
+
+  // The socket answered, so the host service is up and it is the authorization
+  // launch that failed. Reporting 'no host service' instead sent #1622 auditing
+  // the service and its socket while the real fault was on the egress path.
+  await assert.rejects(callGeminiHost('authorization', { id: record.id }), {
+    code: 'gemini_authorization_unavailable',
+    status: 503,
+  })
+
+  // The allow-list itself still holds: a code this version does not know stays
+  // collapsed rather than being forwarded to the panel unvetted.
+  code = 'gemini_not_a_real_code'
+  await assert.rejects(callGeminiHost('authorization', { id: record.id }), { code: 'gemini_host_unavailable' })
+})
+
+test('synchronous host errors and polled test-chat runs report the same resident-pool copy for native worker/tty faults', async () => {
+  for (const code of ['gemini_native_worker_unavailable', 'gemini_native_tty_unavailable']) {
+    const run = setup((operation) => {
+      if (operation === 'get') {
+        return {
+          ...record,
+          auth_method: 'oauth',
+          auth_state: 'authorized',
+          models_discovered: true,
+          models: [model],
+        }
+      }
+      if (operation === 'test-chat') {
+        throw Object.assign(new Error(code), { code, status: 503 })
+      }
+      if (operation === 'test-chat-status') {
+        return { state: 'failed', text: '', error: { code } }
+      }
+      throw new Error(`unexpected ${operation}`)
+    })
+    const startRes = await run('POST', `${environmentPath}/test-chat`, { model, prompt: 'hello' })
+    const pollRes = await run('GET', `${environmentPath}/test-chat/${runId}`)
+    assert.equal(startRes.status, 503)
+    assert.equal(startRes.body.error.code, code)
+    assert.equal(pollRes.status, 200)
+    assert.equal(pollRes.body.data.error.code, code)
+    assert.equal(startRes.body.error.message, pollRes.body.data.error.message)
+  }
 })

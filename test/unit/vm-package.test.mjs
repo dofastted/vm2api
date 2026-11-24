@@ -285,3 +285,71 @@ test('admin export returns the SOCKS password', async (t) => {
   assert.equal(got.response.body.data.credential.export.accounts[0].credentials.access_token, 'sk-ant-oat01-PACKAGE')
   assert.equal(got.response.body.data.vm.id, 'vm-pkg')
 })
+
+test('Claude family session limits round-trip through package export, import, and unpinned write-back', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vm-pkg-family-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = makePool(t)
+  const unpinnedDoc = claudePackage('vm-family')
+  assert.equal(unpinnedDoc.vm.policy.maxPrimarySessions, null)
+  assert.equal(unpinnedDoc.vm.policy.maxPrimarySessionsOverride, false)
+  assert.equal(unpinnedDoc.vm.policy.maxSubagentsPerSession, null)
+  assert.equal(unpinnedDoc.vm.policy.maxSubagentsPerSessionOverride, false)
+
+  const pinnedDoc = buildVmPackage({
+    vm: {
+      id: 'vm-family',
+      name: 'family-slot',
+      platform: 'anthropic',
+      family: 'claude',
+      kernel: 'ubuntu-24.04',
+      policy: {
+        sessionSlots: 8,
+        sessionSlotsOverride: true,
+        maxPrimarySessions: 3,
+        maxPrimarySessionsOverride: true,
+        maxSubagentsPerSession: 0,
+        maxSubagentsPerSessionOverride: true,
+      },
+      claude: { auth_scheme: 'authorization_bearer', mode: 'oauth' },
+    },
+    proxy: { kind: 'local' },
+    claudeCred: {
+      type: 'oauth',
+      access_token: 'sk-ant-oat01-FAMILY',
+      refresh_token: 'sk-ant-ort01-FAMILY',
+      expires_at: 1_900_000_000,
+    },
+  })
+  assert.equal(pinnedDoc.vm.policy.maxPrimarySessions, 3)
+  assert.equal(pinnedDoc.vm.policy.maxPrimarySessionsOverride, true)
+  assert.equal(pinnedDoc.vm.policy.maxSubagentsPerSession, 0)
+  assert.equal(pinnedDoc.vm.policy.maxSubagentsPerSessionOverride, true)
+
+  assert.equal(parseVmPackage({ ...pinnedDoc, vm: { ...pinnedDoc.vm, policy: { maxPrimarySessions: 0 } } }).ok, false)
+  assert.equal(
+    parseVmPackage({ ...pinnedDoc, vm: { ...pinnedDoc.vm, policy: { maxSubagentsPerSession: 21 } } }).ok,
+    false,
+  )
+
+  const created = makeHandler(root, pinnedDoc, { pool })
+  await created.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/package'))
+  assert.equal(created.response.status, 201, created.response.body?.error?.message)
+  const file = path.join(root, 'vms', 'vm-family.json')
+  let saved = JSON.parse(fs.readFileSync(file, 'utf8'))
+  assert.equal(saved.policy.sessionSlots, 8)
+  assert.equal(saved.policy.maxPrimarySessions, 3)
+  assert.equal(saved.policy.maxPrimarySessionsOverride, true)
+  assert.equal(saved.policy.maxSubagentsPerSession, 0)
+  assert.equal(saved.policy.maxSubagentsPerSessionOverride, true)
+
+  unpinnedDoc.proxy = { kind: 'local' }
+  const cleared = makeHandler(root, unpinnedDoc, { pool })
+  await cleared.handlePanel({ method: 'PUT' }, {}, new URL('http://localhost/api/panel/vms/vm-family/package'))
+  assert.equal(cleared.response.status, 200, cleared.response.body?.error?.message)
+  saved = JSON.parse(fs.readFileSync(file, 'utf8'))
+  assert.equal(saved.policy.maxPrimarySessions, null)
+  assert.equal(saved.policy.maxPrimarySessionsOverride, false)
+  assert.equal(saved.policy.maxSubagentsPerSession, null)
+  assert.equal(saved.policy.maxSubagentsPerSessionOverride, false)
+})

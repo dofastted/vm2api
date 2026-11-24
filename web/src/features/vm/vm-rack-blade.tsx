@@ -10,6 +10,8 @@ import { Download, LifeBuoy, Link2, RefreshCw } from 'lucide-react'
 import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
 import {
   geminiAccountStatus,
+  geminiEligibilityNotice,
+  geminiInferenceErrorAction,
   geminiInferenceErrorLabel,
 } from '@/lib/gemini-account-status'
 import { tierVisual } from '@/lib/tier-visual'
@@ -132,6 +134,11 @@ export function GeminiSlotStatus({ vm }: { vm: Vm }) {
   const status = geminiAccountStatus(environment, vm.unschedulable_text)
   const { authorization, blocker, inference, lastInference, modelsLabel } =
     status
+  const eligibilityNotice = geminiEligibilityNotice(environment.account)
+  const failureAction =
+    lastInference?.state === 'failed'
+      ? geminiInferenceErrorAction(lastInference.error_code)
+      : null
   const at = lastInference?.finished_at ?? lastInference?.started_at
   const age = at ? fmtAgo(at) : ''
   return (
@@ -150,6 +157,14 @@ export function GeminiSlotStatus({ vm }: { vm: Vm }) {
           ) : null}
         </span>
       ) : null}
+      {eligibilityNotice ? (
+        <span
+          className='text-[color:var(--status-caution)]'
+          title={eligibilityNotice.action}
+        >
+          {eligibilityNotice.label}
+        </span>
+      ) : null}
       <span
         className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'
         title='仅显示最近一次宿主推理，不代表公共 API 端到端验证'
@@ -164,7 +179,9 @@ export function GeminiSlotStatus({ vm }: { vm: Vm }) {
               </time>
             ) : null}
             {lastInference.state === 'failed' ? (
-              <span>{geminiInferenceErrorLabel(lastInference.error_code)}</span>
+              <span title={failureAction ?? undefined}>
+                {geminiInferenceErrorLabel(lastInference.error_code)}
+              </span>
             ) : null}
           </>
         ) : (

@@ -1,11 +1,16 @@
 import type { Vm } from '@/types/panel-vm'
 import { describe, expect, it } from 'vitest'
 import {
+  DEFAULT_GEMINI_TEST_PROMPT,
+  defaultGeminiTestModel,
   geminiAccountStatus,
   geminiAuthorizationLabel,
+  geminiEligibilityNotice,
   geminiHostBlocker,
+  geminiInferenceErrorAction,
   geminiInferenceErrorLabel,
   geminiInferenceLabel,
+  groupGeminiModels,
 } from './gemini-account-status'
 import {
   accountStatus,
@@ -217,6 +222,9 @@ describe('Gemini account presentation', () => {
     expect(geminiInferenceErrorLabel('gemini_native_worker_unavailable')).toBe(
       '宿主运行环境故障'
     )
+    expect(geminiInferenceErrorLabel('gemini_authorization_unavailable')).toBe(
+      '宿主运行环境故障'
+    )
     expect(geminiInferenceErrorLabel('gemini_inference_failed')).toBe(
       '未知原因'
     )
@@ -255,5 +263,117 @@ describe('Gemini account presentation', () => {
       }
     )
     expect([claude, codex].map(accountUsable)).toEqual([true, true])
+  })
+
+  it('defaults test prompt to hello and selects Gemini 4 neon when available', () => {
+    expect(DEFAULT_GEMINI_TEST_PROMPT).toBe('hello')
+    expect(
+      defaultGeminiTestModel([
+        'gemini-3-flash',
+        'gemini-4-neon-high',
+        'gemini-3.8-flash-high',
+      ])
+    ).toBe('gemini-4-neon-high')
+    expect(
+      defaultGeminiTestModel([
+        'gemini-4-neon-high',
+        'gemini-4-neon',
+        'gemini-3-flash',
+      ])
+    ).toBe('gemini-4-neon')
+    expect(
+      defaultGeminiTestModel(['gemini-3-flash', 'gemini-4-neon-medium'])
+    ).toBe('gemini-4-neon-medium')
+    expect(defaultGeminiTestModel(['gemini-3-flash', 'gemini-2.5-pro'])).toBe(
+      'gemini-3-flash'
+    )
+    expect(defaultGeminiTestModel([])).toBe('')
+  })
+
+  it('provides actionable remediation copy for upstream errors and validates Google verification links', () => {
+    expect(
+      geminiInferenceErrorAction('gemini_account_verification_required')
+    ).toContain('验证链接')
+    expect(geminiInferenceErrorAction('gemini_location_unsupported')).toContain(
+      '代理'
+    )
+    expect(geminiInferenceErrorAction('gemini_quota_exhausted')).toContain(
+      '配额'
+    )
+    expect(geminiInferenceErrorAction('gemini_oauth_required')).toContain(
+      '重新完成官方 Google 授权'
+    )
+    expect(geminiInferenceErrorAction('gemini_proxy_error')).toContain('SOCKS5')
+    expect(geminiInferenceErrorAction('gemini_inference_failed')).toContain(
+      '刷新'
+    )
+    expect(
+      geminiInferenceErrorAction('gemini_native_worker_unavailable')
+    ).toContain('Gemini 维护')
+    expect(
+      geminiInferenceErrorAction('gemini_authorization_unavailable')
+    ).toContain('授权进程')
+    expect(geminiInferenceErrorAction('license_unconfigured')).toContain(
+      '订阅 CRAG'
+    )
+    expect(geminiInferenceErrorAction('license_unconfigured')).not.toContain(
+      '设置 → CRAG 订阅'
+    )
+    expect(geminiInferenceErrorAction('unknown_raw_code')).toBeNull()
+
+    const validUrl =
+      'https://accounts.google.com/v3/signin/continue?plt=abc&sarp=1'
+    expect(
+      geminiEligibilityNotice({
+        eligibility: 'verification_required',
+        validation_url: validUrl,
+      })
+    ).toMatchObject({
+      label: expect.stringContaining('VALIDATION_REQUIRED'),
+      validationUrl: validUrl,
+    })
+    expect(
+      geminiEligibilityNotice({
+        eligibility: 'verification_required',
+        validation_url: 'https://evil.example/phish',
+      })?.validationUrl
+    ).toBeNull()
+    expect(geminiEligibilityNotice({ eligibility: null })).toBeNull()
+  })
+
+  it('groups Antigravity models into Google Gemini vs ag- prefixed Anthropic and OpenAI', () => {
+    const groups = groupGeminiModels(
+      [
+        'claude-sonnet-4-6-high',
+        'gemini-4-neon',
+        'gemini-4-argon',
+        'gpt-oss-120b-medium',
+      ],
+      [
+        { id: 'claude-sonnet-4-6-high', provider: 'anthropic', quota_group: '3p' },
+        { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
+        { id: 'gemini-4-argon', provider: 'google', quota_group: 'gemini-argon-wtu' },
+        { id: 'gpt-oss-120b-medium', provider: 'openai', quota_group: '3p' },
+      ]
+    )
+    expect(groups.map((g) => g.provider)).toEqual([
+      'google',
+      'anthropic',
+      'openai',
+    ])
+    expect(groups[0].models.map((m) => m.publicId)).toEqual([
+      'gemini-4-neon',
+      'gemini-4-argon',
+    ])
+    expect(groups[1].models[0]).toMatchObject({
+      rawId: 'claude-sonnet-4-6-high',
+      publicId: 'ag-claude-sonnet-4-6-high',
+      quotaGroup: '3p',
+    })
+    expect(groups[2].models[0]).toMatchObject({
+      rawId: 'gpt-oss-120b-medium',
+      publicId: 'ag-gpt-oss-120b-medium',
+      quotaGroup: '3p',
+    })
   })
 })

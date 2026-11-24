@@ -1,9 +1,11 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { expect, test, vi } from 'vitest'
+import { ApiError } from '@/lib/api'
 import {
   GeminiAuthorizationChallenge,
   GeminiEnvironments,
+  GeminiOperationError,
   type GeminiInventory,
 } from './gemini-environments'
 
@@ -291,4 +293,40 @@ test('Gemini authorization challenge exposes copyable link alongside open action
   expect(html).toContain('accounts.google.com/o/oauth2/auth')
   expect(html).toContain('target="_blank"')
   expect(html).toContain('rel="noreferrer"')
+})
+
+test('GeminiOperationError renders remediation guidance and maintenance link for host launch failures', () => {
+  const client = new QueryClient()
+  client.setQueryData(['panel', 'me'], { role: 'admin' })
+  const authLaunchHtml = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <GeminiOperationError
+        error={
+          new ApiError(
+            'Gemini 宿主服务在线，但 Google 授权流程未能启动，请检查宿主服务日志与绑定代理的出口连通性',
+            503,
+            'gemini_authorization_unavailable'
+          )
+        }
+      />
+    </QueryClientProvider>
+  )
+  expect(authLaunchHtml).toContain('未能拉起授权进程')
+  expect(authLaunchHtml).toContain('设置 → Gemini：诊断与维护')
+
+  const apiKeyHtml = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <GeminiOperationError
+        error={
+          new ApiError(
+            'Google 未接受该 Gemini API Key，请检查密钥和项目权限',
+            400,
+            'gemini_api_key_rejected'
+          )
+        }
+      />
+    </QueryClientProvider>
+  )
+  expect(apiKeyHtml).toContain('Google AI Studio 核对 API Key 有效性')
+  expect(apiKeyHtml).not.toContain('设置 → Gemini：诊断与维护')
 })

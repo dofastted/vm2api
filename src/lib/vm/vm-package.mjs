@@ -106,6 +106,22 @@ function policyFromVm(vm, codex) {
     out.sessionSlots = policy.sessionSlots
     out.sessionSlotsOverride = policy.sessionSlotsOverride === true
   }
+  if (!codex) {
+    if (policy.maxPrimarySessionsOverride === true && integer(policy.maxPrimarySessions, 1, SESSION_SLOT_MAX)) {
+      out.maxPrimarySessions = policy.maxPrimarySessions
+      out.maxPrimarySessionsOverride = true
+    } else {
+      out.maxPrimarySessions = null
+      out.maxPrimarySessionsOverride = false
+    }
+    if (policy.maxSubagentsPerSessionOverride === true && integer(policy.maxSubagentsPerSession, 0, SESSION_SLOT_MAX)) {
+      out.maxSubagentsPerSession = policy.maxSubagentsPerSession
+      out.maxSubagentsPerSessionOverride = true
+    } else {
+      out.maxSubagentsPerSession = null
+      out.maxSubagentsPerSessionOverride = false
+    }
+  }
   if (policy.priority != null) out.priority = policy.priority
   if (policy.quota && typeof policy.quota === 'object') out.quota = policy.quota
   if (Array.isArray(policy.allowed_models)) out.allowed_models = policy.allowed_models
@@ -235,6 +251,28 @@ function parsePolicy(raw, codex) {
     } else {
       value.sessionSlots = raw.sessionSlots
       value.sessionSlotsOverride = raw.sessionSlotsOverride !== false
+    }
+  }
+  if (!codex && has(raw, 'maxPrimarySessions')) {
+    if (raw.maxPrimarySessions == null) {
+      value.maxPrimarySessions = null
+      value.maxPrimarySessionsOverride = false
+    } else if (!integer(raw.maxPrimarySessions, 1, SESSION_SLOT_MAX)) {
+      return fail('invalid_package', 'maxPrimarySessions 超出范围')
+    } else {
+      value.maxPrimarySessions = raw.maxPrimarySessions
+      value.maxPrimarySessionsOverride = raw.maxPrimarySessionsOverride !== false
+    }
+  }
+  if (!codex && has(raw, 'maxSubagentsPerSession')) {
+    if (raw.maxSubagentsPerSession == null) {
+      value.maxSubagentsPerSession = null
+      value.maxSubagentsPerSessionOverride = false
+    } else if (!integer(raw.maxSubagentsPerSession, 0, SESSION_SLOT_MAX)) {
+      return fail('invalid_package', 'maxSubagentsPerSession 超出范围')
+    } else {
+      value.maxSubagentsPerSession = raw.maxSubagentsPerSession
+      value.maxSubagentsPerSessionOverride = raw.maxSubagentsPerSessionOverride !== false
     }
   }
   if (has(raw, 'weight')) {
@@ -409,6 +447,14 @@ function applyPolicy(vm, policy, codex) {
   if (!codex && has(policy, 'sessionSlots')) {
     vm.policy.sessionSlots = policy.sessionSlots
     vm.policy.sessionSlotsOverride = policy.sessionSlotsOverride === true
+  }
+  if (!codex && has(policy, 'maxPrimarySessions')) {
+    vm.policy.maxPrimarySessions = policy.maxPrimarySessions
+    vm.policy.maxPrimarySessionsOverride = policy.maxPrimarySessionsOverride === true
+  }
+  if (!codex && has(policy, 'maxSubagentsPerSession')) {
+    vm.policy.maxSubagentsPerSession = policy.maxSubagentsPerSession
+    vm.policy.maxSubagentsPerSessionOverride = policy.maxSubagentsPerSessionOverride === true
   }
   if (has(policy, 'weight')) vm.policy.weight = policy.weight
   if (has(policy, 'priority')) {

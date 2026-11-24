@@ -68,3 +68,80 @@ test('unbound CRAGGemini seat warns before OAuth test chat without blocking mode
   )
   expect(html).toContain('请先在「账号」绑定 CRAGGemini 订阅席位')
 })
+
+test('defaults test prompt to hello and prefers Gemini 4 neon model when available', () => {
+  const withNeon: GeminiEnvironment = {
+    ...environment,
+    models: ['gemini-3-flash', 'gemini-4-neon-high', 'gemini-3.8-flash-high'],
+  }
+  const html = renderToStaticMarkup(
+    <QueryClientProvider client={new QueryClient()}>
+      <GeminiTestPanel environment={withNeon} />
+    </QueryClientProvider>
+  )
+  expect(html).toContain('>hello</textarea>')
+  const buttons = [...html.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)]
+  const start = buttons.find(
+    (match) => match[2].replace(/<[^>]*>/g, '').trim() === '开始测试'
+  )
+  expect(start).toBeDefined()
+  expect(/(?:^|\s)disabled(?:[=\s]|$)/.test(start![1])).toBe(false)
+})
+
+test('shows Google verification guidance and safe link when account requires browser validation', () => {
+  const verifyUrl =
+    'https://accounts.google.com/v3/signin/continue?plt=fixture&sarp=1'
+  const needsVerify: GeminiEnvironment = {
+    ...environment,
+    account: {
+      state: 'ok',
+      checked_at: '2026-11-24T00:00:00Z',
+      email: 'verify@example.test',
+      project_id: 'proj-1',
+      region: null,
+      plan: 'Google AI Ultra',
+      expires_at: null,
+      eligibility: 'verification_required',
+      validation_url: verifyUrl,
+      quotas: [],
+      credits: [],
+    },
+  }
+  const html = renderToStaticMarkup(
+    <QueryClientProvider client={new QueryClient()}>
+      <GeminiTestPanel environment={needsVerify} />
+    </QueryClientProvider>
+  )
+  expect(html).toContain('VALIDATION_REQUIRED')
+  expect(html).toContain('打开 Google 验证页')
+  expect(html).toContain('https://accounts.google.com/v3/signin/continue')
+})
+
+test('renders cleanly with mixed Gemini and Anthropic (ag- prefixed) discovered models', () => {
+  const mixed: GeminiEnvironment = {
+    ...environment,
+    models: ['claude-sonnet-4-6-high', 'gemini-4-neon', 'gpt-oss-120b-medium'],
+    account: {
+      state: 'ok',
+      checked_at: '2026-11-24T00:00:00Z',
+      email: 'mixed@example.test',
+      project_id: 'proj-1',
+      region: null,
+      plan: 'Google AI Pro',
+      expires_at: null,
+      model_catalog: [
+        { id: 'claude-sonnet-4-6-high', provider: 'anthropic', quota_group: '3p' },
+        { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
+        { id: 'gpt-oss-120b-medium', provider: 'openai', quota_group: '3p' },
+      ],
+      quotas: [],
+      credits: [],
+    },
+  }
+  const html = renderToStaticMarkup(
+    <QueryClientProvider client={new QueryClient()}>
+      <GeminiTestPanel environment={mixed} />
+    </QueryClientProvider>
+  )
+  expect(html).toContain('>hello</textarea>')
+})

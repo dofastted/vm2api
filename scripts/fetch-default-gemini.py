@@ -18,9 +18,15 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "0.3.0"
-TAG = f"payload-2026.11.23-gemini-{VERSION}"
-NATIVE_RELEASE = f"https://github.com/dofastted/vm2api/releases/download/{TAG}"
+RELEASE_BASE = "https://github.com/dofastted/vm2api/releases/download"
+# The pinned tag is the single source of truth for which release to fetch, and the
+# version is read back out of it. A constant here was a second source that had to be
+# bumped in lockstep with deploy/payload.json, and it drifted: the manifest moved to
+# 0.4.1, 0.4.2 and 0.4.3 while this still said 0.3.0, so read_pins rejected the very
+# manifest it ships with and nothing could be prepared (#1677).
+# The shape is enforced because the tag now comes from a file and is interpolated
+# into a download URL: no path segments, no traversal, no scheme smuggling.
+TAG_PATTERN = re.compile(r"\Apayload-\d{4}\.\d{2}\.\d{2}-gemini-(\d+\.\d+\.\d+(?:-rc\.\d+)?)\Z")
 NATIVE_ASSETS = (
     "craggemini",
     "craggemini.payload.enc",
@@ -49,8 +55,12 @@ def read_pins(manifest):
     with manifest.open(encoding="utf-8") as stream:
         data = json.load(stream)
     default = data.get("geminiDefaultLinuxAmd64") if isinstance(data, dict) else None
-    if not isinstance(default, dict) or default.get("tag") != TAG:
-        raise ValueError(f"{manifest} must pin Gemini release {TAG}")
+    if not isinstance(default, dict):
+        raise ValueError(f"{manifest} must pin geminiDefaultLinuxAmd64")
+    tag = default.get("tag")
+    match = TAG_PATTERN.fullmatch(tag) if isinstance(tag, str) else None
+    if not match:
+        raise ValueError(f"{manifest} has no usable Gemini release tag: {tag!r}")
     assets = default.get("assets")
     if not isinstance(assets, dict) or set(assets) != set(NATIVE_ASSETS):
         raise ValueError(f"{manifest} must pin exactly the five Gemini release assets")
@@ -64,7 +74,7 @@ def read_pins(manifest):
             or not re.fullmatch(r"[a-f0-9]{64}", pin["sha256"])
         ):
             raise ValueError(f"invalid size or SHA-256 pin for {name} in {manifest}")
-    return assets
+    return {"assets": assets, "version": match.group(1), "release": f"{RELEASE_BASE}/{tag}"}
 
 
 def copy_checked(stream, size, sha256, output=None):
@@ -142,7 +152,7 @@ def check_cached(dest, assets):
             os.close(fd)
 
 
-def verify_signed_payload(dest):
+def verify_signed_payload(dest, version):
     verifier = Path(__file__).resolve().with_name("install-gemini-payload.mjs")
     result = subprocess.run(
         [
@@ -160,13 +170,15 @@ def verify_signed_payload(dest):
     )
     if (
         result.returncode
-        or result.stdout.strip() != f"Gemini payload {VERSION} verified"
+        or result.stdout.strip() != f"Gemini payload {version} verified"
     ):
-        detail = result.stderr.strip() or f"expected verified Gemini payload {VERSION}"
+        detail = result.stderr.strip() or f"expected verified Gemini payload {version}"
         raise RuntimeError(f"signed Gemini payload verification failed: {detail}")
 
 
-def prepare(dest, assets):
+def prepare(dest, pins):
+    assets = pins["assets"]
+    version = pins["version"]
     if not dest.is_absolute() or not dest.name or ".." in dest.parts:
         raise ValueError(
             "--dest must be an absolute directory path with a private parent"
@@ -178,7 +190,7 @@ def prepare(dest, assets):
         if os.path.lexists(dest):
             try:
                 check_cached(dest, assets)
-                verify_signed_payload(dest)
+                verify_signed_payload(dest, version)
             except (
                 OSError,
                 ValueError,
@@ -195,12 +207,12 @@ def prepare(dest, assets):
             stage = Path(staging)
             for name in NATIVE_ASSETS:
                 download(
-                    opener, f"{NATIVE_RELEASE}/{name}", stage / name, **assets[name]
+                    opener, f"{pins['release']}/{name}", stage / name, **assets[name]
                 )
             archive = stage / "cli_linux_x64.tar.gz"
             download(opener, AGY_URL, archive, AGY_SIZE, AGY_SHA256)
             extract_agy(archive, stage / "agy")
-            verify_signed_payload(stage)
+            verify_signed_payload(stage, version)
             stage.rename(dest)
     finally:
         os.close(parent_fd)
@@ -215,7 +227,8 @@ def main():
         if sys.platform != "linux" or platform.machine() not in ("x86_64", "amd64"):
             raise RuntimeError("default Gemini payload requires Linux amd64")
         os.umask(0o077)
-        prepare(args.dest, read_pins(args.manifest))
+        pins = read_pins(args.manifest)
+        prepare(args.dest, pins)
     except (
         OSError,
         ValueError,
@@ -225,7 +238,7 @@ def main():
     ) as error:
         print(f"Gemini default payload: {error}", file=sys.stderr)
         return 1
-    print(f"Verified Gemini payload {VERSION}: {args.dest}")
+    print(f"Verified Gemini payload {pins['version']}: {args.dest}")
     return 0
 
 
