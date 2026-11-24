@@ -53,6 +53,18 @@ function extraPark(vm, now) {
   return codexQuotaPark(extraFromSummary(vm), now, { waiveWindowCaps: hasSpendableCodexCredits(vm, now) })
 }
 
+function windowMinutesOf(win) {
+  if (win?.window_minutes != null) return win.window_minutes
+  const match = /^(\d+)([mhd])$/i.exec(String(win?.id || '').trim())
+  if (!match) return null
+  const amount = Number(match[1])
+  if (!Number.isFinite(amount) || amount <= 0) return null
+  const unit = match[2].toLowerCase()
+  if (unit === 'm') return amount
+  if (unit === 'h') return amount * 60
+  return amount * 1440
+}
+
 function extraFromSummary(vm) {
   if (vm?.codex?.extra && typeof vm.codex.extra === 'object') return vm.codex.extra
   if (vm?.codex_extra && typeof vm.codex_extra === 'object') return vm.codex_extra
@@ -80,11 +92,11 @@ function extraFromSummary(vm) {
       codex_primary_used_percent: first.used_percent ?? null,
       codex_primary_reset_at: first.reset_at ?? null,
       codex_primary_reset_after_seconds: first.reset_after_seconds ?? null,
-      codex_primary_window_minutes: first.window_minutes ?? null,
+      codex_primary_window_minutes: windowMinutesOf(first),
       codex_secondary_used_percent: second.used_percent ?? null,
       codex_secondary_reset_at: second.reset_at ?? null,
       codex_secondary_reset_after_seconds: second.reset_after_seconds ?? null,
-      codex_secondary_window_minutes: second.window_minutes ?? null,
+      codex_secondary_window_minutes: windowMinutesOf(second),
       codex_limited_until: vm?.codex_limited_until || null,
     }
   }

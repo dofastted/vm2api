@@ -534,6 +534,21 @@ test('24h window + 0-minute record: local 5h/7d gate stays open while 100% 24h c
   assert.equal(sched.reason, 'quota_24h_header')
   assert.equal(sched.until, Date.parse(resetAt))
 
+  // Summary-only VM without snapshot or window_minutes still infers 24h from window id.
+  const windowsOnlyVm = {
+    id: 'vm-24h-windows-only',
+    platform: 'openai',
+    family: 'codex',
+    status: 'running',
+    schedulable: true,
+    has_token: true,
+    codex_usage: {
+      windows: [{ id: '24h', used_percent: 100, reset_at: resetAt }],
+    },
+  }
+  assert.equal(isCodexSlotParked(windowsOnlyVm, now), true)
+  assert.equal(codexQuotaWindowReason(windowsOnlyVm, now), 'quota_24h_header')
+
   // Stress sorting compares actual 24h utilization across 24h-only summary VMs.
   const low24h = {
     id: 'vm-24h-low',
