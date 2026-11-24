@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import {
   Cpu,
-  HardDrive,
+  Gauge,
   Layers,
   RefreshCw,
   RotateCcw,
@@ -32,6 +32,47 @@ import {
 
 type Block = Record<string, unknown>
 type Strategy = 'balanced' | 'fill' | 'round_robin'
+type GeminiPerformanceTier = 'low' | 'medium' | 'high'
+
+const GEMINI_PERFORMANCE_TIERS: readonly {
+  id: GeminiPerformanceTier
+  title: string
+  desc: string
+  shm: {
+    require_shm: true
+    request_mb: number
+    response_mb: number
+  }
+}[] = [
+  {
+    id: 'low',
+    title: '初',
+    desc: '轻量内存占用，适合常规请求与内存偏紧的宿主机。',
+    shm: { require_shm: true, request_mb: 2, response_mb: 8 },
+  },
+  {
+    id: 'medium',
+    title: '中',
+    desc: '性能与内存均衡，适合绝大多数并发与流式场景。',
+    shm: { require_shm: true, request_mb: 4, response_mb: 16 },
+  },
+  {
+    id: 'high',
+    title: '高',
+    desc: '大吞吐缓冲，适合高并发、大上下文与长流式输出场景。',
+    shm: { require_shm: true, request_mb: 16, response_mb: 64 },
+  },
+]
+
+function resolveGeminiPerformanceTier(
+  requestMb: number,
+  responseMb: number
+): GeminiPerformanceTier {
+  const totalMb = requestMb + responseMb
+  if (totalMb <= 14) return 'low'
+  if (totalMb >= 40) return 'high'
+  return 'medium'
+}
 
 const GEMINI_DEFAULTS = {
   pool: {
@@ -167,8 +208,8 @@ function DaemonLivePanel({
   return (
     <PaneSection
       icon={Cpu}
-      title='CRAGGemini 守护进程与共享内存'
-      desc='实时查看单进程分片接管的多账号状态、agy 槽位水位与 AGYSHM02 共享内存环吞吐。'
+      title='CRAGGemini 守护进程与运行状态'
+      desc='实时查看单进程分片接管的多账号状态、agy 槽位水位与通道吞吐。'
       aside={
         <div className='flex items-center gap-1.5'>
           <Badge variant={available ? 'default' : 'secondary'}>
@@ -235,7 +276,7 @@ function DaemonLivePanel({
               </div>
             </div>
             <div className='rounded-md border bg-muted/25 px-3 py-2'>
-              <div className='text-[11px] text-muted-foreground'>SHM 请求 / CRC 错误</div>
+              <div className='text-[11px] text-muted-foreground'>通道请求 / 校验异常</div>
               <div className='mt-0.5 text-sm font-semibold tabular-nums'>
                 {shm ? `${shm.requests_total} / ${shm.crc_errors_total}` : '待建立'}
               </div>
@@ -244,8 +285,8 @@ function DaemonLivePanel({
 
           {shm ? (
             <div className='flex flex-wrap items-center gap-x-4 gap-y-1 rounded-md border bg-muted/20 px-3 py-2 text-[11px] text-muted-foreground tabular-nums'>
-              <span>SHM 入站：{fmtBytes(shm.request_bytes_total)}</span>
-              <span>SHM 出站：{fmtBytes(shm.response_bytes_total)}</span>
+              <span>通道入站：{fmtBytes(shm.request_bytes_total)}</span>
+              <span>通道出站：{fmtBytes(shm.response_bytes_total)}</span>
               <span>响应帧：{shm.responses_total}</span>
               <span>背压等待：{shm.backpressure_waits_total}</span>
             </div>
@@ -443,9 +484,9 @@ export function GeminiConfigPane({
     'account_cooldown_ms',
     GEMINI_DEFAULTS.failover.account_cooldown_ms
   )
-  const requireShm = shm.require_shm !== false
   const shmReqMb = numOf(shm, 'request_mb', GEMINI_DEFAULTS.shm.request_mb)
   const shmRespMb = numOf(shm, 'response_mb', GEMINI_DEFAULTS.shm.response_mb)
+  const perfTier = resolveGeminiPerformanceTier(shmReqMb, shmRespMb)
 
   const update = (patch: Block) => onChange({ ...root, ...patch })
   const updatePool = (patch: Block) => {
@@ -783,50 +824,62 @@ export function GeminiConfigPane({
       </PaneSection>
 
       <PaneSection
-        icon={HardDrive}
-        title='共享内存传输（AGYSHM02）'
-        desc='CRAGGemini 与 agy 进程之间通过匿名 memfd + SCM_RIGHTS + 双无锁 SPSC 环 + eventfd + CRC32C 传输请求与 SSE 响应。'
+        icon={Gauge}
+        title='CRAGGemini 性能配置'
+        desc='按宿主机内存与并发负载选择运行性能等级，保存后应用到 CRAGGemini 数据通道。'
       >
-        <div className='space-y-4'>
-          <SettingRow
-            label='强制启用共享内存数据面'
-            desc='开启后若 agy bridge 未成功握手 AGYSHM02 共享内存环，直接 fail-closed 拒绝回落，杜绝明文落盘与管道瓶颈。'
-          >
-            <Switch
-              checked={requireShm}
-              disabled={saving}
-              onCheckedChange={(require_shm) => updateShm({ require_shm })}
-              aria-label='强制启用共享内存数据面'
-            />
-          </SettingRow>
-          <div className='grid gap-4 border-t pt-4 sm:grid-cols-2'>
-            <SliderSetting
-              id='gemini-shm-req-mb'
-              label='请求环容量'
-              desc='单个 agy 槽位请求方向 memfd 环形缓冲区大小。'
-              value={shmReqMb}
-              min={1}
-              max={64}
-              step={1}
-              format={(mb) => `${mb} MiB`}
-              fallback={GEMINI_DEFAULTS.shm.request_mb}
-              presets={[2, 4, 8, 16]}
-              onChange={(request_mb) => updateShm({ request_mb })}
-            />
-            <SliderSetting
-              id='gemini-shm-resp-mb'
-              label='响应环容量'
-              desc='单个 agy 槽位 SSE 输出方向 memfd 环形缓冲区大小。'
-              value={shmRespMb}
-              min={1}
-              max={64}
-              step={1}
-              format={(mb) => `${mb} MiB`}
-              fallback={GEMINI_DEFAULTS.shm.response_mb}
-              presets={[8, 16, 32, 64]}
-              onChange={(response_mb) => updateShm({ response_mb })}
-            />
-          </div>
+        <div
+          role='radiogroup'
+          aria-label='CRAGGemini 性能配置'
+          className='grid gap-3 sm:grid-cols-3'
+        >
+          {GEMINI_PERFORMANCE_TIERS.map((tier) => {
+            const selected = tier.id === perfTier
+            return (
+              <button
+                key={tier.id}
+                type='button'
+                role='radio'
+                aria-checked={selected}
+                disabled={saving}
+                onClick={() => updateShm({ ...tier.shm })}
+                className={cn(
+                  'flex cursor-pointer flex-col gap-1.5 rounded-lg border p-3 text-left transition-colors duration-150 outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50',
+                  selected
+                    ? 'border-primary bg-primary/5 ring-1 ring-primary/30'
+                    : 'hover:border-primary/40 hover:bg-accent/40'
+                )}
+              >
+                <div className='flex items-center justify-between gap-2'>
+                  <div className='flex items-center gap-1.5'>
+                    <span className='text-sm font-semibold'>{tier.title}</span>
+                    {tier.id === 'medium' ? (
+                      <Badge
+                        variant='secondary'
+                        className='h-4 px-1.5 text-[10px]'
+                      >
+                        默认
+                      </Badge>
+                    ) : null}
+                  </div>
+                  <span
+                    aria-hidden
+                    className={cn(
+                      'grid size-4 place-items-center rounded-full border',
+                      selected ? 'border-primary' : 'border-muted-foreground/40'
+                    )}
+                  >
+                    {selected ? (
+                      <span className='size-2 rounded-full bg-primary' />
+                    ) : null}
+                  </span>
+                </div>
+                <p className='text-xs leading-5 text-muted-foreground'>
+                  {tier.desc}
+                </p>
+              </button>
+            )
+          })}
         </div>
       </PaneSection>
 
