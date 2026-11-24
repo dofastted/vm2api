@@ -116,3 +116,32 @@ test('shows Google verification guidance and safe link when account requires bro
   expect(html).toContain('打开 Google 验证页')
   expect(html).toContain('https://accounts.google.com/v3/signin/continue')
 })
+
+test('renders cleanly with mixed Gemini and Anthropic (ag- prefixed) discovered models', () => {
+  const mixed: GeminiEnvironment = {
+    ...environment,
+    models: ['claude-sonnet-4-6-high', 'gemini-4-neon', 'gpt-oss-120b-medium'],
+    account: {
+      state: 'ok',
+      checked_at: '2026-11-24T00:00:00Z',
+      email: 'mixed@example.test',
+      project_id: 'proj-1',
+      region: null,
+      plan: 'Google AI Pro',
+      expires_at: null,
+      model_catalog: [
+        { id: 'claude-sonnet-4-6-high', provider: 'anthropic', quota_group: '3p' },
+        { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
+        { id: 'gpt-oss-120b-medium', provider: 'openai', quota_group: '3p' },
+      ],
+      quotas: [],
+      credits: [],
+    },
+  }
+  const html = renderToStaticMarkup(
+    <QueryClientProvider client={new QueryClient()}>
+      <GeminiTestPanel environment={mixed} />
+    </QueryClientProvider>
+  )
+  expect(html).toContain('>hello</textarea>')
+})

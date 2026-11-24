@@ -20,9 +20,13 @@ export const MODELS_DEV_STALE_MS = 6 * 60 * 60 * 1000
 
 const SETTINGS_SNAPSHOT = 'price_catalog_modelsdev'
 const SETTINGS_OVERRIDES = 'model_price_overrides'
-const OVERRIDE_KEY_RE = /^(anthropic|openai|\*)\/([a-z0-9._-]+|\*)$/
+const PLATFORMS = ['anthropic', 'openai', 'google']
+const OVERRIDE_KEY_RE = /^(anthropic|openai|google|\*)\/([a-z0-9._-]+|\*)$/
 const CLAUDE_DATE_RE = /-\d{8}$/
 const CLAUDE_LATEST_RE = /-latest$/
+const ANTIGRAVITY_VARIANT_RE = /-(?:thinking|minimal|low|medium|high|xhigh)$/
+const PREVIEW_SUFFIX_RE = /-preview(?:-\d{2}-\d{2})?$/
+const AG_PREFIX_RE = /^ag-(?=(?:claude-|gpt-|gemini-|o[1-9]|chatgpt|codex-))/i
 const FAMILY_IDS = new Set(['fable', 'mythos', 'opus', 'sonnet', 'haiku'])
 const EPS = 1e-9
 
@@ -86,6 +90,7 @@ function stripDecorations(raw) {
     .replace(/-fast$/i, '')
     .trim()
     .toLowerCase()
+    .replace(AG_PREFIX_RE, '')
 }
 
 export function platformOfModel(raw) {
@@ -95,6 +100,9 @@ export function platformOfModel(raw) {
   if (BUILTIN_RATES.anthropic[id]) return 'anthropic'
   const aliased = BUILTIN_ALIASES[id]
   if (aliased && BUILTIN_RATES.anthropic[aliased]) return 'anthropic'
+  if (BUILTIN_RATES.google?.[id]) return 'google'
+  if (aliased && BUILTIN_RATES.google?.[aliased]) return 'google'
+  if (id.startsWith('gemini-')) return 'google'
   if (BUILTIN_RATES.openai[id]) return 'openai'
   if (aliased && BUILTIN_RATES.openai[aliased]) return 'openai'
   if (/^(gpt-|o[1-9]|chatgpt|codex-|chat-latest$)/.test(id)) return 'openai'
@@ -103,6 +111,16 @@ export function platformOfModel(raw) {
 
 function addCandidate(out, id) {
   if (id && !out.includes(id)) out.push(id)
+}
+
+function stripAntigravityVariants(id) {
+  let cur = id
+  for (let i = 0; i < 3; i++) {
+    const next = cur.replace(ANTIGRAVITY_VARIANT_RE, '').replace(PREVIEW_SUFFIX_RE, '')
+    if (next === cur) break
+    cur = next
+  }
+  return cur
 }
 
 function expandClaude(out, id) {
@@ -118,7 +136,12 @@ export function catalogIdCandidates(raw, platform = null) {
   const plat = platform || platformOfModel(id)
   const out = []
   addCandidate(out, id)
-  if (plat !== 'openai') expandClaude(out, id)
+  const strippedVariant = stripAntigravityVariants(id)
+  if (strippedVariant !== id) addCandidate(out, strippedVariant)
+  if (plat === 'anthropic' || !plat) {
+    expandClaude(out, id)
+    if (strippedVariant !== id) expandClaude(out, strippedVariant)
+  }
   const extras = []
   for (const c of out) {
     const alias = BUILTIN_ALIASES[c]
@@ -126,7 +149,7 @@ export function catalogIdCandidates(raw, platform = null) {
   }
   for (const alias of extras) {
     addCandidate(out, alias)
-    if (plat !== 'openai') expandClaude(out, alias)
+    if (plat === 'anthropic' || !plat) expandClaude(out, alias)
     const nested = BUILTIN_ALIASES[alias]
     if (nested) addCandidate(out, nested)
   }
@@ -231,7 +254,7 @@ export function validatePrice(price, { platform } = {}) {
 
 function overridePlatform(key) {
   const plat = String(key || '').split('/')[0]
-  return plat === 'anthropic' || plat === 'openai' ? plat : null
+  return PLATFORMS.includes(plat) ? plat : null
 }
 
 function mapModelsDevTier(t) {
@@ -273,9 +296,9 @@ function parseModelsDevCost(cost, platform) {
 }
 
 export function parseModelsDev(json) {
-  const out = { anthropic: {}, openai: {} }
+  const out = { anthropic: {}, openai: {}, google: {} }
   if (!json || typeof json !== 'object') return out
-  for (const platform of ['anthropic', 'openai']) {
+  for (const platform of PLATFORMS) {
     const models = json[platform]?.models
     if (!models || typeof models !== 'object') continue
     for (const [id, row] of Object.entries(models)) {
@@ -294,7 +317,7 @@ export function parseModelsDev(json) {
 
 function countSnapshotModels(snap) {
   let n = 0
-  for (const platform of ['anthropic', 'openai']) {
+  for (const platform of PLATFORMS) {
     const dict = snap?.[platform]
     if (!dict) continue
     n += Object.keys(dict).length
@@ -382,6 +405,7 @@ export async function syncModelsDev({ fetchImpl } = {}) {
       error: null,
       anthropic: parsed.anthropic,
       openai: parsed.openai,
+      google: parsed.google,
     }
     persistSnapshot(snap)
     invalidatePriceCatalog()
@@ -393,6 +417,7 @@ export async function syncModelsDev({ fetchImpl } = {}) {
       error: String(e?.message || e),
       anthropic: prev.anthropic || {},
       openai: prev.openai || {},
+      google: prev.google || {},
     }
     persistSnapshot(snap)
     invalidatePriceCatalog()
@@ -549,7 +574,7 @@ function loadCatalog() {
     seen.add(key)
     entries.push(makeEntry(platform, id, { overrides, snap }, now))
   }
-  for (const platform of ['anthropic', 'openai']) {
+  for (const platform of PLATFORMS) {
     for (const id of Object.keys(BUILTIN_RATES[platform] || {})) add(platform, id)
     for (const id of Object.keys(snap[platform] || {})) add(platform, id)
   }
@@ -579,7 +604,7 @@ export function resolvePrice(rawModel, at = Date.now()) {
   const platform = platformOfModel(rawModel)
   const candidates = catalogIdCandidates(rawModel, platform)
   const catalog = loadCatalog()
-  const plats = platform ? [platform] : ['anthropic', 'openai']
+  const plats = platform ? [platform] : PLATFORMS
   // Settle the canonical id before layering, so a `provider/*` override cannot bind to a
   // dated alias and lose the canonical model's builtin modes / tiers. An exact override on
   // any candidate wins first: pricing `claude-haiku-4-5` must also price its dated snapshot.

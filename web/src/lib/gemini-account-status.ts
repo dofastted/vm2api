@@ -134,6 +134,93 @@ const INFERENCE_ERROR_LABELS: Readonly<Record<string, string>> = {
 }
 
 export const DEFAULT_GEMINI_TEST_PROMPT = 'hello'
+export const ANTIGRAVITY_MODEL_PREFIX = 'ag-'
+
+export type GeminiModelProvider = 'google' | 'anthropic' | 'openai'
+
+export type GeminiModelCatalogEntry = {
+  id: string
+  provider: GeminiModelProvider
+  quota_group: string
+}
+
+export type GeminiGroupedModel = {
+  rawId: string
+  publicId: string
+  provider: GeminiModelProvider
+  quotaGroup: string
+}
+
+export type GeminiModelGroup = {
+  provider: GeminiModelProvider
+  label: string
+  models: GeminiGroupedModel[]
+}
+
+const MODEL_GROUP_LABELS: Readonly<Record<GeminiModelProvider, string>> = {
+  google: 'Google Gemini',
+  anthropic: 'Anthropic（API 前缀 ag-）',
+  openai: 'OpenAI / 第三方（API 前缀 ag-）',
+}
+
+function inferModelProvider(rawId: string): GeminiModelProvider {
+  const lower = rawId.trim().toLowerCase()
+  const base = lower.startsWith(ANTIGRAVITY_MODEL_PREFIX)
+    ? lower.slice(ANTIGRAVITY_MODEL_PREFIX.length)
+    : lower
+  if (base.startsWith('claude-')) return 'anthropic'
+  if (/^(gpt-|o[1-9]|chatgpt|codex-)/.test(base)) return 'openai'
+  return 'google'
+}
+
+export function groupGeminiModels(
+  models: readonly string[],
+  catalog?: readonly GeminiModelCatalogEntry[] | null
+): GeminiModelGroup[] {
+  const catalogMap = new Map<string, GeminiModelCatalogEntry>()
+  for (const entry of catalog ?? []) {
+    if (entry?.id) catalogMap.set(entry.id, entry)
+  }
+  const buckets: Record<GeminiModelProvider, GeminiGroupedModel[]> = {
+    google: [],
+    anthropic: [],
+    openai: [],
+  }
+  const seen = new Set<string>()
+  for (const raw of models) {
+    const rawId = raw?.trim()
+    if (!rawId || seen.has(rawId)) continue
+    seen.add(rawId)
+    const meta = catalogMap.get(rawId)
+    const provider: GeminiModelProvider =
+      meta?.provider === 'google' ||
+      meta?.provider === 'anthropic' ||
+      meta?.provider === 'openai'
+        ? meta.provider
+        : inferModelProvider(rawId)
+    const publicId =
+      provider === 'google'
+        ? rawId
+        : rawId.toLowerCase().startsWith(ANTIGRAVITY_MODEL_PREFIX)
+          ? rawId
+          : `${ANTIGRAVITY_MODEL_PREFIX}${rawId}`
+    const quotaGroup =
+      meta?.quota_group ||
+      (provider !== 'google'
+        ? '3p'
+        : rawId.toLowerCase().includes('argon')
+          ? 'gemini-argon-wtu'
+          : 'gemini')
+    buckets[provider].push({ rawId, publicId, provider, quotaGroup })
+  }
+  return (['google', 'anthropic', 'openai'] as const)
+    .filter((provider) => buckets[provider].length > 0)
+    .map((provider) => ({
+      provider,
+      label: MODEL_GROUP_LABELS[provider],
+      models: buckets[provider],
+    }))
+}
 
 export function defaultGeminiTestModel(models: readonly string[]): string {
   const clean = models.filter(Boolean)
@@ -142,6 +229,7 @@ export function defaultGeminiTestModel(models: readonly string[]): string {
     clean.find((id) => id === 'gemini-4-neon') ??
     clean.find((id) => id === 'gemini-4-neon-high') ??
     clean.find((id) => id.startsWith('gemini-4-neon')) ??
+    clean.find((id) => id.startsWith('gemini-')) ??
     clean[0]
   )
 }

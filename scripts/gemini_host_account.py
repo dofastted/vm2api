@@ -192,6 +192,53 @@ def select_onboard_tier(assist_data):
     return fallback
 
 
+_MODEL_PROVIDER_MAP = {
+    "MODEL_PROVIDER_GOOGLE": "google",
+    "MODEL_PROVIDER_ANTHROPIC": "anthropic",
+    "MODEL_PROVIDER_OPENAI": "openai",
+}
+
+
+def classify_model_provider(model, raw_provider=None):
+    if isinstance(raw_provider, str):
+        mapped = _MODEL_PROVIDER_MAP.get(raw_provider.strip().upper())
+        if mapped:
+            return mapped
+    lower = model.lower()
+    if lower.startswith("claude-"):
+        return "anthropic"
+    if lower.startswith(("gpt-", "o1", "o3", "o4", "chatgpt", "codex-")):
+        return "openai"
+    return "google"
+
+
+def classify_quota_group(model, provider):
+    if provider != "google":
+        return "3p"
+    if "argon" in model.lower():
+        return "gemini-argon-wtu"
+    return "gemini"
+
+
+def model_catalog(data):
+    entries = data.get("models")
+    if not isinstance(entries, dict):
+        return []
+    catalog = []
+    for model, info in list(entries.items())[:128]:
+        if not MODEL.fullmatch(model) or not isinstance(info, dict):
+            continue
+        provider = classify_model_provider(model, info.get("modelProvider"))
+        catalog.append(
+            {
+                "id": model,
+                "provider": provider,
+                "quota_group": classify_quota_group(model, provider),
+            }
+        )
+    return sorted(catalog, key=lambda item: item["id"])
+
+
 def models(data, is_api_key=False, *, chat_only=False):
     if is_api_key:
         entries = data.get("models")
@@ -439,6 +486,9 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
                     account["quota_groups"] = quota_groups(summary_data)
         if model_status == 200:
             account["models"], account["quotas"] = models(data)
+            catalog = model_catalog(data)
+            if catalog:
+                account["model_catalog"] = catalog
     state = "partial"
     if user_status == assist_status == model_status == 200:
         state = "ok"

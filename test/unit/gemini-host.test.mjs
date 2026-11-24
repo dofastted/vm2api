@@ -748,12 +748,25 @@ test('Gemini public routes schedule one plain-text turn and reject other keys', 
     },
   })
   const res = { setHeader() {}, once() {} }
-  for (const group_type of ['all', 'anthropic', 'openai']) {
+  for (const group_type of ['anthropic', 'openai']) {
     const denied = await handle({ apiKeyKind: 'managed', apiKeyRecord: { group_type }, once() {} }, res)
     assert.equal(denied.status, 403)
     assert.equal(denied.body.error.code, 'gemini_key_required')
   }
   assert.equal((await handle({ apiKeyKind: 'master', once() {} }, res)).status, 403)
+  const allBareClaude = await handle(
+    {
+      method: 'POST',
+      url: '/v1/messages',
+      apiKeyKind: 'managed',
+      apiKeyRecord: { group_type: 'all' },
+      body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hello' }] },
+      once() {},
+    },
+    res,
+  )
+  assert.equal(allBareClaude.status, 404)
+  assert.equal(allBareClaude.body.error.code, 'gemini_model_unavailable')
   const listed = await handle(
     {
       method: 'GET',

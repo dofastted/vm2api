@@ -7,6 +7,7 @@ import {
   defaultGeminiTestModel,
   geminiEligibilityNotice,
   geminiInferenceErrorAction,
+  groupGeminiModels,
 } from '@/lib/gemini-account-status'
 import { isGeminiHostIssue } from '@/lib/gemini-recovery'
 import { Button } from '@/components/ui/button'
@@ -15,7 +16,9 @@ import { Label } from '@/components/ui/label'
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
@@ -94,9 +97,9 @@ export function GeminiTestPanel({
           : null
   const licenseBlocked =
     !unavailable &&
-    isOAuth &&
-    environment.crag_license &&
-    environment.crag_license.valid === false
+      isOAuth &&
+      environment.crag_license &&
+      environment.crag_license.valid === false
       ? '请先在「账号」绑定 CRAGGemini 订阅席位，再发起 OAuth 测试对话。'
       : null
   const pull = useGeminiMutation({
@@ -110,9 +113,13 @@ export function GeminiTestPanel({
     : null
   const models =
     environment.models_discovered === true &&
-    modelError?.code !== 'gemini_models_empty'
+      modelError?.code !== 'gemini_models_empty'
       ? [...new Set(environment.models.filter(Boolean))]
       : []
+  const modelGroups = groupGeminiModels(
+    models,
+    environment.account?.model_catalog
+  )
   const selected = models.includes(model)
     ? model
     : defaultGeminiTestModel(models)
@@ -194,10 +201,17 @@ export function GeminiTestPanel({
                   />
                 </SelectTrigger>
                 <SelectContent>
-                  {models.map((id) => (
-                    <SelectItem value={id} key={id}>
-                      {id}
-                    </SelectItem>
+                  {modelGroups.map((group) => (
+                    <SelectGroup key={group.provider}>
+                      <SelectLabel>{group.label}</SelectLabel>
+                      {group.models.map((item) => (
+                        <SelectItem value={item.rawId} key={item.rawId}>
+                          {item.provider === 'google'
+                            ? item.rawId
+                            : `${item.publicId} (${item.rawId})`}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
                   ))}
                 </SelectContent>
               </Select>

@@ -41,6 +41,7 @@ import { sanitizeInboundBody, defaultSeedPolicy, callerAutoCompactWindow } from 
 import { fingerprintRequest } from './client-fingerprint.mjs'
 import { validateOfficialModel } from './models.mjs'
 import { handleCodexImages, handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
+import { isAntigravityRoutedModel } from '../gemini/model-catalog.mjs'
 import { isMultipartFormData, normalizeImageEditBody } from './image-edit-multipart.mjs'
 import { readRawBody } from '../http/respond.mjs'
 import { disjointOpenaiUsage } from './openai-usage.mjs'
@@ -739,7 +740,7 @@ export function createHandleProtocol(deps) {
     }
 
     if (protocol === 'anthropic.messages' && req.apiKeyRecord?.group_type === 'gemini') {
-      return deps.handleGeminiMessages(req, res)
+      return deps.handleGeminiMessages(req, res, { logBag })
     }
 
     let inbound
@@ -773,6 +774,18 @@ export function createHandleProtocol(deps) {
     )
     logBag.inbound_device_id = sessionIdForLog(auditIdentity.deviceId)
     logBag.reasoning_effort = reasoningEffortOf(inbound)
+
+    if (
+      req.apiKeyKind === 'managed' &&
+      keyScopeFromRequest(req).group_type === 'all' &&
+      String(req.apiKeyRecord?.category || '').trim().toLowerCase() !== 'api' &&
+      isAntigravityRoutedModel(inbound?.model) &&
+      (protocol === 'openai.chat' || protocol === 'openai.responses' || protocol === 'anthropic.messages') &&
+      typeof (deps.handleGeminiPublic || deps.handleGeminiMessages) === 'function'
+    ) {
+      req.body = inbound
+      return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, { logBag })
+    }
 
     const fp = fingerprintRequest(req, inbound)
     // Before the health probe: its synthesized or fail-closed replies would otherwise answer
