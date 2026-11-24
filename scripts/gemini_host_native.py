@@ -24,6 +24,7 @@ TURN_TIMEOUT = 125
 TOKEN = re.compile(r"[!-~]{24,4096}\Z")
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+ACCOUNT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 LAUNCHER_EXIT_FILE = "launcher-exit"
 LAUNCHER_EXIT = re.compile(rb"(craggemini|agy) (-?[0-9]{1,3})\n")
 ELIGIBILITY_LOG_FILE = "cli-diagnostic"
@@ -283,30 +284,58 @@ def worker_status(socket_path, token, timeout=0.5):
         connection.close()
 
 
-def cancel_worker_request(socket_path, token, request_id, timeout=2.0):
-    if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
-        return False
-    body = json.dumps({"request_id": request_id}, separators=(",", ":")).encode("utf-8")
+def worker_json_request(
+    socket_path, token, method, path, body_obj=None, timeout=5.0
+):
+    if (
+        not isinstance(socket_path, str)
+        or not os.path.isabs(socket_path)
+        or not isinstance(token, str)
+        or not TOKEN.fullmatch(token)
+        or method not in ("GET", "POST", "PUT", "DELETE")
+        or not isinstance(path, str)
+        or not path.startswith("/internal/")
+    ):
+        return 0, None
+    body = (
+        json.dumps(body_obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if body_obj is not None
+        else b""
+    )
+    headers = {"X-Kin-Internal-Token": token}
+    if body:
+        headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = str(len(body))
     connection = _UnixHTTPConnection(socket_path, timeout)
     try:
-        response = connection.request(
-            "POST",
-            "/internal/v1/cancel",
-            {
-                "Content-Type": "application/json",
-                "Content-Length": str(len(body)),
-                "X-Kin-Internal-Token": token,
-            },
-            body,
-        )
+        response = connection.request(method, path, headers, body)
         response.begin()
-        raw = response.read(4096)
-        data = json.loads(raw) if raw else {}
-        return response.status == 200 and data.get("cancelled") is True
+        raw = response.read(256 * 1024 + 1)
+        if len(raw) > 256 * 1024:
+            return response.status, None
+        data = json.loads(raw, object_pairs_hook=_object) if raw else {}
+        return response.status, data if isinstance(data, dict) else None
     except (OSError, ValueError, RecursionError):
-        return False
+        return 0, None
     finally:
         connection.close()
+
+
+def cancel_worker_request(
+    socket_path, token, request_id, timeout=2.0, *, account_id=None
+):
+    if not isinstance(request_id, str) or not REQUEST_ID.fullmatch(request_id):
+        return False
+    if account_id is not None:
+        if not isinstance(account_id, str) or not ACCOUNT_ID.fullmatch(account_id):
+            return False
+        path = f"/internal/v1/accounts/{account_id}/cancel"
+    else:
+        path = "/internal/v1/cancel"
+    status, data = worker_json_request(
+        socket_path, token, "POST", path, {"request_id": request_id}, timeout=timeout
+    )
+    return status == 200 and isinstance(data, dict) and data.get("cancelled") is True
 
 
 LICENSE_ERROR_CODES = frozenset(
@@ -332,8 +361,14 @@ def _map_worker_error(http_status, payload):
         return NativeFailure("gemini_unsupported_turn", 400, message)
     if code in ("invalid_envelope", "invalid_json"):
         return NativeFailure("gemini_invalid_request", 400, message)
-    if code in ("queue_full", "native_unavailable", "kernel_stopping"):
-        return NativeFailure("gemini_operation_busy" if code == "queue_full" else "gemini_native_worker_unavailable", 503, message)
+    if code in ("queue_full", "native_unavailable", "kernel_stopping", "slot_shm_required", "account_circuit_open"):
+        return NativeFailure(
+            "gemini_operation_busy"
+            if code in ("queue_full", "account_circuit_open")
+            else "gemini_native_worker_unavailable",
+            503,
+            message,
+        )
     if code in ("first_byte_timeout", "turn_timeout", "idle_timeout", "queue_timeout"):
         return NativeFailure("gemini_inference_timeout", 504, message)
     if code == "cancelled":
@@ -370,6 +405,7 @@ def open_worker_stream(
     turn_timeout=TURN_TIMEOUT,
     gateway_policy=None,
     diagnostic=None,
+    account_id=None,
 ):
     if (
         not isinstance(socket_path, str)
@@ -381,6 +417,10 @@ def open_worker_stream(
         or not isinstance(request_id, str)
         or not REQUEST_ID.fullmatch(request_id)
         or not isinstance(body_obj, dict)
+        or (
+            account_id is not None
+            and (not isinstance(account_id, str) or not ACCOUNT_ID.fullmatch(account_id))
+        )
     ):
         raise NativeFailure("gemini_inference_bad_input", 400)
     start_deadline = time.monotonic() + startup_timeout
@@ -428,9 +468,14 @@ def open_worker_stream(
             diag_code = diagnostic.poll()
             if diag_code is not None:
                 raise NativeFailure(diag_code, 403)
+        message_path = (
+            f"/internal/v1/accounts/{account_id}/messages"
+            if account_id is not None
+            else "/internal/v1/messages"
+        )
         response = connection.request(
             "POST",
-            "/internal/v1/messages",
+            message_path,
             {
                 "Content-Type": "application/json",
                 "Content-Length": str(len(payload)),
@@ -444,7 +489,9 @@ def open_worker_stream(
                 diag_code = diagnostic.poll()
                 if diag_code is not None:
                     connection.close()
-                    cancel_worker_request(socket_path, token, request_id)
+                    cancel_worker_request(
+                        socket_path, token, request_id, account_id=account_id
+                    )
                     raise NativeFailure(diag_code, 403)
                 remaining = header_deadline - time.monotonic()
                 if remaining <= 0:
@@ -512,6 +559,7 @@ def run_request(request):
     model = request.get("model")
     request_id = request.get("request_id")
     prompt = request.get("prompt")
+    account_id = request.get("account_id")
     if (
         not isinstance(socket_path, str)
         or not os.path.isabs(socket_path)
@@ -524,6 +572,10 @@ def run_request(request):
         or not isinstance(prompt, str)
         or not prompt.strip()
         or len(prompt.encode("utf-8")) > 4096
+        or (
+            account_id is not None
+            and (not isinstance(account_id, str) or not ACCOUNT_ID.fullmatch(account_id))
+        )
     ):
         raise NativeFailure("gemini_inference_bad_input")
     startup_timeout = request.get("startup_timeout", 45)
@@ -555,11 +607,16 @@ def run_request(request):
     ).encode("utf-8")
     if len(body) > MAX_BODY:
         raise NativeFailure("gemini_inference_output_limit")
+    message_path = (
+        f"/internal/v1/accounts/{account_id}/messages"
+        if account_id is not None
+        else "/internal/v1/messages"
+    )
     connection = _UnixHTTPConnection(socket_path, TURN_TIMEOUT)
     try:
         response = connection.request(
             "POST",
-            "/internal/v1/messages",
+            message_path,
             {
                 "Content-Type": "application/json",
                 "Content-Length": str(len(body)),
@@ -739,8 +796,12 @@ def _is_pool_mode_config(config_path):
     try:
         with open(config_path, "rb") as stream:
             data = json.loads(stream.read(256 * 1024))
-        accounts = data.get("accounts") if isinstance(data, dict) else None
-        return isinstance(accounts, list) and len(accounts) > 0
+        if not isinstance(data, dict):
+            return False
+        accounts = data.get("accounts")
+        return (isinstance(accounts, list) and len(accounts) > 0) or (
+            isinstance(data.get("max_accounts"), int) and data.get("max_accounts") >= 1
+        )
     except (OSError, ValueError):
         return False
 

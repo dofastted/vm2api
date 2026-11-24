@@ -136,3 +136,55 @@ export function outboundProfileQueryOptions() {
       api<{ profile: OutboundProfile }>('/api/panel/outbound-profile'),
   })
 }
+
+export type GeminiShmRingStats = {
+  requests_total: number
+  responses_total: number
+  request_bytes_total: number
+  response_bytes_total: number
+  crc_errors_total: number
+  backpressure_waits_total: number
+}
+
+export type GeminiDaemonShardView = {
+  shard_id: string
+  kind: 'shard' | 'per_account'
+  alive: boolean
+  ready: boolean
+  pid: number | null
+  capacity: number
+  account_count: number
+  account_ids: string[]
+  active_slots: number
+  idle_slots: number
+  total_slots: number
+  circuit_open_accounts: number
+  shm_enabled: boolean
+  shm_ring_stats: GeminiShmRingStats | null
+  fault_isolated: boolean
+  restart_count: number
+}
+
+export type GeminiDaemonStatus = {
+  available: boolean
+  host_error?: string
+  host_message?: string
+  mode?: 'sharded' | 'per_account'
+  accounts_per_daemon?: number
+  daemon_fault_isolation?: boolean
+  planned_shards?: number
+  authorized_oauth_accounts?: number
+  total_accounts?: number
+  total_active_slots?: number
+  total_idle_slots?: number
+  shm_ring_stats?: GeminiShmRingStats | null
+  shards: GeminiDaemonShardView[]
+}
+
+export function geminiDaemonStatusQueryOptions() {
+  return queryOptions({
+    queryKey: ['panel', 'gemini', 'daemon-status'] as const,
+    queryFn: () => api<GeminiDaemonStatus>('/api/panel/gemini/daemon-status'),
+    refetchInterval: 15_000,
+  })
+}
