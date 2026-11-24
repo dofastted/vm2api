@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.4.202 — 2026-11-24 · 强制函数调用未兑现时明确失败；上游 modelVersion 如实透出；`service_tier` 能力边界显式化
+
+- **`mode=ANY` / 必需 `tool_choice` 却无函数调用时明确失败**：此前上游以 `STOP` 结束且零 `functionCall` 时,网关仍按成功回复返回 `200`,依赖函数回调交付消息的客户端表现为「模型有输出但没发消息」。现把强制工具意图经 `restoreContext.toolChoice` 传到能观察响应的调度层,在未兑现时返回 `502 gemini_tool_call_required`（已登记进 `FAILURES` 并归入不熔断集合,不会被当作瞬时故障在账号间反复重试）；`AUTO` 的纯文本成功与真实函数调用均不受影响（#1750,修 #1732）。
+- **上游报告的 `modelVersion` 如实透出并标记错配**：区分「请求的」`requested_model`、「派发的」`dispatched_model` 与「回来的」`response_model`,客户端收到的 `modelVersion` 取上游真实值而非静默替换,同时在 `usage_logs` 写入 `model_mismatch`。流式、非流式与尾块错配三种路径一致,无错配时 `model_mismatch = 0`（#1747,修 #1728）。
+- **`service_tier` 的能力边界显式化**：传入 `service_tier: "standard_only"` 而所选 CRAG 内核未声明 `request_service_tier` 能力（以及所有 `cli-node` 路径）时,预检阶段直接返回 `400 unsupported_capability`（`error.param = "service_tier"`,`error.details.execution_path` 标明 `crag` 或 `claude_vm`,`retryable: false`,零上游执行）,**不再静默移除或改写为 `auto`**；内核声明该能力后原样透传（#1752,回应 #1520）。
+- **日志新增 `failed_only` 过滤**：覆盖「非 2xx」、「`final_state` 非 `verified`」与「带错误码」三类,因此能捞出已提交响应头后才失败的 `200` 流式请求;既有 `exclude_status_200` 行为不变（#1753,修 #1213）。
+- **文档**：补充自托管载荷、公钥与兑换渠道的说明（#1745）。
+- 部署说明：本版仅涉及控制面与前端（`src/lib`、`web/src`、`docs/`）。`deploy/payload.json` 的载荷钉选（CRAG `3.1.17`、CRAGGemini `0.4.6`）、`scripts/`、`bin/`、`share/wrap-cli` 与数据库结构均未变,预期 `SLOT_SYNC=skip`,无需重启既有槽位,也无需执行 `install.sh prepare-gemini`。
+
 ## 1.4.201 — 2026-11-24 · 热修：CRAGGemini 恢复剥离 `safetySettings`；未验签载荷不再挡住内核页的升级
 
 - **热修：`target: 'antigravity'` 恢复剥离 `safetySettings`,不再返回 400**（revert `#1735`）：常见 Gemini SDK 与 GUI 客户端（Cherry Studio、Vercel AI SDK `@ai-sdk/google` 等）会给**每个**请求自动附上 5 条 `BLOCK_NONE` 的默认 `safetySettings`。`#1735` 对非空 `safetySettings` 一律以 `400 gemini_unsupported_turn` 拒绝,使这些客户端在 CRAGGemini OAuth 账号上开箱即坏。现恢复 `#1718` / `#1733` 的行为:CRAGGemini 通道干净剥离该字段并保留入站调试捕获,Gemini API key 通道照旧原样转发给上游（#1754）。
