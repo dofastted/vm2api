@@ -2,7 +2,17 @@
 
 ## Unreleased
 
-- **CRAG v2 槽位会话被 9p 写回卡死**：CRAG 把每个会话的 `tap.jsonl` 写在 `/run/kin/work`（宿主机 9p 共享目录），CLI 同时不断 `stat` 它。Ubuntu 24.04 的 6.8 内核里，v9fs 的 getattr 会先对脏页发起写回（`v9fs_vfs_getattr_dotl → filemap_fdatawrite`），stat 撞上一次迟迟不完成的写回时，线程会永久卡在 `folio_wait_writeback`（D 状态）。CLI 进程因此退不干净（`[claude] <defunct>` 且线程仍在），CRAG 一直认为会话位被占用，健康报告 `ready_slots: 0`，之后分到该槽的请求全部静默等到网关超时，并触发「连续 3 次静默超时」熔断（内核故障）。恢复服务和切内核也会被 `slot_native_busy` 拒绝，只能整机关机重开。`kin-crag-apparmor`（每次启动 CRAG 内核前都会内联执行）现在给 `kin-kernel.service` 装一个受管 drop-in `45-vm2api-crag-work.conf`：内核启动前以 root 把 guest tmpfs 挂到 `/run/kin/work`（`mode=0700,size=256m,nosuid,nodev`，属主 kincli），tap 文件不再经过 9p。`ExecStartPre=-+`：挂载失败也不阻塞内核，退回原来的 9p 目录。离开 CRAG v2 时移除 drop-in（已挂载的 tmpfs 留到 guest 重启）；同路径的非受管文件不覆盖。老 guest 镜像无需重建，下一次 CRAG 内核启动即生效。
+## 1.4.203 — 2026-11-25 · CRAGGemini 0.4.7 故障转移与宿主网络加固；省略 `cache_control.ttl` 按路由配置补齐；托管 Key 超限响应统一；Claude 重置后预重置配额头对账与 Codex 自定义时长窗口
+
+- **非透传请求省略 `cache_control.ttl` 按 Web 路由配置补齐**：修复未声明 `ttl` 的 `cache_control` 被误作隐式 `5m`、在 CRAG V3 / HTTP hop 级联降级及未热读磁盘 `routing.json` 的问题；官方透传继续保留调用方省略的 TTL，补齐 `politeEphemeral` 类型校验与 `workerEnvelope` 对 `crag_options.cache_ttl` 的回退读取（#1772）。
+- **托管 API Key 超限响应统一为 `402`/`429` 并附限额元数据与 `Retry-After`**：USD 总额度与滚动消费窗口超限统一返回 `402`，请求数 / RPM / 并发保持 `429`，在 `error.details` 与 `/v1/me/quota` 的 `blocked_by` 补充 `limit_type`、`current`、`limit`、`remaining`、`reset_at`、`retry_after` 与 `Retry-After` 响应头，同时保留旧 `error.type` 兼容、修正双配额及下调 RPM 边界，并在 Gemini 路由保持 `publicError()` 基础设施脱敏边界（#1765）。
+- **Claude 确认配额重置后对账预重置头与单飞缓存隔离**：在 `AccountQuota` 持久化按账号/窗口的 `reset_boundaries` 与 `applied_reset_ops`，屏蔽重置前在途请求/探测/晚到 429 的旧高利用率与旧冷却覆盖；修补 `FailoverRunner` 预重置 429 跳过冷却、`usageCache` `clear()` 失效在途 flight 并按真实上游请求打标时序、以及重置后有效 `0%` 探测同步清理预重置 `rate_limit_reset_at`（#1758）。
+- **Codex 配额窗口按实际时长分类并忽略 0 分钟记录**：按正向 `window_minutes` 归类 `5h` / `24h` / `7d` 等自定义时长窗口、过滤 `<= 0` 分钟异常记录，同步更新调度排序、本地闸线、`oauth-credentials.mjs` `isQuotaParkReason()` 及前端机架/配额/弹窗视图，并保持无 `window_minutes` 历史快照兼容（#1764）。
+- **CRAGGemini 0.4.7 载荷升级、首字节前 502/504 故障转移与可观测性**：`deploy/payload.json` 钉选 `payload-2026.11.24-gemini-0.4.7`，补齐首字节前 502/504 跨账号切换、被动冷却账号回退与请求尝试记录（#1763）；修复 `scripts/fetch-default-gemini.py` 校验远程 manifest 时错误要求 `manifest.json` 自哈希导致远程拉取失败的问题（#1767）。
+- **CRAGGemini 宿主网络中继与早期退出快失败**：`scripts/gemini-host-egress.sh` 与 `scripts/gemini-host.py` 改为宿主机 OUTPUT 中继转发 netns 出口流量并上报脱敏的认证失败阶段（中继句柄命名为 `egress_relay` 避免遮蔽 `Terminal.relay()`）（#1761）；`craggemini` 早期退出时以有界 stderr 排空与白名单分类（`invalid_config` / `license_error` / `bind_failed`）快速失败，零原始 stderr 泄露，并在 `read_exit_detail()` 中优先尊重注入的 `native_exit_reader`（#1760）。
+- **CRAG v2 槽位工作目录迁至 guest tmpfs 避免 9p 写回卡死**：`docker/kin-kvm/guest/kin-crag-apparmor` 为 `kin-kernel.service` 安装受管 drop-in `45-vm2api-crag-work.conf`，启动前防符号链接跟随并以原子 `uid/gid` 选项将 guest tmpfs 挂载到 `/run/kin/work`（`mode=0700,size=256m,nosuid,nodev`），挂载失败自动退回原 9p 目录，离开 CRAG v2 时清理 drop-in，老 guest 镜像无需重建、下次 CRAG 启动即生效（#1741）。
+- **蓝绿部署支持只加型 SQLite 迁移无停机放行**：新增 `deploy/bluegreen/migration-guard.mjs` 并接入 `bg-deploy.sh` 与 `docs/BLUEGREEN.md`，在确认新增 SQLite 迁移仅包含安全加表/加列/小表索引时保持零停机蓝绿切换；全路径闭失败校验已存在表、已有表 `CHECK`/`NOT NULL DEFAULT NULL`、缺失 DB 文件与升级引擎回退逻辑（#1762）。
+- 部署说明：本版涉及控制面、前端、蓝绿部署脚本（`deploy/bluegreen/`）、CRAG guest 挂点脚本（`docker/kin-kvm/guest/kin-crag-apparmor`）、CRAGGemini 宿主脚本（`scripts/fetch-default-gemini.py`、`scripts/gemini-host-egress.sh`、`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）与 `deploy/payload.json` 中 `geminiDefaultLinuxAmd64` 载荷钉选（`0.4.6 → 0.4.7`）。CRAG 内核钉选（`3.1.17`）、数据库结构及 `bin/` / `share/wrap-cli` 字节均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机需执行 `install.sh prepare-gemini` 同步宿主脚本与 `0.4.7` 载荷。
 
 ## 1.4.202 — 2026-11-24 · 强制函数调用未兑现时明确失败；上游 modelVersion 如实透出；`service_tier` 能力边界显式化
 
