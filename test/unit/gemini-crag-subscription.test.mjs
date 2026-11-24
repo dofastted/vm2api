@@ -1078,3 +1078,84 @@ test('createGeminiCragSubscription accepts path-prefixed authority URLs and surf
   assert.equal(status.slot_limit, 20)
   assert.equal(status.quota_grants.length, 2)
 })
+
+test('createGeminiCragSubscription defaults to https://www.vm2api.org/gemini and surfaces issuer_mismatch / payload_key_unknown without collapsing to authority_unavailable', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-default-origin-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const prevEnv = process.env.KIN_CRAG_GEMINI_AUTHORITY_URL
+  delete process.env.KIN_CRAG_GEMINI_AUTHORITY_URL
+  t.after(() => {
+    if (prevEnv === undefined) delete process.env.KIN_CRAG_GEMINI_AUTHORITY_URL
+    else process.env.KIN_CRAG_GEMINI_AUTHORITY_URL = prevEnv
+  })
+
+  const authority = makeAuthority()
+  const machineIdPath = path.join(root, 'machine-id')
+  fs.writeFileSync(machineIdPath, '33333333333333333333333333333333\n')
+
+  const seenUrls = []
+  let mode = 'issuer_mismatch'
+  const fetchImpl = async (url) => {
+    seenUrls.push(String(url))
+    if (mode === 'issuer_mismatch') {
+      return {
+        ok: false,
+        status: 409,
+        headers: new Map([['x-request-id', 'req-issuer']]),
+        async json() {
+          return { ok: false, error: { code: 'issuer_mismatch', message: 'The issuer public key does not match.' } }
+        },
+      }
+    }
+    return {
+      ok: false,
+      status: 400,
+      headers: new Map([['x-request-id', 'req-payload-key']]),
+      async json() {
+        return { ok: false, error: { code: 'payload_key_unknown', message: 'Unknown payload key.' } }
+      },
+    }
+  }
+
+  const dataDir = path.join(root, 'data')
+  const sub = createGeminiCragSubscription({
+    projectRoot: root,
+    dataDir,
+    resolveAuthority: () => ({
+      publicKey: authority.publicKey,
+      issuerId: authority.issuerId,
+      payloadKeyId: authority.payloadKeyId,
+    }),
+    callHost: async () => ({}),
+    fetchImpl,
+    machineIdFile: machineIdPath,
+  })
+  const panel = createGeminiPanelHandler({
+    json: (_res, status, payload) => ({ status, payload }),
+    readBody: async (req) => req.body,
+    cragSubscription: sub,
+    callHost: async () => ({}),
+  })
+  const res = { setHeader() {} }
+  const voucher = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
+
+  const r1 = await panel(
+    { method: 'POST', body: { redemption_code: voucher } },
+    res,
+    '/api/panel/gemini/crag-subscription/redeem',
+  )
+  assert.equal(seenUrls[0], 'https://www.vm2api.org/gemini/v1/host-subscriptions/redeem')
+  assert.equal(r1.status, 409)
+  assert.equal(r1.payload.error.code, 'issuer_mismatch')
+  assert.equal(fs.existsSync(path.join(dataDir, 'crag-gemini-subscription', 'public', 'sync-pending')), false)
+
+  mode = 'payload_key_unknown'
+  const r2 = await panel(
+    { method: 'POST', body: { redemption_code: voucher } },
+    res,
+    '/api/panel/gemini/crag-subscription/redeem',
+  )
+  assert.equal(r2.status, 400)
+  assert.equal(r2.payload.error.code, 'payload_key_unknown')
+  assert.equal(fs.existsSync(path.join(dataDir, 'crag-gemini-subscription', 'public', 'sync-pending')), false)
+})
