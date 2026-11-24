@@ -163,7 +163,7 @@ case "$mode" in
   dc "$active" pull -q "$BG_SERVICE" || true
   # The colour's stop_grace_period is sized for a background drain; here clients are waiting, so cap it.
   docker stop -t "$BG_RESTART_GRACE" "$(cname "$active")" >/dev/null 2>&1 || true
-  dc "$active" up -d --force-recreate
+  dc "$active" up -d --no-deps --force-recreate "$BG_SERVICE"
   for _ in $(seq 1 180); do healthz "$active" >/dev/null && break; sleep 1; done
   healthz "$active" >/dev/null || { log "FAILED: $active did not come back; see docker logs $(cname "$active")"; exit 1; }
   log "restart done: $active on :$(port "$active")"
@@ -192,7 +192,7 @@ case "$mode" in
   touch data/run/bg-active-blue
   point_container blue
   if docker inspect "$BG_NAME" >/dev/null 2>&1; then docker compose down --timeout 100; fi
-  dc blue up -d
+  dc blue up -d --no-deps "$BG_SERVICE"
   for _ in $(seq 1 180); do healthz blue >/dev/null && break; sleep 1; done
   healthz blue >/dev/null || { log "FAILED: blue did not come up"; exit 1; }
   echo blue >"$BG_STATE_DIR/active"
@@ -233,10 +233,10 @@ done < <(awk -v root="$BG_PROJECT_DIR/" '$1 == "source:" && index($2, root) == 1
 entry=$(awk '$1 == "source:" {src = $2} $1 == "target:" && $2 == "/usr/local/bin/vm2api-entrypoint" {print src; exit}' <<<"$rendered")
 [[ -z $entry || -x $entry ]] || { echo "entrypoint $entry is not executable (chmod +x)" >&2; exit 1; }
 
-# 迁移护栏：新镜像带新迁移时两个控制面不能共用库，退回停机重启
+# 迁移护栏：新镜像带新迁移（SQLite 或 PostgreSQL）时两个控制面不能共用库，退回停机重启
 dc "$new" pull -q "$BG_SERVICE" || true
-mig_old=$(docker exec "$(cname "$old")" ls /opt/vm2api/src/lib/db/migrations | sort)
-mig_new=$(dc "$new" run --rm --no-deps -T --entrypoint ls "$BG_SERVICE" /opt/vm2api/src/lib/db/migrations | sort)
+mig_old=$(docker exec "$(cname "$old")" sh -c 'ls /opt/vm2api/src/lib/db/migrations /opt/vm2api/src/lib/db/pg/pg-migrations 2>/dev/null' | sort)
+mig_new=$(dc "$new" run --rm --no-deps -T --entrypoint sh "$BG_SERVICE" -c 'ls /opt/vm2api/src/lib/db/migrations /opt/vm2api/src/lib/db/pg/pg-migrations 2>/dev/null' | sort)
 added=$(comm -13 <(echo "$mig_old") <(echo "$mig_new"))
 if [[ -n $added ]]; then
   log "new image adds migrations: $(echo "$added" | tr '\n' ' ')"
@@ -248,7 +248,7 @@ fi
 rm -f "data/run/bg-active-$new"
 dc "$new" down --timeout 5 >/dev/null 2>&1 || true
 since=$(date -u +%Y-%m-%dT%H:%M:%S)
-dc "$new" up -d
+dc "$new" up -d --no-deps "$BG_SERVICE"
 abort() { log "FAILED: $*; removing $new, $old keeps serving"; dc "$new" down --timeout 5 || true; exit 1; }
 wait_log "$(cname "$new")" "$since" '"event":"vm2api-started"' 180 || abort "standby did not start"
 [[ $(role "$new") == standby ]] || abort "$new did not boot as standby"

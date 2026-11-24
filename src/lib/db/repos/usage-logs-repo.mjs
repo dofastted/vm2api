@@ -168,6 +168,7 @@ const SUMMARY_COLUMNS = [
 
 function toRow(rec) {
   return SUMMARY_COLUMNS.map((c) => {
+    if (c === 'id') return rec.id ?? rec.request_id ?? globalThis.crypto.randomUUID()
     if (c === 'created_at') return rec.created_at ?? rec.ts ?? null
     if (c === 'ip_address') return rec.ip_address ?? rec.ip ?? null
     if (c === 'stream') return rec.stream ? 1 : 0
@@ -774,6 +775,35 @@ export class UsageLogsRepo {
   /** Rewrite cost columns in [since, until]; never actual_cost / rate_multiplier. */
   repriceRange({ since, until } = {}) {
     const { cond, params } = timeCond(since, until)
+    const isPg = this.db?.engine === 'postgres'
+    if (isPg) {
+      const where = cond ? `${cond} AND id > ?` : 'WHERE id > ?'
+      const page = this.db.prepare(`
+        SELECT id, created_at, model, upstream_model, requested_model,
+               input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+               cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
+               rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
+               input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
+               image_cost, total_cost, pricing_model, price_source, price_version, long_context
+        FROM usage_logs ${where}
+        ORDER BY id
+        LIMIT 2000
+      `)
+      const out = { rows: 0, changed: 0, still_unpriced: 0, delta_usd: 0 }
+      let after = ''
+      for (;;) {
+        const rows = page.all(...params, after)
+        if (!rows.length) break
+        const part = this._repriceRows(rows, { writeActualCost: false })
+        out.rows += part.rows
+        out.changed += part.changed
+        out.still_unpriced += part.still_unpriced
+        out.delta_usd += part.delta_usd
+        after = String(rows.at(-1).id)
+      }
+      out.delta_usd = Math.round(out.delta_usd * 1e8) / 1e8
+      return out
+    }
     const where = cond ? `${cond} AND rowid > ?` : 'WHERE rowid > ?'
     // Keyset pages keep a month-long range from loading every row at once.
     const page = this.db.prepare(`
@@ -1841,14 +1871,16 @@ export class UsageLogsRepo {
     const usage_logs = this._pruneUsage(cfg.usageCutoff)
     const debug_by_age = this._deleteOldDebug.run(cfg.debugCutoff).changes
     const debug_by_size = this.trimDebugToMaxBytes(cfg.maxBytes)
-    if (usage_logs + debug_by_age + debug_by_size > 0) {
+    if (this.db?.engine !== 'postgres') {
+      if (usage_logs + debug_by_age + debug_by_size > 0) {
+        try {
+          this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+        } catch {}
+      }
       try {
-        this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+        this.db.exec('PRAGMA optimize')
       } catch {}
     }
-    try {
-      this.db.exec('PRAGMA optimize')
-    } catch {}
     return {
       usage_logs,
       request_log_debug: debug_by_age + debug_by_size,
@@ -1869,8 +1901,8 @@ export class UsageLogsRepo {
         WHERE created_at < ? AND (${LIFETIME_ACCOUNT_SQL}) IS NOT NULL
         GROUP BY 1
         ON CONFLICT(account_id) DO UPDATE SET
-          total_cost = total_cost + excluded.total_cost,
-          total_tokens = total_tokens + excluded.total_tokens
+          total_cost = account_lifetime_usage_archive.total_cost + excluded.total_cost,
+          total_tokens = account_lifetime_usage_archive.total_tokens + excluded.total_tokens
       `)
         .run(cutoff)
       const deleted = this._deleteOldUsage.run(cutoff).changes

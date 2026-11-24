@@ -49,6 +49,7 @@ export function DatabasePage() {
           <div className='space-y-3'>
             <DatabaseOverview
               metrics={metrics.data.database}
+              cache={metrics.data.cache}
               sampledAt={metrics.data.sampled_at}
             />
             <UsageCacheMetricsPanel metrics={metrics.data.usage_cache} />

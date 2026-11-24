@@ -208,11 +208,12 @@ import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import * as panel from './panel-api.mjs'
 import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
 import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } from '../vm/vm-file.mjs'
-import { snapshotDatabaseMetrics } from '../db/database-metrics.mjs'
+import { snapshotDatabaseMetricsAsync } from '../db/database-metrics.mjs'
 import { queryActiveUsage } from '../oauth/active-usage-query.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
-import { getDb, getDbPath } from '../db/database.mjs'
+import { getDb, getDbPath, getPgPool } from '../db/database.mjs'
 import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 import {
   readLocalVersion,
   loadChangelog,
@@ -2250,10 +2251,12 @@ export function createPanelHandler(ctx) {
       }
       if (p.startsWith('/api/panel/cluster/')) return ctx.clusterRoutes.handle(req, res, url)
       if (req.method === 'GET' && p === '/api/panel/database/metrics') {
-        const snapshot = snapshotDatabaseMetrics({
+        const snapshot = await snapshotDatabaseMetricsAsync({
           db: getDb(),
           dbPath: getDbPath(),
+          pgPool: getPgPool(),
           usageCache: getUsageCache(),
+          cacheRuntime: getCacheRuntime(),
         })
         return json(res, 200, panel.ok(snapshot))
       }
@@ -3001,7 +3004,15 @@ export function createPanelHandler(ctx) {
       if (req.method === 'GET' && p === '/api/panel/usage-logs/overview') {
         const u = new URL(req.url, 'http://x')
         const tz = u.searchParams.get('tz') || 'UTC'
-        return json(res, 200, panel.ok(await readView('overview', { tz, owner_user_id: tenantId() })))
+        const owner = tenantId()
+        const bypass = u.searchParams.get('refresh') === '1'
+        const data = await getCacheRuntime().dashboard.getOrLoad(
+          'usage-overview',
+          { tz, owner },
+          () => readView('overview', { tz, owner_user_id: owner }),
+          { bypass },
+        )
+        return json(res, 200, panel.ok(data))
       }
 
       // ---- Statistics page ----
@@ -3010,7 +3021,16 @@ export function createPanelHandler(ctx) {
         const q = statsParams(req, u, 'dimension')
         if (q.error) return json(res, 400, { ok: false, error: { message: q.error } })
         const { range, dimension, tz, owner_user_id } = q
-        return json(res, 200, panel.ok(new StatisticsRepo(getDb()).statistics({ range, dimension, tz, owner_user_id })))
+        const bypass = u.searchParams.get('refresh') === '1'
+        const data = await getCacheRuntime().dashboard.getOrLoad(
+          'statistics',
+          { range, dimension, tz, owner_user_id },
+          async () =>
+            (await readUsage('stats', 'statistics', [{ range, dimension, tz, owner_user_id }])) ??
+            new StatisticsRepo(getDb()).statistics({ range, dimension, tz, owner_user_id }),
+          { bypass },
+        )
+        return json(res, 200, panel.ok(data))
       }
       if (req.method === 'GET' && p === '/api/panel/statistics/leaderboard') {
         const u = new URL(req.url, 'http://x')
@@ -3018,11 +3038,16 @@ export function createPanelHandler(ctx) {
         if (q.error) return json(res, 400, { ok: false, error: { message: q.error } })
         const { range, dimension: scope, tz, owner_user_id } = q
         const limit = u.searchParams.get('limit')
-        return json(
-          res,
-          200,
-          panel.ok(new StatisticsRepo(getDb()).leaderboard({ range, scope, limit, tz, owner_user_id })),
+        const bypass = u.searchParams.get('refresh') === '1'
+        const data = await getCacheRuntime().dashboard.getOrLoad(
+          'statistics-leaderboard',
+          { range, scope, limit, tz, owner_user_id },
+          async () =>
+            (await readUsage('stats', 'leaderboard', [{ range, scope, limit, tz, owner_user_id }])) ??
+            new StatisticsRepo(getDb()).leaderboard({ range, scope, limit, tz, owner_user_id }),
+          { bypass },
         )
+        return json(res, 200, panel.ok(data))
       }
 
       if (req.method === 'GET' && p === '/api/panel/billing') {

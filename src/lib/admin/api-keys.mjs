@@ -17,11 +17,12 @@ import { keyScopeFromRecord, normalizeKeyScope } from './key-scope.mjs'
 import { normalizeKeyAllowedModels, parseKeyAllowedModels } from './key-models.mjs'
 import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
 import crypto from 'node:crypto'
-import { resolveStoreDb } from '../db/database.mjs'
+import { DB_INSTANCE_ID, getDb, isDbOpen, resolveStoreDb } from '../db/database.mjs'
 import { ApiKeysRepo } from '../db/repos/api-keys-repo.mjs'
 import { maybeEncrypt, maybeDecrypt } from '../db/secure.mjs'
 import { calculateCost, normalizeUsage } from './pricing.mjs'
 import { UsersRepo } from '../db/repos/users-repo.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 
 const KEY_PREFIX = 'sk-vm-'
 const HASH_MARKER = 'hmac:'
@@ -178,14 +179,35 @@ export class ApiKeyStore {
     }
   }
 
-  /** Re-read from DB (no-op cache-wise; kept for API compat + post-restore). */
-  reload() {}
+  /** Re-read from DB and clear cached auth entries. */
+  reload() {
+    getCacheRuntime()
+      .apiKeys.invalidateAll()
+      .catch(() => {})
+  }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
   rebind(db) {
     this.db = db
     this.repo = new ApiKeysRepo(db)
     this.users = new UsersRepo(db)
+    getCacheRuntime()
+      .apiKeys.invalidateAll()
+      .catch(() => {})
+  }
+
+  _cacheKey(hash) {
+    if (!hash) return ''
+    if (isDbOpen() && this.db === getDb()) return hash
+    return `${this.db?.[DB_INSTANCE_ID] || 'isolated'}:${hash}`
+  }
+
+  _invalidateHash(hash, reason = 'updated') {
+    const ck = this._cacheKey(hash)
+    if (ck)
+      getCacheRuntime()
+        .apiKeys.invalidateByHash(ck, reason)
+        .catch(() => {})
   }
 
   list({ reveal = false } = {}) {
@@ -210,8 +232,17 @@ export class ApiKeyStore {
   authenticate(token) {
     if (!token) return { ok: false, reason: 'missing' }
     const hash = this._hash(token)
+    const cacheKey = this._cacheKey(hash)
+    const apiKeyCache = getCacheRuntime().apiKeys
+    const cached = apiKeyCache.getSync(cacheKey)
+    if (cached.hit) {
+      if (!cached.value) return { ok: false, reason: 'invalid' }
+      if (!this._ownerActive(cached.value)) return { ok: false, reason: 'user_disabled' }
+      return { ok: true, record: cached.value }
+    }
     const indexed = this.repo.getByHash(hash)
     if (indexed) {
+      apiKeyCache.putSync(cacheKey, indexed)
       if (!this._ownerActive(indexed)) return { ok: false, reason: 'user_disabled' }
       return { ok: true, record: indexed }
     }
@@ -224,9 +255,12 @@ export class ApiKeyStore {
         rec.key_suffix = String(token).slice(-4)
         rec.key_secret = maybeEncrypt(token)
         rec.key = HASH_MARKER + hash
-        return { ok: true, record: this.repo.update(rec) }
+        const updated = this.repo.update(rec)
+        apiKeyCache.putSync(cacheKey, updated)
+        return { ok: true, record: updated }
       }
     }
+    apiKeyCache.putSync(cacheKey, null)
     return { ok: false, reason: 'invalid' }
   }
 
@@ -297,6 +331,7 @@ export class ApiKeyStore {
       throw Object.assign(new Error('invalid expires_at'), { code: 'invalid_expires_at' })
     }
     const stored = this.repo.insert(rec)
+    this._invalidateHash(keyHash, 'created')
     return { ...stored, key, _plain_key: key }
   }
 
@@ -351,7 +386,9 @@ export class ApiKeyStore {
       rec.allowed_models = JSON.stringify(normalizeKeyAllowedModels(patch.allowed_models))
     }
     rec.updated_at = nowIso()
-    return this.repo.update(rec)
+    const updated = this.repo.update(rec)
+    this._invalidateHash(rec.key_hash, 'updated')
+    return updated
   }
 
   /**
@@ -375,6 +412,7 @@ export class ApiKeyStore {
     if (this.repo.getByHash(keyHash)) {
       throw Object.assign(new Error('key already exists'), { code: 'key_exists' })
     }
+    const prevHash = rec.key_hash
     rec.key = HASH_MARKER + keyHash
     rec.key_hash = keyHash
     rec.key_prefix = key.slice(0, 10)
@@ -382,14 +420,21 @@ export class ApiKeyStore {
     rec.key_secret = maybeEncrypt(key)
     rec.updated_at = nowIso()
     const stored = this.repo.update(rec)
+    this._invalidateHash(prevHash, 'rotated')
+    this._invalidateHash(keyHash, 'rotated')
     return { ...stored, key, _plain_key: key }
   }
 
   remove(id) {
+    const prev = this.repo.getById(id)
     const removed = this.repo.remove(id)
     if (!removed) return false
     this.inflight.delete(id)
     this.rpmBuckets.delete(id)
+    if (prev?.key_hash) this._invalidateHash(prev.key_hash, 'removed')
+    getCacheRuntime()
+      .billing.invalidateApiKey(id)
+      .catch(() => {})
     return true
   }
 
@@ -606,10 +651,22 @@ export class ApiKeyStore {
       cost,
     })
     // Mark the key as quota-exhausted when recorded spend reaches its USD quota.
+    let finalRec = rec
     if (rec && rec.status === 'active' && (rec.quota ?? 0) > 0 && (rec.quota_used ?? 0) >= rec.quota) {
-      this.repo.update({ ...rec, status: 'quota_exhausted', updated_at: nowIso() })
+      finalRec = this.repo.update({ ...rec, status: 'quota_exhausted', updated_at: nowIso() })
     }
-    return rec
+    if (finalRec?.key_hash) {
+      getCacheRuntime().apiKeys.putSync(this._cacheKey(finalRec.key_hash), finalRec)
+    }
+    if (cost > 0) {
+      const billing = getCacheRuntime().billing
+      for (const win of RATE_WINDOWS) {
+        if ((finalRec?.[win.limit] ?? 0) > 0) {
+          billing.recordKeyWindowUsage(id, win.name, cost, win.ms).catch(() => {})
+        }
+      }
+    }
+    return finalRec
   }
 
   snapshot() {

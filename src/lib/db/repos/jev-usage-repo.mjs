@@ -52,7 +52,7 @@ export class JevUsageRepo {
       `INSERT INTO jev_usage_events (${FIELDS.join(',')}) VALUES (${FIELDS.map(() => '?').join(',')})`,
     )
     this.sum = db.prepare(`INSERT INTO jev_usage_totals (period,${COUNTS.join(',')}) VALUES (?,?,?,?,?,?,?,?)
-      ON CONFLICT(period) DO UPDATE SET ${COUNTS.map((name) => `${name}=${name}+excluded.${name}`).join(',')}`)
+      ON CONFLICT(period) DO UPDATE SET ${COUNTS.map((name) => `${name}=jev_usage_totals.${name}+excluded.${name}`).join(',')}`)
   }
   record(event) {
     const amounts = [

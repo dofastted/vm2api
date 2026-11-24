@@ -73,6 +73,9 @@ usage() {
   check                对比当前版本与最新 Release，打印 changelog
   changelog            打印本地 CHANGELOG.md
   status               当前版本、容器、探活
+  db-migrate           将现有 SQLite 数据库平滑迁移替换为 PostgreSQL（调用 replace-db-to-pg.sh）
+  db-status            查看当前数据库引擎、PG/Redis 容器与迁移状态
+  db-rollback          一键回滚回原 SQLite 配置并重启控制面
   uninstall            停控制面（默认保留 .env / vms / data）
 
 选项:
@@ -434,6 +437,24 @@ ensure_env() {
   fi
   env_set_if_empty VM2API_API_KEY "$(gen_secret)" || true
   env_set_if_empty VM2API_DB_SECRET "$(gen_secret)" || true
+  env_set_if_empty POSTGRES_USER "vm2api" || true
+  env_set_if_empty POSTGRES_DB "vm2api" || true
+  env_set_if_empty POSTGRES_PASSWORD "$(gen_secret)" || true
+  env_set_if_empty VM2API_PG_PORT "5432" || true
+  env_set_if_empty REDIS_PASSWORD "$(gen_secret)" || true
+  env_set_if_empty VM2API_REDIS_PORT "6379" || true
+  # 升级保护：若检测到既有 SQLite (data/kin.db) 且 .env 尚未声明 VM2API_DB_DRIVER / DATABASE_URL，
+  # 先保持 sqlite 防止误启空 PG 库，待运维执行 db-migrate / replace-db-to-pg.sh 完成迁移切换。
+  if [ -z "$(env_get VM2API_DB_DRIVER)" ]; then
+    if [ -f "${INSTALL_DIR}/data/kin.db" ] && [ -z "$(env_get DATABASE_URL)" ] && [ -z "$(env_get VM2API_DATABASE_URL)" ]; then
+      env_set VM2API_DB_DRIVER "sqlite"
+      warn "检测到已有 SQLite 数据库 (${INSTALL_DIR}/data/kin.db)，暂保持 VM2API_DB_DRIVER=sqlite 以防数据切换丢失"
+      info "请运行以下命令平滑迁移并切换至 PostgreSQL："
+      info "  sudo bash ${INSTALL_DIR}/deploy/replace-db-to-pg.sh"
+    else
+      env_set VM2API_DB_DRIVER "postgres"
+    fi
+  fi
   chmod 600 "$envf" || true
 }
 
@@ -568,11 +589,13 @@ fetch_release_files() {
   mkdir -p "${INSTALL_DIR}/deploy"
   info "下载部署文件 ${tag} → ${INSTALL_DIR}"
   fetch_file "$tag" docker-compose.yml "${INSTALL_DIR}/docker-compose.yml"
+  fetch_file "$tag" docker-compose.local.yml "${INSTALL_DIR}/docker-compose.local.yml" 1
   fetch_file "$tag" .env.example "${INSTALL_DIR}/.env.example"
   fetch_file "$tag" VERSION "${INSTALL_DIR}/VERSION"
   fetch_file "$tag" CHANGELOG.md "${INSTALL_DIR}/CHANGELOG.md" 1
   fetch_file "$tag" deploy/install.sh "${INSTALL_DIR}/deploy/install.sh" 1
-  chmod +x "${INSTALL_DIR}/deploy/install.sh" 2>/dev/null || true
+  fetch_file "$tag" deploy/replace-db-to-pg.sh "${INSTALL_DIR}/deploy/replace-db-to-pg.sh" 1
+  chmod +x "${INSTALL_DIR}/deploy/install.sh" "${INSTALL_DIR}/deploy/replace-db-to-pg.sh" 2>/dev/null || true
   if [ "$HOST_ARCH" = arm64 ]; then
     fetch_file "$tag" deploy/prepare-arm64.py "${INSTALL_DIR}/deploy/prepare-arm64.py" 1
     if [ ! -f "${INSTALL_DIR}/deploy/prepare-arm64.py" ]; then
@@ -1466,12 +1489,46 @@ cmd_uninstall() {
   info "若要整目录删除: rm -rf ${INSTALL_DIR}"
 }
 
+cmd_db_migrate() {
+  need_root
+  local script="${INSTALL_DIR}/deploy/replace-db-to-pg.sh"
+  if [ ! -f "$script" ]; then
+    err "缺少迁移脚本: ${script}，请先执行 upgrade 更新部署文件"
+    exit 1
+  fi
+  bash "$script" --dir "$INSTALL_DIR" "$@"
+}
+
+cmd_db_status() {
+  local script="${INSTALL_DIR}/deploy/replace-db-to-pg.sh"
+  if [ -f "$script" ]; then
+    bash "$script" --dir "$INSTALL_DIR" --status
+  else
+    cmd_status
+  fi
+}
+
+cmd_db_rollback() {
+  need_root
+  local script="${INSTALL_DIR}/deploy/replace-db-to-pg.sh"
+  if [ ! -f "$script" ]; then
+    err "缺少回滚脚本: ${script}"
+    exit 1
+  fi
+  bash "$script" --dir "$INSTALL_DIR" --rollback
+}
+
 COMMAND="install"
+EXTRA_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    install|upgrade|update|crag-update|prepare-native|prepare-crag-host|prepare-gemini|check|changelog|status|uninstall)
+    install|upgrade|update|crag-update|prepare-native|prepare-crag-host|prepare-gemini|check|changelog|status|db-migrate|db-status|db-rollback|uninstall)
       COMMAND="$1"
       shift
+      if [ "$COMMAND" = "db-migrate" ]; then
+        EXTRA_ARGS=("$@")
+        break
+      fi
       ;;
     --version)
       if [ $# -lt 2 ]; then
@@ -1560,6 +1617,9 @@ case "$COMMAND" in
   check) cmd_check ;;
   changelog) cmd_changelog ;;
   status) cmd_status ;;
+  db-migrate) cmd_db_migrate "${EXTRA_ARGS[@]}" ;;
+  db-status) cmd_db_status ;;
+  db-rollback) cmd_db_rollback ;;
   uninstall) cmd_uninstall ;;
   *) usage; exit 1 ;;
 esac

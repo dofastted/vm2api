@@ -320,10 +320,11 @@ function createInput(body) {
 // CHECK forbids marking in dispatch_state (anything past 'reserved'); the dispatch_state
 // arm keeps orders cancelled before that column existed reading as closed.
 const isClosed = (row) => row?.closed_at != null || row?.dispatch_state === 'cancelled'
+const normalizeSlotLimit = (value) => (typeof value === 'string' && /^[1-9]\d*$/.test(value) ? Number(value) : value)
 
 function view(row, activationEnabled = true) {
-  const { order_id, request_id, sku, payment_method, status, created_at, term, amount_minor, slot_limit, reserved_at } =
-    row
+  const { order_id, request_id, sku, payment_method, status, created_at, term, amount_minor, reserved_at } = row
+  const slot_limit = normalizeSlotLimit(row.slot_limit)
   const result = {
     order_id,
     request_id,
@@ -428,7 +429,8 @@ function recoverDeviceOrder(db, orderId, hostId, owner) {
     // UNIQUE(owner, request_id): this browser already holds a different order reserved
     // under the same request id, so one of the two would have to be dropped. Say so
     // instead of surfacing a constraint error as an unexplained failure.
-    if (typeof error?.code === 'string' && error.code.startsWith('SQLITE_CONSTRAINT'))
+    const errCode = String(error?.code || error?.pgCode || '')
+    if (errCode === '23505' || errCode.startsWith('SQLITE_CONSTRAINT'))
       throw failure(409, 'shop_order_recover_conflict', 'This browser already holds an order from the same checkout')
     throw error
   }
@@ -438,6 +440,7 @@ function recoverDeviceOrder(db, orderId, hostId, owner) {
 }
 
 function durable(db, work) {
+  if (db?.engine === 'postgres') return work()
   // The installation-wide default is WAL/NORMAL. Flush before external effects.
   const { synchronous } = db.prepare('PRAGMA synchronous').get()
   if (synchronous < 2) db.exec('PRAGMA synchronous = FULL')
@@ -544,7 +547,7 @@ function reflectOrder(db, owner, order) {
     row.created_at !== created_at ||
     row.term !== term ||
     row.amount_minor !== amount_minor ||
-    row.slot_limit !== slot_limit ||
+    normalizeSlotLimit(row.slot_limit) !== slot_limit ||
     optional.some((key) => order[key] !== undefined && row[key] !== order[key])
   ) {
     throw failure(502, 'shop_invalid_reply', 'Invalid response from CRAG shop')
