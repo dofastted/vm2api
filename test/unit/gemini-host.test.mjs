@@ -314,6 +314,17 @@ test('Gemini host auto-provisions models, plan, onboarding, and token refresh', 
   })
 })
 
+// The default-payload fetcher used to hardcode the release version alongside the
+// manifest pin, and the two drifted for three releases (#1677). Driven from here
+// because `test:ci`'s standing set is 13 keywords that do not include this file:
+// CI picks it up as a modified test, the same way every non-core test here runs.
+test('the default Gemini payload fetcher derives its release from the manifest pin', { timeout: 15_000 }, () => {
+  execFileSync('python3', ['-B', fileURLToPath(new URL('./fetch-default-gemini-pins.py', import.meta.url))], {
+    stdio: 'pipe',
+    timeout: 12_000,
+  })
+})
+
 test('Gemini payload redemption is admin-only and rejects malformed codes before host dispatch', async () => {
   const route = `${root}/payload/redeem`
   assert.equal(authorizePanelRoute('POST', route, 'user').ok, false)
