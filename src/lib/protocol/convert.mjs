@@ -1204,7 +1204,7 @@ export function applyClaudeSSELineToMessage(line, state) {
     } else if (evt.delta.type === 'thinking_delta') {
       block.thinking = (block.thinking || '') + (evt.delta.thinking || '')
     } else if (evt.delta.type === 'signature_delta' && evt.delta.signature) {
-      block.signature = evt.delta.signature
+      block.signature = (block.signature || '') + evt.delta.signature
     } else if (evt.delta.type === 'input_json_delta') {
       block._inputJson = (block._inputJson || '') + (evt.delta.partial_json || '')
     } else if (evt.delta.type === 'refusal_delta') {
@@ -1441,8 +1441,8 @@ export function claudeSSELineToResponsesEvents(line, state) {
       emit(`${refusal ? 'refusal' : 'output_text'}.delta`, { ...fields, content_index: 0, delta: text })
     } else if (delta?.type === 'thinking_delta') {
       block.thinking = (block.thinking || '') + (delta.thinking || '')
-    } else if (delta?.type === 'signature_delta') {
-      block.signature = delta.signature
+    } else if (delta?.type === 'signature_delta' && delta.signature) {
+      block.signature = (block.signature || '') + delta.signature
     }
   } else if (evt.type === 'content_block_stop') {
     const entry = state.blocks.get(evt.index)

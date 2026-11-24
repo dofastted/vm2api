@@ -1792,7 +1792,22 @@ export function createHandleProtocol(deps) {
     const clientStream = isClientStream(inbound, req.headers)
     const streamTracker = clientStream && protocol === 'anthropic.messages' ? createAnthropicStreamTracker() : null
     const anthropicSseErrorRemapper =
-      clientStream && protocol === 'anthropic.messages' ? createAnthropicSseErrorRemapper() : null
+      clientStream && protocol === 'anthropic.messages'
+        ? createAnthropicSseErrorRemapper({
+          isStarted: () => streamTracker?.hasStarted() === true,
+          // The client is told to retry, so the real cause has to survive here or
+          // it survives nowhere: this relay path sets no other logBag fields, and
+          // a deterministic capture fault would otherwise read exactly like a
+          // transient disconnect while the client retries into it.
+          onRetryableTruncation: (payload, mapped) => {
+            const raw = payload?.error || payload || {}
+            logBag.client_error_type = 'rate_limit_error'
+            logBag.truncation_reason = 'mid_stream_error'
+            logBag.error_code = raw.code || raw.type || mapped?.body?.error?.code || logBag.error_code || null
+            logBag.error_message = raw.message || mapped?.body?.error?.message || logBag.error_message || null
+          },
+        })
+        : null
     // One keepalive for the whole Claude stream, including session/seat queues
     // and the gaps between failover attempts. OpenAI keeps its per-attempt one.
     const anthropicKeepalive =
@@ -2598,22 +2613,28 @@ export function createHandleProtocol(deps) {
         }
         const closing = isRecoverableTruncation(result) && !res.writableEnded ? streamTracker?.closingEvents() : null
         if (closing) res.write(closing)
-        else if (
-          protocol === 'anthropic.messages' &&
-          !res.writableEnded &&
-          (result?.nativeHandoff === true || !streamTracker?.hasStarted()) &&
-          !streamTracker?.isFinished()
-        ) {
-          // A strict handoff failure must remain an error even after partial
-          // content. Legacy queue pings still receive the mapped SSE error.
+        else if (protocol === 'anthropic.messages' && !res.writableEnded && !streamTracker?.isFinished()) {
           const mapped = mapProtocolClientError(result, logBag, logBag.error_code)
-          res.write(buildAnthropicSseError(mapped.body?.error || {}, result?.poolReason))
-        } else if (protocol === 'anthropic.messages' && !res.writableEnded && !streamTracker?.isFinished()) {
-          // Started but not closable: ask the client to retry instead of
-          // dropping the connection. error_code/error_message keep the cause.
-          logBag.client_error_type = 'rate_limit_error'
-          logBag.truncation_reason = truncationReason(result, streamTracker)
-          res.write(buildRetryableTruncationError())
+          const mappedErr = mapped.body?.error || {}
+          const retryableStartedHandoff =
+            result?.nativeHandoff === true &&
+            streamTracker?.hasStarted() === true &&
+            mapped.status >= 500 &&
+            mappedErr.type === 'upstream_error' &&
+            !/timeout/i.test(`${logBag.error_code || ''} ${mappedErr.type || ''} ${logBag.error_message || ''}`)
+          if (retryableStartedHandoff || (result?.nativeHandoff !== true && streamTracker?.hasStarted() === true)) {
+            // Started but not closable: ask the client to retry instead of
+            // dropping the connection. error_code/error_message keep the cause.
+            logBag.client_error_type = 'rate_limit_error'
+            logBag.truncation_reason = retryableStartedHandoff
+              ? 'native_handoff_incomplete'
+              : truncationReason(result, streamTracker)
+            res.write(buildRetryableTruncationError())
+          } else {
+            // Unstarted streams (or non-retryable strict handoff failures like
+            // 4xx/timeout/policy) keep the mapped SSE error.
+            res.write(buildAnthropicSseError(mappedErr, result?.poolReason))
+          }
         }
       }
       return res.end()

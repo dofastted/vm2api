@@ -341,8 +341,12 @@ export function createNativeHandoffState({ nativeHandoff = true } = {}) {
       ) {
         throw protocolError('native_handoff_incomplete', 'Native provider response ended before its message terminal')
       }
+      const keepCommittedMaxTokensTools =
+        committed && stream && providerResult.stop_reason === 'max_tokens' && body.content.some(toolBlock)
       const content =
-        providerResult.stop_reason === 'tool_use' ? body.content : body.content.filter((block) => !toolBlock(block))
+        providerResult.stop_reason === 'tool_use' || keepCommittedMaxTokensTools
+          ? body.content
+          : body.content.filter((block) => !toolBlock(block))
       if (providerResult.stop_reason === 'tool_use' && !content.some(toolBlock)) {
         throw protocolError('native_handoff_conflict', 'Native tool_use stop has no complete tool batch')
       }
@@ -366,7 +370,13 @@ export function createNativeHandoffState({ nativeHandoff = true } = {}) {
       ) {
         throw protocolError('native_handoff_invalid', 'Native tool batch has invalid identity or arguments')
       }
-      if (committed && providerResult.stop_reason !== 'tool_use' && stream && body.content.some(toolBlock)) {
+      if (
+        committed &&
+        providerResult.stop_reason !== 'tool_use' &&
+        providerResult.stop_reason !== 'max_tokens' &&
+        stream &&
+        body.content.some(toolBlock)
+      ) {
         return {
           type: 'error',
           error: {
@@ -609,6 +619,12 @@ export async function consumeNativeHandoffStream(
       }
       if (!pending.some((event) => event.type === 'message_delta')) {
         throw protocolError('native_handoff_incomplete', 'Native stream has no terminal message_delta')
+      }
+      if (committed && state.providerResult.stop_reason === 'max_tokens' && openBlocks.size) {
+        for (const index of [...openBlocks].sort((a, b) => a - b)) {
+          await emit({ type: 'content_block_stop', index })
+        }
+        openBlocks.clear()
       }
       for (const event of pending) {
         if (Number.isInteger(event.index) && tools.has(event.index) && state.providerResult.stop_reason !== 'tool_use')

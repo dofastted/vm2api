@@ -1216,3 +1216,48 @@ test('already-Claude image blocks and unusable image_url parts pass through', ()
   assert.deepEqual(body.messages[0].content[0], { type: 'image', source })
   assert.deepEqual(body.messages[0].content[1], { type: 'image_url', image_url: {} })
 })
+
+test('stripInvalidThinkingBlocks deduplicates byte-identical thinking blocks inside one assistant turn', () => {
+  const sigA = 'A'.repeat(48)
+  const sigB = 'B'.repeat(48)
+  const dupThinking = { type: 'thinking', thinking: 'step 1', signature: sigA }
+  const secondThinking = { type: 'thinking', thinking: 'step 2', signature: sigB }
+  const dupRedacted = { type: 'redacted_thinking', data: 'encrypted-blob-1' }
+  const tool = { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'ls' } }
+
+  for (const preserveThinkingBlocks of [true, false]) {
+    const out = stripInvalidThinkingBlocks(
+      {
+        model: 'claude-opus-5',
+        thinking: { type: 'adaptive' },
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'go' }] },
+          {
+            role: 'assistant',
+            content: [dupThinking, { ...dupThinking }, secondThinking, dupRedacted, { ...dupRedacted }, tool],
+          },
+          { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }] },
+          { role: 'assistant', content: [{ ...dupThinking }, { type: 'text', text: 'done' }] },
+        ],
+      },
+      { preserveThinkingBlocks },
+    )
+    assert.deepEqual(
+      out.messages[1].content.map((b) => [b.type, b.signature || b.data || b.id]),
+      preserveThinkingBlocks
+        ? [
+            ['thinking', sigA],
+            ['thinking', sigB],
+            ['redacted_thinking', 'encrypted-blob-1'],
+            ['tool_use', 'toolu_1'],
+          ]
+        : [
+            ['thinking', sigA],
+            ['thinking', sigB],
+            ['tool_use', 'toolu_1'],
+          ],
+    )
+    // A later assistant turn is deduplicated independently, never stripped against earlier turns.
+    assert.equal(out.messages[3].content[0].signature, sigA)
+  }
+})
