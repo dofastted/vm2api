@@ -88,6 +88,10 @@ const RUN_ERRORS = {
     503,
     'CRAGGemini 原生常驻内核未就绪，请稍候等待自动预热，或前往「设置 → Gemini 维护」检查载荷与宿主服务',
   ],
+  gemini_native_config_invalid: [
+    503,
+    'CRAGGemini 拒绝了宿主生成的 worker 配置，请前往「设置 → Gemini 维护」对齐宿主脚本与签名载荷版本',
+  ],
   license_required: [403, GEMINI_LICENSE_MESSAGES.license_required],
   license_expired: [403, GEMINI_LICENSE_MESSAGES.license_expired],
   license_not_yet_valid: [403, GEMINI_LICENSE_MESSAGES.license_not_yet_valid],
@@ -281,8 +285,17 @@ export function geminiProxyFor(proxyPool, proxyId, opts) {
   return proxyFor(proxyPool, proxyId, opts)
 }
 
-function hostError(code, status = 503) {
-  return Object.assign(new Error(code), { code, status })
+const AUTH_STAGE_MESSAGES = {
+  network_prepare: 'Gemini 宿主服务在线，但隔离网络初始化失败，请检查宿主服务日志与 ip/nft/iptables 环境',
+  relay_start: 'Gemini 宿主服务在线，但宿主侧代理中继未能启动，请检查宿主服务日志',
+  proxy_probe: 'Gemini 宿主服务在线，但隔离出口无法连通绑定代理，请检查绑定代理可用性与宿主前置代理路径',
+  egress_start: 'Gemini 宿主服务在线，但隔离出口转发组件（kin-egress）未能就绪，请检查宿主服务日志',
+  cli_launch: 'Gemini 宿主服务在线，但 Antigravity CLI 授权进程未能拉起，请检查宿主服务日志与签名载荷',
+  challenge_wait: 'Gemini 宿主服务在线，但未能在时限内获取 Google 授权链接，请检查绑定代理连通性与宿主服务日志',
+}
+
+function hostError(code, status = 503, extra = null) {
+  return Object.assign(new Error(code), { code, status, ...(extra || {}) })
 }
 
 export function officialGeminiAuthUrl(value) {
@@ -334,8 +347,15 @@ function hostRequest(socketPath, operation, payload) {
             chunks.push(chunk)
           }
           const data = JSON.parse(Buffer.concat(chunks))
-          if (response.statusCode !== 200 && typeof data?.code === 'string' && Object.hasOwn(HOST_ERRORS, data.code))
-            throw hostError(data.code, response.statusCode)
+          if (response.statusCode !== 200 && typeof data?.code === 'string' && Object.hasOwn(HOST_ERRORS, data.code)) {
+            const stage =
+              data.code === 'gemini_authorization_unavailable' &&
+              typeof data.stage === 'string' &&
+              Object.hasOwn(AUTH_STAGE_MESSAGES, data.stage)
+                ? data.stage
+                : null
+            throw hostError(data.code, response.statusCode, stage ? { stage } : null)
+          }
           if (!terminal && operation !== 'redeem' && response.statusCode === 404)
             throw hostError('gemini_environment_not_found', 404)
           if (!terminal && operation !== 'redeem' && response.statusCode === 409)
@@ -831,7 +851,8 @@ export function createGeminiPanelHandler({
     })
   return async function handleGeminiPanel(req, res, pathname) {
     const ok = (data) => json(res, 200, { ok: true, data })
-    const fail = (status, code, message = code) => json(res, status, { ok: false, error: { code, message } })
+    const fail = (status, code, message = code, extra = null) =>
+      json(res, status, { ok: false, error: { code, message, ...(extra || {}) } })
     res.setHeader('Cache-Control', 'no-store')
     if (pathname === `${PANEL_PATH}/maintenance` || pathname.startsWith(`${PANEL_PATH}/maintenance/`)) {
       return maintenance(req, res, pathname)
@@ -1151,7 +1172,13 @@ export function createGeminiPanelHandler({
       }
       if (Object.hasOwn(HOST_ERRORS, error?.code)) {
         const [status, message] = HOST_ERRORS[error.code]
-        return fail(status, error.code, message)
+        const stage =
+          error.code === 'gemini_authorization_unavailable' &&
+          typeof error.stage === 'string' &&
+          Object.hasOwn(AUTH_STAGE_MESSAGES, error.stage)
+            ? error.stage
+            : null
+        return fail(status, error.code, stage ? AUTH_STAGE_MESSAGES[stage] : message, stage ? { stage } : null)
       }
       if (error?.code === 'gemini_proxy_unavailable') return fail(409, error.code, '需要绑定可用的 IPv4 SOCKS5 代理')
       if (error?.code === 'gemini_environment_not_found') return fail(404, error.code, 'Gemini 环境不存在')
@@ -1176,6 +1203,8 @@ function publicError(error) {
   const status = Number.isInteger(error?.status) ? error.status : known?.[0] || 503
   return {
     status,
+    details: error?.details,
+    retryAfter: error?.retryAfter,
     body: {
       error: {
         type: status === 429 ? 'rate_limit_error' : status >= 500 ? 'api_error' : 'invalid_request_error',
@@ -1382,8 +1411,8 @@ function writeStream(res, events) {
   res.end()
 }
 
-function protocolErrorBody(protocol, status, code, message) {
-  return formatGeminiProtocolError(protocol, status, code, message)
+function protocolErrorBody(protocol, status, code, message, details = null) {
+  return formatGeminiProtocolError(protocol, status, code, message, details)
 }
 
 export function googleModelEntry(model) {
@@ -1760,6 +1789,14 @@ export function createGeminiPublicHandler({
       logBag.final_state = 'verified'
       logBag.attempt_count = Number.isInteger(turn?.attempt_count) ? turn.attempt_count : 1
       logBag.upstream_status = turn?.upstream_status ?? 200
+      if (Array.isArray(turn?.attempts) && turn.attempts.length > 0) {
+        logBag.hop_meta = {
+          ...logBag.hop_meta,
+          via: logBag.via,
+          ...(turn.conversation_id ? { conversation_id: turn.conversation_id } : {}),
+          attempts: turn.attempts,
+        }
+      }
       logBag.reasoning_effort = resolveGeminiReasoningEffort({
         inbound: body,
         parsed,
@@ -1799,6 +1836,14 @@ export function createGeminiPublicHandler({
       }
       if (error.authMethod) logBag.via = error.authMethod === 'api_key' ? 'gemini_api_key' : 'craggemini'
       if (error.upstreamModel) logBag.upstream_model = error.upstreamModel
+      if (Array.isArray(error.attempts) && error.attempts.length > 0) {
+        logBag.hop_meta = {
+          ...logBag.hop_meta,
+          ...(logBag.via ? { via: logBag.via } : {}),
+          ...(error.conversationId ? { conversation_id: error.conversationId } : {}),
+          attempts: error.attempts,
+        }
+      }
       const timing = error.timing
       if (timing) {
         if (Number.isFinite(timing.firstByteAt)) logBag.first_byte_ms = Math.max(0, timing.firstByteAt - startedAt)
@@ -1899,9 +1944,12 @@ export function createGeminiPublicHandler({
         logBag.error_code = mapped.body.error.code
         logBag.error_message = mapped.body.error.message
         logBag.final_state = 'failed'
+        if (Number.isFinite(Number(mapped.retryAfter)) && Number(mapped.retryAfter) > 0) {
+          res.setHeader?.('Retry-After', String(Math.max(1, Math.ceil(Number(mapped.retryAfter)))))
+        }
         return respondJson(
           mapped.status,
-          protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
+          protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message, mapped.details),
         )
       }
     }
@@ -2051,9 +2099,12 @@ export function createGeminiPublicHandler({
         if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
         return
       }
+      if (Number.isFinite(Number(mapped.retryAfter)) && Number(mapped.retryAfter) > 0) {
+        res.setHeader?.('Retry-After', String(Math.max(1, Math.ceil(Number(mapped.retryAfter)))))
+      }
       return respondJson(
         mapped.status,
-        protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
+        protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message, mapped.details),
       )
     }
   }

@@ -3,8 +3,9 @@
  *
  * extra keys (direct used %, never inverted):
  *   codex_5h_used_percent / codex_7d_used_percent
- *   codex_primary_* (7d by default) / codex_secondary_* (5h by default)
- * Normalization maps primary and secondary to the 5h and 7d windows by `window_minutes`.
+ *   codex_primary_* (7d fallback without minutes) / codex_secondary_* (5h fallback without minutes)
+ * Normalization classifies windows by their actual positive `window_minutes`
+ * (`300` -> `5h`, `1440` -> `24h`, `10080` -> `7d`, etc.) and ignores non-positive records.
  */
 
 function num(value) {
@@ -70,12 +71,12 @@ export const CODEX_DEFAULT_PARK_MS = 60_000
  * window caps; an explicit park still holds.
  */
 export function codexQuotaPark(extra = {}, now = Date.now(), { waiveWindowCaps = false } = {}) {
-  const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
+  const windows = waiveWindowCaps ? [] : extractCodexWindows(extraToCodexSnapshot(extra))
   let until = null
   let liveCap = false
-  for (const key of waiveWindowCaps ? [] : ['5h', '7d']) {
-    const used = num(limits[`used_${key}_percent`])
-    const resetMs = Date.parse(limits[`reset_${key}_at`] || '')
+  for (const win of windows) {
+    const used = num(win.used_percent)
+    const resetMs = Date.parse(win.reset_at || '')
     if (used == null || used < 100) continue
     if (Number.isFinite(resetMs) && resetMs <= now) continue
     liveCap = true
@@ -161,25 +162,44 @@ function lowerHeaders(headers) {
   return out
 }
 
+function ownDefined(obj, key) {
+  return Object.hasOwn(obj, key) && obj[key] !== undefined
+}
+
 export function extraToCodexSnapshot(extra = {}) {
   if (!extra || typeof extra !== 'object') return emptySnapshot()
+  const primaryWindow = ownDefined(extra, 'codex_primary_window_minutes')
+    ? extra.codex_primary_window_minutes
+    : extra.codex_7d_window_minutes
+  const secondaryWindow = ownDefined(extra, 'codex_secondary_window_minutes')
+    ? extra.codex_secondary_window_minutes
+    : extra.codex_5h_window_minutes
   return {
     primary_used_percent: num(
-      Object.hasOwn(extra, 'codex_primary_used_percent')
-        ? extra.codex_primary_used_percent
-        : extra.codex_7d_used_percent,
+      ownDefined(extra, 'codex_primary_used_percent') ? extra.codex_primary_used_percent : extra.codex_7d_used_percent,
     ),
-    primary_reset_after_seconds: int(extra.codex_primary_reset_after_seconds ?? extra.codex_7d_reset_after_seconds),
-    primary_window_minutes: int(extra.codex_primary_window_minutes ?? extra.codex_7d_window_minutes),
-    primary_reset_at: extra.codex_primary_reset_at || extra.codex_7d_reset_at || null,
+    primary_reset_after_seconds: int(
+      ownDefined(extra, 'codex_primary_reset_after_seconds')
+        ? extra.codex_primary_reset_after_seconds
+        : extra.codex_7d_reset_after_seconds,
+    ),
+    primary_window_minutes: int(primaryWindow),
+    primary_reset_at:
+      (ownDefined(extra, 'codex_primary_reset_at') ? extra.codex_primary_reset_at : extra.codex_7d_reset_at) || null,
     secondary_used_percent: num(
-      Object.hasOwn(extra, 'codex_secondary_used_percent')
+      ownDefined(extra, 'codex_secondary_used_percent')
         ? extra.codex_secondary_used_percent
         : extra.codex_5h_used_percent,
     ),
-    secondary_reset_after_seconds: int(extra.codex_secondary_reset_after_seconds ?? extra.codex_5h_reset_after_seconds),
-    secondary_window_minutes: int(extra.codex_secondary_window_minutes ?? extra.codex_5h_window_minutes),
-    secondary_reset_at: extra.codex_secondary_reset_at || extra.codex_5h_reset_at || null,
+    secondary_reset_after_seconds: int(
+      ownDefined(extra, 'codex_secondary_reset_after_seconds')
+        ? extra.codex_secondary_reset_after_seconds
+        : extra.codex_5h_reset_after_seconds,
+    ),
+    secondary_window_minutes: int(secondaryWindow),
+    secondary_reset_at:
+      (ownDefined(extra, 'codex_secondary_reset_at') ? extra.codex_secondary_reset_at : extra.codex_5h_reset_at) ||
+      null,
     primary_over_secondary_percent: num(extra.codex_primary_over_secondary_percent),
     updated_at: extra.codex_usage_updated_at || extra.updated_at || null,
   }
@@ -200,46 +220,90 @@ function emptySnapshot() {
   }
 }
 
-export function normalizeCodexLimits(snapshot = {}) {
-  const primaryMins = num(snapshot.primary_window_minutes)
-  const secondaryMins = num(snapshot.secondary_window_minutes)
-  const hasPrimary = primaryMins != null
-  const hasSecondary = secondaryMins != null
-  let fiveFromPrimary = false
-  let sevenFromPrimary = false
-  if (hasPrimary && hasSecondary) {
-    if (primaryMins < secondaryMins) fiveFromPrimary = true
-    else sevenFromPrimary = true
-  } else if (hasPrimary) {
-    if (primaryMins <= 360) fiveFromPrimary = true
-    else sevenFromPrimary = true
-  } else if (hasSecondary) {
-    if (secondaryMins <= 360) sevenFromPrimary = true
-    else fiveFromPrimary = true
-  } else {
-    sevenFromPrimary = true
+export function codexWindowIdFromMinutes(minutes) {
+  const mins = int(minutes)
+  if (mins == null || mins <= 0) return null
+  if (mins === 300) return '5h'
+  if (mins === 10080) return '7d'
+  if (mins === 1440) return '24h'
+  if (mins > 1440 && mins % 1440 === 0) return `${mins / 1440}d`
+  if (mins % 60 === 0) return `${mins / 60}h`
+  return `${mins}m`
+}
+
+function rawWindowSlot(snapshot, role) {
+  const minutes = int(snapshot[`${role}_window_minutes`])
+  const used = num(snapshot[`${role}_used_percent`])
+  const resetAfter = int(snapshot[`${role}_reset_after_seconds`])
+  const resetAt = snapshot[`${role}_reset_at`] || null
+  return {
+    role,
+    minutes,
+    used,
+    resetAfter,
+    resetAt,
+    hasData: used != null || resetAfter != null || resetAt != null,
   }
-  if (fiveFromPrimary) {
-    return {
-      used_5h_percent: snapshot.primary_used_percent,
-      reset_5h_seconds: snapshot.primary_reset_after_seconds,
-      window_5h_minutes: snapshot.primary_window_minutes ?? 300,
-      reset_5h_at: snapshot.primary_reset_at,
-      used_7d_percent: snapshot.secondary_used_percent,
-      reset_7d_seconds: snapshot.secondary_reset_after_seconds,
-      window_7d_minutes: snapshot.secondary_window_minutes ?? 10080,
-      reset_7d_at: snapshot.secondary_reset_at,
+}
+
+/**
+ * Extract valid rate-limit windows classified by actual duration.
+ * Records with `window_minutes <= 0` are ignored instead of being bucketed
+ * into `5h` or `7d`. Legacy snapshots without `window_minutes` keep the
+ * historical fallback (`primary` -> `7d`, `secondary` -> `5h`) when populated.
+ */
+export function extractCodexWindows(snapshot = {}) {
+  const slots = [rawWindowSlot(snapshot, 'primary'), rawWindowSlot(snapshot, 'secondary')]
+  const explicitIds = new Set(
+    slots.map((slot) => (slot.minutes != null && slot.minutes > 0 ? codexWindowIdFromMinutes(slot.minutes) : null)),
+  )
+  const byId = new Map()
+  for (const slot of slots) {
+    if (slot.minutes != null && slot.minutes <= 0) continue
+    let id = null
+    let windowMinutes = slot.minutes
+    if (slot.minutes != null) {
+      id = codexWindowIdFromMinutes(slot.minutes)
+    } else if (slot.hasData) {
+      if (slot.role === 'primary') {
+        id = explicitIds.has('7d') && !explicitIds.has('5h') ? '5h' : '7d'
+      } else {
+        id = explicitIds.has('5h') && !explicitIds.has('7d') ? '7d' : '5h'
+      }
+      windowMinutes = id === '5h' ? 300 : 10080
+    } else {
+      continue
+    }
+    if (!id) continue
+    const entry = {
+      id,
+      label: id,
+      used_percent: slot.used,
+      reset_at: slot.resetAt,
+      reset_after_seconds: slot.resetAfter,
+      window_minutes: windowMinutes,
+    }
+    const prev = byId.get(id)
+    if (!prev || (prev.used_percent == null && entry.used_percent != null)) {
+      byId.set(id, entry)
     }
   }
+  return [...byId.values()].sort((a, b) => (a.window_minutes ?? Infinity) - (b.window_minutes ?? Infinity))
+}
+
+export function normalizeCodexLimits(snapshot = {}) {
+  const windows = extractCodexWindows(snapshot)
+  const w5 = windows.find((w) => w.id === '5h') || null
+  const w7 = windows.find((w) => w.id === '7d') || null
   return {
-    used_5h_percent: snapshot.secondary_used_percent,
-    reset_5h_seconds: snapshot.secondary_reset_after_seconds,
-    window_5h_minutes: snapshot.secondary_window_minutes ?? 300,
-    reset_5h_at: snapshot.secondary_reset_at,
-    used_7d_percent: snapshot.primary_used_percent,
-    reset_7d_seconds: snapshot.primary_reset_after_seconds,
-    window_7d_minutes: snapshot.primary_window_minutes ?? 10080,
-    reset_7d_at: snapshot.primary_reset_at,
+    used_5h_percent: w5?.used_percent ?? null,
+    reset_5h_seconds: w5?.reset_after_seconds ?? null,
+    window_5h_minutes: w5?.window_minutes ?? null,
+    reset_5h_at: w5?.reset_at ?? null,
+    used_7d_percent: w7?.used_percent ?? null,
+    reset_7d_seconds: w7?.reset_after_seconds ?? null,
+    window_7d_minutes: w7?.window_minutes ?? null,
+    reset_7d_at: w7?.reset_at ?? null,
   }
 }
 
@@ -279,30 +343,35 @@ export function buildCodexUsageView(extraOrSnapshot = {}) {
     : isCodexSnapshot(input.snapshot)
       ? input.snapshot
       : extraToCodexSnapshot(input)
+  const extracted = extractCodexWindows(snapshot)
   const limits = normalizeCodexLimits(snapshot)
   const quota = codexLimitsToQuota(limits)
+  const hasNonStandardWindow = extracted.some((w) => w.id !== '5h' && w.id !== '7d')
+  const windows = hasNonStandardWindow
+    ? extracted
+    : [
+        {
+          id: '5h',
+          label: '5h',
+          used_percent: limits.used_5h_percent,
+          reset_at: limits.reset_5h_at,
+          reset_after_seconds: limits.reset_5h_seconds,
+          window_minutes: limits.window_5h_minutes,
+        },
+        {
+          id: '7d',
+          label: '7d',
+          used_percent: limits.used_7d_percent,
+          reset_at: limits.reset_7d_at,
+          reset_after_seconds: limits.reset_7d_seconds,
+          window_minutes: limits.window_7d_minutes,
+        },
+      ]
   return {
     snapshot,
     limits,
     quota,
     unit: 'percent_used',
-    windows: [
-      {
-        id: '5h',
-        label: '5h',
-        used_percent: limits.used_5h_percent,
-        reset_at: limits.reset_5h_at,
-        reset_after_seconds: limits.reset_5h_seconds,
-        window_minutes: limits.window_5h_minutes,
-      },
-      {
-        id: '7d',
-        label: '7d',
-        used_percent: limits.used_7d_percent,
-        reset_at: limits.reset_7d_at,
-        reset_after_seconds: limits.reset_7d_seconds,
-        window_minutes: limits.window_7d_minutes,
-      },
-    ],
+    windows,
   }
 }

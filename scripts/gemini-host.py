@@ -30,7 +30,7 @@ import termios
 import threading
 import time
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_NETNS_SLOTS = 8
@@ -420,6 +420,7 @@ INFERENCE_ERROR_CODES = frozenset(
         "gemini_model_unavailable",
         "gemini_models_empty",
         "gemini_native_bridge_timeout",
+        "gemini_native_config_invalid",
         "gemini_native_tty_unavailable",
         "gemini_native_worker_unavailable",
         "gemini_oauth_required",
@@ -458,10 +459,23 @@ def invocation_module():
     return _load_trusted_module("gemini_host_inference", INFERENCE_MODULE)
 
 
+AUTH_FAILURE_STAGES = frozenset(
+    {
+        "network_prepare",
+        "relay_start",
+        "proxy_probe",
+        "egress_start",
+        "cli_launch",
+        "challenge_wait",
+    }
+)
+
+
 class Failure(Exception):
-    def __init__(self, status, code=None):
+    def __init__(self, status, code=None, stage=None):
         self.status = status
         self.code = code
+        self.stage = stage if stage in AUTH_FAILURE_STAGES else None
 
 
 def now():
@@ -687,6 +701,122 @@ os.execv(sys.argv[2], sys.argv[2:])
 
 # The helper binds all three listeners before accepting traffic. A passive check
 # inside the bound netns does not create a connection on its transparent port.
+RELAY_EXEC = """\
+import asyncio, ctypes, os, signal, socket, sys
+
+if ctypes.CDLL(None).prctl(1, signal.SIGKILL, 0, 0, 0) or os.getppid() != int(sys.argv[1]):
+    sys.exit(125)
+
+LISTEN_HOST = sys.argv[2]
+LISTEN_PORT = int(sys.argv[3])
+ALLOWED_PEER = sys.argv[4]
+TARGET_HOST = sys.argv[5]
+TARGET_PORT = int(sys.argv[6])
+MAX_CONNS = 256
+active = 0
+
+
+async def pipe(src, dst):
+    try:
+        while True:
+            data = await src.read(65536)
+            if not data:
+                break
+            dst.write(data)
+            await dst.drain()
+    except (OSError, asyncio.CancelledError):
+        pass
+    finally:
+        try:
+            if dst.can_write_eof():
+                dst.write_eof()
+        except OSError:
+            pass
+
+
+async def handle(client_reader, client_writer):
+    global active
+    peer = client_writer.get_extra_info("peername")
+    if not peer or peer[0] != ALLOWED_PEER or active >= MAX_CONNS:
+        client_writer.close()
+        return
+    active += 1
+    up_writer = None
+    try:
+        up_reader, up_writer = await asyncio.wait_for(
+            asyncio.open_connection(TARGET_HOST, TARGET_PORT), timeout=10.0
+        )
+        t1 = asyncio.create_task(pipe(client_reader, up_writer))
+        t2 = asyncio.create_task(pipe(up_reader, client_writer))
+        await asyncio.gather(t1, t2)
+    except (OSError, asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+    finally:
+        active -= 1
+        for writer in (up_writer, client_writer):
+            if writer is not None:
+                try:
+                    writer.close()
+                except OSError:
+                    pass
+
+
+async def main():
+    server = await asyncio.start_server(
+        handle,
+        host=LISTEN_HOST,
+        port=LISTEN_PORT,
+        family=socket.AF_INET,
+        reuse_address=True,
+    )
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, OSError):
+            pass
+    async with server:
+        await stop.wait()
+
+
+asyncio.run(main())
+"""
+
+
+def slot_network_addrs(slot):
+    base = 4 * int(slot)
+    return f"198.18.252.{base + 1}", f"198.18.252.{base + 2}"
+
+
+def pick_free_relay_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("0.0.0.0", 0))
+        return probe.getsockname()[1]
+
+
+def rewrite_proxy_endpoint(proxy_url, host, port):
+    parsed = urlsplit(proxy_url)
+    userinfo, sep, _ = parsed.netloc.rpartition("@")
+    netloc = f"{userinfo}@{host}:{port}" if sep else f"{host}:{port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def host_tcp_listening(ip, port, uid):
+    try:
+        addr_hex = "%08X:%04X" % (struct.unpack("=I", socket.inet_aton(ip))[0], int(port))
+        uid_str = str(uid)
+        with open("/proc/net/tcp", encoding="ascii") as table:
+            next(table, None)
+            for line in table:
+                row = line.split()
+                if len(row) > 7 and row[1] == addr_hex and row[3] == "0A" and row[7] == uid_str:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 EGRESS_READY = """\
 import sys
 for proto, port, state in [('tcp', 1080, '0A'), ('tcp', 1053, '0A'), ('udp', 1053, '07')]:
@@ -756,6 +886,7 @@ class Agy:
         self.pid = None
         self.terminal = None
         self.egress = None
+        self.egress_relay = None
         self.network_lock = None
         self._network_lease = None
         address, port = proxy_config(proxy_url)
@@ -809,6 +940,7 @@ class Agy:
             self._network_lease = lease
             self.network_lock = lease["lock"]
             self.egress = lease["egress"]
+            self.egress_relay = lease.get("relay")
         else:
             config = self.directory / "egress.json"
             private_json(
@@ -821,44 +953,53 @@ class Agy:
                 },
             )
             os.chown(config, self.host.egress_uid, self.host.egress_uid)
-            self.network_lock = self.host.start_network(self.directory, self.network)
-            subprocess.run(
-                self.launch_args(self.host.egress_uid)
-                + [
-                    sys.executable,
-                    "-I",
-                    "-c",
-                    "import socket,sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), 2).close()",
-                    *self.network[2:],
-                ],
-                check=True,
-                timeout=3,
-                env=SYSTEM_ENV,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            spawn = getattr(self.host, "spawn", lambda fn: fn())
-            self.egress = spawn(
-                lambda: subprocess.Popen(
+            try:
+                self.network_lock = self.host.start_network(self.directory, self.network)
+            except (Failure, OSError, subprocess.SubprocessError) as err:
+                raise Failure(503, getattr(err, "code", None), stage="network_prepare") from err
+            try:
+                subprocess.run(
                     self.launch_args(self.host.egress_uid)
                     + [
                         sys.executable,
                         "-I",
                         "-c",
-                        EGRESS_EXEC,
-                        str(os.getpid()),
-                        str(self.host.egress),
-                        "--config",
-                        str(config),
+                        "import socket,sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), 2).close()",
+                        *self.network[2:],
                     ],
+                    check=True,
+                    timeout=3,
                     env=SYSTEM_ENV,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-            )
-            self.wait_egress()
+            except (Failure, OSError, subprocess.SubprocessError) as err:
+                raise Failure(503, getattr(err, "code", None), stage="proxy_probe") from err
+            try:
+                spawn = getattr(self.host, "spawn", lambda fn: fn())
+                self.egress = spawn(
+                    lambda: subprocess.Popen(
+                        self.launch_args(self.host.egress_uid)
+                        + [
+                            sys.executable,
+                            "-I",
+                            "-c",
+                            EGRESS_EXEC,
+                            str(os.getpid()),
+                            str(self.host.egress),
+                            "--config",
+                            str(config),
+                        ],
+                        env=SYSTEM_ENV,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                )
+                self.wait_egress()
+            except (Failure, OSError, subprocess.SubprocessError) as err:
+                raise Failure(503, getattr(err, "code", None), stage="egress_start") from err
         sandbox = [
             "bwrap",
             "--unshare-pid",
@@ -935,7 +1076,14 @@ class Agy:
             "AGY_CLI_DISABLE_AUTO_UPDATE",
             "true",
         ]
-        self.launch_cli(self.launch_args(self.uid) + sandbox, size)
+        try:
+            self.launch_cli(self.launch_args(self.uid) + sandbox, size)
+        except Failure as err:
+            if err.stage is None:
+                raise Failure(err.status, err.code, stage="cli_launch") from err
+            raise
+        except (OSError, subprocess.SubprocessError) as err:
+            raise Failure(503, stage="cli_launch") from err
 
     def initialize_home(self, home):
         settings = home / ".gemini" / "antigravity-cli"
@@ -1020,7 +1168,9 @@ class Agy:
         ]
 
     def alive(self):
-        return bool(self.pid and self.egress.poll() is None and not self.exited())
+        relay = getattr(self, "egress_relay", None)
+        relay_ok = relay is None or relay.poll() is None
+        return bool(self.pid and self.egress.poll() is None and relay_ok and not self.exited())
 
     def exited(self):
         # WNOWAIT leaves the PID reserved until close() has signalled its group.
@@ -1061,6 +1211,7 @@ class Agy:
         if lease is not None:
             self._network_lease = None
             self.egress = None
+            self.egress_relay = None
             self.network_lock = None
             self.host.release_slot_network(self.slot, lease)
         else:
@@ -1069,6 +1220,12 @@ class Agy:
                     self.egress.kill()
                 self.egress.wait(timeout=5)
                 self.egress = None
+            relay = getattr(self, "egress_relay", None)
+            if relay is not None:
+                if relay.poll() is None:
+                    relay.kill()
+                relay.wait(timeout=5)
+                self.egress_relay = None
             if self.network_lock is not None:
                 try:
                     self.host.stop_network(self.directory, self.network, self.network_lock)
@@ -1418,7 +1575,7 @@ class NativeAgy(Agy):
                 *agy_args,
             ]
         )
-        self.native_exit_reader = native_module_impl.read_launcher_exit
+        self.native_exit_reader = native_module_impl.read_launcher_exit_detail
         spawn = getattr(self.host, "spawn", lambda fn: fn())
         if self.pool_mode:
             # Multi-process CRAGGemini pool allocates per-slot PTYs and pidfd execution guards
@@ -1495,6 +1652,7 @@ class NativeAgy(Agy):
                         "request_id": self.attempt,
                         "prompt": self.prompt,
                         "startup_timeout": 45,
+                        "launcher_uid": self.uid,
                     },
                     secrets=self.credentials,
                 )
@@ -1532,9 +1690,38 @@ class NativeAgy(Agy):
             return {
                 "state": "failed",
                 "text": "",
-                "error": {"code": "gemini_native_worker_unavailable"},
+                "error": {"code": self.early_exit_code()},
             }
         return result
+
+    def read_exit_detail(self):
+        if self.native_dir is None:
+            return None
+        reader = getattr(self, "native_exit_reader", None)
+        if reader is None:
+            reader = native_module().read_launcher_exit_detail
+        outcome = reader(self.native_dir, self.uid)
+        if outcome is None:
+            return None
+        return (
+            (outcome[0], outcome[1], outcome[2])
+            if len(outcome) >= 3
+            else (outcome[0], outcome[1], None)
+        )
+
+    def early_exit_code(self):
+        outcome = self.read_exit_detail()
+        if outcome is None:
+            return "gemini_native_worker_unavailable"
+        reason = outcome[2] if len(outcome) >= 3 else None
+        if reason == "invalid_config":
+            return "gemini_native_config_invalid"
+        if reason is None:
+            return "gemini_native_worker_unavailable"
+        try:
+            return native_module().launcher_exit_code(outcome)
+        except Failure:
+            return "gemini_native_worker_unavailable"
 
     def close(self, preserve=False):
         wrapper_status = self.native_tui.poll() if self.native_tui is not None else None
@@ -1553,12 +1740,13 @@ class NativeAgy(Agy):
                 if self.native_tui is not None:
                     self._stop_process_group(self.native_tui)
                     self.native_tui = None
-                    outcome = self.native_exit_reader(self.native_dir, self.uid)
+                    outcome = self.read_exit_detail()
                     if outcome is not None:
-                        child, status = outcome
+                        child, status, reason = outcome
                         kind = "exit_code" if status >= 0 else "signal"
+                        reason_text = f" reason={reason}" if reason else ""
                         print(
-                            f"Gemini native child={child} {kind}={abs(status)}",
+                            f"Gemini native child={child} {kind}={abs(status)}{reason_text}",
                             file=sys.stderr,
                         )
                     elif wrapper_status is not None:
@@ -1627,9 +1815,11 @@ class NativeSession(NativeAgy):
         return str(self.native_dir / "kernel.sock")
 
     def is_alive(self):
+        egress_relay = getattr(self, "egress_relay", None)
         return (
             self.egress is not None
             and self.egress.poll() is None
+            and (egress_relay is None or egress_relay.poll() is None)
             and self.native_tui is not None
             and self.native_tui.poll() is None
         )
@@ -1677,10 +1867,11 @@ class NativeSession(NativeAgy):
         return self._health_failures >= NATIVE_HEALTH_FAIL_THRESHOLD
 
     def open_stream(self, request_id, body_obj, *, model=None, gateway_policy=None):
+        native_mod = native_module()
         if not self.is_alive():
-            raise native_module().NativeFailure("gemini_native_worker_unavailable", 503)
+            raise native_mod.launcher_exit_failure(self.read_exit_detail())
         effective_model = model or self.model
-        return native_module().open_worker_stream(
+        return native_mod.open_worker_stream(
             self.socket_path,
             self.native_token,
             effective_model,
@@ -1689,6 +1880,8 @@ class NativeSession(NativeAgy):
             startup_timeout=45,
             gateway_policy=gateway_policy,
             diagnostic=self.native_diagnostic,
+            is_alive=self.is_alive,
+            exit_reader=self.read_exit_detail,
         )
 
     def cancel_turn(self, request_id):
@@ -2217,14 +2410,23 @@ class CragDaemonShard:
         )
         return data if status == 200 else None
 
+    def read_exit_detail(self):
+        if self.native_dir is None:
+            return None
+        return native_module().read_launcher_exit_detail(self.native_dir, self.uid)
+
+    def early_exit_code(self):
+        return native_module().launcher_exit_code(self.read_exit_detail())
+
     def open_stream(
         self, env_id, request_id, body_obj, *, model=None, gateway_policy=None
     ):
+        native_mod = native_module()
         if not self.is_alive():
-            raise native_module().NativeFailure("gemini_native_worker_unavailable", 503)
+            raise native_mod.launcher_exit_failure(self.read_exit_detail())
         self.last_used = time.monotonic()
         effective_model = model or NATIVE_DEFAULT_MODEL
-        return native_module().open_worker_stream(
+        return native_mod.open_worker_stream(
             self.socket_path,
             self.native_token,
             effective_model,
@@ -2233,6 +2435,8 @@ class CragDaemonShard:
             startup_timeout=45,
             gateway_policy=gateway_policy,
             account_id=env_id,
+            is_alive=self.is_alive,
+            exit_reader=self.read_exit_detail,
         )
 
     def cancel_turn(self, env_id, request_id):
@@ -2270,14 +2474,27 @@ class CragDaemonShard:
 
     def close(self):
         with self._lock:
-            if self.process is not None:
-                NativeAgy._stop_process_group(self.process)
-                self.process = None
-            if getattr(self, "_owns_native_dir", False) and self.native_dir is not None:
-                shutil.rmtree(self.native_dir, ignore_errors=True)
-                self._owns_native_dir = False
-            if self.directory.exists():
-                shutil.rmtree(self.directory, ignore_errors=True)
+            try:
+                if self.process is not None:
+                    NativeAgy._stop_process_group(self.process)
+                    self.process = None
+                    outcome = self.read_exit_detail()
+                    if outcome is not None:
+                        child, status, reason = outcome
+                        kind = "exit_code" if status >= 0 else "signal"
+                        reason_text = f" reason={reason}" if reason else ""
+                        print(
+                            f"Gemini native shard={self.shard_id} child={child} {kind}={abs(status)}{reason_text}",
+                            file=sys.stderr,
+                        )
+            finally:
+                try:
+                    if getattr(self, "_owns_native_dir", False) and self.native_dir is not None:
+                        shutil.rmtree(self.native_dir, ignore_errors=True)
+                        self._owns_native_dir = False
+                finally:
+                    if self.directory.exists():
+                        shutil.rmtree(self.directory, ignore_errors=True)
 
 
 class ResidentTestChatRun:
@@ -2288,14 +2505,18 @@ class ResidentTestChatRun:
         self.model = model
         self._request_id = f"test-{secrets.token_hex(12)}"
         self._done = False
+        invocation_request = {
+            "socket": session.socket_path,
+            "token": session.native_token,
+            "model": model,
+            "request_id": self._request_id,
+            "prompt": prompt,
+        }
+        session_uid = getattr(session, "uid", None)
+        if type(session_uid) is int and session_uid >= 0:
+            invocation_request["launcher_uid"] = session_uid
         self._invocation = native_module().NativeInvocation(
-            {
-                "socket": session.socket_path,
-                "token": session.native_token,
-                "model": model,
-                "request_id": self._request_id,
-                "prompt": prompt,
-            },
+            invocation_request,
             secrets=credentials,
         )
 
@@ -2319,10 +2540,15 @@ class ResidentTestChatRun:
             return result
         if not self.session.is_alive():
             self._done = True
+            code = (
+                self.session.early_exit_code()
+                if hasattr(self.session, "early_exit_code")
+                else "gemini_native_worker_unavailable"
+            )
             return {
                 "state": "failed",
                 "text": "",
-                "error": {"code": "gemini_native_worker_unavailable"},
+                "error": {"code": code},
             }
         return result
 
@@ -2364,20 +2590,25 @@ class Login(Agy):
     def challenge(self):
         selected = False
         deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            self.read(0.1)
-            if not selected and b"> 1. Google OAuth" in self.buffer:
-                os.write(self.terminal, b"\r")
-                selected = True
-            match = AUTH_LINK.search(self.buffer)
-            if selected and match:
-                url = match.group(1).decode("ascii")
-                self.state = parse_qs(urlsplit(url).query).get("state", [None])[0]
-                return {
-                    "attempt_id": self.attempt,
-                    "url": url,
-                }
-        raise Failure(503)
+        try:
+            while time.monotonic() < deadline:
+                self.read(0.1)
+                if not selected and b"> 1. Google OAuth" in self.buffer:
+                    os.write(self.terminal, b"\r")
+                    selected = True
+                match = AUTH_LINK.search(self.buffer)
+                if selected and match:
+                    url = match.group(1).decode("ascii")
+                    self.state = parse_qs(urlsplit(url).query).get("state", [None])[0]
+                    return {
+                        "attempt_id": self.attempt,
+                        "url": url,
+                    }
+        except Failure as err:
+            raise Failure(err.status, err.code, stage=err.stage or "challenge_wait") from err
+        except OSError as err:
+            raise Failure(503, stage="challenge_wait") from err
+        raise Failure(503, stage="challenge_wait")
 
     def submit(self, code, state, proxy_url):
         if (
@@ -3473,8 +3704,10 @@ class Host:
                 in self.network_inventory("nft", "list", "tables").splitlines()
                 or (
                     shutil.which("iptables", path=SYSTEM_ENV["PATH"])
-                    and f"-N VM2API-AGY-{slot}".encode()
-                    in self.network_inventory("iptables", "-w", "3", "-S").splitlines()
+                    and any(
+                        line in (f"-N VM2API-AGY-{slot}".encode(), f"-N VM2API-AGY-IN-{slot}".encode())
+                        for line in self.network_inventory("iptables", "-w", "3", "-S").splitlines()
+                    )
                 )
             ):
                 raise Failure(503)
@@ -3542,6 +3775,87 @@ class Host:
             terminal.close()
             self._schedule_warm_locked(identifier, force=True)
 
+    def _host_egress_argv(self):
+        return [
+            "setpriv",
+            "--reuid",
+            str(self.egress_uid),
+            "--regid",
+            str(self.egress_uid),
+            "--clear-groups",
+            "--no-new-privs",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+            "--bounding-set=-all",
+        ]
+
+    def _start_egress_relay(self, gateway, guest, relay_port, target_host, target_port):
+        spawn = getattr(self, "spawn", lambda fn: fn())
+        relay = spawn(
+            lambda: subprocess.Popen(
+                self._host_egress_argv()
+                + [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    RELAY_EXEC,
+                    str(os.getpid()),
+                    gateway,
+                    str(relay_port),
+                    guest,
+                    target_host,
+                    str(target_port),
+                ],
+                env=SYSTEM_ENV,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        )
+        deadline = time.monotonic() + 3
+        while relay.poll() is None and time.monotonic() < deadline:
+            if host_tcp_listening(gateway, relay_port, self.egress_uid):
+                return relay
+            time.sleep(0.05)
+        if relay.poll() is None:
+            relay.kill()
+        try:
+            relay.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise Failure(503, stage="relay_start")
+
+    def _probe_egress_target(
+        self, target_host, target_port, relay_gateway, relay_port, launch_args_fn
+    ):
+        probe_code = (
+            "import socket,sys; "
+            "socket.create_connection((sys.argv[1], int(sys.argv[2])), 2).close()"
+        )
+        # 1. Verify the bound SOCKS5 is reachable via host OUTPUT (traversing any
+        #    host transparent proxy front-hop, matching existing sidecar behavior).
+        subprocess.run(
+            self._host_egress_argv()
+            + [sys.executable, "-I", "-c", probe_code, target_host, str(target_port)],
+            check=True,
+            timeout=3,
+            env=SYSTEM_ENV,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # 2. Verify the isolated netns reaches the host relay on the slot gateway.
+        subprocess.run(
+            launch_args_fn(self.egress_uid)
+            + [sys.executable, "-I", "-c", probe_code, relay_gateway, str(relay_port)],
+            check=True,
+            timeout=3,
+            env=SYSTEM_ENV,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     def acquire_slot_network(
         self, slot, env_dir, network, proxy_id, proxy_url, proxy_hash, launch_args_fn
     ):
@@ -3556,8 +3870,12 @@ class Host:
         with lease_lock:
             existing = leases.get(slot)
             if existing is not None:
+                relay_alive = (
+                    existing.get("relay") is None or existing["relay"].poll() is None
+                )
                 if (
                     existing["egress"].poll() is None
+                    and relay_alive
                     and secrets.compare_digest(existing["proxy_hash"], proxy_hash)
                 ):
                     existing["refcount"] += 1
@@ -3566,90 +3884,107 @@ class Host:
                     leases.pop(slot, None)
                     self._teardown_slot_network_lease(existing)
                 else:
-                    raise Failure(503)
+                    raise Failure(503, stage="network_prepare")
             lease_dir = env_dir / f".net-{secrets.token_hex(8)}"
             lease_dir.mkdir(mode=0o711)
             lease_dir.chmod(0o711)
             env_dir.chmod(0o711)
             lock = None
+            relay = None
             egress = None
+            gateway, guest = slot_network_addrs(slot)
+            relay_port = pick_free_relay_port()
+            target_host, target_port = network[2], network[3]
+            relay_network = [str(slot), str(self.egress_uid), gateway, str(relay_port)]
+            relay_proxy_url = rewrite_proxy_endpoint(proxy_url, gateway, relay_port)
             try:
                 config = lease_dir / "egress.json"
                 private_json(
                     config,
                     {
                         "proxy_id": proxy_id,
-                        "proxy_url": proxy_url,
+                        "proxy_url": relay_proxy_url,
                         "listen_tcp": "127.0.0.1:1080",
                         "listen_dns": "127.0.0.1:1053",
                     },
                 )
                 os.chown(config, self.egress_uid, self.egress_uid)
-                lock = self.start_network(lease_dir, network)
-                subprocess.run(
-                    launch_args_fn(self.egress_uid)
-                    + [
+                try:
+                    lock = self.start_network(lease_dir, relay_network)
+                except Failure as err:
+                    raise Failure(err.status, err.code, stage=err.stage or "network_prepare") from err
+                except (OSError, subprocess.SubprocessError) as err:
+                    raise Failure(503, stage="network_prepare") from err
+                try:
+                    relay = self._start_egress_relay(
+                        gateway, guest, relay_port, target_host, target_port
+                    )
+                except Failure as err:
+                    raise Failure(err.status, err.code, stage=err.stage or "relay_start") from err
+                except (OSError, subprocess.SubprocessError) as err:
+                    raise Failure(503, stage="relay_start") from err
+                try:
+                    self._probe_egress_target(
+                        target_host, target_port, gateway, relay_port, launch_args_fn
+                    )
+                except Failure as err:
+                    raise Failure(err.status, err.code, stage=err.stage or "proxy_probe") from err
+                except (OSError, subprocess.SubprocessError) as err:
+                    raise Failure(503, stage="proxy_probe") from err
+                try:
+                    spawn = getattr(self, "spawn", lambda fn: fn())
+                    egress = spawn(
+                        lambda: subprocess.Popen(
+                            launch_args_fn(self.egress_uid)
+                            + [
+                                sys.executable,
+                                "-I",
+                                "-c",
+                                EGRESS_EXEC,
+                                str(os.getpid()),
+                                str(self.egress),
+                                "--config",
+                                str(config),
+                            ],
+                            env=SYSTEM_ENV,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    )
+                    deadline = time.monotonic() + 3
+                    probe = launch_args_fn(self.egress_uid) + [
                         sys.executable,
                         "-I",
                         "-c",
-                        "import socket,sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), 2).close()",
-                        *network[2:],
-                    ],
-                    check=True,
-                    timeout=3,
-                    env=SYSTEM_ENV,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                spawn = getattr(self, "spawn", lambda fn: fn())
-                egress = spawn(
-                    lambda: subprocess.Popen(
-                        launch_args_fn(self.egress_uid)
-                        + [
-                            sys.executable,
-                            "-I",
-                            "-c",
-                            EGRESS_EXEC,
-                            str(os.getpid()),
-                            str(self.egress),
-                            "--config",
-                            str(config),
-                        ],
-                        env=SYSTEM_ENV,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                )
-                deadline = time.monotonic() + 3
-                probe = launch_args_fn(self.egress_uid) + [
-                    sys.executable,
-                    "-I",
-                    "-c",
-                    EGRESS_READY,
-                    str(self.egress_uid),
-                ]
-                while egress.poll() is None and time.monotonic() < deadline:
-                    result = subprocess.run(
-                        probe,
-                        timeout=1,
-                        env=SYSTEM_ENV,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    if result.returncode == 0 and egress.poll() is None:
-                        break
-                    time.sleep(0.05)
-                else:
-                    raise Failure(503)
+                        EGRESS_READY,
+                        str(self.egress_uid),
+                    ]
+                    while egress.poll() is None and time.monotonic() < deadline:
+                        result = subprocess.run(
+                            probe,
+                            timeout=1,
+                            env=SYSTEM_ENV,
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        if result.returncode == 0 and egress.poll() is None:
+                            break
+                        time.sleep(0.05)
+                    else:
+                        raise Failure(503, stage="egress_start")
+                except Failure as err:
+                    raise Failure(err.status, err.code, stage=err.stage or "egress_start") from err
+                except (OSError, subprocess.SubprocessError) as err:
+                    raise Failure(503, stage="egress_start") from err
                 lease = {
                     "slot": slot,
                     "directory": lease_dir,
-                    "network": list(network),
+                    "network": list(relay_network),
                     "proxy_hash": proxy_hash,
                     "lock": lock,
+                    "relay": relay,
                     "egress": egress,
                     "refcount": 1,
                 }
@@ -3663,9 +3998,16 @@ class Host:
                         egress.wait(timeout=5)
                     except subprocess.TimeoutExpired:
                         pass
+                if relay is not None:
+                    if relay.poll() is None:
+                        relay.kill()
+                    try:
+                        relay.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
                 if lock is not None:
                     try:
-                        self.stop_network(lease_dir, network, lock)
+                        self.stop_network(lease_dir, relay_network, lock)
                     finally:
                         os.close(lock)
                 shutil.rmtree(lease_dir, ignore_errors=True)
@@ -3697,6 +4039,15 @@ class Host:
             except subprocess.TimeoutExpired:
                 pass
             lease["egress"] = None
+        relay = lease.get("relay")
+        if relay is not None:
+            if relay.poll() is None:
+                relay.kill()
+            try:
+                relay.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            lease["relay"] = None
         lock = lease.get("lock")
         if lock is not None:
             try:
@@ -5814,8 +6165,22 @@ class Host:
                 env["auth_state"] = "reauth_required"
                 self.touch_environment(env)
                 self.save()
-                print("Gemini CLI authorization did not start", file=sys.stderr)
-                raise Failure(503, "gemini_authorization_unavailable") from error
+                stage = error.stage if isinstance(error, Failure) and error.stage in AUTH_FAILURE_STAGES else None
+                cause = getattr(error, "__cause__", None) or error
+                if isinstance(cause, subprocess.TimeoutExpired):
+                    reason_kind = "timeout"
+                elif isinstance(cause, subprocess.CalledProcessError):
+                    reason_kind = f"exit_code={cause.returncode}"
+                elif isinstance(cause, OSError):
+                    reason_kind = "os_error"
+                else:
+                    reason_kind = "failed"
+                stage_text = f" stage={stage}" if stage else ""
+                print(
+                    f"Gemini CLI authorization did not start{stage_text} reason={reason_kind}",
+                    file=sys.stderr,
+                )
+                raise Failure(503, "gemini_authorization_unavailable", stage=stage) from error
         if operation == "complete":
             self.ensure_payload(legacy_install=False)
             login = self.pending.get(identifier)
@@ -6557,7 +6922,10 @@ class ControlHandler(BaseHTTPRequestHandler):
                     raise Failure(400)
             status, payload = 200, self.server.host.request(operation, body)
         except Failure as error:
-            status, payload = error.status, {"code": error.code} if error.code else {}
+            payload = {"code": error.code} if error.code else {}
+            if error.stage in AUTH_FAILURE_STAGES:
+                payload["stage"] = error.stage
+            status = error.status
         except (ValueError, TimeoutError, RecursionError):
             status, payload = 400, {}
         except (OSError, subprocess.SubprocessError):

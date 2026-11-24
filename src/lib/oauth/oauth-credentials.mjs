@@ -764,7 +764,7 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operat
 }
 
 function isQuotaParkReason(reason) {
-  return /^(quota_5h|quota_7d)|account_quota_exhausted|^rate_limited$/i.test(String(reason || ''))
+  return /^quota_\d+[mhd]|account_quota_exhausted|^rate_limited$/i.test(String(reason || ''))
 }
 
 function clearClaudeAuthCooldown(claude = {}) {

@@ -47,6 +47,7 @@ import {
   applyMessageBreakpoints,
   DEFAULT_CACHE_TTL,
   enforceCacheTtlOrder,
+  fillMissingCacheTtl,
   normalizeCacheTtl,
   listCacheMarkers,
   materializeAutomaticCache,
@@ -292,6 +293,7 @@ export function prepareCliHopBody(
     cacheTtl = DEFAULT_CACHE_TTL,
     requestContext = null,
     preserveSystem = false,
+    preserveCacheTtl = false,
     preserveThinkingBlocks = false,
     preserveCallerEnvironment = false,
     autoCompactWindow = null,
@@ -375,6 +377,9 @@ export function prepareCliHopBody(
     if (Array.isArray(body.tools)) {
       body = { ...body, tools: stripToolCacheControl(body.tools, { preserveCacheControl: zeroFallback }) }
     }
+    // Rewritten hops fill omitted TTLs from the configured default so an
+    // unmarked ttl does not fall back to implicit 5m and shorten later anchors.
+    if (!preserveSystem && !preserveCacheTtl) body = fillMissingCacheTtl(body, cacheTtl)
     // Assembled official templates own their system markers, not the growing
     // conversation. Fill missing message anchors without moving caller markers.
     const shapedFallback = shaped && !preserveSystem
@@ -502,7 +507,9 @@ export function prepareOutboundAttempt({
     dropSampling,
   })
   cleaned = stripIllegalCacheControlFields(cleaned)
-  cleaned = enforceCacheTtlOrder(cleaned, cacheTtl || DEFAULT_CACHE_TTL)
+  const resolvedTtl = cacheTtl || DEFAULT_CACHE_TTL
+  if (!keepCallerSession) cleaned = fillMissingCacheTtl(cleaned, resolvedTtl)
+  cleaned = enforceCacheTtlOrder(cleaned, resolvedTtl)
   const scrubbed = scrubUpstreamClientBody(cleaned, {
     official: !unofficial,
     rewriteTools: toolNameRewrite !== false,

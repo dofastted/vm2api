@@ -6,6 +6,7 @@
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import {
   extraToCodexSnapshot,
+  extractCodexWindows,
   normalizeCodexLimits,
   codexQuotaPark,
   hasSpendableCodexCredits,
@@ -52,37 +53,76 @@ function extraPark(vm, now) {
   return codexQuotaPark(extraFromSummary(vm), now, { waiveWindowCaps: hasSpendableCodexCredits(vm, now) })
 }
 
+function windowMinutesOf(win) {
+  if (win?.window_minutes != null) return win.window_minutes
+  const match = /^(\d+)([mhd])$/i.exec(String(win?.id || '').trim())
+  if (!match) return null
+  const amount = Number(match[1])
+  if (!Number.isFinite(amount) || amount <= 0) return null
+  const unit = match[2].toLowerCase()
+  if (unit === 'm') return amount
+  if (unit === 'h') return amount * 60
+  return amount * 1440
+}
+
 function extraFromSummary(vm) {
   if (vm?.codex?.extra && typeof vm.codex.extra === 'object') return vm.codex.extra
   if (vm?.codex_extra && typeof vm.codex_extra === 'object') return vm.codex_extra
   const usage = vm?.codex_usage
+  const snap = usage?.snapshot
+  if (snap && typeof snap === 'object' && Object.hasOwn(snap, 'primary_used_percent')) {
+    return {
+      codex_primary_used_percent: snap.primary_used_percent,
+      codex_primary_reset_after_seconds: snap.primary_reset_after_seconds,
+      codex_primary_window_minutes: snap.primary_window_minutes,
+      codex_primary_reset_at: snap.primary_reset_at,
+      codex_secondary_used_percent: snap.secondary_used_percent,
+      codex_secondary_reset_after_seconds: snap.secondary_reset_after_seconds,
+      codex_secondary_window_minutes: snap.secondary_window_minutes,
+      codex_secondary_reset_at: snap.secondary_reset_at,
+      codex_limited_until: vm?.codex_limited_until || null,
+    }
+  }
   const windows = Array.isArray(usage?.windows) ? usage.windows : []
+  const custom = windows.filter((w) => w?.id && w.id !== '5h' && w.id !== '7d')
+  if (custom.length) {
+    const first = windows[0] || {}
+    const second = windows[1] || {}
+    return {
+      codex_primary_used_percent: first.used_percent ?? null,
+      codex_primary_reset_at: first.reset_at ?? null,
+      codex_primary_reset_after_seconds: first.reset_after_seconds ?? null,
+      codex_primary_window_minutes: windowMinutesOf(first),
+      codex_secondary_used_percent: second.used_percent ?? null,
+      codex_secondary_reset_at: second.reset_at ?? null,
+      codex_secondary_reset_after_seconds: second.reset_after_seconds ?? null,
+      codex_secondary_window_minutes: windowMinutesOf(second),
+      codex_limited_until: vm?.codex_limited_until || null,
+    }
+  }
   const w5 = windows.find((w) => w?.id === '5h') || {}
   const w7 = windows.find((w) => w?.id === '7d') || {}
   const limits = usage?.limits || {}
   return {
-    codex_5h_used_percent: w5.used_percent ?? limits.used_5h_percent,
-    codex_7d_used_percent: w7.used_percent ?? limits.used_7d_percent,
-    codex_5h_reset_at: w5.reset_at ?? limits.reset_5h_at ?? vm?.reset_5h,
-    codex_7d_reset_at: w7.reset_at ?? limits.reset_7d_at ?? vm?.reset_7d,
-    codex_5h_window_minutes: w5.window_minutes ?? limits.window_5h_minutes ?? 300,
-    codex_7d_window_minutes: w7.window_minutes ?? limits.window_7d_minutes ?? 10080,
+    codex_5h_used_percent: w5.used_percent ?? limits.used_5h_percent ?? null,
+    codex_7d_used_percent: w7.used_percent ?? limits.used_7d_percent ?? null,
+    codex_5h_reset_at: w5.reset_at ?? limits.reset_5h_at ?? vm?.reset_5h ?? null,
+    codex_7d_reset_at: w7.reset_at ?? limits.reset_7d_at ?? vm?.reset_7d ?? null,
+    codex_5h_window_minutes: w5.window_minutes ?? limits.window_5h_minutes ?? null,
+    codex_7d_window_minutes: w7.window_minutes ?? limits.window_7d_minutes ?? null,
     codex_limited_until: vm?.codex_limited_until || null,
   }
 }
 
 function stressOf(vm) {
-  const u5 = Number(vm?.utilization_5h)
-  const u7 = Number(vm?.utilization_7d)
-  if (!Number.isFinite(u5) && !Number.isFinite(u7)) {
-    const limits = normalizeCodexLimits(extraToCodexSnapshot(extraFromSummary(vm)))
-    const p5 = Number(limits.used_5h_percent)
-    const p7 = Number(limits.used_7d_percent)
-    const a = Number.isFinite(p5) ? p5 / 100 : 0
-    const b = Number.isFinite(p7) ? p7 / 100 : 0
-    return Math.max(a, b)
-  }
-  return Math.max(Number.isFinite(u5) ? u5 : 0, Number.isFinite(u7) ? u7 : 0)
+  const u5 = nullableFiniteNumber(vm?.utilization_5h)
+  const u7 = nullableFiniteNumber(vm?.utilization_7d)
+  const windows = extractCodexWindows(extraToCodexSnapshot(extraFromSummary(vm)))
+  const windowRatios = windows
+    .map((w) => nullableFiniteNumber(w.used_percent))
+    .filter((v) => v != null)
+    .map((v) => v / 100)
+  return Math.max(u5 ?? 0, u7 ?? 0, ...windowRatios, 0)
 }
 
 function parkUntil(vm, now) {
@@ -168,10 +208,14 @@ function ratioRank(used) {
   return Math.round((1 - Math.min(1, Math.max(0, used))) * 10_000)
 }
 
-/** 流速因子：5h 窗余量（座位可持续性）；只报 weekly 的号（无 5h 窗）回落到 7d 余量。 */
+/** 流速因子：5h 窗余量（座位可持续性）；无 5h 窗时回落到最短有效窗（如 24h）或 7d 余量。 */
 function quotaRemainingRank(vm) {
   const { u5, u7 } = usedRatios(vm)
-  return ratioRank(u5 != null ? u5 : u7)
+  if (u5 != null) return ratioRank(u5)
+  const windows = extractCodexWindows(extraToCodexSnapshot(extraFromSummary(vm)))
+  const shortest = windows.find((w) => nullableFiniteNumber(w.used_percent) != null)
+  if (shortest) return ratioRank(Number(shortest.used_percent) / 100)
+  return ratioRank(u7)
 }
 
 /** 库存因子：7d 周额度余量。 */
@@ -182,8 +226,8 @@ function quotaStockRank(vm) {
 
 function quotaResetAt(vm) {
   const extra = extraFromSummary(vm)
-  const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
-  const resets = [limits.reset_5h_at, limits.reset_7d_at, vm?.reset_5h, vm?.reset_7d]
+  const windows = extractCodexWindows(extraToCodexSnapshot(extra))
+  const resets = [...windows.map((w) => w.reset_at), vm?.reset_5h, vm?.reset_7d]
     .map((value) => Date.parse(value || ''))
     .filter((value) => Number.isFinite(value))
   if (!resets.length) return null
@@ -444,23 +488,26 @@ export function isCodexFailoverError(result) {
 export function codexQuotaWindowReason(vm, now = Date.now()) {
   const extra = extraFromSummary(vm)
   const waived = hasSpendableCodexCredits(vm, now)
-  const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
-  const used5 = Number(limits.used_5h_percent)
-  const used7 = Number(limits.used_7d_percent)
-  const reset5 = Date.parse(limits.reset_5h_at || '')
-  const reset7 = Date.parse(limits.reset_7d_at || '')
-  const live5 = !waived && Number.isFinite(used5) && used5 >= 100 && (!Number.isFinite(reset5) || reset5 > now)
-  const live7 = !waived && Number.isFinite(used7) && used7 >= 100 && (!Number.isFinite(reset7) || reset7 > now)
-  if (live5) return 'quota_5h_header'
-  if (live7) return 'quota_7d_header'
+  const windows = extractCodexWindows(extraToCodexSnapshot(extra))
+  const isLiveCap = (win) => {
+    if (waived || !win) return false
+    const used = nullableFiniteNumber(win.used_percent)
+    if (used == null || used < 100) return false
+    const reset = Date.parse(win.reset_at || '')
+    return !Number.isFinite(reset) || reset > now
+  }
+  if (isLiveCap(windows.find((w) => w.id === '5h'))) return 'quota_5h_header'
+  if (isLiveCap(windows.find((w) => w.id === '7d'))) return 'quota_7d_header'
+  const other = windows.find((w) => w.id !== '5h' && w.id !== '7d' && isLiveCap(w))
+  if (other) return `quota_${other.id}_header`
   if (codexQuotaPark(extra, now, { waiveWindowCaps: waived }).limited) return 'quota_5h_header'
   return null
 }
 
 function codexRestrictionUntil(vm, now) {
   const extra = extraFromSummary(vm)
-  const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
-  const windowResets = hasSpendableCodexCredits(vm, now) ? [] : [limits.reset_5h_at, limits.reset_7d_at]
+  const windows = extractCodexWindows(extraToCodexSnapshot(extra))
+  const windowResets = hasSpendableCodexCredits(vm, now) ? [] : windows.map((w) => w.reset_at)
   const futures = [...windowResets, extra.codex_limited_until]
     .map((value) => Date.parse(value || ''))
     .filter((value) => Number.isFinite(value) && value > now)

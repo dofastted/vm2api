@@ -28,6 +28,7 @@ import { maybeEncrypt, maybeDecrypt } from '../db/secure.mjs'
 import { calculateCost, normalizeUsage } from './pricing.mjs'
 import { UsersRepo } from '../db/repos/users-repo.mjs'
 import { getCacheRuntime } from '../cache/index.mjs'
+import { ErrorType, makeError } from '../core/errors.mjs'
 
 const KEY_PREFIX = 'sk-vm-'
 const HASH_MARKER = 'hmac:'
@@ -163,13 +164,13 @@ export class ApiKeyStore {
     this.repo = new ApiKeysRepo(this.db)
     this.hashSecret = String(
       hashSecret ||
-      process.env.VM2API_API_KEY_HASH_SECRET ||
-      process.env.KIN_API_KEY_HASH_SECRET ||
-      process.env.VM2API_DB_SECRET ||
-      process.env.KIN_DB_SECRET ||
-      process.env.VM2API_API_KEY ||
-      process.env.KIN_API_KEY ||
-      'kin-development-api-key-hash-secret',
+        process.env.VM2API_API_KEY_HASH_SECRET ||
+        process.env.KIN_API_KEY_HASH_SECRET ||
+        process.env.VM2API_DB_SECRET ||
+        process.env.KIN_DB_SECRET ||
+        process.env.VM2API_API_KEY ||
+        process.env.KIN_API_KEY ||
+        'kin-development-api-key-hash-secret',
     )
     this.inflight = new Map() // id → count
     this.rpmBuckets = new Map() // id → number[] timestamps ms
@@ -192,7 +193,7 @@ export class ApiKeyStore {
   reload() {
     getCacheRuntime()
       .apiKeys.invalidateAll()
-      .catch(() => { })
+      .catch(() => {})
   }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
@@ -202,7 +203,7 @@ export class ApiKeyStore {
     this.users = new UsersRepo(db)
     getCacheRuntime()
       .apiKeys.invalidateAll()
-      .catch(() => { })
+      .catch(() => {})
   }
 
   _cacheKey(hash) {
@@ -216,7 +217,7 @@ export class ApiKeyStore {
     if (ck)
       getCacheRuntime()
         .apiKeys.invalidateByHash(ck, reason)
-        .catch(() => { })
+        .catch(() => {})
   }
 
   list({ reveal = false } = {}) {
@@ -451,7 +452,7 @@ export class ApiKeyStore {
     if (prev?.key_hash) this._invalidateHash(prev.key_hash, 'removed')
     getCacheRuntime()
       .billing.invalidateApiKey(id)
-      .catch(() => { })
+      .catch(() => {})
     return true
   }
 
@@ -460,23 +461,65 @@ export class ApiKeyStore {
     return Date.parse(rec.expires_at) <= now
   }
 
-  _rpmCount(id, now = Date.now()) {
+  _rpmState(id, now = Date.now()) {
     const windowMs = 60_000
     let arr = this.rpmBuckets.get(id) || []
     arr = arr.filter((t) => now - t < windowMs)
     this.rpmBuckets.set(id, arr)
-    return arr.length
+    return { count: arr.length, timestamps: arr }
+  }
+
+  _rpmCount(id, now = Date.now()) {
+    return this._rpmState(id, now).count
   }
 
   /**
    * Pre-flight gate for a managed key. Does not acquire concurrency.
-   * @returns {{ ok: true } | { ok: false, code, message, status }}
+   * Monetary limits return 402; request-count, RPM, and concurrency limits return 429.
+   * Over-limit verdicts include uniform `limit_type`, `current`, `limit`, `remaining`,
+   * `reset_at`, and `retry_after` (seconds) while preserving legacy `detail` keys.
+   * @returns {{ ok: true } | { ok: false, code, message, status, limit_type?, current?, limit?, remaining?, reset_at?, retry_after?, detail? }}
    */
   canAccept(rec, now = Date.now()) {
     if (!rec) return { ok: false, code: 'invalid_api_key', message: 'Invalid credentials', status: 401 }
     if (rec.status !== 'active') {
       if (rec.status === 'quota_exhausted') {
-        return { ok: false, code: 'api_key_quota_exhausted', message: 'API key quota exhausted', status: 429 }
+        const hasUsdQuota = (rec.quota ?? 0) > 0
+        const hasReqQuota = (rec.quota_requests ?? 0) > 0
+        const usdExhausted = hasUsdQuota && (rec.quota_used ?? 0) >= rec.quota
+        if (!usdExhausted && hasReqQuota && (rec.quota_requests_used ?? 0) >= rec.quota_requests) {
+          const current = Number(rec.quota_requests_used) || 0
+          const limit = rec.quota_requests
+          return {
+            ok: false,
+            code: 'api_key_quota_exhausted',
+            message: 'API key quota exhausted',
+            status: 429,
+            limit_type: 'requests_quota',
+            current,
+            limit,
+            remaining: 0,
+            reset_at: null,
+            retry_after: null,
+            detail: { quota_requests: rec.quota_requests, quota_used: rec.quota_requests_used },
+          }
+        }
+        const current = money(Number(rec.quota_used) || 0)
+        const limit = hasUsdQuota ? rec.quota : null
+        const remaining = limit != null ? money(Math.max(0, limit - current)) : 0
+        return {
+          ok: false,
+          code: 'api_key_quota_exhausted',
+          message: hasUsdQuota ? 'API key USD quota exhausted' : 'API key quota exhausted',
+          status: 402,
+          limit_type: 'usd_quota',
+          current,
+          limit,
+          remaining,
+          reset_at: null,
+          retry_after: null,
+          detail: hasUsdQuota ? { quota: rec.quota, quota_used: rec.quota_used } : undefined,
+        }
       }
       return { ok: false, code: 'api_key_disabled', message: 'API key is disabled', status: 403 }
     }
@@ -484,20 +527,36 @@ export class ApiKeyStore {
       return { ok: false, code: 'api_key_expired', message: 'API key has expired', status: 403 }
     }
     if (rec.quota_requests > 0 && (rec.quota_requests_used ?? 0) >= rec.quota_requests) {
+      const current = Number(rec.quota_requests_used) || 0
+      const limit = rec.quota_requests
       return {
         ok: false,
         code: 'api_key_quota_exhausted',
         message: 'API key quota exhausted',
         status: 429,
+        limit_type: 'requests_quota',
+        current,
+        limit,
+        remaining: 0,
+        reset_at: null,
+        retry_after: null,
         detail: { quota_requests: rec.quota_requests, quota_used: rec.quota_requests_used },
       }
     }
     if ((rec.quota ?? 0) > 0 && (rec.quota_used ?? 0) >= rec.quota) {
+      const current = money(Number(rec.quota_used) || 0)
+      const limit = rec.quota
       return {
         ok: false,
         code: 'api_key_quota_exhausted',
         message: 'API key USD quota exhausted',
-        status: 429,
+        status: 402,
+        limit_type: 'usd_quota',
+        current,
+        limit,
+        remaining: 0,
+        reset_at: null,
+        retry_after: null,
         detail: { quota: rec.quota, quota_used: rec.quota_used },
       }
     }
@@ -505,23 +564,44 @@ export class ApiKeyStore {
     for (const win of RATE_WINDOWS) {
       const w = rateWindow(rec, win, now)
       if (w.limit > 0 && w.open && w.used >= w.limit) {
+        const limitType = `spend_${win.name}`
+        const current = money(w.used)
+        const resetMs = w.start + win.ms
+        const resetAt = new Date(resetMs).toISOString()
+        const retryAfter = Math.max(1, Math.ceil((resetMs - now) / 1000))
         return {
           ok: false,
           code: 'api_key_rate_limit',
           message: `API key ${win.name} spend limit exceeded`,
-          status: 429,
+          status: 402,
+          limit_type: limitType,
+          current,
+          limit: w.limit,
+          remaining: 0,
+          reset_at: resetAt,
+          retry_after: retryAfter,
           detail: { limit: w.limit, used: w.used },
         }
       }
     }
     if (rec.rpm > 0) {
-      const n = this._rpmCount(rec.id, now)
+      const { count: n, timestamps } = this._rpmState(rec.id, now)
       if (n >= rec.rpm) {
+        const blockingTs = timestamps[Math.max(0, timestamps.length - rec.rpm)]
+        const resetMs = blockingTs != null ? blockingTs + 60_000 : now + 60_000
+        const resetAt = new Date(resetMs).toISOString()
+        const retryAfter = Math.max(1, Math.ceil((resetMs - now) / 1000))
         return {
           ok: false,
           code: 'api_key_rate_limit',
           message: `API key rate limit exceeded (${rec.rpm}/min)`,
           status: 429,
+          limit_type: 'rpm',
+          current: n,
+          limit: rec.rpm,
+          remaining: 0,
+          reset_at: resetAt,
+          retry_after: retryAfter,
           detail: { rpm: rec.rpm, current: n },
         }
       }
@@ -533,6 +613,12 @@ export class ApiKeyStore {
         code: 'api_key_concurrency_limit',
         message: `API key concurrency limit (${rec.max_concurrency})`,
         status: 429,
+        limit_type: 'key_concurrency',
+        current: inflight,
+        limit: rec.max_concurrency,
+        remaining: 0,
+        reset_at: null,
+        retry_after: 1,
         detail: { inflight, max: rec.max_concurrency },
       }
     }
@@ -548,6 +634,12 @@ export class ApiKeyStore {
             code: 'user_concurrency_limit',
             message: `User concurrency limit (${cap})`,
             status: 429,
+            limit_type: 'user_concurrency',
+            current: total,
+            limit: cap,
+            remaining: 0,
+            reset_at: null,
+            retry_after: 1,
             detail: { inflight: total, max: cap },
           }
         }
@@ -611,7 +703,21 @@ export class ApiKeyStore {
         last_used_at: rec.last_used_at || null,
       },
       accepting: gate.ok,
-      blocked_by: gate.ok ? null : { code: gate.code, message: gate.message, status: gate.status },
+      blocked_by: gate.ok
+        ? null
+        : gate.limit_type
+          ? {
+              code: gate.code,
+              message: gate.message,
+              status: gate.status,
+              limit_type: gate.limit_type,
+              current: gate.current,
+              limit: gate.limit,
+              remaining: gate.remaining,
+              reset_at: gate.reset_at ?? null,
+              retry_after: gate.retry_after ?? null,
+            }
+          : { code: gate.code, message: gate.message, status: gate.status },
       usd: limitView(Number(rec.quota) || 0, Number(rec.quota_used) || 0),
       windows,
       requests: limitView(Number(rec.quota_requests) || 0, Number(rec.quota_requests_used) || 0),
@@ -654,7 +760,7 @@ export class ApiKeyStore {
       try {
         const c = calculateCost(normalized, model)
         if (c?.known) billed = c.total_cost
-      } catch { }
+      } catch {}
     }
     if (billed == null) billed = Number(usage.cost ?? usage.actual_cost) || 0
     // Key quotas and spend windows track the cost after applying the group rate.
@@ -679,7 +785,7 @@ export class ApiKeyStore {
       const billing = getCacheRuntime().billing
       for (const win of RATE_WINDOWS) {
         if ((finalRec?.[win.limit] ?? 0) > 0) {
-          billing.recordKeyWindowUsage(id, win.name, cost, win.ms).catch(() => { })
+          billing.recordKeyWindowUsage(id, win.name, cost, win.ms).catch(() => {})
         }
       }
     }
@@ -701,4 +807,51 @@ export class ApiKeyStore {
       .update(String(token || ''))
       .digest('hex')
   }
+}
+
+/**
+ * Build a uniform gateway error payload (+ optional `Retry-After` header) from
+ * an `ApiKeyStore.canAccept` / `acquire` rejection while preserving legacy `error.type`.
+ */
+export function apiKeyGateDetails(gate = {}) {
+  const base = gate.detail && typeof gate.detail === 'object' ? { ...gate.detail } : {}
+  if (gate.limit_type) {
+    base.limit_type = gate.limit_type
+    base.current = gate.current ?? null
+    base.limit = gate.limit ?? null
+    base.remaining = gate.remaining ?? 0
+    base.reset_at = gate.reset_at ?? null
+    if (gate.retry_after != null) base.retry_after = gate.retry_after
+  }
+  return Object.keys(base).length ? base : undefined
+}
+
+export function makeApiKeyGateError(gate = {}) {
+  const code = gate.code || 'invalid_api_key'
+  const status = gate.status || 401
+  let type = ErrorType.PERMISSION
+  if (status === 401 || code === 'invalid_api_key') {
+    type = ErrorType.AUTH
+  } else if (code === 'api_key_quota_exhausted') {
+    type = ErrorType.QUOTA
+  } else if (
+    code === 'api_key_rate_limit' ||
+    code === 'api_key_concurrency_limit' ||
+    code === 'user_concurrency_limit' ||
+    status === 429
+  ) {
+    type = ErrorType.RATE_LIMIT
+  }
+  const err = makeError({
+    type,
+    code,
+    message: gate.message || code,
+    status,
+    details: apiKeyGateDetails(gate),
+  })
+  const retryAfter = Number(gate.retry_after)
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    err.headers = { 'Retry-After': String(Math.max(1, Math.ceil(retryAfter))) }
+  }
+  return err
 }

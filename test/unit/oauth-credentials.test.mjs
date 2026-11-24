@@ -12,6 +12,8 @@ import {
   applyOauthToCfg,
   persistOauthToVm,
   healLeftoverAuthState,
+  markVmRestriction,
+  clearVmQuotaRestriction,
   markVmAuthCooldown,
   clearVmAuthCooldown,
   clearRecoverableVmCooldown,
@@ -690,4 +692,43 @@ test('clearRecoverableVmCooldown keeps Codex park when grant is dead', () => {
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   assert.equal(vm.temp_unschedulable_reason, 'oauth_revoked')
   assert.equal(vm.codex.extra.codex_limited_until, until)
+})
+
+test('custom duration quota park (quota_24h_header) is preserved by auth healing and cleared by clearVmQuotaRestriction', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-quota-24h-'))
+  try {
+    const vmPath = path.join(dir, 'vm-codex-24h.json')
+    const until = Date.now() + 60_000
+    fs.writeFileSync(
+      vmPath,
+      JSON.stringify({
+        id: 'vm-codex-24h',
+        platform: 'openai',
+        schedulable: true,
+        claude: {},
+      }),
+    )
+    markVmRestriction(vmPath, { until, reason: 'quota_24h_header' })
+
+    healLeftoverAuthState(vmPath)
+    let vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    assert.equal(vm.temp_unschedulable_reason, 'quota_24h_header')
+    assert.equal(vm.temp_unschedulable_until, until)
+    assert.equal(vm.claude.temp_unschedulable_reason, 'quota_24h_header')
+    assert.equal(vm.claude.temp_unschedulable_until, until)
+
+    clearVmAuthCooldown(vmPath)
+    vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    assert.equal(vm.temp_unschedulable_reason, 'quota_24h_header')
+    assert.equal(vm.claude.temp_unschedulable_reason, 'quota_24h_header')
+
+    clearVmQuotaRestriction(vmPath)
+    vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    assert.equal(vm.temp_unschedulable_reason, undefined)
+    assert.equal(vm.temp_unschedulable_until, undefined)
+    assert.equal(vm.claude.temp_unschedulable_reason, undefined)
+    assert.equal(vm.claude.temp_unschedulable_until, undefined)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })

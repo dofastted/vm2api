@@ -126,7 +126,7 @@ export function zoneCounts(vms: Vm[]): Record<VmZone, number> {
 
 // ---------- 单台额度窗口 ----------
 
-export type WindowKey = '5h' | '7d' | 'fable'
+export type WindowKey = '5h' | '7d' | 'fable' | (string & {})
 
 /** 只描述额度占用；费用与 token 走 `vmCostLedger`，两处不重复。 */
 export type WindowReadout = {
@@ -136,10 +136,44 @@ export type WindowReadout = {
   pct: number | null
   note: string | null
   reset: unknown
+  windowMinutes?: number | null
 }
 
-/** 5H → 7D → Fable；无读数的 Fable 窗口展示探测状态。 */
+function clampCodexPercent(value: unknown): number | null {
+  if (value == null || value === '') return null
+  const n = Number(value)
+  if (!Number.isFinite(n)) return null
+  return Math.max(0, Math.min(100, n))
+}
+
+function hasCustomCodexWindows(vm: Vm): boolean {
+  const rows = vm.codex_usage?.windows
+  return Boolean(
+    isCodexVm(vm) &&
+    Array.isArray(rows) &&
+    rows.length > 0 &&
+    rows.some((w) => w?.id && w.id !== '5h' && w.id !== '7d')
+  )
+}
+
+/** 5H → 7D → Fable；Codex 若含非 5h/7d 实际周期（如 24h）则按实际窗口展示。 */
 export function vmWindows(vm: Vm): WindowReadout[] {
+  if (hasCustomCodexWindows(vm)) {
+    return (vm.codex_usage?.windows || []).map((w) => {
+      const id = String(w.id || w.label || 'window')
+      const pct = vm.has_token ? clampCodexPercent(w.used_percent) : null
+      return {
+        key: id,
+        label: String(w.label || id).toUpperCase(),
+        pct,
+        note: null,
+        reset:
+          w.reset_at ??
+          (id === '5h' ? vm.reset_5h : id === '7d' ? vm.reset_7d : null),
+        windowMinutes: w.window_minutes ?? null,
+      }
+    })
+  }
   const probed = (w: '5h' | '7d') =>
     vm.has_token && windowProbed(vm, w) ? usedPctOf(vm, w) : null
   const windows: WindowReadout[] = [
@@ -173,7 +207,7 @@ export function vmWindows(vm: Vm): WindowReadout[] {
 
 /**
  * 刀片主体画什么：读数表，或一句说明加一步动作。
- * `unprobed` = 有凭证但 5h / 7d 都没有实测值——画 0% 会冒充「还很空」。
+ * `unprobed` = 有凭证但没有任何窗口实测值——画 0% 会冒充「还很空」。
  */
 export type BladeState = 'live' | 'dead' | 'vacant' | 'unprobed'
 
@@ -181,7 +215,13 @@ export function bladeState(vm: Vm): BladeState {
   const zone = zoneOf(vm)
   if (zone === 'dead') return 'dead'
   if (zone === 'none' || !vm.has_token) return 'vacant'
-  if (!windowProbed(vm, '5h') && !windowProbed(vm, '7d')) return 'unprobed'
+  const anyCodex = Boolean(
+    vm.codex_usage?.windows?.some(
+      (w) => clampCodexPercent(w.used_percent) != null
+    )
+  )
+  if (!windowProbed(vm, '5h') && !windowProbed(vm, '7d') && !anyCodex)
+    return 'unprobed'
   return 'live'
 }
 

@@ -1,3 +1,4 @@
+import { apiKeyGateDetails } from '../admin/api-keys.mjs'
 import crypto from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 import {
@@ -80,6 +81,10 @@ const FAILURES = {
   gemini_invalid_request: [400, 'Invalid Gemini request payload.'],
   gemini_native_tty_unavailable: [503, 'No free Linux virtual console is available for CRAGGemini.'],
   gemini_native_worker_unavailable: [503, 'The CRAGGemini native worker is unavailable.'],
+  gemini_native_config_invalid: [
+    503,
+    'CRAGGemini rejected the host-generated worker configuration; align the host script and signed payload versions.',
+  ],
   gemini_native_bridge_timeout: [503, 'The CRAGGemini TUI did not connect to its native worker in time.'],
   gemini_egress_unavailable: [503, 'Gemini egress is not available.'],
   gemini_oauth_tools_missing: [503, 'Gemini OAuth runtime tools are missing.'],
@@ -104,6 +109,7 @@ const NON_CIRCUIT_FAILURES = new Set([
   'gemini_invalid_request',
   'gemini_inference_tool_blocked',
   'gemini_tool_call_required',
+  'gemini_native_config_invalid',
   'gemini_proxy_calibration_mismatch',
   'license_required',
   'license_expired',
@@ -123,7 +129,12 @@ const FAILOVER_ERRORS = new Set([
   'gemini_proxy_unavailable',
   'gemini_proxy_error',
   'gemini_native_worker_unavailable',
+  'gemini_native_bridge_timeout',
   'gemini_inference_start_failed',
+  'gemini_inference_failed',
+  'gemini_inference_timeout',
+  'gemini_inference_invalid_output',
+  'gemini_host_protocol_error',
 ])
 
 const ACCOUNT_WIDE_COOLDOWN_ERRORS = new Set([
@@ -373,10 +384,13 @@ export function createGeminiScheduler({
   getEnvOwner = null,
   cragSubscription = null,
   getRoutingConfig = null,
+  attemptsRepo = null,
+  getAttemptsRepo = null,
   quotaCooldownMs = null,
   accountCooldownMs = null,
   now = () => Date.now(),
 }) {
+  const resolveAttemptsRepo = () => (typeof getAttemptsRepo === 'function' ? getAttemptsRepo() : attemptsRepo) || null
   const envOwnerOf = (envId) => {
     if (typeof getEnvOwner === 'function') return getEnvOwner(envId) ?? null
     if (geminiOwnersRepo?.getOwner) return geminiOwnersRepo.getOwner(envId) ?? null
@@ -594,23 +608,27 @@ export function createGeminiScheduler({
     return reserve(balancedOrdered)
   }
 
-  function activeCooldownUntil(account, upstreamModel, quotaGroup, ts) {
-    let until = proactiveCooldownUntil(account, upstreamModel, quotaGroup, ts)
+  function activeCooldownState(account, upstreamModel, quotaGroup, ts) {
+    const proactiveUntil = proactiveCooldownUntil(account, upstreamModel, quotaGroup, ts)
+    let accountUntil = 0
     const accUntil = accountCooldowns.get(account.id) || 0
-    if (accUntil > ts) until = Math.max(until, accUntil)
+    if (accUntil > ts) accountUntil = accUntil
     else if (accUntil) accountCooldowns.delete(account.id)
 
+    let reactiveQuotaUntil = 0
     const grpKey = `${account.id}:${quotaGroup}`
     const grpUntil = groupCooldowns.get(grpKey) || 0
-    if (grpUntil > ts) until = Math.max(until, grpUntil)
+    if (grpUntil > ts) reactiveQuotaUntil = Math.max(reactiveQuotaUntil, grpUntil)
     else if (grpUntil) groupCooldowns.delete(grpKey)
 
     const mdlKey = `${account.id}:${upstreamModel}`
     const mdlUntil = modelCooldowns.get(mdlKey) || 0
-    if (mdlUntil > ts) until = Math.max(until, mdlUntil)
+    if (mdlUntil > ts) reactiveQuotaUntil = Math.max(reactiveQuotaUntil, mdlUntil)
     else if (mdlUntil) modelCooldowns.delete(mdlKey)
 
-    return until
+    const hardUntil = Math.max(proactiveUntil, accountUntil)
+    const cooldownUntil = Math.max(hardUntil, reactiveQuotaUntil)
+    return { cooldownUntil, hardUntil, reactiveQuotaUntil }
   }
 
   function recordFailureCooldown(accountId, upstreamModel, quotaGroup, failure, ts) {
@@ -633,12 +651,14 @@ export function createGeminiScheduler({
         `${accountId}:${upstreamModel}`,
         Math.max(modelCooldowns.get(`${accountId}:${upstreamModel}`) || 0, until),
       )
-      return
+      return until
     }
     if (ACCOUNT_WIDE_COOLDOWN_ERRORS.has(code)) {
       const until = ts + effectiveAccountCooldown
       accountCooldowns.set(accountId, Math.max(accountCooldowns.get(accountId) || 0, until))
+      return until
     }
+    return 0
   }
 
   function clearCooldownOnSuccess(accountId, upstreamModel, quotaGroup) {
@@ -826,7 +846,13 @@ export function createGeminiScheduler({
     }) {
       const turnStartedAt = Number.isFinite(startedAt) ? startedAt : now()
       const gate = apiKeyStore?.acquire?.(apiKeyRecord)
-      if (gate && !gate.ok) throw fail(gate.status || 429, gate.code, gate.message)
+      if (gate && !gate.ok) {
+        const err = fail(gate.status || 429, gate.code, gate.message)
+        const details = apiKeyGateDetails(gate)
+        if (details) err.details = details
+        if (gate.retry_after != null) err.retryAfter = gate.retry_after
+        throw err
+      }
       const allowUnprefixed = allowUnprefixedNonGemini ?? apiKeyRecord?.group_type !== 'all'
       const excluded = new Set()
       let reservation = null
@@ -838,8 +864,11 @@ export function createGeminiScheduler({
       let lastAccountId = null
       let lastAuthMethod = null
       let lastUpstreamModel = null
+      let lastConversationId = null
       let lastTiming = null
       let lastUsage = null
+      const attemptRecords = []
+      const attemptsRepoRef = resolveAttemptsRepo()
       const attachAttemptMeta = (err) => {
         if (!err || typeof err !== 'object') return err
         if (err.attemptCount == null) err.attemptCount = attempts
@@ -849,8 +878,10 @@ export function createGeminiScheduler({
         if (err.accountId == null && lastAccountId) err.accountId = lastAccountId
         if (err.authMethod == null && lastAuthMethod) err.authMethod = lastAuthMethod
         if (err.upstreamModel == null && lastUpstreamModel) err.upstreamModel = lastUpstreamModel
+        if (err.conversationId == null && lastConversationId) err.conversationId = lastConversationId
         if (err.timing == null && lastTiming) err.timing = lastTiming
         if (err.usage == null && lastUsage) err.usage = lastUsage
+        if (err.attempts == null && attemptRecords.length) err.attempts = attemptRecords
         return err
       }
 
@@ -927,7 +958,7 @@ export function createGeminiScheduler({
             ? Math.max(1, (policy.failover.max_account_switches ?? 3) + 1)
             : capableAccounts.length
         const scored = capableAccounts.map(({ account, resolved }) => {
-          const until = activeCooldownUntil(account, resolved.upstreamModel, resolved.quotaGroup, ts)
+          const cd = activeCooldownState(account, resolved.upstreamModel, resolved.quotaGroup, ts)
           const effectiveMaxConc = normalizeConcurrency(
             account.max_concurrency,
             policy.pool.max_concurrency_per_account,
@@ -935,7 +966,9 @@ export function createGeminiScheduler({
           return {
             account,
             resolved,
-            cooldownUntil: until,
+            cooldownUntil: cd.cooldownUntil,
+            hardUntil: cd.hardUntil,
+            reactiveQuotaUntil: cd.reactiveQuotaUntil,
             candidate: {
               accountId: `gemini:${account.id}`,
               vmId: `gemini:${account.id}`,
@@ -952,21 +985,47 @@ export function createGeminiScheduler({
           }
         })
         const uncooled = scored.filter((item) => item.cooldownUntil === 0)
-        // Prefer uncooled accounts; if every account is currently in cooldown, fall back to
-        // probing the earliest-expiring one so single-account pools and post-reset slots recover.
-        const activeList = uncooled.length ? uncooled : [...scored].sort((a, b) => a.cooldownUntil - b.cooldownUntil)
-        const candidates = activeList.map((item) => item.candidate)
-        const resolvedByAccountId = new Map(activeList.map((item) => [item.candidate.accountId, item.resolved]))
+        const reactiveQuotaCooled = scored
+          .filter((item) => item.hardUntil === 0 && item.reactiveQuotaUntil > 0)
+          .sort((a, b) => a.reactiveQuotaUntil - b.reactiveQuotaUntil)
+        const hardCooled = scored.filter((item) => item.hardUntil > 0).sort((a, b) => a.cooldownUntil - b.cooldownUntil)
+        // Tier 1: uncooled accounts (always tried first with policy strategy + sticky affinity).
+        // Tier 2: reactive short-cooldown (429) accounts ordered by earliest expiry, used ONLY
+        // when all Tier 1 accounts fail (never touches proactively-exhausted 0% or ineligible
+        // accounts unless every account is hard-cooled).
+        const primaryItems = uncooled.length ? uncooled : reactiveQuotaCooled.length ? reactiveQuotaCooled : hardCooled
+        const fallbackItems = uncooled.length ? reactiveQuotaCooled : []
+        const allItems = [...primaryItems, ...fallbackItems]
+        const primaryCandidates = primaryItems.map((item) => item.candidate)
+        const fallbackCandidates = fallbackItems.map((item) => item.candidate)
+        const totalCandidates = allItems.length
+        const resolvedByAccountId = new Map(allItems.map((item) => [item.candidate.accountId, item.resolved]))
 
         let lastError = null
-        while (excluded.size < candidates.length && attempts < maxAttempts) {
+        while (excluded.size < totalCandidates && attempts < maxAttempts) {
           signal?.throwIfAborted()
-          const grant = pickCandidateWithPolicy(candidates, excluded, {
-            strategy: policy.pool.strategy,
-            stickyAccountId,
+          let fromFallback = false
+          let grant = pickCandidateWithPolicy(primaryCandidates, excluded, {
+            strategy: uncooled.length ? policy.pool.strategy : 'balanced',
+            stickyAccountId: uncooled.length ? stickyAccountId : null,
           })
+          if (!grant?.selected && fallbackCandidates.length) {
+            for (const candidate of fallbackCandidates) {
+              if (excluded.has(candidate.accountId)) continue
+              const fb = pickCandidateWithPolicy([candidate], excluded, {
+                strategy: 'balanced',
+                stickyAccountId: null,
+              })
+              if (fb?.selected) {
+                grant = fb
+                fromFallback = true
+                break
+              }
+            }
+          }
           if (!grant?.selected) break
           attempts += 1
+          const attemptStartedAt = now()
           reservation = grant.reservation
           const id = grant.selected.accountId.slice('gemini:'.length)
           const resolved = resolvedByAccountId.get(grant.selected.accountId)
@@ -976,6 +1035,26 @@ export function createGeminiScheduler({
           lastUpstreamModel = resolved.upstreamModel
           lastUpstreamStatus = null
           let emittedOutput = false
+          let attemptConversationId = null
+          const selectionReason = fromFallback
+            ? 'cooldown_fallback'
+            : !uncooled.length
+              ? 'all_cooled_probe'
+              : stickyAccountId === id && attempts === 1
+                ? 'sticky'
+                : attempts > 1
+                  ? 'failover'
+                  : policy.pool.strategy || 'balanced'
+          try {
+            attemptsRepoRef?.begin?.({
+              requestId,
+              attemptNo: attempts,
+              vmId: selected.vmId,
+              accountId: selected.accountId,
+              model: resolved.publicId,
+              selectionReason,
+            })
+          } catch {}
 
           try {
             const envOwner = envOwnerOf(id)
@@ -1026,6 +1105,8 @@ export function createGeminiScheduler({
                 )
               }
             }
+            attemptConversationId = outboundConversationId
+            if (outboundConversationId) lastConversationId = outboundConversationId
             const rawOutboundBody = targetBodyFor
               ? targetBodyFor(target, {
                   upstreamModel: resolved.upstreamModel,
@@ -1222,6 +1303,8 @@ export function createGeminiScheduler({
                 ? collected.meta.conversationId
                 : outboundConversationId
             const finishedAt = now()
+            const attemptLatencyMs = Math.max(0, finishedAt - attemptStartedAt)
+            if (reportedConvId) lastConversationId = reportedConvId
             recordStickyAccount(effectiveStickyKey, id, reportedConvId, policy, finishedAt, attemptUsedConversationIds)
             recordToolContinuation(id, collected, finishedAt, continuationCallIds, effectiveStickyKey)
             recordAccountUsage(apiKeyRecord, resolved.publicId, collected.usage || {})
@@ -1231,6 +1314,31 @@ export function createGeminiScheduler({
               typeof collected.reportedModel === 'string' && collected.reportedModel.trim()
                 ? collected.reportedModel.trim()
                 : null
+            try {
+              attemptsRepoRef?.complete?.(requestId, attempts, {
+                upstreamStatus: lastUpstreamStatus ?? 200,
+                errorScope: null,
+                action: 'ok',
+                cooldownUntil: null,
+                downstreamCommitted: true,
+                terminalState: 'verified',
+                usage: collected.usage || null,
+                ttftMs: collected.timing?.ttftMs ?? null,
+                latencyMs: attemptLatencyMs,
+              })
+            } catch {}
+            attemptRecords.push({
+              attempt_no: attempts,
+              account_id: id,
+              vm_id: selected.vmId,
+              upstream_model: reportedModel || resolved.upstreamModel,
+              ...(reportedConvId ? { conversation_id: reportedConvId } : {}),
+              selection_reason: selectionReason,
+              upstream_status: lastUpstreamStatus ?? 200,
+              error_code: null,
+              action: 'ok',
+              latency_ms: attemptLatencyMs,
+            })
             return {
               ...collected,
               account_id: id,
@@ -1242,6 +1350,7 @@ export function createGeminiScheduler({
               provider: resolved.provider,
               quota_group: resolved.quotaGroup,
               attempt_count: attempts,
+              attempts: attemptRecords,
               upstream_status: lastUpstreamStatus ?? 200,
               ...(reportedConvId ? { conversation_id: reportedConvId } : {}),
             }
@@ -1263,14 +1372,48 @@ export function createGeminiScheduler({
 
             if (error?.timing) lastTiming = error.timing
             if (error?.usage) lastUsage = error.usage
-            const failure = attachAttemptMeta(known(error) || error)
+            const failedAt = now()
+            const attemptLatencyMs = Math.max(0, failedAt - attemptStartedAt)
+            const failure = known(error) || error
             const failureCode = failure?.code
             const cancelled = signal?.aborted || failure?.name === 'AbortError' || failureCode === 'ABORT_ERR'
+            const attemptUpstreamStatus = Number.isInteger(failure?.upstreamStatus)
+              ? failure.upstreamStatus
+              : Number.isInteger(lastUpstreamStatus)
+                ? lastUpstreamStatus
+                : Number.isInteger(failure?.status)
+                  ? failure.status
+                  : null
 
             if (cancelled) {
+              try {
+                attemptsRepoRef?.complete?.(requestId, attempts, {
+                  upstreamStatus: attemptUpstreamStatus,
+                  errorScope: 'request',
+                  action: 'stop',
+                  cooldownUntil: null,
+                  downstreamCommitted: emittedOutput,
+                  terminalState: 'cancelled',
+                  usage: error?.usage || null,
+                  ttftMs: error?.timing?.ttftMs ?? null,
+                  latencyMs: attemptLatencyMs,
+                })
+              } catch {}
+              attemptRecords.push({
+                attempt_no: attempts,
+                account_id: id,
+                vm_id: selected.vmId,
+                upstream_model: resolved.upstreamModel,
+                ...(attemptConversationId ? { conversation_id: attemptConversationId } : {}),
+                selection_reason: selectionReason,
+                upstream_status: attemptUpstreamStatus,
+                error_code: 'gemini_inference_cancelled',
+                action: 'stop',
+                latency_ms: attemptLatencyMs,
+              })
               poolScheduler?.unitCircuit?.releaseProbe?.(selected.accountId)
               selected = null
-              throw failure
+              throw attachAttemptMeta(failure)
             }
 
             if (NON_CIRCUIT_FAILURES.has(failureCode)) {
@@ -1279,15 +1422,57 @@ export function createGeminiScheduler({
               poolScheduler?.unitCircuit?.recordFailure?.(selected.accountId)
             }
 
-            recordFailureCooldown(id, resolved.upstreamModel, resolved.quotaGroup, failure, now())
-            lastError = failure
+            const cooldownUntilMs = recordFailureCooldown(
+              id,
+              resolved.upstreamModel,
+              resolved.quotaGroup,
+              failure,
+              failedAt,
+            )
             excluded.add(selected.accountId)
+            const willFailover =
+              !emittedOutput &&
+              FAILOVER_ERRORS.has(failureCode) &&
+              excluded.size < totalCandidates &&
+              attempts < maxAttempts
+            const errorScope = ACCOUNT_WIDE_COOLDOWN_ERRORS.has(failureCode)
+              ? 'account'
+              : failureCode === 'gemini_quota_exhausted'
+                ? 'quota'
+                : 'upstream'
+            const action = willFailover ? 'failover' : 'stop'
+            try {
+              attemptsRepoRef?.complete?.(requestId, attempts, {
+                upstreamStatus: attemptUpstreamStatus,
+                errorScope,
+                action,
+                cooldownUntil: cooldownUntilMs > 0 ? new Date(cooldownUntilMs).toISOString() : null,
+                downstreamCommitted: emittedOutput,
+                terminalState: willFailover ? 'failed_retryable' : 'failed',
+                usage: error?.usage || null,
+                ttftMs: error?.timing?.ttftMs ?? null,
+                latencyMs: attemptLatencyMs,
+              })
+            } catch {}
+            attemptRecords.push({
+              attempt_no: attempts,
+              account_id: id,
+              vm_id: selected.vmId,
+              upstream_model: resolved.upstreamModel,
+              ...(attemptConversationId ? { conversation_id: attemptConversationId } : {}),
+              selection_reason: selectionReason,
+              upstream_status: attemptUpstreamStatus,
+              error_code: failureCode || 'gemini_inference_failed',
+              action,
+              latency_ms: attemptLatencyMs,
+            })
+            lastError = attachAttemptMeta(failure)
             selected = null
 
-            if (!emittedOutput && FAILOVER_ERRORS.has(failureCode) && excluded.size < candidates.length) {
+            if (willFailover) {
               continue
             }
-            throw failure
+            throw lastError
           }
         }
 
@@ -1338,8 +1523,10 @@ export function createGeminiScheduler({
         stopReason: result.stopReason,
         searches: result.searches,
         attempt_count: result.attempt_count,
+        attempts: result.attempts,
         upstream_status: result.upstream_status,
         timing: result.timing,
+        ...(result.conversation_id ? { conversation_id: result.conversation_id } : {}),
       }
     },
   }

@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from http.client import HTTPResponse
+from pathlib import Path
 
 MAX_BODY = 12 * 1024 * 1024
 MAX_FRAME = 2 * 1024 * 1024
@@ -25,8 +26,18 @@ TOKEN = re.compile(r"[!-~]{24,4096}\Z")
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
 REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 ACCOUNT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+MAX_WORKER_STDERR = 4096
 LAUNCHER_EXIT_FILE = "launcher-exit"
-LAUNCHER_EXIT = re.compile(rb"(craggemini|agy) (-?[0-9]{1,3})\n")
+LAUNCHER_EXIT_REASONS = frozenset(
+    {
+        "invalid_config",
+        "license_error",
+        "bind_failed",
+    }
+)
+LAUNCHER_EXIT = re.compile(
+    rb"(craggemini|agy) (-?[0-9]{1,3})(?: ([a-z][a-z0-9_]{0,31}))?\n"
+)
 ELIGIBILITY_LOG_FILE = "cli-diagnostic"
 
 
@@ -406,6 +417,8 @@ def open_worker_stream(
     gateway_policy=None,
     diagnostic=None,
     account_id=None,
+    is_alive=None,
+    exit_reader=None,
 ):
     if (
         not isinstance(socket_path, str)
@@ -429,6 +442,15 @@ def open_worker_stream(
             diag_code = diagnostic.poll()
             if diag_code is not None:
                 raise NativeFailure(diag_code, 403)
+        if exit_reader is not None:
+            outcome = exit_reader()
+            if outcome is not None:
+                raise launcher_exit_failure(outcome)
+        if is_alive is not None and not is_alive():
+            outcome = exit_reader() if exit_reader is not None else None
+            if outcome is not None:
+                raise launcher_exit_failure(outcome)
+            raise NativeFailure("gemini_native_worker_unavailable", 503)
         status = worker_status(socket_path, token, timeout=0.25)
         if status and status.get("license_valid") is False:
             lic = status.get("license") if isinstance(status.get("license"), dict) else {}
@@ -581,8 +603,16 @@ def run_request(request):
     startup_timeout = request.get("startup_timeout", 45)
     if type(startup_timeout) is not int or not 1 <= startup_timeout <= 45:
         startup_timeout = 45
+    launcher_uid = request.get("launcher_uid")
+    if launcher_uid is not None and (type(launcher_uid) is not int or launcher_uid < 0):
+        launcher_uid = None
+    socket_dir = Path(socket_path).parent
     start_deadline = time.monotonic() + startup_timeout
     while time.monotonic() < start_deadline:
+        if launcher_uid is not None:
+            outcome = read_launcher_exit_detail(socket_dir, launcher_uid)
+            if outcome is not None:
+                raise launcher_exit_failure(outcome)
         status = worker_status(socket_path, token, timeout=0.25)
         if status and status.get("license_valid") is False:
             lic = status.get("license") if isinstance(status.get("license"), dict) else {}
@@ -759,10 +789,56 @@ class NativeInvocation:
         self._process = None
 
 
-def read_launcher_exit(directory, uid):
+def _classify_worker_stderr(raw):
+    if not raw:
+        return None
+    text = raw[:MAX_WORKER_STDERR].decode("utf-8", errors="ignore").lower()
+    if (
+        "invalid configuration" in text
+        or "unknown field" in text
+        or (
+            "config" in text
+            and (
+                "failed to parse" in text
+                or "invalid json" in text
+                or "json or fields" in text
+            )
+        )
+    ):
+        return "invalid_config"
+    if "license" in text and any(
+        token in text for token in ("invalid", "expired", "missing", "required", "mismatch")
+    ):
+        return "license_error"
+    if "address already in use" in text or (
+        "failed to bind" in text and "socket" in text
+    ):
+        return "bind_failed"
+    return None
+
+
+def _drain_stderr(pipe, captured):
+    try:
+        while True:
+            chunk = pipe.read(1024)
+            if not chunk:
+                break
+            remaining = MAX_WORKER_STDERR - len(captured)
+            if remaining > 0:
+                captured.extend(chunk[:remaining])
+    except OSError:
+        pass
+    finally:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+def read_launcher_exit_detail(directory, uid):
     try:
         descriptor = os.open(
-            directory / LAUNCHER_EXIT_FILE,
+            Path(directory) / LAUNCHER_EXIT_FILE,
             os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
         )
         with os.fdopen(descriptor, "rb") as stream:
@@ -773,20 +849,43 @@ def read_launcher_exit(directory, uid):
                 or info.st_nlink != 1
             ):
                 return None
-            match = LAUNCHER_EXIT.fullmatch(stream.read(32))
+            match = LAUNCHER_EXIT.fullmatch(stream.read(96))
     except OSError:
         return None
     if match is not None:
         status = int(match[2])
         if -signal.NSIG < status <= 255:
-            return match[1].decode("ascii"), status
+            reason_raw = match[3].decode("ascii") if match[3] is not None else None
+            reason = reason_raw if reason_raw in LAUNCHER_EXIT_REASONS else None
+            return match[1].decode("ascii"), status, reason
     return None
 
 
-def _record_launcher_exit(directory, name, returncode):
+def read_launcher_exit(directory, uid):
+    detail = read_launcher_exit_detail(directory, uid)
+    if detail is None:
+        return None
+    return detail[0], detail[1]
+
+
+def launcher_exit_code(outcome):
+    if outcome is None:
+        return "gemini_native_worker_unavailable"
+    reason = outcome[2] if len(outcome) >= 3 else None
+    if reason == "invalid_config":
+        return "gemini_native_config_invalid"
+    return "gemini_native_worker_unavailable"
+
+
+def launcher_exit_failure(outcome):
+    return NativeFailure(launcher_exit_code(outcome), 503)
+
+
+def _record_launcher_exit(directory, name, returncode, reason=None):
+    suffix = f" {reason}" if reason in LAUNCHER_EXIT_REASONS else ""
     try:
         with open(f"{directory}/{LAUNCHER_EXIT_FILE}", "x", encoding="ascii") as stream:
-            stream.write(f"{name} {returncode}\n")
+            stream.write(f"{name} {returncode}{suffix}\n")
     except OSError:
         # Diagnostic I/O must not replace the child's exit or bypass cleanup.
         pass
@@ -806,35 +905,46 @@ def _is_pool_mode_config(config_path):
         return False
 
 
-def _launch_native(argv):
+def _launch_native(argv, *, worker_bin="/opt/craggemini", directory="/tmp/craggemini", startup_timeout=5):
     # Both children must use the same PID namespace and procfs: the worker
     # compares SO_PEERCRED with the PID reported by the in-process adapter.
-    directory = "/tmp/craggemini"
     config_path = directory + "/kernel.json"
     pool_mode = _is_pool_mode_config(config_path)
     worker = subprocess.Popen(
-        ["/opt/craggemini", "--gateway-worker", "--config", config_path],
+        [worker_bin, "--gateway-worker", "--config", config_path],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
+    stderr_buf = bytearray()
+    stderr_drain = threading.Thread(
+        target=_drain_stderr,
+        args=(worker.stderr, stderr_buf),
+        name="craggemini-stderr",
+        daemon=True,
+    )
+    stderr_drain.start()
     tui = None
     try:
         required_sockets = ("kernel.sock",) if pool_mode else ("kernel.sock", "native.sock")
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + startup_timeout
         while worker.poll() is None and time.monotonic() < deadline:
             if all(os.path.exists(f"{directory}/{name}") for name in required_sockets):
                 break
             time.sleep(0.025)
         else:
-            if worker.returncode is not None:
-                _record_launcher_exit(directory, "craggemini", worker.returncode)
+            if worker.poll() is not None:
+                stderr_drain.join(timeout=0.5)
+                reason = _classify_worker_stderr(bytes(stderr_buf))
+                _record_launcher_exit(directory, "craggemini", worker.returncode, reason=reason)
             return 1
         if pool_mode:
             # In multi-process pool mode, craggemini spawns and guards up to
             # max_concurrency agy processes with per-slot PTYs and memfd rings.
             code = worker.wait()
-            _record_launcher_exit(directory, "craggemini", code)
+            stderr_drain.join(timeout=0.5)
+            reason = _classify_worker_stderr(bytes(stderr_buf))
+            _record_launcher_exit(directory, "craggemini", code, reason=reason)
             return code if code >= 0 else 128 - code
         tui = subprocess.Popen(
             argv,
@@ -848,8 +958,15 @@ def _launch_native(argv):
         pid, status = os.wait()
         child = worker if pid == worker.pid else tui
         child.returncode = os.waitstatus_to_exitcode(status)
+        reason = None
+        if child is worker:
+            stderr_drain.join(timeout=0.5)
+            reason = _classify_worker_stderr(bytes(stderr_buf))
         _record_launcher_exit(
-            directory, "craggemini" if child is worker else "agy", child.returncode
+            directory,
+            "craggemini" if child is worker else "agy",
+            child.returncode,
+            reason=reason,
         )
         return child.returncode if child.returncode >= 0 else 128 - child.returncode
     finally:
@@ -857,6 +974,7 @@ def _launch_native(argv):
             if child is not None:
                 child.kill()
                 child.wait()
+        stderr_drain.join(timeout=0.5)
 
 
 def _worker_main():

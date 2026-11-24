@@ -121,16 +121,22 @@ export function evaluateOpenAIQuotaGate(vm, policy = OPENAI_QUOTA_DEFAULTS, now 
   if (hasSpendableCodexCredits(vm, now)) return OPEN_GATE
   const effective = normalizeOpenAIQuotaPolicy(policy)
   const extra = vm?.codex?.extra || vm?.codex_extra || {}
-  const usage = Object.keys(extra).length
-    ? buildCodexUsageView(extra).quota
-    : vm?.codex_usage?.quota || vm?.codex?.usage?.quota || {}
+  const hasExtra = Object.keys(extra).length > 0
+  const view = hasExtra ? buildCodexUsageView(extra) : vm?.codex_usage || vm?.codex?.usage || null
+  const usage = view?.quota || {}
+  const windows = Array.isArray(view?.windows) ? view.windows : []
   let first = null
   let until = null
   for (const key of ['5h', '7d']) {
-    const percent = extra[`codex_${key}_used_percent`]
-    const normalized = usage[`utilization_${key}`] ?? vm?.[`utilization_${key}`]
+    const win = windows.find((row) => row?.id === key) || null
+    const percent = win?.used_percent
+    const normalized = hasExtra
+      ? usage[`utilization_${key}`]
+      : (usage[`utilization_${key}`] ?? vm?.[`utilization_${key}`])
     const used = percent == null ? usageFraction(normalized) : usageFraction(percent, { percent: true })
-    const reset = extra[`codex_${key}_reset_at`] ?? usage[`reset_${key}`] ?? vm?.[`reset_${key}`]
+    const reset = hasExtra
+      ? (win?.reset_at ?? usage[`reset_${key}`])
+      : (win?.reset_at ?? usage[`reset_${key}`] ?? vm?.[`reset_${key}`])
     if (used == null || resetIsLive(reset, now) === false || used < effective[`limit_${key}`]) continue
     const at = typeof reset === 'number' ? reset : Date.parse(reset || '')
     if (Number.isFinite(at) && at > now) until = until == null ? at : Math.min(until, at)

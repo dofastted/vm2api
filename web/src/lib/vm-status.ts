@@ -469,7 +469,7 @@ export function credentialStatus(vm: Vm | undefined): StatusTone {
 function leftoverQuotaOff(vm: Vm | undefined): boolean {
   if (!vm || vm.schedulable !== false || vm.schedule_manual === true)
     return false
-  return /^(quota_5h|quota_7d)/.test(String(vm.schedule_disabled_reason || ''))
+  return /^quota_\d+[mhd]/.test(String(vm.schedule_disabled_reason || ''))
 }
 
 /** 额度 / 429 / 冷却写成受限，不是操作员关。含未迁完的 leftover quota-off。 */
@@ -535,6 +535,8 @@ function restrictionLabel(vm: Vm, fallback: string): string {
   )
   if (/quota_5h/.test(reason)) return '5h 限制'
   if (/quota_7d/.test(reason)) return '7d 限制'
+  const customQuota = reason.match(/quota_(\d+[mhd])/)
+  if (customQuota) return `${customQuota[1]} 限制`
   return fallback
 }
 

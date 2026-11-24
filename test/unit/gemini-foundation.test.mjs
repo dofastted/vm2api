@@ -1812,3 +1812,269 @@ test('Gemini mode=ANY rejects plain-text STOP without functionCall while keeping
   assert.match(r6.bodyText(), /"finishReason":"STOP"/)
   assert.equal(logs.at(-1).final_state, 'verified')
 })
+
+test('publicError sanitizes HOST_INFRASTRUCTURE_CODES details/retryAfter while forwarding over-limit metadata', async () => {
+  const infraErr = Object.assign(new Error('ENOENT /run/private-gemini.sock'), {
+    code: 'gemini_host_socket_missing',
+    status: 503,
+    details: { socket_path: '/run/private-gemini.sock' },
+    retryAfter: 30,
+  })
+  const overlimitErr = Object.assign(new Error('API key rate limit exceeded (2/min)'), {
+    code: 'api_key_rate_limit',
+    status: 429,
+    details: {
+      limit_type: 'rpm',
+      current: 2,
+      limit: 2,
+      remaining: 0,
+      reset_at: '2026-11-24T12:01:00.000Z',
+      retry_after: 12,
+    },
+    retryAfter: 12,
+  })
+
+  for (const mode of ['complete', 'stream']) {
+    let nextErr = infraErr
+    const scheduler = {
+      catalog: async () => ({ models: ['gemini-2.5-pro'], environments: [] }),
+      ...(mode === 'complete'
+        ? {
+            complete: async () => {
+              throw nextErr
+            },
+          }
+        : {
+            stream: async () => {
+              throw nextErr
+            },
+          }),
+    }
+    const handler = createGeminiPublicHandler({
+      json: jsonResponder,
+      readBody: async (r) => r.body || {},
+      scheduler,
+    })
+
+    // 1. Infrastructure error must be sanitized: 503 gemini_host_unavailable, no details, no Retry-After.
+    nextErr = infraErr
+    const resInfra = makeRes()
+    await handler(
+      makeReq({
+        url: '/v1/chat/completions',
+        body: { model: 'gemini-2.5-pro', messages: [{ role: 'user', content: 'hi' }] },
+      }),
+      resInfra,
+    )
+    assert.equal(resInfra.statusCode, 503)
+    assert.equal(resInfra.headers['retry-after'], undefined)
+    const infraBody = resInfra.jsonBody()
+    assert.equal(infraBody.error.code, 'gemini_host_unavailable')
+    assert.equal(infraBody.error.details, undefined)
+    assert.doesNotMatch(resInfra.bodyText(), /private-gemini\.sock/)
+
+    // 2. Non-infrastructure over-limit error preserves status, Retry-After, and details.
+    nextErr = overlimitErr
+    const resLimit = makeRes()
+    await handler(
+      makeReq({
+        url: '/v1/chat/completions',
+        body: { model: 'gemini-2.5-pro', messages: [{ role: 'user', content: 'hi' }] },
+      }),
+      resLimit,
+    )
+    assert.equal(resLimit.statusCode, 429)
+    assert.equal(resLimit.headers['retry-after'], '12')
+    const limitBody = resLimit.jsonBody()
+    assert.equal(limitBody.error.code, 'api_key_rate_limit')
+    assert.equal(limitBody.error.type, 'rate_limit_error')
+    assert.equal(limitBody.error.details.limit_type, 'rpm')
+    assert.equal(limitBody.error.details.current, 2)
+    assert.equal(limitBody.error.details.limit, 2)
+  }
+})
+
+test('Gemini scheduler fails over pre-output 502/504, falls back to reactive-cooled accounts, and records attemptsRepo + hop_meta', async () => {
+  let clock = 1_700_000_000_000
+  const futureReset = new Date(clock + 3_600_000).toISOString()
+  const envs = [
+    {
+      id: 'env-a',
+      proxy_id: 'px-1',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      models_discovered: true,
+      models: ['gemini-4-neon-high'],
+      capabilities: [...FULL_GEMINI_CAPABILITIES],
+      account: { state: 'ok', quotas: [], quota_groups: [] },
+    },
+    {
+      id: 'env-b',
+      proxy_id: 'px-2',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      models_discovered: true,
+      models: ['gemini-4-neon-high'],
+      capabilities: [...FULL_GEMINI_CAPABILITIES],
+      account: { state: 'ok', quotas: [], quota_groups: [] },
+    },
+    {
+      id: 'env-zero',
+      proxy_id: 'px-3',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      models_discovered: true,
+      models: ['gemini-4-neon-high'],
+      capabilities: [...FULL_GEMINI_CAPABILITIES],
+      account: {
+        state: 'ok',
+        quotas: [{ model: 'gemini-4-neon-high', remaining_fraction: 0, reset_at: futureReset }],
+        quota_groups: [],
+      },
+    },
+  ]
+
+  const recordedAttempts = []
+  const fakeAttemptsRepo = {
+    begin(entry) {
+      recordedAttempts.push({ ...entry, completed: null })
+    },
+    complete(requestId, attemptNo, result) {
+      const row = recordedAttempts.find((r) => r.requestId === requestId && r.attemptNo === attemptNo)
+      if (row) row.completed = result
+    },
+  }
+
+  let scenario = '502-then-ok'
+  const calls = []
+  const scheduler = createGeminiScheduler({
+    now: () => clock,
+    quotaCooldownMs: 60_000,
+    attemptsRepo: fakeAttemptsRepo,
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return envs.find((e) => e.id === payload.id)
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async (_op, payload) => {
+      calls.push({ id: payload.id, convId: payload.body?.conversation_id })
+      if (scenario === '502-then-ok') {
+        if (payload.id === 'env-a') {
+          return sseResponse([JSON.stringify({ code: 'gemini_inference_failed', message: 'bridge lost' })], {
+            statusCode: 502,
+            contentType: 'application/json',
+          })
+        }
+        return sseResponse([
+          `data: ${JSON.stringify({
+            candidates: [{ content: { role: 'model', parts: [{ text: 'recovered-from-502' }] }, finishReason: 'STOP' }],
+          })}\n\n`,
+        ])
+      }
+      if (scenario === 'midstream-502') {
+        return sseResponse([
+          `data: ${JSON.stringify({ candidates: [{ content: { role: 'model', parts: [{ text: 'partial-' }] } }] })}\n\n`,
+          `data: ${JSON.stringify({ error: { code: 502, message: 'midstream drop' } })}\n\n`,
+        ])
+      }
+      if (scenario === 'cool-a-only') {
+        if (payload.id === 'env-a') {
+          return sseResponse([JSON.stringify({ code: 'gemini_quota_exhausted', message: '429 a' })], {
+            statusCode: 429,
+            contentType: 'application/json',
+          })
+        }
+        return sseResponse([
+          `data: ${JSON.stringify({
+            candidates: [{ content: { role: 'model', parts: [{ text: 'b-ok' }] }, finishReason: 'STOP' }],
+          })}\n\n`,
+        ])
+      }
+      if (scenario === 'b-429-fallback-to-reactive-a') {
+        if (payload.id === 'env-b') {
+          return sseResponse([JSON.stringify({ code: 'gemini_quota_exhausted', message: '429 b' })], {
+            statusCode: 429,
+            contentType: 'application/json',
+          })
+        }
+        return sseResponse([
+          `data: ${JSON.stringify({
+            candidates: [
+              { content: { role: 'model', parts: [{ text: 'a-recovered-from-cooldown' }] }, finishReason: 'STOP' },
+            ],
+          })}\n\n`,
+        ])
+      }
+      throw new Error(`unknown scenario ${scenario}`)
+    },
+    resolveProxy: () => 'socks5h://192.0.2.10:1080',
+  })
+
+  // 1. Pre-output 502 on env-a fails over cleanly to env-b with a distinct conversation_id & full attemptsRepo log.
+  const t1 = await scheduler.stream({
+    requestId: 'req-502-failover',
+    model: 'gemini-4-neon-high',
+    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+    stickyKey: 'key:sess-502',
+    apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+  })
+  assert.equal(t1.account_id, 'env-b')
+  assert.equal(t1.text, 'recovered-from-502')
+  assert.equal(t1.attempt_count, 2)
+  assert.equal(t1.attempts.length, 2)
+  assert.equal(t1.attempts[0].account_id, 'env-a')
+  assert.equal(t1.attempts[0].upstream_status, 502)
+  assert.equal(t1.attempts[0].action, 'failover')
+  assert.equal(t1.attempts[1].account_id, 'env-b')
+  assert.equal(t1.attempts[1].action, 'ok')
+  assert.notEqual(calls[0].convId, calls[1].convId, '502 failover must mint a fresh conversation_id')
+  const rows1 = recordedAttempts.filter((r) => r.requestId === 'req-502-failover')
+  assert.equal(rows1.length, 2)
+  assert.equal(rows1[0].completed.terminalState, 'failed_retryable')
+  assert.equal(rows1[1].completed.terminalState, 'verified')
+
+  // 2. Mid-stream 502 after partial output MUST NOT failover or duplicate output.
+  scenario = 'midstream-502'
+  const beforeMid = calls.length
+  await assert.rejects(
+    () =>
+      scheduler.stream({
+        requestId: 'req-mid-502',
+        model: 'gemini-4-neon-high',
+        geminiBody: { contents: [{ role: 'user', parts: [{ text: 'mid' }] }] },
+        apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+      }),
+    (err) => err.code === 'gemini_inference_failed' && err.attemptCount === 1,
+  )
+  assert.equal(calls.length, beforeMid + 1, 'mid-stream 502 must not failover')
+
+  // 3. Reactive 429 on env-a cools env-a (60s), then on next turn if uncooled env-b ALSO 429s,
+  // scheduler falls back to reactive-cooled env-a while STILL skipping proactively-exhausted env-zero!
+  scenario = 'cool-a-only'
+  const t3 = await scheduler.stream({
+    requestId: 'req-cool-a',
+    model: 'gemini-4-neon-high',
+    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'trigger cool a' }] }] },
+    apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+  })
+  assert.equal(t3.account_id, 'env-b')
+
+  clock += 5_000
+  scenario = 'b-429-fallback-to-reactive-a'
+  const beforeFb = calls.length
+  const t4 = await scheduler.stream({
+    requestId: 'req-fb-reactive',
+    model: 'gemini-4-neon-high',
+    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'try fallback' }] }] },
+    apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+  })
+  assert.equal(t4.account_id, 'env-a')
+  assert.equal(t4.text, 'a-recovered-from-cooldown')
+  assert.equal(t4.attempt_count, 2)
+  assert.deepEqual(
+    calls.slice(beforeFb).map((c) => c.id),
+    ['env-b', 'env-a'],
+    'must try uncooled env-b first, then fall back to reactive-cooled env-a, never touching 0% env-zero',
+  )
+  assert.equal(t4.attempts[1].selection_reason, 'cooldown_fallback')
+})

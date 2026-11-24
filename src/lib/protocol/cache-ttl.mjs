@@ -43,18 +43,15 @@ export function cacheTtlFromRoutingFile(filePath) {
   }
 }
 
-/** First effective inbound TTL; TTL-less-only bodies still use the menu setting. */
+/** First explicit inbound TTL in wire order; omitted TTLs defer to the menu setting. */
 export function bodyCacheTtl(body) {
   if (!body || typeof body !== 'object') return null
   let first = null
-  let hasExplicit = false
   const collect = (node) => {
+    if (first != null) return
     const control = node?.cache_control
     if (control?.type !== 'ephemeral') return
-    const raw = control.ttl
-    if (raw != null && raw !== '5m' && raw !== '1h') return
-    if (first == null) first = raw ?? '5m'
-    if (raw != null) hasExplicit = true
+    if (control.ttl === '5m' || control.ttl === '1h') first = control.ttl
   }
   for (const tool of Array.isArray(body.tools) ? body.tools : []) collect(tool)
   for (const block of Array.isArray(body.system) ? body.system : []) collect(block)
@@ -62,7 +59,7 @@ export function bodyCacheTtl(body) {
     for (const block of Array.isArray(message?.content) ? message.content : []) collect(block)
   }
   collect(body)
-  return hasExplicit ? first : null
+  return first
 }
 
 export function bodyRequestsHourCache(body) {
@@ -71,16 +68,18 @@ export function bodyRequestsHourCache(body) {
 
 /**
  * Header, then an explicit 5m/1h on any inbound marker, then the settings menu.
- * This selects the default for new markers. Existing ttl-less caller markers
- * retain Anthropic's implicit 5m regardless of this selection.
+ * Rewritten requests resolve omitted TTLs to this value; official passthrough
+ * leaves caller omissions untouched.
  */
 export function resolveCacheTtl({ headers = {}, body, routing, routingFile } = {}) {
   const hdr = headers[CACHE_TTL_HEADER] || headers['X-Kin-Cache-Ttl']
   if (hdr != null && String(hdr).trim()) return normalizeCacheTtl(hdr)
   const requested = bodyCacheTtl(body)
   if (requested) return requested
+  if (routing?.compatibility?.cache_ttl != null) return cacheTtlFromRouting(routing)
+  if (routingFile) return cacheTtlFromRoutingFile(routingFile)
   if (routing) return cacheTtlFromRouting(routing)
-  return cacheTtlFromRoutingFile(routingFile)
+  return DEFAULT_CACHE_TTL
 }
 
 /** Native passthrough validates caller markers; it never repairs their budget or TTL. */
@@ -166,29 +165,21 @@ export function fillMissingCacheTtl(body, ttl = DEFAULT_CACHE_TTL) {
   if (!body || typeof body !== 'object') return body
   const target = normalizeCacheTtl(ttl)
   let short = false
+  let changed = false
   const fill = (node) => {
     const control = node?.cache_control
     if (!control || control.type !== 'ephemeral') return node
-    if (control.ttl != null) {
-      if (control.ttl !== '1h') short = true
+    if (control.ttl === '1h' || control.ttl === '5m') {
+      if (control.ttl === '5m') short = true
       return node
     }
     const next = short ? '5m' : target
     if (next !== '1h') short = true
+    changed = true
     return { ...node, cache_control: { ...control, ttl: next } }
   }
-  const out = { ...body }
-  if (Array.isArray(out.tools)) out.tools = out.tools.map(fill)
-  if (Array.isArray(out.system)) out.system = out.system.map(fill)
-  if (Array.isArray(out.messages)) {
-    out.messages = out.messages.map((message) => {
-      if (!Array.isArray(message?.content)) return message
-      const content = message.content.map(fill)
-      return content.some((block, i) => block !== message.content[i]) ? { ...message, content } : message
-    })
-  }
-  if (out.cache_control) out.cache_control = fill({ cache_control: out.cache_control }).cache_control
-  return out
+  const out = walkCacheNodes(body, fill)
+  return changed ? out : body
 }
 
 const CACHE_TTL_MS = Object.freeze({ '5m': 5 * 60_000, '1h': 60 * 60_000 })
@@ -497,8 +488,9 @@ export function callerSystemCacheControl(body) {
 function politeEphemeral(control, ttl) {
   if (!control || typeof control !== 'object') return { type: 'ephemeral', ttl }
   if (control.type && control.type !== 'ephemeral') return null
-  if (control.type === 'ephemeral') return control
-  return { ...control, type: 'ephemeral', ttl }
+  const existingTtl = String(control.ttl || '').trim()
+  if (control.type === 'ephemeral' && existingTtl) return control
+  return { ...control, type: 'ephemeral', ttl: existingTtl || ttl }
 }
 
 function stampNode(node, ttl) {
@@ -782,7 +774,7 @@ export function applyCacheBreakpoints(body, { ttl = DEFAULT_CACHE_TTL, config, i
   if (!cfg.enabled) return body
   const source = inbound && typeof inbound === 'object' ? inbound : body
   const target = highestInboundCacheTtl(source, ttl)
-  let out = body
+  let out = fillMissingCacheTtl(body, target)
   if (cfg.tools_tail) out = injectToolsTailBreakpoint(out, target)
   const caller = cfg.preserve_client ? callerSystemCacheControl(source) : null
   // A template that marks its own boundary (the official agent slot) already has
