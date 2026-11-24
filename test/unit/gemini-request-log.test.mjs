@@ -726,6 +726,79 @@ test('API-backend Gemini path records first_byte_ms, first_token_ms, generation_
   assert.match(dbg.response?.body || '', /API ok/)
 })
 
+test('Gemini multi-attempt failover and all-429 errors populate hop_meta.attempts in debug logs', async (t) => {
+  const store = tmpLogStore('debug')
+  t.after(() => {
+    store.db.close()
+    fs.rmSync(store.dataDir, { recursive: true, force: true })
+  })
+
+  const envs = [
+    {
+      id: 'env-hop-a',
+      proxy_id: 'px-1',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      models_discovered: true,
+      models: ['gemini-4-neon-high'],
+      capabilities: [...FULL_GEMINI_CAPABILITIES],
+    },
+    {
+      id: 'env-hop-b',
+      proxy_id: 'px-2',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      models_discovered: true,
+      models: ['gemini-4-neon-high'],
+      capabilities: [...FULL_GEMINI_CAPABILITIES],
+    },
+  ]
+
+  const scheduler = createGeminiScheduler({
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return envs.find((e) => e.id === payload.id)
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async () =>
+      delayedSseResponse([JSON.stringify({ code: 'gemini_quota_exhausted', message: '429' })], {
+        statusCode: 429,
+        contentType: 'application/json',
+      }),
+    resolveProxy: () => 'socks5h://192.0.2.10:1080',
+  })
+
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler,
+    requestLog: store,
+    groupsRepo: { rateMultiplier: () => 1 },
+  })
+
+  const res = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-neon-high:generateContent',
+      groupType: 'gemini',
+      body: { contents: [{ role: 'user', parts: [{ text: 'all 429 test' }] }] },
+    }),
+    res,
+  )
+  assert.equal(res.statusCode, 429)
+  const row = store.queryNormal({ limit: 5 }).items[0]
+  assert.equal(row.attempt_count, 2)
+  const dbg = store.getDebug(row.request_id)
+  assert.equal(dbg.hop_meta?.via, 'craggemini')
+  assert.equal(dbg.hop_meta?.attempts?.length, 2)
+  assert.deepEqual(
+    dbg.hop_meta.attempts.map((a) => a.account_id),
+    ['env-hop-a', 'env-hop-b'],
+  )
+  assert.equal(dbg.hop_meta.attempts[0].action, 'failover')
+  assert.equal(dbg.hop_meta.attempts[1].action, 'stop')
+})
+
 test('Gemini OAuth preserves upstream-reported modelVersion in logs, model_mismatch, and non-streaming responses (#1728)', async (t) => {
   const store = tmpLogStore('normal')
   t.after(() => {

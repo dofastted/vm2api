@@ -1760,6 +1760,14 @@ export function createGeminiPublicHandler({
       logBag.final_state = 'verified'
       logBag.attempt_count = Number.isInteger(turn?.attempt_count) ? turn.attempt_count : 1
       logBag.upstream_status = turn?.upstream_status ?? 200
+      if (Array.isArray(turn?.attempts) && turn.attempts.length > 0) {
+        logBag.hop_meta = {
+          ...logBag.hop_meta,
+          via: logBag.via,
+          ...(turn.conversation_id ? { conversation_id: turn.conversation_id } : {}),
+          attempts: turn.attempts,
+        }
+      }
       logBag.reasoning_effort = resolveGeminiReasoningEffort({
         inbound: body,
         parsed,
@@ -1799,6 +1807,14 @@ export function createGeminiPublicHandler({
       }
       if (error.authMethod) logBag.via = error.authMethod === 'api_key' ? 'gemini_api_key' : 'craggemini'
       if (error.upstreamModel) logBag.upstream_model = error.upstreamModel
+      if (Array.isArray(error.attempts) && error.attempts.length > 0) {
+        logBag.hop_meta = {
+          ...logBag.hop_meta,
+          ...(logBag.via ? { via: logBag.via } : {}),
+          ...(error.conversationId ? { conversation_id: error.conversationId } : {}),
+          attempts: error.attempts,
+        }
+      }
       const timing = error.timing
       if (timing) {
         if (Number.isFinite(timing.firstByteAt)) logBag.first_byte_ms = Math.max(0, timing.firstByteAt - startedAt)
