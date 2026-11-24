@@ -18,6 +18,12 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 
    同一签名清单在同一私有发行目录只生成一个授权码。保留 `.code` 文件并私下交付授权码；仅将对应 `.json` 校验配置以 root 所有、`0600` 权限安装到宿主 `/etc/vm2api/gemini-release.json`，不提交明文授权码，也不要把签发私钥放到部署机。更换校验配置不会沿用旧版激活。
 
+### 自部署获取签名载荷、公钥与授权码的渠道
+
+- **签名载荷与验签公钥（公开 Release 自动获取）**：官方 Linux amd64 签名产物（`craggemini`、`craggemini.payload.enc`、`libagy_bridge.so`、`crag-license-public.pem`、`manifest.json`）已通过本仓库 GitHub Releases 公开分发，具体 tag 由 [`deploy/payload.json`](../deploy/payload.json) 中的 `geminiDefaultLinuxAmd64.tag` 固定。执行 `deploy/install.sh prepare-gemini` 时会调用 `scripts/fetch-default-gemini.py` 自动下载、核对大小与 SHA-256 并安装，不需要自部署用户查找上游私有仓库或手工放置 `/etc/vm2api/gemini-ed25519.pub`。
+- **老版本宿主报 `payload_state: not_configured` / `gemini_public_key_missing`**：通常是宿主仍停留在引入 `geminiDefaultLinuxAmd64` 之前的 `prepare-gemini` 产物。请先确认安装目录的 `VERSION` 已更新到当前发布版本，再在宿主机重新执行 `sudo bash deploy/install.sh prepare-gemini --dir /opt/vm2api`（会更新宿主脚本并自动拉取固定载荷与公钥）。
+- **授权凭证（需单独获取并在面板兑换）**：公开 Release 只提供已签名的运行载荷与公钥；激活推理所需的宿主订阅兑换码 `CRAGR1.…`（或兼容旧版清单的 `CGG1-…`）需通过官方 CRAG 订阅或维护者渠道单独获取，并在面板「订阅 CRAG」或「导入 → Gemini」兑换激活。上方第 6 步的 `issue-gemini-release-code.mjs` 仅适用于自建发行方私下签发自管载荷。
+
 ## 导入与验收边界
 
 - 在面板为环境选平台所有的可用 IPv4 SOCKS5 节点。宿主服务使用独立 UID、文件系统隔离和独立网络命名空间；`agy` 无直连规则，只有 `kin-egress` 可向选定 SOCKS5 的地址和端口建立出站连接。首版不接直连、HTTP 代理或域名型代理端点。
