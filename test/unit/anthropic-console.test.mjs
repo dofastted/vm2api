@@ -4,7 +4,7 @@ import { Readable } from 'node:stream'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { ApiEndpointStore } from '../../src/lib/admin/api-endpoints.mjs'
+import { ApiEndpointStore, fetchUpstreamModels } from '../../src/lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from '../../src/lib/pool/api-scheduler.mjs'
 import {
   anthropicConsoleResult,
@@ -664,4 +664,154 @@ test('an explicit direct choice overrides a saved proxy for both test and model 
   await handlePanel(models, {}, new URL('http://localhost/api/panel/api-endpoints/fetch-models'))
   assert.equal(response.status, 200, JSON.stringify(response.body))
   assert.deepEqual(seen, ['', ''])
+})
+
+test('Gemini console fetches models via /v1beta/models and falls back to /v1/models when /v1beta returns HTML or 405', async () => {
+  const nativeCalls = []
+  const nativeRes = await fetchUpstreamModels({
+    kind: 'gemini',
+    protocol: 'gemini',
+    api_key: 'AIza-test-key-123456',
+    forward: async (request) => {
+      nativeCalls.push(request)
+      return Object.assign(
+        Readable.from([
+          Buffer.from(
+            JSON.stringify({
+              models: [
+                {
+                  name: 'models/gemini-2.5-pro',
+                  displayName: 'Gemini 2.5 Pro',
+                  supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
+                },
+                {
+                  name: 'models/text-embedding-004',
+                  displayName: 'Embedding',
+                  supportedGenerationMethods: ['embedContent'],
+                },
+              ],
+            }),
+          ),
+        ]),
+        { statusCode: 200 },
+      )
+    },
+  })
+  assert.equal(nativeCalls.length, 1)
+  assert.equal(nativeCalls[0].url, 'https://generativelanguage.googleapis.com/v1beta/models')
+  assert.equal(nativeCalls[0].headers['x-goog-api-key'], 'AIza-test-key-123456')
+  assert.equal(nativeCalls[0].headers['anthropic-version'], undefined)
+  assert.deepEqual(
+    nativeRes.models.map((m) => m.name),
+    ['gemini-2.5-pro'],
+  )
+
+  // Split-nginx gateway (like kin.fkcodex.com) returns HTML on /v1beta/models and JSON on /v1/models.
+  const fallbackUrls = []
+  const fallbackRes = await fetchUpstreamModels({
+    kind: 'custom',
+    protocol: 'gemini',
+    base_url: 'https://kin.example.com',
+    api_key: 'sk-vm-gemini-test-key',
+    forward: async (request) => {
+      fallbackUrls.push(request.url)
+      if (request.url.endsWith('/v1beta/models')) {
+        return Object.assign(Readable.from([Buffer.from('<!doctype html><html>vm2api</html>')]), {
+          statusCode: 200,
+          headers: { 'content-type': 'text/html' },
+        })
+      }
+      return Object.assign(
+        Readable.from([
+          Buffer.from(
+            JSON.stringify({
+              object: 'list',
+              data: [
+                { id: 'gemini-4-neon-low', object: 'model', owned_by: 'google' },
+                { id: 'ag-claude-sonnet-4-6', object: 'model', owned_by: 'anthropic' },
+              ],
+            }),
+          ),
+        ]),
+        { statusCode: 200, headers: { 'content-type': 'application/json' } },
+      )
+    },
+  })
+  assert.deepEqual(fallbackUrls, ['https://kin.example.com/v1beta/models', 'https://kin.example.com/v1/models'])
+  assert.deepEqual(
+    fallbackRes.models.map((m) => m.name),
+    ['gemini-4-neon-low', 'ag-claude-sonnet-4-6'],
+  )
+})
+
+test('Gemini console probes native /v1beta generateContent with x-goog-api-key and falls back to /v1 on 405', async () => {
+  const nativeSeen = []
+  const nativeOk = await runAnthropicConsole({
+    input: {
+      protocol: 'gemini',
+      api_key: 'AIza-probe-key',
+      model: 'gemini-2.5-flash',
+      message: 'Hi',
+    },
+    forward: async (request) => {
+      nativeSeen.push(request)
+      return Object.assign(
+        Readable.from([
+          Buffer.from(
+            JSON.stringify({
+              candidates: [{ content: { role: 'model', parts: [{ text: 'pong-gemini' }] }, finishReason: 'STOP' }],
+            }),
+          ),
+        ]),
+        { statusCode: 200 },
+      )
+    },
+  })
+  assert.equal(nativeOk.ok, true)
+  assert.equal(nativeOk.protocol, 'gemini')
+  assert.equal(nativeOk.auth_scheme, 'x_goog_api_key')
+  assert.equal(nativeOk.text, 'pong-gemini')
+  assert.equal(
+    nativeSeen[0].url,
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+  )
+  assert.equal(nativeSeen[0].headers['x-goog-api-key'], 'AIza-probe-key')
+  assert.deepEqual(nativeSeen[0].body, {
+    contents: [{ role: 'user', parts: [{ text: 'Hi' }] }],
+    generationConfig: { maxOutputTokens: 256 },
+  })
+
+  // When /v1beta returns 405 from a split nginx, console retries /v1 native Gemini path.
+  const urls = []
+  const fallbackOk = await runAnthropicConsole({
+    input: {
+      protocol: 'gemini',
+      base_url: 'https://kin.example.com',
+      api_key: 'sk-vm-test-key',
+      model: 'gemini-4-neon-low',
+      message: 'Hi',
+    },
+    forward: async (request) => {
+      urls.push(request.url)
+      if (request.url.includes('/v1beta/')) {
+        return Object.assign(Readable.from([Buffer.from('<html>405 Not Allowed</html>')]), { statusCode: 405 })
+      }
+      return Object.assign(
+        Readable.from([
+          Buffer.from(
+            JSON.stringify({
+              candidates: [{ content: { role: 'model', parts: [{ text: 'v1-pong' }] }, finishReason: 'STOP' }],
+            }),
+          ),
+        ]),
+        { statusCode: 200 },
+      )
+    },
+  })
+  assert.equal(fallbackOk.ok, true)
+  assert.equal(fallbackOk.text, 'v1-pong')
+  assert.deepEqual(urls, [
+    'https://kin.example.com/v1beta/models/gemini-4-neon-low:generateContent',
+    'https://kin.example.com/v1/models/gemini-4-neon-low:generateContent',
+  ])
 })

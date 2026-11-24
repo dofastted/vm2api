@@ -319,7 +319,9 @@ export function KeyLimitsDialog({
               <p className='text-xs text-muted-foreground'>
                 {selectedChannel
                   ? selectedChannel.models?.length
-                    ? `已保存 ${selectedChannel.models.length} 个模型；此密钥只调用所选渠道。`
+                    ? selectedChannel.protocol === 'gemini'
+                      ? `已保存 ${selectedChannel.models.length} 个模型；默认走原生 Gemini（/v1beta 与 /v1），同时支持 OpenAI / Anthropic 多协议调用。`
+                      : `已保存 ${selectedChannel.models.length} 个模型；此密钥只调用所选渠道。`
                     : '此渠道尚未保存模型。请先到 API 页面获取模型。'
                   : channelsError
                     ? '无法加载 API 渠道。请重试。'
@@ -410,8 +412,9 @@ export function KeyLimitsDialog({
               </Field>
             ) : draft.group_type === 'gemini' ? (
               <p className='text-xs text-muted-foreground sm:col-span-2'>
-                仅用于 Gemini 宿主机账号，不使用 VM
-                或直连渠道。请求会在已授权且已拉取模型的账号之间调度。
+                仅用于 Gemini 宿主机账号，不使用 VM 或直连渠道。默认支持原生
+                Gemini（/v1beta 与 /v1），同时兼容 OpenAI Chat / Responses 与
+                Anthropic Messages 协议。
               </p>
             ) : draft.group_type === 'all' ? (
               <p className='text-xs text-muted-foreground sm:col-span-2'>

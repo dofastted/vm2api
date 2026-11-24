@@ -1,9 +1,11 @@
 export const CLAUDE_OFFICIAL_URL = 'https://api.anthropic.com'
 export const OPENAI_OFFICIAL_URL = 'https://api.openai.com'
+export const GEMINI_OFFICIAL_URL = 'https://generativelanguage.googleapis.com'
 
 export const API_ENDPOINT_PRESETS = [
   { kind: 'claude', label: 'Claude 官方', base_url: CLAUDE_OFFICIAL_URL, protocol: 'anthropic' },
   { kind: 'openai', label: 'OpenAI 官方', base_url: OPENAI_OFFICIAL_URL, protocol: 'openai' },
+  { kind: 'gemini', label: 'Gemini 官方', base_url: GEMINI_OFFICIAL_URL, protocol: 'gemini' },
   { kind: 'custom', label: '自定义', base_url: '', protocol: 'anthropic' },
 ]
 
@@ -11,7 +13,7 @@ export function trimBaseUrl(url) {
   return String(url || '')
     .trim()
     .replace(/\/+$/, '')
-    .replace(/\/v1$/i, '')
+    .replace(/\/(?:v1beta|v1)$/i, '')
 }
 
 export function normalizeKind(kind, baseUrl = '') {
@@ -20,21 +22,30 @@ export function normalizeKind(kind, baseUrl = '') {
     .toLowerCase()
   if (k === 'claude' || k === 'anthropic') return 'claude'
   if (k === 'openai') return 'openai'
+  if (k === 'gemini' || k === 'google') return 'gemini'
   const u = trimBaseUrl(baseUrl)
   if (u === CLAUDE_OFFICIAL_URL) return 'claude'
   if (u === OPENAI_OFFICIAL_URL) return 'openai'
+  if (u === GEMINI_OFFICIAL_URL) return 'gemini'
   return 'custom'
 }
 
 export function normalizeProtocol(protocol, kind) {
   if (kind === 'claude') return 'anthropic'
   if (kind === 'openai') return 'openai'
-  return String(protocol || '').toLowerCase() === 'openai' ? 'openai' : 'anthropic'
+  if (kind === 'gemini') return 'gemini'
+  const p = String(protocol || '')
+    .trim()
+    .toLowerCase()
+  if (p === 'openai') return 'openai'
+  if (p === 'gemini' || p === 'google') return 'gemini'
+  return 'anthropic'
 }
 
 export function resolvePreset(kind, input = {}) {
   const resolvedKind = normalizeKind(kind || input.kind, input.base_url)
-  const preset = API_ENDPOINT_PRESETS.find((p) => p.kind === resolvedKind) || API_ENDPOINT_PRESETS[2]
+  const preset =
+    API_ENDPOINT_PRESETS.find((p) => p.kind === resolvedKind) || API_ENDPOINT_PRESETS[API_ENDPOINT_PRESETS.length - 1]
   const protocol = normalizeProtocol(input.protocol, resolvedKind)
   const base_url = resolvedKind === 'custom' ? trimBaseUrl(input.base_url) : preset.base_url
   return {
@@ -50,6 +61,24 @@ export function modelsUrl(baseUrl, { afterId } = {}) {
   const url = `${base}/v1/models`
   if (afterId) return `${url}?after_id=${encodeURIComponent(afterId)}`
   return url
+}
+
+export function geminiModelsUrl(baseUrl, { pageToken, version = 'v1beta' } = {}) {
+  const base = trimBaseUrl(baseUrl)
+  const url = `${base}/${version}/models`
+  if (pageToken) return `${url}?pageToken=${encodeURIComponent(pageToken)}`
+  return url
+}
+
+export function geminiGenerateUrl(baseUrl, model, { stream = false, version = 'v1beta' } = {}) {
+  const base = trimBaseUrl(baseUrl)
+  const cleanModel = String(model || '')
+    .trim()
+    .replace(/^models\//i, '')
+  const encoded = encodeURIComponent(cleanModel)
+  return stream
+    ? `${base}/${version}/models/${encoded}:streamGenerateContent?alt=sse`
+    : `${base}/${version}/models/${encoded}:generateContent`
 }
 
 export function messagesUrl(baseUrl) {
@@ -76,6 +105,20 @@ export function upstreamAuthHeaders(protocol, apiKey, extra = {}) {
     .trim()
     .toLowerCase()
     .replace(/-/g, '_')
+  if (protocol === 'gemini') {
+    delete headers['x-api-key']
+    delete headers['x-goog-api-key']
+    delete headers.authorization
+    delete headers.Authorization
+    if (scheme === 'authorization_bearer' || scheme === 'bearer' || scheme === 'authorization') {
+      headers.authorization = `Bearer ${key}`
+    } else if (scheme === 'x_api_key' || scheme === 'apikey' || scheme === 'api_key') {
+      headers['x-api-key'] = key
+    } else {
+      headers['x-goog-api-key'] = key
+    }
+    return headers
+  }
   if (scheme === 'authorization_bearer' || scheme === 'bearer' || scheme === 'authorization') {
     delete headers['x-api-key']
     headers.authorization = `Bearer ${key}`
@@ -102,7 +145,17 @@ export function parseUpstreamModels(payload, protocol = 'anthropic') {
   const out = []
   const seen = new Set()
   for (const row of rows) {
-    const name = String((typeof row === 'string' ? row : row?.id || row?.name) || '').trim()
+    if (
+      protocol === 'gemini' &&
+      row &&
+      typeof row === 'object' &&
+      Array.isArray(row.supportedGenerationMethods) &&
+      !row.supportedGenerationMethods.some((m) => m === 'generateContent' || m === 'streamGenerateContent')
+    ) {
+      continue
+    }
+    const rawName = String((typeof row === 'string' ? row : row?.id || row?.name) || '').trim()
+    const name = protocol === 'gemini' ? rawName.replace(/^models\//i, '') : rawName
     if (!name) continue
     if (protocol === 'openai' && SKIP_OPENAI.test(name)) continue
     const key = name.toLowerCase()
@@ -111,7 +164,7 @@ export function parseUpstreamModels(payload, protocol = 'anthropic') {
     out.push({
       name,
       alias: name,
-      display_name: String(row?.display_name || row?.id || name),
+      display_name: String(row?.displayName || row?.display_name || row?.id || name),
     })
   }
   return out

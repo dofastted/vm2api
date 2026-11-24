@@ -24,9 +24,14 @@ export function redactSecrets(obj) {
 }
 
 function isGoogleGeminiApiPath(rawUrl) {
-  if (typeof rawUrl !== 'string' || !rawUrl.startsWith('/v1beta/models')) return false
+  if (typeof rawUrl !== 'string') return false
   const pathname = rawUrl.split('?', 1)[0]
-  return pathname === '/v1beta/models' || pathname.startsWith('/v1beta/models/')
+  return (
+    pathname === '/v1beta/models' ||
+    pathname.startsWith('/v1beta/models/') ||
+    pathname === '/v1/models' ||
+    pathname.startsWith('/v1/models/')
+  )
 }
 
 export function extractApiKey(req) {

@@ -35,11 +35,15 @@ import { createGeminiScheduler } from './lib/gemini/scheduler.mjs'
 import {
   createGeminiPublicHandler,
   createGeminiTerminal,
+  formatGoogleModelList,
   geminiKeyAllowsPath,
   geminiProxyFor,
+  googleModelEntry,
   callGeminiHost,
   isGeminiPublicPath,
   isGeminiSharedPath,
+  parseGeminiGeneratePath,
+  parseGeminiModelGetPath,
   warmGeminiEnvironments,
 } from './lib/gemini/routes.mjs'
 import {
@@ -1737,12 +1741,33 @@ const server = http.createServer(async (req, res) => {
       })
     }
 
-    if (req.method === 'GET' && (p === '/v1/models' || p === '/models' || p === '/v1beta/models')) {
+    const singleModelGet = req.method === 'GET' ? parseGeminiModelGetPath(p) : null
+    if (
+      req.method === 'GET' &&
+      (p === '/v1/models' || p === '/models' || p === '/v1beta/models' || Boolean(singleModelGet))
+    ) {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
-      if (p === '/v1beta/models' || groupType === 'gemini') return handleGeminiPublic(req, res)
       if (resolveInferenceBackend(req) === 'api') {
-        return json(res, 200, filterModelCatalogForKey(apiScheduler.catalog(apiScheduleScope(req, groupType)), req))
+        const filtered = filterModelCatalogForKey(apiScheduler.catalog(apiScheduleScope(req, groupType)), req)
+        if (singleModelGet) {
+          const want = singleModelGet.model.replace(/^models\//i, '').toLowerCase()
+          const hit = (filtered?.data || []).find((m) => String(m?.id || '').toLowerCase() === want)
+          if (!hit) {
+            return json(res, 404, {
+              error: {
+                type: 'not_found_error',
+                code: 'model_not_found',
+                message: `Model not found: ${singleModelGet.model}`,
+              },
+            })
+          }
+          return json(res, 200, singleModelGet.version === 'v1beta' ? googleModelEntry(hit) : hit)
+        }
+        return json(res, 200, p === '/v1beta/models' ? formatGoogleModelList(filtered?.data || []) : filtered)
+      }
+      if (p === '/v1beta/models' || singleModelGet?.version === 'v1beta' || groupType === 'gemini') {
+        return handleGeminiPublic(req, res)
       }
       const result = await fetchWorkerModels({ groupType })
       if (groupType === 'all') {
@@ -1756,7 +1781,22 @@ const server = http.createServer(async (req, res) => {
           }
         } catch {}
       }
-      return json(res, 200, filterModelCatalogForKey(result, req))
+      const filtered = filterModelCatalogForKey(result, req)
+      if (singleModelGet) {
+        const want = singleModelGet.model.replace(/^models\//i, '').toLowerCase()
+        const hit = (filtered?.data || []).find((m) => String(m?.id || '').toLowerCase() === want)
+        if (!hit) {
+          return json(res, 404, {
+            error: {
+              type: 'not_found_error',
+              code: 'model_not_found',
+              message: `Model not found: ${singleModelGet.model}`,
+            },
+          })
+        }
+        return json(res, 200, hit)
+      }
+      return json(res, 200, filtered)
     }
     if (req.method === 'POST' && p === '/admin/models/refresh') {
       if (!requireAuth(req, res)) return
@@ -1796,6 +1836,13 @@ const server = http.createServer(async (req, res) => {
 
     if (isGeminiPublicPath(p)) {
       if (!requireAuth(req, res)) return
+      const gemGen = req.method === 'POST' ? parseGeminiGeneratePath(p) : null
+      if (gemGen && resolveInferenceBackend(req) === 'api') {
+        return await handleProtocol(req, res, 'google.gemini', p, {
+          routeModel: gemGen.model,
+          routeStream: gemGen.stream,
+        })
+      }
       return handleGeminiPublic(req, res)
     }
     // A shared path only belongs to Gemini when the key does. Dispatching on

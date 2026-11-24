@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
 import { ApiEndpointsRepo } from '../db/repos/api-endpoints-repo.mjs'
 import {
+  geminiModelsUrl,
   mergeModelLists,
   modelsUrl,
   parseUpstreamModels,
@@ -10,7 +11,12 @@ import {
   upstreamAuthHeaders,
 } from '../pool/api-presets.mjs'
 import { forwardApi, readApiJson } from '../transport/api-kernel-client.mjs'
-import { AUTH_SCHEME_X_API_KEY, resolveAuthScheme } from '../oauth/auth-scheme.mjs'
+import {
+  AUTH_SCHEME_GOOG_API_KEY,
+  AUTH_SCHEME_X_API_KEY,
+  normalizeAuthScheme,
+  resolveAuthScheme,
+} from '../oauth/auth-scheme.mjs'
 
 function nowIso() {
   return new Date().toISOString()
@@ -58,6 +64,12 @@ function maskUpstreamKey(key) {
 function endpointAuthScheme(ep = {}, fallbackProtocol = '') {
   const protocol = resolvePreset(ep.kind, ep).protocol || fallbackProtocol
   if (protocol === 'openai') return 'authorization_bearer'
+  if (protocol === 'gemini') {
+    return (
+      normalizeAuthScheme(ep.auth_scheme || ep.headers?.auth_scheme || ep.headers?.anthropic_apikey_auth_scheme) ||
+      AUTH_SCHEME_GOOG_API_KEY
+    )
+  }
   return (
     resolveAuthScheme({
       mode: 'apikey',
@@ -285,20 +297,58 @@ export async function fetchUpstreamModels({
     throw Object.assign(new Error('base_url must be http(s)'), { code: 'invalid_base_url' })
   }
 
+  const authHeaders = {
+    accept: 'application/json',
+    ...upstreamAuthHeaders(preset.protocol, key, {
+      ...headers,
+      auth_scheme: auth_scheme || headers.auth_scheme || headers.anthropic_apikey_auth_scheme,
+    }),
+  }
+
   const models = []
+  if (preset.protocol === 'gemini') {
+    let pageToken = ''
+    let fallbackToV1 = false
+    for (let page = 0; page < 8; page++) {
+      const upstream = await forward({
+        cfg,
+        method: 'GET',
+        url: geminiModelsUrl(preset.base_url, { pageToken, version: 'v1beta' }),
+        headers: authHeaders,
+        body: '',
+        proxyUrl: proxy_url,
+        timeoutMs: 30_000,
+      })
+      const status = Number(upstream.statusCode) || 502
+      const payload = await readApiJson(upstream)
+      const isJsonObject = payload != null && typeof payload === 'object'
+      if (page === 0 && (!isJsonObject || status === 404 || status === 405)) {
+        fallbackToV1 = true
+        break
+      }
+      if (status >= 400) {
+        const message = payload?.error?.message || payload?.message || `upstream ${status}`
+        throw Object.assign(new Error(String(message).slice(0, 300)), {
+          code: 'fetch_models_failed',
+          status,
+        })
+      }
+      models.push(...parseUpstreamModels(payload, 'gemini'))
+      if (!payload?.nextPageToken) break
+      pageToken = String(payload.nextPageToken)
+    }
+    if (!fallbackToV1) {
+      return { kind: preset.kind, protocol: preset.protocol, base_url: preset.base_url, models }
+    }
+  }
+
   let afterId = ''
   for (let page = 0; page < 8; page++) {
     const upstream = await forward({
       cfg,
       method: 'GET',
       url: modelsUrl(preset.base_url, { afterId }),
-      headers: {
-        accept: 'application/json',
-        ...upstreamAuthHeaders(preset.protocol, key, {
-          ...headers,
-          auth_scheme: auth_scheme || headers.auth_scheme || headers.anthropic_apikey_auth_scheme,
-        }),
-      },
+      headers: authHeaders,
       body: '',
       proxyUrl: proxy_url,
       timeoutMs: 30_000,
@@ -310,6 +360,12 @@ export async function fetchUpstreamModels({
       throw Object.assign(new Error(String(message).slice(0, 300)), {
         code: 'fetch_models_failed',
         status,
+      })
+    }
+    if (payload == null || typeof payload !== 'object') {
+      throw Object.assign(new Error('上游 /v1/models 未返回有效的 JSON 模型列表'), {
+        code: 'fetch_models_failed',
+        status: 502,
       })
     }
     models.push(...parseUpstreamModels(payload, preset.protocol))
