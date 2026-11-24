@@ -20,7 +20,10 @@ export type WindowTiming = {
 
 /** 窗口起点 = 重置时间 − 窗口长度。只用已有的 reset 与 pct，不另取数据。 */
 export function windowTiming(w: WindowReadout, now: number): WindowTiming {
-  const span = WINDOW_SPAN_MS[w.key]
+  const span =
+    w.windowMinutes != null && w.windowMinutes > 0
+      ? w.windowMinutes * 60_000
+      : WINDOW_SPAN_MS[w.key]
   const resetMs = expiresAtToMs(w.reset) || null
   if (!span || !resetMs || resetMs <= now) {
     return {

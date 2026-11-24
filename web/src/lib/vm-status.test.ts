@@ -943,3 +943,17 @@ describe('vmFailedAt', () => {
     expect(vmFailedAt(vm)).toBe(Date.parse('2026-11-22T05:10:00.000Z'))
   })
 })
+
+describe('custom quota window restriction labels (#1744)', () => {
+  it('formats quota_24h_header as 24h 限制', () => {
+    const slot = {
+      id: 'vm-24h',
+      platform: 'openai',
+      has_token: true,
+      schedulable: true,
+      schedule_state: 'restricted',
+      restriction_reason: 'quota_24h_header',
+    } as Vm
+    expect(restrictionCopy(slot)).toContain('24h 限制')
+  })
+})

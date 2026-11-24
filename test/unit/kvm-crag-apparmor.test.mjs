@@ -418,3 +418,118 @@ unixTest('a failed reload removes the new runtime drop-in and does not restart',
   assert.equal(reloads(fx.calls()).length, 2)
   assert.equal(fx.calls().some(kernelRestart), false)
 })
+
+const workDropinPath = '/etc/systemd/system/kin-kernel.service.d/45-vm2api-crag-work.conf'
+
+unixTest('CRAG v2 mounts guest tmpfs over its work directory before the kernel restarts', (context) => {
+  const fx = fixture(context)
+  const result = successful(fx.run({ restart: true }))
+  assert.equal(result.work_dir, 'tmpfs')
+  const dropin = fx.read(workDropinPath)
+  assert.ok(dropin.startsWith(marker))
+  const line = dropin.split('\n').find((entry) => entry.startsWith('ExecStartPre='))
+  // "-+": runs as root despite User=kincli, and a failed mount never keeps the kernel down.
+  assert.match(line, /^ExecStartPre=-\+\/bin\/sh -c '/)
+  assert.match(line, /\[ ! -L \/run\/kin\/work \] && \{ mountpoint -q \/run\/kin\/work \|\| /)
+  assert.match(
+    line,
+    /mkdir -p \/run\/kin\/work && \[ ! -L \/run\/kin\/work \] && mount -t tmpfs -o mode=0700,uid=\$\(id -u kincli\),gid=\$\(id -g kincli\),size=256m,nosuid,nodev vm2api-crag-work \/run\/kin\/work/,
+  )
+  assert.doesNotMatch(line, /\bchown\b/)
+  const inner = line.replace(/^ExecStartPre=-\+\/bin\/sh -c '/, '').replace(/'$/, '')
+  const syntax = spawnSync('sh', ['-n', '-c', inner], { encoding: 'utf8' })
+  assert.equal(syntax.status, 0, syntax.stderr)
+  // Symlink at /run/kin/work must be refused before mountpoint/mkdir/mount run.
+  const target = fx.file('/symlink-target')
+  fs.mkdirSync(target, { recursive: true })
+  const workLink = fx.file('/run/kin/work')
+  fs.symlinkSync(target, workLink)
+  const stubLog = fx.file('/work-hook-calls.log')
+  const spy = `#!/bin/sh\necho "$0 $*" >> '${stubLog}'\nexit 0\n`
+  fx.write('/work-bin/mountpoint', spy, 0o755)
+  fx.write('/work-bin/mount', spy, 0o755)
+  const rewritten = inner.replaceAll('/run/kin/work', workLink)
+  const refused = spawnSync('sh', ['-c', rewritten], {
+    env: { ...process.env, PATH: `${fx.file('/work-bin')}:${process.env.PATH}` },
+    encoding: 'utf8',
+  })
+  assert.notEqual(refused.status, 0)
+  assert.equal(fx.exists('/work-hook-calls.log'), false)
+  // Non-symlink path creates /run/kin/work and sets ownership atomically via mount options.
+  fs.unlinkSync(workLink)
+  fx.write('/work-bin/mountpoint', '#!/bin/sh\nexit 1\n', 0o755)
+  fx.write(
+    '/work-bin/id',
+    '#!/bin/sh\n[ "$2" = "kincli" ] || exit 1\nif [ "$1" = "-u" ]; then echo 1001; elif [ "$1" = "-g" ]; then echo 1002; else exit 1; fi\n',
+    0o755,
+  )
+  const mounted = spawnSync('sh', ['-c', rewritten], {
+    env: { ...process.env, PATH: `${fx.file('/work-bin')}:${process.env.PATH}` },
+    encoding: 'utf8',
+  })
+  assert.equal(mounted.status, 0, mounted.stderr)
+  assert.equal(fs.statSync(workLink).isDirectory(), true)
+  assert.ok(
+    fx
+      .read('/work-hook-calls.log')
+      .includes(`mount -t tmpfs -o mode=0700,uid=1001,gid=1002,size=256m,nosuid,nodev vm2api-crag-work ${workLink}`),
+  )
+  assert.equal(fs.statSync(fx.file(workDropinPath)).mode & 0o777, 0o644)
+  const calls = fx.calls()
+  const lastReload = calls.findLastIndex((call) => call.command === 'systemctl' && call.args[0] === 'daemon-reload')
+  assert.ok(lastReload >= 0 && calls.findIndex(kernelRestart) > lastReload)
+})
+
+unixTest('repeated CRAG preparation keeps the work drop-in without another reload', (context) => {
+  const fx = fixture(context)
+  successful(fx.run())
+  const before = [fx.read(workDropinPath), fs.statSync(fx.file(workDropinPath)).mtimeMs]
+  fx.clearCalls()
+  const result = successful(fx.run())
+  assert.equal(result.work_dir, 'already-tmpfs')
+  assert.deepEqual([fx.read(workDropinPath), fs.statSync(fx.file(workDropinPath)).mtimeMs], before)
+  assert.equal(reloads(fx.calls()).length, 0)
+})
+
+unixTest('the work directory moves to tmpfs even when AppArmor needs no exception', (context) => {
+  const fx = fixture(context, { enabled: 'N' })
+  const result = successful(fx.run({ restart: true }))
+  assert.equal(result.reason, 'apparmor-disabled')
+  assert.equal(result.work_dir, 'tmpfs')
+  assert.equal(fx.exists(dropinPath), false)
+  assert.ok(fx.read(workDropinPath).startsWith(marker))
+})
+
+unixTest('switching away from CRAG v2 releases the managed work drop-in', (context) => {
+  const fx = fixture(context)
+  successful(fx.run())
+  fx.write('/run/kin/kernel.json', JSON.stringify({ dataplane: 'wrap' }))
+  fx.clearCalls()
+  const result = successful(fx.run({ restart: true }))
+  assert.equal(result.work_dir, 'released')
+  assert.equal(fx.exists(workDropinPath), false)
+  assert.ok(reloads(fx.calls()).length >= 1)
+  fx.clearCalls()
+  assert.equal(successful(fx.run()).work_dir, 'not-crag-v2')
+  assert.equal(reloads(fx.calls()).length, 0)
+})
+
+unixTest('administrator configuration at the work drop-in path is left in control', (context) => {
+  const fx = fixture(context)
+  const custom = '# Operator-owned configuration\n[Service]\n'
+  fx.write(workDropinPath, custom)
+  const result = successful(fx.run({ restart: true }))
+  assert.equal(result.work_dir, 'operator-managed')
+  assert.equal(fx.read(workDropinPath), custom)
+  fx.write('/run/kin/kernel.json', JSON.stringify({ dataplane: 'wrap' }))
+  assert.equal(successful(fx.run()).work_dir, 'operator-managed')
+  assert.equal(fx.read(workDropinPath), custom)
+})
+
+unixTest('a failed reload removes the new work drop-in and does not restart', (context) => {
+  const fx = fixture(context, { enabled: 'N' })
+  const result = fx.run({ restart: true, env: { FIXTURE_RELOAD_EXIT: '1' } })
+  assert.notEqual(result.status, 0)
+  assert.equal(fx.exists(workDropinPath), false)
+  assert.equal(fx.calls().some(kernelRestart), false)
+})

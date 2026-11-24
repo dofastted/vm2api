@@ -608,7 +608,7 @@ function QuotaWindows({
         w.key === 'fable'
           ? Number(vm.window_fable_cost) || 0
           : (period?.total_cost ??
-            (w.key === '5h' ? fallback.h5 : fallback.d7)),
+            (w.key === '5h' ? fallback.h5 : w.key === '7d' ? fallback.d7 : 0)),
       requests: period ? period.requests : null,
       tokens: period ? periodTokens(period) : null,
     }

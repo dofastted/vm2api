@@ -36,6 +36,20 @@ RUNTIME_DROPIN = (MARKER + '\n'
                   '[Service]\n'
                   'RuntimeDirectory=\n').encode()
 SLOT_ENV = '/run/kin-guest/slot.env'
+# CRAG v2 appends each session's tap.jsonl under /run/kin/work while the CLI keeps stat()ing it. /run/kin is the
+# host 9p share; on guest kernels whose v9fs getattr starts writeback of dirty pages (filemap_fdatawrite), a stat
+# that lands mid-writeback can wait on that folio forever. The CLI threads then sit in D state, the process never
+# finishes exiting and CRAG keeps the session slot busy, so every later request on the slot hangs until the
+# gateway times out. Keep the work directory on guest tmpfs so the hot tap files never go through 9p. "-+" runs the
+# mount as root and never blocks the kernel: if it fails, the kernel starts on the 9p directory as before.
+WORK_DROPIN_PATH = '/etc/systemd/system/kin-kernel.service.d/45-vm2api-crag-work.conf'
+WORK_DROPIN = (MARKER + '\n'
+               '# CRAG tap files stay on guest tmpfs: stat during 9p writeback can wedge a session.\n'
+               '[Service]\n'
+               "ExecStartPre=-+/bin/sh -c '[ ! -L /run/kin/work ] && { mountpoint -q /run/kin/work || "
+               "{ mkdir -p /run/kin/work && [ ! -L /run/kin/work ] && "
+               "mount -t tmpfs -o mode=0700,uid=$(id -u kincli),gid=$(id -g kincli),size=256m,nosuid,nodev "
+               "vm2api-crag-work /run/kin/work; }; }'\n").encode()
 
 
 def result(status, reason, profile=PROFILE_NAME):
@@ -152,6 +166,48 @@ def preserve_guest_runtime(root):
     return state
 
 
+def reload_or_restore(systemctl, path, previous):
+    try:
+        run([systemctl, 'daemon-reload'], 'systemd reload')
+    except Exception as error:
+        try:
+            restore(path, previous)
+            run([systemctl, 'daemon-reload'], 'systemd rollback reload')
+        except Exception as rollback_error:
+            raise RuntimeError(str(error) + '; rollback: ' + str(rollback_error)) from error
+        raise
+
+
+def isolate_work_dir(root):
+    """Mount guest tmpfs over the CRAG work directory before every kernel start (see WORK_DROPIN)."""
+    dropin = fixed_path(root, WORK_DROPIN_PATH)
+    try:
+        previous = snapshot(dropin)
+    except RuntimeError:
+        return {'work_dir': 'operator-managed'}
+    if previous is not None and previous[0] == WORK_DROPIN:
+        return {'work_dir': 'already-tmpfs'}
+    systemctl = command('systemctl')
+    atomic_write(dropin, WORK_DROPIN)
+    reload_or_restore(systemctl, dropin, previous)
+    return {'work_dir': 'tmpfs'}
+
+
+def release_work_dir(root):
+    """Leaving CRAG v2: drop the managed mount hook. An existing tmpfs stays until the guest reboots."""
+    dropin = fixed_path(root, WORK_DROPIN_PATH)
+    try:
+        previous = snapshot(dropin)
+    except RuntimeError:
+        return {'work_dir': 'operator-managed'}
+    if previous is None:
+        return {'work_dir': 'not-crag-v2'}
+    systemctl = command('systemctl')
+    dropin.unlink()
+    reload_or_restore(systemctl, dropin, previous)
+    return {'work_dir': 'released'}
+
+
 def remove_binding(dropin):
     previous = snapshot(dropin)
     if previous is None:
@@ -180,9 +236,10 @@ def prepare(root):
     if not isinstance(config, dict):
         raise RuntimeError('kernel configuration must be an object')
     if config.get('dataplane') != 'crag' or config.get('crag_kernel_version') != 'v2':
-        return remove_binding(dropin)
+        return {**remove_binding(dropin), **release_work_dir(root)}
     guest = preserve_guest_runtime(root)
-    return {**bind_profile(root, dropin), **guest}
+    profile = bind_profile(root, dropin)
+    return {**profile, **guest, **isolate_work_dir(root)}
 
 
 def bind_profile(root, dropin):

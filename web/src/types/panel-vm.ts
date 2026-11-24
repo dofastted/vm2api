@@ -351,8 +351,11 @@ export type Vm = {
   codex_usage?: {
     windows?: Array<{
       id?: string
+      label?: string
       used_percent?: number | null
       reset_at?: string | null
+      reset_after_seconds?: number | null
+      window_minutes?: number | null
     }>
     quota?: {
       utilization_5h?: number | null

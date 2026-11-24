@@ -7,6 +7,7 @@ import {
   extraFromCodexHeaders,
   codexQuotaPark,
   CODEX_DEFAULT_PARK_MS,
+  codexWindowIdFromMinutes,
 } from '../../src/lib/protocol/codex-usage.mjs'
 
 test('extra maps 5h/7d used percent without inversion', () => {
@@ -98,4 +99,101 @@ test('elapsed reset on a leftover 100% window is not parked', () => {
     now,
   )
   assert.equal(park.limited, false)
+})
+
+test('classifies 1440-minute window as 24h and ignores 0-minute records (#1744)', () => {
+  const view = buildCodexUsageView({
+    codex_primary_window_minutes: 1440,
+    codex_primary_used_percent: 1,
+    codex_secondary_window_minutes: 0,
+    codex_secondary_used_percent: 0,
+  })
+  assert.deepEqual(
+    view.windows.map(({ id, label, window_minutes, used_percent }) => ({ id, label, window_minutes, used_percent })),
+    [{ id: '24h', label: '24h', window_minutes: 1440, used_percent: 1 }],
+  )
+  assert.equal(view.limits.used_5h_percent, null)
+  assert.equal(view.limits.window_5h_minutes, null)
+  assert.equal(view.limits.used_7d_percent, null)
+  assert.equal(view.limits.window_7d_minutes, null)
+  assert.equal(view.quota.utilization_5h, null)
+  assert.equal(view.quota.utilization_7d, null)
+})
+
+test('ignores stale 5h/7d aliases next to explicit 24h and 0-minute raw windows', () => {
+  const view = buildCodexUsageView({
+    codex_primary_window_minutes: 1440,
+    codex_primary_used_percent: 1,
+    codex_secondary_window_minutes: 0,
+    codex_secondary_used_percent: 0,
+    codex_5h_window_minutes: 0,
+    codex_5h_used_percent: 0,
+    codex_7d_window_minutes: 1440,
+    codex_7d_used_percent: 1,
+  })
+  assert.deepEqual(
+    view.windows.map(({ id, window_minutes, used_percent }) => ({ id, window_minutes, used_percent })),
+    [{ id: '24h', window_minutes: 1440, used_percent: 1 }],
+  )
+  assert.equal(view.quota.utilization_5h, null)
+  assert.equal(view.quota.utilization_7d, null)
+})
+
+test('0-minute secondary alongside 7d leaves 5h unknown instead of 0%', () => {
+  const view = buildCodexUsageView({
+    codex_primary_window_minutes: 10080,
+    codex_primary_used_percent: 42,
+    codex_secondary_window_minutes: 0,
+    codex_secondary_used_percent: 0,
+  })
+  assert.deepEqual(
+    view.windows.map(({ id, window_minutes, used_percent }) => ({ id, window_minutes, used_percent })),
+    [
+      { id: '5h', window_minutes: null, used_percent: null },
+      { id: '7d', window_minutes: 10080, used_percent: 42 },
+    ],
+  )
+  assert.equal(view.quota.utilization_5h, null)
+  assert.equal(view.quota.utilization_7d, 0.42)
+})
+
+test('duration formatter covers standard, daily, multi-day, minute, and invalid windows', () => {
+  assert.equal(codexWindowIdFromMinutes(300), '5h')
+  assert.equal(codexWindowIdFromMinutes(1440), '24h')
+  assert.equal(codexWindowIdFromMinutes(10080), '7d')
+  assert.equal(codexWindowIdFromMinutes(60), '1h')
+  assert.equal(codexWindowIdFromMinutes(2880), '2d')
+  assert.equal(codexWindowIdFromMinutes(45), '45m')
+  assert.equal(codexWindowIdFromMinutes(0), null)
+  assert.equal(codexWindowIdFromMinutes(-10), null)
+  assert.equal(codexWindowIdFromMinutes(null), null)
+})
+
+test('codexQuotaPark enforces 100% cap on 24h windows and ignores 0-minute records', () => {
+  const now = Date.parse('2026-11-24T00:00:00.000Z')
+  const resetAt = new Date(now + 3600_000).toISOString()
+  const capped24h = codexQuotaPark(
+    {
+      codex_primary_window_minutes: 1440,
+      codex_primary_used_percent: 100,
+      codex_primary_reset_at: resetAt,
+      codex_secondary_window_minutes: 0,
+      codex_secondary_used_percent: 0,
+    },
+    now,
+  )
+  assert.equal(capped24h.limited, true)
+  assert.equal(capped24h.until, now + 3600_000)
+
+  const bogusZero = codexQuotaPark(
+    {
+      codex_primary_window_minutes: 1440,
+      codex_primary_used_percent: 1,
+      codex_secondary_window_minutes: 0,
+      codex_secondary_used_percent: 100,
+      codex_secondary_reset_at: resetAt,
+    },
+    now,
+  )
+  assert.equal(bogusZero.limited, false)
 })
