@@ -13,6 +13,8 @@
  * when the caller sends none).
  */
 
+import { stripIllegalControlChars } from '../protocol/gemini-convert.mjs'
+
 export const CRAGGEMINI_PERSONA_PRESETS = ['official_full', 'zero']
 export const CRAGGEMINI_SYSTEM_PROMPT_MAX = 32_768
 
@@ -55,7 +57,8 @@ function extractSystemText(systemInstruction) {
 export function applyCragGeminiPromptPolicy(body, policy = {}) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body
   const preset = normalizeCragGeminiPersonaPreset(policy?.preset)
-  const globalPrompt = typeof policy?.globalPrompt === 'string' ? policy.globalPrompt.trim() : ''
+  const globalPrompt =
+    typeof policy?.globalPrompt === 'string' ? stripIllegalControlChars(policy.globalPrompt).trim() : ''
   const out = { ...body }
 
   if (globalPrompt) {
