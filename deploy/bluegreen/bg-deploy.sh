@@ -252,13 +252,17 @@ added=$(comm -13 <(echo "$mig_old") <(echo "$mig_new"))
 if [[ -n $added ]]; then
   log "new image adds migrations: $(echo "$added" | tr '\n' ' ')"
   verdict=
+  guard_err=
   guard_rc=0
   if [[ $BG_ADDITIVE_MIGRATIONS == 1 ]]; then
-    # shellcheck disable=SC2086
+    mapfile -t added_args <<<"$added"
+    guard_err_file=$(mktemp)
     verdict=$(dc "$new" run --rm --no-deps -T -e BG_MIGRATION_GUARD_CLI=1 \
       -e BG_MIGRATION_INDEX_MAX_ROWS="$BG_MIGRATION_INDEX_MAX_ROWS" \
-      --entrypoint node "$BG_SERVICE" --no-warnings --input-type=module - $added \
-      <"$KIT_DIR/migration-guard.mjs" 2>/dev/null) || guard_rc=$?
+      --entrypoint node "$BG_SERVICE" --no-warnings --input-type=module - "${added_args[@]}" \
+      <"$KIT_DIR/migration-guard.mjs" 2>"$guard_err_file") || guard_rc=$?
+    guard_err=$(cat "$guard_err_file" 2>/dev/null || true)
+    rm -f "$guard_err_file"
   else
     guard_rc=3
     verdict='BG_ADDITIVE_MIGRATIONS=0'
@@ -267,6 +271,9 @@ if [[ -n $added ]]; then
     log "migrations are additive-only, continuing blue/green: $verdict"
   else
     log "migrations need a restart (guard exit $guard_rc): ${verdict:-no verdict}"
+    if [[ -n $guard_err ]]; then
+      log "migration guard stderr: $guard_err"
+    fi
     log "refusing blue/green; deploy this release with: $0 --restart"
     exit 2
   fi
