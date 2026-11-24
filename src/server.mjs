@@ -1388,6 +1388,7 @@ const handleGeminiPublic = createGeminiPublicHandler({
   scheduler: geminiScheduler,
   requestLog,
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
+  getRoutingConfig: () => routingConfig,
 })
 const handlePanel = createPanelHandler({
   getDb,

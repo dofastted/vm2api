@@ -401,12 +401,20 @@ def open_worker_stream(
         time.sleep(0.05)
     else:
         raise NativeFailure("gemini_native_bridge_timeout", 503)
+    wire_body = body_obj
+    system_prompt_mode = body_obj.get("system_prompt_mode")
+    if system_prompt_mode is not None:
+        if system_prompt_mode not in ("official_full", "zero"):
+            raise NativeFailure("gemini_inference_bad_input", 400)
+        wire_body = {k: v for k, v in body_obj.items() if k != "system_prompt_mode"}
     envelope = {
         "request_id": request_id,
         "stream": True,
-        "body": body_obj,
+        "body": wire_body,
     }
-    conv_id = body_obj.get("conversation_id") or body_obj.get("conversationId")
+    if system_prompt_mode == "zero":
+        envelope["system_prompt_mode"] = "zero"
+    conv_id = wire_body.get("conversation_id") or wire_body.get("conversationId")
     if isinstance(conv_id, str) and REQUEST_ID.fullmatch(conv_id):
         envelope["conversation_id"] = conv_id
     if isinstance(gateway_policy, dict) and gateway_policy:

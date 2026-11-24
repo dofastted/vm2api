@@ -15,6 +15,7 @@ import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
 import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
+import { applyCragGeminiPromptPolicy, resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
 const PUBLIC_PATH = '/v1/gemini/sessions'
@@ -1370,7 +1371,14 @@ function logProtocolName(protocol) {
   }
 }
 
-export function createGeminiPublicHandler({ json, readBody, scheduler, requestLog = null, groupsRepo = null }) {
+export function createGeminiPublicHandler({
+  json,
+  readBody,
+  scheduler,
+  requestLog = null,
+  groupsRepo = null,
+  getRoutingConfig = null,
+}) {
   return async function handleGeminiPublic(req, res, { logBag: externalLogBag = null } = {}) {
     res.setHeader('Cache-Control', 'no-store')
     const keyGroupType = req.apiKeyKind === 'managed' ? req.apiKeyRecord?.group_type || 'all' : null
@@ -1650,10 +1658,19 @@ export function createGeminiPublicHandler({ json, readBody, scheduler, requestLo
     }
 
     try {
+      const promptPolicy =
+        typeof getRoutingConfig === 'function' ? resolveCragGeminiPromptPolicy(getRoutingConfig()) : null
       const turn = await scheduler.stream({
         model: parsed.model,
-        targetBodyFor: (target, meta) =>
-          buildGeminiRequest(meta?.upstreamModel ? { ...parsed, model: meta.upstreamModel } : parsed, { target }),
+        targetBodyFor: (target, meta) => {
+          const reqBody = buildGeminiRequest(
+            meta?.upstreamModel ? { ...parsed, model: meta.upstreamModel } : parsed,
+            { target },
+          )
+          return target === 'antigravity' && promptPolicy
+            ? applyCragGeminiPromptPolicy(reqBody, promptPolicy)
+            : reqBody
+        },
         requiredCapabilities: parsed.requiredCapabilities,
         plainText: parsed.plainText,
         signal: controller.signal,

@@ -4240,6 +4240,7 @@ class Host:
             "stream",
             "systemInstruction",
             "system_instruction",
+            "system_prompt_mode",
             "tools",
             "toolConfig",
             "tool_config",
@@ -4251,6 +4252,9 @@ class Host:
             "conversationId",
         }
         if any(k not in allowed_top for k in body_obj):
+            return None
+        mode = body_obj.get("system_prompt_mode")
+        if mode is not None and mode not in ("official_full", "zero"):
             return None
         contents = body_obj.get("contents")
         if not isinstance(contents, list) or not contents:
