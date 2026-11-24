@@ -977,3 +977,651 @@ test('Gemini public handler strips safetySettings for CRAGGemini and captures de
   assert.equal(logEvents[0].outbound_body_source, 'craggemini')
   assert.equal('safetySettings' in (logEvents[0].outbound_body || {}), false)
 })
+
+test('CRAGGemini end-to-end 4-protocol parity, early-stop cancel, and tool-continuation sticky conversation_id', async () => {
+  const inferCalls = []
+  const cancelled = []
+  let activeTurn = 'parity'
+
+  const scheduler = createGeminiScheduler({
+    callHost: async (op, payload) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-a',
+              proxy_id: 'proxy-a',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-3-pro'],
+              capabilities: [...NATIVE_TUI_CAPABILITIES],
+            },
+            {
+              id: 'env-b',
+              proxy_id: 'proxy-b',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-3-pro'],
+              capabilities: [...NATIVE_TUI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get')
+        return { id: payload.id, proxy_id: payload.id === 'env-a' ? 'proxy-a' : 'proxy-b', auth_method: 'oauth' }
+      if (op === 'infer-cancel') {
+        cancelled.push(payload)
+        return { cancelled: true }
+      }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: async (_op, payload) => {
+      inferCalls.push({ id: payload.id, body: payload.body })
+      if (activeTurn === 'stop-cancel') {
+        return sseResponse([
+          `data: ${JSON.stringify({ candidates: [{ content: { role: 'model', parts: [{ text: 'alpha ###' }] } }] })}\n\n`,
+          `data: ${JSON.stringify({ candidates: [{ content: { role: 'model', parts: [{ text: 'TAIL_NEVER_SENT' }] }, finishReason: 'STOP' }] })}\n\n`,
+        ])
+      }
+      if (activeTurn === 'tool-turn-1') {
+        return sseResponse([
+          `data: ${JSON.stringify({
+            craggeminiMeta: {
+              conversation_id: 'conv_mcp_sticky_42',
+              native_conversation_id: 'native_42',
+              awaiting_tool_results: true,
+            },
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [
+                    {
+                      functionCall: {
+                        id: 'call_mcp_1',
+                        name: 'mcp__craggemini__get_weather',
+                        args: { city: 'Tokyo' },
+                      },
+                    },
+                  ],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 4, totalTokenCount: 14 },
+          })}\n\n`,
+        ])
+      }
+      return sseResponse([
+        `data: ${JSON.stringify({
+          candidates: [
+            {
+              content: { role: 'model', parts: [{ text: '```json\n{"city":"Tokyo","temp":22}\n```' }] },
+              finishReason: 'STOP',
+            },
+          ],
+          usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 6, totalTokenCount: 18 },
+        })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://1.2.3.4:1080',
+  })
+
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler,
+  })
+
+  // 1. All 4 protocols send minimal CRAGGemini payload (no non-image generationConfig) and unwrap responseFormat JSON cleanly.
+  const endpoints = [
+    [
+      'gemini',
+      '/v1beta/models/gemini-3-pro:generateContent',
+      {
+        contents: [{ role: 'user', parts: [{ text: 'Return Tokyo temp as JSON' }] }],
+        generationConfig: { temperature: 0.4, maxOutputTokens: 128, responseMimeType: 'application/json' },
+      },
+      (body) => body.candidates[0].content.parts[0].text,
+    ],
+    [
+      'openai-chat',
+      '/v1/chat/completions',
+      {
+        model: 'gemini-3-pro',
+        temperature: 0.4,
+        max_tokens: 128,
+        response_format: { type: 'json_object' },
+        messages: [{ role: 'user', content: 'Return Tokyo temp as JSON' }],
+      },
+      (body) => body.choices[0].message.content,
+    ],
+    [
+      'openai-responses',
+      '/v1/responses',
+      {
+        model: 'gemini-3-pro',
+        temperature: 0.4,
+        max_output_tokens: 128,
+        text: { format: { type: 'json_object' } },
+        input: 'Return Tokyo temp as JSON',
+      },
+      (body) => body.output[0].content[0].text,
+    ],
+    [
+      'anthropic',
+      '/v1/messages',
+      {
+        model: 'gemini-3-pro',
+        temperature: 0.4,
+        max_tokens: 128,
+        output_format: { type: 'json_object' },
+        messages: [{ role: 'user', content: 'Return Tokyo temp as JSON' }],
+      },
+      (body) => body.content[0].text,
+    ],
+  ]
+
+  for (const [proto, url, payload, extractText] of endpoints) {
+    const res = makeRes()
+    await handler(makeReq({ method: 'POST', url, body: payload }), res)
+    assert.equal(res.statusCode, 200, `[${proto}] HTTP 200`)
+    assert.equal(extractText(res.jsonBody()), '{"city":"Tokyo","temp":22}', `[${proto}] JSON fence unwrapped`)
+    const lastSent = inferCalls[inferCalls.length - 1].body
+    assert.equal('generationConfig' in lastSent, false, `[${proto}] non-image generationConfig stripped`)
+    assert.equal('safetySettings' in lastSent, false, `[${proto}] safetySettings stripped`)
+  }
+
+  // 2. Local stop sequence in streaming mode truncates output and triggers background infer-cancel on host.
+  activeTurn = 'stop-cancel'
+  const stopRes = makeRes()
+  await handler(
+    makeReq({
+      method: 'POST',
+      url: '/v1/messages',
+      body: {
+        model: 'gemini-3-pro',
+        stream: true,
+        max_tokens: 256,
+        stop_sequences: ['###'],
+        messages: [{ role: 'user', content: 'Write until ###' }],
+      },
+    }),
+    stopRes,
+  )
+  assert.equal(stopRes.statusCode, 200)
+  const stopSse = stopRes.chunks.join('')
+  assert.match(stopSse, /"text":"alpha "/)
+  assert.doesNotMatch(stopSse, /TAIL_NEVER_SENT/)
+  assert.match(stopSse, /"stop_reason":"stop_sequence"/)
+  assert.match(stopSse, /"stop_sequence":"###"/)
+  assert.equal(cancelled.length, 1, 'early stop must issue infer-cancel to release CRAGGemini slot')
+
+  // 3. Tool continuation pins turn 2 to the original CRAGGemini worker account and forwards conversation_id.
+  activeTurn = 'tool-turn-1'
+  const toolRes1 = makeRes()
+  await handler(
+    makeReq({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      body: {
+        model: 'gemini-3-pro',
+        messages: [{ role: 'user', content: 'Weather in Tokyo?' }],
+        tools: [
+          {
+            type: 'function',
+            function: { name: 'get_weather', parameters: { type: 'object', properties: { city: { type: 'string' } } } },
+          },
+        ],
+      },
+    }),
+    toolRes1,
+  )
+  assert.equal(toolRes1.statusCode, 200)
+  const turn1Account = inferCalls[inferCalls.length - 1].id
+  const turn1Call = toolRes1.jsonBody().choices[0].message.tool_calls[0]
+  assert.equal(turn1Call.function.name, 'get_weather', 'mcp__craggemini__ prefix stripped on egress')
+
+  activeTurn = 'parity'
+  const toolRes2 = makeRes()
+  await handler(
+    makeReq({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      body: {
+        model: 'gemini-3-pro',
+        messages: [
+          { role: 'user', content: 'Weather in Tokyo?' },
+          { role: 'assistant', content: null, tool_calls: [turn1Call] },
+          { role: 'tool', tool_call_id: turn1Call.id, content: '{"temp":22}' },
+        ],
+        tools: [
+          {
+            type: 'function',
+            function: { name: 'get_weather', parameters: { type: 'object', properties: { city: { type: 'string' } } } },
+          },
+        ],
+      },
+    }),
+    toolRes2,
+  )
+  assert.equal(toolRes2.statusCode, 200)
+  const turn2Infer = inferCalls[inferCalls.length - 1]
+  assert.equal(turn2Infer.id, turn1Account, 'tool continuation must stick to the suspended CRAGGemini account')
+  assert.equal(turn2Infer.body.conversation_id, 'conv_mcp_sticky_42', 'tool continuation must forward conversation_id')
+})
+
+test('CRAGGemini resume keeps conversation_id on same account and always remints on every account switch (failover, A->B->A, tool failover)', async () => {
+  let failAccounts = new Set()
+  let nowMs = 1_700_000_000_000
+  const calls = []
+
+  const scheduler = createGeminiScheduler({
+    now: () => nowMs,
+    quotaCooldownMs: 30_000,
+    callHost: async (op, payload) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-a',
+              proxy_id: 'proxy-a',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-3-pro'],
+              capabilities: [...NATIVE_TUI_CAPABILITIES],
+            },
+            {
+              id: 'env-b',
+              proxy_id: 'proxy-b',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-3-pro'],
+              capabilities: [...NATIVE_TUI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') {
+        return { id: payload.id, proxy_id: payload.id === 'env-a' ? 'proxy-a' : 'proxy-b', auth_method: 'oauth' }
+      }
+      if (op === 'infer-cancel') return { cancelled: true }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: async (_op, payload) => {
+      calls.push({
+        id: payload.id,
+        requestId: payload.request_id,
+        convId: payload.body?.conversation_id,
+        body: payload.body,
+      })
+      if (failAccounts.has(payload.id)) {
+        return sseResponse([JSON.stringify({ code: 'gemini_quota_exhausted', message: 'rate limited' })], {
+          statusCode: 429,
+          contentType: 'application/json',
+        })
+      }
+      const turnReply = `reply-${calls.length}-on-${payload.id}`
+      return sseResponse([
+        `data: ${JSON.stringify({
+          craggeminiMeta: {
+            conversation_id: payload.body?.conversation_id || '',
+            native_conversation_id: `native_${payload.id}_${payload.body?.conversation_id}`,
+            awaiting_tool_results: false,
+          },
+          candidates: [{ content: { role: 'model', parts: [{ text: turnReply }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 4, totalTokenCount: 14 },
+        })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://1.2.3.4:1080',
+  })
+
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler,
+  })
+
+  const callerConv = 'caller-fixed-conv-99'
+  const postChat = async (messages, extra = {}) => {
+    const res = makeRes()
+    await handler(
+      makeReq({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        body: {
+          model: 'gemini-3-pro',
+          conversation_id: callerConv,
+          messages,
+          ...extra,
+        },
+      }),
+      res,
+    )
+    assert.equal(res.statusCode, 200)
+    return res.jsonBody()
+  }
+
+  // Turn 1: lands on env-a, mints account-scoped outbound conversation_id C1 (!== caller raw ID).
+  const r1 = await postChat([{ role: 'user', content: 'Start project alpha' }])
+  const t1 = calls[calls.length - 1]
+  assert.equal(t1.id, 'env-a')
+  assert.match(t1.convId, /^gc_[a-f0-9]{24}$/)
+  assert.notEqual(t1.convId, callerConv)
+  const c1 = t1.convId
+
+  // Turn 2: same account resume on env-a MUST keep exact same outbound conversation_id C1.
+  const r2 = await postChat([
+    { role: 'user', content: 'Start project alpha' },
+    { role: 'assistant', content: r1.choices[0].message.content },
+    { role: 'user', content: 'Add step 2' },
+  ])
+  const t2 = calls[calls.length - 1]
+  assert.equal(t2.id, 'env-a')
+  assert.equal(t2.convId, c1, 'same-account resume must preserve outbound conversation_id')
+
+  // Turn 3: env-a hits 429 -> intra-request failover to env-b MUST mint a brand-new conversation_id C2 !== C1
+  // and deliver the full multi-turn history so env-b continues seamlessly.
+  failAccounts = new Set(['env-a'])
+  const callsBeforeT3 = calls.length
+  const r3 = await postChat([
+    { role: 'user', content: 'Start project alpha' },
+    { role: 'assistant', content: r1.choices[0].message.content },
+    { role: 'user', content: 'Add step 2' },
+    { role: 'assistant', content: r2.choices[0].message.content },
+    { role: 'user', content: 'Add step 3 after failover' },
+  ])
+  const t3Attempts = calls.slice(callsBeforeT3)
+  assert.equal(t3Attempts.length, 2, 'intra-request failover should try env-a then env-b')
+  assert.equal(t3Attempts[0].id, 'env-a')
+  assert.equal(t3Attempts[0].convId, c1)
+  assert.equal(t3Attempts[1].id, 'env-b')
+  const c2 = t3Attempts[1].convId
+  assert.match(c2, /^gc_[a-f0-9]{24}$/)
+  assert.notEqual(c2, c1, 'account switch env-a -> env-b must mint a new conversation_id')
+  assert.notEqual(c2, callerConv)
+  assert.equal(t3Attempts[1].body.contents.length, 5, 'failover target must receive full history for continuity')
+
+  // Turn 4: stays on env-b and resumes with C2.
+  const r4 = await postChat([
+    { role: 'user', content: 'Start project alpha' },
+    { role: 'assistant', content: r1.choices[0].message.content },
+    { role: 'user', content: 'Add step 2' },
+    { role: 'assistant', content: r2.choices[0].message.content },
+    { role: 'user', content: 'Add step 3 after failover' },
+    { role: 'assistant', content: r3.choices[0].message.content },
+    { role: 'user', content: 'Resume on env-b' },
+  ])
+  const t4 = calls[calls.length - 1]
+  assert.equal(t4.id, 'env-b')
+  assert.equal(t4.convId, c2, 'subsequent turn on env-b must reuse C2')
+
+  // Turn 5: advance clock so env-a exits cooldown, then env-b hits 429 -> switch BACK env-b -> env-a!
+  // MUST mint a 3rd brand-new conversation_id C3 !== C2 AND C3 !== C1!
+  nowMs += 60_000
+  failAccounts = new Set(['env-b'])
+  const callsBeforeT5 = calls.length
+  await postChat([
+    { role: 'user', content: 'Start project alpha' },
+    { role: 'assistant', content: r1.choices[0].message.content },
+    { role: 'user', content: 'Add step 2' },
+    { role: 'assistant', content: r2.choices[0].message.content },
+    { role: 'user', content: 'Add step 3 after failover' },
+    { role: 'assistant', content: r3.choices[0].message.content },
+    { role: 'user', content: 'Resume on env-b' },
+    { role: 'assistant', content: r4.choices[0].message.content },
+    { role: 'user', content: 'Return to env-a' },
+  ])
+  const t5Attempts = calls.slice(callsBeforeT5)
+  const t5Ok = t5Attempts[t5Attempts.length - 1]
+  assert.equal(t5Ok.id, 'env-a')
+  const c3 = t5Ok.convId
+  assert.match(c3, /^gc_[a-f0-9]{24}$/)
+  assert.notEqual(c3, c2, 'switch back env-b -> env-a must not reuse env-b conversation_id')
+  assert.notEqual(c3, c1, 'returning to previously used env-a must mint a fresh conversation_id (not stale C1)')
+  assert.equal(t5Ok.body.contents.length, 9)
+
+  // Stateless client (NO conversation_id / NO x-session-id header) keeps same account + C_stateless via fingerprint,
+  // and remints on switch. Advance clock so env-b exits Turn 5 quota cooldown before testing failover.
+  nowMs += 60_000
+  failAccounts = new Set()
+  const statelessTurn1 = makeRes()
+  await handler(
+    makeReq({
+      method: 'POST',
+      url: '/v1/messages',
+      body: {
+        model: 'gemini-3-pro',
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'Unique stateless thread seed 7788' }],
+      },
+    }),
+    statelessTurn1,
+  )
+  assert.equal(statelessTurn1.statusCode, 200)
+  const st1 = calls[calls.length - 1]
+  const statelessTurn2 = makeRes()
+  await handler(
+    makeReq({
+      method: 'POST',
+      url: '/v1/messages',
+      body: {
+        model: 'gemini-3-pro',
+        max_tokens: 128,
+        messages: [
+          { role: 'user', content: 'Unique stateless thread seed 7788' },
+          { role: 'assistant', content: statelessTurn1.jsonBody().content[0].text },
+          { role: 'user', content: 'Follow up without any session header' },
+        ],
+      },
+    }),
+    statelessTurn2,
+  )
+  assert.equal(statelessTurn2.statusCode, 200)
+  const st2 = calls[calls.length - 1]
+  assert.equal(st2.id, st1.id, 'stateless multi-turn should stick to same account via first-user fingerprint')
+  assert.equal(st2.convId, st1.convId, 'stateless same-account resume should keep outbound conversation_id')
+
+  // Failover stateless thread to the other account -> must remint conversation_id!
+  failAccounts = new Set([st1.id])
+  const statelessTurn3 = makeRes()
+  await handler(
+    makeReq({
+      method: 'POST',
+      url: '/v1/messages',
+      body: {
+        model: 'gemini-3-pro',
+        max_tokens: 128,
+        messages: [
+          { role: 'user', content: 'Unique stateless thread seed 7788' },
+          { role: 'assistant', content: statelessTurn1.jsonBody().content[0].text },
+          { role: 'user', content: 'Follow up without any session header' },
+          { role: 'assistant', content: statelessTurn2.jsonBody().content[0].text },
+          { role: 'user', content: 'Failover turn without session header' },
+        ],
+      },
+    }),
+    statelessTurn3,
+  )
+  assert.equal(statelessTurn3.statusCode, 200)
+  const st3 = calls[calls.length - 1]
+  assert.notEqual(st3.id, st1.id)
+  assert.notEqual(st3.convId, st1.convId, 'stateless failover must remint outbound conversation_id')
+})
+
+test('CRAGGemini suspended MCP tool continuation remints conversation_id and cleans stale binding on failover', async () => {
+  let failAccounts = new Set()
+  let turn1ToolPending = true
+  const calls = []
+
+  const scheduler = createGeminiScheduler({
+    quotaCooldownMs: 30_000,
+    callHost: async (op, payload) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-a',
+              proxy_id: 'proxy-a',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-3-pro'],
+              capabilities: [...NATIVE_TUI_CAPABILITIES],
+            },
+            {
+              id: 'env-b',
+              proxy_id: 'proxy-b',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-3-pro'],
+              capabilities: [...NATIVE_TUI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') {
+        return { id: payload.id, proxy_id: payload.id === 'env-a' ? 'proxy-a' : 'proxy-b', auth_method: 'oauth' }
+      }
+      if (op === 'infer-cancel') return { cancelled: true }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: async (_op, payload) => {
+      calls.push({ id: payload.id, convId: payload.body?.conversation_id, body: payload.body })
+      if (failAccounts.has(payload.id)) {
+        return sseResponse([JSON.stringify({ code: 'gemini_quota_exhausted', message: 'rate limited' })], {
+          statusCode: 429,
+          contentType: 'application/json',
+        })
+      }
+      if (turn1ToolPending) {
+        turn1ToolPending = false
+        return sseResponse([
+          `data: ${JSON.stringify({
+            craggeminiMeta: {
+              conversation_id: 'conv_mcp_orig_7',
+              native_conversation_id: 'native_env_a_7',
+              awaiting_tool_results: true,
+            },
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [
+                    {
+                      functionCall: {
+                        id: 'call_failover_1',
+                        name: 'mcp__craggemini__get_weather',
+                        args: { city: 'Shanghai' },
+                      },
+                    },
+                  ],
+                },
+                finishReason: 'STOP',
+              },
+            ],
+            usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+          })}\n\n`,
+        ])
+      }
+      return sseResponse([
+        `data: ${JSON.stringify({
+          craggeminiMeta: {
+            conversation_id: payload.body?.conversation_id || '',
+            native_conversation_id: `native_${payload.id}_${payload.body?.conversation_id}`,
+            awaiting_tool_results: false,
+          },
+          candidates: [
+            { content: { role: 'model', parts: [{ text: `tool-continued-on-${payload.id}` }] }, finishReason: 'STOP' },
+          ],
+          usageMetadata: { promptTokenCount: 15, candidatesTokenCount: 5, totalTokenCount: 20 },
+        })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://1.2.3.4:1080',
+  })
+
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler,
+  })
+
+  const weatherTools = [
+    {
+      type: 'function',
+      function: { name: 'get_weather', parameters: { type: 'object', properties: { city: { type: 'string' } } } },
+    },
+  ]
+  const send = async (messages) => {
+    const res = makeRes()
+    await handler(
+      makeReq({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        headers: { 'x-session-id': 'mcp-failover-session' },
+        body: { model: 'gemini-3-pro', messages, tools: weatherTools },
+      }),
+      res,
+    )
+    assert.equal(res.statusCode, 200)
+    return res.jsonBody()
+  }
+
+  // Turn 1: lands on env-a and suspends waiting for call_failover_1 under conv_mcp_orig_7.
+  const t1Res = await send([{ role: 'user', content: 'Weather in Shanghai?' }])
+  const callId = t1Res.choices[0].message.tool_calls[0].id
+  assert.equal(calls[0].id, 'env-a')
+
+  // Turn 2: env-a hits 429 on tool_result continuation -> fails over to env-b with brand-new conversation_id!
+  failAccounts = new Set(['env-a'])
+  const t2Res = await send([
+    { role: 'user', content: 'Weather in Shanghai?' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        { id: callId, type: 'function', function: { name: 'get_weather', arguments: '{"city":"Shanghai"}' } },
+      ],
+    },
+    { role: 'tool', tool_call_id: callId, content: '{"temp_c":24}' },
+  ])
+  assert.equal(calls.length, 3)
+  assert.equal(calls[1].id, 'env-a')
+  assert.equal(calls[1].convId, 'conv_mcp_orig_7', 'first attempt should target suspended env-a with original conv id')
+  assert.equal(calls[2].id, 'env-b')
+  const envBConvId = calls[2].convId
+  assert.match(envBConvId, /^gc_[a-f0-9]{24}$/)
+  assert.notEqual(envBConvId, 'conv_mcp_orig_7', 'failover account must never inherit suspended account conv id')
+  assert.notEqual(envBConvId, calls[0].convId)
+  assert.equal(calls[2].body.contents.length, 3, 'failover account must receive full tool history')
+
+  // Turn 3: follow-up turn after tool failover (carrying historical tool_result in messages) MUST stay on env-b
+  // with envBConvId and NOT bounce back to env-a!
+  failAccounts = new Set()
+  await send([
+    { role: 'user', content: 'Weather in Shanghai?' },
+    {
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        { id: callId, type: 'function', function: { name: 'get_weather', arguments: '{"city":"Shanghai"}' } },
+      ],
+    },
+    { role: 'tool', tool_call_id: callId, content: '{"temp_c":24}' },
+    { role: 'assistant', content: t2Res.choices[0].message.content },
+    { role: 'user', content: 'Should I wear a jacket?' },
+  ])
+  const t3Call = calls[calls.length - 1]
+  assert.equal(t3Call.id, 'env-b', 'follow-up turn after tool failover must stay sticky on env-b')
+  assert.equal(t3Call.convId, envBConvId, 'follow-up turn on env-b must resume envBConvId')
+})

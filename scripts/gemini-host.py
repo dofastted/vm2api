@@ -5862,7 +5862,10 @@ class Host:
             "thoughtSignature",
             "thought_signature",
         }
+        valid_aspect_ratios = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
+        valid_image_sizes = {"1K", "2K", "4K"}
         has_substantive_part = False
+        cleaned_contents = []
         for entry in contents:
             if not isinstance(entry, dict) or any(k not in ("role", "parts") for k in entry):
                 return None
@@ -5871,6 +5874,7 @@ class Host:
             parts = entry.get("parts")
             if not isinstance(parts, list) or not parts:
                 return None
+            cleaned_parts = []
             for part in parts:
                 if not isinstance(part, dict) or not part or any(k not in allowed_part_keys for k in part):
                     return None
@@ -5880,7 +5884,7 @@ class Host:
                         return None
                     if any(ord(ch) < 32 and ch not in ("\n", "\r", "\t") for ch in text):
                         return None
-                    if text.strip():
+                    if text.strip() and part.get("thought") is not True:
                         has_substantive_part = True
                 if any(
                     k in part
@@ -5896,20 +5900,128 @@ class Host:
                     )
                 ):
                     has_substantive_part = True
-        if not has_substantive_part:
+                # CRAGGemini SHM does not consume historical thought blocks.
+                if part.get("thought") is True:
+                    continue
+                fd = part.get("fileData") if isinstance(part.get("fileData"), dict) else part.get("file_data")
+                if isinstance(fd, dict):
+                    mime = fd.get("mimeType") or fd.get("mime_type") or "application/octet-stream"
+                    uri = fd.get("fileUri") or fd.get("file_uri") or ""
+                    ref = f"[Attached {mime}: {uri}]" if uri else f"[Attached {mime}]"
+                    cleaned_parts.append({"text": ref})
+                    continue
+                cleaned_part = {
+                    k: v
+                    for k, v in part.items()
+                    if not (
+                        k in ("thoughtSignature", "thought_signature")
+                        and v == "skip_thought_signature_validator"
+                    )
+                }
+                if cleaned_part:
+                    cleaned_parts.append(cleaned_part)
+            if cleaned_parts:
+                cleaned_entry = {"parts": cleaned_parts}
+                if entry.get("role") is not None:
+                    cleaned_entry["role"] = entry["role"]
+                cleaned_contents.append(cleaned_entry)
+        if not has_substantive_part or not cleaned_contents:
             return None
-        stripped_top = {
-            "stream",
-            "safetySettings",
-            "safety_settings",
-            "cachedContent",
-            "cached_content",
-            "conversationId",
-        }
-        forwarded = {k: v for k, v in body_obj.items() if k not in stripped_top}
-        if "conversation_id" not in forwarded and isinstance(body_obj.get("conversationId"), str):
-            forwarded["conversation_id"] = body_obj["conversationId"]
-        forwarded["model"] = model
+
+        forwarded = {"model": model, "contents": cleaned_contents}
+
+        sys_inst = body_obj.get("systemInstruction")
+        if sys_inst is None:
+            sys_inst = body_obj.get("system_instruction")
+        if sys_inst is not None:
+            forwarded["systemInstruction"] = sys_inst
+
+        if mode is not None:
+            forwarded["system_prompt_mode"] = mode
+
+        raw_tool_cfg = body_obj.get("toolConfig")
+        if raw_tool_cfg is None:
+            raw_tool_cfg = body_obj.get("tool_config")
+        fc_cfg = None
+        if isinstance(raw_tool_cfg, dict):
+            fc_cfg = raw_tool_cfg.get("functionCallingConfig")
+            if not isinstance(fc_cfg, dict):
+                fc_cfg = raw_tool_cfg.get("function_calling_config")
+        tool_mode_none = isinstance(fc_cfg, dict) and str(fc_cfg.get("mode", "")).upper() == "NONE"
+
+        if not tool_mode_none and isinstance(body_obj.get("tools"), list):
+            cleaned_tools = []
+            allowed_tool_keys = {
+                "functionDeclarations",
+                "function_declarations",
+                "googleSearch",
+                "google_search",
+                "urlContext",
+                "url_context",
+            }
+            for t in body_obj["tools"]:
+                if not isinstance(t, dict):
+                    continue
+                filtered = {k: v for k, v in t.items() if k in allowed_tool_keys}
+                if filtered:
+                    cleaned_tools.append(filtered)
+            if cleaned_tools:
+                forwarded["tools"] = cleaned_tools
+                if isinstance(raw_tool_cfg, dict) and raw_tool_cfg:
+                    forwarded["toolConfig"] = raw_tool_cfg
+
+        raw_gen = body_obj.get("generationConfig")
+        if raw_gen is None:
+            raw_gen = body_obj.get("generation_config")
+        if isinstance(raw_gen, dict):
+            cleaned_gen = {}
+            raw_mods = raw_gen.get("responseModalities")
+            if raw_mods is None:
+                raw_mods = raw_gen.get("response_modalities")
+            if isinstance(raw_mods, list):
+                mods = [
+                    str(m).upper()
+                    for m in raw_mods
+                    if isinstance(m, str) and m.upper() in ("TEXT", "IMAGE")
+                ]
+                if "IMAGE" in mods:
+                    cleaned_gen["responseModalities"] = mods
+            raw_img = raw_gen.get("imageConfig")
+            if raw_img is None:
+                raw_img = raw_gen.get("image_config")
+            if isinstance(raw_img, dict):
+                clean_img = {}
+                ratio = raw_img.get("aspectRatio")
+                if ratio is None:
+                    ratio = raw_img.get("aspect_ratio")
+                if isinstance(ratio, str) and ratio.strip() in valid_aspect_ratios:
+                    clean_img["aspectRatio"] = ratio.strip()
+                size = raw_img.get("imageSize")
+                if size is None:
+                    size = raw_img.get("image_size")
+                if isinstance(size, str) and size.strip().upper() in valid_image_sizes:
+                    clean_img["imageSize"] = size.strip().upper()
+                if clean_img:
+                    cleaned_gen["imageConfig"] = clean_img
+            cand_count = raw_gen.get("candidateCount")
+            if cand_count is None:
+                cand_count = raw_gen.get("candidate_count")
+            if (
+                ("responseModalities" in cleaned_gen or "imageConfig" in cleaned_gen)
+                and isinstance(cand_count, int)
+                and not isinstance(cand_count, bool)
+                and 1 <= cand_count <= 8
+            ):
+                cleaned_gen["candidateCount"] = cand_count
+            if cleaned_gen:
+                forwarded["generationConfig"] = cleaned_gen
+
+        conv_id = body_obj.get("conversation_id")
+        if not isinstance(conv_id, str) or not conv_id:
+            conv_id = body_obj.get("conversationId")
+        if isinstance(conv_id, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", conv_id):
+            forwarded["conversation_id"] = conv_id
+
         return forwarded
 
     @staticmethod

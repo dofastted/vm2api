@@ -77,6 +77,7 @@ const GEN_READ_OR_BUILT = new Set([
 
 const GOOGLE_SEARCH_TOOLS = new Set(['googleSearch', 'googleSearchRetrieval'])
 const CRAGGEMINI_GOOGLE_TOOLS = new Set(['googleSearch', 'googleSearchRetrieval', 'urlContext'])
+const CRAGGEMINI_VALID_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const CRAGGEMINI_IMAGE_ASPECT_RATIOS = new Set([
   '1:1',
   '2:3',
@@ -103,6 +104,261 @@ const GOOGLE_TOOL_NAMES = new Set([
   'computerUse',
   'retrieval',
 ])
+
+const BUILTIN_CLIENT_TOOL_SCHEMAS = Object.freeze({
+  local_shell: {
+    description: 'Execute a shell command on the local machine.',
+    schema: {
+      type: 'object',
+      properties: {
+        command: { type: 'array', items: { type: 'string' }, description: 'Command and arguments to execute.' },
+        timeout_ms: { type: 'integer', description: 'Optional execution timeout in milliseconds.' },
+        working_directory: { type: 'string', description: 'Working directory for the command.' },
+        env: { type: 'object', description: 'Optional environment variables.' },
+        user: { type: 'string', description: 'Optional user to execute as.' },
+      },
+      required: ['command'],
+    },
+  },
+  shell: {
+    description: 'Execute one or more shell commands in the client environment.',
+    schema: {
+      type: 'object',
+      properties: {
+        commands: { type: 'array', items: { type: 'string' }, description: 'Shell commands to execute.' },
+        timeout_ms: { type: 'integer', description: 'Optional timeout in milliseconds.' },
+        max_output_length: { type: 'integer', description: 'Maximum output length.' },
+      },
+      required: ['commands'],
+    },
+  },
+  apply_patch: {
+    description: 'Create, update, or delete a file using a patch operation.',
+    schema: {
+      type: 'object',
+      properties: {
+        type: { type: 'string', enum: ['create_file', 'delete_file', 'update_file'] },
+        path: { type: 'string', description: 'Target file path.' },
+        diff: { type: 'string', description: 'Patch diff or file content.' },
+      },
+      required: ['type', 'path'],
+    },
+  },
+  computer: {
+    description: 'Execute one or more GUI computer actions.',
+    schema: {
+      type: 'object',
+      properties: {
+        actions: {
+          type: 'array',
+          items: { type: 'object' },
+          description: 'Sequence of computer actions to perform.',
+        },
+      },
+      required: ['actions'],
+    },
+  },
+  computer_preview: {
+    description: 'Execute a single GUI computer action.',
+    schema: {
+      type: 'object',
+      properties: {
+        type: {
+          type: 'string',
+          description: 'Action type (click, double_click, type, keypress, scroll, screenshot, wait, move, drag).',
+        },
+        x: { type: 'integer' },
+        y: { type: 'integer' },
+        button: { type: 'string' },
+        text: { type: 'string' },
+        keys: { type: 'array', items: { type: 'string' } },
+        scroll_x: { type: 'integer' },
+        scroll_y: { type: 'integer' },
+        ms: { type: 'integer' },
+      },
+      required: ['type'],
+    },
+  },
+  tool_search: {
+    description: 'Search and dynamically load client-side tools.',
+    schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search query for tools.' },
+      },
+    },
+  },
+  anthropic_bash: {
+    description: 'Run commands in a bash shell.',
+    schema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'The bash command to run.' },
+        restart: { type: 'boolean', description: 'Restart the bash session.' },
+      },
+    },
+  },
+  anthropic_text_editor: {
+    description: 'View, create, and edit files.',
+    schema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', enum: ['view', 'create', 'str_replace', 'insert', 'undo_edit'] },
+        path: { type: 'string' },
+        file_text: { type: 'string' },
+        old_str: { type: 'string' },
+        new_str: { type: 'string' },
+        insert_line: { type: 'integer' },
+        view_range: { type: 'array', items: { type: 'integer' } },
+      },
+      required: ['command', 'path'],
+    },
+  },
+  anthropic_memory: {
+    description: 'Read and manage persistent memory files.',
+    schema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', enum: ['view', 'create', 'str_replace', 'insert', 'delete', 'rename'] },
+        path: { type: 'string' },
+        file_text: { type: 'string' },
+        old_str: { type: 'string' },
+        new_str: { type: 'string' },
+        insert_line: { type: 'integer' },
+        new_path: { type: 'string' },
+        view_range: { type: 'array', items: { type: 'integer' } },
+      },
+      required: ['command'],
+    },
+  },
+  anthropic_computer: {
+    description: 'Interact with a computer screen using mouse and keyboard actions.',
+    schema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string' },
+        coordinate: { type: 'array', items: { type: 'integer' } },
+        start_coordinate: { type: 'array', items: { type: 'integer' } },
+        text: { type: 'string' },
+        key: { type: 'string' },
+        duration: { type: 'number' },
+        scroll_direction: { type: 'string' },
+        scroll_amount: { type: 'integer' },
+      },
+      required: ['action'],
+    },
+  },
+})
+
+function customToolSchema(format) {
+  let desc = 'Raw input text for this custom tool.'
+  if (isPlainObject(format)) {
+    const syntax = typeof format.syntax === 'string' ? format.syntax.trim() : ''
+    const definition = typeof format.definition === 'string' ? format.definition.trim() : ''
+    if (syntax || definition) {
+      desc = `Input must follow ${syntax || format.type || 'custom'} format${definition ? `:\n${definition}` : '.'}`
+    }
+  }
+  return {
+    type: 'object',
+    properties: { input: { type: 'string', description: desc } },
+    required: ['input'],
+  }
+}
+
+function normalizeUserLocation(loc) {
+  if (!isPlainObject(loc)) return ''
+  const src = isPlainObject(loc.approximate) ? loc.approximate : loc
+  const parts = [src.city, src.region, src.country].map((v) => (typeof v === 'string' ? v.trim() : '')).filter(Boolean)
+  const tz = typeof src.timezone === 'string' ? src.timezone.trim() : ''
+  if (!parts.length && !tz) return ''
+  let out = parts.join(', ')
+  if (tz) out = out ? `${out}; time zone ${tz}` : `time zone ${tz}`
+  return out
+}
+
+function mergeSearchOptions(target, raw) {
+  if (!isPlainObject(raw)) return target
+  const out = target ? { ...target } : {}
+  const size = typeof raw.search_context_size === 'string' ? raw.search_context_size.trim().toLowerCase() : ''
+  if (size) {
+    if (!['low', 'medium', 'high'].includes(size)) {
+      throw makeProtocolError(400, 'gemini_invalid_request', `Unsupported search_context_size: ${size}`)
+    }
+    out.contextSize = size
+  }
+  const loc = normalizeUserLocation(raw.user_location)
+  if (loc) out.location = loc
+  const allowedRaw = Array.isArray(raw.filters?.allowed_domains)
+    ? raw.filters.allowed_domains
+    : Array.isArray(raw.allowed_domains)
+      ? raw.allowed_domains
+      : []
+  if (allowedRaw.length) {
+    const merged = new Set(out.allowedDomains || [])
+    for (const d of allowedRaw) {
+      const clean = typeof d === 'string' ? d.trim().toLowerCase() : ''
+      if (clean) merged.add(clean)
+    }
+    if (merged.size) out.allowedDomains = [...merged]
+  }
+  const blockedRaw = Array.isArray(raw.blocked_domains) ? raw.blocked_domains : []
+  if (blockedRaw.length) {
+    const merged = new Set(out.blockedDomains || [])
+    for (const d of blockedRaw) {
+      const clean = typeof d === 'string' ? d.trim().toLowerCase() : ''
+      if (clean) merged.add(clean)
+    }
+    if (merged.size) out.blockedDomains = [...merged]
+  }
+  return Object.keys(out).length ? out : target
+}
+
+function sanitizeConversationId(raw) {
+  if (typeof raw !== 'string') return null
+  const trimmed = raw.trim()
+  return trimmed && CRAGGEMINI_VALID_ID_RE.test(trimmed) ? trimmed : null
+}
+
+function domainMatchesList(urlOrHost, domains) {
+  if (!domains?.length) return false
+  let host = ''
+  try {
+    host = new URL(urlOrHost).hostname.toLowerCase()
+  } catch {
+    host = String(urlOrHost || '')
+      .trim()
+      .toLowerCase()
+  }
+  if (!host) return false
+  return domains.some((raw) => {
+    const domain = raw
+      .replace(/^https?:\/\//, '')
+      .replace(/\/.*$/, '')
+      .replace(/^\*\./, '')
+    return domain && (host === domain || host.endsWith(`.${domain}`))
+  })
+}
+
+function imageConfigFromOpenAISizeQuality(size, quality) {
+  const cfg = {}
+  if (typeof size === 'string') {
+    const s = size.trim().toLowerCase()
+    if (s === '1024x1024' || s === '512x512' || s === '1:1') cfg.aspectRatio = '1:1'
+    else if (s === '1536x1024' || s === '3:2') cfg.aspectRatio = '3:2'
+    else if (s === '1024x1536' || s === '2:3') cfg.aspectRatio = '2:3'
+    else if (s === '1792x1024' || s === '16:9') cfg.aspectRatio = '16:9'
+    else if (s === '1024x1792' || s === '9:16') cfg.aspectRatio = '9:16'
+    else if (CRAGGEMINI_IMAGE_ASPECT_RATIOS.has(size.trim())) cfg.aspectRatio = size.trim()
+  }
+  if (typeof quality === 'string') {
+    const q = quality.trim().toLowerCase()
+    if (q === 'low' || q === '1k') cfg.imageSize = '1K'
+    else if (q === 'medium' || q === 'standard' || q === '2k') cfg.imageSize = '2K'
+    else if (q === 'high' || q === 'hd' || q === '4k') cfg.imageSize = '4K'
+  }
+  return Object.keys(cfg).length ? cfg : null
+}
 
 const SCHEMA_MAPS = new Set(['properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas'])
 const SCHEMA_ONE = new Set(['items', 'contains', 'propertyNames', 'not', 'if', 'then', 'else', 'contentSchema'])
@@ -179,6 +435,9 @@ export function geminiFuncName(name) {
 
 export function geminiToolNameFromCall(name) {
   let s = String(name || '')
+  if (s.startsWith('mcp__craggemini__') && s.length > 'mcp__craggemini__'.length) {
+    s = s.slice('mcp__craggemini__'.length)
+  }
   for (const sep of [':', '.']) {
     const prefix = `${GEMINI_NS}${sep}`
     if (s.startsWith(prefix) && s.length > prefix.length) {
@@ -188,6 +447,82 @@ export function geminiToolNameFromCall(name) {
   }
   if (s.startsWith(NAME_LEAD)) s = s.slice(NAME_LEAD.length)
   return s
+}
+
+function makeWireToolName(rawName, usedNames) {
+  const base = geminiFuncName(rawName)
+  let safe = base.replace(/[^A-Za-z0-9_-]/g, '_')
+  if (!safe || /^[0-9-]/.test(safe)) safe = `${NAME_LEAD}${safe || 'tool'}`
+  if (safe.length > 64) {
+    const hash = crypto
+      .createHash('sha256')
+      .update(String(rawName || ''))
+      .digest('hex')
+      .slice(0, 8)
+    safe = `${safe.slice(0, 55)}_${hash}`
+  }
+  if (!usedNames.has(safe)) {
+    usedNames.add(safe)
+    return safe
+  }
+  const hash = crypto
+    .createHash('sha256')
+    .update(String(rawName || ''))
+    .digest('hex')
+    .slice(0, 8)
+  let candidate = `${safe.slice(0, 55)}_${hash}`
+  let n = 1
+  while (usedNames.has(candidate)) {
+    candidate = `${safe.slice(0, 52)}_${hash}_${n++}`
+  }
+  usedNames.add(candidate)
+  return candidate
+}
+
+function formatSearchOptionsDirectives(searchOptions) {
+  if (!isPlainObject(searchOptions)) return []
+  const lines = []
+  if (searchOptions.contextSize) {
+    lines.push(`Use ${searchOptions.contextSize} search context depth.`)
+  }
+  if (searchOptions.location) {
+    lines.push(
+      `The user's approximate location is ${searchOptions.location}. Use it for location-dependent questions and searches.`,
+    )
+  }
+  if (Array.isArray(searchOptions.allowedDomains) && searchOptions.allowedDomains.length) {
+    lines.push(`Restrict web searches to these domains using site: queries: ${searchOptions.allowedDomains.join(', ')}`)
+  }
+  if (Array.isArray(searchOptions.blockedDomains) && searchOptions.blockedDomains.length) {
+    lines.push(
+      `Exclude these domains from web searches using -site: queries: ${searchOptions.blockedDomains.join(', ')}`,
+    )
+  }
+  return lines
+}
+
+function formatResponseFormatDirective(responseFormat) {
+  if (!isPlainObject(responseFormat)) return ''
+  if (responseFormat.type === 'json_object') {
+    return 'Respond with a single JSON value only, without Markdown code fences or any other text.'
+  }
+  if (responseFormat.type === 'json_schema' && responseFormat.schema) {
+    const desc = responseFormat.description ? `${responseFormat.description}\n` : ''
+    return `Respond with a single JSON value that conforms to this JSON Schema, without Markdown code fences or any other text:\n${desc}${JSON.stringify(responseFormat.schema)}`
+  }
+  if (responseFormat.type === 'enum' && Array.isArray(responseFormat.values) && responseFormat.values.length) {
+    return `Respond with exactly one of the following values, without quotes, Markdown code fences or any other text:\n${responseFormat.values.join('\n')}`
+  }
+  return ''
+}
+
+function unwrapCustomInput(args) {
+  if (isPlainObject(args)) {
+    if (typeof args.input === 'string') return args.input
+    if (args.input != null) return JSON.stringify(args.input)
+  }
+  if (typeof args === 'string') return args
+  return JSON.stringify(args ?? {})
 }
 
 /** Encode a Gemini thoughtSignature into a tool call ID for non-Gemini clients. */
@@ -818,15 +1153,32 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
     throw makeProtocolError(400, 'gemini_invalid_request', 'Gemini contents must be a non-empty array.')
   }
   const stream = typeof routeStream === 'boolean' ? routeStream : body.stream === true
-  const system = extractGeminiSystemText(body.systemInstruction)
+  const systemParts = []
+  const initialSystem = extractGeminiSystemText(body.systemInstruction)
+  if (initialSystem) systemParts.push(initialSystem)
   const messages = []
   const lastByName = new Map()
   const openByName = new Map()
+  let inLeadingSystem = true
 
   for (const content of body.contents) {
     if (!isPlainObject(content) || !Array.isArray(content.parts)) {
       throw makeProtocolError(400, 'gemini_invalid_request', 'Each Gemini content entry must have a parts array.')
     }
+    if (content.role === 'system' || content.role === 'developer') {
+      const sysText = extractGeminiSystemText(content.parts)
+      if (sysText.trim()) {
+        if (inLeadingSystem) systemParts.push(sysText)
+        else {
+          messages.push({
+            role: 'user',
+            parts: [{ kind: 'text', text: `<system-reminder>\n${sysText.trim()}\n</system-reminder>`, signature: '' }],
+          })
+        }
+      }
+      continue
+    }
+    inLeadingSystem = false
     const baseRole = content.role === 'model' || content.role === 'assistant' ? 'assistant' : 'user'
     let msg = { role: baseRole, parts: [] }
     const switchRole = (role) => {
@@ -982,6 +1334,7 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
   }
 
   let toolChoice = ''
+  let strictValidation = false
   if (fcConfig) {
     const mode = String(fcConfig.mode || 'AUTO').toUpperCase()
     if (mode === 'NONE') toolChoice = 'none'
@@ -996,6 +1349,9 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
       } else {
         toolChoice = 'required'
       }
+    } else if (mode === 'VALIDATED') {
+      strictValidation = true
+      toolChoice = 'auto'
     } else {
       toolChoice = 'auto'
     }
@@ -1005,8 +1361,22 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
   const generationConfig = {}
   const extraGenConfig = {}
   let thinking = null
+  let hideThinking = false
   let responseFormat = null
   if (gc) {
+    if (gc.speechConfig != null) {
+      throw makeProtocolError(400, 'gemini_invalid_request', 'Audio output (speechConfig) is not supported.')
+    }
+    if (Array.isArray(gc.responseModalities) && gc.responseModalities.length) {
+      const mods = gc.responseModalities.map((m) => String(m || '').toUpperCase()).filter(Boolean)
+      if (mods.includes('AUDIO')) {
+        throw makeProtocolError(400, 'gemini_invalid_request', 'Audio output modality is not supported.')
+      }
+      generationConfig.responseModalities = mods
+    }
+    if (Number.isInteger(gc.candidateCount) && gc.candidateCount > 0) {
+      generationConfig.candidateCount = gc.candidateCount
+    }
     if (Number.isInteger(gc.maxOutputTokens) && gc.maxOutputTokens > 0) {
       generationConfig.maxOutputTokens = gc.maxOutputTokens
     }
@@ -1029,6 +1399,9 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
         : typeof tc.thinkingBudget === 'number'
           ? effortFromBudget(tc.thinkingBudget)
           : ''
+      if (tc.includeThoughts === false || effort === 'none' || tc.thinkingBudget === 0) {
+        hideThinking = true
+      }
       thinking = {
         enabled: effort !== 'none' && (Boolean(effort) || tc.includeThoughts === true),
         disabled: effort === 'none' || tc.thinkingBudget === 0,
@@ -1040,30 +1413,50 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
     if (typeof gc.responseMimeType === 'string' && gc.responseMimeType.startsWith('application/json')) {
       const schema = gc.responseJsonSchema || (gc.responseSchema ? lowerOpenApiTypes(gc.responseSchema) : null)
       responseFormat = schema ? { type: 'json_schema', schema } : { type: 'json_object' }
+    } else if (gc.responseMimeType === 'text/x.enum') {
+      const schema = gc.responseJsonSchema || (gc.responseSchema ? lowerOpenApiTypes(gc.responseSchema) : null)
+      const values = Array.isArray(schema?.enum) ? schema.enum.filter((v) => typeof v === 'string') : []
+      if (!values.length) {
+        throw makeProtocolError(
+          400,
+          'gemini_invalid_request',
+          'text/x.enum requires string enum values in responseSchema.',
+        )
+      }
+      responseFormat = { type: 'enum', values }
     }
     if (isPlainObject(gc.imageConfig)) {
       generationConfig.imageConfig = gc.imageConfig
     }
     for (const [k, v] of Object.entries(gc)) {
-      if (!GEN_READ_OR_BUILT.has(k) && v != null) extraGenConfig[k] = v
+      if (!GEN_READ_OR_BUILT.has(k) && k !== 'responseModalities' && v != null) extraGenConfig[k] = v
     }
   }
 
   return {
+    protocol: 'gemini',
     model,
     stream,
-    system,
+    system: systemParts.join('\n\n'),
     messages,
     tools,
     toolChoice,
+    allowedToolNames: allowedNames ? [...allowedNames] : null,
+    disableParallelTools: false,
+    legacyFunctions: false,
+    strictValidation,
     webSearch,
+    searchOptions: null,
     googleTools,
     generationConfig,
     extraGenConfig,
     thinking,
+    hideThinking,
+    thinkingDisplay: null,
     responseFormat,
     safetySettings: Array.isArray(body.safetySettings) ? body.safetySettings : null,
     cachedContent: typeof body.cachedContent === 'string' ? body.cachedContent : null,
+    conversationId: sanitizeConversationId(body.conversationId ?? body.conversation_id),
   }
 }
 
@@ -1076,12 +1469,19 @@ function parseOpenAIChatInbound(body, { headers }) {
   if (body.n != null && body.n !== 1) {
     throw makeProtocolError(400, 'gemini_invalid_request', 'n > 1 is not supported.')
   }
+  if (
+    body.audio != null ||
+    (Array.isArray(body.modalities) && body.modalities.some((m) => String(m || '').toLowerCase() === 'audio'))
+  ) {
+    throw makeProtocolError(400, 'gemini_invalid_request', 'Audio output is not supported.')
+  }
   if (!Array.isArray(body.messages) || !body.messages.length) {
     throw makeProtocolError(400, 'gemini_invalid_request', 'messages must be a non-empty array.')
   }
   const stream = isClientStream(body, headers)
   const systemParts = []
   const messages = []
+  let inLeadingSystem = true
 
   const extractParts = (content) => {
     if (content == null) return []
@@ -1100,11 +1500,22 @@ function parseOpenAIChatInbound(body, { headers }) {
           throw makeProtocolError(400, 'gemini_invalid_request', 'text content part requires a string text field.')
         }
         out.push({ kind: 'text', text: part.text, signature: '' })
+      } else if (part.type === 'refusal' && typeof part.refusal === 'string') {
+        if (part.refusal) out.push({ kind: 'text', text: part.refusal, signature: '' })
       } else if (part.type === 'image_url' || part.type === 'input_image') {
         const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url || part.url
         const media = mediaPartFromUrl(url, 'image/png')
         if (!media) throw makeProtocolError(400, 'gemini_invalid_request', 'image_url must include a valid URL.')
         out.push(media)
+      } else if (part.type === 'input_audio' && isPlainObject(part.input_audio)) {
+        const data = typeof part.input_audio.data === 'string' ? part.input_audio.data.trim() : ''
+        const fmt = String(part.input_audio.format || 'wav')
+          .trim()
+          .toLowerCase()
+          .replace(/^audio\//, '')
+        if (!data) throw makeProtocolError(400, 'gemini_invalid_request', 'input_audio requires data.')
+        const mime = fmt === 'mp3' || fmt === 'mpeg' ? 'audio/mpeg' : `audio/${fmt || 'wav'}`
+        out.push({ kind: 'file', mediaType: mime, data })
       } else if (part.type === 'file' && isPlainObject(part.file)) {
         const fileData = part.file.file_data || part.file.data
         const media = mediaPartFromUrl(fileData, part.file.media_type || 'application/pdf')
@@ -1126,14 +1537,54 @@ function parseOpenAIChatInbound(body, { headers }) {
         .filter((p) => p.kind === 'text')
         .map((p) => p.text)
         .join('\n')
-      if (text) systemParts.push(text)
+      if (text.trim()) {
+        if (inLeadingSystem) {
+          systemParts.push(text)
+        } else {
+          messages.push({
+            role: 'user',
+            parts: [{ kind: 'text', text: `<system-reminder>\n${text.trim()}\n</system-reminder>`, signature: '' }],
+          })
+        }
+      }
     } else if (raw.role === 'user') {
+      inLeadingSystem = false
       const parts = extractParts(raw.content)
       if (parts.length) messages.push({ role: 'user', parts })
     } else if (raw.role === 'assistant') {
+      inLeadingSystem = false
       const parts = extractParts(raw.content)
+      if (typeof raw.refusal === 'string' && raw.refusal) {
+        parts.push({ kind: 'text', text: raw.refusal, signature: '' })
+      }
+      if (isPlainObject(raw.function_call) && typeof raw.function_call.name === 'string' && raw.function_call.name) {
+        parts.push({
+          kind: 'tool_call',
+          id: newCallId(),
+          name: raw.function_call.name,
+          args: parseJsonObjectArgs(raw.function_call.arguments ?? '{}'),
+          signature: '',
+        })
+      }
       if (Array.isArray(raw.tool_calls)) {
         for (const call of raw.tool_calls) {
+          if (call?.type === 'custom' && isPlainObject(call.custom)) {
+            const name = call.custom.name
+            if (!name) throw makeProtocolError(400, 'gemini_invalid_request', 'tool_calls[].custom.name is required.')
+            const { id, signature: idSig } = unsignedToolCallId(call.id || newCallId())
+            const extraSig = call?.extra_content?.google?.thought_signature || ''
+            parts.push({
+              kind: 'tool_call',
+              id,
+              name,
+              args: {
+                input:
+                  typeof call.custom.input === 'string' ? call.custom.input : JSON.stringify(call.custom.input ?? ''),
+              },
+              signature: extraSig || idSig,
+            })
+            continue
+          }
           const name = call?.function?.name || call?.name
           if (!name) throw makeProtocolError(400, 'gemini_invalid_request', 'tool_calls[].function.name is required.')
           const { id, signature: idSig } = unsignedToolCallId(call.id || newCallId())
@@ -1149,6 +1600,7 @@ function parseOpenAIChatInbound(body, { headers }) {
       }
       if (parts.length) messages.push({ role: 'assistant', parts })
     } else if (raw.role === 'tool' || raw.role === 'function') {
+      inLeadingSystem = false
       const { id } = unsignedToolCallId(raw.tool_call_id || raw.id || newCallId())
       const contentParts = extractParts(raw.content)
       const text = contentParts
@@ -1177,8 +1629,14 @@ function parseOpenAIChatInbound(body, { headers }) {
   }
 
   let webSearch = false
+  let searchOptions = null
+  if (isPlainObject(body.web_search_options)) {
+    webSearch = true
+    searchOptions = mergeSearchOptions(searchOptions, body.web_search_options)
+  }
   const googleTools = []
   const tools = []
+  const legacyFunctions = !Array.isArray(body.tools) && Array.isArray(body.functions) && body.functions.length > 0
   const rawTools = Array.isArray(body.tools) ? body.tools : Array.isArray(body.functions) ? body.functions : []
   for (const tool of rawTools) {
     if (!isPlainObject(tool)) throw makeProtocolError(400, 'gemini_invalid_request', 'Each tool must be an object.')
@@ -1188,15 +1646,29 @@ function parseOpenAIChatInbound(body, { headers }) {
         name: String(tool.function.name),
         description: typeof tool.function.description === 'string' ? tool.function.description : '',
         schema: tool.function.parameters || { type: 'object', properties: {} },
+        strict: tool.function.strict === true,
+        kind: 'function',
+      })
+    } else if (tool.type === 'custom' && isPlainObject(tool.custom)) {
+      if (!tool.custom.name) throw makeProtocolError(400, 'gemini_invalid_request', 'tool.custom.name is required.')
+      tools.push({
+        name: String(tool.custom.name),
+        description: typeof tool.custom.description === 'string' ? tool.custom.description : '',
+        schema: customToolSchema(tool.custom.format),
+        strict: false,
+        kind: 'custom_chat',
       })
     } else if (tool.name && !tool.type) {
       tools.push({
         name: String(tool.name),
         description: typeof tool.description === 'string' ? tool.description : '',
         schema: tool.parameters || tool.input_schema || { type: 'object', properties: {} },
+        strict: tool.strict === true,
+        kind: legacyFunctions ? 'legacy_function' : 'function',
       })
     } else if (typeof tool.type === 'string' && tool.type.startsWith('web_search')) {
       webSearch = true
+      searchOptions = mergeSearchOptions(searchOptions, tool)
     } else {
       for (const [k, v] of Object.entries(tool)) {
         const camel = snakeToCamel(k)
@@ -1207,16 +1679,29 @@ function parseOpenAIChatInbound(body, { headers }) {
   }
 
   let toolChoice = ''
+  let allowedToolNames = null
   const tc = body.tool_choice ?? body.function_call
   if (typeof tc === 'string') {
     const lower = tc.toLowerCase()
     if (['none', 'auto', 'required'].includes(lower)) toolChoice = lower
   } else if (isPlainObject(tc)) {
-    const name = tc.function?.name || tc.name
-    if (name) toolChoice = `name:${name}`
-    else if (tc.type === 'none' || tc.type === 'auto') toolChoice = tc.type
-    else if (tc.type === 'required' || tc.type === 'any') toolChoice = 'required'
+    if (tc.type === 'allowed_tools') {
+      const cfg = isPlainObject(tc.allowed_tools) ? tc.allowed_tools : tc
+      const mode = String(cfg.mode || 'auto').toLowerCase()
+      toolChoice = mode === 'required' ? 'required' : 'auto'
+      if (Array.isArray(cfg.tools)) {
+        allowedToolNames = cfg.tools
+          .map((item) => item?.function?.name || item?.custom?.name || item?.name || '')
+          .filter(Boolean)
+      }
+    } else {
+      const name = tc.function?.name || tc.custom?.name || tc.name
+      if (name) toolChoice = `name:${name}`
+      else if (tc.type === 'none' || tc.type === 'auto') toolChoice = tc.type
+      else if (tc.type === 'required' || tc.type === 'any') toolChoice = 'required'
+    }
   }
+  const disableParallelTools = body.parallel_tool_calls === false || legacyFunctions
 
   const generationConfig = {}
   const maxTokens = body.max_completion_tokens ?? body.max_tokens
@@ -1229,23 +1714,41 @@ function parseOpenAIChatInbound(body, { headers }) {
   else if (Array.isArray(body.stop) && body.stop.length) generationConfig.stopSequences = body.stop.map(String)
 
   let thinking = null
-  const effort = normalizeEffort(body.reasoning_effort ?? body.reasoning?.effort)
+  let hideThinking = false
+  const googleTc = isPlainObject(body.extra_body?.google?.thinking_config)
+    ? body.extra_body.google.thinking_config
+    : null
+  const effort = normalizeEffort(googleTc?.thinking_level ?? body.reasoning_effort ?? body.reasoning?.effort)
+  if (body.reasoning?.summary === 'none' || googleTc?.include_thoughts === false || effort === 'none') {
+    hideThinking = true
+  }
   if (effort) {
     thinking = {
       enabled: effort !== 'none',
       disabled: effort === 'none',
       effort: effort !== 'none' ? effort : '',
-      includeThoughts: true,
+      includeThoughts: !hideThinking,
+    }
+  } else if (typeof googleTc?.thinking_budget === 'number' && Number.isFinite(googleTc.thinking_budget)) {
+    const budget = googleTc.thinking_budget
+    if (budget === 0) hideThinking = true
+    thinking = {
+      enabled: budget !== 0,
+      disabled: budget === 0,
+      effort: budget > 0 ? effortFromBudget(budget) : '',
+      budgetTokens: budget,
+      includeThoughts: !hideThinking,
     }
   } else if (isPlainObject(body.thinking)) {
     const type = String(body.thinking.type || '').toLowerCase()
     const budget = Number(body.thinking.budget_tokens ?? body.thinking.budgetTokens)
+    if (type === 'disabled') hideThinking = true
     thinking = {
       enabled: type === 'enabled' || type === 'adaptive',
       disabled: type === 'disabled',
       effort: Number.isFinite(budget) && budget > 0 ? effortFromBudget(budget) : type === 'adaptive' ? 'medium' : '',
       budgetTokens: Number.isFinite(budget) ? budget : undefined,
-      includeThoughts: true,
+      includeThoughts: !hideThinking,
     }
   }
 
@@ -1256,25 +1759,47 @@ function parseOpenAIChatInbound(body, { headers }) {
       const spec = isPlainObject(body.response_format.json_schema)
         ? body.response_format.json_schema
         : body.response_format
-      responseFormat = { type: 'json_schema', schema: spec.schema || { type: 'object' } }
+      if (spec.schema !== undefined && !isPlainObject(spec.schema)) {
+        throw makeProtocolError(
+          400,
+          'gemini_invalid_request',
+          'response_format.json_schema.schema must be a JSON object.',
+        )
+      }
+      responseFormat = {
+        type: 'json_schema',
+        schema: spec.schema || { type: 'object' },
+        ...(typeof spec.description === 'string' && spec.description.trim()
+          ? { description: spec.description.trim() }
+          : {}),
+      }
     }
   }
 
   return {
+    protocol: 'openai-chat',
     model,
     stream,
     system: systemParts.join('\n\n'),
     messages,
     tools,
     toolChoice,
+    allowedToolNames,
+    disableParallelTools,
+    legacyFunctions,
+    strictValidation: tools.some((t) => t.strict),
     webSearch,
+    searchOptions,
     googleTools,
     generationConfig,
     extraGenConfig: {},
     thinking,
+    hideThinking,
+    thinkingDisplay: null,
     responseFormat,
     safetySettings: null,
     cachedContent: null,
+    conversationId: sanitizeConversationId(body.conversation_id ?? headers?.['x-conversation-id']),
   }
 }
 
@@ -1290,6 +1815,106 @@ function parseOpenAIResponsesInbound(body, { headers }) {
     systemParts.push(body.instructions)
   }
   const messages = []
+  let webSearch = false
+  let searchOptions = null
+  const tools = []
+  const generationConfig = {}
+
+  const addResponsesTool = (tool, ns = '') => {
+    if (!isPlainObject(tool)) throw makeProtocolError(400, 'gemini_invalid_request', 'Each tool must be an object.')
+    if (typeof tool.type === 'string' && tool.type.startsWith('web_search')) {
+      webSearch = true
+      searchOptions = mergeSearchOptions(searchOptions, tool)
+      return
+    }
+    if (tool.type === 'image_generation') {
+      generationConfig.responseModalities = ['TEXT', 'IMAGE']
+      const imgCfg = imageConfigFromOpenAISizeQuality(tool.size, tool.quality)
+      if (imgCfg) generationConfig.imageConfig = imgCfg
+      return
+    }
+    if (tool.type === 'namespace' && typeof tool.name === 'string' && Array.isArray(tool.tools)) {
+      const nsName = tool.name.trim()
+      for (const child of tool.tools) addResponsesTool(child, nsName)
+      return
+    }
+    if (tool.type === 'custom') {
+      const rawName = String(tool.name || tool.custom?.name || '').trim()
+      if (!rawName) throw makeProtocolError(400, 'gemini_invalid_request', 'custom tool name is required.')
+      const fullName = ns && ns !== 'functions' ? `${ns}.${rawName}` : rawName
+      tools.push({
+        name: fullName,
+        origName: rawName,
+        namespace: ns && ns !== 'functions' ? ns : '',
+        description:
+          typeof (tool.description ?? tool.custom?.description) === 'string'
+            ? (tool.description ?? tool.custom?.description)
+            : '',
+        schema: customToolSchema(tool.format ?? tool.custom?.format),
+        strict: false,
+        kind: 'custom_responses',
+      })
+      return
+    }
+    if (tool.type === 'local_shell' || tool.type === 'shell' || tool.type === 'apply_patch') {
+      const spec = BUILTIN_CLIENT_TOOL_SCHEMAS[tool.type]
+      tools.push({
+        name: tool.type,
+        origName: tool.type,
+        namespace: '',
+        description: typeof tool.description === 'string' && tool.description ? tool.description : spec.description,
+        schema: spec.schema,
+        strict: false,
+        kind: tool.type,
+      })
+      return
+    }
+    if (tool.type === 'computer' || tool.type === 'computer_use_preview') {
+      const kind = tool.type === 'computer_use_preview' ? 'computer_preview' : 'computer'
+      const spec = BUILTIN_CLIENT_TOOL_SCHEMAS[kind]
+      tools.push({
+        name: 'computer',
+        origName: 'computer',
+        namespace: '',
+        description: typeof tool.description === 'string' && tool.description ? tool.description : spec.description,
+        schema: spec.schema,
+        strict: false,
+        kind,
+      })
+      return
+    }
+    if (tool.type === 'tool_search') {
+      const spec = BUILTIN_CLIENT_TOOL_SCHEMAS.tool_search
+      tools.push({
+        name: 'tool_search',
+        origName: 'tool_search',
+        namespace: '',
+        description: typeof tool.description === 'string' && tool.description ? tool.description : spec.description,
+        schema: tool.parameters || spec.schema,
+        strict: false,
+        kind: 'tool_search',
+      })
+      return
+    }
+    const fn = tool.type === 'function' && isPlainObject(tool.function) ? tool.function : tool
+    if (typeof fn.name === 'string' && fn.name) {
+      const rawName = fn.name
+      const fullName = ns && ns !== 'functions' ? `${ns}.${rawName}` : rawName
+      tools.push({
+        name: fullName,
+        origName: rawName,
+        namespace: ns && ns !== 'functions' ? ns : '',
+        description: typeof fn.description === 'string' ? fn.description : '',
+        schema: fn.parameters || fn.input_schema || { type: 'object', properties: {} },
+        strict: fn.strict === true,
+        kind: 'function',
+      })
+    }
+  }
+
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) addResponsesTool(tool)
+  }
 
   const extractItemParts = (content) => {
     if (typeof content === 'string') return content ? [{ kind: 'text', text: content, signature: '' }] : []
@@ -1306,6 +1931,8 @@ function parseOpenAIResponsesInbound(body, { headers }) {
         if (typeof part.text !== 'string')
           throw makeProtocolError(400, 'gemini_invalid_request', 'text must be a string.')
         out.push({ kind: 'text', text: part.text, signature: '' })
+      } else if (part.type === 'refusal' && typeof part.refusal === 'string') {
+        if (part.refusal) out.push({ kind: 'text', text: part.refusal, signature: '' })
       } else if (part.type === 'input_image' || part.type === 'image_url') {
         const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url || part.url
         const media = mediaPartFromUrl(url, 'image/png')
@@ -1322,6 +1949,32 @@ function parseOpenAIResponsesInbound(body, { headers }) {
     return out
   }
 
+  const extractOutputField = (rawOutput) => {
+    if (typeof rawOutput === 'string') return { text: rawOutput, images: [] }
+    if (Array.isArray(rawOutput)) {
+      const parts = extractItemParts(rawOutput)
+      return {
+        text: parts
+          .filter((p) => p.kind === 'text')
+          .map((p) => p.text)
+          .join('\n'),
+        images: parts.filter((p) => p.kind === 'image'),
+      }
+    }
+    if (isPlainObject(rawOutput) && typeof rawOutput.type === 'string' && rawOutput.type.startsWith('input_')) {
+      const parts = extractItemParts([rawOutput])
+      return {
+        text: parts
+          .filter((p) => p.kind === 'text')
+          .map((p) => p.text)
+          .join('\n'),
+        images: parts.filter((p) => p.kind === 'image'),
+      }
+    }
+    return { text: rawOutput == null ? '' : JSON.stringify(rawOutput), images: [] }
+  }
+
+  let inLeadingSystem = true
   if (typeof body.input === 'string') {
     if (!body.input.trim()) throw makeProtocolError(400, 'gemini_invalid_request', 'input must not be empty.')
     messages.push({ role: 'user', parts: [{ kind: 'text', text: body.input, signature: '' }] })
@@ -1329,51 +1982,170 @@ function parseOpenAIResponsesInbound(body, { headers }) {
     for (const item of body.input) {
       if (!isPlainObject(item))
         throw makeProtocolError(400, 'gemini_invalid_request', 'Each input item must be an object.')
+      if (item.type === 'additional_tools' && Array.isArray(item.tools)) {
+        for (const extraTool of item.tools) addResponsesTool(extraTool)
+        continue
+      }
       if (item.type === 'function_call') {
+        inLeadingSystem = false
         if (typeof item.name !== 'string' || !item.name) {
           throw makeProtocolError(400, 'gemini_invalid_request', 'function_call.name is required.')
         }
         const { id, signature } = unsignedToolCallId(item.call_id || item.id || newCallId())
+        const ns =
+          typeof item.namespace === 'string' && item.namespace && item.namespace !== 'functions' ? item.namespace : ''
+        const fullName = ns ? `${ns}.${item.name}` : item.name
         messages.push({
           role: 'assistant',
-          parts: [{ kind: 'tool_call', id, name: item.name, args: parseJsonObjectArgs(item.arguments), signature }],
+          parts: [{ kind: 'tool_call', id, name: fullName, args: parseJsonObjectArgs(item.arguments), signature }],
         })
-      } else if (item.type === 'function_call_output') {
+      } else if (item.type === 'custom_tool_call') {
+        inLeadingSystem = false
+        if (typeof item.name !== 'string' || !item.name) {
+          throw makeProtocolError(400, 'gemini_invalid_request', 'custom_tool_call.name is required.')
+        }
+        const { id, signature } = unsignedToolCallId(item.call_id || item.id || newCallId())
+        const ns =
+          typeof item.namespace === 'string' && item.namespace && item.namespace !== 'functions' ? item.namespace : ''
+        const fullName = ns ? `${ns}.${item.name}` : item.name
+        messages.push({
+          role: 'assistant',
+          parts: [
+            {
+              kind: 'tool_call',
+              id,
+              name: fullName,
+              args: { input: typeof item.input === 'string' ? item.input : JSON.stringify(item.input ?? '') },
+              signature,
+            },
+          ],
+        })
+      } else if (item.type === 'local_shell_call' || item.type === 'shell_call') {
+        inLeadingSystem = false
+        const { id, signature } = unsignedToolCallId(item.call_id || item.id || newCallId())
+        const action = isPlainObject(item.action) ? { ...item.action } : {}
+        if (item.type === 'local_shell_call') delete action.type
+        messages.push({
+          role: 'assistant',
+          parts: [
+            {
+              kind: 'tool_call',
+              id,
+              name: item.type === 'local_shell_call' ? 'local_shell' : 'shell',
+              args: action,
+              signature,
+            },
+          ],
+        })
+      } else if (item.type === 'apply_patch_call') {
+        inLeadingSystem = false
+        const { id, signature } = unsignedToolCallId(item.call_id || item.id || newCallId())
+        messages.push({
+          role: 'assistant',
+          parts: [
+            {
+              kind: 'tool_call',
+              id,
+              name: 'apply_patch',
+              args: isPlainObject(item.operation) ? item.operation : {},
+              signature,
+            },
+          ],
+        })
+      } else if (item.type === 'computer_call') {
+        inLeadingSystem = false
+        const { id, signature } = unsignedToolCallId(item.call_id || item.id || newCallId())
+        const args = Array.isArray(item.actions)
+          ? { actions: item.actions }
+          : isPlainObject(item.action)
+            ? item.action
+            : {}
+        messages.push({
+          role: 'assistant',
+          parts: [{ kind: 'tool_call', id, name: 'computer', args, signature }],
+        })
+      } else if (item.type === 'tool_search_call') {
+        inLeadingSystem = false
+        const { id, signature } = unsignedToolCallId(item.call_id || item.id || newCallId())
+        messages.push({
+          role: 'assistant',
+          parts: [{ kind: 'tool_call', id, name: 'tool_search', args: parseJsonObjectArgs(item.arguments), signature }],
+        })
+      } else if (
+        item.type === 'function_call_output' ||
+        item.type === 'custom_tool_call_output' ||
+        item.type === 'local_shell_call_output' ||
+        item.type === 'shell_call_output' ||
+        item.type === 'apply_patch_call_output' ||
+        item.type === 'computer_call_output' ||
+        item.type === 'tool_search_output'
+      ) {
+        inLeadingSystem = false
+        if (item.type === 'tool_search_output' && Array.isArray(item.tools)) {
+          for (const extraTool of item.tools) addResponsesTool(extraTool)
+        }
         const { id } = unsignedToolCallId(item.call_id || item.id || newCallId())
-        const out =
-          typeof item.output === 'string'
-            ? item.output
-            : Array.isArray(item.output)
-              ? extractItemParts(item.output)
-                  .filter((p) => p.kind === 'text')
-                  .map((p) => p.text)
-                  .join('\n')
-              : JSON.stringify(item.output ?? '')
-        const images = Array.isArray(item.output) ? extractItemParts(item.output).filter((p) => p.kind === 'image') : []
+        const rawOut =
+          item.type === 'apply_patch_call_output'
+            ? { status: item.status || 'completed', output: item.output ?? '' }
+            : item.type === 'tool_search_output' && item.output == null
+              ? { loaded_tools: Array.isArray(item.tools) ? item.tools.map((t) => t?.name).filter(Boolean) : [] }
+              : item.output
+        const { text: out, images } = extractOutputField(rawOut)
         const finalOut = !out.trim() && !images.length ? EMPTY_TOOL_OK_TEXT : out
+        const fallbackName =
+          item.type === 'local_shell_call_output'
+            ? 'local_shell'
+            : item.type === 'shell_call_output'
+              ? 'shell'
+              : item.type === 'apply_patch_call_output'
+                ? 'apply_patch'
+                : item.type === 'computer_call_output'
+                  ? 'computer'
+                  : item.type === 'tool_search_output'
+                    ? 'tool_search'
+                    : ''
         messages.push({
           role: 'user',
-          parts: [{ kind: 'tool_result', callId: id, name: item.name || '', text: finalOut, isError: false, images }],
+          parts: [
+            {
+              kind: 'tool_result',
+              callId: id,
+              name: item.name || fallbackName,
+              text: finalOut,
+              isError: false,
+              images,
+            },
+          ],
         })
       } else if (item.type === 'reasoning') {
         // Ignore replayed reasoning blocks; Gemini rejects foreign thought blocks.
       } else {
-        if (item.type != null && item.type !== 'message') {
+        if (item.type != null && item.type !== 'message' && item.type !== 'agent_message') {
           throw makeProtocolError(
             400,
             'gemini_invalid_request',
             `Unsupported Responses input item: ${String(item.type)}`,
           )
         }
-        const role = item.role || 'user'
+        const role = item.type === 'agent_message' ? 'user' : item.role || 'user'
         const parts = extractItemParts(item.content)
         if (role === 'system' || role === 'developer') {
           const text = parts
             .filter((p) => p.kind === 'text')
             .map((p) => p.text)
             .join('\n')
-          if (text) systemParts.push(text)
+          if (text.trim()) {
+            if (inLeadingSystem) systemParts.push(text)
+            else {
+              messages.push({
+                role: 'user',
+                parts: [{ kind: 'text', text: `<system-reminder>\n${text.trim()}\n</system-reminder>`, signature: '' }],
+              })
+            }
+          }
         } else if (role === 'user' || role === 'assistant') {
+          inLeadingSystem = false
           if (parts.length) messages.push({ role, parts })
         } else {
           throw makeProtocolError(400, 'gemini_invalid_request', `Unsupported Responses role: ${String(role)}`)
@@ -1384,37 +2156,44 @@ function parseOpenAIResponsesInbound(body, { headers }) {
     throw makeProtocolError(400, 'gemini_invalid_request', 'input must be a string or non-empty array.')
   }
 
-  let webSearch = false
-  const tools = []
-  if (Array.isArray(body.tools)) {
-    for (const tool of body.tools) {
-      if (!isPlainObject(tool)) throw makeProtocolError(400, 'gemini_invalid_request', 'Each tool must be an object.')
-      if (typeof tool.type === 'string' && tool.type.startsWith('web_search')) {
-        webSearch = true
-        continue
-      }
-      const fn = tool.type === 'function' && isPlainObject(tool.function) ? tool.function : tool
-      if (typeof fn.name === 'string' && fn.name) {
-        tools.push({
-          name: fn.name,
-          description: typeof fn.description === 'string' ? fn.description : '',
-          schema: fn.parameters || fn.input_schema || { type: 'object', properties: {} },
-        })
-      }
-    }
-  }
-
   let toolChoice = ''
+  let allowedToolNames = null
   if (typeof body.tool_choice === 'string') {
     const lower = body.tool_choice.toLowerCase()
     if (['none', 'auto', 'required'].includes(lower)) toolChoice = lower
   } else if (isPlainObject(body.tool_choice)) {
-    const name = body.tool_choice.name || body.tool_choice.function?.name
-    if (name) toolChoice = `name:${name}`
-    else if (['none', 'auto', 'required'].includes(body.tool_choice.type)) toolChoice = body.tool_choice.type
+    const tc = body.tool_choice
+    if (tc.type === 'allowed_tools') {
+      const mode = String(tc.mode || 'auto').toLowerCase()
+      toolChoice = mode === 'required' ? 'required' : 'auto'
+      if (Array.isArray(tc.tools)) {
+        allowedToolNames = tc.tools
+          .map((item) => {
+            if (item?.type === 'computer_use_preview') return 'computer'
+            if (['local_shell', 'shell', 'apply_patch', 'computer', 'tool_search'].includes(item?.type))
+              return item.type
+            const ns =
+              typeof item?.namespace === 'string' && item.namespace && item.namespace !== 'functions'
+                ? item.namespace
+                : ''
+            const nm = item?.name || item?.function?.name || item?.custom?.name || ''
+            return nm ? (ns ? `${ns}.${nm}` : nm) : ''
+          })
+          .filter(Boolean)
+      }
+    } else if (['local_shell', 'shell', 'apply_patch', 'computer', 'tool_search'].includes(tc.type)) {
+      toolChoice = `name:${tc.type}`
+    } else if (tc.type === 'computer_use_preview') {
+      toolChoice = 'name:computer'
+    } else {
+      const ns = typeof tc.namespace === 'string' && tc.namespace && tc.namespace !== 'functions' ? tc.namespace : ''
+      const rawName = tc.name || tc.function?.name || tc.custom?.name
+      if (rawName) toolChoice = `name:${ns ? `${ns}.${rawName}` : rawName}`
+      else if (['none', 'auto', 'required'].includes(tc.type)) toolChoice = tc.type
+    }
   }
+  const disableParallelTools = body.parallel_tool_calls === false
 
-  const generationConfig = {}
   if (Number.isInteger(body.max_output_tokens) && body.max_output_tokens > 0) {
     generationConfig.maxOutputTokens = body.max_output_tokens
   }
@@ -1424,13 +2203,17 @@ function parseOpenAIResponsesInbound(body, { headers }) {
   if (typeof body.top_p === 'number' && Number.isFinite(body.top_p)) generationConfig.topP = body.top_p
 
   let thinking = null
+  let hideThinking = false
   const effort = normalizeEffort(body.reasoning?.effort ?? body.reasoning_effort)
+  if (body.reasoning?.summary === 'none' || body.reasoning?.generate_summary === 'none' || effort === 'none') {
+    hideThinking = true
+  }
   if (effort) {
     thinking = {
       enabled: effort !== 'none',
       disabled: effort === 'none',
       effort: effort !== 'none' ? effort : '',
-      includeThoughts: true,
+      includeThoughts: !hideThinking,
     }
   }
 
@@ -1439,25 +2222,45 @@ function parseOpenAIResponsesInbound(body, { headers }) {
   if (isPlainObject(fmt)) {
     if (fmt.type === 'json_object') responseFormat = { type: 'json_object' }
     else if (fmt.type === 'json_schema') {
-      responseFormat = { type: 'json_schema', schema: fmt.schema || { type: 'object' } }
+      if (fmt.schema !== undefined && !isPlainObject(fmt.schema)) {
+        throw makeProtocolError(400, 'gemini_invalid_request', 'text.format.schema must be a JSON object.')
+      }
+      responseFormat = {
+        type: 'json_schema',
+        schema: fmt.schema || { type: 'object' },
+        ...(typeof fmt.description === 'string' && fmt.description.trim()
+          ? { description: fmt.description.trim() }
+          : {}),
+      }
     }
   }
 
   return {
+    protocol: 'openai-responses',
     model,
     stream,
     system: systemParts.join('\n\n'),
     messages,
     tools,
     toolChoice,
+    allowedToolNames,
+    disableParallelTools,
+    legacyFunctions: false,
+    strictValidation: tools.some((t) => t.strict),
     webSearch,
+    searchOptions,
     googleTools: [],
     generationConfig,
     extraGenConfig: {},
     thinking,
+    hideThinking,
+    thinkingDisplay: null,
     responseFormat,
     safetySettings: null,
     cachedContent: null,
+    conversationId: sanitizeConversationId(
+      body.conversation_id ?? body.previous_response_id ?? headers?.['x-conversation-id'],
+    ),
   }
 }
 
@@ -1504,6 +2307,92 @@ function parseAnthropicInbound(body, { headers }) {
 
   const extraSystemParts = []
   let inLeadingSystem = true
+  let webSearch = false
+  let searchOptions = null
+  const googleTools = []
+  const tools = []
+
+  const addAnthropicTool = (tool) => {
+    if (!isPlainObject(tool)) throw makeProtocolError(400, 'gemini_invalid_request', 'Each tool must be an object.')
+    const typeLower = typeof tool.type === 'string' ? tool.type.trim().toLowerCase() : ''
+    if (typeLower.startsWith('web_search')) {
+      webSearch = true
+      searchOptions = mergeSearchOptions(searchOptions, tool)
+      return
+    }
+    if (typeLower.startsWith('web_fetch')) {
+      googleTools.push({ urlContext: {} })
+      return
+    }
+    if (typeLower === 'function' && isPlainObject(tool.function) && tool.function.name) {
+      tools.push({
+        name: String(tool.function.name),
+        description: typeof tool.function.description === 'string' ? tool.function.description : '',
+        schema: tool.function.parameters || { type: 'object', properties: {} },
+        strict: tool.function.strict === true,
+        kind: 'anthropic_tool',
+      })
+      return
+    }
+    if (typeLower.startsWith('bash_')) {
+      const spec = BUILTIN_CLIENT_TOOL_SCHEMAS.anthropic_bash
+      tools.push({
+        name: typeof tool.name === 'string' && tool.name ? tool.name : 'bash',
+        description: typeof tool.description === 'string' && tool.description ? tool.description : spec.description,
+        schema: tool.input_schema || spec.schema,
+        strict: tool.strict === true,
+        kind: 'anthropic_tool',
+      })
+      return
+    }
+    if (typeLower.startsWith('text_editor_') || typeLower === 'str_replace_editor') {
+      const spec = BUILTIN_CLIENT_TOOL_SCHEMAS.anthropic_text_editor
+      tools.push({
+        name: typeof tool.name === 'string' && tool.name ? tool.name : 'str_replace_based_edit_tool',
+        description: typeof tool.description === 'string' && tool.description ? tool.description : spec.description,
+        schema: tool.input_schema || spec.schema,
+        strict: tool.strict === true,
+        kind: 'anthropic_tool',
+      })
+      return
+    }
+    if (typeLower.startsWith('memory_')) {
+      const spec = BUILTIN_CLIENT_TOOL_SCHEMAS.anthropic_memory
+      tools.push({
+        name: typeof tool.name === 'string' && tool.name ? tool.name : 'memory',
+        description: typeof tool.description === 'string' && tool.description ? tool.description : spec.description,
+        schema: tool.input_schema || spec.schema,
+        strict: tool.strict === true,
+        kind: 'anthropic_tool',
+      })
+      return
+    }
+    if (typeLower.startsWith('computer_')) {
+      const spec = BUILTIN_CLIENT_TOOL_SCHEMAS.anthropic_computer
+      tools.push({
+        name: typeof tool.name === 'string' && tool.name ? tool.name : 'computer',
+        description: typeof tool.description === 'string' && tool.description ? tool.description : spec.description,
+        schema: tool.input_schema || spec.schema,
+        strict: tool.strict === true,
+        kind: 'anthropic_tool',
+      })
+      return
+    }
+    if (typeof tool.name === 'string' && tool.name) {
+      tools.push({
+        name: tool.name,
+        description: typeof tool.description === 'string' ? tool.description : '',
+        schema: tool.input_schema || tool.parameters || { type: 'object', properties: {} },
+        strict: tool.strict === true,
+        kind: 'anthropic_tool',
+      })
+    }
+  }
+
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) addAnthropicTool(tool)
+  }
+
   for (const raw of body.messages) {
     if (!isPlainObject(raw) || !['user', 'assistant', 'system'].includes(raw.role)) {
       throw makeProtocolError(400, 'gemini_invalid_request', 'Anthropic message role must be user or assistant.')
@@ -1532,33 +2421,80 @@ function parseAnthropicInbound(body, { headers }) {
     }
     inLeadingSystem = false
     const parts = []
+    let pendingThinkingSig = ''
     if (typeof raw.content === 'string') {
       if (!isPlaceholderText(raw.content)) parts.push({ kind: 'text', text: raw.content, signature: '' })
     } else if (Array.isArray(raw.content)) {
       for (const block of raw.content) {
         if (!isPlainObject(block))
           throw makeProtocolError(400, 'gemini_invalid_request', 'Content block must be an object.')
+        if (block.type === 'tool_addition') {
+          const added = Array.isArray(block.tools) ? block.tools : block.tool ? [block.tool] : []
+          for (const t of added) addAnthropicTool(t)
+          continue
+        }
+        if (block.type === 'tool_removal') {
+          const names = new Set(
+            [
+              ...(typeof block.name === 'string' ? [block.name] : []),
+              ...(typeof block.tool_name === 'string' ? [block.tool_name] : []),
+              ...(Array.isArray(block.names) ? block.names : []),
+              ...(Array.isArray(block.tool_names) ? block.tool_names : []),
+              ...(Array.isArray(block.tools) ? block.tools.map((t) => (typeof t === 'string' ? t : t?.name)) : []),
+            ].filter(Boolean),
+          )
+          if (names.size) {
+            for (let idx = tools.length - 1; idx >= 0; idx--) {
+              if (names.has(tools[idx].name)) tools.splice(idx, 1)
+            }
+          }
+          continue
+        }
         if (block.type === 'text') {
           if (typeof block.text !== 'string') {
             throw makeProtocolError(400, 'gemini_invalid_request', 'text block requires string text.')
           }
           if (!isPlaceholderText(block.text)) {
-            parts.push({ kind: 'text', text: block.text, signature: '' })
+            parts.push({ kind: 'text', text: block.text, signature: pendingThinkingSig })
+            pendingThinkingSig = ''
           }
         } else if (block.type === 'image') {
           const media = parseAnthropicSource(block.source, 'image/png')
           if (!media) throw makeProtocolError(400, 'gemini_invalid_request', 'Invalid Anthropic image source.')
           parts.push(media)
         } else if (block.type === 'document') {
-          const media = parseAnthropicSource(block.source, 'application/pdf')
-          if (!media) throw makeProtocolError(400, 'gemini_invalid_request', 'Invalid Anthropic document source.')
-          parts.push(media)
+          if (block.source?.type === 'content' && Array.isArray(block.source.content)) {
+            for (const sub of block.source.content) {
+              if (
+                isPlainObject(sub) &&
+                sub.type === 'text' &&
+                typeof sub.text === 'string' &&
+                !isPlaceholderText(sub.text)
+              ) {
+                parts.push({ kind: 'text', text: sub.text, signature: '' })
+              } else if (isPlainObject(sub) && sub.type === 'image') {
+                const media = parseAnthropicSource(sub.source, 'image/png')
+                if (media) parts.push(media)
+              }
+            }
+          } else {
+            const media = parseAnthropicSource(block.source, 'application/pdf')
+            if (!media) throw makeProtocolError(400, 'gemini_invalid_request', 'Invalid Anthropic document source.')
+            parts.push(media)
+          }
         } else if (block.type === 'tool_use') {
           if (typeof block.name !== 'string' || !block.name) {
             throw makeProtocolError(400, 'gemini_invalid_request', 'tool_use.name is required.')
           }
           const { id, signature } = unsignedToolCallId(block.id || newCallId())
-          parts.push({ kind: 'tool_call', id, name: block.name, args: parseJsonObjectArgs(block.input), signature })
+          parts.push({
+            kind: 'tool_call',
+            id,
+            name: block.name,
+            args: parseJsonObjectArgs(block.input),
+            signature: signature || pendingThinkingSig,
+          })
+          pendingThinkingSig = ''
         } else if (block.type === 'tool_result') {
           const { id } = unsignedToolCallId(block.tool_use_id || newCallId())
           let text = ''
@@ -1571,7 +2507,17 @@ function parseAnthropicInbound(body, { headers }) {
             for (const sub of block.content) {
               if (typeof sub === 'string') chunks.push(sub)
               else if (isPlainObject(sub) && sub.type === 'text' && typeof sub.text === 'string') chunks.push(sub.text)
-              else if (isPlainObject(sub) && (sub.type === 'image' || sub.type === 'document')) {
+              else if (isPlainObject(sub) && sub.type === 'tool_reference' && typeof sub.tool_name === 'string') {
+                chunks.push(`Tool reference: ${sub.tool_name}`)
+              } else if (isPlainObject(sub) && sub.type === 'search_result') {
+                const header = `Search result: ${sub.title || ''}\n${sub.source || ''}`.trim()
+                if (header) chunks.push(header)
+                if (Array.isArray(sub.content)) {
+                  for (const inner of sub.content) {
+                    if (isPlainObject(inner) && typeof inner.text === 'string') chunks.push(inner.text)
+                  }
+                }
+              } else if (isPlainObject(sub) && (sub.type === 'image' || sub.type === 'document')) {
                 const media = parseAnthropicSource(sub.source, sub.type === 'image' ? 'image/png' : 'application/pdf')
                 if (media) {
                   if (media.kind === 'image') images.push(media)
@@ -1589,13 +2535,36 @@ function parseAnthropicInbound(body, { headers }) {
           }
           parts.push({ kind: 'tool_result', callId: id, name: '', text, isError, images })
           for (const f of extraFiles) parts.push(f)
+        } else if (block.type === 'thinking') {
+          if (typeof block.signature === 'string' && block.signature.trim()) {
+            pendingThinkingSig = block.signature.trim()
+          }
         } else if (
-          block.type === 'thinking' ||
           block.type === 'redacted_thinking' ||
           block.type === 'server_tool_use' ||
           block.type === 'web_search_tool_result'
         ) {
           // Do not send foreign thinking or server tool replay blocks back to Gemini.
+        } else if (
+          block.type === 'search_result' ||
+          block.type === 'tool_reference' ||
+          block.type === 'mcp_tool_use' ||
+          block.type === 'mcp_tool_result' ||
+          block.type === 'web_fetch_tool_result' ||
+          block.type === 'code_execution_tool_result' ||
+          block.type === 'bash_code_execution_tool_result' ||
+          block.type === 'text_editor_code_execution_tool_result' ||
+          block.type === 'tool_search_tool_result'
+        ) {
+          const summary =
+            block.type === 'tool_reference'
+              ? `Tool reference: ${block.tool_name || ''}`
+              : block.type === 'mcp_tool_use'
+                ? `Server tool call ${block.name || ''}: ${JSON.stringify(block.input ?? {})}`
+                : block.type === 'search_result'
+                  ? `Search result: ${block.title || ''}\n${block.source || ''}`.trim()
+                  : `Server tool result ${block.type}: ${JSON.stringify(block.content ?? '')}`
+          if (summary.trim()) parts.push({ kind: 'text', text: summary, signature: '' })
         } else {
           throw makeProtocolError(
             400,
@@ -1613,31 +2582,14 @@ function parseAnthropicInbound(body, { headers }) {
     system = [system, ...extraSystemParts].filter(Boolean).join('\n\n')
   }
 
-  let webSearch = false
-  const tools = []
-  if (Array.isArray(body.tools)) {
-    for (const tool of body.tools) {
-      if (!isPlainObject(tool)) throw makeProtocolError(400, 'gemini_invalid_request', 'Each tool must be an object.')
-      if (typeof tool.type === 'string' && tool.type.startsWith('web_search')) {
-        webSearch = true
-        continue
-      }
-      if (typeof tool.name === 'string' && tool.name) {
-        tools.push({
-          name: tool.name,
-          description: typeof tool.description === 'string' ? tool.description : '',
-          schema: tool.input_schema || tool.parameters || { type: 'object', properties: {} },
-        })
-      }
-    }
-  }
-
   let toolChoice = ''
+  let disableParallelTools = false
   if (isPlainObject(body.tool_choice)) {
     const type = String(body.tool_choice.type || '').toLowerCase()
     if (type === 'none' || type === 'auto') toolChoice = type
     else if (type === 'any') toolChoice = 'required'
     else if (type === 'tool' && body.tool_choice.name) toolChoice = `name:${body.tool_choice.name}`
+    if (body.tool_choice.disable_parallel_tool_use === true) disableParallelTools = true
   }
 
   const generationConfig = {}
@@ -1652,10 +2604,18 @@ function parseAnthropicInbound(body, { headers }) {
   }
 
   let thinking = null
+  let hideThinking = false
+  let thinkingDisplay = null
   const effort = normalizeEffort(body.output_config?.effort)
   if (isPlainObject(body.thinking)) {
     const type = String(body.thinking.type || '').toLowerCase()
     const budget = Number(body.thinking.budget_tokens)
+    if (type === 'disabled') {
+      hideThinking = true
+    } else if (body.thinking.display === 'omitted') {
+      hideThinking = true
+      thinkingDisplay = 'omitted'
+    }
     thinking = {
       enabled: type === 'enabled' || type === 'adaptive',
       disabled: type === 'disabled',
@@ -1668,42 +2628,55 @@ function parseAnthropicInbound(body, { headers }) {
               ? 'medium'
               : '',
       budgetTokens: Number.isFinite(budget) && budget > 0 ? budget : undefined,
-      includeThoughts: true,
+      includeThoughts: !hideThinking,
     }
   } else if (effort) {
+    if (effort === 'none') hideThinking = true
     thinking = {
       enabled: effort !== 'none',
       disabled: effort === 'none',
       effort: effort !== 'none' ? effort : '',
-      includeThoughts: true,
+      includeThoughts: !hideThinking,
     }
   }
 
   let responseFormat = null
-  const outFmt = body.output_config?.format
+  const outFmt = body.output_config?.format ?? body.output_format
   if (isPlainObject(outFmt)) {
-    if (outFmt.type === 'json_schema' && isPlainObject(outFmt.schema)) {
-      responseFormat = { type: 'json_schema', schema: outFmt.schema }
+    if (outFmt.type === 'json_schema') {
+      if (outFmt.schema !== undefined && !isPlainObject(outFmt.schema)) {
+        throw makeProtocolError(400, 'gemini_invalid_request', 'output_format.schema must be a JSON object.')
+      }
+      responseFormat = { type: 'json_schema', schema: outFmt.schema || { type: 'object' } }
     } else if (outFmt.type === 'json_object') {
       responseFormat = { type: 'json_object' }
     }
   }
 
   return {
+    protocol: 'anthropic',
     model,
     stream,
     system,
     messages,
     tools,
     toolChoice,
+    allowedToolNames: null,
+    disableParallelTools,
+    legacyFunctions: false,
+    strictValidation: tools.some((t) => t.strict),
     webSearch,
-    googleTools: [],
+    searchOptions,
+    googleTools,
     generationConfig,
     extraGenConfig: {},
     thinking,
+    hideThinking,
+    thinkingDisplay,
     responseFormat,
     safetySettings: null,
     cachedContent: null,
+    conversationId: sanitizeConversationId(body.conversation_id ?? headers?.['x-conversation-id']),
   }
 }
 
@@ -1729,20 +2702,29 @@ function parseGeminiSessionInbound(body) {
     )
   }
   return {
+    protocol: 'gemini-session',
     model,
     stream: body.stream === true,
     system: '',
     messages: [{ role: 'user', parts: [{ kind: 'text', text: body.input, signature: '' }] }],
     tools: [],
     toolChoice: '',
+    allowedToolNames: null,
+    disableParallelTools: false,
+    legacyFunctions: false,
+    strictValidation: false,
     webSearch: false,
+    searchOptions: null,
     googleTools: [],
     generationConfig: {},
     extraGenConfig: {},
     thinking: null,
+    hideThinking: false,
+    thinkingDisplay: null,
     responseFormat: null,
     safetySettings: null,
     cachedContent: null,
+    conversationId: null,
   }
 }
 
@@ -1832,6 +2814,105 @@ export function classifyGeminiCapabilities(ir) {
   }
 }
 
+function finalizeToolsAndRestoreContext(protocol, ir) {
+  const usedWireNames = new Set()
+  const nameToWire = new Map()
+  const toolMap = new Map()
+  const normalizedTools = []
+
+  const defaultKind = protocol === 'anthropic' ? 'anthropic_tool' : protocol === 'gemini' ? 'gemini_fn' : 'function'
+
+  for (const raw of ir.tools || []) {
+    const keyName = String(raw.name || '')
+    if (!keyName) continue
+    // Deduplicate repeated declarations of the exact same tool name (last wins).
+    let wireName = nameToWire.get(keyName)
+    if (!wireName) {
+      wireName = makeWireToolName(keyName, usedWireNames)
+      nameToWire.set(keyName, wireName)
+    }
+    const origName = typeof raw.origName === 'string' && raw.origName ? raw.origName : keyName
+    const entry = {
+      name: keyName,
+      wireName,
+      origName,
+      namespace: typeof raw.namespace === 'string' ? raw.namespace : '',
+      kind: raw.kind || defaultKind,
+      description: typeof raw.description === 'string' ? raw.description : '',
+      schema: raw.schema || { type: 'object', properties: {} },
+      strict: raw.strict === true,
+    }
+    toolMap.set(wireName, entry)
+    if (origName !== wireName && !toolMap.has(origName)) {
+      toolMap.set(origName, entry)
+    }
+    const existingIdx = normalizedTools.findIndex((t) => t.wireName === wireName)
+    if (existingIdx >= 0) normalizedTools[existingIdx] = entry
+    else normalizedTools.push(entry)
+  }
+
+  // Also map tool names that only appear in history calls/results so history remains consistent.
+  const wireNameFor = (rawName) => {
+    const s = String(rawName || '')
+    if (!s) return ''
+    if (nameToWire.has(s)) return nameToWire.get(s)
+    const computed = makeWireToolName(s, usedWireNames)
+    nameToWire.set(s, computed)
+    if (!toolMap.has(computed)) {
+      toolMap.set(computed, {
+        name: s,
+        wireName: computed,
+        origName: s,
+        namespace: '',
+        kind: defaultKind,
+        description: '',
+        schema: { type: 'object', properties: {} },
+        strict: false,
+      })
+    }
+    return computed
+  }
+
+  let allowedWireNames = null
+  if (Array.isArray(ir.allowedToolNames) && ir.allowedToolNames.length) {
+    allowedWireNames = new Set(ir.allowedToolNames.map((n) => nameToWire.get(n) || geminiFuncName(n)))
+  }
+
+  let effectiveTools = normalizedTools
+  if (allowedWireNames && allowedWireNames.size) {
+    effectiveTools = normalizedTools.filter((t) => allowedWireNames.has(t.wireName))
+  }
+  if (typeof ir.toolChoice === 'string' && ir.toolChoice.startsWith('name:')) {
+    const wantedRaw = ir.toolChoice.slice(5)
+    const wantedWire = nameToWire.get(wantedRaw) || geminiFuncName(wantedRaw)
+    if (!allowedWireNames) allowedWireNames = new Set([wantedWire])
+  }
+
+  const restoreContext = {
+    protocol,
+    toolMap,
+    wireNameFor,
+    toolChoice: ir.toolChoice || '',
+    allowedToolNames: allowedWireNames,
+    disableParallelTools: Boolean(ir.disableParallelTools),
+    legacyFunctions: Boolean(ir.legacyFunctions),
+    strictValidation: Boolean(ir.strictValidation),
+    stopSequences: Array.isArray(ir.generationConfig?.stopSequences) ? ir.generationConfig.stopSequences : [],
+    maxOutputTokens: Number.isInteger(ir.generationConfig?.maxOutputTokens) ? ir.generationConfig.maxOutputTokens : 0,
+    hideThinking: Boolean(ir.hideThinking),
+    thinkingDisplay: ir.thinkingDisplay || null,
+    responseFormat: ir.responseFormat || null,
+    searchOptions: ir.searchOptions || null,
+  }
+
+  return {
+    ...ir,
+    protocol,
+    tools: effectiveTools,
+    restoreContext,
+  }
+}
+
 /**
  * Parse an inbound request from any supported protocol into canonical Gemini IR + capability profile.
  */
@@ -1839,14 +2920,15 @@ export function parseInboundToGemini(protocol, body, { routeModel = null, routeS
   if (!isPlainObject(body)) {
     throw makeProtocolError(400, 'gemini_invalid_request', 'Request body must be a JSON object.')
   }
-  let ir
-  if (protocol === 'gemini') ir = parseGeminiNativeInbound(body, { routeModel, routeStream })
-  else if (protocol === 'openai-chat') ir = parseOpenAIChatInbound(body, { headers })
-  else if (protocol === 'openai-responses') ir = parseOpenAIResponsesInbound(body, { headers })
-  else if (protocol === 'anthropic') ir = parseAnthropicInbound(body, { headers })
-  else if (protocol === 'gemini-session') ir = parseGeminiSessionInbound(body)
+  let rawIr
+  if (protocol === 'gemini') rawIr = parseGeminiNativeInbound(body, { routeModel, routeStream })
+  else if (protocol === 'openai-chat') rawIr = parseOpenAIChatInbound(body, { headers })
+  else if (protocol === 'openai-responses') rawIr = parseOpenAIResponsesInbound(body, { headers })
+  else if (protocol === 'anthropic') rawIr = parseAnthropicInbound(body, { headers })
+  else if (protocol === 'gemini-session') rawIr = parseGeminiSessionInbound(body)
   else throw makeProtocolError(400, 'gemini_unsupported_protocol', `Unsupported protocol: ${String(protocol)}`)
 
+  const ir = finalizeToolsAndRestoreContext(protocol, rawIr)
   const capabilities = classifyGeminiCapabilities(ir)
   return { ...ir, ...capabilities }
 }
@@ -2010,6 +3092,8 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
   const callNames = new Map()
   const contents = []
   const cleanedMessages = dropDuplicateToolResults(ir.messages)
+  const resolveWireName = (rawName) =>
+    ir.restoreContext?.wireNameFor ? ir.restoreContext.wireNameFor(rawName) : geminiFuncName(rawName)
 
   for (const msg of cleanedMessages) {
     const role = msg.role === 'assistant' ? 'model' : 'user'
@@ -2017,17 +3101,19 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
     const signedTurn = msg.parts.some((p) => p.kind === 'tool_call' && p.signature)
     for (const p of msg.parts) {
       if (p.kind === 'thinking') {
-        if (p.signature && !claude) {
-          const thoughtText = ag ? sanitizeNativeTuiText(p.text || '') : p.text || ''
-          parts.push({ text: thoughtText, thought: true, thoughtSignature: p.signature })
+        // CRAGGemini / native agy does not replay historical thought blocks over SHM;
+        // omit them on `antigravity` to minimize payload size while preserving direct Gemini API replay.
+        if (!ag && p.signature && !claude) {
+          parts.push({ text: p.text || '', thought: true, thoughtSignature: p.signature })
         }
       } else if (p.kind === 'text') {
         let text = stripAnthropicBillingLines(p.text || '')
         if (ag) text = sanitizeNativeTuiText(text)
         const substantive = !isPlaceholderText(text)
-        if (substantive || (p.signature && !claude)) {
+        const realSig = p.signature && p.signature !== SKIP_THOUGHT_SIGNATURE ? p.signature : ''
+        if (substantive || (realSig && !claude)) {
           const part = { text: substantive ? text : '' }
-          if (p.signature && !claude) part.thoughtSignature = p.signature
+          if (realSig && !claude) part.thoughtSignature = realSig
           parts.push(part)
         }
       } else if (p.kind === 'image' || p.kind === 'file') {
@@ -2041,17 +3127,26 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
           }
         }
       } else if (p.kind === 'tool_call') {
-        const safeName = geminiFuncName(p.name)
+        const safeName = resolveWireName(p.name)
         if (p.id) callNames.set(p.id, safeName)
         const fnCall = { name: safeName, args: isPlainObject(p.args) ? cleanUndefinedStrings(p.args) : {} }
         if (p.id) fnCall.id = ag ? p.id.replace(/[^a-zA-Z0-9_-]/g, '_') : p.id
         const part = { functionCall: fnCall }
-        if (claude) part.thoughtSignature = SKIP_THOUGHT_SIGNATURE
-        else if (p.signature) part.thoughtSignature = p.signature
-        else if (!signedTurn) part.thoughtSignature = SKIP_THOUGHT_SIGNATURE
+        if (ag) {
+          // On CRAGGemini only preserve genuine thoughtSignature anchors (never inject dummy validator strings).
+          if (!claude && p.signature && p.signature !== SKIP_THOUGHT_SIGNATURE) {
+            part.thoughtSignature = p.signature
+          }
+        } else if (claude) {
+          part.thoughtSignature = SKIP_THOUGHT_SIGNATURE
+        } else if (p.signature) {
+          part.thoughtSignature = p.signature
+        } else if (!signedTurn) {
+          part.thoughtSignature = SKIP_THOUGHT_SIGNATURE
+        }
         parts.push(part)
       } else if (p.kind === 'tool_result') {
-        const safeName = geminiFuncName(p.name || callNames.get(p.callId) || 'tool')
+        const safeName = p.name ? resolveWireName(p.name) : callNames.get(p.callId) || 'tool'
         const key = ag ? 'result' : p.isError ? 'error' : 'output'
         let resultText = typeof p.text === 'string' ? p.text : ''
         if (ag) resultText = sanitizeNativeTuiText(resultText)
@@ -2109,27 +3204,127 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
     antigravity: ag,
   })
 
-  const req = { contents: paired }
+  const req = ag && model ? { model, contents: paired } : { contents: paired }
   let cleanedSystem = stripAnthropicBillingLines(ir.system || '').trim()
   if (ag && cleanedSystem) cleanedSystem = stripIllegalControlChars(cleanedSystem).trim()
+  if (ag) {
+    // Inject concise behavioral directives only for caller contracts that CRAGGemini
+    // cannot receive via generationConfig (parallel_tool_calls, search options, response_format).
+    const directives = []
+    const toolsActive = ir.tools.length > 0 && ir.toolChoice !== 'none'
+    if (ir.disableParallelTools && toolsActive) {
+      directives.push('Call at most one function in this response.')
+    }
+    if (ir.webSearch && ir.searchOptions && ir.toolChoice !== 'none') {
+      directives.push(...formatSearchOptionsDirectives(ir.searchOptions))
+    }
+    if (ir.responseFormat) {
+      const fmtDirective = formatResponseFormatDirective(ir.responseFormat)
+      if (fmtDirective) directives.push(fmtDirective)
+    }
+    if (directives.length) {
+      const block = stripIllegalControlChars(directives.join('\n')).trim()
+      if (block) cleanedSystem = cleanedSystem ? `${cleanedSystem}\n\n${block}` : block
+    }
+  }
   if (cleanedSystem) {
     req.systemInstruction = { parts: [{ text: cleanedSystem }] }
   }
 
+  if (ag) {
+    // CRAGGemini minimal tool forwarding:
+    // - `toolChoice === 'none'` omits both `tools` and `toolConfig` so native `agy` never registers unused tools.
+    // - Supports combining `functionDeclarations` with allowed native Google tools (`googleSearch`, `urlContext`).
+    // - Omits default `{ mode: 'AUTO' }` `toolConfig` unless `allowedFunctionNames` narrows the set.
+    if (ir.toolChoice !== 'none') {
+      const agTools = []
+      if (ir.tools.length > 0) {
+        const decls = ir.tools.map((tool) => {
+          const wireName = tool.wireName || resolveWireName(tool.name)
+          const decl = { name: wireName }
+          if (tool.description) decl.description = stripIllegalControlChars(tool.description)
+          decl.parameters = sanitizeGeminiSchema(tool.schema, { plain: true })
+          return decl
+        })
+        agTools.push({ functionDeclarations: decls })
+      }
+      if (ir.webSearch) agTools.push({ googleSearch: {} })
+      for (const gt of ir.googleTools || []) {
+        const keys = isPlainObject(gt) ? Object.keys(gt) : []
+        if (!keys.length || !keys.every((k) => CRAGGEMINI_GOOGLE_TOOLS.has(k))) continue
+        if (keys.length === 1 && keys[0] === 'googleSearch' && ir.webSearch) continue
+        agTools.push(gt)
+      }
+      if (agTools.length) req.tools = agTools
+
+      if (ir.tools.length > 0) {
+        const fc = {}
+        if (ir.toolChoice === 'required') {
+          fc.mode = 'ANY'
+          if (ir.restoreContext?.allowedToolNames?.size) {
+            fc.allowedFunctionNames = [...ir.restoreContext.allowedToolNames]
+          }
+        } else if (typeof ir.toolChoice === 'string' && ir.toolChoice.startsWith('name:')) {
+          fc.mode = 'ANY'
+          fc.allowedFunctionNames = [resolveWireName(ir.toolChoice.slice(5))]
+        } else if (ir.restoreContext?.allowedToolNames?.size) {
+          fc.mode = 'AUTO'
+          fc.allowedFunctionNames = [...ir.restoreContext.allowedToolNames]
+        }
+        if (fc.mode) req.toolConfig = { functionCallingConfig: fc }
+      }
+    }
+
+    // Minimal CRAGGemini generationConfig: strip all sampling/token/thinking/schema fields
+    // ignored by CRAGGemini SHM, retaining ONLY image-generation controls when requested.
+    const rawGen = { ...ir.extraGenConfig, ...ir.generationConfig }
+    const agGen = {}
+    if (Array.isArray(rawGen.responseModalities)) {
+      const mods = rawGen.responseModalities
+        .map((m) => String(m || '').toUpperCase())
+        .filter((m) => m === 'TEXT' || m === 'IMAGE')
+      if (mods.includes('IMAGE')) agGen.responseModalities = mods
+    }
+    if (isPlainObject(rawGen.imageConfig)) {
+      const cleanImageCfg = {}
+      const ratio = typeof rawGen.imageConfig.aspectRatio === 'string' ? rawGen.imageConfig.aspectRatio.trim() : ''
+      if (ratio && CRAGGEMINI_IMAGE_ASPECT_RATIOS.has(ratio)) cleanImageCfg.aspectRatio = ratio
+      const size =
+        typeof rawGen.imageConfig.imageSize === 'string' ? rawGen.imageConfig.imageSize.trim().toUpperCase() : ''
+      if (size === '1K' || size === '2K' || size === '4K') cleanImageCfg.imageSize = size
+      if (Object.keys(cleanImageCfg).length) agGen.imageConfig = cleanImageCfg
+    }
+    if (
+      (agGen.responseModalities || agGen.imageConfig) &&
+      Number.isInteger(rawGen.candidateCount) &&
+      rawGen.candidateCount > 0 &&
+      rawGen.candidateCount <= 8
+    ) {
+      agGen.candidateCount = rawGen.candidateCount
+    }
+    if (Object.keys(agGen).length) req.generationConfig = agGen
+
+    if (ir.conversationId) req.conversation_id = ir.conversationId
+    return req
+  }
+
+  // Direct Google Gemini API (`target === 'gemini'`): preserve full native Gemini API fields.
   if (ir.tools.length > 0 && ir.toolChoice !== 'none') {
     const decls = ir.tools.map((tool) => {
-      const decl = { name: geminiFuncName(tool.name) }
+      const decl = { name: tool.wireName || resolveWireName(tool.name) }
       if (tool.description) decl.description = tool.description
-      if (ag) decl.parameters = sanitizeGeminiSchema(tool.schema, { plain: true })
-      else decl.parametersJsonSchema = sanitizeGeminiSchema(tool.schema, { plain: false })
+      decl.parametersJsonSchema = sanitizeGeminiSchema(tool.schema, { plain: false })
       return decl
     })
     req.tools = [{ functionDeclarations: decls }]
     const fc = { mode: 'AUTO' }
     if (ir.toolChoice === 'required') fc.mode = 'ANY'
-    else if (ir.toolChoice.startsWith('name:')) {
+    else if (typeof ir.toolChoice === 'string' && ir.toolChoice.startsWith('name:')) {
       fc.mode = 'ANY'
-      fc.allowedFunctionNames = [geminiFuncName(ir.toolChoice.slice(5))]
+      fc.allowedFunctionNames = [resolveWireName(ir.toolChoice.slice(5))]
+    }
+    if (ir.restoreContext?.allowedToolNames?.size && !fc.allowedFunctionNames) {
+      fc.allowedFunctionNames = [...ir.restoreContext.allowedToolNames]
     }
     req.toolConfig = { functionCallingConfig: fc }
   } else if (ir.toolChoice === 'none' && ir.tools.length > 0) {
@@ -2137,41 +3332,29 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
   } else if (ir.webSearch || ir.googleTools.length > 0) {
     const tools = []
     if (ir.webSearch) tools.push({ googleSearch: {} })
-    for (const gt of ir.googleTools) {
-      if (ag) {
-        const keys = isPlainObject(gt) ? Object.keys(gt) : []
-        if (!keys.length || !keys.every((k) => CRAGGEMINI_GOOGLE_TOOLS.has(k))) continue
-      }
-      tools.push(gt)
-    }
+    for (const gt of ir.googleTools) tools.push(gt)
     if (tools.length) req.tools = tools
   }
 
   const gen = { ...ir.extraGenConfig, ...ir.generationConfig }
-  if (ag && isPlainObject(gen.imageConfig)) {
-    const cleanImageCfg = {}
-    const ratio = typeof gen.imageConfig.aspectRatio === 'string' ? gen.imageConfig.aspectRatio.trim() : ''
-    if (ratio && CRAGGEMINI_IMAGE_ASPECT_RATIOS.has(ratio)) cleanImageCfg.aspectRatio = ratio
-    const size = typeof gen.imageConfig.imageSize === 'string' ? gen.imageConfig.imageSize.trim().toUpperCase() : ''
-    if (size === '1K' || size === '2K' || size === '4K') cleanImageCfg.imageSize = size
-    if (Object.keys(cleanImageCfg).length) gen.imageConfig = cleanImageCfg
-    else delete gen.imageConfig
-  }
   const tc = buildThinkingConfig(ir, model)
   if (tc) gen.thinkingConfig = tc
   if (ir.responseFormat) {
-    gen.responseMimeType = 'application/json'
-    if (ir.responseFormat.type === 'json_schema' && ir.responseFormat.schema) {
-      gen.responseJsonSchema = sanitizeGeminiSchema(ir.responseFormat.schema, { plain: false })
+    if (ir.responseFormat.type === 'enum' && Array.isArray(ir.responseFormat.values)) {
+      gen.responseMimeType = 'text/x.enum'
+      gen.responseJsonSchema = { type: 'string', enum: ir.responseFormat.values }
+    } else {
+      gen.responseMimeType = 'application/json'
+      if (ir.responseFormat.type === 'json_schema' && ir.responseFormat.schema) {
+        gen.responseJsonSchema = sanitizeGeminiSchema(ir.responseFormat.schema, { plain: false })
+      }
     }
   }
   if (Object.keys(gen).length) req.generationConfig = gen
-  // CRAGGemini (`ALLOWED_BODY_KEYS`) and Antigravity reject top-level `safetySettings` / `cachedContent`;
-  // keep them only on direct Gemini API requests when non-empty.
-  if (!ag && Array.isArray(ir.safetySettings) && ir.safetySettings.length > 0) {
+  if (Array.isArray(ir.safetySettings) && ir.safetySettings.length > 0) {
     req.safetySettings = ir.safetySettings
   }
-  if (!ag && typeof ir.cachedContent === 'string' && ir.cachedContent.length > 0) {
+  if (typeof ir.cachedContent === 'string' && ir.cachedContent.length > 0) {
     req.cachedContent = ir.cachedContent
   }
   return req
@@ -2296,8 +3479,8 @@ function stopToGeminiFinish(stop) {
   return 'STOP'
 }
 
-function stopToOpenAIFinish(stop) {
-  if (stop === 'tool') return 'tool_calls'
+function stopToOpenAIFinish(stop, { legacyFunctions = false } = {}) {
+  if (stop === 'tool') return legacyFunctions ? 'function_call' : 'tool_calls'
   if (stop === 'length') return 'length'
   if (stop === 'filter') return 'content_filter'
   return 'stop'
@@ -2306,6 +3489,7 @@ function stopToOpenAIFinish(stop) {
 function stopToAnthropicReason(stop) {
   if (stop === 'tool') return 'tool_use'
   if (stop === 'length') return 'max_tokens'
+  if (stop === 'stop_sequence') return 'stop_sequence'
   if (stop === 'filter') return 'refusal'
   return 'end_turn'
 }
@@ -2376,7 +3560,12 @@ export function parseGeminiSseFrame(frame) {
       message: response.error.message || 'Gemini returned an error frame',
     }
   }
-  return { kind: 'chunk', chunk: response }
+  const meta = isPlainObject(payload.craggeminiMeta)
+    ? payload.craggeminiMeta
+    : isPlainObject(response.craggeminiMeta)
+      ? response.craggeminiMeta
+      : null
+  return { kind: 'chunk', chunk: response, meta }
 }
 
 /**
@@ -2407,7 +3596,7 @@ export function createGeminiEventDecoder({ fallbackModel = '' } = {}) {
     return normalizeGeminiUsage(mergedRawUsage)
   }
 
-  function decodeChunk(chunk, emit) {
+  function decodeChunk(chunk, emit, meta = null) {
     if (!isPlainObject(chunk)) return
     const usage = mergeRawUsage(chunk.usageMetadata ?? chunk.usage_metadata)
     if (usage) latestUsage = usage
@@ -2421,6 +3610,16 @@ export function createGeminiEventDecoder({ fallbackModel = '' } = {}) {
         usage: latestUsage
           ? { input_tokens: latestUsage.input_tokens, cache_read_tokens: latestUsage.cache_read_tokens }
           : null,
+      })
+    }
+    const effectiveMeta = meta || (isPlainObject(chunk.craggeminiMeta) ? chunk.craggeminiMeta : null)
+    if (effectiveMeta) {
+      emit({
+        kind: 'meta',
+        conversationId: typeof effectiveMeta.conversation_id === 'string' ? effectiveMeta.conversation_id : '',
+        nativeConversationId:
+          typeof effectiveMeta.native_conversation_id === 'string' ? effectiveMeta.native_conversation_id : '',
+        awaitingToolResults: effectiveMeta.awaiting_tool_results === true,
       })
     }
     const candidates = Array.isArray(chunk.candidates) ? chunk.candidates : []
@@ -2502,7 +3701,7 @@ export function createGeminiEventDecoder({ fallbackModel = '' } = {}) {
     decodeChunk,
     decodeSseFrame(frame, emit) {
       const parsed = parseGeminiSseFrame(frame)
-      if (parsed.kind === 'chunk') decodeChunk(parsed.chunk, emit)
+      if (parsed.kind === 'chunk') decodeChunk(parsed.chunk, emit, parsed.meta)
       else if (parsed.kind === 'error') {
         emit({ kind: 'error', status: parsed.status, code: parsed.code, message: parsed.message })
       } else if (parsed.kind === 'invalid') {
@@ -2525,6 +3724,298 @@ export function createGeminiEventDecoder({ fallbackModel = '' } = {}) {
   }
 }
 
+function unquoteClaudeEnumArgs(args, schema) {
+  if (!isPlainObject(args) || !isPlainObject(schema?.properties)) return args
+  let changed = false
+  const out = { ...args }
+  for (const [key, val] of Object.entries(args)) {
+    const prop = schema.properties[key]
+    if (!isPlainObject(prop)) continue
+    if (typeof val === 'string' && Array.isArray(prop.enum) && prop.enum.length && !prop.enum.includes(val)) {
+      try {
+        const parsed = JSON.parse(val)
+        if (typeof parsed === 'string' && prop.enum.includes(parsed)) {
+          out[key] = parsed
+          changed = true
+        }
+      } catch {}
+    } else if (isPlainObject(val) && isPlainObject(prop.properties)) {
+      const nested = unquoteClaudeEnumArgs(val, prop)
+      if (nested !== val) {
+        out[key] = nested
+        changed = true
+      }
+    }
+  }
+  return changed ? out : args
+}
+
+function unwrapStructuredText(rawText, responseFormat) {
+  let text = String(rawText ?? '').trim()
+  const fence = /^```(?:json|JSON|[a-zA-Z0-9_-]+)?\s*\r?\n([\s\S]*?)\r?\n```$/.exec(text)
+  if (fence) text = fence[1].trim()
+  if (responseFormat?.type === 'enum') {
+    if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+      text = text.slice(1, -1).trim()
+    }
+  }
+  return text
+}
+
+/**
+ * Outbound restoration middleware: restores tool names/shapes/namespaces,
+ * enforces caller contracts stripped for CRAGGemini (stopSequences, maxOutputTokens,
+ * hideThinking, disableParallelTools, allowedToolNames, responseFormat fences,
+ * search domain filters, Claude double-quoted enum fix) uniformly across all 4 protocols.
+ */
+export function createGeminiRestoreTransform(
+  restoreContext,
+  { target = 'antigravity', model = '', onEarlyStop = null } = {},
+) {
+  const ctx = isPlainObject(restoreContext) ? restoreContext : null
+  if (!ctx) {
+    return {
+      push(event, emit) {
+        emit(event)
+      },
+      flush() {},
+    }
+  }
+
+  const ag = target === 'antigravity'
+  const claudeModel = /claude/i.test(model)
+  const stopSeqs = Array.isArray(ctx.stopSequences)
+    ? ctx.stopSequences.filter((s) => typeof s === 'string' && s.length > 0)
+    : []
+  const maxStopLen = stopSeqs.reduce((acc, s) => Math.max(acc, s.length), 0)
+  const bufferForResponseFormat = ag && isPlainObject(ctx.responseFormat)
+  const enforceMaxTokens = ag && Number.isInteger(ctx.maxOutputTokens) && ctx.maxOutputTokens > 0
+
+  let terminated = false
+  let stopBuf = ''
+  let formatBuf = ''
+  let emittedToolCalls = 0
+  let emittedChars = 0
+  let observedOutputTokens = 0
+  let latestUsage = null
+
+  const triggerEarlyStop = (stopEvent, emit) => {
+    if (terminated) return
+    terminated = true
+    emit(stopEvent)
+    if (latestUsage) emit({ kind: 'usage', usage: latestUsage })
+    onEarlyStop?.()
+  }
+
+  const flushStopMatch = (incomingText, emit) => {
+    const combined = stopBuf + incomingText
+    let bestIdx = -1
+    let bestSeq = ''
+    for (const seq of stopSeqs) {
+      const idx = combined.indexOf(seq)
+      if (idx >= 0 && (bestIdx < 0 || idx < bestIdx)) {
+        bestIdx = idx
+        bestSeq = seq
+      }
+    }
+    if (bestIdx >= 0) {
+      const prefix = combined.slice(0, bestIdx)
+      stopBuf = ''
+      if (prefix) {
+        emittedChars += prefix.length
+        emit({ kind: 'text', text: prefix })
+      }
+      triggerEarlyStop({ kind: 'stop', finishReason: 'STOP', stopReason: 'stop_sequence', stopSequence: bestSeq }, emit)
+      return true
+    }
+    if (maxStopLen > 1 && combined.length >= maxStopLen) {
+      const safeLen = combined.length - (maxStopLen - 1)
+      const safe = combined.slice(0, safeLen)
+      stopBuf = combined.slice(safeLen)
+      if (safe) {
+        emittedChars += safe.length
+        emit({ kind: 'text', text: safe })
+      }
+    } else if (maxStopLen <= 1) {
+      stopBuf = ''
+      if (combined) {
+        emittedChars += combined.length
+        emit({ kind: 'text', text: combined })
+      }
+    } else {
+      stopBuf = combined
+    }
+    return false
+  }
+
+  const checkTokenCap = (emit) => {
+    if (!enforceMaxTokens || terminated) return false
+    const estTokens = Math.max(observedOutputTokens, Math.ceil(emittedChars / 4))
+    if (estTokens >= ctx.maxOutputTokens) {
+      if (stopBuf) {
+        emit({ kind: 'text', text: stopBuf })
+        stopBuf = ''
+      }
+      triggerEarlyStop({ kind: 'stop', finishReason: 'MAX_TOKENS', stopReason: 'length' }, emit)
+      return true
+    }
+    return false
+  }
+
+  return {
+    push(event, emit) {
+      if (!event) return
+      if (event.kind === 'usage' && event.usage) {
+        latestUsage = event.usage
+        if (Number.isSafeInteger(event.usage.output_tokens)) {
+          observedOutputTokens = Math.max(observedOutputTokens, event.usage.output_tokens)
+        }
+        if (terminated) return
+        emit(event)
+        return
+      }
+      if (event.kind === 'meta' || event.kind === 'start' || event.kind === 'error') {
+        if (terminated && event.kind !== 'meta') return
+        emit(event)
+        return
+      }
+      if (terminated) return
+
+      if (event.kind === 'thinking') {
+        if (ctx.hideThinking) return
+        emittedChars += (event.text || '').length
+        emit(event)
+        checkTokenCap(emit)
+        return
+      }
+
+      if (event.kind === 'thinking_signature') {
+        if (ctx.hideThinking && ctx.thinkingDisplay !== 'omitted' && ctx.protocol !== 'gemini') return
+        emit(event)
+        return
+      }
+
+      if (event.kind === 'search') {
+        const allowed = ctx.searchOptions?.allowedDomains
+        const blocked = ctx.searchOptions?.blockedDomains
+        if (allowed?.length || blocked?.length) {
+          const hits = (event.hits || []).filter((hit) => {
+            const targetUrl = hit?.url || hit?.title || ''
+            if (allowed?.length && !domainMatchesList(targetUrl, allowed)) return false
+            if (blocked?.length && domainMatchesList(targetUrl, blocked)) return false
+            return true
+          })
+          emit({ ...event, hits })
+          return
+        }
+        emit(event)
+        return
+      }
+
+      if (event.kind === 'tool_call') {
+        if (ctx.toolChoice === 'none') return
+        const cleanName = geminiToolNameFromCall(event.name)
+        const entry = ctx.toolMap?.get(event.name) || ctx.toolMap?.get(cleanName) || null
+        if (ctx.allowedToolNames?.size) {
+          const matchedWire = entry?.wireName || cleanName
+          if (
+            !ctx.allowedToolNames.has(matchedWire) &&
+            !ctx.allowedToolNames.has(event.name) &&
+            !ctx.allowedToolNames.has(cleanName)
+          ) {
+            return
+          }
+        }
+        if (ctx.disableParallelTools && emittedToolCalls >= 1) return
+        emittedToolCalls += 1
+        let args = event.args || {}
+        if (claudeModel && entry?.schema) {
+          args = unquoteClaudeEnumArgs(args, entry.schema)
+        }
+        emit({
+          ...event,
+          name: entry?.origName || cleanName,
+          wireName: entry?.wireName || cleanName,
+          namespace: entry?.namespace || '',
+          toolKind: entry?.kind || (ctx.legacyFunctions ? 'legacy_function' : 'function'),
+          args,
+        })
+        return
+      }
+
+      if (event.kind === 'text') {
+        let piece = event.text || ''
+        if (!piece) return
+        if (bufferForResponseFormat) {
+          formatBuf += piece
+          return
+        }
+        if (enforceMaxTokens) {
+          const budgetChars = ctx.maxOutputTokens * 4
+          const remaining = budgetChars - (emittedChars + stopBuf.length)
+          if (remaining <= 0) {
+            checkTokenCap(emit)
+            return
+          }
+          if (piece.length > remaining) {
+            piece = piece.slice(0, remaining)
+          }
+        }
+        if (stopSeqs.length) {
+          if (flushStopMatch(piece, emit)) return
+        } else {
+          emittedChars += piece.length
+          emit({ ...event, text: piece })
+        }
+        checkTokenCap(emit)
+        return
+      }
+
+      if (event.kind === 'stop') {
+        if (bufferForResponseFormat && formatBuf) {
+          const clean = unwrapStructuredText(formatBuf, ctx.responseFormat)
+          formatBuf = ''
+          if (clean) {
+            if (stopSeqs.length) {
+              if (flushStopMatch(clean, emit)) return
+            } else {
+              emit({ kind: 'text', text: clean })
+            }
+          }
+        }
+        if (stopBuf) {
+          emit({ kind: 'text', text: stopBuf })
+          stopBuf = ''
+        }
+        emit({
+          ...event,
+          stopReason:
+            event.stopReason === 'stop' && emittedToolCalls > 0
+              ? 'tool'
+              : event.stopReason === 'tool' && emittedToolCalls === 0
+                ? 'stop'
+                : event.stopReason,
+        })
+        return
+      }
+
+      emit(event)
+    },
+    flush(emit) {
+      if (terminated) return
+      if (bufferForResponseFormat && formatBuf) {
+        const clean = unwrapStructuredText(formatBuf, ctx.responseFormat)
+        formatBuf = ''
+        if (clean) emit({ kind: 'text', text: clean })
+      }
+      if (stopBuf) {
+        emit({ kind: 'text', text: stopBuf })
+        stopBuf = ''
+      }
+    },
+  }
+}
+
 /** Accumulate decoded IR events into a complete turn object for JSON rendering and billing. */
 export function createGeminiCollector({ fallbackModel = '' } = {}) {
   let id = `resp_${randomHex(10)}`
@@ -2532,9 +4023,11 @@ export function createGeminiCollector({ fallbackModel = '' } = {}) {
   const parts = []
   let stopReason = 'stop'
   let finishReason = 'STOP'
+  let stopSequence = null
   let sawFinish = false
   let usage = null
   let error = null
+  let meta = null
   const searches = []
 
   return {
@@ -2545,6 +4038,13 @@ export function createGeminiCollector({ fallbackModel = '' } = {}) {
           if (event.responseId) id = event.responseId
           if (event.model) model = event.model
           if (event.usage && !usage) usage = { ...event.usage, output_tokens: 0, total_tokens: 0 }
+          break
+        case 'meta':
+          meta = {
+            conversationId: event.conversationId || meta?.conversationId || '',
+            nativeConversationId: event.nativeConversationId || meta?.nativeConversationId || '',
+            awaitingToolResults: event.awaitingToolResults === true || meta?.awaitingToolResults === true,
+          }
           break
         case 'thinking': {
           const last = parts[parts.length - 1]
@@ -2579,6 +4079,8 @@ export function createGeminiCollector({ fallbackModel = '' } = {}) {
             id: event.id,
             signedId: event.signedId,
             name: event.name,
+            namespace: event.namespace || '',
+            toolKind: event.toolKind || 'function',
             args: event.args,
             signature: event.signature || '',
           })
@@ -2590,6 +4092,7 @@ export function createGeminiCollector({ fallbackModel = '' } = {}) {
           sawFinish = true
           stopReason = event.stopReason || 'stop'
           finishReason = event.finishReason || 'STOP'
+          if (typeof event.stopSequence === 'string') stopSequence = event.stopSequence
           break
         case 'usage':
           usage = event.usage
@@ -2623,7 +4126,9 @@ export function createGeminiCollector({ fallbackModel = '' } = {}) {
         searches,
         stopReason: toolCalls.length && stopReason === 'stop' ? 'tool' : stopReason,
         finishReason,
+        stopSequence,
         sawFinish,
+        meta,
         usage: usage || {
           input_tokens: 0,
           output_tokens: 0,
@@ -2685,10 +4190,93 @@ function renderGoogleParts(parts) {
   return out
 }
 
+function responsesItemFromToolCall(tc, itemHex = randomHex(10)) {
+  const callId = tc.signedId || tc.id
+  const kind = tc.toolKind || 'function'
+  const ns = tc.namespace || ''
+  if (kind === 'custom_responses') {
+    return {
+      id: `ctc_${itemHex}`,
+      type: 'custom_tool_call',
+      status: 'completed',
+      call_id: callId,
+      name: tc.name,
+      ...(ns ? { namespace: ns } : {}),
+      input: unwrapCustomInput(tc.args),
+    }
+  }
+  if (kind === 'local_shell') {
+    return {
+      id: `lsh_${itemHex}`,
+      type: 'local_shell_call',
+      status: 'completed',
+      call_id: callId,
+      action: { type: 'exec', ...(isPlainObject(tc.args) ? tc.args : {}) },
+    }
+  }
+  if (kind === 'shell') {
+    return {
+      id: `sh_${itemHex}`,
+      type: 'shell_call',
+      status: 'completed',
+      call_id: callId,
+      action: isPlainObject(tc.args) ? tc.args : {},
+    }
+  }
+  if (kind === 'apply_patch') {
+    return {
+      id: `ap_${itemHex}`,
+      type: 'apply_patch_call',
+      status: 'completed',
+      call_id: callId,
+      operation: isPlainObject(tc.args) ? tc.args : {},
+    }
+  }
+  if (kind === 'computer' || kind === 'computer_preview') {
+    const args = isPlainObject(tc.args) ? tc.args : {}
+    return {
+      id: `cu_${itemHex}`,
+      type: 'computer_call',
+      status: 'completed',
+      call_id: callId,
+      ...(kind === 'computer' ? { actions: Array.isArray(args.actions) ? args.actions : [] } : { action: args }),
+    }
+  }
+  if (kind === 'tool_search') {
+    return {
+      id: `tsc_${itemHex}`,
+      type: 'tool_search_call',
+      status: 'completed',
+      call_id: callId,
+      execution: 'client',
+      arguments: isPlainObject(tc.args) ? tc.args : {},
+    }
+  }
+  return {
+    id: `fc_${itemHex}`,
+    type: 'function_call',
+    status: 'completed',
+    call_id: callId,
+    name: tc.name,
+    ...(ns ? { namespace: ns } : {}),
+    arguments: JSON.stringify(tc.args || {}),
+    ...(ns === 'collaboration' ? { encrypted_function_args: [] } : {}),
+  }
+}
+
+function markdownImageFor(mediaType, data) {
+  return `![image](data:${mediaType || 'image/png'};base64,${data})`
+}
+
 /** Render a collected Gemini turn as a non-streaming JSON body in any target protocol. */
-export function renderGeminiProtocolResponse(protocol, collected, { model, sessionId, accountId } = {}) {
+export function renderGeminiProtocolResponse(
+  protocol,
+  collected,
+  { model, sessionId, accountId, restoreContext = null } = {},
+) {
   const effectiveModel = model || collected.model
   const usage = collected.usage || {}
+  const legacyFunctions = Boolean(restoreContext?.legacyFunctions)
   if (protocol === 'gemini') {
     const parts = renderGoogleParts(collected.parts)
     const candidate = {
@@ -2714,6 +4302,8 @@ export function renderGeminiProtocolResponse(protocol, collected, { model, sessi
         content.push(block)
       } else if (p.kind === 'text' && p.text) {
         content.push({ type: 'text', text: p.text })
+      } else if (p.kind === 'image' && p.data) {
+        content.push({ type: 'text', text: markdownImageFor(p.mediaType, p.data) })
       } else if (p.kind === 'tool_call') {
         content.push({ type: 'tool_use', id: p.signedId || p.id, name: p.name, input: p.args || {} })
       }
@@ -2725,30 +4315,50 @@ export function renderGeminiProtocolResponse(protocol, collected, { model, sessi
       model: effectiveModel,
       content,
       stop_reason: stopToAnthropicReason(collected.stopReason),
-      stop_sequence: null,
+      stop_sequence: collected.stopSequence ?? null,
       usage: toAnthropicUsage(usage),
     }
   }
   if (protocol === 'openai-chat') {
+    let textContent = collected.text || ''
+    if (collected.images?.length) {
+      const md = collected.images.map((img) => markdownImageFor(img.mediaType, img.data)).join('\n')
+      textContent = textContent ? `${textContent.endsWith('\n') ? textContent : `${textContent}\n`}${md}\n` : `${md}\n`
+    }
     const message = {
       role: 'assistant',
-      content: collected.text || (collected.toolCalls.length ? null : ''),
+      content: textContent || (collected.toolCalls.length ? null : ''),
     }
     if (collected.thinking) message.reasoning_content = collected.thinking
     if (collected.toolCalls.length) {
-      message.tool_calls = collected.toolCalls.map((tc) => ({
-        id: tc.signedId || tc.id,
-        type: 'function',
-        function: { name: tc.name, arguments: JSON.stringify(tc.args || {}) },
-        ...(tc.signature ? { extra_content: { google: { thought_signature: tc.signature } } } : {}),
-      }))
+      if (legacyFunctions) {
+        const first = collected.toolCalls[0]
+        message.function_call = { name: first.name, arguments: JSON.stringify(first.args || {}) }
+      } else {
+        message.tool_calls = collected.toolCalls.map((tc) => {
+          if (tc.toolKind === 'custom_chat') {
+            return {
+              id: tc.signedId || tc.id,
+              type: 'custom',
+              custom: { name: tc.name, input: unwrapCustomInput(tc.args) },
+              ...(tc.signature ? { extra_content: { google: { thought_signature: tc.signature } } } : {}),
+            }
+          }
+          return {
+            id: tc.signedId || tc.id,
+            type: 'function',
+            function: { name: tc.name, arguments: JSON.stringify(tc.args || {}) },
+            ...(tc.signature ? { extra_content: { google: { thought_signature: tc.signature } } } : {}),
+          }
+        })
+      }
     }
     return {
       id: `chatcmpl_${randomHex(12)}`,
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: effectiveModel,
-      choices: [{ index: 0, message, finish_reason: stopToOpenAIFinish(collected.stopReason) }],
+      choices: [{ index: 0, message, finish_reason: stopToOpenAIFinish(collected.stopReason, { legacyFunctions }) }],
       usage: toOpenAIChatUsage(usage),
     }
   }
@@ -2762,7 +4372,7 @@ export function renderGeminiProtocolResponse(protocol, collected, { model, sessi
         summary: [{ type: 'summary_text', text: collected.thinking }],
       })
     }
-    if (collected.text || !collected.toolCalls.length) {
+    if (collected.text || (!collected.toolCalls.length && !collected.images?.length)) {
       output.push({
         id: `msg_${randomHex(12)}`,
         type: 'message',
@@ -2771,15 +4381,16 @@ export function renderGeminiProtocolResponse(protocol, collected, { model, sessi
         content: [{ type: 'output_text', text: collected.text || '', annotations: [] }],
       })
     }
-    for (const tc of collected.toolCalls) {
+    for (let i = 0; i < (collected.images?.length || 0); i++) {
       output.push({
-        id: `fc_${randomHex(10)}`,
-        type: 'function_call',
+        id: `ig_${randomHex(8)}_${i}`,
+        type: 'image_generation_call',
         status: 'completed',
-        call_id: tc.signedId || tc.id,
-        name: tc.name,
-        arguments: JSON.stringify(tc.args || {}),
+        result: collected.images[i].data,
       })
+    }
+    for (const tc of collected.toolCalls) {
+      output.push(responsesItemFromToolCall(tc))
     }
     const status = collected.stopReason === 'length' || collected.stopReason === 'filter' ? 'incomplete' : 'completed'
     const out = {
@@ -2877,8 +4488,12 @@ export function formatGeminiProtocolStreamError(protocol, status, code, message)
  * Incremental SSE encoder translating normalized Gemini IR events into
  * real-time wire frames for `gemini`, `openai-chat`, `openai-responses`, or `anthropic`.
  */
-export function createGeminiProtocolStreamEncoder(protocol, { model = '', responseId = '' } = {}) {
+export function createGeminiProtocolStreamEncoder(
+  protocol,
+  { model = '', responseId = '', restoreContext = null } = {},
+) {
   const collector = createGeminiCollector({ fallbackModel: model })
+  const legacyFunctions = Boolean(restoreContext?.legacyFunctions)
   let started = false
   let finished = false
   let resolvedModel = model
@@ -2974,15 +4589,36 @@ export function createGeminiProtocolStreamEncoder(protocol, { model = '', respon
           sentRole = true
           return chunk(delta)
         }
+        if (event.kind === 'image' && event.data) {
+          const md = `${markdownImageFor(event.mediaType, event.data)}\n`
+          const delta = sentRole ? { content: md } : { role: 'assistant', content: md }
+          sentRole = true
+          return chunk(delta)
+        }
         if (event.kind === 'tool_call') {
-          const idx = toolIndex++
-          const tc = {
-            index: idx,
-            id: event.signedId || event.id,
-            type: 'function',
-            function: { name: event.name, arguments: JSON.stringify(event.args || {}) },
-            ...(event.signature ? { extra_content: { google: { thought_signature: event.signature } } } : {}),
+          if (legacyFunctions) {
+            const fc = { name: event.name, arguments: JSON.stringify(event.args || {}) }
+            const delta = sentRole ? { function_call: fc } : { role: 'assistant', function_call: fc }
+            sentRole = true
+            return chunk(delta)
           }
+          const idx = toolIndex++
+          const tc =
+            event.toolKind === 'custom_chat'
+              ? {
+                  index: idx,
+                  id: event.signedId || event.id,
+                  type: 'custom',
+                  custom: { name: event.name, input: unwrapCustomInput(event.args) },
+                  ...(event.signature ? { extra_content: { google: { thought_signature: event.signature } } } : {}),
+                }
+              : {
+                  index: idx,
+                  id: event.signedId || event.id,
+                  type: 'function',
+                  function: { name: event.name, arguments: JSON.stringify(event.args || {}) },
+                  ...(event.signature ? { extra_content: { google: { thought_signature: event.signature } } } : {}),
+                }
           const delta = sentRole ? { tool_calls: [tc] } : { role: 'assistant', tool_calls: [tc] }
           sentRole = true
           return chunk(delta)
@@ -2999,7 +4635,9 @@ export function createGeminiProtocolStreamEncoder(protocol, { model = '', respon
         const res = collector.result()
         let out = ''
         if (!sentRole) out += chunk({ role: 'assistant', content: '' })
-        out += chunk({}, stopToOpenAIFinish(res.stopReason), { usage: toOpenAIChatUsage(res.usage) })
+        out += chunk({}, stopToOpenAIFinish(res.stopReason, { legacyFunctions }), {
+          usage: toOpenAIChatUsage(res.usage),
+        })
         out += 'data: [DONE]\n\n'
         return out
       },
@@ -3082,6 +4720,17 @@ export function createGeminiProtocolStreamEncoder(protocol, { model = '', respon
           out += sse('content_block_delta', { index: openBlock.index, delta: { type: 'text_delta', text: event.text } })
           return out
         }
+        if (event.kind === 'image' && event.data) {
+          let out = ensureStart() + closeOpen()
+          const index = blockIndex++
+          out += sse('content_block_start', { index, content_block: { type: 'text', text: '' } })
+          out += sse('content_block_delta', {
+            index,
+            delta: { type: 'text_delta', text: markdownImageFor(event.mediaType, event.data) },
+          })
+          out += sse('content_block_stop', { index })
+          return out
+        }
         if (event.kind === 'tool_call') {
           let out = ensureStart() + closeOpen()
           const index = blockIndex++
@@ -3108,7 +4757,7 @@ export function createGeminiProtocolStreamEncoder(protocol, { model = '', respon
         const res = collector.result()
         let out = ensureStart(res.usage) + closeOpen()
         out += sse('message_delta', {
-          delta: { stop_reason: stopToAnthropicReason(res.stopReason), stop_sequence: null },
+          delta: { stop_reason: stopToAnthropicReason(res.stopReason), stop_sequence: res.stopSequence ?? null },
           usage: toAnthropicUsage(res.usage || {}),
         })
         out += sse('message_stop', {})
@@ -3215,41 +4864,63 @@ export function createGeminiProtocolStreamEncoder(protocol, { model = '', respon
         })
         return out
       }
+      if (event.kind === 'image' && event.data) {
+        let out = ensureStart() + closeReasoning() + closeText()
+        const index = outputIndex++
+        const item = {
+          id: `ig_${randomHex(8)}_${index}`,
+          type: 'image_generation_call',
+          status: 'completed',
+          result: event.data,
+        }
+        out += sse('response.output_item.added', { output_index: index, item: { ...item, status: 'in_progress' } })
+        out += sse('response.output_item.done', { output_index: index, item })
+        return out
+      }
       if (event.kind === 'tool_call') {
         let out = ensureStart() + closeReasoning() + closeText()
         const index = outputIndex++
-        const itemId = `fc_${randomHex(10)}`
-        const callId = event.signedId || event.id
-        const args = JSON.stringify(event.args || {})
-        out += sse('response.output_item.added', {
-          output_index: index,
-          item: {
-            id: itemId,
-            type: 'function_call',
-            status: 'in_progress',
-            call_id: callId,
-            name: event.name,
-            arguments: '',
-          },
-        })
-        out += sse('response.function_call_arguments.delta', { item_id: itemId, output_index: index, delta: args })
-        out += sse('response.function_call_arguments.done', {
-          item_id: itemId,
-          output_index: index,
-          name: event.name,
-          arguments: args,
-        })
-        out += sse('response.output_item.done', {
-          output_index: index,
-          item: {
-            id: itemId,
-            type: 'function_call',
-            status: 'completed',
-            call_id: callId,
-            name: event.name,
-            arguments: args,
-          },
-        })
+        const item = responsesItemFromToolCall(event)
+        if (item.type === 'function_call') {
+          out += sse('response.output_item.added', {
+            output_index: index,
+            item: { ...item, status: 'in_progress', arguments: '' },
+          })
+          out += sse('response.function_call_arguments.delta', {
+            item_id: item.id,
+            output_index: index,
+            delta: item.arguments,
+          })
+          out += sse('response.function_call_arguments.done', {
+            item_id: item.id,
+            output_index: index,
+            name: item.name,
+            arguments: item.arguments,
+          })
+          out += sse('response.output_item.done', { output_index: index, item })
+        } else if (item.type === 'custom_tool_call') {
+          out += sse('response.output_item.added', {
+            output_index: index,
+            item: { ...item, status: 'in_progress', input: '' },
+          })
+          out += sse('response.custom_tool_call_input.delta', {
+            item_id: item.id,
+            output_index: index,
+            delta: item.input,
+          })
+          out += sse('response.custom_tool_call_input.done', {
+            item_id: item.id,
+            output_index: index,
+            input: item.input,
+          })
+          out += sse('response.output_item.done', { output_index: index, item })
+        } else {
+          out += sse('response.output_item.added', {
+            output_index: index,
+            item: { ...item, status: 'in_progress' },
+          })
+          out += sse('response.output_item.done', { output_index: index, item })
+        }
         return out
       }
       if (event.kind === 'error') {
@@ -3264,7 +4935,7 @@ export function createGeminiProtocolStreamEncoder(protocol, { model = '', respon
       const res = collector.result()
       let out = ensureStart() + closeReasoning() + closeText()
       const finalResp = {
-        ...renderGeminiProtocolResponse('openai-responses', res, { model: resolvedModel }),
+        ...renderGeminiProtocolResponse('openai-responses', res, { model: resolvedModel, restoreContext }),
         id: respId,
       }
       const eventName = finalResp.status === 'incomplete' ? 'response.incomplete' : 'response.completed'
