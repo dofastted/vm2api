@@ -6,11 +6,13 @@ import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { copyText } from '@/lib/clipboard'
 import {
+  type GeminiModelCatalogEntry,
   geminiAuthorizationLabel,
   geminiEligibilityNotice,
   geminiInferenceErrorAction,
   geminiInferenceLabel,
   geminiInferenceErrorLabel,
+  groupGeminiModels,
 } from '@/lib/gemini-account-status'
 import { isGeminiHostIssue } from '@/lib/gemini-recovery'
 import { Button } from '@/components/ui/button'
@@ -117,7 +119,7 @@ export type GeminiEnvironment = {
   name: string
   proxy_id: string
   auth_state:
-    'unverified' | 'authorizing' | 'authorized' | 'reauth_required' | 'disabled'
+  'unverified' | 'authorizing' | 'authorized' | 'reauth_required' | 'disabled'
   runtime_ready: boolean
   billing_ready: boolean
   proxy_ready?: boolean
@@ -142,6 +144,7 @@ export type GeminiEnvironment = {
     eligibility?:
       'verification_required' | 'location_unsupported' | 'ineligible' | null
     validation_url?: string | null
+    model_catalog?: GeminiModelCatalogEntry[]
     quotas: (QuotaReading & { model: string })[]
     quota_groups?: {
       name: string
@@ -155,12 +158,12 @@ export type GeminiInventory = {
   available: boolean
   host_message?: string
   payload_state?:
-    | 'installed'
-    | 'install_on_create'
-    | 'awaiting_redemption'
-    | 'not_configured'
-    | 'invalid'
-    | 'unknown'
+  | 'installed'
+  | 'install_on_create'
+  | 'awaiting_redemption'
+  | 'not_configured'
+  | 'invalid'
+  | 'unknown'
   payload_mode?: 'legacy_release' | 'crag_subscription'
   payload_issue?: keyof typeof PAYLOAD_ISSUES | null
   release_activated?: boolean | null
@@ -392,7 +395,9 @@ function AntigravityUsage({ environment }: { environment: GeminiEnvironment }) {
         </p>
       )}
       <p className='text-xs text-muted-foreground'>
-        本地逐回合用量尚不可用；请求数、Token 和费用不从额度变化推算。
+        {environment.billing_ready
+          ? '本地逐回合用量已接入请求日志与计费统计；上方额度窗口仅反映上游订阅余量。'
+          : '本地逐回合用量尚不可用；请求数、Token 和费用不从额度变化推算。'}
       </p>
     </section>
   )
@@ -429,7 +434,7 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
             {environment.last_inference.model} ·{' '}
             {localTime(
               environment.last_inference.finished_at ||
-                environment.last_inference.started_at
+              environment.last_inference.started_at
             )}
             {environment.last_inference.state === 'failed'
               ? ` · ${geminiInferenceErrorLabel(environment.last_inference.error_code)}`
@@ -437,7 +442,7 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
           </dd>
         ) : null}
         {environment.last_inference?.state === 'failed' &&
-        geminiInferenceErrorAction(environment.last_inference.error_code) ? (
+          geminiInferenceErrorAction(environment.last_inference.error_code) ? (
           <dd className='mt-0.5 text-xs text-muted-foreground'>
             {geminiInferenceErrorAction(environment.last_inference.error_code)}
           </dd>
@@ -472,8 +477,8 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
                 ? `已绑定席位 #${environment.crag_license.seat}`
                 : '许可有效'
               : geminiInferenceErrorLabel(
-                  environment.crag_license.code ?? 'license_required'
-                )}
+                environment.crag_license.code ?? 'license_required'
+              )}
           </dd>
         </div>
       ) : null}
@@ -551,7 +556,30 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
       <div className='sm:col-span-2 lg:col-span-3'>
         <dt className='text-muted-foreground'>模型</dt>
         <dd className='break-words'>
-          {environment.models?.join('、') || '未提供'}
+          {(() => {
+            const groups = groupGeminiModels(
+              environment.models ?? [],
+              account?.model_catalog
+            )
+            if (!groups.length) return '未提供'
+            if (groups.length === 1 && groups[0].provider === 'google') {
+              return groups[0].models.map((item) => item.publicId).join('、')
+            }
+            return (
+              <div className='mt-1 space-y-1.5'>
+                {groups.map((group) => (
+                  <div key={group.provider} className='text-xs'>
+                    <span className='font-medium text-muted-foreground'>
+                      {group.label}（{group.models.length}）：
+                    </span>
+                    <span className='break-words'>
+                      {group.models.map((item) => item.publicId).join('、')}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )
+          })()}
         </dd>
       </div>
       <div className='text-sm text-muted-foreground sm:col-span-2 lg:col-span-3'>
@@ -796,14 +824,14 @@ export function GeminiEnvironments({
   const operation = useGeminiMutation({
     mutationFn: async (action: {
       type:
-        | 'create'
-        | 'authorize'
-        | 'complete'
-        | 'disable'
-        | 'delete'
-        | 'refresh'
-        | 'bind_seat'
-        | 'release_seat'
+      | 'create'
+      | 'authorize'
+      | 'complete'
+      | 'disable'
+      | 'delete'
+      | 'refresh'
+      | 'bind_seat'
+      | 'release_seat'
       id?: string
     }) => {
       const resource = `${ROOT}/environments${action.id ? `/${encodeURIComponent(action.id)}` : ''}`
@@ -903,11 +931,11 @@ export function GeminiEnvironments({
     : environment?.proxy_ready === false
       ? '绑定的 IPv4 SOCKS5 代理不可用。'
       : geminiPayloadIssue(inventory.data) ||
-        (inventory.data.oauth_runtime_issue
-          ? OAUTH_ISSUES[inventory.data.oauth_runtime_issue]
-          : awaitingRedemption
-            ? '请先兑换 CRAGGemini 内核。'
-            : null)
+      (inventory.data.oauth_runtime_issue
+        ? OAUTH_ISSUES[inventory.data.oauth_runtime_issue]
+        : awaitingRedemption
+          ? '请先兑换 CRAGGemini 内核。'
+          : null)
 
   const account = environment ? (
     <div className='space-y-4'>
@@ -937,7 +965,7 @@ export function GeminiEnvironments({
           </Button>
         ) : null}
         {environment.auth_state === 'authorized' ||
-        environment.auth_state === 'reauth_required' ? (
+          environment.auth_state === 'reauth_required' ? (
           <Button
             type='button'
             variant='outline'
@@ -952,8 +980,8 @@ export function GeminiEnvironments({
           </Button>
         ) : null}
         {isCragSubscription &&
-        environment.auth_method === 'oauth' &&
-        !environment.crag_license?.valid ? (
+          environment.auth_method === 'oauth' &&
+          !environment.crag_license?.valid ? (
           <Button
             type='button'
             variant='outline'
@@ -966,10 +994,10 @@ export function GeminiEnvironments({
           </Button>
         ) : null}
         {isCragSubscription &&
-        environment.auth_method === 'oauth' &&
-        environment.crag_license?.valid &&
-        environment.crag_license.scope === 'host' &&
-        cragSub?.reclaim_supported ? (
+          environment.auth_method === 'oauth' &&
+          environment.crag_license?.valid &&
+          environment.crag_license.scope === 'host' &&
+          cragSub?.reclaim_supported ? (
           <Button
             type='button'
             variant='outline'
@@ -1022,7 +1050,7 @@ export function GeminiEnvironments({
         )}
       </div>
       {environment.auth_method === 'oauth' &&
-      environment.auth_state === 'authorized' ? (
+        environment.auth_state === 'authorized' ? (
         terminalUnavailable ? (
           <p role='status' className='text-sm text-muted-foreground'>
             暂时无法启动 Gemini：{terminalUnavailable}
@@ -1036,8 +1064,8 @@ export function GeminiEnvironments({
         )
       ) : null}
       {payloadReady &&
-      challenge?.id === environment.id &&
-      environment.auth_state === 'authorizing' ? (
+        challenge?.id === environment.id &&
+        environment.auth_state === 'authorizing' ? (
         <GeminiAuthorizationChallenge
           key={challenge.attempt_id}
           environmentId={environment.id}

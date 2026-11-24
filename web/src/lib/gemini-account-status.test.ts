@@ -10,6 +10,7 @@ import {
   geminiInferenceErrorAction,
   geminiInferenceErrorLabel,
   geminiInferenceLabel,
+  groupGeminiModels,
 } from './gemini-account-status'
 import {
   accountStatus,
@@ -338,5 +339,41 @@ describe('Gemini account presentation', () => {
       })?.validationUrl
     ).toBeNull()
     expect(geminiEligibilityNotice({ eligibility: null })).toBeNull()
+  })
+
+  it('groups Antigravity models into Google Gemini vs ag- prefixed Anthropic and OpenAI', () => {
+    const groups = groupGeminiModels(
+      [
+        'claude-sonnet-4-6-high',
+        'gemini-4-neon',
+        'gemini-4-argon',
+        'gpt-oss-120b-medium',
+      ],
+      [
+        { id: 'claude-sonnet-4-6-high', provider: 'anthropic', quota_group: '3p' },
+        { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
+        { id: 'gemini-4-argon', provider: 'google', quota_group: 'gemini-argon-wtu' },
+        { id: 'gpt-oss-120b-medium', provider: 'openai', quota_group: '3p' },
+      ]
+    )
+    expect(groups.map((g) => g.provider)).toEqual([
+      'google',
+      'anthropic',
+      'openai',
+    ])
+    expect(groups[0].models.map((m) => m.publicId)).toEqual([
+      'gemini-4-neon',
+      'gemini-4-argon',
+    ])
+    expect(groups[1].models[0]).toMatchObject({
+      rawId: 'claude-sonnet-4-6-high',
+      publicId: 'ag-claude-sonnet-4-6-high',
+      quotaGroup: '3p',
+    })
+    expect(groups[2].models[0]).toMatchObject({
+      rawId: 'gpt-oss-120b-medium',
+      publicId: 'ag-gpt-oss-120b-medium',
+      quotaGroup: '3p',
+    })
   })
 })
