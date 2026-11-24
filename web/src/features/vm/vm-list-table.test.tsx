@@ -235,6 +235,61 @@ describe('VM account column kernel label', () => {
     expect(geminiChip).toBe(chip(normal))
   })
 
+  it('keeps Gemini rows and cards compact and hides stale eligibility after a newer verified run', () => {
+    const verified = geminiSlot({
+      id: 'verified-gemini',
+      name: 'Verified Gemini',
+      proxy_id: 'px-011f7746',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      runtime_ready: true,
+      billing_ready: true,
+      kernel_version: '0.3.0',
+      created_at: null,
+      updated_at: null,
+      models_discovered: true,
+      models: ['gemini-2.5-pro'],
+      last_inference: {
+        state: 'completed',
+        model: 'gemini-2.5-pro',
+        started_at: '2026-11-24T02:00:00Z',
+        finished_at: '2026-11-24T02:00:05Z',
+        error_code: null,
+      },
+      account: {
+        state: 'ok',
+        checked_at: '2026-11-24T01:00:00Z',
+        email: 'a@example.com',
+        project_id: null,
+        region: null,
+        plan: null,
+        expires_at: null,
+        eligibility: 'verification_required',
+        quotas: [],
+        credits: [],
+      },
+    })
+    const html = (node: ReactNode) =>
+      renderToStaticMarkup(
+        <QueryClientProvider client={new QueryClient()}>
+          {node}
+        </QueryClientProvider>
+      )
+    const table = html(<VmTable vms={[verified]} />)
+    expect(table).toContain('data-vm-row')
+    expect(table).toMatch(/data-vm-row[^>]*class="[^"]*h-\[38px\]/)
+    expect(table).not.toContain('min-h-[38px]')
+    for (const view of [
+      table,
+      html(<VmRack vms={[verified]} size='l' filter='all' />),
+      html(<VmRack vms={[verified]} size='s' filter='all' />),
+    ]) {
+      expect(view).toContain('上次宿主推理成功')
+      expect(view).not.toContain('VALIDATION_REQUIRED')
+      expect(view).not.toContain('text-[color:var(--status-caution)]')
+    }
+  })
+
   it('keeps pending, cancelled, failed and verified turns out of generic 在池 counts', () => {
     const candidate: NonNullable<Vm['gemini']> = {
       id: 'pending-gemini',

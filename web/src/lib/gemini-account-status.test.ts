@@ -339,6 +339,26 @@ describe('Gemini account presentation', () => {
       })?.validationUrl
     ).toBeNull()
     expect(geminiEligibilityNotice({ eligibility: null })).toBeNull()
+
+    const stale = {
+      eligibility: 'verification_required',
+      checked_at: '2026-11-24T01:00:00Z',
+    }
+    const run = (state: 'completed' | 'failed', finished_at: string) => ({
+      state,
+      finished_at,
+    })
+    // 验证后重新推理成功：旧资格结论不再提示。
+    expect(
+      geminiEligibilityNotice(stale, run('completed', '2026-11-24T02:00:00Z'))
+    ).toBeNull()
+    // 推理早于这次账号检查，或推理失败：仍要提示。
+    expect(
+      geminiEligibilityNotice(stale, run('completed', '2026-11-24T00:00:00Z'))
+    ).not.toBeNull()
+    expect(
+      geminiEligibilityNotice(stale, run('failed', '2026-11-24T02:00:00Z'))
+    ).not.toBeNull()
   })
 
   it('groups Antigravity models into Google Gemini vs ag- prefixed Anthropic and OpenAI', () => {
