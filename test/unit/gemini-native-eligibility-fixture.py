@@ -152,6 +152,8 @@ class Fixture:
             run.egress = subprocess.Popen(["/bin/sleep", "30"], start_new_session=True)
             run.native_tui_pid = run.pid = run.terminal = run.network_lock = None
             run.native_tui_start = None
+            run.pool_mode = False
+            run._network_lease = None
             run.owns_directory = False
             run.credentials = ()
             run.prompt = None

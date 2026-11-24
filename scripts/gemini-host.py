@@ -1057,8 +1057,8 @@ class Agy:
         if self.terminal is not None:
             os.close(self.terminal)
             self.terminal = None
-        if self._network_lease is not None:
-            lease = self._network_lease
+        lease = getattr(self, "_network_lease", None)
+        if lease is not None:
             self._network_lease = None
             self.egress = None
             self.network_lock = None
@@ -1563,13 +1563,17 @@ class NativeAgy(Agy):
                         )
                     elif wrapper_status is not None:
                         kind = "exit_code" if wrapper_status >= 0 else "signal"
-                        wrapper_kind = "pool" if self.pool_mode else "openvt"
+                        wrapper_kind = (
+                            "pool" if getattr(self, "pool_mode", False) else "openvt"
+                        )
                         print(
                             f"Gemini native wrapper={wrapper_kind} {kind}={abs(wrapper_status)} child_record=missing",
                             file=sys.stderr,
                         )
                     else:
-                        wrapper_kind = "pool" if self.pool_mode else "openvt"
+                        wrapper_kind = (
+                            "pool" if getattr(self, "pool_mode", False) else "openvt"
+                        )
                         print(
                             f"Gemini native wrapper={wrapper_kind} status=running_before_cleanup child_record=missing",
                             file=sys.stderr,
