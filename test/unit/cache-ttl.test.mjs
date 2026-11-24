@@ -1,3 +1,6 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
@@ -51,8 +54,23 @@ test('the first explicit TTL in Anthropic wire order controls session resolution
   }
   assert.equal(
     resolveCacheTtl({ headers: {}, body: implicitFirst, routing: { compatibility: { cache_ttl: '1h' } } }),
-    '5m',
+    '1h',
   )
+})
+
+test('resolveCacheTtl falls back to routingFile when routing object omits cache_ttl', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cache-ttl-file-'))
+  try {
+    const file = path.join(dir, 'routing.json')
+    fs.writeFileSync(file, JSON.stringify({ compatibility: { cache_ttl: '5m' } }))
+    assert.equal(resolveCacheTtl({ headers: {}, routing: {}, routingFile: file }), '5m')
+    fs.writeFileSync(file, JSON.stringify({ compatibility: { cache_ttl: '1h' } }))
+    const future = new Date(Date.now() + 2000)
+    fs.utimesSync(file, future, future)
+    assert.equal(resolveCacheTtl({ headers: {}, routing: {}, routingFile: file }), '1h')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('ttl-less callers leave the platform default selection to the settings menu', () => {

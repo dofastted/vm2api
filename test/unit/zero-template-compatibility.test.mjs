@@ -43,7 +43,7 @@ test('reordered caller caches retain four controls, scope and coverage across a 
   ].filter((block) => block.cache_control)
   assert.deepEqual(
     marked.map((block) => block.cache_control),
-    [first.cache_control, second.cache_control, third.cache_control, control('5m')],
+    [first.cache_control, control('1h'), third.cache_control, control('5m')],
   )
   const hourAt = out.system.findIndex((block) => block.cache_control?.ttl === '1h')
   assert.ok(out.system.slice(0, hourAt).some((block) => block.text === second.text))
@@ -78,7 +78,7 @@ test('a mid-system cache moves earlier short message controls after the hour wit
   assert.equal(out.messages[1].content[0].text, assistant.text)
   assert.deepEqual(
     out.messages[3].content.map((block) => block.cache_control),
-    [rule.cache_control, user.cache_control, assistant.cache_control],
+    [rule.cache_control, user.cache_control, control('5m')],
   )
   validateCacheBreakpoints(out)
 })
@@ -116,8 +116,8 @@ for (const model of ['claude-opus-5-5', 'claude-sonnet-5']) {
     assert.deepEqual(out.messages[1].content, [toolUse])
     if (model === 'claude-sonnet-5') {
       // Upstream places unsupported system turns at the top level, so the
-      // original tool-result marker remains ordered and needs no deferral.
-      assert.deepEqual(out.messages[2].content[0], toolResult)
+      // original tool-result marker remains ordered and gets the default TTL.
+      assert.deepEqual(out.messages[2].content[0], { ...toolResult, cache_control: control('1h') })
       assert.ok(out.system.some((block) => block.text === rule.text))
       assert.ok(!out.messages.some((message) => message.role === 'system'))
     } else {
@@ -129,7 +129,7 @@ for (const model of ['claude-opus-5-5', 'claude-sonnet-5']) {
     }
     assert.deepEqual(
       listCacheMarkers(out).map((marker) => marker.ttl),
-      ['1h', null],
+      ['1h', '1h'],
     )
     assert.equal(JSON.stringify(out).split(rule.text).length - 1, 1)
     validateCacheBreakpoints(out)
@@ -169,7 +169,7 @@ for (const id of ['instructions', 'caller_system']) {
     assert.deepEqual(out.tools, [tool])
     assert.deepEqual(
       markers.filter((marker) => marker.section !== 'tools').map((marker) => marker.ttl),
-      ['1h', null, '5m'],
+      ['1h', '1h', '5m'],
     )
     for (const block of system) assert.equal(JSON.stringify(out).split(block.text).length - 1, 1)
     validateCacheBreakpoints(out)
@@ -188,11 +188,11 @@ for (const [variable, rule] of [
     })
     assert.deepEqual(
       out.system.find((block) => block.text === rule),
-      caller,
+      { ...caller, cache_control: control('1h') },
     )
     assert.deepEqual(
       listCacheMarkers(out).map((marker) => marker.ttl),
-      [null],
+      ['1h'],
     )
     validateCacheBreakpoints(out)
   })
@@ -223,7 +223,7 @@ test('a cached caller reminder stays singly wrapped and its literal variables ar
   assert.ok(messages.includes('LITERAL {{billing}} RULE'))
   assert.deepEqual(
     listCacheMarkers(out).map((marker) => marker.ttl),
-    [null],
+    ['1h'],
   )
 })
 
@@ -235,7 +235,7 @@ test('a pure caller variable keeps the marked source block whitespace inside its
   })
   assert.deepEqual(
     out.messages[0].content.find((block) => block.cache_control),
-    caller,
+    { ...caller, cache_control: control('1h') },
   )
 })
 
@@ -328,13 +328,13 @@ for (const variable of ['caller_agent', 'caller_system', 'agent_official']) {
 }
 
 for (const ttl of ['5m', '1h']) {
-  test(`zero fills only template TTL from ${ttl} while keeping caller's implicit 5m`, (t) => {
+  test(`zero fills both template and omitted caller TTL from ${ttl}`, (t) => {
     const caller = text('Caller implicit TTL')
     const { out } = render(t, { ttl, blocks: [text('Template implicit TTL')], input: { system: [caller] } })
-    assert.deepEqual(out.system.at(-1), caller)
+    assert.deepEqual(out.system.at(-1), { ...caller, cache_control: control(ttl) })
     assert.deepEqual(
       listCacheMarkers(out).map((marker) => marker.ttl),
-      [ttl, null],
+      [ttl, ttl],
     )
     validateCacheBreakpoints(out)
   })
@@ -366,14 +366,14 @@ test('zero omits an incompatible template 5m marker before caller 1h, preserving
   validateCacheBreakpoints(out)
 })
 
-test('zero respects an earlier tool implicit 5m and later message markers', (t) => {
+test('zero fills an earlier omitted tool TTL from config while respecting explicit 5m tool markers', (t) => {
   const tool = { name: 'Read', input_schema: { type: 'object' }, cache_control: control() }
   const message = { role: 'user', content: [text('Message marker', '5m')] }
   const { out } = render(t, {
     blocks: [text('Incompatible template hour', '1h'), text('Template implicit TTL')],
     input: { tools: [tool], system: [text('Caller rule', null)], messages: [message] },
   })
-  assert.deepEqual(out.tools, [tool])
+  assert.deepEqual(out.tools, [{ ...tool, cache_control: control('1h') }])
   assert.deepEqual(out.messages, [message])
   assert.deepEqual(out.system.slice(1), [
     text('Incompatible template hour', null),
@@ -381,6 +381,20 @@ test('zero respects an earlier tool implicit 5m and later message markers', (t) 
     text('Caller rule', null),
   ])
   validateCacheBreakpoints(out)
+
+  // Explicit 5m tool marker still stays 5m and keeps template markers compatible.
+  const explicitTool = { name: 'Read', input_schema: { type: 'object' }, cache_control: control('5m') }
+  const { out: outFive } = render(t, {
+    blocks: [text('Incompatible template hour', '1h'), text('Template implicit TTL')],
+    input: { tools: [explicitTool], system: [text('Caller rule', null)], messages: [message] },
+  })
+  assert.deepEqual(outFive.tools, [explicitTool])
+  assert.deepEqual(outFive.system.slice(1), [
+    text('Incompatible template hour', null),
+    text('Template implicit TTL', '5m'),
+    text('Caller rule', null),
+  ])
+  validateCacheBreakpoints(outFive)
 })
 
 test('zero fills template 1h before a caller message hour marker', (t) => {
