@@ -217,6 +217,7 @@ export function LogsPage() {
       : filters.excludeStatus200
         ? '仅非 2xx'
         : '全部状态',
+    filters.failedOnly ? '所有失败（含流式 200）' : null,
     errorClass
       ? `错误类 ${ERROR_CLASS_META[errorClass]?.label || errorClass}`
       : null,

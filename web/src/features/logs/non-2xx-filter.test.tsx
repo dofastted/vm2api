@@ -53,3 +53,25 @@ describe('non-2xx log filter wording', () => {
     expect(active).not.toContain('!200')
   })
 })
+
+describe('failed-only filter includes committed 200 streaming failures (#1213)', () => {
+  it('exposes the 所有失败 preset alongside 仅非 2xx and renders its active chip', () => {
+    const filters: LogsFilterState = { failedOnly: true }
+    const quick = renderToStaticMarkup(
+      <QuickFiltersBar filters={filters} onChange={() => {}} />
+    )
+    const active = renderToStaticMarkup(
+      <ActiveFiltersDisplay
+        isAdmin={true}
+        filters={filters}
+        options={undefined}
+        onRemove={() => {}}
+        onClearAll={() => {}}
+      />
+    )
+    expect(quick).toContain('>仅非 2xx<')
+    expect(quick).toContain('>所有失败<')
+    expect(quick).not.toContain('仅错误')
+    expect(active).toContain('所有失败（含流式 200）')
+  })
+})

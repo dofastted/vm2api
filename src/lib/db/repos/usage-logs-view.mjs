@@ -38,6 +38,7 @@ const EXPORT_LIMIT_MAX = 5000
 /** Newest rows an export reads when classes must be filtered in JS. */
 const EXPORT_SCAN_CAP = 10000
 const DEFAULT_VIA = 'go-worker-pool'
+const FAILED_ONLY_PRED = `((status IS NULL OR status < 200 OR status >= 300) OR (final_state IS NOT NULL AND final_state != '' AND final_state != 'verified') OR ${ERROR_PRED})`
 
 const BLOCKED_STATES = {
   distill_blocked: 'distill',
@@ -350,6 +351,7 @@ function buildFilter(filters, defaultMuted) {
   if (filters.debug_only) where.push("log_mode = 'debug'")
   // Legacy export `status=error`: the error predicate without picking a class.
   if (filters.errors_only) where.push(ERROR_PRED)
+  if (filters.failed_only) where.push(FAILED_ONLY_PRED)
   const start = isoOrNull(filters.start_time)
   if (start) {
     where.push('created_at >= ?')
