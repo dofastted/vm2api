@@ -26,6 +26,7 @@ import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { attachFailureDecision, AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
 import { PoisonRequestGuard } from './poison-request-guard.mjs'
+import { inferRateLimitWindow } from './rate-limit-service.mjs'
 
 // Seat wait for the one-shot repair hop when the rejected hop already spent the deadline.
 const REPAIR_HOP_WAIT_MS = 30_000
@@ -1248,6 +1249,7 @@ export class FailoverRunner {
           schedulingMs: selected.schedulingMs,
         })
         attemptStarted = started
+        const attemptResetGenerations = this.scheduler?.accountQuota?.resetGenerations?.(selected.accountId) || null
         const repairKey = searchRepairKey(stickyKey, model, selected)
         const hint = this.searchRepairs.get(repairKey)
         if (hint && hint.expiresAt <= Date.now()) this.searchRepairs.delete(repairKey)
@@ -1305,7 +1307,13 @@ export class FailoverRunner {
           },
         })
         noteHop(result)
-        if (result) result.committed = result.committed || committed
+        if (result) {
+          result.committed = result.committed || committed
+          if (result.attemptStartedAt == null) result.attemptStartedAt = attemptStarted
+          if (result.attemptResetGenerations == null && attemptResetGenerations) {
+            result.attemptResetGenerations = attemptResetGenerations
+          }
+        }
         adoptProviderResponseHeaders(result)
         if (signal?.aborted || isClientCancelledResult(result)) {
           this.attemptsRepo?.complete?.(requestId, attemptNo, {
@@ -1380,9 +1388,30 @@ export class FailoverRunner {
                 vmId: selected.vmId,
                 result,
                 policy,
+                requestStartedAt: attemptStarted,
+                resetGenerations: attemptResetGenerations,
               }) || null
             : null
-        if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
+        let preResetRateLimitIgnored = hardBlock?.ignored === true
+        if (
+          !preResetRateLimitIgnored &&
+          !this.rateLimitService &&
+          !result?.committed &&
+          !pinVmId &&
+          policy.action === 'continue-and-cooldown' &&
+          (policy.reason === 'account_quota_exhausted' || policy.reason === 'fable_rate_limited') &&
+          this.scheduler?.accountQuota?.isPreResetResponse
+        ) {
+          const targetWindow =
+            policy.reason === 'fable_rate_limited' ? '7d_oi' : inferRateLimitWindow(result, Date.now())
+          preResetRateLimitIgnored = !!this.scheduler.accountQuota.isPreResetResponse(selected.accountId, targetWindow, {
+            requestStartedAt: attemptStarted,
+            resetGenerations: attemptResetGenerations,
+          })
+        }
+        if (preResetRateLimitIgnored && policy.action === 'continue-and-cooldown') {
+          policy = { ...policy, action: 'continue', cooldownUntil: null }
+        } else if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
           policy = { ...policy, cooldownUntil: hardBlock.until }
         }
 

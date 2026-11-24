@@ -43,7 +43,7 @@ import { probeAccount } from '../oauth/usage-probe.mjs'
 import { queryOpenaiQuota, resetOpenaiQuota } from '../oauth/openai-quota.mjs'
 import { queryClaudeResetCredits, redeemClaudeResetCredit } from '../oauth/claude-reset-credits.mjs'
 import { canOfficialUsage, credentialModeOfVm, isSetupTokenMode } from '../oauth/credential-mode.mjs'
-import { getUsageCache } from '../oauth/usage-cache.mjs'
+import { attachUsageFetchMeta, getUsageCache, getUsageFetchMeta } from '../oauth/usage-cache.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { filterVmsForPanel } from './resource-owner.mjs'
 import { nodePlatform } from '../cluster/placement.mjs'
@@ -1119,7 +1119,17 @@ export async function buildClaudeResetQuery({ cfg, id, transport, now } = {}) {
   })
 }
 
-export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, card, transport, now } = {}) {
+export async function buildClaudeResetRedeem({
+  cfg,
+  accountQuota = null,
+  usageCache = null,
+  id,
+  idempotencyKey,
+  card,
+  transport,
+  now,
+} = {}) {
+  const clock = typeof now === 'function' ? now : () => Date.now()
   const result = await redeemClaudeResetCredit({
     projectRoot: cfg.paths.project,
     vmId: id,
@@ -1127,6 +1137,24 @@ export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, card, tr
     card,
     ...(transport ? { transport } : {}),
     ...(now ? { now } : {}),
+    onResetConfirmed: accountQuota?.recordQuotaReset
+      ? ({ accountId, receiptAccountId, operationId, cleared, at, replayed }) => {
+          // A replayed receipt created before a slot was rebound must not affect the new account.
+          if (!accountId || !receiptAccountId || receiptAccountId !== accountId) return
+          const recorded = accountQuota.recordQuotaReset(accountId, {
+            cleared,
+            at,
+            operationId,
+            now: clock(),
+            replayed,
+          })
+          if (recorded?.applied) {
+            try {
+              ;(usageCache || getUsageCache()).clear(accountId)
+            } catch {}
+          }
+        }
+      : null,
   })
   if (!result.ok) return claudeResetFail(result)
   return ok({
@@ -1273,7 +1301,16 @@ export async function buildProbeOne({
         probed_at: new Date().toISOString(),
         ...(headerProbe ? { ...headerProbe, error: null } : {}),
       }
-    : await cache.load(accountId, () => probeAccount({ exec, vm, includeFable }), { force: !!force })
+    : await cache.load(
+        accountId,
+        async () => {
+          const startedAt = Date.now()
+          const resetGenerations = accountQuota.resetGenerations?.(accountId) || null
+          const probed = await probeAccount({ exec, vm, includeFable })
+          return attachUsageFetchMeta(probed, { startedAt, resetGenerations })
+        },
+        { force: !!force },
+      )
   if (fatalUsageCredentialFailure(result)) {
     try {
       markVmRefreshError(path.join(cfg.paths.project, 'vms', `${id}.json`), {
@@ -1288,7 +1325,13 @@ export async function buildProbeOne({
   const profile = [result, acc?.unified, vm.claude, vm].find(
     (record) => record?.account_tier_source === 'profile' && ['pro', 'max'].includes(record.account_tier),
   )
-  if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result)
+  if (!skipHop) {
+    const fetchMeta = getUsageFetchMeta(result)
+    accountQuota.ingestOAuthUsage(accountId, result, {
+      ...(fetchMeta?.startedAt != null ? { startedAt: fetchMeta.startedAt } : {}),
+      ...(fetchMeta?.resetGenerations ? { resetGenerations: fetchMeta.resetGenerations } : {}),
+    })
+  }
   if (result.subscription_type) {
     persistVmSubscription(cfg.paths.project, id, result, {
       accountUuid: vm.claude?.account_uuid,

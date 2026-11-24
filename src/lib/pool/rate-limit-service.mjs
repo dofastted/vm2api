@@ -87,6 +87,21 @@ export function anthropic429Reset(headers = {}, now = Date.now()) {
   return null
 }
 
+export function infer429Window(headers = {}, parsed = null) {
+  if (parsed?.window) return parsed.window
+  if (isRejected(header(headers, 'anthropic-ratelimit-unified-7d-status'))) return '7d'
+  const claim = String(header(headers, 'anthropic-ratelimit-unified-representative-claim') || '').toLowerCase()
+  if (/seven_day_overage_included|7d_oi/.test(claim)) return '7d_oi'
+  if (/seven_day|7d/.test(claim)) return '7d'
+  return '5h'
+}
+
+export function inferRateLimitWindow(result = {}, now = Date.now()) {
+  const headers = extraHeadersFromLimitError(bodyMessage(result?.body), result?.headers || {}, now)
+  const parsed = anthropic429Reset(headers, now)
+  return infer429Window(headers, parsed)
+}
+
 export class RateLimitService {
   constructor({ runtimeRepo = null, accountQuota = null, config = {}, onUsageProbe = null } = {}) {
     this.runtimeRepo = runtimeRepo
@@ -108,14 +123,50 @@ export class RateLimitService {
    * account until its reset, a short limit just passes. Retry-After alone
    * never proves a plan window.
    */
-  handleUpstreamError({ accountId, vmId, result = {}, policy = null, now = Date.now() } = {}) {
+  handleUpstreamError({
+    accountId,
+    vmId,
+    result = {},
+    policy = null,
+    now = Date.now(),
+    requestStartedAt = null,
+    resetGenerations = null,
+  } = {}) {
     if (!accountId || !this.runtimeRepo || result?.committed || policy?.scope === 'request') return null
     const reason = String(policy?.reason || '')
-    if (Number(result?.status) === 429) {
-      this.requestUsageProbe({ accountId, vmId, now })
+    if (reason === 'fable_rate_limited') {
+      if (
+        this.accountQuota?.isPreResetResponse?.(accountId, '7d_oi', {
+          requestStartedAt,
+          resetGenerations,
+        })
+      ) {
+        return { kind: 'pre_reset_ignored', ignored: true, window: '7d_oi' }
+      }
+      if (Number(result?.status) === 429) {
+        this.requestUsageProbe({ accountId, vmId, now })
+      }
+      return null
     }
     if (policy?.scope === 'account' && reason === 'account_quota_exhausted') {
-      return this.handle429({ accountId, vmId, result, now })
+      const headers = extraHeadersFromLimitError(bodyMessage(result.body), result.headers || {}, now)
+      const parsed = anthropic429Reset(headers, now)
+      const targetWindow = infer429Window(headers, parsed)
+      if (
+        this.accountQuota?.isPreResetResponse?.(accountId, targetWindow, {
+          requestStartedAt,
+          resetGenerations,
+        })
+      ) {
+        return { kind: 'pre_reset_ignored', ignored: true, window: targetWindow }
+      }
+      if (Number(result?.status) === 429) {
+        this.requestUsageProbe({ accountId, vmId, now })
+      }
+      return this.handle429({ accountId, vmId, result, now, requestStartedAt, resetGenerations })
+    }
+    if (Number(result?.status) === 429) {
+      this.requestUsageProbe({ accountId, vmId, now })
     }
     if (reason === 'rate_limited_unknown') return null
     if (reason === 'provider_overloaded' && Number(result?.status) === 529) {
@@ -143,9 +194,18 @@ export class RateLimitService {
     return true
   }
 
-  handle429({ accountId, vmId, result = {}, now = Date.now() }) {
+  handle429({ accountId, vmId, result = {}, now = Date.now(), requestStartedAt = null, resetGenerations = null }) {
     const headers = extraHeadersFromLimitError(bodyMessage(result.body), result.headers || {}, now)
     const parsed = anthropic429Reset(headers, now)
+    const targetWindow = infer429Window(headers, parsed)
+    if (
+      this.accountQuota?.isPreResetResponse?.(accountId, targetWindow, {
+        requestStartedAt,
+        resetGenerations,
+      })
+    ) {
+      return null
+    }
     const fallback = !parsed
     const resetAt = parsed?.resetAt || now + this.config.fallback_cooldown_min * 60_000
     const windowEnd = parsed?.fiveHourReset || (parsed?.window === '7d' ? null : resetAt)
@@ -161,6 +221,9 @@ export class RateLimitService {
         exhausted: true,
         status: 429,
         countRequest: false,
+        now,
+        ...(requestStartedAt != null ? { requestStartedAt } : {}),
+        ...(resetGenerations ? { resetGenerations } : {}),
       })
     } catch {}
     if (fallback) this.requestUsageProbe({ accountId, vmId, now })
@@ -177,8 +240,23 @@ export class RateLimitService {
    * Update the session window on every response with live headers.
    * An out-of-range reset is ignored. `allowed` is the only early unblock.
    */
-  updateSessionWindow({ accountId, vmId = null, headers = {}, now = Date.now() } = {}) {
+  updateSessionWindow({
+    accountId,
+    vmId = null,
+    headers = {},
+    now = Date.now(),
+    requestStartedAt = null,
+    resetGenerations = null,
+  } = {}) {
     if (!accountId || !this.runtimeRepo) return false
+    if (
+      this.accountQuota?.isPreResetResponse?.(accountId, '5h', {
+        requestStartedAt,
+        resetGenerations,
+      })
+    ) {
+      return false
+    }
     const status = String(header(headers, 'anthropic-ratelimit-unified-5h-status') || '').toLowerCase()
     if (!status) return false
     const patch = { vmId, sessionWindowStatus: status }

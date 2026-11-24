@@ -115,12 +115,22 @@ export function createImportCommit(ctx) {
   }
 
   function officialCcStatsHandler(vmId, accountUuid = null) {
+    const startedAt = Date.now()
+    const initialAccountId = accountUuid || getVm(ctx.cfg.paths.project, vmId)?.claude?.account_uuid || vmId
+    const resetGenerations = ctx.accountQuota?.resetGenerations?.(initialAccountId) || null
     return (stats) => {
       if (stats?.subscription_type) persistVmSubscription(ctx.cfg.paths.project, vmId, stats, { accountUuid })
       const accountId = accountUuid || getVm(ctx.cfg.paths.project, vmId)?.claude?.account_uuid || vmId
       if (stats?.five_hour || stats?.seven_day || stats?.seven_day_oi || stats?.extra_usage) {
         try {
-          ctx.accountQuota.ingestOAuthUsage(accountId, { usage_status: 200, ok: true, ...stats })
+          ctx.accountQuota.ingestOAuthUsage(
+            accountId,
+            { usage_status: 200, ok: true, ...stats },
+            {
+              startedAt,
+              ...(accountId === initialAccountId && resetGenerations ? { resetGenerations } : {}),
+            },
+          )
         } catch {}
       }
       if (
