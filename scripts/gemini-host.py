@@ -33,8 +33,17 @@ from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-MAX_ENVIRONMENTS = 8
+MAX_NETNS_SLOTS = 8
+MAX_ENVIRONMENTS = 256
 MAX_CONCURRENCY = 64
+MAX_ACCOUNTS_PER_DAEMON = 256
+DEFAULT_ACCOUNTS_PER_DAEMON = 50
+SHARD_HEALTH_FAIL_THRESHOLD = 3
+SHARD_RESTART_BACKOFF_MIN = 2.0
+SHARD_RESTART_BACKOFF_MAX = 60.0
+SHARD_ID = re.compile(r"shard-[0-9]{1,4}\Z")
+LIFECYCLE_ACTIONS = frozenset({"pause", "resume", "recycle", "reset_circuit"})
+SCHEDULING_STRATEGIES = frozenset({"balanced", "fill", "round_robin"})
 AUTH_TTL = 300
 AUTH_MIN_SETTLE_SECONDS = 3.0
 AUTH_SETTLE_SECONDS = 6.0
@@ -127,6 +136,157 @@ NATIVE_HEALTH_POLL_INTERVAL = 15.0
 NATIVE_WARM_BACKOFF_MIN = 2.0
 NATIVE_WARM_BACKOFF_MAX = 60.0
 NATIVE_DEFAULT_MODEL = "gemini-3-flash"
+DEFAULT_RUNTIME_POLICY = {
+    "strategy": "balanced",
+    "accounts_per_daemon": DEFAULT_ACCOUNTS_PER_DAEMON,
+    "daemon_fault_isolation": True,
+    "max_concurrency_per_account": 2,
+    "min_warm_slots": 1,
+    "session_idle_ttl_secs": NATIVE_SESSION_TTL,
+    "max_queue": 16,
+    "queue_timeout_ms": 10000,
+    "timeout_ms": 120000,
+    "first_byte_timeout_ms": 90000,
+    "idle_timeout_ms": 15000,
+    "circuit_failure_threshold": 3,
+    "circuit_open_ms": 30000,
+    "sticky_enabled": True,
+    "sticky_ttl_secs": 3600,
+    "require_shm": True,
+    "shm_request_mb": 4,
+    "shm_response_mb": 16,
+}
+
+
+def _clamp_policy_int(value, lo, hi, fallback):
+    if type(value) is bool or not isinstance(value, (int, float)):
+        return fallback
+    num = int(round(value))
+    return max(lo, min(hi, num))
+
+
+def normalize_runtime_policy(raw=None, base=None):
+    merged = dict(DEFAULT_RUNTIME_POLICY)
+    if isinstance(base, dict):
+        merged.update(base)
+    if not isinstance(raw, dict):
+        return merged
+    pool = raw.get("pool") if isinstance(raw.get("pool"), dict) else raw
+    sticky = raw.get("sticky") if isinstance(raw.get("sticky"), dict) else raw
+    shm = raw.get("shm") if isinstance(raw.get("shm"), dict) else raw
+    strategy = pool.get("strategy", raw.get("strategy", merged["strategy"]))
+    if strategy in SCHEDULING_STRATEGIES:
+        merged["strategy"] = strategy
+    merged["accounts_per_daemon"] = _clamp_policy_int(
+        pool.get("accounts_per_daemon", raw.get("accounts_per_daemon")),
+        1,
+        MAX_ACCOUNTS_PER_DAEMON,
+        merged["accounts_per_daemon"],
+    )
+    if isinstance(pool.get("daemon_fault_isolation"), bool):
+        merged["daemon_fault_isolation"] = pool["daemon_fault_isolation"]
+    elif isinstance(raw.get("daemon_fault_isolation"), bool):
+        merged["daemon_fault_isolation"] = raw["daemon_fault_isolation"]
+    merged["max_concurrency_per_account"] = _clamp_policy_int(
+        pool.get("max_concurrency_per_account", raw.get("max_concurrency_per_account")),
+        1,
+        MAX_CONCURRENCY,
+        merged["max_concurrency_per_account"],
+    )
+    merged["min_warm_slots"] = min(
+        merged["max_concurrency_per_account"],
+        _clamp_policy_int(
+            pool.get("min_warm_slots", raw.get("min_warm_slots")),
+            0,
+            16,
+            merged["min_warm_slots"],
+        ),
+    )
+    raw_ttl = pool.get("session_idle_ttl_secs", raw.get("session_idle_ttl_secs"))
+    if raw_ttl == 0 and type(raw_ttl) is int:
+        merged["session_idle_ttl_secs"] = 0
+    elif raw_ttl is not None:
+        merged["session_idle_ttl_secs"] = _clamp_policy_int(
+            raw_ttl, 10, 86400, merged["session_idle_ttl_secs"]
+        )
+    merged["max_queue"] = _clamp_policy_int(
+        pool.get("max_queue", raw.get("max_queue")), 0, 64, merged["max_queue"]
+    )
+    merged["queue_timeout_ms"] = _clamp_policy_int(
+        pool.get("queue_timeout_ms", raw.get("queue_timeout_ms")),
+        100,
+        600000,
+        merged["queue_timeout_ms"],
+    )
+    merged["timeout_ms"] = _clamp_policy_int(
+        pool.get("timeout_ms", raw.get("timeout_ms")),
+        100,
+        600000,
+        merged["timeout_ms"],
+    )
+    merged["first_byte_timeout_ms"] = _clamp_policy_int(
+        pool.get("first_byte_timeout_ms", raw.get("first_byte_timeout_ms")),
+        100,
+        600000,
+        merged["first_byte_timeout_ms"],
+    )
+    merged["idle_timeout_ms"] = _clamp_policy_int(
+        pool.get("idle_timeout_ms", raw.get("idle_timeout_ms")),
+        100,
+        600000,
+        merged["idle_timeout_ms"],
+    )
+    merged["circuit_failure_threshold"] = _clamp_policy_int(
+        pool.get("circuit_failure_threshold", raw.get("circuit_failure_threshold")),
+        0,
+        20,
+        merged["circuit_failure_threshold"],
+    )
+    merged["circuit_open_ms"] = _clamp_policy_int(
+        pool.get("circuit_open_ms", raw.get("circuit_open_ms")),
+        1000,
+        600000,
+        merged["circuit_open_ms"],
+    )
+    if isinstance(sticky.get("enabled"), bool):
+        merged["sticky_enabled"] = sticky["enabled"]
+    elif isinstance(raw.get("sticky_enabled"), bool):
+        merged["sticky_enabled"] = raw["sticky_enabled"]
+    sticky_ttl = sticky.get("ttl_seconds", raw.get("sticky_ttl_secs"))
+    if sticky_ttl is not None:
+        merged["sticky_ttl_secs"] = _clamp_policy_int(
+            sticky_ttl, 0, 604800, merged["sticky_ttl_secs"]
+        )
+    if isinstance(shm.get("require_shm"), bool):
+        merged["require_shm"] = shm["require_shm"]
+    elif isinstance(raw.get("require_shm"), bool):
+        merged["require_shm"] = raw["require_shm"]
+    merged["shm_request_mb"] = _clamp_policy_int(
+        shm.get("request_mb", raw.get("shm_request_mb")),
+        1,
+        64,
+        merged["shm_request_mb"],
+    )
+    merged["shm_response_mb"] = _clamp_policy_int(
+        shm.get("response_mb", raw.get("shm_response_mb")),
+        1,
+        64,
+        merged["shm_response_mb"],
+    )
+    return merged
+
+
+def runtime_policy_to_kernel_patch(policy):
+    pol = normalize_runtime_policy(policy)
+    return {
+        "strategy": pol["strategy"],
+        "max_accounts": pol["accounts_per_daemon"],
+        "sticky_enabled": pol["sticky_enabled"],
+        "sticky_ttl_secs": pol["sticky_ttl_secs"],
+        "require_shm": pol["require_shm"],
+        "circuit_failure_threshold": pol["circuit_failure_threshold"],
+        "circuit_open_ms": pol["circuit_open_ms"],
+    }
 BLOCKING_ACCOUNT_ELIGIBILITIES = frozenset(
     {"verification_required", "location_unsupported", "ineligible"}
 )
@@ -497,7 +657,7 @@ class Agy:
     def __init__(self, host, environment, proxy_url, profile=None, size=(180, 40)):
         self.host = host
         self.environment = environment
-        self.slot = environment["slot"]
+        self.slot = environment["slot"] % MAX_NETNS_SLOTS
         self.uid = host.uid_base + self.slot
         self.attempt = secrets.token_hex(16)
         dirname = self.attempt if profile is None else "terminal-" + self.attempt
@@ -1030,17 +1190,29 @@ class NativeAgy(Agy):
             "--log-file",
             "/tmp/craggemini/" + native_module_impl.ELIGIBILITY_LOG_FILE,
         ]
+        pol = normalize_runtime_policy(getattr(self.host, "runtime_policy", None))
         kernel_cfg = {
             "run_dir": "/tmp/craggemini",
             "internal_token": self.native_token,
             "session_id": self.attempt,
             "model": self.model,
             "agy_sha256": AGY_SHA256,
-            "timeout_ms": 120000,
-            "first_byte_timeout_ms": 90000,
-            "idle_timeout_ms": 15000,
-            "queue_timeout_ms": 1000,
-            "max_queue": max(4, self.max_concurrency * 2) if self.pool_mode else 1,
+            "timeout_ms": pol["timeout_ms"],
+            "first_byte_timeout_ms": pol["first_byte_timeout_ms"],
+            "idle_timeout_ms": pol["idle_timeout_ms"],
+            "queue_timeout_ms": pol["queue_timeout_ms"],
+            "max_queue": max(pol["max_queue"], self.max_concurrency * 2)
+            if self.pool_mode
+            else 1,
+            "shm_request_bytes": pol["shm_request_mb"] * 1024 * 1024,
+            "shm_response_bytes": pol["shm_response_mb"] * 1024 * 1024,
+            "strategy": pol["strategy"],
+            "max_accounts": 1,
+            "sticky_enabled": pol["sticky_enabled"],
+            "sticky_ttl_secs": pol["sticky_ttl_secs"],
+            "require_shm": pol["require_shm"],
+            "circuit_failure_threshold": pol["circuit_failure_threshold"],
+            "circuit_open_ms": pol["circuit_open_ms"],
             "vm_id": self.environment["id"],
             "license_dir": "/run/kin/crag-license",
             "host_license_dir": "/run/kin/crag-host",
@@ -1067,8 +1239,10 @@ class NativeAgy(Agy):
                             ).hexdigest(),
                             "netns_transparent_egress": True,
                             "max_concurrency": self.max_concurrency,
-                            "min_warm_slots": 1,
-                            "session_idle_ttl_secs": NATIVE_SESSION_TTL,
+                            "min_warm_slots": min(
+                                self.max_concurrency, pol["min_warm_slots"]
+                            ),
+                            "session_idle_ttl_secs": pol["session_idle_ttl_secs"],
                             "model": self.model,
                             "agy_args": agy_args,
                             "oauth_proxy_required": True,
@@ -1428,6 +1602,586 @@ class NativeSession(NativeAgy):
             )
         except OSError:
             return False
+
+    def apply_policy(self, policy):
+        if not self.is_alive():
+            return False
+        patch = runtime_policy_to_kernel_patch(policy)
+        patch["max_accounts"] = 1
+        status, _ = native_module().worker_json_request(
+            self.socket_path, self.native_token, "PUT", "/internal/v1/policy", patch
+        )
+        return status == 200
+
+    def account_lifecycle(self, account_id, action):
+        if not self.is_alive() or action not in LIFECYCLE_ACTIONS:
+            return None
+        status, data = native_module().worker_json_request(
+            self.socket_path,
+            self.native_token,
+            "POST",
+            f"/internal/v1/accounts/{account_id}/lifecycle",
+            {"action": action},
+        )
+        return data if status == 200 else None
+
+
+class CragDaemonShard:
+    """Single CRAGGemini daemon shard supervising up to accounts_per_daemon (default 50)
+    OAuth accounts with per-account LocalProxyBridge isolation and per-slot memfd SHM rings."""
+
+    def __init__(self, host, shard_id, initial_members, policy=None):
+        self.host = host
+        self.shard_id = shard_id
+        self.uid = host.egress_uid
+        self.attempt = secrets.token_hex(16)
+        self.policy = normalize_runtime_policy(
+            policy if policy is not None else getattr(host, "runtime_policy", None)
+        )
+        self.directory = host.directory / "_shards" / f"{shard_id}-{self.attempt[:12]}"
+        self.accounts_root = self.directory / "accounts"
+        self.native_dir = None
+        self._owns_native_dir = False
+        self.native_token = secrets.token_hex(32)
+        self.process = None
+        self.members = {}
+        self.started_at = now()
+        self.last_used = time.monotonic()
+        self._health_failures = 0
+        self._ever_ready = False
+        self._last_health = None
+        self._last_health_at = 0.0
+        self._lock = threading.RLock()
+        try:
+            self._start(initial_members)
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def socket_path(self):
+        return str(self.native_dir / "kernel.sock")
+
+    @staticmethod
+    def _agy_args_for(model):
+        return [
+            "--mode",
+            "plan",
+            "--dangerously-skip-permissions",
+            "--add-dir",
+            "/accounts",
+            "--model",
+            model,
+            "--settings",
+            json.dumps(NATIVE_CLI_SETTINGS, separators=(",", ":")),
+        ]
+
+    def _stage_account_files(self, env, auth):
+        env_id = env["id"]
+        acc_root = self.accounts_root / env_id
+        home = acc_root / "home"
+        work = acc_root / "work"
+        settings_dir = home / ".gemini" / "antigravity-cli"
+        for directory in (acc_root, home, home / ".gemini", settings_dir, work):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chown(directory, self.uid, self.uid)
+        private_json(settings_dir / "settings.json", NATIVE_CLI_SETTINGS)
+        os.chown(settings_dir / "settings.json", self.uid, self.uid)
+        profile_name = env.get("profile")
+        if isinstance(profile_name, str) and profile_name:
+            src_cli = (
+                self.host.directory
+                / env_id
+                / profile_name
+                / "home"
+                / ".gemini"
+                / "antigravity-cli"
+            )
+            src_uid = self.host.env_uid(env)
+            for rel in ("installation_id", "cache/default_project_id.txt"):
+                src = src_cli / rel
+                dst = settings_dir / rel
+                try:
+                    fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    with os.fdopen(fd, "rb") as stream:
+                        info = os.fstat(stream.fileno())
+                        if (
+                            stat.S_ISREG(info.st_mode)
+                            and info.st_uid == src_uid
+                            and 0 < info.st_size <= 4096
+                        ):
+                            raw = stream.read(4097)
+                            if 0 < len(raw) <= 4096:
+                                dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                                os.chown(dst.parent, self.uid, self.uid)
+                                dst.write_bytes(raw)
+                                os.chmod(dst, 0o600)
+                                os.chown(dst, self.uid, self.uid)
+                except OSError:
+                    pass
+        token_bytes = auth[1] if isinstance(auth, tuple) and len(auth) > 1 else None
+        if isinstance(token_bytes, (bytes, bytearray)) and token_bytes:
+            token_path = settings_dir / TOKEN_NAME
+            token_path.write_bytes(token_bytes)
+            os.chmod(token_path, 0o600)
+            os.chown(token_path, self.uid, self.uid)
+        return f"/accounts/{env_id}/home", f"/accounts/{env_id}/work"
+
+    def _account_binding_payload(self, env, proxy_url, model):
+        env_id = env["id"]
+        conc = max(env_concurrency(env), 1)
+        min_warm = min(conc, self.policy["min_warm_slots"])
+        return {
+            "account_id": env_id,
+            "env_id": env_id,
+            "agy_home": f"/accounts/{env_id}/home",
+            "work_dir": f"/accounts/{env_id}/work",
+            "run_dir": f"/tmp/craggemini/acc-{env_id}",
+            "proxy_id": env["proxy_id"],
+            "proxy_url": proxy_url,
+            "proxy_sha256": hashlib.sha256(proxy_url.encode()).hexdigest(),
+            "netns_transparent_egress": False,
+            "max_concurrency": conc,
+            "min_warm_slots": min_warm,
+            "session_idle_ttl_secs": self.policy["session_idle_ttl_secs"],
+            "model": model,
+            "agy_args": self._agy_args_for(model),
+            "oauth_proxy_required": True,
+            "enabled": True,
+        }
+
+    def _start(self, initial_members):
+        shards_parent = self.directory.parent
+        shards_parent.mkdir(mode=0o711, exist_ok=True)
+        shards_parent.chmod(0o711)
+        self.directory.mkdir(mode=0o711)
+        self.directory.chmod(0o711)
+        self.accounts_root.mkdir(mode=0o700)
+        os.chown(self.accounts_root, self.uid, self.uid)
+
+        candidate = self.directory / "native"
+        if len(str(candidate / "kernel.sock").encode("utf-8")) > 96:
+            NATIVE_RUNTIME_ROOT.mkdir(mode=0o711, exist_ok=True)
+            os.chmod(NATIVE_RUNTIME_ROOT, 0o711)
+            check_root_owned(NATIVE_RUNTIME_ROOT)
+            self.native_dir = (
+                NATIVE_RUNTIME_ROOT / f"sh-{self.shard_id}-{self.attempt[:10]}"
+            )
+            self._owns_native_dir = True
+        else:
+            self.native_dir = candidate
+            self._owns_native_dir = False
+        self.native_dir.mkdir(mode=0o700)
+        os.chown(self.native_dir, self.uid, self.uid)
+
+        accounts_cfg = []
+        default_model = NATIVE_DEFAULT_MODEL
+        for env, proxy_url, auth, model in initial_members:
+            self._stage_account_files(env, auth)
+            effective_model = model or self.host._initial_session_model(env)
+            default_model = effective_model
+            accounts_cfg.append(
+                self._account_binding_payload(env, proxy_url, effective_model)
+            )
+            self.members[env["id"]] = {
+                "proxy_id": env["proxy_id"],
+                "proxy_hash": hashlib.sha256(proxy_url.encode()).digest(),
+                "max_concurrency": env_concurrency(env),
+                "model": effective_model,
+            }
+
+        pol = self.policy
+        kernel_cfg = {
+            "run_dir": "/tmp/craggemini",
+            "internal_token": self.native_token,
+            "session_id": self.attempt,
+            "model": default_model,
+            "agy_sha256": AGY_SHA256,
+            "timeout_ms": pol["timeout_ms"],
+            "first_byte_timeout_ms": pol["first_byte_timeout_ms"],
+            "idle_timeout_ms": pol["idle_timeout_ms"],
+            "queue_timeout_ms": pol["queue_timeout_ms"],
+            "max_queue": max(pol["max_queue"], 16),
+            "shm_request_bytes": pol["shm_request_mb"] * 1024 * 1024,
+            "shm_response_bytes": pol["shm_response_mb"] * 1024 * 1024,
+            "strategy": pol["strategy"],
+            "max_accounts": pol["accounts_per_daemon"],
+            "sticky_enabled": pol["sticky_enabled"],
+            "sticky_ttl_secs": pol["sticky_ttl_secs"],
+            "require_shm": pol["require_shm"],
+            "circuit_failure_threshold": pol["circuit_failure_threshold"],
+            "circuit_open_ms": pol["circuit_open_ms"],
+            "agy_bin": "/opt/agy",
+            "bridge_so": "/opt/libagy_bridge.so",
+            "verify_agy_sha256": True,
+            "strict_unique_proxy": False,
+            "require_proxy_calibration": False,
+            "vm_id": self.shard_id,
+            "license_dir": "/run/kin/crag-license",
+            "host_license_dir": "/run/kin/crag-host",
+            "accounts": accounts_cfg,
+        }
+        config_path = self.native_dir / "kernel.json"
+        private_json(config_path, kernel_cfg)
+        os.chown(config_path, self.uid, self.uid)
+
+        license_dir = self.directory / "crag-license"
+        license_dir.mkdir(mode=0o700)
+        os.chown(license_dir, self.uid, self.uid)
+
+        hostname = f"ws-{self.shard_id}"
+        identity_files = {
+            "resolv.conf": "nameserver 1.1.1.1\noptions timeout:2 attempts:2\n",
+            "passwd": f"agy:x:{self.uid}:{self.uid}:Antigravity:/accounts:/bin/sh\n",
+            "group": f"agy:x:{self.uid}:\n",
+            "nsswitch.conf": "passwd: files\ngroup: files\nhosts: files dns\n",
+            "hosts": f"127.0.0.1 localhost {hostname}\n::1 localhost\n",
+        }
+        identity = []
+        for name, contents in identity_files.items():
+            target = self.directory / name
+            target.write_text(contents, encoding="ascii")
+            target.chmod(0o644)
+            identity += ["--ro-bind", str(target), "/etc/" + name]
+
+        crag_mounts = [
+            "--dir",
+            "/run",
+            "--dir",
+            "/run/kin",
+            "--dir",
+            "/run/kin/crag-license",
+            "--bind",
+            str(license_dir),
+            "/run/kin/crag-license",
+        ]
+        if self.host.crag_host_dir is not None and self.host.crag_host_dir.is_dir():
+            crag_mounts.extend(
+                [
+                    "--dir",
+                    "/run/kin/crag-host",
+                    "--ro-bind",
+                    str(self.host.crag_host_dir),
+                    "/run/kin/crag-host",
+                ]
+            )
+        if self.host.payload_mode == "crag_subscription":
+            crag_mounts.extend(
+                [
+                    "--ro-bind",
+                    str(self.host.payload / "craggemini.payload.enc"),
+                    "/opt/craggemini.payload.enc",
+                    "--ro-bind",
+                    str(self.host.payload / "manifest.json"),
+                    "/opt/manifest.json",
+                    "--ro-bind",
+                    str(self.host.payload / "crag-license-public.pem"),
+                    "/opt/crag-license-public.pem",
+                ]
+            )
+
+        argv = [
+            "setpriv",
+            "--reuid",
+            str(self.uid),
+            "--regid",
+            str(self.uid),
+            "--clear-groups",
+            "--no-new-privs",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+            "--bounding-set=-all",
+            "bwrap",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--hostname",
+            hostname,
+            "--die-with-parent",
+            "--clearenv",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind-try",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
+            "--ro-bind-try",
+            "/bin",
+            "/bin",
+            "--ro-bind-try",
+            "/etc/ssl/certs",
+            "/etc/ssl/certs",
+            *identity,
+            *crag_mounts,
+            "--ro-bind",
+            str(self.host.payload / "agy"),
+            "/opt/agy",
+            "--ro-bind",
+            str(self.host.payload / "craggemini"),
+            "/opt/craggemini",
+            "--ro-bind",
+            str(self.host.payload / "libagy_bridge.so"),
+            "/opt/libagy_bridge.so",
+            "--dir",
+            "/accounts",
+            "--bind",
+            str(self.accounts_root),
+            "/accounts",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--dir",
+            "/tmp/craggemini",
+            "--bind",
+            str(self.native_dir),
+            "/tmp/craggemini",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--setenv",
+            "TERM",
+            "xterm-256color",
+            "--setenv",
+            "LANG",
+            "C.UTF-8",
+            "--setenv",
+            "AGY_CLI_DISABLE_AUTO_UPDATE",
+            "true",
+            "--setenv",
+            "CRAGGEMINI_SESSION_ID",
+            self.attempt,
+            "--ro-bind",
+            str(NATIVE_MODULE),
+            "/opt/gemini_host_native.py",
+            "--",
+            "/usr/bin/python3",
+            "-I",
+            "/opt/gemini_host_native.py",
+            "--launch-native",
+            "/opt/agy",
+        ]
+        spawn = getattr(self.host, "spawn", lambda fn: fn())
+        try:
+            self.process = spawn(
+                lambda: subprocess.Popen(
+                    argv,
+                    env=SYSTEM_ENV,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            )
+        except OSError:
+            raise Failure(503, "gemini_native_worker_unavailable") from None
+
+    def is_alive(self):
+        return self.process is not None and self.process.poll() is None
+
+    def health(self, timeout=0.5):
+        if not self.is_alive():
+            self._last_health = None
+            self._health_failures = SHARD_HEALTH_FAIL_THRESHOLD
+            return None
+        status = native_module().worker_status(
+            self.socket_path, self.native_token, timeout=timeout
+        )
+        self._last_health = status
+        self._last_health_at = time.monotonic()
+        if (
+            isinstance(status, dict)
+            and status.get("ready") is True
+            and status.get("needs_recovery") is not True
+        ):
+            self._health_failures = 0
+            self._ever_ready = True
+        else:
+            self._health_failures += 1
+        return status
+
+    def is_severely_unhealthy(self):
+        if not self.is_alive():
+            return True
+        if isinstance(self._last_health, dict):
+            if self._last_health.get("needs_recovery") is True:
+                return True
+            if self._last_health.get("ok") is False:
+                return True
+        return self._health_failures >= SHARD_HEALTH_FAIL_THRESHOLD
+
+    def apply_policy(self, policy):
+        with self._lock:
+            self.policy = normalize_runtime_policy(policy, base=self.policy)
+            if not self.is_alive():
+                return False
+            patch = runtime_policy_to_kernel_patch(self.policy)
+            status, _ = native_module().worker_json_request(
+                self.socket_path, self.native_token, "PUT", "/internal/v1/policy", patch
+            )
+            return status == 200
+
+    def sync_account(self, env, proxy_url, auth, model=None):
+        with self._lock:
+            if not self.is_alive():
+                raise Failure(503, "gemini_native_worker_unavailable")
+            env_id = env["id"]
+            proxy_hash = hashlib.sha256(proxy_url.encode()).digest()
+            desired_conc = env_concurrency(env)
+            effective_model = model or self.host._initial_session_model(env)
+            self._stage_account_files(env, auth)
+            existing = self.members.get(env_id)
+            if existing is None:
+                payload = self._account_binding_payload(env, proxy_url, effective_model)
+                payload["auto_calibrate"] = False
+                status, _ = native_module().worker_json_request(
+                    self.socket_path,
+                    self.native_token,
+                    "POST",
+                    "/internal/v1/accounts",
+                    payload,
+                    timeout=10.0,
+                )
+                if status != 200:
+                    raise Failure(503, "gemini_native_worker_unavailable")
+                self.members[env_id] = {
+                    "proxy_id": env["proxy_id"],
+                    "proxy_hash": proxy_hash,
+                    "max_concurrency": desired_conc,
+                    "model": effective_model,
+                }
+                return True
+            if existing["proxy_id"] != env["proxy_id"] or not secrets.compare_digest(
+                existing["proxy_hash"], proxy_hash
+            ):
+                status, _ = native_module().worker_json_request(
+                    self.socket_path,
+                    self.native_token,
+                    "POST",
+                    f"/internal/v1/accounts/{env_id}/proxy",
+                    {
+                        "proxy_id": env["proxy_id"],
+                        "proxy_url": proxy_url,
+                        "proxy_sha256": hashlib.sha256(proxy_url.encode()).hexdigest(),
+                        "auto_calibrate": False,
+                    },
+                    timeout=10.0,
+                )
+                if status != 200:
+                    raise Failure(503, "gemini_native_worker_unavailable")
+                existing["proxy_id"] = env["proxy_id"]
+                existing["proxy_hash"] = proxy_hash
+            if existing["max_concurrency"] != desired_conc:
+                status, _ = native_module().worker_json_request(
+                    self.socket_path,
+                    self.native_token,
+                    "POST",
+                    f"/internal/v1/accounts/{env_id}/scale",
+                    {
+                        "runnable_slots": desired_conc,
+                        "max_concurrency": desired_conc,
+                        "idle_ttl_secs": self.policy["session_idle_ttl_secs"],
+                    },
+                    timeout=10.0,
+                )
+                if status == 200:
+                    existing["max_concurrency"] = desired_conc
+            return True
+
+    def remove_account(self, env_id):
+        with self._lock:
+            self.members.pop(env_id, None)
+            if self.is_alive():
+                native_module().worker_json_request(
+                    self.socket_path,
+                    self.native_token,
+                    "DELETE",
+                    f"/internal/v1/accounts/{env_id}",
+                    timeout=5.0,
+                )
+            acc_dir = self.accounts_root / env_id
+            if acc_dir.exists():
+                shutil.rmtree(acc_dir, ignore_errors=True)
+
+    def account_lifecycle(self, env_id, action):
+        if action not in LIFECYCLE_ACTIONS or not self.is_alive():
+            return None
+        status, data = native_module().worker_json_request(
+            self.socket_path,
+            self.native_token,
+            "POST",
+            f"/internal/v1/accounts/{env_id}/lifecycle",
+            {"action": action},
+            timeout=10.0,
+        )
+        return data if status == 200 else None
+
+    def open_stream(
+        self, env_id, request_id, body_obj, *, model=None, gateway_policy=None
+    ):
+        if not self.is_alive():
+            raise native_module().NativeFailure("gemini_native_worker_unavailable", 503)
+        self.last_used = time.monotonic()
+        effective_model = model or NATIVE_DEFAULT_MODEL
+        return native_module().open_worker_stream(
+            self.socket_path,
+            self.native_token,
+            effective_model,
+            request_id,
+            body_obj,
+            startup_timeout=45,
+            gateway_policy=gateway_policy,
+            account_id=env_id,
+        )
+
+    def cancel_turn(self, env_id, request_id):
+        try:
+            return native_module().cancel_worker_request(
+                self.socket_path, self.native_token, request_id, account_id=env_id
+            )
+        except OSError:
+            return False
+
+    def status_view(self, fault_meta=None):
+        health = self.health(timeout=0.35) if self.is_alive() else None
+        pool = health.get("pool") if isinstance(health, dict) and isinstance(health.get("pool"), dict) else {}
+        return {
+            "shard_id": self.shard_id,
+            "kind": "shard",
+            "alive": self.is_alive(),
+            "ready": bool(isinstance(health, dict) and health.get("ready") is True),
+            "pid": self.process.pid if self.process is not None else None,
+            "started_at": self.started_at,
+            "capacity": self.policy["accounts_per_daemon"],
+            "account_count": len(self.members),
+            "account_ids": sorted(self.members.keys()),
+            "active_slots": int(pool.get("active_slots") or 0),
+            "idle_slots": int(pool.get("idle_slots") or 0),
+            "total_slots": int(pool.get("total_slots") or 0),
+            "circuit_open_accounts": int(pool.get("circuit_open_accounts") or 0),
+            "shm_enabled": bool(self.policy.get("require_shm", True)),
+            "shm_ring_stats": pool.get("shm_ring_stats") or None,
+            "policy": pool.get("policy") or runtime_policy_to_kernel_patch(self.policy),
+            "accounts": pool.get("accounts") if isinstance(pool.get("accounts"), list) else [],
+            "fault_isolated": bool(fault_meta and fault_meta.get("isolated")),
+            "restart_count": int(fault_meta.get("restarts", 0)) if fault_meta else 0,
+        }
+
+    def close(self):
+        with self._lock:
+            if self.process is not None:
+                NativeAgy._stop_process_group(self.process)
+                self.process = None
+            if getattr(self, "_owns_native_dir", False) and self.native_dir is not None:
+                shutil.rmtree(self.native_dir, ignore_errors=True)
+                self._owns_native_dir = False
+            if self.directory.exists():
+                shutil.rmtree(self.directory, ignore_errors=True)
 
 
 class ResidentTestChatRun:
@@ -1809,14 +2563,19 @@ class Host:
         self.crag_host_dir = getattr(args, "crag_host_dir", None)
         self.egress = args.egress
         self.uid_base = args.uid_base
-        self.egress_uid = args.uid_base + MAX_ENVIRONMENTS
+        self.egress_uid = args.uid_base + MAX_NETNS_SLOTS
         self.state_file = self.directory / "environments.json"
+        self.policy_file = self.directory / "runtime-policy.json"
         self.lock = threading.RLock()
         self._spawner = _Spawner()
         self.pending = {}
         self.terminals = {}
         self.runs = {}
         self.native_sessions = {}
+        self.daemon_shards = {}
+        self._shard_locks = {}
+        self._shard_faults = {}
+        self._account_shard_map = {}
         self._session_locks = {}
         self._slot_networks = {}
         self._network_lease_lock = threading.Lock()
@@ -1825,6 +2584,7 @@ class Host:
         self._warming = set()
         self.active_infers = {}
         self.last_inference = {}
+        self.runtime_policy = self._load_runtime_policy()
         self.network_scope = os.stat("/proc/self/ns/net").st_ino
         self.environments = (
             json.loads(self.state_file.read_bytes()) if self.state_file.exists() else {}
@@ -1883,11 +2643,373 @@ class Host:
                 check_root_owned(NATIVE_RUNTIME_ROOT)
                 os.chmod(NATIVE_RUNTIME_ROOT, 0o711)
                 for stale in NATIVE_RUNTIME_ROOT.iterdir():
-                    if stale.is_dir() and re.fullmatch(r"s[0-9]+-[a-f0-9]{8,16}", stale.name):
+                    if stale.is_dir() and (
+                        re.fullmatch(r"s[0-9]+-[a-f0-9]{8,16}", stale.name)
+                        or re.fullmatch(r"sh-shard-[0-9]+-[a-f0-9]{8,16}", stale.name)
+                    ):
                         shutil.rmtree(stale, ignore_errors=True)
             except (OSError, RuntimeError):
                 pass
+        stale_shards = self.directory / "_shards"
+        if stale_shards.is_dir():
+            try:
+                check_root_owned(stale_shards)
+                shutil.rmtree(stale_shards, ignore_errors=True)
+            except (OSError, RuntimeError):
+                pass
         self.inspect_payload()
+
+    def env_uid(self, env):
+        return self.uid_base + (env["slot"] % MAX_NETNS_SLOTS)
+
+    def _load_runtime_policy(self):
+        try:
+            if self.policy_file.exists():
+                raw = json.loads(read_root_file(self.policy_file, 32768))
+                return normalize_runtime_policy(raw)
+        except (OSError, RuntimeError, ValueError):
+            pass
+        return dict(DEFAULT_RUNTIME_POLICY)
+
+    def _save_runtime_policy(self):
+        private_json(self.policy_file, self.runtime_policy)
+
+    def _use_sharded_daemon(self):
+        return (
+            int(
+                self.runtime_policy.get(
+                    "accounts_per_daemon", DEFAULT_ACCOUNTS_PER_DAEMON
+                )
+            )
+            > 1
+        )
+
+    def _shard_lock(self, shard_id):
+        with self.lock:
+            lock = self._shard_locks.get(shard_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._shard_locks[shard_id] = lock
+            return lock
+
+    def _shard_id_for_account(self, identifier):
+        per_daemon = max(
+            1,
+            int(
+                self.runtime_policy.get(
+                    "accounts_per_daemon", DEFAULT_ACCOUNTS_PER_DAEMON
+                )
+            ),
+        )
+        existing = self._account_shard_map.get(identifier)
+        if existing is not None:
+            shard = self.daemon_shards.get(existing)
+            if shard is None or len(shard.members) < per_daemon or identifier in shard.members:
+                return existing
+        oauth_ids = sorted(
+            env_id
+            for env_id, env in self.environments.items()
+            if env.get("auth_method", "oauth") == "oauth"
+        )
+        try:
+            rank = oauth_ids.index(identifier)
+        except ValueError:
+            rank = len(oauth_ids)
+        shard_id = f"shard-{rank // per_daemon}"
+        self._account_shard_map[identifier] = shard_id
+        return shard_id
+
+    def _is_shard_isolated(self, shard_id):
+        meta = self._shard_faults.get(shard_id)
+        if not meta:
+            return False
+        return time.monotonic() < meta.get("isolated_until", 0.0)
+
+    def _record_shard_fault(self, shard_id):
+        meta = self._shard_faults.setdefault(
+            shard_id, {"failures": 0, "restarts": 0, "isolated_until": 0.0}
+        )
+        meta["failures"] += 1
+        delay = min(
+            SHARD_RESTART_BACKOFF_MAX,
+            SHARD_RESTART_BACKOFF_MIN * (2 ** min(meta["failures"] - 1, 5)),
+        )
+        if self.runtime_policy.get("daemon_fault_isolation", True):
+            meta["isolated_until"] = time.monotonic() + delay
+        return meta
+
+    def _stop_shard(self, shard_id):
+        shard = self.daemon_shards.pop(shard_id, None)
+        if shard is not None:
+            shard.close()
+
+    def _remove_account_from_shard(self, identifier):
+        shard_id = self._account_shard_map.pop(identifier, None)
+        if shard_id is None:
+            return
+        shard = self.daemon_shards.get(shard_id)
+        if shard is not None:
+            try:
+                shard.remove_account(identifier)
+            except OSError:
+                pass
+
+    def apply_runtime_policy(self, raw_policy):
+        if raw_policy is not None and not isinstance(raw_policy, dict):
+            raise Failure(400)
+        prev_per_daemon = int(
+            self.runtime_policy.get("accounts_per_daemon", DEFAULT_ACCOUNTS_PER_DAEMON)
+        )
+        self.runtime_policy = normalize_runtime_policy(
+            raw_policy, base=self.runtime_policy
+        )
+        self._save_runtime_policy()
+        updated = 0
+        total = 0
+        for shard in list(self.daemon_shards.values()):
+            total += 1
+            if shard.apply_policy(self.runtime_policy):
+                updated += 1
+        for session in list(self.native_sessions.values()):
+            total += 1
+            if session.apply_policy(self.runtime_policy):
+                updated += 1
+        if (
+            prev_per_daemon != self.runtime_policy["accounts_per_daemon"]
+            and not self._use_sharded_daemon()
+        ):
+            for shard_id in list(self.daemon_shards):
+                if not any(
+                    self.active_infers.get(acc_id)
+                    for acc_id in self.daemon_shards[shard_id].members
+                ):
+                    self._stop_shard(shard_id)
+            self._account_shard_map.clear()
+        return {
+            "ok": True,
+            "shards_updated": updated,
+            "shards_total": total,
+            "policy": dict(self.runtime_policy),
+        }
+
+    def daemon_status(self):
+        shards = []
+        total_accounts = 0
+        total_active = 0
+        total_idle = 0
+        agg_shm = {
+            "requests_total": 0,
+            "responses_total": 0,
+            "request_bytes_total": 0,
+            "response_bytes_total": 0,
+            "crc_errors_total": 0,
+            "backpressure_waits_total": 0,
+        }
+        has_shm = False
+
+        def _merge_shm(stats):
+            nonlocal has_shm
+            if not isinstance(stats, dict):
+                return
+            has_shm = True
+            for key in agg_shm:
+                val = stats.get(key)
+                if isinstance(val, int) and val >= 0:
+                    agg_shm[key] += val
+
+        now_mono = time.monotonic()
+        for shard_id, shard in sorted(self.daemon_shards.items()):
+            fault = self._shard_faults.get(shard_id)
+            fault_view = {
+                "isolated": bool(fault and now_mono < fault.get("isolated_until", 0.0)),
+                "restarts": fault.get("restarts", 0) if fault else 0,
+            }
+            view = shard.status_view(fault_meta=fault_view)
+            shards.append(view)
+            total_accounts += view["account_count"]
+            total_active += view["active_slots"]
+            total_idle += view["idle_slots"]
+            _merge_shm(view.get("shm_ring_stats"))
+
+        for env_id, session in sorted(self.native_sessions.items()):
+            health = session.health(timeout=0.35) if session.is_alive() else None
+            pool = (
+                health.get("pool")
+                if isinstance(health, dict) and isinstance(health.get("pool"), dict)
+                else {}
+            )
+            shm_stats = pool.get("shm_ring_stats") or None
+            _merge_shm(shm_stats)
+            active_slots = int(pool.get("active_slots") or 0)
+            idle_slots = int(pool.get("idle_slots") or 0)
+            total_slots = int(pool.get("total_slots") or 0)
+            shards.append(
+                {
+                    "shard_id": f"acct-{env_id[-8:]}",
+                    "kind": "per_account",
+                    "alive": session.is_alive(),
+                    "ready": bool(isinstance(health, dict) and health.get("ready") is True),
+                    "pid": session.native_tui.pid
+                    if getattr(session, "native_tui", None) is not None
+                    else None,
+                    "capacity": 1,
+                    "account_count": 1,
+                    "account_ids": [env_id],
+                    "active_slots": active_slots,
+                    "idle_slots": idle_slots,
+                    "total_slots": total_slots,
+                    "circuit_open_accounts": int(pool.get("circuit_open_accounts") or 0),
+                    "shm_enabled": bool(self.runtime_policy.get("require_shm", True)),
+                    "shm_ring_stats": shm_stats,
+                    "policy": pool.get("policy")
+                    or runtime_policy_to_kernel_patch(self.runtime_policy),
+                    "accounts": pool.get("accounts")
+                    if isinstance(pool.get("accounts"), list)
+                    else [],
+                    "fault_isolated": False,
+                    "restart_count": 0,
+                }
+            )
+            total_accounts += 1
+            total_active += active_slots
+            total_idle += idle_slots
+
+        oauth_envs = sum(
+            1
+            for env in self.environments.values()
+            if env.get("auth_method", "oauth") == "oauth"
+            and env.get("auth_state") == "authorized"
+        )
+        per_daemon = int(
+            self.runtime_policy.get("accounts_per_daemon", DEFAULT_ACCOUNTS_PER_DAEMON)
+        )
+        planned_shards = (
+            (oauth_envs + per_daemon - 1) // per_daemon if oauth_envs > 0 else 0
+        )
+        return {
+            "mode": "sharded" if self._use_sharded_daemon() else "per_account",
+            "accounts_per_daemon": per_daemon,
+            "daemon_fault_isolation": bool(
+                self.runtime_policy.get("daemon_fault_isolation", True)
+            ),
+            "policy": dict(self.runtime_policy),
+            "planned_shards": planned_shards,
+            "authorized_oauth_accounts": oauth_envs,
+            "total_accounts": total_accounts,
+            "total_active_slots": total_active,
+            "total_idle_slots": total_idle,
+            "shm_ring_stats": agg_shm if has_shm else None,
+            "shards": shards,
+        }
+
+    def daemon_action(self, body):
+        action = body.get("action")
+        if action == "restart_shard":
+            shard_id = body.get("shard_id")
+            if not isinstance(shard_id, str) or not SHARD_ID.fullmatch(shard_id):
+                raise Failure(400)
+            shard = self.daemon_shards.get(shard_id)
+            if shard is not None:
+                if any(self.active_infers.get(acc_id) for acc_id in shard.members):
+                    raise Failure(409, "gemini_operation_busy")
+                self._stop_shard(shard_id)
+            meta = self._shard_faults.setdefault(
+                shard_id, {"failures": 0, "restarts": 0, "isolated_until": 0.0}
+            )
+            meta["failures"] = 0
+            meta["isolated_until"] = 0.0
+            meta["restarts"] += 1
+            return {"ok": True, "action": "restart_shard", "shard_id": shard_id}
+        if action == "rebalance":
+            restarted = 0
+            for shard_id, shard in list(self.daemon_shards.items()):
+                if any(self.active_infers.get(acc_id) for acc_id in shard.members):
+                    continue
+                self._stop_shard(shard_id)
+                restarted += 1
+            self._account_shard_map.clear()
+            self._shard_faults.clear()
+            return {"ok": True, "action": "rebalance", "restarted_shards": restarted}
+        if action == "account_lifecycle":
+            account_id = body.get("account_id")
+            lifecycle_action = body.get("lifecycle_action")
+            if (
+                not isinstance(account_id, str)
+                or account_id not in self.environments
+                or lifecycle_action not in LIFECYCLE_ACTIONS
+            ):
+                raise Failure(400)
+            shard_id = self._account_shard_map.get(account_id)
+            shard = self.daemon_shards.get(shard_id) if shard_id else None
+            if shard is not None and shard.is_alive():
+                result = shard.account_lifecycle(account_id, lifecycle_action)
+                if result is None:
+                    raise Failure(503, "gemini_native_worker_unavailable")
+                return {
+                    "ok": True,
+                    "action": "account_lifecycle",
+                    "account_id": account_id,
+                    "lifecycle_action": lifecycle_action,
+                    "result": result,
+                }
+            session = self.native_sessions.get(account_id)
+            if session is not None and session.is_alive():
+                result = session.account_lifecycle(account_id, lifecycle_action)
+                if result is None:
+                    raise Failure(503, "gemini_native_worker_unavailable")
+                return {
+                    "ok": True,
+                    "action": "account_lifecycle",
+                    "account_id": account_id,
+                    "lifecycle_action": lifecycle_action,
+                    "result": result,
+                }
+            raise Failure(409, "gemini_native_worker_unavailable")
+        raise Failure(400)
+
+    def _acquire_shard_for_account(self, ctx):
+        identifier = ctx["identifier"]
+        with self.lock:
+            shard_id = self._shard_id_for_account(identifier)
+            if self._is_shard_isolated(shard_id):
+                return None, shard_id
+        with self._shard_lock(shard_id):
+            with self.lock:
+                self._remember_runtime_proxy(ctx["env"], ctx["proxy_url"])
+                if self._is_shard_isolated(shard_id):
+                    return None, shard_id
+                shard = self.daemon_shards.get(shard_id)
+                if shard is not None and (
+                    not shard.is_alive() or shard.is_severely_unhealthy()
+                ):
+                    self._stop_shard(shard_id)
+                    shard = None
+            try:
+                if shard is None:
+                    shard = CragDaemonShard(
+                        self,
+                        shard_id,
+                        [(ctx["env"], ctx["proxy_url"], ctx["auth"], ctx["model"])],
+                        policy=self.runtime_policy,
+                    )
+                    with self.lock:
+                        self.daemon_shards[shard_id] = shard
+                        meta = self._shard_faults.get(shard_id)
+                        if meta:
+                            meta["failures"] = 0
+                            meta["isolated_until"] = 0.0
+                else:
+                    shard.sync_account(
+                        ctx["env"], ctx["proxy_url"], ctx["auth"], model=ctx["model"]
+                    )
+                return shard, shard_id
+            except (Failure, OSError, subprocess.SubprocessError):
+                with self.lock:
+                    self._stop_shard(shard_id)
+                    self._record_shard_fault(shard_id)
+                    if self.runtime_policy.get("daemon_fault_isolation", True):
+                        return None, shard_id
+                raise
 
     def spawn(self, fn):
         return self._spawner.call(fn)
@@ -2678,7 +3800,7 @@ class Host:
                         and not existing.is_severely_unhealthy()
                     ):
                         return
-                    uid = self.uid_base + env["slot"]
+                    uid = self.env_uid(env)
                     profile = env.get("profile")
                     auth = profile and profile_secrets(
                         self.directory / identifier / profile, uid, include_raw=True
@@ -2959,7 +4081,7 @@ class Host:
             or identifier in self.pending
         ):
             raise Failure(409, "gemini_operation_busy")
-        uid = self.uid_base + env["slot"]
+        uid = self.env_uid(env)
         directory = self.directory / identifier
         if env.get("auth_method") == "api_key":
             key = json.loads(read_root_file(directory / "credential.json", 1024)).get(
@@ -2981,7 +4103,7 @@ class Host:
         profile_name = env.get("profile")
         if not profile_name or env.get("auth_method", "oauth") != "oauth":
             return False
-        uid = self.uid_base + env["slot"]
+        uid = self.env_uid(env)
         updated = profile_secrets(run.directory, uid, include_raw=True)
         if not updated:
             return False
@@ -3013,7 +4135,7 @@ class Host:
         profile_name = env.get("profile")
         if not profile_name or env.get("auth_method", "oauth") != "oauth":
             return None
-        uid = self.uid_base + env["slot"]
+        uid = self.env_uid(env)
         loaded = profile_secrets(
             self.directory / env["id"] / profile_name, uid, include_raw=True
         )
@@ -3234,7 +4356,7 @@ class Host:
 
     def probe_proxy(self, env, proxy_url):
         started = time.monotonic()
-        result = read_account(self.uid_base + env["slot"], proxy_url, "proxy-probe")
+        result = read_account(self.env_uid(env), proxy_url, "proxy-probe")
         return {
             "ok": result.get("ok") is True,
             "latency_ms": round((time.monotonic() - started) * 1000),
@@ -3262,6 +4384,7 @@ class Host:
         if new_id != env["proxy_id"]:
             self.stop_run(identifier)
             self.stop_native_session(identifier)
+            self._remove_account_from_shard(identifier)
             self._clear_runtime_proxy(identifier)
             updated = {**env, "proxy_id": new_id, "updated_at": now()}
             updated.pop("call_models", None)
@@ -3321,7 +4444,7 @@ class Host:
         ):
             raise Failure(409, TERMINAL_OAUTH)
         profile = self.directory / identifier / env["profile"]
-        credentials = profile_secrets(profile, self.uid_base + env["slot"])
+        credentials = profile_secrets(profile, self.env_uid(env))
         if not credentials:
             raise Failure(409, TERMINAL_OAUTH)
         if body.get("proxy_id") != env["proxy_id"]:
@@ -3355,6 +4478,11 @@ class Host:
         with self.lock:
             for identifier in list(self.active_infers):
                 self.cancel_infer(identifier)
+            for shard_id in list(self.daemon_shards):
+                try:
+                    self._stop_shard(shard_id)
+                except (OSError, subprocess.SubprocessError):
+                    failed = True
             for stop, active in (
                 (self.stop_run, self.runs),
                 (self.stop_native_session, self.native_sessions),
@@ -3375,6 +4503,27 @@ class Host:
 
     def _cleanup_locked(self):
         now_mono = time.monotonic()
+        for shard_id, shard in list(self.daemon_shards.items()):
+            if any(self.active_infers.get(acc_id) for acc_id in shard.members):
+                continue
+            if not shard.is_alive():
+                self._stop_shard(shard_id)
+                self._record_shard_fault(shard_id)
+                continue
+            last_probe = getattr(shard, "_last_health_at", 0.0)
+            if now_mono - last_probe >= NATIVE_HEALTH_POLL_INTERVAL:
+                status = shard.health(timeout=0.5)
+                if (
+                    isinstance(status, dict)
+                    and status.get("ready") is True
+                    and status.get("needs_recovery") is not True
+                ):
+                    meta = self._shard_faults.get(shard_id)
+                    if meta:
+                        meta["failures"] = 0
+                if shard.is_severely_unhealthy():
+                    self._stop_shard(shard_id)
+                    self._record_shard_fault(shard_id)
         for identifier, session in list(self.native_sessions.items()):
             if self.active_infers.get(identifier):
                 continue
@@ -3537,7 +4686,7 @@ class Host:
         env_dir = self.directory / env["id"]
         env_dir.mkdir(mode=0o711, exist_ok=True)
         env_dir.chmod(0o711)
-        uid = self.uid_base + env["slot"]
+        uid = self.env_uid(env)
         target = env_dir / "crag-license"
         if target.exists() or target.is_symlink():
             info = target.lstat()
@@ -3553,7 +4702,7 @@ class Host:
         if env.get("auth_method", "oauth") != "oauth":
             raise Failure(409, "gemini_subscription_oauth_only")
         self.ensure_payload(legacy_install=False)
-        uid = self.uid_base + env["slot"]
+        uid = self.env_uid(env)
         machine_id = self.ensure_env_machine_id(env)
         license_dir = self.ensure_env_license_dir(env)
         staging_dir = None
@@ -3743,8 +4892,17 @@ class Host:
         account = env.get("account", {})
         method = env.get("auth_method", "oauth")
         session = self.native_sessions.get(env["id"])
+        shard_id = self._account_shard_map.get(env["id"])
+        shard = self.daemon_shards.get(shard_id) if shard_id else None
+        shard_ready = (
+            shard is not None
+            and env["id"] in shard.members
+            and shard.is_alive()
+            and not shard.is_severely_unhealthy()
+        )
         runtime_ready = (
             (method == "api_key" and env["auth_state"] == "authorized" and bool(env.get("call_models")))
+            or shard_ready
             or (
                 session is not None
                 and session.is_alive()
@@ -3788,7 +4946,7 @@ class Host:
         if credential["expiry"] <= time.time():
             return {"state": "reauth_required", "checked_at": now()}
         return read_account(
-            self.uid_base + slot, proxy_url, "oauth_import", oauth_token=credential
+            self.uid_base + (slot % MAX_NETNS_SLOTS), proxy_url, "oauth_import", oauth_token=credential
         )
 
     def refresh_account(self, env, proxy_url, *, auto_pull_models=True):
@@ -3798,7 +4956,7 @@ class Host:
                 "api_key"
             ]
             account = read_account(
-                self.uid_base + env["slot"], proxy_url, "api_key", api_key=api_key
+                self.env_uid(env), proxy_url, "api_key", api_key=api_key
             )
         elif env.get("oauth_imported"):
             credential = json.loads((directory / "oauth-import.json").read_bytes())
@@ -3825,7 +4983,7 @@ class Host:
                 except (OSError, subprocess.SubprocessError, ValueError, RuntimeError):
                     agy_non_auth_error = True
             account = read_account(
-                self.uid_base + env["slot"],
+                self.env_uid(env),
                 proxy_url,
                 "oauth",
                 profile=directory / env["profile"],
@@ -3840,7 +4998,7 @@ class Host:
                 try:
                     self.pull_models(env, proxy_url, allow_reauth_probe=True)
                     account = read_account(
-                        self.uid_base + env["slot"],
+                        self.env_uid(env),
                         proxy_url,
                         "oauth",
                         profile=directory / env["profile"],
@@ -3922,6 +5080,7 @@ class Host:
         if operation in {
             "list",
             "get",
+            "daemon-status",
             "maintenance-status",
             "test-chat-status",
             "test-chat-cancel",
@@ -3965,6 +5124,12 @@ class Host:
                     or any(self.running(key) for key in self.runs)
                 )
             }
+        if operation == "daemon-status":
+            return self.daemon_status()
+        if operation == "apply-policy":
+            return self.apply_runtime_policy(body.get("policy", body))
+        if operation == "daemon-action":
+            return self.daemon_action(body)
         if operation == "install-payload":
             self.load_payload(materialize=True, verify_again=True)
             return {
@@ -4035,14 +5200,14 @@ class Host:
             call_models = None
             if method == "api_key":
                 account = read_account(
-                    self.uid_base + slot, proxy_url, "api_key", api_key=api_key
+                    self.uid_base + (slot % MAX_NETNS_SLOTS), proxy_url, "api_key", api_key=api_key
                 )
                 if account["state"] == "reauth_required":
                     raise Failure(400, "gemini_api_key_rejected")
                 if account["state"] not in ("ok", "partial"):
                     raise Failure(502, "gemini_account_read_failed")
                 chat_data = read_account(
-                    self.uid_base + slot, proxy_url, "api-key-models", api_key=api_key
+                    self.uid_base + (slot % MAX_NETNS_SLOTS), proxy_url, "api-key-models", api_key=api_key
                 )
                 if chat_data.get("state") in ("ok", "partial") and chat_data.get(
                     "models"
@@ -4151,6 +5316,7 @@ class Host:
             self.cancel_infer(identifier)
             self.stop_run(identifier)
             self.stop_native_session(identifier)
+            self._remove_account_from_shard(identifier)
             self._clear_runtime_proxy(identifier)
             self.stop_terminal(identifier)
             self.cancel(identifier)
@@ -4172,6 +5338,7 @@ class Host:
             self.cancel_infer(identifier)
             self.stop_run(identifier)
             self.stop_native_session(identifier)
+            self._remove_account_from_shard(identifier)
             self._clear_runtime_proxy(identifier)
             self.stop_terminal(identifier)
             self.cancel(identifier)
@@ -4408,6 +5575,9 @@ class Host:
             "cancel_fn": None,
         }
         self.active_infers.setdefault(identifier, {})[request_id] = infer_entry
+        gateway_policy = body.get("gateway_policy")
+        if not isinstance(gateway_policy, dict):
+            gateway_policy = None
         return {
             "identifier": identifier,
             "env": dict(env),
@@ -4419,6 +5589,7 @@ class Host:
             "request_id": request_id,
             "infer_body": infer_body,
             "native_body": native_body,
+            "gateway_policy": gateway_policy,
             "evidence": evidence,
             "entry": infer_entry,
         }
@@ -4573,6 +5744,68 @@ class Host:
             if isinstance(v, str) and v
         )
         native_mod = native_module()
+        gateway_policy = ctx.get("gateway_policy")
+        shard = None
+        shard_id = None
+        if self._use_sharded_daemon() and self.payload_mode != "crag_subscription":
+            shard, shard_id = self._acquire_shard_for_account(ctx)
+        if shard is not None:
+            conn = None
+            had_error = False
+
+            def stop_shard_turn():
+                shard.cancel_turn(identifier, ctx["request_id"])
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+
+            ctx["entry"]["cancel_fn"] = stop_shard_turn
+            try:
+                conn, response = shard.open_stream(
+                    identifier,
+                    ctx["request_id"],
+                    ctx["native_body"],
+                    model=ctx["model"],
+                    gateway_policy=gateway_policy,
+                )
+                handler.begin_sse()
+                while not cancel_event.is_set():
+                    chunk = response.read1(16384)
+                    if not chunk:
+                        break
+                    handler.write_sse_chunk(self._redact_bytes(chunk, creds))
+                if cancel_event.is_set():
+                    had_error = True
+                    return "cancelled", "gemini_inference_cancelled"
+                return "completed", None
+            except native_mod.NativeFailure as error:
+                had_error = error.code != "gemini_unsupported_turn"
+                status = error.status or 502
+                handler.send_json_error(status, error.code, error.message)
+                return "failed", error.code
+            except (BrokenPipeError, ConnectionResetError):
+                had_error = True
+                stop_shard_turn()
+                raise
+            except (OSError, TimeoutError):
+                had_error = True
+                handler.send_json_error(502, "gemini_inference_failed")
+                return "failed", "gemini_inference_failed"
+            finally:
+                if conn is not None:
+                    conn.close()
+                unhealthy = not shard.is_alive()
+                if not unhealthy and had_error:
+                    shard.health(timeout=0.5)
+                    unhealthy = shard.is_severely_unhealthy()
+                if unhealthy and shard_id:
+                    with self.lock:
+                        if self.daemon_shards.get(shard_id) is shard:
+                            self._stop_shard(shard_id)
+                            self._record_shard_fault(shard_id)
+
         session = self._acquire_native_session(ctx)
         conn = None
         had_error = False
@@ -4588,7 +5821,10 @@ class Host:
         ctx["entry"]["cancel_fn"] = stop_native
         try:
             conn, response = session.open_stream(
-                ctx["request_id"], ctx["native_body"], model=ctx["model"]
+                ctx["request_id"],
+                ctx["native_body"],
+                model=ctx["model"],
+                gateway_policy=gateway_policy,
             )
             handler.begin_sse()
             while not cancel_event.is_set():
@@ -4746,6 +5982,9 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "test-chat-cancel",
                 "infer-cancel",
                 "warm",
+                "apply-policy",
+                "daemon-status",
+                "daemon-action",
                 "license-machine-code",
                 "license-activate",
                 "license-status",
@@ -4837,14 +6076,14 @@ def main():
     if os.geteuid() != 0 or not 1024 <= args.uid_base <= 65524:
         raise SystemExit("Gemini host setup requires root and a dedicated UID range")
     os.umask(0o077)
-    for uid in range(args.uid_base, args.uid_base + MAX_ENVIRONMENTS + 1):
+    for uid in range(args.uid_base, args.uid_base + MAX_NETNS_SLOTS + 1):
         try:
             pwd.getpwuid(uid)
         except KeyError:
             continue
         raise SystemExit("Gemini UID range overlaps a host user")
     if any(
-        args.uid_base <= account.gr_gid <= args.uid_base + MAX_ENVIRONMENTS
+        args.uid_base <= account.gr_gid <= args.uid_base + MAX_NETNS_SLOTS
         for account in grp.getgrall()
     ):
         raise SystemExit("Gemini GID range overlaps a host group")

@@ -1382,6 +1382,7 @@ const geminiScheduler = createGeminiScheduler({
   apiKeyStore,
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
   cragSubscription: geminiCragSubscription,
+  getRoutingConfig: () => routingConfig,
 })
 const handleGeminiPublic = createGeminiPublicHandler({
   json,

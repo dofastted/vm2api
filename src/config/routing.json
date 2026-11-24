@@ -132,6 +132,45 @@
       "codex-auto-review": "gpt-6-luna"
     }
   },
+  "gemini": {
+    "enabled": true,
+    "protocols": {
+      "google.gemini": { "mode": "native", "enabled": true },
+      "anthropic.messages": { "mode": "convert", "enabled": true },
+      "openai.chat": { "mode": "convert", "enabled": true },
+      "openai.responses": { "mode": "convert", "enabled": true },
+      "google.gemini.session": { "mode": "native", "enabled": true }
+    },
+    "pool": {
+      "strategy": "balanced",
+      "accounts_per_daemon": 50,
+      "daemon_fault_isolation": true,
+      "max_concurrency_per_account": 2,
+      "min_warm_slots": 1,
+      "session_idle_ttl_secs": 600,
+      "max_queue": 16,
+      "queue_timeout_ms": 10000,
+      "timeout_ms": 120000,
+      "first_byte_timeout_ms": 90000,
+      "idle_timeout_ms": 15000,
+      "circuit_failure_threshold": 3,
+      "circuit_open_ms": 30000
+    },
+    "sticky": {
+      "enabled": true,
+      "ttl_seconds": 3600
+    },
+    "failover": {
+      "max_account_switches": 3,
+      "quota_cooldown_ms": 60000,
+      "account_cooldown_ms": 300000
+    },
+    "shm": {
+      "require_shm": true,
+      "request_mb": 4,
+      "response_mb": 16
+    }
+  },
 
   "compatibility": {
     "persona_preset": "official_full",
