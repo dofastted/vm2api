@@ -349,6 +349,51 @@ test('classifyGeminiCapabilities enforces strict CRAG native_tui admission', () 
   assert.equal(classifyGeminiCapabilities(session).plainText, 'hi')
 })
 
+test('an empty safetySettings or cachedContent requests nothing and stays on the plain-text path (#1703)', () => {
+  const ROUTE = { routeModel: 'gemini-2.5-flash' }
+  const base = { contents: [{ role: 'user', parts: [{ text: 'Reply exactly: CONTROL_OK' }] }] }
+
+  // Control: the same turn without the field is admitted.
+  const control = parseInboundToGemini('gemini', { ...base }, ROUTE)
+  assert.equal(control.nativeTuiCompatible, true)
+  assert.equal(control.plainText, 'Reply exactly: CONTROL_OK')
+
+  // An empty array carries no safety configuration at all, so it must not pull in
+  // `generation_config`: doing so nulls `plainText`, and scheduler.mjs then answers
+  // 400 gemini_unsupported_turn for a turn the native transport could have served.
+  const emptySafety = parseInboundToGemini('gemini', { ...base, safetySettings: [] }, ROUTE)
+  assert.equal(emptySafety.nativeTuiCompatible, true)
+  assert.deepEqual(emptySafety.requiredCapabilities, [])
+  assert.deepEqual(emptySafety.unsupportedFields, [])
+  assert.equal(emptySafety.plainText, 'Reply exactly: CONTROL_OK')
+
+  // Same reasoning for an empty cached-content name.
+  const emptyCache = parseInboundToGemini('gemini', { ...base, cachedContent: '' }, ROUTE)
+  assert.equal(emptyCache.nativeTuiCompatible, true)
+  assert.deepEqual(emptyCache.requiredCapabilities, [])
+  assert.equal(emptyCache.plainText, 'Reply exactly: CONTROL_OK')
+
+  // A non-empty threshold is real configuration: it still requires the capability,
+  // but the field is now named so the caller knows what to drop.
+  const threshold = { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' }
+  const realSafety = parseInboundToGemini('gemini', { ...base, safetySettings: [threshold] }, ROUTE)
+  assert.equal(realSafety.nativeTuiCompatible, false)
+  assert.ok(realSafety.requiredCapabilities.includes('generation_config'))
+  assert.ok(realSafety.unsupportedFields.includes('safetySettings'))
+  assert.equal(realSafety.plainText, null)
+
+  const realCache = parseInboundToGemini('gemini', { ...base, cachedContent: 'cachedContents/abc123' }, ROUTE)
+  assert.ok(realCache.requiredCapabilities.includes('generation_config'))
+  assert.ok(realCache.unsupportedFields.includes('cachedContent'))
+
+  // Other capabilities name their own caller-visible field too.
+  const sysInstruction = { parts: [{ text: 'be terse' }] }
+  const withSystem = parseInboundToGemini('gemini', { ...base, systemInstruction: sysInstruction }, ROUTE)
+  assert.ok(withSystem.unsupportedFields.includes('systemInstruction'))
+  const withTools = parseInboundToGemini('gemini', { ...base, tools: [{ googleSearch: {} }] }, ROUTE)
+  assert.ok(withTools.unsupportedFields.includes('tools'))
+})
+
 test('SSE decoder, collector, non-streaming renderers, and streaming encoders work across all 4 protocols', () => {
   const thoughtSig = Buffer.from('thought-sig-1').toString('base64')
   const toolSig = Buffer.from('tool-sig-1').toString('base64')
