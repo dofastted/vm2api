@@ -369,6 +369,7 @@ def open_worker_stream(
     startup_timeout=45,
     turn_timeout=TURN_TIMEOUT,
     gateway_policy=None,
+    diagnostic=None,
 ):
     if (
         not isinstance(socket_path, str)
@@ -384,6 +385,10 @@ def open_worker_stream(
         raise NativeFailure("gemini_inference_bad_input", 400)
     start_deadline = time.monotonic() + startup_timeout
     while time.monotonic() < start_deadline:
+        if diagnostic is not None:
+            diag_code = diagnostic.poll()
+            if diag_code is not None:
+                raise NativeFailure(diag_code, 403)
         status = worker_status(socket_path, token, timeout=0.25)
         if status and status.get("license_valid") is False:
             lic = status.get("license") if isinstance(status.get("license"), dict) else {}
@@ -411,6 +416,10 @@ def open_worker_stream(
         raise NativeFailure("gemini_inference_output_limit", 413)
     connection = _UnixHTTPConnection(socket_path, turn_timeout)
     try:
+        if diagnostic is not None:
+            diag_code = diagnostic.poll()
+            if diag_code is not None:
+                raise NativeFailure(diag_code, 403)
         response = connection.request(
             "POST",
             "/internal/v1/messages",
@@ -421,6 +430,22 @@ def open_worker_stream(
             },
             payload,
         )
+        if diagnostic is not None and connection.sock is not None:
+            header_deadline = time.monotonic() + turn_timeout
+            while time.monotonic() < header_deadline:
+                diag_code = diagnostic.poll()
+                if diag_code is not None:
+                    connection.close()
+                    cancel_worker_request(socket_path, token, request_id)
+                    raise NativeFailure(diag_code, 403)
+                remaining = header_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                readable, _, _ = select.select(
+                    [connection.sock], [], [], min(0.2, remaining)
+                )
+                if readable:
+                    break
         response.begin()
         ct = (response.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
         if response.status != 200 or ct != "text/event-stream":
