@@ -5,7 +5,7 @@
 #   bg-deploy.sh               把 compose/.env 当前描述的版本部署到空闲颜色并切流量
 #   bg-deploy.sh --wait        同上，但前台等旧实例排空结束
 #   bg-deploy.sh --status      看颜色、角色、haproxy 状态
-#   bg-deploy.sh --restart     普通重启当前颜色（带新迁移的版本用；haproxy 挂住请求，会中断一次）
+#   bg-deploy.sh --restart     普通重启当前颜色（带非只加型新迁移的版本用；haproxy 挂住请求，会中断一次）
 #   bg-deploy.sh --cutover <old> <new>   新实例已激活但切 haproxy 失败时，修好 haproxy 后从第 4 步续做
 #
 # 顺序（见 src/lib/core/handover.mjs）：
@@ -32,6 +32,8 @@
 #   BG_NAME             容器/项目名前缀（默认 vm2api → vm2api-blue / vm2api-green）
 #   BG_DRAIN_MS         旧实例最长排空毫秒（默认 3600000）
 #   BG_RESTART_GRACE    --restart 时等旧容器退出的秒数，超时强杀（默认 100）
+#   BG_ADDITIVE_MIGRATIONS   1（默认）= SQLite 上只加不改的新迁移照常蓝绿；0 = 有新迁移就要求 --restart
+#   BG_MIGRATION_INDEX_MAX_ROWS   新迁移给已有表建索引时允许的最大行数（默认 100000）
 # 站点自己的额外挂载/环境（补丁、调试开关）放 <状态目录>/override.yml，存在就叠在最后。
 set -euo pipefail
 
@@ -56,6 +58,8 @@ BG_SERVICE=${BG_SERVICE:-vm2api}
 BG_NAME=${BG_NAME:-vm2api}
 BG_DRAIN_MS=${BG_DRAIN_MS:-3600000}
 BG_RESTART_GRACE=${BG_RESTART_GRACE:-100}
+BG_ADDITIVE_MIGRATIONS=${BG_ADDITIVE_MIGRATIONS:-1}
+BG_MIGRATION_INDEX_MAX_ROWS=${BG_MIGRATION_INDEX_MAX_ROWS:-100000}
 KIT_DIR=$BG_PROJECT_DIR/deploy/bluegreen
 
 cd "$BG_PROJECT_DIR"
@@ -238,15 +242,41 @@ done < <(awk -v root="$BG_PROJECT_DIR/" '$1 == "source:" && index($2, root) == 1
 entry=$(awk '$1 == "source:" {src = $2} $1 == "target:" && $2 == "/usr/local/bin/vm2api-entrypoint" {print src; exit}' <<<"$rendered")
 [[ -z $entry || -x $entry ]] || { echo "entrypoint $entry is not executable (chmod +x)" >&2; exit 1; }
 
-# 迁移护栏：新镜像带新迁移（SQLite 或 PostgreSQL）时两个控制面不能共用库，退回停机重启
+# 迁移护栏：新镜像带新迁移（SQLite 或 PostgreSQL）时，旧颜色在重叠期间要和已迁移的库共处。
+# SQLite 部署上只加不改的迁移（建表、常量默认值加列、新表/小表建索引，见 migration-guard.mjs）照常蓝绿；
+# 其余情况、PostgreSQL 部署、或 BG_ADDITIVE_MIGRATIONS=0 时退回停机重启
 dc "$new" pull -q "$BG_SERVICE" || true
 mig_old=$(docker exec "$(cname "$old")" sh -c 'ls /opt/vm2api/src/lib/db/migrations /opt/vm2api/src/lib/db/pg/pg-migrations 2>/dev/null' | sort)
 mig_new=$(dc "$new" run --rm --no-deps -T --entrypoint sh "$BG_SERVICE" -c 'ls /opt/vm2api/src/lib/db/migrations /opt/vm2api/src/lib/db/pg/pg-migrations 2>/dev/null' | sort)
 added=$(comm -13 <(echo "$mig_old") <(echo "$mig_new"))
 if [[ -n $added ]]; then
   log "new image adds migrations: $(echo "$added" | tr '\n' ' ')"
-  log "refusing blue/green; deploy this release with: $0 --restart"
-  exit 2
+  verdict=
+  guard_err=
+  guard_rc=0
+  if [[ $BG_ADDITIVE_MIGRATIONS == 1 ]]; then
+    mapfile -t added_args <<<"$added"
+    guard_err_file=$(mktemp)
+    verdict=$(dc "$new" run --rm --no-deps -T -e BG_MIGRATION_GUARD_CLI=1 \
+      -e BG_MIGRATION_INDEX_MAX_ROWS="$BG_MIGRATION_INDEX_MAX_ROWS" \
+      --entrypoint node "$BG_SERVICE" --no-warnings --input-type=module - "${added_args[@]}" \
+      <"$KIT_DIR/migration-guard.mjs" 2>"$guard_err_file") || guard_rc=$?
+    guard_err=$(cat "$guard_err_file" 2>/dev/null || true)
+    rm -f "$guard_err_file"
+  else
+    guard_rc=3
+    verdict='BG_ADDITIVE_MIGRATIONS=0'
+  fi
+  if [[ $guard_rc == 0 ]]; then
+    log "migrations are additive-only, continuing blue/green: $verdict"
+  else
+    log "migrations need a restart (guard exit $guard_rc): ${verdict:-no verdict}"
+    if [[ -n $guard_err ]]; then
+      log "migration guard stderr: $guard_err"
+    fi
+    log "refusing blue/green; deploy this release with: $0 --restart"
+    exit 2
+  fi
 fi
 
 # 1 standby
