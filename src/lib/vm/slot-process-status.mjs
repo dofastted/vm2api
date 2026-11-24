@@ -48,21 +48,25 @@ export function retireScriptVerdict(result) {
   return typeof result?.code === 'number' && String(result?.stdout || '').includes(RETIRE_RAN_MARKER)
 }
 
-export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect = inspectContainerOrNull } = {}) {
+export async function retireLegacyTelemetry({
+  vm,
+  run = runSlotProcess,
+  inspect = inspectContainerOrNull,
+  host: slotHostOverride = null,
+} = {}) {
   if (!vm?.id) return { ok: false, code: 'invalid_vm' }
-  const host = slotHost(vm)
+  const host = slotHostOverride || slotHost(vm)
   if (host.native) return { ok: false, code: 'telemetry_unsupported' }
   let runtime
   try {
-    const docker = inspect === inspectContainerOrNull ? host.dockerApi() : null
-    runtime = await inspect(docker, slotExecContainer(vm))
+    runtime = await inspect(host.dockerApi(), slotExecContainer(vm))
   } catch {
     return { ok: false, code: 'telemetry_runtime_unavailable' }
   }
   if (!runtime?.State?.Running) return { ok: true, running: false, state: 'stopped' }
   const needsRecreate = Boolean(vm.node_id) && !isKvmRuntime(vm) && !hasClusterComputerBinds(runtime)
   const recreateMeta = needsRecreate ? { needsRecreate: true } : {}
-  const env = run === runSlotProcess ? host.dockerEnv() : undefined
+  const env = host.dockerEnv()
   const attempt = () =>
     run(slotExecArgv(vm, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), {
       timeoutMs: 5000,

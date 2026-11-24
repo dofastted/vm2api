@@ -252,6 +252,13 @@ test('CRAG telemetry publishes settings, uses authenticated apply, and restores 
   }
   const ops = {
     retire: async () => ({ ok: true, running }),
+    writeKernelConfig: (projectRoot, record, options) => {
+      assert.equal(projectRoot, root)
+      assert.equal(record.id, id)
+      assert.equal(read(vmPath).schedule_hold.reason, 'maintenance')
+      assert.equal(options.publish, false)
+      events.push(['write-config'])
+    },
     restart: async () => {
       assert.equal(read(vmPath).schedule_hold.reason, 'maintenance')
       assert.equal(read(vmPath).schedulable, false)
@@ -271,6 +278,7 @@ test('CRAG telemetry publishes settings, uses authenticated apply, and restores 
     ['apply', true],
     ['hold'],
     ['apply', true],
+    ['write-config'],
     ['restart'],
     ['apply', true],
     ['release'],

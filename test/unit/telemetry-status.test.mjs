@@ -146,17 +146,30 @@ test('retireLegacyTelemetry flags cluster Docker containers missing /etc/kin-com
     node_id: 'node-a',
     runtime: { type: 'docker', container: 'kin-cluster' },
   }
+  // A node slot reaches Docker over SSH; stand in for the node, not for the decision.
+  const docker = { node: 'node-a' }
+  const host = { native: false, dockerApi: () => docker, dockerEnv: () => ({ DOCKER_HOST: 'node-a' }) }
+  const seen = []
   const legacy = await retireLegacyTelemetry({
     vm: clusterVm,
-    inspect: async () => ({ State: { Running: true }, HostConfig: { Binds: [] }, Mounts: [] }),
-    run: async () => ({ code: 0, timed_out: false }),
+    host,
+    inspect: async (api) => {
+      seen.push(api)
+      return { State: { Running: true }, HostConfig: { Binds: [] }, Mounts: [] }
+    },
+    run: async (_argv, opts) => {
+      seen.push(opts.env)
+      return { code: 0, timed_out: false }
+    },
   })
   assert.equal(legacy.ok, true)
   assert.equal(legacy.running, true)
   assert.equal(legacy.needsRecreate, true)
+  assert.deepEqual(seen, [docker, { DOCKER_HOST: 'node-a' }])
 
   const current = await retireLegacyTelemetry({
     vm: clusterVm,
+    host,
     inspect: async () => ({
       State: { Running: true },
       HostConfig: {
