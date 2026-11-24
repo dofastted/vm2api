@@ -259,8 +259,7 @@ const INFERENCE_ERROR_ACTIONS: Readonly<Record<string, string>> = {
     '处理方式：上游未返回可调用模型，请检查代理连通性、账号订阅资格或重新授权后再拉取。',
   gemini_inference_timeout:
     '处理方式：上游响应超时（504），请检查代理延迟或稍后重试。',
-  gemini_inference_bad_input:
-    '处理方式：请缩短提示词或改为纯文本内容后重试。',
+  gemini_inference_bad_input: '处理方式：请缩短提示词或改为纯文本内容后重试。',
   gemini_inference_invalid_output:
     '处理方式：上游返回异常空包或中断，请重试或切换其他模型确认。',
   gemini_inference_output_limit:
@@ -288,7 +287,7 @@ const INFERENCE_ERROR_ACTIONS: Readonly<Record<string, string>> = {
   license_binding_mismatch:
     '处理方式：许可与当前环境设备绑定不一致，请在「账号」页重新绑定席位。',
   license_unconfigured:
-    '处理方式：请先在「设置 → CRAG 订阅」完成 CRAGGemini 兑换与激活。',
+    '处理方式：请先在「订阅 CRAG」或「导入 → Gemini」完成 CRAGGemini 兑换与激活。',
 }
 
 export function geminiInferenceErrorLabel(code?: string | null): string {

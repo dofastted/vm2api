@@ -142,10 +142,7 @@ export type GeminiEnvironment = {
     plan: string | null
     expires_at: string | null
     eligibility?:
-    | 'verification_required'
-    | 'location_unsupported'
-    | 'ineligible'
-    | null
+      'verification_required' | 'location_unsupported' | 'ineligible' | null
     validation_url?: string | null
     model_catalog?: GeminiModelCatalogEntry[]
     quotas: (QuotaReading & { model: string })[]
@@ -1264,14 +1261,7 @@ export function GeminiEnvironments({
         </p>
       ) : null}
       {operation.isError ? (
-        <div className='space-y-1'>
-          <p role='alert' className='text-sm text-destructive'>
-            {operation.error.message}
-          </p>
-          {isGeminiHostIssue(geminiError(operation.error, '').code) ? (
-            <GeminiMaintenanceLink />
-          ) : null}
-        </div>
+        <GeminiOperationError error={operation.error} />
       ) : null}
       {environment && !isImport ? (
         <GeminiDetails environment={environment}>{account}</GeminiDetails>
@@ -1279,5 +1269,21 @@ export function GeminiEnvironments({
         account
       )}
     </section>
+  )
+}
+
+export function GeminiOperationError({ error }: { error: Error }) {
+  const parsed = geminiError(error, '')
+  const action = geminiInferenceErrorAction(parsed.code)
+  return (
+    <div className='space-y-1'>
+      <p role='alert' className='text-sm text-destructive'>
+        {error.message}
+      </p>
+      {action ? (
+        <p className='text-xs text-muted-foreground'>{action}</p>
+      ) : null}
+      {isGeminiHostIssue(parsed.code) ? <GeminiMaintenanceLink /> : null}
+    </div>
   )
 }

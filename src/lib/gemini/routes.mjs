@@ -58,14 +58,8 @@ const RUN_ERRORS = {
     502,
     '无法通过绑定代理连接 Google 上游，请在「代理」页探活检查 SOCKS5 节点连通性与出口质量，或更换代理后重试',
   ],
-  gemini_model_unavailable: [
-    409,
-    '上游不支持或未开放所选模型（404），请先点击「拉取模型」刷新最新模型目录后再试',
-  ],
-  gemini_models_empty: [
-    502,
-    '上游未返回可调用模型，请检查账号资格与代理连通性，或重新完成授权后再拉取',
-  ],
+  gemini_model_unavailable: [409, '上游不支持或未开放所选模型（404），请先点击「拉取模型」刷新最新模型目录后再试'],
+  gemini_models_empty: [502, '上游未返回可调用模型，请检查账号资格与代理连通性，或重新完成授权后再拉取'],
   gemini_api_key_invalid: [
     400,
     '当前 Gemini API Key 无效或权限不足（400/401/403），请在 Google AI Studio 核对密钥状态与项目权限后重新配置',
@@ -74,35 +68,20 @@ const RUN_ERRORS = {
     429,
     '上游模型配额已用尽（429 RESOURCE_EXHAUSTED），请等待配额重置、切换其他模型或调度到其他账号',
   ],
-  gemini_inference_timeout: [
-    503,
-    '上游响应超时（504），可能是代理延迟过高或模型负载波动，请检查代理延迟后重试',
-  ],
-  gemini_inference_invalid_output: [
-    502,
-    '上游返回空回复或无法解析的流式响应，请重试或切换其他模型确认',
-  ],
+  gemini_inference_timeout: [503, '上游响应超时（504），可能是代理延迟过高或模型负载波动，请检查代理延迟后重试'],
+  gemini_inference_invalid_output: [502, '上游返回空回复或无法解析的流式响应，请重试或切换其他模型确认'],
   gemini_inference_start_failed: [
     503,
     '无法启动本地 Gemini 推理进程，请前往「设置 → Gemini 维护」检查宿主服务与载荷状态',
   ],
   gemini_inference_cancelled: [409, 'Gemini 测试已手动取消'],
-  gemini_inference_output_limit: [
-    502,
-    '模型单次回复超过测试输出上限，请精简提示词或限制回复长度后重试',
-  ],
-  gemini_inference_tool_blocked: [
-    502,
-    '当前测试通道限制了该工具调用，请改用纯文本提示词重试',
-  ],
+  gemini_inference_output_limit: [502, '模型单次回复超过测试输出上限，请精简提示词或限制回复长度后重试'],
+  gemini_inference_tool_blocked: [502, '当前测试通道限制了该工具调用，请改用纯文本提示词重试'],
   gemini_inference_failed: [
     502,
     '上游推理失败（502），请先刷新账号状态确认是否触发 Google 身份验证/风控，再检查绑定代理与宿主服务日志',
   ],
-  gemini_native_tty_unavailable: [
-    503,
-    '宿主机没有可用的虚拟终端资源，请检查宿主机状态并重启 vm2api-gemini 服务',
-  ],
+  gemini_native_tty_unavailable: [503, '宿主机没有可用的虚拟终端资源，请检查宿主机状态并重启 vm2api-gemini 服务'],
   gemini_native_worker_unavailable: [
     503,
     'CRAGGemini 原生常驻内核未就绪，请稍候等待自动预热，或前往「设置 → Gemini 维护」检查载荷与宿主服务',
@@ -189,8 +168,6 @@ const HOST_ERRORS = {
     503,
     'Gemini 宿主服务在线，但 Google 授权流程未能启动，请检查宿主服务日志与绑定代理的出口连通性',
   ],
-  gemini_native_tty_unavailable: [503, '没有可供 CRAGGemini 使用的空闲 Linux 虚拟控制台'],
-  gemini_native_worker_unavailable: [503, 'CRAGGemini 原生 worker 未就绪，请检查宿主服务日志'],
   gemini_native_bridge_timeout: [503, 'CRAGGemini TUI 未能在时限内连接 native worker'],
   gemini_account_read_failed: [502, '无法通过所选代理读取 Google 账号数据'],
   gemini_api_key_rejected: [400, 'Google 未接受该 Gemini API Key，请检查密钥和项目权限'],
@@ -682,11 +659,7 @@ export const callGeminiHostStream = (operation, payload, options) =>
  * for all authorized, licensed OAuth environments so inference starts hot and recovers
  * automatically after control-plane or gemini-host restarts.
  */
-export async function warmGeminiEnvironments({
-  callHost = callGeminiHost,
-  proxyPool,
-  environmentIds = null,
-} = {}) {
+export async function warmGeminiEnvironments({ callHost = callGeminiHost, proxyPool, environmentIds = null } = {}) {
   const report = { warmed: 0, warming: 0, skipped: 0 }
   let view
   try {
@@ -964,9 +937,7 @@ export function createGeminiPanelHandler({
         const environment = await readEnvironment(callHost, id)
         let result = await callHost('models', { id, ...boundProxy(proxyPool, environment) })
         if (environment.auth_method === 'oauth' && cragSubscription?.ensureEnvironmentSeat) {
-          const seat = await cragSubscription
-            .ensureEnvironmentSeat(id, { env: result })
-            .catch(() => ({ bound: false }))
+          const seat = await cragSubscription.ensureEnvironmentSeat(id, { env: result }).catch(() => ({ bound: false }))
           if (seat.bound) {
             result = await callHost('get', { id })
           }

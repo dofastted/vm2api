@@ -314,6 +314,17 @@ test('Gemini host auto-provisions models, plan, onboarding, and token refresh', 
   })
 })
 
+// The default-payload fetcher used to hardcode the release version alongside the
+// manifest pin, and the two drifted for three releases (#1677). Driven from here
+// because `test:ci`'s standing set is 13 keywords that do not include this file:
+// CI picks it up as a modified test, the same way every non-core test here runs.
+test('the default Gemini payload fetcher derives its release from the manifest pin', { timeout: 15_000 }, () => {
+  execFileSync('python3', ['-B', fileURLToPath(new URL('./fetch-default-gemini-pins.py', import.meta.url))], {
+    stdio: 'pipe',
+    timeout: 12_000,
+  })
+})
+
 test('Gemini payload redemption is admin-only and rejects malformed codes before host dispatch', async () => {
   const route = `${root}/payload/redeem`
   assert.equal(authorizePanelRoute('POST', route, 'user').ok, false)
@@ -1502,10 +1513,7 @@ test('Gemini scheduler allows 10 concurrent slots on acc1 with strict per-accoun
       assert.equal(op, 'infer')
       assert.equal(payload.id, 'gemini-acc1')
       assert.equal(payload.proxy_id, 'px-1')
-      assert.equal(
-        payload.proxy_sha256,
-        createHash('sha256').update(proxyMap['px-1']).digest('hex'),
-      )
+      assert.equal(payload.proxy_sha256, createHash('sha256').update(proxyMap['px-1']).digest('hex'))
       inflightPayloads.push(payload)
       if (inflightPayloads.length === 10) resolveAll10()
       const gate = new Promise((resolve) => releases.push(resolve))
@@ -1644,4 +1652,34 @@ test('a host error code the control plane knows survives, and only an unknown on
   // collapsed rather than being forwarded to the panel unvetted.
   code = 'gemini_not_a_real_code'
   await assert.rejects(callGeminiHost('authorization', { id: record.id }), { code: 'gemini_host_unavailable' })
+})
+
+test('synchronous host errors and polled test-chat runs report the same resident-pool copy for native worker/tty faults', async () => {
+  for (const code of ['gemini_native_worker_unavailable', 'gemini_native_tty_unavailable']) {
+    const run = setup((operation) => {
+      if (operation === 'get') {
+        return {
+          ...record,
+          auth_method: 'oauth',
+          auth_state: 'authorized',
+          models_discovered: true,
+          models: [model],
+        }
+      }
+      if (operation === 'test-chat') {
+        throw Object.assign(new Error(code), { code, status: 503 })
+      }
+      if (operation === 'test-chat-status') {
+        return { state: 'failed', text: '', error: { code } }
+      }
+      throw new Error(`unexpected ${operation}`)
+    })
+    const startRes = await run('POST', `${environmentPath}/test-chat`, { model, prompt: 'hello' })
+    const pollRes = await run('GET', `${environmentPath}/test-chat/${runId}`)
+    assert.equal(startRes.status, 503)
+    assert.equal(startRes.body.error.code, code)
+    assert.equal(pollRes.status, 200)
+    assert.equal(pollRes.body.data.error.code, code)
+    assert.equal(startRes.body.error.message, pollRes.body.data.error.message)
+  }
 })

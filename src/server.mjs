@@ -2112,7 +2112,7 @@ server.listen(cfg.port, cfg.host, () => {
       void warmGemini()
       const timer = setInterval(warmGemini, 30_000)
       timer.unref()
-      server.once('close', () => clearInterval(timer))
+      onLeaderStop(() => clearInterval(timer))
     }
     try {
       vmTestSchedule.start()

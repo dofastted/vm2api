@@ -6,6 +6,7 @@ describe('Gemini maintenance recovery classification', () => {
     expect(isGeminiHostIssue('gemini_host_socket_missing')).toBe(true)
     expect(isGeminiHostIssue('gemini_payload_invalid')).toBe(true)
     expect(isGeminiHostIssue('gemini_egress_unavailable')).toBe(true)
+    expect(isGeminiHostIssue('gemini_authorization_unavailable')).toBe(true)
     expect(isGeminiHostIssue('gemini_native_worker_unavailable')).toBe(true)
   })
 

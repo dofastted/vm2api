@@ -109,6 +109,31 @@ test('buildRouting exposes effective Codex routing to the panel', () => {
   assert.equal(data.codex.protocols['openai.responses'].enabled, true)
 })
 
+test('buildRouting exposes normalized batch_group config to the panel', () => {
+  const defaults = buildRouting({
+    routingConfig: {},
+    stickyRouter: { stats: () => ({ active_sessions: 0 }) },
+  }).data
+  assert.deepEqual(defaults.batch_group, {
+    enabled: false,
+    enabled_for_all: false,
+    keys: [],
+    min: 1,
+    max: 0,
+    per_member_concurrency: 3,
+    idle_ttl_s: 900,
+    observe: false,
+  })
+  const configured = buildRouting({
+    routingConfig: { batch_group: { enabled: true, enabled_for_all: true, min: 3, max: 8 } },
+    stickyRouter: { stats: () => ({ active_sessions: 0 }) },
+  }).data
+  assert.equal(configured.batch_group.enabled, true)
+  assert.equal(configured.batch_group.enabled_for_all, true)
+  assert.equal(configured.batch_group.min, 3)
+  assert.equal(configured.batch_group.max, 8)
+})
+
 test('canAccept uses per-tier 5h and weekly lines', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
