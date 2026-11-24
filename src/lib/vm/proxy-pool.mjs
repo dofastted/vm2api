@@ -42,6 +42,11 @@ const DEFAULT_CONFIG = {
   probe_interval_min: 10, // 5 | 10 | 30 | 60
   probe_timeout_ms: 8000,
   max_failures: 2, // consecutive failures before disable
+  // Boot storms (kernel restores, link dialing, bin pushes) starve the very
+  // first probe rounds; a failure there describes the storm, not the proxy.
+  // Failures inside this window count and surface as 'fail' but cannot cross
+  // into dead + cascading slot disable. 0 restores the old verdict.
+  boot_grace_min: 10,
   enabled: true,
   disconnect_on_error: false, // experimental: stop slot + tear SOCKS on runtime errors
   geo_timeout_ms: 8000,
@@ -225,6 +230,11 @@ function hydrateProxy(proxy) {
 
 function uid(prefix = 'px') {
   return `${prefix}-${crypto.randomBytes(4).toString('hex')}`
+}
+
+/** Timeouts (`timeout`, `egress_timeout：…`, `egress_tls_timeout：…`) are what a starved, freshly booted machine produces on its own. */
+function bootStormShaped(error) {
+  return /^(?:[a-z_]+_)?timeout(?:：|$)/.test(String(error || ''))
 }
 
 function isSocksPort(value) {
@@ -448,6 +458,9 @@ export class ProxyPool extends EventEmitter {
     this.state = { config: { ...DEFAULT_CONFIG }, proxies: [] }
     this._timer = null
     this._probing = false
+    // A restored process re-litigates proxy health from a cold, busy machine:
+    // probe failures right after boot are boot-storm evidence, not proxy death.
+    this._bootAt = Date.now()
     this._activeProbes = new WeakMap()
     this._probeSockets = new Map()
     // Node exits are not pool rows: px-local's geo is the control plane's, a node slot leaves elsewhere.
@@ -1173,6 +1186,13 @@ export class ProxyPool extends EventEmitter {
     if (patch.max_failures != null) {
       this.state.config.max_failures = Math.max(1, Number(patch.max_failures) || 2)
     }
+    if (patch.boot_grace_min != null) {
+      const n = Number(patch.boot_grace_min)
+      if (!Number.isFinite(n) || n < 0 || n > 120) {
+        return { ok: false, error: 'invalid_boot_grace_min', min: 0, max: 120 }
+      }
+      this.state.config.boot_grace_min = n
+    }
     if (patch.enabled != null) this.state.config.enabled = !!patch.enabled
     if (patch.disconnect_on_error != null) this.state.config.disconnect_on_error = !!patch.disconnect_on_error
     if (patch.bind_limit != null) {
@@ -1843,11 +1863,30 @@ export class ProxyPool extends EventEmitter {
     p.last_error = result.error || 'probe_failed'
     p.status = 'fail'
     const maxFail = this.state.config.max_failures || 2
+    if (this._bootGraceActive() && bootStormShaped(p.last_error)) {
+      // Boot storm: kernel restores and bin pushes are still hogging the wire,
+      // so a timeout here says nothing about the proxy. Keep the row 'fail'
+      // (visible, counted) but never let the streak cross into dead + cascade.
+      // A half-streak persisted by the previous process rides the same clamp:
+      // its evidence predates a restart this process cannot vouch for.
+      // Hard answers (refused, auth, not a proxy) are not storm evidence and
+      // keep the normal verdict, so a proxy that died during the restart is
+      // still parked. A crash loop keeps reopening the window for timeouts only.
+      p.consecutive_failures = Math.min(p.consecutive_failures, maxFail - 1)
+      return
+    }
     if (p.consecutive_failures >= maxFail) {
       p.enabled = false
       p.status = 'dead'
       if (cascade) this._cascadeDisableVm(p, `proxy_probe_failed:${p.last_error}`)
     }
+  }
+
+  /** True while the process is younger than `boot_grace_min`. */
+  _bootGraceActive(now = Date.now()) {
+    const min = Number(this.state.config.boot_grace_min)
+    if (!Number.isFinite(min) || min <= 0) return false
+    return now - this._bootAt < min * 60_000
   }
 
   _applyProbeResult(p, result, opts = {}) {

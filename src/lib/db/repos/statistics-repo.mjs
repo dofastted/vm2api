@@ -340,7 +340,7 @@ export class StatisticsRepo {
     const { cond, params } = this._scope(since, until, owner_user_id, extra)
     const rows = this.db
       .prepare(`
-      SELECT ${col} AS sid,
+      SELECT COALESCE(${col}, '') AS sid,
              COUNT(*) AS requests,
              COALESCE(SUM(CASE WHEN ${SUCCESS_PRED} THEN 1 ELSE 0 END), 0) AS success,
              COALESCE(SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END), 0) AS errors,
@@ -356,7 +356,7 @@ export class StatisticsRepo {
              AVG(duration_ms) AS avg_duration_ms,
              AVG(first_token_ms) AS avg_ttft_ms
       FROM usage_logs ${cond}
-      GROUP BY IFNULL(${col}, '')
+      GROUP BY COALESCE(${col}, '')
       ORDER BY cost DESC, requests DESC
       ${listOwned ? '' : 'LIMIT ?'}
     `)

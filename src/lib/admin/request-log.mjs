@@ -846,7 +846,7 @@ export class RequestLogStore {
       max_mb: this.maxMb,
       muted_error_classes: this.mutedErrorClasses.slice(),
       recent_normal: this._mem.length,
-      backend: 'sqlite',
+      backend: this.db?.engine === 'postgres' ? 'postgres' : 'sqlite',
       jsonl_mirror: this.jsonlMirror,
       total_rows: (() => {
         try {

@@ -24,3 +24,13 @@ test('resident pre-warming skips accounts blocked by eligibility', { timeout: 15
     timeout: 12_000,
   })
 })
+
+test('re-auth worker refreshes outside host.lock, logs failures, and cleans up checking state', {
+  timeout: 15_000,
+}, () => {
+  execFileSync('python3', ['-B', path.join(root, 'test/unit/gemini-reauth-worker.py')], {
+    cwd: root,
+    stdio: 'pipe',
+    timeout: 12_000,
+  })
+})

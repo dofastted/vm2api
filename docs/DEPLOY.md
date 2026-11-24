@@ -22,9 +22,13 @@ VM2API_DB_SECRET='再一串'
 
 | 容器 | 说明 |
 |---|---|
-| `vm2api` | 控制面。Compose **只起这一个** |
+| `vm2api` | 控制面（`network_mode: host`） |
+| `vm2api-postgres` | PostgreSQL 18 主库（仅绑定 `127.0.0.1:5432`，全新安装默认启用；使用外部云库时可 `--no-deps` 跳过） |
+| `vm2api-redis` | Redis 8 L2 缓存（仅绑定 `127.0.0.1:6379`，可选，不可用时自动降级 L1） |
 | `kin-<槽>` | 每个**已启动**的槽 1 个 |
-| 没有 | 未启动的槽；同机其它项目的 postgres 等 |
+| 没有 | 未启动的槽；同机其它项目的独立数据库 |
+
+> **从既有 SQLite 迁移到 PostgreSQL**：升级不会自动丢弃 `data/kin.db`，请按 [PostgreSQL 迁移指南](POSTGRES_MIGRATION.md) 执行 `sudo bash /opt/vm2api/deploy/replace-db-to-pg.sh`（支持 Docker 与宿主机 systemd，支持一键 `--rollback`）。
 
 不是一个父容器里多个子进程。
 

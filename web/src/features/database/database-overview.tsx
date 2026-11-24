@@ -1,4 +1,7 @@
-import type { DatabaseRuntimeMetrics } from '@/types/panel-database'
+import type {
+  DatabaseRuntimeMetrics,
+  MultiTierCacheMetrics,
+} from '@/types/panel-database'
 import { StatusMark } from '@/components/status-mark'
 import { PanelCard, StatCell } from '@/features/overview/panel-card'
 import {
@@ -8,7 +11,7 @@ import {
   formatMetricTime,
 } from './metrics'
 
-function latency(value: number | null): string {
+function latency(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return '—'
   if (value < 10) return `${value.toFixed(2)}ms`
   return `${Math.round(value)}ms`
@@ -38,11 +41,118 @@ function Detail({ label, value }: { label: string; value: string }) {
 
 export function DatabaseOverview({
   metrics,
+  cache,
   sampledAt,
 }: {
   metrics: DatabaseRuntimeMetrics
+  cache?: MultiTierCacheMetrics | null
   sampledAt: string | null
 }) {
+  const isPostgres = metrics.engine === 'postgres'
+
+  if (isPostgres) {
+    const connText =
+      metrics.pg_connections_total == null
+        ? '—'
+        : `${formatMetricNumber(metrics.pg_connections_active ?? 0)} / ${formatMetricNumber(metrics.pg_connections_total)}`
+    const connHint =
+      metrics.pg_max_connections == null
+        ? `空闲 ${formatMetricNumber(metrics.pg_connections_idle ?? 0)}`
+        : `上限 ${formatMetricNumber(metrics.pg_max_connections)} · 空闲 ${formatMetricNumber(metrics.pg_connections_idle ?? 0)}`
+
+    const asyncPool = metrics.pg_pool?.async
+    const syncPool = metrics.pg_pool?.sync
+    const poolActive = (asyncPool?.active ?? 0) + (syncPool?.active ?? 0)
+    const poolMax = (asyncPool?.max ?? 0) + (syncPool?.max ?? 0)
+    const poolText = poolMax > 0 ? `${poolActive} / ${poolMax}` : '—'
+    const poolWaiting = (asyncPool?.waiting ?? 0) + (syncPool?.waiting ?? 0)
+
+    const cacheModeLabel =
+      cache?.mode === 'l1+redis'
+        ? 'L1 + Redis'
+        : cache?.mode === 'l1+pg_notify'
+          ? 'L1 + PG Notify'
+          : cache?.mode
+            ? cache.mode.toUpperCase()
+            : '—'
+
+    return (
+      <PanelCard
+        title='数据库运行态'
+        meta={sampledAt ? `采样于 ${formatMetricTime(sampledAt)}` : '当前快照'}
+        action={
+          <StatusMark
+            variant='pill'
+            tone={
+              metrics.ok
+                ? { key: 'ok', cls: 'ok', text: '探针正常' }
+                : { key: 'bad', cls: 'bad', text: '探针失败' }
+            }
+          />
+        }
+      >
+        <div className='grid grid-cols-2 gap-px bg-border/60 sm:grid-cols-3 xl:grid-cols-6'>
+          <StatCell
+            label='探针耗时'
+            value={latency(metrics.probe_latency_ms)}
+            hint='SELECT 1'
+          />
+          <StatCell
+            label='数据库大小'
+            value={formatMetricBytes(metrics.file_size_bytes)}
+            hint={metrics.pg_database || 'PostgreSQL'}
+          />
+          <StatCell
+            label='Buffer 命中率'
+            value={formatMetricPercent(metrics.pg_cache_hit_ratio ?? null)}
+            hint='pg_stat_database'
+          />
+          <StatCell label='活跃 / 总连接' value={connText} hint={connHint} />
+          <StatCell
+            label='应用连接池'
+            value={poolText}
+            hint={`等待 ${poolWaiting} · 异步+兼容池`}
+          />
+          <StatCell
+            label='Migration'
+            value={metrics.latest_migration || '—'}
+            hint={`${formatMetricNumber(metrics.migration_count)} 次 · ${formatMetricTime(metrics.latest_migration_at)}`}
+          />
+        </div>
+
+        <dl className='grid grid-cols-2 gap-x-5 gap-y-3 border-t px-4 py-3 sm:grid-cols-3 xl:grid-cols-6'>
+          <Detail label='引擎' value='POSTGRESQL' />
+          <Detail label='服务端版本' value={metrics.pg_version || '—'} />
+          <Detail
+            label='死锁计数'
+            value={formatMetricNumber(metrics.pg_deadlocks ?? 0)}
+          />
+          <Detail label='多级缓存' value={cacheModeLabel} />
+          <Detail
+            label='L1 缓存命中率'
+            value={formatMetricPercent(cache?.l1?.hit_rate ?? null)}
+          />
+          <Detail
+            label='Redis L2'
+            value={
+              cache?.l2_redis?.connected
+                ? `已连接 (${latency(cache.redis_ping_ms)})`
+                : cache?.l2_redis?.configured
+                  ? '降级 L1'
+                  : '未启用'
+            }
+          />
+        </dl>
+
+        <p className='border-t px-4 py-2.5 text-[11px] leading-relaxed text-muted-foreground'>
+          PostgreSQL 运行态指标来自 pg_database_size、pg_stat_database 与
+          pg_stat_activity； 应用层多级缓存（L1 LRU + Singleflight + 可选 Redis
+          L2 / PubSub 失效）单独统计。
+        </p>
+      </PanelCard>
+    )
+  }
+
   const pageUse =
     metrics.used_pages == null && metrics.page_count == null
       ? '—'

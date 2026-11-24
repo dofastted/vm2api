@@ -146,7 +146,11 @@ export class VmPoolsRepo {
 
 function mapConstraint(error) {
   const message = String(error?.message || error)
-  if (/UNIQUE/i.test(message) && /vm_pools|name/i.test(message)) {
+  const code = String(error?.code || error?.pgCode || '')
+  if (
+    (code === '23505' || /UNIQUE|duplicate key/i.test(message)) &&
+    /vm_pools|name/i.test(message + ' ' + String(error?.constraint || ''))
+  ) {
     return Object.assign(new Error('账号池名称已存在'), { code: 'vm_pool_name_taken' })
   }
   return error
