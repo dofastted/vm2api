@@ -281,8 +281,17 @@ export function geminiProxyFor(proxyPool, proxyId, opts) {
   return proxyFor(proxyPool, proxyId, opts)
 }
 
-function hostError(code, status = 503) {
-  return Object.assign(new Error(code), { code, status })
+const AUTH_STAGE_MESSAGES = {
+  network_prepare: 'Gemini 宿主服务在线，但隔离网络初始化失败，请检查宿主服务日志与 ip/nft/iptables 环境',
+  relay_start: 'Gemini 宿主服务在线，但宿主侧代理中继未能启动，请检查宿主服务日志',
+  proxy_probe: 'Gemini 宿主服务在线，但隔离出口无法连通绑定代理，请检查绑定代理可用性与宿主前置代理路径',
+  egress_start: 'Gemini 宿主服务在线，但隔离出口转发组件（kin-egress）未能就绪，请检查宿主服务日志',
+  cli_launch: 'Gemini 宿主服务在线，但 Antigravity CLI 授权进程未能拉起，请检查宿主服务日志与签名载荷',
+  challenge_wait: 'Gemini 宿主服务在线，但未能在时限内获取 Google 授权链接，请检查绑定代理连通性与宿主服务日志',
+}
+
+function hostError(code, status = 503, extra = null) {
+  return Object.assign(new Error(code), { code, status, ...(extra || {}) })
 }
 
 export function officialGeminiAuthUrl(value) {
@@ -334,8 +343,15 @@ function hostRequest(socketPath, operation, payload) {
             chunks.push(chunk)
           }
           const data = JSON.parse(Buffer.concat(chunks))
-          if (response.statusCode !== 200 && typeof data?.code === 'string' && Object.hasOwn(HOST_ERRORS, data.code))
-            throw hostError(data.code, response.statusCode)
+          if (response.statusCode !== 200 && typeof data?.code === 'string' && Object.hasOwn(HOST_ERRORS, data.code)) {
+            const stage =
+              data.code === 'gemini_authorization_unavailable' &&
+              typeof data.stage === 'string' &&
+              Object.hasOwn(AUTH_STAGE_MESSAGES, data.stage)
+                ? data.stage
+                : null
+            throw hostError(data.code, response.statusCode, stage ? { stage } : null)
+          }
           if (!terminal && operation !== 'redeem' && response.statusCode === 404)
             throw hostError('gemini_environment_not_found', 404)
           if (!terminal && operation !== 'redeem' && response.statusCode === 409)
@@ -831,7 +847,8 @@ export function createGeminiPanelHandler({
     })
   return async function handleGeminiPanel(req, res, pathname) {
     const ok = (data) => json(res, 200, { ok: true, data })
-    const fail = (status, code, message = code) => json(res, status, { ok: false, error: { code, message } })
+    const fail = (status, code, message = code, extra = null) =>
+      json(res, status, { ok: false, error: { code, message, ...(extra || {}) } })
     res.setHeader('Cache-Control', 'no-store')
     if (pathname === `${PANEL_PATH}/maintenance` || pathname.startsWith(`${PANEL_PATH}/maintenance/`)) {
       return maintenance(req, res, pathname)
@@ -1151,7 +1168,13 @@ export function createGeminiPanelHandler({
       }
       if (Object.hasOwn(HOST_ERRORS, error?.code)) {
         const [status, message] = HOST_ERRORS[error.code]
-        return fail(status, error.code, message)
+        const stage =
+          error.code === 'gemini_authorization_unavailable' &&
+          typeof error.stage === 'string' &&
+          Object.hasOwn(AUTH_STAGE_MESSAGES, error.stage)
+            ? error.stage
+            : null
+        return fail(status, error.code, stage ? AUTH_STAGE_MESSAGES[stage] : message, stage ? { stage } : null)
       }
       if (error?.code === 'gemini_proxy_unavailable') return fail(409, error.code, '需要绑定可用的 IPv4 SOCKS5 代理')
       if (error?.code === 'gemini_environment_not_found') return fail(404, error.code, 'Gemini 环境不存在')
