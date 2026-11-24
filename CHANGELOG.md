@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.4.192 — 2026-11-24 · PostgreSQL 与多级缓存支持；CRAGGemini 系统提示词控制与 `0.4.4` 载荷；集群遥测与代理池重启宽限窗修复
+
+- **PostgreSQL 数据库引擎与多级缓存支持**：扩展数据库层支持 PostgreSQL（兼容既有 SQLite 单文件与隔离单测），新增 `src/lib/db/pg/` 连接池管理、Advisory Lock 并发安全迁移（`001`–`004`）、SQL 方言兼容层与仪表盘预聚合器；新增 `src/lib/cache/` L1 LRU + Singleflight + 可选 L2 Redis 缓存与跨实例实时失效（Redis 异常自动 Fail-Open 降级 L1）；重构在线备份/恢复至独立 Worker（支持 `pg_dump` 与流式 `.pg.ndjson.gz` 防死锁批量恢复）；配套流式迁移工具 `scripts/migrate-sqlite-to-pg.mjs`、生产一键切流与 `--rollback` 脚本 `deploy/replace-db-to-pg.sh`（`deploy/install.sh` 升级时检测到已有 `data/kin.db` 自动保持 `VM2API_DB_DRIVER=sqlite` 防误切空库），以及 Web 数据库与缓存监控面板（#1699）。
+- **CRAGGemini 系统提示词控制与 `0.4.4` 载荷钉住**：系统提示词页面新增 `CRAGGemini (Antigravity)` 标签页，支持 `official_full`（官方提示词）与 `zero`（0 提示词替换）两种模式及可选全局系统提示词（`compatibility.craggemini_persona_preset` / `craggemini_system_prompt`）；控制面与宿主（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）透传 `system_prompt_mode`（向下兼容旧版 worker）；`deploy/payload.json` 钉住签名载荷 `payload-2026.11.24-gemini-0.4.4`（`craggemini` 0.4.4 + `libagy_bridge.so`）（#1700）。
+- **CRAGGemini 后台重认证检查锁并发与日志修复**：`_schedule_reauth_check_locked` 后台线程不再持全局 `host.lock` 执行网络 I/O，`refresh_account` 自身为忙碌判定与尾部状态变更（`env` 更新、`save()`、`stop_native_session`、`_schedule_warm_locked`）及 `pull_models` 写盘取锁，并在环境于探测期间被删除时跳过回写；将 `except BaseException: pass` 改为捕获 `Exception` 并向 `stderr` 输出脱敏错误日志，不吞 `KeyboardInterrupt` / `SystemExit`（#1695，修复 #1674）。
+- **代理池 boot 探活宽限窗（按失败形状收窄）**：新增 `boot_grace_min`（默认 10 分钟，0 关闭），重启宽限窗内仅对超时类探活失败（`timeout`、`egress_timeout`、`egress_dns_timeout`、`egress_tls_timeout`）钳制 `consecutive_failures` 于 `max_failures - 1`，避免升级重启风暴瞬态超时连坐摘除整个号池；`connection_refused` 等明确拒绝保持原有 `dead` 与级联禁用判定（#1698，替代 #1640）。
+- **集群 Docker CRAG 遥测修复与测试缝隙清理**：补齐指纹目录 `0755`/`0644` 权限归一化、`writeKernelConfig` 为集群 Docker CRAG 槽位输出 `dmi_dir: '/etc/kin-dmi'`、CRAG 重装保留原生遥测设置、上游 `reason`/`upstream_message` 透传以及旧集群容器缺失挂载时的维护态重建路径（复用 `slot-computer-files.mjs` 单一挂载来源）（#1636，修复 #1592）；移除 `fleet-update.mjs` 与 `slot-process-status.mjs` 中依赖测试替身判定的分支，确保每次 CRAG 重启前无条件写入内核配置并可观测验证（#1696）。
+- 部署说明：本版涉及控制面（含 `Dockerfile` 新增 `postgresql-client` 及 `pg`/`ioredis` 依赖）、前端、CRAGGemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）与 `geminiDefaultLinuxAmd64`（`0.4.4`）加密载荷；Claude/Codex 槽位内核与 `wrap-cli` 字节未变，`remote-apply.sh` 报 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位。存量 SQLite 宿主执行 `install.sh upgrade` 会自动保持 `VM2API_DB_DRIVER=sqlite`，待需要时再执行 `sudo bash deploy/replace-db-to-pg.sh` 平滑迁移。
+
 ## 1.4.191 — 2026-11-24 · Gemini 原生 `/v1beta` + `/v1` 端口与 Gemini API 多协议渠道；不合格原生会话快速失败；Gemini 槽位状态紧凑化
 
 - Gemini 公开端口补齐：新增 `/v1/models/:model:(generateContent|streamGenerateContent)` 稳定路径与单模型查询 `GET /v1beta/models/:model`、`GET /v1/models/:model`；`/v1/models*` 允许 `?key=` 鉴权，CORS 放行 `x-goog-api-key`、`x-goog-api-client`；`category=api` 密钥访问 `/v1beta/models*` 与 `/v1/models/:model:*` 时分流至 API 渠道，不再误落本地 CRAGGemini host socket（#1690）。
