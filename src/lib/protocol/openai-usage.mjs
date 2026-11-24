@@ -45,6 +45,7 @@ function usageObject(body) {
 function hasAnthropicCacheNames(usage) {
   return (
     usage.cache_read_input_tokens != null ||
+    usage.cache_read_tokens != null ||
     usage.cache_creation_input_tokens != null ||
     (usage.cache_creation && typeof usage.cache_creation === 'object')
   )

@@ -7,6 +7,7 @@ import {
   createGeminiEventDecoder,
   createSseFrameSplitter,
 } from '../protocol/gemini-convert.mjs'
+import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import {
   classifyAntigravityModel,
   indexAccountModelCatalog,
@@ -198,11 +199,26 @@ async function readRun(callHost, id, runId, signal) {
   throw fail(504, 'gemini_inference_timeout')
 }
 
-async function consumeStreamResponse(response, { model, onEvent, signal }) {
+async function consumeStreamResponse(response, { model, onEvent, signal, startedAt = null, now = () => Date.now() }) {
   const decoder = createGeminiEventDecoder({ fallbackModel: model })
   const collector = createGeminiCollector({ fallbackModel: model })
+  const timing = createStreamTiming(Number.isFinite(startedAt) ? startedAt : now())
   let streamError = null
+  let sawChunk = false
   const emit = (event) => {
+    const at = now()
+    if (event?.kind === 'start') {
+      timing.observe({ type: 'message_start' }, at)
+    } else if (
+      event?.kind === 'text' ||
+      event?.kind === 'thinking' ||
+      event?.kind === 'tool_call' ||
+      event?.kind === 'image'
+    ) {
+      timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, at)
+    } else if (event?.kind === 'stop') {
+      timing.observe({ type: 'message_delta', delta: { stop_reason: event.stopReason || 'end_turn' } }, at)
+    }
     collector.push(event)
     if (event.kind === 'error' && !streamError) streamError = event
     onEvent?.(event)
@@ -219,10 +235,15 @@ async function consumeStreamResponse(response, { model, onEvent, signal }) {
   try {
     for await (const chunk of response) {
       signal?.throwIfAborted()
+      if (!sawChunk) {
+        sawChunk = true
+        timing.observe({ type: 'message_start' }, now())
+      }
       splitter.push(chunk)
     }
     signal?.throwIfAborted()
     splitter.flush()
+    decoder.flush?.(emit)
   } finally {
     signal?.removeEventListener('abort', onAbort)
   }
@@ -241,12 +262,22 @@ async function consumeStreamResponse(response, { model, onEvent, signal }) {
               : streamError.status === 400
                 ? 'gemini_invalid_request'
                 : 'gemini_inference_failed'
-    throw fail(streamError.status || FAILURES[code][0], code, streamError.message)
+    const err = fail(streamError.status || FAILURES[code][0], code, streamError.message)
+    if (Number.isInteger(streamError.status)) err.upstreamStatus = streamError.status
+    err.timing = timing.snapshot()
+    err.usage = result.usage
+    throw err
   }
   if (!result.sawFinish && !result.text && !result.toolCalls.length && !result.images.length) {
-    throw fail(502, 'gemini_inference_invalid_output')
+    const err = fail(502, 'gemini_inference_invalid_output')
+    err.timing = timing.snapshot()
+    err.usage = result.usage
+    throw err
   }
-  return result
+  if (!result.sawFinish) {
+    timing.observe({ type: 'message_stop' }, now())
+  }
+  return { ...result, timing: timing.snapshot() }
 }
 
 async function readErrorPayload(response) {
@@ -626,12 +657,14 @@ export function createGeminiScheduler({
       unsupportedFields = [],
       plainText = null,
       requestId = `gem_${crypto.randomBytes(12).toString('hex')}`,
+      startedAt = null,
       stickyKey = null,
       signal,
       apiKeyRecord,
       allowUnprefixedNonGemini = null,
       onEvent = null,
     }) {
+      const turnStartedAt = Number.isFinite(startedAt) ? startedAt : now()
       const gate = apiKeyStore?.acquire?.(apiKeyRecord)
       if (gate && !gate.ok) throw fail(gate.status || 429, gate.code, gate.message)
       const allowUnprefixed = allowUnprefixedNonGemini ?? (apiKeyRecord?.group_type !== 'all')
@@ -640,6 +673,26 @@ export function createGeminiScheduler({
       let selected = null
       let legacyRun = null
       let activeInfer = null
+      let attempts = 0
+      let lastUpstreamStatus = null
+      let lastAccountId = null
+      let lastAuthMethod = null
+      let lastUpstreamModel = null
+      let lastTiming = null
+      let lastUsage = null
+      const attachAttemptMeta = (err) => {
+        if (!err || typeof err !== 'object') return err
+        if (err.attemptCount == null) err.attemptCount = attempts
+        if (err.upstreamStatus == null && lastUpstreamStatus != null) {
+          err.upstreamStatus = lastUpstreamStatus
+        }
+        if (err.accountId == null && lastAccountId) err.accountId = lastAccountId
+        if (err.authMethod == null && lastAuthMethod) err.authMethod = lastAuthMethod
+        if (err.upstreamModel == null && lastUpstreamModel) err.upstreamModel = lastUpstreamModel
+        if (err.timing == null && lastTiming) err.timing = lastTiming
+        if (err.usage == null && lastUsage) err.usage = lastUsage
+        return err
+      }
 
       try {
         signal?.throwIfAborted()
@@ -731,7 +784,6 @@ export function createGeminiScheduler({
         const resolvedByAccountId = new Map(activeList.map((item) => [item.candidate.accountId, item.resolved]))
 
         let lastError = null
-        let attempts = 0
         while (excluded.size < candidates.length && attempts < maxAttempts) {
           signal?.throwIfAborted()
           const grant = pickCandidateWithPolicy(candidates, excluded, {
@@ -744,6 +796,10 @@ export function createGeminiScheduler({
           const id = grant.selected.accountId.slice('gemini:'.length)
           const resolved = resolvedByAccountId.get(grant.selected.accountId)
           selected = { ...grant.selected, id, resolved }
+          lastAccountId = id
+          lastAuthMethod = selected.authMethod || 'oauth'
+          lastUpstreamModel = resolved.upstreamModel
+          lastUpstreamStatus = null
           let emittedOutput = false
 
           try {
@@ -753,6 +809,7 @@ export function createGeminiScheduler({
             const proxyUrl = resolveProxy ? resolveProxy(proxyId) : undefined
             signal?.throwIfAborted()
             const authMethod = listed?.auth_method === 'api_key' ? 'api_key' : selected.authMethod || 'oauth'
+            lastAuthMethod = authMethod
             const rawOutboundBody = targetBodyFor
               ? targetBodyFor(authMethod === 'api_key' ? 'gemini' : 'antigravity', {
                   upstreamModel: resolved.upstreamModel,
@@ -791,6 +848,7 @@ export function createGeminiScheduler({
                 },
                 { signal, timeoutMs: Math.max(STREAM_TURN_MS, (policy.pool.timeout_ms || 120_000) + 15_000) },
               )
+              if (Number.isInteger(res?.statusCode)) lastUpstreamStatus = res.statusCode
               const contentType = String(res.headers?.['content-type'] || '')
                 .split(';')[0]
                 .trim()
@@ -863,6 +921,8 @@ export function createGeminiScheduler({
               collected = await consumeStreamResponse(streamResponse, {
                 model: resolved.publicId,
                 signal,
+                startedAt: turnStartedAt,
+                now,
                 onEvent: (event) => {
                   if (event && event.kind !== 'error') emittedOutput = true
                   onEvent?.(event)
@@ -878,6 +938,8 @@ export function createGeminiScheduler({
                 throw fail(mapped?.[0] || 502, mapped ? code : 'gemini_inference_failed')
               }
               if (typeof result.text !== 'string') throw fail(502, 'gemini_host_protocol_error')
+              lastUpstreamStatus = 200
+              const finishedAt = now()
               const usage = {}
               for (const key of [
                 'input_tokens',
@@ -886,7 +948,10 @@ export function createGeminiScheduler({
                 'reasoning_tokens',
                 'total_tokens',
               ]) {
-                const count = result.usage?.[key]
+                const count =
+                  key === 'reasoning_tokens'
+                    ? (result.usage?.reasoning_tokens ?? result.usage?.thinking_tokens)
+                    : result.usage?.[key]
                 if (Number.isSafeInteger(count) && count >= 0) usage[key] = count
               }
               const collector = createGeminiCollector({ fallbackModel: resolved.publicId })
@@ -904,7 +969,16 @@ export function createGeminiScheduler({
               if (result.text) emit({ kind: 'text', text: result.text })
               emit({ kind: 'stop', finishReason: 'STOP', stopReason: 'stop' })
               emit({ kind: 'usage', usage })
-              collected = collector.result()
+              collected = {
+                ...collector.result(),
+                timing: {
+                  firstByteAt: finishedAt,
+                  firstByteMs: Math.max(0, finishedAt - turnStartedAt),
+                  firstTokenAt: finishedAt,
+                  ttftMs: Math.max(0, finishedAt - turnStartedAt),
+                  generationMs: null,
+                },
+              }
             }
 
             clearCooldownOnSuccess(id, resolved.upstreamModel, resolved.quotaGroup)
@@ -920,6 +994,8 @@ export function createGeminiScheduler({
               upstream_model: resolved.upstreamModel,
               provider: resolved.provider,
               quota_group: resolved.quotaGroup,
+              attempt_count: attempts,
+              upstream_status: lastUpstreamStatus ?? 200,
             }
           } catch (error) {
             if (legacyRun) {
@@ -937,7 +1013,9 @@ export function createGeminiScheduler({
             reservation?.release()
             reservation = null
 
-            const failure = known(error) || error
+            if (error?.timing) lastTiming = error.timing
+            if (error?.usage) lastUsage = error.usage
+            const failure = attachAttemptMeta(known(error) || error)
             const failureCode = failure?.code
             const cancelled = signal?.aborted || failure?.name === 'AbortError' || failureCode === 'ABORT_ERR'
 
@@ -965,7 +1043,7 @@ export function createGeminiScheduler({
           }
         }
 
-        throw lastError || fail(503, 'gemini_operation_busy')
+        throw attachAttemptMeta(lastError || fail(503, 'gemini_operation_busy'))
       } finally {
         reservation?.release()
         try {
@@ -974,12 +1052,23 @@ export function createGeminiScheduler({
       }
     },
 
-    async complete({ model, text, stickyKey = null, signal, apiKeyRecord, allowUnprefixedNonGemini = null }) {
+    async complete({
+      model,
+      text,
+      requestId,
+      startedAt = null,
+      stickyKey = null,
+      signal,
+      apiKeyRecord,
+      allowUnprefixedNonGemini = null,
+    }) {
       const result = await this.stream({
         model,
         geminiBody: { contents: [{ role: 'user', parts: [{ text }] }] },
         requiredCapabilities: [],
         plainText: text,
+        ...(requestId ? { requestId } : {}),
+        startedAt,
         stickyKey,
         signal,
         apiKeyRecord,
@@ -992,6 +1081,11 @@ export function createGeminiScheduler({
         auth_method: result.auth_method,
         model: result.model,
         upstream_model: result.upstream_model,
+        stopReason: result.stopReason,
+        searches: result.searches,
+        attempt_count: result.attempt_count,
+        upstream_status: result.upstream_status,
+        timing: result.timing,
       }
     },
   }

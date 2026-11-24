@@ -368,13 +368,15 @@ function normalizeEffort(raw) {
   const value = String(raw || '')
     .trim()
     .toLowerCase()
+    .replace(/^thinking_level_/, '')
   if (!value) return ''
   if (['none', 'off', 'disabled', '0'].includes(value)) return 'none'
   if (['minimal', 'min'].includes(value)) return 'minimal'
   if (value === 'low') return 'low'
   if (value === 'medium' || value === 'med') return 'medium'
   if (value === 'high') return 'high'
-  if (value === 'xhigh' || value === 'max') return 'high'
+  if (value === 'xhigh') return 'xhigh'
+  if (value === 'max') return 'max'
   return ''
 }
 
@@ -396,6 +398,8 @@ function budgetFromEffort(effort) {
     case 'medium':
       return 8192
     case 'high':
+    case 'xhigh':
+    case 'max':
       return 16384
     default:
       return 8192
@@ -2176,12 +2180,20 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
 export function normalizeGeminiUsage(metadata) {
   if (!isPlainObject(metadata)) return null
   const int = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : 0)
-  const prompt = int(metadata.promptTokenCount)
-  const cached = Math.min(prompt, int(metadata.cachedContentTokenCount))
-  const candidates = int(metadata.candidatesTokenCount)
-  const thoughts = int(metadata.thoughtsTokenCount)
-  const total = int(metadata.totalTokenCount)
+  const rawPrompt = int(metadata.promptTokenCount ?? metadata.prompt_token_count)
+  const rawCached = int(metadata.cachedContentTokenCount ?? metadata.cached_content_token_count)
+  const candidates = int(metadata.candidatesTokenCount ?? metadata.candidates_token_count)
+  const thoughts = int(metadata.thoughtsTokenCount ?? metadata.thoughts_token_count)
+  const total = int(metadata.totalTokenCount ?? metadata.total_token_count)
   const output = candidates + thoughts
+  let prompt = rawPrompt
+  if (prompt === 0 && total > 0) {
+    prompt = Math.max(total - output, 0)
+  }
+  if (prompt === 0 && rawCached > 0) {
+    prompt = rawCached
+  }
+  const cached = Math.min(prompt, rawCached)
   return {
     input_tokens: Math.max(prompt - cached, 0),
     output_tokens: output,
@@ -2376,11 +2388,28 @@ export function createGeminiEventDecoder({ fallbackModel = '' } = {}) {
   let sawTool = false
   let stopped = false
   let searched = false
+  let mergedRawUsage = null
   let latestUsage = null
+  let emittedUsage = null
+
+  function mergeRawUsage(raw) {
+    if (!isPlainObject(raw)) return null
+    const next = mergedRawUsage ? { ...mergedRawUsage } : {}
+    let changed = false
+    for (const [k, v] of Object.entries(raw)) {
+      if (v != null) {
+        next[k] = v
+        changed = true
+      }
+    }
+    if (!changed && !mergedRawUsage) return null
+    mergedRawUsage = next
+    return normalizeGeminiUsage(mergedRawUsage)
+  }
 
   function decodeChunk(chunk, emit) {
     if (!isPlainObject(chunk)) return
-    const usage = normalizeGeminiUsage(chunk.usageMetadata)
+    const usage = mergeRawUsage(chunk.usageMetadata ?? chunk.usage_metadata)
     if (usage) latestUsage = usage
     if (!started) {
       started = true
@@ -2463,7 +2492,8 @@ export function createGeminiEventDecoder({ fallbackModel = '' } = {}) {
         })
       }
     }
-    if (stopped && latestUsage) {
+    if (stopped && latestUsage && emittedUsage !== latestUsage) {
+      emittedUsage = latestUsage
       emit({ kind: 'usage', usage: latestUsage })
     }
   }
@@ -2479,6 +2509,12 @@ export function createGeminiEventDecoder({ fallbackModel = '' } = {}) {
         emit({ kind: 'error', status: 502, code: 'gemini_inference_invalid_output', message: parsed.message })
       }
       return parsed.kind
+    },
+    flush(emit) {
+      if (latestUsage && emittedUsage !== latestUsage) {
+        emittedUsage = latestUsage
+        emit({ kind: 'usage', usage: latestUsage })
+      }
     },
     get usage() {
       return latestUsage

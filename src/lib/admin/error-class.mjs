@@ -82,6 +82,7 @@ const CODE_MAP = {
   request_cancelled: 'timeout',
   client_aborted: 'timeout',
   selection_cancelled: 'timeout',
+  gemini_inference_cancelled: 'timeout',
   ECONNRESET: 'timeout',
   aborted: 'timeout',
   upstream_auth_error: 'credential',
@@ -101,6 +102,7 @@ export const IGNORED_ERROR_CODES = new Set([
   'request_cancelled',
   'client_aborted',
   'selection_cancelled',
+  'gemini_inference_cancelled',
 ])
 
 /**
