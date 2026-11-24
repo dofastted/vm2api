@@ -66,6 +66,37 @@ test('boot-grace: a half-streak persisted by the previous process rides the same
   assert.deepEqual(disabled, [])
 })
 
+test('boot-grace: a hard refusal right after boot keeps the dead + cascade verdict', (t) => {
+  const disabled = []
+  const pool = makePool(t, { onDisableVm: (vmId) => disabled.push(vmId) })
+  const p = addProxy(pool)
+  pool.bind(p.id, 'vm-02')
+  const refused = { ok: false, scope: 'socks', error: 'connection_refused', latency_ms: null }
+
+  pool._applyProbeResult(p, refused)
+  pool._applyProbeResult(p, refused)
+
+  assert.equal(p.status, 'dead')
+  assert.equal(p.enabled, false)
+  assert.deepEqual(disabled, ['vm-02'])
+})
+
+test('boot-grace covers every timeout shape the probes report', (t) => {
+  const pool = makePool(t)
+  for (const error of [
+    'timeout',
+    'egress_timeout：经代理连接检测目标超时',
+    'egress_dns_timeout：经代理 DNS 探测超时',
+  ]) {
+    const p = addProxy(pool)
+    pool._applyProbeResult(p, { ok: false, scope: 'socks', error, latency_ms: null })
+    pool._applyProbeResult(p, { ok: false, scope: 'socks', error, latency_ms: null })
+    assert.equal(p.status, 'fail', error)
+    assert.equal(p.enabled, true, error)
+    pool.state.proxies = []
+  }
+})
+
 test('after the grace window the old verdict is intact: dead + cascade', (t) => {
   const disabled = []
   const pool = makePool(t, { onDisableVm: (vmId, reason) => disabled.push([vmId, reason]) })
@@ -77,7 +108,7 @@ test('after the grace window the old verdict is intact: dead + cascade', (t) => 
 
   assert.equal(p.status, 'dead')
   assert.equal(p.enabled, false)
-  assert.deepEqual(disabled, [[ 'vm-02', `proxy_probe_failed:${FAIL.error}` ]])
+  assert.deepEqual(disabled, [['vm-02', `proxy_probe_failed:${FAIL.error}`]])
 })
 
 test('boot_grace_min=0 restores the pre-grace behavior for operators who want it', (t) => {

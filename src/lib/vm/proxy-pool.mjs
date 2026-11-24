@@ -232,6 +232,11 @@ function uid(prefix = 'px') {
   return `${prefix}-${crypto.randomBytes(4).toString('hex')}`
 }
 
+/** Timeouts (`timeout`, `egress_timeout：…`, `egress_tls_timeout：…`) are what a starved, freshly booted machine produces on its own. */
+function bootStormShaped(error) {
+  return /^(?:[a-z_]+_)?timeout(?:：|$)/.test(String(error || ''))
+}
+
 function isSocksPort(value) {
   const port = Number(value)
   return Number.isInteger(port) && port >= 1 && port <= 65535
@@ -1858,12 +1863,15 @@ export class ProxyPool extends EventEmitter {
     p.last_error = result.error || 'probe_failed'
     p.status = 'fail'
     const maxFail = this.state.config.max_failures || 2
-    if (this._bootGraceActive()) {
+    if (this._bootGraceActive() && bootStormShaped(p.last_error)) {
       // Boot storm: kernel restores and bin pushes are still hogging the wire,
       // so a timeout here says nothing about the proxy. Keep the row 'fail'
       // (visible, counted) but never let the streak cross into dead + cascade.
       // A half-streak persisted by the previous process rides the same clamp:
       // its evidence predates a restart this process cannot vouch for.
+      // Hard answers (refused, auth, not a proxy) are not storm evidence and
+      // keep the normal verdict, so a proxy that died during the restart is
+      // still parked. A crash loop keeps reopening the window for timeouts only.
       p.consecutive_failures = Math.min(p.consecutive_failures, maxFail - 1)
       return
     }
