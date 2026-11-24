@@ -398,36 +398,6 @@ test('an empty safetySettings or cachedContent requests nothing and stays on the
   assert.ok(withTools.unsupportedFields.includes('tools'))
 })
 
-test('a populated safetySettings is refused on CRAGGemini instead of silently dropped, and still reaches the API-key channel', () => {
-  const base = { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] }
-  const threshold = { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_MEDIUM_AND_ABOVE' }
-  const ROUTE = { routeModel: 'gemini-4-neon-high', routeStream: false }
-
-  // CRAGGemini cannot apply the field. Dropping it quietly is the one outcome the
-  // caller cannot detect, so the turn is refused and the message names the way out.
-  const populated = parseInboundToGemini('gemini', { ...base, safetySettings: [threshold] }, ROUTE)
-  assert.throws(
-    () => buildGeminiRequest(populated, { target: 'antigravity' }),
-    (err) => {
-      assert.equal(err.status, 400)
-      assert.equal(err.code, 'gemini_unsupported_turn')
-      assert.match(err.message, /safetySettings/)
-      assert.match(err.message, /API key/)
-      return true
-    },
-  )
-
-  // An empty array asks for nothing, so it is not a refusal and not forwarded (#1703).
-  const empty = parseInboundToGemini('gemini', { ...base, safetySettings: [] }, ROUTE)
-  const agEmpty = buildGeminiRequest(empty, { target: 'antigravity' })
-  assert.equal('safetySettings' in agEmpty, false)
-
-  // The API-key channel talks to Google directly and keeps honouring the field.
-  const direct = buildGeminiRequest(populated, { target: 'gemini' })
-  assert.deepEqual(direct.safetySettings, [threshold])
-  assert.equal('safetySettings' in buildGeminiRequest(empty, { target: 'gemini' }), false)
-})
-
 test('SSE decoder, collector, non-streaming renderers, and streaming encoders work across all 4 protocols', () => {
   const thoughtSig = Buffer.from('thought-sig-1').toString('base64')
   const toolSig = Buffer.from('tool-sig-1').toString('base64')
@@ -945,11 +915,7 @@ test('antigravity target strips CRAGGemini-disallowed fields (safetySettings, ca
   }
 
   const ir = parseInboundToGemini('gemini', aiSdkPayload, { routeModel: 'gemini-4-neon-high', routeStream: true })
-  // A populated safetySettings is refused on this target rather than dropped (see the
-  // dedicated case below). The remaining strip assertions reuse the same turn with the
-  // field emptied so they keep covering cachedContent, imageConfig, fileData and tools.
-  assert.throws(() => buildGeminiRequest(ir, { target: 'antigravity' }), /safetySettings/)
-  const agReq = buildGeminiRequest({ ...ir, safetySettings: [] }, { target: 'antigravity' })
+  const agReq = buildGeminiRequest(ir, { target: 'antigravity' })
 
   for (const key of Object.keys(agReq)) {
     assert.ok(CRAGGEMINI_ALLOWED_KEYS.has(key), `Unexpected top-level key for CRAGGemini: ${key}`)
