@@ -145,6 +145,20 @@ def test_account_skips_onboard_when_validation_required():
     assert not any(url.endswith("onboardUser") for url in calls)
     assert account_mod.safe_google_validation_url("https://evil.example/phish") is None
 
+    # Active paidTier / currentTier accounts must NOT be flagged by other ineligibleTiers entries.
+    assert account_mod.parse_ineligibility(
+        {
+            "currentTier": {"id": "free-tier", "name": "Google AI Standard"},
+            "ineligibleTiers": [
+                {
+                    "reasonCode": "VALIDATION_REQUIRED",
+                    "tierId": "enterprise-tier",
+                    "validationUrl": valid_url,
+                }
+            ],
+        }
+    ) == (None, None)
+
 
 def test_realistic_login_settlement_hostname_and_headless_device_inheritance():
     # 1. Deterministic per-env hostname (never shared static "agy")

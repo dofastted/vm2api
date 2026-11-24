@@ -20,14 +20,17 @@ const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const MODEL = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const RUN_ID = /^[a-f0-9]{32}$/
 const MAX_CONCURRENCY = 64
+const DEFAULT_CONCURRENCY = 20
+const DEFAULT_MAX_SESSIONS = 20
 const POLL_MS = 250
 const TURN_MS = 120_000
 const STREAM_TURN_MS = 300_000
 const DEFAULT_QUOTA_COOLDOWN_MS = 60_000
 const DEFAULT_ACCOUNT_COOLDOWN_MS = 5 * 60_000
 
-function normalizeConcurrency(value) {
-  return Number.isSafeInteger(value) && value >= 1 && value <= MAX_CONCURRENCY ? value : 1
+function normalizeConcurrency(value, fallback = DEFAULT_CONCURRENCY) {
+  if (Number.isSafeInteger(value) && value >= 1 && value <= MAX_CONCURRENCY) return value
+  return Number.isSafeInteger(fallback) && fallback >= 1 && fallback <= MAX_CONCURRENCY ? fallback : DEFAULT_CONCURRENCY
 }
 
 const FAILURES = {
@@ -149,7 +152,8 @@ function quotaGroupKeyOfBucket(groupName = '', windowId = '') {
 
 function proactiveCooldownUntil(account, upstreamModel, quotaGroup, ts) {
   let until = 0
-  if (INELIGIBLE_STATES.has(account?.eligibility)) {
+  const inferenceVerified = account?.last_inference?.state === 'completed'
+  if (INELIGIBLE_STATES.has(account?.eligibility) && !inferenceVerified) {
     until = Math.max(until, ts + DEFAULT_ACCOUNT_COOLDOWN_MS)
   }
   const quotas = account?.quotas
@@ -299,6 +303,30 @@ export function createGeminiScheduler({
 
   function recordStickyAccount(stickyKey, accountId, policy, ts) {
     if (!stickyKey || !policy.sticky.enabled || !policy.sticky.ttl_seconds) return
+    const maxSessions = Number.isSafeInteger(policy.pool?.max_sessions_per_account)
+      ? policy.pool.max_sessions_per_account
+      : DEFAULT_MAX_SESSIONS
+    if (maxSessions > 0) {
+      let oldestKey = null
+      let oldestAt = Infinity
+      let countForAccount = 0
+      for (const [k, v] of stickyBindings.entries()) {
+        if (v.expiresAt <= ts) {
+          stickyBindings.delete(k)
+          continue
+        }
+        if (k !== stickyKey && v.accountId === accountId) {
+          countForAccount += 1
+          if (v.touchedAt < oldestAt) {
+            oldestAt = v.touchedAt
+            oldestKey = k
+          }
+        }
+      }
+      if (countForAccount >= maxSessions && oldestKey) {
+        stickyBindings.delete(oldestKey)
+      }
+    }
     if (stickyBindings.size >= 4096) {
       for (const [k, v] of stickyBindings.entries()) {
         if (v.expiresAt <= ts) stickyBindings.delete(k)
@@ -307,6 +335,7 @@ export function createGeminiScheduler({
     }
     stickyBindings.set(stickyKey, {
       accountId,
+      touchedAt: ts,
       expiresAt: ts + policy.sticky.ttl_seconds * 1000,
     })
   }
@@ -554,11 +583,15 @@ export function createGeminiScheduler({
           accounts.push({
             id: environment.id,
             auth_method: authMethod,
-            max_concurrency: normalizeConcurrency(environment.max_concurrency),
+            max_concurrency: normalizeConcurrency(
+              environment.max_concurrency,
+              currentPolicy().pool.max_concurrency_per_account,
+            ),
             capabilities: accountCapabilities(environment),
             models,
             catalogIndex,
             eligibility: environment.account?.eligibility || null,
+            last_inference: environment.last_inference || null,
             quotas: Array.isArray(environment.account?.quotas) ? environment.account.quotas : [],
             quota_groups: Array.isArray(environment.account?.quota_groups) ? environment.account.quota_groups : [],
           })
@@ -660,7 +693,8 @@ export function createGeminiScheduler({
         const scored = capableAccounts.map(({ account, resolved }) => {
           const until = activeCooldownUntil(account, resolved.upstreamModel, resolved.quotaGroup, ts)
           const effectiveMaxConc = normalizeConcurrency(
-            account.max_concurrency ?? policy.pool.max_concurrency_per_account,
+            account.max_concurrency,
+            policy.pool.max_concurrency_per_account,
           )
           return {
             account,

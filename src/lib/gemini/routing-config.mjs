@@ -18,16 +18,18 @@ export const DEFAULT_GEMINI_ROUTING = Object.freeze({
     strategy: 'balanced',
     accounts_per_daemon: 50,
     daemon_fault_isolation: true,
-    max_concurrency_per_account: 2,
+    max_concurrency_per_account: 20,
+    max_sessions_per_account: 20,
     min_warm_slots: 1,
     session_idle_ttl_secs: 600,
-    max_queue: 16,
+    max_queue: 32,
     queue_timeout_ms: 10_000,
     timeout_ms: 120_000,
     first_byte_timeout_ms: 90_000,
     idle_timeout_ms: 15_000,
     circuit_failure_threshold: 3,
     circuit_open_ms: 30_000,
+    eligibility_probe_interval_secs: 180,
   }),
   sticky: Object.freeze({
     enabled: true,
@@ -114,6 +116,7 @@ export function validateGeminiRoutingPatch(body = {}) {
     validateIntRange(pool, 'accounts_per_daemon', 1, 256, 'gemini.pool', 'invalid_gemini_pool')
     validateBoolean(pool, 'daemon_fault_isolation', 'gemini.pool', 'invalid_gemini_pool')
     validateIntRange(pool, 'max_concurrency_per_account', 1, 64, 'gemini.pool', 'invalid_gemini_pool')
+    validateIntRange(pool, 'max_sessions_per_account', 1, 64, 'gemini.pool', 'invalid_gemini_pool')
     validateIntRange(pool, 'min_warm_slots', 0, 16, 'gemini.pool', 'invalid_gemini_pool')
     if (
       Object.hasOwn(pool, 'min_warm_slots') &&
@@ -126,6 +129,22 @@ export function validateGeminiRoutingPatch(body = {}) {
       const ttl = pool.session_idle_ttl_secs
       if (typeof ttl !== 'number' || !Number.isInteger(ttl) || (ttl !== 0 && (ttl < 10 || ttl > 86_400))) {
         throw typedError('gemini.pool.session_idle_ttl_secs 必须是 0 或 10 到 86400 之间的整数', 'invalid_gemini_pool')
+      }
+    }
+    if (
+      Object.hasOwn(pool, 'eligibility_probe_interval_secs') &&
+      pool.eligibility_probe_interval_secs !== undefined
+    ) {
+      const interval = pool.eligibility_probe_interval_secs
+      if (
+        typeof interval !== 'number' ||
+        !Number.isInteger(interval) ||
+        (interval !== 0 && (interval < 30 || interval > 3_600))
+      ) {
+        throw typedError(
+          'gemini.pool.eligibility_probe_interval_secs 必须是 0 或 30 到 3600 之间的整数',
+          'invalid_gemini_pool',
+        )
       }
     }
     validateIntRange(pool, 'max_queue', 0, 64, 'gemini.pool', 'invalid_gemini_pool')
@@ -198,17 +217,24 @@ export function normalizeGeminiRouting(raw = {}) {
   const rawPool = asObject(src.pool) || {}
   const defPool = DEFAULT_GEMINI_ROUTING.pool
   const maxConc = clampInt(rawPool.max_concurrency_per_account, 1, 64, defPool.max_concurrency_per_account)
+  const maxSessions = clampInt(rawPool.max_sessions_per_account, 1, 64, defPool.max_sessions_per_account)
   const minWarm = Math.min(maxConc, clampInt(rawPool.min_warm_slots, 0, 16, defPool.min_warm_slots))
   const rawTtl = rawPool.session_idle_ttl_secs
   const idleTtl =
     rawTtl === 0
       ? 0
       : clampInt(rawTtl, 10, 86_400, defPool.session_idle_ttl_secs)
+  const rawProbeInterval = rawPool.eligibility_probe_interval_secs
+  const eligibilityProbeInterval =
+    rawProbeInterval === 0
+      ? 0
+      : clampInt(rawProbeInterval, 30, 3_600, defPool.eligibility_probe_interval_secs)
   const pool = {
     strategy: GEMINI_STRATEGIES.includes(rawPool.strategy) ? rawPool.strategy : defPool.strategy,
     accounts_per_daemon: clampInt(rawPool.accounts_per_daemon, 1, 256, defPool.accounts_per_daemon),
     daemon_fault_isolation: rawPool.daemon_fault_isolation !== false,
     max_concurrency_per_account: maxConc,
+    max_sessions_per_account: maxSessions,
     min_warm_slots: minWarm,
     session_idle_ttl_secs: idleTtl,
     max_queue: clampInt(rawPool.max_queue, 0, 64, defPool.max_queue),
@@ -218,6 +244,7 @@ export function normalizeGeminiRouting(raw = {}) {
     idle_timeout_ms: clampInt(rawPool.idle_timeout_ms, 100, 600_000, defPool.idle_timeout_ms),
     circuit_failure_threshold: clampInt(rawPool.circuit_failure_threshold, 0, 20, defPool.circuit_failure_threshold),
     circuit_open_ms: clampInt(rawPool.circuit_open_ms, 1_000, 600_000, defPool.circuit_open_ms),
+    eligibility_probe_interval_secs: eligibilityProbeInterval,
   }
 
   const rawSticky = asObject(src.sticky) || {}

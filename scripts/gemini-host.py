@@ -36,6 +36,9 @@ ROOT = Path(__file__).resolve().parents[1]
 MAX_NETNS_SLOTS = 8
 MAX_ENVIRONMENTS = 256
 MAX_CONCURRENCY = 64
+DEFAULT_ENV_CONCURRENCY = 20
+DEFAULT_MAX_SESSIONS = 20
+ELIGIBILITY_PROBE_INTERVAL = 180.0
 MAX_ACCOUNTS_PER_DAEMON = 256
 DEFAULT_ACCOUNTS_PER_DAEMON = 50
 SHARD_HEALTH_FAIL_THRESHOLD = 3
@@ -140,16 +143,18 @@ DEFAULT_RUNTIME_POLICY = {
     "strategy": "balanced",
     "accounts_per_daemon": DEFAULT_ACCOUNTS_PER_DAEMON,
     "daemon_fault_isolation": True,
-    "max_concurrency_per_account": 2,
+    "max_concurrency_per_account": DEFAULT_ENV_CONCURRENCY,
+    "max_sessions_per_account": DEFAULT_MAX_SESSIONS,
     "min_warm_slots": 1,
     "session_idle_ttl_secs": NATIVE_SESSION_TTL,
-    "max_queue": 16,
+    "max_queue": 32,
     "queue_timeout_ms": 10000,
     "timeout_ms": 120000,
     "first_byte_timeout_ms": 90000,
     "idle_timeout_ms": 15000,
     "circuit_failure_threshold": 3,
     "circuit_open_ms": 30000,
+    "eligibility_probe_interval_secs": int(ELIGIBILITY_PROBE_INTERVAL),
     "sticky_enabled": True,
     "sticky_ttl_secs": 3600,
     "require_shm": True,
@@ -193,6 +198,21 @@ def normalize_runtime_policy(raw=None, base=None):
         MAX_CONCURRENCY,
         merged["max_concurrency_per_account"],
     )
+    merged["max_sessions_per_account"] = _clamp_policy_int(
+        pool.get("max_sessions_per_account", raw.get("max_sessions_per_account")),
+        1,
+        MAX_CONCURRENCY,
+        merged["max_sessions_per_account"],
+    )
+    raw_probe_interval = pool.get(
+        "eligibility_probe_interval_secs", raw.get("eligibility_probe_interval_secs")
+    )
+    if raw_probe_interval == 0 and type(raw_probe_interval) is int:
+        merged["eligibility_probe_interval_secs"] = 0
+    elif raw_probe_interval is not None:
+        merged["eligibility_probe_interval_secs"] = _clamp_policy_int(
+            raw_probe_interval, 30, 3600, merged["eligibility_probe_interval_secs"]
+        )
     merged["min_warm_slots"] = min(
         merged["max_concurrency_per_account"],
         _clamp_policy_int(
@@ -383,9 +403,13 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def env_concurrency(env):
+def env_concurrency(env, default=DEFAULT_ENV_CONCURRENCY):
     value = env.get("max_concurrency") if isinstance(env, dict) else None
-    return value if type(value) is int and 1 <= value <= MAX_CONCURRENCY else 1
+    if type(value) is int and 1 <= value <= MAX_CONCURRENCY:
+        return value
+    if type(default) is int and 1 <= default <= MAX_CONCURRENCY:
+        return default
+    return DEFAULT_ENV_CONCURRENCY
 
 
 def env_hostname(env):
@@ -3904,10 +3928,236 @@ class Host:
             with self.lock:
                 getattr(self, "_provisioning", set()).discard(identifier)
 
+    def _clear_eligibility_on_inference_success_locked(self, identifier):
+        env = self.environments.get(identifier)
+        if not env:
+            return False
+        account = env.get("account")
+        if not isinstance(account, dict):
+            return False
+        had_blocking = (
+            account.get("eligibility") in BLOCKING_ACCOUNT_ELIGIBILITIES
+            or "validation_url" in account
+        )
+        if not had_blocking:
+            return False
+        account.pop("eligibility", None)
+        account.pop("validation_url", None)
+        ts = now()
+        account["checked_at"] = ts
+        account["eligibility_verified_at"] = ts
+        if account.get("state") not in ("ok", "partial"):
+            account["state"] = "ok"
+        # Persist without invalidating last_inference binding (do not mutate updated_at).
+        private_json(self.state_file, self.environments)
+        self._schedule_warm_locked(identifier, force=True)
+        return True
+
+    def _clear_eligibility_verified_on_failure_locked(self, identifier, error_code):
+        if error_code not in (
+            "gemini_account_verification_required",
+            "gemini_location_unsupported",
+            "gemini_account_ineligible",
+        ):
+            return
+        env = self.environments.get(identifier)
+        account = env.get("account") if isinstance(env, dict) else None
+        if not isinstance(account, dict):
+            return
+        mapped = {
+            "gemini_account_verification_required": "verification_required",
+            "gemini_location_unsupported": "location_unsupported",
+            "gemini_account_ineligible": "ineligible",
+        }[error_code]
+        account.pop("eligibility_verified_at", None)
+        account["eligibility"] = mapped
+        account["checked_at"] = now()
+        private_json(self.state_file, self.environments)
+
+    def _probe_eligibility_via_inference(self, env_snapshot, proxy_url, auth, model):
+        identifier = env_snapshot["id"]
+        request_id = f"elig-{secrets.token_hex(8)}"
+        ctx = {
+            "identifier": identifier,
+            "env": env_snapshot,
+            "proxy_url": proxy_url,
+            "auth": auth,
+            "model": model,
+            "request_id": request_id,
+            "native_body": {
+                "model": model,
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+            },
+        }
+        conn = None
+        try:
+            session = self._acquire_native_session(ctx)
+            conn, response = session.open_stream(
+                request_id, ctx["native_body"], model=model
+            )
+            frames = []
+            pending = bytearray()
+            total = 0
+            while True:
+                chunk = response.read1(16384)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > native_module().MAX_SSE:
+                    return False, "gemini_inference_output_limit"
+                pending.extend(chunk)
+                while True:
+                    b_lf = pending.find(b"\n\n")
+                    b_crlf = pending.find(b"\r\n\r\n")
+                    if b_crlf >= 0 and (b_lf < 0 or b_crlf < b_lf):
+                        boundary, width = b_crlf, 4
+                    elif b_lf >= 0:
+                        boundary, width = b_lf, 2
+                    else:
+                        break
+                    frames.append(bytes(pending[: boundary + width]))
+                    del pending[: boundary + width]
+            native_module().parse_sse(frames)
+            return True, None
+        except native_module().NativeFailure as err:
+            return False, err.code
+        except (Failure, OSError, TimeoutError, ValueError):
+            return False, "gemini_inference_failed"
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def _schedule_eligibility_probe_locked(self, identifier):
+        interval = int(
+            self.runtime_policy.get(
+                "eligibility_probe_interval_secs", int(ELIGIBILITY_PROBE_INTERVAL)
+            )
+        )
+        if interval <= 0:
+            return False
+        env = self.environments.get(identifier)
+        if (
+            not env
+            or env.get("auth_method", "oauth") != "oauth"
+            or env.get("oauth_imported")
+            or env.get("auth_state") != "authorized"
+            or not env.get("profile")
+        ):
+            return False
+        eligibility = (env.get("account") or {}).get("eligibility")
+        if eligibility not in BLOCKING_ACCOUNT_ELIGIBILITIES:
+            return False
+        cached = getattr(self, "_runtime_proxies", {}).get(identifier)
+        if not cached or cached[0] != env["proxy_id"]:
+            return False
+        proxy_url = cached[1]
+        probing = getattr(self, "_eligibility_probing", None)
+        if probing is None:
+            probing = set()
+            self._eligibility_probing = probing
+        if identifier in probing:
+            return False
+        cooldowns = getattr(self, "_eligibility_probe_next_at", None)
+        if cooldowns is None:
+            cooldowns = {}
+            self._eligibility_probe_next_at = cooldowns
+        now_mono = time.monotonic()
+        if now_mono < cooldowns.get(identifier, 0.0):
+            return False
+        probing.add(identifier)
+        cooldowns[identifier] = now_mono + float(interval)
+
+        def _worker():
+            try:
+                with self.lock:
+                    cur = self.environments.get(identifier)
+                    if (
+                        not cur
+                        or cur.get("auth_state") != "authorized"
+                        or self.running(identifier)
+                        or identifier in self.terminals
+                        or identifier in self.pending
+                    ):
+                        return
+                    target_env = cur
+                # First refresh upstream account metadata (loadCodeAssist).
+                self.refresh_account(target_env, proxy_url, auto_pull_models=False)
+                # If still marked blocked (e.g. stale loadCodeAssist VALIDATION_REQUIRED),
+                # run a real inference probe when runtime is ready; if inference succeeds, clear the warning.
+                with self.lock:
+                    cur = self.environments.get(identifier)
+                    if (
+                        not cur
+                        or cur.get("auth_state") != "authorized"
+                        or (cur.get("account") or {}).get("eligibility")
+                        not in BLOCKING_ACCOUNT_ELIGIBILITIES
+                        or not cur.get("call_models")
+                        or self.running(identifier)
+                        or identifier in self.terminals
+                        or identifier in self.pending
+                        or getattr(self, "payload_state", None) != "installed"
+                        or self.oauth_runtime_issue() is not None
+                    ):
+                        return
+                    uid = self.env_uid(cur)
+                    profile = cur.get("profile")
+                    auth = profile and profile_secrets(
+                        self.directory / identifier / profile, uid, include_raw=True
+                    )
+                    if not auth:
+                        return
+                    env_snapshot = dict(cur)
+                    probe_model = self._initial_session_model(env_snapshot)
+                ok, err_code = self._probe_eligibility_via_inference(
+                    env_snapshot, proxy_url, auth, probe_model
+                )
+                if ok:
+                    with self.lock:
+                        cur = self.environments.get(identifier)
+                        if cur and cur.get("auth_state") == "authorized":
+                            ts = now()
+                            self.last_inference[identifier] = (
+                                self.inference_binding(cur),
+                                {
+                                    "state": "completed",
+                                    "model": probe_model,
+                                    "started_at": ts,
+                                    "finished_at": ts,
+                                    "error_code": None,
+                                },
+                                hashlib.sha256(proxy_url.encode()).hexdigest(),
+                            )
+                            self._clear_eligibility_on_inference_success_locked(
+                                identifier
+                            )
+                elif err_code in (
+                    "gemini_account_verification_required",
+                    "gemini_location_unsupported",
+                    "gemini_account_ineligible",
+                ):
+                    with self.lock:
+                        self._clear_eligibility_verified_on_failure_locked(
+                            identifier, err_code
+                        )
+            except BaseException:
+                pass
+            finally:
+                with self.lock:
+                    getattr(self, "_eligibility_probing", set()).discard(identifier)
+
+        threading.Thread(
+            target=_worker, name=f"gemini-elig-{identifier[-8:]}", daemon=True
+        ).start()
+        return True
+
     def warm_environment(self, env, proxy_url, model=None):
         identifier = env["id"]
         self._remember_runtime_proxy(env, proxy_url)
         self._schedule_provision_locked(identifier, proxy_url)
+        self._schedule_eligibility_probe_locked(identifier)
         proxy_hash = hashlib.sha256(proxy_url.encode()).digest()
         existing = self.native_sessions.get(identifier)
         if existing is not None:
@@ -4042,6 +4292,11 @@ class Host:
                 result["state"],
                 error.get("code") if isinstance(error, dict) else None,
             )
+            if result["state"] == "completed":
+                for env_id, item in self.runs.items():
+                    if item is entry:
+                        self._clear_eligibility_on_inference_success_locked(env_id)
+                        break
             entry["process"].close()
             entry["process"] = None
             entry["result"] = result
@@ -4218,7 +4473,7 @@ class Host:
 
     def pull_models(self, env, proxy_url, *, allow_reauth_probe=False):
         uid, key, auth = self.operation_account(
-            env, allow_reauth_probe=allow_reauth_probe
+            env, allow_concurrent_infer=True, allow_reauth_probe=allow_reauth_probe
         )
         if key:
             data = read_account(uid, proxy_url, "api-key-models", api_key=key)
@@ -4283,7 +4538,7 @@ class Host:
             or len(prompt.encode()) > 4096
         ):
             raise Failure(400)
-        uid, key, auth = self.operation_account(env)
+        uid, key, auth = self.operation_account(env, allow_concurrent_infer=True)
         if model not in env.get("call_models", []):
             raise Failure(409, "gemini_model_unavailable")
         identifier = env["id"]
@@ -4629,6 +4884,7 @@ class Host:
         for identifier in list(self.environments):
             if identifier not in self.native_sessions:
                 self._schedule_warm_locked(identifier)
+            self._schedule_eligibility_probe_locked(identifier)
 
     def _post_auth_provision(self, env, proxy_url):
         if (
@@ -4929,6 +5185,9 @@ class Host:
             **({"oauth_imported": True} if env.get("oauth_imported") else {}),
             "runtime_ready": runtime_ready,
             "max_concurrency": env_concurrency(env),
+            "max_sessions": int(
+                self.runtime_policy.get("max_sessions_per_account", DEFAULT_MAX_SESSIONS)
+            ),
             "active_slots": len(self.active_infers.get(env["id"], {})),
             "capabilities": list(FULL_CAPABILITIES if method == "api_key" else NATIVE_CAPABILITIES),
             "kernel_version": self.payload_version,
@@ -5034,6 +5293,24 @@ class Host:
             if self.environments.get(env["id"]) is not env:
                 return self.view(env)
             prev_eligibility = (env.get("account") or {}).get("eligibility")
+            prev_verified_at = (env.get("account") or {}).get("eligibility_verified_at")
+            last_entry = self.last_inference.get(env["id"])
+            inference_proven = bool(
+                (
+                    last_entry
+                    and last_entry[0] == self.inference_binding(env)
+                    and isinstance(last_entry[1], dict)
+                    and last_entry[1].get("state") == "completed"
+                )
+                or prev_verified_at
+            )
+            if (
+                inference_proven
+                and account.get("eligibility") == "verification_required"
+            ):
+                account.pop("eligibility", None)
+                account.pop("validation_url", None)
+                account["eligibility_verified_at"] = prev_verified_at or now()
             if account.get("state") in ("error", "reauth_required") and env.get("account"):
                 previous = env["account"]
                 if previous.get("state") in ("ok", "partial") and not previous.get(
@@ -5169,7 +5446,11 @@ class Host:
                 raise Failure(400)
             raw_concurrency = body.get("max_concurrency")
             if raw_concurrency is None:
-                max_concurrency = 1
+                max_concurrency = int(
+                    self.runtime_policy.get(
+                        "max_concurrency_per_account", DEFAULT_ENV_CONCURRENCY
+                    )
+                )
             elif type(raw_concurrency) is int and 1 <= raw_concurrency <= MAX_CONCURRENCY:
                 max_concurrency = raw_concurrency
             else:
@@ -5285,19 +5566,60 @@ class Host:
             raw_concurrency = body.get("max_concurrency")
             if type(raw_concurrency) is not int or not 1 <= raw_concurrency <= MAX_CONCURRENCY:
                 raise Failure(400, "gemini_invalid_concurrency")
+            run_entry = self.runs.get(identifier)
+            run_active = bool(run_entry and run_entry["process"] is not None)
             if (
-                self.running(identifier)
+                run_active
                 or identifier in self.terminals
                 or identifier in self.pending
             ):
                 raise Failure(409, "gemini_operation_busy")
             if env_concurrency(env) != raw_concurrency:
-                self.stop_native_session(identifier)
+                has_active_infer = bool(self.active_infers.get(identifier))
+                scaled_live = False
+                shard_id = self._account_shard_map.get(identifier)
+                shard = self.daemon_shards.get(shard_id) if shard_id else None
+                if shard is not None and shard.is_alive() and identifier in shard.members:
+                    st, _ = native_module().worker_json_request(
+                        shard.socket_path,
+                        shard.native_token,
+                        "POST",
+                        f"/internal/v1/accounts/{identifier}/scale",
+                        {
+                            "runnable_slots": raw_concurrency,
+                            "max_concurrency": raw_concurrency,
+                            "idle_ttl_secs": self.runtime_policy["session_idle_ttl_secs"],
+                        },
+                        timeout=5.0,
+                    )
+                    if st == 200:
+                        shard.members[identifier]["max_concurrency"] = raw_concurrency
+                        scaled_live = True
+                session = self.native_sessions.get(identifier)
+                if not scaled_live and session is not None and session.is_alive():
+                    st, _ = native_module().worker_json_request(
+                        session.socket_path,
+                        session.native_token,
+                        "POST",
+                        f"/internal/v1/accounts/{identifier}/scale",
+                        {
+                            "runnable_slots": raw_concurrency,
+                            "max_concurrency": raw_concurrency,
+                            "idle_ttl_secs": self.runtime_policy["session_idle_ttl_secs"],
+                        },
+                        timeout=5.0,
+                    )
+                    if st == 200:
+                        session.max_concurrency = raw_concurrency
+                        scaled_live = True
+                if not scaled_live and not has_active_infer:
+                    self.stop_native_session(identifier)
                 self.save_environment(
                     env,
                     {**env, "max_concurrency": raw_concurrency, "updated_at": now()},
                 )
-                self._schedule_warm_locked(identifier, force=True)
+                if not scaled_live and not has_active_infer:
+                    self._schedule_warm_locked(identifier, force=True)
             return self.view(env)
         if operation in ("test-chat-status", "test-chat-cancel"):
             return self.run_request(operation, identifier, body)
@@ -5630,6 +5952,12 @@ class Host:
                     final_state,
                     None if final_state == "completed" else final_code,
                 )
+                if final_state == "completed":
+                    self._clear_eligibility_on_inference_success_locked(identifier)
+                elif final_state == "failed":
+                    self._clear_eligibility_verified_on_failure_locked(
+                        identifier, final_code
+                    )
 
     def _stream_api_key_infer(self, ctx, handler):
         key = ctx["key"]

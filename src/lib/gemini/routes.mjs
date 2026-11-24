@@ -724,7 +724,10 @@ export async function warmGeminiEnvironments({ callHost = callGeminiHost, proxyP
       report.skipped += 1
       continue
     }
-    if (env.runtime_ready === true && env.models_discovered === true) {
+    const hasBlockingEligibility = Boolean(
+      env.account?.eligibility && ACCOUNT_ELIGIBILITIES.has(env.account.eligibility),
+    )
+    if (env.runtime_ready === true && env.models_discovered === true && !hasBlockingEligibility) {
       report.warmed += 1
       continue
     }

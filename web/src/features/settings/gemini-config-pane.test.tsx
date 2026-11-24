@@ -114,6 +114,8 @@ describe('settings Gemini entry & scheduling config pane', () => {
     expect(html).toContain('入口与协议准入')
     expect(html).toContain('调度策略与粘性会话')
     expect(html).toContain('单 CRAGGemini 多账号接管与并发')
+    expect(html).toContain('单账号默认会话上限')
+    expect(html).toContain('资格警告定时探测间隔')
     expect(html).toContain('共享内存传输（AGYSHM02）')
     expect(html).toContain('故障切号与熔断保护')
     expect(html).toContain('50 (推荐)')

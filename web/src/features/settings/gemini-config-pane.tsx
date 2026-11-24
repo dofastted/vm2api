@@ -38,16 +38,18 @@ const GEMINI_DEFAULTS = {
     strategy: 'balanced' as Strategy,
     accounts_per_daemon: 50,
     daemon_fault_isolation: true,
-    max_concurrency_per_account: 2,
+    max_concurrency_per_account: 20,
+    max_sessions_per_account: 20,
     min_warm_slots: 1,
     session_idle_ttl_secs: 600,
-    max_queue: 16,
+    max_queue: 32,
     queue_timeout_ms: 10_000,
     timeout_ms: 120_000,
     first_byte_timeout_ms: 90_000,
     idle_timeout_ms: 15_000,
     circuit_failure_threshold: 3,
     circuit_open_ms: 30_000,
+    eligibility_probe_interval_secs: 180,
   },
   sticky: {
     enabled: true,
@@ -374,9 +376,19 @@ export function GeminiConfigPane({
     'max_concurrency_per_account',
     GEMINI_DEFAULTS.pool.max_concurrency_per_account
   )
+  const maxSessions = numOf(
+    pool,
+    'max_sessions_per_account',
+    GEMINI_DEFAULTS.pool.max_sessions_per_account
+  )
   const minWarm = Math.min(
     maxConc,
     numOf(pool, 'min_warm_slots', GEMINI_DEFAULTS.pool.min_warm_slots)
+  )
+  const eligibilityProbeInterval = numOf(
+    pool,
+    'eligibility_probe_interval_secs',
+    GEMINI_DEFAULTS.pool.eligibility_probe_interval_secs
   )
   const idleTtlSecs = numOf(
     pool,
@@ -642,11 +654,11 @@ export function GeminiConfigPane({
             />
           </SettingRow>
 
-          <div className='grid gap-4 border-t pt-4 sm:grid-cols-2'>
+          <div className='grid gap-4 border-t pt-4 sm:grid-cols-3'>
             <StepperSetting
               id='gemini-max-concurrency'
               label='单账号默认并发槽位'
-              desc='单个账号可同时运行的 agy CLI 进程上限。'
+              desc='单个账号可同时运行的 agy CLI 进程上限（默认 20）。'
               value={maxConc}
               min={1}
               max={64}
@@ -654,6 +666,19 @@ export function GeminiConfigPane({
               fallback={GEMINI_DEFAULTS.pool.max_concurrency_per_account}
               onChange={(max_concurrency_per_account) =>
                 updatePool({ max_concurrency_per_account })
+              }
+            />
+            <StepperSetting
+              id='gemini-max-sessions'
+              label='单账号默认会话上限'
+              desc='单账号可并发粘性绑定的 Session 上限（默认 20）。'
+              value={maxSessions}
+              min={1}
+              max={64}
+              unit='会话'
+              fallback={GEMINI_DEFAULTS.pool.max_sessions_per_account}
+              onChange={(max_sessions_per_account) =>
+                updatePool({ max_sessions_per_account })
               }
             />
             <StepperSetting
@@ -879,6 +904,30 @@ export function GeminiConfigPane({
               presets={[60000, 300000, 600000]}
               onChange={(account_cooldown_ms) =>
                 updateFailover({ account_cooldown_ms })
+              }
+            />
+          </div>
+
+          <div className='border-t pt-4'>
+            <SliderSetting
+              id='gemini-eligibility-probe'
+              label='资格警告定时探测间隔'
+              desc='对标记 VALIDATION_REQUIRED 等上游受限状态的账号定期探测；一旦能够成功推理即自动清除警告并恢复调度（0 表示关闭定时探测）。'
+              value={eligibilityProbeInterval}
+              min={0}
+              max={3600}
+              step={30}
+              format={(s) => (s === 0 ? '关闭' : fmtDuration(s * 1000))}
+              fallback={GEMINI_DEFAULTS.pool.eligibility_probe_interval_secs}
+              presets={[60, 180, 300, 900]}
+              onChange={(eligibility_probe_interval_secs) =>
+                updatePool({
+                  eligibility_probe_interval_secs:
+                    eligibility_probe_interval_secs > 0 &&
+                    eligibility_probe_interval_secs < 30
+                      ? 30
+                      : eligibility_probe_interval_secs,
+                })
               }
             />
           </div>

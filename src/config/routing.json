@@ -145,16 +145,18 @@
       "strategy": "balanced",
       "accounts_per_daemon": 50,
       "daemon_fault_isolation": true,
-      "max_concurrency_per_account": 2,
+      "max_concurrency_per_account": 20,
+      "max_sessions_per_account": 20,
       "min_warm_slots": 1,
       "session_idle_ttl_secs": 600,
-      "max_queue": 16,
+      "max_queue": 32,
       "queue_timeout_ms": 10000,
       "timeout_ms": 120000,
       "first_byte_timeout_ms": 90000,
       "idle_timeout_ms": 15000,
       "circuit_failure_threshold": 3,
-      "circuit_open_ms": 30000
+      "circuit_open_ms": 30000,
+      "eligibility_probe_interval_secs": 180
     },
     "sticky": {
       "enabled": true,

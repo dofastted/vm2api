@@ -200,4 +200,63 @@ with tempfile.TemporaryDirectory(prefix="gemini-shards-") as temporary:
         assert single["policy"]["accounts_per_daemon"] == 1
         assert host._use_sharded_daemon() is False
 
+        # Default concurrency and max_sessions are both 20.
+        assert host.runtime_policy["max_concurrency_per_account"] == 20
+        assert host.runtime_policy["max_sessions_per_account"] == 20
+        assert impl.env_concurrency({}) == 20
+        env0 = host.environments[ids[0]]
+        view0 = host.view(env0)
+        assert view0["max_concurrency"] == 20
+        assert view0["max_sessions"] == 20
+
+        # Active API inference below max_concurrency=20 must NOT block operation_account(allow_concurrent_infer=True).
+        host.active_infers[ids[0]] = {"req-live-1": {"cancel_event": Mock()}}
+        with patch.object(impl, "profile_secrets", return_value=(("tok",), b"{}")):
+            uid, key, auth = host.operation_account(env0, allow_concurrent_infer=True)
+            assert key is None and auth is not None
+        host.active_infers.pop(ids[0], None)
+
+        # Successful inference clears stale VALIDATION_REQUIRED eligibility & validation_url
+        # and prevents refresh_account from re-poisoning the verified account.
+        env0["account"] = {
+            "state": "ok",
+            "eligibility": "verification_required",
+            "validation_url": "https://accounts.google.com/v3/signin/continue?plt=1",
+            "checked_at": "2030-01-01T00:00:00+00:00",
+        }
+        cleared = host._clear_eligibility_on_inference_success_locked(ids[0])
+        assert cleared is True
+        assert "eligibility" not in env0["account"]
+        assert "validation_url" not in env0["account"]
+        assert "eligibility_verified_at" in env0["account"]
+
+        # Periodic eligibility probe clears stale VALIDATION_REQUIRED when inference probe succeeds.
+        env1 = host.environments[ids[1]]
+        env1["account"] = {
+            "state": "ok",
+            "eligibility": "verification_required",
+            "validation_url": "https://accounts.google.com/v3/signin/continue?plt=2",
+            "checked_at": "2030-01-01T00:00:00+00:00",
+        }
+        host._remember_runtime_proxy(env1, PROXY)
+        with (
+            patch.object(impl, "profile_secrets", return_value=(("tok",), b"{}")),
+            patch.object(host, "refresh_account"),
+            patch.object(
+                host, "_probe_eligibility_via_inference", return_value=(True, None)
+            ) as probe_mock,
+        ):
+            scheduled = host._schedule_eligibility_probe_locked(ids[1])
+            assert scheduled is True
+            # Wait briefly for daemon probe thread to finish.
+            import time as _t
+
+            deadline = _t.monotonic() + 3.0
+            while ids[1] in getattr(host, "_eligibility_probing", set()) and _t.monotonic() < deadline:
+                _t.sleep(0.02)
+            probe_mock.assert_called_once()
+        assert "eligibility" not in env1["account"]
+        assert "validation_url" not in env1["account"]
+        assert host.last_inference[ids[1]][1]["state"] == "completed"
+
 print("OK")
