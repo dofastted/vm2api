@@ -125,6 +125,7 @@ const INFERENCE_ERROR_LABELS: Readonly<Record<string, string>> = {
   gemini_inference_invalid_output: '响应无法解析',
   gemini_inference_output_limit: '响应超过长度限制',
   gemini_inference_tool_blocked: '不支持工具调用',
+  gemini_native_config_invalid: 'CRAGGemini 配置被载荷拒绝',
   license_required: '未绑定 CRAGGemini 订阅席位',
   license_expired: 'CRAGGemini 订阅许可已过期',
   license_not_yet_valid: 'CRAGGemini 许可尚未生效',
@@ -270,6 +271,8 @@ const INFERENCE_ERROR_ACTIONS: Readonly<Record<string, string>> = {
     '处理方式：请先在「账号」页点击刷新确认是否触发 Google 身份验证/风控，再排查绑定代理与宿主服务日志。',
   gemini_native_worker_unavailable:
     '处理方式：CRAGGemini 常驻内核正在预热或异常退出，请稍候重试，或前往「设置 → Gemini 维护」检查载荷与宿主服务。',
+  gemini_native_config_invalid:
+    '处理方式：CRAGGemini 在握手前因配置字段不兼容退出，请前往「设置 → Gemini 维护」对齐宿主脚本与签名载荷版本后重试。',
   gemini_native_tty_unavailable:
     '处理方式：宿主机终端资源不足，请检查并重启宿主机 vm2api-gemini 服务。',
   gemini_native_bridge_timeout:
@@ -351,7 +354,12 @@ export function geminiEligibilityNotice(
     // 抑制提示需要证明这次推理比资格结论更新。缺失或无法解析的 checked_at
     // 不是证明（面板的 checked_at 没有兜底，缺字段就下发 null），而误抑制会
     // 连一键验证链接一起藏掉，此时后端仍按 eligibility 冷却该账号。
-    if (Number.isFinite(checked) && Number.isFinite(finished) && finished >= checked) return null
+    if (
+      Number.isFinite(checked) &&
+      Number.isFinite(finished) &&
+      finished >= checked
+    )
+      return null
   }
   switch (account?.eligibility) {
     case 'verification_required':

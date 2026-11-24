@@ -8,6 +8,7 @@ describe('Gemini maintenance recovery classification', () => {
     expect(isGeminiHostIssue('gemini_egress_unavailable')).toBe(true)
     expect(isGeminiHostIssue('gemini_authorization_unavailable')).toBe(true)
     expect(isGeminiHostIssue('gemini_native_worker_unavailable')).toBe(true)
+    expect(isGeminiHostIssue('gemini_native_config_invalid')).toBe(true)
   })
 
   it('separates unsupported installed OAuth capability from account authorization', () => {

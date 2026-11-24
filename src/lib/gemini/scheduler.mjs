@@ -80,6 +80,10 @@ const FAILURES = {
   gemini_invalid_request: [400, 'Invalid Gemini request payload.'],
   gemini_native_tty_unavailable: [503, 'No free Linux virtual console is available for CRAGGemini.'],
   gemini_native_worker_unavailable: [503, 'The CRAGGemini native worker is unavailable.'],
+  gemini_native_config_invalid: [
+    503,
+    'CRAGGemini rejected the host-generated worker configuration; align the host script and signed payload versions.',
+  ],
   gemini_native_bridge_timeout: [503, 'The CRAGGemini TUI did not connect to its native worker in time.'],
   gemini_egress_unavailable: [503, 'Gemini egress is not available.'],
   gemini_oauth_tools_missing: [503, 'Gemini OAuth runtime tools are missing.'],
@@ -104,6 +108,7 @@ const NON_CIRCUIT_FAILURES = new Set([
   'gemini_invalid_request',
   'gemini_inference_tool_blocked',
   'gemini_tool_call_required',
+  'gemini_native_config_invalid',
   'gemini_proxy_calibration_mismatch',
   'license_required',
   'license_expired',

@@ -596,6 +596,115 @@ with tempfile.TemporaryDirectory(prefix="gemini-multiproc-host-") as mp_tmp:
     finally:
         host_mod.profile_secrets = orig_secrets
 
+# #1729: early worker exit before handshake must classify invalid config and fast-fail
+# instead of waiting until gemini_native_bridge_timeout.
+with tempfile.TemporaryDirectory(prefix="gemini-native-early-exit-") as early_dir:
+    ed = Path(early_dir)
+    (ed / "kernel.json").write_text('{"max_accounts": 1}', encoding="utf-8")
+    bad_cfg_bin = ed / "fake-craggemini-bad-cfg"
+    bad_cfg_bin.write_text(
+        "#!/bin/sh\n"
+        "echo 'craggemini: invalid configuration JSON or fields token=sk-secret-never-leak' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    bad_cfg_bin.chmod(0o755)
+    t_start = time.monotonic()
+    rc = native._launch_native(
+        ["/bin/true"],
+        worker_bin=str(bad_cfg_bin),
+        directory=str(ed),
+        startup_timeout=5,
+    )
+    assert rc == 1, rc
+    assert time.monotonic() - t_start < 2.0
+    raw_exit = (ed / native.LAUNCHER_EXIT_FILE).read_text(encoding="ascii")
+    assert raw_exit == "craggemini 1 invalid_config\n", raw_exit
+    assert "sk-secret-never-leak" not in raw_exit
+    uid = os.getuid()
+    assert native.read_launcher_exit(ed, uid) == ("craggemini", 1)
+    assert native.read_launcher_exit_detail(ed, uid) == ("craggemini", 1, "invalid_config")
+
+    # open_worker_stream fast-fails with gemini_native_config_invalid (not bridge timeout).
+    t_stream = time.monotonic()
+    try:
+        native.open_worker_stream(
+            str(ed / "kernel.sock"),
+            "t" * 32,
+            "gemini-2.5-pro",
+            "req-early-cfg",
+            {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+            startup_timeout=10,
+            is_alive=lambda: False,
+            exit_reader=lambda: native.read_launcher_exit_detail(ed, uid),
+        )
+    except native.NativeFailure as err:
+        assert err.code == "gemini_native_config_invalid", err.code
+        assert err.status == 503, err.status
+        assert time.monotonic() - t_stream < 1.0
+    else:
+        raise AssertionError("open_worker_stream should fast-fail on invalid_config")
+
+    # run_request (NativeInvocation path) also fast-fails on launcher-exit before timeout.
+    t_req = time.monotonic()
+    try:
+        native.run_request(
+            {
+                "socket": str(ed / "kernel.sock"),
+                "token": "t" * 32,
+                "model": "gemini-2.5-pro",
+                "request_id": "req-early-inv",
+                "prompt": "hi",
+                "startup_timeout": 10,
+                "launcher_uid": uid,
+            }
+        )
+    except native.NativeFailure as err:
+        assert err.code == "gemini_native_config_invalid", err.code
+        assert time.monotonic() - t_req < 1.0
+    else:
+        raise AssertionError("run_request should fast-fail on invalid_config")
+
+    # Unclassified stderr exit records no arbitrary text and fast-fails as worker_unavailable.
+    (ed / native.LAUNCHER_EXIT_FILE).unlink()
+    crash_bin = ed / "fake-craggemini-crash"
+    crash_bin.write_text(
+        "#!/bin/sh\n"
+        "echo 'panic: unexpected internal failure secret=top-secret' >&2\n"
+        "exit 2\n",
+        encoding="utf-8",
+    )
+    crash_bin.chmod(0o755)
+    rc2 = native._launch_native(
+        ["/bin/true"],
+        worker_bin=str(crash_bin),
+        directory=str(ed),
+        startup_timeout=5,
+    )
+    assert rc2 == 1, rc2
+    raw_exit2 = (ed / native.LAUNCHER_EXIT_FILE).read_text(encoding="ascii")
+    assert raw_exit2 == "craggemini 2\n", raw_exit2
+    assert "top-secret" not in raw_exit2
+    assert native.read_launcher_exit_detail(ed, uid) == ("craggemini", 2, None)
+
+    t_dead = time.monotonic()
+    try:
+        native.open_worker_stream(
+            str(ed / "kernel.sock"),
+            "t" * 32,
+            "gemini-2.5-pro",
+            "req-early-dead",
+            {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+            startup_timeout=10,
+            is_alive=lambda: False,
+            exit_reader=lambda: None,
+        )
+    except native.NativeFailure as err:
+        assert err.code == "gemini_native_worker_unavailable", err.code
+        assert time.monotonic() - t_dead < 1.0
+    else:
+        raise AssertionError("open_worker_stream should fast-fail when worker is dead")
+
 print(
     "Native worker fixture: health, streaming, cancel, error mapping, pool concurrency, SSE completion and usage PASS"
 )

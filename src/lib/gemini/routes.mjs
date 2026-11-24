@@ -88,6 +88,10 @@ const RUN_ERRORS = {
     503,
     'CRAGGemini 原生常驻内核未就绪，请稍候等待自动预热，或前往「设置 → Gemini 维护」检查载荷与宿主服务',
   ],
+  gemini_native_config_invalid: [
+    503,
+    'CRAGGemini 拒绝了宿主生成的 worker 配置，请前往「设置 → Gemini 维护」对齐宿主脚本与签名载荷版本',
+  ],
   license_required: [403, GEMINI_LICENSE_MESSAGES.license_required],
   license_expired: [403, GEMINI_LICENSE_MESSAGES.license_expired],
   license_not_yet_valid: [403, GEMINI_LICENSE_MESSAGES.license_not_yet_valid],
