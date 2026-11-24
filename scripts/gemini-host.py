@@ -885,10 +885,9 @@ class Agy:
         self.pid = None
         self.terminal = None
         self.egress = None
-        self.relay = None
+        self.egress_relay = None
         self.network_lock = None
         self._network_lease = None
-        self._last_stage = None
         address, port = proxy_config(proxy_url)
         self.network = [str(self.slot), str(host.egress_uid), address, port]
         self.namespace = f"vm2agy{self.slot}"
@@ -940,7 +939,7 @@ class Agy:
             self._network_lease = lease
             self.network_lock = lease["lock"]
             self.egress = lease["egress"]
-            self.relay = lease.get("relay")
+            self.egress_relay = lease.get("relay")
         else:
             config = self.directory / "egress.json"
             private_json(
@@ -953,12 +952,10 @@ class Agy:
                 },
             )
             os.chown(config, self.host.egress_uid, self.host.egress_uid)
-            self._last_stage = "network_prepare"
             try:
                 self.network_lock = self.host.start_network(self.directory, self.network)
             except (Failure, OSError, subprocess.SubprocessError) as err:
                 raise Failure(503, getattr(err, "code", None), stage="network_prepare") from err
-            self._last_stage = "proxy_probe"
             try:
                 subprocess.run(
                     self.launch_args(self.host.egress_uid)
@@ -978,7 +975,6 @@ class Agy:
                 )
             except (Failure, OSError, subprocess.SubprocessError) as err:
                 raise Failure(503, getattr(err, "code", None), stage="proxy_probe") from err
-            self._last_stage = "egress_start"
             try:
                 spawn = getattr(self.host, "spawn", lambda fn: fn())
                 self.egress = spawn(
@@ -1079,7 +1075,6 @@ class Agy:
             "AGY_CLI_DISABLE_AUTO_UPDATE",
             "true",
         ]
-        self._last_stage = "cli_launch"
         try:
             self.launch_cli(self.launch_args(self.uid) + sandbox, size)
         except Failure as err:
@@ -1172,7 +1167,7 @@ class Agy:
         ]
 
     def alive(self):
-        relay = getattr(self, "relay", None)
+        relay = getattr(self, "egress_relay", None)
         relay_ok = relay is None or relay.poll() is None
         return bool(self.pid and self.egress.poll() is None and relay_ok and not self.exited())
 
@@ -1215,7 +1210,7 @@ class Agy:
         if lease is not None:
             self._network_lease = None
             self.egress = None
-            self.relay = None
+            self.egress_relay = None
             self.network_lock = None
             self.host.release_slot_network(self.slot, lease)
         else:
@@ -1224,12 +1219,12 @@ class Agy:
                     self.egress.kill()
                 self.egress.wait(timeout=5)
                 self.egress = None
-            relay = getattr(self, "relay", None)
+            relay = getattr(self, "egress_relay", None)
             if relay is not None:
                 if relay.poll() is None:
                     relay.kill()
                 relay.wait(timeout=5)
-                self.relay = None
+                self.egress_relay = None
             if self.network_lock is not None:
                 try:
                     self.host.stop_network(self.directory, self.network, self.network_lock)
@@ -1788,10 +1783,11 @@ class NativeSession(NativeAgy):
         return str(self.native_dir / "kernel.sock")
 
     def is_alive(self):
+        egress_relay = getattr(self, "egress_relay", None)
         return (
             self.egress is not None
             and self.egress.poll() is None
-            and (getattr(self, "relay", None) is None or self.relay.poll() is None)
+            and (egress_relay is None or egress_relay.poll() is None)
             and self.native_tui is not None
             and self.native_tui.poll() is None
         )

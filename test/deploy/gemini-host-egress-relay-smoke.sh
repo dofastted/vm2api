@@ -54,13 +54,26 @@ with socket.create_server(("192.0.2.5", 1080)) as server:
 PY
 proxy_pid=$!
 
+relay_uid=0
+relay_prefix=()
+tproxy_mark=0
+if [[ $(id -u) == 0 ]] && command -v setpriv >/dev/null && id nobody >/dev/null 2>&1; then
+    relay_uid=$(id -u nobody)
+    relay_prefix=(setpriv --reuid "$relay_uid" --regid "$relay_uid" --clear-groups)
+    iptables -t nat -A OUTPUT -m owner --uid-owner "$relay_uid" -d 192.0.2.5 -p tcp --dport 1080 -j REDIRECT --to-ports 52345
+else
+    tproxy_mark=0x66
+    iptables -t nat -A OUTPUT -d 192.0.2.5 -p tcp --dport 1080 -m mark ! --mark 0x66 -j REDIRECT --to-ports 52345
+fi
+
 # Mock transparent proxy on :52345 forwarding host OUTPUT traffic to 192.0.2.5:1080
 # and writing a marker file to prove the front-hop was actually traversed.
 tproxy_hit=$(mktemp)
-python3 - "$tproxy_hit" <<'PY' &
+python3 - "$tproxy_hit" "$tproxy_mark" <<'PY' &
 import socket, sys, threading
 
 hit_file = sys.argv[1]
+so_mark = int(sys.argv[2], 0)
 
 def pipe(src, dst):
     try:
@@ -82,7 +95,11 @@ with socket.create_server(("0.0.0.0", 52345)) as server:
     client, _ = server.accept()
     with open(hit_file, "w", encoding="ascii") as out:
         out.write("HIT\n")
-    with client, socket.create_connection(("192.0.2.5", 1080), 3) as upstream:
+    with client, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as upstream:
+        upstream.settimeout(3)
+        if so_mark:
+            upstream.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_MARK", 36), so_mark)
+        upstream.connect(("192.0.2.5", 1080))
         t1 = threading.Thread(target=pipe, args=(client, upstream), daemon=True)
         t2 = threading.Thread(target=pipe, args=(upstream, client), daemon=True)
         t1.start()
@@ -108,16 +125,6 @@ host_svc_pid=$!
 
 trap 'kill "$proxy_pid" "$tproxy_pid" "$host_svc_pid" "${relay_pid:-}" "${egress_pid:-}" 2>/dev/null || true; rm -f "$tproxy_hit"' EXIT
 sleep 0.2
-
-relay_uid=0
-relay_prefix=()
-if [[ $(id -u) == 0 ]] && command -v setpriv >/dev/null && id nobody >/dev/null 2>&1; then
-    relay_uid=$(id -u nobody)
-    relay_prefix=(setpriv --reuid "$relay_uid" --regid "$relay_uid" --clear-groups)
-    iptables -t nat -A OUTPUT -m owner --uid-owner "$relay_uid" -d 192.0.2.5 -p tcp --dport 1080 -j REDIRECT --to-ports 52345
-else
-    iptables -t nat -A OUTPUT -d 192.0.2.5 -p tcp --dport 1080 -m mark ! --mark 0x66 -j REDIRECT --to-ports 52345
-fi
 
 helper="$1/scripts/gemini-host-egress.sh"
 gateway=198.18.252.1

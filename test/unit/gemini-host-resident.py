@@ -436,4 +436,51 @@ with tempfile.TemporaryDirectory(prefix="gemini-resident-") as temporary:
             assert ENV_ID not in host.native_sessions
             sched_warm.assert_called_once_with(ENV_ID, force=True)
 
+        # 13. Terminal.relay() method must NOT be shadowed by Agy's egress_relay handle.
+        fake_term_egress = Mock()
+        fake_term_egress.poll.return_value = None
+        fake_term_relay = Mock()
+        fake_term_relay.poll.return_value = None
+
+        def fake_terminal_start(self_term, _proxy_url, _size):
+            self_term.pid = 4242
+            self_term.terminal = 99
+            self_term.egress = fake_term_egress
+            self_term.egress_relay = fake_term_relay
+
+        with (
+            patch.object(impl.Agy, "start", fake_terminal_start),
+            patch.object(impl.Terminal, "await_start", return_value=None),
+            patch.object(impl.Terminal, "exited", return_value=False),
+            patch.object(impl.Terminal, "live_profile", return_value=True),
+            patch.object(impl.os, "read", return_value=b"hi"),
+        ):
+            term = impl.Terminal(
+                host,
+                records[ENV_ID],
+                PROXY,
+                directory / ENV_ID / PROFILE,
+                (80, 24),
+                "sess-relay-check",
+                ("tok",),
+            )
+            assert term.egress_relay is fake_term_relay
+            assert callable(term.relay), "Terminal.relay method must remain callable"
+            assert term.relay.__func__ is impl.Terminal.relay
+            assert term.alive() is True
+            assert term.relay(b"", None) == "aGk="
+            fake_term_relay.poll.return_value = 1
+            assert term.alive() is False
+
+        # NativeSession.is_alive() also tracks egress_relay.
+        ns_probe = impl.NativeSession.__new__(impl.NativeSession)
+        ns_probe.egress = fake_term_egress
+        ns_probe.native_tui = Mock()
+        ns_probe.native_tui.poll.return_value = None
+        ns_probe.egress_relay = fake_term_relay
+        fake_term_relay.poll.return_value = None
+        assert ns_probe.is_alive() is True
+        fake_term_relay.poll.return_value = 1
+        assert ns_probe.is_alive() is False
+
 print("gemini-host-resident: ALL PASS")
