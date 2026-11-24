@@ -1119,7 +1119,17 @@ export async function buildClaudeResetQuery({ cfg, id, transport, now } = {}) {
   })
 }
 
-export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, card, transport, now } = {}) {
+export async function buildClaudeResetRedeem({
+  cfg,
+  accountQuota = null,
+  usageCache = null,
+  id,
+  idempotencyKey,
+  card,
+  transport,
+  now,
+} = {}) {
+  const clock = typeof now === 'function' ? now : () => Date.now()
   const result = await redeemClaudeResetCredit({
     projectRoot: cfg.paths.project,
     vmId: id,
@@ -1127,6 +1137,24 @@ export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, card, tr
     card,
     ...(transport ? { transport } : {}),
     ...(now ? { now } : {}),
+    onResetConfirmed: accountQuota?.recordQuotaReset
+      ? ({ accountId, receiptAccountId, operationId, cleared, at, replayed }) => {
+          // A replayed receipt created before a slot was rebound must not affect the new account.
+          if (!accountId || !receiptAccountId || receiptAccountId !== accountId) return
+          const recorded = accountQuota.recordQuotaReset(accountId, {
+            cleared,
+            at,
+            operationId,
+            now: clock(),
+            replayed,
+          })
+          if (recorded?.applied) {
+            try {
+              ;(usageCache || getUsageCache()).clear(accountId)
+            } catch {}
+          }
+        }
+      : null,
   })
   if (!result.ok) return claudeResetFail(result)
   return ok({
@@ -1264,6 +1292,8 @@ export async function buildProbeOne({
   if (force) cache.clear(accountId)
   const skipHop = !shouldHopOfficialUsage(acc?.unified, { hop, force })
   const headerProbe = skipHop ? probeFromPassiveHeaders(acc?.unified || {}) : null
+  const probeStartedAt = Date.now()
+  const probeResetGenerations = accountQuota.resetGenerations?.(accountId) || null
   const result = skipHop
     ? {
         ok: false,
@@ -1288,7 +1318,12 @@ export async function buildProbeOne({
   const profile = [result, acc?.unified, vm.claude, vm].find(
     (record) => record?.account_tier_source === 'profile' && ['pro', 'max'].includes(record.account_tier),
   )
-  if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result)
+  if (!skipHop) {
+    accountQuota.ingestOAuthUsage(accountId, result, {
+      startedAt: probeStartedAt,
+      resetGenerations: probeResetGenerations,
+    })
+  }
   if (result.subscription_type) {
     persistVmSubscription(cfg.paths.project, id, result, {
       accountUuid: vm.claude?.account_uuid,

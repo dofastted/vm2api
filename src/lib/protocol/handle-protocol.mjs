@@ -2710,10 +2710,15 @@ export function createHandleProtocol(deps) {
           .join('\n')
         const headers = extraHeadersFromLimitError(limitText, result.headers || {})
         const exhausted = isAccountQuotaExhausted(result, limitText)
+        const headerTiming = {
+          requestStartedAt: result.attemptStartedAt ?? logCtx.t0,
+          ...(result.attemptResetGenerations ? { resetGenerations: result.attemptResetGenerations } : {}),
+        }
         accountQuota.ingestHeaders(result.accountId, headers, healthReal ? null : logBag.usage, {
           exhausted,
           status: result.status,
           countRequest: !healthReal,
+          ...headerTiming,
         })
         const pool = typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler
         // Live `5h-status` on every response; `allowed` is the only early unblock.
@@ -2722,6 +2727,7 @@ export function createHandleProtocol(deps) {
             accountId: result.accountId,
             vmId: result.vmId || null,
             headers: result.headers || {},
+            ...headerTiming,
           })
         }
         if (pool?.syncQuotaSchedule && result.vmId && cfg?.paths?.project) {

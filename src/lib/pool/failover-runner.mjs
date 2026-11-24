@@ -1248,6 +1248,7 @@ export class FailoverRunner {
           schedulingMs: selected.schedulingMs,
         })
         attemptStarted = started
+        const attemptResetGenerations = this.scheduler?.accountQuota?.resetGenerations?.(selected.accountId) || null
         const repairKey = searchRepairKey(stickyKey, model, selected)
         const hint = this.searchRepairs.get(repairKey)
         if (hint && hint.expiresAt <= Date.now()) this.searchRepairs.delete(repairKey)
@@ -1305,7 +1306,13 @@ export class FailoverRunner {
           },
         })
         noteHop(result)
-        if (result) result.committed = result.committed || committed
+        if (result) {
+          result.committed = result.committed || committed
+          if (result.attemptStartedAt == null) result.attemptStartedAt = attemptStarted
+          if (result.attemptResetGenerations == null && attemptResetGenerations) {
+            result.attemptResetGenerations = attemptResetGenerations
+          }
+        }
         adoptProviderResponseHeaders(result)
         if (signal?.aborted || isClientCancelledResult(result)) {
           this.attemptsRepo?.complete?.(requestId, attemptNo, {
@@ -1380,6 +1387,8 @@ export class FailoverRunner {
                 vmId: selected.vmId,
                 result,
                 policy,
+                requestStartedAt: attemptStarted,
+                resetGenerations: attemptResetGenerations,
               }) || null
             : null
         if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {

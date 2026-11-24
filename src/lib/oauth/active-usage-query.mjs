@@ -33,6 +33,8 @@ export function createActiveUsageQuery({ probe = probeVmUsage } = {}) {
         return failure(429, 'usage_rate_limited', `官方额度查询限流，请约 ${Math.ceil(backoff / 1000)} 秒后重试`)
       }
       const exec = { vmId: vm.id, homeDir: path.join(projectRoot, 'vms', vm.id, 'cli-home'), oauth: vm.claude, vm }
+      const probeStartedAt = Date.now()
+      const probeResetGenerations = accountQuota.resetGenerations?.(accountId) || null
       let result
       try {
         result = await probe({ exec, vm, includeFable: false, timeoutMs: 30_000 })
@@ -40,7 +42,10 @@ export function createActiveUsageQuery({ probe = probeVmUsage } = {}) {
         return failure(502, 'usage_query_failed', '官方额度查询失败，请稍后重试')
       }
       if (isOfficialUsageRateLimited(result)) {
-        await accountQuota.ingestOAuthUsage(accountId, result)
+        await accountQuota.ingestOAuthUsage(accountId, result, {
+          startedAt: probeStartedAt,
+          resetGenerations: probeResetGenerations,
+        })
         return failure(429, 'usage_rate_limited', '官方额度查询限流，请稍后重试')
       }
       if (!result.ok || !('usage_status' in result) || result.usage_status !== 200 || result.limits_present !== true) {
@@ -50,7 +55,10 @@ export function createActiveUsageQuery({ probe = probeVmUsage } = {}) {
             : usageErrorText(result) || '官方接口未返回完整额度数据'
         return failure(502, 'usage_query_failed', message)
       }
-      await accountQuota.ingestOAuthUsage(accountId, result)
+      await accountQuota.ingestOAuthUsage(accountId, result, {
+        startedAt: probeStartedAt,
+        resetGenerations: probeResetGenerations,
+      })
       getUsageCache().clear(accountId)
       return {
         status: 200,

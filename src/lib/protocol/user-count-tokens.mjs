@@ -394,6 +394,8 @@ export async function resolveUsageWindows({
   if (!usageWindowsEmpty(listed)) return { listed, source }
   if (!shouldHopOfficialUsage(acc?.unified, { hop: true })) return { listed, source }
   const cache = usageCache || getUsageCache()
+  const probeStartedAt = Date.now()
+  const probeResetGenerations = accountQuota?.resetGenerations?.(accountId) || null
   let result
   try {
     result = await cache.load(accountId, () => probe({ exec, vm, includeFable: false }))
@@ -402,7 +404,10 @@ export async function resolveUsageWindows({
   }
   if (!result || isOfficialUsageRateLimited(result)) return { listed, source }
   try {
-    accountQuota?.ingestOAuthUsage?.(accountId, result)
+    accountQuota?.ingestOAuthUsage?.(accountId, result, {
+      startedAt: probeStartedAt,
+      resetGenerations: probeResetGenerations,
+    })
   } catch {}
   const next = accountQuota?.repo?.get?.(accountId) || acc
   listed = listQuotaFromHeaders(next?.unified || {})

@@ -267,6 +267,7 @@ function loadAccount(projectRoot, vmId) {
   return {
     ok: true,
     vm,
+    accountId: vm.claude?.account_uuid || vm.id,
     exec: {
       vmId: vm.id,
       homeDir: path.join(projectRoot, 'vms', vm.id, 'cli-home'),
@@ -561,6 +562,7 @@ export async function redeemClaudeResetCredit({
   card,
   transport = defaultTransport,
   now = () => Date.now(),
+  onResetConfirmed = null,
 } = {}) {
   const normalized = normalizeKey(idempotencyKey)
   if (normalized.error) return normalized.error
@@ -570,11 +572,37 @@ export async function redeemClaudeResetCredit({
   if (!account.ok) return account
   const operation = claudeResetOperationId(vmId, normalized.key)
   return withAccountLease(vmId, now(), async () => {
-    const existing = await mutateState(projectRoot, async (state) => ({
-      value: storedOutcome(state.operations[operation]),
-    }))
+    const existing = await mutateState(projectRoot, async (state) => {
+      const record = state.operations[operation]
+      const view = storedOutcome(record)
+      if (!view) return { value: null }
+      return {
+        value: {
+          view,
+          meta: {
+            outcome: record.outcome,
+            cleared: Array.isArray(record.cleared) ? record.cleared : [],
+            at: record.at || null,
+            receiptAccountId: record.account_id || null,
+          },
+        },
+      }
+    })
     if (existing?.ok === false) return existing
-    if (existing) return { ok: true, ...existing }
+    if (existing) {
+      if (existing.meta.outcome === 'reset' && typeof onResetConfirmed === 'function') {
+        await onResetConfirmed({
+          vmId,
+          accountId: account.accountId,
+          receiptAccountId: existing.meta.receiptAccountId,
+          operationId: operation,
+          cleared: existing.meta.cleared,
+          at: existing.meta.at,
+          replayed: true,
+        })
+      }
+      return { ok: true, ...existing.view }
+    }
     const outcome = await redeemOnce({
       projectRoot,
       vmId,
@@ -585,19 +613,33 @@ export async function redeemClaudeResetCredit({
       now,
     })
     if (!outcome.ok) return outcome
+    const recordedAt = iso(now())
     const saved = await mutateState(projectRoot, async (state) => {
       state.operations[operation] = {
         outcome: outcome.outcome,
+        account_id: account.accountId,
         ...(outcome.kind ? { kind: outcome.kind } : {}),
         ...(outcome.reason ? { reason: outcome.reason } : {}),
         ...(outcome.cleared ? { cleared: outcome.cleared } : {}),
         ...(outcome.cooldown_until ? { cooldown_until: outcome.cooldown_until } : {}),
         ...(outcome.claude_reset_credits ? { credits: outcome.claude_reset_credits } : {}),
-        at: iso(now()),
+        at: recordedAt,
       }
       return { write: true, value: outcome }
     })
-    return saved?.ok === false ? saved : outcome
+    if (saved?.ok === false) return saved
+    if (outcome.outcome === 'reset' && typeof onResetConfirmed === 'function') {
+      await onResetConfirmed({
+        vmId,
+        accountId: account.accountId,
+        receiptAccountId: account.accountId,
+        operationId: operation,
+        cleared: Array.isArray(outcome.cleared) ? outcome.cleared : [],
+        at: recordedAt,
+        replayed: false,
+      })
+    }
+    return outcome
   })
 }
 
