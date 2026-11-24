@@ -1536,6 +1536,7 @@ export class FailoverRunner {
             'image_too_large',
             'invalid_image_url',
             'invalid_kernel_request',
+            'unsupported_capability',
             'invalid_tool_schema',
             'thinking_incompatible',
           ].includes(error.body?.error?.code)

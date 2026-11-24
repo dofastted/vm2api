@@ -580,6 +580,7 @@ export function mapUpstreamError(status, body, headers = {}) {
       'classifier_invalid_cache',
       'invalid_request_context',
       'invalid_kernel_request',
+      'unsupported_capability',
       'thinking_incompatible',
       ErrorCode.IMAGE_TOO_LARGE,
     ].includes(inboundCode)
@@ -589,10 +590,12 @@ export function mapUpstreamError(status, body, headers = {}) {
       code: inboundCode,
       message: body.error.message,
       status: 400,
-      ...(['thinking_incompatible', ErrorCode.IMAGE_TOO_LARGE].includes(inboundCode) && body?.error?.param
+      ...(['thinking_incompatible', 'unsupported_capability', ErrorCode.IMAGE_TOO_LARGE].includes(inboundCode) &&
+      body?.error?.param
         ? { param: body.error.param }
         : {}),
-      ...(['thinking_incompatible', ErrorCode.IMAGE_TOO_LARGE].includes(inboundCode) && body?.error?.details
+      ...(['thinking_incompatible', 'unsupported_capability', ErrorCode.IMAGE_TOO_LARGE].includes(inboundCode) &&
+      body?.error?.details
         ? { details: body.error.details }
         : {}),
     })
