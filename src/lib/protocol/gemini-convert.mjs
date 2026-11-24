@@ -3590,6 +3590,7 @@ export function parseGeminiSseFrame(frame) {
  */
 export function createGeminiEventDecoder({ fallbackModel = '' } = {}) {
   let started = false
+  let reportedModel = null
   let sawTool = false
   let stopped = false
   let searched = false
@@ -3616,17 +3617,24 @@ export function createGeminiEventDecoder({ fallbackModel = '' } = {}) {
     if (!isPlainObject(chunk)) return
     const usage = mergeRawUsage(chunk.usageMetadata ?? chunk.usage_metadata)
     if (usage) latestUsage = usage
+    const chunkModel =
+      typeof chunk.modelVersion === 'string' && chunk.modelVersion.trim() ? chunk.modelVersion.trim() : null
     if (!started) {
       started = true
+      if (chunkModel) reportedModel = chunkModel
       emit({
         kind: 'start',
         responseId:
           typeof chunk.responseId === 'string' && chunk.responseId ? chunk.responseId : `resp_${randomHex(10)}`,
-        model: typeof chunk.modelVersion === 'string' && chunk.modelVersion ? chunk.modelVersion : fallbackModel,
+        model: chunkModel || fallbackModel,
+        ...(chunkModel ? { reportedModel: chunkModel } : {}),
         usage: latestUsage
           ? { input_tokens: latestUsage.input_tokens, cache_read_tokens: latestUsage.cache_read_tokens }
           : null,
       })
+    } else if (chunkModel && chunkModel !== reportedModel) {
+      reportedModel = chunkModel
+      emit({ kind: 'model', model: chunkModel, reportedModel: chunkModel })
     }
     const effectiveMeta = meta || (isPlainObject(chunk.craggeminiMeta) ? chunk.craggeminiMeta : null)
     if (effectiveMeta) {
@@ -4036,6 +4044,7 @@ export function createGeminiRestoreTransform(
 export function createGeminiCollector({ fallbackModel = '' } = {}) {
   let id = `resp_${randomHex(10)}`
   let model = fallbackModel
+  let reportedModel = null
   const parts = []
   let stopReason = 'stop'
   let finishReason = 'STOP'
@@ -4053,7 +4062,12 @@ export function createGeminiCollector({ fallbackModel = '' } = {}) {
         case 'start':
           if (event.responseId) id = event.responseId
           if (event.model) model = event.model
+          if (event.reportedModel) reportedModel = event.reportedModel
           if (event.usage && !usage) usage = { ...event.usage, output_tokens: 0, total_tokens: 0 }
+          break
+        case 'model':
+          if (event.model) model = event.model
+          if (event.reportedModel) reportedModel = event.reportedModel
           break
         case 'meta':
           meta = {
@@ -4134,6 +4148,7 @@ export function createGeminiCollector({ fallbackModel = '' } = {}) {
       return {
         id,
         model,
+        reportedModel,
         parts,
         text,
         thinking,
@@ -4538,6 +4553,10 @@ export function createGeminiProtocolStreamEncoder(
           if (event.responseId) resolvedId = event.responseId
           return ''
         }
+        if (event.kind === 'model') {
+          if (event.model) resolvedModel = event.model
+          return ''
+        }
         if (event.kind === 'thinking') return emitChunk([{ text: event.text, thought: true }])
         if (event.kind === 'thinking_signature') {
           return emitChunk([{ text: '', thought: true, thoughtSignature: event.signature }])
@@ -4590,6 +4609,10 @@ export function createGeminiProtocolStreamEncoder(
         collector.push(event)
         if (event.kind === 'start') {
           started = true
+          if (event.model) resolvedModel = event.model
+          return ''
+        }
+        if (event.kind === 'model') {
           if (event.model) resolvedModel = event.model
           return ''
         }
@@ -4695,6 +4718,10 @@ export function createGeminiProtocolStreamEncoder(
         if (event.kind === 'start') {
           if (event.model) resolvedModel = event.model
           return ensureStart(event.usage)
+        }
+        if (event.kind === 'model') {
+          if (event.model) resolvedModel = event.model
+          return ''
         }
         if (event.kind === 'thinking') {
           let out = ensureStart()
@@ -4827,6 +4854,10 @@ export function createGeminiProtocolStreamEncoder(
       if (event.kind === 'start') {
         if (event.model) resolvedModel = event.model
         return ensureStart()
+      }
+      if (event.kind === 'model') {
+        if (event.model) resolvedModel = event.model
+        return ''
       }
       if (event.kind === 'thinking') {
         let out = ensureStart() + closeText()

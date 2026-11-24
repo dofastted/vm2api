@@ -725,3 +725,156 @@ test('API-backend Gemini path records first_byte_ms, first_token_ms, generation_
   assert.equal(dbg.response?.status, 200)
   assert.match(dbg.response?.body || '', /API ok/)
 })
+
+test('Gemini OAuth preserves upstream-reported modelVersion in logs, model_mismatch, and non-streaming responses (#1728)', async (t) => {
+  const store = tmpLogStore('normal')
+  t.after(() => {
+    store.db.close()
+    fs.rmSync(store.dataDir, { recursive: true, force: true })
+  })
+
+  const dispatched = []
+  let script = []
+  const scheduler = createGeminiScheduler({
+    callHost: async (op) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-h2n',
+              proxy_id: 'px-1',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-4-hydrogen-high', 'gemini-4-neon-high'],
+              capabilities: [...FULL_GEMINI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') return { id: 'env-h2n', proxy_id: 'px-1', auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async (_op, payload) => {
+      dispatched.push(payload.model)
+      return delayedSseResponse(script)
+    },
+    resolveProxy: () => 'socks5h://192.0.2.10:1080',
+  })
+
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler,
+    requestLog: store,
+    groupsRepo: { rateMultiplier: () => 1 },
+    apiKeyStore: { users: { getById: () => ({ id: 9, role: 'admin' }) } },
+  })
+
+  // 1. Streaming request for Hydrogen where upstream self-reports Neon.
+  script = [
+    `data: ${JSON.stringify({
+      candidates: [{ content: { role: 'model', parts: [{ text: 'hello' }] }, finishReason: 'STOP' }],
+      modelVersion: 'gemini-4-neon',
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+    })}\n\n`,
+  ]
+  const resStream = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-hydrogen-high:streamGenerateContent?alt=sse',
+      body: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+    }),
+    resStream,
+  )
+  assert.equal(resStream.statusCode, 200)
+  const sseFrames = resStream
+    .bodyText()
+    .split('\n\n')
+    .filter((b) => b.startsWith('data:'))
+    .map((b) => JSON.parse(b.slice(5).trim()))
+  assert.ok(sseFrames.length >= 1)
+  assert.ok(sseFrames.every((f) => f.modelVersion === 'gemini-4-neon'))
+
+  // 2. Non-streaming request for Hydrogen where upstream self-reports Neon.
+  const resJson = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-hydrogen-high:generateContent',
+      body: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+    }),
+    resJson,
+  )
+  assert.equal(resJson.statusCode, 200)
+  assert.equal(resJson.jsonBody().modelVersion, 'gemini-4-neon')
+
+  // 3. Late modelVersion arriving only on a subsequent SSE chunk.
+  script = [
+    `data: ${JSON.stringify({
+      candidates: [{ content: { role: 'model', parts: [{ text: 'part1' }] } }],
+    })}\n\n`,
+    `data: ${JSON.stringify({
+      candidates: [{ content: { role: 'model', parts: [{ text: 'part2' }] }, finishReason: 'STOP' }],
+      modelVersion: 'gemini-4-neon',
+    })}\n\n`,
+  ]
+  const resLate = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-hydrogen-high:streamGenerateContent?alt=sse',
+      body: { contents: [{ role: 'user', parts: [{ text: 'late' }] }] },
+    }),
+    resLate,
+  )
+  assert.equal(resLate.statusCode, 200)
+  const lateFrames = resLate
+    .bodyText()
+    .split('\n\n')
+    .filter((b) => b.startsWith('data:'))
+    .map((b) => JSON.parse(b.slice(5).trim()))
+  assert.equal(lateFrames.at(-1).modelVersion, 'gemini-4-neon')
+
+  // 4. Control: upstream omits modelVersion -> falls back to dispatched model, no mismatch.
+  script = [
+    `data: ${JSON.stringify({
+      candidates: [{ content: { role: 'model', parts: [{ text: 'plain' }] }, finishReason: 'STOP' }],
+    })}\n\n`,
+  ]
+  const resControl = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-hydrogen-high:generateContent',
+      body: { contents: [{ role: 'user', parts: [{ text: 'control' }] }] },
+    }),
+    resControl,
+  )
+  assert.equal(resControl.statusCode, 200)
+  assert.equal(resControl.jsonBody().modelVersion, 'gemini-4-hydrogen-high')
+
+  assert.deepEqual(dispatched, [
+    'gemini-4-hydrogen-high',
+    'gemini-4-hydrogen-high',
+    'gemini-4-hydrogen-high',
+    'gemini-4-hydrogen-high',
+  ])
+
+  const rows = store.db
+    .prepare(
+      'SELECT path, model, requested_model, upstream_model, model_mismatch, reasoning_effort FROM usage_logs ORDER BY rowid ASC',
+    )
+    .all()
+  assert.equal(rows.length, 4)
+
+  // Streaming, non-streaming, and late-chunk mismatch all record Neon + model_mismatch = 1, while preserving effort from dispatched Hydrogen-high.
+  for (const row of rows.slice(0, 3)) {
+    assert.equal(row.model, 'gemini-4-hydrogen-high')
+    assert.equal(row.requested_model, 'gemini-4-hydrogen-high')
+    assert.equal(row.upstream_model, 'gemini-4-neon')
+    assert.equal(row.model_mismatch, 1)
+    assert.equal(row.reasoning_effort, 'high')
+  }
+  assert.equal(rows[3].requested_model, 'gemini-4-hydrogen-high')
+  assert.equal(rows[3].upstream_model, 'gemini-4-hydrogen-high')
+  assert.equal(rows[3].model_mismatch, 0)
+})
