@@ -70,6 +70,7 @@ export function AnthropicConsolePage() {
   const [allEndpoints, setEndpoints] = useState<EndpointDraft[]>([
     freshEndpoint('anthropic'),
     freshEndpoint('openai'),
+    freshEndpoint('gemini'),
   ])
   const endpoints = useMemo(
     () => allEndpoints.filter((item) => item.protocol === protocol),
@@ -101,7 +102,7 @@ export function AnthropicConsolePage() {
   useEffect(() => {
     if (loaded || !stored.data) return
     const rows = (stored.data.items || []).map(draftFromStored)
-    for (const kind of ['anthropic', 'openai'] as const) {
+    for (const kind of ['anthropic', 'openai', 'gemini'] as const) {
       if (!rows.some((item) => item.protocol === kind))
         rows.push(freshEndpoint(kind))
     }
@@ -286,7 +287,7 @@ export function AnthropicConsolePage() {
           role='group'
           aria-label='API 协议'
         >
-          {(['anthropic', 'openai'] as const).map((kind) => (
+          {(['anthropic', 'openai', 'gemini'] as const).map((kind) => (
             <Button
               key={kind}
               variant={protocol === kind ? 'secondary' : 'outline'}
@@ -345,6 +346,11 @@ export function AnthropicConsolePage() {
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
+                        {protocol === 'gemini' ? (
+                          <SelectItem value='x_goog_api_key'>
+                            x-goog-api-key
+                          </SelectItem>
+                        ) : null}
                         <SelectItem value='x_api_key'>x-api-key</SelectItem>
                         <SelectItem value='authorization_bearer'>
                           Bearer
@@ -358,7 +364,13 @@ export function AnthropicConsolePage() {
                       onChange={(event) =>
                         patchEndpoint(item.id, { apiKey: event.target.value })
                       }
-                      placeholder={protocol === 'openai' ? 'sk-…' : 'sk-ant-…'}
+                      placeholder={
+                        protocol === 'gemini'
+                          ? 'AIza… / sk-vm-…'
+                          : protocol === 'openai'
+                            ? 'sk-…'
+                            : 'sk-ant-…'
+                      }
                       aria-label={`密钥 ${index + 1}`}
                     />
                     <Popover

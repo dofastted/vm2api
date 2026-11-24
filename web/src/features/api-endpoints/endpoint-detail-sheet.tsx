@@ -32,13 +32,14 @@ import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { apiEndpointsQueryOptions } from '@/features/api-endpoints/queries'
 
-type EndpointKind = 'claude' | 'openai' | 'custom'
-type Protocol = 'anthropic' | 'openai'
-type EpAuthScheme = 'x_api_key' | 'authorization_bearer'
+type EndpointKind = 'claude' | 'openai' | 'gemini' | 'custom'
+type Protocol = 'anthropic' | 'openai' | 'gemini'
+type EpAuthScheme = 'x_api_key' | 'authorization_bearer' | 'x_goog_api_key'
 
 const KIND_FALLBACK_LABEL: Record<EndpointKind, string> = {
   claude: 'Claude 官方',
   openai: 'OpenAI 官方',
+  gemini: 'Gemini 官方',
   custom: '自定义',
 }
 
@@ -128,7 +129,11 @@ function EndpointForm({
     setKind(nextKind)
     if (nextKind !== 'custom') {
       setBaseUrl(nextPreset.base_url)
-      setProtocol((nextPreset.protocol as Protocol) || 'anthropic')
+      const nextProtocol = (nextPreset.protocol as Protocol) || 'anthropic'
+      setProtocol(nextProtocol)
+      if (nextProtocol === 'gemini') setAuthScheme('x_goog_api_key')
+      else if (nextProtocol === 'openai') setAuthScheme('authorization_bearer')
+      else setAuthScheme('x_api_key')
     }
     // 名称为空、或仍是「自动填充」态时才跟着类型联动；用户改过名字就不再覆盖
     const autoNames = [prevPreset.label, 'api', '']
@@ -276,12 +281,12 @@ function EndpointForm({
               <SelectContent>
                 {(presets.length
                   ? presets
-                  : (['claude', 'openai', 'custom'] as EndpointKind[]).map(
-                      (k) => ({
-                        kind: k,
-                        label: KIND_FALLBACK_LABEL[k],
-                      })
-                    )
+                  : (
+                      ['claude', 'openai', 'gemini', 'custom'] as EndpointKind[]
+                    ).map((k) => ({
+                      kind: k,
+                      label: KIND_FALLBACK_LABEL[k],
+                    }))
                 ).map((p) => (
                   <SelectItem key={p.kind} value={p.kind}>
                     {p.label}
@@ -310,7 +315,15 @@ function EndpointForm({
             <Field label='协议'>
               <Select
                 value={protocol}
-                onValueChange={(value) => setProtocol(value as Protocol)}
+                onValueChange={(value) => {
+                  const next = value as Protocol
+                  setProtocol(next)
+                  if (next === 'gemini') setAuthScheme('x_goog_api_key')
+                  else if (next === 'openai')
+                    setAuthScheme('authorization_bearer')
+                  else if (authScheme === 'x_goog_api_key')
+                    setAuthScheme('x_api_key')
+                }}
               >
                 <SelectTrigger className='w-full'>
                   <SelectValue />
@@ -318,6 +331,7 @@ function EndpointForm({
                 <SelectContent>
                   <SelectItem value='anthropic'>Anthropic Messages</SelectItem>
                   <SelectItem value='openai'>OpenAI Chat</SelectItem>
+                  <SelectItem value='gemini'>Google Gemini</SelectItem>
                 </SelectContent>
               </Select>
             </Field>
@@ -345,6 +359,9 @@ function EndpointForm({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
+                {protocol === 'gemini' ? (
+                  <SelectItem value='x_goog_api_key'>x-goog-api-key</SelectItem>
+                ) : null}
                 <SelectItem value='x_api_key'>x-api-key</SelectItem>
                 <SelectItem value='authorization_bearer'>
                   Authorization: Bearer
@@ -650,6 +667,13 @@ function presetFor(
       label: 'OpenAI 官方',
       base_url: 'https://api.openai.com',
       protocol: 'openai',
+    }
+  if (kind === 'gemini')
+    return {
+      kind: 'gemini',
+      label: 'Gemini 官方',
+      base_url: 'https://generativelanguage.googleapis.com',
+      protocol: 'gemini',
     }
   return {
     kind: 'claude',

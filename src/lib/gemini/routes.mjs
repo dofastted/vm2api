@@ -13,11 +13,7 @@ import {
 } from '../protocol/gemini-convert.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
-import {
-  ANTIGRAVITY_PROVIDERS,
-  ANTIGRAVITY_QUOTA_GROUPS,
-  isAntigravityRoutedModel,
-} from './model-catalog.mjs'
+import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
@@ -210,12 +206,41 @@ export function isGeminiPanelPath(value) {
   return value === PANEL_PATH || value.startsWith(`${PANEL_PATH}/`)
 }
 
+const GEMINI_GENERATE_PATH_RE = /^\/(v1beta|v1)\/models\/([^/:]+):(generateContent|streamGenerateContent)$/
+const GEMINI_MODEL_GET_PATH_RE = /^\/(v1beta|v1)\/models\/([^/:]+)$/
+
+export function parseGeminiGeneratePath(pathname) {
+  const match = GEMINI_GENERATE_PATH_RE.exec(String(pathname || ''))
+  if (!match) return null
+  let model = match[2]
+  try {
+    model = decodeURIComponent(match[2])
+  } catch {}
+  return {
+    version: match[1],
+    model,
+    action: match[3],
+    stream: match[3] === 'streamGenerateContent',
+  }
+}
+
+export function parseGeminiModelGetPath(pathname) {
+  const match = GEMINI_MODEL_GET_PATH_RE.exec(String(pathname || ''))
+  if (!match) return null
+  let model = match[2]
+  try {
+    model = decodeURIComponent(match[2])
+  } catch {}
+  return { version: match[1], model }
+}
+
 /** Paths only Gemini serves. These route by path alone. */
 export function isGeminiPublicPath(value) {
   return (
     value === PUBLIC_PATH ||
     value.startsWith(`${PUBLIC_PATH}/`) ||
-    /^\/v1beta\/models\/[^/]+:(?:generateContent|streamGenerateContent)$/.test(value)
+    Boolean(parseGeminiGeneratePath(value)) ||
+    /^\/v1beta\/models\/[^/:]+$/.test(value)
   )
 }
 
@@ -241,7 +266,8 @@ export function geminiKeyAllowsPath(pathname, method) {
     isGeminiSharedPath(pathname) ||
     (method === 'POST' && (pathname === '/v1/messages' || pathname === '/messages')) ||
     (method === 'GET' &&
-      ['/models', '/v1/models', '/v1beta/models', '/v1/usage', '/v1/me/quota', '/v1/me/usage'].includes(pathname))
+      (['/models', '/v1/models', '/v1beta/models', '/v1/usage', '/v1/me/quota', '/v1/me/usage'].includes(pathname) ||
+        Boolean(parseGeminiModelGetPath(pathname))))
   )
 }
 
@@ -1286,19 +1312,39 @@ function protocolErrorBody(protocol, status, code, message) {
   return formatGeminiProtocolError(protocol, status, code, message)
 }
 
+export function googleModelEntry(model) {
+  const id = typeof model === 'string' ? model : String(model?.id || '').trim()
+  return {
+    name: `models/${id}`,
+    baseModelId: id,
+    displayName: (typeof model === 'object' && model?.display_name) || id,
+    supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
+  }
+}
+
+export function formatGoogleModelList(models = []) {
+  return {
+    models: (Array.isArray(models) ? models : [])
+      .filter((m) => (typeof m === 'string' ? m : m?.id))
+      .map(googleModelEntry),
+  }
+}
+
 function publicModels(catalog, req) {
   return filterModelCatalogForKey({ object: 'list', data: catalog.models }, req)
 }
 
 function googleModelList(catalog, req) {
-  const models = publicModels(catalog, req).data
-  return {
-    models: models.map((model) => ({
-      name: `models/${model.id}`,
-      displayName: model.id,
-      supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
-    })),
-  }
+  return formatGoogleModelList(publicModels(catalog, req).data)
+}
+
+function findCatalogModel(models, requestedId) {
+  const want = String(requestedId || '')
+    .trim()
+    .replace(/^models\//i, '')
+    .toLowerCase()
+  if (!want) return null
+  return (Array.isArray(models) ? models : []).find((m) => String(m?.id || '').toLowerCase() === want) || null
 }
 
 function beginSse(res) {
@@ -1339,9 +1385,29 @@ export function createGeminiPublicHandler({ json, readBody, scheduler, requestLo
     }
     const url = new URL(req.url || PUBLIC_PATH, 'http://127.0.0.1')
     const googleModels = url.pathname === '/v1beta/models'
-    if (req.method === 'GET' && [PUBLIC_PATH, '/v1/models', '/models', '/v1beta/models'].includes(url.pathname)) {
+    const singleModelGet = req.method === 'GET' ? parseGeminiModelGetPath(url.pathname) : null
+    if (
+      req.method === 'GET' &&
+      ([PUBLIC_PATH, '/v1/models', '/models', '/v1beta/models'].includes(url.pathname) || singleModelGet)
+    ) {
       try {
         const catalog = await scheduler.catalog()
+        if (singleModelGet) {
+          const hit = findCatalogModel(publicModels(catalog, req).data, singleModelGet.model)
+          if (!hit) {
+            return json(
+              res,
+              404,
+              protocolErrorBody(
+                singleModelGet.version === 'v1beta' ? 'gemini' : 'openai-chat',
+                404,
+                'gemini_model_unavailable',
+                `Model not found: ${singleModelGet.model}`,
+              ),
+            )
+          }
+          return json(res, 200, singleModelGet.version === 'v1beta' ? googleModelEntry(hit) : hit)
+        }
         return json(res, 200, googleModels ? googleModelList(catalog, req) : publicModels(catalog, req))
       } catch (error) {
         const mapped = publicError(error)
@@ -1349,7 +1415,7 @@ export function createGeminiPublicHandler({ json, readBody, scheduler, requestLo
           res,
           mapped.status,
           protocolErrorBody(
-            googleModels ? 'gemini' : 'openai-chat',
+            googleModels || singleModelGet?.version === 'v1beta' ? 'gemini' : 'openai-chat',
             mapped.status,
             mapped.body.error.code,
             mapped.body.error.message,
@@ -1361,7 +1427,7 @@ export function createGeminiPublicHandler({ json, readBody, scheduler, requestLo
     const messages = url.pathname === '/v1/messages' || url.pathname === '/messages'
     const chat = url.pathname === '/v1/chat/completions' || url.pathname === '/chat/completions'
     const responses = url.pathname === '/v1/responses' || url.pathname === '/responses'
-    const google = /^\/v1beta\/models\/([^/:]+):(generateContent|streamGenerateContent)$/.exec(url.pathname)
+    const google = parseGeminiGeneratePath(url.pathname)
     if (req.method !== 'POST' || !(session || messages || chat || responses || google)) {
       return json(res, 404, { error: { code: 'not_found', message: 'not found' } })
     }
@@ -1374,8 +1440,8 @@ export function createGeminiPublicHandler({ json, readBody, scheduler, requestLo
           : responses
             ? 'openai-responses'
             : 'gemini-session'
-    const routeStream = google ? google[2] === 'streamGenerateContent' : undefined
-    const modelFromPath = google ? decodeURIComponent(google[1]) : null
+    const routeStream = google ? google.stream : undefined
+    const modelFromPath = google ? google.model : null
     const bodyLimit = protocol === 'gemini-session' ? 256 * 1024 : 12 * 1024 * 1024
 
     const startedAt = Date.now()
@@ -1459,7 +1525,8 @@ export function createGeminiPublicHandler({ json, readBody, scheduler, requestLo
     }
 
     const targetModel = supportsStream ? parsed.model : requested.model
-    const wantStream = protocol === 'gemini-session' ? false : (supportsStream ? parsed.stream : requested.stream) === true
+    const wantStream =
+      protocol === 'gemini-session' ? false : (supportsStream ? parsed.stream : requested.stream) === true
     logBag.model = targetModel
     logBag.requested_model = targetModel
     logBag.stream = wantStream

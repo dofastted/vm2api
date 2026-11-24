@@ -9,6 +9,7 @@ import { credentialModeOfVm, normalizeCredentialMode } from './credential-mode.m
 
 export const AUTH_SCHEME_X_API_KEY = 'x_api_key'
 export const AUTH_SCHEME_BEARER = 'authorization_bearer'
+export const AUTH_SCHEME_GOOG_API_KEY = 'x_goog_api_key'
 
 export function normalizeAuthScheme(raw) {
   const s = String(raw || '')
@@ -23,6 +24,8 @@ export function normalizeAuthScheme(raw) {
     s === 'oauth'
   )
     return AUTH_SCHEME_BEARER
+  if (s === AUTH_SCHEME_GOOG_API_KEY || s === 'x_goog_api_key' || s === 'goog_api_key' || s === 'gemini_api_key')
+    return AUTH_SCHEME_GOOG_API_KEY
   if (s === AUTH_SCHEME_X_API_KEY || s === 'x_api_key' || s === 'apikey' || s === 'api_key')
     return AUTH_SCHEME_X_API_KEY
   return ''

@@ -30,6 +30,8 @@ export type ApiEndpointPreset = {
   protocol: string
 }
 
+export type ApiEndpointAuthScheme = AuthScheme | 'x_goog_api_key'
+
 export type ApiEndpoint = {
   id: string
   name?: string
@@ -38,11 +40,11 @@ export type ApiEndpoint = {
   priority?: number
   disabled?: boolean
   disable_cooling?: boolean
-  kind?: 'claude' | 'openai' | 'custom'
-  protocol?: 'anthropic' | 'openai'
+  kind?: 'claude' | 'openai' | 'gemini' | 'custom'
+  protocol?: 'anthropic' | 'openai' | 'gemini'
   risk_review_enabled?: boolean
-  /** 上游认证方案，后端 `endpointAuthScheme()` 计算得出，openai 协议恒为 bearer。 */
-  auth_scheme?: AuthScheme
+  /** 上游认证方案，后端 `endpointAuthScheme()` 计算得出，openai 协议恒为 bearer，gemini 默认 x_goog_api_key。 */
+  auth_scheme?: ApiEndpointAuthScheme
   headers?: Record<string, string>
   api_key_entries?: ApiKeyEntry[]
   models?: ApiModelEntry[]

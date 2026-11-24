@@ -7,6 +7,7 @@ import path from 'node:path'
 import { Readable } from 'node:stream'
 import test from 'node:test'
 import { extractApiKey, redactSecrets } from '../../src/lib/core/security.mjs'
+import { CORS_ALLOW_HEADERS } from '../../src/lib/http/cors.mjs'
 import {
   cancelGeminiNativeTurn,
   prepareGeminiNativeTurn,
@@ -17,6 +18,8 @@ import {
   geminiKeyAllowsPath,
   isGeminiPublicPath,
   isGeminiSharedPath,
+  parseGeminiGeneratePath,
+  parseGeminiModelGetPath,
 } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
 import { FULL_GEMINI_CAPABILITIES, NATIVE_TUI_CAPABILITIES } from '../../src/lib/protocol/gemini-convert.mjs'
@@ -729,4 +732,103 @@ test('Google account verification ineligibility returns 403 without tripping cir
   assert.equal(res.jsonBody().error.code, 'gemini_account_verification_required')
   assert.equal(tracker.calls.failure.length, 0)
   assert.equal(tracker.calls.probe.length, 1)
+})
+
+test('Gemini public ports support /v1 native generateContent, single-model GET, /v1/models ?key= auth, and CORS headers', async () => {
+  assert.match(CORS_ALLOW_HEADERS, /x-goog-api-key/)
+  assert.match(CORS_ALLOW_HEADERS, /x-goog-api-client/)
+
+  assert.equal(extractApiKey({ headers: {}, url: '/v1/models?key=sk-vm-query-v1' }), 'sk-vm-query-v1')
+  assert.equal(
+    extractApiKey({
+      headers: {},
+      url: '/v1/models/gemini-4-neon-low:generateContent?key=sk-vm-query-gen',
+    }),
+    'sk-vm-query-gen',
+  )
+  assert.equal(extractApiKey({ headers: {}, url: '/v1/models?key=kin-panel-secret' }), '')
+  assert.equal(extractApiKey({ headers: {}, url: '/v1/chat/completions?key=sk-vm-nope' }), '')
+
+  assert.equal(isGeminiPublicPath('/v1/models/gemini-4-neon-low:generateContent'), true)
+  assert.equal(isGeminiPublicPath('/v1/models/gemini-4-neon-low:streamGenerateContent'), true)
+  assert.equal(isGeminiPublicPath('/v1beta/models/gemini-4-neon-low'), true)
+  assert.equal(isGeminiPublicPath('/v1/models'), false)
+  assert.equal(isGeminiPublicPath('/v1/models/gemini-4-neon-low'), false)
+  assert.equal(geminiKeyAllowsPath('/v1/models/gemini-4-neon-low', 'GET'), true)
+  assert.equal(geminiKeyAllowsPath('/v1beta/models/gemini-4-neon-low', 'GET'), true)
+  assert.equal(geminiKeyAllowsPath('/v1/models/gemini-4-neon-low:generateContent', 'POST'), true)
+  assert.deepEqual(parseGeminiGeneratePath('/v1/models/gemini-4-neon-low:streamGenerateContent'), {
+    version: 'v1',
+    model: 'gemini-4-neon-low',
+    action: 'streamGenerateContent',
+    stream: true,
+  })
+  assert.deepEqual(parseGeminiModelGetPath('/v1beta/models/gemini-4-neon-low'), {
+    version: 'v1beta',
+    model: 'gemini-4-neon-low',
+  })
+
+  const scheduler = createGeminiScheduler({
+    callHost: async (op) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-key',
+              proxy_id: 'proxy-1',
+              auth_state: 'authorized',
+              auth_method: 'api_key',
+              models_discovered: true,
+              models: ['gemini-4-neon-low'],
+              capabilities: [...FULL_GEMINI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') return { id: 'env-key', proxy_id: 'proxy-1', auth_method: 'api_key' }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: async () =>
+      sseResponse([
+        `data: ${JSON.stringify({
+          candidates: [{ content: { role: 'model', parts: [{ text: 'v1-ok' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, totalTokenCount: 7 },
+        })}\n\n`,
+      ]),
+    resolveProxy: () => 'socks5h://1.2.3.4:1080',
+  })
+  const handler = createGeminiPublicHandler({ json: jsonResponder, readBody: async () => ({}), scheduler })
+
+  const resMetaBeta = makeRes()
+  await handler(makeReq({ method: 'GET', url: '/v1beta/models/gemini-4-neon-low' }), resMetaBeta)
+  assert.equal(resMetaBeta.statusCode, 200)
+  assert.deepEqual(resMetaBeta.jsonBody(), {
+    name: 'models/gemini-4-neon-low',
+    baseModelId: 'gemini-4-neon-low',
+    displayName: 'gemini-4-neon-low',
+    supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
+  })
+
+  const resMetaV1 = makeRes()
+  await handler(makeReq({ method: 'GET', url: '/v1/models/gemini-4-neon-low' }), resMetaV1)
+  assert.equal(resMetaV1.statusCode, 200)
+  assert.equal(resMetaV1.jsonBody().id, 'gemini-4-neon-low')
+
+  const resMissing = makeRes()
+  await handler(makeReq({ method: 'GET', url: '/v1beta/models/no-such-model' }), resMissing)
+  assert.equal(resMissing.statusCode, 404)
+  assert.equal(resMissing.jsonBody().error.status, 'NOT_FOUND')
+
+  const resGenV1 = makeRes()
+  await handler(
+    makeReq({
+      method: 'POST',
+      url: '/v1/models/gemini-4-neon-low:generateContent',
+      body: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+    }),
+    resGenV1,
+  )
+  assert.equal(resGenV1.statusCode, 200)
+  assert.equal(resGenV1.jsonBody().candidates[0].content.parts[0].text, 'v1-ok')
 })
