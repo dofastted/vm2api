@@ -3,6 +3,7 @@
  * envelopes are unchanged; slot start/reload go through startSlotReady.
  */
 import { setSlotDesktopEnabled, slotDesktopStatus } from '../vm/slot-desktop.mjs'
+import { validateGeminiRoutingPatch } from '../gemini/routing-config.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -7051,6 +7052,7 @@ export function createPanelHandler(ctx) {
             validateOpenAIQuotaPatch(body.codex.quota)
           }
           validateInferenceWebsocketPatch(body)
+          validateGeminiRoutingPatch(body)
         } catch (error) {
           if (error instanceof TypeError || error instanceof RangeError) {
             return json(res, 400, {
@@ -7121,6 +7123,7 @@ export function createPanelHandler(ctx) {
             applied_session_slots: applied.session_slots,
             kernel_persona: applied.kernel_persona || null,
             telemetry_sync: applied.telemetry_sync || null,
+            gemini_sync: applied.gemini_sync || null,
             inference_runtime: publicEngineRuntime,
           }),
         )

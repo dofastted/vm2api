@@ -23,6 +23,7 @@ import { QueryGate } from '@/components/query-gate'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { AboutPane } from '@/features/settings/about-pane'
 import { BackupPane } from '@/features/settings/backup-pane'
+import { GeminiConfigPane } from '@/features/settings/gemini-config-pane'
 import { GeminiInstallPane } from '@/features/settings/gemini-install-pane'
 import { HealthPane } from '@/features/settings/health-pane'
 import { LogsPane } from '@/features/settings/logs-pane'
@@ -42,6 +43,7 @@ import {
   thinkingDisplayFromCompat,
 } from '@/features/settings/protocol-authority'
 import {
+  geminiDaemonStatusQueryOptions,
   notifyQueryOptions,
   outboundProfileQueryOptions,
   routingQueryOptions,
@@ -167,7 +169,8 @@ export function SettingsPage() {
         tab,
         inherited,
         saved?.kernel_persona,
-        saved?.telemetry_sync
+        saved?.telemetry_sync,
+        saved?.gemini_sync
       )
       if (tab === 'telemetry' && saved?.telemetry_sync?.failed?.length) {
         toast.warning(message)
@@ -183,6 +186,13 @@ export function SettingsPage() {
         }),
         ...(tab === 'notify'
           ? [qc.invalidateQueries({ queryKey: notifyQueryOptions().queryKey })]
+          : []),
+        ...(tab === 'gemini-config'
+          ? [
+              qc.invalidateQueries({
+                queryKey: geminiDaemonStatusQueryOptions().queryKey,
+              }),
+            ]
           : []),
       ])
     },
@@ -232,7 +242,9 @@ export function SettingsPage() {
           ? 'Claude 配额闸线、并发、RPM，以及请求体上限。GPT 配额在 OpenAI 页。个人自用引导会把闸关掉并拉到上限；这里仍可再改。'
           : tab === 'openai'
             ? 'GPT 传输、准入、配额与客户端画像。全局 WebSocket 只作用于推理，不影响终端或集群。'
-            : tab === 'logs'
+            : tab === 'gemini-config'
+              ? 'Gemini 入口准入、CRAGGemini 单进程分片接管、并发调度、共享内存（AGYSHM02）与故障保护。宿主安装与升级在「Gemini 维护」页。'
+              : tab === 'logs'
               ? '设置请求日志的记录模式、保留时间和存储上限。逐条记录在日志页查看。'
               : undefined
       }
@@ -395,6 +407,17 @@ export function SettingsPage() {
                   pending={dirty}
                 />
               ) : null}
+              {tab === 'gemini-config' ? (
+                <GeminiConfigPane
+                  value={
+                    (draft.gemini as Record<string, unknown> | undefined) || {}
+                  }
+                  onChange={(next) =>
+                    setDraft((current) => ({ ...current, gemini: next }))
+                  }
+                  saving={save.isPending}
+                />
+              ) : null}
               {tab === 'logs' ? (
                 <LogsPane
                   value={logging}
@@ -553,7 +576,8 @@ function settingsSaveToast(
   tab: SettingsTabId,
   inherited: number,
   kernel?: { updated?: number } | null,
-  telemetry?: RoutingSaveResult['telemetry_sync']
+  telemetry?: RoutingSaveResult['telemetry_sync'],
+  geminiSync?: RoutingSaveResult['gemini_sync']
 ) {
   if (tab === 'protocol') {
     const hot =
@@ -566,6 +590,17 @@ function settingsSaveToast(
     return `已保存 · ${inherited} 个槽位改为跟随全局 · ${hot}`
   }
   if (tab === 'openai') return '已保存 · GPT 配置'
+  if (tab === 'gemini-config') {
+    if (geminiSync?.ok) {
+      return geminiSync.shards_total
+        ? `已保存 · Gemini 配置（已热更新 ${geminiSync.shards_updated ?? 0}/${geminiSync.shards_total} 个分片）`
+        : '已保存 · Gemini 配置（已同步宿主）'
+    }
+    if (geminiSync && !geminiSync.ok) {
+      return '已保存 · Gemini 配置（宿主未在线，启动后生效）'
+    }
+    return '已保存 · Gemini 配置'
+  }
   if (tab === 'telemetry' && telemetry) {
     const failed = telemetry.failed?.length
       ? ` · ${telemetry.failed.length} 个未生效：${telemetry.failed.slice(0, 3).join('、')}`
@@ -588,5 +623,11 @@ type RoutingSaveResult = {
     updated?: number
     skipped?: number
     failed?: string[]
+  } | null
+  gemini_sync?: {
+    ok?: boolean
+    shards_updated?: number
+    shards_total?: number
+    code?: string
   } | null
 }

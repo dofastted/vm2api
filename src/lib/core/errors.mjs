@@ -523,17 +523,47 @@ export function incompleteAssistantClientError(result = {}) {
  * reached the client (#1215). Capacity errors are excluded on purpose: a 429/529
  * carries the panel's own Retry-After and a client is meant to come back.
  */
+const PARTIAL_CONTINUATION_DETAIL_KEYS = [
+  'prior_reason',
+  'interrupted_at',
+  'retry_after_sec',
+  'recovery_attempts',
+  'max_recoveries',
+  'recovery_exhausted',
+]
+
+function partialContinuationRelayDetails(body) {
+  const src = body?.error?.details
+  if (!src || typeof src !== 'object' || Array.isArray(src)) return {}
+  const picked = {}
+  for (const key of PARTIAL_CONTINUATION_DETAIL_KEYS) {
+    const value = src[key]
+    if (
+      typeof value === 'string' ||
+      (typeof value === 'number' && Number.isFinite(value)) ||
+      typeof value === 'boolean'
+    ) {
+      picked[key] = value
+    }
+  }
+  return picked
+}
+
 function terminalRelayDetails(status, body) {
+  // CRAG names a submission whose partial output cannot be replayed with this
+  // exact type. The verdict is the kernel's own, so the 409 carrying it is as
+  // terminal as a 410 even when the body omits the flag (#1518). Forward safe
+  // diagnostic metadata (cooldown, prior reason, recovery budget) while keeping
+  // retryable: false so SDK auto-retries stay disabled. Other 409s stay
+  // untouched: a conflict the panel has not declared terminal may well clear.
+  if (status === 409 && body?.error?.type === 'partial_provider_output_nonretryable') {
+    return { ...partialContinuationRelayDetails(body), retryable: false }
+  }
   if (body?.error?.details?.retryable === false) return { retryable: false }
   // 410 Gone is terminal by definition. An expired tool continuation cannot be
   // revived, so every retry of the same hop can only answer 410 again; saying so
   // does not infer *why* it expired, which stays the kernel's to report.
   if (status === 410) return { retryable: false }
-  // CRAG names a submission whose partial output cannot be replayed with this
-  // exact type. The verdict is the kernel's own, so the 409 carrying it is as
-  // terminal as a 410 even when the body omits the flag (#1518). Other 409s stay
-  // untouched: a conflict the panel has not declared terminal may well clear.
-  if (status === 409 && body?.error?.type === 'partial_provider_output_nonretryable') return { retryable: false }
   return {}
 }
 

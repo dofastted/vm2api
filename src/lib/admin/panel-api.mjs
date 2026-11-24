@@ -11,6 +11,7 @@ import { hostMemoryPressureOf, LOCAL_HOST_KEY } from '../cluster/host-memory-pre
 import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
 import { redactionStatus } from '../redaction/runtime.mjs'
+import { normalizeGeminiRouting } from '../gemini/routing-config.mjs'
 import { readSlotProcessStatus } from '../vm/slot-process-status.mjs'
 import { openaiUsageAccountId } from '../vm/codex-slot.mjs'
 import os from 'node:os'
@@ -1596,6 +1597,7 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     inference: presentInference(routingConfig?.inference),
     websocket: normalizeInferenceWebsocket(routingConfig?.websocket),
     codex: normalizeCodexRouting(routingConfig?.codex),
+    gemini: normalizeGeminiRouting(routingConfig?.gemini),
     official_cc: normalizeOfficialCcConfig(routingConfig?.official_cc),
     health_probe: normalizeHealthProbeConfig(routingConfig?.health_probe),
     usage_probe: normalizeUsageProbeConfig(routingConfig?.usage_probe),

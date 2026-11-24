@@ -143,6 +143,10 @@ def safe_google_validation_url(value):
 def parse_ineligibility(assist_data):
     if not isinstance(assist_data, dict):
         return None, None
+    # An account with an active paidTier or currentTier is already onboarded and usable;
+    # ineligibleTiers entries for other/alternative tiers must not mark it blocked.
+    if assist_data.get("paidTier") or assist_data.get("currentTier"):
+        return None, None
     ineligible = assist_data.get("ineligibleTiers")
     if not isinstance(ineligible, list):
         return None, None
