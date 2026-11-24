@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 1.4.197 — 2026-11-24 · CRAGGemini 0.4.6 与 CRAG 3.1.17 载荷升级；集成 API 与多层密钥归属隔离；PG 一键安装加固
+
+- **CRAGGemini 通道精简与账号会话隔离，载荷钉到 0.4.6**：`deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 由 `payload-2026.11.24-gemini-0.4.4` 升级到 `payload-2026.11.24-gemini-0.4.6`；精简 CRAGGemini 的 SHM 入站路径、隔离各账号会话，并新增 `scripts/verify-craggemini-sessions.mjs` 会话校验脚本（#1733）。
+- **零信任协议白名单清洗与 CRAG 3.1.17**：`crag_release` 由 `payload-2026.11.23-crag-3.1.14` 升级到 `payload-2026.11.24-crag-3.1.17`，新增 `src/lib/protocol/crag-whitelist.mjs` 对出站协议做白名单清洗，并支持 2.1.330 的 Auto Mode（#1731）。
+- **通用外部集成 API 与多层推理密钥权限隔离**：新增 `/api/integration/v1/*` 独立集成令牌体系（`sk-int-*`，仅落库 HMAC-SHA256 哈希），默认仅允许本机回环直连并按需放开 `allow_remote` + IP 白名单；推理密钥引入 `platform` / `tenant` / `resource` 三层权限与双向归属隔离，写侧跨归属域绑定返回 `403 scope_owner_mismatch`，运行时在 `ApiScheduler`、`api-protocol`、`handle-protocol`、`gemini/scheduler`、`gemini/routes` 与 `/v1/models`、`/v1beta/models` 统一过滤（#1730）。
+- **PostgreSQL 一键安装加固与 SQLite 无缝迁移**：加固 PG 一键安装路径、依赖自动准备与由 SQLite 平滑迁移的流程（#1712）。
+- **宿主不再向过旧载荷下发它拒绝的内核配置键**：`#1704` 起宿主会把九个调度 / SHM 键写进 `kernel.json`，但这些键只有 0.4.5 及以后的载荷接受，而当时钉住的仍是 0.4.4——于是 `v1.4.193`～`v1.4.196` 发布的宿主脚本会让自己钉住的载荷拒绝配置，worker 在桥接握手前退出并对外表现为 `gemini_native_bridge_timeout`。现按载荷版本下发：只有确实读出低于 0.4.5 的版本才不下发这些键，缺失或读不出版本时保持原行为，不静默降级；同时 `CragDaemonShard` 分片路径（`#1704` 新增、无旧形态）在过旧载荷上退回按账号的 `NativeSession`（#1734，修 #1729）。
+- **CRAGGemini 无法应用的 `safetySettings` 改为明确报错**：`buildGeminiRequest` 的 antigravity 分支此前从不设置该字段，带值的安全策略被静默丢弃并按成功返回，调用方无从察觉。现以 `400 gemini_unsupported_turn` 拒绝并提示「省略该字段或改用 Gemini API key 环境」；空数组不要求任何配置，仍原样放行且不转发；直连 Gemini API 渠道照旧生效（#1735）。
+- **请求日志的用量、缓存、思考强度、TPS 与调试捕获对齐**（#1727）；**Fable 额度错误与账号冷却解耦**：纯 Fable 额度等待不再误报 `529`，未知 429 不再扩大为账号硬冷却（#1722）。
+- **修复 `dev` 上三条失败单测并加固 `Agy` / `NativeAgy` 清理路径**：`Agy.close()` 与 `NativeAgy` 的错误上报分支改用带默认值的属性读取，避免 `__init__` 中途失败时用 `AttributeError` 盖掉原始错误（#1736）。
+- 部署说明：本版涉及控制面、**两个槽位载荷 pin**（CRAGGemini `0.4.4 → 0.4.6`、CRAG `3.1.14 → 3.1.17`）、宿主脚本（`scripts/gemini-host.py`、`scripts/docker-entrypoint.sh`、`scripts/panel-upgrade.sh`）与**两个数据库迁移**（SQLite `068_multi_tier_key_permissions.sql`、PostgreSQL `005_multi_tier_key_permissions.sql`）。两个迁移均为新增列 / 新增表：`api_endpoints.owner_user_id` 可空无默认，存量端点因此全部视为平台自建；`api_keys.permission_tier` 默认 `platform`，存量密钥落在该档后仍可访问平台自建资源，**对存量部署为无操作**。`bin/` 字节未变，预期 `SLOT_SYNC=skip`。`scripts/` 不在 `remote-apply.sh` 的应用范围内，宿主侧改动与 `0.4.6` 载荷需执行 `install.sh prepare-gemini` 才会生效（该步骤会重启 `vm2api-gemini.service`）；本版包含 #1734 的版本闸门后该步骤才是安全的——在此之前「新宿主脚本 + 0.4.4 载荷」会使 Gemini worker 无法启动。
+
 ## 1.4.196 — 2026-11-24 · 热修：CRAGGemini 性能配置改为初 / 中 / 高三档并移除 Web 底层协议术语
 
 - **Web 设置页「Gemini」性能配置三档化与文案脱敏**：将原底层传输参数区块替换为「CRAGGemini 性能配置」**初 / 中 / 高**三档单选（均沿用后端既有 `gemini.shm` 配置链路，分别映射到 `2/8 MiB`、`4/16 MiB`（默认）、`16/64 MiB`，兼容既有历史数值回显），同步替换设置页副标题与守护进程实时状态卡中的底层协议与通道术语为「性能配置」「通道请求 / 校验异常」「通道入站 / 出站」。
