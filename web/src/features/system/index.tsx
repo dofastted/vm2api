@@ -14,6 +14,7 @@ import { inheritProtocolOnSlots } from '@/features/settings/protocol-authority'
 import { routingQueryOptions } from '@/features/settings/queries'
 import { SaveBar } from '@/features/settings/save-bar'
 import { SettingsSkeleton } from '@/features/settings/settings-skeleton'
+import { CragGeminiPanel } from '@/features/system/craggemini-panel'
 import { CragPrintPanel } from '@/features/system/crag-print-panel'
 import { SystemPromptWorkspace } from '@/features/system/prompt-workspace'
 import { compatibilityPatch } from './compat-patch'
@@ -36,7 +37,7 @@ export function SystemPromptPage() {
   const [draft, setDraft] = useState<Record<string, unknown>>({})
   const [personaProblems, setPersonaProblems] = useState<string[]>([])
   const [discardKey, setDiscardKey] = useState(0)
-  const [kernelSet, setKernelSet] = useState<'cli-node' | 'crag'>('cli-node')
+  const [kernelSet, setKernelSet] = useState<'cli-node' | 'crag' | 'craggemini'>('cli-node')
 
   useEffect(() => {
     if (routing.data) setDraft(routing.data)
@@ -130,12 +131,13 @@ export function SystemPromptPage() {
           <div
             role='tablist'
             aria-label='提示词内核'
-            className='mb-4 grid gap-2 sm:grid-cols-2'
+            className='mb-4 grid gap-2 sm:grid-cols-3'
           >
             {(
               [
                 ['cli-node', 'cli-node 原生内核', '模板注入，写入 kernel.json'],
                 ['crag', 'CRAG v2 print', '不读 persona_preset，不是 TUI'],
+                ['craggemini', 'CRAGGemini (Antigravity)', 'agy 官方 / 0 提示词'],
               ] as const
             ).map(([value, label, detail]) => {
               const selected = kernelSet === value
@@ -178,6 +180,15 @@ export function SystemPromptPage() {
           </div>
           <div hidden={kernelSet !== 'crag'}>
             <CragPrintPanel
+              compat={
+                (draft.compatibility as Record<string, unknown> | undefined) ||
+                {}
+              }
+              onChange={(next) => setDraft({ ...draft, compatibility: next })}
+            />
+          </div>
+          <div hidden={kernelSet !== 'craggemini'}>
+            <CragGeminiPanel
               compat={
                 (draft.compatibility as Record<string, unknown> | undefined) ||
                 {}
