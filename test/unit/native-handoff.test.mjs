@@ -4,11 +4,19 @@ import http from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { Readable } from 'node:stream'
 import { createRespond, readBody } from '../../src/lib/http/respond.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 import { RateLimitService } from '../../src/lib/pool/rate-limit-service.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { consumeNativeHandoffStream, createNativeHandoffState } from '../../src/lib/protocol/native-handoff.mjs'
+import {
+  applyClaudeSSELineToMessage,
+  claudeSSELineToResponsesEvents,
+  createClaudeMessageAssembler,
+  createResponsesStreamState,
+} from '../../src/lib/protocol/convert.mjs'
 import { callGoWorker, streamGoWorker } from '../../src/lib/transport/go-worker-client.mjs'
 import {
   finalizeAssembledAssistantHop,
@@ -1385,3 +1393,80 @@ for (const deliveryMode of ['realtime', 'verified']) {
     }
   })
 }
+
+test('realtime native handoff completes real max_tokens cut inside tool_use without native_handoff_conflict', async () => {
+  for (const closeToolBlock of [true, false]) {
+    const result = summary({ stop_reason: 'max_tokens' })
+    const toolStream = [
+      frame({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_cut', name: 'Write', input: {} } }),
+      frame({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"filePath":"/tmp/a' } }),
+      ...(closeToolBlock ? [frame({ type: 'content_block_stop', index: 0 })] : []),
+    ].join('')
+    const sse = start(result) + toolStream + resultFrame(result) + terminalFrames(result)
+    const response = Readable.from([Buffer.from(sse)])
+    response.headers = { 'content-type': 'text/event-stream' }
+    response.trailers = {}
+
+    const state = createNativeHandoffState({ nativeHandoff: true })
+    const lines = []
+    let commits = 0
+    const received = await consumeNativeHandoffStream(response, {
+      state,
+      deliveryMode: 'realtime',
+      isCommitEvent: (event) => event.type === 'content_block_start',
+      onCommit: () => commits++,
+      onEvent: (line) => lines.push(line),
+    })
+
+    assert.equal(commits, 1)
+    assert.equal(received.committed, true)
+    assert.equal(received.body.type, 'message')
+    assert.equal(received.body.stop_reason, 'max_tokens')
+    assert.deepEqual(received.body.usage, USAGE)
+    const events = eventsFrom(lines)
+    assert.ok(!events.some((event) => event.type === 'error'))
+    assert.equal(events.filter((event) => event.type === 'content_block_stop' && event.index === 0).length, 1)
+    assert.equal(events.at(-2).type, 'message_delta')
+    assert.equal(events.at(-2).delta.stop_reason, 'max_tokens')
+    assert.equal(events.at(-1).type, 'message_stop')
+  }
+})
+
+test('realtime native handoff still fails committed tool_use on refusal stop', async () => {
+  const result = summary({ stop_reason: 'refusal' })
+  const sse = start(result) + toolFrames(0, 'toolu_refused') + resultFrame(result) + terminalFrames(result)
+  const response = Readable.from([Buffer.from(sse)])
+  response.headers = { 'content-type': 'text/event-stream' }
+  response.trailers = {}
+
+  const state = createNativeHandoffState({ nativeHandoff: true })
+  const lines = []
+  const received = await consumeNativeHandoffStream(response, {
+    state,
+    deliveryMode: 'realtime',
+    isCommitEvent: (event) => event.type === 'content_block_start',
+    onEvent: (line) => lines.push(line),
+  })
+  assert.equal(received.body.type, 'error')
+  assert.equal(received.body.error.code, 'native_handoff_conflict')
+  assert.ok(eventsFrom(lines).some((event) => event.type === 'error'))
+})
+
+test('multi-chunk signature_delta appends instead of overwriting', () => {
+  const assembler = createClaudeMessageAssembler()
+  const lines = [
+    'data: {"type":"message_start","message":{"id":"msg_sig","model":"claude-opus-5","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}',
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"abc"}}',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"part1-"}}',
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"part2"}}',
+    'data: {"type":"content_block_stop","index":0}',
+  ]
+  for (const line of lines) applyClaudeSSELineToMessage(line, assembler)
+  assert.equal(assembler.message.content[0].signature, 'part1-part2')
+
+  const respState = createResponsesStreamState('claude-opus-5', 'vm-test', [])
+  for (const line of lines) claudeSSELineToResponsesEvents(line, respState)
+  const encoded = respState.output[0].encrypted_content.replace(/^anthropic-thinking-v1:/, '')
+  assert.equal(JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')).signature, 'part1-part2')
+})

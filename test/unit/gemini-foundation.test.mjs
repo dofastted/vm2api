@@ -6,6 +6,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import test from 'node:test'
+import { extractApiKey, redactSecrets } from '../../src/lib/core/security.mjs'
+import { CORS_ALLOW_HEADERS } from '../../src/lib/http/cors.mjs'
 import {
   cancelGeminiNativeTurn,
   prepareGeminiNativeTurn,
@@ -16,6 +18,8 @@ import {
   geminiKeyAllowsPath,
   isGeminiPublicPath,
   isGeminiSharedPath,
+  parseGeminiGeneratePath,
+  parseGeminiModelGetPath,
 } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
 import { FULL_GEMINI_CAPABILITIES, NATIVE_TUI_CAPABILITIES } from '../../src/lib/protocol/gemini-convert.mjs'
@@ -274,17 +278,18 @@ test('full 4-protocol streaming & non-streaming end-to-end on api_key environmen
   })
 })
 
-test('CRAG capability-aware admission routes rich turns away from oauth and rejects when only oauth exists', async () => {
+test('CRAG capability-aware admission routes rich turns away from restricted slots and supports full native capabilities on craggemini', async () => {
   const inferTargets = []
+  const legacyRestrictedCaps = ['streaming', 'native_tui']
   let envs = [
     {
-      id: 'env-oauth',
+      id: 'env-oauth-legacy',
       proxy_id: 'proxy-1',
       auth_state: 'authorized',
       auth_method: 'oauth',
       models_discovered: true,
       models: ['gemini-2.5-flash'],
-      capabilities: [...NATIVE_TUI_CAPABILITIES],
+      capabilities: [...legacyRestrictedCaps],
     },
     {
       id: 'env-apikey',
@@ -317,7 +322,7 @@ test('CRAG capability-aware admission routes rich turns away from oauth and reje
   })
   const handler = createGeminiPublicHandler({ json: jsonResponder, readBody: async () => ({}), scheduler })
 
-  // Rich turn with system + tools MUST route to api_key, never oauth.
+  // Rich turn with system + tools MUST route to api_key when oauth only advertises legacy restricted caps.
   const res1 = makeRes()
   await handler(
     makeReq({
@@ -335,7 +340,7 @@ test('CRAG capability-aware admission routes rich turns away from oauth and reje
   assert.equal(res1.statusCode, 200)
   assert.deepEqual(inferTargets, ['env-apikey'])
 
-  // When ONLY oauth native_tui environment exists, rich turn MUST fail closed with 400 gemini_unsupported_turn (no silent drop, no host call).
+  // When ONLY legacy restricted native_tui environment exists, rich turn MUST fail closed with 400 gemini_unsupported_turn.
   envs = [envs[0]]
   const res2 = makeRes()
   await handler(
@@ -354,7 +359,7 @@ test('CRAG capability-aware admission routes rich turns away from oauth and reje
   assert.equal(res2.jsonBody().error.code, 'gemini_unsupported_turn')
   assert.deepEqual(inferTargets, ['env-apikey']) // Zero host calls made for rejected turn!
 
-  // Plain-text turn on oauth-only pool succeeds via native TUI.
+  // Plain-text turn on legacy oauth-only pool succeeds via native TUI.
   const res3 = makeRes()
   await handler(
     makeReq({
@@ -367,7 +372,44 @@ test('CRAG capability-aware admission routes rich turns away from oauth and reje
     res3,
   )
   assert.equal(res3.statusCode, 200)
-  assert.deepEqual(inferTargets, ['env-apikey', 'env-oauth'])
+  assert.deepEqual(inferTargets, ['env-apikey', 'env-oauth-legacy'])
+
+  // Modern CRAGGemini OAuth environment (NATIVE_TUI_CAPABILITIES) accepts multi-turn, image, and web search.
+  envs = [
+    {
+      id: 'env-oauth-craggemini',
+      proxy_id: 'proxy-1',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      models_discovered: true,
+      models: ['gemini-2.5-flash'],
+      capabilities: [...NATIVE_TUI_CAPABILITIES],
+    },
+  ]
+  const res4 = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1/chat/completions',
+      body: {
+        model: 'gemini-2.5-flash',
+        messages: [
+          { role: 'system', content: 'be concise' },
+          { role: 'user', content: 'Remember ZEBRA-1' },
+          { role: 'assistant', content: 'Got it' },
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: 'What color is this image?' },
+              { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' } },
+            ],
+          },
+        ],
+      },
+    }),
+    res4,
+  )
+  assert.equal(res4.statusCode, 200)
+  assert.deepEqual(inferTargets, ['env-apikey', 'env-oauth-legacy', 'env-oauth-craggemini'])
 })
 
 test('error handling: circuit breaker, pre-stream vs mid-stream errors, and disconnect infer-cancel', async () => {
@@ -622,4 +664,171 @@ test('Codex and Claude route isolation invariants remain intact', async () => {
     assert.equal(res.statusCode, 403)
     assert.equal(res.jsonBody().error.code, 'gemini_key_required')
   }
+})
+
+test('Google Gemini native auth headers (x-goog-api-key and /v1beta ?key=) extract and redact safely', () => {
+  assert.equal(
+    extractApiKey({ headers: { 'x-goog-api-key': 'sk-kin-gem-123' }, url: '/v1beta/models' }),
+    'sk-kin-gem-123',
+  )
+  assert.equal(extractApiKey({ headers: { 'x-goog-api-key': 'kin-panel-secret' }, url: '/v1beta/models' }), '')
+  assert.equal(
+    extractApiKey({
+      headers: {},
+      url: '/v1beta/models/gemini-2.5-pro:generateContent?key=sk-kin-query-456&alt=sse',
+    }),
+    'sk-kin-query-456',
+  )
+  assert.equal(extractApiKey({ headers: {}, url: '/v1beta/models?key=kin-panel-secret' }), '')
+  // Query parameter ?key= is scoped strictly to /v1beta/models endpoints.
+  assert.equal(extractApiKey({ headers: {}, url: '/v1/chat/completions?key=sk-kin-query-456' }), '')
+  assert.equal(extractApiKey({ headers: {}, url: '/api/panel/gemini?key=sk-kin-query-456' }), '')
+  const redacted = redactSecrets({ url: '/v1beta/models?key=my-secret-gemini-key&alt=sse' })
+  assert.doesNotMatch(redacted, /my-secret-gemini-key/)
+  assert.match(redacted, /key=\*\*\*REDACTED\*\*\*/)
+})
+
+test('Google account verification ineligibility returns 403 without tripping circuit breaker', async () => {
+  const tracker = makeCircuitTracker()
+  const scheduler = createGeminiScheduler({
+    callHost: async (op) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-verify',
+              proxy_id: 'proxy-1',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-3-flash'],
+              capabilities: [...NATIVE_TUI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') return { id: 'env-verify', proxy_id: 'proxy-1', auth_method: 'oauth' }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: async () =>
+      sseResponse([JSON.stringify({ code: 'gemini_account_verification_required' })], {
+        statusCode: 403,
+        contentType: 'application/json',
+      }),
+    resolveProxy: () => 'socks5h://1.2.3.4:1080',
+    poolScheduler: tracker,
+  })
+  const handler = createGeminiPublicHandler({ json: jsonResponder, readBody: async () => ({}), scheduler })
+  const res = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1/chat/completions',
+      body: { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hello' }] },
+    }),
+    res,
+  )
+  assert.equal(res.statusCode, 403)
+  assert.equal(res.jsonBody().error.code, 'gemini_account_verification_required')
+  assert.equal(tracker.calls.failure.length, 0)
+  assert.equal(tracker.calls.probe.length, 1)
+})
+
+test('Gemini public ports support /v1 native generateContent, single-model GET, /v1/models ?key= auth, and CORS headers', async () => {
+  assert.match(CORS_ALLOW_HEADERS, /x-goog-api-key/)
+  assert.match(CORS_ALLOW_HEADERS, /x-goog-api-client/)
+
+  assert.equal(extractApiKey({ headers: {}, url: '/v1/models?key=sk-vm-query-v1' }), 'sk-vm-query-v1')
+  assert.equal(
+    extractApiKey({
+      headers: {},
+      url: '/v1/models/gemini-4-neon-low:generateContent?key=sk-vm-query-gen',
+    }),
+    'sk-vm-query-gen',
+  )
+  assert.equal(extractApiKey({ headers: {}, url: '/v1/models?key=kin-panel-secret' }), '')
+  assert.equal(extractApiKey({ headers: {}, url: '/v1/chat/completions?key=sk-vm-nope' }), '')
+
+  assert.equal(isGeminiPublicPath('/v1/models/gemini-4-neon-low:generateContent'), true)
+  assert.equal(isGeminiPublicPath('/v1/models/gemini-4-neon-low:streamGenerateContent'), true)
+  assert.equal(isGeminiPublicPath('/v1beta/models/gemini-4-neon-low'), true)
+  assert.equal(isGeminiPublicPath('/v1/models'), false)
+  assert.equal(isGeminiPublicPath('/v1/models/gemini-4-neon-low'), false)
+  assert.equal(geminiKeyAllowsPath('/v1/models/gemini-4-neon-low', 'GET'), true)
+  assert.equal(geminiKeyAllowsPath('/v1beta/models/gemini-4-neon-low', 'GET'), true)
+  assert.equal(geminiKeyAllowsPath('/v1/models/gemini-4-neon-low:generateContent', 'POST'), true)
+  assert.deepEqual(parseGeminiGeneratePath('/v1/models/gemini-4-neon-low:streamGenerateContent'), {
+    version: 'v1',
+    model: 'gemini-4-neon-low',
+    action: 'streamGenerateContent',
+    stream: true,
+  })
+  assert.deepEqual(parseGeminiModelGetPath('/v1beta/models/gemini-4-neon-low'), {
+    version: 'v1beta',
+    model: 'gemini-4-neon-low',
+  })
+
+  const scheduler = createGeminiScheduler({
+    callHost: async (op) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-key',
+              proxy_id: 'proxy-1',
+              auth_state: 'authorized',
+              auth_method: 'api_key',
+              models_discovered: true,
+              models: ['gemini-4-neon-low'],
+              capabilities: [...FULL_GEMINI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') return { id: 'env-key', proxy_id: 'proxy-1', auth_method: 'api_key' }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: async () =>
+      sseResponse([
+        `data: ${JSON.stringify({
+          candidates: [{ content: { role: 'model', parts: [{ text: 'v1-ok' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, totalTokenCount: 7 },
+        })}\n\n`,
+      ]),
+    resolveProxy: () => 'socks5h://1.2.3.4:1080',
+  })
+  const handler = createGeminiPublicHandler({ json: jsonResponder, readBody: async () => ({}), scheduler })
+
+  const resMetaBeta = makeRes()
+  await handler(makeReq({ method: 'GET', url: '/v1beta/models/gemini-4-neon-low' }), resMetaBeta)
+  assert.equal(resMetaBeta.statusCode, 200)
+  assert.deepEqual(resMetaBeta.jsonBody(), {
+    name: 'models/gemini-4-neon-low',
+    baseModelId: 'gemini-4-neon-low',
+    displayName: 'gemini-4-neon-low',
+    supportedGenerationMethods: ['generateContent', 'streamGenerateContent'],
+  })
+
+  const resMetaV1 = makeRes()
+  await handler(makeReq({ method: 'GET', url: '/v1/models/gemini-4-neon-low' }), resMetaV1)
+  assert.equal(resMetaV1.statusCode, 200)
+  assert.equal(resMetaV1.jsonBody().id, 'gemini-4-neon-low')
+
+  const resMissing = makeRes()
+  await handler(makeReq({ method: 'GET', url: '/v1beta/models/no-such-model' }), resMissing)
+  assert.equal(resMissing.statusCode, 404)
+  assert.equal(resMissing.jsonBody().error.status, 'NOT_FOUND')
+
+  const resGenV1 = makeRes()
+  await handler(
+    makeReq({
+      method: 'POST',
+      url: '/v1/models/gemini-4-neon-low:generateContent',
+      body: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+    }),
+    resGenV1,
+  )
+  assert.equal(resGenV1.statusCode, 200)
+  assert.equal(resGenV1.jsonBody().candidates[0].content.parts[0].text, 'v1-ok')
 })

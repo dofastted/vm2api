@@ -6,7 +6,24 @@ import { consumeClaudeSSEData } from '../protocol/convert.mjs'
 import { isCompleteAssistantMessage, mapUpstreamError } from '../core/errors.mjs'
 import { isContentPolicyErrorCode } from '../core/refusal-guard.mjs'
 import { forwardApi, readApiJson } from '../transport/api-kernel-client.mjs'
-import { messagesUrl, normalizeProtocol, resolvePreset, responsesUrl, upstreamAuthHeaders } from './api-presets.mjs'
+import {
+  geminiGenerateUrl,
+  messagesUrl,
+  normalizeProtocol,
+  resolvePreset,
+  responsesUrl,
+  upstreamAuthHeaders,
+} from './api-presets.mjs'
+import {
+  buildGeminiRequest,
+  createGeminiCollector,
+  createGeminiEventDecoder,
+  createGeminiProtocolStreamEncoder,
+  createSseFrameSplitter,
+  formatGeminiProtocolStreamError,
+  parseInboundToGemini,
+  renderGeminiProtocolResponse,
+} from '../protocol/gemini-convert.mjs'
 import { claudeToOpenAIResponsesRequest } from './api-openai.mjs'
 import {
   assembleCodexBodyFromSse,
@@ -299,9 +316,8 @@ export async function runApiInference({
   redactionPrincipal = '',
   redactionSession = '',
 } = {}) {
-  const canonical = officialMessagesBody(convertedBody)
-  const model = canonical.model
-  const picked = selected || scheduler.pick(model)
+  const requestedModel = convertedBody?.model || inbound?.model || ''
+  const picked = selected || scheduler.pick(requestedModel)
   if (!picked.ok) {
     return {
       ok: false,
@@ -316,6 +332,45 @@ export async function runApiInference({
   const protocolKind = normalizeProtocol(picked.endpoint.protocol || preset.protocol, preset.kind)
   const extraHeaders = joinHeaderMap(picked.endpoint.headers)
   const isOpenAI = protocolKind === 'openai'
+  const isGemini = protocolKind === 'gemini'
+  if (isGemini) {
+    if (requestContext) {
+      return {
+        ok: false,
+        status: 400,
+        terminalState: 'rejected',
+        body: {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            code: 'classifier_model_incompatible',
+            message: 'Classifier requests require the selected Anthropic model without endpoint model substitution.',
+          },
+        },
+      }
+    }
+    return await runGeminiApiInference({
+      req,
+      res,
+      cfg,
+      scheduler,
+      picked,
+      store,
+      preset,
+      extraHeaders,
+      protocol,
+      inbound,
+      clientStream,
+      deliveryMode,
+      signal,
+      timeoutMs,
+      converters,
+      routing,
+      redactionPrincipal,
+      redactionSession,
+    })
+  }
+  const canonical = officialMessagesBody(convertedBody)
   if (requestContext && (isOpenAI || picked.upstream_model !== canonical.model)) {
     return {
       ok: false,
@@ -806,6 +861,309 @@ async function runOpenAIResponsesUpstream({
     terminalState: completed ? 'verified' : committed ? 'incomplete' : 'rejected',
     committed,
     ...timing.snapshot(),
+  }
+}
+
+function geminiProtocolOf(protocol) {
+  switch (protocol) {
+    case 'google.gemini':
+      return 'gemini'
+    case 'anthropic.messages':
+      return 'anthropic'
+    case 'openai.chat':
+      return 'openai-chat'
+    case 'openai.responses':
+      return 'openai-responses'
+    default:
+      return null
+  }
+}
+
+async function runGeminiApiInference({
+  req,
+  res,
+  cfg,
+  scheduler,
+  picked,
+  store,
+  preset,
+  extraHeaders,
+  protocol,
+  inbound,
+  clientStream,
+  deliveryMode,
+  signal,
+  timeoutMs,
+  converters,
+  routing,
+  redactionPrincipal,
+  redactionSession,
+}) {
+  const geminiProto = geminiProtocolOf(protocol)
+  if (!geminiProto) {
+    return {
+      ok: false,
+      status: 400,
+      via: 'api-kernel',
+      body: {
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          code: 'gemini_unsupported_protocol',
+          message: `Unsupported inbound protocol for Gemini API endpoint: ${String(protocol)}`,
+        },
+      },
+      terminalState: 'rejected',
+    }
+  }
+
+  let parsed
+  try {
+    parsed = parseInboundToGemini(geminiProto, inbound, {
+      routeModel: picked.requested_model || inbound?.model || picked.upstream_model,
+      routeStream: clientStream,
+      headers: req?.headers || {},
+    })
+  } catch (error) {
+    return {
+      ok: false,
+      status: Number.isInteger(error?.status) ? error.status : 400,
+      via: 'api-kernel',
+      body: {
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          code: error?.code || 'gemini_invalid_request',
+          message: String(error?.message || 'Invalid Gemini request.'),
+        },
+      },
+      terminalState: 'rejected',
+    }
+  }
+
+  let body = buildGeminiRequest({ ...parsed, model: picked.upstream_model }, { target: 'gemini' })
+  const redactionState = await ensureRedaction(routing || {}, { projectRoot: cfg?.paths?.project })
+  const redaction = redactionState.enabled
+    ? { principal: redactionPrincipal, session: redactionSession, maxBodyBytes: redactionState.maxBodyBytes }
+    : null
+  if (redaction) body = await maskJson(body, redaction)
+
+  const authHeaders = upstreamAuthHeaders('gemini', picked.key.api_key, {
+    ...extraHeaders,
+    auth_scheme: picked.endpoint.auth_scheme || extraHeaders.auth_scheme || extraHeaders.anthropic_apikey_auth_scheme,
+  })
+  const headers = {
+    'content-type': 'application/json',
+    accept: 'text/event-stream',
+    ...authHeaders,
+  }
+
+  const timing = createStreamTiming()
+  const dialVersion = async (version) =>
+    await forwardApi({
+      cfg,
+      url: geminiGenerateUrl(preset.base_url, picked.upstream_model, { stream: true, version }),
+      headers,
+      body,
+      proxyUrl: picked.key.proxy_url,
+      signal,
+      timeoutMs,
+    })
+
+  let upstream
+  try {
+    upstream = await dialVersion('v1beta')
+    const ct = String(upstream.headers?.['content-type'] || '').toLowerCase()
+    if (upstream.statusCode === 404 || upstream.statusCode === 405 || ct.includes('text/html')) {
+      try {
+        upstream.resume?.()
+      } catch {}
+      upstream = await dialVersion('v1')
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      status: 502,
+      via: 'api-kernel',
+      body: {
+        type: 'error',
+        error: {
+          type: 'api_error',
+          code: error.code || 'api_kernel_transport',
+          message: String(error.message || error).slice(0, 300),
+        },
+      },
+      terminalState: 'transport_error',
+      transportError: true,
+    }
+  }
+
+  const status = Number(upstream.statusCode) || 502
+  if (status === 429 && !picked.endpoint.disable_cooling) {
+    const retry = Number(upstream.headers?.['retry-after'] || 30)
+    const until = new Date(Date.now() + Math.max(1, retry) * 1000).toISOString()
+    try {
+      store.setKeyCooldown(picked.key.id, until)
+    } catch {}
+    scheduler.reload(store.listRaw())
+  }
+
+  const resultBase = {
+    ok: status >= 200 && status < 300,
+    status,
+    upstreamStatus: status,
+    via: 'api-kernel',
+    vmId: null,
+    accountId: picked.key.id,
+    endpointId: picked.endpoint.id,
+    model: picked.upstream_model,
+    headers: { ...(upstream.headers || {}) },
+  }
+
+  if (status >= 400) {
+    const payload = await readApiJson(upstream).catch(() => ({}))
+    const isJson = payload != null && typeof payload === 'object'
+    const message = isJson ? payload?.error?.message || payload?.message || `upstream ${status}` : `upstream ${status}`
+    const upstreamCode = isJson ? String(payload?.error?.code || payload?.code || '').trim() : ''
+    const contentCode = isContentPolicyErrorCode(upstreamCode) ? upstreamCode.toLowerCase() : ''
+    return {
+      ...resultBase,
+      ok: false,
+      body: {
+        type: 'error',
+        error: {
+          ...(contentCode ? { code: contentCode } : {}),
+          type: 'api_error',
+          message: String(message).slice(0, 300),
+        },
+      },
+      upstreamError: {
+        code: upstreamCode || null,
+        type: isJson ? payload?.error?.type || null : null,
+        message: String(message),
+      },
+      terminalState: 'rejected',
+    }
+  }
+
+  const inboundModel = picked.requested_model || inbound?.model || picked.upstream_model
+  const decoder = createGeminiEventDecoder({ fallbackModel: inboundModel })
+  const collector = createGeminiCollector({ fallbackModel: inboundModel })
+  const encoder = clientStream ? createGeminiProtocolStreamEncoder(geminiProto, { model: inboundModel }) : null
+  let streamError = null
+  let committed = false
+  let sawFirstByte = false
+  const emit = (event) => {
+    collector.push(event)
+    if (event.kind === 'error' && !streamError) {
+      streamError = event
+      return
+    }
+    if (event.kind === 'text' || event.kind === 'thinking' || event.kind === 'tool_call' || event.kind === 'image') {
+      timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, Date.now())
+    }
+    if (!clientStream || !encoder) return
+    const chunk = encoder.push(event)
+    if (!chunk) return
+    if (!res.headersSent) converters.writeSSEHeaders(res)
+    committed = true
+    res.write(chunk)
+  }
+  const splitter = createSseFrameSplitter((frame) => {
+    decoder.decodeSseFrame(frame, emit)
+  })
+  for await (const chunk of upstream) {
+    if (!sawFirstByte) {
+      sawFirstByte = true
+      timing.observe(null, Date.now())
+    }
+    const piece = redaction ? await restoreSseLine(chunk.toString('utf8'), redaction) : chunk
+    splitter.push(piece)
+  }
+  splitter.flush()
+
+  const collected = collector.result()
+  const usage = collected.usage
+    ? {
+        input_tokens: collected.usage.input_tokens || 0,
+        output_tokens: collected.usage.output_tokens || 0,
+        ...(collected.usage.cache_read_tokens ? { cache_read_input_tokens: collected.usage.cache_read_tokens } : {}),
+        ...(collected.usage.reasoning_tokens ? { reasoning_tokens: collected.usage.reasoning_tokens } : {}),
+      }
+    : null
+
+  if (streamError) {
+    const errStatus =
+      Number(streamError.status) >= 400 && Number(streamError.status) < 600 ? Number(streamError.status) : 502
+    const errCode = streamError.code || 'gemini_inference_failed'
+    const errMsg = streamError.message || 'Gemini stream error'
+    if (clientStream && res.headersSent) {
+      try {
+        res.write(formatGeminiProtocolStreamError(geminiProto, errStatus, errCode, errMsg))
+      } catch {}
+    }
+    return {
+      ...resultBase,
+      ...timing.snapshot(),
+      ok: false,
+      status: errStatus,
+      body: { type: 'error', error: { type: 'api_error', code: errCode, message: errMsg } },
+      usage,
+      committed,
+      terminalState: committed ? 'incomplete' : 'rejected',
+    }
+  }
+
+  const hasContent = Boolean(
+    collected.sawFinish || collected.text || collected.toolCalls.length || collected.images.length,
+  )
+  if (!hasContent) {
+    return {
+      ...resultBase,
+      ...timing.snapshot(),
+      ok: false,
+      status: 502,
+      body: {
+        type: 'error',
+        error: {
+          type: 'api_error',
+          code: 'gemini_inference_invalid_output',
+          message: 'Empty Gemini upstream response.',
+        },
+      },
+      usage,
+      committed,
+      terminalState: committed ? 'incomplete' : 'rejected',
+    }
+  }
+
+  if (clientStream) {
+    const tail = encoder.finish()
+    if (tail) {
+      if (!res.headersSent) converters.writeSSEHeaders(res)
+      committed = true
+      res.write(tail)
+    }
+    return {
+      ...resultBase,
+      ...timing.snapshot(),
+      ok: resultBase.ok && (deliveryMode !== 'verified' || collected.sawFinish || committed),
+      usage,
+      stopReason: collected.stopReason || 'end_turn',
+      committed,
+      terminalState: collected.sawFinish ? 'verified' : committed ? 'incomplete' : 'rejected',
+    }
+  }
+
+  return {
+    ...resultBase,
+    ...timing.snapshot(),
+    ok: true,
+    body: renderGeminiProtocolResponse(geminiProto, collected, { model: inboundModel }),
+    usage,
+    stopReason: collected.stopReason || 'end_turn',
+    committed: true,
+    terminalState: 'verified',
   }
 }
 

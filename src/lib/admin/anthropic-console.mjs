@@ -5,8 +5,15 @@
  * endpoint picker (priority, prefix, alias, key round-robin) and that key's proxy.
  * The browser never dials upstream.
  */
-import { normalizeAuthScheme, AUTH_SCHEME_BEARER, AUTH_SCHEME_X_API_KEY } from '../oauth/auth-scheme.mjs'
 import {
+  normalizeAuthScheme,
+  AUTH_SCHEME_BEARER,
+  AUTH_SCHEME_GOOG_API_KEY,
+  AUTH_SCHEME_X_API_KEY,
+} from '../oauth/auth-scheme.mjs'
+import {
+  GEMINI_OFFICIAL_URL,
+  geminiGenerateUrl,
   messagesUrl,
   responsesUrl,
   OPENAI_OFFICIAL_URL,
@@ -160,22 +167,32 @@ export function buildAnthropicConsoleRequest(input = {}, picked = null, proxyPoo
 
   const endpoint = scheduled ? picked.endpoint : null
   const protocol = (scheduled ? endpoint.protocol : input.protocol) || 'anthropic'
-  if (!['anthropic', 'openai'].includes(protocol)) {
+  if (!['anthropic', 'openai', 'gemini'].includes(protocol)) {
     throw Object.assign(new Error('不支持的 API 协议'), { code: 'invalid_protocol', status: 400 })
   }
   const openai = protocol === 'openai'
+  const gemini = protocol === 'gemini'
   const key = scheduled ? String(picked.key?.api_key || '').trim() : String(input.api_key || input.apiKey || '').trim()
   if (!key) {
     throw Object.assign(new Error('先填 API key'), { code: 'api_key_required', status: 400 })
   }
-  const scheme =
-    (openai
-      ? AUTH_SCHEME_BEARER
-      : normalizeAuthScheme(scheduled ? endpoint.auth_scheme : input.auth_scheme || input.authScheme)) ||
-    AUTH_SCHEME_X_API_KEY
+  const explicitScheme = normalizeAuthScheme(scheduled ? endpoint.auth_scheme : input.auth_scheme || input.authScheme)
+  const scheme = openai
+    ? AUTH_SCHEME_BEARER
+    : gemini
+      ? explicitScheme || AUTH_SCHEME_GOOG_API_KEY
+      : explicitScheme === AUTH_SCHEME_BEARER
+        ? AUTH_SCHEME_BEARER
+        : AUTH_SCHEME_X_API_KEY
   const baseUrl = scheduled
     ? endpoint.base_url
-    : input.base_url || input.baseUrl || (openai ? OPENAI_OFFICIAL_URL : ANTHROPIC_CONSOLE_URL)
+    : input.base_url ||
+      input.baseUrl ||
+      (openai ? OPENAI_OFFICIAL_URL : gemini ? GEMINI_OFFICIAL_URL : ANTHROPIC_CONSOLE_URL)
+  const trimmedBase = trimBaseUrl(baseUrl)
+  if (!/^https?:\/\//i.test(trimmedBase)) {
+    throw Object.assign(new Error('地址必须是 http 或 https'), { code: 'invalid_base_url', status: 400 })
+  }
   const proxyUrl = scheduled
     ? anthropicProxyUrl(picked.key?.proxy_url)
     : resolveConsoleProxyUrl(proxyPool, input.proxy_id || input.proxyId)
@@ -185,24 +202,33 @@ export function buildAnthropicConsoleRequest(input = {}, picked = null, proxyPoo
     accept: 'application/json',
     ...upstreamAuthHeaders(protocol, key, { ...extra, auth_scheme: scheme }),
   }
-  const messageUrl = anthropicMessagesUrl(baseUrl)
 
   return {
     method: 'POST',
-    url: openai ? responsesUrl(baseUrl) : messageUrl,
+    url: openai
+      ? responsesUrl(trimmedBase)
+      : gemini
+        ? geminiGenerateUrl(trimmedBase, model, { stream: false, version: 'v1beta' })
+        : anthropicMessagesUrl(trimmedBase),
+    fallbackUrl: gemini ? geminiGenerateUrl(trimmedBase, model, { stream: false, version: 'v1' }) : null,
     headers,
-    body: {
-      model,
-      ...(openai
-        ? { max_output_tokens: maxTokens, input: message, stream: false }
-        : { max_tokens: maxTokens, messages: [{ role: 'user', content: message }] }),
-    },
+    body: gemini
+      ? {
+          contents: [{ role: 'user', parts: [{ text: message }] }],
+          generationConfig: { maxOutputTokens: maxTokens },
+        }
+      : {
+          model,
+          ...(openai
+            ? { max_output_tokens: maxTokens, input: message, stream: false }
+            : { max_tokens: maxTokens, messages: [{ role: 'user', content: message }] }),
+        },
     proxyUrl,
     timeoutMs: ANTHROPIC_CONSOLE_TIMEOUT_MS,
     meta: {
       mode: scheduled ? 'scheduled' : 'direct',
       protocol,
-      auth_scheme: scheme === AUTH_SCHEME_BEARER ? AUTH_SCHEME_BEARER : AUTH_SCHEME_X_API_KEY,
+      auth_scheme: scheme,
       endpoint_id: endpoint?.id || null,
       endpoint_name: endpoint?.name || null,
       key_id: scheduled ? picked.key?.id || null : null,
@@ -222,17 +248,32 @@ function textFromContent(content) {
     .join('')
 }
 
+function textFromGeminiCandidates(candidates) {
+  if (!Array.isArray(candidates)) return ''
+  return candidates
+    .flatMap((c) => (Array.isArray(c?.content?.parts) ? c.content.parts : []))
+    .filter((p) => p && !p.thought && typeof p.text === 'string')
+    .map((p) => p.text)
+    .join('')
+}
+
 export function anthropicConsoleResult(upstream, meta) {
   const status = Number(upstream?.statusCode) || 502
   return readApiJson(upstream).then((payload) => {
-    const body = payload && typeof payload === 'object' ? payload : { raw: String(payload ?? '') }
+    const isJson = payload != null && typeof payload === 'object'
+    const body = isJson ? payload : { raw: String(payload ?? '') }
     const message = body?.error?.message || body?.message || ''
+    const ok = status >= 200 && status < 300 && isJson
     return {
-      ok: status >= 200 && status < 300,
+      ok,
       status,
       text:
-        textFromContent(body?.content) || (body?.output || []).map((item) => textFromContent(item?.content)).join(''),
-      error: status >= 400 ? String(message || `上游返回 ${status}`).slice(0, 500) : '',
+        textFromContent(body?.content) ||
+        (body?.output || []).map((item) => textFromContent(item?.content)).join('') ||
+        textFromGeminiCandidates(body?.candidates),
+      error: !ok
+        ? String(message || (!isJson ? `上游返回非 JSON 响应（HTTP ${status}）` : `上游返回 ${status}`)).slice(0, 500)
+        : '',
       body,
       ...meta,
     }
@@ -240,23 +281,40 @@ export function anthropicConsoleResult(upstream, meta) {
 }
 
 async function forwardConsoleRequest(request, { cfg, forward }) {
-  try {
-    const upstream = await forward({
-      cfg,
-      method: request.method,
-      url: request.url,
-      headers: request.headers,
-      body: request.body,
-      proxyUrl: request.proxyUrl,
-      timeoutMs: request.timeoutMs,
-    })
-    return anthropicConsoleResult(upstream, request.meta)
-  } catch (error) {
-    throw Object.assign(new Error(String(error?.message || error).slice(0, 300)), {
-      code: error?.code || 'api_kernel_transport',
-      status: 502,
-    })
+  const sendOne = async (url) => {
+    try {
+      const upstream = await forward({
+        cfg,
+        method: request.method,
+        url,
+        headers: request.headers,
+        body: request.body,
+        proxyUrl: request.proxyUrl,
+        timeoutMs: request.timeoutMs,
+      })
+      return await anthropicConsoleResult(upstream, request.meta)
+    } catch (error) {
+      throw Object.assign(new Error(String(error?.message || error).slice(0, 300)), {
+        code: error?.code || 'api_kernel_transport',
+        status: 502,
+      })
+    }
   }
+  const primary = await sendOne(request.url)
+  const v1betaBlocked =
+    request.fallbackUrl &&
+    !primary.ok &&
+    (primary.status === 404 || primary.status === 405 || typeof primary.body?.raw === 'string')
+  if (!v1betaBlocked) return primary
+  const fallback = await sendOne(request.fallbackUrl)
+  if (fallback.ok) return fallback
+  if (fallback.status === 404 || fallback.status === 405 || typeof fallback.body?.raw === 'string') {
+    return {
+      ...primary,
+      error: `原生 Gemini 端点（/v1beta 与 /v1）均未返回有效响应（HTTP ${primary.status} / ${fallback.status}），请检查反代是否转发 /v1beta/ 或升级上游网关`,
+    }
+  }
+  return fallback
 }
 
 export async function runAnthropicConsole({

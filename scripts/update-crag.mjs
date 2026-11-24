@@ -40,11 +40,26 @@ function records(root) {
 }
 
 export function cragUpdateInventory(root, routing) {
-  return records(root).map((vm) => {
+  const vms = records(root)
+  const targetArch = cragTargetArch(root)
+  const activeArchs = new Set([targetArch])
+  for (const vm of vms) {
+    if (
+      !isCodexVm(vm) &&
+      !vm.node_id &&
+      resolveKernelDataplane(vm, routing) === 'crag' &&
+      resolveCragKernelVersion(vm, routing) === 'v2'
+    ) {
+      const arch = cragSlotArch(root, vm)
+      if (arch && arch !== 'darwin') activeArchs.add(arch)
+    }
+  }
+  return vms.map((vm) => {
     const active =
       !isCodexVm(vm) && resolveKernelDataplane(vm, routing) === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
     const installed = path.join(root, 'vms', vm.id, 'cli-home/.kin/crag-v2')
-    const cached = !isCodexVm(vm) && !vm.node_id && fs.existsSync(installed)
+    const slotArch = !isCodexVm(vm) && !vm.node_id ? cragSlotArch(root, vm) : ''
+    const cached = Boolean(slotArch && slotArch !== 'darwin' && activeArchs.has(slotArch) && fs.existsSync(installed))
     return { vm, installed, action: active ? 'sync' : cached ? 'cache' : 'skip' }
   })
 }
@@ -94,16 +109,45 @@ export async function updateCrag(
     const pulled = await pull(root, { kernel: 'crag', tag, latest: true })
     if (!pulled.ok) throw new Error(pulled.code || 'crag_pull_failed')
     const targetArch = cragTargetArch(root)
-    const src = cragV2PackageRoot(root, targetArch)
-    const verified = verifyCragV2Tree(src, { arch: targetArch })
-    if (!verified.ok) throw new Error(verified.code)
-    const manifest = fs.readFileSync(path.join(src, 'manifest.json'))
-    const expectedCore = verified.manifest.payload.plaintext_sha256
-    const matchingTree = (dir, vm) =>
-      matchingCragTree(dir, manifest, {
-        verify: (treeDir) => verifyCragV2Tree(treeDir, { arch: vm ? cragSlotArch(root, vm) : targetArch }),
+    const extraArchs = new Set()
+    for (const { vm, action } of inventory) {
+      if (action !== 'sync' || vm.node_id) continue
+      const slotArch = cragSlotArch(root, vm)
+      if (slotArch && slotArch !== 'darwin' && slotArch !== targetArch) extraArchs.add(slotArch)
+    }
+    const pinnedTag = pulled.release?.tag || tag
+    for (const arch of extraArchs) {
+      const extraPulled = await pull(root, { kernel: 'crag', tag: pinnedTag, latest: !pinnedTag }, { arch })
+      if (!extraPulled.ok) throw new Error(extraPulled.code || 'crag_pull_failed')
+    }
+    const packagesByArch = new Map()
+    const packageForArch = (arch) => {
+      const resolvedArch = arch || targetArch
+      if (packagesByArch.has(resolvedArch)) return packagesByArch.get(resolvedArch)
+      const pkgSrc = cragV2PackageRoot(root, resolvedArch)
+      const pkgVerified = verifyCragV2Tree(pkgSrc, { arch: resolvedArch })
+      if (!pkgVerified.ok) throw new Error(pkgVerified.code)
+      const pkg = {
+        src: pkgSrc,
+        manifest: fs.readFileSync(path.join(pkgSrc, 'manifest.json')),
+        expectedCore: pkgVerified.manifest.payload.plaintext_sha256,
+      }
+      packagesByArch.set(resolvedArch, pkg)
+      return pkg
+    }
+    const primaryPkg = packageForArch(targetArch)
+    const { manifest } = primaryPkg
+    const matchingTree = (dir, vm) => {
+      const slotArch = vm ? cragSlotArch(root, vm) : targetArch
+      const pkg = packageForArch(slotArch)
+      return matchingCragTree(dir, pkg.manifest, {
+        verify: (treeDir) => verifyCragV2Tree(treeDir, { arch: slotArch }),
       })
-    const matchingCore = (hashes) => hashes.length === 1 && hashes[0] === expectedCore
+    }
+    const matchingCore = (hashes, vm) => {
+      const expectedCore = packageForArch(vm ? cragSlotArch(root, vm) : targetArch).expectedCore
+      return hashes.length === 1 && hashes[0] === expectedCore
+    }
 
     const targets = []
     for (const { vm, action, installed } of inventory) {
@@ -111,7 +155,7 @@ export async function updateCrag(
       if (
         !vm.node_id &&
         matchingTree(installed, vm) &&
-        (vm.status === 'stopped' || (vm.status === 'running' && matchingCore(await coreHashes(vm))))
+        (vm.status === 'stopped' || (vm.status === 'running' && matchingCore(await coreHashes(vm), vm)))
       )
         continue
       targets.push({ id: vm.id, kernel: 'crag' })
@@ -157,7 +201,8 @@ export async function updateCrag(
       const status = result?.status ?? vm.status
       const item = { id: vm.id, action, status, node_id: vm.node_id || null, ok: true }
       const slotArch = cragSlotArch(root, vm)
-      if (action === 'cache' && !matchingTree(installed, vm)) refreshCachedPackage(src, installed, slotArch)
+      if (action === 'cache' && !matchingTree(installed, vm))
+        refreshCachedPackage(packageForArch(slotArch).src, installed, slotArch)
       if (action !== 'skip' && !vm.node_id && !matchingTree(installed, vm))
         throw new Error(`crag_installed_hash_mismatch:${vm.id}`)
       if (action === 'sync' && vm.node_id) {
@@ -165,6 +210,7 @@ export async function updateCrag(
       } else if (action === 'sync' && status === 'running') {
         const current = JSON.parse(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`), 'utf8'))
         if (current.node_id) throw new Error(`crag_inventory_changed:${vm.id}`)
+        const expectedCore = packageForArch(slotArch).expectedCore
         const core = await waitForCragCore(current, expectedCore, { coreHashes, sleep: delay, ...coreWait })
         if (!core.ok) throw new Error(`${core.code}:${vm.id}`)
         if (!(await cragSlotHealthy(slotExec(root, current), { health })))

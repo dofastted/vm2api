@@ -5,8 +5,6 @@ import test from 'node:test'
 import {
   clusterCragContainerReady,
   clusterDockerCommandReady,
-  clusterFingerprintBinds,
-  hasClusterFingerprintBinds,
   slotContainerBody,
 } from '../../src/lib/cluster/remote-slot.mjs'
 import { hasClusterSubscriptionBinds } from '../../src/lib/cluster/crag-subscription-files.mjs'
@@ -98,7 +96,8 @@ function fixture({
   removeFails = false,
   cragReady = false,
   subscription = false,
-  fingerprintBinds = true,
+  computerRequired = false,
+  computerBinds = true,
   cpuWrapped = false,
 } = {}) {
   const calls = []
@@ -116,11 +115,7 @@ function fixture({
       Labels: { 'kin.vm.layout': '2' },
       ...(kvmEnv ? { Env: kvmEnv } : {}),
     },
-    HostConfig: {
-      NetworkMode: 'network',
-      RestartPolicy: { Name: 'unless-stopped' },
-      ...(kind === 'docker' && fingerprintBinds ? { Binds: clusterFingerprintBinds('/fixture') } : {}),
-    },
+    HostConfig: { NetworkMode: 'network', RestartPolicy: { Name: 'unless-stopped' } },
     State: { Running: running, Restarting: restarting },
   }
   let info = missing
@@ -141,7 +136,7 @@ function fixture({
     },
     prepare: async () => ({
       nodeId: target.node_id,
-      session: { docker: {}, client: {} },
+      session: { docker: {}, client: {}, host: { uid: 1000 } },
       image: 'image',
       user: 'fixture',
       remoteDir: '/fixture',
@@ -194,9 +189,11 @@ function fixture({
     resolveKernelDataplane: (vm) => vm?.dataplane || 'kernel',
     projectCragUniversalVm: async () => {},
     readCragClusterSubscription: () => subscription,
-    hasClusterFingerprintBinds,
     hasClusterSubscriptionBinds,
     publishClusterSubscription: async () => calls.push('publish-subscription'),
+    clusterComputerPolicy: () => ({ computer: computerRequired, required: computerRequired }),
+    hasClusterComputerBinds: () => computerBinds,
+    pushClusterComputer: async () => computerRequired,
   }
   const fns = vmContext.runInNewContext(
     `${restartPolicy}; ${start.replace('export ', '')}; ${reload.replace('export ', '')}; ({ startRemoteSlot, reloadRemoteSlot })`,
@@ -211,67 +208,21 @@ function fixture({
   }
 }
 
-test('cluster Docker slotContainerBody mounts /etc/kin-computer and /etc/kin-dmi; legacy containers recreate on start and reload', async () => {
-  const body = slotContainerBody(
-    { id: 'vm-cluster-fp', node_id: 'node-a', dataplane: 'crag', crag_kernel_version: 'v2' },
-    {
-      image: 'fixture',
-      network: 'fixture',
-      remoteDir: '/remote/vms/vm-cluster-fp',
-      user: '10001:987',
-      routing: {},
-    },
-  )
-  assert.deepEqual(clusterFingerprintBinds('/remote/vms/vm-cluster-fp'), [
-    '/remote/vms/vm-cluster-fp/fingerprint:/var/lib/kin-persona:ro',
-    '/remote/vms/vm-cluster-fp/fingerprint/system/etc/hostname:/etc/hostname:ro',
-    '/remote/vms/vm-cluster-fp/fingerprint/system/etc/kin-computer:/etc/kin-computer:ro',
-    '/remote/vms/vm-cluster-fp/fingerprint/system/dmi/id:/etc/kin-dmi:ro',
-    '/remote/vms/vm-cluster-fp/fingerprint/system/hardware:/etc/kin-hardware:ro',
-  ])
-  for (const expected of clusterFingerprintBinds('/remote/vms/vm-cluster-fp')) {
-    assert.ok(body.HostConfig.Binds.includes(expected), `missing bind ${expected}`)
-  }
-  assert.equal(hasClusterFingerprintBinds(body, '/remote/vms/vm-cluster-fp'), true)
-  assert.equal(hasClusterFingerprintBinds({ HostConfig: { Binds: [] } }, '/remote/vms/vm-cluster-fp'), false)
-  assert.equal(
-    hasClusterFingerprintBinds({
-      Mounts: [
-        { Source: '/remote/vms/vm-cluster-fp/fingerprint', Destination: '/var/lib/kin-persona', RW: false },
-        {
-          Source: '/remote/vms/vm-cluster-fp/fingerprint/system/etc/hostname',
-          Destination: '/etc/hostname',
-          RW: false,
-        },
-        {
-          Source: '/remote/vms/vm-cluster-fp/fingerprint/system/etc/kin-computer',
-          Destination: '/etc/kin-computer',
-          RW: false,
-        },
-        { Source: '/remote/vms/vm-cluster-fp/fingerprint/system/dmi/id', Destination: '/etc/kin-dmi', RW: false },
-        {
-          Source: '/remote/vms/vm-cluster-fp/fingerprint/system/hardware',
-          Destination: '/etc/kin-hardware',
-          RW: false,
-        },
-      ],
-    }),
-    true,
-  )
-
-  const legacyStart = fixture({ cragReady: true, fingerprintBinds: false })
+test('a telemetry-on cluster Docker slot without computer binds is recreated on start and reload; telemetry-off is left alone', async () => {
+  const legacyStart = fixture({ cragReady: true, computerRequired: true, computerBinds: false })
   legacyStart.target.dataplane = 'crag'
   assert.equal((await legacyStart.boot()).action, 'created')
   assert.deepEqual(legacyStart.calls, ['remove', 'files', 'create', 'start', 'runtime'])
 
-  const legacyReload = fixture({ cragReady: true, fingerprintBinds: false })
+  const legacyReload = fixture({ cragReady: true, computerRequired: true, computerBinds: false })
   legacyReload.target.dataplane = 'crag'
   assert.equal((await legacyReload.reload()).action, 'created')
   assert.deepEqual(legacyReload.calls, ['remove', 'files', 'create', 'start', 'runtime'])
 
-  const kvmStart = fixture({ kind: 'kvm', fingerprintBinds: false })
-  assert.equal((await kvmStart.boot()).action, 'already-running')
-  assert.deepEqual(kvmStart.calls, ['runtime'])
+  const telemetryOff = fixture({ cragReady: true, computerBinds: false })
+  telemetryOff.target.dataplane = 'crag'
+  assert.equal((await telemetryOff.boot()).action, 'already-running')
+  assert.deepEqual(telemetryOff.calls, ['disable-autorestart', 'runtime'])
 })
 
 test('a subscribed cluster Docker slot replaces the old container before starting with read-only license mounts', async () => {

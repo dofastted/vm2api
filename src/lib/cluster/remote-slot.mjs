@@ -113,6 +113,7 @@ import {
   vmNodeId,
 } from './placement.mjs'
 import { openSftp, readRemoteFileNoFollow, runRemote, shellQuote, writeRemoteFile } from './remote-fs.mjs'
+import { stripSlotCredentialEmailBytes } from '../oauth/oauth-credentials.mjs'
 
 import {
   pushCragSlot,
@@ -129,6 +130,13 @@ import {
   hasClusterSubscriptionBinds,
   publishClusterSubscription,
 } from './crag-subscription-files.mjs'
+import {
+  clusterComputerBinds,
+  hasClusterComputerBinds,
+  hasLocalComputer,
+  pushClusterComputer,
+} from './slot-computer-files.mjs'
+import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 
 const CRAG_V2_SECCOMP = JSON.stringify(
   JSON.parse(fs.readFileSync(new URL('../vm/crag-v2-seccomp.json', import.meta.url), 'utf8')),
@@ -160,48 +168,6 @@ export function clusterCragContainerReady(info) {
   if (info?.HostConfig?.Init !== true) return false
   const opts = info?.HostConfig?.SecurityOpt || []
   return opts.some((opt) => String(opt).startsWith('seccomp=')) && opts.includes('apparmor=unconfined')
-}
-
-const FINGERPRINT_MOUNT_SPECS = Object.freeze([
-  ['', '/var/lib/kin-persona'],
-  ['/system/etc/hostname', '/etc/hostname'],
-  ['/system/etc/kin-computer', '/etc/kin-computer'],
-  ['/system/dmi/id', '/etc/kin-dmi'],
-  ['/system/hardware', '/etc/kin-hardware'],
-])
-
-export function clusterFingerprintBinds(remoteDir) {
-  return FINGERPRINT_MOUNT_SPECS.map(([suffix, dest]) => `${remoteDir}/fingerprint${suffix}:${dest}:ro`)
-}
-
-export function hasClusterFingerprintBinds(container, remoteDir = '') {
-  if (remoteDir) {
-    const binds = container?.HostConfig?.Binds || []
-    if (clusterFingerprintBinds(remoteDir).every((bind) => binds.includes(bind))) return true
-  }
-  if (Array.isArray(container?.Mounts) && container.Mounts.length > 0) {
-    return FINGERPRINT_MOUNT_SPECS.every(([suffix, dest]) =>
-      container.Mounts.some(
-        (mount) =>
-          mount.Destination === dest &&
-          mount.RW === false &&
-          (remoteDir
-            ? mount.Source === `${remoteDir}/fingerprint${suffix}`
-            : String(mount.Source || '').endsWith(`/fingerprint${suffix}`)),
-      ),
-    )
-  }
-  const binds = container?.HostConfig?.Binds || []
-  return FINGERPRINT_MOUNT_SPECS.every(([suffix, dest]) =>
-    binds.some((bind) => {
-      const parts = String(bind || '').split(':')
-      return (
-        parts[1] === dest &&
-        parts[2] === 'ro' &&
-        (remoteDir ? parts[0] === `${remoteDir}/fingerprint${suffix}` : parts[0].endsWith(`/fingerprint${suffix}`))
-      )
-    }),
-  )
 }
 
 function failure(err, fallbackCode = 'remote_slot_failed') {
@@ -431,7 +397,10 @@ async function migrateClaudeDir(session, vm, remoteDir) {
   const old = await readRemoteFileNoFollow(session.client, `${remoteDir}/${cred}`).catch(() => null)
   if (!old?.length) return
   const owner = session.host.uid === 0 ? remoteSlotOwner(session.host, vm) : null
-  await writeRemoteFile(await openSftp(session.client), dest, old, { mode: 0o600, owner })
+  await writeRemoteFile(await openSftp(session.client), dest, stripSlotCredentialEmailBytes(old).data, {
+    mode: 0o600,
+    owner,
+  })
 }
 
 /** iptables plan → one shell script; mirrors egress.mjs applyIptables (-N tolerant, -C guards the next row). */
@@ -1262,7 +1231,7 @@ function kvmSlotContainerBody(vm, { image, network, ip = '', remoteDir, routing,
 
 export function slotContainerBody(
   vm,
-  { image, network, ip = '', remoteDir, user, routing, accel, subscription = false },
+  { image, network, ip = '', remoteDir, user, routing, accel, subscription = false, computer = false },
 ) {
   if (isKvmRuntime(vm))
     return kvmSlotContainerBody(vm, { image, network, ip, remoteDir, routing, accel, slotUser: user })
@@ -1310,8 +1279,9 @@ export function slotContainerBody(
         `${remoteDir}/machine-id:/etc/machine-id:ro`,
         `${remoteDir}/machine-id:/var/lib/dbus/machine-id:ro`,
         `${remoteDir}/slot-bin:${LIVE_BIN}:ro`,
-        ...clusterFingerprintBinds(remoteDir),
         ...(subscription ? clusterSubscriptionBinds(remoteDir) : []),
+        // Same read-only computer identity a local Docker slot gets (computerDockerArgs).
+        ...(computer ? clusterComputerBinds(remoteDir) : []),
       ],
       NetworkMode: network,
       RestartPolicy: { Name: remoteSlotRestartPolicy(vm, routing) },
@@ -1704,6 +1674,18 @@ export async function syncRemoteSlotRestartPolicy(vm, routing) {
   }
 }
 
+/**
+ * Docker slots get the control plane's computer identity bound read-only, like a
+ * local slot. A running container only has to be recreated for it when telemetry
+ * is on for that slot (the kernel refuses telemetry without it); otherwise the
+ * binds are added the next time the container is created anyway.
+ */
+export function clusterComputerPolicy(projectRoot, vm) {
+  const computer = !isKvmRuntime(vm) && !isCodexVm(vm) && hasLocalComputer(projectRoot, vm)
+  const required = computer && isTelemetryEnabled(defaultSeedPolicy(vm.seed_policy || {}))
+  return { computer, required }
+}
+
 /** Remote twin of startVmRuntime. Running + same image/network is left alone (Node restart must not bounce slots). */
 export async function startRemoteSlot(vm, projectRoot, opts = {}) {
   const { recreate = false, pinnedImageId = null } = opts
@@ -1723,6 +1705,7 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
     const kvm = isKvmRuntime(vm)
     const crag = !kvm && resolveKernelDataplane(vm, routing) === 'crag'
     const subscription = crag && !!readCragClusterSubscription(projectRoot, vm)
+    const computerPolicy = clusterComputerPolicy(projectRoot, vm)
     let accel = vm.runtime?.accel
     if (kvm && accel !== 'kvm' && accel !== 'tcg') {
       const probe = await probeRemoteAccel(session, routing)
@@ -1755,8 +1738,8 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
       runtimeLabelOf(existing) === runtimeKind(vm) &&
       codexRoleMatches(existing, vm) &&
       clusterDockerCommandReady(vm, existing, routing) &&
-      (kvm || hasClusterFingerprintBinds(existing, remoteDir)) &&
       (!subscription || hasClusterSubscriptionBinds(existing, remoteDir)) &&
+      (!computerPolicy.required || hasClusterComputerBinds(existing, remoteDir)) &&
       // Running stays true during Docker restart-policy backoff. Recreate the
       // loop just like the local runtime; otherwise watchdog revival is a no-op.
       !existing.State?.Restarting &&
@@ -1792,6 +1775,12 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
     ensureGuestMachineIdFile(projectRoot, vm)
     await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
     if (subscription) await publishClusterSubscription(projectRoot, vm, session, { force: true })
+    const computer =
+      computerPolicy.computer &&
+      (await pushClusterComputer(projectRoot, vm, session, {
+        remoteDir,
+        owner: session.host.uid === 0 ? remoteSlotOwner(session.host, vm) : null,
+      }))
     if (!existing) await migrateClaudeDir(session, vm, remoteDir)
     if (kvm) {
       await runRemote(
@@ -1815,6 +1804,7 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
           routing,
           accel,
           subscription,
+          computer,
         }),
       )
       action = 'created'
@@ -1864,8 +1854,8 @@ async function reloadRemoteSlotAdmitted(vm, projectRoot, { routing }) {
       runtimeLabelOf(existing) !== runtimeKind(vm) ||
       !codexRoleMatches(existing, vm) ||
       !clusterDockerCommandReady(vm, existing, routing) ||
-      (!isKvmRuntime(vm) && !hasClusterFingerprintBinds(existing, remoteDir)) ||
-      (subscription && !hasClusterSubscriptionBinds(existing, remoteDir))
+      (subscription && !hasClusterSubscriptionBinds(existing, remoteDir)) ||
+      (clusterComputerPolicy(projectRoot, vm).required && !hasClusterComputerBinds(existing, remoteDir))
     ) {
       return startRemoteSlotAdmitted(vm, projectRoot, { recreate: !!existing, routing })
     }

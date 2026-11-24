@@ -5,8 +5,8 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 ## 默认安装与激活
 
 1. 在有 `systemd` 的 Linux amd64 宿主运行一键安装或升级。Ubuntu 24.04 等 apt 宿主会自动补齐缺少的 `nodejs`、`python3` 和 Gemini 网络、沙箱工具；其他发行版请按安装器提示准备依赖。安装器按 [`deploy/payload.json`](../deploy/payload.json) 下载固定的 CRAGGemini 运行产物和公钥，再直接从 Google 下载 `agy 1.5.9`。校验大小、SHA-256 和 Ed25519 签名后，原子安装到 `share/gemini/current`。默认路径无需手工下载、放公钥或创建兑换校验文件。
-2. 面板显示「已安装，等待兑换」后，在「导入 → Gemini → 兑换 CRAGGemini」或「订阅 CRAG」输入 `CGG1-…`。激活绑定到宿主安装的清单；错误码不会解锁，服务重启保留激活。明文码不入库、不持久化。激活不代替 Google 授权，也不会自动把账号加入调度。
-3. Google OAuth 和交互终端还需要 `ip`、`nft`、`setpriv`、支持非特权用户命名空间的 `bwrap`、`openvt`（kbd）、vm2api 自带的 `kin-egress`、IPv4 转发和绑定的 SOCKS5 代理。OAuth 推理依赖可分配的 Linux 虚拟控制台；预留服务配置中的 UID/GID 区间与 `198.18.252.0/27`，不要为此开放直连或调整全局转发策略。
+2. 面板显示「已安装，等待兑换」或进入订阅模式后，可在「订阅 CRAG」或「导入 → Gemini」兑换宿主级叠加凭证 `CRAGR1.…`（兑换后在环境「账号」页绑定/释放 CRAGGemini 席位），或兼容旧版清单兑换码 `CGG1-…`。激活绑定到宿主安装或宿主标识；错误码不会解锁，服务重启保留激活。明文码不入库、不持久化。激活不代替 Google 授权，也不会自动把账号加入调度。
+3. Google OAuth、常驻推理和交互终端还需要 `ip`、`nft`、`setpriv`、支持非特权用户命名空间的 `bwrap`、vm2api 自带的 `kin-egress`、IPv4 转发和绑定的 SOCKS5 代理；交互终端（及回退 TUI 启动路径）还需 `openvt`（kbd）和可分配的 Linux 虚拟控制台。常驻 OAuth 推理采用 CRAGGemini 进程池模式（按环境 `max_concurrency` 分配独立 PTY 槽位并共享同一隔离网络命名空间租约），不再每回合抢占宿主虚拟控制台；预留服务配置中的 UID/GID 区间与 `198.18.252.0/27`，不要为此开放直连或调整全局转发策略。
 4. 安装器不覆盖已有载荷（包括旧 `rc.1`），也不覆盖 `/etc/vm2api` 的手工信任设置。自管载荷仍可使用 `prepare-gemini --gemini-payload-source DIR`，并在 `/etc/vm2api/gemini-ed25519.pub` 配置该载荷的受信公钥；已有手工兑换校验配置仍适用。载荷源目录及其父路径须由 root 所有且不可由非 root 写入，不可放在 `/tmp`。
 5. `--no-start` 跳过服务及准备。Gemini 失败不阻断控制面安装或升级。「设置 → Gemini」集中显示宿主状态、诊断、安装/修复、推理环境恢复、CLI/CRAGGemini 兼容版本更新与回滚；操作由独立 root 维护服务执行。缺少维护组件时，页面会提示先在宿主初始化，不能以网页按钮绕过权限。自定义安装目录可用 `sudo bash /path/to/vm2api/deploy/install.sh prepare-gemini --dir /path/to/vm2api`。安装目录只由宿主管理员选择，不从维护 API 接收。详见 [维护与版本管理](gemini-maintenance.md)。独立 Node 网关须具备 `vm2api` 组权限；Docker 部署使用更新后的两个 socket 目录挂载。
 6. 第 2 步的授权码在发行机对已签名、已解包的载荷签发：
@@ -26,9 +26,9 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 - **Antigravity Tools 账号文件**：在「导入 → Gemini」选择一个账号 JSON 文件、填写环境名称并绑定平台代理。面板只发送访问令牌及其 Unix 秒过期时间；不上传刷新令牌、账号名或配额快照。宿主经该代理向 Google 验证账号身份和 Code Assist 权限，成功后才保存凭据并显示账号、模型与额度。过期后重新进行 Google 授权；此方式不启用 OAuth 推理。
 - **Gemini API Key**：经绑定代理调用 Google 模型列表验证凭据，再以仅宿主服务可读的权限保存。模型列表不是推理验收；该凭据通道不返回账号邮箱、订阅或按模型使用配额。
 - **虚拟机 → Gemini → 详情 → 代理**：可查看、测通或换绑 IPv4 SOCKS5。测通请求只检查能否经绑定代理连接 Google，不发送账号凭据。换绑会清除已有模型和账号数据快照，不删除登录；授权、CLI 终端或测试运行时不得换绑。
-- **详情 → 测试**：先拉取模型，再选择模型发送单条纯文本。OAuth 使用隔离的官方 `agy models` 发现模型；推理时为该回合启动 CRAGGemini 原生 worker，并在空闲 Linux VT 上启动同一私有 HOME 中的 `agy` TUI，由 `LD_PRELOAD` 原生输入桥接收请求、经 worker 返回 Gemini SSE。API Key 只把目录中声明支持 `generateContent` 的模型加入测试列表，并直接调用 Google `generateContent`。请求只用当前账号及绑定代理，不切换账号、不回落直连。测试不计入 vm2api 密钥扣费，但可能消耗 Google 侧用量；真实 VT/TUI 验收需要 Linux amd64 宿主。
-- 各种导入方式都在 VM 页显示环境、代理绑定、授权状态、载荷版本和可读取的数据。「刷新数据」经绑定代理读取 Google 响应：OAuth 按可用权限读取账号、项目、订阅、模型、配额及 Credits，API Key 读取模型。展开 OAuth 账号可看共享额度的 5 小时和每周窗口、使用比例、剩余比例和重置时间；共享窗口未返回仍可看逐模型额度。两类读数不叠加，未返回比例不显示为零，旧数据标明读取失败后的快照时间。额度和 Credits 不代表本地调用量或费用。凭据失效时需重新授权或导入；尚未启用 OAuth 自动续票。宿主服务的状态目录不纳入 VM 包或面板备份。
-- OAuth 授权、拉取模型和推理是不同检查。Google 若拒绝当前账号所在地区的 Antigravity 调用，测试返回 `gemini_location_unsupported`，不会触发重新授权、换号或换代理；不要把有模型列表当作推理就绪。
+- **详情 → 测试**：先拉取模型，再选择模型发送单条纯文本测试。OAuth 使用隔离的官方 `agy models` 发现模型；推理时复用或自动预热该环境的 CRAGGemini 常驻进程池（同一私有 HOME 与绑定代理命名空间内的 `craggemini --pool-size` 及各槽位 `agy` 实例），经 `LD_PRELOAD` 原生输入桥接收请求并返回 Gemini SSE。API Key 只把目录中声明支持 `generateContent` 的模型加入测试列表，并直接调用 Google `generateContent`。请求只用当前账号及绑定代理，不切换账号、不回落直连。测试不计入 vm2api 密钥扣费，但可能消耗 Google 侧用量。
+- 各种导入方式都在 VM 页显示环境、代理绑定、授权状态、载荷版本和可读取的数据。「刷新数据」经绑定代理读取 Google 响应：OAuth 按可用权限读取账号、项目、订阅、模型、配额及 Credits，API Key 读取模型。展开 OAuth 账号可看共享额度的 5 小时和每周窗口、使用比例、剩余比例和重置时间；共享窗口未返回仍可看逐模型额度。两类读数不叠加，未返回比例不显示为零，旧数据标明读取失败后的快照时间。额度和 Credits 不代表本地调用量或费用。持有 `refresh_token` 的官方 OAuth 环境在过期前支持经绑定代理自动续票；仅含短期 `access_token` 的导入文件或刷新被上游拒绝时仍需重新授权。宿主服务的状态目录不纳入 VM 包或面板备份。
+- OAuth 授权、拉取模型和推理是不同检查。Google 若拒绝当前账号的地区或资格，测试与网关会按上游诊断返回 `gemini_location_unsupported`、`gemini_account_verification_required` 或 `gemini_account_ineligible`，不会触发自动换号或换代理；不要把有模型列表当作推理就绪。
 - 可使用非 root 账号运行 `bash test/deploy/gemini-host-egress-smoke.sh /absolute/path/kin-egress`，在一次性 Linux 命名空间用 `iptables` 模拟 Docker 的默认转发丢弃策略，检查选定 SOCKS5 的透明转发、转发器退出后失败和网络清理。该测试不访问 Google 或主机代理池。
 - 有签名产物时，可在带 Node 和 Python 的一次性 Linux amd64 容器内以 root 运行 `bash test/deploy/gemini-host-install-smoke.sh /path/to/signed-payload /path/to/public-key`。断网烟测覆盖验签、传统手工安装、默认预装后锁定、拒绝无效兑换码和激活重启持久化。
 - 原生 worker 和 `agy` 必须在同一个沙箱 PID 命名空间和 `/proc` 内运行，以便 worker 用 Unix socket 对端 PID 核对 `agy` 的控制台与二进制摘要。可在有空闲 VT、装有 `openvt`、`bwrap`、`setpriv` 的一次性 Linux amd64 客机内断网运行 `sudo python3 -B test/deploy/gemini-host-native-launch-smoke.py /path/to/verified-payload`，验证真实 launcher 握手及模拟上游回合完成。
@@ -39,9 +39,9 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 
 管理员创建的 Gemini 专用密钥可以通过 `GET /v1/models` 查询模型，并使用已授权且已拉取该模型的 Google OAuth 环境。协议入口包括 OpenAI Chat Completions、OpenAI Responses、Anthropic Messages、Google `generateContent` / `streamGenerateContent`，以及兼容旧客户端的 `/v1/gemini/sessions/:id`。
 
-当前原生适配只接受每回合一条纯文本 user 输入；system、历史对话、工具、多模态及 Gemini generation settings 会明确拒绝。CRAGGemini 原生 worker 内部使用 SSE，但面向 JSON 请求的公开协议先等完整回合后再生成对应 JSON；流式端点以 SSE 帧返回完整回合，不承诺首 token 延迟流式。Google API 错误和 OpenAI/Anthropic 错误按各自协议形状映射。
+公开网关的原生适配支持多轮对话历史、`systemInstruction`（系统指令）、函数工具声明与工具结果（`tools` / `toolConfig`）、常用生成参数（`generationConfig`）以及内联多模态输入（请求体上限 12 MiB）；超出 `NATIVE_CAPABILITIES` 范围的字段仍会明确拒绝，不静默丢弃。CRAGGemini 原生 worker 内部使用 SSE：面向 JSON 请求的公开协议收齐完整回合后再组装对应 JSON，流式端点按上游 SSE 帧转发。Google API 错误和 OpenAI/Anthropic 错误按各自协议形状映射。
 
-OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进入复用的 `PoolScheduler` 账号平衡、in-flight 并发预留和 unit-circuit 状态。每个环境同时只接受一个原生回合；繁忙时在其他符合模型和代理条件的环境中选择。一次回合一旦由 CRAGGemini host 接受，后续推理失败不自动重放到另一账号；客户端应按错误码决定是否重试。每个环境使用自身已绑定 SOCKS5 与独立网络命名空间；模型白名单及 Gemini API key 限额照常执行。
+OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进入复用的 `PoolScheduler` 账号平衡、in-flight 并发预留和 unit-circuit 状态。每个环境支持配置 `max_concurrency`（`1–64`，默认 `1`），达到本环境并发上限时在其他符合模型和代理条件的环境中选择。一次回合一旦由 CRAGGemini host 接受，后续推理失败不自动重放到另一账号；客户端应按错误码决定是否重试。每个环境使用自身已绑定 SOCKS5 与独立网络命名空间；模型白名单及 Gemini API key 限额照常执行。
 
 ### 管理员诊断接口
 
@@ -49,6 +49,7 @@ OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进�
 
 | 方法与路径                  | 请求                                                 | 响应                                                                    |
 | --------------------------- | ---------------------------------------------------- | ----------------------------------------------------------------------- |
+| `PUT /concurrency`          | `{max_concurrency}`，`1–64` 整数                     | 环境视图，含更新后的 `max_concurrency`                                  |
 | `POST /proxy/probe`         | 无                                                   | `ok`、`latency_ms`，失败附 `code`                                       |
 | `PUT /proxy`                | `{proxy_id}`                                         | 环境视图                                                                |
 | `POST /models`              | 无                                                   | 环境视图，含 `models` 和 `models_discovered`                            |
@@ -65,7 +66,7 @@ OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进�
 | 入口与额度 | Gemini 会话使用独立入口，不与 Claude、Codex 或 API 直连混合调度。额度按共享组展示 5 小时和每周窗口，逐模型读数单列。 |
 | 协议适配   | 请求先归一化再派发到官方 `agy` 的原生桥，只接受桥明确支持的字段与能力。                                              |
 
-内部适配器 [`native-turn.mjs`](../src/lib/gemini/native-turn.mjs) 把 Gemini `streamGenerateContent` 请求体、Anthropic Messages、OpenAI Chat Completions 和 Responses 的单条文本输入收敛为 `{ request_id, stream: true, body: { model, contents } }`，保留文本顺序和空白。由受信服务端选定固定模型和每回合独立的 `kernel.sock`，经 `/internal/v1/messages` 调用 CRAGGemini worker；worker 的 `native.sock` 与 `LD_PRELOAD` 桥接到 `agy` TUI 原生输入队列。历史由原生会话持有，不接收外部历史、系统指令、工具、生成参数、多模态或非流式选项；不支持的字段明确拒绝，不静默丢弃。适配器保留原生 Gemini SSE，不把首个 HTTP 200 当作回合成功，也不自动重试。
+公开网关经协议转换层 [`gemini-convert.mjs`](../src/lib/protocol/gemini-convert.mjs) 将 Gemini `generateContent` / `streamGenerateContent` 请求体、Anthropic Messages、OpenAI Chat Completions 和 Responses 统一转换为 Gemini 请求结构（含 `model`、`contents` 及可选 `systemInstruction`、`tools`、`toolConfig`、`generationConfig`），再由宿主 [`gemini-host.py`](../scripts/gemini-host.py) 校验并组装 `{ request_id, stream: true, body }` 发往目标环境常驻 CRAGGemini 池的 `kernel.sock`（`/internal/v1/messages`），由对应槽位的 `agy` 实例经 `LD_PRELOAD` 原生桥执行（早期单轮纯文本辅助模块 [`native-turn.mjs`](../src/lib/gemini/native-turn.mjs) 仍保留最小信封回归契约）。不支持的字段明确拒绝，不静默丢弃；宿主保留原生 Gemini SSE，不把首个 HTTP 200 当作回合成功，也不自动重试。
 
 宿主解析 Gemini SSE 时同时接受顶层 `candidates`／`usageMetadata` 和 Code Assist 的 `response` 包装；无有效结束帧仍按失败处理。Unix socket 回归覆盖包装帧的文本、结束原因与用量。CRAGGemini 独立 worker 的真实 OAuth 验证不等于 vm2api 验收：还需将含 Code Assist 捕获修复的签名载荷接入 vm2api，再从网关端发起真实 OAuth 回合。
 
@@ -77,9 +78,9 @@ OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进�
 
 原生 OAuth 回合复用该环境已经完成官方 CLI 登录的私有 HOME，保留 CLI 的 onboarding、项目状态及令牌刷新；仅复制 token 到全新 HOME 不等价于复用登录环境。每回合仍有独立工作目录、原生 socket 和请求身份，并通过 CLI 的仅会话 `--settings` 保持严格工具权限及禁用额外 Credits。主题预览里的 `compilation failed` 是示例文案，不能据此判断运行故障。
 
-对已选中环境的失败回合，调度器必须保留宿主错误码；`gemini_location_unsupported` 应返回 HTTP 403，并释放半开熔断探针而不记为基础设施失败。排查公网 `503 gemini_host_unavailable` 时应单独跟踪该请求，不能仅凭另一回合的地区拒绝日志归因。
+对已选中环境的失败回合，调度器必须保留宿主错误码；`gemini_location_unsupported`、`gemini_account_verification_required` 和 `gemini_account_ineligible` 返回 HTTP 403，并释放半开熔断探针而不记为基础设施失败。排查公网 `503 gemini_host_unavailable` 时应单独跟踪该请求，不能仅凭另一回合的资格拒绝日志归因。
 
-原生 CLI 通过 `--log-file` 写入当前回合私有目录的 FIFO，不写入或读取共享 profile 的 `cli.log`。每回合有独立排空线程，每批最多读取 64 KiB，单行最多保留 4 KiB；不依赖同步宿主请求循环，避免另一条请求阻塞时卡住 CLI 日志写入。线程只保留 `server_oauth.go` 明确地区资格拒绝的固定错误码 `gemini_location_unsupported`；未知、超长或跨回合文本不用于归因，原始日志不落盘、不返回客户端。失败终态最多等待 250 ms 获取已经排入 FIFO 的诊断快照；清理时停止并等待线程退出，再回收描述符，避免与 fd 复用竞争。已完成的模型结果优先；否则本回合白名单诊断优先于通用错误。
+原生 CLI 通过 `--log-file` 写入私有目录的 FIFO，不写入或读取共享 profile 的 `cli.log`。独立排空线程每批最多读取 64 KiB，单行最多保留 4 KiB；不依赖同步宿主请求循环，避免另一条请求阻塞时卡住 CLI 日志写入。线程按固定规则提取结构化 `EligibilityDiagnostic`（地区受限 `gemini_location_unsupported`、需浏览器核验 `gemini_account_verification_required` 及可选 `accounts.google.com` 验证链接、账号无资格 `gemini_account_ineligible`）；未知、超长或跨环境文本不用于归因，原始日志不落盘、不返回客户端。失败终态最多等待 250 ms 获取已经排入 FIFO 的诊断快照；清理时停止并等待线程退出，再回收描述符，避免与 fd 复用竞争。已完成的模型结果优先；否则白名单诊断优先于通用错误。
 
 在一次性 Linux amd64 环境、禁止外部网络的条件下，运行 `sudo python3 -B test/deploy/gemini-host-native-launch-smoke.py PAYLOAD_DIR --fifo-backpressure`。它把 FIFO 缩至 4 KiB，使用固定官方 CLI、`openvt`、`bwrap` 和 loopback 上游，并阻塞真实宿主 HTTP 请求；原生 fixture 回合必须在该请求释放前完成。单元联测另覆盖 256 KiB 日志突发、线程停止、资格错误到公开 HTTP 403 及探针释放；这些测试不代表生产 OAuth 推理已经验收。
 

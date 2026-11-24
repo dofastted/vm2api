@@ -10,6 +10,8 @@ import { Download, LifeBuoy, Link2, RefreshCw } from 'lucide-react'
 import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
 import {
   geminiAccountStatus,
+  geminiEligibilityNotice,
+  geminiInferenceErrorAction,
   geminiInferenceErrorLabel,
 } from '@/lib/gemini-account-status'
 import { tierVisual } from '@/lib/tier-visual'
@@ -126,51 +128,85 @@ export function BladeControls({
   )
 }
 
-export function GeminiSlotStatus({ vm }: { vm: Vm }) {
+/**
+ * Gemini 槽位状态。表格行（`inline`）只占一行，与普通槽的调度列等高；
+ * 卡片里固定两行：总状态 + 模型/授权，最近推理或唯一一条警示。
+ * 完整证据放在悬停提示里，不再逐条铺开。
+ */
+export function GeminiSlotStatus({
+  vm,
+  inline = false,
+}: {
+  vm: Vm
+  inline?: boolean
+}) {
   const environment = vm.gemini
   if (!environment) return null
   const status = geminiAccountStatus(environment, vm.unschedulable_text)
   const { authorization, blocker, inference, lastInference, modelsLabel } =
     status
+  const notice = geminiEligibilityNotice(environment.account, lastInference)
+  const failed =
+    lastInference?.state === 'failed'
+      ? geminiInferenceErrorLabel(lastInference.error_code)
+      : null
+  const failureAction =
+    lastInference?.state === 'failed'
+      ? geminiInferenceErrorAction(lastInference.error_code)
+      : null
   const at = lastInference?.finished_at ?? lastInference?.started_at
-  const age = at ? fmtAgo(at) : ''
-  return (
-    <span className='grid min-w-0 gap-1 text-xs whitespace-normal text-muted-foreground'>
-      <span className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'>
-        <StatusMark variant='pill' tone={authorization} />
-        <span>{modelsLabel}</span>
-      </span>
-      {blocker ? (
-        <span className='text-[color:var(--status-caution)]'>{blocker}</span>
-      ) : environment.auth_state === 'authorized' ? (
-        <span className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'>
-          <span>候选条件已满足</span>
-          {status.tone.key === 'pending' ? (
-            <StatusMark variant='pill' tone={status.tone} />
-          ) : null}
-        </span>
-      ) : null}
+  const age = at ? fmtAgo(at) || at : ''
+  const run = lastInference
+    ? [lastInference.model, age].filter(Boolean).join(' · ')
+    : null
+  // 只露出一条警示：资格提示优先，其次最近一次失败原因。
+  const warn = notice?.label ?? failed
+  const aside = blocker ? authorization.text : modelsLabel
+  const title = [
+    authorization.text,
+    modelsLabel,
+    blocker ??
+      (environment.auth_state === 'authorized' ? '候选条件已满足' : null),
+    notice ? `${notice.label}：${notice.action}` : null,
+    [inference.text, run, failed].filter(Boolean).join(' · '),
+    failureAction,
+    '仅显示最近一次宿主推理，不代表公共 API 端到端验证',
+  ]
+    .filter(Boolean)
+    .join('\n')
+  const note = (text: string, className?: string) => (
+    <span
+      className={cn(
+        'min-w-0 truncate',
+        warn && text === warn && 'text-[color:var(--status-caution)]',
+        className
+      )}
+    >
+      {text}
+    </span>
+  )
+  if (inline) {
+    return (
       <span
-        className='flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1'
-        title='仅显示最近一次宿主推理，不代表公共 API 端到端验证'
+        className='flex min-w-0 items-center gap-[7px] text-[11.5px] text-muted-foreground'
+        title={title}
       >
-        {lastInference ? (
-          <>
-            <StatusMark variant='pill' tone={inference} />
-            <span className='min-w-0 break-all'>{lastInference.model}</span>
-            {at ? (
-              <time dateTime={at} title={at}>
-                {age || at}
-              </time>
-            ) : null}
-            {lastInference.state === 'failed' ? (
-              <span>{geminiInferenceErrorLabel(lastInference.error_code)}</span>
-            ) : null}
-          </>
-        ) : (
-          <span>{inference.text}</span>
-        )}
+        <StatusMark tone={status.tone} className='font-semibold' />
+        {note(warn ?? run ?? aside)}
       </span>
+    )
+  }
+  return (
+    <span
+      className='grid min-w-0 gap-1 text-xs text-muted-foreground'
+      title={title}
+    >
+      {/* 放不下时整段换到被裁掉的第二行，窄卡只留状态，不截成半个字。 */}
+      <span className='flex h-[22px] min-w-0 flex-wrap items-center gap-x-2 overflow-hidden'>
+        <StatusMark variant='pill' tone={status.tone} />
+        {note(aside, 'shrink-0')}
+      </span>
+      {note(warn ?? run ?? inference.text)}
     </span>
   )
 }

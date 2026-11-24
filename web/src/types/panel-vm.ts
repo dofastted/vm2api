@@ -258,6 +258,9 @@ export type SeatOccupant = {
   state: 'active' | 'held' | 'idle' | string
   inflight: number
   held_until?: number | null
+  subagents_running?: number
+  subagents_queued?: number
+  subagents_max?: number | null
 }
 
 export type ScheduleState = 'on' | 'off' | 'unschedulable' | 'restricted'
@@ -451,6 +454,12 @@ export type Vm = {
   /** Claude CLI native 执行位热准入上限，也是预调度的席位上限；内核固定预开 20。 */
   session_slots?: number | null
   session_slots_override?: boolean
+  /** Claude family mode root-session cap. */
+  max_primary_sessions?: number | null
+  max_primary_sessions_override?: boolean
+  /** null = family mode disabled, children keep their own seats. */
+  max_subagents_per_session?: number | null
+  max_subagents_per_session_override?: boolean
   /** 去掉本槽覆盖（PATCH 字段传 null）后会落回的值。 */
   scheduling_inherited?: VmSchedulingInherited | null
   /** 单槽位配额覆盖；缺字段 = 跟随全局 `settings/quota`。GPT 槽位恒为 null。 */
@@ -849,6 +858,8 @@ export type VmSchedulingInherited = {
   max_sessions?: number | null
   /** Codex 行为 null。 */
   session_slots: number | null
+  max_primary_sessions?: number | null
+  max_subagents_per_session?: number | null
 }
 
 export type OpenAIQuotaPolicy = {

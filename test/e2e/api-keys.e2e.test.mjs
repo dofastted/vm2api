@@ -148,7 +148,9 @@ test('Gemini keys persist, remain isolated and fail closed without the host serv
     })
     assert.equal(messages.status, 503, messages.text)
     assert.equal(messages.json.error.code, 'gemini_host_unavailable')
-    const isolated = await api(gw, 'POST', '/v1/chat/completions', { headers, body: {} })
+    // Must stay a path outside isGeminiSharedPath: a Gemini key legitimately
+    // reaches the shared OpenAI paths, so asserting the mismatch there is moot.
+    const isolated = await api(gw, 'POST', '/v1/completions', { headers, body: {} })
     assert.equal(isolated.status, 403, isolated.text)
     assert.equal(isolated.json.error.code, 'key_group_mismatch')
   } finally {

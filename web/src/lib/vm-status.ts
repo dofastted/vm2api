@@ -285,7 +285,11 @@ export function seatTitle(vm: Vm): string {
             : seat.state === 'held'
               ? '交接'
               : '占用'
-        return `#${Number(seat.index)} ${short || '—'} ${state}`
+        const children =
+          seat.subagents_max == null
+            ? ''
+            : ` 子代理 ${seat.subagents_running ?? 0}/${seat.subagents_max} 排队 ${seat.subagents_queued ?? 0}`
+        return `#${Number(seat.index)} ${short || '—'} ${state}${children}`
       })
     parts.push(labels.join(' · '))
   }

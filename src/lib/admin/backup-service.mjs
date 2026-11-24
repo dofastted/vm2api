@@ -61,6 +61,30 @@ export const DEFAULT_SCHEDULE = {
   retention: 7,
 }
 
+/** SIGTERM the tar processes this process spawned (Linux /proc; no-op elsewhere). Returns how many. */
+export function killChildArchivers({ pid = process.pid, proc = '/proc' } = {}) {
+  let entries = []
+  try {
+    entries = fs.readdirSync(proc)
+  } catch {
+    return 0
+  }
+  let n = 0
+  for (const e of entries) {
+    if (!/^\d+$/.test(e)) continue
+    try {
+      const stat = fs.readFileSync(path.join(proc, e, 'stat'), 'utf8')
+      const close = stat.lastIndexOf(')')
+      const comm = stat.slice(stat.indexOf('(') + 1, close)
+      const ppid = Number(stat.slice(close + 2).split(' ')[1])
+      if (ppid !== pid || comm !== 'tar') continue
+      process.kill(Number(e), 'SIGTERM')
+      n++
+    } catch {}
+  }
+  return n
+}
+
 export class BackupService {
   constructor({ dataDir, projectRoot, configDir, backupDir, tmpDir, checkIntervalMs = 10 * 60_000 } = {}) {
     this.dataDir = dataDir
@@ -194,6 +218,58 @@ export class BackupService {
     }
   }
 
+  /** True while a backup worker thread is alive; it can outlive abortRunning() while VACUUM INTO runs. */
+  get busy() {
+    return !!this._worker
+  }
+
+  /**
+   * Stop a backup in progress (blue/green handover, shutdown): the worker holds a minutes-long VACUUM +
+   * tar and keeps a draining controller alive. Its staging dir is removed by the next cleanStaging().
+   */
+  async abortRunning() {
+    const worker = this._worker
+    if (!worker) return false
+    // terminate() cannot interrupt the worker's synchronous spawnSync('tar'): stop the archiver first.
+    killChildArchivers()
+    await worker.terminate().catch(() => {})
+    return true
+  }
+
+  /**
+   * Remove staging dirs left by backups that never finished (process killed mid-run). Each is a full
+   * DB snapshot (tens of GB). Only the leader backs up, so at leader start none of them is live.
+   * The dirs are picked synchronously (a backup started right after is never among them) and removed
+   * off the main thread: unlinking a tens-of-GB file on ext4 blocks for seconds.
+   */
+  async cleanStaging() {
+    const stale = []
+    for (const base of new Set([process.env.KIN_BACKUP_TMPDIR, this.tmpDir].filter(Boolean))) {
+      let names = []
+      try {
+        names = fs.readdirSync(base)
+      } catch {
+        continue
+      }
+      for (const name of names) {
+        if (!/^kin-backup-[A-Za-z0-9]{6}$/.test(name)) continue
+        const dir = path.join(base, name)
+        try {
+          if (fs.lstatSync(dir).isDirectory()) stale.push(dir)
+        } catch {}
+      }
+    }
+    const removed = []
+    for (const dir of stale) {
+      try {
+        await fs.promises.rm(dir, { recursive: true, force: true })
+        removed.push(dir)
+      } catch {}
+    }
+    if (removed.length) console.log(`[backup] removed ${removed.length} unfinished staging dir(s)`)
+    return removed
+  }
+
   _runBackupWorker(job) {
     return new Promise((resolve, reject) => {
       const worker = new Worker(new URL('./backup-worker.mjs', import.meta.url), {
@@ -208,6 +284,7 @@ export class BackupService {
           job,
         },
       })
+      this._worker = worker
       let settled = false
       const finish = (fn, arg) => {
         if (settled) return
@@ -225,7 +302,9 @@ export class BackupService {
       })
       worker.once('error', (e) => finish(reject, e))
       worker.once('exit', (code) => {
-        if (code !== 0) finish(reject, new Error(`backup worker exited with code ${code}`))
+        if (this._worker === worker) this._worker = null
+        if (code !== 0) finish(reject, Object.assign(new Error(`backup worker exited with code ${code}`), { code: 'backup_aborted' }))
+        else finish(reject, new Error('backup worker exited without a result'))
       })
     })
   }

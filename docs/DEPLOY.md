@@ -253,11 +253,17 @@ location / {
 }
 ```
 
-`Connection ""` 会剥掉 Upgrade，终端或 Responses WS 握手拿不到 101。生产机的 Go 前门在 `:8787`、Node 在 `:8788` 时，上述两个 WebSocket location 必须 `proxy_pass` 到 Node。终端症状和核对命令见 [nginx-shell.md](nginx-shell.md)。
+`Connection ""` 会剥掉 Upgrade，终端或 Responses WS 握手拿不到 101。生产机的 Go 前门在 `:8787`、Node 在 `:8788` 时，上述两个 WebSocket location 必须 `proxy_pass` 到 Node；若自定义反代拆分了 API 路由而非统一 `location /`，还需将 `/v1beta/` 一并转发到网关，避免 Google Gemini SDK 请求落到静态页返回 405/HTML。终端症状和核对命令见 [nginx-shell.md](nginx-shell.md)。
 
 ## 本机 Node（备选）
 
 `npm run fetch:payload` 拉 `bin/kin-{kernel,codex-kernel,oauth-auth}` 与 `share/`；`npm run build:egress && npm run build:worker`；`npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`；以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
+
+## 不停服升级（蓝绿）
+
+普通升级要重启控制面，期间请求挂住、长流可能被砍。单机可以改用蓝绿：haproxy 在前，两个颜色轮流接班，切换约 1 秒、旧实例在后台跑完长流。见 [BLUEGREEN.md](BLUEGREEN.md)。
+
+切到蓝绿后，升级一律用 `deploy/bluegreen/bg-deploy.sh`：`install.sh` 只更新文件、不再 `compose up`；直接 `docker compose up -d` 起来的单容器会拒绝启动（`vm2api_bluegreen_install`）。
 
 ## 一键安装 / 更新
 

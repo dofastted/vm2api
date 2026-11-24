@@ -164,7 +164,12 @@ CRAG 2.8.16 没有该能力，旧槽保留 legacy 路径，不能将只更新 No
 | 设置 | 生效边界 |
 |---|---|
 | `pool.queue_max` | vm2api 全池等待上限，不复制成每个 CRAG worker 的队列深度。 |
+| `pool.max_subagents_per_session` | 每个根会话同时放行的子代理请求数, 整数 0-20. 缺省或 `null` 关闭家族模式, 子代理各占一个席位. 0 开启模式并让所有子代理等候. |
+| `pool.max_primary_sessions` | 家族模式下每台 Claude VM 的主会话席位上限, 整数 1-20. 缺省或 `null` 使用该 VM 的物理席位上限. 主会话和子代理执行时共同受物理执行位和账号并发约束. |
 | `pool.sticky_wait_timeout_ms` / `pool.fallback_wait_timeout_ms` | 分别约束粘性与全池等待阶段。送入 CRAG 的是当前阶段剩余额度，并受 `failover.total_retry_deadline_ms` 截止约束；无额度只尝试立即准入。worker 保留独立容量和队列深度上限，未下发等待额度时才使用启动配置的排队时限。 |
+| `pool.kernel_lease` | 内核槽租约，`off`（默认）/ `observe` / `enforce`。账本是网关每台 VM 的在途请求数（蓝绿重叠期含旧实例负载），容量取 CRAG 健康报告的 `runnable_capacity`（`min(slots_per_worker, memory_slot_capacity)`）；不报该字段的内核不受限。`observe` 只计数（日志 `[kernel-lease]`：`would-deny`、内核 slot_busy 时账本的判断、每分钟汇总），不改变调度。`enforce`：在途 ≥ 容量的 VM 不再准入，扫描换到有空槽的 VM 或在网关排队；内容派生席位（`cache_control` 哈希 / 指纹，无调用方 session）按请求各拿一个租约，原 VM 只用于排序；有 session 的对话仍留在原席位。 |
+| `pool.kernel_lease_queue_grace_ms` | `enforce` 下已拿到租约的请求在 CRAG 内的排队上限（默认 5000，`0` 不排队）。只覆盖上一个请求的进程还在退出的那一小段（实测 0.1～0.3s），超过仍满视为账本失步，内核直接返回，不吃掉重试预算。这个默认值依据的是 CRAG 3.1.12 的实测释放时间：**换内核版本后先把 `pool.kernel_lease` 退回 `observe`**，看一轮 `[kernel-lease]` 汇总里的失步计数正常再开回 `enforce`。 |
+| `failover.home_slot_busy_max_wait_ms` | `keep_session_home` 下原号内核 slot_busy 时，请求累计等到该时长后返回 529 `session_home_slot_busy`，不再重试到 `total_retry_deadline_ms`。`0`（默认）保持原行为。 |
 | `failover.session_queue_timeout_ms` | 同会话进入调度前的串行等待；`0` 不限时，不占号池等待队列或 worker 槽。 |
 | `KIN_UPSTREAM_TIMEOUT` / `failover.stream_idle_timeout_ms` | CRAG turn 的首个有效内容等待 / 后续内容间静默上限；HTTP 响应头、verified 完整交付和推理总时限是不同的计时点。已开始的 turn 保留原策略。 |
 | `sticky.ttl_seconds` | vm2api 的账号/VM 绑定记忆；已保存的绑定不会因改值而重写到期时间。 |

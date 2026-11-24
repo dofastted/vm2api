@@ -18,20 +18,48 @@ function sse(event, data) {
 }
 
 /** Anthropic streaming error. `type` is what clients branch on (`overloaded_error`, …). */
-export function buildAnthropicSseError(error = {}) {
+export function buildAnthropicSseError(error = {}, poolReason = null) {
   const body = {
     type: String(error.type || 'api_error'),
     message: String(error.message || 'An error occurred while processing the request'),
   }
   if (error.code) body.code = String(error.code)
+  if (error.code === ErrorCode.POOL_OVERLOADED && poolReason === 'subagent_limit') {
+    body.details = { reason: poolReason }
+  }
   return sse('error', { type: 'error', error: body })
+}
+
+const MID_STREAM_TRUNCATION_MSG_RE =
+  /Provider observation is incomplete|invalid native response stream|stream closed before message_stop|ended before a valid terminal event|Native provider response (?:is incomplete|ended before)/i
+
+const MID_STREAM_TRUNCATION_CODES = new Set([
+  'native_handoff_incomplete',
+  'upstream_stream_incomplete',
+  'stream_incomplete',
+])
+
+export function isRetryableMidStreamSseError(payload, mapped) {
+  const rawErr = payload?.error || payload || {}
+  const mappedErr = mapped?.body?.error
+  if (!mappedErr || mapped.status < 500 || mappedErr.type !== 'upstream_error') return false
+  const rawType = String(rawErr.type || '').toLowerCase()
+  const rawCode = String(rawErr.code || mappedErr.code || '').toLowerCase()
+  const rawMsg = String(rawErr.message || mappedErr.message || '')
+  if (/timeout/i.test(`${rawCode} ${rawType} ${rawMsg}`)) return false
+  if (rawType === 'capture_error') return true
+  if (MID_STREAM_TRUNCATION_CODES.has(rawCode)) return true
+  return MID_STREAM_TRUNCATION_MSG_RE.test(rawMsg)
 }
 
 /**
  * Remap upstream `event: error` SSE data lines through mapUpstreamError so
  * streaming Anthropic clients see the same taxonomy as non-streaming responses.
+ * Once a stream has already delivered `message_start`, transient mid-response
+ * capture/stream interruptions are remapped to a retryable `rate_limit_error`
+ * so Claude Code retries instead of ending the turn with mid-response disconnect.
  */
-export function createAnthropicSseErrorRemapper({ headers = {} } = {}) {
+export function createAnthropicSseErrorRemapper({ headers = {}, isStarted = null, onRetryableTruncation = null } = {}) {
   let pendingEvent = null
   return {
     remapLine(line) {
@@ -60,6 +88,18 @@ export function createAnthropicSseErrorRemapper({ headers = {} } = {}) {
       const err = mapped.body?.error
       if (!err) return line
       const suffix = text.slice(trimmed.length)
+      if (isStarted?.() === true && isRetryableMidStreamSseError(payload, mapped)) {
+        onRetryableTruncation?.(payload, mapped)
+        const data = JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            message: 'Upstream stream was interrupted mid-response; please retry',
+            ...(err.request_id ? { request_id: err.request_id } : {}),
+          },
+        })
+        return `data: ${data}${suffix || '\n'}`
+      }
       const data = JSON.stringify({
         type: 'error',
         error: {

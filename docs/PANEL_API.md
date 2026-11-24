@@ -113,7 +113,7 @@
 | POST | `/vms/:id/oauth/to-setup-token` | 把当前完整 OAuth 活票改成 Setup Token（保留 refresh/过期）。已是 setup-token 则幂等 |
 | POST | `/vms/:id/oauth/generate-auth-url` | CAI / Setup Token PKCE 授权链接；要求绑定可用出口。`claude_code` 返回 409 `native_login_required`，请使用专用终端 |
 | POST | `/vms/:id/oauth/exchange-code` | CAI / Setup Token 提交会话 ID 和授权码；导入并同步后才返回成功。Claude Code 的回调由专用终端处理 |
-| POST | `/vms/:id/credentials/sync` | 管理员手动同步 Claude 客户端凭证，成功返回 `{ synced: true }`。无凭证返回 409，同步失败返回 502；不换票、不回传 token。远程槽保留节点已轮换凭证并修复客户端链接 |
+| POST | `/vms/:id/credentials/sync` | 管理员手动同步 Claude 客户端凭证，成功返回 `{ synced: true }`。无凭证返回 409，同步失败返回 502；不换票、不回传 token，并排除凭证内邮箱字段。远程槽保留节点已轮换凭证、剔除遗留邮箱并修复客户端链接 |
 | GET/POST | `/vms/:id/official-cc-bootstrap` | 初装进度 / `{ manual:true }` 再跑 |
 | GET/PUT | `/vms/:id/seed-settings` | 播种；面板默认锁定，解锁后改、播种前确认。`settings.json` 可编辑 env（经 `extra_env`）与 `theme`；`autoUpdates`/`grove_enabled` 与 TZ/LANG/LC_ALL、telemetry/bedrock/vertex 等契约 env 只读展示，TZ/LANG 经 PUT `timezone` / `timezone_follow_proxy` / `locale` 写入槽位后再播种，不经 `extra_env`；`claude_setting` 可编辑。`GET ?debug=1` 额外返回 `telemetry_log`（最近 40 行脱敏上传审计，默认不带） |
 | POST | `/vms/:id/collect-identity` | guest 采集（locale/tz/`guest_machine_id`、槽内 `/etc/os-release` 的 `VERSION_ID`、系统与架构）；Codex Analytics 只使用这次采集的运行环境 |
@@ -207,6 +207,10 @@
 记录字段：`schedule_off`、`unschedulable{reason,detail,at}`、`schedule_hold{reason,detail,at}`（系统暂停：`maintenance` / `proxy_cooldown`，由写入方自己解除）。`schedulable` / `schedule_disabled_reason` / `schedule_manual` 每次写入时派生，保留给旧读者与回滚。升级后首次启动把旧记录迁到新字段，原文件备份到 `backups/schedule-migration-<ts>/`；上线前可用 `node scripts/replay-schedule-state.mjs --project <dir>` 预览迁移结果。设置 `routing.pool.manual_schedule_wins` 已移除（调度关不会被任何自动路径打开）。
 
 ### 平台独立的槽位限额
+
+Claude 的 `PATCH /api/panel/vms/:id` 接受 `max_primary_sessions` (1-20) 和 `max_subagents_per_session` (0-20). 每项单独传 `null` 恢复继承, 非法值返回 400 `invalid_scheduling_value`. 全局默认由 `PUT /api/panel/routing` 的 `pool` 对象设置. 两项均默认 `null`, 前者跟随本 VM 物理席位上限, 后者关闭家族模式. 列表和详情返回两项生效值、对应的 `_override` 标记及 `scheduling_inherited` 中的继承值.
+
+家族模式下, `seats_used` 统计本 VM 占用的根席位, `seats_max` 为生效的主会话上限 n. 每个 `seat_sessions` 成员及 SSE 对应的 `sessions` 成员另带 `subagents_running` (含已放行请求), `subagents_queued` 和 `subagents_max`. 根迁移后, 当前根席位保留到整个家族的在跑和排队请求结束, 旧 VM 在本地最后一份预约结束时交还席位. 热更新的 n 和 m 用于新进调度的请求. 所有执行预约 (含旧票和免席位探测) 在放行时按 VM 当时的家族模式检查物理位. 关闭模式的快照显示最近观察到的物理容量.
 
 `max_concurrency` / `max_rpm` 传数字钉住本槽，传 `null` 清除覆盖并立即使用本平台全局值。Claude 跟随 `tiers`；OpenAI 跟随 `codex.quota`，不受 Claude 分档保存影响。
 

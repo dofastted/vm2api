@@ -1,7 +1,13 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { expect, test, vi } from 'vitest'
-import { GeminiEnvironments, type GeminiInventory } from './gemini-environments'
+import { ApiError } from '@/lib/api'
+import {
+  GeminiAuthorizationChallenge,
+  GeminiEnvironments,
+  GeminiOperationError,
+  type GeminiInventory,
+} from './gemini-environments'
 
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ children }: { children: string }) => <a>{children}</a>,
@@ -180,4 +186,147 @@ test('Gemini API key does not claim to expose Antigravity subscription quota', (
   const html = showGemini(true, 'vm', 'api_key')
   expect(html).toContain('Gemini API Key 不提供 Antigravity 订阅额度')
   expect(html).not.toContain('已用 0%')
+})
+
+test('CRAGGemini subscription mode renders subscription status and seat bind/release controls', () => {
+  const unboundClient = new QueryClient()
+  unboundClient.setQueryData(['panel', 'me'], { role: 'admin' })
+  unboundClient.setQueryData(['panel', 'gemini-environments'], {
+    available: true,
+    payload_state: 'installed',
+    payload_mode: 'crag_subscription',
+    release_activated: true,
+    crag_subscription: {
+      configured: true,
+      active: true,
+      product: 'craggemini',
+      host_id: 'host-1',
+      sync_pending: false,
+      version: 2,
+      revision: 2,
+      issued_at: 1_800_000_000,
+      expires_at: 1_803_000_000,
+      slot_limit: 2,
+      used_slots: 1,
+      available_slots: 1,
+      reclaim_supported: true,
+    },
+    environments: [
+      {
+        id: 'gemini-unbound',
+        name: '未绑席位',
+        proxy_id: 'px-one',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        runtime_ready: false,
+        billing_ready: false,
+        kernel_version: '0.3.0',
+        models: ['gemini-3-flash'],
+        models_discovered: true,
+        crag_license: {
+          product: 'craggemini',
+          status: 'unlicensed',
+          valid: false,
+          seat_required: true,
+          code: 'license_required',
+        },
+        account: null,
+      },
+      {
+        id: 'gemini-bound',
+        name: '已绑席位',
+        proxy_id: 'px-one',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        runtime_ready: false,
+        billing_ready: false,
+        kernel_version: '0.3.0',
+        models: ['gemini-3-flash'],
+        models_discovered: true,
+        crag_license: {
+          product: 'craggemini',
+          status: 'valid',
+          valid: true,
+          seat_required: true,
+          scope: 'host',
+          seat: 1,
+        },
+        account: null,
+      },
+    ],
+  })
+  const unboundHtml = renderToStaticMarkup(
+    <QueryClientProvider client={unboundClient}>
+      <GeminiEnvironments environmentId='gemini-unbound' />
+    </QueryClientProvider>
+  )
+  expect(unboundHtml).toContain('CRAGGemini 宿主订阅已激活')
+  expect(unboundHtml).toContain('未绑定 CRAGGemini 订阅席位')
+  expect(unboundHtml).toContain('绑定 CRAG 席位')
+
+  const boundHtml = renderToStaticMarkup(
+    <QueryClientProvider client={unboundClient}>
+      <GeminiEnvironments environmentId='gemini-bound' />
+    </QueryClientProvider>
+  )
+  expect(boundHtml).toContain('已绑定席位 #1')
+  expect(boundHtml).toContain('释放 CRAG 席位')
+})
+
+test('Gemini authorization challenge exposes copyable link alongside open action', () => {
+  const url =
+    'https://accounts.google.com/o/oauth2/auth?redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&code_challenge_method=S256&state=s1&code_challenge=c1'
+  const html = renderToStaticMarkup(
+    <GeminiAuthorizationChallenge
+      environmentId='gemini-one'
+      url={url}
+      code=''
+      busy={false}
+      onCodeChange={() => {}}
+      onSubmit={() => {}}
+    />
+  )
+  expect(html).toContain('Google 授权链接')
+  expect(html).toContain('复制链接')
+  expect(html).toContain('打开 Google 授权页')
+  expect(html).toContain('readOnly=""')
+  expect(html).toContain('accounts.google.com/o/oauth2/auth')
+  expect(html).toContain('target="_blank"')
+  expect(html).toContain('rel="noreferrer"')
+})
+
+test('GeminiOperationError renders remediation guidance and maintenance link for host launch failures', () => {
+  const client = new QueryClient()
+  client.setQueryData(['panel', 'me'], { role: 'admin' })
+  const authLaunchHtml = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <GeminiOperationError
+        error={
+          new ApiError(
+            'Gemini 宿主服务在线，但 Google 授权流程未能启动，请检查宿主服务日志与绑定代理的出口连通性',
+            503,
+            'gemini_authorization_unavailable'
+          )
+        }
+      />
+    </QueryClientProvider>
+  )
+  expect(authLaunchHtml).toContain('未能拉起授权进程')
+  expect(authLaunchHtml).toContain('设置 → Gemini：诊断与维护')
+
+  const apiKeyHtml = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <GeminiOperationError
+        error={
+          new ApiError(
+            'Google 未接受该 Gemini API Key，请检查密钥和项目权限',
+            400,
+            'gemini_api_key_rejected'
+          )
+        }
+      />
+    </QueryClientProvider>
+  )
+  expect(apiKeyHtml).toContain('Google AI Studio 核对 API Key 有效性')
+  expect(apiKeyHtml).not.toContain('设置 → Gemini：诊断与维护')
 })

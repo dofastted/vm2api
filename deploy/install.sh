@@ -911,7 +911,21 @@ prepare_gemini_host() (
   if [ "$use_default" = 1 ] && [ -f "${default_source}/crag-license-public.pem" ]; then
     public_key_path="${default_source}/crag-license-public.pem"
   fi
-  sed -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" -e "s|@PAYLOAD_SOURCE_ARG@|${source_arg}|g" \
+  local crag_data_dir="${INSTALL_DIR}/data"
+  if [ ! -d "$crag_data_dir" ] && [ -d "${INSTALL_DIR}/src/data/crag-gemini-subscription" ]; then
+    crag_data_dir="${INSTALL_DIR}/src/data"
+  fi
+  if [ -f "${INSTALL_DIR}/.env" ]; then
+    local env_data_dir
+    env_data_dir="$(grep -m1 '^KIN_DATA_DIR=' "${INSTALL_DIR}/.env" | cut -d= -f2- | tr -d '\r' | sed -e "s/^['\"]//" -e "s/['\"]$//")" || true
+    if [[ "$env_data_dir" == /* && "$env_data_dir" != *[[:space:]\|]* ]]; then
+      crag_data_dir="${env_data_dir%/}"
+    fi
+  fi
+  local crag_host_dir="${crag_data_dir}/crag-gemini-subscription/public"
+  sed -e "s|@INSTALL_DIR@/data/crag-gemini-subscription/public|${crag_host_dir}|g" \
+    -e "s|@INSTALL_DIR@/src/data/crag-gemini-subscription/public|${crag_host_dir}|g" \
+    -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" -e "s|@PAYLOAD_SOURCE_ARG@|${source_arg}|g" \
     -e "s|@DEFAULT_PAYLOAD_ARGS@|${default_args}|g" \
     -e "s|--public-key /etc/vm2api/gemini-ed25519.pub|--public-key ${public_key_path}|g" \
     "${staging}/${files[0]}" > "${staging}/vm2api-gemini.service" || return 1
@@ -1174,6 +1188,12 @@ start_stack() {
   prepare_crag_host || return 1
   prepare_docker_crag_apparmor || return 1
   cd "${INSTALL_DIR}"
+  # Blue/green install: files are updated, but the controller is switched by bg-deploy.sh, not compose up.
+  if [ -f bluegreen/active ]; then
+    warn "蓝绿部署（bluegreen/active=$(cat bluegreen/active)）：文件已更新，跳过 compose up"
+    info "切换到新版本：deploy/bluegreen/bg-deploy.sh（带新迁移时用 --restart），见 docs/BLUEGREEN.md"
+    return
+  fi
   auto_sync_wrap="${KIN_AUTO_SYNC_WRAP:-0}"
   if [ "$mode" = image ]; then
     info "docker compose pull && up -d（拉预构建镜像，本机不构建）"

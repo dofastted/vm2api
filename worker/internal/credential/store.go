@@ -140,7 +140,6 @@ func (s *Store) Load() (Credential, map[string]any, error) {
 		RefreshToken: firstString(oauth, "refreshToken", "refresh_token"),
 		ExpiresAt:    normalizeExpiry(firstValue(oauth, "expiresAt", "expires_at")),
 		Generation:   firstInt64(oauth, "kinGeneration", "kin_generation", "_token_version"),
-		Email:        firstString(oauth, "email", "emailAddress", "email_address"),
 		AccountUUID:  firstString(oauth, "accountUuid", "account_uuid"),
 		OrgUUID:      firstString(oauth, "orgUuid", "org_uuid", "organization_uuid"),
 		Scopes:       scopes,
@@ -155,9 +154,6 @@ func (s *Store) Load() (Credential, map[string]any, error) {
 			credential.APIKey = key
 			credential.AccessToken = key
 			credential.BaseURL = firstString(api, "baseUrl", "base_url")
-			if credential.Email == "" {
-				credential.Email = firstString(api, "email")
-			}
 			if credential.AuthScheme == "" {
 				credential.AuthScheme = firstString(api, "authScheme", "auth_scheme")
 			}
@@ -188,12 +184,15 @@ func (s *Store) Save(credential Credential, document map[string]any) (Credential
 	credential.AuthScheme = NormalizeAuthScheme(credential.AuthScheme, credential.Type)
 	document["type"] = credential.Type
 	document["authScheme"] = credential.AuthScheme
+	// Email stays on the control plane; never persist it inside the VM credential file.
+	stripEmailFields(document)
 	if credential.IsAPIKey() {
 		api := nestedMap(document, "anthropicApiKey")
 		if api == nil {
 			api = make(map[string]any)
 			document["anthropicApiKey"] = api
 		}
+		stripEmailFields(api)
 		api["apiKey"] = credential.Token()
 		if credential.BaseURL != "" {
 			api["baseUrl"] = credential.BaseURL
@@ -242,9 +241,8 @@ func (s *Store) Save(credential Credential, document map[string]any) (Credential
 		oauth["expiresAt"] = credential.ExpiresAt
 	}
 	oauth["kinGeneration"] = credential.Generation
-	if credential.Email != "" {
-		oauth["email"] = credential.Email
-	}
+	stripEmailFields(oauth)
+	stripEmailFields(nestedMap(document, "anthropicApiKey"))
 	if credential.AccountUUID != "" {
 		oauth["accountUuid"] = credential.AccountUUID
 	}
@@ -339,6 +337,15 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 		_ = directory.Close()
 	}
 	return nil
+}
+
+func stripEmailFields(values map[string]any) {
+	if values == nil {
+		return
+	}
+	delete(values, "email")
+	delete(values, "emailAddress")
+	delete(values, "email_address")
 }
 
 func nestedMap(document map[string]any, key string) map[string]any {
@@ -475,7 +482,6 @@ func DecodeImport(reader io.Reader, maxBytes int64) (Credential, error) {
 			APIKey:      apiKey,
 			AccessToken: apiKey,
 			BaseURL:     strings.TrimSpace(payload.BaseURL),
-			Email:       strings.TrimSpace(payload.Email),
 			AccountUUID: strings.TrimSpace(payload.AccountUUID),
 			OrgUUID:     strings.TrimSpace(payload.OrgUUID),
 			AuthScheme:  NormalizeAuthScheme(payload.AuthScheme, TypeAPIKey),
@@ -486,7 +492,6 @@ func DecodeImport(reader io.Reader, maxBytes int64) (Credential, error) {
 		AccessToken:  strings.TrimSpace(payload.AccessToken),
 		RefreshToken: strings.TrimSpace(payload.RefreshToken),
 		ExpiresAt:    expiry,
-		Email:        strings.TrimSpace(payload.Email),
 		AccountUUID:  strings.TrimSpace(payload.AccountUUID),
 		OrgUUID:      strings.TrimSpace(payload.OrgUUID),
 		Scopes:       payload.Scopes,

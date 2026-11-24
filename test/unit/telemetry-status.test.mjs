@@ -161,11 +161,9 @@ test('retireLegacyTelemetry flags cluster Docker containers missing /etc/kin-com
       State: { Running: true },
       HostConfig: {
         Binds: [
-          '/srv/vms/vm-cluster-legacy/fingerprint:/var/lib/kin-persona:ro',
-          '/srv/vms/vm-cluster-legacy/fingerprint/system/etc/hostname:/etc/hostname:ro',
-          '/srv/vms/vm-cluster-legacy/fingerprint/system/etc/kin-computer:/etc/kin-computer:ro',
-          '/srv/vms/vm-cluster-legacy/fingerprint/system/dmi/id:/etc/kin-dmi:ro',
-          '/srv/vms/vm-cluster-legacy/fingerprint/system/hardware:/etc/kin-hardware:ro',
+          '/srv/vms/vm-cluster-legacy/computer/etc/kin-computer:/etc/kin-computer:ro',
+          '/srv/vms/vm-cluster-legacy/computer/dmi/id:/etc/kin-dmi:ro',
+          '/srv/vms/vm-cluster-legacy/computer/hardware:/etc/kin-hardware:ro',
         ],
       },
     }),

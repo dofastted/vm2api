@@ -690,12 +690,21 @@ function HostOverview({
             className='text-sm text-muted-foreground'
           >
             每张码从兑换时独立计时，未到期额度相加；不绑定、不启动 VM。 Claude
-            订阅码增加本机槽位；以 CGG1- 开头的码兑换 CRAGGemini，不占用 Claude
+            订阅码增加本机槽位；CRAGGemini 订阅码（CRAGR1.…）请点击右上角「兑换
+            CRAGGemini」兑换，旧版 CGG1- 码也可直接在此兑换，不占用 Claude
             槽位。
           </p>
           <Button type='submit' size='sm' disabled={!code.trim() || !!action}>
             {action === 'redeem' ? '正在兑换…' : '兑换到本机'}
           </Button>
+          <div className='rounded-md border border-sky-500/20 bg-sky-500/5 px-3 py-2 text-xs leading-5 text-muted-foreground'>
+            <strong className='font-medium text-foreground'>
+              CRAGGemini 兑换码说明：
+            </strong>
+            1 个月 / 10 槽兑换码（¥100，¥10/槽，支持多码叠加）；首批测试支持 7
+            天 / 10 槽测试兑换码（单码可用 100 次，不同宿主机各 1
+            次、同机幂等）。请点右上角「兑换 CRAGGemini」完成兑换。
+          </div>
         </form>
       ) : null}
       {notice ? (
@@ -1549,6 +1558,8 @@ function ShopOrders({
                   description: plan.description,
                   remaining: plan.remaining,
                   renewable: plan.renewable,
+                  product: plan.product,
+                  stackable: plan.stackable,
                   monthly: monthlyPrice(
                     plan.amount_minor,
                     planMonths(plan.term, plan.months)

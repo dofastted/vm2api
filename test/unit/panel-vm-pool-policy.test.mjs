@@ -49,6 +49,51 @@ const patchVm = (handlePanel, id = 'vm-01') =>
 const poolPolicy = (handlePanel) =>
   handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/pool-policy'))
 
+test('Claude family PATCH validates both fields before writing and independently inherits live pool defaults', async (t) => {
+  const root = tmpProject()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  seed(root, 'vm-01')
+  const routingConfig = { pool: { max_primary_sessions: 5, max_subagents_per_session: 3 } }
+  async function patch(body) {
+    const { handlePanel, response } = handler(root, body, { routingConfig })
+    await patchVm(handlePanel)
+    return response
+  }
+  const empty = await patch({})
+  assert.equal(empty.status, 400)
+  assert.equal(
+    empty.body.error.message,
+    'max_concurrency, max_rpm, max_sessions, session_slots, quota_override, allowed_models, auth_scheme, inference_engine, persona_preset, dataplane, crag_kernel_version, schedule_level, active_hours, timezone, weight, name, machine.memory or timezone_follow_proxy required',
+  )
+  for (const [key, bad] of [
+    ['max_primary_sessions', 0],
+    ['max_primary_sessions', 21],
+    ['max_subagents_per_session', -1],
+    ['max_subagents_per_session', 2.5],
+    ['max_subagents_per_session', '3'],
+  ]) {
+    const response = await patch({ max_primary_sessions: 1, max_subagents_per_session: 1, [key]: bad })
+    assert.equal(response.status, 400)
+    assert.equal(response.body.error.code, 'invalid_scheduling_value')
+    assert.deepEqual(policyOf(root, 'vm-01'), {})
+  }
+  const pinned = await patch({ max_primary_sessions: 20, max_subagents_per_session: 0 })
+  assert.equal(pinned.status, 200)
+  const vm = pinned.body.data.vm
+  assert.equal(vm.max_primary_sessions, 20)
+  assert.equal(vm.max_subagents_per_session, 0)
+  assert.equal(vm.max_subagents_per_session_override, true)
+  assert.equal(vm.scheduling_inherited.max_primary_sessions, 5)
+  assert.equal(vm.scheduling_inherited.max_subagents_per_session, 3)
+  const cleared = (await patch({ max_primary_sessions: null })).body.data.vm
+  assert.equal(cleared.max_primary_sessions, 5)
+  assert.equal(cleared.max_primary_sessions_override, false)
+  assert.equal(cleared.max_subagents_per_session_override, true)
+  routingConfig.pool.max_subagents_per_session = null
+  assert.equal((await patch({ max_subagents_per_session: null })).body.data.vm.max_subagents_per_session, null)
+  assert.equal(policyOf(root, 'vm-01').maxSubagentsPerSessionOverride, false)
+})
+
 test('PATCH weight pins the Codex slot weight', async () => {
   const root = tmpProject()
   try {

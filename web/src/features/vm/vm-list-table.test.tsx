@@ -1,6 +1,7 @@
 import { type ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
+import { readFileSync } from 'node:fs'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import { FleetPulse } from './fleet-pulse'
@@ -35,6 +36,24 @@ function render(over: Partial<Vm> = {}) {
 }
 
 describe('VM scheduling priority', () => {
+  it('groups the three Claude seat PATCH fields under one VM type check', () => {
+    const source = readFileSync(
+      new URL('./vm-scheduling.tsx', import.meta.url),
+      'utf8'
+    )
+    const guards = [...source.matchAll(/if \(!isCodexVm\(vm\)\) \{([^}]+)\}/g)]
+    const fields = [
+      'session_slots',
+      'max_primary_sessions',
+      'max_subagents_per_session',
+    ]
+    expect(
+      guards.some(([, block]) =>
+        fields.every((field) => block.includes(`knob('${field}',`))
+      )
+    ).toBe(true)
+  })
+
   it.each(['anthropic', 'openai'] as const)(
     'shows and edits the same %s priority throughout the panel',
     (platform) => {
@@ -72,6 +91,44 @@ describe('VM scheduling priority', () => {
 })
 
 describe('VM row interaction and health', () => {
+  it('shows family limits and the waiting children on a Claude root seat', () => {
+    const vm: Vm = {
+      id: 'vm-01',
+      session_slots: 6,
+      seats_max: 2,
+      max_primary_sessions: 2,
+      max_primary_sessions_override: true,
+      max_subagents_per_session: 0,
+      max_subagents_per_session_override: true,
+      seat_sessions: [
+        {
+          index: 0,
+          session_id: 'root',
+          state: 'idle',
+          inflight: 0,
+          subagents_running: 0,
+          subagents_queued: 2,
+          subagents_max: 0,
+        },
+      ],
+    }
+    const block = renderToStaticMarkup(<VmSchedulingBlock vm={vm} />)
+    expect(block).toContain('主会话上限')
+    expect(block).toContain('子代理 0/0 · 排队 2')
+    expect(block).toContain('本槽钉住；全局 关闭')
+    expect(
+      renderToStaticMarkup(<VmSchedulingBlock vm={{ id: 'legacy' }} />)
+    ).toContain('关闭(子代理各占一个席位)')
+    const editor = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <VmSchedulingEditor vm={vm} />
+      </QueryClientProvider>
+    )
+    expect(editor).toContain('默认控制同时占用的客户端会话席位数')
+    expect(editor).toContain('跟随 · 6')
+    expect(editor).toMatch(/<select[^>]*aria-label="每会话子代理上限"/)
+    expect(editor).toContain('<option value="20">20</option>')
+  })
   it('opens detail from a left button and exposes a separate expand control', () => {
     const html = render()
     expect(html).toContain('aria-label="打开 vm-01 详情页"')
@@ -141,6 +198,96 @@ describe('VM account column kernel label', () => {
     const hostOnly = renderSlots(<VmTable vms={[gemini]} />)
     expect(hostOnly).not.toContain('role="switch"')
     expect(hostOnly).not.toContain('24h 无请求')
+  })
+
+  it('renders a Gemini slot proxy with the same chip as a normal slot', () => {
+    const pool = [
+      { id: 'px-011f7746', host: '1.2.3.4', port: 1080, status: 'ok', latency_ms: 88 },
+    ]
+    const gemini = geminiSlot(
+      {
+        id: 'gemini-proxy',
+        name: 'Gemini proxy',
+        proxy_id: 'px-011f7746',
+        auth_state: 'authorized',
+        runtime_ready: false,
+        billing_ready: false,
+        auth_method: 'oauth',
+        kernel_version: null,
+        created_at: null,
+        updated_at: null,
+        models: [],
+        account: null,
+      },
+      undefined,
+      pool
+    )
+    const normal: Vm = { id: 'vm-01', has_token: true, proxy: pool[0], proxy_id: 'px-011f7746' }
+    const chip = (vm: Vm) =>
+      renderToStaticMarkup(
+        <QueryClientProvider client={new QueryClient()}>
+          <VmRack vms={[vm]} filter='all' size='l' />
+        </QueryClientProvider>
+      ).match(/<div[^>]*bg-ok-1[^>]*>.*?<\/div>/)?.[0]
+    const geminiChip = chip(gemini)
+    expect(geminiChip).toContain('1.2.3.4:1080')
+    expect(geminiChip).toContain('88')
+    expect(geminiChip).toBe(chip(normal))
+  })
+
+  it('keeps Gemini rows and cards compact and hides stale eligibility after a newer verified run', () => {
+    const verified = geminiSlot({
+      id: 'verified-gemini',
+      name: 'Verified Gemini',
+      proxy_id: 'px-011f7746',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      runtime_ready: true,
+      billing_ready: true,
+      kernel_version: '0.3.0',
+      created_at: null,
+      updated_at: null,
+      models_discovered: true,
+      models: ['gemini-2.5-pro'],
+      last_inference: {
+        state: 'completed',
+        model: 'gemini-2.5-pro',
+        started_at: '2026-11-24T02:00:00Z',
+        finished_at: '2026-11-24T02:00:05Z',
+        error_code: null,
+      },
+      account: {
+        state: 'ok',
+        checked_at: '2026-11-24T01:00:00Z',
+        email: 'a@example.com',
+        project_id: null,
+        region: null,
+        plan: null,
+        expires_at: null,
+        eligibility: 'verification_required',
+        quotas: [],
+        credits: [],
+      },
+    })
+    const html = (node: ReactNode) =>
+      renderToStaticMarkup(
+        <QueryClientProvider client={new QueryClient()}>
+          {node}
+        </QueryClientProvider>
+      )
+    const table = html(<VmTable vms={[verified]} />)
+    expect(table).toContain('data-vm-row')
+    expect(table).toMatch(/data-vm-row[^>]*class="[^"]*h-\[38px\]/)
+    expect(table).not.toContain('min-h-[38px]')
+    for (const view of [
+      table,
+      html(<VmRack vms={[verified]} size='l' filter='all' />),
+      html(<VmRack vms={[verified]} size='s' filter='all' />),
+    ]) {
+      expect(view).toContain('上次宿主推理成功')
+      expect(view).not.toContain('VALIDATION_REQUIRED')
+      expect(view).not.toContain('text-[color:var(--status-caution)]')
+    }
   })
 
   it('keeps pending, cancelled, failed and verified turns out of generic 在池 counts', () => {

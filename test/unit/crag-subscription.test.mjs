@@ -324,12 +324,64 @@ test('the identity rebuild escape hatch is never taken by the ordinary path', (t
   assert.equal(rebuilt.hostId, before.hostId)
   assert.equal(service.deviceIdentity().hostId, before.hostId)
 
-  // Without a usable NIC a rebuild would land back on the machine-id it is
-  // escaping, so it refuses rather than destroying the stored identity.
-  const stuck = connect({ machineIdFile: null, netDirectory: path.join(root, 'absent') })
-  assert.throws(() => stuck.rebuildDeviceIdentity({ reason: 'host_id_collision' }), {
-    code: 'crag_subscription_host_identity_unavailable',
+  // Without a usable NIC a rebuild no longer refuses: the SMBIOS UUID is also
+  // per-instance, so it descends to that instead of landing back on the
+  // `machine-id` it is escaping.
+  const dmi = path.join(root, 'product_uuid')
+  fs.writeFileSync(dmi, '7f1c9a52-3b84-4d61-9f2e-0a5d8c6b4e13\n')
+  const viaDmi = connect({ machineIdFile: null, netDirectory: path.join(root, 'absent'), dmiUuidFile: dmi })
+  assert.equal(viaDmi.rebuildDeviceIdentity({ reason: 'host_id_collision' }).source, 'dmi')
+
+  // With the per-instance sources gone it keeps descending rather than failing.
+  // `/etc/machine-id` and `/proc/cpuinfo` are not injectable and exist on any
+  // ordinary Linux host, so "every source unavailable" is not reachable from
+  // here -- which is what the CPU fallback is for: a weak identity beats none,
+  // because without one the request fails outright. The descent is asserted
+  // instead of a refusal that can no longer be provoked.
+  const descended = connect({
+    machineIdFile: null,
+    netDirectory: path.join(root, 'absent'),
+    dmiUuidFile: path.join(root, 'absent-dmi'),
+  }).rebuildDeviceIdentity({ reason: 'host_id_collision' })
+  assert.ok(['machine-id', 'mount', 'cpu'].includes(descended.source), `descended to ${descended.source}`)
+  assert.match(descended.hostId, /^[a-f0-9]{64}$/)
+})
+
+/** The v1.4.186 regression and its self-repair. That version retired a stored
+ * identity as soon as it stopped matching the sampled hardware, which replaced a
+ * paid host's identity with one the Authority had never issued -- `status` then
+ * answered 404 and every admission failed with
+ * `license_crag_host_usage_unverified`. A host carrying that damage must heal on
+ * its next admission, and a deliberate rebuild must not be healed away with it. */
+test('a v1.4.186 retirement is reclaimed, while a deliberate rebuild is not', (t) => {
+  const { root, publicDir, connect } = standaloneHost(t)
+  const service = connect({
+    machineIdFile: null,
+    netDirectory: fakeNet(root, { eth0: { mac: '52:54:00:12:34:56' } }),
   })
+  const privateDir = path.join(path.dirname(publicDir), 'private')
+  fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
+  fs.mkdirSync(privateDir, { recursive: true, mode: 0o700 })
+
+  // Exactly what v1.4.186 left behind: the paid identity moved to `.legacy`,
+  // with a freshly derived one in its place that no subscription belongs to.
+  const paid = 'a'.repeat(64)
+  const stranded = 'd'.repeat(64)
+  fs.writeFileSync(path.join(publicDir, 'host_id.legacy'), paid, { mode: 0o644 })
+  fs.writeFileSync(path.join(privateDir, 'credential.legacy'), 'K'.repeat(43), { mode: 0o600 })
+  fs.writeFileSync(path.join(publicDir, 'host_id'), stranded, { mode: 0o644 })
+
+  assert.equal(service.deviceIdentity().hostId, paid, 'the paid identity comes back')
+  assert.equal(fs.readFileSync(path.join(publicDir, 'host_id'), 'utf8'), paid)
+  assert.ok(!fs.existsSync(path.join(publicDir, 'host_id.legacy')), 'and is reclaimed, not copied')
+  assert.equal(fs.readFileSync(path.join(privateDir, 'credential'), 'utf8'), 'K'.repeat(43))
+
+  // A rebuild is a decision, so it must survive the next admission. It retires
+  // to a different suffix for that reason; reusing `.legacy` would make the
+  // repair above undo it.
+  const rebuilt = service.rebuildDeviceIdentity({ reason: 'host_id_collision' })
+  assert.notEqual(rebuilt.hostId, paid)
+  assert.equal(service.deviceIdentity().hostId, rebuilt.hostId, 'the rebuild is not reclaimed')
 })
 
 test('per-voucher detail is shown only when it reconciles with the signed aggregate', async (t) => {

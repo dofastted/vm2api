@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { copyText } from '@/lib/clipboard'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -50,33 +51,14 @@ export function VmDesktopCard({
   const root = `/api/panel/vms/${encodeURIComponent(id)}`
   const qc = useQueryClient()
   const [open, setOpen] = useState(false)
+  const [viewerPhase, setViewerPhase] = useState<
+    'connecting' | 'open' | 'closed' | 'error'
+  >('connecting')
   const [fullscreen, setFullscreen] = useState(false)
   const [clip, setClip] = useState('')
   const [remoteClip, setRemoteClip] = useState('')
   const frameRef = useRef<HTMLDivElement>(null)
   const viewer = useRef<NoVncHandle | null>(null)
-
-  // 面板多为 HTTP 直连（非安全上下文），navigator.clipboard 不可用，
-  // 用隐藏 textarea + execCommand 在点击手势内写本机剪贴板
-  const copyToLocal = async (text: string) => {
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        await navigator.clipboard.writeText(text)
-        return true
-      }
-    } catch {
-      // 落入 execCommand 兜底
-    }
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    const ok = document.execCommand('copy')
-    ta.remove()
-    return ok
-  }
 
   // 工具栏按钮点击后自动把焦点还给桌面画面（输入框除外，用户可能要继续打字）
   const refocusDesktop = () => {
@@ -155,8 +137,10 @@ export function VmDesktopCard({
               <NoVncViewer
                 ticketPath={`${root}/desktop-ticket`}
                 socketPath={`${root}/desktop/ws`}
+                active={active}
                 handleRef={viewer}
                 onPhase={(p) => {
+                  setViewerPhase(p)
                   if (p === 'open')
                     void qc.invalidateQueries({ queryKey: ['vm-desktop', id] })
                 }}
@@ -169,21 +153,25 @@ export function VmDesktopCard({
             >
               <Input
                 className='h-8 max-w-xs'
-                placeholder='发送到桌面剪贴板（长文本兜底）'
+                placeholder='粘贴发送到桌面（长文本兜底）'
                 value={clip}
                 onChange={(e) => setClip(e.target.value)}
               />
               <Button
                 size='sm'
                 variant='outline'
-                disabled={!clip}
+                disabled={!clip || viewerPhase !== 'open'}
                 onClick={() => {
-                  viewer.current?.paste(clip)
+                  const outcome = viewer.current?.paste(clip) ?? false
+                  if (!outcome) {
+                    toast.error('桌面尚未连接，请连接后再发送')
+                    return
+                  }
                   setClip('')
-                  toast.success('已写入桌面剪贴板')
+                  if (outcome === 'sent') toast.success('已发送到桌面')
                 }}
               >
-                发送剪贴板
+                发送到桌面
               </Button>
               <Button
                 size='sm'
@@ -191,7 +179,7 @@ export function VmDesktopCard({
                 disabled={!remoteClip}
                 title={remoteClip}
                 onClick={async () => {
-                  const ok = await copyToLocal(remoteClip)
+                  const ok = await copyText(remoteClip)
                   if (ok) toast.success('已复制到本机剪贴板')
                   else toast.error('复制失败，请手动复制预览内容')
                 }}
@@ -207,14 +195,22 @@ export function VmDesktopCard({
               <Button size='sm' variant='outline' onClick={goFullscreen}>
                 全屏
               </Button>
-              <Button size='sm' variant='ghost' onClick={() => setOpen(false)}>
+              <Button
+                size='sm'
+                variant='ghost'
+                onClick={() => {
+                  setOpen(false)
+                  setViewerPhase('closed')
+                }}
+              >
                 关闭
               </Button>
             </div>
             <p className='text-xs text-muted-foreground'>
-              Mac 直接用 Command+C /
-              V：复制粘贴与桌面双向直通（中文、链接、验证码均可直接粘贴；桌面内复制的内容点「带回桌面剪贴板」或在本面板页按
-              Command+C 取回）；Command+=/- 缩放会作用到桌面内网页。
+              本页签激活时可直接用 Command/Ctrl+C、V
+              与桌面双向复制粘贴（中文、链接、验证码均可直接粘贴；桌面内复制的内容可点「带回桌面剪贴板」，无页面选区时也可按
+              Command/Ctrl+C 取回）；Mac 下 Command+=/-
+              缩放仅在本页签拦截给桌面。
             </p>
           </>
         ) : (
@@ -223,7 +219,10 @@ export function VmDesktopCard({
               size='sm'
               variant='outline'
               disabled={!s?.enabled}
-              onClick={() => setOpen(true)}
+              onClick={() => {
+                setViewerPhase('connecting')
+                setOpen(true)
+              }}
             >
               打开桌面
             </Button>

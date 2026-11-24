@@ -4,6 +4,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process'
+import { isOverlap } from '../core/handover.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import {
@@ -1008,7 +1009,9 @@ async function startRustKernel(
   if (!paths.socketPath) return { ok: false, reason: 'socket_missing' }
   const existing = await rustKernelHealth(exec, { timeoutMs: healthTimeoutMs })
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
-  const staleWrap = wrapNewerThanKernel(exec)
+  // Blue/green overlap: a newer wrap must not restart a kernel the draining controller may be using.
+  // The deploy syncs wraps once that controller exits (handover exclusive pass).
+  const staleWrap = !isOverlap() && wrapNewerThanKernel(exec)
   const currentVm = kernelVm(exec)
   const expectedSlots = wrapSlotCount(currentVm)
   const slotMismatch = !!paths.configPath && kernelSlotsDiffer(paths.configPath, existing, expectedSlots)

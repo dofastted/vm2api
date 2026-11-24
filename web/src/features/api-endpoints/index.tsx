@@ -201,7 +201,9 @@ function EndpointCard({
             <span>
               {endpoint.auth_scheme === 'authorization_bearer'
                 ? 'Bearer'
-                : 'x-api-key'}
+                : endpoint.auth_scheme === 'x_goog_api_key'
+                  ? 'x-goog-api-key'
+                  : 'x-api-key'}
             </span>
           ) : null}
         </div>
@@ -270,5 +272,6 @@ function summarize(items: ApiEndpoint[]) {
 function kindLabel(kind: ApiEndpoint['kind']): string {
   if (kind === 'claude') return 'Claude 官方'
   if (kind === 'openai') return 'OpenAI 官方'
+  if (kind === 'gemini') return 'Gemini 官方'
   return '自定义'
 }

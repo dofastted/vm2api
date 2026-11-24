@@ -26,6 +26,7 @@ import {
   readWorkerCredentialFile,
   refreshErrorCodeOf,
   REFRESH_SKEW_MS,
+  stripWorkerCredentialEmail,
   writeWorkerCredentialFile,
   ensureOfficialCredentialLink,
   slotUidGidFromHomeDir,
@@ -1887,7 +1888,6 @@ export function credentialSummary(credential, now = Date.now()) {
     mode: credential.mode || credential.type || null,
     account_uuid: credential.account_uuid || null,
     org_uuid: credential.org_uuid || null,
-    email: credential.email || null,
     scope: credential.scope || null,
     auth_scheme: credential.auth_scheme || null,
     has_access: credential.has_access ?? !!(credential.access_token || credential.api_key),
@@ -1972,12 +1972,19 @@ async function reconcileClaudeClientCredentials(
           throw new Error('credential_link_failed')
         }
       }
+      const sanitizeCredentials = async () => {
+        const stripped = stripWorkerCredentialEmail(exec.homeDir)
+        if (stripped.changed && host.kind === 'node' && typeof host.onImport === 'function') {
+          await host.onImport(exec.vm, slotDir)
+        }
+      }
       if (host.kind === 'node') {
         const pulled = await host.afterRefresh(exec.vm, slotDir)
         if (pulled?.reason === 'remote_missing') {
           if (refreshInSlot) return clientCredentialRequired()
           throw new Error('remote_missing')
         }
+        await sanitizeCredentials()
         await repairRemoteLink()
       }
       const credential = readWorkerCredentialFile(exec.homeDir)
@@ -1986,8 +1993,15 @@ async function reconcileClaudeClientCredentials(
       const hasAccess = hasAccessPresence(credential || {})
       const hasRefresh = hasRefreshPresence(credential || {})
       if (!hasAccess && !(refreshInSlot && refreshable && hasRefresh)) return clientCredentialRequired()
+      await sanitizeCredentials()
       repairLocalLink()
-      if (!refreshInSlot) return { ok: true, synced: true, credential: credentialSummary(credential) }
+      if (!refreshInSlot) {
+        return {
+          ok: true,
+          synced: true,
+          credential: credentialSummary(readWorkerCredentialFile(exec.homeDir) || credential),
+        }
+      }
 
       let live = credential
       let refreshed = false
@@ -2003,6 +2017,7 @@ async function reconcileClaudeClientCredentials(
         if (!result?.ok) return staleClientCredential({ error: result?.body?.error })
         // Slot refresh also pulls the remote file back. Verify persisted expiry,
         // not the subprocess's reported expiry, before admitting the client.
+        await sanitizeCredentials()
         live = readWorkerCredentialFile(exec.homeDir)
         if (!live || !hasAccessPresence(live) || needsRefresh(live.expires_at)) return staleClientCredential()
         await repairRemoteLink()

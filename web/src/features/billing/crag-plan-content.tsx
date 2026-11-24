@@ -64,6 +64,42 @@ function Renewal({ renewable }: { renewable: boolean | undefined }) {
   )
 }
 
+function ProductTags({
+  product,
+  stackable,
+  unitPrice,
+}: {
+  product?: 'crag-v2' | 'craggemini'
+  stackable?: boolean
+  unitPrice?: string | null
+}) {
+  return (
+    <>
+      {product === 'craggemini' ? (
+        <span
+          className={`${tag} bg-sky-500/10 text-sky-700 ring-1 ring-sky-500/20 ring-inset dark:text-sky-300`}
+        >
+          CRAGGemini
+        </span>
+      ) : null}
+      {stackable ? (
+        <span
+          className={`${tag} bg-violet-500/10 text-violet-700 ring-1 ring-violet-500/20 ring-inset dark:text-violet-300`}
+        >
+          可叠加
+        </span>
+      ) : null}
+      {unitPrice ? (
+        <span
+          className={`${tag} bg-background text-muted-foreground tabular-nums ring-1 ring-border ring-inset`}
+        >
+          {unitPrice} / 槽
+        </span>
+      ) : null}
+    </>
+  )
+}
+
 function Stock({
   remaining,
   soldOut,
@@ -134,6 +170,7 @@ export function PickerPlanContent({
             </span>
           ) : null)}
         <span className={`${space.tags} flex flex-wrap gap-1.5 empty:hidden`}>
+          <ProductTags product={plan.product} stackable={plan.stackable} />
           <Stock
             remaining={plan.remaining}
             soldOut='已售罄'
@@ -187,6 +224,26 @@ export function CommercePlanContent({
             </span>
           ) : null)}
         <span className={`${space.tags} flex flex-wrap gap-1.5`}>
+          <ProductTags
+            product={plan.product}
+            stackable={plan.stackable}
+            unitPrice={
+              plan.product === 'craggemini' &&
+              plan.amount_minor != null &&
+              plan.amount_minor > 0 &&
+              typeof plan.slot_limit === 'number' &&
+              plan.slot_limit > 0
+                ? formatPlanDetails(
+                    Math.round(
+                      plan.amount_minor /
+                        (Number(months) || 1) /
+                        plan.slot_limit
+                    ),
+                    null
+                  ).price
+                : null
+            }
+          />
           <Stock
             remaining={plan.remaining}
             soldOut='首批售罄'

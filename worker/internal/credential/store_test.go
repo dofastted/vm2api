@@ -220,11 +220,86 @@ func TestStoreRoundTripAuthScheme(t *testing.T) {
 }
 
 func TestDecodeImportAPIKey(t *testing.T) {
-	cred, err := DecodeImport(strings.NewReader(`{"type":"apikey","api_key":"sk-ant-api03-imported"}`), 4096)
+	cred, err := DecodeImport(strings.NewReader(`{"type":"apikey","api_key":"sk-ant-api03-imported","email":"hidden@example.com"}`), 4096)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !cred.IsAPIKey() || cred.Token() != "sk-ant-api03-imported" {
 		t.Fatalf("decoded = %#v", cred)
+	}
+	if cred.Email != "" {
+		t.Fatalf("email should be ignored on import, got %q", cred.Email)
+	}
+}
+
+func TestStoreSaveExcludesAndStripsEmail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	seed := `{
+		"email": "top@example.com",
+		"emailAddress": "top-addr@example.com",
+		"email_address": "top-snake@example.com",
+		"claudeAiOauth": {
+			"accessToken": "old-access",
+			"refreshToken": "old-refresh",
+			"expiresAt": 1900000000000,
+			"email": "oauth@example.com",
+			"emailAddress": "oauth-addr@example.com",
+			"email_address": "oauth-snake@example.com",
+			"accountUuid": "acct-1",
+			"orgUuid": "org-1"
+		}
+	}`
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(path)
+	current, document, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Email != "" {
+		t.Fatalf("load should not expose email, got %q", current.Email)
+	}
+	current.AccessToken = "new-access"
+	current.Email = "should-not-write@example.com"
+	if _, err := store.Save(current, document); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	for _, forbidden := range []string{"example.com", `"email"`, "emailAddress", "email_address"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("saved OAuth credentials still contain %s: %s", forbidden, text)
+		}
+	}
+
+	apiSeed := map[string]any{
+		"email": "api-top@example.com",
+		"anthropicApiKey": map[string]any{
+			"apiKey":        "sk-ant-api03-old",
+			"email":         "api@example.com",
+			"emailAddress":  "api-addr@example.com",
+			"email_address": "api-snake@example.com",
+		},
+	}
+	if _, err := store.Save(Credential{
+		Type:   TypeAPIKey,
+		APIKey: "sk-ant-api03-new",
+		Email:  "should-not-write@example.com",
+	}, apiSeed); err != nil {
+		t.Fatal(err)
+	}
+	rawAPI, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiText := string(rawAPI)
+	for _, forbidden := range []string{"example.com", `"email"`, "emailAddress", "email_address"} {
+		if strings.Contains(apiText, forbidden) {
+			t.Fatalf("saved API key credentials still contain %s: %s", forbidden, apiText)
+		}
 	}
 }

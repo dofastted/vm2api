@@ -11,6 +11,8 @@ export type CommerceRules = {
   custom_renewable?: boolean
 }
 
+export type CragProduct = 'crag-v2' | 'craggemini'
+
 export type CragPlan = {
   sku: string
   term: string
@@ -23,6 +25,24 @@ export type CragPlan = {
   description?: string
   enabled?: boolean
   months?: number
+  product?: CragProduct
+  stackable?: boolean
+}
+
+export const CRAG_GEMINI_UNIT_PRICE_MINOR = 1000
+
+export const CRAG_GEMINI_DEFAULT_PLAN: CragPlan = {
+  sku: 'craggemini-1m-10',
+  term: '1m',
+  amount_minor: 10000,
+  slot_limit: 10,
+  product: 'craggemini',
+  stackable: true,
+  renewable: false,
+  enabled: true,
+  name: 'CRAGGemini 1个月兑换码 · 10 槽',
+  description:
+    'CRAGGemini 1个月宿主机兑换码，含 10 个席位槽位（¥10/槽），支持多码叠加；首批测试支持 7 天 / 10 槽兑换码（单码可用 100 次）。',
 }
 
 export type DraftPlan = Omit<CragPlan, 'amount_minor' | 'slot_limit'> & {
@@ -40,6 +60,8 @@ export type PlanOption = {
   enabled?: boolean
   remaining?: number | null
   renewable?: boolean
+  product?: CragProduct
+  stackable?: boolean
   /** 已格式化的折合月价；null 表示该套餐不适用（月卡或未定价）。 */
   monthly?: string | null
 }

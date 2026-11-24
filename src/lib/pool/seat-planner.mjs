@@ -94,6 +94,10 @@ export class SeatPlanner {
     this.seats = new Map()
     /** @type {Map<string, Map<number, object>>} vmId → index → seat */
     this.byVm = new Map()
+    // Scoped root seat → its requests, including serial follow-ups and grants in transit.
+    this.subagents = new Map()
+    // Only an admitted primary can refresh its scoped root registration.
+    this.roots = new Map()
     /** @type {Map<string, object[]>} */
     this.vmQueues = new Map()
     /** @type {object[]} */
@@ -120,9 +124,31 @@ export class SeatPlanner {
     this.caps.set(String(vmId), Number(cap) || 0)
   }
 
-  seatOf(seatKey) {
+  seatOf(seatKey, destination = null, departingSeat = null) {
     if (!seatKey) return null
-    return this.seats.get(String(seatKey)) || null
+    const active = this.seats.get(String(seatKey))
+    if (!destination || (active && (active !== departingSeat || active.vmId === destination))) return active || null
+    // Returning home before the old requests finished reuses their existing seat.
+    for (const seat of this.byVm.get(destination)?.values() || []) if (seat.seatKey === seatKey) return seat
+    return null
+  }
+
+  setRootVm(seatKey, vmId, familyMode) {
+    const previous = this.roots.get(seatKey)
+    if (familyMode) this.roots.set(seatKey, { vmId, expiresAt: Date.now() + this.stickyTtlMs() })
+    if (previous && previous.vmId !== vmId) {
+      if (!familyMode) this.roots.delete(seatKey)
+      for (const ticket of this.vmQueues.get(previous.vmId) || []) {
+        if (ticket.child && ticket.seatKey === seatKey) ticket.wake?.()
+      }
+    }
+  }
+
+  rootVm(seatKey) {
+    const root = this.roots.get(seatKey)
+    if (root && Date.now() < root.expiresAt) return root.vmId
+    this.roots.delete(seatKey)
+    return null
   }
 
   openCount(vmId) {
@@ -145,17 +171,61 @@ export class SeatPlanner {
    */
   hasSeatWaiters(vmId, { before = null } = {}) {
     const id = String(vmId)
-    if ((this.vmQueues.get(id) || []).some((ticket) => ticket.kind === 'seat')) return true
+    const ahead = (ticket) => !before?.child || ticket.sequence < before.sequence
+    if ((this.vmQueues.get(id) || []).some((ticket) => ticket.kind === 'seat' && ahead(ticket))) return true
     for (const ticket of this.globalQueue) {
       if (ticket === before) break
-      if (ticket.accepts(id)) return true
+      if (ticket.accepts(id) && ahead(ticket)) return true
     }
     return false
   }
 
   /** Seated requests of this VM already waiting for concurrency: newcomers line up behind them. */
   hasConcWaiters(vmId) {
-    return (this.vmQueues.get(String(vmId)) || []).some((ticket) => ticket.kind === 'conc')
+    return (this.vmQueues.get(String(vmId)) || []).some((ticket) => ticket.kind === 'conc' && !ticket.child)
+  }
+
+  earlierSubagentWaiting(child) {
+    for (const other of this.subagents.get(child.seatKey) || []) {
+      if (!other.running && other.order != null && other.order < child.order) return true
+    }
+    return false
+  }
+
+  trackSubagent(home) {
+    const { seatKey } = home
+    const family = this.subagents.get(seatKey) || new Set()
+    const child = {
+      ...home,
+      running: false,
+      order: null,
+      closed: false,
+      close: () => {
+        if (!family.delete(child)) return
+        child.closed = true
+        if (!family.size) this.subagents.delete(seatKey)
+        const seat = this.seatOf(seatKey)
+        this.finishDialog(seat)
+        this.pump(child.vmId)
+        const current = this.roots.get(seatKey)?.vmId
+        if (current && current !== child.vmId) this.pump(current)
+        this.changed()
+      },
+    }
+    family.add(child)
+    this.subagents.set(seatKey, family)
+    this.changed()
+    return child
+  }
+
+  subagentCounts(seatKey) {
+    let running = 0
+    let queued = 0
+    for (const child of this.subagents.get(seatKey) || []) {
+      if (child.running) running++
+      else queued++
+    }
+    return { running, queued }
   }
 
   open(seatKey, { vmId, accountId = null, cap = 0 }) {
@@ -191,11 +261,13 @@ export class SeatPlanner {
    * as a new open. `index` is kept when that cell is free. `heldUntil` is
    * only a restart race: the dialog already ended, so the slot frees unless
    * that session queues again before the timer. It is not sticky TTL.
+   * `home: false` books the cell only, like a family seat after leaveHome:
+   * the session's home is elsewhere and this cell frees with its last request.
    */
-  restore(seatKey, { vmId, accountId = null, index = null, heldUntil = null, cap = 0 } = {}) {
+  restore(seatKey, { vmId, accountId = null, index = null, heldUntil = null, cap = 0, home = true } = {}) {
     const key = String(seatKey || '')
     const id = String(vmId || '')
-    if (!key || !id || this.seats.has(key)) return null
+    if (!key || !id || (home && this.seats.has(key))) return null
     let book = this.byVm.get(id)
     if (!book) {
       book = new Map()
@@ -216,7 +288,7 @@ export class SeatPlanner {
       live: true,
     }
     book.set(slot, seat)
-    this.seats.set(key, seat)
+    if (home) this.seats.set(key, seat)
     if (cap) this.noteCap(id, cap)
     if (until) this.armHold(seat)
     this.changed()
@@ -249,11 +321,15 @@ export class SeatPlanner {
     }
     if (seat.inflight === 0 && !followUp) this.finishDialog(seat)
     this.pump(seat.vmId)
+    const current = this.roots.get(seat.seatKey)?.vmId
+    if (current && current !== seat.vmId) this.pump(current)
   }
 
   /** A later request is queued, or already granted and not yet taken by its caller. */
   followUpWaiting(seat) {
-    const mine = (ticket) => ticket.seatKey === seat.seatKey
+    if (this.seatOf(seat.seatKey) !== seat) return false
+    if (this.subagents.has(seat.seatKey) && this.roots.get(seat.seatKey)?.vmId === seat.vmId) return true
+    const mine = (ticket) => ticket.seatKey === seat.seatKey && (!ticket.child || ticket.vmId === seat.vmId)
     for (const queue of this.vmQueues.values()) {
       if (queue.some(mine)) return true
     }
@@ -334,6 +410,14 @@ export class SeatPlanner {
     if (book && book.size === 0) this.byVm.delete(seat.vmId)
   }
 
+  /** Keep a draining family seat in this VM's book until its last reservation ends. */
+  leaveHome(seat) {
+    if (seat.family && seat.inflight > 0) {
+      if (this.seats.get(seat.seatKey) === seat) this.seats.delete(seat.seatKey)
+      this.changed()
+    } else this.free(seat)
+  }
+
   enqueue(ticket) {
     ticket.queued = true
     if (ticket.vmId) {
@@ -348,15 +432,17 @@ export class SeatPlanner {
   }
 
   remove(ticket) {
-    if (!ticket?.queued) return
-    const seatKey = ticket.seatKey
-    const vmId = ticket.vmId
-    this.unlink(ticket)
-    const seat = vmId ? this.seatOf(seatKey) : null
-    // A timeout never calls release. Rearm the sticky hold once this VM's
-    // queue is empty so the seat does not stay taken after the session gave up.
-    if (seat?.vmId === vmId) this.armHold(seat)
-    this.changed()
+    if (ticket?.queued) {
+      const { seatKey, vmId } = ticket
+      this.unlink(ticket)
+      const seat = vmId ? this.seatOf(seatKey) : null
+      // A timeout never calls release. Rearm the sticky hold once this VM's
+      // queue is empty so the seat does not stay taken after the session gave up.
+      if (seat?.vmId === vmId) this.armHold(seat)
+      this.changed()
+    }
+    // A migration ticket can also be the last request keeping its source seat alive.
+    if (ticket?.departingSeat) this.finishDialog(ticket.departingSeat)
   }
 
   unlink(ticket) {
@@ -401,6 +487,10 @@ export class SeatPlanner {
     for (const [id, queue] of this.vmQueues) {
       for (const ticket of queue) {
         if (ticket.seatKey !== seatKey) continue
+        if (ticket.child) {
+          if (id === vmId) ticket.kind = 'conc'
+          continue
+        }
         if (id === vmId && ticket.kind === 'conc') continue
         moved.push(ticket)
       }
@@ -446,12 +536,21 @@ export class SeatPlanner {
   pumpOne(vmId) {
     for (const kind of ['conc', 'seat']) {
       for (const ticket of [...(this.vmQueues.get(vmId) || [])]) {
+        if (ticket.child) ticket.kind = this.seatOf(ticket.seatKey, vmId)?.vmId === vmId ? 'conc' : 'seat'
         if (!ticket.queued || ticket.kind !== kind) continue
         if (ticket.expired?.()) {
           ticket.wake?.()
           continue
         }
-        if (!this.grant(ticket, vmId)) break
+        if (ticket.child && kind === 'seat') {
+          // This child needs a new root seat. Older global seekers may take it first.
+          for (const earlier of [...this.globalQueue]) {
+            if (earlier.sequence < ticket.sequence && earlier.accepts(vmId)) this.grant(earlier, vmId)
+          }
+          if (this.hasSeatWaiters(vmId, { before: ticket })) continue
+        }
+        // A child can be blocked on its own family while another root still has capacity.
+        if (!this.grant(ticket, vmId) && !ticket.child) break
       }
     }
     for (const ticket of [...this.globalQueue]) {
@@ -498,32 +597,40 @@ export class SeatPlanner {
   }
 
   /** Per-VM seat and queue counts; VMs absent from the map are idle. */
-  snapshot() {
+  snapshot(limitsOf = () => null) {
     const seats = {}
-    const row = (vmId) =>
-      (seats[vmId] ||= {
+    const row = (vmId, limits) =>
+      (seats[vmId] ??= {
         seats_used: 0,
-        seats_max: this.caps.get(vmId) || 0,
+        seats_max: limits?.subagents != null ? limits.seats : this.caps.get(vmId) || 0,
         seats_grace: 0,
         queue_depth: 0,
         conc_waiting: 0,
         sessions: [],
       })
     for (const [vmId, book] of this.byVm) {
-      const entry = row(vmId)
+      const limits = limitsOf(vmId)
+      const entry = row(vmId, limits)
       entry.seats_used = book.size
       const sessions = []
       for (const seat of book.values()) {
         if (seat.heldUntil != null || seat.graceUntil != null) entry.seats_grace += 1
-        sessions.push(sessionView(seat))
+        const view = sessionView(seat)
+        if (limits?.subagents != null) {
+          const { running, queued } = this.subagentCounts(seat.seatKey)
+          Object.assign(view, { subagents_running: running, subagents_queued: queued, subagents_max: limits.subagents })
+        }
+        sessions.push(view)
       }
       sessions.sort((a, b) => a.index - b.index)
       entry.sessions = sessions
     }
     for (const [vmId, queue] of this.vmQueues) {
-      const entry = row(vmId)
+      const entry = seats[vmId] || row(vmId, limitsOf(vmId))
       entry.queue_depth += queue.length
-      entry.conc_waiting += queue.filter((ticket) => ticket.kind === 'conc').length
+      entry.conc_waiting += queue.filter((ticket) =>
+        ticket.child ? ticket.child.waitReason === 'concurrency_limit' : ticket.kind === 'conc',
+      ).length
     }
     return { seats, global_queue_depth: this.globalQueue.length }
   }

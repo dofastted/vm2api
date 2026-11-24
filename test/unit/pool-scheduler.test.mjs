@@ -466,10 +466,12 @@ test('only the CRAG seat outside the signed quota leaves the pool, including a l
   const hostId = 'a'.repeat(64)
   const publicDir = cragSubscriptionPublicDirectory(root)
   fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
-  fs.writeFileSync(path.join(publicDir, 'host_id'), hostId)
+  // Explicit modes: crag-license rejects group-writable public files, and a
+  // developer umask of 0002 would otherwise create them that way.
+  fs.writeFileSync(path.join(publicDir, 'host_id'), hostId, { mode: 0o644 })
   const publish = (revision, slotLimit) => {
     const { code } = issueHostEntitlement(root, hostId, { revision, slot_limit: slotLimit })
-    fs.writeFileSync(path.join(publicDir, 'entitlement.code'), code)
+    fs.writeFileSync(path.join(publicDir, 'entitlement.code'), code, { mode: 0o644 })
   }
   publish(1, 2)
   for (const [index, id] of ['vm-01', 'vm-02'].entries()) {
@@ -3829,4 +3831,29 @@ test('fresh_account_isolation_ms: bootstrap escape releases a continuing convers
   assert.equal(served.ok, true, 'a brand-new pool must stay schedulable even for continuing conversations')
   assert.ok(served.vmId === 'vm-01' || served.vmId === 'vm-02')
   served.release()
+})
+
+test('a cold health cache is probed for every slot at once, not one slot after another', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let inflight = 0
+  let peak = 0
+  const calls = []
+  const pool = scheduler(root, {
+    workerHealth: async ({ vmId }) => {
+      calls.push(vmId)
+      inflight++
+      peak = Math.max(peak, inflight)
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      inflight--
+      return { ok: true, credential: { generation: 1, has_access: true } }
+    },
+  })
+  const candidates = await pool.eligibleCandidates({ model: 'claude-test' })
+  assert.ok(candidates.length >= 2)
+  assert.ok(peak >= 2, `health hops overlapped (peak ${peak})`)
+  assert.equal(new Set(calls).size, calls.length, 'each slot is probed once per scan')
+  // Warm cache: no further hops.
+  await pool.eligibleCandidates({ model: 'claude-test' })
+  assert.equal(calls.length, candidates.length)
 })

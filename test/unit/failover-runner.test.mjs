@@ -2003,6 +2003,82 @@ test('session queue timeout defaults to 15 minutes and reloads over the default'
   assert.equal(runner.config.session_queue_timeout_ms, 0)
 })
 
+test('batch member requests sharing a sticky key run concurrently, not serialized', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler })
+  const memberKey = 'p:anthropic:bg:key_1:s:abc#0'
+  let release
+  let entered
+  const holderEntered = new Promise((resolve) => {
+    entered = resolve
+  })
+  const holder = runner.run({
+    requestId: 'req-bg-1',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: memberKey,
+    batchMember: true,
+    callAttempt: () => {
+      entered()
+      return new Promise((resolve) => {
+        release = () => resolve(success())
+      })
+    },
+  })
+  await holderEntered
+  const second = await runner.run({
+    requestId: 'req-bg-2',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: memberKey,
+    batchMember: true,
+    callAttempt: () => success(),
+  })
+  assert.equal(second.ok, true)
+  release()
+  assert.equal((await holder).ok, true)
+  assert.equal(scheduler.selectCalls, 2)
+})
+
+test('a caller session id that looks like a batch member key is still serialized', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler, config: { session_queue_timeout_ms: 40 } })
+  const forgedKey = 'p:anthropic:k1:bg:s:ab#0'
+  let release
+  let entered
+  const holderEntered = new Promise((resolve) => {
+    entered = resolve
+  })
+  const holder = runner.run({
+    requestId: 'req-forged-1',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: forgedKey,
+    callAttempt: () => {
+      entered()
+      return new Promise((resolve) => {
+        release = () => resolve(success())
+      })
+    },
+  })
+  await holderEntered
+  let waiterCalls = 0
+  const second = await runner.run({
+    requestId: 'req-forged-2',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: forgedKey,
+    callAttempt: () => {
+      waiterCalls += 1
+      return success()
+    },
+  })
+  assert.equal(second.ok, false)
+  assert.equal(waiterCalls, 0)
+  release()
+  assert.equal((await holder).ok, true)
+})
+
 test('a same-session waiter times out without starting or overlapping the holder', async () => {
   const scheduler = new Scheduler([candidate(1)])
   const runner = new FailoverRunner({ scheduler, config: { session_queue_timeout_ms: 40 } })
@@ -2684,6 +2760,49 @@ test('keep_session_home with allowQueue:false: a home kernel with no free slot a
   assert.equal(result.accountId, 'account-1')
 })
 
+test('keep_session_home: home_slot_busy_max_wait_ms bounds the home retry with 529', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const noted = []
+  scheduler.noteKernelSlotBusy = (unit) => noted.push(unit.accountId)
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: pinnedStickyRouter(),
+    config: {
+      same_account_retry_delay_ms: 0,
+      home_slot_busy_retry_ms: 20,
+      home_slot_busy_max_wait_ms: 120,
+      keep_session_home: true,
+    },
+  })
+  const seen = []
+  const startedAt = Date.now()
+  const result = await runner.run({
+    requestId: 'req-home-slot-busy-bounded',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    stickyKey: 'sess:home',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return {
+        ok: false,
+        status: 503,
+        upstreamExecutions: 0,
+        body: { error: { type: 'api_error', code: 'slot_busy', message: 'no free slot' } },
+      }
+    },
+  })
+  const elapsed = Date.now() - startedAt
+  assert.ok(seen.length >= 2, 'retried home before giving up')
+  assert.ok(
+    seen.every((id) => id === 'account-1'),
+    'never spilled the transcript',
+  )
+  assert.ok(elapsed >= 120 && elapsed < 2000, `bounded wait (${elapsed}ms)`)
+  assert.equal(result.status, 529)
+  assert.equal(result.body.error.details.reason, 'session_home_slot_busy')
+  assert.equal(noted.length, seen.length, 'every kernel slot_busy reaches the lease ledger')
+})
+
 test('keep_session_home with allowQueue:false: pre-hop kernel slot_busy stamps zero attemptCount and zero hops', async () => {
   const previous = process.env.KIN_KERNEL_BIN
   process.env.KIN_KERNEL_BIN = process.execPath
@@ -3186,4 +3305,42 @@ test('#1562: CRAG pre-first-frame SOCKS5/transport_error 502 fails over across s
     assert.equal(scheduler.unitCircuit.snapshot('account-A').failures, 1)
     assert.equal(scheduler.unitCircuit.snapshot('account-B').failures, 1)
   }
+})
+
+test('timeout tracker: repeat trips back off 15/30/60 minutes; success forgets them, reset does not', async () => {
+  const { vmTimeoutTracker } = await import('../../src/lib/pool/failover-runner.mjs')
+  vmTimeoutTracker.reset()
+  const m = 60_000
+  assert.equal(vmTimeoutTracker.recordTrip('vm-t', 0), 1)
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 0), 0, 'one trip: no hold')
+  vmTimeoutTracker.recordTrip('vm-t', 10 * m)
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 10 * m), 25 * m)
+  vmTimeoutTracker.reset('vm-t')
+  vmTimeoutTracker.recordTrip('vm-t', 30 * m)
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 30 * m), 60 * m, 'reset keeps trip history')
+  vmTimeoutTracker.recordTrip('vm-t', 70 * m)
+  vmTimeoutTracker.recordTrip('vm-t', 80 * m)
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 80 * m), 140 * m, 'capped at 60 minutes')
+  assert.equal(vmTimeoutTracker.faultHoldUntil('vm-t', 80 * m + 3 * 60 * m), 0, 'trips age out of the 2h window')
+  vmTimeoutTracker.recordSuccess('vm-t')
+  assert.equal(vmTimeoutTracker.trips.has('vm-t'), false)
+  vmTimeoutTracker.reset()
+})
+
+test('timeout tracker: tripCount only counts trips inside the window and prunes the rest', async () => {
+  const { vmTimeoutTracker } = await import('../../src/lib/pool/failover-runner.mjs')
+  vmTimeoutTracker.reset()
+  const m = 60_000
+  vmTimeoutTracker.recordTrip('vm-t', 0)
+  vmTimeoutTracker.recordTrip('vm-t', 10 * m)
+  vmTimeoutTracker.recordTrip('vm-t', 130 * m)
+  // The oldest two have left the 2h window by now: the circuit log must not
+  // claim them. recordTrip is the only other writer and it is skipped while the
+  // fault is already set, so tripCount has to do the pruning itself.
+  assert.equal(vmTimeoutTracker.tripCount('vm-t', 140 * m), 1, 'aged-out trips are not counted')
+  assert.deepEqual(vmTimeoutTracker.trips.get('vm-t'), [130 * m], 'and are dropped from the list')
+  assert.equal(vmTimeoutTracker.tripCount('vm-t', 400 * m), 0, 'an empty window counts nothing')
+  assert.equal(vmTimeoutTracker.trips.has('vm-t'), false, 'the VM leaves the map once nothing is left')
+  assert.equal(vmTimeoutTracker.tripCount(null), 0)
+  vmTimeoutTracker.reset()
 })

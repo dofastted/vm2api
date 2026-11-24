@@ -27,7 +27,16 @@ export const FULL_GEMINI_CAPABILITIES = Object.freeze([
   'multimodal',
   'full_gemini_api',
 ])
-export const NATIVE_TUI_CAPABILITIES = Object.freeze(['streaming', 'native_tui'])
+export const NATIVE_TUI_CAPABILITIES = Object.freeze([
+  'streaming',
+  'native_tui',
+  'multi_turn',
+  'system_instruction',
+  'tools',
+  'generation_config',
+  'thinking',
+  'multimodal',
+])
 
 const MODEL_RE = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const SIG_MARK = '__ts'
@@ -183,20 +192,19 @@ export function unsignedToolCallId(rawId) {
     if (raw) rest = rest.slice(SIG_RAW.length)
     let digits = 0
     while (digits < rest.length && rest[digits] >= '0' && rest[digits] <= '9') digits++
+    if (digits === 0) continue
     const afterDigits = rest.slice(digits)
     if (!afterDigits.startsWith(SIG_END)) continue
     const encoded = afterDigits.slice(SIG_END.length)
-    if (digits > 0 && rest.slice(0, digits) !== String(encoded.length)) {
-      return { id, signature: '' }
-    }
-    if (!encoded) return { id, signature: '' }
+    if (!encoded || rest.slice(0, digits) !== String(encoded.length)) continue
+    if (!/^[A-Za-z0-9_-]+$/.test(encoded)) continue
     try {
       const buf = Buffer.from(encoded, 'base64url')
-      if (!buf.length) return { id, signature: '' }
+      if (!buf.length || buf.toString('base64url') !== encoded) continue
       const signature = raw ? buf.toString('utf8') : buf.toString('base64')
       return { id: id.slice(0, rel), signature }
     } catch {
-      return { id, signature: '' }
+      continue
     }
   }
   return { id, signature: '' }
@@ -575,7 +583,11 @@ function parseDataUrl(url) {
   const isBase64 = match[2] === ';base64'
   const raw = match[3] || ''
   if (isBase64) return { mimeType, data: raw }
-  return { mimeType, data: Buffer.from(decodeURIComponent(raw), 'utf8').toString('base64') }
+  try {
+    return { mimeType, data: Buffer.from(decodeURIComponent(raw), 'utf8').toString('base64') }
+  } catch {
+    return null
+  }
 }
 
 function mediaPartFromUrl(url, fallbackMime = 'image/png') {
@@ -1708,7 +1720,11 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
     const parts = []
     const signedTurn = msg.parts.some((p) => p.kind === 'tool_call' && p.signature)
     for (const p of msg.parts) {
-      if (p.kind === 'text') {
+      if (p.kind === 'thinking') {
+        if (p.signature && !claude) {
+          parts.push({ text: p.text || '', thought: true, thoughtSignature: p.signature })
+        }
+      } else if (p.kind === 'text') {
         if (p.text || (p.signature && !claude)) {
           const part = { text: p.text || '' }
           if (p.signature && !claude) part.thoughtSignature = p.signature
@@ -1965,10 +1981,19 @@ export function parseGeminiSseFrame(frame) {
     const raw = dataLines.join('\n')
     try {
       const parsed = JSON.parse(raw)
+      const status = Number.isInteger(parsed?.status)
+        ? parsed.status
+        : Number.isInteger(parsed?.error?.code)
+          ? parsed.error.code
+          : 502
       return {
         kind: 'error',
-        status: parsed?.error?.code || parsed?.status || 502,
-        code: parsed?.error?.code || parsed?.code || 'gemini_inference_failed',
+        status,
+        code:
+          (typeof parsed?.error?.code === 'string' && parsed.error.code) ||
+          (typeof parsed?.error?.status === 'string' && parsed.error.status) ||
+          (typeof parsed?.code === 'string' && parsed.code) ||
+          'gemini_inference_failed',
         message: parsed?.error?.message || parsed?.message || 'Gemini stream error',
       }
     } catch {
@@ -2157,7 +2182,7 @@ export function createGeminiCollector({ fallbackModel = '' } = {}) {
         }
         case 'thinking_signature': {
           const last = parts[parts.length - 1]
-          if (last && last.kind === 'thinking') last.signature = event.signature
+          if (last && last.kind === 'thinking' && !last.signature) last.signature = event.signature
           else parts.push({ kind: 'thinking', text: '', signature: event.signature })
           break
         }
@@ -2647,10 +2672,10 @@ export function createGeminiProtocolStreamEncoder(protocol, { model = '', respon
         }
         if (event.kind === 'thinking') {
           let out = ensureStart()
-          if (openBlock?.type !== 'thinking') {
+          if (openBlock?.type !== 'thinking' || openBlock.signed) {
             out += closeOpen()
             const index = blockIndex++
-            openBlock = { index, type: 'thinking' }
+            openBlock = { index, type: 'thinking', signed: false }
             out += sse('content_block_start', { index, content_block: { type: 'thinking', thinking: '' } })
           }
           out += sse('content_block_delta', {
@@ -2661,12 +2686,13 @@ export function createGeminiProtocolStreamEncoder(protocol, { model = '', respon
         }
         if (event.kind === 'thinking_signature') {
           let out = ensureStart()
-          if (openBlock?.type !== 'thinking') {
+          if (openBlock?.type !== 'thinking' || openBlock.signed) {
             out += closeOpen()
             const index = blockIndex++
-            openBlock = { index, type: 'thinking' }
+            openBlock = { index, type: 'thinking', signed: false }
             out += sse('content_block_start', { index, content_block: { type: 'thinking', thinking: '' } })
           }
+          openBlock.signed = true
           out += sse('content_block_delta', {
             index: openBlock.index,
             delta: { type: 'signature_delta', signature: event.signature },
@@ -2711,7 +2737,7 @@ export function createGeminiProtocolStreamEncoder(protocol, { model = '', respon
         let out = ensureStart(res.usage) + closeOpen()
         out += sse('message_delta', {
           delta: { stop_reason: stopToAnthropicReason(res.stopReason), stop_sequence: null },
-          usage: { output_tokens: res.usage?.output_tokens || 0 },
+          usage: toAnthropicUsage(res.usage || {}),
         })
         out += sse('message_stop', {})
         return out
@@ -2879,30 +2905,45 @@ export function createGeminiProtocolStreamEncoder(protocol, { model = '', respon
 
 /** Convenience helper: split incremental raw bytes into complete SSE frames. */
 export function createSseFrameSplitter(onFrame) {
+  const decoder = new TextDecoder('utf-8')
   let buffer = ''
+  const drain = () => {
+    while (true) {
+      const lf = buffer.indexOf('\n\n')
+      const crlf = buffer.indexOf('\r\n\r\n')
+      let boundary = -1
+      let width = 0
+      if (crlf >= 0 && (lf < 0 || crlf < lf)) {
+        boundary = crlf
+        width = 4
+      } else if (lf >= 0) {
+        boundary = lf
+        width = 2
+      } else {
+        break
+      }
+      const frame = buffer.slice(0, boundary + width)
+      buffer = buffer.slice(boundary + width)
+      onFrame(frame)
+    }
+  }
   return {
     push(chunk) {
-      buffer += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
-      while (true) {
-        const lf = buffer.indexOf('\n\n')
-        const crlf = buffer.indexOf('\r\n\r\n')
-        let boundary = -1
-        let width = 0
-        if (crlf >= 0 && (lf < 0 || crlf < lf)) {
-          boundary = crlf
-          width = 4
-        } else if (lf >= 0) {
-          boundary = lf
-          width = 2
-        } else {
-          break
-        }
-        const frame = buffer.slice(0, boundary + width)
-        buffer = buffer.slice(boundary + width)
-        onFrame(frame)
+      if (typeof chunk === 'string') {
+        buffer += chunk
+      } else if (chunk != null) {
+        const bytes = ArrayBuffer.isView(chunk)
+          ? chunk
+          : chunk instanceof ArrayBuffer
+            ? new Uint8Array(chunk)
+            : Buffer.from(chunk)
+        buffer += decoder.decode(bytes, { stream: true })
       }
+      drain()
     },
     flush() {
+      buffer += decoder.decode()
+      drain()
       const rem = buffer.trim()
       buffer = ''
       if (rem) onFrame(`${rem}\n\n`)

@@ -1,5 +1,5 @@
 import { createHash, createPublicKey, verify } from 'node:crypto'
-import { constants, createWriteStream, readFileSync } from 'node:fs'
+import { closeSync, constants, createWriteStream, fstatSync, openSync, readSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, open, rename, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { Transform } from 'node:stream'
@@ -328,11 +328,76 @@ export async function installGeminiPayload(source, destination, publicKey) {
   return parsed.version
 }
 
-export function readCragGeminiPackageAuthority(payloadDir, expectedPublicKeyPem = null) {
-  const manifestPath = path.join(payloadDir, 'manifest.json')
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+function readRegularSync(filename, limit) {
+  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
+  const fd = openSync(filename, flags)
+  try {
+    const info = fstatSync(fd)
+    if (!info.isFile() || info.size < 1 || info.size > limit) reject('gemini_payload_invalid_file')
+    const buffer = Buffer.alloc(limit + 1)
+    let offset = 0
+    while (offset < buffer.length) {
+      const n = readSync(fd, buffer, offset, buffer.length - offset, offset)
+      if (n === 0) break
+      offset += n
+    }
+    if (offset === 0 || offset > limit) reject('gemini_payload_invalid_file')
+    return buffer.subarray(0, offset)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+export function readPinnedCragGeminiPublicKeySha256(projectRoot) {
+  if (!projectRoot || typeof projectRoot !== 'string') return null
+  try {
+    const raw = readRegularSync(path.join(projectRoot, 'deploy', 'payload.json'), 256 * 1024)
+    const release = JSON.parse(raw.toString('utf8'))
+    const sha = release?.geminiDefaultLinuxAmd64?.assets?.['crag-license-public.pem']?.sha256
+    return typeof sha === 'string' && HEX64.test(sha) ? sha : null
+  } catch {
+    return null
+  }
+}
+
+export function readCragGeminiPackageAuthority(
+  payloadDir,
+  expectedPublicKeyPem = null,
+  { expectedPublicKeySha256 = null } = {},
+) {
+  const hasPem =
+    expectedPublicKeyPem != null &&
+    (typeof expectedPublicKeyPem === 'string'
+      ? expectedPublicKeyPem.trim().length > 0
+      : Buffer.isBuffer(expectedPublicKeyPem)
+        ? expectedPublicKeyPem.length > 0
+        : true)
+  const hasPinnedSha = typeof expectedPublicKeySha256 === 'string' && HEX64.test(expectedPublicKeySha256)
+  // Never self-attest by trusting crag-license-public.pem from payloadDir without an independent trust root.
+  if (!hasPem && !hasPinnedSha) reject('gemini_payload_invalid_signature')
+
+  const manifestBytes = readRegularSync(path.join(payloadDir, 'manifest.json'), 65536)
+  let manifest
+  try {
+    manifest = JSON.parse(manifestBytes.toString('utf8'))
+  } catch {
+    reject('gemini_payload_invalid_manifest')
+  }
   if (!isCragEncryptedManifest(manifest)) reject('gemini_payload_invalid_manifest')
-  const pem = expectedPublicKeyPem ?? readFileSync(path.join(payloadDir, 'crag-license-public.pem'))
-  const parsed = parseCragGeminiManifest(manifest, pem)
+
+  const bundledPem = readRegularSync(path.join(payloadDir, 'crag-license-public.pem'), 4096)
+  const bundledSha = createHash('sha256').update(bundledPem).digest('hex')
+  if (hasPinnedSha && bundledSha !== expectedPublicKeySha256) {
+    reject('gemini_payload_invalid_signature')
+  }
+
+  const verificationKey = hasPem ? expectedPublicKeyPem : bundledPem
+  const parsed = parseCragGeminiManifest(manifest, verificationKey)
+  if (hasPem && !rawEd25519Bytes(createPublicKey(bundledPem)).equals(parsed.authority.publicKeyBytes)) {
+    reject('gemini_payload_invalid_signature')
+  }
+  if (manifest.sha256['crag-license-public.pem'] !== bundledSha) {
+    reject('gemini_payload_invalid_signature')
+  }
   return parsed.authority
 }

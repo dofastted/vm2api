@@ -20,6 +20,7 @@ import {
   isGeminiPublicPath,
   isGeminiSharedPath,
   officialGeminiAuthUrl,
+  warmGeminiEnvironments,
 } from '../../src/lib/gemini/routes.mjs'
 
 const root = '/api/panel/gemini'
@@ -301,6 +302,24 @@ test('Gemini inventory hides evidence after same-ID endpoint or credential edits
 
 test('Gemini host inference evidence follows admitted runs and their bindings', { timeout: 15_000 }, () => {
   execFileSync('python3', ['-B', fileURLToPath(new URL('./gemini-host-evidence.py', import.meta.url))], {
+    stdio: 'pipe',
+    timeout: 12_000,
+  })
+})
+
+test('Gemini host auto-provisions models, plan, onboarding, and token refresh', { timeout: 15_000 }, () => {
+  execFileSync('python3', ['-B', fileURLToPath(new URL('./gemini-account-and-auto-provision.py', import.meta.url))], {
+    stdio: 'pipe',
+    timeout: 12_000,
+  })
+})
+
+// The default-payload fetcher used to hardcode the release version alongside the
+// manifest pin, and the two drifted for three releases (#1677). Driven from here
+// because `test:ci`'s standing set is 13 keywords that do not include this file:
+// CI picks it up as a modified test, the same way every non-core test here runs.
+test('the default Gemini payload fetcher derives its release from the manifest pin', { timeout: 15_000 }, () => {
+  execFileSync('python3', ['-B', fileURLToPath(new URL('./fetch-default-gemini-pins.py', import.meta.url))], {
     stdio: 'pipe',
     timeout: 12_000,
   })
@@ -740,12 +759,25 @@ test('Gemini public routes schedule one plain-text turn and reject other keys', 
     },
   })
   const res = { setHeader() {}, once() {} }
-  for (const group_type of ['all', 'anthropic', 'openai']) {
+  for (const group_type of ['anthropic', 'openai']) {
     const denied = await handle({ apiKeyKind: 'managed', apiKeyRecord: { group_type }, once() {} }, res)
     assert.equal(denied.status, 403)
     assert.equal(denied.body.error.code, 'gemini_key_required')
   }
   assert.equal((await handle({ apiKeyKind: 'master', once() {} }, res)).status, 403)
+  const allBareClaude = await handle(
+    {
+      method: 'POST',
+      url: '/v1/messages',
+      apiKeyKind: 'managed',
+      apiKeyRecord: { group_type: 'all' },
+      body: { model: 'claude-sonnet-4-6', messages: [{ role: 'user', content: 'hello' }] },
+      once() {},
+    },
+    res,
+  )
+  assert.equal(allBareClaude.status, 404)
+  assert.equal(allBareClaude.body.error.code, 'gemini_model_unavailable')
   const listed = await handle(
     {
       method: 'GET',
@@ -1365,5 +1397,289 @@ test('host installer refuses an unsigned manifest and never activates damaged pa
     } else {
       await assert.rejects(readSignedGeminiManifest(source, verificationKey), /gemini_payload_invalid_manifest/)
     }
+  }
+})
+
+test('Gemini environment concurrency config and strict OAuth proxy calibration digest', async () => {
+  for (const [role, allowed] of [
+    ['user', false],
+    ['super', false],
+    ['admin', true],
+  ]) {
+    assert.equal(authorizePanelRoute('PUT', `${environmentPath}/concurrency`, role).ok, allowed)
+  }
+
+  const operations = []
+  const run = setup((operation, payload) => {
+    operations.push([operation, payload])
+    if (operation === 'create') {
+      return { ...record, max_concurrency: payload.max_concurrency, active_slots: 0 }
+    }
+    if (operation === 'concurrency-set') {
+      return { ...record, max_concurrency: payload.max_concurrency, active_slots: 2 }
+    }
+    if (operation === 'get') return { ...record, max_concurrency: 10, active_slots: 0 }
+    if (operation === 'authorize') return { url: official, attempt_id: 'attempt-calibrated' }
+    if (operation === 'complete') return { ...record, auth_state: 'authorized', max_concurrency: 10, active_slots: 0 }
+    throw new Error(`unexpected op ${operation}`)
+  })
+
+  for (const invalid of [0, -1, 65, '10', 1.5, null]) {
+    const badCreate = await run('POST', `${root}/environments`, {
+      name: record.name,
+      proxy_id: record.proxy_id,
+      max_concurrency: invalid,
+    })
+    assert.equal(badCreate.status, 400)
+    assert.equal(badCreate.body.error.code, 'gemini_invalid_concurrency')
+
+    const badPut = await run('PUT', `${environmentPath}/concurrency`, { max_concurrency: invalid })
+    assert.equal(badPut.status, 400)
+    assert.equal(badPut.body.error.code, 'gemini_invalid_concurrency')
+  }
+  assert.deepEqual(operations, [])
+
+  const created = await run('POST', `${root}/environments`, {
+    name: record.name,
+    proxy_id: record.proxy_id,
+    max_concurrency: 10,
+  })
+  assert.equal(created.status, 200)
+  assert.equal(created.body.data.max_concurrency, 10)
+  assert.equal(created.body.data.active_slots, 0)
+
+  const scaled = await run('PUT', `${environmentPath}/concurrency`, { max_concurrency: 12 })
+  assert.equal(scaled.status, 200)
+  assert.equal(scaled.body.data.max_concurrency, 12)
+  assert.equal(scaled.body.data.active_slots, 2)
+
+  const expectedDigest = createHash('sha256').update(proxyUrl).digest('hex')
+  const authStart = await run('POST', `${environmentPath}/authorization`)
+  assert.equal(authStart.status, 200)
+  const authDone = await run('PUT', `${environmentPath}/authorization`, {
+    attempt_id: 'attempt-calibrated',
+    code: 'calibrated-code',
+  })
+  assert.equal(authDone.status, 200)
+
+  const authorizeOp = operations.find(([op]) => op === 'authorize')
+  const completeOp = operations.find(([op]) => op === 'complete')
+  assert.equal(authorizeOp[1].proxy_sha256, expectedDigest)
+  assert.equal(completeOp[1].proxy_sha256, expectedDigest)
+})
+
+test('Gemini scheduler allows 10 concurrent slots on acc1 with strict per-account proxy calibration', async () => {
+  const environments = [
+    {
+      id: 'gemini-acc1',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      proxy_id: 'px-1',
+      max_concurrency: 10,
+      models_discovered: true,
+      models: [model],
+    },
+    {
+      id: 'gemini-acc2',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      proxy_id: 'px-2',
+      max_concurrency: 2,
+      models_discovered: true,
+      models: [model],
+    },
+  ]
+  const proxyMap = {
+    'px-1': 'socks5h://u1:p1@192.0.2.101:1080',
+    'px-2': 'socks5h://u2:p2@192.0.2.102:1080',
+  }
+  const pool = new PoolScheduler()
+  const inflightPayloads = []
+  const releases = []
+  let resolveAll10
+  const tenActive = new Promise((resolve) => {
+    resolveAll10 = resolve
+  })
+
+  const scheduler = createGeminiScheduler({
+    poolScheduler: pool,
+    resolveProxy: (pid) => proxyMap[pid],
+    callHost: async (op, input) => {
+      if (op === 'list') return { payload_state: 'installed', environments: [environments[0]] }
+      if (op === 'get') return environments.find((e) => e.id === input.id)
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async (op, payload) => {
+      assert.equal(op, 'infer')
+      assert.equal(payload.id, 'gemini-acc1')
+      assert.equal(payload.proxy_id, 'px-1')
+      assert.equal(payload.proxy_sha256, createHash('sha256').update(proxyMap['px-1']).digest('hex'))
+      inflightPayloads.push(payload)
+      if (inflightPayloads.length === 10) resolveAll10()
+      const gate = new Promise((resolve) => releases.push(resolve))
+      return {
+        statusCode: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        destroy() {},
+        async *[Symbol.asyncIterator]() {
+          await gate
+          yield Buffer.from(
+            `data: {"candidates":[{"content":{"parts":[{"text":"slot-${payload.request_id}"}]},"finishReason":"STOP"}]}\n\n`,
+          )
+        },
+      }
+    },
+  })
+
+  const tasks = Array.from({ length: 10 }, (_, i) =>
+    scheduler.stream({
+      model,
+      requestId: `req-${i}`,
+      geminiBody: { model, contents: [{ role: 'user', parts: [{ text: `hi ${i}` }] }] },
+    }),
+  )
+  await tenActive
+  assert.equal(pool.inflight.get('gemini:gemini-acc1'), 10)
+  for (const release of releases) release()
+  const results = await Promise.all(tasks)
+  assert.equal(results.length, 10)
+  assert.equal(pool.inflight.size, 0)
+})
+
+test('warmGeminiEnvironments proactively warms authorized licensed OAuth envs and skips ineligible ones', async () => {
+  const warmedCalls = []
+  const envReady = {
+    id: 'gemini-aaaaaaaaaaaaaaaaaaaaaaaa',
+    proxy_id: 'px-1',
+    auth_method: 'oauth',
+    auth_state: 'authorized',
+    runtime_ready: true,
+    models_discovered: true,
+    crag_license: { valid: true },
+  }
+  const envNeedModels = {
+    id: 'gemini-eeeeeeeeeeeeeeeeeeeeeeee',
+    proxy_id: 'px-1',
+    auth_method: 'oauth',
+    auth_state: 'authorized',
+    runtime_ready: true,
+    models_discovered: false,
+    crag_license: { valid: true },
+  }
+  const envCold = {
+    id: 'gemini-bbbbbbbbbbbbbbbbbbbbbbbb',
+    proxy_id: 'px-1',
+    auth_method: 'oauth',
+    auth_state: 'authorized',
+    runtime_ready: false,
+    crag_license: { valid: true },
+  }
+  const envUnlicensed = {
+    id: 'gemini-cccccccccccccccccccccccc',
+    proxy_id: 'px-1',
+    auth_method: 'oauth',
+    auth_state: 'authorized',
+    runtime_ready: false,
+    crag_license: { valid: false },
+  }
+  const envApiKey = {
+    id: 'gemini-dddddddddddddddddddddddd',
+    proxy_id: 'px-1',
+    auth_method: 'api_key',
+    auth_state: 'authorized',
+    runtime_ready: false,
+  }
+  const report = await warmGeminiEnvironments({
+    proxyPool: () => ({
+      snapshot: () => ({ proxies: [{ id: 'px-1', enabled: true, status: 'ok', owner_user_id: null }] }),
+      getProxyByIdWithAuth: (id) => (id === 'px-1' ? { url: proxyUrl } : null),
+    }),
+    callHost: async (op, payload) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          payload_mode: 'crag_subscription',
+          environments: [envReady, envNeedModels, envCold, envUnlicensed, envApiKey],
+        }
+      }
+      warmedCalls.push([op, payload])
+      return payload.id === envNeedModels.id
+        ? { warmed: true, runtime_ready: true, warming: false }
+        : { warmed: false, runtime_ready: false, warming: true }
+    },
+  })
+  assert.deepEqual(report, { warmed: 2, warming: 1, skipped: 2 })
+  assert.equal(warmedCalls.length, 2)
+  assert.equal(warmedCalls[0][0], 'warm')
+  assert.equal(warmedCalls[0][1].id, envNeedModels.id)
+  assert.equal(warmedCalls[1][0], 'warm')
+  assert.equal(warmedCalls[1][1].id, envCold.id)
+  assert.equal(warmedCalls[1][1].proxy_id, 'px-1')
+  assert.equal(warmedCalls[1][1].proxy_url, proxyUrl)
+  assert.equal(warmedCalls[1][1].proxy_sha256, createHash('sha256').update(proxyUrl).digest('hex'))
+})
+test('a host error code the control plane knows survives, and only an unknown one collapses (#1622)', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-authcode-'))
+  const socketPath = path.join(directory, 'control.sock')
+  const previous = process.env.KIN_GEMINI_HOST_SOCKET
+  process.env.KIN_GEMINI_HOST_SOCKET = socketPath
+  let code = 'gemini_authorization_unavailable'
+  const server = http.createServer(async (request, response) => {
+    for await (const chunk of request) void chunk
+    response.writeHead(503, { 'Content-Type': 'application/json' })
+    response.end(JSON.stringify({ code }))
+  })
+  t.after(async () => {
+    if (previous === undefined) delete process.env.KIN_GEMINI_HOST_SOCKET
+    else process.env.KIN_GEMINI_HOST_SOCKET = previous
+    await new Promise((resolve) => server.close(resolve))
+    await rm(directory, { recursive: true, force: true })
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, resolve)
+  })
+
+  // The socket answered, so the host service is up and it is the authorization
+  // launch that failed. Reporting 'no host service' instead sent #1622 auditing
+  // the service and its socket while the real fault was on the egress path.
+  await assert.rejects(callGeminiHost('authorization', { id: record.id }), {
+    code: 'gemini_authorization_unavailable',
+    status: 503,
+  })
+
+  // The allow-list itself still holds: a code this version does not know stays
+  // collapsed rather than being forwarded to the panel unvetted.
+  code = 'gemini_not_a_real_code'
+  await assert.rejects(callGeminiHost('authorization', { id: record.id }), { code: 'gemini_host_unavailable' })
+})
+
+test('synchronous host errors and polled test-chat runs report the same resident-pool copy for native worker/tty faults', async () => {
+  for (const code of ['gemini_native_worker_unavailable', 'gemini_native_tty_unavailable']) {
+    const run = setup((operation) => {
+      if (operation === 'get') {
+        return {
+          ...record,
+          auth_method: 'oauth',
+          auth_state: 'authorized',
+          models_discovered: true,
+          models: [model],
+        }
+      }
+      if (operation === 'test-chat') {
+        throw Object.assign(new Error(code), { code, status: 503 })
+      }
+      if (operation === 'test-chat-status') {
+        return { state: 'failed', text: '', error: { code } }
+      }
+      throw new Error(`unexpected ${operation}`)
+    })
+    const startRes = await run('POST', `${environmentPath}/test-chat`, { model, prompt: 'hello' })
+    const pollRes = await run('GET', `${environmentPath}/test-chat/${runId}`)
+    assert.equal(startRes.status, 503)
+    assert.equal(startRes.body.error.code, code)
+    assert.equal(pollRes.status, 200)
+    assert.equal(pollRes.body.data.error.code, code)
+    assert.equal(startRes.body.error.message, pollRes.body.data.error.message)
   }
 })

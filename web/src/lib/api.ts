@@ -174,6 +174,9 @@ export type VmPatch = {
   max_rpm?: number | null
   /** OpenAI only; null clears the pin and follows codex.quota.max_sessions. */
   max_sessions?: number | null
+  /** Claude family mode; null clears the slot override. */
+  max_primary_sessions?: number | null
+  max_subagents_per_session?: number | null
   session_slots?: number | null
   quota_override?: VmQuotaOverride | null
   allowed_models?: string[]

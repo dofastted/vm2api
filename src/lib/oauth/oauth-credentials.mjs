@@ -137,6 +137,76 @@ export function slotWorkerCredentialPath(homeDir) {
   return path.join(homeDir, '.claude', 'credentials.json')
 }
 
+const SLOT_CREDENTIAL_EMAIL_KEYS = ['email', 'emailAddress', 'email_address']
+
+function deleteSlotCredentialEmailKeys(target) {
+  if (!target || typeof target !== 'object' || Array.isArray(target)) return false
+  let removed = false
+  for (const key of SLOT_CREDENTIAL_EMAIL_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(target, key)) {
+      delete target[key]
+      removed = true
+    }
+  }
+  return removed
+}
+
+/** Strip email attributes from an Anthropic slot credentials.json document so the VM never sees them. */
+export function stripSlotCredentialEmail(doc) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return { changed: false, doc }
+  let changed = deleteSlotCredentialEmailKeys(doc)
+  if (deleteSlotCredentialEmailKeys(doc.claudeAiOauth)) changed = true
+  if (deleteSlotCredentialEmailKeys(doc.anthropicApiKey)) changed = true
+  return { changed, doc }
+}
+
+/** Strip email attributes from raw credentials.json bytes; clean or non-JSON input returns the original buffer. */
+export function stripSlotCredentialEmailBytes(raw) {
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(String(raw ?? ''), 'utf8')
+  let parsed
+  try {
+    parsed = JSON.parse(buf.toString('utf8'))
+  } catch {
+    return { changed: false, data: buf }
+  }
+  const { changed, doc } = stripSlotCredentialEmail(parsed)
+  if (!changed) return { changed: false, data: buf }
+  return { changed: true, data: Buffer.from(`${JSON.stringify(doc, null, 2)}\n`, 'utf8') }
+}
+
+/** Remove legacy email fields from an existing slot credentials.json in place without rewriting clean files. */
+export function stripWorkerCredentialEmail(homeDir, { uid, gid } = {}) {
+  const file = slotWorkerCredentialPath(homeDir)
+  if (!file) return { changed: false }
+  let raw
+  let prevMode = 0o600
+  try {
+    const st = fs.lstatSync(file)
+    if (!st.isFile()) return { changed: false }
+    prevMode = st.mode & 0o777
+    raw = fs.readFileSync(file)
+  } catch {
+    return { changed: false }
+  }
+  const cleaned = stripSlotCredentialEmailBytes(raw)
+  if (!cleaned.changed) return { changed: false }
+  try {
+    fs.chmodSync(file, 0o600)
+  } catch {}
+  atomicWriteJson(file, cleaned.data.toString('utf8'), { mode: 0o600 })
+  if (uid != null && gid != null) {
+    try {
+      fs.chownSync(file, uid, gid)
+    } catch {}
+  } else {
+    chownSlotCredentialFile(homeDir, file)
+  }
+  try {
+    fs.chmodSync(file, prevMode || 0o444)
+  } catch {}
+  return { changed: true, path: file }
+}
+
 function regularOauthGrant(file) {
   let st
   try {
@@ -200,8 +270,10 @@ export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false
   if (!fs.existsSync(workerFile)) {
     if (!adopt && !create) return { wrote: false, error: 'worker credentials.json missing' }
     fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 })
-    if (adopt) fs.copyFileSync(officialFile, workerFile)
-    else fs.writeFileSync(workerFile, '{}\n', { mode: 0o600 })
+    if (adopt) {
+      const adopted = stripSlotCredentialEmailBytes(fs.readFileSync(officialFile))
+      fs.writeFileSync(workerFile, adopted.data, { mode: 0o600 })
+    } else fs.writeFileSync(workerFile, '{}\n', { mode: 0o600 })
     fs.chmodSync(workerFile, 0o600)
     if (uid != null && gid != null) {
       try {
@@ -209,13 +281,19 @@ export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false
       } catch {}
     }
   } else if (adopt) {
-    fs.copyFileSync(officialFile, workerFile)
+    const adopted = stripSlotCredentialEmailBytes(fs.readFileSync(officialFile))
+    try {
+      fs.chmodSync(workerFile, 0o600)
+    } catch {}
+    fs.writeFileSync(workerFile, adopted.data, { mode: 0o600 })
     fs.chmodSync(workerFile, 0o600)
     if (uid != null && gid != null) {
       try {
         fs.chownSync(workerFile, uid, gid)
       } catch {}
     }
+  } else {
+    stripWorkerCredentialEmail(homeDir, { uid, gid })
   }
   fs.mkdirSync(claudeDir, { recursive: true })
   try {
@@ -482,7 +560,7 @@ export function writeWorkerCredentialFile(homeDir, cred) {
   }
   if (n.refresh_token && !isOfficialSetupTokenMode(mode)) oauth.refreshToken = n.refresh_token
   if (expiresAtMs) oauth.expiresAt = expiresAtMs
-  if (n.email) oauth.email = n.email
+  // Email stays on the control plane (vm.json / DB); never expose it inside the VM.
   if (n.account_uuid) oauth.accountUuid = n.account_uuid
   if (n.org_uuid) oauth.orgUuid = n.org_uuid
   if (scopes.length) oauth.scopes = scopes
@@ -535,6 +613,7 @@ export function ensureSlotSubscriptionType(homeDir, accountTier = null, { source
 
   const tier = identified || 'pro'
   oauth.subscriptionType = tier
+  stripSlotCredentialEmail(doc)
   try {
     fs.chmodSync(file, 0o600)
   } catch {}

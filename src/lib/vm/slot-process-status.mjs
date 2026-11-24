@@ -12,7 +12,7 @@ import { resolveKernelDataplane } from './slot-engine.mjs'
 import { slotHost } from './slot-host.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
-import { hasClusterFingerprintBinds } from '../cluster/remote-slot.mjs'
+import { hasClusterComputerBinds } from '../cluster/slot-computer-files.mjs'
 import { runSlotProcess } from '../transport/slot-oauth.mjs'
 import { slotExecArgv, slotExecContainer } from './slot-exec.mjs'
 import { inspectContainerOrNull } from '../cluster/docker-remote.mjs'
@@ -60,7 +60,7 @@ export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect 
     return { ok: false, code: 'telemetry_runtime_unavailable' }
   }
   if (!runtime?.State?.Running) return { ok: true, running: false, state: 'stopped' }
-  const needsRecreate = Boolean(vm.node_id) && !isKvmRuntime(vm) && !hasClusterFingerprintBinds(runtime)
+  const needsRecreate = Boolean(vm.node_id) && !isKvmRuntime(vm) && !hasClusterComputerBinds(runtime)
   const recreateMeta = needsRecreate ? { needsRecreate: true } : {}
   const env = run === runSlotProcess ? host.dockerEnv() : undefined
   const attempt = () =>

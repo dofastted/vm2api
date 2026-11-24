@@ -9,6 +9,7 @@ import {
   CRAG_GEMINI_PRODUCT,
   installGeminiPayload,
   readCragGeminiPackageAuthority,
+  readPinnedCragGeminiPublicKeySha256,
   verifyCragGeminiPayload,
   verifyGeminiPayload,
 } from '../../src/lib/gemini/payload.mjs'
@@ -209,6 +210,162 @@ test('CRAG encrypted craggemini payload verification rejects tampering, wrong is
   })
 })
 
+test('readCragGeminiPackageAuthority enforces independent trust root and rejects symlinks', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-trust-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const wrongAuthority = makeAuthority()
+  const { dir } = seedCragGeminiPayloadDir(path.join(root, 'pkg'), authority, { agyDigestOverride: AGY_SHA256 })
+  const pinnedSha = sha256(Buffer.from(authority.publicPem))
+
+  // Never self-attest when neither explicit PEM nor SHA-256 pin is provided.
+  assert.throws(() => readCragGeminiPackageAuthority(dir), { code: 'gemini_payload_invalid_signature' })
+  assert.throws(() => readCragGeminiPackageAuthority(dir, ''), { code: 'gemini_payload_invalid_signature' })
+  assert.throws(() => readCragGeminiPackageAuthority(dir, null, { expectedPublicKeySha256: 'not-hex' }), {
+    code: 'gemini_payload_invalid_signature',
+  })
+
+  // Valid SHA-256 pin verifies manifest and returns package authority.
+  const pinned = readCragGeminiPackageAuthority(dir, null, { expectedPublicKeySha256: pinnedSha })
+  assert.equal(pinned.issuerId, authority.issuerId)
+  assert.equal(pinned.payloadKeyId, authority.payloadKeyId)
+  assert.equal(pinned.product, CRAG_GEMINI_PRODUCT)
+
+  // Mismatched SHA-256 pin rejected.
+  assert.throws(
+    () => readCragGeminiPackageAuthority(dir, null, { expectedPublicKeySha256: sha256(wrongAuthority.publicPem) }),
+    { code: 'gemini_payload_invalid_signature' },
+  )
+
+  // Tampered bundled PEM rejected even when expectedPublicKeyPem is supplied.
+  const swappedDir = seedCragGeminiPayloadDir(path.join(root, 'swapped-pem'), authority, {
+    agyDigestOverride: AGY_SHA256,
+  }).dir
+  fs.writeFileSync(path.join(swappedDir, 'crag-license-public.pem'), wrongAuthority.publicPem)
+  assert.throws(() => readCragGeminiPackageAuthority(swappedDir, authority.publicPem), {
+    code: 'gemini_payload_invalid_signature',
+  })
+
+  // deploy/payload.json pin extraction succeeds on valid pin and returns null otherwise.
+  const proj = path.join(root, 'proj')
+  fs.mkdirSync(path.join(proj, 'deploy'), { recursive: true })
+  assert.equal(readPinnedCragGeminiPublicKeySha256(proj), null)
+  fs.writeFileSync(
+    path.join(proj, 'deploy', 'payload.json'),
+    JSON.stringify({
+      geminiDefaultLinuxAmd64: {
+        assets: { 'crag-license-public.pem': { sha256: pinnedSha } },
+      },
+    }),
+  )
+  assert.equal(readPinnedCragGeminiPublicKeySha256(proj), pinnedSha)
+
+  // Symlinked manifest.json or crag-license-public.pem must be rejected via O_NOFOLLOW.
+  if (process.platform !== 'win32') {
+    const symManifest = seedCragGeminiPayloadDir(path.join(root, 'sym-manifest'), authority, {
+      agyDigestOverride: AGY_SHA256,
+    }).dir
+    const externalManifest = path.join(root, 'external-manifest.json')
+    fs.renameSync(path.join(symManifest, 'manifest.json'), externalManifest)
+    fs.symlinkSync(externalManifest, path.join(symManifest, 'manifest.json'))
+    assert.throws(() => readCragGeminiPackageAuthority(symManifest, authority.publicPem))
+
+    const symPem = seedCragGeminiPayloadDir(path.join(root, 'sym-pem'), authority, {
+      agyDigestOverride: AGY_SHA256,
+    }).dir
+    const externalPem = path.join(root, 'external-public.pem')
+    fs.renameSync(path.join(symPem, 'crag-license-public.pem'), externalPem)
+    fs.symlinkSync(externalPem, path.join(symPem, 'crag-license-public.pem'))
+    assert.throws(() => readCragGeminiPackageAuthority(symPem, null, { expectedPublicKeySha256: pinnedSha }))
+  }
+})
+
+test('createGeminiCragSubscription resolves trust root from deploy/payload.json or publicKeyFile and fails closed', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-root-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const wrongAuthority = makeAuthority()
+  const pinnedSha = sha256(Buffer.from(authority.publicPem))
+
+  const proj = path.join(root, 'proj')
+  const currentDir = path.join(proj, 'share', 'gemini', 'current')
+  const { dir: seeded } = seedCragGeminiPayloadDir(path.join(root, 'seed'), authority, {
+    agyDigestOverride: AGY_SHA256,
+  })
+  fs.mkdirSync(path.dirname(currentDir), { recursive: true })
+  fs.cpSync(seeded, currentDir, { recursive: true })
+  fs.mkdirSync(path.join(proj, 'deploy'), { recursive: true })
+  const payloadJsonPath = path.join(proj, 'deploy', 'payload.json')
+  const machineIdPath = path.join(root, 'machine-id')
+  fs.writeFileSync(machineIdPath, 'fedcba9876543210fedcba9876543210\n')
+  const callHost = async () => ({})
+
+  // Without deploy/payload.json pin or publicKeyFile, runtime fails closed (no self-attestation).
+  const unpinned = createGeminiCragSubscription({
+    projectRoot: proj,
+    dataDir: path.join(root, 'data-unpinned'),
+    callHost,
+    origin: 'http://127.0.0.1:18790',
+    machineIdFile: machineIdPath,
+  })
+  assert.equal((await unpinned.status()).configured, false)
+
+  // With valid deploy/payload.json SHA-256 pin, runtime resolves package authority.
+  fs.writeFileSync(
+    payloadJsonPath,
+    JSON.stringify({
+      geminiDefaultLinuxAmd64: { assets: { 'crag-license-public.pem': { sha256: pinnedSha } } },
+    }),
+  )
+  const pinnedStatus = await unpinned.status()
+  assert.equal(pinnedStatus.configured, true)
+  assert.equal(pinnedStatus.issuer_public_key_id, authority.issuerId)
+  assert.equal(pinnedStatus.payload_key_id, authority.payloadKeyId)
+
+  // Mismatched deploy/payload.json pin fails closed.
+  fs.writeFileSync(
+    payloadJsonPath,
+    JSON.stringify({
+      geminiDefaultLinuxAmd64: {
+        assets: { 'crag-license-public.pem': { sha256: sha256(Buffer.from(wrongAuthority.publicPem)) } },
+      },
+    }),
+  )
+  assert.equal((await unpinned.status()).configured, false)
+
+  // Operator-rotated publicKeyFile overrides deploy/payload.json pin cleanly.
+  const rotatedKeyFile = path.join(root, 'rotated-public.pem')
+  fs.writeFileSync(rotatedKeyFile, authority.publicPem)
+  const rotated = createGeminiCragSubscription({
+    projectRoot: proj,
+    dataDir: path.join(root, 'data-rotated'),
+    publicKeyFile: rotatedKeyFile,
+    callHost,
+    origin: 'http://127.0.0.1:18790',
+    machineIdFile: machineIdPath,
+  })
+  const rotatedStatus = await rotated.status()
+  assert.equal(rotatedStatus.configured, true)
+  assert.equal(rotatedStatus.issuer_public_key_id, authority.issuerId)
+
+  // Explicitly configured missing publicKeyFile fails closed (does not fall back to deploy/payload.json).
+  fs.writeFileSync(
+    payloadJsonPath,
+    JSON.stringify({
+      geminiDefaultLinuxAmd64: { assets: { 'crag-license-public.pem': { sha256: pinnedSha } } },
+    }),
+  )
+  const missingKeySub = createGeminiCragSubscription({
+    projectRoot: proj,
+    dataDir: path.join(root, 'data-missing'),
+    publicKeyFile: path.join(root, 'does-not-exist.pem'),
+    callHost,
+    origin: 'http://127.0.0.1:18790',
+    machineIdFile: machineIdPath,
+  })
+  assert.equal((await missingKeySub.status()).configured, false)
+})
+
 test('verifyCragGeminiHostEntitlement & verifyCragGeminiSlotPermit enforce CRAGH1/CRAGH2/CRAGH3 and product isolation', () => {
   const authority = makeAuthority()
   const hostId = 'a1'.repeat(32)
@@ -299,6 +456,34 @@ test('verifyCragGeminiHostEntitlement & verifyCragGeminiSlotPermit enforce CRAGH
       verifyCragGeminiSlotPermit(permit.code, h3Claims, authority.publicKey, { expectedVmId: vmId, now: now + 1500 }),
     {
       code: 'license_binding_mismatch',
+    },
+  )
+
+  // Malformed base64url tokens fail with license_invalid (403), never raw TypeError.
+  assert.throws(() => parseCragGeminiMachineCode('CRAGM1.not!valid+base64'), {
+    code: 'license_invalid',
+    status: 403,
+  })
+  assert.throws(() => verifyCragGeminiHostEntitlement('CRAGH1.bad+payload.bad+sig', hostId, authority.publicKey), {
+    code: 'license_invalid',
+    status: 403,
+  })
+
+  // CRAGH3 with expires_at <= issued_at must be rejected as license_invalid.
+  const h3InvalidWindow = signToken(authority, 'CRAGH3', {
+    version: 3,
+    product: CRAG_GEMINI_PRODUCT,
+    host_id: hostId,
+    revision: 5,
+    issued_at: now,
+    expires_at: now,
+    grants: [{ slots: 1, expires_at: now }],
+  })
+  assert.throws(
+    () => verifyCragGeminiHostEntitlement(h3InvalidWindow, hostId, authority.publicKey, { now, allowExpired: true }),
+    {
+      code: 'license_invalid',
+      status: 403,
     },
   )
 })
@@ -591,4 +776,386 @@ test('end-to-end Gemini CRAG subscription: redeem, bind OAuth seat, skip api_key
   assert.equal(bind2Ok.payload.data.seat, 1)
   assert.equal(fs.existsSync(path.join(subscription.publicDir, 'entitlement.code')), true)
   assert.equal(fs.existsSync(path.join(subscription.publicDir, 'sync-pending')), false)
+})
+
+test('auto-binds CRAGGemini seats on create, panel inventory reconcile, and scheduler catalog', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-autobind-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const now = Math.floor(Date.now() / 1000)
+
+  let revision = 0
+  let nextSeat = 1
+  const seatMap = new Map()
+  const buildH2 = (hostId) => {
+    const roster = [...seatMap.values()]
+      .sort((a, b) => a.seat - b.seat)
+      .map(({ seat, permitSha }) => ({ seat, permit_sha256: permitSha }))
+    const claims = {
+      version: 2,
+      product: CRAG_GEMINI_PRODUCT,
+      host_id: hostId,
+      revision,
+      issued_at: now - 60,
+      expires_at: now + 86400,
+      slot_limit: 'unlimited',
+      roster,
+    }
+    return {
+      entitlement: signToken(authority, 'CRAGH2', claims),
+      expires_at: claims.expires_at,
+      slot_limit: claims.slot_limit,
+      revision: claims.revision,
+      used_slots: roster.length,
+      available_slots: 10_000 - roster.length,
+      reclaim_supported: true,
+    }
+  }
+
+  const fetchImpl = async (url, options) => {
+    const action = url.split('/').pop()
+    const body = JSON.parse(options.body)
+    if (action === 'redeem') {
+      revision += 1
+      return new Response(JSON.stringify({ ok: true, data: buildH2(body.host_id) }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    if (action === 'bind') {
+      const identity = parseCragGeminiMachineCode(body.machine_code)
+      if (!seatMap.has(identity.vm_id)) {
+        const seat = nextSeat++
+        const permit = issuePermit(authority, body.machine_code, body.host_id, seat)
+        seatMap.set(identity.vm_id, { seat, permitCode: permit.code, permitSha: permit.permit_sha256 })
+        revision += 1
+      }
+      const entry = seatMap.get(identity.vm_id)
+      const h2 = buildH2(body.host_id)
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          data: { entitlement: h2.entitlement, slot_permit: entry.permitCode, seat: entry.seat },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    throw new Error(`unexpected authority action: ${action}`)
+  }
+
+  const machines = {}
+  const activePermits = new Map()
+  const environments = new Map()
+  const addEnv = (env) => {
+    environments.set(env.id, env)
+    if (env.auth_method !== 'api_key') machines[env.id] = makeMachineCode(env.id)
+  }
+
+  const envLicenseView = (env) => {
+    if (env.auth_method === 'api_key') {
+      return { product: CRAG_GEMINI_PRODUCT, status: 'not_required', valid: true, seat_required: false, vm_id: env.id }
+    }
+    const seat = activePermits.get(env.id)
+    if (!seat) {
+      return {
+        product: CRAG_GEMINI_PRODUCT,
+        status: 'unlicensed',
+        valid: false,
+        seat_required: true,
+        vm_id: env.id,
+        code: 'license_required',
+      }
+    }
+    return {
+      product: CRAG_GEMINI_PRODUCT,
+      status: 'valid',
+      valid: true,
+      seat_required: true,
+      vm_id: env.id,
+      scope: 'host',
+      seat,
+    }
+  }
+
+  let createCounter = 0
+  const callHost = async (op, body) => {
+    if (op === 'list') {
+      return {
+        payload_state: 'installed',
+        payload_mode: 'crag_subscription',
+        release_activated: true,
+        environments: [...environments.values()].map((env) => ({ ...env, crag_license: envLicenseView(env) })),
+      }
+    }
+    if (op === 'get') {
+      const env = environments.get(body.id)
+      if (!env) throw Object.assign(new Error('not found'), { code: 'gemini_environment_not_found', status: 404 })
+      return { ...env, payload_mode: 'crag_subscription', crag_license: envLicenseView(env) }
+    }
+    if (op === 'create') {
+      const id = `gemini-auto-${++createCounter}`
+      const env = {
+        id,
+        name: body.name,
+        proxy_id: body.proxy_id,
+        auth_state: body.auth_method === 'api_key' ? 'authorized' : 'unverified',
+        auth_method: body.auth_method === 'api_key' ? 'api_key' : 'oauth',
+        models_discovered: body.auth_method === 'api_key',
+        models: body.auth_method === 'api_key' ? ['gemini-2.5-pro'] : [],
+      }
+      addEnv(env)
+      return { ...env, payload_mode: 'crag_subscription', crag_license: envLicenseView(env) }
+    }
+    if (op === 'license-machine-code') return { machine_code: machines[body.id].machine_code, vm_id: body.id }
+    if (op === 'license-activate') {
+      const claims = JSON.parse(Buffer.from(body.code.split('.')[1], 'base64url'))
+      activePermits.set(body.id, claims.seat)
+      return envLicenseView(environments.get(body.id))
+    }
+    throw new Error(`unexpected host op: ${op}`)
+  }
+
+  const machineIdPath = path.join(root, 'host-machine-id')
+  fs.writeFileSync(machineIdPath, 'fedcba9876543210fedcba9876543210\n')
+  const subscription = createGeminiCragSubscription({
+    projectRoot: root,
+    dataDir: path.join(root, 'data'),
+    resolveAuthority: () => ({
+      product: CRAG_GEMINI_PRODUCT,
+      publicKey: authority.publicKey,
+      publicKeyBytes: authority.publicBytes,
+      issuerId: authority.issuerId,
+      payloadKeyId: authority.payloadKeyId,
+      softwareVersion: '0.3.0',
+    }),
+    callHost,
+    fetchImpl,
+    origin: 'http://127.0.0.1:18790',
+    machineIdFile: machineIdPath,
+  })
+
+  const responses = []
+  const panel = createGeminiPanelHandler({
+    json: (_res, status, payload) => responses.push({ status, payload }),
+    readBody: async (req) => req.body,
+    proxyPool: () => ({
+      snapshot: () => ({ proxies: [{ id: 'px-1', enabled: true, status: 'ok', owner_user_id: null }] }),
+      getProxyByIdWithAuth: () => ({ url: 'socks5h://192.0.2.10:1080' }),
+    }),
+    cragSubscription: subscription,
+    callHost,
+  })
+  const res = { setHeader() {} }
+
+  // 1. Activate host subscription
+  const voucher = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
+  await panel({ method: 'POST', body: { redemption_code: voucher } }, res, '/api/panel/gemini/crag-subscription/redeem')
+  assert.equal(responses.pop().status, 200)
+
+  // 2. Creating an OAuth env auto-binds seat #1 immediately
+  await panel({ method: 'POST', body: { name: 'Fresh OAuth', proxy_id: 'px-1' } }, res, '/api/panel/gemini/environments')
+  const createdOAuth = responses.pop()
+  assert.equal(createdOAuth.status, 200)
+  assert.equal(createdOAuth.payload.data.crag_license.valid, true)
+  assert.equal(createdOAuth.payload.data.crag_license.seat, 1)
+
+  // 3. Creating an API Key env never consumes a seat
+  await panel(
+    {
+      method: 'POST',
+      body: { name: 'Key Env', proxy_id: 'px-1', auth_method: 'api_key', api_key: 'AIzaSyTestKeyValue1234567890' },
+    },
+    res,
+    '/api/panel/gemini/environments',
+  )
+  const createdKey = responses.pop()
+  assert.equal(createdKey.status, 200)
+  assert.equal(seatMap.size, 1)
+
+  // 4. Existing unlicensed OAuth env is auto-bound on GET /api/panel/gemini; disabled env is skipped
+  addEnv({
+    id: 'gemini-existing-oauth',
+    name: 'Existing OAuth',
+    proxy_id: 'px-1',
+    auth_state: 'authorized',
+    auth_method: 'oauth',
+    models_discovered: true,
+    models: ['gemini-3-flash'],
+  })
+  addEnv({
+    id: 'gemini-disabled-oauth',
+    name: 'Disabled OAuth',
+    proxy_id: 'px-1',
+    auth_state: 'disabled',
+    auth_method: 'oauth',
+    models_discovered: true,
+    models: ['gemini-3-flash'],
+  })
+  await panel({ method: 'GET' }, res, '/api/panel/gemini')
+  const listed = responses.pop()
+  assert.equal(listed.status, 200)
+  const existingView = listed.payload.data.environments.find((e) => e.id === 'gemini-existing-oauth')
+  const disabledView = listed.payload.data.environments.find((e) => e.id === 'gemini-disabled-oauth')
+  assert.equal(existingView.crag_license.valid, true)
+  assert.equal(existingView.crag_license.seat, 2)
+  assert.equal(disabledView.crag_license.valid, false)
+
+  // 5. Headless scheduler.catalog() also auto-binds an unlicensed ready OAuth env
+  addEnv({
+    id: 'gemini-sched-oauth',
+    name: 'Scheduler OAuth',
+    proxy_id: 'px-1',
+    auth_state: 'authorized',
+    auth_method: 'oauth',
+    models_discovered: true,
+    models: ['gemini-3-pro'],
+  })
+  const scheduler = createGeminiScheduler({ callHost, cragSubscription: subscription })
+  const catalog = await scheduler.catalog()
+  assert.ok(catalog.accounts.some((a) => a.id === 'gemini-sched-oauth'))
+  assert.equal(activePermits.get('gemini-sched-oauth'), 3)
+})
+
+test('createGeminiCragSubscription accepts path-prefixed authority URLs and surfaces stacked quota_grants', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-path-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const now = Math.floor(Date.now() / 1000)
+  const machineIdPath = path.join(root, 'machine-id')
+  fs.writeFileSync(machineIdPath, '22222222222222222222222222222222\n')
+
+  const seenUrls = []
+  const fetchImpl = async (url, options) => {
+    seenUrls.push(String(url))
+    const body = JSON.parse(options.body)
+    const ent = signToken(authority, 'CRAGH2', {
+      version: 2,
+      product: CRAG_GEMINI_PRODUCT,
+      host_id: body.host_id,
+      revision: 2,
+      issued_at: now - 5,
+      expires_at: now + 7 * 86400,
+      slot_limit: 20,
+      roster: [],
+    })
+    return {
+      ok: true,
+      status: 200,
+      headers: new Map([['x-request-id', 'req-stacked']]),
+      async json() {
+        return {
+          ok: true,
+          data: {
+            entitlement: ent,
+            slot_limit: 20,
+            expires_at: now + 7 * 86400,
+            quota_grants: [
+              { code_id: 'code-7d', expires_at: now + 7 * 86400, slot_limit: 10 },
+              { code_id: 'code-1m', expires_at: now + 30 * 86400, slot_limit: 10 },
+            ],
+          },
+        }
+      },
+    }
+  }
+
+  const sub = createGeminiCragSubscription({
+    projectRoot: root,
+    dataDir: path.join(root, 'data'),
+    resolveAuthority: () => ({
+      publicKey: authority.publicKey,
+      issuerId: authority.issuerId,
+      payloadKeyId: authority.payloadKeyId,
+    }),
+    callHost: async () => ({}),
+    fetchImpl,
+    origin: 'https://www.vm2api.org/gemini/',
+    machineIdFile: machineIdPath,
+  })
+  const voucher = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
+  const status = await sub.redeem(voucher)
+  assert.equal(seenUrls[0], 'https://www.vm2api.org/gemini/v1/host-subscriptions/redeem')
+  assert.equal(status.slot_limit, 20)
+  assert.equal(status.quota_grants.length, 2)
+})
+
+test('createGeminiCragSubscription defaults to https://www.vm2api.org/gemini and surfaces issuer_mismatch / payload_key_unknown without collapsing to authority_unavailable', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-default-origin-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const prevEnv = process.env.KIN_CRAG_GEMINI_AUTHORITY_URL
+  delete process.env.KIN_CRAG_GEMINI_AUTHORITY_URL
+  t.after(() => {
+    if (prevEnv === undefined) delete process.env.KIN_CRAG_GEMINI_AUTHORITY_URL
+    else process.env.KIN_CRAG_GEMINI_AUTHORITY_URL = prevEnv
+  })
+
+  const authority = makeAuthority()
+  const machineIdPath = path.join(root, 'machine-id')
+  fs.writeFileSync(machineIdPath, '33333333333333333333333333333333\n')
+
+  const seenUrls = []
+  let mode = 'issuer_mismatch'
+  const fetchImpl = async (url) => {
+    seenUrls.push(String(url))
+    if (mode === 'issuer_mismatch') {
+      return {
+        ok: false,
+        status: 409,
+        headers: new Map([['x-request-id', 'req-issuer']]),
+        async json() {
+          return { ok: false, error: { code: 'issuer_mismatch', message: 'The issuer public key does not match.' } }
+        },
+      }
+    }
+    return {
+      ok: false,
+      status: 400,
+      headers: new Map([['x-request-id', 'req-payload-key']]),
+      async json() {
+        return { ok: false, error: { code: 'payload_key_unknown', message: 'Unknown payload key.' } }
+      },
+    }
+  }
+
+  const dataDir = path.join(root, 'data')
+  const sub = createGeminiCragSubscription({
+    projectRoot: root,
+    dataDir,
+    resolveAuthority: () => ({
+      publicKey: authority.publicKey,
+      issuerId: authority.issuerId,
+      payloadKeyId: authority.payloadKeyId,
+    }),
+    callHost: async () => ({}),
+    fetchImpl,
+    machineIdFile: machineIdPath,
+  })
+  const panel = createGeminiPanelHandler({
+    json: (_res, status, payload) => ({ status, payload }),
+    readBody: async (req) => req.body,
+    cragSubscription: sub,
+    callHost: async () => ({}),
+  })
+  const res = { setHeader() {} }
+  const voucher = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
+
+  const r1 = await panel(
+    { method: 'POST', body: { redemption_code: voucher } },
+    res,
+    '/api/panel/gemini/crag-subscription/redeem',
+  )
+  assert.equal(seenUrls[0], 'https://www.vm2api.org/gemini/v1/host-subscriptions/redeem')
+  assert.equal(r1.status, 409)
+  assert.equal(r1.payload.error.code, 'issuer_mismatch')
+  assert.equal(fs.existsSync(path.join(dataDir, 'crag-gemini-subscription', 'public', 'sync-pending')), false)
+
+  mode = 'payload_key_unknown'
+  const r2 = await panel(
+    { method: 'POST', body: { redemption_code: voucher } },
+    res,
+    '/api/panel/gemini/crag-subscription/redeem',
+  )
+  assert.equal(r2.status, 400)
+  assert.equal(r2.payload.error.code, 'payload_key_unknown')
+  assert.equal(fs.existsSync(path.join(dataDir, 'crag-gemini-subscription', 'public', 'sync-pending')), false)
 })

@@ -1,11 +1,16 @@
 import type { Vm } from '@/types/panel-vm'
 import { describe, expect, it } from 'vitest'
 import {
+  DEFAULT_GEMINI_TEST_PROMPT,
+  defaultGeminiTestModel,
   geminiAccountStatus,
   geminiAuthorizationLabel,
+  geminiEligibilityNotice,
   geminiHostBlocker,
+  geminiInferenceErrorAction,
   geminiInferenceErrorLabel,
   geminiInferenceLabel,
+  groupGeminiModels,
 } from './gemini-account-status'
 import {
   accountStatus,
@@ -99,6 +104,34 @@ describe('Gemini account presentation', () => {
       group: 'unschedulable',
       blocker: '绑定代理不可用',
     })
+    expect(
+      geminiAccountStatus({
+        ...candidate,
+        crag_license: {
+          product: 'craggemini',
+          status: 'unlicensed',
+          valid: false,
+          code: 'license_required',
+        },
+      })
+    ).toMatchObject({
+      group: 'unschedulable',
+      blocker: '未绑定 CRAGGemini 订阅席位',
+    })
+    expect(
+      geminiAccountStatus({
+        ...candidate,
+        crag_license: {
+          product: 'craggemini',
+          status: 'valid',
+          valid: true,
+          seat: 1,
+        },
+      })
+    ).toMatchObject({
+      group: 'pending',
+      blocker: null,
+    })
   })
 
   it('shows known host blockers without treating them as credential failures', () => {
@@ -177,7 +210,19 @@ describe('Gemini account presentation', () => {
     expect(geminiInferenceErrorLabel('gemini_location_unsupported')).toBe(
       'Google 地区资格受限'
     )
+    expect(
+      geminiInferenceErrorLabel('gemini_account_verification_required')
+    ).toBe('Google 账号需先完成浏览器验证')
+    expect(geminiInferenceErrorLabel('gemini_account_ineligible')).toBe(
+      'Google 账号不符合 Antigravity 资格'
+    )
+    expect(geminiInferenceErrorLabel('license_required')).toBe(
+      '未绑定 CRAGGemini 订阅席位'
+    )
     expect(geminiInferenceErrorLabel('gemini_native_worker_unavailable')).toBe(
+      '宿主运行环境故障'
+    )
+    expect(geminiInferenceErrorLabel('gemini_authorization_unavailable')).toBe(
       '宿主运行环境故障'
     )
     expect(geminiInferenceErrorLabel('gemini_inference_failed')).toBe(
@@ -218,5 +263,158 @@ describe('Gemini account presentation', () => {
       }
     )
     expect([claude, codex].map(accountUsable)).toEqual([true, true])
+  })
+
+  it('defaults test prompt to hello and selects Gemini 4 neon when available', () => {
+    expect(DEFAULT_GEMINI_TEST_PROMPT).toBe('hello')
+    expect(
+      defaultGeminiTestModel([
+        'gemini-3-flash',
+        'gemini-4-neon-high',
+        'gemini-3.8-flash-high',
+      ])
+    ).toBe('gemini-4-neon-high')
+    expect(
+      defaultGeminiTestModel([
+        'gemini-4-neon-high',
+        'gemini-4-neon',
+        'gemini-3-flash',
+      ])
+    ).toBe('gemini-4-neon')
+    expect(
+      defaultGeminiTestModel(['gemini-3-flash', 'gemini-4-neon-medium'])
+    ).toBe('gemini-4-neon-medium')
+    expect(defaultGeminiTestModel(['gemini-3-flash', 'gemini-2.5-pro'])).toBe(
+      'gemini-3-flash'
+    )
+    expect(defaultGeminiTestModel([])).toBe('')
+  })
+
+  it('provides actionable remediation copy for upstream errors and validates Google verification links', () => {
+    expect(
+      geminiInferenceErrorAction('gemini_account_verification_required')
+    ).toContain('验证链接')
+    expect(geminiInferenceErrorAction('gemini_location_unsupported')).toContain(
+      '代理'
+    )
+    expect(geminiInferenceErrorAction('gemini_quota_exhausted')).toContain(
+      '配额'
+    )
+    expect(geminiInferenceErrorAction('gemini_oauth_required')).toContain(
+      '重新完成官方 Google 授权'
+    )
+    expect(geminiInferenceErrorAction('gemini_proxy_error')).toContain('SOCKS5')
+    expect(geminiInferenceErrorAction('gemini_inference_failed')).toContain(
+      '刷新'
+    )
+    expect(
+      geminiInferenceErrorAction('gemini_native_worker_unavailable')
+    ).toContain('Gemini 维护')
+    expect(
+      geminiInferenceErrorAction('gemini_authorization_unavailable')
+    ).toContain('授权进程')
+    expect(geminiInferenceErrorAction('license_unconfigured')).toContain(
+      '订阅 CRAG'
+    )
+    expect(geminiInferenceErrorAction('license_unconfigured')).not.toContain(
+      '设置 → CRAG 订阅'
+    )
+    expect(geminiInferenceErrorAction('unknown_raw_code')).toBeNull()
+
+    const validUrl =
+      'https://accounts.google.com/v3/signin/continue?plt=abc&sarp=1'
+    expect(
+      geminiEligibilityNotice({
+        eligibility: 'verification_required',
+        validation_url: validUrl,
+      })
+    ).toMatchObject({
+      label: expect.stringContaining('VALIDATION_REQUIRED'),
+      validationUrl: validUrl,
+    })
+    expect(
+      geminiEligibilityNotice({
+        eligibility: 'verification_required',
+        validation_url: 'https://evil.example/phish',
+      })?.validationUrl
+    ).toBeNull()
+    expect(geminiEligibilityNotice({ eligibility: null })).toBeNull()
+
+    const stale = {
+      eligibility: 'verification_required',
+      checked_at: '2026-11-24T01:00:00Z',
+    }
+    const run = (state: 'completed' | 'failed', finished_at: string) => ({
+      state,
+      finished_at,
+    })
+    // 验证后重新推理成功：旧资格结论不再提示。
+    expect(
+      geminiEligibilityNotice(stale, run('completed', '2026-11-24T02:00:00Z'))
+    ).toBeNull()
+    // 推理早于这次账号检查，或推理失败：仍要提示。
+    expect(
+      geminiEligibilityNotice(stale, run('completed', '2026-11-24T00:00:00Z'))
+    ).not.toBeNull()
+    expect(
+      geminiEligibilityNotice(stale, run('failed', '2026-11-24T02:00:00Z'))
+    ).not.toBeNull()
+    // 账号没有检查时间戳（面板的 checked_at 无兜底，缺字段就下发 null）时，
+    // 无法证明这次推理比资格结论更新，必须保留提示——否则后端仍按
+    // eligibility 冷却该账号，面板却不再显示验证入口。
+    expect(
+      geminiEligibilityNotice(
+        { eligibility: 'verification_required' },
+        run('completed', '2026-11-24T02:00:00Z')
+      )
+    ).not.toBeNull()
+    expect(
+      geminiEligibilityNotice(
+        { eligibility: 'verification_required', checked_at: null },
+        run('completed', '2026-11-24T02:00:00Z')
+      )
+    ).not.toBeNull()
+    expect(
+      geminiEligibilityNotice(
+        { eligibility: 'verification_required', checked_at: 'not-a-date' },
+        run('completed', '2026-11-24T02:00:00Z')
+      )
+    ).not.toBeNull()
+  })
+
+  it('groups Antigravity models into Google Gemini vs ag- prefixed Anthropic and OpenAI', () => {
+    const groups = groupGeminiModels(
+      [
+        'claude-sonnet-4-6-high',
+        'gemini-4-neon',
+        'gemini-4-argon',
+        'gpt-oss-120b-medium',
+      ],
+      [
+        { id: 'claude-sonnet-4-6-high', provider: 'anthropic', quota_group: '3p' },
+        { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
+        { id: 'gemini-4-argon', provider: 'google', quota_group: 'gemini-argon-wtu' },
+        { id: 'gpt-oss-120b-medium', provider: 'openai', quota_group: '3p' },
+      ]
+    )
+    expect(groups.map((g) => g.provider)).toEqual([
+      'google',
+      'anthropic',
+      'openai',
+    ])
+    expect(groups[0].models.map((m) => m.publicId)).toEqual([
+      'gemini-4-neon',
+      'gemini-4-argon',
+    ])
+    expect(groups[1].models[0]).toMatchObject({
+      rawId: 'claude-sonnet-4-6-high',
+      publicId: 'ag-claude-sonnet-4-6-high',
+      quotaGroup: '3p',
+    })
+    expect(groups[2].models[0]).toMatchObject({
+      rawId: 'gpt-oss-120b-medium',
+      publicId: 'ag-gpt-oss-120b-medium',
+      quotaGroup: '3p',
+    })
   })
 })
