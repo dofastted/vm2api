@@ -83,7 +83,10 @@ export function GeminiTestPanel({
   const resource = geminiResource(environment.id)
   const test = useGeminiTestChat(resource)
   const isOAuth = environment.auth_method === 'oauth'
-  const eligibilityNotice = geminiEligibilityNotice(environment.account)
+  const eligibilityNotice = geminiEligibilityNotice(
+    environment.account,
+    environment.last_inference
+  )
   const authorizationHint = isOAuth
     ? '请在「账号」完成 Google 授权后再试。'
     : '此 API Key 未处于已授权状态。'
