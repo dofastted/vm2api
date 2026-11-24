@@ -237,6 +237,7 @@ import { downloadReleaseKernel, kernelReleaseHttpStatus, listKernelReleaseVersio
 import {
   cragReleasePin,
   describeKernelCatalog,
+  geminiReleasePin,
   listKernelReleases,
   pullKernelRelease,
   selectKernelRelease,
@@ -3425,6 +3426,7 @@ export function createPanelHandler(ctx) {
           panel.ok({
             kernels: describeKernelCatalog(cfg.paths.project),
             crag_pin: cragReleasePin(cfg.paths.project),
+            gemini_pin: geminiReleasePin(cfg.paths.project),
             licenses,
             install_licenses: installLicenses,
             installations,

@@ -270,8 +270,19 @@ function releaseFetch() {
         size: 1024,
         browser_download_url: `https://github.com/dofastted/vm2api/releases/download/${tag}/crag-v2-licensed-amd64.tar.gz`,
       })
+      const geminiAssets = (tag) =>
+        ['craggemini', 'craggemini.payload.enc', 'libagy_bridge.so', 'crag-license-public.pem', 'manifest.json'].map(
+          (name) => ({
+            name,
+            size: 512,
+            browser_download_url: `https://github.com/dofastted/vm2api/releases/download/${tag}/${name}`,
+          }),
+        )
       const standard = 'payload-2026.11.14-crag-1.2.1'
       const legacy = `${standard}-legacy`
+      const geminiOk = 'payload-2026.11.24-gemini-0.4.6'
+      const geminiIncomplete = 'payload-2026.11.24-gemini-0.4.7'
+      const geminiDraft = 'payload-2026.11.24-gemini-0.4.8'
       return Response.json([
         { tag_name: 'v1.2.4', draft: true, prerelease: false, assets },
         { tag_name: 'v1.2.3', draft: false, prerelease: false, assets },
@@ -280,6 +291,14 @@ function releaseFetch() {
         { tag_name: 'payload-2026.11.15-crag-1.2.3', draft: false, assets: [] },
         { tag_name: legacy, draft: false, prerelease: true, assets: [crag(legacy)] },
         { tag_name: standard, draft: false, prerelease: true, assets: [crag(standard)] },
+        { tag_name: geminiDraft, draft: true, prerelease: true, assets: geminiAssets(geminiDraft) },
+        {
+          tag_name: geminiIncomplete,
+          draft: false,
+          prerelease: true,
+          assets: geminiAssets(geminiIncomplete).slice(0, 4),
+        },
+        { tag_name: geminiOk, draft: false, prerelease: true, assets: geminiAssets(geminiOk) },
       ])
     }
     if (href.endsWith('/releases/latest')) return Response.json({ tag_name: 'v1.2.3', assets })
@@ -315,6 +334,7 @@ test('pull route updates cache only and returns actionable paid asset failure wi
   assert.deepEqual(versions.body.data, {
     'cli-node': ['v1.2.3', 'v1.2.1'],
     crag: ['payload-2026.11.14-crag-1.2.1'],
+    craggemini: ['payload-2026.11.24-gemini-0.4.6'],
   })
   const historical = await route(root, 'POST', '/pull', { kernel: 'cli-node', tag: 'v1.2.1' }, options)
   assert.equal(historical.status, 200, JSON.stringify(historical.body))
@@ -353,6 +373,25 @@ test('catalog reports the deployed CRAG pin and omits an unusable one', async (t
   const body = (await route(root, 'GET', '')).body.data
   assert.equal(body.kernels[1].id, 'crag')
   assert.equal(body.kernels[1].payload_tag, undefined)
+  assert.equal(body.gemini_pin, null)
+  fs.writeFileSync(
+    path.join(deploy, 'payload.json'),
+    JSON.stringify({
+      crag_release: 'payload-2026.11.21-crag-3.1.12',
+      geminiDefaultLinuxAmd64: { tag: 'payload-2026.11.24-gemini-0.4.6' },
+    }),
+  )
+  assert.deepEqual((await route(root, 'GET', '')).body.data.gemini_pin, {
+    tag: 'payload-2026.11.24-gemini-0.4.6',
+    version: '0.4.6',
+  })
+  fs.writeFileSync(
+    path.join(deploy, 'payload.json'),
+    JSON.stringify({
+      geminiDefaultLinuxAmd64: { tag: 'v0.4.6' },
+    }),
+  )
+  assert.equal((await route(root, 'GET', '')).body.data.gemini_pin, null)
 })
 
 test('pull route follows the release pin only when the caller asks for it', async (t) => {

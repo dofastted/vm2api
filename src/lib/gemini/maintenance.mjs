@@ -133,6 +133,7 @@ function snapshotView(raw) {
       return { id: check.id, state: check.state, code: codeOf(check.code) }
     }),
     job,
+    ...(raw.supports_remote_releases === true ? { supports_remote_releases: true } : {}),
   }
 }
 
