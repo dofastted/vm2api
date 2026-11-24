@@ -108,6 +108,7 @@ export function publicEndpointView(ep, { reveal = false } = {}) {
     auth_scheme: endpointAuthScheme(ep),
     disable_cooling: !!ep.disable_cooling,
     priority: Number(ep.priority) || 0,
+    owner_user_id: ep.owner_user_id ? String(ep.owner_user_id).trim() || null : null,
     created_at: ep.created_at,
     updated_at: ep.updated_at,
     api_key_entries: (ep.api_key_entries || []).map((k) => ({
@@ -177,6 +178,7 @@ export class ApiEndpointStore {
       ),
       disable_cooling: !!input.disable_cooling,
       priority: Number(input.priority) || 0,
+      owner_user_id: input.owner_user_id ? String(input.owner_user_id).trim() || null : null,
       created_at: nowIso(),
       updated_at: nowIso(),
     }
@@ -215,6 +217,9 @@ export class ApiEndpointStore {
     }
     if (patch.disable_cooling != null) rec.disable_cooling = !!patch.disable_cooling
     if (patch.priority != null) rec.priority = Number(patch.priority) || 0
+    if (Object.prototype.hasOwnProperty.call(patch, 'owner_user_id')) {
+      rec.owner_user_id = patch.owner_user_id ? String(patch.owner_user_id).trim() || null : null
+    }
     rec.updated_at = nowIso()
     this.repo.updateEndpoint(rec)
     if (Array.isArray(patch.models)) this.replaceModels(id, patch.models)

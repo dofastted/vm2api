@@ -218,19 +218,51 @@ if [ "$STANDBY" = 0 ]; then
   export VM2API_BOOTSTRAP_LOCK_FD=9 VM2API_BOOTSTRAP_WRAP_CHANGED="$WRAP_CHANGED"
 fi
 
+# Upgrade guard: if an existing SQLite installation (data/kin.db) upgraded its Compose file
+# without setting VM2API_DB_DRIVER or DATABASE_URL in .env, keep SQLite instead of letting
+# docker-compose.yml's default DATABASE_HOST=127.0.0.1 accidentally boot an empty/unreachable PG.
+if [ "${VM2API_DB_DRIVER:-auto}" = "auto" ] && [ -f "${ROOT}/data/kin.db" ]; then
+  if [ -z "${DATABASE_URL:-}" ] && [ -z "${VM2API_DATABASE_URL:-}" ] \
+    && [ -z "$(env_get_file VM2API_DB_DRIVER "$ENVF")" ] \
+    && [ -z "$(env_get_file DATABASE_URL "$ENVF")" ] \
+    && [ -z "$(env_get_file VM2API_DATABASE_URL "$ENVF")" ]; then
+    VM2API_DB_DRIVER=sqlite
+    export VM2API_DB_DRIVER
+    echo "vm2api: existing SQLite detected (${ROOT}/data/kin.db) with no explicit PG config in .env; keeping SQLite. Run deploy/replace-db-to-pg.sh to migrate to PostgreSQL." >&2
+  fi
+fi
+
 # Wait briefly for PostgreSQL readiness when configured so cold container boots never race PG init
-if [ "${VM2API_DB_DRIVER:-auto}" = "postgres" ] || [ -n "${DATABASE_URL:-}" ] || [ -n "${VM2API_DATABASE_URL:-}" ] || [ -n "${DATABASE_HOST:-}" ] || [ -n "${PGHOST:-}" ]; then
-  if [ "${VM2API_DB_DRIVER:-auto}" != "sqlite" ] && command -v pg_isready >/dev/null 2>&1; then
-    pg_host="${DATABASE_HOST:-${PGHOST:-127.0.0.1}}"
-    pg_port="${DATABASE_PORT:-${PGPORT:-5432}}"
-    pg_user="${DATABASE_USER:-${PGUSER:-vm2api}}"
-    if [ -z "${DATABASE_URL:-}" ] && [ -z "${VM2API_DATABASE_URL:-}" ]; then
+if [ "${VM2API_DB_DRIVER:-auto}" != "sqlite" ] && { [ "${VM2API_DB_DRIVER:-auto}" = "postgres" ] || [ -n "${DATABASE_URL:-}" ] || [ -n "${VM2API_DATABASE_URL:-}" ] || [ -n "${DATABASE_HOST:-}" ] || [ -n "${PGHOST:-}" ]; }; then
+  if command -v pg_isready >/dev/null 2>&1; then
+    pg_url="${VM2API_DATABASE_URL:-${DATABASE_URL:-}}"
+    pg_ready=0
+    if [ -n "$pg_url" ]; then
       i=0
-      while [ "$i" -lt 20 ]; do
-        pg_isready -h "$pg_host" -p "$pg_port" -U "$pg_user" >/dev/null 2>&1 && break
+      while [ "$i" -lt 25 ]; do
+        if pg_isready -d "$pg_url" >/dev/null 2>&1; then
+          pg_ready=1
+          break
+        fi
         i=$((i + 1))
         sleep 1
       done
+    else
+      pg_host="${DATABASE_HOST:-${PGHOST:-127.0.0.1}}"
+      pg_port="${DATABASE_PORT:-${PGPORT:-5432}}"
+      pg_user="${DATABASE_USER:-${PGUSER:-vm2api}}"
+      i=0
+      while [ "$i" -lt 25 ]; do
+        if pg_isready -h "$pg_host" -p "$pg_port" -U "$pg_user" >/dev/null 2>&1; then
+          pg_ready=1
+          break
+        fi
+        i=$((i + 1))
+        sleep 1
+      done
+    fi
+    if [ "$pg_ready" != 1 ]; then
+      echo "vm2api: PostgreSQL not ready after 25s pre-wait; handing off to Node pool retry." >&2
     fi
   fi
 fi

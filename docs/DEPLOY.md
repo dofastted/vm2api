@@ -28,7 +28,7 @@ VM2API_DB_SECRET='再一串'
 | `kin-<槽>` | 每个**已启动**的槽 1 个 |
 | 没有 | 未启动的槽；同机其它项目的独立数据库 |
 
-> **从既有 SQLite 迁移到 PostgreSQL**：升级不会自动丢弃 `data/kin.db`，请按 [PostgreSQL 迁移指南](POSTGRES_MIGRATION.md) 执行 `sudo bash /opt/vm2api/deploy/replace-db-to-pg.sh`（支持 Docker 与宿主机 systemd，支持一键 `--rollback`）。
+> **PostgreSQL 一键安装与存量 SQLite 无缝迁移**：支持使用 `curl -sSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install-pg.sh | sudo bash` 自动补装缺失的 Docker / `postgresql-client` / Node(`pg`,`ioredis`) 依赖并完成全新部署或存量无缝迁移；普通 `upgrade` 与面板更新均会自动保留未迁移的 `data/kin.db`（不会误启空 PG 或抢占已有 5432/6379 端口），详情见 [PostgreSQL 迁移指南](POSTGRES_MIGRATION.md)。
 
 不是一个父容器里多个子进程。
 

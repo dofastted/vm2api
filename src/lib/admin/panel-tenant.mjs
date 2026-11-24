@@ -64,9 +64,12 @@ export function denyIfUserCannotDeleteVm(req, res, vm, json) {
   return true
 }
 
+const INTEGRATION_DELEGATED_SYM = Symbol.for('vm2api.integrationDelegated')
+
 /** All panel roles own only their keys; the machine Master owns unassigned platform keys. */
 export function panelOwnsKey(req, rec) {
   if (!rec) return false
+  if (req?.[INTEGRATION_DELEGATED_SYM]) return true
   const owner = normalizeOwnerId(rec.user_id)
   if (req.apiKeyKind === 'master') return owner === null
   const userId = normalizeOwnerId(req.panelUserId)

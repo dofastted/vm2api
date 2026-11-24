@@ -74,7 +74,7 @@ export function prepareClassifierBody(input, { stream = true } = {}) {
   if (entry._heuristic) incompatible('Classifier model capabilities are unknown; specify a supported model explicitly.')
   if (input.max_tokens != null && (!Number.isInteger(input.max_tokens) || input.max_tokens <= 0))
     incompatible('Classifier max_tokens must be a positive integer.')
-  let body = officialMessagesBody(input, { stream })
+  let body = officialMessagesBody(input, { stream, preserveConsecutiveUser: true })
   body.model = entry.id
   const alwaysOn = entry.capabilities.requires_adaptive === true
   if (body.thinking && !['disabled', 'adaptive', 'enabled', 'between_tools'].includes(body.thinking.type))

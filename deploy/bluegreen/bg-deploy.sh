@@ -191,7 +191,12 @@ case "$mode" in
   mkdir -p "$(dirname "$BG_HAPROXY_STATE")" data/run
   touch data/run/bg-active-blue
   point_container blue
-  if docker inspect "$BG_NAME" >/dev/null 2>&1; then docker compose down --timeout 100; fi
+  # Only stop/remove the single control-plane container; never run `docker compose down`,
+  # which would also stop local postgres/redis containers required by blue/green colors.
+  if docker inspect "$BG_NAME" >/dev/null 2>&1; then
+    docker stop -t 100 "$BG_NAME" >/dev/null 2>&1 || true
+    docker rm -f "$BG_NAME" >/dev/null 2>&1 || true
+  fi
   dc blue up -d --no-deps "$BG_SERVICE"
   for _ in $(seq 1 180); do healthz blue >/dev/null && break; sleep 1; done
   healthz blue >/dev/null || { log "FAILED: blue did not come up"; exit 1; }

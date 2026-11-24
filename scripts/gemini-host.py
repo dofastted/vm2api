@@ -307,6 +307,71 @@ def runtime_policy_to_kernel_patch(policy):
         "circuit_failure_threshold": pol["circuit_failure_threshold"],
         "circuit_open_ms": pol["circuit_open_ms"],
     }
+
+
+# The kernel understands these scheduling / SHM keys only from 0.4.5 on. #1704 began
+# emitting them while deploy/payload.json still pinned 0.4.4, so every release from
+# v1.4.193 shipped a host that hands its own pinned payload a config that payload
+# rejects: the worker exits before the handshake and the request fails as a bridge
+# timeout (#1729).
+#
+# The boundary is the payload version, not a capability list. The pinned 0.4.4
+# manifest already declares shm_ring_v2, shm_dispatch_v1, gateway_policy_v1 and
+# live_control_v1, so capabilities do not describe which config keys it parses.
+# Unlike the constant that drifted in #1677, this is not a second copy of the pin:
+# it is the version a feature needs, so moving the pin forward lifts the gate on
+# its own.
+#
+# Act only on a version we positively read as older than the minimum. An absent or
+# unparseable version keeps today's behaviour instead of degrading: payload_failure()
+# nulls payload_version, and treating that as "too old" would silently drop sharding
+# and the SHM sizes on a healthy 0.4.5 host, trading the reported break for a quieter
+# one.
+KERNEL_POLICY_MIN_PAYLOAD = (0, 4, 5, 1)
+
+KERNEL_POLICY_FIELDS = (
+    "shm_request_bytes",
+    "shm_response_bytes",
+    "strategy",
+    "max_accounts",
+    "sticky_enabled",
+    "sticky_ttl_secs",
+    "require_shm",
+    "circuit_failure_threshold",
+    "circuit_open_ms",
+)
+
+_PAYLOAD_VERSION_RE = re.compile(r"\A(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?\Z")
+
+
+def _parse_payload_version(version):
+    """Order a payload version, with a prerelease sorting below its own release."""
+    if not isinstance(version, str):
+        return None
+    match = _PAYLOAD_VERSION_RE.fullmatch(version.strip())
+    if not match:
+        return None
+    return (
+        int(match[1]),
+        int(match[2]),
+        int(match[3]),
+        0 if match[4] else 1,
+    )
+
+
+def kernel_policy_rejected_by_payload(version):
+    """True only for a version read as predating KERNEL_POLICY_MIN_PAYLOAD."""
+    parsed = _parse_payload_version(version)
+    return parsed is not None and parsed < KERNEL_POLICY_MIN_PAYLOAD
+
+
+def strip_unsupported_kernel_policy(kernel_cfg, version):
+    """Drop policy keys a payload known to predate 0.4.5 would reject."""
+    if not kernel_policy_rejected_by_payload(version):
+        return kernel_cfg
+    for field in KERNEL_POLICY_FIELDS:
+        kernel_cfg.pop(field, None)
+    return kernel_cfg
 BLOCKING_ACCOUNT_ELIGIBILITIES = frozenset(
     {"verification_required", "location_unsupported", "ineligible"}
 )
@@ -992,8 +1057,8 @@ class Agy:
         if self.terminal is not None:
             os.close(self.terminal)
             self.terminal = None
-        if self._network_lease is not None:
-            lease = self._network_lease
+        lease = getattr(self, "_network_lease", None)
+        if lease is not None:
             self._network_lease = None
             self.egress = None
             self.network_lock = None
@@ -1276,6 +1341,9 @@ class NativeAgy(Agy):
                 }
             )
         config = self.native_dir / "kernel.json"
+        strip_unsupported_kernel_policy(
+            kernel_cfg, getattr(self.host, "payload_version", None)
+        )
         private_json(config, kernel_cfg)
         os.chown(config, self.uid, self.uid)
         self.native_diagnostic = native_module_impl.EligibilityDiagnostic(
@@ -1495,13 +1563,17 @@ class NativeAgy(Agy):
                         )
                     elif wrapper_status is not None:
                         kind = "exit_code" if wrapper_status >= 0 else "signal"
-                        wrapper_kind = "pool" if self.pool_mode else "openvt"
+                        wrapper_kind = (
+                            "pool" if getattr(self, "pool_mode", False) else "openvt"
+                        )
                         print(
                             f"Gemini native wrapper={wrapper_kind} {kind}={abs(wrapper_status)} child_record=missing",
                             file=sys.stderr,
                         )
                     else:
-                        wrapper_kind = "pool" if self.pool_mode else "openvt"
+                        wrapper_kind = (
+                            "pool" if getattr(self, "pool_mode", False) else "openvt"
+                        )
                         print(
                             f"Gemini native wrapper={wrapper_kind} status=running_before_cleanup child_record=missing",
                             file=sys.stderr,
@@ -2699,6 +2771,13 @@ class Host:
         private_json(self.policy_file, self.runtime_policy)
 
     def _use_sharded_daemon(self):
+        # The shard path is new in #1704 and has no pre-0.4.5 shape: its kernel config
+        # carries the keys KERNEL_POLICY_FIELDS gates, and stripping them would hand an
+        # older payload a config that parses but no longer describes the sharding the
+        # host intends. Refuse the path instead and fall back to the per-account
+        # NativeSession, which is the same fallback crag_subscription already takes.
+        if kernel_policy_rejected_by_payload(getattr(self, "payload_version", None)):
+            return False
         return (
             int(
                 self.runtime_policy.get(
@@ -5787,7 +5866,10 @@ class Host:
             "thoughtSignature",
             "thought_signature",
         }
+        valid_aspect_ratios = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
+        valid_image_sizes = {"1K", "2K", "4K"}
         has_substantive_part = False
+        cleaned_contents = []
         for entry in contents:
             if not isinstance(entry, dict) or any(k not in ("role", "parts") for k in entry):
                 return None
@@ -5796,6 +5878,7 @@ class Host:
             parts = entry.get("parts")
             if not isinstance(parts, list) or not parts:
                 return None
+            cleaned_parts = []
             for part in parts:
                 if not isinstance(part, dict) or not part or any(k not in allowed_part_keys for k in part):
                     return None
@@ -5805,7 +5888,7 @@ class Host:
                         return None
                     if any(ord(ch) < 32 and ch not in ("\n", "\r", "\t") for ch in text):
                         return None
-                    if text.strip():
+                    if text.strip() and part.get("thought") is not True:
                         has_substantive_part = True
                 if any(
                     k in part
@@ -5821,20 +5904,128 @@ class Host:
                     )
                 ):
                     has_substantive_part = True
-        if not has_substantive_part:
+                # CRAGGemini SHM does not consume historical thought blocks.
+                if part.get("thought") is True:
+                    continue
+                fd = part.get("fileData") if isinstance(part.get("fileData"), dict) else part.get("file_data")
+                if isinstance(fd, dict):
+                    mime = fd.get("mimeType") or fd.get("mime_type") or "application/octet-stream"
+                    uri = fd.get("fileUri") or fd.get("file_uri") or ""
+                    ref = f"[Attached {mime}: {uri}]" if uri else f"[Attached {mime}]"
+                    cleaned_parts.append({"text": ref})
+                    continue
+                cleaned_part = {
+                    k: v
+                    for k, v in part.items()
+                    if not (
+                        k in ("thoughtSignature", "thought_signature")
+                        and v == "skip_thought_signature_validator"
+                    )
+                }
+                if cleaned_part:
+                    cleaned_parts.append(cleaned_part)
+            if cleaned_parts:
+                cleaned_entry = {"parts": cleaned_parts}
+                if entry.get("role") is not None:
+                    cleaned_entry["role"] = entry["role"]
+                cleaned_contents.append(cleaned_entry)
+        if not has_substantive_part or not cleaned_contents:
             return None
-        stripped_top = {
-            "stream",
-            "safetySettings",
-            "safety_settings",
-            "cachedContent",
-            "cached_content",
-            "conversationId",
-        }
-        forwarded = {k: v for k, v in body_obj.items() if k not in stripped_top}
-        if "conversation_id" not in forwarded and isinstance(body_obj.get("conversationId"), str):
-            forwarded["conversation_id"] = body_obj["conversationId"]
-        forwarded["model"] = model
+
+        forwarded = {"model": model, "contents": cleaned_contents}
+
+        sys_inst = body_obj.get("systemInstruction")
+        if sys_inst is None:
+            sys_inst = body_obj.get("system_instruction")
+        if sys_inst is not None:
+            forwarded["systemInstruction"] = sys_inst
+
+        if mode is not None:
+            forwarded["system_prompt_mode"] = mode
+
+        raw_tool_cfg = body_obj.get("toolConfig")
+        if raw_tool_cfg is None:
+            raw_tool_cfg = body_obj.get("tool_config")
+        fc_cfg = None
+        if isinstance(raw_tool_cfg, dict):
+            fc_cfg = raw_tool_cfg.get("functionCallingConfig")
+            if not isinstance(fc_cfg, dict):
+                fc_cfg = raw_tool_cfg.get("function_calling_config")
+        tool_mode_none = isinstance(fc_cfg, dict) and str(fc_cfg.get("mode", "")).upper() == "NONE"
+
+        if not tool_mode_none and isinstance(body_obj.get("tools"), list):
+            cleaned_tools = []
+            allowed_tool_keys = {
+                "functionDeclarations",
+                "function_declarations",
+                "googleSearch",
+                "google_search",
+                "urlContext",
+                "url_context",
+            }
+            for t in body_obj["tools"]:
+                if not isinstance(t, dict):
+                    continue
+                filtered = {k: v for k, v in t.items() if k in allowed_tool_keys}
+                if filtered:
+                    cleaned_tools.append(filtered)
+            if cleaned_tools:
+                forwarded["tools"] = cleaned_tools
+                if isinstance(raw_tool_cfg, dict) and raw_tool_cfg:
+                    forwarded["toolConfig"] = raw_tool_cfg
+
+        raw_gen = body_obj.get("generationConfig")
+        if raw_gen is None:
+            raw_gen = body_obj.get("generation_config")
+        if isinstance(raw_gen, dict):
+            cleaned_gen = {}
+            raw_mods = raw_gen.get("responseModalities")
+            if raw_mods is None:
+                raw_mods = raw_gen.get("response_modalities")
+            if isinstance(raw_mods, list):
+                mods = [
+                    str(m).upper()
+                    for m in raw_mods
+                    if isinstance(m, str) and m.upper() in ("TEXT", "IMAGE")
+                ]
+                if "IMAGE" in mods:
+                    cleaned_gen["responseModalities"] = mods
+            raw_img = raw_gen.get("imageConfig")
+            if raw_img is None:
+                raw_img = raw_gen.get("image_config")
+            if isinstance(raw_img, dict):
+                clean_img = {}
+                ratio = raw_img.get("aspectRatio")
+                if ratio is None:
+                    ratio = raw_img.get("aspect_ratio")
+                if isinstance(ratio, str) and ratio.strip() in valid_aspect_ratios:
+                    clean_img["aspectRatio"] = ratio.strip()
+                size = raw_img.get("imageSize")
+                if size is None:
+                    size = raw_img.get("image_size")
+                if isinstance(size, str) and size.strip().upper() in valid_image_sizes:
+                    clean_img["imageSize"] = size.strip().upper()
+                if clean_img:
+                    cleaned_gen["imageConfig"] = clean_img
+            cand_count = raw_gen.get("candidateCount")
+            if cand_count is None:
+                cand_count = raw_gen.get("candidate_count")
+            if (
+                ("responseModalities" in cleaned_gen or "imageConfig" in cleaned_gen)
+                and isinstance(cand_count, int)
+                and not isinstance(cand_count, bool)
+                and 1 <= cand_count <= 8
+            ):
+                cleaned_gen["candidateCount"] = cand_count
+            if cleaned_gen:
+                forwarded["generationConfig"] = cleaned_gen
+
+        conv_id = body_obj.get("conversation_id")
+        if not isinstance(conv_id, str) or not conv_id:
+            conv_id = body_obj.get("conversationId")
+        if isinstance(conv_id, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", conv_id):
+            forwarded["conversation_id"] = conv_id
+
         return forwarded
 
     @staticmethod

@@ -348,6 +348,8 @@ try:
     fake_host = host_mod.Host.__new__(host_mod.Host)
     fake_host.lock = threading.Lock()
     fake_host.native_sessions = {}
+    fake_host.runtime_policy = {"accounts_per_daemon": 1}
+    fake_host.payload_mode = "legacy_release"
 
     class FakeDiag:
         def poll(self, *, final=False):
@@ -431,6 +433,12 @@ with tempfile.TemporaryDirectory(prefix="gemini-multiproc-host-") as mp_tmp:
     mp_host.terminals = {}
     mp_host.runs = {}
     mp_host.native_sessions = {}
+    mp_host.daemon_shards = {}
+    mp_host._shard_locks = {}
+    mp_host._shard_faults = {}
+    mp_host._account_shard_map = {}
+    mp_host._runtime_proxies = {}
+    mp_host.runtime_policy = {"accounts_per_daemon": 1}
     mp_host._session_locks = {}
     mp_host.active_infers = {}
     mp_host.last_inference = {}
@@ -518,6 +526,73 @@ with tempfile.TemporaryDirectory(prefix="gemini-multiproc-host-") as mp_tmp:
         assert mp_host.active_infers[mp_env_id]["req-slot-3"]["cancel_event"].is_set() is True
         assert mp_host.active_infers[mp_env_id]["req-slot-0"]["cancel_event"].is_set() is False
         assert mp_host.cancel_infer(mp_env_id, "req-missing") is False
+
+        # _extract_native_turn_body defense-in-depth minimal CRAGGemini whitelist checks
+        cleaned = host_mod.Host._extract_native_turn_body(
+            "gemini-test",
+            {
+                "model": "ignored-model",
+                "stream": True,
+                "system_instruction": {"parts": [{"text": "sys"}]},
+                "conversationId": "conv_py_1",
+                "safetySettings": [{"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"}],
+                "cachedContent": "cachedContents/x",
+                "generationConfig": {
+                    "temperature": 0.5,
+                    "maxOutputTokens": 512,
+                    "thinkingConfig": {"thinkingBudget": 1024},
+                    "imageConfig": {"aspectRatio": "99:99", "imageSize": "8K"},
+                },
+                "tools": [
+                    {"functionDeclarations": [{"name": "get_weather"}]},
+                    {"googleSearch": {}},
+                    {"codeExecution": {}},
+                ],
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": "hi"},
+                            {"fileData": {"mimeType": "application/pdf", "fileUri": "https://example.test/a.pdf"}},
+                        ],
+                    },
+                    {
+                        "role": "model",
+                        "parts": [
+                            {"thought": True, "text": "hidden"},
+                            {"text": "ok", "thoughtSignature": "skip_thought_signature_validator"},
+                        ],
+                    },
+                ],
+            },
+        )
+        assert cleaned is not None
+        assert set(cleaned.keys()) == {"model", "contents", "systemInstruction", "tools", "conversation_id"}, cleaned.keys()
+        assert cleaned["model"] == "gemini-test"
+        assert cleaned["conversation_id"] == "conv_py_1"
+        assert "generationConfig" not in cleaned
+        assert cleaned["tools"] == [{"functionDeclarations": [{"name": "get_weather"}]}, {"googleSearch": {}}]
+        assert cleaned["contents"][0]["parts"][1] == {"text": "[Attached application/pdf: https://example.test/a.pdf]"}
+        assert cleaned["contents"][1]["parts"] == [{"text": "ok"}]
+
+        # Valid image generationConfig is preserved while non-image params are stripped
+        img_cleaned = host_mod.Host._extract_native_turn_body(
+            "gemini-test",
+            {
+                "contents": [{"role": "user", "parts": [{"text": "draw"}]}],
+                "generationConfig": {
+                    "temperature": 0.9,
+                    "responseModalities": ["TEXT", "IMAGE"],
+                    "imageConfig": {"aspectRatio": "16:9", "imageSize": "2K"},
+                    "candidateCount": 2,
+                },
+            },
+        )
+        assert img_cleaned["generationConfig"] == {
+            "responseModalities": ["TEXT", "IMAGE"],
+            "imageConfig": {"aspectRatio": "16:9", "imageSize": "2K"},
+            "candidateCount": 2,
+        }
     finally:
         host_mod.profile_secrets = orig_secrets
 

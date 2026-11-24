@@ -8,6 +8,7 @@ import {
   resolveCatalogModel,
 } from '../protocol/models.mjs'
 import { isGptSeriesId } from '../protocol/gpt-ids.mjs'
+import { PLATFORM_SCOPE, endpointMatchesOwnerScope } from '../admin/resource-owner.mjs'
 
 /**
  * CLIProxy-shaped picker: grouped round-robin by endpoint then key.
@@ -74,13 +75,13 @@ export function modelIdsForEndpoint(ep, { forcePrefix = false } = {}) {
       for (const m of listOfficialModels()) {
         add(m.id)
       }
-    } catch {}
+    } catch { }
   } else if (isOfficialOpenAI(ep)) {
     try {
       for (const m of listGptPublicModels()) {
         add(m.id)
       }
-    } catch {}
+    } catch { }
   }
   return ids
 }
@@ -130,6 +131,22 @@ function keyReady(key, now, disableCooling) {
   return Date.parse(key.cooldown_until) <= now
 }
 
+function endpointMatchesFilters(
+  ep,
+  { groupType = 'all', endpointId = null, ownerScope = PLATFORM_SCOPE, allowedEndpointIds = null } = {},
+) {
+  if (!ep || ep.disabled) return false
+  if (!endpointMatchesOwnerScope(ep, ownerScope)) return false
+  if (endpointId && ep.id !== endpointId) return false
+  if (Array.isArray(allowedEndpointIds) && !allowedEndpointIds.includes(ep.id)) return false
+  const targetGroup = String(groupType || 'all').toLowerCase()
+  const proto = normalizeProtocol(ep.protocol, ep.kind)
+  if (targetGroup === 'anthropic' && proto !== 'anthropic') return false
+  if (targetGroup === 'openai' && proto !== 'openai') return false
+  if (targetGroup === 'gemini' && proto !== 'gemini') return false
+  return true
+}
+
 export class ApiScheduler {
   constructor() {
     this.endpoints = []
@@ -143,17 +160,20 @@ export class ApiScheduler {
     this.endpoints = Array.isArray(endpoints) ? endpoints : []
   }
 
-  catalog({ groupType = 'all', endpointId = null } = {}) {
+  hasOwnedEndpoints(
+    ownerScope = PLATFORM_SCOPE,
+    { groupType = 'all', endpointId = null, allowedEndpointIds = null } = {},
+  ) {
+    return this.endpoints.some((ep) =>
+      endpointMatchesFilters(ep, { groupType, endpointId, ownerScope, allowedEndpointIds }),
+    )
+  }
+
+  catalog({ groupType = 'all', endpointId = null, ownerScope = PLATFORM_SCOPE, allowedEndpointIds = null } = {}) {
     const data = []
     const seen = new Set()
-    const targetGroup = String(groupType || 'all').toLowerCase()
     for (const ep of this.endpoints) {
-      if (ep.disabled) continue
-      if (endpointId && ep.id !== endpointId) continue
-      const proto = normalizeProtocol(ep.protocol, ep.kind)
-      if (targetGroup === 'anthropic' && proto !== 'anthropic') continue
-      if (targetGroup === 'openai' && proto !== 'openai') continue
-      if (targetGroup === 'gemini' && proto !== 'gemini') continue
+      if (!endpointMatchesFilters(ep, { groupType, endpointId, ownerScope, allowedEndpointIds })) continue
       for (const id of modelIdsForEndpoint(ep, { forcePrefix: this.forcePrefix })) {
         const k = lower(id)
         if (seen.has(k)) continue
@@ -170,18 +190,17 @@ export class ApiScheduler {
     return { object: 'list', data, source: 'api-endpoints' }
   }
 
-  pick(requestedModel, now = Date.now(), { groupType = 'all', endpointId = null } = {}) {
-    const targetGroup = String(groupType || 'all').toLowerCase()
+  pick(
+    requestedModel,
+    now = Date.now(),
+    { groupType = 'all', endpointId = null, ownerScope = PLATFORM_SCOPE, allowedEndpointIds = null } = {},
+  ) {
     const parents = this.endpoints
-      .filter((ep) => {
-        if (ep.disabled) return false
-        if (endpointId && ep.id !== endpointId) return false
-        const proto = normalizeProtocol(ep.protocol, ep.kind)
-        if (targetGroup === 'anthropic' && proto !== 'anthropic') return false
-        if (targetGroup === 'openai' && proto !== 'openai') return false
-        if (targetGroup === 'gemini' && proto !== 'gemini') return false
-        return endpointMatchesModel(ep, requestedModel)
-      })
+      .filter(
+        (ep) =>
+          endpointMatchesFilters(ep, { groupType, endpointId, ownerScope, allowedEndpointIds }) &&
+          endpointMatchesModel(ep, requestedModel),
+      )
       .sort((a, b) => (Number(b.priority) || 0) - (Number(a.priority) || 0))
     if (!parents.length) {
       return { ok: false, code: 'model_not_found', message: `no api endpoint serves ${requestedModel}` }

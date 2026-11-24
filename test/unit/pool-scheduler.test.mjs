@@ -787,6 +787,67 @@ test('fable family cooldown still allows sonnet on the same account', async (t) 
   sonnet.release()
 })
 
+for (const source of ['usage', 'model-cooldown']) {
+  test(`Fable quota from ${source} returns 429 without dispatch and leaves Opus available`, async (t) => {
+    const root = project()
+    const repo = new RuntimeRepo()
+    const resetAt = Date.now() + 109005_000
+    const pool = scheduler(root, {
+      runtimeRepo: repo,
+      accountQuota: {
+        canAccept: () => ({ ok: true }),
+        fableWindowLimited: () => source === 'usage',
+        fableWindowResetAt: () => resetAt,
+      },
+    })
+    t.after(() => cleanupProject(root, pool))
+    if (source === 'model-cooldown') {
+      pool.markCooldown(
+        { accountId: 'account-1', vmId: 'vm-01' },
+        { model: 'fable', until: resetAt, reason: 'fable_rate_limited' },
+      )
+    }
+    const result = await new FailoverRunner({ scheduler: pool }).run({
+      requestId: `fable-quota-${source}`,
+      model: 'claude-fable-5-2',
+      pinVmId: 'vm-01',
+      callAttempt: () => assert.fail('known exhausted Fable quota must not reach the upstream'),
+    })
+    assert.equal(result.status, 429)
+    assert.equal(result.body.error.code, 'pool_fable_rate_limited')
+    assert.match(result.body.error.message, /Fable/)
+    assert.ok(result.retryAfterSec > 109000)
+    const opus = await pool.selectAndReserve({
+      model: 'claude-opus-5-5',
+      pinVmId: 'vm-01',
+      allowWait: false,
+    })
+    assert.equal(opus.ok, true)
+    assert.equal(opus.accountId, 'account-1')
+    opus.release()
+  })
+}
+
+test('a pool split between Fable and shared quota exhaustion still returns 429', async (t) => {
+  const root = project()
+  const repo = new RuntimeRepo()
+  const resetAt = Date.now() + 60_000
+  const pool = scheduler(root, { runtimeRepo: repo })
+  t.after(() => cleanupProject(root, pool))
+  pool.markCooldown(
+    { accountId: 'account-1', vmId: 'vm-01' },
+    { model: 'fable', until: resetAt, reason: 'fable_rate_limited' },
+  )
+  repo.markCooldown('account-2', { vmId: 'vm-02', until: resetAt, reason: 'quota_5h_header' })
+  const result = await new FailoverRunner({ scheduler: pool }).run({
+    requestId: 'mixed-quota',
+    model: 'claude-fable-5-2',
+    callAttempt: () => assert.fail('all candidates have known quota exhaustion'),
+  })
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.code, 'pool_rate_limited')
+})
+
 test('fable concurrency cap leaves room for other models', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

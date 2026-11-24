@@ -5,20 +5,20 @@ import {
   NATIVE_TUI_CAPABILITIES,
   createGeminiCollector,
   createGeminiEventDecoder,
+  createGeminiRestoreTransform,
   createSseFrameSplitter,
 } from '../protocol/gemini-convert.mjs'
-import {
-  classifyAntigravityModel,
-  indexAccountModelCatalog,
-  resolveUpstreamModel,
-} from './model-catalog.mjs'
+import { createStreamTiming } from '../protocol/stream-timing.mjs'
+import { classifyAntigravityModel, indexAccountModelCatalog, resolveUpstreamModel } from './model-catalog.mjs'
 import { callGeminiHost, callGeminiHostStream } from './routes.mjs'
 import { DEFAULT_GEMINI_ROUTING, normalizeGeminiRouting } from './routing-config.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
+import { PLATFORM_SCOPE, geminiEnvMatchesOwnerScope } from '../admin/resource-owner.mjs'
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const MODEL = /^[a-z0-9][a-z0-9._-]{0,99}$/
 const RUN_ID = /^[a-f0-9]{32}$/
+const CONV_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const MAX_CONCURRENCY = 64
 const DEFAULT_CONCURRENCY = 20
 const DEFAULT_MAX_SESSIONS = 20
@@ -27,6 +27,17 @@ const TURN_MS = 120_000
 const STREAM_TURN_MS = 300_000
 const DEFAULT_QUOTA_COOLDOWN_MS = 60_000
 const DEFAULT_ACCOUNT_COOLDOWN_MS = 5 * 60_000
+const TOOL_CONTINUATION_TTL_MS = 10 * 60_000
+const TOOL_CONTINUATION_MAX = 2048
+const MAX_TRACKED_CONVERSATION_IDS = 32
+
+function mintOutboundConversationId(avoidSet = null) {
+  for (let i = 0; i < 8; i += 1) {
+    const id = `gc_${crypto.randomBytes(12).toString('hex')}`
+    if (!avoidSet || !avoidSet.has(id)) return id
+  }
+  return `gc_${crypto.randomBytes(16).toString('hex')}`
+}
 
 function normalizeConcurrency(value, fallback = DEFAULT_CONCURRENCY) {
   if (Number.isSafeInteger(value) && value >= 1 && value <= MAX_CONCURRENCY) return value
@@ -173,8 +184,7 @@ function proactiveCooldownUntil(account, upstreamModel, quotaGroup, ts) {
       for (const w of windows) {
         const bucketGroup = quotaGroupKeyOfBucket(g?.name, w?.id)
         if (!bucketGroup) continue
-        const matches =
-          bucketGroup === quotaGroup || (quotaGroup === 'gemini-argon-wtu' && bucketGroup === 'gemini')
+        const matches = bucketGroup === quotaGroup || (quotaGroup === 'gemini-argon-wtu' && bucketGroup === 'gemini')
         if (!matches) continue
         if (w.remaining_fraction === 0) {
           const parsed = w.reset_at ? Date.parse(w.reset_at) : NaN
@@ -198,17 +208,60 @@ async function readRun(callHost, id, runId, signal) {
   throw fail(504, 'gemini_inference_timeout')
 }
 
-async function consumeStreamResponse(response, { model, onEvent, signal }) {
+async function consumeStreamResponse(
+  response,
+  {
+    model,
+    target = 'antigravity',
+    restoreContext = null,
+    onEvent,
+    signal,
+    onEarlyStop = null,
+    startedAt = null,
+    now = () => Date.now(),
+  },
+) {
   const decoder = createGeminiEventDecoder({ fallbackModel: model })
   const collector = createGeminiCollector({ fallbackModel: model })
+  const timing = createStreamTiming(Number.isFinite(startedAt) ? startedAt : now())
   let streamError = null
+  let sawChunk = false
+  let earlyStopped = false
   const emit = (event) => {
+    const at = now()
+    if (event?.kind === 'start') {
+      timing.observe({ type: 'message_start' }, at)
+    } else if (
+      event?.kind === 'text' ||
+      event?.kind === 'thinking' ||
+      event?.kind === 'tool_call' ||
+      event?.kind === 'image'
+    ) {
+      timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, at)
+    } else if (event?.kind === 'stop') {
+      timing.observe({ type: 'message_delta', delta: { stop_reason: event.stopReason || 'end_turn' } }, at)
+    }
     collector.push(event)
     if (event.kind === 'error' && !streamError) streamError = event
     onEvent?.(event)
   }
+  const restore = createGeminiRestoreTransform(restoreContext, {
+    target,
+    model,
+    onEarlyStop: () => {
+      if (earlyStopped) return
+      earlyStopped = true
+      onEarlyStop?.()
+      try {
+        response.destroy()
+      } catch {}
+    },
+  })
   const splitter = createSseFrameSplitter((frame) => {
-    decoder.decodeSseFrame(frame, emit)
+    if (earlyStopped) return
+    decoder.decodeSseFrame(frame, (ev) => {
+      if (!earlyStopped) restore.push(ev, emit)
+    })
   })
   const onAbort = () => {
     try {
@@ -218,11 +271,25 @@ async function consumeStreamResponse(response, { model, onEvent, signal }) {
   signal?.addEventListener('abort', onAbort, { once: true })
   try {
     for await (const chunk of response) {
+      if (earlyStopped) break
       signal?.throwIfAborted()
+      if (!sawChunk) {
+        sawChunk = true
+        timing.observe({ type: 'message_start' }, now())
+      }
       splitter.push(chunk)
+      if (earlyStopped) break
     }
-    signal?.throwIfAborted()
-    splitter.flush()
+    if (!earlyStopped) {
+      signal?.throwIfAborted()
+      splitter.flush()
+      decoder.flush?.((ev) => {
+        if (!earlyStopped) restore.push(ev, emit)
+      })
+      restore.flush(emit)
+    }
+  } catch (err) {
+    if (!earlyStopped) throw err
   } finally {
     signal?.removeEventListener('abort', onAbort)
   }
@@ -241,12 +308,22 @@ async function consumeStreamResponse(response, { model, onEvent, signal }) {
               : streamError.status === 400
                 ? 'gemini_invalid_request'
                 : 'gemini_inference_failed'
-    throw fail(streamError.status || FAILURES[code][0], code, streamError.message)
+    const err = fail(streamError.status || FAILURES[code][0], code, streamError.message)
+    if (Number.isInteger(streamError.status)) err.upstreamStatus = streamError.status
+    err.timing = timing.snapshot()
+    err.usage = result.usage
+    throw err
   }
   if (!result.sawFinish && !result.text && !result.toolCalls.length && !result.images.length) {
-    throw fail(502, 'gemini_inference_invalid_output')
+    const err = fail(502, 'gemini_inference_invalid_output')
+    err.timing = timing.snapshot()
+    err.usage = result.usage
+    throw err
   }
-  return result
+  if (!result.sawFinish) {
+    timing.observe({ type: 'message_stop' }, now())
+  }
+  return { ...result, timing: timing.snapshot() }
 }
 
 async function readErrorPayload(response) {
@@ -271,26 +348,86 @@ export function createGeminiScheduler({
   poolScheduler,
   apiKeyStore,
   groupsRepo,
+  geminiOwnersRepo = null,
+  getEnvOwner = null,
   cragSubscription = null,
   getRoutingConfig = null,
   quotaCooldownMs = null,
   accountCooldownMs = null,
   now = () => Date.now(),
 }) {
+  const envOwnerOf = (envId) => {
+    if (typeof getEnvOwner === 'function') return getEnvOwner(envId) ?? null
+    if (geminiOwnersRepo?.getOwner) return geminiOwnersRepo.getOwner(envId) ?? null
+    return null
+  }
   const streamHost = callHostStream ?? (callHost === callGeminiHost ? callGeminiHostStream : null)
   const groupCooldowns = new Map()
   const modelCooldowns = new Map()
   const accountCooldowns = new Map()
   const stickyBindings = new Map()
+  const toolContinuationBindings = new Map()
   const localInflight = new Map()
   let rrCursor = 0
+
+  function resolveToolContinuation(callIds, ts) {
+    if (!Array.isArray(callIds) || !callIds.length) return null
+    for (let i = callIds.length - 1; i >= 0; i -= 1) {
+      const cid = callIds[i]
+      if (typeof cid !== 'string' || !cid) continue
+      const entry = toolContinuationBindings.get(cid)
+      if (!entry) continue
+      if (entry.expiresAt <= ts) {
+        toolContinuationBindings.delete(cid)
+        continue
+      }
+      return entry
+    }
+    return null
+  }
+
+  function recordToolContinuation(accountId, collected, ts, consumedCallIds = [], stickyKey = null) {
+    if (Array.isArray(consumedCallIds)) {
+      for (const cid of consumedCallIds) {
+        if (typeof cid === 'string' && cid) toolContinuationBindings.delete(cid)
+      }
+    }
+    const meta = collected?.meta
+    if (
+      !meta?.awaitingToolResults ||
+      !meta.conversationId ||
+      !CONV_ID.test(meta.conversationId) ||
+      !Array.isArray(collected?.toolCalls) ||
+      !collected.toolCalls.length
+    ) {
+      return
+    }
+    if (toolContinuationBindings.size >= TOOL_CONTINUATION_MAX) {
+      for (const [k, v] of toolContinuationBindings.entries()) {
+        if (v.expiresAt <= ts) toolContinuationBindings.delete(k)
+      }
+      if (toolContinuationBindings.size >= TOOL_CONTINUATION_MAX) toolContinuationBindings.clear()
+    }
+    const entry = {
+      accountId,
+      conversationId: meta.conversationId,
+      stickyKey,
+      expiresAt: ts + TOOL_CONTINUATION_TTL_MS,
+    }
+    for (const tc of collected.toolCalls) {
+      if (typeof tc?.id === 'string' && tc.id) toolContinuationBindings.set(tc.id, entry)
+      if (typeof tc?.signedId === 'string' && tc.signedId && tc.signedId !== tc.id) {
+        toolContinuationBindings.set(tc.signedId, entry)
+      }
+    }
+  }
 
   function currentPolicy() {
     const raw = typeof getRoutingConfig === 'function' ? getRoutingConfig()?.gemini : null
     return raw ? normalizeGeminiRouting(raw) : DEFAULT_GEMINI_ROUTING
   }
 
-  function resolveStickyAccount(stickyKey, ts) {
+  function resolveStickyBinding(stickyKey, ts) {
     if (!stickyKey) return null
     const entry = stickyBindings.get(stickyKey)
     if (!entry) return null
@@ -298,11 +435,12 @@ export function createGeminiScheduler({
       stickyBindings.delete(stickyKey)
       return null
     }
-    return entry.accountId
+    return entry
   }
 
-  function recordStickyAccount(stickyKey, accountId, policy, ts) {
+  function recordStickyAccount(stickyKey, accountId, outboundConversationId, policy, ts, extraUsedIds = null) {
     if (!stickyKey || !policy.sticky.enabled || !policy.sticky.ttl_seconds) return
+    const prev = stickyBindings.get(stickyKey)
     const maxSessions = Number.isSafeInteger(policy.pool?.max_sessions_per_account)
       ? policy.pool.max_sessions_per_account
       : DEFAULT_MAX_SESSIONS
@@ -333,16 +471,35 @@ export function createGeminiScheduler({
       }
       if (stickyBindings.size >= 4096) stickyBindings.clear()
     }
+    const usedConversationIds = new Set(prev?.usedConversationIds || [])
+    if (extraUsedIds) {
+      for (const cid of extraUsedIds) {
+        if (typeof cid === 'string' && CONV_ID.test(cid)) usedConversationIds.add(cid)
+      }
+    }
+    if (typeof outboundConversationId === 'string' && CONV_ID.test(outboundConversationId)) {
+      usedConversationIds.add(outboundConversationId)
+    }
+    while (usedConversationIds.size > MAX_TRACKED_CONVERSATION_IDS) {
+      const oldest = usedConversationIds.values().next().value
+      usedConversationIds.delete(oldest)
+    }
     stickyBindings.set(stickyKey, {
       accountId,
+      outboundConversationId:
+        typeof outboundConversationId === 'string' && CONV_ID.test(outboundConversationId)
+          ? outboundConversationId
+          : prev?.accountId === accountId
+            ? prev.outboundConversationId || null
+            : null,
+      usedConversationIds,
       touchedAt: ts,
       expiresAt: ts + policy.sticky.ttl_seconds * 1000,
     })
   }
 
   function pickCandidateWithPolicy(candidates, excluded, { strategy, stickyAccountId }) {
-    const inflightOf = (id) =>
-      poolScheduler ? poolScheduler.inflight?.get?.(id) || 0 : localInflight.get(id) || 0
+    const inflightOf = (id) => (poolScheduler ? poolScheduler.inflight?.get?.(id) || 0 : localInflight.get(id) || 0)
     const reserve = (list) =>
       poolScheduler
         ? poolScheduler.reserveExternalCandidates(list, { excluded })
@@ -447,8 +604,14 @@ export function createGeminiScheduler({
           ? failure.retryAfterMs
           : effectiveQuotaCooldown
       const until = ts + retryMs
-      groupCooldowns.set(`${accountId}:${quotaGroup}`, Math.max(groupCooldowns.get(`${accountId}:${quotaGroup}`) || 0, until))
-      modelCooldowns.set(`${accountId}:${upstreamModel}`, Math.max(modelCooldowns.get(`${accountId}:${upstreamModel}`) || 0, until))
+      groupCooldowns.set(
+        `${accountId}:${quotaGroup}`,
+        Math.max(groupCooldowns.get(`${accountId}:${quotaGroup}`) || 0, until),
+      )
+      modelCooldowns.set(
+        `${accountId}:${upstreamModel}`,
+        Math.max(modelCooldowns.get(`${accountId}:${upstreamModel}`) || 0, until),
+      )
       return
     }
     if (ACCOUNT_WIDE_COOLDOWN_ERRORS.has(code)) {
@@ -499,8 +662,7 @@ export function createGeminiScheduler({
   return {
     cooldownSnapshot() {
       const ts = now()
-      const active = (map) =>
-        Object.fromEntries([...map.entries()].filter(([, until]) => until > ts))
+      const active = (map) => Object.fromEntries([...map.entries()].filter(([, until]) => until > ts))
       return {
         groups: active(groupCooldowns),
         models: active(modelCooldowns),
@@ -508,7 +670,7 @@ export function createGeminiScheduler({
       }
     },
 
-    async catalog() {
+    async catalog({ ownerScope = PLATFORM_SCOPE, allowedEnvIds = null } = {}) {
       let view = await callHost('list', {})
       if (!Array.isArray(view?.environments)) throw fail(502, 'gemini_host_protocol_error')
       if (view.payload_state !== 'installed') return { models: [], accounts: [] }
@@ -554,9 +716,12 @@ export function createGeminiScheduler({
           !Array.isArray(environment.models)
         )
           continue
+        const envOwner = envOwnerOf(environment.id)
+        if (!geminiEnvMatchesOwnerScope(envOwner, ownerScope)) continue
+        if (Array.isArray(allowedEnvIds) && !allowedEnvIds.includes(environment.id)) continue
         if (resolveProxy) {
           try {
-            resolveProxy(environment.proxy_id)
+            resolveProxy(environment.proxy_id, envOwner)
           } catch (error) {
             if (error?.code === 'gemini_proxy_unavailable') continue
             throw error
@@ -622,28 +787,55 @@ export function createGeminiScheduler({
       model,
       geminiBody,
       targetBodyFor = null,
+      restoreContext = null,
+      continuationCallIds = [],
+      inboundConversationId = null,
       requiredCapabilities = [],
       unsupportedFields = [],
       plainText = null,
       requestId = `gem_${crypto.randomBytes(12).toString('hex')}`,
+      startedAt = null,
       stickyKey = null,
       signal,
       apiKeyRecord,
       allowUnprefixedNonGemini = null,
+      ownerScope = PLATFORM_SCOPE,
+      allowedEnvIds = null,
       onEvent = null,
     }) {
+      const turnStartedAt = Number.isFinite(startedAt) ? startedAt : now()
       const gate = apiKeyStore?.acquire?.(apiKeyRecord)
       if (gate && !gate.ok) throw fail(gate.status || 429, gate.code, gate.message)
-      const allowUnprefixed = allowUnprefixedNonGemini ?? (apiKeyRecord?.group_type !== 'all')
+      const allowUnprefixed = allowUnprefixedNonGemini ?? apiKeyRecord?.group_type !== 'all'
       const excluded = new Set()
       let reservation = null
       let selected = null
       let legacyRun = null
       let activeInfer = null
+      let attempts = 0
+      let lastUpstreamStatus = null
+      let lastAccountId = null
+      let lastAuthMethod = null
+      let lastUpstreamModel = null
+      let lastTiming = null
+      let lastUsage = null
+      const attachAttemptMeta = (err) => {
+        if (!err || typeof err !== 'object') return err
+        if (err.attemptCount == null) err.attemptCount = attempts
+        if (err.upstreamStatus == null && lastUpstreamStatus != null) {
+          err.upstreamStatus = lastUpstreamStatus
+        }
+        if (err.accountId == null && lastAccountId) err.accountId = lastAccountId
+        if (err.authMethod == null && lastAuthMethod) err.authMethod = lastAuthMethod
+        if (err.upstreamModel == null && lastUpstreamModel) err.upstreamModel = lastUpstreamModel
+        if (err.timing == null && lastTiming) err.timing = lastTiming
+        if (err.usage == null && lastUsage) err.usage = lastUsage
+        return err
+      }
 
       try {
         signal?.throwIfAborted()
-        const catalog = await this.catalog()
+        const catalog = await this.catalog({ ownerScope, allowedEnvIds })
         const matchedAccounts = []
         for (const account of catalog.accounts) {
           const resolved = resolveUpstreamModel(model, account.models, {
@@ -691,7 +883,24 @@ export function createGeminiScheduler({
 
         const ts = now()
         const policy = currentPolicy()
-        const stickyAccountId = policy.sticky.enabled ? resolveStickyAccount(stickyKey, ts) : null
+        const continuationBinding = resolveToolContinuation(continuationCallIds, ts)
+        const effectiveStickyKey = stickyKey || continuationBinding?.stickyKey || null
+        const prevStickyBinding = resolveStickyBinding(effectiveStickyKey, ts)
+        const stickyAccountId =
+          continuationBinding?.accountId || (policy.sticky.enabled ? prevStickyBinding?.accountId || null : null)
+        const attemptUsedConversationIds = new Set(prevStickyBinding?.usedConversationIds || [])
+        if (prevStickyBinding?.outboundConversationId) {
+          attemptUsedConversationIds.add(prevStickyBinding.outboundConversationId)
+        }
+        if (continuationBinding?.conversationId) {
+          attemptUsedConversationIds.add(continuationBinding.conversationId)
+        }
+        if (typeof inboundConversationId === 'string' && inboundConversationId) {
+          attemptUsedConversationIds.add(inboundConversationId)
+        }
+        if (typeof geminiBody?.conversation_id === 'string' && geminiBody.conversation_id) {
+          attemptUsedConversationIds.add(geminiBody.conversation_id)
+        }
         const maxAttempts =
           typeof getRoutingConfig === 'function'
             ? Math.max(1, (policy.failover.max_account_switches ?? 3) + 1)
@@ -724,14 +933,11 @@ export function createGeminiScheduler({
         const uncooled = scored.filter((item) => item.cooldownUntil === 0)
         // Prefer uncooled accounts; if every account is currently in cooldown, fall back to
         // probing the earliest-expiring one so single-account pools and post-reset slots recover.
-        const activeList = uncooled.length
-          ? uncooled
-          : [...scored].sort((a, b) => a.cooldownUntil - b.cooldownUntil)
+        const activeList = uncooled.length ? uncooled : [...scored].sort((a, b) => a.cooldownUntil - b.cooldownUntil)
         const candidates = activeList.map((item) => item.candidate)
         const resolvedByAccountId = new Map(activeList.map((item) => [item.candidate.accountId, item.resolved]))
 
         let lastError = null
-        let attempts = 0
         while (excluded.size < candidates.length && attempts < maxAttempts) {
           signal?.throwIfAborted()
           const grant = pickCandidateWithPolicy(candidates, excluded, {
@@ -744,31 +950,80 @@ export function createGeminiScheduler({
           const id = grant.selected.accountId.slice('gemini:'.length)
           const resolved = resolvedByAccountId.get(grant.selected.accountId)
           selected = { ...grant.selected, id, resolved }
+          lastAccountId = id
+          lastAuthMethod = selected.authMethod || 'oauth'
+          lastUpstreamModel = resolved.upstreamModel
+          lastUpstreamStatus = null
           let emittedOutput = false
 
           try {
+            const envOwner = envOwnerOf(id)
+            if (
+              !geminiEnvMatchesOwnerScope(envOwner, ownerScope) ||
+              (Array.isArray(allowedEnvIds) && !allowedEnvIds.includes(id))
+            ) {
+              throw fail(403, 'gemini_model_unavailable')
+            }
             const listed = await callHost('get', { id })
             const proxyId = listed?.proxy_id
             if (typeof proxyId !== 'string' || !ID.test(proxyId)) throw fail(502, 'gemini_host_protocol_error')
-            const proxyUrl = resolveProxy ? resolveProxy(proxyId) : undefined
+            const proxyUrl = resolveProxy ? resolveProxy(proxyId, envOwner) : undefined
             signal?.throwIfAborted()
             const authMethod = listed?.auth_method === 'api_key' ? 'api_key' : selected.authMethod || 'oauth'
+            lastAuthMethod = authMethod
+            const target = authMethod === 'api_key' ? 'gemini' : 'antigravity'
+            // Account-scoped outbound conversation_id policy for CRAGGemini:
+            // - Reuse the active conversation_id ONLY when staying on the exact same account
+            //   (same-account resume or suspended MCP tool continuation).
+            // - On ANY account switch (failover, cooldown rotation, A->B->A return, or tool
+            //   continuation failover), ALWAYS mint a brand-new conversation_id that never
+            //   reuses any previous account's or caller's raw conversation_id.
+            let outboundConversationId = null
+            let switchedAccount = false
+            if (target === 'antigravity') {
+              if (
+                continuationBinding &&
+                continuationBinding.accountId === id &&
+                CONV_ID.test(continuationBinding.conversationId)
+              ) {
+                outboundConversationId = continuationBinding.conversationId
+              } else if (
+                policy.sticky.enabled &&
+                prevStickyBinding &&
+                prevStickyBinding.accountId === id &&
+                attempts === 1 &&
+                CONV_ID.test(prevStickyBinding.outboundConversationId || '')
+              ) {
+                outboundConversationId = prevStickyBinding.outboundConversationId
+              } else {
+                outboundConversationId = mintOutboundConversationId(attemptUsedConversationIds)
+                attemptUsedConversationIds.add(outboundConversationId)
+                switchedAccount = Boolean(
+                  (prevStickyBinding && prevStickyBinding.accountId !== id) ||
+                    (continuationBinding && continuationBinding.accountId !== id) ||
+                    attempts > 1,
+                )
+              }
+            }
             const rawOutboundBody = targetBodyFor
-              ? targetBodyFor(authMethod === 'api_key' ? 'gemini' : 'antigravity', {
+              ? targetBodyFor(target, {
                   upstreamModel: resolved.upstreamModel,
                   publicModel: resolved.publicId,
+                  ...(outboundConversationId ? { conversationId: outboundConversationId } : {}),
+                  switchedAccount,
                 })
-              : geminiBody
+              : outboundConversationId && geminiBody && typeof geminiBody === 'object'
+                ? { ...geminiBody, conversation_id: outboundConversationId }
+                : geminiBody
             const outboundBody =
               rawOutboundBody && typeof rawOutboundBody === 'object' && 'model' in rawOutboundBody
                 ? { ...rawOutboundBody, model: resolved.upstreamModel }
                 : rawOutboundBody
+            const attemptRequestId = attempts === 1 ? requestId : `${requestId}_a${attempts}`.slice(0, 128)
 
             let streamResponse = null
             if (streamHost) {
-              const proxySha256 = proxyUrl
-                ? crypto.createHash('sha256').update(proxyUrl).digest('hex')
-                : undefined
+              const proxySha256 = proxyUrl ? crypto.createHash('sha256').update(proxyUrl).digest('hex') : undefined
               const gatewayPolicy =
                 typeof getRoutingConfig === 'function'
                   ? {
@@ -785,18 +1040,19 @@ export function createGeminiScheduler({
                   proxy_url: proxyUrl,
                   ...(proxySha256 ? { proxy_sha256: proxySha256 } : {}),
                   model: resolved.upstreamModel,
-                  request_id: requestId,
+                  request_id: attemptRequestId,
                   ...(gatewayPolicy ? { gateway_policy: gatewayPolicy } : {}),
                   body: outboundBody,
                 },
                 { signal, timeoutMs: Math.max(STREAM_TURN_MS, (policy.pool.timeout_ms || 120_000) + 15_000) },
               )
+              if (Number.isInteger(res?.statusCode)) lastUpstreamStatus = res.statusCode
               const contentType = String(res.headers?.['content-type'] || '')
                 .split(';')[0]
                 .trim()
                 .toLowerCase()
               if (res.statusCode === 200 && contentType === 'text/event-stream') {
-                activeInfer = { id, request_id: requestId }
+                activeInfer = { id, request_id: attemptRequestId }
                 streamResponse = res
               } else {
                 const errBody = await readErrorPayload(res)
@@ -862,7 +1118,18 @@ export function createGeminiScheduler({
             if (streamResponse) {
               collected = await consumeStreamResponse(streamResponse, {
                 model: resolved.publicId,
+                target,
+                restoreContext,
                 signal,
+                startedAt: turnStartedAt,
+                now,
+                onEarlyStop: () => {
+                  if (activeInfer) {
+                    const ref = activeInfer
+                    activeInfer = null
+                    callHost('infer-cancel', ref).catch(() => {})
+                  }
+                },
                 onEvent: (event) => {
                   if (event && event.kind !== 'error') emittedOutput = true
                   onEvent?.(event)
@@ -878,6 +1145,8 @@ export function createGeminiScheduler({
                 throw fail(mapped?.[0] || 502, mapped ? code : 'gemini_inference_failed')
               }
               if (typeof result.text !== 'string') throw fail(502, 'gemini_host_protocol_error')
+              lastUpstreamStatus = 200
+              const finishedAt = now()
               const usage = {}
               for (const key of [
                 'input_tokens',
@@ -886,7 +1155,10 @@ export function createGeminiScheduler({
                 'reasoning_tokens',
                 'total_tokens',
               ]) {
-                const count = result.usage?.[key]
+                const count =
+                  key === 'reasoning_tokens'
+                    ? (result.usage?.reasoning_tokens ?? result.usage?.thinking_tokens)
+                    : result.usage?.[key]
                 if (Number.isSafeInteger(count) && count >= 0) usage[key] = count
               }
               const collector = createGeminiCollector({ fallbackModel: resolved.publicId })
@@ -904,14 +1176,36 @@ export function createGeminiScheduler({
               if (result.text) emit({ kind: 'text', text: result.text })
               emit({ kind: 'stop', finishReason: 'STOP', stopReason: 'stop' })
               emit({ kind: 'usage', usage })
-              collected = collector.result()
+              collected = {
+                ...collector.result(),
+                timing: {
+                  firstByteAt: finishedAt,
+                  firstByteMs: Math.max(0, finishedAt - turnStartedAt),
+                  firstTokenAt: finishedAt,
+                  ttftMs: Math.max(0, finishedAt - turnStartedAt),
+                  generationMs: null,
+                },
+              }
             }
 
             clearCooldownOnSuccess(id, resolved.upstreamModel, resolved.quotaGroup)
-            recordStickyAccount(stickyKey, id, policy, now())
+            const reportedConvId =
+              target === 'antigravity' &&
+              typeof collected.meta?.conversationId === 'string' &&
+              CONV_ID.test(collected.meta.conversationId) &&
+              !(
+                switchedAccount &&
+                attemptUsedConversationIds.has(collected.meta.conversationId) &&
+                collected.meta.conversationId !== outboundConversationId
+              )
+                ? collected.meta.conversationId
+                : outboundConversationId
+            const finishedAt = now()
+            recordStickyAccount(effectiveStickyKey, id, reportedConvId, policy, finishedAt, attemptUsedConversationIds)
+            recordToolContinuation(id, collected, finishedAt, continuationCallIds, effectiveStickyKey)
             recordAccountUsage(apiKeyRecord, resolved.publicId, collected.usage || {})
             poolScheduler?.unitCircuit?.recordSuccess?.(selected.accountId)
-            poolScheduler?.lastUsed?.set?.(selected.accountId, now())
+            poolScheduler?.lastUsed?.set?.(selected.accountId, finishedAt)
             return {
               ...collected,
               account_id: id,
@@ -920,6 +1214,9 @@ export function createGeminiScheduler({
               upstream_model: resolved.upstreamModel,
               provider: resolved.provider,
               quota_group: resolved.quotaGroup,
+              attempt_count: attempts,
+              upstream_status: lastUpstreamStatus ?? 200,
+              ...(reportedConvId ? { conversation_id: reportedConvId } : {}),
             }
           } catch (error) {
             if (legacyRun) {
@@ -937,7 +1234,9 @@ export function createGeminiScheduler({
             reservation?.release()
             reservation = null
 
-            const failure = known(error) || error
+            if (error?.timing) lastTiming = error.timing
+            if (error?.usage) lastUsage = error.usage
+            const failure = attachAttemptMeta(known(error) || error)
             const failureCode = failure?.code
             const cancelled = signal?.aborted || failure?.name === 'AbortError' || failureCode === 'ABORT_ERR'
 
@@ -965,7 +1264,7 @@ export function createGeminiScheduler({
           }
         }
 
-        throw lastError || fail(503, 'gemini_operation_busy')
+        throw attachAttemptMeta(lastError || fail(503, 'gemini_operation_busy'))
       } finally {
         reservation?.release()
         try {
@@ -974,16 +1273,31 @@ export function createGeminiScheduler({
       }
     },
 
-    async complete({ model, text, stickyKey = null, signal, apiKeyRecord, allowUnprefixedNonGemini = null }) {
+    async complete({
+      model,
+      text,
+      requestId,
+      startedAt = null,
+      stickyKey = null,
+      signal,
+      apiKeyRecord,
+      allowUnprefixedNonGemini = null,
+      ownerScope = PLATFORM_SCOPE,
+      allowedEnvIds = null,
+    }) {
       const result = await this.stream({
         model,
         geminiBody: { contents: [{ role: 'user', parts: [{ text }] }] },
         requiredCapabilities: [],
         plainText: text,
+        ...(requestId ? { requestId } : {}),
+        startedAt,
         stickyKey,
         signal,
         apiKeyRecord,
         allowUnprefixedNonGemini,
+        ownerScope,
+        allowedEnvIds,
       })
       return {
         text: result.text,
@@ -992,6 +1306,11 @@ export function createGeminiScheduler({
         auth_method: result.auth_method,
         model: result.model,
         upstream_model: result.upstream_model,
+        stopReason: result.stopReason,
+        searches: result.searches,
+        attempt_count: result.attempt_count,
+        upstream_status: result.upstream_status,
+        timing: result.timing,
       }
     },
   }

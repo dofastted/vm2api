@@ -2538,6 +2538,45 @@ test('signature 400 without foreign thinking still surfaces with the switch off'
 
 // 2026-11-17 prod: three accounts each answered 429 (native stream path tags any
 // failed hop 'incomplete'), and the caller got 502 incomplete_response.
+test('a Fable 429 with only Retry-After probes usage without cooling ordinary Opus', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const probes = []
+  const runner = new FailoverRunner({
+    scheduler,
+    rateLimitService: {
+      handleUpstreamError({ accountId, policy }) {
+        probes.push({ accountId, policy })
+        return null
+      },
+    },
+  })
+  const failed = await runner.run({
+    requestId: 'fable-unknown-quota',
+    canonicalBody: { model: 'claude-fable-5-2' },
+    model: 'claude-fable-5-2',
+    callAttempt: () => ({
+      ok: false,
+      status: 429,
+      terminalState: 'incomplete',
+      providerResult: { response_headers: { 'retry-after': '109005' } },
+      body: { error: { type: 'rate_limit_error', message: "This request would exceed your account's rate limit." } },
+    }),
+  })
+  assert.equal(failed.status, 429)
+  assert.equal(failed.headers['retry-after'], '109005')
+  assert.equal(probes.length, 1)
+  assert.equal(probes[0].policy.reason, 'rate_limited_unknown')
+  assert.equal(probes[0].policy.cooldownUntil, null)
+  assert.deepEqual(scheduler.cooldowns, [])
+  const opus = await runner.run({
+    requestId: 'opus-after-fable',
+    canonicalBody: { model: 'claude-opus-5-5' },
+    model: 'claude-opus-5-5',
+    callAttempt: () => success('OK'),
+  })
+  assert.equal(opus.status, 200)
+})
+
 test('when every account answers 429 the caller gets that 429, not a generic 502', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const seen = []

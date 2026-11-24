@@ -36,6 +36,10 @@ const COLUMNS = [
   'allowed_vms',
   'vm_pool_id',
   'allowed_models',
+  'permission_tier',
+  'owner_id',
+  'allowed_endpoints',
+  'allowed_gemini_envs',
   'key_secret',
   'user_id',
   'group_id',
@@ -87,7 +91,10 @@ function toValue(rec, c) {
   if (v == null) {
     if (c === 'category') return 'oauth'
     if (c === 'group_type') return 'all'
-    if (c === 'allowed_vms' || c === 'allowed_models') return '[]'
+    if (c === 'permission_tier') return 'platform'
+    if (c === 'allowed_vms' || c === 'allowed_models' || c === 'allowed_endpoints' || c === 'allowed_gemini_envs') {
+      return '[]'
+    }
     return NUMERIC_DEFAULT_0.has(c) ? 0 : null
   }
   return v

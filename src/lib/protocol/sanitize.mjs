@@ -255,7 +255,7 @@ export function canReuseCanonicalHistory(messages) {
 
 export function sanitizeAnthropicBody(
   body,
-  { preserveContentShape = false, onSystemBlock, reuseCanonicalHistory = false } = {},
+  { preserveContentShape = false, onSystemBlock, reuseCanonicalHistory = false, preserveConsecutiveUser = false } = {},
 ) {
   if (!body || typeof body !== 'object') return body
 
@@ -284,7 +284,7 @@ export function sanitizeAnthropicBody(
     if (reuseCanonicalHistory && Array.isArray(out.messages)) {
       out.messages = out.messages.map((message) => (message && typeof message === 'object' ? { ...message } : message))
     }
-    normalizeAnthropicMessages(out)
+    normalizeAnthropicMessages(out, { preserveConsecutiveUser })
     stripIllegalBodyContentFields(out)
   }
 
@@ -320,7 +320,10 @@ export function sanitizeAnthropicBody(
  *     control which the per-message effort beta allows as the first entry
  *   - a system turn that cannot be kept still contributes its effort the same way
  */
-export function normalizeAnthropicMessages(body, { keepMidConversationSystem = true } = {}) {
+export function normalizeAnthropicMessages(
+  body,
+  { keepMidConversationSystem = true, preserveConsecutiveUser = false } = {},
+) {
   if (!body || !Array.isArray(body.messages)) return body
   repairAutoModeReminders(body)
 
@@ -365,7 +368,7 @@ export function normalizeAnthropicMessages(body, { keepMidConversationSystem = t
     mapped.push(keptAnthropicMessage(message, nextRole))
   }
 
-  const merged = mergeConsecutiveAnthropicMessages(mapped)
+  const merged = mergeConsecutiveAnthropicMessages(mapped, { preserveConsecutiveUser })
   if (merged.length && merged[0].role !== 'user' && !isEmptyEffortControl(merged[0])) {
     merged.unshift({ role: 'user', content: '.' })
   }
@@ -530,11 +533,17 @@ export function anthropicContentIsEmpty(content) {
   })
 }
 
-export function mergeConsecutiveAnthropicMessages(messages) {
+export function mergeConsecutiveAnthropicMessages(messages, { preserveConsecutiveUser = false } = {}) {
   const out = []
   for (const message of messages) {
     const last = out[out.length - 1]
-    if (!last || last.role !== message.role || messageHasTurnControls(last) || messageHasTurnControls(message)) {
+    if (
+      !last ||
+      last.role !== message.role ||
+      (preserveConsecutiveUser && message.role === 'user') ||
+      messageHasTurnControls(last) ||
+      messageHasTurnControls(message)
+    ) {
       out.push({ ...message })
       continue
     }

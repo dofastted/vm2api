@@ -39,21 +39,38 @@ import { usageFromSseLine } from '../protocol/handle-codex.mjs'
 import { BETA_CONTEXT_1M } from '../protocol/claude-code-betas.mjs'
 import { shouldPassContext1mByPolicy } from '../protocol/model-policy.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
+import { resolveGeminiReasoningEffort } from '../protocol/log-fields.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
 import { ensureRedaction, maskJson, restoreSseLine } from '../redaction/runtime.mjs'
+import { keyTierPolicyFromRecord } from '../admin/key-scope.mjs'
+import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 
 export function resolveInferenceBackend(req) {
   if (req?.apiKeyKind !== 'managed') return 'oauth'
-  return String(req.apiKeyRecord?.category || '')
+  const category = String(req.apiKeyRecord?.category || '')
     .trim()
-    .toLowerCase() === 'api'
-    ? 'api'
-    : 'oauth'
+    .toLowerCase()
+  if (category === 'api') return 'api'
+  if (category === 'all') return 'all'
+  return 'oauth'
 }
 
-export function apiScheduleScope(req, groupType) {
-  const endpointId = req.apiKeyRecord?.api_endpoint_id || null
-  return { endpointId, groupType: endpointId ? 'all' : groupType }
+export function apiScheduleScope(req, groupType, usersRepo = null) {
+  const policy = keyTierPolicyFromRecord(req?.apiKeyRecord)
+  const ownerScope = ownerScopeFromRequest(req, usersRepo)
+  const endpointId = policy.api_endpoint_id || null
+  const allowedEndpointIds =
+    policy.permission_tier === 'resource'
+      ? policy.allowed_endpoints
+      : policy.allowed_endpoints.length > 0
+        ? policy.allowed_endpoints
+        : null
+  return {
+    endpointId,
+    groupType: endpointId ? 'all' : groupType,
+    ownerScope,
+    allowedEndpointIds,
+  }
 }
 
 export { messagesUrl, responsesUrl } from './api-presets.mjs'
@@ -1008,6 +1025,14 @@ async function runGeminiApiInference({
     scheduler.reload(store.listRaw())
   }
 
+  const inboundModel = picked.requested_model || inbound?.model || picked.upstream_model
+  const reasoningEffort = resolveGeminiReasoningEffort({
+    inbound,
+    parsed,
+    outboundBody: body,
+    model: inboundModel,
+    upstreamModel: picked.upstream_model,
+  })
   const resultBase = {
     ok: status >= 200 && status < 300,
     status,
@@ -1018,6 +1043,9 @@ async function runGeminiApiInference({
     endpointId: picked.endpoint.id,
     model: picked.upstream_model,
     headers: { ...(upstream.headers || {}) },
+    outboundBody: body,
+    outboundBodySource: 'gemini_api',
+    reasoningEffort,
   }
 
   if (status >= 400) {
@@ -1046,7 +1074,6 @@ async function runGeminiApiInference({
     }
   }
 
-  const inboundModel = picked.requested_model || inbound?.model || picked.upstream_model
   const decoder = createGeminiEventDecoder({ fallbackModel: inboundModel })
   const collector = createGeminiCollector({ fallbackModel: inboundModel })
   const encoder = clientStream ? createGeminiProtocolStreamEncoder(geminiProto, { model: inboundModel }) : null
@@ -1054,13 +1081,23 @@ async function runGeminiApiInference({
   let committed = false
   let sawFirstByte = false
   const emit = (event) => {
+    const at = Date.now()
+    if (event.kind === 'start') {
+      timing.observe({ type: 'message_start' }, at)
+    } else if (
+      event.kind === 'text' ||
+      event.kind === 'thinking' ||
+      event.kind === 'tool_call' ||
+      event.kind === 'image'
+    ) {
+      timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, at)
+    } else if (event.kind === 'stop') {
+      timing.observe({ type: 'message_delta', delta: { stop_reason: event.stopReason || 'end_turn' } }, at)
+    }
     collector.push(event)
     if (event.kind === 'error' && !streamError) {
       streamError = event
       return
-    }
-    if (event.kind === 'text' || event.kind === 'thinking' || event.kind === 'tool_call' || event.kind === 'image') {
-      timing.observe({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } }, Date.now())
     }
     if (!clientStream || !encoder) return
     const chunk = encoder.push(event)
@@ -1075,20 +1112,28 @@ async function runGeminiApiInference({
   for await (const chunk of upstream) {
     if (!sawFirstByte) {
       sawFirstByte = true
-      timing.observe(null, Date.now())
+      timing.observe({ type: 'message_start' }, Date.now())
     }
     const piece = redaction ? await restoreSseLine(chunk.toString('utf8'), redaction) : chunk
     splitter.push(piece)
   }
   splitter.flush()
+  decoder.flush?.(emit)
 
   const collected = collector.result()
+  const webSearches = Array.isArray(collected.searches) ? collected.searches.length : 0
   const usage = collected.usage
     ? {
         input_tokens: collected.usage.input_tokens || 0,
         output_tokens: collected.usage.output_tokens || 0,
-        ...(collected.usage.cache_read_tokens ? { cache_read_input_tokens: collected.usage.cache_read_tokens } : {}),
+        ...(collected.usage.cache_read_tokens
+          ? {
+              cache_read_input_tokens: collected.usage.cache_read_tokens,
+              cache_read_tokens: collected.usage.cache_read_tokens,
+            }
+          : {}),
         ...(collected.usage.reasoning_tokens ? { reasoning_tokens: collected.usage.reasoning_tokens } : {}),
+        ...(webSearches > 0 ? { web_search_requests: webSearches } : {}),
       }
     : null
 
@@ -1135,6 +1180,9 @@ async function runGeminiApiInference({
       committed,
       terminalState: committed ? 'incomplete' : 'rejected',
     }
+  }
+  if (!collected.sawFinish) {
+    timing.observe({ type: 'message_stop' }, Date.now())
   }
 
   if (clientStream) {

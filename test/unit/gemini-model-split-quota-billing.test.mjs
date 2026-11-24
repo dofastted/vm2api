@@ -186,7 +186,9 @@ test('scheduler isolates 3p 429 cooldown from gemini quota group and automatical
       }
       return sseResponse([
         `data: ${JSON.stringify({
-          candidates: [{ content: { role: 'model', parts: [{ text: `reply-from-${payload.id}` }] }, finishReason: 'STOP' }],
+          candidates: [
+            { content: { role: 'model', parts: [{ text: `reply-from-${payload.id}` }] }, finishReason: 'STOP' },
+          ],
           usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 50, totalTokenCount: 150 },
         })}\n\n`,
       ])
@@ -256,7 +258,7 @@ test('scheduler skips proactively exhausted accounts and fails over on verificat
       },
     },
     {
-      id: 'env-verify-fail',
+      id: 'env-a-verify-fail',
       proxy_id: 'px-2',
       auth_state: 'authorized',
       auth_method: 'oauth',
@@ -266,7 +268,7 @@ test('scheduler skips proactively exhausted accounts and fails over on verificat
       account: { state: 'ok', quotas: [], quota_groups: [] },
     },
     {
-      id: 'env-healthy',
+      id: 'env-b-healthy',
       proxy_id: 'px-3',
       auth_state: 'authorized',
       auth_method: 'oauth',
@@ -286,7 +288,7 @@ test('scheduler skips proactively exhausted accounts and fails over on verificat
     },
     callHostStream: async (_op, payload) => {
       attempted.push(payload.id)
-      if (payload.id === 'env-verify-fail') {
+      if (payload.id === 'env-a-verify-fail') {
         return sseResponse([JSON.stringify({ code: 'gemini_account_verification_required' })], {
           statusCode: 403,
           contentType: 'application/json',
@@ -306,9 +308,9 @@ test('scheduler skips proactively exhausted accounts and fails over on verificat
     geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
     apiKeyRecord: { id: 'k-all', group_type: 'all' },
   })
-  assert.equal(turn.account_id, 'env-healthy')
-  // env-exhausted was skipped proactively; env-verify-fail failed over cleanly to env-healthy!
-  assert.deepEqual(attempted, ['env-verify-fail', 'env-healthy'])
+  assert.equal(turn.account_id, 'env-b-healthy')
+  // env-exhausted was skipped proactively; env-a-verify-fail failed over cleanly to env-b-healthy!
+  assert.deepEqual(attempted, ['env-a-verify-fail', 'env-b-healthy'])
 })
 
 test('Gemini builtin pricing & ag- prefix cost resolution cover Google, Anthropic, and OpenAI variants', () => {
@@ -336,7 +338,10 @@ test('Gemini builtin pricing & ag- prefix cost resolution cover Google, Anthropi
     const agClaude = resolvePrice('ag-claude-sonnet-4-6-high')
     assert.equal(agClaude.platform, 'anthropic')
     assert.equal(agClaude.id, 'claude-sonnet-4-6')
-    const agClaudeCost = calculateCost({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, 'ag-claude-sonnet-4-6-high')
+    const agClaudeCost = calculateCost(
+      { input_tokens: 1_000_000, output_tokens: 1_000_000 },
+      'ag-claude-sonnet-4-6-high',
+    )
     assert.equal(agClaudeCost.known, true)
     assert.equal(agClaudeCost.input_cost, 3)
     assert.equal(agClaudeCost.output_cost, 15)
@@ -388,7 +393,12 @@ test('Gemini public handler records requestLog once on direct calls and populate
       sseResponse([
         `data: ${JSON.stringify({
           candidates: [{ content: { role: 'model', parts: [{ text: 'logged-ok' }] }, finishReason: 'STOP' }],
-          usageMetadata: { promptTokenCount: 100, cachedContentTokenCount: 20, candidatesTokenCount: 40, totalTokenCount: 140 },
+          usageMetadata: {
+            promptTokenCount: 100,
+            cachedContentTokenCount: 20,
+            candidatesTokenCount: 40,
+            totalTokenCount: 140,
+          },
         })}\n\n`,
       ]),
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
@@ -400,6 +410,7 @@ test('Gemini public handler records requestLog once on direct calls and populate
     scheduler,
     requestLog: mockRequestLog,
     groupsRepo: { rateMultiplier: () => 1.5 },
+    apiKeyStore: { users: { getById: () => ({ id: 7, role: 'admin' }) } },
   })
 
   // 1. Direct call (e.g. /v1beta/models/... with `all` key) writes one requestLog entry.

@@ -3,6 +3,9 @@ import http from 'node:http'
 import { isIP } from 'node:net'
 import path from 'node:path'
 import { filterModelCatalogForKey, keyModelError } from '../admin/key-models.mjs'
+import { summarizeBody } from '../admin/request-log.mjs'
+import { keyTierPolicyFromRecord } from '../admin/key-scope.mjs'
+import { PLATFORM_SCOPE, normalizeOwnerId, ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import {
   buildGeminiRequest,
   createGeminiProtocolStreamEncoder,
@@ -11,6 +14,7 @@ import {
   parseInboundToGemini,
   renderGeminiProtocolResponse,
 } from '../protocol/gemini-convert.mjs'
+import { resolveGeminiReasoningEffort, sessionIdForLog } from '../protocol/log-fields.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
 import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
@@ -273,8 +277,8 @@ export function geminiKeyAllowsPath(pathname, method) {
   )
 }
 
-export function geminiProxyFor(proxyPool, proxyId) {
-  return proxyFor(proxyPool, proxyId)
+export function geminiProxyFor(proxyPool, proxyId, opts) {
+  return proxyFor(proxyPool, proxyId, opts)
 }
 
 function hostError(code, status = 503) {
@@ -530,7 +534,10 @@ function cragLicenseView(value) {
   }
 }
 
-function environmentView(value, { id, proxyId, proxyPool, withProxyReady = false, billingReady = false } = {}) {
+function environmentView(
+  value,
+  { id, proxyId, proxyPool, withProxyReady = false, billingReady = false, ownerUserId = null } = {},
+) {
   if (
     !validId(value?.id) ||
     !validId(value.proxy_id) ||
@@ -540,10 +547,11 @@ function environmentView(value, { id, proxyId, proxyPool, withProxyReady = false
   ) {
     throw hostError(PROTOCOL_ERROR)
   }
+  const normalizedOwner = normalizeOwnerId(ownerUserId)
   let proxyUrl
   if (proxyPool && (withProxyReady || value.last_inference != null)) {
     try {
-      proxyUrl = proxyFor(proxyPool(), value.proxy_id)
+      proxyUrl = proxyFor(proxyPool(), value.proxy_id, { ownerUserId: normalizedOwner })
     } catch (error) {
       if (error?.code !== 'gemini_proxy_unavailable') throw error
     }
@@ -557,6 +565,7 @@ function environmentView(value, { id, proxyId, proxyPool, withProxyReady = false
   return {
     id: value.id,
     proxy_id: value.proxy_id,
+    ...(normalizedOwner ? { owner_user_id: normalizedOwner } : {}),
     ...(withProxyReady && proxyPool && { proxy_ready: Boolean(proxyUrl) }),
     name: text(value.name, 80) || '',
     auth_state: value.auth_state,
@@ -615,13 +624,22 @@ function authorizationInput(body) {
   }
 }
 
-function proxyFor(proxyPool, proxyId, { allowUnhealthy = false } = {}) {
+function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, ownerUserId = null } = {}) {
   if (!validId(proxyId)) throw hostError('gemini_proxy_unavailable', 409)
-  const proxy = proxyPool?.snapshot({ ownerUserId: null }).proxies.find((entry) => entry.id === proxyId)
+  const targetOwner = normalizeOwnerId(ownerUserId)
+  const scopedList = proxyPool?.snapshot({ ownerUserId: targetOwner || null })?.proxies || []
+  let proxy = scopedList.find((entry) => entry.id === proxyId)
+  if (!proxy && targetOwner) {
+    // Tenant-owned Gemini environments may use either their own proxy or a platform proxy, never another tenant's proxy.
+    const platformList = proxyPool?.snapshot({ ownerUserId: null })?.proxies || []
+    proxy = platformList.find((entry) => entry.id === proxyId)
+  }
+  const pOwner = normalizeOwnerId(proxy?.owner_user_id)
+  const ownerAllowed = targetOwner ? !pOwner || pOwner === targetOwner : !pOwner
   if (
     !proxy?.enabled ||
     (!allowUnhealthy && (proxy.status === 'dead' || proxy.status === 'fail')) ||
-    proxy.owner_user_id ||
+    !ownerAllowed ||
     proxy.blocked_reason
   ) {
     throw hostError('gemini_proxy_unavailable', 409)
@@ -798,11 +816,19 @@ export function createGeminiPanelHandler({
   proxyPool,
   terminal,
   cragSubscription = null,
+  geminiOwnersRepo = null,
   callHost = callGeminiHost,
   billingReady = false,
 }) {
   const maintenance = createGeminiMaintenanceHandler({ json, readBody })
-  const toEnvView = (value, opts = {}) => environmentView(value, { proxyPool, billingReady, ...opts })
+  const envOwnerOf = (envId) => geminiOwnersRepo?.getOwner?.(envId) ?? null
+  const toEnvView = (value, opts = {}) =>
+    environmentView(value, {
+      proxyPool,
+      billingReady,
+      ownerUserId: Object.hasOwn(opts, 'ownerUserId') ? opts.ownerUserId : envOwnerOf(value?.id),
+      ...opts,
+    })
   return async function handleGeminiPanel(req, res, pathname) {
     const ok = (data) => json(res, 200, { ok: true, data })
     const fail = (status, code, message = code) => json(res, status, { ok: false, error: { code, message } })
@@ -860,6 +886,12 @@ export function createGeminiPanelHandler({
           }
         }
         const subscription = cragSubscription ? await cragSubscription.status().catch(() => null) : null
+        const reqUrl = new URL(req.url || PANEL_PATH, 'http://127.0.0.1')
+        const filterOwnerRaw = reqUrl.searchParams.get('owner_user_id')
+        const filterOwner = filterOwnerRaw != null && filterOwnerRaw !== '' ? normalizeOwnerId(filterOwnerRaw) : null
+        const visibleEnvs = filterOwner
+          ? view.environments.filter((env) => envOwnerOf(env.id) === filterOwner)
+          : view.environments
         return ok({
           available: true,
           payload_state: PAYLOAD_STATES.has(view.payload_state) ? view.payload_state : 'unknown',
@@ -868,7 +900,7 @@ export function createGeminiPanelHandler({
           release_activated: typeof view.release_activated === 'boolean' ? view.release_activated : null,
           oauth_runtime_issue: OAUTH_ISSUES.has(view.oauth_runtime_issue) ? view.oauth_runtime_issue : null,
           ...(subscription ? { crag_subscription: subscription } : {}),
-          environments: view.environments.map((value) => toEnvView(value, { withProxyReady: true })),
+          environments: visibleEnvs.map((value) => toEnvView(value, { withProxyReady: true })),
         })
       }
       // All Gemini panel routes pass through the existing admin-only panel ACL.
@@ -912,7 +944,8 @@ export function createGeminiPanelHandler({
         ) {
           return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
         }
-        const proxyUrl = proxyFor(proxyPool(), body.proxy_id)
+        const ownerUserId = normalizeOwnerId(body?.owner_user_id)
+        const proxyUrl = proxyFor(proxyPool(), body.proxy_id, { ownerUserId })
         let created = await callHost('create', {
           name,
           proxy_id: body.proxy_id,
@@ -923,6 +956,9 @@ export function createGeminiPanelHandler({
             oauth_account: { access_token: imported.access_token, expiry_timestamp: imported.expiry_timestamp },
           }),
         })
+        if (ownerUserId && geminiOwnersRepo?.setOwner) {
+          geminiOwnersRepo.setOwner(created.id, ownerUserId)
+        }
         if (method === 'oauth' && cragSubscription?.ensureEnvironmentSeat) {
           const seat = await cragSubscription
             .ensureEnvironmentSeat(created.id, { env: created })
@@ -931,7 +967,7 @@ export function createGeminiPanelHandler({
             created = await callHost('get', { id: created.id })
           }
         }
-        return ok(toEnvView(created))
+        return ok(toEnvView(created, { ownerUserId }))
       }
       const match =
         /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|concurrency|disable|refresh|terminal-ticket|proxy\/probe|proxy|models|test-chat|crag-license(?:\/(?:bind|activate|release))?)(?:\/([^/]+))?)?$/.exec(
@@ -980,24 +1016,28 @@ export function createGeminiPanelHandler({
         const proxyId = body?.proxy_id
         if (!validId(proxyId)) return fail(400, 'gemini_invalid_proxy_id')
         const environment = await readEnvironment(callHost, id)
+        const envOwner = envOwnerOf(id)
         const result = await callHost('proxy-bind', {
           id,
           previous_proxy_id: environment.proxy_id,
           proxy_id: proxyId,
-          proxy_url: proxyFor(proxyPool(), proxyId),
+          proxy_url: proxyFor(proxyPool(), proxyId, { ownerUserId: envOwner }),
         })
-        return ok(toEnvView(result, { id, proxyId }))
+        return ok(toEnvView(result, { id, proxyId, ownerUserId: envOwner }))
       }
       if (req.method === 'POST' && action === 'proxy/probe') {
         const environment = await readEnvironment(callHost, id)
         // Only probing the existing binding may bypass stored health. Scope,
         // enablement, policy, and valid IPv4 SOCKS5 still apply.
-        const target = boundProxy(proxyPool, environment, { allowUnhealthy: true })
+        const target = boundProxy(proxyPool, environment, { allowUnhealthy: true, ownerUserId: envOwnerOf(id) })
         return ok(probeView(await callHost('proxy-probe', { id, ...target })))
       }
       if (req.method === 'POST' && action === 'models') {
         const environment = await readEnvironment(callHost, id)
-        let result = await callHost('models', { id, ...boundProxy(proxyPool, environment) })
+        let result = await callHost('models', {
+          id,
+          ...boundProxy(proxyPool, environment, { ownerUserId: envOwnerOf(id) }),
+        })
         if (environment.auth_method === 'oauth' && cragSubscription?.ensureEnvironmentSeat) {
           const seat = await cragSubscription.ensureEnvironmentSeat(id, { env: result }).catch(() => ({ bound: false }))
           if (seat.bound) {
@@ -1016,7 +1056,12 @@ export function createGeminiPanelHandler({
         if (!model) return fail(400, 'gemini_invalid_model')
         if (!validPrompt(prompt)) return fail(400, 'gemini_invalid_prompt')
         const environment = await readEnvironment(callHost, id)
-        const result = await callHost('test-chat', { id, ...boundProxy(proxyPool, environment), model, prompt })
+        const result = await callHost('test-chat', {
+          id,
+          ...boundProxy(proxyPool, environment, { ownerUserId: envOwnerOf(id) }),
+          model,
+          prompt,
+        })
         if (!validRunId(result?.run_id)) throw hostError(PROTOCOL_ERROR)
         return ok({ run_id: result.run_id })
       }
@@ -1030,6 +1075,7 @@ export function createGeminiPanelHandler({
           seatRelease = await cragSubscription.releaseEnvironment(id, { ignoreMissing: true })
         }
         await callHost('delete', { id })
+        geminiOwnersRepo?.remove?.(id)
         return ok({ deleted: true, ...(seatRelease ? { seat_released: seatRelease.released === true } : {}) })
       }
       if (req.method === 'POST' && action === 'disable') {
@@ -1038,7 +1084,7 @@ export function createGeminiPanelHandler({
       }
       if (req.method === 'POST' && action === 'refresh') {
         const environment = environmentView(await callHost('get', { id }))
-        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
+        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id, { ownerUserId: envOwnerOf(id) })
         let refreshed = await callHost('refresh', { id, proxy_id: environment.proxy_id, proxy_url: proxyUrl })
         if (environment.auth_method === 'oauth' && cragSubscription?.ensureEnvironmentSeat) {
           const seat = await cragSubscription
@@ -1053,7 +1099,7 @@ export function createGeminiPanelHandler({
       if (action !== 'authorization') return fail(404, 'not_found')
       if (req.method === 'POST') {
         const environment = environmentView(await callHost('get', { id }))
-        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
+        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id, { ownerUserId: envOwnerOf(id) })
         const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
         const auth = await callHost('authorize', {
           id,
@@ -1072,7 +1118,7 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_invalid_authorization_code', '请输入 Google 授权码或完整回调链接')
         }
         const environment = environmentView(await callHost('get', { id }))
-        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id)
+        const proxyUrl = proxyFor(proxyPool(), environment.proxy_id, { ownerUserId: envOwnerOf(id) })
         const proxySha256 = crypto.createHash('sha256').update(proxyUrl).digest('hex')
         let completed = await callHost('complete', {
           id,
@@ -1398,15 +1444,70 @@ function logProtocolName(protocol) {
   }
 }
 
+function extractGeminiSessionId(req, body, sessionPathId = '') {
+  const headers = req?.headers || {}
+  for (const key of [
+    'x-session-id',
+    'x-conversation-id',
+    'x-claude-code-session-id',
+    'x-opencode-session',
+    'x-opencode-session-id',
+    'session-id',
+    'thread-id',
+  ]) {
+    if (typeof headers[key] === 'string' && headers[key].trim()) return headers[key].trim()
+  }
+  for (const field of ['conversation_id', 'conversationId', 'session_id', 'thread_id', 'prompt_cache_key']) {
+    if (typeof body?.[field] === 'string' && body[field].trim()) return body[field].trim()
+  }
+  if (typeof body?.metadata?.user_id === 'string' && body.metadata.user_id.trim()) {
+    const rawUser = body.metadata.user_id.trim()
+    if (rawUser.startsWith('{')) {
+      try {
+        const parsedUid = JSON.parse(rawUser)
+        if (typeof parsedUid?.session_id === 'string' && parsedUid.session_id.trim()) {
+          return parsedUid.session_id.trim()
+        }
+      } catch {}
+    }
+    const match = /_session_([A-Za-z0-9._-]+)$/.exec(rawUser)
+    return match ? match[1] : rawUser
+  }
+  return typeof sessionPathId === 'string' ? sessionPathId.trim() : ''
+}
+
 export function createGeminiPublicHandler({
   json,
   readBody,
   scheduler,
   requestLog = null,
   groupsRepo = null,
+  apiKeyStore = null,
   getRoutingConfig = null,
 }) {
-  return async function handleGeminiPublic(req, res, { logBag: externalLogBag = null } = {}) {
+  const geminiScopeFromReq = (req) => {
+    const rec = req?.apiKeyRecord || null
+    const policy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(rec) : null
+    // In production `apiKeyStore.users` resolves whether `user_id` is an admin or tenant.
+    // When invoked standalone without a users repo, a `gemini`-group key without an explicit
+    // `owner_id` or `tenant` tier defaults to `PLATFORM_SCOPE` (only admins can create `gemini` keys).
+    const ownerScope =
+      !apiKeyStore?.users && !policy?.owner_id && policy?.permission_tier !== 'tenant' && rec?.group_type === 'gemini'
+        ? PLATFORM_SCOPE
+        : ownerScopeFromRequest(req, apiKeyStore?.users)
+    const allowedEnvIds =
+      policy?.permission_tier === 'resource'
+        ? policy.allowed_gemini_envs
+        : policy?.allowed_gemini_envs?.length
+          ? policy.allowed_gemini_envs
+          : null
+    return { ownerScope, allowedEnvIds }
+  }
+  return async function handleGeminiPublic(
+    req,
+    res,
+    { logBag: externalLogBag = null, logCtx: externalLogCtx = null } = {},
+  ) {
     res.setHeader('Cache-Control', 'no-store')
     const keyGroupType = req.apiKeyKind === 'managed' ? req.apiKeyRecord?.group_type || 'all' : null
     if (keyGroupType !== 'gemini' && keyGroupType !== 'all') {
@@ -1418,6 +1519,7 @@ export function createGeminiPublicHandler({
         },
       })
     }
+    const geminiScope = geminiScopeFromReq(req)
     const url = new URL(req.url || PUBLIC_PATH, 'http://127.0.0.1')
     const googleModels = url.pathname === '/v1beta/models'
     const singleModelGet = req.method === 'GET' ? parseGeminiModelGetPath(url.pathname) : null
@@ -1426,7 +1528,7 @@ export function createGeminiPublicHandler({
       ([PUBLIC_PATH, '/v1/models', '/models', '/v1beta/models'].includes(url.pathname) || singleModelGet)
     ) {
       try {
-        const catalog = await scheduler.catalog()
+        const catalog = await scheduler.catalog(geminiScope)
         if (singleModelGet) {
           const hit = findCatalogModel(publicModels(catalog, req).data, singleModelGet.model)
           if (!hit) {
@@ -1489,21 +1591,28 @@ export function createGeminiPublicHandler({
     const modelFromPath = google ? google.model : null
     const bodyLimit = protocol === 'gemini-session' ? 256 * 1024 : 12 * 1024 * 1024
 
-    const startedAt = Date.now()
     const ownLogCtx =
       !externalLogBag && requestLog?.start
-        ? requestLog.start(req, { protocol: logProtocolName(protocol), route: url.pathname })
+        ? requestLog.start(req, { protocol: logProtocolName(protocol), pathName: url.pathname })
         : null
-    if (ownLogCtx) requestLog?.tapResponse?.(ownLogCtx, res)
+    const activeLogCtx = externalLogCtx || ownLogCtx
+    const startedAt = activeLogCtx?.t0 || Date.now()
     const logBag = externalLogBag || {}
+    if (logBag.outbound_headers_source === 'unavailable') logBag.outbound_headers_source = null
+    if (ownLogCtx) {
+      res._kinRequestId = ownLogCtx.request_id
+      // Register tapResponse before our finish listener so ctx.response has final status/headers/body.
+      requestLog?.tapResponse?.(ownLogCtx, res)
+    }
     let ownLogFlushed = false
+    let ownLogStatusOverride = null
     const finishOwnLog = (statusCode) => {
       if (!ownLogCtx || ownLogFlushed) return
       ownLogFlushed = true
       try {
         const groupId = req.apiKeyRecord?.group_id ?? 1
         requestLog.finish(ownLogCtx, {
-          status: statusCode ?? (res.statusCode || 0),
+          status: statusCode ?? ownLogStatusOverride ?? (res.statusCode || 0),
           api_key_kind: req.apiKeyKind || null,
           api_key_id: req.apiKeyRecord?.id || null,
           user_id: req.apiKeyRecord?.user_id ?? null,
@@ -1512,6 +1621,15 @@ export function createGeminiPublicHandler({
           ...logBag,
         })
       } catch {}
+    }
+    const hasFinishHook = typeof res?.once === 'function'
+    if (ownLogCtx && hasFinishHook) {
+      res.once('finish', () => finishOwnLog(ownLogStatusOverride ?? (res.statusCode || 0)))
+    }
+    const respondJson = (statusCode, payload) => {
+      const out = json(res, statusCode, payload)
+      if (ownLogCtx && !hasFinishHook) finishOwnLog(statusCode)
+      return out
     }
 
     let body = req.body
@@ -1523,12 +1641,15 @@ export function createGeminiPublicHandler({
         logBag.error_code = 'invalid_json'
         logBag.error_message = 'Invalid JSON request body.'
         logBag.final_state = 'failed'
-        finishOwnLog(status)
-        return json(res, status, protocolErrorBody(protocol, status, 'invalid_json', 'Invalid JSON request body.'))
+        logBag.attempt_count = 0
+        return respondJson(status, protocolErrorBody(protocol, status, 'invalid_json', 'Invalid JSON request body.'))
       }
     }
-    if (ownLogCtx?.mode === 'debug' && logBag.inbound_body == null) {
+    if (activeLogCtx?.mode === 'debug' && logBag.inbound_body == null) {
       logBag.inbound_body = body
+    }
+    if (logBag.inbound_summary == null) {
+      logBag.inbound_summary = summarizeBody(body)
     }
 
     const supportsStream = typeof scheduler.stream === 'function'
@@ -1548,8 +1669,8 @@ export function createGeminiPublicHandler({
         logBag.error_code = code
         logBag.error_message = msg
         logBag.final_state = 'failed'
-        finishOwnLog(status)
-        return json(res, status, protocolErrorBody(protocol, status, code, msg))
+        logBag.attempt_count = 0
+        return respondJson(status, protocolErrorBody(protocol, status, code, msg))
       }
     } else {
       requested = geminiTurnFromBody(body, protocol, modelFromPath)
@@ -1559,9 +1680,8 @@ export function createGeminiPublicHandler({
         logBag.error_message =
           'This CRAGGemini route accepts one plain-text user turn without tools or generation settings.'
         logBag.final_state = 'failed'
-        finishOwnLog(status)
-        return json(
-          res,
+        logBag.attempt_count = 0
+        return respondJson(
           status,
           protocolErrorBody(
             protocol,
@@ -1576,19 +1696,29 @@ export function createGeminiPublicHandler({
     const targetModel = supportsStream ? parsed.model : requested.model
     const wantStream =
       protocol === 'gemini-session' ? false : (supportsStream ? parsed.stream : requested.stream) === true
+    const stickyHeader = extractGeminiSessionId(req, body, session?.[1])
     logBag.model = targetModel
     logBag.requested_model = targetModel
     logBag.stream = wantStream
-    logBag.has_tools = Boolean(supportsStream ? parsed?.requiredCapabilities?.includes('tools') : false)
-    logBag.attempt_count = 1
+    logBag.has_tools = Boolean(
+      supportsStream
+        ? parsed?.tools?.length > 0 ||
+            parsed?.webSearch ||
+            parsed?.googleTools?.length > 0 ||
+            parsed?.requiredCapabilities?.includes('tools')
+        : false,
+    )
+    logBag.attempt_count = 0
+    logBag.reasoning_effort = resolveGeminiReasoningEffort({ inbound: body, parsed, model: targetModel })
+    if (!logBag.session_id) logBag.session_id = sessionIdForLog(stickyHeader)
+    logBag.outbound_session_id = sessionIdForLog(stickyHeader)
 
     if (keyGroupType === 'all' && !isAntigravityRoutedModel(targetModel)) {
       const msg = 'All-access keys must address Antigravity non-Gemini models with the ag- prefix.'
       logBag.error_code = 'gemini_model_unavailable'
       logBag.error_message = msg
       logBag.final_state = 'failed'
-      finishOwnLog(404)
-      return json(res, 404, protocolErrorBody(protocol, 404, 'gemini_model_unavailable', msg))
+      return respondJson(404, protocolErrorBody(protocol, 404, 'gemini_model_unavailable', msg))
     }
 
     const denied = keyModelError(req, targetModel, { anthropic: messages })
@@ -1596,22 +1726,29 @@ export function createGeminiPublicHandler({
       logBag.error_code = denied.body.error.code
       logBag.error_message = denied.body.error.message
       logBag.final_state = 'failed'
-      finishOwnLog(denied.status)
-      return json(
-        res,
+      return respondJson(
         denied.status,
         protocolErrorBody(protocol, denied.status, denied.body.error.code, denied.body.error.message),
       )
     }
 
     const controller = new AbortController()
-    req.once('aborted', () => controller.abort())
-    res.once('close', () => {
+    req.once?.('aborted', () => controller.abort())
+    res.once?.('close', () => {
       if (!res.writableEnded) controller.abort()
     })
 
+    let lastOutboundBody = null
     const applyTurnLog = (turn) => {
       const usage = turn?.usage || {}
+      const cacheRead = usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? 0
+      const reasoning = usage.reasoning_tokens ?? 0
+      const webSearches =
+        Number.isSafeInteger(usage.web_search_requests) && usage.web_search_requests > 0
+          ? usage.web_search_requests
+          : Array.isArray(turn?.searches) && turn.searches.length > 0
+            ? turn.searches.length
+            : 0
       logBag.model = turn?.model || targetModel
       logBag.requested_model = targetModel
       logBag.upstream_model = turn?.upstream_model || turn?.model || targetModel
@@ -1621,13 +1758,75 @@ export function createGeminiPublicHandler({
       logBag.via = turn?.auth_method === 'api_key' ? 'gemini_api_key' : 'craggemini'
       logBag.stop_reason = turn?.stopReason || 'end_turn'
       logBag.final_state = 'verified'
+      logBag.attempt_count = Number.isInteger(turn?.attempt_count) ? turn.attempt_count : 1
+      logBag.upstream_status = turn?.upstream_status ?? 200
+      logBag.reasoning_effort = resolveGeminiReasoningEffort({
+        inbound: body,
+        parsed,
+        outboundBody: lastOutboundBody,
+        model: targetModel,
+        upstreamModel: turn?.upstream_model || turn?.model || targetModel,
+      })
       logBag.usage = {
         input_tokens: usage.input_tokens || 0,
         output_tokens: usage.output_tokens || 0,
-        ...(usage.cache_read_tokens ? { cache_read_tokens: usage.cache_read_tokens } : {}),
-        ...(usage.reasoning_tokens ? { reasoning_tokens: usage.reasoning_tokens } : {}),
+        ...(cacheRead > 0 ? { cache_read_input_tokens: cacheRead, cache_read_tokens: cacheRead } : {}),
+        ...(reasoning > 0 ? { reasoning_tokens: reasoning } : {}),
+        ...(webSearches > 0 ? { web_search_requests: webSearches } : {}),
       }
-      if (logBag.first_token_ms == null) logBag.first_token_ms = Math.max(0, Date.now() - startedAt)
+      const timing = turn?.timing
+      if (timing) {
+        logBag.first_byte_ms = Number.isFinite(timing.firstByteAt)
+          ? Math.max(0, timing.firstByteAt - startedAt)
+          : (timing.firstByteMs ?? logBag.first_byte_ms ?? null)
+        logBag.first_token_ms = Number.isFinite(timing.firstTokenAt)
+          ? Math.max(0, timing.firstTokenAt - startedAt)
+          : (timing.ttftMs ?? logBag.first_token_ms ?? null)
+        logBag.generation_ms = timing.generationMs ?? null
+      } else if (logBag.first_token_ms == null) {
+        logBag.first_token_ms = Math.max(0, Date.now() - startedAt)
+      }
+    }
+
+    const applyErrorLog = (error) => {
+      if (!error || typeof error !== 'object') return
+      if (Number.isInteger(error.attemptCount)) logBag.attempt_count = error.attemptCount
+      if (Number.isInteger(error.upstreamStatus)) logBag.upstream_status = error.upstreamStatus
+      if (error.accountId) {
+        logBag.account_id = error.accountId
+        logBag.final_account_id = error.accountId
+        logBag.vm_id = `gemini:${error.accountId}`
+      }
+      if (error.authMethod) logBag.via = error.authMethod === 'api_key' ? 'gemini_api_key' : 'craggemini'
+      if (error.upstreamModel) logBag.upstream_model = error.upstreamModel
+      const timing = error.timing
+      if (timing) {
+        if (Number.isFinite(timing.firstByteAt)) logBag.first_byte_ms = Math.max(0, timing.firstByteAt - startedAt)
+        else if (timing.firstByteMs != null) logBag.first_byte_ms = timing.firstByteMs
+        if (Number.isFinite(timing.firstTokenAt)) logBag.first_token_ms = Math.max(0, timing.firstTokenAt - startedAt)
+        else if (timing.ttftMs != null) logBag.first_token_ms = timing.ttftMs
+        if (timing.generationMs != null) logBag.generation_ms = timing.generationMs
+      }
+      const usage = error.usage
+      if (usage && (usage.input_tokens || usage.output_tokens || usage.cache_read_tokens || usage.reasoning_tokens)) {
+        const cacheRead = usage.cache_read_input_tokens ?? usage.cache_read_tokens ?? 0
+        const reasoning = usage.reasoning_tokens ?? 0
+        logBag.usage = {
+          input_tokens: usage.input_tokens || 0,
+          output_tokens: usage.output_tokens || 0,
+          ...(cacheRead > 0 ? { cache_read_input_tokens: cacheRead, cache_read_tokens: cacheRead } : {}),
+          ...(reasoning > 0 ? { reasoning_tokens: reasoning } : {}),
+        }
+      }
+      if (lastOutboundBody) {
+        logBag.reasoning_effort = resolveGeminiReasoningEffort({
+          inbound: body,
+          parsed,
+          outboundBody: lastOutboundBody,
+          model: targetModel,
+          upstreamModel: error.upstreamModel || targetModel,
+        })
+      }
     }
 
     if (!supportsStream) {
@@ -1635,31 +1834,52 @@ export function createGeminiPublicHandler({
         const turn = await scheduler.complete({
           model: requested.model,
           text: requested.text,
+          requestId: activeLogCtx?.request_id,
+          startedAt,
+          stickyKey: stickyHeader ? `${req.apiKeyRecord?.id || 'anon'}:${stickyHeader.slice(0, 128)}` : null,
           signal: controller.signal,
           apiKeyRecord: req.apiKeyRecord,
           allowUnprefixedNonGemini: keyGroupType === 'gemini',
+          ...geminiScope,
         })
         applyTurnLog(turn)
-        finishOwnLog(200)
-        if (messages)
-          return requested.stream ? writeStream(res, anthropicStream(turn)) : json(res, 200, anthropicMessage(turn))
+        if (messages) {
+          if (requested.stream) {
+            const out = writeStream(res, anthropicStream(turn))
+            if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
+            return out
+          }
+          return respondJson(200, anthropicMessage(turn))
+        }
         if (protocol === 'openai-chat') {
-          if (!requested.stream) return json(res, 200, chatCompletion(turn))
+          if (!requested.stream) return respondJson(200, chatCompletion(turn))
           const id = `chatcmpl_${crypto.randomBytes(12).toString('hex')}`
-          return writeStream(res, [
+          const out = writeStream(res, [
             `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', model: turn.model, choices: [{ index: 0, delta: { role: 'assistant', content: turn.text }, finish_reason: null }] })}\n\n`,
             `data: ${JSON.stringify({ id, object: 'chat.completion.chunk', model: turn.model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: turn.usage?.input_tokens || 0, completion_tokens: turn.usage?.output_tokens || 0, total_tokens: turn.usage?.total_tokens || 0 } })}\n\n`,
             'data: [DONE]\n\n',
           ])
+          if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
+          return out
         }
         if (protocol === 'openai-responses') {
-          return requested.stream ? writeStream(res, responsesStream(turn)) : json(res, 200, responsesOutput(turn))
+          if (requested.stream) {
+            const out = writeStream(res, responsesStream(turn))
+            if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
+            return out
+          }
+          return respondJson(200, responsesOutput(turn))
         }
         if (protocol === 'gemini') {
           const response = googleOutput(turn)
-          return routeStream ? writeStream(res, [`data: ${JSON.stringify(response)}\n\n`]) : json(res, 200, response)
+          if (routeStream) {
+            const out = writeStream(res, [`data: ${JSON.stringify(response)}\n\n`])
+            if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
+            return out
+          }
+          return respondJson(200, response)
         }
-        return json(res, 200, {
+        return respondJson(200, {
           id: session[1],
           model: turn.model,
           account_id: turn.account_id,
@@ -1667,9 +1887,11 @@ export function createGeminiPublicHandler({
           usage: turn.usage,
         })
       } catch (error) {
+        applyErrorLog(error)
         if (controller.signal.aborted) {
           logBag.error_code = 'gemini_inference_cancelled'
-          logBag.final_state = 'aborted'
+          logBag.final_state = 'cancelled'
+          ownLogStatusOverride = 499
           finishOwnLog(499)
           return
         }
@@ -1677,9 +1899,7 @@ export function createGeminiPublicHandler({
         logBag.error_code = mapped.body.error.code
         logBag.error_message = mapped.body.error.message
         logBag.final_state = 'failed'
-        finishOwnLog(mapped.status)
-        return json(
-          res,
+        return respondJson(
           mapped.status,
           protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
         )
@@ -1687,43 +1907,86 @@ export function createGeminiPublicHandler({
     }
 
     let headersSent = false
-    const encoder = wantStream ? createGeminiProtocolStreamEncoder(protocol, { model: parsed.model }) : null
+    const encoder = wantStream
+      ? createGeminiProtocolStreamEncoder(protocol, { model: parsed.model, restoreContext: parsed.restoreContext })
+      : null
+    const continuationCallIds = []
+    const parsedMsgs = Array.isArray(parsed.messages) ? parsed.messages : []
+    for (let i = parsedMsgs.length - 1; i >= 0; i -= 1) {
+      const msgResults = []
+      for (const part of parsedMsgs[i]?.parts || []) {
+        if (part?.kind === 'tool_result' && typeof part.callId === 'string' && part.callId) {
+          msgResults.push(part.callId)
+        }
+      }
+      if (!msgResults.length) break
+      continuationCallIds.unshift(...msgResults)
+    }
     const writeChunk = (text) => {
       if (!text || controller.signal.aborted) return
       if (!headersSent) {
         beginSse(res)
         headersSent = true
-        if (logBag.first_token_ms == null) logBag.first_token_ms = Math.max(0, Date.now() - startedAt)
       }
       res.write(text)
     }
 
-    const stickyHeader =
-      (typeof req.headers?.['x-session-id'] === 'string' && req.headers['x-session-id'].trim()) ||
-      (typeof req.headers?.['x-conversation-id'] === 'string' && req.headers['x-conversation-id'].trim()) ||
-      (typeof body?.conversation_id === 'string' && body.conversation_id.trim()) ||
-      (typeof body?.session_id === 'string' && body.session_id.trim()) ||
-      session?.[1] ||
+    const deriveFirstUserFingerprint = () => {
+      const msgs = Array.isArray(parsed?.messages) ? parsed.messages : []
+      const firstUser = msgs.find((m) => m?.role === 'user') || msgs[0]
+      if (!firstUser || !Array.isArray(firstUser.parts)) return ''
+      const text = firstUser.parts
+        .filter((p) => p?.kind === 'text' && typeof p.text === 'string' && p.text.trim())
+        .map((p) => p.text)
+        .join('\n')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 4000)
+      if (text) return `ch:${crypto.createHash('sha256').update(text).digest('hex').slice(0, 24)}`
+      const firstMedia = firstUser.parts.find((p) => p?.data || p?.url)
+      if (firstMedia) {
+        const seed = firstMedia.data ? String(firstMedia.data).slice(0, 512) : String(firstMedia.url)
+        return `ch:${crypto.createHash('sha256').update(seed).digest('hex').slice(0, 24)}`
+      }
+      return ''
+    }
+    const stickySeed =
+      stickyHeader ||
+      deriveFirstUserFingerprint() ||
+      (typeof body?.previous_response_id === 'string' && body.previous_response_id.trim()) ||
       ''
-    const stickyKey = stickyHeader ? `${req.apiKeyRecord?.id || 'anon'}:${stickyHeader.slice(0, 128)}` : null
+    const stickyKey = stickySeed ? `${req.apiKeyRecord?.id || 'anon'}:${stickySeed.slice(0, 128)}` : null
 
     try {
       const promptPolicy =
         typeof getRoutingConfig === 'function' ? resolveCragGeminiPromptPolicy(getRoutingConfig()) : null
       const turn = await scheduler.stream({
         model: parsed.model,
+        ...(activeLogCtx?.request_id ? { requestId: activeLogCtx.request_id } : {}),
+        startedAt,
         targetBodyFor: (target, meta) => {
-          const reqBody = buildGeminiRequest(meta?.upstreamModel ? { ...parsed, model: meta.upstreamModel } : parsed, {
-            target,
-          })
+          const irForTarget = {
+            ...parsed,
+            ...(meta?.upstreamModel ? { model: meta.upstreamModel } : {}),
+            // On CRAGGemini (`antigravity`), always apply the scheduler's account-scoped
+            // outbound conversation_id so switching accounts never reuses the prior account's
+            // or raw caller's conversation_id.
+            ...(target === 'antigravity' && meta?.conversationId ? { conversationId: meta.conversationId } : {}),
+          }
+          const reqBody = buildGeminiRequest(irForTarget, { target })
           const finalBody =
             target === 'antigravity' && promptPolicy ? applyCragGeminiPromptPolicy(reqBody, promptPolicy) : reqBody
-          if (ownLogCtx?.capture_outbound) {
+          lastOutboundBody = finalBody
+          logBag.outbound_summary = summarizeBody(finalBody)
+          if (activeLogCtx?.capture_outbound) {
             logBag.outbound_body = finalBody
             logBag.outbound_body_source = target === 'antigravity' ? 'craggemini' : 'gemini_api'
           }
           return finalBody
         },
+        restoreContext: parsed.restoreContext,
+        continuationCallIds,
+        inboundConversationId: parsed.conversationId || null,
         requiredCapabilities: parsed.requiredCapabilities,
         unsupportedFields: parsed.unsupportedFields,
         plainText: parsed.plainText,
@@ -1731,6 +1994,7 @@ export function createGeminiPublicHandler({
         signal: controller.signal,
         apiKeyRecord: req.apiKeyRecord,
         allowUnprefixedNonGemini: keyGroupType === 'gemini',
+        ...geminiScope,
         onEvent: wantStream
           ? (event) => {
               if (event?.kind === 'error') return
@@ -1739,32 +2003,36 @@ export function createGeminiPublicHandler({
           : null,
       })
       if (controller.signal.aborted) {
+        applyTurnLog(turn)
         logBag.error_code = 'gemini_inference_cancelled'
-        logBag.final_state = 'aborted'
+        logBag.final_state = 'cancelled'
+        ownLogStatusOverride = 499
         finishOwnLog(499)
         return
       }
       applyTurnLog(turn)
-      finishOwnLog(200)
       if (wantStream) {
         writeChunk(encoder.finish())
         if (!headersSent) beginSse(res)
         res.end()
+        if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
         return
       }
-      return json(
-        res,
+      return respondJson(
         200,
         renderGeminiProtocolResponse(protocol, turn, {
           model: turn.model || parsed.model,
           sessionId: session?.[1],
           accountId: turn.account_id,
+          restoreContext: parsed.restoreContext,
         }),
       )
     } catch (error) {
+      applyErrorLog(error)
       if (controller.signal.aborted) {
         logBag.error_code = 'gemini_inference_cancelled'
-        logBag.final_state = 'aborted'
+        logBag.final_state = 'cancelled'
+        ownLogStatusOverride = 499
         finishOwnLog(499)
         return
       }
@@ -1772,18 +2040,18 @@ export function createGeminiPublicHandler({
       logBag.error_code = mapped.body.error.code
       logBag.error_message = mapped.body.error.message
       logBag.final_state = 'failed'
-      finishOwnLog(headersSent ? 200 : mapped.status)
       if (headersSent) {
+        ownLogStatusOverride = 200
         try {
           res.write(
             formatGeminiProtocolStreamError(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
           )
           res.end()
         } catch {}
+        if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
         return
       }
-      return json(
-        res,
+      return respondJson(
         mapped.status,
         protocolErrorBody(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
       )

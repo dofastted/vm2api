@@ -1,3 +1,4 @@
+import { assertNoUnrepresentableCragFields, sanitizeCragBodyWhitelist } from './crag-whitelist.mjs'
 import { isSmallTextTurn, messageHasTurnControls, reusableContentBlock, sanitizeAnthropicBody } from './sanitize.mjs'
 import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
@@ -127,7 +128,7 @@ function validateMessages(messages, checkReuse = false) {
   return reusable
 }
 
-function canonicalRequest(body, { reuseCanonicalHistory = false } = {}) {
+function canonicalRequest(body, { reuseCanonicalHistory = false, preserveConsecutiveUser = false } = {}) {
   if (!object(body)) invalid('body', 'must be an object')
   const tools = normalizeToolInputSchemas(body.tools, invalid)
   if (tools !== body.tools) body = { ...body, tools }
@@ -163,6 +164,7 @@ function canonicalRequest(body, { reuseCanonicalHistory = false } = {}) {
   // changing tool IDs or thinking signatures here invalidates CRAG continuation hashes.
   const out = sanitizeAnthropicBody(body, {
     reuseCanonicalHistory: reuseCanonicalHistory && ((messages) => validateMessages(messages, true)),
+    preserveConsecutiveUser,
   })
   for (const key of INTERNAL_FIELDS) delete out[key]
   if (!out.messages.length) invalid('messages', 'contains no content after normalization')
@@ -170,8 +172,10 @@ function canonicalRequest(body, { reuseCanonicalHistory = false } = {}) {
 }
 
 /** Structured native_messages: the CLI owns system layout and cache policy. */
-export function prepareCliNodeRequest(body) {
-  const out = canonicalRequest(body)
+export function prepareCliNodeRequest(body, { requestContext = null } = {}) {
+  const out = canonicalRequest(body, {
+    preserveConsecutiveUser: requestContext?.purpose === 'auto_mode_classifier',
+  })
   for (const key of Object.keys(out)) {
     if (key.startsWith('crag_')) delete out[key]
   }
@@ -183,16 +187,21 @@ export function prepareCliNodeRequest(body) {
 }
 
 /** Native CRAG imports history itself; PTY projection remains worker-owned. */
-export function prepareCragRequest(body, health) {
-  const out = canonicalRequest(body, { reuseCanonicalHistory: !isSmallTextTurn(body) })
-  if (needsCragProviderCompatibility(out, health?.capabilities) && out.crag_prompt != null) {
+export function prepareCragRequest(body, health, { requestContext = null } = {}) {
+  assertNoUnrepresentableCragFields(body)
+  const isClassifier = requestContext?.purpose === 'auto_mode_classifier'
+  const reuseHistory = !isSmallTextTurn(body) && !isClassifier
+  const normalized = canonicalRequest(body, {
+    reuseCanonicalHistory: reuseHistory,
+    preserveConsecutiveUser: isClassifier,
+  })
+  if (needsCragProviderCompatibility(normalized, health?.capabilities) && normalized.crag_prompt != null) {
     invalid('crag_prompt', 'provider compatibility requests must use system instead')
   }
-  delete out.auto_compact_window
-  // Claude Code 2.1.325+ sends `diagnostics: { previous_message_id }` (cache-diagnosis beta) on every turn.
-  // CRAG's bundled Claude Code predates it and rejects the whole request with 400
-  // "unsupported request field: diagnostics"; the field only asks for optional cache diagnostics.
-  delete out.diagnostics
+  const { body: out } = sanitizeCragBodyWhitelist(normalized, {
+    capabilities: health?.capabilities,
+    preserveCanonicalHistory: reuseHistory,
+  })
   if (out.crag_options != null) {
     if (!object(out.crag_options)) invalid('crag_options', 'must be an object')
     const aliases = Object.fromEntries(Object.entries(out.crag_options).filter(([key]) => CRAG_ALIASES.has(key)))

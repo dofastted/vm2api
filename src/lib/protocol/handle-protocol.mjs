@@ -72,7 +72,14 @@ import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/re
 import { loggedReasoningEffort } from './thinking.mjs'
 import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
 import { ownerScopeFromRequest, pinnedVmIdFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
-import { applyVmPool, keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
+import {
+  applyVmPool,
+  keyAllowsVm,
+  keyScopeFromRequest,
+  keyTierPolicyFromRecord,
+  vmGroupType,
+  vmPoolDenial,
+} from '../admin/key-scope.mjs'
 import { keyModelError } from '../admin/key-models.mjs'
 import {
   resolveInferenceEngine,
@@ -207,7 +214,7 @@ import {
   recordThinkingOwners,
   thinkingOwners as defaultThinkingOwners,
 } from '../pool/thinking-owner.mjs'
-import { getVm } from '../vm/vm-registry.mjs'
+import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { credentialModeFromOauth, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import {
   prepareAnthropicRequest,
@@ -740,7 +747,7 @@ export function createHandleProtocol(deps) {
     }
 
     if (protocol === 'anthropic.messages' && req.apiKeyRecord?.group_type === 'gemini') {
-      return deps.handleGeminiMessages(req, res, { logBag })
+      return deps.handleGeminiMessages(req, res, { logBag, logCtx })
     }
 
     let inbound
@@ -785,18 +792,59 @@ export function createHandleProtocol(deps) {
     logBag.inbound_device_id = sessionIdForLog(auditIdentity.deviceId)
     logBag.reasoning_effort = reasoningEffortOf(inbound)
 
+    const rawInboundBackend = resolveInferenceBackend(req)
+    const inboundKeyPolicy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(req.apiKeyRecord) : null
     if (
       req.apiKeyKind === 'managed' &&
       keyScopeFromRequest(req).group_type === 'all' &&
-      String(req.apiKeyRecord?.category || '')
-        .trim()
-        .toLowerCase() !== 'api' &&
+      rawInboundBackend !== 'api' &&
       isAntigravityRoutedModel(inbound?.model) &&
       (protocol === 'openai.chat' || protocol === 'openai.responses' || protocol === 'anthropic.messages') &&
       typeof (deps.handleGeminiPublic || deps.handleGeminiMessages) === 'function'
     ) {
-      req.body = inbound
-      return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, { logBag })
+      let preferGeminiApiChannel = false
+      if (rawInboundBackend === 'all') {
+        const hasPinnedEndpoints =
+          Boolean(inboundKeyPolicy?.api_endpoint_id) || (inboundKeyPolicy?.allowed_endpoints?.length || 0) > 0
+        if (
+          inboundKeyPolicy?.permission_tier === 'resource' &&
+          inboundKeyPolicy.allowed_gemini_envs.length === 0 &&
+          hasPinnedEndpoints
+        ) {
+          preferGeminiApiChannel = true
+        } else if (apiScheduler?.pick) {
+          const gemScope = {
+            ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+            allowedEnvIds:
+              inboundKeyPolicy?.permission_tier === 'resource'
+                ? inboundKeyPolicy.allowed_gemini_envs
+                : inboundKeyPolicy?.allowed_gemini_envs?.length
+                  ? inboundKeyPolicy.allowed_gemini_envs
+                  : null,
+          }
+          let hasOwnedGeminiEnv = false
+          if (typeof deps.geminiScheduler?.catalog === 'function') {
+            try {
+              const cat = await deps.geminiScheduler.catalog(gemScope)
+              hasOwnedGeminiEnv = Array.isArray(cat?.accounts) && cat.accounts.length > 0
+            } catch {
+              hasOwnedGeminiEnv = false
+            }
+          }
+          if (!hasOwnedGeminiEnv) {
+            const probe = apiScheduler.pick(
+              inbound?.model,
+              Date.now(),
+              apiScheduleScope(req, 'all', apiKeyStore?.users),
+            )
+            if (probe?.ok) preferGeminiApiChannel = true
+          }
+        }
+      }
+      if (!preferGeminiApiChannel) {
+        req.body = inbound
+        return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, { logBag, logCtx })
+      }
     }
 
     const fp = fingerprintRequest(req, inbound)
@@ -943,18 +991,57 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, errorResult.status, errorResult.body)
     }
-    const inferenceBackend = resolveInferenceBackend(req)
-    if (inferenceBackend === 'api' && ownerScopeFromRequest(req, apiKeyStore?.users).type !== 'platform') {
-      stats.errors++
-      const errorResult = makeError({
-        type: ErrorType.PERMISSION,
-        code: ErrorCode.API_BACKEND_FORBIDDEN,
-        message: '租户密钥只能调用自己名下的槽位',
-        status: 403,
-      })
-      logBag.error_code = ErrorCode.API_BACKEND_FORBIDDEN
-      logBag.error_message = errorResult.body?.error?.message || null
-      return json(res, 403, errorResult.body)
+    const rawBackend = resolveInferenceBackend(req)
+    const reqOwnerScope = panelDiagnostics ? { type: 'any' } : ownerScopeFromRequest(req, apiKeyStore?.users)
+    let keyScope = keyScopeFromRequest(req)
+    if (inboundKeyPolicy) {
+      keyScope = { ...keyScope, permission_tier: inboundKeyPolicy.permission_tier }
+    }
+    let inferenceBackend = rawBackend === 'api' ? 'api' : 'oauth'
+    let apiScope = rawBackend === 'api' ? apiScheduleScope(req, keyScope.group_type, apiKeyStore?.users) : null
+    if (rawBackend === 'api') {
+      if (reqOwnerScope.type !== 'platform' && !apiScheduler?.hasOwnedEndpoints?.(reqOwnerScope, apiScope)) {
+        stats.errors++
+        const errorResult = makeError({
+          type: ErrorType.PERMISSION,
+          code: ErrorCode.API_BACKEND_FORBIDDEN,
+          message: '租户密钥只能调用自己名下的槽位或 API 渠道',
+          status: 403,
+        })
+        logBag.error_code = ErrorCode.API_BACKEND_FORBIDDEN
+        logBag.error_message = errorResult.body?.error?.message || null
+        return json(res, 403, errorResult.body)
+      }
+    } else if (rawBackend === 'all') {
+      const candidateApiScope = apiScheduleScope(req, keyScope.group_type, apiKeyStore?.users)
+      if (protocol === 'google.gemini') {
+        inferenceBackend = 'api'
+        apiScope = candidateApiScope
+      } else if (apiScheduler?.hasOwnedEndpoints?.(reqOwnerScope, candidateApiScope)) {
+        const detected = detectInboundPlatform(ctx.body?.model)
+        const targetPlatform = detected?.ok ? detected.platform : null
+        let hasOwnedVm = false
+        const vmDeniedByResourcePin =
+          keyScope.permission_tier === 'resource' && !keyScope.vm_pool_id && (keyScope.allowed_vms?.length || 0) === 0
+        if (!vmDeniedByResourcePin && keyScope.group_type !== 'gemini' && cfg.paths?.project) {
+          try {
+            hasOwnedVm = listVms(cfg.paths.project).some(
+              (vm) =>
+                !vm.disabled &&
+                vm.schedulable !== false &&
+                vmMatchesOwnerScope(vm, reqOwnerScope) &&
+                keyAllowsVm(keyScope, vm) &&
+                (!targetPlatform || vmGroupType(vm) === targetPlatform),
+            )
+          } catch {
+            hasOwnedVm = false
+          }
+        }
+        if (!hasOwnedVm) {
+          inferenceBackend = 'api'
+          apiScope = candidateApiScope
+        }
+      }
     }
     let want1m = hasClaudeCode1mSuffix(inbound?.model) || hasClaudeCode1mSuffix(ctx.body?.model)
     const modelRewrite =
@@ -982,8 +1069,6 @@ export function createHandleProtocol(deps) {
     // API endpoint protocols own routing; apply model overrides before choosing the channel.
     if (inferenceBackend === 'api') ctx = applyIntercept(cfg.intercept.rules, 'before_upstream', ctx)
     let apiInbound = inferenceBackend === 'api' ? ctx.body : null
-    let keyScope = keyScopeFromRequest(req)
-    const apiScope = inferenceBackend === 'api' ? apiScheduleScope(req, keyScope.group_type) : null
     let apiPicked = apiScope ? apiScheduler.pick(ctx.body?.model, Date.now(), apiScope) : null
     if (apiPicked && !apiPicked.ok) {
       stats.errors++
@@ -1211,10 +1296,19 @@ export function createHandleProtocol(deps) {
       if (inferenceBackend === 'api') {
         if (apiScope.endpointId && route.kind === 'endpoint' && route.target !== apiScope.endpointId)
           return unavailable()
+        if (
+          route.kind === 'endpoint' &&
+          Array.isArray(apiScope.allowedEndpointIds) &&
+          !apiScope.allowedEndpointIds.includes(route.target)
+        ) {
+          return unavailable()
+        }
         apiInbound = ctx.body
         apiPicked = apiScheduler.pick(ctx.body.model, Date.now(), {
           groupType: platform.platform,
           endpointId: route.kind === 'endpoint' ? route.target : apiScope.endpointId,
+          ownerScope: apiScope.ownerScope,
+          allowedEndpointIds: apiScope.allowedEndpointIds,
         })
         if (!apiPicked.ok) return unavailable()
         if (apiOpenAI && validateApiOpenAIRequest(protocol, apiInbound)) return unavailable()
@@ -1659,28 +1753,33 @@ export function createHandleProtocol(deps) {
         personaIn.messages.some(
           (message) => Array.isArray(message?.content) && message.content.some((block) => block?.cache_control != null),
         ))
-    if (!preserveApiCallerBody && !apiNonAnthropic && !requestContext)
-      ctx.body = applyCrsUnofficialPersona(ctx.body, {
-        officialClient: officialPassthrough,
-        forceConfigured: !officialPassthrough,
-        routingFile: routingConfigPath,
-        cacheTtl: requestedCacheTtl,
-        headers: req.headers,
-        sessionId: outboundSessionId,
-        model: ctx.body?.model,
-        cliVersion: OFFICIAL_CLI_VERSION,
-      })
-    if (!officialPassthrough && !requestContext && !apiGemini)
-      ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
-    let personaHideTokens =
-      requestContext || apiNonAnthropic || preserveApiCallerBody
-        ? 0
-        : personaHideForUnofficial(personaIn, ctx.body, {
-            officialClient: officialPassthrough,
-            mode: personaMode,
-            hides: personaHidesUsageFromRoutingFile(routingConfigPath),
-            standing: standingUsageFromRoutingFile(routingConfigPath),
-          })
+    let personaHideTokens = 0
+    if (inferenceBackend === 'api') {
+      if (!preserveApiCallerBody && !apiNonAnthropic && !requestContext) {
+        ctx.body = applyCrsUnofficialPersona(ctx.body, {
+          officialClient: officialPassthrough,
+          forceConfigured: !officialPassthrough,
+          routingFile: routingConfigPath,
+          cacheTtl: requestedCacheTtl,
+          headers: req.headers,
+          sessionId: outboundSessionId,
+          model: ctx.body?.model,
+          cliVersion: OFFICIAL_CLI_VERSION,
+        })
+      }
+      if (!officialPassthrough && !requestContext && !apiGemini) {
+        ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
+      }
+      personaHideTokens =
+        requestContext || apiNonAnthropic || preserveApiCallerBody
+          ? 0
+          : personaHideForUnofficial(personaIn, ctx.body, {
+              officialClient: officialPassthrough,
+              mode: personaMode,
+              hides: personaHidesUsageFromRoutingFile(routingConfigPath),
+              standing: standingUsageFromRoutingFile(routingConfigPath),
+            })
+    }
 
     if (inferenceBackend === 'api') {
       const managedKey = req.apiKeyRecord || null
@@ -1752,6 +1851,18 @@ export function createHandleProtocol(deps) {
       }
       // The api backend forwards the converted body untouched: its session is the outbound one.
       logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(ctx.body) || logBag.session_id)
+      if (result?.outboundBody != null) {
+        logBag.outbound_summary = summarizeBody(result.outboundBody)
+        if (logCtx.capture_outbound) {
+          logBag.outbound_body = result.outboundBody
+          if (result.outboundBodySource) logBag.outbound_body_source = result.outboundBodySource
+        }
+      }
+      if (apiGemini && logBag.outbound_headers_source === 'unavailable') {
+        logBag.outbound_headers_source = null
+      }
+      if (result?.reasoningEffort) logBag.reasoning_effort = result.reasoningEffort
+      if (result?.stopReason) logBag.stop_reason = result.stopReason
       logBag.account_id = result?.accountId || null
       logBag.final_account_id = result?.accountId || null
       logBag.upstream_status = result?.upstreamStatus ?? null
@@ -2131,7 +2242,8 @@ export function createHandleProtocol(deps) {
                 validateImageDimensions(materialized)
                 hopBody = materialized
               }
-              if (identity) {
+              const nativeCragV3 = caps?.includes('generation_controls_v3') && caps?.includes('linux_tui_native_queue')
+              if (identity && !nativeCragV3) {
                 hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
                   officialClient: officialTraffic,
                   sessionId: attemptSessionId,
@@ -2142,11 +2254,6 @@ export function createHandleProtocol(deps) {
                   vmId: selected.vmId,
                   epoch: attemptStartedAt,
                 })
-              }
-              if (!reuseIngress) {
-                const scrubbed = scrubUpstreamClientBody(hopBody, scrubOptions)
-                hopBody = scrubbed.body
-                toolNames = composeToolNames(toolNames, scrubbed.reverse)
               }
               if (
                 caps?.includes('generation_controls_v3') &&
@@ -2165,6 +2272,7 @@ export function createHandleProtocol(deps) {
                 transport: preparedHop.ready.health?.transport,
                 persona: cragPersona,
                 prompt_mode: hopBody.crag_prompt?.mode || 'default',
+                safeguards_stripped: Boolean(personaIn.safeguards != null && hopBody.safeguards == null),
               }
               logBag.official_cc_inference = 'crag-print'
               logBag.provider = 'local_cli'
@@ -2301,19 +2409,23 @@ export function createHandleProtocol(deps) {
           }
 
           cacheTtl = requestedCacheTtl
-          if (!requestContext && !officialPassthrough && (modeOverride || officialTraffic)) {
+          if (!requestContext && !officialPassthrough) {
             const configuredMode = modeOverride || resolveSlotPersonaPreset(selected.vm, routingNow)
-            const rewritten = applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
-              officialClient: false,
-              forceConfigured: true,
-              routingFile: routingConfigPath,
-              cacheTtl: requestedCacheTtl,
-              mode: configuredMode,
-              sessionId: attemptSessionId,
-              model: personaIn?.model,
-              cliVersion: OFFICIAL_CLI_VERSION,
-              identity,
-            })
+            const rewritten = enforceCacheTtlOrder(
+              applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
+                officialClient: false,
+                forceConfigured: true,
+                routingFile: routingConfigPath,
+                cacheTtl: requestedCacheTtl,
+                mode: configuredMode,
+                headers: req.headers,
+                sessionId: attemptSessionId,
+                model: personaIn?.model,
+                cliVersion: OFFICIAL_CLI_VERSION,
+                identity,
+              }),
+              requestedCacheTtl,
+            )
             hopBody = officialMessagesBody(rewritten)
             for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
             personaHideTokens = personaHideForUnofficial(personaIn, rewritten, {
