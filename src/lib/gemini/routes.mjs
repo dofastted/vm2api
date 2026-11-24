@@ -1717,6 +1717,7 @@ export function createGeminiPublicHandler({
             : reqBody
         },
         requiredCapabilities: parsed.requiredCapabilities,
+        unsupportedFields: parsed.unsupportedFields,
         plainText: parsed.plainText,
         stickyKey,
         signal: controller.signal,

@@ -1708,21 +1708,45 @@ function isValidNativeTuiText(text) {
  * Determine which backend capabilities an IR turn requires.
  * Ensures restricted `native_tui` slots (`craggemini`) never silently drop
  * caller system instructions, history, tools, generation parameters, or media.
+ *
+ * `unsupportedFields` names the caller-visible fields behind each capability.
+ * Without it the 400 can only say the turn is unsupported, not which field made
+ * it so, and the caller has to bisect their own payload to find out (#1703).
  */
 export function classifyGeminiCapabilities(ir) {
   const required = new Set()
-  if (ir.system && ir.system.trim()) required.add('system_instruction')
-  if (ir.messages.length !== 1 || ir.messages[0]?.role !== 'user') required.add('multi_turn')
-  if (ir.tools.length > 0 || ir.webSearch || ir.googleTools.length > 0 || ir.toolChoice) required.add('tools')
-  if (
-    Object.keys(ir.generationConfig || {}).length > 0 ||
-    Object.keys(ir.extraGenConfig || {}).length > 0 ||
-    ir.thinking != null ||
-    ir.responseFormat != null ||
-    ir.safetySettings != null ||
-    ir.cachedContent != null
-  ) {
+  const fields = new Set()
+  if (ir.system && ir.system.trim()) {
+    required.add('system_instruction')
+    fields.add('systemInstruction')
+  }
+  if (ir.messages.length !== 1 || ir.messages[0]?.role !== 'user') {
+    required.add('multi_turn')
+    fields.add('contents')
+  }
+  if (ir.tools.length > 0 || ir.webSearch || ir.googleTools.length > 0 || ir.toolChoice) {
+    required.add('tools')
+    fields.add(ir.tools.length > 0 || ir.webSearch || ir.googleTools.length > 0 ? 'tools' : 'toolConfig')
+  }
+  const genConfig = []
+  if (Object.keys(ir.generationConfig || {}).length > 0) genConfig.push('generationConfig')
+  if (Object.keys(ir.extraGenConfig || {}).length > 0) genConfig.push('generationConfig')
+  if (ir.thinking != null) genConfig.push('generationConfig.thinkingConfig')
+  if (ir.responseFormat != null) genConfig.push('generationConfig.responseSchema')
+  // A field the caller sent but left empty requests nothing, so it must not pull in
+  // a capability: `safetySettings: []` and `cachedContent: ''` carry no configuration,
+  // yet a presence test pushed such a turn off the plain-text path and the scheduler
+  // then answered 400 for a turn the native transport could serve (#1703). The
+  // non-empty tests used for `generationConfig` above were already the right shape.
+  if (Array.isArray(ir.safetySettings) ? ir.safetySettings.length > 0 : ir.safetySettings != null) {
+    genConfig.push('safetySettings')
+  }
+  if (typeof ir.cachedContent === 'string' ? ir.cachedContent.length > 0 : ir.cachedContent != null) {
+    genConfig.push('cachedContent')
+  }
+  if (genConfig.length > 0) {
     required.add('generation_config')
+    for (const name of genConfig) fields.add(name)
   }
   let plainText = ''
   if (ir.messages.length === 1 && ir.messages[0].role === 'user') {
@@ -1732,19 +1756,24 @@ export function classifyGeminiCapabilities(ir) {
         pieces.push(part.text)
       } else if (part.kind === 'image' || part.kind === 'file') {
         required.add('multimodal')
+        fields.add(part.kind === 'image' ? 'contents[].inlineData' : 'contents[].fileData')
       } else if (part.kind === 'tool_call' || part.kind === 'tool_result') {
         required.add('tools')
+        fields.add('contents[].functionCall')
       } else {
         required.add('thinking')
+        fields.add('contents[].thought')
       }
     }
     plainText = pieces.join('')
   }
   if (required.size === 0 && !isValidNativeTuiText(plainText)) {
     required.add('full_gemini_api')
+    fields.add('contents[].text')
   }
   return {
     requiredCapabilities: [...required],
+    unsupportedFields: [...fields],
     nativeTuiCompatible: required.size === 0,
     plainText: required.size === 0 ? plainText : null,
   }
