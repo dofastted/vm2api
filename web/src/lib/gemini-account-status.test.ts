@@ -359,6 +359,27 @@ describe('Gemini account presentation', () => {
     expect(
       geminiEligibilityNotice(stale, run('failed', '2026-11-24T02:00:00Z'))
     ).not.toBeNull()
+    // 账号没有检查时间戳（面板的 checked_at 无兜底，缺字段就下发 null）时，
+    // 无法证明这次推理比资格结论更新，必须保留提示——否则后端仍按
+    // eligibility 冷却该账号，面板却不再显示验证入口。
+    expect(
+      geminiEligibilityNotice(
+        { eligibility: 'verification_required' },
+        run('completed', '2026-11-24T02:00:00Z')
+      )
+    ).not.toBeNull()
+    expect(
+      geminiEligibilityNotice(
+        { eligibility: 'verification_required', checked_at: null },
+        run('completed', '2026-11-24T02:00:00Z')
+      )
+    ).not.toBeNull()
+    expect(
+      geminiEligibilityNotice(
+        { eligibility: 'verification_required', checked_at: 'not-a-date' },
+        run('completed', '2026-11-24T02:00:00Z')
+      )
+    ).not.toBeNull()
   })
 
   it('groups Antigravity models into Google Gemini vs ag- prefixed Anthropic and OpenAI', () => {
