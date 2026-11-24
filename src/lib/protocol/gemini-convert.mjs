@@ -76,6 +76,24 @@ const GEN_READ_OR_BUILT = new Set([
 ])
 
 const GOOGLE_SEARCH_TOOLS = new Set(['googleSearch', 'googleSearchRetrieval'])
+const CRAGGEMINI_GOOGLE_TOOLS = new Set(['googleSearch', 'googleSearchRetrieval', 'urlContext'])
+const CRAGGEMINI_IMAGE_ASPECT_RATIOS = new Set([
+  '1:1',
+  '2:3',
+  '3:2',
+  '3:4',
+  '4:3',
+  '4:5',
+  '5:4',
+  '9:16',
+  '16:9',
+  '21:9',
+  '1:4',
+  '4:1',
+  '1:8',
+  '8:1',
+])
+const PLAIN_SCHEMA_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'array', 'object'])
 const GOOGLE_TOOL_NAMES = new Set([
   'urlContext',
   'codeExecution',
@@ -487,8 +505,31 @@ export function sanitizeGeminiSchema(raw, { plain = false } = {}) {
     return value
   }
   const expanding = new Set()
+  const normalizePlainSchemaType = (raw) => {
+    if (typeof raw !== 'string') return null
+    const lower = raw.trim().toLowerCase()
+    if (PLAIN_SCHEMA_TYPES.has(lower)) return lower
+    if (lower === 'float' || lower === 'double' || lower === 'decimal') return 'number'
+    if (
+      lower === 'int' ||
+      lower === 'int32' ||
+      lower === 'int64' ||
+      lower === 'uint' ||
+      lower === 'uint32' ||
+      lower === 'uint64' ||
+      lower === 'long' ||
+      lower === 'short'
+    ) {
+      return 'integer'
+    }
+    if (lower === 'bool') return 'boolean'
+    if (lower === 'dict' || lower === 'map' || lower === 'record') return 'object'
+    if (lower === 'list' || lower === 'tuple') return 'array'
+    return null
+  }
   const schemaTypeOf = (node) => {
-    if (typeof node.type === 'string') return node.type.toLowerCase()
+    const normalized = normalizePlainSchemaType(node.type)
+    if (normalized) return normalized
     if (node.properties != null) return 'object'
     if (node.items != null) return 'array'
     return 'object'
@@ -598,19 +639,27 @@ export function sanitizeGeminiSchema(raw, { plain = false } = {}) {
       } else if (k === 'type') {
         if (Array.isArray(v)) {
           for (const t of v) {
-            const lower = typeof t === 'string' ? t.toLowerCase() : t
-            if (lower === 'null') out.nullable = true
-            else if (out.type === undefined) out.type = lower
+            const rawLower = typeof t === 'string' ? t.trim().toLowerCase() : ''
+            if (rawLower === 'null') out.nullable = true
+            else {
+              const norm = normalizePlainSchemaType(t)
+              if (norm && out.type === undefined) out.type = norm
+            }
           }
           for (const t of v) {
-            const lower = typeof t === 'string' ? t.toLowerCase() : t
-            if ((lower === 'array' && value.items != null) || (lower === 'object' && value.properties != null)) {
-              out.type = lower
+            const norm = normalizePlainSchemaType(t)
+            if ((norm === 'array' && value.items != null) || (norm === 'object' && value.properties != null)) {
+              out.type = norm
               break
             }
           }
         } else if (typeof v === 'string') {
-          out.type = v.toLowerCase()
+          if (v.trim().toLowerCase() === 'null') {
+            out.nullable = true
+          } else {
+            const norm = normalizePlainSchemaType(v)
+            if (norm) out.type = norm
+          }
         }
       } else if (k === 'properties' && isPlainObject(v)) {
         const props = {}
@@ -852,8 +901,8 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
         msg.parts.push({ kind: 'tool_result', callId: id, name, text: mergedText, isError, images })
         for (const f of extraFiles) msg.parts.push(f)
       } else if (isPlainObject(part.inlineData)) {
-        const mimeType = typeof part.inlineData.mimeType === 'string' ? part.inlineData.mimeType : ''
-        const data = typeof part.inlineData.data === 'string' ? part.inlineData.data : ''
+        const mimeType = typeof part.inlineData.mimeType === 'string' ? part.inlineData.mimeType.trim() : ''
+        const data = typeof part.inlineData.data === 'string' ? part.inlineData.data.trim() : ''
         if (!mimeType || !data) {
           throw makeProtocolError(400, 'gemini_invalid_request', 'inlineData requires mimeType and data.')
         }
@@ -913,7 +962,7 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
       }
       if (Array.isArray(tool.functionDeclarations)) {
         for (const decl of tool.functionDeclarations) {
-          if (!isPlainObject(decl) || typeof decl.name !== 'string' || !decl.name) {
+          if (!isPlainObject(decl) || typeof decl.name !== 'string' || !decl.name.trim()) {
             throw makeProtocolError(400, 'gemini_invalid_request', 'functionDeclarations[].name is required.')
           }
           if (allowedNames && !allowedNames.has(decl.name)) continue
@@ -1098,26 +1147,26 @@ function parseOpenAIChatInbound(body, { headers }) {
     } else if (raw.role === 'tool' || raw.role === 'function') {
       const { id } = unsignedToolCallId(raw.tool_call_id || raw.id || newCallId())
       const contentParts = extractParts(raw.content)
-    const text = contentParts
-      .filter((p) => p.kind === 'text')
-      .map((p) => p.text)
-      .join('\n')
-    const images = contentParts.filter((p) => p.kind === 'image')
-    const isError = raw.is_error === true || raw.isError === true
-    const finalText = !text.trim() && !images.length ? (isError ? EMPTY_TOOL_ERR_TEXT : EMPTY_TOOL_OK_TEXT) : text
-    messages.push({
-      role: 'user',
-      parts: [
-        {
-          kind: 'tool_result',
-          callId: id,
-          name: typeof raw.name === 'string' ? raw.name : '',
-          text: finalText,
-          isError,
-          images,
-        },
-      ],
-    })
+      const text = contentParts
+        .filter((p) => p.kind === 'text')
+        .map((p) => p.text)
+        .join('\n')
+      const images = contentParts.filter((p) => p.kind === 'image')
+      const isError = raw.is_error === true || raw.isError === true
+      const finalText = !text.trim() && !images.length ? (isError ? EMPTY_TOOL_ERR_TEXT : EMPTY_TOOL_OK_TEXT) : text
+      messages.push({
+        role: 'user',
+        parts: [
+          {
+            kind: 'tool_result',
+            callId: id,
+            name: typeof raw.name === 'string' ? raw.name : '',
+            text: finalText,
+            isError,
+            images,
+          },
+        ],
+      })
     } else {
       throw makeProtocolError(400, 'gemini_invalid_request', `Unsupported message role: ${raw.role}`)
     }
@@ -1979,7 +2028,14 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
         }
       } else if (p.kind === 'image' || p.kind === 'file') {
         if (p.data) parts.push({ inlineData: { mimeType: p.mediaType, data: p.data } })
-        else if (p.url) parts.push({ fileData: { mimeType: p.mediaType, fileUri: p.url } })
+        else if (p.url) {
+          if (ag) {
+            const refText = sanitizeNativeTuiText(`[Attached ${p.mediaType || 'file'}: ${p.url}]`)
+            if (refText.trim()) parts.push({ text: refText })
+          } else {
+            parts.push({ fileData: { mimeType: p.mediaType, fileUri: p.url } })
+          }
+        }
       } else if (p.kind === 'tool_call') {
         const safeName = geminiFuncName(p.name)
         if (p.id) callNames.set(p.id, safeName)
@@ -2007,7 +2063,14 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
         if (Array.isArray(p.images)) {
           for (const img of p.images) {
             if (img.data) parts.push({ inlineData: { mimeType: img.mediaType, data: img.data } })
-            else if (img.url) parts.push({ fileData: { mimeType: img.mediaType, fileUri: img.url } })
+            else if (img.url) {
+              if (ag) {
+                const refText = sanitizeNativeTuiText(`[Attached ${img.mediaType || 'image'}: ${img.url}]`)
+                if (refText.trim()) parts.push({ text: refText })
+              } else {
+                parts.push({ fileData: { mimeType: img.mediaType, fileUri: img.url } })
+              }
+            }
           }
         }
       }
@@ -2070,11 +2133,26 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
   } else if (ir.webSearch || ir.googleTools.length > 0) {
     const tools = []
     if (ir.webSearch) tools.push({ googleSearch: {} })
-    for (const gt of ir.googleTools) tools.push(gt)
-    req.tools = tools
+    for (const gt of ir.googleTools) {
+      if (ag) {
+        const keys = isPlainObject(gt) ? Object.keys(gt) : []
+        if (!keys.length || !keys.every((k) => CRAGGEMINI_GOOGLE_TOOLS.has(k))) continue
+      }
+      tools.push(gt)
+    }
+    if (tools.length) req.tools = tools
   }
 
   const gen = { ...ir.extraGenConfig, ...ir.generationConfig }
+  if (ag && isPlainObject(gen.imageConfig)) {
+    const cleanImageCfg = {}
+    const ratio = typeof gen.imageConfig.aspectRatio === 'string' ? gen.imageConfig.aspectRatio.trim() : ''
+    if (ratio && CRAGGEMINI_IMAGE_ASPECT_RATIOS.has(ratio)) cleanImageCfg.aspectRatio = ratio
+    const size = typeof gen.imageConfig.imageSize === 'string' ? gen.imageConfig.imageSize.trim().toUpperCase() : ''
+    if (size === '1K' || size === '2K' || size === '4K') cleanImageCfg.imageSize = size
+    if (Object.keys(cleanImageCfg).length) gen.imageConfig = cleanImageCfg
+    else delete gen.imageConfig
+  }
   const tc = buildThinkingConfig(ir, model)
   if (tc) gen.thinkingConfig = tc
   if (ir.responseFormat) {
@@ -2084,8 +2162,14 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
     }
   }
   if (Object.keys(gen).length) req.generationConfig = gen
-  if (ir.safetySettings) req.safetySettings = ir.safetySettings
-  if (ir.cachedContent) req.cachedContent = ir.cachedContent
+  // CRAGGemini (`ALLOWED_BODY_KEYS`) and Antigravity reject top-level `safetySettings` / `cachedContent`;
+  // keep them only on direct Gemini API requests when non-empty.
+  if (!ag && Array.isArray(ir.safetySettings) && ir.safetySettings.length > 0) {
+    req.safetySettings = ir.safetySettings
+  }
+  if (!ag && typeof ir.cachedContent === 'string' && ir.cachedContent.length > 0) {
+    req.cachedContent = ir.cachedContent
+  }
   return req
 }
 

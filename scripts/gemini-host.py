@@ -5760,6 +5760,8 @@ class Host:
             "generation_config",
             "safetySettings",
             "safety_settings",
+            "cachedContent",
+            "cached_content",
             "conversation_id",
             "conversationId",
         }
@@ -5821,7 +5823,17 @@ class Host:
                     has_substantive_part = True
         if not has_substantive_part:
             return None
-        forwarded = {k: v for k, v in body_obj.items() if k != "stream"}
+        stripped_top = {
+            "stream",
+            "safetySettings",
+            "safety_settings",
+            "cachedContent",
+            "cached_content",
+            "conversationId",
+        }
+        forwarded = {k: v for k, v in body_obj.items() if k not in stripped_top}
+        if "conversation_id" not in forwarded and isinstance(body_obj.get("conversationId"), str):
+            forwarded["conversation_id"] = body_obj["conversationId"]
         forwarded["model"] = model
         return forwarded
 

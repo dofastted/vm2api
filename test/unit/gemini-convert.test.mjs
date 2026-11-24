@@ -731,7 +731,9 @@ function passesCragValidText(text) {
 test('antigravity target sanitizes CLI slash tokens, control chars, billing headers, and empty turns', () => {
   assert.equal(stripIllegalControlChars('\x1b[31mFAIL\x1b[0m\x00\x08\x7f\u0085\nok\t!'), 'FAIL\nok\t!')
   assert.equal(escapeNativeTuiSlashes('https://example.test/a foo/bar'), 'https://example.test/a foo/bar')
-  assert.ok(passesCragValidText(sanitizeNativeTuiText('/quit\n/clear a / b // comment /mnt/x/vm2api \x1b[32mOK\x1b[0m')))
+  assert.ok(
+    passesCragValidText(sanitizeNativeTuiText('/quit\n/clear a / b // comment /mnt/x/vm2api \x1b[32mOK\x1b[0m')),
+  )
 
   // Claude Code multi-turn payload with slash paths, ANSI logs, billing headers,
   // server_tool_use/web_search_tool_result, mid-conversation system, empty tool_result, and trailing empty assistant.
@@ -740,7 +742,10 @@ test('antigravity target sanitizes CLI slash tokens, control chars, billing head
     max_tokens: 1024,
     system: [
       { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1; cch=abc' },
-      { type: 'text', text: 'Inspect /etc/hosts\x1b[33m carefully\x1b[0m.\n```\nx-anthropic-billing-header: keep-in-code\n```' },
+      {
+        type: 'text',
+        text: 'Inspect /etc/hosts\x1b[33m carefully\x1b[0m.\n```\nx-anthropic-billing-header: keep-in-code\n```',
+      },
     ],
     messages: [
       { role: 'system', content: 'Leading system rule.' },
@@ -748,7 +753,10 @@ test('antigravity target sanitizes CLI slash tokens, control chars, billing head
         role: 'user',
         content: [
           { type: 'text', text: '(no content)' },
-          { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1; cch=abc\nRead /mnt/x/vm2api/src/server.mjs and check a / b\x00' },
+          {
+            type: 'text',
+            text: 'x-anthropic-billing-header: cc_version=2.1; cch=abc\nRead /mnt/x/vm2api/src/server.mjs and check a / b\x00',
+          },
         ],
       },
       {
@@ -756,7 +764,12 @@ test('antigravity target sanitizes CLI slash tokens, control chars, billing head
         content: [
           { type: 'server_tool_use', id: 'srv_1', name: 'web_search', input: { query: 'test' } },
           { type: 'web_search_tool_result', tool_use_id: 'srv_1', content: [] },
-          { type: 'tool_use', id: 'toolu_1', name: 'read_file', input: { path: '/mnt/x/vm2api/src/server.mjs', stale: '[undefined]' } },
+          {
+            type: 'tool_use',
+            id: 'toolu_1',
+            name: 'read_file',
+            input: { path: '/mnt/x/vm2api/src/server.mjs', stale: '[undefined]' },
+          },
           { type: 'tool_use', id: 'toolu_2', name: 'run_cmd', input: {} },
         ],
       },
@@ -814,4 +827,164 @@ test('antigravity target sanitizes CLI slash tokens, control chars, billing head
   const emptyAg = buildGeminiRequest(emptyIr, { target: 'antigravity' })
   assert.deepEqual(emptyAg.contents, [{ role: 'user', parts: [{ text: '.' }] }])
   assert.ok(passesCragValidText(emptyAg.contents[0].parts[0].text))
+})
+
+test('antigravity target strips CRAGGemini-disallowed fields (safetySettings, cachedContent, fileData, unsupported googleTools, non-standard schema types, invalid imageConfig)', () => {
+  const CRAGGEMINI_ALLOWED_KEYS = new Set([
+    'model',
+    'stream',
+    'contents',
+    'messages',
+    'input',
+    'system',
+    'systemInstruction',
+    'system_instruction',
+    'instructions',
+    'system_prompt_mode',
+    'crag_prompt',
+    'tools',
+    'toolConfig',
+    'tool_config',
+    'tool_choice',
+    'generationConfig',
+    'generation_config',
+    'web_search_options',
+    'thinking',
+    'max_tokens',
+    'temperature',
+    'top_p',
+    'top_k',
+    'stop',
+    'stop_sequences',
+    'conversation_id',
+    'previous_response_id',
+    'metadata',
+    'parallel_tool_calls',
+    'reasoning',
+    'response_format',
+    'subagents',
+  ])
+  const CRAGGEMINI_SCHEMA_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'array', 'object'])
+
+  // 1. Minimal @ai-sdk/google request with safetySettings + cachedContent + invalid imageConfig.
+  const aiSdkPayload = {
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { text: 'Check this file' },
+          { fileData: { mimeType: 'application/pdf', fileUri: 'https://example.test/docs/spec.pdf' } },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 1024,
+      imageConfig: { aspectRatio: '99:99', imageSize: '8K' },
+    },
+    safetySettings: [
+      { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+      { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+    ],
+    cachedContent: 'cachedContents/abc123',
+    tools: [
+      {
+        functionDeclarations: [
+          {
+            name: 'inspect_data',
+            description: 'Inspect structured data',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                score: { type: 'float' },
+                count: { type: ['int64', 'null'] },
+                flag: { type: 'bool' },
+                anything: { type: 'any' },
+                meta: { type: 'dict' },
+                tags: { type: 'list', items: { type: 'string' } },
+              },
+              required: ['score', 'count'],
+            },
+          },
+        ],
+      },
+    ],
+  }
+
+  const ir = parseInboundToGemini('gemini', aiSdkPayload, { routeModel: 'gemini-4-neon-high', routeStream: true })
+  const agReq = buildGeminiRequest(ir, { target: 'antigravity' })
+
+  for (const key of Object.keys(agReq)) {
+    assert.ok(CRAGGEMINI_ALLOWED_KEYS.has(key), `Unexpected top-level key for CRAGGemini: ${key}`)
+  }
+  assert.equal('safetySettings' in agReq, false)
+  assert.equal('cachedContent' in agReq, false)
+  assert.equal('imageConfig' in (agReq.generationConfig || {}), false)
+
+  // fileData downgraded to sanitized text reference instead of unsupported fileData part.
+  assert.equal(
+    agReq.contents.some((turn) => turn.parts.some((p) => 'fileData' in p)),
+    false,
+  )
+  assert.ok(
+    agReq.contents[0].parts.some(
+      (p) => typeof p.text === 'string' && p.text.includes('https://example.test/docs/spec.pdf'),
+    ),
+  )
+
+  // Non-standard schema types normalized or omitted so craggemini::project_tool_schema accepts them.
+  const props = agReq.tools[0].functionDeclarations[0].parameters.properties
+  assert.equal(props.score.type, 'number')
+  assert.equal(props.count.type, 'integer')
+  assert.equal(props.count.nullable, true)
+  assert.equal(props.flag.type, 'boolean')
+  assert.equal(props.anything.type, undefined)
+  assert.equal(props.meta.type, 'object')
+  assert.equal(props.tags.type, 'array')
+  for (const prop of Object.values(props)) {
+    if (prop.type !== undefined) {
+      assert.ok(CRAGGEMINI_SCHEMA_TYPES.has(prop.type), `Invalid schema type for CRAGGemini: ${prop.type}`)
+    }
+  }
+
+  // Direct Gemini API target still preserves real safetySettings, cachedContent, and fileData.
+  const directReq = buildGeminiRequest(ir, { target: 'gemini' })
+  assert.equal(directReq.safetySettings.length, 4)
+  assert.equal(directReq.cachedContent, 'cachedContents/abc123')
+  assert.equal(directReq.contents[0].parts[1].fileData.fileUri, 'https://example.test/docs/spec.pdf')
+
+  // Empty safetySettings/cachedContent are omitted on both targets.
+  const emptyCfgIr = parseInboundToGemini(
+    'gemini',
+    { contents: [{ role: 'user', parts: [{ text: 'hi' }] }], safetySettings: [], cachedContent: '' },
+    { routeModel: 'gemini-4-neon-high', routeStream: false },
+  )
+  assert.equal('safetySettings' in buildGeminiRequest(emptyCfgIr, { target: 'gemini' }), false)
+  assert.equal('cachedContent' in buildGeminiRequest(emptyCfgIr, { target: 'gemini' }), false)
+  assert.equal('safetySettings' in buildGeminiRequest(emptyCfgIr, { target: 'antigravity' }), false)
+
+  // Unsupported googleTools (codeExecution, googleMaps) filtered for antigravity; urlContext & googleSearch preserved.
+  const googleToolsIr = parseInboundToGemini(
+    'gemini',
+    {
+      contents: [{ role: 'user', parts: [{ text: 'search news' }] }],
+      tools: [{ googleSearch: {} }, { urlContext: {} }, { codeExecution: {} }, { googleMaps: {} }],
+    },
+    { routeModel: 'gemini-4-neon-high', routeStream: false },
+  )
+  const agToolsReq = buildGeminiRequest(googleToolsIr, { target: 'antigravity' })
+  assert.deepEqual(agToolsReq.tools, [{ googleSearch: {} }, { urlContext: {} }])
+
+  const unsupportedOnlyIr = parseInboundToGemini(
+    'gemini',
+    {
+      contents: [{ role: 'user', parts: [{ text: 'run python' }] }],
+      tools: [{ codeExecution: {} }],
+    },
+    { routeModel: 'gemini-4-neon-high', routeStream: false },
+  )
+  assert.equal('tools' in buildGeminiRequest(unsupportedOnlyIr, { target: 'antigravity' }), false)
+  assert.deepEqual(buildGeminiRequest(unsupportedOnlyIr, { target: 'gemini' }).tools, [{ codeExecution: {} }])
 })
