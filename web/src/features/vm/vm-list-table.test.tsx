@@ -200,6 +200,41 @@ describe('VM account column kernel label', () => {
     expect(hostOnly).not.toContain('24h 无请求')
   })
 
+  it('renders a Gemini slot proxy with the same chip as a normal slot', () => {
+    const pool = [
+      { id: 'px-011f7746', host: '1.2.3.4', port: 1080, status: 'ok', latency_ms: 88 },
+    ]
+    const gemini = geminiSlot(
+      {
+        id: 'gemini-proxy',
+        name: 'Gemini proxy',
+        proxy_id: 'px-011f7746',
+        auth_state: 'authorized',
+        runtime_ready: false,
+        billing_ready: false,
+        auth_method: 'oauth',
+        kernel_version: null,
+        created_at: null,
+        updated_at: null,
+        models: [],
+        account: null,
+      },
+      undefined,
+      pool
+    )
+    const normal: Vm = { id: 'vm-01', has_token: true, proxy: pool[0], proxy_id: 'px-011f7746' }
+    const chip = (vm: Vm) =>
+      renderToStaticMarkup(
+        <QueryClientProvider client={new QueryClient()}>
+          <VmRack vms={[vm]} filter='all' size='l' />
+        </QueryClientProvider>
+      ).match(/<div[^>]*bg-ok-1[^>]*>.*?<\/div>/)?.[0]
+    const geminiChip = chip(gemini)
+    expect(geminiChip).toContain('1.2.3.4:1080')
+    expect(geminiChip).toContain('88')
+    expect(geminiChip).toBe(chip(normal))
+  })
+
   it('keeps pending, cancelled, failed and verified turns out of generic 在池 counts', () => {
     const candidate: NonNullable<Vm['gemini']> = {
       id: 'pending-gemini',

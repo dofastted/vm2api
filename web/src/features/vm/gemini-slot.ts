@@ -1,4 +1,4 @@
-import type { Vm } from '@/types/panel-vm'
+import type { Vm, VmProxySnap } from '@/types/panel-vm'
 import { geminiHostBlocker } from '@/lib/gemini-account-status'
 import {
   geminiPayloadIssue,
@@ -8,7 +8,8 @@ import {
 
 export function geminiSlot(
   environment: GeminiEnvironment,
-  inventory?: GeminiInventory
+  inventory?: GeminiInventory,
+  proxies?: VmProxySnap[]
 ): Vm {
   const { auth_state: auth, account } = environment
   return {
@@ -16,6 +17,10 @@ export function geminiSlot(
     name: environment.name,
     gemini: environment,
     email: account?.email || undefined,
+    // Same pool row a normal slot carries, so ProxyChip renders one way for both.
+    proxy: proxies?.find((p) => p.id === environment.proxy_id) ?? {
+      id: environment.proxy_id,
+    },
     proxy_id: environment.proxy_id,
     proxy_configured: true,
     credential_mode: environment.auth_method === 'oauth' ? 'oauth' : 'apikey',

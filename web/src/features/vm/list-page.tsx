@@ -36,6 +36,7 @@ import {
   geminiPayloadIssue,
 } from '@/features/import/gemini-environments'
 import { usageQueryOptions } from '@/features/overview/queries'
+import { proxiesQueryOptions } from '@/features/proxies/queries'
 import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-link'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
@@ -127,6 +128,7 @@ export function VmListPage() {
   const vmsQ = useQuery(vmsListQueryOptions(5000))
   const isAdmin = me.data?.role === 'admin'
   const gemini = useQuery({ ...geminiInventoryOptions(), enabled: isAdmin })
+  const proxies = useQuery({ ...proxiesQueryOptions(), enabled: isAdmin })
   usePoolSeatStream()
   const usage = useQuery({
     ...usageQueryOptions(5000),
@@ -228,7 +230,7 @@ export function VmListPage() {
     ? [
         ...vms,
         ...geminiInventory.environments.map((environment) =>
-          geminiSlot(environment, geminiInventory)
+          geminiSlot(environment, geminiInventory, proxies.data?.proxies)
         ),
       ]
     : vms
