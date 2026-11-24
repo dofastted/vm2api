@@ -76,6 +76,22 @@ vi.mock('@tanstack/react-query', async (importOriginal) => ({
         isLoading: false,
       }
     }
+    if (queryKey.includes('gemini-maintenance')) {
+      return {
+        data: undefined,
+        isLoading: false,
+        isPending: false,
+        isError: false,
+      }
+    }
+    if (queryKey.includes('gemini-environments')) {
+      return {
+        data: undefined,
+        isLoading: false,
+        isPending: false,
+        isError: false,
+      }
+    }
     return {
       data: queryKey.includes('kernels')
         ? {
@@ -728,5 +744,11 @@ describe('one-click CRAG upgrade to the pinned payload', () => {
     render({ id: 'slot-a', resolved_dataplane: 'wrap' })
     expect(state.confirm?.open).toBe(false)
     expect(toast.error).toHaveBeenCalledWith('没有正在运行 CRAG 的槽位')
+  })
+
+  it('renders CRAGGemini inside the available kernels section', () => {
+    const html = render(cragVm)
+    expect(html).toContain('CRAGGemini')
+    expect(html).toContain('宿主服务')
   })
 })

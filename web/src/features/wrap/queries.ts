@@ -29,9 +29,15 @@ export type KernelCatalog = {
   kernels: KernelProduct[]
   /** The CRAG payload this deployment pins, or null when nothing is pinned. */
   crag_pin?: { tag: string; label?: string } | null
+  /** The CRAGGemini payload this deployment pins, or null when nothing is pinned. */
+  gemini_pin?: { tag: string; version?: string } | null
   licenses: Record<string, CragLicenseStatus>
   install_licenses?: Record<string, CragLicenseStatus>
   installations?: Record<string, KernelInstallation>
+}
+
+export type KernelVersions = Record<KernelId, string[]> & {
+  craggemini?: string[]
 }
 
 export type KernelTarget = {
@@ -74,8 +80,7 @@ export function kernelCatalogQueryOptions() {
 export function kernelVersionsQueryOptions() {
   return queryOptions({
     queryKey: ['panel', 'kernel-releases'] as const,
-    queryFn: () =>
-      api<Record<KernelId, string[]>>('/api/panel/kernels/releases'),
+    queryFn: () => api<KernelVersions>('/api/panel/kernels/releases'),
     staleTime: 5 * 60_000,
     retry: false,
   })

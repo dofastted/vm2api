@@ -40,14 +40,31 @@ AGY_URL = (
 )
 AGY_SIZE = 99166075
 AGY_SHA256 = "8b1f5e56779f2434a0af36f1b715a8392a084de550f8c68bc79821f95fabf3fa"
+AGY_BINARY_SHA256 = "39816d49d5ab92229952987225c23ea3fed7580699dcb4a444e0388e0ac1ce43"
+ALLOWED_DOWNLOAD_HOSTS = frozenset(
+    {
+        "github.com",
+        "release-assets.githubusercontent.com",
+        "objects.githubusercontent.com",
+        "storage.googleapis.com",
+    }
+)
 CHUNK_SIZE = 1024 * 1024
 MAX_MEMBER_SIZE = 512 * 1024 * 1024  # Same limit as the signed-payload verifier.
+MAX_MANIFEST_SIZE = 65536
 
 
 class HttpsRedirects(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if urlsplit(newurl).scheme != "https":
-            raise RuntimeError("download redirected to a non-HTTPS URL")
+        parsed = urlsplit(newurl)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname not in ALLOWED_DOWNLOAD_HOSTS
+            or parsed.username
+            or parsed.password
+            or parsed.port is not None
+        ):
+            raise RuntimeError("download redirected to an untrusted URL")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -74,7 +91,12 @@ def read_pins(manifest):
             or not re.fullmatch(r"[a-f0-9]{64}", pin["sha256"])
         ):
             raise ValueError(f"invalid size or SHA-256 pin for {name} in {manifest}")
-    return {"assets": assets, "version": match.group(1), "release": f"{RELEASE_BASE}/{tag}"}
+    return {
+        "tag": tag,
+        "assets": assets,
+        "version": match.group(1),
+        "release": f"{RELEASE_BASE}/{tag}",
+    }
 
 
 def copy_checked(stream, size, sha256, output=None):
@@ -104,6 +126,66 @@ def download(opener, url, dest, size, sha256):
             copy_checked(response, size, sha256, output)
     except (OSError, http.client.HTTPException, ValueError, RuntimeError) as error:
         raise RuntimeError(f"download {dest.name} from {url}: {error}") from error
+
+
+def download_bounded(opener, url, dest, max_size, expected_sha256=None):
+    print(f"Fetching Gemini release asset: {dest.name}", flush=True)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        request = Request(url, headers={"User-Agent": "vm2api-gemini-payload"})
+        with opener.open(request, timeout=60) as response, dest.open("xb") as output:
+            if response.status != 200:
+                raise RuntimeError(f"unexpected HTTP status {response.status}")
+            while chunk := response.read(CHUNK_SIZE):
+                total += len(chunk)
+                if total > max_size:
+                    raise ValueError(f"download exceeds {max_size}-byte limit")
+                digest.update(chunk)
+                output.write(chunk)
+        if total == 0:
+            raise ValueError("empty download")
+        if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+            raise ValueError("SHA-256 does not match signed manifest")
+    except (OSError, http.client.HTTPException, ValueError, RuntimeError) as error:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError(f"download {dest.name} from {url}: {error}") from error
+
+
+def reuse_verified_agy(source_path, dest):
+    if source_path is None:
+        return False
+    try:
+        fd = os.open(source_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022
+            or not 0 < info.st_size <= MAX_MEMBER_SIZE
+        ):
+            return False
+        with os.fdopen(fd, "rb", closefd=False) as source, dest.open("xb") as output:
+            while chunk := source.read(CHUNK_SIZE):
+                total += len(chunk)
+                if total > MAX_MEMBER_SIZE:
+                    raise ValueError("agy exceeds size limit")
+                digest.update(chunk)
+                output.write(chunk)
+        if digest.hexdigest() != AGY_BINARY_SHA256:
+            dest.unlink(missing_ok=True)
+            return False
+        return True
+    except (OSError, ValueError):
+        dest.unlink(missing_ok=True)
+        return False
+    finally:
+        os.close(fd)
 
 
 def extract_agy(archive, output):
@@ -218,17 +300,96 @@ def prepare(dest, pins):
         os.close(parent_fd)
 
 
+def prepare_remote_tag(dest, tag, pubkey_pin, *, reuse_agy=None, opener=None, verify=verify_signed_payload):
+    match = TAG_PATTERN.fullmatch(tag) if isinstance(tag, str) else None
+    if not match:
+        raise ValueError(f"unusable Gemini release tag: {tag!r}")
+    version = match.group(1)
+    if not dest.is_absolute() or not dest.name or ".." in dest.parts:
+        raise ValueError(
+            "--dest must be an absolute directory path with a private parent"
+        )
+    parent_fd = os.open(dest.parent, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
+    try:
+        require_private(os.fstat(parent_fd), dest.parent, stat.S_ISDIR)
+        fcntl.flock(parent_fd, fcntl.LOCK_EX)
+        if os.path.lexists(dest):
+            raise RuntimeError(f"destination already exists: {dest}")
+        release = f"{RELEASE_BASE}/{tag}"
+        active_opener = opener if opener is not None else build_opener(HttpsRedirects())
+        with tempfile.TemporaryDirectory(prefix=".gemini-", dir=dest.parent) as staging:
+            stage = Path(staging)
+            # Pin the issuer public key against the root-owned deploy/payload.json trust root.
+            download(
+                active_opener,
+                f"{release}/crag-license-public.pem",
+                stage / "crag-license-public.pem",
+                **pubkey_pin,
+            )
+            download_bounded(
+                active_opener,
+                f"{release}/manifest.json",
+                stage / "manifest.json",
+                MAX_MANIFEST_SIZE,
+            )
+            manifest = json.loads((stage / "manifest.json").read_text(encoding="utf-8"))
+            sha_map = manifest.get("sha256") if isinstance(manifest, dict) else None
+            if (
+                not isinstance(manifest, dict)
+                or manifest.get("family") != "crag"
+                or manifest.get("encrypted") is not True
+                or manifest.get("software_version") != version
+                or not isinstance(sha_map, dict)
+                or sha_map.get("crag-license-public.pem") != pubkey_pin["sha256"]
+                or sha_map.get("agy") != AGY_BINARY_SHA256
+                or not all(
+                    isinstance(sha_map.get(name), str)
+                    and re.fullmatch(r"[a-f0-9]{64}", sha_map[name])
+                    for name in NATIVE_ASSETS
+                )
+            ):
+                raise RuntimeError("remote Gemini manifest failed pinned trust checks")
+            for name in ("craggemini", "craggemini.payload.enc", "libagy_bridge.so"):
+                download_bounded(
+                    active_opener,
+                    f"{release}/{name}",
+                    stage / name,
+                    MAX_MEMBER_SIZE,
+                    expected_sha256=sha_map[name],
+                )
+            if not reuse_verified_agy(reuse_agy, stage / "agy"):
+                archive = stage / "cli_linux_x64.tar.gz"
+                download(active_opener, AGY_URL, archive, AGY_SIZE, AGY_SHA256)
+                extract_agy(archive, stage / "agy")
+            verify(stage, version)
+            stage.rename(dest)
+    finally:
+        os.close(parent_fd)
+    return version
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--dest", type=Path, required=True)
+    parser.add_argument("--tag", type=str, default=None)
+    parser.add_argument("--reuse-agy", type=Path, default=None)
     args = parser.parse_args()
     try:
         if sys.platform != "linux" or platform.machine() not in ("x86_64", "amd64"):
             raise RuntimeError("default Gemini payload requires Linux amd64")
         os.umask(0o077)
         pins = read_pins(args.manifest)
-        prepare(args.dest, pins)
+        if args.tag and args.tag != pins["tag"]:
+            version = prepare_remote_tag(
+                args.dest,
+                args.tag,
+                pins["assets"]["crag-license-public.pem"],
+                reuse_agy=args.reuse_agy,
+            )
+        else:
+            prepare(args.dest, pins)
+            version = pins["version"]
     except (
         OSError,
         ValueError,
@@ -238,7 +399,7 @@ def main():
     ) as error:
         print(f"Gemini default payload: {error}", file=sys.stderr)
         return 1
-    print(f"Verified Gemini payload {pins['version']}: {args.dest}")
+    print(f"Verified Gemini payload {version}: {args.dest}")
     return 0
 
 

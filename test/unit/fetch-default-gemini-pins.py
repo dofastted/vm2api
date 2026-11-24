@@ -98,6 +98,21 @@ def test_still_requires_the_five_pinned_assets():
             raise AssertionError("read_pins accepted invalid asset pins")
 
 
+def test_redirects_allow_only_trusted_https_hosts():
+    handler = impl.HttpsRedirects()
+    for blocked in (
+        "http://github.com/dofastted/vm2api/releases/download/x/y",
+        "https://evil.example/craggemini",
+        "https://github.com:8443/dofastted/vm2api/releases/download/x/y",
+        "https://user:pass@github.com/dofastted/vm2api/releases/download/x/y",
+    ):
+        try:
+            handler.redirect_request(None, None, 302, "Found", {}, blocked)
+        except RuntimeError:
+            continue
+        raise AssertionError(f"HttpsRedirects allowed untrusted URL {blocked!r}")
+
+
 for name, case in sorted(globals().items()):
     if name.startswith("test_"):
         case()

@@ -5438,6 +5438,7 @@ class Host:
             "get",
             "daemon-status",
             "maintenance-status",
+            "maintenance-quiesce",
             "test-chat-status",
             "test-chat-cancel",
             "infer-cancel",
@@ -5480,6 +5481,22 @@ class Host:
                     or any(self.running(key) for key in self.runs)
                 )
             }
+        if operation == "maintenance-quiesce":
+            if (
+                self.pending
+                or self.terminals
+                or any(self.active_infers.values())
+                or any(self.running(key) for key in self.runs)
+            ):
+                return {"busy": True}
+            stopped = 0
+            for shard_id in list(getattr(self, "daemon_shards", {})):
+                self._stop_shard(shard_id)
+                stopped += 1
+            for identifier in list(getattr(self, "native_sessions", {})):
+                self.stop_native_session(identifier)
+                stopped += 1
+            return {"busy": False, "stopped": stopped}
         if operation == "daemon-status":
             return self.daemon_status()
         if operation == "apply-policy":
@@ -6504,6 +6521,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "terminal-stop",
                 "install-payload",
                 "maintenance-status",
+                "maintenance-quiesce",
                 "proxy-probe",
                 "proxy-bind",
                 "concurrency-set",
@@ -6526,7 +6544,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise Failure(400)
-            if operation in ("install-payload", "maintenance-status"):
+            if operation in ("install-payload", "maintenance-status", "maintenance-quiesce"):
                 _, uid, _ = struct.unpack(
                     "3i",
                     self.request.getsockopt(

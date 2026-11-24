@@ -31,6 +31,9 @@ import { geminiInventoryOptions } from '@/features/import/gemini-environments'
 import { useGeminiBusy } from '@/features/import/gemini-operations'
 import { GeminiTestPanel } from '@/features/import/gemini-test-panel'
 import {
+  GEMINI_INSTALL_COMMAND,
+  geminiPayloadLabels,
+  geminiPhaseLabels,
   type MaintenanceRelease,
   type MaintenanceRequest,
   type MaintenanceSnapshot,
@@ -39,18 +42,11 @@ import {
   startMaintenance,
 } from './gemini-maintenance'
 
-const COMMAND =
-  'curl -fsSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install-gemini.sh | sudo bash -s -- --dir /opt/vm2api'
+const COMMAND = GEMINI_INSTALL_COMMAND
 
 const payloadLabels: Record<string, string> = {
-  installed: '已安装',
-  invalid: '校验失败',
-  missing: '未安装',
-  not_installed: '未安装',
+  ...geminiPayloadLabels,
   not_configured: '未配置',
-  awaiting_redemption: '等待兑换',
-  unknown: '未知',
-  unverified: '正在验证',
 }
 
 const checkStates = { pass: '通过', fail: '失败', warning: '警告' } as const
@@ -59,23 +55,7 @@ const jobStates = {
   completed: '已完成',
   failed: '失败',
 } as const
-const phaseLabels: Record<string, string> = {
-  queued: '等待执行',
-  checking: '检查宿主',
-  dependencies: '准备宿主依赖',
-  diagnosing: '诊断宿主',
-  fetching: '下载签名载荷',
-  preparing_runtime: '准备运行文件',
-  restoring: '恢复未完成的维护',
-  downloading: '下载签名载荷',
-  verifying: '验证载荷',
-  applying: '应用变更',
-  starting: '启动 Gemini 服务',
-  installing: '安装运行环境',
-  restarting: '重启 Gemini 服务',
-  completed: '执行完成',
-  failed: '执行失败',
-}
+const phaseLabels = geminiPhaseLabels
 
 const restartCopy =
   '此操作可能启动或重启 Gemini 服务，使该服务短暂不可用；不会重启控制面。宿主仍有授权、终端或推理任务时，会拒绝变更，不会强制停止任务。'
