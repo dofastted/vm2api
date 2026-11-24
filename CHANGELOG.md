@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **CRAG v2 槽位会话被 9p 写回卡死**：CRAG 把每个会话的 `tap.jsonl` 写在 `/run/kin/work`（宿主机 9p 共享目录），CLI 同时不断 `stat` 它。Ubuntu 24.04 的 6.8 内核里，v9fs 的 getattr 会先对脏页发起写回（`v9fs_vfs_getattr_dotl → filemap_fdatawrite`），stat 撞上一次迟迟不完成的写回时，线程会永久卡在 `folio_wait_writeback`（D 状态）。CLI 进程因此退不干净（`[claude] <defunct>` 且线程仍在），CRAG 一直认为会话位被占用，健康报告 `ready_slots: 0`，之后分到该槽的请求全部静默等到网关超时，并触发「连续 3 次静默超时」熔断（内核故障）。恢复服务和切内核也会被 `slot_native_busy` 拒绝，只能整机关机重开。`kin-crag-apparmor`（每次启动 CRAG 内核前都会内联执行）现在给 `kin-kernel.service` 装一个受管 drop-in `45-vm2api-crag-work.conf`：内核启动前以 root 把 guest tmpfs 挂到 `/run/kin/work`（`mode=0700,size=256m,nosuid,nodev`，属主 kincli），tap 文件不再经过 9p。`ExecStartPre=-+`：挂载失败也不阻塞内核，退回原来的 9p 目录。离开 CRAG v2 时移除 drop-in（已挂载的 tmpfs 留到 guest 重启）；同路径的非受管文件不覆盖。老 guest 镜像无需重建，下一次 CRAG 内核启动即生效。
+
 ## 1.4.202 — 2026-11-24 · 强制函数调用未兑现时明确失败；上游 modelVersion 如实透出；`service_tier` 能力边界显式化
 
 - **`mode=ANY` / 必需 `tool_choice` 却无函数调用时明确失败**：此前上游以 `STOP` 结束且零 `functionCall` 时,网关仍按成功回复返回 `200`,依赖函数回调交付消息的客户端表现为「模型有输出但没发消息」。现把强制工具意图经 `restoreContext.toolChoice` 传到能观察响应的调度层,在未兑现时返回 `502 gemini_tool_call_required`（已登记进 `FAILURES` 并归入不熔断集合,不会被当作瞬时故障在账号间反复重试）；`AUTO` 的纯文本成功与真实函数调用均不受影响（#1750,修 #1732）。
