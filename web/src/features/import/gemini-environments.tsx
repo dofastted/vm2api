@@ -7,6 +7,8 @@ import { api } from '@/lib/api'
 import { copyText } from '@/lib/clipboard'
 import {
   geminiAuthorizationLabel,
+  geminiEligibilityNotice,
+  geminiInferenceErrorAction,
   geminiInferenceLabel,
   geminiInferenceErrorLabel,
 } from '@/lib/gemini-account-status'
@@ -137,6 +139,12 @@ export type GeminiEnvironment = {
     region: string | null
     plan: string | null
     expires_at: string | null
+    eligibility?:
+      | 'verification_required'
+      | 'location_unsupported'
+      | 'ineligible'
+      | null
+    validation_url?: string | null
     quotas: (QuotaReading & { model: string })[]
     quota_groups?: {
       name: string
@@ -431,6 +439,12 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
               : ''}
           </dd>
         ) : null}
+        {environment.last_inference?.state === 'failed' &&
+        geminiInferenceErrorAction(environment.last_inference.error_code) ? (
+          <dd className='mt-0.5 text-xs text-muted-foreground'>
+            {geminiInferenceErrorAction(environment.last_inference.error_code)}
+          </dd>
+        ) : null}
       </div>
       <div>
         <dt className='text-muted-foreground'>公共 API 端到端验证</dt>
@@ -496,6 +510,47 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
             : '尚未读取'}
         </dd>
       </div>
+      {(() => {
+        const notice = geminiEligibilityNotice(account)
+        if (!notice) return null
+        return (
+          <div className='space-y-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 sm:col-span-2 lg:col-span-3'>
+            <dt className='font-medium text-amber-700 dark:text-amber-300'>
+              上游资格状态 · {notice.label}
+            </dt>
+            <dd className='text-xs text-muted-foreground'>{notice.action}</dd>
+            {notice.validationUrl ? (
+              <dd className='flex flex-wrap items-center gap-2 pt-0.5'>
+                <a
+                  href={notice.validationUrl}
+                  target='_blank'
+                  rel='noopener noreferrer'
+                  className='inline-flex items-center gap-1 text-xs font-medium text-primary underline underline-offset-4'
+                >
+                  打开 Google 验证页
+                  <ExternalLink className='size-3' />
+                </a>
+                <Button
+                  type='button'
+                  variant='outline'
+                  size='sm'
+                  className='h-6 px-2 text-xs'
+                  onClick={async () => {
+                    if (await copyText(notice.validationUrl!)) {
+                      toast.success('已复制 Google 验证链接')
+                    } else {
+                      toast.error('复制失败，请点击链接直接打开')
+                    }
+                  }}
+                >
+                  <Copy className='mr-1 size-3' />
+                  复制验证链接
+                </Button>
+              </dd>
+            ) : null}
+          </div>
+        )
+      })()}
       <div className='sm:col-span-2 lg:col-span-3'>
         <dt className='text-muted-foreground'>模型</dt>
         <dd className='break-words'>

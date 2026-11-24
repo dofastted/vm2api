@@ -1,9 +1,13 @@
 import type { Vm } from '@/types/panel-vm'
 import { describe, expect, it } from 'vitest'
 import {
+  DEFAULT_GEMINI_TEST_PROMPT,
+  defaultGeminiTestModel,
   geminiAccountStatus,
   geminiAuthorizationLabel,
+  geminiEligibilityNotice,
   geminiHostBlocker,
+  geminiInferenceErrorAction,
   geminiInferenceErrorLabel,
   geminiInferenceLabel,
 } from './gemini-account-status'
@@ -255,5 +259,72 @@ describe('Gemini account presentation', () => {
       }
     )
     expect([claude, codex].map(accountUsable)).toEqual([true, true])
+  })
+
+  it('defaults test prompt to hello and selects Gemini 4 neon when available', () => {
+    expect(DEFAULT_GEMINI_TEST_PROMPT).toBe('hello')
+    expect(
+      defaultGeminiTestModel([
+        'gemini-3-flash',
+        'gemini-4-neon-high',
+        'gemini-3.8-flash-high',
+      ])
+    ).toBe('gemini-4-neon-high')
+    expect(
+      defaultGeminiTestModel([
+        'gemini-4-neon-high',
+        'gemini-4-neon',
+        'gemini-3-flash',
+      ])
+    ).toBe('gemini-4-neon')
+    expect(
+      defaultGeminiTestModel(['gemini-3-flash', 'gemini-4-neon-medium'])
+    ).toBe('gemini-4-neon-medium')
+    expect(defaultGeminiTestModel(['gemini-3-flash', 'gemini-2.5-pro'])).toBe(
+      'gemini-3-flash'
+    )
+    expect(defaultGeminiTestModel([])).toBe('')
+  })
+
+  it('provides actionable remediation copy for upstream errors and validates Google verification links', () => {
+    expect(
+      geminiInferenceErrorAction('gemini_account_verification_required')
+    ).toContain('验证链接')
+    expect(
+      geminiInferenceErrorAction('gemini_location_unsupported')
+    ).toContain('代理')
+    expect(geminiInferenceErrorAction('gemini_quota_exhausted')).toContain(
+      '配额'
+    )
+    expect(geminiInferenceErrorAction('gemini_oauth_required')).toContain(
+      '重新完成官方 Google 授权'
+    )
+    expect(geminiInferenceErrorAction('gemini_proxy_error')).toContain('SOCKS5')
+    expect(geminiInferenceErrorAction('gemini_inference_failed')).toContain(
+      '刷新'
+    )
+    expect(
+      geminiInferenceErrorAction('gemini_native_worker_unavailable')
+    ).toContain('Gemini 维护')
+    expect(geminiInferenceErrorAction('unknown_raw_code')).toBeNull()
+
+    const validUrl =
+      'https://accounts.google.com/v3/signin/continue?plt=abc&sarp=1'
+    expect(
+      geminiEligibilityNotice({
+        eligibility: 'verification_required',
+        validation_url: validUrl,
+      })
+    ).toMatchObject({
+      label: expect.stringContaining('VALIDATION_REQUIRED'),
+      validationUrl: validUrl,
+    })
+    expect(
+      geminiEligibilityNotice({
+        eligibility: 'verification_required',
+        validation_url: 'https://evil.example/phish',
+      })?.validationUrl
+    ).toBeNull()
+    expect(geminiEligibilityNotice({ eligibility: null })).toBeNull()
   })
 })

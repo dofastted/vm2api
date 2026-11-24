@@ -33,27 +33,75 @@ const ACCOUNT_ELIGIBILITIES = new Set(['verification_required', 'location_unsupp
 const PAYLOAD_STATES = new Set(['installed', 'install_on_create', 'awaiting_redemption', 'not_configured', 'invalid'])
 const RUN_STATES = new Set(['running', 'completed', 'failed'])
 const RUN_ERRORS = {
-  gemini_oauth_required: [409, '请重新完成 Google OAuth 授权'],
-  gemini_location_unsupported: [403, 'Google 判定当前账号所在地区不支持 Antigravity；拉取模型成功不代表可对话'],
+  gemini_oauth_required: [
+    409,
+    'Google OAuth 凭据已失效或被吊销（401 / invalid_grant），请在「账号」页重新完成官方 Google 授权（建议浏览器与绑定代理保持同区出口）',
+  ],
+  gemini_location_unsupported: [
+    403,
+    'Google 判定当前账号或出口地区不支持 Antigravity（403 UNSUPPORTED_REGION）；拉取模型成功不代表可对话，请在「代理」页更换支持地区（如美国住宅）的代理后重试，或更换账号',
+  ],
   gemini_account_verification_required: [
     403,
-    'Google 要求先在浏览器完成该账号的身份验证后才能使用 Antigravity；拉取模型成功不代表可对话',
+    'Google 要求先在浏览器完成该账号的身份验证（403 VALIDATION_REQUIRED）；拉取模型成功不代表可对话，请在对应账号浏览器打开「账号」页的 Google 验证链接完成核验后再试',
   ],
-  gemini_account_ineligible: [403, 'Google 判定当前账号暂不符合 Antigravity 使用资格，请检查账号状态或更换账号'],
-  gemini_proxy_error: [502, '无法通过绑定代理连接 Gemini，请检查代理'],
-  gemini_model_unavailable: [409, '当前环境不支持所选模型，请重新获取模型列表'],
-  gemini_models_empty: [502, 'Gemini 未返回可用模型'],
-  gemini_api_key_invalid: [400, '当前 Gemini API Key 无效'],
-  gemini_quota_exhausted: [429, 'Gemini 额度已用尽，请稍后重试'],
-  gemini_inference_timeout: [503, 'Gemini 请求超时，请稍后重试'],
-  gemini_inference_invalid_output: [502, 'Gemini 返回了无法解析的响应'],
-  gemini_inference_start_failed: [503, '无法启动 Gemini 测试进程'],
-  gemini_inference_cancelled: [409, 'Gemini 测试已取消'],
-  gemini_inference_output_limit: [502, 'Gemini 响应超过测试输出上限'],
-  gemini_inference_tool_blocked: [502, '此测试仅支持文本，不支持工具调用'],
-  gemini_inference_failed: [502, 'Gemini 请求失败，请检查环境状态'],
-  gemini_native_tty_unavailable: [503, '没有可用的 Linux 虚拟控制台运行 CRAGGemini'],
-  gemini_native_worker_unavailable: [503, 'Gemini 原生 TUI worker 未就绪，请检查宿主机控制台和 CRAGGemini 载荷'],
+  gemini_account_ineligible: [
+    403,
+    'Google 判定当前账号暂不符合 Antigravity 使用资格（403），请检查账号订阅状态、年龄限制或更换可用个人账号',
+  ],
+  gemini_proxy_error: [
+    502,
+    '无法通过绑定代理连接 Google 上游，请在「代理」页探活检查 SOCKS5 节点连通性与出口质量，或更换代理后重试',
+  ],
+  gemini_model_unavailable: [
+    409,
+    '上游不支持或未开放所选模型（404），请先点击「拉取模型」刷新最新模型目录后再试',
+  ],
+  gemini_models_empty: [
+    502,
+    '上游未返回可调用模型，请检查账号资格与代理连通性，或重新完成授权后再拉取',
+  ],
+  gemini_api_key_invalid: [
+    400,
+    '当前 Gemini API Key 无效或权限不足（400/401/403），请在 Google AI Studio 核对密钥状态与项目权限后重新配置',
+  ],
+  gemini_quota_exhausted: [
+    429,
+    '上游模型配额已用尽（429 RESOURCE_EXHAUSTED），请等待配额重置、切换其他模型或调度到其他账号',
+  ],
+  gemini_inference_timeout: [
+    503,
+    '上游响应超时（504），可能是代理延迟过高或模型负载波动，请检查代理延迟后重试',
+  ],
+  gemini_inference_invalid_output: [
+    502,
+    '上游返回空回复或无法解析的流式响应，请重试或切换其他模型确认',
+  ],
+  gemini_inference_start_failed: [
+    503,
+    '无法启动本地 Gemini 推理进程，请前往「设置 → Gemini 维护」检查宿主服务与载荷状态',
+  ],
+  gemini_inference_cancelled: [409, 'Gemini 测试已手动取消'],
+  gemini_inference_output_limit: [
+    502,
+    '模型单次回复超过测试输出上限，请精简提示词或限制回复长度后重试',
+  ],
+  gemini_inference_tool_blocked: [
+    502,
+    '当前测试通道限制了该工具调用，请改用纯文本提示词重试',
+  ],
+  gemini_inference_failed: [
+    502,
+    '上游推理失败（502），请先刷新账号状态确认是否触发 Google 身份验证/风控，再检查绑定代理与宿主服务日志',
+  ],
+  gemini_native_tty_unavailable: [
+    503,
+    '宿主机没有可用的虚拟终端资源，请检查宿主机状态并重启 vm2api-gemini 服务',
+  ],
+  gemini_native_worker_unavailable: [
+    503,
+    'CRAGGemini 原生常驻内核未就绪，请稍候等待自动预热，或前往「设置 → Gemini 维护」检查载荷与宿主服务',
+  ],
   license_required: [403, GEMINI_LICENSE_MESSAGES.license_required],
   license_expired: [403, GEMINI_LICENSE_MESSAGES.license_expired],
   license_not_yet_valid: [403, GEMINI_LICENSE_MESSAGES.license_not_yet_valid],
