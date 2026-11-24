@@ -1654,6 +1654,62 @@ test('a host error code the control plane knows survives, and only an unknown on
   await assert.rejects(callGeminiHost('authorization', { id: record.id }), { code: 'gemini_host_unavailable' })
 })
 
+test('authorization failing stage survives allowlist and maps to stage-specific panel message (#1622)', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'gemini-authstage-'))
+  const socketPath = path.join(directory, 'control.sock')
+  const previous = process.env.KIN_GEMINI_HOST_SOCKET
+  process.env.KIN_GEMINI_HOST_SOCKET = socketPath
+  let stage = 'proxy_probe'
+  const server = http.createServer(async (request, response) => {
+    for await (const chunk of request) void chunk
+    response.writeHead(503, { 'Content-Type': 'application/json' })
+    response.end(JSON.stringify({ code: 'gemini_authorization_unavailable', stage }))
+  })
+  t.after(async () => {
+    if (previous === undefined) delete process.env.KIN_GEMINI_HOST_SOCKET
+    else process.env.KIN_GEMINI_HOST_SOCKET = previous
+    await new Promise((resolve) => server.close(resolve))
+    await rm(directory, { recursive: true, force: true })
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, resolve)
+  })
+
+  await assert.rejects(callGeminiHost('authorize', { id: record.id }), (err) => {
+    assert.equal(err.code, 'gemini_authorization_unavailable')
+    assert.equal(err.status, 503)
+    assert.equal(err.stage, 'proxy_probe')
+    return true
+  })
+
+  // Panel route formats allowlisted stage into stage-specific guidance + error.stage.
+  const panelStage = setup((op) => {
+    if (op === 'get') return record
+    if (op === 'authorize') {
+      throw Object.assign(new Error('gemini_authorization_unavailable'), {
+        code: 'gemini_authorization_unavailable',
+        status: 503,
+        stage: 'proxy_probe',
+      })
+    }
+    throw new Error(`unexpected ${op}`)
+  })
+  const resStage = await panelStage('POST', `/api/panel/gemini/environments/${record.id}/authorization`)
+  assert.equal(resStage.status, 503)
+  assert.equal(resStage.body.error.code, 'gemini_authorization_unavailable')
+  assert.equal(resStage.body.error.stage, 'proxy_probe')
+  assert.match(resStage.body.error.message, /隔离出口无法连通绑定代理/)
+
+  // Unknown stage values are dropped rather than forwarded unvetted.
+  stage = 'raw_secret_exception_text'
+  await assert.rejects(callGeminiHost('authorize', { id: record.id }), (err) => {
+    assert.equal(err.code, 'gemini_authorization_unavailable')
+    assert.equal(err.stage, undefined)
+    return true
+  })
+})
+
 test('synchronous host errors and polled test-chat runs report the same resident-pool copy for native worker/tty faults', async () => {
   for (const code of ['gemini_native_worker_unavailable', 'gemini_native_tty_unavailable']) {
     const run = setup((operation) => {

@@ -11,11 +11,20 @@ namespace=$prefix
 host_link=${prefix}h
 peer_link=${prefix}p
 docker_chain=VM2API-AGY-$2
+input_chain=VM2API-AGY-IN-$2
+relay_mode=0
+if [[ $4 == "$gateway" ]]; then
+    relay_mode=1
+fi
 
 iptables_rule() { iptables -w 3 "$@"; }
 
 docker_chain_exists() {
     command -v iptables >/dev/null && iptables_rule -S "$docker_chain" >/dev/null 2>&1
+}
+
+input_chain_exists() {
+    command -v iptables >/dev/null && iptables_rule -S "$input_chain" >/dev/null 2>&1
 }
 
 allow_docker_forwarding() {
@@ -29,6 +38,19 @@ allow_docker_forwarding() {
         -p tcp --sport "$2" -m conntrack --ctstate ESTABLISHED -j ACCEPT
     iptables_rule -I DOCKER-USER 1 -i "$host_link" -j "$docker_chain"
     iptables_rule -I DOCKER-USER 1 -o "$host_link" -j "$docker_chain"
+}
+
+allow_host_relay_input() {
+    if ! command -v iptables >/dev/null || ! iptables_rule -S INPUT >/dev/null 2>&1; then
+        return
+    fi
+    if [[ $(iptables_rule -S INPUT) == "-P INPUT ACCEPT" ]]; then
+        return
+    fi
+    iptables_rule -N "$input_chain"
+    iptables_rule -A "$input_chain" -i "$host_link" -s "$guest/32" -d "$gateway/32" \
+        -p tcp --dport "$1" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+    iptables_rule -I INPUT 1 -i "$host_link" -j "$input_chain"
 }
 
 cleanup() {
@@ -45,6 +67,13 @@ cleanup() {
         iptables_rule -F "$docker_chain"
         iptables_rule -X "$docker_chain"
     fi
+    if input_chain_exists; then
+        if iptables_rule -C INPUT -i "$host_link" -j "$input_chain" >/dev/null 2>&1; then
+            iptables_rule -D INPUT -i "$host_link" -j "$input_chain"
+        fi
+        iptables_rule -F "$input_chain"
+        iptables_rule -X "$input_chain"
+    fi
 }
 
 case $1 in
@@ -53,9 +82,11 @@ case $1 in
     *) exit 2 ;;
 esac
 
-[[ $(< /proc/sys/net/ipv4/ip_forward) == 1 ]]
+if (( ! relay_mode )); then
+    [[ $(< /proc/sys/net/ipv4/ip_forward) == 1 ]]
+fi
 [[ ! -e /run/netns/$namespace ]]
-if ip link show "$host_link" >/dev/null 2>&1 || nft list table inet "$prefix" >/dev/null 2>&1 || docker_chain_exists; then
+if ip link show "$host_link" >/dev/null 2>&1 || nft list table inet "$prefix" >/dev/null 2>&1 || docker_chain_exists || input_chain_exists; then
     exit 1
 fi
 trap cleanup EXIT
@@ -88,7 +119,34 @@ table inet gemini_out {
     }
 }
 EOF
-nft -f - <<EOF
+if (( relay_mode )); then
+    # Relay mode terminates the netns egress socket on the slot gateway IP so
+    # the host-side single-target relay dials the bound SOCKS5 via host OUTPUT
+    # (traversing host transparent proxies cleanly). A priority -150 prerouting
+    # identity DNAT marks conntrack before host dstnat (-100) transparent-proxy
+    # REDIRECT rules can hijack the relay leg into host_input DROP, while
+    # host_input still drops all other host access from the slot veth.
+    nft -f - <<EOF
+table inet $prefix {
+    chain prerouting_relay {
+        type nat hook prerouting priority -150; policy accept;
+        iifname "$host_link" ip saddr $guest ip daddr $gateway tcp dport $5 dnat ip to $gateway:$5
+    }
+    chain restrict {
+        type filter hook forward priority -20; policy accept;
+        iifname "$host_link" drop
+        oifname "$host_link" drop
+    }
+    chain host_input {
+        type filter hook input priority -20; policy accept;
+        iifname "$host_link" ip saddr $guest ip daddr $gateway tcp dport $5 accept
+        iifname "$host_link" drop
+    }
+}
+EOF
+    allow_host_relay_input "$5"
+else
+    nft -f - <<EOF
 table inet $prefix {
     chain restrict {
         type filter hook forward priority -20; policy accept;
@@ -107,7 +165,8 @@ table inet $prefix {
     }
 }
 EOF
-allow_docker_forwarding "$4" "$5"
+    allow_docker_forwarding "$4" "$5"
+fi
 ip address add "$gateway/30" dev "$host_link"
 ip link set "$host_link" up
 ip -n "$namespace" link set "$peer_link" up
