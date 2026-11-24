@@ -2,11 +2,12 @@
 
 ## Unreleased
 
-## 1.4.198 — 2026-11-24 · 修正 CRAG 内核 pin:改钉 3.1.7
+## 1.4.199 — 2026-11-24 · CRAG 内核 pin 确认为 3.1.17
 
-- **CRAG 内核 pin 修正**：`v1.4.197` 的 `crag_release` 指向 `payload-2026.11.24-crag-3.1.17`，该制品自报 `software_version` 为 `3.1.17`，并非预期下发的内核。本版改钉 `payload-2026.11.19-crag-3.1.7`（制品自报 `software_version` 为 `3.1.7`），相应更新 `share/crag/kernels/v2/amd64/crag-v2`、`crag-v2.payload.enc`、`manifest.json`、`unpack-note.md` 与 `dist/crag-v2-licensed-amd64.tar.gz` 的资产名、大小与 `sha256`；同目录的 `LICENSES.txt`、`claude-code-2.1.321/*`、`crag-license-public.pem`、`kernel.json.example` 与 `share/crag/kin-kernel` 在两个 release 中字节一致，未改动。
-- **`v1.4.197` 不要部署**：该版本除 CRAG pin 外的内容与本版相同，但其 CRAG pin 指向非预期内核。请直接使用 `v1.4.198`。
-- 部署说明：除 CRAG pin 外，其余与 `v1.4.197` 一致——CRAGGemini 载荷仍钉 `payload-2026.11.24-gemini-0.4.6`，两个数据库迁移（SQLite `068`、PostgreSQL `005`）对存量部署为无操作，`bin/` 字节未变（预期 `SLOT_SYNC=skip`）。`share/crag/kernels/` 与 `share/gemini/` 均**不在** `remote-apply.sh` 的应用范围内：CRAG 内核随 `install.sh` / 面板内核管理生效，CRAGGemini 载荷与宿主脚本需执行 `install.sh prepare-gemini`。
+- **CRAG 内核 pin 保持 `payload-2026.11.24-crag-3.1.17`**：`deploy/payload.json` 与 `v1.4.197` 逐字节一致。开发过程中曾短暂改钉 `payload-2026.11.19-crag-3.1.7`（未发布的 `1.4.198`），经确认 `3.1.17` 才是预期下发的内核，已还原。
+- **撤回未发布的 `1.4.198` 中「`v1.4.197` 不要部署」的说明**：该说明不成立。`v1.4.197` 的 CRAG pin 与本版相同，内容无问题；`1.4.198` 未打 tag、未发布。
+- 其余内容与 `v1.4.197` 一致，详见下方该版条目。
+- 部署说明：CRAGGemini 载荷钉 `payload-2026.11.24-gemini-0.4.6`，两个数据库迁移（SQLite `068`、PostgreSQL `005`）对存量部署为无操作，`bin/` 字节未变（预期 `SLOT_SYNC=skip`）。`share/crag/kernels/` 与 `share/gemini/` 均**不在** `remote-apply.sh` 的应用范围内：CRAG 内核随 `install.sh` / 面板内核管理生效，CRAGGemini 载荷与宿主脚本需执行 `install.sh prepare-gemini`。
 
 ## 1.4.197 — 2026-11-24 · CRAGGemini 0.4.6 与 CRAG 3.1.17 载荷升级；集成 API 与多层密钥归属隔离；PG 一键安装加固
 
