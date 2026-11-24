@@ -1494,6 +1494,7 @@ export function createGeminiPublicHandler({
       !externalLogBag && requestLog?.start
         ? requestLog.start(req, { protocol: logProtocolName(protocol), route: url.pathname })
         : null
+    if (ownLogCtx) requestLog?.tapResponse?.(ownLogCtx, res)
     const logBag = externalLogBag || {}
     let ownLogFlushed = false
     const finishOwnLog = (statusCode) => {
@@ -1525,6 +1526,9 @@ export function createGeminiPublicHandler({
         finishOwnLog(status)
         return json(res, status, protocolErrorBody(protocol, status, 'invalid_json', 'Invalid JSON request body.'))
       }
+    }
+    if (ownLogCtx?.mode === 'debug' && logBag.inbound_body == null) {
+      logBag.inbound_body = body
     }
 
     const supportsStream = typeof scheduler.stream === 'function'
@@ -1699,7 +1703,8 @@ export function createGeminiPublicHandler({
       (typeof req.headers?.['x-conversation-id'] === 'string' && req.headers['x-conversation-id'].trim()) ||
       (typeof body?.conversation_id === 'string' && body.conversation_id.trim()) ||
       (typeof body?.session_id === 'string' && body.session_id.trim()) ||
-      (session?.[1] || '')
+      session?.[1] ||
+      ''
     const stickyKey = stickyHeader ? `${req.apiKeyRecord?.id || 'anon'}:${stickyHeader.slice(0, 128)}` : null
 
     try {
@@ -1708,13 +1713,16 @@ export function createGeminiPublicHandler({
       const turn = await scheduler.stream({
         model: parsed.model,
         targetBodyFor: (target, meta) => {
-          const reqBody = buildGeminiRequest(
-            meta?.upstreamModel ? { ...parsed, model: meta.upstreamModel } : parsed,
-            { target },
-          )
-          return target === 'antigravity' && promptPolicy
-            ? applyCragGeminiPromptPolicy(reqBody, promptPolicy)
-            : reqBody
+          const reqBody = buildGeminiRequest(meta?.upstreamModel ? { ...parsed, model: meta.upstreamModel } : parsed, {
+            target,
+          })
+          const finalBody =
+            target === 'antigravity' && promptPolicy ? applyCragGeminiPromptPolicy(reqBody, promptPolicy) : reqBody
+          if (ownLogCtx?.capture_outbound) {
+            logBag.outbound_body = finalBody
+            logBag.outbound_body_source = target === 'antigravity' ? 'craggemini' : 'gemini_api'
+          }
+          return finalBody
         },
         requiredCapabilities: parsed.requiredCapabilities,
         unsupportedFields: parsed.unsupportedFields,
