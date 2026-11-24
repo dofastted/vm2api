@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { CRAG_GEMINI_PRODUCT, readCragGeminiPackageAuthority, readPinnedCragGeminiPublicKeySha256 } from './payload.mjs'
 
-const DEFAULT_AUTHORITY = 'https://www.vm2api.org'
+const DEFAULT_AUTHORITY = 'https://www.vm2api.org/gemini'
 const HOST_DOMAIN = 'crag-gemini-host-v1:'
 const MAX_HOST_ENTITLEMENT_BYTES = 1536 * 1024
 const MAX_SUBSCRIPTION_TOKEN_BYTES = 8192
@@ -15,11 +15,16 @@ const VOUCHER_RE = /^CRAGR1\.[A-Za-z0-9_-]{43}$/
 const AUTHORITY_ERRORS = new Map([
   ['redeem_unavailable', 404],
   ['host_redeem_conflict', 409],
+  ['issuer_mismatch', 409],
+  ['payload_key_unknown', 400],
+  ['payload_key_conflict', 409],
   ['host_binding_conflict', 409],
   ['host_subscription_inactive', 403],
   ['auth_forbidden', 403],
   ['not_found', 404],
   ['slot_limit_reached', 409],
+  ['renewal_unavailable', 409],
+  ['host_transfer_cooldown', 409],
   ['request_conflict', 409],
   ['invalid_request', 400],
   ['license_invalid', 400],
@@ -47,6 +52,13 @@ export const GEMINI_LICENSE_MESSAGES = {
   host_binding_conflict: '该 Gemini 环境已绑定到其他设备密钥，无法覆盖。',
   redeem_unavailable: '该 CRAGR1 兑换码不可用或已被兑换。',
   host_redeem_conflict: '该 CRAGR1 兑换码已绑定到其他宿主机。',
+  issuer_mismatch: 'CRAGGemini 授权中心不认可当前宿主载荷的签发公钥，请核对授权地址与 CRAGGemini 载荷版本。',
+  payload_key_unknown: 'CRAGGemini 授权中心未登记当前宿主载荷密钥，请更新 CRAGGemini 载荷后重试。',
+  payload_key_conflict: 'CRAGGemini 载荷密钥与当前订阅状态冲突，请检查载荷版本后重试。',
+  renewal_unavailable: '当前 CRAGGemini 订阅暂不可续期。',
+  host_transfer_cooldown: '宿主机迁移尚在冷却期内，请稍后重试。',
+  request_conflict: 'CRAGGemini 授权请求存在冲突，请稍后重试。',
+  invalid_request: 'CRAGGemini 授权请求参数无效，请核对版本后重试。',
   auth_forbidden: 'CRAGGemini 授权中心拒绝了宿主机凭据。',
   not_found: '授权中心未找到对应的宿主机订阅或载荷密钥。',
 }
@@ -444,7 +456,7 @@ export function createGeminiCragSubscription({
     try {
       const text = fs.readFileSync(machineIdFile, 'utf8').trim().toLowerCase().replaceAll('-', '')
       if (/^[a-f0-9]{32}$/.test(text) && !/^(0{32}|f{32})$/.test(text)) raw = text
-    } catch {}
+    } catch { }
     const derived = raw
       ? sha256Hex(`${HOST_DOMAIN}${raw}`)
       : sha256Hex(`${HOST_DOMAIN}${randomBytes(16).toString('hex')}`)
