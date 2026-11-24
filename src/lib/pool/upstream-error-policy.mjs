@@ -809,9 +809,12 @@ function classifyUpstreamResultRaw(
     }
     return {
       scope: 'account',
-      action: reset > now ? 'continue-and-cooldown' : 'continue',
+      action: 'continue',
       reason: 'rate_limited_unknown',
-      cooldownUntil: reset > now ? reset : null,
+      // Retry-After says when to retry this request, not which models are
+      // exhausted. The usage probe resolves the window without parking
+      // unrelated models on the account.
+      cooldownUntil: null,
       retrySameAccount: false,
     }
   }

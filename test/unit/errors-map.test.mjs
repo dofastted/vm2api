@@ -530,6 +530,15 @@ test('pool-wide cooldowns: 529 overload cooldown is capacity, 429 cooldown is a 
   assert.ok(limited.retryAfterSec >= 1)
 })
 
+test('Fable pool quota keeps its 429 and model-specific message at the client boundary', () => {
+  const limited = rewritePoolErrorForClient(null, { error: { code: 'pool_fable_rate_limited' } })
+  assert.equal(limited.status, 429)
+  assert.equal(limited.body.error.type, 'rate_limit_error')
+  assert.equal(limited.body.error.code, 'upstream_rate_limit')
+  assert.match(limited.body.error.message, /Fable/)
+  assert.ok(limited.retryAfterSec >= 1)
+})
+
 test('poolErrorKind separates capacity from nothing-eligible and leaves upstream errors alone', () => {
   assert.equal(poolErrorKind('pool_overloaded'), 'overloaded')
   assert.equal(poolErrorKind('account_pool_exhausted'), 'unavailable')

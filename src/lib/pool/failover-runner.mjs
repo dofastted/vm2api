@@ -9,6 +9,7 @@ import { flattenSearchResultHistory, searchHistoryFingerprint } from '../protoco
 import { MIN_THINKING_BUDGET } from '../protocol/thinking.mjs'
 import {
   CLIENT_POOL_BUSY_MESSAGE,
+  CLIENT_POOL_FABLE_RATE_LIMITED_MESSAGE,
   CLIENT_POOL_RATE_LIMITED_MESSAGE,
   clientCancelledResult,
   isClientCancelledResult,
@@ -213,6 +214,7 @@ const CAPACITY_SELECTION_REASONS = new Set([
  */
 function poolRateLimitedError(details = {}) {
   const retryMs = Number(details.retry_after_ms ?? details.soonest_available_ms)
+  const fableLimited = details.reason === 'pool_fable_rate_limited'
   return {
     ok: false,
     status: 429,
@@ -223,8 +225,8 @@ function poolRateLimitedError(details = {}) {
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        code: 'pool_rate_limited',
-        message: CLIENT_POOL_RATE_LIMITED_MESSAGE,
+        code: fableLimited ? 'pool_fable_rate_limited' : 'pool_rate_limited',
+        message: fableLimited ? CLIENT_POOL_FABLE_RATE_LIMITED_MESSAGE : CLIENT_POOL_RATE_LIMITED_MESSAGE,
         details,
       },
     },
@@ -594,7 +596,7 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
     last_status: lastResult?.status ?? null,
   }
   if (CAPACITY_SELECTION_REASONS.has(reason)) return poolOverloadedError(details)
-  if (reason === 'pool_rate_limited') return poolRateLimitedError(details)
+  if (reason === 'pool_rate_limited' || reason === 'pool_fable_rate_limited') return poolRateLimitedError(details)
   if (reason === 'quota_guard_request_too_large') return quotaGuardTooLargeError(details)
   if (reason === ErrorCode.CLUSTER_SLOT_RECONNECTING) {
     return {
