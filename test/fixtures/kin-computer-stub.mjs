@@ -68,7 +68,10 @@ function writeDocker(out, vmId) {
   fs.mkdirSync(dmi, { recursive: true })
   fs.writeFileSync(path.join(etc, 'hostname'), `${hostname}\n`, 'utf8')
   fs.writeFileSync(path.join(etc, 'machine-id'), `${machine_id}\n`, 'utf8')
+  fs.writeFileSync(path.join(etc, 'kin-computer'), 'source=linux-pc\n', 'utf8')
   fs.writeFileSync(path.join(hw, 'mac'), `${mac}\n`, 'utf8')
+  fs.writeFileSync(path.join(dmi, 'sys_vendor'), 'KinStub\n', 'utf8')
+  fs.writeFileSync(path.join(dmi, 'product_name'), 'Workstation\n', 'utf8')
 }
 
 const { runtime, vmId, out } = parseCreate(process.argv.slice(2))

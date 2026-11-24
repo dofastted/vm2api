@@ -31,9 +31,11 @@ export function clusterComputerBinds(remoteDir) {
   return MOUNTS.map((m) => `${remoteDir}/computer/${m.rel}:${m.guest}:ro`)
 }
 
-export function hasClusterComputerBinds(container, remoteDir) {
+/** Without remoteDir (callers that only hold the inspected container) any node root is accepted. */
+export function hasClusterComputerBinds(container, remoteDir = '') {
   const binds = container?.HostConfig?.Binds || []
-  return clusterComputerBinds(remoteDir).every((bind) => binds.includes(bind))
+  if (remoteDir) return clusterComputerBinds(remoteDir).every((bind) => binds.includes(bind))
+  return MOUNTS.every((m) => binds.some((bind) => String(bind).endsWith(`/computer/${m.rel}:${m.guest}:ro`)))
 }
 
 function regularFile(file) {

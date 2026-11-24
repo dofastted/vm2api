@@ -21,6 +21,10 @@ const start = source.slice(
   source.indexOf('export async function startRemoteSlot('),
   source.indexOf('/** Remote twin of reloadSlotWorker'),
 )
+const reload = source.slice(
+  source.indexOf('export async function reloadRemoteSlot('),
+  source.indexOf('/** Update a node slot'),
+)
 const restartPolicy = source.slice(
   source.indexOf('function remoteSlotRestartPolicy('),
   source.indexOf('/** Reconcile an existing node slot'),
@@ -92,6 +96,8 @@ function fixture({
   removeFails = false,
   cragReady = false,
   subscription = false,
+  computerRequired = false,
+  computerBinds = true,
   cpuWrapped = false,
 } = {}) {
   const calls = []
@@ -130,7 +136,7 @@ function fixture({
     },
     prepare: async () => ({
       nodeId: target.node_id,
-      session: { docker: {}, client: {} },
+      session: { docker: {}, client: {}, host: { uid: 1000 } },
       image: 'image',
       user: 'fixture',
       remoteDir: '/fixture',
@@ -185,13 +191,39 @@ function fixture({
     readCragClusterSubscription: () => subscription,
     hasClusterSubscriptionBinds,
     publishClusterSubscription: async () => calls.push('publish-subscription'),
-    clusterComputerPolicy: () => ({ computer: false, required: false }),
-    hasClusterComputerBinds: () => true,
-    pushClusterComputer: async () => false,
+    clusterComputerPolicy: () => ({ computer: computerRequired, required: computerRequired }),
+    hasClusterComputerBinds: () => computerBinds,
+    pushClusterComputer: async () => computerRequired,
   }
-  const boot = vmContext.runInNewContext(`${restartPolicy}; ${start.replace('export ', '')}; startRemoteSlot`, io)
-  return { calls, target, boot: () => boot(target, '/fixture'), state: () => info?.State }
+  const fns = vmContext.runInNewContext(
+    `${restartPolicy}; ${start.replace('export ', '')}; ${reload.replace('export ', '')}; ({ startRemoteSlot, reloadRemoteSlot })`,
+    io,
+  )
+  return {
+    calls,
+    target,
+    boot: () => fns.startRemoteSlot(target, '/fixture'),
+    reload: () => fns.reloadRemoteSlot(target, '/fixture'),
+    state: () => info?.State,
+  }
 }
+
+test('a telemetry-on cluster Docker slot without computer binds is recreated on start and reload; telemetry-off is left alone', async () => {
+  const legacyStart = fixture({ cragReady: true, computerRequired: true, computerBinds: false })
+  legacyStart.target.dataplane = 'crag'
+  assert.equal((await legacyStart.boot()).action, 'created')
+  assert.deepEqual(legacyStart.calls, ['remove', 'files', 'create', 'start', 'runtime'])
+
+  const legacyReload = fixture({ cragReady: true, computerRequired: true, computerBinds: false })
+  legacyReload.target.dataplane = 'crag'
+  assert.equal((await legacyReload.reload()).action, 'created')
+  assert.deepEqual(legacyReload.calls, ['remove', 'files', 'create', 'start', 'runtime'])
+
+  const telemetryOff = fixture({ cragReady: true, computerBinds: false })
+  telemetryOff.target.dataplane = 'crag'
+  assert.equal((await telemetryOff.boot()).action, 'already-running')
+  assert.deepEqual(telemetryOff.calls, ['disable-autorestart', 'runtime'])
+})
 
 test('a subscribed cluster Docker slot replaces the old container before starting with read-only license mounts', async () => {
   const f = fixture({ cragReady: true, subscription: true })

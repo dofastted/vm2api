@@ -139,3 +139,36 @@ test('retire legacy telemetry retries transport failures and reports unverified,
   assert.equal(recoveredOnRetry.ok, true)
   assert.ok(!recoveredOnRetry.unverified)
 })
+
+test('retireLegacyTelemetry flags cluster Docker containers missing /etc/kin-computer or /etc/kin-dmi mounts', async () => {
+  const clusterVm = {
+    id: 'vm-cluster-legacy',
+    node_id: 'node-a',
+    runtime: { type: 'docker', container: 'kin-cluster' },
+  }
+  const legacy = await retireLegacyTelemetry({
+    vm: clusterVm,
+    inspect: async () => ({ State: { Running: true }, HostConfig: { Binds: [] }, Mounts: [] }),
+    run: async () => ({ code: 0, timed_out: false }),
+  })
+  assert.equal(legacy.ok, true)
+  assert.equal(legacy.running, true)
+  assert.equal(legacy.needsRecreate, true)
+
+  const current = await retireLegacyTelemetry({
+    vm: clusterVm,
+    inspect: async () => ({
+      State: { Running: true },
+      HostConfig: {
+        Binds: [
+          '/srv/vms/vm-cluster-legacy/computer/etc/kin-computer:/etc/kin-computer:ro',
+          '/srv/vms/vm-cluster-legacy/computer/dmi/id:/etc/kin-dmi:ro',
+          '/srv/vms/vm-cluster-legacy/computer/hardware:/etc/kin-hardware:ro',
+        ],
+      },
+    }),
+    run: async () => ({ code: 0, timed_out: false }),
+  })
+  assert.equal(current.ok, true)
+  assert.equal(current.needsRecreate, undefined)
+})

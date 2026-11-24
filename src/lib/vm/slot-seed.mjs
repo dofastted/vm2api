@@ -14,8 +14,10 @@ import {
 import { buildKinSeedJson } from '../identity/workstation-profile.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import crypto from 'node:crypto'
+import { readRoutingConfigFile } from '../core/config.mjs'
 import { runtimeFileOwner } from '../oauth/oauth-credentials.mjs'
 import { telemetryDisableNonessentialTraffic } from './native-telemetry.mjs'
+import { resolveKernelDataplane } from './slot-engine.mjs'
 import { withVmLock } from './vm-file.mjs'
 
 function resolveDisableNonessential(projectRoot, routing, override) {
@@ -23,8 +25,7 @@ function resolveDisableNonessential(projectRoot, routing, override) {
   if (routing && typeof routing === 'object') return telemetryDisableNonessentialTraffic(routing)
   if (!projectRoot) return false
   try {
-    const raw = fs.readFileSync(path.join(projectRoot, 'src', 'config', 'routing.json'), 'utf8')
-    return telemetryDisableNonessentialTraffic(JSON.parse(raw))
+    return telemetryDisableNonessentialTraffic(readRoutingConfigFile(projectRoot))
   } catch {
     return false
   }
@@ -206,14 +207,32 @@ export function writeSlotSeedFiles(
 }
 
 /** Caller holds the VM lifecycle lock; serialize with seed-policy publication too. */
-export async function initializeSlotSeedFiles(projectRoot, vm, host, { routing = null, disableNonessentialTraffic } = {}) {
+export async function initializeSlotSeedFiles(
+  projectRoot,
+  vm,
+  host,
+  { routing = null, disableNonessentialTraffic, cragNativeTelemetry } = {},
+) {
   const slotDir = path.join(projectRoot, 'vms', vm.id)
   return withVmLock(`seed-publication:${slotDir}.json`, async () => {
+    let effectiveRouting = routing
+    if (!effectiveRouting && projectRoot) {
+      try {
+        effectiveRouting = readRoutingConfigFile(projectRoot)
+      } catch {
+        effectiveRouting = null
+      }
+    }
+    const resolvedCragTelemetry =
+      typeof cragNativeTelemetry === 'boolean'
+        ? cragNativeTelemetry
+        : resolveKernelDataplane(vm, effectiveRouting || {}) === 'crag' && !host?.native
     // Remote VM settings, not a stale controller mirror, own custom fields.
     const existing = await host.seedFiles(vm, slotDir)
     const seed = writeSlotSeedFiles(projectRoot, vm, null, {
       existingSettings: existing.files['settings.json'] === null ? {} : JSON.parse(existing.files['settings.json']),
-      routing,
+      cragNativeTelemetry: resolvedCragTelemetry,
+      routing: effectiveRouting,
       disableNonessentialTraffic,
     })
     const result = await host.syncSeed(vm, slotDir)

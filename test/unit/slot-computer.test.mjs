@@ -105,6 +105,7 @@ test('container computer prepare is stable and exposes mac plus dmi', () => {
   assert.match(first.guest_machine_id, MACHINE_ID_RE)
   assert.match(first.mac, /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/)
   assert.equal(fs.statSync(path.join(first.dir, 'system', 'dmi', 'id')).isDirectory(), true)
+  assert.equal(fs.readFileSync(path.join(first.dir, 'system', 'etc', 'kin-computer'), 'utf8').trim(), 'source=linux-pc')
   assert.equal(
     fs
       .readFileSync(path.join(first.dir, 'system', 'hardware', 'mac'), 'utf8')
@@ -113,4 +114,41 @@ test('container computer prepare is stable and exposes mac plus dmi', () => {
     first.mac,
   )
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+function assertFingerprintModes(dir) {
+  const stat = fs.lstatSync(dir)
+  if (stat.isSymbolicLink()) return
+  if (stat.isDirectory()) {
+    assert.equal(stat.mode & 0o777, 0o755, `expected 0755 on directory ${dir}`)
+    for (const entry of fs.readdirSync(dir)) assertFingerprintModes(path.join(dir, entry))
+    return
+  }
+  if (stat.isFile()) {
+    assert.equal(stat.mode & 0o777, 0o644, `expected 0644 on file ${dir}`)
+  }
+}
+
+test('ensureSlotComputer normalizes fingerprint dirs to 0755 and files to 0644 under umask 077', {
+  skip: process.platform === 'win32',
+}, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-computer-umask-'))
+  const previousUmask = process.umask(0o077)
+  try {
+    const dockerVm = { id: 'vm-umask-docker', kernel: 'debian-12', runtime: { type: 'docker' } }
+    const created = ensureSlotComputer(root, dockerVm)
+    assert.equal(created.created, true)
+    assertFingerprintModes(created.dir)
+
+    // Simulate a pre-existing slot whose fingerprint files were stranded at 0700/0600.
+    fs.chmodSync(path.join(created.dir, 'system', 'etc', 'kin-computer'), 0o600)
+    fs.chmodSync(path.join(created.dir, 'system', 'dmi', 'id'), 0o700)
+    const healed = ensureSlotComputer(root, dockerVm)
+    assert.equal(healed.created, false)
+    assert.equal(healed.hostname, created.hostname)
+    assertFingerprintModes(healed.dir)
+  } finally {
+    process.umask(previousUmask)
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

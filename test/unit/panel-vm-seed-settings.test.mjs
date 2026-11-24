@@ -20,10 +20,11 @@ function seed(root, id) {
   )
 }
 
-function handler(project, { readBody = async () => ({}), proxyPool = {} } = {}) {
+function handler(project, { readBody = async () => ({}), proxyPool = {}, telemetryOps } = {}) {
   const response = {}
   const handlePanel = createPanelHandler({
     cfg: { paths: { project }, vm: { id: null } },
+    ...(telemetryOps ? { telemetryOps } : {}),
     requireAuth(req) {
       req.apiKeyKind = 'master'
       req.panelRole = 'admin'
@@ -260,6 +261,85 @@ test('PUT seed-settings preserves newer credentials, runtime and omitted policy 
     assert.equal(saved.timezone, 'Asia/Shanghai')
     assert.equal(fs.existsSync(path.join(root, 'vms', 'vm-01', 'cli-home', '.claude', 'kin-seed.json')), false)
   } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('PUT seed-settings surfaces upstream CRAG 409 message and reason without breaking claude_setting override', async () => {
+  const http = await import('node:http')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-crag-409-'))
+  const id = 'vm-01'
+  const runDir = path.join(root, 'vms', id, 'run')
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.writeFileSync(path.join(runDir, 'internal.token'), 'panel-seed-token')
+  fs.writeFileSync(
+    path.join(runDir, 'kernel.json'),
+    JSON.stringify({ vm_id: id, dataplane: 'crag', runtime_variant: 'crag-v2' }),
+  )
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'vms', `${id}.json`),
+    JSON.stringify({
+      id,
+      name: id,
+      status: 'running',
+      dataplane: 'crag',
+      crag_kernel_version: 'v2',
+      runtime: {
+        type: 'docker',
+        container: 'kin-01',
+        worker_run_dir: runDir,
+        kernel_socket: path.join(runDir, 'kernel.sock'),
+        worker_token_file: path.join(runDir, 'internal.token'),
+      },
+      seed_policy: { telemetry_disabled: true, claude_setting: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1' },
+    }),
+  )
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json')
+    if (req.url === '/internal/health') {
+      res.end(JSON.stringify({ ok: true, runtime_variant: 'crag-v2', crag_telemetry_apply_v1: true }))
+      return
+    }
+    if (req.url === '/internal/v1/telemetry/apply') {
+      res.writeHead(409).end(
+        JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'telemetry_native_settings_blocked',
+            reason: 'guest_source_invalid',
+            message: 'Native guest settings, telemetry allowlist or guest source prevent enabling telemetry',
+          },
+        }),
+      )
+      return
+    }
+    res.writeHead(404).end('{}')
+  })
+  await new Promise((resolve, reject) => server.once('error', reject).listen(path.join(runDir, 'kernel.sock'), resolve))
+  try {
+    const { handlePanel, response } = handler(root, {
+      readBody: async () => ({ telemetry_disabled: false, claude_setting: 'CUSTOM_OVERRIDE=kept' }),
+      telemetryOps: { retire: async () => ({ ok: true, running: true }) },
+    })
+    await handlePanel(
+      { method: 'PUT', url: `/api/panel/vms/${id}/seed-settings` },
+      {},
+      new URL(`http://localhost/api/panel/vms/${id}/seed-settings`),
+    )
+    assert.equal(response.status, 502)
+    assert.equal(response.body.error.code, 'telemetry_native_settings_blocked')
+    assert.equal(response.body.error.reason, 'guest_source_invalid')
+    assert.equal(
+      response.body.error.upstream_message,
+      'Native guest settings, telemetry allowlist or guest source prevent enabling telemetry',
+    )
+    assert.match(response.body.error.message, /Claude Code 槽内设置或 OS 特征阻止开启遥测/)
+    assert.match(response.body.error.message, /guest_source_invalid/)
+    assert.equal(response.body.data.claude_setting, 'CUSTOM_OVERRIDE=kept')
+    assert.equal(response.body.data.settings_json.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, undefined)
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
