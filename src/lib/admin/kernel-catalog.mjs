@@ -20,7 +20,9 @@ import { isReleaseTag } from './release.mjs'
 import {
   CRAG_V2_RELEASE_ASSET,
   fetchKernelReleaseMetadata,
+  geminiPayloadVersion,
   isCragPayloadTag,
+  isGeminiPayloadTag,
   openKernelReleaseAsset,
   selectCragV2Asset,
   selectKernelAsset,
@@ -879,6 +881,20 @@ export function cragReleasePin(projectRoot) {
   if (!isCragPayloadTag(tag)) return null
   const pinned = CRAG_PINNED_RELEASES.find((entry) => entry.tag === tag)
   return { tag, ...(pinned?.label ? { label: pinned.label } : {}) }
+}
+
+// The deployed release pins one CRAGGemini payload under geminiDefaultLinuxAmd64.
+// Expose its tag and version so the kernel page can display and target that pin.
+export function geminiReleasePin(projectRoot) {
+  let tag
+  try {
+    tag = releasePayload(projectRoot)?.geminiDefaultLinuxAmd64?.tag
+  } catch {
+    return null
+  }
+  if (!isGeminiPayloadTag(tag)) return null
+  const version = geminiPayloadVersion(tag)
+  return version ? { tag, version } : { tag }
 }
 
 export async function pullKernelRelease(

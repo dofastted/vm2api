@@ -90,6 +90,9 @@ SAFE_PATH = re.compile(r"/[A-Za-z0-9._/-]+")
 SAFE_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,63}")
 HEX = re.compile(r"[0-9a-f]{64}")
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+GEMINI_PAYLOAD_TAG = re.compile(
+    r"\Apayload-\d{4}\.\d{2}\.\d{2}-gemini-(\d+\.\d+\.\d+(?:-rc\.\d+)?)\Z"
+)
 MAX_MEMBER = 512 * 1024 * 1024
 
 
@@ -475,17 +478,60 @@ class SystemService:
             main = int(info.get("MainPID", "0")) if active else 0
             if not Path("/sys/fs/cgroup/cgroup.controllers").exists() and active:
                 raise fail("runtime_unreachable")
-            if group_path.exists():
+
+            def has_extra_procs():
+                if not group_path.exists():
+                    return False
                 for parent, _, _ in os.walk(
                     group_path, onerror=lambda error: (_ for _ in ()).throw(error)
                 ):
                     with (Path(parent) / "cgroup.procs").open() as processes:
                         if any(int(pid) != main for pid in processes if pid.strip()):
-                            raise fail("busy", 409)
+                            return True
+                return False
+
+            if group_path.exists():
+                if has_extra_procs():
+                    if active and self._quiesce_idle_pools():
+                        deadline = time.monotonic() + 5.0
+                        while has_extra_procs() and time.monotonic() < deadline:
+                            time.sleep(0.1)
+                    if has_extra_procs():
+                        raise fail("busy", 409)
             elif active:
                 raise fail("runtime_unreachable")
         except (OSError, ValueError):
             raise fail("runtime_unreachable") from None
+
+    def _quiesce_idle_pools(self):
+        """Ask an idle gemini-host to stop warm resident pools (never active requests)."""
+        client = UnixHTTP(self.runtime_socket)
+        try:
+            client.request(
+                "POST",
+                "/maintenance-quiesce",
+                b"{}",
+                {"Content-Type": "application/json"},
+            )
+            response = client.getresponse()
+            if response.status == 404:
+                return False
+            result = parse_json(response.read(256))
+            if (
+                response.status != 200
+                or not isinstance(result, dict)
+                or type(result.get("busy")) is not bool
+            ):
+                raise fail("runtime_unreachable")
+            if result["busy"]:
+                raise fail("busy", 409)
+            return True
+        except Failure:
+            raise
+        except (OSError, http.client.HTTPException, ValueError, RecursionError):
+            raise fail("runtime_unreachable") from None
+        finally:
+            client.close()
 
     def reload(self):
         command(["/usr/bin/systemctl", "daemon-reload"], 15, "systemd_reload_failed")
@@ -673,13 +719,27 @@ class Maintenance:
         finally:
             os.close(fd)
 
+    def resolve_release(self, release_id):
+        if release_id is None or release_id == self.release["id"]:
+            return {**self.release, "pinned": True}
+        if self.crag_bundle:
+            match = GEMINI_PAYLOAD_TAG.fullmatch(release_id)
+            if match:
+                return {
+                    "id": release_id,
+                    "version": match.group(1),
+                    "cli_version": self.release["cli_version"],
+                    "pinned": False,
+                }
+        raise fail("unknown_release", 400)
+
     def start_job(self, action, release_id):
         if action not in ACTIONS or (
             release_id is not None and action not in RELEASE_ACTIONS
         ):
             raise fail("invalid_action", 400)
-        if release_id is not None and release_id != self.release["id"]:
-            raise fail("unknown_release", 400)
+        if release_id is not None:
+            self.resolve_release(release_id)
         with self.guard:
             if self.job and self.job["status"] == "running":
                 raise fail("busy", 409)
@@ -893,15 +953,14 @@ class Maintenance:
             "rollback": rollback,
             "checks": checks,
             "job": job,
+            **({"supports_remote_releases": True} if self.crag_bundle else {}),
         }
 
-    def can_update(self, version, cli_version):
-        installed, target = version_order(version), version_order(
-            self.release["version"]
-        )
-        cli, target_cli = version_order(cli_version), version_order(
-            self.release["cli_version"]
-        )
+    def can_update(self, version, cli_version, target_version=None, target_cli_version=None):
+        installed = version_order(version)
+        target = version_order(target_version or self.release["version"])
+        cli = version_order(cli_version)
+        target_cli = version_order(target_cli_version or self.release["cli_version"])
         return (
             installed is not None
             and target is not None
@@ -1374,6 +1433,74 @@ class Maintenance:
         shutil.rmtree(source)
         return default, digest, members
 
+    def stage_release(self, release_id=None):
+        target = self.resolve_release(release_id)
+        if target["pinned"]:
+            return self.stage_pinned()
+        if sys.platform != "linux" or platform.machine() not in {"x86_64", "amd64"}:
+            raise fail("unsupported_host")
+        self.phase("fetching")
+        source = self.transaction / "source"
+        fetcher = self.bundle / "scripts/fetch-default-gemini.py"
+        for entry in (
+            fetcher,
+            self.descriptor,
+            *(self.bundle / name for name in VERIFIER_FILES),
+        ):
+            require_root(entry, stat.S_ISREG)
+        argv = [
+            "/usr/bin/python3",
+            "-I",
+            str(fetcher),
+            "--manifest",
+            str(self.descriptor),
+            "--dest",
+            str(source),
+            "--tag",
+            target["id"],
+        ]
+        existing_agy = self.current / "agy"
+        try:
+            require_root(existing_agy, stat.S_ISREG)
+            argv.extend(["--reuse-agy", str(existing_agy)])
+        except (OSError, ValueError):
+            pass
+        command(argv, 600, "fetch_failed")
+        self.phase("verifying")
+        pubkey_pin = self.pins["crag-license-public.pem"]
+        if not hash_pin(source / "crag-license-public.pem", pubkey_pin):
+            raise fail("payload_pin_mismatch")
+        key = source / "crag-license-public.pem"
+        candidate = self.transaction / "payload"
+        if self.verify(source, key, self.bundle, dest=candidate) != target["version"]:
+            raise fail("release_payload_mismatch")
+        manifest_raw = read_root(candidate / "manifest.json", 65536)
+        digest = hashlib.sha256(manifest_raw).hexdigest()
+        manifest = parse_json(manifest_raw)
+        members = {
+            name: (
+                require_root(candidate / name, stat.S_ISREG).st_size,
+                sha_hex,
+            )
+            for name, sha_hex in manifest["sha256"].items()
+        }
+        defaults = self.runtime / "defaults"
+        root_dir(defaults, 0o700)
+        default = defaults / digest
+        root_dir(default, 0o700)
+        if exists(default / "crag-license-public.pem"):
+            if not hash_pin(default / "crag-license-public.pem", pubkey_pin):
+                raise fail("default_trust_conflict")
+        else:
+            copy_file(
+                source / "crag-license-public.pem",
+                default / "crag-license-public.pem",
+                0o644,
+                pin=pubkey_pin,
+            )
+        shutil.rmtree(source)
+        return default, digest, members
+
     def backup_record(self):
         value = parse_json(read_root(self.backup / "good.json", 4096))
         if (
@@ -1539,11 +1666,22 @@ class Maintenance:
             elif action in {"update_cli", "update_native"}:
                 if current is None:
                     raise fail("update_requires_valid_payload", 409)
-                if not self.can_update(current["version"], current["cli_version"]):
+                target = self.resolve_release(release_id)
+                if not self.can_update(
+                    current["version"],
+                    current["cli_version"],
+                    target["version"],
+                    target["cli_version"],
+                ):
                     raise fail("downgrade_blocked", 409)
-                if current["digest"] == self.pins["manifest.json"]["sha256"]:
+                if (
+                    target["pinned"]
+                    and current["digest"] == self.pins["manifest.json"]["sha256"]
+                ):
                     return
-                default, _, members = self.stage_pinned()
+                default, staged_digest, members = self.stage_release(target["id"])
+                if current["digest"] == staged_digest:
+                    return
                 if action == "update_cli" and any(
                     members[m] != current["members"][m]
                     for m in ("craggemini", "libagy_bridge.so")
@@ -1554,6 +1692,7 @@ class Maintenance:
                 preserve_runtime = False
                 verifier_root = self.bundle
             elif current is None:
+                target = self.resolve_release(release_id)
                 pinned_digest = self.pins["manifest.json"]["sha256"]
                 source = options.get("--payload-source")
                 materialized = False
@@ -1574,7 +1713,9 @@ class Maintenance:
                     verifier_root = candidate["verifier_root"]
                     materialized = True
                 if not materialized:
-                    if current_id is not None and digest != pinned_digest:
+                    if current_id is not None and (
+                        not target["pinned"] or digest != pinned_digest
+                    ):
                         raise fail("repair_release_unknown", 409)
                     if current_id is None:
                         # A missing custom payload may not be silently replaced by a
@@ -1598,7 +1739,7 @@ class Maintenance:
                             )
                             if configured["manifest_sha256"] != pinned_digest:
                                 raise fail("repair_release_unknown", 409)
-                    default, _, _ = self.stage_pinned()
+                    default, _, _ = self.stage_release(target["id"])
                     target_unit = self.write_unit(before, default)
                     if current_id is None:
                         new_activation = None

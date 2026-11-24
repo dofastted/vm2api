@@ -202,3 +202,28 @@ test('permission and transient failures do not request a root bootstrap', async 
     assert.deepEqual(result.body.data, { available: false, bootstrap_required: false, code })
   }
 })
+
+test('remote release capability flag and install release_id pass through cleanly', async () => {
+  const seen = []
+  const handler = createGeminiMaintenanceHandler({
+    json,
+    readBody: async (req) => req.body,
+    callMaintenance: async (op, body) => {
+      seen.push([op, body])
+      return { ...base, supports_remote_releases: true }
+    },
+  })
+  const status = await handler({ method: 'GET' }, response, root)
+  assert.equal(status.status, 200)
+  assert.equal(status.body.data.supports_remote_releases, true)
+  const install = await handler(
+    { method: 'POST', body: { action: 'install', release_id: 'payload-2026.11.24-gemini-0.4.6' } },
+    response,
+    root + '/jobs',
+  )
+  assert.equal(install.status, 200)
+  assert.deepEqual(seen, [
+    ['status', {}],
+    ['jobs', { action: 'install', release_id: 'payload-2026.11.24-gemini-0.4.6' }],
+  ])
+})

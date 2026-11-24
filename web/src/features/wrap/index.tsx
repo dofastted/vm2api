@@ -32,12 +32,15 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
+import { geminiInventoryOptions } from '@/features/import/gemini-environments'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import { maintenanceQueryOptions } from '@/features/settings/gemini-maintenance'
 import {
   CragRuntimeCounts,
   CragRuntimeDetail,
 } from '@/features/vm/crag-runtime-counts'
 import { cragHostStatusQueryOptions } from '@/features/vm/queries'
+import { CragGeminiKernelRow } from './craggemini-row'
 import { KernelLicenseDialog } from './license-dialog'
 import {
   installKernelTargets,
@@ -422,7 +425,7 @@ export function WrapSamplePage() {
   return (
     <PageHeader
       title='内核'
-      description='可拉取最新或指定版本。拉取只更新缓存；确认重装后才应用到 VM。'
+      description='可拉取、安装或更新 cli-node、CRAG 与 CRAGGemini 内核；拉取只更新缓存，确认后才应用。'
       extra={
         <Button
           variant='ghost'
@@ -431,7 +434,15 @@ export function WrapSamplePage() {
           onClick={() => {
             void catalog.refetch()
             void dashboard.refetch()
-            if (canEdit) void cragHost.refetch()
+            if (canEdit) {
+              void cragHost.refetch()
+              void qc.refetchQueries?.({
+                queryKey: maintenanceQueryOptions.queryKey,
+              })
+              void qc.refetchQueries?.({
+                queryKey: geminiInventoryOptions().queryKey,
+              })
+            }
           }}
         >
           <RefreshCw aria-hidden='true' />
@@ -652,6 +663,18 @@ export function WrapSamplePage() {
                 </div>
               </div>
             ))}
+            <CragGeminiKernelRow
+              canEdit={canEdit}
+              parentBusy={busy}
+              geminiPin={catalog.data?.gemini_pin}
+              remoteVersions={versions.data?.craggemini}
+              versionsFetching={versions.isFetching}
+              versionsError={versions.isError}
+              onOpenVersionMenu={() => {
+                if (versions.isError) void versions.refetch()
+                setVersionMenuOpened(true)
+              }}
+            />
           </section>
 
           <section aria-labelledby='kernel-vms-heading' className='space-y-3'>
