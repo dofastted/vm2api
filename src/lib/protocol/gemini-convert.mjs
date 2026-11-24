@@ -45,6 +45,9 @@ const SIG_END = '__'
 const NAME_LEAD = '_x_'
 const GEMINI_NS = 'default_api'
 const INTERRUPTED_TOOL_NOTE = '[The result of this tool call is unavailable: the turn was interrupted.]'
+const TRANSIT_DEFENSE_FALLBACK_TEXT = '.'
+const EMPTY_TOOL_OK_TEXT = 'Command executed successfully.'
+const EMPTY_TOOL_ERR_TEXT = 'Tool execution failed with no output.'
 const MAX_NATIVE_TEXT_BYTES = 256 * 1024
 const MAX_SESSION_TEXT_BYTES = 4096
 
@@ -226,13 +229,116 @@ function parseJsonObjectArgs(raw) {
   return {}
 }
 
+const FENCED_CODE_BLOCK_RE = /```[\s\S]*?```/g
+const ANSI_ESCAPE_RE = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))/g
+const ILLEGAL_CONTROL_RE = /[^\P{Cc}\n\r\t]/gu
+const LEADING_SLASH_TOKEN_RE = /(^|\p{White_Space})(\/+)/gu
+
+function isPlaceholderText(text, { allowEllipsis = false } = {}) {
+  if (typeof text !== 'string') return true
+  const trimmed = text.trim()
+  if (!trimmed || trimmed === '(no content)' || trimmed === '·' || trimmed === '[undefined]') return true
+  if (allowEllipsis && trimmed === '...') return true
+  return false
+}
+
+function isBillingHeaderLine(line) {
+  const trimmed = line.trim().toLowerCase()
+  if (!trimmed) return false
+  if (/^(?:x-[a-z0-9_-]*billing[a-z0-9_-]*|[a-z0-9_-]+-billing-(?:header|metadata|token|info)):/.test(trimmed)) {
+    return true
+  }
+  if (/^x-[a-z0-9_-]+:/.test(trimmed) && /(?:cc_version=|cch=|cc_entrypoint=)/.test(trimmed)) {
+    return true
+  }
+  return trimmed.includes('cc_version=') && trimmed.includes('cch=')
+}
+
+function stripBillingSegment(segment) {
+  const lines = segment.split('\n')
+  let removed = false
+  const kept = lines.filter((line) => {
+    if (isBillingHeaderLine(line)) {
+      removed = true
+      return false
+    }
+    return true
+  })
+  if (!removed) return { text: segment, removed: false }
+  return { text: kept.join('\n').replace(/\n{3,}/g, '\n\n'), removed: true }
+}
+
 function stripAnthropicBillingLines(text) {
   if (!text) return ''
-  return text
-    .split('\n')
-    .filter((line) => !line.trimStart().toLowerCase().startsWith('x-anthropic-billing-header:'))
-    .join('\n')
-    .trim()
+  let anyRemoved = false
+  let out = ''
+  let lastIndex = 0
+  FENCED_CODE_BLOCK_RE.lastIndex = 0
+  for (const match of text.matchAll(FENCED_CODE_BLOCK_RE)) {
+    const before = text.slice(lastIndex, match.index)
+    const cleaned = stripBillingSegment(before)
+    if (cleaned.removed) anyRemoved = true
+    out += cleaned.text + match[0]
+    lastIndex = match.index + match[0].length
+  }
+  const tail = stripBillingSegment(text.slice(lastIndex))
+  if (tail.removed) anyRemoved = true
+  out += tail.text
+  return anyRemoved ? out.trim() : text
+}
+
+/**
+ * Strip ANSI escape sequences and illegal Unicode Cc control characters (keeping \n, \r, \t)
+ * and repair lone UTF-16 surrogates so CRAGGemini (`valid_text` / `valid_system_prompt`)
+ * and `gemini-host.py` never reject pasted terminal logs or binary artifacts.
+ */
+export function stripIllegalControlChars(text) {
+  if (typeof text !== 'string' || !text) return ''
+  return text.toWellFormed().replace(ANSI_ESCAPE_RE, '').replace(ILLEGAL_CONTROL_RE, '')
+}
+
+/**
+ * Neutralize whitespace-preceded `/` tokens (e.g. `/etc/hosts`, `/v1/messages`, `// comment`,
+ * `a / b`, `/help`) with a non-whitespace, non-control zero-width separator (`U+200B`) so
+ * CRAGGemini's `valid_text` and `agy`'s TUI slash-command parser treat them as ordinary text
+ * without altering path semantics.
+ */
+export function escapeNativeTuiSlashes(text) {
+  if (typeof text !== 'string' || !text) return ''
+  return text.replace(LEADING_SLASH_TOKEN_RE, '$1\u200B$2')
+}
+
+export function sanitizeNativeTuiText(text) {
+  return escapeNativeTuiSlashes(stripIllegalControlChars(text))
+}
+
+function sanitizeNativeTuiResponseValue(value, depth = 0) {
+  if (depth > 16) return value
+  if (typeof value === 'string') return sanitizeNativeTuiText(value)
+  if (Array.isArray(value)) return value.map((item) => sanitizeNativeTuiResponseValue(item, depth + 1))
+  if (isPlainObject(value)) {
+    const out = {}
+    for (const [k, v] of Object.entries(value)) {
+      if (v === '[undefined]') continue
+      out[k] = sanitizeNativeTuiResponseValue(v, depth + 1)
+    }
+    return out
+  }
+  return value
+}
+
+function cleanUndefinedStrings(value, depth = 0) {
+  if (depth > 10) return value
+  if (Array.isArray(value)) return value.map((item) => cleanUndefinedStrings(item, depth + 1))
+  if (isPlainObject(value)) {
+    const out = {}
+    for (const [k, v] of Object.entries(value)) {
+      if (v === '[undefined]') continue
+      out[k] = cleanUndefinedStrings(v, depth + 1)
+    }
+    return out
+  }
+  return value
 }
 
 function geminiGeneration(model) {
@@ -992,24 +1098,26 @@ function parseOpenAIChatInbound(body, { headers }) {
     } else if (raw.role === 'tool' || raw.role === 'function') {
       const { id } = unsignedToolCallId(raw.tool_call_id || raw.id || newCallId())
       const contentParts = extractParts(raw.content)
-      const text = contentParts
-        .filter((p) => p.kind === 'text')
-        .map((p) => p.text)
-        .join('\n')
-      const images = contentParts.filter((p) => p.kind === 'image')
-      messages.push({
-        role: 'user',
-        parts: [
-          {
-            kind: 'tool_result',
-            callId: id,
-            name: typeof raw.name === 'string' ? raw.name : '',
-            text,
-            isError: raw.is_error === true || raw.isError === true,
-            images,
-          },
-        ],
-      })
+    const text = contentParts
+      .filter((p) => p.kind === 'text')
+      .map((p) => p.text)
+      .join('\n')
+    const images = contentParts.filter((p) => p.kind === 'image')
+    const isError = raw.is_error === true || raw.isError === true
+    const finalText = !text.trim() && !images.length ? (isError ? EMPTY_TOOL_ERR_TEXT : EMPTY_TOOL_OK_TEXT) : text
+    messages.push({
+      role: 'user',
+      parts: [
+        {
+          kind: 'tool_result',
+          callId: id,
+          name: typeof raw.name === 'string' ? raw.name : '',
+          text: finalText,
+          isError,
+          images,
+        },
+      ],
+    })
     } else {
       throw makeProtocolError(400, 'gemini_invalid_request', `Unsupported message role: ${raw.role}`)
     }
@@ -1189,9 +1297,10 @@ function parseOpenAIResponsesInbound(body, { headers }) {
                   .join('\n')
               : JSON.stringify(item.output ?? '')
         const images = Array.isArray(item.output) ? extractItemParts(item.output).filter((p) => p.kind === 'image') : []
+        const finalOut = !out.trim() && !images.length ? EMPTY_TOOL_OK_TEXT : out
         messages.push({
           role: 'user',
-          parts: [{ kind: 'tool_result', callId: id, name: item.name || '', text: out, isError: false, images }],
+          parts: [{ kind: 'tool_result', callId: id, name: item.name || '', text: finalOut, isError: false, images }],
         })
       } else if (item.type === 'reasoning') {
         // Ignore replayed reasoning blocks; Gemini rejects foreign thought blocks.
@@ -1340,13 +1449,38 @@ function parseAnthropicInbound(body, { headers }) {
     return null
   }
 
+  const extraSystemParts = []
+  let inLeadingSystem = true
   for (const raw of body.messages) {
-    if (!isPlainObject(raw) || !['user', 'assistant'].includes(raw.role)) {
+    if (!isPlainObject(raw) || !['user', 'assistant', 'system'].includes(raw.role)) {
       throw makeProtocolError(400, 'gemini_invalid_request', 'Anthropic message role must be user or assistant.')
     }
+    if (raw.role === 'system') {
+      const sysText =
+        typeof raw.content === 'string'
+          ? raw.content
+          : Array.isArray(raw.content)
+            ? raw.content
+                .map((b) => (isPlainObject(b) && b.type === 'text' && typeof b.text === 'string' ? b.text : ''))
+                .filter(Boolean)
+                .join('\n')
+            : ''
+      if (sysText.trim()) {
+        if (inLeadingSystem) {
+          extraSystemParts.push(sysText)
+        } else {
+          messages.push({
+            role: 'user',
+            parts: [{ kind: 'text', text: `<system-reminder>\n${sysText.trim()}\n</system-reminder>`, signature: '' }],
+          })
+        }
+      }
+      continue
+    }
+    inLeadingSystem = false
     const parts = []
     if (typeof raw.content === 'string') {
-      if (raw.content) parts.push({ kind: 'text', text: raw.content, signature: '' })
+      if (!isPlaceholderText(raw.content)) parts.push({ kind: 'text', text: raw.content, signature: '' })
     } else if (Array.isArray(raw.content)) {
       for (const block of raw.content) {
         if (!isPlainObject(block))
@@ -1355,7 +1489,9 @@ function parseAnthropicInbound(body, { headers }) {
           if (typeof block.text !== 'string') {
             throw makeProtocolError(400, 'gemini_invalid_request', 'text block requires string text.')
           }
-          parts.push({ kind: 'text', text: block.text, signature: '' })
+          if (!isPlaceholderText(block.text)) {
+            parts.push({ kind: 'text', text: block.text, signature: '' })
+          }
         } else if (block.type === 'image') {
           const media = parseAnthropicSource(block.source, 'image/png')
           if (!media) throw makeProtocolError(400, 'gemini_invalid_request', 'Invalid Anthropic image source.')
@@ -1391,11 +1527,22 @@ function parseAnthropicInbound(body, { headers }) {
               }
             }
             text = chunks.join('\n')
+          } else if (block.content != null) {
+            text = JSON.stringify(block.content)
           }
-          parts.push({ kind: 'tool_result', callId: id, name: '', text, isError: block.is_error === true, images })
+          const isError = block.is_error === true
+          if (!text.trim() && !images.length && !extraFiles.length) {
+            text = isError ? EMPTY_TOOL_ERR_TEXT : EMPTY_TOOL_OK_TEXT
+          }
+          parts.push({ kind: 'tool_result', callId: id, name: '', text, isError, images })
           for (const f of extraFiles) parts.push(f)
-        } else if (block.type === 'thinking' || block.type === 'redacted_thinking') {
-          // Do not send foreign thinking back to Gemini.
+        } else if (
+          block.type === 'thinking' ||
+          block.type === 'redacted_thinking' ||
+          block.type === 'server_tool_use' ||
+          block.type === 'web_search_tool_result'
+        ) {
+          // Do not send foreign thinking or server tool replay blocks back to Gemini.
         } else {
           throw makeProtocolError(
             400,
@@ -1408,6 +1555,9 @@ function parseAnthropicInbound(body, { headers }) {
       throw makeProtocolError(400, 'gemini_invalid_request', 'Anthropic message content must be a string or array.')
     }
     if (parts.length) messages.push({ role: raw.role, parts })
+  }
+  if (extraSystemParts.length) {
+    system = [system, ...extraSystemParts].filter(Boolean).join('\n\n')
   }
 
   let webSearch = false
@@ -1558,21 +1708,45 @@ function isValidNativeTuiText(text) {
  * Determine which backend capabilities an IR turn requires.
  * Ensures restricted `native_tui` slots (`craggemini`) never silently drop
  * caller system instructions, history, tools, generation parameters, or media.
+ *
+ * `unsupportedFields` names the caller-visible fields behind each capability.
+ * Without it the 400 can only say the turn is unsupported, not which field made
+ * it so, and the caller has to bisect their own payload to find out (#1703).
  */
 export function classifyGeminiCapabilities(ir) {
   const required = new Set()
-  if (ir.system && ir.system.trim()) required.add('system_instruction')
-  if (ir.messages.length !== 1 || ir.messages[0]?.role !== 'user') required.add('multi_turn')
-  if (ir.tools.length > 0 || ir.webSearch || ir.googleTools.length > 0 || ir.toolChoice) required.add('tools')
-  if (
-    Object.keys(ir.generationConfig || {}).length > 0 ||
-    Object.keys(ir.extraGenConfig || {}).length > 0 ||
-    ir.thinking != null ||
-    ir.responseFormat != null ||
-    ir.safetySettings != null ||
-    ir.cachedContent != null
-  ) {
+  const fields = new Set()
+  if (ir.system && ir.system.trim()) {
+    required.add('system_instruction')
+    fields.add('systemInstruction')
+  }
+  if (ir.messages.length !== 1 || ir.messages[0]?.role !== 'user') {
+    required.add('multi_turn')
+    fields.add('contents')
+  }
+  if (ir.tools.length > 0 || ir.webSearch || ir.googleTools.length > 0 || ir.toolChoice) {
+    required.add('tools')
+    fields.add(ir.tools.length > 0 || ir.webSearch || ir.googleTools.length > 0 ? 'tools' : 'toolConfig')
+  }
+  const genConfig = []
+  if (Object.keys(ir.generationConfig || {}).length > 0) genConfig.push('generationConfig')
+  if (Object.keys(ir.extraGenConfig || {}).length > 0) genConfig.push('generationConfig')
+  if (ir.thinking != null) genConfig.push('generationConfig.thinkingConfig')
+  if (ir.responseFormat != null) genConfig.push('generationConfig.responseSchema')
+  // A field the caller sent but left empty requests nothing, so it must not pull in
+  // a capability: `safetySettings: []` and `cachedContent: ''` carry no configuration,
+  // yet a presence test pushed such a turn off the plain-text path and the scheduler
+  // then answered 400 for a turn the native transport could serve (#1703). The
+  // non-empty tests used for `generationConfig` above were already the right shape.
+  if (Array.isArray(ir.safetySettings) ? ir.safetySettings.length > 0 : ir.safetySettings != null) {
+    genConfig.push('safetySettings')
+  }
+  if (typeof ir.cachedContent === 'string' ? ir.cachedContent.length > 0 : ir.cachedContent != null) {
+    genConfig.push('cachedContent')
+  }
+  if (genConfig.length > 0) {
     required.add('generation_config')
+    for (const name of genConfig) fields.add(name)
   }
   let plainText = ''
   if (ir.messages.length === 1 && ir.messages[0].role === 'user') {
@@ -1582,19 +1756,24 @@ export function classifyGeminiCapabilities(ir) {
         pieces.push(part.text)
       } else if (part.kind === 'image' || part.kind === 'file') {
         required.add('multimodal')
+        fields.add(part.kind === 'image' ? 'contents[].inlineData' : 'contents[].fileData')
       } else if (part.kind === 'tool_call' || part.kind === 'tool_result') {
         required.add('tools')
+        fields.add('contents[].functionCall')
       } else {
         required.add('thinking')
+        fields.add('contents[].thought')
       }
     }
     plainText = pieces.join('')
   }
   if (required.size === 0 && !isValidNativeTuiText(plainText)) {
     required.add('full_gemini_api')
+    fields.add('contents[].text')
   }
   return {
     requiredCapabilities: [...required],
+    unsupportedFields: [...fields],
     nativeTuiCompatible: required.size === 0,
     plainText: required.size === 0 ? plainText : null,
   }
@@ -1704,6 +1883,70 @@ function buildThinkingConfig(ir, model) {
   return tc
 }
 
+function isSubstantiveTurnPart(part, { allowEllipsis = false } = {}) {
+  if (!isPlainObject(part)) return false
+  if (part.functionCall || part.functionResponse || part.inlineData || part.fileData) return true
+  if (typeof part.text === 'string') return !isPlaceholderText(part.text, { allowEllipsis })
+  return false
+}
+
+/**
+ * Antigravity-Manager transit defense: guarantee valid non-empty contents ending
+ * with a substantive user (or tool functionResponse) turn, and satisfy CRAGGemini's
+ * non-empty delta invariants when `target === 'antigravity'`.
+ */
+function ensureGeminiContentsValid(contents, { antigravity = false } = {}) {
+  const out = contents.filter((turn) => Array.isArray(turn?.parts) && turn.parts.length > 0)
+  if (!out.length) {
+    out.push({ role: 'user', parts: [{ text: TRANSIT_DEFENSE_FALLBACK_TEXT }] })
+    return out
+  }
+  if (out[0].role === 'model') {
+    out.unshift({ role: 'user', parts: [{ text: '[Continuing from previous AI thoughts...]' }] })
+  }
+  for (let i = 0; i < out.length - 1; i++) {
+    if (!out[i].parts.length) {
+      out[i].parts.push({ text: out[i].role === 'model' ? '...' : TRANSIT_DEFENSE_FALLBACK_TEXT })
+    }
+  }
+  while (out.length && out[out.length - 1].role === 'model') {
+    const last = out[out.length - 1]
+    if (hasFunctionResponse(last.parts)) break
+    const hasSubstantive = last.parts.some((part) => isSubstantiveTurnPart(part, { allowEllipsis: true }))
+    if (!hasSubstantive) {
+      out.pop()
+      continue
+    }
+    out.push({ role: 'user', parts: [{ text: 'Continue.' }] })
+    break
+  }
+  if (!out.length) {
+    out.push({ role: 'user', parts: [{ text: TRANSIT_DEFENSE_FALLBACK_TEXT }] })
+    return out
+  }
+  const last = out[out.length - 1]
+  if (last.role === 'user') {
+    const hasSubstantive = last.parts.some((part) => isSubstantiveTurnPart(part))
+    if (!hasSubstantive) {
+      last.parts = [{ text: TRANSIT_DEFENSE_FALLBACK_TEXT }]
+    } else if (antigravity) {
+      const hasNonEmptyText = last.parts.some(
+        (part) => part.thought !== true && typeof part.text === 'string' && !isPlaceholderText(part.text),
+      )
+      const hasInlineMedia = last.parts.some((part) => part.inlineData != null)
+      const hasFileMedia = last.parts.some((part) => part.fileData != null)
+      const hasFr = hasFunctionResponse(last.parts)
+      // CRAGGemini's single-message build_delta reads `messages[0].text` directly; ensure
+      // non-empty text when a single-turn payload only has functionResponse, or when the
+      // trailing user turn only carries fileData URLs (which CRAGGemini does not stage as inline media).
+      if (!hasNonEmptyText && !hasInlineMedia && ((out.length === 1 && hasFr) || (hasFileMedia && !hasFr))) {
+        last.parts.push({ text: hasFileMedia && !hasFr ? 'Inspect the attached media.' : 'Continue.' })
+      }
+    }
+  }
+  return out
+}
+
 /**
  * Build a canonical Google Gemini `generateContent` request body from IR.
  * `target`: `'gemini'` (Google Gemini API) or `'antigravity'` (Antigravity / Code Assist).
@@ -1722,11 +1965,15 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
     for (const p of msg.parts) {
       if (p.kind === 'thinking') {
         if (p.signature && !claude) {
-          parts.push({ text: p.text || '', thought: true, thoughtSignature: p.signature })
+          const thoughtText = ag ? sanitizeNativeTuiText(p.text || '') : p.text || ''
+          parts.push({ text: thoughtText, thought: true, thoughtSignature: p.signature })
         }
       } else if (p.kind === 'text') {
-        if (p.text || (p.signature && !claude)) {
-          const part = { text: p.text || '' }
+        let text = stripAnthropicBillingLines(p.text || '')
+        if (ag) text = sanitizeNativeTuiText(text)
+        const substantive = !isPlaceholderText(text)
+        if (substantive || (p.signature && !claude)) {
+          const part = { text: substantive ? text : '' }
           if (p.signature && !claude) part.thoughtSignature = p.signature
           parts.push(part)
         }
@@ -1736,7 +1983,7 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
       } else if (p.kind === 'tool_call') {
         const safeName = geminiFuncName(p.name)
         if (p.id) callNames.set(p.id, safeName)
-        const fnCall = { name: safeName, args: isPlainObject(p.args) ? p.args : {} }
+        const fnCall = { name: safeName, args: isPlainObject(p.args) ? cleanUndefinedStrings(p.args) : {} }
         if (p.id) fnCall.id = ag ? p.id.replace(/[^a-zA-Z0-9_-]/g, '_') : p.id
         const part = { functionCall: fnCall }
         if (claude) part.thoughtSignature = SKIP_THOUGHT_SIGNATURE
@@ -1746,7 +1993,15 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
       } else if (p.kind === 'tool_result') {
         const safeName = geminiFuncName(p.name || callNames.get(p.callId) || 'tool')
         const key = ag ? 'result' : p.isError ? 'error' : 'output'
-        const fr = { name: safeName, response: { [key]: p.text || '' } }
+        let resultText = typeof p.text === 'string' ? p.text : ''
+        if (ag) resultText = sanitizeNativeTuiText(resultText)
+        if (!resultText.trim() && !(Array.isArray(p.images) && p.images.length)) {
+          resultText = p.isError ? EMPTY_TOOL_ERR_TEXT : EMPTY_TOOL_OK_TEXT
+        }
+        const fr = {
+          name: safeName,
+          response: ag ? sanitizeNativeTuiResponseValue({ [key]: resultText }) : { [key]: resultText },
+        }
         if (p.callId) fr.id = ag ? p.callId.replace(/[^a-zA-Z0-9_-]/g, '_') : p.callId
         parts.push({ functionResponse: fr })
         if (Array.isArray(p.images)) {
@@ -1783,16 +2038,13 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
     }
   }
 
-  const paired = pairFunctionTurns(contents, { responseKey: ag ? 'result' : 'output' })
-  if (paired.length && paired[0].role === 'model') {
-    paired.unshift({ role: 'user', parts: [{ text: '[Continuing from previous AI thoughts...]' }] })
-  }
-  if (paired.length && paired[paired.length - 1].role === 'model') {
-    paired.push({ role: 'user', parts: [{ text: 'Continue.' }] })
-  }
+  const paired = ensureGeminiContentsValid(pairFunctionTurns(contents, { responseKey: ag ? 'result' : 'output' }), {
+    antigravity: ag,
+  })
 
   const req = { contents: paired }
-  const cleanedSystem = stripAnthropicBillingLines(ir.system || '')
+  let cleanedSystem = stripAnthropicBillingLines(ir.system || '').trim()
+  if (ag && cleanedSystem) cleanedSystem = stripIllegalControlChars(cleanedSystem).trim()
   if (cleanedSystem) {
     req.systemInstruction = { parts: [{ text: cleanedSystem }] }
   }

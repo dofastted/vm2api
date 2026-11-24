@@ -410,6 +410,75 @@ test('CRAG capability-aware admission routes rich turns away from restricted slo
   )
   assert.equal(res4.statusCode, 200)
   assert.deepEqual(inferTargets, ['env-apikey', 'env-oauth-legacy', 'env-oauth-craggemini'])
+
+  // Single-turn request containing slash paths and ANSI control chars succeeds on modern CRAGGemini
+  // after target-specific sanitization, while legacy restricted native_tui still rejects it.
+  const capturedBodies = []
+  const sanitizedScheduler = createGeminiScheduler({
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') {
+        const found = envs.find((e) => e.id === payload.id)
+        return { id: found.id, proxy_id: found.proxy_id, auth_method: found.auth_method }
+      }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: async (_op, payload) => {
+      capturedBodies.push(payload.body)
+      return sseResponse([
+        `data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: 'sanitized-ok' }] }, finishReason: 'STOP' }] })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://1.2.3.4:1080',
+    poolScheduler: makeCircuitTracker(),
+  })
+  const sanitizedHandler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler: sanitizedScheduler,
+  })
+  const res5 = makeRes()
+  await sanitizedHandler(
+    makeReq({
+      url: '/v1/messages',
+      body: {
+        model: 'gemini-2.5-flash',
+        messages: [{ role: 'user', content: 'Inspect /etc/hosts and \x1b[31m/var/log/syslog\x1b[0m' }],
+      },
+    }),
+    res5,
+  )
+  assert.equal(res5.statusCode, 200)
+  assert.equal(capturedBodies.length, 1)
+  const sentText = capturedBodies[0].contents[0].parts[0].text
+  assert.equal(/[^\P{Cc}\n\r\t]/u.test(sentText), false)
+  assert.equal(sentText.split(/\p{White_Space}+/u).some((w) => w.startsWith('/')), false)
+
+  // Legacy restricted native_tui environment still fails closed for raw slash text.
+  envs = [
+    {
+      id: 'env-oauth-legacy',
+      proxy_id: 'proxy-1',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      models_discovered: true,
+      models: ['gemini-2.5-flash'],
+      capabilities: [...legacyRestrictedCaps],
+    },
+  ]
+  const res6 = makeRes()
+  await sanitizedHandler(
+    makeReq({
+      url: '/v1/messages',
+      body: {
+        model: 'gemini-2.5-flash',
+        messages: [{ role: 'user', content: 'please run /quit' }],
+      },
+    }),
+    res6,
+  )
+  assert.equal(res6.statusCode, 400)
+  assert.equal(res6.jsonBody().error.code, 'gemini_unsupported_turn')
 })
 
 test('error handling: circuit breaker, pre-stream vs mid-stream errors, and disconnect infer-cancel', async () => {

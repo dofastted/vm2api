@@ -623,6 +623,7 @@ export function createGeminiScheduler({
       geminiBody,
       targetBodyFor = null,
       requiredCapabilities = [],
+      unsupportedFields = [],
       plainText = null,
       requestId = `gem_${crypto.randomBytes(12).toString('hex')}`,
       stickyKey = null,
@@ -672,8 +673,13 @@ export function createGeminiScheduler({
             catalog.accounts.length ? 'gemini_model_unavailable' : 'gemini_no_account',
           )
         }
+        const canTransformForNative = Boolean(streamHost && targetBodyFor)
         const capableAccounts = matchedAccounts.filter(({ account }) =>
-          requiredCapabilities.every((cap) => account.capabilities.has(cap)),
+          requiredCapabilities.every(
+            (cap) =>
+              account.capabilities.has(cap) ||
+              (cap === 'full_gemini_api' && canTransformForNative && account.capabilities.has('multi_turn')),
+          ),
         )
         if (!capableAccounts.length) {
           throw fail(
@@ -827,7 +833,17 @@ export function createGeminiScheduler({
               }
             } else {
               if (plainText == null) {
-                throw fail(400, 'gemini_unsupported_turn', 'This Gemini host transport only supports plain-text turns.')
+                // Name the fields, not just the verdict: this transport carries a
+                // prompt string and nothing else, so the caller's only way forward
+                // is to drop the offending field, and they cannot do that from
+                // "unsupported turn" alone (#1703).
+                const offending = unsupportedFields.join(', ')
+                const detail = offending ? `; unsupported in this request: ${offending}` : ''
+                throw fail(
+                  400,
+                  'gemini_unsupported_turn',
+                  `This Gemini host transport only supports plain-text turns${detail}.`,
+                )
               }
               const started = await callHost('test-chat', {
                 id,
