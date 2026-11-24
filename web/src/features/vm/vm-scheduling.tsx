@@ -458,7 +458,7 @@ export function VmSchedulingBlock({
               own={vm.max_subagents_per_session_override}
               title={
                 vm.max_subagents_per_session_override
-                  ? `本槽钉住, 全局 ${inherited?.max_subagents_per_session ?? '关闭'}`
+                  ? `本槽钉住；全局 ${inherited?.max_subagents_per_session ?? '关闭'}`
                   : vm.max_subagents_per_session == null
                     ? '跟随全局；全局留空时关闭家族模式'
                     : `跟随全局；每个主会话最多 ${vm.max_subagents_per_session} 个`
@@ -684,7 +684,7 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
               {codex ? null : (
                 <KnobRow
                   label='席位上限'
-                  desc='家族模式下, 主会话与子代理共同使用本 VM 的物理执行位.'
+                  desc='默认控制同时占用的客户端会话席位数（回合结束即让位）；开启家族模式时，主会话与子代理共同占用本 VM 的物理执行位。'
                   inheritedText={String(inherited?.session_slots ?? '—')}
                   own={draft.seats.own}
                   onOwnChange={(own) =>
@@ -719,7 +719,7 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
                   label='主会话上限'
                   desc='家族模式下每台 VM 同时占用的根会话席位数。留空全局时默认跟随物理席位上限。'
                   inheritedText={String(
-                    inherited?.max_primary_sessions ?? draft.primary.value
+                    inherited?.max_primary_sessions ?? vm.session_slots ?? '—'
                   )}
                   own={draft.primary.own}
                   onOwnChange={(own) =>
@@ -745,7 +745,7 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
               {codex ? null : (
                 <KnobRow
                   label='每会话子代理上限'
-                  desc='0 表示子代理在根 VM 排队直至超时. 全局留空时默认关闭.'
+                  desc='开启家族模式后限制每个主会话并发的子代理数；0 表示子代理在根 VM 排队直至超时，全局留空时默认关闭家族模式。'
                   inheritedText={
                     inherited?.max_subagents_per_session == null
                       ? '关闭(子代理各占一个席位)'

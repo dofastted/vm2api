@@ -1489,10 +1489,7 @@ test('Gemini scheduler allows 10 concurrent slots on acc1 with strict per-accoun
       assert.equal(op, 'infer')
       assert.equal(payload.id, 'gemini-acc1')
       assert.equal(payload.proxy_id, 'px-1')
-      assert.equal(
-        payload.proxy_sha256,
-        createHash('sha256').update(proxyMap['px-1']).digest('hex'),
-      )
+      assert.equal(payload.proxy_sha256, createHash('sha256').update(proxyMap['px-1']).digest('hex'))
       inflightPayloads.push(payload)
       if (inflightPayloads.length === 10) resolveAll10()
       const gate = new Promise((resolve) => releases.push(resolve))
@@ -1631,4 +1628,34 @@ test('a host error code the control plane knows survives, and only an unknown on
   // collapsed rather than being forwarded to the panel unvetted.
   code = 'gemini_not_a_real_code'
   await assert.rejects(callGeminiHost('authorization', { id: record.id }), { code: 'gemini_host_unavailable' })
+})
+
+test('synchronous host errors and polled test-chat runs report the same resident-pool copy for native worker/tty faults', async () => {
+  for (const code of ['gemini_native_worker_unavailable', 'gemini_native_tty_unavailable']) {
+    const run = setup((operation) => {
+      if (operation === 'get') {
+        return {
+          ...record,
+          auth_method: 'oauth',
+          auth_state: 'authorized',
+          models_discovered: true,
+          models: [model],
+        }
+      }
+      if (operation === 'test-chat') {
+        throw Object.assign(new Error(code), { code, status: 503 })
+      }
+      if (operation === 'test-chat-status') {
+        return { state: 'failed', text: '', error: { code } }
+      }
+      throw new Error(`unexpected ${operation}`)
+    })
+    const startRes = await run('POST', `${environmentPath}/test-chat`, { model, prompt: 'hello' })
+    const pollRes = await run('GET', `${environmentPath}/test-chat/${runId}`)
+    assert.equal(startRes.status, 503)
+    assert.equal(startRes.body.error.code, code)
+    assert.equal(pollRes.status, 200)
+    assert.equal(pollRes.body.data.error.code, code)
+    assert.equal(startRes.body.error.message, pollRes.body.data.error.message)
+  }
 })
