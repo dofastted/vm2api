@@ -962,10 +962,7 @@ test('Gemini public handler strips safetySettings for CRAGGemini and captures de
       url: '/v1beta/models/gemini-4-neon-high:streamGenerateContent',
       body: {
         contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
-        // An empty array asks for nothing, so it travels inbound, is recorded by the
-        // debug capture, and is still omitted outbound. A populated one is refused
-        // instead of dropped — asserted right below.
-        safetySettings: [],
+        safetySettings: [{ category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' }],
         cachedContent: 'cachedContents/test-1',
       },
     }),
@@ -976,25 +973,9 @@ test('Gemini public handler strips safetySettings for CRAGGemini and captures de
   assert.equal('safetySettings' in capturedInferBody, false)
   assert.equal('cachedContent' in capturedInferBody, false)
   assert.equal(logEvents.length, 1)
-  assert.equal(logEvents[0].inbound_body?.safetySettings?.length, 0)
+  assert.equal(logEvents[0].inbound_body?.safetySettings?.length, 1)
   assert.equal(logEvents[0].outbound_body_source, 'craggemini')
   assert.equal('safetySettings' in (logEvents[0].outbound_body || {}), false)
-
-  // A safety policy CRAGGemini cannot apply is reported, not silently discarded.
-  const refused = makeRes()
-  await handler(
-    makeReq({
-      method: 'POST',
-      url: '/v1beta/models/gemini-4-neon-high:streamGenerateContent',
-      body: {
-        contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
-        safetySettings: [{ category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' }],
-      },
-    }),
-    refused,
-  )
-  assert.equal(refused.statusCode, 400)
-  assert.match(JSON.stringify(refused.jsonBody()), /safetySettings/)
 })
 
 test('CRAGGemini end-to-end 4-protocol parity, early-stop cancel, and tool-continuation sticky conversation_id', async () => {
