@@ -217,5 +217,23 @@ fi
 if [ "$STANDBY" = 0 ]; then
   export VM2API_BOOTSTRAP_LOCK_FD=9 VM2API_BOOTSTRAP_WRAP_CHANGED="$WRAP_CHANGED"
 fi
+
+# Wait briefly for PostgreSQL readiness when configured so cold container boots never race PG init
+if [ "${VM2API_DB_DRIVER:-auto}" = "postgres" ] || [ -n "${DATABASE_URL:-}" ] || [ -n "${VM2API_DATABASE_URL:-}" ] || [ -n "${DATABASE_HOST:-}" ] || [ -n "${PGHOST:-}" ]; then
+  if [ "${VM2API_DB_DRIVER:-auto}" != "sqlite" ] && command -v pg_isready >/dev/null 2>&1; then
+    pg_host="${DATABASE_HOST:-${PGHOST:-127.0.0.1}}"
+    pg_port="${DATABASE_PORT:-${PGPORT:-5432}}"
+    pg_user="${DATABASE_USER:-${PGUSER:-vm2api}}"
+    if [ -z "${DATABASE_URL:-}" ] && [ -z "${VM2API_DATABASE_URL:-}" ]; then
+      i=0
+      while [ "$i" -lt 20 ]; do
+        pg_isready -h "$pg_host" -p "$pg_port" -U "$pg_user" >/dev/null 2>&1 && break
+        i=$((i + 1))
+        sleep 1
+      done
+    fi
+  fi
+fi
+
 cd /opt/vm2api
 exec node src/server.mjs

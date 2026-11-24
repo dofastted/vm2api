@@ -1,0 +1,11 @@
+# 本地目录挂载 overlay（借鉴 sub2api docker-compose.local.yml）
+# 将 PostgreSQL 与 Redis 数据直接落盘到指定宿主机目录，便于备份与磁盘隔离（如挂载独立数据盘）：
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+services:
+  postgres:
+    volumes:
+      - ${VM2API_PG_DATA_DIR:-./data/postgres}:/var/lib/postgresql/data
+
+  redis:
+    volumes:
+      - ${VM2API_REDIS_DATA_DIR:-./data/redis}:/data

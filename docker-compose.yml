@@ -1,14 +1,89 @@
-# 控制面容器 + 宿主机 Docker 管槽位。
+# 控制面容器 + PostgreSQL + Redis + 宿主机 Docker 管槽位。
 # 镜像直接拉取，不在用户机器上构建；仓库目录不再限定 /opt/vm2api：
 # 槽容器的 -v 源路径由控制面自省 `docker inspect vm2api` 的 Mounts 换算成宿主路径。
-# 本地开发要构建镜像：docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# 本地绑定目录持久化 PG/Redis（参考 sub2api）：
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+# 本地开发要构建镜像：
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# 安全约定：vm2api 使用 network_mode: host，因此 postgres 与 redis 仅监听 127.0.0.1，
+# 既供控制面本机直连，也不向公网暴露数据库端口。
 services:
+  postgres:
+    image: ${VM2API_PG_IMAGE:-postgres:18-alpine}
+    container_name: ${VM2API_PG_CONTAINER_NAME:-vm2api-postgres}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${VM2API_PG_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vm2api}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vm2api_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-vm2api}
+      # PostgreSQL 18 默认 PGDATA 为 /var/lib/postgresql/18/docker，显式固定避免匿名卷丢失数据
+      PGDATA: /var/lib/postgresql/data
+      TZ: ${TZ:-UTC}
+    command:
+      - postgres
+      - -c
+      - max_connections=${PG_MAX_CONNECTIONS:-200}
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-768MB}
+      - -c
+      - work_mem=${PG_WORK_MEM:-16MB}
+      - -c
+      - maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-128MB}
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - random_page_cost=1.1
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vm2api} -d ${POSTGRES_DB:-vm2api}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  redis:
+    image: ${VM2API_REDIS_IMAGE:-redis:8-alpine}
+    container_name: ${VM2API_REDIS_CONTAINER_NAME:-vm2api-redis}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${VM2API_REDIS_PORT:-6379}:6379"
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - "${REDIS_MAXMEMORY:-256mb}"
+      - --maxmemory-policy
+      - allkeys-lru
+      - --requirepass
+      - "${REDIS_PASSWORD:-vm2api_redis_change_me}"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"${REDIS_PASSWORD:-vm2api_redis_change_me}\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
   vm2api:
     image: ${VM2API_IMAGE:-ghcr.io/dofastted/vm2api}:${VM2API_IMAGE_TAG:-latest}
     container_name: ${VM2API_CONTAINER_NAME:-vm2api}
     restart: unless-stopped
     init: true
     network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     cap_add:
       - NET_ADMIN
       - NET_RAW
@@ -24,6 +99,20 @@ services:
       KIN_OAUTH_AUTH_BIN: /opt/vm2api/bin/kin-oauth-auth
       KIN_COMPUTER_BIN: ${KIN_COMPUTER_BIN:-/opt/vm2api/bin/kin-computer}
       KIN_AUTO_SYNC_WRAP: ${KIN_AUTO_SYNC_WRAP:-1}
+      # 数据库与缓存默认指向本机 127.0.0.1；若外部云库配置了 DATABASE_URL / REDIS_URL 则自动优先生效
+      VM2API_DB_DRIVER: ${VM2API_DB_DRIVER:-auto}
+      DATABASE_URL: ${DATABASE_URL:-}
+      DATABASE_HOST: ${DATABASE_HOST:-127.0.0.1}
+      DATABASE_PORT: ${VM2API_PG_PORT:-5432}
+      DATABASE_USER: ${POSTGRES_USER:-vm2api}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:-vm2api_change_me}
+      DATABASE_DBNAME: ${POSTGRES_DB:-vm2api}
+      DATABASE_SSLMODE: ${DATABASE_SSLMODE:-disable}
+      REDIS_URL: ${REDIS_URL:-}
+      REDIS_HOST: ${REDIS_HOST:-127.0.0.1}
+      REDIS_PORT: ${VM2API_REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-vm2api_redis_change_me}
+      VM2API_REDIS_DISABLED: ${VM2API_REDIS_DISABLED:-0}
       # 自省容器名；VM2API_HOST_ROOT 可显式覆盖宿主安装目录。
       VM2API_CONTAINER_NAME: ${VM2API_CONTAINER_NAME:-vm2api}
       VM2API_HOST_ROOT: ${VM2API_HOST_ROOT:-}
@@ -44,3 +133,7 @@ services:
       - ./bin:/opt/vm2api/bin
       - ./share:/opt/vm2api/share
       - ./src/config:/opt/vm2api/src/config
+
+volumes:
+  postgres_data:
+  redis_data:

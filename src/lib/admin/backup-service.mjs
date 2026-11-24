@@ -41,8 +41,10 @@ import crypto from 'node:crypto'
 import zlib from 'node:zlib'
 import { spawnSync } from 'node:child_process'
 import { Worker } from 'node:worker_threads'
-import { getDb, getDbPath, closeDatabase, openDatabase } from '../db/database.mjs'
-import { sha256File } from './backup-core.mjs'
+import { getDb, getDbEngine, getDbPath, getPgConfig, getPgPool, closeDatabase, openDatabase } from '../db/database.mjs'
+import { buildPgConnectionString } from '../db/pg/config.mjs'
+import { pgRestoreAvailable, sha256File } from './backup-core.mjs'
+import { getCacheRuntime } from '../cache/index.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { BackupRepo } from '../db/repos/backup-repo.mjs'
 import { reconcileVms } from '../vm/vm-db-sync.mjs'
@@ -272,8 +274,11 @@ export class BackupService {
 
   _runBackupWorker(job) {
     return new Promise((resolve, reject) => {
+      const engine = getDbEngine()
       const worker = new Worker(new URL('./backup-worker.mjs', import.meta.url), {
         workerData: {
+          engine,
+          pgConnectionString: engine === 'postgres' ? buildPgConnectionString(getPgConfig()) : null,
           dataDir: this.dataDir,
           ctx: {
             projectRoot: this.projectRoot,
@@ -303,7 +308,8 @@ export class BackupService {
       worker.once('error', (e) => finish(reject, e))
       worker.once('exit', (code) => {
         if (this._worker === worker) this._worker = null
-        if (code !== 0) finish(reject, Object.assign(new Error(`backup worker exited with code ${code}`), { code: 'backup_aborted' }))
+        if (code !== 0)
+          finish(reject, Object.assign(new Error(`backup worker exited with code ${code}`), { code: 'backup_aborted' }))
         else finish(reject, new Error('backup worker exited without a result'))
       })
     })
@@ -363,45 +369,79 @@ export class BackupService {
 
       // 1. extract / decompress
       tmp = this._mkdtemp('kin-restore-')
+      const isPg = getDbEngine() === 'postgres'
       let dbFile
       let manifest = null
       if (rec.file_name?.endsWith('.tar.gz')) {
         const r = spawnSync('tar', ['-xzf', rec.file_path, '-C', tmp], { stdio: 'pipe' })
         if (r.status !== 0) throw new Error(`tar extract failed: ${String(r.stderr || '').slice(0, 300)}`)
-        dbFile = path.join(tmp, 'db', 'kin.db')
         try {
           manifest = JSON.parse(fs.readFileSync(path.join(tmp, 'manifest.json'), 'utf8'))
         } catch {}
-        if (manifest?.sha256s?.['db/kin.db']) {
-          if (sha256File(dbFile) !== manifest.sha256s['db/kin.db']) {
-            throw Object.assign(new Error('db snapshot sha256 mismatch inside archive'), { code: 'backup_corrupt' })
+        if (isPg) {
+          const pgDumpFile = path.join(tmp, 'db', 'kin.pgdump')
+          const pgJsonFile = path.join(tmp, 'db', 'kin.pg.ndjson.gz')
+          if (fs.existsSync(pgDumpFile)) {
+            dbFile = pgDumpFile
+            if (manifest?.sha256s?.['db/kin.pgdump'] && sha256File(dbFile) !== manifest.sha256s['db/kin.pgdump']) {
+              throw Object.assign(new Error('pg dump sha256 mismatch inside archive'), { code: 'backup_corrupt' })
+            }
+          } else if (fs.existsSync(pgJsonFile)) {
+            dbFile = pgJsonFile
+            if (
+              manifest?.sha256s?.['db/kin.pg.ndjson.gz'] &&
+              sha256File(dbFile) !== manifest.sha256s['db/kin.pg.ndjson.gz']
+            ) {
+              throw Object.assign(new Error('pg snapshot sha256 mismatch inside archive'), { code: 'backup_corrupt' })
+            }
+          } else {
+            throw Object.assign(new Error('no PostgreSQL snapshot inside backup archive'), {
+              code: 'backup_incompatible',
+            })
+          }
+        } else {
+          dbFile = path.join(tmp, 'db', 'kin.db')
+          if (manifest?.sha256s?.['db/kin.db']) {
+            if (sha256File(dbFile) !== manifest.sha256s['db/kin.db']) {
+              throw Object.assign(new Error('db snapshot sha256 mismatch inside archive'), { code: 'backup_corrupt' })
+            }
           }
         }
+      } else if (isPg) {
+        dbFile = rec.file_path
       } else {
         dbFile = path.join(tmp, 'kin.db')
         fs.writeFileSync(dbFile, zlib.gunzipSync(fs.readFileSync(rec.file_path)))
       }
       if (!fs.existsSync(dbFile)) throw new Error('no db snapshot inside backup')
 
-      // 2. swap the live database
-      const dbPath = getDbPath()
-      closeDatabase()
-      const keep = `${dbPath}.pre-restore`
-      try {
-        fs.rmSync(keep, { force: true })
-      } catch {}
-      try {
-        fs.renameSync(dbPath, keep)
-      } catch {}
-      for (const suffix of ['-wal', '-shm']) {
+      // 2. restore database
+      let db
+      if (isPg) {
+        await this._restorePostgresSnapshot(dbFile)
+        await getCacheRuntime().client.invalidate({ prefixes: ['apikey:', 'billing:', 'sched:', 'dash:'] })
+        db = getDb()
+      } else {
+        const dbPath = getDbPath()
+        closeDatabase()
+        const keep = `${dbPath}.pre-restore`
         try {
-          fs.rmSync(dbPath + suffix, { force: true })
+          fs.rmSync(keep, { force: true })
         } catch {}
+        try {
+          fs.renameSync(dbPath, keep)
+        } catch {}
+        for (const suffix of ['-wal', '-shm']) {
+          try {
+            fs.rmSync(dbPath + suffix, { force: true })
+          } catch {}
+        }
+        fs.copyFileSync(dbFile, dbPath)
+        try {
+          fs.chmodSync(dbPath, 0o600)
+        } catch {}
+        db = openDatabase({ dataDir: this.dataDir, dbPath })
       }
-      fs.copyFileSync(dbFile, dbPath)
-      try {
-        fs.chmodSync(dbPath, 0o600)
-      } catch {}
 
       // 3. restore vm + config files from the archive (tar flavor only)
       const vmsDirSrc = path.join(tmp, 'vms')
@@ -433,10 +473,7 @@ export class BackupService {
         }
       }
 
-      // 4. reopen + migrate (old backups upgrade automatically)
-      const db = openDatabase({ dataDir: this.dataDir, dbPath })
-
-      // 5. db-only backups: rebuild vm files from the credential mirror
+      // 4. db-only backups: rebuild vm files from the credential mirror
       if (this.projectRoot) {
         invalidateReadCache()
         try {
@@ -474,6 +511,47 @@ export class BackupService {
         } catch {}
       }
     }
+  }
+
+  async _restorePostgresSnapshot(dbFile) {
+    const pgConnectionString = buildPgConnectionString(getPgConfig())
+    if (!pgConnectionString) throw new Error('PostgreSQL connection configuration unavailable for restore')
+    return await new Promise((resolve, reject) => {
+      const worker = new Worker(new URL('./backup-worker.mjs', import.meta.url), {
+        workerData: {
+          op: 'pg_restore',
+          engine: 'postgres',
+          pgConnectionString,
+          dbFile,
+        },
+      })
+      let settled = false
+      const finish = (fn, arg) => {
+        if (settled) return
+        settled = true
+        fn(arg)
+      }
+      worker.once('message', (msg) => {
+        if (msg && msg.ok) return finish(resolve)
+        finish(
+          reject,
+          Object.assign(new Error((msg && msg.error && msg.error.message) || 'PostgreSQL restore failed'), {
+            code: (msg && msg.error && msg.error.code) || 'restore_failed',
+          }),
+        )
+      })
+      worker.once('error', (e) => finish(reject, e))
+      worker.once('exit', (code) => {
+        if (code !== 0) {
+          finish(
+            reject,
+            Object.assign(new Error(`restore worker exited with code ${code}`), { code: 'restore_aborted' }),
+          )
+        } else {
+          finish(reject, new Error('restore worker exited without a result'))
+        }
+      })
+    })
   }
 
   /**

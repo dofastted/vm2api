@@ -26,7 +26,9 @@
   "dependencies": {
     "croner": "^10.0.1",
     "https-proxy-agent": "^9.1.0",
+    "ioredis": "^6.1.0",
     "node-fetch": "^2.7.0",
+    "pg": "^8.23.1",
     "socks-proxy-agent": "^10.1.0",
     "ssh2": "^1.17.0",
     "ws": "^8.22.0"

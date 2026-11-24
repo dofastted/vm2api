@@ -1,13 +1,12 @@
 /**
- * SQLite database layer built on `node:sqlite`.
- *
- * - The single-process gateway uses embedded SQLite in WAL mode, versioned
- *   SQL migrations with SHA-256 checksum verification, repository modules,
- *   a settings table, and backup records.
- * - Zero new dependencies: uses the built-in `node:sqlite` DatabaseSync.
+ * Unified database layer supporting both PostgreSQL (production default when
+ * configured) and embedded SQLite (`node:sqlite` DatabaseSync, fallback for
+ * isolated unit tests and legacy single-file deployments).
  *
  * Env:
- *   KIN_DB_PATH — override db file path (default <dataDir>/kin.db)
+ *   VM2API_DB_DRIVER    — auto | postgres | sqlite (default: auto)
+ *   VM2API_DATABASE_URL / DATABASE_URL / DATABASE_HOST / PGHOST — PG connection
+ *   KIN_DB_PATH         — override SQLite db file path (default <dataDir>/kin.db)
  */
 
 import fs from 'node:fs'
@@ -15,11 +14,29 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
-import { startSqlitePool, stopSqlitePool } from './sqlite-pool.mjs'
+import { startPgReadPool, startSqlitePool, stopSqlitePool } from './sqlite-pool.mjs'
 import { armWriteBehind, flushWrites } from './write-behind.mjs'
+import { resolveDbDriver, resolvePgConfig } from './pg/config.mjs'
+import { createPgPool } from './pg/pg-pool.mjs'
+import { applyPgMigrations } from './pg/migrations-runner.mjs'
+import { createPgSyncDb } from './pg/pg-sync-db.mjs'
+import { startDashboardAggregator, stopDashboardAggregator } from './pg/dashboard-aggregator.mjs'
+import { closeCacheRuntime, initCacheRuntime } from '../cache/index.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const MIGRATIONS_DIR = path.join(__dirname, 'migrations')
+
+let _instanceSeq = 0
+export const DB_INSTANCE_ID = Symbol('vm2api.dbInstanceId')
+
+function tagDbInstance(db, engine) {
+  if (!db) return db
+  try {
+    if (!db[DB_INSTANCE_ID]) db[DB_INSTANCE_ID] = `${engine}:${++_instanceSeq}`
+    if (!db.engine) db.engine = engine
+  } catch {}
+  return db
+}
 
 function sha256Hex(s) {
   return crypto.createHash('sha256').update(s).digest('hex')
@@ -35,9 +52,6 @@ function migrationChecksums(sql) {
   }
 }
 
-// 001 was published briefly before the proxy pool switched to its persisted
-// record shape. Its checksum cannot be treated as the current 001: migration
-// 018 assumes the newer columns and otherwise fails after accepting the hash.
 const HISTORICAL_001_PROXY_CHECKSUMS = new Set([
   '376c686118bbd8aaa6db6ea13fb2ff0afecc0c7464bc3d668743a55c9ccafdde',
   'd6769ea311718b5af91e47295f97c3bf2722ece6d26acee7e89df84b88599ae2',
@@ -103,8 +117,6 @@ function reconcileHistorical001ProxySchema(db, checksum) {
   return true
 }
 
-// Upstream assigned 055 to lifetime usage after the buyer-orders branch had used
-// 055–057 for the shop. The SQL is unchanged; move only the applied records.
 function reconcileCragShopMigrationVersions(db, dir, files) {
   if (!files.includes('055_account_lifetime_usage.sql')) return
   const get = db.prepare('SELECT name, checksum FROM schema_migrations WHERE version = ?')
@@ -112,7 +124,6 @@ function reconcileCragShopMigrationVersions(db, dir, files) {
 
   withTransaction(db, () => {
     const move = db.prepare('UPDATE schema_migrations SET version = ?, name = ?, checksum = ? WHERE version = ?')
-    // Move from the highest version down so existing primary keys never collide.
     for (const [from, to, suffix] of [
       ['057', '058', 'crag_shop_activation.sql'],
       ['056', '057', 'crag_shop_commerce.sql'],
@@ -135,6 +146,9 @@ function reconcileCragShopMigrationVersions(db, dir, files) {
 
 let _db = null
 let _dbPath = null
+let _engine = 'sqlite'
+let _pgPool = null
+let _pgConfig = null
 let poolWanted = false
 
 export function resolveDbPath({ dataDir, dbPath } = {}) {
@@ -145,7 +159,7 @@ export function resolveDbPath({ dataDir, dbPath } = {}) {
 }
 
 /**
- * Standalone (non-singleton) open: PRAGMAs + migrations applied.
+ * Standalone (non-singleton) SQLite open: PRAGMAs + migrations applied.
  * Used by unit tests and by stores constructed without a global db.
  * @returns {DatabaseSync}
  */
@@ -161,17 +175,18 @@ export function createDatabase({ dataDir, dbPath, migrationsDir } = {}) {
   db.exec('PRAGMA busy_timeout = 5000')
   db.exec('PRAGMA foreign_keys = ON')
   applyMigrations(db, { migrationsDir })
-  return db
+  return tagDbInstance(db, 'sqlite')
 }
 
 /**
- * Open (or return the already-open) singleton database.
- * @returns {DatabaseSync}
+ * Open (or return the already-open) singleton database synchronously (SQLite).
+ * For PostgreSQL startup, call `await openDatabaseAsync(...)` during boot.
+ * @returns {DatabaseSync|import('./pg/pg-sync-db.mjs').PgSyncDb}
  */
 export function openDatabase({ dataDir, dbPath, migrationsDir, pooled = false } = {}) {
   if (pooled) poolWanted = true
   if (_db) {
-    if (poolWanted) {
+    if (poolWanted && _engine === 'sqlite') {
       startSqlitePool(_dbPath)
       armWriteBehind(_db)
     }
@@ -179,6 +194,7 @@ export function openDatabase({ dataDir, dbPath, migrationsDir, pooled = false } 
   }
   _db = createDatabase({ dataDir, dbPath, migrationsDir })
   _dbPath = resolveDbPath({ dataDir, dbPath })
+  _engine = 'sqlite'
   if (poolWanted) {
     startSqlitePool(_dbPath)
     armWriteBehind(_db)
@@ -187,8 +203,80 @@ export function openDatabase({ dataDir, dbPath, migrationsDir, pooled = false } 
 }
 
 /**
+ * Async singleton database opener supporting both PostgreSQL and SQLite.
+ * Automatically selects PostgreSQL when `VM2API_DB_DRIVER=postgres` or PG env
+ * vars (`DATABASE_URL`, `VM2API_DATABASE_URL`, `DATABASE_HOST`, `PGHOST`) exist.
+ */
+export async function openDatabaseAsync({
+  dataDir,
+  dbPath,
+  migrationsDir,
+  pgMigrationsDir,
+  pooled = false,
+  driver,
+  connectionString,
+  pgConfig,
+  enableAggregator = true,
+} = {}) {
+  if (pooled) poolWanted = true
+  const resolvedDriver = resolveDbDriver({ driver, connectionString })
+
+  if (_db) {
+    if (_engine === 'postgres' && poolWanted) {
+      startPgReadPool(_db, _pgPool)
+      armWriteBehind(_db)
+    } else if (_engine === 'sqlite' && poolWanted) {
+      startSqlitePool(_dbPath)
+      armWriteBehind(_db)
+    }
+    return _db
+  }
+
+  if (resolvedDriver === 'postgres') {
+    const resolvedPg = resolvePgConfig({ connectionString, pgConfig })
+    if (!resolvedPg) {
+      throw new Error(
+        'VM2API_DB_DRIVER=postgres requested but no PostgreSQL connection details configured (set DATABASE_URL or DATABASE_HOST)',
+      )
+    }
+    const pool = createPgPool(resolvedPg)
+    try {
+      await applyPgMigrations(pool, pgMigrationsDir ? { migrationsDir: pgMigrationsDir } : undefined)
+      const cacheRt = await initCacheRuntime({ pgPool: pool })
+      const syncDb = await createPgSyncDb(resolvedPg, {
+        onMutation: (tables) => cacheRt.onDbTablesMutated(tables),
+      })
+      tagDbInstance(syncDb, 'postgres')
+      _db = syncDb
+      _pgPool = pool
+      _pgConfig = resolvedPg
+      _dbPath = null
+      _engine = 'postgres'
+
+      if (poolWanted) {
+        startPgReadPool(syncDb, pool)
+        armWriteBehind(syncDb)
+      }
+      if (enableAggregator && process.env.VM2API_DASHBOARD_AGGREGATOR_DISABLED !== '1') {
+        startDashboardAggregator(pool)
+      }
+      return _db
+    } catch (err) {
+      try {
+        await pool.end()
+      } catch {}
+      throw err
+    }
+  }
+
+  const db = openDatabase({ dataDir, dbPath, migrationsDir, pooled })
+  await initCacheRuntime().catch(() => {})
+  return db
+}
+
+/**
  * Resolve the db a store should use: explicit db → global singleton →
- * standalone connection rooted at dataDir (test isolation path).
+ * standalone SQLite connection rooted at dataDir (test isolation path).
  */
 export function resolveStoreDb({ db, dataDir } = {}) {
   if (db) return db
@@ -210,24 +298,67 @@ export function getDbPath() {
   return _dbPath
 }
 
+export function getDbEngine() {
+  return _engine
+}
+
+export function getPgPool() {
+  return _pgPool
+}
+
+export function getPgConfig() {
+  return _pgConfig
+}
+
 export function closeDatabase() {
   flushWrites()
   armWriteBehind(null)
+  stopDashboardAggregator()
   stopSqlitePool()
   if (_db) {
     try {
       _db.close()
     } catch {}
   }
+  if (_pgPool) {
+    const pool = _pgPool
+    _pgPool = null
+    pool.end().catch(() => {})
+  }
   _db = null
   _dbPath = null
+  _pgConfig = null
+  _engine = 'sqlite'
+  poolWanted = false
+}
+
+export async function closeDatabaseAsync() {
+  flushWrites()
+  armWriteBehind(null)
+  stopDashboardAggregator()
+  stopSqlitePool()
+  await closeCacheRuntime().catch(() => {})
+  if (_db) {
+    try {
+      _db.close()
+    } catch {}
+  }
+  if (_pgPool) {
+    const pool = _pgPool
+    _pgPool = null
+    try {
+      await pool.end()
+    } catch {}
+  }
+  _db = null
+  _dbPath = null
+  _pgConfig = null
+  _engine = 'sqlite'
+  poolWanted = false
 }
 
 /**
- * Versioned SQL migrations with SHA-256 checksum verification.
- * Files: migrations/NNN_name.sql, applied in filename order inside a
- * transaction each. `schema_migrations` records version+checksum; a
- * checksum mismatch on an already-applied migration is a hard error.
+ * Versioned SQLite SQL migrations with SHA-256 checksum verification.
  */
 export function applyMigrations(db, { migrationsDir } = {}) {
   const dir = migrationsDir || MIGRATIONS_DIR
@@ -285,7 +416,7 @@ export function applyMigrations(db, { migrationsDir } = {}) {
   return results
 }
 
-/** Run fn inside a transaction (nested calls just run inline). */
+/** Run fn inside a transaction (nested calls just run inline). Works on SQLite and PgSyncDb. */
 export function withTransaction(db, fn) {
   if (db.isTransaction) return fn()
   db.exec('BEGIN')
@@ -304,7 +435,7 @@ export function withTransaction(db, fn) {
 }
 
 /**
- * Online-consistent snapshot of the live database (WAL-safe).
+ * Online-consistent snapshot of the live SQLite database (WAL-safe).
  * @returns {string} destination path
  */
 export function vacuumInto(db, destPath) {
