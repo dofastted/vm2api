@@ -43,7 +43,7 @@ import { probeAccount } from '../oauth/usage-probe.mjs'
 import { queryOpenaiQuota, resetOpenaiQuota } from '../oauth/openai-quota.mjs'
 import { queryClaudeResetCredits, redeemClaudeResetCredit } from '../oauth/claude-reset-credits.mjs'
 import { canOfficialUsage, credentialModeOfVm, isSetupTokenMode } from '../oauth/credential-mode.mjs'
-import { getUsageCache } from '../oauth/usage-cache.mjs'
+import { attachUsageFetchMeta, getUsageCache, getUsageFetchMeta } from '../oauth/usage-cache.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { filterVmsForPanel } from './resource-owner.mjs'
 import { nodePlatform } from '../cluster/placement.mjs'
@@ -1292,8 +1292,6 @@ export async function buildProbeOne({
   if (force) cache.clear(accountId)
   const skipHop = !shouldHopOfficialUsage(acc?.unified, { hop, force })
   const headerProbe = skipHop ? probeFromPassiveHeaders(acc?.unified || {}) : null
-  const probeStartedAt = Date.now()
-  const probeResetGenerations = accountQuota.resetGenerations?.(accountId) || null
   const result = skipHop
     ? {
         ok: false,
@@ -1303,7 +1301,16 @@ export async function buildProbeOne({
         probed_at: new Date().toISOString(),
         ...(headerProbe ? { ...headerProbe, error: null } : {}),
       }
-    : await cache.load(accountId, () => probeAccount({ exec, vm, includeFable }), { force: !!force })
+    : await cache.load(
+        accountId,
+        async () => {
+          const startedAt = Date.now()
+          const resetGenerations = accountQuota.resetGenerations?.(accountId) || null
+          const probed = await probeAccount({ exec, vm, includeFable })
+          return attachUsageFetchMeta(probed, { startedAt, resetGenerations })
+        },
+        { force: !!force },
+      )
   if (fatalUsageCredentialFailure(result)) {
     try {
       markVmRefreshError(path.join(cfg.paths.project, 'vms', `${id}.json`), {
@@ -1319,9 +1326,10 @@ export async function buildProbeOne({
     (record) => record?.account_tier_source === 'profile' && ['pro', 'max'].includes(record.account_tier),
   )
   if (!skipHop) {
+    const fetchMeta = getUsageFetchMeta(result)
     accountQuota.ingestOAuthUsage(accountId, result, {
-      startedAt: probeStartedAt,
-      resetGenerations: probeResetGenerations,
+      ...(fetchMeta?.startedAt != null ? { startedAt: fetchMeta.startedAt } : {}),
+      ...(fetchMeta?.resetGenerations ? { resetGenerations: fetchMeta.resetGenerations } : {}),
     })
   }
   if (result.subscription_type) {

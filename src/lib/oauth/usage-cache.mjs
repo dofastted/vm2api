@@ -12,6 +12,23 @@ export const API_CACHE_TTL_MS = 3 * 60_000
 export const API_ERROR_CACHE_TTL_MS = 60_000
 export const API_QUERY_MAX_JITTER_MS = 800
 
+const USAGE_FETCH_META = Symbol('usage_fetch_meta')
+
+export function attachUsageFetchMeta(result, meta) {
+  if (!result || typeof result !== 'object' || !meta) return result
+  const target = Object.isFrozen(result) ? { ...result } : result
+  Object.defineProperty(target, USAGE_FETCH_META, {
+    value: meta,
+    enumerable: false,
+    configurable: true,
+  })
+  return target
+}
+
+export function getUsageFetchMeta(result) {
+  return result && typeof result === 'object' ? result[USAGE_FETCH_META] || null : null
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -35,6 +52,9 @@ function isFailureResult(result) {
 export function createUsageCache({ now = () => Date.now(), random = Math.random, jitter = true } = {}) {
   const store = new Map()
   const flights = new Map()
+  const accountEpochs = new Map()
+  let globalEpoch = 0
+  const epochOf = (id) => globalEpoch + (accountEpochs.get(id) || 0)
   const startedAt = new Date(now()).toISOString()
   const metrics = {
     requests: 0,
@@ -91,6 +111,7 @@ export function createUsageCache({ now = () => Date.now(), random = Math.random,
     }
 
     metrics.misses += 1
+    const flightEpoch = epochOf(id)
     const pending = (async () => {
       const again = peek(id)
       if (again?.hit === 'ok') return again.result
@@ -103,22 +124,24 @@ export function createUsageCache({ now = () => Date.now(), random = Math.random,
         if (delay > 0) await sleep(delay)
       }
       metrics.upstream_fetches += 1
+      const fetchStartedAt = now()
       try {
-        const result = await fetcher()
+        const raw = await fetcher()
+        const result = getUsageFetchMeta(raw) ? raw : attachUsageFetchMeta(raw, { startedAt: fetchStartedAt })
         if (isFailureResult(result)) {
           metrics.upstream_failures += 1
-          rememberError(id, asError(result), result)
+          if (epochOf(id) === flightEpoch) rememberError(id, asError(result), result)
           return result
         }
-        rememberOk(id, result)
+        if (epochOf(id) === flightEpoch) rememberOk(id, result)
         return result
       } catch (error) {
         metrics.upstream_failures += 1
-        rememberError(id, error, error?.result || null)
+        if (epochOf(id) === flightEpoch) rememberError(id, error, error?.result || null)
         throw error
       }
     })().finally(() => {
-      flights.delete(id)
+      if (flights.get(id) === pending) flights.delete(id)
     })
 
     flights.set(id, pending)
@@ -129,8 +152,16 @@ export function createUsageCache({ now = () => Date.now(), random = Math.random,
     peek,
     load,
     clear(accountId) {
-      if (accountId == null) store.clear()
-      else store.delete(String(accountId))
+      if (accountId == null) {
+        globalEpoch += 1
+        store.clear()
+        flights.clear()
+      } else {
+        const id = String(accountId)
+        accountEpochs.set(id, (accountEpochs.get(id) || 0) + 1)
+        store.delete(id)
+        flights.delete(id)
+      }
     },
     size() {
       return store.size

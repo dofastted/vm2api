@@ -4,11 +4,14 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { buildClaudeResetRedeem, quotaFromAccount } from '../../src/lib/admin/panel-api.mjs'
-import { createUsageCache } from '../../src/lib/oauth/usage-cache.mjs'
+import { createImportCommit } from '../../src/lib/oauth/import-commit.mjs'
+import { createUsageCache, getUsageFetchMeta } from '../../src/lib/oauth/usage-cache.mjs'
 import { resetClaudeResetLeasesForTest } from '../../src/lib/oauth/claude-reset-credits.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
+import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { listQuotaFromHeaders } from '../../src/lib/pool/quota-window.mjs'
 import { RateLimitService } from '../../src/lib/pool/rate-limit-service.mjs'
+import { resolveUsageWindows } from '../../src/lib/protocol/user-count-tokens.mjs'
 import { AccountRuntimeRepo } from '../../src/lib/db/repos/account-runtime-repo.mjs'
 import { createDatabase } from '../../src/lib/db/database.mjs'
 
@@ -630,68 +633,615 @@ test('#1723 persisted reset boundaries survive restart for reconciliation, repla
 
   // Simulate process restart by opening a fresh SQLite handle and AccountQuota instance.
   const reopenedDb = createDatabase({ dataDir })
-  t.after(() => {
+  try {
+    const restartedQuota = new AccountQuota({
+      db: reopenedDb,
+      config: {
+        quota: { safety_ratio: 0.85, weekly_safety_ratio: 0.8, block_on_5h: true, block_on_7d: true },
+        concurrency: { default_max_per_account: 2 },
+      },
+    })
+
+    // Reset generation survived restart.
+    assert.deepEqual(restartedQuota.resetGenerations('acc-1'), { '5h': 1, '7d': 1, '7d_oi': 0 })
+
+    // Post-reset official probe after restart reconciles 84%/76% -> 0%/0%.
+    restartedQuota.ingestOAuthUsage('acc-1', officialZeroProbe(T2), {
+      startedAt: T2,
+      resetGenerations: restartedQuota.resetGenerations('acc-1'),
+      now: T2,
+    })
+    assert.equal(listQuotaFromHeaders(restartedQuota.repo.get('acc-1').unified, { now: T2 }).utilization_5h, 0)
+    assert.equal(listQuotaFromHeaders(restartedQuota.repo.get('acc-1').unified, { now: T2 }).utilization_7d, 0)
+
+    // Late pre-reset response after restart is still blocked.
+    restartedQuota.ingestHeaders(
+      'acc-1',
+      {
+        'anthropic-ratelimit-unified-5h-utilization': '0.84',
+        'anthropic-ratelimit-unified-5h-reset': RESET_5H_OLD,
+        'anthropic-ratelimit-unified-5h-status': 'allowed',
+      },
+      null,
+      { requestStartedAt: T0, resetGenerations: preResetGens, now: T3 },
+    )
+    assert.equal(listQuotaFromHeaders(restartedQuota.repo.get('acc-1').unified, { now: T3 }).utilization_5h, 0)
+
+    // Post-reset usage + replayed receipt after restart does not reopen boundary or wipe consumption.
+    restartedQuota.ingestHeaders(
+      'acc-1',
+      {
+        'anthropic-ratelimit-unified-5h-utilization': '0.60',
+        'anthropic-ratelimit-unified-5h-reset': String(Math.floor((T3 + 5 * 3600_000) / 1000)),
+        'anthropic-ratelimit-unified-5h-status': 'allowed',
+      },
+      null,
+      { requestStartedAt: T3, resetGenerations: restartedQuota.resetGenerations('acc-1'), now: T3 },
+    )
+    await buildClaudeResetRedeem({
+      cfg,
+      accountQuota: restartedQuota,
+      id: 'vm-1',
+      idempotencyKey: 'op-restart',
+      transport,
+      now: () => T4,
+    })
+    assert.deepEqual(restartedQuota.resetGenerations('acc-1'), { '5h': 1, '7d': 1, '7d_oi': 0 })
+    restartedQuota.ingestOAuthUsage('acc-1', officialZeroProbe(T5), {
+      startedAt: T5,
+      resetGenerations: restartedQuota.resetGenerations('acc-1'),
+      now: T5,
+    })
+    assert.equal(listQuotaFromHeaders(restartedQuota.repo.get('acc-1').unified, { now: T5 }).utilization_5h, 0.6)
+  } finally {
     try {
       reopenedDb.close()
     } catch {}
-  })
-  const restartedQuota = new AccountQuota({
-    db: reopenedDb,
-    config: {
-      quota: { safety_ratio: 0.85, weekly_safety_ratio: 0.8, block_on_5h: true, block_on_7d: true },
-      concurrency: { default_max_per_account: 2 },
-    },
-  })
+  }
+})
 
-  // Reset generation survived restart.
-  assert.deepEqual(restartedQuota.resetGenerations('acc-1'), { '5h': 1, '7d': 1, '7d_oi': 0 })
+test('#1758 blocker 1 & minor 1: FailoverRunner skips applyCooldown on pre-reset account_quota_exhausted and fable_rate_limited 429s', async (t) => {
+  // 1a. Pre-reset account_quota_exhausted 429 must not lock account or evict sessions.
+  {
+    const { cfg, quota, runtimeRepo } = makeFixture(t)
+    runtimeRepo.upsert({ account_id: 'acc-1', vm_id: 'vm-1', status: 'ready' })
+    const rateLimitService = new RateLimitService({ runtimeRepo, accountQuota: quota })
+    const cooldownCalls = []
+    const sessionEvictions = []
+    let selectCount = 0
+    const scheduler = {
+      accountQuota: quota,
+      async selectAndReserve() {
+        selectCount += 1
+        if (selectCount > 1) return { ok: false, reason: 'account_pool_exhausted' }
+        return { ok: true, accountId: 'acc-1', vmId: 'vm-1', release() {} }
+      },
+      markSuccess() {},
+      markCooldown(selected, opts) {
+        cooldownCalls.push({ selected, opts })
+        runtimeRepo.markCooldown(selected.accountId, { vmId: selected.vmId, ...opts })
+      },
+      releaseAccountSessions(info) {
+        sessionEvictions.push(info)
+      },
+    }
+    const runner = new FailoverRunner({
+      scheduler,
+      rateLimitService,
+      config: { max_same_account_retries: 0, max_total_attempts: 2 },
+    })
 
-  // Post-reset official probe after restart reconciles 84%/76% -> 0%/0%.
-  restartedQuota.ingestOAuthUsage('acc-1', officialZeroProbe(T2), {
-    startedAt: T2,
-    resetGenerations: restartedQuota.resetGenerations('acc-1'),
-    now: T2,
-  })
-  assert.equal(listQuotaFromHeaders(restartedQuota.repo.get('acc-1').unified, { now: T2 }).utilization_5h, 0)
-  assert.equal(listQuotaFromHeaders(restartedQuota.repo.get('acc-1').unified, { now: T2 }).utilization_7d, 0)
+    const attemptPolicies = []
+    await runner.run({
+      requestId: 'req-pre-reset-429',
+      model: 'claude-sonnet-4-5',
+      requestBody: { model: 'claude-sonnet-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      onAttempt: ({ policy }) => attemptPolicies.push(policy),
+      callAttempt: async () => {
+        // Confirmed reset lands while this upstream request is in flight!
+        const { transport } = scriptedTransport({ clears: ['five_hour'] })
+        await buildClaudeResetRedeem({
+          cfg,
+          accountQuota: quota,
+          id: 'vm-1',
+          idempotencyKey: 'op-failover-5h',
+          transport,
+          now: () => Date.now() + 1000,
+        })
+        return {
+          ok: false,
+          status: 429,
+          committed: false,
+          headers: {
+            'anthropic-ratelimit-unified-5h-status': 'rejected',
+            'anthropic-ratelimit-unified-5h-utilization': '1',
+            'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + 2 * 3600_000) / 1000)),
+          },
+          body: { type: 'error', error: { type: 'rate_limit_error', message: 'Rate limited' } },
+        }
+      },
+    })
 
-  // Late pre-reset response after restart is still blocked.
-  restartedQuota.ingestHeaders(
-    'acc-1',
-    {
-      'anthropic-ratelimit-unified-5h-utilization': '0.84',
-      'anthropic-ratelimit-unified-5h-reset': RESET_5H_OLD,
-      'anthropic-ratelimit-unified-5h-status': 'allowed',
-    },
-    null,
-    { requestStartedAt: T0, resetGenerations: preResetGens, now: T3 },
-  )
-  assert.equal(listQuotaFromHeaders(restartedQuota.repo.get('acc-1').unified, { now: T3 }).utilization_5h, 0)
+    assert.equal(attemptPolicies.length, 1)
+    assert.equal(attemptPolicies[0].action, 'continue')
+    assert.equal(attemptPolicies[0].cooldownUntil, null)
+    assert.equal(cooldownCalls.length, 0)
+    assert.equal(sessionEvictions.length, 0)
+    const state = runtimeRepo.get('acc-1')
+    assert.equal(state.cooldown_until, null)
+    assert.equal(state.rate_limit_reset_at, null)
+  }
 
-  // Post-reset usage + replayed receipt after restart does not reopen boundary or wipe consumption.
-  restartedQuota.ingestHeaders(
-    'acc-1',
-    {
-      'anthropic-ratelimit-unified-5h-utilization': '0.60',
-      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((T3 + 5 * 3600_000) / 1000)),
-      'anthropic-ratelimit-unified-5h-status': 'allowed',
-    },
-    null,
-    { requestStartedAt: T3, resetGenerations: restartedQuota.resetGenerations('acc-1'), now: T3 },
-  )
-  await buildClaudeResetRedeem({
-    cfg,
-    accountQuota: restartedQuota,
-    id: 'vm-1',
-    idempotencyKey: 'op-restart',
-    transport,
-    now: () => T4,
-  })
-  assert.deepEqual(restartedQuota.resetGenerations('acc-1'), { '5h': 1, '7d': 1, '7d_oi': 0 })
-  restartedQuota.ingestOAuthUsage('acc-1', officialZeroProbe(T5), {
-    startedAt: T5,
-    resetGenerations: restartedQuota.resetGenerations('acc-1'),
-    now: T5,
-  })
-  assert.equal(listQuotaFromHeaders(restartedQuota.repo.get('acc-1').unified, { now: T5 }).utilization_5h, 0.6)
+  // 1b. Pre-reset fable_rate_limited 429 must not apply Fable model cooldown after 7d_oi reset.
+  {
+    const { cfg, quota, runtimeRepo } = makeFixture(t, { vmId: 'vm-f1', accountUuid: 'acc-f1' })
+    runtimeRepo.upsert({ account_id: 'acc-f1', vm_id: 'vm-f1', status: 'ready' })
+    const rateLimitService = new RateLimitService({ runtimeRepo, accountQuota: quota })
+    const cooldownCalls = []
+    let selectCount = 0
+    const scheduler = {
+      accountQuota: quota,
+      async selectAndReserve() {
+        selectCount += 1
+        if (selectCount > 1) return { ok: false, reason: 'account_pool_exhausted' }
+        return { ok: true, accountId: 'acc-f1', vmId: 'vm-f1', release() {} }
+      },
+      markSuccess() {},
+      markCooldown(selected, opts) {
+        cooldownCalls.push({ selected, opts })
+      },
+    }
+    const runner = new FailoverRunner({
+      scheduler,
+      rateLimitService,
+      config: { max_same_account_retries: 0, max_total_attempts: 2 },
+    })
+
+    const attemptPolicies = []
+    await runner.run({
+      requestId: 'req-pre-reset-fable-429',
+      model: 'claude-fable-5',
+      requestBody: { model: 'claude-fable-5', messages: [{ role: 'user', content: 'hi' }] },
+      onAttempt: ({ policy }) => attemptPolicies.push(policy),
+      callAttempt: async () => {
+        const { transport } = scriptedTransport({ clears: ['seven_day_overage_included'], givesBackWeekly: true })
+        await buildClaudeResetRedeem({
+          cfg,
+          accountQuota: quota,
+          id: 'vm-f1',
+          idempotencyKey: 'op-failover-fable',
+          transport,
+          now: () => Date.now() + 1000,
+        })
+        return {
+          ok: false,
+          status: 429,
+          committed: false,
+          headers: {
+            'anthropic-ratelimit-unified-7d_oi-status': 'rejected',
+            'anthropic-ratelimit-unified-7d_oi-reset': String(Math.floor((Date.now() + 86_400_000) / 1000)),
+          },
+          body: { type: 'error', error: { type: 'rate_limit_error', message: 'Rate limited' } },
+        }
+      },
+    })
+
+    assert.equal(attemptPolicies.length, 1)
+    assert.equal(attemptPolicies[0].reason, 'fable_rate_limited')
+    assert.equal(attemptPolicies[0].action, 'continue')
+    assert.equal(attemptPolicies[0].cooldownUntil, null)
+    assert.equal(cooldownCalls.length, 0)
+  }
+
+  // Minor #1: When parsed.window is null, infer '7d' from 7d-status or representative-claim before '5h'.
+  {
+    const { cfg, quota, runtimeRepo } = makeFixture(t, { vmId: 'vm-7d', accountUuid: 'acc-7d' })
+    runtimeRepo.upsert({ account_id: 'acc-7d', vm_id: 'vm-7d', status: 'ready' })
+    const rateLimitService = new RateLimitService({ runtimeRepo, accountQuota: quota })
+    const preResetGens = quota.resetGenerations('acc-7d')
+
+    const { transport } = scriptedTransport({ clears: ['seven_day'] })
+    await buildClaudeResetRedeem({
+      cfg,
+      accountQuota: quota,
+      id: 'vm-7d',
+      idempotencyKey: 'op-7d-only',
+      transport,
+      now: () => T1,
+    })
+
+    // 7d-status rejected with only retry-after (no 7d-reset -> parsed.window === null).
+    const ignoredByStatus = rateLimitService.handleUpstreamError({
+      accountId: 'acc-7d',
+      vmId: 'vm-7d',
+      result: {
+        status: 429,
+        committed: false,
+        headers: {
+          'anthropic-ratelimit-unified-7d-status': 'rejected',
+          'retry-after': '3600',
+        },
+        body: { error: { message: 'Rate limited' } },
+      },
+      policy: { scope: 'account', reason: 'account_quota_exhausted', action: 'continue-and-cooldown' },
+      now: T2,
+      requestStartedAt: T0,
+      resetGenerations: preResetGens,
+    })
+    assert.equal(ignoredByStatus?.ignored, true)
+    assert.equal(ignoredByStatus?.window, '7d')
+
+    // representative-claim: seven_day with aggregate reset (parsed.window === null).
+    const ignoredByClaim = rateLimitService.handleUpstreamError({
+      accountId: 'acc-7d',
+      vmId: 'vm-7d',
+      result: {
+        status: 429,
+        committed: false,
+        headers: {
+          'anthropic-ratelimit-unified-representative-claim': 'seven_day',
+          'anthropic-ratelimit-unified-reset': RESET_7D_OLD,
+        },
+        body: { error: { message: 'Rate limited' } },
+      },
+      policy: { scope: 'account', reason: 'account_quota_exhausted', action: 'continue-and-cooldown' },
+      now: T2,
+      requestStartedAt: T0,
+      resetGenerations: preResetGens,
+    })
+    assert.equal(ignoredByClaim?.ignored, true)
+    assert.equal(ignoredByClaim?.window, '7d')
+    assert.equal(runtimeRepo.get('acc-7d').rate_limit_reset_at, null)
+  }
+})
+
+test('#1758 blocker 2: usage-cache epoch invalidates in-flight pre-reset probes and preserves fetch-start timing', async (t) => {
+  // 2a. In-flight pre-reset probe invalidated by clear() cannot write to store or delete newer flight.
+  {
+    let clockMs = T0
+    const cache = createUsageCache({ now: () => clockMs, jitter: false })
+    let releasePre
+    const preGate = new Promise((resolve) => {
+      releasePre = resolve
+    })
+    let releasePost
+    const postGate = new Promise((resolve) => {
+      releasePost = resolve
+    })
+
+    const preFlight = cache.load('acc-1', async () => {
+      await preGate
+      return { ok: true, five_hour: { utilization: 84 }, seven_day: { utilization: 76 } }
+    })
+
+    // Confirmed reset clears cache + flights and bumps epoch.
+    clockMs = T1
+    cache.clear('acc-1')
+    assert.equal(cache.peek('acc-1'), null)
+
+    // Post-reset caller starts a fresh flight (must NOT join preFlight).
+    clockMs = T2
+    const postFlight = cache.load('acc-1', async () => {
+      await postGate
+      return { ok: true, five_hour: { utilization: 0 }, seven_day: { utilization: 0 } }
+    })
+
+    // Stale pre-reset flight finishes first: must NOT write 84%/76% or delete postFlight!
+    releasePre()
+    const preRes = await preFlight
+    assert.equal(preRes.five_hour.utilization, 84)
+    assert.equal(cache.peek('acc-1'), null)
+    assert.equal(cache.stats().inflight, 1)
+
+    // Another post-reset caller joins postFlight (was NOT deleted by preFlight.finally).
+    const postJoin = cache.load('acc-1', async () => {
+      throw new Error('should have joined active post-reset flight')
+    })
+    releasePost()
+    const [postRes, joinedRes] = await Promise.all([postFlight, postJoin])
+    assert.equal(postRes.five_hour.utilization, 0)
+    assert.equal(joinedRes.five_hour.utilization, 0)
+    assert.equal(cache.peek('acc-1')?.result?.five_hour?.utilization, 0)
+    assert.equal(cache.stats().inflight, 0)
+  }
+
+  // 2b. Cached/shared probe keeps fetch-start timing so post-reset caller cannot stamp it post-reset.
+  {
+    const { cfg, quota } = makeFixture(t, { vmId: 'vm-u2', accountUuid: 'acc-u2' })
+    seedPreResetHeaders(quota, 'acc-u2', { u5: 0.84, u7: 0.76, now: T0 })
+    // Put a pre-reset stale entry in usageCache (simulated at T0 without clear to test timing defense-in-depth).
+    const cache = createUsageCache({ now: () => T0, jitter: false })
+    const preProbe = await cache.load('acc-u2', async () => ({
+      ok: true,
+      usage_status: 200,
+      limits_present: true,
+      probed_at: new Date(T3).toISOString(), // even if probed_at were late, fetchStartedAt is T0!
+      five_hour: { utilization: 84, resets_at: new Date(Number(RESET_5H_OLD) * 1000).toISOString(), status: 'allowed' },
+      seven_day: { utilization: 76, resets_at: RESET_7D_OFFICIAL, status: 'allowed_warning' },
+    }))
+    assert.equal(getUsageFetchMeta(preProbe)?.startedAt, T0)
+
+    // Confirmed reset at T1 (use a different cache instance so `cache` still holds the pre-reset entry).
+    const { transport } = scriptedTransport({ clears: ['five_hour', 'seven_day'] })
+    await buildClaudeResetRedeem({
+      cfg,
+      accountQuota: quota,
+      usageCache: createUsageCache({ jitter: false }),
+      id: 'vm-u2',
+      idempotencyKey: 'op-u2',
+      transport,
+      now: () => T1,
+    })
+
+    // Clear headers temporarily to force resolveUsageWindows to call cache.load -> hits pre-reset entry.
+    const accBefore = quota.repo.get('acc-u2')
+    accBefore.unified.headers = {}
+    quota.repo.save(accBefore)
+
+    await resolveUsageWindows({
+      accountQuota: quota,
+      accountId: 'acc-u2',
+      vmId: 'vm-u2',
+      exec: {},
+      vm: { id: 'vm-u2', claude: { account_uuid: 'acc-u2' } },
+      usageCache: cache,
+      probe: async () => {
+        throw new Error('expected cache hit')
+      },
+    })
+
+    // Reset boundaries must NOT be consumed by the pre-reset cached result!
+    const accAfter = quota.repo.get('acc-u2')
+    assert.equal(accAfter.unified.reset_boundaries['5h'].reconciled, false)
+    assert.equal(accAfter.unified.reset_boundaries['7d'].reconciled, false)
+    assert.equal(accAfter.unified.headers['5h'], undefined)
+  }
+})
+
+test('#1758 blocker 3: post-reset reconciliation clears pre-reset rate_limit_reset_at but preserves overload and post-reset 429s', async (t) => {
+  // 3a. Pre-reset 429 sets future rate_limit_reset_at -> reset -> valid 0% official probe lifts it.
+  {
+    const { cfg, quota, runtimeRepo } = makeFixture(t)
+    runtimeRepo.upsert({ account_id: 'acc-1', vm_id: 'vm-1', status: 'ready' })
+    const rateLimit = new RateLimitService({ runtimeRepo, accountQuota: quota })
+
+    const resetFutureSec = String(Math.floor((T0 + 3 * 3600_000) / 1000))
+    const block = rateLimit.handle429({
+      accountId: 'acc-1',
+      vmId: 'vm-1',
+      result: {
+        status: 429,
+        headers: {
+          'anthropic-ratelimit-unified-5h-status': 'rejected',
+          'anthropic-ratelimit-unified-5h-utilization': '1',
+          'anthropic-ratelimit-unified-5h-reset': resetFutureSec,
+        },
+      },
+      now: T0,
+    })
+    assert.ok(block?.until > T2)
+    assert.ok(runtimeRepo.get('acc-1').rate_limit_reset_at > T2)
+
+    const { transport } = scriptedTransport({ clears: ['five_hour', 'seven_day'] })
+    await buildClaudeResetRedeem({
+      cfg,
+      accountQuota: quota,
+      id: 'vm-1',
+      idempotencyKey: 'op-clear-rl',
+      transport,
+      now: () => T1,
+    })
+
+    // Post-reset valid 0% official probe reconciles and clears pre-reset rate_limit_reset_at.
+    quota.ingestOAuthUsage('acc-1', officialZeroProbe(T2), {
+      startedAt: T2,
+      resetGenerations: quota.resetGenerations('acc-1'),
+      now: T2,
+    })
+    const state = runtimeRepo.get('acc-1')
+    assert.equal(state.rate_limit_reset_at, null)
+    assert.equal(state.cooldown_until, null)
+    assert.equal(state.status, 'ready')
+    assert.equal(quota.canAccept('acc-1', { now: T2 }).ok, true)
+  }
+
+  // 3b. Active overload_until (529) prevents clearing.
+  {
+    const { cfg, quota, runtimeRepo } = makeFixture(t, { vmId: 'vm-ov', accountUuid: 'acc-ov' })
+    runtimeRepo.upsert({ account_id: 'acc-ov', vm_id: 'vm-ov', status: 'ready' })
+    runtimeRepo.updateWindow('acc-ov', {
+      vmId: 'vm-ov',
+      rateLimitedAt: T0,
+      rateLimitResetAt: T0 + 3 * 3600_000,
+      overloadUntil: T2 + 10 * 60_000,
+    })
+    const { transport } = scriptedTransport({ clears: ['five_hour'] })
+    await buildClaudeResetRedeem({
+      cfg,
+      accountQuota: quota,
+      id: 'vm-ov',
+      idempotencyKey: 'op-ov',
+      transport,
+      now: () => T1,
+    })
+    quota.ingestOAuthUsage('acc-ov', officialZeroProbe(T2), {
+      startedAt: T2,
+      resetGenerations: quota.resetGenerations('acc-ov'),
+      now: T2,
+    })
+    assert.ok(runtimeRepo.get('acc-ov').rate_limit_reset_at > T2)
+    assert.ok(runtimeRepo.get('acc-ov').overload_until > T2)
+  }
+
+  // 3c. Post-reset 429 (rate_limited_at > reset boundary) is NOT cleared by reconciling an earlier reset.
+  {
+    const { cfg, quota, runtimeRepo } = makeFixture(t, { vmId: 'vm-post429', accountUuid: 'acc-post429' })
+    runtimeRepo.upsert({ account_id: 'acc-post429', vm_id: 'vm-post429', status: 'ready' })
+    const { transport } = scriptedTransport({ clears: ['five_hour'] })
+    await buildClaudeResetRedeem({
+      cfg,
+      accountQuota: quota,
+      id: 'vm-post429',
+      idempotencyKey: 'op-post429',
+      transport,
+      now: () => T1,
+    })
+    // A brand new 429 happens at T2 (AFTER reset T1).
+    runtimeRepo.updateWindow('acc-post429', {
+      vmId: 'vm-post429',
+      rateLimitedAt: T2,
+      rateLimitResetAt: T2 + 3 * 3600_000,
+    })
+    quota.ingestOAuthUsage('acc-post429', officialZeroProbe(T3), {
+      startedAt: T3,
+      resetGenerations: quota.resetGenerations('acc-post429'),
+      now: T3,
+    })
+    assert.ok(runtimeRepo.get('acc-post429').rate_limit_reset_at > T3)
+  }
+})
+
+test('#1758 minors 2, 3, 4: per-window 429 reconcile, stale official/allocation guard, and import-commit timing', async (t) => {
+  // Minor #2: 5h 429 must not prematurely reconcile 7d when 7d utilization is absent.
+  {
+    const { cfg, quota } = makeFixture(t, { vmId: 'vm-m2', accountUuid: 'acc-m2' })
+    seedPreResetHeaders(quota, 'acc-m2', { u5: 0.84, u7: 0.76, now: T0 })
+    const { transport } = scriptedTransport({ clears: ['five_hour', 'seven_day'] })
+    await buildClaudeResetRedeem({
+      cfg,
+      accountQuota: quota,
+      id: 'vm-m2',
+      idempotencyKey: 'op-m2',
+      transport,
+      now: () => T1,
+    })
+    const gens = quota.resetGenerations('acc-m2')
+    quota.ingestHeaders(
+      'acc-m2',
+      {
+        'anthropic-ratelimit-unified-5h-status': 'rejected',
+        'anthropic-ratelimit-unified-5h-reset': RESET_5H_OLD,
+        'anthropic-ratelimit-unified-7d-status': 'allowed',
+      },
+      null,
+      { exhausted: true, countRequest: false, requestStartedAt: T2, resetGenerations: gens, now: T2 },
+    )
+    const acc = quota.repo.get('acc-m2')
+    assert.equal(acc.unified.reset_boundaries['5h'].reconciled, true)
+    assert.equal(acc.unified.reset_boundaries['7d'].reconciled, false)
+    assert.equal(acc.unified.headers['7d'].utilization, 0.76)
+  }
+
+  // Minor #3: open header reconciliation clears stale pre-reset limited official window;
+  // healOfficialOverwriteExtra ignores pre-reset header allocations.
+  {
+    const { cfg, quota } = makeFixture(t, { vmId: 'vm-m3', accountUuid: 'acc-m3' })
+    // Seed pre-reset 84% header allocation + limited official 100%.
+    seedPreResetHeaders(quota, 'acc-m3', { u5: 0.84, u7: 0.76, now: T0 })
+    const seeded = quota.repo.get('acc-m3')
+    seeded.unified.official = {
+      '5h': { utilization: 1, status: 'rejected', reset: new Date(Number(RESET_5H_OLD) * 1000).toISOString() },
+      '7d': { utilization: 1, status: 'rejected', reset: RESET_7D_OFFICIAL },
+    }
+    seeded.unified['5h'] = { ...seeded.unified.official['5h'] }
+    seeded.unified['7d'] = { ...seeded.unified.official['7d'] }
+    quota.repo.save(seeded)
+
+    const { transport } = scriptedTransport({ clears: ['five_hour', 'seven_day'] })
+    await buildClaudeResetRedeem({
+      cfg,
+      accountQuota: quota,
+      id: 'vm-m3',
+      idempotencyKey: 'op-m3',
+      transport,
+      now: () => T1,
+    })
+    const gens = quota.resetGenerations('acc-m3')
+    quota.ingestHeaders(
+      'acc-m3',
+      {
+        'anthropic-ratelimit-unified-5h-utilization': '0.05',
+        'anthropic-ratelimit-unified-5h-status': 'allowed',
+        'anthropic-ratelimit-unified-5h-reset': String(Math.floor((T2 + 5 * 3600_000) / 1000)),
+      },
+      null,
+      { requestStartedAt: T2, resetGenerations: gens, now: T2 },
+    )
+    const afterOpen = quota.repo.get('acc-m3')
+    assert.equal(afterOpen.unified.official['5h'].status, 'allowed')
+    assert.equal(afterOpen.unified.official['5h'].utilization, 0.05)
+    assert.equal(afterOpen.unified['5h'].status, 'allowed')
+    assert.equal(afterOpen.unified['5h'].utilization, 0.05)
+
+    // Pre-reset 84% allocation at T0 must not heal a post-reset 100% official reading at T3.
+    const { cfg: cfg3b, quota: quota3b } = makeFixture(t, { vmId: 'vm-m3b', accountUuid: 'acc-m3b' })
+    seedPreResetHeaders(quota3b, 'acc-m3b', { u5: 0.84, u7: 0.2, now: T0 })
+    const { transport: t3b } = scriptedTransport({ clears: ['five_hour'] })
+    await buildClaudeResetRedeem({
+      cfg: cfg3b,
+      accountQuota: quota3b,
+      id: 'vm-m3b',
+      idempotencyKey: 'op-m3b',
+      transport: t3b,
+      now: () => T1,
+    })
+    const gens3b = quota3b.resetGenerations('acc-m3b')
+    quota3b.ingestOAuthUsage(
+      'acc-m3b',
+      {
+        ok: true,
+        usage_status: 200,
+        limits_present: true,
+        probed_at: new Date(T2).toISOString(),
+        five_hour: {
+          utilization: 100,
+          resets_at: new Date(T2 + 5 * 3600_000).toISOString(),
+          status: 'rejected',
+        },
+        seven_day: { utilization: 20, resets_at: RESET_7D_OFFICIAL, status: 'allowed' },
+      },
+      { startedAt: T2, resetGenerations: gens3b, now: T2 },
+    )
+    const afterFull = quota3b.repo.get('acc-m3b')
+    assert.equal(afterFull.unified.headers['5h'].utilization, 1)
+    assert.equal(afterFull.unified.headers['5h'].status, 'rejected')
+  }
+
+  // Minor #4: officialCcStatsHandler captures startedAt & resetGenerations before stats arrive.
+  {
+    const { cfg, quota } = makeFixture(t, { vmId: 'vm-m4', accountUuid: 'acc-m4' })
+    seedPreResetHeaders(quota, 'acc-m4', { u5: 0.84, u7: 0.76, now: T0 })
+    const { officialCcStatsHandler } = createImportCommit({
+      cfg,
+      accountQuota: quota,
+      routingConfig: {},
+      applyVmConcurrency() {},
+    })
+    // Handler created before reset (captures gen 0 and pre-reset startedAt).
+    const onStats = officialCcStatsHandler('vm-m4', 'acc-m4')
+
+    const { transport } = scriptedTransport({ clears: ['five_hour', 'seven_day'] })
+    await buildClaudeResetRedeem({
+      cfg,
+      accountQuota: quota,
+      id: 'vm-m4',
+      idempotencyKey: 'op-m4',
+      transport,
+      now: () => T1,
+    })
+    quota.ingestOAuthUsage('acc-m4', officialZeroProbe(T2), {
+      startedAt: T2,
+      resetGenerations: quota.resetGenerations('acc-m4'),
+      now: T2,
+    })
+    assert.equal(listQuotaFromHeaders(quota.repo.get('acc-m4').unified, { now: T2 }).utilization_5h, 0)
+
+    // Pre-reset bootstrap stats finish late -> must be ignored!
+    onStats({
+      five_hour: { utilization: 84, resets_at: new Date(Number(RESET_5H_OLD) * 1000).toISOString(), status: 'allowed' },
+      seven_day: { utilization: 76, resets_at: RESET_7D_OFFICIAL, status: 'allowed_warning' },
+    })
+    assert.equal(listQuotaFromHeaders(quota.repo.get('acc-m4').unified, { now: T3 }).utilization_5h, 0)
+    assert.equal(listQuotaFromHeaders(quota.repo.get('acc-m4').unified, { now: T3 }).utilization_7d, 0)
+  }
 })

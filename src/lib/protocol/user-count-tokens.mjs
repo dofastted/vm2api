@@ -23,7 +23,7 @@ import {
   isClaudeCodeFamilyRequest,
 } from '../identity/claude-code-only.mjs'
 import { canCountTokens, canOfficialUsage, credentialModeOfVm, isApiKeyMode } from '../oauth/credential-mode.mjs'
-import { getUsageCache } from '../oauth/usage-cache.mjs'
+import { attachUsageFetchMeta, getUsageCache, getUsageFetchMeta } from '../oauth/usage-cache.mjs'
 import { probeAccount } from '../oauth/usage-probe.mjs'
 import { isOfficialUsageRateLimited, shouldHopOfficialUsage } from '../oauth/crs-usage-probe.mjs'
 import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
@@ -394,19 +394,23 @@ export async function resolveUsageWindows({
   if (!usageWindowsEmpty(listed)) return { listed, source }
   if (!shouldHopOfficialUsage(acc?.unified, { hop: true })) return { listed, source }
   const cache = usageCache || getUsageCache()
-  const probeStartedAt = Date.now()
-  const probeResetGenerations = accountQuota?.resetGenerations?.(accountId) || null
   let result
   try {
-    result = await cache.load(accountId, () => probe({ exec, vm, includeFable: false }))
+    result = await cache.load(accountId, async () => {
+      const startedAt = Date.now()
+      const resetGenerations = accountQuota?.resetGenerations?.(accountId) || null
+      const probed = await probe({ exec, vm, includeFable: false })
+      return attachUsageFetchMeta(probed, { startedAt, resetGenerations })
+    })
   } catch {
     return { listed, source }
   }
   if (!result || isOfficialUsageRateLimited(result)) return { listed, source }
   try {
+    const fetchMeta = getUsageFetchMeta(result)
     accountQuota?.ingestOAuthUsage?.(accountId, result, {
-      startedAt: probeStartedAt,
-      resetGenerations: probeResetGenerations,
+      ...(fetchMeta?.startedAt != null ? { startedAt: fetchMeta.startedAt } : {}),
+      ...(fetchMeta?.resetGenerations ? { resetGenerations: fetchMeta.resetGenerations } : {}),
     })
   } catch {}
   const next = accountQuota?.repo?.get?.(accountId) || acc

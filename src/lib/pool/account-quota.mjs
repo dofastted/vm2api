@@ -330,6 +330,10 @@ export class AccountQuota {
     const writeExtra = countRequest || exhausted
     const u5 = num(h['anthropic-ratelimit-unified-5h-utilization'])
     const u7 = num(h['anthropic-ratelimit-unified-7d-utilization'])
+    const s5Raw = String(h['anthropic-ratelimit-unified-5h-status'] || '').toLowerCase()
+    const s7Raw = String(h['anthropic-ratelimit-unified-7d-status'] || '').toLowerCase()
+    const rejected5 = s5Raw === 'rejected' || s5Raw === 'rate_limited'
+    const rejected7 = s7Raw === 'rejected' || s7Raw === 'rate_limited'
     const sampledAt = new Date(nowMs).toISOString()
     const timing = {
       resetGenerations: extra.resetGenerations ?? null,
@@ -340,6 +344,7 @@ export class AccountQuota {
     const checkOi = checkResetWindowWrite(acc, '7d_oi', timing)
     let sampled = false
     let reconciledAny = false
+    let resetReconciledAtMs = null
     if (exhausted) {
       if (check5.allowed) dropElapsedReset(acc, '5h', h['anthropic-ratelimit-unified-5h-reset'], nowMs)
       if (check7.allowed) dropElapsedReset(acc, '7d', h['anthropic-ratelimit-unified-7d-reset'], nowMs)
@@ -349,7 +354,7 @@ export class AccountQuota {
       check5.allowed &&
       (u5 != null || h['anthropic-ratelimit-unified-5h-status'] || h['anthropic-ratelimit-unified-5h-reset'])
     ) {
-      const reconcile5 = check5.pendingReset && (u5 != null || exhausted)
+      const reconcile5 = check5.pendingReset && (u5 != null || rejected5)
       writeHeaderWindow(
         acc,
         '5h',
@@ -363,7 +368,9 @@ export class AccountQuota {
       )
       if (reconcile5) {
         acc.unified.reset_boundaries['5h'] = { ...acc.unified.reset_boundaries['5h'], reconciled: true }
+        clearStalePreResetOfficialWindow(acc, '5h')
         reconciledAny = true
+        resetReconciledAtMs = maxTimestamp(resetReconciledAtMs, boundaryAtMsOf(acc.unified.reset_boundaries['5h']))
       }
       sampled = true
     }
@@ -372,7 +379,7 @@ export class AccountQuota {
       check7.allowed &&
       (u7 != null || h['anthropic-ratelimit-unified-7d-status'] || h['anthropic-ratelimit-unified-7d-reset'])
     ) {
-      const reconcile7 = check7.pendingReset && (u7 != null || exhausted)
+      const reconcile7 = check7.pendingReset && (u7 != null || rejected7)
       writeHeaderWindow(
         acc,
         '7d',
@@ -386,7 +393,9 @@ export class AccountQuota {
       )
       if (reconcile7) {
         acc.unified.reset_boundaries['7d'] = { ...acc.unified.reset_boundaries['7d'], reconciled: true }
+        clearStalePreResetOfficialWindow(acc, '7d')
         reconciledAny = true
+        resetReconciledAtMs = maxTimestamp(resetReconciledAtMs, boundaryAtMsOf(acc.unified.reset_boundaries['7d']))
       }
       sampled = true
     }
@@ -487,7 +496,10 @@ export class AccountQuota {
     const saved = this.repo.save(acc)
     this._writeSessionWindow(saved)
     if (reconciledAny && this.headerUnderSafety(saved, nowMs)) {
-      this.clearQuotaExhaustedCooldown(accountId)
+      this.clearQuotaExhaustedCooldown(accountId, {
+        now: nowMs,
+        ...(resetReconciledAtMs != null ? { resetReconciledAtMs } : {}),
+      })
     }
     if (sampled) {
       const observed5 = headerWindowOrEmpty(saved.unified, '5h', { now: nowMs })
@@ -702,13 +714,14 @@ export class AccountQuota {
       transport: fableTransport,
     }
     acc.unified.last_probe = acc.last_probe
+    let syncResult = { copied: false, reconciledAny: false, resetReconciledAtMs: null }
     if (usageOk) {
-      syncActiveToPassive(acc, nowIso, {
+      syncResult = syncActiveToPassive(acc, nowIso, {
         now: nowMs,
         freshWindows,
         checks: { '5h': check5, '7d': check7, '7d_oi': checkOi },
       })
-      healOfficialOverwriteExtra(acc, accountId, this.repo)
+      healOfficialOverwriteExtra(acc, accountId, this.repo, nowMs)
       clearHeaderExhaustIfOfficialOpen(acc, { allowed5: check5.allowed, allowed7: check7.allowed })
     }
     settleElapsedHeaderWindows(acc, nowIso, nowMs)
@@ -725,7 +738,12 @@ export class AccountQuota {
       })
     }
     if (usageOk && this.headerUnderSafety(saved, nowMs)) {
-      this.clearQuotaExhaustedCooldown(accountId)
+      this.clearQuotaExhaustedCooldown(accountId, {
+        now: nowMs,
+        ...(syncResult.reconciledAny && syncResult.resetReconciledAtMs != null
+          ? { resetReconciledAtMs: syncResult.resetReconciledAtMs }
+          : {}),
+      })
     }
     return saved
   }
@@ -750,6 +768,7 @@ export class AccountQuota {
       startedAtMs: parseTimestampMs(requestStartedAt),
     }
     let reconciledAny = false
+    let resetReconciledAtMs = null
     for (const info of infos) {
       if (!info || typeof info !== 'object') continue
       const typ = String(info.rateLimitType || info.rate_limit_type || '')
@@ -775,7 +794,9 @@ export class AccountQuota {
         )
         if (reconcile) {
           acc.unified.reset_boundaries[window] = { ...acc.unified.reset_boundaries[window], reconciled: true }
+          clearStalePreResetOfficialWindow(acc, window)
           reconciledAny = true
+          resetReconciledAtMs = maxTimestamp(resetReconciledAtMs, boundaryAtMsOf(acc.unified.reset_boundaries[window]))
         }
         acc.unified.headers[window].rate_limit_type = typ || null
         if (isRej) {
@@ -813,7 +834,10 @@ export class AccountQuota {
     this._rollWindowHistory(acc, nowMs)
     const saved = this.repo.save(acc)
     if (reconciledAny && this.headerUnderSafety(saved, nowMs)) {
-      this.clearQuotaExhaustedCooldown(accountId)
+      this.clearQuotaExhaustedCooldown(accountId, {
+        now: nowMs,
+        ...(resetReconciledAtMs != null ? { resetReconciledAtMs } : {}),
+      })
     }
     return saved
   }
@@ -1216,10 +1240,10 @@ export class AccountQuota {
     )
     if (leftover.changed) wiped = leftover
     if (!changed && !wiped.changed) {
-      const healed = healOfficialOverwriteExtra(acc, accountId, this.repo)
+      const healed = healOfficialOverwriteExtra(acc, accountId, this.repo, now)
       if (!healed) {
         if (backoffExpired) this.repo.save(acc)
-        if (this.headerUnderSafety(acc)) this.clearQuotaExhaustedCooldown(accountId)
+        if (this.headerUnderSafety(acc, now)) this.clearQuotaExhaustedCooldown(accountId, { now })
         return acc
       }
     } else {
@@ -1232,12 +1256,12 @@ export class AccountQuota {
         writeOfficialWindow(acc, '5h', n5)
         writeOfficialWindow(acc, '7d', n7)
       }
-      healOfficialOverwriteExtra(acc, accountId, this.repo)
+      healOfficialOverwriteExtra(acc, accountId, this.repo, now)
     }
     acc.unified.updated_at = new Date().toISOString()
     const saved = this.repo.save(acc)
     this._writeSessionWindow(saved)
-    if (this.headerUnderSafety(saved)) this.clearQuotaExhaustedCooldown(accountId)
+    if (this.headerUnderSafety(saved, now)) this.clearQuotaExhaustedCooldown(accountId, { now })
     return saved
   }
 
@@ -1260,7 +1284,7 @@ export class AccountQuota {
     return true
   }
 
-  clearQuotaExhaustedCooldown(accountId) {
+  clearQuotaExhaustedCooldown(accountId, { now = Date.now(), resetReconciledAtMs = null } = {}) {
     if (!accountId || !this.runtimeRepo) return false
     let state = null
     try {
@@ -1269,12 +1293,24 @@ export class AccountQuota {
       return false
     }
     if (!state) return false
-    // Live 429 / overload columns belong to RateLimitService; passive Extra never lifts them.
-    if (Number(state.rate_limit_reset_at) > Date.now() || Number(state.overload_until) > Date.now()) return false
+    const nowMs = parseTimestampMs(now) ?? Date.now()
+    // Live 529 overload belongs to RateLimitService; never clear it here.
+    if (Number(state.overload_until) > nowMs) return false
+    const rateLimitedFuture = Number(state.rate_limit_reset_at) > nowMs
+    const reconciledAt = parseTimestampMs(resetReconciledAtMs)
+    const rateLimitedAt = parseTimestampMs(state.rate_limited_at)
+    const canClearPreResetRateLimit =
+      rateLimitedFuture &&
+      reconciledAt != null &&
+      rateLimitedAt != null &&
+      rateLimitedAt <= reconciledAt
+    // Live 429 columns belong to RateLimitService; passive Extra never lifts them
+    // unless a confirmed reset boundary (at >= rate_limited_at) was just reconciled.
+    if (rateLimitedFuture && !canClearPreResetRateLimit) return false
     const reason = String(state.cooldown_reason || '')
     const quotaCool = !reason || /quota|account_quota_exhausted|rate_limited/i.test(reason)
     if (!quotaCool) return false
-    if (!state.cooldown_until && !reason) return false
+    if (!state.cooldown_until && !reason && !canClearPreResetRateLimit) return false
     try {
       this.runtimeRepo.upsert?.({
         ...state,
@@ -1282,6 +1318,9 @@ export class AccountQuota {
         cooldown_until: null,
         cooldown_reason: null,
         rate_limit_reset_at: null,
+        ...(canClearPreResetRateLimit && state.session_window_status === 'rejected'
+          ? { session_window_status: 'allowed' }
+          : {}),
       })
     } catch {
       return false
@@ -1646,6 +1685,32 @@ function parseTimestampMs(value) {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+function boundaryAtMsOf(boundary) {
+  return parseTimestampMs(boundary?.at_ms ?? boundary?.at)
+}
+
+function maxTimestamp(current, next) {
+  if (next == null) return current
+  return current == null ? next : Math.max(current, next)
+}
+
+function clearStalePreResetOfficialWindow(acc, key) {
+  if (!acc?.unified) return
+  const next = acc.unified.headers?.[key]
+  if (!next || officialLooksLimited(next)) return
+  const replacement = {
+    utilization: next.utilization ?? 0,
+    reset: next.reset || null,
+    status: next.status || 'allowed',
+  }
+  if (acc.unified.official?.[key] && officialLooksLimited(acc.unified.official[key])) {
+    acc.unified.official[key] = { ...replacement }
+  }
+  if (acc.unified[key] && officialLooksLimited(acc.unified[key])) {
+    acc.unified[key] = { ...replacement }
+  }
+}
+
 function checkResetWindowWrite(
   acc,
   key,
@@ -1790,6 +1855,7 @@ function syncActiveToPassive(acc, sampledAt, { now = Date.now(), freshWindows = 
   const at = sampledAt || new Date(now).toISOString()
   let copied = false
   let reconciledAny = false
+  let resetReconciledAtMs = null
   for (const key of ['5h', '7d']) {
     const check = checks?.[key] || null
     if (check && !check.allowed) continue
@@ -1815,6 +1881,7 @@ function syncActiveToPassive(acc, sampledAt, { now = Date.now(), freshWindows = 
       acc.unified.reset_boundaries[key] = { ...acc.unified.reset_boundaries[key], reconciled: true }
       copied = true
       reconciledAny = true
+      resetReconciledAtMs = maxTimestamp(resetReconciledAtMs, boundaryAtMsOf(acc.unified.reset_boundaries[key]))
       continue
     }
     if (!shouldCopyOfficialToExtra(src, extra, now)) {
@@ -1861,7 +1928,7 @@ function syncActiveToPassive(acc, sampledAt, { now = Date.now(), freshWindows = 
     }
   }
   if (copied) acc.unified.headers.sampled_at = at
-  return { copied, reconciledAny }
+  return { copied, reconciledAny, resetReconciledAtMs }
 }
 
 function lastHeaderAllocation(repo, accountId) {
@@ -1891,12 +1958,12 @@ function expireUsageProbeBackoff(acc, now = Date.now()) {
 }
 
 /** Undo leftover official 100% that was copied onto a still-open Extra window. */
-function healOfficialOverwriteExtra(acc, accountId, repo) {
+function healOfficialOverwriteExtra(acc, accountId, repo, now = Date.now()) {
   if (!acc?.unified?.headers) return false
   const extra = acc.unified.headers['5h']
   const official = officialWindow(acc.unified, '5h')
   if (!officialLooksLimited(extra) || !officialLooksLimited(official)) return false
-  if (extraIsLiveOpen(extra)) return false
+  if (extraIsLiveOpen(extra, now)) return false
   // Only undo a value this probe copied; rows written before per-window times use the shared one.
   const sampled = extra.sampled_at || acc.unified.headers.sampled_at
   const probeAt = acc.last_probe?.at || acc.unified.last_probe?.at
@@ -1906,14 +1973,24 @@ function healOfficialOverwriteExtra(acc, accountId, repo) {
     if (Number.isFinite(sampledMs) && Number.isFinite(probeMs) && Math.abs(sampledMs - probeMs) > 5000) return false
   }
   const last = lastHeaderAllocation(repo, accountId)
+  const boundaryAtMs = boundaryAtMsOf(acc.unified.reset_boundaries?.['5h'])
+  if (boundaryAtMs != null) {
+    const lastAtMs = parseTimestampMs(last?.at)
+    if (lastAtMs == null || lastAtMs < boundaryAtMs) return false
+  }
   const prev = Number(last?.util_5h)
   if (!Number.isFinite(prev) || prev >= 0.95) return false
-  writeHeaderWindow(acc, '5h', {
-    utilization: prev,
-    status: last.status_5h || 'allowed',
-    reset: extra.reset || last.reset_5h || official.reset || null,
-    sampled_at: last.at,
-  })
+  writeHeaderWindow(
+    acc,
+    '5h',
+    {
+      utilization: prev,
+      status: last.status_5h || 'allowed',
+      reset: extra.reset || last.reset_5h || official.reset || null,
+      sampled_at: last.at,
+    },
+    { now },
+  )
   acc.unified.headers.exhausted_at = null
   return true
 }
