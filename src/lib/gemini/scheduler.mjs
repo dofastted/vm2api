@@ -1227,12 +1227,18 @@ export function createGeminiScheduler({
             recordAccountUsage(apiKeyRecord, resolved.publicId, collected.usage || {})
             poolScheduler?.unitCircuit?.recordSuccess?.(selected.accountId)
             poolScheduler?.lastUsed?.set?.(selected.accountId, finishedAt)
+            const reportedModel =
+              typeof collected.reportedModel === 'string' && collected.reportedModel.trim()
+                ? collected.reportedModel.trim()
+                : null
             return {
               ...collected,
               account_id: id,
               auth_method: authMethod,
               model: resolved.publicId,
-              upstream_model: resolved.upstreamModel,
+              dispatched_model: resolved.upstreamModel,
+              response_model: reportedModel,
+              upstream_model: reportedModel || resolved.upstreamModel,
               provider: resolved.provider,
               quota_group: resolved.quotaGroup,
               attempt_count: attempts,
@@ -1326,6 +1332,8 @@ export function createGeminiScheduler({
         account_id: result.account_id,
         auth_method: result.auth_method,
         model: result.model,
+        dispatched_model: result.dispatched_model ?? null,
+        response_model: result.response_model ?? null,
         upstream_model: result.upstream_model,
         stopReason: result.stopReason,
         searches: result.searches,
