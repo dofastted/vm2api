@@ -470,3 +470,31 @@ test('active sessions flag one-off (single request, no tools) apart without merg
     ],
   )
 })
+
+test('failed_only filter matches committed HTTP 200 failed terminals without altering exclude_status_200 (#1213)', () => {
+  const db = freshDb()
+  const rows = seed(db, [
+    { status: 200, final_state: 'verified' },
+    { status: 200, final_state: null },
+    { status: 200, final_state: 'rejected', error_code: 'slot_busy' },
+    { status: 200, final_state: 'incomplete' },
+    { status: 200, final_state: 'failed', error_code: 'gemini_tool_call_required' },
+    { status: 529, final_state: 'rejected', error_code: 'slot_busy' },
+  ])
+  const view = new UsageLogsView(db)
+  const ids = (f) =>
+    view
+      .listBatch(f)
+      .logs.map((r) => r.id)
+      .sort()
+
+  // exclude_status_200 stays pure HTTP status filtering.
+  assert.deepEqual(ids({ exclude_status_200: true }), [rows[5].id])
+
+  // failed_only includes non-2xx AND committed 200 rows whose final_state is not verified,
+  // while leaving verified and legacy unrecorded-terminal 200 rows out.
+  assert.deepEqual(ids({ failed_only: true }), [rows[2].id, rows[3].id, rows[4].id, rows[5].id].sort())
+
+  // Combining status_code=200 + failed_only isolates committed 200 streaming failures.
+  assert.deepEqual(ids({ status_code: '200', failed_only: true }), [rows[2].id, rows[3].id, rows[4].id].sort())
+})

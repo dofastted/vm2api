@@ -101,6 +101,12 @@ export function ActiveFiltersDisplay({
       label: '状态码',
       value: String(filters.statusCode),
     })
+  if (filters.failedOnly)
+    chips.push({
+      key: 'failedOnly',
+      label: '失败终态',
+      value: '所有失败（含流式 200）',
+    })
   if ((filters.minRetry ?? 0) > 0)
     chips.push({
       key: 'minRetry',

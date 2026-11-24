@@ -17,6 +17,8 @@ export type LogsSearch = {
   endTime?: number
   /** 精确状态码或 `!200`（= 只看非 2xx）。 */
   statusCode?: number | '!200'
+  /** 筛选所有失败请求（含流式 200 失败终态）。 */
+  failedOnly?: boolean
   model?: string
   /** 计费/实际模型不一致。 */
   mismatch?: boolean
@@ -41,6 +43,7 @@ export type LogsFilterState = {
   endTime?: number
   statusCode?: number
   excludeStatus200?: boolean
+  failedOnly?: boolean
   model?: string
   mismatch?: boolean
   endpoint?: string
@@ -88,6 +91,7 @@ export function validateLogsSearch(
     startTime: search.startTime == null ? undefined : int(search.startTime),
     endTime: search.endTime == null ? undefined : int(search.endTime),
     statusCode,
+    failedOnly: flag(search.failedOnly),
     model: str(search.model),
     mismatch: flag(search.mismatch),
     endpoint: str(search.endpoint),
@@ -111,6 +115,7 @@ export function searchToFilters(search: LogsSearch): LogsFilterState {
     statusCode:
       typeof search.statusCode === 'number' ? search.statusCode : undefined,
     excludeStatus200: exclude || undefined,
+    failedOnly: search.failedOnly,
     model: search.model,
     mismatch: search.mismatch,
     endpoint: search.endpoint,
@@ -132,6 +137,7 @@ export function filtersToSearch(filters: LogsFilterState): LogsSearch {
   if (filters.endTime != null) out.endTime = filters.endTime
   if (filters.excludeStatus200) out.statusCode = '!200'
   else if (filters.statusCode != null) out.statusCode = filters.statusCode
+  if (filters.failedOnly) out.failedOnly = true
   if (filters.model) out.model = filters.model
   if (filters.mismatch) out.mismatch = true
   if (filters.endpoint) out.endpoint = filters.endpoint
@@ -160,6 +166,7 @@ export function filtersToApi(
   if (filters.protocol) out.protocol = filters.protocol
   if (filters.statusCode != null) out.statusCode = filters.statusCode
   else if (filters.excludeStatus200) out.excludeStatus200 = true
+  if (filters.failedOnly) out.failedOnly = true
   if (filters.mismatch) out.modelMismatch = true
   if (filters.minRetry != null && filters.minRetry > 0)
     out.minAttemptCount = filters.minRetry + 1
@@ -191,6 +198,7 @@ export function usageLogFiltersQuery(
   set('protocol', filters.protocol)
   set('status_code', filters.statusCode)
   if (filters.excludeStatus200) qs.set('exclude_status_200', '1')
+  if (filters.failedOnly) qs.set('failed_only', '1')
   if (filters.modelMismatch) qs.set('model_mismatch', '1')
   set('min_attempt_count', filters.minAttemptCount)
   set('error_class', filters.errorClass)
@@ -212,6 +220,7 @@ export function activeFilterCount(filters: LogsFilterState): number {
   if (filters.vmId) count++
   if (filters.sessionId) count++
   if (filters.statusCode != null || filters.excludeStatus200) count++
+  if (filters.failedOnly) count++
   if (filters.model) count++
   if (filters.mismatch) count++
   if (filters.endpoint) count++
