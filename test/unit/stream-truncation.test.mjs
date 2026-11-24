@@ -178,3 +178,30 @@ test('started SSE stream remaps transient mid-response capture/stream errors to 
     assert.equal(notified, 0)
   }
 })
+
+test('the retryable-truncation callback receives the raw payload and the mapped error', () => {
+  // The client is told to retry, so the caller has to be able to log what really
+  // happened. This relay path writes no other diagnostic fields, so if these two
+  // arguments were dropped a deterministic fault would read as a transient drop.
+  const upstream = {
+    type: 'error',
+    error: { type: 'capture_error', code: 'capture_broke', message: 'Provider observation is incomplete' },
+  }
+  const seen = []
+  const remapper = createAnthropicSseErrorRemapper({
+    isStarted: () => true,
+    onRetryableTruncation: (payload, mapped) => {
+      seen.push([payload, mapped])
+    },
+  })
+  remapper.remapLine('event: error\n')
+  const out = JSON.parse(remapper.remapLine(`data: ${JSON.stringify(upstream)}\n`).trim().slice(5))
+  assert.equal(out.error.type, 'rate_limit_error')
+  assert.equal(seen.length, 1)
+  const [payload, mapped] = seen[0]
+  assert.equal(payload.error.type, 'capture_error')
+  assert.equal(payload.error.code, 'capture_broke')
+  assert.equal(payload.error.message, 'Provider observation is incomplete')
+  assert.ok(mapped?.body?.error, 'the mapped error must reach the callback too')
+  assert.ok(mapped.status >= 500)
+})

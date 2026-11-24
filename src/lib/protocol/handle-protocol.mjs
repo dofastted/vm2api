@@ -1782,9 +1782,16 @@ export function createHandleProtocol(deps) {
       clientStream && protocol === 'anthropic.messages'
         ? createAnthropicSseErrorRemapper({
           isStarted: () => streamTracker?.hasStarted() === true,
-          onRetryableTruncation: () => {
+          // The client is told to retry, so the real cause has to survive here or
+          // it survives nowhere: this relay path sets no other logBag fields, and
+          // a deterministic capture fault would otherwise read exactly like a
+          // transient disconnect while the client retries into it.
+          onRetryableTruncation: (payload, mapped) => {
+            const raw = payload?.error || payload || {}
             logBag.client_error_type = 'rate_limit_error'
             logBag.truncation_reason = 'mid_stream_error'
+            logBag.error_code = raw.code || raw.type || mapped?.body?.error?.code || logBag.error_code || null
+            logBag.error_message = raw.message || mapped?.body?.error?.message || logBag.error_message || null
           },
         })
         : null
