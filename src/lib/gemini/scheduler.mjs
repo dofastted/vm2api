@@ -64,6 +64,10 @@ const FAILURES = {
   gemini_quota_exhausted: [429, 'The selected Gemini account quota is exhausted.'],
   gemini_inference_timeout: [504, 'The Gemini turn timed out.'],
   gemini_inference_invalid_output: [502, 'Gemini returned an unreadable response.'],
+  gemini_tool_call_required: [
+    502,
+    'Upstream completed without a required function call (functionCallingConfig.mode=ANY / tool_choice required).',
+  ],
   gemini_inference_start_failed: [503, 'Gemini could not start the turn.'],
   gemini_inference_cancelled: [499, 'The Gemini turn was cancelled.'],
   gemini_inference_output_limit: [502, 'The Gemini response exceeded the text limit.'],
@@ -99,6 +103,7 @@ const NON_CIRCUIT_FAILURES = new Set([
   'gemini_unsupported_turn',
   'gemini_invalid_request',
   'gemini_inference_tool_blocked',
+  'gemini_tool_call_required',
   'gemini_proxy_calibration_mismatch',
   'license_required',
   'license_expired',
@@ -316,6 +321,22 @@ async function consumeStreamResponse(
   }
   if (!result.sawFinish && !result.text && !result.toolCalls.length && !result.images.length) {
     const err = fail(502, 'gemini_inference_invalid_output')
+    err.timing = timing.snapshot()
+    err.usage = result.usage
+    throw err
+  }
+  const requiredChoice = typeof restoreContext?.toolChoice === 'string' ? restoreContext.toolChoice : ''
+  const requiresToolCall =
+    (requiredChoice === 'required' || requiredChoice.startsWith('name:')) && (restoreContext?.toolMap?.size ?? 0) > 0
+  if (
+    requiresToolCall &&
+    result.toolCalls.length === 0 &&
+    (result.stopReason === 'stop' || (!result.sawFinish && result.text))
+  ) {
+    const message = requiredChoice.startsWith('name:')
+      ? `Upstream completed without calling required function "${requiredChoice.slice(5)}".`
+      : FAILURES.gemini_tool_call_required[1]
+    const err = fail(502, 'gemini_tool_call_required', message)
     err.timing = timing.snapshot()
     err.usage = result.usage
     throw err
