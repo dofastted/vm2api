@@ -3232,6 +3232,22 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
   }
 
   if (ag) {
+    // CRAGGemini carries no safetySettings, and this branch returns without ever
+    // setting the field. Dropping a populated one silently answers as though the
+    // caller's safety policy had been applied, which is the one outcome they cannot
+    // detect: say so instead and name the way out. An empty array asks for nothing,
+    // so it keeps falling through (#1703).
+    //
+    // The plain-text host transport already reports this through `unsupportedFields`
+    // (scheduler.mjs), but that path only guards turns it cannot carry at all; the
+    // main inference path reached here with no word to the caller.
+    if (Array.isArray(ir.safetySettings) && ir.safetySettings.length > 0) {
+      throw makeProtocolError(
+        400,
+        'gemini_unsupported_turn',
+        'CRAGGemini cannot apply safetySettings; omit the field or use a Gemini API key environment.',
+      )
+    }
     // CRAGGemini minimal tool forwarding:
     // - `toolChoice === 'none'` omits both `tools` and `toolConfig` so native `agy` never registers unused tools.
     // - Supports combining `functionDeclarations` with allowed native Google tools (`googleSearch`, `urlContext`).
