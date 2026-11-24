@@ -1812,3 +1812,84 @@ test('Gemini mode=ANY rejects plain-text STOP without functionCall while keeping
   assert.match(r6.bodyText(), /"finishReason":"STOP"/)
   assert.equal(logs.at(-1).final_state, 'verified')
 })
+
+test('publicError sanitizes HOST_INFRASTRUCTURE_CODES details/retryAfter while forwarding over-limit metadata', async () => {
+  const infraErr = Object.assign(new Error('ENOENT /run/private-gemini.sock'), {
+    code: 'gemini_host_socket_missing',
+    status: 503,
+    details: { socket_path: '/run/private-gemini.sock' },
+    retryAfter: 30,
+  })
+  const overlimitErr = Object.assign(new Error('API key rate limit exceeded (2/min)'), {
+    code: 'api_key_rate_limit',
+    status: 429,
+    details: {
+      limit_type: 'rpm',
+      current: 2,
+      limit: 2,
+      remaining: 0,
+      reset_at: '2026-11-24T12:01:00.000Z',
+      retry_after: 12,
+    },
+    retryAfter: 12,
+  })
+
+  for (const mode of ['complete', 'stream']) {
+    let nextErr = infraErr
+    const scheduler = {
+      catalog: async () => ({ models: ['gemini-2.5-pro'], environments: [] }),
+      ...(mode === 'complete'
+        ? {
+            complete: async () => {
+              throw nextErr
+            },
+          }
+        : {
+            stream: async () => {
+              throw nextErr
+            },
+          }),
+    }
+    const handler = createGeminiPublicHandler({
+      json: jsonResponder,
+      readBody: async (r) => r.body || {},
+      scheduler,
+    })
+
+    // 1. Infrastructure error must be sanitized: 503 gemini_host_unavailable, no details, no Retry-After.
+    nextErr = infraErr
+    const resInfra = makeRes()
+    await handler(
+      makeReq({
+        url: '/v1/chat/completions',
+        body: { model: 'gemini-2.5-pro', messages: [{ role: 'user', content: 'hi' }] },
+      }),
+      resInfra,
+    )
+    assert.equal(resInfra.statusCode, 503)
+    assert.equal(resInfra.headers['retry-after'], undefined)
+    const infraBody = resInfra.jsonBody()
+    assert.equal(infraBody.error.code, 'gemini_host_unavailable')
+    assert.equal(infraBody.error.details, undefined)
+    assert.doesNotMatch(resInfra.bodyText(), /private-gemini\.sock/)
+
+    // 2. Non-infrastructure over-limit error preserves status, Retry-After, and details.
+    nextErr = overlimitErr
+    const resLimit = makeRes()
+    await handler(
+      makeReq({
+        url: '/v1/chat/completions',
+        body: { model: 'gemini-2.5-pro', messages: [{ role: 'user', content: 'hi' }] },
+      }),
+      resLimit,
+    )
+    assert.equal(resLimit.statusCode, 429)
+    assert.equal(resLimit.headers['retry-after'], '12')
+    const limitBody = resLimit.jsonBody()
+    assert.equal(limitBody.error.code, 'api_key_rate_limit')
+    assert.equal(limitBody.error.type, 'rate_limit_error')
+    assert.equal(limitBody.error.details.limit_type, 'rpm')
+    assert.equal(limitBody.error.details.current, 2)
+    assert.equal(limitBody.error.details.limit, 2)
+  }
+})

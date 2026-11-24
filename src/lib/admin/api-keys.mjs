@@ -466,7 +466,7 @@ export class ApiKeyStore {
     let arr = this.rpmBuckets.get(id) || []
     arr = arr.filter((t) => now - t < windowMs)
     this.rpmBuckets.set(id, arr)
-    return { count: arr.length, oldest: arr.length ? arr[0] : null }
+    return { count: arr.length, timestamps: arr }
   }
 
   _rpmCount(id, now = Date.now()) {
@@ -486,7 +486,8 @@ export class ApiKeyStore {
       if (rec.status === 'quota_exhausted') {
         const hasUsdQuota = (rec.quota ?? 0) > 0
         const hasReqQuota = (rec.quota_requests ?? 0) > 0
-        if (!hasUsdQuota && hasReqQuota && (rec.quota_requests_used ?? 0) >= rec.quota_requests) {
+        const usdExhausted = hasUsdQuota && (rec.quota_used ?? 0) >= rec.quota
+        if (!usdExhausted && hasReqQuota && (rec.quota_requests_used ?? 0) >= rec.quota_requests) {
           const current = Number(rec.quota_requests_used) || 0
           const limit = rec.quota_requests
           return {
@@ -584,9 +585,10 @@ export class ApiKeyStore {
       }
     }
     if (rec.rpm > 0) {
-      const { count: n, oldest } = this._rpmState(rec.id, now)
+      const { count: n, timestamps } = this._rpmState(rec.id, now)
       if (n >= rec.rpm) {
-        const resetMs = oldest != null ? oldest + 60_000 : now + 60_000
+        const blockingTs = timestamps[Math.max(0, timestamps.length - rec.rpm)]
+        const resetMs = blockingTs != null ? blockingTs + 60_000 : now + 60_000
         const resetAt = new Date(resetMs).toISOString()
         const retryAfter = Math.max(1, Math.ceil((resetMs - now) / 1000))
         return {

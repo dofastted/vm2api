@@ -332,3 +332,65 @@ test('over-limit verdicts unify 402 (spend) vs 429 (RPM/concurrency/requests), m
   assert.equal(concErr.headers['Retry-After'], '1')
   store.release(concKey)
 })
+
+test('dual-quota key reports 429 requests_quota when USD cap is raised while requests remain exhausted', () => {
+  const store = tmpStore()
+  const now = Date.parse('2026-11-24T12:00:00.000Z')
+  const rec = store.create({ name: 'dual', quota: 1, quota_requests: 2, rpm: 0, max_concurrency: 0 })
+  store.recordUsage(rec.id, { total_cost: 0.6 })
+  store.recordUsage(rec.id, { total_cost: 0.9 })
+  assert.equal(store.getById(rec.id).status, 'quota_exhausted')
+
+  // Raising USD quota alone leaves quota_requests exhausted so status stays quota_exhausted.
+  store.update(rec.id, { quota: 10 })
+  const updated = store.getById(rec.id)
+  assert.equal(updated.status, 'quota_exhausted')
+
+  const gate = store.canAccept(updated, now)
+  assert.equal(gate.ok, false)
+  assert.equal(gate.status, 429)
+  assert.equal(gate.code, 'api_key_quota_exhausted')
+  assert.equal(gate.limit_type, 'requests_quota')
+  assert.equal(gate.current, 2)
+  assert.equal(gate.limit, 2)
+  assert.equal(gate.remaining, 0)
+  assert.equal(gate.reset_at, null)
+  assert.equal(gate.retry_after, null)
+
+  const err = makeApiKeyGateError(gate)
+  assert.equal(err.status, 429)
+  assert.equal(err.body.error.type, 'quota_error')
+  assert.equal(err.body.error.details.limit_type, 'requests_quota')
+  assert.equal(err.headers, undefined)
+})
+
+test('lowered RPM computes reset_at and retry_after from the timestamp that frees capacity', () => {
+  const store = tmpStore()
+  const now = Date.parse('2026-11-24T12:00:00.000Z')
+  const rec = store.create({ name: 'rpm-lowered', rpm: 4, max_concurrency: 0 })
+
+  // 4 requests in the last 60s at -50s, -40s, -20s, -5s
+  for (const offsetMs of [50_000, 40_000, 20_000, 5_000]) {
+    assert.equal(store.acquire(rec, now - offsetMs).ok, true)
+    store.release(rec)
+  }
+
+  // Lower RPM to 2: 3 oldest entries (-50s, -40s, -20s) must expire before count drops below 2.
+  store.update(rec.id, { rpm: 2 })
+  const lowered = store.getById(rec.id)
+  const gate = store.canAccept(lowered, now)
+  assert.equal(gate.ok, false)
+  assert.equal(gate.status, 429)
+  assert.equal(gate.code, 'api_key_rate_limit')
+  assert.equal(gate.limit_type, 'rpm')
+  assert.equal(gate.current, 4)
+  assert.equal(gate.limit, 2)
+  assert.equal(gate.remaining, 0)
+  const expectedResetMs = now - 20_000 + 60_000
+  assert.equal(gate.reset_at, new Date(expectedResetMs).toISOString())
+  assert.equal(gate.retry_after, 40)
+
+  // Still blocked 1ms before reset_at, accepted right at reset_at.
+  assert.equal(store.canAccept(lowered, expectedResetMs - 1).ok, false)
+  assert.equal(store.canAccept(lowered, expectedResetMs).ok, true)
+})
