@@ -13,7 +13,12 @@
  * the panel can re-reveal a key for copying after creation.
  */
 
-import { keyScopeFromRecord, normalizeKeyScope } from './key-scope.mjs'
+import {
+  keyScopeFromRecord,
+  keyTierPolicyFromRecord,
+  normalizeKeyScope,
+  normalizeMultiTierKeyConfig,
+} from './key-scope.mjs'
 import { normalizeKeyAllowedModels, parseKeyAllowedModels } from './key-models.mjs'
 import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
 import crypto from 'node:crypto'
@@ -133,8 +138,12 @@ export function publicKeyView(rec, { reveal = false } = {}) {
     requests: rec.requests || 0,
     tokens_in: rec.tokens_in || 0,
     tokens_out: rec.tokens_out || 0,
-    category: rec.category === 'api' ? 'api' : 'oauth',
-    api_endpoint_id: rec.category === 'api' ? (rec.api_endpoint_id ?? null) : null,
+    category: rec.category === 'api' ? 'api' : rec.category === 'all' ? 'all' : 'oauth',
+    api_endpoint_id: rec.category === 'api' || rec.category === 'all' ? (rec.api_endpoint_id ?? null) : null,
+    permission_tier: keyTierPolicyFromRecord(rec).permission_tier,
+    owner_id: keyTierPolicyFromRecord(rec).owner_id,
+    allowed_endpoints: keyTierPolicyFromRecord(rec).allowed_endpoints,
+    allowed_gemini_envs: keyTierPolicyFromRecord(rec).allowed_gemini_envs,
     ...keyScopeFromRecord(rec),
     allowed_models: parseKeyAllowedModels(rec.allowed_models),
     inflight: undefined, // filled by store.snapshot
@@ -154,13 +163,13 @@ export class ApiKeyStore {
     this.repo = new ApiKeysRepo(this.db)
     this.hashSecret = String(
       hashSecret ||
-        process.env.VM2API_API_KEY_HASH_SECRET ||
-        process.env.KIN_API_KEY_HASH_SECRET ||
-        process.env.VM2API_DB_SECRET ||
-        process.env.KIN_DB_SECRET ||
-        process.env.VM2API_API_KEY ||
-        process.env.KIN_API_KEY ||
-        'kin-development-api-key-hash-secret',
+      process.env.VM2API_API_KEY_HASH_SECRET ||
+      process.env.KIN_API_KEY_HASH_SECRET ||
+      process.env.VM2API_DB_SECRET ||
+      process.env.KIN_DB_SECRET ||
+      process.env.VM2API_API_KEY ||
+      process.env.KIN_API_KEY ||
+      'kin-development-api-key-hash-secret',
     )
     this.inflight = new Map() // id → count
     this.rpmBuckets = new Map() // id → number[] timestamps ms
@@ -183,7 +192,7 @@ export class ApiKeyStore {
   reload() {
     getCacheRuntime()
       .apiKeys.invalidateAll()
-      .catch(() => {})
+      .catch(() => { })
   }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
@@ -193,7 +202,7 @@ export class ApiKeyStore {
     this.users = new UsersRepo(db)
     getCacheRuntime()
       .apiKeys.invalidateAll()
-      .catch(() => {})
+      .catch(() => { })
   }
 
   _cacheKey(hash) {
@@ -207,7 +216,7 @@ export class ApiKeyStore {
     if (ck)
       getCacheRuntime()
         .apiKeys.invalidateByHash(ck, reason)
-        .catch(() => {})
+        .catch(() => { })
   }
 
   list({ reveal = false } = {}) {
@@ -279,12 +288,8 @@ export class ApiKeyStore {
       throw Object.assign(new Error('key already exists'), { code: 'key_exists' })
     }
 
-    const category =
-      String(input.category || 'oauth')
-        .trim()
-        .toLowerCase() === 'api'
-        ? 'api'
-        : 'oauth'
+    const multiTier = normalizeMultiTierKeyConfig(input, { partial: false })
+    const category = multiTier.category
     const rec = {
       id: 'key_' + crypto.randomBytes(6).toString('hex'),
       name,
@@ -313,18 +318,24 @@ export class ApiKeyStore {
       tokens_in: 0,
       tokens_out: 0,
       category,
+      permission_tier: multiTier.permission_tier,
+      owner_id: multiTier.owner_id,
+      allowed_endpoints: JSON.stringify(multiTier.allowed_endpoints),
+      allowed_gemini_envs: JSON.stringify(multiTier.allowed_gemini_envs),
       ...storedKeyScope(
         normalizeKeyScope(
           {
             group_type: input.group_type,
             allowed_vms: input.allowed_vms,
             category,
+            permission_tier: multiTier.permission_tier,
+            owner_id: multiTier.owner_id,
             ...(Object.prototype.hasOwnProperty.call(input, 'vm_pool_id') ? { vm_pool_id: input.vm_pool_id } : {}),
           },
           { isApi: category === 'api' },
         ),
       ),
-      api_endpoint_id: category === 'api' ? (input.api_endpoint_id ?? null) : null,
+      api_endpoint_id: category === 'api' || category === 'all' ? (input.api_endpoint_id ?? null) : null,
       allowed_models: JSON.stringify(normalizeKeyAllowedModels(input.allowed_models)),
     }
     if (rec.expires_at && Number.isNaN(Date.parse(rec.expires_at))) {
@@ -375,12 +386,18 @@ export class ApiKeyStore {
     ) {
       rec.status = 'active'
     }
-    if (patch.category != null) {
-      rec.category = String(patch.category).trim().toLowerCase() === 'api' ? 'api' : 'oauth'
-    }
-    if (rec.category !== 'api') rec.api_endpoint_id = null
+    const multiTier = normalizeMultiTierKeyConfig(patch, { partial: true, current: rec })
+    rec.category = multiTier.category
+    rec.permission_tier = multiTier.permission_tier
+    rec.owner_id = multiTier.owner_id
+    rec.allowed_endpoints = JSON.stringify(multiTier.allowed_endpoints)
+    rec.allowed_gemini_envs = JSON.stringify(multiTier.allowed_gemini_envs)
+    if (rec.category !== 'api' && rec.category !== 'all') rec.api_endpoint_id = null
     else if (Object.hasOwn(patch, 'api_endpoint_id')) rec.api_endpoint_id = patch.api_endpoint_id ?? null
-    const scope = normalizeKeyScope(patch, { partial: true, current: rec, isApi: rec.category === 'api' })
+    const scope = normalizeKeyScope(
+      { ...patch, category: rec.category, permission_tier: rec.permission_tier, owner_id: rec.owner_id },
+      { partial: true, current: rec, isApi: rec.category === 'api' },
+    )
     if (scope) Object.assign(rec, storedKeyScope(scope))
     if (Object.hasOwn(patch, 'allowed_models')) {
       rec.allowed_models = JSON.stringify(normalizeKeyAllowedModels(patch.allowed_models))
@@ -434,7 +451,7 @@ export class ApiKeyStore {
     if (prev?.key_hash) this._invalidateHash(prev.key_hash, 'removed')
     getCacheRuntime()
       .billing.invalidateApiKey(id)
-      .catch(() => {})
+      .catch(() => { })
     return true
   }
 
@@ -637,7 +654,7 @@ export class ApiKeyStore {
       try {
         const c = calculateCost(normalized, model)
         if (c?.known) billed = c.total_cost
-      } catch {}
+      } catch { }
     }
     if (billed == null) billed = Number(usage.cost ?? usage.actual_cost) || 0
     // Key quotas and spend windows track the cost after applying the group rate.
@@ -662,7 +679,7 @@ export class ApiKeyStore {
       const billing = getCacheRuntime().billing
       for (const win of RATE_WINDOWS) {
         if ((finalRec?.[win.limit] ?? 0) > 0) {
-          billing.recordKeyWindowUsage(id, win.name, cost, win.ms).catch(() => {})
+          billing.recordKeyWindowUsage(id, win.name, cost, win.ms).catch(() => { })
         }
       }
     }

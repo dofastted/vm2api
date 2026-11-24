@@ -42,19 +42,35 @@ import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import { resolveGeminiReasoningEffort } from '../protocol/log-fields.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
 import { ensureRedaction, maskJson, restoreSseLine } from '../redaction/runtime.mjs'
+import { keyTierPolicyFromRecord } from '../admin/key-scope.mjs'
+import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 
 export function resolveInferenceBackend(req) {
   if (req?.apiKeyKind !== 'managed') return 'oauth'
-  return String(req.apiKeyRecord?.category || '')
+  const category = String(req.apiKeyRecord?.category || '')
     .trim()
-    .toLowerCase() === 'api'
-    ? 'api'
-    : 'oauth'
+    .toLowerCase()
+  if (category === 'api') return 'api'
+  if (category === 'all') return 'all'
+  return 'oauth'
 }
 
-export function apiScheduleScope(req, groupType) {
-  const endpointId = req.apiKeyRecord?.api_endpoint_id || null
-  return { endpointId, groupType: endpointId ? 'all' : groupType }
+export function apiScheduleScope(req, groupType, usersRepo = null) {
+  const policy = keyTierPolicyFromRecord(req?.apiKeyRecord)
+  const ownerScope = ownerScopeFromRequest(req, usersRepo)
+  const endpointId = policy.api_endpoint_id || null
+  const allowedEndpointIds =
+    policy.permission_tier === 'resource'
+      ? policy.allowed_endpoints
+      : policy.allowed_endpoints.length > 0
+        ? policy.allowed_endpoints
+        : null
+  return {
+    endpointId,
+    groupType: endpointId ? 'all' : groupType,
+    ownerScope,
+    allowedEndpointIds,
+  }
 }
 
 export { messagesUrl, responsesUrl } from './api-presets.mjs'

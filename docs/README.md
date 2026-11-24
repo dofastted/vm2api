@@ -11,7 +11,7 @@
 - [RISK.md](RISK.md) — 封控拦截（蒸馏 → 硬正则 → 拒答缓存 → 决策模型 → 放行出站）
 - [PANEL_API.md](PANEL_API.md) — 管理台 API
 - [CRAG 支付与鉴权验收](crag-payment-acceptance.md) — 商城调用、回调归属、宿主订阅兑换与实付复跑
-- [AFO_INTEGRATION.md](AFO_INTEGRATION.md) — AFO 平台对接的 `/api/v1` 兼容层规格（未实现）
+- [INTEGRATION_API.md](INTEGRATION_API.md) — 通用外部集成 API（`/api/integration/v1`，独立令牌、细粒度权限与回环/SSH 安全接入）
 - [redaction/README.md](redaction/README.md) — 可启停内容脱敏：默认关闭；helper 未就绪时阻断，不发明文
 - [ISSUE_BACKLOG.md](ISSUE_BACKLOG.md) — open issue 复核后暂不修复的清单（2026-10-28）
 - 抄本：[deploy/env.example](deploy/env.example) · [deploy/vm2api.service](deploy/vm2api.service)
