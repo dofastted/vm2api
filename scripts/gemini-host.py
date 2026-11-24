@@ -307,6 +307,71 @@ def runtime_policy_to_kernel_patch(policy):
         "circuit_failure_threshold": pol["circuit_failure_threshold"],
         "circuit_open_ms": pol["circuit_open_ms"],
     }
+
+
+# The kernel understands these scheduling / SHM keys only from 0.4.5 on. #1704 began
+# emitting them while deploy/payload.json still pinned 0.4.4, so every release from
+# v1.4.193 shipped a host that hands its own pinned payload a config that payload
+# rejects: the worker exits before the handshake and the request fails as a bridge
+# timeout (#1729).
+#
+# The boundary is the payload version, not a capability list. The pinned 0.4.4
+# manifest already declares shm_ring_v2, shm_dispatch_v1, gateway_policy_v1 and
+# live_control_v1, so capabilities do not describe which config keys it parses.
+# Unlike the constant that drifted in #1677, this is not a second copy of the pin:
+# it is the version a feature needs, so moving the pin forward lifts the gate on
+# its own.
+#
+# Act only on a version we positively read as older than the minimum. An absent or
+# unparseable version keeps today's behaviour instead of degrading: payload_failure()
+# nulls payload_version, and treating that as "too old" would silently drop sharding
+# and the SHM sizes on a healthy 0.4.5 host, trading the reported break for a quieter
+# one.
+KERNEL_POLICY_MIN_PAYLOAD = (0, 4, 5, 1)
+
+KERNEL_POLICY_FIELDS = (
+    "shm_request_bytes",
+    "shm_response_bytes",
+    "strategy",
+    "max_accounts",
+    "sticky_enabled",
+    "sticky_ttl_secs",
+    "require_shm",
+    "circuit_failure_threshold",
+    "circuit_open_ms",
+)
+
+_PAYLOAD_VERSION_RE = re.compile(r"\A(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?\Z")
+
+
+def _parse_payload_version(version):
+    """Order a payload version, with a prerelease sorting below its own release."""
+    if not isinstance(version, str):
+        return None
+    match = _PAYLOAD_VERSION_RE.fullmatch(version.strip())
+    if not match:
+        return None
+    return (
+        int(match[1]),
+        int(match[2]),
+        int(match[3]),
+        0 if match[4] else 1,
+    )
+
+
+def kernel_policy_rejected_by_payload(version):
+    """True only for a version read as predating KERNEL_POLICY_MIN_PAYLOAD."""
+    parsed = _parse_payload_version(version)
+    return parsed is not None and parsed < KERNEL_POLICY_MIN_PAYLOAD
+
+
+def strip_unsupported_kernel_policy(kernel_cfg, version):
+    """Drop policy keys a payload known to predate 0.4.5 would reject."""
+    if not kernel_policy_rejected_by_payload(version):
+        return kernel_cfg
+    for field in KERNEL_POLICY_FIELDS:
+        kernel_cfg.pop(field, None)
+    return kernel_cfg
 BLOCKING_ACCOUNT_ELIGIBILITIES = frozenset(
     {"verification_required", "location_unsupported", "ineligible"}
 )
@@ -1276,6 +1341,9 @@ class NativeAgy(Agy):
                 }
             )
         config = self.native_dir / "kernel.json"
+        strip_unsupported_kernel_policy(
+            kernel_cfg, getattr(self.host, "payload_version", None)
+        )
         private_json(config, kernel_cfg)
         os.chown(config, self.uid, self.uid)
         self.native_diagnostic = native_module_impl.EligibilityDiagnostic(
@@ -2699,6 +2767,13 @@ class Host:
         private_json(self.policy_file, self.runtime_policy)
 
     def _use_sharded_daemon(self):
+        # The shard path is new in #1704 and has no pre-0.4.5 shape: its kernel config
+        # carries the keys KERNEL_POLICY_FIELDS gates, and stripping them would hand an
+        # older payload a config that parses but no longer describes the sharding the
+        # host intends. Refuse the path instead and fall back to the per-account
+        # NativeSession, which is the same fallback crag_subscription already takes.
+        if kernel_policy_rejected_by_payload(getattr(self, "payload_version", None)):
+            return False
         return (
             int(
                 self.runtime_policy.get(

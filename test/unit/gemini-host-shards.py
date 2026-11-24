@@ -259,4 +259,85 @@ with tempfile.TemporaryDirectory(prefix="gemini-shards-") as temporary:
         assert "validation_url" not in env1["account"]
         assert host.last_inference[ids[1]][1]["state"] == "completed"
 
+
+# 2. The kernel policy keys #1704 added are withheld from a payload read as older
+# than 0.4.5, which is the combination that broke v1.4.193+ against the pinned
+# 0.4.4 payload (#1729).
+assert impl.kernel_policy_rejected_by_payload("0.4.4") is True
+assert impl.kernel_policy_rejected_by_payload("0.4.3") is True
+assert impl.kernel_policy_rejected_by_payload("0.3.0") is True
+assert impl.kernel_policy_rejected_by_payload("0.4.5") is False
+assert impl.kernel_policy_rejected_by_payload("0.4.6") is False
+assert impl.kernel_policy_rejected_by_payload("0.5.0") is False
+assert impl.kernel_policy_rejected_by_payload("1.0.0") is False
+# Double-digit components compare numerically, not lexically.
+assert impl.kernel_policy_rejected_by_payload("0.4.10") is False
+assert impl.kernel_policy_rejected_by_payload("0.10.0") is False
+# A prerelease sorts below its own release, so 0.4.5-rc is not yet 0.4.5.
+assert impl.kernel_policy_rejected_by_payload("0.4.5-rc.1") is True
+assert impl.kernel_policy_rejected_by_payload("0.4.6-rc.1") is False
+# An absent or unreadable version keeps today's behaviour rather than degrading:
+# payload_failure() nulls payload_version on a healthy host.
+assert impl.kernel_policy_rejected_by_payload(None) is False
+assert impl.kernel_policy_rejected_by_payload("") is False
+assert impl.kernel_policy_rejected_by_payload("fixture-1") is False
+assert impl.kernel_policy_rejected_by_payload("0.4") is False
+assert impl.kernel_policy_rejected_by_payload(404) is False
+
+_BASE_CFG = {
+    "run_dir": "/tmp/craggemini",
+    "timeout_ms": 120000,
+    "vm_id": "gemini-1",
+    "shm_request_bytes": 4194304,
+    "shm_response_bytes": 16777216,
+    "strategy": "fill",
+    "max_accounts": 1,
+    "sticky_enabled": True,
+    "sticky_ttl_secs": 1800,
+    "require_shm": True,
+    "circuit_failure_threshold": 5,
+    "circuit_open_ms": 30000,
+}
+
+old = impl.strip_unsupported_kernel_policy(dict(_BASE_CFG), "0.4.4")
+assert set(old) == {"run_dir", "timeout_ms", "vm_id"}
+for field in impl.KERNEL_POLICY_FIELDS:
+    assert field not in old
+# Keys that already existed before #1704 survive the strip.
+assert old["timeout_ms"] == 120000
+
+kept = impl.strip_unsupported_kernel_policy(dict(_BASE_CFG), "0.4.5")
+assert kept == _BASE_CFG
+
+# 3. A payload older than 0.4.5 also turns off the shard path rather than being
+# handed a shard config with its scheduling keys removed.
+with tempfile.TemporaryDirectory(prefix="gemini-gate-") as temporary:
+    directory = Path(temporary)
+    (directory / "environments.json").write_text(json.dumps(dict([make_env(0)])))
+    gate_args = SimpleNamespace(
+        state=directory,
+        uid_base=1000,
+        payload=directory / "payload",
+        payload_source=None,
+        public_key=None,
+        default_public_key=None,
+        default_release_verifier=None,
+        release_verifier=None,
+        egress=None,
+    )
+    with (
+        patch.object(impl, "check_root_owned"),
+        patch.object(impl, "read_root_file", side_effect=lambda p, limit: p.read_bytes()),
+    ):
+        gate_host = FixtureHost(gate_args)
+    assert gate_host.runtime_policy["accounts_per_daemon"] > 1
+    gate_host.payload_version = "0.4.5"
+    assert gate_host._use_sharded_daemon() is True
+    gate_host.payload_version = "0.4.4"
+    assert gate_host._use_sharded_daemon() is False
+    # An unreadable version leaves the topology as it is today.
+    gate_host.payload_version = None
+    assert gate_host._use_sharded_daemon() is True
+
+
 print("OK")
