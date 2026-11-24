@@ -452,7 +452,10 @@ test('CRAG capability-aware admission routes rich turns away from restricted slo
   assert.equal(capturedBodies.length, 1)
   const sentText = capturedBodies[0].contents[0].parts[0].text
   assert.equal(/[^\P{Cc}\n\r\t]/u.test(sentText), false)
-  assert.equal(sentText.split(/\p{White_Space}+/u).some((w) => w.startsWith('/')), false)
+  assert.equal(
+    sentText.split(/\p{White_Space}+/u).some((w) => w.startsWith('/')),
+    false,
+  )
 
   // Legacy restricted native_tui environment still fails closed for raw slash text.
   envs = [
@@ -900,4 +903,77 @@ test('Gemini public ports support /v1 native generateContent, single-model GET, 
   )
   assert.equal(resGenV1.statusCode, 200)
   assert.equal(resGenV1.jsonBody().candidates[0].content.parts[0].text, 'v1-ok')
+})
+
+test('Gemini public handler strips safetySettings for CRAGGemini and captures debug inbound/outbound bodies', async () => {
+  let capturedInferBody = null
+  const logEvents = []
+  let tapped = false
+  const scheduler = createGeminiScheduler({
+    callHost: async (op) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-crag',
+              proxy_id: 'proxy-1',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-4-neon-high'],
+              capabilities: [...NATIVE_TUI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') return { id: 'env-crag', proxy_id: 'proxy-1', auth_method: 'oauth' }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: async (_op, payload) => {
+      capturedInferBody = payload.body
+      return sseResponse([
+        `data: ${JSON.stringify({
+          candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 2, totalTokenCount: 12 },
+        })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://1.2.3.4:1080',
+  })
+
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler,
+    requestLog: {
+      start: (_req, meta) => ({ mode: 'debug', capture_outbound: true, ...meta }),
+      tapResponse: () => {
+        tapped = true
+      },
+      finish: (_ctx, extra) => logEvents.push(extra),
+    },
+  })
+
+  const res = makeRes()
+  await handler(
+    makeReq({
+      method: 'POST',
+      url: '/v1beta/models/gemini-4-neon-high:streamGenerateContent',
+      body: {
+        contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
+        safetySettings: [{ category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' }],
+        cachedContent: 'cachedContents/test-1',
+      },
+    }),
+    res,
+  )
+  assert.equal(res.statusCode, 200)
+  assert.equal(tapped, true)
+  assert.equal('safetySettings' in capturedInferBody, false)
+  assert.equal('cachedContent' in capturedInferBody, false)
+  assert.equal(logEvents.length, 1)
+  assert.equal(logEvents[0].inbound_body?.safetySettings?.length, 1)
+  assert.equal(logEvents[0].outbound_body_source, 'craggemini')
+  assert.equal('safetySettings' in (logEvents[0].outbound_body || {}), false)
 })
