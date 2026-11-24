@@ -471,3 +471,114 @@ test('a listVms summary (top-level active_hours) is gated too', () => {
   const picked = pickCodexSlots([resting, gpt('vm-on')], { now })
   assert.deepEqual(picked.ids, ['vm-on'])
 })
+
+test('24h window + 0-minute record: local 5h/7d gate stays open while 100% 24h cap parks and restricts (#1744)', async () => {
+  const { codexQuotaWindowReason, evaluateCodexQuotaSchedule } = await import('../../src/lib/pool/codex-slot-pool.mjs')
+  const { buildCodexUsageView } = await import('../../src/lib/protocol/codex-usage.mjs')
+  const { evaluateOpenAIQuotaGate } = await import('../../src/lib/pool/openai-quota-policy.mjs')
+  const { isQuotaWindowReason } = await import('../../src/lib/pool/availability.mjs')
+  const { stateOfReason } = await import('../../src/lib/pool/schedule-state.mjs')
+  const now = Date.parse('2026-11-24T12:00:00.000Z')
+  const resetAt = new Date(now + 4 * 3600_000).toISOString()
+
+  const healthyExtra = {
+    codex_primary_window_minutes: 1440,
+    codex_primary_used_percent: 92,
+    codex_primary_reset_at: resetAt,
+    codex_secondary_window_minutes: 0,
+    codex_secondary_used_percent: 0,
+    // Stale misclassified aliases from older builds must not trigger 7d local gate.
+    codex_5h_window_minutes: 0,
+    codex_5h_used_percent: 0,
+    codex_7d_window_minutes: 1440,
+    codex_7d_used_percent: 92,
+  }
+  const healthyVm = {
+    id: 'vm-24h-a',
+    platform: 'openai',
+    family: 'codex',
+    status: 'running',
+    schedulable: true,
+    has_token: true,
+    codex: { extra: healthyExtra, usage: buildCodexUsageView(healthyExtra) },
+    codex_usage: buildCodexUsageView(healthyExtra),
+  }
+  assert.equal(evaluateOpenAIQuotaGate(healthyVm, { limit_5h: 0.8, limit_7d: 0.8 }, now).limited, false)
+  assert.equal(isCodexSlotParked(healthyVm, now, { limit_5h: 0.8, limit_7d: 0.8 }), false)
+  assert.equal(codexQuotaWindowReason(healthyVm, now), null)
+
+  // Summary-only VM (no codex.extra) with 100% 24h cap must still park with quota_24h_header.
+  const cappedExtra = {
+    codex_primary_window_minutes: 1440,
+    codex_primary_used_percent: 100,
+    codex_primary_reset_at: resetAt,
+    codex_secondary_window_minutes: 0,
+    codex_secondary_used_percent: 0,
+  }
+  const cappedSummaryVm = {
+    id: 'vm-24h-capped',
+    platform: 'openai',
+    family: 'codex',
+    status: 'running',
+    schedulable: true,
+    has_token: true,
+    codex_usage: buildCodexUsageView(cappedExtra),
+  }
+  assert.equal(isCodexSlotParked(cappedSummaryVm, now), true)
+  assert.equal(codexQuotaWindowReason(cappedSummaryVm, now), 'quota_24h_header')
+  assert.equal(isQuotaWindowReason('quota_24h_header'), true)
+  assert.equal(stateOfReason('quota_24h_header')?.text, '24h 限制')
+
+  const sched = evaluateCodexQuotaSchedule(cappedSummaryVm, now)
+  assert.equal(sched.action, 'restrict')
+  assert.equal(sched.reason, 'quota_24h_header')
+  assert.equal(sched.until, Date.parse(resetAt))
+
+  // Summary-only VM without snapshot or window_minutes still infers 24h from window id.
+  const windowsOnlyVm = {
+    id: 'vm-24h-windows-only',
+    platform: 'openai',
+    family: 'codex',
+    status: 'running',
+    schedulable: true,
+    has_token: true,
+    codex_usage: {
+      windows: [{ id: '24h', used_percent: 100, reset_at: resetAt }],
+    },
+  }
+  assert.equal(isCodexSlotParked(windowsOnlyVm, now), true)
+  assert.equal(codexQuotaWindowReason(windowsOnlyVm, now), 'quota_24h_header')
+
+  // Stress sorting compares actual 24h utilization across 24h-only summary VMs.
+  const low24h = {
+    id: 'vm-24h-low',
+    platform: 'openai',
+    family: 'codex',
+    status: 'running',
+    schedulable: true,
+    has_token: true,
+    codex_usage: buildCodexUsageView({
+      codex_primary_window_minutes: 1440,
+      codex_primary_used_percent: 10,
+      codex_secondary_window_minutes: 0,
+      codex_secondary_used_percent: 0,
+    }),
+  }
+  const high24h = {
+    id: 'vm-24h-high',
+    platform: 'openai',
+    family: 'codex',
+    status: 'running',
+    schedulable: true,
+    has_token: true,
+    codex_usage: buildCodexUsageView({
+      codex_primary_window_minutes: 1440,
+      codex_primary_used_percent: 80,
+      codex_secondary_window_minutes: 0,
+      codex_secondary_used_percent: 0,
+    }),
+  }
+  const picked = pickCodexSlots([high24h, low24h, cappedSummaryVm], { now })
+  assert.deepEqual(picked.ready, ['vm-24h-low', 'vm-24h-high'])
+  assert.deepEqual(picked.parked, ['vm-24h-capped'])
+})

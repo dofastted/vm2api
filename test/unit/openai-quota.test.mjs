@@ -710,3 +710,28 @@ test('refreshStaleCodexCreditsForVm deduplicates single-flight calls and throttl
   assert.equal(afterReplace.skipped, undefined)
   assert.equal(afterReplace.spendable, true)
 })
+
+test('extraFromRateLimit keeps 24h window and leaves 5h/7d null when secondary window is 0s (#1744)', async () => {
+  const { buildCodexUsageView } = await import('../../src/lib/protocol/codex-usage.mjs')
+  const extra = extraFromRateLimit({
+    primary_window: {
+      used_percent: 1,
+      limit_window_seconds: 86400,
+      reset_after_seconds: 3600,
+    },
+    secondary_window: {
+      used_percent: 0,
+      limit_window_seconds: 0,
+      reset_after_seconds: 0,
+    },
+  })
+  assert.equal(extra.codex_5h_used_percent, null)
+  assert.equal(extra.codex_7d_used_percent, null)
+  assert.equal(extra.codex_5h_window_minutes, null)
+  assert.equal(extra.codex_7d_window_minutes, null)
+  const view = buildCodexUsageView(extra)
+  assert.deepEqual(
+    view.windows.map(({ id, window_minutes, used_percent }) => ({ id, window_minutes, used_percent })),
+    [{ id: '24h', window_minutes: 1440, used_percent: 1 }],
+  )
+})

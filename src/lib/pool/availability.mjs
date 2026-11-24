@@ -502,9 +502,9 @@ export function evaluateAccount({
   })
 }
 
-/** Extra 5h/7d reject reasons that write restriction, not 调度关. */
+/** Extra quota-window reject reasons (5h / 7d / 24h / …) that write restriction, not 调度关. */
 export function isQuotaWindowReason(reason) {
-  return /^(quota_5h|quota_7d)/.test(String(reason || ''))
+  return /^quota_\d+[mhd]/.test(String(reason || ''))
 }
 
 /** Account-scope quota / 429 parks stored on temp_unschedulable_* + runtime cooldown. */
