@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.22-oauth-short-lived",
+  "release": "payload-2026.11.24-oauth-chrome-tls",
   "crag_release": "payload-2026.11.23-crag-3.1.14",
   "crag_authorization": {
     "family": "crag",
@@ -49,8 +49,8 @@
     {
       "path": "bin/kin-oauth-auth",
       "asset": "kin-oauth-auth",
-      "size": 47421622,
-      "sha256": "66abd58482bb90221dfc0776640cf9c519df6b8af0e0ffc3df25d301c7be85b3"
+      "size": 11559096,
+      "sha256": "41bbcd57737e8dd3b65a1aafc9bc523d15bf316605a60dfa3e6841bbdc5f0f16"
     },
     {
       "path": "bin/kin-computer",
