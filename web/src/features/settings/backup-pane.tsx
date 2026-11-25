@@ -24,7 +24,14 @@ import {
   backupsQueryOptions,
   routingQueryOptions,
 } from '@/features/settings/queries'
-import { backupActionDisabled, parseBackupFilename } from './backup-utils'
+import {
+  backupActionDisabled,
+  backupActionDisabledReason,
+  backupEngineLabel,
+  backupFormatBadge,
+  backupRestoreDisabled,
+  parseBackupFilename,
+} from './backup-utils'
 import { settleInt, typingInt } from './int-input'
 
 const DEFAULT_BACKUP_CONFIG: BackupScheduleConfig = {
@@ -37,6 +44,7 @@ const BACKUP_KIND_LABELS: Record<string, string> = {
   manual: '手动',
   scheduled: '自动',
   pre_restore: '恢复前快照',
+  imported: '磁盘导入',
 }
 
 function backupKindLabel(kind?: string): string {
@@ -92,6 +100,7 @@ export function BackupPane() {
   const list = useQuery(backupsQueryOptions())
   const cfg = useQuery(backupConfigQueryOptions())
   const [restoreId, setRestoreId] = useState('')
+  const [deleteId, setDeleteId] = useState('')
   const [draft, setDraft] = useState<Partial<BackupScheduleConfig> | null>(null)
 
   const savedConfig: BackupScheduleConfig = {
@@ -159,9 +168,26 @@ export function BackupPane() {
     onError: (error: Error) => toast.error(error.message),
   })
 
-  const items = list.data?.items || []
+  const remove = useMutation({
+    mutationFn: (id: string) =>
+      api(`/api/panel/backups/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      }),
+    onSuccess: async () => {
+      toast.success('备份已删除')
+      setDeleteId('')
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: backupsQueryOptions().queryKey }),
+        qc.invalidateQueries({ queryKey: backupConfigQueryOptions().queryKey }),
+      ])
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
 
-  async function download(id: string) {
+  const items = list.data?.items || []
+  const currentEngine = list.data?.engine
+
+  async function download(id: string, fallbackName?: string | null) {
     const res = await panelFetch(
       `/api/panel/backups/${encodeURIComponent(id)}/download`
     )
@@ -175,7 +201,11 @@ export function BackupPane() {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = parseBackupFilename(res.headers.get('content-disposition'), id)
+    a.download = parseBackupFilename(
+      res.headers.get('content-disposition'),
+      id,
+      fallbackName
+    )
     a.click()
     URL.revokeObjectURL(url)
   }
@@ -262,7 +292,14 @@ export function BackupPane() {
       <Card>
         <CardHeader className='flex flex-row items-center justify-between gap-3'>
           <div className='space-y-1'>
-            <CardTitle>备份记录</CardTitle>
+            <div className='flex flex-wrap items-center gap-2'>
+              <CardTitle>备份记录</CardTitle>
+              {currentEngine ? (
+                <Badge variant='outline' className='font-mono text-[11px]'>
+                  当前数据库：{backupEngineLabel(currentEngine)}
+                </Badge>
+              ) : null}
+            </div>
             <p className='text-xs text-muted-foreground'>
               恢复前会自动创建一份恢复前快照；恢复期间协议口返回 503。
             </p>
@@ -270,7 +307,7 @@ export function BackupPane() {
           <Button
             size='sm'
             onClick={() => create.mutate()}
-            disabled={create.isPending || restore.isPending}
+            disabled={create.isPending || restore.isPending || remove.isPending}
             loading={create.isPending}
           >
             创建备份
@@ -287,6 +324,7 @@ export function BackupPane() {
                 <TableRow>
                   <TableHead>ID</TableHead>
                   <TableHead>类型</TableHead>
+                  <TableHead>引擎 / 格式</TableHead>
                   <TableHead>时间</TableHead>
                   <TableHead>大小</TableHead>
                   <TableHead>状态</TableHead>
@@ -295,15 +333,14 @@ export function BackupPane() {
               </TableHeader>
               <TableBody>
                 {items.map((b) => {
-                  const disabled = backupActionDisabled(b)
+                  const actionDisabled = backupActionDisabled(b)
+                  const actionReason = backupActionDisabledReason(b)
+                  const restoreState = backupRestoreDisabled(b, currentEngine)
+                  const crossEngine = !actionDisabled && restoreState.disabled
+                  const formatBadge = backupFormatBadge(b)
                   const sizeValue = b.size_bytes ?? b.size
                   const statusOk = b.status === 'ok'
                   const missingFile = statusOk && b.file_exists !== true
-                  const disabledReason = !statusOk
-                    ? '该备份已失败，无法下载或恢复'
-                    : missingFile
-                      ? '备份文件不存在，无法下载或恢复'
-                      : undefined
                   return (
                     <TableRow key={b.id}>
                       <TableCell className='font-mono text-xs'>
@@ -311,6 +348,18 @@ export function BackupPane() {
                       </TableCell>
                       <TableCell className='text-xs'>
                         {backupKindLabel(b.kind)}
+                      </TableCell>
+                      <TableCell className='text-xs'>
+                        {formatBadge ? (
+                          <Badge
+                            variant={crossEngine ? 'destructive' : 'outline'}
+                            className='font-mono text-[11px]'
+                          >
+                            {formatBadge}
+                          </Badge>
+                        ) : (
+                          <span className='text-muted-foreground'>—</span>
+                        )}
                       </TableCell>
                       <TableCell className='text-xs tabular-nums'>
                         {fmtExpiresAt(b.created_at)}
@@ -332,6 +381,11 @@ export function BackupPane() {
                               ? '文件缺失'
                               : '正常'}
                         </Badge>
+                        {crossEngine && restoreState.reason ? (
+                          <p className='max-w-xs text-xs text-amber-600 dark:text-amber-400'>
+                            {restoreState.reason}
+                          </p>
+                        ) : null}
                         {b.error ? (
                           <p className='max-w-xs text-xs break-all text-destructive'>
                             {b.error}
@@ -342,10 +396,10 @@ export function BackupPane() {
                         <Button
                           size='sm'
                           variant='outline'
-                          disabled={disabled}
-                          title={disabledReason}
+                          disabled={actionDisabled}
+                          title={actionReason}
                           onClick={() =>
-                            download(b.id).catch((e: Error) =>
+                            download(b.id, b.file_name).catch((e: Error) =>
                               toast.error(e.message)
                             )
                           }
@@ -355,11 +409,24 @@ export function BackupPane() {
                         <Button
                           size='sm'
                           variant='destructive'
-                          disabled={disabled || restore.isPending}
-                          title={disabledReason}
+                          disabled={
+                            restoreState.disabled ||
+                            restore.isPending ||
+                            remove.isPending
+                          }
+                          title={restoreState.reason}
                           onClick={() => setRestoreId(b.id)}
                         >
                           恢复
+                        </Button>
+                        <Button
+                          size='sm'
+                          variant='outline'
+                          className='text-destructive hover:text-destructive'
+                          disabled={restore.isPending || remove.isPending}
+                          onClick={() => setDeleteId(b.id)}
+                        >
+                          删除
                         </Button>
                       </TableCell>
                     </TableRow>
@@ -381,6 +448,21 @@ export function BackupPane() {
             isLoading={restore.isPending}
             handleConfirm={() => {
               if (restoreId && !restore.isPending) restore.mutate(restoreId)
+            }}
+          />
+          <ConfirmDialog
+            open={!!deleteId}
+            onOpenChange={(open) => {
+              if (!open && !remove.isPending) setDeleteId('')
+            }}
+            title='确认删除备份'
+            desc={`删除备份 ${deleteId} 将同时移除台账记录与磁盘归档文件（如存在），且不可撤销。`}
+            confirmText='确认删除'
+            cancelBtnText='取消'
+            destructive
+            isLoading={remove.isPending}
+            handleConfirm={() => {
+              if (deleteId && !remove.isPending) remove.mutate(deleteId)
             }}
           />
         </CardContent>

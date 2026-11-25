@@ -56,6 +56,7 @@ import { invalidateReadCache, isVmRecordFile } from '../vm/vm-file.mjs'
 export { tarAvailable } from './backup-core.mjs'
 
 const SCHEDULE_KEY = 'backup_schedule'
+const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'utf8')
 
 export const DEFAULT_SCHEDULE = {
   enabled: true,
@@ -88,13 +89,24 @@ export function killChildArchivers({ pid = process.pid, proc = '/proc' } = {}) {
 }
 
 export class BackupService {
-  constructor({ dataDir, projectRoot, configDir, backupDir, tmpDir, checkIntervalMs = 10 * 60_000 } = {}) {
+  constructor({
+    dataDir,
+    projectRoot,
+    configDir,
+    backupDir,
+    tmpDir,
+    checkIntervalMs = 10 * 60_000,
+    getEngine = null,
+    isPgRestoreAvailable = null,
+  } = {}) {
     this.dataDir = dataDir
     this.projectRoot = projectRoot
     this.configDir = configDir || null
     this.backupDir = backupDir || path.join(dataDir, 'backups')
     this.tmpDir = tmpDir || path.join(dataDir, 'tmp')
     this.checkIntervalMs = checkIntervalMs
+    this._getDbEngine = typeof getEngine === 'function' ? getEngine : getDbEngine
+    this._pgRestoreAvailable = typeof isPgRestoreAvailable === 'function' ? isPgRestoreAvailable : pgRestoreAvailable
     this.isRestoring = false
     this._running = false
     this._timer = null
@@ -274,7 +286,7 @@ export class BackupService {
 
   _runBackupWorker(job) {
     return new Promise((resolve, reject) => {
-      const engine = getDbEngine()
+      const engine = this._getDbEngine()
       const worker = new Worker(new URL('./backup-worker.mjs', import.meta.url), {
         workerData: {
           engine,
@@ -342,8 +354,131 @@ export class BackupService {
   // ---------- restore ----------
 
   /**
-   * Restore from a recorded backup. Automatically snapshots the current
-   * state first (kind=pre_restore). Re-binds stores via onRestored callback.
+   * Preflight a backup archive before creating a `pre_restore` snapshot:
+   * validate engine compatibility, extract/decompress into a staging dir when
+   * needed, verify inner snapshot checksums against manifest.json, and check
+   * `pg_restore` availability for `.pgdump` snapshots.
+   */
+  async _prepareRestoreArchive(rec, isPg) {
+    const fileName = rec.file_name || path.basename(rec.file_path)
+    const targetEngine = isPg ? 'postgres' : 'sqlite'
+    const declaredEngine = rec.includes?.engine
+
+    if (declaredEngine && declaredEngine !== targetEngine) {
+      throw Object.assign(
+        new Error(`backup engine (${declaredEngine}) is incompatible with current database (${targetEngine})`),
+        { code: 'backup_incompatible' },
+      )
+    }
+
+    if (fileName.endsWith('.tar.gz')) {
+      const tmp = this._mkdtemp('kin-restore-')
+      try {
+        const r = spawnSync('tar', ['-xzf', rec.file_path, '-C', tmp], { stdio: 'pipe' })
+        if (r.status !== 0) {
+          const msg = `tar extract failed: ${String(r.stderr || r.error?.message || '').slice(0, 300)}`
+          throw r.error?.code === 'ENOENT' ? new Error(msg) : Object.assign(new Error(msg), { code: 'backup_corrupt' })
+        }
+        let manifest = null
+        try {
+          manifest = JSON.parse(fs.readFileSync(path.join(tmp, 'manifest.json'), 'utf8'))
+        } catch {}
+
+        if (isPg) {
+          const pgDumpFile = path.join(tmp, 'db', 'kin.pgdump')
+          const pgJsonFile = path.join(tmp, 'db', 'kin.pg.ndjson.gz')
+          if (fs.existsSync(pgDumpFile)) {
+            if (manifest?.sha256s?.['db/kin.pgdump'] && sha256File(pgDumpFile) !== manifest.sha256s['db/kin.pgdump']) {
+              throw Object.assign(new Error('pg dump sha256 mismatch inside archive'), { code: 'backup_corrupt' })
+            }
+            if (!(await this._pgRestoreAvailable())) {
+              throw Object.assign(new Error('pg_restore binary is required to restore custom PostgreSQL dumps'), {
+                code: 'pg_restore_missing',
+              })
+            }
+            return { tmp, dbFile: pgDumpFile }
+          }
+          if (fs.existsSync(pgJsonFile)) {
+            if (
+              manifest?.sha256s?.['db/kin.pg.ndjson.gz'] &&
+              sha256File(pgJsonFile) !== manifest.sha256s['db/kin.pg.ndjson.gz']
+            ) {
+              throw Object.assign(new Error('pg snapshot sha256 mismatch inside archive'), { code: 'backup_corrupt' })
+            }
+            return { tmp, dbFile: pgJsonFile }
+          }
+          throw Object.assign(new Error('no PostgreSQL snapshot inside backup archive'), {
+            code: 'backup_incompatible',
+          })
+        }
+
+        const sqliteFile = path.join(tmp, 'db', 'kin.db')
+        if (!fs.existsSync(sqliteFile)) {
+          throw Object.assign(new Error('no SQLite snapshot inside backup archive'), {
+            code: 'backup_incompatible',
+          })
+        }
+        if (manifest?.sha256s?.['db/kin.db'] && sha256File(sqliteFile) !== manifest.sha256s['db/kin.db']) {
+          throw Object.assign(new Error('db snapshot sha256 mismatch inside archive'), { code: 'backup_corrupt' })
+        }
+        return { tmp, dbFile: sqliteFile }
+      } catch (err) {
+        try {
+          fs.rmSync(tmp, { recursive: true, force: true })
+        } catch {}
+        throw err
+      }
+    }
+
+    if (isPg) {
+      if (fileName.endsWith('.pgdump')) {
+        if (!(await this._pgRestoreAvailable())) {
+          throw Object.assign(new Error('pg_restore binary is required to restore custom PostgreSQL dumps'), {
+            code: 'pg_restore_missing',
+          })
+        }
+        return { tmp: null, dbFile: rec.file_path }
+      }
+      if (fileName.endsWith('.pg.ndjson.gz')) {
+        return { tmp: null, dbFile: rec.file_path }
+      }
+      throw Object.assign(new Error(`unsupported backup format for PostgreSQL: ${fileName}`), {
+        code: 'backup_incompatible',
+      })
+    }
+
+    if (fileName.endsWith('.db.gz')) {
+      const tmp = this._mkdtemp('kin-restore-')
+      try {
+        const dbFile = path.join(tmp, 'kin.db')
+        const raw = zlib.gunzipSync(fs.readFileSync(rec.file_path))
+        if (raw.length < SQLITE_HEADER.length || !raw.subarray(0, SQLITE_HEADER.length).equals(SQLITE_HEADER)) {
+          throw Object.assign(new Error('decompressed backup is not a valid SQLite database'), {
+            code: 'backup_corrupt',
+          })
+        }
+        fs.writeFileSync(dbFile, raw)
+        return { tmp, dbFile }
+      } catch (err) {
+        try {
+          fs.rmSync(tmp, { recursive: true, force: true })
+        } catch {}
+        if (err?.code) throw err
+        throw Object.assign(new Error(`failed to decompress SQLite backup: ${String(err.message || err)}`), {
+          code: 'backup_corrupt',
+        })
+      }
+    }
+
+    throw Object.assign(new Error(`unsupported backup format for SQLite: ${fileName}`), {
+      code: 'backup_incompatible',
+    })
+  }
+
+  /**
+   * Restore from a recorded backup. Preflights format, checksums, engine
+   * compatibility, and `pg_restore` availability before creating the
+   * automatic `pre_restore` safety-net snapshot. Re-binds stores via onRestored.
    */
   async restoreBackup(id) {
     const rec = this._repo().get(id)
@@ -364,56 +499,14 @@ export class BackupService {
     this.isRestoring = true
     let tmp = null
     try {
-      // 0. safety net snapshot of the current state
-      const pre = await this.createBackup({ kind: 'pre_restore', note: `before restore of ${rec.id}` })
+      // 0. preflight format, manifest/inner checksums, engine compatibility, and pg_restore
+      const isPg = this._getDbEngine() === 'postgres'
+      const prepared = await this._prepareRestoreArchive(rec, isPg)
+      tmp = prepared.tmp
+      const dbFile = prepared.dbFile
 
-      // 1. extract / decompress
-      tmp = this._mkdtemp('kin-restore-')
-      const isPg = getDbEngine() === 'postgres'
-      let dbFile
-      let manifest = null
-      if (rec.file_name?.endsWith('.tar.gz')) {
-        const r = spawnSync('tar', ['-xzf', rec.file_path, '-C', tmp], { stdio: 'pipe' })
-        if (r.status !== 0) throw new Error(`tar extract failed: ${String(r.stderr || '').slice(0, 300)}`)
-        try {
-          manifest = JSON.parse(fs.readFileSync(path.join(tmp, 'manifest.json'), 'utf8'))
-        } catch {}
-        if (isPg) {
-          const pgDumpFile = path.join(tmp, 'db', 'kin.pgdump')
-          const pgJsonFile = path.join(tmp, 'db', 'kin.pg.ndjson.gz')
-          if (fs.existsSync(pgDumpFile)) {
-            dbFile = pgDumpFile
-            if (manifest?.sha256s?.['db/kin.pgdump'] && sha256File(dbFile) !== manifest.sha256s['db/kin.pgdump']) {
-              throw Object.assign(new Error('pg dump sha256 mismatch inside archive'), { code: 'backup_corrupt' })
-            }
-          } else if (fs.existsSync(pgJsonFile)) {
-            dbFile = pgJsonFile
-            if (
-              manifest?.sha256s?.['db/kin.pg.ndjson.gz'] &&
-              sha256File(dbFile) !== manifest.sha256s['db/kin.pg.ndjson.gz']
-            ) {
-              throw Object.assign(new Error('pg snapshot sha256 mismatch inside archive'), { code: 'backup_corrupt' })
-            }
-          } else {
-            throw Object.assign(new Error('no PostgreSQL snapshot inside backup archive'), {
-              code: 'backup_incompatible',
-            })
-          }
-        } else {
-          dbFile = path.join(tmp, 'db', 'kin.db')
-          if (manifest?.sha256s?.['db/kin.db']) {
-            if (sha256File(dbFile) !== manifest.sha256s['db/kin.db']) {
-              throw Object.assign(new Error('db snapshot sha256 mismatch inside archive'), { code: 'backup_corrupt' })
-            }
-          }
-        }
-      } else if (isPg) {
-        dbFile = rec.file_path
-      } else {
-        dbFile = path.join(tmp, 'kin.db')
-        fs.writeFileSync(dbFile, zlib.gunzipSync(fs.readFileSync(rec.file_path)))
-      }
-      if (!fs.existsSync(dbFile)) throw new Error('no db snapshot inside backup')
+      // 1. safety net snapshot of the current state (only after preflight passes)
+      const pre = await this.createBackup({ kind: 'pre_restore', note: `before restore of ${rec.id}` })
 
       // 2. restore database
       let db
@@ -444,8 +537,8 @@ export class BackupService {
       }
 
       // 3. restore vm + config files from the archive (tar flavor only)
-      const vmsDirSrc = path.join(tmp, 'vms')
-      if (this.projectRoot && fs.existsSync(vmsDirSrc)) {
+      const vmsDirSrc = tmp ? path.join(tmp, 'vms') : null
+      if (this.projectRoot && vmsDirSrc && fs.existsSync(vmsDirSrc)) {
         const vmsDir = path.join(this.projectRoot, 'vms')
         fs.mkdirSync(vmsDir, { recursive: true })
         // replace vm json records with archive state (cli-home dirs untouched)
@@ -463,8 +556,8 @@ export class BackupService {
           } catch {}
         }
       }
-      const cfgDirSrc = path.join(tmp, 'config')
-      if (this.configDir && fs.existsSync(cfgDirSrc)) {
+      const cfgDirSrc = tmp ? path.join(tmp, 'config') : null
+      if (this.configDir && cfgDirSrc && fs.existsSync(cfgDirSrc)) {
         fs.mkdirSync(this.configDir, { recursive: true })
         for (const f of fs.readdirSync(cfgDirSrc)) {
           const dest = path.join(this.configDir, f)
@@ -500,7 +593,7 @@ export class BackupService {
       // 7. re-bind stores to the fresh connection. A failed rebind leaves the
       //    process partially attached to the closed database, so it must make
       //    the restore fail instead of reporting a false success.
-      if (this._rebindStores) this._rebindStores(db)
+      if (this._rebindStores) await this._rebindStores(db)
 
       return { ok: true, restored: rec.id, pre_restore: pre.id }
     } finally {
