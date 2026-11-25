@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 1.4.218 — 2026-11-25 · CRAG 订阅宿主机直充/锁价续费/整机迁移与云端订单；PostgreSQL 运行时、备份与一键迁移加固；CRAG v2 续跑 transcript 迁至来宾 tmpfs
+
+- **CRAG 订阅极简重构（`host_id` 直充、锁价续费、云端历史订单与整机零冷却迁移）**：
+  - `src/lib/vm/crag-subscription.mjs` 与 `src/lib/admin/crag-subscription-routes.mjs` 在 `GET /api/panel/crag-subscription` 暴露完整 64 位十六进制 `host_id`，允许无本地凭据时零 Bearer 调用并在 `status()` 自动拉取已直充或升级的 `CRAGH2` 权益；新增 `GET /api/panel/crag-subscription/orders` 与 `POST /api/panel/crag-subscription/migrate`（支持 64-hex `host_id` 或设备 UUID，零冷却整机迁移）。
+  - `src/lib/admin/crag-shop.mjs` 与 `src/lib/admin/crag-shop-supplier.mjs` 在创建标准/设备订单时自动注入当前宿主机 `host_id` 实现支付完成后直充激活，并支持 `sku: "renewal"` + `renew_order_id` 一键锁价续费（不再依赖旧版 `CRAGRP1` `renewalProof`，商品涨价或下架后仍锁定原实付金额）。
+  - 前端新增 `web/src/features/billing/crag-cloud-orders.tsx`（`CragCloudOrdersPanel`），并扩展 `crag-shop.tsx`、`crag-device-identity.tsx`、`crag-host-subscription.tsx`、`crag-subscription-errors.ts` 与 `queries.ts`，展示可复制完整 `host_id`、有效/总计兑换券数、云端历史订单、一键锁价续费与整机/单笔迁移（保留 `#1826` 身份冲突重建能力）（#1842，配套 `dofastted/crag#28`）。
+- **PostgreSQL 运行时、备份恢复、流式迁移预检与 systemd 一键脚本端到端加固**：
+  - 运行时与可观测性：`src/lib/db/database.mjs` 新增 `withSavepoint()` 并接入 `write-behind.mjs`、`request-log.mjs`、`legacy-import.mjs` 隔离 PG 事务内单条 SQL 异常（防 `25P02` 污染批次）；`pg-sync-db.mjs` 在 worker `error`/`exit` 时唤醒 `Atomics.wait` 并施加有界 RPC 超时；`usage-logs-repo.mjs` / `usage-logs-view.mjs` 统一不区分大小写检索（`LOWER(col) LIKE ?`）并经 `settings.usage_logs_db_created_at` 保留历史覆盖起点；`cache-client.mjs` 在 Redis 不可达时回退 PG `LISTEN/NOTIFY`；`dashboard-aggregator.mjs` 对齐 `IGNORED_ERROR_CODES` 并在咨询锁下清理 24 小时前 outbox；`database-metrics.mjs` 暴露 `pg_top_tables` 与 `pg_dashboard_watermark`（#1841）。
+  - 备份与恢复：`backup-core.mjs` 通过 `PGPASSWORD` 传递凭据而非命令行 URI、`dumpPgLogicalNdjsonGz()` 按外键拓扑序经服务端 `NO SCROLL CURSOR` 流式导出、`restorePgSnapshotJob()` 以 `readline` 流式恢复并加 `lock_timeout = '30s'`；`backup-service.mjs` 回收 `pg_dump`/`pg_restore` 子进程并识别 `.pgdump` / `.pg.ndjson.gz` 孤儿归档（#1841）。
+  - 迁移器与部署脚本：`scripts/migrate-sqlite-to-pg.mjs` 新增零停机 `--preflight` 预检、默认拒绝静默丢表/丢列（需显式 `--allow-partial-schema`）、安全对齐种子表、大表字节级进度及 `--verify` 序列与订单/VM 校验；`deploy/install-pg.sh`、`deploy/replace-db-to-pg.sh`、`deploy/install.sh` 与 `docs/POSTGRES_MIGRATION.md` 支持 systemd `vm2api.service` 优先检测、`systemctl show` 读取真实 drop-in 端口/环境、`0600` `.env.postgres` 凭据隔离及 Phase 0 零停机预检（#1841）。
+- **CRAG v2 续跑 transcript 目录同步迁至来宾 tmpfs 避免 9p 写回卡死**：`docker/kin-kvm/guest/kin-crag-apparmor` 抽象 `isolate_tmpfs` / `release_tmpfs`，在 `#1741` `/run/kin/work` 之外新增受管 drop-in `46-vm2api-crag-transcripts.conf`，在内核启动前防符号链接跟随并将 `/home/kincli/.claude/projects` 挂载为来宾 tmpfs（`mode=0700,uid/gid=kincli,size=512m,nosuid,nodev`），失败时自动退回原 9p 目录，离开 CRAG v2 时清理受管 drop-in 且保留管理员自定义文件（#1838）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、PostgreSQL 迁移/安装脚本（`deploy/install*.sh`、`deploy/replace-db-to-pg.sh`、`scripts/migrate-sqlite-to-pg.mjs`）及 KVM guest 侧脚本（`docker/kin-kvm/guest/kin-crag-apparmor`）；`deploy/payload.json`（CRAG `3.1.20` 与 CRAGGemini `0.4.11`）、Gemini 宿主脚本、SQLite 迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.217` 均未变，常规升级预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位（KVM CRAG v2 槽位下次重启启用 `46-vm2api-crag-transcripts.conf`；CRAG 订阅直充/锁价续费/整机迁移需配合 `crag-auth` `dofastted/crag#28` 生效）。
+
 ## 1.4.217 — 2026-11-25 · Codex `token_revoked` 自动摘牌；探活组织禁用直挂四态；主动查询静置窗边界修复；无凭证运行槽与额度条交互校准
 
 - **Codex 槽位 OpenAI `token_revoked` 凭证吊销与 Claude 同口径自动摘牌**：将 OpenAI 401 吊销文案（`token_revoked` / `invalidated oauth token`）统一纳入错误分类（`classifyOAuth401` / `GRANT_DEAD`）、`FailoverRunner` 刷新恢复、`credential-refresh-monitor`、`oauth-credentials`（`refreshErrorCodeOf` 写盘归一为 `oauth_revoked`）、调度资格门、transport 致命判定、`usage-probe-monitor`（跳过死凭证探活）、`panel-api` 遗留清理与前端 `web/src/lib/vm-status.ts` 状态模型，避免死号持续占座雪崩；中流（`terminalState: incomplete`）吊销维持 `oauth_unconfirmed` 保守语义，历史 `refresh_error: "token_revoked"` 旧值同步判死（#1814）。
