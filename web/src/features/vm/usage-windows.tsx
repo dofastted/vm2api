@@ -98,17 +98,23 @@ function observationPercent(value: number | null | undefined) {
     : `${(value * 100).toFixed(0)}%`
 }
 
-/** Mutable stored state, not raw query receipts; rendering never changes admission. */
+/** Mutable stored state, not raw query receipts; shown only on divergence or staleness. */
 export function ClaudeQuotaObservations({ vm, now }: { vm: Vm; now: number }) {
   const observations = vm.quota_observations
   const official = observations?.official
   if (isCodexVm(vm) || !official) return null
   const windows = ['5h', '7d'] as const
+  const isStale = (sample: { reset?: string | null; stale?: boolean } | null | undefined) => {
+    const reset = expiresAtToMs(sample?.reset)
+    return Boolean(sample?.stale || (reset != null && reset > 0 && reset <= now))
+  }
   const different = windows.some((key) => {
     const measured = official[key]?.utilization
     const displayed = key === '5h' ? vm.utilization_5h : vm.utilization_7d
     return measured != null && displayed != null && measured !== displayed
   })
+  const hasStale = windows.some((key) => isStale(official[key]))
+  if (!different && !hasStale) return null
   return (
     <details
       className='min-w-0 text-[11px] text-muted-foreground'
@@ -117,15 +123,11 @@ export function ClaudeQuotaObservations({ vm, now }: { vm: Vm; now: number }) {
       onKeyDown={(event) => event.stopPropagation()}
     >
       <summary className='cursor-pointer'>
-        官方侧存储状态：5H {observationPercent(official['5h']?.utilization)} ·
-        7D {observationPercent(official['7d']?.utilization)}
+        官方侧存储：5H {observationPercent(official['5h']?.utilization)} · 7D{' '}
+        {observationPercent(official['7d']?.utilization)}
         {different ? ' · 与当前展示不同' : ''}
       </summary>
       <div className='mt-1 grid gap-1 break-words'>
-        <p>
-          官方侧保留时间字段：{official.updated_at || '未知'}
-          。该时间不保证对应当前窗口读数，也不代表每个窗口都已重新采样。
-        </p>
         {windows.map((key) => (
           <div key={key}>
             {key.toUpperCase()}
@@ -135,14 +137,12 @@ export function ClaudeQuotaObservations({ vm, now }: { vm: Vm; now: number }) {
                 ['保守合并记录', observations.passive[key]],
               ] as const
             ).map(([label, sample]) => {
-              const reset = expiresAtToMs(sample?.reset)
-              const stale =
-                sample?.stale || (reset != null && reset > 0 && reset <= now)
+              const stale = isStale(sample)
               return (
                 <p key={label}>
                   {label}：{observationPercent(sample?.utilization)}
-                  {stale ? '（陈旧）' : ''}；状态 {sample?.status || '未知'}
-                  ；重置 {sample?.reset || '未知'}；
+                  {stale ? '（陈旧）' : ''} · 状态 {sample?.status || '未知'} ·
+                  重置 {sample?.reset || '未知'} ·{' '}
                   {sample?.sampled_at || '窗口采样时间未知'}
                 </p>
               )
@@ -150,7 +150,8 @@ export function ClaudeQuotaObservations({ vm, now }: { vm: Vm; now: number }) {
           </div>
         ))}
         <p>
-          当前额度保留原有保守合并规则；两侧存储值可能不同，不能仅凭时间字段覆盖。官方侧可能被重置后的响应头校正，并非官方查询原始回执。保守记录含响应头及官方同步值，不等于原始响应头。查询失败不会清零，存储状态不代表实时可用额度。
+          官方侧保留时间：{official.updated_at || '未知'}
+          （不保证对应单窗口采样；重置后可能被响应头校正，并非官方查询原始回执，不改变保守调度规则）。
         </p>
       </div>
     </details>
@@ -199,7 +200,6 @@ export function VmUsageWindows({
           quiet={quiet}
         />
       ))}
-      <ClaudeQuotaObservations vm={vm} now={now} />
       {quotaActions ? <VmQuotaActions vm={vm} now={now} /> : null}
     </div>
   )

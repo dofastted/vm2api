@@ -1,7 +1,7 @@
 import type { Vm } from '@/types/panel-vm'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
-import { VmUsageWindows } from './usage-windows'
+import { ClaudeQuotaObservations, VmUsageWindows } from './usage-windows'
 
 function render(five: number | null, seven: number | null) {
   const vm: Vm = {
@@ -53,7 +53,7 @@ describe('Claude official quota observations', () => {
   }
   function claude(overrides = {}) {
     return renderToStaticMarkup(
-      <VmUsageWindows
+      <ClaudeQuotaObservations
         vm={
           {
             id: 'fixture',
@@ -68,9 +68,30 @@ describe('Claude official quota observations', () => {
       />
     )
   }
+  it('keeps VmUsageWindows clean for rack baseline alignment', () => {
+    const html = renderToStaticMarkup(
+      <VmUsageWindows
+        vm={
+          {
+            id: 'fixture',
+            has_token: true,
+            platform: 'anthropic',
+            utilization_7d: 0.76,
+            quota_observations: snapshot,
+          } as Vm
+        }
+        now={Date.parse('2026-11-01T00:05:00Z')}
+      />
+    )
+    expect(html).toContain('76%')
+    expect(html).not.toContain('官方侧存储')
+  })
+  it('stays hidden when official storage matches displayed utilization and is not stale', () => {
+    expect(claude({ utilization_7d: 0 })).toBe('')
+  })
   it('shows official zero beside conservative usage, source and distinct timestamps', () => {
     const html = claude()
-    expect(html).toContain('官方侧存储状态')
+    expect(html).toContain('官方侧存储：')
     expect(html).toContain('0%')
     expect(html).toContain('76%')
     expect(html).toContain('与当前展示不同')
@@ -88,21 +109,21 @@ describe('Claude official quota observations', () => {
         },
       },
     })
-    expect(html).toContain('官方侧存储状态')
+    expect(html).toContain('官方侧存储：')
     expect(html).toContain('5%')
     expect(html).toContain('2026-11-01T00:00:00Z')
-    expect(html).toContain('可能被重置后的响应头校正，并非官方查询原始回执')
-    expect(html).toContain('该时间不保证对应当前窗口读数')
+    expect(html).toContain('重置后可能被响应头校正，并非官方查询原始回执')
+    expect(html).toContain('不保证对应单窗口采样')
     expect(html).not.toContain('官方查询记录')
     expect(html).not.toContain('官方记录更新时间')
     expect(html).not.toContain('官方查询：')
   })
   it('does not invent official snapshots for old servers or other platforms', () => {
     expect(claude({ quota_observations: undefined })).not.toContain(
-      '官方侧存储状态'
+      '官方侧存储'
     )
     expect(claude({ platform: 'openai', family: 'codex' })).not.toContain(
-      '官方侧存储状态'
+      '官方侧存储'
     )
   })
   it('retains stale official observations with a warning, not a new zero', () => {
@@ -115,7 +136,7 @@ describe('Claude official quota observations', () => {
         },
       },
     })
-    expect(html).toContain('官方侧存储状态')
+    expect(html).toContain('官方侧存储：')
     expect(html).toContain('陈旧')
     expect(html).toContain('未知')
     expect(html).not.toMatch(/>0%</)
