@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 1.4.221 — 2026-11-26 · 修复 Gemini `crag_subscription` 分片崩溃 503 循环；钉选 CRAG 3.1.21 与遥测上传核验；商城画布缓存持久化、日志思考后缀对齐与 PostgreSQL 备份预检加固
+
+- **修复 Gemini `crag_subscription` 分片 `license_error` 导致的周期性 `503 gemini_native_worker_unavailable`**：
+  - `scripts/gemini-host.py` 在 `payload_mode == "crag_subscription"` 时强制 `_use_sharded_daemon()` 返回 `False`（统一走单账号 `NativeSession` 进程池，与每环境独立 `/etc/machine-id` 设备绑定保持一致），并对齐 `daemon_status()` 的 `planned_shards` 计算（#1863）。
+  - 新增 `_clear_shard_fault()`，移除 `_acquire_shard_for_account()` 启动即清零退避计数的缺陷（仅在健康检查或 `open_stream` 真正就绪后重置），恢复 `2s → 60s` 指数退避；在 `_stream_native_infer()` 中，当分片在发送 SSE 响应头之前崩溃且开启 `daemon_fault_isolation` 时透明隔离并同请求回落至单账号 `NativeSession`（#1863）。
+- **CRAG 遥测上传核验并钉选 CRAG `3.1.21` 签名载荷**：`deploy/payload.json` 将 CRAG 载荷升级至 `payload-2026.11.26-crag-3.1.21`；扩展 `src/lib/transport/rust-kernel-client.mjs`、`src/lib/vm/slot-process-status.mjs`、`src/lib/admin/kernel-catalog.mjs` 与前端 `telemetry-pane.tsx` / `seed-policy-card.tsx` / `detail-page.tsx`，补齐 CRAG 遥测上传校验状态与文档说明（#1859）。
+- **CRAG 商城商品画布缓存持久化、Gemini 日志模型名对齐与 PostgreSQL 备份预检对齐**：
+  - `src/lib/admin/crag-shop.mjs`、`crag-shop-supplier.mjs` 与 `web/src/features/billing/crag-shop.tsx` 持久化商品目录画布缓存，支持摘要哈希跳过重复拉取与上游超时回退（#1862）。
+  - `src/lib/protocol/log-fields.mjs`、`src/lib/db/repos/usage-logs-view.mjs` 与 `web/src/features/logs/log-display.ts` 将 Gemini 思考档位后缀与上游裸 `modelVersion` 视为同源匹配（#1860）。
+  - `src/lib/admin/backup-service.mjs`、`panel-routes.mjs` 与 `web/src/features/settings/backup-pane.tsx` 对齐 PostgreSQL 备份预检、HTTP 状态码与界面展示（#1858）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、`deploy/payload.json`（CRAG 升级至 `3.1.21`，CRAGGemini 维持 `0.4.12`）与 `scripts/gemini-host.py`；数据库迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.220` 未变，预期 `SLOT_SYNC=skip`；Gemini 宿主机同步 `scripts/gemini-host.py` 后重启 `vm2api-gemini` 即可彻底消除 `503 gemini_native_worker_unavailable`（`v1.4.211`～`v1.4.220` 旧版在升级前可通过将 `accounts_per_daemon` 设为 `1` 临时止血）。
+
 ## 1.4.220 — 2026-11-26 · 钉选 CRAGGemini 0.4.12 并恢复 agy 工具执行；修复 PostgreSQL `cooldown_until` 类型归一与一键切库脚本
 
 - **恢复 CRAGGemini `agy` 客户端工具执行并钉选 `0.4.12` 签名载荷**：
