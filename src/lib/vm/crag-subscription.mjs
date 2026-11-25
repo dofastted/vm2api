@@ -2019,7 +2019,12 @@ export function createCragSubscription({
           try {
             return await finish(targetHost, targetIntent, targetPrevious, targetAsserted, replay)
           } catch (error) {
-            if (renewal || expectedHost || error?.code !== 'auth_forbidden' || error?.recovery !== 'host_id_collision') {
+            if (
+              renewal ||
+              expectedHost ||
+              error?.code !== 'auth_forbidden' ||
+              error?.recovery !== 'host_id_collision'
+            ) {
               throw error
             }
             // Confirmed host_id_collision: retire the colliding local identity and
