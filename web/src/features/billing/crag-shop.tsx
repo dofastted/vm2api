@@ -31,6 +31,7 @@ import {
   type CragOrderActivationRecovery,
 } from '@/features/vm/crag-subscription-errors'
 import {
+  cragHostOrdersQueryOptions,
   cragHostStatusQueryOptions,
   type CragHostStatus,
 } from '@/features/vm/queries'
@@ -43,6 +44,7 @@ import {
   type CragPlan,
   type Presentation,
 } from './crag-catalog'
+import { CragCloudOrdersPanel } from './crag-cloud-orders'
 import {
   CragCommerce,
   CragPaymentButtons,
@@ -901,6 +903,12 @@ function useHostStatus(enabled: boolean) {
   })
 }
 
+type OverviewContext = {
+  channels: readonly Method[]
+  busy: boolean
+  onRenewOrder: (orderId: string, amountMinor: number, method: Method) => void
+}
+
 export function CragSubscriptionPage() {
   const me = useQuery(meQueryOptions())
   const isAdmin = me.data?.role === 'admin' && !me.isError
@@ -914,7 +922,18 @@ export function CragSubscriptionPage() {
       host={host.isError ? undefined : host.data}
       overview={
         isAdmin
-          ? (onUpdated) => <HostOverview host={host} onUpdated={onUpdated} />
+          ? (onUpdated, ctx) => (
+              <div className='space-y-6'>
+                <CragCloudOrdersPanel
+                  host={host.isError ? undefined : host.data}
+                  channels={ctx.channels}
+                  busy={ctx.busy}
+                  onRenewOrder={ctx.onRenewOrder}
+                  onHostChanged={onUpdated}
+                />
+                <HostOverview host={host} onUpdated={onUpdated} />
+              </div>
+            )
           : null
       }
     />
@@ -940,7 +959,7 @@ function ShopOrders({
   isAdmin: boolean
   host?: CragHostStatus
   owner: string
-  overview: ((onUpdated: () => void) => ReactNode) | null
+  overview: ((onUpdated: () => void, ctx: OverviewContext) => ReactNode) | null
 }) {
   const qc = useQueryClient()
   const request = device ? cragDeviceApi : api
@@ -1125,6 +1144,21 @@ function ShopOrders({
           setOrdersFailed(false)
           setOrdersProblem('')
           setLoading(false)
+          if (
+            isAdmin &&
+            mine.orders.some(
+              (item) =>
+                item.status === 'fulfilled' &&
+                item.activation?.state === 'active'
+            )
+          ) {
+            void qc.invalidateQueries({
+              queryKey: cragHostStatusQueryOptions().queryKey,
+            })
+            void qc.invalidateQueries({
+              queryKey: cragHostOrdersQueryOptions().queryKey,
+            })
+          }
         },
         (error: unknown) => {
           if (signal.aborted) return
@@ -1390,7 +1424,14 @@ function ShopOrders({
     paymentMethod: Method,
     price?: number
   ) {
-    if (!canOrder || !channels.includes(paymentMethod) || busy) return
+    const lockedOrderRenewal =
+      selection.sku === 'renewal' && !!selection.renew_order_id
+    if (
+      (!canOrder && !lockedOrderRenewal) ||
+      !channels.includes(paymentMethod) ||
+      busy
+    )
+      return
     const activation_target =
       isAdmin && selection.sku !== 'renewal' && targetVmId
         ? { vm_id: targetVmId }
@@ -1403,6 +1444,7 @@ function ShopOrders({
       last.slots === selection.slots &&
       last.months === selection.months &&
       last.coupon === selection.coupon &&
+      last.renew_order_id === selection.renew_order_id &&
       last.payment_method === paymentMethod &&
       last.expected_amount_minor === price &&
       last.activation_target?.vm_id === activation_target?.vm_id
@@ -1958,7 +2000,8 @@ function ShopOrders({
                             <span>{device ? '到账状态' : '激活状态'}</span>
                             <StatusMark
                               tone={
-                                device && order.activation.state === 'active'
+                                order.activation.state === 'active' &&
+                                (device || !order.activation.vm_id)
                                   ? {
                                       key: 'active',
                                       cls: 'ok',
@@ -2269,7 +2312,16 @@ function ShopOrders({
                 </div>
               ) : null}
             </section>
-            {overview?.(() => refresh((n) => n + 1))}
+            {overview?.(() => refresh((n) => n + 1), {
+              channels,
+              busy,
+              onRenewOrder: (orderId, amountMinor, method) =>
+                createOrder(
+                  { sku: 'renewal', renew_order_id: orderId },
+                  method,
+                  amountMinor
+                ),
+            })}
           </div>
         </div>
       </div>

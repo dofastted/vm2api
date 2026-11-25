@@ -23,6 +23,7 @@ export type CommerceSelection = {
   slots?: number
   months?: number
   coupon?: string
+  renew_order_id?: string
 }
 
 export const paymentLabels = { wxpay: '微信支付', alipay: '支付宝' }
