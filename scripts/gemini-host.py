@@ -638,23 +638,214 @@ def invocation_module():
     return _load_trusted_module("gemini_host_inference", INFERENCE_MODULE)
 
 
+SANDBOX_PROBE_OK_TTL = 300.0
+SANDBOX_PROBE_FAIL_TTL = 15.0
+SANDBOX_PROBE_TIMEOUT = 3.0
+SANDBOX_PROBE_STDERR_LIMIT = 4096
+SANDBOX_APPARMOR_PROFILE = "vm2api-gemini"
+SANDBOX_APPARMOR_STDERR = re.compile(
+    rb"(?:uid_map|permission denied|operation not permitted)", re.I
+)
+SANDBOX_ERROR_CODES = frozenset(
+    {
+        "gemini_sandbox_apparmor_restricted",
+        "gemini_sandbox_unavailable",
+    }
+)
+SAFE_AUTH_REASON = re.compile(
+    r"\A(?:timeout|os_error|failed|exited|exit_code=-?[0-9]{1,5}|signal=[0-9]{1,3})\Z"
+)
+
 AUTH_FAILURE_STAGES = frozenset(
     {
         "network_prepare",
         "relay_start",
         "proxy_probe",
         "egress_start",
+        "sandbox_denied",
         "cli_launch",
+        "cli_early_exit",
         "challenge_wait",
     }
 )
 
 
 class Failure(Exception):
-    def __init__(self, status, code=None, stage=None):
+    def __init__(self, status, code=None, stage=None, reason=None):
         self.status = status
         self.code = code
         self.stage = stage if stage in AUTH_FAILURE_STAGES else None
+        self.reason = (
+            reason
+            if isinstance(reason, str) and SAFE_AUTH_REASON.fullmatch(reason)
+            else None
+        )
+
+
+def _read_bounded_text(path, limit=256):
+    try:
+        with open(path, "rb") as stream:
+            return stream.read(limit).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return None
+
+
+def _apparmor_sandbox_evidence(stderr_bytes=b"", *, host_root=Path("/")):
+    enabled = _read_bounded_text(
+        host_root / "sys/module/apparmor/parameters/enabled"
+    )
+    if enabled not in {"Y", "1", "yes"}:
+        return False
+    restricted = _read_bounded_text(
+        host_root / "proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+    )
+    if restricted != "1":
+        return False
+    current = _read_bounded_text(host_root / "proc/self/attr/apparmor/current")
+    if current is None:
+        current = _read_bounded_text(host_root / "proc/self/attr/current")
+    lacks_profile = False
+    if current is not None:
+        parts = current.split()
+        profile_token = parts[0] if parts else ""
+        lacks_profile = (
+            profile_token == "unconfined"
+            or profile_token != SANDBOX_APPARMOR_PROFILE
+        )
+    stderr_match = bool(
+        stderr_bytes and SANDBOX_APPARMOR_STDERR.search(stderr_bytes)
+    )
+    return lacks_profile or stderr_match
+
+
+def _sandbox_probe_command(uid, *, true_bin=None):
+    if true_bin is None:
+        true_bin = "/usr/bin/true" if os.path.exists("/usr/bin/true") else "/bin/true"
+    return [
+        "setpriv",
+        "--reuid",
+        str(uid),
+        "--regid",
+        str(uid),
+        "--clear-groups",
+        "--no-new-privs",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--bounding-set=-all",
+        "bwrap",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-net",
+        "--die-with-parent",
+        "--clearenv",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind-try",
+        "/lib",
+        "/lib",
+        "--ro-bind-try",
+        "/lib64",
+        "/lib64",
+        "--ro-bind-try",
+        "/bin",
+        "/bin",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--",
+        true_bin,
+    ]
+
+
+def _run_bounded_probe(
+    argv,
+    *,
+    timeout=SANDBOX_PROBE_TIMEOUT,
+    stderr_limit=SANDBOX_PROBE_STDERR_LIMIT,
+):
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=SYSTEM_ENV,
+        start_new_session=True,
+    )
+    stderr_buf = bytearray()
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    try:
+        stderr_fd = None
+        if proc.stderr is not None:
+            try:
+                stderr_fd = proc.stderr.fileno()
+            except (AttributeError, OSError, ValueError):
+                stderr_fd = None
+        if stderr_fd is not None:
+            os.set_blocking(stderr_fd, False)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                ready, _, _ = select.select([stderr_fd], [], [], min(0.1, remaining))
+                if ready:
+                    try:
+                        chunk = os.read(stderr_fd, 4096)
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        break
+                    if len(stderr_buf) < stderr_limit:
+                        stderr_buf.extend(chunk[: stderr_limit - len(stderr_buf)])
+                elif proc.poll() is not None:
+                    while True:
+                        try:
+                            chunk = os.read(stderr_fd, 4096)
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            break
+                        if len(stderr_buf) < stderr_limit:
+                            stderr_buf.extend(chunk[: stderr_limit - len(stderr_buf)])
+                    break
+        if not timed_out:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                rc = proc.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                rc = None
+        else:
+            rc = None
+        if timed_out:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+            return None, b""
+        if stderr_fd is None and proc.stderr is not None:
+            raw = proc.stderr.read(stderr_limit)
+            if isinstance(raw, str):
+                raw = raw.encode("utf-8", errors="replace")
+            if raw:
+                stderr_buf.extend(raw[:stderr_limit])
+        return rc, bytes(stderr_buf)
+    finally:
+        if proc.stderr is not None:
+            try:
+                proc.stderr.close()
+            except OSError:
+                pass
 
 
 def now():
@@ -1063,6 +1254,7 @@ class Agy:
         self.profile = profile
         self.owns_directory = False
         self.pid = None
+        self._exit_status = None
         self.terminal = None
         self.egress = None
         self.egress_relay = None
@@ -1351,15 +1543,37 @@ class Agy:
         relay_ok = relay is None or relay.poll() is None
         return bool(self.pid and self.egress.poll() is None and relay_ok and not self.exited())
 
+    def poll_exit_status(self):
+        cached = getattr(self, "_exit_status", None)
+        if cached is not None:
+            return cached
+        if not self.pid:
+            return None
+        try:
+            info = os.waitid(
+                os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
+            )
+        except ChildProcessError:
+            return None
+        if info is None:
+            return None
+        if info.si_code == os.CLD_EXITED:
+            status = {"exit_code": int(info.si_status)}
+        elif info.si_code in (os.CLD_KILLED, os.CLD_DUMPED):
+            status = {"signal": int(info.si_status)}
+        else:
+            status = {"status": int(info.si_status)}
+        self._exit_status = status
+        return status
+
     def exited(self):
         # WNOWAIT leaves the PID reserved until close() has signalled its group.
-        return (
-            os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-            is not None
-        )
+        return self.poll_exit_status() is not None
 
     def close(self, preserve=False):
         if self.pid:
+            # Capture real child exit code/signal before sending SIGTERM/SIGKILL.
+            self.poll_exit_status()
             if preserve and not self.exited():
                 for sig_fn in (
                     lambda: os.killpg(self.pid, signal.SIGTERM),
@@ -2874,9 +3088,43 @@ class Login(Agy):
         self.token_seen_at = None
         super().__init__(host, environment, proxy_url)
 
+    @staticmethod
+    def _format_exit_reason(exit_status):
+        if not isinstance(exit_status, dict):
+            return None
+        if "exit_code" in exit_status:
+            return f"exit_code={exit_status['exit_code']}"
+        if "signal" in exit_status:
+            return f"signal={exit_status['signal']}"
+        return None
+
+    def _wait_exit_status(self, timeout=0.2):
+        status = self.poll_exit_status()
+        if status is not None or not self.pid:
+            return status
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.01)
+            status = self.poll_exit_status()
+            if status is not None:
+                return status
+        return None
+
+    def _classify_early_exit(self, exit_status):
+        # Never expose or log self.buffer / PTY output.
+        reason = self._format_exit_reason(exit_status) or "exited"
+        probe = getattr(self.host, "probe_sandbox", None)
+        sandbox_issue = probe(force=True) if callable(probe) else None
+        if sandbox_issue in SANDBOX_ERROR_CODES:
+            return Failure(503, sandbox_issue, stage="sandbox_denied", reason=reason)
+        return Failure(503, stage="cli_early_exit", reason=reason)
+
     def read(self, timeout):
         if not self.alive():
-            raise Failure(503)
+            exit_status = self.poll_exit_status()
+            raise Failure(
+                503, reason=self._format_exit_reason(exit_status) or "exited"
+            )
         if select.select([self.terminal], [], [], timeout)[0]:
             try:
                 data = os.read(self.terminal, 16384)
@@ -2887,7 +3135,10 @@ class Login(Agy):
                     raise
                 data = b""
             if not data:
-                raise Failure(409)
+                exit_status = self._wait_exit_status(0.2)
+                raise Failure(
+                    409, reason=self._format_exit_reason(exit_status) or "exited"
+                )
             self.buffer = (self.buffer + data)[-65536:]
 
     def challenge(self):
@@ -2908,10 +3159,23 @@ class Login(Agy):
                         "url": url,
                     }
         except Failure as err:
-            raise Failure(err.status, err.code, stage=err.stage or "challenge_wait") from err
+            if err.stage is not None:
+                raise
+            exit_status = self._wait_exit_status(0.2)
+            if exit_status is not None or not self.alive():
+                raise self._classify_early_exit(exit_status) from err
+            raise Failure(
+                err.status, err.code, stage="challenge_wait", reason=err.reason
+            ) from err
         except OSError as err:
-            raise Failure(503, stage="challenge_wait") from err
-        raise Failure(503, stage="challenge_wait")
+            exit_status = self._wait_exit_status(0.2)
+            if exit_status is not None or not self.alive():
+                raise self._classify_early_exit(exit_status) from err
+            raise Failure(503, stage="challenge_wait", reason="os_error") from err
+        exit_status = self.poll_exit_status()
+        if exit_status is not None or not self.alive():
+            raise self._classify_early_exit(exit_status)
+        raise Failure(503, stage="challenge_wait", reason="timeout")
 
     def submit(self, code, state, proxy_url):
         if (
@@ -3217,6 +3481,8 @@ class Host:
         self._session_locks = {}
         self._slot_networks = {}
         self._network_lease_lock = threading.Lock()
+        self._sandbox_probe_lock = threading.Lock()
+        self._sandbox_probe_cache = None
         self._runtime_proxies = {}
         self._warm_backoff = {}
         self._warming = set()
@@ -4027,6 +4293,44 @@ class Host:
         self.payload_state = "installed"
         return {"kernel_version": self.payload_version}
 
+    def _run_sandbox_probe(self):
+        if any(
+            not shutil.which(tool, path=SYSTEM_ENV["PATH"])
+            for tool in ("setpriv", "bwrap")
+        ):
+            return "gemini_sandbox_unavailable"
+        argv = _sandbox_probe_command(self.uid_base)
+        try:
+            rc, stderr_bytes = _run_bounded_probe(argv)
+        except OSError:
+            return "gemini_sandbox_unavailable"
+        if rc == 0:
+            return None
+        if rc is not None and _apparmor_sandbox_evidence(stderr_bytes):
+            return "gemini_sandbox_apparmor_restricted"
+        return "gemini_sandbox_unavailable"
+
+    def probe_sandbox(self, *, force=False):
+        lock = getattr(self, "_sandbox_probe_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._sandbox_probe_lock = lock
+        with lock:
+            cached = getattr(self, "_sandbox_probe_cache", None)
+            now_mono = time.monotonic()
+            if not force and cached is not None:
+                checked_at, cached_issue = cached
+                ttl = (
+                    SANDBOX_PROBE_OK_TTL
+                    if cached_issue is None
+                    else SANDBOX_PROBE_FAIL_TTL
+                )
+                if now_mono - checked_at < ttl:
+                    return cached_issue
+            issue = self._run_sandbox_probe()
+            self._sandbox_probe_cache = (time.monotonic(), issue)
+            return issue
+
     def oauth_runtime_issue(self):
         if any(
             not shutil.which(tool, path=SYSTEM_ENV["PATH"])
@@ -4040,14 +4344,25 @@ class Host:
         except (OSError, RuntimeError):
             return "gemini_egress_unavailable"
         try:
-            if Path("/proc/sys/net/ipv4/ip_forward").read_text().strip() == "1":
-                return None
+            if Path("/proc/sys/net/ipv4/ip_forward").read_text().strip() != "1":
+                return "gemini_ipv4_forwarding_unavailable"
         except OSError:
             print("Gemini OAuth could not read IPv4 forwarding state", file=sys.stderr)
-        return "gemini_ipv4_forwarding_unavailable"
+            return "gemini_ipv4_forwarding_unavailable"
+        return self.probe_sandbox()
 
-    def ensure_oauth_runtime(self):
+    def ensure_oauth_runtime(self, *, refresh_on_failure=False):
         self.ensure_payload()
+        lock = getattr(self, "_sandbox_probe_lock", None)
+        if lock is not None:
+            with lock:
+                cached = getattr(self, "_sandbox_probe_cache", None)
+                if refresh_on_failure or (cached is not None and cached[1] is not None):
+                    self._sandbox_probe_cache = None
+        else:
+            cached = getattr(self, "_sandbox_probe_cache", None)
+            if refresh_on_failure or (cached is not None and cached[1] is not None):
+                self._sandbox_probe_cache = None
         issue = self.oauth_runtime_issue()
         if issue:
             raise Failure(503, issue)
@@ -6506,6 +6821,7 @@ class Host:
             "daemon-status",
             "maintenance-status",
             "maintenance-quiesce",
+            "maintenance-sandbox",
             "test-chat-status",
             "test-chat-cancel",
             "infer-cancel",
@@ -6548,6 +6864,9 @@ class Host:
                     or any(self.running(key) for key in self.runs)
                 )
             }
+        if operation == "maintenance-sandbox":
+            issue = self.probe_sandbox(force=bool(body.get("force")))
+            return {"ok": issue is None, "code": issue}
         if operation == "maintenance-quiesce":
             if (
                 self.pending
@@ -6893,22 +7212,40 @@ class Host:
                 env["auth_state"] = "reauth_required"
                 self.touch_environment(env)
                 self.save()
-                stage = error.stage if isinstance(error, Failure) and error.stage in AUTH_FAILURE_STAGES else None
-                cause = getattr(error, "__cause__", None) or error
-                if isinstance(cause, subprocess.TimeoutExpired):
-                    reason_kind = "timeout"
-                elif isinstance(cause, subprocess.CalledProcessError):
-                    reason_kind = f"exit_code={cause.returncode}"
-                elif isinstance(cause, OSError):
-                    reason_kind = "os_error"
+                stage = (
+                    error.stage
+                    if isinstance(error, Failure) and error.stage in AUTH_FAILURE_STAGES
+                    else None
+                )
+                code = (
+                    error.code
+                    if isinstance(error, Failure) and error.code in SANDBOX_ERROR_CODES
+                    else "gemini_authorization_unavailable"
+                )
+                if (
+                    isinstance(error, Failure)
+                    and isinstance(error.reason, str)
+                    and SAFE_AUTH_REASON.fullmatch(error.reason)
+                ):
+                    reason_kind = error.reason
                 else:
-                    reason_kind = "failed"
+                    cause = getattr(error, "__cause__", None) or error
+                    if isinstance(cause, subprocess.TimeoutExpired):
+                        reason_kind = "timeout"
+                    elif isinstance(cause, subprocess.CalledProcessError) and isinstance(
+                        cause.returncode, int
+                    ):
+                        reason_kind = f"exit_code={cause.returncode}"
+                    elif isinstance(cause, OSError):
+                        reason_kind = "os_error"
+                    else:
+                        reason_kind = "failed"
                 stage_text = f" stage={stage}" if stage else ""
                 print(
                     f"Gemini CLI authorization did not start{stage_text} reason={reason_kind}",
                     file=sys.stderr,
                 )
-                raise Failure(503, "gemini_authorization_unavailable", stage=stage) from error
+                raise Failure(503, code, stage=stage) from error
         if operation == "complete":
             self.ensure_payload(legacy_install=False)
             login = self.pending.get(identifier)
@@ -7758,6 +8095,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "install-payload",
                 "maintenance-status",
                 "maintenance-quiesce",
+                "maintenance-sandbox",
                 "proxy-probe",
                 "proxy-bind",
                 "concurrency-set",
@@ -7781,7 +8119,12 @@ class ControlHandler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise Failure(400)
-            if operation in ("install-payload", "maintenance-status", "maintenance-quiesce"):
+            if operation in (
+                "install-payload",
+                "maintenance-status",
+                "maintenance-quiesce",
+                "maintenance-sandbox",
+            ):
                 _, uid, _ = struct.unpack(
                     "3i",
                     self.request.getsockopt(
@@ -7790,7 +8133,12 @@ class ControlHandler(BaseHTTPRequestHandler):
                 )
                 if uid != 0:
                     raise Failure(403)
-                if body:
+                if operation == "maintenance-sandbox":
+                    if body and (
+                        set(body) != {"force"} or type(body["force"]) is not bool
+                    ):
+                        raise Failure(400)
+                elif body:
                     raise Failure(400)
             status, payload = 200, self.server.host.request(operation, body)
         except Failure as error:
