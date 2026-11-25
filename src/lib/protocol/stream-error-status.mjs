@@ -1,7 +1,7 @@
 import { isPlanLimitMessage } from '../pool/quota-window.mjs'
 
 const AUTH_ERROR_TEXT =
-  /authentication_error|token has been revoked|oauth_revoked|invalid_grant|invalid (?:bearer|x-api-key)|OAuth token has expired/i
+  /authentication_error|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant|invalid (?:bearer|x-api-key)|OAuth token has expired/i
 const PERMISSION_ERROR_TEXT = /organization does not have access to claude/i
 
 /**

@@ -28,6 +28,7 @@ import {
   persistVmSubscription,
   isCodexVm,
   migrateVmSchedule,
+  markUnschedulable,
 } from '../vm/vm-registry.mjs'
 import { clearRecoverableVmCooldown, markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import {
@@ -53,6 +54,7 @@ import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { pickScheduleFields } from '../pool/schedule-state.mjs'
 import { socksProxyFamily, normalizeSocksHost } from '../vm/socks-address.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
+import { isOrganizationDisabledUsageResult } from '../pool/upstream-error-policy.mjs'
 import { mergeBatchGroupConfig } from '../pool/batch-group.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy, vmQuotaOverrideOf, vmQuotaView } from '../pool/vm-quota-override.mjs'
 import { GATE_OPEN, gatePolicyFields, gateZone, quotaGateOf } from '../pool/quota-gate.mjs'
@@ -1193,13 +1195,19 @@ function applyFableProbeResult(accountQuota, accountId, found) {
   accountQuota.repo.save(saved)
   return found.tier
 }
+/** A 403 org refusal in the official /usage probe: park like the runtime 401/403 path. */
+function organizationDisabledProbe(result = {}) {
+  return isOrganizationDisabledUsageResult(result)
+}
 function fatalUsageCredentialFailure(result = {}) {
   if (result?.ok === true || result?.usage_scope_missing) return false
   const status = Number(result?.usage_status || result?.status || 0)
   const text = String(result?.usage_error || result?.error || result?.fable?.error || '').toLowerCase()
   return (
     status === 401 ||
-    /oauth_revoked|token has been revoked|invalid_grant|oauth_invalid_grant|refresh token not found/.test(text)
+    /oauth_revoked|token has been revoked|token_revoked|invalidated oauth token|invalid_grant|oauth_invalid_grant|refresh token not found/.test(
+      text,
+    )
   )
 }
 
@@ -1318,7 +1326,21 @@ export async function buildProbeOne({
         },
         { force: !!force },
       )
-  if (fatalUsageCredentialFailure(result)) {
+  // The probe heard the same org refusal the runtime 400/401/403 classifier
+  // parks on: park now, without waiting for real traffic to trip it again.
+  // Operator-only re-enable, identical to the runtime path (four-state model).
+  // Checked BEFORE the bare-401 fatal branch: an org-disabled 401 must not be
+  // recorded as oauth_revoked ("凭证吊销" would be a wrong panel verdict).
+  if (organizationDisabledProbe(result)) {
+    try {
+      markUnschedulable(cfg.paths.project, id, 'organization_disabled', {
+        status: Number(result.usage_status || result.status) || null,
+        message: String(result.usage_error?.message || result.usage_error || result.error || '').slice(0, 500),
+        account_id: accountId || null,
+        at: new Date().toISOString(),
+      })
+    } catch {}
+  } else if (fatalUsageCredentialFailure(result)) {
     try {
       markVmRefreshError(path.join(cfg.paths.project, 'vms', `${id}.json`), {
         error: {
@@ -1396,12 +1418,16 @@ export async function buildProbeOne({
     accountQuota.setAccountTier(accountId, tier, { source: 'usage' })
     persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
   }
+  // The org-refusal park above rewrote vm.json; re-read so the probe response
+  // does not report the just-parked slot as still schedulable.
+  const vmFresh = organizationDisabledProbe(result) ? getVm(cfg.paths.project, id) : null
+  const vmView = vmFresh || vm
   const availability = evaluateAccount({
-    vm,
+    vm: vmView,
     account: after || {},
     hasToken: true,
-    hasRefresh: !!(vm.has_refresh || vm.claude?.has_refresh),
-    schedulable: vm.schedulable !== false,
+    hasRefresh: !!(vmView.has_refresh || vmView.claude?.has_refresh),
+    schedulable: vmView.schedulable !== false,
     lastProbe: qAfter.last_probe,
     probeSource: qAfter.probe_source,
     quota: qAfter,
@@ -2453,7 +2479,9 @@ function findRuntime(accountQuota, vm, snap = null) {
       const leftover =
         leftoverKey &&
         (!cred.has_access ||
-          /refresh_token_missing|invalid_grant|worker_unhealthy/.test(err + String(state.status || '')))
+          /refresh_token_missing|invalid_grant|token_revoked|invalidated oauth token|worker_unhealthy/.test(
+          err + String(state.status || '')
+        ))
       const live = !!(vm.has_refresh || vm.has_token || vm.account_uuid)
       if (leftover && live) continue
       return freshenRuntimeState(state, vm, repo)
@@ -2485,7 +2513,10 @@ function freshenRuntimeState(state, vm, repo = null) {
   }
   const cred = state.worker_status?.credential
   const lastError = String(state.worker_status?.last_error || state.worker_status?.error || '')
-  const leftover = /invalid_grant|refresh token not found|oauth_revoked|credential_refresh_failed/i.test(lastError)
+  const leftover =
+    /invalid_grant|refresh token not found|oauth_revoked|credential_refresh_failed|token_revoked|invalidated oauth token/i.test(
+      lastError
+    )
   const wMs = expiresAtToMs(cred?.expires_at)
   const vMs = expiresAtToMs(vm.expires_at)
   const liveMs = Math.max(wMs || 0, vMs || 0)

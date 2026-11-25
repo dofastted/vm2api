@@ -31,7 +31,10 @@ import {
 import { HISTORY_WINDOW_MS, rollWindowHistory } from './window-history.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from './quota-tiers.mjs'
 import { resolvePolicyModelId } from '../protocol/model-policy.mjs'
-import { isFableCreditsRequiredMessage } from './upstream-error-policy.mjs'
+import {
+  isFableCreditsRequiredMessage,
+  isOrganizationDisabledUsageResult,
+} from './upstream-error-policy.mjs'
 import { SessionLimitRegistry } from './session-limit.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy } from './vm-quota-override.mjs'
 import {
@@ -562,7 +565,15 @@ export class AccountQuota {
     }
     const nowIso = probe.probed_at || new Date(nowMs).toISOString()
     const officialUpdatedAtMs = parseTimestampMs(nowIso) ?? nowMs
-    if (isOfficialUsageRateLimited(probe)) {
+    // An org refusal is a deterministic slot state, not a transient usage
+    // backoff: keep the raw error (the panel and the runtime classifier both
+    // read it) instead of painting rate_limited over an org-disabled slot.
+    const orgDisabled = isOrganizationDisabledUsageResult({
+      ...probe,
+      ok: probe.ok,
+      usage_scope_missing: probe.usage_scope_missing,
+    })
+    if (isOfficialUsageRateLimited(probe) && !orgDisabled) {
       const retryMs = Number(probe.retry_after_ms)
       const backoff =
         Number.isFinite(retryMs) && retryMs > 0 ? Math.min(Math.max(retryMs, 60_000), 30 * 60_000) : 15 * 60_000
@@ -1559,7 +1570,7 @@ export class AccountQuota {
     if (!accountId) return null
     const acc = this.repo.get(accountId)
     if (!acc) return null
-    const revoke = /access token has been revoked|token has been revoked|oauth_revoked/i
+    const revoke = /access token has been revoked|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i
     const u = acc.unified || {}
     const lp = u.last_probe || acc.last_probe || null
     const fb = u.fable || null
@@ -2132,7 +2143,7 @@ function syncActiveToPassive(
         continue
       }
       if (hasExtra && !extraElapsed && extraIsLiveOpen(extra, now) && eu != null && ou <= 0.15 && eu >= 0.4) {
-        const referenceSampleMs = existingSampleMs ?? latestActivityAtMs
+        const referenceSampleMs = maxTimestamp(existingSampleMs, latestActivityAtMs)
         if (
           !forceReconcile &&
           referenceSampleMs != null &&
@@ -2244,7 +2255,7 @@ function syncActiveToPassive(
           ouOi <= 0.15 &&
           euOi >= 0.4
         ) {
-          const refOiMs = existingOiSampleMs ?? latestActivityAtMs
+          const refOiMs = maxTimestamp(existingOiSampleMs, latestActivityAtMs)
           if (!forceReconcile && refOiMs != null && probeStartedAtMs - refOiMs < ACTIVE_CALIBRATION_SETTLE_MS) {
             oiRetainReason = 'settle_window'
             oiSettleRem = ACTIVE_CALIBRATION_SETTLE_MS - (probeStartedAtMs - refOiMs)

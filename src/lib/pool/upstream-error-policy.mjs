@@ -72,6 +72,32 @@ const ORGANIZATION_DISABLED_PATTERNS = [
   /organization.*(?:blocked|banned|disabled)/i,
 ]
 
+/**
+ * The org refuses this seat. Shared by the runtime 400/401/403 classifier and
+ * the official /usage probe pipeline so both park the slot on the same
+ * wording — a probe hit parks without waiting for real traffic to trip it.
+ * `usage_error` may be a structured object (crs-usage-probe falls back to the
+ * whole error body), so extract the human text before matching.
+ */
+export function isOrganizationDisabledText(text) {
+  const blob =
+    typeof text === 'string'
+      ? text
+      : String(text?.message || text?.error || '')
+  if (!blob) return false
+  return ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(blob))
+}
+
+/** A usage-probe result carries the org refusal: park it like the runtime does (400/401/403). */
+export function isOrganizationDisabledUsageResult(result = {}) {
+  if (result?.ok === true || result?.usage_scope_missing) return false
+  const status = Number(result?.usage_status || result?.status || 0)
+  if (status !== 400 && status !== 401 && status !== 403) return false
+  const text =
+    result?.usage_error || result?.error || result?.fable?.error || result?.message || ''
+  return isOrganizationDisabledText(text)
+}
+
 function bodyMessage(body) {
   if (typeof body === 'string') return body
   return String(body?.error?.message || body?.error?.error || body?.message || body?.error || '')
@@ -225,7 +251,7 @@ export function isUnconfirmedAuthFailure(result = {}) {
   const hay = `${code} ${message} ${workerCode}`
   const authish =
     Number(result.status) === 401 ||
-    /token has been revoked|oauth_revoked|invalid_grant|authentication_error|needs_refresh|credential needs refresh|no credential|credential_required/i.test(
+    /token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant|authentication_error|needs_refresh|credential needs refresh|no credential|credential_required/i.test(
       hay,
     )
   if (!authish) return false
@@ -346,7 +372,10 @@ export function clampOauth401CooldownMs(ms) {
   return Math.min(MAX_OAUTH_401_COOLDOWN_MS, Math.max(5_000, n))
 }
 
-const GRANT_DEAD = /token has been revoked|oauth_revoked|invalid_grant/i
+// OpenAI/codex revocations come as `error.code = "token_revoked"` with the message
+// "Encountered invalidated oauth token for user" — same grant death as Anthropic's
+// "token has been revoked", just spelled differently.
+const GRANT_DEAD = /token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant/i
 
 function classifyOAuth401(hasRefresh, hay) {
   if (hasRefresh === false) {
@@ -531,7 +560,7 @@ function classifyUpstreamResultRaw(
   // another unit instead of returning the 403.
   if (
     (status === 400 || status === 401 || status === 403) &&
-    ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(message))
+    isOrganizationDisabledText(message)
   ) {
     return {
       scope: 'account',
@@ -544,7 +573,12 @@ function classifyUpstreamResultRaw(
       detail: { status, message: message.slice(0, 500) },
     }
   }
-  if (/token has been revoked|oauth_revoked|invalid_grant|authentication_error/i.test(hay) || status === 401) {
+  if (
+    /token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant|authentication_error/i.test(
+      hay,
+    ) ||
+    status === 401
+  ) {
     if (isUnconfirmedAuthFailure(result)) {
       return {
         scope: 'account',
