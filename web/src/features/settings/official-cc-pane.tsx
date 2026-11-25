@@ -153,8 +153,12 @@ export function OfficialCcSettingsPane({
               <Input
                 id='occ-hello'
                 maxLength={200}
+                placeholder='hello'
                 value={String(config.hello_prompt ?? 'hello')}
                 onChange={(e) => set({ hello_prompt: e.target.value })}
+                onBlur={(e) => {
+                  if (!e.target.value.trim()) set({ hello_prompt: 'hello' })
+                }}
               />
             </div>
 
@@ -200,8 +204,8 @@ export function OfficialCcSettingsPane({
             <p className='text-xs text-muted-foreground'>
               运输固定 cli-hop，跟 inference.engine=rust。保存不会把
               official_cc.inference 写成 http。三种内核搭配在内核页切换。hello
-              之后在槽内跑 CLI /usage，失败重试 2 次；账号等级以完整官方 usage
-              为准。hello 默认不常驻。
+              之后在槽内跑 CLI /usage，失败重试 2 次；优先取官方 OAuth profile
+              等级，缺失时按完整官方 usage 推断。hello 默认不常驻。
             </p>
           </CollapsibleContent>
         </Collapsible>

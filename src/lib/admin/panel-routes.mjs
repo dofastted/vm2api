@@ -2314,10 +2314,12 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok(snapshot))
       }
       if (req.method === 'GET' && p === '/api/panel/version') {
+        const refresh = ['1', 'true'].includes(String(url.searchParams.get('refresh') || '').toLowerCase())
         const status = await buildUpdateStatus({
           projectRoot: cfg?.paths?.project,
           currentVersion: runningVersion,
           upgrade: await readHostUpgradeStatus(),
+          ...(refresh ? { cacheMs: 0 } : {}),
         })
         return json(res, 200, panel.ok(status))
       }
