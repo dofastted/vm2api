@@ -585,6 +585,23 @@ export function GeminiConfigPane({
               </SettingRow>
             )
           })}
+          <SettingRow
+            label='官方 Gemini 请求体透传'
+            desc={
+              root.official_passthrough !== false
+                ? '开：仅经校验的原生 Google Gemini 请求体走透传路径（仍执行 8-Key SHM 投影与提示词归一化）；第三方冲突指纹与跨协议一律走 IR 归一化。'
+                : '关：原生 Gemini 请求也强制走统一 IR 归一，不透传原始请求体。'
+            }
+          >
+            <Switch
+              checked={root.official_passthrough !== false}
+              disabled={saving}
+              onCheckedChange={(official_passthrough) =>
+                update({ official_passthrough })
+              }
+              aria-label='官方 Gemini 请求体透传'
+            />
+          </SettingRow>
         </div>
       </PaneSection>
 

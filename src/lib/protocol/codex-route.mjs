@@ -13,6 +13,7 @@ export const CODEX_UPSTREAM_TRANSPORTS = Object.freeze(['prefer_websocket', 'htt
 
 export const DEFAULT_CODEX_ROUTING = Object.freeze({
   enabled: true,
+  official_passthrough: true,
   // `auto` resolves the official Codex catalog client version at sync time,
   // falling back to the verified release pin when the registry is unavailable.
   catalog_client_version: 'auto',
@@ -84,6 +85,12 @@ export function validateInferenceWebsocketPatch(body = {}) {
   if (!Object.prototype.hasOwnProperty.call(body, 'codex')) return
   if (!asObject(body.codex)) throw typedError('codex 必须是对象', 'invalid_codex_websocket')
   const codex = body.codex
+  if (
+    Object.prototype.hasOwnProperty.call(codex, 'official_passthrough') &&
+    typeof codex.official_passthrough !== 'boolean'
+  ) {
+    throw typedError('codex.official_passthrough 必须是布尔', 'invalid_codex_passthrough')
+  }
   if (Object.prototype.hasOwnProperty.call(codex, 'websocket')) {
     validateEnabledToggle(codex.websocket, 'codex.websocket', 'invalid_codex_websocket')
   }
@@ -142,6 +149,7 @@ export function normalizeCodexRouting(raw = {}) {
   }
   return {
     enabled: src.enabled !== false,
+    official_passthrough: src.official_passthrough !== false,
     catalog_client_version:
       typeof src.catalog_client_version === 'string' && src.catalog_client_version.trim()
         ? src.catalog_client_version.trim()
