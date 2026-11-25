@@ -281,13 +281,37 @@ export type VmHealthPayload = {
 }
 
 /** 展开明细的请求健康：按需取，30 秒内复用。 */
-export function vmHealthQueryOptions(id: string, range: VmHealthRange) {
+export function vmHealthQueryOptions(
+  id: string,
+  range: VmHealthRange,
+  isGemini = false
+) {
   return queryOptions({
-    queryKey: ['panel', 'vm', id, 'health', range] as const,
+    queryKey: [
+      'panel',
+      isGemini ? 'gemini' : 'vm',
+      id,
+      'health',
+      range,
+    ] as const,
     queryFn: () =>
       api<VmHealthPayload>(
-        `/api/panel/vms/${encodeURIComponent(id)}/health?range=${range}`
+        isGemini
+          ? `/api/panel/gemini/environments/${encodeURIComponent(id)}/health?range=${range}`
+          : `/api/panel/vms/${encodeURIComponent(id)}/health?range=${range}`
       ),
     staleTime: 30_000,
+  })
+}
+
+export function vmStatsDetailQueryOptions(id: string, isGemini = false) {
+  return queryOptions({
+    queryKey: ['panel', isGemini ? 'gemini-stats' : 'vm', id] as const,
+    queryFn: () =>
+      api<VmDetailPayload>(
+        isGemini
+          ? `/api/panel/gemini/environments/${encodeURIComponent(id)}/stats`
+          : `/api/panel/vms/${encodeURIComponent(id)}`
+      ),
   })
 }

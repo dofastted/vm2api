@@ -8,10 +8,15 @@ export type VmActions = {
   openStats: (vm: Vm) => void
   openReauth: (vm: Vm) => void
   openRecovery: (vm: Vm) => void
+  openProxy?: (vm: Vm) => void
   refreshToken: (vm: Vm) => void
+  pullModels?: (vm: Vm) => void
+  disableGemini?: (vm: Vm) => void
   recover: (vm: Vm) => void
   /** 正在刷新令牌 / 恢复状态的槽位 id，用于禁用重复点击。 */
   refreshingId: string | null
+  pullingModelsId?: string | null
+  disablingId?: string | null
   recoveringId: string | null
   /** 未提供时菜单不渲染对应项。 */
   reset?: (vm: Vm) => void

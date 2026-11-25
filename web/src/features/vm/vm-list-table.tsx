@@ -26,7 +26,13 @@ import {
 } from 'lucide-react'
 import { credentialRegistrationOf } from '@/lib/cred-type'
 import { fmtResetClock, resetCountdown } from '@/lib/fable-status'
-import { fmtNum, fmtUsd } from '@/lib/format'
+import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
+import {
+  geminiAccountStatus,
+  geminiEligibilityNotice,
+  geminiInferenceErrorAction,
+  geminiInferenceErrorLabel,
+} from '@/lib/gemini-account-status'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
 import {
@@ -59,7 +65,6 @@ import { riskFg, RISK_SOLID, riskLevel } from '@/features/vm/usage-meter'
 import { PlatformMark } from '@/features/vm/vm-account-identity'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
-import { GeminiSlotStatus } from '@/features/vm/vm-rack-blade'
 import {
   emptyZoneCounts,
   GEMINI_EVIDENCE_ZONES,
@@ -108,8 +113,65 @@ const STATE_ICON_FG: Partial<Record<ScheduleStateLabel, string>> = {
   开: 'text-[color:var(--status-ok)]',
 }
 
+function geminiSchedSummary(vm: Vm): {
+  text: string | null
+  title: string
+  warn: boolean
+} | null {
+  const environment = vm.gemini
+  if (!environment) return null
+  const status = geminiAccountStatus(environment, vm.unschedulable_text)
+  const { authorization, blocker, inference, lastInference, modelsLabel } =
+    status
+  const notice = geminiEligibilityNotice(environment.account, lastInference)
+  const failed =
+    lastInference?.state === 'failed'
+      ? geminiInferenceErrorLabel(lastInference.error_code)
+      : null
+  const failureAction =
+    lastInference?.state === 'failed'
+      ? geminiInferenceErrorAction(lastInference.error_code)
+      : null
+  const at = lastInference?.finished_at ?? lastInference?.started_at
+  const age = at ? fmtAgo(at) || at : ''
+  const run = lastInference
+    ? [lastInference.model, age].filter(Boolean).join(' · ')
+    : null
+  const warnText = notice?.label ?? failed
+  const aside = blocker ? authorization.text : modelsLabel
+  const title = [
+    status.tone.text,
+    authorization.text,
+    modelsLabel,
+    blocker ??
+      (environment.auth_state === 'authorized' ? '候选条件已满足' : null),
+    environment.schedulable === false ? '已手动关闭调度' : null,
+    environment.restriction?.text
+      ? `当前受限：${environment.restriction.text}`
+      : null,
+    notice ? `${notice.label}：${notice.action}` : null,
+    [inference.text, run, failed].filter(Boolean).join(' · '),
+    failureAction,
+    '仅显示最近一次宿主推理，不代表公共 API 端到端验证',
+  ]
+    .filter(Boolean)
+    .join('\n')
+  const text =
+    vm.restriction_text ||
+    blocker ||
+    (environment.auth_state === 'disabled'
+      ? '已停用'
+      : environment.schedulable === false
+        ? '手动关闭'
+        : warnText || run || aside)
+  return {
+    text,
+    title,
+    warn: Boolean(warnText && text === warnText),
+  }
+}
+
 function SchedCell({ vm }: { vm: Vm }) {
-  if (vm.gemini) return <GeminiSlotStatus vm={vm} inline />
   const level = Number(vm.schedule_level)
   const levelOk = Number.isInteger(level) && level >= 1 && level <= 10
   const manual = vm.schedule_level_mode === 'manual'
@@ -118,12 +180,15 @@ function SchedCell({ vm }: { vm: Vm }) {
   const breaker = label === '受限' && tone.key === 'circuit'
   const style = STATE_STYLE[label]
   const Icon = breaker ? Zap : style.icon
-  const reason =
-    label === '受限' || label === '不可调度'
+  const geminiSummary = geminiSchedSummary(vm)
+  const reason = geminiSummary
+    ? geminiSummary.text
+    : label === '受限' || label === '不可调度'
       ? vm.restriction_text || vm.unschedulable_text || tone.text
       : label === '关'
         ? '手动关闭'
         : null
+  const reasonTitle = geminiSummary?.title ?? reason ?? undefined
   return (
     <>
       <SchedulableSwitch {...vmSchedulableProps(vm)} />
@@ -166,11 +231,13 @@ function SchedCell({ vm }: { vm: Vm }) {
             'min-w-0 flex-1 truncate',
             label === '关'
               ? TERT
-              : breaker
+              : breaker || geminiSummary?.warn
                 ? 'text-[color:var(--status-caution)]'
-                : style.cls
+                : label === '开' && geminiSummary
+                  ? 'text-muted-foreground'
+                  : style.cls
           )}
-          title={reason}
+          title={reasonTitle}
         >
           {reason}
         </span>
@@ -188,6 +255,9 @@ const SLOT_HEIGHT: Record<SlotState, string> = {
 }
 
 function HealthCell({ vm }: { vm: Vm }) {
+  if (vm.gemini && !vm.gemini.billing_ready && !vm.health_24h) {
+    return <span className={TERT}>—</span>
+  }
   const h = healthSummary(vm.health_24h)
   return (
     <>
@@ -493,8 +563,10 @@ const COLS: Col[] = [
 
 function ProdCell({ vm }: { vm: Vm }) {
   const tier = claudeTier(vm)
-  const plan = vm.gemini ? vm.gemini.account?.plan : tier.label
-  const crag = (vm.resolved_dataplane ?? vm.dataplane) === 'crag'
+  const plan = vm.gemini ? vm.gemini.account?.plan || 'Gemini' : tier.label
+  const crag =
+    (vm.resolved_dataplane ?? vm.dataplane) === 'crag' ||
+    vm.gemini?.auth_method === 'oauth'
   const registration = credentialRegistrationOf(vm)
   const node = vm.node_name || vm.node_id || 'local'
   return (
@@ -671,28 +743,30 @@ function SummaryBar({ a }: { a: Agg }) {
         }
         x={
           a.gemini
-            ? `Gemini ${a.gemini} · 普通槽 ${a.n - a.gemini}`
+            ? a.n === a.gemini
+              ? `Gemini ${a.gemini}`
+              : `Gemini ${a.gemini} · 普通槽 ${a.n - a.gemini}`
             : `受限 ${a.by.restricted} · 关闭 ${a.by.off} · 未使用 ${a.by.none} · 不可调度 ${a.by.dead}`
         }
       />
       <Kpi
-        k={a.gemini ? '普通槽 24h 成功率' : '24h 成功率'}
+        k='24h 成功率'
         v={fmtHealthPct(pct)}
         x={`失败 ${fmtNum(a.req - a.ok)}`}
         tone={HEALTH_FG[healthTone(pct)]}
       />
       <Kpi
-        k={a.gemini ? '普通槽近 24h 请求' : '近 24h 请求'}
+        k='近 24h 请求'
         v={fmtNum(a.req)}
         x={`北京时间今日 ${fmtNum(a.today)}`}
       />
       <Kpi
-        k={a.gemini ? '普通槽 7 天花费' : '7 天窗口花费'}
+        k='7 天窗口花费'
         v={a.spend ? fmtUsd(a.spend, 2) : '—'}
         x={a.top ? `最高 ${a.top.vm.id} ${fmtUsd(a.top.spend, 0)}` : ''}
       />
       <Kpi
-        k={a.gemini ? '普通槽席位占用' : '席位占用'}
+        k='席位占用'
         v={
           <>
             {a.used}
@@ -702,7 +776,7 @@ function SummaryBar({ a }: { a: Agg }) {
         x={a.cap ? `${Math.round((a.used / a.cap) * 100)}%` : ''}
       />
       <Kpi
-        k={a.gemini ? '普通槽排队' : '排队'}
+        k='排队'
         v={a.queue}
         x={a.queued ? `${a.queued} 台有排队` : '无排队'}
         tone={a.queue ? 'text-[color:var(--status-warn)]' : undefined}
@@ -1033,7 +1107,9 @@ export function VmTable({
                                 stickyLeft,
                                 'left-0 flex items-center justify-center',
                                 max &&
-                                  'shadow-[inset_2px_0_0_var(--tier-max-border)]'
+                                  'shadow-[inset_2px_0_0_var(--tier-max-border)]',
+                                vm.gemini &&
+                                  'shadow-[inset_2px_0_0_var(--tier-gemini-border)]'
                               )}
                             >
                               <Button
@@ -1070,11 +1146,7 @@ export function VmTable({
                                   dim && i > 0 && 'opacity-50'
                                 )}
                               >
-                                {vm.gemini && i > 0 ? (
-                                  <span className={TERT}>—</span>
-                                ) : (
-                                  c.cell(r, now)
-                                )}
+                                {c.cell(r, now)}
                               </div>
                             ))}
                             <div
@@ -1104,26 +1176,7 @@ export function VmTable({
                               </span>
                             </div>
                           </div>
-                          {open && vm.gemini ? (
-                            <div
-                              id={detailId}
-                              className='flex items-center gap-3 border-b px-4 py-2 text-xs text-muted-foreground'
-                            >
-                              <span>{vm.email || '未提供邮箱'}</span>
-                              <span>
-                                {vm.gemini.account?.plan || '未提供订阅'}
-                              </span>
-                              <ProxyChip vm={vm} compact />
-                              <Button
-                                type='button'
-                                size='sm'
-                                variant='ghost'
-                                onClick={() => actions.openDetail(vm)}
-                              >
-                                管理 Gemini 凭证
-                              </Button>
-                            </div>
-                          ) : open ? (
+                          {open ? (
                             <VmRowDetail
                               id={detailId}
                               vm={vm}

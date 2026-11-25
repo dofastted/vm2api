@@ -48,9 +48,15 @@ export function assignableUsers(users: PanelUser[] | undefined): PanelUser[] {
 
 export type PatchVmOwnerResponse = { vm?: Vm }
 
-export function patchVmOwner(vmId: string, user_id: string | null) {
+export function patchVmOwner(
+  vmId: string,
+  user_id: string | null,
+  isGemini = false
+) {
   return api<PatchVmOwnerResponse>(
-    `/api/panel/vms/${encodeURIComponent(vmId)}/owner`,
+    isGemini
+      ? `/api/panel/gemini/environments/${encodeURIComponent(vmId)}/owner`
+      : `/api/panel/vms/${encodeURIComponent(vmId)}/owner`,
     {
       method: 'PATCH',
       body: JSON.stringify({ user_id }),

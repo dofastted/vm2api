@@ -32,6 +32,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { loadConfig, reloadActiveVm, routingConfigFile } from './lib/core/config.mjs'
 import { createGeminiCragSubscription } from './lib/gemini/subscription.mjs'
 import { createGeminiScheduler } from './lib/gemini/scheduler.mjs'
+import { createGeminiSlotPrefs } from './lib/gemini/slot-prefs.mjs'
 import {
   createGeminiPublicHandler,
   createGeminiTerminal,
@@ -1369,6 +1370,12 @@ const geminiCragSubscription = createGeminiCragSubscription({
   callHost: callGeminiHost,
 })
 const geminiTerminal = createGeminiTerminal({ proxyPool: () => proxyPool })
+const geminiSlotPrefs = createGeminiSlotPrefs({
+  settingsRepo: {
+    get: (key, fallback) => new SettingsRepo().get(key, fallback),
+    set: (key, value) => new SettingsRepo().set(key, value),
+  },
+})
 const geminiScheduler = createGeminiScheduler({
   callHost: callGeminiHost,
   resolveProxy: (proxyId, envOwnerId) => geminiProxyFor(proxyPool, proxyId, { ownerUserId: envOwnerId }),
@@ -1376,6 +1383,7 @@ const geminiScheduler = createGeminiScheduler({
   apiKeyStore,
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
   geminiOwnersRepo: geminiOwnersProxy,
+  slotPrefs: geminiSlotPrefs,
   cragSubscription: geminiCragSubscription,
   getRoutingConfig: () => routingConfig,
   getAttemptsRepo: () => attemptsRepo,
@@ -1396,6 +1404,8 @@ const handlePanel = createPanelHandler({
   cragSubscription,
   geminiCragSubscription,
   geminiOwnersRepo: geminiOwnersProxy,
+  geminiSlotPrefs,
+  geminiScheduler,
   handleCragShop,
   json,
   writeSSEHeaders,
