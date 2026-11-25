@@ -13,9 +13,17 @@
  * never silently drop unsupported fields on restricted native-TUI slots.
  */
 import crypto from 'node:crypto'
+import {
+  escapeNativeTuiSlashes,
+  sanitizeNativeTuiText,
+  stripIllegalControlChars,
+  stripVendorBillingLines,
+} from '../gemini/prompt-normalizer.mjs'
 import { isClientStream } from './convert.mjs'
 import { firstNonEmptyEffort, isEmptyEffortValue } from './log-fields.mjs'
 import { buildAnthropicSseError } from './stream-truncation.mjs'
+
+export { escapeNativeTuiSlashes, sanitizeNativeTuiText, stripIllegalControlChars }
 
 export const SKIP_THOUGHT_SIGNATURE = 'skip_thought_signature_validator'
 export const FULL_GEMINI_CAPABILITIES = Object.freeze([
@@ -583,11 +591,6 @@ function parseJsonObjectArgs(raw) {
   return {}
 }
 
-const FENCED_CODE_BLOCK_RE = /```[\s\S]*?```/g
-const ANSI_ESCAPE_RE = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))/g
-const ILLEGAL_CONTROL_RE = /[^\P{Cc}\n\r\t]/gu
-const LEADING_SLASH_TOKEN_RE = /(^|\p{White_Space})(\/+)/gu
-
 function isPlaceholderText(text, { allowEllipsis = false } = {}) {
   if (typeof text !== 'string') return true
   const trimmed = text.trim()
@@ -596,74 +599,8 @@ function isPlaceholderText(text, { allowEllipsis = false } = {}) {
   return false
 }
 
-function isBillingHeaderLine(line) {
-  const trimmed = line.trim().toLowerCase()
-  if (!trimmed) return false
-  if (/^(?:x-[a-z0-9_-]*billing[a-z0-9_-]*|[a-z0-9_-]+-billing-(?:header|metadata|token|info)):/.test(trimmed)) {
-    return true
-  }
-  if (/^x-[a-z0-9_-]+:/.test(trimmed) && /(?:cc_version=|cch=|cc_entrypoint=)/.test(trimmed)) {
-    return true
-  }
-  return trimmed.includes('cc_version=') && trimmed.includes('cch=')
-}
-
-function stripBillingSegment(segment) {
-  const lines = segment.split('\n')
-  let removed = false
-  const kept = lines.filter((line) => {
-    if (isBillingHeaderLine(line)) {
-      removed = true
-      return false
-    }
-    return true
-  })
-  if (!removed) return { text: segment, removed: false }
-  return { text: kept.join('\n').replace(/\n{3,}/g, '\n\n'), removed: true }
-}
-
 function stripAnthropicBillingLines(text) {
-  if (!text) return ''
-  let anyRemoved = false
-  let out = ''
-  let lastIndex = 0
-  FENCED_CODE_BLOCK_RE.lastIndex = 0
-  for (const match of text.matchAll(FENCED_CODE_BLOCK_RE)) {
-    const before = text.slice(lastIndex, match.index)
-    const cleaned = stripBillingSegment(before)
-    if (cleaned.removed) anyRemoved = true
-    out += cleaned.text + match[0]
-    lastIndex = match.index + match[0].length
-  }
-  const tail = stripBillingSegment(text.slice(lastIndex))
-  if (tail.removed) anyRemoved = true
-  out += tail.text
-  return anyRemoved ? out.trim() : text
-}
-
-/**
- * Strip ANSI escape sequences and illegal Unicode Cc control characters (keeping \n, \r, \t)
- * and repair lone UTF-16 surrogates so CRAGGemini (`valid_text` / `valid_system_prompt`)
- * and `gemini-host.py` never reject pasted terminal logs or binary artifacts.
- */
-export function stripIllegalControlChars(text) {
-  if (typeof text !== 'string' || !text) return ''
-  return text.toWellFormed().replace(ANSI_ESCAPE_RE, '').replace(ILLEGAL_CONTROL_RE, '')
-}
-
-/**
- * Neutralize whitespace-preceded `/` tokens (e.g. `/etc/hosts`, `/v1/messages`, `// comment`,
- * `a / b`, `/help`) with a non-whitespace, non-control zero-width separator (`U+200B`) so
- * CRAGGemini's `valid_text` and `agy`'s TUI slash-command parser treat them as ordinary text
- * without altering path semantics.
- */
-export function escapeNativeTuiSlashes(text) {
-  if (typeof text !== 'string' || !text) return ''
-  return text.replace(LEADING_SLASH_TOKEN_RE, '$1\u200B$2')
-}
-
-export function sanitizeNativeTuiText(text) {
-  return escapeNativeTuiSlashes(stripIllegalControlChars(text))
+  return stripVendorBillingLines(text)
 }
 
 function sanitizeNativeTuiResponseValue(value, depth = 0) {

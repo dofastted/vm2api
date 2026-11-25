@@ -18,9 +18,10 @@ import { resolveGeminiReasoningEffort, sessionIdForLog } from '../protocol/log-f
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
 import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
+import { normalizeGeminiOutboundPrompt } from './prompt-normalizer.mjs'
 import { isGeminiProtocolAllowed } from './routing-config.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
-import { applyCragGeminiPromptPolicy, resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
+import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
 const PUBLIC_PATH = '/v1/gemini/sessions'
@@ -2006,8 +2007,9 @@ export function createGeminiPublicHandler({
     const stickyKey = stickySeed ? `${req.apiKeyRecord?.id || 'anon'}:${stickySeed.slice(0, 128)}` : null
 
     try {
-      const promptPolicy =
-        typeof getRoutingConfig === 'function' ? resolveCragGeminiPromptPolicy(getRoutingConfig()) : null
+      const promptPolicy = resolveCragGeminiPromptPolicy(
+        typeof getRoutingConfig === 'function' ? getRoutingConfig() : {},
+      )
       const turn = await scheduler.stream({
         model: parsed.model,
         ...(activeLogCtx?.request_id ? { requestId: activeLogCtx.request_id } : {}),
@@ -2022,10 +2024,20 @@ export function createGeminiPublicHandler({
             ...(target === 'antigravity' && meta?.conversationId ? { conversationId: meta.conversationId } : {}),
           }
           const reqBody = buildGeminiRequest(irForTarget, { target })
-          const finalBody =
-            target === 'antigravity' && promptPolicy ? applyCragGeminiPromptPolicy(reqBody, promptPolicy) : reqBody
+          const normalized = normalizeGeminiOutboundPrompt(reqBody, {
+            target,
+            policy: promptPolicy,
+            headers: req.headers,
+          })
+          const finalBody = normalized.body
           lastOutboundBody = finalBody
           logBag.outbound_summary = summarizeBody(finalBody)
+          if (normalized.report) {
+            logBag.hop_meta = {
+              ...(logBag.hop_meta && typeof logBag.hop_meta === 'object' ? logBag.hop_meta : {}),
+              prompt_normalization: normalized.report,
+            }
+          }
           if (activeLogCtx?.capture_outbound) {
             logBag.outbound_body = finalBody
             logBag.outbound_body_source = target === 'antigravity' ? 'craggemini' : 'gemini_api'

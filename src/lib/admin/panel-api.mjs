@@ -467,6 +467,12 @@ export function validatePersonaRoutingPatch(body = {}) {
       problems.push('craggemini_system_prompt 超过 32768 字符')
     }
   }
+  if (compat.craggemini_prompt_normalization != null && String(compat.craggemini_prompt_normalization).trim() !== '') {
+    const raw = String(compat.craggemini_prompt_normalization).trim()
+    if (raw !== 'auto' && raw !== 'strict' && raw !== 'off') {
+      problems.push(`craggemini_prompt_normalization 必须是 auto / strict / off，收到 ${raw}`)
+    }
+  }
   if (compat.overlay_preset != null && String(compat.overlay_preset).trim() !== '') {
     const raw = String(compat.overlay_preset).trim()
     if (!OVERLAY_PRESETS.includes(raw)) {
