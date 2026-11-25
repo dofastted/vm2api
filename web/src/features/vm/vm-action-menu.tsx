@@ -2,14 +2,17 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import {
+  Ban,
   BarChart3,
   Download,
+  Globe,
   LifeBuoy,
   Link2,
   MoreHorizontal,
   Play,
   RefreshCw,
   RotateCcw,
+  SlidersHorizontal,
   Star,
   Trash2,
   Undo2,
@@ -60,17 +63,119 @@ export function VmActionMenu({
   const admin = me.data?.role === 'admin'
   const perms = useVmPerms()
   if (vm.gemini) {
+    const env = vm.gemini
+    const canRefresh =
+      (env.auth_state === 'authorized' ||
+        env.auth_state === 'reauth_required') &&
+      env.proxy_ready !== false
+    const canModels =
+      env.auth_state === 'authorized' && env.proxy_ready !== false
     return (
-      <Button
-        type='button'
-        size='sm'
-        variant='ghost'
-        className={className}
-        aria-label={`管理 ${vm.name || vm.id}`}
-        onClick={() => actions.openDetail(vm)}
-      >
-        <MoreHorizontal />
-      </Button>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            type='button'
+            size='icon'
+            variant='ghost'
+            className={cn('size-7 text-muted-foreground', className)}
+            aria-label={`更多操作 ${vm.name || vm.id}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <MoreHorizontal className='size-4' />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          align='end'
+          className='w-44'
+          onClick={(e) => e.stopPropagation()}
+        >
+          <DropdownMenuItem onSelect={() => actions.openTest(vm)}>
+            <Play className='text-[color:var(--status-ok)]' />
+            测试链接
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => actions.openStats(vm)}>
+            <BarChart3 className='text-[color:var(--tier-pro-solid)]' />
+            查看统计
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => actions.openDetail(vm)}>
+            <SlidersHorizontal />
+            管理详情
+          </DropdownMenuItem>
+          {actions.openProxy ? (
+            <DropdownMenuItem onSelect={() => actions.openProxy?.(vm)}>
+              <Globe />
+              代理配置
+            </DropdownMenuItem>
+          ) : null}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            disabled={!canRefresh || actions.refreshingId === vm.id}
+            onSelect={() => actions.refreshToken(vm)}
+          >
+            <RefreshCw />
+            刷新数据
+          </DropdownMenuItem>
+          {actions.pullModels ? (
+            <DropdownMenuItem
+              disabled={!canModels || actions.pullingModelsId === vm.id}
+              onSelect={() => actions.pullModels?.(vm)}
+            >
+              <Download />
+              拉取模型
+            </DropdownMenuItem>
+          ) : null}
+          {admin && actions.openAssignOwner ? (
+            <DropdownMenuItem
+              disabled={actions.ownerBusyId === vm.id}
+              onSelect={() => actions.openAssignOwner?.(vm)}
+            >
+              <UserRoundPlus />
+              分配给租户
+            </DropdownMenuItem>
+          ) : null}
+          {admin && actions.reclaimOwner && canReclaimVm(vm) ? (
+            <DropdownMenuItem
+              disabled={actions.ownerBusyId === vm.id}
+              onSelect={() => actions.reclaimOwner?.(vm)}
+            >
+              <Undo2 />
+              收回
+            </DropdownMenuItem>
+          ) : null}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            disabled={!restricted || actions.recoveringId === vm.id}
+            title={restricted ?? '当前没有冷却或熔断'}
+            onSelect={() => actions.recover(vm)}
+          >
+            <RotateCcw />
+            恢复状态
+          </DropdownMenuItem>
+          {actions.disableGemini || actions.remove ? (
+            <DropdownMenuSeparator />
+          ) : null}
+          {actions.disableGemini ? (
+            <DropdownMenuItem
+              disabled={
+                env.auth_state === 'disabled' || actions.disablingId === vm.id
+              }
+              onSelect={() => actions.disableGemini?.(vm)}
+            >
+              <Ban />
+              停用
+            </DropdownMenuItem>
+          ) : null}
+          {actions.remove ? (
+            <DropdownMenuItem
+              variant='destructive'
+              onSelect={() => actions.remove?.(vm)}
+            >
+              <Trash2 />
+              删除
+            </DropdownMenuItem>
+          ) : null}
+        </DropdownMenuContent>
+      </DropdownMenu>
     )
   }
   return (

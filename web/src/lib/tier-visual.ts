@@ -3,7 +3,15 @@ import { isCodexVm } from '@/lib/vm-kind'
 import { claudeTier } from '@/lib/vm-status'
 
 export type TierKey =
-  'free' | 'pro' | 'max' | 'team' | 'enterprise' | 'codex' | 'none' | 'unknown'
+  | 'free'
+  | 'pro'
+  | 'max'
+  | 'team'
+  | 'enterprise'
+  | 'codex'
+  | 'gemini'
+  | 'none'
+  | 'unknown'
 
 /**
  * 账号等级的视觉皮肤。等级轴与健康状态轴正交：
@@ -28,7 +36,7 @@ const NEUTRAL: TierVisual = {
   badge: 'bg-muted text-muted-foreground',
 }
 
-const SKIN: Record<'pro' | 'max' | 'codex', TierVisual> = {
+const SKIN: Record<'pro' | 'max' | 'codex' | 'gemini', TierVisual> = {
   pro: {
     key: 'pro',
     label: 'Pro',
@@ -50,9 +58,22 @@ const SKIN: Record<'pro' | 'max' | 'codex', TierVisual> = {
     badge:
       'bg-[color:var(--tier-codex-solid)] text-[color:var(--tier-codex-solid-fg)]',
   },
+  gemini: {
+    key: 'gemini',
+    label: 'Gemini',
+    row: 'border-l-2 border-l-[color:var(--tier-gemini-border)] hover:bg-[color:var(--tier-gemini-surface-hover)]',
+    badge:
+      'bg-[color:var(--tier-gemini-solid)] text-[color:var(--tier-gemini-solid-fg)]',
+  },
 }
 
 export function tierVisual(vm: Vm | undefined): TierVisual {
+  if (vm?.gemini) {
+    return {
+      ...SKIN.gemini,
+      label: vm.gemini.account?.plan || SKIN.gemini.label,
+    }
+  }
   if (isCodexVm(vm)) return SKIN.codex
   const { key, label } = claudeTier(vm)
   if (key === 'pro' || key === 'max')

@@ -3,6 +3,7 @@ import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { resetCountdown } from '@/lib/fable-status'
 import { fmtNum, fmtUsd } from '@/lib/format'
+import { geminiAccountStatus } from '@/lib/gemini-account-status'
 import { cn } from '@/lib/utils'
 import { vmCostLedger } from '@/lib/vm-usage'
 import { RISK_SOLID, riskFg, riskLevel } from '@/features/vm/usage-meter'
@@ -78,8 +79,19 @@ export const VmUnit = memo(function VmUnit({
 }) {
   const open = useOpenOnKey(vm)
   const state = bladeState(vm)
+  const windows = vmWindows(vm)
   const ledger = vmCostLedger(vm, accounts)
   const total = ledger[ledger.length - 1]
+  const geminiStatus = vm.gemini
+    ? geminiAccountStatus(vm.gemini, vm.unschedulable_text)
+    : null
+  const stateNote = vm.gemini
+    ? state === 'dead'
+      ? geminiStatus?.blocker || geminiStatus?.authorization.text || '不可调度'
+      : state === 'vacant'
+        ? geminiStatus?.authorization.text || '未授权'
+        : NOTE[state]
+    : NOTE[state]
   return (
     <article
       role='button'
@@ -98,24 +110,32 @@ export const VmUnit = memo(function VmUnit({
         <VmAccountIdentity vm={vm} />
       </div>
       {vm.gemini ? (
-        <div className='col-span-2'>
-          <GeminiSlotStatus vm={vm} />
+        <div className='col-span-2 min-w-0'>
+          <GeminiSlotStatus vm={vm} inline />
         </div>
-      ) : state === 'live' ? (
+      ) : null}
+      {state === 'live' && windows.length > 0 ? (
         <span className='flex items-end gap-1.5'>
-          {vmWindows(vm).map((w) => (
+          {windows.map((w) => (
             <MiniColumn key={w.key} w={w} now={now} />
           ))}
+        </span>
+      ) : state === 'live' && vm.gemini?.auth_method === 'api_key' ? (
+        <span className='self-center text-[11px] text-muted-foreground'>
+          API Key · {vm.gemini.models.length} 模型
         </span>
       ) : (
         <span
           className={cn(
-            'self-center text-[11px] text-muted-foreground',
+            'self-center truncate text-[11px] text-muted-foreground',
             state === 'dead' && 'text-[color:var(--status-bad)]',
-            state === 'unprobed' && 'text-[color:var(--status-caution)]'
+            state === 'unprobed' &&
+              !vm.gemini &&
+              'text-[color:var(--status-caution)]'
           )}
+          title={stateNote}
         >
-          {NOTE[state]}
+          {stateNote}
         </span>
       )}
       {total.cost || total.tokens ? (

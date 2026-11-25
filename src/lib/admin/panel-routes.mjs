@@ -618,7 +618,7 @@ export function syncInstalledKernels(args, operation = runKernelSync) {
   const ids = kernelSyncIds(args.project, args.body)
   const exact = { ...args, body: { ...args.body, ids } }
   const run = kernelSyncTail.then(() => withKernelVmLocks(args.project, ids, () => operation(exact)))
-  kernelSyncTail = run.catch(() => { })
+  kernelSyncTail = run.catch(() => {})
   return run
 }
 
@@ -657,7 +657,7 @@ async function forgetNodeSlot(vm, subscription, manager) {
     // Local relay sockets only; a leftover one must not block forgetting the slot.
     try {
       await manager.dropSlotRelays?.(vm.id)
-    } catch { }
+    } catch {}
     return { ok: true, action: 'skipped', teardownConfirmed: true }
   })
   return gone.ok ? { ...gone, node } : gone
@@ -772,9 +772,14 @@ export function createPanelHandler(ctx) {
     json,
     readBody,
     proxyPool: () => ctx.proxyPool,
+    poolScheduler: () => ctx.poolScheduler,
     terminal: ctx.geminiTerminal,
     cragSubscription: ctx.geminiCragSubscription,
     geminiOwnersRepo: ctx.geminiOwnersRepo || null,
+    geminiSlotPrefs: ctx.geminiSlotPrefs || null,
+    geminiScheduler: ctx.geminiScheduler || null,
+    panelUsers: ctx.panelUsers || null,
+    requestLog: ctx.requestLog || null,
     billingReady: Boolean(ctx.requestLog),
   })
   // A checkout can change under a live Node process; report its boot version.
@@ -895,7 +900,7 @@ export function createPanelHandler(ctx) {
       let hostUrl = ''
       try {
         hostUrl = host.localExitProxyUrl(vm) || ''
-      } catch { }
+      } catch {}
       if (hostUrl) {
         const r = await proxyPool.geoLookup(hostUrl, { timeoutMs: proxyPool.state?.config?.geo_timeout_ms })
         if (!r?.ok) return { ok: false, code: 'geo_lookup_failed', error: String(r?.error || 'geo lookup failed') }
@@ -942,10 +947,10 @@ export function createPanelHandler(ctx) {
         } else {
           vm =
             (patchVmRecord(cfg.paths.project, id, { status: 'error' }),
-              markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', {
-                message: String(startError).slice(0, 240),
-              }),
-              getVm(cfg.paths.project, id)) || vm
+            markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', {
+              message: String(startError).slice(0, 240),
+            }),
+            getVm(cfg.paths.project, id)) || vm
         }
       } else {
         vm = patchVmRecord(cfg.paths.project, id, { status: 'running' }) || vm
@@ -1910,7 +1915,7 @@ export function createPanelHandler(ctx) {
       if (authed.source === 'env' && password) {
         try {
           buyerId = panelUsers.bootstrapFromEnv({ username: authed.username, password })?.id
-        } catch { }
+        } catch {}
       }
       const buyer = buyerId ? { id: buyerId } : authed.source === 'env' ? { configuredAdmin: true } : undefined
       const token = createPanelSession(authed.username, { role: authed.role, buyer })
@@ -2510,12 +2515,12 @@ export function createPanelHandler(ctx) {
             ident.role === 'admin'
               ? normalizeMultiTierKeyConfig({ ...body, user_id: input.user_id }, { partial: false })
               : {
-                permission_tier: 'platform',
-                owner_id: null,
-                category: 'oauth',
-                allowed_endpoints: [],
-                allowed_gemini_envs: [],
-              }
+                  permission_tier: 'platform',
+                  owner_id: null,
+                  category: 'oauth',
+                  allowed_endpoints: [],
+                  allowed_gemini_envs: [],
+                }
           const isApi = isApiCategory(tierCfg.category)
           const allowsEndpoint = isMixedOrApiCategory(tierCfg.category)
           const scopeInput = {
@@ -2568,8 +2573,8 @@ export function createPanelHandler(ctx) {
           }
           const defaultConc = Number(
             ctx.routingConfig?.concurrency?.default_key_concurrency ??
-            ctx.routingConfig?.concurrency?.default_max_per_account ??
-            20,
+              ctx.routingConfig?.concurrency?.default_max_per_account ??
+              20,
           )
           const rec = apiKeyStore.create({
             name: body?.name,
@@ -2645,9 +2650,9 @@ export function createPanelHandler(ctx) {
           const tierCfg =
             ident.role === 'admin'
               ? normalizeMultiTierKeyConfig(
-                { ...body, user_id: currentRec?.user_id },
-                { partial: true, current: currentRec },
-              )
+                  { ...body, user_id: currentRec?.user_id },
+                  { partial: true, current: currentRec },
+                )
               : null
           const effectiveCategory = tierCfg ? tierCfg.category : (body?.category ?? currentRec?.category)
           const isApi = isApiCategory(effectiveCategory)
@@ -3084,7 +3089,7 @@ export function createPanelHandler(ctx) {
             if (!tenant) jobs.unshift(usageRead({ kind: 'repo', method: 'totals' }))
             const out = await Promise.all(jobs)
             if (tenant) [buckets, window] = out
-            else[totals, buckets, window] = out
+            else [totals, buckets, window] = out
           } catch (err) {
             console.warn(`[sqlite-pool] repo.stats: ${err?.message || err}`)
           }
@@ -3365,12 +3370,12 @@ export function createPanelHandler(ctx) {
           visibleVmIds:
             ident.role === 'user'
               ? () =>
-                new Set(
-                  filterVmsForPanel(listVms(cfg.paths.project, ctx.routingConfig), {
-                    role: ident.role,
-                    userId: ownerUserId,
-                  }).map((vm) => vm.id),
-                )
+                  new Set(
+                    filterVmsForPanel(listVms(cfg.paths.project, ctx.routingConfig), {
+                      role: ident.role,
+                      userId: ownerUserId,
+                    }).map((vm) => vm.id),
+                  )
               : null,
         })
       }
@@ -4640,8 +4645,8 @@ export function createPanelHandler(ctx) {
                 raised.code === 'vm_not_found'
                   ? 404
                   : raised.code === 'invalid_memory' ||
-                    raised.code === 'memory_not_increased' ||
-                    raised.code === 'kvm_memory_raise_forbidden'
+                      raised.code === 'memory_not_increased' ||
+                      raised.code === 'kvm_memory_raise_forbidden'
                     ? 400
                     : 502
               return json(res, status, {
@@ -5054,31 +5059,31 @@ export function createPanelHandler(ctx) {
           // Detach this VM only — do not unbind other slots sharing the SOCKS5.
           try {
             proxyPool.unbindVm(id)
-          } catch { }
+          } catch {}
           try {
             fs.rmSync(path.join(cfg.paths.project, 'vms', id), { recursive: true, force: true })
-          } catch { }
+          } catch {}
           fs.unlinkSync(vmPath)
           invalidateVmSlotReadCache(cfg.paths.project, id)
           try {
             vmTestSchedule.remove(id)
-          } catch { }
+          } catch {}
           if (active === id) {
             clearActiveVm(cfg.paths.project)
             try {
               clearActiveVmFromDb()
-            } catch { }
+            } catch {}
             try {
               reloadActiveVm(cfg)
-            } catch { }
+            } catch {}
           }
           try {
             removeVmFromDb(id)
-          } catch { }
+          } catch {}
           try {
             const chat = path.join(cfg.paths.project, 'vms', `${id}-chat.json`)
             if (fs.existsSync(chat)) fs.unlinkSync(chat)
-          } catch { }
+          } catch {}
           return json(
             res,
             200,
@@ -5107,7 +5112,7 @@ export function createPanelHandler(ctx) {
           let { vm } = recreateVmFiles(cfg.paths.project, prev, { mode })
           try {
             invalidateLiveCredentialCache()
-          } catch { }
+          } catch {}
           if (!hasBoundExit(vm.proxy)) {
             try {
               const allocated = proxyPool.allocateForVm(id)
@@ -5115,13 +5120,13 @@ export function createPanelHandler(ctx) {
                 bindVmProxy(cfg.paths.project, id, proxyPool.getProxyForVm(id))
                 adoptVmProxyBinding(vm, getVm(cfg.paths.project, id))
               }
-            } catch { }
+            } catch {}
           }
           if (!hasBoundExit(vm.proxy)) {
             vm =
               (patchVmRecord(cfg.paths.project, id, { status: 'stopped' }),
-                markUnschedulable(cfg.paths.project, id, 'proxy_required'),
-                getVm(cfg.paths.project, id)) || vm
+              markUnschedulable(cfg.paths.project, id, 'proxy_required'),
+              getVm(cfg.paths.project, id)) || vm
             return json(res, 409, {
               ok: false,
               error: { code: 'proxy_required', message: 'No healthy SOCKS5 is available for this VM' },
@@ -5133,10 +5138,10 @@ export function createPanelHandler(ctx) {
           if (!boot.ok) {
             vm =
               (patchVmRecord(cfg.paths.project, id, { status: 'stopped' }),
-                markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', {
-                  message: String(boot.error || 'runtime start failed').slice(0, 240),
-                }),
-                getVm(cfg.paths.project, id)) || vm
+              markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', {
+                message: String(boot.error || 'runtime start failed').slice(0, 240),
+              }),
+              getVm(cfg.paths.project, id)) || vm
             if (gone.action !== 'absent') {
               return json(res, 500, {
                 ok: false,
@@ -5159,8 +5164,8 @@ export function createPanelHandler(ctx) {
           }
           vm =
             (patchVmRecord(cfg.paths.project, id, { status: 'running' }),
-              mode === 'keep' ? null : markUnschedulable(cfg.paths.project, id, 'no_credential'),
-              getVm(cfg.paths.project, id)) || vm
+            mode === 'keep' ? null : markUnschedulable(cfg.paths.project, id, 'no_credential'),
+            getVm(cfg.paths.project, id)) || vm
           return json(
             res,
             200,
@@ -5205,7 +5210,7 @@ export function createPanelHandler(ctx) {
                 fs.rmSync(file, { force: true })
                 removed.push(path.relative(cfg.paths.project, file))
               }
-            } catch { }
+            } catch {}
           }
           const vm =
             patchVmRecord(cfg.paths.project, id, (record) => {
@@ -5226,7 +5231,7 @@ export function createPanelHandler(ctx) {
             }) || prev
           try {
             invalidateLiveCredentialCache()
-          } catch { }
+          } catch {}
           // The kernel still holds the old token in memory: stop it, then bring a
           // credential-less kernel back so the slot matches an empty slot.
           const kernel = { stopped: false, restarted: false, error: null }
@@ -5246,7 +5251,7 @@ export function createPanelHandler(ctx) {
             const repo = ctx.accountQuota?.repo
             const row = repo && typeof repo.get === 'function' ? repo.get(id) : null
             if (row && typeof repo.save === 'function') repo.save({ ...row, email: null, name: id })
-          } catch { }
+          } catch {}
           const saved = getVm(cfg.paths.project, id) || vm
           return json(
             res,
@@ -5278,7 +5283,7 @@ export function createPanelHandler(ctx) {
         applyOfficialFingerprintToVm(vmPath, path.join(cfg.paths.project, 'vms', id, 'cli-home'))
         try {
           vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-        } catch { }
+        } catch {}
         return json(res, 200, panel.ok({ id, fingerprint: vm.fingerprint }))
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/reconcile-fingerprint$/.test(p)) {
@@ -5814,7 +5819,7 @@ export function createPanelHandler(ctx) {
         // No node named: auto placement may still pick one by memory/load headroom.
         // Only for admin Docker creates whose exit is not pinned to this host.
         let placement = null
-        let releasePlacement = () => { }
+        let releasePlacement = () => {}
         const placementPolicy = normalizeAutoPlacement(ctx.routingConfig?.cluster?.auto_placement)
         const wanted = requestedPlacement(body, placementPolicy)
         const exitPinsHost = typeof body.proxy_id === 'string' && isLocalEgressId(body.proxy_id.trim())
@@ -6134,7 +6139,7 @@ export function createPanelHandler(ctx) {
                 ownerUserId: vm.owner_user_id || null,
                 role: ident.role,
               })
-            } catch (e) { }
+            } catch (e) {}
           }
           if (allocated) {
             bindVmProxy(cfg.paths.project, id, proxyPool.getProxyForVm(id))
@@ -6164,7 +6169,7 @@ export function createPanelHandler(ctx) {
         if (!startError && body.activate === true) {
           try {
             activateVmSlot(id)
-          } catch (e) { }
+          } catch (e) {}
         }
         const createBindSubscription =
           !req.apiKeyKind && ident.role === 'admin' && !!ident.user && sameOriginPost(req, cfg.base_url)
@@ -6772,7 +6777,7 @@ export function createPanelHandler(ctx) {
         }
         try {
           invalidateLiveCredentialCache()
-        } catch { }
+        } catch {}
         return json(
           res,
           200,
@@ -6853,7 +6858,7 @@ export function createPanelHandler(ctx) {
         }
         try {
           invalidateLiveCredentialCache()
-        } catch { }
+        } catch {}
         return json(
           res,
           200,
@@ -7158,9 +7163,9 @@ export function createPanelHandler(ctx) {
         if (!result.ok) {
           const status =
             result.error === 'no_codex_slot' ||
-              result.error === 'proxy_required' ||
-              result.error === 'invalid_request' ||
-              result.error === 'invalid_catalog_version'
+            result.error === 'proxy_required' ||
+            result.error === 'invalid_request' ||
+            result.error === 'invalid_catalog_version'
               ? 400
               : 502
           return json(res, status, {

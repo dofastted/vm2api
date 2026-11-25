@@ -25,22 +25,25 @@ export function PlatformChip({
 }) {
   const resolved = kind ?? (vm?.gemini ? 'gemini' : vmKindOf(vm))
   const gpt = resolved === 'codex'
+  const gemini = resolved === 'gemini'
   return (
     <span
       className={cn(
         'inline-flex shrink-0 items-center rounded-[5px] border px-1.5 py-0.5 text-[10px] leading-none font-semibold tracking-[0.03em]',
-        gpt
-          ? 'border-[color:var(--tier-codex-border)] text-[color:var(--tier-codex-fg)]'
-          : 'border-[color:var(--tier-pro-border)] text-[color:var(--tier-pro-fg)]',
+        gemini
+          ? 'border-[color:var(--tier-gemini-border)] text-[color:var(--tier-gemini-fg)]'
+          : gpt
+            ? 'border-[color:var(--tier-codex-border)] text-[color:var(--tier-codex-fg)]'
+            : 'border-[color:var(--tier-pro-border)] text-[color:var(--tier-pro-fg)]',
         className
       )}
     >
-      {resolved === 'gemini' ? 'Gemini' : platformLabelOf(resolved)}
+      {gemini ? 'Gemini' : platformLabelOf(resolved)}
     </span>
   )
 }
 
-/** `[Claude|GPT] 邮箱`。`compact` 给卡片 / 表格：字号下调并缩短本地段。 */
+/** `[Claude|GPT|Gemini] 邮箱`。`compact` 给卡片 / 表格：字号下调并缩短本地段。 */
 export function SlotIdentity({
   vm,
   vmId,
@@ -60,11 +63,16 @@ export function SlotIdentity({
   compact?: boolean
   className?: string
 }) {
-  const kind = vm ? vmKindOf(vm) : kindFromModel(model, protocol)
+  const kind: VmKind | 'gemini' = vm?.gemini
+    ? 'gemini'
+    : vm
+      ? vmKindOf(vm)
+      : kindFromModel(model, protocol)
   const full = slotAccountLabel(vm, { email, vmId, emptyLabel })
   // 有自定义名称时优先展示名称（识别靠名称体系），账号地址放悬停提示
   const name = String(vm?.name || '').trim()
-  const shown = name || (compact && full.includes('@') ? compactEmail(full) : full)
+  const shown =
+    name || (compact && full.includes('@') ? compactEmail(full) : full)
   const tip = name ? `${name} · ${full}` : full.includes('@') ? full : undefined
   return (
     <span

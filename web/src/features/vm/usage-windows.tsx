@@ -1,5 +1,9 @@
+import { useQueryClient } from '@tanstack/react-query'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
+import { Download, RefreshCw } from 'lucide-react'
+import { toast } from 'sonner'
+import { api } from '@/lib/api'
 import {
   expiresAtToMs,
   fmtResetClock,
@@ -10,6 +14,14 @@ import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
 import { vmCostLedger } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
+import { Button } from '@/components/ui/button'
+import type { GeminiEnvironment } from '@/features/import/gemini-environments'
+import {
+  geminiResource,
+  syncGeminiEnvironment,
+  useGeminiBusy,
+  useGeminiMutation,
+} from '@/features/import/gemini-operations'
 import { ActiveUsageAction } from '@/features/vm/active-usage-action'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { OpenaiQuotaActions } from '@/features/vm/openai-quota-actions'
@@ -104,9 +116,13 @@ export function ClaudeQuotaObservations({ vm, now }: { vm: Vm; now: number }) {
   const official = observations?.official
   if (isCodexVm(vm) || !official) return null
   const windows = ['5h', '7d'] as const
-  const isStale = (sample: { reset?: string | null; stale?: boolean } | null | undefined) => {
+  const isStale = (
+    sample: { reset?: string | null; stale?: boolean } | null | undefined
+  ) => {
     const reset = expiresAtToMs(sample?.reset)
-    return Boolean(sample?.stale || (reset != null && reset > 0 && reset <= now))
+    return Boolean(
+      sample?.stale || (reset != null && reset > 0 && reset <= now)
+    )
   }
   const different = windows.some((key) => {
     const measured = official[key]?.utilization
@@ -158,8 +174,68 @@ export function ClaudeQuotaObservations({ vm, now }: { vm: Vm; now: number }) {
   )
 }
 
-/** GPT 槽：刷新额度和积分 / 使用重置券；Claude 完整 OAuth：原生限额查询 / 重置。 */
+function GeminiQuotaActions({ vm }: { vm: Vm }) {
+  const qc = useQueryClient()
+  const busy = useGeminiBusy()
+  const env = vm.gemini
+  const action = useGeminiMutation({
+    mutationFn: (kind: 'refresh' | 'models') =>
+      api<GeminiEnvironment>(`${geminiResource(vm.id)}/${kind}`, {
+        method: 'POST',
+      }),
+    onSuccess: async (updated, kind) => {
+      await syncGeminiEnvironment(qc, updated)
+      toast.success(
+        kind === 'refresh' ? '已刷新 Gemini 账号与额度' : '已拉取可用模型'
+      )
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  if (!env) return null
+  const canRefresh =
+    (env.auth_state === 'authorized' || env.auth_state === 'reauth_required') &&
+    env.proxy_ready !== false
+  const canModels = env.auth_state === 'authorized' && env.proxy_ready !== false
+  return (
+    <div
+      data-row-actions
+      className='flex flex-wrap items-center gap-1'
+      onClick={(event) => event.stopPropagation()}
+      onKeyDown={(event) => event.stopPropagation()}
+    >
+      <Button
+        type='button'
+        size='sm'
+        variant='ghost'
+        className='h-6 gap-1 px-1.5 text-[11px] text-muted-foreground'
+        disabled={busy || !canRefresh}
+        loading={action.isPending && action.variables === 'refresh'}
+        title='刷新上游账号状态与配额窗口'
+        onClick={() => action.mutate('refresh')}
+      >
+        <RefreshCw className='size-3' />
+        刷新数据
+      </Button>
+      <Button
+        type='button'
+        size='sm'
+        variant='ghost'
+        className='h-6 gap-1 px-1.5 text-[11px] text-muted-foreground'
+        disabled={busy || !canModels}
+        loading={action.isPending && action.variables === 'models'}
+        title='从上游重新拉取可调用模型列表'
+        onClick={() => action.mutate('models')}
+      >
+        <Download className='size-3' />
+        拉取模型
+      </Button>
+    </div>
+  )
+}
+
+/** GPT 槽：刷新额度和积分 / 使用重置券；Claude 完整 OAuth：原生限额查询 / 重置；Gemini：刷新数据 / 拉取模型。 */
 export function VmQuotaActions({ vm, now }: { vm: Vm; now: number }) {
+  if (vm.gemini) return <GeminiQuotaActions vm={vm} />
   return isCodexVm(vm) ? (
     <OpenaiQuotaActions vm={vm} compact now={now} />
   ) : (

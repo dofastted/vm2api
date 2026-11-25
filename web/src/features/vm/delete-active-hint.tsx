@@ -13,6 +13,14 @@ export function DeleteActiveVmHint({
   vms: Vm[]
   force?: boolean
 }) {
+  if (target.gemini) {
+    return (
+      <p className='mt-2 text-destructive'>
+        删除 Gemini 宿主环境不可恢复：将释放已绑定的 CRAGGemini
+        席位并清除凭据与代理绑定。
+      </p>
+    )
+  }
   const plan = planDeleteActiveVm(target, vms)
   const forceNote = force ? (
     <p className='mt-2 text-destructive'>
