@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.4.205 — 2026-11-25 · CRAGGemini 0.4.9 MCP 桥内部暴露名称收口为 `crag`（`mcp_crag_*`）
+
+- **CRAGGemini 0.4.9 MCP 桥命名收口**：`deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 升级至 `payload-2026.11.25-gemini-0.4.9`。MCP 桥服务名由 `craggemini` 统一收口为 `crag`，`agy` 内部工具暴露前缀统一为 `mcp_crag_<tool>`（不再携带详细 `gemini` 后缀）；写入 `mcp_config.json` 时自动清理旧版 `craggemini` 条目避免重复挂载，同时保留对历史前缀的兼容剥离。
+- 部署说明：仅更新 `deploy/payload.json` 中 `geminiDefaultLinuxAmd64` 载荷钉选（`0.4.8 → 0.4.9`）与版本号，控制面代码、前端、CRAG 内核钉选（`3.1.17`）、数据库结构及 `bin/` / `share/wrap-cli` 字节均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步 `0.4.9` 载荷后重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance`。
+
 ## 1.4.204 — 2026-11-25 · CRAGGemini 0.4.8 Pool 模式每槽位 MCP 工具桥接；`control.sock` 并发队列扩容与 `IncompleteRead` 收口
 
 - **CRAGGemini 0.4.8 修复客户端工具 MCP 桥接（消除 `502 gemini_tool_call_required`）**：`deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 升级至 `payload-2026.11.25-gemini-0.4.8`。`craggemini` 加密引导程序通过共享同步模块 `mcp_stdio` 直接短路执行 `--internal-mcp`（消除对 `mcp-bridge.json` 误走 `vm_id="standalone"` 授权校验导致的 `license_binding_mismatch` 与重复 memfd 解密）；Pool 模式启动 `AgySlot` 前自动并发安全地写入 `mcp-bridge.json` 与 `<agy_home>/.gemini/config/mcp_config.json`，并通过 `CRAGGEMINI_SLOT_ID → X-Craggemini-Slot-Id` 将 `/internal/mcp/*` 路由至对应槽位独立的 `McpCoordinator`；提交 prompt 前同步等待 `agy` 完成 `tools/list` 刷新（含空工具回合清理），并修复多会话并发下的 `ToolContinuation` 挂起工具匹配（#1775）。
