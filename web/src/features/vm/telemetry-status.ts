@@ -29,9 +29,12 @@ export function telemetryStatusLabel(
     ) {
       return telemetry.error || 'CRAG 启动策略待确认'
     }
-    return telemetry.enabled
-      ? 'CRAG 已确认开启 · 未验证上传'
-      : 'CRAG 已确认关闭启动策略'
+    if (!telemetry.enabled) return 'CRAG 已确认关闭启动策略'
+    if (telemetry.upload_confirmed) return 'CRAG 已确认开启 · 已验证上传'
+    if (telemetry.last_error) return `CRAG 上传失败 · ${telemetry.last_error}`
+    return telemetry.upload_supported
+      ? 'CRAG 已确认开启 · 等待首次上传'
+      : 'CRAG 已确认开启 · 未验证上传'
   }
   if (desired !== null && !telemetryPolicyConfirmed(telemetry, desired)) {
     return desired

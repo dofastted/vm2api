@@ -2,6 +2,7 @@
 import {
   rustKernelHealth,
   supportsCragTelemetryApply,
+  supportsCragTelemetryUpload,
   toPublicKernelHealth,
   verifyCragTelemetryPolicy,
 } from '../transport/rust-kernel-client.mjs'
@@ -115,13 +116,25 @@ export async function readSlotProcessStatus({
   }
   let crag = resolveKernelDataplane(vm, routing) === 'crag'
   const unconfirmed = '未能核验 CRAG 启动策略'
-  const cragStatus = ({ enabled = null, error = null, reason = null, upstream_message = null } = {}) => ({
+  const cragStatus = ({
+    enabled = null,
+    error = null,
+    reason = null,
+    upstream_message = null,
+    upload_confirmed = false,
+    upload_supported = false,
+    last_upload_at = null,
+    last_error = null,
+  } = {}) => ({
     ...unknown,
     telemetry: {
       state: 'launch_policy',
       enabled,
       error,
-      upload_confirmed: false,
+      upload_confirmed: enabled === true && upload_confirmed === true,
+      ...(upload_supported ? { upload_supported: true } : {}),
+      ...(upload_supported || last_upload_at ? { last_upload_at: last_upload_at ?? null } : {}),
+      ...(upload_supported || last_error ? { last_error: last_error ?? null } : {}),
       ...(reason ? { reason } : {}),
       ...(upstream_message ? { upstream_message } : {}),
     },
@@ -136,7 +149,7 @@ export async function readSlotProcessStatus({
     if (!liveCrag) return cragStatus({ error: '运行中的内核不是 CRAG' })
     if (!supportsCragTelemetryApply(observed)) return cragStatus({ error: '运行中的 CRAG 不支持遥测核验' })
     const verified = await verifyCragTelemetryPolicy(exec, isTelemetryEnabled(vm.seed_policy), timeoutMs)
-    return cragStatus(verified)
+    return cragStatus({ ...verified, upload_supported: supportsCragTelemetryUpload(observed) })
   } catch {
     return crag ? cragStatus({ error: unconfirmed }) : unknown
   }
