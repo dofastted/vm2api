@@ -1799,3 +1799,89 @@ test('gemini-4-carbon-high effort propagation, default CRAGGemini thinkingConfig
   const anthTc = anthMidIr.messages.flatMap((m) => m.parts).find((p) => p.kind === 'tool_call')
   assert.equal(anthTc?.signature, 'sig_redacted_77')
 })
+
+test('makeWireToolName caps wire names at 55 chars so mcp_crag_<wireName> stays <= 64 and restores MCP/Claude tools', () => {
+  const toolNames = [
+    'Bash',
+    'Read',
+    'NotebookEdit',
+    'LSP',
+    'EnterWorktree',
+    'ExitWorktree',
+    'Agent',
+    'Skill',
+    'AskUserQuestion',
+    'SendMessage',
+    'Workflow',
+    'EnterPlanMode',
+    'ExitPlanMode',
+    'mcp__context7__resolve-library-id',
+    'mcp__context7__query-docs',
+    'mcp__sequential-thinking__sequentialthinking',
+    'mcp__grok-search__web_search',
+    'mcp__grok-search__web_map',
+    'mcp__chrome-devtools__take_screenshot',
+    'mcp__chrome-devtools__evaluate_script',
+    'mcp__chrome-devtools__very_long_tool_name_that_exceeds_fifty_five_characters_easily_v1',
+    'mcp__chrome-devtools__very_long_tool_name_that_exceeds_fifty_five_characters_easily_v2',
+    'my.dotted.namespace.tool',
+    'my_dotted_namespace_tool',
+  ]
+  const ir = parseInboundToGemini('anthropic', {
+    model: 'gemini-4-carbon-high',
+    max_tokens: 4096,
+    tools: toolNames.map((name) => ({
+      name,
+      description: `Tool ${name}`,
+      input_schema: {
+        type: 'object',
+        properties: { q: { type: 'string' } },
+        additionalProperties: false,
+      },
+    })),
+    messages: [{ role: 'user', content: 'List worktrees' }],
+  })
+
+  const agReq = buildGeminiRequest(ir, { target: 'antigravity' })
+  const decls = agReq.tools[0].functionDeclarations
+  assert.equal(decls.length, toolNames.length)
+
+  const seenWire = new Set()
+  for (const decl of decls) {
+    assert.ok(decl.name.length <= 55, `wire name exceeds 55 chars: ${decl.name} (${decl.name.length})`)
+    assert.ok(
+      `mcp_crag_${decl.name}`.length <= 64,
+      `prefixed MCP name exceeds 64 chars: mcp_crag_${decl.name}`,
+    )
+    assert.match(decl.name, /^[A-Za-z_][A-Za-z0-9_-]*$/, `invalid wire tool name: ${decl.name}`)
+    assert.equal(seenWire.has(decl.name), false, `duplicate wire name: ${decl.name}`)
+    seenWire.add(decl.name)
+  }
+
+  // Round-trip restore through createGeminiRestoreTransform for prefixed and unprefixed callbacks.
+  const restore = createGeminiRestoreTransform(ir.restoreContext, {
+    target: 'antigravity',
+    model: 'gemini-4-carbon-high',
+  })
+  const collector = createGeminiCollector({ fallbackModel: 'gemini-4-carbon-high' })
+  restore.push({ kind: 'start', responseId: 'r_tools', model: 'gemini-4-carbon-high' }, (out) => collector.push(out))
+  for (let i = 0; i < decls.length; i += 1) {
+    const wire = decls[i].name
+    const emittedName = i % 2 === 0 ? `mcp_crag_${wire}` : wire
+    restore.push(
+      {
+        kind: 'tool_call',
+        id: `tc_${i}`,
+        signedId: `tc_${i}`,
+        name: emittedName,
+        args: { q: 'ok' },
+        signature: '',
+      },
+      (out) => collector.push(out),
+    )
+  }
+  restore.push({ kind: 'stop', finishReason: 'STOP', stopReason: 'tool' }, (out) => collector.push(out))
+
+  const restoredNames = collector.result().toolCalls.map((c) => c.name)
+  assert.deepEqual(restoredNames, toolNames)
+})
