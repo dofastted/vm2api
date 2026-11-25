@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.4.223 — 2026-11-26 · 钉选 CRAGGemini 0.4.13（阻止 `agy` 20k MCP 工具截断）并收紧线协议工具名 55 字符上限
+
+- **阻止 `agy 1.5.9` 20k Token 预算静默截断客户端/MCP 工具，并钉选 `CRAGGemini 0.4.13` 签名载荷**：
+  - `deploy/payload.json` 将 `geminiDefaultLinuxAmd64` 升级至 `payload-2026.11.26-gemini-0.4.13`（对应 `dofastted/antigravity-cli-proxy#18` / `v0.4.13`，沿用现有 `crag-auth-gemini` 授权锚 `f9572077…` / `d2470877…`），通过 `Hook::CustomizationBudget` 解除 20,000-token `CustomizationTokenBudget` 截断、消除布尔 `additionalProperties` Schema 冗余描述、`defer_ack=1` + `POST /internal/mcp/listed` 延迟确认 `tools/list` 刷新竞争，并仅剥离内部 `crag`/`craggemini` 前缀以完整保留客户端 `mcp__<server>__<tool>` 声明（#1873）。
+  - `src/lib/protocol/gemini-convert.mjs` 与 `test/unit/gemini-convert.test.mjs` 将出站 wire 工具名缩短策略统一收口为 55 字符上限（叠加 `mcp_crag_` 前缀后严格不超过 64 字符 `ValidateToolName` 限制）（#1873）。
+- 部署说明：本次改动仅涉及控制面（`src/lib/protocol/gemini-convert.mjs`）与 `deploy/payload.json`（CRAGGemini 默认载荷由 `0.4.12` 升级至 `0.4.13`，CRAG 维持 `3.1.21`）；前端（`web/src/`）、数据库迁移结构、Gemini 宿主脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.222` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；升级控制面并在 Gemini 宿主机切换 CRAGGemini `0.4.13` 载荷、重启 `vm2api` 与 `vm2api-gemini` 即可生效。
+
 ## 1.4.222 — 2026-11-26 · Gemini 定向 AppArmor userns 策略与沙箱探针；常规日志错误详情持久化、writeHead 响应头捕获与跨跳关联 ID
 
 - **Gemini 定向 AppArmor userns 策略、真实沙箱探针与安全 OAuth 早退归因**：
