@@ -1,4 +1,4 @@
-import { REASONING_EFFORTS, reasoningEffortOf } from './log-fields.mjs'
+import { REASONING_EFFORTS, firstNonEmptyEffort, isEmptyEffortValue, reasoningEffortOf } from './log-fields.mjs'
 
 import { BETA_THINKING_DISPLAY_UPDATES } from './claude-code-betas.mjs'
 
@@ -14,7 +14,12 @@ import {
   resolvePlatformThinkingBudget,
   MIN_THINKING_BUDGET,
 } from './model-policy.mjs'
-import { anthropicContentIsEmpty, mergeConsecutiveAnthropicMessages, messageHasTurnControls } from './sanitize.mjs'
+import {
+  anthropicContentIsEmpty,
+  mergeConsecutiveAnthropicMessages,
+  messageHasTurnControls,
+  stripEmptyEffort,
+} from './sanitize.mjs'
 
 export { canRepairAdaptiveThinking, clampEnabledThinkingBudget, resolvePlatformThinkingBudget, MIN_THINKING_BUDGET }
 
@@ -49,13 +54,13 @@ const EFFORT_TO_BUDGET = {
 const DEFAULT_FALLBACK_BUDGET = 4096
 
 export function openaiReasoningToClaudeThinking(body) {
-  let effort = body.reasoning_effort
-  if (!effort && body.reasoning && typeof body.reasoning === 'object') {
-    effort = body.reasoning.effort
-  }
-  if (!effort) return null
+  const effort = firstNonEmptyEffort(
+    body?.reasoning_effort,
+    body?.reasoning && typeof body.reasoning === 'object' ? body.reasoning.effort : undefined,
+  )
+  if (effort === undefined) return null
 
-  const e = String(effort).toLowerCase()
+  const e = String(effort).trim().toLowerCase()
   if (e === 'none' || e === 'off') {
     return { type: 'disabled' }
   }
@@ -288,22 +293,32 @@ export function stripUnsupportedEffort(body = {}) {
   return { ...out, messages: mergeConsecutiveAnthropicMessages(messages) }
 }
 
-/** Official fill: missing output_config.effort. `default_effort: off` adds nothing. */
+/** Resolve model default effort: panel default_effort, else catalog default, else high. */
+export function resolveModelDefaultEffort(model) {
+  let configured
+  try {
+    configured = getModelParams(model)?.default_effort
+  } catch {
+    configured = undefined
+  }
+  if (configured === 'off') return 'off'
+  const normalized = typeof configured === 'string' ? configured.trim().toLowerCase() : ''
+  if (normalized) return normalized
+  return catalogEffort(model) || 'high'
+}
+
+/** Official fill: missing or empty output_config.effort. `default_effort: off` adds nothing. */
 export function ensureUnofficialEffortHigh(body = {}) {
   if (!body || typeof body !== 'object') return body
   if (!modelSupportsEffort(body.model)) return stripUnsupportedEffort(body)
-  let effort = 'high'
-  try {
-    effort = getModelParams(body.model)?.default_effort || 'high'
-  } catch {
-    effort = 'high'
+  const cleaned = stripEmptyEffort(body)
+  const effort = resolveModelDefaultEffort(cleaned.model)
+  if (effort === 'off') return cleaned
+  if (cleaned.output_config && typeof cleaned.output_config === 'object') {
+    if (!isEmptyEffortValue(cleaned.output_config.effort)) return cleaned
+    return { ...cleaned, output_config: { ...cleaned.output_config, effort } }
   }
-  if (effort === 'off') return body
-  if (body.output_config && typeof body.output_config === 'object') {
-    if (body.output_config.effort != null && body.output_config.effort !== '') return body
-    return { ...body, output_config: { ...body.output_config, effort } }
-  }
-  return { ...body, output_config: { effort } }
+  return { ...cleaned, output_config: { effort } }
 }
 
 // Same order as cli-node getDefaultEffortForModel: longer ids first.
@@ -339,14 +354,7 @@ export function loggedReasoningEffort(body) {
   const explicit = reasoningEffortOf(body)
   if (explicit) return explicit
   if (!body || typeof body !== 'object' || !modelSupportsEffort(body.model)) return null
-  let configured
-  try {
-    configured = getModelParams(body.model)?.default_effort
-  } catch {
-    configured = undefined
-  }
-  if (!configured) configured = catalogEffort(body.model) || 'high'
-  if (configured === 'off') return null
-  const effort = String(configured).trim().toLowerCase()
+  const effort = resolveModelDefaultEffort(body.model)
+  if (effort === 'off') return null
   return REASONING_EFFORTS.has(effort) ? effort : null
 }

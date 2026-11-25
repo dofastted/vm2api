@@ -5,6 +5,18 @@
 
 export const REASONING_EFFORTS = new Set(['none', 'minimal', 'auto', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
 
+/** Missing, null, or whitespace-only effort is treated as omitted. */
+export function isEmptyEffortValue(value) {
+  return value == null || (typeof value === 'string' && value.trim() === '')
+}
+
+export function firstNonEmptyEffort(...values) {
+  for (const value of values) {
+    if (!isEmptyEffortValue(value)) return value
+  }
+  return undefined
+}
+
 const MODEL_PAREN_EFFORT_RE = /\((none|minimal|auto|low|medium|high|xhigh|max|ultra)\)$/i
 const MODEL_SUFFIX_EFFORT_RE = /(?:^|[-_])(minimal|low|medium|high|xhigh|max)$/i
 
@@ -55,16 +67,17 @@ function geminiThinkingConfigOf(body) {
 export function reasoningEffortOf(inbound) {
   if (!inbound || typeof inbound !== 'object') return null
   const tc = geminiThinkingConfigOf(inbound)
-  let raw =
-    inbound.output_config?.effort ??
-    inbound.reasoning_effort ??
-    inbound.reasoning?.effort ??
-    tc?.thinkingLevel ??
-    tc?.thinking_level
+  let raw = firstNonEmptyEffort(
+    inbound.output_config?.effort,
+    inbound.reasoning_effort,
+    inbound.reasoning?.effort,
+    tc?.thinkingLevel,
+    tc?.thinking_level,
+  )
   if (Array.isArray(inbound.messages)) {
     for (let i = inbound.messages.length - 1; i >= 0; i--) {
       const effort = inbound.messages[i]?.output_config?.effort
-      if (effort != null && effort !== '') {
+      if (!isEmptyEffortValue(effort)) {
         raw = effort
         break
       }

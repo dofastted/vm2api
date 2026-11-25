@@ -7,6 +7,7 @@ import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, openaiChatUsageFro
 import { resolveGptFastAlias } from './gpt-model-policy.mjs'
 import { buildAnthropicSseError } from './stream-truncation.mjs'
 import { claudeStopReasonToOpenAIFinish } from './convert.mjs'
+import { firstNonEmptyEffort } from './log-fields.mjs'
 
 const IDENTITY_KEYS = [
   'base_url',
@@ -300,7 +301,7 @@ function stripUnsupportedCodexFields(body = {}) {
   delete next.max_tokens
   delete next.temperature
   delete next.prompt_cache_retention
-  const effort = normalizeCodexReasoningEffort(next.reasoning?.effort || next.reasoning_effort)
+  const effort = normalizeCodexReasoningEffort(firstNonEmptyEffort(next.reasoning?.effort, next.reasoning_effort))
   delete next.reasoning_effort
   if (effort) {
     next.reasoning = {

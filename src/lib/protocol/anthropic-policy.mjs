@@ -6,6 +6,7 @@ import {
   liftMidConversationSystemMessages,
   mergeConsecutiveAnthropicMessages,
   messageHasTurnControls,
+  stripEmptyEffort,
   stripIllegalContentFields,
   sanitizeAnthropicBody,
 } from './sanitize.mjs'
@@ -539,7 +540,10 @@ export function prepareAnthropicRequest(
     out = ensureUnofficialEffortHigh(out)
     validateBetweenToolsThinking(out)
     out = rectifyUnofficialRequest(out)
-  } else out = ensureOutputConfigSchema(out)
+  } else {
+    out = stripEmptyEffort(out)
+    out = ensureOutputConfigSchema(out)
+  }
   if (Array.isArray(out.system)) {
     out.system = cleanContent(out.system, { keepEmptyIdentity: true })
   }

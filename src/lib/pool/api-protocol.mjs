@@ -39,7 +39,7 @@ import { usageFromSseLine } from '../protocol/handle-codex.mjs'
 import { BETA_CONTEXT_1M } from '../protocol/claude-code-betas.mjs'
 import { shouldPassContext1mByPolicy } from '../protocol/model-policy.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
-import { resolveGeminiReasoningEffort } from '../protocol/log-fields.mjs'
+import { firstNonEmptyEffort, isEmptyEffortValue, resolveGeminiReasoningEffort } from '../protocol/log-fields.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
 import { ensureRedaction, maskJson, restoreSseLine } from '../redaction/runtime.mjs'
 import { keyTierPolicyFromRecord } from '../admin/key-scope.mjs'
@@ -415,13 +415,26 @@ export async function runApiInference({
         store: false,
       }
     : { ...stripIllegalCacheControlFields(canonical), model: picked.upstream_model, stream: true }
-  if (isOpenAI && protocol === 'openai.chat') {
-    for (const name of ['temperature', 'top_p', 'parallel_tool_calls']) {
-      if (inbound?.[name] != null) body[name] = inbound[name]
+  if (isOpenAI) {
+    if (protocol === 'openai.chat') {
+      for (const name of ['temperature', 'top_p', 'parallel_tool_calls']) {
+        if (inbound?.[name] != null) body[name] = inbound[name]
+      }
     }
-    if (body.reasoning_effort != null) {
-      body.reasoning = { ...body.reasoning, effort: body.reasoning?.effort ?? body.reasoning_effort }
-      delete body.reasoning_effort
+    const effort = firstNonEmptyEffort(body.reasoning?.effort, body.reasoning_effort)
+    delete body.reasoning_effort
+    if (effort !== undefined) {
+      body.reasoning = { ...(body.reasoning && typeof body.reasoning === 'object' ? body.reasoning : {}), effort }
+    } else if (
+      body.reasoning &&
+      typeof body.reasoning === 'object' &&
+      Object.prototype.hasOwnProperty.call(body.reasoning, 'effort') &&
+      isEmptyEffortValue(body.reasoning.effort)
+    ) {
+      const nextReasoning = { ...body.reasoning }
+      delete nextReasoning.effort
+      if (Object.keys(nextReasoning).length) body.reasoning = nextReasoning
+      else delete body.reasoning
     }
   }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
