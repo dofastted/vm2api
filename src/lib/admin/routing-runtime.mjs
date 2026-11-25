@@ -46,11 +46,7 @@ import {
   normalizeInferenceWebsocket,
   validateInferenceWebsocketPatch,
 } from '../protocol/codex-route.mjs'
-import {
-  mergeGeminiRouting,
-  normalizeGeminiRouting,
-  validateGeminiRoutingPatch,
-} from '../gemini/routing-config.mjs'
+import { mergeGeminiRouting, normalizeGeminiRouting, validateGeminiRoutingPatch } from '../gemini/routing-config.mjs'
 import { callGeminiHost } from '../gemini/routes.mjs'
 import {
   validateOpenAIQuotaPatch,
@@ -383,6 +379,7 @@ export function createRoutingRuntime(ctx) {
       ...prev,
       ...next,
       real: { ...(prev.real || {}), ...(next.real || {}) },
+      gemini: { ...(prev.gemini || {}), ...(next.gemini || {}) },
       match: { ...(prev.match || {}), ...(next.match || {}) },
     })
     getHealth()?.setConfig(routingConfig.health_probe)

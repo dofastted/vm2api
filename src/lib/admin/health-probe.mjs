@@ -4,12 +4,14 @@
  * shapes replay the cached official Messages body (standard protocol
  * shape, real upstream id) and never acquire concurrency.
  */
+import crypto from 'node:crypto'
 import { isOfficialClaudeUa } from '../identity/crs-headers.mjs'
 import { isOfficialClaudeCodeTraffic } from '../identity/crs-persona.mjs'
 import { vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import { fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions, fromClaudeToResponses } from '../protocol/convert.mjs'
+import { isGeminiSeriesId } from '../protocol/gemini-model-policy.mjs'
 import { detectInboundPlatform } from '../protocol/platform-detect.mjs'
 
 export const HEALTH_REAL_HEADER = 'x-kin-health-real'
@@ -32,9 +34,9 @@ export const DEFAULT_HEALTH_PROBE = Object.freeze({
   fail_closed: true,
   run_on_start: true,
   // Off: stop after the first successful slot (cache snapshot unchanged). On: probe every
-  // schedulable slot each interval; first success still writes the cache snapshot.
+  // schedulable slot sequentially (no concurrency); first success still writes the cache snapshot.
   probe_all_slots: false,
-  concurrency: 2,
+  concurrency: 1,
   real: Object.freeze({
     model: 'claude-haiku-4-5',
     prompt: 'hello',
@@ -44,6 +46,15 @@ export const DEFAULT_HEALTH_PROBE = Object.freeze({
     vm_ids: Object.freeze([]),
     // GPT snapshot for chat/responses on GPT models. Empty = no Codex probe.
     openai_model: '',
+  }),
+  gemini: Object.freeze({
+    // Gemini series models: default probe once per hour (3600s) and replay cached response.
+    enabled: true,
+    interval_sec: 3600,
+    cache_ttl_sec: 5400,
+    model: '',
+    prompt: 'hello',
+    timeout_ms: 60_000,
   }),
   match: Object.freeze({
     max_tokens: 32,
@@ -120,7 +131,12 @@ function normalizeCacheModels(input) {
   return out
 }
 
-export function cacheTtlSec(cfg = DEFAULT_HEALTH_PROBE) {
+export function cacheTtlSec(cfg = DEFAULT_HEALTH_PROBE, platform = 'anthropic') {
+  if (platform === 'gemini') {
+    const gemTtl = Number(cfg?.gemini?.cache_ttl_sec)
+    if (Number.isFinite(gemTtl) && gemTtl > 0) return gemTtl
+    return DEFAULT_HEALTH_PROBE.gemini.cache_ttl_sec
+  }
   const ttl = Number(cfg?.cache_ttl_sec)
   if (Number.isFinite(ttl) && ttl > 0) return ttl
   const stale = Number(cfg?.max_stale_sec)
@@ -141,16 +157,20 @@ export function inboundMatchesCacheModels(body = {}, cfg = DEFAULT_HEALTH_PROBE)
 
 export function resolveCacheResponseModel(inbound = {}, snapshot = {}, cfg = DEFAULT_HEALTH_PROBE) {
   const pinned = String(cfg?.cache_model || '').trim()
-  if (pinned) return pinned
+  if (pinned && (healthPlatformOf(inbound) !== 'gemini' || isGeminiSeriesId(pinned))) return pinned
   return String(inbound?.model || snapshot?.model || cfg?.real?.model || 'claude-haiku-4-5').trim()
 }
 
 export function normalizeHealthProbeConfig(raw = {}) {
   const src = raw && typeof raw === 'object' ? raw : {}
   const realSrc = src.real && typeof src.real === 'object' ? src.real : {}
+  const geminiSrc = src.gemini && typeof src.gemini === 'object' ? src.gemini : {}
   const matchSrc = src.match && typeof src.match === 'object' ? src.match : {}
   const modeRaw = String(realSrc.outbound_mode || DEFAULT_HEALTH_PROBE.real.outbound_mode).toLowerCase()
   const ttl = clampInt(src.cache_ttl_sec ?? src.max_stale_sec, 30, 172800, DEFAULT_HEALTH_PROBE.cache_ttl_sec)
+  const geminiInterval = clampInt(geminiSrc.interval_sec, 60, 86400, DEFAULT_HEALTH_PROBE.gemini.interval_sec)
+  const geminiTtlFallback = Math.max(DEFAULT_HEALTH_PROBE.gemini.cache_ttl_sec, geminiInterval)
+  const geminiTtl = clampInt(geminiSrc.cache_ttl_sec, 60, 172800, geminiTtlFallback)
   return {
     enabled: asBool(src.enabled, DEFAULT_HEALTH_PROBE.enabled),
     interval_sec: clampInt(src.interval_sec, 30, 86400, DEFAULT_HEALTH_PROBE.interval_sec),
@@ -165,7 +185,8 @@ export function normalizeHealthProbeConfig(raw = {}) {
     fail_closed: asBool(src.fail_closed, true),
     run_on_start: asBool(src.run_on_start, true),
     probe_all_slots: asBool(src.probe_all_slots, DEFAULT_HEALTH_PROBE.probe_all_slots),
-    concurrency: clampInt(src.concurrency, 1, 8, DEFAULT_HEALTH_PROBE.concurrency),
+    // Health probes are strictly serial (one completes before the next starts).
+    concurrency: 1,
     real: {
       model: String(realSrc.model || DEFAULT_HEALTH_PROBE.real.model).trim() || DEFAULT_HEALTH_PROBE.real.model,
       prompt:
@@ -179,6 +200,19 @@ export function normalizeHealthProbeConfig(raw = {}) {
       openai_model: String(realSrc.openai_model || '')
         .trim()
         .slice(0, 120),
+    },
+    gemini: {
+      enabled: asBool(geminiSrc.enabled, DEFAULT_HEALTH_PROBE.gemini.enabled),
+      interval_sec: geminiInterval,
+      cache_ttl_sec: geminiTtl,
+      model: String(geminiSrc.model || '')
+        .trim()
+        .slice(0, 120),
+      prompt:
+        String(geminiSrc.prompt ?? DEFAULT_HEALTH_PROBE.gemini.prompt)
+          .trim()
+          .slice(0, 200) || DEFAULT_HEALTH_PROBE.gemini.prompt,
+      timeout_ms: clampInt(geminiSrc.timeout_ms, 10_000, 180_000, DEFAULT_HEALTH_PROBE.gemini.timeout_ms),
     },
     match: {
       max_tokens: clampInt(matchSrc.max_tokens, 1, 4096, DEFAULT_HEALTH_PROBE.match.max_tokens),
@@ -216,7 +250,25 @@ function blockText(block) {
   if (typeof block.text === 'string') return block.text
   if (typeof block.content === 'string') return block.content
   if (Array.isArray(block.content)) return block.content.map(blockText).join('')
+  if (Array.isArray(block.parts)) return block.parts.map(blockText).join('')
   return ''
+}
+
+function hasNonTextGeminiPart(parts) {
+  if (!Array.isArray(parts)) return false
+  return parts.some(
+    (p) =>
+      p &&
+      typeof p === 'object' &&
+      (p.inlineData != null ||
+        p.inline_data != null ||
+        p.fileData != null ||
+        p.file_data != null ||
+        p.functionCall != null ||
+        p.function_call != null ||
+        p.functionResponse != null ||
+        p.function_response != null),
+  )
 }
 
 function systemText(system) {
@@ -233,8 +285,24 @@ function messageText(msg) {
 
 export function extractProbeUserText(body = {}) {
   if (!body || typeof body !== 'object') return { text: '', messages: 0, users: 0 }
-  if (typeof body.prompt === 'string' && !Array.isArray(body.messages) && body.input == null) {
+  if (
+    typeof body.prompt === 'string' &&
+    !Array.isArray(body.messages) &&
+    body.input == null &&
+    !Array.isArray(body.contents)
+  ) {
     return { text: body.prompt.trim(), messages: 1, users: 1 }
+  }
+  if (Array.isArray(body.contents) && !Array.isArray(body.messages) && body.input == null) {
+    if (body.contents.some((m) => hasNonTextGeminiPart(m?.parts))) {
+      return { text: '', messages: body.contents.length, users: 0 }
+    }
+    const users = body.contents.filter((m) => !m?.role || String(m.role).toLowerCase() === 'user')
+    return {
+      text: users.map(blockText).join('').trim(),
+      messages: body.contents.length,
+      users: users.length,
+    }
   }
   if (body.input != null && !Array.isArray(body.messages)) {
     if (typeof body.input === 'string') return { text: body.input.trim(), messages: 1, users: 1 }
@@ -257,7 +325,12 @@ export function extractProbeUserText(body = {}) {
 }
 
 export function inboundMaxTokens(body = {}) {
-  const n = Number(body?.max_tokens ?? body?.max_completion_tokens)
+  const n = Number(
+    body?.max_tokens ??
+      body?.max_completion_tokens ??
+      body?.generationConfig?.maxOutputTokens ??
+      body?.generation_config?.max_output_tokens,
+  )
   return Number.isFinite(n) && n > 0 ? n : 0
 }
 
@@ -312,16 +385,24 @@ export function isHealthShape(headers = {}, body = {}, cfg = DEFAULT_HEALTH_PROB
     }
   }
   const maxTokens = inboundMaxTokens(body)
+  const geminiSide = protocol === 'google.gemini' || protocol === 'gemini'
   const openaiSide = protocol === 'openai.chat' || protocol === 'openai.responses'
   const missingOk =
     match.allow_missing_max_tokens !== false &&
-    openaiSide &&
+    (openaiSide || geminiSide) &&
     body?.max_tokens == null &&
     body?.max_completion_tokens == null &&
-    body?.max_output_tokens == null
+    body?.max_output_tokens == null &&
+    body?.generationConfig?.maxOutputTokens == null &&
+    body?.generation_config?.max_output_tokens == null
   if (!missingOk && (!maxTokens || maxTokens > match.max_tokens)) return false
-  // Responses tests carry a long instructions prompt; only system is checked.
-  if (match.require_no_system !== false && systemText(body?.system)) return false
+  // Responses tests carry a long instructions prompt; check Claude/Gemini system fields.
+  if (
+    match.require_no_system !== false &&
+    (systemText(body?.system) || systemText(body?.systemInstruction) || systemText(body?.system_instruction))
+  ) {
+    return false
+  }
   const tools = Array.isArray(body?.tools) ? body.tools : []
   if (match.require_no_tools !== false && tools.length) return false
   const extracted = extractProbeUserText(body)
@@ -358,17 +439,23 @@ export function hasCachedMessage(snapshot) {
   return !!id && snapshot?.ok === true
 }
 
-export function isSnapshotValid(snapshot, cfg = DEFAULT_HEALTH_PROBE, now = Date.now()) {
+export function isSnapshotValid(snapshot, cfg = DEFAULT_HEALTH_PROBE, now = Date.now(), platform = 'anthropic') {
   if (!snapshot || snapshot.ok !== true || !snapshot.at) return false
   const at = Date.parse(snapshot.at)
   if (!Number.isFinite(at)) return false
   const age = now - at
-  const staleMs = cacheTtlSec(cfg) * 1000
+  const staleMs = cacheTtlSec(cfg, platform) * 1000
   return age >= 0 && age <= staleMs
 }
 
-export function viewSnapshot(snapshot, cfg = DEFAULT_HEALTH_PROBE, now = Date.now(), nextAt = null) {
-  const valid = isSnapshotValid(snapshot, cfg, now)
+export function viewSnapshot(
+  snapshot,
+  cfg = DEFAULT_HEALTH_PROBE,
+  now = Date.now(),
+  nextAt = null,
+  platform = 'anthropic',
+) {
+  const valid = isSnapshotValid(snapshot, cfg, now, platform)
   return {
     ok: !!snapshot?.ok && valid,
     at: snapshot?.at || null,
@@ -382,7 +469,7 @@ export function viewSnapshot(snapshot, cfg = DEFAULT_HEALTH_PROBE, now = Date.no
     duration_ms: snapshot?.duration_ms || null,
     next_at: nextAt,
     age_ms: snapshot?.at ? Math.max(0, now - Date.parse(snapshot.at) || 0) : null,
-    cache_ttl_sec: cacheTtlSec(cfg),
+    cache_ttl_sec: cacheTtlSec(cfg, platform),
     cache_models: [...(cfg.cache_models || [])],
     cache_model: cfg.cache_model || '',
   }
@@ -402,9 +489,11 @@ export function healthUnavailableError(snapshot = null, requestId = null) {
   return { type: 'error', error }
 }
 
-/** Which cached snapshot answers this inbound model: GPT models use the Codex probe. */
-export function healthPlatformOf(body = {}) {
-  const platform = detectInboundPlatform(body?.model)
+/** Which cached snapshot answers this inbound model: Gemini uses the hourly Gemini probe; GPT uses Codex. */
+export function healthPlatformOf(body = {}, modelHint = '') {
+  const rawModel = body?.model || modelHint
+  if (isGeminiSeriesId(rawModel)) return 'gemini'
+  const platform = detectInboundPlatform(rawModel)
   return platform.ok && platform.platform === 'openai' ? 'openai' : 'anthropic'
 }
 
@@ -415,11 +504,14 @@ export function decideHealthIntercept({
   snapshot = null,
   now = Date.now(),
   protocol = '',
+  platform = '',
 } = {}) {
   if (!cfg?.enabled || !cfg.intercept_unofficial) return { action: 'pass' }
+  const resolvedPlatform = platform || healthPlatformOf(body)
+  if (resolvedPlatform === 'gemini' && cfg?.gemini?.enabled === false) return { action: 'pass' }
   if (!isHealthShape(headers, body, cfg, protocol)) return { action: 'pass' }
   if (!inboundMatchesCacheModels(body, cfg)) return { action: 'pass' }
-  if (isSnapshotValid(snapshot, cfg, now) && hasCachedMessage(snapshot)) {
+  if (isSnapshotValid(snapshot, cfg, now, resolvedPlatform) && hasCachedMessage(snapshot)) {
     return { action: 'cache', snapshot, via: HEALTH_VIA_CACHE }
   }
   if (!cfg.fail_closed) return { action: 'pass' }
@@ -451,10 +543,36 @@ export function cachedClaudeMessage(snapshot = {}, inbound = {}, cfg = DEFAULT_H
   }
 }
 
+function claudeToGoogleGeminiResponse(claude) {
+  const text = (claude.content || [])
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text || '')
+    .join('')
+  const input = Number(claude.usage?.input_tokens) || 0
+  const output = Number(claude.usage?.output_tokens) || 0
+  const total = Number(claude.usage?.total_tokens) || input + output
+  return {
+    candidates: [
+      {
+        content: { role: 'model', parts: [{ text }] },
+        finishReason: 'STOP',
+        index: 0,
+      },
+    ],
+    usageMetadata: {
+      promptTokenCount: input,
+      candidatesTokenCount: output,
+      totalTokenCount: total,
+    },
+    modelVersion: claude.model,
+  }
+}
+
 /** Replay the cached official Messages body in the caller's protocol. No local msg_health_* ids. */
 export function synthesizeProtocolResponse(protocol, inbound = {}, snapshot = {}, cfg = DEFAULT_HEALTH_PROBE) {
   const claude = cachedClaudeMessage(snapshot, inbound, cfg)
   if (!claude) return null
+  if (protocol === 'google.gemini' || protocol === 'gemini') return claudeToGoogleGeminiResponse(claude)
   if (protocol === 'openai.chat') return fromClaudeToOpenAIChat(claude, claude.model)
   if (protocol === 'openai.completions') return fromClaudeToOpenAICompletions(claude, claude.model)
   if (protocol === 'openai.responses') return fromClaudeToResponses(claude, claude.model)
@@ -464,6 +582,9 @@ export function synthesizeProtocolResponse(protocol, inbound = {}, snapshot = {}
 export function formatHealthSse(protocol, inbound, snapshot, cfg = DEFAULT_HEALTH_PROBE) {
   const claude = cachedClaudeMessage(snapshot, inbound, cfg)
   if (!claude) return ''
+  if (protocol === 'google.gemini' || protocol === 'gemini') {
+    return `data: ${JSON.stringify(claudeToGoogleGeminiResponse(claude))}\n\n`
+  }
   const lines = []
   const ev = (event, data) => {
     if (event) lines.push(`event: ${event}`)
@@ -609,42 +730,218 @@ export function selectHealthProbeTargets(vms = [], cfg = DEFAULT_HEALTH_PROBE, n
   })
 }
 
+export function selectGeminiProbeModel(catalog = null, cfg = DEFAULT_HEALTH_PROBE) {
+  const configured = String(cfg?.gemini?.model || '').trim()
+  if (configured) return configured
+  const models = Array.isArray(catalog?.models) ? catalog.models : []
+  const ids = models
+    .map((m) => (typeof m === 'string' ? m : String(m?.id || '')).trim())
+    .filter((id) => isGeminiSeriesId(id))
+  if (!ids.length) return null
+  return ids.find((id) => /flash[-._]?lite/i.test(id)) || ids.find((id) => /flash/i.test(id)) || ids[0]
+}
+
 export function createHealthProbeMonitor(opts = {}) {
   let config = normalizeHealthProbeConfig(opts.config)
-  // anthropic: Claude slot probe (legacy single snapshot). openai: Codex slot probe.
-  const snapshots = { anthropic: null, openai: null }
+  // anthropic: Claude slot probe (legacy single snapshot). openai: Codex slot probe. gemini: hourly Gemini probe.
+  const snapshots = { anthropic: null, openai: null, gemini: null }
   let lastRunAt = 0
+  let geminiLastRunAt = 0
   let inflight = null
+  let geminiInflight = null
+  let allInflight = null
+  let serialChain = Promise.resolve()
   let timer = null
+  let geminiTimer = null
   const nowFn = opts.now || (() => Date.now())
+
+  // Serialize all real health probes (across slots, platforms, and timers) so one finishes before the next starts.
+  const enqueueSerial = (fn) => {
+    const run = serialChain.then(fn, fn)
+    serialChain = run.then(
+      () => {},
+      () => {},
+    )
+    return run
+  }
 
   const getConfig = () => config
   const nextAtIso = () => {
     if (!config.enabled || !lastRunAt) return null
     return new Date(lastRunAt + config.interval_sec * 1000).toISOString()
   }
+  const geminiNextAtIso = () => {
+    if (!config.enabled || !config.gemini?.enabled || !geminiLastRunAt) return null
+    return new Date(geminiLastRunAt + config.gemini.interval_sec * 1000).toISOString()
+  }
 
   const getSnapshot = (platform = 'anthropic') =>
-    viewSnapshot(snapshots[platform] || null, config, nowFn(), nextAtIso())
+    viewSnapshot(
+      snapshots[platform] || null,
+      config,
+      nowFn(),
+      platform === 'gemini' ? geminiNextAtIso() : nextAtIso(),
+      platform,
+    )
 
   const probeTargets = (platform, now) =>
     selectHealthProbeTargets(opts.listTargets?.() || [], config, now).filter(
       (vm) => (String(vm.platform || '').toLowerCase() === 'openai' ? 'openai' : 'anthropic') === platform,
     )
 
-  const decide = (headers, body, protocol = '') => {
-    const platform = healthPlatformOf(body)
+  const decide = (headers, body, protocol = '', decideOpts = {}) => {
+    const modelHint = String(decideOpts?.model || '').trim()
+    const effectiveBody =
+      modelHint && (!body || typeof body !== 'object' || !body.model)
+        ? { ...(body && typeof body === 'object' ? body : {}), model: modelHint }
+        : body
+    const platform = healthPlatformOf(effectiveBody, modelHint)
     const now = nowFn()
     const decision = decideHealthIntercept({
       headers,
-      body,
+      body: effectiveBody,
       protocol,
       cfg: config,
       snapshot: snapshots[platform],
       now,
+      platform,
     })
-    if (decision.action === 'fail' && probeTargets(platform, now).length) return { action: 'pass' }
+    if (decision.action === 'fail') {
+      if (platform === 'gemini') return { action: 'pass' }
+      if (probeTargets(platform, now).length) return { action: 'pass' }
+    }
     return decision
+  }
+
+  const probeGemini = async (started) => {
+    if (!config.gemini?.enabled) {
+      snapshots.gemini = null
+      return
+    }
+    if (typeof opts.runGeminiProbe !== 'function') return
+
+    let catalog = null
+    if (typeof opts.listGeminiTargets === 'function') {
+      try {
+        catalog = await opts.listGeminiTargets()
+      } catch (e) {
+        const prev = snapshots.gemini
+        const errMsg = String(e?.message || e || 'gemini_catalog_failed').slice(0, 300)
+        if (prev?.ok && isSnapshotValid(prev, config, nowFn(), 'gemini')) {
+          snapshots.gemini = { ...prev, last_error: errMsg, last_failed_at: new Date(nowFn()).toISOString() }
+          return
+        }
+        snapshots.gemini = {
+          ok: false,
+          at: new Date(nowFn()).toISOString(),
+          vm_id: null,
+          model: config.gemini.model || null,
+          text: null,
+          status: 0,
+          error: errMsg,
+          duration_ms: nowFn() - started,
+        }
+        return
+      }
+      const accounts = Array.isArray(catalog?.accounts) ? catalog.accounts : []
+      if (!accounts.length) {
+        const prev = snapshots.gemini
+        if (prev?.ok && isSnapshotValid(prev, config, nowFn(), 'gemini')) return
+        snapshots.gemini = {
+          ok: false,
+          at: new Date(started).toISOString(),
+          vm_id: null,
+          model: config.gemini.model || null,
+          text: null,
+          status: 0,
+          error: 'no_schedulable_credential',
+          duration_ms: nowFn() - started,
+        }
+        return
+      }
+    }
+
+    const targetModel = selectGeminiProbeModel(catalog, config) || (catalog ? null : 'gemini-2.5-flash')
+    if (!targetModel) {
+      const prev = snapshots.gemini
+      if (prev?.ok && isSnapshotValid(prev, config, nowFn(), 'gemini')) return
+      snapshots.gemini = {
+        ok: false,
+        at: new Date(started).toISOString(),
+        vm_id: null,
+        model: null,
+        text: null,
+        status: 0,
+        error: 'no_schedulable_credential',
+        duration_ms: nowFn() - started,
+      }
+      return
+    }
+
+    try {
+      const result = await opts.runGeminiProbe({
+        model: targetModel,
+        prompt: config.gemini.prompt || DEFAULT_HEALTH_PROBE.gemini.prompt,
+        timeout_ms: config.gemini.timeout_ms || DEFAULT_HEALTH_PROBE.gemini.timeout_ms,
+      })
+      if (result?.ok) {
+        const fallbackId = `gem_probe_${crypto.randomBytes(8).toString('hex')}`
+        const body = sanitizeCachedMessage(result.body, {
+          id: result.id || fallbackId,
+          text: result.text || 'ok',
+          model: result.model || targetModel,
+          stop_reason: result.stop_reason || 'end_turn',
+          usage: result.usage,
+        })
+        snapshots.gemini = {
+          ok: true,
+          at: new Date(nowFn()).toISOString(),
+          vm_id: result.vm_id || (result.account_id ? `gemini:${result.account_id}` : 'gemini'),
+          model: body.model || result.model || targetModel,
+          text: String(result.text || 'ok').slice(0, 4000),
+          status: result.status || 200,
+          error: null,
+          duration_ms: nowFn() - started,
+          body,
+        }
+        return
+      }
+      const errMsg = String(result?.error?.message || result?.error || 'probe_failed').slice(0, 300)
+      const failedAt = new Date(nowFn()).toISOString()
+      const prev = snapshots.gemini
+      if (prev?.ok && isSnapshotValid(prev, config, nowFn(), 'gemini')) {
+        snapshots.gemini = { ...prev, last_error: errMsg, last_failed_at: failedAt }
+        return
+      }
+      snapshots.gemini = {
+        ok: false,
+        at: failedAt,
+        vm_id: result?.vm_id || (result?.account_id ? `gemini:${result.account_id}` : null),
+        model: targetModel,
+        text: null,
+        status: result?.status || 0,
+        error: errMsg,
+        duration_ms: nowFn() - started,
+      }
+    } catch (e) {
+      const errMsg = String(e?.message || e || 'probe_failed').slice(0, 300)
+      const failedAt = new Date(nowFn()).toISOString()
+      const prev = snapshots.gemini
+      if (prev?.ok && isSnapshotValid(prev, config, nowFn(), 'gemini')) {
+        snapshots.gemini = { ...prev, last_error: errMsg, last_failed_at: failedAt }
+        return
+      }
+      snapshots.gemini = {
+        ok: false,
+        at: failedAt,
+        vm_id: null,
+        model: targetModel,
+        text: null,
+        status: 0,
+        error: errMsg,
+        duration_ms: nowFn() - started,
+      }
+    }
   }
 
   const probePlatform = async (platform, real, started) => {
@@ -715,38 +1012,20 @@ export function createHealthProbeMonitor(opts = {}) {
     }
 
     let lastError = null
-    if (!config.probe_all_slots) {
-      for (const vm of targets) {
-        const outcome = await probeVm(vm)
-        if (outcome.ok) {
+    let wroteThisRun = false
+    for (const vm of targets) {
+      const outcome = await probeVm(vm)
+      if (outcome.ok) {
+        if (!wroteThisRun) {
+          wroteThisRun = true
           writeSuccessSnapshot(vm, outcome.result)
-          return
         }
+        if (!config.probe_all_slots) return
+      } else {
         lastError = outcome.error
       }
-    } else {
-      let bestOkIndex = Infinity
-      const limit = config.concurrency
-      let cursor = 0
-      const workers = Array.from({ length: Math.min(limit, targets.length) }, async () => {
-        while (cursor < targets.length) {
-          const index = cursor
-          const vm = targets[cursor]
-          cursor += 1
-          const outcome = await probeVm(vm)
-          if (outcome.ok) {
-            if (index < bestOkIndex) {
-              bestOkIndex = index
-              writeSuccessSnapshot(vm, outcome.result)
-            }
-          } else {
-            lastError = outcome.error
-          }
-        }
-      })
-      await Promise.all(workers)
-      if (snapshots[platform]?.ok) return
     }
+    if (wroteThisRun) return
     const failedAt = new Date(nowFn()).toISOString()
     const prev = snapshots[platform]
     if (prev?.ok && isSnapshotValid(prev, config, nowFn())) {
@@ -769,9 +1048,9 @@ export function createHealthProbeMonitor(opts = {}) {
     }
   }
 
-  const runRealProbe = async () => {
+  const runFleetProbe = async () => {
     if (inflight) return inflight
-    inflight = (async () => {
+    inflight = enqueueSerial(async () => {
       const started = nowFn()
       lastRunAt = started
       await probePlatform('anthropic', config.real, started)
@@ -781,10 +1060,39 @@ export function createHealthProbeMonitor(opts = {}) {
         snapshots.openai = null
       }
       return getSnapshot('anthropic')
-    })().finally(() => {
+    }).finally(() => {
       inflight = null
     })
     return inflight
+  }
+
+  const runGeminiRealProbe = async () => {
+    if (geminiInflight) return geminiInflight
+    geminiInflight = enqueueSerial(async () => {
+      const started = nowFn()
+      geminiLastRunAt = started
+      await probeGemini(started)
+      return getSnapshot('gemini')
+    }).finally(() => {
+      geminiInflight = null
+    })
+    return geminiInflight
+  }
+
+  const runRealProbe = async ({ platform = 'all' } = {}) => {
+    if (platform === 'gemini') return runGeminiRealProbe()
+    if (platform === 'fleet') return runFleetProbe()
+    if (allInflight) return allInflight
+    allInflight = (async () => {
+      const anthropicSnap = await runFleetProbe()
+      if (config.gemini?.enabled && typeof opts.runGeminiProbe === 'function') {
+        await runGeminiRealProbe()
+      }
+      return anthropicSnap
+    })().finally(() => {
+      allInflight = null
+    })
+    return allInflight
   }
 
   const stop = () => {
@@ -792,26 +1100,55 @@ export function createHealthProbeMonitor(opts = {}) {
       clearInterval(timer)
       timer = null
     }
+    if (geminiTimer) {
+      clearInterval(geminiTimer)
+      geminiTimer = null
+    }
   }
 
-  const start = ({ immediate = false } = {}) => {
+  const start = ({ immediate = false, immediateFleet = immediate, immediateGemini = immediate } = {}) => {
     stop()
     if (!config.enabled) return { started: false, reason: 'disabled' }
     timer = setInterval(() => {
-      runRealProbe().catch(() => {})
+      runFleetProbe().catch(() => {})
     }, config.interval_sec * 1000)
     if (typeof timer.unref === 'function') timer.unref()
-    if (immediate && config.run_on_start) {
+    if (immediateFleet && config.run_on_start) {
       queueMicrotask(() => {
-        runRealProbe().catch(() => {})
+        runFleetProbe().catch(() => {})
       })
     }
-    return { started: true, interval_sec: config.interval_sec, run_on_start: config.run_on_start }
+    if (config.gemini?.enabled && typeof opts.runGeminiProbe === 'function') {
+      geminiTimer = setInterval(() => {
+        runGeminiRealProbe().catch(() => {})
+      }, config.gemini.interval_sec * 1000)
+      if (typeof geminiTimer.unref === 'function') geminiTimer.unref()
+      if (immediateGemini && config.run_on_start) {
+        queueMicrotask(() => {
+          runGeminiRealProbe().catch(() => {})
+        })
+      }
+    }
+    return {
+      started: true,
+      interval_sec: config.interval_sec,
+      gemini_interval_sec: config.gemini.interval_sec,
+      run_on_start: config.run_on_start,
+    }
   }
 
   const setConfig = (next, { restart = true } = {}) => {
+    const prevEnabled = config.enabled
+    const prevGeminiActive = config.enabled && config.gemini?.enabled
     config = normalizeHealthProbeConfig(next)
-    if (restart) start({ immediate: false })
+    const nextGeminiActive = config.enabled && config.gemini?.enabled
+    if (!nextGeminiActive) snapshots.gemini = null
+    if (restart) {
+      const triggerFleet = !prevEnabled && config.enabled
+      const triggerGemini =
+        !prevGeminiActive && nextGeminiActive && !isSnapshotValid(snapshots.gemini, config, nowFn(), 'gemini')
+      start({ immediate: false, immediateFleet: triggerFleet, immediateGemini: triggerGemini })
+    }
     return config
   }
 
@@ -819,10 +1156,15 @@ export function createHealthProbeMonitor(opts = {}) {
     getConfig,
     setConfig,
     getSnapshot,
-    getSnapshots: () => ({ anthropic: getSnapshot('anthropic'), openai: getSnapshot('openai') }),
+    getSnapshots: () => ({
+      anthropic: getSnapshot('anthropic'),
+      openai: getSnapshot('openai'),
+      gemini: getSnapshot('gemini'),
+    }),
     rawSnapshot: (platform = 'anthropic') => snapshots[platform] || null,
     decide,
     runRealProbe,
+    runGeminiRealProbe,
     start,
     stop,
   }

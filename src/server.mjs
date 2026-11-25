@@ -675,6 +675,42 @@ healthMonitor = createHealthProbeMonitor({
       unofficial: false,
       extraHeaders: { [HEALTH_REAL_HEADER]: '1' },
     }),
+  listGeminiTargets: async () => {
+    if (!geminiScheduler?.catalog) return { models: [], accounts: [] }
+    return geminiScheduler.catalog()
+  },
+  runGeminiProbe: async ({ model, prompt, timeout_ms }) => {
+    if (!geminiScheduler?.complete) return { ok: false, error: 'gemini_scheduler_unavailable' }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeout_ms || 60_000)
+    try {
+      const turn = await geminiScheduler.complete({
+        model,
+        text: prompt || 'hello',
+        startedAt: Date.now(),
+        signal: controller.signal,
+        allowUnprefixedNonGemini: false,
+      })
+      return {
+        ok: true,
+        status: turn?.upstream_status ?? 200,
+        text: turn?.text || 'ok',
+        vm_id: turn?.account_id ? `gemini:${turn.account_id}` : 'gemini',
+        account_id: turn?.account_id || null,
+        model: turn?.response_model || turn?.model || model,
+        stop_reason: turn?.stopReason || 'end_turn',
+        usage: turn?.usage || { input_tokens: 0, output_tokens: 0 },
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        status: error?.upstreamStatus || error?.status || 0,
+        error: error?.message || error?.code || String(error),
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  },
 })
 const vmTestSchedule = new VmTestScheduleRunner({
   projectRoot: cfg.paths.project,
@@ -1409,6 +1445,7 @@ const handleGeminiPublic = createGeminiPublicHandler({
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
   apiKeyStore,
   getRoutingConfig: () => routingConfig,
+  getHealthMonitor: () => healthMonitor,
 })
 const integrationTokenStore = new IntegrationTokenStore()
 const handlePanel = createPanelHandler({

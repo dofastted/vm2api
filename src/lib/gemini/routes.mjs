@@ -3,6 +3,7 @@ import http from 'node:http'
 import { isIP } from 'node:net'
 import path from 'node:path'
 import { filterModelCatalogForKey, keyModelError } from '../admin/key-models.mjs'
+import { formatHealthSse, synthesizeProtocolResponse } from '../admin/health-probe.mjs'
 import { summarizeBody } from '../admin/request-log.mjs'
 import { keyTierPolicyFromRecord } from '../admin/key-scope.mjs'
 import { PLATFORM_SCOPE, normalizeOwnerId, ownerScopeFromRequest } from '../admin/resource-owner.mjs'
@@ -14,7 +15,7 @@ import {
   parseInboundToGemini,
   renderGeminiProtocolResponse,
 } from '../protocol/gemini-convert.mjs'
-import { resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
+import { isGeminiSeriesId, resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
 import { reasoningEffortOf, resolveGeminiReasoningEffort, sessionIdForLog } from '../protocol/log-fields.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
@@ -228,7 +229,7 @@ export function parseGeminiGeneratePath(pathname) {
   let model = match[2]
   try {
     model = decodeURIComponent(match[2])
-  } catch {}
+  } catch { }
   return {
     version: match[1],
     model,
@@ -243,7 +244,7 @@ export function parseGeminiModelGetPath(pathname) {
   let model = match[2]
   try {
     model = decodeURIComponent(match[2])
-  } catch {}
+  } catch { }
   return { version: match[1], model }
 }
 
@@ -353,8 +354,8 @@ function hostRequest(socketPath, operation, payload) {
           if (response.statusCode !== 200 && typeof data?.code === 'string' && Object.hasOwn(HOST_ERRORS, data.code)) {
             const stage =
               data.code === 'gemini_authorization_unavailable' &&
-              typeof data.stage === 'string' &&
-              Object.hasOwn(AUTH_STAGE_MESSAGES, data.stage)
+                typeof data.stage === 'string' &&
+                Object.hasOwn(AUTH_STAGE_MESSAGES, data.stage)
                 ? data.stage
                 : null
             throw hostError(data.code, response.statusCode, stage ? { stage } : null)
@@ -464,8 +465,8 @@ function accountView(account) {
   const validationUrl = safeGoogleValidationUrl(account?.validation_url)
   const modelCatalog = items(account.model_catalog, 128, (entry) =>
     modelName(entry?.id) &&
-    ANTIGRAVITY_PROVIDERS.has(entry?.provider) &&
-    ANTIGRAVITY_QUOTA_GROUPS.has(entry?.quota_group)
+      ANTIGRAVITY_PROVIDERS.has(entry?.provider) &&
+      ANTIGRAVITY_QUOTA_GROUPS.has(entry?.quota_group)
       ? { id: entry.id, provider: entry.provider, quota_group: entry.quota_group }
       : null,
   )
@@ -699,10 +700,10 @@ function environmentView(
     ...(value.models_discovered === true && { models_discovered: true }),
     ...(Array.isArray(value.capabilities)
       ? {
-          capabilities: items(value.capabilities, 32, (c) =>
-            typeof c === 'string' && /^[a-z0-9_]{1,40}$/.test(c) ? c : null,
-          ),
-        }
+        capabilities: items(value.capabilities, 32, (c) =>
+          typeof c === 'string' && /^[a-z0-9_]{1,40}$/.test(c) ? c : null,
+        ),
+      }
       : {}),
     account: accountView(value.account),
     ...(Object.hasOwn(value, 'last_inference') && {
@@ -1233,10 +1234,10 @@ export function createGeminiPanelHandler({
         let usageStats = null
         try {
           byModel = requestLog.costByModel?.({ vmId, accountId: id }) || []
-        } catch {}
+        } catch { }
         try {
           usageStats = requestLog.vmUsageStats?.({ vmId, days: 30 }) || null
-        } catch {}
+        } catch { }
         return ok({
           billing: {
             by_model: byModel,
@@ -1429,8 +1430,8 @@ export function createGeminiPanelHandler({
         const [status, message] = HOST_ERRORS[error.code]
         const stage =
           error.code === 'gemini_authorization_unavailable' &&
-          typeof error.stage === 'string' &&
-          Object.hasOwn(AUTH_STAGE_MESSAGES, error.stage)
+            typeof error.stage === 'string' &&
+            Object.hasOwn(AUTH_STAGE_MESSAGES, error.stage)
             ? error.stage
             : null
         return fail(status, error.code, stage ? AUTH_STAGE_MESSAGES[stage] : message, stage ? { stage } : null)
@@ -1752,7 +1753,7 @@ function extractGeminiSessionId(req, body, sessionPathId = '') {
         if (typeof parsedUid?.session_id === 'string' && parsedUid.session_id.trim()) {
           return parsedUid.session_id.trim()
         }
-      } catch {}
+      } catch { }
     }
     const match = /_session_([A-Za-z0-9._-]+)$/.exec(rawUser)
     return match ? match[1] : rawUser
@@ -1768,6 +1769,7 @@ export function createGeminiPublicHandler({
   groupsRepo = null,
   apiKeyStore = null,
   getRoutingConfig = null,
+  getHealthMonitor = null,
 }) {
   const geminiScopeFromReq = (req) => {
     const rec = req?.apiKeyRecord || null
@@ -1904,7 +1906,7 @@ export function createGeminiPublicHandler({
           rate_multiplier: groupsRepo?.rateMultiplier?.(groupId) ?? 1,
           ...logBag,
         })
-      } catch {}
+      } catch { }
     }
     const hasFinishHook = typeof res?.once === 'function'
     if (ownLogCtx && hasFinishHook) {
@@ -1987,9 +1989,9 @@ export function createGeminiPublicHandler({
     logBag.has_tools = Boolean(
       supportsStream
         ? parsed?.tools?.length > 0 ||
-            parsed?.webSearch ||
-            parsed?.googleTools?.length > 0 ||
-            parsed?.requiredCapabilities?.includes('tools')
+        parsed?.webSearch ||
+        parsed?.googleTools?.length > 0 ||
+        parsed?.requiredCapabilities?.includes('tools')
         : false,
     )
     logBag.attempt_count = 0
@@ -2023,6 +2025,41 @@ export function createGeminiPublicHandler({
         denied.status,
         protocolErrorBody(protocol, denied.status, denied.body.error.code, denied.body.error.message),
       )
+    }
+
+    const healthMonitor = typeof getHealthMonitor === 'function' ? getHealthMonitor() : null
+    if (healthMonitor && protocol !== 'gemini-session' && isGeminiSeriesId(targetModel)) {
+      const canonicalProtocol = logProtocolName(protocol)
+      const healthBody =
+        body && typeof body === 'object' && !Array.isArray(body)
+          ? { ...body, model: targetModel }
+          : { model: targetModel }
+      const healthDecision = healthMonitor.decide?.(req.headers, healthBody, canonicalProtocol, { model: targetModel })
+      if (healthDecision?.action === 'cache') {
+        const hpCfg = healthMonitor.getConfig?.()
+        const cached = synthesizeProtocolResponse(canonicalProtocol, healthBody, healthDecision.snapshot || {}, hpCfg)
+        if (cached) {
+          const snapUsage = healthDecision.snapshot?.body?.usage || { input_tokens: 0, output_tokens: 0 }
+          logBag.via = healthDecision.via
+          logBag.attempt_count = 0
+          logBag.vm_id = healthDecision.snapshot?.vm_id || null
+          logBag.upstream_model = healthDecision.snapshot?.model || targetModel
+          logBag.usage = {
+            input_tokens: snapUsage.input_tokens || 0,
+            output_tokens: snapUsage.output_tokens || 0,
+          }
+          logBag.stop_reason = healthDecision.snapshot?.body?.stop_reason || 'end_turn'
+          logBag.final_state = healthDecision.via
+          logBag.first_token_ms = Math.max(0, Date.now() - startedAt)
+          if (wantStream) {
+            const sse = formatHealthSse(canonicalProtocol, healthBody, healthDecision.snapshot || {}, hpCfg)
+            const out = writeStream(res, [sse])
+            if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
+            return out
+          }
+          return respondJson(200, cached)
+        }
+      }
     }
 
     const controller = new AbortController()
@@ -2323,10 +2360,10 @@ export function createGeminiPublicHandler({
         ...geminiScope,
         onEvent: wantStream
           ? (event) => {
-              if (event?.kind === 'error') return headersSent
-              writeChunk(encoder.push(event))
-              return headersSent
-            }
+            if (event?.kind === 'error') return headersSent
+            writeChunk(encoder.push(event))
+            return headersSent
+          }
           : null,
       })
       if (controller.signal.aborted) {
@@ -2374,7 +2411,7 @@ export function createGeminiPublicHandler({
             formatGeminiProtocolStreamError(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
           )
           res.end()
-        } catch {}
+        } catch { }
         if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
         return
       }
