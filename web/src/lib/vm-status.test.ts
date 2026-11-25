@@ -21,6 +21,7 @@ import {
   vmCircuit,
   vmCircuitTitle,
   vmFailedAt,
+  vmRunning,
 } from './vm-status'
 
 function liveVm(over: Partial<Vm> = {}): Vm {
@@ -955,5 +956,37 @@ describe('custom quota window restriction labels (#1744)', () => {
       restriction_reason: 'quota_24h_header',
     } as Vm
     expect(restrictionCopy(slot)).toContain('24h 限制')
+  })
+})
+
+describe('vmRunning', () => {
+  it('reports running for a live container even when no credential is bound', () => {
+    expect(
+      vmRunning({ id: 'vm-07', status: 'running', has_token: false })
+    ).toBe(true)
+    expect(vmRunning({ id: 'vm-07', status: 'ok', has_token: false })).toBe(
+      true
+    )
+  })
+
+  it('reports stopped for stopped, dead, or disabled slots even with a token', () => {
+    expect(vmRunning({ id: 'vm-06', status: 'stopped', has_token: true })).toBe(
+      false
+    )
+    expect(vmRunning({ id: 'vm-06', status: 'dead', has_token: true })).toBe(
+      false
+    )
+    expect(
+      vmRunning({ id: 'vm-06', status: 'disabled', has_token: true })
+    ).toBe(false)
+    expect(vmRunning(undefined)).toBe(false)
+  })
+
+  it('falls back to active or has_token only when status is omitted', () => {
+    expect(vmRunning({ id: 'vm-legacy', has_token: true })).toBe(true)
+    expect(vmRunning({ id: 'vm-empty', has_token: false })).toBe(false)
+    expect(vmRunning({ id: 'vm-active', active: true, has_token: false })).toBe(
+      true
+    )
   })
 })
