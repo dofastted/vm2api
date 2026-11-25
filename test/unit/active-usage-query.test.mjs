@@ -1,6 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { createDatabase } from '../../src/lib/db/database.mjs'
 import { createActiveUsageQuery } from '../../src/lib/oauth/active-usage-query.mjs'
+import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 
 const vm = { id: 'vm-01', claude: { mode: 'oauth', has_access: true, account_uuid: 'account-1' } }
 const successful = {
@@ -23,9 +28,9 @@ function fixture(overrides = {}) {
         await Promise.resolve()
         return account
       },
-      async ingestOAuthUsage(id, result) {
+      async ingestOAuthUsage(id, result, opts) {
         await Promise.resolve()
-        writes.push({ id, result })
+        writes.push({ id, result, opts })
         return { unified: { account_tier: 'max' } }
       },
     },
@@ -131,4 +136,75 @@ test('GPT slots are rejected before probing', async () => {
   const result = await f.query({ ...f.args, vm: { ...vm, kind: 'codex' } })
   assert.equal(result.status, 400)
   assert.equal(result.body.error.code, 'unsupported_platform')
+})
+
+test('#1776 failed, 429 rate-limited, or partial-window active queries never clear existing headers', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'active-usage-1776-'))
+  fs.mkdirSync(path.join(root, 'data'), { recursive: true })
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  const db = createDatabase({ dataDir: path.join(root, 'data') })
+  const quota = new AccountQuota({ db, config: {} })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+
+  const t0 = Date.parse('2026-11-24T07:00:00Z')
+  const t1 = Date.parse('2026-11-25T00:15:00Z')
+  const reset5 = String(Math.floor((t1 + 3 * 3600_000) / 1000))
+  const reset7 = String(Math.floor((t1 + 48 * 3600_000) / 1000))
+  quota.ingestHeaders(
+    'account-1',
+    {
+      'anthropic-ratelimit-unified-5h-utilization': '0.84',
+      'anthropic-ratelimit-unified-5h-reset': reset5,
+      'anthropic-ratelimit-unified-5h-status': 'allowed',
+      'anthropic-ratelimit-unified-7d-utilization': '0.76',
+      'anthropic-ratelimit-unified-7d-reset': reset7,
+      'anthropic-ratelimit-unified-7d-status': 'allowed_warning',
+    },
+    null,
+    { now: t0 },
+  )
+
+  // 1. 429, 502, and 200+limits_present:false keep both 0.84 and 0.76 intact.
+  for (const [response, expectedStatus] of [
+    [{ ok: false, usage_status: 429, probed_at: new Date(t1).toISOString() }, 429],
+    [{ ok: false, usage_status: 502, usage_error: 'bad gateway', probed_at: new Date(t1).toISOString() }, 502],
+    [{ ok: true, usage_status: 200, limits_present: false, probed_at: new Date(t1).toISOString() }, 502],
+  ]) {
+    const accRow = quota.repo.get('account-1')
+    delete accRow.unified.usage_rate_limited_until
+    quota.repo.save(accRow)
+
+    const queryErr = createActiveUsageQuery({ now: () => t1, probe: async () => response })
+    const res = await queryErr({ projectRoot: root, vm, accountQuota: quota, forceReconcile: true })
+    assert.equal(res.status, expectedStatus)
+    const after = quota.repo.get('account-1')
+    assert.equal(after.unified.headers['5h'].utilization, 0.84)
+    assert.equal(after.unified.headers['7d'].utilization, 0.76)
+  }
+
+  // 2. Partial window (five_hour: null, seven_day: 0) reconciles ONLY 7d and preserves 5h = 0.84.
+  const accClean = quota.repo.get('account-1')
+  delete accClean.unified.usage_rate_limited_until
+  quota.repo.save(accClean)
+
+  const queryPartial = createActiveUsageQuery({
+    now: () => t1,
+    probe: async () => ({
+      ok: true,
+      usage_status: 200,
+      limits_present: true,
+      probed_at: new Date(t1).toISOString(),
+      five_hour: null,
+      seven_day: { utilization: 0, status: 'allowed', resets_at: new Date(Number(reset7) * 1000).toISOString() },
+    }),
+  })
+  const partialRes = await queryPartial({ projectRoot: root, vm, accountQuota: quota })
+  assert.equal(partialRes.status, 200)
+  assert.deepEqual(partialRes.body.data.reconciled_windows, ['7d'])
+  const afterPartial = quota.repo.get('account-1')
+  assert.equal(afterPartial.unified.headers['5h'].utilization, 0.84)
+  assert.equal(afterPartial.unified.headers['7d'].utilization, 0)
 })
