@@ -655,3 +655,13 @@ export function modelsDevMeta(platform, id) {
   if (!row) return null
   return { name: row.name ?? null, context: row.context ?? null }
 }
+
+export function listModelsDevModels(platform) {
+  const dict = readSnapshot()?.[platform]
+  if (!dict || typeof dict !== 'object') return []
+  return Object.entries(dict).map(([id, row]) => ({
+    id,
+    display_name: row?.name ?? null,
+    context: row?.context ?? null,
+  }))
+}

@@ -59,7 +59,7 @@ export function fmtImageRates(price: Price | null | undefined): string {
 }
 
 export function cacheFillHint(
-  platform: 'anthropic' | 'openai',
+  platform: 'anthropic' | 'openai' | 'google',
   field: 'cache_5m' | 'cache_1h',
   input: string
 ): string {

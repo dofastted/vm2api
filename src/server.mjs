@@ -57,6 +57,7 @@ import {
   getPanelAdmin,
 } from './lib/core/security.mjs'
 import { loadModelPolicy } from './lib/protocol/model-policy.mjs'
+import { loadGeminiModelPolicy } from './lib/protocol/gemini-model-policy.mjs'
 import { gatewayModelCatalog } from './lib/protocol/models.mjs'
 import {
   createCredentialRefreshMonitor,
@@ -348,6 +349,11 @@ try {
   loadModelPolicy()
 } catch (e) {
   console.warn('[model-policy] boot load failed', e?.message || e)
+}
+try {
+  loadGeminiModelPolicy()
+} catch (e) {
+  console.warn('[gemini-model-policy] boot load failed', e?.message || e)
 }
 // one-time migration of legacy JSON files (data/*.json + request-logs) into the DB
 const legacyImport = runLegacyImport({ dataDir, projectRoot: cfg.paths.project })
@@ -810,6 +816,13 @@ usageProbeMonitor = createUsageProbeMonitor({
 catalogMonitor = createCatalogMonitor({
   projectRoot: cfg.paths.project,
   codexCatalogVersion: () => routingConfig.codex?.catalog_client_version || 'auto',
+  callGeminiHost,
+  resolveGeminiProxy: (proxyId, envId) => {
+    const ownerUserId = geminiOwnersRepo?.getOwner?.(envId) ?? null
+    return geminiProxyFor(proxyPool, proxyId, { ownerUserId })
+  },
+  getApiEndpointStore: () => apiEndpointStore,
+  cfg,
   log: (event) => console.log(JSON.stringify(event)),
 })
 notifyMonitor = createNotifyMonitor({

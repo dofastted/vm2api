@@ -32,6 +32,7 @@ import {
 import {
   type ModelEntry,
   type ModelParams,
+  type ModelPlatform,
   type ModelPolicy,
   type Pass1mMode,
   catalogFacts,
@@ -47,6 +48,7 @@ import {
   fmtPerM,
   priceSourceLabel,
   priceSourceVariant,
+  tiersSummary,
 } from './price-display'
 
 type Props = {
@@ -55,7 +57,7 @@ type Props = {
   pol: ModelPolicy
   pricing?: PolicyPrice | null
   open: boolean
-  platform: 'anthropic' | 'openai'
+  platform: ModelPlatform
   onToggleOpen: () => void
   onToggleEnabled: (on: boolean) => void
   onModel: (fn: (rec: Omit<ModelEntry, 'id'>) => void) => void
@@ -96,10 +98,15 @@ export function ModelRow({
   const displayName = model.display_name || model.id
   const price = pricing?.effective ?? null
   const priceSource = pricing?.source ?? null
-  // GPT rows show upstream catalog facts; Claude thinking / max_tokens / 1M knobs do not apply.
+  // GPT rows show upstream catalog facts; Google rows show Gemini default thinking effort & slot scope.
   const claude = platform === 'anthropic'
-  const facts = claude ? null : catalogFacts(model)
-  const fast = claude || /-fast$/i.test(model.id) ? null : fastAliasState(model)
+  const openai = platform === 'openai'
+  const google = platform === 'google'
+  const facts = openai ? catalogFacts(model) : null
+  const fast =
+    !openai || /-fast$/i.test(model.id) ? null : fastAliasState(model)
+  const geminiDefaultEffort =
+    params.default_effort === 'off' ? '不补' : params.default_effort || 'medium'
 
   return (
     <Dialog
@@ -145,7 +152,7 @@ export function ModelRow({
                 </p>
                 <div className='mt-1.5 flex flex-wrap items-center gap-1.5'>
                   <span className='font-mono text-xs tabular-nums'>
-                    {claude ? fmtBaseRates(price) : fmtOpenaiRates(price)}
+                    {openai ? fmtOpenaiRates(price) : fmtBaseRates(price)}
                   </span>
                   <span className='text-[10px] text-muted-foreground'>
                     每 1M
@@ -159,6 +166,12 @@ export function ModelRow({
 
             {facts ? (
               <OpenaiCardMetrics facts={facts} />
+            ) : google ? (
+              <div className='grid gap-2 text-xs sm:grid-cols-3'>
+                <Metric label='上下文' value={win.text} strong />
+                <Metric label='缺省思考' value={geminiDefaultEffort} />
+                <Metric label='适用范围' value='Gemini 槽位' />
+              </div>
             ) : (
               <div className='grid gap-2 text-xs sm:grid-cols-3'>
                 <Metric
@@ -297,6 +310,14 @@ export function ModelRow({
                     />
                   </div>
                 </>
+              ) : google ? (
+                <div className='space-y-3'>
+                  <p className='text-xs leading-5 text-muted-foreground'>
+                    此模型仅用于 Google Gemini 系列模型与 Gemini
+                    系列槽位；关闭后将不再进入 Gemini 公开目录，也不会调度到
+                    Gemini 槽位。
+                  </p>
+                </div>
               ) : (
                 <div className='space-y-3'>
                   <p className='text-xs leading-5 text-muted-foreground'>
@@ -412,6 +433,32 @@ export function ModelRow({
                   </p>
                 )}
               </Panel>
+            ) : google ? (
+              <Panel title='思考等级参数' icon={<Gauge className='size-4' />}>
+                <EditorRow label='缺省思考等级'>
+                  <Select
+                    value={params.default_effort || 'medium'}
+                    onValueChange={(value) => onParam('default_effort', value)}
+                  >
+                    <SelectTrigger className='h-8 w-full sm:w-[220px]'>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value='off'>不补</SelectItem>
+                      <SelectItem value='minimal'>minimal</SelectItem>
+                      <SelectItem value='low'>low</SelectItem>
+                      <SelectItem value='medium'>medium（默认）</SelectItem>
+                      <SelectItem value='high'>high</SelectItem>
+                      <SelectItem value='xhigh'>xhigh</SelectItem>
+                      <SelectItem value='max'>max</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </EditorRow>
+                <p className='text-xs leading-5 text-muted-foreground'>
+                  Gemini 请求未携带思考等级（thinkingLevel / reasoning_effort /
+                  thinking 等）时自动使用此缺省值，默认一律为 medium。
+                </p>
+              </Panel>
             ) : null}
           </section>
 
@@ -483,6 +530,18 @@ export function ModelRow({
                     />
                   ) : null}
                 </>
+              ) : google ? (
+                <>
+                  <Fact label='来源' value={priceSourceLabel(priceSource)} />
+                  <Fact
+                    label='input / output / cache read'
+                    value={`${fmtBaseRates(price)} / 1M`}
+                    mono
+                  />
+                  {price ? (
+                    <Fact label='长上下文' value={tiersSummary(price)} />
+                  ) : null}
+                </>
               ) : (
                 <OpenaiPriceFacts price={price} source={priceSource} />
               )}
@@ -491,6 +550,15 @@ export function ModelRow({
             <Panel title='能力' icon={<Gauge className='size-4' />} compact>
               {facts ? (
                 <OpenaiCapabilityFacts facts={facts} live={live} />
+              ) : google ? (
+                <>
+                  <Fact label='上下文' value={win.text} />
+                  <Fact label='缺省思考等级' value={geminiDefaultEffort} />
+                  <Fact
+                    label='目录状态'
+                    value={live ? '对外可见' : '未进入目录'}
+                  />
+                </>
               ) : (
                 <>
                   <Fact

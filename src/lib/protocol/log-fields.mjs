@@ -97,6 +97,7 @@ export function resolveGeminiReasoningEffort({
   outboundBody = null,
   model = null,
   upstreamModel = null,
+  defaultEffort = null,
 } = {}) {
   const explicit = reasoningEffortOf(inbound)
   if (explicit) return explicit
@@ -125,7 +126,12 @@ export function resolveGeminiReasoningEffort({
       if (fromBudget) return fromBudget
     }
   }
-  return effortFromModelName(model) || effortFromModelName(upstreamModel) || null
+  const fromModel = effortFromModelName(model) || effortFromModelName(upstreamModel)
+  if (fromModel) return fromModel
+  if (defaultEffort && String(defaultEffort).trim().toLowerCase() !== 'off') {
+    return normalizeReasoningEffort(String(defaultEffort))
+  }
+  return null
 }
 
 const SESSION_ID_MAX = 200

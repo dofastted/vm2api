@@ -14,7 +14,8 @@ import {
   parseInboundToGemini,
   renderGeminiProtocolResponse,
 } from '../protocol/gemini-convert.mjs'
-import { resolveGeminiReasoningEffort, sessionIdForLog } from '../protocol/log-fields.mjs'
+import { resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
+import { reasoningEffortOf, resolveGeminiReasoningEffort, sessionIdForLog } from '../protocol/log-fields.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
 import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
@@ -1992,7 +1993,16 @@ export function createGeminiPublicHandler({
         : false,
     )
     logBag.attempt_count = 0
-    logBag.reasoning_effort = resolveGeminiReasoningEffort({ inbound: body, parsed, model: targetModel })
+    const defaultGeminiEffort = resolveGeminiDefaultEffort(targetModel)
+    const requestedEffort = parsed?.thinking?.disabled
+      ? null
+      : parsed?.thinking?.effort || reasoningEffortOf(body) || null
+    logBag.reasoning_effort = resolveGeminiReasoningEffort({
+      inbound: body,
+      parsed,
+      model: targetModel,
+      defaultEffort: defaultGeminiEffort,
+    })
     if (!logBag.session_id) logBag.session_id = sessionIdForLog(stickyHeader)
     logBag.outbound_session_id = sessionIdForLog(stickyHeader)
 
@@ -2057,6 +2067,7 @@ export function createGeminiPublicHandler({
         outboundBody: lastOutboundBody,
         model: targetModel,
         upstreamModel: turn?.dispatched_model || turn?.upstream_model || turn?.model || targetModel,
+        defaultEffort: defaultGeminiEffort,
       })
       logBag.usage = {
         input_tokens: usage.input_tokens || 0,
@@ -2124,6 +2135,7 @@ export function createGeminiPublicHandler({
           outboundBody: lastOutboundBody,
           model: targetModel,
           upstreamModel: error.upstreamModel || targetModel,
+          defaultEffort: defaultGeminiEffort,
         })
       }
     }
@@ -2265,6 +2277,7 @@ export function createGeminiPublicHandler({
       )
       const turn = await scheduler.stream({
         model: parsed.model,
+        requestedEffort,
         ...(activeLogCtx?.request_id ? { requestId: activeLogCtx.request_id } : {}),
         startedAt,
         targetBodyFor: (target, meta) => {

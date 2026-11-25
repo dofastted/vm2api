@@ -10,6 +10,7 @@ import {
   createSseFrameSplitter,
 } from '../protocol/gemini-convert.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
+import { isGeminiModelEnabled, isGeminiSeriesId, resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
 import { classifyAntigravityModel, indexAccountModelCatalog, resolveUpstreamModel } from './model-catalog.mjs'
 import { callGeminiHost, callGeminiHostStream } from './routes.mjs'
 import { DEFAULT_GEMINI_ROUTING, normalizeGeminiRouting } from './routing-config.mjs'
@@ -905,6 +906,7 @@ export function createGeminiScheduler({
         for (const rawId of account.models) {
           const hint = account.catalogIndex?.get(rawId) || null
           const classified = classifyAntigravityModel(rawId, hint?.provider, hint?.quota_group)
+          if (classified.provider === 'google' && !isGeminiModelEnabled(classified.public_id)) continue
           if (!publicModels.has(classified.public_id)) {
             publicModels.set(classified.public_id, {
               id: classified.public_id,
@@ -923,6 +925,7 @@ export function createGeminiScheduler({
 
     async stream({
       model,
+      requestedEffort = null,
       geminiBody,
       targetBodyFor = null,
       restoreContext = null,
@@ -984,12 +987,18 @@ export function createGeminiScheduler({
 
       try {
         signal?.throwIfAborted()
+        if (isGeminiSeriesId(model) && !isGeminiModelEnabled(model)) {
+          throw fail(404, 'gemini_model_unavailable', `Gemini model '${model}' is disabled by model policy.`)
+        }
+        const defaultEffort = isGeminiSeriesId(model) ? resolveGeminiDefaultEffort(model) : null
         const catalog = await this.catalog({ ownerScope, allowedEnvIds })
         const matchedAccounts = []
         for (const account of catalog.accounts) {
           const resolved = resolveUpstreamModel(model, account.models, {
             allowUnprefixedNonGemini: allowUnprefixed,
             catalogIndex: account.catalogIndex,
+            requestedEffort,
+            defaultEffort,
           })
           if (resolved) matchedAccounts.push({ account, resolved })
         }
@@ -999,6 +1008,8 @@ export function createGeminiScheduler({
               resolveUpstreamModel(model, account.models, {
                 allowUnprefixedNonGemini: allowUnprefixed,
                 catalogIndex: account.catalogIndex,
+                requestedEffort,
+                defaultEffort,
               }),
             ),
           )

@@ -43,10 +43,11 @@ type Draft = FieldDraft & {
   image: ImageDraft | null
 }
 
-/** Anthropic prices `fast`; OpenAI service tiers are flex / priority / ultrafast. */
-const PLATFORM_MODES: Record<'anthropic' | 'openai', ModeKey[]> = {
+/** Anthropic prices `fast`; OpenAI service tiers are flex / priority / ultrafast; Google uses base + long-context tiers. */
+const PLATFORM_MODES: Record<'anthropic' | 'openai' | 'google', ModeKey[]> = {
   anthropic: ['fast'],
   openai: ['flex', 'priority', 'ultrafast'],
+  google: [],
 }
 
 const MODE_LABEL: Record<ModeKey, string> = {
@@ -227,10 +228,11 @@ function FieldGrid({
 }: {
   value: FieldDraft
   onChange: (next: FieldDraft) => void
-  platform: 'anthropic' | 'openai'
+  platform: 'anthropic' | 'openai' | 'google'
   idPrefix: string
 }) {
   const openai = platform === 'openai'
+  const google = platform === 'google'
   function set(key: keyof FieldDraft, raw: string) {
     // OpenAI has one cache-write rate; keep both stored fields equal.
     if (openai && key === 'cache_5m') {
@@ -246,16 +248,25 @@ function FieldGrid({
         ['output', 'output', true],
         ['cache_5m', 'cache write', false],
       ] as const)
-    : ([
-        ['input', 'input', true],
-        ['output', 'output', true],
-        ['cache_read', 'cache read', true],
-        ['cache_5m', '5m write', false],
-        ['cache_1h', '1h write', false],
-      ] as const)
+    : google
+      ? ([
+          ['input', 'input', true],
+          ['output', 'output', true],
+          ['cache_read', 'cache read', true],
+        ] as const)
+      : ([
+          ['input', 'input', true],
+          ['output', 'output', true],
+          ['cache_read', 'cache read', true],
+          ['cache_5m', '5m write', false],
+          ['cache_1h', '1h write', false],
+        ] as const)
   return (
     <div
-      className={cn('grid gap-2', openai ? 'sm:grid-cols-4' : 'sm:grid-cols-5')}
+      className={cn(
+        'grid gap-2',
+        openai ? 'sm:grid-cols-4' : google ? 'sm:grid-cols-3' : 'sm:grid-cols-5'
+      )}
     >
       {fields.map(([key, label, required]) => (
         <div key={key} className='space-y-1'>
@@ -353,7 +364,9 @@ export function PriceOverrideDialog({
           <DialogDescription>
             {platform === 'openai'
               ? 'input / cached input / output 必填（USD / 1M），cache write 可空。'
-              : 'input / output / cache_read 必填（USD / 1M），cache_5m / cache_1h 可空，按平台补全。'}{' '}
+              : platform === 'google'
+                ? 'input / output / cache_read 必填（USD / 1M），可按需配置长上下文档位。'
+                : 'input / output / cache_read 必填（USD / 1M），cache_5m / cache_1h 可空，按平台补全。'}{' '}
             key {key}
           </DialogDescription>
         </DialogHeader>
@@ -460,57 +473,62 @@ export function PriceOverrideDialog({
             )}
           </section>
 
-          <section className='space-y-3'>
-            <h4 className='text-sm font-medium'>
-              {platform === 'openai'
-                ? '服务档位价（flex / priority / ultrafast）'
-                : '档位价（fast）'}
-            </h4>
-            {MODE_KEYS
-              // An existing price for the other platform's mode stays visible so it is not lost.
-              .filter(
-                (mode) =>
-                  PLATFORM_MODES[platform].includes(mode) || draft.modes[mode]
-              )
-              .map((mode) => {
-                const modeDraft = draft.modes[mode]
-                return (
-                  <div key={mode} className='space-y-2'>
-                    <label className='flex items-center gap-2 text-sm'>
-                      <Checkbox
-                        checked={Boolean(modeDraft)}
-                        onCheckedChange={(v) =>
-                          setDraft({
-                            ...draft,
-                            modes: {
-                              ...draft.modes,
-                              [mode]: v === true ? emptyFields() : null,
-                            },
-                          })
-                        }
-                      />
-                      {MODE_LABEL[mode]}
-                    </label>
-                    {modeDraft ? (
-                      <FieldGrid
-                        idPrefix={mode}
-                        platform={platform}
-                        value={modeDraft}
-                        onChange={(next) =>
-                          setDraft({
-                            ...draft,
-                            modes: {
-                              ...draft.modes,
-                              [mode]: { ...modeDraft, ...next },
-                            },
-                          })
-                        }
-                      />
-                    ) : null}
-                  </div>
+          {MODE_KEYS.some(
+            (mode) =>
+              PLATFORM_MODES[platform].includes(mode) || draft.modes[mode]
+          ) ? (
+            <section className='space-y-3'>
+              <h4 className='text-sm font-medium'>
+                {platform === 'openai'
+                  ? '服务档位价（flex / priority / ultrafast）'
+                  : '档位价（fast）'}
+              </h4>
+              {MODE_KEYS
+                // An existing price for the other platform's mode stays visible so it is not lost.
+                .filter(
+                  (mode) =>
+                    PLATFORM_MODES[platform].includes(mode) || draft.modes[mode]
                 )
-              })}
-          </section>
+                .map((mode) => {
+                  const modeDraft = draft.modes[mode]
+                  return (
+                    <div key={mode} className='space-y-2'>
+                      <label className='flex items-center gap-2 text-sm'>
+                        <Checkbox
+                          checked={Boolean(modeDraft)}
+                          onCheckedChange={(v) =>
+                            setDraft({
+                              ...draft,
+                              modes: {
+                                ...draft.modes,
+                                [mode]: v === true ? emptyFields() : null,
+                              },
+                            })
+                          }
+                        />
+                        {MODE_LABEL[mode]}
+                      </label>
+                      {modeDraft ? (
+                        <FieldGrid
+                          idPrefix={mode}
+                          platform={platform}
+                          value={modeDraft}
+                          onChange={(next) =>
+                            setDraft({
+                              ...draft,
+                              modes: {
+                                ...draft.modes,
+                                [mode]: { ...modeDraft, ...next },
+                              },
+                            })
+                          }
+                        />
+                      ) : null}
+                    </div>
+                  )
+                })}
+            </section>
+          ) : null}
 
           {draft.image ? (
             <section className='space-y-2'>

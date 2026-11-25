@@ -20,6 +20,7 @@ import {
   stripVendorBillingLines,
 } from '../gemini/prompt-normalizer.mjs'
 import { isClientStream } from './convert.mjs'
+import { isGeminiSeriesId, resolveGeminiDefaultEffort } from './gemini-model-policy.mjs'
 import { firstNonEmptyEffort, isEmptyEffortValue } from './log-fields.mjs'
 import { buildAnthropicSseError } from './stream-truncation.mjs'
 
@@ -2936,24 +2937,55 @@ function pairFunctionTurns(contents, { responseKey = 'output' } = {}) {
   return out
 }
 
-function buildThinkingConfig(ir, model) {
-  if (!ir.thinking) return null
+function modelSupportsGeminiDefaultThinking(model) {
+  if (!isGeminiSeriesId(model)) return false
+  const lower = String(model || '')
+    .trim()
+    .toLowerCase()
+  if (/(?:^|[-_/])(embedding|imagen|veo|aqa|tts)(?:$|[-_])/.test(lower)) return false
+  if (/gemini-1[.-]/.test(lower)) return false
+  if (/gemini-2\.0(?![0-9])/.test(lower) && !lower.includes('thinking')) return false
+  const gen = geminiGeneration(lower)
+  if (gen >= 3) return true
+  if (/gemini-2\.5/.test(lower) || lower.includes('thinking')) return true
+  return false
+}
+
+function mapGemini3ThinkingLevel(effort, model) {
+  if (effort === 'minimal') return /flash/i.test(model) ? 'minimal' : 'low'
+  if (effort === 'low') return 'low'
+  if (effort === 'medium') return 'medium'
+  return 'high'
+}
+
+function buildThinkingConfig(ir, model, { defaultEffort = null } = {}) {
   const gen = geminiGeneration(model)
-  if (ir.thinking.disabled) {
+  const explicit = ir.thinking
+  if (explicit?.disabled) {
     if (gen >= 3) return { thinkingLevel: 'low', includeThoughts: false }
     return { thinkingBudget: 0 }
   }
-  if (!ir.thinking.enabled && !ir.thinking.effort) return null
-  const tc = { includeThoughts: ir.thinking.includeThoughts !== false }
-  if (gen >= 3) {
-    const effort = ir.thinking.effort || 'medium'
-    if (effort === 'minimal') tc.thinkingLevel = /flash/i.test(model) ? 'minimal' : 'low'
-    else if (effort === 'low') tc.thinkingLevel = 'low'
-    else if (effort === 'medium') tc.thinkingLevel = /flash/i.test(model) || gen > 3 ? 'medium' : 'high'
-    else tc.thinkingLevel = 'high'
+  const hasExplicit = Boolean(explicit && (explicit.enabled || explicit.effort || explicit.budgetTokens != null))
+  const fallbackEffort = defaultEffort && defaultEffort !== 'off' ? normalizeEffort(defaultEffort) || 'medium' : null
+  if (!hasExplicit) {
+    if (!fallbackEffort || fallbackEffort === 'none' || !modelSupportsGeminiDefaultThinking(model)) {
+      return null
+    }
+    const tc = { includeThoughts: explicit ? explicit.includeThoughts !== false : true }
+    if (gen >= 3) {
+      tc.thinkingLevel = mapGemini3ThinkingLevel(fallbackEffort, model)
+      return tc
+    }
+    tc.thinkingBudget = budgetFromEffort(fallbackEffort)
     return tc
   }
-  const budget = ir.thinking.budgetTokens || budgetFromEffort(ir.thinking.effort || 'medium')
+  const tc = { includeThoughts: explicit.includeThoughts !== false }
+  const effort = explicit.effort || fallbackEffort || 'medium'
+  if (gen >= 3) {
+    tc.thinkingLevel = mapGemini3ThinkingLevel(effort, model)
+    return tc
+  }
+  const budget = explicit.budgetTokens || budgetFromEffort(effort)
   tc.thinkingBudget = budget
   return tc
 }
@@ -3026,7 +3058,7 @@ function ensureGeminiContentsValid(contents, { antigravity = false } = {}) {
  * Build a canonical Google Gemini `generateContent` request body from IR.
  * `target`: `'gemini'` (Google Gemini API) or `'antigravity'` (Antigravity / Code Assist).
  */
-export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } = {}) {
+export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model, defaultEffort } = {}) {
   const ag = target === 'antigravity'
   const claude = /claude/i.test(model)
   const callNames = new Map()
@@ -3277,7 +3309,8 @@ export function buildGeminiRequest(ir, { target = 'gemini', model = ir.model } =
   }
 
   const gen = { ...ir.extraGenConfig, ...ir.generationConfig }
-  const tc = buildThinkingConfig(ir, model)
+  const effectiveDefaultEffort = defaultEffort !== undefined ? defaultEffort : resolveGeminiDefaultEffort(model)
+  const tc = buildThinkingConfig(ir, model, { defaultEffort: effectiveDefaultEffort })
   if (tc) gen.thinkingConfig = tc
   if (ir.responseFormat) {
     if (ir.responseFormat.type === 'enum' && Array.isArray(ir.responseFormat.values)) {
