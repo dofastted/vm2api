@@ -61,7 +61,15 @@ export function isUsageProbeTarget(vm) {
   if (!vm?.id) return false
   if (!hasRefreshPresence(vm.claude) && !vm.has_refresh && !vm.has_token) return false
   const grantErr = String(vm.claude?.refresh_error || vm.refresh_error || '')
-  if (/invalid_grant|refresh token not found/i.test(grantErr)) return false
+  // Skip probing revoked grants: the usage call would just 401 upstream on a dead token.
+  if (
+    /invalid_grant|refresh token not found|oauth_revoked|token_revoked|invalidated oauth token/i.test(grantErr)
+  )
+    return false
+  // A parked org-disabled slot never recovers on its own (operator-only): stop
+  // probing it — each hop would just burn an upstream 403 on a dead token and
+  // rewrite unschedulable.at, losing the real park timestamp.
+  if (vm.unschedulable?.reason === 'organization_disabled') return false
   const status = String(vm.status || '').toLowerCase()
   if (HARD_DOWN.has(status)) return false
   if (!vmHasProxyPath(vm)) return false

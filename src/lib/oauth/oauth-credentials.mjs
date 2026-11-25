@@ -691,7 +691,7 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operat
   if (!vmPath || !fs.existsSync(vmPath)) return null
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   const prev = vm.claude || {}
-  const prevRevoked = /oauth_revoked|token has been revoked/i.test(
+  const prevRevoked = /oauth_revoked|token has been revoked|token_revoked|invalidated oauth token/i.test(
     String(prev.refresh_error || prev.temp_unschedulable_reason || vm.schedule_disabled_reason || ''),
   )
   const prevExp = expiresAtToMs(prev.expires_at)
@@ -811,7 +811,11 @@ export function clearVmQuotaRestriction(vmPath) {
 function isRecoverableCooldownReason(reason) {
   const text = String(reason || '')
   if (!text) return true
-  if (/oauth_revoked|oauth_invalid_grant|invalid_grant|token has been revoked|credential_refresh_failed/i.test(text)) {
+  if (
+    /oauth_revoked|oauth_invalid_grant|invalid_grant|token has been revoked|token_revoked|invalidated oauth token|credential_refresh_failed/i.test(
+      text,
+    )
+  ) {
     return false
   }
   return true
@@ -863,7 +867,7 @@ export function healLeftoverAuthState(vmPath) {
     vm.schedule_disabled_reason || vm.claude.refresh_error || vm.claude.temp_unschedulable_reason || '',
   )
   if (isQuotaParkReason(vm.claude.temp_unschedulable_reason || vm.temp_unschedulable_reason)) return vm
-  if (/oauth_revoked|oauth_invalid_grant|token has been revoked/i.test(reason)) return vm
+  if (/oauth_revoked|oauth_invalid_grant|token has been revoked|token_revoked|invalidated oauth token/i.test(reason)) return vm
   const had =
     vm.claude.temp_unschedulable_until || vm.claude.temp_unschedulable_reason || vm.claude.oauth_401_generation
   if (!had) return vm
@@ -909,7 +913,7 @@ export function classifyCredentialRefresh(result) {
   const status = Number(result?.status) || 0
   const blob = `${code} ${message}`.toLowerCase()
   if (
-    /invalid_grant|invalid_refresh_token|refresh_token_missing|refresh token not found|token has been revoked|oauth_revoked|oauth_no_refresh/.test(
+    /invalid_grant|invalid_refresh_token|refresh_token_missing|refresh token not found|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|oauth_no_refresh/.test(
       blob,
     )
   ) {
@@ -935,7 +939,9 @@ export function refreshErrorCodeOf(result) {
   if (/invalid_grant/i.test(blob)) return 'invalid_grant'
   if (/invalid_refresh_token/i.test(blob)) return 'invalid_refresh_token'
   if (/refresh_token_missing|refresh token not found/i.test(blob)) return 'refresh_token_missing'
-  if (/token has been revoked|oauth_revoked/i.test(blob)) return 'oauth_revoked'
+  // Normalize OpenAI's revocation wording ("token_revoked" / "invalidated oauth token")
+  // onto the shared oauth_revoked code so every downstream reader keeps working.
+  if (/token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i.test(blob)) return 'oauth_revoked'
   return code || 'credential_refresh_failed'
 }
 

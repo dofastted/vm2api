@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-- **CRAG v2 槽位会话仍被 9p 写回卡死（#1741 的后续）**：#1741 把 `/run/kin/work` 挪到了来宾 tmpfs，但 CRAG 以 `/run/kin/work` 为工作目录、带 `--resume` 启动官方 CLI，每个请求还会在 `~/.claude/projects/-run-kin-work/` 写一份续跑 transcript，并在整个回合里不断追加、`stat`。`~` 是 kinhome 9p 共享，同一个写回等待照样会卡：已装 #1741 的 KVM 槽再次出现 `[claude] <defunct>`、线程停在 `folio_wait_bit_common`，CRAG 一直占着会话位。现在 `kin-crag-apparmor` 再装一个受管 drop-in `46-vm2api-crag-transcripts.conf`，每次内核启动前把 `~/.claude/projects` 挂成来宾 tmpfs（512m，属主 kincli），挂载失败照旧用 9p，不挡内核启动；`~/.claude` 已存在就不碰（凭据在里面），缺了才以 kincli 创建；拒绝符号链接；离开 CRAG v2 时撤掉，管理员自己的同名文件不动。这些 transcript 只服务写它的那个请求（CRAG ≥ 3.1.20 会回收残留，#1726），来宾重启即清空。
+## 1.4.217 — 2026-11-25 · Codex `token_revoked` 自动摘牌；探活组织禁用直挂四态；主动查询静置窗边界修复；无凭证运行槽与额度条交互校准
+
+- **Codex 槽位 OpenAI `token_revoked` 凭证吊销与 Claude 同口径自动摘牌**：将 OpenAI 401 吊销文案（`token_revoked` / `invalidated oauth token`）统一纳入错误分类（`classifyOAuth401` / `GRANT_DEAD`）、`FailoverRunner` 刷新恢复、`credential-refresh-monitor`、`oauth-credentials`（`refreshErrorCodeOf` 写盘归一为 `oauth_revoked`）、调度资格门、transport 致命判定、`usage-probe-monitor`（跳过死凭证探活）、`panel-api` 遗留清理与前端 `web/src/lib/vm-status.ts` 状态模型，避免死号持续占座雪崩；中流（`terminalState: incomplete`）吊销维持 `oauth_unconfirmed` 保守语义，历史 `refresh_error: "token_revoked"` 旧值同步判死（#1814）。
+- **官方 `/usage` 探活识别组织禁用并直接挂起槽位**：`src/lib/pool/upstream-error-policy.mjs` 导出共享检测器 `isOrganizationDisabledText` 与 `isOrganizationDisabledUsageResult`（覆盖 `400`/`401`/`403` 及对象/字符串形态）；`panel-api.mjs` 探活在裸 401 致命分支之前识别组织禁用并直接 `markUnschedulable('organization_disabled')`（重读 `vm.json` 同步刷新可用性），仅操作员手动恢复；`account-quota.mjs` 不再对组织禁用打 `rate_limited` 退避并保留原始错误文案；`usage-probe-monitor.mjs` 跳过已挂起的 `organization_disabled` 槽位避免持续消耗 403 并覆写挂起时间（#1822）。
+- **主动用量查询保留近期无 Header 推理的静置保护**：`src/lib/pool/account-quota.mjs` 的 `5h`/`7d` 与 `7d_oi` 主动对账路径改用 `maxTimestamp(existingSampleMs, latestActivityAtMs)`，避免近期仅更新 `last_used_at` 而未带新额度 Header 的推理被普通主动查询绕过 5 分钟静置窗，显式 `force_reconcile` 行为保持不变（#1836，关联 #1776、#1820）。
+- **前端无凭证运行槽状态与额度条展示校准**：`web/src/lib/vm-status.ts` 的 `vmRunning()` 仅按实际运行态判定（`running`/`ok`/`active`，缺省 `status` 时才结合 `has_token` 兜底），修复无凭证但仍在运行的槽位在面板误显为「停止」且无法关机/改编号的死锁（#1824）；`web/src/features/vm/vm-list-table.tsx` 移除额度进度条内易被误读为用量游标的竖直时间刻线，保留悬停 `title` 时间进度提示（#1810）。
+- 部署说明：本次改动仅涉及控制面（`src/`）与前端（`web/src/`）；`deploy/payload.json`（CRAG `3.1.20` 与 CRAGGemini `0.4.11`）、Gemini 宿主脚本、数据库迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.216` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位（若从 `1.4.215` 直接跨版升级至 `1.4.217`，需一并按 `1.4.216` 说明同步 Gemini 宿主脚本并切换 CRAGGemini `0.4.11` 载荷）。
 
 ## 1.4.216 — 2026-11-25 · 钉选 CRAGGemini 0.4.11 与 1-hop 直连数据面；设置页全量巡检校准；CPA/sub2api 导入、主动用量对账、CRAG 冲突重建与槽位邮箱脱敏统一
 

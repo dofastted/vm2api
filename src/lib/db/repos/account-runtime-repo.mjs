@@ -283,7 +283,7 @@ export class AccountRuntimeRepo {
   static AUTH_COOLDOWN = /authentication_failed_after_refresh|permission_denied/i
   /** Grant-death leftover. A later live ticket must drop this or the panel stays revoke. */
   static GRANT_REVOKE_COOLDOWN =
-    /oauth_revoked|oauth_invalid_grant|invalid_grant|token has been revoked|oauth_no_refresh/i
+    /oauth_revoked|oauth_invalid_grant|invalid_grant|token has been revoked|token_revoked|invalidated oauth token|oauth_no_refresh/i
 
   isAuthCooldown(state) {
     return AccountRuntimeRepo.AUTH_COOLDOWN.test(String(state?.cooldown_reason || ''))
