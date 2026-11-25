@@ -61,6 +61,7 @@ CLI_SETTINGS = {"toolPermission": "strict", "useG1Credits": False}
 NATIVE_CLI_SETTINGS = {
     "allowNonWorkspaceAccess": True,
     "useG1Credits": False,
+    "verbosity": "high",
     "permissions": {
         "allow": [
             "read_file(/work/.craggemini-media)",
@@ -124,9 +125,120 @@ LICENSE_ERROR_CODES = frozenset(
         "license_not_yet_valid",
         "license_invalid",
         "license_binding_mismatch",
+        "license_payload_key_mismatch",
         "license_unconfigured",
+        "gemini_subscription_sync_pending",
     }
 )
+
+
+def extract_permit_payload_key_id(code):
+    if not isinstance(code, str):
+        return None
+    text = code.strip()
+    if not text or len(text) > 65536:
+        return None
+    parts = text.split(".")
+    if len(parts) != 3 or parts[0] not in ("CRAGS1", "CRAGL1"):
+        return None
+    segment = parts[1]
+    if not segment:
+        return None
+    try:
+        padded = segment + "=" * (-len(segment) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        claims = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(claims, dict):
+        return None
+    key_id = claims.get("payload_key_id")
+    if isinstance(key_id, str) and SHA256.fullmatch(key_id):
+        return key_id
+    return None
+
+
+def classify_craggemini_license_cli_error(stdout, stderr, *, sync_pending=False):
+    if isinstance(stdout, str) and stdout.strip():
+        try:
+            parsed = json.loads(stdout)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            code = parsed.get("code")
+            if isinstance(code, str) and code in LICENSE_ERROR_CODES:
+                if code == "license_invalid" and sync_pending:
+                    return 503, "gemini_subscription_sync_pending"
+                return (503 if code == "gemini_subscription_sync_pending" else 403), code
+    text = (stderr or "").lower()
+    if "payload key" in text or "unlock the selected encrypted package" in text:
+        return 403, "license_payload_key_mismatch"
+    if (
+        "different instance" in text
+        or "different vm" in text
+        or "different seat" in text
+        or "different host" in text
+        or "binding" in text
+    ):
+        return 403, "license_binding_mismatch"
+    if "expired" in text:
+        return 403, "license_expired"
+    if "not valid yet" in text:
+        return 403, "license_not_yet_valid"
+    if "unconfigured" in text:
+        return 403, "license_unconfigured"
+    if (
+        "registration code is required" in text
+        or "permit or registration code is required" in text
+    ):
+        return 403, "license_required"
+    if sync_pending:
+        return 503, "gemini_subscription_sync_pending"
+    return 403, "license_invalid"
+
+
+def reconcile_craggemini_license_status(
+    status,
+    *,
+    expected_payload_key_id=None,
+    permit_payload_key_id=None,
+    sync_pending=False,
+):
+    if not isinstance(status, dict):
+        return status
+    if (
+        status.get("valid") is not True
+        and status.get("code") == "license_invalid"
+        and sync_pending
+    ):
+        return {
+            **status,
+            "status": "sync_pending",
+            "valid": False,
+            "code": "gemini_subscription_sync_pending",
+            "sync_pending": True,
+            "message": "CRAGGemini host subscription sync is pending.",
+        }
+    if (
+        status.get("valid") is True
+        and isinstance(expected_payload_key_id, str)
+        and SHA256.fullmatch(expected_payload_key_id)
+    ):
+        actual_key_id = status.get("payload_key_id") or permit_payload_key_id
+        if (
+            isinstance(actual_key_id, str)
+            and SHA256.fullmatch(actual_key_id)
+            and actual_key_id != expected_payload_key_id
+        ):
+            return {
+                **status,
+                "status": "invalid",
+                "valid": False,
+                "code": "license_payload_key_mismatch",
+                "payload_key_id": actual_key_id,
+                "message": "The CRAGGemini license payload key does not match the installed package.",
+            }
+    return status
 AGY_SHA256 = "39816d49d5ab92229952987225c23ea3fed7580699dcb4a444e0388e0ac1ce43"
 INFERENCE_MODULE = ROOT / "scripts/gemini_host_inference.py"
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
@@ -5551,7 +5663,12 @@ class Host:
                 env=SYSTEM_ENV,
             )
             if result.returncode != 0:
-                raise Failure(403, "license_invalid")
+                status_code, error_code = classify_craggemini_license_cli_error(
+                    result.stdout,
+                    result.stderr,
+                    sync_pending=self._crag_host_sync_pending(),
+                )
+                raise Failure(status_code, error_code)
             data = json.loads(result.stdout)
             if not isinstance(data, dict):
                 raise Failure(503, "license_invalid")
@@ -5564,6 +5681,47 @@ class Host:
             if staging_dir is not None:
                 shutil.rmtree(staging_dir, ignore_errors=True)
 
+    def _crag_host_sync_pending(self):
+        if self.crag_host_dir is None:
+            return False
+        try:
+            marker = self.crag_host_dir / "sync-pending"
+            return marker.exists() or marker.is_symlink()
+        except OSError:
+            return False
+
+    def _expected_payload_key_id(self):
+        manifest_path = self.payload / "manifest.json"
+        try:
+            fd = os.open(manifest_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                    return None
+                data = json.loads(stream.read(65537).decode("utf-8", errors="strict"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        payload = data.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        key_id = payload.get("key_id")
+        return key_id if isinstance(key_id, str) and SHA256.fullmatch(key_id) else None
+
+    def _read_env_permit_payload_key_id(self, env):
+        reg_file = self.directory / env["id"] / "crag-license" / "registration.code"
+        try:
+            fd = os.open(reg_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                    return None
+                text = stream.read(65537).decode("utf-8", errors="strict")
+        except (OSError, UnicodeDecodeError):
+            return None
+        return extract_permit_payload_key_id(text)
+
     def license_status(self, env):
         if env.get("auth_method", "oauth") == "api_key":
             return {
@@ -5575,6 +5733,20 @@ class Host:
             }
         try:
             status = self.run_craggemini_license_cli(env, ["--license-status"])
+            status = reconcile_craggemini_license_status(
+                status,
+                expected_payload_key_id=(
+                    self._expected_payload_key_id()
+                    if self.payload_mode == "crag_subscription"
+                    else None
+                ),
+                permit_payload_key_id=(
+                    None
+                    if status.get("payload_key_id")
+                    else self._read_env_permit_payload_key_id(env)
+                ),
+                sync_pending=self._crag_host_sync_pending(),
+            )
             status.setdefault("product", "craggemini")
             status["seat_required"] = True
             return status
@@ -5582,9 +5754,20 @@ class Host:
             code = error.code if error.code in LICENSE_ERROR_CODES else "license_unconfigured"
             return {
                 "product": "craggemini",
-                "status": "unlicensed" if code == "license_required" else "unconfigured",
+                "status": (
+                    "unlicensed"
+                    if code == "license_required"
+                    else "sync_pending"
+                    if code == "gemini_subscription_sync_pending"
+                    else "unconfigured"
+                ),
                 "valid": False,
                 "seat_required": True,
+                **(
+                    {"sync_pending": True}
+                    if code == "gemini_subscription_sync_pending"
+                    else {}
+                ),
                 "vm_id": env["id"],
                 "code": code,
             }
@@ -6457,6 +6640,36 @@ class Host:
                 and 1 <= cand_count <= 8
             ):
                 cleaned_gen["candidateCount"] = cand_count
+            raw_tc = raw_gen.get("thinkingConfig")
+            if raw_tc is None:
+                raw_tc = raw_gen.get("thinking_config")
+            if isinstance(raw_tc, dict):
+                clean_tc = {}
+                inc = raw_tc.get("includeThoughts")
+                if inc is None:
+                    inc = raw_tc.get("include_thoughts")
+                if isinstance(inc, bool):
+                    clean_tc["includeThoughts"] = inc
+                lvl = raw_tc.get("thinkingLevel")
+                if lvl is None:
+                    lvl = raw_tc.get("thinking_level")
+                if isinstance(lvl, str) and lvl.strip().lower() in (
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "extra_high",
+                    "none",
+                ):
+                    clean_tc["thinkingLevel"] = lvl.strip().lower()
+                budget = raw_tc.get("thinkingBudget")
+                if budget is None:
+                    budget = raw_tc.get("thinking_budget")
+                if isinstance(budget, int) and not isinstance(budget, bool) and -1 <= budget <= 131072:
+                    clean_tc["thinkingBudget"] = budget
+                if clean_tc:
+                    cleaned_gen["thinkingConfig"] = clean_tc
             if cleaned_gen:
                 forwarded["generationConfig"] = cleaned_gen
 

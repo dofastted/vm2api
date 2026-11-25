@@ -15,7 +15,11 @@ import {
   parseInboundToGemini,
   renderGeminiProtocolResponse,
 } from '../protocol/gemini-convert.mjs'
-import { isGeminiSeriesId, resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
+import {
+  extractImpliedModelEffort,
+  isGeminiSeriesId,
+  resolveGeminiDefaultEffort,
+} from '../protocol/gemini-model-policy.mjs'
 import { reasoningEffortOf, resolveGeminiReasoningEffort, sessionIdForLog } from '../protocol/log-fields.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
@@ -101,7 +105,9 @@ const RUN_ERRORS = {
   license_not_yet_valid: [403, GEMINI_LICENSE_MESSAGES.license_not_yet_valid],
   license_invalid: [403, GEMINI_LICENSE_MESSAGES.license_invalid],
   license_binding_mismatch: [403, GEMINI_LICENSE_MESSAGES.license_binding_mismatch],
+  license_payload_key_mismatch: [403, GEMINI_LICENSE_MESSAGES.license_payload_key_mismatch],
   license_unconfigured: [403, GEMINI_LICENSE_MESSAGES.license_unconfigured],
+  gemini_subscription_sync_pending: [503, GEMINI_LICENSE_MESSAGES.gemini_subscription_sync_pending],
 }
 const INFERENCE_STATES = new Set([...RUN_STATES, 'cancelled'])
 const INFERENCE_ERROR_CODES = new Set([
@@ -229,7 +235,7 @@ export function parseGeminiGeneratePath(pathname) {
   let model = match[2]
   try {
     model = decodeURIComponent(match[2])
-  } catch { }
+  } catch {}
   return {
     version: match[1],
     model,
@@ -244,7 +250,7 @@ export function parseGeminiModelGetPath(pathname) {
   let model = match[2]
   try {
     model = decodeURIComponent(match[2])
-  } catch { }
+  } catch {}
   return { version: match[1], model }
 }
 
@@ -354,8 +360,8 @@ function hostRequest(socketPath, operation, payload) {
           if (response.statusCode !== 200 && typeof data?.code === 'string' && Object.hasOwn(HOST_ERRORS, data.code)) {
             const stage =
               data.code === 'gemini_authorization_unavailable' &&
-                typeof data.stage === 'string' &&
-                Object.hasOwn(AUTH_STAGE_MESSAGES, data.stage)
+              typeof data.stage === 'string' &&
+              Object.hasOwn(AUTH_STAGE_MESSAGES, data.stage)
                 ? data.stage
                 : null
             throw hostError(data.code, response.statusCode, stage ? { stage } : null)
@@ -465,8 +471,8 @@ function accountView(account) {
   const validationUrl = safeGoogleValidationUrl(account?.validation_url)
   const modelCatalog = items(account.model_catalog, 128, (entry) =>
     modelName(entry?.id) &&
-      ANTIGRAVITY_PROVIDERS.has(entry?.provider) &&
-      ANTIGRAVITY_QUOTA_GROUPS.has(entry?.quota_group)
+    ANTIGRAVITY_PROVIDERS.has(entry?.provider) &&
+    ANTIGRAVITY_QUOTA_GROUPS.has(entry?.quota_group)
       ? { id: entry.id, provider: entry.provider, quota_group: entry.quota_group }
       : null,
   )
@@ -550,6 +556,8 @@ function cragLicenseView(value) {
     ...(text(value.scope, 32) ? { scope: text(value.scope, 32) } : {}),
     ...(Number.isSafeInteger(value.seat) && value.seat > 0 ? { seat: value.seat } : {}),
     ...(text(value.license_id, 128) ? { license_id: text(value.license_id, 128) } : {}),
+    ...(text(value.payload_key_id, 64) ? { payload_key_id: text(value.payload_key_id, 64) } : {}),
+    ...(typeof value.sync_pending === 'boolean' ? { sync_pending: value.sync_pending } : {}),
     ...(Number.isSafeInteger(value.issued_at) ? { issued_at: value.issued_at } : {}),
     ...(Number.isSafeInteger(value.not_before) ? { not_before: value.not_before } : {}),
     ...(Number.isSafeInteger(value.expires_at) ? { expires_at: value.expires_at } : {}),
@@ -700,10 +708,10 @@ function environmentView(
     ...(value.models_discovered === true && { models_discovered: true }),
     ...(Array.isArray(value.capabilities)
       ? {
-        capabilities: items(value.capabilities, 32, (c) =>
-          typeof c === 'string' && /^[a-z0-9_]{1,40}$/.test(c) ? c : null,
-        ),
-      }
+          capabilities: items(value.capabilities, 32, (c) =>
+            typeof c === 'string' && /^[a-z0-9_]{1,40}$/.test(c) ? c : null,
+          ),
+        }
       : {}),
     account: accountView(value.account),
     ...(Object.hasOwn(value, 'last_inference') && {
@@ -1014,7 +1022,18 @@ export function createGeminiPanelHandler({
       }
       if (req.method === 'GET' && pathname === `${PANEL_PATH}/crag-subscription`) {
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
-        return ok(await cragSubscription.status())
+        const reqUrl = new URL(req.url || pathname, 'http://127.0.0.1')
+        const syncParam = reqUrl.searchParams.get('sync')
+        const sync = syncParam === '1' || syncParam === 'true'
+        return ok(await cragSubscription.status({ sync }))
+      }
+      if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/sync`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        if (cragSubscription.hasSyncPending?.()) {
+          const recovered = await cragSubscription.recover()
+          return ok(recovered?.status || (await cragSubscription.status()))
+        }
+        return ok(await cragSubscription.status({ sync: true }))
       }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/redeem`) {
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
@@ -1026,6 +1045,9 @@ export function createGeminiPanelHandler({
         return ok(await cragSubscription.upgrade())
       }
       if (req.method === 'GET' && pathname === PANEL_PATH) {
+        if (cragSubscription?.hasSyncPending?.()) {
+          await cragSubscription.recover().catch(() => null)
+        }
         let view = await callHost('list', {})
         if (!Array.isArray(view?.environments)) throw hostError(PROTOCOL_ERROR)
         if (cragSubscription?.reconcileEnvironmentSeats && view.payload_mode === 'crag_subscription') {
@@ -1234,10 +1256,10 @@ export function createGeminiPanelHandler({
         let usageStats = null
         try {
           byModel = requestLog.costByModel?.({ vmId, accountId: id }) || []
-        } catch { }
+        } catch {}
         try {
           usageStats = requestLog.vmUsageStats?.({ vmId, days: 30 }) || null
-        } catch { }
+        } catch {}
         return ok({
           billing: {
             by_model: byModel,
@@ -1430,8 +1452,8 @@ export function createGeminiPanelHandler({
         const [status, message] = HOST_ERRORS[error.code]
         const stage =
           error.code === 'gemini_authorization_unavailable' &&
-            typeof error.stage === 'string' &&
-            Object.hasOwn(AUTH_STAGE_MESSAGES, error.stage)
+          typeof error.stage === 'string' &&
+          Object.hasOwn(AUTH_STAGE_MESSAGES, error.stage)
             ? error.stage
             : null
         return fail(status, error.code, stage ? AUTH_STAGE_MESSAGES[stage] : message, stage ? { stage } : null)
@@ -1753,7 +1775,7 @@ function extractGeminiSessionId(req, body, sessionPathId = '') {
         if (typeof parsedUid?.session_id === 'string' && parsedUid.session_id.trim()) {
           return parsedUid.session_id.trim()
         }
-      } catch { }
+      } catch {}
     }
     const match = /_session_([A-Za-z0-9._-]+)$/.exec(rawUser)
     return match ? match[1] : rawUser
@@ -1906,7 +1928,7 @@ export function createGeminiPublicHandler({
           rate_multiplier: groupsRepo?.rateMultiplier?.(groupId) ?? 1,
           ...logBag,
         })
-      } catch { }
+      } catch {}
     }
     const hasFinishHook = typeof res?.once === 'function'
     if (ownLogCtx && hasFinishHook) {
@@ -1989,16 +2011,19 @@ export function createGeminiPublicHandler({
     logBag.has_tools = Boolean(
       supportsStream
         ? parsed?.tools?.length > 0 ||
-        parsed?.webSearch ||
-        parsed?.googleTools?.length > 0 ||
-        parsed?.requiredCapabilities?.includes('tools')
+            parsed?.webSearch ||
+            parsed?.googleTools?.length > 0 ||
+            parsed?.requiredCapabilities?.includes('tools')
         : false,
     )
     logBag.attempt_count = 0
     const defaultGeminiEffort = resolveGeminiDefaultEffort(targetModel)
+    const impliedModelEffort = extractImpliedModelEffort(targetModel)
     const requestedEffort = parsed?.thinking?.disabled
       ? null
-      : parsed?.thinking?.effort || reasoningEffortOf(body) || null
+      : parsed?.thinking?.effort ||
+        reasoningEffortOf(body) ||
+        (impliedModelEffort && impliedModelEffort !== 'none' ? impliedModelEffort : null)
     logBag.reasoning_effort = resolveGeminiReasoningEffort({
       inbound: body,
       parsed,
@@ -2320,13 +2345,19 @@ export function createGeminiPublicHandler({
         targetBodyFor: (target, meta) => {
           const irForTarget = {
             ...parsed,
+            requestedModel: targetModel,
             ...(meta?.upstreamModel ? { model: meta.upstreamModel } : {}),
             // On CRAGGemini (`antigravity`), always apply the scheduler's account-scoped
             // outbound conversation_id so switching accounts never reuses the prior account's
             // or raw caller's conversation_id.
             ...(target === 'antigravity' && meta?.conversationId ? { conversationId: meta.conversationId } : {}),
           }
-          const reqBody = buildGeminiRequest(irForTarget, { target })
+          const reqBody = buildGeminiRequest(irForTarget, {
+            target,
+            defaultEffort: defaultGeminiEffort,
+            includeThinkingConfig:
+              target === 'antigravity' && Boolean(requestedEffort || parsed?.thinking || parsed?.hideThinking),
+          })
           const normalized = normalizeGeminiOutboundPrompt(reqBody, {
             target,
             policy: promptPolicy,
@@ -2360,10 +2391,10 @@ export function createGeminiPublicHandler({
         ...geminiScope,
         onEvent: wantStream
           ? (event) => {
-            if (event?.kind === 'error') return headersSent
-            writeChunk(encoder.push(event))
-            return headersSent
-          }
+              if (event?.kind === 'error') return headersSent
+              writeChunk(encoder.push(event))
+              return headersSent
+            }
           : null,
       })
       if (controller.signal.aborted) {
@@ -2411,7 +2442,7 @@ export function createGeminiPublicHandler({
             formatGeminiProtocolStreamError(protocol, mapped.status, mapped.body.error.code, mapped.body.error.message),
           )
           res.end()
-        } catch { }
+        } catch {}
         if (ownLogCtx && !hasFinishHook) finishOwnLog(200)
         return
       }

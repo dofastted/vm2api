@@ -2246,6 +2246,29 @@ server.listen(cfg.port, cfg.host, () => {
       void cragSubscription.recover().catch(() => {
         console.warn('[crag-subscription] startup recovery failed; use the administrator panel to retry')
       })
+      void geminiCragSubscription.recover().catch(() => {
+        console.warn('[crag-gemini-subscription] startup recovery failed; will retry in background')
+      })
+      let maintainingGeminiSub = false
+      const maintainGeminiSub = () => {
+        if (maintainingGeminiSub) return
+        maintainingGeminiSub = true
+        void (async () => {
+          if (geminiCragSubscription.hasSyncPending?.()) {
+            await geminiCragSubscription.recover().catch(() => {
+              console.warn('[crag-gemini-subscription] background sync-pending recovery deferred')
+            })
+          }
+          await geminiCragSubscription.refreshExpiredEntitlement?.().catch(() => {
+            console.warn('[crag-gemini-subscription] expired quota refresh deferred')
+          })
+        })().finally(() => {
+          maintainingGeminiSub = false
+        })
+      }
+      const geminiSubTimer = setInterval(maintainGeminiSub, 15_000).unref()
+      onLeaderStop(() => clearInterval(geminiSubTimer))
+      maintainGeminiSub()
       const refresh = () =>
         void cragSubscription.refreshExpiredEntitlement().catch(() => {
           console.warn('[crag-subscription] expired quota refresh deferred')

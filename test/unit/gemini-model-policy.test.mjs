@@ -368,3 +368,35 @@ test('syncGeminiCatalog merges Google models from live Gemini slots and models.d
     setGeminiModelPolicyTestHooks(null)
   }
 })
+
+test('gemini-4-carbon-high and parenthesized effort resolve cleanly across tiered and untiered catalogs', () => {
+  const settings = makeMemorySettings()
+  setGeminiModelPolicyTestHooks({ settings })
+  try {
+    const seeded = seedGeminiPolicy()
+    assert.ok(seeded.models['gemini-4-carbon'], 'gemini-4-carbon must exist in seedGeminiPolicy')
+    assert.equal(seeded.models['gemini-4-carbon'].params.default_effort, 'medium')
+    assert.equal(resolveGeminiDefaultEffort('gemini-4-carbon-high'), 'medium')
+
+    // 1. Account exposes tiered carbon slugs
+    const tieredCarbon = ['gemini-4-carbon-low', 'gemini-4-carbon-medium', 'gemini-4-carbon-high']
+    const exactHigh = resolveUpstreamModel('gemini-4-carbon-high', tieredCarbon)
+    assert.equal(exactHigh?.upstreamModel, 'gemini-4-carbon-high')
+    assert.equal(exactHigh?.publicId, 'gemini-4-carbon-high')
+
+    const parenHigh = resolveUpstreamModel('gemini-4-carbon(high)', tieredCarbon)
+    assert.equal(parenHigh?.upstreamModel, 'gemini-4-carbon-high')
+
+    // xhigh/max clamps to high when carbon only exposes low/medium/high
+    const clampedHigh = resolveUpstreamModel('gemini-4-carbon-xhigh', tieredCarbon)
+    assert.equal(clampedHigh?.upstreamModel, 'gemini-4-carbon-high')
+
+    // 2. Account only exposes untiered base `gemini-4-carbon` -> `gemini-4-carbon-high` still resolves!
+    const untieredCarbon = ['gemini-4-carbon']
+    const fallbackBase = resolveUpstreamModel('gemini-4-carbon-high', untieredCarbon)
+    assert.equal(fallbackBase?.upstreamModel, 'gemini-4-carbon')
+    assert.equal(fallbackBase?.publicId, 'gemini-4-carbon-high')
+  } finally {
+    setGeminiModelPolicyTestHooks(null)
+  }
+})
