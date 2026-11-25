@@ -624,7 +624,9 @@ with tempfile.TemporaryDirectory(prefix="gemini-p2-shard-") as p2_tmp:
     assert not (staged_a / "registration.code").exists()
     assert (staged_b / "registration.code").read_text(encoding="utf-8") == "CRAGS1.seat-b"
 
-    # /infer-target returns direct=True with Unix socket target for warm sharded account.
+    # /infer-target returns direct=True with Unix socket target for warm per-account pool
+    # under crag_subscription (sharded daemon is disabled because each environment has its
+    # own /etc/machine-id bound to device.json), and direct=True kind=shard under non-subscription.
     sock_file = p2_root / "kernel.sock"
     direct_srv = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
     direct_srv.bind(str(sock_file))
@@ -633,13 +635,14 @@ with tempfile.TemporaryDirectory(prefix="gemini-p2-shard-") as p2_tmp:
         p2_host = impl.Host.__new__(impl.Host)
         p2_host.directory = p2_root
         p2_host.payload_mode = "crag_subscription"
-        p2_host.payload_version = "0.4.10"
+        p2_host.payload_version = "0.4.12"
         p2_host.lock = _th.RLock()
         p2_host.environments = {env_a_id: env_a}
         p2_host.runtime_policy = dict(impl.DEFAULT_RUNTIME_POLICY)
         p2_host.daemon_shards = {}
         p2_host.native_sessions = {}
         p2_host._account_shard_map = {}
+        p2_host._shard_faults = {}
         p2_host.active_infers = {}
         p2_host.runs = {}
         p2_host.terminals = {}
@@ -648,6 +651,41 @@ with tempfile.TemporaryDirectory(prefix="gemini-p2-shard-") as p2_tmp:
         p2_host.socket_path = None
         p2_host.operation_account = lambda env, **kw: (os.getuid(), None, (("tok",), b"{}"))
 
+        assert p2_host._use_sharded_daemon() is False
+        sub_status = p2_host.daemon_status()
+        assert sub_status["mode"] == "per_account"
+        assert sub_status["planned_shards"] == 1
+
+        warm_session = SimpleNamespace(
+            uid=os.getuid(),
+            socket_path=str(sock_file),
+            native_token="s" * 40,
+            attempt="epoch-session-1",
+            pool_mode=True,
+            _ever_ready=True,
+            is_alive=lambda: True,
+            is_severely_unhealthy=lambda: False,
+        )
+        p2_host._acquire_native_session = lambda ctx: warm_session
+        sub_target = p2_host.request(
+            "infer-target",
+            {
+                "id": env_a_id,
+                "proxy_id": "px-1",
+                "proxy_url": PROXY,
+                "model": "gemini-3-pro",
+            },
+        )
+        assert sub_target["direct"] is True
+        assert sub_target["kind"] == "session"
+        assert sub_target["socket_path"] == str(sock_file)
+        assert sub_target["token"] == "s" * 40
+        assert sub_target["message_path"] == f"/internal/v1/accounts/{env_a_id}/messages"
+        assert sub_target["cancel_path"] == f"/internal/v1/accounts/{env_a_id}/cancel"
+        assert sub_target["account_id"] == env_a_id
+
+        p2_host.payload_mode = "signed_manifest"
+        assert p2_host._use_sharded_daemon() is True
         warm_shard = SimpleNamespace(
             uid=os.getuid(),
             socket_path=str(sock_file),
@@ -726,5 +764,118 @@ with tempfile.TemporaryDirectory(prefix="gemini-p2-shard-") as p2_tmp:
             assert (alloc_sock, os.getuid(), 995) in chown_calls
         finally:
             alloc_srv.close()
+
+# 8. Startup shard crash keeps exponential backoff and transparently falls back to per-account session.
+with tempfile.TemporaryDirectory(prefix="gemini-shard-fallback-") as fb_tmp:
+    fb_root = Path(fb_tmp)
+    fb_id, fb_env = make_env(20)
+    (fb_root / "environments.json").write_text(json.dumps({fb_id: fb_env}))
+    fb_args = SimpleNamespace(
+        state=fb_root,
+        uid_base=1000,
+        payload=fb_root / "payload",
+        payload_source=None,
+        public_key=None,
+        default_public_key=None,
+        default_release_verifier=None,
+        release_verifier=None,
+        egress=None,
+    )
+    with (
+        patch.object(impl, "check_root_owned"),
+        patch.object(impl, "read_root_file", side_effect=lambda p, limit: p.read_bytes()),
+    ):
+        fb_host = FixtureHost(fb_args)
+        fb_host.payload_mode = "signed_manifest"
+        fb_host.payload_version = "0.4.12"
+
+        # 8a. Respawning after a prior fault must NOT reset failures until shard becomes ready.
+        ctx_fb = {
+            "identifier": fb_id,
+            "env": fb_env,
+            "proxy_url": PROXY,
+            "auth": (("tok",), b"{}"),
+            "model": "gemini-3-pro",
+            "request_id": "req-fb-1",
+            "native_body": {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+            "entry": {"cancel_event": _th.Event(), "cancel_fn": None},
+        }
+        fb_host._record_shard_fault("shard-0")
+        assert fb_host._shard_faults["shard-0"]["failures"] == 1
+        # Simulate isolation window expiring.
+        fb_host._shard_faults["shard-0"]["isolated_until"] = 0.0
+
+        dead_shard = Mock()
+        dead_shard.members = {fb_id: {}}
+        dead_shard.is_alive.return_value = False
+        dead_shard.is_severely_unhealthy.return_value = True
+        dead_shard.open_stream.side_effect = native_mod.NativeFailure(
+            "gemini_native_worker_unavailable", 503
+        )
+
+        class _FakeResp:
+            def __init__(self):
+                self._chunks = [b'data: {"candidates":[{"finishReason":"STOP"}]}\n\n', b""]
+
+            def read1(self, _n):
+                return self._chunks.pop(0) if self._chunks else b""
+
+        class _FakeHandler:
+            def __init__(self):
+                self.sse_started = False
+                self.chunks = []
+                self.errors = []
+
+            def begin_sse(self):
+                self.sse_started = True
+
+            def write_sse_chunk(self, chunk):
+                self.chunks.append(chunk)
+
+            def send_json_error(self, status, code=None, *args, **kwargs):
+                self.errors.append((status, code))
+
+        fallback_session = Mock()
+        fallback_session.is_alive.return_value = True
+        fallback_session.is_severely_unhealthy.return_value = False
+        fallback_session.native_diagnostic = None
+        fallback_session.open_stream.return_value = (Mock(), _FakeResp())
+
+        handler = _FakeHandler()
+        with (
+            patch.object(impl, "CragDaemonShard", return_value=dead_shard),
+            patch.object(fb_host, "_acquire_native_session", return_value=fallback_session),
+            patch.object(impl, "native_module", return_value=native_mod),
+            patch.object(impl, "session_diagnostic", return_value=None),
+        ):
+            state, err_code = fb_host._stream_native_infer(ctx_fb, handler)
+
+        assert (state, err_code) == ("completed", None)
+        assert handler.sse_started is True
+        assert handler.errors == []
+        assert len(handler.chunks) == 1
+        assert "shard-0" not in fb_host.daemon_shards
+        # failures escalated from 1 -> 2 instead of being reset to 0 on spawn.
+        assert fb_host._shard_faults["shard-0"]["failures"] == 2
+        assert fb_host._is_shard_isolated("shard-0") is True
+        dead_shard.close.assert_called_once()
+        fallback_session.open_stream.assert_called_once()
+
+        # 8b. Once a shard succeeds open_stream, failures reset back to 0.
+        fb_host._shard_faults["shard-0"]["isolated_until"] = 0.0
+        healthy_shard = Mock()
+        healthy_shard.members = {fb_id: {}}
+        healthy_shard.is_alive.return_value = True
+        healthy_shard.is_severely_unhealthy.return_value = False
+        healthy_shard.open_stream.return_value = (Mock(), _FakeResp())
+        handler2 = _FakeHandler()
+        with (
+            patch.object(impl, "CragDaemonShard", return_value=healthy_shard),
+            patch.object(impl, "native_module", return_value=native_mod),
+        ):
+            state2, err_code2 = fb_host._stream_native_infer(ctx_fb, handler2)
+        assert (state2, err_code2) == ("completed", None)
+        assert fb_host._shard_faults["shard-0"]["failures"] == 0
+        assert fb_host._is_shard_isolated("shard-0") is False
 
 print("OK")
