@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.4.215 — 2026-11-25 · CRAGGemini 席位许可语义/同步恢复/换签对齐；`gemini-4-carbon-high` 思考强度与多协议对齐
+
+- **CRAGGemini 席位许可语义、同步恢复与载荷密钥换签全链路对齐**：
+  - `src/lib/gemini/subscription.mjs` 与 `src/server.mjs` 新增 `hasSyncPending()`、`recover()`、`refreshExpiredEntitlement()` 及启动/后台 15s 恢复循环，并通过 `withLock` 串行化同步避免竞态；`verifyCragGeminiSlotPermit()` 对载荷密钥漂移抛出 `license_payload_key_mismatch`，`bindEnvironment()` 在 `payload_key_conflict` / `host_binding_conflict` 时自动带 `reissue: true` 重试换签；导出唯一事实来源 `RECOVERABLE_GEMINI_SEAT_CODES`（`license_required` / `license_binding_mismatch` / `license_expired` / `license_payload_key_mismatch`）供 `src/lib/gemini/scheduler.mjs` 复用自愈；`src/lib/gemini/routes.mjs` 新增 `POST /api/panel/gemini/crag-subscription/sync` 与 `GET ?sync=1` 并在拉取库存前自动恢复残留 `sync-pending`（#1825）。
+  - `scripts/gemini-host.py` 与 `scripts/gemini_host_native.py` 不再将 `craggemini` 非零退出一律塌缩为 `license_invalid`，改为解析结构化 JSON/stderr 精确归因，识别 `sync-pending` 返回 `gemini_subscription_sync_pending`（HTTP 503），并在 `license_status()` 中比对 `CRAGS1`/`CRAGL1` 与 `manifest.json` 的 `payload.key_id`（向下兼容 `0.4.10` 二进制）（#1825）。
+  - `web/src/lib/gemini-account-status.ts` 与 `web/src/features/import/gemini-environments.tsx` 区分「宿主订阅同步中」与「未激活」、提供「继续同步订阅」操作按钮，补齐 `license_payload_key_mismatch` / `gemini_subscription_sync_pending` 文案，并将失效席位按钮与指引统一为「重新绑定 CRAG 席位」（#1825）。
+- **Gemini `gemini-4-carbon-high` 思考强度传播、`agy` 默认详略度与多协议对齐**：完善 `src/lib/gemini/model-catalog.mjs`、`src/lib/protocol/gemini-convert.mjs`、`src/lib/protocol/gemini-model-policy.mjs`、`src/lib/gemini/routes.mjs` 与 `scripts/gemini-host.py`，补齐 OpenAI Chat `reasoning_content` / `extra_body.google.thinkingConfig`、OpenAI Responses `configuration_update` / `reasoning.encrypted_content` 往返及 Anthropic 会话中段 `output_config.effort` / `redacted_thinking` 签名透传（#1823）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）与 Gemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）；`deploy/payload.json`（CRAG `3.1.20` 与 CRAGGemini `0.4.10`）、数据库迁移结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步脚本后需重启 `vm2api-gemini` 生效。
+
 ## 1.4.214 — 2026-11-25 · 钉选 CRAG 3.1.20 与 CRAGGemini 0.4.10；多 CLI 429 触发词归一化与 410/429 透传；Gemini 串行每小时健康缓存
 
 - **CRAG 3.1.20 与 CRAGGemini 0.4.10 签名载荷全线升级**：
