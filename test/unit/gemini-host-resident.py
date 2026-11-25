@@ -483,4 +483,37 @@ with tempfile.TemporaryDirectory(prefix="gemini-resident-") as temporary:
         fake_term_relay.poll.return_value = 1
         assert ns_probe.is_alive() is False
 
+        # 14. ThreadingUnixStreamServer must configure a large listen backlog (>= 128) for burst concurrency.
+        assert impl.ThreadingUnixStreamServer.request_queue_size >= 128, (
+            impl.ThreadingUnixStreamServer.request_queue_size
+        )
+
+        # 15. _stream_native_infer handles http.client.IncompleteRead cleanly as 502 gemini_inference_failed.
+        from http.client import IncompleteRead
+
+        bad_sess = make_fake_session()
+        bad_conn = Mock()
+        bad_resp = Mock()
+        bad_resp.read1.side_effect = IncompleteRead(b"")
+        bad_sess.open_stream.return_value = (bad_conn, bad_resp)
+        host.native_sessions[ENV_ID] = bad_sess
+        fake_handler = Mock()
+        fake_ctx = {
+            "identifier": ENV_ID,
+            "request_id": "req-incomplete-read",
+            "native_body": {"model": MODEL_A, "contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+            "model": MODEL_A,
+            "auth": ((), None),
+            "entry": {"cancel_event": threading.Event()},
+            "gateway_policy": None,
+        }
+        with (
+            patch.object(host, "_use_sharded_daemon", return_value=False),
+            patch.object(host, "_acquire_native_session", return_value=bad_sess),
+        ):
+            state, err_code = host._stream_native_infer(fake_ctx, fake_handler)
+        assert (state, err_code) == ("failed", "gemini_inference_failed")
+        fake_handler.send_json_error.assert_called_once_with(502, "gemini_inference_failed")
+        bad_conn.close.assert_called_once()
+
 print("gemini-host-resident: ALL PASS")
