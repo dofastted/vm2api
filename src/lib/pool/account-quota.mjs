@@ -2143,7 +2143,7 @@ function syncActiveToPassive(
         continue
       }
       if (hasExtra && !extraElapsed && extraIsLiveOpen(extra, now) && eu != null && ou <= 0.15 && eu >= 0.4) {
-        const referenceSampleMs = existingSampleMs ?? latestActivityAtMs
+        const referenceSampleMs = maxTimestamp(existingSampleMs, latestActivityAtMs)
         if (
           !forceReconcile &&
           referenceSampleMs != null &&
@@ -2255,7 +2255,7 @@ function syncActiveToPassive(
           ouOi <= 0.15 &&
           euOi >= 0.4
         ) {
-          const refOiMs = existingOiSampleMs ?? latestActivityAtMs
+          const refOiMs = maxTimestamp(existingOiSampleMs, latestActivityAtMs)
           if (!forceReconcile && refOiMs != null && probeStartedAtMs - refOiMs < ACTIVE_CALIBRATION_SETTLE_MS) {
             oiRetainReason = 'settle_window'
             oiSettleRem = ACTIVE_CALIBRATION_SETTLE_MS - (probeStartedAtMs - refOiMs)
