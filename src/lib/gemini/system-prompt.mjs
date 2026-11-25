@@ -37,6 +37,41 @@ export function resolveCragGeminiPromptPolicy(routing = {}) {
   }
 }
 
+const CONFLICTING_CLI_IDENTITY_RE = /\bYou\s+are\s+(?:Claude\s+Code|OpenCode)\b/gi
+
+/**
+ * Normalize third-party CLI identity declarations in outbound CRAGGemini
+ * `systemInstruction` (e.g. `You are Claude Code` / `You are OpenCode`) that
+ * conflict with the target Gemini runtime and cause Google Antigravity upstream
+ * to reject healthy accounts with HTTP 429 RESOURCE_EXHAUSTED.
+ */
+export function sanitizeCragGeminiSystemText(text) {
+  if (typeof text !== 'string' || !text) return text
+  return text.replace(CONFLICTING_CLI_IDENTITY_RE, 'You are a coding assistant')
+}
+
+function sanitizeSystemInstruction(systemInstruction) {
+  if (!systemInstruction) return systemInstruction
+  if (typeof systemInstruction === 'string') {
+    return sanitizeCragGeminiSystemText(systemInstruction)
+  }
+  if (typeof systemInstruction === 'object' && Array.isArray(systemInstruction.parts)) {
+    let changed = false
+    const nextParts = systemInstruction.parts.map((part) => {
+      if (part && typeof part.text === 'string') {
+        const sanitized = sanitizeCragGeminiSystemText(part.text)
+        if (sanitized !== part.text) {
+          changed = true
+          return { ...part, text: sanitized }
+        }
+      }
+      return part
+    })
+    return changed ? { ...systemInstruction, parts: nextParts } : systemInstruction
+  }
+  return systemInstruction
+}
+
 function extractSystemText(systemInstruction) {
   if (!systemInstruction) return ''
   if (typeof systemInstruction === 'string') return systemInstruction.trim()
@@ -64,7 +99,9 @@ export function applyCragGeminiPromptPolicy(body, policy = {}) {
   if (globalPrompt) {
     const existing = extractSystemText(out.systemInstruction)
     const merged = existing ? `${globalPrompt}\n\n${existing}` : globalPrompt
-    out.systemInstruction = { parts: [{ text: merged }] }
+    out.systemInstruction = { parts: [{ text: sanitizeCragGeminiSystemText(merged) }] }
+  } else if (out.systemInstruction != null) {
+    out.systemInstruction = sanitizeSystemInstruction(out.systemInstruction)
   }
 
   out.system_prompt_mode = preset

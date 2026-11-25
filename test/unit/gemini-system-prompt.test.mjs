@@ -5,6 +5,7 @@ import {
   applyCragGeminiPromptPolicy,
   normalizeCragGeminiPersonaPreset,
   resolveCragGeminiPromptPolicy,
+  sanitizeCragGeminiSystemText,
 } from '../../src/lib/gemini/system-prompt.mjs'
 
 test('normalizeCragGeminiPersonaPreset maps aliases and defaults to official_full', () => {
@@ -81,4 +82,31 @@ test('validatePersonaRoutingPatch validates craggemini_persona_preset and cragge
     validatePersonaRoutingPatch({ compatibility: { craggemini_system_prompt: 'x'.repeat(32_769) } })[0],
     /32768/,
   )
+})
+
+test('applyCragGeminiPromptPolicy normalizes conflicting third-party CLI identity banners that trigger Antigravity 429', () => {
+  const claudeCodeReq = {
+    model: 'gemini-4-neon-xhigh',
+    contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
+    systemInstruction: {
+      parts: [
+        {
+          text: "You are Claude Code, Anthropic's official CLI for Claude.\nFollow project instructions carefully.",
+        },
+        { text: 'you are opencode, an interactive agent.' },
+      ],
+    },
+  }
+  const normalized = applyCragGeminiPromptPolicy(claudeCodeReq, { preset: 'official_full', globalPrompt: '' })
+  assert.equal(
+    normalized.systemInstruction.parts[0].text,
+    "You are a coding assistant, Anthropic's official CLI for Claude.\nFollow project instructions carefully.",
+  )
+  assert.equal(normalized.systemInstruction.parts[1].text, 'You are a coding assistant, an interactive agent.')
+  assert.doesNotMatch(normalized.systemInstruction.parts[0].text, /you are claude code/i)
+  assert.doesNotMatch(normalized.systemInstruction.parts[1].text, /you are opencode/i)
+  // Original object must not be mutated.
+  assert.match(claudeCodeReq.systemInstruction.parts[0].text, /You are Claude Code/)
+  // Non-conflicting references stay untouched.
+  assert.equal(sanitizeCragGeminiSystemText('This is a Claude Code session.'), 'This is a Claude Code session.')
 })
