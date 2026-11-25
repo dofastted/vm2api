@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.204 — 2026-11-25 · CRAGGemini 0.4.8 Pool 模式每槽位 MCP 工具桥接；`control.sock` 并发队列扩容与 `IncompleteRead` 收口
+
+- **CRAGGemini 0.4.8 修复客户端工具 MCP 桥接（消除 `502 gemini_tool_call_required`）**：`deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 升级至 `payload-2026.11.25-gemini-0.4.8`。`craggemini` 加密引导程序通过共享同步模块 `mcp_stdio` 直接短路执行 `--internal-mcp`（消除对 `mcp-bridge.json` 误走 `vm_id="standalone"` 授权校验导致的 `license_binding_mismatch` 与重复 memfd 解密）；Pool 模式启动 `AgySlot` 前自动并发安全地写入 `mcp-bridge.json` 与 `<agy_home>/.gemini/config/mcp_config.json`，并通过 `CRAGGEMINI_SLOT_ID → X-Craggemini-Slot-Id` 将 `/internal/mcp/*` 路由至对应槽位独立的 `McpCoordinator`；提交 prompt 前同步等待 `agy` 完成 `tools/list` 刷新（含空工具回合清理），并修复多会话并发下的 `ToolContinuation` 挂起工具匹配（#1775）。
+- **CRAGGemini 宿主并发队列与流式异常收口（消除 10 并发突发 `503 gemini_host_unavailable`）**：`scripts/gemini-host.py` 将 `ThreadingUnixStreamServer.request_queue_size` 由 Python 默认 5 提升至 128，并将主 accept 循环中的 `host.cleanup()` 节流至 `>= 0.25s`，防止高并发突发溢出内核连接队列；`_stream_native_infer` 与 `scripts/gemini_host_native.py` 补全捕获 `http.client.HTTPException`（如 `IncompleteRead`）并统一收口为 `502 gemini_inference_failed`（#1775）。
+- 部署说明：本版涉及 CRAGGemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）与 `deploy/payload.json` 中 `geminiDefaultLinuxAmd64` 载荷钉选（`0.4.7 → 0.4.8`）。控制面代码、前端、CRAG 内核钉选（`3.1.17`）、数据库结构及 `bin/` / `share/wrap-cli` 字节均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机需同步宿主脚本并更新 `0.4.8` 载荷后重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance`。
+
 ## 1.4.203 — 2026-11-25 · CRAGGemini 0.4.7 故障转移与宿主网络加固；省略 `cache_control.ttl` 按路由配置补齐；托管 Key 超限响应统一；Claude 重置后预重置配额头对账与 Codex 自定义时长窗口
 
 - **非透传请求省略 `cache_control.ttl` 按 Web 路由配置补齐**：修复未声明 `ttl` 的 `cache_control` 被误作隐式 `5m`、在 CRAG V3 / HTTP hop 级联降级及未热读磁盘 `routing.json` 的问题；官方透传继续保留调用方省略的 TTL，补齐 `politeEphemeral` 类型校验与 `workerEnvelope` 对 `crag_options.cache_ttl` 的回退读取（#1772）。
