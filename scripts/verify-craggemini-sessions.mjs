@@ -20,9 +20,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
+import { normalizeGeminiOutboundPrompt } from '../src/lib/gemini/prompt-normalizer.mjs'
 import { createGeminiPublicHandler } from '../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../src/lib/gemini/scheduler.mjs'
-import { applyCragGeminiPromptPolicy } from '../src/lib/gemini/system-prompt.mjs'
 import {
   NATIVE_TUI_CAPABILITIES,
   SKIP_THOUGHT_SIGNATURE,
@@ -1638,6 +1638,12 @@ async function runSampleThroughHandler(sample) {
     } else {
       cragCheck = validateCragGeminiContract(capturedBody, { expectedModel: DEFAULT_MODEL, strictMinimal: true })
       if (!cragCheck.ok) errors.push(...cragCheck.errors)
+      const reNormalized = normalizeGeminiOutboundPrompt(capturedBody, { target: 'antigravity' })
+      if (JSON.stringify(reNormalized.body) !== JSON.stringify(capturedBody)) {
+        errors.push(
+          `prompt normalization not idempotent (residual rules: ${reNormalized.report?.rules_applied?.join(', ') || 'unknown'})`,
+        )
+      }
       if (typeof sample.extraAssert === 'function') {
         const extraErr = sample.extraAssert(capturedBody)
         if (extraErr) errors.push(extraErr)
