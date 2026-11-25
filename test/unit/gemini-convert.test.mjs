@@ -84,6 +84,11 @@ test('tool name prefixes and signedToolCallId round-trip safely', () => {
   assert.equal(geminiFuncName('-dash'), '_x_-dash')
   assert.equal(geminiToolNameFromCall('default_api:read_file'), 'read_file')
   assert.equal(geminiToolNameFromCall('default_api._x_123run'), '123run')
+  assert.equal(geminiToolNameFromCall('mcp_crag_Bash'), 'Bash')
+  assert.equal(geminiToolNameFromCall('mcp_crag_Read'), 'Read')
+  assert.equal(geminiToolNameFromCall('mcp__crag__Bash'), 'Bash')
+  assert.equal(geminiToolNameFromCall('mcp_craggemini_Bash'), 'Bash')
+  assert.equal(geminiToolNameFromCall('mcp__craggemini__Bash'), 'Bash')
 
   // Canonical base64 signature round-trips cleanly.
   const b64Sig = Buffer.from('gemini-thought-sig-bytes').toString('base64')

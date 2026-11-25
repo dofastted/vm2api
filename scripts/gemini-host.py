@@ -1593,8 +1593,6 @@ class NativeAgy(Agy):
         license_dir = self.host.ensure_env_license_dir(self.environment)
         native_module_impl = native_module()
         agy_args = [
-            "--mode",
-            "plan",
             "--dangerously-skip-permissions",
             "--add-dir",
             "/work",
@@ -2158,8 +2156,6 @@ class CragDaemonShard:
     @staticmethod
     def _agy_args_for(model):
         return [
-            "--mode",
-            "plan",
             "--dangerously-skip-permissions",
             "--add-dir",
             "/accounts",
