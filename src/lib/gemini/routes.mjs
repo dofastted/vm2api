@@ -2045,8 +2045,9 @@ export function createGeminiPublicHandler({
         ...geminiScope,
         onEvent: wantStream
           ? (event) => {
-              if (event?.kind === 'error') return
+              if (event?.kind === 'error') return headersSent
               writeChunk(encoder.push(event))
+              return headersSent
             }
           : null,
       })

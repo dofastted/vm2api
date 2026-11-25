@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.4.206 — 2026-11-25 · 修复 Gemini 429 跨账号切号与冷却隔离；`apply-policy` 热同步空闲回收与预热槽位
+
+- **修复 Gemini 429（`RESOURCE_EXHAUSTED`）切号与冷却缺陷**：
+  - `src/lib/gemini/scheduler.mjs` 与 `src/lib/gemini/routes.mjs` 修复首字节/内容输出前的 `start` / `meta` SSE 帧误置 `emittedOutput` 阻断跨账号切换的问题，仅在下游实际写出响应头或收到内容事件时才禁止切号；
+  - `all_cooled_probe` 严格保留按最早冷却过期时间排序的探测顺序，避免被 `poolScheduler.reserveExternalCandidates()` / 字母序覆写并锁死在同一账号序列；同时在每次尝试开始时更新 `lastUsed`，确保失败场景下均衡轮转生效；
+  - 被动 429 冷却收口至单模型维度（`modelCooldowns`），避免单个模型（如 `gemini-4-neon-xhigh`）限流误伤同账号下其它健康模型，同时保留主动 0% 配额组冷却；
+  - `known(error)` 保留 `upstreamStatus`、`retryAfterMs`、`retryAfter`、`timing`、`usage`、`details`，并解析上游 429 响应的 `retry_after_ms` / `Retry-After` 指导冷却时长。
+- **修复 `scripts/gemini-host.py` 策略热同步**：`NativeSession.apply_policy()` 与 `CragDaemonShard.apply_policy()` 在 `PUT /internal/v1/policy` 成功后同步调用 `POST /internal/v1/accounts/<id>/scale` 推送 `idle_ttl_secs` 与 `min_warm_slots`（`concurrency-set` 与 `sync_account` 同步携带 `min_warm_slots`），修改 `session_idle_ttl_secs` 等池参数立即对运行中账号生效，无需重启 `vm2api-gemini`。
+- 部署说明：本次改动覆盖控制面 `src/lib/gemini/scheduler.mjs`、`src/lib/gemini/routes.mjs` 及 Gemini 宿主机脚本 `scripts/gemini-host.py`；前端、CRAG/CRAGGemini 载荷钉选、数据库结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；需同步 `scripts/gemini-host.py` 到宿主机并重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance`，再灰度/覆盖发布控制面 `v1.4.206`。
+
 ## 1.4.205 — 2026-11-25 · CRAGGemini 0.4.9 MCP 桥内部暴露名称收口为 `crag`（`mcp_crag_*`）
 
 - **CRAGGemini 0.4.9 MCP 桥命名收口**：`deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 升级至 `payload-2026.11.25-gemini-0.4.9`。MCP 桥服务名由 `craggemini` 统一收口为 `crag`，`agy` 内部工具暴露前缀统一为 `mcp_crag_<tool>`（不再携带详细 `gemini` 后缀）；写入 `mcp_config.json` 时自动清理旧版 `craggemini` 条目避免重复挂载，同时保留对历史前缀的兼容剥离。
