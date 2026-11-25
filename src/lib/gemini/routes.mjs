@@ -30,6 +30,7 @@ import { isGeminiProtocolAllowed } from './routing-config.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 import { createGeminiSlotPrefs, parseGeminiDisplayName, parseGeminiScheduleLevel } from './slot-prefs.mjs'
 import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
+import { compileWithProtoFront, protoFrontMode } from '../transport/proto-front-client.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
 const PUBLIC_PATH = '/v1/gemini/sessions'
@@ -1500,6 +1501,10 @@ function publicError(error) {
   }
   const known = HOST_ERRORS[code]
   const status = Number.isInteger(error?.status) ? error.status : known?.[0] || 503
+  const message =
+    code === 'gemini_operation_busy' && status === 503
+      ? '当前可用 Gemini 账号并发繁忙，请稍后重试'
+      : known?.[1] || error?.message || 'Gemini request failed.'
   return {
     status,
     details: error?.details,
@@ -1508,7 +1513,7 @@ function publicError(error) {
       error: {
         type: status === 429 ? 'rate_limit_error' : status >= 500 ? 'api_error' : 'invalid_request_error',
         code,
-        message: known?.[1] || error?.message || 'Gemini request failed.',
+        message,
       },
     },
   }
@@ -1981,6 +1986,56 @@ export function createGeminiPublicHandler({
       logBag.inbound_summary = summarizeBody(body)
     }
 
+    const pfMode = protoFrontMode()
+    if (pfMode === 'go' && protocol !== 'gemini-session') {
+      try {
+        const pfRes = await compileWithProtoFront({
+          cfg: { paths: { project: process.cwd() } },
+          inboundProtocol: logProtocolName(protocol),
+          targetFamily: 'gemini_antigravity',
+          reqPath: url.pathname,
+          headers: req.headers,
+          body,
+          routing: typeof getRoutingConfig === 'function' ? getRoutingConfig() : {},
+          routeModel: modelFromPath || '',
+          routeStream,
+        })
+        if (pfRes) {
+          logBag.hop_meta = {
+            ...(logBag.hop_meta && typeof logBag.hop_meta === 'object' ? logBag.hop_meta : {}),
+            proto_front: {
+              mode: pfRes.mode || null,
+              decision: pfRes.decision || null,
+              stripped_fields: pfRes.stripped_fields || [],
+            },
+          }
+        }
+      } catch (err) {
+        logBag.hop_meta = {
+          ...(logBag.hop_meta && typeof logBag.hop_meta === 'object' ? logBag.hop_meta : {}),
+          proto_front_error: err?.code || err?.message || 'error',
+        }
+      }
+    } else if (pfMode === 'shadow' && protocol !== 'gemini-session') {
+      void compileWithProtoFront({
+        cfg: { paths: { project: process.cwd() } },
+        inboundProtocol: logProtocolName(protocol),
+        targetFamily: 'gemini_antigravity',
+        reqPath: url.pathname,
+        headers: req.headers,
+        body,
+        routing: typeof getRoutingConfig === 'function' ? getRoutingConfig() : {},
+        routeModel: modelFromPath || '',
+        routeStream,
+      })
+        .then((shadowRes) => {
+          logBag.hop_meta = {
+            ...(logBag.hop_meta && typeof logBag.hop_meta === 'object' ? logBag.hop_meta : {}),
+            proto_front_shadow: { ok: shadowRes?.ok === true, mode: shadowRes?.mode, decision: shadowRes?.decision },
+          }
+        })
+        .catch(() => {})
+    }
     const supportsStream = typeof scheduler.stream === 'function'
     let parsed = null
     let requested = null

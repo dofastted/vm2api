@@ -6,11 +6,7 @@ import type {
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import { GeminiConfigPane } from './gemini-config-pane'
-import {
-  SETTINGS_NAV_GROUPS,
-  SETTINGS_TABS,
-  settingsTabId,
-} from './navigation'
+import { SETTINGS_NAV_GROUPS, SETTINGS_TABS, settingsTabId } from './navigation'
 
 type ReactQuery = {
   useQueryClient: typeof useQueryClient
@@ -93,9 +89,9 @@ describe('settings Gemini entry & scheduling config pane', () => {
       true
     )
     expect(ops?.items.some((item) => item.id === 'gemini')).toBe(true)
-    expect(
-      SETTINGS_TABS.find(([id]) => id === 'gemini-config')?.[1]
-    ).toBe('Gemini')
+    expect(SETTINGS_TABS.find(([id]) => id === 'gemini-config')?.[1]).toBe(
+      'Gemini'
+    )
     expect(SETTINGS_TABS.find(([id]) => id === 'gemini')?.[1]).toBe(
       'Gemini 维护'
     )
@@ -118,6 +114,7 @@ describe('settings Gemini entry & scheduling config pane', () => {
     expect(html).toContain('分片接管 · 50/进程')
     expect(html).toContain('shard-0')
     expect(html).toContain('入口与协议准入')
+    expect(html).toContain('官方 Gemini 请求体透传')
     expect(html).toContain('调度策略与粘性会话')
     expect(html).toContain('单 CRAGGemini 多账号接管与并发')
     expect(html).toContain('单账号默认会话上限')

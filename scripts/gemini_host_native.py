@@ -465,7 +465,7 @@ def _map_worker_error(http_status, payload):
     if code in ("queue_full", "native_unavailable", "kernel_stopping", "slot_shm_required", "account_circuit_open"):
         return NativeFailure(
             "gemini_operation_busy"
-            if code in ("queue_full", "account_circuit_open")
+            if code == "queue_full"
             else "gemini_native_worker_unavailable",
             503,
             message,

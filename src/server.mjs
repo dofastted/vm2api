@@ -95,6 +95,7 @@ import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
 import { apiScheduleScope, resolveInferenceBackend } from './lib/pool/api-protocol.mjs'
 import { bootApiKernel, apiKernelPaths, apiKernelSnapshot } from './lib/transport/api-kernel-client.mjs'
+import { bootProtoFront } from './lib/transport/proto-front-client.mjs'
 import { PanelUserStore } from './lib/admin/panel-users.mjs'
 import { RequestLogStore } from './lib/admin/request-log.mjs'
 import {
@@ -2235,6 +2236,7 @@ if (process.env.KIN_CRS_MOCK !== '1') {
   )
 }
 await bootApiKernel(cfg)
+await bootProtoFront(cfg)
 server.keepAliveTimeout = 120_000
 server.headersTimeout = 125_000
 server.timeout = 0

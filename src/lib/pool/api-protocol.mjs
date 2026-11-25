@@ -6,6 +6,7 @@ import { consumeClaudeSSEData } from '../protocol/convert.mjs'
 import { isCompleteAssistantMessage, mapUpstreamError } from '../core/errors.mjs'
 import { isContentPolicyErrorCode } from '../core/refusal-guard.mjs'
 import { forwardApi, readApiJson } from '../transport/api-kernel-client.mjs'
+import { compileWithProtoFront, protoFrontMode } from '../transport/proto-front-client.mjs'
 import {
   geminiGenerateUrl,
   messagesUrl,
@@ -404,13 +405,35 @@ export async function runApiInference({
       },
     }
   }
-  const body = isOpenAI
-    ? {
-        ...(protocol === 'openai.responses'
+  let openAIBaseBody = null
+  if (isOpenAI) {
+    if (protoFrontMode() === 'go') {
+      try {
+        const pfRes = await compileWithProtoFront({
+          cfg,
+          inboundProtocol: protocol,
+          targetFamily: 'api_openai',
+          reqPath: req?.url || '',
+          headers: req?.headers || {},
+          body: inbound,
+          routing: routing || {},
+          endpointBodyPolicy: picked.endpoint.body_policy || '',
+        })
+        if (pfRes?.ok && pfRes.outbound_body) openAIBaseBody = pfRes.outbound_body
+      } catch {}
+    }
+    if (!openAIBaseBody) {
+      openAIBaseBody =
+        protocol === 'openai.responses'
           ? inbound
           : protocol === 'openai.chat'
             ? chatToCodexResponses(inbound)
-            : claudeToOpenAIResponsesRequest(canonical)),
+            : claudeToOpenAIResponsesRequest(canonical)
+    }
+  }
+  let body = isOpenAI
+    ? {
+        ...openAIBaseBody,
         model: picked.upstream_model,
         stream: true,
         store: false,
