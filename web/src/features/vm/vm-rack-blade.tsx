@@ -159,8 +159,9 @@ export function GeminiSlotStatus({
   const run = lastInference
     ? [lastInference.model, age].filter(Boolean).join(' · ')
     : null
-  // 只露出一条警示：资格提示优先，其次最近一次失败原因。
-  const warn = notice?.label ?? failed
+  // 只露出一条警示：阻断型资格提示优先，其次最近一次失败原因；参考性核验链接不覆盖正常状态。
+  const blockingNotice = notice && !notice.advisory ? notice : null
+  const warn = blockingNotice?.label ?? failed
   const aside = blocker ? authorization.text : modelsLabel
   const title = [
     authorization.text,

@@ -230,6 +230,40 @@ with tempfile.TemporaryDirectory(prefix="gemini-shards-") as temporary:
         assert "validation_url" not in env0["account"]
         assert "eligibility_verified_at" in env0["account"]
 
+        # Refreshing a verified paid-tier account must not resurrect an advisory
+        # validation_url from alternative tiers, while preserving non-verification blocks.
+        with (
+            patch.object(host, "_profile_token_state", return_value=(False, False)),
+            patch.object(
+                impl,
+                "read_account",
+                return_value={
+                    "state": "ok",
+                    "validation_url": "https://accounts.google.com/v3/signin/continue?plt=paid",
+                    "checked_at": "2030-01-01T00:05:00+00:00",
+                },
+            ),
+        ):
+            host.refresh_account(env0, PROXY, auto_pull_models=False)
+        assert "validation_url" not in env0["account"]
+        assert "eligibility_verified_at" in env0["account"]
+
+        with (
+            patch.object(host, "_profile_token_state", return_value=(False, False)),
+            patch.object(
+                impl,
+                "read_account",
+                return_value={
+                    "state": "ok",
+                    "eligibility": "location_unsupported",
+                    "validation_url": "https://accounts.google.com/v3/signin/continue?plt=loc",
+                    "checked_at": "2030-01-01T00:06:00+00:00",
+                },
+            ),
+        ):
+            host.refresh_account(env0, PROXY, auto_pull_models=False)
+        assert env0["account"].get("eligibility") == "location_unsupported"
+
         # Periodic eligibility probe clears stale VALIDATION_REQUIRED when inference probe succeeds.
         env1 = host.environments[ids[1]]
         env1["account"] = {

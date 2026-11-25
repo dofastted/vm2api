@@ -168,9 +168,19 @@ export function GeminiTestPanel({
             {eligibilityNotice ? (
               <div
                 role='status'
-                className='space-y-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm'
+                className={
+                  eligibilityNotice.advisory
+                    ? 'space-y-1.5 rounded-md border border-border bg-muted/40 p-3 text-sm'
+                    : 'space-y-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-sm'
+                }
               >
-                <p className='font-medium text-amber-700 dark:text-amber-300'>
+                <p
+                  className={
+                    eligibilityNotice.advisory
+                      ? 'font-medium text-foreground'
+                      : 'font-medium text-amber-700 dark:text-amber-300'
+                  }
+                >
                   {eligibilityNotice.label}
                 </p>
                 <p className='text-xs text-muted-foreground'>

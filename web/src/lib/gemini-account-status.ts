@@ -347,6 +347,7 @@ export function geminiEligibilityNotice(
   label: string
   action: string
   validationUrl: string | null
+  advisory: boolean
 } | null {
   if (lastInference?.state === 'completed' && lastInference.finished_at) {
     const checked = account?.checked_at ? Date.parse(account.checked_at) : NaN
@@ -368,6 +369,7 @@ export function geminiEligibilityNotice(
         action:
           '请在对应 Google 账号浏览器打开下方验证链接完成核验，随后返回刷新账号状态即可恢复对话。',
         validationUrl: safeGoogleValidationUrl(account.validation_url),
+        advisory: false,
       }
     case 'location_unsupported':
       return {
@@ -375,12 +377,14 @@ export function geminiEligibilityNotice(
         action:
           '请在「代理」页更换至支持地区（如美国住宅）的 SOCKS5 代理后刷新账号。',
         validationUrl: null,
+        advisory: false,
       }
     case 'ineligible':
       return {
         label: 'Google 判定当前账号暂不符合 Antigravity 使用资格',
         action: '请检查该 Google 账号订阅状态与年龄限制，或更换可用个人账号。',
         validationUrl: null,
+        advisory: false,
       }
     default: {
       const validationUrl = safeGoogleValidationUrl(account?.validation_url)
@@ -390,6 +394,7 @@ export function geminiEligibilityNotice(
             action:
               '若对话提示需要身份核验，请在对应 Google 账号浏览器打开链接，完成核验后重试。',
             validationUrl,
+            advisory: true,
           }
         : null
     }
