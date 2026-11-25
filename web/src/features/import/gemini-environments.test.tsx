@@ -8,6 +8,8 @@ import {
   GeminiOperationError,
   type GeminiInventory,
 } from './gemini-environments'
+import { geminiProxyAddress, geminiProxyOptionLabel } from './gemini-operations'
+import { GeminiProxyPanel } from './gemini-proxy-panel'
 
 vi.mock('@tanstack/react-router', () => ({
   Link: ({ children }: { children: string }) => <a>{children}</a>,
@@ -386,4 +388,163 @@ test('GeminiOperationError renders remediation guidance and maintenance link for
   )
   expect(apiKeyHtml).toContain('Google AI Studio 核对 API Key 有效性')
   expect(apiKeyHtml).not.toContain('设置 → Gemini 维护：诊断与维护')
+})
+
+test('geminiProxyOptionLabel displays IP/host, distinct exit IP, region, latency, and falls back safely', () => {
+  const base = {
+    enabled: true,
+    status: 'ok',
+    kind: 'socks5',
+    address_family: 4,
+  }
+  expect(geminiProxyAddress({ host: '45.67.89.10', port: 1080 })).toBe(
+    '45.67.89.10:1080'
+  )
+  expect(geminiProxyAddress({ host: '2001:db8::1', port: 1080 })).toBe(
+    '[2001:db8::1]:1080'
+  )
+  expect(geminiProxyAddress({})).toBeNull()
+
+  // Unlabeled direct IPv4 proxy shows IP:port instead of bare px-xxxx
+  expect(
+    geminiProxyOptionLabel({
+      ...base,
+      id: 'px-4a07ab03',
+      label: null,
+      host: '45.67.89.10',
+      port: 1080,
+    })
+  ).toBe('45.67.89.10:1080 · px-4a07ab03')
+
+  // Direct IPv4 with matching geo.ip avoids duplicating IP while showing region and latency
+  expect(
+    geminiProxyOptionLabel({
+      ...base,
+      id: 'px-4a07ab03',
+      label: null,
+      host: '45.67.89.10',
+      port: 1080,
+      geo: { ip: '45.67.89.10', country_code: 'US' },
+      latency_ms: 82,
+    })
+  ).toBe('45.67.89.10:1080 · US · 82ms · px-4a07ab03')
+
+  // Relay/domain proxy shows both host:port and probed exit IP
+  expect(
+    geminiProxyOptionLabel({
+      ...base,
+      id: 'px-relay',
+      label: '美国住宅',
+      host: 'us.relay.example',
+      port: 10800,
+      geo: { ip: '203.0.113.45', country_code: 'US' },
+      latency_ms: 115,
+    })
+  ).toBe(
+    '美国住宅 · us.relay.example:10800 · 出口 203.0.113.45 · US · 115ms · px-relay'
+  )
+
+  // Minimal fallback without host never emits ?:?
+  expect(
+    geminiProxyOptionLabel({
+      ...base,
+      id: 'px-bare',
+    })
+  ).toBe('px-bare')
+})
+
+test('Gemini import selector and proxy panel render proxy IP and exit IP for unlabeled proxies', () => {
+  const client = new QueryClient()
+  client.setQueryData(['panel', 'me'], { role: 'admin' })
+  client.setQueryData(['panel', 'gemini-environments'], {
+    available: true,
+    payload_state: 'installed',
+    environments: [
+      {
+        id: 'gemini-ip',
+        name: 'Gemini IP',
+        proxy_id: 'px-4a07ab03',
+        proxy_ready: true,
+        auth_method: 'oauth',
+        auth_state: 'authorized',
+        schedulable: true,
+        models_discovered: false,
+        models: [],
+      },
+    ],
+  })
+  client.setQueryData(['panel', 'gemini-egress-options'], {
+    proxies: [
+      {
+        id: 'px-4a07ab03',
+        label: null,
+        host: '45.67.89.10',
+        port: 1080,
+        geo: { ip: '203.0.113.45', country_code: 'US' },
+        latency_ms: 68,
+        enabled: true,
+        status: 'ok',
+        kind: 'socks5',
+        address_family: 4,
+      },
+      {
+        id: 'px-a49903b0',
+        label: null,
+        host: '198.51.100.22',
+        port: 1080,
+        enabled: true,
+        status: 'ok',
+        kind: 'socks5',
+        address_family: 4,
+      },
+    ],
+  })
+
+  const importHtml = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <GeminiEnvironments />
+    </QueryClientProvider>
+  )
+  expect(importHtml).toContain(
+    '45.67.89.10:1080 · 出口 203.0.113.45 · US · 68ms · px-4a07ab03'
+  )
+  expect(importHtml).toContain('198.51.100.22:1080 · px-a49903b0')
+
+  const vmHtml = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <GeminiEnvironments environmentId='gemini-ip' />
+    </QueryClientProvider>
+  )
+  expect(vmHtml).toContain(
+    '45.67.89.10:1080 · 出口 203.0.113.45 · US · 68ms · px-4a07ab03'
+  )
+
+  const proxyPanelHtml = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <GeminiProxyPanel
+        environment={{
+          id: 'gemini-ip',
+          name: 'Gemini IP',
+          proxy_id: 'px-4a07ab03',
+          proxy_ready: true,
+          auth_method: 'oauth',
+          auth_state: 'authorized',
+          runtime_ready: true,
+          billing_ready: true,
+          kernel_version: '0.4.7',
+          created_at: null,
+          updated_at: null,
+          schedulable: true,
+          models_discovered: false,
+          models: [],
+          account: null,
+        }}
+        active
+      />
+    </QueryClientProvider>
+  )
+  expect(proxyPanelHtml).toContain('代理地址')
+  expect(proxyPanelHtml).toContain('45.67.89.10:1080')
+  expect(proxyPanelHtml).toContain('出口 IP')
+  expect(proxyPanelHtml).toContain('203.0.113.45')
 })
