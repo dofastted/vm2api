@@ -4713,10 +4713,27 @@ export function createPanelHandler(ctx) {
       // Explicit quota refresh: no inference request or cached-success response.
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/usage\/query$/.test(p)) {
         const id = p.split('/')[4]
+        let body = {}
+        try {
+          body = (await readBody(req, 4096)) || {}
+        } catch (error) {
+          return json(res, error?.status || 400, {
+            ok: false,
+            error: { code: error?.code || 'invalid_request', message: String(error?.message || 'invalid JSON body') },
+          })
+        }
+        if (typeof body !== 'object' || Array.isArray(body)) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_request', message: 'Request body must be a JSON object' },
+          })
+        }
+        const forceReconcile = body.force_reconcile === true || body.reconcile_headers === true
         const result = await queryActiveUsage({
           projectRoot: cfg.paths.project,
           vm: getVm(cfg.paths.project, id),
           accountQuota,
+          forceReconcile,
         })
         return json(res, result.status, result.body)
       }
