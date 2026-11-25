@@ -110,7 +110,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     platform: kind.platform,
     family: kind.family,
     codex_kernel: kind.kind === 'codex',
-    email: kind.kind === 'codex' ? codex?.email || null : vm.claude?.email || null,
+    email: kind.kind === 'codex' ? codex?.email || vm.email || null : vm.claude?.email || vm.email || null,
     account_uuid: kind.kind === 'codex' ? null : vm.claude?.account_uuid || null,
     org_uuid: kind.kind === 'codex' ? codex?.chatgpt_account_id || null : vm.claude?.org_uuid || null,
     has_token: kind.kind === 'codex' ? !!codex?.has_token : hasAccessPresence(vm.claude),

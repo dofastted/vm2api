@@ -27,7 +27,7 @@ import {
   weeklySplitInfo,
 } from '@/lib/fable-status'
 import { usedPctOf } from '@/lib/format'
-import { compactEmail, isCodexVm } from '@/lib/vm-kind'
+import { isCodexVm, slotDisplayTitle } from '@/lib/vm-kind'
 import {
   accountStatus,
   claudeTier,
@@ -423,10 +423,7 @@ function VmDetailBody({
         : ''
 
   return (
-    <PageHeader
-      title={vm.name || (vm.email ? compactEmail(vm.email, 28) : vm.id)}
-      fluid
-    >
+    <PageHeader title={slotDisplayTitle(vm)} fluid>
       <QueryGate
         loading={detail.isLoading && !listVm}
         error={detail.error}

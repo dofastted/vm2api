@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 import type { ApiEndpoint } from '@/types/panel-api-endpoints'
 import type { ApiKeyItem, VmPool } from '@/types/panel-keys'
 import type { Vm } from '@/types/panel-vm'
+import { slotDisplayTitle, slotRawEmail } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -475,8 +476,11 @@ export function KeyLimitsDialog({
                               }))
                             }}
                           />
-                          <span className='truncate'>
-                            {vm.name || vm.email || vm.id}
+                          <span
+                            className='truncate'
+                            title={slotRawEmail(vm) || vm.name || vm.id}
+                          >
+                            {slotDisplayTitle(vm)}
                           </span>
                           <span className='font-mono text-xs text-muted-foreground'>
                             {vm.id}

@@ -434,7 +434,7 @@ describe('VM account column kernel label', () => {
     expect(html).toContain('aria-label="anthropic"')
     for (const label of [
       'vm-01',
-      'account@ex…',
+      'accou...@examp',
       'Max',
       'kvm',
       'oauth',
@@ -655,10 +655,47 @@ describe('Gemini VM page full UI alignment', () => {
     expect(detail).toContain('成本')
     expect(detail).toContain('$3.45')
 
-    // 5. SlotIdentity identifies Gemini instead of Claude
+    // 5. SlotIdentity identifies Gemini instead of Claude and formats detected email
     const identity = renderNode(<SlotIdentity vm={gemini} compact />)
     expect(identity).toContain('>Gemini</span>')
+    expect(identity).toContain('>gem@examp</span>')
+    expect(identity).toContain('title="Gemini Pro 1 · gem@example.com"')
     expect(identity).not.toContain('>Claude</span>')
+
+    // 5b. All slot types (Claude / Codex / Gemini) format detected emails as 5-char prefix + ... + @ + 5-char domain
+    const sampleEmail = '12345678@gmail21321.com'
+    const allSlots: Vm[] = [
+      {
+        id: 'vm-c1',
+        name: 'Claude 1',
+        platform: 'anthropic',
+        email: sampleEmail,
+        has_token: true,
+      },
+      {
+        id: 'vm-o1',
+        name: 'Codex 1',
+        platform: 'openai',
+        family: 'codex',
+        email: sampleEmail,
+        has_token: true,
+      },
+      { ...gemini, id: 'gem-e1', email: sampleEmail },
+    ]
+    for (const slot of allSlots) {
+      expect(renderNode(<VmTable vms={[slot]} />)).toContain(
+        '>12345...@gmail</span>'
+      )
+      expect(
+        renderNode(<VmRack vms={[slot]} filter='all' size='l' />)
+      ).toContain('>12345...@gmail</div>')
+      expect(
+        renderNode(<VmRack vms={[slot]} filter='all' size='s' />)
+      ).toContain('>12345...@gmail</div>')
+      expect(renderNode(<SlotIdentity vm={slot} compact />)).toContain(
+        '>12345...@gmail</span>'
+      )
+    }
 
     // 6. Probed Gemini participates in remain sort alongside normal slots
     const claudeLow: Vm = {

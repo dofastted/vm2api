@@ -36,6 +36,7 @@ import {
 import { fmtResetClock, resetCountdown } from '@/lib/fable-status'
 import { fmtMs, fmtNum, fmtUsd } from '@/lib/format'
 import { cn } from '@/lib/utils'
+import { slotDisplayTitle, slotRawEmail } from '@/lib/vm-kind'
 import { accountStatus, vmRunning } from '@/lib/vm-status'
 import {
   fmtHitPct,
@@ -734,8 +735,11 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             <BarChart3 className='size-5' />
           </span>
           <div className='min-w-0'>
-            <div className='truncate font-semibold'>
-              {vm.name || vm.email || vm.id}
+            <div
+              className='truncate font-semibold'
+              title={slotRawEmail(vm) || vm.name || vm.id}
+            >
+              {slotDisplayTitle(vm)}
             </div>
             <div className='text-xs text-muted-foreground'>
               近 {usage?.days ?? 30} 天用量 · 官方价
