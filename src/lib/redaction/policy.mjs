@@ -1,7 +1,15 @@
-const WORD_LIMIT = 256
-const WORD_BYTES = 1024
-const WORDS_BYTES = 64 * 1024
-const RULE_LIMIT = 32
+export const REDACTION_WORD_LIMIT = 256
+export const REDACTION_WORD_BYTES = 1024
+export const REDACTION_WORDS_BYTES = 64 * 1024
+export const REDACTION_RULE_LIMIT = 32
+export const REDACTION_PREFIX_MIN = 3
+export const REDACTION_PREFIX_MAX = 64
+export const REDACTION_REGEX_MAX = 300
+
+const WORD_LIMIT = REDACTION_WORD_LIMIT
+const WORD_BYTES = REDACTION_WORD_BYTES
+const WORDS_BYTES = REDACTION_WORDS_BYTES
+const RULE_LIMIT = REDACTION_RULE_LIMIT
 
 export function defaultRedaction() {
   return {
@@ -55,17 +63,29 @@ function cleanKinds(kinds) {
   return out
 }
 
-function cleanRules(rules) {
+function cleanRules(rules, { strict = false } = {}) {
   if (!Array.isArray(rules)) throw fail('redaction.rules must be a list')
-  if (rules.length > RULE_LIMIT) throw fail('redaction.rules exceeds 32')
+  if (rules.length > RULE_LIMIT) throw fail(`redaction.rules exceeds ${RULE_LIMIT}`)
   return rules
-    .map((rule) => {
+    .map((rule, index) => {
       if (!rule || typeof rule !== 'object' || Array.isArray(rule)) throw fail('redaction.rules entry is invalid')
       const kind = rule.kind == null ? '' : String(rule.kind)
       const prefix = rule.prefix == null ? '' : String(rule.prefix).trim()
       const regex = rule.regex == null ? '' : String(rule.regex).trim()
       if (prefix && regex) throw fail('a redaction rule has a prefix or a regex, not both')
-      if (!prefix && !regex) return null
+      if (!prefix && !regex) {
+        if (strict) throw fail(`redaction.rules[${index}] requires a non-empty prefix or regex`)
+        return null
+      }
+      if (strict && prefix) {
+        const prefixBytes = Buffer.byteLength(prefix)
+        if (prefixBytes < REDACTION_PREFIX_MIN || prefixBytes > REDACTION_PREFIX_MAX) {
+          throw fail(`redaction.rules[${index}].prefix must be ${REDACTION_PREFIX_MIN}-${REDACTION_PREFIX_MAX} bytes`)
+        }
+      }
+      if (strict && regex && Buffer.byteLength(regex) > REDACTION_REGEX_MAX) {
+        throw fail(`redaction.rules[${index}].regex exceeds ${REDACTION_REGEX_MAX} bytes`)
+      }
       return { kind, prefix, regex }
     })
     .filter(Boolean)
@@ -74,8 +94,10 @@ function cleanRules(rules) {
 /**
  * Normalize a routing.redaction object. Missing means the default off policy.
  * Explicit garbage is rejected; it is not coerced to disabled.
+ * Pass `{ strict: true }` on API writes to reject empty/oversized rules instead
+ * of silently dropping blank entries (disk reads stay lenient for legacy files).
  */
-export function normalizeRedaction(value) {
+export function normalizeRedaction(value, { strict = false } = {}) {
   if (value == null) return defaultRedaction()
   if (typeof value !== 'object' || Array.isArray(value)) throw fail('redaction must be an object')
   const allowed = new Set(['enabled', 'secrets', 'personal', 'words', 'wordsAnyCase', 'rules', 'kinds', 'allow'])
@@ -88,7 +110,7 @@ export function normalizeRedaction(value) {
   if (value.wordsAnyCase != null && typeof value.wordsAnyCase !== 'boolean')
     throw fail('redaction.wordsAnyCase must be boolean')
   const words = cleanWords(value.words || [], 'words')
-  const rules = cleanRules(value.rules || [])
+  const rules = cleanRules(value.rules || [], { strict })
   const kinds = cleanKinds(value.kinds)
   const allow = cleanWords(value.allow || [], 'allow')
   if (value.enabled && !value.secrets && !value.personal && words.length === 0 && rules.length === 0) {
@@ -104,4 +126,11 @@ export function normalizeRedaction(value) {
     kinds,
     allow,
   }
+}
+
+/** PUT /api/panel/routing strict check for redaction patches. */
+export function validateRedactionPatch(body = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return
+  if (!Object.prototype.hasOwnProperty.call(body, 'redaction')) return
+  normalizeRedaction(body.redaction, { strict: true })
 }

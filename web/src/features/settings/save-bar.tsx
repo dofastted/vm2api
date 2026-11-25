@@ -11,11 +11,13 @@ import { Button } from '@/components/ui/button'
  */
 export function SaveBar({
   blockedReason,
+  summary,
   saving,
   onSave,
   onDiscard,
 }: {
   blockedReason?: string
+  summary?: string
   saving: boolean
   onSave: () => void
   onDiscard: () => void
@@ -32,7 +34,9 @@ export function SaveBar({
             <span className='truncate'>{blockedReason}</span>
           </span>
         ) : (
-          <span className='text-sm text-muted-foreground'>有未保存的更改</span>
+          <span className='truncate text-sm text-muted-foreground'>
+            {summary || '有未保存的更改'}
+          </span>
         )}
         <div className='flex shrink-0 items-center gap-2'>
           <Button
