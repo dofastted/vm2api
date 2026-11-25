@@ -44,15 +44,20 @@ export function slotState(
     return { ...base, live: 'unknown', label: '探测原生状态', probing: true }
   }
   if (observed?.state === 'launch_policy') {
+    const live: LiveKey = !confirmed
+      ? vm.status === 'stopped'
+        ? 'parked'
+        : 'unknown'
+      : !on
+        ? 'off'
+        : observed.upload_confirmed
+          ? 'live'
+          : observed.last_error
+            ? 'blocked'
+            : 'policy'
     return {
       ...base,
-      live: confirmed
-        ? on
-          ? 'policy'
-          : 'off'
-        : vm.status === 'stopped'
-          ? 'parked'
-          : 'unknown',
+      live,
       label:
         !confirmed && vm.status === 'stopped'
           ? '槽已停 · 启动后核验 CRAG'

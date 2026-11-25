@@ -422,3 +422,107 @@ test('CRAG telemetry publishes settings, uses authenticated apply, and restores 
   }
   assert.deepEqual(events, [])
 })
+
+test('CRAG telemetry upload verification surfaces confirmed uploads, errors, and sanitized fields', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-telemetry-upload-'))
+  const id = 'vm-02'
+  const slotDir = path.join(root, 'vms', id)
+  const runDir = path.join(slotDir, 'run')
+  const vmPath = path.join(root, 'vms', `${id}.json`)
+  writeSlot(root, id, { dataplane: 'crag', schedulable: true, seed_policy: { telemetry_disabled: false } })
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.writeFileSync(path.join(runDir, 'internal.token'), 'fixture-internal-token')
+  let uploadState = { upload_confirmed: false, last_upload_at: null, last_error: null }
+  const server = http.createServer(async (req, res) => {
+    res.setHeader('content-type', 'application/json')
+    if (req.headers['x-internal-token'] !== 'fixture-internal-token') {
+      res.writeHead(401).end('{}')
+      return
+    }
+    if (req.url === '/internal/health') {
+      res.end(
+        JSON.stringify({
+          ok: true,
+          runtime_variant: 'crag-v2',
+          crag_telemetry_apply_v1: true,
+          crag_telemetry_upload_v1: true,
+        }),
+      )
+      return
+    }
+    if (req.url === '/internal/v1/telemetry/apply' && req.method === 'POST') {
+      let raw = ''
+      for await (const chunk of req) raw += chunk
+      const { enabled } = JSON.parse(raw)
+      res.end(
+        JSON.stringify({
+          ok: true,
+          applied: true,
+          enabled,
+          scope: 'native_claude_launch',
+          ...uploadState,
+        }),
+      )
+      return
+    }
+    res.writeHead(404).end('{}')
+  })
+  await new Promise((resolve, reject) => server.once('error', reject).listen(path.join(runDir, 'kernel.sock'), resolve))
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const probe = () => readSlotProcessStatus({ projectRoot: root, vm: JSON.parse(fs.readFileSync(vmPath, 'utf8')) })
+
+  assert.deepEqual((await probe()).telemetry, {
+    state: 'launch_policy',
+    enabled: true,
+    error: null,
+    upload_confirmed: false,
+    upload_supported: true,
+    last_upload_at: null,
+    last_error: null,
+  })
+
+  uploadState = { upload_confirmed: true, last_upload_at: '2026-11-26T00:05:00.000Z', last_error: null }
+  assert.deepEqual((await probe()).telemetry, {
+    state: 'launch_policy',
+    enabled: true,
+    error: null,
+    upload_confirmed: true,
+    upload_supported: true,
+    last_upload_at: '2026-11-26T00:05:00.000Z',
+    last_error: null,
+  })
+
+  uploadState = {
+    upload_confirmed: false,
+    last_upload_at: '2026-11-26T00:05:00.000Z',
+    last_error: 'http_403',
+  }
+  assert.deepEqual((await probe()).telemetry, {
+    state: 'launch_policy',
+    enabled: true,
+    error: null,
+    upload_confirmed: false,
+    upload_supported: true,
+    last_upload_at: '2026-11-26T00:05:00.000Z',
+    last_error: 'http_403',
+  })
+
+  // Malformed free-text errors and invalid timestamps are sanitized out.
+  uploadState = {
+    upload_confirmed: false,
+    last_upload_at: 'not-a-timestamp',
+    last_error: 'https://secret.example/token',
+  }
+  assert.deepEqual((await probe()).telemetry, {
+    state: 'launch_policy',
+    enabled: true,
+    error: null,
+    upload_confirmed: false,
+    upload_supported: true,
+    last_upload_at: null,
+    last_error: null,
+  })
+})

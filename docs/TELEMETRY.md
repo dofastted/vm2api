@@ -166,10 +166,16 @@ an unavailable worker remains unconfirmed. Stopped slots are not started.
 The telemetry page's recheck reads the running worker's authenticated policy
 without republishing configuration or restarting anything. It requires
 `crag_telemetry_apply_v1` (available in CRAG 3.1.4) and shows an unconfirmed
-state when the running worker cannot attest the saved policy. A successful
-check reports `upload_confirmed: false`: it does not attest a running sender,
-an emptied queue, or network delivery. The managed upload interval is not
-applied to CRAG's official Claude process.
+state when the running worker cannot attest the saved policy. Workers that also
+advertise `crag_telemetry_upload_v1` observe real native Claude Code batch
+uploads to `https://api.anthropic.com/api/event_logging/v2/batch`, append
+sanitized counts-only lines (`at`, `ok`, `events`, `error`, `source: "crag"`)
+to `run/telemetry-upload.log` (capped at 40 lines), and report actual
+`upload_confirmed`, `last_upload_at`, and `last_error` in
+`POST /internal/v1/telemetry/apply` without fabricating test telemetry. Older
+CRAG workers without `crag_telemetry_upload_v1` continue to report
+`upload_confirmed: false`. The managed upload interval is not applied to CRAG's
+official Claude process.
 
 ### Official initialization
 
