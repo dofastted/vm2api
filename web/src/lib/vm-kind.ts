@@ -118,6 +118,50 @@ function slotNumber(value: string): number | null {
   return matched ? Number(matched[1]) : null
 }
 
+/**
+ * 槽位邮箱脱敏展示（全槽位 SSOT）：
+ * 前缀保留 5 个字符（超出补 `...`），`@` 后保留 5 个字符。
+ * 例如：`12345678@gmail21321.com` → `12345...@gmail`。
+ */
+export function formatSlotEmail(
+  email: string,
+  prefixLen = 5,
+  domainLen = 5
+): string {
+  const value = String(email || '').trim()
+  if (!value) return ''
+  const at = value.lastIndexOf('@')
+  if (at <= 0 || at === value.length - 1) return clipLabel(value)
+  const localChars = Array.from(value.slice(0, at))
+  const domainChars = Array.from(value.slice(at + 1))
+  const localShown =
+    localChars.length > prefixLen
+      ? `${localChars.slice(0, prefixLen).join('')}...`
+      : localChars.join('')
+  const domainShown = domainChars.slice(0, domainLen).join('')
+  return `${localShown}@${domainShown}`
+}
+
+/** 读取任意槽位（Claude / Codex / Gemini）探测到的原始邮箱。 */
+export function slotRawEmail(
+  vm?: Pick<Vm, 'email' | 'gemini'> | null,
+  fallbackEmail?: string | null
+): string {
+  return String(
+    vm?.email || vm?.gemini?.account?.email || fallbackEmail || ''
+  ).trim()
+}
+
+/** 槽位展示名：能探测到邮箱则优先显示脱敏邮箱，否则回退名称或 ID。 */
+export function slotDisplayTitle(
+  vm?: Pick<Vm, 'id' | 'name' | 'email' | 'gemini'> | null,
+  fallbackEmail?: string | null
+): string {
+  const raw = slotRawEmail(vm, fallbackEmail)
+  if (raw) return formatSlotEmail(raw)
+  return String(vm?.name || vm?.id || '').trim() || '未绑定账号'
+}
+
 /** 卡片 / 表格用：本地段优先，域名过长只留尾标。完整地址走 title。 */
 export function compactEmail(email: string, max = 22): string {
   const value = String(email || '').trim()

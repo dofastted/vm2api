@@ -43,7 +43,7 @@ import {
   SLOT_BG,
   type SlotState,
 } from '@/lib/vm-health'
-import { clipLabel } from '@/lib/vm-kind'
+import { clipLabel, formatSlotEmail, slotRawEmail } from '@/lib/vm-kind'
 import {
   claudeTier,
   poolStatus,
@@ -569,6 +569,7 @@ function ProdCell({ vm }: { vm: Vm }) {
     vm.gemini?.auth_method === 'oauth'
   const registration = credentialRegistrationOf(vm)
   const node = vm.node_name || vm.node_id || 'local'
+  const email = slotRawEmail(vm)
   return (
     <>
       <PlatformMark vm={vm} />
@@ -604,9 +605,9 @@ function ProdCell({ vm }: { vm: Vm }) {
           'min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground',
           SEC
         )}
-        title={vm.email || ''}
+        title={email}
       >
-        {vm.email ? clipLabel(vm.email) : '未绑定邮箱'}
+        {email ? formatSlotEmail(email) : '未绑定邮箱'}
       </span>
       <span
         className={cn(

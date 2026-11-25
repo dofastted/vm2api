@@ -17,6 +17,7 @@ import {
 } from '@/lib/gemini-account-status'
 import { isGeminiHostIssue } from '@/lib/gemini-recovery'
 import { cn } from '@/lib/utils'
+import { formatSlotEmail } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -735,7 +736,9 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
       </div>
       <div>
         <dt className='text-muted-foreground'>账号</dt>
-        <dd>{account?.email || '未提供'}</dd>
+        <dd title={account?.email || undefined}>
+          {account?.email ? formatSlotEmail(account.email) : '未提供'}
+        </dd>
       </div>
       <div>
         <dt className='text-muted-foreground'>项目 / 地区 / 订阅</dt>

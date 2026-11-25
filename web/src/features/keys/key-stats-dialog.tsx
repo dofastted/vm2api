@@ -13,6 +13,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { fmtMs, fmtNum, fmtUsd } from '@/lib/format'
+import { slotDisplayTitle } from '@/lib/vm-kind'
 import { cacheHitPct } from '@/lib/vm-usage'
 import {
   Dialog,
@@ -71,7 +72,7 @@ function StatsBody({ item, vms }: { item: ApiKeyItem; vms: Vm[] }) {
   const usage = q.data?.usage_stats ?? null
   const view = summarizeUsageStats(usage)
   const today = view?.summary.today
-  const names = new Map(vms.map((vm) => [vm.id, vm.name || vm.email || vm.id]))
+  const names = new Map(vms.map((vm) => [vm.id, slotDisplayTitle(vm)]))
   const vmRows: VmUsageStatsRank[] = (usage?.vms ?? []).map((row) => ({
     ...row,
     name: names.get(row.name) || row.name,
