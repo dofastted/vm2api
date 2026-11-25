@@ -64,6 +64,8 @@ const OAUTH_RUNTIME_LABELS: Readonly<Record<string, string>> = {
   gemini_oauth_tools_missing: '宿主缺少 Google 授权所需工具',
   gemini_egress_unavailable: '宿主缺少可用的 kin-egress',
   gemini_ipv4_forwarding_unavailable: '宿主 IPv4 转发未就绪',
+  gemini_sandbox_apparmor_restricted: '宿主 AppArmor 限制了 Gemini 沙箱',
+  gemini_sandbox_unavailable: '宿主非特权沙箱（bwrap）不可用',
 }
 
 export function geminiHostBlocker(
@@ -143,6 +145,8 @@ const INFERENCE_ERROR_LABELS: Readonly<Record<string, string>> = {
   gemini_inference_output_limit: '响应超过长度限制',
   gemini_inference_tool_blocked: '不支持工具调用',
   gemini_native_config_invalid: 'CRAGGemini 配置被载荷拒绝',
+  gemini_sandbox_apparmor_restricted: '宿主 AppArmor 限制了 Gemini 沙箱',
+  gemini_sandbox_unavailable: '宿主非特权沙箱不可用',
   license_required: '未绑定 CRAGGemini 订阅席位',
   license_expired: 'CRAGGemini 订阅许可已过期',
   license_not_yet_valid: 'CRAGGemini 许可尚未生效',
@@ -298,6 +302,10 @@ const INFERENCE_ERROR_ACTIONS: Readonly<Record<string, string>> = {
     '处理方式：本地桥接握手超时，请稍候重试或检查宿主机 vm2api-gemini 日志。',
   gemini_authorization_unavailable:
     '处理方式：宿主服务在线但未能拉起授权进程，请检查宿主机日志与绑定代理的出口连通性。',
+  gemini_sandbox_apparmor_restricted:
+    '处理方式：宿主机 AppArmor 限制了非特权 user namespace，请前往「设置 → Gemini 维护」执行「修复安装」或在宿主机运行 prepare-gemini。',
+  gemini_sandbox_unavailable:
+    '处理方式：宿主机非特权沙箱（bwrap）不可用，请前往「设置 → Gemini 维护」诊断宿主并检查 bubblewrap 与服务日志。',
   license_required:
     '处理方式：请在「账号」页为当前环境绑定可用的 CRAGGemini 订阅席位。',
   license_expired:

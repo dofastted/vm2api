@@ -203,6 +203,10 @@ const OAUTH_ISSUES = {
   gemini_oauth_tools_missing: '宿主缺少 Google 授权所需工具。',
   gemini_egress_unavailable: '宿主缺少可用的 kin-egress。',
   gemini_ipv4_forwarding_unavailable: '宿主 IPv4 转发未就绪。',
+  gemini_sandbox_apparmor_restricted:
+    '宿主机 AppArmor 限制了非特权 user namespace，导致 Gemini 沙箱无法启动，请前往「设置 → Gemini 维护」修复或在宿主机运行 prepare-gemini。',
+  gemini_sandbox_unavailable:
+    '宿主机非特权沙箱（bwrap）不可用，无法启动 Gemini 隔离进程。',
 }
 
 export function geminiPayloadIssue(inventory?: GeminiInventory) {

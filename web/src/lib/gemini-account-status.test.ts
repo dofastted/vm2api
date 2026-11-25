@@ -168,6 +168,32 @@ describe('Gemini account presentation', () => {
     const blocked = { ...slot(candidate), unschedulable_text: hostBlocker }
     expect(vmCredDead(blocked)).toBe(false)
     expect(credentialStatus(blocked).text).toBe('已完成官方 Google 授权')
+    expect(
+      geminiHostBlocker(candidate, {
+        available: true,
+        payload_state: 'installed',
+        oauth_runtime_issue: 'gemini_sandbox_apparmor_restricted',
+      })
+    ).toBe('宿主 AppArmor 限制了 Gemini 沙箱')
+    expect(
+      geminiHostBlocker(candidate, {
+        available: true,
+        payload_state: 'installed',
+        oauth_runtime_issue: 'gemini_sandbox_unavailable',
+      })
+    ).toBe('宿主非特权沙箱（bwrap）不可用')
+    expect(
+      geminiInferenceErrorLabel('gemini_sandbox_apparmor_restricted')
+    ).toBe('宿主 AppArmor 限制了 Gemini 沙箱')
+    expect(
+      geminiInferenceErrorAction('gemini_sandbox_apparmor_restricted')
+    ).toContain('prepare-gemini')
+    expect(geminiInferenceErrorLabel('gemini_sandbox_unavailable')).toBe(
+      '宿主非特权沙箱不可用'
+    )
+    expect(geminiInferenceErrorAction('gemini_sandbox_unavailable')).toContain(
+      'bubblewrap'
+    )
   })
 
   it.each([

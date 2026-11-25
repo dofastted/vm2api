@@ -18,6 +18,7 @@ export const geminiCheckLabels: Record<string, string> = {
   pinned_egress: '固定出口代理（kin-egress）',
   runtime_tools: '运行工具依赖',
   ipv4_forwarding: 'IPv4 转发',
+  sandbox: '非特权沙箱（bwrap / AppArmor）',
   google_qualification: 'Google 账号资格与真实推理',
   runtime: '运行环境',
 }
@@ -98,6 +99,19 @@ const MAINTENANCE_ERROR_LABELS: Record<string, string> = {
     '宿主 kin-egress 摘要与发行清单不一致，请先更新控制面与宿主维护服务',
   gemini_maintenance_ipv4_forwarding_disabled:
     '宿主机未开启 IPv4 转发（net.ipv4.ip_forward=0）',
+  gemini_sandbox_apparmor_restricted:
+    '宿主机 AppArmor 限制了非特权 user namespace，导致 Gemini 沙箱无法启动；请执行「修复安装」或在宿主机运行 prepare-gemini',
+  gemini_sandbox_unavailable:
+    '宿主机非特权沙箱（bwrap）不可用，请检查宿主机 bubblewrap、内核 userns 配置与服务日志',
+  gemini_maintenance_sandbox_unverified: '尚未完成非特权沙箱（bwrap）实测检查',
+  gemini_maintenance_apparmor_unavailable:
+    '宿主机启用了 AppArmor userns 限制，但缺少 apparmor_parser、ABI 4.0 或 apparmor.service 未加载',
+  gemini_maintenance_apparmor_policy_conflict:
+    '检测到非 vm2api 托管的 /etc/apparmor.d/vm2api-gemini 策略或符号链接，拒绝覆盖',
+  gemini_maintenance_apparmor_load_failed:
+    '加载 vm2api-gemini AppArmor 策略失败，请检查宿主机 AppArmor 状态与日志',
+  gemini_maintenance_apparmor_load_failed_timeout:
+    '加载 vm2api-gemini AppArmor 策略超时，请检查宿主机 AppArmor 状态与日志',
   gemini_maintenance_google_not_tested:
     '本地自检不含 Google 账号资格与真实推理，请在下方手动试聊验证',
   gemini_oauth_tools_missing:
