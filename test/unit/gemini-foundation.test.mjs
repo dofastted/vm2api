@@ -760,7 +760,7 @@ test('Google Gemini native auth headers (x-goog-api-key and /v1beta ?key=) extra
   assert.match(redacted, /key=\*\*\*REDACTED\*\*\*/)
 })
 
-test('Google account verification ineligibility returns 403 without tripping circuit breaker', async () => {
+test('Google account verification ineligibility returns 403 and counts toward circuit breaker', async () => {
   const tracker = makeCircuitTracker()
   const scheduler = createGeminiScheduler({
     callHost: async (op) => {
@@ -802,8 +802,109 @@ test('Google account verification ineligibility returns 403 without tripping cir
   )
   assert.equal(res.statusCode, 403)
   assert.equal(res.jsonBody().error.code, 'gemini_account_verification_required')
-  assert.equal(tracker.calls.failure.length, 0)
+  assert.equal(tracker.calls.failure.length, 1)
+  assert.equal(tracker.calls.probe.length, 0)
+})
+
+test('Gemini upstream 400 counts toward circuit breaker without failover while local unsupported turn and license 403 do not', async () => {
+  const tracker = makeCircuitTracker()
+  let mode = 'http400'
+  let inferCalls = 0
+  const scheduler = createGeminiScheduler({
+    callHost: async (op, input) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-a',
+              proxy_id: 'proxy-1',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-3-flash'],
+              capabilities: [...NATIVE_TUI_CAPABILITIES],
+            },
+            {
+              id: 'env-b',
+              proxy_id: 'proxy-1',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-3-flash'],
+              capabilities: [...NATIVE_TUI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') return { id: input.id, proxy_id: 'proxy-1', auth_method: 'oauth' }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: async () => {
+      inferCalls += 1
+      if (mode === 'http400') {
+        return sseResponse([JSON.stringify({ code: 'gemini_invalid_request', message: 'bad upstream request' })], {
+          statusCode: 400,
+          contentType: 'application/json',
+        })
+      }
+      if (mode === 'unsupported') {
+        return sseResponse([JSON.stringify({ code: 'gemini_unsupported_turn' })], {
+          statusCode: 400,
+          contentType: 'application/json',
+        })
+      }
+      return sseResponse([JSON.stringify({ code: 'license_required' })], {
+        statusCode: 403,
+        contentType: 'application/json',
+      })
+    },
+    resolveProxy: () => 'socks5h://1.2.3.4:1080',
+    poolScheduler: tracker,
+  })
+  const handler = createGeminiPublicHandler({ json: jsonResponder, readBody: async () => ({}), scheduler })
+
+  // 1. Upstream 400 returns 400 without failover and records circuit failure.
+  const res400 = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1/chat/completions',
+      body: { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hello' }] },
+    }),
+    res400,
+  )
+  assert.equal(res400.statusCode, 400)
+  assert.equal(res400.jsonBody().error.code, 'gemini_invalid_request')
+  assert.equal(inferCalls, 1)
+  assert.equal(tracker.calls.failure.length, 1)
+
+  // 2. Local unsupported turn 400 does NOT record circuit failure.
+  mode = 'unsupported'
+  const resUnsupported = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1/chat/completions',
+      body: { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hello' }] },
+    }),
+    resUnsupported,
+  )
+  assert.equal(resUnsupported.statusCode, 400)
+  assert.equal(tracker.calls.failure.length, 1)
   assert.equal(tracker.calls.probe.length, 1)
+
+  // 3. Local license 403 does NOT record circuit failure.
+  mode = 'license'
+  const resLicense = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1/chat/completions',
+      body: { model: 'gemini-3-flash', messages: [{ role: 'user', content: 'hello' }] },
+    }),
+    resLicense,
+  )
+  assert.equal(resLicense.statusCode, 403)
+  assert.equal(tracker.calls.failure.length, 1)
+  assert.equal(tracker.calls.probe.length, 2)
 })
 
 test('Gemini public ports support /v1 native generateContent, single-model GET, /v1/models ?key= auth, and CORS headers', async () => {
@@ -2174,7 +2275,9 @@ test('429 failover: pre-content SSE meta/start error switches accounts, preserve
       }
       return sseResponse([
         `data: ${JSON.stringify({
-          candidates: [{ content: { role: 'model', parts: [{ text: `ok-from-${payload.id}` }] }, finishReason: 'STOP' }],
+          candidates: [
+            { content: { role: 'model', parts: [{ text: `ok-from-${payload.id}` }] }, finishReason: 'STOP' },
+          ],
         })}\n\n`,
       ])
     },

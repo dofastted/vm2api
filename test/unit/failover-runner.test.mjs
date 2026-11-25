@@ -3383,3 +3383,129 @@ test('timeout tracker: tripCount only counts trips inside the window and prunes 
   assert.equal(vmTimeoutTracker.tripCount(null), 0)
   vmTimeoutTracker.reset()
 })
+
+test('upstream 400 stops without failover while 400 and 403 both count toward UnitCircuit and trip at threshold', async () => {
+  let now = 10_000
+  const unitCircuit = new UnitCircuit({ failureThreshold: 3, openMs: 30_000, now: () => now })
+  const candidates = [
+    { vmId: 'vm-A', accountId: 'account-A', waitMs: 0 },
+    { vmId: 'vm-B', accountId: 'account-B', waitMs: 0 },
+  ]
+  const scheduler = {
+    unitCircuit,
+    async selectAndReserve({ excluded }) {
+      const picked = candidates.find(
+        (item) =>
+          !excluded.has(item.accountId) && !excluded.has(item.vmId) && unitCircuit.inspect(item.accountId, now).ok,
+      )
+      if (!picked) return { ok: false, reason: 'no_eligible_accounts' }
+      const hold = unitCircuit.admit(picked.accountId, now)
+      if (!hold.ok) return { ok: false, reason: hold.reason }
+      return { ...picked, ok: true, release() {} }
+    },
+    markCooldown() {},
+    markSuccess() {},
+    releaseAccountSessions() {},
+  }
+  const runner = new FailoverRunner({ scheduler, config: { same_account_retry_delay_ms: 0 } })
+
+  // 1. Upstream generic 400 stops immediately (no failover) and increments failures to 1.
+  const hop1Vms = []
+  const r1 = await runner.run({
+    requestId: 'req-400-1',
+    canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+    model: 'claude-sonnet-5',
+    callAttempt: ({ candidate }) => {
+      hop1Vms.push(candidate.vmId)
+      return {
+        ok: false,
+        status: 400,
+        terminalState: 'rejected',
+        body: { type: 'error', error: { type: 'invalid_request_error', message: 'bad upstream payload' } },
+      }
+    },
+  })
+  assert.equal(r1.status, 400)
+  assert.deepEqual(hop1Vms, ['vm-A'])
+  assert.equal(unitCircuit.snapshot('account-A').failures, 1)
+  assert.equal(unitCircuit.snapshot('account-A').state, 'closed')
+
+  // 2. Local validation / refusal 400 does NOT increment failures.
+  await runner.run({
+    requestId: 'req-400-local',
+    canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+    model: 'claude-sonnet-5',
+    callAttempt: () => ({
+      ok: false,
+      status: 400,
+      terminalState: 'rejected',
+      body: { type: 'error', error: { code: 'invalid_kernel_request', message: 'local invalid' } },
+    }),
+  })
+  assert.equal(unitCircuit.snapshot('account-A').failures, 1)
+
+  // 3. Upstream 403 fails over to vm-B and increments account-A failures to 2.
+  const hop3Vms = []
+  const r3 = await runner.run({
+    requestId: 'req-403-2',
+    canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+    model: 'claude-sonnet-5',
+    callAttempt: ({ candidate }) => {
+      hop3Vms.push(candidate.vmId)
+      if (candidate.vmId === 'vm-A') {
+        return {
+          ok: false,
+          status: 403,
+          terminalState: 'rejected',
+          body: { type: 'error', error: { type: 'permission_error', message: 'permission denied' } },
+        }
+      }
+      return success('ok-from-b')
+    },
+  })
+  assert.equal(r3.ok, true)
+  assert.deepEqual(hop3Vms, ['vm-A', 'vm-B'])
+  assert.equal(unitCircuit.snapshot('account-A').failures, 2)
+  assert.equal(unitCircuit.snapshot('account-A').state, 'closed')
+
+  // 4. First repairable 400 that STILL fails with 400 after repair counts once -> reaches 3 and opens circuit!
+  let repairAttempt = 0
+  const r4 = await runner.run({
+    requestId: 'req-400-3',
+    canonicalBody: {
+      model: 'claude-sonnet-5',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'hello' }] },
+      ],
+    },
+    model: 'claude-sonnet-5',
+    callAttempt: () => {
+      repairAttempt += 1
+      return {
+        ok: false,
+        status: 400,
+        terminalState: 'rejected',
+        body: { type: 'error', error: { message: 'Conversation must end with a user message' } },
+      }
+    },
+  })
+  assert.equal(repairAttempt, 2)
+  assert.equal(r4.status, 400)
+  assert.equal(unitCircuit.snapshot('account-A').failures, 3)
+  assert.equal(unitCircuit.snapshot('account-A').state, 'open')
+
+  // 5. Next request bypasses tripped vm-A and goes straight to vm-B.
+  const hop5Vms = []
+  const r5 = await runner.run({
+    requestId: 'req-after-trip',
+    canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+    model: 'claude-sonnet-5',
+    callAttempt: ({ candidate }) => {
+      hop5Vms.push(candidate.vmId)
+      return success('routed-to-b')
+    },
+  })
+  assert.equal(r5.ok, true)
+  assert.deepEqual(hop5Vms, ['vm-B'])
+})

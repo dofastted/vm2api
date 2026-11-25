@@ -354,7 +354,7 @@ function CircuitFlow({
             <span className='text-[10px]'>+{threshold - 10}</span>
           ) : null}
         </span>,
-        `连续 ${threshold} 次 5xx`,
+        `连续 ${threshold} 次 400/403/5xx`,
         '529 / 401 不计'
       )}
       {arrow}

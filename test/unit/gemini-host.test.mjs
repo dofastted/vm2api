@@ -999,7 +999,7 @@ test('Gemini gateway uses shared account reservations and each selected environm
   assert.equal(pool.inflight.size, 0)
 })
 
-test('a selected Gemini location rejection stays HTTP 403 and releases the half-open probe', async () => {
+test('a selected Gemini location rejection stays HTTP 403 and counts toward the unit circuit', async () => {
   const account = {
     id: 'gemini-location',
     auth_state: 'authorized',
@@ -1048,7 +1048,12 @@ test('a selected Gemini location rejection stays HTTP 403 and releases the half-
   )
   assert.equal(result.status, 403)
   assert.equal(result.body.error.code, 'gemini_location_unsupported')
-  assert.deepEqual(pool.unitCircuit.inspect(accountId), { ok: true, state: 'half_open', probeAvailable: true })
+  assert.deepEqual(pool.unitCircuit.inspect(accountId), {
+    ok: false,
+    reason: 'circuit_open',
+    until: 3001,
+    state: 'open',
+  })
   assert.equal(pool.unitCircuit.snapshot(accountId).failures, 1)
   assert.equal(pool.inflight.size, 0)
 })

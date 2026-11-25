@@ -334,7 +334,7 @@ export type Vm = {
     reason: string
     detail?: Record<string, unknown> | null
   } | null
-  /** Claude 单元熔断（Codex 为 null）。连续 5xx 达阈值后打开，到期只放 1 个探测。 */
+  /** Claude 单元熔断（Codex 为 null）。连续 400/403/5xx 达阈值后打开，到期只放 1 个探测。 */
   circuit?: VmCircuit | null
   cooldown_until?: number
   cooldown_reason?: string
