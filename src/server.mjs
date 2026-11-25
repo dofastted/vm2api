@@ -986,7 +986,7 @@ function rejectAuth(req, res, error) {
   return false
 }
 
-/** `keyGate: false` (key self-service) skips the managed key's quota / RPM / concurrency gate and the gateway bucket. */
+/** `keyGate: false` (key self-service) skips the managed key's quota / RPM / concurrency gate. */
 function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = false } = {}) {
   req.presentedApiKey = extractApiKey(req)
   const token = extractPanelToken(req) || req.presentedApiKey
@@ -1034,9 +1034,9 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
     })
     return false
   }
-  // Master env API key — unlimited admin
+  // Master env API key — unlimited admin unless KIN_RATE_CAP is explicitly configured
   if (timingSafeEqualStr(token, cfg.api_key)) {
-    if (!allowRate(token)) {
+    if (cfg.limits.rate_capacity_explicit && !allowRate(token)) {
       return rejectAuth(
         req,
         res,
@@ -1086,18 +1086,6 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
   const gate = keyGate ? apiKeyStore.canAccept(managed.record) : { ok: true }
   if (!gate.ok) {
     return rejectAuth(req, res, makeApiKeyGateError(gate))
-  }
-  if (keyGate && !allowRate(token)) {
-    return rejectAuth(
-      req,
-      res,
-      makeError({
-        type: ErrorType.RATE_LIMIT,
-        code: ErrorCode.GATEWAY_RATE_LIMIT,
-        message: 'Gateway rate limit exceeded. Retry later.',
-        status: 429,
-      }),
-    )
   }
   req.apiKeyKind = 'managed'
   req.apiKeyRecord = managed.record

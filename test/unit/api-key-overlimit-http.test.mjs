@@ -6,8 +6,8 @@ import { formatGeminiProtocolError } from '../../src/lib/protocol/gemini-convert
 
 const MODEL = 'claude-haiku-4-5-20251001'
 
-async function gateway(t) {
-  const gw = await startGateway({ env: { KIN_KERNEL_BIN: process.execPath } })
+async function gateway(t, extraEnv = {}) {
+  const gw = await startGateway({ readyMs: 20_000, env: { KIN_KERNEL_BIN: process.execPath, ...extraEnv } })
   t.after(async () => {
     await gw.stop()
     fs.rmSync(gw.project, { recursive: true, force: true })
@@ -120,4 +120,64 @@ test('formatGeminiProtocolError preserves quota_error/rate_limit_error types and
   assert.equal(gem.error.code, 402)
   assert.equal(gem.error.status, 'RESOURCE_EXHAUSTED')
   assert.equal(gem.error.details[0].metadata.limit_type, 'usd_quota')
+})
+
+test('managed key with unlimited concurrency/RPM and >60 RPM follows panel settings instead of built-in 60 gateway bucket', async (t) => {
+  const gw = await gateway(t)
+  const unlimited = await api(gw, 'POST', '/api/panel/api-keys', {
+    body: { name: 'unlimited-burst', max_concurrency: 0, rpm: 0 },
+  })
+  assert.equal(unlimited.status, 201, unlimited.text)
+  assert.equal(unlimited.json.item.max_concurrency, 0)
+  assert.equal(unlimited.json.item.rpm, 0)
+
+  const unlimitedHeaders = { authorization: `Bearer ${unlimited.json.item.key}` }
+  const burst = await Promise.all(
+    Array.from({ length: 65 }, () => api(gw, 'GET', '/v1/models', { headers: unlimitedHeaders })),
+  )
+  for (const res of burst) {
+    assert.equal(res.status, 200, res.text)
+  }
+
+  const highRpm = await api(gw, 'POST', '/api/panel/api-keys', {
+    body: { name: 'rpm-65', max_concurrency: 0, rpm: 65 },
+  })
+  assert.equal(highRpm.status, 201, highRpm.text)
+  const rpmHeaders = { authorization: `Bearer ${highRpm.json.item.key}` }
+  const msgBody = { model: MODEL, max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }
+  for (let i = 0; i < 65; i++) {
+    const res = await api(gw, 'POST', '/v1/messages', { headers: rpmHeaders, body: msgBody })
+    assert.equal(res.status, 200, `request #${i + 1}: ${res.text}`)
+  }
+  const over = await api(gw, 'POST', '/v1/messages', { headers: rpmHeaders, body: msgBody })
+  assert.equal(over.status, 429, over.text)
+  assert.equal(over.json.error.code, 'api_key_rate_limit')
+  assert.equal(over.json.error.details.limit_type, 'rpm')
+  assert.equal(over.json.error.details.limit, 65)
+
+  // Default master key also stays unlimited when KIN_RATE_CAP is unset.
+  const masterBurst = await Promise.all(Array.from({ length: 65 }, () => api(gw, 'GET', '/v1/models')))
+  for (const res of masterBurst) {
+    assert.equal(res.status, 200, res.text)
+  }
+})
+
+test('explicit KIN_RATE_CAP still caps master key while managed key follows its own panel limits', async (t) => {
+  const gw = await gateway(t, { KIN_RATE_CAP: '2', KIN_RATE_REFILL: '0.001' })
+  const created = await api(gw, 'POST', '/api/panel/api-keys', {
+    body: { name: 'managed-independent', max_concurrency: 0, rpm: 0 },
+  })
+  assert.equal(created.status, 201, created.text)
+
+  const headers = { authorization: `Bearer ${created.json.item.key}` }
+  for (let i = 0; i < 5; i++) {
+    const res = await api(gw, 'GET', '/v1/models', { headers })
+    assert.equal(res.status, 200, `managed #${i + 1}: ${res.text}`)
+  }
+
+  // Master key already spent 1 token on POST /api/panel/api-keys; next call consumes token #2, then #3 is 429.
+  assert.equal((await api(gw, 'GET', '/v1/models')).status, 200)
+  const blocked = await api(gw, 'GET', '/v1/models')
+  assert.equal(blocked.status, 429, blocked.text)
+  assert.equal(blocked.json.error.code, 'gateway_rate_limit')
 })

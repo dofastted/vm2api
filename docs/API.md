@@ -251,7 +251,7 @@ curl -sS http://127.0.0.1:8787/v1/usage -H "Authorization: Bearer $KEY"
 
 - 只返回本 Key 的数据：不含槽位、上游账户、代理 / 出口、属主用户、客户端 IP 或其他 Key。
 - 已到期、额度用尽、窗口超限、RPM / 并发已满的 Key **照常可查**，用来看被拦的原因；停用、删除或属主被停用的 Key → `401`（停用为 `api_key_disabled`）。主密钥和面板会话 → `400 managed_key_required`。
-- 不占并发、不计 RPM、不记用量、不进调度，也不消耗网关的按密钥令牌桶；另有按 Key 的限频，每分钟 60 次（突发 60、每秒补 1），超出 `429 gateway_rate_limit` 并带 `retry-after`。
+- 不占并发、不计 RPM、不记用量、不进调度；另有按 Key 的自助查询限频，每分钟 60 次（突发 60、每秒补 1），超出 `429 gateway_rate_limit` 并带 `retry-after`。
 - 限额字段 `limit` 为 `null` 表示不限（面板里填 0）。
 
 ### `GET /v1/me/quota`
