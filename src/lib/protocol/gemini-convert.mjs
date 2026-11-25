@@ -484,10 +484,20 @@ export function geminiFuncName(name) {
   return s
 }
 
+const MCP_CALL_PREFIXES = [
+  'mcp__craggemini__',
+  'mcp_craggemini_',
+  'mcp__crag__',
+  'mcp_crag_',
+]
+
 export function geminiToolNameFromCall(name) {
   let s = String(name || '')
-  if (s.startsWith('mcp__craggemini__') && s.length > 'mcp__craggemini__'.length) {
-    s = s.slice('mcp__craggemini__'.length)
+  for (const prefix of MCP_CALL_PREFIXES) {
+    if (s.startsWith(prefix) && s.length > prefix.length) {
+      s = s.slice(prefix.length)
+      break
+    }
   }
   for (const sep of [':', '.']) {
     const prefix = `${GEMINI_NS}${sep}`
