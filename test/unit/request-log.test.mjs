@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import {
@@ -13,7 +14,10 @@ import {
   logsToJsonl,
 } from '../../src/lib/admin/request-log.mjs'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
+import { mapUpstreamError } from '../../src/lib/core/errors.mjs'
 import { GroupsRepo } from '../../src/lib/db/repos/groups-repo.mjs'
+import { RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
+import { createRespond } from '../../src/lib/http/respond.mjs'
 import { gateVerdict } from '../../src/lib/protocol/intercept-stats.mjs'
 import { UsageLogsView } from '../../src/lib/db/repos/usage-logs-view.mjs'
 
@@ -1438,4 +1442,283 @@ test('start(): missing url yields an empty path, not undefined', () => {
   const store = tmpStore('normal')
   const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { protocol: 'x' })
   assert.equal(ctx.path, '')
+})
+
+test('tapResponse captures writeHead headers (x-request-id, x-should-retry) from real http.ServerResponse + createRespond().json (#1845)', async (t) => {
+  const store = tmpStore('debug')
+  const respond = createRespond({ rewrite: { enabled: false } })
+  const mapped = mapUpstreamError(409, {
+    error: {
+      type: 'partial_provider_output_nonretryable',
+      message: 'Provider output for this continuation was interrupted and cannot be replayed immediately.',
+      details: {
+        retryable: true,
+        prior_reason: 'client_cancelled',
+        interrupted_at: 1795495209,
+        retry_after_sec: 20,
+        recovery_attempts: 1,
+        max_recoveries: 2,
+        recovery_exhausted: false,
+      },
+    },
+  })
+
+  let capturedRequestId = null
+  const server = http.createServer((req, res) => {
+    const ctx = store.start(req, { protocol: 'anthropic.messages', pathName: '/v1/messages' })
+    capturedRequestId = ctx.request_id
+    res._kinRequestId = ctx.request_id
+    store.tapResponse(ctx, res)
+    res.setHeader('retry-after', '20')
+    res.once('finish', () => {
+      store.finish(ctx, {
+        status: mapped.status,
+        error_code: 'upstream_invalid_request',
+        upstream_type: 'partial_provider_output_nonretryable',
+        error_details: mapped.body.error.details,
+      })
+    })
+    respond.json(res, mapped.status, mapped.body)
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve))
+    store.db.close()
+    fs.rmSync(store.dataDir, { recursive: true, force: true })
+  })
+
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/messages`, { method: 'POST' })
+  const payload = await response.json()
+  assert.equal(response.status, 409)
+  assert.equal(response.headers.get('x-request-id'), capturedRequestId)
+  assert.equal(response.headers.get('x-should-retry'), 'false')
+  assert.equal(response.headers.get('retry-after'), '20')
+  assert.equal(payload.error.details.retryable, false)
+
+  // Wait one tick for the server 'finish' listener to flush store.finish().
+  await new Promise((resolve) => setImmediate(resolve))
+  const dbg = store.getDebug(capturedRequestId)
+  assert.ok(dbg?.response)
+  assert.equal(dbg.response.status, 409)
+  assert.equal(dbg.response.headers['x-request-id'], capturedRequestId)
+  assert.equal(dbg.response.headers['x-should-retry'], 'false')
+  assert.equal(dbg.response.headers['retry-after'], '20')
+  assert.match(String(dbg.response.headers['content-type']), /application\/json/)
+})
+
+test('tapResponse handles all Node writeHead signatures, precedence over setHeader, and header redaction (#1845)', async (t) => {
+  const store = tmpStore('debug')
+  const ids = {}
+  const server = http.createServer((req, res) => {
+    const ctx = store.start(req, { protocol: 'anthropic.messages', pathName: req.url })
+    ids[req.url] = ctx.request_id
+    store.tapResponse(ctx, res)
+    res.once('finish', () => store.finish(ctx, { status: res.statusCode }))
+    if (req.url === '/reason-obj') {
+      res.setHeader('x-should-retry', 'true')
+      res.setHeader('x-only-setheader', 'kept')
+      res.writeHead(410, 'Gone', {
+        'X-Should-Retry': 'false',
+        'X-Request-ID': ctx.request_id,
+        'Set-Cookie': 'panel=secret-cookie',
+      })
+      res.end('{"gone":true}')
+      return
+    }
+    if (req.url === '/flat-array') {
+      res.writeHead(409, [
+        'X-Should-Retry',
+        'false',
+        'X-Request-ID',
+        ctx.request_id,
+        'Authorization',
+        'Bearer sk-ant-oat01-ABCDEFGH12345678',
+      ])
+      res.end('{"conflict":true}')
+      return
+    }
+    res.writeHead(409, 'Conflict', [
+      ['X-Should-Retry', 'false'],
+      ['X-Custom', 'tuple-val'],
+    ])
+    res.end('{"tuple":true}')
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve))
+    store.db.close()
+    fs.rmSync(store.dataDir, { recursive: true, force: true })
+  })
+
+  const base = `http://127.0.0.1:${server.address().port}`
+  for (const route of ['/reason-obj', '/flat-array', '/tuple-array']) {
+    const resp = await fetch(`${base}${route}`)
+    await resp.text()
+  }
+  await new Promise((resolve) => setImmediate(resolve))
+
+  const reasonObj = store.getDebug(ids['/reason-obj'])
+  assert.equal(reasonObj.response.status, 410)
+  assert.equal(reasonObj.response.headers['x-should-retry'], 'false')
+  assert.equal(reasonObj.response.headers['x-only-setheader'], 'kept')
+  assert.equal(reasonObj.response.headers['x-request-id'], ids['/reason-obj'])
+  assert.equal(reasonObj.response.headers['set-cookie'], '***REDACTED***')
+
+  const flatArr = store.getDebug(ids['/flat-array'])
+  assert.equal(flatArr.response.status, 409)
+  assert.equal(flatArr.response.headers['x-should-retry'], 'false')
+  assert.equal(flatArr.response.headers['x-request-id'], ids['/flat-array'])
+  assert.equal(flatArr.response.headers.authorization, '***REDACTED***')
+
+  const tupleArr = store.getDebug(ids['/tuple-array'])
+  assert.equal(tupleArr.response.status, 409)
+  assert.equal(tupleArr.response.headers['x-should-retry'], 'false')
+  assert.equal(tupleArr.response.headers['x-custom'], 'tuple-val')
+})
+
+test('normal mode persists sanitized #1705 / 410 error_details, upstream_type, and attempt correlation IDs (#1845)', (t) => {
+  const store = tmpStore('normal')
+  t.after(() => {
+    try {
+      store.db.close()
+    } catch {}
+    fs.rmSync(store.dataDir, { recursive: true, force: true })
+  })
+
+  const ctx409 = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  const attempts = new RequestAttemptsRepo(store.db)
+  attempts.begin({
+    requestId: ctx409.request_id,
+    attemptNo: 1,
+    vmId: 'vm-11',
+    accountId: 'acc-11',
+    model: 'claude-sonnet-4-6',
+    selectionReason: 'sticky',
+  })
+  attempts.complete(ctx409.request_id, 1, {
+    upstreamStatus: 409,
+    errorScope: 'request',
+    errorCode: 'upstream_invalid_request',
+    upstreamType: 'partial_provider_output_nonretryable',
+    errorDetails: {
+      upstream_type: 'partial_provider_output_nonretryable',
+      retryable: false,
+      prior_reason: 'client_cancelled',
+      interrupted_at: 1795495209,
+      retry_after_sec: 20,
+      recovery_attempts: 1,
+      max_recoveries: 2,
+      recovery_exhausted: false,
+      secret_prompt: 'must-drop',
+      nested: { nope: true },
+    },
+    action: 'stop',
+    terminalState: 'rejected',
+    hopRequestId: '11111111-2222-4333-8444-555555555555',
+    providerRunId: 'run_abc123',
+    providerTurnId: 'turn_def456',
+    providerAttemptId: 2,
+    providerRequestId: 'req_upstream_789',
+  })
+
+  const sum409 = store.finish(ctx409, {
+    status: 409,
+    upstream_status: 409,
+    model: 'claude-sonnet-4-6',
+    vm_id: 'vm-11',
+    account_id: 'acc-11',
+    error_code: 'upstream_invalid_request',
+    error_message: 'Provider output interrupted',
+    upstream_type: 'partial_provider_output_nonretryable',
+    error_details: {
+      upstream_type: 'partial_provider_output_nonretryable',
+      retryable: false,
+      prior_reason: 'client_cancelled',
+      interrupted_at: 1795495209,
+      retry_after_sec: 20,
+      recovery_attempts: 1,
+      max_recoveries: 2,
+      recovery_exhausted: false,
+      internal_secret: 'sk-ant-oat01-ABCDEFGH12345678',
+      raw_body: { prompt: 'secret' },
+    },
+  })
+
+  const ctx410 = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  store.finish(ctx410, {
+    status: 410,
+    upstream_status: 410,
+    model: 'claude-sonnet-4-6',
+    error_code: 'upstream_invalid_request',
+    upstream_type: 'invalid_request_error',
+    error_details: {
+      retryable: false,
+      reason: 'handoff_expired',
+      unallowlisted: 'drop-me',
+    },
+  })
+
+  assert.equal(sum409.upstream_type, 'partial_provider_output_nonretryable')
+  assert.deepEqual(sum409.error_details, {
+    upstream_type: 'partial_provider_output_nonretryable',
+    retryable: false,
+    prior_reason: 'client_cancelled',
+    interrupted_at: 1795495209,
+    retry_after_sec: 20,
+    recovery_attempts: 1,
+    max_recoveries: 2,
+    recovery_exhausted: false,
+  })
+  // Normal mode writes no debug log, yet error_details & attempt IDs persist across reopen.
+  assert.equal(store.listDebug({ limit: 5 }).length, 0)
+
+  const reopened = new RequestLogStore({ dataDir: store.dataDir, mode: 'normal' })
+  t.after(() => reopened.db.close())
+  const q = reopened.queryNormal({ q: 'partial_provider_output_nonretryable' })
+  assert.equal(q.total, 1)
+  assert.equal(q.items[0].upstream_type, 'partial_provider_output_nonretryable')
+  assert.equal(q.items[0].error_details.prior_reason, 'client_cancelled')
+  assert.equal(q.items[0].error_details.recovery_attempts, 1)
+  assert.equal(q.items[0].error_details.internal_secret, undefined)
+
+  const view = new UsageLogsView(reopened.db)
+  const batch = view.listBatch({ q: 'partial_provider_output_nonretryable' })
+  assert.equal(batch.logs.length, 1)
+  const row = batch.logs[0]
+  assert.equal(row.upstreamType, 'partial_provider_output_nonretryable')
+  assert.deepEqual(row.errorDetails, sum409.error_details)
+  assert.equal(row.providerChain.length, 1)
+  assert.equal(row.providerChain[0].errorCode, 'upstream_invalid_request')
+  assert.equal(row.providerChain[0].upstreamType, 'partial_provider_output_nonretryable')
+  assert.equal(row.providerChain[0].errorDetails.prior_reason, 'client_cancelled')
+  assert.equal(row.providerChain[0].errorDetails.secret_prompt, undefined)
+  assert.equal(row.providerChain[0].hopRequestId, '11111111-2222-4333-8444-555555555555')
+  assert.equal(row.providerChain[0].providerRunId, 'run_abc123')
+  assert.equal(row.providerChain[0].providerTurnId, 'turn_def456')
+  assert.equal(row.providerChain[0].providerAttemptId, 2)
+  assert.equal(row.providerChain[0].providerRequestId, 'req_upstream_789')
+
+  const row410 = view.listBatch({ request_id: ctx410.request_id }).logs[0]
+  assert.equal(row410.upstreamType, 'invalid_request_error')
+  assert.deepEqual(row410.errorDetails, {
+    upstream_type: 'invalid_request_error',
+    retryable: false,
+    reason: 'handoff_expired',
+  })
+
+  const exported = view.exportRows({ limit: 10 })
+  const csv = logsToCsv(exported.items)
+  assert.match(csv, /upstream_type,error_details/)
+  assert.match(csv, /partial_provider_output_nonretryable/)
+  assert.match(csv, /handoff_expired/)
+  assert.doesNotMatch(csv, /ABCDEFGH12345678/)
+  const jsonl = logsToJsonl(exported.items)
+  assert.match(jsonl, /"prior_reason":"client_cancelled"/)
+  assert.doesNotMatch(jsonl, /ABCDEFGH12345678/)
 })

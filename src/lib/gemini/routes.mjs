@@ -150,6 +150,8 @@ const OAUTH_ISSUES = new Set([
   'gemini_oauth_tools_missing',
   'gemini_egress_unavailable',
   'gemini_ipv4_forwarding_unavailable',
+  'gemini_sandbox_apparmor_restricted',
+  'gemini_sandbox_unavailable',
 ])
 const HOST_ERRORS = {
   ...RUN_ERRORS,
@@ -182,6 +184,14 @@ const HOST_ERRORS = {
     '缺少 Gemini OAuth/TUI 所需工具，请检查宿主 ip、nft、setpriv、bwrap、openvt 和 curl',
   ],
   gemini_ipv4_forwarding_unavailable: [503, '宿主 IPv4 转发未就绪，无法经绑定代理启动 Google 授权'],
+  gemini_sandbox_apparmor_restricted: [
+    503,
+    '宿主机 AppArmor 限制了非特权 user namespace，导致 Gemini 沙箱无法启动；请在宿主机执行 prepare-gemini 或前往「设置 → Gemini 维护」执行修复安装',
+  ],
+  gemini_sandbox_unavailable: [
+    503,
+    '宿主机非特权沙箱（bwrap）不可用，无法启动 Gemini 隔离进程；请前往「设置 → Gemini 维护」诊断宿主并检查宿主服务日志',
+  ],
   // Unregistered codes fall through to FAILURE, which reads as "no host service at
   // all" -- the one answer this is not. The socket answered, so the host is up and
   // it is the authorization launch that failed; losing that sent #1622 looking at
@@ -306,9 +316,18 @@ const AUTH_STAGE_MESSAGES = {
   relay_start: 'Gemini 宿主服务在线，但宿主侧代理中继未能启动，请检查宿主服务日志',
   proxy_probe: 'Gemini 宿主服务在线，但隔离出口无法连通绑定代理，请检查绑定代理可用性与宿主前置代理路径',
   egress_start: 'Gemini 宿主服务在线，但隔离出口转发组件（kin-egress）未能就绪，请检查宿主服务日志',
+  sandbox_denied:
+    'Gemini 宿主服务在线，但宿主机沙箱策略（AppArmor / bwrap）拒绝启动隔离进程，请前往「设置 → Gemini 维护」诊断并修复宿主',
   cli_launch: 'Gemini 宿主服务在线，但 Antigravity CLI 授权进程未能拉起，请检查宿主服务日志与签名载荷',
+  cli_early_exit:
+    'Gemini 宿主服务在线，但 Antigravity CLI 授权进程在输出授权链接前异常退出，请检查宿主服务日志、签名载荷与沙箱状态',
   challenge_wait: 'Gemini 宿主服务在线，但未能在时限内获取 Google 授权链接，请检查绑定代理连通性与宿主服务日志',
 }
+const AUTH_STAGE_CODES = new Set([
+  'gemini_authorization_unavailable',
+  'gemini_sandbox_apparmor_restricted',
+  'gemini_sandbox_unavailable',
+])
 
 function hostError(code, status = 503, extra = null) {
   return Object.assign(new Error(code), { code, status, ...(extra || {}) })
@@ -365,7 +384,7 @@ function hostRequest(socketPath, operation, payload) {
           const data = JSON.parse(Buffer.concat(chunks))
           if (response.statusCode !== 200 && typeof data?.code === 'string' && Object.hasOwn(HOST_ERRORS, data.code)) {
             const stage =
-              data.code === 'gemini_authorization_unavailable' &&
+              AUTH_STAGE_CODES.has(data.code) &&
               typeof data.stage === 'string' &&
               Object.hasOwn(AUTH_STAGE_MESSAGES, data.stage)
                 ? data.stage
@@ -1473,12 +1492,14 @@ export function createGeminiPanelHandler({
       if (Object.hasOwn(HOST_ERRORS, error?.code)) {
         const [status, message] = HOST_ERRORS[error.code]
         const stage =
-          error.code === 'gemini_authorization_unavailable' &&
+          AUTH_STAGE_CODES.has(error.code) &&
           typeof error.stage === 'string' &&
           Object.hasOwn(AUTH_STAGE_MESSAGES, error.stage)
             ? error.stage
             : null
-        return fail(status, error.code, stage ? AUTH_STAGE_MESSAGES[stage] : message, stage ? { stage } : null)
+        const resolvedMessage =
+          error.code === 'gemini_authorization_unavailable' && stage ? AUTH_STAGE_MESSAGES[stage] : message
+        return fail(status, error.code, resolvedMessage, stage ? { stage } : null)
       }
       if (error?.code === 'gemini_proxy_unavailable') return fail(409, error.code, '需要绑定可用的 IPv4 SOCKS5 代理')
       if (error?.code === 'gemini_environment_not_found') return fail(404, error.code, 'Gemini 环境不存在')

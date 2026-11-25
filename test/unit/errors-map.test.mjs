@@ -15,6 +15,10 @@ import {
   isIncompleteAssistantMessage,
   finalizeAssembledAssistantHop,
   mergeAssembledAssistantHop,
+  sanitizeErrorToken,
+  sanitizeErrorDetailsForLog,
+  resolveLoggedErrorCode,
+  extractErrorLogFields,
   CLIENT_POOL_BUSY_MESSAGE,
   CLIENT_POOL_UNAVAILABLE_MESSAGE,
 } from '../../src/lib/core/errors.mjs'
@@ -573,4 +577,119 @@ test('#1215: 410 Gone forwards allowlisted continuation expiration reason and dr
   assert.equal(unknownReason.status, 410)
   assert.equal(unknownReason.body.error.details.retryable, false)
   assert.equal(unknownReason.body.error.details.reason, undefined)
+})
+
+test('#1845: sanitizeErrorDetailsForLog, extractErrorLogFields, and resolveLoggedErrorCode preserve safe #1705/410 diagnostics without leaking secrets', () => {
+  assert.equal(sanitizeErrorToken('partial_provider_output_nonretryable'), 'partial_provider_output_nonretryable')
+  assert.equal(sanitizeErrorToken('sk-ant-oat01-ABCDEFGH12345678'), null)
+  assert.equal(sanitizeErrorToken('Bearer secret'), null)
+  assert.equal(sanitizeErrorToken('has spaces'), null)
+
+  // CRAG 409 partial_provider_output_nonretryable without body.error.code
+  const raw409 = {
+    status: 409,
+    body: {
+      error: {
+        type: 'partial_provider_output_nonretryable',
+        message: 'Provider output interrupted',
+        details: {
+          retryable: true,
+          prior_reason: 'client_cancelled',
+          interrupted_at: 1795495209,
+          retry_after_sec: 20,
+          recovery_attempts: 1,
+          max_recoveries: 2,
+          recovery_exhausted: false,
+          internal_secret: 'sk-ant-oat01-must-not-leak',
+          nested: { prompt: 'secret' },
+        },
+      },
+    },
+  }
+  const mapped409 = mapUpstreamError(raw409.status, raw409.body)
+  const fields409 = extractErrorLogFields(raw409, mapped409)
+  assert.equal(fields409.upstream_type, 'partial_provider_output_nonretryable')
+  assert.deepEqual(fields409.error_details, {
+    upstream_type: 'partial_provider_output_nonretryable',
+    retryable: false,
+    prior_reason: 'client_cancelled',
+    interrupted_at: 1795495209,
+    retry_after_sec: 20,
+    recovery_attempts: 1,
+    max_recoveries: 2,
+    recovery_exhausted: false,
+  })
+  assert.equal(
+    resolveLoggedErrorCode({
+      explicitCode: raw409.body.error.code || null,
+      mappedCode: mapped409.body.error.code,
+      upstreamType: fields409.upstream_type,
+      fallbackCode: 'upstream_error',
+    }),
+    'partial_provider_output_nonretryable',
+  )
+
+  // ISO-8601 interrupted_at is also accepted while arbitrary strings are rejected.
+  const isoDetails = sanitizeErrorDetailsForLog({
+    interrupted_at: '2026-11-26T00:00:00.000Z',
+    prior_reason: 'upstream_timeout',
+  })
+  assert.deepEqual(isoDetails, {
+    prior_reason: 'upstream_timeout',
+    interrupted_at: '2026-11-26T00:00:00.000Z',
+  })
+  assert.equal(sanitizeErrorDetailsForLog({ interrupted_at: 'not-a-timestamp' }), null)
+
+  // 410 Gone enforces CONTINUATION_GONE_REASONS allowlist.
+  const raw410 = {
+    status: 410,
+    body: {
+      error: {
+        type: 'invalid_request_error',
+        message: 'gone',
+        details: { retryable: false, reason: 'handoff_expired', raw_prompt: 'secret' },
+      },
+    },
+  }
+  const mapped410 = mapUpstreamError(410, raw410.body)
+  const fields410 = extractErrorLogFields(raw410, mapped410)
+  assert.equal(fields410.upstream_type, 'invalid_request_error')
+  assert.deepEqual(fields410.error_details, {
+    upstream_type: 'invalid_request_error',
+    retryable: false,
+    reason: 'handoff_expired',
+  })
+  assert.equal(
+    sanitizeErrorDetailsForLog({ reason: 'untrusted_reason', retryable: false }, { status: 410 }).reason,
+    undefined,
+  )
+
+  // Generic 'upstream_error' fallback does not clobber mappedCode or specific upstream_type.
+  assert.equal(
+    resolveLoggedErrorCode({
+      explicitCode: null,
+      mappedCode: 'upstream_rate_limit',
+      upstreamType: 'rate_limit_error',
+      fallbackCode: 'upstream_error',
+    }),
+    'upstream_rate_limit',
+  )
+  assert.equal(
+    resolveLoggedErrorCode({
+      explicitCode: null,
+      mappedCode: 'upstream_error',
+      upstreamType: 'partial_provider_output_nonretryable',
+      fallbackCode: 'upstream_error',
+    }),
+    'partial_provider_output_nonretryable',
+  )
+  assert.equal(
+    resolveLoggedErrorCode({
+      explicitCode: 'tool_turn_expired',
+      mappedCode: 'upstream_invalid_request',
+      upstreamType: 'invalid_request_error',
+      fallbackCode: 'upstream_error',
+    }),
+    'tool_turn_expired',
+  )
 })

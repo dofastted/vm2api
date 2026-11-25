@@ -96,6 +96,11 @@ test('maps check ids, check codes, and failed job error codes to Chinese with se
           state: 'warning',
           code: 'gemini_maintenance_ipv4_forwarding_disabled',
         },
+        {
+          id: 'sandbox',
+          state: 'fail',
+          code: 'gemini_sandbox_apparmor_restricted',
+        },
       ],
       job: {
         id: 'job-2',
@@ -113,8 +118,38 @@ test('maps check ids, check codes, and failed job error codes to Chinese with se
   expect(html).toContain('gemini_maintenance_service_inactive')
   expect(html).toContain('IPv4 转发')
   expect(html).toContain('宿主机未开启 IPv4 转发')
+  expect(html).toContain('非特权沙箱（bwrap / AppArmor）')
+  expect(html).toContain('AppArmor 限制了非特权 user namespace')
+  expect(html).toContain('gemini_sandbox_apparmor_restricted')
   expect(html).toContain('宿主仍有进行中的 Gemini 授权、终端、推理或维护任务')
   expect(html).toContain('gemini_maintenance_busy')
+
+  const unavailableHtml = renderStatus(
+    baseSnapshot({
+      checks: [
+        {
+          id: 'sandbox',
+          state: 'fail',
+          code: 'gemini_sandbox_unavailable',
+        },
+      ],
+      job: {
+        id: 'job-3',
+        action: 'repair',
+        status: 'failed',
+        phase: 'failed',
+        error_code: 'gemini_maintenance_apparmor_policy_conflict',
+        started_at: '2026-11-22T09:00:00Z',
+        finished_at: '2026-11-22T09:00:05Z',
+      },
+    })
+  )
+  expect(unavailableHtml).toContain('非特权沙箱（bwrap）不可用')
+  expect(unavailableHtml).toContain('gemini_sandbox_unavailable')
+  expect(unavailableHtml).toContain('/etc/apparmor.d/vm2api-gemini')
+  expect(unavailableHtml).toContain(
+    'gemini_maintenance_apparmor_policy_conflict'
+  )
 })
 
 test('bootstrap notice offers both local prepare-gemini script and remote curl command', () => {

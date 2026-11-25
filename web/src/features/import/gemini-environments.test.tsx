@@ -145,6 +145,20 @@ test('VM details distinguish missing Antigravity files from OAuth host prerequis
   expect(html).toContain('Antigravity 签名载荷不完整')
   expect(html).toContain('宿主缺少可用的 kin-egress')
   expect(html).toContain('Antigravity 额度与使用分析')
+
+  const apparmorHtml = showGemini(true, 'vm', 'oauth', {
+    payload_state: 'installed',
+    release_activated: true,
+    oauth_runtime_issue: 'gemini_sandbox_apparmor_restricted',
+  })
+  expect(apparmorHtml).toContain('AppArmor 限制了非特权 user namespace')
+
+  const sandboxHtml = showGemini(true, 'vm', 'oauth', {
+    payload_state: 'installed',
+    release_activated: true,
+    oauth_runtime_issue: 'gemini_sandbox_unavailable',
+  })
+  expect(sandboxHtml).toContain('宿主机非特权沙箱（bwrap）不可用')
 })
 
 test('Gemini import only displays eligible platform SOCKS5 and leaves inventory management to VM', () => {

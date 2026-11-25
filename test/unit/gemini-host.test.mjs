@@ -1784,6 +1784,61 @@ test('authorization failing stage survives allowlist and maps to stage-specific 
     assert.equal(err.stage, undefined)
     return true
   })
+
+  // #1847 sandbox_denied / cli_early_exit stages and split sandbox error codes survive allowlist.
+  for (const [newStage, pattern] of [
+    ['sandbox_denied', /沙箱策略/],
+    ['cli_early_exit', /异常退出/],
+  ]) {
+    const panelNewStage = setup((op) => {
+      if (op === 'get') return record
+      if (op === 'authorize') {
+        throw Object.assign(new Error('gemini_authorization_unavailable'), {
+          code: 'gemini_authorization_unavailable',
+          status: 503,
+          stage: newStage,
+        })
+      }
+      throw new Error(`unexpected ${op}`)
+    })
+    const res = await panelNewStage('POST', `/api/panel/gemini/environments/${record.id}/authorization`)
+    assert.equal(res.status, 503)
+    assert.equal(res.body.error.code, 'gemini_authorization_unavailable')
+    assert.equal(res.body.error.stage, newStage)
+    assert.match(res.body.error.message, pattern)
+  }
+
+  for (const [sandboxCode, pattern] of [
+    ['gemini_sandbox_apparmor_restricted', /AppArmor/],
+    ['gemini_sandbox_unavailable', /bwrap/],
+  ]) {
+    const panelSandbox = setup((op) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          oauth_runtime_issue: sandboxCode,
+          environments: [],
+        }
+      }
+      if (op === 'get') return record
+      if (op === 'authorize') {
+        throw Object.assign(new Error(sandboxCode), {
+          code: sandboxCode,
+          status: 503,
+          stage: 'sandbox_denied',
+        })
+      }
+      throw new Error(`unexpected ${op}`)
+    })
+    const listRes = await panelSandbox('GET', '/api/panel/gemini')
+    assert.equal(listRes.status, 200)
+    assert.equal(listRes.body.data.oauth_runtime_issue, sandboxCode)
+    const authRes = await panelSandbox('POST', `/api/panel/gemini/environments/${record.id}/authorization`)
+    assert.equal(authRes.status, 503)
+    assert.equal(authRes.body.error.code, sandboxCode)
+    assert.equal(authRes.body.error.stage, 'sandbox_denied')
+    assert.match(authRes.body.error.message, pattern)
+  }
 })
 
 test('synchronous host errors and polled test-chat runs report the same resident-pool copy for native worker/tty faults', async () => {

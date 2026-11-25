@@ -11,6 +11,9 @@
  * 仍服务于错误归集与导出，由 `types/panel-logs.ts` 描述。
  */
 
+/** 安全脱敏后的标量错误诊断字段（upstream_type / #1705 续传恢复字段 / 410 reason）。 */
+export type LogErrorDetails = Record<string, string | number | boolean>
+
 /** 单次上游尝试，`request_attempts` 直出，按 `attemptNumber` 升序构成供应商链。 */
 export type ProviderChainItem = {
   attemptNumber: number
@@ -26,11 +29,20 @@ export type ProviderChainItem = {
   upstreamStatus: number | null
   /** 错误归属域：client / provider / platform。 */
   errorScope: string | null
+  errorCode?: string | null
+  upstreamType?: string | null
+  errorDetails?: LogErrorDetails | null
   /** 本次尝试的终态（success / exhausted / cooldown / …）。 */
   terminalState: string | null
   action: string | null
   /** 该次尝试是否已把响应提交给下游（= 最终服务方）。 */
   downstreamCommitted: boolean
+  /** 网关发给槽位内核的单跳 request_id，用于对照 `docker logs kin-NN`。 */
+  hopRequestId?: string | null
+  providerRunId?: string | null
+  providerTurnId?: string | null
+  providerAttemptId?: number | null
+  providerRequestId?: string | null
   /** 调度总耗时，包含实际排队；历史记录没有拆分。 */
   waitMs: number | null
   queueWaitMs: number | null
@@ -183,6 +195,8 @@ export type UsageLogRow = {
   errorOwner: 'client' | 'provider' | 'platform' | null
   errorCode: string | null
   errorMessage: string | null
+  upstreamType?: string | null
+  errorDetails?: LogErrorDetails | null
   /** classifyJev 实际 POST 的 state。送审上下文，不是模型指出的命中句。 */
   jevState: string | null
 

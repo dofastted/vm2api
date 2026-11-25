@@ -123,6 +123,50 @@ test('request_attempts.cooldown_until normalizes legacy ISO-8601 strings to inte
   }
 })
 
+test('#1845: SQLite 069 and PostgreSQL 006 migrations add identical usage_logs and request_attempts columns', () => {
+  const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../..')
+  const pgSql = fs.readFileSync(
+    path.join(root, 'src/lib/db/pg/pg-migrations/006_log_error_details_and_hop_correlation.sql'),
+    'utf8',
+  )
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-069-parity-'))
+  try {
+    const db = createDatabase({ dbPath: path.join(tmpDir, 'kin.db') })
+    const cols = (table) =>
+      new Set(
+        db
+          .prepare(`PRAGMA table_info(${table})`)
+          .all()
+          .map((row) => row.name),
+      )
+    const usageCols = cols('usage_logs')
+    const attemptCols = cols('request_attempts')
+    db.close()
+
+    const expectedUsage = ['upstream_type', 'error_details']
+    const expectedAttempts = [
+      'error_code',
+      'upstream_type',
+      'error_details_json',
+      'hop_request_id',
+      'provider_run_id',
+      'provider_turn_id',
+      'provider_attempt_id',
+      'provider_request_id',
+    ]
+    for (const col of expectedUsage) {
+      assert.ok(usageCols.has(col), `SQLite usage_logs missing ${col}`)
+      assert.match(pgSql, new RegExp(`ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS ${col}\\b`))
+    }
+    for (const col of expectedAttempts) {
+      assert.ok(attemptCols.has(col), `SQLite request_attempts missing ${col}`)
+      assert.match(pgSql, new RegExp(`ALTER TABLE request_attempts ADD COLUMN IF NOT EXISTS ${col}\\b`))
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
 test('migrateSqliteToPostgres transfers tables, sanitizes NUL bytes, reconciles seeded groups, preserves origin created_at, resets sequences, verifies parity, and is idempotent', {
   skip: !PG_URL,
 }, async () => {

@@ -45,7 +45,17 @@ function Field({ label, value }: { label: string; value: string | null }) {
   )
 }
 
+function formatErrorDetails(
+  details: ProviderChainItem['errorDetails']
+): string | null {
+  if (!details) return null
+  const entries = Object.entries(details)
+  if (!entries.length) return null
+  return entries.map(([key, value]) => `${key}=${String(value)}`).join(' ')
+}
+
 function AttemptDetails({ item }: { item: ProviderChainItem }) {
+  const detailsText = formatErrorDetails(item.errorDetails)
   return (
     <div className='space-y-2 text-xs'>
       <Field label='槽位' value={item.vmName || item.vmId} />
@@ -64,10 +74,26 @@ function AttemptDetails({ item }: { item: ProviderChainItem }) {
       />
       <Field label='终态' value={terminalStateLabel(item.terminalState)} />
       <Field label='错误域' value={item.errorScope} />
+      <Field label='错误码' value={item.errorCode ?? null} />
+      <Field label='上游错误类型' value={item.upstreamType ?? null} />
+      <Field label='错误详情' value={detailsText} />
       <Field label='动作' value={item.action} />
       <Field
         label='已提交下游'
         value={item.downstreamCommitted ? '是' : '否'}
+      />
+      <Field label='Hop Request ID' value={item.hopRequestId ?? null} />
+      <Field label='Provider Run ID' value={item.providerRunId ?? null} />
+      <Field label='Provider Turn ID' value={item.providerTurnId ?? null} />
+      <Field
+        label='Provider Attempt ID'
+        value={
+          item.providerAttemptId != null ? String(item.providerAttemptId) : null
+        }
+      />
+      <Field
+        label='Provider Request ID'
+        value={item.providerRequestId ?? null}
       />
       <Field
         label='调度总耗时'
@@ -139,7 +165,17 @@ function formatTimeline(row: UsageLogRow): string {
         item.upstreamStatus != null ? `status=${item.upstreamStatus}` : '',
         item.terminalState ? `state=${item.terminalState}` : '',
         item.errorScope ? `scope=${item.errorScope}` : '',
+        item.errorCode ? `code=${item.errorCode}` : '',
+        item.upstreamType ? `upstream_type=${item.upstreamType}` : '',
+        formatErrorDetails(item.errorDetails) ?? '',
         item.action ? `action=${item.action}` : '',
+        item.hopRequestId ? `hop=${item.hopRequestId}` : '',
+        item.providerRunId ? `run=${item.providerRunId}` : '',
+        item.providerTurnId ? `turn=${item.providerTurnId}` : '',
+        item.providerAttemptId != null
+          ? `attempt=${item.providerAttemptId}`
+          : '',
+        item.providerRequestId ? `provider_req=${item.providerRequestId}` : '',
         item.waitMs != null ? `wait=${item.waitMs}ms` : '',
         item.ttftMs != null ? `ttft=${item.ttftMs}ms` : '',
         item.latencyMs != null ? `latency=${item.latencyMs}ms` : '',

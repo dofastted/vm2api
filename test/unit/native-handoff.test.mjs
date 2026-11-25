@@ -6,6 +6,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { createRespond, readBody } from '../../src/lib/http/respond.mjs'
+import { RequestLogStore } from '../../src/lib/admin/request-log.mjs'
+import { RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
+import { UsageLogsView } from '../../src/lib/db/repos/usage-logs-view.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 import { RateLimitService } from '../../src/lib/pool/rate-limit-service.mjs'
@@ -1398,8 +1401,16 @@ test('realtime native handoff completes real max_tokens cut inside tool_use with
   for (const closeToolBlock of [true, false]) {
     const result = summary({ stop_reason: 'max_tokens' })
     const toolStream = [
-      frame({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_cut', name: 'Write', input: {} } }),
-      frame({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"filePath":"/tmp/a' } }),
+      frame({
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'toolu_cut', name: 'Write', input: {} },
+      }),
+      frame({
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'input_json_delta', partial_json: '{"filePath":"/tmp/a' },
+      }),
       ...(closeToolBlock ? [frame({ type: 'content_block_stop', index: 0 })] : []),
     ].join('')
     const sse = start(result) + toolStream + resultFrame(result) + terminalFrames(result)
@@ -1470,3 +1481,249 @@ test('multi-chunk signature_delta appends instead of overwriting', () => {
   const encoded = respState.output[0].encrypted_content.replace(/^anthropic-thinking-v1:/, '')
   assert.equal(JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')).signature, 'part1-part2')
 })
+
+unixTest(
+  '#1845: protocol handler persists hop_request_id, providerResult correlation IDs, #1705 error_details, and writeHead headers',
+  async (t) => {
+    const providerSuccess = summary({
+      schema_version: 2,
+      provider_complete: true,
+      handoff_complete: true,
+      delivery_complete: true,
+      response_valid: true,
+      source: 'provider_http',
+      http_status: 200,
+      public_status: 200,
+      stop_reason: 'end_turn',
+      run_id: 'run_1845_ok',
+      turn_id: 'turn_1845_ok',
+      attempt_id: 2,
+      request_id: 'req_anthropic_ok',
+    })
+    const provider409 = {
+      type: 'kin_provider_result',
+      schema_version: 2,
+      provider_complete: false,
+      usage_complete: false,
+      source: 'crag',
+      http_status: 409,
+      public_status: 409,
+      run_id: 'run_1845_409',
+      turn_id: 'turn_1845_409',
+      attempt_id: 3,
+      request_id: 'req_anthropic_409',
+      error: {
+        type: 'partial_provider_output_nonretryable',
+        message: 'Provider output for this continuation was interrupted and cannot be replayed immediately.',
+        details: {
+          retryable: true,
+          prior_reason: 'client_cancelled',
+          interrupted_at: 1795495209,
+          retry_after_sec: 20,
+          recovery_attempts: 1,
+          max_recoveries: 2,
+          recovery_exhausted: false,
+          internal_secret: 'sk-ant-oat01-must-not-leak',
+        },
+      },
+    }
+
+    let mode = 'ok'
+    const fx = await fixture(
+      async (_req, res) => {
+        if (mode === '409') {
+          res.writeHead(409, {
+            'content-type': 'application/json',
+            'x-kin-provider-result': JSON.stringify(provider409),
+            'retry-after': '20',
+          })
+          res.end(JSON.stringify({ type: 'error', error: provider409.error, _kin_provider_result: provider409 }))
+          return
+        }
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          trailer: 'x-kin-provider-result',
+        })
+        res.write(
+          start(providerSuccess) +
+            textFrames(0, 'done') +
+            resultFrame(providerSuccess) +
+            terminalFrames(providerSuccess),
+        )
+        res.addTrailers({ 'x-kin-provider-result': JSON.stringify(providerSuccess) })
+        res.end()
+      },
+      { capabilities: ['native_handoff_v1', 'provider_result_v2'] },
+    )
+    t.after(() => fx.close())
+
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-nh-1845-'))
+    const logStore = new RequestLogStore({ dataDir, mode: 'debug' })
+    const attemptsRepo = new RequestAttemptsRepo(logStore.db)
+    t.after(() => {
+      logStore.db.close()
+      fs.rmSync(dataDir, { recursive: true, force: true })
+    })
+
+    const runner = new FailoverRunner({
+      attemptsRepo,
+      scheduler: {
+        async selectAndReserve() {
+          return {
+            ok: true,
+            vmId: 'vm-11',
+            accountId: 'acc-11',
+            vm: { id: 'vm-11' },
+            selectionReason: 'sticky',
+            release() {},
+          }
+        },
+        markSuccess() {},
+        markCooldown() {},
+      },
+    })
+
+    const cfg = {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+      paths: { project: dataDir, data: dataDir },
+    }
+    const routing = { failover: { stream_keepalive_ms: 0 } }
+    const handler = createHandleProtocol({
+      ...createRespond(cfg),
+      readBody,
+      cfg,
+      requireAuth: () => true,
+      requestLog: logStore,
+      stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+      groupsRepo: { rateMultiplier: () => 1 },
+      routingConfigPath: path.join(dataDir, 'routing.json'),
+      routingConfig: routing,
+      getRoutingConfig: () => routing,
+      stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
+      apiKeyStore: {},
+      accountQuota: { ingestHeaders() {} },
+      failoverRunner: {
+        run(opts) {
+          return runner.run({
+            ...opts,
+            applyAttempt: null,
+            callAttempt: ({ body, signal, onCommit }) =>
+              streamGoWorker(
+                options(fx, {
+                  envelope: { body, headers: {}, stream: true },
+                  gatewayRequestId: opts.requestId,
+                  signal,
+                  onCommit,
+                }),
+              ),
+          })
+        },
+      },
+    })
+
+    const gateway = http.createServer((req, res) => {
+      req.apiKeyKind = 'master'
+      handler.handleProtocol(req, res, 'anthropic.messages', req.url).catch((error) => {
+        if (!res.headersSent) res.writeHead(500)
+        res.end(String(error.stack))
+      })
+    })
+    await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve))
+    t.after(async () => {
+      gateway.closeAllConnections()
+      await new Promise((resolve) => gateway.close(resolve))
+    })
+
+    const base = `http://127.0.0.1:${gateway.address().port}`
+    const okResp = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-request-id': 'gw-1845-ok' },
+      body: JSON.stringify({
+        model: MODEL,
+        stream: false,
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    })
+    assert.equal(okResp.status, 200)
+    await okResp.json()
+
+    mode = '409'
+    const errResp = await fetch(`${base}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-request-id': 'gw-1845-409' },
+      body: JSON.stringify({
+        model: MODEL,
+        stream: false,
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    })
+    assert.equal(errResp.status, 409)
+    assert.equal(errResp.headers.get('x-request-id'), 'gw-1845-409')
+    assert.equal(errResp.headers.get('x-should-retry'), 'false')
+    await errResp.json()
+    await new Promise((resolve) => setImmediate(resolve))
+
+    assert.equal(fx.requests.length, 2)
+    assert.equal(fx.requests[0].headers['x-gateway-request-id'], 'gw-1845-ok')
+    assert.equal(fx.requests[1].headers['x-gateway-request-id'], 'gw-1845-409')
+    const hopIdOk = fx.requests[0].envelope.request_id
+    const hopId409 = fx.requests[1].envelope.request_id
+    assert.ok(hopIdOk && hopId409 && hopIdOk !== hopId409)
+
+    // Debug hop_meta + response headers verification
+    const dbgOk = logStore.getDebug('gw-1845-ok')
+    assert.equal(dbgOk.hop_meta.hop_request_id, hopIdOk)
+    assert.equal(dbgOk.hop_meta.native_handoff.hop_request_id, hopIdOk)
+    assert.equal(dbgOk.hop_meta.native_handoff.run_id, 'run_1845_ok')
+    assert.equal(dbgOk.hop_meta.native_handoff.turn_id, 'turn_1845_ok')
+    assert.equal(dbgOk.hop_meta.native_handoff.attempt_id, 2)
+    assert.equal(dbgOk.hop_meta.native_handoff.request_id, 'req_anthropic_ok')
+
+    const dbg409 = logStore.getDebug('gw-1845-409')
+    assert.equal(dbg409.response.headers['x-request-id'], 'gw-1845-409')
+    assert.equal(dbg409.response.headers['x-should-retry'], 'false')
+    assert.equal(dbg409.hop_meta.hop_request_id, hopId409)
+    assert.equal(dbg409.hop_meta.native_handoff.run_id, 'run_1845_409')
+    assert.equal(dbg409.hop_meta.native_handoff.turn_id, 'turn_1845_409')
+    assert.equal(dbg409.hop_meta.native_handoff.attempt_id, 3)
+    assert.equal(dbg409.hop_meta.native_handoff.request_id, 'req_anthropic_409')
+
+    // Normal usage_logs + request_attempts + UsageLogsView verification
+    const view = new UsageLogsView(logStore.db)
+    const rowOk = view.listBatch({ request_id: 'gw-1845-ok' }).logs[0]
+    assert.equal(rowOk.providerChain.length, 1)
+    assert.equal(rowOk.providerChain[0].hopRequestId, hopIdOk)
+    assert.equal(rowOk.providerChain[0].providerRunId, 'run_1845_ok')
+    assert.equal(rowOk.providerChain[0].providerTurnId, 'turn_1845_ok')
+    assert.equal(rowOk.providerChain[0].providerAttemptId, 2)
+    assert.equal(rowOk.providerChain[0].providerRequestId, 'req_anthropic_ok')
+
+    const row409 = view.listBatch({ request_id: 'gw-1845-409' }).logs[0]
+    assert.equal(row409.statusCode, 409)
+    assert.equal(row409.errorCode, 'partial_provider_output_nonretryable')
+    assert.equal(row409.upstreamType, 'partial_provider_output_nonretryable')
+    assert.deepEqual(row409.errorDetails, {
+      upstream_type: 'partial_provider_output_nonretryable',
+      retryable: false,
+      prior_reason: 'client_cancelled',
+      interrupted_at: 1795495209,
+      retry_after_sec: 20,
+      recovery_attempts: 1,
+      max_recoveries: 2,
+      recovery_exhausted: false,
+    })
+    assert.equal(row409.providerChain.length, 1)
+    assert.equal(row409.providerChain[0].upstreamType, 'partial_provider_output_nonretryable')
+    assert.equal(row409.providerChain[0].errorDetails.prior_reason, 'client_cancelled')
+    assert.equal(row409.providerChain[0].hopRequestId, hopId409)
+    assert.equal(row409.providerChain[0].providerRunId, 'run_1845_409')
+    assert.equal(row409.providerChain[0].providerTurnId, 'turn_1845_409')
+    assert.equal(row409.providerChain[0].providerAttemptId, 3)
+    assert.equal(row409.providerChain[0].providerRequestId, 'req_anthropic_409')
+  },
+)

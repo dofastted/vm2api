@@ -12,13 +12,16 @@ import {
   CLIENT_POOL_FABLE_RATE_LIMITED_MESSAGE,
   CLIENT_POOL_RATE_LIMITED_MESSAGE,
   clientCancelledResult,
+  extractErrorLogFields,
   isClientCancelledResult,
   isCompleteAssistantMessage,
   isIncompleteAssistantMessage,
   incompleteAssistantClientError,
+  resolveLoggedErrorCode,
   ErrorCode,
   KERNEL_FAILURE_STATUS,
 } from '../core/errors.mjs'
+import { extractProviderCorrelation } from '../protocol/log-fields.mjs'
 import { hasRefreshPresence, readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { kernelFaults } from '../transport/rust-kernel-client.mjs'
@@ -142,6 +145,28 @@ function searchRepairKey(stickyKey, model, selected) {
 
 function usageOf(result) {
   return result?.usage || result?.body?.usage || null
+}
+
+function attemptDiagnostics(result, { includeError = true } = {}) {
+  const corr = extractProviderCorrelation(result)
+  const errFields = includeError && result && !result.ok ? extractErrorLogFields(result) : null
+  const errorCode =
+    includeError && result && !result.ok
+      ? resolveLoggedErrorCode({
+          explicitCode: result?.body?.error?.code,
+          upstreamType: errFields?.upstream_type,
+        })
+      : null
+  return {
+    errorCode,
+    upstreamType: errFields?.upstream_type ?? null,
+    errorDetails: errFields?.error_details ?? null,
+    hopRequestId: corr.hop_request_id,
+    providerRunId: corr.run_id,
+    providerTurnId: corr.turn_id,
+    providerAttemptId: corr.attempt_id,
+    providerRequestId: corr.request_id,
+  }
 }
 
 function verifiedSuccess(result) {
@@ -1328,6 +1353,7 @@ export class FailoverRunner {
             downstreamCommitted: !!(result?.committed || committed),
             terminalState: 'cancelled',
             latencyMs: Date.now() - attemptStarted,
+            ...attemptDiagnostics(result, { includeError: false }),
           })
           releaseStickySlots()
           return { ...clientCancelledResult(result), via: result?.via || 'pool-failover', ...attribution() }
@@ -1459,6 +1485,7 @@ export class FailoverRunner {
           usage: usageOf(result),
           ttftMs: result?.ttftMs ?? null,
           latencyMs: Date.now() - attemptStarted,
+          ...attemptDiagnostics(result, { includeError: !result?.ok }),
         })
         if (typeof onAttempt === 'function') {
           await onAttempt({ attemptNo, selected, result, policy })
@@ -1608,6 +1635,7 @@ export class FailoverRunner {
             downstreamCommitted: false,
             terminalState: 'invalid_request',
             latencyMs: Date.now() - attemptStarted,
+            ...attemptDiagnostics({ ok: false, status: 400, body: error.body }),
           })
           releaseStickySlots()
           return {
@@ -1670,6 +1698,7 @@ export class FailoverRunner {
           downstreamCommitted: committed,
           terminalState: result.terminalState,
           latencyMs: Date.now() - attemptStarted,
+          ...attemptDiagnostics(result),
         })
         if (committed || !shouldContinue(policy)) {
           releaseStickySlots()

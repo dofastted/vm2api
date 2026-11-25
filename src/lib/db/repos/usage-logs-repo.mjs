@@ -165,7 +165,20 @@ const SUMMARY_COLUMNS = [
   'image_input_tokens',
   'image_output_tokens',
   'image_cost',
+  'upstream_type',
+  'error_details',
 ]
+
+function parseErrorDetails(value) {
+  if (value == null || value === '') return null
+  if (typeof value === 'object' && !Array.isArray(value)) return value
+  try {
+    const parsed = JSON.parse(String(value))
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
 
 function toRow(rec) {
   return SUMMARY_COLUMNS.map((c) => {
@@ -174,6 +187,10 @@ function toRow(rec) {
     if (c === 'ip_address') return rec.ip_address ?? rec.ip ?? null
     if (c === 'stream') return rec.stream ? 1 : 0
     if (c === 'has_tools') return rec.has_tools == null ? null : rec.has_tools ? 1 : 0
+    if (c === 'error_details') {
+      if (rec[c] == null || rec[c] === '') return null
+      return typeof rec[c] === 'string' ? rec[c] : JSON.stringify(rec[c])
+    }
     if (c === 'cache_creation_tokens' && rec[c] == null) return null
     if (
       c === 'input_tokens' ||
@@ -199,6 +216,8 @@ function fromRow(row) {
     ip: row.ip_address,
     stream: !!row.stream,
     has_tools: row.has_tools == null ? null : !!row.has_tools,
+    upstream_type: row.upstream_type ?? null,
+    error_details: parseErrorDetails(row.error_details),
   }
 }
 
@@ -549,10 +568,10 @@ export class UsageLogsRepo {
     }
     if (q) {
       where.push(
-        '(LOWER(path) LIKE ? OR LOWER(error_code) LIKE ? OR LOWER(error_message) LIKE ? OR LOWER(request_id) LIKE ?)',
+        '(LOWER(path) LIKE ? OR LOWER(error_code) LIKE ? OR LOWER(error_message) LIKE ? OR LOWER(request_id) LIKE ? OR LOWER(upstream_type) LIKE ?)',
       )
       const like = `%${String(q).slice(0, 100).toLowerCase()}%`
-      params.push(like, like, like, like)
+      params.push(like, like, like, like, like)
     }
     const cond = where.length ? `WHERE ${where.join(' AND ')}` : ''
     const cap = Math.max(1, Math.min(5000, Number(maxLimit) || 500))

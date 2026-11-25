@@ -79,7 +79,7 @@ import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestS
 import { agentSummarySession } from './agent-summary.mjs'
 import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/request-log.mjs'
 import { loggedReasoningEffort } from './thinking.mjs'
-import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
+import { extractProviderCorrelation, reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
 import { ownerScopeFromRequest, pinnedVmIdFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
 import {
   applyVmPool,
@@ -103,6 +103,8 @@ import {
   rewritePoolErrorForClient,
   validateRequestBody,
   mapModelError,
+  extractErrorLogFields,
+  resolveLoggedErrorCode,
   isClientCancelledResult,
   isIncompleteAssistantMessage,
   finalizeAssembledAssistantHop,
@@ -411,7 +413,7 @@ export function createHandleProtocol(deps) {
 
   function mapProtocolClientError(result, logBag, fallbackCode) {
     const opaqueCrag429 = result?.policy?.reason === 'crag_opaque_429'
-    const originalCode = opaqueCrag429 ? result.policy.reason : result?.body?.error?.code || fallbackCode
+    const explicitCode = opaqueCrag429 ? result.policy.reason : result?.body?.error?.code || null
     const originalMessage = result?.body?.error?.message || null
     const details = result?.body?.error?.details || {}
     const policyRefusal =
@@ -429,6 +431,15 @@ export function createHandleProtocol(deps) {
     if (opaqueCrag429) mapped.body.error.message = originalMessage
     const summary = formatPoolSelectionSummary(details)
     const mappedCode = mapped.body?.error?.code
+    const { upstream_type, error_details } = extractErrorLogFields(result, mapped)
+    const loggedCode = resolveLoggedErrorCode({
+      explicitCode,
+      mappedCode,
+      upstreamType: upstream_type,
+      fallbackCode,
+    })
+    logBag.upstream_type = upstream_type
+    logBag.error_details = error_details
     if (mappedCode === ErrorCode.REFUSAL_GUARD || mappedCode === ErrorCode.THIRD_PARTY_CLIENT) {
       // The kernel often names an AUP refusal upstream_invalid_request, and a
       // third-party extra-usage 400 upstream_error. Keep the mapped code so the
@@ -436,14 +447,14 @@ export function createHandleProtocol(deps) {
       logBag.error_code = mappedCode
       logBag.error_message = logBag.error_message || originalMessage || mapped.body?.error?.message || null
     } else {
-      logBag.error_code = originalCode || mappedCode
+      logBag.error_code = loggedCode
       logBag.error_message = summary || originalMessage || mapped.body?.error?.message || null
     }
     if (logBag.classifier) {
       logBag.classifier.error = {
         status: result?.status || null,
         type: result?.body?.error?.type || null,
-        code: originalCode,
+        code: loggedCode || fallbackCode || null,
         upstream_code: result?.body?.error?.upstream_code || null,
         stop_reason: result?.stopReason || null,
         stop_details: result?.stopDetails ?? null,
@@ -637,6 +648,7 @@ export function createHandleProtocol(deps) {
     redactionPrincipal = '',
     redactionSession = '',
     tenantId = '',
+    gatewayRequestId = null,
   }) {
     const assembler = createClaudeMessageAssembler()
     const workerResult = await dispatchStreamInference({
@@ -661,6 +673,7 @@ export function createHandleProtocol(deps) {
       slotWaitMs: candidate.slotWaitMs,
       slotWaitDeadlineMs: candidate.slotWaitDeadlineMs,
       tenantId,
+      gatewayRequestId,
       noGoFallback,
       ensureCredential: (exec) => ensureWorkerCredential(exec),
       redactionPrincipal,
@@ -705,6 +718,8 @@ export function createHandleProtocol(deps) {
       usage: null,
       error_code: null,
       error_message: null,
+      upstream_type: null,
+      error_details: null,
       via: 'go-worker-pool',
       attempt_count: null,
       final_state: null,
@@ -2664,6 +2679,7 @@ export function createHandleProtocol(deps) {
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
               redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
               tenantId,
+              gatewayRequestId: logCtx.request_id,
             })
           }
           const publicStream = replayScope ? createIssuedToolStream() : null
@@ -2714,6 +2730,7 @@ export function createHandleProtocol(deps) {
               slotWaitMs: candidate.slotWaitMs,
               slotWaitDeadlineMs: candidate.slotWaitDeadlineMs,
               tenantId,
+              gatewayRequestId: logCtx.request_id,
               noGoFallback: !!pinVmId,
               ensureCredential: (exec) => ensureWorkerCredential(exec),
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
@@ -2804,14 +2821,23 @@ export function createHandleProtocol(deps) {
     logBag.account_id = result?.accountId || null
     logBag.final_account_id = result?.accountId || null
     if (result?.threadBetas) logBag.hop_meta = { ...logBag.hop_meta, thread_betas: result.threadBetas }
+    const correlation = extractProviderCorrelation(result)
+    if (correlation.hop_request_id) {
+      logBag.hop_meta = { ...logBag.hop_meta, hop_request_id: correlation.hop_request_id }
+    }
     if (result?.nativeHandoff === true) {
       const provider = result.providerResult
       logBag.hop_meta = {
         ...logBag.hop_meta,
         native_handoff: {
+          ...(correlation.hop_request_id ? { hop_request_id: correlation.hop_request_id } : {}),
           message_id: provider?.message_id ?? null,
           stop_reason: provider?.stop_reason ?? null,
           usage_complete: provider?.usage_complete === true,
+          run_id: correlation.run_id,
+          turn_id: correlation.turn_id,
+          attempt_id: correlation.attempt_id,
+          request_id: correlation.provider_request_id,
           ...(provider?.schema_version === 2
             ? {
                 provider_complete: provider.provider_complete,
@@ -2823,6 +2849,20 @@ export function createHandleProtocol(deps) {
                 public_status: provider.public_status ?? null,
               }
             : {}),
+        },
+      }
+    } else if (result?.providerResult) {
+      const provider = result.providerResult
+      logBag.hop_meta = {
+        ...logBag.hop_meta,
+        provider_result: {
+          ...(correlation.hop_request_id ? { hop_request_id: correlation.hop_request_id } : {}),
+          message_id: provider?.message_id ?? null,
+          stop_reason: provider?.stop_reason ?? null,
+          run_id: correlation.run_id,
+          turn_id: correlation.turn_id,
+          attempt_id: correlation.attempt_id,
+          request_id: correlation.provider_request_id,
         },
       }
     }
@@ -2916,7 +2956,14 @@ export function createHandleProtocol(deps) {
       }
       if (!result?.ok) {
         stats.errors++
-        logBag.error_code = result?.body?.error?.code || 'stream_incomplete'
+        const streamErr = extractErrorLogFields(result)
+        logBag.error_code = resolveLoggedErrorCode({
+          explicitCode: result?.body?.error?.code,
+          upstreamType: streamErr.upstream_type,
+          fallbackCode: 'stream_incomplete',
+        })
+        logBag.upstream_type = streamErr.upstream_type
+        logBag.error_details = streamErr.error_details
         logBag.error_message = result?.body?.error?.message || 'Stream did not reach a verified terminal state'
         if (protocol === 'openai.responses' && !res.writableEnded) {
           const { code, message, param = null } = mapProtocolClientError(result, logBag, logBag.error_code).body.error
@@ -3023,6 +3070,8 @@ export function createHandleProtocol(deps) {
       usage: null,
       error_code: null,
       error_message: null,
+      upstream_type: null,
+      error_details: null,
       via: 'codex-search',
       attempt_count: null,
       final_state: null,
@@ -3213,6 +3262,8 @@ export function createHandleProtocol(deps) {
       usage: null,
       error_code: null,
       error_message: null,
+      upstream_type: null,
+      error_details: null,
       via: 'codex-images',
       attempt_count: null,
       final_state: null,

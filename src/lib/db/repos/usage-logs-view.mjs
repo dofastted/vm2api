@@ -170,6 +170,17 @@ function blockedBy(row) {
   return null
 }
 
+function parseErrorDetails(value) {
+  if (value == null || value === '') return null
+  if (typeof value === 'object' && !Array.isArray(value)) return value
+  try {
+    const parsed = JSON.parse(String(value))
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
 /** Raw `usage_logs` row (already `enrichLogRow`-ed) + batched names → `UsageLogRow`. */
 export function toUsageLogRow(row, names, chain = []) {
   const accountId = row.final_account_id || row.account_id || null
@@ -178,6 +189,7 @@ export function toUsageLogRow(row, names, chain = []) {
   const cacheCreation = nullableNum(row.cache_creation_tokens)
   const cacheRead = num(row.cache_read_tokens)
   const blocked = blockedBy(row)
+  const errorDetails = parseErrorDetails(row.error_details)
   return {
     id: row.id,
     requestId: row.request_id ?? null,
@@ -239,6 +251,8 @@ export function toUsageLogRow(row, names, chain = []) {
     errorOwner: row.error_owner ?? null,
     errorCode: row.error_code || null,
     errorMessage: row.error_message || null,
+    upstreamType: row.upstream_type ?? errorDetails?.upstream_type ?? null,
+    errorDetails,
     blockedBy: blocked,
     blockedReason: blocked ? row.error_message || row.error_label || null : null,
     userAgent: row.user_agent || null,
@@ -268,6 +282,7 @@ function attemptWithinRow(attempt, row) {
 }
 
 function toProviderChainItem(r, names) {
+  const errorDetails = parseErrorDetails(r.error_details_json)
   return {
     attemptNumber: num(r.attempt_no),
     vmId: r.vm_id ?? null,
@@ -278,9 +293,17 @@ function toProviderChainItem(r, names) {
     selectionReason: r.selection_reason ?? null,
     upstreamStatus: nullableNum(r.upstream_status),
     errorScope: r.error_scope ?? null,
+    errorCode: r.error_code ?? null,
+    upstreamType: r.upstream_type ?? errorDetails?.upstream_type ?? null,
+    errorDetails,
     terminalState: r.terminal_state ?? null,
     action: r.action ?? null,
     downstreamCommitted: !!r.downstream_committed,
+    hopRequestId: r.hop_request_id ?? null,
+    providerRunId: r.provider_run_id ?? null,
+    providerTurnId: r.provider_turn_id ?? null,
+    providerAttemptId: nullableNum(r.provider_attempt_id),
+    providerRequestId: r.provider_request_id ?? null,
     waitMs: nullableNum(r.wait_ms),
     queueWaitMs: nullableNum(r.queue_wait_ms),
     schedulingMs: nullableNum(r.scheduling_ms),
@@ -376,10 +399,10 @@ function buildFilter(filters, defaultMuted) {
   }
   if (filters.q) {
     where.push(
-      '(LOWER(path) LIKE ? OR LOWER(error_code) LIKE ? OR LOWER(error_message) LIKE ? OR LOWER(request_id) LIKE ?)',
+      '(LOWER(path) LIKE ? OR LOWER(error_code) LIKE ? OR LOWER(error_message) LIKE ? OR LOWER(request_id) LIKE ? OR LOWER(upstream_type) LIKE ?)',
     )
     const like = `%${String(filters.q).slice(0, 100).toLowerCase()}%`
-    params.push(like, like, like, like)
+    params.push(like, like, like, like, like)
   }
   const errorClass = filters.error_class ? String(filters.error_class) : null
   if (errorClass) where.push(ERROR_PRED)
@@ -409,6 +432,8 @@ function exportRow(raw) {
     ip: raw.ip_address,
     stream: !!raw.stream,
     has_tools: raw.has_tools == null ? null : !!raw.has_tools,
+    upstream_type: raw.upstream_type ?? null,
+    error_details: parseErrorDetails(raw.error_details),
   })
 }
 
