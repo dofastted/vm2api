@@ -16,6 +16,8 @@ import type { GeminiEnvironment } from './gemini-environments'
 import {
   GEMINI_INVENTORY_KEY,
   geminiError,
+  geminiProxyAddress,
+  geminiProxyOptionLabel,
   geminiProxyOptions,
   geminiResource,
   isGeminiProxy,
@@ -93,6 +95,19 @@ export function GeminiProxyPanel({
             {bound?.label && bound.label !== boundId ? (
               <Field label='代理名称'>{bound.label}</Field>
             ) : null}
+            {bound && geminiProxyAddress(bound) ? (
+              <Field label='代理地址'>
+                <span className='font-mono'>{geminiProxyAddress(bound)}</span>
+              </Field>
+            ) : null}
+            {bound?.geo?.ip ? (
+              <Field label='出口 IP'>
+                <span className='font-mono'>{bound.geo.ip}</span>
+                {bound.geo.country_code || bound.geo.country
+                  ? ` · ${bound.geo.country_code || bound.geo.country}`
+                  : null}
+              </Field>
+            ) : null}
             {boundId ? (
               <Field label='绑定状态'>
                 {environment.proxy_ready === false ||
@@ -147,9 +162,7 @@ export function GeminiProxyPanel({
               <SelectContent>
                 {candidates.map((proxy) => (
                   <SelectItem key={proxy.id} value={proxy.id}>
-                    {proxy.label && proxy.label !== proxy.id
-                      ? `${proxy.label} · ${proxy.id}`
-                      : proxy.id}
+                    {geminiProxyOptionLabel(proxy)}
                   </SelectItem>
                 ))}
               </SelectContent>

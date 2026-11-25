@@ -17,9 +17,17 @@ export function geminiResource(id: string) {
   return `${GEMINI_ROOT}/environments/${encodeURIComponent(id)}`
 }
 
-type GeminiProxy = {
+export type GeminiProxy = {
   id: string
-  label?: string
+  label?: string | null
+  host?: string | null
+  port?: number | string | null
+  latency_ms?: number | null
+  geo?: {
+    ip?: string | null
+    country?: string | null
+    country_code?: string | null
+  } | null
   enabled: boolean
   kind: string
   address_family?: number | null
@@ -44,6 +52,49 @@ export function isGeminiProxy(proxy: GeminiProxy) {
     proxy.status !== 'dead' &&
     proxy.status !== 'fail'
   )
+}
+
+/** Public proxy address (`host:port`) without ever reading credentials. */
+export function geminiProxyAddress(
+  proxy: Pick<GeminiProxy, 'host' | 'port'> | null | undefined
+): string | null {
+  const rawHost = String(proxy?.host || '').trim()
+  if (!rawHost) return null
+  const host =
+    rawHost.includes(':') && !rawHost.startsWith('[') ? `[${rawHost}]` : rawHost
+  const port = proxy?.port
+  return port != null && String(port).trim() !== '' ? `${host}:${port}` : host
+}
+
+/**
+ * Human-readable proxy option label for Gemini selectors & summary cards.
+ * Shows label (if set), `host:port`, distinct probed exit IP, region, latency,
+ * and proxy ID so unlabeled `px-*` entries remain immediately identifiable.
+ */
+export function geminiProxyOptionLabel(proxy: GeminiProxy): string {
+  const parts: string[] = []
+  const id = String(proxy.id || '').trim()
+  const label = String(proxy.label || '').trim()
+  const rawHost = String(proxy.host || '').trim()
+  const address = geminiProxyAddress(proxy)
+  const exitIp = String(proxy.geo?.ip || '').trim()
+  const region = String(
+    proxy.geo?.country_code || proxy.geo?.country || ''
+  ).trim()
+  const latency =
+    proxy.latency_ms != null && Number.isFinite(Number(proxy.latency_ms))
+      ? `${Math.round(Number(proxy.latency_ms))}ms`
+      : ''
+
+  if (label && label !== id) parts.push(label)
+  if (address && address !== label) parts.push(address)
+  if (exitIp && exitIp !== rawHost && exitIp !== address && exitIp !== label) {
+    parts.push(`出口 ${exitIp}`)
+  }
+  if (region) parts.push(region)
+  if (latency) parts.push(latency)
+  if (id && !parts.includes(id)) parts.push(id)
+  return parts.join(' · ') || id
 }
 
 export function useGeminiBusy() {

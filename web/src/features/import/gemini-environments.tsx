@@ -36,7 +36,9 @@ import {
 import {
   GEMINI_INVENTORY_KEY as QUERY_KEY,
   GEMINI_ROOT as ROOT,
+  geminiProxyOptionLabel,
   geminiProxyOptions,
+  type GeminiProxy,
   geminiError,
   isGeminiProxy,
   syncGeminiEnvironment,
@@ -605,7 +607,13 @@ function GeminiBasicPrefs({
   )
 }
 
-function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
+function EnvironmentData({
+  environment,
+  proxy,
+}: {
+  environment: GeminiEnvironment
+  proxy?: GeminiProxy | null
+}) {
   const account = environment.account
   return (
     <dl className='grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3'>
@@ -616,7 +624,7 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
       <div>
         <dt className='text-muted-foreground'>绑定代理</dt>
         <dd>
-          {environment.proxy_id}
+          {proxy ? geminiProxyOptionLabel(proxy) : environment.proxy_id}
           {environment.proxy_ready === false ? ' · 不可用' : null}
         </dd>
       </div>
@@ -1041,9 +1049,10 @@ export function GeminiEnvironments({
   const inventory = useQuery(geminiInventoryOptions())
   const proxies = useQuery({
     ...geminiProxyOptions,
-    enabled: isImport && inventory.data?.available === true,
+    enabled: inventory.data?.available === true,
   })
-  const exits = (proxies.data?.proxies ?? []).filter(isGeminiProxy)
+  const proxyPool = proxies.data?.proxies ?? []
+  const exits = proxyPool.filter(isGeminiProxy)
   const busy = useGeminiBusy()
   const [name, setName] = useState('')
   const [proxyId, setProxyId] = useState('')
@@ -1268,7 +1277,12 @@ export function GeminiEnvironments({
       {!isImport ? (
         <GeminiBasicPrefs environment={environment} busy={busy} />
       ) : null}
-      <EnvironmentData environment={environment} />
+      <EnvironmentData
+        environment={environment}
+        proxy={
+          proxyPool.find((item) => item.id === environment.proxy_id) ?? null
+        }
+      />
       <div className='flex flex-wrap gap-2'>
         {environment.auth_method !== 'api_key' ? (
           <Button
@@ -1661,7 +1675,7 @@ export function GeminiEnvironments({
               <option value=''>选择代理</option>
               {exits.map((proxy) => (
                 <option key={proxy.id} value={proxy.id}>
-                  {proxy.label || proxy.id}
+                  {geminiProxyOptionLabel(proxy)}
                 </option>
               ))}
             </select>
