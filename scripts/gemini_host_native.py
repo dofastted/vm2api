@@ -155,11 +155,12 @@ class EligibilityDiagnostic:
 
 
 class NativeFailure(Exception):
-    def __init__(self, code, status=None, message=None):
+    def __init__(self, code, status=None, message=None, retry_after_ms=None):
         super().__init__(message or code)
         self.code = code
         self.status = status
         self.message = message
+        self.retry_after_ms = retry_after_ms
 
 
 def _object(pairs):
@@ -385,7 +386,15 @@ def _map_worker_error(http_status, payload):
     if code == "cancelled":
         return NativeFailure("gemini_inference_cancelled", 499, message)
     if effective_status == 429:
-        return NativeFailure("gemini_quota_exhausted", 429, message)
+        raw_retry = payload.get("retry_after_ms") if isinstance(payload, dict) else None
+        retry_after_ms = (
+            raw_retry
+            if type(raw_retry) is int and 1 <= raw_retry <= 3_600_000
+            else None
+        )
+        return NativeFailure(
+            "gemini_quota_exhausted", 429, message, retry_after_ms=retry_after_ms
+        )
     if effective_status == 401:
         return NativeFailure("gemini_oauth_required", 401, message)
     if effective_status == 403:

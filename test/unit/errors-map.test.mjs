@@ -547,3 +547,30 @@ test('poolErrorKind separates capacity from nothing-eligible and leaves upstream
   assert.equal(poolErrorKind('upstream_rate_limit', 'Rate limit exceeded'), null)
   assert.equal(poolErrorKind('incomplete_response'), null)
 })
+
+test('#1215: 410 Gone forwards allowlisted continuation expiration reason and drops unknown fields', () => {
+  for (const reason of ['waiting_expired', 'handoff_expired', 'receipt_expired', 'cancelled']) {
+    const mapped = mapUpstreamError(410, {
+      error: {
+        type: 'invalid_request_error',
+        message: 'MCP continuation is no longer available',
+        details: { retryable: false, reason, internal_secret: 'must_not_leak' },
+      },
+    })
+    assert.equal(mapped.status, 410)
+    assert.equal(mapped.body.error.details.retryable, false)
+    assert.equal(mapped.body.error.details.reason, reason)
+    assert.equal(mapped.body.error.details.internal_secret, undefined)
+  }
+
+  const unknownReason = mapUpstreamError(410, {
+    error: {
+      type: 'invalid_request_error',
+      message: 'gone',
+      details: { retryable: false, reason: 'arbitrary_untrusted_text' },
+    },
+  })
+  assert.equal(unknownReason.status, 410)
+  assert.equal(unknownReason.body.error.details.retryable, false)
+  assert.equal(unknownReason.body.error.details.reason, undefined)
+})

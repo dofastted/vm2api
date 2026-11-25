@@ -6754,7 +6754,12 @@ class Host:
             except native_mod.NativeFailure as error:
                 had_error = error.code != "gemini_unsupported_turn"
                 status = error.status or 502
-                handler.send_json_error(status, error.code, error.message)
+                handler.send_json_error(
+                    status,
+                    error.code,
+                    error.message,
+                    retry_after_ms=error.retry_after_ms,
+                )
                 return "failed", error.code
             except (BrokenPipeError, ConnectionResetError):
                 had_error = True
@@ -6826,7 +6831,12 @@ class Host:
             else:
                 status = error.status or 502
                 message = error.message
-            handler.send_json_error(status, code, message)
+            handler.send_json_error(
+                status,
+                code,
+                message,
+                retry_after_ms=error.retry_after_ms,
+            )
             return "failed", code
         except (BrokenPipeError, ConnectionResetError):
             had_error = True
@@ -6870,7 +6880,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         self._headers_sent = False
         super().setup()
 
-    def send_json_error(self, status, code=None, message=None):
+    def send_json_error(self, status, code=None, message=None, retry_after_ms=None):
         if self._headers_sent:
             return
         payload = {}
@@ -6878,12 +6888,18 @@ class ControlHandler(BaseHTTPRequestHandler):
             payload["code"] = code
         if message:
             payload["message"] = message
+        retry_after_sec = None
+        if type(retry_after_ms) is int and retry_after_ms > 0:
+            payload["retry_after_ms"] = retry_after_ms
+            retry_after_sec = max(1, (retry_after_ms + 999) // 1000)
         data = json.dumps(payload).encode()
         self._headers_sent = True
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
+            if retry_after_sec is not None:
+                self.send_header("Retry-After", str(retry_after_sec))
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
