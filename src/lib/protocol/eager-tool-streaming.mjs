@@ -1,13 +1,13 @@
 /**
- * routing failover.eager_tool_streaming (default off): mark custom tools
- * eager_input_streaming only when the panel turns it on. Official Claude Code
- * omits the field. Explicit false stays off; a caller's own boolean wins;
- * server tools are left alone.
+ * routing failover.eager_tool_streaming (default on): mark custom tools
+ * eager_input_streaming unless the panel explicitly turns it off, matching
+ * routing.json (`true`) and the settings switch (`!== false`). A caller's
+ * own boolean wins; server tools are left alone.
  */
 import { isAnthropicServerTool, isWebSearchTool } from './web-search.mjs'
 
 export function eagerToolStreamingEnabled(routing) {
-  return routing?.failover?.eager_tool_streaming === true
+  return routing?.failover?.eager_tool_streaming !== false
 }
 
 export function callerEagerInputStreaming(tool) {

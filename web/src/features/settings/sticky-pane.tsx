@@ -29,6 +29,7 @@ type StickyPaneProps = {
   onChange: (patch: Obj) => void
   saving?: boolean
   pending?: boolean
+  pendingCards?: Partial<Record<StickyDialog, boolean>>
 }
 
 function SummaryButton({
@@ -83,6 +84,7 @@ export function StickyPane({
   onChange,
   saving = false,
   pending = false,
+  pendingCards,
 }: StickyPaneProps) {
   const [dialog, setDialog] = useState<StickyDialog | null>(null)
   const [local, setLocal] = useState<Obj>({ ...sticky })
@@ -144,8 +146,8 @@ export function StickyPane({
             icon={Link2}
             title='会话绑定'
             value={enabled ? '已启用' : '已停用'}
-            desc='优先回到绑定 VM；session 占着的槽位跟这个绑定一起留'
-            pending={pending}
+            desc='同一会话在 TTL 内优先回到绑定 VM；单轮结束即归还并发池席位'
+            pending={pendingCards ? !!pendingCards.binding : pending}
             disabled={saving}
             buttonRef={(node) => {
               triggerRefs.current.binding = node
@@ -158,8 +160,8 @@ export function StickyPane({
             icon={Clock3}
             title='绑定保持时间'
             value={fmtDuration(ttl * 1000)}
-            desc='绑定 TTL，也是请求结束后 session 继续占槽的时间'
-            pending={pending}
+            desc='仅记忆 session → VM 路由亲和，不占并发池席位；CLI 空闲进程回收见「协议 → 槽空闲超时」'
+            pending={pendingCards ? !!pendingCards.ttl : pending}
             disabled={saving}
             buttonRef={(node) => {
               triggerRefs.current.ttl = node
@@ -182,7 +184,7 @@ export function StickyPane({
         <span>
           <span className='block text-sm font-medium'>
             出站 session · {outbound === 'passthrough' ? '透传' : '重建'}
-            {pending ? (
+            {(pendingCards ? !!pendingCards.outbound : pending) ? (
               <span className='ml-2 rounded bg-[color:var(--status-caution)]/15 px-1.5 py-0.5 text-[10px] font-normal text-[color:var(--status-caution)]'>
                 待保存
               </span>
@@ -197,8 +199,9 @@ export function StickyPane({
         <h3 className='font-medium'>身份识别与平台回路</h3>
         <p className='mt-2 leading-6 text-muted-foreground'>
           网关先取调用方显式 session，再按现有回退路径提取身份。Claude
-          保留设备/席位亲和； OpenAI
-          保留绑定账号与忙时借槽，previous_response_id 不能跨账号任意续接。 旧
+          保留设备与 VM 路由亲和（单轮请求结束即立即归还并发池席位，原生 CLI
+          空闲进程回收见 「设置 → 协议 → 槽空闲超时」）；OpenAI
+          保留绑定账号与忙时借槽，previous_response_id 不能跨账号任意续接。旧
           mode、header_keys 和 body_keys
           继续保存在路由配置中，但不在此提供没有生效路径的编辑器。
         </p>
@@ -234,7 +237,8 @@ export function StickyPane({
                 <div>
                   <Label htmlFor='sticky-dialog-enabled'>启用绑定</Label>
                   <p className='mt-1 text-xs text-muted-foreground'>
-                    同一来源在 TTL 内优先回到原账号。
+                    同一会话在 TTL 内优先回到绑定
+                    VM；单轮请求结束后立即归还并发池席位，不占用席位。
                   </p>
                 </div>
                 <Switch
@@ -269,6 +273,11 @@ export function StickyPane({
                     ))}
                   </SelectContent>
                 </Select>
+                <p className='text-xs leading-5 text-muted-foreground'>
+                  仅记忆 session → VM
+                  路由亲和，单轮请求结束即立即归还并发池席位，不占用席位。原生
+                  Claude CLI 空闲进程回收由「设置 → 协议 → 槽空闲超时」控制。
+                </p>
               </div>
             ) : null}
             {dialog === 'outbound' ? (

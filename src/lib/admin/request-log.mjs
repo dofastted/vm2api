@@ -35,10 +35,68 @@ export function presentedApiKeyForLog(token) {
 
 const MODES = new Set(['off', 'normal', 'debug'])
 
+export const LOGGING_RETAIN_DAYS_MIN = 1
+export const LOGGING_RETAIN_DAYS_MAX = 90
+export const LOGGING_MAX_MB_MIN = 0
+export const LOGGING_MAX_MB_MAX = 102400
+
 const DEFAULT_RETAIN_DAYS = 7
 const DEFAULT_DEBUG_RETAIN_DAYS = 3
 const DEFAULT_MAX_MB = 2048
 const CLEANUP_INTERVAL_MS = 10 * 60 * 1000
+
+function loggingValidationError(message) {
+  const error = new TypeError(message)
+  error.code = 'invalid_logging_config'
+  return error
+}
+
+function parseStrictBoundedInt(raw, min, max, field) {
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < min || raw > max) {
+    throw loggingValidationError(`${field} 必须是 ${min}–${max} 的整数`)
+  }
+  return raw
+}
+
+/** PUT /api/panel/routing strict check for logging retention and debug payload bounds. */
+export function validateLoggingRoutingPatch(body = {}, currentLogging = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return
+  if (!Object.prototype.hasOwnProperty.call(body, 'logging')) return
+  const logging = body.logging
+  if (!logging || typeof logging !== 'object' || Array.isArray(logging)) {
+    throw loggingValidationError('logging 必须是对象')
+  }
+  if (Object.prototype.hasOwnProperty.call(logging, 'mode')) {
+    if (typeof logging.mode !== 'string' || !MODES.has(logging.mode.trim().toLowerCase())) {
+      throw loggingValidationError('logging.mode 必须是 off / normal / debug')
+    }
+  }
+  const hasRetain = Object.prototype.hasOwnProperty.call(logging, 'retain_days')
+  const hasDebugRetain = Object.prototype.hasOwnProperty.call(logging, 'debug_retain_days')
+  const current = normalizeLoggingConfig(currentLogging || {})
+  const retainDays = hasRetain
+    ? parseStrictBoundedInt(
+        logging.retain_days,
+        LOGGING_RETAIN_DAYS_MIN,
+        LOGGING_RETAIN_DAYS_MAX,
+        'logging.retain_days',
+      )
+    : current.retain_days
+  const debugRetainDays = hasDebugRetain
+    ? parseStrictBoundedInt(
+        logging.debug_retain_days,
+        LOGGING_RETAIN_DAYS_MIN,
+        LOGGING_RETAIN_DAYS_MAX,
+        'logging.debug_retain_days',
+      )
+    : current.debug_retain_days
+  if ((hasRetain || hasDebugRetain) && debugRetainDays > retainDays) {
+    throw loggingValidationError('logging.debug_retain_days 不能大于 logging.retain_days')
+  }
+  if (Object.prototype.hasOwnProperty.call(logging, 'max_mb')) {
+    parseStrictBoundedInt(logging.max_mb, LOGGING_MAX_MB_MIN, LOGGING_MAX_MB_MAX, 'logging.max_mb')
+  }
+}
 
 function clampInt(value, min, max, fallback) {
   if (value == null || value === '') return fallback

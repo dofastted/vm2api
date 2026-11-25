@@ -37,7 +37,7 @@ describe('settings log boundary', () => {
     const html = renderToStaticMarkup(<SettingsPage />)
 
     expect(html).toContain(
-      '设置请求日志的记录模式、保留时间和存储上限。逐条记录在日志页查看。'
+      '设置请求日志的记录模式、保留天数与 Debug 载荷上限。逐条记录在日志页查看。'
     )
     expect(html).toContain('日志保留')
   })

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { Link } from '@tanstack/react-router'
 import {
   ArrowRightLeft,
   Armchair,
@@ -26,6 +27,11 @@ import { SEAT_CAP_MAX, SeatCells } from '@/components/scheduler-viz'
 import { SEAT_CAP_STEPS, withCurrent } from '@/features/vm/scheduling-steps'
 import { PoolLivePanel } from './pool-live-panel'
 import {
+  FAILOVER_DEFAULTS,
+  POOL_DEFAULTS,
+  effectiveSeatCap,
+} from './routing-draft'
+import {
   ChipGroup,
   FamilyLimitSelect,
   SliderSetting,
@@ -44,30 +50,7 @@ type PoolPaneProps = {
   onInferenceChange: (patch: Obj) => void
   saving?: boolean
   pending?: boolean
-}
-
-/** 与后端 DEFAULT_POOL_ROUTING / failover-runner 默认值一致。 */
-const POOL_DEFAULTS = {
-  queue_max: 50,
-  seat_grace_ms: 30000,
-  seat_budget_reserve_pct: 0.02,
-  sticky_wait_timeout_ms: 45000,
-  fallback_wait_timeout_ms: 30000,
-  circuit_failure_threshold: 3,
-  circuit_open_ms: 30000,
-}
-
-const FAILOVER_DEFAULTS = {
-  max_same_account_retries: 1,
-  same_account_retry_delay_ms: 500,
-  max_account_switches: 10,
-  max_total_attempts: 12,
-  total_retry_deadline_ms: 120000,
-  oauth_401_cooldown_ms: 120000,
-  same_account_retry_max_hop_ms: 10000,
-  signature_repair: false,
-  stream_idle_timeout_ms: 180000,
-  eager_tool_streaming: true,
+  pendingCards?: Partial<Record<'strategy' | 'seats' | 'queue', boolean>>
 }
 
 function numOf(source: Obj, key: string, fallback: number): number {
@@ -431,13 +414,15 @@ export function PoolPane({
   onInferenceChange,
   saving = false,
   pending = false,
+  pendingCards,
 }: PoolPaneProps) {
   const strategy = pool.strategy === 'fill' ? 'fill' : 'balanced'
   const resetPriority = pool.reset_priority !== false
-  const seatCap = Math.min(
+  const physicalSlots = Math.min(
     SEAT_CAP_MAX,
     Math.max(1, numOf(inference, 'session_slots', SEAT_CAP_MAX))
   )
+  const seatCap = effectiveSeatCap(pool, inference)
   const queueMax = numOf(pool, 'queue_max', POOL_DEFAULTS.queue_max)
   const reservePct =
     Math.round(
@@ -513,7 +498,6 @@ export function PoolPane({
         prewarm_enabled: inferenceDraft.prewarm_enabled === true,
       })
       onPoolChange({
-        seat_grace_ms: poolDraft.seat_grace_ms,
         max_primary_sessions: poolDraft.max_primary_sessions ?? null,
         max_subagents_per_session: poolDraft.max_subagents_per_session ?? null,
         seat_budget_reserve_pct: poolDraft.seat_budget_reserve_pct,
@@ -571,7 +555,7 @@ export function PoolPane({
           title='分配策略'
           value={`${strategy === 'fill' ? '填充' : '平衡'}${resetPriority ? ' · 临近重置优先' : ''}`}
           desc='Claude 新 session 开席的优先顺序'
-          pending={pending}
+          pending={pendingCards ? !!pendingCards.strategy : pending}
           disabled={saving}
           buttonRef={(node) => {
             triggerRefs.current.strategy = node
@@ -583,7 +567,7 @@ export function PoolPane({
           title='席位容量'
           value={`${seatCap} 席 / VM`}
           desc={`对话结束即释放 · 预算预留 ${reservePct}%`}
-          pending={pending}
+          pending={pendingCards ? !!pendingCards.seats : pending}
           disabled={saving}
           buttonRef={(node) => {
             triggerRefs.current.seats = node
@@ -595,7 +579,7 @@ export function PoolPane({
           title='排队等待'
           value={`${queueMax} 个 · ${fmtDuration(Math.max(sticky, fallbackWait))}`}
           desc={`粘性 ${fmtDuration(sticky)} · 全局 ${fmtDuration(fallbackWait)}`}
-          pending={pending}
+          pending={pendingCards ? !!pendingCards.queue : pending}
           disabled={saving}
           buttonRef={(node) => {
             triggerRefs.current.queue = node
@@ -627,18 +611,19 @@ export function PoolPane({
         >
           <ShieldAlert className='size-3.5' aria-hidden /> 故障保护
         </button>
-        <a
+        <Link
           className='inline-flex min-h-11 items-center gap-1 text-primary hover:underline'
-          href='/console/#/vm'
+          to='/vm'
         >
           <Link2 className='size-3.5' aria-hidden /> 账号优先级 · VM 调度
-        </a>
-        <a
+        </Link>
+        <Link
           className='inline-flex min-h-11 items-center gap-1 text-primary hover:underline'
-          href='/console/#/settings/sticky'
+          to='/settings/$tab'
+          params={{ tab: 'sticky' }}
         >
           <Link2 className='size-3.5' aria-hidden /> 粘性设置
-        </a>
+        </Link>
       </div>
       <Dialog
         open={open !== null}
@@ -701,7 +686,7 @@ export function PoolPane({
                         value,
                         String(value),
                       ]),
-                      seatCap
+                      physicalSlots
                     )}
                     onChange={(value) =>
                       updateDraft('inference', { session_slots: value })
@@ -767,22 +752,6 @@ export function PoolPane({
                   />
                 </div>
                 <SliderSetting
-                  id='pool-seat-grace'
-                  label='旧席位宽限（不再释放槽位）'
-                  value={numOf(
-                    poolDraft,
-                    'seat_grace_ms',
-                    POOL_DEFAULTS.seat_grace_ms
-                  )}
-                  min={0}
-                  max={120000}
-                  step={5000}
-                  format={(ms) => (ms ? fmtDuration(ms) : '不保留')}
-                  fallback={POOL_DEFAULTS.seat_grace_ms}
-                  presets={[0, 10000, 30000, 60000, 120000]}
-                  onChange={(ms) => updateDraft('pool', { seat_grace_ms: ms })}
-                />
-                <SliderSetting
                   id='pool-seat-reserve'
                   label='每席位预算预留'
                   value={
@@ -812,13 +781,7 @@ export function PoolPane({
                       POOL_DEFAULTS.seat_budget_reserve_pct
                     ) * 100
                   }
-                  cap={Math.min(
-                    SEAT_CAP_MAX,
-                    Math.max(
-                      1,
-                      numOf(inferenceDraft, 'session_slots', SEAT_CAP_MAX)
-                    )
-                  )}
+                  cap={effectiveSeatCap(poolDraft, inferenceDraft)}
                 />
               </>
             ) : null}

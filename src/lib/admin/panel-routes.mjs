@@ -154,7 +154,7 @@ import {
   vmOwnerId,
 } from './resource-owner.mjs'
 import { servePoolSeatStream } from './pool-seat-stream.mjs'
-import { logsToCsv, logsToJsonl } from './request-log.mjs'
+import { logsToCsv, logsToJsonl, validateLoggingRoutingPatch } from './request-log.mjs'
 import {
   listVms,
   getVm,
@@ -203,7 +203,10 @@ import { parseScheduleLevelInput, manualScheduleLevelOf } from '../pool/credenti
 import { parseActiveHoursInput } from '../pool/active-hours.mjs'
 import { parseVmQuotaOverride } from '../pool/vm-quota-override.mjs'
 import { validateOpenAIQuotaPatch, normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
+import { validateQuotaRoutingPatch } from '../pool/pool-scheduler.mjs'
 import { validateInferenceWebsocketPatch } from '../protocol/codex-route.mjs'
+import { validateRedactionPatch } from '../redaction/policy.mjs'
+import { ensureRedaction, redactionStatus } from '../redaction/runtime.mjs'
 import {
   normalizeInferenceConfig,
   normalizeSessionSlots,
@@ -261,7 +264,7 @@ import { withSlotMaintenance } from '../vm/slot-maintenance.mjs'
 import { clearActiveVmFromDb, removeVmFromDb } from '../vm/vm-db-sync.mjs'
 import { renameVmId } from '../vm/vm-rename.mjs'
 import { normalizeCredentialMode } from '../oauth/credential-mode.mjs'
-import { reloadActiveVm } from '../core/config.mjs'
+import { DEFAULT_MAX_REQUEST_BYTES, reloadActiveVm } from '../core/config.mjs'
 import {
   OS_CATALOG,
   kernelForIndex,
@@ -1705,7 +1708,7 @@ export function createPanelHandler(ctx) {
     })
   }
 
-  function restoreRoutingRuntime(previous) {
+  async function restoreRoutingRuntime(previous) {
     ctx.routingConfig = previous
     ctx.healthMonitor?.setConfig(ctx.routingConfig.health_probe)
     ctx.usageProbeMonitor?.setConfig(ctx.routingConfig.usage_probe)
@@ -1722,6 +1725,9 @@ export function createPanelHandler(ctx) {
     stickyRouter.reloadConfig(ctx.routingConfig)
     accountQuota.reloadConfig(ctx.routingConfig)
     ctx.poolScheduler?.reloadConfig?.(poolSchedulerConfig())
+    try {
+      await ensureRedaction(ctx.routingConfig, { projectRoot: cfg.paths.project })
+    } catch {}
   }
 
   async function prepareInheritedInferenceEngine(body) {
@@ -1738,7 +1744,7 @@ export function createPanelHandler(ctx) {
         try {
           return await persistRoutingPatch(body)
         } catch (error) {
-          restoreRoutingRuntime(previousRoutingConfig)
+          await restoreRoutingRuntime(previousRoutingConfig)
           if (body.pool || body.failover) initPoolRuntime()
           throw error
         }
@@ -7290,7 +7296,12 @@ export function createPanelHandler(ctx) {
           ...ctx.routingConfig,
           compatibility: canonicalPersonaCompat(ctx.routingConfig?.compatibility),
         }
-        return json(res, 200, panel.buildRouting({ routingConfig, stickyRouter }))
+        const rawCeiling = Number(cfg?.limits?.max_body_bytes)
+        const maxBodyBytes = Number.isFinite(rawCeiling) && rawCeiling > 0 ? rawCeiling : DEFAULT_MAX_REQUEST_BYTES
+        const payload = panel.buildRouting({ routingConfig, stickyRouter })
+        payload.data.max_body_bytes = maxBodyBytes
+        payload.data.max_body_mib = Math.floor(maxBodyBytes / (1024 * 1024))
+        return json(res, 200, payload)
       }
       // GET /api/panel/outbound-profile — read-only outbound reference for the global preset
       if (req.method === 'GET' && p === '/api/panel/outbound-profile') {
@@ -7313,8 +7324,11 @@ export function createPanelHandler(ctx) {
           }
           validateInferenceWebsocketPatch(body)
           validateGeminiRoutingPatch(body)
+          validateQuotaRoutingPatch(body, ctx.routingConfig?.quota)
+          validateLoggingRoutingPatch(body, ctx.routingConfig?.logging)
+          validateRedactionPatch(body)
         } catch (error) {
-          if (error instanceof TypeError || error instanceof RangeError) {
+          if (error instanceof TypeError || error instanceof RangeError || error?.status === 400) {
             return json(res, 400, {
               ok: false,
               error: {
@@ -7367,10 +7381,16 @@ export function createPanelHandler(ctx) {
         try {
           applied = appliedDuringSwitch ?? (await persistRoutingPatch(body))
         } catch (error) {
-          restoreRoutingRuntime(previousRoutingConfig)
-          return json(res, 503, {
+          await restoreRoutingRuntime(previousRoutingConfig)
+          const status =
+            Number.isInteger(error?.status) && error.status >= 400 && error.status < 600 ? error.status : 503
+          return json(res, status, {
             ok: false,
-            error: { code: 'routing_persist_failed', message: String(error?.message || error) },
+            error: {
+              ...(status === 400 ? { type: 'invalid_request_error' } : {}),
+              code: error?.code || (status === 400 ? 'invalid_redaction_config' : 'routing_persist_failed'),
+              message: String(error?.message || error),
+            },
           })
         }
         return json(
@@ -7378,6 +7398,7 @@ export function createPanelHandler(ctx) {
           200,
           panel.ok({
             ...publicRoutingNotify(ctx.routingConfig),
+            redaction_runtime: redactionStatus(),
             applied_concurrency: applied.concurrency,
             applied_rpm: applied.rpm,
             applied_session_slots: applied.session_slots,
