@@ -54,7 +54,7 @@ import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { pickScheduleFields } from '../pool/schedule-state.mjs'
 import { socksProxyFamily, normalizeSocksHost } from '../vm/socks-address.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
-import { isOrganizationDisabledText } from '../pool/upstream-error-policy.mjs'
+import { isOrganizationDisabledUsageResult } from '../pool/upstream-error-policy.mjs'
 import { mergeBatchGroupConfig } from '../pool/batch-group.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy, vmQuotaOverrideOf, vmQuotaView } from '../pool/vm-quota-override.mjs'
 import { GATE_OPEN, gatePolicyFields, gateZone, quotaGateOf } from '../pool/quota-gate.mjs'
@@ -1197,11 +1197,7 @@ function applyFableProbeResult(accountQuota, accountId, found) {
 }
 /** A 403 org refusal in the official /usage probe: park like the runtime 401/403 path. */
 function organizationDisabledProbe(result = {}) {
-  if (result?.ok === true || result?.usage_scope_missing) return false
-  const status = Number(result?.usage_status || result?.status || 0)
-  if (status !== 403 && status !== 401) return false
-  const text = String(result?.usage_error || result?.error || result?.fable?.error || '')
-  return isOrganizationDisabledText(text)
+  return isOrganizationDisabledUsageResult(result)
 }
 function fatalUsageCredentialFailure(result = {}) {
   if (result?.ok === true || result?.usage_scope_missing) return false
@@ -1328,26 +1324,27 @@ export async function buildProbeOne({
         },
         { force: !!force },
       )
-  if (fatalUsageCredentialFailure(result)) {
+  // The probe heard the same org refusal the runtime 400/401/403 classifier
+  // parks on: park now, without waiting for real traffic to trip it again.
+  // Operator-only re-enable, identical to the runtime path (four-state model).
+  // Checked BEFORE the bare-401 fatal branch: an org-disabled 401 must not be
+  // recorded as oauth_revoked ("凭证吊销" would be a wrong panel verdict).
+  if (organizationDisabledProbe(result)) {
+    try {
+      markUnschedulable(cfg.paths.project, id, 'organization_disabled', {
+        status: Number(result.usage_status || result.status) || null,
+        message: String(result.usage_error?.message || result.usage_error || result.error || '').slice(0, 500),
+        account_id: accountId || null,
+        at: new Date().toISOString(),
+      })
+    } catch {}
+  } else if (fatalUsageCredentialFailure(result)) {
     try {
       markVmRefreshError(path.join(cfg.paths.project, 'vms', `${id}.json`), {
         error: {
           code: result.usage_status === 401 ? 'oauth_revoked' : 'invalid_grant',
           message: result.usage_error || result.error || 'OAuth credential was rejected',
         },
-      })
-    } catch {}
-  }
-  // The probe heard the same org refusal the runtime 401/403 classifier parks
-  // on: park now, without waiting for real traffic to trip the 403 again.
-  // Operator-only re-enable, identical to the runtime path (four-state model).
-  else if (organizationDisabledProbe(result)) {
-    try {
-      markUnschedulable(cfg.paths.project, id, 'organization_disabled', {
-        status: Number(result.usage_status || result.status) || null,
-        message: String(result.usage_error || result.error || '').slice(0, 500),
-        account_id: accountId || null,
-        at: new Date().toISOString(),
       })
     } catch {}
   }
@@ -1419,12 +1416,16 @@ export async function buildProbeOne({
     accountQuota.setAccountTier(accountId, tier, { source: 'usage' })
     persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
   }
+  // The org-refusal park above rewrote vm.json; re-read so the probe response
+  // does not report the just-parked slot as still schedulable.
+  const vmFresh = organizationDisabledProbe(result) ? getVm(cfg.paths.project, id) : null
+  const vmView = vmFresh || vm
   const availability = evaluateAccount({
-    vm,
+    vm: vmView,
     account: after || {},
     hasToken: true,
-    hasRefresh: !!(vm.has_refresh || vm.claude?.has_refresh),
-    schedulable: vm.schedulable !== false,
+    hasRefresh: !!(vmView.has_refresh || vmView.claude?.has_refresh),
+    schedulable: vmView.schedulable !== false,
     lastProbe: qAfter.last_probe,
     probeSource: qAfter.probe_source,
     quota: qAfter,

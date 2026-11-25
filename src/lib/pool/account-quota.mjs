@@ -31,7 +31,10 @@ import {
 import { HISTORY_WINDOW_MS, rollWindowHistory } from './window-history.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from './quota-tiers.mjs'
 import { resolvePolicyModelId } from '../protocol/model-policy.mjs'
-import { isFableCreditsRequiredMessage, isOrganizationDisabledText } from './upstream-error-policy.mjs'
+import {
+  isFableCreditsRequiredMessage,
+  isOrganizationDisabledUsageResult,
+} from './upstream-error-policy.mjs'
 import { SessionLimitRegistry } from './session-limit.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy } from './vm-quota-override.mjs'
 import {
@@ -560,13 +563,7 @@ export class AccountQuota {
     // An org refusal is a deterministic slot state, not a transient usage
     // backoff: keep the raw error (the panel and the runtime classifier both
     // read it) instead of painting rate_limited over an org-disabled slot.
-    const orgDisabled =
-      (probe.usage_status === 401 || probe.usage_status === 403) &&
-      isOrganizationDisabledText(
-        typeof probe.usage_error === 'string'
-          ? probe.usage_error
-          : String(probe.usage_error?.message || probe.usage_error?.error || probe.error || ''),
-      )
+    const orgDisabled = isOrganizationDisabledUsageResult({ ...probe, ok: probe.ok, usage_scope_missing: probe.usage_scope_missing })
     if (isOfficialUsageRateLimited(probe) && !orgDisabled) {
       const retryMs = Number(probe.retry_after_ms)
       const backoff =

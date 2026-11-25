@@ -73,14 +73,29 @@ const ORGANIZATION_DISABLED_PATTERNS = [
 ]
 
 /**
- * The org refuses this seat. Shared by the runtime 401/403 classifier and the
- * official /usage probe pipeline so both park the slot on the same wording —
- * a probe hit parks without waiting for real traffic to trip the 403.
+ * The org refuses this seat. Shared by the runtime 400/401/403 classifier and
+ * the official /usage probe pipeline so both park the slot on the same
+ * wording — a probe hit parks without waiting for real traffic to trip it.
+ * `usage_error` may be a structured object (crs-usage-probe falls back to the
+ * whole error body), so extract the human text before matching.
  */
 export function isOrganizationDisabledText(text) {
-  const blob = String(text || '')
+  const blob =
+    typeof text === 'string'
+      ? text
+      : String(text?.message || text?.error || '')
   if (!blob) return false
   return ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(blob))
+}
+
+/** A usage-probe result carries the org refusal: park it like the runtime does (400/401/403). */
+export function isOrganizationDisabledUsageResult(result = {}) {
+  if (result?.ok === true || result?.usage_scope_missing) return false
+  const status = Number(result?.usage_status || result?.status || 0)
+  if (status !== 400 && status !== 401 && status !== 403) return false
+  const text =
+    result?.usage_error || result?.error || result?.fable?.error || result?.message || ''
+  return isOrganizationDisabledText(text)
 }
 
 function bodyMessage(body) {
