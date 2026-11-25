@@ -28,6 +28,10 @@ export function unitOf(seconds: number): IntervalUnit {
   return seconds >= 3600 && seconds % 3600 === 0 ? 'hour' : 'min'
 }
 
+export function isExactInUnit(seconds: number, unit: IntervalUnit): boolean {
+  return unit === 'hour' ? seconds % 3600 === 0 : seconds % 60 === 0
+}
+
 export function unitBounds(unit: IntervalUnit): [number, number] {
   return unit === 'hour' ? [1, 24] : [1, 1440]
 }

@@ -1,5 +1,7 @@
 import { type ComponentProps, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
+import { ArrowRight } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -20,19 +22,13 @@ type HealthPaneProps = {
   failover: Obj
   healthProbe: Obj | undefined
   compatibility: Obj
-  onFailoverChange: (next: Obj) => void
+  onFailoverChange?: (next: Obj) => void
   onHealthProbeChange: (next: Obj) => void
   onCompatibilityChange: (next: Obj) => void
 }
 
 function obj(value: unknown): Obj {
   return value && typeof value === 'object' ? (value as Obj) : {}
-}
-
-function clampInt(raw: string, min: number, max: number, fallback: number) {
-  const n = Math.round(Number(raw))
-  if (!Number.isFinite(n)) return fallback
-  return Math.min(max, Math.max(min, n))
 }
 
 /**
@@ -82,7 +78,6 @@ export function HealthPane(props: HealthPaneProps) {
     failover,
     healthProbe,
     compatibility,
-    onFailoverChange,
     onHealthProbeChange,
     onCompatibilityChange,
   } = props
@@ -137,21 +132,17 @@ export function HealthPane(props: HealthPaneProps) {
           </SettingRow>
           <SettingRow
             label='thinking 合法间隔'
-            desc='未写 max_tokens 时用模型目录 max_tokens_default。写了且低于此值时抬到该值；「不抬升」或模式「不改」时不抬。该数值在 enabled thinking 的 budget 不小于 max_tokens 时只补 thinking 合法间隔。'
+            desc='未写 max_tokens 时用模型目录 max_tokens_default。写了且低于此值时，「默认抬升」模式会抬到该值，「不改」模式则保留原值；当开启 thinking 且 budget_tokens 不小于 max_tokens 时补足合法间隔。关闭右侧总开关后，将同时停用缺失默认抬升与 budget_tokens 间隔补齐。'
           >
             <div className='flex flex-col items-end gap-3 sm:flex-row sm:flex-wrap sm:items-center'>
-              <Input
+              <DeferredIntInput
                 className='w-24'
-                type='number'
                 min={1}
                 max={4096}
+                fallback={128}
                 disabled={minTokens.enabled === false}
                 value={Number(minTokens.value ?? 128)}
-                onChange={(event) =>
-                  setMinTokens({
-                    value: clampInt(event.target.value, 1, 4096, 128),
-                  })
-                }
+                onCommit={(next) => setMinTokens({ value: next })}
                 aria-label='thinking 合法间隔'
               />
               <div
@@ -164,6 +155,7 @@ export function HealthPane(props: HealthPaneProps) {
                   size='sm'
                   variant={preserveCaller ? 'outline' : 'default'}
                   className='min-h-11'
+                  aria-pressed={!preserveCaller}
                   disabled={minTokens.enabled === false}
                   onClick={() =>
                     setMinTokens({
@@ -180,6 +172,7 @@ export function HealthPane(props: HealthPaneProps) {
                   size='sm'
                   variant={preserveCaller ? 'default' : 'outline'}
                   className='min-h-11'
+                  aria-pressed={preserveCaller}
                   disabled={minTokens.enabled === false}
                   onClick={() =>
                     setMinTokens({ mode: '不改', no_raise: true, raise: false })
@@ -190,26 +183,14 @@ export function HealthPane(props: HealthPaneProps) {
               </div>
               <label className='flex items-center gap-2 text-xs text-muted-foreground'>
                 <Switch
-                  checked={preserveCaller}
-                  disabled={minTokens.enabled === false}
+                  checked={minTokens.enabled !== false}
                   onCheckedChange={(checked) =>
-                    setMinTokens(
-                      checked
-                        ? { mode: '不改', no_raise: true, raise: false }
-                        : { mode: 'floor', no_raise: false, raise: true }
-                    )
+                    setMinTokens({ enabled: checked })
                   }
-                  aria-label='不抬升'
+                  aria-label='启用 thinking 合法间隔'
                 />
-                不抬升
+                <span>启用默认抬升与间隔补齐</span>
               </label>
-              <Switch
-                checked={minTokens.enabled !== false}
-                onCheckedChange={(checked) =>
-                  setMinTokens({ enabled: checked })
-                }
-                aria-label='启用 thinking 合法间隔'
-              />
             </div>
           </SettingRow>
         </CardContent>
@@ -222,7 +203,7 @@ export function HealthPane(props: HealthPaneProps) {
         onRealChange={setReal}
         onGeminiChange={setGemini}
       />
-      <SignatureRepairCard failover={failover} onChange={onFailoverChange} />
+      <SignatureRepairCard failover={failover} />
     </>
   )
 }
@@ -420,22 +401,19 @@ function SnapshotLine({
   )
 }
 
-function SignatureRepairCard({
-  failover,
-  onChange,
-}: {
-  failover: Obj
-  onChange: (next: Obj) => void
-}) {
+function SignatureRepairCard({ failover }: { failover: Obj }) {
   // 默认值在 gateway HEAD 与工作区之间相反（!== false vs === true），
   // 所以不硬编码默认态，严格按 GET /routing 的实际值回显。
   const enabled = failover.signature_repair === true
   return (
     <Card>
-      <CardHeader>
+      <CardHeader className='flex flex-row items-center justify-between gap-3'>
         <CardTitle>签名修复</CardTitle>
+        <Badge variant={enabled ? 'default' : 'secondary'}>
+          {enabled ? '当前：已开启' : '当前：已关闭'}
+        </Badge>
       </CardHeader>
-      <CardContent className='flex items-start justify-between gap-4'>
+      <CardContent className='space-y-3'>
         <div className='space-y-1 text-sm text-muted-foreground'>
           <p>
             上游因思考签名返回 400
@@ -448,13 +426,14 @@ function SignatureRepairCard({
             自适应）不受此开关影响。
           </p>
         </div>
-        <Switch
-          checked={enabled}
-          onCheckedChange={(checked) =>
-            onChange({ ...failover, signature_repair: checked })
-          }
-          aria-label='签名修复'
-        />
+        <Link
+          to='/settings/$tab'
+          params={{ tab: 'pool' }}
+          className='inline-flex items-center gap-1 text-xs font-medium text-primary underline-offset-4 hover:underline'
+        >
+          前往「账号池 → 重试与切号」调整
+          <ArrowRight className='size-3' aria-hidden />
+        </Link>
       </CardContent>
     </Card>
   )

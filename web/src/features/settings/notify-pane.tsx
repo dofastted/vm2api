@@ -1,6 +1,8 @@
+import { useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import type {
   NotifyConfig,
+  NotifyEmailConfig,
   NotifyEvents,
   NotifyFeishuConfig,
   NotifyTelegramConfig,
@@ -16,6 +18,7 @@ import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
 import { StatusMark } from '@/components/status-mark'
 import { notifyQueryOptions } from '@/features/settings/queries'
+import { settleInt, typingInt } from './int-input'
 
 const DEFAULT_EVENTS: NotifyEvents = {
   pool_empty: true,
@@ -49,7 +52,37 @@ const EVENT_FIELDS: {
   { key: 'account_up', label: '账号上线', desc: '单个账号恢复可用' },
 ]
 
-function notifyConfig(value: NotifyConfig | undefined): NotifyConfig {
+function parseRecipients(raw: string): string[] {
+  return raw
+    .split(/[,;\s]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function normalizeEmailConfig(
+  value: Partial<NotifyEmailConfig> | undefined
+): NotifyEmailConfig {
+  const to = Array.isArray(value?.to)
+    ? value.to.map((item) => String(item).trim()).filter(Boolean)
+    : typeof value?.to === 'string'
+      ? parseRecipients(value.to)
+      : []
+  return {
+    enabled: false,
+    host: '',
+    secure: false,
+    user: '',
+    pass: '',
+    from: '',
+    ...value,
+    port: Number(value?.port) || 587,
+    to,
+  }
+}
+
+type NormalizedNotifyConfig = NotifyConfig & { email: NotifyEmailConfig }
+
+function notifyConfig(value: NotifyConfig | undefined): NormalizedNotifyConfig {
   return {
     enabled: false,
     interval_sec: 60,
@@ -60,6 +93,7 @@ function notifyConfig(value: NotifyConfig | undefined): NotifyConfig {
     console_url: '',
     ...value,
     events: { ...DEFAULT_EVENTS, ...(value?.events || {}) },
+    email: normalizeEmailConfig(value?.email),
     telegram: {
       enabled: false,
       bot_token: '',
@@ -86,14 +120,17 @@ function NumberField({
   value,
   min,
   max,
+  fallback,
   onChange,
 }: {
   ariaLabel: string
   value: number
   min: number
   max: number
+  fallback: number
   onChange: (value: number) => void
 }) {
+  const [text, setText] = useState<string | null>(null)
   return (
     <Input
       className='w-28 tabular-nums'
@@ -101,8 +138,19 @@ function NumberField({
       aria-label={ariaLabel}
       min={min}
       max={max}
-      value={value}
-      onChange={(event) => onChange(Number(event.target.value) || min)}
+      value={text ?? String(value)}
+      onChange={(event) => {
+        const raw = event.target.value
+        setText(raw)
+        const n = typingInt(raw)
+        if (n !== null && n >= min && n <= max) onChange(n)
+      }}
+      onBlur={() => {
+        if (text === null) return
+        const settled = settleInt(text, min, max, fallback)
+        setText(null)
+        if (settled !== value) onChange(settled)
+      }}
     />
   )
 }
@@ -115,10 +163,35 @@ export function NotifyPane({
   onChange: (next: NotifyConfig) => void
 }) {
   const config = notifyConfig(value)
+  const email = config.email
   const telegram = config.telegram
   const wecom = config.wecom
   const feishu = config.feishu
   const status = useQuery(notifyQueryOptions())
+  const [emailToText, setEmailToText] = useState<string | null>(null)
+
+  const testEmail = useMutation({
+    mutationFn: () => {
+      if (!email.host.trim()) throw new Error('先填写 SMTP 服务器地址')
+      if (!email.from.trim() && !email.user.trim()) {
+        throw new Error('先填写发件人地址或 SMTP 用户名')
+      }
+      const recipients = email.to.filter((item) => item.includes('@'))
+      if (!recipients.length) throw new Error('先填写至少一个有效收件人邮箱')
+      return api('/api/panel/notify/test', {
+        method: 'POST',
+        body: JSON.stringify({
+          channel: 'email',
+          email: { ...email, to: recipients, enabled: true },
+        }),
+      })
+    },
+    onSuccess: async () => {
+      toast.success('测试邮件已发送')
+      await status.refetch()
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
 
   const testTelegram = useMutation({
     mutationFn: () => {
@@ -171,12 +244,17 @@ export function NotifyPane({
         body: JSON.stringify({ channel: 'feishu', feishu }),
       })
     },
-    onSuccess: () => toast.success('测试飞书已发送'),
+    onSuccess: async () => {
+      toast.success('测试飞书已发送')
+      await status.refetch()
+    },
     onError: (error: Error) => toast.error(error.message),
   })
 
   const patch = (next: Partial<NotifyConfig>) =>
     onChange({ ...config, ...next })
+  const patchEmail = (next: Partial<NotifyEmailConfig>) =>
+    patch({ email: { ...email, ...next } })
   const patchTelegram = (next: Partial<NotifyTelegramConfig>) =>
     patch({ telegram: { ...telegram, ...next } })
   const patchWecom = (next: Partial<NotifyWecomConfig>) =>
@@ -202,6 +280,14 @@ export function NotifyPane({
         </CardHeader>
         <CardContent className='space-y-3'>
           <div className='flex flex-wrap items-center gap-x-6 gap-y-2 text-sm'>
+            <StatusMark
+              tone={
+                status.data?.channels?.email
+                  ? { key: 'email-ready', cls: 'ok', text: '邮件已就绪' }
+                  : { key: 'email-missing', cls: 'none', text: '邮件未就绪' }
+              }
+              variant='pill'
+            />
             <StatusMark
               tone={
                 status.data?.channels?.telegram
@@ -277,54 +363,61 @@ export function NotifyPane({
               onCheckedChange={(run_on_start) => patch({ run_on_start })}
             />
           </SettingRow>
-          <SettingRow label='检查间隔' desc='秒，最小 15'>
+          <SettingRow label='检查间隔' desc='秒，15–86400，默认 60'>
             <NumberField
               ariaLabel='检查间隔（秒）'
               value={config.interval_sec}
               min={15}
               max={86400}
+              fallback={60}
               onChange={(interval_sec) => patch({ interval_sec })}
             />
           </SettingRow>
           <SettingRow
             label='通知冷却'
-            desc='秒，账号池同类事件的最小发送间隔；VM 下线按每次状态变化通知'
+            desc='秒，30–86400，默认 300；账号池同类事件的最小发送间隔，VM 下线按每次状态变化通知'
           >
             <NumberField
               ariaLabel='通知冷却（秒）'
               value={config.cooldown_sec}
               min={30}
               max={86400}
+              fallback={300}
               onChange={(cooldown_sec) => patch({ cooldown_sec })}
             />
           </SettingRow>
-          <SettingRow label='汇报间隔' desc='秒，最小 300'>
+          <SettingRow label='汇报间隔' desc='秒，300–86400，默认 21600'>
             <NumberField
               ariaLabel='汇报间隔（秒）'
               value={config.digest_sec}
               min={300}
               max={86400}
+              fallback={21600}
               onChange={(digest_sec) => patch({ digest_sec })}
             />
           </SettingRow>
-          <SettingRow label='最小可用数' desc='低于该数量触发账号池偏低'>
+          <SettingRow
+            label='最小可用数'
+            desc='1–1000，低于该数量触发账号池偏低'
+          >
             <NumberField
               ariaLabel='最小可用数'
               value={config.min_available}
               min={1}
               max={1000}
+              fallback={1}
               onChange={(min_available) => patch({ min_available })}
             />
           </SettingRow>
           <SettingRow
             label='控制台地址'
-            desc='通知消息中的回跳链接，留空使用后端地址'
+            desc='通知消息中的回跳链接，留空使用后端地址（未带 /cc 或 /console 时自动拼接 /cc#/cluster）'
           >
             <Input
               aria-label='控制台地址'
               className='w-full min-w-56 sm:w-80'
               maxLength={200}
-              placeholder={location.origin}
+              placeholder='https://panel.example.com/cc'
               value={config.console_url}
               onChange={(event) => patch({ console_url: event.target.value })}
             />
@@ -529,6 +622,116 @@ export function NotifyPane({
               />
             </SettingRow>
           ) : null}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className='flex flex-row items-center justify-between gap-3'>
+          <CardTitle>邮件通知（SMTP）</CardTitle>
+          <Button
+            variant='outline'
+            size='sm'
+            loading={testEmail.isPending}
+            onClick={() => testEmail.mutate()}
+          >
+            发送测试
+          </Button>
+        </CardHeader>
+        <CardContent className='divide-y'>
+          <SettingRow label='启用邮件' desc='保存后纳入定时通知通道'>
+            <Switch
+              checked={email.enabled}
+              aria-label='启用邮件'
+              onCheckedChange={(enabled) => patchEmail({ enabled })}
+            />
+          </SettingRow>
+          <SettingRow label='SMTP 服务器' desc='例如 smtp.example.com'>
+            <Input
+              aria-label='SMTP 服务器'
+              className='w-full min-w-56 sm:w-80'
+              maxLength={200}
+              placeholder='smtp.example.com'
+              value={email.host}
+              onChange={(event) => patchEmail({ host: event.target.value })}
+            />
+          </SettingRow>
+          <SettingRow
+            label='端口'
+            desc='1–65535，默认 587（STARTTLS）；465 通常开启隐式 TLS'
+          >
+            <NumberField
+              ariaLabel='SMTP 端口'
+              value={email.port}
+              min={1}
+              max={65535}
+              fallback={587}
+              onChange={(port) => patchEmail({ port })}
+            />
+          </SettingRow>
+          <SettingRow
+            label='隐式 TLS（SSL）'
+            desc='开启后直接建立 TLS 连接（常见于 465 端口）；关闭时若服务器支持会自动升级 STARTTLS'
+          >
+            <Switch
+              checked={email.secure}
+              aria-label='SMTP 隐式 TLS'
+              onCheckedChange={(secure) => patchEmail({ secure })}
+            />
+          </SettingRow>
+          <SettingRow label='SMTP 用户名' desc='无需认证的中继服务器可留空'>
+            <Input
+              aria-label='SMTP 用户名'
+              className='w-full min-w-56 sm:w-80'
+              maxLength={200}
+              placeholder='alerts@example.com'
+              value={email.user}
+              onChange={(event) => patchEmail({ user: event.target.value })}
+            />
+          </SettingRow>
+          <SettingRow
+            label='SMTP 密码 / 授权码'
+            desc={
+              email.pass_set
+                ? '已保存；留空不会覆盖现有密码'
+                : '用于 SMTP LOGIN 认证，保存后不再回显'
+            }
+          >
+            <Input
+              aria-label='SMTP 密码'
+              className='w-full min-w-56 sm:w-80'
+              type='password'
+              autoComplete='new-password'
+              maxLength={200}
+              placeholder={email.pass_set ? '已保存，留空不改' : '选填'}
+              value={email.pass}
+              onChange={(event) => patchEmail({ pass: event.target.value })}
+            />
+          </SettingRow>
+          <SettingRow label='发件人地址' desc='留空默认使用 SMTP 用户名'>
+            <Input
+              aria-label='邮件发件人'
+              className='w-full min-w-56 sm:w-80'
+              maxLength={200}
+              placeholder='KIN 告警 <alerts@example.com>'
+              value={email.from}
+              onChange={(event) => patchEmail({ from: event.target.value })}
+            />
+          </SettingRow>
+          <SettingRow label='收件人列表' desc='多个邮箱用逗号、分号或空格分隔'>
+            <Input
+              aria-label='邮件收件人'
+              className='w-full min-w-56 sm:w-80'
+              maxLength={500}
+              placeholder='ops@example.com, admin@example.com'
+              value={emailToText ?? email.to.join(', ')}
+              onChange={(event) => {
+                const raw = event.target.value
+                setEmailToText(raw)
+                patchEmail({ to: parseRecipients(raw) })
+              }}
+              onBlur={() => setEmailToText(null)}
+            />
+          </SettingRow>
         </CardContent>
       </Card>
     </>

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   amountIn,
   intervalLabel,
+  isExactInUnit,
   secondsFrom,
   unitOf,
   uploadIntervalOf,
@@ -36,5 +37,14 @@ describe('telemetry upload interval', () => {
     expect(intervalLabel(600)).toBe('10 分钟')
     expect(intervalLabel(7200)).toBe('2 小时')
     expect(intervalLabel(5400)).toBe('1 小时 30 分钟')
+  })
+
+  it('detects whether seconds can be represented losslessly in a unit', () => {
+    expect(isExactInUnit(600, 'min')).toBe(true)
+    expect(isExactInUnit(600, 'hour')).toBe(false)
+    expect(isExactInUnit(3600, 'hour')).toBe(true)
+    expect(isExactInUnit(3600, 'min')).toBe(true)
+    expect(isExactInUnit(5400, 'hour')).toBe(false)
+    expect(isExactInUnit(5400, 'min')).toBe(true)
   })
 })
