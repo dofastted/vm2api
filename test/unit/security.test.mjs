@@ -157,3 +157,47 @@ test('existing loose panel session file is tightened on load', async () => {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('createRateLimiter enforces positive limits and disables throttling when capacity or refill <= 0', async () => {
+  const { createRateLimiter } = await import(`../../src/lib/core/security.mjs?ratelimit=${Date.now()}`)
+  const limited = createRateLimiter({ capacity: 2, refillPerSec: 0.001 })
+  assert.equal(limited('k'), true)
+  assert.equal(limited('k'), true)
+  assert.equal(limited('k'), false)
+
+  const disabledByCap = createRateLimiter({ capacity: 0, refillPerSec: 1 })
+  for (let i = 0; i < 10; i++) assert.equal(disabledByCap('k'), true)
+
+  const disabledByRefill = createRateLimiter({ capacity: 1, refillPerSec: 0 })
+  for (let i = 0; i < 10; i++) assert.equal(disabledByRefill('k'), true)
+})
+
+test('loadConfig distinguishes explicit KIN_RATE_CAP=0 from default rate limits', async () => {
+  const prevKey = process.env.VM2API_API_KEY
+  const prevCap = process.env.KIN_RATE_CAP
+  const prevRefill = process.env.KIN_RATE_REFILL
+  process.env.VM2API_API_KEY = 'sk-test-rate-config'
+  try {
+    delete process.env.KIN_RATE_CAP
+    delete process.env.KIN_RATE_REFILL
+    const { loadConfig } = await import(`../../src/lib/core/config.mjs?rate=${Date.now()}`)
+    const def = loadConfig()
+    assert.equal(def.limits.rate_capacity, 60)
+    assert.equal(def.limits.rate_refill, 1)
+    assert.equal(def.limits.rate_capacity_explicit, false)
+
+    process.env.KIN_RATE_CAP = '0'
+    process.env.KIN_RATE_REFILL = '0'
+    const zero = loadConfig()
+    assert.equal(zero.limits.rate_capacity, 0)
+    assert.equal(zero.limits.rate_refill, 0)
+    assert.equal(zero.limits.rate_capacity_explicit, true)
+  } finally {
+    if (prevKey == null) delete process.env.VM2API_API_KEY
+    else process.env.VM2API_API_KEY = prevKey
+    if (prevCap == null) delete process.env.KIN_RATE_CAP
+    else process.env.KIN_RATE_CAP = prevCap
+    if (prevRefill == null) delete process.env.KIN_RATE_REFILL
+    else process.env.KIN_RATE_REFILL = prevRefill
+  }
+})
