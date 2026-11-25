@@ -2078,3 +2078,183 @@ test('Gemini scheduler fails over pre-output 502/504, falls back to reactive-coo
   )
   assert.equal(t4.attempts[1].selection_reason, 'cooldown_fallback')
 })
+
+test('429 failover: pre-content SSE meta/start error switches accounts, preserves earliest-expiry order in all_cooled_probe, honors retry_after_ms, and scopes cooldown per model', async () => {
+  let clock = 1_750_000_000_000
+  const envs = [
+    {
+      id: 'env-a',
+      proxy_id: 'px-a',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      models_discovered: true,
+      models: ['gemini-4-neon-xhigh', 'gemini-4-hydrogen-high'],
+      capabilities: [...NATIVE_TUI_CAPABILITIES],
+      account: { state: 'ok', quotas: [], quota_groups: [] },
+    },
+    {
+      id: 'env-b',
+      proxy_id: 'px-b',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      models_discovered: true,
+      models: ['gemini-4-neon-xhigh', 'gemini-4-hydrogen-high'],
+      capabilities: [...NATIVE_TUI_CAPABILITIES],
+      account: { state: 'ok', quotas: [], quota_groups: [] },
+    },
+    {
+      id: 'env-c',
+      proxy_id: 'px-c',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      models_discovered: true,
+      models: ['gemini-4-neon-xhigh', 'gemini-4-hydrogen-high'],
+      capabilities: [...NATIVE_TUI_CAPABILITIES],
+      account: { state: 'ok', quotas: [], quota_groups: [] },
+    },
+  ]
+
+  // Pool scheduler with biased lastUsed (env-c used most recently, env-a never used)
+  const tracker = makeCircuitTracker()
+  tracker.lastUsed.set('gemini:env-c', clock - 1_000)
+  tracker.lastUsed.set('gemini:env-b', clock - 2_000)
+  tracker.lastUsed.set('gemini:env-a', 0)
+  tracker.reserveExternalCandidates = (candidates, { excluded }) => {
+    const avail = candidates
+      .filter((c) => !excluded.has(c.accountId))
+      .sort(
+        (l, r) =>
+          (tracker.lastUsed.get(l.accountId) || 0) - (tracker.lastUsed.get(r.accountId) || 0) ||
+          l.accountId.localeCompare(r.accountId),
+      )
+    return avail[0] ? { selected: avail[0], reservation: { release() {} } } : null
+  }
+
+  let mode = 'preContentSse429OnA'
+  const calls = []
+  const scheduler = createGeminiScheduler({
+    now: () => clock,
+    quotaCooldownMs: 60_000,
+    poolScheduler: tracker,
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments: envs }
+      if (op === 'get') return envs.find((e) => e.id === payload.id)
+      if (op === 'infer-cancel') return { cancelled: true }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async (_op, payload) => {
+      calls.push({ id: payload.id, model: payload.model })
+      if (mode === 'preContentSse429OnA' && payload.id === 'env-a') {
+        // Upstream emits a metadata-only SSE chunk (triggers decoder `start` + `meta` without any
+        // content bytes written to downstream google.gemini stream) followed by SSE 429 error!
+        return sseResponse([
+          `data: ${JSON.stringify({
+            responseId: 'r-pre-429',
+            modelVersion: 'gemini-4-neon-xhigh',
+            craggeminiMeta: { conversation_id: payload.body?.conversation_id || 'gc_1' },
+            candidates: [],
+          })}\n\n`,
+          `data: ${JSON.stringify({
+            error: { code: 429, status: 'RESOURCE_EXHAUSTED', message: 'model capacity' },
+          })}\n\n`,
+        ])
+      }
+      if (mode === 'all429WithRetryAfter') {
+        const retryMs = payload.id === 'env-a' ? 90_000 : payload.id === 'env-b' ? 15_000 : 45_000
+        return sseResponse(
+          [JSON.stringify({ code: 'gemini_quota_exhausted', message: '429', retry_after_ms: retryMs })],
+          { statusCode: 429, contentType: 'application/json' },
+        )
+      }
+      if (mode === 'probeOrderCheck') {
+        return sseResponse([JSON.stringify({ code: 'gemini_quota_exhausted', message: 'still 429' })], {
+          statusCode: 429,
+          contentType: 'application/json',
+        })
+      }
+      return sseResponse([
+        `data: ${JSON.stringify({
+          candidates: [{ content: { role: 'model', parts: [{ text: `ok-from-${payload.id}` }] }, finishReason: 'STOP' }],
+        })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://192.0.2.10:1080',
+  })
+
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler,
+  })
+
+  // 1. Streaming /v1beta/...:streamGenerateContent where env-a emits start+meta then SSE 429 MUST switch to env-b!
+  const res1 = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-neon-xhigh:streamGenerateContent',
+      body: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+    }),
+    res1,
+  )
+  assert.equal(res1.statusCode, 200)
+  assert.match(res1.bodyText(), /ok-from-env-b/)
+  assert.deepEqual(
+    calls.map((c) => c.id),
+    ['env-a', 'env-b'],
+    'pre-content start/meta SSE 429 must seamlessly switch from env-a to env-b',
+  )
+
+  // 2. Sibling Gemini model (gemini-4-hydrogen-high) on env-a MUST NOT be poisoned by gemini-4-neon-xhigh 429!
+  const snapAfter429 = scheduler.cooldownSnapshot()
+  assert.equal(Object.keys(snapAfter429.groups).length, 0, 'reactive 429 must not poison entire quota group')
+  assert.ok(snapAfter429.models['env-a:gemini-4-neon-xhigh'] > clock)
+
+  const beforeSibling = calls.length
+  const sibTurn = await scheduler.stream({
+    model: 'gemini-4-hydrogen-high',
+    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'sibling ok' }] }] },
+    apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+  })
+  assert.equal(sibTurn.account_id, 'env-c', 'uncooled env-c/env-a remain eligible for sibling model')
+  assert.equal(calls.length, beforeSibling + 1)
+
+  // 3. When all accounts 429 with distinct retry_after_ms, all_cooled_probe MUST try earliest-expiry first
+  // (env-b @ +15s, then env-c @ +45s, then env-a @ +90s) even when poolScheduler.lastUsed prefers another order!
+  clock += 70_000
+  mode = 'all429WithRetryAfter'
+  await assert.rejects(
+    () =>
+      scheduler.stream({
+        model: 'gemini-4-neon-xhigh',
+        geminiBody: { contents: [{ role: 'user', parts: [{ text: 'cool all' }] }] },
+        apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+      }),
+    (err) => err.code === 'gemini_quota_exhausted' && err.attemptCount === 3,
+  )
+  const snapAll = scheduler.cooldownSnapshot()
+  assert.equal(snapAll.models['env-b:gemini-4-neon-xhigh'], clock + 15_000)
+  assert.equal(snapAll.models['env-c:gemini-4-neon-xhigh'], clock + 45_000)
+  assert.equal(snapAll.models['env-a:gemini-4-neon-xhigh'], clock + 90_000)
+
+  // Bias poolScheduler.lastUsed heavily toward env-a; all_cooled_probe must STILL probe earliest expiry first!
+  tracker.lastUsed.set('gemini:env-a', 1)
+  tracker.lastUsed.set('gemini:env-b', clock + 100)
+  tracker.lastUsed.set('gemini:env-c', clock + 50)
+  clock += 5_000
+  mode = 'probeOrderCheck'
+  const beforeProbe = calls.length
+  await assert.rejects(
+    () =>
+      scheduler.stream({
+        model: 'gemini-4-neon-xhigh',
+        geminiBody: { contents: [{ role: 'user', parts: [{ text: 'probe order' }] }] },
+        apiKeyRecord: { id: 'k1', group_type: 'gemini' },
+      }),
+    (err) => err.code === 'gemini_quota_exhausted' && err.attemptCount === 3,
+  )
+  assert.deepEqual(
+    calls.slice(beforeProbe).map((c) => c.id),
+    ['env-b', 'env-c', 'env-a'],
+    'all_cooled_probe must preserve earliest cooldown expiry order instead of stale lastUsed/alphabetical order',
+  )
+})

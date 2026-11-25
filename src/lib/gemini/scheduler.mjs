@@ -146,6 +146,41 @@ const ACCOUNT_WIDE_COOLDOWN_ERRORS = new Set([
 
 const INELIGIBLE_STATES = new Set(['verification_required', 'location_unsupported', 'ineligible'])
 
+const CONTENT_OUTPUT_EVENTS = new Set([
+  'text',
+  'thinking',
+  'thinking_signature',
+  'text_signature',
+  'tool_call',
+  'image',
+  'search',
+  'stop',
+])
+
+function parseRetryAfterMs(rawBody, headers) {
+  const bodyMs = Number(rawBody?.retry_after_ms ?? rawBody?.retryAfterMs)
+  if (Number.isFinite(bodyMs) && bodyMs > 0) {
+    return Math.min(3_600_000, Math.max(1_000, Math.round(bodyMs)))
+  }
+  const bodySec = Number(rawBody?.retry_after ?? rawBody?.retryAfter)
+  if (Number.isFinite(bodySec) && bodySec > 0) {
+    return Math.min(3_600_000, Math.max(1_000, Math.round(bodySec * 1000)))
+  }
+  const headerVal = headers?.['retry-after'] ?? headers?.['Retry-After']
+  if (headerVal != null && headerVal !== '') {
+    const asNum = Number(headerVal)
+    if (Number.isFinite(asNum) && asNum > 0) {
+      return Math.min(3_600_000, Math.max(1_000, Math.round(asNum * 1000)))
+    }
+    const asDate = Date.parse(String(headerVal))
+    if (Number.isFinite(asDate)) {
+      const delta = asDate - Date.now()
+      if (delta > 0) return Math.min(3_600_000, Math.max(1_000, Math.round(delta)))
+    }
+  }
+  return null
+}
+
 function fail(status, code, message = FAILURES[code]?.[1] || code) {
   const error = new Error(message)
   error.status = status
@@ -157,7 +192,14 @@ function known(error) {
   const code = error?.code
   if (typeof code === 'string' && Object.hasOwn(FAILURES, code)) {
     const [status, message] = FAILURES[code]
-    return fail(Number.isInteger(error.status) ? error.status : status, code, error.message || message)
+    const out = fail(Number.isInteger(error.status) ? error.status : status, code, error.message || message)
+    if (Number.isInteger(error.upstreamStatus)) out.upstreamStatus = error.upstreamStatus
+    if (Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) out.retryAfterMs = error.retryAfterMs
+    if (error.retryAfter != null) out.retryAfter = error.retryAfter
+    if (error.timing) out.timing = error.timing
+    if (error.usage) out.usage = error.usage
+    if (error.details) out.details = error.details
+    return out
   }
   return null
 }
@@ -643,10 +685,10 @@ export function createGeminiScheduler({
           ? failure.retryAfterMs
           : effectiveQuotaCooldown
       const until = ts + retryMs
-      groupCooldowns.set(
-        `${accountId}:${quotaGroup}`,
-        Math.max(groupCooldowns.get(`${accountId}:${quotaGroup}`) || 0, until),
-      )
+      // Scope reactive 429 cooldown to the specific upstream model so a single
+      // model's capacity/RPM 429 does not poison healthy sibling models on the
+      // same account. Proactive 0% bucket exhaustion in `account.quota_groups`
+      // still enforces group-wide cooldowns via `proactiveCooldownUntil`.
       modelCooldowns.set(
         `${accountId}:${upstreamModel}`,
         Math.max(modelCooldowns.get(`${accountId}:${upstreamModel}`) || 0, until),
@@ -1005,10 +1047,27 @@ export function createGeminiScheduler({
         while (excluded.size < totalCandidates && attempts < maxAttempts) {
           signal?.throwIfAborted()
           let fromFallback = false
-          let grant = pickCandidateWithPolicy(primaryCandidates, excluded, {
-            strategy: uncooled.length ? policy.pool.strategy : 'balanced',
-            stickyAccountId: uncooled.length ? stickyAccountId : null,
-          })
+          let grant = null
+          if (uncooled.length) {
+            grant = pickCandidateWithPolicy(primaryCandidates, excluded, {
+              strategy: policy.pool.strategy,
+              stickyAccountId,
+            })
+          } else {
+            // Preserve earliest-expiry order across cooled candidates instead of letting
+            // balanced/lastUsed sorting lock every probe onto the same account sequence.
+            for (const candidate of primaryCandidates) {
+              if (excluded.has(candidate.accountId)) continue
+              const probeGrant = pickCandidateWithPolicy([candidate], excluded, {
+                strategy: 'balanced',
+                stickyAccountId: null,
+              })
+              if (probeGrant?.selected) {
+                grant = probeGrant
+                break
+              }
+            }
+          }
           if (!grant?.selected && fallbackCandidates.length) {
             for (const candidate of fallbackCandidates) {
               if (excluded.has(candidate.accountId)) continue
@@ -1030,6 +1089,7 @@ export function createGeminiScheduler({
           const id = grant.selected.accountId.slice('gemini:'.length)
           const resolved = resolvedByAccountId.get(grant.selected.accountId)
           selected = { ...grant.selected, id, resolved }
+          poolScheduler?.lastUsed?.set?.(selected.accountId, attemptStartedAt)
           lastAccountId = id
           lastAuthMethod = selected.authMethod || 'oauth'
           lastUpstreamModel = resolved.upstreamModel
@@ -1186,7 +1246,18 @@ export function createGeminiScheduler({
                           : res.statusCode === 404
                             ? 'gemini_model_unavailable'
                             : 'gemini_inference_failed'
-                  throw fail(res.statusCode || FAILURES[errCode][0], errCode, errBody?.message || FAILURES[errCode][1])
+                  const err = fail(
+                    res.statusCode || FAILURES[errCode][0],
+                    errCode,
+                    errBody?.message || FAILURES[errCode][1],
+                  )
+                  if (Number.isInteger(res.statusCode)) err.upstreamStatus = res.statusCode
+                  const retryAfterMs = parseRetryAfterMs(errBody, res.headers)
+                  if (retryAfterMs != null) {
+                    err.retryAfterMs = retryAfterMs
+                    err.retryAfter = Math.ceil(retryAfterMs / 1000)
+                  }
+                  throw err
                 }
               }
             } else {
@@ -1233,8 +1304,12 @@ export function createGeminiScheduler({
                   }
                 },
                 onEvent: (event) => {
-                  if (event && event.kind !== 'error') emittedOutput = true
-                  onEvent?.(event)
+                  const committed = onEvent?.(event)
+                  if (typeof committed === 'boolean') {
+                    if (committed) emittedOutput = true
+                  } else if (event && CONTENT_OUTPUT_EVENTS.has(event.kind)) {
+                    emittedOutput = true
+                  }
                 },
               })
               activeInfer = null

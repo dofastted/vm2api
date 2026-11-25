@@ -339,5 +339,68 @@ with tempfile.TemporaryDirectory(prefix="gemini-gate-") as temporary:
     gate_host.payload_version = None
     assert gate_host._use_sharded_daemon() is True
 
+# 4. NativeSession.apply_policy() and CragDaemonShard.apply_policy() must hot-propagate
+# session_idle_ttl_secs and min_warm_slots via POST /internal/v1/accounts/<id>/scale.
+fake_calls = []
+
+
+def _fake_worker_json_request(sock, token, method, path, payload=None, timeout=5.0):
+    fake_calls.append((method, path, payload))
+    return 200, {"ok": True}
+
+
+with patch.object(impl, "native_module", return_value=SimpleNamespace(worker_json_request=_fake_worker_json_request)):
+    # 4a. NativeSession (pool_mode=True)
+    ns = impl.NativeSession.__new__(impl.NativeSession)
+    ns.host = SimpleNamespace(runtime_policy=dict(impl.DEFAULT_RUNTIME_POLICY))
+    ns.environment = {"id": "gemini-111111111111111111111111", "max_concurrency": 3}
+    ns.max_concurrency = 3
+    ns.pool_mode = True
+    ns.native_dir = Path("/tmp/ns-test")
+    ns.native_token = "tok"
+    ns.is_alive = lambda: True
+    assert ns.apply_policy({"pool": {"session_idle_ttl_secs": 90, "min_warm_slots": 1}}) is True
+    assert len(fake_calls) == 2
+    assert fake_calls[0][0] == "PUT" and fake_calls[0][1] == "/internal/v1/policy"
+    assert fake_calls[1][0] == "POST"
+    assert fake_calls[1][1] == "/internal/v1/accounts/gemini-111111111111111111111111/scale"
+    assert fake_calls[1][2] == {
+        "runnable_slots": 3,
+        "max_concurrency": 3,
+        "min_warm_slots": 1,
+        "idle_ttl_secs": 90,
+    }
+
+    # 4b. CragDaemonShard (2 members with distinct max_concurrency, clamping min_warm_slots)
+    fake_calls.clear()
+    import threading as _th
+
+    sh = impl.CragDaemonShard.__new__(impl.CragDaemonShard)
+    sh._lock = _th.RLock()
+    sh.policy = dict(impl.DEFAULT_RUNTIME_POLICY)
+    sh.native_dir = Path("/tmp/sh-test")
+    sh.native_token = "tok"
+    sh.is_alive = lambda: True
+    sh.members = {
+        "gemini-222222222222222222222222": {"max_concurrency": 3},
+        "gemini-333333333333333333333333": {"max_concurrency": 1},
+    }
+    assert sh.apply_policy({"pool": {"session_idle_ttl_secs": 90, "min_warm_slots": 2}}) is True
+    assert len(fake_calls) == 3
+    assert fake_calls[0][0] == "PUT" and fake_calls[0][1] == "/internal/v1/policy"
+    scale_by_path = {path: body for method, path, body in fake_calls[1:] if method == "POST"}
+    assert scale_by_path["/internal/v1/accounts/gemini-222222222222222222222222/scale"] == {
+        "runnable_slots": 3,
+        "max_concurrency": 3,
+        "min_warm_slots": 2,
+        "idle_ttl_secs": 90,
+    }
+    assert scale_by_path["/internal/v1/accounts/gemini-333333333333333333333333/scale"] == {
+        "runnable_slots": 1,
+        "max_concurrency": 1,
+        "min_warm_slots": 1,
+        "idle_ttl_secs": 90,
+    }
+
 
 print("OK")
