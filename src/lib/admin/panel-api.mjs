@@ -2455,7 +2455,9 @@ function findRuntime(accountQuota, vm, snap = null) {
       const leftover =
         leftoverKey &&
         (!cred.has_access ||
-          /refresh_token_missing|invalid_grant|worker_unhealthy/.test(err + String(state.status || '')))
+          /refresh_token_missing|invalid_grant|token_revoked|invalidated oauth token|worker_unhealthy/.test(
+          err + String(state.status || '')
+        ))
       const live = !!(vm.has_refresh || vm.has_token || vm.account_uuid)
       if (leftover && live) continue
       return freshenRuntimeState(state, vm, repo)
@@ -2487,7 +2489,10 @@ function freshenRuntimeState(state, vm, repo = null) {
   }
   const cred = state.worker_status?.credential
   const lastError = String(state.worker_status?.last_error || state.worker_status?.error || '')
-  const leftover = /invalid_grant|refresh token not found|oauth_revoked|credential_refresh_failed/i.test(lastError)
+  const leftover =
+    /invalid_grant|refresh token not found|oauth_revoked|credential_refresh_failed|token_revoked|invalidated oauth token/i.test(
+      lastError
+    )
   const wMs = expiresAtToMs(cred?.expires_at)
   const vMs = expiresAtToMs(vm.expires_at)
   const liveMs = Math.max(wMs || 0, vMs || 0)

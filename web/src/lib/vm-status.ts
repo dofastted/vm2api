@@ -60,8 +60,11 @@ const USAGE_PROBE_SOURCES = new Set([
   'messages-headers',
 ])
 
+// OpenAI/codex revocations surface as error.code "token_revoked" /
+// "Encountered invalidated oauth token for user" — the same grant death
+// as Anthropic's "token has been revoked", spelled differently.
 const GRANT_DEATH =
-  /credential_refresh_failed|oauth_revoked|oauth_invalid_grant|invalid_grant/i
+  /credential_refresh_failed|oauth_revoked|oauth_invalid_grant|invalid_grant|token_revoked|invalidated oauth token/i
 
 function isTestChatProbe(vm: Vm): boolean {
   return TEST_PROBE_SOURCES.test(String(vm.last_probe?.source || ''))
@@ -124,7 +127,7 @@ function grantRevoked(vm: Vm): boolean {
       ? null
       : vm.availability?.reason,
   ]
-  return /access token has been revoked|token has been revoked|oauth_revoked/i.test(
+  return /access token has been revoked|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i.test(
     bits.filter(Boolean).join(' ')
   )
 }

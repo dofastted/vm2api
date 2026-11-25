@@ -61,7 +61,11 @@ export function isUsageProbeTarget(vm) {
   if (!vm?.id) return false
   if (!hasRefreshPresence(vm.claude) && !vm.has_refresh && !vm.has_token) return false
   const grantErr = String(vm.claude?.refresh_error || vm.refresh_error || '')
-  if (/invalid_grant|refresh token not found/i.test(grantErr)) return false
+  // Skip probing revoked grants: the usage call would just 401 upstream on a dead token.
+  if (
+    /invalid_grant|refresh token not found|oauth_revoked|token_revoked|invalidated oauth token/i.test(grantErr)
+  )
+    return false
   const status = String(vm.status || '').toLowerCase()
   if (HARD_DOWN.has(status)) return false
   if (!vmHasProxyPath(vm)) return false

@@ -66,6 +66,24 @@ test('isUnconfirmedAuthFailure: a definitive codex revocation is not an unconfir
   assert.equal(isUnconfirmedAuthFailure({ status: 401, body: CODEX_401_BODY }), false)
 })
 
+test('mid-stream codex revocation follows the same unconfirmed path as claude (consistency, no cooldown)', () => {
+  // Upstream deliberately treats terminalState:'incomplete' auth failures as
+  // unconfirmed for both providers: a wrap hop can stream a stale local 401
+  // before the CLI loaded the host ticket. Pin codex onto that same path so a
+  // definitive body does not park mid-stream while claude does not.
+  const codexMidStream = { status: 401, body: CODEX_401_BODY, terminalState: 'incomplete', committed: true }
+  const claudeMidStream = { status: 401, body: CLAUDE_401_BODY, terminalState: 'incomplete', committed: true }
+  assert.equal(isUnconfirmedAuthFailure(codexMidStream), true)
+  assert.equal(isUnconfirmedAuthFailure(claudeMidStream), true)
+  const codexPolicy = classifyUpstreamResult(codexMidStream, { hasRefresh: true })
+  assert.equal(codexPolicy.reason, 'oauth_unconfirmed')
+  // The definitive path (no terminalState) still parks — the production case.
+  assert.equal(
+    classifyUpstreamResult({ status: 401, body: CODEX_401_BODY }, { hasRefresh: true }).reason,
+    'oauth_revoked',
+  )
+})
+
 test('classifyCredentialRefresh: codex token endpoint rejection is fatal', () => {
   assert.equal(classifyCredentialRefresh(CODEX_TOKEN_ENDPOINT_REFRESH), 'fatal')
 })
