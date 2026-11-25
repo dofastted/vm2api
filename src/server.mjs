@@ -1436,6 +1436,7 @@ const geminiScheduler = createGeminiScheduler({
   cragSubscription: geminiCragSubscription,
   getRoutingConfig: () => routingConfig,
   getAttemptsRepo: () => attemptsRepo,
+  listCacheTtlMs: 2000,
 })
 const handleGeminiPublic = createGeminiPublicHandler({
   json,
@@ -1975,6 +1976,7 @@ const server = http.createServer(async (req, res) => {
           routeStream: gemGen.stream,
         })
       }
+      let preloadedGemCat = null
       if (gemGen && backend === 'all') {
         const policy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(req.apiKeyRecord) : null
         const gemScope = {
@@ -1989,6 +1991,7 @@ const server = http.createServer(async (req, res) => {
         let hasOwnedGemEnv = false
         try {
           const cat = await geminiScheduler.catalog(gemScope)
+          preloadedGemCat = cat
           hasOwnedGemEnv = Array.isArray(cat?.accounts) && cat.accounts.length > 0
         } catch {
           hasOwnedGemEnv = false
@@ -2003,7 +2006,7 @@ const server = http.createServer(async (req, res) => {
           })
         }
       }
-      return handleGeminiPublic(req, res)
+      return handleGeminiPublic(req, res, preloadedGemCat ? { catalogSnapshot: preloadedGemCat } : {})
     }
     // A shared path only belongs to Gemini when the key does. Dispatching on
     // the path alone would make the OpenAI handlers below unreachable, and

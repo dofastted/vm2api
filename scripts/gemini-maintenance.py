@@ -1764,25 +1764,37 @@ class Maintenance:
                     verifier_root = candidate["verifier_root"]
                     materialized = True
                 if not materialized:
+                    manual_trust_configured = (
+                        "--release-verifier" in options
+                        or exists(self.manual_release)
+                        or (
+                            before is not None
+                            and Path(options["--public-key"]) != self.public_key
+                        )
+                        or (
+                            "--default-release-verifier" not in options
+                            and exists(self.public_key)
+                        )
+                    )
                     if current_id is not None and (
                         not target["pinned"] or digest != pinned_digest
                     ):
-                        raise fail("repair_release_unknown", 409)
+                        # When current payload failed verification under standard default trust
+                        # (e.g. corrupted manifest.json or mismatched old release digest), allow
+                        # repair/recover to replace it with a freshly verified signed release
+                        # instead of deadlocking between update_requires_valid_payload and
+                        # repair_release_unknown. Manual trust configurations still fail closed.
+                        can_reinstall_broken = (
+                            action in {"repair", "recover"}
+                            and not manual_trust_configured
+                            and (self.crag_bundle or target["pinned"])
+                        )
+                        if not can_reinstall_broken:
+                            raise fail("repair_release_unknown", 409)
                     if current_id is None:
                         # A missing custom payload may not be silently replaced by a
                         # default just because the installer has a pinned catalog.
-                        if (
-                            "--release-verifier" in options
-                            or exists(self.manual_release)
-                            or (
-                                before is not None
-                                and Path(options["--public-key"]) != self.public_key
-                            )
-                            or (
-                                "--default-release-verifier" not in options
-                                and exists(self.public_key)
-                            )
-                        ):
+                        if manual_trust_configured:
                             raise fail("manual_source_required", 409)
                         if "--default-release-verifier" in options:
                             configured = read_verifier(
@@ -1790,9 +1802,9 @@ class Maintenance:
                             )
                             if configured["manifest_sha256"] != pinned_digest:
                                 raise fail("repair_release_unknown", 409)
-                    default, _, _ = self.stage_release(target["id"])
+                    default, staged_digest, _ = self.stage_release(target["id"])
                     target_unit = self.write_unit(before, default)
-                    if current_id is None:
+                    if current_id is None or digest != staged_digest:
                         new_activation = None
                     verifier_root = self.bundle
             target_unit = self.write_unit(target_unit)

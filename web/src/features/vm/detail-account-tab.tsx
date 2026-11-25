@@ -10,7 +10,7 @@ import {
 import { extraUsageText } from '@/lib/fable-status'
 import { fmtExpiresAt, fmtNum, pct } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { isCodexVm } from '@/lib/vm-kind'
+import { formatSlotEmail, isCodexVm, slotRawEmail } from '@/lib/vm-kind'
 import { claudeTier, credExpiry } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -200,10 +200,13 @@ export function VmAccountTab(props: VmAccountTabProps) {
               )}
               <Field label={gpt ? 'ChatGPT 账号' : 'UUID'} compact>
                 {gpt ? (
-                  <span className='text-sm'>
-                    {String(
-                      vm.email || vm.account_uuid || acc.account_id || '—'
-                    )}
+                  <span
+                    className='text-sm'
+                    title={slotRawEmail(vm) || undefined}
+                  >
+                    {slotRawEmail(vm)
+                      ? formatSlotEmail(slotRawEmail(vm))
+                      : String(vm.account_uuid || acc.account_id || '—')}
                   </span>
                 ) : (
                   <span className='font-mono text-xs'>

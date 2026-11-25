@@ -428,7 +428,9 @@ function HostOverview({
   const [upgradeFailed, setUpgradeFailed] = useState(false)
   const [code, setCode] = useState('')
   const [notice, setNotice] = useState<{ text: string; error?: true }>()
-  const [action, setAction] = useState<'redeem' | 'recover' | 'upgrade'>()
+  const [action, setAction] = useState<
+    'redeem' | 'recover' | 'upgrade' | 'rebuild-identity'
+  >()
   const [packageChanged, setPackageChanged] = useState(false)
   const [confirmRecovery, setConfirmRecovery] = useState(false)
   const operating = useRef(false)
@@ -590,6 +592,31 @@ function HostOverview({
       setAction(undefined)
     }
   }
+  async function rebuildIdentity() {
+    if (operating.current) return
+    operating.current = true
+    setAction('rebuild-identity')
+    setNotice(undefined)
+    const { queryKey } = cragHostStatusQueryOptions()
+    try {
+      const next = await api<CragHostStatus>(`${hostRoot}/rebuild-identity`, {
+        method: 'POST',
+        body: '{}',
+      })
+      qc.setQueryData(queryKey, next)
+      setNotice({
+        text: '已为本机重建设备标识。请重新提交原兑换码或使用原订单号迁移恢复订阅。',
+      })
+      onUpdated()
+    } catch (error) {
+      setNotice({ text: hostRedemptionError(error), error: true })
+    } finally {
+      await qc.invalidateQueries({ queryKey })
+      operating.current = false
+      setAction(undefined)
+    }
+  }
+
   const probeFailed = status?.target_probe_failed && !status.ready
   return (
     <section
@@ -612,10 +639,24 @@ function HostOverview({
         </Button>
       </div>
       {status?.credential_recovery ? (
-        <p role='alert' className='text-sm text-destructive'>
-          {cragCredentialRecoveryFaults[status.credential_recovery] ??
-            cragSubscriptionErrors.auth_forbidden}
-        </p>
+        <div className='space-y-2'>
+          <p role='alert' className='text-sm text-destructive'>
+            {cragCredentialRecoveryFaults[status.credential_recovery] ??
+              cragSubscriptionErrors.auth_forbidden}
+          </p>
+          {status.credential_recovery === 'host_id_collision' ||
+          status.credential_recovery === 'not_activated' ? (
+            <Button
+              type='button'
+              variant='outline'
+              size='sm'
+              disabled={host.isFetching || !!action}
+              onClick={() => void rebuildIdentity()}
+            >
+              {action === 'rebuild-identity' ? '重建中…' : '重建设备标识'}
+            </Button>
+          ) : null}
+        </div>
       ) : null}
       {status ? (
         <>

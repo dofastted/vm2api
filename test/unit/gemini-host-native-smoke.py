@@ -567,10 +567,17 @@ with tempfile.TemporaryDirectory(prefix="gemini-multiproc-host-") as mp_tmp:
             },
         )
         assert cleaned is not None
-        assert set(cleaned.keys()) == {"model", "contents", "systemInstruction", "tools", "conversation_id"}, cleaned.keys()
+        assert set(cleaned.keys()) == {
+            "model",
+            "contents",
+            "systemInstruction",
+            "tools",
+            "generationConfig",
+            "conversation_id",
+        }, cleaned.keys()
         assert cleaned["model"] == "gemini-test"
         assert cleaned["conversation_id"] == "conv_py_1"
-        assert "generationConfig" not in cleaned
+        assert cleaned["generationConfig"] == {"thinkingConfig": {"thinkingBudget": 1024}}
         assert cleaned["tools"] == [{"functionDeclarations": [{"name": "get_weather"}]}, {"googleSearch": {}}]
         assert cleaned["contents"][0]["parts"][1] == {"text": "[Attached application/pdf: https://example.test/a.pdf]"}
         assert cleaned["contents"][1]["parts"] == [{"text": "ok"}]

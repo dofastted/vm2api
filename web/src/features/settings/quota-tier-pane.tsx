@@ -40,6 +40,7 @@ import {
   quotaDialogClass,
   recordOf,
 } from './quota-values'
+import { exhaustionGuardOrderError } from './routing-draft'
 import {
   ChipGroup,
   PaneSection,
@@ -155,6 +156,7 @@ function ClaudeGates({
   const policy = tiers[tier] || {}
   const fallback = TIER_DEFAULTS[tier]
   const weekly = recordOf(quota.weekly_split)
+  const exhaustionError = exhaustionGuardOrderError(quota)
   return (
     <div className='space-y-4'>
       <TierTabs tier={tier} onTier={onTier} />
@@ -238,6 +240,11 @@ function ClaudeGates({
             onQuotaChange({ exhaustion_guard_stop: value / 100 })
           }
         />
+        {exhaustionError ? (
+          <p role='alert' className='text-xs text-destructive'>
+            {exhaustionError}
+          </p>
+        ) : null}
       </div>
       <div className='space-y-3 rounded-lg border p-3'>
         <SliderSetting
@@ -450,6 +457,8 @@ export function QuotaTierPane({
   onFailoverChange,
   saving = false,
   pending = false,
+  pendingCards,
+  maxBodyMib,
 }: {
   tiers: Record<string, QuotaTierPolicy>
   quota: Obj
@@ -459,6 +468,8 @@ export function QuotaTierPane({
   onFailoverChange: (patch: Obj) => void
   saving?: boolean
   pending?: boolean
+  pendingCards?: Partial<Record<'gates' | 'concurrency' | 'rpm', boolean>>
+  maxBodyMib?: number
 }) {
   const list = useQuery(vmsListQueryOptions(5000))
   const [dialog, setDialog] = useState<DialogKind | null>(null)
@@ -491,6 +502,7 @@ export function QuotaTierPane({
   const closeDialog = () => {
     if (!saving) setDialog(null)
   }
+  const gatesOrderError = exhaustionGuardOrderError(draftQuota)
   const apply = () => {
     if (!dialog || saving) return
     if (dialog === 'details') {
@@ -498,6 +510,7 @@ export function QuotaTierPane({
       return
     }
     if (dialog === 'gates') {
+      if (gatesOrderError) return
       TIERS.forEach(({ key }) => {
         const policy = draftTiers[key] || {}
         onChange(key, {
@@ -562,6 +575,26 @@ export function QuotaTierPane({
   }
 
   const claudeItems = (list.data?.items || []).filter((vm) => !isCodexVm(vm))
+  const configuredMib = numberOf(
+    failover.max_request_mib,
+    REQUEST_BODY_DEFAULT_MIB
+  )
+  const ceilingMib =
+    typeof maxBodyMib === 'number' &&
+    Number.isFinite(maxBodyMib) &&
+    maxBodyMib > 0
+      ? Math.floor(maxBodyMib)
+      : null
+  const sliderMax =
+    ceilingMib != null ? Math.min(128, Math.max(8, ceilingMib)) : 128
+  const bodyPresets = Array.from(
+    new Set(
+      [32, 64, 128]
+        .filter((p) => p <= sliderMax)
+        .concat(sliderMax >= 8 ? [sliderMax] : [])
+    )
+  ).sort((a, b) => a - b)
+  const exceedsCeiling = ceilingMib != null && configuredMib > ceilingMib
   const title =
     dialog === 'gates'
       ? '配额闸线'
@@ -587,7 +620,7 @@ export function QuotaTierPane({
               return `${Math.round(ratioValue(policy, 'limit_5h', fallback.limit_5h))}% / ${Math.round(ratioValue(policy, 'limit_7d', fallback.limit_7d))}%`
             })}
             desc='5h / 7d，本地软闸'
-            pending={pending}
+            pending={pendingCards ? !!pendingCards.gates : pending}
             buttonRef={(node) => {
               triggerRefs.current.gates = node
             }}
@@ -603,7 +636,7 @@ export function QuotaTierPane({
                 `${numberOf(policy.max_concurrency, TIER_DEFAULTS[key].max_concurrency)}`
             )}
             desc='每个账号的在飞请求数'
-            pending={pending}
+            pending={pendingCards ? !!pendingCards.concurrency : pending}
             buttonRef={(node) => {
               triggerRefs.current.concurrency = node
             }}
@@ -617,7 +650,7 @@ export function QuotaTierPane({
               formatRpm(numberOf(policy.max_rpm, TIER_DEFAULTS[key].max_rpm))
             )}
             desc='满后排队，不切号；0 = 不限'
-            pending={pending}
+            pending={pendingCards ? !!pendingCards.rpm : pending}
             buttonRef={(node) => {
               triggerRefs.current.rpm = node
             }}
@@ -650,25 +683,41 @@ export function QuotaTierPane({
       <PaneSection
         icon={HardDrive}
         title='请求体上限'
-        desc='入站请求正文的最大大小，图片和工具写入的大文件都算在内。Claude 与 GPT 共用。超过返回 413。保存后各槽 kernel 在没有请求时重启。不能超过 KIN_MAX_BODY。'
+        desc='入站请求正文的最大大小（受当前进程 KIN_MAX_BODY 封顶），图片和工具写入的大文件都算在内，超过返回 413。Claude 与 GPT 共用（Gemini 独立走宿主限制）；保存后 Claude 槽在无在飞请求时重载 kernel，GPT 槽的 codex-kernel 在下次空闲请求时应用新上限。'
       >
         <fieldset disabled={saving} className='min-w-0 border-0 p-0'>
           <SliderSetting
             id='quota-max-request'
             label='允许的最大请求体'
-            value={numberOf(failover.max_request_mib, REQUEST_BODY_DEFAULT_MIB)}
+            value={configuredMib}
             min={8}
-            max={128}
+            max={sliderMax}
             step={8}
             format={(value) => `${value} MiB`}
-            fallback={REQUEST_BODY_DEFAULT_MIB}
-            presets={[32, 64, 128]}
+            fallback={Math.min(REQUEST_BODY_DEFAULT_MIB, sliderMax)}
+            presets={bodyPresets}
             onChange={(value) =>
               onFailoverChange({
-                max_request_mib: Math.min(128, Math.max(8, Math.round(value))),
+                max_request_mib: Math.min(
+                  sliderMax,
+                  Math.max(8, Math.round(value))
+                ),
               })
             }
-          />
+          >
+            {exceedsCeiling ? (
+              <p role='alert' className='text-xs text-destructive'>
+                当前配置值（{configuredMib} MiB）高于进程 KIN_MAX_BODY 上限（
+                {ceilingMib} MiB），入站实际封顶为 {ceilingMib}{' '}
+                MiB；需提高环境变量 KIN_MAX_BODY 并重启控制面才能生效。
+              </p>
+            ) : ceilingMib != null ? (
+              <p className='text-xs text-muted-foreground'>
+                当前进程 KIN_MAX_BODY 有效上限为 {ceilingMib} MiB
+                {ceilingMib < 128 ? '（滑块已按进程上限封顶）' : ''}。
+              </p>
+            ) : null}
+          </SliderSetting>
         </fieldset>
       </PaneSection>
 
@@ -763,7 +812,7 @@ export function QuotaTierPane({
             {dialog !== 'details' ? (
               <Button
                 type='button'
-                disabled={saving}
+                disabled={saving || (dialog === 'gates' && !!gatesOrderError)}
                 className='min-h-11'
                 onClick={apply}
               >

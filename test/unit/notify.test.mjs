@@ -22,12 +22,14 @@ import {
 } from '../../src/lib/admin/notify.mjs'
 
 test('normalize fills defaults and clamps', () => {
-  const n = normalizeNotifyConfig({ interval_sec: 3, min_available: 0, email: { port: 0 } })
+  const n = normalizeNotifyConfig({ interval_sec: 3, cooldown_sec: -5, min_available: 0, email: { port: '' } })
   assert.equal(n.enabled, false)
   assert.equal(n.interval_sec, 15)
+  assert.equal(n.cooldown_sec, 30)
   assert.equal(n.min_available, 1)
   assert.equal(n.digest_sec, 21600)
   assert.equal(n.email.port, 587)
+  assert.equal(normalizeNotifyConfig({ email: { port: 0 } }).email.port, 1)
   assert.equal(n.events.pool_empty, true)
   assert.equal(n.events.digest, true)
   assert.equal(n.events.revoked, true)
@@ -256,7 +258,7 @@ test('Feishu outage cards put incident details ahead of metrics and link to the 
       )
       assert.deepEqual(tables[0].rows, [{ value_0: '128', value_1: '92.0k', value_2: '$2.48' }])
       assert.deepEqual(tables[1].rows, [{ value_0: '99.2%', value_1: '1', value_2: '1 / 0' }])
-      assert.equal(elements.at(-1).behaviors[0].default_url, 'https://panel.example/cc/#/cluster')
+      assert.equal(elements.at(-1).behaviors[0].default_url, 'https://panel.example/cc#/cluster')
       return Response.json({ StatusCode: 0 })
     },
   })
@@ -411,14 +413,14 @@ test('format message stays Chinese and includes console url', () => {
   assert.match(msg.text, /vm-04 d@x 无效凭证/)
   assert.doesNotMatch(msg.text, /vm-03 c@x/)
   assert.doesNotMatch(msg.text, /^不可用$/m)
-  assert.match(msg.text, /http:\/\/127\.0\.0\.1:8787\/#\/cluster/)
+  assert.match(msg.text, /http:\/\/127\.0\.0\.1:8787\/cc#\/cluster/)
   const custom = formatNotifyMessage(
     { type: 'pool_empty' },
     snap,
     normalizeNotifyConfig({ console_url: 'https://panel.example/' }),
     'http://127.0.0.1:8787',
   )
-  assert.match(custom.text, /https:\/\/panel\.example\/#\/cluster/)
+  assert.match(custom.text, /https:\/\/panel\.example\/cc#\/cluster/)
   assert.doesNotMatch(formatNotifyMessage({ type: 'pool_empty' }, snap).text, /#\/cluster/)
   assert.match(msg.subject, /KIN/)
 })

@@ -24,6 +24,7 @@ import { reasoningEffortOf, resolveGeminiReasoningEffort, sessionIdForLog } from
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
 import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
+import { normalizeGeminiOAuthImport } from './oauth-import.mjs'
 import { normalizeGeminiOutboundPrompt } from './prompt-normalizer.mjs'
 import { isGeminiProtocolAllowed } from './routing-config.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
@@ -77,6 +78,10 @@ const RUN_ERRORS = {
   gemini_quota_exhausted: [
     429,
     '上游模型配额已用尽（429 RESOURCE_EXHAUSTED），请等待配额重置、切换其他模型或调度到其他账号',
+  ],
+  gemini_content_rejected: [
+    429,
+    '上游拒绝了当前请求提示词（429 内容触发过滤，非账号配额耗尽），请精简或调整系统提示词后重试',
   ],
   gemini_inference_timeout: [503, '上游响应超时（504），可能是代理延迟过高或模型负载波动，请检查代理延迟后重试'],
   gemini_inference_invalid_output: [502, '上游返回空回复或无法解析的流式响应，请重试或切换其他模型确认'],
@@ -1038,11 +1043,15 @@ export function createGeminiPanelHandler({
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/redeem`) {
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
         const body = await readBody(req, 2048)
-        return ok(await cragSubscription.redeem(body?.redemption_code))
+        const out = await cragSubscription.redeem(body?.redemption_code)
+        geminiScheduler?.invalidateCatalogCache?.()
+        return ok(out)
       }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/upgrade`) {
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
-        return ok(await cragSubscription.upgrade())
+        const out = await cragSubscription.upgrade()
+        geminiScheduler?.invalidateCatalogCache?.()
+        return ok(out)
       }
       if (req.method === 'GET' && pathname === PANEL_PATH) {
         if (cragSubscription?.hasSyncPending?.()) {
@@ -1095,10 +1104,11 @@ export function createGeminiPanelHandler({
         if (typeof result?.kernel_version !== 'string' || !/^[a-zA-Z0-9.-]{1,64}$/.test(result.kernel_version)) {
           throw hostError(PROTOCOL_ERROR)
         }
+        geminiScheduler?.invalidateCatalogCache?.()
         return ok({ kernel_version: result.kernel_version })
       }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/environments`) {
-        const body = await readBody(req, 8192)
+        const body = await readBody(req, 64 * 1024)
         const name = typeof body?.name === 'string' ? body.name.trim() : ''
         const method = body?.auth_method ?? 'oauth'
         if (!name || name.length > 80 || !validId(body?.proxy_id) || !['oauth', 'api_key'].includes(method)) {
@@ -1114,14 +1124,8 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_invalid_concurrency', HOST_ERRORS.gemini_invalid_concurrency[1])
         }
         const imported = body?.oauth_account
-        if (
-          imported != null &&
-          (method !== 'oauth' ||
-            typeof imported.access_token !== 'string' ||
-            !/^[A-Za-z0-9._~+/-]{1,4096}={0,2}$/.test(imported.access_token) ||
-            !Number.isSafeInteger(imported.expiry_timestamp) ||
-            imported.expiry_timestamp <= 0)
-        ) {
+        const normalizedImport = imported != null ? normalizeGeminiOAuthImport(imported) : null
+        if (imported != null && (method !== 'oauth' || !normalizedImport)) {
           return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
         }
         const ownerUserId = normalizeOwnerId(body?.owner_user_id)
@@ -1132,8 +1136,11 @@ export function createGeminiPanelHandler({
           proxy_url: proxyUrl,
           ...(maxConcurrency != null ? { max_concurrency: maxConcurrency } : {}),
           ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
-          ...(imported != null && {
-            oauth_account: { access_token: imported.access_token, expiry_timestamp: imported.expiry_timestamp },
+          ...(normalizedImport != null && {
+            oauth_account: {
+              access_token: normalizedImport.access_token,
+              expiry_timestamp: normalizedImport.expiry_timestamp,
+            },
           }),
         })
         if (ownerUserId && geminiOwnersRepo?.setOwner) {
@@ -1147,6 +1154,7 @@ export function createGeminiPanelHandler({
             created = await callHost('get', { id: created.id })
           }
         }
+        geminiScheduler?.invalidateCatalogCache?.()
         return ok(toEnvView(created, { ownerUserId }))
       }
       const match =
@@ -1279,14 +1287,20 @@ export function createGeminiPanelHandler({
           return ok(await cragSubscription.environmentStatus(id))
         }
         if (req.method === 'POST' && action === 'crag-license/bind') {
-          return ok(await cragSubscription.bindEnvironment(id))
+          const out = await cragSubscription.bindEnvironment(id)
+          geminiScheduler?.invalidateCatalogCache?.()
+          return ok(out)
         }
         if (req.method === 'POST' && action === 'crag-license/activate') {
           const body = await readBody(req, 16384)
-          return ok(await cragSubscription.activateEnvironment(id, body?.code))
+          const out = await cragSubscription.activateEnvironment(id, body?.code)
+          geminiScheduler?.invalidateCatalogCache?.()
+          return ok(out)
         }
         if (req.method === 'POST' && action === 'crag-license/release') {
-          return ok(await cragSubscription.releaseEnvironment(id))
+          const out = await cragSubscription.releaseEnvironment(id)
+          geminiScheduler?.invalidateCatalogCache?.()
+          return ok(out)
         }
         return fail(404, 'not_found')
       }
@@ -1306,6 +1320,7 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_invalid_concurrency', HOST_ERRORS.gemini_invalid_concurrency[1])
         }
         const result = await callHost('concurrency-set', { id, max_concurrency: maxConcurrency })
+        geminiScheduler?.invalidateCatalogCache?.()
         return ok(toEnvView(result, { id }))
       }
       if (req.method === 'PUT' && action === 'proxy') {
@@ -1320,6 +1335,7 @@ export function createGeminiPanelHandler({
           proxy_id: proxyId,
           proxy_url: proxyFor(proxyPool(), proxyId, { ownerUserId: envOwner }),
         })
+        geminiScheduler?.invalidateCatalogCache?.()
         return ok(toEnvView(result, { id, proxyId, ownerUserId: envOwner }))
       }
       if (req.method === 'POST' && action === 'proxy/probe') {
@@ -1342,6 +1358,7 @@ export function createGeminiPanelHandler({
           }
         }
         const view = toEnvView(result, { id, proxyId: environment.proxy_id })
+        geminiScheduler?.invalidateCatalogCache?.()
         if (!view.models.length) throw hostError('gemini_models_empty')
         return ok(view)
       }
@@ -1375,10 +1392,12 @@ export function createGeminiPanelHandler({
         geminiOwnersRepo?.remove?.(id)
         slotPrefs.remove(id)
         geminiScheduler?.clearRestriction?.(id)
+        geminiScheduler?.invalidateCatalogCache?.()
         return ok({ deleted: true, ...(seatRelease ? { seat_released: seatRelease.released === true } : {}) })
       }
       if (req.method === 'POST' && action === 'disable') {
         await callHost('disable', { id })
+        geminiScheduler?.invalidateCatalogCache?.()
         return ok({ disabled: true })
       }
       if (req.method === 'POST' && action === 'refresh') {
@@ -1393,6 +1412,7 @@ export function createGeminiPanelHandler({
             refreshed = await callHost('get', { id })
           }
         }
+        geminiScheduler?.invalidateCatalogCache?.()
         return ok(toEnvView(refreshed))
       }
       if (action !== 'authorization') return fail(404, 'not_found')
@@ -1435,6 +1455,7 @@ export function createGeminiPanelHandler({
             completed = await callHost('get', { id })
           }
         }
+        geminiScheduler?.invalidateCatalogCache?.()
         return ok(toEnvView(completed))
       }
       return fail(404, 'not_found')
@@ -1814,7 +1835,7 @@ export function createGeminiPublicHandler({
   return async function handleGeminiPublic(
     req,
     res,
-    { logBag: externalLogBag = null, logCtx: externalLogCtx = null } = {},
+    { logBag: externalLogBag = null, logCtx: externalLogCtx = null, catalogSnapshot = null } = {},
   ) {
     res.setHeader('Cache-Control', 'no-store')
     const keyGroupType = req.apiKeyKind === 'managed' ? req.apiKeyRecord?.group_type || 'all' : null
@@ -2213,6 +2234,7 @@ export function createGeminiPublicHandler({
           signal: controller.signal,
           apiKeyRecord: req.apiKeyRecord,
           allowUnprefixedNonGemini: keyGroupType === 'gemini',
+          ...(catalogSnapshot ? { catalogSnapshot } : {}),
           ...geminiScope,
         })
         applyTurnLog(turn)
@@ -2337,39 +2359,58 @@ export function createGeminiPublicHandler({
       const promptPolicy = resolveCragGeminiPromptPolicy(
         typeof getRoutingConfig === 'function' ? getRoutingConfig() : {},
       )
+      const builtTargetBodies = new Map()
       const turn = await scheduler.stream({
         model: parsed.model,
         requestedEffort,
         ...(activeLogCtx?.request_id ? { requestId: activeLogCtx.request_id } : {}),
         startedAt,
         targetBodyFor: (target, meta) => {
-          const irForTarget = {
-            ...parsed,
-            requestedModel: targetModel,
-            ...(meta?.upstreamModel ? { model: meta.upstreamModel } : {}),
-            // On CRAGGemini (`antigravity`), always apply the scheduler's account-scoped
-            // outbound conversation_id so switching accounts never reuses the prior account's
-            // or raw caller's conversation_id.
-            ...(target === 'antigravity' && meta?.conversationId ? { conversationId: meta.conversationId } : {}),
+          const targetModelName = meta?.upstreamModel || parsed.model
+          const cacheKey = `${target}\0${targetModelName}`
+          let built = builtTargetBodies.get(cacheKey)
+          if (!built) {
+            const irForTarget = {
+              ...parsed,
+              requestedModel: targetModel,
+              ...(meta?.upstreamModel ? { model: meta.upstreamModel } : {}),
+              // On CRAGGemini (`antigravity`), always apply the scheduler's account-scoped
+              // outbound conversation_id so switching accounts never reuses the prior account's
+              // or raw caller's conversation_id.
+              ...(target === 'antigravity' && meta?.conversationId ? { conversationId: meta.conversationId } : {}),
+            }
+            const reqBody = buildGeminiRequest(irForTarget, {
+              target,
+              defaultEffort: defaultGeminiEffort,
+              includeThinkingConfig:
+                target === 'antigravity' && Boolean(requestedEffort || parsed?.thinking || parsed?.hideThinking),
+            })
+            const normalized = normalizeGeminiOutboundPrompt(reqBody, {
+              target,
+              policy: promptPolicy,
+              headers: req.headers,
+            })
+            built = {
+              body: normalized.body,
+              report: normalized.report,
+              summary: summarizeBody(normalized.body),
+            }
+            builtTargetBodies.set(cacheKey, built)
           }
-          const reqBody = buildGeminiRequest(irForTarget, {
-            target,
-            defaultEffort: defaultGeminiEffort,
-            includeThinkingConfig:
-              target === 'antigravity' && Boolean(requestedEffort || parsed?.thinking || parsed?.hideThinking),
-          })
-          const normalized = normalizeGeminiOutboundPrompt(reqBody, {
-            target,
-            policy: promptPolicy,
-            headers: req.headers,
-          })
-          const finalBody = normalized.body
+          const finalBody =
+            target === 'antigravity' &&
+            meta?.conversationId &&
+            built.body &&
+            typeof built.body === 'object' &&
+            built.body.conversation_id !== meta.conversationId
+              ? { ...built.body, conversation_id: meta.conversationId }
+              : built.body
           lastOutboundBody = finalBody
-          logBag.outbound_summary = summarizeBody(finalBody)
-          if (normalized.report) {
+          logBag.outbound_summary = built.summary
+          if (built.report) {
             logBag.hop_meta = {
               ...(logBag.hop_meta && typeof logBag.hop_meta === 'object' ? logBag.hop_meta : {}),
-              prompt_normalization: normalized.report,
+              prompt_normalization: built.report,
             }
           }
           if (activeLogCtx?.capture_outbound) {
@@ -2388,6 +2429,7 @@ export function createGeminiPublicHandler({
         signal: controller.signal,
         apiKeyRecord: req.apiKeyRecord,
         allowUnprefixedNonGemini: keyGroupType === 'gemini',
+        ...(catalogSnapshot ? { catalogSnapshot } : {}),
         ...geminiScope,
         onEvent: wantStream
           ? (event) => {

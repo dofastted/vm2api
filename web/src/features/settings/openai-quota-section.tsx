@@ -165,11 +165,15 @@ export function OpenaiQuotaSection({
   onChange,
   saving = false,
   pending = false,
+  pendingCards,
 }: {
   quota: Partial<OpenAIQuotaPolicy>
   onChange: (patch: Partial<OpenAIQuotaPolicy>) => void
   saving?: boolean
   pending?: boolean
+  pendingCards?: Partial<
+    Record<'gates' | 'concurrency' | 'rpm' | 'sessions', boolean>
+  >
 }) {
   const list = useQuery(vmsListQueryOptions(5000))
   const [dialog, setDialog] = useState<DialogKind | null>(null)
@@ -238,7 +242,7 @@ export function OpenaiQuotaSection({
             title='配额闸线'
             value={`${Math.round(effective.limit_5h * 100)}% / ${Math.round(effective.limit_7d * 100)}%`}
             desc='5h / 7d，本地软闸'
-            pending={pending}
+            pending={pendingCards ? !!pendingCards.gates : pending}
             buttonRef={(node) => {
               triggerRefs.current.gates = node
             }}
@@ -250,7 +254,7 @@ export function OpenaiQuotaSection({
             title='执行并发'
             value={String(effective.max_concurrency)}
             desc='每个账号的在飞请求数'
-            pending={pending}
+            pending={pendingCards ? !!pendingCards.concurrency : pending}
             buttonRef={(node) => {
               triggerRefs.current.concurrency = node
             }}
@@ -262,7 +266,7 @@ export function OpenaiQuotaSection({
             title='请求速率'
             value={formatRpm(effective.max_rpm)}
             desc='满后排队，不切号；0 = 不限'
-            pending={pending}
+            pending={pendingCards ? !!pendingCards.rpm : pending}
             buttonRef={(node) => {
               triggerRefs.current.rpm = node
             }}
@@ -276,7 +280,7 @@ export function OpenaiQuotaSection({
               effective.max_sessions ? String(effective.max_sessions) : '不限'
             }
             desc='活跃对话窗口，5 分钟空闲回收'
-            pending={pending}
+            pending={pendingCards ? !!pendingCards.sessions : pending}
             buttonRef={(node) => {
               triggerRefs.current.sessions = node
             }}

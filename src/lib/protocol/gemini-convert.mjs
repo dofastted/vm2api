@@ -421,11 +421,52 @@ function snakeToCamel(key) {
  * caller-owned payloads (`args`, `response`, schemas, `labels`) untouched.
  */
 export function geminiCamelCase(value) {
-  if (Array.isArray(value)) return value.map(geminiCamelCase)
+  if (Array.isArray(value)) {
+    let out = null
+    for (let i = 0; i < value.length; i += 1) {
+      const item = value[i]
+      const next = geminiCamelCase(item)
+      if (out) {
+        out[i] = next
+      } else if (next !== item) {
+        out = value.slice()
+        out[i] = next
+      }
+    }
+    return out || value
+  }
   if (!isPlainObject(value)) return value
+  const keys = Object.keys(value)
+  let changed = false
+  let hasSnake = false
+  for (let i = 0; i < keys.length; i += 1) {
+    if (keys[i].includes('_')) {
+      hasSnake = true
+      changed = true
+      break
+    }
+  }
+  if (!hasSnake) {
+    let out = null
+    for (let i = 0; i < keys.length; i += 1) {
+      const key = keys[i]
+      const raw = value[key]
+      const nextVal = GEMINI_OWN_KEYS.has(key) ? raw : geminiCamelCase(raw)
+      if (out) {
+        out[key] = nextVal
+      } else if (nextVal !== raw) {
+        out = {}
+        for (let j = 0; j < i; j += 1) out[keys[j]] = value[keys[j]]
+        out[key] = nextVal
+      }
+    }
+    return out || value
+  }
   const out = {}
-  const originalKeys = new Set(Object.keys(value))
-  for (const [key, raw] of Object.entries(value)) {
+  const originalKeys = new Set(keys)
+  for (let i = 0; i < keys.length; i += 1) {
+    const key = keys[i]
+    const raw = value[key]
     const camel = snakeToCamel(key)
     const nextVal = GEMINI_OWN_KEYS.has(camel) ? raw : geminiCamelCase(raw)
     if (camel === key) {
@@ -434,7 +475,7 @@ export function geminiCamelCase(value) {
       out[camel] = nextVal
     }
   }
-  return out
+  return changed ? out : value
 }
 
 export function geminiFuncName(name) {
