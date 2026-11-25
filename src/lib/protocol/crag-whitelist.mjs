@@ -9,6 +9,7 @@
  */
 import { CRS_OFFICIAL_CLI_SYSTEM } from '../identity/crs-persona.mjs'
 import { materializeAutomaticCache } from './cache-ttl.mjs'
+import { isEmptyEffortValue } from './log-fields.mjs'
 import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
 const BILLING_LINE_RE = /^x-anthropic-billing-header:/i
@@ -160,6 +161,12 @@ function pickKeys(source, allowedSet) {
   return out
 }
 
+function pickOutputConfig(source) {
+  const cfg = pickKeys(source, OUTPUT_CONFIG_KEYS)
+  if (Object.hasOwn(cfg, 'effort') && isEmptyEffortValue(cfg.effort)) delete cfg.effort
+  return Object.keys(cfg).length ? cfg : undefined
+}
+
 function hasOnlyAllowedKeys(source, allowedSet) {
   for (const key of Object.keys(source)) {
     if (!allowedSet.has(key)) return false
@@ -290,6 +297,14 @@ function isCleanMessages(messages) {
   for (const message of messages) {
     if (!isPlainObject(message) || !hasOnlyAllowedKeys(message, MESSAGE_ALLOWED_KEYS)) return false
     if (!['user', 'assistant', 'system'].includes(message.role)) return false
+    if (message.output_config != null) {
+      if (!isPlainObject(message.output_config) || !hasOnlyAllowedKeys(message.output_config, OUTPUT_CONFIG_KEYS)) {
+        return false
+      }
+      if (Object.hasOwn(message.output_config, 'effort') && isEmptyEffortValue(message.output_config.effort)) {
+        return false
+      }
+    }
     if (typeof message.content === 'string') continue
     if (!Array.isArray(message.content)) return false
     if (!message.content.every(isCleanBlock)) return false
@@ -399,7 +414,8 @@ function sanitizeMessages(messages, { preserveCanonicalHistory = false } = {}) {
       invalid(`${param}.content`, 'must be text or an array of content blocks')
     }
     if (message.output_config != null && isPlainObject(message.output_config)) {
-      out.output_config = pickKeys(message.output_config, OUTPUT_CONFIG_KEYS)
+      const cfg = pickOutputConfig(message.output_config)
+      if (cfg) out.output_config = cfg
     }
     if (message.clear_at != null) out.clear_at = message.clear_at
     return out
@@ -664,8 +680,8 @@ export function sanitizeCragBodyWhitelist(
 
   if (materialized.output_config != null) {
     if (!isPlainObject(materialized.output_config)) invalid('output_config', 'must be an object')
-    const cfg = pickKeys(materialized.output_config, OUTPUT_CONFIG_KEYS)
-    if (Object.keys(cfg).length) out.output_config = cfg
+    const cfg = pickOutputConfig(materialized.output_config)
+    if (cfg) out.output_config = cfg
   }
 
   if (materialized.context_management != null) {
@@ -726,7 +742,16 @@ export function sanitizeCragBodyWhitelist(
 
   // Controlled CRAG internal fields
   for (const key of CRAG_INTERNAL_ALLOWED_TOP_KEYS) {
-    if (materialized[key] !== undefined) out[key] = materialized[key]
+    const value = materialized[key]
+    if (value === undefined) continue
+    if (key === 'effort' && isEmptyEffortValue(value)) continue
+    if (key === 'crag_options' && isPlainObject(value) && Object.hasOwn(value, 'effort') && isEmptyEffortValue(value.effort)) {
+      const next = { ...value }
+      delete next.effort
+      if (Object.keys(next).length) out[key] = next
+      continue
+    }
+    out[key] = value
   }
 
   if (validateCacheBudget) validateBreakpointOrderAndBudget(out)

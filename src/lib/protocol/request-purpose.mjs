@@ -2,6 +2,7 @@ import { findClaudeSecurityMonitorPrompt } from '../identity/crs-persona.mjs'
 import { getModelEntry, validateBetweenToolsThinking } from './model-policy.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { stripIllegalCacheControlFields } from './cache-ttl.mjs'
+import { isEmptyEffortValue } from './log-fields.mjs'
 
 function textOf(content) {
   if (typeof content === 'string') return content
@@ -89,7 +90,7 @@ export function prepareClassifierBody(input, { stream = true } = {}) {
       body.thinking.budget_tokens >= body.max_tokens)
   )
     incompatible('Classifier thinking budget must be at least 1024 and below max_tokens.')
-  if (body.output_config?.effort != null && !entry.capabilities.supports_effort)
+  if (!isEmptyEffortValue(body.output_config?.effort) && !entry.capabilities.supports_effort)
     incompatible('The selected classifier model does not support output effort.')
   if (alwaysOn && ['tool', 'any', 'required'].includes(body.tool_choice?.type)) {
     incompatible('The selected classifier model requires thinking and cannot honor forced classify_result tool choice.')

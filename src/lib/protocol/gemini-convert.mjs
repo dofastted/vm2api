@@ -14,6 +14,7 @@
  */
 import crypto from 'node:crypto'
 import { isClientStream } from './convert.mjs'
+import { firstNonEmptyEffort, isEmptyEffortValue } from './log-fields.mjs'
 import { buildAnthropicSseError } from './stream-truncation.mjs'
 
 export const SKIP_THOUGHT_SIGNATURE = 'skip_thought_signature_validator'
@@ -1394,7 +1395,7 @@ function parseGeminiNativeInbound(rawBody, { routeModel, routeStream }) {
     }
     if (isPlainObject(gc.thinkingConfig)) {
       const tc = gc.thinkingConfig
-      const effort = tc.thinkingLevel
+      const effort = !isEmptyEffortValue(tc.thinkingLevel)
         ? normalizeEffort(tc.thinkingLevel)
         : typeof tc.thinkingBudget === 'number'
           ? effortFromBudget(tc.thinkingBudget)
@@ -1718,7 +1719,9 @@ function parseOpenAIChatInbound(body, { headers }) {
   const googleTc = isPlainObject(body.extra_body?.google?.thinking_config)
     ? body.extra_body.google.thinking_config
     : null
-  const effort = normalizeEffort(googleTc?.thinking_level ?? body.reasoning_effort ?? body.reasoning?.effort)
+  const effort = normalizeEffort(
+    firstNonEmptyEffort(googleTc?.thinking_level, body.reasoning_effort, body.reasoning?.effort),
+  )
   if (body.reasoning?.summary === 'none' || googleTc?.include_thoughts === false || effort === 'none') {
     hideThinking = true
   }
@@ -2204,7 +2207,7 @@ function parseOpenAIResponsesInbound(body, { headers }) {
 
   let thinking = null
   let hideThinking = false
-  const effort = normalizeEffort(body.reasoning?.effort ?? body.reasoning_effort)
+  const effort = normalizeEffort(firstNonEmptyEffort(body.reasoning?.effort, body.reasoning_effort))
   if (body.reasoning?.summary === 'none' || body.reasoning?.generate_summary === 'none' || effort === 'none') {
     hideThinking = true
   }
