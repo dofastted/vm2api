@@ -18,7 +18,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { redactSecrets } from '../core/security.mjs'
-import { resolveStoreDb } from '../db/database.mjs'
+import { resolveStoreDb, withSavepoint } from '../db/database.mjs'
 import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
@@ -765,7 +765,9 @@ export class RequestLogStore {
     const persist = () => {
       summary.vm_owner_user_id = this.repo.vmOwnerOf(extra.vm_id)
       try {
-        this.repo.insertSummaryIfAbsent(summary)
+        withSavepoint(this.repo.db, 'reqlog_sum', () => {
+          this.repo.insertSummaryIfAbsent(summary)
+        })
       } catch {}
       if (this.jsonlMirror) this._appendJsonl(summary)
       if (ctx.mode !== 'debug') return
@@ -802,7 +804,9 @@ export class RequestLogStore {
         response: ctx.response ? debugResponse(ctx.response) : null,
       }
       try {
-        this.repo.insertDebug(summary.request_id || summary.id, summary.ts, debugRec)
+        withSavepoint(this.repo.db, 'reqlog_dbg', () => {
+          this.repo.insertDebug(summary.request_id || summary.id, summary.ts, debugRec)
+        })
       } catch {}
     }
     this._mem.push(summary)

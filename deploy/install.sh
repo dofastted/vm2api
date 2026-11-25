@@ -817,7 +817,7 @@ fetch_file() {
 # 镜像安装：只落部署文件，不 clone 仓库，不在本机构建。
 fetch_release_files() {
   local tag="$1"
-  mkdir -p "${INSTALL_DIR}/deploy"
+  mkdir -p "${INSTALL_DIR}/deploy" "${INSTALL_DIR}/scripts"
   info "下载部署文件 ${tag} → ${INSTALL_DIR}"
   fetch_file "$tag" docker-compose.yml "${INSTALL_DIR}/docker-compose.yml"
   fetch_file "$tag" docker-compose.local.yml "${INSTALL_DIR}/docker-compose.local.yml" 1
@@ -827,6 +827,7 @@ fetch_release_files() {
   fetch_file "$tag" deploy/install.sh "${INSTALL_DIR}/deploy/install.sh" 1
   fetch_file "$tag" deploy/install-pg.sh "${INSTALL_DIR}/deploy/install-pg.sh" 1
   fetch_file "$tag" deploy/replace-db-to-pg.sh "${INSTALL_DIR}/deploy/replace-db-to-pg.sh" 1
+  fetch_file "$tag" scripts/migrate-sqlite-to-pg.mjs "${INSTALL_DIR}/scripts/migrate-sqlite-to-pg.mjs" 1
   chmod +x "${INSTALL_DIR}/deploy/install.sh" "${INSTALL_DIR}/deploy/install-pg.sh" "${INSTALL_DIR}/deploy/replace-db-to-pg.sh" 2>/dev/null || true
   if [ "$HOST_ARCH" = arm64 ]; then
     fetch_file "$tag" deploy/prepare-arm64.py "${INSTALL_DIR}/deploy/prepare-arm64.py" 1
@@ -1962,24 +1963,26 @@ cmd_uninstall() {
 
 ensure_migrate_script() {
   local script="${INSTALL_DIR}/deploy/replace-db-to-pg.sh"
-  if [ -f "$script" ]; then
-    echo "$script"
-    return 0
-  fi
   local self_dir=""
   if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
     self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     if [ -f "${self_dir}/replace-db-to-pg.sh" ]; then
-      mkdir -p "${INSTALL_DIR}/deploy"
-      cp -f "${self_dir}/replace-db-to-pg.sh" "$script"
-      chmod +x "$script" 2>/dev/null || true
+      if [ "${self_dir}/replace-db-to-pg.sh" != "$script" ]; then
+        mkdir -p "${INSTALL_DIR}/deploy"
+        cp -f "${self_dir}/replace-db-to-pg.sh" "$script"
+        chmod +x "$script" 2>/dev/null || true
+      fi
       echo "$script"
       return 0
     fi
   fi
+  if [ -f "$script" ] && grep -q -- '--preflight' "$script" 2>/dev/null; then
+    echo "$script"
+    return 0
+  fi
   local ref="${TARGET_VERSION:-main}"
   mkdir -p "${INSTALL_DIR}/deploy"
-  info "未检测到本地迁移脚本，正在自动获取 ${ref}/deploy/replace-db-to-pg.sh ..."
+  info "未检测到最新版迁移脚本，正在自动获取 ${ref}/deploy/replace-db-to-pg.sh ..."
   fetch_file "$ref" deploy/replace-db-to-pg.sh "$script" 0
   chmod +x "$script" 2>/dev/null || true
   echo "$script"

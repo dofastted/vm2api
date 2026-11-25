@@ -363,8 +363,10 @@ function buildFilter(filters, defaultMuted) {
     params.push(end)
   }
   if (filters.q) {
-    where.push('(path LIKE ? OR error_code LIKE ? OR error_message LIKE ? OR request_id LIKE ?)')
-    const like = `%${String(filters.q).slice(0, 100)}%`
+    where.push(
+      '(LOWER(path) LIKE ? OR LOWER(error_code) LIKE ? OR LOWER(error_message) LIKE ? OR LOWER(request_id) LIKE ?)',
+    )
+    const like = `%${String(filters.q).slice(0, 100).toLowerCase()}%`
     params.push(like, like, like, like)
   }
   const errorClass = filters.error_class ? String(filters.error_class) : null

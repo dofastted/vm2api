@@ -49,6 +49,7 @@ usage() {
   --pg-runtime auto|docker|native  systemd 宿主机模式指定本地 PG 运行方式
   --no-install-deps          禁用自动安装系统/Node 依赖，仅检查
   --check-deps               仅执行依赖与环境预检，不做任何变更
+  --preflight                零停机 SQLite 表结构/约束隐患预扫与目标库权限检测
   --dry-run                  存量迁移预检（不停止服务、不写数据）
   --status                   查看当前数据库引擎、依赖与容器状态
   --rollback                 一键回滚回原 SQLite 配置并重启控制面
@@ -84,7 +85,7 @@ while [ $idx -le $# ]; do
       idx=$((idx + 1))
       continue
       ;;
-    --dry-run|--check-deps|--pg-runtime|--sqlite|--truncate|--skip-debug|--skip-disk-check|--mode|--auto-pull)
+    --dry-run|--check-deps|--preflight|--pg-runtime|--sqlite|--truncate|--skip-debug|--skip-disk-check|--mode|--auto-pull)
       ACTION="db-migrate"
       ;;
   esac
@@ -101,7 +102,7 @@ INSTALLER=""
 TMP_INSTALLER=""
 if [ -n "$SCRIPT_DIR" ] && [ -f "${SCRIPT_DIR}/install.sh" ]; then
   INSTALLER="${SCRIPT_DIR}/install.sh"
-elif [ -f "${INSTALL_DIR}/deploy/install.sh" ] && [ "$ACTION" != "auto" ]; then
+elif [ -f "${INSTALL_DIR}/deploy/install.sh" ] && [ "$ACTION" != "auto" ] && grep -q 'db-migrate)' "${INSTALL_DIR}/deploy/install.sh" 2>/dev/null; then
   INSTALLER="${INSTALL_DIR}/deploy/install.sh"
 else
   TMP_INSTALLER="$(mktemp)"
@@ -119,18 +120,49 @@ elif [ "$ACTION" = "db-migrate" ]; then
   exec bash "$INSTALLER" db-migrate "${PASS_ARGS[@]}"
 fi
 
-# Auto-detect fresh PG install vs existing SQLite Docker/systemd migration vs existing PG upgrade
-env_driver=""
-if [ -f "${INSTALL_DIR}/.env" ]; then
-  env_driver="$(grep -E '^VM2API_DB_DRIVER=' "${INSTALL_DIR}/.env" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "'" | tr -d '"' | tr -d '\r' || true)"
-fi
+SYSTEMD_UNIT="${VM2API_SYSTEMD_UNIT:-vm2api.service}"
+SYSTEMD_DROPIN_DIR="${VM2API_SYSTEMD_DROPIN_DIR:-/etc/systemd/system/${SYSTEMD_UNIT}.d}"
+
+is_systemd_host() {
+  # Blue/green Docker hosts take precedence over systemd detection.
+  if [ -f "${INSTALL_DIR}/bluegreen/active" ]; then
+    return 1
+  fi
+  command -v systemctl >/dev/null 2>&1 || return 1
+  if systemctl is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null || systemctl is-enabled --quiet "$SYSTEMD_UNIT" 2>/dev/null; then
+    if ! command -v docker >/dev/null 2>&1 || ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx 'vm2api'; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+read_env_driver() {
+  local f val=""
+  for f in "${INSTALL_DIR}/.env" "${INSTALL_DIR}/.env.postgres" "${SYSTEMD_DROPIN_DIR}/20-postgres.conf"; do
+    [ -f "$f" ] || continue
+    local line
+    line="$(grep -E '^(Environment=)?VM2API_DB_DRIVER=' "$f" 2>/dev/null | tail -n1 || true)"
+    if [ -n "$line" ]; then
+      val="$(printf '%s' "$line" | sed -E 's/^Environment=//' | cut -d= -f2- | tr -d "'" | tr -d '"' | tr -d '\r')"
+    fi
+  done
+  printf '%s' "$val"
+}
+
+# Auto-detect fresh PG install vs existing SQLite systemd/Docker migration vs existing PG upgrade
+env_driver="$(read_env_driver)"
 
 if [ -f "${INSTALL_DIR}/data/kin.db" ] && [ "$env_driver" != "postgres" ]; then
-  if [ -f "${INSTALL_DIR}/docker-compose.yml" ]; then
+  if is_systemd_host; then
+    exec bash "$INSTALLER" db-migrate "${PASS_ARGS[@]}"
+  elif [ -f "${INSTALL_DIR}/docker-compose.yml" ]; then
     exec bash "$INSTALLER" upgrade --auto-migrate "${PASS_ARGS[@]}"
   else
     exec bash "$INSTALLER" db-migrate "${PASS_ARGS[@]}"
   fi
+elif is_systemd_host; then
+  exec bash "$INSTALLER" db-status --dir "$INSTALL_DIR"
 elif [ -f "${INSTALL_DIR}/docker-compose.yml" ]; then
   exec bash "$INSTALLER" upgrade --db postgres "${PASS_ARGS[@]}"
 else
