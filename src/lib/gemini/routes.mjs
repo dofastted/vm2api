@@ -24,6 +24,7 @@ import { reasoningEffortOf, resolveGeminiReasoningEffort, sessionIdForLog } from
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
 import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
+import { normalizeGeminiOAuthImport } from './oauth-import.mjs'
 import { normalizeGeminiOutboundPrompt } from './prompt-normalizer.mjs'
 import { isGeminiProtocolAllowed } from './routing-config.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
@@ -1107,7 +1108,7 @@ export function createGeminiPanelHandler({
         return ok({ kernel_version: result.kernel_version })
       }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/environments`) {
-        const body = await readBody(req, 8192)
+        const body = await readBody(req, 64 * 1024)
         const name = typeof body?.name === 'string' ? body.name.trim() : ''
         const method = body?.auth_method ?? 'oauth'
         if (!name || name.length > 80 || !validId(body?.proxy_id) || !['oauth', 'api_key'].includes(method)) {
@@ -1123,14 +1124,8 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_invalid_concurrency', HOST_ERRORS.gemini_invalid_concurrency[1])
         }
         const imported = body?.oauth_account
-        if (
-          imported != null &&
-          (method !== 'oauth' ||
-            typeof imported.access_token !== 'string' ||
-            !/^[A-Za-z0-9._~+/-]{1,4096}={0,2}$/.test(imported.access_token) ||
-            !Number.isSafeInteger(imported.expiry_timestamp) ||
-            imported.expiry_timestamp <= 0)
-        ) {
+        const normalizedImport = imported != null ? normalizeGeminiOAuthImport(imported) : null
+        if (imported != null && (method !== 'oauth' || !normalizedImport)) {
           return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
         }
         const ownerUserId = normalizeOwnerId(body?.owner_user_id)
@@ -1141,8 +1136,11 @@ export function createGeminiPanelHandler({
           proxy_url: proxyUrl,
           ...(maxConcurrency != null ? { max_concurrency: maxConcurrency } : {}),
           ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
-          ...(imported != null && {
-            oauth_account: { access_token: imported.access_token, expiry_timestamp: imported.expiry_timestamp },
+          ...(normalizedImport != null && {
+            oauth_account: {
+              access_token: normalizedImport.access_token,
+              expiry_timestamp: normalizedImport.expiry_timestamp,
+            },
           }),
         })
         if (ownerUserId && geminiOwnersRepo?.setOwner) {
