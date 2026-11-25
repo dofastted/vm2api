@@ -10,6 +10,23 @@ function parse(value, fallback = null) {
   }
 }
 
+export function normalizeCooldownUntilMs(value) {
+  if (value == null || value === '') return null
+  if (typeof value === 'bigint') return Number(value)
+  if (typeof value === 'number') return Number.isFinite(value) ? Math.trunc(value) : null
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) return null
+    if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
+      const n = Number(trimmed)
+      return Number.isFinite(n) ? Math.trunc(n) : null
+    }
+    const parsed = Date.parse(trimmed)
+    return Number.isFinite(parsed) ? Math.trunc(parsed) : null
+  }
+  return null
+}
+
 function rowToAttempt(row) {
   if (!row) return null
   return {
@@ -115,7 +132,7 @@ export class RequestAttemptsRepo {
         result.upstreamStatus ?? null,
         result.errorScope ?? null,
         result.action ?? null,
-        result.cooldownUntil ?? null,
+        normalizeCooldownUntilMs(result.cooldownUntil),
         result.downstreamCommitted ? 1 : 0,
         result.terminalState ?? null,
         result.usage != null ? JSON.stringify(result.usage) : null,

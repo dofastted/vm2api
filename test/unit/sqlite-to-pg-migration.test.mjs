@@ -10,6 +10,7 @@ import path from 'node:path'
 import pg from 'pg'
 import { createDatabase } from '../../src/lib/db/database.mjs'
 import { UsageLogsRepo } from '../../src/lib/db/repos/usage-logs-repo.mjs'
+import { RequestAttemptsRepo, normalizeCooldownUntilMs } from '../../src/lib/db/repos/request-attempts-repo.mjs'
 import { createPgSyncDb } from '../../src/lib/db/pg/pg-sync-db.mjs'
 import { resolvePgConfig } from '../../src/lib/db/pg/config.mjs'
 import {
@@ -17,6 +18,7 @@ import {
   MIGRATION_TABLES,
   migrateSqliteToPostgres,
   preflightSqliteToPostgres,
+  sanitizeValue,
 } from '../../scripts/migrate-sqlite-to-pg.mjs'
 import { seedMockSqlite } from '../../scripts/seed-mock-sqlite.mjs'
 
@@ -80,6 +82,42 @@ test('preflightSqliteToPostgres validates clean DB and blocks unmapped tables, C
     assert.ok(badReport.blockingIssues.some((s) => s.includes('unexpected_new_table')))
     assert.ok(badReport.blockingIssues.some((s) => s.includes('duplicate active username')))
     assert.ok(badReport.blockingIssues.some((s) => s.includes('NULL/empty created_at')))
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
+test('request_attempts.cooldown_until normalizes legacy ISO-8601 strings to integer epoch ms in repo and migrator', () => {
+  const iso = '2026-11-25T01:30:11.033Z'
+  const expectedMs = Date.parse(iso)
+  assert.equal(normalizeCooldownUntilMs(iso), expectedMs)
+  assert.equal(normalizeCooldownUntilMs(expectedMs + 0.7), expectedMs)
+  assert.equal(normalizeCooldownUntilMs(String(expectedMs)), expectedMs)
+  assert.equal(normalizeCooldownUntilMs(''), null)
+  assert.equal(normalizeCooldownUntilMs('not-a-date'), null)
+
+  assert.equal(sanitizeValue('request_attempts', 'cooldown_until', iso), expectedMs)
+  assert.equal(sanitizeValue('request_attempts', 'cooldown_until', expectedMs), expectedMs)
+  assert.equal(sanitizeValue('request_attempts', 'cooldown_until', ''), null)
+  assert.equal(sanitizeValue('request_attempts', 'cooldown_until', 'garbage'), null)
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-attempts-cooldown-'))
+  try {
+    const db = createDatabase({ dbPath: path.join(tmpDir, 'kin.db') })
+    const repo = new RequestAttemptsRepo(db)
+    repo.begin({ requestId: 'req-iso', attemptNo: 1, vmId: 'vm-1', accountId: 'acc-1', model: 'gemini-2.5-pro' })
+    repo.complete('req-iso', 1, {
+      upstreamStatus: 429,
+      errorScope: 'quota',
+      action: 'failover',
+      cooldownUntil: iso,
+      terminalState: 'failed_retryable',
+    })
+    const rows = repo.list('req-iso')
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].cooldown_until, expectedMs)
+    assert.equal(typeof rows[0].cooldown_until, 'number')
+    db.close()
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true })
   }
@@ -150,6 +188,11 @@ test('migrateSqliteToPostgres transfers tables, sanitizes NUL bytes, reconciles 
       'u1',
       now,
     )
+    const legacyIsoCooldown = '2026-11-25T01:30:11.033Z'
+    db.prepare(
+      `INSERT INTO request_attempts (request_id, attempt_no, vm_id, account_id, model, started_at, cooldown_until, downstream_committed)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run('req_legacy_iso', 1, 'gemini-u1', 'gemini-u1', 'gemini-2.5-pro', now, legacyIsoCooldown, 0)
     db.close()
 
     // Preflight with live PG target must pass
@@ -182,6 +225,10 @@ test('migrateSqliteToPostgres transfers tables, sanitizes NUL bytes, reconciles 
       assert.equal(pgLogsRepo.logCoverageStart(), historicalOrigin)
       const groups = syncDb.prepare('SELECT id, name FROM groups ORDER BY id').all()
       assert.deepEqual(groups, [{ id: 1, name: 'custom_coding' }])
+      const attemptRow = syncDb
+        .prepare('SELECT cooldown_until FROM request_attempts WHERE request_id = ?')
+        .get('req_legacy_iso')
+      assert.equal(Number(attemptRow.cooldown_until), Date.parse(legacyIsoCooldown))
     } finally {
       syncDb.close()
     }
