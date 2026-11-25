@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.213 — 2026-11-25 · Google/Gemini 独立模型策略、`medium` 默认思考强度与模型/计费定价页接入
+
+- **Google / Gemini 独立模型策略与 `medium` 默认思考强度**：新增 `src/lib/protocol/gemini-model-policy.mjs`（持久化键 `gemini_model_policy`），严格作用于 `gemini-*` 系列与 Gemini 槽位，缺省为所有 Gemini 模型启用 `default_effort: 'medium'`；新增 `GET/PUT/POST /api/panel/model-policy?platform=google`、`POST /api/panel/model-policy/sync-gemini` 与 `catalog-monitor` 定时同步（融合实时 Gemini 槽位、Gemini API 端点与 `models.dev` Google 目录）；在全部入站协议（`gemini`、`openai-chat`、`openai-responses`、`anthropic`）省略思考强度时自动注入默认 `medium`（显式指定强度或关闭思考时保持原样，且不破坏 CRAGGemini SHM 最小载荷约束），支持无后缀 Gemini 模型在 Antigravity 槽位解析到 `-medium` 档位，并在 `scheduler.catalog()` / `scheduler.stream()` 执行启停策略开关（#1811）。
+- **模型页与计费页接入 Google 模型定价**：将 Google Gemini 模型接入 `pricing-view`、模型页 Google 供应商标签与「同步 Google」流程，并在计费页新增 Google 定价表与 `google/*` 价格覆写弹窗（#1811）。
+- 部署说明：本次改动涉及控制面（`src/`）与前端（`web/src/`）；`deploy/payload.json` 载荷钉选（CRAG `3.1.18`、CRAGGemini `0.4.9`、最新 `kin-worker`）、`scripts/gemini-host.py`、数据库迁移结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启 `vm2api-gemini` 或既有 Claude/Codex 槽位。
+
 ## 1.4.212 — 2026-11-25 · Gemini 槽位面板控制与视图全面对齐；`/crag-subscription` 自动识别 CRAGGemini `CRAGR1` 兑换码
 
 - **Gemini 槽位面板控制与视图与 Claude/GPT 槽位全面对齐**：新增 `src/lib/gemini/slot-prefs.mjs`（基于 `SettingsRepo` `gemini_slot_prefs` 持久化 `schedulable`、`schedule_level` P1–P10 与 `display_name`，无需数据库迁移）并接入 `createGeminiScheduler` 调度与熔断/冷却清理；扩展 `GET /api/panel/gemini` 返回用量、费用、健康度、在途请求、调度与限制状态，新增 `/health`、`/stats`、`POST /schedulable`、`PATCH /prefs`、`POST /recover`、`PATCH /owner` 接口；前端补齐 Gemini 主题样式、`CRAGAnti` 标识、`VmTable` / `VmRowDetail` / `VmBlade` / `VmUnit` / `FleetPulse` / `VmStatsDialog` / `VmActionMenu` 及详情弹窗内联调度与基础配置表单（#1806）。
