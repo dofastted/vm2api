@@ -2447,3 +2447,98 @@ unixTest('streamGoWorker and callGoWorker do not post cancel after terminal mess
     await fx.close()
   }
 })
+
+unixTest(
+  'callGoWorker and streamGoWorker return per-hop hopRequestId and pass gatewayRequestId only as internal header (#1845)',
+  async (t) => {
+    const seen = []
+    const fx = await fixture(async (req, res) => {
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      const envelope = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      seen.push({
+        gatewayHeader: req.headers['x-gateway-request-id'] || null,
+        requestId: envelope.request_id,
+        envelopeHeaders: envelope.headers || null,
+        bodyKeys: Object.keys(envelope.body || {}),
+      })
+      if (seen.length === 3) {
+        res.writeHead(409, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            type: 'error',
+            error: {
+              type: 'partial_provider_output_nonretryable',
+              message: 'interrupted',
+              details: { prior_reason: 'client_cancelled', retry_after_sec: 20 },
+            },
+          }),
+        )
+        return
+      }
+      if (envelope.stream) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        writeData(res, {
+          type: 'message_start',
+          message: { id: 'msg_hop', type: 'message', role: 'assistant', model: 'claude-sonnet-5', content: [] },
+        })
+        writeData(res, { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
+        writeData(res, { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } })
+        writeData(res, { type: 'content_block_stop', index: 0 })
+        writeData(res, { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } })
+        writeData(res, { type: 'message_stop' })
+        res.end()
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json', 'x-terminal-state': 'verified' })
+      res.end(
+        JSON.stringify({
+          type: 'message',
+          id: 'msg_hop_json',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ok' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }),
+      )
+    })
+    t.after(() => fx.close())
+
+    const gatewayRequestId = 'gw-req-1845-test'
+    const r1 = await callGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+      gatewayRequestId,
+    })
+    const r2 = await streamGoWorker({
+      exec: fx.exec,
+      envelope: {
+        body: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+        headers: { 'x-gateway-request-id': 'forged-in-envelope', 'x-app': 'cli' },
+        stream: true,
+      },
+      gatewayRequestId,
+    })
+    const r3 = await callGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+      gatewayRequestId,
+    })
+
+    assert.equal(r1.ok, true)
+    assert.equal(r2.ok, true)
+    assert.equal(r3.ok, false)
+    assert.equal(r3.status, 409)
+    assert.equal(seen.length, 3)
+
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    for (const [idx, res] of [r1, r2, r3].entries()) {
+      assert.match(res.hopRequestId, uuidRe)
+      assert.equal(res.hopRequestId, seen[idx].requestId)
+      assert.equal(seen[idx].gatewayHeader, gatewayRequestId)
+      assert.equal(seen[idx].bodyKeys.includes('gateway_request_id'), false)
+      assert.equal(seen[idx].envelopeHeaders?.['x-gateway-request-id'], undefined)
+    }
+    assert.equal(new Set([r1.hopRequestId, r2.hopRequestId, r3.hopRequestId]).size, 3)
+  },
+)

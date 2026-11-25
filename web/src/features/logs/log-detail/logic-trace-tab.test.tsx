@@ -1,0 +1,116 @@
+import type { UsageLogRow } from '@/types/panel-usage-logs'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { describe, expect, it } from 'vitest'
+import { LogicTraceTab } from './logic-trace-tab'
+
+const row: UsageLogRow = {
+  id: 'log_2',
+  requestId: 'req_2',
+  createdAt: '2026-11-26T00:00:00.000Z',
+  userId: null,
+  userName: null,
+  keyId: null,
+  keyName: null,
+  sessionId: null,
+  clientSessionId: null,
+  inboundDeviceId: null,
+  upstreamStatus: 409,
+  providerName: null,
+  accountId: null,
+  vmId: 'vm-11',
+  vmName: 'Slot 11',
+  model: 'claude-sonnet-4-6',
+  originalModel: 'claude-sonnet-4-6',
+  actualResponseModel: null,
+  modelMismatch: 0,
+  endpoint: '/v1/messages',
+  protocol: 'anthropic.messages',
+  method: 'POST',
+  statusCode: 409,
+  logMode: 'normal',
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheCreationInputTokens: 0,
+  cacheReadInputTokens: 0,
+  cacheCreation5mInputTokens: 0,
+  cacheCreation1hInputTokens: 0,
+  cacheTtlApplied: null,
+  totalTokens: 0,
+  costUsd: null,
+  actualCostUsd: null,
+  groupCostMultiplier: null,
+  costBreakdown: null,
+  durationMs: 120,
+  firstByteMs: null,
+  ttftMs: null,
+  generationMs: null,
+  stopReason: null,
+  attemptCount: 1,
+  finalState: 'rejected',
+  via: 'rust-kernel',
+  stream: false,
+  hasTools: false,
+  serviceTier: null,
+  upstreamServiceTier: null,
+  speed: null,
+  context1mApplied: null,
+  reasoningEffort: null,
+  errorClass: 'request',
+  errorLabel: '请求格式',
+  errorOwner: 'client',
+  errorCode: 'partial_provider_output_nonretryable',
+  errorMessage: 'Provider output interrupted',
+  upstreamType: 'partial_provider_output_nonretryable',
+  errorDetails: { prior_reason: 'client_cancelled', retryable: false },
+  jevState: null,
+  blockedBy: null,
+  blockedReason: null,
+  userAgent: null,
+  clientIp: null,
+  apiKeyPresented: null,
+  specialSettings: [],
+  providerChain: [
+    {
+      attemptNumber: 1,
+      vmId: 'vm-11',
+      vmName: 'Slot 11',
+      accountId: 'acc-11',
+      providerName: 'acct@example.com',
+      model: 'claude-sonnet-4-6',
+      selectionReason: 'sticky',
+      startedAt: '2026-11-26T00:00:00.000Z',
+      completedAt: '2026-11-26T00:00:00.120Z',
+      upstreamStatus: 409,
+      errorScope: 'request',
+      errorCode: 'partial_provider_output_nonretryable',
+      upstreamType: 'partial_provider_output_nonretryable',
+      errorDetails: { prior_reason: 'client_cancelled', retry_after_sec: 20 },
+      action: 'stop',
+      downstreamCommitted: false,
+      terminalState: 'rejected',
+      hopRequestId: '11111111-2222-4333-8444-555555555555',
+      providerRunId: 'run_1845',
+      providerTurnId: 'turn_1845',
+      providerAttemptId: 2,
+      providerRequestId: 'req_upstream_1845',
+      waitMs: 0,
+      queueWaitMs: 0,
+      schedulingMs: 0,
+      ttftMs: null,
+      latencyMs: 120,
+    },
+  ],
+}
+
+describe('LogicTraceTab correlation and error diagnostics (#1845)', () => {
+  it('renders hopRequestId, providerResult correlation IDs, and attempt error details', () => {
+    const html = renderToStaticMarkup(<LogicTraceTab row={row} />)
+    expect(html).toContain('11111111-2222-4333-8444-555555555555')
+    expect(html).toContain('run_1845')
+    expect(html).toContain('turn_1845')
+    expect(html).toContain('req_upstream_1845')
+    expect(html).toContain('partial_provider_output_nonretryable')
+    expect(html).toContain('prior_reason=client_cancelled')
+    expect(html).toContain('retry_after_sec=20')
+  })
+})

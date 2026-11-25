@@ -18,6 +18,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { redactSecrets } from '../core/security.mjs'
+import { sanitizeErrorDetailsForLog, sanitizeErrorToken } from '../core/errors.mjs'
 import { resolveStoreDb, withSavepoint } from '../db/database.mjs'
 import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
@@ -323,6 +324,41 @@ function costColumnsForLog(usage, model, extra = {}) {
   }
 }
 
+function appendCapturedHeader(target, rawKey, value) {
+  if (rawKey == null || value === undefined) return
+  const key = String(rawKey).trim().toLowerCase()
+  if (!key) return
+  if (Object.hasOwn(target, key)) {
+    const prev = target[key]
+    target[key] = Array.isArray(prev) ? [...prev, value] : [prev, value]
+  } else {
+    target[key] = value
+  }
+}
+
+function normalizeWriteHeadHeaders(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const out = {}
+  if (Array.isArray(raw)) {
+    if (raw.length > 0 && Array.isArray(raw[0])) {
+      for (const pair of raw) {
+        if (Array.isArray(pair) && pair.length >= 2) appendCapturedHeader(out, pair[0], pair[1])
+      }
+    } else {
+      for (let i = 0; i + 1 < raw.length; i += 2) {
+        appendCapturedHeader(out, raw[i], raw[i + 1])
+      }
+    }
+  } else {
+    for (const [k, v] of Object.entries(raw)) {
+      if (v === undefined) continue
+      const key = String(k).trim().toLowerCase()
+      if (key) out[key] = v
+    }
+  }
+  return Object.keys(out).length ? out : null
+}
+
 function redactHeaders(headers = {}) {
   const out = {}
   for (const [k, v] of Object.entries(headers)) {
@@ -626,6 +662,23 @@ export class RequestLogStore {
       captured.body += text.slice(0, Math.max(0, room))
       captured.truncated = true
     }
+    let writeHeadStatus = null
+    let writeHeadHeaders = null
+    if (typeof res.writeHead === 'function') {
+      const writeHead = res.writeHead
+      res.writeHead = function tappedWriteHead(statusCode, statusMessage, headers) {
+        let rawHeaders = null
+        if (typeof statusMessage === 'string') rawHeaders = headers
+        else if (statusMessage != null) rawHeaders = statusMessage
+        else if (headers != null) rawHeaders = headers
+        const out = writeHead.apply(this, arguments)
+        const parsedStatus = Number(statusCode)
+        if (Number.isInteger(parsedStatus) && parsedStatus > 0) writeHeadStatus = parsedStatus
+        const normalized = normalizeWriteHeadHeaders(rawHeaders)
+        if (normalized) writeHeadHeaders = { ...(writeHeadHeaders || {}), ...normalized }
+        return out
+      }
+    }
     const write = res.write
     const end = res.end
     res.write = function tappedWrite(chunk, encoding, cb) {
@@ -637,9 +690,17 @@ export class RequestLogStore {
       return end.call(this, chunk, encoding, cb)
     }
     res.once('finish', () => {
-      captured.status = res.statusCode || null
+      captured.status = res.statusCode || writeHeadStatus || null
       try {
-        captured.headers = redactHeaders(res.getHeaders?.() || {})
+        const merged = {}
+        const fromSetHeader = res.getHeaders?.() || {}
+        for (const [k, v] of Object.entries(fromSetHeader)) {
+          if (v === undefined) continue
+          const key = String(k).trim().toLowerCase()
+          if (key) merged[key] = v
+        }
+        if (writeHeadHeaders) Object.assign(merged, writeHeadHeaders)
+        captured.headers = redactHeaders(merged)
       } catch {}
     })
   }
@@ -672,6 +733,11 @@ export class RequestLogStore {
       speed: extra.speed ?? usage.speed,
       requested_speed: extra.requested_speed ?? usage.requested_speed,
     }
+    const upstreamType = sanitizeErrorToken(extra.upstream_type ?? extra.error_details?.upstream_type, 128)
+    const errorDetails = sanitizeErrorDetailsForLog(extra.error_details, {
+      status: extra.status ?? null,
+      upstreamType,
+    })
     const summary = {
       id: 'log_' + crypto.randomBytes(6).toString('hex'),
       request_id: ctx.request_id,
@@ -701,6 +767,8 @@ export class RequestLogStore {
       output_tokens: extra.output_tokens ?? usage.output_tokens ?? null,
       error_code: extra.error_code || null,
       error_message: extra.error_message ? String(extra.error_message).slice(0, 300) : null,
+      upstream_type: upstreamType,
+      error_details: errorDetails,
       user_agent: ctx.user_agent,
       ip: ctx.ip,
       api_key_presented: extra.api_key_presented ? presentedApiKeyForLog(extra.api_key_presented) : null,
@@ -1000,6 +1068,8 @@ const EXPORT_COLUMNS = [
   'error_code',
   'error_message',
   'error_label',
+  'upstream_type',
+  'error_details',
   'model',
   'vm_id',
   'ip',
@@ -1017,7 +1087,7 @@ const EXPORT_COLUMNS = [
 
 function csvCell(v) {
   if (v == null || v === '') return ''
-  const s = String(v)
+  const s = typeof v === 'object' ? JSON.stringify(v) : String(v)
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
 }
 

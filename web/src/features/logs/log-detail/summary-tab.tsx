@@ -593,17 +593,25 @@ export function SummaryTab({
         </div>
       ) : null}
 
-      {row.errorMessage || row.errorCode ? (
+      {row.errorMessage ||
+      row.errorCode ||
+      row.upstreamType ||
+      (row.errorDetails && Object.keys(row.errorDetails).length > 0) ? (
         <div className='space-y-2'>
           <SectionTitle icon={AlertCircle} color='text-rose-600'>
             错误信息
           </SectionTitle>
-          <div className='space-y-1 rounded-lg border bg-rose-50 p-3 dark:bg-rose-950/20'>
-            {row.errorCode || row.errorOwner ? (
+          <div className='space-y-2 rounded-lg border bg-rose-50 p-3 dark:bg-rose-950/20'>
+            {row.errorCode || row.upstreamType || row.errorOwner ? (
               <div className='flex flex-wrap gap-1'>
                 {row.errorCode ? (
                   <Badge variant='outline' className='font-mono text-[10px]'>
                     {row.errorCode}
+                  </Badge>
+                ) : null}
+                {row.upstreamType && row.upstreamType !== row.errorCode ? (
+                  <Badge variant='outline' className='font-mono text-[10px]'>
+                    {row.upstreamType}
                   </Badge>
                 ) : null}
                 {row.errorOwner ? (
@@ -617,6 +625,28 @@ export function SummaryTab({
               <p className='font-mono text-xs break-words whitespace-pre-wrap text-rose-800 dark:text-rose-200'>
                 {row.errorMessage}
               </p>
+            ) : null}
+            {row.errorDetails && Object.keys(row.errorDetails).length > 0 ? (
+              <div className='flex flex-wrap gap-1.5 border-t border-rose-200/70 pt-2 dark:border-rose-800/60'>
+                {Object.entries(row.errorDetails)
+                  .filter(
+                    ([key]) =>
+                      !(
+                        key === 'upstream_type' &&
+                        (row.upstreamType === row.errorDetails?.upstream_type ||
+                          row.errorCode === row.errorDetails?.upstream_type)
+                      )
+                  )
+                  .map(([key, value]) => (
+                    <Badge
+                      key={key}
+                      variant='outline'
+                      className='font-mono text-[10px]'
+                    >
+                      {key}={String(value)}
+                    </Badge>
+                  ))}
+              </div>
             ) : null}
           </div>
         </div>
