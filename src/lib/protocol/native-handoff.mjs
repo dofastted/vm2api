@@ -131,7 +131,7 @@ function parseProviderResult(raw) {
     usage: value.usage ?? null,
     usage_complete: value.usage_complete,
   }
-  for (const key of ['stop_details', 'error', 'http_status', 'request_id']) {
+  for (const key of ['stop_details', 'error', 'http_status', 'request_id', 'run_id', 'turn_id', 'attempt_id']) {
     if (Object.hasOwn(value, key)) result[key] = value[key]
   }
   return result

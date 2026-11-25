@@ -6,7 +6,12 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { checkAdditive, classifyStatement, resolveEngine, splitStatements } from '../../deploy/bluegreen/migration-guard.mjs'
+import {
+  checkAdditive,
+  classifyStatement,
+  resolveEngine,
+  splitStatements,
+} from '../../deploy/bluegreen/migration-guard.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const GUARD = path.join(ROOT, 'deploy/bluegreen/migration-guard.mjs')
@@ -19,6 +24,15 @@ const sqlite = (name, sql) => ({ engine: 'sqlite', files: [{ name, sql }] })
 test('068 multi-tier key permissions is additive on a small database', () => {
   const sql = fs.readFileSync(path.join(SQLITE_DIR, '068_multi_tier_key_permissions.sql'), 'utf8')
   const v = checkAdditive({ ...sqlite('068_multi_tier_key_permissions.sql', sql), rowCount: () => 5 })
+  assert.equal(v.additive, true, JSON.stringify(v.reasons))
+})
+
+test('069 log error details and hop correlation is additive even on a huge database (#1845)', () => {
+  const sql = fs.readFileSync(path.join(SQLITE_DIR, '069_log_error_details_and_hop_correlation.sql'), 'utf8')
+  const v = checkAdditive({
+    ...sqlite('069_log_error_details_and_hop_correlation.sql', sql),
+    rowCount: () => 10_000_000,
+  })
   assert.equal(v.additive, true, JSON.stringify(v.reasons))
 })
 
@@ -318,7 +332,11 @@ test('resolveEngine does not swallow config import errors and mirrors docker-ent
   assert.equal(await resolveEngine(prePg, { DATABASE_HOST: '127.0.0.1' }), 'sqlite')
 
   // 2. config.mjs 存在但语法/导入报错 → 必须抛错，不能静默回退 sqlite
-  const broken = fixtureRoot(t, { '100_add.sql': 'ALTER TABLE api_keys ADD COLUMN x TEXT;' }, { pgConfig: 'export const ???' })
+  const broken = fixtureRoot(
+    t,
+    { '100_add.sql': 'ALTER TABLE api_keys ADD COLUMN x TEXT;' },
+    { pgConfig: 'export const ???' },
+  )
   await assert.rejects(() => resolveEngine(broken, { VM2API_DB_DRIVER: 'postgres' }))
   const brokenCli = runCli(broken, ['100_add.sql'], { VM2API_DB_DRIVER: 'postgres' })
   assert.equal(brokenCli.status, 1, brokenCli.stdout + brokenCli.stderr)

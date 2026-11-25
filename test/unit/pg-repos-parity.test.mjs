@@ -475,6 +475,11 @@ function runAll22ReposScenario(db) {
     downstreamCommitted: true,
     terminalState: 'ok',
     usage: { input_tokens: 100, output_tokens: 50 },
+    hopRequestId: '11111111-2222-4333-8444-555555555555',
+    providerRunId: 'run_p1',
+    providerTurnId: 'turn_p1',
+    providerAttemptId: 1,
+    providerRequestId: 'req_upstream_p1',
     ttftMs: 120,
     latencyMs: 450,
   })
@@ -484,6 +489,11 @@ function runAll22ReposScenario(db) {
     terminal: attList[0]?.terminal_state,
     committed: attList[0]?.downstream_committed,
     usageOut: attList[0]?.usage?.output_tokens,
+    hopRequestId: attList[0]?.hop_request_id,
+    providerRunId: attList[0]?.provider_run_id,
+    providerTurnId: attList[0]?.provider_turn_id,
+    providerAttemptId: attList[0]?.provider_attempt_id,
+    providerRequestId: attList[0]?.provider_request_id,
   }
 
   // 15. RefusalGuardsRepo (exercises .iterate() in nearest()!)
@@ -662,6 +672,13 @@ function runAll22ReposScenario(db) {
     status: 502,
     error_code: 'upstream_502',
     error_message: 'Bad Gateway',
+    upstream_type: 'partial_provider_output_nonretryable',
+    error_details: {
+      upstream_type: 'partial_provider_output_nonretryable',
+      retryable: false,
+      prior_reason: 'client_cancelled',
+      retry_after_sec: 20,
+    },
     duration_ms: 200,
     input_tokens: 100,
     output_tokens: 0,

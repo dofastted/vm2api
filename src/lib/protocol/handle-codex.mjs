@@ -1073,6 +1073,7 @@ export async function handleCodexProtocol({
               routing,
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
               redactionSession: String(req.headers?.['x-session-id'] || inboundSession.session_id || ''),
+              gatewayRequestId: res?._kinRequestId || null,
               body: outboundBody,
               envelope: {
                 body: outboundBody,
@@ -1162,6 +1163,9 @@ export async function handleCodexProtocol({
           result.body = { error: conversionError }
         }
         ingestCodexHop(projectRoot, vm.id, result, Date.now(), normalizeCodexRouting(routing.codex).quota)
+        if (result?.hopRequestId) {
+          logBag.hop_meta = { ...logBag.hop_meta, hop_request_id: result.hopRequestId }
+        }
         if (result?.transport_retried) logBag.transport_retried = true
         if (result?.reasoning_history_retried) {
           logBag.attempt_count += 1

@@ -144,6 +144,52 @@ export function sessionIdForLog(value) {
   return s ? s.slice(0, SESSION_ID_MAX) : null
 }
 
+const CORRELATION_ID_MAX = 128
+const CORRELATION_SECRET_RE = /^(?:sk-(?:ant|kin|vm)-|AIza|eyJ)/i
+
+/** Safe bounded correlation ID (UUIDs, Anthropic req_*, CRAG run/turn IDs); never whitespace, controls, or secrets. */
+export function correlationIdForLog(value, maxLen = CORRELATION_ID_MAX) {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  const limit = Math.min(CORRELATION_ID_MAX, Math.max(1, Number(maxLen) || CORRELATION_ID_MAX))
+  if (!trimmed || trimmed.length > limit) return null
+  if (/[\x00-\x1f\x7f\s]/.test(trimmed)) return null
+  if (CORRELATION_SECRET_RE.test(trimmed)) return null
+  return trimmed
+}
+
+function nonNegativeSafeInt(value) {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null
+}
+
+/**
+ * Extract safe, bounded hop & native providerResult correlation IDs for
+ * `hop_meta.native_handoff` and `request_attempts` so operators can join
+ * gateway rows directly against `docker logs kin-NN`.
+ */
+export function extractProviderCorrelation(result = null) {
+  const provider =
+    result?.providerResult && typeof result.providerResult === 'object' && !Array.isArray(result.providerResult)
+      ? result.providerResult
+      : null
+  const turnRaw =
+    typeof provider?.turn_id === 'number' && Number.isSafeInteger(provider.turn_id) && provider.turn_id >= 0
+      ? String(provider.turn_id)
+      : provider?.turn_id
+  const providerRequestId = correlationIdForLog(provider?.request_id)
+  const fallbackRequestId = correlationIdForLog(
+    result?.body?.error?.request_id ?? result?.body?.request_id ?? result?.headers?.['request-id'],
+  )
+  return {
+    hop_request_id: correlationIdForLog(result?.hopRequestId),
+    run_id: correlationIdForLog(provider?.run_id),
+    turn_id: correlationIdForLog(turnRaw),
+    attempt_id: nonNegativeSafeInt(provider?.attempt_id),
+    provider_request_id: providerRequestId,
+    request_id: providerRequestId || fallbackRequestId,
+  }
+}
+
 const GEMINI_MODEL_PREFIX_RE = /^gemini-/i
 const GEMINI_PAREN_EFFORT_RE = /\(([^()]+)\)$/
 const GEMINI_TIER_SUFFIX_RE = /-(minimal|low|medium|high|xhigh|extra-high|max)$/i

@@ -1,5 +1,7 @@
 import { getDb } from '../database.mjs'
 import { enqueueWrite, writeBehindArmed } from '../write-behind.mjs'
+import { sanitizeErrorDetailsForLog, sanitizeErrorToken } from '../../core/errors.mjs'
+import { correlationIdForLog } from '../../protocol/log-fields.mjs'
 
 function parse(value, fallback = null) {
   if (value == null) return fallback
@@ -27,8 +29,23 @@ export function normalizeCooldownUntilMs(value) {
   return null
 }
 
+function normalizeProviderAttemptId(value) {
+  if (value == null || value === '') return null
+  if (typeof value === 'bigint') {
+    const n = Number(value)
+    return Number.isSafeInteger(n) && n >= 0 ? n : null
+  }
+  if (typeof value === 'number') return Number.isSafeInteger(value) && value >= 0 ? value : null
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+    const n = Number(value.trim())
+    return Number.isSafeInteger(n) && n >= 0 ? n : null
+  }
+  return null
+}
+
 function rowToAttempt(row) {
   if (!row) return null
+  const errorDetails = parse(row.error_details_json)
   return {
     id: row.id,
     request_id: row.request_id,
@@ -41,11 +58,19 @@ function rowToAttempt(row) {
     completed_at: row.completed_at,
     upstream_status: row.upstream_status,
     error_scope: row.error_scope,
+    error_code: row.error_code ?? null,
+    upstream_type: row.upstream_type ?? errorDetails?.upstream_type ?? null,
+    error_details: errorDetails,
     action: row.action,
     cooldown_until: row.cooldown_until,
     downstream_committed: !!row.downstream_committed,
     terminal_state: row.terminal_state,
     usage: parse(row.usage_json),
+    hop_request_id: row.hop_request_id ?? null,
+    provider_run_id: row.provider_run_id ?? null,
+    provider_turn_id: row.provider_turn_id ?? null,
+    provider_attempt_id: normalizeProviderAttemptId(row.provider_attempt_id),
+    provider_request_id: row.provider_request_id ?? null,
     wait_ms: row.wait_ms,
     queue_wait_ms: row.queue_wait_ms,
     scheduling_ms: row.scheduling_ms,
@@ -62,14 +87,19 @@ export class RequestAttemptsRepo {
         request_id, attempt_no, vm_id, account_id, model, selection_reason,
         started_at, completed_at, upstream_status, error_scope, action,
         cooldown_until, downstream_committed, terminal_state, usage_json,
-        wait_ms, ttft_ms, latency_ms, queue_wait_ms, scheduling_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        wait_ms, ttft_ms, latency_ms, queue_wait_ms, scheduling_ms,
+        error_code, upstream_type, error_details_json,
+        hop_request_id, provider_run_id, provider_turn_id, provider_attempt_id, provider_request_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     this._complete = db.prepare(`
       UPDATE request_attempts SET
         completed_at = ?, upstream_status = ?, error_scope = ?, action = ?,
         cooldown_until = ?, downstream_committed = ?, terminal_state = ?,
-        usage_json = ?, ttft_ms = ?, latency_ms = ?
+        usage_json = ?, ttft_ms = ?, latency_ms = ?,
+        error_code = ?, upstream_type = ?, error_details_json = ?,
+        hop_request_id = ?, provider_run_id = ?, provider_turn_id = ?,
+        provider_attempt_id = ?, provider_request_id = ?
       WHERE request_id = ? AND attempt_no = ?
     `)
     this._list = db.prepare(`
@@ -90,6 +120,7 @@ export class RequestAttemptsRepo {
     waitMs = 0,
     queueWaitMs = null,
     schedulingMs = null,
+    hopRequestId = null,
   }) {
     const startedAt = new Date().toISOString()
     const write = () => {
@@ -114,6 +145,14 @@ export class RequestAttemptsRepo {
         null,
         queueWaitMs,
         schedulingMs,
+        null,
+        null,
+        null,
+        correlationIdForLog(hopRequestId),
+        null,
+        null,
+        null,
+        null,
       )
     }
     if (writeBehindArmed()) {
@@ -126,6 +165,23 @@ export class RequestAttemptsRepo {
 
   complete(requestId, attemptNo, result = {}) {
     const completedAt = new Date().toISOString()
+    const errorCode = sanitizeErrorToken(result.errorCode, 128)
+    const upstreamType = sanitizeErrorToken(result.upstreamType ?? result.errorDetails?.upstream_type, 128)
+    const errorDetails = sanitizeErrorDetailsForLog(result.errorDetails, {
+      status: result.upstreamStatus ?? null,
+      upstreamType,
+    })
+    const hopRequestId = correlationIdForLog(result.hopRequestId)
+    const providerRunId = correlationIdForLog(result.providerRunId)
+    const providerTurnId = correlationIdForLog(
+      typeof result.providerTurnId === 'number' &&
+        Number.isSafeInteger(result.providerTurnId) &&
+        result.providerTurnId >= 0
+        ? String(result.providerTurnId)
+        : result.providerTurnId,
+    )
+    const providerAttemptId = normalizeProviderAttemptId(result.providerAttemptId)
+    const providerRequestId = correlationIdForLog(result.providerRequestId)
     const write = () => {
       this._complete.run(
         completedAt,
@@ -138,6 +194,14 @@ export class RequestAttemptsRepo {
         result.usage != null ? JSON.stringify(result.usage) : null,
         result.ttftMs ?? null,
         result.latencyMs ?? null,
+        errorCode,
+        upstreamType,
+        errorDetails ? JSON.stringify(errorDetails) : null,
+        hopRequestId,
+        providerRunId,
+        providerTurnId,
+        providerAttemptId,
+        providerRequestId,
         requestId,
         attemptNo,
       )
