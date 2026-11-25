@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## 1.4.214 — 2026-11-25 · 钉选 CRAG 3.1.20 与 CRAGGemini 0.4.10；多 CLI 429 触发词归一化与 410/429 透传；Gemini 串行每小时健康缓存
+- **官方 `/usage` 探活识别组织禁用 403 并直接挂起槽位，不再伪装成官方限流退避**：探活管线此前把组织禁用 403（`OAuth authentication is currently not allowed for this organization.`）当作「官方 `/usage` 临时限流」处理——`ingestOAuthUsage` 走限流退避分支给 `last_probe` 打上 `rate_limited: true` 并写退避窗口，而凭证刷新不受组织禁用影响照常成功，导致资格门全绿、槽位自动回池，直到真实流量再撞一次 403 才被运行时分类器挂起（一天内可往返多次）。现 `upstream-error-policy` 导出 `isOrganizationDisabledText` 与运行时 401/403 分类器共享同一份组织禁用文案表；探活命中即 `markUnschedulable('organization_disabled')` 写四态记录（与运行时 `pauseUnit` 同一落点、同样仅操作员手动开回，后台凭证刷新无法解除）；`ingestOAuthUsage` 对组织禁用不再进限流退避分支，原始文案落 `last_probe.error` 供面板显示。## 1.4.214 — 2026-11-25 · 钉选 CRAG 3.1.20 与 CRAGGemini 0.4.10；多 CLI 429 触发词归一化与 410/429 透传；Gemini 串行每小时健康缓存
 
 - **CRAG 3.1.20 与 CRAGGemini 0.4.10 签名载荷全线升级**：
   - `deploy/payload.json` 与 `src/lib/admin/kernel-catalog.mjs` 升级 CRAG 至 `3.1.20`（`payload-2026.11.25-crag-3.1.20`，对应 `dofastted/crag@v3.1.20` PR `#26`），修复孤儿 transcript JSONL 回收（#1726）、首字节前 401 续跑可重试与 410 结构化 `details.reason`（#1215）及 `GET /api/oauth/usage` 转发（#1311），沿用生产授权锚（`9dbb4bc2…` / `835451e2…`）；同步在 `src/lib/core/errors.mjs` 对 `410 Gone` 按白名单透传 `details.reason`（`waiting_expired` / `handoff_expired` / `receipt_expired` / `cancelled`）（#1816）。
