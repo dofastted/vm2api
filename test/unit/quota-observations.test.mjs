@@ -71,6 +71,41 @@ test('#1776 active query exposes official zero separately, without overwriting c
   assert.equal(calls, 1, 'display must not query the provider')
 })
 
+test('post-reset headers reconcile official storage without updating its old query time', (t) => {
+  const { quota, now } = fixture(t)
+  const stamp = new Date(now).toISOString()
+  quota.ingestOAuthUsage('synthetic-account', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    probed_at: stamp,
+    seven_day: { utilization: 100, status: 'rejected', resets_at: new Date(now + 86400_000).toISOString() },
+  })
+  assert.equal(quota.repo.get('synthetic-account').unified.official['7d'].utilization, 1)
+  quota.recordQuotaReset('synthetic-account', {
+    cleared: ['seven_day'],
+    now: now + 1000,
+    operationId: 'synthetic-reset',
+  })
+  quota.ingestHeaders(
+    'synthetic-account',
+    {
+      'anthropic-ratelimit-unified-7d-utilization': '0.05',
+      'anthropic-ratelimit-unified-7d-status': 'allowed',
+      'anthropic-ratelimit-unified-7d-reset': String(Math.floor((now + 8 * 86400_000) / 1000)),
+    },
+    null,
+    { now: now + 2000, requestStartedAt: now + 2000, resetGenerations: quota.resetGenerations('synthetic-account') },
+  )
+  const acc = quota.repo.get('synthetic-account')
+  const before = structuredClone(acc)
+  const official = quotaFromAccount(acc).quota_observations.official
+  assert.equal(official['7d'].utilization, 0.05)
+  assert.equal(official.updated_at, stamp)
+  assert.equal(official['7d'].sampled_at, null)
+  assert.deepEqual(quota.repo.get('synthetic-account'), before)
+})
+
 test('observation projection preserves unknown, zero and stale samples without borrowing aggregate timestamps', () => {
   const acc = {
     unified: {

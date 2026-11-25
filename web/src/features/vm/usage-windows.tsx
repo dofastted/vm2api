@@ -98,7 +98,7 @@ function observationPercent(value: number | null | undefined) {
     : `${(value * 100).toFixed(0)}%`
 }
 
-/** Saved observations only; rendering never refreshes or changes admission. */
+/** Mutable stored state, not raw query receipts; rendering never changes admission. */
 export function ClaudeQuotaObservations({ vm, now }: { vm: Vm; now: number }) {
   const observations = vm.quota_observations
   const official = observations?.official
@@ -117,21 +117,21 @@ export function ClaudeQuotaObservations({ vm, now }: { vm: Vm; now: number }) {
       onKeyDown={(event) => event.stopPropagation()}
     >
       <summary className='cursor-pointer'>
-        官方查询记录：5H {observationPercent(official['5h']?.utilization)} · 7D{' '}
-        {observationPercent(official['7d']?.utilization)}
+        官方侧存储状态：5H {observationPercent(official['5h']?.utilization)} ·
+        7D {observationPercent(official['7d']?.utilization)}
         {different ? ' · 与当前展示不同' : ''}
       </summary>
       <div className='mt-1 grid gap-1 break-words'>
         <p>
-          官方记录更新时间：{official.updated_at || '未知'}
-          。整体更新时间不代表每个窗口都已重新采样。
+          官方侧保留时间字段：{official.updated_at || '未知'}
+          。该时间不保证对应当前窗口读数，也不代表每个窗口都已重新采样。
         </p>
         {windows.map((key) => (
           <div key={key}>
             {key.toUpperCase()}
             {(
               [
-                ['官方查询', official[key]],
+                ['官方侧存储', official[key]],
                 ['保守合并记录', observations.passive[key]],
               ] as const
             ).map(([label, sample]) => {
@@ -150,7 +150,7 @@ export function ClaudeQuotaObservations({ vm, now }: { vm: Vm; now: number }) {
           </div>
         ))}
         <p>
-          当前额度保留原有保守合并规则；来源读数可能不同，不能仅凭更新时间覆盖。保守记录含响应头及官方同步值，不等于原始响应头。查询失败不会清零，历史记录不代表实时可用额度。
+          当前额度保留原有保守合并规则；两侧存储值可能不同，不能仅凭时间字段覆盖。官方侧可能被重置后的响应头校正，并非官方查询原始回执。保守记录含响应头及官方同步值，不等于原始响应头。查询失败不会清零，存储状态不代表实时可用额度。
         </p>
       </div>
     </details>

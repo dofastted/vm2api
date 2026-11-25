@@ -70,7 +70,7 @@ describe('Claude official quota observations', () => {
   }
   it('shows official zero beside conservative usage, source and distinct timestamps', () => {
     const html = claude()
-    expect(html).toContain('官方查询记录')
+    expect(html).toContain('官方侧存储状态')
     expect(html).toContain('0%')
     expect(html).toContain('76%')
     expect(html).toContain('与当前展示不同')
@@ -78,12 +78,31 @@ describe('Claude official quota observations', () => {
     expect(html).toContain('2026-10-31T00:00:00Z')
     expect(html).toContain('窗口采样时间未知')
   })
+  it('does not attribute a reconciled 5% value to the older official query', () => {
+    const html = claude({
+      quota_observations: {
+        ...snapshot,
+        official: {
+          ...snapshot.official,
+          '7d': { ...snapshot.official['7d'], utilization: 0.05 },
+        },
+      },
+    })
+    expect(html).toContain('官方侧存储状态')
+    expect(html).toContain('5%')
+    expect(html).toContain('2026-11-01T00:00:00Z')
+    expect(html).toContain('可能被重置后的响应头校正，并非官方查询原始回执')
+    expect(html).toContain('该时间不保证对应当前窗口读数')
+    expect(html).not.toContain('官方查询记录')
+    expect(html).not.toContain('官方记录更新时间')
+    expect(html).not.toContain('官方查询：')
+  })
   it('does not invent official snapshots for old servers or other platforms', () => {
     expect(claude({ quota_observations: undefined })).not.toContain(
-      '官方查询记录'
+      '官方侧存储状态'
     )
     expect(claude({ platform: 'openai', family: 'codex' })).not.toContain(
-      '官方查询记录'
+      '官方侧存储状态'
     )
   })
   it('retains stale official observations with a warning, not a new zero', () => {
@@ -96,7 +115,7 @@ describe('Claude official quota observations', () => {
         },
       },
     })
-    expect(html).toContain('官方查询记录')
+    expect(html).toContain('官方侧存储状态')
     expect(html).toContain('陈旧')
     expect(html).toContain('未知')
     expect(html).not.toMatch(/>0%</)

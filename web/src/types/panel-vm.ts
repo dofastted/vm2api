@@ -346,6 +346,7 @@ export type Vm = {
   circuit?: VmCircuit | null
   cooldown_until?: number
   cooldown_reason?: string
+  /** Mutable stored quota state: official windows may be reconciled from headers. */
   quota_observations?: {
     official:
       | ({ updated_at: string | null } & Record<
