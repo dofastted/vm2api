@@ -20,6 +20,7 @@ import {
   createResponsesSseEventNamer,
   assembleCodexBodyFromSse,
   codexBodyToAnthropicMessage,
+  codexCompatibleFunctionTools,
   isToolArgumentsError,
   toCodexResponses,
 } from './codex-convert.mjs'
@@ -907,6 +908,7 @@ export async function handleCodexProtocol({
   let attempts = 0
   let switches = 0
   let counted = false
+  let compatibleTools = null
   try {
     for (;;) {
       const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, {
@@ -1014,7 +1016,7 @@ export async function handleCodexProtocol({
         }
         hops += 1
         logBag.vm_id = vm.id
-        logBag.attempt_count = hops
+        logBag.attempt_count += 1
         logBag.usage_account_id = openaiUsageAccountId(searchCredentials(projectRoot, vm).accountId)
         const chunks = []
         const nameSseEvent = createResponsesSseEventNamer()
@@ -1057,7 +1059,11 @@ export async function handleCodexProtocol({
           previous_response_id: inboundSession.previous_response_id,
         }
         logBag.outbound_session_id = sessionIdForLog(outboundSessionId)
-        const outboundBody = applyCodexRebuildBody({ ...converted.body, stream: true }, outboundSessionId, sessionMode)
+        let outboundBody = applyCodexRebuildBody(
+          { ...converted.body, ...(compatibleTools && { tools: compatibleTools }), stream: true },
+          outboundSessionId,
+          sessionMode,
+        )
         const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
@@ -1122,8 +1128,37 @@ export async function handleCodexProtocol({
               if (named) res.write(named)
             },
           })
-        let result = await runHop()
-        let policyRefusal = afterHop?.(result)
+        const runAttempt = async () => {
+          let result = await runHop()
+          let policyRefusal = afterHop?.(result)
+          const error = result?.body?.error
+          if (
+            !compatibleTools &&
+            !policyRefusal &&
+            !result?.ok &&
+            Number(result?.status) === 400 &&
+            error?.code === 'invalid_json_schema' &&
+            /^Invalid schema for 'tools\[\d+\]\.parameters': Unsatisfiable schema:/.test(error.message || '') &&
+            !result.committed &&
+            !result.transportError &&
+            !hopEmitted &&
+            !res.headersSent &&
+            !gone.signal.aborted &&
+            attempts < failoverBudget.maxAttempts
+          ) {
+            compatibleTools = codexCompatibleFunctionTools(outboundBody.tools)
+            if (compatibleTools) {
+              attempts += 1
+              logBag.attempt_count += 1
+              outboundBody = { ...outboundBody, tools: compatibleTools }
+              if (captureOutbound) logBag.outbound_body = outboundBody
+              result = await runHop()
+              policyRefusal = afterHop?.(result)
+            }
+          }
+          return { result, policyRefusal }
+        }
+        let { result, policyRefusal } = await runAttempt()
         // A transient seat-local failure gets the same account up to N retries
         // before the request spends a switch. 401/403/429 are never retried here:
         // they are credential/account state and must move to another seat.
@@ -1141,12 +1176,13 @@ export async function handleCodexProtocol({
           sameAccountRetries += 1
           attempts += 1
           hops += 1
-          logBag.attempt_count = hops
+          logBag.attempt_count += 1
           logBag.codex_same_account_retried = sameAccountRetries
           await new Promise((resolve) => setTimeout(resolve, sameRetryDelayMs))
           hopEmitted = false
-          result = await runHop()
-          policyRefusal = afterHop?.(result)
+          const retried = await runAttempt()
+          result = retried.result
+          policyRefusal = retried.policyRefusal
         }
         // The log and total duration share ingress time; pool scoring keeps hop TTFT.
         logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)

@@ -8,6 +8,156 @@ import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-run
 
 beforeEach(() => resetOpenAIAccountRuntime())
 
+const rejectedToolSchema = {
+  ok: false,
+  status: 400,
+  committed: false,
+  body: {
+    error: {
+      code: 'invalid_json_schema',
+      message:
+        "Invalid schema for 'tools[0].parameters': Unsatisfiable schema: required property 'id' is unsatisfiable.",
+    },
+  },
+}
+
+const toolParameters = {
+  type: 'object',
+  properties: { id: { $ref: '#/$defs/id' } },
+  required: ['id'],
+  $defs: { id: { type: 'string' } },
+}
+
+test('Codex schema recovery retries the same session once with the full tool set', async (t) => {
+  const tools = [
+    { type: 'function', function: { name: 'nested', parameters: toolParameters } },
+    { type: 'function', name: 'flat', parameters: toolParameters },
+    { type: 'function', name: 'explicit', parameters: toolParameters, strict: true },
+    { type: 'web_search' },
+  ]
+  const seen = []
+  const fx = fixture(t, {
+    body: { tools },
+    hop: async ({ body, exec, envelope, onEvent }) => {
+      seen.push({ body, slot: exec.vmId, session: envelope.session.session_id })
+      assert.equal(envelope.body, body)
+      if (seen.length === 1) return rejectedToolSchema
+      await onEvent(`data: ${JSON.stringify({ type: 'response.completed', response })}\n\n`)
+      return { ok: true, status: 200, body: response, usage: response.usage, terminalState: 'verified' }
+    },
+  })
+  fx.args.captureOutbound = true
+  await handleCodexProtocol(fx.args)
+  assert.equal(fx.res.statusCode, 200)
+  assert.equal(seen.length, 2)
+  assert.equal(seen[0].slot, seen[1].slot)
+  assert.equal(seen[0].session, seen[1].session)
+  assert.deepEqual(seen[0].body.tools, tools)
+  assert.deepEqual(seen[1].body, {
+    ...seen[0].body,
+    tools: [
+      { type: 'function', ...tools[0].function, strict: false },
+      { ...tools[1], strict: false },
+      tools[2],
+      tools[3],
+    ],
+  })
+  assert.equal(fx.args.logBag.attempt_count, 2)
+  assert.equal(fx.args.logBag.outbound_body, seen[1].body)
+  assert.equal(fx.args.logBag.codex_failed_over, undefined)
+})
+
+test('Codex schema recovery returns the upstream error after one compatibility attempt', async (t) => {
+  let hops = 0
+  const fx = fixture(t, {
+    body: { tools: [{ type: 'function', name: 'implicit', parameters: toolParameters }] },
+    hop: async () => {
+      hops += 1
+      return rejectedToolSchema
+    },
+  })
+  await handleCodexProtocol(fx.args)
+  assert.equal(hops, 2)
+  assert.equal(fx.res.statusCode, 400)
+  assert.deepEqual(fx.res.body, rejectedToolSchema.body)
+})
+
+test('Codex failover counts the schema recovery attempt', async (t) => {
+  const slots = []
+  const fx = fixture(t, {
+    body: { tools: [{ type: 'function', name: 'implicit', parameters: toolParameters }] },
+    hop: async ({ body, exec }) => {
+      slots.push(exec.vmId)
+      if (slots.length === 1) return rejectedToolSchema
+      assert.equal(body.tools[0].strict, false)
+      if (slots.length === 2) {
+        return { ok: false, status: 503, body: { error: { code: 'no_capacity', message: 'credential busy' } } }
+      }
+      return { ok: true, status: 200, body: response }
+    },
+  })
+  await handleCodexProtocol(fx.args)
+  assert.equal(fx.res.statusCode, 200)
+  assert.equal(slots.length, 3)
+  assert.equal(slots[0], slots[1])
+  assert.notEqual(slots[1], slots[2])
+  assert.equal(fx.args.logBag.attempt_count, 3)
+})
+
+test('Codex Responses accepts a messages body while preserving explicit tool strictness', async (t) => {
+  const tools = [
+    { type: 'function', function: { name: 'implicit', parameters: toolParameters } },
+    { type: 'function', function: { name: 'strict', parameters: toolParameters, strict: true } },
+    { type: 'function', name: 'non_strict', parameters: toolParameters, strict: false },
+  ]
+  const sent = []
+  const fx = fixture(t, {
+    body: { input: undefined, messages: [{ role: 'user', content: 'hello' }], tools },
+    hop: async ({ body }) => {
+      sent.push(body)
+      return sent.length === 1 ? rejectedToolSchema : { ok: true, status: 200, body: response }
+    },
+  })
+  await handleCodexProtocol(fx.args)
+  assert.equal(fx.res.statusCode, 200)
+  assert.deepEqual(
+    sent.map((body) => body.tools.map((tool) => tool.strict)),
+    [
+      [undefined, true, false],
+      [false, true, false],
+    ],
+  )
+  assert.deepEqual(sent[1].input, sent[0].input)
+  assert.ok(sent[1].tools.every((tool) => tool.parameters === toolParameters))
+})
+
+for (const boundary of ['explicit strict', 'event', 'committed', 'attempt budget']) {
+  test(`Codex schema recovery skips retry with ${boundary}`, async (t) => {
+    let hops = 0
+    const fx = fixture(t, {
+      body: {
+        stream: true,
+        tools: [
+          {
+            type: 'function',
+            name: 'tool',
+            parameters: toolParameters,
+            ...(boundary === 'explicit strict' && { strict: true }),
+          },
+        ],
+      },
+      hop: async ({ onEvent }) => {
+        hops += 1
+        if (boundary === 'event') await onEvent('data: {"type":"response.created"}\n\n')
+        return { ...rejectedToolSchema, committed: boundary === 'committed' }
+      },
+    })
+    if (boundary === 'attempt budget') fx.args.routing.failover = { max_total_attempts: 1 }
+    await handleCodexProtocol(fx.args)
+    assert.equal(hops, 1)
+  })
+}
+
 const response = {
   id: 'resp_test',
   object: 'response',
