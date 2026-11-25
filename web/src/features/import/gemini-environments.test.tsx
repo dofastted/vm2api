@@ -271,6 +271,62 @@ test('CRAGGemini subscription mode renders subscription status and seat bind/rel
   )
   expect(boundHtml).toContain('已绑定席位 #1')
   expect(boundHtml).toContain('释放 CRAG 席位')
+
+  const syncPendingClient = new QueryClient()
+  syncPendingClient.setQueryData(['panel', 'me'], { role: 'admin' })
+  syncPendingClient.setQueryData(['panel', 'gemini-environments'], {
+    available: true,
+    payload_state: 'installed',
+    payload_mode: 'crag_subscription',
+    release_activated: true,
+    crag_subscription: {
+      configured: true,
+      active: false,
+      product: 'craggemini',
+      host_id: 'host-1',
+      sync_pending: true,
+      version: 2,
+      revision: 2,
+      issued_at: 1_800_000_000,
+      expires_at: 1_803_000_000,
+      slot_limit: 2,
+      used_slots: 1,
+      available_slots: 0,
+      reclaim_supported: true,
+    },
+    environments: [
+      {
+        id: 'gemini-mismatch',
+        name: '载荷换签',
+        proxy_id: 'px-one',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        runtime_ready: false,
+        billing_ready: false,
+        kernel_version: '0.4.10',
+        models: ['gemini-3-flash'],
+        models_discovered: true,
+        crag_license: {
+          product: 'craggemini',
+          status: 'invalid',
+          valid: false,
+          seat_required: true,
+          code: 'license_payload_key_mismatch',
+        },
+        account: null,
+      },
+    ],
+  })
+  const syncPendingHtml = renderToStaticMarkup(
+    <QueryClientProvider client={syncPendingClient}>
+      <GeminiEnvironments environmentId='gemini-mismatch' />
+    </QueryClientProvider>
+  )
+  expect(syncPendingHtml).toContain('CRAGGemini 宿主订阅正在同步上次变更')
+  expect(syncPendingHtml).toContain('继续同步订阅')
+  expect(syncPendingHtml).toContain('CRAGGemini 许可与当前载荷版本不匹配')
+  expect(syncPendingHtml).toContain('重新绑定 CRAG 席位')
+  expect(syncPendingHtml).not.toContain('CRAGGemini 宿主订阅未激活')
 })
 
 test('Gemini authorization challenge exposes copyable link alongside open action', () => {

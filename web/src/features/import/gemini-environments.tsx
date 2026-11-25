@@ -98,6 +98,8 @@ export type GeminiCragLicense = {
   seat_required?: boolean
   scope?: string | null
   seat?: number | null
+  payload_key_id?: string | null
+  sync_pending?: boolean
   expires_at?: number | null
   code?: string | null
   message?: string | null
@@ -290,6 +292,11 @@ export function GeminiStartupStatus({
               ? ` · 到期 ${localTime(new Date(inventory.crag_subscription.expires_at * 1000).toISOString())}`
               : ''}
             ）。
+          </p>
+        ) : inventory.crag_subscription?.sync_pending ? (
+          <p role='status'>
+            CRAGGemini
+            宿主订阅正在同步上次变更（已兑换记录仍保留），请点击「继续同步订阅」或稍候自动恢复。
           </p>
         ) : (
           <p role='status'>
@@ -707,6 +714,16 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
                   environment.crag_license.code ?? 'license_required'
                 )}
           </dd>
+          {!environment.crag_license.valid &&
+          geminiInferenceErrorAction(
+            environment.crag_license.code ?? 'license_required'
+          ) ? (
+            <dd className='mt-0.5 text-xs text-muted-foreground'>
+              {geminiInferenceErrorAction(
+                environment.crag_license.code ?? 'license_required'
+              )}
+            </dd>
+          ) : null}
         </div>
       ) : null}
       <div>
@@ -1084,6 +1101,7 @@ export function GeminiEnvironments({
         | 'refresh'
         | 'bind_seat'
         | 'release_seat'
+        | 'sync_subscription'
       id?: string
     }) => {
       const resource = `${ROOT}/environments${action.id ? `/${encodeURIComponent(action.id)}` : ''}`
@@ -1145,6 +1163,8 @@ export function GeminiEnvironments({
         await api(`${resource}/crag-license/bind`, { method: 'POST' })
       if (action.type === 'release_seat')
         await api(`${resource}/crag-license/release`, { method: 'POST' })
+      if (action.type === 'sync_subscription')
+        await api(`${ROOT}/crag-subscription/sync`, { method: 'POST' })
       if (action.type === 'delete') await api(resource, { method: 'DELETE' })
       setChallenge(null)
       setCode('')
@@ -1234,6 +1254,16 @@ export function GeminiEnvironments({
             刷新数据
           </Button>
         ) : null}
+        {isCragSubscription && cragSub?.sync_pending ? (
+          <Button
+            type='button'
+            variant='outline'
+            disabled={busy}
+            onClick={() => operation.mutate({ type: 'sync_subscription' })}
+          >
+            继续同步订阅
+          </Button>
+        ) : null}
         {isCragSubscription &&
         environment.auth_method === 'oauth' &&
         !environment.crag_license?.valid ? (
@@ -1245,7 +1275,10 @@ export function GeminiEnvironments({
               operation.mutate({ type: 'bind_seat', id: environment.id })
             }
           >
-            绑定 CRAG 席位
+            {environment.crag_license?.code &&
+            environment.crag_license.code !== 'license_required'
+              ? '重新绑定 CRAG 席位'
+              : '绑定 CRAG 席位'}
           </Button>
         ) : null}
         {isCragSubscription &&
@@ -1264,7 +1297,10 @@ export function GeminiEnvironments({
             释放 CRAG 席位
           </Button>
         ) : null}
-        {!isImport && isCragSubscription && !cragSub?.active ? (
+        {!isImport &&
+        isCragSubscription &&
+        !cragSub?.active &&
+        !cragSub?.sync_pending ? (
           <GeminiRedeemDialog
             mode='crag_subscription'
             onRedeemed={() => {
@@ -1351,6 +1387,19 @@ export function GeminiEnvironments({
         </p>
       ) : null}
       <GeminiStartupStatus inventory={inventory.data} />
+      {isImport && isCragSubscription && cragSub?.sync_pending ? (
+        <div>
+          <Button
+            type='button'
+            size='sm'
+            variant='outline'
+            disabled={busy}
+            onClick={() => operation.mutate({ type: 'sync_subscription' })}
+          >
+            继续同步订阅
+          </Button>
+        </div>
+      ) : null}
       {isImport ? (
         <GeminiRedeemDialog
           mode={isCragSubscription ? 'crag_subscription' : 'legacy_release'}

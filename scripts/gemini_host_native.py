@@ -357,7 +357,9 @@ LICENSE_ERROR_CODES = frozenset(
         "license_not_yet_valid",
         "license_invalid",
         "license_binding_mismatch",
+        "license_payload_key_mismatch",
         "license_unconfigured",
+        "gemini_subscription_sync_pending",
     }
 )
 
@@ -367,7 +369,7 @@ def _map_worker_error(http_status, payload):
     upstream = payload.get("upstream_status") if isinstance(payload, dict) else None
     message = payload.get("error") if isinstance(payload, dict) and isinstance(payload.get("error"), str) else None
     if isinstance(code, str) and code in LICENSE_ERROR_CODES:
-        return NativeFailure(code, 403, message)
+        return NativeFailure(code, 503 if code == "gemini_subscription_sync_pending" else 403, message)
     effective_status = upstream if isinstance(upstream, int) and 400 <= upstream <= 599 else http_status
     if code == "unsupported_turn":
         return NativeFailure("gemini_unsupported_turn", 400, message)
