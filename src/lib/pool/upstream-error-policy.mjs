@@ -72,6 +72,17 @@ const ORGANIZATION_DISABLED_PATTERNS = [
   /organization.*(?:blocked|banned|disabled)/i,
 ]
 
+/**
+ * The org refuses this seat. Shared by the runtime 401/403 classifier and the
+ * official /usage probe pipeline so both park the slot on the same wording —
+ * a probe hit parks without waiting for real traffic to trip the 403.
+ */
+export function isOrganizationDisabledText(text) {
+  const blob = String(text || '')
+  if (!blob) return false
+  return ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(blob))
+}
+
 function bodyMessage(body) {
   if (typeof body === 'string') return body
   return String(body?.error?.message || body?.error?.error || body?.message || body?.error || '')
@@ -531,7 +542,7 @@ function classifyUpstreamResultRaw(
   // another unit instead of returning the 403.
   if (
     (status === 400 || status === 401 || status === 403) &&
-    ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(message))
+    isOrganizationDisabledText(message)
   ) {
     return {
       scope: 'account',

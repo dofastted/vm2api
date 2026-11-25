@@ -28,6 +28,7 @@ import {
   persistVmSubscription,
   isCodexVm,
   migrateVmSchedule,
+  markUnschedulable,
 } from '../vm/vm-registry.mjs'
 import { clearRecoverableVmCooldown, markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import {
@@ -53,6 +54,7 @@ import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { pickScheduleFields } from '../pool/schedule-state.mjs'
 import { socksProxyFamily, normalizeSocksHost } from '../vm/socks-address.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
+import { isOrganizationDisabledText } from '../pool/upstream-error-policy.mjs'
 import { mergeBatchGroupConfig } from '../pool/batch-group.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy, vmQuotaOverrideOf, vmQuotaView } from '../pool/vm-quota-override.mjs'
 import { GATE_OPEN, gatePolicyFields, gateZone, quotaGateOf } from '../pool/quota-gate.mjs'
@@ -1193,6 +1195,14 @@ function applyFableProbeResult(accountQuota, accountId, found) {
   accountQuota.repo.save(saved)
   return found.tier
 }
+/** A 403 org refusal in the official /usage probe: park like the runtime 401/403 path. */
+function organizationDisabledProbe(result = {}) {
+  if (result?.ok === true || result?.usage_scope_missing) return false
+  const status = Number(result?.usage_status || result?.status || 0)
+  if (status !== 403 && status !== 401) return false
+  const text = String(result?.usage_error || result?.error || result?.fable?.error || '')
+  return isOrganizationDisabledText(text)
+}
 function fatalUsageCredentialFailure(result = {}) {
   if (result?.ok === true || result?.usage_scope_missing) return false
   const status = Number(result?.usage_status || result?.status || 0)
@@ -1325,6 +1335,19 @@ export async function buildProbeOne({
           code: result.usage_status === 401 ? 'oauth_revoked' : 'invalid_grant',
           message: result.usage_error || result.error || 'OAuth credential was rejected',
         },
+      })
+    } catch {}
+  }
+  // The probe heard the same org refusal the runtime 401/403 classifier parks
+  // on: park now, without waiting for real traffic to trip the 403 again.
+  // Operator-only re-enable, identical to the runtime path (four-state model).
+  else if (organizationDisabledProbe(result)) {
+    try {
+      markUnschedulable(cfg.paths.project, id, 'organization_disabled', {
+        status: Number(result.usage_status || result.status) || null,
+        message: String(result.usage_error || result.error || '').slice(0, 500),
+        account_id: accountId || null,
+        at: new Date().toISOString(),
       })
     } catch {}
   }
