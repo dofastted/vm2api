@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.4.210 — 2026-11-25 · 载荷全线对齐最新构建（CRAG 3.1.18 与最新 `kin-worker`）；Gemini 核验链接与维护诊断、面板配额观测与 Codex 借槽会话修复
+
+- **CRAG 签名载荷升级至 `3.1.18`**：`deploy/payload.json` 的 `crag_release` 升级至 `payload-2026.11.25-crag-3.1.18`（对应 `dofastted/crag@v3.1.18`），整合 PR `#24`（中断工具续接 30 秒冷却防抖、最多 2 次有界冷恢复与 409 结构化诊断元数据，配套 `vm2api` `#1705`）与 PR `#25`（3.1.17 非流式/合成 SSE `safeguard_results` 透传），沿用既有生产信任锚（`9dbb4bc2…` / `835451e2…`）与官方 Claude Code `2.1.321`；同步更新 `src/lib/admin/kernel-catalog.mjs` 的 `CRAG_PINNED_RELEASES`。
+- **重编并钉选最新 Linux amd64 `kin-worker`**：`deploy/payload.json` 的 `release` 升级至 `payload-2026.11.25-worker-oauth-guard`，`bin/kin-worker` 更新为最新 `worker/` 源码编译产物（包含 `90b8c1210` 代理回退、`fbb7cc8a0` `--attempt-guard` 节点侧刷新防重放日志、`f51d809b0` `guard-probe` 自愈探针与 `730414a57` 凭证去 `email`）；其余槽位/辅助载荷（`cli-node 2.1.321`、`kin-oauth-auth` Chrome 133 TLS、`kin-kernel`、`kin-egress`、`kin-codex-kernel`、`kin-computer`、`kin-slot-gate` 与 `CRAGGemini 0.4.9`）均为最新指向。
+- **Gemini 安全核验链接与维护诊断修复**：保留付费档位账号的安全验证链接而不阻断调度，刷新后对已核验提示性链接做抑制并降级机架告警（#1794）；`scripts/gemini-maintenance.py` 改为按受管 systemd unit 实际配置路径诊断 `kin-egress` 可执行文件（#1795）。
+- **面板配额观测与 Codex 借槽会话稳定化**：在 VM 详情与统计视图中按需展示已保存的官方 Claude 配额观测来源而不改变调度准入（#1792）；Codex 借槽出站会话在同代生命周期内保持稳定（#1787）。
+- 部署说明：本版涉及控制面（`src/`）、前端（`web/src/`）、Gemini 宿主/维护脚本（`scripts/gemini-host.py`、`scripts/gemini_host_account.py`、`scripts/gemini-maintenance.py`）与 `deploy/payload.json` 载荷钉选（`kin-worker` 更新、`CRAG 3.1.17 → 3.1.18`，`CRAGGemini 0.4.9` 与 `cli-node` / `kin-kernel` / `kin-oauth-auth` 字节未变）。`bin/kin-worker` 字节变更，槽位需按维护窗口同步/重启方可使用新版 `guard-probe` 与刷新防重放日志；CRAG `3.1.18` 经面板内核页或 `install.sh` 升级生效；Gemini 宿主机需同步宿主与维护脚本后重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance`。
+
 ## 1.4.209 — 2026-11-25 · CRAGGemini 多 CLI 提示词统一归一化；上游 400/403 纳入单元熔断；托管密钥直从面板限额；空 effort 默认回落与巡检对齐
 
 - **CRAGGemini 多 CLI 提示词统一归一化管线**：新增 `src/lib/gemini/prompt-normalizer.mjs` 作为唯一事实来源，覆盖 15+ 主流编码 CLI（Claude Code、Codex CLI、OpenCode、Gemini CLI、Cursor、Cline、Roo Code、Kilo Code、Windsurf/Cascade、Aider、GitHub Copilot、Continue、Amp、Factory Droid、Hermes、OpenClaw、Oh-My-Pi）经四协议进入 CRAGGemini 通道的提示词清洗与去冲突；跨供应商计费行剥离与语义归一化统一保护 Markdown 代码围栏（`` ``` `` / `~~~`），范围扩展至 `contents` 内嵌系统封装与 `tools[].functionDeclarations[].description`，并在 `official_full` 模式采用成对标签匹配消除 `agy 1.5.9` 宿主标签冲突（不误伤 TypeScript 泛型）；`routes.mjs` 缺省执行归一化并上报脱敏 `hop_meta.prompt_normalization` 遥测，新增 `routing.compatibility.craggemini_prompt_normalization`（`auto` | `strict` | `off`）及 `panel-api.mjs` 校验，直连 Gemini API 密钥通道与普通用户文本保持原样（#1793）。
