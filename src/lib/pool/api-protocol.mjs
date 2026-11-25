@@ -38,6 +38,7 @@ import {
 import { usageFromSseLine } from '../protocol/handle-codex.mjs'
 import { BETA_CONTEXT_1M } from '../protocol/claude-code-betas.mjs'
 import { shouldPassContext1mByPolicy } from '../protocol/model-policy.mjs'
+import { resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import { firstNonEmptyEffort, isEmptyEffortValue, resolveGeminiReasoningEffort } from '../protocol/log-fields.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
@@ -971,7 +972,13 @@ async function runGeminiApiInference({
     }
   }
 
-  let body = buildGeminiRequest({ ...parsed, model: picked.upstream_model }, { target: 'gemini' })
+  const inboundModel = picked.requested_model || inbound?.model || picked.upstream_model
+  const defaultGeminiEffort =
+    resolveGeminiDefaultEffort(picked.upstream_model) ?? resolveGeminiDefaultEffort(inboundModel)
+  let body = buildGeminiRequest(
+    { ...parsed, model: picked.upstream_model },
+    { target: 'gemini', defaultEffort: defaultGeminiEffort },
+  )
   const redactionState = await ensureRedaction(routing || {}, { projectRoot: cfg?.paths?.project })
   const redaction = redactionState.enabled
     ? { principal: redactionPrincipal, session: redactionSession, maxBodyBytes: redactionState.maxBodyBytes }
@@ -1038,13 +1045,13 @@ async function runGeminiApiInference({
     scheduler.reload(store.listRaw())
   }
 
-  const inboundModel = picked.requested_model || inbound?.model || picked.upstream_model
   const reasoningEffort = resolveGeminiReasoningEffort({
     inbound,
     parsed,
     outboundBody: body,
     model: inboundModel,
     upstreamModel: picked.upstream_model,
+    defaultEffort: defaultGeminiEffort,
   })
   const resultBase = {
     ok: status >= 200 && status < 300,

@@ -90,6 +90,12 @@ import {
   saveGptModelPolicy,
   resetGptModelPolicy,
 } from '../protocol/gpt-model-policy.mjs'
+import {
+  getGeminiModelPolicy,
+  listGeminiPolicyModels,
+  saveGeminiModelPolicy,
+  resetGeminiModelPolicy,
+} from '../protocol/gemini-model-policy.mjs'
 import { refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 import {
   defaultSeedPolicy,
@@ -100,7 +106,7 @@ import {
 
 import { runVmTestChat, resolveTestModels, syncCodexCatalog } from './vm-test-chat.mjs'
 import { VmTestScheduleError } from './vm-test-schedule.mjs'
-import { readCatalogSync, syncClaudeCatalog, syncGptCatalog } from './catalog-monitor.mjs'
+import { readCatalogSync, syncClaudeCatalog, syncGptCatalog, syncGeminiCatalog } from './catalog-monitor.mjs'
 import { setPriceOverride, listPriceOverrides, syncModelsDev } from './price-catalog.mjs'
 import { buildPricing } from './pricing-view.mjs'
 import { publicKeyView } from './api-keys.mjs'
@@ -126,7 +132,7 @@ import { publicUserView } from './panel-users.mjs'
 import { authorizePanelRoute, mePayload, panelIdentity } from './panel-acl.mjs'
 import { INTEGRATION_DELEGATED, handleIntegrationAdminRoute } from './integration-routes.mjs'
 import { IntegrationTokenStore } from './integration-tokens.mjs'
-import { createGeminiPanelHandler, isGeminiPanelPath } from '../gemini/routes.mjs'
+import { callGeminiHost, createGeminiPanelHandler, geminiProxyFor, isGeminiPanelPath } from '../gemini/routes.mjs'
 import {
   denyIfUserCannotDeleteVm,
   denyIfUserMissesKey,
@@ -7013,6 +7019,20 @@ export function createPanelHandler(ctx) {
             }),
           )
         }
+        if (platform === 'google' || platform === 'gemini') {
+          const pol = getGeminiModelPolicy()
+          const models = listGeminiPolicyModels()
+          return json(
+            res,
+            200,
+            panel.ok({
+              policy: pol,
+              models,
+              effective: models,
+              platform: 'google',
+            }),
+          )
+        }
         const pol = getModelPolicy()
         return json(
           res,
@@ -7040,6 +7060,20 @@ export function createPanelHandler(ctx) {
               effective: models,
               image_tools: listImageToolModels(),
               platform: 'openai',
+            }),
+          )
+        }
+        if (platform === 'google' || platform === 'gemini') {
+          const saved = saveGeminiModelPolicy(body.policy || body)
+          const models = listGeminiPolicyModels()
+          return json(
+            res,
+            200,
+            panel.ok({
+              policy: saved,
+              models,
+              effective: models,
+              platform: 'google',
             }),
           )
         }
@@ -7073,6 +7107,20 @@ export function createPanelHandler(ctx) {
               effective: models,
               image_tools: listImageToolModels(),
               platform: 'openai',
+            }),
+          )
+        }
+        if (platform === 'google' || platform === 'gemini') {
+          const saved = resetGeminiModelPolicy()
+          const models = listGeminiPolicyModels()
+          return json(
+            res,
+            200,
+            panel.ok({
+              policy: saved,
+              models,
+              effective: models,
+              platform: 'google',
             }),
           )
         }
@@ -7193,6 +7241,41 @@ export function createPanelHandler(ctx) {
             catalog_version: result.catalog_version,
             ids: result.ids,
             added: result.added || [],
+            catalog_sync: readCatalogSync(),
+          }),
+        )
+      }
+      // POST /api/panel/model-policy/sync-gemini — latest Google Gemini models from slots, Gemini API endpoints & models.dev
+      if (req.method === 'POST' && p === '/api/panel/model-policy/sync-gemini') {
+        const result = await syncGeminiCatalog({
+          callGeminiHost,
+          resolveGeminiProxy: (proxyId, envId) => {
+            const ownerUserId = ctx.geminiOwnersRepo?.getOwner?.(envId) ?? null
+            return geminiProxyFor(ctx.proxyPool, proxyId, { ownerUserId })
+          },
+          apiEndpointStore: ctx.apiEndpointStore,
+          cfg,
+          refreshModelsDev: true,
+        })
+        if (!result.ok) {
+          return json(res, result.error === 'no_google_models' ? 400 : 502, {
+            ok: false,
+            error: { code: result.error, message: result.error },
+            data: { synced: 0, catalog_sync: readCatalogSync() },
+          })
+        }
+        const models = listGeminiPolicyModels()
+        return json(
+          res,
+          200,
+          panel.ok({
+            policy: getGeminiModelPolicy(),
+            models,
+            effective: models,
+            platform: 'google',
+            synced: result.synced,
+            added: result.added || [],
+            sources: result.sources || [],
             catalog_sync: readCatalogSync(),
           }),
         )

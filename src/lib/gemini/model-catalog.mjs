@@ -14,6 +14,7 @@ export const ANTIGRAVITY_PROVIDERS = new Set(['google', 'anthropic', 'openai'])
 export const ANTIGRAVITY_QUOTA_GROUPS = new Set(['gemini', 'gemini-argon-wtu', '3p'])
 
 const MODEL_SLUG_RE = /^[a-z0-9][a-z0-9._-]{0,99}$/
+const EFFORT_SUFFIX_RE = /-(?:minimal|low|medium|high|xhigh|max)$/i
 
 function normalizeProvider(value) {
   if (typeof value !== 'string') return null
@@ -61,15 +62,9 @@ export function classifyAntigravityModel(rawId, providerHint = null, quotaGroupH
   const id = String(rawId || '').trim()
   const base = stripAntigravityPrefix(id)
   const provider = normalizeProvider(providerHint) || inferProviderFromSlug(base)
-  const quota_group = ANTIGRAVITY_QUOTA_GROUPS.has(quotaGroupHint)
-    ? quotaGroupHint
-    : quotaGroupForModel(base, provider)
+  const quota_group = ANTIGRAVITY_QUOTA_GROUPS.has(quotaGroupHint) ? quotaGroupHint : quotaGroupForModel(base, provider)
   const public_id =
-    provider === 'google'
-      ? id
-      : id.toLowerCase().startsWith(ANTIGRAVITY_PREFIX)
-        ? id
-        : `${ANTIGRAVITY_PREFIX}${id}`
+    provider === 'google' ? id : id.toLowerCase().startsWith(ANTIGRAVITY_PREFIX) ? id : `${ANTIGRAVITY_PREFIX}${id}`
   return {
     id,
     public_id,
@@ -111,7 +106,7 @@ export function indexAccountModelCatalog(account) {
 export function resolveUpstreamModel(
   requestedId,
   availableRawModels,
-  { allowUnprefixedNonGemini = false, catalogIndex = null } = {},
+  { allowUnprefixedNonGemini = false, catalogIndex = null, requestedEffort = null, defaultEffort = null } = {},
 ) {
   if (typeof requestedId !== 'string' || !requestedId.trim()) return null
   const wanted = requestedId.trim()
@@ -128,16 +123,41 @@ export function resolveUpstreamModel(
     publicByLower.set(classified.public_id.toLowerCase(), classified)
   }
 
+  const formatHit = (hit, publicIdOverride = null) => ({
+    publicId: publicIdOverride || hit.public_id,
+    upstreamModel: hit.id,
+    provider: hit.provider,
+    owned_by: hit.owned_by,
+    quotaGroup: hit.quota_group,
+  })
+
+  const bareGeminiWithoutEffort = wantedLower.startsWith('gemini-') && !EFFORT_SUFFIX_RE.test(wantedLower)
+  const cleanEffort = (value) => {
+    const e = String(value || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^thinking_level_/, '')
+    return e && e !== 'off' && e !== 'none' ? e : ''
+  }
+
+  // 0. Explicit effort on an unsuffixed Gemini model selects `${model}-${effort}` when available.
+  const explicitEff = bareGeminiWithoutEffort ? cleanEffort(requestedEffort) : ''
+  if (explicitEff) {
+    const effortHit = publicByLower.get(`${wantedLower}-${explicitEff}`)
+    if (effortHit) return formatHit(effortHit)
+  }
+
   // 1. Canonical match against public ID (`gemini-*` or `ag-*`).
   const publicHit = publicByLower.get(wantedLower)
   if (publicHit) {
-    return {
-      publicId: publicHit.public_id,
-      upstreamModel: publicHit.id,
-      provider: publicHit.provider,
-      owned_by: publicHit.owned_by,
-      quotaGroup: publicHit.quota_group,
-    }
+    return formatHit(publicHit)
+  }
+
+  // 1b. Default effort fallback for unsuffixed Gemini models when slot exposes tiered variants (e.g. `-medium`).
+  const defaultEff = bareGeminiWithoutEffort ? cleanEffort(defaultEffort) : ''
+  if (defaultEff) {
+    const defaultHit = publicByLower.get(`${wantedLower}-${defaultEff}`)
+    if (defaultHit) return formatHit(defaultHit)
   }
 
   // 2. Explicit `ag-` prefix stripped to match raw upstream slug (e.g. if caller sent `ag-gemini-*` or non-catalog model).
@@ -145,13 +165,7 @@ export function resolveUpstreamModel(
     const stripped = wantedLower.slice(ANTIGRAVITY_PREFIX.length)
     const rawHit = rawByLower.get(stripped)
     if (rawHit) {
-      return {
-        publicId: rawHit.public_id,
-        upstreamModel: rawHit.id,
-        provider: rawHit.provider,
-        owned_by: rawHit.owned_by,
-        quotaGroup: rawHit.quota_group,
-      }
+      return formatHit(rawHit)
     }
   }
 
@@ -159,13 +173,7 @@ export function resolveUpstreamModel(
   if (allowUnprefixedNonGemini) {
     const rawHit = rawByLower.get(wantedLower)
     if (rawHit) {
-      return {
-        publicId: wanted,
-        upstreamModel: rawHit.id,
-        provider: rawHit.provider,
-        owned_by: rawHit.owned_by,
-        quotaGroup: rawHit.quota_group,
-      }
+      return formatHit(rawHit, wanted)
     }
   }
 
