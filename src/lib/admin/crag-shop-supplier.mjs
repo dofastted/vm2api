@@ -7,6 +7,7 @@ const MAX_RESPONSE = 64 * 1024
 // Catalog descriptions can use the full published 128-plan limit with UTF-8 copy.
 const MAX_PLANS_RESPONSE = 384 * 1024
 const SHOP_TIMEOUT = 8000
+const PLANS_TIMEOUT = 15000
 const PILOT_TOKEN_LENGTH = 43 // Unpadded base64url for 32 bytes.
 
 export const isPaymentMethod = (value) => value === 'wxpay' || value === 'alipay'
@@ -315,9 +316,109 @@ async function readPilotToken(file) {
   }
 }
 
+function parsePlans(value) {
+  if (
+    !object(value) ||
+    !Array.isArray(value.plans) ||
+    !Array.isArray(value.payment_methods) ||
+    !value.payment_methods.every(isPaymentMethod)
+  )
+    throw invalidReply()
+  const plans = value.plans.map((item) => {
+    const plan = publicPlan(item)
+    for (const key of ['name', 'description']) {
+      if (item[key] === undefined) continue
+      if (typeof item[key] !== 'string') throw invalidReply()
+      plan[key] = item[key]
+    }
+    if (item.enabled !== undefined) {
+      if (typeof item.enabled !== 'boolean') throw invalidReply()
+      plan.enabled = item.enabled
+    }
+    if (item.stock !== undefined) {
+      if (!Number.isSafeInteger(item.stock) || item.stock < 0) throw invalidReply()
+      plan.stock = item.stock
+    }
+    if (item.months !== undefined) {
+      if (!isQuantity(item.months)) throw invalidReply()
+      plan.months = item.months
+    }
+    return plan
+  })
+  if (new Set(plans.map(({ sku }) => sku)).size !== plans.length) throw invalidReply()
+  const result = { plans, payment_methods: [...new Set(value.payment_methods)] }
+  if (value.commerce !== undefined) {
+    const commerce = value.commerce
+    if (
+      !object(commerce) ||
+      !isAmount(commerce.unit_amount_minor) ||
+      !isAmount(commerce.max_amount_minor) ||
+      commerce.unit_amount_minor > commerce.max_amount_minor ||
+      !isQuantity(commerce.max_months) ||
+      !isQuantity(commerce.max_slots) ||
+      !isQuantity(commerce.min_months ?? 1) ||
+      !isQuantity(commerce.min_slots ?? 1) ||
+      commerce.min_months === null ||
+      commerce.min_slots === null ||
+      (commerce.min_months ?? 1) > commerce.max_months ||
+      (commerce.min_slots ?? 1) > commerce.max_slots ||
+      (commerce.custom_enabled !== undefined && typeof commerce.custom_enabled !== 'boolean') ||
+      (commerce.custom_renewable !== undefined && typeof commerce.custom_renewable !== 'boolean')
+    )
+      throw invalidReply()
+    result.commerce = Object.fromEntries(
+      [
+        'unit_amount_minor',
+        'max_amount_minor',
+        'min_months',
+        'max_months',
+        'min_slots',
+        'max_slots',
+        'custom_enabled',
+        'custom_renewable',
+      ]
+        .filter((key) => commerce[key] !== undefined)
+        .map((key) => [key, commerce[key]]),
+    )
+  }
+  if (value.revision !== undefined) {
+    if (!Number.isSafeInteger(value.revision) || value.revision < 0) throw invalidReply()
+    result.revision = value.revision
+  }
+  if (value.presentation !== undefined) {
+    if (!object(value.presentation)) throw invalidReply()
+    result.presentation = {}
+    for (const key of [
+      'title',
+      'description',
+      'plans_title',
+      'orders_title',
+      'custom_title',
+      'unavailable_text',
+      'empty_plans_text',
+      'empty_orders_text',
+    ]) {
+      if (value.presentation[key] === undefined) continue
+      if (typeof value.presentation[key] !== 'string') throw invalidReply()
+      result.presentation[key] = value.presentation[key]
+    }
+    if (object(value.presentation.layout)) result.presentation.layout = publicLayout(value.presentation.layout)
+  }
+  return result
+}
+
 export function createShopSupplier(fetchImpl = globalThis.fetch) {
-  async function send(operation, path, { method = 'GET', receipt, body, allowPilot = true } = {}) {
-    const headers = { accept: 'application/json', 'cache-control': 'no-store' }
+  async function send(
+    operation,
+    path,
+    { method = 'GET', receipt, body, allowPilot = true, ifNoneMatch = null, returnMeta = false } = {},
+  ) {
+    const conditional = operation === 'plans' && typeof ifNoneMatch === 'string' && ifNoneMatch.length > 0
+    const headers = {
+      accept: 'application/json',
+      'cache-control': conditional ? 'no-cache' : 'no-store',
+    }
+    if (conditional) headers['if-none-match'] = ifNoneMatch
     if (receipt) headers.authorization = `Bearer ${receipt}`
     if (body) headers['content-type'] = 'application/json'
     let response
@@ -346,8 +447,11 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
         body: body && JSON.stringify(body),
         redirect: 'error',
         cache: 'no-store',
-        signal: AbortSignal.timeout(SHOP_TIMEOUT),
+        signal: AbortSignal.timeout(operation === 'plans' ? PLANS_TIMEOUT : SHOP_TIMEOUT),
       })
+      if (conditional && response.status === 304) {
+        return { notModified: true, etag: response.headers.get('etag') || ifNoneMatch }
+      }
       if (!response.ok) {
         if (['create', 'quote'].includes(operation) && [400, 409].includes(response.status)) {
           const reply = await readReply(response).catch(() => null)
@@ -360,6 +464,9 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
       // Never surface an accidentally reflected pilot token in buyer data or payment forms.
       for (const secret of [pilotToken, body?.renewal_proof]) {
         if (secret && JSON.stringify(value).includes(JSON.stringify(secret).slice(1, -1))) throw invalidReply()
+      }
+      if (returnMeta) {
+        return { notModified: false, value, etag: response.headers.get('etag') || null }
       }
       return value
     } catch (err) {
@@ -397,95 +504,12 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
 
   return {
     async plans({ allowPilot = false } = {}) {
-      const value = await send('plans', '/shop/plans', { allowPilot })
-      if (
-        !object(value) ||
-        !Array.isArray(value.plans) ||
-        !Array.isArray(value.payment_methods) ||
-        !value.payment_methods.every(isPaymentMethod)
-      )
-        throw invalidReply()
-      const plans = value.plans.map((value) => {
-        const plan = publicPlan(value)
-        for (const key of ['name', 'description']) {
-          if (value[key] === undefined) continue
-          if (typeof value[key] !== 'string') throw invalidReply()
-          plan[key] = value[key]
-        }
-        if (value.enabled !== undefined) {
-          if (typeof value.enabled !== 'boolean') throw invalidReply()
-          plan.enabled = value.enabled
-        }
-        if (value.stock !== undefined) {
-          if (!Number.isSafeInteger(value.stock) || value.stock < 0) throw invalidReply()
-          plan.stock = value.stock
-        }
-        if (value.months !== undefined) {
-          if (!isQuantity(value.months)) throw invalidReply()
-          plan.months = value.months
-        }
-        return plan
-      })
-      if (new Set(plans.map(({ sku }) => sku)).size !== plans.length) throw invalidReply()
-      const result = { plans, payment_methods: [...new Set(value.payment_methods)] }
-      if (value.commerce !== undefined) {
-        const commerce = value.commerce
-        if (
-          !object(commerce) ||
-          !isAmount(commerce.unit_amount_minor) ||
-          !isAmount(commerce.max_amount_minor) ||
-          commerce.unit_amount_minor > commerce.max_amount_minor ||
-          !isQuantity(commerce.max_months) ||
-          !isQuantity(commerce.max_slots) ||
-          !isQuantity(commerce.min_months ?? 1) ||
-          !isQuantity(commerce.min_slots ?? 1) ||
-          commerce.min_months === null ||
-          commerce.min_slots === null ||
-          (commerce.min_months ?? 1) > commerce.max_months ||
-          (commerce.min_slots ?? 1) > commerce.max_slots ||
-          (commerce.custom_enabled !== undefined && typeof commerce.custom_enabled !== 'boolean') ||
-          (commerce.custom_renewable !== undefined && typeof commerce.custom_renewable !== 'boolean')
-        )
-          throw invalidReply()
-        result.commerce = Object.fromEntries(
-          [
-            'unit_amount_minor',
-            'max_amount_minor',
-            'min_months',
-            'max_months',
-            'min_slots',
-            'max_slots',
-            'custom_enabled',
-            'custom_renewable',
-          ]
-            .filter((key) => commerce[key] !== undefined)
-            .map((key) => [key, commerce[key]]),
-        )
-      }
-      if (value.revision !== undefined) {
-        if (!Number.isSafeInteger(value.revision) || value.revision < 0) throw invalidReply()
-        result.revision = value.revision
-      }
-      if (value.presentation !== undefined) {
-        if (!object(value.presentation)) throw invalidReply()
-        result.presentation = {}
-        for (const key of [
-          'title',
-          'description',
-          'plans_title',
-          'orders_title',
-          'custom_title',
-          'unavailable_text',
-          'empty_plans_text',
-          'empty_orders_text',
-        ]) {
-          if (value.presentation[key] === undefined) continue
-          if (typeof value.presentation[key] !== 'string') throw invalidReply()
-          result.presentation[key] = value.presentation[key]
-        }
-        if (object(value.presentation.layout)) result.presentation.layout = publicLayout(value.presentation.layout)
-      }
-      return result
+      return parsePlans(await send('plans', '/shop/plans', { allowPilot }))
+    },
+    async fetchPlans({ allowPilot = false, ifNoneMatch = null } = {}) {
+      const reply = await send('plans', '/shop/plans', { allowPilot, ifNoneMatch, returnMeta: true })
+      if (reply.notModified) return { status: 'not_modified', etag: reply.etag }
+      return { status: 'ok', catalog: parsePlans(reply.value), etag: reply.etag }
     },
     async quote(input, renewalProof, { allowPilot = true } = {}) {
       const value = await send('quote', '/shop/quote', {
