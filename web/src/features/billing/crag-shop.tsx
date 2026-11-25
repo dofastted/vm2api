@@ -369,6 +369,53 @@ function HostSummary({
   )
 }
 
+const CRAGR1_VOUCHER_RE = /^CRAGR1\.[A-Za-z0-9_-]{43}$/
+
+type GeminiSubscriptionRedeemResult = {
+  active: boolean
+  slot_limit: number | 'unlimited'
+  available_slots?: number | null
+  quota_grants?: Array<{ expires_at: number; slot_limit?: number | null }>
+}
+
+const GEMINI_FALLBACK_DISPLAYABLE_ERRORS = new Set([
+  'host_redeem_conflict',
+  'issuer_mismatch',
+  'payload_key_unknown',
+  'payload_key_conflict',
+  'auth_forbidden',
+  'slot_limit_reached',
+  'renewal_unavailable',
+  'host_transfer_cooldown',
+  'request_conflict',
+  'gemini_subscription_busy',
+  'gemini_subscription_invalid_entitlement',
+])
+
+function isGeminiSubscriptionRedeemResult(
+  value: unknown
+): value is GeminiSubscriptionRedeemResult {
+  return (
+    Boolean(value) &&
+    typeof value === 'object' &&
+    typeof (value as { active?: unknown }).active === 'boolean' &&
+    ((value as { slot_limit?: unknown }).slot_limit === 'unlimited' ||
+      typeof (value as { slot_limit?: unknown }).slot_limit === 'number')
+  )
+}
+
+function formatGeminiRedeemSuccess(result: GeminiSubscriptionRedeemResult) {
+  const limitLabel =
+    result.slot_limit === 'unlimited' ? '不限' : String(result.slot_limit)
+  const availableLabel =
+    result.available_slots != null ? String(result.available_slots) : '—'
+  const stackedSuffix =
+    result.quota_grants && result.quota_grants.length > 1
+      ? `，当前已叠加 ${result.quota_grants.length} 张有效兑换码`
+      : ''
+  return `已自动识别为 CRAGGemini 兑换码：宿主订阅已激活（席位额度 ${limitLabel}，可用席位 ${availableLabel}${stackedSuffix}），不占用 Claude CRAG 槽位。请为需要的 Google OAuth 环境绑定席位。`
+}
+
 function HostOverview({
   host,
   onUpdated,
@@ -437,6 +484,7 @@ function HostOverview({
     setAction(operation)
     setNotice(undefined)
     const { queryKey } = cragHostStatusQueryOptions()
+    let handledByGemini = false
     try {
       const next = await api<CragHostStatus>(`${hostRoot}/${operation}`, {
         method: 'POST',
@@ -468,14 +516,56 @@ function HostOverview({
         })
       }
     } catch (error) {
-      setPackageChanged(
+      const canFallbackToGemini =
+        operation === 'redeem' &&
+        CRAGR1_VOUCHER_RE.test(redemptionCode) &&
         isApiError(error) &&
-          error.code === 'crag_subscription_host_package_changed'
-      )
-      setConfirmRecovery(false)
-      setNotice({ text: hostRedemptionError(error), error: true })
+        (error.code === 'redeem_unavailable' ||
+          error.code === 'crag_subscription_host_package_unready')
+      if (canFallbackToGemini) {
+        try {
+          const geminiResult = await api<GeminiSubscriptionRedeemResult>(
+            '/api/panel/gemini/crag-subscription/redeem',
+            {
+              method: 'POST',
+              body: JSON.stringify({ redemption_code: redemptionCode }),
+            }
+          )
+          if (isGeminiSubscriptionRedeemResult(geminiResult)) {
+            handledByGemini = true
+            setPackageChanged(false)
+            setConfirmRecovery(false)
+            setCode('')
+            setNotice({ text: formatGeminiRedeemSuccess(geminiResult) })
+            await qc.invalidateQueries({
+              queryKey: geminiInventoryOptions().queryKey,
+            })
+          }
+        } catch (geminiError) {
+          if (
+            isApiError(geminiError) &&
+            geminiError.code &&
+            GEMINI_FALLBACK_DISPLAYABLE_ERRORS.has(geminiError.code)
+          ) {
+            handledByGemini = true
+            setPackageChanged(false)
+            setConfirmRecovery(false)
+            setNotice({ text: geminiError.message, error: true })
+          }
+        }
+      }
+      if (!handledByGemini) {
+        setPackageChanged(
+          isApiError(error) &&
+            error.code === 'crag_subscription_host_package_changed'
+        )
+        setConfirmRecovery(false)
+        setNotice({ text: hostRedemptionError(error), error: true })
+      }
     } finally {
-      await qc.invalidateQueries({ queryKey })
+      if (!handledByGemini) {
+        await qc.invalidateQueries({ queryKey })
+      }
       operating.current = false
       setAction(undefined)
     }
@@ -690,9 +780,9 @@ function HostOverview({
             className='text-sm text-muted-foreground'
           >
             每张码从兑换时独立计时，未到期额度相加；不绑定、不启动 VM。 Claude
-            订阅码增加本机槽位；CRAGGemini 订阅码（CRAGR1.…）请点击右上角「兑换
-            CRAGGemini」兑换，旧版 CGG1- 码也可直接在此兑换，不占用 Claude
-            槽位。
+            订阅码增加本机槽位；CRAGGemini 兑换码（CRAGR1.… 或旧版
+            CGG1-）也可直接在此自动识别兑换（或点右上角「兑换
+            CRAGGemini」），不占用 Claude 槽位。
           </p>
           <Button type='submit' size='sm' disabled={!code.trim() || !!action}>
             {action === 'redeem' ? '正在兑换…' : '兑换到本机'}
@@ -703,7 +793,8 @@ function HostOverview({
             </strong>
             1 个月 / 10 槽兑换码（¥100，¥10/槽，支持多码叠加）；首批测试支持 7
             天 / 10 槽测试兑换码（单码可用 100 次，不同宿主机各 1
-            次、同机幂等）。请点右上角「兑换 CRAGGemini」完成兑换。
+            次、同机幂等）。可直接在此输入兑换，或点右上角「兑换
+            CRAGGemini」完成兑换。
           </div>
         </form>
       ) : null}
