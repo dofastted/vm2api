@@ -369,13 +369,9 @@ function QuotaCell({
             backgroundColor: RISK_SOLID[riskLevel(w.pct)],
           }}
         />
-        {t.elapsedPct != null ? (
-          <b
-            aria-hidden
-            className='absolute -top-[3px] -bottom-[3px] w-0.5 rounded-[1px] bg-foreground'
-            style={{ left: `calc(${t.elapsedPct}% - 1px)` }}
-          />
-        ) : null}
+        {/* 时间进度只放 title 提示，不在轨道上画刻线——
+            进度条内任何竖线（无论形态/透明度）都会被读成「用量游标」，
+            降透明刻线两轮实测仍稳定被误读。 */}
       </span>
     </div>
   )
