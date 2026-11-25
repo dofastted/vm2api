@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.4.208 — 2026-11-25 · 修复 Claude Code 系统提示词中双用途安全工具括注触发 Google 上游 429 误判
+
+- **修复 CRAGGemini 出站 `systemInstruction` 另一处 Claude Code 指纹触发 429**：对失败的真实 `claude-cli` 43KB 系统提示词逐段与逐句二分实测确认，除 `You are Claude Code` 横幅外，Google Antigravity 上游还会对 Claude Code 内置安全提示中的固定句式 `Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context` 直接返回 `429 RESOURCE_EXHAUSTED`（其余 80 个系统段落、37KB 对话内容与全部工具声明均返回 `200 OK`）。`src/lib/gemini/system-prompt.mjs` 在 `sanitizeCragGeminiSystemText()` 中将该括注归一化为 `Dual-use security tools require clear authorization context`，完整保留安全约束语义并消除 `claude-cli` 误触 429。
+- 部署说明：本次改动仅涉及控制面 `src/lib/gemini/system-prompt.mjs` 与单测；前端、`scripts/gemini-host.py`、CRAG/CRAGGemini 载荷钉选、数据库结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启 `vm2api-gemini` 或既有 Claude/Codex 槽位。
+
 ## 1.4.207 — 2026-11-25 · 修复 CRAGGemini 入站第三方 CLI 系统身份横幅触发 Google 上游 429 误判
 
 - **修复 CRAGGemini 出站 `systemInstruction` 第三方 CLI 身份横幅触发 429**：实测确认 Google Antigravity 上游对 `systemInstruction` 中大小写不敏感的 `You are Claude Code` / `You are OpenCode` 直接返回 `429 RESOURCE_EXHAUSTED`（即使账号配额 95–100% 且切号重试全部账号均失败）。`src/lib/gemini/system-prompt.mjs` 在 `applyCragGeminiPromptPolicy()` 中对 CRAGGemini 出站 `systemInstruction` 自动将冲突的第三方 CLI 身份声明归一化为 `You are a coding assistant`，保留其余全部指令不变，消除 `claude-cli` / OpenCode 请求误触 429。
