@@ -414,6 +414,9 @@ test('only explicit platform SOCKS5 environments are created and credentials sta
   assert.deepEqual(result.body.data, {
     ...record,
     auth_method: 'oauth',
+    schedulable: true,
+    schedule_level: 5,
+    schedule_level_mode: 'auto',
     kernel_version: null,
     account: null,
     created_at: null,
