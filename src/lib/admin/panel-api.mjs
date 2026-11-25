@@ -1748,6 +1748,29 @@ function activeFableCreditsRequired(unified, now = Date.now()) {
   return { model: mark.model || null, at: mark.at || null, until: mark.until }
 }
 
+// Display-only snapshots. Do not promote legacy aliases or aggregate update times
+// to fresh per-window observations, and do not feed this projection into admission.
+function quotaObservations(u) {
+  const window = (w) => {
+    if (!w || typeof w !== 'object') return null
+    const value = w.utilization == null || w.utilization === '' ? null : Number(w.utilization)
+    return {
+      utilization: value != null && Number.isFinite(value) ? value : null,
+      status: typeof w.status === 'string' ? w.status : null,
+      reset: w.reset || w.resets_at || null,
+      sampled_at: w.sampled_at || null,
+      stale: w.stale === true,
+    }
+  }
+  return {
+    official: u.official
+      ? { updated_at: u.official.updated_at || null, '5h': window(u.official['5h']), '7d': window(u.official['7d']) }
+      : null,
+    // This store can also contain copies from official usage; it is not raw headers.
+    passive: { '5h': window(u.headers?.['5h']), '7d': window(u.headers?.['7d']) },
+  }
+}
+
 export function quotaFromAccount(acc, quotaConfig) {
   const u = acc?.unified || {}
   const listed = listQuotaFromHeaders(u)
@@ -1779,6 +1802,7 @@ export function quotaFromAccount(acc, quotaConfig) {
   const effectiveStatus5 = o5Limited ? 'rejected' : listed.status_5h || o5.status || null
   const effectiveStatus7 = o7Limited ? 'rejected' : listed.status_7d || o7.status || null
   const q = {
+    quota_observations: quotaObservations(u),
     utilization_5h: effectiveU5,
     utilization_7d: effectiveU7,
     utilization_7d_sonnet: sonnet.utilization != null ? Number(sonnet.utilization) : null,
@@ -2220,6 +2244,8 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     // Window state on its own: availability may carry a stronger reason (cool, quota).
     active_hours_active: activeHours ? activeHoursState.active : null,
     claude_code_version: v.claude_code_version,
+    quota_observations:
+      isCodex || acc?.account_id !== (v.account_uuid || v.claude?.account_uuid || v.id) ? null : q.quota_observations,
     utilization_5h: u5,
     utilization_7d: u7,
     utilization_7d_sonnet: isCodex ? null : q.utilization_7d_sonnet,

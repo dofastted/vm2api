@@ -92,6 +92,71 @@ function WindowRow({
   )
 }
 
+function observationPercent(value: number | null | undefined) {
+  return value == null || !Number.isFinite(value)
+    ? '未知'
+    : `${(value * 100).toFixed(0)}%`
+}
+
+/** Saved observations only; rendering never refreshes or changes admission. */
+export function ClaudeQuotaObservations({ vm, now }: { vm: Vm; now: number }) {
+  const observations = vm.quota_observations
+  const official = observations?.official
+  if (isCodexVm(vm) || !official) return null
+  const windows = ['5h', '7d'] as const
+  const different = windows.some((key) => {
+    const measured = official[key]?.utilization
+    const displayed = key === '5h' ? vm.utilization_5h : vm.utilization_7d
+    return measured != null && displayed != null && measured !== displayed
+  })
+  return (
+    <details
+      className='min-w-0 text-[11px] text-muted-foreground'
+      data-row-actions
+      onClick={(event) => event.stopPropagation()}
+      onKeyDown={(event) => event.stopPropagation()}
+    >
+      <summary className='cursor-pointer'>
+        官方查询记录：5H {observationPercent(official['5h']?.utilization)} · 7D{' '}
+        {observationPercent(official['7d']?.utilization)}
+        {different ? ' · 与当前展示不同' : ''}
+      </summary>
+      <div className='mt-1 grid gap-1 break-words'>
+        <p>
+          官方记录更新时间：{official.updated_at || '未知'}
+          。整体更新时间不代表每个窗口都已重新采样。
+        </p>
+        {windows.map((key) => (
+          <div key={key}>
+            {key.toUpperCase()}
+            {(
+              [
+                ['官方查询', official[key]],
+                ['保守合并记录', observations.passive[key]],
+              ] as const
+            ).map(([label, sample]) => {
+              const reset = expiresAtToMs(sample?.reset)
+              const stale =
+                sample?.stale || (reset != null && reset > 0 && reset <= now)
+              return (
+                <p key={label}>
+                  {label}：{observationPercent(sample?.utilization)}
+                  {stale ? '（陈旧）' : ''}；状态 {sample?.status || '未知'}
+                  ；重置 {sample?.reset || '未知'}；
+                  {sample?.sampled_at || '窗口采样时间未知'}
+                </p>
+              )
+            })}
+          </div>
+        ))}
+        <p>
+          当前额度保留原有保守合并规则；来源读数可能不同，不能仅凭更新时间覆盖。保守记录含响应头及官方同步值，不等于原始响应头。查询失败不会清零，历史记录不代表实时可用额度。
+        </p>
+      </div>
+    </details>
+  )
+}
+
 /** GPT 槽：刷新额度和积分 / 使用重置券；Claude 完整 OAuth：原生限额查询 / 重置。 */
 export function VmQuotaActions({ vm, now }: { vm: Vm; now: number }) {
   return isCodexVm(vm) ? (
@@ -134,6 +199,7 @@ export function VmUsageWindows({
           quiet={quiet}
         />
       ))}
+      <ClaudeQuotaObservations vm={vm} now={now} />
       {quotaActions ? <VmQuotaActions vm={vm} now={now} /> : null}
     </div>
   )
