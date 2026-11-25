@@ -222,6 +222,63 @@ class InstallPgWrapperRoutingTests(unittest.TestCase):
                 self.run_wrapper(d, ["--check-deps"]),
                 ["db-migrate", "--dir", str(d), "--check-deps"],
             )
+            self.assertEqual(
+                self.run_wrapper(d, ["--preflight"]),
+                ["db-migrate", "--dir", str(d), "--preflight"],
+            )
+
+    def test_routes_systemd_host_with_leftover_docker_compose_to_db_migrate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "app"
+            fake_bin = Path(tmp) / "bin"
+            wrapper_dir = Path(tmp) / "wrapper"
+            (d / "data").mkdir(parents=True)
+            (d / "data" / "kin.db").write_text("sqlite", encoding="utf-8")
+            # Leftover docker-compose.yml co-existing on a live systemd/overlay host
+            (d / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+            fake_bin.mkdir()
+            wrapper_dir.mkdir()
+
+            make_exe(
+                fake_bin / "systemctl",
+                "#!/usr/bin/env bash\nif [ \"$1\" = \"is-active\" ] || [ \"$1\" = \"is-enabled\" ]; then exit 0; fi\nexit 0\n",
+            )
+            make_exe(
+                fake_bin / "docker",
+                "#!/usr/bin/env bash\n# Only slot containers running, no vm2api control container\necho 'kin-01'\n",
+            )
+            shutil.copy2(INSTALL_PG, wrapper_dir / "install-pg.sh")
+            out_file = wrapper_dir / "invoked.txt"
+            make_exe(
+                wrapper_dir / "install.sh",
+                f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "{out_file}"\n',
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["VM2API_SYSTEMD_DROPIN_DIR"] = str(Path(tmp) / "dropin")
+
+            # Unmigrated SQLite on systemd + leftover docker-compose.yml -> MUST route to db-migrate (not Docker upgrade!)
+            res = subprocess.run(
+                ["bash", str(wrapper_dir / "install-pg.sh"), "--dir", str(d), "--yes"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(out_file.read_text(encoding="utf-8").splitlines(), ["db-migrate", "--dir", str(d), "--yes"])
+
+            # Once migrated via .env.postgres -> routes to db-status (never Docker upgrade!)
+            (d / ".env.postgres").write_text("VM2API_DB_DRIVER=postgres\n", encoding="utf-8")
+            res2 = subprocess.run(
+                ["bash", str(wrapper_dir / "install-pg.sh"), "--dir", str(d)],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(res2.returncode, 0, res2.stderr)
+            self.assertEqual(out_file.read_text(encoding="utf-8").splitlines(), ["db-status", "--dir", str(d)])
 
 
 class ReplaceDbToPgPreflightTests(unittest.TestCase):
@@ -264,7 +321,94 @@ class ReplaceDbToPgPreflightTests(unittest.TestCase):
             )
             self.assertNotEqual(res.returncode, 0)
             self.assertIn("pg / ioredis", res.stderr + res.stdout)
-            self.assertFalse(stop_log.exists(), "must never stop systemd service when preflight fails")
+            calls = stop_log.read_text(encoding="utf-8").splitlines() if stop_log.exists() else []
+            mutating = [c for c in calls if c.split()[:1] in (["stop"], ["start"], ["restart"], ["daemon-reload"])]
+            self.assertEqual(mutating, [], f"must never mutate systemd service when preflight fails: {mutating}")
+
+    def test_systemd_missing_migrator_script_aborts_before_stopping_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "app"
+            fake_bin = Path(tmp) / "bin"
+            isolated_script = Path(tmp) / "replace-db-to-pg.sh"
+            shutil.copy2(REPLACE_PG, isolated_script)
+            (root / "src" / "lib" / "db" / "pg").mkdir(parents=True)
+            (root / "src" / "lib" / "db" / "pg" / "config.mjs").write_text("export {}\n", encoding="utf-8")
+            (root / "data").mkdir(parents=True)
+            (root / "data" / "kin.db").write_text("sqlite", encoding="utf-8")
+            fake_bin.mkdir()
+
+            stop_log = Path(tmp) / "systemctl.log"
+            make_exe(fake_bin / "systemctl", f'#!/usr/bin/env bash\necho "$*" >> "{stop_log}"\nexit 0\n')
+            for tool in ("curl", "openssl", "python3", "psql", "pg_dump", "pg_isready"):
+                make_exe(fake_bin / tool, "#!/usr/bin/env bash\nexit 0\n")
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            res = subprocess.run(
+                [
+                    "bash",
+                    str(isolated_script),
+                    "--dir",
+                    str(root),
+                    "--mode",
+                    "systemd",
+                    "--database-url",
+                    "postgresql://u:p@127.0.0.1:5432/vm2api",
+                    "--no-redis",
+                    "--no-install-deps",
+                    "--yes",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("migrate-sqlite-to-pg.mjs", res.stderr + res.stdout)
+            calls = stop_log.read_text(encoding="utf-8").splitlines() if stop_log.exists() else []
+            mutating = [c for c in calls if c.split()[:1] in (["stop"], ["start"], ["restart"], ["daemon-reload"])]
+            self.assertEqual(mutating, [], f"must never mutate systemd service when migrator script is missing: {mutating}")
+
+    def test_systemd_effective_env_reads_strangler_port_and_db_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "app"
+            fake_bin = Path(tmp) / "bin"
+            (root / "data").mkdir(parents=True)
+            custom_db = root / "data" / "custom-kin.db"
+            custom_db.write_text("sqlite", encoding="utf-8")
+            # Stale .env has PORT=8787, while systemd strangler.conf overrides PORT=8788 & KIN_DB_PATH
+            (root / ".env").write_text("PORT=8787\nVM2API_API_KEY=old-key\n", encoding="utf-8")
+            fake_bin.mkdir()
+
+            make_exe(
+                fake_bin / "systemctl",
+                f"""#!/usr/bin/env bash
+if [ "$1" = "show" ]; then
+  if [[ "$*" == *"--property=Environment "* ]] || [[ "$*" == *"--property=Environment"* && "$*" != *"EnvironmentFiles"* ]]; then
+    echo "PORT=8788 HOST=127.0.0.1 KIN_API_KEY=real-systemd-key KIN_DB_PATH={custom_db}"
+  fi
+  exit 0
+fi
+exit 0
+""",
+            )
+            curl_log = Path(tmp) / "curl.log"
+            make_exe(fake_bin / "curl", f'#!/usr/bin/env bash\necho "$*" >> "{curl_log}"\nexit 0\n')
+            make_exe(fake_bin / "docker", "#!/usr/bin/env bash\nexit 0\n")
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            res = subprocess.run(
+                ["bash", str(REPLACE_PG), "--dir", str(root), "--mode", "systemd", "--status"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn(str(custom_db), res.stdout)
+            self.assertIn("http://127.0.0.1:8788/health", res.stdout)
+            self.assertIn("127.0.0.1:8788/health", curl_log.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

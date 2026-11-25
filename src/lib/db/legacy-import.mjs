@@ -18,7 +18,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import { getDb, withTransaction } from './database.mjs'
+import { getDb, withSavepoint, withTransaction } from './database.mjs'
 import { SettingsRepo } from './repos/settings-repo.mjs'
 import { ApiKeysRepo } from './repos/api-keys-repo.mjs'
 import { AccountsRepo } from './repos/accounts-repo.mjs'
@@ -58,8 +58,16 @@ export function runLegacyImport({ dataDir, projectRoot, db = null, retainDays = 
   }
 
   withTransaction(d, () => {
+    const runIsolated = (name, fn) => {
+      try {
+        withSavepoint(d, name, fn)
+      } catch {
+        counts.errors += 1
+      }
+    }
+
     // --- api keys ---
-    try {
+    runIsolated('imp_api_keys', () => {
       const raw = readJson(path.join(dataDir, 'api-keys.json'))
       if (raw === undefined) counts.errors += 1
       const repo = new ApiKeysRepo(d)
@@ -74,12 +82,10 @@ export function runLegacyImport({ dataDir, projectRoot, db = null, retainDays = 
         })
         counts.api_keys += 1
       }
-    } catch {
-      counts.errors += 1
-    }
+    })
 
     // --- account stats ---
-    try {
+    runIsolated('imp_accounts', () => {
       const raw = readJson(path.join(dataDir, 'account-stats.json'))
       if (raw === undefined) counts.errors += 1
       const repo = new AccountsRepo(d)
@@ -92,12 +98,10 @@ export function runLegacyImport({ dataDir, projectRoot, db = null, retainDays = 
           counts.allocations += 1
         }
       }
-    } catch {
-      counts.errors += 1
-    }
+    })
 
     // --- sticky sessions ---
-    try {
+    runIsolated('imp_sticky', () => {
       const raw = readJson(path.join(dataDir, 'sticky-map.json'))
       if (raw === undefined) counts.errors += 1
       const repo = new StickyRepo(d)
@@ -106,12 +110,10 @@ export function runLegacyImport({ dataDir, projectRoot, db = null, retainDays = 
         repo.upsert(key, ent)
         counts.sticky += 1
       }
-    } catch {
-      counts.errors += 1
-    }
+    })
 
     // --- proxy pool ---
-    try {
+    runIsolated('imp_proxies', () => {
       const raw = readJson(path.join(dataDir, 'proxy-pool.json'))
       if (raw === undefined) counts.errors += 1
       if (raw?.proxies?.length || raw?.config) {
@@ -123,12 +125,10 @@ export function runLegacyImport({ dataDir, projectRoot, db = null, retainDays = 
           counts.proxies = raw.proxies.length
         }
       }
-    } catch {
-      counts.errors += 1
-    }
+    })
 
     // --- request logs (normal summaries, recent days) ---
-    try {
+    runIsolated('imp_request_logs', () => {
       const repo = new UsageLogsRepo(d)
       const root = path.join(dataDir, 'request-logs')
       if (fs.existsSync(root)) {
@@ -140,13 +140,11 @@ export function runLegacyImport({ dataDir, projectRoot, db = null, retainDays = 
           try {
             const lines = fs.readFileSync(path.join(root, f), 'utf8').split('\n').filter(Boolean)
             for (const line of lines) {
-              try {
+              runIsolated('imp_reqlog_row', () => {
                 const rec = JSON.parse(line)
                 if (!rec?.id) rec.id = 'log_' + crypto.randomBytes(6).toString('hex')
                 if (repo.insertSummaryIfAbsent(rec)) counts.request_logs += 1
-              } catch {
-                counts.errors += 1
-              }
+              })
             }
           } catch {
             counts.errors += 1
@@ -167,47 +165,39 @@ export function runLegacyImport({ dataDir, projectRoot, db = null, retainDays = 
               continue
             }
             for (const f of files) {
-              try {
+              runIsolated('imp_debug_row', () => {
                 const rec = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'))
                 const reqId = rec?.request_id || f.replace(/\.json$/, '')
                 if (repo.insertDebugIfAbsent(reqId, rec?.ts || new Date(dayMs).toISOString(), rec)) {
                   counts.request_log_debug += 1
                 }
-              } catch {
-                counts.errors += 1
-              }
+              })
             }
           }
         }
       }
-    } catch {
-      counts.errors += 1
-    }
+    })
 
     // --- vms + active ---
-    try {
+    runIsolated('imp_vms', () => {
       const repo = new VmsRepo(d)
       const vmsDir = projectRoot ? path.join(projectRoot, 'vms') : null
       if (vmsDir && fs.existsSync(vmsDir)) {
         for (const f of fs.readdirSync(vmsDir)) {
           if (!isVmRecordFile(f)) continue
-          try {
+          runIsolated('imp_vm_row', () => {
             const file = path.join(vmsDir, f)
             const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
-            if (!vm?.id || repo.get(vm.id)) continue
+            if (!vm?.id || repo.get(vm.id)) return
             const st = fs.statSync(file)
             repo.upsertFromVmJson(vm, { mtimeMs: st.mtimeMs })
             counts.vms += 1
-          } catch {
-            counts.errors += 1
-          }
+          })
         }
         const active = readJson(path.join(vmsDir, 'active.json'))
         if (active?.active_vm) repo.setActiveVmId(active.active_vm)
       }
-    } catch {
-      counts.errors += 1
-    }
+    })
 
     settings.set(IMPORT_FLAG, { at: new Date().toISOString(), counts })
   })

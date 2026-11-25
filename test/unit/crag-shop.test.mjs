@@ -1854,3 +1854,145 @@ test('migration 067 enforces sanitized activation failure columns and pollActiva
   assert.equal(activeRow.activation_request_id, null)
   assert.ok(statusCalls >= 1)
 })
+
+test('direct-credit purchase injects host_id, auto-syncs host rights on fulfillment, and supports locked-price order renewal without renewalProof', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-shop-direct-'))
+  const db = createDatabase({ dbPath: path.join(root, 'kin.db') })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const hostId = 'd'.repeat(64)
+  const sentQuotes = []
+  const sentCreates = []
+  let statusSyncs = 0
+  let renewalProofCalls = 0
+  let supplierStatus = 'pending'
+
+  const handler = createCragShopHandler({
+    dataDir: root,
+    publicBaseUrl: PANEL,
+    getDb: () => db,
+    json: (_, http, body) => ({ http, ...body }),
+    readRawBody: (req) => req.raw,
+    isCurrentAdmin: () => true,
+    subscription: {
+      purchaseDeviceId: () => hostId,
+      async status() {
+        statusSyncs++
+        return { state: 'active', host_id: hostId, slot_limit: 2 }
+      },
+      async renewalProof() {
+        renewalProofCalls++
+        throw new Error('should not require legacy renewalProof for renew_order_id')
+      },
+    },
+    supplier: {
+      async quote(input, proof) {
+        sentQuotes.push({ input, proof })
+        if (input.sku === 'renewal') {
+          return {
+            sku: 'renewal',
+            term: '1m',
+            months: 1,
+            slot_limit: 2,
+            subtotal_minor: 2900,
+            discount_minor: 0,
+            amount_minor: 2900,
+            renew_order_id: input.renew_order_id,
+          }
+        }
+        return { ...PLAN, months: 1, subtotal_minor: PLAN.amount_minor, discount_minor: 0 }
+      },
+      async create(row, _receipt, proof, purchase) {
+        sentCreates.push({ order_id: row.order_id, proof, purchase })
+        const amount = purchase.sku === 'renewal' ? 2900 : PLAN.amount_minor
+        return {
+          order: {
+            ...order(row.order_id, supplierStatus),
+            sku: row.sku,
+            amount_minor: amount,
+            host_id: purchase.host_id,
+            direct_credit: true,
+            ...(purchase.renew_order_id ? { renew_order_id: purchase.renew_order_id } : {}),
+          },
+        }
+      },
+      async status(row) {
+        const amount = row.sku === 'renewal' ? 2900 : PLAN.amount_minor
+        return {
+          ...order(row.order_id, supplierStatus),
+          sku: row.sku,
+          amount_minor: amount,
+          host_id: hostId,
+          direct_credit: true,
+        }
+      },
+    },
+  })
+
+  const call = (method, endpoint, body) => {
+    const url = new URL(`${PANEL}${BASE}${endpoint}`)
+    return handler(
+      {
+        ...PERSON,
+        method,
+        raw: Buffer.from(body === undefined ? '' : JSON.stringify(body)),
+        headers: {
+          host: 'panel.example.test',
+          origin: PANEL,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+        },
+      },
+      {},
+      url,
+      cragShopRoute(method, url.pathname),
+    )
+  }
+
+  // 1. Standard panel purchase injects host_id automatically for direct credit.
+  const buy = await call('POST', '/orders', {
+    ...INPUT,
+    request_id: 'direct-buy-1',
+    expected_amount_minor: PLAN.amount_minor,
+  })
+  assert.equal(buy.http, 200)
+  assert.equal(sentCreates[0].purchase.host_id, hostId)
+  assert.equal(buy.data.activation.state, 'manual')
+
+  // When payment completes and supplier returns direct_credit: true + fulfilled,
+  // status poll syncs host rights and marks order active automatically!
+  supplierStatus = 'fulfilled'
+  const buyFulfilled = await call('GET', `/orders/${buy.data.order_id}`)
+  assert.equal(buyFulfilled.http, 200)
+  assert.equal(buyFulfilled.data.status, 'fulfilled')
+  assert.equal(buyFulfilled.data.activation.state, 'active')
+  assert.equal(statusSyncs, 1)
+
+  // 2. Locked-price renewal quotes & creates with host_id + renew_order_id and NO legacy renewalProof.
+  const quote = await call('POST', '/quote', {
+    sku: 'renewal',
+    renew_order_id: buy.data.order_id,
+  })
+  assert.equal(quote.http, 200)
+  assert.equal(quote.data.amount_minor, 2900)
+  assert.equal(quote.data.renew_order_id, buy.data.order_id)
+  assert.equal(sentQuotes.at(-1).input.host_id, hostId)
+  assert.equal(sentQuotes.at(-1).proof, undefined)
+
+  const renew = await call('POST', '/orders', {
+    sku: 'renewal',
+    renew_order_id: buy.data.order_id,
+    payment_method: 'alipay',
+    request_id: 'direct-renew-1',
+    expected_amount_minor: 2900,
+  })
+  assert.equal(renew.http, 200)
+  assert.equal(sentCreates[1].purchase.host_id, hostId)
+  assert.equal(sentCreates[1].purchase.renew_order_id, buy.data.order_id)
+  assert.equal(sentCreates[1].proof, undefined)
+  assert.equal(renew.data.activation.state, 'active')
+  assert.equal(renewalProofCalls, 0)
+  assert.equal(statusSyncs, 2)
+})

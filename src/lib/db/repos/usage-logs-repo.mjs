@@ -59,6 +59,7 @@ function addKeyUsage(into, row) {
 }
 
 /** settings key: ISO instant before which usage_logs rows may have been pruned. Monotonic. */
+export const DB_CREATED_AT_KEY = 'usage_logs_db_created_at'
 const PRUNED_THROUGH_KEY = 'usage_logs_pruned_through'
 const BILLING_STATS_CACHE_TTL_MS = 10_000
 const BILLING_BACKFILL_INTERVAL_MS = 60_000
@@ -547,8 +548,10 @@ export class UsageLogsRepo {
       params.push(new Date(until).toISOString())
     }
     if (q) {
-      where.push('(path LIKE ? OR error_code LIKE ? OR error_message LIKE ? OR request_id LIKE ?)')
-      const like = `%${String(q).slice(0, 100)}%`
+      where.push(
+        '(LOWER(path) LIKE ? OR LOWER(error_code) LIKE ? OR LOWER(error_message) LIKE ? OR LOWER(request_id) LIKE ?)',
+      )
+      const like = `%${String(q).slice(0, 100).toLowerCase()}%`
       params.push(like, like, like, like)
     }
     const cond = where.length ? `WHERE ${where.join(' AND ')}` : ''
@@ -1431,26 +1434,36 @@ export class UsageLogsRepo {
 
   /**
    * Earliest instant whose traffic is still fully in usage_logs: the later of the DB's
-   * creation (first migration) and the recorded prune boundary. Neither the oldest
-   * surviving row (a quiet hour looks like a gap) nor the current retain_days (raising
-   * it does not bring deleted rows back) can stand in for that boundary.
+   * creation (first migration, or preserved SQLite origin across PG migration) and the
+   * recorded prune boundary. Neither the oldest surviving row (a quiet hour looks like
+   * a gap) nor the current retain_days (raising it does not bring deleted rows back)
+   * can stand in for that boundary.
    */
   logCoverageStart() {
-    const created = Date.parse(
+    const origin = Date.parse(this._settingJson(DB_CREATED_AT_KEY) || '')
+    const schema = Date.parse(
       this.db.prepare("SELECT MIN(applied_at) AS t FROM schema_migrations WHERE version = '001'").get()?.t || '',
     )
+    let created = -Infinity
+    if (Number.isFinite(origin) && Number.isFinite(schema)) created = Math.min(origin, schema)
+    else if (Number.isFinite(origin)) created = origin
+    else if (Number.isFinite(schema)) created = schema
     const pruned = Date.parse(this._prunedThrough() || '')
-    const start = Math.max(Number.isFinite(created) ? created : -Infinity, Number.isFinite(pruned) ? pruned : -Infinity)
+    const start = Math.max(created, Number.isFinite(pruned) ? pruned : -Infinity)
     return Number.isFinite(start) ? new Date(start).toISOString() : null
   }
 
-  _prunedThrough() {
-    const row = this.db.prepare(`SELECT value FROM settings WHERE key = '${PRUNED_THROUGH_KEY}'`).get()
+  _settingJson(key) {
+    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key)
     try {
       return row ? JSON.parse(row.value) : null
     } catch {
       return null
     }
+  }
+
+  _prunedThrough() {
+    return this._settingJson(PRUNED_THROUGH_KEY)
   }
 
   /**

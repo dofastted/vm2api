@@ -6,6 +6,7 @@ const BIND = /^\/api\/panel\/vms\/([^/]+)\/crag-license\/bind$/
 
 export function cragSubscriptionRoute(method, path) {
   if (method === 'GET' && path === ROOT) return { action: 'status' }
+  if (method === 'GET' && path === `${ROOT}/orders`) return { action: 'orders' }
   if (method !== 'POST') return null
   if (path === `${ROOT}/redeem`) return { action: 'redeem' }
   if (path === `${ROOT}/recover`) return { action: 'recover' }
@@ -13,6 +14,7 @@ export function cragSubscriptionRoute(method, path) {
   if (path === `${ROOT}/unbind`) return { action: 'unbind' }
   if (path === `${ROOT}/claim-by-order`) return { action: 'claim' }
   if (path === `${ROOT}/rebuild-identity`) return { action: 'rebuild-identity' }
+  if (path === `${ROOT}/migrate`) return { action: 'migrate' }
   const match = BIND.exec(path)
   return match ? { action: 'bind', id: match[1] } : null
 }
@@ -61,6 +63,11 @@ const claimMessages = {
     'That order id is already recorded against a different voucher. Keep the original order and ask the administrator to reconcile it; do not redeem again.',
 }
 
+const migrateMessages = {
+  not_found: 'No subscription, vouchers, or historical orders were found for that source host ID.',
+  invalid_request: 'Enter a valid source host ID or device UUID that differs from the current host.',
+}
+
 const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
 const credentialRecoveries = new Set(['not_activated', 'host_id_collision', 'failed'])
 
@@ -69,9 +76,11 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
     const message =
       action === 'claim' && Object.hasOwn(claimMessages, code)
         ? claimMessages[code]
-        : Object.hasOwn(messages, code)
-          ? messages[code]
-          : messages.crag_subscription_failed
+        : action === 'migrate' && Object.hasOwn(migrateMessages, code)
+          ? migrateMessages[code]
+          : Object.hasOwn(messages, code)
+            ? messages[code]
+            : messages.crag_subscription_failed
     const validRecovery = credentialRecoveries.has(error?.recovery) ? error.recovery : undefined
     const validRequestId =
       typeof error?.authorityRequestId === 'string' && authorityRequestId.test(error.authorityRequestId)
@@ -104,7 +113,7 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
     if (!master && (req.apiKeyKind || !identity.user || identity.role !== 'admin')) return reject(res, 403, 'forbidden')
 
     let body
-    if (action !== 'status') {
+    if (action !== 'status' && action !== 'orders') {
       if (!master && !sameOriginPost(req, publicBaseUrl)) return reject(res, 403, 'crag_subscription_origin_denied')
       if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) {
         return reject(res, 415, 'crag_subscription_json_required')
@@ -124,18 +133,40 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
           ? Object.keys(body).length === 1 && typeof body.redemption_code === 'string'
           : action === 'claim'
             ? Object.keys(body).length === 1 && typeof body.order_id === 'string'
-            : action === 'recover'
-              ? Object.keys(body).length === 0 || (Object.keys(body).length === 1 && body.use_current_package === true)
-              : Object.keys(body).length === 0
+            : action === 'migrate'
+              ? Object.keys(body).length === 1 && typeof body.from_host_id === 'string'
+              : action === 'recover'
+                ? Object.keys(body).length === 0 ||
+                  (Object.keys(body).length === 1 && body.use_current_package === true)
+                : Object.keys(body).length === 0
       if (!valid) return reject(res, 400, 'crag_subscription_invalid_request')
     }
 
     try {
+      if (action === 'orders') {
+        const params = new URL(req.url || '/', 'http://localhost').searchParams
+        const rawLimit = params.get('limit')
+        const rawOffset = params.get('offset')
+        const limit = rawLimit == null ? 50 : Number(rawLimit)
+        const offset = rawOffset == null ? 0 : Number(rawOffset)
+        if (
+          !Number.isInteger(limit) ||
+          limit < 1 ||
+          limit > 200 ||
+          !Number.isInteger(offset) ||
+          offset < 0 ||
+          offset > 1_000_000
+        ) {
+          return reject(res, 400, 'crag_subscription_invalid_request')
+        }
+        return ok(res, await subscription.orders({ limit, offset }))
+      }
       if (action === 'redeem') return ok(res, await subscription.redeem(body.redemption_code))
       if (action === 'upgrade') return ok(res, await subscription.upgrade())
       if (action === 'unbind') return ok(res, await subscription.unbind())
       if (action === 'claim') return ok(res, await subscription.claimByOrder(body.order_id))
       if (action === 'rebuild-identity') return ok(res, await subscription.rebuildIdentity())
+      if (action === 'migrate') return ok(res, await subscription.migrate(body.from_host_id))
       if (action === 'bind') {
         const vm = getVm(id)
         if (!vm) return reject(res, 404, 'vm_not_found')

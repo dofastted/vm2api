@@ -16,6 +16,8 @@ export const isOrderId = (value) =>
   typeof value === 'string' &&
   value.length === 36 &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
+export const isHostId = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+export const isReferenceOrderId = (value) => typeof value === 'string' && /^[0-9a-zA-Z_-]{1,64}$/.test(value)
 export const ORDER_STATES = ['reserved', 'pending', 'paid', 'fulfilled']
 export const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
 export const isQuantity = (value) => Number.isInteger(value) && value >= 1 && value <= 2147483647
@@ -114,10 +116,17 @@ function publicQuote(value, input) {
   if (
     plan.sku !== input.sku ||
     (input.slots !== undefined && plan.slot_limit !== input.slots) ||
-    (input.months !== undefined && snapshot.months !== input.months)
+    (input.months !== undefined && snapshot.months !== input.months) ||
+    (value.renew_order_id !== undefined &&
+      (!isReferenceOrderId(value.renew_order_id) ||
+        (input.renew_order_id !== undefined && value.renew_order_id !== input.renew_order_id)))
   )
     throw invalidReply()
-  return { ...plan, ...snapshot }
+  return {
+    ...plan,
+    ...snapshot,
+    ...(value.renew_order_id !== undefined ? { renew_order_id: value.renew_order_id } : {}),
+  }
 }
 
 function publicOrder(value, row) {
@@ -134,10 +143,23 @@ function publicOrder(value, row) {
     created_at <= 0 ||
     (row.expected_amount_minor != null && plan.amount_minor !== row.expected_amount_minor) ||
     (purchase.slots !== undefined && plan.slot_limit !== purchase.slots) ||
-    (purchase.months !== undefined && snapshot.months !== undefined && snapshot.months !== purchase.months)
+    (purchase.months !== undefined && snapshot.months !== undefined && snapshot.months !== purchase.months) ||
+    (value.host_id !== undefined && !isHostId(value.host_id)) ||
+    (value.direct_credit !== undefined && typeof value.direct_credit !== 'boolean') ||
+    (value.renew_order_id !== undefined && !isReferenceOrderId(value.renew_order_id))
   )
     throw invalidReply()
-  return { ...plan, ...snapshot, order_id, status, created_at, payment_method }
+  return {
+    ...plan,
+    ...snapshot,
+    order_id,
+    status,
+    created_at,
+    payment_method,
+    ...(value.host_id !== undefined ? { host_id: value.host_id } : {}),
+    ...(value.direct_credit !== undefined ? { direct_credit: value.direct_credit } : {}),
+    ...(value.renew_order_id !== undefined ? { renew_order_id: value.renew_order_id } : {}),
+  }
 }
 
 const FORM_KEYS = [

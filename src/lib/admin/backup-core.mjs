@@ -11,11 +11,31 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import readline from 'node:readline'
 import zlib from 'node:zlib'
 import { spawnSync } from 'node:child_process'
 import { getDb, getPgConfig, getPgPool, vacuumInto } from '../db/database.mjs'
 import { buildPgConnectionString } from '../db/pg/config.mjs'
 import { BackupRepo } from '../db/repos/backup-repo.mjs'
+
+/**
+ * Strip embedded password from a PostgreSQL URI and pass it via `PGPASSWORD`
+ * environment variable so `pg_dump` / `pg_restore` never leak credentials in argv (`ps`).
+ */
+export function buildPgToolInvocation(dsn) {
+  const env = { ...process.env }
+  if (!dsn) return { uri: '', env }
+  try {
+    const u = new URL(dsn)
+    if (u.password) {
+      env.PGPASSWORD = decodeURIComponent(u.password)
+      u.password = ''
+    }
+    return { uri: u.toString(), env }
+  } catch {
+    return { uri: dsn, env }
+  }
+}
 
 export function stamp(d = new Date()) {
   return d.toISOString().replace(/[:.]/g, '-')
@@ -118,6 +138,74 @@ function stageVmsAndConfig(ctx, tmp, includes, sha256s) {
   }
 }
 
+/** Sort PostgreSQL tables in FK parent-before-child topological order. */
+async function orderTablesByFk(client, tables) {
+  const fkRes = await client.query(`
+    SELECT DISTINCT
+      tc.table_name AS child_table,
+      ccu.table_name AS parent_table
+    FROM information_schema.table_constraints tc
+    JOIN information_schema.constraint_column_usage ccu
+      ON tc.constraint_name = ccu.constraint_name
+     AND tc.table_schema = ccu.table_schema
+    WHERE tc.constraint_type = 'FOREIGN KEY'
+      AND tc.table_schema = current_schema()
+  `)
+  const tableSet = new Set(tables)
+  const deps = new Map(tables.map((t) => [t, new Set()]))
+  const children = new Map(tables.map((t) => [t, new Set()]))
+  for (const { child_table: child, parent_table: parent } of fkRes.rows) {
+    if (child === parent || !tableSet.has(child) || !tableSet.has(parent)) continue
+    deps.get(child).add(parent)
+    children.get(parent).add(child)
+  }
+  const ordered = []
+  const queue = tables.filter((t) => deps.get(t).size === 0)
+  const seen = new Set(queue)
+  while (queue.length) {
+    const cur = queue.shift()
+    ordered.push(cur)
+    for (const ch of children.get(cur)) {
+      deps.get(ch).delete(cur)
+      if (deps.get(ch).size === 0 && !seen.has(ch)) {
+        seen.add(ch)
+        queue.push(ch)
+      }
+    }
+  }
+  for (const t of tables) {
+    if (!seen.has(t)) ordered.push(t)
+  }
+  return ordered
+}
+
+async function insertPgRestoreRows(client, table, cols, rows, deferredJump) {
+  if (!rows.length || !cols?.length) return
+  const MAX_PG_PARAMS = 30_000
+  const colList = cols.map((c) => `"${c}"`).join(', ')
+  const batchSize = Math.max(1, Math.min(200, Math.floor(MAX_PG_PARAMS / Math.max(1, cols.length))))
+  const isClusterNodes = table === 'cluster_nodes' && cols.includes('jump_node_id') && cols.includes('id')
+
+  for (let i = 0; i < rows.length; i += batchSize) {
+    const slice = rows.slice(i, i + batchSize)
+    const values = []
+    const tuples = []
+    let pIdx = 1
+    for (const row of slice) {
+      if (isClusterNodes && row.jump_node_id != null) {
+        deferredJump.push([row.jump_node_id, row.id])
+      }
+      const ph = []
+      for (const c of cols) {
+        ph.push(`$${pIdx++}`)
+        values.push(isClusterNodes && c === 'jump_node_id' ? null : (row[c] ?? null))
+      }
+      tuples.push(`(${ph.join(', ')})`)
+    }
+    await client.query(`INSERT INTO "${table}" (${colList}) VALUES ${tuples.join(', ')} ON CONFLICT DO NOTHING`, values)
+  }
+}
+
 /** Pure-JS streaming logical dump fallback when `pg_dump` binary is not installed. */
 async function dumpPgLogicalNdjsonGz(pool, outFile) {
   fs.mkdirSync(path.dirname(outFile), { recursive: true })
@@ -139,19 +227,22 @@ async function dumpPgLogicalNdjsonGz(pool, outFile) {
     WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
     ORDER BY table_name
   `)
+  const validTables = tablesRes.rows.map((r) => r.table_name).filter((t) => /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(t))
 
   const client = await pool.connect()
   try {
     await client.query('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+    const orderedTables = await orderTablesByFk(client, validTables)
     await writeLine({
       type: 'meta',
       engine: 'postgres',
       format: 'pg_logical_ndjson_gz',
+      fk_ordered: true,
+      tables: orderedTables,
       created_at: new Date().toISOString(),
     })
 
-    for (const { table_name: table } of tablesRes.rows) {
-      if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table)) continue
+    for (const table of orderedTables) {
       const colRes = await client.query(
         `SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 ORDER BY ordinal_position`,
         [table],
@@ -159,13 +250,17 @@ async function dumpPgLogicalNdjsonGz(pool, outFile) {
       const cols = colRes.rows.map((r) => r.column_name)
       await writeLine({ type: 'table', name: table, columns: cols })
       const chunkSize = 1000
-      let offset = 0
-      for (;;) {
-        const res = await client.query(`SELECT * FROM "${table}" LIMIT $1 OFFSET $2`, [chunkSize, offset])
-        if (!res.rows.length) break
-        await writeLine({ type: 'rows', table, rows: res.rows })
-        offset += res.rows.length
-        if (res.rows.length < chunkSize) break
+      // Server-side cursor inside REPEATABLE READ streams every table in O(N) without OFFSET drift.
+      await client.query(`DECLARE "vm2api_dump_cur" NO SCROLL CURSOR FOR SELECT * FROM "${table}"`)
+      try {
+        for (;;) {
+          const res = await client.query(`FETCH ${chunkSize} FROM "vm2api_dump_cur"`)
+          if (!res.rows.length) break
+          await writeLine({ type: 'rows', table, rows: res.rows })
+          if (res.rows.length < chunkSize) break
+        }
+      } finally {
+        await client.query('CLOSE "vm2api_dump_cur"')
       }
     }
     await client.query('COMMIT')
@@ -200,6 +295,7 @@ export async function restorePgSnapshotJob({ pool, connectionString, dbFile }) {
         code: 'pg_restore_missing',
       })
     }
+    const { uri, env } = buildPgToolInvocation(connectionString)
     const restoreArgs = ['--clean', '--if-exists', '--no-owner', '--no-privileges']
     if (pool) {
       try {
@@ -210,8 +306,8 @@ export async function restorePgSnapshotJob({ pool, connectionString, dbFile }) {
         }
       } catch {}
     }
-    restoreArgs.push(`--dbname=${connectionString}`, dbFile)
-    const r = spawnSync('pg_restore', restoreArgs, { stdio: 'pipe', env: process.env })
+    restoreArgs.push(`--dbname=${uri}`, dbFile)
+    const r = spawnSync('pg_restore', restoreArgs, { stdio: 'pipe', env })
     if (r.status !== 0) {
       throw new Error(`pg_restore failed: ${String(r.stderr || '').slice(0, 300)}`)
     }
@@ -225,103 +321,61 @@ export async function restorePgSnapshotJob({ pool, connectionString, dbFile }) {
   }
 
   if (!pool) throw new Error('PostgreSQL pool unavailable for restore')
-  const raw = zlib.gunzipSync(fs.readFileSync(dbFile)).toString('utf8')
-  const lines = raw.split('\n').filter(Boolean)
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
+    await client.query("SET LOCAL lock_timeout = '30s'")
     await client.query('SET LOCAL synchronous_commit = off')
+
+    const gunzip = zlib.createGunzip()
+    const stream = fs.createReadStream(dbFile).pipe(gunzip)
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity })
 
     const tableCols = new Map()
     const tableRows = new Map()
-    for (const line of lines) {
+    const deferredJump = []
+    let streamingOrdered = false
+    let truncated = false
+
+    for await (const line of rl) {
+      if (!line) continue
       const rec = JSON.parse(line)
-      if (rec.type === 'table' && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(rec.name)) {
-        tableCols.set(rec.name, rec.columns)
-        if (!tableRows.has(rec.name)) tableRows.set(rec.name, [])
-      } else if (rec.type === 'rows' && Array.isArray(rec.rows) && rec.rows.length) {
-        if (!tableRows.has(rec.table)) tableRows.set(rec.table, [])
-        tableRows.get(rec.table).push(...rec.rows)
-      }
-    }
-
-    const tables = [...tableCols.keys()].filter((t) => t !== 'schema_migrations')
-    const fkRes = await client.query(`
-      SELECT DISTINCT
-        tc.table_name AS child_table,
-        ccu.table_name AS parent_table
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.constraint_column_usage ccu
-        ON tc.constraint_name = ccu.constraint_name
-       AND tc.table_schema = ccu.table_schema
-      WHERE tc.constraint_type = 'FOREIGN KEY'
-        AND tc.table_schema = current_schema()
-    `)
-    const tableSet = new Set(tables)
-    const deps = new Map(tables.map((t) => [t, new Set()]))
-    const children = new Map(tables.map((t) => [t, new Set()]))
-    for (const { child_table: child, parent_table: parent } of fkRes.rows) {
-      if (child === parent || !tableSet.has(child) || !tableSet.has(parent)) continue
-      deps.get(child).add(parent)
-      children.get(parent).add(child)
-    }
-    const ordered = []
-    const queue = tables.filter((t) => deps.get(t).size === 0)
-    const seen = new Set(queue)
-    while (queue.length) {
-      const cur = queue.shift()
-      ordered.push(cur)
-      for (const ch of children.get(cur)) {
-        deps.get(ch).delete(cur)
-        if (deps.get(ch).size === 0 && !seen.has(ch)) {
-          seen.add(ch)
-          queue.push(ch)
-        }
-      }
-    }
-    for (const t of tables) {
-      if (!seen.has(t)) ordered.push(t)
-    }
-
-    if (ordered.length) {
-      await client.query(`TRUNCATE TABLE ${ordered.map((t) => `"${t}"`).join(', ')} RESTART IDENTITY CASCADE`)
-    }
-
-    const MAX_PG_PARAMS = 30_000
-    for (const table of ordered) {
-      const rows = tableRows.get(table) || []
-      if (!rows.length) continue
-      const cols = tableCols.get(table)
-      const colList = cols.map((c) => `"${c}"`).join(', ')
-      const batchSize = Math.max(1, Math.min(200, Math.floor(MAX_PG_PARAMS / Math.max(1, cols.length))))
-      const isClusterNodes = table === 'cluster_nodes' && cols.includes('jump_node_id') && cols.includes('id')
-      const deferredJump = []
-
-      for (let i = 0; i < rows.length; i += batchSize) {
-        const slice = rows.slice(i, i + batchSize)
-        const values = []
-        const tuples = []
-        let pIdx = 1
-        for (const row of slice) {
-          if (isClusterNodes && row.jump_node_id != null) {
-            deferredJump.push([row.jump_node_id, row.id])
-          }
-          const ph = []
-          for (const c of cols) {
-            ph.push(`$${pIdx++}`)
-            values.push(isClusterNodes && c === 'jump_node_id' ? null : (row[c] ?? null))
-          }
-          tuples.push(`(${ph.join(', ')})`)
-        }
-        await client.query(
-          `INSERT INTO "${table}" (${colList}) VALUES ${tuples.join(', ')} ON CONFLICT DO NOTHING`,
-          values,
+      if (rec.type === 'meta' && rec.fk_ordered === true && Array.isArray(rec.tables)) {
+        const safeTables = rec.tables.filter(
+          (t) => typeof t === 'string' && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(t) && t !== 'schema_migrations',
         )
+        if (safeTables.length) {
+          await client.query(`TRUNCATE TABLE ${safeTables.map((t) => `"${t}"`).join(', ')} RESTART IDENTITY CASCADE`)
+          truncated = true
+          streamingOrdered = true
+        }
+      } else if (rec.type === 'table' && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(rec.name)) {
+        tableCols.set(rec.name, rec.columns)
+        if (!streamingOrdered && !tableRows.has(rec.name)) tableRows.set(rec.name, [])
+      } else if (rec.type === 'rows' && Array.isArray(rec.rows) && rec.rows.length) {
+        if (rec.table === 'schema_migrations') continue
+        if (streamingOrdered) {
+          await insertPgRestoreRows(client, rec.table, tableCols.get(rec.table), rec.rows, deferredJump)
+        } else {
+          if (!tableRows.has(rec.table)) tableRows.set(rec.table, [])
+          tableRows.get(rec.table).push(...rec.rows)
+        }
       }
+    }
 
-      for (const [jumpId, nodeId] of deferredJump) {
-        await client.query('UPDATE "cluster_nodes" SET "jump_node_id" = $1 WHERE "id" = $2', [jumpId, nodeId])
+    if (!streamingOrdered) {
+      const tables = [...tableCols.keys()].filter((t) => t !== 'schema_migrations')
+      const ordered = await orderTablesByFk(client, tables)
+      if (ordered.length && !truncated) {
+        await client.query(`TRUNCATE TABLE ${ordered.map((t) => `"${t}"`).join(', ')} RESTART IDENTITY CASCADE`)
       }
+      for (const table of ordered) {
+        await insertPgRestoreRows(client, table, tableCols.get(table), tableRows.get(table) || [], deferredJump)
+      }
+    }
+
+    for (const [jumpId, nodeId] of deferredJump) {
+      await client.query('UPDATE "cluster_nodes" SET "jump_node_id" = $1 WHERE "id" = $2', [jumpId, nodeId])
     }
 
     // Re-sync BIGSERIAL/SERIAL sequences so post-restore inserts never collide on id=1.
@@ -383,6 +437,7 @@ export async function runPgBackupJob(ctx, { id, createdAt, kind = 'manual', note
       dbSnap = path.join(dbDir, 'kin.pgdump')
       dbRelPath = 'db/kin.pgdump'
       pgFormat = 'pg_dump_custom'
+      const { uri, env } = buildPgToolInvocation(dsn)
       const dumpArgs = ['--format=custom', '--no-owner', '--no-privileges']
       if (pool) {
         try {
@@ -393,8 +448,8 @@ export async function runPgBackupJob(ctx, { id, createdAt, kind = 'manual', note
           }
         } catch {}
       }
-      dumpArgs.push(`--file=${dbSnap}`, dsn)
-      const r = spawnSync('pg_dump', dumpArgs, { stdio: 'pipe', env: process.env })
+      dumpArgs.push(`--file=${dbSnap}`, uri)
+      const r = spawnSync('pg_dump', dumpArgs, { stdio: 'pipe', env })
       if (r.status !== 0) {
         throw new Error(`pg_dump failed: ${String(r.stderr || '').slice(0, 300)}`)
       }

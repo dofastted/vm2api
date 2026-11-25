@@ -50,6 +50,25 @@ WORK_DROPIN = (MARKER + '\n'
                "{ mkdir -p /run/kin/work && [ ! -L /run/kin/work ] && "
                "mount -t tmpfs -o mode=0700,uid=$(id -u kincli),gid=$(id -g kincli),size=256m,nosuid,nodev "
                "vm2api-crag-work /run/kin/work; }; }'\n").encode()
+# The work directory is not the only hot file on 9p. CRAG starts the CLI in /run/kin/work with --resume, so every
+# request also writes a resume transcript under ~/.claude/projects/-run-kin-work/ and the CLI appends to and stat()s
+# it for the whole turn. ~ is the kinhome 9p share, so the same writeback wait still wedged sessions on a guest that
+# already had the work directory on tmpfs (zombie CLI, threads in folio_wait_bit_common). The transcripts only serve the
+# request that wrote them (CRAG >= 3.1.20 reclaims leftovers, #1726), so they move to guest tmpfs as well; a guest
+# reboot drops them. Paths stay literal (systemd expands ${NAME} in the command line); ~/.claude is created as kincli
+# only when missing, so a mount failure leaves the CLI on a writable 9p directory as before.
+TRANSCRIPT_DIR = '/home/kincli/.claude/projects'
+TRANSCRIPT_DROPIN_PATH = '/etc/systemd/system/kin-kernel.service.d/46-vm2api-crag-transcripts.conf'
+TRANSCRIPT_DROPIN = (MARKER + '\n'
+                     '# CRAG resume transcripts stay on guest tmpfs: the same 9p writeback wait as the tap files.\n'
+                     '[Service]\n'
+                     "ExecStartPre=-+/bin/sh -c '[ ! -L /home/kincli/.claude ] && [ ! -L " + TRANSCRIPT_DIR + " ] && "
+                     "{ mountpoint -q " + TRANSCRIPT_DIR + " || { "
+                     "{ [ -d /home/kincli/.claude ] || install -d -m 0700 -o kincli -g kincli /home/kincli/.claude; } && "
+                     "{ [ -d " + TRANSCRIPT_DIR + " ] || install -d -m 0700 -o kincli -g kincli " + TRANSCRIPT_DIR + "; } && "
+                     "[ ! -L /home/kincli/.claude ] && [ ! -L " + TRANSCRIPT_DIR + " ] && "
+                     "mount -t tmpfs -o mode=0700,uid=$(id -u kincli),gid=$(id -g kincli),size=512m,nosuid,nodev "
+                     "vm2api-crag-transcripts " + TRANSCRIPT_DIR + "; }; }'\n").encode()
 
 
 def result(status, reason, profile=PROFILE_NAME):
@@ -178,34 +197,50 @@ def reload_or_restore(systemctl, path, previous):
         raise
 
 
-def isolate_work_dir(root):
-    """Mount guest tmpfs over the CRAG work directory before every kernel start (see WORK_DROPIN)."""
-    dropin = fixed_path(root, WORK_DROPIN_PATH)
+def isolate_tmpfs(root, path, content, key):
+    """Install a managed drop-in that mounts guest tmpfs before every kernel start (see WORK/TRANSCRIPT_DROPIN)."""
+    dropin = fixed_path(root, path)
     try:
         previous = snapshot(dropin)
     except RuntimeError:
-        return {'work_dir': 'operator-managed'}
-    if previous is not None and previous[0] == WORK_DROPIN:
-        return {'work_dir': 'already-tmpfs'}
+        return {key: 'operator-managed'}
+    if previous is not None and previous[0] == content:
+        return {key: 'already-tmpfs'}
     systemctl = command('systemctl')
-    atomic_write(dropin, WORK_DROPIN)
+    atomic_write(dropin, content)
     reload_or_restore(systemctl, dropin, previous)
-    return {'work_dir': 'tmpfs'}
+    return {key: 'tmpfs'}
 
 
-def release_work_dir(root):
-    """Leaving CRAG v2: drop the managed mount hook. An existing tmpfs stays until the guest reboots."""
-    dropin = fixed_path(root, WORK_DROPIN_PATH)
+def release_tmpfs(root, path, key):
+    """Leaving CRAG v2: drop a managed mount hook. An existing tmpfs stays until the guest reboots."""
+    dropin = fixed_path(root, path)
     try:
         previous = snapshot(dropin)
     except RuntimeError:
-        return {'work_dir': 'operator-managed'}
+        return {key: 'operator-managed'}
     if previous is None:
-        return {'work_dir': 'not-crag-v2'}
+        return {key: 'not-crag-v2'}
     systemctl = command('systemctl')
     dropin.unlink()
     reload_or_restore(systemctl, dropin, previous)
-    return {'work_dir': 'released'}
+    return {key: 'released'}
+
+
+def isolate_work_dir(root):
+    return isolate_tmpfs(root, WORK_DROPIN_PATH, WORK_DROPIN, 'work_dir')
+
+
+def release_work_dir(root):
+    return release_tmpfs(root, WORK_DROPIN_PATH, 'work_dir')
+
+
+def isolate_transcripts(root):
+    return isolate_tmpfs(root, TRANSCRIPT_DROPIN_PATH, TRANSCRIPT_DROPIN, 'transcripts')
+
+
+def release_transcripts(root):
+    return release_tmpfs(root, TRANSCRIPT_DROPIN_PATH, 'transcripts')
 
 
 def remove_binding(dropin):
@@ -236,10 +271,10 @@ def prepare(root):
     if not isinstance(config, dict):
         raise RuntimeError('kernel configuration must be an object')
     if config.get('dataplane') != 'crag' or config.get('crag_kernel_version') != 'v2':
-        return {**remove_binding(dropin), **release_work_dir(root)}
+        return {**remove_binding(dropin), **release_work_dir(root), **release_transcripts(root)}
     guest = preserve_guest_runtime(root)
     profile = bind_profile(root, dropin)
-    return {**profile, **guest, **isolate_work_dir(root)}
+    return {**profile, **guest, **isolate_work_dir(root), **isolate_transcripts(root)}
 
 
 def bind_profile(root, dropin):

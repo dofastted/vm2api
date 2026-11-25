@@ -41,11 +41,12 @@ ok() { echo -e "${GREEN}[成功]${NC} $*"; }
 warn() { echo -e "${YELLOW}[警告]${NC} $*"; }
 err() { echo -e "${RED}[错误]${NC} $*" >&2; }
 
+GITHUB_REPO="${VM2API_GITHUB_REPO:-dofastted/vm2api}"
 INSTALL_DIR="${VM2API_DIR:-/opt/vm2api}"
 DEPLOY_MODE="auto"        # auto | docker | systemd
 PG_RUNTIME="auto"         # auto | docker | native
 SERVICE_NAME="vm2api"
-SYSTEMD_UNIT="vm2api.service"
+SYSTEMD_UNIT="${VM2API_SYSTEMD_UNIT:-vm2api.service}"
 SQLITE_PATH=""
 DATABASE_URL_ARG=""
 REDIS_URL_ARG=""
@@ -66,6 +67,7 @@ EXTERNAL_PG=0
 NO_REDIS=0
 AUTO_INSTALL_DEPS=1
 CHECK_DEPS_ONLY=0
+PREFLIGHT_ONLY=0
 AUTO_PULL=0
 TRUNCATE_TARGET=0
 SKIP_DEBUG=0
@@ -103,6 +105,7 @@ usage() {
   --install-deps             自动安装缺失的宿主/PG/Node 依赖（默认开启）
   --no-install-deps          禁用自动安装依赖，缺失时仅报错提示
   --check-deps               仅检查依赖与环境就绪情况，不修改配置、不停止服务
+  --preflight                零停机 SQLite 完整性/表结构/约束隐患预扫与目标库权限检测
   --auto-pull                Docker 模式下若镜像版本过旧缺少迁移脚本，自动执行 compose pull
   --truncate                 导入前清空目标 PostgreSQL 表（用于干净重跑）
   --skip-debug               跳过超大 request_log_debug 调试正文表
@@ -132,6 +135,7 @@ while [ $# -gt 0 ]; do
     --install-deps) AUTO_INSTALL_DEPS=1; shift ;;
     --no-install-deps) AUTO_INSTALL_DEPS=0; shift ;;
     --check-deps) CHECK_DEPS_ONLY=1; shift ;;
+    --preflight) PREFLIGHT_ONLY=1; shift ;;
     --auto-pull) AUTO_PULL=1; shift ;;
     --truncate) TRUNCATE_TARGET=1; shift ;;
     --skip-debug) SKIP_DEBUG=1; shift ;;
@@ -156,9 +160,14 @@ case "$PG_RUNTIME" in
 esac
 
 ENV_FILE="${INSTALL_DIR}/.env"
+SYSTEMD_PG_ENV_FILE="${INSTALL_DIR}/.env.postgres"
 SYSTEMD_DROPIN_DIR="${VM2API_SYSTEMD_DROPIN_DIR:-/etc/systemd/system/${SYSTEMD_UNIT}.d}"
 SYSTEMD_DROPIN_FILE="${SYSTEMD_DROPIN_DIR}/20-postgres.conf"
 BACKUP_ROOT="${INSTALL_DIR}/data/backups"
+SCRIPT_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 
 gen_secret() {
   if command -v openssl >/dev/null 2>&1; then
@@ -176,6 +185,92 @@ env_get() {
   line="$(grep -E "^${key}=" "$file" 2>/dev/null | tail -n1 || true)"
   [ -n "$line" ] || return 0
   printf '%s' "$line" | cut -d= -f2- | tr -d "'" | tr -d '"' | tr -d '\r'
+}
+
+# Read an effective environment key from systemd unit + drop-ins (e.g. strangler.conf PORT=8788,
+# KIN_API_KEY, KIN_DB_PATH) so systemd/overlay hosts do not depend on stale values in .env.
+systemd_env_get() {
+  local key="$1"
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local env_line env_files_line
+  env_line="$(systemctl show "$SYSTEMD_UNIT" --property=Environment --value 2>/dev/null || true)"
+  env_files_line="$(systemctl show "$SYSTEMD_UNIT" --property=EnvironmentFiles --value 2>/dev/null || true)"
+  if [ -z "$env_line" ] && [ -z "$env_files_line" ]; then
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    _SD_KEY="$key" _SD_ENV="$env_line" _SD_FILES="$env_files_line" python3 - <<'PY' 2>/dev/null || true
+import os, re, shlex
+target = os.environ["_SD_KEY"]
+found = None
+# EnvironmentFiles are applied before unit Environment= or in drop-in order; load files first.
+for m in re.finditer(r"(\S+)\s+\(ignore_errors=", os.environ.get("_SD_FILES", "")):
+    fp = m.group(1).lstrip("-")
+    if not os.path.isfile(fp):
+        continue
+    try:
+        with open(fp, encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                s = raw.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                if k.strip() == target:
+                    found = v.strip().strip("'\"")
+    except OSError:
+        pass
+try:
+    tokens = shlex.split(os.environ.get("_SD_ENV", ""))
+except ValueError:
+    tokens = os.environ.get("_SD_ENV", "").split()
+for tok in tokens:
+    if "=" in tok:
+        k, v = tok.split("=", 1)
+        if k == target:
+            found = v
+if found is not None:
+    print(found, end="")
+PY
+    return 0
+  fi
+  local tok
+  for tok in $env_line; do
+    case "$tok" in
+      "${key}="*) printf '%s' "${tok#*=}" ;;
+    esac
+  done
+}
+
+effective_env_get() {
+  local key="$1" mode="${2:-}" val=""
+  if [ "$mode" = "systemd" ]; then
+    val="$(systemd_env_get "$key")"
+    if [ -n "$val" ]; then
+      printf '%s' "$val"
+      return 0
+    fi
+    val="$(env_get "$key" "$SYSTEMD_PG_ENV_FILE")"
+    if [ -n "$val" ]; then
+      printf '%s' "$val"
+      return 0
+    fi
+  fi
+  env_get "$key" "$ENV_FILE"
+}
+
+resolve_control_plane_port() {
+  local mode="${1:-}" port=""
+  port="$(effective_env_get PORT "$mode")"
+  printf '%s' "${port:-8787}"
+}
+
+resolve_api_key() {
+  local mode="${1:-}" key=""
+  key="$(effective_env_get VM2API_API_KEY "$mode")"
+  if [ -z "$key" ]; then
+    key="$(effective_env_get KIN_API_KEY "$mode")"
+  fi
+  printf '%s' "$key"
 }
 
 # Literal, injection-safe env upsert (preserves &, |, ?, = in DATABASE_URL / REDIS_URL).
@@ -387,8 +482,8 @@ detect_mode() {
     echo "docker"
     return
   fi
-  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files "$SYSTEMD_UNIT" >/dev/null 2>&1 && systemctl is-enabled "$SYSTEMD_UNIT" >/dev/null 2>&1; then
-    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$SERVICE_NAME"; then
+  if command -v systemctl >/dev/null 2>&1 && { systemctl is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null || systemctl is-enabled --quiet "$SYSTEMD_UNIT" 2>/dev/null; }; then
+    if ! command -v docker >/dev/null 2>&1 || ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$SERVICE_NAME"; then
       echo "systemd"
       return
     fi
@@ -422,14 +517,20 @@ resolve_pg_runtime() {
 }
 
 resolve_sqlite_path() {
+  local mode="${1:-}"
   if [ -n "$SQLITE_PATH" ]; then
     echo "$SQLITE_PATH"
     return
   fi
-  local from_env
-  from_env="$(env_get KIN_DB_PATH)"
+  local from_env data_dir
+  from_env="$(effective_env_get KIN_DB_PATH "$mode")"
   if [ -n "$from_env" ]; then
     echo "$from_env"
+    return
+  fi
+  data_dir="$(effective_env_get KIN_DATA_DIR "$mode")"
+  if [ -n "$data_dir" ]; then
+    echo "${data_dir%/}/kin.db"
     return
   fi
   echo "${INSTALL_DIR}/data/kin.db"
@@ -510,10 +611,48 @@ host_has_pg_npm_deps() {
   )
 }
 
+ensure_host_migrator_script() {
+  local target="${INSTALL_DIR}/scripts/migrate-sqlite-to-pg.mjs"
+  if [ ! -f "$target" ]; then
+    if [ -n "$SCRIPT_DIR" ] && [ -f "${SCRIPT_DIR}/../scripts/migrate-sqlite-to-pg.mjs" ]; then
+      mkdir -p "${INSTALL_DIR}/scripts"
+      cp -f "${SCRIPT_DIR}/../scripts/migrate-sqlite-to-pg.mjs" "$target"
+      ok "已同步迁移脚本至 ${target}"
+    elif [ "$AUTO_INSTALL_DEPS" = 1 ] && command -v curl >/dev/null 2>&1; then
+      local ref="main" ver=""
+      if [ -f "${INSTALL_DIR}/VERSION" ]; then
+        ver="$(tr -d '[:space:]' <"${INSTALL_DIR}/VERSION" 2>/dev/null || true)"
+        [ -n "$ver" ] && ref="v${ver#v}"
+      fi
+      mkdir -p "${INSTALL_DIR}/scripts"
+      info "缺少 ${target}，正在自动获取 scripts/migrate-sqlite-to-pg.mjs (${ref})..."
+      if ! curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 \
+        "https://raw.githubusercontent.com/${GITHUB_REPO}/${ref}/scripts/migrate-sqlite-to-pg.mjs" -o "${target}.new"; then
+        rm -f "${target}.new"
+        curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 60 \
+          "https://raw.githubusercontent.com/${GITHUB_REPO}/main/scripts/migrate-sqlite-to-pg.mjs" -o "${target}.new" || {
+          rm -f "${target}.new"
+          err "无法自动获取 ${target}，请手动同步最新 scripts/migrate-sqlite-to-pg.mjs 后重试（控制面尚未停止）"
+          return 1
+        }
+      fi
+      mv -f "${target}.new" "$target"
+      ok "已自动补齐迁移脚本: ${target}"
+    else
+      err "缺少迁移脚本 ${target}（请先同步最新 scripts/migrate-sqlite-to-pg.mjs 或移除 --no-install-deps 自动获取；控制面尚未停止）"
+      return 1
+    fi
+  fi
+  if ! node --check "$target" >/dev/null 2>&1; then
+    err "迁移脚本语法检查失败: ${target}"
+    return 1
+  fi
+}
+
 ensure_host_node_pg_deps() {
   local mode="$1"
   if [ "$mode" = "systemd" ] && [ ! -f "${INSTALL_DIR}/src/lib/db/pg/config.mjs" ]; then
-    err "当前 ${INSTALL_DIR} 代码版本尚未包含 PostgreSQL 模块（缺少 src/lib/db/pg/config.mjs）。请先 git pull/checkout 至支持 PostgreSQL 的版本再执行迁移！"
+    err "当前 ${INSTALL_DIR} 代码版本尚未包含 PostgreSQL 模块（缺少 src/lib/db/pg/config.mjs）。请先升级至支持 PostgreSQL 的版本再执行迁移！"
     return 1
   fi
 
@@ -525,6 +664,8 @@ ensure_host_node_pg_deps() {
     err "宿主机 Node.js 版本过低（当前 $(node -v 2>/dev/null || echo unknown)），迁移脚本需要 Node.js >= 22.5（内置 node:sqlite）"
     return 1
   fi
+
+  ensure_host_migrator_script || return 1
 
   if ! host_has_pg_npm_deps; then
     if [ ! -f "${INSTALL_DIR}/package.json" ]; then
@@ -663,12 +804,12 @@ provision_native_pg_redis() {
     return 1
   fi
 
-  info "初始化原生 PostgreSQL 角色与数据库 (${PG_USER} / ${PG_DB})..."
+  info "初始化原生 PostgreSQL 角色与数据库 (${PG_USER} / ${PG_DB} on port ${PG_PORT})..."
   local esc_user esc_db esc_pass
   esc_user="${PG_USER//\'/\'\'}"
   esc_db="${PG_DB//\'/\'\'}"
   esc_pass="${PG_PASSWORD//\'/\'\'}"
-  su - postgres -c "psql -v ON_ERROR_STOP=1" <<SQL >/dev/null
+  su - postgres -c "psql -p \"${PG_PORT}\" -v ON_ERROR_STOP=1" <<SQL >/dev/null
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${esc_user}') THEN
@@ -679,9 +820,15 @@ BEGIN
 END
 \$\$;
 SQL
-  if ! su - postgres -c "psql -tAc \"SELECT 1 FROM pg_database WHERE datname='${esc_db}'\"" | grep -qx 1; then
-    su - postgres -c "createdb -O \"${PG_USER}\" \"${PG_DB}\""
+  if ! su - postgres -c "psql -p \"${PG_PORT}\" -tAc \"SELECT 1 FROM pg_database WHERE datname='${esc_db}'\"" | grep -qx 1; then
+    su - postgres -c "createdb -p \"${PG_PORT}\" -O \"${PG_USER}\" \"${PG_DB}\""
   fi
+  # PostgreSQL 15+ revokes CREATE on schema public from PUBLIC; ensure role owns DB & public schema.
+  su - postgres -c "psql -p \"${PG_PORT}\" -d \"${PG_DB}\" -v ON_ERROR_STOP=1" <<SQL >/dev/null
+ALTER DATABASE "${PG_DB}" OWNER TO "${PG_USER}";
+GRANT ALL ON SCHEMA public TO "${PG_USER}";
+ALTER SCHEMA public OWNER TO "${PG_USER}";
+SQL
   ok "宿主机原生 PostgreSQL 角色与数据库已就绪"
 
   if [ "$NO_REDIS" = 0 ] && [ -z "$REDIS_URL_ARG" ] && command -v redis-server >/dev/null 2>&1; then
@@ -780,20 +927,53 @@ start_control_plane() {
   fi
 }
 
+run_sqlite_preflight() {
+  local runner="$1" sqlite_file="$2" dsn="${3:-}"
+  info "执行零停机 SQLite 表结构与约束预检（--preflight）..."
+  local -a extra=()
+  [ -n "$dsn" ] && extra+=(--pg-url "$dsn")
+  if [ "$runner" = "host" ]; then
+    node "${INSTALL_DIR}/scripts/migrate-sqlite-to-pg.mjs" \
+      --sqlite "$sqlite_file" \
+      --preflight \
+      "${extra[@]}"
+  else
+    local default_sqlite="${INSTALL_DIR}/data/kin.db"
+    if [ "$sqlite_file" = "$default_sqlite" ]; then
+      compose_cmd run --rm --no-deps --entrypoint node "$SERVICE_NAME" \
+        /opt/vm2api/scripts/migrate-sqlite-to-pg.mjs \
+        --sqlite /opt/vm2api/data/kin.db \
+        --preflight \
+        "${extra[@]}"
+    else
+      local src_dir src_base
+      src_dir="$(cd "$(dirname "$sqlite_file")" && pwd)"
+      src_base="$(basename "$sqlite_file")"
+      compose_cmd run --rm --no-deps \
+        -v "${src_dir}:/tmp/vm2api-migrate-src:ro" \
+        --entrypoint node "$SERVICE_NAME" \
+        /opt/vm2api/scripts/migrate-sqlite-to-pg.mjs \
+        --sqlite "/tmp/vm2api-migrate-src/${src_base}" \
+        --preflight \
+        "${extra[@]}"
+    fi
+  fi
+}
+
 show_status() {
-  local mode port driver bg_active
+  local mode port driver bg_active sqlite_file
   mode="$(detect_mode)"
   bg_active="$(detect_bluegreen_active)"
-  port="$(env_get PORT)"
-  port="${port:-8787}"
-  driver="$(env_get VM2API_DB_DRIVER)"
+  port="$(resolve_control_plane_port "$mode")"
+  driver="$(effective_env_get VM2API_DB_DRIVER "$mode")"
+  sqlite_file="$(resolve_sqlite_path "$mode")"
   echo "安装目录:   ${INSTALL_DIR}"
   echo "部署模式:   ${mode}${bg_active:+ (bluegreen:${bg_active})}"
   echo "DB 驱动:    ${driver:-auto}"
-  echo "SQLite 文件: $(resolve_sqlite_path) ($([ -f "$(resolve_sqlite_path)" ] && ls -lh "$(resolve_sqlite_path)" | awk '{print $5}' || echo '不存在'))"
+  echo "SQLite 文件: ${sqlite_file} ($([ -f "$sqlite_file" ] && ls -lh "$sqlite_file" | awk '{print $5}' || echo '不存在'))"
   echo "宿主依赖:   psql=$(command -v psql >/dev/null 2>&1 && echo ok || echo missing) pg_dump=$(command -v pg_dump >/dev/null 2>&1 && echo ok || echo missing) docker=$(command -v docker >/dev/null 2>&1 && echo ok || echo missing) node=$(command -v node >/dev/null 2>&1 && node -v || echo missing)"
   if [ -f "$SYSTEMD_DROPIN_FILE" ]; then
-    echo "Systemd PG: ${SYSTEMD_DROPIN_FILE} (已启用)"
+    echo "Systemd PG: ${SYSTEMD_DROPIN_FILE} (已启用${SYSTEMD_PG_ENV_FILE:+, env=${SYSTEMD_PG_ENV_FILE}})"
   fi
   if command -v docker >/dev/null 2>&1; then
     docker ps -a --filter "name=vm2api" --format "容器:       {{.Names}}  {{.Status}}  {{.Ports}}" 2>/dev/null || true
@@ -801,7 +981,7 @@ show_status() {
   if curl -fsS --noproxy '*' "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
     echo "控制面探活: ok (http://127.0.0.1:${port}/health)"
   else
-    echo "控制面探活: down"
+    echo "控制面探活: down (http://127.0.0.1:${port}/health)"
   fi
 }
 
@@ -817,6 +997,10 @@ do_rollback() {
       rm -f "$SYSTEMD_DROPIN_FILE"
       ok "已移除 systemd drop-in: ${SYSTEMD_DROPIN_FILE}"
     fi
+    if [ -f "$SYSTEMD_PG_ENV_FILE" ]; then
+      rm -f "$SYSTEMD_PG_ENV_FILE"
+      ok "已移除 systemd PG 环境文件: ${SYSTEMD_PG_ENV_FILE}"
+    fi
     systemctl daemon-reload
   fi
 
@@ -831,16 +1015,15 @@ do_rollback() {
   # Rollback to SQLite must NEVER depend on PG/Redis containers.
   start_control_plane "$mode" "$bg_active" 1
 
-  port="$(env_get PORT)"
-  port="${port:-8787}"
+  port="$(resolve_control_plane_port "$mode")"
   for _ in $(seq 1 30); do
     if curl -fsS --noproxy '*' "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
-      ok "回滚完成，控制面已切回 SQLite 并通过健康检查！"
+      ok "回滚完成，控制面已切回 SQLite 并通过健康检查！(http://127.0.0.1:${port}/health)"
       exit 0
     fi
     sleep 2
   done
-  err "回滚后控制面探活超时，请检查日志"
+  err "回滚后控制面探活超时 (http://127.0.0.1:${port}/health)，请检查日志"
   exit 1
 }
 
@@ -857,7 +1040,7 @@ fi
 MODE="$(detect_mode)"
 BG_ACTIVE="$(detect_bluegreen_active)"
 RESOLVED_PG_RUNTIME="$(resolve_pg_runtime "$MODE")"
-SRC_SQLITE="$(resolve_sqlite_path)"
+SRC_SQLITE="$(resolve_sqlite_path "$MODE")"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 MIGRATION_BACKUP_DIR="${BACKUP_ROOT}/pre-pg-migration-${STAMP}"
 
@@ -975,22 +1158,31 @@ else
   info "目标缓存: L1 + 本地(${RESOLVED_PG_RUNTIME}) Redis 127.0.0.1:${REDIS_PORT}"
 fi
 
-# External target pre-flight probe BEFORE dry-run completion or stopping control plane
+# External target pre-flight probe + zero-downtime SQLite schema/hazard preflight BEFORE stopping control plane
 if [ "$EXTERNAL_PG" = 1 ]; then
   probe_pg_connectivity "$TARGET_DSN" "$MIGRATOR_RUNNER"
+  run_sqlite_preflight "$MIGRATOR_RUNNER" "$SRC_SQLITE" "$TARGET_DSN"
+else
+  run_sqlite_preflight "$MIGRATOR_RUNNER" "$SRC_SQLITE"
 fi
 if [ -n "$REDIS_URL_ARG" ] && [ "$NO_REDIS" = 0 ]; then
   probe_redis_connectivity "$TARGET_REDIS_URL" "$MIGRATOR_RUNNER"
 fi
 
+if [ "$PREFLIGHT_ONLY" = 1 ]; then
+  echo ""
+  ok "[PREFLIGHT] 零停机 SQLite 结构/约束与依赖预检全部通过！"
+  exit 0
+fi
+
 if [ "$DRY_RUN" = 1 ]; then
   echo ""
-  ok "[DRY-RUN] 全部依赖与预检通过！拟执行步骤："
+  ok "[DRY-RUN] 全部依赖、SQLite 预扫与预检通过！拟执行步骤："
   echo "  1. 备份 ${SRC_SQLITE} 及 .env 到 ${MIGRATION_BACKUP_DIR}"
   echo "  2. 准备并校验 PostgreSQL（${RESOLVED_PG_RUNTIME}）${NO_REDIS:+（无 Redis）}"
   echo "  3. 仅停止控制面（${MODE}${BG_ACTIVE:+/bluegreen:${BG_ACTIVE}}），保持全部 kin-* 槽位运行"
   echo "  4. 使用 ${MIGRATOR_RUNNER} 执行器流式迁移全部表并运行 --verify + --rollup"
-  echo "  5. 切换配置为 VM2API_DB_DRIVER=postgres 并重启控制面验证 /health 与 /api/panel/database/metrics"
+  echo "  5. 切换配置为 VM2API_DB_DRIVER=postgres 并重启控制面验证 http://127.0.0.1:$(resolve_control_plane_port "$MODE")/health 与 /api/panel/database/metrics"
   exit 0
 fi
 
@@ -1045,7 +1237,20 @@ start_local_pg_redis() {
       compose_cmd pull postgres >/dev/null 2>&1 || true
       compose_cmd up -d postgres
     else
+      local need_create_pg=0
       if ! docker ps -a --format '{{.Names}}' | grep -qx "$PG_CONTAINER_NAME"; then
+        need_create_pg=1
+      else
+        local pg_running pg_mapped_port
+        pg_running="$(docker inspect -f '{{.State.Running}}' "$PG_CONTAINER_NAME" 2>/dev/null || echo false)"
+        pg_mapped_port="$(docker inspect -f '{{(index (index .HostConfig.PortBindings "5432/tcp") 0).HostPort}}' "$PG_CONTAINER_NAME" 2>/dev/null || true)"
+        if [ "$pg_running" != "true" ] && [ -n "$pg_mapped_port" ] && [ "$pg_mapped_port" != "$PG_PORT" ]; then
+          warn "已停止的容器 ${PG_CONTAINER_NAME} 端口映射(${pg_mapped_port})与目标端口(${PG_PORT})不一致，重建容器（保留数据目录）..."
+          docker rm "$PG_CONTAINER_NAME" >/dev/null
+          need_create_pg=1
+        fi
+      fi
+      if [ "$need_create_pg" = 1 ]; then
         local pg_host_dir="${PG_DATA_DIR_ARG:-${INSTALL_DIR}/data/postgres}"
         mkdir -p "$pg_host_dir"
         docker run -d --name "$PG_CONTAINER_NAME" --restart unless-stopped \
@@ -1055,8 +1260,16 @@ start_local_pg_redis() {
           -e PGDATA=/var/lib/postgresql/data \
           -p "127.0.0.1:${PG_PORT}:5432" \
           -v "${pg_host_dir}:/var/lib/postgresql/data" \
+          --health-cmd "pg_isready -U ${PG_USER} -d ${PG_DB}" \
+          --health-interval 5s --health-timeout 5s --health-retries 12 \
           postgres:18-alpine \
-          -c max_connections=200 -c shared_buffers=256MB
+          -c max_connections=200 \
+          -c shared_buffers=256MB \
+          -c effective_cache_size=768MB \
+          -c work_mem=16MB \
+          -c maintenance_work_mem=128MB \
+          -c wal_buffers=16MB \
+          -c random_page_cost=1.1
       else
         docker start "$PG_CONTAINER_NAME" >/dev/null
       fi
@@ -1085,13 +1298,28 @@ start_local_pg_redis() {
       compose_cmd pull redis >/dev/null 2>&1 || true
       compose_cmd up -d redis
     else
+      local need_create_redis=0
       if ! docker ps -a --format '{{.Names}}' | grep -qx "$REDIS_CONTAINER_NAME"; then
+        need_create_redis=1
+      else
+        local r_running r_mapped_port
+        r_running="$(docker inspect -f '{{.State.Running}}' "$REDIS_CONTAINER_NAME" 2>/dev/null || echo false)"
+        r_mapped_port="$(docker inspect -f '{{(index (index .HostConfig.PortBindings "6379/tcp") 0).HostPort}}' "$REDIS_CONTAINER_NAME" 2>/dev/null || true)"
+        if [ "$r_running" != "true" ] && [ -n "$r_mapped_port" ] && [ "$r_mapped_port" != "$REDIS_PORT" ]; then
+          warn "已停止的容器 ${REDIS_CONTAINER_NAME} 端口映射(${r_mapped_port})与目标端口(${REDIS_PORT})不一致，重建容器（保留数据目录）..."
+          docker rm "$REDIS_CONTAINER_NAME" >/dev/null
+          need_create_redis=1
+        fi
+      fi
+      if [ "$need_create_redis" = 1 ]; then
         local redis_host_dir="${REDIS_DATA_DIR_ARG:-${INSTALL_DIR}/data/redis}"
         mkdir -p "$redis_host_dir"
         docker run -d --name "$REDIS_CONTAINER_NAME" --restart unless-stopped \
           -p "127.0.0.1:${REDIS_PORT}:6379" \
           -v "${redis_host_dir}:/data" \
-          redis:8-alpine redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"
+          --health-cmd "redis-cli -a \"${REDIS_PASSWORD}\" --no-auth-warning ping | grep -q PONG" \
+          --health-interval 5s --health-timeout 5s --health-retries 10 \
+          redis:8-alpine redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass "$REDIS_PASSWORD"
       else
         docker start "$REDIS_CONTAINER_NAME" >/dev/null
       fi
@@ -1144,7 +1372,7 @@ cleanup_on_failure() {
     env_set VM2API_DB_DRIVER sqlite
   fi
   if [ "$MODE" = "systemd" ]; then
-    rm -f "$SYSTEMD_DROPIN_FILE" 2>/dev/null || true
+    rm -f "$SYSTEMD_DROPIN_FILE" "$SYSTEMD_PG_ENV_FILE" 2>/dev/null || true
     systemctl daemon-reload || true
   fi
   # Always roll back to SQLite with --no-deps so PG/Redis never blocks recovery.
@@ -1220,20 +1448,30 @@ if [ "$EXTERNAL_PG" = 1 ] || [ "$NO_REDIS" = 1 ] || [ -n "$REDIS_URL_ARG" ] || [
 fi
 
 if [ "$MODE" = "systemd" ]; then
+  # Write credentials to a 0600 EnvironmentFile rather than inline Environment= lines:
+  # avoids systemd %-specifier expansion on URL-encoded passwords and hides secrets from `systemctl cat`.
+  local_tmp_pg_env="$(mktemp "${SYSTEMD_PG_ENV_FILE}.XXXXXX")"
+  {
+    printf '# Managed by deploy/replace-db-to-pg.sh (%s)\n' "$STAMP"
+    printf 'VM2API_DB_DRIVER=postgres\n'
+    printf 'DATABASE_URL=%s\n' "$TARGET_DSN"
+    if [ -n "$TARGET_REDIS_URL" ]; then
+      printf 'REDIS_URL=%s\n' "$TARGET_REDIS_URL"
+      printf 'VM2API_REDIS_DISABLED=0\n'
+    else
+      printf 'VM2API_REDIS_DISABLED=1\n'
+    fi
+  } >"$local_tmp_pg_env"
+  chmod 600 "$local_tmp_pg_env"
+  mv -f "$local_tmp_pg_env" "$SYSTEMD_PG_ENV_FILE"
+
   mkdir -p "$SYSTEMD_DROPIN_DIR"
   {
     printf '# Managed by deploy/replace-db-to-pg.sh (%s)\n' "$STAMP"
     printf '[Service]\n'
-    printf 'Environment=VM2API_DB_DRIVER=postgres\n'
-    printf 'Environment=DATABASE_URL=%s\n' "$TARGET_DSN"
-    if [ -n "$TARGET_REDIS_URL" ]; then
-      printf 'Environment=REDIS_URL=%s\n' "$TARGET_REDIS_URL"
-      printf 'Environment=VM2API_REDIS_DISABLED=0\n'
-    else
-      printf 'Environment=VM2API_REDIS_DISABLED=1\n'
-    fi
+    printf 'EnvironmentFile=%s\n' "$SYSTEMD_PG_ENV_FILE"
   } >"$SYSTEMD_DROPIN_FILE"
-  chmod 600 "$SYSTEMD_DROPIN_FILE"
+  chmod 644 "$SYSTEMD_DROPIN_FILE"
   systemctl daemon-reload
 fi
 
@@ -1242,8 +1480,7 @@ start_control_plane "$MODE" "$BG_ACTIVE" "$USE_NO_DEPS"
 # ---------------------------------------------------------------------------
 # Phase 4: Verify live /health and /api/panel/database/metrics
 # ---------------------------------------------------------------------------
-PORT_VAL="$(env_get PORT)"
-PORT_VAL="${PORT_VAL:-8787}"
+PORT_VAL="$(resolve_control_plane_port "$MODE")"
 info "等待控制面就绪 (http://127.0.0.1:${PORT_VAL}/health)..."
 HEALTH_OK=0
 for _ in $(seq 1 45); do
@@ -1254,12 +1491,11 @@ for _ in $(seq 1 45); do
   sleep 2
 done
 if [ "$HEALTH_OK" != 1 ]; then
-  err "控制面健康检查超时"
+  err "控制面健康检查超时 (http://127.0.0.1:${PORT_VAL}/health)"
   false
 fi
 
-API_KEY_VAL="$(env_get VM2API_API_KEY)"
-API_KEY_VAL="${API_KEY_VAL:-$(env_get KIN_API_KEY)}"
+API_KEY_VAL="$(resolve_api_key "$MODE")"
 if [ -n "$API_KEY_VAL" ]; then
   METRICS_JSON="$(curl -fsS --noproxy '*' -H "Authorization: Bearer ${API_KEY_VAL}" "http://127.0.0.1:${PORT_VAL}/api/panel/database/metrics" 2>/dev/null || true)"
   if [ -z "$METRICS_JSON" ]; then

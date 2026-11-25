@@ -435,6 +435,28 @@ export function withTransaction(db, fn) {
 }
 
 /**
+ * Isolate a fallible step inside an active PostgreSQL transaction using a SAVEPOINT.
+ * Prevents a caught SQL error from poisoning subsequent statements with `25P02`.
+ * Zero-overhead pass-through on SQLite or outside an active transaction.
+ */
+export function withSavepoint(db, name, fn) {
+  if (!db || db.engine !== 'postgres' || !db.isTransaction) return fn()
+  const sp = String(name || 'sp').replace(/[^a-zA-Z0-9_]/g, '_')
+  db.exec(`SAVEPOINT ${sp}`)
+  try {
+    const out = fn()
+    db.exec(`RELEASE SAVEPOINT ${sp}`)
+    return out
+  } catch (err) {
+    try {
+      db.exec(`ROLLBACK TO SAVEPOINT ${sp}`)
+      db.exec(`RELEASE SAVEPOINT ${sp}`)
+    } catch {}
+    throw err
+  }
+}
+
+/**
  * Online-consistent snapshot of the live SQLite database (WAL-safe).
  * @returns {string} destination path
  */

@@ -458,11 +458,13 @@ test('redemption accepts the device UUID the panel shows, as well as the hashed 
 
 test('retiring a host drops its local rights and reports what can be carried over', async (t) => {
   let issued
+  let unbound = false
   const seen = []
   const { root, publicDir, connect } = standaloneHost(t, async (url, { body }) => {
     const action = url.slice(url.lastIndexOf('/') + 1)
     seen.push(action)
     if (action === 'unbind') {
+      unbound = true
       return Response.json({
         ok: true,
         data: {
@@ -471,6 +473,9 @@ test('retiring a host drops its local rights and reports what can be carried ove
           cooldown_until: Math.floor(Date.now() / 1000) + 604800,
         },
       })
+    }
+    if (unbound) {
+      return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
     }
     issued ??= issueHostEntitlement(root, JSON.parse(body).host_id, { slot_limit: 2 })
     return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
@@ -2025,6 +2030,7 @@ test('a lost renewal response suspends real control admission until restart repl
   const service = connect()
   assert.deepEqual(await service.status(), {
     ready: true,
+    host_id: service.deviceIdentity().hostId,
     // Identity travels with every status: the panel shows it, and an identity
     // fault is only diagnosable with its source. Derived here rather than
     // hardcoded because the fixture's machine-id is random per run.
@@ -3503,4 +3509,153 @@ test('rebuild-identity panel route invokes subscription.rebuildIdentity with emp
   const invalid = await handler({ ...req, rawBody: JSON.stringify({ extra: true }) }, res, route)
   assert.equal(invalid.status, 400)
   assert.equal(called, 1)
+})
+
+test('direct-credit pull via status() activates an unredeemed host without Bearer and upgrades revisions', async (t) => {
+  let remoteRights
+  const seenAuth = []
+  const { root, publicDir, connect } = standaloneHost(t, async (url, { body, headers }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    seenAuth.push([action, headers.authorization ?? null])
+    const req = JSON.parse(body)
+    if (action === 'status') {
+      if (!remoteRights) return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+      return Response.json({
+        ok: true,
+        data: { entitlement: remoteRights.code, ...remoteRights.claims, used_slots: 0 },
+      })
+    }
+    return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+  })
+  seedEncryptedPackage(root)
+  const service = connect()
+  const hostId = service.purchaseDeviceId()
+
+  // Unredeemed host with 404 stays unredeemed without writing local entitlement.
+  const empty = await service.status()
+  assert.equal(empty.state, 'unredeemed')
+  assert.equal(empty.host_id, hostId)
+  assert.equal(seenAuth[0][1], null, 'unredeemed status pull sends no Bearer header')
+  assert.equal(fs.existsSync(path.join(publicDir, 'entitlement.code')), false)
+
+  // Direct credit lands at Authority -> status() pulls signed entitlement rev 1 automatically.
+  remoteRights = issueHostEntitlement(root, hostId, { revision: 1, slot_limit: 4 })
+  const credited = await service.status()
+  assert.equal(credited.state, 'active')
+  assert.equal(credited.slot_limit, 4)
+  assert.equal(credited.revision, 1)
+  assert.equal(fs.readFileSync(path.join(publicDir, 'entitlement.code'), 'utf8'), remoteRights.code)
+
+  // Second purchase stacks slots at Authority (rev 2) -> status() upgrades local entitlement automatically.
+  remoteRights = issueHostEntitlement(root, hostId, { revision: 2, slot_limit: 9 })
+  const stacked = await service.status()
+  assert.equal(stacked.state, 'active')
+  assert.equal(stacked.slot_limit, 9)
+  assert.equal(stacked.revision, 2)
+})
+
+test('cloud orders and whole-host migration work via host_id or device UUID and expose panel routes', async (t) => {
+  const fromHost = '1'.repeat(64)
+  let migratedPayload
+  const { root, publicDir, connect } = standaloneHost(t, async (url, { body, headers }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    const req = JSON.parse(body)
+    if (action === 'orders') {
+      assert.equal(headers.authorization, undefined)
+      return Response.json({
+        ok: true,
+        data: {
+          host_id: req.host_id,
+          product: 'crag-v2',
+          orders: [
+            {
+              order_id: 'ord-1',
+              order_kind: 'purchase',
+              sku: 'starter-1m',
+              slot_limit: 2,
+              months: 1,
+              amount_minor: 2900,
+              subtotal_minor: 2900,
+              discount_minor: 0,
+              payment_method: 'alipay',
+              original_host_id: req.host_id,
+              current_host_id: req.host_id,
+              status: 'active',
+              paid_at: 1700000000,
+              granted_at: 1700000000,
+              expires_at: 1900000000,
+              created_at: 1700000000,
+            },
+          ],
+          vouchers: [{ code_id: 'c-1', slot_limit: 2, months: 1, status: 'active' }],
+          total: 1,
+          limit: req.limit,
+          offset: req.offset,
+        },
+      })
+    }
+    if (action === 'migrate') {
+      migratedPayload = req
+      const rights = issueHostEntitlement(root, req.to_host_id, { revision: 3, slot_limit: 6 })
+      return Response.json({
+        ok: true,
+        data: {
+          from_host_id: req.from_host_id,
+          to_host_id: req.to_host_id,
+          migrated_vouchers: 2,
+          migrated_orders: 3,
+          rights: { entitlement: rights.code, ...rights.claims, used_slots: 0 },
+        },
+      })
+    }
+    return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+  })
+  seedEncryptedPackage(root)
+  const service = connect()
+  const toHost = service.purchaseDeviceId()
+
+  const handler = createCragSubscriptionHandler({
+    subscription: service,
+    json: (_, status, body) => ({ status, body }),
+    readRawBody: (req) => Buffer.from(req.rawBody || '{}'),
+  })
+  const baseReq = {
+    panelUser: 'owner',
+    panelRole: 'admin',
+    headers: { host: 'localhost', origin: 'http://localhost', 'content-type': 'application/json' },
+  }
+  const res = { setHeader() {} }
+
+  const ordersRoute = cragSubscriptionRoute('GET', '/api/panel/crag-subscription/orders')
+  const ordersRes = await handler(
+    { ...baseReq, url: '/api/panel/crag-subscription/orders?limit=20&offset=0' },
+    res,
+    ordersRoute,
+  )
+  assert.equal(ordersRes.status, 200)
+  assert.equal(ordersRes.body.data.host_id, toHost)
+  assert.equal(ordersRes.body.data.orders.length, 1)
+  assert.equal(ordersRes.body.data.orders[0].amount_minor, 2900)
+
+  const migrateRoute = cragSubscriptionRoute('POST', '/api/panel/crag-subscription/migrate')
+  const selfMigrate = await handler(
+    { ...baseReq, rawBody: JSON.stringify({ from_host_id: toHost }) },
+    res,
+    migrateRoute,
+  )
+  assert.equal(selfMigrate.status, 400)
+
+  const migratedRes = await handler(
+    { ...baseReq, rawBody: JSON.stringify({ from_host_id: fromHost }) },
+    res,
+    migrateRoute,
+  )
+  assert.equal(migratedRes.status, 200)
+  assert.equal(migratedPayload.from_host_id, fromHost)
+  assert.equal(migratedPayload.to_host_id, toHost)
+  assert.equal(migratedRes.body.data.migrated_vouchers, 2)
+  assert.equal(migratedRes.body.data.migrated_orders, 3)
+  assert.equal(migratedRes.body.data.status.state, 'active')
+  assert.equal(migratedRes.body.data.status.slot_limit, 6)
+  assert.equal(fs.existsSync(path.join(publicDir, 'entitlement.code')), true)
 })
