@@ -266,9 +266,24 @@ resolve_control_plane_port() {
 
 resolve_api_key() {
   local mode="${1:-}" key=""
-  key="$(effective_env_get VM2API_API_KEY "$mode")"
+  if [ "$mode" = "systemd" ]; then
+    # Prefer live systemd unit/drop-in keys before falling back to a possibly stale .env file.
+    key="$(systemd_env_get VM2API_API_KEY)"
+    if [ -z "$key" ]; then
+      key="$(systemd_env_get KIN_API_KEY)"
+    fi
+    if [ -z "$key" ]; then
+      key="$(env_get VM2API_API_KEY "$SYSTEMD_PG_ENV_FILE")"
+    fi
+    if [ -z "$key" ]; then
+      key="$(env_get KIN_API_KEY "$SYSTEMD_PG_ENV_FILE")"
+    fi
+  fi
   if [ -z "$key" ]; then
-    key="$(effective_env_get KIN_API_KEY "$mode")"
+    key="$(env_get VM2API_API_KEY "$ENV_FILE")"
+  fi
+  if [ -z "$key" ]; then
+    key="$(env_get KIN_API_KEY "$ENV_FILE")"
   fi
   printf '%s' "$key"
 }
@@ -1176,10 +1191,12 @@ if [ "$PREFLIGHT_ONLY" = 1 ]; then
 fi
 
 if [ "$DRY_RUN" = 1 ]; then
+  local_redis_note=""
+  [ "$NO_REDIS" = 1 ] && local_redis_note="（无 Redis）"
   echo ""
   ok "[DRY-RUN] 全部依赖、SQLite 预扫与预检通过！拟执行步骤："
   echo "  1. 备份 ${SRC_SQLITE} 及 .env 到 ${MIGRATION_BACKUP_DIR}"
-  echo "  2. 准备并校验 PostgreSQL（${RESOLVED_PG_RUNTIME}）${NO_REDIS:+（无 Redis）}"
+  echo "  2. 准备并校验 PostgreSQL（${RESOLVED_PG_RUNTIME}）${local_redis_note}"
   echo "  3. 仅停止控制面（${MODE}${BG_ACTIVE:+/bluegreen:${BG_ACTIVE}}），保持全部 kin-* 槽位运行"
   echo "  4. 使用 ${MIGRATOR_RUNNER} 执行器流式迁移全部表并运行 --verify + --rollup"
   echo "  5. 切换配置为 VM2API_DB_DRIVER=postgres 并重启控制面验证 http://127.0.0.1:$(resolve_control_plane_port "$MODE")/health 与 /api/panel/database/metrics"
@@ -1375,6 +1392,8 @@ cleanup_on_failure() {
     rm -f "$SYSTEMD_DROPIN_FILE" "$SYSTEMD_PG_ENV_FILE" 2>/dev/null || true
     systemctl daemon-reload || true
   fi
+  # Stop first if Phase 3 already started the control plane so rollback genuinely restarts onto SQLite.
+  stop_control_plane "$MODE" "$BG_ACTIVE" || true
   # Always roll back to SQLite with --no-deps so PG/Redis never blocks recovery.
   start_control_plane "$MODE" "$BG_ACTIVE" 1 || true
 }
