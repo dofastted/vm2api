@@ -134,6 +134,7 @@ import { installJevUsageRecorder } from './lib/protocol/jev-usage.mjs'
 import { runLegacyImport } from './lib/db/legacy-import.mjs'
 import { initVmDbSync, stopVmWatch } from './lib/vm/vm-db-sync.mjs'
 import { BackupService } from './lib/admin/backup-service.mjs'
+import { ensureRedaction } from './lib/redaction/runtime.mjs'
 import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
 import { createHostMemoryPressure, installHostMemoryPressure } from './lib/cluster/host-memory-pressure.mjs'
@@ -883,7 +884,7 @@ const backupService = new BackupService({
   projectRoot: cfg.paths.project,
   configDir: path.dirname(routingConfigPath),
 })
-backupService.onRestored((db) => {
+backupService.onRestored(async (db) => {
   // A restore swaps the DatabaseSync instance and routing files. Rebuild every
   // holder before reporting success; otherwise requests keep stale snapshots
   // or silently write through statements owned by the closed connection.
@@ -925,6 +926,11 @@ backupService.onRestored((db) => {
   initPoolRuntime()
   reloadActiveVm(cfg)
   vmTestSchedule.reload()
+  try {
+    await ensureRedaction(routingConfig, { projectRoot: cfg.paths.project })
+  } catch (err) {
+    console.warn('[backup] redaction resync after restore failed:', String(err?.message || err))
+  }
 })
 // A just-activated leader waits for the draining controller to exit before its catch-up backup:
 // that one may still be mid-run, and two full snapshots of a large DB would run side by side.

@@ -1,5 +1,5 @@
 /**
- * SQLite-backed request logs for access, usage, and billing.
+ * Database-backed request logs (PostgreSQL / SQLite) for access, usage, and billing.
  *
  * Modes:
  *   off    — no writes

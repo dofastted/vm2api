@@ -33,6 +33,16 @@ export type PersonaBlock = {
   cache_control?: { type?: string; ttl?: string; [key: string]: unknown }
   [key: string]: unknown
 }
+export type BackupDbEngine = 'postgres' | 'sqlite'
+
+export type BackupIncludes = {
+  db?: boolean
+  engine?: BackupDbEngine
+  format?: string
+  vms?: number
+  config?: number
+}
+
 export type BackupItem = {
   id: string
   created_at?: string
@@ -42,6 +52,7 @@ export type BackupItem = {
   size?: number
   size_bytes?: number | null
   file_exists?: boolean
+  includes?: BackupIncludes | null
   error?: string | null
   note?: string | null
 }
@@ -348,6 +359,7 @@ export type NotifyStatus = {
 }
 
 export type BackupsPayload = {
+  engine?: BackupDbEngine
   items?: BackupItem[]
 }
 
