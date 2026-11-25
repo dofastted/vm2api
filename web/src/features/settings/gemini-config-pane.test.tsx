@@ -22,10 +22,16 @@ vi.mock('@tanstack/react-router', () => ({
   Link: ({
     children,
     className,
+    hash,
   }: {
     children: React.ReactNode
     className?: string
-  }) => <a className={className}>{children}</a>,
+    hash?: string
+  }) => (
+    <a className={className} data-hash={hash}>
+      {children}
+    </a>
+  ),
 }))
 
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
@@ -152,5 +158,22 @@ describe('settings Gemini entry & scheduling config pane', () => {
     expect(selectedTitleFor(16, 64)).toBe('高')
     expect(selectedTitleFor(1, 4)).toBe('初')
     expect(selectedTitleFor(8, 32)).toBe('高')
+  })
+
+  it('aligns disabled 403 copy, sticky ttl=0 wording, and maintenance section hash', () => {
+    const html = renderToStaticMarkup(
+      <GeminiConfigPane
+        value={{
+          enabled: false,
+          sticky: { enabled: true, ttl_seconds: 0 },
+        }}
+        onChange={vi.fn()}
+      />
+    )
+    expect(html).toContain('返回 403（gemini_disabled）')
+    expect(html).not.toContain('返回 503')
+    expect(html).toContain('设为 0 时不保留跨请求粘性绑定')
+    expect(html).toContain('>不保留<')
+    expect(html).toContain('data-hash="gemini-maintenance"')
   })
 })

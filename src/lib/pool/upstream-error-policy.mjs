@@ -540,6 +540,7 @@ function classifyUpstreamResultRaw(
       cooldownUntil: null,
       retrySameAccount: false,
       pauseSchedule: true,
+      ...(status === 400 || status === 403 ? { circuit: true } : {}),
       detail: { status, message: message.slice(0, 500) },
     }
   }
@@ -572,6 +573,7 @@ function classifyUpstreamResultRaw(
       reason: 'credential_refresh_failed',
       cooldownUntil: now + CREDENTIAL_ENSURE_COOLDOWN_MS,
       retrySameAccount: false,
+      circuit: true,
     }
   }
   // Plan limit arrives as 429, as a kernel 502 provider_error, or (pre-restore)
@@ -706,7 +708,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
       }
     }
-    return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null }
+    return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null, circuit: true }
   }
   if (status === 401) return classifyOAuth401(hasRefresh, hay)
   if (status === 403) {
@@ -716,6 +718,7 @@ function classifyUpstreamResultRaw(
         action: 'continue-and-cooldown',
         reason: 'proxy_or_edge_forbidden',
         cooldownUntil: now + 60_000,
+        circuit: true,
       }
     }
     if (isFableModel(model)) {
@@ -726,6 +729,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: null,
         retrySameAccount: false,
         mark_tier: 'pro',
+        circuit: true,
       }
     }
     return {
@@ -733,6 +737,7 @@ function classifyUpstreamResultRaw(
       action: 'continue-and-cooldown',
       reason: 'permission_denied',
       cooldownUntil: now + clampOauth401CooldownMs(oauth401CooldownMs),
+      circuit: true,
     }
   }
   if (status === 429) {

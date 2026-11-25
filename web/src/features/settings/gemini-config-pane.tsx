@@ -14,6 +14,7 @@ import {
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { fmtDuration } from '@/lib/format'
+import { GEMINI_MAINTENANCE_SECTION_ID } from '@/lib/gemini-recovery'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -239,7 +240,11 @@ function DaemonLivePanel({
             className='h-7 gap-1 px-2 text-xs'
             asChild
           >
-            <Link to='/settings/$tab' params={{ tab: 'gemini' }}>
+            <Link
+              to='/settings/$tab'
+              params={{ tab: 'gemini' }}
+              hash={GEMINI_MAINTENANCE_SECTION_ID}
+            >
               <Wrench className='size-3' />
               Gemini 维护
             </Link>
@@ -258,27 +263,39 @@ function DaemonLivePanel({
         <div className='space-y-3'>
           <div className='grid grid-cols-2 gap-2.5 sm:grid-cols-4'>
             <div className='rounded-md border bg-muted/25 px-3 py-2'>
-              <div className='text-[11px] text-muted-foreground'>活跃分片 / 规划</div>
+              <div className='text-[11px] text-muted-foreground'>
+                活跃分片 / 规划
+              </div>
               <div className='mt-0.5 text-sm font-semibold tabular-nums'>
                 {shards.length} / {status?.planned_shards ?? 0}
               </div>
             </div>
             <div className='rounded-md border bg-muted/25 px-3 py-2'>
-              <div className='text-[11px] text-muted-foreground'>接管账号 / 已授权</div>
+              <div className='text-[11px] text-muted-foreground'>
+                接管账号 / 已授权
+              </div>
               <div className='mt-0.5 text-sm font-semibold tabular-nums'>
-                {status?.total_accounts ?? 0} / {status?.authorized_oauth_accounts ?? 0}
+                {status?.total_accounts ?? 0} /{' '}
+                {status?.authorized_oauth_accounts ?? 0}
               </div>
             </div>
             <div className='rounded-md border bg-muted/25 px-3 py-2'>
-              <div className='text-[11px] text-muted-foreground'>agy 槽位 (活跃/空闲)</div>
+              <div className='text-[11px] text-muted-foreground'>
+                agy 槽位 (活跃/空闲)
+              </div>
               <div className='mt-0.5 text-sm font-semibold tabular-nums'>
-                {status?.total_active_slots ?? 0} / {status?.total_idle_slots ?? 0}
+                {status?.total_active_slots ?? 0} /{' '}
+                {status?.total_idle_slots ?? 0}
               </div>
             </div>
             <div className='rounded-md border bg-muted/25 px-3 py-2'>
-              <div className='text-[11px] text-muted-foreground'>通道请求 / 校验异常</div>
+              <div className='text-[11px] text-muted-foreground'>
+                通道请求 / 校验异常
+              </div>
               <div className='mt-0.5 text-sm font-semibold tabular-nums'>
-                {shm ? `${shm.requests_total} / ${shm.crc_errors_total}` : '待建立'}
+                {shm
+                  ? `${shm.requests_total} / ${shm.crc_errors_total}`
+                  : '待建立'}
               </div>
             </div>
           </div>
@@ -300,7 +317,9 @@ function DaemonLivePanel({
                   className='flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs'
                 >
                   <div className='flex flex-wrap items-center gap-2'>
-                    <span className='font-mono font-medium'>{shard.shard_id}</span>
+                    <span className='font-mono font-medium'>
+                      {shard.shard_id}
+                    </span>
                     <Badge
                       variant={
                         shard.fault_isolated
@@ -505,7 +524,11 @@ export function GeminiConfigPane({
   const updateFailover = (patch: Block) =>
     update({ failover: { ...failover, ...patch } })
   const updateShm = (patch: Block) => update({ shm: { ...shm, ...patch } })
-  const setProtocol = (key: string, mode: 'native' | 'convert', enabled: boolean) =>
+  const setProtocol = (
+    key: string,
+    mode: 'native' | 'convert',
+    enabled: boolean
+  ) =>
     update({
       protocols: {
         ...protocols,
@@ -529,7 +552,7 @@ export function GeminiConfigPane({
         desc={
           routeOn
             ? '控制 Gemini 总开关及各协议入口是否允许调度至 CRAGGemini。'
-            : '已关闭：所有 Gemini 公共入口返回 503，不消耗账号配额。'
+            : '已关闭：所有 Gemini 公共入口返回 403（gemini_disabled），不消耗账号配额。'
         }
         aside={
           <Switch
@@ -630,12 +653,12 @@ export function GeminiConfigPane({
             <SliderSetting
               id='gemini-sticky-ttl'
               label='粘性保留时长'
-              desc='超时未活跃后释放会话与账号的绑定；0 表示仅当前进程周期。'
+              desc='超时未活跃后释放会话与账号的绑定；设为 0 时不保留跨请求粘性绑定。'
               value={stickyTtlSecs}
               min={0}
               max={86400}
               step={60}
-              format={(s) => (s === 0 ? '关闭超时' : fmtDuration(s * 1000))}
+              format={(s) => (s === 0 ? '不保留' : fmtDuration(s * 1000))}
               fallback={GEMINI_DEFAULTS.sticky.ttl_seconds}
               presets={[300, 1800, 3600, 14400, 86400]}
               onChange={(ttl_seconds) => updateSticky({ ttl_seconds })}
@@ -886,7 +909,7 @@ export function GeminiConfigPane({
       <PaneSection
         icon={ShieldAlert}
         title='故障切号与熔断保护'
-        desc='单账号 429/5xx 或桥接异常时自动隔离与切号，保护同分片其余账号稳定。'
+        desc='单账号 400/403/429/5xx 或桥接异常时自动隔离与切号，保护同分片其余账号稳定。'
       >
         <div className='space-y-4'>
           <div className='grid gap-4 sm:grid-cols-2'>

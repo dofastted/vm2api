@@ -240,7 +240,7 @@ export function vmCircuitTitle(vm: Vm | undefined, now = Date.now()): string {
   if (c.state === 'half_open')
     return '熔断半开 · 下一个请求作为探测，成功即恢复'
   const sec = Math.max(1, Math.ceil(c.left / 1000))
-  return `熔断中 · 连续 ${c.failures}/${c.threshold} 次 5xx · ${sec}s 后放行探测`
+  return `熔断中 · 连续 ${c.failures}/${c.threshold} 次 400/403/5xx · ${sec}s 后放行探测`
 }
 
 function circuitTone(vm: Vm | undefined): StatusTone | null {

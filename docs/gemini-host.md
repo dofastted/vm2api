@@ -8,7 +8,7 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 2. 面板显示「已安装，等待兑换」或进入订阅模式后，可在「订阅 CRAG」或「导入 → Gemini」兑换宿主级叠加凭证 `CRAGR1.…`（兑换后在环境「账号」页绑定/释放 CRAGGemini 席位），或兼容旧版清单兑换码 `CGG1-…`。激活绑定到宿主安装或宿主标识；错误码不会解锁，服务重启保留激活。明文码不入库、不持久化。激活不代替 Google 授权，也不会自动把账号加入调度。
 3. Google OAuth、常驻推理和交互终端还需要 `ip`、`nft`、`setpriv`、支持非特权用户命名空间的 `bwrap`、vm2api 自带的 `kin-egress`、IPv4 转发和绑定的 SOCKS5 代理；交互终端（及回退 TUI 启动路径）还需 `openvt`（kbd）和可分配的 Linux 虚拟控制台。常驻 OAuth 推理采用 CRAGGemini 进程池模式（按环境 `max_concurrency` 分配独立 PTY 槽位并共享同一隔离网络命名空间租约），不再每回合抢占宿主虚拟控制台；预留服务配置中的 UID/GID 区间与 `198.18.252.0/27`，不要为此开放直连或调整全局转发策略。
 4. 安装器不覆盖已有载荷（包括旧 `rc.1`），也不覆盖 `/etc/vm2api` 的手工信任设置。自管载荷仍可使用 `prepare-gemini --gemini-payload-source DIR`，并在 `/etc/vm2api/gemini-ed25519.pub` 配置该载荷的受信公钥；已有手工兑换校验配置仍适用。载荷源目录及其父路径须由 root 所有且不可由非 root 写入，不可放在 `/tmp`。
-5. `--no-start` 跳过服务及准备。Gemini 失败不阻断控制面安装或升级。「设置 → Gemini」集中显示宿主状态、诊断、安装/修复、推理环境恢复、CLI/CRAGGemini 兼容版本更新与回滚；操作由独立 root 维护服务执行。缺少维护组件时，页面会提示先在宿主初始化，不能以网页按钮绕过权限。自定义安装目录可用 `sudo bash /path/to/vm2api/deploy/install.sh prepare-gemini --dir /path/to/vm2api`。安装目录只由宿主管理员选择，不从维护 API 接收。详见 [维护与版本管理](gemini-maintenance.md)。独立 Node 网关须具备 `vm2api` 组权限；Docker 部署使用更新后的两个 socket 目录挂载。
+5. `--no-start` 跳过服务及准备。Gemini 失败不阻断控制面安装或升级。「设置 → Gemini 维护」集中显示宿主状态、诊断、安装/修复、推理环境恢复、CLI/CRAGGemini 兼容版本更新与回滚；操作由独立 root 维护服务执行。缺少维护组件时，页面会提示先在宿主初始化，不能以网页按钮绕过权限。自定义安装目录可用 `sudo bash /path/to/vm2api/deploy/install.sh prepare-gemini --dir /path/to/vm2api`。安装目录只由宿主管理员选择，不从维护 API 接收。详见 [维护与版本管理](gemini-maintenance.md)。独立 Node 网关须具备 `vm2api` 组权限；Docker 部署使用更新后的两个 socket 目录挂载。
 6. 第 2 步的授权码在发行机对已签名、已解包的载荷签发：
 
    ```sh
@@ -47,7 +47,7 @@ Linux amd64 的 vm2api 一键安装和升级默认准备 Gemini（Antigravity CL
 
 公开网关的原生适配支持多轮对话历史、`systemInstruction`（系统指令）、函数工具声明与工具结果（`tools` / `toolConfig`）、常用生成参数（`generationConfig`）以及内联多模态输入（请求体上限 12 MiB）；超出 `NATIVE_CAPABILITIES` 范围的字段仍会明确拒绝，不静默丢弃。CRAGGemini 原生 worker 内部使用 SSE：面向 JSON 请求的公开协议收齐完整回合后再组装对应 JSON，流式端点按上游 SSE 帧转发。Google API 错误和 OpenAI/Anthropic 错误按各自协议形状映射。
 
-OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进入复用的 `PoolScheduler` 账号平衡、in-flight 并发预留和 unit-circuit 状态。每个环境支持配置 `max_concurrency`（`1–64`，默认 `1`），达到本环境并发上限时在其他符合模型和代理条件的环境中选择。一次回合一旦由 CRAGGemini host 接受，后续推理失败不自动重放到另一账号；客户端应按错误码决定是否重试。每个环境使用自身已绑定 SOCKS5 与独立网络命名空间；模型白名单及 Gemini API key 限额照常执行。
+OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进入复用的 `PoolScheduler` 账号平衡、in-flight 并发预留和 unit-circuit 状态。每个环境支持配置 `max_concurrency`（`1–64`，默认跟随 `routing.gemini.pool.max_concurrency_per_account`，缺省为 `20`），达到本环境并发上限时在其他符合模型和代理条件的环境中选择。尚未向客户端产出输出前遇到配额限流或上游 `502`/`503`/`504` 等可重试故障时，调度器按 `max_account_switches`（默认 `3` 次）自动切换其他可用环境；一旦回合已产出输出，后续中断或失败不再自动重放到另一账号，客户端应按错误码决定是否重试。每个环境使用自身已绑定 SOCKS5 与独立网络命名空间；模型白名单及 Gemini API key 限额照常执行。
 
 ### 管理员诊断接口
 
@@ -84,7 +84,7 @@ OAuth 环境仍由 Gemini host 管理 token、HOME 和代理绑定；请求进�
 
 原生 OAuth 回合复用该环境已经完成官方 CLI 登录的私有 HOME，保留 CLI 的 onboarding、项目状态及令牌刷新；仅复制 token 到全新 HOME 不等价于复用登录环境。每回合仍有独立工作目录、原生 socket 和请求身份，并通过 CLI 的仅会话 `--settings` 保持严格工具权限及禁用额外 Credits。主题预览里的 `compilation failed` 是示例文案，不能据此判断运行故障。
 
-对已选中环境的失败回合，调度器必须保留宿主错误码；`gemini_location_unsupported`、`gemini_account_verification_required` 和 `gemini_account_ineligible` 返回 HTTP 403，并释放半开熔断探针而不记为基础设施失败。排查公网 `503 gemini_host_unavailable` 时应单独跟踪该请求，不能仅凭另一回合的资格拒绝日志归因。
+对已选中环境的失败回合，调度器必须保留宿主错误码；`gemini_location_unsupported`、`gemini_account_verification_required` 和 `gemini_account_ineligible` 返回 HTTP 403，与上游 `gemini_invalid_request`（HTTP 400）一并计入单账号熔断失败次数（半开探针命中时重新打开熔断）。排查公网 `503 gemini_host_unavailable` 时应单独跟踪该请求，不能仅凭另一回合的资格拒绝日志归因。
 
 原生 CLI 通过 `--log-file` 写入私有目录的 FIFO，不写入或读取共享 profile 的 `cli.log`。独立排空线程每批最多读取 64 KiB，单行最多保留 4 KiB；不依赖同步宿主请求循环，避免另一条请求阻塞时卡住 CLI 日志写入。线程按固定规则提取结构化 `EligibilityDiagnostic`（地区受限 `gemini_location_unsupported`、需浏览器核验 `gemini_account_verification_required` 及可选 `accounts.google.com` 验证链接、账号无资格 `gemini_account_ineligible`）；未知、超长或跨环境文本不用于归因，原始日志不落盘、不返回客户端。失败终态最多等待 250 ms 获取已经排入 FIFO 的诊断快照；清理时停止并等待线程退出，再回收描述符，避免与 fd 复用竞争。已完成的模型结果优先；否则白名单诊断优先于通用错误。
 

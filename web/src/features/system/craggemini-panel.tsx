@@ -23,6 +23,15 @@ export function cragGeminiGlobalPromptFromCompat(
     : ''
 }
 
+export function cragGeminiPromptProblem(
+  compat: Compat | undefined
+): string | null {
+  return cragGeminiGlobalPromptFromCompat(compat).length >
+    CRAGGEMINI_SYSTEM_PROMPT_MAX
+    ? `craggemini_system_prompt 超过 ${CRAGGEMINI_SYSTEM_PROMPT_MAX} 字符`
+    : null
+}
+
 const OPTIONS: {
   value: CragGeminiPersona
   label: string

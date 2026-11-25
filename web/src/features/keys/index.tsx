@@ -429,7 +429,13 @@ function KeyRow({
           )}
         </div>
       </TableCell>
-      <TableCell>{item.category === 'api' ? 'API' : 'OAuth'}</TableCell>
+      <TableCell>
+        {item.category === 'api'
+          ? 'API'
+          : item.category === 'all'
+            ? '全部'
+            : 'OAuth'}
+      </TableCell>
       <TableCell>
         <StatusMark tone={keyStatusTone(item)} />
       </TableCell>
@@ -480,9 +486,13 @@ function KeyRow({
 function scopeText(item: ApiKeyItem): string {
   if (item.group_type === 'gemini') return 'Gemini · CRAGAnti'
   if (item.vm_pool_id) return `账号池 · ${item.vm_pool_name || item.vm_pool_id}`
+  const count = item.allowed_vms?.length || 0
+  const unpinnedMulti =
+    count === 0 &&
+    (item.category === 'all' || item.permission_tier === 'tenant')
   if (item.group_type === 'anthropic')
-    return `Anthropic · ${item.allowed_vms?.length || 0} 台`
+    return unpinnedMulti ? 'Anthropic' : `Anthropic · ${count} 台`
   if (item.group_type === 'openai')
-    return `OpenAI · ${item.allowed_vms?.length || 0} 台`
+    return unpinnedMulti ? 'OpenAI' : `OpenAI · ${count} 台`
   return '全局'
 }

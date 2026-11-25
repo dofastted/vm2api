@@ -566,7 +566,7 @@ describe('unit circuit', () => {
     })
     expect(vmCircuit(vm, now)).toMatchObject({ state: 'open', left: 12_000 })
     expect(vmCircuitTitle(vm, now)).toBe(
-      '熔断中 · 连续 3/3 次 5xx · 12s 后放行探测'
+      '熔断中 · 连续 3/3 次 400/403/5xx · 12s 后放行探测'
     )
     expect(
       poolStatus({

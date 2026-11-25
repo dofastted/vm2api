@@ -1378,7 +1378,7 @@ export class FailoverRunner {
         if (knownSearchRepair && policy.reason === 'search_repairable') {
           // Repeating the identical flatten cannot fix a second rejection.
           this.searchRepairs.delete(repairKey)
-          policy = { ...policy, action: 'stop' }
+          policy = { ...policy, action: 'stop', circuit: true }
         }
         // The rate limit service is the sole writer of rate_limit_reset_at / overload_until.
         const hardBlock =
@@ -1404,10 +1404,14 @@ export class FailoverRunner {
         ) {
           const targetWindow =
             policy.reason === 'fable_rate_limited' ? '7d_oi' : inferRateLimitWindow(result, Date.now())
-          preResetRateLimitIgnored = !!this.scheduler.accountQuota.isPreResetResponse(selected.accountId, targetWindow, {
-            requestStartedAt: attemptStarted,
-            resetGenerations: attemptResetGenerations,
-          })
+          preResetRateLimitIgnored = !!this.scheduler.accountQuota.isPreResetResponse(
+            selected.accountId,
+            targetWindow,
+            {
+              requestStartedAt: attemptStarted,
+              resetGenerations: attemptResetGenerations,
+            },
+          )
         }
         if (preResetRateLimitIgnored && policy.action === 'continue-and-cooldown') {
           policy = { ...policy, action: 'continue', cooldownUntil: null }

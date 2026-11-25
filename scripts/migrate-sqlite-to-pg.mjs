@@ -3,8 +3,8 @@
  * Streaming, idempotent SQLite -> PostgreSQL migrator for vm2api.
  *
  * Features:
- * - Applies PostgreSQL schema migrations (001..004) automatically under advisory lock.
- * - Streams all 31 active tables + thinking_signature_owners in FK-safe order using
+ * - Applies PostgreSQL schema migrations (001..005) automatically under advisory lock.
+ * - Streams all 32 active tables + thinking_signature_owners in FK-safe order using
  *   rowid keyset pagination (constant memory even on multi-GB kin.db).
  * - Sanitizes UTF-8 NUL bytes (\u0000) which PostgreSQL TEXT/JSONB forbids.
  * - Handles self-referential FK (`cluster_nodes.jump_node_id`) in two passes.
@@ -25,7 +25,7 @@ import { createPgPool } from '../src/lib/db/pg/pg-pool.mjs'
 import { applyPgMigrations } from '../src/lib/db/pg/migrations-runner.mjs'
 import { runDashboardAggregation } from '../src/lib/db/pg/dashboard-aggregator.mjs'
 
-// FK-safe migration order covering all 31 active vm2api tables + optional runtime table.
+// FK-safe migration order covering all 32 active vm2api tables + optional runtime table.
 // Legacy tables (accounts_legacy, account_runtime_states_legacy, panel_users_legacy) are intentionally skipped.
 export const MIGRATION_TABLES = [
   'settings',
@@ -44,6 +44,7 @@ export const MIGRATION_TABLES = [
   'cluster_nodes',
   'cluster_node_direct_links',
   'crag_shop_orders',
+  'gemini_environment_owners',
   'jev_usage_events',
   'jev_usage_meta',
   'jev_usage_totals',

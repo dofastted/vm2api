@@ -58,8 +58,9 @@ export function extractApiKey(req) {
   return ''
 }
 
-/** Simple token bucket per key */
+/** Simple token bucket per key; non-positive capacity or refill disables throttling. */
 export function createRateLimiter({ capacity = 60, refillPerSec = 1 } = {}) {
+  if (!(capacity > 0) || !(refillPerSec > 0)) return () => true
   const buckets = new Map()
   return function allow(key) {
     const now = Date.now()

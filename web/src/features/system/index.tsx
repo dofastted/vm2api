@@ -4,7 +4,6 @@ import { VIEW_TITLES } from '@/config/nav'
 import type { Dashboard } from '@/types/panel-overview'
 import { toast } from 'sonner'
 import { api, patchVm } from '@/lib/api'
-import { protocolPersonaSaveToast } from '@/lib/persona-template'
 import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
 import { PageHeader } from '@/components/page-header'
@@ -14,10 +13,17 @@ import { inheritProtocolOnSlots } from '@/features/settings/protocol-authority'
 import { routingQueryOptions } from '@/features/settings/queries'
 import { SaveBar } from '@/features/settings/save-bar'
 import { SettingsSkeleton } from '@/features/settings/settings-skeleton'
-import { CragGeminiPanel } from '@/features/system/craggemini-panel'
 import { CragPrintPanel } from '@/features/system/crag-print-panel'
+import {
+  CragGeminiPanel,
+  cragGeminiPromptProblem,
+} from '@/features/system/craggemini-panel'
 import { SystemPromptWorkspace } from '@/features/system/prompt-workspace'
-import { compatibilityPatch } from './compat-patch'
+import {
+  compatibilityPatch,
+  systemPromptSaveToast,
+  type SystemPromptKernelSet,
+} from './compat-patch'
 
 type RoutingSaveResult = {
   compatibility?: Record<string, unknown>
@@ -37,7 +43,7 @@ export function SystemPromptPage() {
   const [draft, setDraft] = useState<Record<string, unknown>>({})
   const [personaProblems, setPersonaProblems] = useState<string[]>([])
   const [discardKey, setDiscardKey] = useState(0)
-  const [kernelSet, setKernelSet] = useState<'cli-node' | 'crag' | 'craggemini'>('cli-node')
+  const [kernelSet, setKernelSet] = useState<SystemPromptKernelSet>('cli-node')
 
   useEffect(() => {
     if (routing.data) setDraft(routing.data)
@@ -82,7 +88,12 @@ export function SystemPromptPage() {
         )
       }
       toast.success(
-        protocolPersonaSaveToast(compat, inherited, saved?.kernel_persona)
+        systemPromptSaveToast(
+          kernelSet,
+          compat,
+          inherited,
+          saved?.kernel_persona
+        )
       )
       await Promise.all([
         qc.invalidateQueries({ queryKey: routingQueryOptions().queryKey }),
@@ -97,7 +108,13 @@ export function SystemPromptPage() {
     serverJson !== null &&
     Object.keys(draft).length > 0 &&
     JSON.stringify(draft) !== serverJson
-  const blocked = personaProblems.length > 0
+  const cragGeminiProblem = cragGeminiPromptProblem(
+    draft.compatibility as Record<string, unknown> | undefined
+  )
+  const problems = cragGeminiProblem
+    ? [...personaProblems, cragGeminiProblem]
+    : personaProblems
+  const blocked = problems.length > 0
 
   const discard = () => {
     setDraft(routing.data ?? {})
@@ -111,7 +128,7 @@ export function SystemPromptPage() {
       e.preventDefault()
       if (!dirty || save.isPending) return
       if (blocked) {
-        toast.error(personaProblems[0])
+        toast.error(problems[0])
         return
       }
       save.mutate()
@@ -200,7 +217,7 @@ export function SystemPromptPage() {
       </div>
       {dirty ? (
         <SaveBar
-          blockedReason={blocked ? personaProblems[0] : undefined}
+          blockedReason={blocked ? problems[0] : undefined}
           saving={save.isPending}
           onSave={() => save.mutate()}
           onDiscard={discard}

@@ -82,7 +82,12 @@ test('per-run CLI eligibility survives native failure, host transport and public
       JSON.stringify(body),
       /fixture-secret|fixture-private-prompt|server_oauth|not eligible for Antigravity/,
     )
-    assert.deepEqual(pool.unitCircuit.inspect(accountId), { ok: true, state: 'half_open', probeAvailable: true })
+    assert.deepEqual(pool.unitCircuit.inspect(accountId), {
+      ok: false,
+      reason: 'circuit_open',
+      until: 3001,
+      state: 'open',
+    })
     assert.equal(pool.inflight.size, 0)
   } finally {
     server.closeAllConnections()

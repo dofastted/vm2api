@@ -14,11 +14,11 @@ export function GeminiMaintenanceLink() {
           hash={GEMINI_MAINTENANCE_SECTION_ID}
           className='text-primary underline underline-offset-4'
         >
-          设置 → Gemini：诊断与维护
+          设置 → Gemini 维护：诊断与维护
         </Link>
       ) : (
         <span className='text-muted-foreground'>
-          请联系管理员在「设置 → Gemini」诊断与维护。
+          请联系管理员在「设置 → Gemini 维护」诊断与维护。
         </span>
       )}
     </span>

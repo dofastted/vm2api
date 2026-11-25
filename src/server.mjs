@@ -122,7 +122,8 @@ import { ensureProxyEgress, proxyEgressReady } from './lib/vm/egress.mjs'
 import { syncIpv6ProxyEgress } from './lib/vm/proxy-policy-runtime.mjs'
 import { GATEWAY_CAPABILITIES } from './lib/vm/execution-context.mjs'
 import { isTelemetryPath, telemetryInterceptResponse } from './lib/identity/telemetry-rewrite.mjs'
-import { openDatabaseAsync, closeDatabaseAsync, getDb, getDbEngine } from './lib/db/database.mjs'
+import { openDatabaseAsync, closeDatabaseAsync, getDb, getDbEngine, getPgPool } from './lib/db/database.mjs'
+import { startDashboardAggregator, stopDashboardAggregator } from './lib/db/pg/dashboard-aggregator.mjs'
 import { snapshotCacheMetrics } from './lib/cache/index.mjs'
 import { armWriteBehind } from './lib/db/write-behind.mjs'
 import { JevUsageRepo } from './lib/db/repos/jev-usage-repo.mjs'
@@ -338,7 +339,7 @@ const allowRate = createRateLimiter({
 
 // --- Persistent store (PostgreSQL or SQLite) ---
 const dataDir = cfg.paths.data || path.join(cfg.paths.root, 'data')
-await openDatabaseAsync({ dataDir, pooled: true })
+await openDatabaseAsync({ dataDir, pooled: true, enableAggregator: false })
 armWriteBehind(getDb())
 const jevUsageRepo = new JevUsageRepo()
 installJevUsageRecorder((event) => jevUsageRepo.record(event))
@@ -986,7 +987,7 @@ function rejectAuth(req, res, error) {
   return false
 }
 
-/** `keyGate: false` (key self-service) skips the managed key's quota / RPM / concurrency gate and the gateway bucket. */
+/** `keyGate: false` (key self-service) skips the managed key's quota / RPM / concurrency gate. */
 function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = false } = {}) {
   req.presentedApiKey = extractApiKey(req)
   const token = extractPanelToken(req) || req.presentedApiKey
@@ -1034,9 +1035,9 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
     })
     return false
   }
-  // Master env API key — unlimited admin
+  // Master env API key — unlimited admin unless KIN_RATE_CAP is explicitly configured
   if (timingSafeEqualStr(token, cfg.api_key)) {
-    if (!allowRate(token)) {
+    if (cfg.limits.rate_capacity_explicit && !allowRate(token)) {
       return rejectAuth(
         req,
         res,
@@ -1086,18 +1087,6 @@ function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = 
   const gate = keyGate ? apiKeyStore.canAccept(managed.record) : { ok: true }
   if (!gate.ok) {
     return rejectAuth(req, res, makeApiKeyGateError(gate))
-  }
-  if (keyGate && !allowRate(token)) {
-    return rejectAuth(
-      req,
-      res,
-      makeError({
-        type: ErrorType.RATE_LIMIT,
-        code: ErrorCode.GATEWAY_RATE_LIMIT,
-        message: 'Gateway rate limit exceeded. Retry later.',
-        status: 429,
-      }),
-    )
   }
   req.apiKeyKind = 'managed'
   req.apiKeyRecord = managed.record
@@ -2189,6 +2178,10 @@ server.timeout = 0
 
 server.listen(cfg.port, cfg.host, () => {
   runAtActivation('background', () => {
+    if (getDbEngine() === 'postgres' && process.env.VM2API_DASHBOARD_AGGREGATOR_DISABLED !== '1') {
+      startDashboardAggregator(getPgPool())
+      onLeaderStop(() => stopDashboardAggregator())
+    }
     if (process.env.KIN_CRS_MOCK !== '1') {
       void cragSubscription.recover().catch(() => {
         console.warn('[crag-subscription] startup recovery failed; use the administrator panel to retry')

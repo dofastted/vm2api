@@ -79,10 +79,6 @@ export function classifyAntigravityModel(rawId, providerHint = null, quotaGroupH
   }
 }
 
-export function publicModelId(rawId, providerHint = null) {
-  return classifyAntigravityModel(rawId, providerHint).public_id
-}
-
 /**
  * Build a Map<rawModelId, { provider, quota_group }> from `environment.account.model_catalog`.
  */

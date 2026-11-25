@@ -7,6 +7,7 @@
  *   - VM & Gemini environment lifecycle (list / get / create / start / stop / delete)
  *   - SOCKS5 / HTTP proxy pool (list / import / probe / bind / unbind / delete)
  *   - Account credential onboarding (OAuth auth URL / code exchange / import / Gemini OAuth)
+ *   - Official API key endpoints (list / create / update / delete / manage upstream keys)
  *   - Scoped inference API keys (list / create / update / delete)
  *
  * Non-whitelisted routes (system upgrades, kernels, cluster SSH, DB metrics, backups,

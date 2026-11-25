@@ -70,10 +70,7 @@ test('validatePersonaRoutingPatch validates craggemini_persona_preset and cragge
     validatePersonaRoutingPatch({ compatibility: { craggemini_persona_preset: 'custom' } })[0],
     /craggemini_persona_preset/,
   )
-  assert.deepEqual(
-    validatePersonaRoutingPatch({ compatibility: { craggemini_system_prompt: 'Be concise.' } }),
-    [],
-  )
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { craggemini_system_prompt: 'Be concise.' } }), [])
   assert.match(
     validatePersonaRoutingPatch({ compatibility: { craggemini_system_prompt: 123 } })[0],
     /craggemini_system_prompt/,
@@ -81,6 +78,14 @@ test('validatePersonaRoutingPatch validates craggemini_persona_preset and cragge
   assert.match(
     validatePersonaRoutingPatch({ compatibility: { craggemini_system_prompt: 'x'.repeat(32_769) } })[0],
     /32768/,
+  )
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { craggemini_prompt_normalization: 'auto' } }), [])
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { craggemini_prompt_normalization: 'strict' } }), [])
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { craggemini_prompt_normalization: 'off' } }), [])
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { craggemini_prompt_normalization: '' } }), [])
+  assert.match(
+    validatePersonaRoutingPatch({ compatibility: { craggemini_prompt_normalization: 'custom' } })[0],
+    /craggemini_prompt_normalization/,
   )
 })
 
@@ -100,10 +105,10 @@ test('applyCragGeminiPromptPolicy normalizes conflicting third-party CLI identit
   const normalized = applyCragGeminiPromptPolicy(claudeCodeReq, { preset: 'official_full', globalPrompt: '' })
   assert.equal(
     normalized.systemInstruction.parts[0].text,
-    "You are a coding assistant, Anthropic's official CLI for Claude.\nFollow project instructions carefully.",
+    'You are a coding assistant.\nFollow project instructions carefully.',
   )
-  assert.equal(normalized.systemInstruction.parts[1].text, 'You are a coding assistant, an interactive agent.')
-  assert.doesNotMatch(normalized.systemInstruction.parts[0].text, /you are claude code/i)
+  assert.equal(normalized.systemInstruction.parts[1].text, 'You are a coding assistant.')
+  assert.doesNotMatch(normalized.systemInstruction.parts[0].text, /you are claude code|anthropic/i)
   assert.doesNotMatch(normalized.systemInstruction.parts[1].text, /you are opencode/i)
   // Original object must not be mutated.
   assert.match(claudeCodeReq.systemInstruction.parts[0].text, /You are Claude Code/)
