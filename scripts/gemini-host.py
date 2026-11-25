@@ -1896,12 +1896,37 @@ class NativeSession(NativeAgy):
     def apply_policy(self, policy):
         if not self.is_alive():
             return False
-        patch = runtime_policy_to_kernel_patch(policy)
+        pol = normalize_runtime_policy(
+            policy, base=getattr(self.host, "runtime_policy", None)
+        )
+        patch = runtime_policy_to_kernel_patch(pol)
         patch["max_accounts"] = 1
         status, _ = native_module().worker_json_request(
             self.socket_path, self.native_token, "PUT", "/internal/v1/policy", patch
         )
-        return status == 200
+        if status != 200:
+            return False
+        if getattr(self, "pool_mode", False):
+            env_id = self.environment["id"]
+            conc = max(
+                int(getattr(self, "max_concurrency", env_concurrency(self.environment)) or 1),
+                1,
+            )
+            scale_status, _ = native_module().worker_json_request(
+                self.socket_path,
+                self.native_token,
+                "POST",
+                f"/internal/v1/accounts/{env_id}/scale",
+                {
+                    "runnable_slots": conc,
+                    "max_concurrency": conc,
+                    "min_warm_slots": min(conc, pol["min_warm_slots"]),
+                    "idle_ttl_secs": pol["session_idle_ttl_secs"],
+                },
+                timeout=5.0,
+            )
+            return scale_status == 200
+        return True
 
     def account_lifecycle(self, account_id, action):
         if not self.is_alive() or action not in LIFECYCLE_ACTIONS:
@@ -2314,7 +2339,27 @@ class CragDaemonShard:
             status, _ = native_module().worker_json_request(
                 self.socket_path, self.native_token, "PUT", "/internal/v1/policy", patch
             )
-            return status == 200
+            if status != 200:
+                return False
+            all_ok = True
+            for env_id, meta in list(self.members.items()):
+                conc = max(int(meta.get("max_concurrency") or 1), 1)
+                scale_status, _ = native_module().worker_json_request(
+                    self.socket_path,
+                    self.native_token,
+                    "POST",
+                    f"/internal/v1/accounts/{env_id}/scale",
+                    {
+                        "runnable_slots": conc,
+                        "max_concurrency": conc,
+                        "min_warm_slots": min(conc, self.policy["min_warm_slots"]),
+                        "idle_ttl_secs": self.policy["session_idle_ttl_secs"],
+                    },
+                    timeout=5.0,
+                )
+                if scale_status != 200:
+                    all_ok = False
+            return all_ok
 
     def sync_account(self, env, proxy_url, auth, model=None):
         with self._lock:
@@ -2375,6 +2420,9 @@ class CragDaemonShard:
                     {
                         "runnable_slots": desired_conc,
                         "max_concurrency": desired_conc,
+                        "min_warm_slots": min(
+                            desired_conc, self.policy["min_warm_slots"]
+                        ),
                         "idle_ttl_secs": self.policy["session_idle_ttl_secs"],
                     },
                     timeout=10.0,
@@ -6036,6 +6084,9 @@ class Host:
                         {
                             "runnable_slots": raw_concurrency,
                             "max_concurrency": raw_concurrency,
+                            "min_warm_slots": min(
+                                raw_concurrency, self.runtime_policy["min_warm_slots"]
+                            ),
                             "idle_ttl_secs": self.runtime_policy["session_idle_ttl_secs"],
                         },
                         timeout=5.0,
@@ -6053,6 +6104,9 @@ class Host:
                         {
                             "runnable_slots": raw_concurrency,
                             "max_concurrency": raw_concurrency,
+                            "min_warm_slots": min(
+                                raw_concurrency, self.runtime_policy["min_warm_slots"]
+                            ),
                             "idle_ttl_secs": self.runtime_policy["session_idle_ttl_secs"],
                         },
                         timeout=5.0,
