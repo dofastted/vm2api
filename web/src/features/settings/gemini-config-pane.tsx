@@ -263,27 +263,39 @@ function DaemonLivePanel({
         <div className='space-y-3'>
           <div className='grid grid-cols-2 gap-2.5 sm:grid-cols-4'>
             <div className='rounded-md border bg-muted/25 px-3 py-2'>
-              <div className='text-[11px] text-muted-foreground'>活跃分片 / 规划</div>
+              <div className='text-[11px] text-muted-foreground'>
+                活跃分片 / 规划
+              </div>
               <div className='mt-0.5 text-sm font-semibold tabular-nums'>
                 {shards.length} / {status?.planned_shards ?? 0}
               </div>
             </div>
             <div className='rounded-md border bg-muted/25 px-3 py-2'>
-              <div className='text-[11px] text-muted-foreground'>接管账号 / 已授权</div>
+              <div className='text-[11px] text-muted-foreground'>
+                接管账号 / 已授权
+              </div>
               <div className='mt-0.5 text-sm font-semibold tabular-nums'>
-                {status?.total_accounts ?? 0} / {status?.authorized_oauth_accounts ?? 0}
+                {status?.total_accounts ?? 0} /{' '}
+                {status?.authorized_oauth_accounts ?? 0}
               </div>
             </div>
             <div className='rounded-md border bg-muted/25 px-3 py-2'>
-              <div className='text-[11px] text-muted-foreground'>agy 槽位 (活跃/空闲)</div>
+              <div className='text-[11px] text-muted-foreground'>
+                agy 槽位 (活跃/空闲)
+              </div>
               <div className='mt-0.5 text-sm font-semibold tabular-nums'>
-                {status?.total_active_slots ?? 0} / {status?.total_idle_slots ?? 0}
+                {status?.total_active_slots ?? 0} /{' '}
+                {status?.total_idle_slots ?? 0}
               </div>
             </div>
             <div className='rounded-md border bg-muted/25 px-3 py-2'>
-              <div className='text-[11px] text-muted-foreground'>通道请求 / 校验异常</div>
+              <div className='text-[11px] text-muted-foreground'>
+                通道请求 / 校验异常
+              </div>
               <div className='mt-0.5 text-sm font-semibold tabular-nums'>
-                {shm ? `${shm.requests_total} / ${shm.crc_errors_total}` : '待建立'}
+                {shm
+                  ? `${shm.requests_total} / ${shm.crc_errors_total}`
+                  : '待建立'}
               </div>
             </div>
           </div>
@@ -305,7 +317,9 @@ function DaemonLivePanel({
                   className='flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs'
                 >
                   <div className='flex flex-wrap items-center gap-2'>
-                    <span className='font-mono font-medium'>{shard.shard_id}</span>
+                    <span className='font-mono font-medium'>
+                      {shard.shard_id}
+                    </span>
                     <Badge
                       variant={
                         shard.fault_isolated
@@ -510,7 +524,11 @@ export function GeminiConfigPane({
   const updateFailover = (patch: Block) =>
     update({ failover: { ...failover, ...patch } })
   const updateShm = (patch: Block) => update({ shm: { ...shm, ...patch } })
-  const setProtocol = (key: string, mode: 'native' | 'convert', enabled: boolean) =>
+  const setProtocol = (
+    key: string,
+    mode: 'native' | 'convert',
+    enabled: boolean
+  ) =>
     update({
       protocols: {
         ...protocols,
@@ -891,7 +909,7 @@ export function GeminiConfigPane({
       <PaneSection
         icon={ShieldAlert}
         title='故障切号与熔断保护'
-        desc='单账号 429/5xx 或桥接异常时自动隔离与切号，保护同分片其余账号稳定。'
+        desc='单账号 400/403/429/5xx 或桥接异常时自动隔离与切号，保护同分片其余账号稳定。'
       >
         <div className='space-y-4'>
           <div className='grid gap-4 sm:grid-cols-2'>

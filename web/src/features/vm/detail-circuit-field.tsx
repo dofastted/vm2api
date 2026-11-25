@@ -46,7 +46,7 @@ export function CircuitField({ vm, now: pageNow }: { vm: Vm; now: number }) {
       <div className='flex flex-wrap items-center gap-x-2 gap-y-1'>
         <span className={cn('font-medium', tone)}>{label}</span>
         <span className='text-xs text-muted-foreground tabular-nums'>
-          连续 5xx {failures}/{threshold}
+          连续 400/403/5xx {failures}/{threshold}
         </span>
         {c?.state === 'open' ? (
           <span className='text-xs text-muted-foreground tabular-nums'>
