@@ -12,6 +12,7 @@ export function cragSubscriptionRoute(method, path) {
   if (path === `${ROOT}/upgrade`) return { action: 'upgrade' }
   if (path === `${ROOT}/unbind`) return { action: 'unbind' }
   if (path === `${ROOT}/claim-by-order`) return { action: 'claim' }
+  if (path === `${ROOT}/rebuild-identity`) return { action: 'rebuild-identity' }
   const match = BIND.exec(path)
   return match ? { action: 'bind', id: match[1] } : null
 }
@@ -134,6 +135,7 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
       if (action === 'upgrade') return ok(res, await subscription.upgrade())
       if (action === 'unbind') return ok(res, await subscription.unbind())
       if (action === 'claim') return ok(res, await subscription.claimByOrder(body.order_id))
+      if (action === 'rebuild-identity') return ok(res, await subscription.rebuildIdentity())
       if (action === 'bind') {
         const vm = getVm(id)
         if (!vm) return reject(res, 404, 'vm_not_found')

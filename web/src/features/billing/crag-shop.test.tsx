@@ -1469,6 +1469,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     const overview = html.slice(html.indexOf('id="crag-host-overview"'))
     expect(overview).toContain('role="alert"')
     expect(overview).toContain('/etc/machine-id')
+    expect(overview).toContain('重建设备标识')
   })
 })
 

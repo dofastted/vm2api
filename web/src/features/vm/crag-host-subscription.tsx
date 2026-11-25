@@ -30,7 +30,12 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
   const busy = host.isFetching || working
 
   async function perform(
-    action: 'bind' | 'recover' | 'unbind' | 'claim-by-order',
+    action:
+      | 'bind'
+      | 'recover'
+      | 'unbind'
+      | 'claim-by-order'
+      | 'rebuild-identity',
     payload?: Record<string, unknown>
   ) {
     if (busy) return
@@ -68,6 +73,11 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
         if (action === 'claim-by-order') {
           setNotice({
             text: '已把该订单的兑换券迁到本机，剩余时长照旧。原机器上这张券的额度已同时失效。',
+          })
+        }
+        if (action === 'rebuild-identity') {
+          setNotice({
+            text: '已为本机重建设备标识。请重新提交原兑换码或通过「从其他设备迁移」输入原订单号恢复订阅。',
           })
         }
       }
@@ -117,10 +127,24 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
       </div>
       <CragRuntimeCounts status={host.isError ? undefined : status} />
       {status?.credential_recovery ? (
-        <p role='alert' className='text-sm text-destructive'>
-          {cragCredentialRecoveryFaults[status.credential_recovery] ??
-            cragSubscriptionErrors.auth_forbidden}
-        </p>
+        <div className='space-y-2'>
+          <p role='alert' className='text-sm text-destructive'>
+            {cragCredentialRecoveryFaults[status.credential_recovery] ??
+              cragSubscriptionErrors.auth_forbidden}
+          </p>
+          {status.credential_recovery === 'host_id_collision' ||
+          status.credential_recovery === 'not_activated' ? (
+            <Button
+              type='button'
+              variant='outline'
+              size='sm'
+              disabled={busy}
+              onClick={() => void perform('rebuild-identity')}
+            >
+              重建设备标识
+            </Button>
+          ) : null}
+        </div>
       ) : null}
       {host.isError ? (
         <p role='alert' className='text-sm text-destructive'>
