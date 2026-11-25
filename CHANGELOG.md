@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Codex 槽位凭证被 OpenAI 吊销后与 Claude 同口径自动摘牌**：OpenAI 吊销返回 `401` `error.code="token_revoked"`（message 为 `Encountered invalidated oauth token for user`），与既有 grant-death 词表（`token has been revoked` / `oauth_revoked` / `invalid_grant`，Anthropic 文案）零匹配，导致被吊销的 Codex 槽位既不冷却摘牌也不在面板显示无效凭证，死号持续被调度、每次占座直至池容量雪崩。将 `token_revoked` 与 `invalidated oauth token` 统一纳入错误策略（`classifyOAuth401`）、failover 刷新恢复（`grantDead`）、凭证刷新监控、写盘归一（`refreshErrorCodeOf` 归一为 `oauth_revoked`，下游摘牌/展示链天然工作）、调度资格门、transport 层致命判定、面板探活/重授权清理与前端状态模型的全部 grant-death 判定；usage 探活不再对死凭证每轮打 `/usage`（消除死 token 上的持续 401 指纹信号），`findRuntime` / `freshenRuntimeState` 将原始 OpenAI 文案的陈旧 worker 行按遗留清除（重授权后面板立即回绿）。历史遗留 `refresh_error: "token_revoked"` 旧值亦按死凭证处理（仍有 live access TTL 保护不误摘）；中流（`terminalState: incomplete`）吊销与 Claude 同走 `oauth_unconfirmed` 保守路径，确定形态 401 照常挂起。
+
 ## 1.4.213 — 2026-11-25 · Google/Gemini 独立模型策略、`medium` 默认思考强度与模型/计费定价页接入
 
 - **Google / Gemini 独立模型策略与 `medium` 默认思考强度**：新增 `src/lib/protocol/gemini-model-policy.mjs`（持久化键 `gemini_model_policy`），严格作用于 `gemini-*` 系列与 Gemini 槽位，缺省为所有 Gemini 模型启用 `default_effort: 'medium'`；新增 `GET/PUT/POST /api/panel/model-policy?platform=google`、`POST /api/panel/model-policy/sync-gemini` 与 `catalog-monitor` 定时同步（融合实时 Gemini 槽位、Gemini API 端点与 `models.dev` Google 目录）；在全部入站协议（`gemini`、`openai-chat`、`openai-responses`、`anthropic`）省略思考强度时自动注入默认 `medium`（显式指定强度或关闭思考时保持原样，且不破坏 CRAGGemini SHM 最小载荷约束），支持无后缀 Gemini 模型在 Antigravity 槽位解析到 `-medium` 档位，并在 `scheduler.catalog()` / `scheduler.stream()` 执行启停策略开关（#1811）。
