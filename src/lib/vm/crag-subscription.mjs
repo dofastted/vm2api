@@ -926,6 +926,13 @@ export function createCragSubscription({
     }
   }
 
+  function optionalCredential(hostId) {
+    const prior = load(hostFile, 0o644, 64)
+    if (prior != null && prior !== hostId) return null
+    const key = load(keyFile, 0o600, 43)
+    return key && validVoucher(`CRAGR1.${key}`) ? key : null
+  }
+
   function credential(hostId, initialize = false) {
     const prior = load(hostFile, 0o644, 64)
     // A stored identity is authoritative again. v1.4.186 retired it here when it
@@ -1279,13 +1286,26 @@ export function createCragSubscription({
         if (!unchangedRights(local, readLocalRights())) return status(confirmed, false)
       }
       let rights = claims ? { reclaim_supported: claims.version === 2 } : {}
-      if (claims && !pending) {
-        if (confirmed?.code === previous.code && confirmed.rights) {
+      if (!pending && !needsRefresh) {
+        if (claims && confirmed?.code === previous.code && confirmed.rights) {
           rights = confirmed.rights
-        } else if (!needsRefresh) {
+        } else if (claims) {
           try {
             const remote = await authority('status', hostId, credential(hostId))
-            if (remote.entitlement === previous.code) rights = projection(remote, claims)
+            if (remote.entitlement === previous.code) {
+              rights = projection(remote, claims)
+            } else if (remote.entitlement && !exclusiveState) {
+              const next = verifyRights(hostId, remote, previous)
+              if (
+                next.claims.revision > previous.claims.revision &&
+                unchangedRights(local, readLocalRights()) &&
+                !readRosterIntent() &&
+                !load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES)
+              ) {
+                publish(entitlementFile, next.code, 0o644)
+                if (mayRetry) return status(next, false)
+              }
+            }
           } catch (error) {
             // Signed local rights still apply during an Authority outage. Do not guess remote metadata.
             // A refused credential recovery is not an outage though: it is a
@@ -1294,6 +1314,29 @@ export function createCragSubscription({
             // difference between "the panel looks normal until a redemption
             // mysteriously fails" and being told what to fix.
             if (error.recovery && error.recovery !== 'unavailable') credential_recovery = error.recovery
+          }
+        } else if (!confirmed && !exclusiveState) {
+          try {
+            const remote = await authority('status', hostId, optionalCredential(hostId), undefined, false)
+            if (remote?.entitlement) {
+              const next = verifyRights(hostId, remote, null)
+              if (
+                unchangedRights(local, readLocalRights()) &&
+                !readRosterIntent() &&
+                !load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES)
+              ) {
+                storage(true)
+                if (!load(hostFile, 0o644, 64) && !load(keyFile, 0o600, 43)) {
+                  credential(hostId, true)
+                } else if (!load(hostFile, 0o644, 64)) {
+                  publish(hostFile, hostId, 0o644, true)
+                }
+                publish(entitlementFile, next.code, 0o644)
+                if (mayRetry) return status(next, false)
+              }
+            }
+          } catch {
+            // Unredeemed host or Authority unreachable: remain unredeemed without mutating disk.
           }
         }
       }
@@ -1319,6 +1362,7 @@ export function createCragSubscription({
       if (runtime === null && mayRetry) return status(confirmed, false)
       return {
         ready: targetReady,
+        host_id: hostId,
         // The identity itself, so the panel can show what to quote in a support
         // request and which source it came from. `uuid` is null on an install
         // whose original source is gone (see `storedUuid`).
@@ -1359,6 +1403,7 @@ export function createCragSubscription({
       return {
         ready: false,
         state: 'unavailable',
+        ...(identity?.hostId && { host_id: identity.hostId }),
         ...(identity?.uuid && { device_uuid: identity.uuid }),
         ...(identity && { identity_source: identity.source }),
         available_seats: null,
@@ -1417,13 +1462,15 @@ export function createCragSubscription({
     let status
     let code
     try {
+      const headers = { 'content-type': 'application/json', accept: 'application/json' }
+      if (key) headers.authorization = `Bearer ${key}`
       const response = await fetchImpl(`${origin}/v1/host-subscriptions/${action}`, {
         method: 'POST',
         redirect: 'error',
         cache: 'no-store',
         signal: AbortSignal.timeout(8000),
-        headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'application/json' },
-        body: JSON.stringify({ host_id: hostId, ...extra }),
+        headers,
+        body: JSON.stringify(action === 'migrate' ? extra : { host_id: hostId, ...extra }),
       })
       const id = response.headers.get('x-request-id')
       if (authorityRequestId.test(id ?? '')) requestId = id
@@ -1439,7 +1486,7 @@ export function createCragSubscription({
     }
     const error = code ? fail(code, status) : fail('crag_subscription_authority_unavailable', 502)
     if (requestId) error.authorityRequestId = requestId
-    if (code === 'auth_forbidden' && allowRecovery) {
+    if (code === 'auth_forbidden' && allowRecovery && key) {
       let replacement
       try {
         replacement = await recoverCredential(hostId)
@@ -1972,7 +2019,12 @@ export function createCragSubscription({
           try {
             return await finish(targetHost, targetIntent, targetPrevious, targetAsserted, replay)
           } catch (error) {
-            if (renewal || expectedHost || error?.code !== 'auth_forbidden' || error?.recovery !== 'host_id_collision') {
+            if (
+              renewal ||
+              expectedHost ||
+              error?.code !== 'auth_forbidden' ||
+              error?.recovery !== 'host_id_collision'
+            ) {
               throw error
             }
             // Confirmed host_id_collision: retire the colliding local identity and
@@ -2429,6 +2481,60 @@ export function createCragSubscription({
         for (const file of [entitlementFile, marker, deferredReleaseFile]) remove(file)
         return { ...(await status()), released }
       })
+    },
+    async orders({ limit = 50, offset = 0 } = {}) {
+      const safeLimit = Number.isInteger(limit) && limit >= 1 && limit <= 200 ? limit : 50
+      const safeOffset = Number.isInteger(offset) && offset >= 0 && offset <= 1_000_000 ? offset : 0
+      const hostId = identity()
+      const data = await authority('orders', hostId, optionalCredential(hostId), {
+        limit: safeLimit,
+        offset: safeOffset,
+      })
+      return {
+        host_id: typeof data.host_id === 'string' ? data.host_id : hostId,
+        product: typeof data.product === 'string' ? data.product : 'crag-v2',
+        orders: Array.isArray(data.orders) ? data.orders : [],
+        vouchers: Array.isArray(data.vouchers) ? data.vouchers : [],
+        total: Number.isSafeInteger(data.total) ? data.total : 0,
+        limit: Number.isSafeInteger(data.limit) ? data.limit : safeLimit,
+        offset: Number.isSafeInteger(data.offset) ? data.offset : safeOffset,
+      }
+    },
+    migrate(fromHostInput) {
+      return exclusive(
+        async () => {
+          const trimmed = typeof fromHostInput === 'string' ? fromHostInput.trim().toLowerCase() : ''
+          const fromHostId = isDigest(trimmed) ? trimmed : uuidToHostId(trimmed)
+          if (!fromHostId) throw fail('crag_subscription_invalid_request', 400)
+          const hostId = identity()
+          if (fromHostId === hostId) throw fail('crag_subscription_invalid_request', 400)
+          checkNoIntent()
+          storage(true)
+          const previous = current(hostId)
+          const data = await authority('migrate', hostId, optionalCredential(hostId), {
+            from_host_id: fromHostId,
+            to_host_id: hostId,
+          })
+          let confirmed
+          if (data?.rights?.entitlement) {
+            confirmed = verifyRights(hostId, data.rights, previous)
+            if (!load(hostFile, 0o644, 64) && !load(keyFile, 0o600, 43)) {
+              credential(hostId, true)
+            } else if (!load(hostFile, 0o644, 64)) {
+              publish(hostFile, hostId, 0o644, true)
+            }
+            publish(entitlementFile, confirmed.code, 0o644)
+          }
+          return {
+            from_host_id: typeof data.from_host_id === 'string' ? data.from_host_id : fromHostId,
+            to_host_id: typeof data.to_host_id === 'string' ? data.to_host_id : hostId,
+            migrated_vouchers: Number.isSafeInteger(data.migrated_vouchers) ? data.migrated_vouchers : 0,
+            migrated_orders: Number.isSafeInteger(data.migrated_orders) ? data.migrated_orders : 0,
+            status: await status(confirmed),
+          }
+        },
+        { blockBefore: true },
+      )
     },
     async releaseStoppedBinding(vm, { stop } = {}) {
       const unchanged = (supported = false) => ({ released: false, stopped: false, reclaim_supported: supported })
