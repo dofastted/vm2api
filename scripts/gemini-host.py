@@ -7,6 +7,7 @@ import grp
 import hashlib
 import hmac
 import importlib.util
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler
 import ipaddress
 import json
@@ -6702,7 +6703,7 @@ class Host:
                 had_error = True
                 stop_shard_turn()
                 raise
-            except (OSError, TimeoutError):
+            except (OSError, TimeoutError, HTTPException):
                 had_error = True
                 handler.send_json_error(502, "gemini_inference_failed")
                 return "failed", "gemini_inference_failed"
@@ -6774,7 +6775,7 @@ class Host:
             had_error = True
             stop_native()
             raise
-        except (OSError, TimeoutError):
+        except (OSError, TimeoutError, HTTPException):
             had_error = True
             handler.send_json_error(502, "gemini_inference_failed")
             return "failed", "gemini_inference_failed"
@@ -6803,6 +6804,7 @@ class ThreadingUnixStreamServer(
 ):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128
 
 
 class ControlHandler(BaseHTTPRequestHandler):
@@ -7067,9 +7069,13 @@ def main():
                 )
                 with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as notify:
                     notify.sendto(b"READY=1", address)
+            last_cleanup = time.monotonic()
             while not stop:
                 server.handle_request()
-                host.cleanup()
+                now_mono = time.monotonic()
+                if now_mono - last_cleanup >= 0.25:
+                    last_cleanup = now_mono
+                    host.cleanup()
     finally:
         try:
             host.close()
