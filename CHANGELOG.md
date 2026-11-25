@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.4.210 — 2026-11-25 · Codex 借槽稳定出站会话；Gemini 诊断校验实际配置 egress 与保留核验链接；面板详情按需展示 Claude 官方侧额度差异
+
+- **Codex 借用非 home 槽时在当前绑定代次内稳定 `outbound_session_id`**：修复 home 槽仍在池中且并发满、请求借用其他槽位时，因 `attemptStartedAt` 参与 `epoch` 导致每次借用都重铸 `outbound_session_id` / `prompt_cache_key` 并打散 prompt cache 的问题；`handleCodexProtocol` 仅在 live home 存在且选中非 home 槽时按 `(sessionKey, homeVm, homeSession, generation, borrowerVm)` 派生稳定材料，保持不迁移 home、跨借用槽隔离、迁移换代自动刷新以及 `passthrough` 行为不变（#1787，修 #1771）。
+- **Gemini 维护诊断校验服务单元实际配置的 `--egress` 可执行文件**：修复 `scripts/gemini-maintenance.py` 的 `Maintenance.inspect()` 硬编码检查 `runtime/bin/kin-egress`，导致全新 `install.sh install` 部署后因单位配置为 `INSTALL_DIR/bin/kin-egress` 而必报 `gemini_maintenance_egress_invalid`（以及残留旧 `runtime` 副本掩盖已损坏配置路径）的问题；改为读取受管 unit 的规范化 `--egress` 路径并沿用原有 root 属主、不可写、哈希钉选与可执行校验（#1795，关联 #1770）。
+- **已订阅 Gemini 账号保留安全 Google 核验链接并避免误告警**：`scripts/gemini_host_account.py` 在 `paidTier` / `currentTier` 非空时不改变原有非阻断 `parse_ineligibility` 语义，独立提取安全的 `VALIDATION_REQUIRED` 官方验证链接至 `account.validation_url`；`scripts/gemini-host.py` 在账号已通过真实推理验证（`inference_proven`）后的刷新中同步清除替代套餐的残留 `validation_url`（不误清 `location_unsupported` 等阻断）；前端将纯参考链接标记为 `advisory`，在机架/列表页不覆盖正常状态或挂黄标，在账号页与试聊页以中性样式提供验证入口（#1794，回应 #1766）。
+- **面板详情按需展示 Claude 官方侧与保守合并两套额度存储**：`src/lib/admin/panel-api.mjs` 在账号与 VM 投影中增加白名单只读字段 `quota_observations`（不改调度准入、保守合并规则或触发额外上游请求，槽位换绑时隔离旧账号快照）；前端仅在详情面板、行展开详情与统计弹窗中当官方侧存储与当前展示值存在差异或官方窗口陈旧时渲染折叠对比，不影响机架主卡三行基线对齐，并明确标注官方侧为可变存储状态（#1792，回应 #1776）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）与 Gemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_account.py`、`scripts/gemini-maintenance.py`）；`deploy/payload.json` 载荷钉选（CRAG `3.1.17`、CRAGGemini `0.4.9`）、数据库迁移结构与 `bin/` / `share/wrap-cli` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机如需生效 `pinned_egress` 诊断与核验链接修复，需执行 `install.sh prepare-gemini` 同步宿主脚本。
+
 ## 1.4.209 — 2026-11-25 · CRAGGemini 多 CLI 提示词统一归一化；上游 400/403 纳入单元熔断；托管密钥直从面板限额；空 effort 默认回落与巡检对齐
 
 - **CRAGGemini 多 CLI 提示词统一归一化管线**：新增 `src/lib/gemini/prompt-normalizer.mjs` 作为唯一事实来源，覆盖 15+ 主流编码 CLI（Claude Code、Codex CLI、OpenCode、Gemini CLI、Cursor、Cline、Roo Code、Kilo Code、Windsurf/Cascade、Aider、GitHub Copilot、Continue、Amp、Factory Droid、Hermes、OpenClaw、Oh-My-Pi）经四协议进入 CRAGGemini 通道的提示词清洗与去冲突；跨供应商计费行剥离与语义归一化统一保护 Markdown 代码围栏（`` ``` `` / `~~~`），范围扩展至 `contents` 内嵌系统封装与 `tools[].functionDeclarations[].description`，并在 `official_full` 模式采用成对标签匹配消除 `agy 1.5.9` 宿主标签冲突（不误伤 TypeScript 泛型）；`routes.mjs` 缺省执行归一化并上报脱敏 `hop_meta.prompt_normalization` 遥测，新增 `routing.compatibility.craggemini_prompt_normalization`（`auto` | `strict` | `off`）及 `panel-api.mjs` 校验，直连 Gemini API 密钥通道与普通用户文本保持原样（#1793）。
