@@ -678,4 +678,53 @@ with tempfile.TemporaryDirectory(prefix="gemini-p2-shard-") as p2_tmp:
     finally:
         direct_srv.close()
 
+    # Direct runtime directory permissions:
+    # 1) _allocate_native_dir creates direct_root with 0o711 (so unprivileged bwrap UIDs
+    #    can traverse it) and native_dir with 0o700 (uid:uid) so craggemini's startup
+    #    run_dir==0700 check succeeds.
+    # 2) _expose_direct_socket transitions native_dir to 0o710 (uid:gateway_gid) and
+    #    kernel.sock to 0o660 (uid:gateway_gid) once the worker is ready.
+    perm_root = p2_root / "run-gemini"
+    perm_root.mkdir(mode=0o755)
+    perm_host = impl.Host.__new__(impl.Host)
+    perm_host.socket_path = perm_root / "control.sock"
+    perm_host.gateway_gid = 995
+    chown_calls = []
+
+    def _record_chown(target, uid_val, gid_val):
+        chown_calls.append((Path(target), uid_val, gid_val))
+
+    with (
+        patch.object(impl, "check_root_owned"),
+        patch.object(impl.os, "geteuid", return_value=0),
+        patch.object(impl.os, "chown", side_effect=_record_chown),
+    ):
+        allocated_dir, owns_dir = perm_host._allocate_native_dir(
+            os.getuid(), p2_root / "fallback-native", "sh-shard-0-deadbeef01"
+        )
+        assert owns_dir is True
+        assert allocated_dir == perm_root / "d" / "sh-shard-0-deadbeef01"
+        assert ((perm_root / "d").stat().st_mode & 0o7777) == 0o711
+        assert (allocated_dir.stat().st_mode & 0o7777) == 0o700
+        assert (perm_root / "d", 0, 995) in chown_calls
+        assert (allocated_dir, os.getuid(), os.getuid()) in chown_calls
+
+        alloc_sock = allocated_dir / "kernel.sock"
+        alloc_srv = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+        alloc_srv.bind(str(alloc_sock))
+        alloc_srv.listen(1)
+        try:
+            os.chmod(alloc_sock, 0o600)
+            chown_calls.clear()
+            exposed = perm_host._expose_direct_socket(
+                SimpleNamespace(uid=os.getuid(), socket_path=str(alloc_sock))
+            )
+            assert exposed is True
+            assert (allocated_dir.stat().st_mode & 0o7777) == 0o710
+            assert (alloc_sock.stat().st_mode & 0o7777) == 0o660
+            assert (allocated_dir, os.getuid(), 995) in chown_calls
+            assert (alloc_sock, os.getuid(), 995) in chown_calls
+        finally:
+            alloc_srv.close()
+
 print("OK")

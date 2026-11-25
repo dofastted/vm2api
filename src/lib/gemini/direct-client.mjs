@@ -362,13 +362,7 @@ export function mapCragWorkerError(httpStatus, payload) {
     code === 'slot_shm_required' ||
     code === 'account_circuit_open'
   ) {
-    return makeErr(
-      503,
-      code === 'queue_full' || code === 'account_circuit_open'
-        ? 'gemini_operation_busy'
-        : 'gemini_native_worker_unavailable',
-      message,
-    )
+    return makeErr(503, code === 'queue_full' ? 'gemini_operation_busy' : 'gemini_native_worker_unavailable', message)
   }
   if (code === 'first_byte_timeout' || code === 'turn_timeout' || code === 'idle_timeout' || code === 'queue_timeout') {
     return makeErr(504, 'gemini_inference_timeout', message)
