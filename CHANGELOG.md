@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.4.220 — 2026-11-26 · 钉选 CRAGGemini 0.4.12 并恢复 agy 工具执行；修复 PostgreSQL `cooldown_until` 类型归一与一键切库脚本
+
+- **恢复 CRAGGemini `agy` 客户端工具执行并钉选 `0.4.12` 签名载荷**：
+  - `deploy/payload.json` 将 `geminiDefaultLinuxAmd64` 升级至 `payload-2026.11.26-gemini-0.4.12`（对应 `dofastted/antigravity-cli-proxy#16` / `v0.4.12`，沿用生产授权锚 `f9572077…` / `d2470877…` 与 `agy` `39816d49…`）（#1854）。
+  - `scripts/gemini-host.py` 移除原生启动参数中的 `--mode plan`，避免 CRAGGemini 运行态锁死在计划模式；`src/lib/protocol/gemini-convert.mjs` 在工具转换链路剥离 `mcp_crag_*` / `mcp__crag__*` / `mcp_craggemini_*` / `mcp__craggemini__*` 内部前缀（#1854）。
+- **PostgreSQL 迁移与运行时修复**：
+  - `src/lib/gemini/scheduler.mjs`、`src/lib/db/repos/request-attempts-repo.mjs` 与 `scripts/migrate-sqlite-to-pg.mjs` 将 `request_attempts.cooldown_until` 统一归一化为整型 epoch 毫秒，避免 ISO 时间戳字符串触发 PostgreSQL `bigint` 写入/迁移异常（#1852）。
+  - `deploy/replace-db-to-pg.sh` 的 `resolve_api_key()` 改为优先读取生效的 systemd `KIN_API_KEY` 而非陈旧 `.env` 中的 `VM2API_API_KEY`，并在 `cleanup_on_failure()` 回滚前先 `stop` 再 `start` `vm2api`，防止失败回退时进程继续持有已移除的 PostgreSQL 配置（#1855）。
+- 部署说明：本次改动涉及控制面（`src/`）、`deploy/payload.json`（CRAGGemini 默认载荷由 `0.4.11` 升级至 `0.4.12`，CRAG 维持 `3.1.20`）、`scripts/gemini-host.py`、`scripts/migrate-sqlite-to-pg.mjs` 与 `deploy/replace-db-to-pg.sh`；前端（`web/src/`）、数据库迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.219` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步脚本、更新 `deploy/payload.json` 与维护 bundle 并切换 CRAGGemini `0.4.12` 载荷后，重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance` 一次即可生效。
+
 ## 1.4.219 — 2026-11-25 · 修复 Gemini bwrap 直连目录穿越与熔断错误归因；Go 协议前置 sidecar 与官方透传开关；Gemini 代理选择器展示 IP/出口 IP/地区
 
 - **修复 Gemini `bwrap` 直连目录穿越权限与熔断错误归因回归（消除全模型 503）**：

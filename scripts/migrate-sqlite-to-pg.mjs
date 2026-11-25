@@ -85,10 +85,26 @@ function quoteIdent(name) {
   return `"${name}"`
 }
 
-function sanitizeValue(table, col, val, counters) {
+export function sanitizeValue(table, col, val, counters = { nulFields: 0 }) {
   if (val === undefined || val === null) return null
   if (table === 'crag_shop_orders' && col === 'slot_limit') {
     return String(val)
+  }
+  if (table === 'request_attempts' && col === 'cooldown_until') {
+    if (typeof val === 'bigint') return val.toString()
+    if (typeof val === 'number') return Number.isFinite(val) ? Math.trunc(val) : null
+    if (typeof val === 'string') {
+      const trimmed = val.trim()
+      if (!trimmed) return null
+      if (/^-?\d+$/.test(trimmed)) return trimmed
+      if (/^-?\d+\.\d+$/.test(trimmed)) {
+        const n = Number(trimmed)
+        return Number.isFinite(n) ? Math.trunc(n) : null
+      }
+      const parsed = Date.parse(trimmed)
+      return Number.isFinite(parsed) ? Math.trunc(parsed) : null
+    }
+    return null
   }
   if (typeof val === 'bigint') return val.toString()
   if (typeof val === 'string') {

@@ -69,6 +69,10 @@ test('deploy/replace-db-to-pg.sh enforces pre-stop dependency/connectivity check
   // Must NEVER use loose substring container matching that could hit another Postgres container on host
   assert.doesNotMatch(script, /--filter "name=postgres"/)
   assert.match(script, /name=\^\/\$\{fallback_name\}\$/)
+  // Systemd mode must resolve unit KIN_API_KEY before falling back to stale .env VM2API_API_KEY
+  assert.match(script, /systemd_env_get KIN_API_KEY/)
+  // Rollback trap must stop an already-started control plane before restarting onto SQLite
+  assert.match(script, /cleanup_on_failure\(\)[\s\S]*stop_control_plane "\$MODE" "\$BG_ACTIVE"[\s\S]*start_control_plane "\$MODE" "\$BG_ACTIVE" 1/)
 })
 
 test('deploy/install.sh auto-installs PG dependencies, guards SQLite upgrades, and exposes PG flags + db-migrate', () => {
