@@ -382,8 +382,17 @@ export function geminiEligibilityNotice(
         action: '请检查该 Google 账号订阅状态与年龄限制，或更换可用个人账号。',
         validationUrl: null,
       }
-    default:
-      return null
+    default: {
+      const validationUrl = safeGoogleValidationUrl(account?.validation_url)
+      return validationUrl
+        ? {
+            label: 'Google 返回了账号核验链接（不代表当前账号不可用）',
+            action:
+              '若对话提示需要身份核验，请在对应 Google 账号浏览器打开链接，完成核验后重试。',
+            validationUrl,
+          }
+        : null
+    }
   }
 }
 
