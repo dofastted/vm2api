@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.4.222 — 2026-11-26 · Gemini 定向 AppArmor userns 策略与沙箱探针；常规日志错误详情持久化、writeHead 响应头捕获与跨跳关联 ID
+
+- **Gemini 定向 AppArmor userns 策略、真实沙箱探针与安全 OAuth 早退归因**：
+  - `deploy/install.sh` 与 `scripts/gemini-maintenance.py` 仅在开启 `kernel.apparmor_restrict_unprivileged_userns=1` 的宿主机按条件生成并原子加载受管 `/etc/apparmor.d/vm2api-gemini`（`abi <abi/4.0>`、`flags=(unconfined)`、`userns,`），并将 `AppArmorProfile=vm2api-gemini` 与 `After/Requires=apparmor.service` 内联至 `/etc/systemd/system/vm2api-gemini.service`（保持零 drop-in 约定，缺依赖或存在人工自定义配置时闭失败）（#1868，修 #1847）。
+  - `scripts/gemini-host.py`、`scripts/gemini-maintenance.py`、`src/lib/gemini/routes.mjs` 及前端设置/导入/账号状态页新增有界无网 `setpriv` + `bwrap` 沙箱探针与 `sandbox` 维护检查项（区分 `gemini_sandbox_apparmor_restricted` 与 `gemini_sandbox_unavailable`，正/负 TTL 缓存并支持诊断强制刷新）；OAuth 登录通过 `Agy.poll_exit_status()`（`waitid(..., WNOWAIT)`）区分真实 8 秒超时与子进程早退/沙箱拒绝且零 PTY 泄露（#1868）。
+- **常规日志结构化错误详情持久化、`writeHead` 响应头捕获与跨跳关联 ID**：
+  - 新增纯增量可空迁移 `src/lib/db/migrations/069_log_error_details_and_hop_correlation.sql`（SQLite）与 `src/lib/db/pg/pg-migrations/006_log_error_details_and_hop_correlation.sql`（PostgreSQL 对等），为 `usage_logs` 与 `request_attempts` 补充 `upstream_type`、`error_details` / `error_details_json`、`error_code`、`hop_request_id` 及 `provider_{run,turn,attempt,request}_id`；`src/lib/core/errors.mjs` 新增白名单标量脱敏器持久记录 `#1705` 续接标量与 410 `reason`，`handle-protocol.mjs` 不再让泛化 `upstream_error` 掩盖具体映射码（#1869，关联 #1845）。
+  - `src/lib/admin/request-log.mjs` 完整包装 `res.writeHead` 各类签名并在脱敏前按线序合并 `res.getHeaders()` 与 `writeHead` 头，确保 debug 日志保留 `x-request-id` 与 `x-should-retry`；`go-worker-client.mjs`、`native-handoff.mjs`、`log-fields.mjs`、`failover-runner.mjs` 及前端日志详情页（`SummaryTab`、`LogicTraceTab`）全链路记录并展示单跳 `hop_request_id` 与内核 `providerResult` 关联 ID（内部 `x-gateway-request-id` 仅限 Unix socket 且不进 CRAG v2 透传白名单）（#1869）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、数据库增量迁移（SQLite `069` / PostgreSQL `006`，纯可空 `ADD COLUMN IF NOT EXISTS` 在线无重写）、`deploy/install.sh` 及 Gemini 宿主与维护脚本（`scripts/gemini-host.py`、`scripts/gemini-maintenance.py`）；`deploy/payload.json`（CRAG `3.1.21` 与 CRAGGemini `0.4.12`）及 `bin/` / `share/wrap-cli` 相对 `1.4.221` 未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步脚本并刷新维护 bundle 后需重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance` 一次以启用 `sandbox` 探针与 OAuth 早退归因。
+
 ## 1.4.221 — 2026-11-26 · 修复 Gemini `crag_subscription` 分片崩溃 503 循环；钉选 CRAG 3.1.21 与遥测上传核验；商城画布缓存持久化、日志思考后缀对齐与 PostgreSQL 备份预检加固
 
 - **修复 Gemini `crag_subscription` 分片 `license_error` 导致的周期性 `503 gemini_native_worker_unavailable`**：
