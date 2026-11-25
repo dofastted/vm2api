@@ -519,9 +519,23 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
         )
         if (!notice) return null
         return (
-          <div className='space-y-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 sm:col-span-2 lg:col-span-3'>
-            <dt className='font-medium text-amber-700 dark:text-amber-300'>
-              上游资格状态 · {notice.label}
+          <div
+            className={
+              notice.advisory
+                ? 'space-y-1.5 rounded-md border border-border bg-muted/40 p-3 sm:col-span-2 lg:col-span-3'
+                : 'space-y-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 sm:col-span-2 lg:col-span-3'
+            }
+          >
+            <dt
+              className={
+                notice.advisory
+                  ? 'font-medium text-foreground'
+                  : 'font-medium text-amber-700 dark:text-amber-300'
+              }
+            >
+              {notice.advisory
+                ? notice.label
+                : `上游资格状态 · ${notice.label}`}
             </dt>
             <dd className='text-xs text-muted-foreground'>{notice.action}</dd>
             {notice.validationUrl ? (

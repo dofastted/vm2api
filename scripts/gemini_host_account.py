@@ -166,6 +166,21 @@ def parse_ineligibility(assist_data):
     return fallback if fallback is not None else (None, None)
 
 
+def verification_url(assist_data):
+    """A safe action is independent of whether an alternative tier blocks use."""
+    if not isinstance(assist_data, dict):
+        return None
+    entries = assist_data.get("ineligibleTiers")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("reasonCode") == "VALIDATION_REQUIRED":
+            url = safe_google_validation_url(entry.get("validationUrl"))
+            if url:
+                return url
+    return None
+
+
 def select_onboard_tier(assist_data):
     if not isinstance(assist_data, dict):
         return None
@@ -432,6 +447,9 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
         except (ValueError, OverflowError, OSError):
             expiry = None
     eligibility, validation_url = parse_ineligibility(assist_data)
+    # Keep the link even when paid/current-tier metadata correctly suppresses
+    # alternative-tier eligibility failures. A URL alone never blocks scheduling.
+    validation_url = validation_url or verification_url(assist_data)
     account = {
         "email": text(user_data.get("email"), 254)
         or text(token.get("id_token_email"), 254),

@@ -22,7 +22,11 @@ import {
 import { Button } from '@/components/ui/button'
 import { vmHealthQueryOptions, type VmHealthRange } from './queries'
 import { riskFg } from './usage-meter'
-import { VmQuotaActions, WindowBar } from './usage-windows'
+import {
+  ClaudeQuotaObservations,
+  VmQuotaActions,
+  WindowBar,
+} from './usage-windows'
 import { vmWindows } from './vm-rack-model'
 import { windowTiming } from './window-timing'
 
@@ -300,6 +304,7 @@ function WindowsCard({ vm, now }: { vm: Vm; now: number }) {
         })}
       </div>
       <div className='mt-3 border-t pt-2.5'>
+        <ClaudeQuotaObservations vm={vm} now={now} />
         <VmQuotaActions vm={vm} now={now} />
       </div>
     </section>

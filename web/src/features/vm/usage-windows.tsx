@@ -92,6 +92,72 @@ function WindowRow({
   )
 }
 
+function observationPercent(value: number | null | undefined) {
+  return value == null || !Number.isFinite(value)
+    ? '未知'
+    : `${(value * 100).toFixed(0)}%`
+}
+
+/** Mutable stored state, not raw query receipts; shown only on divergence or staleness. */
+export function ClaudeQuotaObservations({ vm, now }: { vm: Vm; now: number }) {
+  const observations = vm.quota_observations
+  const official = observations?.official
+  if (isCodexVm(vm) || !official) return null
+  const windows = ['5h', '7d'] as const
+  const isStale = (sample: { reset?: string | null; stale?: boolean } | null | undefined) => {
+    const reset = expiresAtToMs(sample?.reset)
+    return Boolean(sample?.stale || (reset != null && reset > 0 && reset <= now))
+  }
+  const different = windows.some((key) => {
+    const measured = official[key]?.utilization
+    const displayed = key === '5h' ? vm.utilization_5h : vm.utilization_7d
+    return measured != null && displayed != null && measured !== displayed
+  })
+  const hasStale = windows.some((key) => isStale(official[key]))
+  if (!different && !hasStale) return null
+  return (
+    <details
+      className='min-w-0 text-[11px] text-muted-foreground'
+      data-row-actions
+      onClick={(event) => event.stopPropagation()}
+      onKeyDown={(event) => event.stopPropagation()}
+    >
+      <summary className='cursor-pointer'>
+        官方侧存储：5H {observationPercent(official['5h']?.utilization)} · 7D{' '}
+        {observationPercent(official['7d']?.utilization)}
+        {different ? ' · 与当前展示不同' : ''}
+      </summary>
+      <div className='mt-1 grid gap-1 break-words'>
+        {windows.map((key) => (
+          <div key={key}>
+            {key.toUpperCase()}
+            {(
+              [
+                ['官方侧存储', official[key]],
+                ['保守合并记录', observations.passive[key]],
+              ] as const
+            ).map(([label, sample]) => {
+              const stale = isStale(sample)
+              return (
+                <p key={label}>
+                  {label}：{observationPercent(sample?.utilization)}
+                  {stale ? '（陈旧）' : ''} · 状态 {sample?.status || '未知'} ·
+                  重置 {sample?.reset || '未知'} ·{' '}
+                  {sample?.sampled_at || '窗口采样时间未知'}
+                </p>
+              )
+            })}
+          </div>
+        ))}
+        <p>
+          官方侧保留时间：{official.updated_at || '未知'}
+          （不保证对应单窗口采样；重置后可能被响应头校正，并非官方查询原始回执，不改变保守调度规则）。
+        </p>
+      </div>
+    </details>
+  )
+}
+
 /** GPT 槽：刷新额度和积分 / 使用重置券；Claude 完整 OAuth：原生限额查询 / 重置。 */
 export function VmQuotaActions({ vm, now }: { vm: Vm; now: number }) {
   return isCodexVm(vm) ? (

@@ -1376,10 +1376,14 @@ class Maintenance:
         if exists(self.pending):
             return
         try:
-            egress_ok = hash_pin(self.runtime / "bin/kin-egress", self.egress_pin)
+            # The installer uses INSTALL_DIR/bin; maintenance recovery uses runtime/bin.
+            # Diagnose the configured executable, not an unused or absent copy.
+            options = self.unit_args(self.unit_bytes())
+            egress = canonical(options.get("--egress"))
+            egress_ok = hash_pin(egress, self.egress_pin)
             if egress_ok:
-                egress_ok = os.access(self.runtime / "bin/kin-egress", os.X_OK)
-        except (OSError, ValueError):
+                egress_ok = os.access(egress, os.X_OK)
+        except (Failure, OSError, ValueError):
             egress_ok = False
         with self.guard:
             self.egress_ok = egress_ok
