@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.4.221 — 2026-11-26 · 修复 Gemini `crag_subscription` 分片 503；钉选 CRAG 3.1.21 与原生遥测上传验证；CRAG 套餐画布持久化缓存；PG 备份预检/UI 与 Gemini 日志口径对齐
+
+- **修复 Gemini `crag_subscription` 分片守护进程 503 与分片故障回退**：`scripts/gemini-host.py` 在 `payload_mode == "crag_subscription"` 下禁用共享 rootfs 的 `CragDaemonShard`（消除单环境 `/etc/machine-id` 缺失导致的 `exit_code=1 reason=license_error`）并对齐 `planned_shards`；新增 `_clear_shard_fault()` 仅在分片就绪或成功流式响应后清零退避计数，避免故障回退被锁死在 2s 最小退避；`_stream_native_infer()` 在发包前分片异常退出时透明隔离分片并回落至按账号 `NativeSession` 池（#1863）。
+- **接入 CRAG 原生遥测真实上传验证并钉选 CRAG `3.1.21` 签名载荷**：
+  - `deploy/payload.json` 与 `src/lib/admin/kernel-catalog.mjs` 将 CRAG 载荷升级至 `payload-2026.11.26-crag-3.1.21`（对应 `dofastted/crag#29` / `v3.1.21`，沿用既有生产信任锚 `9dbb4bc2…` / `835451e2…`）（#1859）。
+  - `src/lib/transport/rust-kernel-client.mjs` 与 `src/lib/vm/slot-process-status.mjs` 支持 `crag_telemetry_upload_v1` 并向面板透传脱敏后的 `upload_confirmed`、`upload_supported`、`last_upload_at`、`last_error`；前端遥测面板与槽位种子页区分四态展示并开放查看最近 40 条脱敏上传计数日志，同步更新 `docs/TELEMETRY.md`（#1859）。
+- **CRAG 套餐与展示画布持久化缓存、哈希跳过与超时降级**：`src/lib/admin/crag-shop.mjs`、`src/lib/admin/crag-shop-supplier.mjs` 与 `src/server.mjs` 将套餐画布按 `public`/`pilot` 作用域持久化至 `settings`（`crag_shop_catalog_cache_v1`），提供 SHA-256 `catalog_hash`、`ETag`/`If-None-Match`（`304`）、SWR + singleflight 合并、启动预热 `warmPlans` 及刷新超时/5xx 降级返回 `stale: true`；前端 `web/src/features/billing/crag-shop.tsx` 支持 `localStorage` 首屏水合、`?hash=` 无变更跳过、聚焦节流且超时不覆写已就绪画布（#1862）。
+- **PostgreSQL 备份/恢复预检、状态码与 `BackupPane` UI 端到端对齐**：`src/lib/admin/backup-service.mjs` 在 `pre_restore` 前置校验归档格式、SHA-256、双向 PG↔SQLite 引擎兼容与 `pg_restore` 可用性并确保异步 `_rebindStores` 与临时目录清理；`src/lib/admin/panel-routes.mjs` 返回当前引擎、区分 `.pgdump`/`.gz` MIME 并映射 `422`/`503`；`src/server.mjs` 恢复后异步重同步 `ensureRedaction`；前端 `backup-pane.tsx` / `backup-utils.ts` 新增引擎与格式徽章、跨引擎恢复禁用提示、本地化 `磁盘导入` 及二次确认删除（#1858）。
+- **Gemini 思考后缀日志模型匹配口径统一**：抽离 `src/lib/protocol/log-fields.mjs` `modelMismatch()` 作为唯一事实来源并在 `web/src/features/logs/log-display.ts` 新增 `isGeminiTierEquivalentModel()`，将 Gemini 思考档位后缀（`-minimal/-low/-medium/-high/-xhigh/-max` 等）与上游裸 `modelVersion` 视为一致，同时在 `UsageLogsView` 归一化历史误标 `model_mismatch = 1` 记录（保留真实跨模型/降档失配检测）（#1860）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、`deploy/payload.json`（CRAG 载荷由 `3.1.20` 升级至 `3.1.21`，CRAGGemini 维持 `0.4.12`）以及 `scripts/gemini-host.py`；数据库迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.220` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机需同步 `scripts/gemini-host.py` 与维护 bundle 并重启 `vm2api-gemini` 与 `vm2api-gemini-maintenance` 一次以启用 `#1863` 修复；CRAG `3.1.21` 可通过面板内核页或 `install.sh` 按需升级。
+
 ## 1.4.220 — 2026-11-26 · 钉选 CRAGGemini 0.4.12 并恢复 agy 工具执行；修复 PostgreSQL `cooldown_until` 类型归一与一键切库脚本
 
 - **恢复 CRAGGemini `agy` 客户端工具执行并钉选 `0.4.12` 签名载荷**：
