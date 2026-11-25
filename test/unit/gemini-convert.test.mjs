@@ -1633,3 +1633,164 @@ test('createGeminiRestoreTransform enforces stopSequences, maxOutputTokens, resp
     /data:image\/png;base64,QUJD/,
   )
 })
+
+test('gemini-4-carbon-high effort propagation, default CRAGGemini thinkingConfig, and Antigravity2API multi-protocol parity', () => {
+  // 1. gemini-4-carbon-high preserves high thinkingLevel on both Gemini and CRAGGemini (includeThinkingConfig: true)
+  const carbonIr = parseInboundToGemini('openai-chat', {
+    model: 'gemini-4-carbon-high',
+    messages: [{ role: 'user', content: 'Solve this step by step.' }],
+  })
+  assert.equal(carbonIr.model, 'gemini-4-carbon-high')
+  assert.equal(carbonIr.hideThinking, false)
+  const carbonAgDefault = buildGeminiRequest(carbonIr, { target: 'antigravity' })
+  assert.equal('generationConfig' in carbonAgDefault, false, 'default minimal antigravity build stays unchanged')
+  const carbonAgThinking = buildGeminiRequest(carbonIr, {
+    target: 'antigravity',
+    includeThinkingConfig: true,
+    defaultEffort: 'medium',
+  })
+  assert.deepEqual(carbonAgThinking.generationConfig, {
+    thinkingConfig: {
+      includeThoughts: true,
+      thinkingLevel: 'high',
+    },
+  })
+
+  // Even when scheduler falls back upstreamModel to untiered `gemini-4-carbon`, requestedModel keeps `high`
+  const carbonFallbackAg = buildGeminiRequest(
+    { ...carbonIr, model: 'gemini-4-carbon', requestedModel: 'gemini-4-carbon-high' },
+    { target: 'antigravity', includeThinkingConfig: true, defaultEffort: 'medium' },
+  )
+  assert.deepEqual(carbonFallbackAg.generationConfig, {
+    thinkingConfig: {
+      includeThoughts: true,
+      thinkingLevel: 'high',
+    },
+  })
+
+  // Bare `gemini-4-carbon` defaults to `includeThoughts: true, thinkingLevel: 'medium'` on CRAGGemini
+  const bareCarbonIr = parseInboundToGemini('gemini', {
+    model: 'models/gemini-4-carbon[1m]',
+    contents: [{ role: 'user', parts: [{ text: 'Hello' }] }],
+  })
+  assert.equal(bareCarbonIr.model, 'gemini-4-carbon')
+  const bareCarbonAg = buildGeminiRequest(bareCarbonIr, {
+    target: 'antigravity',
+    includeThinkingConfig: true,
+    defaultEffort: 'medium',
+  })
+  assert.deepEqual(bareCarbonAg.generationConfig, {
+    thinkingConfig: {
+      includeThoughts: true,
+      thinkingLevel: 'medium',
+    },
+  })
+
+  // `model(effort)` syntax + hydrogen `xhigh` support
+  const parenCarbonIr = parseInboundToGemini('anthropic', {
+    model: 'gemini-4-carbon(high)',
+    max_tokens: 4096,
+    messages: [{ role: 'user', content: 'Analyze' }],
+  })
+  assert.equal(parenCarbonIr.model, 'gemini-4-carbon')
+  assert.equal(parenCarbonIr.thinking?.effort, 'high')
+  const hydroIr = parseInboundToGemini('openai-chat', {
+    model: 'gemini-4-hydrogen',
+    reasoning_effort: 'xhigh',
+    messages: [{ role: 'user', content: 'Deep analysis' }],
+  })
+  const hydroOut = buildGeminiRequest(hydroIr, {
+    target: 'antigravity',
+    includeThinkingConfig: true,
+  })
+  assert.deepEqual(hydroOut.generationConfig.thinkingConfig, {
+    includeThoughts: true,
+    thinkingLevel: 'xhigh',
+  })
+
+  // 2. OpenAI Chat inbound assistant `reasoning_content` + camelCase `extra_body.google.thinkingConfig`
+  const chatHistoryIr = parseInboundToGemini('openai-chat', {
+    model: 'gemini-4-carbon',
+    extra_body: {
+      google: {
+        thinkingConfig: {
+          thinkingLevel: 'HIGH',
+          includeThoughts: true,
+        },
+      },
+    },
+    messages: [
+      { role: 'user', content: 'First turn' },
+      { role: 'assistant', reasoning_content: 'Prior thought', content: 'Prior answer' },
+      { role: 'user', content: 'Second turn' },
+    ],
+  })
+  assert.equal(chatHistoryIr.thinking?.effort, 'high')
+  assert.equal(chatHistoryIr.messages[1].parts[0].kind, 'thinking')
+  assert.equal(chatHistoryIr.messages[1].parts[0].text, 'Prior thought')
+
+  // 3. OpenAI Responses `configuration_update`, `encrypted_content` replay, and outbound `reasoning.encrypted_content`
+  const respIr = parseInboundToGemini('openai-responses', {
+    model: 'gemini-4-carbon',
+    include: ['reasoning.encrypted_content'],
+    reasoning: { effort: 'low' },
+    input: [
+      { type: 'message', role: 'user', content: 'Turn 1' },
+      { type: 'reasoning', encrypted_content: 'sig_enc_123', summary: [{ type: 'summary_text', text: 'thought' }] },
+      { type: 'function_call', call_id: 'call_1', name: 'lookup', arguments: '{"q":"x"}' },
+      { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+      { type: 'configuration_update', reasoning: { effort: 'high' } },
+      { type: 'message', role: 'user', content: 'Turn 2' },
+    ],
+  })
+  assert.equal(respIr.thinking?.effort, 'high', 'configuration_update overrides initial reasoning.effort')
+  assert.equal(respIr.restoreContext?.includeEncryptedReasoning, true)
+  const tcPart = respIr.messages.flatMap((m) => m.parts).find((p) => p.kind === 'tool_call')
+  assert.equal(tcPart?.signature, 'sig_enc_123', 'encrypted_content attaches to subsequent function_call')
+
+  const encEncoder = createGeminiProtocolStreamEncoder('openai-responses', {
+    model: 'gemini-4-carbon-high',
+    restoreContext: respIr.restoreContext,
+  })
+  let encSse = ''
+  encSse += encEncoder.push({ kind: 'start', model: 'gemini-4-carbon-high', responseId: 'r1' })
+  encSse += encEncoder.push({ kind: 'thinking', text: 'Detailed agy reasoning.' })
+  encSse += encEncoder.push({ kind: 'thinking_signature', signature: 'sig_out_999' })
+  encSse += encEncoder.push({ kind: 'text', text: 'Done.' })
+  encSse += encEncoder.push({ kind: 'stop', finishReason: 'STOP', stopReason: 'stop' })
+  encSse += encEncoder.finish()
+  assert.match(encSse, /"encrypted_content":"sig_out_999"/)
+
+  const encJson = renderGeminiProtocolResponse('openai-responses', encEncoder.result(), {
+    model: 'gemini-4-carbon-high',
+    restoreContext: respIr.restoreContext,
+  })
+  assert.equal(encJson.output[0].type, 'reasoning')
+  assert.equal(encJson.output[0].encrypted_content, 'sig_out_999')
+
+  // 4. Anthropic mid-conversation `output_config.effort` and `redacted_thinking` signature preservation
+  const anthMidIr = parseInboundToGemini('anthropic', {
+    model: 'gemini-4-carbon',
+    max_tokens: 4096,
+    output_config: { effort: 'low' },
+    messages: [
+      { role: 'user', content: 'Start' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'redacted_thinking', data: 'sig_redacted_77' },
+          { type: 'tool_use', id: 'toolu_1', name: 'ping', input: {} },
+        ],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'pong' }],
+      },
+      { role: 'system', output_config: { effort: 'high' }, content: 'Switch effort' },
+      { role: 'user', content: 'Continue' },
+    ],
+  })
+  assert.equal(anthMidIr.thinking?.effort, 'high')
+  const anthTc = anthMidIr.messages.flatMap((m) => m.parts).find((p) => p.kind === 'tool_call')
+  assert.equal(anthTc?.signature, 'sig_redacted_77')
+})

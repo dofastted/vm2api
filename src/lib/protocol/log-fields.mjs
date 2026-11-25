@@ -39,10 +39,12 @@ export function effortFromThinkingBudget(budget) {
 }
 
 export function effortFromModelName(model) {
-  const text = String(model || '').trim()
+  let text = String(model || '').trim()
   if (!text) return null
+  text = text.replace(/\[1m\]$/i, '')
   const paren = MODEL_PAREN_EFFORT_RE.exec(text)
   if (paren) return normalizeReasoningEffort(paren[1])
+  text = text.replace(/-latest$/i, '').replace(/-thinking$/i, '')
   const suffix = MODEL_SUFFIX_EFFORT_RE.exec(text)
   if (suffix) return normalizeReasoningEffort(suffix[1])
   return null
