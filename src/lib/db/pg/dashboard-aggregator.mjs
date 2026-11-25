@@ -10,6 +10,7 @@
 const AGG_LOCK_KEY = 'vm2api_dashboard_aggregator_v1'
 const DEFAULT_INTERVAL_MS = 60_000
 
+let kickoff = null
 let timer = null
 let running = false
 
@@ -279,13 +280,20 @@ export function startDashboardAggregator(pool, { intervalMs = DEFAULT_INTERVAL_M
     }
   }
   // Initial non-blocking catch-up after startup settles
-  const kickoff = setTimeout(tick, 5_000)
+  kickoff = setTimeout(() => {
+    kickoff = null
+    void tick()
+  }, 5_000)
   kickoff.unref?.()
   timer = setInterval(tick, Math.max(10_000, Number(intervalMs) || DEFAULT_INTERVAL_MS))
   timer.unref?.()
 }
 
 export function stopDashboardAggregator() {
+  if (kickoff) {
+    clearTimeout(kickoff)
+    kickoff = null
+  }
   if (timer) {
     clearInterval(timer)
     timer = null

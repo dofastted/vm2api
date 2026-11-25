@@ -8,7 +8,7 @@ vm2api 支持将主数据库从嵌入式 SQLite 迁移至 **PostgreSQL**，并�
 
 | 组件 | 作用与依赖保障 |
 | --- | --- |
-| `postgres:18-alpine` | 主库（显式 `PGDATA=/var/lib/postgresql/data`，仅监听 `127.0.0.1`），通过 Advisory Lock + SHA-256 校验执行 `src/lib/db/pg/pg-migrations/001..004`；默认端口 `5432` 被本机其他服务占用时自动顺延至空闲端口 |
+| `postgres:18-alpine` | 主库（显式 `PGDATA=/var/lib/postgresql/data`，仅监听 `127.0.0.1`），通过 Advisory Lock + SHA-256 校验执行 `src/lib/db/pg/pg-migrations/001..005`；默认端口 `5432` 被本机其他服务占用时自动顺延至空闲端口 |
 | `redis:8-alpine`（可选） | L2 分布式缓存、Lua 原子余额/窗口计数、Redis `TIME` 并发槽、Pub/Sub 跨实例失效；不可达或禁用（`--no-redis`）时自动 fail-open 降级至 L1 + PG `LISTEN/NOTIFY` |
 | 控制面镜像（amd64 / arm64） | `Dockerfile` 与 `deploy/Dockerfile.arm64-control` 均预装 `postgresql-client`（`pg_dump` / `pg_restore` / `psql` / `pg_isready`）及 Node 生产依赖 `pg` + `ioredis` |
 | 一键脚本自动补装依赖 | `deploy/install-pg.sh`、`deploy/install.sh`、`deploy/replace-db-to-pg.sh` 自动检测包管理器（`apt` / `dnf` / `yum` / `apk`），在停服前补齐 `git`、`curl`、`python3`、`openssl`、`postgresql-client`、`docker` + Compose 插件；systemd 宿主机模式自动校验 Node >= 22.5 并补装 `pg` / `ioredis`（`npm ci --omit=dev`），无 Docker 时支持 `--pg-runtime native` 原生安装 `postgresql` + `redis-server` |
@@ -94,7 +94,7 @@ sudo bash /opt/vm2api/deploy/replace-db-to-pg.sh \
 1. **停服前完成全部前置校验**：依赖检查/自动补装（`postgresql-client`、`docker`/Compose、systemd 下 Node >= 22.5 + `pg`/`ioredis`、Docker 镜像内 `migrate-sqlite-to-pg.mjs` + `pg`）、端口冲突检测与顺延、目标 PG `SELECT 1` 探针——任何条件不满足都在零停机下安全退出。
 2. **绝不触碰运行中的 `kin-*` 槽容器、`vms/` 目录或设备授权**；仅短暂停机 `vm2api` 控制面（兼容普通 Compose、蓝绿与 systemd）。
 3. 停服后先对 `kin.db` 做 `WAL checkpoint(TRUNCATE)`，再将原 `kin.db`（含 WAL/SHM）与 `.env` 备份至 `data/backups/pre-pg-migration-<时间戳>/`，原 SQLite 永不删除。
-4. 流式分批迁移全部 31 张业务表 + `thinking_signature_owners`，清理 PostgreSQL 禁止的 UTF-8 NUL 字节，重置全部 `BIGSERIAL` 序列并运行 `ANALYZE`。
+4. 流式分批迁移全部 32 张业务表 + `thinking_signature_owners`，清理 PostgreSQL 禁止的 UTF-8 NUL 字节，重置全部 `BIGSERIAL` 序列并运行 `ANALYZE`。
 5. 自动执行 `--verify`（全表行数 + `usage_logs` Token/费用总额 + `users.balance` + `api_keys` 精确核对）与 `--rollup`（预热仪表盘聚合表）。
 6. 使用 `--force-recreate` 启动控制面并核验 `/health` 与 `/api/panel/database/metrics` 返回 `engine: "postgres"` 且 `ok: true`；任意环节失败均自动触发 `ERR` 回滚至 SQLite。
 

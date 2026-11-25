@@ -12,6 +12,7 @@ import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
 import { redactionStatus } from '../redaction/runtime.mjs'
 import { normalizeGeminiRouting } from '../gemini/routing-config.mjs'
+import { CRAGGEMINI_PERSONA_PRESETS, CRAGGEMINI_SYSTEM_PROMPT_MAX } from '../gemini/system-prompt.mjs'
 import { readSlotProcessStatus } from '../vm/slot-process-status.mjs'
 import { openaiUsageAccountId } from '../vm/codex-slot.mjs'
 import os from 'node:os'
@@ -456,15 +457,15 @@ export function validatePersonaRoutingPatch(body = {}) {
   }
   if (compat.craggemini_persona_preset != null && String(compat.craggemini_persona_preset).trim() !== '') {
     const raw = String(compat.craggemini_persona_preset).trim()
-    if (raw !== 'official_full' && raw !== 'zero') {
-      problems.push(`craggemini_persona_preset 必须是 official_full / zero，收到 ${raw}`)
+    if (!CRAGGEMINI_PERSONA_PRESETS.includes(raw)) {
+      problems.push(`craggemini_persona_preset 必须是 ${CRAGGEMINI_PERSONA_PRESETS.join(' / ')}，收到 ${raw}`)
     }
   }
   if (compat.craggemini_system_prompt != null) {
     if (typeof compat.craggemini_system_prompt !== 'string') {
       problems.push('craggemini_system_prompt 必须是字符串')
-    } else if (compat.craggemini_system_prompt.length > 32_768) {
-      problems.push('craggemini_system_prompt 超过 32768 字符')
+    } else if (compat.craggemini_system_prompt.length > CRAGGEMINI_SYSTEM_PROMPT_MAX) {
+      problems.push(`craggemini_system_prompt 超过 ${CRAGGEMINI_SYSTEM_PROMPT_MAX} 字符`)
     }
   }
   if (compat.overlay_preset != null && String(compat.overlay_preset).trim() !== '') {

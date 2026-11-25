@@ -14,8 +14,12 @@ export type ApiKeyItem = {
   key?: string
   revealable?: boolean
   status?: string
-  category?: 'oauth' | 'api'
+  category?: 'oauth' | 'api' | 'all'
   api_endpoint_id?: string | null
+  permission_tier?: 'platform' | 'tenant' | 'resource'
+  owner_id?: string | null
+  allowed_endpoints?: string[]
+  allowed_gemini_envs?: string[]
   max_concurrency?: number
   quota_requests?: number
   quota_used?: number

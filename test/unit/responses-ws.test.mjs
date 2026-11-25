@@ -83,7 +83,7 @@ function openWs(url, headers = {}) {
         } catch {
           body = {}
         }
-        done({ ok: false, status: res.statusCode, body, ws: null })
+        done({ ok: false, status: res.statusCode, headers: res.headers, body, ws: null })
       })
     })
     ws.once('error', (error) => {
@@ -1154,7 +1154,12 @@ test('real handleProtocol: a Codex incomplete response reaches WebSocket and its
     assert.equal(spent.tokens_out, 10_000)
     assert.ok(spent.quota_used > 0)
     assert.equal(spent.status, 'quota_exhausted')
+    const quotaErrFrame = nextFrame(opened.ws, (frame) => frame.type === 'error')
     opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'second' }))
+    const errFrame = await quotaErrFrame
+    assert.equal(errFrame.status, 402)
+    assert.equal(errFrame.error.code, 'api_key_quota_exhausted')
+    assert.equal(errFrame.error.details?.limit_type, 'usd_quota')
     await waitFinish(2)
     assert.equal(finishCalls[1].error_code, 'api_key_quota_exhausted')
     assert.equal(hops, 1)
@@ -1211,6 +1216,34 @@ test('unexpected handler failures do not expose internal exception details', asy
     assert.doesNotMatch(JSON.stringify(frame), /private|credentials|secret-fixture-token/)
   } finally {
     opened.ws.close()
+    await live.close()
+  }
+})
+
+test('WebSocket upgrade handshake preserves Retry-After headers set before json()', async () => {
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth(_req, res) {
+      res.setHeader('Retry-After', '17')
+      json(res, 402, {
+        error: {
+          type: 'rate_limit_error',
+          code: 'api_key_rate_limit',
+          message: 'API key 5h spend limit exceeded',
+          details: { limit_type: 'spend_5h', retry_after: 17 },
+        },
+      })
+      return false
+    },
+    async handleProtocol() {},
+  })
+  try {
+    const denied = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    assert.equal(denied.ok, false)
+    assert.equal(denied.status, 402)
+    assert.equal(denied.headers?.['retry-after'], '17')
+    assert.equal(denied.body?.error?.details?.limit_type, 'spend_5h')
+  } finally {
     await live.close()
   }
 })

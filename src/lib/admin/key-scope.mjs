@@ -82,7 +82,7 @@ function poolIdOf(value) {
 export function normalizeKeyCategory(value, { fallback = 'oauth' } = {}) {
   if (value == null || value === '') return fallback
   const v = String(value).trim().toLowerCase()
-  if (v === 'oauth' || v === 'api' || v === 'all') return v
+  if (KEY_CATEGORIES.includes(v)) return v
   return null
 }
 

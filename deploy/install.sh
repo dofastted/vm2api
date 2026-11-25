@@ -996,7 +996,7 @@ PY
     atomic_maintenance_file "$bundle/scripts/gemini-maintenance.py" "$root/scripts/gemini-maintenance.py" 644 &&
     atomic_maintenance_file "$bundle/deploy/gemini-maintenance.service.example" "$unit" 644 &&
     systemctl daemon-reload && systemctl enable vm2api-gemini-maintenance.service && systemctl restart vm2api-gemini-maintenance.service; then
-    ok "Gemini 维护服务已就绪，可在设置 → Gemini 操作"
+    ok "Gemini 维护服务已就绪，可在设置 → Gemini 维护 操作"
     return 0
   fi
   systemctl stop vm2api-gemini-maintenance.service || warn "无法停止未就绪的维护服务"

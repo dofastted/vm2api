@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { compatibilityPatch } from './compat-patch'
+import { compatibilityPatch, systemPromptSaveToast } from './compat-patch'
 
 describe('system prompt save body', () => {
   it('sends only compatibility, never other routing sections', () => {
@@ -23,5 +23,30 @@ describe('system prompt save body', () => {
       persona_preset: 'zero',
       persona_inject: 'zero',
     })
+  })
+
+  it('formats save toast for the active kernel tab instead of always reporting cli-node preset', () => {
+    expect(
+      systemPromptSaveToast(
+        'craggemini',
+        { persona_preset: 'official_full', craggemini_persona_preset: 'zero' },
+        0
+      )
+    ).toBe('已保存 · CRAGGemini · 0提示词')
+    expect(
+      systemPromptSaveToast(
+        'crag',
+        { persona_preset: 'official_full', crag_persona_preset: 'zero' },
+        0
+      )
+    ).toBe('已保存 · CRAG v2 print · 0注入')
+    expect(
+      systemPromptSaveToast(
+        'cli-node',
+        { persona_preset: 'official_full' },
+        0,
+        { updated: 0 }
+      )
+    ).toContain('官方完整提示词')
   })
 })

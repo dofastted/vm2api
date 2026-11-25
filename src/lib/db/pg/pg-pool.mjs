@@ -111,21 +111,3 @@ export function getPgPoolStats(pool) {
     max: pool.options?.max ?? null,
   }
 }
-
-/** Execute an async callback inside a PostgreSQL transaction on a dedicated client. */
-export async function withPgTransaction(pool, fn) {
-  const client = await pool.connect()
-  try {
-    await client.query('BEGIN')
-    const result = await fn(client)
-    await client.query('COMMIT')
-    return result
-  } catch (err) {
-    try {
-      await client.query('ROLLBACK')
-    } catch {}
-    throw err
-  } finally {
-    client.release()
-  }
-}
