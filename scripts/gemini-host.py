@@ -3417,6 +3417,12 @@ class Host:
         private_json(self.policy_file, self.runtime_policy)
 
     def _use_sharded_daemon(self):
+        # Each crag_subscription environment has its own per-environment /etc/machine-id
+        # bound into its device.json and registration.code, while CragDaemonShard runs
+        # inside a single shared bwrap rootfs without per-account /etc/machine-id
+        # isolation. Always use per-account NativeSession pools under crag_subscription.
+        if getattr(self, "payload_mode", None) == "crag_subscription":
+            return False
         # The shard path is new in #1704 and has no pre-0.4.5 shape: its kernel config
         # carries the keys KERNEL_POLICY_FIELDS gates, and stripping them would hand an
         # older payload a config that parses but no longer describes the sharding the
@@ -3486,6 +3492,12 @@ class Host:
         if self.runtime_policy.get("daemon_fault_isolation", True):
             meta["isolated_until"] = time.monotonic() + delay
         return meta
+
+    def _clear_shard_fault(self, shard_id):
+        meta = self._shard_faults.get(shard_id)
+        if meta:
+            meta["failures"] = 0
+            meta["isolated_until"] = 0.0
 
     def _stop_shard(self, shard_id):
         shard = self.daemon_shards.pop(shard_id, None)
@@ -3629,14 +3641,18 @@ class Host:
             if env.get("auth_method", "oauth") == "oauth"
             and env.get("auth_state") == "authorized"
         )
+        use_sharded = self._use_sharded_daemon()
         per_daemon = int(
             self.runtime_policy.get("accounts_per_daemon", DEFAULT_ACCOUNTS_PER_DAEMON)
         )
+        effective_per_daemon = per_daemon if use_sharded else 1
         planned_shards = (
-            (oauth_envs + per_daemon - 1) // per_daemon if oauth_envs > 0 else 0
+            (oauth_envs + effective_per_daemon - 1) // effective_per_daemon
+            if oauth_envs > 0
+            else 0
         )
         return {
-            "mode": "sharded" if self._use_sharded_daemon() else "per_account",
+            "mode": "sharded" if use_sharded else "per_account",
             "accounts_per_daemon": per_daemon,
             "daemon_fault_isolation": bool(
                 self.runtime_policy.get("daemon_fault_isolation", True)
@@ -3743,10 +3759,6 @@ class Host:
                     )
                     with self.lock:
                         self.daemon_shards[shard_id] = shard
-                        meta = self._shard_faults.get(shard_id)
-                        if meta:
-                            meta["failures"] = 0
-                            meta["isolated_until"] = 0.0
                 else:
                     shard.sync_account(
                         ctx["env"], ctx["proxy_url"], ctx["auth"], model=ctx["model"]
@@ -5618,9 +5630,7 @@ class Host:
                     and status.get("ready") is True
                     and status.get("needs_recovery") is not True
                 ):
-                    meta = self._shard_faults.get(shard_id)
-                    if meta:
-                        meta["failures"] = 0
+                    self._clear_shard_fault(shard_id)
                 if shard.is_severely_unhealthy():
                     self._stop_shard(shard_id)
                     self._record_shard_fault(shard_id)
@@ -6413,8 +6423,9 @@ class Host:
 
         worker = None
         is_shard = False
+        shard_id = None
         if use_shard:
-            shard, _ = self._acquire_shard_for_account(ctx)
+            shard, shard_id = self._acquire_shard_for_account(ctx)
             if shard is not None:
                 worker = shard
                 is_shard = True
@@ -6433,6 +6444,9 @@ class Host:
             ):
                 return {"direct": False, "reason": "warming"}
             worker._ever_ready = True
+            if is_shard and shard_id:
+                with self.lock:
+                    self._clear_shard_fault(shard_id)
         if not self._expose_direct_socket(worker):
             return {"direct": False, "reason": "socket_unavailable"}
         use_account_route = is_shard or getattr(worker, "pool_mode", False)
@@ -7462,6 +7476,7 @@ class Host:
         if shard is not None:
             conn = None
             had_error = False
+            stream_started = False
 
             def stop_shard_turn():
                 shard.cancel_turn(identifier, ctx["request_id"])
@@ -7480,6 +7495,10 @@ class Host:
                     model=ctx["model"],
                     gateway_policy=gateway_policy,
                 )
+                if shard_id:
+                    with self.lock:
+                        self._clear_shard_fault(shard_id)
+                stream_started = True
                 handler.begin_sse()
                 while not cancel_event.is_set():
                     chunk = response.read1(_SSE_STREAM_READ_BYTES)
@@ -7492,25 +7511,45 @@ class Host:
                 return "completed", None
             except native_mod.NativeFailure as error:
                 had_error = error.code != "gemini_unsupported_turn"
-                status = error.status or 502
-                self._emit_json_error(
-                    handler,
-                    status,
-                    error.code,
-                    error.message,
-                    retry_after_ms=error.retry_after_ms,
-                    upstream_reason=getattr(error, "upstream_reason", None),
-                    content_rejected=getattr(error, "content_rejected", False),
-                )
-                return "failed", error.code
+                if (
+                    not stream_started
+                    and error.status == 503
+                    and error.code
+                    in (
+                        "gemini_native_worker_unavailable",
+                        "gemini_native_bridge_timeout",
+                    )
+                    and self.runtime_policy.get("daemon_fault_isolation", True)
+                    and (not shard.is_alive() or shard.is_severely_unhealthy())
+                ):
+                    pass
+                else:
+                    status = error.status or 502
+                    self._emit_json_error(
+                        handler,
+                        status,
+                        error.code,
+                        error.message,
+                        retry_after_ms=error.retry_after_ms,
+                        upstream_reason=getattr(error, "upstream_reason", None),
+                        content_rejected=getattr(error, "content_rejected", False),
+                    )
+                    return "failed", error.code
             except (BrokenPipeError, ConnectionResetError):
                 had_error = True
                 stop_shard_turn()
                 raise
             except (OSError, TimeoutError, HTTPException):
                 had_error = True
-                handler.send_json_error(502, "gemini_inference_failed")
-                return "failed", "gemini_inference_failed"
+                if (
+                    not stream_started
+                    and self.runtime_policy.get("daemon_fault_isolation", True)
+                    and (not shard.is_alive() or shard.is_severely_unhealthy())
+                ):
+                    pass
+                else:
+                    handler.send_json_error(502, "gemini_inference_failed")
+                    return "failed", "gemini_inference_failed"
             finally:
                 if conn is not None:
                     conn.close()
