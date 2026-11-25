@@ -533,3 +533,135 @@ unixTest('a failed reload removes the new work drop-in and does not restart', (c
   assert.equal(fx.exists(workDropinPath), false)
   assert.equal(fx.calls().some(kernelRestart), false)
 })
+
+const transcriptDropinPath = '/etc/systemd/system/kin-kernel.service.d/46-vm2api-crag-transcripts.conf'
+
+function transcriptHook(fx) {
+  const line = fx
+    .read(transcriptDropinPath)
+    .split('\n')
+    .find((entry) => entry.startsWith('ExecStartPre='))
+  assert.match(line, /^ExecStartPre=-\+\/bin\/sh -c '/)
+  return line.replace(/^ExecStartPre=-\+\/bin\/sh -c '/, '').replace(/'$/, '')
+}
+
+function transcriptStubs(fx) {
+  const log = fx.file('/transcript-hook-calls.log')
+  fx.write('/transcript-bin/mountpoint', '#!/bin/sh\nexit 1\n', 0o755)
+  fx.write('/transcript-bin/mount', `#!/bin/sh\necho "mount $*" >> '${log}'\nexit 0\n`, 0o755)
+  // install -d … <dir>: record the call and create the directory without needing a kincli account.
+  fx.write(
+    '/transcript-bin/install',
+    `#!/bin/sh\necho "install $*" >> '${log}'\nfor last; do :; done\nmkdir -p "$last"\n`,
+    0o755,
+  )
+  fx.write(
+    '/transcript-bin/id',
+    '#!/bin/sh\n[ "$2" = "kincli" ] || exit 1\nif [ "$1" = "-u" ]; then echo 1001; elif [ "$1" = "-g" ]; then echo 1002; else exit 1; fi\n',
+    0o755,
+  )
+  const run = (script) =>
+    spawnSync('sh', ['-c', script], {
+      env: { ...process.env, PATH: `${fx.file('/transcript-bin')}:${process.env.PATH}` },
+      encoding: 'utf8',
+    })
+  const calls = () =>
+    fx.exists('/transcript-hook-calls.log') ? fx.read('/transcript-hook-calls.log').trim().split('\n') : []
+  return { run, calls }
+}
+
+unixTest('CRAG v2 also mounts guest tmpfs over the CLI resume transcripts before the kernel restarts', (context) => {
+  const fx = fixture(context)
+  const result = successful(fx.run({ restart: true }))
+  assert.equal(result.work_dir, 'tmpfs')
+  assert.equal(result.transcripts, 'tmpfs')
+  const dropin = fx.read(transcriptDropinPath)
+  assert.ok(dropin.startsWith(marker))
+  assert.equal(fs.statSync(fx.file(transcriptDropinPath)).mode & 0o777, 0o644)
+  const inner = transcriptHook(fx)
+  // systemd expands ${NAME} inside ExecStartPre; the hook must only use literal paths and $(…) substitutions.
+  assert.doesNotMatch(inner, /\$\{/)
+  assert.doesNotMatch(inner, /\bchown\b/)
+  assert.match(
+    inner,
+    /mount -t tmpfs -o mode=0700,uid=\$\(id -u kincli\),gid=\$\(id -g kincli\),size=512m,nosuid,nodev vm2api-crag-transcripts \/home\/kincli\/\.claude\/projects/,
+  )
+  const syntax = spawnSync('sh', ['-n', '-c', inner], { encoding: 'utf8' })
+  assert.equal(syntax.status, 0, syntax.stderr)
+  const calls = fx.calls()
+  const lastReload = calls.findLastIndex((call) => call.command === 'systemctl' && call.args[0] === 'daemon-reload')
+  assert.ok(lastReload >= 0 && calls.findIndex(kernelRestart) > lastReload)
+})
+
+unixTest(
+  'the transcript hook refuses symlinks and creates missing directories as kincli only when absent',
+  (context) => {
+    const fx = fixture(context)
+    successful(fx.run())
+    const home = fx.file('/home/kincli')
+    const rewritten = transcriptHook(fx).replaceAll('/home/kincli', home)
+    const hook = transcriptStubs(fx)
+    // ~/.claude as a symlink: nothing runs.
+    const target = fx.file('/elsewhere')
+    fs.mkdirSync(target, { recursive: true })
+    fs.mkdirSync(home, { recursive: true })
+    fs.symlinkSync(target, path.join(home, '.claude'))
+    assert.notEqual(hook.run(rewritten).status, 0)
+    assert.deepEqual(hook.calls(), [])
+    // ~/.claude/projects as a symlink: nothing runs either.
+    fs.unlinkSync(path.join(home, '.claude'))
+    fs.mkdirSync(path.join(home, '.claude'))
+    fs.symlinkSync(target, path.join(home, '.claude', 'projects'))
+    assert.notEqual(hook.run(rewritten).status, 0)
+    assert.deepEqual(hook.calls(), [])
+    // Existing ~/.claude (holds the credentials): left as is, only the missing projects directory is created.
+    fs.unlinkSync(path.join(home, '.claude', 'projects'))
+    const mounted = hook.run(rewritten)
+    assert.equal(mounted.status, 0, mounted.stderr)
+    assert.deepEqual(hook.calls(), [
+      `install -d -m 0700 -o kincli -g kincli ${home}/.claude/projects`,
+      `mount -t tmpfs -o mode=0700,uid=1001,gid=1002,size=512m,nosuid,nodev vm2api-crag-transcripts ${home}/.claude/projects`,
+    ])
+    // Fresh home: both directories are created before the mount.
+    fs.rmSync(path.join(home, '.claude'), { recursive: true })
+    fs.unlinkSync(fx.file('/transcript-hook-calls.log'))
+    assert.equal(hook.run(rewritten).status, 0)
+    assert.deepEqual(hook.calls(), [
+      `install -d -m 0700 -o kincli -g kincli ${home}/.claude`,
+      `install -d -m 0700 -o kincli -g kincli ${home}/.claude/projects`,
+      `mount -t tmpfs -o mode=0700,uid=1001,gid=1002,size=512m,nosuid,nodev vm2api-crag-transcripts ${home}/.claude/projects`,
+    ])
+  },
+)
+
+unixTest('repeated CRAG preparation keeps the transcript drop-in without another reload', (context) => {
+  const fx = fixture(context)
+  successful(fx.run())
+  const before = [fx.read(transcriptDropinPath), fs.statSync(fx.file(transcriptDropinPath)).mtimeMs]
+  fx.clearCalls()
+  const result = successful(fx.run())
+  assert.equal(result.transcripts, 'already-tmpfs')
+  assert.deepEqual([fx.read(transcriptDropinPath), fs.statSync(fx.file(transcriptDropinPath)).mtimeMs], before)
+  assert.equal(reloads(fx.calls()).length, 0)
+})
+
+unixTest('switching away from CRAG v2 releases the transcript drop-in', (context) => {
+  const fx = fixture(context)
+  successful(fx.run())
+  fx.write('/run/kin/kernel.json', JSON.stringify({ dataplane: 'wrap' }))
+  const result = successful(fx.run({ restart: true }))
+  assert.equal(result.transcripts, 'released')
+  assert.equal(fx.exists(transcriptDropinPath), false)
+  assert.equal(successful(fx.run()).transcripts, 'not-crag-v2')
+})
+
+unixTest('administrator configuration at the transcript drop-in path is left in control', (context) => {
+  const fx = fixture(context)
+  const custom = '# Operator-owned configuration\n[Service]\n'
+  fx.write(transcriptDropinPath, custom)
+  assert.equal(successful(fx.run({ restart: true })).transcripts, 'operator-managed')
+  assert.equal(fx.read(transcriptDropinPath), custom)
+  fx.write('/run/kin/kernel.json', JSON.stringify({ dataplane: 'wrap' }))
+  assert.equal(successful(fx.run()).transcripts, 'operator-managed')
+  assert.equal(fx.read(transcriptDropinPath), custom)
+})

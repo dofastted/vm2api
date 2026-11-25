@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **CRAG v2 槽位会话仍被 9p 写回卡死（#1741 的后续）**：#1741 把 `/run/kin/work` 挪到了来宾 tmpfs，但 CRAG 以 `/run/kin/work` 为工作目录、带 `--resume` 启动官方 CLI，每个请求还会在 `~/.claude/projects/-run-kin-work/` 写一份续跑 transcript，并在整个回合里不断追加、`stat`。`~` 是 kinhome 9p 共享，同一个写回等待照样会卡：已装 #1741 的 KVM 槽再次出现 `[claude] <defunct>`、线程停在 `folio_wait_bit_common`，CRAG 一直占着会话位。现在 `kin-crag-apparmor` 再装一个受管 drop-in `46-vm2api-crag-transcripts.conf`，每次内核启动前把 `~/.claude/projects` 挂成来宾 tmpfs（512m，属主 kincli），挂载失败照旧用 9p，不挡内核启动；`~/.claude` 已存在就不碰（凭据在里面），缺了才以 kincli 创建；拒绝符号链接；离开 CRAG v2 时撤掉，管理员自己的同名文件不动。这些 transcript 只服务写它的那个请求（CRAG ≥ 3.1.20 会回收残留，#1726），来宾重启即清空。
+
 ## 1.4.216 — 2026-11-25 · 钉选 CRAGGemini 0.4.11 与 1-hop 直连数据面；设置页全量巡检校准；CPA/sub2api 导入、主动用量对账、CRAG 冲突重建与槽位邮箱脱敏统一
 
 - **CRAGGemini `0.4.11` 签名载荷升级、429 恢复增强、分片订阅守卫与 1-hop 直连数据面**：
