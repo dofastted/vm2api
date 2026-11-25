@@ -4977,7 +4977,7 @@ export function createPanelHandler(ctx) {
         }
         const currentVm = getVm(cfg.paths.project, id)
         const credentialFailure =
-          /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked/i.test(
+          /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked|token_revoked|invalidated oauth token/i.test(
             `${currentVm?.claude?.refresh_error || ''} ${currentVm?.schedule_disabled_reason || ''}`,
           )
         if (body.schedulable && credentialFailure) {

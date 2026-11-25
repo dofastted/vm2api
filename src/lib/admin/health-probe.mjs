@@ -706,7 +706,8 @@ export function isHealthProbeTarget(vm, now = Date.now()) {
   const status = String(vm.status || '').toLowerCase()
   if (HARD_UNAVAILABLE.has(status)) return false
   const grantErr = String(vm.claude?.refresh_error || vm.refresh_error || vm.schedule_disabled_reason || '')
-  if (/invalid_grant|refresh token not found|oauth_revoked|token has been revoked/i.test(grantErr)) return false
+  if (/invalid_grant|refresh token not found|oauth_revoked|token has been revoked|token_revoked|invalidated oauth token/i.test(grantErr))
+    return false
   const coolUntil = Number(vm.cooldown_until || vm.claude?.temp_unschedulable_until) || 0
   if (
     coolUntil > Date.now() &&

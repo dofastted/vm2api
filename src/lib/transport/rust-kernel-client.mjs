@@ -326,6 +326,7 @@ export function isNeedsRefreshResult(result) {
   if (code.startsWith('license_')) return false
   if (code === 'needs_refresh' || /needs_refresh/i.test(hay)) return true
   if (status === 401) return true
-  if (/authentication_error|token has been revoked|oauth_revoked|invalid_grant/i.test(hay)) return true
+  if (/authentication_error|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant/i.test(hay))
+    return true
   return false
 }
