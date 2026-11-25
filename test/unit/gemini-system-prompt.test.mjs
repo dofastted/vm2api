@@ -110,3 +110,29 @@ test('applyCragGeminiPromptPolicy normalizes conflicting third-party CLI identit
   // Non-conflicting references stay untouched.
   assert.equal(sanitizeCragGeminiSystemText('This is a Claude Code session.'), 'This is a Claude Code session.')
 })
+
+test('applyCragGeminiPromptPolicy normalizes Claude Code dual-use security parenthetical that triggers Antigravity 429', () => {
+  const stockPara =
+    'IMPORTANT: Assist with authorized security testing, defensive security, CTF challenges, and educational contexts. ' +
+    'Refuse requests for destructive techniques, DoS attacks, mass targeting, supply chain compromise, or detection evasion for malicious purposes. ' +
+    'Dual-use security tools (C2 frameworks, credential testing, exploit development) require clear authorization context: ' +
+    'pentesting engagements, CTF competitions, security research, or defensive use cases.'
+  const req = {
+    model: 'gemini-4-neon-xhigh',
+    contents: [{ role: 'user', parts: [{ text: 'hello' }] }],
+    systemInstruction: {
+      parts: [{ text: `You are Claude Code, Anthropic's official CLI for Claude.\n\n${stockPara}` }],
+    },
+  }
+  const normalized = applyCragGeminiPromptPolicy(req, { preset: 'official_full', globalPrompt: '' })
+  const outText = normalized.systemInstruction.parts[0].text
+  assert.doesNotMatch(outText, /you are claude code/i)
+  assert.doesNotMatch(outText, /C2 frameworks/i)
+  assert.match(outText, /Refuse requests for destructive techniques/)
+  assert.match(
+    outText,
+    /Dual-use security tools require clear authorization context: pentesting engagements, CTF competitions, security research, or defensive use cases\./,
+  )
+  // Original request object must remain untouched.
+  assert.match(req.systemInstruction.parts[0].text, /C2 frameworks/)
+})
