@@ -28,7 +28,9 @@ import { ThinkingOwnerStore } from '../../src/lib/pool/thinking-owner.mjs'
 import { snapshotDatabaseMetricsAsync } from '../../src/lib/db/database-metrics.mjs'
 import { runDashboardAggregation } from '../../src/lib/db/pg/dashboard-aggregator.mjs'
 import { readAll, usagePoolEnabled, usageRead } from '../../src/lib/db/sqlite-pool.mjs'
-import { getCacheRuntime } from '../../src/lib/cache/index.mjs'
+import { enqueueWrite, flushWrites } from '../../src/lib/db/write-behind.mjs'
+import { buildPgToolInvocation } from '../../src/lib/admin/backup-core.mjs'
+import { MultiTierCacheClient, getCacheRuntime } from '../../src/lib/cache/index.mjs'
 
 const PG_URL = process.env.VM2API_TEST_PG_URL || ''
 
@@ -180,13 +182,86 @@ test('PostgreSQL end-to-end engine, repos, read pool, metrics, aggregation, and 
       const asyncRows = await readAll('SELECT COUNT(*) AS c FROM usage_logs')
       assert.equal(Number(asyncRows[0].c), 1)
 
-      // 7. Dashboard aggregation rollup
+      // 7. Write-behind savepoint isolation: a failing callback must NOT poison the batch (25P02)
+      enqueueWrite(() => {
+        // Trigger a PG SQL error (duplicate PK on settings with invalid syntax / constraint violation)
+        db.prepare('INSERT INTO users (id, email, username, password_hash) VALUES (?, ?, ?, ?)').run(
+          'u_pg_1',
+          'dup@example.com',
+          'AlicePG',
+          'h',
+        )
+      })
+      enqueueWrite(() => {
+        settings.set('write_behind_survived', { ok: true })
+      })
+      flushWrites()
+      assert.deepEqual(settings.get('write_behind_survived'), { ok: true })
+
+      // 8. Case-insensitive LIKE search parity across UsageLogsRepo and UsageLogsView
+      logs.insertSummary({
+        id: 'log_pg_case',
+        request_id: 'REQ_UPPER_CASE_99',
+        ts: now,
+        path: '/v1/Messages',
+        model: 'claude-sonnet-4-5',
+        status: 500,
+        error_code: 'UPSTREAM_ERROR',
+        error_message: 'Anthropic Overload Notice',
+        user_id: 'u_pg_1',
+        api_key_id: created.id,
+      })
+      logs.insertSummary({
+        id: 'log_pg_cancel',
+        request_id: 'req_pg_cancel_1',
+        ts: now,
+        model: 'claude-sonnet-4-5',
+        status: 200,
+        error_code: 'client_aborted',
+        user_id: 'u_pg_1',
+        api_key_id: created.id,
+      })
+      assert.equal(logs.query({ q: 'anthropic overload' }).items.length, 1)
+      assert.equal(logs.query({ q: 'req_upper_case' }).items.length, 1)
+      const viewSearch = new UsageLogsView(db).listBatch({ q: 'ANTHROPIC OVERLOAD' })
+      assert.equal(viewSearch.logs.length, 1)
+      assert.equal(viewSearch.logs[0].requestId, 'REQ_UPPER_CASE_99')
+
+      // 9. Dashboard aggregation rollup (ignores client_aborted in error_requests & prunes stale outbox >24h)
+      await pool.query(
+        "INSERT INTO scheduler_outbox (event_type, created_at) VALUES ('stale_ev', NOW() - INTERVAL '48 hours')",
+      )
+      await pool.query(
+        "INSERT INTO auth_cache_invalidation_outbox (key_hash, reason, created_at) VALUES ('old_hash', 'rotated', NOW() - INTERVAL '48 hours')",
+      )
       const agg = await runDashboardAggregation(pool, { fullBackfill: true })
       assert.equal(agg.skipped, false)
       assert.ok(agg.hourlyBuckets >= 1)
       assert.ok(agg.dailyBuckets >= 1)
+      assert.ok(agg.outboxPruned >= 2)
+      const hourlyErrors = Number(
+        (await pool.query('SELECT COALESCE(SUM(error_requests), 0)::bigint AS e FROM usage_dashboard_hourly')).rows[0]
+          ?.e || 0,
+      )
+      assert.equal(hourlyErrors, 1, 'client_aborted must not be counted as an error in dashboard rollup')
 
-      // 8. Database metrics async snapshot
+      // 10. CacheClient falls back to PG LISTEN/NOTIFY when configured Redis is unreachable
+      const fallbackCache = new MultiTierCacheClient({
+        redisConfig: {
+          url: 'redis://127.0.0.1:1',
+          connectTimeout: 300,
+          commandTimeout: 300,
+          maxRetriesPerRequest: 0,
+        },
+      })
+      try {
+        await fallbackCache.connect({ pgPool: pool })
+        assert.equal(fallbackCache.stats().mode, 'l1+pg_notify')
+      } finally {
+        await fallbackCache.close()
+      }
+
+      // 11. Database metrics async snapshot includes vm2api_table_sizes() and aggregation watermark
       const metrics = await snapshotDatabaseMetricsAsync({
         db,
         pgPool: pool,
@@ -197,7 +272,15 @@ test('PostgreSQL end-to-end engine, repos, read pool, metrics, aggregation, and 
       assert.ok(metrics.database.file_size_bytes > 0)
       assert.ok(metrics.database.migration_count >= 4)
       assert.ok(metrics.database.pg_version)
+      assert.ok(Array.isArray(metrics.database.pg_top_tables) && metrics.database.pg_top_tables.length >= 1)
+      assert.ok(metrics.database.pg_dashboard_watermark?.last_aggregated_at)
       assert.ok(metrics.cache)
+
+      // 12. PG tool invocation helper strips password from URI and passes via PGPASSWORD env
+      const inv = buildPgToolInvocation('postgresql://vm2api:s%40cret%2Fpw@127.0.0.1:5432/vm2api?sslmode=disable')
+      assert.equal(inv.env.PGPASSWORD, 's@cret/pw')
+      assert.doesNotMatch(inv.uri, /s%40cret/)
+      assert.doesNotMatch(inv.uri, /s@cret/)
     } finally {
       try {
         fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 3 })

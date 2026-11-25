@@ -1,3 +1,5 @@
+import { withSavepoint } from './database.mjs'
+
 /**
  * Batched write-behind flusher for hot-path request logging & accounting.
  *
@@ -56,9 +58,10 @@ function drainBatch() {
     return false
   }
   try {
-    for (const fn of batch) {
+    for (let i = 0; i < batch.length; i += 1) {
+      const fn = batch[i]
       try {
-        fn()
+        withSavepoint(db, `wb_${i}`, fn)
       } catch (err) {
         console.warn('[write-behind]', err?.message || err)
       }

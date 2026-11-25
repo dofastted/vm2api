@@ -198,9 +198,11 @@ export async function snapshotDatabaseMetricsAsync({
   let migrationCount = null
   let latestMigration = null
   let latestMigrationAt = null
+  let topTables = null
+  let dashboardWatermark = null
 
   if (health.ok) {
-    const [metaRes, statRes, actRes, migCountRes, migLatestRes] = await Promise.all([
+    const [metaRes, statRes, actRes, migCountRes, migLatestRes, sizesRes, wmRes] = await Promise.all([
       pgPool
         .query(
           `SELECT
@@ -230,6 +232,14 @@ export async function snapshotDatabaseMetricsAsync({
       pgPool.query('SELECT COUNT(*)::int AS count FROM schema_migrations').catch(() => null),
       pgPool
         .query('SELECT version, applied_at FROM schema_migrations ORDER BY applied_at DESC, version DESC LIMIT 1')
+        .catch(() => null),
+      pgPool
+        .query('SELECT table_name, total_bytes, table_bytes, index_bytes, est_rows FROM vm2api_table_sizes() LIMIT 12')
+        .catch(() => null),
+      pgPool
+        .query(
+          'SELECT last_aggregated_at, last_aggregated_id, updated_at FROM usage_dashboard_aggregation_watermark WHERE id = 1',
+        )
         .catch(() => null),
     ])
 
@@ -261,6 +271,25 @@ export async function snapshotDatabaseMetricsAsync({
     if (latest) {
       latestMigration = latest.version == null ? null : String(latest.version)
       latestMigrationAt = latest.applied_at == null ? null : String(latest.applied_at)
+    }
+
+    if (Array.isArray(sizesRes?.rows)) {
+      topTables = sizesRes.rows.map((r) => ({
+        table_name: String(r.table_name),
+        total_bytes: numberOrNull(r.total_bytes),
+        table_bytes: numberOrNull(r.table_bytes),
+        index_bytes: numberOrNull(r.index_bytes),
+        est_rows: numberOrNull(r.est_rows),
+      }))
+    }
+
+    const wm = wmRes?.rows?.[0]
+    if (wm) {
+      dashboardWatermark = {
+        last_aggregated_at: wm.last_aggregated_at ? String(wm.last_aggregated_at) : null,
+        last_aggregated_id: wm.last_aggregated_id ? String(wm.last_aggregated_id) : null,
+        updated_at: wm.updated_at ? new Date(wm.updated_at).toISOString() : null,
+      }
     }
   }
 
@@ -302,6 +331,8 @@ export async function snapshotDatabaseMetricsAsync({
       pg_connections_idle: idleConnections,
       pg_max_connections: maxConnections,
       pg_deadlocks: deadlocks,
+      pg_top_tables: topTables,
+      pg_dashboard_watermark: dashboardWatermark,
       pg_pool: {
         async: asyncPoolStats,
         sync: syncPoolStats,

@@ -9,7 +9,15 @@ import os from 'node:os'
 import path from 'node:path'
 import pg from 'pg'
 import { createDatabase } from '../../src/lib/db/database.mjs'
-import { MIGRATION_TABLES, migrateSqliteToPostgres } from '../../scripts/migrate-sqlite-to-pg.mjs'
+import { UsageLogsRepo } from '../../src/lib/db/repos/usage-logs-repo.mjs'
+import { createPgSyncDb } from '../../src/lib/db/pg/pg-sync-db.mjs'
+import { resolvePgConfig } from '../../src/lib/db/pg/config.mjs'
+import {
+  DB_CREATED_AT_SETTING_KEY,
+  MIGRATION_TABLES,
+  migrateSqliteToPostgres,
+  preflightSqliteToPostgres,
+} from '../../scripts/migrate-sqlite-to-pg.mjs'
 import { seedMockSqlite } from '../../scripts/seed-mock-sqlite.mjs'
 
 const PG_URL = process.env.VM2API_TEST_PG_URL || ''
@@ -34,7 +42,50 @@ test('MIGRATION_TABLES and seedMockSqlite cover every active SQLite table includ
   }
 })
 
-test('migrateSqliteToPostgres transfers tables, sanitizes NUL bytes, resets sequences, verifies parity, and is idempotent', {
+test('preflightSqliteToPostgres validates clean DB and blocks unmapped tables, CI username dupes, and NULL timestamps', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-preflight-'))
+  try {
+    const cleanPath = path.join(tmpDir, 'clean.db')
+    const cleanDb = createDatabase({ dbPath: cleanPath })
+    cleanDb.close()
+
+    const okReport = await preflightSqliteToPostgres({ sqlitePath: cleanPath })
+    assert.equal(okReport.ok, true)
+    assert.deepEqual(okReport.blockingIssues, [])
+    assert.deepEqual(okReport.unmappedTables, [])
+    assert.ok(okReport.migrations.count >= 60)
+
+    const badPath = path.join(tmpDir, 'bad.db')
+    const badDb = createDatabase({ dbPath: badPath })
+    badDb.exec('CREATE TABLE unexpected_new_table (id TEXT PRIMARY KEY)')
+    badDb.exec('DROP INDEX IF EXISTS idx_users_username_active')
+    badDb
+      .prepare(
+        'INSERT INTO users (id, email, username, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run('u_a', 'a@test.com', 'Alice', 'h1', 'user', 'active', '2026-01-01T00:00:00.000Z')
+    badDb
+      .prepare(
+        'INSERT INTO users (id, email, username, password_hash, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run('u_b', 'b@test.com', 'alice', 'h2', 'user', 'active', '2026-01-01T00:00:00.000Z')
+    badDb
+      .prepare('INSERT INTO usage_logs (id, request_id, created_at, status) VALUES (?, ?, ?, ?)')
+      .run('log_null_ts', 'req_null_ts', '', 200)
+    badDb.close()
+
+    const badReport = await preflightSqliteToPostgres({ sqlitePath: badPath })
+    assert.equal(badReport.ok, false)
+    assert.deepEqual(badReport.unmappedTables, ['unexpected_new_table'])
+    assert.ok(badReport.blockingIssues.some((s) => s.includes('unexpected_new_table')))
+    assert.ok(badReport.blockingIssues.some((s) => s.includes('duplicate active username')))
+    assert.ok(badReport.blockingIssues.some((s) => s.includes('NULL/empty created_at')))
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
+
+test('migrateSqliteToPostgres transfers tables, sanitizes NUL bytes, reconciles seeded groups, preserves origin created_at, resets sequences, verifies parity, and is idempotent', {
   skip: !PG_URL,
 }, async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-mig-test-'))
@@ -52,6 +103,12 @@ test('migrateSqliteToPostgres transfers tables, sanitizes NUL bytes, resets sequ
   try {
     const db = createDatabase({ dbPath: sqlitePath })
     const now = new Date().toISOString()
+
+    // Stamp an older historical migration 001 date and customize default groups to test seed reconciliation
+    const historicalOrigin = '2025-09-07T06:46:08.235Z'
+    db.prepare("UPDATE schema_migrations SET applied_at = ? WHERE version = '001'").run(historicalOrigin)
+    db.prepare('DELETE FROM groups WHERE id = 2').run()
+    db.prepare('UPDATE groups SET name = ? WHERE id = 1').run('custom_coding')
 
     // Seed diverse tables including real NUL bytes (via BLOB so node:sqlite preserves embedded \x00), self-FK cluster_nodes, crag_shop_orders slot_limit, and usage_logs
     db.prepare('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run(
@@ -95,6 +152,12 @@ test('migrateSqliteToPostgres transfers tables, sanitizes NUL bytes, resets sequ
     )
     db.close()
 
+    // Preflight with live PG target must pass
+    const pf = await preflightSqliteToPostgres({ sqlitePath, pgUrl: schemaUrl })
+    assert.equal(pf.ok, true)
+    assert.equal(pf.pgProbe?.ok, true)
+    assert.equal(pf.pgProbe?.canCreate, true)
+
     // First migration run with verify + rollup
     const r1 = await migrateSqliteToPostgres({
       sqlitePath,
@@ -103,10 +166,25 @@ test('migrateSqliteToPostgres transfers tables, sanitizes NUL bytes, resets sequ
       rollup: true,
     })
     assert.equal(r1.ok, true)
+    assert.equal(r1.originCreatedAt, historicalOrigin)
     assert.equal(r1.verification.ok, true)
     assert.equal(r1.verification.mismatches, 0)
+    assert.equal(r1.verification.sequences.groups.ok, true)
     assert.ok(r1.totalNulSanitized >= 3)
     assert.ok(r1.rollup.hourlyBuckets >= 1)
+
+    // Verify historical coverage start is preserved on PG via settings.usage_logs_db_created_at
+    const syncDb = await createPgSyncDb(resolvePgConfig({ connectionString: schemaUrl }))
+    try {
+      const originRow = syncDb.prepare('SELECT value FROM settings WHERE key = ?').get(DB_CREATED_AT_SETTING_KEY)
+      assert.equal(JSON.parse(originRow.value), historicalOrigin)
+      const pgLogsRepo = new UsageLogsRepo(syncDb)
+      assert.equal(pgLogsRepo.logCoverageStart(), historicalOrigin)
+      const groups = syncDb.prepare('SELECT id, name FROM groups ORDER BY id').all()
+      assert.deepEqual(groups, [{ id: 1, name: 'custom_coding' }])
+    } finally {
+      syncDb.close()
+    }
 
     // Second run must be 100% idempotent (0 new inserts, still verified)
     const r2 = await migrateSqliteToPostgres({

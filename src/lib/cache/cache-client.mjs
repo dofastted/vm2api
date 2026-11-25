@@ -123,7 +123,10 @@ export class MultiTierCacheClient {
 
     if (this.redisConfig) {
       await this._connectRedis()
-    } else if (this.pgPool) {
+      if (!this.hasRedis && this.pgPool && !this.pgNotifyClient) {
+        await this._connectPgNotify()
+      }
+    } else if (this.pgPool && !this.pgNotifyClient) {
       await this._connectPgNotify()
     }
   }

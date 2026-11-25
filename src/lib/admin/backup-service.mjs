@@ -79,7 +79,7 @@ export function killChildArchivers({ pid = process.pid, proc = '/proc' } = {}) {
       const close = stat.lastIndexOf(')')
       const comm = stat.slice(stat.indexOf('(') + 1, close)
       const ppid = Number(stat.slice(close + 2).split(' ')[1])
-      if (ppid !== pid || comm !== 'tar') continue
+      if (ppid !== pid || !['tar', 'pg_dump', 'pg_restore'].includes(comm)) continue
       process.kill(Number(e), 'SIGTERM')
       n++
     } catch {}
@@ -572,7 +572,7 @@ export class BackupService {
     }
     if (!fs.existsSync(this.backupDir)) return
     for (const f of fs.readdirSync(this.backupDir)) {
-      if (!/^kin-backup-.*\.(tar\.gz|db\.gz)$/.test(f) || existing.has(f)) continue
+      if (!/^kin-backup-.*\.(tar\.gz|db\.gz|pgdump|pg\.ndjson\.gz)$/.test(f) || existing.has(f)) continue
       const fp = path.join(this.backupDir, f)
       try {
         const st = fs.statSync(fp)
