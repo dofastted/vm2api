@@ -9,9 +9,30 @@ import os from 'node:os'
 import path from 'node:path'
 import pg from 'pg'
 import { createDatabase } from '../../src/lib/db/database.mjs'
-import { migrateSqliteToPostgres } from '../../scripts/migrate-sqlite-to-pg.mjs'
+import { MIGRATION_TABLES, migrateSqliteToPostgres } from '../../scripts/migrate-sqlite-to-pg.mjs'
+import { seedMockSqlite } from '../../scripts/seed-mock-sqlite.mjs'
 
 const PG_URL = process.env.VM2API_TEST_PG_URL || ''
+
+test('MIGRATION_TABLES and seedMockSqlite cover every active SQLite table including gemini_environment_owners', () => {
+  assert.ok(MIGRATION_TABLES.includes('gemini_environment_owners'))
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-seed-check-'))
+  try {
+    const outPath = path.join(tmpDir, 'mock.db')
+    const seeded = seedMockSqlite({ outPath, usageCount: 20 })
+    const empty = Object.entries(seeded.tableCounts)
+      .filter(([, count]) => count === 0)
+      .map(([name]) => name)
+    assert.deepEqual(empty, [])
+    assert.ok(seeded.tableCounts.gemini_environment_owners >= 1)
+    for (const table of Object.keys(seeded.tableCounts)) {
+      if (table === 'schema_migrations') continue
+      assert.ok(MIGRATION_TABLES.includes(table), `MIGRATION_TABLES missing active table: ${table}`)
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true })
+  }
+})
 
 test('migrateSqliteToPostgres transfers tables, sanitizes NUL bytes, resets sequences, verifies parity, and is idempotent', {
   skip: !PG_URL,
@@ -66,6 +87,11 @@ test('migrateSqliteToPostgres transfers tables, sanitizes NUL bytes, resets sequ
       'req_1',
       now,
       Buffer.from('{"body":"clean\x00payload"}'),
+    )
+    db.prepare('INSERT INTO gemini_environment_owners (env_id, owner_user_id, created_at) VALUES (?, ?, ?)').run(
+      'gemini-u1',
+      'u1',
+      now,
     )
     db.close()
 

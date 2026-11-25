@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Full 33-table extreme-edge-case Mock SQLite database generator for vm2api.
+ * Full 34-table extreme-edge-case Mock SQLite database generator for vm2api.
  *
- * Ensures EVERY active table in vm2api (31 schema tables + thinking_signature_owners +
+ * Ensures EVERY active table in vm2api (32 schema tables + thinking_signature_owners +
  * schema_migrations) is populated with deterministic, production-representative, and
  * edge-case records covering:
  *   - Tables often empty in prod (vm_pools, vm_pool_members, redeem_codes,
@@ -977,11 +977,16 @@ export function seedMockSqlite({ outPath, usageCount = 400, hashSecret = 'mock-v
       )
     }
 
-    // 30. thinking_signature_owners (BIGINT created_at)
+    // 30. thinking_signature_owners (BIGINT created_at) & gemini_environment_owners
     const insThink = db.prepare('INSERT INTO thinking_signature_owners (key, account_id, created_at) VALUES (?, ?, ?)')
     for (let i = 1; i <= 25; i += 1) {
       insThink.run(sha256(`thinking_sig_${i}`).slice(0, 32), `acct_${(i % 5) + 1}`, nowMs - i * 1000)
     }
+    const insGemOwner = db.prepare(
+      'INSERT INTO gemini_environment_owners (env_id, owner_user_id, created_at) VALUES (?, ?, ?)',
+    )
+    insGemOwner.run('gemini-alice-1', 'u_alice', nowIso)
+    insGemOwner.run('gemini-alice-2', 'u_alice', nowIso)
 
     // 31. usage_logs, 32. request_attempts, 33. request_log_debug
     const insUsage = db.prepare(`

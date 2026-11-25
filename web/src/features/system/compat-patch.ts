@@ -1,9 +1,32 @@
 import {
   personaInjectFromPreset,
   personaPresetFromCompat,
+  protocolPersonaSaveToast,
 } from '@/lib/persona-template'
+import { cragPersonaFromCompat } from './crag-print-panel'
+import { cragGeminiPersonaFromCompat } from './craggemini-panel'
 
 type Compat = Record<string, unknown>
+export type SystemPromptKernelSet = 'cli-node' | 'crag' | 'craggemini'
+
+export function systemPromptSaveToast(
+  kernelSet: SystemPromptKernelSet,
+  compat: Compat | undefined,
+  inherited: number,
+  kernel?: { updated?: number } | null
+): string {
+  if (kernelSet === 'craggemini') {
+    const label =
+      cragGeminiPersonaFromCompat(compat) === 'zero' ? '0提示词' : '官方提示词'
+    return `已保存 · CRAGGemini · ${label}`
+  }
+  if (kernelSet === 'crag') {
+    const label =
+      cragPersonaFromCompat(compat) === 'zero' ? '0注入' : '官方完整'
+    return `已保存 · CRAG v2 print · ${label}`
+  }
+  return protocolPersonaSaveToast(compat, inherited, kernel)
+}
 
 /**
  * 系统提示词页保存体：只发 `compatibility` 里改过的键。PUT /routing 按段合并、

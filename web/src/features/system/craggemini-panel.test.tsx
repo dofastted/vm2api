@@ -3,8 +3,10 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import {
   CragGeminiPanel,
+  CRAGGEMINI_SYSTEM_PROMPT_MAX,
   cragGeminiGlobalPromptFromCompat,
   cragGeminiPersonaFromCompat,
+  cragGeminiPromptProblem,
 } from './craggemini-panel'
 
 function elements(
@@ -56,5 +58,18 @@ describe('CragGeminiPanel', () => {
       craggemini_persona_preset: 'official_full',
       craggemini_system_prompt: '',
     })
+  })
+
+  it('flags oversized craggemini_system_prompt so SaveBar blocks before PUT /routing', () => {
+    expect(
+      cragGeminiPromptProblem({
+        craggemini_system_prompt: 'x'.repeat(CRAGGEMINI_SYSTEM_PROMPT_MAX),
+      })
+    ).toBeNull()
+    expect(
+      cragGeminiPromptProblem({
+        craggemini_system_prompt: 'x'.repeat(CRAGGEMINI_SYSTEM_PROMPT_MAX + 1),
+      })
+    ).toBe(`craggemini_system_prompt 超过 ${CRAGGEMINI_SYSTEM_PROMPT_MAX} 字符`)
   })
 })

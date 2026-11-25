@@ -14,6 +14,7 @@ import {
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { fmtDuration } from '@/lib/format'
+import { GEMINI_MAINTENANCE_SECTION_ID } from '@/lib/gemini-recovery'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -239,7 +240,11 @@ function DaemonLivePanel({
             className='h-7 gap-1 px-2 text-xs'
             asChild
           >
-            <Link to='/settings/$tab' params={{ tab: 'gemini' }}>
+            <Link
+              to='/settings/$tab'
+              params={{ tab: 'gemini' }}
+              hash={GEMINI_MAINTENANCE_SECTION_ID}
+            >
               <Wrench className='size-3' />
               Gemini 维护
             </Link>
@@ -529,7 +534,7 @@ export function GeminiConfigPane({
         desc={
           routeOn
             ? '控制 Gemini 总开关及各协议入口是否允许调度至 CRAGGemini。'
-            : '已关闭：所有 Gemini 公共入口返回 503，不消耗账号配额。'
+            : '已关闭：所有 Gemini 公共入口返回 403（gemini_disabled），不消耗账号配额。'
         }
         aside={
           <Switch
@@ -630,12 +635,12 @@ export function GeminiConfigPane({
             <SliderSetting
               id='gemini-sticky-ttl'
               label='粘性保留时长'
-              desc='超时未活跃后释放会话与账号的绑定；0 表示仅当前进程周期。'
+              desc='超时未活跃后释放会话与账号的绑定；设为 0 时不保留跨请求粘性绑定。'
               value={stickyTtlSecs}
               min={0}
               max={86400}
               step={60}
-              format={(s) => (s === 0 ? '关闭超时' : fmtDuration(s * 1000))}
+              format={(s) => (s === 0 ? '不保留' : fmtDuration(s * 1000))}
               fallback={GEMINI_DEFAULTS.sticky.ttl_seconds}
               presets={[300, 1800, 3600, 14400, 86400]}
               onChange={(ttl_seconds) => updateSticky({ ttl_seconds })}

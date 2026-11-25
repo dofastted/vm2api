@@ -289,6 +289,7 @@ test('reader reports the peer gone once: file removed, heartbeat lost, or never 
 })
 
 import { ClusterManager } from '../../src/lib/cluster/cluster-manager.mjs'
+import { startDashboardAggregator, stopDashboardAggregator } from '../../src/lib/db/pg/dashboard-aggregator.mjs'
 
 test('standby pre-dials node links and activation adopts them instead of dialling again', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-prewarm-'))
@@ -338,4 +339,23 @@ test('every leader background setInterval in server.mjs stops on handover instea
     'background intervals must register with onLeaderStop so SIGUSR1 handover stops them while draining',
   )
   assert.ok(block.includes('const timer = setInterval(warmGemini, 30_000)'))
+  assert.ok(
+    src.includes('openDatabaseAsync({ dataDir, pooled: true, enableAggregator: false })'),
+    'standby must not start the PostgreSQL dashboard aggregator before activation',
+  )
+  assert.ok(block.includes('startDashboardAggregator(getPgPool())'))
+  assert.ok(block.includes('onLeaderStop(() => stopDashboardAggregator())'))
+})
+
+test('stopDashboardAggregator cancels the initial kickoff timer before it touches the pool', async () => {
+  let connects = 0
+  const fakePool = {
+    async connect() {
+      connects += 1
+      throw new Error('should not connect after stopDashboardAggregator')
+    },
+  }
+  startDashboardAggregator(fakePool, { intervalMs: 10_000 })
+  stopDashboardAggregator()
+  assert.equal(connects, 0)
 })

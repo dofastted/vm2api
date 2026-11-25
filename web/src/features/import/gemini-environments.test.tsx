@@ -119,7 +119,7 @@ test('Gemini shows the socket failure without claiming the service is disabled',
     'admin'
   )
   expect(asAdmin).toContain('控制面无权访问 Gemini 控制 socket')
-  expect(asAdmin).toContain('设置 → Gemini：诊断与维护')
+  expect(asAdmin).toContain('设置 → Gemini 维护：诊断与维护')
   expect(asAdmin).not.toContain('创建 Gemini 环境')
 
   const asUser = showGemini(
@@ -130,7 +130,7 @@ test('Gemini shows the socket failure without claiming the service is disabled',
     'user'
   )
   expect(asUser).toContain('控制面无权访问 Gemini 控制 socket')
-  expect(asUser).toContain('请联系管理员在「设置 → Gemini」诊断与维护。')
+  expect(asUser).toContain('请联系管理员在「设置 → Gemini 维护」诊断与维护。')
   expect(asUser).not.toContain('创建 Gemini 环境')
 })
 
@@ -312,7 +312,7 @@ test('GeminiOperationError renders remediation guidance and maintenance link for
     </QueryClientProvider>
   )
   expect(authLaunchHtml).toContain('未能拉起授权进程')
-  expect(authLaunchHtml).toContain('设置 → Gemini：诊断与维护')
+  expect(authLaunchHtml).toContain('设置 → Gemini 维护：诊断与维护')
 
   const apiKeyHtml = renderToStaticMarkup(
     <QueryClientProvider client={client}>
@@ -328,5 +328,5 @@ test('GeminiOperationError renders remediation guidance and maintenance link for
     </QueryClientProvider>
   )
   expect(apiKeyHtml).toContain('Google AI Studio 核对 API Key 有效性')
-  expect(apiKeyHtml).not.toContain('设置 → Gemini：诊断与维护')
+  expect(apiKeyHtml).not.toContain('设置 → Gemini 维护：诊断与维护')
 })
