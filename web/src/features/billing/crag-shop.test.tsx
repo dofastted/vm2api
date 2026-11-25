@@ -895,6 +895,120 @@ describe('CRAG buyer presentation and activation wire', () => {
     }
   )
 
+  it('auto-detects CRAGGemini CRAGR1 vouchers when Claude redemption returns redeem_unavailable', async () => {
+    const code = `CRAGR1.${'g'.repeat(43)}`
+    vi.mocked(api)
+      .mockRejectedValueOnce(
+        new ApiError('not a claude code', 404, 'redeem_unavailable')
+      )
+      .mockResolvedValueOnce({
+        active: true,
+        slot_limit: 10,
+        used_slots: 0,
+        available_slots: 10,
+      })
+
+    render()
+    fillHostCode(code)
+    submitHostCode()
+    await settle()
+
+    expect(api).toHaveBeenNthCalledWith(
+      1,
+      '/api/panel/crag-subscription/redeem',
+      {
+        method: 'POST',
+        body: JSON.stringify({ redemption_code: code }),
+      }
+    )
+    expect(api).toHaveBeenNthCalledWith(
+      2,
+      '/api/panel/gemini/crag-subscription/redeem',
+      {
+        method: 'POST',
+        body: JSON.stringify({ redemption_code: code }),
+      }
+    )
+    const html = render()
+    expect(html).toContain('已自动识别为 CRAGGemini 兑换码')
+    expect(html).toContain('席位额度 10，可用席位 10')
+    expect(html).not.toContain(code)
+    expect(state.hostInput?.value).toBe('')
+    expect(state.setQueryData).not.toHaveBeenCalled()
+    expect(state.invalidateQueries).toHaveBeenCalledExactlyOnceWith({
+      queryKey: ['panel', 'gemini-environments'],
+    })
+  })
+
+  it('auto-detects CRAGGemini CRAGR1 vouchers even when Claude package is unready', async () => {
+    const code = `CRAGR1.${'h'.repeat(43)}`
+    vi.mocked(api)
+      .mockRejectedValueOnce(
+        new ApiError(
+          'no claude pkg',
+          409,
+          'crag_subscription_host_package_unready'
+        )
+      )
+      .mockResolvedValueOnce({
+        active: true,
+        slot_limit: 10,
+        used_slots: 0,
+        available_slots: 10,
+      })
+
+    render()
+    fillHostCode(code)
+    submitHostCode()
+    await settle()
+
+    expect(api).toHaveBeenCalledTimes(2)
+    expect(render()).toContain('已自动识别为 CRAGGemini 兑换码')
+    expect(state.hostInput?.value).toBe('')
+    expect(state.invalidateQueries).toHaveBeenCalledExactlyOnceWith({
+      queryKey: ['panel', 'gemini-environments'],
+    })
+  })
+
+  it('surfaces CRAGGemini-specific error when fallback identifies a conflicting Gemini voucher', async () => {
+    const code = `CRAGR1.${'k'.repeat(43)}`
+    vi.mocked(api)
+      .mockRejectedValueOnce(
+        new ApiError('not claude', 404, 'redeem_unavailable')
+      )
+      .mockRejectedValueOnce(
+        new ApiError(
+          '该 CRAGR1 兑换码已绑定到其他宿主机。',
+          409,
+          'host_redeem_conflict'
+        )
+      )
+
+    render()
+    fillHostCode(code)
+    submitHostCode()
+    await settle()
+
+    const html = render()
+    expect(html).toContain('该 CRAGR1 兑换码已绑定到其他宿主机。')
+    expect(state.hostInput?.value).toBe(code)
+  })
+
+  it('does not try CRAGGemini fallback when Claude already recognizes the voucher as conflicting', async () => {
+    const code = `CRAGR1.${'m'.repeat(43)}`
+    vi.mocked(api).mockRejectedValueOnce(
+      new ApiError('claude conflict', 409, 'host_redeem_conflict')
+    )
+
+    render()
+    fillHostCode(code)
+    submitHostCode()
+    await settle()
+
+    expect(api).toHaveBeenCalledTimes(1)
+    expect(render()).toContain('此码与当前宿主机或订阅不匹配')
+  })
+
   it('lets only admins recover a pending host sync without resubmitting a code', async () => {
     const pending = { state: 'sync_pending', ready: false } as const
     state.hostStatus = pending
