@@ -12,6 +12,7 @@ import { materializeAutomaticCache } from './cache-ttl.mjs'
 import { isOnlyOfficialCliIdentitySystem, sanitizeSafeguardsForCrag } from './crag-whitelist.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
 import { needsCragProviderCompatibility } from './kernel-request.mjs'
+import { isEmptyEffortValue } from './log-fields.mjs'
 /**
  * Print is the CRAG v2 worker only. A live health report wins, then an
  * explicit dataplane on the VM, then the kernel.json that worker was started
@@ -315,6 +316,16 @@ function hasOutputConfig(message) {
   return message?.output_config != null && typeof message.output_config === 'object'
 }
 
+function mergeFoldedOutputConfig(base, next) {
+  if (!next || typeof next !== 'object') return base
+  const merged = { ...(base || {}), ...next }
+  if (Object.prototype.hasOwnProperty.call(next, 'effort') && isEmptyEffortValue(next.effort)) {
+    if (base && Object.prototype.hasOwnProperty.call(base, 'effort')) merged.effort = base.effort
+    else delete merged.effort
+  }
+  return Object.keys(merged).length ? merged : base
+}
+
 /** Media has no reminder form, and `clear_at` acts where it stands. */
 function foldable(message) {
   if (message?.clear_at != null) return false
@@ -367,7 +378,7 @@ function foldSystemTurns(messages) {
             ...previous,
             content: [...contentBlocks(previous.content), ...blocks],
           }
-        if (hasOutputConfig(message)) outputConfig = { ...outputConfig, ...message.output_config }
+        if (hasOutputConfig(message)) outputConfig = mergeFoldedOutputConfig(outputConfig, message.output_config)
       } else {
         pending = pending.concat(blocks)
         pendingSource.push(message)
@@ -382,7 +393,7 @@ function foldSystemTurns(messages) {
           content: prependAfterToolResults(content, pending),
         })
         for (const source of pendingSource)
-          if (hasOutputConfig(source)) outputConfig = { ...outputConfig, ...source.output_config }
+          if (hasOutputConfig(source)) outputConfig = mergeFoldedOutputConfig(outputConfig, source.output_config)
         pending = []
         pendingSource = []
       } else {

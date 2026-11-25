@@ -7,6 +7,7 @@ import {
   canonicalizeClaudeMessagesShape,
   copyOfficialAnthropicFields,
   normalizeAnthropicMessages,
+  stripEmptyEffort,
   stripIllegalBodyContentFields,
 } from './sanitize.mjs'
 import { sanitizeAnthropicTools } from './web-search.mjs'
@@ -16,8 +17,9 @@ export function officialMessagesBody(
   body = {},
   { stream = undefined, preserveContentShape = false, preserveConsecutiveUser = false } = {},
 ) {
-  const out = copyOfficialAnthropicFields(body)
+  let out = copyOfficialAnthropicFields(body)
   applyStructuredOutput(out, body)
+  out = stripEmptyEffort(out)
   normalizeAnthropicMessages(out, { preserveConsecutiveUser })
   stripIllegalBodyContentFields(out)
   if (Array.isArray(out.tools)) out.tools = sanitizeAnthropicTools(out.tools)
