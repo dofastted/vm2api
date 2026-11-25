@@ -14,7 +14,7 @@ import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 // a refresh token still exists — the worker must be allowed to rotate and retry.
 export const AUTH_COOLDOWN_REASON = /authentication_failed_after_refresh|permission_denied/i
 const FATAL_CREDENTIAL_COOLDOWN =
-  /oauth_invalid_grant|invalid_grant|refresh_token_missing|organization_disabled|oauth_revoked|token has been revoked/i
+  /oauth_invalid_grant|invalid_grant|refresh_token_missing|organization_disabled|oauth_revoked|token has been revoked|token_revoked|invalidated oauth token/i
 /** Panel VM test probes are not grant-death. Stale access 401 must not eject a live ticket. */
 export const TEST_PROBE_SOURCES = new Set(['test-chat', 'kin-console-test'])
 
@@ -26,8 +26,8 @@ export function isAuthCooldownReason(reason) {
   return AUTH_COOLDOWN_REASON.test(String(reason || ''))
 }
 const REFRESH_FAILURE =
-  /credential_refresh_failed|oauth_refresh|refresh_token_missing|refresh_token_invalid|invalid_grant|token has been revoked|worker_output_invalid|refresh_rejected|refresh_denied/i
-const GRANT_REVOKED = /access token has been revoked|token has been revoked|oauth_revoked/i
+  /credential_refresh_failed|oauth_refresh|refresh_token_missing|refresh_token_invalid|invalid_grant|token has been revoked|token_revoked|invalidated oauth token|worker_output_invalid|refresh_rejected|refresh_denied/i
+const GRANT_REVOKED = /access token has been revoked|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i
 
 export function isRefreshFailure(workerStatus) {
   if (String(workerStatus?.last_error_class || workerStatus?.refresh_class || '').toLowerCase() === 'retryable')

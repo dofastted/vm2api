@@ -251,7 +251,7 @@ export function isUnconfirmedAuthFailure(result = {}) {
   const hay = `${code} ${message} ${workerCode}`
   const authish =
     Number(result.status) === 401 ||
-    /token has been revoked|oauth_revoked|invalid_grant|authentication_error|needs_refresh|credential needs refresh|no credential|credential_required/i.test(
+    /token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant|authentication_error|needs_refresh|credential needs refresh|no credential|credential_required/i.test(
       hay,
     )
   if (!authish) return false
@@ -372,7 +372,10 @@ export function clampOauth401CooldownMs(ms) {
   return Math.min(MAX_OAUTH_401_COOLDOWN_MS, Math.max(5_000, n))
 }
 
-const GRANT_DEAD = /token has been revoked|oauth_revoked|invalid_grant/i
+// OpenAI/codex revocations come as `error.code = "token_revoked"` with the message
+// "Encountered invalidated oauth token for user" — same grant death as Anthropic's
+// "token has been revoked", just spelled differently.
+const GRANT_DEAD = /token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant/i
 
 function classifyOAuth401(hasRefresh, hay) {
   if (hasRefresh === false) {
@@ -570,7 +573,12 @@ function classifyUpstreamResultRaw(
       detail: { status, message: message.slice(0, 500) },
     }
   }
-  if (/token has been revoked|oauth_revoked|invalid_grant|authentication_error/i.test(hay) || status === 401) {
+  if (
+    /token has been revoked|token_revoked|invalidated oauth token|oauth_revoked|invalid_grant|authentication_error/i.test(
+      hay,
+    ) ||
+    status === 401
+  ) {
     if (isUnconfirmedAuthFailure(result)) {
       return {
         scope: 'account',

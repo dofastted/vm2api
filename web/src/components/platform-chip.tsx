@@ -6,10 +6,11 @@ import {
 } from '@/lib/cred-type'
 import { cn } from '@/lib/utils'
 import {
-  compactEmail,
+  formatSlotEmail,
   kindFromModel,
   platformLabelOf,
   slotAccountLabel,
+  slotRawEmail,
   type VmKind,
   vmKindOf,
 } from '@/lib/vm-kind'
@@ -68,12 +69,21 @@ export function SlotIdentity({
     : vm
       ? vmKindOf(vm)
       : kindFromModel(model, protocol)
-  const full = slotAccountLabel(vm, { email, vmId, emptyLabel })
-  // 有自定义名称时优先展示名称（识别靠名称体系），账号地址放悬停提示
+  const rawEmail = slotRawEmail(vm, email)
+  const full = slotAccountLabel(vm, {
+    email: rawEmail || email,
+    vmId,
+    emptyLabel,
+  })
   const name = String(vm?.name || '').trim()
-  const shown =
-    name || (compact && full.includes('@') ? compactEmail(full) : full)
-  const tip = name ? `${name} · ${full}` : full.includes('@') ? full : undefined
+  const shown = rawEmail ? formatSlotEmail(rawEmail) : name || full
+  const tip = rawEmail
+    ? name && name !== rawEmail
+      ? `${name} · ${rawEmail}`
+      : rawEmail
+    : name && full !== name
+      ? `${name} · ${full}`
+      : undefined
   return (
     <span
       className={cn(

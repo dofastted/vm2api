@@ -436,4 +436,39 @@ describe('gemini_native_config_invalid status copy', () => {
       geminiInferenceErrorAction('gemini_native_config_invalid')
     ).toContain('对齐宿主脚本与签名载荷版本')
   })
+
+  it('aligns CRAGGemini license mismatch, sync pending, and invalid guidance with real UI actions', () => {
+    expect(geminiInferenceErrorLabel('license_payload_key_mismatch')).toBe(
+      'CRAGGemini 许可与当前载荷版本不匹配'
+    )
+    expect(
+      geminiInferenceErrorAction('license_payload_key_mismatch')
+    ).toContain('重新绑定 CRAG 席位')
+    expect(geminiInferenceErrorLabel('gemini_subscription_sync_pending')).toBe(
+      'CRAGGemini 宿主订阅同步中'
+    )
+    expect(
+      geminiInferenceErrorAction('gemini_subscription_sync_pending')
+    ).toContain('继续同步订阅')
+    expect(geminiInferenceErrorAction('license_invalid')).toContain(
+      '重新绑定 CRAG 席位'
+    )
+    expect(geminiInferenceErrorAction('license_invalid')).not.toContain(
+      '释放后重新绑定'
+    )
+    expect(
+      geminiAccountStatus({
+        ...candidate,
+        crag_license: {
+          product: 'craggemini',
+          status: 'invalid',
+          valid: false,
+          code: 'license_payload_key_mismatch',
+        },
+      })
+    ).toMatchObject({
+      group: 'unschedulable',
+      blocker: 'CRAGGemini 许可与当前载荷版本不匹配',
+    })
+  })
 })

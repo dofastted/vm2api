@@ -32,7 +32,7 @@ export const REVOKE_TEXT = 'revoke'
 /** Dead grant only. Do not match stale-access 401 (`authentication_failed_after_refresh`) or `/usage` 429. */
 export const TRANSIENT_CREDENTIAL_REFRESH_FAIL = /worker_output_invalid|refresh_rejected|refresh_denied/i
 export const CREDENTIAL_REFRESH_FAIL =
-  /oauth_invalid_grant|invalid_grant|refresh_token_missing|refresh_token_invalid|refresh token not found|oauth_revoked|oauth_no_refresh|oauth_cleared|credential_refresh_failed|worker_output_invalid|refresh_rejected|refresh_denied/i
+  /oauth_invalid_grant|invalid_grant|refresh_token_missing|refresh_token_invalid|refresh token not found|oauth_revoked|oauth_no_refresh|oauth_cleared|credential_refresh_failed|worker_output_invalid|refresh_rejected|refresh_denied|token_revoked|invalidated oauth token/i
 
 function liveAccessTtlMs(vm = {}, workerCredential = {}, expiresAt = null) {
   return (

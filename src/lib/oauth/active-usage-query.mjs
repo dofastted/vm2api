@@ -14,17 +14,18 @@ function failure(status, code, message) {
 }
 
 /** Explicit user action: fresh official usage, no model request or cached-success fallback. */
-export function createActiveUsageQuery({ probe = probeVmUsage } = {}) {
+export function createActiveUsageQuery({ probe = probeVmUsage, now = () => Date.now() } = {}) {
   const flights = new Map()
-  return async function query({ projectRoot, vm, accountQuota }) {
+  return async function query({ projectRoot, vm, accountQuota, forceReconcile = false, reconcileHeaders = false }) {
     if (!vm) return failure(404, 'vm_not_found', '槽位不存在')
     if (isCodexVm(vm)) return failure(400, 'unsupported_platform', '请使用 GPT 额度查询')
     if (!vmHasClaudeCredential(vm)) return failure(400, 'no_oauth_token', '请先导入账号凭证')
     if (!canOfficialUsage(credentialModeOfVm(vm))) {
       return failure(400, 'usage_scope_required', '当前凭证不支持官方额度查询，请导入完整 OAuth')
     }
+    const confirmedForce = forceReconcile === true || reconcileHeaders === true
     const accountId = vm.claude?.account_uuid || vm.id
-    const key = `${projectRoot}:${vm.id}:${accountId}`
+    const key = `${projectRoot}:${vm.id}:${accountId}${confirmedForce ? ':force' : ''}`
     if (flights.has(key)) return await flights.get(key)
     const pending = (async () => {
       const account = await accountQuota.ensure({ account_id: accountId, vm_id: vm.id })
@@ -33,7 +34,7 @@ export function createActiveUsageQuery({ probe = probeVmUsage } = {}) {
         return failure(429, 'usage_rate_limited', `官方额度查询限流，请约 ${Math.ceil(backoff / 1000)} 秒后重试`)
       }
       const exec = { vmId: vm.id, homeDir: path.join(projectRoot, 'vms', vm.id, 'cli-home'), oauth: vm.claude, vm }
-      const probeStartedAt = Date.now()
+      const probeStartedAt = now()
       const probeResetGenerations = accountQuota.resetGenerations?.(accountId) || null
       let result
       try {
@@ -44,6 +45,7 @@ export function createActiveUsageQuery({ probe = probeVmUsage } = {}) {
       if (isOfficialUsageRateLimited(result)) {
         await accountQuota.ingestOAuthUsage(accountId, result, {
           startedAt: probeStartedAt,
+          now: now(),
           resetGenerations: probeResetGenerations,
         })
         return failure(429, 'usage_rate_limited', '官方额度查询限流，请稍后重试')
@@ -55,11 +57,26 @@ export function createActiveUsageQuery({ probe = probeVmUsage } = {}) {
             : usageErrorText(result) || '官方接口未返回完整额度数据'
         return failure(502, 'usage_query_failed', message)
       }
+      let calibration = null
       await accountQuota.ingestOAuthUsage(accountId, result, {
         startedAt: probeStartedAt,
+        now: now(),
         resetGenerations: probeResetGenerations,
+        activeCalibration: true,
+        forceReconcile: confirmedForce,
+        onCalibration(summary) {
+          calibration = summary
+        },
       })
       getUsageCache().clear(accountId)
+      const cal = calibration || {
+        reconciled: true,
+        force_reconcile: confirmedForce,
+        reconciled_windows: [],
+        retained_windows: [],
+        can_force_reconcile: false,
+        settle_remaining_ms: 0,
+      }
       return {
         status: 200,
         body: {
@@ -71,6 +88,12 @@ export function createActiveUsageQuery({ probe = probeVmUsage } = {}) {
             five_hour: result.five_hour,
             seven_day: result.seven_day,
             seven_day_oi: result.seven_day_oi,
+            reconciled: cal.reconciled,
+            force_reconcile: cal.force_reconcile,
+            reconciled_windows: cal.reconciled_windows,
+            retained_windows: cal.retained_windows,
+            can_force_reconcile: cal.can_force_reconcile,
+            settle_remaining_ms: cal.settle_remaining_ms,
           },
         },
       }

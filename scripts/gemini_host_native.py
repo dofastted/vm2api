@@ -155,12 +155,22 @@ class EligibilityDiagnostic:
 
 
 class NativeFailure(Exception):
-    def __init__(self, code, status=None, message=None, retry_after_ms=None):
+    def __init__(
+        self,
+        code,
+        status=None,
+        message=None,
+        retry_after_ms=None,
+        upstream_reason=None,
+        content_rejected=False,
+    ):
         super().__init__(message or code)
         self.code = code
         self.status = status
         self.message = message
         self.retry_after_ms = retry_after_ms
+        self.upstream_reason = upstream_reason
+        self.content_rejected = bool(content_rejected)
 
 
 def _object(pairs):
@@ -255,45 +265,125 @@ def parse_sse(frames):
 
 
 class _UnixHTTPConnection:
-    def __init__(self, path, timeout):
+    def __init__(self, path, timeout, *, keep_alive=False, sock=None):
         self.path = path
         self.timeout = timeout
-        self.sock = None
+        self.keep_alive = keep_alive
+        self.sock = sock
 
     def request(self, method, path, headers, body):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(self.path)
+        if self.sock is None:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(self.timeout)
+            self.sock.connect(self.path)
+        else:
+            self.sock.settimeout(self.timeout)
+        conn_hdr = "Connection: keep-alive" if self.keep_alive else "Connection: close"
         lines = [f"{method} {path} HTTP/1.1", "Host: localhost"]
         lines.extend(f"{key}: {value}" for key, value in headers.items())
-        lines.extend(("Connection: close", "", ""))
+        lines.extend((conn_hdr, "", ""))
         self.sock.sendall("\r\n".join(lines).encode("ascii") + body)
         return HTTPResponse(self.sock)
 
+    def detach(self):
+        sock = self.sock
+        self.sock = None
+        return sock
+
     def close(self):
         if self.sock:
-            self.sock.close()
+            try:
+                self.sock.close()
+            except OSError:
+                pass
             self.sock = None
 
 
+class _UnixConnectionPool:
+    """Thread-safe HTTP/1.1 keep-alive pool for short JSON control calls to craggemini."""
+
+    def __init__(self, max_per_path=8, idle_ttl=30.0):
+        self._lock = threading.Lock()
+        self._idle = {}
+        self._max_per_path = max_per_path
+        self._idle_ttl = idle_ttl
+
+    def acquire(self, path):
+        now_t = time.monotonic()
+        with self._lock:
+            bucket = self._idle.get(path)
+            while bucket:
+                sock, stored_at = bucket.pop()
+                if now_t - stored_at <= self._idle_ttl:
+                    return sock
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            if bucket is not None and not bucket:
+                self._idle.pop(path, None)
+        return None
+
+    def release(self, path, sock):
+        if sock is None:
+            return
+        with self._lock:
+            bucket = self._idle.setdefault(path, [])
+            if len(bucket) >= self._max_per_path:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return
+            bucket.append((sock, time.monotonic()))
+
+
+_CONTROL_CONN_POOL = _UnixConnectionPool()
+
+
+def _pooled_unix_json_exchange(socket_path, method, path, headers, body, timeout, max_bytes):
+    reused_sock = _CONTROL_CONN_POOL.acquire(socket_path)
+    for attempt in range(2):
+        sock = reused_sock if attempt == 0 else None
+        conn = _UnixHTTPConnection(socket_path, timeout, keep_alive=True, sock=sock)
+        try:
+            response = conn.request(method, path, headers, body)
+            response.begin()
+            raw = response.read(max_bytes + 1)
+            can_reuse = (
+                not response.will_close
+                and len(raw) <= max_bytes
+                and response.isclosed()
+            )
+            if can_reuse:
+                _CONTROL_CONN_POOL.release(socket_path, conn.detach())
+            else:
+                conn.close()
+            return response.status, raw
+        except (OSError, HTTPException, ValueError):
+            conn.close()
+            if attempt == 0 and reused_sock is not None:
+                continue
+            raise
+
+
 def worker_status(socket_path, token, timeout=0.5):
-    connection = _UnixHTTPConnection(socket_path, timeout)
     try:
-        response = connection.request(
-            "GET", "/internal/health", {"X-Kin-Internal-Token": token}, b""
+        status, raw = _pooled_unix_json_exchange(
+            socket_path,
+            "GET",
+            "/internal/health",
+            {"X-Kin-Internal-Token": token},
+            b"",
+            timeout,
+            64 * 1024,
         )
-        response.begin()
-        if response.status != 200:
-            return None
-        raw = response.read(64 * 1024 + 1)
-        if len(raw) > 64 * 1024:
+        if status != 200 or len(raw) > 64 * 1024:
             return None
         data = json.loads(raw, object_pairs_hook=_object)
         return data if isinstance(data, dict) else None
-    except (OSError, ValueError, RecursionError):
+    except (OSError, HTTPException, ValueError, RecursionError):
         return None
-    finally:
-        connection.close()
 
 
 def worker_json_request(
@@ -318,19 +408,16 @@ def worker_json_request(
     if body:
         headers["Content-Type"] = "application/json"
         headers["Content-Length"] = str(len(body))
-    connection = _UnixHTTPConnection(socket_path, timeout)
     try:
-        response = connection.request(method, path, headers, body)
-        response.begin()
-        raw = response.read(256 * 1024 + 1)
+        status, raw = _pooled_unix_json_exchange(
+            socket_path, method, path, headers, body, timeout, 256 * 1024
+        )
         if len(raw) > 256 * 1024:
-            return response.status, None
+            return status, None
         data = json.loads(raw, object_pairs_hook=_object) if raw else {}
-        return response.status, data if isinstance(data, dict) else None
-    except (OSError, ValueError, RecursionError):
+        return status, data if isinstance(data, dict) else None
+    except (OSError, HTTPException, ValueError, RecursionError):
         return 0, None
-    finally:
-        connection.close()
 
 
 def cancel_worker_request(
@@ -357,7 +444,9 @@ LICENSE_ERROR_CODES = frozenset(
         "license_not_yet_valid",
         "license_invalid",
         "license_binding_mismatch",
+        "license_payload_key_mismatch",
         "license_unconfigured",
+        "gemini_subscription_sync_pending",
     }
 )
 
@@ -367,7 +456,7 @@ def _map_worker_error(http_status, payload):
     upstream = payload.get("upstream_status") if isinstance(payload, dict) else None
     message = payload.get("error") if isinstance(payload, dict) and isinstance(payload.get("error"), str) else None
     if isinstance(code, str) and code in LICENSE_ERROR_CODES:
-        return NativeFailure(code, 403, message)
+        return NativeFailure(code, 503 if code == "gemini_subscription_sync_pending" else 403, message)
     effective_status = upstream if isinstance(upstream, int) and 400 <= upstream <= 599 else http_status
     if code == "unsupported_turn":
         return NativeFailure("gemini_unsupported_turn", 400, message)
@@ -392,8 +481,19 @@ def _map_worker_error(http_status, payload):
             if type(raw_retry) is int and 1 <= raw_retry <= 3_600_000
             else None
         )
+        raw_reason = payload.get("upstream_reason") if isinstance(payload, dict) else None
+        upstream_reason = raw_reason if isinstance(raw_reason, str) and raw_reason else None
+        content_rejected = bool(
+            isinstance(payload, dict)
+            and (payload.get("content_rejected") is True or code == "gemini_content_rejected")
+        )
         return NativeFailure(
-            "gemini_quota_exhausted", 429, message, retry_after_ms=retry_after_ms
+            "gemini_content_rejected" if content_rejected else "gemini_quota_exhausted",
+            429,
+            message,
+            retry_after_ms=retry_after_ms,
+            upstream_reason=upstream_reason,
+            content_rejected=content_rejected,
         )
     if effective_status == 401:
         return NativeFailure("gemini_oauth_required", 401, message)
@@ -428,6 +528,7 @@ def open_worker_stream(
     account_id=None,
     is_alive=None,
     exit_reader=None,
+    skip_ready_probe=False,
 ):
     if (
         not isinstance(socket_path, str)
@@ -445,33 +546,35 @@ def open_worker_stream(
         )
     ):
         raise NativeFailure("gemini_inference_bad_input", 400)
-    start_deadline = time.monotonic() + startup_timeout
-    while time.monotonic() < start_deadline:
-        if diagnostic is not None:
-            diag_code = diagnostic.poll()
-            if diag_code is not None:
-                raise NativeFailure(diag_code, 403)
-        if exit_reader is not None:
-            outcome = exit_reader()
-            if outcome is not None:
-                raise launcher_exit_failure(outcome)
-        if is_alive is not None and not is_alive():
-            outcome = exit_reader() if exit_reader is not None else None
-            if outcome is not None:
-                raise launcher_exit_failure(outcome)
-            raise NativeFailure("gemini_native_worker_unavailable", 503)
-        status = worker_status(socket_path, token, timeout=0.25)
-        if status and status.get("license_valid") is False:
-            lic = status.get("license") if isinstance(status.get("license"), dict) else {}
-            lic_code = lic.get("code") if isinstance(lic.get("code"), str) and lic.get("code") in LICENSE_ERROR_CODES else "license_required"
-            raise NativeFailure(lic_code, 403, lic.get("message") if isinstance(lic.get("message"), str) else None)
-        if status and status.get("needs_recovery") is True:
-            raise NativeFailure("gemini_native_worker_unavailable", 503)
-        if _worker_ready(status):
-            break
-        time.sleep(0.05)
-    else:
+
+    def _wait_worker_ready():
+        start_deadline = time.monotonic() + startup_timeout
+        while time.monotonic() < start_deadline:
+            if diagnostic is not None:
+                diag_code = diagnostic.poll()
+                if diag_code is not None:
+                    raise NativeFailure(diag_code, 403)
+            if exit_reader is not None:
+                outcome = exit_reader()
+                if outcome is not None:
+                    raise launcher_exit_failure(outcome)
+            if is_alive is not None and not is_alive():
+                outcome = exit_reader() if exit_reader is not None else None
+                if outcome is not None:
+                    raise launcher_exit_failure(outcome)
+                raise NativeFailure("gemini_native_worker_unavailable", 503)
+            status = worker_status(socket_path, token, timeout=0.25)
+            if status and status.get("license_valid") is False:
+                lic = status.get("license") if isinstance(status.get("license"), dict) else {}
+                lic_code = lic.get("code") if isinstance(lic.get("code"), str) and lic.get("code") in LICENSE_ERROR_CODES else "license_required"
+                raise NativeFailure(lic_code, 403, lic.get("message") if isinstance(lic.get("message"), str) else None)
+            if status and status.get("needs_recovery") is True:
+                raise NativeFailure("gemini_native_worker_unavailable", 503)
+            if _worker_ready(status):
+                return
+            time.sleep(0.05)
         raise NativeFailure("gemini_native_bridge_timeout", 503)
+
     wire_body = body_obj
     system_prompt_mode = body_obj.get("system_prompt_mode")
     if system_prompt_mode is not None:
@@ -493,62 +596,95 @@ def open_worker_stream(
     payload = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(payload) > MAX_BODY:
         raise NativeFailure("gemini_inference_output_limit", 413)
-    connection = _UnixHTTPConnection(socket_path, turn_timeout)
-    try:
+    message_path = (
+        f"/internal/v1/accounts/{account_id}/messages"
+        if account_id is not None
+        else "/internal/v1/messages"
+    )
+
+    if not skip_ready_probe:
+        _wait_worker_ready()
+    else:
         if diagnostic is not None:
             diag_code = diagnostic.poll()
             if diag_code is not None:
                 raise NativeFailure(diag_code, 403)
-        message_path = (
-            f"/internal/v1/accounts/{account_id}/messages"
-            if account_id is not None
-            else "/internal/v1/messages"
-        )
-        response = connection.request(
-            "POST",
-            message_path,
-            {
-                "Content-Type": "application/json",
-                "Content-Length": str(len(payload)),
-                "X-Kin-Internal-Token": token,
-            },
-            payload,
-        )
-        if diagnostic is not None and connection.sock is not None:
-            header_deadline = time.monotonic() + turn_timeout
-            while time.monotonic() < header_deadline:
+        if exit_reader is not None:
+            outcome = exit_reader()
+            if outcome is not None:
+                raise launcher_exit_failure(outcome)
+        if is_alive is not None and not is_alive():
+            outcome = exit_reader() if exit_reader is not None else None
+            if outcome is not None:
+                raise launcher_exit_failure(outcome)
+            raise NativeFailure("gemini_native_worker_unavailable", 503)
+
+    probed_after_skip = not skip_ready_probe
+    while True:
+        connection = _UnixHTTPConnection(socket_path, turn_timeout)
+        try:
+            if diagnostic is not None:
                 diag_code = diagnostic.poll()
                 if diag_code is not None:
-                    connection.close()
-                    cancel_worker_request(
-                        socket_path, token, request_id, account_id=account_id
-                    )
                     raise NativeFailure(diag_code, 403)
-                remaining = header_deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                readable, _, _ = select.select(
-                    [connection.sock], [], [], min(0.2, remaining)
-                )
-                if readable:
-                    break
-        response.begin()
-        ct = (response.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
-        if response.status != 200 or ct != "text/event-stream":
-            raw = response.read(64 * 1024)
-            err_payload = None
-            try:
-                err_payload = json.loads(raw) if raw else None
-            except ValueError:
+            response = connection.request(
+                "POST",
+                message_path,
+                {
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                    "X-Kin-Internal-Token": token,
+                },
+                payload,
+            )
+            if diagnostic is not None and connection.sock is not None:
+                header_deadline = time.monotonic() + turn_timeout
+                while time.monotonic() < header_deadline:
+                    diag_code = diagnostic.poll()
+                    if diag_code is not None:
+                        connection.close()
+                        cancel_worker_request(
+                            socket_path, token, request_id, account_id=account_id
+                        )
+                        raise NativeFailure(diag_code, 403)
+                    remaining = header_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    readable, _, _ = select.select(
+                        [connection.sock], [], [], min(0.2, remaining)
+                    )
+                    if readable:
+                        break
+            response.begin()
+            ct = (response.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if response.status != 200 or ct != "text/event-stream":
+                raw = response.read(64 * 1024)
                 err_payload = None
+                try:
+                    err_payload = json.loads(raw) if raw else None
+                except ValueError:
+                    err_payload = None
+                connection.close()
+                mapped = _map_worker_error(response.status, err_payload)
+                if (
+                    not probed_after_skip
+                    and mapped.code == "gemini_native_worker_unavailable"
+                    and response.status == 503
+                ):
+                    probed_after_skip = True
+                    _wait_worker_ready()
+                    continue
+                raise mapped
+            return connection, response
+        except NativeFailure:
+            raise
+        except (OSError, TimeoutError, HTTPException):
             connection.close()
-            raise _map_worker_error(response.status, err_payload)
-        return connection, response
-    except NativeFailure:
-        raise
-    except (OSError, TimeoutError, HTTPException):
-        connection.close()
-        raise NativeFailure("gemini_inference_failed", 502) from None
+            if not probed_after_skip:
+                probed_after_skip = True
+                _wait_worker_ready()
+                continue
+            raise NativeFailure("gemini_inference_failed", 502) from None
 
 
 def query_free_vt(lock_path):

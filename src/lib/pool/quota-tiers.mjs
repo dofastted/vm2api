@@ -10,6 +10,7 @@
  */
 
 import { GATE_OPEN, gateZone, quotaGateOf } from './quota-gate.mjs'
+import { isOfficialWindowLimited, listQuotaFromHeaders } from './quota-window.mjs'
 
 export const TIER_KEYS = ['default', 'pro', 'max']
 
@@ -128,16 +129,24 @@ function utilRatio(value) {
 }
 
 /** Draining or gated on 5h/7d (quota-gate.mjs): the account is at or near its line. */
-export function isNearLimit(acc, policy) {
+export function isNearLimit(acc, policy, { now = Date.now() } = {}) {
   const p = policy || resolveTierPolicy({}, accountTierKey(acc))
   const limit5 = Number(p.limit_5h ?? p.safety_ratio ?? 0.85)
   const limit7 = Number(p.limit_7d ?? p.weekly_safety_ratio ?? 0.8)
   const gate = quotaGateOf(p)
   const u = acc?.unified || {}
-  const w5 = u.official?.['5h'] || u['5h'] || {}
-  const w7 = u.official?.['7d'] || u['7d'] || {}
-  return (
-    gateZone(utilRatio(w5.utilization), limit5, gate) !== GATE_OPEN ||
-    gateZone(utilRatio(w7.utilization), limit7, gate) !== GATE_OPEN
-  )
+  const listed = listQuotaFromHeaders(u, { now })
+  const o5 = u.official?.['5h'] || u['5h'] || {}
+  const o7 = u.official?.['7d'] || u['7d'] || {}
+  const u5 = isOfficialWindowLimited(o5, { now })
+    ? 1
+    : listed.utilization_5h != null
+      ? listed.utilization_5h
+      : o5.utilization
+  const u7 = isOfficialWindowLimited(o7, { now })
+    ? 1
+    : listed.utilization_7d != null
+      ? listed.utilization_7d
+      : o7.utilization
+  return gateZone(utilRatio(u5), limit5, gate) !== GATE_OPEN || gateZone(utilRatio(u7), limit7, gate) !== GATE_OPEN
 }

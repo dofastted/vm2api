@@ -45,7 +45,7 @@ for (const [label, fetchImpl] of [
   })
 }
 
-test('cached stale release preserves refresh failure until a successful retry', async (t) => {
+test('failed refresh invalidates cache TTL instead of caching errors for 5 minutes', async (t) => {
   const root = fixture(t)
   await buildUpdateStatus({ projectRoot: root, fetchImpl: goodFetch, now: () => 1000, cacheMs: 0 })
   const failed = await buildUpdateStatus({
@@ -56,23 +56,27 @@ test('cached stale release preserves refresh failure until a successful retry', 
     now: () => 2000,
     cacheMs: 0,
   })
-  let fetched = false
-  const cached = await buildUpdateStatus({
+  assert.equal(failed.check_status, 'failed')
+  assert.equal(failed.latest_tag, null)
+  assert.equal(failed.update_available, null)
+  assert.equal(failed.source_error, 'offline')
+
+  let retries = 0
+  const stillFailed = await buildUpdateStatus({
     projectRoot: root,
     now: () => 2001,
     fetchImpl: async () => {
-      fetched = true
-      return goodFetch()
+      retries += 1
+      throw new Error('offline')
     },
   })
-  for (const status of [failed, cached]) {
-    assert.equal(status.check_status, 'failed')
-    assert.equal(status.latest_tag, null)
-    assert.equal(status.update_available, null)
-    assert.equal(status.source_error, 'offline')
-  }
-  assert.equal(fetched, false)
-  const recovered = await buildUpdateStatus({ projectRoot: root, fetchImpl: goodFetch, now: () => 2002, cacheMs: 0 })
+  assert.equal(retries, 1)
+  assert.equal(stillFailed.check_status, 'failed')
+  assert.equal(stillFailed.latest_tag, null)
+  assert.equal(stillFailed.update_available, null)
+  assert.equal(stillFailed.source_error, 'offline')
+
+  const recovered = await buildUpdateStatus({ projectRoot: root, fetchImpl: goodFetch, now: () => 2002 })
   assert.equal(recovered.check_status, 'ok')
   assert.equal(recovered.source_error, null)
   assert.equal(recovered.latest_tag, 'v1.3.180')
@@ -124,12 +128,14 @@ test('explicit upgrade target remains available during lookup failure', async (t
   assert.equal(result.data.source_error, 'offline')
 })
 
-test('fetch-unavailable error is preserved when a stale release enters the cache', async (t) => {
+test('fetch-unavailable error is not cached and recovers once fetchImpl is available', async (t) => {
   const root = fixture(t)
   await buildUpdateStatus({ projectRoot: root, fetchImpl: goodFetch, now: () => 1000, cacheMs: 0 })
   const failed = await fetchLatestRelease({ fetchImpl: null, now: () => 2000, cacheMs: 0 })
-  const cached = await fetchLatestRelease({ fetchImpl: goodFetch, now: () => 2001 })
   assert.equal(failed.error, 'fetch_unavailable')
-  assert.equal(cached.error, 'fetch_unavailable')
-  assert.equal(cached.cached, true)
+  assert.equal(failed.cached, false)
+  const retried = await fetchLatestRelease({ fetchImpl: goodFetch, now: () => 2001 })
+  assert.equal(retried.error, null)
+  assert.equal(retried.cached, false)
+  assert.equal(retried.release.tag, 'v1.3.180')
 })

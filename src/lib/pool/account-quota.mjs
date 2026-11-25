@@ -65,6 +65,8 @@ import {
 
 /** How long a 'usage credits required' Fable answer keeps Fable off the seat. */
 export const FABLE_CREDITS_DENY_MS = 6 * 60 * 60_000
+/** Minimum post-inference settle age before an unconfirmed active query crosses the low-reading guard. */
+export const ACTIVE_CALIBRATION_SETTLE_MS = 5 * 60_000
 
 const RESET_WINDOW_MAP = {
   five_hour: '5h',
@@ -410,9 +412,10 @@ export class AccountQuota {
         reset:
           h['anthropic-ratelimit-unified-7d_oi-reset'] || (reconcileOi ? null : acc.unified['7d_oi']?.reset || null),
         status: h['anthropic-ratelimit-unified-7d_oi-status'] || statusFromUtil(uOi ?? 0),
+        sampled_at: sampledAt,
       }
+      acc.unified.headers['7d_oi'] = { ...acc.unified['7d_oi'] }
       if (reconcileOi) {
-        acc.unified.headers['7d_oi'] = { ...acc.unified['7d_oi'] }
         acc.unified.reset_boundaries['7d_oi'] = { ...acc.unified.reset_boundaries['7d_oi'], reconciled: true }
         reconciledAny = true
       }
@@ -542,10 +545,11 @@ export class AccountQuota {
   ingestOAuthUsage(accountId, probe = {}, opts = {}) {
     const acc = this.ensure({ account_id: accountId })
     const nowMs = parseTimestampMs(opts.now ?? probe.now) ?? Date.now()
+    const startedAtMs = parseTimestampMs(opts.startedAt ?? probe.started_at ?? probe.request_started_at)
     const rawProbedAtMs = parseTimestampMs(probe.probed_at)
     const probeTiming = {
       resetGenerations: opts.resetGenerations ?? probe.reset_generations ?? null,
-      startedAtMs: parseTimestampMs(opts.startedAt ?? probe.started_at ?? probe.request_started_at),
+      startedAtMs,
       probedAtMs: rawProbedAtMs,
       allowProbedAtFallback: true,
     }
@@ -560,10 +564,15 @@ export class AccountQuota {
       acc.unified.account_tier_source = 'profile'
     }
     const nowIso = probe.probed_at || new Date(nowMs).toISOString()
+    const officialUpdatedAtMs = parseTimestampMs(nowIso) ?? nowMs
     // An org refusal is a deterministic slot state, not a transient usage
     // backoff: keep the raw error (the panel and the runtime classifier both
     // read it) instead of painting rate_limited over an org-disabled slot.
-    const orgDisabled = isOrganizationDisabledUsageResult({ ...probe, ok: probe.ok, usage_scope_missing: probe.usage_scope_missing })
+    const orgDisabled = isOrganizationDisabledUsageResult({
+      ...probe,
+      ok: probe.ok,
+      usage_scope_missing: probe.usage_scope_missing,
+    })
     if (isOfficialUsageRateLimited(probe) && !orgDisabled) {
       const retryMs = Number(probe.retry_after_ms)
       const backoff =
@@ -585,6 +594,14 @@ export class AccountQuota {
       return this.repo.save(acc)
     }
     if (acc.unified) delete acc.unified.usage_rate_limited_until
+    const usageOk = probe.ok === true || (probe.usage_status > 0 && probe.usage_status < 400)
+    const completeOfficialUsage = usageOk && probe.limits_present === true
+    const activeCalibration =
+      opts.activeCalibration === true &&
+      probe.ok === true &&
+      Number(probe.usage_status) === 200 &&
+      probe.limits_present === true
+    const forceReconcile = activeCalibration && opts.forceReconcile === true
     const official = probe.interpretations?.official || {}
     const w5 = official.five_hour || probe.five_hour || {}
     const w7 = official.seven_day || probe.seven_day || {}
@@ -612,24 +629,34 @@ export class AccountQuota {
     const oiNorm = oiUtil != null && Number.isFinite(oiUtil) ? (oiUtil > 1.5 ? oiUtil / 100 : oiUtil) : null
     const oiRejected =
       ['rejected', 'rate_limited'].includes(String(oi?.status || '').toLowerCase()) || (oiNorm != null && oiNorm >= 1)
-    if (checkOi.allowed && (oiNorm != null || oi?.status || oi?.resets_at || oi?.reset || oiRejected)) {
-      const reconcileOi = checkOi.pendingReset && oiNorm != null
-      acc.unified['7d_oi'] = {
-        utilization: reconcileOi ? oiNorm : (oiNorm ?? (oiRejected ? 1 : (acc.unified['7d_oi']?.utilization ?? null))),
-        reset:
-          oi?.resets_at ||
-          oi?.reset ||
-          probe.fable?.reset_at ||
-          (reconcileOi ? null : acc.unified['7d_oi']?.reset || null),
-        status: oiRejected
-          ? 'rejected'
-          : oi?.status ||
-            (oiNorm != null ? statusFromUtil(oiNorm) : reconcileOi ? null : acc.unified['7d_oi']?.status || null),
-      }
+    const hasOiObservation = Boolean(oiNorm != null || oi?.status || oi?.resets_at || oi?.reset || oiRejected)
+    const incomingOi = hasOiObservation
+      ? {
+          utilization: oiNorm ?? (oiRejected ? 1 : null),
+          reset: oi?.resets_at || oi?.reset || probe.fable?.reset_at || null,
+          status: oiRejected ? 'rejected' : oi?.status || (oiNorm != null ? statusFromUtil(oiNorm) : null),
+        }
+      : null
+    if (checkOi.allowed && hasOiObservation) {
       freshWindows['7d_oi'] = true
+      if (!activeCalibration) {
+        const reconcileOi = checkOi.pendingReset && oiNorm != null
+        acc.unified['7d_oi'] = {
+          utilization: reconcileOi
+            ? oiNorm
+            : (oiNorm ?? (oiRejected ? 1 : (acc.unified['7d_oi']?.utilization ?? null))),
+          reset:
+            oi?.resets_at ||
+            oi?.reset ||
+            probe.fable?.reset_at ||
+            (reconcileOi ? null : acc.unified['7d_oi']?.reset || null),
+          status: oiRejected
+            ? 'rejected'
+            : oi?.status ||
+              (oiNorm != null ? statusFromUtil(oiNorm) : reconcileOi ? null : acc.unified['7d_oi']?.status || null),
+        }
+      }
     }
-    const usageOk = probe.ok === true || (probe.usage_status > 0 && probe.usage_status < 400)
-    const completeOfficialUsage = usageOk && probe.limits_present === true
     const leftoverFable = acc.unified.fable || {}
     const hasFableUsage =
       probe.usage_has_fable === true ||
@@ -640,8 +667,15 @@ export class AccountQuota {
         '7d_oi': oi,
       }) &&
         (oiNorm != null || oi?.resets_at || oi?.reset || oi?.status))
+    const inflightCount = this.inflight.get(accountId) || 0
+    const latestActivityAtMs = this._latestActivityAtMs(accountId)
     if (completeOfficialUsage && (probe.usage_has_fable === true || hasFableUsage)) acc.unified.usage_has_fable = true
-    else if (completeOfficialUsage && probe.usage_has_fable === false && checkOi.allowed) {
+    else if (
+      completeOfficialUsage &&
+      probe.usage_has_fable === false &&
+      checkOi.allowed &&
+      (!activeCalibration || inflightCount === 0)
+    ) {
       acc.unified.usage_has_fable = false
       delete acc.unified['7d_oi']
       if (acc.unified.headers) delete acc.unified.headers['7d_oi']
@@ -673,7 +707,14 @@ export class AccountQuota {
       }
     } else if (usageOk) {
       const leftover = leftoverFable
-      if (checkOi.allowed && checkOi.pendingReset && freshWindows['7d_oi'] && oiNorm != null && acc.unified.fable) {
+      if (
+        !activeCalibration &&
+        checkOi.allowed &&
+        checkOi.pendingReset &&
+        freshWindows['7d_oi'] &&
+        oiNorm != null &&
+        acc.unified.fable
+      ) {
         acc.unified.fable = {
           ...acc.unified.fable,
           limited: oiRejected,
@@ -721,15 +762,41 @@ export class AccountQuota {
       transport: fableTransport,
     }
     acc.unified.last_probe = acc.last_probe
-    let syncResult = { copied: false, reconciledAny: false, resetReconciledAtMs: null }
+    let syncResult = {
+      copied: false,
+      reconciledAny: false,
+      calibratedAny: false,
+      resetReconciledAtMs: null,
+      retainedWindows: [],
+      blockedWindows: new Set(),
+      calibration: {
+        reconciled: true,
+        force_reconcile: forceReconcile,
+        reconciled_windows: [],
+        retained_windows: [],
+        can_force_reconcile: false,
+        settle_remaining_ms: 0,
+      },
+    }
     if (usageOk) {
       syncResult = syncActiveToPassive(acc, nowIso, {
         now: nowMs,
         freshWindows,
         checks: { '5h': check5, '7d': check7, '7d_oi': checkOi },
+        activeCalibration,
+        forceReconcile,
+        probeStartedAtMs: startedAtMs,
+        officialUpdatedAtMs,
+        inflightCount,
+        latestActivityAtMs,
+        incomingWindows: { '5h': w5, '7d': w7, '7d_oi': incomingOi },
+        hasFableProbe: Boolean(probe.fable && !fableTransport),
       })
       healOfficialOverwriteExtra(acc, accountId, this.repo, nowMs)
-      clearHeaderExhaustIfOfficialOpen(acc, { allowed5: check5.allowed, allowed7: check7.allowed })
+      clearHeaderExhaustIfOfficialOpen(acc, {
+        allowed5: check5.allowed && !syncResult.blockedWindows.has('5h') && (freshWindows['5h'] || !activeCalibration),
+        allowed7: check7.allowed && !syncResult.blockedWindows.has('7d') && (freshWindows['7d'] || !activeCalibration),
+      })
     }
     settleElapsedHeaderWindows(acc, nowIso, nowMs)
     this._rollWindowHistory(acc, nowMs)
@@ -745,12 +812,23 @@ export class AccountQuota {
       })
     }
     if (usageOk && this.headerUnderSafety(saved, nowMs)) {
+      const activeCalibratedBeforeMs =
+        activeCalibration &&
+        syncResult.calibratedAny &&
+        syncResult.retainedWindows.length === 0 &&
+        Number.isFinite(startedAtMs)
+          ? startedAtMs
+          : null
       this.clearQuotaExhaustedCooldown(accountId, {
         now: nowMs,
         ...(syncResult.reconciledAny && syncResult.resetReconciledAtMs != null
           ? { resetReconciledAtMs: syncResult.resetReconciledAtMs }
           : {}),
+        ...(activeCalibratedBeforeMs != null ? { activeCalibratedBeforeMs } : {}),
       })
+    }
+    if (typeof opts.onCalibration === 'function') {
+      opts.onCalibration(syncResult.calibration)
     }
     return saved
   }
@@ -1291,7 +1369,10 @@ export class AccountQuota {
     return true
   }
 
-  clearQuotaExhaustedCooldown(accountId, { now = Date.now(), resetReconciledAtMs = null } = {}) {
+  clearQuotaExhaustedCooldown(
+    accountId,
+    { now = Date.now(), resetReconciledAtMs = null, activeCalibratedBeforeMs = null } = {},
+  ) {
     if (!accountId || !this.runtimeRepo) return false
     let state = null
     try {
@@ -1305,19 +1386,23 @@ export class AccountQuota {
     if (Number(state.overload_until) > nowMs) return false
     const rateLimitedFuture = Number(state.rate_limit_reset_at) > nowMs
     const reconciledAt = parseTimestampMs(resetReconciledAtMs)
+    const calibratedBefore = parseTimestampMs(activeCalibratedBeforeMs)
     const rateLimitedAt = parseTimestampMs(state.rate_limited_at)
+    if (reconciledAt != null && rateLimitedAt != null && rateLimitedAt > reconciledAt) return false
+    if (calibratedBefore != null && rateLimitedAt != null && rateLimitedAt >= calibratedBefore) return false
     const canClearPreResetRateLimit =
-      rateLimitedFuture &&
-      reconciledAt != null &&
-      rateLimitedAt != null &&
-      rateLimitedAt <= reconciledAt
+      rateLimitedFuture && reconciledAt != null && rateLimitedAt != null && rateLimitedAt <= reconciledAt
+    const canClearPreCalibrationRateLimit =
+      rateLimitedFuture && calibratedBefore != null && (rateLimitedAt == null || rateLimitedAt < calibratedBefore)
+    const canLiftRateLimit = canClearPreResetRateLimit || canClearPreCalibrationRateLimit
     // Live 429 columns belong to RateLimitService; passive Extra never lifts them
-    // unless a confirmed reset boundary (at >= rate_limited_at) was just reconciled.
-    if (rateLimitedFuture && !canClearPreResetRateLimit) return false
+    // unless a confirmed reset boundary (at >= rate_limited_at) or validated active
+    // calibration (started after rate_limited_at) was just reconciled.
+    if (rateLimitedFuture && !canLiftRateLimit) return false
     const reason = String(state.cooldown_reason || '')
     const quotaCool = !reason || /quota|account_quota_exhausted|rate_limited/i.test(reason)
     if (!quotaCool) return false
-    if (!state.cooldown_until && !reason && !canClearPreResetRateLimit) return false
+    if (!state.cooldown_until && !reason && !canLiftRateLimit) return false
     try {
       this.runtimeRepo.upsert?.({
         ...state,
@@ -1325,9 +1410,7 @@ export class AccountQuota {
         cooldown_until: null,
         cooldown_reason: null,
         rate_limit_reset_at: null,
-        ...(canClearPreResetRateLimit && state.session_window_status === 'rejected'
-          ? { session_window_status: 'allowed' }
-          : {}),
+        ...(canLiftRateLimit && state.session_window_status === 'rejected' ? { session_window_status: 'allowed' } : {}),
       })
     } catch {
       return false
@@ -1336,6 +1419,20 @@ export class AccountQuota {
       this.onQuotaCooldownCleared?.(accountId)
     } catch {}
     return true
+  }
+
+  _latestActivityAtMs(accountId) {
+    let latest = null
+    try {
+      const ms = Number(this.runtimeRepo?.get?.(accountId)?.last_used_at)
+      if (Number.isFinite(ms) && ms > 0) latest = maxTimestamp(latest, ms)
+    } catch {}
+    try {
+      const row = this.repo.recentAllocations?.(accountId, 1)?.[0]
+      const parsed = parseTimestampMs(row?.at)
+      if (parsed != null && parsed > 0) latest = maxTimestamp(latest, parsed)
+    } catch {}
+    return latest
   }
 
   _lastUsedAt(accountId) {
@@ -1473,7 +1570,7 @@ export class AccountQuota {
     if (!accountId) return null
     const acc = this.repo.get(accountId)
     if (!acc) return null
-    const revoke = /access token has been revoked|token has been revoked|oauth_revoked/i
+    const revoke = /access token has been revoked|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i
     const u = acc.unified || {}
     const lp = u.last_probe || acc.last_probe || null
     const fb = u.fable || null
@@ -1641,8 +1738,8 @@ export class AccountQuota {
     return out
   }
 
-  nearLimit(acc) {
-    return isNearLimit(acc, this.policyFor(acc))
+  nearLimit(acc, opts) {
+    return isNearLimit(acc, this.policyFor(acc), opts)
   }
 }
 
@@ -1853,32 +1950,122 @@ function shouldCopyOfficialToExtra(official, extra, now = Date.now()) {
   return false
 }
 
+function existingWindowSampledAtMs(unified, key) {
+  const headers = unified?.headers
+  if (!headers) return null
+  if (key !== '7d_oi') {
+    const own = parseTimestampMs(headers[key]?.sampled_at)
+    if (own != null) return own
+    const otherKey = key === '5h' ? '7d' : '5h'
+    const shared = parseTimestampMs(headers.sampled_at)
+    const other = parseTimestampMs(headers[otherKey]?.sampled_at)
+    if (shared != null && (other == null || other !== shared)) return shared
+    return null
+  }
+  return parseTimestampMs(headers['7d_oi']?.sampled_at ?? unified?.['7d_oi']?.sampled_at ?? headers.sampled_at)
+}
+
+function buildRetainedWindow(
+  key,
+  reason,
+  { ou = null, eu = null, at = null, headerSampledAt = null, settleRemainingMs = 0 } = {},
+) {
+  return {
+    window: key,
+    reason,
+    official_utilization: ou,
+    retained_utilization: eu,
+    official_updated_at: at,
+    header_sampled_at: headerSampledAt,
+    settle_remaining_ms: reason === 'settle_window' ? Math.max(1, Math.round(settleRemainingMs)) : 0,
+  }
+}
+
 /**
- * Official /usage writes Extra only when Extra is empty, elapsed, or leftover rejected.
+ * Official /usage writes Extra only when Extra is empty, elapsed, or leftover rejected,
+ * or when an explicit active calibration satisfies all monotonic/idle/settle guards.
  * Only what it copies counts as sampled at the probe time.
  */
-function syncActiveToPassive(acc, sampledAt, { now = Date.now(), freshWindows = null, checks = null } = {}) {
+function syncActiveToPassive(
+  acc,
+  sampledAt,
+  {
+    now = Date.now(),
+    freshWindows = null,
+    checks = null,
+    activeCalibration = false,
+    forceReconcile = false,
+    probeStartedAtMs = null,
+    officialUpdatedAtMs = null,
+    inflightCount = 0,
+    latestActivityAtMs = null,
+    incomingWindows = null,
+    hasFableProbe = false,
+  } = {},
+) {
   acc.unified.headers = acc.unified.headers || {}
   const at = sampledAt || new Date(now).toISOString()
   let copied = false
   let reconciledAny = false
+  let calibratedAny = false
   let resetReconciledAtMs = null
+  const reconciledWindows = []
+  const retainedWindows = []
+  const blockedWindows = new Set()
+
   for (const key of ['5h', '7d']) {
     const check = checks?.[key] || null
-    if (check && !check.allowed) continue
-    const src = acc.unified.official?.[key] || acc.unified[key]
     const extra = acc.unified.headers[key]
+    const eu = extra?.utilization != null ? officialUtilToExtra(extra.utilization) : null
+    if (check && !check.allowed) {
+      blockedWindows.add(key)
+      if (activeCalibration) {
+        const incomingParsed = applyOfficialWindow(incomingWindows?.[key] || {})
+        if (incomingParsed?.utilization != null && extra && eu !== incomingParsed.utilization) {
+          retainedWindows.push(
+            buildRetainedWindow(key, 'reset_boundary', {
+              ou: incomingParsed.utilization,
+              eu,
+              at,
+              headerSampledAt: extra?.sampled_at || null,
+            }),
+          )
+        }
+      }
+      continue
+    }
+    if (freshWindows && !freshWindows[key]) continue
+    const src = acc.unified.official?.[key] || acc.unified[key]
+    const ou = officialUtilToExtra(src?.utilization)
     const officialReset = src?.reset || src?.resets_at || null
     const pendingReset = check?.pendingReset === true
     if (pendingReset) {
-      const hasFreshValue =
-        (!freshWindows || freshWindows[key] === true) && officialUtilToExtra(src?.utilization) != null
+      const hasFreshValue = (!freshWindows || freshWindows[key] === true) && ou != null
       if (!hasFreshValue || !shouldCopyOfficialToExtra(src, null, now)) continue
+      if (activeCalibration) {
+        if (inflightCount > 0) {
+          blockedWindows.add(key)
+          retainedWindows.push(
+            buildRetainedWindow(key, 'inflight', { ou, eu, at, headerSampledAt: extra?.sampled_at || null }),
+          )
+          continue
+        }
+        if (
+          !Number.isFinite(probeStartedAtMs) ||
+          (latestActivityAtMs != null && latestActivityAtMs >= probeStartedAtMs)
+        ) {
+          blockedWindows.add(key)
+          retainedWindows.push(
+            buildRetainedWindow(key, 'newer_headers', { ou, eu, at, headerSampledAt: extra?.sampled_at || null }),
+          )
+          continue
+        }
+      }
       writeHeaderWindow(
         acc,
         key,
         {
-          utilization: officialUtilToExtra(src.utilization),
+          utilization: ou,
           reset: officialReset || null,
           status: src.status || null,
           sampled_at: at,
@@ -1888,9 +2075,111 @@ function syncActiveToPassive(acc, sampledAt, { now = Date.now(), freshWindows = 
       acc.unified.reset_boundaries[key] = { ...acc.unified.reset_boundaries[key], reconciled: true }
       copied = true
       reconciledAny = true
+      calibratedAny = true
+      reconciledWindows.push(key)
       resetReconciledAtMs = maxTimestamp(resetReconciledAtMs, boundaryAtMsOf(acc.unified.reset_boundaries[key]))
       continue
     }
+
+    if (activeCalibration) {
+      if (ou == null) {
+        if (officialReset && extra && !extra.reset) writeHeaderWindow(acc, key, { reset: officialReset }, { now })
+        continue
+      }
+      const hasExtra = Boolean(extra && (extra.utilization != null || extra.status || extra.reset))
+      const extraResetMs = parseResetMs(extra?.reset)
+      const extraElapsed = Number.isFinite(extraResetMs) && extraResetMs <= now
+      const existingSampleMs = existingWindowSampledAtMs(acc.unified, key)
+      const headerSampledIso =
+        extra?.sampled_at || (existingSampleMs != null ? new Date(existingSampleMs).toISOString() : null)
+
+      if (hasExtra && !extraElapsed && extraIsLiveOpen(extra, now) && officialLooksLimited(src)) {
+        blockedWindows.add(key)
+        if (eu !== ou) {
+          retainedWindows.push(
+            buildRetainedWindow(key, 'official_leftover_limit', {
+              ou,
+              eu,
+              at,
+              headerSampledAt: headerSampledIso,
+            }),
+          )
+        }
+        continue
+      }
+      if (inflightCount > 0) {
+        blockedWindows.add(key)
+        if (hasExtra && !extraElapsed && eu !== ou) {
+          retainedWindows.push(buildRetainedWindow(key, 'inflight', { ou, eu, at, headerSampledAt: headerSampledIso }))
+        }
+        continue
+      }
+      if (
+        !Number.isFinite(probeStartedAtMs) ||
+        (latestActivityAtMs != null && latestActivityAtMs >= probeStartedAtMs)
+      ) {
+        blockedWindows.add(key)
+        if (hasExtra && !extraElapsed && eu !== ou) {
+          retainedWindows.push(
+            buildRetainedWindow(key, 'newer_headers', { ou, eu, at, headerSampledAt: headerSampledIso }),
+          )
+        }
+        continue
+      }
+      if (
+        hasExtra &&
+        !extraElapsed &&
+        existingSampleMs != null &&
+        (probeStartedAtMs <= existingSampleMs ||
+          !Number.isFinite(officialUpdatedAtMs) ||
+          officialUpdatedAtMs < existingSampleMs)
+      ) {
+        blockedWindows.add(key)
+        if (eu !== ou) {
+          retainedWindows.push(
+            buildRetainedWindow(key, 'newer_headers', { ou, eu, at, headerSampledAt: headerSampledIso }),
+          )
+        }
+        continue
+      }
+      if (hasExtra && !extraElapsed && extraIsLiveOpen(extra, now) && eu != null && ou <= 0.15 && eu >= 0.4) {
+        const referenceSampleMs = existingSampleMs ?? latestActivityAtMs
+        if (
+          !forceReconcile &&
+          referenceSampleMs != null &&
+          probeStartedAtMs - referenceSampleMs < ACTIVE_CALIBRATION_SETTLE_MS
+        ) {
+          blockedWindows.add(key)
+          if (officialReset && extra && !extra.reset) writeHeaderWindow(acc, key, { reset: officialReset }, { now })
+          retainedWindows.push(
+            buildRetainedWindow(key, 'settle_window', {
+              ou,
+              eu,
+              at,
+              headerSampledAt: headerSampledIso || new Date(referenceSampleMs).toISOString(),
+              settleRemainingMs: ACTIVE_CALIBRATION_SETTLE_MS - (probeStartedAtMs - referenceSampleMs),
+            }),
+          )
+          continue
+        }
+      }
+      writeHeaderWindow(
+        acc,
+        key,
+        {
+          utilization: ou,
+          reset: officialReset || null,
+          status: src.status || null,
+          sampled_at: at,
+        },
+        { now, replace: true },
+      )
+      copied = true
+      calibratedAny = true
+      reconciledWindows.push(key)
+      continue
+    }
+
     if (!shouldCopyOfficialToExtra(src, extra, now)) {
       if (officialReset && extra && !extra.reset) writeHeaderWindow(acc, key, { reset: officialReset }, { now })
       continue
@@ -1907,35 +2196,183 @@ function syncActiveToPassive(acc, sampledAt, { now = Date.now(), freshWindows = 
       { now },
     )
     copied = true
+    reconciledWindows.push(key)
   }
+
   const oiCheck = checks?.['7d_oi'] || null
-  const oi = acc.unified['7d_oi']
-  if ((!oiCheck || oiCheck.allowed) && oi && (oi.utilization != null || oi.status || oi.reset)) {
-    const pendingOi = oiCheck?.pendingReset === true
-    if (pendingOi) {
-      const hasFreshOi =
-        (!freshWindows || freshWindows['7d_oi'] === true) && officialUtilToExtra(oi.utilization) != null
-      if (hasFreshOi) {
-        acc.unified.headers['7d_oi'] = {
-          utilization: officialUtilToExtra(oi.utilization),
-          reset: oi.reset || null,
-          status: oi.status || null,
+  if (activeCalibration) {
+    const incomingOi = incomingWindows?.['7d_oi'] || null
+    const prevOi = acc.unified.headers?.['7d_oi'] || acc.unified['7d_oi'] || null
+    const euOi = prevOi?.utilization != null ? officialUtilToExtra(prevOi.utilization) : null
+    if (oiCheck && !oiCheck.allowed) {
+      blockedWindows.add('7d_oi')
+      const ouBlocked = officialUtilToExtra(incomingOi?.utilization)
+      if (ouBlocked != null && prevOi && euOi !== ouBlocked) {
+        retainedWindows.push(
+          buildRetainedWindow('7d_oi', 'reset_boundary', {
+            ou: ouBlocked,
+            eu: euOi,
+            at,
+            headerSampledAt: prevOi?.sampled_at || null,
+          }),
+        )
+      }
+    } else if (freshWindows?.['7d_oi'] === true && incomingOi) {
+      const ouOi = officialUtilToExtra(incomingOi.utilization)
+      if (ouOi != null) {
+        const hasPrevOi = Boolean(prevOi && (prevOi.utilization != null || prevOi.status || prevOi.reset))
+        const prevOiResetMs = parseResetMs(prevOi?.reset)
+        const prevOiElapsed = Number.isFinite(prevOiResetMs) && prevOiResetMs <= now
+        const existingOiSampleMs = existingWindowSampledAtMs(acc.unified, '7d_oi')
+        const oiHeaderIso =
+          prevOi?.sampled_at || (existingOiSampleMs != null ? new Date(existingOiSampleMs).toISOString() : null)
+        let oiRetainReason = null
+        let oiSettleRem = 0
+        if (hasPrevOi && !prevOiElapsed && extraIsLiveOpen(prevOi, now) && officialLooksLimited(incomingOi)) {
+          oiRetainReason = 'official_leftover_limit'
+        } else if (inflightCount > 0) {
+          oiRetainReason = 'inflight'
+        } else if (
+          !Number.isFinite(probeStartedAtMs) ||
+          (latestActivityAtMs != null && latestActivityAtMs >= probeStartedAtMs)
+        ) {
+          oiRetainReason = 'newer_headers'
+        } else if (
+          hasPrevOi &&
+          !prevOiElapsed &&
+          existingOiSampleMs != null &&
+          (probeStartedAtMs <= existingOiSampleMs ||
+            !Number.isFinite(officialUpdatedAtMs) ||
+            officialUpdatedAtMs < existingOiSampleMs)
+        ) {
+          oiRetainReason = 'newer_headers'
+        } else if (
+          !oiCheck?.pendingReset &&
+          hasPrevOi &&
+          !prevOiElapsed &&
+          extraIsLiveOpen(prevOi, now) &&
+          euOi != null &&
+          ouOi <= 0.15 &&
+          euOi >= 0.4
+        ) {
+          const refOiMs = existingOiSampleMs ?? latestActivityAtMs
+          if (!forceReconcile && refOiMs != null && probeStartedAtMs - refOiMs < ACTIVE_CALIBRATION_SETTLE_MS) {
+            oiRetainReason = 'settle_window'
+            oiSettleRem = ACTIVE_CALIBRATION_SETTLE_MS - (probeStartedAtMs - refOiMs)
+          }
         }
-        acc.unified.reset_boundaries['7d_oi'] = { ...acc.unified.reset_boundaries['7d_oi'], reconciled: true }
+        if (oiRetainReason) {
+          blockedWindows.add('7d_oi')
+          if (hasPrevOi && !prevOiElapsed && euOi !== ouOi) {
+            retainedWindows.push(
+              buildRetainedWindow('7d_oi', oiRetainReason, {
+                ou: ouOi,
+                eu: euOi,
+                at,
+                headerSampledAt: oiHeaderIso,
+                settleRemainingMs: oiSettleRem,
+              }),
+            )
+          }
+        } else {
+          const nextOi = {
+            utilization: ouOi,
+            reset: incomingOi.reset || null,
+            status: incomingOi.status || statusFromUtil(ouOi),
+            sampled_at: at,
+          }
+          acc.unified['7d_oi'] = { ...nextOi }
+          acc.unified.headers['7d_oi'] = { ...nextOi }
+          if (oiCheck?.pendingReset === true) {
+            acc.unified.reset_boundaries['7d_oi'] = { ...acc.unified.reset_boundaries['7d_oi'], reconciled: true }
+            reconciledAny = true
+            resetReconciledAtMs = maxTimestamp(
+              resetReconciledAtMs,
+              boundaryAtMsOf(acc.unified.reset_boundaries['7d_oi']),
+            )
+          }
+          if (acc.unified.fable && !hasFableProbe) {
+            acc.unified.fable = {
+              ...acc.unified.fable,
+              limited: officialLooksLimited(nextOi),
+              utilization: ouOi,
+              reset: nextOi.reset,
+              probed_at: at,
+            }
+          }
+          copied = true
+          calibratedAny = true
+          reconciledWindows.push('7d_oi')
+        }
+      }
+    }
+  } else {
+    const oi = acc.unified['7d_oi']
+    if (
+      (!oiCheck || oiCheck.allowed) &&
+      (!freshWindows || freshWindows['7d_oi'] === true) &&
+      oi &&
+      (oi.utilization != null || oi.status || oi.reset)
+    ) {
+      const pendingOi = oiCheck?.pendingReset === true
+      if (pendingOi) {
+        const hasFreshOi =
+          (!freshWindows || freshWindows['7d_oi'] === true) && officialUtilToExtra(oi.utilization) != null
+        if (hasFreshOi) {
+          acc.unified.headers['7d_oi'] = {
+            utilization: officialUtilToExtra(oi.utilization),
+            reset: oi.reset || null,
+            status: oi.status || null,
+          }
+          acc.unified.reset_boundaries['7d_oi'] = { ...acc.unified.reset_boundaries['7d_oi'], reconciled: true }
+          copied = true
+          reconciledAny = true
+          reconciledWindows.push('7d_oi')
+        }
+      } else {
+        acc.unified.headers['7d_oi'] = {
+          utilization: officialUtilToExtra(oi.utilization) ?? acc.unified.headers['7d_oi']?.utilization ?? null,
+          reset: oi.reset || acc.unified.headers['7d_oi']?.reset || null,
+          status: oi.status || acc.unified.headers['7d_oi']?.status || null,
+        }
         copied = true
-        reconciledAny = true
+        reconciledWindows.push('7d_oi')
       }
-    } else {
-      acc.unified.headers['7d_oi'] = {
-        utilization: officialUtilToExtra(oi.utilization) ?? acc.unified.headers['7d_oi']?.utilization ?? null,
-        reset: oi.reset || acc.unified.headers['7d_oi']?.reset || null,
-        status: oi.status || acc.unified.headers['7d_oi']?.status || null,
-      }
-      copied = true
     }
   }
+
   if (copied) acc.unified.headers.sampled_at = at
-  return { copied, reconciledAny, resetReconciledAtMs }
+  if (activeCalibration && calibratedAny && acc.unified.headers.exhausted_at) {
+    const exhaustedAtMs = parseTimestampMs(acc.unified.headers.exhausted_at)
+    const s5 = String(acc.unified.headers['5h']?.status || '').toLowerCase()
+    const s7 = String(acc.unified.headers['7d']?.status || '').toLowerCase()
+    const stillRejected = s5 === 'rejected' || s5 === 'rate_limited' || s7 === 'rejected' || s7 === 'rate_limited'
+    if (
+      !stillRejected &&
+      (exhaustedAtMs == null || (Number.isFinite(probeStartedAtMs) && exhaustedAtMs < probeStartedAtMs))
+    ) {
+      acc.unified.headers.exhausted_at = null
+    }
+  }
+
+  const canForceReconcile = retainedWindows.length > 0 && retainedWindows.every((w) => w.reason === 'settle_window')
+  const settleRemainingMs = retainedWindows.reduce((max, w) => Math.max(max, Number(w.settle_remaining_ms) || 0), 0)
+  return {
+    copied,
+    reconciledAny,
+    calibratedAny,
+    resetReconciledAtMs,
+    retainedWindows,
+    blockedWindows,
+    calibration: {
+      reconciled: retainedWindows.length === 0,
+      force_reconcile: forceReconcile,
+      reconciled_windows: reconciledWindows,
+      retained_windows: retainedWindows,
+      can_force_reconcile: canForceReconcile,
+      settle_remaining_ms: settleRemainingMs,
+    },
+  }
 }
 
 function lastHeaderAllocation(repo, accountId) {

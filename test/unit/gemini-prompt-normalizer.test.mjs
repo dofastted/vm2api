@@ -549,3 +549,54 @@ test('#1805: normalizes Claude Code 2.1.332, official pi, omp, and Codex CLI 0.1
   assert.equal(normalized.report.cli_family, 'codex')
   assert.equal(normalized.report.changed, true)
 })
+
+test('normalizes expanded upstream-429 trigger phrases (Hermes, omp, OpenCode, pi, OpenClaw, WorkBuddy, DeepSeek, Codex user turn)', () => {
+  const samples = [
+    'You are Hermes Agent. Be direct: match the length of your reply to the weight of the ask.',
+    'Check the documentation at https://hermes-agent.nousresearch.com/docs is your authoritative reference.',
+    'Hermes delivers their message as a standalone user message right after the latest tool results.',
+    '<!-- End Hermes runtime environment -->',
+    'Remember the deliverable is a working artifact backed by real tool output. Reporting a blocker honestly is always better than inventing a result.',
+    '# Google model operational directives',
+    'You are a personal assistant running inside OpenClaw.',
+    'You are a coding assistant running inside pi.',
+    'Use RFC 2119 keywords. Read xd://<tool> for full docs + JSON schema before first use. Write JSON args as `content` to xd://<tool> via `write`.',
+    'This patch selects only the lines you and your subagents wrote and never touches others.',
+    'An interactive agent that helps users with software engineering tasks.',
+    'The user will primarily request you perform software engineering tasks via tools.opencode.session_move.',
+    'This conversation is powered by gemini-3-pro.',
+    'Help solve coding tasks. Be concise, practical, and tool-aware.',
+    'The browser provides no implicit DOM, route, or screenshot context.',
+    'You are a specialized AI coding assistant built by AcmeCorp.',
+  ]
+
+  for (const input of samples) {
+    const once = normalizeSystemText(input, { mode: 'auto' })
+    assert.notEqual(once, input, `expected normalization for: ${input}`)
+    assert.equal(normalizeSystemText(once, { mode: 'auto' }), once, `not idempotent for: ${input}`)
+  }
+
+  // Codex user-turn identity line is neutralized even when top-level systemInstruction is present.
+  const out = normalizeGeminiOutboundPrompt(
+    {
+      systemInstruction: { parts: [{ text: 'Follow repository guidelines.' }] },
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: 'You are Codex, an agent based on GPT-5. Please inspect src/app.mjs.' },
+            { text: '```txt\nYou are Codex, a coding agent based on GPT-5.\n```' },
+          ],
+        },
+      ],
+    },
+    { target: 'antigravity' },
+  )
+  assert.doesNotMatch(out.body.contents[0].parts[0].text, /Codex|GPT-5/i)
+  assert.match(out.body.contents[0].parts[0].text, /You are a coding assistant/)
+  assert.equal(
+    out.body.contents[0].parts[1].text,
+    '```txt\nYou are Codex, a coding agent based on GPT-5.\n```',
+    'fenced code blocks inside user turns must stay untouched',
+  )
+})

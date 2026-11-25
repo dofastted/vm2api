@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -436,5 +437,245 @@ with patch.object(impl, "native_module", return_value=SimpleNamespace(worker_jso
         "idle_ttl_secs": 90,
     }
 
+# 5. License status stat-fingerprinted caching, invalidation, and Google 429 error parsing.
+import time as _time
+
+with tempfile.TemporaryDirectory(prefix="gemini-host-lic-cache-") as lic_tmp:
+    lic_root = Path(lic_tmp)
+    env_id = "gemini-444444444444444444444444"
+    lic_dir = lic_root / env_id / "crag-license"
+    host_dir = lic_root / "crag-host"
+    lic_dir.mkdir(parents=True)
+    host_dir.mkdir(parents=True)
+    reg_file = lic_dir / "registration.code"
+    reg_file.write_text("CRAGS1.v1", encoding="utf-8")
+
+    ch = impl.Host.__new__(impl.Host)
+    ch.directory = lic_root
+    ch.crag_host_dir = host_dir
+    ch.payload_mode = "crag_subscription"
+    ch.verified_payload = "v1"
+    ch.lock = _th.RLock()
+    ch.environments = {
+        env_id: {
+            "id": env_id,
+            "name": "Cache Env",
+            "proxy_id": "px-1",
+            "slot": 0,
+            "auth_method": "oauth",
+            "auth_state": "authorized",
+            "account": {"state": "ok"},
+        }
+    }
+    ch.native_sessions = {}
+    ch.daemon_shards = {}
+    ch._account_shard_map = {}
+    ch.active_infers = {}
+    ch.last_inference = {}
+    ch.runtime_policy = dict(impl.DEFAULT_RUNTIME_POLICY)
+    ch.payload_state = "installed"
+    ch.payload_issue = None
+    ch.payload_version = "0.4.10"
+    ch.inspect_payload = lambda: None
+    ch.oauth_runtime_issue = lambda: None
+    ch._profile_credential_health = lambda _env: None
+    ch.last_inference_view = lambda _env: {}
+
+    cli_calls = [0]
+
+    def fake_cli(_env, _args, input_code=None):
+        cli_calls[0] += 1
+        return {"status": "valid", "valid": True, "seat": 1, "expires_at": int(_time.time()) + 3600}
+
+    ch.run_craggemini_license_cli = fake_cli
+    res1 = ch.request("list", {})
+    res2 = ch.request("list", {})
+    assert cli_calls[0] == 1, f"expected cached license_status hit, got {cli_calls[0]} CLI calls"
+    assert res1["environments"][0]["crag_license"]["valid"] is True
+    assert res2["environments"][0]["crag_license"]["valid"] is True
+
+    # Modifying registration.code changes lstat fingerprint and triggers fresh verification.
+    reg_file.write_text("CRAGS1.v2-longer", encoding="utf-8")
+    ch.request("list", {})
+    assert cli_calls[0] == 2, f"expected cache invalidation on stat change, got {cli_calls[0]}"
+
+    # Google JSON 429 parsing (quotaResetDelay, reason, and content_rejected).
+    ms, reason, rejected = impl.Host._parse_google_quota_error(
+        {
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{"reason": "QUOTA_EXHAUSTED", "metadata": {"quotaResetDelay": "1m15s"}}],
+            }
+        }
+    )
+    assert (ms, reason, rejected) == (75_000, "QUOTA_EXHAUSTED", False)
+
+    ms2, reason2, rejected2 = impl.Host._parse_google_quota_error(
+        {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Resource exhausted"}}
+    )
+    assert (ms2, reason2, rejected2) == (None, None, True)
+
+# 6. Native body control-char regex fast path & Unix HTTP/1.1 keep-alive connection pool reuse.
+clean_body = {"contents": [{"role": "user", "parts": [{"text": "hello\tworld\nline2"}]}]}
+extracted = impl.Host._extract_native_turn_body("gemini-3-pro", clean_body)
+assert extracted is not None and extracted["contents"][0]["parts"][0]["text"] == "hello\tworld\nline2"
+assert impl.Host._extract_native_turn_body(
+    "gemini-3-pro", {"contents": [{"role": "user", "parts": [{"text": "bad\x07bell"}]}]}
+) is None
+
+import socket as _sock
+
+with patch.object(impl, "check_root_owned"):
+    native_mod = impl.native_module()
+with tempfile.TemporaryDirectory(prefix="gemini-keepalive-") as ka_tmp:
+    sock_path = str(Path(ka_tmp) / "kernel.sock")
+    accepted = [0]
+    served = [0]
+    stop_ka = _th.Event()
+    srv = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+    srv.bind(sock_path)
+    srv.listen(4)
+    srv.settimeout(0.5)
+
+    def _serve_keepalive():
+        body = b'{"ready":true,"native_pid":42}'
+        resp = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Connection: keep-alive\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+            + body
+        )
+        while not stop_ka.is_set():
+            try:
+                conn, _ = srv.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            accepted[0] += 1
+            conn.settimeout(1.0)
+            try:
+                while not stop_ka.is_set():
+                    data = conn.recv(4096)
+                    if not data:
+                        break
+                    served[0] += 1
+                    conn.sendall(resp)
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    t = _th.Thread(target=_serve_keepalive, daemon=True)
+    t.start()
+    try:
+        tok = "a" * 32
+        r1 = native_mod.worker_status(sock_path, tok, timeout=1.0)
+        r2 = native_mod.worker_status(sock_path, tok, timeout=1.0)
+        assert r1 == {"ready": True, "native_pid": 42}
+        assert r2 == {"ready": True, "native_pid": 42}
+        assert served[0] == 2
+        assert accepted[0] == 1, f"expected keep-alive socket reuse (1 accept), got {accepted[0]}"
+    finally:
+        stop_ka.set()
+        srv.close()
+        t.join(timeout=2.0)
+
+# 7. P2-A & P2-B: crag_subscription CragDaemonShard per-account license staging/sync + /infer-target.
+with tempfile.TemporaryDirectory(prefix="gemini-p2-shard-") as p2_tmp:
+    p2_root = Path(p2_tmp)
+    env_a_id, env_a = make_env(10)
+    env_b_id, env_b = make_env(11)
+    for eid, code_val in ((env_a_id, "CRAGS1.seat-a"), (env_b_id, "CRAGS1.seat-b")):
+        ldir = p2_root / eid / "crag-license"
+        ldir.mkdir(parents=True)
+        (ldir / "device.json").write_text('{"device_id":"dev-1"}', encoding="utf-8")
+        (ldir / "registration.code").write_text(code_val, encoding="utf-8")
+
+    sh_sub = impl.CragDaemonShard.__new__(impl.CragDaemonShard)
+    sh_sub._lock = _th.RLock()
+    sh_sub.uid = os.getuid()
+    sh_sub.policy = dict(impl.DEFAULT_RUNTIME_POLICY)
+    sh_sub.accounts_root = p2_root / "_shards" / "shard-0" / "accounts"
+    sh_sub.host = SimpleNamespace(
+        directory=p2_root,
+        payload_mode="crag_subscription",
+    )
+    sh_sub.members = {env_a_id: {}, env_b_id: {}}
+
+    with patch.object(impl.os, "chown"):
+        sh_sub._sync_account_license_files(env_a)
+        sh_sub._sync_account_license_files(env_b)
+    staged_a = sh_sub.accounts_root / env_a_id / "crag-license"
+    staged_b = sh_sub.accounts_root / env_b_id / "crag-license"
+    assert (staged_a / "registration.code").read_text(encoding="utf-8") == "CRAGS1.seat-a"
+    assert (staged_b / "registration.code").read_text(encoding="utf-8") == "CRAGS1.seat-b"
+
+    binding_a = sh_sub._account_binding_payload(env_a, PROXY, "gemini-3-pro")
+    assert binding_a["vm_id"] == env_a_id
+    assert binding_a["license_dir"] == f"/accounts/{env_a_id}/crag-license"
+
+    # Clearing host registration.code for env_a removes ONLY env_a's staged permit; env_b stays intact.
+    (p2_root / env_a_id / "crag-license" / "registration.code").unlink()
+    with patch.object(impl.os, "chown"):
+        sh_sub.sync_account_license(env_a)
+    assert not (staged_a / "registration.code").exists()
+    assert (staged_b / "registration.code").read_text(encoding="utf-8") == "CRAGS1.seat-b"
+
+    # /infer-target returns direct=True with Unix socket target for warm sharded account.
+    sock_file = p2_root / "kernel.sock"
+    direct_srv = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+    direct_srv.bind(str(sock_file))
+    direct_srv.listen(2)
+    try:
+        p2_host = impl.Host.__new__(impl.Host)
+        p2_host.directory = p2_root
+        p2_host.payload_mode = "crag_subscription"
+        p2_host.payload_version = "0.4.10"
+        p2_host.lock = _th.RLock()
+        p2_host.environments = {env_a_id: env_a}
+        p2_host.runtime_policy = dict(impl.DEFAULT_RUNTIME_POLICY)
+        p2_host.daemon_shards = {}
+        p2_host.native_sessions = {}
+        p2_host._account_shard_map = {}
+        p2_host.active_infers = {}
+        p2_host.runs = {}
+        p2_host.terminals = {}
+        p2_host.pending = {}
+        p2_host.gateway_gid = None
+        p2_host.socket_path = None
+        p2_host.operation_account = lambda env, **kw: (os.getuid(), None, (("tok",), b"{}"))
+
+        warm_shard = SimpleNamespace(
+            uid=os.getuid(),
+            socket_path=str(sock_file),
+            native_token="t" * 40,
+            attempt="epoch-direct-1",
+            _ever_ready=True,
+            is_alive=lambda: True,
+            is_severely_unhealthy=lambda: False,
+        )
+        p2_host._acquire_shard_for_account = lambda ctx: (warm_shard, "shard-0")
+
+        target_info = p2_host.request(
+            "infer-target",
+            {
+                "id": env_a_id,
+                "proxy_id": "px-1",
+                "proxy_url": PROXY,
+                "model": "gemini-3-pro",
+            },
+        )
+        assert target_info["direct"] is True
+        assert target_info["kind"] == "shard"
+        assert target_info["socket_path"] == str(sock_file)
+        assert target_info["token"] == "t" * 40
+        assert target_info["message_path"] == f"/internal/v1/accounts/{env_a_id}/messages"
+        assert target_info["cancel_path"] == f"/internal/v1/accounts/{env_a_id}/cancel"
+        assert target_info["account_id"] == env_a_id
+    finally:
+        direct_srv.close()
 
 print("OK")

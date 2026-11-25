@@ -241,11 +241,11 @@ export async function fetchLatestRelease({
   cacheMs = DEFAULT_CACHE_MS,
 } = {}) {
   const ts = now()
-  if (releaseCache.value && ts - releaseCache.at < cacheMs) {
-    return { release: releaseCache.value, error: releaseCache.error, cached: true }
+  if (releaseCache.value && !releaseCache.error && ts - releaseCache.at < cacheMs) {
+    return { release: releaseCache.value, error: null, cached: true }
   }
   if (!fetchImpl) {
-    releaseCache.at = ts
+    releaseCache.at = 0
     releaseCache.error = 'fetch_unavailable'
     return { release: releaseCache.value, error: 'fetch_unavailable', cached: false }
   }
@@ -256,14 +256,14 @@ export async function fetchLatestRelease({
     })
     if (!res.ok) {
       const error = `github_http_${res.status}`
-      releaseCache.at = ts
+      releaseCache.at = 0
       releaseCache.error = error
       return { release: releaseCache.value, error, cached: false }
     }
     const release = publicRelease(await res.json())
     if (!release) {
       const error = 'github_empty'
-      releaseCache.at = ts
+      releaseCache.at = 0
       releaseCache.error = error
       return { release: releaseCache.value, error, cached: false }
     }
@@ -273,7 +273,7 @@ export async function fetchLatestRelease({
     return { release, error: null, cached: false }
   } catch (err) {
     const error = String(err?.message || err || 'github_unreachable')
-    releaseCache.at = ts
+    releaseCache.at = 0
     releaseCache.error = error
     return { release: releaseCache.value, error, cached: false }
   }

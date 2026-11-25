@@ -273,6 +273,50 @@ export type QuotaObservation = {
   stale: boolean
 }
 
+export type ActiveUsageRetentionReason =
+  | 'settle_window'
+  | 'inflight'
+  | 'newer_headers'
+  | 'reset_boundary'
+  | 'official_leftover_limit'
+
+export type ActiveUsageRetainedWindow = {
+  window: '5h' | '7d' | '7d_oi'
+  reason: ActiveUsageRetentionReason
+  official_utilization: number | null
+  retained_utilization: number | null
+  official_updated_at: string | null
+  header_sampled_at: string | null
+  settle_remaining_ms: number
+}
+
+export type ActiveUsageQueryResult = {
+  vm_id: string
+  source: string
+  probed_at?: string | null
+  five_hour?: {
+    utilization?: number | null
+    status?: string | null
+    resets_at?: string | null
+  } | null
+  seven_day?: {
+    utilization?: number | null
+    status?: string | null
+    resets_at?: string | null
+  } | null
+  seven_day_oi?: {
+    utilization?: number | null
+    status?: string | null
+    resets_at?: string | null
+  } | null
+  reconciled?: boolean
+  force_reconcile?: boolean
+  reconciled_windows?: Array<'5h' | '7d' | '7d_oi'>
+  retained_windows?: ActiveUsageRetainedWindow[]
+  can_force_reconcile?: boolean
+  settle_remaining_ms?: number
+}
+
 export type Vm = {
   id: string
   gemini?: GeminiEnvironment

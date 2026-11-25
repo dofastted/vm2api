@@ -953,7 +953,11 @@ test('auto-binds CRAGGemini seats on create, panel inventory reconcile, and sche
   assert.equal(responses.pop().status, 200)
 
   // 2. Creating an OAuth env auto-binds seat #1 immediately
-  await panel({ method: 'POST', body: { name: 'Fresh OAuth', proxy_id: 'px-1' } }, res, '/api/panel/gemini/environments')
+  await panel(
+    { method: 'POST', body: { name: 'Fresh OAuth', proxy_id: 'px-1' } },
+    res,
+    '/api/panel/gemini/environments',
+  )
   const createdOAuth = responses.pop()
   assert.equal(createdOAuth.status, 200)
   assert.equal(createdOAuth.payload.data.crag_license.valid, true)
@@ -1158,4 +1162,469 @@ test('createGeminiCragSubscription defaults to https://www.vm2api.org/gemini and
   assert.equal(r2.status, 400)
   assert.equal(r2.payload.error.code, 'payload_key_unknown')
   assert.equal(fs.existsSync(path.join(dataDir, 'crag-gemini-subscription', 'public', 'sync-pending')), false)
+})
+
+test('verifyCragGeminiSlotPermit classifies payload_key_id drift as license_payload_key_mismatch', () => {
+  const authority = makeAuthority()
+  const now = Math.floor(Date.now() / 1000)
+  const hostId = 'a'.repeat(64)
+  const permit = signToken(authority, 'CRAGS1', {
+    version: 1,
+    product: CRAG_GEMINI_PRODUCT,
+    host_id: hostId,
+    seat: 1,
+    vm_id: 'gemini-key-drift',
+    machine_id_hash: 'b'.repeat(64),
+    device_public_key: crypto.randomBytes(32).toString('base64url'),
+    payload_key_id: 'c'.repeat(64),
+    wrapped_key: {
+      ephemeral_public_key: crypto.randomBytes(32).toString('base64url'),
+      nonce: crypto.randomBytes(12).toString('base64url'),
+      ciphertext: crypto.randomBytes(32).toString('base64url'),
+      tag: crypto.randomBytes(16).toString('base64url'),
+    },
+  })
+  const entitlementClaims = {
+    version: 2,
+    product: CRAG_GEMINI_PRODUCT,
+    host_id: hostId,
+    revision: 1,
+    issued_at: now - 10,
+    expires_at: now + 3600,
+    slot_limit: 5,
+    roster: [{ seat: 1, permit_sha256: crypto.createHash('sha256').update(permit).digest('hex') }],
+  }
+  assert.throws(
+    () =>
+      verifyCragGeminiSlotPermit(permit, entitlementClaims, authority.publicKey, {
+        expectedHostId: hostId,
+        expectedVmId: 'gemini-key-drift',
+        expectedPayloadKeyId: authority.payloadKeyId,
+        now,
+      }),
+    { code: 'license_payload_key_mismatch' },
+  )
+})
+
+test('bindEnvironment retries with reissue: true on payload_key_conflict/host_binding_conflict and auto-heals recoverable license states', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-reissue-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const now = Math.floor(Date.now() / 1000)
+  const machineIdPath = path.join(root, 'machine-id')
+  fs.writeFileSync(machineIdPath, '44444444444444444444444444444444\n')
+  const dataDir = path.join(root, 'data')
+
+  const envs = new Map([
+    [
+      'gemini-drift',
+      {
+        id: 'gemini-drift',
+        name: 'Payload Drift',
+        proxy_id: 'px-1',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        models_discovered: true,
+        models: ['gemini-3-pro'],
+        crag_license: {
+          product: CRAG_GEMINI_PRODUCT,
+          status: 'invalid',
+          valid: false,
+          seat_required: true,
+          code: 'license_payload_key_mismatch',
+        },
+      },
+    ],
+    [
+      'gemini-binding',
+      {
+        id: 'gemini-binding',
+        name: 'Device Drift',
+        proxy_id: 'px-1',
+        auth_state: 'authorized',
+        auth_method: 'oauth',
+        models_discovered: true,
+        models: ['gemini-3-pro'],
+        crag_license: {
+          product: CRAG_GEMINI_PRODUCT,
+          status: 'invalid',
+          valid: false,
+          seat_required: true,
+          code: 'license_binding_mismatch',
+        },
+      },
+    ],
+  ])
+
+  const bindRequests = []
+  let revision = 1
+  const roster = []
+  const fetchImpl = async (url, options) => {
+    const body = JSON.parse(options.body)
+    if (String(url).endsWith('/redeem')) {
+      const ent = signToken(authority, 'CRAGH2', {
+        version: 2,
+        product: CRAG_GEMINI_PRODUCT,
+        host_id: body.host_id,
+        revision,
+        issued_at: now - 10,
+        expires_at: now + 86400,
+        slot_limit: 5,
+        roster: [],
+      })
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map(),
+        async json() {
+          return { ok: true, data: { entitlement: ent, slot_limit: 5, used_slots: 0, available_slots: 5 } }
+        },
+      }
+    }
+    if (String(url).endsWith('/bind')) {
+      bindRequests.push(body)
+      const parsed = parseCragGeminiMachineCode(body.machine_code)
+      if (!body.reissue) {
+        const conflict = parsed.vm_id === 'gemini-drift' ? 'payload_key_conflict' : 'host_binding_conflict'
+        return {
+          ok: false,
+          status: 409,
+          headers: new Map(),
+          async json() {
+            return { ok: false, error: { code: conflict } }
+          },
+        }
+      }
+      const seat = parsed.vm_id === 'gemini-drift' ? 1 : 2
+      const permit = signToken(authority, 'CRAGS1', {
+        version: 1,
+        product: CRAG_GEMINI_PRODUCT,
+        host_id: body.host_id,
+        seat,
+        vm_id: parsed.vm_id,
+        machine_id_hash: parsed.machine_id_hash,
+        device_public_key: parsed.device_public_key,
+        payload_key_id: authority.payloadKeyId,
+        wrapped_key: {
+          ephemeral_public_key: crypto.randomBytes(32).toString('base64url'),
+          nonce: crypto.randomBytes(12).toString('base64url'),
+          ciphertext: crypto.randomBytes(32).toString('base64url'),
+          tag: crypto.randomBytes(16).toString('base64url'),
+        },
+      })
+      const sha = crypto.createHash('sha256').update(permit).digest('hex')
+      roster.push({ seat, permit_sha256: sha })
+      roster.sort((a, b) => a.seat - b.seat)
+      revision += 1
+      const ent = signToken(authority, 'CRAGH2', {
+        version: 2,
+        product: CRAG_GEMINI_PRODUCT,
+        host_id: body.host_id,
+        revision,
+        issued_at: now - 10,
+        expires_at: now + 86400,
+        slot_limit: 5,
+        roster,
+      })
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map(),
+        async json() {
+          return { ok: true, data: { seat, slot_permit: permit, entitlement: ent } }
+        },
+      }
+    }
+    throw new Error(`unexpected url ${url}`)
+  }
+
+  const callHost = async (op, payload) => {
+    if (op === 'list') {
+      return {
+        payload_state: 'installed',
+        payload_mode: 'crag_subscription',
+        environments: [...envs.values()],
+      }
+    }
+    if (op === 'get') return envs.get(payload.id)
+    if (op === 'license-machine-code') {
+      return { machine_code: makeMachineCode(payload.id).machine_code }
+    }
+    if (op === 'license-activate') {
+      const env = envs.get(payload.id)
+      env.crag_license = {
+        product: CRAG_GEMINI_PRODUCT,
+        status: 'valid',
+        valid: true,
+        seat_required: true,
+        scope: 'host',
+        seat: payload.id === 'gemini-drift' ? 1 : 2,
+      }
+      return env.crag_license
+    }
+    return {}
+  }
+
+  const sub = createGeminiCragSubscription({
+    projectRoot: root,
+    dataDir,
+    resolveAuthority: () => ({
+      publicKey: authority.publicKey,
+      issuerId: authority.issuerId,
+      payloadKeyId: authority.payloadKeyId,
+    }),
+    callHost,
+    fetchImpl,
+    machineIdFile: machineIdPath,
+  })
+  const panel = createGeminiPanelHandler({
+    json: (_res, status, payload) => ({ status, payload }),
+    readBody: async (req) => req.body,
+    cragSubscription: sub,
+    callHost,
+  })
+  const res = { setHeader() {} }
+  const voucher = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
+  const redeemed = await panel(
+    { method: 'POST', body: { redemption_code: voucher } },
+    res,
+    '/api/panel/gemini/crag-subscription/redeem',
+  )
+  assert.equal(redeemed.status, 200)
+  assert.equal(redeemed.payload.data.active, true)
+  const listed = await panel({ method: 'GET', url: '/api/panel/gemini' }, res, '/api/panel/gemini')
+  assert.equal(listed.status, 200)
+  assert.equal(listed.payload.data.crag_subscription.used_slots, 2)
+  assert.equal(envs.get('gemini-drift').crag_license.valid, true)
+  assert.equal(envs.get('gemini-binding').crag_license.valid, true)
+  assert.equal(bindRequests.length, 4)
+  assert.equal(bindRequests[0].reissue, undefined)
+  assert.equal(bindRequests[1].reissue, true)
+  assert.equal(bindRequests[2].reissue, undefined)
+  assert.equal(bindRequests[3].reissue, true)
+})
+
+test('recover(), POST /crag-subscription/sync, and refreshExpiredEntitlement() clear stuck sync-pending and refresh stacked expiry', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-recover-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const now = Math.floor(Date.now() / 1000)
+  const machineIdPath = path.join(root, 'machine-id')
+  fs.writeFileSync(machineIdPath, '55555555555555555555555555555555\n')
+  const dataDir = path.join(root, 'data')
+  const publicDir = path.join(dataDir, 'crag-gemini-subscription', 'public')
+
+  let remoteRevision = 1
+  let remoteExpiresAt = now - 60
+  let statusCalls = 0
+  const fetchImpl = async (url, options) => {
+    const body = JSON.parse(options.body)
+    if (String(url).endsWith('/redeem') || String(url).endsWith('/status')) {
+      if (String(url).endsWith('/status')) statusCalls += 1
+      const ent = signToken(authority, 'CRAGH2', {
+        version: 2,
+        product: CRAG_GEMINI_PRODUCT,
+        host_id: body.host_id,
+        revision: remoteRevision,
+        issued_at: now - 3600,
+        expires_at: remoteExpiresAt,
+        slot_limit: 10,
+        roster: [],
+      })
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map(),
+        async json() {
+          return { ok: true, data: { entitlement: ent, slot_limit: 10, used_slots: 0, available_slots: 10 } }
+        },
+      }
+    }
+    throw new Error(`unexpected url ${url}`)
+  }
+
+  const sub = createGeminiCragSubscription({
+    projectRoot: root,
+    dataDir,
+    resolveAuthority: () => ({
+      publicKey: authority.publicKey,
+      issuerId: authority.issuerId,
+      payloadKeyId: authority.payloadKeyId,
+    }),
+    callHost: async () => ({ payload_state: 'installed', payload_mode: 'crag_subscription', environments: [] }),
+    fetchImpl,
+    machineIdFile: machineIdPath,
+  })
+  const voucher = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
+  await sub.redeem(voucher)
+
+  // Simulate stacked voucher expiry rollover: local entitlement expired, remote now serves next grant.
+  remoteRevision = 2
+  remoteExpiresAt = now + 86400
+  const refreshed = await sub.refreshExpiredEntitlement()
+  assert.equal(refreshed.refreshed, true)
+  assert.equal(refreshed.status.active, true)
+  assert.equal(refreshed.status.revision, 2)
+
+  // Simulate leftover sync-pending marker from interrupted authority request.
+  fs.writeFileSync(path.join(publicDir, 'sync-pending'), 'pending\n')
+  assert.equal(sub.hasSyncPending(), true)
+  assert.equal((await sub.status()).active, false)
+  assert.equal((await sub.status()).sync_pending, true)
+
+  const panel = createGeminiPanelHandler({
+    json: (_res, status, payload) => ({ status, payload }),
+    readBody: async (req) => req.body,
+    cragSubscription: sub,
+    callHost: async () => ({ payload_state: 'installed', payload_mode: 'crag_subscription', environments: [] }),
+  })
+  const res = { setHeader() {} }
+  const synced = await panel(
+    { method: 'POST', url: '/api/panel/gemini/crag-subscription/sync' },
+    res,
+    '/api/panel/gemini/crag-subscription/sync',
+  )
+  assert.equal(synced.status, 200)
+  assert.equal(synced.payload.data.sync_pending, false)
+  assert.equal(synced.payload.data.active, true)
+  assert.equal(sub.hasSyncPending(), false)
+  assert.ok(statusCalls >= 2)
+})
+
+test('createGeminiCragSubscription.recover() reconciles stale sync-pending and auto-rebinds license_binding_mismatch', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-recover-mismatch-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const now = Math.floor(Date.now() / 1000)
+  const machineIdPath = path.join(root, 'machine-id')
+  fs.writeFileSync(machineIdPath, '44444444444444444444444444444444\n')
+
+  let revision = 1
+  const seatMap = new Map()
+  const buildH2 = (hostId) => {
+    const roster = [...seatMap.values()]
+      .sort((a, b) => a.seat - b.seat)
+      .map(({ seat, permitSha }) => ({ seat, permit_sha256: permitSha }))
+    return {
+      entitlement: signToken(authority, 'CRAGH2', {
+        version: 2,
+        product: CRAG_GEMINI_PRODUCT,
+        host_id: hostId,
+        revision,
+        issued_at: now - 60,
+        expires_at: now + 86400,
+        slot_limit: 5,
+        roster,
+      }),
+      revision,
+      slot_limit: 5,
+      used_slots: roster.length,
+      available_slots: 5 - roster.length,
+    }
+  }
+
+  let failRedeemOnce = false
+  const fetchImpl = async (url, options) => {
+    const action = url.split('/').pop()
+    const body = JSON.parse(options.body)
+    if (action === 'redeem') {
+      revision += 1
+      if (failRedeemOnce) {
+        failRedeemOnce = false
+        throw new Error('simulated network drop after authority commit')
+      }
+      return new Response(JSON.stringify({ ok: true, data: buildH2(body.host_id) }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    if (action === 'status') {
+      return new Response(JSON.stringify({ ok: true, data: buildH2(body.host_id) }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    if (action === 'bind') {
+      const identity = parseCragGeminiMachineCode(body.machine_code)
+      const seat = seatMap.size + 1
+      const permit = issuePermit(authority, body.machine_code, body.host_id, seat)
+      seatMap.set(identity.vm_id, { seat, permitCode: permit.code, permitSha: permit.permit_sha256 })
+      revision += 1
+      const h2 = buildH2(body.host_id)
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          data: { entitlement: h2.entitlement, slot_permit: permit.code, seat },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    throw new Error(`unexpected action: ${action}`)
+  }
+
+  const machine = makeMachineCode('gemini-mismatch-1')
+  let activatedCode = null
+  const callHost = async (op, body) => {
+    if (op === 'get') {
+      return {
+        id: 'gemini-mismatch-1',
+        auth_method: 'oauth',
+        auth_state: 'authorized',
+        payload_mode: 'crag_subscription',
+        crag_license: activatedCode
+          ? { valid: true, seat: 1, seat_required: true }
+          : { valid: false, seat_required: true, code: 'license_binding_mismatch' },
+      }
+    }
+    if (op === 'license-machine-code') return { machine_code: machine.machine_code, vm_id: 'gemini-mismatch-1' }
+    if (op === 'license-activate') {
+      activatedCode = body.code
+      return { valid: true, seat: 1, seat_required: true }
+    }
+    throw new Error(`unexpected op: ${op}`)
+  }
+
+  const sub = createGeminiCragSubscription({
+    projectRoot: root,
+    dataDir: path.join(root, 'data'),
+    resolveAuthority: () => ({
+      product: CRAG_GEMINI_PRODUCT,
+      publicKey: authority.publicKey,
+      publicKeyBytes: authority.publicBytes,
+      issuerId: authority.issuerId,
+      payloadKeyId: authority.payloadKeyId,
+    }),
+    callHost,
+    fetchImpl,
+    origin: 'http://127.0.0.1:18790',
+    machineIdFile: machineIdPath,
+  })
+
+  // 1. Simulate redeem transport failure leaving sync-pending on disk.
+  failRedeemOnce = true
+  const voucher = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
+  await assert.rejects(() => sub.redeem(voucher), { code: 'gemini_subscription_authority_unavailable' })
+  assert.equal(sub.hasSyncPending(), true)
+
+  // 2. recover() reconciles with authority status, writes entitlement.code, and removes sync-pending.
+  const rec = await sub.recover()
+  assert.equal(rec.recovered, true)
+  assert.equal(sub.hasSyncPending(), false)
+  assert.equal(rec.status.active, true)
+
+  // 3. Reconcile auto-rebinds an environment stuck in license_binding_mismatch.
+  const res = await sub.reconcileEnvironmentSeats(
+    [
+      {
+        id: 'gemini-mismatch-1',
+        auth_method: 'oauth',
+        auth_state: 'authorized',
+        payload_mode: 'crag_subscription',
+        crag_license: { valid: false, seat_required: true, code: 'license_binding_mismatch' },
+      },
+    ],
+    { payloadMode: 'crag_subscription' },
+  )
+  assert.deepEqual(res.boundIds, ['gemini-mismatch-1'])
+  assert.ok(activatedCode?.startsWith('CRAGS1.'))
 })

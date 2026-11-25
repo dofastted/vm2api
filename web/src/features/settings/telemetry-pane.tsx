@@ -7,11 +7,13 @@ import {
 } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import type { Vm, VmSeedSettings } from '@/types/panel-vm'
-import { ArrowRight, ChevronRight, RefreshCw } from 'lucide-react'
+import { ArrowRight, ChevronRight, RefreshCw, RotateCcw } from 'lucide-react'
 import { toast } from 'sonner'
 import { api, isApiError } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { isCodexVm, slotNameLabel } from '@/lib/vm-kind'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
@@ -26,9 +28,11 @@ import {
 import {
   amountIn,
   intervalLabel,
+  isExactInUnit,
   secondsFrom,
   unitBounds,
   unitOf,
+  UPLOAD_INTERVAL_DEFAULT,
   UPLOAD_INTERVAL_PRESETS,
   type IntervalUnit,
 } from '@/features/settings/telemetry-interval'
@@ -190,29 +194,47 @@ function IntervalSetting({
   onChange: (seconds: number) => void
 }) {
   const [unit, setUnit] = useState<IntervalUnit>(() => unitOf(value))
+  const [prevValue, setPrevValue] = useState(value)
+  if (value !== prevValue) {
+    setPrevValue(value)
+    if (!isExactInUnit(value, unit)) {
+      setUnit(unitOf(value))
+    }
+  }
   const [min, max] = unitBounds(unit)
+  const exact = isExactInUnit(value, unit)
   const switchUnit = (next: IntervalUnit) => {
     setUnit(next)
-    const seconds = secondsFrom(amountIn(value, next), next)
-    if (seconds !== value) onChange(seconds)
+  }
+  const resetToDefault = () => {
+    setUnit(unitOf(UPLOAD_INTERVAL_DEFAULT))
+    if (value !== UPLOAD_INTERVAL_DEFAULT) onChange(UPLOAD_INTERVAL_DEFAULT)
   }
   return (
-    <div className='space-y-3 border-t border-[var(--hairline)] pt-4'>
+    <div className='space-y-3'>
       <StepperSetting
         id='telemetry-upload-interval'
         label='上传间隔'
         desc={
           <>
             仅适用
-            cli-node：有待发事件时才合批，缺有效凭证或当前出口信息时暂停上传。
+            cli-node：有待发事件时才合批，缺有效凭证或当前出口信息时暂停上传。默认{' '}
+            {intervalLabel(UPLOAD_INTERVAL_DEFAULT)}。
           </>
         }
         value={amountIn(value, unit)}
         min={min}
         max={max}
         unit={unit === 'hour' ? '小时' : '分钟'}
+        fallback={unit === 'min' ? UPLOAD_INTERVAL_DEFAULT / 60 : undefined}
         onChange={(amount) => onChange(secondsFrom(amount, unit))}
       />
+      {!exact ? (
+        <p className='text-xs text-muted-foreground'>
+          当前实际间隔为 {intervalLabel(value)}
+          （非整小时）；仅切换单位不会改动配置，调整数值后按小时换算生效。
+        </p>
+      ) : null}
       <div className='flex flex-wrap items-center justify-between gap-x-4 gap-y-2'>
         <ChipGroup
           label='常用间隔'
@@ -223,15 +245,30 @@ function IntervalSetting({
             onChange(seconds)
           }}
         />
-        <ChipGroup<IntervalUnit>
-          label='单位'
-          value={unit}
-          options={[
-            ['min', '分钟'],
-            ['hour', '小时'],
-          ]}
-          onChange={switchUnit}
-        />
+        <div className='flex flex-wrap items-center gap-2'>
+          {unit === 'hour' && value !== UPLOAD_INTERVAL_DEFAULT ? (
+            <Button
+              type='button'
+              size='sm'
+              variant='ghost'
+              className='h-7 cursor-pointer gap-1 px-1.5 text-[11px] text-muted-foreground'
+              onClick={resetToDefault}
+              title={`恢复默认 ${intervalLabel(UPLOAD_INTERVAL_DEFAULT)}`}
+            >
+              <RotateCcw className='size-3' aria-hidden />
+              默认 {intervalLabel(UPLOAD_INTERVAL_DEFAULT)}
+            </Button>
+          ) : null}
+          <ChipGroup<IntervalUnit>
+            label='单位'
+            value={unit}
+            options={[
+              ['min', '分钟'],
+              ['hour', '小时'],
+            ]}
+            onChange={switchUnit}
+          />
+        </div>
       </div>
     </div>
   )
@@ -365,6 +402,12 @@ export function TelemetryPane({
   const pendingRemote = pendingTargets.filter((vm) => vm.node_id).length
   const fetching = dash.isFetching || details.some((d) => d.isFetching)
   const steps = pipeline(interval)
+  const offCount = slots.length - onCount
+  const savedDefaultEnabled =
+    (routing.data?.telemetry as { default_enabled?: boolean } | undefined)
+      ?.default_enabled === true
+  const willRetroactivelyEnable =
+    defaultEnabled && !savedDefaultEnabled && offCount > 0
   const official = routing.data?.official_cc as
     { sync_telemetry?: boolean } | undefined
   const codex = routing.data?.codex as
@@ -372,21 +415,20 @@ export function TelemetryPane({
 
   return (
     <div className='space-y-3'>
-      <Card className='gap-5'>
-        <CardHeader className='flex flex-wrap items-start justify-between gap-x-6 gap-y-3'>
+      <Card className='gap-0 py-0'>
+        <CardHeader className='flex flex-wrap items-start justify-between gap-x-6 gap-y-3 py-6'>
           <div className='min-w-0 space-y-1.5'>
-            <CardTitle className='text-base'>遥测</CardTitle>
+            <div className='flex flex-wrap items-center gap-2'>
+              <CardTitle className='text-base'>槽位遥测开关</CardTitle>
+              <Badge variant='secondary'>即时生效</Badge>
+            </div>
             <p className='max-w-[68ch] text-sm text-muted-foreground'>
-              每个 Claude 槽只有一个开关。写入{' '}
+              单槽开关与「全部开启 / 全部关闭」会立即下发到对应 VM（写入{' '}
               <code className='font-mono text-xs text-foreground'>
                 telemetry_disabled === false
               </code>{' '}
-              才算开，缺这个值也是关。把{' '}
-              <code className='font-mono text-xs text-foreground'>
-                settings.json
-              </code>{' '}
-              发布到原生 Claude 目录。CRAG
-              的检测只核验原生启动策略，不发送测试遥测，也不证明上传。 其他
+              才算开，缺这个值也是关），无需点击底部保存按钮。CRAG
+              的检测只核验原生启动策略，不发送测试遥测，也不证明上传。其他
               Claude 槽由常驻 cli-node 发送，展开可查看最近 40 条计数日志。
               {codexCount
                 ? ` GPT 使用独立统计链路，${codexCount} 个不在此列。`
@@ -436,7 +478,7 @@ export function TelemetryPane({
             </Button>
           </div>
         </CardHeader>
-        <CardContent className='space-y-3'>
+        <CardContent className='space-y-3 pb-4'>
           <FleetBar counts={counts} total={slots.length} />
           <div className='flex flex-wrap items-center gap-x-5 gap-y-1.5 text-xs'>
             {counts.map(([key, n]) =>
@@ -479,26 +521,77 @@ export function TelemetryPane({
               </span>
             </div>
           ) : null}
+        </CardContent>
+        <div className='border-t border-[var(--hairline)]'>
+          {dash.isLoading ? (
+            <p className='px-6 py-5 text-sm text-muted-foreground'>读取槽位…</p>
+          ) : slots.length === 0 ? (
+            <p className='px-6 py-5 text-sm text-muted-foreground'>
+              还没有 Claude 槽。建好槽并完成官方初装后，这里会列出它的遥测状态。
+            </p>
+          ) : (
+            <ul className='divide-y divide-[var(--hairline)]'>
+              {slots.map((slot) => (
+                <SlotRow
+                  key={slot.vm.id}
+                  slot={slot}
+                  busy={busy.has(slot.vm.id) || bulk?.current === slot.vm.id}
+                  locked={!!bulk}
+                  open={open === slot.vm.id}
+                  onToggleOpen={() =>
+                    setOpen((cur) => (cur === slot.vm.id ? null : slot.vm.id))
+                  }
+                  onSet={(enabled) => void setOne(slot.vm, enabled)}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
+      </Card>
+
+      <Card className='gap-5'>
+        <CardHeader className='space-y-1.5'>
+          <div className='flex flex-wrap items-center gap-2'>
+            <CardTitle className='text-base'>全局遥测策略</CardTitle>
+            <Badge variant='outline'>需底部保存</Badge>
+          </div>
+          <p className='max-w-[68ch] text-sm text-muted-foreground'>
+            以下配置修改后不会立即生效，需要点击页面底部的「保存」按钮统一写入全局路由配置并同步至
+            Claude 槽。
+          </p>
+        </CardHeader>
+        <CardContent className='space-y-4'>
           <IntervalSetting value={interval} onChange={onIntervalChange} />
-          <div className='flex items-center justify-between gap-3 border-t border-[var(--hairline)] pt-4'>
-            <div className='min-w-0'>
-              <Label
-                htmlFor='telemetry-default-enabled'
-                className='text-sm font-normal'
-              >
-                新建槽默认开启
-              </Label>
-              <p className='text-xs text-muted-foreground'>
-                打开后，保存会把现有 Claude
-                槽全部开启，之后新建的槽也默认开启。关闭只影响之后新建的槽。
-              </p>
+          <div className='space-y-2 border-t border-[var(--hairline)] pt-4'>
+            <div className='flex items-center justify-between gap-3'>
+              <div className='min-w-0'>
+                <Label
+                  htmlFor='telemetry-default-enabled'
+                  className='text-sm font-normal'
+                >
+                  默认开启遥测（保存时同步现有 Claude 槽）
+                </Label>
+                <p className='text-xs text-muted-foreground'>
+                  从关闭切为开启并保存后，除了新建 Claude
+                  槽默认开启，还会把当前所有已关闭的现有 Claude
+                  槽一并开启；关闭保存仅影响之后新建的槽，不会自动关闭现有槽。
+                </p>
+              </div>
+              <Switch
+                id='telemetry-default-enabled'
+                checked={defaultEnabled}
+                onCheckedChange={onDefaultEnabledChange}
+                aria-label='默认开启遥测（保存时同步现有 Claude 槽）'
+              />
             </div>
-            <Switch
-              id='telemetry-default-enabled'
-              checked={defaultEnabled}
-              onCheckedChange={onDefaultEnabledChange}
-              aria-label='新建槽默认开启遥测'
-            />
+            {willRetroactivelyEnable ? (
+              <Alert>
+                <AlertDescription className='text-xs'>
+                  注意：当前有 {offCount} 个现有 Claude
+                  槽处于关闭状态。点击底部「保存」后，这些现有槽也会一并开启遥测。
+                </AlertDescription>
+              </Alert>
+            ) : null}
           </div>
           <div className='flex items-center justify-between gap-3 border-t border-[var(--hairline)] pt-4'>
             <div className='min-w-0'>
@@ -516,7 +609,7 @@ export function TelemetryPane({
                 默认关闭（保持{' '}
                 <code className='font-mono text-[11px]'>unset</code>），原生{' '}
                 <code className='font-mono text-[11px]'>/usage</code>{' '}
-                用量查询与非必要请求正常可用；开启后统一向各 Claude 槽写入{' '}
+                用量查询与非必要请求正常可用；开启并保存后统一向各 Claude 槽写入{' '}
                 <code className='font-mono text-[11px]'>&quot;1&quot;</code>
                 ，官方 CLI 将屏蔽{' '}
                 <code className='font-mono text-[11px]'>/usage</code>{' '}
@@ -531,32 +624,6 @@ export function TelemetryPane({
             />
           </div>
         </CardContent>
-      </Card>
-
-      <Card className='gap-0 py-0'>
-        {dash.isLoading ? (
-          <p className='px-6 py-5 text-sm text-muted-foreground'>读取槽位…</p>
-        ) : slots.length === 0 ? (
-          <p className='px-6 py-5 text-sm text-muted-foreground'>
-            还没有 Claude 槽。建好槽并完成官方初装后，这里会列出它的遥测状态。
-          </p>
-        ) : (
-          <ul className='divide-y divide-[var(--hairline)]'>
-            {slots.map((slot) => (
-              <SlotRow
-                key={slot.vm.id}
-                slot={slot}
-                busy={busy.has(slot.vm.id) || bulk?.current === slot.vm.id}
-                locked={!!bulk}
-                open={open === slot.vm.id}
-                onToggleOpen={() =>
-                  setOpen((cur) => (cur === slot.vm.id ? null : slot.vm.id))
-                }
-                onSet={(enabled) => void setOne(slot.vm, enabled)}
-              />
-            ))}
-          </ul>
-        )}
       </Card>
 
       <Card className='gap-5'>

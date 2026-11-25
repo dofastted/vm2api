@@ -36,9 +36,26 @@ export type PersonaBlock = {
 export type BackupItem = {
   id: string
   created_at?: string
-  size?: number
-  note?: string
   kind?: string
+  status?: string
+  file_name?: string | null
+  size?: number
+  size_bytes?: number | null
+  file_exists?: boolean
+  error?: string | null
+  note?: string | null
+}
+
+export type BackupScheduleConfig = {
+  enabled: boolean
+  interval_hours: number
+  retention: number
+}
+
+export type BackupConfigPayload = {
+  ok?: boolean
+  config?: BackupScheduleConfig
+  next_auto_at?: string | null
 }
 /** `GET/PUT /api/panel/distill`。协议入口蒸馏拦截规则。 */
 export type DistillRules = {
@@ -286,6 +303,19 @@ export type NotifyFeishuConfig = {
   clear_secret?: boolean
 }
 
+export type NotifyEmailConfig = {
+  enabled: boolean
+  host: string
+  port: number
+  secure: boolean
+  user: string
+  /** GET 永远为空；保存后只通过 pass_set 表示已配置，禁止回显。 */
+  pass: string
+  pass_set?: boolean
+  from: string
+  to: string[]
+}
+
 /** `GET /routing -> notify` 与 `GET /notify -> config` 的脱敏通知配置。 */
 export type NotifyConfig = {
   enabled: boolean
@@ -299,7 +329,7 @@ export type NotifyConfig = {
   telegram: NotifyTelegramConfig
   wecom: NotifyWecomConfig
   feishu: NotifyFeishuConfig
-  email?: Record<string, unknown>
+  email?: NotifyEmailConfig
 }
 
 export type NotifyStatus = {

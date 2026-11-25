@@ -148,7 +148,9 @@ const INFERENCE_ERROR_LABELS: Readonly<Record<string, string>> = {
   license_not_yet_valid: 'CRAGGemini 许可尚未生效',
   license_invalid: 'CRAGGemini 许可无效',
   license_binding_mismatch: 'CRAGGemini 许可绑定不匹配',
+  license_payload_key_mismatch: 'CRAGGemini 许可与当前载荷版本不匹配',
   license_unconfigured: 'CRAGGemini 订阅未配置',
+  gemini_subscription_sync_pending: 'CRAGGemini 宿主订阅同步中',
 }
 
 export const DEFAULT_GEMINI_TEST_PROMPT = 'hello'
@@ -303,11 +305,15 @@ const INFERENCE_ERROR_ACTIONS: Readonly<Record<string, string>> = {
   license_not_yet_valid:
     '处理方式：请核对宿主机系统时间与 CRAGGemini 许可生效时间。',
   license_invalid:
-    '处理方式：请在「账号」页释放后重新绑定席位，或前往订阅页刷新宿主许可。',
+    '处理方式：请确认 CRAGGemini 宿主订阅已激活且未处于同步中，然后在「账号」页点击「重新绑定 CRAG 席位」，或前往「设置 → Gemini 维护」检查载荷与宿主订阅目录。',
   license_binding_mismatch:
-    '处理方式：许可与当前环境设备绑定不一致，请在「账号」页重新绑定席位。',
+    '处理方式：许可与当前环境设备或宿主机名单不一致，请在「账号」页点击「重新绑定 CRAG 席位」。',
+  license_payload_key_mismatch:
+    '处理方式：CRAGGemini 载荷密钥已更新，请在「账号」页点击「重新绑定 CRAG 席位」以换签当前版本许可。',
   license_unconfigured:
     '处理方式：请先在「订阅 CRAG」或「导入 → Gemini」完成 CRAGGemini 兑换与激活。',
+  gemini_subscription_sync_pending:
+    '处理方式：宿主机上次订阅变更尚未完成同步，请点击「继续同步订阅」或稍候等待自动恢复。',
 }
 
 export function geminiInferenceErrorLabel(code?: string | null): string {
