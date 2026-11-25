@@ -1,11 +1,17 @@
 /** Panel `计费` tab payload: effective prices, sources, overrides and catalog health. */
 import { getPolicyCatalogIds } from '../protocol/model-policy.mjs'
 import { getGptPolicyCatalogIds, listImageToolModels } from '../protocol/gpt-model-policy.mjs'
+import { getGeminiPolicyCatalogIds } from '../protocol/gemini-model-policy.mjs'
 import { readCatalogSync } from './catalog-monitor.mjs'
 import { getModelsDevStatus, listPriceCatalog, listPriceOverrides, resolvePrice } from './price-catalog.mjs'
 
 function policyPrices() {
-  const ids = [...getPolicyCatalogIds(), ...getGptPolicyCatalogIds(), ...listImageToolModels().map((m) => m.id)]
+  const ids = [
+    ...getPolicyCatalogIds(),
+    ...getGptPolicyCatalogIds(),
+    ...getGeminiPolicyCatalogIds(),
+    ...listImageToolModels().map((m) => m.id),
+  ]
   const out = {}
   for (const id of ids) {
     const hit = resolvePrice(id)
@@ -16,7 +22,7 @@ function policyPrices() {
 
 export function buildPricing({ requestLog = null } = {}) {
   const policy = policyPrices()
-  const inPolicy = new Set(Object.values(policy).flatMap((row) => (row ? [row.id] : [])))
+  const inPolicy = new Set([...Object.keys(policy), ...Object.values(policy).flatMap((row) => (row ? [row.id] : []))])
   let unpriced = []
   try {
     unpriced = requestLog?.repo?.unpricedModels?.() || []

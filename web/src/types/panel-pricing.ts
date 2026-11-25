@@ -32,7 +32,7 @@ export type SyncStatus = {
 }
 
 export type PricingEntry = {
-  platform: 'anthropic' | 'openai'
+  platform: 'anthropic' | 'openai' | 'google'
   id: string
   name: string | null
   context: number | null
@@ -81,6 +81,7 @@ export type PricingPayload = {
   catalog_sync: {
     claude: SyncStatus | null
     codex: SyncStatus | null
+    gemini?: SyncStatus | null
   }
 }
 

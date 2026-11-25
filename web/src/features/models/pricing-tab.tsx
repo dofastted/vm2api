@@ -93,12 +93,15 @@ function CatalogTable({
   title,
   rows,
   openai = false,
+  google = false,
   onEdit,
 }: {
   title: string
   rows: PricingEntry[]
   /** OpenAI terms: cached input, one cache-write rate, service tiers, image tokens. */
   openai?: boolean
+  /** Google Gemini terms: input / output / cache read + long-context tiers. */
+  google?: boolean
   onEdit: (entry: PricingEntry) => void
 }) {
   const [inPolicyOnly, setInPolicyOnly] = useState(true)
@@ -136,6 +139,13 @@ function CatalogTable({
                   <TableHead>长上下文</TableHead>
                   <TableHead>服务档位</TableHead>
                   <TableHead>图像 token</TableHead>
+                </>
+              ) : google ? (
+                <>
+                  <TableHead className='text-end'>input</TableHead>
+                  <TableHead className='text-end'>output</TableHead>
+                  <TableHead className='text-end'>cache read</TableHead>
+                  <TableHead>长上下文</TableHead>
                 </>
               ) : (
                 <>
@@ -179,6 +189,15 @@ function CatalogTable({
                       </TableCell>
                       <TableCell className='font-mono text-xs tabular-nums'>
                         {fmtImageRates(price)}
+                      </TableCell>
+                    </>
+                  ) : google ? (
+                    <>
+                      <RateCell value={price?.input} />
+                      <RateCell value={price?.output} />
+                      <RateCell value={price?.cache_read} />
+                      <TableCell className='text-xs'>
+                        {tiersSummary(price)}
                       </TableCell>
                     </>
                   ) : (
@@ -272,6 +291,7 @@ export function PricingTab() {
     return {
       anthropic: models.filter((m) => m.platform === 'anthropic'),
       openai: models.filter((m) => m.platform === 'openai'),
+      google: models.filter((m) => m.platform === 'google'),
     }
   }, [q.data?.models])
 
@@ -351,6 +371,12 @@ export function PricingTab() {
           title='OpenAI'
           rows={grouped.openai}
           openai
+          onEdit={setEdit}
+        />
+        <CatalogTable
+          title='Google'
+          rows={grouped.google}
+          google
           onEdit={setEdit}
         />
       </div>

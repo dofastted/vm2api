@@ -29,6 +29,7 @@ import {
   type CatalogMode,
   type ModelEntry,
   type ModelParams,
+  type ModelPlatform,
   type ModelPolicy,
   type Pass1mMode,
   type PolicyDefaults,
@@ -53,9 +54,8 @@ const BETA_FILTERS: [BetaFilter, string][] = [
 export function ModelsPage() {
   const qc = useQueryClient()
   const [pageTab, setPageTab] = useState<'models' | 'pricing'>('models')
-  const [catalogPlatform, setCatalogPlatform] = useState<
-    'anthropic' | 'openai'
-  >('anthropic')
+  const [catalogPlatform, setCatalogPlatform] =
+    useState<ModelPlatform>('anthropic')
   const q = useQuery(modelPolicyQueryOptions(catalogPlatform))
   const pricingQ = useQuery(pricingQueryOptions())
   const [draft, setDraft] = useState<ModelPolicy>(() => hydratePolicy(null))
@@ -165,6 +165,23 @@ export function ModelsPage() {
     },
     onError: (error: Error) => toast.error(error.message),
   })
+  const syncGemini = useMutation({
+    mutationFn: () =>
+      api<PolicyPayload>('/api/panel/model-policy/sync-gemini', {
+        method: 'POST',
+        body: '{}',
+      }),
+    onSuccess: async (data) => {
+      toast.success(`已同步 Google Gemini 目录 (${data.synced || 0})`)
+      await Promise.all([
+        qc.invalidateQueries({
+          queryKey: modelPolicyQueryOptions('google').queryKey,
+        }),
+        qc.invalidateQueries({ queryKey: pricingQueryOptions().queryKey }),
+      ])
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
 
   function patchModel(id: string, fn: (rec: Omit<ModelEntry, 'id'>) => void) {
     setDraft((prev) => {
@@ -196,6 +213,7 @@ export function ModelsPage() {
         const effort = String(value)
         rec.params.default_effort =
           effort === 'off' ||
+          effort === 'minimal' ||
           effort === 'low' ||
           effort === 'medium' ||
           effort === 'high' ||
@@ -259,7 +277,7 @@ export function ModelsPage() {
     })
   }
 
-  function switchPlatform(next: 'anthropic' | 'openai') {
+  function switchPlatform(next: ModelPlatform) {
     if (next === catalogPlatform) return
     if (
       dirty &&
@@ -275,13 +293,22 @@ export function ModelsPage() {
   }
 
   const claudePool = catalogPlatform === 'anthropic'
+  const openaiPool = catalogPlatform === 'openai'
+  const googlePool = catalogPlatform === 'google'
   const imageTools = q.data?.image_tools || []
   // Mapping targets follow the saved policy: the server validates against it.
-  const gptTargets = claudePool ? [] : mappingTargets(all)
+  const gptTargets = openaiPool ? mappingTargets(all) : []
   const imageIds = imageTools.flatMap((m) => [m.id, ...m.snapshots])
+  const poolTitle = claudePool
+    ? 'Claude 官方模型矩阵'
+    : openaiPool
+      ? 'GPT / Codex 官方模型矩阵'
+      : 'Google / Gemini 官方模型矩阵'
   const poolHint = claudePool
     ? 'Claude 号池。同一会话只占一个 VM session 窗口，不和 GPT 混调度。'
-    : 'GPT 号池。粘性独立，不占用 Claude 原生 session 槽。'
+    : openaiPool
+      ? 'GPT 号池。粘性独立，不占用 Claude 原生 session 槽。'
+      : 'Gemini 号池。此处配置的模型仅供 Gemini 系列模型与 Gemini 系列槽位使用；请求未携带思考等级时默认补齐缺省值（默认 medium）。'
 
   return (
     <PageHeader
@@ -304,7 +331,7 @@ export function ModelsPage() {
               >
                 {sync.isPending ? '同步中…' : '同步 Worker'}
               </Button>
-            ) : (
+            ) : openaiPool ? (
               <Button
                 variant='outline'
                 className='cursor-pointer'
@@ -316,6 +343,19 @@ export function ModelsPage() {
                 disabled={syncGpt.isPending}
               >
                 {syncGpt.isPending ? '同步中…' : '同步 GPT'}
+              </Button>
+            ) : (
+              <Button
+                variant='outline'
+                className='cursor-pointer'
+                onClick={() => {
+                  const ask = syncConfirmText(dirty, ' Google ')
+                  if (ask && !window.confirm(ask)) return
+                  syncGemini.mutate()
+                }}
+                disabled={syncGemini.isPending}
+              >
+                {syncGemini.isPending ? '同步中…' : '同步 Google'}
               </Button>
             )}
             <Button
@@ -379,7 +419,11 @@ export function ModelsPage() {
                     <Tabs
                       value={catalogPlatform}
                       onValueChange={(value) => {
-                        if (value === 'anthropic' || value === 'openai') {
+                        if (
+                          value === 'anthropic' ||
+                          value === 'openai' ||
+                          value === 'google'
+                        ) {
                           switchPlatform(value)
                         }
                       }}
@@ -397,13 +441,17 @@ export function ModelsPage() {
                         >
                           OpenAI
                         </TabsTrigger>
+                        <TabsTrigger
+                          value='google'
+                          className='cursor-pointer px-4'
+                        >
+                          Google
+                        </TabsTrigger>
                       </TabsList>
                     </Tabs>
                     <div className='max-w-3xl space-y-1'>
                       <h3 className='text-xl font-semibold tracking-tight'>
-                        {claudePool
-                          ? 'Claude 官方模型矩阵'
-                          : 'GPT / Codex 官方模型矩阵'}
+                        {poolTitle}
                       </h3>
                       <p className='text-sm leading-6 text-muted-foreground'>
                         {poolHint}
@@ -411,6 +459,7 @@ export function ModelsPage() {
                       <CatalogSyncBar
                         claude={pricingQ.data?.catalog_sync?.claude ?? null}
                         codex={pricingQ.data?.catalog_sync?.codex ?? null}
+                        gemini={pricingQ.data?.catalog_sync?.gemini ?? null}
                       />
                     </div>
                   </div>
@@ -430,9 +479,9 @@ export function ModelsPage() {
                 </div>
               </section>
 
-              {claudePool ? null : (
+              {openaiPool ? (
                 <ModelMappingCard targets={gptTargets} imageIds={imageIds} />
-              )}
+              ) : null}
 
               {dirty ? (
                 <p
@@ -541,7 +590,9 @@ export function ModelsPage() {
                       ? '无匹配模型。改搜索或筛选条件。'
                       : claudePool
                         ? '暂无模型配置。可先同步 Worker 目录。'
-                        : '暂无 GPT 模型。可先同步 GPT 目录。'
+                        : googlePool
+                          ? '暂无 Gemini 模型。可先同步 Google 目录。'
+                          : '暂无 GPT 模型。可先同步 GPT 目录。'
                   }
                 />
               ) : (
@@ -575,14 +626,14 @@ export function ModelsPage() {
                   onCatalogMode={setCatalog}
                   onDefaults={patchDefaults}
                 />
-              ) : (
+              ) : openaiPool ? (
                 <ImageToolSection
                   models={imageTools}
                   enabled={draft.image_tools}
                   pricing={pricingQ.data?.policy}
                   onToggle={setImageTool}
                 />
-              )}
+              ) : null}
             </div>
           </QueryGate>
         </TabsContent>
@@ -608,14 +659,17 @@ function PoolStat({ label, value }: { label: string; value: number }) {
 function CatalogSyncBar({
   claude,
   codex,
+  gemini,
 }: {
   claude: SyncStatus | null
   codex: SyncStatus | null
+  gemini: SyncStatus | null
 }) {
   return (
     <div className='space-y-0.5 text-xs leading-5 text-muted-foreground'>
       <p>{formatCatalogSync('Claude', claude)}</p>
       <p>{formatCatalogSync('GPT', codex)}</p>
+      <p>{formatCatalogSync('Google', gemini)}</p>
     </div>
   )
 }

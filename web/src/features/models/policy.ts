@@ -1,3 +1,4 @@
+export type ModelPlatform = 'anthropic' | 'openai' | 'google'
 export type Pass1mMode = 'true' | 'false' | 'inherit'
 export type BetaFilter = 'all' | 'pass' | 'strip' | 'inherit'
 export type CatalogMode =
@@ -17,7 +18,8 @@ export type ModelParams = {
   thinking_fallback_budget?: number
   max_tokens_default?: number
   max_tokens_cap?: number
-  default_effort?: '' | 'off' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  default_effort?:
+    '' | 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 }
 
 export type ModelBetas = {
