@@ -5783,9 +5783,12 @@ class Host:
                 )
                 or prev_verified_at
             )
-            if (
-                inference_proven
-                and account.get("eligibility") == "verification_required"
+            if inference_proven and (
+                account.get("eligibility") == "verification_required"
+                or (
+                    account.get("eligibility") is None
+                    and "validation_url" in account
+                )
             ):
                 account.pop("eligibility", None)
                 account.pop("validation_url", None)
