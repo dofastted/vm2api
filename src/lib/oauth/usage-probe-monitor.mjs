@@ -66,6 +66,10 @@ export function isUsageProbeTarget(vm) {
     /invalid_grant|refresh token not found|oauth_revoked|token_revoked|invalidated oauth token/i.test(grantErr)
   )
     return false
+  // A parked org-disabled slot never recovers on its own (operator-only): stop
+  // probing it — each hop would just burn an upstream 403 on a dead token and
+  // rewrite unschedulable.at, losing the real park timestamp.
+  if (vm.unschedulable?.reason === 'organization_disabled') return false
   const status = String(vm.status || '').toLowerCase()
   if (HARD_DOWN.has(status)) return false
   if (!vmHasProxyPath(vm)) return false
