@@ -476,3 +476,47 @@ test('#1776 active calibration respects 529 overload_until and newer 429 cooldow
     assert.equal(runtimeRepo.get('acc-oi').rate_limit_reset_at, T1_NEXT_DAY + 120_000)
   }
 })
+
+for (const key of ['5h', '7d', '7d_oi']) {
+  test(`active calibration uses latest inference activity for ${key} settle time without fresh quota headers`, async (t) => {
+    const { root, vm, quota, runtimeRepo } = makeEnv(t)
+    quota.ingestHeaders(
+      'acc-1',
+      {
+        [`anthropic-ratelimit-unified-${key}-utilization`]: '0.76',
+        [`anthropic-ratelimit-unified-${key}-reset`]: RESET_7D_FUTURE,
+        [`anthropic-ratelimit-unified-${key}-status`]: 'allowed_warning',
+      },
+      null,
+      { now: T0 },
+    )
+    // A completed inference can omit quota headers, leaving an older window sample.
+    runtimeRepo.upsert({ account_id: 'acc-1', vm_id: vm.id, last_used_at: T1_NEXT_DAY - 30_000 })
+    const before = structuredClone(quota.repo.get('acc-1').unified.headers[key])
+    const probe = officialZero(
+      T1_NEXT_DAY,
+      key === '7d_oi'
+        ? {
+            usage_has_fable: true,
+            seven_day_oi: { utilization: 0, status: 'allowed', resets_at: RESET_7D_FUTURE_ISO },
+          }
+        : {},
+    )
+    const query = createActiveUsageQuery({ now: () => T1_NEXT_DAY, probe: async () => probe })
+    const res = await query({ projectRoot: root, vm, accountQuota: quota })
+    assert.equal(res.status, 200)
+    assert.equal(
+      quota.repo.get('acc-1').unified.headers[key].utilization,
+      0.76,
+      'an inference completed 30s ago must retain the high reading during settle despite an old quota sample',
+    )
+    assert.equal(res.body.data.reconciled, false)
+    const retained = res.body.data.retained_windows.find((w) => w.window === key)
+    assert.equal(retained?.reason, 'settle_window')
+    assert.equal(retained?.settle_remaining_ms, ACTIVE_CALIBRATION_SETTLE_MS - 30_000)
+    assert.equal(retained?.header_sampled_at, before.sampled_at || new Date(T0).toISOString())
+    const forced = await query({ projectRoot: root, vm, accountQuota: quota, forceReconcile: true })
+    assert.equal(forced.status, 200)
+    assert.equal(quota.repo.get('acc-1').unified.headers[key].utilization, 0)
+  })
+}
