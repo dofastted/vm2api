@@ -647,6 +647,74 @@ test('OAuth account import redacts credentials and preserves the authorization b
   assert.equal(accepted.body.data.account.email, 'verified@example.test')
   assert.equal(accepted.body.data.runtime_ready, false)
   assert.doesNotMatch(JSON.stringify(accepted.body), /fixture-access-never-returned/)
+
+  // CPA and sub2api OAuth formats normalize to minimal `{ access_token, expiry_timestamp }`
+  // before reaching the host and never forward refresh tokens.
+  const forwarded = []
+  const capture = setup((operation, payload) => {
+    forwarded.push({ operation, payload })
+    return {
+      ...record,
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      oauth_imported: true,
+      account: { state: 'ok', email: 'converted@example.test' },
+    }
+  })
+
+  const cpaResp = await capture('POST', endpoint, {
+    name: 'cpa-ag',
+    proxy_id: record.proxy_id,
+    oauth_account: {
+      type: 'antigravity',
+      access_token: 'ya29.cpa-import-token',
+      refresh_token: '1//must-not-forward-cpa',
+      expired: '2030-01-01T00:00:00Z',
+    },
+  })
+  assert.equal(cpaResp.status, 200)
+  assert.deepEqual(forwarded.at(-1).payload.oauth_account, {
+    access_token: 'ya29.cpa-import-token',
+    expiry_timestamp: 1893456000,
+  })
+
+  const sub2apiResp = await capture('POST', endpoint, {
+    name: 'sub2api-gem',
+    proxy_id: record.proxy_id,
+    oauth_account: {
+      exported_at: '2026-11-25T08:00:00Z',
+      proxies: [],
+      accounts: [
+        {
+          name: 'gem-1',
+          platform: 'gemini',
+          type: 'oauth',
+          credentials: {
+            access_token: 'ya29.sub2api-import-token',
+            refresh_token: '1//must-not-forward-sub2api',
+            expires_at: '1893456000',
+          },
+        },
+      ],
+    },
+  })
+  assert.equal(sub2apiResp.status, 200)
+  assert.deepEqual(forwarded.at(-1).payload.oauth_account, {
+    access_token: 'ya29.sub2api-import-token',
+    expiry_timestamp: 1893456000,
+  })
+
+  const wrongProvider = await invalid('POST', endpoint, {
+    name: 'claude-cpa',
+    proxy_id: record.proxy_id,
+    oauth_account: {
+      type: 'claude',
+      access_token: 'sk-ant-oat01-wrong-provider',
+      expired: '2030-01-01T00:00:00Z',
+    },
+  })
+  assert.equal(wrongProvider.status, 400)
+  assert.equal(wrongProvider.body.error.code, 'gemini_oauth_import_invalid')
 })
 
 test('Gemini panel exposes scoped quota windows without inventing missing fractions or exposing raw fields', async () => {

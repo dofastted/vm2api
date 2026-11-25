@@ -28,6 +28,11 @@ import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-li
 import { usersQueryOptions } from '@/features/users/queries'
 import { resolveOwnerUsername } from '@/features/vm/vm-owner'
 import {
+  GEMINI_IMPORT_FORMAT_LABELS,
+  type ParsedGeminiImportResult,
+  readGeminiAccountImportFile,
+} from './gemini-account-import'
+import {
   GEMINI_INVENTORY_KEY as QUERY_KEY,
   GEMINI_ROOT as ROOT,
   geminiProxyOptions,
@@ -39,44 +44,6 @@ import {
 } from './gemini-operations'
 import { GeminiProxyPanel } from './gemini-proxy-panel'
 import { GeminiTestPanel } from './gemini-test-panel'
-
-const ACCOUNT_FILE_LIMIT = 128 * 1024
-
-async function readOAuthAccount(file: File | null) {
-  if (!file || file.size > ACCOUNT_FILE_LIMIT) {
-    throw new Error('请选择不超过 128 KiB 的单个账号 JSON 文件。')
-  }
-  try {
-    const data: unknown = JSON.parse(await file.text())
-    if (!data || typeof data !== 'object' || !('token' in data))
-      throw new Error()
-    const token = data.token
-    if (
-      !token ||
-      typeof token !== 'object' ||
-      !('access_token' in token) ||
-      !('expiry_timestamp' in token)
-    ) {
-      throw new Error()
-    }
-    if (
-      typeof token.access_token !== 'string' ||
-      !token.access_token ||
-      typeof token.expiry_timestamp !== 'number' ||
-      !Number.isSafeInteger(token.expiry_timestamp)
-    ) {
-      throw new Error()
-    }
-    return {
-      access_token: token.access_token,
-      expiry_timestamp: token.expiry_timestamp,
-    }
-  } catch {
-    throw new Error(
-      '文件格式无效，请选择 Antigravity Tools 导出的单个账号 JSON。'
-    )
-  }
-}
 
 type QuotaReading = {
   remaining_fraction: number | null
@@ -1065,6 +1032,13 @@ export function GeminiEnvironments({
   >('oauth')
   const [apiKey, setApiKey] = useState('')
   const [accountFile, setAccountFile] = useState<File | null>(null)
+  const [accountImport, setAccountImport] =
+    useState<ParsedGeminiImportResult | null>(null)
+  const [accountImportIndex, setAccountImportIndex] = useState(0)
+  const [accountImportError, setAccountImportError] = useState<string | null>(
+    null
+  )
+  const [accountImportParsedAt, setAccountImportParsedAt] = useState(0)
   const [challenge, setChallenge] = useState<
     (Authorization & { id: string }) | null
   >(null)
@@ -1072,6 +1046,57 @@ export function GeminiEnvironments({
   const [deleteId, setDeleteId] = useState<string | null>(null)
   const [createdId, setCreatedId] = useState<string | null>(null)
   const nameInput = useRef<HTMLInputElement>(null)
+  const nameAutoFilled = useRef(false)
+  const accountParseSeq = useRef(0)
+
+  const selectedImportAccount =
+    accountImport?.accounts[accountImportIndex] ??
+    accountImport?.accounts[0] ??
+    null
+
+  const resetAccountImport = () => {
+    accountParseSeq.current += 1
+    setAccountFile(null)
+    setAccountImport(null)
+    setAccountImportIndex(0)
+    setAccountImportError(null)
+    setAccountImportParsedAt(0)
+  }
+
+  const applySuggestedName = (suggested?: string) => {
+    if (!suggested) return
+    setName((current) => {
+      if (!current.trim() || nameAutoFilled.current) {
+        nameAutoFilled.current = true
+        return suggested
+      }
+      return current
+    })
+  }
+
+  const handleAccountFileChange = (file: File | null) => {
+    const seq = ++accountParseSeq.current
+    setAccountFile(file)
+    setAccountImport(null)
+    setAccountImportIndex(0)
+    setAccountImportError(null)
+    setAccountImportParsedAt(0)
+    if (!file) return
+    void readGeminiAccountImportFile(file)
+      .then((parsed) => {
+        if (accountParseSeq.current !== seq) return
+        setAccountImport(parsed)
+        setAccountImportIndex(0)
+        setAccountImportParsedAt(Date.now())
+        applySuggestedName(parsed.accounts[0]?.suggestedName)
+      })
+      .catch((error: unknown) => {
+        if (accountParseSeq.current !== seq) return
+        setAccountImportError(
+          error instanceof Error ? error.message : '账号文件解析失败。'
+        )
+      })
+  }
 
   const operation = useGeminiMutation({
     mutationFn: async (action: {
@@ -1088,18 +1113,41 @@ export function GeminiEnvironments({
     }) => {
       const resource = `${ROOT}/environments${action.id ? `/${encodeURIComponent(action.id)}` : ''}`
       if (action.type === 'create') {
-        const imported =
-          authMethod === 'oauth_file'
-            ? await readOAuthAccount(accountFile)
+        let importedAccount = selectedImportAccount
+        if (authMethod === 'oauth_file' && !importedAccount) {
+          const parsed = await readGeminiAccountImportFile(accountFile)
+          importedAccount =
+            parsed.accounts[accountImportIndex] ?? parsed.accounts[0] ?? null
+        }
+        if (authMethod === 'oauth_file' && !importedAccount) {
+          throw new Error('请选择有效的账号 JSON 文件。')
+        }
+        const effectiveMethod =
+          authMethod === 'oauth_file' && importedAccount
+            ? importedAccount.kind === 'api_key'
+              ? 'api_key'
+              : 'oauth'
+            : authMethod
+        const effectiveApiKey =
+          authMethod === 'oauth_file' && importedAccount?.kind === 'api_key'
+            ? importedAccount.api_key
+            : authMethod === 'api_key'
+              ? apiKey.trim()
+              : null
+        const effectiveOAuthAccount =
+          authMethod === 'oauth_file' && importedAccount?.kind === 'oauth'
+            ? importedAccount.oauth_account
             : null
         const environment = await api<GeminiEnvironment>(resource, {
           method: 'POST',
           body: JSON.stringify({
             name,
             proxy_id: proxyId,
-            auth_method: imported ? 'oauth' : authMethod,
-            ...(imported ? { oauth_account: imported } : {}),
-            ...(authMethod === 'api_key' ? { api_key: apiKey.trim() } : {}),
+            auth_method: effectiveMethod,
+            ...(effectiveOAuthAccount
+              ? { oauth_account: effectiveOAuthAccount }
+              : {}),
+            ...(effectiveApiKey ? { api_key: effectiveApiKey } : {}),
           }),
         })
         client.setQueryData<GeminiInventory>(
@@ -1112,8 +1160,9 @@ export function GeminiEnvironments({
             }
         )
         setName('')
+        nameAutoFilled.current = false
         setApiKey('')
-        setAccountFile(null)
+        resetAccountImport()
         setCreatedId(environment.id)
         return
       }
@@ -1392,7 +1441,7 @@ export function GeminiEnvironments({
                   onChange={() => {
                     setAuthMethod('oauth')
                     setApiKey('')
-                    setAccountFile(null)
+                    resetAccountImport()
                   }}
                 />
                 Google 授权
@@ -1404,7 +1453,7 @@ export function GeminiEnvironments({
                   checked={authMethod === 'api_key'}
                   onChange={() => {
                     setAuthMethod('api_key')
-                    setAccountFile(null)
+                    resetAccountImport()
                   }}
                 />
                 Gemini API Key
@@ -1419,7 +1468,7 @@ export function GeminiEnvironments({
                     setApiKey('')
                   }}
                 />
-                导入 Antigravity 账号文件
+                导入账号文件（Antigravity / CPA / sub2api）
               </label>
             </div>
           </fieldset>
@@ -1431,7 +1480,10 @@ export function GeminiEnvironments({
               required
               maxLength={80}
               value={name}
-              onChange={(event) => setName(event.target.value)}
+              onChange={(event) => {
+                nameAutoFilled.current = false
+                setName(event.target.value)
+              }}
             />
           </div>
           {authMethod === 'oauth_file' ? (
@@ -1446,16 +1498,85 @@ export function GeminiEnvironments({
                 disabled={operation.isPending}
                 aria-describedby='gemini-account-file-help'
                 onChange={(event) =>
-                  setAccountFile(event.target.files?.item(0) ?? null)
+                  handleAccountFileChange(event.target.files?.item(0) ?? null)
                 }
               />
               <p
                 id='gemini-account-file-help'
                 className='text-sm text-muted-foreground'
               >
-                一次导入一个账号。凭据通过所选代理验证，过期后请重新进行 Google
-                授权。
+                支持 Antigravity Tools、CLIProxyAPI（CPA）与 sub2api 导出的账号
+                JSON（多账号文件可选择单个导入）。OAuth
+                凭据仅上传访问令牌与过期时间并经所选代理验证，过期后请重新进行
+                Google 授权。
               </p>
+              {accountImportError ? (
+                <p role='alert' className='text-sm text-destructive'>
+                  {accountImportError}
+                </p>
+              ) : null}
+              {accountImport && selectedImportAccount ? (
+                <div className='space-y-2 rounded-md border bg-muted/30 p-3 text-sm'>
+                  {accountImport.accounts.length > 1 ? (
+                    <div className='space-y-1.5'>
+                      <Label htmlFor='gemini-import-account'>
+                        选择要导入的账号（共 {accountImport.accounts.length}{' '}
+                        个）
+                      </Label>
+                      <select
+                        id='gemini-import-account'
+                        className='block w-full rounded-md border bg-background p-2 text-sm'
+                        disabled={operation.isPending}
+                        value={String(accountImportIndex)}
+                        onChange={(event) => {
+                          const nextIndex = Number(event.target.value)
+                          if (
+                            Number.isInteger(nextIndex) &&
+                            nextIndex >= 0 &&
+                            nextIndex < accountImport.accounts.length
+                          ) {
+                            setAccountImportIndex(nextIndex)
+                            applySuggestedName(
+                              accountImport.accounts[nextIndex]?.suggestedName
+                            )
+                          }
+                        }}
+                      >
+                        {accountImport.accounts.map((item, idx) => (
+                          <option key={`${item.label}-${idx}`} value={idx}>
+                            {item.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : null}
+                  <p role='status' className='text-xs text-muted-foreground'>
+                    已识别：{GEMINI_IMPORT_FORMAT_LABELS[accountImport.format]}{' '}
+                    ·{' '}
+                    {selectedImportAccount.kind === 'api_key'
+                      ? 'Gemini API Key'
+                      : 'OAuth 凭据'}
+                    {selectedImportAccount.email
+                      ? ` · ${selectedImportAccount.email}`
+                      : ''}
+                    {selectedImportAccount.project_id
+                      ? ` · 项目 ${selectedImportAccount.project_id}`
+                      : ''}
+                    {accountImport.skippedNonGemini > 0
+                      ? `（已忽略 ${accountImport.skippedNonGemini} 个非 Gemini/Antigravity 账号）`
+                      : ''}
+                  </p>
+                  {selectedImportAccount.kind === 'oauth' &&
+                  accountImportParsedAt > 0 &&
+                  selectedImportAccount.oauth_account.expiry_timestamp * 1000 <=
+                    accountImportParsedAt ? (
+                    <p className='text-xs text-amber-700 dark:text-amber-300'>
+                      提示：文件中的访问令牌可能已过期，导入验证时可能会被
+                      Google 拒绝；请导出最新凭据或改用 Google 授权。
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           ) : null}
           {authMethod === 'api_key' ? (
@@ -1501,7 +1622,10 @@ export function GeminiEnvironments({
               !canInstall ||
               !name.trim() ||
               (authMethod === 'api_key' && !apiKey.trim()) ||
-              (authMethod === 'oauth_file' && !accountFile) ||
+              (authMethod === 'oauth_file' &&
+                (!accountFile ||
+                  Boolean(accountImportError) ||
+                  !selectedImportAccount)) ||
               !exits.some((proxy) => proxy.id === proxyId)
             }
           >
