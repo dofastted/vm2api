@@ -1,5 +1,5 @@
 import { type ComponentProps, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -8,6 +8,7 @@ import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
 import {
   healthProbeQueryOptions,
+  runHealthProbe,
   type HealthSnapshotView,
 } from '@/features/settings/queries'
 import { settleInt, typingInt } from './int-input'
@@ -87,9 +88,12 @@ export function HealthPane(props: HealthPaneProps) {
   } = props
   const probe = obj(healthProbe)
   const real = obj(probe.real)
+  const gemini = obj(probe.gemini)
   const minTokens = obj(compatibility.min_max_tokens)
   const setProbe = (patch: Obj) => onHealthProbeChange({ ...probe, ...patch })
   const setReal = (patch: Obj) => setProbe({ real: { ...real, ...patch } })
+  const setGemini = (patch: Obj) =>
+    setProbe({ gemini: { ...gemini, ...patch } })
   const minTokensMode = String(minTokens.mode ?? minTokens.tier ?? '').trim()
   const explicitFloor = ['floor', 'default', 'raise'].includes(minTokensMode)
   // Match the backend: an explicit mode takes precedence over legacy flags.
@@ -213,8 +217,10 @@ export function HealthPane(props: HealthPaneProps) {
       <HealthCacheCard
         probe={probe}
         real={real}
+        gemini={gemini}
         onProbeChange={setProbe}
         onRealChange={setReal}
+        onGeminiChange={setGemini}
       />
       <SignatureRepairCard failover={failover} onChange={onFailoverChange} />
     </>
@@ -224,15 +230,26 @@ export function HealthPane(props: HealthPaneProps) {
 function HealthCacheCard({
   probe,
   real,
+  gemini,
   onProbeChange,
   onRealChange,
+  onGeminiChange,
 }: {
   probe: Obj
   real: Obj
+  gemini: Obj
   onProbeChange: (patch: Obj) => void
   onRealChange: (patch: Obj) => void
+  onGeminiChange: (patch: Obj) => void
 }) {
+  const queryClient = useQueryClient()
   const status = useQuery(healthProbeQueryOptions())
+  const probeNow = useMutation({
+    mutationFn: (platform: 'all' | 'gemini') => runHealthProbe(platform),
+    onSuccess: (data) => {
+      queryClient.setQueryData(['panel', 'health-probe'], data)
+    },
+  })
   const snaps = status.data?.snapshots
   return (
     <Card>
@@ -240,7 +257,8 @@ function HealthCacheCard({
         <CardTitle>健康缓存</CardTitle>
         <p className='text-xs text-muted-foreground'>
           定时用真实槽位跑一次对话并缓存结果。渠道或账号测试发出的简短 hi / ping
-          探测请求直接回放缓存，覆盖 Messages、Chat、Responses 的流式和非流式。
+          探测请求直接回放缓存，覆盖 Messages、Chat、Responses、Gemini
+          的流式和非流式。
         </p>
       </CardHeader>
       <CardContent className='divide-y'>
@@ -264,7 +282,7 @@ function HealthCacheCard({
         </SettingRow>
         <SettingRow
           label='全号轮询'
-          desc='每个间隔对所有可调度槽各探一次（受并发上限、工作时段、冷却与凭证排除约束）。列表中首个成功的结果仍写入健康缓存；关闭时探测到第一个可用槽即停止。'
+          desc='每个间隔对所有可调度槽按顺序逐个各探一次（严格串行、不并发，受工作时段、冷却与凭证排除约束）。列表中首个成功的结果仍写入健康缓存；关闭时探测到第一个可用槽即停止。'
         >
           <Switch
             checked={probe.probe_all_slots === true}
@@ -307,10 +325,70 @@ function HealthCacheCard({
             aria-label='GPT 探测模型'
           />
         </SettingRow>
+        <SettingRow
+          label='Gemini 健康缓存'
+          desc='开启健康缓存后，Gemini 系列模型按独立间隔定时探测，匹配的探测请求统一返回缓存值。'
+        >
+          <Switch
+            checked={gemini.enabled !== false}
+            onCheckedChange={(checked) => onGeminiChange({ enabled: checked })}
+            aria-label='启用 Gemini 健康缓存'
+          />
+        </SettingRow>
+        <SettingRow
+          label='Gemini 探测间隔'
+          desc='秒，60–86400，默认 3600（每 1 小时探测一次）'
+        >
+          <DeferredIntInput
+            className='w-28'
+            min={60}
+            max={86400}
+            fallback={3600}
+            value={Number(gemini.interval_sec ?? 3600)}
+            onCommit={(next) => onGeminiChange({ interval_sec: next })}
+            aria-label='Gemini 探测间隔'
+          />
+        </SettingRow>
+        <SettingRow
+          label='Gemini 缓存有效期'
+          desc='秒，60–172800，默认 5400；过期后探测请求照常进入调度'
+        >
+          <DeferredIntInput
+            className='w-28'
+            min={60}
+            max={172800}
+            fallback={5400}
+            value={Number(gemini.cache_ttl_sec ?? 5400)}
+            onCommit={(next) => onGeminiChange({ cache_ttl_sec: next })}
+            aria-label='Gemini 缓存有效期'
+          />
+        </SettingRow>
+        <SettingRow
+          label='Gemini 探测模型'
+          desc='指定 Gemini 定时探测所用模型；留空则自动选取已授权 Gemini 槽位中的轻量模型。'
+        >
+          <Input
+            className='w-56'
+            placeholder='留空自动选择'
+            value={String(gemini.model ?? '')}
+            onChange={(event) => onGeminiChange({ model: event.target.value })}
+            aria-label='Gemini 探测模型'
+          />
+        </SettingRow>
         <SettingRow label='最近快照'>
-          <div className='flex flex-col items-end gap-1 text-xs'>
+          <div className='flex flex-col items-end gap-1.5 text-xs'>
             <SnapshotLine label='Claude' snap={snaps?.anthropic} />
             <SnapshotLine label='GPT' snap={snaps?.openai} />
+            <SnapshotLine label='Gemini' snap={snaps?.gemini} />
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              disabled={probeNow.isPending}
+              onClick={() => probeNow.mutate('all')}
+            >
+              {probeNow.isPending ? '探测中…' : '立即探测'}
+            </Button>
           </div>
         </SettingRow>
       </CardContent>

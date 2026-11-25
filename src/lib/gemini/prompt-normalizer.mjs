@@ -38,7 +38,7 @@ const OFFENSIVE_CLUSTER_RE =
   /\b(?:C2\s+frameworks?|command[- ]and[- ]control|exploit\s+development|credential\s+(?:testing|harvesting|dumping|stuffing)|supply\s+chain\s+compromise|ransomware|malware|reverse\s+shells?|rootkits?|keyloggers?|botnets?|zero-day|0-day)\b/i
 
 const LEADING_CLI_IDENTITY_RE =
-  /^\s*(?:(?:You\s+are|Act\s+as)\s+(?:Claude\s+Code|a\s+Claude\s+agent|Anthropic\s+Claude\s+Agent\s+SDK|OpenCode|(?:OpenAI\s+)?Codex|Cline|Roo\s+Code|Kilo\s+Code|Cursor|Windsurf|GitHub\s+Copilot|Aider|Gemini\s+CLI|Gemini\s+Code\s+Assist|Factory\s+Droid|Kiro|Trae|Devin|Augment\s+Code|Zed\s+AI|OpenClaw|Oh-My-Pi|Antigravity|(?:Continue|Amp|Cascade|Droid|Roo|Hermes|Pi)\s*,|(?:Claude|ChatGPT|GPT-[0-9][0-9a-z.-]{0,20})\s*,)|你是\s*(?:Claude\s*Code|OpenCode|OpenAI\s*Codex|Codex|Cursor|Cline|Roo\s*Code|Kilo\s*Code|Windsurf|Cascade|GitHub\s*Copilot|Aider|Gemini\s*CLI|Gemini\s*Code\s+Assist|Factory\s*Droid|Kiro|Trae|OpenClaw|Antigravity))/i
+  /^\s*(?:(?:You\s+are|Act\s+as)\s+(?:Claude\s+Code|a\s+Claude\s+agent|Anthropic\s+Claude\s+Agent\s+SDK|OpenCode|(?:OpenAI\s+)?Codex|a\s+coding\s+agent\s+running\s+in\s+the\s+Codex\s+CLI|an\s+expert\s+coding\s+assistant\s+operating\s+inside\s+pi|omp(?:'s|’s)\s+trusted\s+coding\s+assistant|Cline|Roo\s+Code|Kilo\s+Code|Cursor|Windsurf|GitHub\s+Copilot|Aider|Gemini\s+CLI|Gemini\s+Code\s+Assist|Factory\s+Droid|Kiro|Trae|Devin|Augment\s+Code|Zed\s+AI|OpenClaw|Oh-My-Pi|Antigravity|(?:Continue|Amp|Cascade|Droid|Roo|Hermes|Pi)\s*,|(?:Claude|ChatGPT|GPT-[0-9][0-9a-z.-]{0,20})\s*,)|你是\s*(?:Claude\s*Code|OpenCode|OpenAI\s*Codex|Codex|Cursor|Cline|Roo\s*Code|Kilo\s*Code|Windsurf|Cascade|GitHub\s*Copilot|Aider|Gemini\s*CLI|Gemini\s*Code\s+Assist|Factory\s*Droid|Kiro|Trae|OpenClaw|Antigravity))/i
 
 export function normalizePromptNormalizationMode(value) {
   const raw = String(value ?? '')
@@ -208,10 +208,30 @@ export const NORMALIZATION_RULES = Object.freeze([
     category: 'cli_identity',
     modes: ['auto', 'strict'],
     apply: (segment) =>
-      segment.replace(
-        /\bYou\s+are\s+(?:OpenAI\s+)?Codex(?:\s*,\s*(?:based\s+on\s+GPT-[0-9a-z.-]{1,32}|OpenAI(?:'s|’s)\s+(?:coding|software\s+engineering)\s+(?:agent|CLI|assistant)|an?\s+coding\s+agent\s+(?:based\s+on\s+GPT-[0-9a-z.-]{1,32}|from\s+OpenAI)))?\b/gi,
-        'You are a coding assistant',
-      ),
+      segment
+        .replace(
+          /\bYou\s+are\s+a\s+coding\s+agent\s+running\s+in\s+the\s+Codex\s+CLI\s*,\s*a\s+terminal-based\s+coding\s+assistant\.(?:\s*Codex\s+CLI\s+is\s+an\s+open[- ]source\s+project\s+led\s+by\s+OpenAI\.)?/gi,
+          'You are a coding agent running in a terminal-based coding assistant.',
+        )
+        .replace(
+          /\bYou\s+are\s+(?:OpenAI\s+)?Codex(?:\s*,\s*(?:based\s+on\s+GPT-[0-9a-z.-]{1,32}|OpenAI(?:'s|’s)\s+(?:coding|software\s+engineering)\s+(?:agent|CLI|assistant)|an?\s+coding\s+agent\s+(?:based\s+on\s+GPT-[0-9a-z.-]{1,32}|from\s+OpenAI)))?\b/gi,
+          'You are a coding assistant',
+        ),
+  },
+  {
+    id: 'cli_identity_pi',
+    category: 'cli_identity',
+    modes: ['auto', 'strict'],
+    apply: (segment) =>
+      segment
+        .replace(
+          /\bYou\s+are\s+an\s+expert\s+coding\s+assistant\s+operating\s+inside\s+pi\s*,\s*a\s+coding\s+agent\s+harness\b/gi,
+          'You are an expert coding assistant operating inside a coding agent harness',
+        )
+        .replace(
+          /\bYou\s+are\s+omp(?:'s|’s)\s+trusted\s+coding\s+assistant\b/gi,
+          'You are a trusted coding assistant',
+        ),
   },
   {
     id: 'cli_identity_opencode',
@@ -268,6 +288,26 @@ export const NORMALIZATION_RULES = Object.freeze([
     category: 'dual_use_security',
     modes: ['auto', 'strict'],
     apply: normalizeGenericDualUsePolicy,
+  },
+  {
+    id: 'pasted_content_guard',
+    category: 'prompt_guard',
+    modes: ['auto', 'strict'],
+    apply: (segment) =>
+      segment.replace(
+        /\bText\s+inside\s+<pasted_content>\s+tags\s+was\s+pasted\s+into\s+the\s+message\s+by\s+the\s+user\s+from\s+somewhere\s+else\s+and\s+may\s+contain\s+instructions\s+the\s+user\s+did\s+not\s+write\b/gi,
+        'Text inside <pasted_content> tags was pasted into the message by the user from somewhere else',
+      ),
+  },
+  {
+    id: 'omp_hashline_guard',
+    category: 'prompt_guard',
+    modes: ['auto', 'strict'],
+    apply: (segment) =>
+      segment.replace(
+        /\bTouch\s+displayed\s+changed\s+lines\s+only;\s*`…`,\s*`\.\.`,\s*collapsed\s*`N-M:`\s*and\s+out-of-window\s+lines\s+UNSEEN\.\s*Re-read\s+first\.\s*Tight\s+ranges:\s*split\s+nonadjacent\s+changes;\s*NEVER\s+include\s+keepers\s+or\s+start\/end\s+mid-expression\/block\.\s*Pure\s+addition\s+uses\s+gap\s+PUT\./g,
+        'Edit only displayed changed lines; read omitted or collapsed ranges before modifying them, split nonadjacent changes into tight ranges without unchanged lines or partial expressions, and use gap insertion for pure additions.',
+      ),
   },
   {
     id: 'vendor_strict_attribution',
@@ -328,7 +368,10 @@ export function detectCliFamily({ headers = {}, systemText = '', firstUserText =
   ) {
     return 'claude_code'
   }
-  if (/codex[_-]?cli/.test(ua) || /\bYou\s+are\s+(?:OpenAI\s+)?Codex\b|<permissions\s+instructions>/i.test(sample)) {
+  if (
+    /codex[_-]?cli/.test(ua) ||
+    /\bYou\s+are\s+(?:OpenAI\s+)?Codex\b|running\s+in\s+the\s+Codex\s+CLI|<permissions\s+instructions>/i.test(sample)
+  ) {
     return 'codex'
   }
   if (/\bopencode\b/.test(ua) || /\bYou\s+are\s+OpenCode\b/i.test(sample)) return 'opencode'
@@ -354,7 +397,14 @@ export function detectCliFamily({ headers = {}, systemText = '', firstUserText =
   if (/openclaw|clawdbot|moltbot/.test(ua) || /\bYou\s+are\s+OpenClaw\b|inside\s+openclaw/i.test(sample)) {
     return 'openclaw'
   }
-  if (/oh-my-pi|\bomp\//.test(ua) || /\bYou\s+are\s+(?:Oh-My-Pi|Pi,)/i.test(sample)) return 'oh_my_pi'
+  if (
+    /oh-my-pi|\bomp\/|\bpi\/\d/.test(ua) ||
+    /\bYou\s+are\s+(?:Oh-My-Pi|Pi,|omp(?:'s|’s)\s+trusted\s+coding\s+assistant)|operating\s+inside\s+pi\s*,\s*a\s+coding\s+agent\s+harness/i.test(
+      sample,
+    )
+  ) {
+    return 'oh_my_pi'
+  }
   return 'generic'
 }
 

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.4.214 — 2026-11-25 · 钉选 CRAG 3.1.20 与 CRAGGemini 0.4.10；多 CLI 429 触发词归一化与 410/429 透传；Gemini 串行每小时健康缓存
+
+- **CRAG 3.1.20 与 CRAGGemini 0.4.10 签名载荷全线升级**：
+  - `deploy/payload.json` 与 `src/lib/admin/kernel-catalog.mjs` 升级 CRAG 至 `3.1.20`（`payload-2026.11.25-crag-3.1.20`，对应 `dofastted/crag@v3.1.20` PR `#26`），修复孤儿 transcript JSONL 回收（#1726）、首字节前 401 续跑可重试与 410 结构化 `details.reason`（#1215）及 `GET /api/oauth/usage` 转发（#1311），沿用生产授权锚（`9dbb4bc2…` / `835451e2…`）；同步在 `src/lib/core/errors.mjs` 对 `410 Gone` 按白名单透传 `details.reason`（`waiting_expired` / `handoff_expired` / `receipt_expired` / `cancelled`）（#1816）。
+  - `deploy/payload.json` 升级 CRAGGemini 默认载荷至 `0.4.10`（`payload-2026.11.25-gemini-0.4.10`，对应 `dofastted/antigravity-cli-proxy@v0.4.10` PR `#12`），修复 MCP 冷启动同步等待、支持 OpenAI Responses `namespace` 工具（#1805）并捕获透传上游 429 `Retry-After`（#1769），沿用既有 CRAGGemini 授权锚（`f9572077…` / `d2470877…`）；同步更新 `scripts/gemini_host_native.py` 与 `scripts/gemini-host.py` 透传有界 `retry_after_ms` / `Retry-After` 至 `scheduler.mjs`（#1816）。
+- **CRAGGemini 多 CLI 上游 429 触发文本归一化补全**：`src/lib/gemini/prompt-normalizer.mjs` 新增带代码围栏保护的幂等规则，覆盖二分定位的 4 项触发词——Claude Code `2.1.332` `<pasted_content>` 警告、官方 `pi`、`omp`（含 Hashline `UNSEEN. Re-read first.`）与 Codex CLI `0.171.0`，同步扩展 `detectCliFamily` 与 `LEADING_CLI_IDENTITY_RE`（#1816）。
+- **Gemini 串行每小时健康探测缓存与设置页控制**：`src/lib/admin/health-probe.mjs` 扩展支持 `gemini-*` 模型（默认探测间隔 `3600s`、缓存 TTL `5400s`），跨全部入站协议（Google 原生、OpenAI Chat/Responses、Anthropic Messages 流式与非流式）与 CRAGGemini/API 通道直接命中缓存，全网关 Claude/OpenAI/Gemini 探测统一走单串行队列（`concurrency = 1`）；前端 **设置 → 探测 → 健康缓存**（`web/src/features/settings/health-pane.tsx`）新增 Gemini 开关、间隔、TTL、探测模型、快照展示与立即探测按钮（#1815）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、`deploy/payload.json`（CRAG `3.1.20` 与 CRAGGemini `0.4.10`）以及 Gemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）；`bin/kin-kernel`、`share/wrap-cli` 与数据库迁移未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步脚本并切换 `0.4.10` 加密载荷后需重启 `vm2api-gemini` 生效，CRAG `3.1.20` 经面板内核页或 `install.sh` 升级生效。
+
 ## 1.4.213 — 2026-11-25 · Google/Gemini 独立模型策略、`medium` 默认思考强度与模型/计费定价页接入
 
 - **Google / Gemini 独立模型策略与 `medium` 默认思考强度**：新增 `src/lib/protocol/gemini-model-policy.mjs`（持久化键 `gemini_model_policy`），严格作用于 `gemini-*` 系列与 Gemini 槽位，缺省为所有 Gemini 模型启用 `default_effort: 'medium'`；新增 `GET/PUT/POST /api/panel/model-policy?platform=google`、`POST /api/panel/model-policy/sync-gemini` 与 `catalog-monitor` 定时同步（融合实时 Gemini 槽位、Gemini API 端点与 `models.dev` Google 目录）；在全部入站协议（`gemini`、`openai-chat`、`openai-responses`、`anthropic`）省略思考强度时自动注入默认 `medium`（显式指定强度或关闭思考时保持原样，且不破坏 CRAGGemini SHM 最小载荷约束），支持无后缀 Gemini 模型在 Antigravity 槽位解析到 `-medium` 档位，并在 `scheduler.catalog()` / `scheduler.stream()` 执行启停策略开关（#1811）。

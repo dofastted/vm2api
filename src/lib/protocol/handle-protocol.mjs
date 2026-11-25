@@ -265,9 +265,9 @@ export function createHandleProtocol(deps) {
   const requestLog = deps.requestLog
   const stickyRouter = deps.stickyRouter
   const getBatchGroups = () =>
-    (deps.batchGroups ||= new BatchGroups({
-      onExpire: (memberKey) => stickyRouter?.unbind?.(scopeStickyKey(memberKey, 'anthropic')),
-    }))
+  (deps.batchGroups ||= new BatchGroups({
+    onExpire: (memberKey) => stickyRouter?.unbind?.(scopeStickyKey(memberKey, 'anthropic')),
+  }))
   const accountQuota = deps.accountQuota
   const apiKeyStore = deps.apiKeyStore
   const apiScheduler = deps.apiScheduler
@@ -303,7 +303,7 @@ export function createHandleProtocol(deps) {
         rateMultiplier,
         officialCost: priced.total_cost,
       })
-    } catch {}
+    } catch { }
   }
 
   function respondKeyGateError(res, gate) {
@@ -347,7 +347,7 @@ export function createHandleProtocol(deps) {
         rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey.group_id ?? 1),
         officialCost: priced.total_cost,
       })
-    } catch {}
+    } catch { }
   }
 
   /** Codex handlers take the same managed-key acquire / release / spend as the Claude paths. */
@@ -366,7 +366,7 @@ export function createHandleProtocol(deps) {
     } finally {
       try {
         apiKeyStore.release(managedKey)
-      } catch {}
+      } catch { }
       billCodexKey(managedKey, logBag)
     }
   }
@@ -411,9 +411,9 @@ export function createHandleProtocol(deps) {
     const mapped = policyRefusal
       ? upstreamRiskClientError(logBag.risk_upstream_reason, logBag.risk_request_id)
       : rewritePoolErrorForClient(
-          mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
-          result?.body,
-        )
+        mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
+        result?.body,
+      )
     if (mapped.body.error.code === ErrorCode.POOL_OVERLOADED && result?.poolReason === 'subagent_limit') {
       mapped.body.error.details = { reason: result.poolReason }
     }
@@ -739,7 +739,7 @@ export function createHandleProtocol(deps) {
           rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
           ...logBag,
         })
-      } catch {}
+      } catch { }
     })
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
@@ -949,7 +949,9 @@ export function createHandleProtocol(deps) {
         logBag.usage = healthDecision.snapshot?.body?.usage || { input_tokens: 0, output_tokens: 0 }
         logBag.stop_reason = healthDecision.snapshot?.body?.stop_reason || 'end_turn'
         logBag.final_state = healthDecision.via
-        if (isClientStream(inbound, req.headers)) {
+        const wantHealthStream =
+          protocol === 'google.gemini' ? routeMeta?.routeStream === true : isClientStream(inbound, req.headers)
+        if (wantHealthStream) {
           writeSSEHeaders(res)
           res.write(formatHealthSse(protocol, inbound, healthDecision.snapshot || {}, hpCfg))
           return res.end()
@@ -1084,14 +1086,14 @@ export function createHandleProtocol(deps) {
     const imageModel = inferenceBackend === 'api' ? null : canonicalImageToolModel(ctx.body?.model)
     const platform = apiPicked
       ? {
-          ok: true,
-          platform:
-            apiPicked.endpoint.protocol === 'openai'
-              ? 'openai'
-              : apiPicked.endpoint.protocol === 'gemini'
-                ? 'gemini'
-                : 'anthropic',
-        }
+        ok: true,
+        platform:
+          apiPicked.endpoint.protocol === 'openai'
+            ? 'openai'
+            : apiPicked.endpoint.protocol === 'gemini'
+              ? 'gemini'
+              : 'anthropic',
+      }
       : imageModel
         ? { ok: true, platform: 'openai' }
         : detectInboundPlatform(ctx.body?.model)
@@ -1334,12 +1336,12 @@ export function createHandleProtocol(deps) {
       const accountGate = !scopedRiskGate
         ? null
         : (account) =>
-            applyProtocolIntercept({
-              ...gateArgs,
-              body: auditBody,
-              account,
-              skipMandatory: true,
-            })
+          applyProtocolIntercept({
+            ...gateArgs,
+            body: auditBody,
+            account,
+            skipMandatory: true,
+          })
       if (protocol === 'anthropic.messages') {
         const codex = normalizeCodexRouting(routing.codex)
         return runWithCodexKey(req, res, logBag, () =>
@@ -1445,14 +1447,14 @@ export function createHandleProtocol(deps) {
         apiGemini || (apiOpenAI && protocol === 'openai.responses')
           ? { claude: ctx.body, mode: 'passthrough' }
           : toClaudeMessages(protocol, ctx.body, {
-              rewrite: rewriteEnabled,
-              model_map: false,
-              preserve_content_shape: officialPassthrough,
-              onSystemBlock:
-                inferenceBackend !== 'api' && !officialPassthrough
-                  ? trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
-                  : undefined,
-            })
+            rewrite: rewriteEnabled,
+            model_map: false,
+            preserve_content_shape: officialPassthrough,
+            onSystemBlock:
+              inferenceBackend !== 'api' && !officialPassthrough
+                ? trackCallerSystemBlock(ctx.body?.system, callerEnvironment)
+                : undefined,
+          })
     } catch (error) {
       if (
         !['invalid_responses_conversion', 'invalid_messages_conversion', 'thinking_incompatible'].includes(error.code)
@@ -1625,14 +1627,14 @@ export function createHandleProtocol(deps) {
       ? { stickyKey: null, stickyKeys: [] }
       : stickyRouter?.sessionPoolKeys
         ? stickyRouter.sessionPoolKeys(req, inbound, {
-            sessionId: inboundIdentity.sessionId,
-            deviceId: stickyDeviceId,
-            migrate: !isProbe,
-          })
+          sessionId: inboundIdentity.sessionId,
+          deviceId: stickyDeviceId,
+          migrate: !isProbe,
+        })
         : {
-            stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
-            stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
-          }
+          stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
+          stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
+        }
     // Sessionless batch traffic: stick (key, workload) to a small elastic group
     // of accounts instead of fanning out over the pool. See pool/batch-group.mjs.
     let batchPick = null
@@ -1691,7 +1693,7 @@ export function createHandleProtocol(deps) {
     try {
       const disk = routingConfigPath ? readJsonParsedCached(routingConfigPath) : null
       if (disk) routingForCacheTtl = disk
-    } catch {}
+    } catch { }
     const requestedCacheTtl = pinConversationCacheTtl(
       stickyKey || callerSession || outboundSessionId,
       resolveCacheTtl({
@@ -1799,11 +1801,11 @@ export function createHandleProtocol(deps) {
         requestContext || apiNonAnthropic || preserveApiCallerBody
           ? 0
           : personaHideForUnofficial(personaIn, ctx.body, {
-              officialClient: officialPassthrough,
-              mode: personaMode,
-              hides: personaHidesUsageFromRoutingFile(routingConfigPath),
-              standing: standingUsageFromRoutingFile(routingConfigPath),
-            })
+            officialClient: officialPassthrough,
+            mode: personaMode,
+            hides: personaHidesUsageFromRoutingFile(routingConfigPath),
+            standing: standingUsageFromRoutingFile(routingConfigPath),
+          })
     }
 
     if (inferenceBackend === 'api') {
@@ -1871,7 +1873,7 @@ export function createHandleProtocol(deps) {
         if (managedKey) {
           try {
             apiKeyStore.release(managedKey)
-          } catch {}
+          } catch { }
         }
       }
       // The api backend forwards the converted body untouched: its session is the outbound one.
@@ -1945,12 +1947,12 @@ export function createHandleProtocol(deps) {
           output = apiOpenAI
             ? result.body
             : fromClaudeToResponses(
-                clientBody,
-                inbound.model,
-                result.endpointId,
-                converted.mode,
-                converted.responseTools,
-              )
+              clientBody,
+              inbound.model,
+              result.endpointId,
+              converted.mode,
+              converted.responseTools,
+            )
       }
       return sendPublicJson(output)
     }
@@ -1980,34 +1982,34 @@ export function createHandleProtocol(deps) {
     const anthropicSseErrorRemapper =
       clientStream && protocol === 'anthropic.messages'
         ? createAnthropicSseErrorRemapper({
-            isStarted: () => streamTracker?.hasStarted() === true,
-            // The client is told to retry, so the real cause has to survive here or
-            // it survives nowhere: this relay path sets no other logBag fields, and
-            // a deterministic capture fault would otherwise read exactly like a
-            // transient disconnect while the client retries into it.
-            onRetryableTruncation: (payload, mapped) => {
-              const raw = payload?.error || payload || {}
-              logBag.client_error_type = 'rate_limit_error'
-              logBag.truncation_reason = 'mid_stream_error'
-              logBag.error_code = raw.code || raw.type || mapped?.body?.error?.code || logBag.error_code || null
-              logBag.error_message = raw.message || mapped?.body?.error?.message || logBag.error_message || null
-            },
-          })
+          isStarted: () => streamTracker?.hasStarted() === true,
+          // The client is told to retry, so the real cause has to survive here or
+          // it survives nowhere: this relay path sets no other logBag fields, and
+          // a deterministic capture fault would otherwise read exactly like a
+          // transient disconnect while the client retries into it.
+          onRetryableTruncation: (payload, mapped) => {
+            const raw = payload?.error || payload || {}
+            logBag.client_error_type = 'rate_limit_error'
+            logBag.truncation_reason = 'mid_stream_error'
+            logBag.error_code = raw.code || raw.type || mapped?.body?.error?.code || logBag.error_code || null
+            logBag.error_message = raw.message || mapped?.body?.error?.message || logBag.error_message || null
+          },
+        })
         : null
     // One keepalive for the whole Claude stream, including session/seat queues
     // and the gaps between failover attempts. OpenAI keeps its per-attempt one.
     const anthropicKeepalive =
       clientStream && protocol === 'anthropic.messages' && streamKeepaliveMs > 0
         ? createDownstreamKeepalive({
-            intervalMs: streamKeepaliveMs,
-            userAgent: req.headers['user-agent'] || req.headers['User-Agent'] || '',
-            protocol,
-            write: (chunk) => {
-              if (res.writableEnded || res.destroyed) return
-              if (!res.headersSent) writeSSEHeaders(res)
-              res.write(chunk)
-            },
-          })
+          intervalMs: streamKeepaliveMs,
+          userAgent: req.headers['user-agent'] || req.headers['User-Agent'] || '',
+          protocol,
+          write: (chunk) => {
+            if (res.writableEnded || res.destroyed) return
+            if (!res.headersSent) writeSSEHeaders(res)
+            res.write(chunk)
+          },
+        })
         : null
     anthropicKeepalive?.armAfter(queueKeepaliveDelay)
     const upstreamStream = true
@@ -2661,7 +2663,7 @@ export function createHandleProtocol(deps) {
       if (managedKey) {
         try {
           apiKeyStore.release(managedKey)
-        } catch {}
+        } catch { }
       }
     }
 
@@ -2687,14 +2689,14 @@ export function createHandleProtocol(deps) {
           usage_complete: provider?.usage_complete === true,
           ...(provider?.schema_version === 2
             ? {
-                provider_complete: provider.provider_complete,
-                handoff_complete: provider.handoff_complete ?? null,
-                delivery_complete: provider.delivery_complete ?? null,
-                response_valid: provider.response_valid ?? null,
-                source: provider.source ?? null,
-                http_status: provider.http_status ?? null,
-                public_status: provider.public_status ?? null,
-              }
+              provider_complete: provider.provider_complete,
+              handoff_complete: provider.handoff_complete ?? null,
+              delivery_complete: provider.delivery_complete ?? null,
+              response_valid: provider.response_valid ?? null,
+              source: provider.source ?? null,
+              http_status: provider.http_status ?? null,
+              public_status: provider.public_status ?? null,
+            }
             : {}),
         },
       }
@@ -2764,7 +2766,7 @@ export function createHandleProtocol(deps) {
           const vm = getVm(cfg.paths.project, result.vmId)
           if (vm) pool.syncQuotaSchedule(vm)
         }
-      } catch {}
+      } catch { }
       attachPricing(logBag, {
         managedKey,
         rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
@@ -2902,7 +2904,7 @@ export function createHandleProtocol(deps) {
           rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
           ...logBag,
         })
-      } catch {}
+      } catch { }
     })
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
@@ -2993,14 +2995,14 @@ export function createHandleProtocol(deps) {
     const keepalive =
       stream && streamKeepaliveMs > 0
         ? createDownstreamKeepalive({
-            intervalMs: streamKeepaliveMs,
-            protocol,
-            write: (chunk) => {
-              if (responseClosed(res)) return
-              if (!res.headersSent) writeSSEHeaders(res)
-              res.write(chunk)
-            },
-          })
+          intervalMs: streamKeepaliveMs,
+          protocol,
+          write: (chunk) => {
+            if (responseClosed(res)) return
+            if (!res.headersSent) writeSSEHeaders(res)
+            res.write(chunk)
+          },
+        })
         : null
     let reply = null
     try {
@@ -3092,7 +3094,7 @@ export function createHandleProtocol(deps) {
           rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
           ...logBag,
         })
-      } catch {}
+      } catch { }
     })
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
