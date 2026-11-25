@@ -186,6 +186,92 @@ export function multiplierBadgeClass(multiplier: number): string {
 
 // ---------- 模型 ----------
 
+const GEMINI_MODEL_PREFIX_RE = /^gemini-/i
+const GEMINI_PAREN_EFFORT_RE = /\(([^()]+)\)$/
+const GEMINI_TIER_SUFFIX_RE =
+  /-(minimal|low|medium|high|xhigh|extra-high|max)$/i
+
+function normalizeGeminiTierToken(raw: string): string | null {
+  const s = raw
+    .trim()
+    .toLowerCase()
+    .replace(/^thinking_level_/, '')
+  if (!s) return null
+  if (s === 'none' || s === 'off' || s === 'disabled' || s === '0')
+    return 'none'
+  if (s === 'minimal' || s === 'min') return 'minimal'
+  if (s === 'low') return 'low'
+  if (s === 'medium' || s === 'med' || s === 'auto' || s === 'adaptive')
+    return 'medium'
+  if (s === 'high') return 'high'
+  if (s === 'xhigh' || s === 'extra_high' || s === 'extra-high' || s === 'max')
+    return 'xhigh'
+  if (/^\d+$/.test(s)) {
+    const n = Number(s)
+    if (n === 0) return 'none'
+    if (n <= 1024) return 'minimal'
+    if (n <= 4096) return 'low'
+    if (n <= 12288) return 'medium'
+    if (n <= 24576) return 'high'
+    return 'xhigh'
+  }
+  return null
+}
+
+function parseGeminiModelForAudit(
+  raw: string
+): { base: string; effort: string | null } | null {
+  let work = raw.trim().split('/').filter(Boolean).pop() ?? ''
+  if (!work) return null
+  work = work.replace(/\[1m\]$/i, '').toLowerCase()
+  if (!GEMINI_MODEL_PREFIX_RE.test(work)) return null
+  let effort: string | null = null
+  const paren = GEMINI_PAREN_EFFORT_RE.exec(work)
+  if (paren && paren.index > 0) {
+    const parsed = normalizeGeminiTierToken(paren[1])
+    if (parsed) {
+      effort = parsed
+      work = work.slice(0, paren.index)
+    }
+  }
+  work = work.replace(/-thinking$/i, '')
+  const suffix = GEMINI_TIER_SUFFIX_RE.exec(work)
+  if (suffix && suffix.index > 0) {
+    if (!effort) effort = normalizeGeminiTierToken(suffix[1])
+    work = work.slice(0, suffix.index)
+  }
+  work = work.replace(/-thinking$/i, '')
+  return { base: work, effort }
+}
+
+/**
+ * Gemini 请求通常带思考档位后缀（如 `gemini-4-neon-high` / `gemini-4-neon(high)`），
+ * 上游 `modelVersion` 只回显基础模型名（`gemini-4-neon`）。基础模型一致且未出现显式
+ * 档位冲突（如 `high` 降成 `low`）时视为同一模型，不作为响应模型不一致告警。
+ */
+export function isGeminiTierEquivalentModel(
+  requested: string | null | undefined,
+  actual: string | null | undefined
+): boolean {
+  if (!requested || !actual) return false
+  const norm = (m: string) =>
+    (m.trim().split('/').filter(Boolean).pop() ?? '')
+      .replace(/\[1m\]$/i, '')
+      .toLowerCase()
+  const normReq = norm(requested)
+  const normAct = norm(actual)
+  if (normReq === normAct) return true
+  const reqGemini = parseGeminiModelForAudit(normReq)
+  const actGemini = parseGeminiModelForAudit(normAct)
+  if (!reqGemini || !actGemini || reqGemini.base !== actGemini.base)
+    return false
+  return (
+    !reqGemini.effort ||
+    !actGemini.effort ||
+    reqGemini.effort === actGemini.effort
+  )
+}
+
 export type ModelAuditDisplay = {
   /** 列表主显示 / 计费模型。 */
   primaryBillingModel: string | null
@@ -208,12 +294,16 @@ export function resolveModelAuditDisplay(row: {
   const hasActualMismatch = Boolean(
     row.actualResponseModel &&
     effectiveRequestModel &&
-    row.actualResponseModel !== effectiveRequestModel
+    row.actualResponseModel !== effectiveRequestModel &&
+    !isGeminiTierEquivalentModel(effectiveRequestModel, row.actualResponseModel)
   )
   return {
     primaryBillingModel: effectiveRequestModel,
     hasRedirect: Boolean(
-      row.originalModel && row.model && row.originalModel !== row.model
+      row.originalModel &&
+      row.model &&
+      row.originalModel !== row.model &&
+      !isGeminiTierEquivalentModel(row.originalModel, row.model)
     ),
     hasActualMismatch,
     secondaryActualModel: hasActualMismatch ? row.actualResponseModel : null,

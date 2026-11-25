@@ -951,3 +951,99 @@ test('Gemini OAuth preserves upstream-reported modelVersion in logs, model_misma
   assert.equal(rows[3].upstream_model, 'gemini-4-hydrogen-high')
   assert.equal(rows[3].model_mismatch, 0)
 })
+
+test('Gemini thinking-suffix request with bare upstream modelVersion does not flag model_mismatch', async (t) => {
+  const store = tmpLogStore('normal')
+  t.after(() => {
+    store.db.close()
+    fs.rmSync(store.dataDir, { recursive: true, force: true })
+  })
+
+  let script = []
+  const scheduler = createGeminiScheduler({
+    callHost: async (op) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-neon',
+              proxy_id: 'px-1',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-4-neon-high', 'gemini-4-neon-medium', 'gemini-4-neon'],
+              capabilities: [...FULL_GEMINI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') return { id: 'env-neon', proxy_id: 'px-1', auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async () => delayedSseResponse(script),
+    resolveProxy: () => 'socks5h://192.0.2.10:1080',
+  })
+
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler,
+    requestLog: store,
+    groupsRepo: { rateMultiplier: () => 1 },
+    apiKeyStore: { users: { getById: () => ({ id: 9, role: 'admin' }) } },
+  })
+
+  // 1. Requested `gemini-4-neon-high`, upstream echoes bare `gemini-4-neon` -> same model, no mismatch.
+  script = [
+    `data: ${JSON.stringify({
+      candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+      modelVersion: 'gemini-4-neon',
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, thoughtsTokenCount: 20, totalTokenCount: 35 },
+    })}\n\n`,
+  ]
+  const resBare = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-neon-high:streamGenerateContent?alt=sse',
+      body: {
+        contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+        generationConfig: { thinkingConfig: { includeThoughts: true, thinkingLevel: 'high' } },
+      },
+    }),
+    resBare,
+  )
+  assert.equal(resBare.statusCode, 200)
+
+  // 2. Requested `gemini-4-neon-high`, upstream explicitly reports lower tier `gemini-4-neon-low` -> real mismatch.
+  script = [
+    `data: ${JSON.stringify({
+      candidates: [{ content: { role: 'model', parts: [{ text: 'downgraded' }] }, finishReason: 'STOP' }],
+      modelVersion: 'gemini-4-neon-low',
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+    })}\n\n`,
+  ]
+  const resDowngrade = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-neon-high:streamGenerateContent?alt=sse',
+      body: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
+    }),
+    resDowngrade,
+  )
+  assert.equal(resDowngrade.statusCode, 200)
+
+  const rows = store.db
+    .prepare(
+      'SELECT requested_model, upstream_model, model_mismatch, reasoning_effort FROM usage_logs ORDER BY rowid ASC',
+    )
+    .all()
+  assert.equal(rows.length, 2)
+  assert.equal(rows[0].requested_model, 'gemini-4-neon-high')
+  assert.equal(rows[0].upstream_model, 'gemini-4-neon')
+  assert.equal(rows[0].model_mismatch, 0)
+  assert.equal(rows[0].reasoning_effort, 'high')
+  assert.equal(rows[1].requested_model, 'gemini-4-neon-high')
+  assert.equal(rows[1].upstream_model, 'gemini-4-neon-low')
+  assert.equal(rows[1].model_mismatch, 1)
+})

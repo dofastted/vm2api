@@ -7,6 +7,7 @@ import {
   chainItemStatus,
   finalChainItem,
   formatShortDistance,
+  isGeminiTierEquivalentModel,
   latencySegments,
   resolveModelAuditDisplay,
   segmentWidth,
@@ -278,6 +279,56 @@ describe('display helpers', () => {
     expect(audit.primaryBillingModel).toBe('claude-y')
     expect(audit.hasRedirect).toBe(true)
     expect(audit.secondaryActualModel).toBe('claude-z')
+  })
+
+  it('treats Gemini thinking-tier suffix vs bare upstream modelVersion as matching', () => {
+    const bareEcho = resolveModelAuditDisplay({
+      originalModel: 'gemini-4-neon-high',
+      model: 'gemini-4-neon-high',
+      actualResponseModel: 'gemini-4-neon',
+    })
+    expect(bareEcho.primaryBillingModel).toBe('gemini-4-neon-high')
+    expect(bareEcho.hasRedirect).toBe(false)
+    expect(bareEcho.hasActualMismatch).toBe(false)
+    expect(bareEcho.secondaryActualModel).toBeNull()
+
+    const parenEcho = resolveModelAuditDisplay({
+      originalModel: 'gemini-4-neon(high)[1m]',
+      model: 'gemini-4-neon-high',
+      actualResponseModel: 'gemini-4-neon',
+    })
+    expect(parenEcho.hasRedirect).toBe(false)
+    expect(parenEcho.hasActualMismatch).toBe(false)
+
+    expect(
+      isGeminiTierEquivalentModel('gemini-2.5-pro-thinking', 'gemini-2.5-pro')
+    ).toBe(true)
+    expect(
+      isGeminiTierEquivalentModel(
+        'models/gemini-4-neon-medium',
+        'gemini-4-neon'
+      )
+    ).toBe(true)
+
+    const tierDowngrade = resolveModelAuditDisplay({
+      originalModel: 'gemini-4-neon-high',
+      model: 'gemini-4-neon-high',
+      actualResponseModel: 'gemini-4-neon-low',
+    })
+    expect(tierDowngrade.hasActualMismatch).toBe(true)
+    expect(tierDowngrade.secondaryActualModel).toBe('gemini-4-neon-low')
+
+    const crossModel = resolveModelAuditDisplay({
+      originalModel: 'gemini-4-hydrogen-high',
+      model: 'gemini-4-hydrogen-high',
+      actualResponseModel: 'gemini-4-neon',
+    })
+    expect(crossModel.hasActualMismatch).toBe(true)
+    expect(crossModel.secondaryActualModel).toBe('gemini-4-neon')
+
+    expect(
+      isGeminiTierEquivalentModel('gemini-3.1-pro-preview', 'gemini-3.1-pro')
+    ).toBe(false)
   })
 })
 

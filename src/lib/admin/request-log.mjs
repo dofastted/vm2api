@@ -24,7 +24,7 @@ import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
 import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
 import { disjointOpenaiUsage } from '../protocol/openai-usage.mjs'
-import { REASONING_EFFORTS, sessionIdForLog } from '../protocol/log-fields.mjs'
+import { REASONING_EFFORTS, modelMismatch, sessionIdForLog } from '../protocol/log-fields.mjs'
 
 /** Persist the token a client actually sent — only for failed ingress auth. */
 export function presentedApiKeyForLog(token) {
@@ -321,19 +321,6 @@ function costColumnsForLog(usage, model, extra = {}) {
     speed: priced.speed ?? null,
     long_context: priced.long_context ?? null,
   }
-}
-
-/** Tri-state model mismatch: null = upstream did not declare a model. */
-function modelMismatch(requested, upstream) {
-  if (!requested || !upstream) return null
-  const norm = (m) =>
-    String(m)
-      .split('/')
-      .filter(Boolean)
-      .pop()
-      .replace(/\[1m\]$/i, '')
-      .toLowerCase()
-  return norm(requested) === norm(upstream) ? 0 : 1
 }
 
 function redactHeaders(headers = {}) {

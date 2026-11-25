@@ -143,3 +143,88 @@ export function sessionIdForLog(value) {
   const s = String(value ?? '').trim()
   return s ? s.slice(0, SESSION_ID_MAX) : null
 }
+
+const GEMINI_MODEL_PREFIX_RE = /^gemini-/i
+const GEMINI_PAREN_EFFORT_RE = /\(([^()]+)\)$/
+const GEMINI_TIER_SUFFIX_RE = /-(minimal|low|medium|high|xhigh|extra-high|max)$/i
+
+function normalizeGeminiTierToken(raw) {
+  const s = String(raw || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^thinking_level_/, '')
+  if (!s) return null
+  if (s === 'none' || s === 'off' || s === 'disabled' || s === '0') return 'none'
+  if (s === 'minimal' || s === 'min') return 'minimal'
+  if (s === 'low') return 'low'
+  if (s === 'medium' || s === 'med' || s === 'auto' || s === 'adaptive') return 'medium'
+  if (s === 'high') return 'high'
+  if (s === 'xhigh' || s === 'extra_high' || s === 'extra-high' || s === 'max') return 'xhigh'
+  if (/^\d+$/.test(s)) {
+    const n = Number(s)
+    if (n === 0) return 'none'
+    if (n <= 1024) return 'minimal'
+    if (n <= 4096) return 'low'
+    if (n <= 12288) return 'medium'
+    if (n <= 24576) return 'high'
+    return 'xhigh'
+  }
+  return null
+}
+
+function parseGeminiModelForAudit(raw) {
+  let work = String(raw || '')
+    .trim()
+    .split('/')
+    .filter(Boolean)
+    .pop()
+  if (!work) return null
+  work = work.replace(/\[1m\]$/i, '').toLowerCase()
+  if (!GEMINI_MODEL_PREFIX_RE.test(work)) return null
+  let effort = null
+  const paren = GEMINI_PAREN_EFFORT_RE.exec(work)
+  if (paren && paren.index > 0) {
+    const parsed = normalizeGeminiTierToken(paren[1])
+    if (parsed) {
+      effort = parsed
+      work = work.slice(0, paren.index)
+    }
+  }
+  work = work.replace(/-thinking$/i, '')
+  const suffix = GEMINI_TIER_SUFFIX_RE.exec(work)
+  if (suffix && suffix.index > 0) {
+    if (!effort) effort = normalizeGeminiTierToken(suffix[1])
+    work = work.slice(0, suffix.index)
+  }
+  work = work.replace(/-thinking$/i, '')
+  return { base: work, effort }
+}
+
+/**
+ * Tri-state model mismatch: null = upstream did not declare a model, 0 = match, 1 = mismatch.
+ * Gemini models commonly carry a thinking-tier suffix (e.g. `gemini-4-neon-high`,
+ * `gemini-4-neon(high)`, `gemini-2.5-pro-thinking`) while upstream `modelVersion`
+ * echoes the bare base model (`gemini-4-neon`). Treat them as matching when the base
+ * model matches and neither side contradicts the other's explicit tier.
+ */
+export function modelMismatch(requested, upstream) {
+  if (!requested || !upstream) return null
+  const norm = (m) =>
+    String(m)
+      .split('/')
+      .filter(Boolean)
+      .pop()
+      .replace(/\[1m\]$/i, '')
+      .toLowerCase()
+  const normReq = norm(requested)
+  const normUp = norm(upstream)
+  if (normReq === normUp) return 0
+  const reqGemini = parseGeminiModelForAudit(normReq)
+  const upGemini = parseGeminiModelForAudit(normUp)
+  if (reqGemini && upGemini && reqGemini.base === upGemini.base) {
+    if (!reqGemini.effort || !upGemini.effort || reqGemini.effort === upGemini.effort) {
+      return 0
+    }
+  }
+  return 1
+}
