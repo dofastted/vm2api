@@ -100,6 +100,8 @@ export type HealthSnapshotView = {
   model: string | null
   error: string | null
   age_ms: number | null
+  next_at?: string | null
+  cache_ttl_sec?: number
 }
 
 export type HealthProbePayload = {
@@ -108,6 +110,7 @@ export type HealthProbePayload = {
   snapshots: {
     anthropic: HealthSnapshotView
     openai: HealthSnapshotView
+    gemini?: HealthSnapshotView
   } | null
 }
 
@@ -116,6 +119,14 @@ export function healthProbeQueryOptions() {
     queryKey: ['panel', 'health-probe'] as const,
     queryFn: () => api<HealthProbePayload>('/api/panel/health-probe'),
     refetchInterval: 30_000,
+  })
+}
+
+export function runHealthProbe(platform: 'all' | 'gemini' = 'all') {
+  return api<HealthProbePayload>('/api/panel/health-probe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ platform }),
   })
 }
 
