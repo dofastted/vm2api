@@ -1580,3 +1580,139 @@ describe('CRAG 买家页消费 presentation.layout', () => {
     })
   })
 })
+
+describe('CRAG 画布本地缓存、哈希跳过与防超时加载', () => {
+  const hash1 = '1'.repeat(64)
+  const hash2 = '2'.repeat(64)
+
+  function makeStorage(initial: Record<string, string> = {}) {
+    const store = new Map(Object.entries(initial))
+    return {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        store.set(key, value)
+      },
+      removeItem: (key: string) => {
+        store.delete(key)
+      },
+      snapshot: () => Object.fromEntries(store),
+    }
+  }
+
+  function stubBrowserEnv() {
+    vi.stubGlobal('window', {
+      setTimeout,
+      clearTimeout,
+      setInterval,
+      clearInterval,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })
+  }
+
+  it('首屏直接从 localStorage 回填缓存画布，哈希不变时不覆盖状态也不刷新修订', async () => {
+    state.values = []
+    const storage = makeStorage({
+      'vm2api:crag-shop:catalog:v1:panel': JSON.stringify({
+        ...catalog,
+        catalog_hash: hash1,
+        presentation: { title: '缓存画布标题', plans_title: '缓存套餐区' },
+      }),
+    })
+    vi.stubGlobal('localStorage', storage)
+    stubBrowserEnv()
+    vi.mocked(api).mockResolvedValueOnce({
+      unchanged: true,
+      catalog_hash: hash1,
+    })
+
+    // First render uses hydrated cache directly (no loading skeleton!).
+    const html = render()
+    expect(html).toContain('缓存画布标题')
+    expect(html).toContain('缓存套餐区')
+    expect(html).not.toContain('正在查询套餐')
+
+    // Run catalog effect (index 1: 0=pageshow, 1=catalog, 2=orders).
+    const catalogEffect = vi.mocked(useEffect).mock.calls[1]?.[0]
+    const cleanup = catalogEffect?.()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(api).toHaveBeenCalledWith(
+      `/api/panel/crag-shop/plans?hash=${hash1}`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    )
+    // Unchanged hash preserves catalog state and does not bump catalogRevision.
+    expect(state.values[1]).toMatchObject({
+      status: 'ready',
+      data: { catalog_hash: hash1 },
+    })
+    expect(state.values[2]).toBe(0)
+    if (typeof cleanup === 'function') cleanup()
+  })
+
+  it('已缓存画布在刷新超时或报错时不被清空，只有新哈希到来才更新本地缓存', async () => {
+    vi.useFakeTimers()
+    state.values = []
+    const storage = makeStorage({
+      'vm2api:crag-shop:catalog:v1:panel': JSON.stringify({
+        ...catalog,
+        catalog_hash: hash1,
+        presentation: { title: '旧版缓存画布' },
+      }),
+    })
+    vi.stubGlobal('localStorage', storage)
+    stubBrowserEnv()
+
+    // First fetch hangs and triggers catalog timeout.
+    vi.mocked(api).mockImplementationOnce(
+      (_path, opts) =>
+        new Promise((_resolve, reject) => {
+          opts?.signal?.addEventListener('abort', () =>
+            reject(new DOMException('timeout', 'AbortError'))
+          )
+        })
+    )
+    render()
+    const catalogEffect = vi.mocked(useEffect).mock.calls[1]?.[0]
+    const cleanup = catalogEffect?.()
+    await vi.advanceTimersByTimeAsync(15_000)
+
+    // Timeout must NOT wipe out the already-rendered cached canvas.
+    expect(state.values[1]).toMatchObject({
+      status: 'ready',
+      data: { presentation: { title: '旧版缓存画布' } },
+    })
+    expect(render()).toContain('旧版缓存画布')
+    expect(render()).not.toContain('暂时无法确认可售套餐')
+
+    // Manual refresh passes refresh=1 and updates cache when hash changes.
+    vi.mocked(api).mockResolvedValueOnce({
+      ...catalog,
+      catalog_hash: hash2,
+      presentation: { title: '新版发布画布' },
+    })
+    click('刷新套餐')
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(api).toHaveBeenLastCalledWith(
+      `/api/panel/crag-shop/plans?hash=${hash1}&refresh=1`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    )
+    expect(state.values[1]).toMatchObject({
+      status: 'ready',
+      data: { catalog_hash: hash2, presentation: { title: '新版发布画布' } },
+    })
+    expect(state.values[2]).toBe(1)
+    expect(storage.snapshot()['vm2api:crag-shop:catalog:v1:panel']).toContain(
+      '新版发布画布'
+    )
+    if (typeof cleanup === 'function') cleanup()
+  })
+})

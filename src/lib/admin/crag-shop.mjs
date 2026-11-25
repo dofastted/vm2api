@@ -32,7 +32,40 @@ const UNPAID_STATES = ORDER_STATES.slice(0, ORDER_STATES.indexOf('paid'))
 // expired, so an unpaid order older than this is closed locally — but only after the
 // supplier confirms it is still unpaid, so a late payment is never dropped.
 const PAYMENT_WINDOW = 30 * 60
+const CATALOG_CACHE_KEY = 'crag_shop_catalog_cache_v1'
+const CATALOG_FRESH_MS = 60_000
+const CATALOG_REVALIDATE_COOLDOWN_MS = 3_000
 const nowSeconds = () => Math.floor(Date.now() / 1000)
+const isCatalogHash = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  const keys = Object.keys(value)
+    .filter((key) => value[key] !== undefined)
+    .sort()
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+}
+
+export function catalogHash(catalog) {
+  return createHash('sha256').update(canonicalJson(catalog)).digest('hex')
+}
+
+function etagMatches(header, hash) {
+  if (typeof header !== 'string' || !header.trim()) return false
+  const target = `"${hash}"`
+  for (const part of header.split(',')) {
+    const candidate = part.trim()
+    if (candidate === '*') return true
+    const normalized = candidate.startsWith('W/') ? candidate.slice(2).trim() : candidate
+    if (normalized === target || normalized === hash) return true
+  }
+  return false
+}
+
+function isCachedCatalogPayload(value) {
+  return object(value) && Array.isArray(value.plans) && Array.isArray(value.payment_methods)
+}
 
 export const isCragShopPath = (pathname) => pathname === ROOT || pathname.startsWith(`${ROOT}/`)
 export const isCragDeviceShopPath = (pathname) => pathname.startsWith(`${DEVICE_ROOT}/`)
@@ -573,8 +606,182 @@ export function createCragShopHandler({
   allowDeviceRequest = () => true,
   activationEnabled = true,
   supplier = createShopSupplier(),
+  catalogCacheTtlMs = CATALOG_FRESH_MS,
+  nowMs = () => Date.now(),
 }) {
   const project = (row) => view(row, activationEnabled)
+  const catalogCache = new Map()
+  const inflightCatalog = new Map()
+  let hydratedDb = null
+
+  function hydrateCatalogCache() {
+    let db
+    try {
+      db = getDb?.()
+    } catch {
+      return
+    }
+    if (!db || hydratedDb === db) return
+    hydratedDb = db
+    try {
+      const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(CATALOG_CACHE_KEY)
+      if (!row?.value) return
+      const parsed = JSON.parse(row.value)
+      if (!object(parsed)) return
+      for (const scope of ['public', 'pilot']) {
+        const saved = parsed[scope]
+        if (!object(saved) || !isCachedCatalogPayload(saved.catalog)) continue
+        const hash = catalogHash(saved.catalog)
+        catalogCache.set(scope, {
+          catalog: saved.catalog,
+          hash,
+          etag: typeof saved.etag === 'string' && saved.etag ? saved.etag : `"${hash}"`,
+          fetchedAt: Number.isFinite(saved.fetched_at) ? saved.fetched_at : 0,
+          checkedAt: 0,
+        })
+      }
+    } catch {
+      // Missing settings table or corrupt snapshot degrades cleanly to live fetch.
+    }
+  }
+
+  function persistCatalogCache() {
+    let db
+    try {
+      db = getDb?.()
+    } catch {
+      return
+    }
+    if (!db) return
+    const snapshot = {}
+    for (const scope of ['public', 'pilot']) {
+      const entry = catalogCache.get(scope)
+      if (!entry) continue
+      snapshot[scope] = {
+        catalog: entry.catalog,
+        hash: entry.hash,
+        etag: entry.etag,
+        fetched_at: entry.fetchedAt,
+      }
+    }
+    try {
+      db.prepare(`
+        INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+      `).run(CATALOG_CACHE_KEY, JSON.stringify(snapshot), new Date(nowMs()).toISOString())
+    } catch {
+      // Cache persistence is best-effort and must never fail plan delivery.
+    }
+  }
+
+  async function revalidateCatalog(scope, { force = false } = {}) {
+    hydrateCatalogCache()
+    const existing = catalogCache.get(scope)
+    if (inflightCatalog.has(scope)) return inflightCatalog.get(scope)
+    if (!force && existing && existing.checkedAt > 0 && nowMs() - existing.checkedAt < CATALOG_REVALIDATE_COOLDOWN_MS) {
+      return existing
+    }
+    const allowPilot = scope === 'pilot'
+    const ifNoneMatch = existing ? existing.etag || `"${existing.hash}"` : null
+    const task = (async () => {
+      if (typeof supplier.fetchPlans === 'function') {
+        const reply = await supplier.fetchPlans({ allowPilot, ifNoneMatch })
+        const now = nowMs()
+        if (reply.status === 'not_modified' && existing) {
+          const nextEtag = reply.etag || existing.etag
+          const updated = { ...existing, etag: nextEtag, checkedAt: now }
+          catalogCache.set(scope, updated)
+          if (nextEtag !== existing.etag) persistCatalogCache()
+          return updated
+        }
+        const catalog = reply.catalog
+        const nextHash = catalogHash(catalog)
+        const nextEtag = reply.etag || `"${nextHash}"`
+        if (existing && existing.hash === nextHash) {
+          const updated = { ...existing, etag: nextEtag, checkedAt: now }
+          catalogCache.set(scope, updated)
+          if (nextEtag !== existing.etag) persistCatalogCache()
+          return updated
+        }
+        const updated = { catalog, hash: nextHash, etag: nextEtag, fetchedAt: now, checkedAt: now }
+        catalogCache.set(scope, updated)
+        persistCatalogCache()
+        return updated
+      }
+      const catalog = await supplier.plans({ allowPilot })
+      const now = nowMs()
+      const nextHash = catalogHash(catalog)
+      if (existing && existing.hash === nextHash) {
+        const updated = { ...existing, checkedAt: now }
+        catalogCache.set(scope, updated)
+        return updated
+      }
+      const updated = { catalog, hash: nextHash, etag: `"${nextHash}"`, fetchedAt: now, checkedAt: now }
+      catalogCache.set(scope, updated)
+      persistCatalogCache()
+      return updated
+    })()
+    inflightCatalog.set(scope, task)
+    try {
+      return await task
+    } finally {
+      if (inflightCatalog.get(scope) === task) inflightCatalog.delete(scope)
+    }
+  }
+
+  async function resolveCatalog({ allowPilot, forceRefresh }) {
+    hydrateCatalogCache()
+    const scope = allowPilot ? 'pilot' : 'public'
+    const cached = catalogCache.get(scope)
+    if (cached && !forceRefresh) {
+      if (nowMs() - cached.checkedAt >= catalogCacheTtlMs) {
+        void revalidateCatalog(scope).catch(() => {})
+      }
+      return { ...cached, stale: false }
+    }
+    if (cached && forceRefresh) {
+      try {
+        return { ...(await revalidateCatalog(scope, { force: true })), stale: false }
+      } catch {
+        return { ...cached, stale: true }
+      }
+    }
+    return { ...(await revalidateCatalog(scope, { force: forceRefresh })), stale: false }
+  }
+
+  async function servePlans(req, res, url, { allowPilot }) {
+    const forceRefresh = url.searchParams.get('refresh') === '1'
+    const entry = await resolveCatalog({ allowPilot, forceRefresh })
+    const etag = `"${entry.hash}"`
+    res.setHeader?.('ETag', etag)
+    res.setHeader?.('Cache-Control', 'no-cache')
+    if (
+      etagMatches(req.headers?.['if-none-match'], entry.hash) &&
+      typeof res.writeHead === 'function' &&
+      typeof res.end === 'function'
+    ) {
+      res.writeHead(304)
+      res.end()
+      return true
+    }
+    const clientHash = url.searchParams.get('hash')
+    if (isCatalogHash(clientHash) && clientHash === entry.hash) {
+      return json(res, 200, {
+        ok: true,
+        data: { unchanged: true, catalog_hash: entry.hash, ...(entry.stale ? { stale: true } : {}) },
+      })
+    }
+    return json(res, 200, {
+      ok: true,
+      data: { ...entry.catalog, catalog_hash: entry.hash, ...(entry.stale ? { stale: true } : {}) },
+    })
+  }
+
+  async function warmPlans() {
+    const scopes = ['public']
+    if (process.env.VM2API_CRAG_SHOP_PILOT_TOKEN_FILE) scopes.push('pilot')
+    await Promise.allSettled(scopes.map((scope) => revalidateCatalog(scope)))
+  }
   function deviceIdentity() {
     let hostId
     try {
@@ -866,7 +1073,7 @@ export function createCragShopHandler({
       const device = isCragDeviceShopPath(url.pathname)
       let owner = buyerOwner(req)
       const ok = (data) => json(res, 200, { ok: true, data })
-      if (!device && route === 'plans') return ok(await supplier.plans({ allowPilot: !!owner }))
+      if (!device && route === 'plans') return await servePlans(req, res, url, { allowPilot: !!owner })
       if (!device && !owner) {
         // A valid panel session with no buyer binding is not the same as not being signed
         // in, and "sign in" is advice such a user cannot act on — they already are. The
@@ -895,7 +1102,7 @@ export function createCragShopHandler({
               `${DEVICE_COOKIE}=${randomBytes(32).toString('base64url')}; Path=${DEVICE_ROOT}; Max-Age=31536000; HttpOnly; SameSite=Strict${secure}`,
             )
           }
-          return ok(await supplier.plans(supplierOptions))
+          return await servePlans(req, res, url, supplierOptions)
         }
         if (!token) {
           // Only 'plans' mints a checkout identity. A request that merely arrived without
@@ -1221,5 +1428,5 @@ export function createCragShopHandler({
     }
   }
 
-  return Object.assign(handleCragShop, { pollActivation, pollOrderExpiry })
+  return Object.assign(handleCragShop, { pollActivation, pollOrderExpiry, warmPlans })
 }
