@@ -940,7 +940,19 @@ export async function handleCodexProtocol({
           firstUserIdentity,
           clientIp: clientIp(req),
           userAgent: req.headers?.['user-agent'] || '',
-          epoch: `${attemptStartedAt}:${vm.id}:${hops}`,
+          // Borrowing does not move the home pin, so the attempt clock cannot
+          // identify the borrower's session. Scope it to this home generation.
+          epoch:
+            picked.home === stickyBound?.vmId && stickyBound?.sessionId && vm.id !== picked.home
+              ? JSON.stringify([
+                  'codex-borrow',
+                  picked.sessionKey,
+                  stickyBound.vmId,
+                  stickyBound.sessionId,
+                  stickyBound.generation,
+                  vm.id,
+                ])
+              : `${attemptStartedAt}:${vm.id}:${hops}`,
         }
         // passthrough forwards an explicit inbound session verbatim; without
         // one it still derives the deterministic seed instead of sending null.
