@@ -38,16 +38,21 @@ export function resolveCragGeminiPromptPolicy(routing = {}) {
 }
 
 const CONFLICTING_CLI_IDENTITY_RE = /\bYou\s+are\s+(?:Claude\s+Code|OpenCode)\b/gi
+const CLAUDE_CODE_DUAL_USE_BANNER_RE =
+  /\bDual-use\s+security\s+tools\s*\([^)\n]{1,160}\)\s+require\s+clear\s+authorization\s+context\b/gi
 
 /**
- * Normalize third-party CLI identity declarations in outbound CRAGGemini
- * `systemInstruction` (e.g. `You are Claude Code` / `You are OpenCode`) that
- * conflict with the target Gemini runtime and cause Google Antigravity upstream
- * to reject healthy accounts with HTTP 429 RESOURCE_EXHAUSTED.
+ * Normalize third-party CLI fingerprint strings in outbound CRAGGemini
+ * `systemInstruction` (e.g. `You are Claude Code` / `You are OpenCode` and
+ * Claude Code's stock dual-use security tool parenthetical) that cause Google
+ * Antigravity upstream to reject healthy accounts with HTTP 429
+ * RESOURCE_EXHAUSTED, while preserving the underlying safety guidance.
  */
 export function sanitizeCragGeminiSystemText(text) {
   if (typeof text !== 'string' || !text) return text
-  return text.replace(CONFLICTING_CLI_IDENTITY_RE, 'You are a coding assistant')
+  return text
+    .replace(CONFLICTING_CLI_IDENTITY_RE, 'You are a coding assistant')
+    .replace(CLAUDE_CODE_DUAL_USE_BANNER_RE, 'Dual-use security tools require clear authorization context')
 }
 
 function sanitizeSystemInstruction(systemInstruction) {
