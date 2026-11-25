@@ -156,8 +156,29 @@ function hasCustomCodexWindows(vm: Vm): boolean {
   )
 }
 
-/** 5H → 7D → Fable；Codex 若含非 5h/7d 实际周期（如 24h）则按实际窗口展示。 */
+/** 5H → 7D → Fable；Codex 若含非 5h/7d 实际周期（如 24h）则按实际窗口展示；Gemini API Key 无订阅窗口。 */
 export function vmWindows(vm: Vm): WindowReadout[] {
+  if (vm.gemini) {
+    if (vm.gemini.auth_method === 'api_key') return []
+    const probed = (w: '5h' | '7d') =>
+      vm.has_token && windowProbed(vm, w) ? usedPctOf(vm, w) : null
+    return [
+      {
+        key: '5h',
+        label: '5H',
+        pct: probed('5h'),
+        note: null,
+        reset: vm.reset_5h,
+      },
+      {
+        key: '7d',
+        label: '7D',
+        pct: probed('7d'),
+        note: null,
+        reset: vm.reset_7d,
+      },
+    ]
+  }
   if (hasCustomCodexWindows(vm)) {
     return (vm.codex_usage?.windows || []).map((w) => {
       const id = String(w.id || w.label || 'window')
@@ -215,6 +236,12 @@ export function bladeState(vm: Vm): BladeState {
   const zone = zoneOf(vm)
   if (zone === 'dead') return 'dead'
   if (zone === 'none' || !vm.has_token) return 'vacant'
+  if (vm.gemini) {
+    if (vm.gemini.auth_method === 'api_key') return 'live'
+    return windowProbed(vm, '5h') || windowProbed(vm, '7d')
+      ? 'live'
+      : 'unprobed'
+  }
   const anyCodex = Boolean(
     vm.codex_usage?.windows?.some(
       (w) => clampCodexPercent(w.used_percent) != null

@@ -420,6 +420,7 @@ export function createGeminiScheduler({
   groupsRepo,
   geminiOwnersRepo = null,
   getEnvOwner = null,
+  slotPrefs = null,
   cragSubscription = null,
   getRoutingConfig = null,
   attemptsRepo = null,
@@ -749,6 +750,61 @@ export function createGeminiScheduler({
       }
     },
 
+    environmentRestriction(envId, ts = now()) {
+      if (!envId) return { restriction: null, circuit: null }
+      const rawCircuit = poolScheduler?.unitCircuit?.view?.(`gemini:${envId}`, ts) || null
+      const circuit = rawCircuit && rawCircuit.state !== 'closed' ? rawCircuit : null
+
+      let accountUntil = accountCooldowns.get(envId) || 0
+      if (accountUntil <= ts) {
+        if (accountUntil) accountCooldowns.delete(envId)
+        accountUntil = 0
+      }
+
+      const prefix = `${envId}:`
+      let groupUntil = 0
+      for (const [key, until] of groupCooldowns.entries()) {
+        if (!key.startsWith(prefix)) continue
+        if (until > ts) groupUntil = Math.max(groupUntil, until)
+        else groupCooldowns.delete(key)
+      }
+
+      let modelUntil = 0
+      for (const [key, until] of modelCooldowns.entries()) {
+        if (!key.startsWith(prefix)) continue
+        if (until > ts) modelUntil = Math.max(modelUntil, until)
+        else modelCooldowns.delete(key)
+      }
+
+      let restriction = null
+      if (circuit?.state === 'open') {
+        restriction = { reason: 'circuit_open', text: '熔断中', until: circuit.open_until ?? null }
+      } else if (circuit?.state === 'half_open') {
+        restriction = { reason: 'circuit_probe', text: '熔断探测', until: null }
+      } else if (accountUntil > 0) {
+        restriction = { reason: 'account_cooldown', text: '账号冷却中', until: accountUntil }
+      } else if (groupUntil > 0) {
+        restriction = { reason: 'quota_group_cooldown', text: '配额组冷却中', until: groupUntil }
+      } else if (modelUntil > 0) {
+        restriction = { reason: 'model_quota_cooldown', text: '模型冷却中', until: modelUntil }
+      }
+      return { restriction, circuit }
+    },
+
+    clearRestriction(envId) {
+      if (!envId) return { cleared: false }
+      accountCooldowns.delete(envId)
+      const prefix = `${envId}:`
+      for (const key of [...groupCooldowns.keys()]) {
+        if (key.startsWith(prefix)) groupCooldowns.delete(key)
+      }
+      for (const key of [...modelCooldowns.keys()]) {
+        if (key.startsWith(prefix)) modelCooldowns.delete(key)
+      }
+      poolScheduler?.unitCircuit?.reset?.(`gemini:${envId}`)
+      return { cleared: true }
+    },
+
     async catalog({ ownerScope = PLATFORM_SCOPE, allowedEnvIds = null } = {}) {
       let view = await callHost('list', {})
       if (!Array.isArray(view?.environments)) throw fail(502, 'gemini_host_protocol_error')
@@ -798,6 +854,8 @@ export function createGeminiScheduler({
         const envOwner = envOwnerOf(environment.id)
         if (!geminiEnvMatchesOwnerScope(envOwner, ownerScope)) continue
         if (Array.isArray(allowedEnvIds) && !allowedEnvIds.includes(environment.id)) continue
+        const pref = slotPrefs?.resolved?.(environment.id) ?? null
+        if (pref && pref.schedulable === false) continue
         if (resolveProxy) {
           try {
             resolveProxy(environment.proxy_id, envOwner)
@@ -827,6 +885,7 @@ export function createGeminiScheduler({
           accounts.push({
             id: environment.id,
             auth_method: authMethod,
+            schedule_level: pref?.schedule_level ?? 5,
             max_concurrency: normalizeConcurrency(
               environment.max_concurrency,
               currentPolicy().pool.max_concurrency_per_account,
@@ -1016,7 +1075,9 @@ export function createGeminiScheduler({
               provider: resolved.provider,
               authMethod: account.auth_method,
               maxConcurrency: effectiveMaxConc,
-              priority: account.auth_method === 'api_key' && requiredCapabilities.length ? 1 : 0,
+              priority:
+                (Number.isSafeInteger(account.schedule_level) ? account.schedule_level : 5) * 10 +
+                (account.auth_method === 'api_key' && requiredCapabilities.length ? 1 : 0),
               weight: 1,
               lastUsedAt: 0,
             },

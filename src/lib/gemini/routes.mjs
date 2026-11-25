@@ -21,6 +21,7 @@ import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedMod
 import { normalizeGeminiOutboundPrompt } from './prompt-normalizer.mjs'
 import { isGeminiProtocolAllowed } from './routing-config.mjs'
 import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
+import { createGeminiSlotPrefs, parseGeminiDisplayName, parseGeminiScheduleLevel } from './slot-prefs.mjs'
 import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
@@ -555,9 +556,90 @@ function cragLicenseView(value) {
   }
 }
 
+function geminiUsageView(cost) {
+  if (!cost) return null
+  const today = cost.today && typeof cost.today === 'object' ? cost.today : null
+  const todayInput = Number(cost.today_input_tokens ?? today?.input_tokens ?? 0)
+  const todayOut = Number(cost.today_output_tokens ?? today?.output_tokens ?? 0)
+  const todayRead = Number(cost.today_cache_read_tokens ?? today?.cache_read_tokens ?? 0)
+  const todayWrite = Number(cost.today_cache_creation_tokens ?? today?.cache_creation_tokens ?? 0)
+  const prompt = todayInput + todayRead + todayWrite
+  const totalTokens =
+    Number(cost.input_tokens || 0) +
+    Number(cost.output_tokens || 0) +
+    Number(cost.cache_read_tokens || 0) +
+    Number(cost.cache_creation_tokens || 0)
+  return {
+    today_cost: Number(cost.today_cost ?? today?.total_cost ?? 0),
+    today_requests: Number(cost.today_requests ?? today?.requests ?? 0),
+    today_tokens: todayInput + todayOut + todayRead + todayWrite,
+    today_input_tokens: todayInput,
+    today_output_tokens: todayOut,
+    today_cache_read_tokens: todayRead,
+    today_cache_creation_tokens: todayWrite,
+    cache_hit_rate: prompt > 0 ? Math.min(1, todayRead / prompt) : null,
+    window_5h_cost: Number(cost.window_5h_cost || 0),
+    window_5h_requests: Number(cost.window_5h_requests || 0),
+    window_5h_tokens: Number(cost.window_5h_tokens || 0),
+    window_7d_cost: Number(cost.window_7d_cost || 0),
+    window_7d_requests: Number(cost.window_7d_requests || 0),
+    window_7d_success: Number(cost.window_7d_success || 0),
+    window_7d_errors: Number(cost.window_7d_errors || 0),
+    window_7d_tokens: Number(cost.window_7d_tokens || 0),
+    total_cost: Number(cost.total_cost || 0),
+    total_tokens: totalTokens,
+    health_24h: Array.isArray(cost.health_24h) ? cost.health_24h : null,
+  }
+}
+
+function geminiPeriodView(row) {
+  if (!row || typeof row !== 'object') return null
+  return {
+    requests: Number(row.requests || 0),
+    input_tokens: Number(row.input_tokens || 0),
+    output_tokens: Number(row.output_tokens || 0),
+    cache_read_tokens: Number(row.cache_read_tokens || 0),
+    cache_creation_tokens: Number(row.cache_creation_tokens || 0),
+    total_cost: Number(row.total_cost || 0),
+  }
+}
+
+function indexGeminiBillingAccounts(requestLog) {
+  const byEnvId = new Map()
+  if (!requestLog?.billingStats) return byEnvId
+  let billing = null
+  try {
+    billing = requestLog.billingStats()
+  } catch {
+    return byEnvId
+  }
+  for (const row of billing?.accounts || []) {
+    const vmId = typeof row?.vm_id === 'string' ? row.vm_id : ''
+    if (!vmId.startsWith('gemini:')) continue
+    const envId = vmId.slice('gemini:'.length)
+    if (!envId) continue
+    if (!byEnvId.has(envId) || row.account_id === envId) {
+      byEnvId.set(envId, row)
+    }
+  }
+  return byEnvId
+}
+
 function environmentView(
   value,
-  { id, proxyId, proxyPool, withProxyReady = false, billingReady = false, ownerUserId = null } = {},
+  {
+    id,
+    proxyId,
+    proxyPool,
+    withProxyReady = false,
+    billingReady = false,
+    ownerUserId = null,
+    usage = null,
+    inflight = null,
+    slotPref = null,
+    restriction = null,
+    circuit = null,
+  } = {},
 ) {
   if (
     !validId(value?.id) ||
@@ -583,14 +665,25 @@ function environmentView(
     proxyUrl &&
     value.last_inference != null &&
     crypto.createHash('sha256').update(proxyUrl).digest('hex') === value.last_inference_proxy_sha256
+  const resolvedInflight =
+    Number.isSafeInteger(inflight) && inflight >= 0
+      ? inflight
+      : Number.isSafeInteger(value.active_slots) && value.active_slots >= 0
+        ? value.active_slots
+        : null
   return {
     id: value.id,
     proxy_id: value.proxy_id,
     ...(normalizedOwner ? { owner_user_id: normalizedOwner } : {}),
     ...(withProxyReady && proxyPool && { proxy_ready: Boolean(proxyUrl) }),
-    name: text(value.name, 80) || '',
+    name: (slotPref?.display_name && text(slotPref.display_name, 80)) || text(value.name, 80) || '',
     auth_state: value.auth_state,
     auth_method: value.auth_method === 'api_key' ? 'api_key' : 'oauth',
+    schedulable: slotPref ? slotPref.schedulable !== false : true,
+    schedule_level: Number.isSafeInteger(slotPref?.schedule_level) ? slotPref.schedule_level : 5,
+    schedule_level_mode: slotPref?.schedule_level_mode === 'manual' ? 'manual' : 'auto',
+    ...(restriction ? { restriction } : {}),
+    ...(circuit ? { circuit } : {}),
     ...(value.oauth_imported === true && value.auth_method === 'oauth' ? { oauth_imported: true } : {}),
     kernel_version: text(value.kernel_version),
     runtime_ready: value.runtime_ready === true,
@@ -600,6 +693,7 @@ function environmentView(
     ...(Number.isSafeInteger(value.active_slots) && value.active_slots >= 0
       ? { active_slots: value.active_slots }
       : {}),
+    ...(resolvedInflight != null ? { inflight: resolvedInflight } : {}),
     models: items(value.models, 128, modelName),
     ...(value.models_discovered === true && { models_discovered: true }),
     ...(Array.isArray(value.capabilities)
@@ -614,6 +708,7 @@ function environmentView(
       last_inference: matchesProxy ? lastInferenceView(value.last_inference) : null,
     }),
     ...(value.crag_license ? { crag_license: cragLicenseView(value.crag_license) } : {}),
+    ...(usage ? { usage } : {}),
     created_at: text(value.created_at),
     updated_at: text(value.updated_at),
     billing_ready: billingReady === true,
@@ -835,21 +930,54 @@ export function createGeminiPanelHandler({
   json,
   readBody,
   proxyPool,
+  poolScheduler = null,
   terminal,
   cragSubscription = null,
   geminiOwnersRepo = null,
+  geminiSlotPrefs = null,
+  geminiScheduler = null,
+  panelUsers = null,
+  requestLog = null,
   callHost = callGeminiHost,
-  billingReady = false,
+  billingReady = Boolean(requestLog),
 }) {
   const maintenance = createGeminiMaintenanceHandler({ json, readBody })
+  const slotPrefs = geminiSlotPrefs || createGeminiSlotPrefs()
   const envOwnerOf = (envId) => geminiOwnersRepo?.getOwner?.(envId) ?? null
-  const toEnvView = (value, opts = {}) =>
-    environmentView(value, {
+  const resolvePoolScheduler = () => (typeof poolScheduler === 'function' ? poolScheduler() : poolScheduler)
+  const liveInflightOf = (envId) => {
+    const n = resolvePoolScheduler()?.inflight?.get?.(`gemini:${envId}`)
+    return Number.isSafeInteger(n) && n >= 0 ? n : null
+  }
+  const restrictionFor = (envId) => {
+    if (!envId) return { restriction: null, circuit: null }
+    if (geminiScheduler?.environmentRestriction) {
+      return geminiScheduler.environmentRestriction(envId)
+    }
+    const rawCircuit = resolvePoolScheduler()?.unitCircuit?.view?.(`gemini:${envId}`) || null
+    const circuit = rawCircuit && rawCircuit.state !== 'closed' ? rawCircuit : null
+    if (!circuit) return { restriction: null, circuit: null }
+    return {
+      circuit,
+      restriction:
+        circuit.state === 'open'
+          ? { reason: 'circuit_open', text: '熔断中', until: circuit.open_until ?? null }
+          : { reason: 'circuit_probe', text: '熔断探测', until: null },
+    }
+  }
+  const toEnvView = (value, opts = {}) => {
+    const runtimeState = restrictionFor(value?.id)
+    return environmentView(value, {
       proxyPool,
       billingReady,
       ownerUserId: Object.hasOwn(opts, 'ownerUserId') ? opts.ownerUserId : envOwnerOf(value?.id),
+      inflight: Object.hasOwn(opts, 'inflight') ? opts.inflight : liveInflightOf(value?.id),
+      slotPref: slotPrefs.resolved(value?.id),
+      restriction: runtimeState.restriction,
+      circuit: runtimeState.circuit,
       ...opts,
     })
+  }
   return async function handleGeminiPanel(req, res, pathname) {
     const ok = (data) => json(res, 200, { ok: true, data })
     const fail = (status, code, message = code, extra = null) =>
@@ -914,6 +1042,7 @@ export function createGeminiPanelHandler({
         const visibleEnvs = filterOwner
           ? view.environments.filter((env) => envOwnerOf(env.id) === filterOwner)
           : view.environments
+        const billingByEnvId = indexGeminiBillingAccounts(requestLog)
         return ok({
           available: true,
           payload_state: PAYLOAD_STATES.has(view.payload_state) ? view.payload_state : 'unknown',
@@ -922,7 +1051,12 @@ export function createGeminiPanelHandler({
           release_activated: typeof view.release_activated === 'boolean' ? view.release_activated : null,
           oauth_runtime_issue: OAUTH_ISSUES.has(view.oauth_runtime_issue) ? view.oauth_runtime_issue : null,
           ...(subscription ? { crag_subscription: subscription } : {}),
-          environments: visibleEnvs.map((value) => toEnvView(value, { withProxyReady: true })),
+          environments: visibleEnvs.map((value) =>
+            toEnvView(value, {
+              withProxyReady: true,
+              usage: geminiUsageView(billingByEnvId.get(value?.id)),
+            }),
+          ),
         })
       }
       // All Gemini panel routes pass through the existing admin-only panel ACL.
@@ -992,11 +1126,128 @@ export function createGeminiPanelHandler({
         return ok(toEnvView(created, { ownerUserId }))
       }
       const match =
-        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|concurrency|disable|refresh|terminal-ticket|proxy\/probe|proxy|models|test-chat|crag-license(?:\/(?:bind|activate|release))?)(?:\/([^/]+))?)?$/.exec(
+        /^\/api\/panel\/gemini\/environments\/([A-Za-z0-9_-]{1,64})(?:\/(authorization|concurrency|disable|refresh|schedulable|prefs|recover|owner|terminal-ticket|proxy\/probe|proxy|models|test-chat|health|stats|crag-license(?:\/(?:bind|activate|release))?)(?:\/([^/]+))?)?$/.exec(
           pathname,
         )
       if (!match || !validId(match[1])) return fail(404, 'not_found')
       const [, id, action, runId] = match
+      if (action === 'schedulable') {
+        if (runId !== undefined || req.method !== 'POST') return fail(404, 'not_found')
+        const body = await readBody(req, 1024)
+        if (typeof body?.schedulable !== 'boolean') {
+          return fail(400, 'invalid_request', 'schedulable 必须为布尔值')
+        }
+        const saved = slotPrefs.patch(id, { schedulable: body.schedulable })
+        return ok({ id, ...saved })
+      }
+      if (action === 'prefs') {
+        if (runId !== undefined || req.method !== 'PATCH') return fail(404, 'not_found')
+        const body = await readBody(req, 4096)
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          return fail(400, 'invalid_request', '无效的配置请求')
+        }
+        const prefPatch = {}
+        if (Object.hasOwn(body, 'name')) {
+          const parsedName = parseGeminiDisplayName(body.name)
+          if (!parsedName.ok) return fail(400, 'gemini_invalid_name', '环境名称长度不能超过 80 个字符')
+          prefPatch.display_name = parsedName.value
+        }
+        if (Object.hasOwn(body, 'schedule_level')) {
+          const parsedLevel = parseGeminiScheduleLevel(body.schedule_level)
+          if (!parsedLevel.ok) {
+            return fail(400, 'gemini_invalid_schedule_level', '调度优先级必须为 1–10 的整数或自动')
+          }
+          prefPatch.schedule_level = parsedLevel.value
+        }
+        if (Object.hasOwn(body, 'schedulable')) {
+          if (typeof body.schedulable !== 'boolean') {
+            return fail(400, 'invalid_request', 'schedulable 必须为布尔值')
+          }
+          prefPatch.schedulable = body.schedulable
+        }
+        let maxConcurrency = null
+        if (Object.hasOwn(body, 'max_concurrency') && body.max_concurrency !== undefined) {
+          maxConcurrency = parseConcurrency(body.max_concurrency)
+          if (maxConcurrency == null) {
+            return fail(400, 'gemini_invalid_concurrency', HOST_ERRORS.gemini_invalid_concurrency[1])
+          }
+        }
+        let hostEnv = null
+        if (maxConcurrency != null) {
+          hostEnv = await callHost('concurrency-set', { id, max_concurrency: maxConcurrency })
+        }
+        if (Object.keys(prefPatch).length > 0) {
+          slotPrefs.patch(id, prefPatch)
+        }
+        if (!hostEnv) {
+          hostEnv = await callHost('get', { id })
+        }
+        return ok(toEnvView(hostEnv, { id }))
+      }
+      if (action === 'recover') {
+        if (runId !== undefined || req.method !== 'POST') return fail(404, 'not_found')
+        geminiScheduler?.clearRestriction?.(id)
+        resolvePoolScheduler()?.unitCircuit?.reset?.(`gemini:${id}`)
+        return ok({ id, cleared: true })
+      }
+      if (action === 'owner') {
+        if (runId !== undefined || req.method !== 'PATCH') return fail(404, 'not_found')
+        const body = await readBody(req, 4096)
+        const raw = Object.hasOwn(body || {}, 'user_id') ? body.user_id : body?.owner_user_id
+        const nextOwner = raw === null || raw === '' || raw === undefined ? null : normalizeOwnerId(raw)
+        if (raw != null && raw !== '' && !nextOwner) {
+          return fail(400, 'invalid_request', '无效的租户用户 ID')
+        }
+        if (nextOwner && panelUsers?.getById && !panelUsers.getById(nextOwner)) {
+          return fail(404, 'user_not_found', 'user not found')
+        }
+        if (nextOwner) geminiOwnersRepo?.setOwner?.(id, nextOwner)
+        else geminiOwnersRepo?.remove?.(id)
+        return ok({ id, owner_user_id: nextOwner })
+      }
+      if (action === 'health') {
+        if (runId !== undefined || req.method !== 'GET') return fail(404, 'not_found')
+        if (!requestLog?.healthBuckets) return fail(503, 'request_log_unavailable', 'request log unavailable')
+        const reqUrl = new URL(req.url || pathname, 'http://127.0.0.1')
+        const range = reqUrl.searchParams.get('range') === '7d' ? '7d' : '24h'
+        const shape = range === '7d' ? { slots: 84, slotMin: 120 } : { slots: 48, slotMin: 30 }
+        const vmId = `gemini:${id}`
+        const now = Date.now()
+        const start = new Date(now - shape.slots * shape.slotMin * 60_000).toISOString()
+        const buckets = requestLog.healthBuckets({ now, vmId, ...shape }).get(vmId) || null
+        return ok({
+          range,
+          slot_min: shape.slotMin,
+          start,
+          buckets,
+          top_errors: requestLog.topErrors?.({ vmId, since: start }) || [],
+        })
+      }
+      if (action === 'stats') {
+        if (runId !== undefined || req.method !== 'GET') return fail(404, 'not_found')
+        if (!requestLog) return fail(503, 'request_log_unavailable', 'request log unavailable')
+        const vmId = `gemini:${id}`
+        const cost = indexGeminiBillingAccounts(requestLog).get(id) || null
+        let byModel = []
+        let usageStats = null
+        try {
+          byModel = requestLog.costByModel?.({ vmId, accountId: id }) || []
+        } catch {}
+        try {
+          usageStats = requestLog.vmUsageStats?.({ vmId, days: 30 }) || null
+        } catch {}
+        return ok({
+          billing: {
+            by_model: byModel,
+            usage_stats: usageStats,
+            window_5h: geminiPeriodView(cost?.window_5h),
+            window_7d: geminiPeriodView(cost?.window_7d),
+            prev_window_5h: null,
+            prev_window_7d: null,
+            window_5h_projection: null,
+          },
+        })
+      }
       if (action?.startsWith('crag-license')) {
         if (runId !== undefined) return fail(404, 'not_found')
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
@@ -1098,6 +1349,8 @@ export function createGeminiPanelHandler({
         }
         await callHost('delete', { id })
         geminiOwnersRepo?.remove?.(id)
+        slotPrefs.remove(id)
+        geminiScheduler?.clearRestriction?.(id)
         return ok({ deleted: true, ...(seatRelease ? { seat_released: seatRelease.released === true } : {}) })
       }
       if (req.method === 'POST' && action === 'disable') {

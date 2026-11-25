@@ -4,13 +4,17 @@ import type { Vm } from '@/types/panel-vm'
 import { readFileSync } from 'node:fs'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
+import { SlotIdentity } from '@/components/platform-chip'
+import { restrictionTitle } from './clear-restriction'
 import { FleetPulse } from './fleet-pulse'
 import { geminiSlot } from './gemini-slot'
 import { VmTable } from './vm-list-table'
+import { canReclaimVm } from './vm-owner'
 import { VmRack } from './vm-rack'
-import { zoneCounts } from './vm-rack-model'
+import { bladeState, vmWindows, zoneCounts } from './vm-rack-model'
+import { VmRowDetail } from './vm-row-detail'
 import { VmSchedulingBlock, VmSchedulingEditor } from './vm-scheduling'
-import { filterVms } from './vm-table'
+import { filterVms, sortVms } from './vm-table'
 
 vi.mock('./vm-actions-context', () => ({ useVmActions: () => ({}) }))
 vi.mock('./vm-action-menu', () => ({ VmActionMenu: () => null }))
@@ -196,13 +200,19 @@ describe('VM account column kernel label', () => {
       expect(html).not.toContain('运行就绪')
     }
     const hostOnly = renderSlots(<VmTable vms={[gemini]} />)
-    expect(hostOnly).not.toContain('role="switch"')
+    expect(hostOnly).toContain('role="switch"')
     expect(hostOnly).not.toContain('24h 无请求')
   })
 
   it('renders a Gemini slot proxy with the same chip as a normal slot', () => {
     const pool = [
-      { id: 'px-011f7746', host: '1.2.3.4', port: 1080, status: 'ok', latency_ms: 88 },
+      {
+        id: 'px-011f7746',
+        host: '1.2.3.4',
+        port: 1080,
+        status: 'ok',
+        latency_ms: 88,
+      },
     ]
     const gemini = geminiSlot(
       {
@@ -222,7 +232,12 @@ describe('VM account column kernel label', () => {
       undefined,
       pool
     )
-    const normal: Vm = { id: 'vm-01', has_token: true, proxy: pool[0], proxy_id: 'px-011f7746' }
+    const normal: Vm = {
+      id: 'vm-01',
+      has_token: true,
+      proxy: pool[0],
+      proxy_id: 'px-011f7746',
+    }
     const chip = (vm: Vm) =>
       renderToStaticMarkup(
         <QueryClientProvider client={new QueryClient()}>
@@ -359,7 +374,7 @@ describe('VM account column kernel label', () => {
       expect(html).toContain('Google 地区资格受限')
       expect(html).toContain('gemini-2.5-pro')
       expect(html).not.toContain('无效凭证')
-      expect(html).not.toContain('role="switch"')
+      expect(html).toContain('role="switch"')
     }
 
     const pulse = renderToStaticMarkup(
@@ -475,5 +490,320 @@ describe('VM list summary and toggles', () => {
     expect(html).toMatch(/aria-pressed="false"[^>]*>.*按状态分组/)
     expect(html).toMatch(/aria-pressed="false"[^>]*>.*次要信息常显/)
     expect(html).toContain('data-pin="false"')
+  })
+})
+
+describe('Gemini VM page full UI alignment', () => {
+  it('renders Gemini OAuth quota windows, health, seats, cost ledger, pulse, row detail, and sorting', () => {
+    const buckets = Array.from({ length: 48 }, (_, i): [number, number] =>
+      i === 47 ? [19, 1] : [0, 0]
+    )
+    const gemini = geminiSlot({
+      id: 'gem-pro-1',
+      name: 'Gemini Pro 1',
+      proxy_id: 'px-gem',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      runtime_ready: true,
+      billing_ready: true,
+      kernel_version: '0.4.9',
+      max_concurrency: 10,
+      active_slots: 2,
+      inflight: 2,
+      created_at: null,
+      updated_at: null,
+      models_discovered: true,
+      models: ['gemini-2.5-pro', 'claude-sonnet-4-6-high'],
+      last_inference: {
+        state: 'completed',
+        model: 'gemini-2.5-pro',
+        started_at: '2026-11-24T02:00:00Z',
+        finished_at: '2026-11-24T02:00:04Z',
+        error_code: null,
+      },
+      usage: {
+        today_cost: 3.45,
+        today_requests: 20,
+        today_tokens: 150000,
+        today_input_tokens: 100000,
+        today_output_tokens: 30000,
+        today_cache_read_tokens: 20000,
+        today_cache_creation_tokens: 0,
+        cache_hit_rate: 0.1667,
+        window_5h_cost: 1.25,
+        window_5h_requests: 8,
+        window_5h_tokens: 50000,
+        window_7d_cost: 12.34,
+        window_7d_requests: 40,
+        window_7d_success: 38,
+        window_7d_errors: 2,
+        window_7d_tokens: 450000,
+        total_cost: 28.9,
+        total_tokens: 900000,
+        health_24h: buckets,
+      },
+      account: {
+        state: 'ok',
+        checked_at: '2026-11-24T01:00:00Z',
+        email: 'gem@example.com',
+        project_id: 'proj-1',
+        region: 'us',
+        plan: 'Google AI Pro',
+        expires_at: '2030-01-01T00:00:00Z',
+        quotas: [],
+        quota_groups: [
+          {
+            name: 'Gemini',
+            windows: [
+              {
+                id: 'gemini-5h',
+                period: '5h',
+                remaining_fraction: 0.25,
+                reset_at: '2030-01-01T05:00:00Z',
+              },
+              {
+                id: 'gemini-7d',
+                period: 'weekly',
+                remaining_fraction: 0.6,
+                reset_at: '2030-01-07T00:00:00Z',
+              },
+            ],
+          },
+          {
+            name: 'Claude / 3P',
+            windows: [
+              {
+                id: '3p-5h',
+                period: '5h',
+                remaining_fraction: 0.5,
+                reset_at: '2030-01-01T05:00:00Z',
+              },
+            ],
+          },
+        ],
+        credits: [],
+      },
+    })
+
+    // Quota & state mapping
+    expect(bladeState(gemini)).toBe('live')
+    expect(vmWindows(gemini).map((w) => [w.key, w.pct])).toEqual([
+      ['5h', 75],
+      ['7d', 40],
+    ])
+    expect(gemini.seats_used).toBe(2)
+    expect(gemini.seats_max).toBe(10)
+
+    const renderNode = (node: ReactNode) =>
+      renderToStaticMarkup(
+        <QueryClientProvider client={new QueryClient()}>
+          {node}
+        </QueryClientProvider>
+      )
+
+    // 1. Table aligns every column + summary bar without "普通槽" split copy
+    const table = renderNode(<VmTable vms={[gemini]} />)
+    expect(table).toContain('>95.0%</b>')
+    expect(table).toContain('>75%</span>')
+    expect(table).toContain('>40%</span>')
+    expect(table).toContain('不适用')
+    expect(table).toContain('2/10')
+    expect(table).toContain('$12.34')
+    expect(table).toContain('$29')
+    expect(table).toContain('bg-orange-200')
+    expect(table).not.toContain('普通槽 24h')
+
+    // 2. Grid L and S cards render aligned quota bars, cost ledger, seats, and Gemini stripe
+    const rackL = renderNode(<VmRack vms={[gemini]} filter='all' size='l' />)
+    expect(rackL).toContain('--tier-gemini-solid')
+    expect(rackL).toContain('75%')
+    expect(rackL).toContain('40%')
+    expect(rackL).toContain('$1.25')
+    expect(rackL).toContain('$12.34')
+    expect(rackL).toContain('$28.90')
+    expect(rackL).toContain('刷新数据')
+    expect(rackL).toContain('拉取模型')
+    expect(rackL).toContain('席位')
+
+    const rackS = renderNode(<VmRack vms={[gemini]} filter='all' size='s' />)
+    expect(rackS).toContain('--tier-gemini-solid')
+    expect(rackS).toContain('$29')
+
+    // 3. FleetPulse includes Gemini headroom, today spend, and 7d success rate
+    const pulse = renderNode(
+      <FleetPulse vms={[gemini]} filter='all' onFilter={() => undefined} />
+    )
+    expect(pulse).toContain('60%')
+    expect(pulse).toContain('$3.45')
+    expect(pulse).toContain('95.0%')
+    expect(pulse).toContain('38 成 · 2 败')
+    expect(pulse).not.toContain('普通槽')
+
+    // 4. Expanded VmRowDetail renders all 3 cards + multi-group quota breakdown
+    const detail = renderNode(
+      <VmRowDetail
+        id='row-gem-pro-1'
+        vm={gemini}
+        now={Date.parse('2030-01-01T02:00:00Z')}
+        onOpenDetail={() => undefined}
+      />
+    )
+    expect(detail).toContain('请求健康')
+    expect(detail).toContain('用量窗口')
+    expect(detail).toContain('共享额度分组明细')
+    expect(detail).toContain('Claude / 3P')
+    expect(detail).toContain('成本')
+    expect(detail).toContain('$3.45')
+
+    // 5. SlotIdentity identifies Gemini instead of Claude
+    const identity = renderNode(<SlotIdentity vm={gemini} compact />)
+    expect(identity).toContain('>Gemini</span>')
+    expect(identity).not.toContain('>Claude</span>')
+
+    // 6. Probed Gemini participates in remain sort alongside normal slots
+    const claudeLow: Vm = {
+      id: 'vm-low',
+      has_token: true,
+      utilization_5h: 0.9,
+    }
+    const sorted = sortVms([claudeLow, gemini], 'remain', 'desc')
+    expect(sorted.map((v) => v.id)).toEqual(['gem-pro-1', 'vm-low'])
+  })
+
+  it('renders Gemini API Key without fake quota bars while preserving cost ledger', () => {
+    const apiKeySlot = geminiSlot({
+      id: 'gem-key-1',
+      name: 'Gemini Key',
+      proxy_id: 'px-gem',
+      auth_state: 'authorized',
+      auth_method: 'api_key',
+      runtime_ready: true,
+      billing_ready: true,
+      kernel_version: '0.4.9',
+      created_at: null,
+      updated_at: null,
+      models_discovered: true,
+      models: ['gemini-2.5-pro'],
+      usage: {
+        today_cost: 0.5,
+        today_requests: 3,
+        today_tokens: 12000,
+        today_input_tokens: 8000,
+        today_output_tokens: 4000,
+        today_cache_read_tokens: 0,
+        today_cache_creation_tokens: 0,
+        cache_hit_rate: null,
+        window_5h_cost: 0.5,
+        window_5h_requests: 3,
+        window_5h_tokens: 12000,
+        window_7d_cost: 2.1,
+        window_7d_requests: 15,
+        window_7d_success: 15,
+        window_7d_errors: 0,
+        window_7d_tokens: 55000,
+        total_cost: 2.1,
+        total_tokens: 55000,
+        health_24h: null,
+      },
+      account: null,
+    })
+
+    expect(bladeState(apiKeySlot)).toBe('live')
+    expect(vmWindows(apiKeySlot)).toEqual([])
+    const rack = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <VmRack vms={[apiKeySlot]} filter='all' size='l' />
+      </QueryClientProvider>
+    )
+    expect(rack).toContain('API Key 按量计费')
+    expect(rack).toContain('$2.10')
+  })
+
+  it('renders Gemini scheduling switch, priority badge, restriction, paused, and owner states', () => {
+    const base: NonNullable<Vm['gemini']> = {
+      id: 'gem-ctl-1',
+      name: 'Gemini Ctrl',
+      proxy_id: 'px-gem',
+      auth_state: 'authorized',
+      auth_method: 'oauth',
+      runtime_ready: true,
+      billing_ready: true,
+      kernel_version: '0.4.9',
+      created_at: null,
+      updated_at: null,
+      models_discovered: true,
+      models: ['gemini-2.5-pro'],
+      account: {
+        state: 'ok',
+        checked_at: '2030-01-01T00:00:00Z',
+        email: 'ctrl@example.com',
+        project_id: null,
+        region: null,
+        plan: 'Google AI Pro',
+        expires_at: null,
+        quotas: [],
+        credits: [],
+      },
+    }
+
+    const manualHigh = geminiSlot({
+      ...base,
+      schedule_level: 8,
+      schedule_level_mode: 'manual',
+      owner_user_id: 'u-tenant-1',
+    })
+    expect(canReclaimVm(manualHigh)).toBe(true)
+    const tableManual = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <VmTable vms={[manualHigh]} />
+      </QueryClientProvider>
+    )
+    expect(tableManual).toContain('role="switch"')
+    expect(tableManual).toContain('P8')
+    expect(tableManual).toContain('>手</small>')
+
+    const paused = geminiSlot({
+      ...base,
+      id: 'gem-off',
+      schedulable: false,
+    })
+    expect(zoneCounts([paused]).off).toBe(1)
+    const tableOff = renderToStaticMarkup(
+      <QueryClientProvider client={new QueryClient()}>
+        <VmTable vms={[paused]} />
+      </QueryClientProvider>
+    )
+    expect(tableOff).toContain('手动关闭')
+
+    const cooled = geminiSlot({
+      ...base,
+      id: 'gem-cool',
+      restriction: {
+        reason: 'account_cooldown',
+        text: '账号冷却中',
+        until: Date.now() + 120_000,
+      },
+    })
+    expect(zoneCounts([cooled]).restricted).toBe(1)
+    expect(restrictionTitle(cooled)).toContain('账号冷却中')
+
+    const tripped = geminiSlot({
+      ...base,
+      id: 'gem-trip',
+      restriction: {
+        reason: 'circuit_open',
+        text: '熔断中',
+        until: Date.now() + 60_000,
+      },
+      circuit: {
+        state: 'open',
+        failures: 3,
+        threshold: 3,
+        open_until: Date.now() + 60_000,
+        open_ms: 60_000,
+      },
+    })
+    expect(zoneCounts([tripped]).restricted).toBe(1)
+    expect(restrictionTitle(tripped)).toContain('熔断中')
   })
 })

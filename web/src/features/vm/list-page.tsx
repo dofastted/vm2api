@@ -35,6 +35,10 @@ import {
   geminiInventoryOptions,
   geminiPayloadIssue,
 } from '@/features/import/gemini-environments'
+import {
+  GEMINI_INVENTORY_KEY,
+  geminiResource,
+} from '@/features/import/gemini-operations'
 import { usageQueryOptions } from '@/features/overview/queries'
 import { proxiesQueryOptions } from '@/features/proxies/queries'
 import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-link'
@@ -190,13 +194,20 @@ export function VmListPage() {
   const deleteVm = useMutation({
     mutationFn: async ({
       id,
+      gemini,
       switchTo,
       force,
     }: {
       id: string
+      gemini?: boolean
       switchTo?: string
       force?: boolean
     }) => {
+      if (gemini) {
+        return api<VmDeleteResult>(geminiResource(id), {
+          method: 'DELETE',
+        })
+      }
       if (switchTo) {
         await api(`/api/panel/vms/${encodeURIComponent(switchTo)}/activate`, {
           method: 'POST',
@@ -206,10 +217,15 @@ export function VmListPage() {
         method: 'DELETE',
       })
     },
-    onSuccess: async (data, { id, switchTo }) => {
+    onSuccess: async (data, { id, gemini, switchTo }) => {
       setDeleteTarget(null)
       setDeleteInput('')
       setForceDelete(false)
+      if (gemini) {
+        toast.success(`已删除 ${id}`)
+        await qc.invalidateQueries({ queryKey: GEMINI_INVENTORY_KEY })
+        return
+      }
       await completeVmDeletion(
         qc,
         data,
@@ -426,6 +442,7 @@ export function VmListPage() {
           </div>
         </div>
         <VmActionsProvider
+          slots={slots}
           accounts={accounts}
           onReset={
             perms.admin
@@ -578,6 +595,7 @@ export function VmListPage() {
           if (deleteTarget && !deleteBlocked) {
             deleteVm.mutate({
               id: deleteTarget.id,
+              gemini: Boolean(deleteTarget.gemini),
               switchTo: deleteSwitchId,
               force: forceDelete && !!nodeGone,
             })
@@ -606,6 +624,7 @@ export function VmListPage() {
             ) {
               deleteVm.mutate({
                 id: deleteTarget.id,
+                gemini: Boolean(deleteTarget.gemini),
                 switchTo: deleteSwitchId,
                 force: forceDelete && !!nodeGone,
               })

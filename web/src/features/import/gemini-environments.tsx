@@ -1,6 +1,7 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
+import type { VmCircuit } from '@/types/panel-vm'
 import { Check, Copy, ExternalLink } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
@@ -15,6 +16,7 @@ import {
   groupGeminiModels,
 } from '@/lib/gemini-account-status'
 import { isGeminiHostIssue } from '@/lib/gemini-recovery'
+import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -23,12 +25,15 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { WsTerminal } from '@/components/ws-terminal-lazy'
 import { GeminiRedeemDialog } from '@/features/billing/gemini-redeem-dialog'
 import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-link'
+import { usersQueryOptions } from '@/features/users/queries'
+import { resolveOwnerUsername } from '@/features/vm/vm-owner'
 import {
   GEMINI_INVENTORY_KEY as QUERY_KEY,
   GEMINI_ROOT as ROOT,
   geminiProxyOptions,
   geminiError,
   isGeminiProxy,
+  syncGeminiEnvironment,
   useGeminiBusy,
   useGeminiMutation,
 } from './gemini-operations'
@@ -114,18 +119,56 @@ export type GeminiCragSubscription = {
   reclaim_supported: boolean
 }
 
+export type GeminiEnvironmentUsage = {
+  today_cost: number
+  today_requests: number
+  today_tokens: number
+  today_input_tokens: number
+  today_output_tokens: number
+  today_cache_read_tokens: number
+  today_cache_creation_tokens: number
+  cache_hit_rate: number | null
+  window_5h_cost: number
+  window_5h_requests: number
+  window_5h_tokens: number
+  window_7d_cost: number
+  window_7d_requests: number
+  window_7d_success: number
+  window_7d_errors: number
+  window_7d_tokens: number
+  total_cost: number
+  total_tokens: number
+  health_24h: Array<[number, number]> | null
+}
+
+export type GeminiEnvironmentRestriction = {
+  reason: string
+  text: string
+  until: number | null
+}
+
 export type GeminiEnvironment = {
   id: string
   name: string
   proxy_id: string
+  owner_user_id?: string | null
+  schedulable?: boolean
+  schedule_level?: number
+  schedule_level_mode?: 'auto' | 'manual'
+  restriction?: GeminiEnvironmentRestriction | null
+  circuit?: VmCircuit | null
   auth_state:
-  'unverified' | 'authorizing' | 'authorized' | 'reauth_required' | 'disabled'
+    'unverified' | 'authorizing' | 'authorized' | 'reauth_required' | 'disabled'
   runtime_ready: boolean
   billing_ready: boolean
   proxy_ready?: boolean
   auth_method: 'oauth' | 'api_key'
   oauth_imported?: boolean
   kernel_version: string | null
+  max_concurrency?: number
+  active_slots?: number
+  inflight?: number
+  usage?: GeminiEnvironmentUsage | null
   created_at: string | null
   updated_at: string | null
   models: string[]
@@ -158,12 +201,12 @@ export type GeminiInventory = {
   available: boolean
   host_message?: string
   payload_state?:
-  | 'installed'
-  | 'install_on_create'
-  | 'awaiting_redemption'
-  | 'not_configured'
-  | 'invalid'
-  | 'unknown'
+    | 'installed'
+    | 'install_on_create'
+    | 'awaiting_redemption'
+    | 'not_configured'
+    | 'invalid'
+    | 'unknown'
   payload_mode?: 'legacy_release' | 'crag_subscription'
   payload_issue?: keyof typeof PAYLOAD_ISSUES | null
   release_activated?: boolean | null
@@ -403,6 +446,190 @@ function AntigravityUsage({ environment }: { environment: GeminiEnvironment }) {
   )
 }
 
+function GeminiBasicPrefs({
+  environment,
+  busy,
+}: {
+  environment: GeminiEnvironment
+  busy: boolean
+}) {
+  const client = useQueryClient()
+  const users = useQuery(usersQueryOptions())
+  const [name, setName] = useState(environment.name || '')
+  const [concurrency, setConcurrency] = useState(
+    environment.max_concurrency != null
+      ? String(environment.max_concurrency)
+      : ''
+  )
+  const [levelMode, setLevelMode] = useState<'auto' | 'manual'>(
+    environment.schedule_level_mode === 'manual' ? 'manual' : 'auto'
+  )
+  const [level, setLevel] = useState<number>(
+    typeof environment.schedule_level === 'number' &&
+      environment.schedule_level >= 1 &&
+      environment.schedule_level <= 10
+      ? environment.schedule_level
+      : 5
+  )
+
+  useEffect(() => {
+    setName(environment.name || '')
+    setConcurrency(
+      environment.max_concurrency != null
+        ? String(environment.max_concurrency)
+        : ''
+    )
+    setLevelMode(
+      environment.schedule_level_mode === 'manual' ? 'manual' : 'auto'
+    )
+    setLevel(
+      typeof environment.schedule_level === 'number' &&
+        environment.schedule_level >= 1 &&
+        environment.schedule_level <= 10
+        ? environment.schedule_level
+        : 5
+    )
+  }, [
+    environment.id,
+    environment.name,
+    environment.max_concurrency,
+    environment.schedule_level,
+    environment.schedule_level_mode,
+  ])
+
+  const save = useGeminiMutation({
+    mutationFn: async () => {
+      const payload: Record<string, unknown> = {
+        name: name.trim(),
+        schedule_level: levelMode === 'manual' ? level : null,
+      }
+      if (concurrency.trim() !== '') {
+        const parsed = Number(concurrency.trim())
+        if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > 64) {
+          throw new Error('并发上限必须为 1 到 64 的整数')
+        }
+        if (parsed !== environment.max_concurrency) {
+          payload.max_concurrency = parsed
+        }
+      }
+      const updated = await api<GeminiEnvironment>(
+        `${ROOT}/environments/${encodeURIComponent(environment.id)}/prefs`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify(payload),
+        }
+      )
+      await syncGeminiEnvironment(client, updated)
+    },
+    onSuccess: () => toast.success('已保存基础与调度配置'),
+    onError: (err: Error) => toast.error(err.message),
+  })
+
+  const ownerLabel = resolveOwnerUsername(
+    environment.owner_user_id,
+    users.data?.items
+  )
+
+  return (
+    <section className='space-y-3 border-b pb-4' aria-label='基础与调度配置'>
+      <div className='flex flex-wrap items-baseline justify-between gap-2'>
+        <h3 className='text-base font-semibold'>基础与调度配置</h3>
+        <span className='text-xs text-muted-foreground'>
+          属主：{ownerLabel}
+        </span>
+      </div>
+      <div className='grid gap-3 sm:grid-cols-2'>
+        <div className='space-y-1.5'>
+          <Label htmlFor={`gemini-pref-name-${environment.id}`}>显示名称</Label>
+          <Input
+            id={`gemini-pref-name-${environment.id}`}
+            maxLength={80}
+            value={name}
+            disabled={busy || save.isPending}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </div>
+        <div className='space-y-1.5'>
+          <Label htmlFor={`gemini-pref-conc-${environment.id}`}>
+            并发上限（1–64）
+          </Label>
+          <Input
+            id={`gemini-pref-conc-${environment.id}`}
+            type='number'
+            min={1}
+            max={64}
+            step={1}
+            placeholder='默认（宿主配置）'
+            value={concurrency}
+            disabled={busy || save.isPending}
+            onChange={(e) => setConcurrency(e.target.value)}
+          />
+        </div>
+      </div>
+      <div className='space-y-1.5'>
+        <div className='flex items-center justify-between text-sm'>
+          <span className='font-medium'>调度优先级</span>
+          <span className='text-xs text-muted-foreground'>
+            {levelMode === 'manual' ? `P${level} · 手动` : 'P5 · 自动'}
+          </span>
+        </div>
+        <div
+          role='radiogroup'
+          aria-label='Gemini 调度优先级'
+          className='flex flex-wrap items-center gap-1'
+        >
+          <button
+            type='button'
+            role='radio'
+            aria-checked={levelMode === 'auto'}
+            disabled={busy || save.isPending}
+            onClick={() => setLevelMode('auto')}
+            className={cn(
+              'h-7 rounded-md border px-2 text-xs font-medium transition-colors',
+              levelMode === 'auto'
+                ? 'border-primary bg-primary text-primary-foreground'
+                : 'border-border bg-background text-muted-foreground hover:bg-muted'
+            )}
+          >
+            自动
+          </button>
+          {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => (
+            <button
+              key={n}
+              type='button'
+              role='radio'
+              aria-checked={levelMode === 'manual' && level === n}
+              disabled={busy || save.isPending}
+              onClick={() => {
+                setLevelMode('manual')
+                setLevel(n)
+              }}
+              className={cn(
+                'h-7 w-7 rounded-md border font-mono text-xs font-semibold tabular-nums transition-colors',
+                levelMode === 'manual' && level === n
+                  ? 'border-primary bg-primary text-primary-foreground'
+                  : 'border-border bg-background text-muted-foreground hover:bg-muted'
+              )}
+            >
+              {n}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className='flex items-center gap-2'>
+        <Button
+          type='button'
+          size='sm'
+          disabled={busy || save.isPending}
+          onClick={() => save.mutate(undefined)}
+        >
+          {save.isPending ? '保存中…' : '保存配置'}
+        </Button>
+      </div>
+    </section>
+  )
+}
+
 function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
   const account = environment.account
   return (
@@ -434,7 +661,7 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
             {environment.last_inference.model} ·{' '}
             {localTime(
               environment.last_inference.finished_at ||
-              environment.last_inference.started_at
+                environment.last_inference.started_at
             )}
             {environment.last_inference.state === 'failed'
               ? ` · ${geminiInferenceErrorLabel(environment.last_inference.error_code)}`
@@ -442,7 +669,7 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
           </dd>
         ) : null}
         {environment.last_inference?.state === 'failed' &&
-          geminiInferenceErrorAction(environment.last_inference.error_code) ? (
+        geminiInferenceErrorAction(environment.last_inference.error_code) ? (
           <dd className='mt-0.5 text-xs text-muted-foreground'>
             {geminiInferenceErrorAction(environment.last_inference.error_code)}
           </dd>
@@ -477,8 +704,8 @@ function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
                 ? `已绑定席位 #${environment.crag_license.seat}`
                 : '许可有效'
               : geminiInferenceErrorLabel(
-                environment.crag_license.code ?? 'license_required'
-              )}
+                  environment.crag_license.code ?? 'license_required'
+                )}
           </dd>
         </div>
       ) : null}
@@ -676,14 +903,20 @@ export function geminiInventoryOptions() {
 
 function GeminiDetails({
   environment,
+  initialTab = 'account',
   children,
 }: {
   environment: GeminiEnvironment
+  initialTab?: 'account' | 'proxy' | 'test'
   children: React.ReactNode
 }) {
-  const [tab, setTab] = useState('account')
+  const [tab, setTab] = useState<'account' | 'proxy' | 'test'>(initialTab)
   return (
-    <Tabs value={tab} onValueChange={setTab} className='min-w-0'>
+    <Tabs
+      value={tab}
+      onValueChange={(next) => setTab(next as 'account' | 'proxy' | 'test')}
+      className='min-w-0'
+    >
       <TabsList aria-label='Gemini 环境详情'>
         <TabsTrigger value='account'>账号</TabsTrigger>
         <TabsTrigger value='proxy'>代理</TabsTrigger>
@@ -811,8 +1044,10 @@ export function GeminiAuthorizationChallenge({
 
 export function GeminiEnvironments({
   environmentId,
+  initialTab,
 }: {
   environmentId?: string
+  initialTab?: 'account' | 'proxy' | 'test'
 }) {
   const isImport = !environmentId
   const client = useQueryClient()
@@ -841,14 +1076,14 @@ export function GeminiEnvironments({
   const operation = useGeminiMutation({
     mutationFn: async (action: {
       type:
-      | 'create'
-      | 'authorize'
-      | 'complete'
-      | 'disable'
-      | 'delete'
-      | 'refresh'
-      | 'bind_seat'
-      | 'release_seat'
+        | 'create'
+        | 'authorize'
+        | 'complete'
+        | 'disable'
+        | 'delete'
+        | 'refresh'
+        | 'bind_seat'
+        | 'release_seat'
       id?: string
     }) => {
       const resource = `${ROOT}/environments${action.id ? `/${encodeURIComponent(action.id)}` : ''}`
@@ -948,16 +1183,19 @@ export function GeminiEnvironments({
     : environment?.proxy_ready === false
       ? '绑定的 IPv4 SOCKS5 代理不可用。'
       : geminiPayloadIssue(inventory.data) ||
-      (inventory.data.oauth_runtime_issue
-        ? OAUTH_ISSUES[inventory.data.oauth_runtime_issue]
-        : awaitingRedemption
-          ? '请先兑换 CRAGGemini 内核。'
-          : null)
+        (inventory.data.oauth_runtime_issue
+          ? OAUTH_ISSUES[inventory.data.oauth_runtime_issue]
+          : awaitingRedemption
+            ? '请先兑换 CRAGGemini 内核。'
+            : null)
 
   const account = environment ? (
     <div className='space-y-4'>
       {isImport ? <h3 className='font-medium'>{environment.name}</h3> : null}
       {!isImport ? <AntigravityUsage environment={environment} /> : null}
+      {!isImport ? (
+        <GeminiBasicPrefs environment={environment} busy={busy} />
+      ) : null}
       <EnvironmentData environment={environment} />
       <div className='flex flex-wrap gap-2'>
         {environment.auth_method !== 'api_key' ? (
@@ -982,7 +1220,7 @@ export function GeminiEnvironments({
           </Button>
         ) : null}
         {environment.auth_state === 'authorized' ||
-          environment.auth_state === 'reauth_required' ? (
+        environment.auth_state === 'reauth_required' ? (
           <Button
             type='button'
             variant='outline'
@@ -997,8 +1235,8 @@ export function GeminiEnvironments({
           </Button>
         ) : null}
         {isCragSubscription &&
-          environment.auth_method === 'oauth' &&
-          !environment.crag_license?.valid ? (
+        environment.auth_method === 'oauth' &&
+        !environment.crag_license?.valid ? (
           <Button
             type='button'
             variant='outline'
@@ -1011,10 +1249,10 @@ export function GeminiEnvironments({
           </Button>
         ) : null}
         {isCragSubscription &&
-          environment.auth_method === 'oauth' &&
-          environment.crag_license?.valid &&
-          environment.crag_license.scope === 'host' &&
-          cragSub?.reclaim_supported ? (
+        environment.auth_method === 'oauth' &&
+        environment.crag_license?.valid &&
+        environment.crag_license.scope === 'host' &&
+        cragSub?.reclaim_supported ? (
           <Button
             type='button'
             variant='outline'
@@ -1067,7 +1305,7 @@ export function GeminiEnvironments({
         )}
       </div>
       {environment.auth_method === 'oauth' &&
-        environment.auth_state === 'authorized' ? (
+      environment.auth_state === 'authorized' ? (
         terminalUnavailable ? (
           <p role='status' className='text-sm text-muted-foreground'>
             暂时无法启动 Gemini：{terminalUnavailable}
@@ -1081,8 +1319,8 @@ export function GeminiEnvironments({
         )
       ) : null}
       {payloadReady &&
-        challenge?.id === environment.id &&
-        environment.auth_state === 'authorizing' ? (
+      challenge?.id === environment.id &&
+      environment.auth_state === 'authorizing' ? (
         <GeminiAuthorizationChallenge
           key={challenge.attempt_id}
           environmentId={environment.id}
@@ -1281,7 +1519,9 @@ export function GeminiEnvironments({
         <GeminiOperationError error={operation.error} />
       ) : null}
       {environment && !isImport ? (
-        <GeminiDetails environment={environment}>{account}</GeminiDetails>
+        <GeminiDetails environment={environment} initialTab={initialTab}>
+          {account}
+        </GeminiDetails>
       ) : (
         account
       )}

@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { fmtNum, fmtUsd, usedPctOf } from '@/lib/format'
+import { windowProbed } from '@/lib/pool-quota'
 import { cn } from '@/lib/utils'
 import { vmTodayStats, vmWeekOutcome } from '@/lib/vm-usage'
 import {
@@ -58,8 +59,7 @@ function computePulse(vms: Vm[], accounts?: UsageAccountRow[]): Pulse {
 
   for (const vm of vms) {
     counts[zoneOf(vm)] += 1
-    if (vm.gemini) continue
-    if (vm.has_token) {
+    if (vm.has_token && (!vm.gemini || windowProbed(vm, '7d'))) {
       const remain = Math.max(0, 100 - usedPctOf(vm, '7d'))
       remains.push(remain)
       headroom[Math.min(4, Math.floor(remain / 20))] += 1
@@ -153,7 +153,6 @@ export function FleetPulse({
   className?: string
 }) {
   const pulse = useMemo(() => computePulse(vms, accounts), [vms, accounts])
-  const hasGemini = vms.some((vm) => !!vm.gemini)
   const segments = ZONES.filter((z) => pulse.counts[z.key] > 0)
   const focused = filter !== 'all'
   const headroomMax = Math.max(...pulse.headroom, 1)
@@ -222,7 +221,7 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title={hasGemini ? '普通槽 7 天窗口余量' : '7 天窗口余量'}
+        title='7 天窗口余量'
         className='xl:col-span-2'
         meta={
           <span className='text-[13px] leading-none font-[590] tracking-[-0.01em] tabular-nums'>
@@ -279,7 +278,7 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title={hasGemini ? '普通槽今日消耗 · 北京时间' : '今日消耗 · 北京时间'}
+        title='今日消耗 · 北京时间'
         className='xl:col-span-2'
         meta={
           <span className='text-[11px] text-muted-foreground tabular-nums'>
@@ -307,7 +306,7 @@ export function FleetPulse({
       </Cell>
 
       <Cell
-        title={hasGemini ? '普通槽 7 天窗口成败' : '7 天窗口成败'}
+        title='7 天窗口成败'
         className='sm:col-span-2 xl:col-span-2'
         meta={
           <span className='text-[11px] text-muted-foreground tabular-nums'>

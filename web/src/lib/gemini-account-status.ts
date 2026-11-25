@@ -28,11 +28,28 @@ type CragLicense = {
   seat_required?: boolean
 }
 
+type AccountRestriction = {
+  reason: string
+  text: string
+  until: number | null
+}
+
+type AccountCircuit = {
+  state: 'closed' | 'open' | 'half_open'
+  failures: number
+  threshold: number
+  open_until: number | null
+  open_ms: number
+}
+
 type Account = Authorization &
   InferenceEvidence & {
     models_discovered?: boolean
     models: readonly string[]
     proxy_ready?: boolean
+    schedulable?: boolean
+    restriction?: AccountRestriction | null
+    circuit?: AccountCircuit | null
     crag_license?: CragLicense | null
   }
 
@@ -433,6 +450,7 @@ type GeminiGroup =
   | 'off'
   | 'none'
   | 'bad'
+  | 'restricted'
   | 'unschedulable'
   | 'pending'
   | 'host_failed'
@@ -474,6 +492,29 @@ export function geminiAccountStatus(
       if (blocker) {
         group = 'unschedulable'
         tone = { key: group, cls: 'bad', text: blocker }
+      } else if (environment.schedulable === false) {
+        group = 'off'
+        tone = { key: 'off', cls: 'off', text: '调度关' }
+      } else if (
+        environment.circuit &&
+        environment.circuit.state !== 'closed'
+      ) {
+        group = 'restricted'
+        tone =
+          environment.circuit.state === 'open'
+            ? { key: 'circuit', cls: 'bad', text: '熔断中' }
+            : { key: 'circuit', cls: 'caution', text: '熔断探测' }
+      } else if (
+        environment.restriction &&
+        (!environment.restriction.until ||
+          environment.restriction.until > Date.now())
+      ) {
+        group = 'restricted'
+        tone = {
+          key: 'cool',
+          cls: 'caution',
+          text: environment.restriction.text || '冷却中',
+        }
       } else if (inference.key === 'completed') {
         group = 'host_verified'
         tone = inference

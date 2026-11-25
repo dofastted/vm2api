@@ -29,7 +29,9 @@ export function PlatformMark({ vm }: { vm: Vm }) {
 export function VmAccountIdentity({ vm }: { vm: Vm }) {
   const email = vm.email?.trim() || ''
   const registration = credentialRegistrationOf(vm)
-  const crag = (vm.resolved_dataplane ?? vm.dataplane) === 'crag'
+  const crag =
+    (vm.resolved_dataplane ?? vm.dataplane) === 'crag' ||
+    vm.gemini?.auth_method === 'oauth'
   const node = vm.node_name || vm.node_id || 'local'
   return (
     <div className='min-w-0 space-y-0.5'>
