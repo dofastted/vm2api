@@ -510,17 +510,21 @@ export function geminiToolNameFromCall(name) {
   return s
 }
 
+// Leave room for CRAGGemini's 9-char `mcp_crag_` prefix so `mcp_crag_<wireName>`
+// always fits inside `agy` 1.5.9's 64-char `ValidateToolName` ceiling without double truncation.
+const MAX_WIRE_TOOL_NAME_LEN = 55
+
 function makeWireToolName(rawName, usedNames) {
   const base = geminiFuncName(rawName)
   let safe = base.replace(/[^A-Za-z0-9_-]/g, '_')
   if (!safe || /^[0-9-]/.test(safe)) safe = `${NAME_LEAD}${safe || 'tool'}`
-  if (safe.length > 64) {
+  if (safe.length > MAX_WIRE_TOOL_NAME_LEN) {
     const hash = crypto
       .createHash('sha256')
       .update(String(rawName || ''))
       .digest('hex')
       .slice(0, 8)
-    safe = `${safe.slice(0, 55)}_${hash}`
+    safe = `${safe.slice(0, MAX_WIRE_TOOL_NAME_LEN - 9)}_${hash}`
   }
   if (!usedNames.has(safe)) {
     usedNames.add(safe)
@@ -531,10 +535,11 @@ function makeWireToolName(rawName, usedNames) {
     .update(String(rawName || ''))
     .digest('hex')
     .slice(0, 8)
-  let candidate = `${safe.slice(0, 55)}_${hash}`
+  let candidate = `${safe.slice(0, MAX_WIRE_TOOL_NAME_LEN - 9)}_${hash}`
   let n = 1
   while (usedNames.has(candidate)) {
-    candidate = `${safe.slice(0, 52)}_${hash}_${n++}`
+    const tail = `_${hash}_${n++}`
+    candidate = `${safe.slice(0, Math.max(1, MAX_WIRE_TOOL_NAME_LEN - tail.length))}${tail}`
   }
   usedNames.add(candidate)
   return candidate
