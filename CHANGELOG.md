@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.4.219 — 2026-11-25 · 修复 Gemini bwrap 直连目录穿越与熔断错误归因；Go 协议前置 sidecar 与官方透传开关；Gemini 代理选择器展示 IP/出口 IP/地区
+
+- **修复 Gemini `bwrap` 直连目录穿越权限与熔断错误归因回归（消除全模型 503）**：
+  - `scripts/gemini-host.py` 修复 `/run/vm2api-gemini/d`（`direct_root`）`0750` 权限阻断非特权 `bwrap` worker（`--clear-groups`）穿越挂载及 `<short_name>` 启动前非 `0700` 触发 `craggemini` `Config::validate()` 失败的问题：启动时创建/自愈 `direct_root` 为 `0711`（`root:gateway_gid`，仅穿越不可列举）、worker 启动前以 `0700`（`uid:uid`）创建 `native_dir`，待 worker 就绪后在 `_expose_direct_socket()` 将 `native_dir` 切换为 `0710`（`uid:gateway_gid`）并将 `kernel.sock` 设为 `0660`（`uid:gateway_gid`）（#1848）。
+  - `scripts/gemini_host_native.py`、`src/lib/gemini/direct-client.mjs`、`src/lib/gemini/scheduler.mjs` 与 `src/lib/gemini/routes.mjs` 将内核 `account_circuit_open` 与全部候选账号被 `unitCircuit` 熔断的场景统一归因为 `503 gemini_native_worker_unavailable`（`gemini_operation_busy` 严格保留给队列满/并发饱和），并将公网 503 池并发文案（「当前可用 Gemini 账号并发繁忙，请稍后重试」）与面板 409 单环境锁文案分离（#1848）。
+- **Go 无状态协议前置 sidecar、Web Settings 官方请求体透传开关与 130 用例离线基线**：
+  - 新增纯 Go 标准库协议前置 sidecar（`protofront/` → `bin/kin-proto-front`）与 `src/lib/transport/proto-front-client.mjs`，实现星形 IR 与 4+1 入站协议双向编解码、Web Settings + 官方请求体双闸门透传校验、面向 CRAG/CRAGGemini/Codex 的防撞车剥离与畸形 JSON Schema `fail_closed_schema` 400 拦截，并通过 `KIN_PROTO_FRONT=node|shadow|go` 控制灰度切流（默认保持 `node` 不启动 sidecar，零行为变更、可即时回退）（#1849）。
+  - `src/lib/protocol/codex-route.mjs` 新增 `codex.official_passthrough`（默认 `true`）、`src/lib/gemini/routing-config.mjs` 新增 `gemini.official_passthrough`（默认 `true`），前端在 `web/src/features/settings/openai-pane.tsx` 与 `gemini-config-pane.tsx` 暴露对应「官方 Codex/Gemini 请求体透传」开关；新增 `scripts/protocol-baseline/` 130 用例离线基线并将 `protofront` 接入 CI 与 `scripts/check-gofmt.mjs`（#1849）。
+- **Gemini 代理选择器与详情页展示代理地址、出口 IP 与地区**：`web/src/features/import/gemini-operations.ts` 扩展 `GeminiProxy` 公开字段并新增 `geminiProxyAddress()` / `geminiProxyOptionLabel()`（安全处理 IPv6 方括号、区分中转域名与实测 `geo.ip`），同步应用于 `gemini-environments.tsx`（导入下拉与详情「绑定代理」）及 `gemini-proxy-panel.tsx`（重绑下拉与已绑卡片新增「代理地址」/「出口 IP」行）（#1843）。
+- 部署说明：本次改动涉及控制面（`src/`）、前端（`web/src/`）、Gemini 宿主脚本（`scripts/gemini-host.py`、`scripts/gemini_host_native.py`）以及默认关闭的 Go 协议前置源码（`protofront/`，运行期默认 `KIN_PROTO_FRONT=node`）；`deploy/payload.json`（CRAG `3.1.20` 与 CRAGGemini `0.4.11`）、`scripts/gemini-maintenance.py`、数据库迁移结构与 `bin/` / `share/wrap-cli` 相对 `1.4.218` 均未变，预期 `SLOT_SYNC=skip`，无需重启既有 Claude/Codex 槽位；Gemini 宿主机同步 `scripts/gemini-host.py` 与 `scripts/gemini_host_native.py` 后需重启 `vm2api-gemini` 一次以启用 `bwrap` 直连目录两阶段权限修复。
+
 ## 1.4.218 — 2026-11-25 · CRAG 订阅宿主机直充/锁价续费/整机迁移与云端订单；PostgreSQL 运行时、备份与一键迁移加固；CRAG v2 续跑 transcript 迁至来宾 tmpfs
 
 - **CRAG 订阅极简重构（`host_id` 直充、锁价续费、云端历史订单与整机零冷却迁移）**：
