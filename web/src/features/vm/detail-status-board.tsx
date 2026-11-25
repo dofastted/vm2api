@@ -52,6 +52,7 @@ import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
 import { OpenaiQuotaPanel } from '@/features/vm/openai-quota-panel'
 import { proxyHealthOf } from '@/features/vm/proxy-health'
 import { RuntimeChip } from '@/features/vm/runtime-chip'
+import { ClaudeQuotaObservations } from '@/features/vm/usage-windows'
 import { VmMemoryBlock } from '@/features/vm/vm-memory-block'
 import { VmSchedulingBlock } from '@/features/vm/vm-scheduling'
 import { telemetryEnabled } from './telemetry-policy'
@@ -391,6 +392,7 @@ export function VmStatusBoard(props: Props) {
                     />
                   </div>
                 ) : null}
+                <ClaudeQuotaObservations vm={vm} now={now} />
                 <ActiveUsageAction vm={vm} />
                 <ClaudeResetActions
                   vm={vm}

@@ -58,7 +58,10 @@ import { StatusMark } from '@/components/status-mark'
 import { VmCostByModel } from '@/features/vm/detail-cost-by-model'
 import { vmQueryOptions } from '@/features/vm/queries'
 import { riskFg, UsageMeter } from '@/features/vm/usage-meter'
-import { VmQuotaActions } from '@/features/vm/usage-windows'
+import {
+  ClaudeQuotaObservations,
+  VmQuotaActions,
+} from '@/features/vm/usage-windows'
 import { vmWindows } from '@/features/vm/vm-rack-model'
 import {
   projectionView,
@@ -662,6 +665,7 @@ function QuotaWindows({
           <WindowLine key={cell.key} cell={cell} />
         ))}
         <div className='mt-auto'>
+          <ClaudeQuotaObservations vm={vm} now={now} />
           <VmQuotaActions vm={vm} now={now} />
         </div>
       </WindowCard>

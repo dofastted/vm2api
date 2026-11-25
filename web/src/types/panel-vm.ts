@@ -265,6 +265,14 @@ export type SeatOccupant = {
 
 export type ScheduleState = 'on' | 'off' | 'unschedulable' | 'restricted'
 
+export type QuotaObservation = {
+  utilization: number | null
+  status: string | null
+  reset: string | null
+  sampled_at: string | null
+  stale: boolean
+}
+
 export type Vm = {
   id: string
   gemini?: GeminiEnvironment
@@ -338,6 +346,16 @@ export type Vm = {
   circuit?: VmCircuit | null
   cooldown_until?: number
   cooldown_reason?: string
+  /** Mutable stored quota state: official windows may be reconciled from headers. */
+  quota_observations?: {
+    official:
+      | ({ updated_at: string | null } & Record<
+          '5h' | '7d',
+          QuotaObservation | null
+        >)
+      | null
+    passive: Record<'5h' | '7d', QuotaObservation | null>
+  } | null
   utilization_5h?: number | null
   utilization_7d?: number | null
   utilization_7d_oi?: number
