@@ -2361,3 +2361,155 @@ test('429 failover: pre-content SSE meta/start error switches accounts, preserve
     'all_cooled_probe must preserve earliest cooldown expiry order instead of stale lastUsed/alphabetical order',
   )
 })
+
+test('CRAGGemini gemini-4-carbon-high forwards high thinkingConfig and returns detailed thinking by default across all 4 protocols', async () => {
+  const inferCalls = []
+  const scheduler = createGeminiScheduler({
+    callHost: async (op, payload) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-carbon',
+              proxy_id: 'proxy-carbon',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              // Only untiered `gemini-4-carbon` in catalog: `gemini-4-carbon-high` must resolve and forward `thinkingLevel: 'high'`!
+              models: ['gemini-4-carbon'],
+              capabilities: [...NATIVE_TUI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') return { id: payload.id, proxy_id: 'proxy-carbon', auth_method: 'oauth' }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: async (_op, payload) => {
+      inferCalls.push(payload)
+      return sseResponse([
+        `data: ${JSON.stringify({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ thought: true, text: 'Detailed agy thinking trace.' }],
+              },
+            },
+          ],
+        })}\n\n`,
+        `data: ${JSON.stringify({
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [
+                  { thought: true, text: '', thoughtSignature: 'sig_carbon_high_1' },
+                  { text: 'Verified answer.' },
+                ],
+              },
+              finishReason: 'STOP',
+            },
+          ],
+          usageMetadata: {
+            promptTokenCount: 10,
+            candidatesTokenCount: 4,
+            thoughtsTokenCount: 8,
+            totalTokenCount: 22,
+          },
+        })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://1.2.3.4:1080',
+  })
+
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler,
+  })
+
+  const cases = [
+    {
+      name: 'gemini',
+      url: '/v1beta/models/gemini-4-carbon-high:generateContent',
+      body: { contents: [{ role: 'user', parts: [{ text: 'Check carbon high' }] }] },
+      verify: (out) => {
+        assert.equal(out.candidates[0].content.parts[0].thought, true)
+        assert.equal(out.candidates[0].content.parts[0].text, 'Detailed agy thinking trace.')
+        assert.equal(out.candidates[0].content.parts[0].thoughtSignature, 'sig_carbon_high_1')
+        assert.equal(out.candidates[0].content.parts[1].text, 'Verified answer.')
+      },
+    },
+    {
+      name: 'openai-chat',
+      url: '/v1/chat/completions',
+      body: {
+        model: 'gemini-4-carbon-high',
+        messages: [{ role: 'user', content: 'Check carbon high' }],
+      },
+      verify: (out) => {
+        assert.equal(out.model, 'gemini-4-carbon-high')
+        assert.equal(out.choices[0].message.reasoning_content, 'Detailed agy thinking trace.')
+        assert.equal(out.choices[0].message.content, 'Verified answer.')
+        assert.equal(out.usage.completion_tokens_details.reasoning_tokens, 8)
+      },
+    },
+    {
+      name: 'openai-responses',
+      url: '/v1/responses',
+      body: {
+        model: 'gemini-4-carbon-high',
+        include: ['reasoning.encrypted_content'],
+        input: 'Check carbon high',
+      },
+      verify: (out) => {
+        assert.equal(out.model, 'gemini-4-carbon-high')
+        assert.equal(out.output[0].type, 'reasoning')
+        assert.equal(out.output[0].summary[0].text, 'Detailed agy thinking trace.')
+        assert.equal(out.output[0].encrypted_content, 'sig_carbon_high_1')
+        assert.equal(out.output[1].content[0].text, 'Verified answer.')
+      },
+    },
+    {
+      name: 'anthropic',
+      url: '/v1/messages',
+      body: {
+        model: 'gemini-4-carbon-high',
+        max_tokens: 1024,
+        messages: [{ role: 'user', content: 'Check carbon high' }],
+      },
+      verify: (out) => {
+        assert.equal(out.model, 'gemini-4-carbon-high')
+        assert.deepEqual(out.content[0], {
+          type: 'thinking',
+          thinking: 'Detailed agy thinking trace.',
+          signature: 'sig_carbon_high_1',
+        })
+        assert.deepEqual(out.content[1], {
+          type: 'text',
+          text: 'Verified answer.',
+        })
+      },
+    },
+  ]
+
+  for (const c of cases) {
+    const res = makeRes()
+    await handler(makeReq({ method: 'POST', url: c.url, body: c.body }), res)
+    assert.equal(res.statusCode, 200, `[${c.name}] HTTP 200`)
+    const sent = inferCalls[inferCalls.length - 1]
+    assert.deepEqual(
+      sent.body.generationConfig,
+      {
+        thinkingConfig: {
+          includeThoughts: true,
+          thinkingLevel: 'high',
+        },
+      },
+      `[${c.name}] CRAGGemini receives high thinkingConfig`,
+    )
+    c.verify(res.jsonBody())
+  }
+})

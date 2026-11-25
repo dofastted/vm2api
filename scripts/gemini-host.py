@@ -61,6 +61,7 @@ CLI_SETTINGS = {"toolPermission": "strict", "useG1Credits": False}
 NATIVE_CLI_SETTINGS = {
     "allowNonWorkspaceAccess": True,
     "useG1Credits": False,
+    "verbosity": "high",
     "permissions": {
         "allow": [
             "read_file(/work/.craggemini-media)",
@@ -6457,6 +6458,36 @@ class Host:
                 and 1 <= cand_count <= 8
             ):
                 cleaned_gen["candidateCount"] = cand_count
+            raw_tc = raw_gen.get("thinkingConfig")
+            if raw_tc is None:
+                raw_tc = raw_gen.get("thinking_config")
+            if isinstance(raw_tc, dict):
+                clean_tc = {}
+                inc = raw_tc.get("includeThoughts")
+                if inc is None:
+                    inc = raw_tc.get("include_thoughts")
+                if isinstance(inc, bool):
+                    clean_tc["includeThoughts"] = inc
+                lvl = raw_tc.get("thinkingLevel")
+                if lvl is None:
+                    lvl = raw_tc.get("thinking_level")
+                if isinstance(lvl, str) and lvl.strip().lower() in (
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "extra_high",
+                    "none",
+                ):
+                    clean_tc["thinkingLevel"] = lvl.strip().lower()
+                budget = raw_tc.get("thinkingBudget")
+                if budget is None:
+                    budget = raw_tc.get("thinking_budget")
+                if isinstance(budget, int) and not isinstance(budget, bool) and -1 <= budget <= 131072:
+                    clean_tc["thinkingBudget"] = budget
+                if clean_tc:
+                    cleaned_gen["thinkingConfig"] = clean_tc
             if cleaned_gen:
                 forwarded["generationConfig"] = cleaned_gen
 

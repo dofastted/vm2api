@@ -17,8 +17,52 @@ const GEMINI_EFFORT_SET = new Set(GEMINI_EFFORT_VALUES)
 
 const GEMINI_MODEL_RE = /^gemini-[a-z0-9][a-z0-9._-]{0,95}$/i
 const GEMINI_NON_CHAT_RE = /(?:^|[-_])(embedding|aqa|tts|live|audio|robotics|computer-use)(?:$|[-_])/i
-const GEMINI_VARIANT_SUFFIX_RE = /-(?:thinking|minimal|low|medium|high|xhigh|max)$/i
+const GEMINI_VARIANT_SUFFIX_RE = /-(?:thinking|minimal|low|medium|high|xhigh|extra-high|max|latest)$/i
 const GEMINI_PREVIEW_SUFFIX_RE = /-preview(?:-\d{2}-\d{2})?$/i
+const MODEL_PAREN_EFFORT_RE = /\(([^()]+)\)$/
+const MODEL_TIER_SUFFIX_RE = /-(minimal|low|medium|high|xhigh|extra-high|max)$/i
+
+function normalizeImpliedEffortToken(raw) {
+  const s = String(raw || '')
+    .trim()
+    .toLowerCase()
+  if (!s) return null
+  if (s === 'none' || s === 'off' || s === 'disabled' || s === '0') return 'none'
+  if (s === 'minimal') return 'minimal'
+  if (s === 'low') return 'low'
+  if (s === 'medium' || s === 'med' || s === 'auto' || s === 'adaptive') return 'medium'
+  if (s === 'high') return 'high'
+  if (s === 'xhigh' || s === 'extra_high' || s === 'extra-high' || s === 'max') return 'xhigh'
+  if (/^\d+$/.test(s)) {
+    const budget = Number(s)
+    if (budget === 0) return 'none'
+    if (budget <= 1024) return 'minimal'
+    if (budget <= 4096) return 'low'
+    if (budget <= 12288) return 'medium'
+    if (budget <= 24576) return 'high'
+    return 'xhigh'
+  }
+  return null
+}
+
+export function extractImpliedModelEffort(raw) {
+  let s = String(raw || '').trim()
+  if (!s) return null
+  s = (s.split('/').filter(Boolean).pop() || s).replace(/^models\//i, '').trim()
+  s = s.replace(/\[1m\]$/i, '')
+  const parenMatch = MODEL_PAREN_EFFORT_RE.exec(s)
+  if (parenMatch) {
+    const parsed = normalizeImpliedEffortToken(parenMatch[1])
+    if (parsed) return parsed
+    s = s.slice(0, parenMatch.index)
+  }
+  s = s.replace(/-latest$/i, '').replace(/-thinking$/i, '')
+  const tierMatch = MODEL_TIER_SUFFIX_RE.exec(s)
+  if (tierMatch) {
+    return normalizeImpliedEffortToken(tierMatch[1])
+  }
+  return null
+}
 
 const CAP_GEMINI = Object.freeze({
   context_window: 1_000_000,
@@ -34,7 +78,13 @@ const CAP_GEMINI = Object.freeze({
 function bareModelId(raw) {
   const s = String(raw || '').trim()
   if (!s) return ''
-  return (s.split('/').filter(Boolean).pop() || s).replace(/^models\//i, '').trim()
+  let bare = (s.split('/').filter(Boolean).pop() || s).replace(/^models\//i, '').trim()
+  bare = bare.replace(/\[1m\]$/i, '')
+  const parenMatch = MODEL_PAREN_EFFORT_RE.exec(bare)
+  if (parenMatch && normalizeImpliedEffortToken(parenMatch[1])) {
+    bare = bare.slice(0, parenMatch.index)
+  }
+  return bare.trim()
 }
 
 export function isGeminiSeriesId(id) {
@@ -96,6 +146,7 @@ export function seedGeminiPolicy() {
     ['gemini-4-neon', { display_name: 'Gemini 4 Neon', sort: 10 }],
     ['gemini-4-argon', { display_name: 'Gemini 4 Argon', sort: 12 }],
     ['gemini-4-hydrogen', { display_name: 'Gemini 4 Hydrogen', sort: 14 }],
+    ['gemini-4-carbon', { display_name: 'Gemini 4 Carbon', sort: 15 }],
     ['gemini-3.8-flash', { display_name: 'Gemini 3.8 Flash', sort: 20 }],
     ['gemini-3.5-flash-lite', { display_name: 'Gemini 3.5 Flash Lite', sort: 22 }],
     ['gemini-3.1-pro', { display_name: 'Gemini 3.1 Pro', sort: 25 }],
