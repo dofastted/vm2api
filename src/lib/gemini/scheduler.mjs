@@ -1895,7 +1895,22 @@ export function createGeminiScheduler({
           }
         }
 
-        throw attachAttemptMeta(lastError || fail(503, 'gemini_operation_busy'))
+        if (!lastError) {
+          const allCandidates = [...primaryCandidates, ...fallbackCandidates].filter((c) => !excluded.has(c.accountId))
+          const inflightCountOf = (id) =>
+            poolScheduler ? poolScheduler.inflight?.get?.(id) || 0 : localInflight.get(id) || 0
+          const circuitBlocked =
+            allCandidates.length > 0 &&
+            allCandidates.some((c) => poolScheduler?.unitCircuit?.inspect?.(c.accountId)?.ok === false) &&
+            !allCandidates.some((c) => {
+              const circuitOk = poolScheduler?.unitCircuit?.inspect?.(c.accountId)?.ok !== false
+              return circuitOk && inflightCountOf(c.accountId) >= Math.max(1, c.maxConcurrency)
+            })
+          throw attachAttemptMeta(
+            fail(503, circuitBlocked ? 'gemini_native_worker_unavailable' : 'gemini_operation_busy'),
+          )
+        }
+        throw attachAttemptMeta(lastError)
       } finally {
         reservation?.release()
         try {

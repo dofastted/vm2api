@@ -2943,3 +2943,88 @@ test('P2-B direct Unix socket data plane streams 1-hop from Node to CRAGGemini a
     fs.rmSync(tmpDir, { recursive: true, force: true })
   }
 })
+
+test('open unitCircuit surfaces gemini_native_worker_unavailable while genuine slot saturation surfaces pool-busy 503 message', async () => {
+  const { PoolScheduler } = await import('../../src/lib/pool/pool-scheduler.mjs')
+  const { mapCragWorkerError } = await import('../../src/lib/gemini/direct-client.mjs')
+
+  assert.equal(mapCragWorkerError(503, { code: 'account_circuit_open' }).code, 'gemini_native_worker_unavailable')
+  assert.equal(mapCragWorkerError(503, { code: 'queue_full' }).code, 'gemini_operation_busy')
+
+  const env = {
+    id: 'gemini-circuit-check-0001',
+    proxy_id: 'px-1',
+    auth_state: 'authorized',
+    auth_method: 'oauth',
+    max_concurrency: 1,
+    models_discovered: true,
+    models: ['gemini-3-pro'],
+    capabilities: [...FULL_GEMINI_CAPABILITIES],
+  }
+  const accountId = `gemini:${env.id}`
+  const pool = new PoolScheduler()
+  let nowMs = 10_000
+  pool.unitCircuit.now = () => nowMs
+  pool.unitCircuit.configure({ failureThreshold: 2, openMs: 30_000 })
+  pool.unitCircuit.recordFailure(accountId)
+  pool.unitCircuit.recordFailure(accountId)
+  assert.equal(pool.unitCircuit.inspect(accountId).ok, false)
+
+  const scheduler = createGeminiScheduler({
+    poolScheduler: pool,
+    now: () => nowMs,
+    resolveProxy: () => 'socks5h://127.0.0.1:1080',
+    callHost: async (op) => {
+      if (op === 'list') return { payload_state: 'installed', environments: [env] }
+      if (op === 'get') return env
+      throw new Error(`unexpected host op: ${op}`)
+    },
+  })
+
+  const handle = createGeminiPublicHandler({
+    json: (_res, status, body) => ({ status, body }),
+    readBody: async (req) => req.body,
+    scheduler,
+  })
+
+  const circuitRes = await handle(
+    {
+      method: 'POST',
+      url: '/v1beta/models/gemini-3-pro:generateContent',
+      body: { contents: [{ role: 'user', parts: [{ text: 'health probe' }] }] },
+      apiKeyKind: 'managed',
+      apiKeyRecord: { group_type: 'gemini' },
+      once() {},
+    },
+    { setHeader() {}, once() {} },
+  )
+  assert.equal(circuitRes.status, 503)
+  assert.doesNotMatch(JSON.stringify(circuitRes.body), /此 Gemini 环境正在执行其他操作/)
+  assert.match(JSON.stringify(circuitRes.body), /CRAGGemini 原生常驻内核未就绪/)
+
+  // Advance past openMs, complete probe -> circuit closed, then occupy max_concurrency=1 slot -> genuine pool-busy 503.
+  nowMs += 30_001
+  pool.unitCircuit.admit(accountId)
+  pool.unitCircuit.recordSuccess(accountId)
+  assert.equal(pool.unitCircuit.inspect(accountId).ok, true)
+  const held = pool.reserveExternalCandidates([{ accountId, vmId: accountId, maxConcurrency: 1, priority: 0 }])
+  assert.ok(held?.reservation)
+  try {
+    const busyRes = await handle(
+      {
+        method: 'POST',
+        url: '/v1/chat/completions',
+        body: { model: 'gemini-3-pro', messages: [{ role: 'user', content: 'busy check' }] },
+        apiKeyKind: 'managed',
+        apiKeyRecord: { group_type: 'gemini' },
+        once() {},
+      },
+      { setHeader() {}, once() {} },
+    )
+    assert.equal(busyRes.status, 503)
+    assert.equal(busyRes.body.error.code, 'gemini_operation_busy')
+    assert.equal(busyRes.body.error.message, '当前可用 Gemini 账号并发繁忙，请稍后重试')
+  } finally {
+    held.reservation.release()
+  }
+})

@@ -411,6 +411,7 @@ assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status"
 assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status": 404}).code == "gemini_model_unavailable"
 assert native._map_worker_error(504, {"code": "first_byte_timeout"}).code == "gemini_inference_timeout"
 assert native._map_worker_error(503, {"code": "queue_full"}).code == "gemini_operation_busy"
+assert native._map_worker_error(503, {"code": "account_circuit_open"}).code == "gemini_native_worker_unavailable"
 
 # Pool-mode readiness accepts ready=True + pool.enabled=True + pool.ready=True with native_pid=None
 assert native._worker_ready({"ready": True, "native_pid": 12}) is True

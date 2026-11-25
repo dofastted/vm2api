@@ -1500,6 +1500,10 @@ function publicError(error) {
   }
   const known = HOST_ERRORS[code]
   const status = Number.isInteger(error?.status) ? error.status : known?.[0] || 503
+  const message =
+    code === 'gemini_operation_busy' && status === 503
+      ? '当前可用 Gemini 账号并发繁忙，请稍后重试'
+      : known?.[1] || error?.message || 'Gemini request failed.'
   return {
     status,
     details: error?.details,
@@ -1508,7 +1512,7 @@ function publicError(error) {
       error: {
         type: status === 429 ? 'rate_limit_error' : status >= 500 ? 'api_error' : 'invalid_request_error',
         code,
-        message: known?.[1] || error?.message || 'Gemini request failed.',
+        message,
       },
     },
   }

@@ -3296,6 +3296,7 @@ class Host:
         if direct_root is not None and direct_root.exists():
             try:
                 check_root_owned(direct_root)
+                os.chmod(direct_root, 0o711)
                 for stale in direct_root.iterdir():
                     if stale.is_dir() and (
                         re.fullmatch(r"s[0-9]+-[a-f0-9]{8,16}", stale.name)
@@ -3331,14 +3332,18 @@ class Host:
             and os.geteuid() == 0
             and len(str(direct_root / short_name / "kernel.sock").encode("utf-8")) <= 96
         ):
-            direct_root.mkdir(mode=0o750, exist_ok=True)
+            # 0o711 lets both gateway_gid and unprivileged bwrap worker UIDs traverse
+            # direct_root without listing sibling directories; native_dir starts as
+            # 0o700 (uid:uid) so craggemini Config::validate() accepts run_dir, then
+            # _expose_direct_socket() opens 0o710 (uid:gateway_gid) once ready.
+            direct_root.mkdir(mode=0o711, exist_ok=True)
             os.chown(direct_root, 0, gateway_gid)
-            os.chmod(direct_root, 0o750)
+            os.chmod(direct_root, 0o711)
             check_root_owned(direct_root)
             native_dir = direct_root / short_name
-            native_dir.mkdir(mode=0o750)
-            os.chown(native_dir, uid, gateway_gid)
-            os.chmod(native_dir, 0o750)
+            native_dir.mkdir(mode=0o700)
+            os.chown(native_dir, uid, uid)
+            os.chmod(native_dir, 0o700)
             return native_dir, True
         if len(str(fallback_candidate / "kernel.sock").encode("utf-8")) > 96:
             NATIVE_RUNTIME_ROOT.mkdir(mode=0o711, exist_ok=True)
@@ -3366,10 +3371,26 @@ class Host:
             return False
         gateway_gid = getattr(self, "gateway_gid", None)
         if os.geteuid() == 0:
-            if info.st_uid != getattr(worker, "uid", info.st_uid):
+            expected_uid = getattr(worker, "uid", info.st_uid)
+            if info.st_uid != expected_uid:
                 return False
             if gateway_gid is not None:
+                direct_root = self._direct_runtime_root()
+                allowed_roots = {
+                    root for root in (direct_root, NATIVE_RUNTIME_ROOT) if root is not None
+                }
+                parent = sock.parent
+                if parent.parent not in allowed_roots:
+                    return False
                 try:
+                    parent_info = parent.lstat()
+                    if (
+                        not stat.S_ISDIR(parent_info.st_mode)
+                        or parent_info.st_uid != expected_uid
+                    ):
+                        return False
+                    os.chown(parent, expected_uid, gateway_gid)
+                    os.chmod(parent, 0o710)
                     os.chown(sock, info.st_uid, gateway_gid)
                     os.chmod(sock, 0o660)
                 except OSError:
