@@ -3399,3 +3399,108 @@ test('crag subscription route scopes claim-by-order error copy away from other a
   assert.equal(claimConflict.body.error.code, 'request_conflict')
   assert.match(claimConflict.body.error.message, /already recorded/i)
 })
+
+test('rebuildDeviceIdentity generates a fresh identity when hardware sources still collide', (t) => {
+  const { root, publicDir, connect } = standaloneHost(t)
+  const service = connect()
+  const original = service.deviceIdentity()
+  fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
+  fs.writeFileSync(path.join(publicDir, 'host_id'), original.hostId, { mode: 0o644 })
+
+  const rebuilt = service.rebuildDeviceIdentity({ reason: 'host_id_collision' })
+  assert.equal(rebuilt.source, 'generated')
+  assert.notEqual(rebuilt.hostId, original.hostId)
+  assert.equal(service.deviceIdentity().hostId, rebuilt.hostId)
+  assert.equal(service.deviceIdentity().uuid, rebuilt.uuid)
+})
+
+test('redeem and claimByOrder automatically rebuild a colliding host_id and retry once', async (t) => {
+  const seenRedeemHosts = []
+  const seenClaimHosts = []
+  let collidingHostId
+  const { root, privateDir, connect } = standaloneHost(t, async (url, { body }) => {
+    const action = url.slice(url.lastIndexOf('/') + 1)
+    const request = JSON.parse(body)
+    if (action === 'redeem') {
+      seenRedeemHosts.push(request.host_id)
+      if (request.host_id === collidingHostId) {
+        return Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+      }
+      const issued = issueHostEntitlement(root, request.host_id, { slot_limit: 2, revision: 1 })
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    if (action === 'claim-by-order') {
+      seenClaimHosts.push(request.host_id)
+      if (request.host_id === collidingHostId) {
+        return Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+      }
+      const issued = issueHostEntitlement(root, request.host_id, { slot_limit: 3, revision: 1 })
+      return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
+    }
+    if (action === 'recover') {
+      return Response.json({ ok: false, error: { code: 'auth_forbidden' } }, { status: 403 })
+    }
+    return Response.json({ ok: false, error: { code: 'not_found' } }, { status: 404 })
+  })
+  seedEncryptedPackage(root)
+  const { issuerId, payloadKeyId } = cragTargetIds(root)
+  fs.mkdirSync(path.join(root, 'deploy'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'deploy/payload.json'),
+    JSON.stringify({ crag_authorization: { issuer_public_key_id: issuerId, payload_key_id: payloadKeyId } }),
+  )
+  const service = connect()
+
+  // Seed a host that already activated once and then hits a confirmed host_id_collision.
+  await service.redeem(voucher())
+  collidingHostId = service.deviceIdentity().hostId
+  fs.writeFileSync(path.join(privateDir, 'credential'), crypto.randomBytes(32).toString('base64url'), { mode: 0o600 })
+
+  const redeemed = await service.redeem(voucher())
+  assert.equal(redeemed.slot_limit, 2)
+  assert.equal(seenRedeemHosts.length, 3, 'initial redeem + colliding attempt + rebuilt retry')
+  assert.equal(seenRedeemHosts[1], collidingHostId)
+  assert.notEqual(seenRedeemHosts[2], collidingHostId)
+  assert.equal(service.deviceIdentity().hostId, seenRedeemHosts[2])
+
+  // Same automatic rebuild on claimByOrder when colliding.
+  collidingHostId = service.deviceIdentity().hostId
+  fs.writeFileSync(path.join(privateDir, 'credential'), crypto.randomBytes(32).toString('base64url'), { mode: 0o600 })
+  const claimed = await service.claimByOrder('order-collision-1')
+  assert.equal(claimed.slot_limit, 3)
+  assert.equal(seenClaimHosts.length, 2)
+  assert.equal(seenClaimHosts[0], collidingHostId)
+  assert.notEqual(seenClaimHosts[1], collidingHostId)
+  assert.equal(service.deviceIdentity().hostId, seenClaimHosts[1])
+})
+
+test('rebuild-identity panel route invokes subscription.rebuildIdentity with empty JSON body', async () => {
+  let called = 0
+  const handler = createCragSubscriptionHandler({
+    subscription: {
+      rebuildIdentity: async () => {
+        called++
+        return { ready: true, state: 'unredeemed', device_uuid: '11111111-2222-3333-4444-555555555555' }
+      },
+    },
+    json: (_, status, body) => ({ status, body }),
+    readRawBody: (req) => Buffer.from(req.rawBody || '{}'),
+  })
+  const route = cragSubscriptionRoute('POST', '/api/panel/crag-subscription/rebuild-identity')
+  assert.deepEqual(route, { action: 'rebuild-identity' })
+  const res = { setHeader() {} }
+  const req = {
+    panelUser: 'owner',
+    panelRole: 'admin',
+    headers: { host: 'localhost', origin: 'http://localhost', 'content-type': 'application/json' },
+    rawBody: '{}',
+  }
+  const reply = await handler(req, res, route)
+  assert.equal(reply.status, 200)
+  assert.equal(called, 1)
+  assert.equal(reply.body.data.state, 'unredeemed')
+
+  const invalid = await handler({ ...req, rawBody: JSON.stringify({ extra: true }) }, res, route)
+  assert.equal(invalid.status, 400)
+  assert.equal(called, 1)
+})

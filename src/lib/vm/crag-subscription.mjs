@@ -799,15 +799,37 @@ export function createCragSubscription({
    * guarantee `deviceIdentity` exists to provide. */
   function rebuildDeviceIdentity({ reason } = {}) {
     if (!reason) throw fail()
-    storage()
+    storage(true)
+    const previousHostId = load(hostFile, 0o644, 64)
     // Same order as the ordinary path, so a rebuild cannot land on a source the
     // ordinary path would have rejected -- and so a host with no qualifying NIC
     // can still be rebuilt, which a MAC-only rebuild could not do.
+    //
+    // When escaping a confirmed `host_id_collision`, prefer the first source that
+    // actually produces a different host id; if every hardware source still maps
+    // back to the colliding id (e.g. cloned guests sharing `/etc/machine-id` with
+    // no unique NIC/DMI), generate a fresh 128-bit identity so the host is never
+    // trapped on the colliding id forever.
     let picked
+    let fallback
     for (const [source, raw] of candidateRaws()) {
       if (!raw) continue
-      picked = [source, raw]
-      break
+      fallback ??= [source, raw]
+      if (!previousHostId || hostIdFromRaw(raw) !== previousHostId) {
+        picked = [source, raw]
+        break
+      }
+    }
+    if (!picked) {
+      if (reason === 'host_id_collision') {
+        let generated
+        do {
+          generated = randomBytes(16).toString('hex')
+        } while (previousHostId && hostIdFromRaw(generated) === previousHostId)
+        picked = ['generated', generated]
+      } else {
+        picked = fallback
+      }
     }
     if (!picked) throw hostIdentityUnavailable()
     const [source, raw] = picked
@@ -826,6 +848,7 @@ export function createCragSubscription({
     retireIdentity()
     publish(hostFile, hostId, 0o644)
     publish(uuidFile, uuid, 0o644)
+    publish(keyFile, randomBytes(32).toString('base64url'), 0o600)
     return { hostId, uuid, source }
   }
 
@@ -1945,6 +1968,24 @@ export function createCragSubscription({
         storage(!renewal)
         const previous = current(hostId)
         if (renewal && !previous) throw fail('host_subscription_inactive', 409)
+        const redeemWithCollisionRebuild = async (targetHost, targetIntent, targetPrevious, targetAsserted, replay) => {
+          try {
+            return await finish(targetHost, targetIntent, targetPrevious, targetAsserted, replay)
+          } catch (error) {
+            if (renewal || expectedHost || error?.code !== 'auth_forbidden' || error?.recovery !== 'host_id_collision') {
+              throw error
+            }
+            // Confirmed host_id_collision: retire the colliding local identity and
+            // mint a fresh host_id + credential, then retry once with the same paid
+            // voucher so the Authority migrates the voucher to this machine without
+            // disturbing the other host that owns the colliding id.
+            const rebuilt = rebuildDeviceIdentity({ reason: 'host_id_collision' })
+            credential(rebuilt.hostId, true)
+            const nextIntent = { ...targetIntent, host_id: rebuilt.hostId }
+            publish(intentFile, JSON.stringify(nextIntent), 0o600, true)
+            return await finish(rebuilt.hostId, nextIntent, null, targetAsserted, false)
+          }
+        }
         const rawIntent = load(intentFile, 0o600, MAX_REDEEM_INTENT_BYTES)
         if (rawIntent != null) {
           const saved = JSON.parse(rawIntent)
@@ -1961,7 +2002,7 @@ export function createCragSubscription({
               !appliedRedemption(hostId, voucherDigest(redemption_code))
             )
               throw hostPackageChanged()
-            const confirmed = await finish(hostId, saved, previous, {}, true)
+            const confirmed = await redeemWithCollisionRebuild(hostId, saved, previous, {}, true)
             return expectedHost ? undefined : status(confirmed)
           }
           if (expectedHost) throw fail('crag_subscription_sync_pending', 409)
@@ -1992,7 +2033,7 @@ export function createCragSubscription({
           }),
         }
         publish(intentFile, JSON.stringify(intent), 0o600, true)
-        const confirmed = await finish(hostId, intent, previous, asserted)
+        const confirmed = await redeemWithCollisionRebuild(hostId, intent, previous, asserted, false)
         if (!expectedHost) return status(confirmed)
       },
       { blockBefore: true },
@@ -2327,10 +2368,10 @@ export function createCragSubscription({
     claimByOrder(orderId) {
       return exclusive(async () => {
         if (!validOrderId(orderId)) throw fail('crag_subscription_invalid_request', 400)
-        const hostId = identity()
+        let hostId = identity()
         checkNoIntent()
         storage(true)
-        const previous = current(hostId)
+        let previous = current(hostId)
         // The Authority binds the voucher to this host's credential, so it has to
         // exist before the request: a first claim on a fresh machine has none yet.
         credential(hostId, true)
@@ -2344,14 +2385,37 @@ export function createCragSubscription({
         // package could not serve the entitlement being claimed anyway.
         const enrollment = hostEnrollmentIdentity(projectRoot, hostPackageDigest(projectRoot))
         if (!enrollment.payload_key_id || !enrollment.issuer_public_key_id) throw hostPackageUnready()
-        const data = await authority('claim-by-order', hostId, credential(hostId), {
-          order_id: orderId,
-          ...enrollment,
-        })
+        let data
+        try {
+          data = await authority('claim-by-order', hostId, credential(hostId), {
+            order_id: orderId,
+            ...enrollment,
+          })
+        } catch (error) {
+          if (error?.code !== 'auth_forbidden' || error?.recovery !== 'host_id_collision') throw error
+          const rebuilt = rebuildDeviceIdentity({ reason: 'host_id_collision' })
+          hostId = rebuilt.hostId
+          previous = null
+          credential(hostId, true)
+          data = await authority('claim-by-order', hostId, credential(hostId), {
+            order_id: orderId,
+            ...enrollment,
+          })
+        }
         const confirmed = verifyRights(hostId, data, previous)
         publish(entitlementFile, confirmed.code, 0o644)
         return status(confirmed)
       })
+    },
+    rebuildIdentity() {
+      return exclusive(
+        async () => {
+          storage(true)
+          rebuildDeviceIdentity({ reason: 'host_id_collision' })
+          return status()
+        },
+        { blockBefore: true },
+      )
     },
     unbind() {
       return exclusive(async () => {

@@ -23,11 +23,11 @@ function byName(tools) {
   return Object.fromEntries(tools.map((tool) => [tool.name, tool]))
 }
 
-test('applyEagerToolStreaming stays off unless the panel turns it on', () => {
+test('applyEagerToolStreaming defaults to on when unset or omitted in routing', () => {
   const unset = applyEagerToolStreaming(body(), {})
   const emptyFailover = applyEagerToolStreaming(body(), { failover: {} })
-  assert.equal(byName(unset.tools).Write.eager_input_streaming, undefined)
-  assert.equal(byName(emptyFailover.tools).Write.eager_input_streaming, undefined)
+  assert.equal(byName(unset.tools).Write.eager_input_streaming, true)
+  assert.equal(byName(emptyFailover.tools).Write.eager_input_streaming, true)
   assert.equal(byName(applyEagerToolStreaming(body(), on).tools).Write.eager_input_streaming, true)
 })
 

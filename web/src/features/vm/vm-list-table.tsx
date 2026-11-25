@@ -43,7 +43,7 @@ import {
   SLOT_BG,
   type SlotState,
 } from '@/lib/vm-health'
-import { clipLabel } from '@/lib/vm-kind'
+import { clipLabel, formatSlotEmail, slotRawEmail } from '@/lib/vm-kind'
 import {
   claudeTier,
   poolStatus,
@@ -369,13 +369,9 @@ function QuotaCell({
             backgroundColor: RISK_SOLID[riskLevel(w.pct)],
           }}
         />
-        {t.elapsedPct != null ? (
-          <b
-            aria-hidden
-            className='absolute -top-[3px] -bottom-[3px] w-0.5 rounded-[1px] bg-foreground'
-            style={{ left: `calc(${t.elapsedPct}% - 1px)` }}
-          />
-        ) : null}
+        {/* 时间进度只放 title 提示，不在轨道上画刻线——
+            进度条内任何竖线（无论形态/透明度）都会被读成「用量游标」，
+            降透明刻线两轮实测仍稳定被误读。 */}
       </span>
     </div>
   )
@@ -569,6 +565,7 @@ function ProdCell({ vm }: { vm: Vm }) {
     vm.gemini?.auth_method === 'oauth'
   const registration = credentialRegistrationOf(vm)
   const node = vm.node_name || vm.node_id || 'local'
+  const email = slotRawEmail(vm)
   return (
     <>
       <PlatformMark vm={vm} />
@@ -604,9 +601,9 @@ function ProdCell({ vm }: { vm: Vm }) {
           'min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground',
           SEC
         )}
-        title={vm.email || ''}
+        title={email}
       >
-        {vm.email ? clipLabel(vm.email) : '未绑定邮箱'}
+        {email ? formatSlotEmail(email) : '未绑定邮箱'}
       </span>
       <span
         className={cn(

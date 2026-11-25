@@ -76,15 +76,44 @@ function startHelper({ bin, directory }) {
   return { child, sock, capabilityFile }
 }
 
+async function stopChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return
+  const closed = new Promise((resolve) => {
+    child.once('close', resolve)
+    child.once('error', resolve)
+  })
+  try {
+    child.kill()
+  } catch {
+    return
+  }
+  let timer
+  await Promise.race([
+    closed,
+    new Promise((resolve) => {
+      timer = setTimeout(resolve, 1000)
+      timer.unref?.()
+    }),
+  ])
+  clearTimeout(timer)
+}
+
 export async function ensureRedaction(routing, { projectRoot, binPath } = {}) {
   let policy
   try {
     policy = normalizeRedaction(routing?.redaction)
   } catch (error) {
-    state = { enabled: true, ready: false, policy: null, error: error.code || 'invalid_redaction_config' }
+    state = {
+      enabled: true,
+      ready: false,
+      policy: null,
+      child: state.child || null,
+      error: error.code || 'invalid_redaction_config',
+    }
     throw error
   }
   if (!policy.enabled) {
+    await stopChild(state.child)
     state = { ...disabled, policy }
     return state
   }
@@ -94,7 +123,11 @@ export async function ensureRedaction(routing, { projectRoot, binPath } = {}) {
     return state
   }
   if (!boot) {
-    boot = bootHelper(policy, { projectRoot, binPath }).finally(() => {
+    const previousChild = state.child
+    boot = (async () => {
+      await stopChild(previousChild)
+      return bootHelper(policy, { projectRoot, binPath })
+    })().finally(() => {
       boot = null
     })
   }
@@ -107,7 +140,7 @@ async function bootHelper(policy, { projectRoot, binPath }) {
   const bundled = path.join(projectRoot || '', 'bin', 'kin-redact')
   const bin = binPath || process.env.KIN_REDACT_BIN || (fs.existsSync(bundled) ? bundled : '')
   if (!bin || !fs.existsSync(bin)) {
-    state = { enabled: true, ready: false, policy, client: null, error: 'redaction_unavailable' }
+    state = { enabled: true, ready: false, policy, client: null, child: null, error: 'redaction_unavailable' }
     throw unavailable('redaction helper is not installed')
   }
   const directory = path.join(projectRoot || os.tmpdir(), 'data', 'redact')
@@ -123,8 +156,15 @@ async function bootHelper(policy, { projectRoot, binPath }) {
     state = { enabled: true, ready: true, policy, client, child: helper.child, error: null }
     return state
   } catch (error) {
-    helper.child.kill()
-    state = { enabled: true, ready: false, policy, client: null, error: 'redaction_unavailable' }
+    await stopChild(helper.child)
+    state = {
+      enabled: true,
+      ready: false,
+      policy,
+      client: null,
+      child: null,
+      error: error.code || 'redaction_unavailable',
+    }
     throw error.status ? error : unavailable(error.message || 'redaction helper failed')
   }
 }

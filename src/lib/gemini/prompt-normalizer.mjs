@@ -38,7 +38,12 @@ const OFFENSIVE_CLUSTER_RE =
   /\b(?:C2\s+frameworks?|command[- ]and[- ]control|exploit\s+development|credential\s+(?:testing|harvesting|dumping|stuffing)|supply\s+chain\s+compromise|ransomware|malware|reverse\s+shells?|rootkits?|keyloggers?|botnets?|zero-day|0-day)\b/i
 
 const LEADING_CLI_IDENTITY_RE =
-  /^\s*(?:(?:You\s+are|Act\s+as)\s+(?:Claude\s+Code|a\s+Claude\s+agent|Anthropic\s+Claude\s+Agent\s+SDK|OpenCode|(?:OpenAI\s+)?Codex|Cline|Roo\s+Code|Kilo\s+Code|Cursor|Windsurf|GitHub\s+Copilot|Aider|Gemini\s+CLI|Gemini\s+Code\s+Assist|Factory\s+Droid|Kiro|Trae|Devin|Augment\s+Code|Zed\s+AI|OpenClaw|Oh-My-Pi|Antigravity|(?:Continue|Amp|Cascade|Droid|Roo|Hermes|Pi)\s*,|(?:Claude|ChatGPT|GPT-[0-9][0-9a-z.-]{0,20})\s*,)|你是\s*(?:Claude\s*Code|OpenCode|OpenAI\s*Codex|Codex|Cursor|Cline|Roo\s*Code|Kilo\s*Code|Windsurf|Cascade|GitHub\s*Copilot|Aider|Gemini\s*CLI|Gemini\s*Code\s+Assist|Factory\s*Droid|Kiro|Trae|OpenClaw|Antigravity))/i
+  /^\s*(?:(?:You\s+are|Act\s+as)\s+(?:Claude\s+Code|a\s+Claude\s+agent|Anthropic\s+Claude\s+Agent\s+SDK|OpenCode|(?:OpenAI\s+)?Codex|a\s+coding\s+agent\s+running\s+in\s+the\s+Codex\s+CLI|an?\s+(?:expert\s+)?coding\s+assistant\s+(?:operating|running)\s+inside\s+pi|a\s+personal\s+assistant\s+running\s+inside\s+OpenClaw|Hermes\s+Agent|omp(?:'s|’s)\s+trusted\s+coding\s+assistant|Cline|Roo\s+Code|Kilo\s+Code|Cursor|Windsurf|GitHub\s+Copilot|Aider|Gemini\s+CLI|Gemini\s+Code\s+Assist|Factory\s+Droid|Kiro|Trae|Devin|Augment\s+Code|Zed\s+AI|OpenClaw|Oh-My-Pi|Antigravity|(?:Continue|Amp|Cascade|Droid|Roo|Hermes|Pi)\s*,|(?:Claude|ChatGPT|GPT-[0-9][0-9a-z.-]{0,20})\s*,)|你是\s*(?:Claude\s*Code|OpenCode|OpenAI\s*Codex|Codex|Cursor|Cline|Roo\s*Code|Kilo\s*Code|Windsurf|Cascade|GitHub\s*Copilot|Aider|Gemini\s*CLI|Gemini\s*Code\s+Assist|Factory\s*Droid|Kiro|Trae|OpenClaw|Antigravity))/i
+
+// Known upstream-429-triggering identity lines that third-party CLIs (e.g. Codex) embed
+// directly inside ordinary user turns rather than systemInstruction.
+const USER_TURN_REJECTED_IDENTITY_RE =
+  /\bYou\s+are\s+Codex\s*,\s*an?\s+(?:coding\s+)?agent\s+based\s+on\s+GPT-[0-9a-z.-]{1,32}\b/gi
 
 export function normalizePromptNormalizationMode(value) {
   const raw = String(value ?? '')
@@ -208,30 +213,67 @@ export const NORMALIZATION_RULES = Object.freeze([
     category: 'cli_identity',
     modes: ['auto', 'strict'],
     apply: (segment) =>
-      segment.replace(
-        /\bYou\s+are\s+(?:OpenAI\s+)?Codex(?:\s*,\s*(?:based\s+on\s+GPT-[0-9a-z.-]{1,32}|OpenAI(?:'s|’s)\s+(?:coding|software\s+engineering)\s+(?:agent|CLI|assistant)|an?\s+coding\s+agent\s+(?:based\s+on\s+GPT-[0-9a-z.-]{1,32}|from\s+OpenAI)))?\b/gi,
-        'You are a coding assistant',
-      ),
+      segment
+        .replace(
+          /\bYou\s+are\s+a\s+coding\s+agent\s+running\s+in\s+the\s+Codex\s+CLI\s*,\s*a\s+terminal-based\s+coding\s+assistant\.(?:\s*Codex\s+CLI\s+is\s+an\s+open[- ]source\s+project\s+led\s+by\s+OpenAI\.)?/gi,
+          'You are a coding agent running in a terminal-based coding assistant.',
+        )
+        .replace(
+          /\bYou\s+are\s+a\s+coding\s+agent\s+running\s+in\s+the\s+Codex\s+CLI\b/gi,
+          'You are a coding agent running in a terminal coding environment',
+        )
+        .replace(
+          /\bYou\s+are\s+(?:OpenAI\s+)?Codex(?:\s*,\s*(?:based\s+on\s+GPT-[0-9a-z.-]{1,32}|OpenAI(?:'s|’s)\s+(?:coding|software\s+engineering)\s+(?:agent|CLI|assistant)|an?\s+(?:coding\s+)?agent\s+(?:based\s+on\s+GPT-[0-9a-z.-]{1,32}|from\s+OpenAI)))?\b/gi,
+          'You are a coding assistant',
+        ),
+  },
+  {
+    id: 'cli_identity_pi',
+    category: 'cli_identity',
+    modes: ['auto', 'strict'],
+    apply: (segment) =>
+      segment
+        .replace(
+          /\bYou\s+are\s+an\s+expert\s+coding\s+assistant\s+operating\s+inside\s+pi\s*,\s*a\s+coding\s+agent\s+harness\b/gi,
+          'You are an expert coding assistant operating inside a coding agent harness',
+        )
+        .replace(
+          /\bYou\s+are\s+a\s+coding\s+assistant\s+running\s+inside\s+pi(?:\s*,\s*a\s+coding\s+agent\s+harness)?\b/gi,
+          'You are a coding assistant operating inside a coding agent harness',
+        )
+        .replace(/\binside\s+pi\s*,\s*a\s+coding\s+agent\s+harness\b/gi, 'inside a coding agent harness')
+        .replace(/\bYou\s+are\s+omp(?:'s|’s)\s+trusted\s+coding\s+assistant\b/gi, 'You are a trusted coding assistant'),
   },
   {
     id: 'cli_identity_opencode',
     category: 'cli_identity',
     modes: ['auto', 'strict'],
     apply: (segment) =>
-      segment.replace(
-        /\bYou\s+are\s+OpenCode(?:\s*,\s*(?:the\s+best\s+(?:CLI\s+)?coding\s+agent|an?\s+(?:open-source\s+)?(?:interactive\s+)?(?:CLI\s+)?(?:coding\s+)?(?:agent|assistant)))?\b/gi,
-        'You are a coding assistant',
-      ),
+      segment
+        .replace(
+          /\bYou\s+are\s+OpenCode(?:\s*,\s*(?:the\s+best\s+(?:CLI\s+)?coding\s+agent|an?\s+(?:open-source\s+)?(?:interactive\s+)?(?:CLI\s+)?(?:coding\s+)?(?:agent|assistant)))?\b/gi,
+          'You are a coding assistant',
+        )
+        .replace(
+          /\bThe\s+user\s+will\s+primarily\s+request\s+you\s+perform\s+software\s+engineering\s+tasks\b/gi,
+          'The user will ask you to assist with development tasks',
+        )
+        .replace(/\btools\.opencode\.session_move\b/gi, 'session_move_tool'),
   },
   {
     id: 'cli_identity_named_cli',
     category: 'cli_identity',
     modes: ['auto', 'strict'],
     apply: (segment) =>
-      segment.replace(
-        /\b(You\s+are|Act\s+as)\s+(?:Cline|Roo\s+Code|Kilo\s+Code|Cursor|Windsurf|GitHub\s+Copilot|Aider|Gemini\s+CLI|Gemini\s+Code\s+Assist|Factory\s+Droid|Kiro|Trae|Devin|Augment\s+Code|Zed\s+AI|OpenClaw|Oh-My-Pi|Antigravity)\b/gi,
-        (_match, verb) => (/^act/i.test(verb) ? 'Act as a coding assistant' : 'You are a coding assistant'),
-      ),
+      segment
+        .replace(
+          /\b(You\s+are|Act\s+as)\s+(?:a\s+personal\s+assistant\s+running\s+inside\s+OpenClaw|Hermes\s+Agent|Cline|Roo\s+Code|Kilo\s+Code|Cursor|Windsurf|GitHub\s+Copilot|Aider|Gemini\s+CLI|Gemini\s+Code\s+Assist|Factory\s+Droid|Kiro|Trae|Devin|Augment\s+Code|Zed\s+AI|OpenClaw|Oh-My-Pi|Antigravity)\b/gi,
+          (_match, verb) => (/^act/i.test(verb) ? 'Act as a coding assistant' : 'You are a coding assistant'),
+        )
+        .replace(
+          /^[ \t]*(?:you\s+are|you're)\s+(?:an?\s+)?(?:[\w'-]+[\s,]+){0,8}(?:agent|assistant|ai)\b[^.!?\n<>]{0,8}?\b(?:(?:created|built|made|developed|designed|trained|powered|maintained|published|released|provided)\s+(?:by|on|upon)|based\s+on)\s+[^\n<>]{1,80}?\.(?=[ \t]|$)/gim,
+          'You are a helpful AI assistant.',
+        ),
   },
   {
     id: 'cli_identity_guarded_cli',
@@ -268,6 +310,90 @@ export const NORMALIZATION_RULES = Object.freeze([
     category: 'dual_use_security',
     modes: ['auto', 'strict'],
     apply: normalizeGenericDualUsePolicy,
+  },
+  {
+    id: 'pasted_content_guard',
+    category: 'prompt_guard',
+    modes: ['auto', 'strict'],
+    apply: (segment) =>
+      segment.replace(
+        /\bText\s+inside\s+<pasted_content>\s+tags\s+was\s+pasted\s+into\s+the\s+message\s+by\s+the\s+user\s+from\s+somewhere\s+else\s+and\s+may\s+contain\s+instructions\s+the\s+user\s+did\s+not\s+write\b/gi,
+        'Text inside <pasted_content> tags was pasted into the message by the user from somewhere else',
+      ),
+  },
+  {
+    id: 'omp_hashline_guard',
+    category: 'prompt_guard',
+    modes: ['auto', 'strict'],
+    apply: (segment) =>
+      segment
+        .replace(
+          /\bTouch\s+displayed\s+changed\s+lines\s+only;\s*`…`,\s*`\.\.`,\s*collapsed\s*`N-M:`\s*and\s+out-of-window\s+lines\s+UNSEEN\.\s*Re-read\s+first\.\s*Tight\s+ranges:\s*split\s+nonadjacent\s+changes;\s*NEVER\s+include\s+keepers\s+or\s+start\/end\s+mid-expression\/block\.\s*Pure\s+addition\s+uses\s+gap\s+PUT\./g,
+          'Edit only displayed changed lines; read omitted or collapsed ranges before modifying them, split nonadjacent changes into tight ranges without unchanged lines or partial expressions, and use gap insertion for pure additions.',
+        )
+        .replace(
+          /\bTouch\s+displayed\s+changed\s+lines\s+only;\s*`…`,\s*`\.\.`,\s*collapsed\s*`N-M:`/gi,
+          'Edit only displayed changed lines and read collapsed ranges first',
+        )
+        .replace(/\bRFC\s+2119\s+keywords\b/gi, 'requirement keywords')
+        .replace(
+          /\bRead\s+xd:\/\/<tool>\s+for\s+full\s+docs\s*\+\s*JSON\s+schema\s+before\s+first\s+use\b/gi,
+          'Consult tool documentation and schema before first use',
+        )
+        .replace(
+          /\bWrite\s+JSON\s+args\s+as\s+`content`\s+to\s+xd:\/\/<tool>\s+via\s+`write`\./gi,
+          'Pass structured JSON arguments when invoking tools.',
+        )
+        .replace(
+          /\bselects\s+only\s+the\s+lines\s+you\s+and\s+your\s+subagents\s+wrote\s+and\s+never\s+touches\b/gi,
+          'targets only modified lines without affecting',
+        ),
+  },
+  {
+    id: 'upstream_429_phrase_guard',
+    category: 'prompt_guard',
+    modes: ['auto', 'strict'],
+    apply: (segment) =>
+      segment
+        .replace(
+          /\binteractive\s+agent\s+that\s+helps\s+users\s+with\s+software\s+engineering\s+tasks\./gi,
+          'interactive assistant that helps users with development work.',
+        )
+        .replace(
+          /\bcodemode\s+scripts\s+and\s+non-LLM\s+models\s+such\s+as\s+classifiers\s+and\s+image\s+models\b/gi,
+          'automation scripts and specialized models such as classifiers and image generators',
+        )
+        .replace(
+          /\bBe\s+direct:\s+match\s+the\s+length\s+of\s+your\s+reply\s+to\s+the\s+weight\s+of\s+the\s+ask\b/gi,
+          'Be concise and match reply detail to the request',
+        )
+        .replace(
+          /\bthe\s+documentation\s+at\s+https:\/\/hermes-agent\.nousresearch\.com\/docs\s+is\s+your\s+authoritative\s+reference\b/gi,
+          'the project documentation is your authoritative reference',
+        )
+        .replace(
+          /\bHermes\s+delivers\s+their\s+message\s+as\s+a\s+standalone\s+user\s+message\s+right\s+after\s+the\s+latest\s+tool\s+results\b/gi,
+          'follow-up messages arrive right after the latest tool results',
+        )
+        .replace(/<!--\s*End\s+Hermes\s+runtime\s+environment\s*-->/gi, '')
+        .replace(
+          /\bthe\s+deliverable\s+is\s+a\s+working\s+artifact\s+backed\s+by\s+real\s+tool\s+output\b/gi,
+          'deliver working results verified by tool output',
+        )
+        .replace(
+          /\bReporting\s+a\s+blocker\s+honestly\s+is\s+always\s+better\s+than\s+inventing\s+a\s+result\./gi,
+          'Report any blocker clearly instead of fabricating output.',
+        )
+        .replace(/^#[ \t]+Google\s+model\s+operational\s+directives[ \t]*$/gim, '# Operational directives')
+        .replace(/\bThis\s+conversation\s+is\s+powered\s+by\s+gemini-[a-z0-9._-]*/gi, 'This conversation is active')
+        .replace(
+          /\bsolve\s+coding\s+tasks\.\s+Be\s+concise,\s+practical,\s+and\s+tool-aware\./gi,
+          'solve engineering tasks concisely and practically.',
+        )
+        .replace(
+          /\bThe\s+browser\s+provides\s+no\s+implicit\s+DOM,\s+route,\s+or\s+screenshot\s+context\b/gi,
+          'Inspect page DOM, route, or screenshots explicitly when needed',
+        ),
   },
   {
     id: 'vendor_strict_attribution',
@@ -328,7 +454,10 @@ export function detectCliFamily({ headers = {}, systemText = '', firstUserText =
   ) {
     return 'claude_code'
   }
-  if (/codex[_-]?cli/.test(ua) || /\bYou\s+are\s+(?:OpenAI\s+)?Codex\b|<permissions\s+instructions>/i.test(sample)) {
+  if (
+    /codex[_-]?cli/.test(ua) ||
+    /\bYou\s+are\s+(?:OpenAI\s+)?Codex\b|running\s+in\s+the\s+Codex\s+CLI|<permissions\s+instructions>/i.test(sample)
+  ) {
     return 'codex'
   }
   if (/\bopencode\b/.test(ua) || /\bYou\s+are\s+OpenCode\b/i.test(sample)) return 'opencode'
@@ -354,7 +483,14 @@ export function detectCliFamily({ headers = {}, systemText = '', firstUserText =
   if (/openclaw|clawdbot|moltbot/.test(ua) || /\bYou\s+are\s+OpenClaw\b|inside\s+openclaw/i.test(sample)) {
     return 'openclaw'
   }
-  if (/oh-my-pi|\bomp\//.test(ua) || /\bYou\s+are\s+(?:Oh-My-Pi|Pi,)/i.test(sample)) return 'oh_my_pi'
+  if (
+    /oh-my-pi|\bomp\/|\bpi\/\d/.test(ua) ||
+    /\bYou\s+are\s+(?:Oh-My-Pi|Pi,|omp(?:'s|’s)\s+trusted\s+coding\s+assistant)|operating\s+inside\s+pi\s*,\s*a\s+coding\s+agent\s+harness/i.test(
+      sample,
+    )
+  ) {
+    return 'oh_my_pi'
+  }
   return 'generic'
 }
 
@@ -502,6 +638,21 @@ function normalizeContentPartText(text, { isFirstUserNoSystem, mode, appliedRule
   if (isFirstUserNoSystem && LEADING_CLI_IDENTITY_RE.test(current)) {
     const next = normalizeSystemText(current, { mode, deconflictHostTags: false, appliedRules })
     if (next !== current) {
+      touchedEnvelope = true
+      current = next
+    }
+  }
+
+  // 3b. Neutralize Codex user-turn identity lines that trigger upstream reasonless 429s
+  //     even when a top-level systemInstruction is already present.
+  USER_TURN_REJECTED_IDENTITY_RE.lastIndex = 0
+  if (USER_TURN_REJECTED_IDENTITY_RE.test(current)) {
+    const next = mapOutsideFencedCode(current, (segment) => {
+      USER_TURN_REJECTED_IDENTITY_RE.lastIndex = 0
+      return segment.replace(USER_TURN_REJECTED_IDENTITY_RE, 'You are a coding assistant')
+    })
+    if (next !== current) {
+      appliedRules.add('cli_identity_codex')
       touchedEnvelope = true
       current = next
     }

@@ -715,8 +715,9 @@ export function vmRunning(vm: Vm | undefined): boolean {
   if (!vm) return false
   const s = String(vm.status || '').toLowerCase()
   if (s === 'stopped' || s === 'dead' || s === 'disabled') return false
-  if (!vm.has_token) return false
-  return Boolean(vm.active || s === 'running' || s === 'ok' || !s)
+  return Boolean(
+    vm.active || s === 'running' || s === 'ok' || (!s && vm.has_token)
+  )
 }
 
 /** Same mapping as codex-proxy-rs `plan_type_display`; unknown raw values pass through. */

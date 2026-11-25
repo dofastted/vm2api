@@ -2,6 +2,7 @@ import { Link } from '@tanstack/react-router'
 import type { Vm } from '@/types/panel-vm'
 import { fmtUsd } from '@/lib/format'
 import { cn } from '@/lib/utils'
+import { slotDisplayTitle } from '@/lib/vm-kind'
 import { proxyHostLabel } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { StatusMark } from '@/components/status-mark'
@@ -220,7 +221,7 @@ function SlotTable({
                       : vm.name || vm.id
                   }
                 >
-                  {vm.name || vm.id}
+                  {slotDisplayTitle(vm)}
                 </Link>
                 <ActiveVmBadge vm={vm} />
               </div>

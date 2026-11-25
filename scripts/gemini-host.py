@@ -61,6 +61,7 @@ CLI_SETTINGS = {"toolPermission": "strict", "useG1Credits": False}
 NATIVE_CLI_SETTINGS = {
     "allowNonWorkspaceAccess": True,
     "useG1Credits": False,
+    "verbosity": "high",
     "permissions": {
         "allow": [
             "read_file(/work/.craggemini-media)",
@@ -95,6 +96,72 @@ OAUTH_ACCESS_TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{1,4096}={0,2}\Z")
 RELEASE_CODE = re.compile(r"CGG1-[A-Za-z0-9_-]{43}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 MANUAL_RELEASE = Path("/etc/vm2api/gemini-release.json")
+_NATIVE_ALLOWED_TOP = frozenset(
+    {
+        "model",
+        "contents",
+        "stream",
+        "systemInstruction",
+        "system_instruction",
+        "system_prompt_mode",
+        "tools",
+        "toolConfig",
+        "tool_config",
+        "generationConfig",
+        "generation_config",
+        "safetySettings",
+        "safety_settings",
+        "cachedContent",
+        "cached_content",
+        "conversation_id",
+        "conversationId",
+    }
+)
+_NATIVE_ALLOWED_PART_KEYS = frozenset(
+    {
+        "text",
+        "inlineData",
+        "inline_data",
+        "fileData",
+        "file_data",
+        "functionCall",
+        "function_call",
+        "functionResponse",
+        "function_response",
+        "thought",
+        "thoughtSignature",
+        "thought_signature",
+    }
+)
+_NATIVE_SUBSTANTIVE_PART_KEYS = frozenset(
+    {
+        "inlineData",
+        "inline_data",
+        "fileData",
+        "file_data",
+        "functionCall",
+        "function_call",
+        "functionResponse",
+        "function_response",
+    }
+)
+_NATIVE_VALID_ASPECT_RATIOS = frozenset(
+    {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
+)
+_NATIVE_VALID_IMAGE_SIZES = frozenset({"1K", "2K", "4K"})
+_NATIVE_ALLOWED_TOOL_KEYS = frozenset(
+    {
+        "functionDeclarations",
+        "function_declarations",
+        "googleSearch",
+        "google_search",
+        "urlContext",
+        "url_context",
+    }
+)
+_NATIVE_ILLEGAL_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_NATIVE_CONV_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
+_SSE_STREAM_READ_BYTES = 65536
 AUTH_LINK = re.compile(
     rb"\x1b\]8;[^;\x1b]*;(https://accounts\.google\.com/o/oauth2/auth\?[^\x07\x1b]{1,4096})(?:\x07|\x1b\\)"
 )
@@ -124,9 +191,120 @@ LICENSE_ERROR_CODES = frozenset(
         "license_not_yet_valid",
         "license_invalid",
         "license_binding_mismatch",
+        "license_payload_key_mismatch",
         "license_unconfigured",
+        "gemini_subscription_sync_pending",
     }
 )
+
+
+def extract_permit_payload_key_id(code):
+    if not isinstance(code, str):
+        return None
+    text = code.strip()
+    if not text or len(text) > 65536:
+        return None
+    parts = text.split(".")
+    if len(parts) != 3 or parts[0] not in ("CRAGS1", "CRAGL1"):
+        return None
+    segment = parts[1]
+    if not segment:
+        return None
+    try:
+        padded = segment + "=" * (-len(segment) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        claims = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(claims, dict):
+        return None
+    key_id = claims.get("payload_key_id")
+    if isinstance(key_id, str) and SHA256.fullmatch(key_id):
+        return key_id
+    return None
+
+
+def classify_craggemini_license_cli_error(stdout, stderr, *, sync_pending=False):
+    if isinstance(stdout, str) and stdout.strip():
+        try:
+            parsed = json.loads(stdout)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            code = parsed.get("code")
+            if isinstance(code, str) and code in LICENSE_ERROR_CODES:
+                if code == "license_invalid" and sync_pending:
+                    return 503, "gemini_subscription_sync_pending"
+                return (503 if code == "gemini_subscription_sync_pending" else 403), code
+    text = (stderr or "").lower()
+    if "payload key" in text or "unlock the selected encrypted package" in text:
+        return 403, "license_payload_key_mismatch"
+    if (
+        "different instance" in text
+        or "different vm" in text
+        or "different seat" in text
+        or "different host" in text
+        or "binding" in text
+    ):
+        return 403, "license_binding_mismatch"
+    if "expired" in text:
+        return 403, "license_expired"
+    if "not valid yet" in text:
+        return 403, "license_not_yet_valid"
+    if "unconfigured" in text:
+        return 403, "license_unconfigured"
+    if (
+        "registration code is required" in text
+        or "permit or registration code is required" in text
+    ):
+        return 403, "license_required"
+    if sync_pending:
+        return 503, "gemini_subscription_sync_pending"
+    return 403, "license_invalid"
+
+
+def reconcile_craggemini_license_status(
+    status,
+    *,
+    expected_payload_key_id=None,
+    permit_payload_key_id=None,
+    sync_pending=False,
+):
+    if not isinstance(status, dict):
+        return status
+    if (
+        status.get("valid") is not True
+        and status.get("code") == "license_invalid"
+        and sync_pending
+    ):
+        return {
+            **status,
+            "status": "sync_pending",
+            "valid": False,
+            "code": "gemini_subscription_sync_pending",
+            "sync_pending": True,
+            "message": "CRAGGemini host subscription sync is pending.",
+        }
+    if (
+        status.get("valid") is True
+        and isinstance(expected_payload_key_id, str)
+        and SHA256.fullmatch(expected_payload_key_id)
+    ):
+        actual_key_id = status.get("payload_key_id") or permit_payload_key_id
+        if (
+            isinstance(actual_key_id, str)
+            and SHA256.fullmatch(actual_key_id)
+            and actual_key_id != expected_payload_key_id
+        ):
+            return {
+                **status,
+                "status": "invalid",
+                "valid": False,
+                "code": "license_payload_key_mismatch",
+                "payload_key_id": actual_key_id,
+                "message": "The CRAGGemini license payload key does not match the installed package.",
+            }
+    return status
 AGY_SHA256 = "39816d49d5ab92229952987225c23ea3fed7580699dcb4a444e0388e0ac1ce43"
 INFERENCE_MODULE = ROOT / "scripts/gemini_host_inference.py"
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
@@ -1407,20 +1585,10 @@ class NativeAgy(Agy):
         super().__init__(host, environment, proxy_url, profile=profile)
 
     def launch_cli(self, argv, size):
-        candidate = self.directory / "native"
-        if len(str(candidate / "kernel.sock").encode("utf-8")) > 96:
-            NATIVE_RUNTIME_ROOT.mkdir(mode=0o711, exist_ok=True)
-            os.chmod(NATIVE_RUNTIME_ROOT, 0o711)
-            check_root_owned(NATIVE_RUNTIME_ROOT)
-            self.native_dir = (
-                NATIVE_RUNTIME_ROOT / f"s{getattr(self, 'slot', 0)}-{self.attempt[:12]}"
-            )
-            self._owns_native_dir = True
-        else:
-            self.native_dir = candidate
-            self._owns_native_dir = False
-        self.native_dir.mkdir(mode=0o700)
-        os.chown(self.native_dir, self.uid, self.uid)
+        short_name = f"s{getattr(self, 'slot', 0)}-{self.attempt[:12]}"
+        self.native_dir, self._owns_native_dir = self.host._allocate_native_dir(
+            self.uid, self.directory / "native", short_name
+        )
         self.native_token = secrets.token_hex(32)
         license_dir = self.host.ensure_env_license_dir(self.environment)
         native_module_impl = native_module()
@@ -1872,7 +2040,12 @@ class NativeSession(NativeAgy):
         if not self.is_alive():
             raise native_mod.launcher_exit_failure(self.read_exit_detail())
         effective_model = model or self.model
-        return native_mod.open_worker_stream(
+        skip_probe = bool(
+            getattr(self, "_ever_ready", False)
+            and self.is_alive()
+            and not self.is_severely_unhealthy()
+        )
+        stream = native_mod.open_worker_stream(
             self.socket_path,
             self.native_token,
             effective_model,
@@ -1883,7 +2056,12 @@ class NativeSession(NativeAgy):
             diagnostic=self.native_diagnostic,
             is_alive=self.is_alive,
             exit_reader=self.read_exit_detail,
+            skip_ready_probe=skip_probe,
         )
+        self._ever_ready = True
+        self._health_failures = 0
+        self.host._expose_direct_socket(self)
+        return stream
 
     def cancel_turn(self, request_id):
         try:
@@ -2040,13 +2218,69 @@ class CragDaemonShard:
             token_path.write_bytes(token_bytes)
             os.chmod(token_path, 0o600)
             os.chown(token_path, self.uid, self.uid)
+        self._sync_account_license_files(env)
         return f"/accounts/{env_id}/home", f"/accounts/{env_id}/work"
+
+    def _sync_account_license_files(self, env):
+        if getattr(self.host, "payload_mode", None) != "crag_subscription":
+            return
+        env_id = env["id"]
+        dst_dir = self.accounts_root / env_id / "crag-license"
+        dst_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chown(dst_dir, self.uid, self.uid)
+        src_dir = self.host.directory / env_id / "crag-license"
+        for name in ("device.json", "registration.code"):
+            src = src_dir / name
+            dst = dst_dir / name
+            raw = None
+            try:
+                fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, "rb") as stream:
+                    info = os.fstat(stream.fileno())
+                    if stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 65536:
+                        data = stream.read(65537)
+                        if 0 < len(data) <= 65536:
+                            raw = data
+            except OSError:
+                raw = None
+            if raw is None:
+                try:
+                    if dst.exists() or dst.is_symlink():
+                        dst.unlink()
+                except OSError:
+                    pass
+                continue
+            try:
+                if dst.is_file() and not dst.is_symlink() and dst.read_bytes() == raw:
+                    os.chmod(dst, 0o600)
+                    os.chown(dst, self.uid, self.uid)
+                    continue
+            except OSError:
+                pass
+            staging = dst_dir / f".{name}.{secrets.token_hex(6)}"
+            try:
+                with os.fdopen(
+                    os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600),
+                    "wb",
+                ) as out:
+                    out.write(raw)
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.chown(staging, self.uid, self.uid)
+                os.chmod(staging, 0o600)
+                staging.replace(dst)
+            finally:
+                staging.unlink(missing_ok=True)
+
+    def sync_account_license(self, env):
+        with self._lock:
+            self._sync_account_license_files(env)
 
     def _account_binding_payload(self, env, proxy_url, model):
         env_id = env["id"]
         conc = max(env_concurrency(env), 1)
         min_warm = min(conc, self.policy["min_warm_slots"])
-        return {
+        payload = {
             "account_id": env_id,
             "env_id": env_id,
             "agy_home": f"/accounts/{env_id}/home",
@@ -2064,6 +2298,10 @@ class CragDaemonShard:
             "oauth_proxy_required": True,
             "enabled": True,
         }
+        if getattr(self.host, "payload_mode", None) == "crag_subscription":
+            payload["vm_id"] = env_id
+            payload["license_dir"] = f"/accounts/{env_id}/crag-license"
+        return payload
 
     def _start(self, initial_members):
         shards_parent = self.directory.parent
@@ -2074,23 +2312,14 @@ class CragDaemonShard:
         self.accounts_root.mkdir(mode=0o700)
         os.chown(self.accounts_root, self.uid, self.uid)
 
-        candidate = self.directory / "native"
-        if len(str(candidate / "kernel.sock").encode("utf-8")) > 96:
-            NATIVE_RUNTIME_ROOT.mkdir(mode=0o711, exist_ok=True)
-            os.chmod(NATIVE_RUNTIME_ROOT, 0o711)
-            check_root_owned(NATIVE_RUNTIME_ROOT)
-            self.native_dir = (
-                NATIVE_RUNTIME_ROOT / f"sh-{self.shard_id}-{self.attempt[:10]}"
-            )
-            self._owns_native_dir = True
-        else:
-            self.native_dir = candidate
-            self._owns_native_dir = False
-        self.native_dir.mkdir(mode=0o700)
-        os.chown(self.native_dir, self.uid, self.uid)
+        short_name = f"sh-{self.shard_id}-{self.attempt[:10]}"
+        self.native_dir, self._owns_native_dir = self.host._allocate_native_dir(
+            self.uid, self.directory / "native", short_name
+        )
 
         accounts_cfg = []
         default_model = NATIVE_DEFAULT_MODEL
+        boot_license_env_id = None
         for env, proxy_url, auth, model in initial_members:
             self._stage_account_files(env, auth)
             effective_model = model or self.host._initial_session_model(env)
@@ -2104,8 +2333,27 @@ class CragDaemonShard:
                 "max_concurrency": env_concurrency(env),
                 "model": effective_model,
             }
+            if getattr(self.host, "payload_mode", None) == "crag_subscription":
+                reg = self.accounts_root / env["id"] / "crag-license" / "registration.code"
+                if boot_license_env_id is None or reg.is_file():
+                    if boot_license_env_id is None or not (
+                        self.accounts_root / boot_license_env_id / "crag-license" / "registration.code"
+                    ).is_file():
+                        boot_license_env_id = env["id"]
 
         pol = self.policy
+        kernel_vm_id = (
+            boot_license_env_id
+            if getattr(self.host, "payload_mode", None) == "crag_subscription"
+            and boot_license_env_id
+            else self.shard_id
+        )
+        kernel_license_dir = (
+            f"/accounts/{boot_license_env_id}/crag-license"
+            if getattr(self.host, "payload_mode", None) == "crag_subscription"
+            and boot_license_env_id
+            else "/run/kin/crag-license"
+        )
         kernel_cfg = {
             "run_dir": "/tmp/craggemini",
             "internal_token": self.native_token,
@@ -2131,8 +2379,8 @@ class CragDaemonShard:
             "verify_agy_sha256": True,
             "strict_unique_proxy": False,
             "require_proxy_calibration": False,
-            "vm_id": self.shard_id,
-            "license_dir": "/run/kin/crag-license",
+            "vm_id": kernel_vm_id,
+            "license_dir": kernel_license_dir,
             "host_license_dir": "/run/kin/crag-host",
             "accounts": accounts_cfg,
         }
@@ -2475,7 +2723,12 @@ class CragDaemonShard:
             raise native_mod.launcher_exit_failure(self.read_exit_detail())
         self.last_used = time.monotonic()
         effective_model = model or NATIVE_DEFAULT_MODEL
-        return native_mod.open_worker_stream(
+        skip_probe = bool(
+            getattr(self, "_ever_ready", False)
+            and self.is_alive()
+            and not self.is_severely_unhealthy()
+        )
+        stream = native_mod.open_worker_stream(
             self.socket_path,
             self.native_token,
             effective_model,
@@ -2486,7 +2739,12 @@ class CragDaemonShard:
             account_id=env_id,
             is_alive=self.is_alive,
             exit_reader=self.read_exit_detail,
+            skip_ready_probe=skip_probe,
         )
+        self._ever_ready = True
+        self._health_failures = 0
+        self.host._expose_direct_socket(self)
+        return stream
 
     def cancel_turn(self, env_id, request_id):
         try:
@@ -2937,6 +3195,14 @@ class Host:
         self.payload_mode = "legacy_release"
         self.payload_issue = None
         self.crag_host_dir = getattr(args, "crag_host_dir", None)
+        self.socket_path = getattr(args, "socket", None)
+        self.gateway_group = getattr(args, "gateway_group", None)
+        self.gateway_gid = None
+        if isinstance(self.gateway_group, str) and self.gateway_group:
+            try:
+                self.gateway_gid = grp.getgrnam(self.gateway_group).gr_gid
+            except KeyError:
+                self.gateway_gid = None
         self.egress = args.egress
         self.uid_base = args.uid_base
         self.egress_uid = args.uid_base + MAX_NETNS_SLOTS
@@ -3026,6 +3292,18 @@ class Host:
                         shutil.rmtree(stale, ignore_errors=True)
             except (OSError, RuntimeError):
                 pass
+        direct_root = self._direct_runtime_root()
+        if direct_root is not None and direct_root.exists():
+            try:
+                check_root_owned(direct_root)
+                for stale in direct_root.iterdir():
+                    if stale.is_dir() and (
+                        re.fullmatch(r"s[0-9]+-[a-f0-9]{8,16}", stale.name)
+                        or re.fullmatch(r"sh-shard-[0-9]+-[a-f0-9]{8,16}", stale.name)
+                    ):
+                        shutil.rmtree(stale, ignore_errors=True)
+            except (OSError, RuntimeError):
+                pass
         stale_shards = self.directory / "_shards"
         if stale_shards.is_dir():
             try:
@@ -3037,6 +3315,77 @@ class Host:
 
     def env_uid(self, env):
         return self.uid_base + (env["slot"] % MAX_NETNS_SLOTS)
+
+    def _direct_runtime_root(self):
+        sock = getattr(self, "socket_path", None)
+        if isinstance(sock, Path):
+            return sock.parent / "d"
+        return None
+
+    def _allocate_native_dir(self, uid, fallback_candidate, short_name):
+        direct_root = self._direct_runtime_root()
+        gateway_gid = getattr(self, "gateway_gid", None)
+        if (
+            direct_root is not None
+            and gateway_gid is not None
+            and os.geteuid() == 0
+            and len(str(direct_root / short_name / "kernel.sock").encode("utf-8")) <= 96
+        ):
+            direct_root.mkdir(mode=0o750, exist_ok=True)
+            os.chown(direct_root, 0, gateway_gid)
+            os.chmod(direct_root, 0o750)
+            check_root_owned(direct_root)
+            native_dir = direct_root / short_name
+            native_dir.mkdir(mode=0o750)
+            os.chown(native_dir, uid, gateway_gid)
+            os.chmod(native_dir, 0o750)
+            return native_dir, True
+        if len(str(fallback_candidate / "kernel.sock").encode("utf-8")) > 96:
+            NATIVE_RUNTIME_ROOT.mkdir(mode=0o711, exist_ok=True)
+            os.chmod(NATIVE_RUNTIME_ROOT, 0o711)
+            check_root_owned(NATIVE_RUNTIME_ROOT)
+            native_dir = NATIVE_RUNTIME_ROOT / short_name
+            owns = True
+        else:
+            native_dir = fallback_candidate
+            owns = False
+        native_dir.mkdir(mode=0o700)
+        os.chown(native_dir, uid, uid)
+        return native_dir, owns
+
+    def _expose_direct_socket(self, worker):
+        sock_str = getattr(worker, "socket_path", None)
+        if not isinstance(sock_str, str) or not sock_str:
+            return False
+        sock = Path(sock_str)
+        try:
+            info = sock.lstat()
+        except OSError:
+            return False
+        if not stat.S_ISSOCK(info.st_mode):
+            return False
+        gateway_gid = getattr(self, "gateway_gid", None)
+        if os.geteuid() == 0:
+            if info.st_uid != getattr(worker, "uid", info.st_uid):
+                return False
+            if gateway_gid is not None:
+                try:
+                    os.chown(sock, info.st_uid, gateway_gid)
+                    os.chmod(sock, 0o660)
+                except OSError:
+                    return False
+        return True
+
+    def _sync_shard_account_license(self, env):
+        shard_id = getattr(self, "_account_shard_map", {}).get(env["id"])
+        if not shard_id:
+            return
+        shard = getattr(self, "daemon_shards", {}).get(shard_id)
+        if shard is not None and env["id"] in shard.members:
+            try:
+                shard.sync_account_license(env)
+            except OSError:
+                pass
 
     def _load_runtime_policy(self):
         try:
@@ -5551,7 +5900,12 @@ class Host:
                 env=SYSTEM_ENV,
             )
             if result.returncode != 0:
-                raise Failure(403, "license_invalid")
+                status_code, error_code = classify_craggemini_license_cli_error(
+                    result.stdout,
+                    result.stderr,
+                    sync_pending=self._crag_host_sync_pending(),
+                )
+                raise Failure(status_code, error_code)
             data = json.loads(result.stdout)
             if not isinstance(data, dict):
                 raise Failure(503, "license_invalid")
@@ -5564,7 +5918,125 @@ class Host:
             if staging_dir is not None:
                 shutil.rmtree(staging_dir, ignore_errors=True)
 
-    def license_status(self, env):
+    def _crag_host_sync_pending(self):
+        host_dir = getattr(self, "crag_host_dir", None)
+        if host_dir is None:
+            return False
+        try:
+            marker = host_dir / "sync-pending"
+            return marker.exists() or marker.is_symlink()
+        except OSError:
+            return False
+
+    def _expected_payload_key_id(self):
+        payload_dir = getattr(self, "payload", None)
+        if payload_dir is None:
+            return None
+        manifest_path = payload_dir / "manifest.json"
+        try:
+            fd = os.open(manifest_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                    return None
+                data = json.loads(stream.read(65537).decode("utf-8", errors="strict"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        payload = data.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        key_id = payload.get("key_id")
+        return key_id if isinstance(key_id, str) and SHA256.fullmatch(key_id) else None
+
+    def _read_env_permit_payload_key_id(self, env):
+        directory = getattr(self, "directory", None)
+        if directory is None:
+            return None
+        reg_file = directory / env["id"] / "crag-license" / "registration.code"
+        try:
+            fd = os.open(reg_file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                    return None
+                text = stream.read(65537).decode("utf-8", errors="strict")
+        except (OSError, UnicodeDecodeError):
+            return None
+        return extract_permit_payload_key_id(text)
+
+    @staticmethod
+    def _stat_token(path):
+        if path is None:
+            return None
+        try:
+            st = os.lstat(path)
+            return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        except OSError:
+            return None
+
+    def _license_cache_state(self):
+        lock = getattr(self, "_license_cache_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._license_cache_lock = lock
+        cache = getattr(self, "_license_status_cache", None)
+        if cache is None:
+            cache = {}
+            self._license_status_cache = cache
+        return lock, cache
+
+    def _invalidate_license_cache(self, env_id=None):
+        lock, cache = self._license_cache_state()
+        with lock:
+            if env_id is None:
+                cache.clear()
+            else:
+                cache.pop(env_id, None)
+
+    def _license_status_fingerprint(self, env):
+        env_id = env["id"]
+        directory = getattr(self, "directory", None)
+        lic_dir = (directory / env_id / "crag-license") if directory is not None else None
+        host_dir = getattr(self, "crag_host_dir", None)
+        payload_dir = getattr(self, "payload", None)
+        return (
+            env_id,
+            getattr(self, "payload_mode", None),
+            getattr(self, "verified_payload", None),
+            self._stat_token(payload_dir / "manifest.json" if payload_dir is not None else None),
+            self._stat_token(lic_dir / "registration.code" if lic_dir is not None else None),
+            self._stat_token(lic_dir / "device.json" if lic_dir is not None else None),
+            self._stat_token(host_dir / "entitlement.code" if host_dir is not None else None),
+            self._stat_token(host_dir / "revoked" if host_dir is not None else None),
+            self._stat_token(host_dir / "sync-pending" if host_dir is not None else None),
+            self._stat_token(Path("/etc/machine-id")),
+        )
+
+    def _get_cached_license_status(self, env):
+        env_id = env["id"]
+        fp = self._license_status_fingerprint(env)
+        lock, cache = self._license_cache_state()
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        with lock:
+            entry = cache.get(env_id)
+            if entry is None:
+                return None, fp
+            cached_fp, cached_at, status = entry
+            ttl = 30.0 if status.get("valid") is True else 5.0
+            if cached_fp != fp or (now_mono - cached_at) >= ttl:
+                return None, fp
+            expires_at = status.get("expires_at")
+            if isinstance(expires_at, (int, float)) and now_wall >= expires_at:
+                return None, fp
+            not_before = status.get("not_before")
+            if isinstance(not_before, (int, float)) and now_wall < not_before:
+                return None, fp
+            return dict(status), fp
+
+    def license_status(self, env, *, use_cache=True):
         if env.get("auth_method", "oauth") == "api_key":
             return {
                 "product": "craggemini",
@@ -5573,21 +6045,59 @@ class Host:
                 "seat_required": False,
                 "vm_id": env["id"],
             }
+        fp = None
+        if use_cache:
+            cached, fp = self._get_cached_license_status(env)
+            if cached is not None:
+                return cached
         try:
             status = self.run_craggemini_license_cli(env, ["--license-status"])
+            status = reconcile_craggemini_license_status(
+                status,
+                expected_payload_key_id=(
+                    self._expected_payload_key_id()
+                    if self.payload_mode == "crag_subscription"
+                    else None
+                ),
+                permit_payload_key_id=(
+                    None
+                    if status.get("payload_key_id")
+                    else self._read_env_permit_payload_key_id(env)
+                ),
+                sync_pending=self._crag_host_sync_pending(),
+            )
             status.setdefault("product", "craggemini")
             status["seat_required"] = True
-            return status
         except Failure as error:
             code = error.code if error.code in LICENSE_ERROR_CODES else "license_unconfigured"
-            return {
+            status = {
                 "product": "craggemini",
-                "status": "unlicensed" if code == "license_required" else "unconfigured",
+                "status": (
+                    "unlicensed"
+                    if code == "license_required"
+                    else "sync_pending"
+                    if code == "gemini_subscription_sync_pending"
+                    else "unconfigured"
+                ),
                 "valid": False,
                 "seat_required": True,
+                **(
+                    {"sync_pending": True}
+                    if code == "gemini_subscription_sync_pending"
+                    else {}
+                ),
                 "vm_id": env["id"],
                 "code": code,
             }
+        if use_cache:
+            if fp is None:
+                fp = self._license_status_fingerprint(env)
+            lock, cache = self._license_cache_state()
+            with lock:
+                if len(cache) > MAX_ENVIRONMENTS * 2:
+                    cache.clear()
+                cache[env["id"]] = (fp, time.monotonic(), dict(status))
+        return status
 
     def license_release_candidate(self, env):
         if env.get("auth_method", "oauth") != "oauth":
@@ -5621,6 +6131,8 @@ class Host:
                 reg_file.unlink()
         except OSError:
             pass
+        self._sync_shard_account_license(env)
+        self._invalidate_license_cache(identifier)
         return {"cleared": True}
 
     def view(self, env):
@@ -5831,7 +6343,128 @@ class Host:
                     self._schedule_warm_locked(env["id"], force=True)
             return self.view(env)
 
+    def _prewarm_license_cache_unlocked(self, envs):
+        for env in envs:
+            if env.get("auth_method", "oauth") == "api_key":
+                continue
+            cached, _ = self._get_cached_license_status(env)
+            if cached is None:
+                self.license_status(env, use_cache=True)
+
+    def _resolve_infer_target(self, body):
+        with self.lock:
+            descriptor = os.open(
+                self.directory / "maintenance.lock",
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                0o600,
+            )
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                pending = self.directory / "maintenance.pending"
+                if pending.exists() or pending.is_symlink():
+                    raise Failure(409, "gemini_operation_busy")
+            except BlockingIOError:
+                raise Failure(409, "gemini_operation_busy") from None
+            finally:
+                os.close(descriptor)
+
+            identifier = body.get("id")
+            if not isinstance(identifier, str) or identifier not in self.environments:
+                raise Failure(404)
+            env = self.environments[identifier]
+            if body.get("proxy_id") != env["proxy_id"]:
+                raise Failure(409)
+            proxy_url = body.get("proxy_url")
+            proxy_config(proxy_url)
+            verify_proxy_sha256(body, proxy_url)
+            model = body.get("model")
+            if not isinstance(model, str) or not MODEL.fullmatch(model):
+                raise Failure(400, "gemini_invalid_request")
+            _, key, auth = self.operation_account(env, allow_concurrent_infer=True)
+            if model not in env.get("call_models", []):
+                raise Failure(409, "gemini_model_unavailable")
+            if key:
+                return {"direct": False, "reason": "api_key"}
+            ctx = {
+                "identifier": identifier,
+                "env": dict(env),
+                "proxy_url": proxy_url,
+                "auth": auth,
+                "model": model,
+            }
+            use_shard = self._use_sharded_daemon()
+
+        worker = None
+        is_shard = False
+        if use_shard:
+            shard, _ = self._acquire_shard_for_account(ctx)
+            if shard is not None:
+                worker = shard
+                is_shard = True
+        if worker is None:
+            worker = self._acquire_native_session(ctx)
+            is_shard = False
+
+        if not worker.is_alive() or worker.is_severely_unhealthy():
+            return {"direct": False, "reason": "warming"}
+        if not getattr(worker, "_ever_ready", False):
+            health = worker.health(timeout=0.35)
+            if not (
+                isinstance(health, dict)
+                and health.get("ready") is True
+                and health.get("needs_recovery") is not True
+            ):
+                return {"direct": False, "reason": "warming"}
+            worker._ever_ready = True
+        if not self._expose_direct_socket(worker):
+            return {"direct": False, "reason": "socket_unavailable"}
+        use_account_route = is_shard or getattr(worker, "pool_mode", False)
+        return {
+            "direct": True,
+            "kind": "shard" if is_shard else "session",
+            "socket_path": worker.socket_path,
+            "token": worker.native_token,
+            "message_path": (
+                f"/internal/v1/accounts/{identifier}/messages"
+                if use_account_route
+                else "/internal/v1/messages"
+            ),
+            "cancel_path": (
+                f"/internal/v1/accounts/{identifier}/cancel"
+                if use_account_route
+                else "/internal/v1/cancel"
+            ),
+            "account_id": identifier if use_account_route else None,
+            "epoch": getattr(worker, "attempt", ""),
+            "ttl_ms": 30000,
+        }
+
     def request(self, operation, body):
+        if operation == "infer-target":
+            return self._resolve_infer_target(body)
+        # Evaluate any uncached CRAGGemini license checks outside the global Host lock
+        # so bwrap forks never stall concurrent infer/list/get traffic.
+        if operation == "list":
+            envs_to_warm = []
+            with self.lock:
+                self.inspect_payload()
+                if self.payload_mode == "crag_subscription":
+                    envs_to_warm = [dict(e) for e in self.environments.values()]
+            if envs_to_warm:
+                self._prewarm_license_cache_unlocked(envs_to_warm)
+        elif operation == "get":
+            env_to_warm = None
+            with self.lock:
+                self.inspect_payload()
+                identifier = body.get("id") if isinstance(body, dict) else None
+                if (
+                    self.payload_mode == "crag_subscription"
+                    and isinstance(identifier, str)
+                    and identifier in self.environments
+                ):
+                    env_to_warm = dict(self.environments[identifier])
+            if env_to_warm is not None:
+                self._prewarm_license_cache_unlocked([env_to_warm])
         with self.lock:
             return self._locked_request(operation, body)
 
@@ -5908,12 +6541,15 @@ class Host:
             return self.daemon_action(body)
         if operation == "install-payload":
             self.load_payload(materialize=True, verify_again=True)
+            self._invalidate_license_cache()
             return {
                 "version": self.payload_version,
                 "activation_required": self.payload_state == "awaiting_redemption",
             }
         if operation == "redeem":
-            return self.redeem_payload(body.get("redemption_code"))
+            result = self.redeem_payload(body.get("redemption_code"))
+            self._invalidate_license_cache()
+            return result
         if operation == "list":
             self.inspect_payload()
             return {
@@ -6050,11 +6686,13 @@ class Host:
             if not isinstance(code, str) or not 16 <= len(code.strip()) <= 16384:
                 raise Failure(400, "gemini_subscription_invalid_code")
             status = self.run_craggemini_license_cli(env, [], input_code=code)
+            self._invalidate_license_cache(identifier)
+            self._sync_shard_account_license(env)
             self.stop_native_session(identifier)
             self._schedule_warm_locked(identifier, force=True)
             return status
         if operation == "license-status":
-            return {"license": self.license_status(env)}
+            return {"license": self.license_status(env, use_cache=False)}
         if operation == "license-release-candidate":
             return self.license_release_candidate(env)
         if operation == "license-clear":
@@ -6174,6 +6812,7 @@ class Host:
             self.touch_environment(env)
             self.save()
             if operation == "delete":
+                self._invalidate_license_cache(identifier)
                 shutil.rmtree(self.directory / identifier)
                 del self.environments[identifier]
                 self.save()
@@ -6265,26 +6904,7 @@ class Host:
     def _extract_native_turn_body(model, body_obj):
         if not isinstance(body_obj, dict):
             return None
-        allowed_top = {
-            "model",
-            "contents",
-            "stream",
-            "systemInstruction",
-            "system_instruction",
-            "system_prompt_mode",
-            "tools",
-            "toolConfig",
-            "tool_config",
-            "generationConfig",
-            "generation_config",
-            "safetySettings",
-            "safety_settings",
-            "cachedContent",
-            "cached_content",
-            "conversation_id",
-            "conversationId",
-        }
-        if any(k not in allowed_top for k in body_obj):
+        if not _NATIVE_ALLOWED_TOP.issuperset(body_obj):
             return None
         mode = body_obj.get("system_prompt_mode")
         if mode is not None and mode not in ("official_full", "zero"):
@@ -6292,22 +6912,6 @@ class Host:
         contents = body_obj.get("contents")
         if not isinstance(contents, list) or not contents:
             return None
-        allowed_part_keys = {
-            "text",
-            "inlineData",
-            "inline_data",
-            "fileData",
-            "file_data",
-            "functionCall",
-            "function_call",
-            "functionResponse",
-            "function_response",
-            "thought",
-            "thoughtSignature",
-            "thought_signature",
-        }
-        valid_aspect_ratios = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
-        valid_image_sizes = {"1K", "2K", "4K"}
         has_substantive_part = False
         cleaned_contents = []
         for entry in contents:
@@ -6320,29 +6924,17 @@ class Host:
                 return None
             cleaned_parts = []
             for part in parts:
-                if not isinstance(part, dict) or not part or any(k not in allowed_part_keys for k in part):
+                if not isinstance(part, dict) or not part or not _NATIVE_ALLOWED_PART_KEYS.issuperset(part):
                     return None
                 if "text" in part:
                     text = part["text"]
                     if not isinstance(text, str):
                         return None
-                    if any(ord(ch) < 32 and ch not in ("\n", "\r", "\t") for ch in text):
+                    if _NATIVE_ILLEGAL_CTRL_RE.search(text):
                         return None
                     if text.strip() and part.get("thought") is not True:
                         has_substantive_part = True
-                if any(
-                    k in part
-                    for k in (
-                        "inlineData",
-                        "inline_data",
-                        "fileData",
-                        "file_data",
-                        "functionCall",
-                        "function_call",
-                        "functionResponse",
-                        "function_response",
-                    )
-                ):
+                if not has_substantive_part and not _NATIVE_SUBSTANTIVE_PART_KEYS.isdisjoint(part):
                     has_substantive_part = True
                 # CRAGGemini SHM does not consume historical thought blocks.
                 if part.get("thought") is True:
@@ -6354,16 +6946,22 @@ class Host:
                     ref = f"[Attached {mime}: {uri}]" if uri else f"[Attached {mime}]"
                     cleaned_parts.append({"text": ref})
                     continue
-                cleaned_part = {
-                    k: v
-                    for k, v in part.items()
-                    if not (
-                        k in ("thoughtSignature", "thought_signature")
-                        and v == "skip_thought_signature_validator"
-                    )
-                }
-                if cleaned_part:
-                    cleaned_parts.append(cleaned_part)
+                if (
+                    part.get("thoughtSignature") == "skip_thought_signature_validator"
+                    or part.get("thought_signature") == "skip_thought_signature_validator"
+                ):
+                    cleaned_part = {
+                        k: v
+                        for k, v in part.items()
+                        if not (
+                            k in ("thoughtSignature", "thought_signature")
+                            and v == "skip_thought_signature_validator"
+                        )
+                    }
+                    if cleaned_part:
+                        cleaned_parts.append(cleaned_part)
+                else:
+                    cleaned_parts.append(part)
             if cleaned_parts:
                 cleaned_entry = {"parts": cleaned_parts}
                 if entry.get("role") is not None:
@@ -6395,18 +6993,10 @@ class Host:
 
         if not tool_mode_none and isinstance(body_obj.get("tools"), list):
             cleaned_tools = []
-            allowed_tool_keys = {
-                "functionDeclarations",
-                "function_declarations",
-                "googleSearch",
-                "google_search",
-                "urlContext",
-                "url_context",
-            }
             for t in body_obj["tools"]:
                 if not isinstance(t, dict):
                     continue
-                filtered = {k: v for k, v in t.items() if k in allowed_tool_keys}
+                filtered = {k: v for k, v in t.items() if k in _NATIVE_ALLOWED_TOOL_KEYS}
                 if filtered:
                     cleaned_tools.append(filtered)
             if cleaned_tools:
@@ -6438,12 +7028,12 @@ class Host:
                 ratio = raw_img.get("aspectRatio")
                 if ratio is None:
                     ratio = raw_img.get("aspect_ratio")
-                if isinstance(ratio, str) and ratio.strip() in valid_aspect_ratios:
+                if isinstance(ratio, str) and ratio.strip() in _NATIVE_VALID_ASPECT_RATIOS:
                     clean_img["aspectRatio"] = ratio.strip()
                 size = raw_img.get("imageSize")
                 if size is None:
                     size = raw_img.get("image_size")
-                if isinstance(size, str) and size.strip().upper() in valid_image_sizes:
+                if isinstance(size, str) and size.strip().upper() in _NATIVE_VALID_IMAGE_SIZES:
                     clean_img["imageSize"] = size.strip().upper()
                 if clean_img:
                     cleaned_gen["imageConfig"] = clean_img
@@ -6457,13 +7047,43 @@ class Host:
                 and 1 <= cand_count <= 8
             ):
                 cleaned_gen["candidateCount"] = cand_count
+            raw_tc = raw_gen.get("thinkingConfig")
+            if raw_tc is None:
+                raw_tc = raw_gen.get("thinking_config")
+            if isinstance(raw_tc, dict):
+                clean_tc = {}
+                inc = raw_tc.get("includeThoughts")
+                if inc is None:
+                    inc = raw_tc.get("include_thoughts")
+                if isinstance(inc, bool):
+                    clean_tc["includeThoughts"] = inc
+                lvl = raw_tc.get("thinkingLevel")
+                if lvl is None:
+                    lvl = raw_tc.get("thinking_level")
+                if isinstance(lvl, str) and lvl.strip().lower() in (
+                    "minimal",
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "extra_high",
+                    "none",
+                ):
+                    clean_tc["thinkingLevel"] = lvl.strip().lower()
+                budget = raw_tc.get("thinkingBudget")
+                if budget is None:
+                    budget = raw_tc.get("thinking_budget")
+                if isinstance(budget, int) and not isinstance(budget, bool) and -1 <= budget <= 131072:
+                    clean_tc["thinkingBudget"] = budget
+                if clean_tc:
+                    cleaned_gen["thinkingConfig"] = clean_tc
             if cleaned_gen:
                 forwarded["generationConfig"] = cleaned_gen
 
         conv_id = body_obj.get("conversation_id")
         if not isinstance(conv_id, str) or not conv_id:
             conv_id = body_obj.get("conversationId")
-        if isinstance(conv_id, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", conv_id):
+        if isinstance(conv_id, str) and _NATIVE_CONV_ID_RE.fullmatch(conv_id):
             forwarded["conversation_id"] = conv_id
 
         return forwarded
@@ -6602,6 +7222,89 @@ class Host:
                         identifier, final_code
                     )
 
+    @staticmethod
+    def _parse_google_duration_ms(raw):
+        if not isinstance(raw, str):
+            return None
+        text = raw.strip()
+        if not text or len(text) > 64:
+            return None
+        total_ms = 0.0
+        pos = 0
+        for match in re.finditer(r"(\d+(?:\.\d+)?)(ms|s|m|h)", text):
+            if match.start() != pos:
+                return None
+            pos = match.end()
+            val = float(match.group(1))
+            unit = match.group(2)
+            factor = {"ms": 1.0, "s": 1000.0, "m": 60000.0, "h": 3600000.0}[unit]
+            total_ms += val * factor
+        if pos != len(text) or total_ms <= 0:
+            return None
+        return max(1, min(3_600_000, int(-(-total_ms // 1))))
+
+    @classmethod
+    def _parse_google_quota_error(cls, parsed_err):
+        if not isinstance(parsed_err, dict):
+            return None, None, False
+        err_obj = parsed_err.get("error") if isinstance(parsed_err.get("error"), dict) else parsed_err
+        details = err_obj.get("details") if isinstance(err_obj, dict) else None
+        retry_after_ms = None
+        upstream_reason = None
+        if isinstance(details, list):
+            for item in details:
+                if not isinstance(item, dict):
+                    continue
+                reason = item.get("reason")
+                if isinstance(reason, str) and reason and upstream_reason is None:
+                    upstream_reason = reason
+                delay_ms = cls._parse_google_duration_ms(item.get("retryDelay"))
+                if delay_ms is not None:
+                    retry_after_ms = max(retry_after_ms or 0, delay_ms)
+                meta = item.get("metadata")
+                if isinstance(meta, dict):
+                    qdelay = cls._parse_google_duration_ms(meta.get("quotaResetDelay"))
+                    if qdelay is not None:
+                        retry_after_ms = max(retry_after_ms or 0, qdelay)
+                    ts_raw = meta.get("quotaResetTimeStamp")
+                    if isinstance(ts_raw, str) and ts_raw.strip():
+                        try:
+                            dt = datetime.fromisoformat(ts_raw.strip().replace("Z", "+00:00"))
+                            delta_ms = int((dt.timestamp() - time.time()) * 1000)
+                            if delta_ms > 0:
+                                retry_after_ms = max(
+                                    retry_after_ms or 0, min(3_600_000, delta_ms)
+                                )
+                        except ValueError:
+                            pass
+        content_rejected = (
+            isinstance(err_obj, dict)
+            and err_obj.get("status") == "RESOURCE_EXHAUSTED"
+            and upstream_reason is None
+            and retry_after_ms is None
+        )
+        return retry_after_ms, upstream_reason, content_rejected
+
+    @staticmethod
+    def _emit_json_error(
+        handler,
+        status,
+        code=None,
+        message=None,
+        *,
+        retry_after_ms=None,
+        upstream_reason=None,
+        content_rejected=False,
+    ):
+        extra = {}
+        if retry_after_ms is not None:
+            extra["retry_after_ms"] = retry_after_ms
+        if isinstance(upstream_reason, str) and upstream_reason:
+            extra["upstream_reason"] = upstream_reason
+        if content_rejected:
+            extra["content_rejected"] = True
+        handler.send_json_error(status, code, message, **extra)
+
     def _stream_api_key_infer(self, ctx, handler):
         key = ctx["key"]
         cancel_event = ctx["entry"]["cancel_event"]
@@ -6644,11 +7347,18 @@ class Host:
             if status != 200 or ct != "text/event-stream":
                 raw_err = proc.stdout.read(65536) if proc.stdout else b""
                 err_msg = None
+                retry_after_ms = None
+                upstream_reason = None
+                content_rejected = False
                 try:
                     parsed_err = json.loads(raw_err) if raw_err else {}
                     err_obj = parsed_err.get("error") if isinstance(parsed_err, dict) else None
                     if isinstance(err_obj, dict) and isinstance(err_obj.get("message"), str):
                         err_msg = err_obj["message"][:512]
+                    if status == 429:
+                        retry_after_ms, upstream_reason, content_rejected = (
+                            self._parse_google_quota_error(parsed_err)
+                        )
                 except ValueError:
                     pass
                 code = {
@@ -6657,14 +7367,26 @@ class Host:
                     401: "gemini_api_key_invalid",
                     403: "gemini_api_key_invalid",
                     404: "gemini_model_unavailable",
-                    429: "gemini_quota_exhausted",
+                    429: "gemini_content_rejected" if content_rejected else "gemini_quota_exhausted",
                 }.get(status, "gemini_inference_failed")
                 http_status = status if 400 <= status <= 599 else 502
-                handler.send_json_error(http_status, code, err_msg)
+                self._emit_json_error(
+                    handler,
+                    http_status,
+                    code,
+                    err_msg,
+                    retry_after_ms=retry_after_ms,
+                    upstream_reason=upstream_reason,
+                    content_rejected=content_rejected,
+                )
                 return "failed", code
             handler.begin_sse()
             while not cancel_event.is_set():
-                chunk = proc.stdout.read1(16384) if hasattr(proc.stdout, "read1") else proc.stdout.read(16384)
+                chunk = (
+                    proc.stdout.read1(_SSE_STREAM_READ_BYTES)
+                    if hasattr(proc.stdout, "read1")
+                    else proc.stdout.read(_SSE_STREAM_READ_BYTES)
+                )
                 if not chunk:
                     break
                 handler.write_sse_chunk(self._redact_bytes(chunk, secret_bytes))
@@ -6718,7 +7440,7 @@ class Host:
         gateway_policy = ctx.get("gateway_policy")
         shard = None
         shard_id = None
-        if self._use_sharded_daemon() and self.payload_mode != "crag_subscription":
+        if self._use_sharded_daemon():
             shard, shard_id = self._acquire_shard_for_account(ctx)
         if shard is not None:
             conn = None
@@ -6743,7 +7465,7 @@ class Host:
                 )
                 handler.begin_sse()
                 while not cancel_event.is_set():
-                    chunk = response.read1(16384)
+                    chunk = response.read1(_SSE_STREAM_READ_BYTES)
                     if not chunk:
                         break
                     handler.write_sse_chunk(self._redact_bytes(chunk, creds))
@@ -6754,7 +7476,15 @@ class Host:
             except native_mod.NativeFailure as error:
                 had_error = error.code != "gemini_unsupported_turn"
                 status = error.status or 502
-                handler.send_json_error(status, error.code, error.message)
+                self._emit_json_error(
+                    handler,
+                    status,
+                    error.code,
+                    error.message,
+                    retry_after_ms=error.retry_after_ms,
+                    upstream_reason=getattr(error, "upstream_reason", None),
+                    content_rejected=getattr(error, "content_rejected", False),
+                )
                 return "failed", error.code
             except (BrokenPipeError, ConnectionResetError):
                 had_error = True
@@ -6799,7 +7529,7 @@ class Host:
             )
             handler.begin_sse()
             while not cancel_event.is_set():
-                chunk = response.read1(16384)
+                chunk = response.read1(_SSE_STREAM_READ_BYTES)
                 if not chunk:
                     break
                 handler.write_sse_chunk(self._redact_bytes(chunk, creds))
@@ -6826,7 +7556,15 @@ class Host:
             else:
                 status = error.status or 502
                 message = error.message
-            handler.send_json_error(status, code, message)
+            self._emit_json_error(
+                handler,
+                status,
+                code,
+                message,
+                retry_after_ms=error.retry_after_ms,
+                upstream_reason=getattr(error, "upstream_reason", None),
+                content_rejected=getattr(error, "content_rejected", False),
+            )
             return "failed", code
         except (BrokenPipeError, ConnectionResetError):
             had_error = True
@@ -6870,7 +7608,15 @@ class ControlHandler(BaseHTTPRequestHandler):
         self._headers_sent = False
         super().setup()
 
-    def send_json_error(self, status, code=None, message=None):
+    def send_json_error(
+        self,
+        status,
+        code=None,
+        message=None,
+        retry_after_ms=None,
+        upstream_reason=None,
+        content_rejected=False,
+    ):
         if self._headers_sent:
             return
         payload = {}
@@ -6878,12 +7624,22 @@ class ControlHandler(BaseHTTPRequestHandler):
             payload["code"] = code
         if message:
             payload["message"] = message
+        if isinstance(upstream_reason, str) and upstream_reason:
+            payload["upstream_reason"] = upstream_reason
+        if content_rejected:
+            payload["content_rejected"] = True
+        retry_after_sec = None
+        if type(retry_after_ms) is int and retry_after_ms > 0:
+            payload["retry_after_ms"] = retry_after_ms
+            retry_after_sec = max(1, (retry_after_ms + 999) // 1000)
         data = json.dumps(payload).encode()
         self._headers_sent = True
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Cache-Control", "no-store")
+            if retry_after_sec is not None:
+                self.send_header("Retry-After", str(retry_after_sec))
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -6954,6 +7710,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "test-chat-status",
                 "test-chat-cancel",
                 "infer-cancel",
+                "infer-target",
                 "warm",
                 "apply-policy",
                 "daemon-status",

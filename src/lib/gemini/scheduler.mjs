@@ -12,9 +12,10 @@ import {
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import { isGeminiModelEnabled, isGeminiSeriesId, resolveGeminiDefaultEffort } from '../protocol/gemini-model-policy.mjs'
 import { classifyAntigravityModel, indexAccountModelCatalog, resolveUpstreamModel } from './model-catalog.mjs'
+import { createDirectCragClient } from './direct-client.mjs'
 import { callGeminiHost, callGeminiHostStream } from './routes.mjs'
 import { DEFAULT_GEMINI_ROUTING, normalizeGeminiRouting } from './routing-config.mjs'
-import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
+import { GEMINI_LICENSE_MESSAGES, RECOVERABLE_GEMINI_SEAT_CODES } from './subscription.mjs'
 import { PLATFORM_SCOPE, geminiEnvMatchesOwnerScope } from '../admin/resource-owner.mjs'
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
@@ -64,6 +65,10 @@ const FAILURES = {
   gemini_account_ineligible: [403, 'Google rejected this account as ineligible for Antigravity.'],
   gemini_proxy_error: [502, 'The bound Gemini proxy could not reach Google.'],
   gemini_quota_exhausted: [429, 'The selected Gemini account quota is exhausted.'],
+  gemini_content_rejected: [
+    429,
+    'The request prompt was rejected by upstream content filtering (429); account quota was not exhausted.',
+  ],
   gemini_inference_timeout: [504, 'The Gemini turn timed out.'],
   gemini_inference_invalid_output: [502, 'Gemini returned an unreadable response.'],
   gemini_tool_call_required: [
@@ -95,11 +100,14 @@ const FAILURES = {
   license_not_yet_valid: [403, GEMINI_LICENSE_MESSAGES.license_not_yet_valid],
   license_invalid: [403, GEMINI_LICENSE_MESSAGES.license_invalid],
   license_binding_mismatch: [403, GEMINI_LICENSE_MESSAGES.license_binding_mismatch],
+  license_payload_key_mismatch: [403, GEMINI_LICENSE_MESSAGES.license_payload_key_mismatch],
   license_unconfigured: [403, GEMINI_LICENSE_MESSAGES.license_unconfigured],
+  gemini_subscription_sync_pending: [503, GEMINI_LICENSE_MESSAGES.gemini_subscription_sync_pending],
 }
 
 const NON_CIRCUIT_FAILURES = new Set([
   'gemini_quota_exhausted',
+  'gemini_content_rejected',
   'gemini_oauth_required',
   'gemini_api_key_invalid',
   'gemini_model_unavailable',
@@ -113,7 +121,9 @@ const NON_CIRCUIT_FAILURES = new Set([
   'license_not_yet_valid',
   'license_invalid',
   'license_binding_mismatch',
+  'license_payload_key_mismatch',
   'license_unconfigured',
+  'gemini_subscription_sync_pending',
 ])
 
 const FAILOVER_ERRORS = new Set([
@@ -154,6 +164,44 @@ const CONTENT_OUTPUT_EVENTS = new Set([
   'stop',
 ])
 
+const GROUP_QUOTA_EXHAUSTED_REASONS = new Set(['QUOTA_EXHAUSTED', 'INSUFFICIENT_G1_CREDITS_BALANCE'])
+const SHORT_RATE_LIMIT_MAX_MS = 5_000
+
+function parseGoDurationMs(raw) {
+  if (typeof raw !== 'string') return null
+  const text = raw.trim()
+  if (!text || text.length > 64) return null
+  let totalMs = 0
+  let pos = 0
+  const re = /(\d+(?:\.\d+)?)(ms|s|m|h)/g
+  for (const match of text.matchAll(re)) {
+    if (match.index !== pos) return null
+    pos = match.index + match[0].length
+    const val = Number(match[1])
+    if (!Number.isFinite(val) || val < 0) return null
+    const unit = match[2]
+    const factor = unit === 'ms' ? 1 : unit === 's' ? 1_000 : unit === 'm' ? 60_000 : 3_600_000
+    totalMs += val * factor
+  }
+  if (pos !== text.length || !Number.isFinite(totalMs) || totalMs <= 0) return null
+  return Math.min(3_600_000, Math.max(1, Math.ceil(totalMs)))
+}
+
+function parseUpstreamQuotaMeta(rawBody) {
+  let upstreamReason =
+    typeof rawBody?.upstream_reason === 'string' && rawBody.upstream_reason ? rawBody.upstream_reason : null
+  const errObj = rawBody?.error && typeof rawBody.error === 'object' ? rawBody.error : rawBody
+  const details = Array.isArray(errObj?.details) ? errObj.details : []
+  for (const item of details) {
+    if (!item || typeof item !== 'object') continue
+    if (!upstreamReason && typeof item.reason === 'string' && item.reason) {
+      upstreamReason = item.reason
+    }
+  }
+  const explicitContentRejected = rawBody?.content_rejected === true || rawBody?.code === 'gemini_content_rejected'
+  return { upstreamReason, contentRejected: explicitContentRejected }
+}
+
 function parseRetryAfterMs(rawBody, headers) {
   const bodyMs = Number(rawBody?.retry_after_ms ?? rawBody?.retryAfterMs)
   if (Number.isFinite(bodyMs) && bodyMs > 0) {
@@ -163,11 +211,38 @@ function parseRetryAfterMs(rawBody, headers) {
   if (Number.isFinite(bodySec) && bodySec > 0) {
     return Math.min(3_600_000, Math.max(1_000, Math.round(bodySec * 1000)))
   }
+  const errObj = rawBody?.error && typeof rawBody.error === 'object' ? rawBody.error : rawBody
+  const details = Array.isArray(errObj?.details) ? errObj.details : []
+  let googleMs = null
+  for (const item of details) {
+    if (!item || typeof item !== 'object') continue
+    const rd = parseGoDurationMs(item.retryDelay)
+    if (rd != null) googleMs = Math.max(googleMs || 0, rd)
+    const meta = item.metadata && typeof item.metadata === 'object' ? item.metadata : null
+    if (meta) {
+      const qd = parseGoDurationMs(meta.quotaResetDelay)
+      if (qd != null) googleMs = Math.max(googleMs || 0, qd)
+      if (typeof meta.quotaResetTimeStamp === 'string' && meta.quotaResetTimeStamp.trim()) {
+        const parsedTs = Date.parse(meta.quotaResetTimeStamp.trim())
+        if (Number.isFinite(parsedTs)) {
+          const delta = parsedTs - Date.now()
+          if (delta > 0) googleMs = Math.max(googleMs || 0, Math.min(3_600_000, Math.round(delta)))
+        }
+      }
+    }
+  }
+  if (googleMs != null && googleMs > 0) {
+    return Math.min(3_600_000, Math.max(1_000, googleMs))
+  }
   const headerVal = headers?.['retry-after'] ?? headers?.['Retry-After']
   if (headerVal != null && headerVal !== '') {
     const asNum = Number(headerVal)
     if (Number.isFinite(asNum) && asNum > 0) {
       return Math.min(3_600_000, Math.max(1_000, Math.round(asNum * 1000)))
+    }
+    const asDur = parseGoDurationMs(String(headerVal))
+    if (asDur != null) {
+      return Math.min(3_600_000, Math.max(1_000, asDur))
     }
     const asDate = Date.parse(String(headerVal))
     if (Number.isFinite(asDate)) {
@@ -193,6 +268,8 @@ function known(error) {
     if (Number.isInteger(error.upstreamStatus)) out.upstreamStatus = error.upstreamStatus
     if (Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) out.retryAfterMs = error.retryAfterMs
     if (error.retryAfter != null) out.retryAfter = error.retryAfter
+    if (typeof error.upstreamReason === 'string' && error.upstreamReason) out.upstreamReason = error.upstreamReason
+    if (error.contentRejected === true) out.contentRejected = true
     if (error.timing) out.timing = error.timing
     if (error.usage) out.usage = error.usage
     if (error.details) out.details = error.details
@@ -428,6 +505,8 @@ export function createGeminiScheduler({
   getAttemptsRepo = null,
   quotaCooldownMs = null,
   accountCooldownMs = null,
+  listCacheTtlMs = callHost === callGeminiHost ? 2000 : 0,
+  directClient = undefined,
   now = () => Date.now(),
 }) {
   const resolveAttemptsRepo = () => (typeof getAttemptsRepo === 'function' ? getAttemptsRepo() : attemptsRepo) || null
@@ -437,6 +516,15 @@ export function createGeminiScheduler({
     return null
   }
   const streamHost = callHostStream ?? (callHost === callGeminiHost ? callGeminiHostStream : null)
+  const effectiveDirectClient =
+    directClient !== undefined
+      ? directClient
+      : callHost === callGeminiHost && streamHost === callGeminiHostStream
+        ? createDirectCragClient({ callHost, now })
+        : null
+  const effectiveListCacheTtlMs = Number.isFinite(listCacheTtlMs) && listCacheTtlMs > 0 ? Math.floor(listCacheTtlMs) : 0
+  let hostListCache = null
+  let hostListInFlight = null
   const groupCooldowns = new Map()
   const modelCooldowns = new Map()
   const accountCooldowns = new Map()
@@ -444,6 +532,35 @@ export function createGeminiScheduler({
   const toolContinuationBindings = new Map()
   const localInflight = new Map()
   let rrCursor = 0
+
+  function invalidateCatalogCache() {
+    hostListCache = null
+    effectiveDirectClient?.invalidate?.()
+  }
+
+  async function fetchHostList({ force = false } = {}) {
+    if (!force && effectiveListCacheTtlMs > 0 && hostListCache) {
+      if (now() - hostListCache.fetchedAt < effectiveListCacheTtlMs) {
+        return hostListCache.view
+      }
+    }
+    if (!force && hostListInFlight) {
+      return hostListInFlight
+    }
+    const pending = Promise.resolve()
+      .then(() => callHost('list', {}))
+      .then((view) => {
+        if (effectiveListCacheTtlMs > 0 && Array.isArray(view?.environments)) {
+          hostListCache = { view, fetchedAt: now() }
+        }
+        return view
+      })
+      .finally(() => {
+        if (hostListInFlight === pending) hostListInFlight = null
+      })
+    if (!force) hostListInFlight = pending
+    return pending
+  }
 
   function resolveToolContinuation(callIds, ts) {
     if (!Array.isArray(callIds) || !callIds.length) return null
@@ -673,6 +790,10 @@ export function createGeminiScheduler({
 
   function recordFailureCooldown(accountId, upstreamModel, quotaGroup, failure, ts) {
     const code = failure?.code
+    if (code === 'gemini_content_rejected' || failure?.contentRejected === true) {
+      // Prompt content rejection (reasonless 429) is request-scoped, not account exhaustion.
+      return 0
+    }
     const policy = currentPolicy()
     const effectiveQuotaCooldown = quotaCooldownMs ?? policy.failover.quota_cooldown_ms ?? DEFAULT_QUOTA_COOLDOWN_MS
     const effectiveAccountCooldown =
@@ -683,14 +804,20 @@ export function createGeminiScheduler({
           ? failure.retryAfterMs
           : effectiveQuotaCooldown
       const until = ts + retryMs
-      // Scope reactive 429 cooldown to the specific upstream model so a single
-      // model's capacity/RPM 429 does not poison healthy sibling models on the
-      // same account. Proactive 0% bucket exhaustion in `account.quota_groups`
-      // still enforces group-wide cooldowns via `proactiveCooldownUntil`.
+      // Scope generic/capacity reactive 429 cooldown to the specific upstream model so a
+      // single model's RPM/capacity 429 does not poison healthy sibling models. When upstream
+      // explicitly reports QUOTA_EXHAUSTED / INSUFFICIENT_G1_CREDITS_BALANCE, also cool the
+      // shared quota group so sibling models on the same exhausted bucket fail over cleanly.
       modelCooldowns.set(
         `${accountId}:${upstreamModel}`,
         Math.max(modelCooldowns.get(`${accountId}:${upstreamModel}`) || 0, until),
       )
+      if (quotaGroup && GROUP_QUOTA_EXHAUSTED_REASONS.has(failure?.upstreamReason)) {
+        groupCooldowns.set(
+          `${accountId}:${quotaGroup}`,
+          Math.max(groupCooldowns.get(`${accountId}:${quotaGroup}`) || 0, until),
+        )
+      }
       return until
     }
     if (ACCOUNT_WIDE_COOLDOWN_ERRORS.has(code)) {
@@ -806,8 +933,14 @@ export function createGeminiScheduler({
       return { cleared: true }
     },
 
-    async catalog({ ownerScope = PLATFORM_SCOPE, allowedEnvIds = null } = {}) {
-      let view = await callHost('list', {})
+    invalidateCatalogCache,
+
+    async catalog({ ownerScope = PLATFORM_SCOPE, allowedEnvIds = null, forceRefresh = false } = {}) {
+      if (cragSubscription?.hasSyncPending?.()) {
+        await cragSubscription.recover().catch(() => null)
+        invalidateCatalogCache()
+      }
+      let view = await fetchHostList({ force: forceRefresh })
       if (!Array.isArray(view?.environments)) throw fail(502, 'gemini_host_protocol_error')
       if (view.payload_state !== 'installed') return { models: [], accounts: [] }
       const payloadMode = view.payload_mode === 'crag_subscription' ? 'crag_subscription' : 'legacy_release'
@@ -824,14 +957,15 @@ export function createGeminiScheduler({
             Array.isArray(environment.models) &&
             environment.models.length > 0 &&
             environment.crag_license?.valid !== true &&
-            (!environment.crag_license?.code || environment.crag_license.code === 'license_required'),
+            (!environment.crag_license?.code || RECOVERABLE_GEMINI_SEAT_CODES.has(environment.crag_license.code)),
         )
         if (needSeat.length) {
           const reconciled = await cragSubscription
             .reconcileEnvironmentSeats(needSeat, { payloadMode })
             .catch(() => ({ boundIds: [] }))
           if (reconciled.boundIds?.length) {
-            view = await callHost('list', {})
+            invalidateCatalogCache()
+            view = await fetchHostList({ force: true })
             if (!Array.isArray(view?.environments)) throw fail(502, 'gemini_host_protocol_error')
             if (view.payload_state !== 'installed') return { models: [], accounts: [] }
           }
@@ -885,6 +1019,7 @@ export function createGeminiScheduler({
           }
           accounts.push({
             id: environment.id,
+            proxy_id: environment.proxy_id,
             auth_method: authMethod,
             schedule_level: pref?.schedule_level ?? 5,
             max_concurrency: normalizeConcurrency(
@@ -942,6 +1077,7 @@ export function createGeminiScheduler({
       allowUnprefixedNonGemini = null,
       ownerScope = PLATFORM_SCOPE,
       allowedEnvIds = null,
+      catalogSnapshot = null,
       onEvent = null,
     }) {
       const turnStartedAt = Number.isFinite(startedAt) ? startedAt : now()
@@ -955,6 +1091,8 @@ export function createGeminiScheduler({
       }
       const allowUnprefixed = allowUnprefixedNonGemini ?? apiKeyRecord?.group_type !== 'all'
       const excluded = new Set()
+      const shortRetried = new Set()
+      let preferredRetryAccountId = null
       let reservation = null
       let selected = null
       let legacyRun = null
@@ -991,7 +1129,10 @@ export function createGeminiScheduler({
           throw fail(404, 'gemini_model_unavailable', `Gemini model '${model}' is disabled by model policy.`)
         }
         const defaultEffort = isGeminiSeriesId(model) ? resolveGeminiDefaultEffort(model) : null
-        const catalog = await this.catalog({ ownerScope, allowedEnvIds })
+        const catalog =
+          catalogSnapshot && Array.isArray(catalogSnapshot.accounts)
+            ? catalogSnapshot
+            : await this.catalog({ ownerScope, allowedEnvIds })
         const matchedAccounts = []
         for (const account of catalog.accounts) {
           const resolved = resolveUpstreamModel(model, account.models, {
@@ -1110,18 +1251,29 @@ export function createGeminiScheduler({
         const fallbackCandidates = fallbackItems.map((item) => item.candidate)
         const totalCandidates = allItems.length
         const resolvedByAccountId = new Map(allItems.map((item) => [item.candidate.accountId, item.resolved]))
+        const accountByAccountId = new Map(allItems.map((item) => [item.candidate.accountId, item.account]))
 
         let lastError = null
         while (excluded.size < totalCandidates && attempts < maxAttempts) {
           signal?.throwIfAborted()
           let fromFallback = false
           let grant = null
-          if (uncooled.length) {
+          if (preferredRetryAccountId && !excluded.has(preferredRetryAccountId)) {
+            const retryCand = allItems.find((item) => item.candidate.accountId === preferredRetryAccountId)?.candidate
+            preferredRetryAccountId = null
+            if (retryCand) {
+              grant = pickCandidateWithPolicy([retryCand], excluded, {
+                strategy: 'balanced',
+                stickyAccountId: null,
+              })
+            }
+          }
+          if (!grant?.selected && uncooled.length) {
             grant = pickCandidateWithPolicy(primaryCandidates, excluded, {
               strategy: policy.pool.strategy,
               stickyAccountId,
             })
-          } else {
+          } else if (!grant?.selected) {
             // Preserve earliest-expiry order across cooled candidates instead of letting
             // balanced/lastUsed sorting lock every probe onto the same account sequence.
             for (const candidate of primaryCandidates) {
@@ -1192,12 +1344,18 @@ export function createGeminiScheduler({
             ) {
               throw fail(403, 'gemini_model_unavailable')
             }
-            const listed = await callHost('get', { id })
-            const proxyId = listed?.proxy_id
+            const cachedAccount = accountByAccountId.get(selected.accountId)
+            let proxyId = cachedAccount?.proxy_id
+            let authMethod = cachedAccount?.auth_method === 'api_key' ? 'api_key' : selected.authMethod || 'oauth'
+            if (typeof proxyId !== 'string' || !ID.test(proxyId)) {
+              const listed = await callHost('get', { id })
+              proxyId = listed?.proxy_id
+              if (listed?.auth_method === 'api_key') authMethod = 'api_key'
+              else if (listed?.auth_method === 'oauth') authMethod = 'oauth'
+            }
             if (typeof proxyId !== 'string' || !ID.test(proxyId)) throw fail(502, 'gemini_host_protocol_error')
             const proxyUrl = resolveProxy ? resolveProxy(proxyId, envOwner) : undefined
             signal?.throwIfAborted()
-            const authMethod = listed?.auth_method === 'api_key' ? 'api_key' : selected.authMethod || 'oauth'
             lastAuthMethod = authMethod
             const target = authMethod === 'api_key' ? 'gemini' : 'antigravity'
             // Account-scoped outbound conversation_id policy for CRAGGemini:
@@ -1262,70 +1420,116 @@ export function createGeminiScheduler({
                       stream_idle_timeout_ms: policy.pool.idle_timeout_ms,
                     }
                   : undefined
-              const res = await streamHost(
-                'infer',
-                {
+              const turnTimeoutMs = Math.max(STREAM_TURN_MS, (policy.pool.timeout_ms || 120_000) + 15_000)
+              if (target === 'antigravity' && effectiveDirectClient) {
+                const directTarget = await effectiveDirectClient.resolveTarget({
                   id,
-                  proxy_id: proxyId,
-                  proxy_url: proxyUrl,
-                  ...(proxySha256 ? { proxy_sha256: proxySha256 } : {}),
+                  proxyId,
+                  proxyUrl,
+                  proxySha256,
                   model: resolved.upstreamModel,
-                  request_id: attemptRequestId,
-                  ...(gatewayPolicy ? { gateway_policy: gatewayPolicy } : {}),
-                  body: outboundBody,
-                },
-                { signal, timeoutMs: Math.max(STREAM_TURN_MS, (policy.pool.timeout_ms || 120_000) + 15_000) },
-              )
-              if (Number.isInteger(res?.statusCode)) lastUpstreamStatus = res.statusCode
-              const contentType = String(res.headers?.['content-type'] || '')
-                .split(';')[0]
-                .trim()
-                .toLowerCase()
-              if (res.statusCode === 200 && contentType === 'text/event-stream') {
-                activeInfer = { id, request_id: attemptRequestId }
-                streamResponse = res
-              } else {
-                const errBody = await readErrorPayload(res)
-                if (
-                  res.statusCode === 404 &&
-                  (!errBody?.code || errBody.code === 'not_found' || errBody.code === 'gemini_host_protocol_error') &&
-                  plainText != null
-                ) {
-                  // Backward compatibility with an older host without /infer.
-                  const started = await callHost('test-chat', {
+                })
+                if (directTarget) {
+                  const directOutcome = await effectiveDirectClient.openDirectStream(directTarget, {
+                    model: resolved.upstreamModel,
+                    requestId: attemptRequestId,
+                    bodyObj: outboundBody,
+                    gatewayPolicy,
+                    signal,
+                    timeoutMs: turnTimeoutMs,
+                  })
+                  if (directOutcome.ok) {
+                    lastUpstreamStatus = 200
+                    activeInfer = { id, request_id: attemptRequestId, directTarget }
+                    streamResponse = directOutcome.res
+                  } else if (!directOutcome.fallback) {
+                    if (
+                      typeof directOutcome.error?.code === 'string' &&
+                      (directOutcome.error.code.startsWith('license_') ||
+                        directOutcome.error.code === 'gemini_native_worker_unavailable')
+                    ) {
+                      effectiveDirectClient.invalidate(id)
+                    }
+                    if (Number.isInteger(directOutcome.error?.upstreamStatus)) {
+                      lastUpstreamStatus = directOutcome.error.upstreamStatus
+                    }
+                    throw directOutcome.error
+                  } else {
+                    effectiveDirectClient.invalidate(id)
+                  }
+                }
+              }
+              if (!streamResponse) {
+                const res = await streamHost(
+                  'infer',
+                  {
                     id,
                     proxy_id: proxyId,
                     proxy_url: proxyUrl,
+                    ...(proxySha256 ? { proxy_sha256: proxySha256 } : {}),
                     model: resolved.upstreamModel,
-                    prompt: plainText,
-                  })
-                  if (typeof started?.run_id !== 'string' || !RUN_ID.test(started.run_id)) {
-                    throw fail(502, 'gemini_host_protocol_error')
-                  }
-                  legacyRun = { id, run_id: started.run_id }
+                    request_id: attemptRequestId,
+                    ...(gatewayPolicy ? { gateway_policy: gatewayPolicy } : {}),
+                    body: outboundBody,
+                  },
+                  { signal, timeoutMs: turnTimeoutMs },
+                )
+                if (Number.isInteger(res?.statusCode)) lastUpstreamStatus = res.statusCode
+                const contentType = String(res.headers?.['content-type'] || '')
+                  .split(';')[0]
+                  .trim()
+                  .toLowerCase()
+                if (res.statusCode === 200 && contentType === 'text/event-stream') {
+                  activeInfer = { id, request_id: attemptRequestId }
+                  streamResponse = res
                 } else {
-                  const errCode =
-                    typeof errBody?.code === 'string' && Object.hasOwn(FAILURES, errBody.code)
-                      ? errBody.code
-                      : res.statusCode === 429
-                        ? 'gemini_quota_exhausted'
-                        : res.statusCode === 400
-                          ? 'gemini_invalid_request'
-                          : res.statusCode === 404
-                            ? 'gemini_model_unavailable'
-                            : 'gemini_inference_failed'
-                  const err = fail(
-                    res.statusCode || FAILURES[errCode][0],
-                    errCode,
-                    errBody?.message || FAILURES[errCode][1],
-                  )
-                  if (Number.isInteger(res.statusCode)) err.upstreamStatus = res.statusCode
-                  const retryAfterMs = parseRetryAfterMs(errBody, res.headers)
-                  if (retryAfterMs != null) {
-                    err.retryAfterMs = retryAfterMs
-                    err.retryAfter = Math.ceil(retryAfterMs / 1000)
+                  const errBody = await readErrorPayload(res)
+                  if (
+                    res.statusCode === 404 &&
+                    (!errBody?.code || errBody.code === 'not_found' || errBody.code === 'gemini_host_protocol_error') &&
+                    plainText != null
+                  ) {
+                    // Backward compatibility with an older host without /infer.
+                    const started = await callHost('test-chat', {
+                      id,
+                      proxy_id: proxyId,
+                      proxy_url: proxyUrl,
+                      model: resolved.upstreamModel,
+                      prompt: plainText,
+                    })
+                    if (typeof started?.run_id !== 'string' || !RUN_ID.test(started.run_id)) {
+                      throw fail(502, 'gemini_host_protocol_error')
+                    }
+                    legacyRun = { id, run_id: started.run_id }
+                  } else {
+                    const quotaMeta = parseUpstreamQuotaMeta(errBody)
+                    const errCode =
+                      typeof errBody?.code === 'string' && Object.hasOwn(FAILURES, errBody.code)
+                        ? errBody.code
+                        : res.statusCode === 429
+                          ? quotaMeta.contentRejected
+                            ? 'gemini_content_rejected'
+                            : 'gemini_quota_exhausted'
+                          : res.statusCode === 400
+                            ? 'gemini_invalid_request'
+                            : res.statusCode === 404
+                              ? 'gemini_model_unavailable'
+                              : 'gemini_inference_failed'
+                    const err = fail(
+                      res.statusCode || FAILURES[errCode][0],
+                      errCode,
+                      errBody?.message || FAILURES[errCode][1],
+                    )
+                    if (Number.isInteger(res.statusCode)) err.upstreamStatus = res.statusCode
+                    if (quotaMeta.upstreamReason) err.upstreamReason = quotaMeta.upstreamReason
+                    if (quotaMeta.contentRejected || errCode === 'gemini_content_rejected') err.contentRejected = true
+                    const retryAfterMs = parseRetryAfterMs(errBody, res.headers)
+                    if (retryAfterMs != null) {
+                      err.retryAfterMs = retryAfterMs
+                      err.retryAfter = Math.ceil(retryAfterMs / 1000)
+                    }
+                    throw err
                   }
-                  throw err
                 }
               }
             } else {
@@ -1368,7 +1572,11 @@ export function createGeminiScheduler({
                   if (activeInfer) {
                     const ref = activeInfer
                     activeInfer = null
-                    callHost('infer-cancel', ref).catch(() => {})
+                    if (ref.directTarget && effectiveDirectClient) {
+                      effectiveDirectClient.cancelDirectTurn(ref.directTarget, ref.request_id).catch(() => {})
+                    } else {
+                      callHost('infer-cancel', ref).catch(() => {})
+                    }
                   }
                 },
                 onEvent: (event) => {
@@ -1506,7 +1714,11 @@ export function createGeminiScheduler({
             }
             if (activeInfer) {
               try {
-                await callHost('infer-cancel', activeInfer)
+                if (activeInfer.directTarget && effectiveDirectClient) {
+                  await effectiveDirectClient.cancelDirectTurn(activeInfer.directTarget, activeInfer.request_id)
+                } else {
+                  await callHost('infer-cancel', activeInfer)
+                }
               } catch {}
               activeInfer = null
             }
@@ -1564,6 +1776,67 @@ export function createGeminiScheduler({
             } else {
               poolScheduler?.unitCircuit?.recordFailure?.(selected.accountId)
             }
+            if (
+              failureCode === 'gemini_proxy_unavailable' ||
+              failureCode === 'gemini_model_unavailable' ||
+              failureCode === 'gemini_oauth_required' ||
+              failureCode === 'gemini_host_protocol_error' ||
+              failureCode === 'gemini_environment_conflict' ||
+              (typeof failureCode === 'string' && failureCode.startsWith('license_'))
+            ) {
+              invalidateCatalogCache()
+            }
+
+            // Short transient RPM backoff (<= 5s, non-quota-exhausted, non-content-rejected):
+            // wait once and retry the same account before cooling or burning sibling accounts.
+            const canShortRetrySameAccount =
+              !emittedOutput &&
+              failureCode === 'gemini_quota_exhausted' &&
+              failure?.contentRejected !== true &&
+              !GROUP_QUOTA_EXHAUSTED_REASONS.has(failure?.upstreamReason) &&
+              Number.isFinite(failure?.retryAfterMs) &&
+              failure.retryAfterMs > 0 &&
+              failure.retryAfterMs <= SHORT_RATE_LIMIT_MAX_MS &&
+              !shortRetried.has(selected.accountId) &&
+              attempts < maxAttempts
+
+            if (canShortRetrySameAccount) {
+              shortRetried.add(selected.accountId)
+              preferredRetryAccountId = selected.accountId
+              try {
+                attemptsRepoRef?.complete?.(requestId, attempts, {
+                  upstreamStatus: attemptUpstreamStatus,
+                  errorScope: 'quota',
+                  action: 'retry_backoff',
+                  cooldownUntil: null,
+                  downstreamCommitted: false,
+                  terminalState: 'failed_retryable',
+                  usage: error?.usage || null,
+                  ttftMs: error?.timing?.ttftMs ?? null,
+                  latencyMs: attemptLatencyMs,
+                })
+              } catch {}
+              attemptRecords.push({
+                attempt_no: attempts,
+                account_id: id,
+                vm_id: selected.vmId,
+                upstream_model: resolved.upstreamModel,
+                ...(attemptConversationId ? { conversation_id: attemptConversationId } : {}),
+                selection_reason: selectionReason,
+                upstream_status: attemptUpstreamStatus,
+                error_code: failureCode,
+                action: 'retry_backoff',
+                latency_ms: attemptLatencyMs,
+              })
+              lastError = attachAttemptMeta(failure)
+              selected = null
+              try {
+                await sleep(Math.min(failure.retryAfterMs, SHORT_RATE_LIMIT_MAX_MS), undefined, { signal })
+              } catch (sleepErr) {
+                throw attachAttemptMeta(sleepErr)
+              }
+              continue
+            }
 
             const cooldownUntilMs = recordFailureCooldown(
               id,
@@ -1575,14 +1848,17 @@ export function createGeminiScheduler({
             excluded.add(selected.accountId)
             const willFailover =
               !emittedOutput &&
+              failure?.contentRejected !== true &&
               FAILOVER_ERRORS.has(failureCode) &&
               excluded.size < totalCandidates &&
               attempts < maxAttempts
             const errorScope = ACCOUNT_WIDE_COOLDOWN_ERRORS.has(failureCode)
               ? 'account'
-              : failureCode === 'gemini_quota_exhausted'
-                ? 'quota'
-                : 'upstream'
+              : failureCode === 'gemini_content_rejected'
+                ? 'request'
+                : failureCode === 'gemini_quota_exhausted'
+                  ? 'quota'
+                  : 'upstream'
             const action = willFailover ? 'failover' : 'stop'
             try {
               attemptsRepoRef?.complete?.(requestId, attempts, {
@@ -1639,6 +1915,7 @@ export function createGeminiScheduler({
       allowUnprefixedNonGemini = null,
       ownerScope = PLATFORM_SCOPE,
       allowedEnvIds = null,
+      catalogSnapshot = null,
     }) {
       const result = await this.stream({
         model,
@@ -1653,6 +1930,7 @@ export function createGeminiScheduler({
         allowUnprefixedNonGemini,
         ownerScope,
         allowedEnvIds,
+        catalogSnapshot,
       })
       return {
         text: result.text,

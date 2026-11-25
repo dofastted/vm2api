@@ -339,6 +339,44 @@ function emptyPoolFailure(candidates, now = Date.now()) {
  */
 export const QUOTA_GUARD_DEFAULTS = { new_session_ratio: 0.85, stop_ratio: 0.95 }
 
+function quotaValidationError(message) {
+  const error = new TypeError(message)
+  error.code = 'invalid_quota_config'
+  return error
+}
+
+/** PUT /api/panel/routing strict check for quota exhaustion guard thresholds. */
+export function validateQuotaRoutingPatch(body = {}, currentQuota = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return
+  if (!Object.prototype.hasOwnProperty.call(body, 'quota')) return
+  const quota = body.quota
+  if (!quota || typeof quota !== 'object' || Array.isArray(quota)) {
+    throw quotaValidationError('quota 必须是对象')
+  }
+  const hasNew = Object.prototype.hasOwnProperty.call(quota, 'exhaustion_guard_new_session')
+  const hasStop = Object.prototype.hasOwnProperty.call(quota, 'exhaustion_guard_stop')
+  if (!hasNew && !hasStop) return
+  const parseRatio = (raw, field) => {
+    if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0 || raw > 1) {
+      throw quotaValidationError(`${field} 必须是 (0, 1] 之间的数字`)
+    }
+    return raw
+  }
+  const fallbackRatio = (raw, fallback) => {
+    const n = Number(raw)
+    return Number.isFinite(n) && n > 0 && n <= 1 ? n : fallback
+  }
+  const newSession = hasNew
+    ? parseRatio(quota.exhaustion_guard_new_session, 'quota.exhaustion_guard_new_session')
+    : fallbackRatio(currentQuota?.exhaustion_guard_new_session, QUOTA_GUARD_DEFAULTS.new_session_ratio)
+  const stop = hasStop
+    ? parseRatio(quota.exhaustion_guard_stop, 'quota.exhaustion_guard_stop')
+    : fallbackRatio(currentQuota?.exhaustion_guard_stop, QUOTA_GUARD_DEFAULTS.stop_ratio)
+  if (newSession > stop) {
+    throw quotaValidationError('quota.exhaustion_guard_new_session 不能大于 quota.exhaustion_guard_stop')
+  }
+}
+
 export function quotaGuardConfigOf(quota = {}) {
   const ratio = (value, fallback) => {
     const n = Number(value)

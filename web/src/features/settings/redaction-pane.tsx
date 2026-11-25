@@ -1,8 +1,17 @@
+import { useState } from 'react'
 import { Ban, ShieldCheck, TextQuote } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
+import {
+  REDACTION_PREFIX_MAX,
+  REDACTION_PREFIX_MIN,
+  REDACTION_REGEX_MAX,
+  REDACTION_RULE_LIMIT,
+  REDACTION_WORD_LIMIT,
+  validateRedactionDraft,
+} from './routing-draft'
 import { PaneSection } from './scheduler-controls'
 
 type Block = Record<string, unknown>
@@ -70,6 +79,9 @@ export function RedactionPane({
   runtime: Block
   onChange: (next: Block) => void
 }) {
+  const [ruleModes, setRuleModes] = useState<
+    Record<number, 'prefix' | 'regex'>
+  >({})
   const enabled = redaction.enabled === true
   const personal = redaction.personal !== false
   const kinds =
@@ -81,12 +93,13 @@ export function RedactionPane({
   const rules = Array.isArray(redaction.rules)
     ? (redaction.rules as Rule[])
     : []
+  const validation = validateRedactionDraft(redaction)
   const status = runtime.error
     ? '不可用，新请求会被阻断'
     : runtime.enabled && runtime.ready
       ? '正在保护新请求'
       : enabled
-        ? '已保存，等待生效'
+        ? '待保存生效'
         : '未开启'
 
   function patch(next: Block) {
@@ -95,6 +108,21 @@ export function RedactionPane({
 
   function setRule(index: number, next: Rule) {
     patch({ rules: rules.map((rule, at) => (at === index ? next : rule)) })
+  }
+
+  function removeRule(index: number) {
+    setRuleModes((current) => {
+      const next: Record<number, 'prefix' | 'regex'> = {}
+      for (const [rawKey, mode] of Object.entries(current)) {
+        const key = Number(rawKey)
+        if (key < index) next[key] = mode
+        else if (key > index) next[key - 1] = mode
+      }
+      return next
+    })
+    patch({
+      rules: rules.filter((_, at) => at !== index),
+    })
   }
 
   return (
@@ -143,6 +171,11 @@ export function RedactionPane({
             />
           </SettingRow>
         </div>
+        {validation.emptyPolicyError ? (
+          <p role='alert' className='text-xs text-destructive'>
+            {validation.emptyPolicyError}
+          </p>
+        ) : null}
       </PaneSection>
 
       <PaneSection
@@ -169,7 +202,7 @@ export function RedactionPane({
       <PaneSection
         icon={TextQuote}
         title='自定义词和规则'
-        desc='引擎不认识的名字、代号和密钥前缀。一行一个词。规则最多 32 条，前缀和正则只能填一个。'
+        desc={`引擎不认识的名字、代号和密钥前缀。自定义词一行一个（最多 ${REDACTION_WORD_LIMIT} 条、单条 ≤ 1 KiB）；自定义规则最多 ${REDACTION_RULE_LIMIT} 条，前缀（${REDACTION_PREFIX_MIN}–${REDACTION_PREFIX_MAX} 字节）与 RE2 正则（≤ ${REDACTION_REGEX_MAX} 字节）二选一且内容不能为空。`}
       >
         <div className='space-y-4'>
           <SettingRow
@@ -183,9 +216,15 @@ export function RedactionPane({
             />
           </SettingRow>
           <label className='block space-y-1.5'>
-            <span className='text-sm font-medium'>自定义词</span>
+            <span className='flex items-center justify-between gap-2 text-sm font-medium'>
+              <span>自定义词</span>
+              <span className='text-xs font-normal text-muted-foreground tabular-nums'>
+                {validation.wordCount} / {REDACTION_WORD_LIMIT}
+              </span>
+            </span>
             <textarea
               aria-label='自定义敏感词'
+              aria-invalid={!!validation.wordsError}
               rows={4}
               value={
                 Array.isArray(redaction.words)
@@ -197,15 +236,25 @@ export function RedactionPane({
               }
               className='w-full rounded-md border bg-transparent p-2 font-mono text-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
             />
+            {validation.wordsError ? (
+              <p role='alert' className='text-xs font-normal text-destructive'>
+                {validation.wordsError}
+              </p>
+            ) : null}
           </label>
           <div className='space-y-2'>
             <div className='flex items-center justify-between gap-3'>
-              <span className='text-sm font-medium'>自定义规则</span>
+              <span className='flex items-center gap-2 text-sm font-medium'>
+                <span>自定义规则</span>
+                <span className='text-xs font-normal text-muted-foreground tabular-nums'>
+                  {validation.ruleCount} / {REDACTION_RULE_LIMIT}
+                </span>
+              </span>
               <Button
                 type='button'
                 size='sm'
                 variant='outline'
-                disabled={rules.length >= 32}
+                disabled={rules.length >= REDACTION_RULE_LIMIT}
                 onClick={() =>
                   patch({
                     rules: [...rules, { kind: '', prefix: '', regex: '' }],
@@ -215,6 +264,11 @@ export function RedactionPane({
                 添加规则
               </Button>
             </div>
+            {validation.rulesError ? (
+              <p role='alert' className='text-xs text-destructive'>
+                {validation.rulesError}
+              </p>
+            ) : null}
             {rules.length === 0 ? (
               <p className='text-xs leading-5 text-muted-foreground'>
                 还没有自定义规则。内置的密钥和邮箱规则仍然有效。
@@ -222,85 +276,105 @@ export function RedactionPane({
             ) : (
               <ul className='space-y-2'>
                 {rules.map((rule, index) => {
-                  const mode = rule.regex ? 'regex' : 'prefix'
+                  const mode: 'prefix' | 'regex' = rule.regex
+                    ? 'regex'
+                    : rule.prefix
+                      ? 'prefix'
+                      : (ruleModes[index] ?? 'prefix')
+                  const rowError = validation.ruleErrors[index]
                   return (
                     <li
                       key={index}
-                      className='grid gap-2 rounded-md border p-2 sm:grid-cols-[8rem_6rem_1fr_auto]'
+                      className='space-y-1.5 rounded-md border p-2'
                     >
-                      <input
-                        aria-label={`规则 ${index + 1} 名称`}
-                        value={rule.kind || ''}
-                        onChange={(event) =>
-                          setRule(index, { ...rule, kind: event.target.value })
-                        }
-                        placeholder='名称'
-                        className='rounded-md border bg-transparent px-2 py-1.5 font-mono text-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
-                      />
-                      <select
-                        aria-label={`规则 ${index + 1} 类型`}
-                        value={mode}
-                        onChange={(event) =>
-                          setRule(
-                            index,
-                            event.target.value === 'regex'
-                              ? {
-                                  kind: rule.kind,
-                                  prefix: '',
-                                  regex: rule.prefix || rule.regex || '',
-                                }
-                              : {
-                                  kind: rule.kind,
-                                  prefix: rule.regex || rule.prefix || '',
-                                  regex: '',
-                                }
-                          )
-                        }
-                        className='rounded-md border bg-transparent px-2 py-1.5 text-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
-                      >
-                        <option value='prefix'>前缀</option>
-                        <option value='regex'>正则</option>
-                      </select>
-                      <input
-                        aria-label={`规则 ${index + 1} 内容`}
-                        value={
-                          mode === 'regex'
-                            ? rule.regex || ''
-                            : rule.prefix || ''
-                        }
-                        onChange={(event) =>
-                          setRule(
-                            index,
+                      <div className='grid gap-2 sm:grid-cols-[8rem_6rem_1fr_auto]'>
+                        <input
+                          aria-label={`规则 ${index + 1} 名称`}
+                          value={rule.kind || ''}
+                          onChange={(event) =>
+                            setRule(index, {
+                              ...rule,
+                              kind: event.target.value,
+                            })
+                          }
+                          placeholder='名称'
+                          className='rounded-md border bg-transparent px-2 py-1.5 font-mono text-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
+                        />
+                        <select
+                          aria-label={`规则 ${index + 1} 类型`}
+                          value={mode}
+                          onChange={(event) => {
+                            const nextMode =
+                              event.target.value === 'regex'
+                                ? 'regex'
+                                : 'prefix'
+                            setRuleModes((current) => ({
+                              ...current,
+                              [index]: nextMode,
+                            }))
+                            setRule(
+                              index,
+                              nextMode === 'regex'
+                                ? {
+                                    kind: rule.kind,
+                                    prefix: '',
+                                    regex: rule.prefix || rule.regex || '',
+                                  }
+                                : {
+                                    kind: rule.kind,
+                                    prefix: rule.regex || rule.prefix || '',
+                                    regex: '',
+                                  }
+                            )
+                          }}
+                          className='rounded-md border bg-transparent px-2 py-1.5 text-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
+                        >
+                          <option value='prefix'>前缀</option>
+                          <option value='regex'>正则</option>
+                        </select>
+                        <input
+                          aria-label={`规则 ${index + 1} 内容`}
+                          aria-invalid={!!rowError}
+                          value={
                             mode === 'regex'
-                              ? {
-                                  kind: rule.kind,
-                                  prefix: '',
-                                  regex: event.target.value,
-                                }
-                              : {
-                                  kind: rule.kind,
-                                  prefix: event.target.value,
-                                  regex: '',
-                                }
-                          )
-                        }
-                        placeholder={
-                          mode === 'regex' ? 'RE2 正则' : '例如 oc_sk_'
-                        }
-                        className='rounded-md border bg-transparent px-2 py-1.5 font-mono text-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
-                      />
-                      <Button
-                        type='button'
-                        size='sm'
-                        variant='ghost'
-                        onClick={() =>
-                          patch({
-                            rules: rules.filter((_, at) => at !== index),
-                          })
-                        }
-                      >
-                        删除
-                      </Button>
+                              ? rule.regex || ''
+                              : rule.prefix || ''
+                          }
+                          onChange={(event) =>
+                            setRule(
+                              index,
+                              mode === 'regex'
+                                ? {
+                                    kind: rule.kind,
+                                    prefix: '',
+                                    regex: event.target.value,
+                                  }
+                                : {
+                                    kind: rule.kind,
+                                    prefix: event.target.value,
+                                    regex: '',
+                                  }
+                            )
+                          }
+                          placeholder={
+                            mode === 'regex' ? 'RE2 正则' : '例如 oc_sk_'
+                          }
+                          className='rounded-md border bg-transparent px-2 py-1.5 font-mono text-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
+                        />
+                        <Button
+                          type='button'
+                          size='sm'
+                          variant='ghost'
+                          onClick={() => removeRule(index)}
+                        >
+                          删除
+                        </Button>
+                      </div>
+                      {rowError ? (
+                        <p role='alert' className='text-xs text-destructive'>
+                          {rowError}
+                        </p>
+                      ) : null}
                     </li>
                   )
                 })}
@@ -313,19 +387,34 @@ export function RedactionPane({
       <PaneSection
         icon={Ban}
         title='放行'
-        desc='整段值原样发送，不管是哪条规则找到的。比较时不区分大小写。一行一个。'
+        desc={`整段值原样发送，不管是哪条规则找到的。比较时不区分大小写。一行一个（最多 ${REDACTION_WORD_LIMIT} 条、单条 ≤ 1 KiB）。`}
+        aside={
+          <span className='text-xs text-muted-foreground tabular-nums'>
+            {validation.allowCount} / {REDACTION_WORD_LIMIT}
+          </span>
+        }
       >
-        <textarea
-          aria-label='放行名单'
-          rows={4}
-          value={
-            Array.isArray(redaction.allow)
-              ? redaction.allow.map((item) => String(item)).join('\n')
-              : ''
-          }
-          onChange={(event) => patch({ allow: event.target.value.split('\n') })}
-          className='w-full rounded-md border bg-transparent p-2 font-mono text-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
-        />
+        <div className='space-y-1.5'>
+          <textarea
+            aria-label='放行名单'
+            aria-invalid={!!validation.allowError}
+            rows={4}
+            value={
+              Array.isArray(redaction.allow)
+                ? redaction.allow.map((item) => String(item)).join('\n')
+                : ''
+            }
+            onChange={(event) =>
+              patch({ allow: event.target.value.split('\n') })
+            }
+            className='w-full rounded-md border bg-transparent p-2 font-mono text-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
+          />
+          {validation.allowError ? (
+            <p role='alert' className='text-xs text-destructive'>
+              {validation.allowError}
+            </p>
+          ) : null}
+        </div>
       </PaneSection>
 
       <PaneSection

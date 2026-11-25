@@ -1,5 +1,7 @@
 import { type ComponentProps, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
+import { ArrowRight } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -8,6 +10,7 @@ import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
 import {
   healthProbeQueryOptions,
+  runHealthProbe,
   type HealthSnapshotView,
 } from '@/features/settings/queries'
 import { settleInt, typingInt } from './int-input'
@@ -19,19 +22,13 @@ type HealthPaneProps = {
   failover: Obj
   healthProbe: Obj | undefined
   compatibility: Obj
-  onFailoverChange: (next: Obj) => void
+  onFailoverChange?: (next: Obj) => void
   onHealthProbeChange: (next: Obj) => void
   onCompatibilityChange: (next: Obj) => void
 }
 
 function obj(value: unknown): Obj {
   return value && typeof value === 'object' ? (value as Obj) : {}
-}
-
-function clampInt(raw: string, min: number, max: number, fallback: number) {
-  const n = Math.round(Number(raw))
-  if (!Number.isFinite(n)) return fallback
-  return Math.min(max, Math.max(min, n))
 }
 
 /**
@@ -81,15 +78,17 @@ export function HealthPane(props: HealthPaneProps) {
     failover,
     healthProbe,
     compatibility,
-    onFailoverChange,
     onHealthProbeChange,
     onCompatibilityChange,
   } = props
   const probe = obj(healthProbe)
   const real = obj(probe.real)
+  const gemini = obj(probe.gemini)
   const minTokens = obj(compatibility.min_max_tokens)
   const setProbe = (patch: Obj) => onHealthProbeChange({ ...probe, ...patch })
   const setReal = (patch: Obj) => setProbe({ real: { ...real, ...patch } })
+  const setGemini = (patch: Obj) =>
+    setProbe({ gemini: { ...gemini, ...patch } })
   const minTokensMode = String(minTokens.mode ?? minTokens.tier ?? '').trim()
   const explicitFloor = ['floor', 'default', 'raise'].includes(minTokensMode)
   // Match the backend: an explicit mode takes precedence over legacy flags.
@@ -133,21 +132,17 @@ export function HealthPane(props: HealthPaneProps) {
           </SettingRow>
           <SettingRow
             label='thinking 合法间隔'
-            desc='未写 max_tokens 时用模型目录 max_tokens_default。写了且低于此值时抬到该值；「不抬升」或模式「不改」时不抬。该数值在 enabled thinking 的 budget 不小于 max_tokens 时只补 thinking 合法间隔。'
+            desc='未写 max_tokens 时用模型目录 max_tokens_default。写了且低于此值时，「默认抬升」模式会抬到该值，「不改」模式则保留原值；当开启 thinking 且 budget_tokens 不小于 max_tokens 时补足合法间隔。关闭右侧总开关后，将同时停用缺失默认抬升与 budget_tokens 间隔补齐。'
           >
             <div className='flex flex-col items-end gap-3 sm:flex-row sm:flex-wrap sm:items-center'>
-              <Input
+              <DeferredIntInput
                 className='w-24'
-                type='number'
                 min={1}
                 max={4096}
+                fallback={128}
                 disabled={minTokens.enabled === false}
                 value={Number(minTokens.value ?? 128)}
-                onChange={(event) =>
-                  setMinTokens({
-                    value: clampInt(event.target.value, 1, 4096, 128),
-                  })
-                }
+                onCommit={(next) => setMinTokens({ value: next })}
                 aria-label='thinking 合法间隔'
               />
               <div
@@ -160,6 +155,7 @@ export function HealthPane(props: HealthPaneProps) {
                   size='sm'
                   variant={preserveCaller ? 'outline' : 'default'}
                   className='min-h-11'
+                  aria-pressed={!preserveCaller}
                   disabled={minTokens.enabled === false}
                   onClick={() =>
                     setMinTokens({
@@ -176,6 +172,7 @@ export function HealthPane(props: HealthPaneProps) {
                   size='sm'
                   variant={preserveCaller ? 'default' : 'outline'}
                   className='min-h-11'
+                  aria-pressed={preserveCaller}
                   disabled={minTokens.enabled === false}
                   onClick={() =>
                     setMinTokens({ mode: '不改', no_raise: true, raise: false })
@@ -186,26 +183,14 @@ export function HealthPane(props: HealthPaneProps) {
               </div>
               <label className='flex items-center gap-2 text-xs text-muted-foreground'>
                 <Switch
-                  checked={preserveCaller}
-                  disabled={minTokens.enabled === false}
+                  checked={minTokens.enabled !== false}
                   onCheckedChange={(checked) =>
-                    setMinTokens(
-                      checked
-                        ? { mode: '不改', no_raise: true, raise: false }
-                        : { mode: 'floor', no_raise: false, raise: true }
-                    )
+                    setMinTokens({ enabled: checked })
                   }
-                  aria-label='不抬升'
+                  aria-label='启用 thinking 合法间隔'
                 />
-                不抬升
+                <span>启用默认抬升与间隔补齐</span>
               </label>
-              <Switch
-                checked={minTokens.enabled !== false}
-                onCheckedChange={(checked) =>
-                  setMinTokens({ enabled: checked })
-                }
-                aria-label='启用 thinking 合法间隔'
-              />
             </div>
           </SettingRow>
         </CardContent>
@@ -213,10 +198,12 @@ export function HealthPane(props: HealthPaneProps) {
       <HealthCacheCard
         probe={probe}
         real={real}
+        gemini={gemini}
         onProbeChange={setProbe}
         onRealChange={setReal}
+        onGeminiChange={setGemini}
       />
-      <SignatureRepairCard failover={failover} onChange={onFailoverChange} />
+      <SignatureRepairCard failover={failover} />
     </>
   )
 }
@@ -224,15 +211,26 @@ export function HealthPane(props: HealthPaneProps) {
 function HealthCacheCard({
   probe,
   real,
+  gemini,
   onProbeChange,
   onRealChange,
+  onGeminiChange,
 }: {
   probe: Obj
   real: Obj
+  gemini: Obj
   onProbeChange: (patch: Obj) => void
   onRealChange: (patch: Obj) => void
+  onGeminiChange: (patch: Obj) => void
 }) {
+  const queryClient = useQueryClient()
   const status = useQuery(healthProbeQueryOptions())
+  const probeNow = useMutation({
+    mutationFn: (platform: 'all' | 'gemini') => runHealthProbe(platform),
+    onSuccess: (data) => {
+      queryClient.setQueryData(['panel', 'health-probe'], data)
+    },
+  })
   const snaps = status.data?.snapshots
   return (
     <Card>
@@ -240,7 +238,8 @@ function HealthCacheCard({
         <CardTitle>健康缓存</CardTitle>
         <p className='text-xs text-muted-foreground'>
           定时用真实槽位跑一次对话并缓存结果。渠道或账号测试发出的简短 hi / ping
-          探测请求直接回放缓存，覆盖 Messages、Chat、Responses 的流式和非流式。
+          探测请求直接回放缓存，覆盖 Messages、Chat、Responses、Gemini
+          的流式和非流式。
         </p>
       </CardHeader>
       <CardContent className='divide-y'>
@@ -264,7 +263,7 @@ function HealthCacheCard({
         </SettingRow>
         <SettingRow
           label='全号轮询'
-          desc='每个间隔对所有可调度槽各探一次（受并发上限、工作时段、冷却与凭证排除约束）。列表中首个成功的结果仍写入健康缓存；关闭时探测到第一个可用槽即停止。'
+          desc='每个间隔对所有可调度槽按顺序逐个各探一次（严格串行、不并发，受工作时段、冷却与凭证排除约束）。列表中首个成功的结果仍写入健康缓存；关闭时探测到第一个可用槽即停止。'
         >
           <Switch
             checked={probe.probe_all_slots === true}
@@ -307,10 +306,70 @@ function HealthCacheCard({
             aria-label='GPT 探测模型'
           />
         </SettingRow>
+        <SettingRow
+          label='Gemini 健康缓存'
+          desc='开启健康缓存后，Gemini 系列模型按独立间隔定时探测，匹配的探测请求统一返回缓存值。'
+        >
+          <Switch
+            checked={gemini.enabled !== false}
+            onCheckedChange={(checked) => onGeminiChange({ enabled: checked })}
+            aria-label='启用 Gemini 健康缓存'
+          />
+        </SettingRow>
+        <SettingRow
+          label='Gemini 探测间隔'
+          desc='秒，60–86400，默认 3600（每 1 小时探测一次）'
+        >
+          <DeferredIntInput
+            className='w-28'
+            min={60}
+            max={86400}
+            fallback={3600}
+            value={Number(gemini.interval_sec ?? 3600)}
+            onCommit={(next) => onGeminiChange({ interval_sec: next })}
+            aria-label='Gemini 探测间隔'
+          />
+        </SettingRow>
+        <SettingRow
+          label='Gemini 缓存有效期'
+          desc='秒，60–172800，默认 5400；过期后探测请求照常进入调度'
+        >
+          <DeferredIntInput
+            className='w-28'
+            min={60}
+            max={172800}
+            fallback={5400}
+            value={Number(gemini.cache_ttl_sec ?? 5400)}
+            onCommit={(next) => onGeminiChange({ cache_ttl_sec: next })}
+            aria-label='Gemini 缓存有效期'
+          />
+        </SettingRow>
+        <SettingRow
+          label='Gemini 探测模型'
+          desc='指定 Gemini 定时探测所用模型；留空则自动选取已授权 Gemini 槽位中的轻量模型。'
+        >
+          <Input
+            className='w-56'
+            placeholder='留空自动选择'
+            value={String(gemini.model ?? '')}
+            onChange={(event) => onGeminiChange({ model: event.target.value })}
+            aria-label='Gemini 探测模型'
+          />
+        </SettingRow>
         <SettingRow label='最近快照'>
-          <div className='flex flex-col items-end gap-1 text-xs'>
+          <div className='flex flex-col items-end gap-1.5 text-xs'>
             <SnapshotLine label='Claude' snap={snaps?.anthropic} />
             <SnapshotLine label='GPT' snap={snaps?.openai} />
+            <SnapshotLine label='Gemini' snap={snaps?.gemini} />
+            <Button
+              type='button'
+              size='sm'
+              variant='outline'
+              disabled={probeNow.isPending}
+              onClick={() => probeNow.mutate('all')}
+            >
+              {probeNow.isPending ? '探测中…' : '立即探测'}
+            </Button>
           </div>
         </SettingRow>
       </CardContent>
@@ -342,22 +401,19 @@ function SnapshotLine({
   )
 }
 
-function SignatureRepairCard({
-  failover,
-  onChange,
-}: {
-  failover: Obj
-  onChange: (next: Obj) => void
-}) {
+function SignatureRepairCard({ failover }: { failover: Obj }) {
   // 默认值在 gateway HEAD 与工作区之间相反（!== false vs === true），
   // 所以不硬编码默认态，严格按 GET /routing 的实际值回显。
   const enabled = failover.signature_repair === true
   return (
     <Card>
-      <CardHeader>
+      <CardHeader className='flex flex-row items-center justify-between gap-3'>
         <CardTitle>签名修复</CardTitle>
+        <Badge variant={enabled ? 'default' : 'secondary'}>
+          {enabled ? '当前：已开启' : '当前：已关闭'}
+        </Badge>
       </CardHeader>
-      <CardContent className='flex items-start justify-between gap-4'>
+      <CardContent className='space-y-3'>
         <div className='space-y-1 text-sm text-muted-foreground'>
           <p>
             上游因思考签名返回 400
@@ -370,13 +426,14 @@ function SignatureRepairCard({
             自适应）不受此开关影响。
           </p>
         </div>
-        <Switch
-          checked={enabled}
-          onCheckedChange={(checked) =>
-            onChange({ ...failover, signature_repair: checked })
-          }
-          aria-label='签名修复'
-        />
+        <Link
+          to='/settings/$tab'
+          params={{ tab: 'pool' }}
+          className='inline-flex items-center gap-1 text-xs font-medium text-primary underline-offset-4 hover:underline'
+        >
+          前往「账号池 → 重试与切号」调整
+          <ArrowRight className='size-3' aria-hidden />
+        </Link>
       </CardContent>
     </Card>
   )

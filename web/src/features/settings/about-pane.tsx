@@ -10,6 +10,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import {
   changelogQueryOptions,
+  fetchVersionStatus,
   versionQueryOptions,
   type ChangelogEntry,
   type ReleaseStatus,
@@ -50,6 +51,16 @@ export function AboutPane() {
       window.location.reload()
     }
   }, [data, upgradeTarget])
+
+  const checkUpdate = useMutation({
+    mutationFn: () => fetchVersionStatus({ refresh: true }),
+    onSuccess: (payload) => {
+      qc.setQueryData(versionQueryOptions().queryKey, payload)
+    },
+    onError: (error: Error) => {
+      toast.error(error.message)
+    },
+  })
 
   const upgrade = useMutation({
     mutationFn: () =>
@@ -114,8 +125,9 @@ export function AboutPane() {
           <Button
             size='sm'
             variant='outline'
-            onClick={() => version.refetch()}
-            loading={version.isFetching}
+            disabled={checkUpdate.isPending}
+            onClick={() => checkUpdate.mutate()}
+            loading={version.isFetching || checkUpdate.isPending}
           >
             <RefreshCw />
             检查更新
@@ -199,8 +211,8 @@ export function AboutPane() {
         <CardContent className='space-y-3'>
           <p className='text-sm text-muted-foreground'>
             在宿主机执行。保留 .env / vms / data。本地槽同步 kernel 与
-            CLI；集群槽按同一份 kernel、cli-node 和 Go
-            遥测重建镜像并换容器，不改凭证和指纹。
+            CLI；集群槽按同一份 kernel、cli-node 与 kin-worker / kin-egress
+            重建镜像并换容器，不改凭证和指纹。
           </p>
           <pre className='overflow-x-auto rounded-md bg-muted px-3 py-2 font-mono text-xs'>
             {data?.upgrade_command ||

@@ -1,5 +1,9 @@
 import { queryOptions } from '@tanstack/react-query'
-import type { BackupsPayload, NotifyStatus } from '@/types/panel-routing'
+import type {
+  BackupConfigPayload,
+  BackupsPayload,
+  NotifyStatus,
+} from '@/types/panel-routing'
 import { api } from '@/lib/api'
 
 export type ChangelogEntry = {
@@ -72,14 +76,20 @@ export function backupsQueryOptions() {
 export function backupConfigQueryOptions() {
   return queryOptions({
     queryKey: ['panel', 'backups-config'] as const,
-    queryFn: () => api<Record<string, unknown>>('/api/panel/backups/config'),
+    queryFn: () => api<BackupConfigPayload>('/api/panel/backups/config'),
   })
+}
+
+export function fetchVersionStatus(opts?: { refresh?: boolean }) {
+  return api<ReleaseStatus>(
+    opts?.refresh ? '/api/panel/version?refresh=1' : '/api/panel/version'
+  )
 }
 
 export function versionQueryOptions() {
   return queryOptions({
     queryKey: ['panel', 'version'] as const,
-    queryFn: () => api<ReleaseStatus>('/api/panel/version'),
+    queryFn: () => fetchVersionStatus(),
     staleTime: 60_000,
   })
 }
@@ -100,6 +110,8 @@ export type HealthSnapshotView = {
   model: string | null
   error: string | null
   age_ms: number | null
+  next_at?: string | null
+  cache_ttl_sec?: number
 }
 
 export type HealthProbePayload = {
@@ -108,6 +120,7 @@ export type HealthProbePayload = {
   snapshots: {
     anthropic: HealthSnapshotView
     openai: HealthSnapshotView
+    gemini?: HealthSnapshotView
   } | null
 }
 
@@ -116,6 +129,14 @@ export function healthProbeQueryOptions() {
     queryKey: ['panel', 'health-probe'] as const,
     queryFn: () => api<HealthProbePayload>('/api/panel/health-probe'),
     refetchInterval: 30_000,
+  })
+}
+
+export function runHealthProbe(platform: 'all' | 'gemini' = 'all') {
+  return api<HealthProbePayload>('/api/panel/health-probe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ platform }),
   })
 }
 

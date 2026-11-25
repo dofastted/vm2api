@@ -1,4 +1,5 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -48,8 +49,17 @@ export function Socks5Pane() {
   return (
     <div className='space-y-3'>
       <p className='text-sm text-muted-foreground'>
-        名单、绑定、导入在「代理池」。这里只写网关合同。每槽必须绑一条出口；一条默认最多
-        5 台。
+        名单、绑定、导入在「代理池」。这里只写网关合同。每槽必须绑一条出口；单条代理默认上限
+        5 台，可在「
+        <Link
+          to='/proxies'
+          className='text-primary underline-offset-4 hover:underline'
+        >
+          代理
+        </Link>
+        」（<code className='font-mono text-xs'>/proxies</code>
+        ）页按节点调整绑定上限（
+        <code className='font-mono text-xs'>bind_limit</code>）。
       </p>
       <Card>
         <CardHeader>

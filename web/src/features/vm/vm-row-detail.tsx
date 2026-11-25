@@ -12,6 +12,7 @@ import {
   SLOT_BG,
   SLOT_LABEL,
 } from '@/lib/vm-health'
+import { formatSlotEmail, slotRawEmail } from '@/lib/vm-kind'
 import {
   usageAccountForVm,
   vmCacheHitPct,
@@ -492,7 +493,11 @@ export function VmRowDetail({
       <div className='mb-2 flex flex-wrap items-center justify-between gap-2'>
         {vm.gemini ? (
           <div className='flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground'>
-            <span>{vm.email || '未提供邮箱'}</span>
+            <span title={slotRawEmail(vm) || undefined}>
+              {slotRawEmail(vm)
+                ? formatSlotEmail(slotRawEmail(vm))
+                : '未提供邮箱'}
+            </span>
             <span>{vm.gemini.account?.plan || 'Gemini'}</span>
             <span>
               {vm.gemini.models_discovered

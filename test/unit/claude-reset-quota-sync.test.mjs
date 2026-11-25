@@ -6,7 +6,11 @@ import test from 'node:test'
 import { buildClaudeResetRedeem, quotaFromAccount } from '../../src/lib/admin/panel-api.mjs'
 import { createImportCommit } from '../../src/lib/oauth/import-commit.mjs'
 import { createUsageCache, getUsageFetchMeta } from '../../src/lib/oauth/usage-cache.mjs'
-import { resetClaudeResetLeasesForTest } from '../../src/lib/oauth/claude-reset-credits.mjs'
+import {
+  claudeResetOperationId,
+  claudeResetOrgId,
+  resetClaudeResetLeasesForTest,
+} from '../../src/lib/oauth/claude-reset-credits.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { listQuotaFromHeaders } from '../../src/lib/pool/quota-window.mjs'
@@ -1244,4 +1248,57 @@ test('#1758 minors 2, 3, 4: per-window 429 reconcile, stale official/allocation 
     assert.equal(listQuotaFromHeaders(quota.repo.get('acc-m4').unified, { now: T3 }).utilization_5h, 0)
     assert.equal(listQuotaFromHeaders(quota.repo.get('acc-m4').unified, { now: T3 }).utilization_7d, 0)
   }
+})
+
+test('#1776 legacy 1.4.168 receipt without account_id never contaminates rebound slot account', async (t) => {
+  const { dataDir, cfg, quota, writeVm } = makeFixture(t, { vmId: 'vm-1', accountUuid: 'acc-B', schedulable: true })
+  const opKey = claudeResetOperationId('vm-1', 'legacy-168-op')
+  const orgKey = claudeResetOrgId(ORG)
+  fs.writeFileSync(
+    path.join(dataDir, 'claude-reset-state.json'),
+    JSON.stringify({
+      version: 1,
+      operations: {
+        [opKey]: {
+          outcome: 'reset',
+          kind: 'full',
+          cleared: ['five_hour', 'seven_day', 'seven_day_overage_included'],
+          at: new Date(T1).toISOString(),
+        },
+      },
+      fences: {
+        [orgKey]: {
+          operation: opKey,
+          state: 'reset',
+          at: new Date(T1).toISOString(),
+        },
+      },
+    }),
+  )
+
+  // Slot vm-1 was rebound to acc-B, which produced real 76% weekly consumption at T2 > T1.
+  writeVm('vm-1', 'acc-B', true)
+  seedPreResetHeaders(quota, 'acc-B', { u5: 0.42, u7: 0.76, now: T2 })
+
+  const { transport } = scriptedTransport({ clears: ['five_hour', 'seven_day', 'seven_day_overage_included'] })
+  const replay = await buildClaudeResetRedeem({
+    cfg,
+    accountQuota: quota,
+    id: 'vm-1',
+    idempotencyKey: 'legacy-168-op',
+    transport,
+    now: () => T3,
+  })
+  assert.equal(replay.ok, true)
+  assert.equal(replay.data.outcome, 'reset')
+  assert.equal(replay.data.replayed, true)
+
+  // Unattributed 1.4.168 receipt must never create reset_boundaries on acc-B or invalidate acc-B's 76% usage.
+  assert.equal(quota.repo.get('acc-B').unified.reset_boundaries ?? null, null)
+  assert.deepEqual(quota.resetGenerations('acc-B'), { '5h': 0, '7d': 0, '7d_oi': 0 })
+
+  quota.ingestOAuthUsage('acc-B', officialZeroProbe(T4), { startedAt: T4, now: T4 })
+  const listedB = listQuotaFromHeaders(quota.repo.get('acc-B').unified, { now: T4 })
+  assert.equal(listedB.utilization_5h, 0.42)
+  assert.equal(listedB.utilization_7d, 0.76)
 })

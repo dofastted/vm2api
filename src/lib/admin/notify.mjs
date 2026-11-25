@@ -88,9 +88,19 @@ function asBool(value, fallback) {
 }
 
 function clampInt(value, min, max, fallback) {
+  if (value == null || typeof value === 'boolean' || (typeof value === 'string' && !value.trim())) return fallback
   const n = Number(value)
-  if (!Number.isFinite(n) || n <= 0) return fallback
+  if (!Number.isFinite(n)) return fallback
   return Math.min(max, Math.max(min, Math.round(n)))
+}
+
+export function buildNotifyConsoleLink(rawUrl) {
+  const trimmed = String(rawUrl || '').trim()
+  if (!trimmed) return ''
+  const withoutHash = trimmed.split('#')[0].replace(/\/+$/, '')
+  if (!withoutHash) return ''
+  if (/\/(?:cc|console)$/i.test(withoutHash)) return `${withoutHash}#/cluster`
+  return `${withoutHash}/cc#/cluster`
 }
 
 function isSecretKeep(value) {
@@ -548,8 +558,7 @@ export function formatNotifyMessage(event, snap, cfg = DEFAULT_NOTIFY, baseUrl =
     lines.push('')
     lines.push(time)
   }
-  const url = String(cfg.console_url || baseUrl || '').replace(/\/$/, '')
-  const consoleLink = url ? `${url}/#/cluster` : ''
+  const consoleLink = buildNotifyConsoleLink(cfg.console_url || baseUrl)
   if (consoleLink) lines.push(consoleLink)
   return {
     title,

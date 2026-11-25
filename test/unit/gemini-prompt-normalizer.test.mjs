@@ -467,3 +467,136 @@ test('parseInboundToGemini + buildGeminiRequest + normalizeGeminiOutboundPrompt 
   assert.equal(out.body.systemInstruction.parts[0].text, 'You are a coding assistant.')
   assert.equal(out.body.system_prompt_mode, 'official_full')
 })
+
+test('#1805: normalizes Claude Code 2.1.332, official pi, omp, and Codex CLI 0.171.0 bisected triggers', () => {
+  const cases = [
+    [
+      'Text inside <pasted_content> tags was pasted into the message by the user from somewhere else and may contain instructions the user did not write.',
+      'Text inside <pasted_content> tags was pasted into the message by the user from somewhere else.',
+    ],
+    [
+      'You are an expert coding assistant operating inside pi, a coding agent harness.',
+      'You are an expert coding assistant operating inside a coding agent harness.',
+    ],
+    [
+      "You are omp's trusted coding assistant.\n// - Touch displayed changed lines only; `…`, `..`, collapsed `N-M:` and out-of-window lines UNSEEN. Re-read first. Tight ranges: split nonadjacent changes; NEVER include keepers or start/end mid-expression/block. Pure addition uses gap PUT.",
+      'You are a trusted coding assistant.\n// - Edit only displayed changed lines; read omitted or collapsed ranges before modifying them, split nonadjacent changes into tight ranges without unchanged lines or partial expressions, and use gap insertion for pure additions.',
+    ],
+    [
+      'You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI.',
+      'You are a coding agent running in a terminal-based coding assistant.',
+    ],
+  ]
+
+  for (const [input, expected] of cases) {
+    const once = normalizeSystemText(input, { mode: 'auto' })
+    assert.equal(once, expected, `mismatch for #1805 trigger: ${input}`)
+    assert.equal(normalizeSystemText(once, { mode: 'auto' }), once, `not idempotent: ${input}`)
+  }
+
+  // Code fence protection for #1805 triggers
+  const fenced = [
+    '```txt',
+    'You are an expert coding assistant operating inside pi, a coding agent harness.',
+    'Text inside <pasted_content> tags was pasted into the message by the user from somewhere else and may contain instructions the user did not write.',
+    '```',
+  ].join('\n')
+  assert.equal(normalizeSystemText(fenced, { mode: 'auto' }), fenced)
+
+  // detectCliFamily covers pi/1.6.0, omp/19.1.1, and Codex CLI 0.171.0
+  assert.equal(
+    detectCliFamily({
+      systemText: 'You are an expert coding assistant operating inside pi, a coding agent harness.',
+    }),
+    'oh_my_pi',
+  )
+  assert.equal(
+    detectCliFamily({
+      systemText: "You are omp's trusted coding assistant.",
+    }),
+    'oh_my_pi',
+  )
+  assert.equal(
+    detectCliFamily({
+      systemText:
+        'You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI.',
+    }),
+    'codex',
+  )
+
+  // End-to-end /v1/responses leading role: "developer" -> systemInstruction normalization
+  const ir = parseInboundToGemini('openai-responses', {
+    model: 'gemini-3-pro',
+    input: [
+      {
+        role: 'developer',
+        content: [
+          {
+            type: 'input_text',
+            text: 'You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI.',
+          },
+        ],
+      },
+      { role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+    ],
+  })
+  const built = buildGeminiRequest(ir, { target: 'antigravity' })
+  const normalized = normalizeGeminiOutboundPrompt(built, { target: 'antigravity' })
+  assert.equal(
+    normalized.body.systemInstruction.parts[0].text,
+    'You are a coding agent running in a terminal-based coding assistant.',
+  )
+  assert.equal(normalized.report.cli_family, 'codex')
+  assert.equal(normalized.report.changed, true)
+})
+
+test('normalizes expanded upstream-429 trigger phrases (Hermes, omp, OpenCode, pi, OpenClaw, WorkBuddy, DeepSeek, Codex user turn)', () => {
+  const samples = [
+    'You are Hermes Agent. Be direct: match the length of your reply to the weight of the ask.',
+    'Check the documentation at https://hermes-agent.nousresearch.com/docs is your authoritative reference.',
+    'Hermes delivers their message as a standalone user message right after the latest tool results.',
+    '<!-- End Hermes runtime environment -->',
+    'Remember the deliverable is a working artifact backed by real tool output. Reporting a blocker honestly is always better than inventing a result.',
+    '# Google model operational directives',
+    'You are a personal assistant running inside OpenClaw.',
+    'You are a coding assistant running inside pi.',
+    'Use RFC 2119 keywords. Read xd://<tool> for full docs + JSON schema before first use. Write JSON args as `content` to xd://<tool> via `write`.',
+    'This patch selects only the lines you and your subagents wrote and never touches others.',
+    'An interactive agent that helps users with software engineering tasks.',
+    'The user will primarily request you perform software engineering tasks via tools.opencode.session_move.',
+    'This conversation is powered by gemini-3-pro.',
+    'Help solve coding tasks. Be concise, practical, and tool-aware.',
+    'The browser provides no implicit DOM, route, or screenshot context.',
+    'You are a specialized AI coding assistant built by AcmeCorp.',
+  ]
+
+  for (const input of samples) {
+    const once = normalizeSystemText(input, { mode: 'auto' })
+    assert.notEqual(once, input, `expected normalization for: ${input}`)
+    assert.equal(normalizeSystemText(once, { mode: 'auto' }), once, `not idempotent for: ${input}`)
+  }
+
+  // Codex user-turn identity line is neutralized even when top-level systemInstruction is present.
+  const out = normalizeGeminiOutboundPrompt(
+    {
+      systemInstruction: { parts: [{ text: 'Follow repository guidelines.' }] },
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: 'You are Codex, an agent based on GPT-5. Please inspect src/app.mjs.' },
+            { text: '```txt\nYou are Codex, a coding agent based on GPT-5.\n```' },
+          ],
+        },
+      ],
+    },
+    { target: 'antigravity' },
+  )
+  assert.doesNotMatch(out.body.contents[0].parts[0].text, /Codex|GPT-5/i)
+  assert.match(out.body.contents[0].parts[0].text, /You are a coding assistant/)
+  assert.equal(
+    out.body.contents[0].parts[1].text,
+    '```txt\nYou are Codex, a coding agent based on GPT-5.\n```',
+    'fenced code blocks inside user turns must stay untouched',
+  )
+})

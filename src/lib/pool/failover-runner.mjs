@@ -97,7 +97,7 @@ export const vmTimeoutTracker = {
 export const TIMEOUT_FAULT_PREFIX = 'consecutive_timeouts:'
 
 const DEFAULTS = {
-  max_account_switches: 10,
+  max_account_switches: 3,
   max_total_attempts: 12,
   max_accounts_per_request: 0,
   total_retry_deadline_ms: 120000,
@@ -113,6 +113,7 @@ const DEFAULTS = {
   // Different sessions that must go silent on one VM before requests that large are kept off it.
   poison_request_vm_sessions: 2,
   delivery_mode: 'realtime',
+  // Conservative programmatic fallback (shipped src/config/routing.json sets 3).
   max_same_account_retries: 1,
   same_account_retry_delay_ms: 500,
   same_account_retry_max_hop_ms: 10_000,
@@ -880,10 +881,10 @@ export class FailoverRunner {
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
     const startedAt = Date.now()
     const budget = new AttemptCoordinator({
-      maxSameUnitRetries: Number(this.config.max_same_account_retries ?? 1),
-      maxUnitSwitches: Number(this.config.max_account_switches ?? 10),
-      maxTotalAttempts: Number(this.config.max_total_attempts ?? 12),
-      deadlineMs: Number(this.config.total_retry_deadline_ms || 120000),
+      maxSameUnitRetries: Number(this.config.max_same_account_retries ?? DEFAULTS.max_same_account_retries),
+      maxUnitSwitches: Number(this.config.max_account_switches ?? DEFAULTS.max_account_switches),
+      maxTotalAttempts: Number(this.config.max_total_attempts ?? DEFAULTS.max_total_attempts),
+      deadlineMs: Number(this.config.total_retry_deadline_ms || DEFAULTS.total_retry_deadline_ms),
       startedAt,
     })
     const deadline = budget.deadline

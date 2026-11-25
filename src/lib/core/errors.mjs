@@ -552,6 +552,13 @@ function partialContinuationRelayDetails(body) {
   return picked
 }
 
+const CONTINUATION_GONE_REASONS = new Set([
+  'waiting_expired',
+  'handoff_expired',
+  'receipt_expired',
+  'cancelled',
+])
+
 function terminalRelayDetails(status, body) {
   // CRAG names a submission whose partial output cannot be replayed with this
   // exact type. The verdict is the kernel's own, so the 409 carrying it is as
@@ -562,11 +569,16 @@ function terminalRelayDetails(status, body) {
   if (status === 409 && body?.error?.type === 'partial_provider_output_nonretryable') {
     return { ...partialContinuationRelayDetails(body), retryable: false }
   }
-  if (body?.error?.details?.retryable === false) return { retryable: false }
   // 410 Gone is terminal by definition. An expired tool continuation cannot be
-  // revived, so every retry of the same hop can only answer 410 again; saying so
-  // does not infer *why* it expired, which stays the kernel's to report.
-  if (status === 410) return { retryable: false }
+  // revived, so every retry of the same hop can only answer 410 again; forward
+  // only allowlisted kernel-supplied expiration reasons (#1215).
+  if (status === 410) {
+    const reason = body?.error?.details?.reason
+    return typeof reason === 'string' && CONTINUATION_GONE_REASONS.has(reason)
+      ? { retryable: false, reason }
+      : { retryable: false }
+  }
+  if (body?.error?.details?.retryable === false) return { retryable: false }
   return {}
 }
 

@@ -72,4 +72,10 @@ describe('release check display', () => {
       renderStatus({ update_available: true, latest_tag: 'v1.3.180' })
     ).toContain('有更新')
   })
+
+  it('describes cluster slot refresh with kin-worker / kin-egress instead of obsolete Go telemetry', () => {
+    const html = renderStatus({})
+    expect(html).toContain('kin-worker / kin-egress')
+    expect(html).not.toContain('Go 遥测')
+  })
 })

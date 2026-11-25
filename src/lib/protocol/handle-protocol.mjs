@@ -805,6 +805,7 @@ export function createHandleProtocol(deps) {
       typeof (deps.handleGeminiPublic || deps.handleGeminiMessages) === 'function'
     ) {
       let preferGeminiApiChannel = false
+      let preloadedGeminiCatalog = null
       if (rawInboundBackend === 'all') {
         const hasPinnedEndpoints =
           Boolean(inboundKeyPolicy?.api_endpoint_id) || (inboundKeyPolicy?.allowed_endpoints?.length || 0) > 0
@@ -828,6 +829,7 @@ export function createHandleProtocol(deps) {
           if (typeof deps.geminiScheduler?.catalog === 'function') {
             try {
               const cat = await deps.geminiScheduler.catalog(gemScope)
+              preloadedGeminiCatalog = cat
               hasOwnedGeminiEnv = Array.isArray(cat?.accounts) && cat.accounts.length > 0
             } catch {
               hasOwnedGeminiEnv = false
@@ -845,7 +847,11 @@ export function createHandleProtocol(deps) {
       }
       if (!preferGeminiApiChannel) {
         req.body = inbound
-        return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, { logBag, logCtx })
+        return (deps.handleGeminiPublic || deps.handleGeminiMessages)(req, res, {
+          logBag,
+          logCtx,
+          ...(preloadedGeminiCatalog ? { catalogSnapshot: preloadedGeminiCatalog } : {}),
+        })
       }
     }
 
@@ -949,7 +955,9 @@ export function createHandleProtocol(deps) {
         logBag.usage = healthDecision.snapshot?.body?.usage || { input_tokens: 0, output_tokens: 0 }
         logBag.stop_reason = healthDecision.snapshot?.body?.stop_reason || 'end_turn'
         logBag.final_state = healthDecision.via
-        if (isClientStream(inbound, req.headers)) {
+        const wantHealthStream =
+          protocol === 'google.gemini' ? routeMeta?.routeStream === true : isClientStream(inbound, req.headers)
+        if (wantHealthStream) {
           writeSSEHeaders(res)
           res.write(formatHealthSse(protocol, inbound, healthDecision.snapshot || {}, hpCfg))
           return res.end()

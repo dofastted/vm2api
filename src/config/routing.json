@@ -223,6 +223,14 @@
       "outbound_mode": "official",
       "vm_ids": []
     },
+    "gemini": {
+      "enabled": true,
+      "interval_sec": 3600,
+      "cache_ttl_sec": 5400,
+      "model": "",
+      "prompt": "hello",
+      "timeout_ms": 60000
+    },
     "match": {
       "max_tokens": 32,
       "max_prompt_chars": 16,
