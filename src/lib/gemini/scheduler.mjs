@@ -14,7 +14,7 @@ import { isGeminiModelEnabled, isGeminiSeriesId, resolveGeminiDefaultEffort } fr
 import { classifyAntigravityModel, indexAccountModelCatalog, resolveUpstreamModel } from './model-catalog.mjs'
 import { callGeminiHost, callGeminiHostStream } from './routes.mjs'
 import { DEFAULT_GEMINI_ROUTING, normalizeGeminiRouting } from './routing-config.mjs'
-import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
+import { GEMINI_LICENSE_MESSAGES, RECOVERABLE_GEMINI_SEAT_CODES } from './subscription.mjs'
 import { PLATFORM_SCOPE, geminiEnvMatchesOwnerScope } from '../admin/resource-owner.mjs'
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
@@ -95,7 +95,9 @@ const FAILURES = {
   license_not_yet_valid: [403, GEMINI_LICENSE_MESSAGES.license_not_yet_valid],
   license_invalid: [403, GEMINI_LICENSE_MESSAGES.license_invalid],
   license_binding_mismatch: [403, GEMINI_LICENSE_MESSAGES.license_binding_mismatch],
+  license_payload_key_mismatch: [403, GEMINI_LICENSE_MESSAGES.license_payload_key_mismatch],
   license_unconfigured: [403, GEMINI_LICENSE_MESSAGES.license_unconfigured],
+  gemini_subscription_sync_pending: [503, GEMINI_LICENSE_MESSAGES.gemini_subscription_sync_pending],
 }
 
 const NON_CIRCUIT_FAILURES = new Set([
@@ -113,7 +115,9 @@ const NON_CIRCUIT_FAILURES = new Set([
   'license_not_yet_valid',
   'license_invalid',
   'license_binding_mismatch',
+  'license_payload_key_mismatch',
   'license_unconfigured',
+  'gemini_subscription_sync_pending',
 ])
 
 const FAILOVER_ERRORS = new Set([
@@ -807,6 +811,9 @@ export function createGeminiScheduler({
     },
 
     async catalog({ ownerScope = PLATFORM_SCOPE, allowedEnvIds = null } = {}) {
+      if (cragSubscription?.hasSyncPending?.()) {
+        await cragSubscription.recover().catch(() => null)
+      }
       let view = await callHost('list', {})
       if (!Array.isArray(view?.environments)) throw fail(502, 'gemini_host_protocol_error')
       if (view.payload_state !== 'installed') return { models: [], accounts: [] }
@@ -824,7 +831,7 @@ export function createGeminiScheduler({
             Array.isArray(environment.models) &&
             environment.models.length > 0 &&
             environment.crag_license?.valid !== true &&
-            (!environment.crag_license?.code || environment.crag_license.code === 'license_required'),
+            (!environment.crag_license?.code || RECOVERABLE_GEMINI_SEAT_CODES.has(environment.crag_license.code)),
         )
         if (needSeat.length) {
           const reconciled = await cragSubscription

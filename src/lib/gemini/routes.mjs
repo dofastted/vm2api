@@ -105,7 +105,9 @@ const RUN_ERRORS = {
   license_not_yet_valid: [403, GEMINI_LICENSE_MESSAGES.license_not_yet_valid],
   license_invalid: [403, GEMINI_LICENSE_MESSAGES.license_invalid],
   license_binding_mismatch: [403, GEMINI_LICENSE_MESSAGES.license_binding_mismatch],
+  license_payload_key_mismatch: [403, GEMINI_LICENSE_MESSAGES.license_payload_key_mismatch],
   license_unconfigured: [403, GEMINI_LICENSE_MESSAGES.license_unconfigured],
+  gemini_subscription_sync_pending: [503, GEMINI_LICENSE_MESSAGES.gemini_subscription_sync_pending],
 }
 const INFERENCE_STATES = new Set([...RUN_STATES, 'cancelled'])
 const INFERENCE_ERROR_CODES = new Set([
@@ -554,6 +556,8 @@ function cragLicenseView(value) {
     ...(text(value.scope, 32) ? { scope: text(value.scope, 32) } : {}),
     ...(Number.isSafeInteger(value.seat) && value.seat > 0 ? { seat: value.seat } : {}),
     ...(text(value.license_id, 128) ? { license_id: text(value.license_id, 128) } : {}),
+    ...(text(value.payload_key_id, 64) ? { payload_key_id: text(value.payload_key_id, 64) } : {}),
+    ...(typeof value.sync_pending === 'boolean' ? { sync_pending: value.sync_pending } : {}),
     ...(Number.isSafeInteger(value.issued_at) ? { issued_at: value.issued_at } : {}),
     ...(Number.isSafeInteger(value.not_before) ? { not_before: value.not_before } : {}),
     ...(Number.isSafeInteger(value.expires_at) ? { expires_at: value.expires_at } : {}),
@@ -1018,7 +1022,18 @@ export function createGeminiPanelHandler({
       }
       if (req.method === 'GET' && pathname === `${PANEL_PATH}/crag-subscription`) {
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
-        return ok(await cragSubscription.status())
+        const reqUrl = new URL(req.url || pathname, 'http://127.0.0.1')
+        const syncParam = reqUrl.searchParams.get('sync')
+        const sync = syncParam === '1' || syncParam === 'true'
+        return ok(await cragSubscription.status({ sync }))
+      }
+      if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/sync`) {
+        if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
+        if (cragSubscription.hasSyncPending?.()) {
+          const recovered = await cragSubscription.recover()
+          return ok(recovered?.status || (await cragSubscription.status()))
+        }
+        return ok(await cragSubscription.status({ sync: true }))
       }
       if (req.method === 'POST' && pathname === `${PANEL_PATH}/crag-subscription/redeem`) {
         if (!cragSubscription) return fail(503, 'license_unconfigured', GEMINI_LICENSE_MESSAGES.license_unconfigured)
@@ -1030,6 +1045,9 @@ export function createGeminiPanelHandler({
         return ok(await cragSubscription.upgrade())
       }
       if (req.method === 'GET' && pathname === PANEL_PATH) {
+        if (cragSubscription?.hasSyncPending?.()) {
+          await cragSubscription.recover().catch(() => null)
+        }
         let view = await callHost('list', {})
         if (!Array.isArray(view?.environments)) throw hostError(PROTOCOL_ERROR)
         if (cragSubscription?.reconcileEnvironmentSeats && view.payload_mode === 'crag_subscription') {

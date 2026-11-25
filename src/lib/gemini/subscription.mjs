@@ -31,13 +31,22 @@ const AUTHORITY_ERRORS = new Map([
   ['license_binding_mismatch', 400],
 ])
 
+export const RECOVERABLE_GEMINI_SEAT_CODES = new Set([
+  'license_required',
+  'license_binding_mismatch',
+  'license_expired',
+  'license_payload_key_mismatch',
+])
+
 export const GEMINI_LICENSE_MESSAGES = {
   license_required: '当前 Gemini OAuth 环境尚未绑定 CRAGGemini 订阅席位，请先绑定席位或激活许可。',
   license_expired: 'CRAGGemini 宿主机订阅或实例许可已过期，请续费或重新激活。',
   license_not_yet_valid: 'CRAGGemini 许可尚未生效，请检查系统 UTC 时间。',
   license_invalid: 'CRAGGemini 订阅许可或签名载荷无效。',
   license_binding_mismatch: 'CRAGGemini 许可与当前环境、设备或宿主机订阅名单不匹配。',
+  license_payload_key_mismatch: 'CRAGGemini 席位许可与当前已安装加密载荷密钥不匹配，请重新绑定席位以换签。',
   license_unconfigured: 'CRAGGemini 尚未配置加密载荷或订阅信任根。',
+  gemini_subscription_sync_pending: 'CRAGGemini 宿主订阅正在同步上次变更，请稍候自动恢复或点击「继续同步订阅」。',
   gemini_subscription_oauth_only: '纯 API Key 模式不运行 CRAGGemini，无需绑定 CRAG 订阅席位。',
   gemini_subscription_not_active: '请先为宿主机兑换 CRAGGemini 订阅凭证。',
   gemini_subscription_reclaim_unsupported: '当前宿主机订阅版本不支持 CRAGH2 席位回收，请先升级订阅格式。',
@@ -321,7 +330,7 @@ export function verifyCragGeminiSlotPermit(
     throw fail('license_binding_mismatch', 403)
   }
   if (expectedPayloadKeyId && permit.payload_key_id !== expectedPayloadKeyId) {
-    throw fail('license_invalid', 403)
+    throw fail('license_payload_key_mismatch', 403)
   }
 
   if (entitlementClaims.version === 1) {
@@ -435,6 +444,7 @@ export function createGeminiCragSubscription({
   const credentialFile = path.join(privateDir, 'credential')
   const AUTO_BIND_BACKOFF_MS = 30_000
   const autoBindBackoff = new Map()
+  let lastExpiryRefresh = null
   let busy = false
 
   function ensureStorage() {
@@ -456,7 +466,7 @@ export function createGeminiCragSubscription({
     try {
       const text = fs.readFileSync(machineIdFile, 'utf8').trim().toLowerCase().replaceAll('-', '')
       if (/^[a-f0-9]{32}$/.test(text) && !/^(0{32}|f{32})$/.test(text)) raw = text
-    } catch { }
+    } catch {}
     const derived = raw
       ? sha256Hex(`${HOST_DOMAIN}${raw}`)
       : sha256Hex(`${HOST_DOMAIN}${randomBytes(16).toString('hex')}`)
@@ -594,7 +604,7 @@ export function createGeminiCragSubscription({
       env.crag_license?.seat_required === true
     if (!isCragSub) return false
     if (env.crag_license?.valid === true) return false
-    if (env.crag_license?.code && env.crag_license.code !== 'license_required') return false
+    if (env.crag_license?.code && !RECOVERABLE_GEMINI_SEAT_CODES.has(env.crag_license.code)) return false
     return true
   }
 
@@ -652,8 +662,127 @@ export function createGeminiCragSubscription({
     }
   }
 
+  async function syncFromAuthorityLocked(authority) {
+    const hostId = resolveHostId(false)
+    let local = null
+    try {
+      local = readLocalEntitlement(authority)
+    } catch {
+      local = null
+    }
+    const pendingSync = fs.existsSync(syncMarkerFile)
+    const cred = readOptionalFile(credentialFile, 128)?.trim()
+    if (!cred || !validVoucher(`CRAGR1.${cred}`)) {
+      if (pendingSync && !local) {
+        removeFile(syncMarkerFile)
+        autoBindBackoff.clear()
+        return { hostId, local: null, remote: null, clearedOrphan: true }
+      }
+      return { hostId, local, remote: null, clearedOrphan: false }
+    }
+    if (!local && !pendingSync) {
+      return { hostId, local: null, remote: null, clearedOrphan: false }
+    }
+    try {
+      const data = await callAuthority('status', hostId, cred, {})
+      if (typeof data?.entitlement === 'string' && data.entitlement.trim()) {
+        const trimmed = data.entitlement.trim()
+        const nextClaims = verifyCragGeminiHostEntitlement(trimmed, hostId, authority.publicKey, {
+          allowExpired: true,
+        })
+        if (local && nextClaims.revision < local.claims.revision) {
+          throw fail('gemini_subscription_invalid_entitlement', 502)
+        }
+        if (!local || nextClaims.revision > local.claims.revision || trimmed !== local.code) {
+          publishFile(entitlementFile, `${trimmed}\n`, 0o644)
+          local = { hostId, code: trimmed, claims: nextClaims }
+        }
+      }
+      if (pendingSync) {
+        removeFile(syncMarkerFile)
+        autoBindBackoff.clear()
+      }
+      return { hostId, local, remote: data, clearedOrphan: false }
+    } catch (error) {
+      if (
+        pendingSync &&
+        !local &&
+        (error?.code === 'not_found' ||
+          error?.code === 'host_subscription_inactive' ||
+          error?.code === 'auth_forbidden')
+      ) {
+        removeFile(syncMarkerFile)
+        autoBindBackoff.clear()
+        return { hostId, local: null, remote: null, clearedOrphan: true }
+      }
+      throw error
+    }
+  }
+
   return {
     publicDir,
+
+    hasSyncPending() {
+      return fs.existsSync(syncMarkerFile)
+    },
+
+    async recover() {
+      if (!fs.existsSync(syncMarkerFile)) return { recovered: false, pending: false }
+      return withLock(async () => {
+        if (!fs.existsSync(syncMarkerFile)) return { recovered: false, pending: false }
+        let authority
+        try {
+          authority = packageAuthority()
+        } catch {
+          return { recovered: false, pending: true }
+        }
+        const synced = await syncFromAuthorityLocked(authority)
+        const status = formatStatus({
+          hostId: synced.hostId,
+          authority,
+          local: synced.local,
+          remote: synced.remote,
+        })
+        if (synced.clearedOrphan) return { recovered: true, cleared_orphan: true, status }
+        return { recovered: true, status }
+      })
+    },
+
+    async refreshExpiredEntitlement() {
+      if (busy || fs.existsSync(syncMarkerFile) || !fs.existsSync(entitlementFile)) {
+        return { refreshed: false }
+      }
+      let authority
+      let local
+      try {
+        authority = packageAuthority()
+        local = readLocalEntitlement(authority)
+      } catch {
+        return { refreshed: false }
+      }
+      const nowMs = Date.now()
+      if (!local || local.claims.expires_at * 1000 > nowMs) return { refreshed: false }
+      if (lastExpiryRefresh?.code === local.code && nowMs < lastExpiryRefresh.retryAfter) {
+        return { refreshed: false }
+      }
+      lastExpiryRefresh = { code: local.code, retryAfter: nowMs + AUTO_BIND_BACKOFF_MS }
+      return withLock(async () => {
+        if (fs.existsSync(syncMarkerFile)) return { refreshed: false }
+        const synced = await syncFromAuthorityLocked(authority)
+        const status = formatStatus({
+          hostId: synced.hostId,
+          authority,
+          local: synced.local,
+          remote: synced.remote,
+        })
+        if (status.active) {
+          lastExpiryRefresh = null
+          autoBindBackoff.clear()
+          return { refreshed: true, status }
+        }
+        return { refreshed: false, status }
+      })
+    },
 
     async status({ sync = false } = {}) {
       let authority = null
@@ -662,23 +791,20 @@ export function createGeminiCragSubscription({
       } catch {
         return formatStatus({ hostId: readOptionalFile(hostIdFile, 128)?.trim() || null, authority: null, local: null })
       }
-      const hostId = resolveHostId(false)
-      let local = readLocalEntitlement(authority)
-      let remote = null
-      if (sync && local) {
-        const cred = resolveCredential(hostId, false)
-        const data = await callAuthority('status', hostId, cred, {})
-        const nextClaims = verifyCragGeminiHostEntitlement(data.entitlement, hostId, authority.publicKey, {
-          allowExpired: true,
+      if (sync) {
+        return withLock(async () => {
+          const synced = await syncFromAuthorityLocked(authority)
+          return formatStatus({
+            hostId: synced.hostId,
+            authority,
+            local: synced.local,
+            remote: synced.remote,
+          })
         })
-        if (nextClaims.revision < local.claims.revision) throw fail('gemini_subscription_invalid_entitlement', 502)
-        if (nextClaims.revision > local.claims.revision) {
-          publishFile(entitlementFile, `${data.entitlement}\n`, 0o644)
-          local = { hostId, code: data.entitlement, claims: nextClaims }
-        }
-        remote = data
       }
-      return formatStatus({ hostId, authority, local, remote })
+      const hostId = resolveHostId(false)
+      const local = readLocalEntitlement(authority)
+      return formatStatus({ hostId, authority, local, remote: null })
     },
 
     async redeem(redemptionCode) {
@@ -758,11 +884,20 @@ export function createGeminiCragSubscription({
 
         publishFile(syncMarkerFile, 'pending\n', 0o644)
         try {
-          const bound = await callAuthority('bind', hostId, cred, {
+          const request = {
             machine_code: machineCode,
             issuer_public_key_id: authority.issuerId,
             payload_key_id: authority.payloadKeyId,
-          })
+          }
+          let bound
+          try {
+            bound = await callAuthority('bind', hostId, cred, request)
+          } catch (error) {
+            if (error?.code !== 'payload_key_conflict' && error?.code !== 'host_binding_conflict') {
+              throw error
+            }
+            bound = await callAuthority('bind', hostId, cred, { ...request, reissue: true })
+          }
           const nextClaims = verifyCragGeminiHostEntitlement(bound.entitlement, hostId, authority.publicKey)
           if (nextClaims.revision < local.claims.revision) {
             throw fail('gemini_subscription_invalid_entitlement', 502)
