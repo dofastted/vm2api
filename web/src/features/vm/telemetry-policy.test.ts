@@ -1,5 +1,6 @@
-import type { CragTelemetryState, VmTelemetryState } from '@/types/panel-vm'
+import type { CragTelemetryState, Vm, VmTelemetryState } from '@/types/panel-vm'
 import { describe, expect, it } from 'vitest'
+import { slotState } from '@/features/settings/telemetry-slot-state'
 import { telemetryLive } from './seed-settings'
 import { telemetryEnabled, telemetrySeedFlags } from './telemetry-policy'
 import {
@@ -77,19 +78,72 @@ describe('native policy acknowledgment', () => {
     ).toBe(false)
   })
 
-  it('shows CRAG policy acknowledgment without claiming upload or queue state', () => {
-    const crag: CragTelemetryState = {
+  it('shows CRAG policy acknowledgment and real upload verification states', () => {
+    const legacyCrag: CragTelemetryState = {
       state: 'launch_policy',
       enabled: true,
       error: null,
       upload_confirmed: false,
     }
-    expect(telemetryPolicyConfirmed(crag, true)).toBe(true)
-    expect(telemetryStatusLabel(crag, true)).toContain('未验证上传')
-    const disabled = { ...crag, enabled: false }
+    expect(telemetryPolicyConfirmed(legacyCrag, true)).toBe(true)
+    expect(telemetryStatusLabel(legacyCrag, true)).toContain('未验证上传')
+
+    const waitingCrag: CragTelemetryState = {
+      ...legacyCrag,
+      upload_supported: true,
+      last_upload_at: null,
+      last_error: null,
+    }
+    expect(telemetryStatusLabel(waitingCrag, true)).toContain('等待首次上传')
+
+    const verifiedCrag: CragTelemetryState = {
+      ...waitingCrag,
+      upload_confirmed: true,
+      last_upload_at: '2026-11-26T00:05:00.000Z',
+    }
+    expect(telemetryStatusLabel(verifiedCrag, true)).toContain('已验证上传')
+
+    const failedCrag: CragTelemetryState = {
+      ...waitingCrag,
+      upload_confirmed: false,
+      last_error: 'http_403',
+    }
+    expect(telemetryStatusLabel(failedCrag, true)).toBe(
+      'CRAG 上传失败 · http_403'
+    )
+
+    const vm: Vm = {
+      id: 'vm-crag-01',
+      status: 'running',
+      resolved_dataplane: 'crag',
+      seed_policy: { telemetry_disabled: false },
+    }
+    expect(
+      slotState(vm, {
+        data: { vm, kernel: { telemetry: verifiedCrag } },
+        isPending: false,
+        isError: false,
+      }).live
+    ).toBe('live')
+    expect(
+      slotState(vm, {
+        data: { vm, kernel: { telemetry: failedCrag } },
+        isPending: false,
+        isError: false,
+      }).live
+    ).toBe('blocked')
+    expect(
+      slotState(vm, {
+        data: { vm, kernel: { telemetry: waitingCrag } },
+        isPending: false,
+        isError: false,
+      }).live
+    ).toBe('policy')
+
+    const disabled = { ...legacyCrag, enabled: false }
     expect(telemetryPolicyConfirmed(disabled, false)).toBe(true)
     expect(telemetryStatusLabel(disabled, false)).not.toContain('队列')
-    const pending = { ...crag, enabled: null, error: '需要重启' }
+    const pending = { ...legacyCrag, enabled: null, error: '需要重启' }
     expect(telemetryPolicyConfirmed(pending, false)).toBe(false)
     expect(telemetryStatusLabel(pending, true)).toBe('需要重启')
   })

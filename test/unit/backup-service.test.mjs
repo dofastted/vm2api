@@ -3,12 +3,17 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import zlib from 'node:zlib'
+import { EventEmitter } from 'node:events'
 import { spawnSync } from 'node:child_process'
-import { openDatabase, closeDatabase, getDb } from '../../src/lib/db/database.mjs'
+import { openDatabase, closeDatabase, getDb, getDbPath } from '../../src/lib/db/database.mjs'
+import { BackupRepo } from '../../src/lib/db/repos/backup-repo.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import { VmsRepo } from '../../src/lib/db/repos/vms-repo.mjs'
+import { sha256File } from '../../src/lib/admin/backup-core.mjs'
 import { BackupService, tarAvailable } from '../../src/lib/admin/backup-service.mjs'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
+import { ensureRedaction, publishRedactionForTests, redactionStatus } from '../../src/lib/redaction/runtime.mjs'
 import { stopVmWatch, initVmDbSync } from '../../src/lib/vm/vm-db-sync.mjs'
 import { setVmWriteHook } from '../../src/lib/vm/vm-file.mjs'
 
@@ -47,6 +52,7 @@ afterEach(() => {
   svc.stopScheduler()
   stopVmWatch()
   setVmWriteHook(null)
+  publishRedactionForTests(null)
   closeDatabase()
   fs.rmSync(root, { recursive: true, force: true })
   delete process.env.KIN_BACKUP_DISABLED
@@ -321,4 +327,287 @@ test('killChildArchivers stops a tar this process spawned and leaves other child
     tar.kill('SIGKILL')
     other.kill('SIGKILL')
   }
+})
+
+function registerSyntheticBackup({ id, fileName, content, kind = 'imported', includes = null }) {
+  const backupDir = path.join(dataDir, 'backups')
+  fs.mkdirSync(backupDir, { recursive: true })
+  const fp = path.join(backupDir, fileName)
+  fs.writeFileSync(fp, content)
+  return new BackupRepo(getDb()).insert({
+    id,
+    created_at: new Date().toISOString(),
+    kind,
+    status: 'ok',
+    file_path: fp,
+    file_name: fileName,
+    size_bytes: fs.statSync(fp).size,
+    sha256: sha256File(fp),
+    db_bytes: fs.statSync(fp).size,
+    includes,
+    error: null,
+    note: null,
+  })
+}
+
+function buildTarArchive(entries) {
+  const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-bak-stage-'))
+  const out = path.join(stage, '..', `archive-${Date.now()}-${Math.random().toString(16).slice(2)}.tar.gz`)
+  try {
+    for (const [relPath, buf] of Object.entries(entries)) {
+      const dest = path.join(stage, relPath)
+      fs.mkdirSync(path.dirname(dest), { recursive: true })
+      fs.writeFileSync(dest, buf)
+    }
+    const r = spawnSync('tar', ['-czf', out, '-C', stage, '.'], { stdio: 'pipe' })
+    assert.equal(r.status, 0, `tar failed: ${String(r.stderr || '')}`)
+    return fs.readFileSync(out)
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true })
+    fs.rmSync(out, { force: true })
+  }
+}
+
+function listRestoreTmpDirs() {
+  const tmpBase = path.join(dataDir, 'tmp')
+  if (!fs.existsSync(tmpBase)) return []
+  return fs.readdirSync(tmpBase).filter((name) => name.startsWith('kin-restore-'))
+}
+
+test('P2-14: SQLite mode preflight rejects PG backups before pre_restore and keeps kin.db intact', async () => {
+  new SettingsRepo(getDb()).set('sqlite_sentinel', 'intact')
+  const dbPath = getDbPath()
+  const originalDbPrefix = fs.readFileSync(dbPath).subarray(0, 16)
+
+  let preRestoreCalls = 0
+  const origCreateBackup = svc.createBackup.bind(svc)
+  svc.createBackup = async (opts) => {
+    if (opts?.kind === 'pre_restore') preRestoreCalls += 1
+    return origCreateBackup(opts)
+  }
+
+  // 1. Standalone .pg.ndjson.gz (must NOT be gunzipped over kin.db!)
+  const ndjsonGz = zlib.gzipSync(Buffer.from('{"type":"meta","engine":"postgres","tables":[]}\n', 'utf8'))
+  const recNdjson = registerSyntheticBackup({
+    id: 'bak_pg_ndjson',
+    fileName: 'kin-backup-2026-11-26.pg.ndjson.gz',
+    content: ndjsonGz,
+    includes: null,
+  })
+  await assert.rejects(svc.restoreBackup(recNdjson.id), (err) => {
+    assert.equal(err.code, 'backup_incompatible')
+    return true
+  })
+
+  // 2. Standalone .pgdump
+  const recPgdump = registerSyntheticBackup({
+    id: 'bak_pg_dump',
+    fileName: 'kin-backup-2026-11-26.pgdump',
+    content: Buffer.from('PGDMP-fake-custom-dump', 'utf8'),
+    includes: null,
+  })
+  await assert.rejects(svc.restoreBackup(recPgdump.id), (err) => {
+    assert.equal(err.code, 'backup_incompatible')
+    return true
+  })
+
+  // 3. PG .tar.gz with includes=null (orphan archive containing only db/kin.pgdump)
+  const pgDumpBytes = Buffer.from('PGDMP-inside-tar', 'utf8')
+  const pgTarBuf = buildTarArchive({
+    'db/kin.pgdump': pgDumpBytes,
+    'manifest.json': JSON.stringify({ version: 2, engine: 'postgres', format: 'pg_dump_custom' }),
+  })
+  const recPgTar = registerSyntheticBackup({
+    id: 'bak_pg_tar_orphan',
+    fileName: 'kin-backup-2026-11-26-pg.tar.gz',
+    content: pgTarBuf,
+    includes: null,
+  })
+  await assert.rejects(svc.restoreBackup(recPgTar.id), (err) => {
+    assert.equal(err.code, 'backup_incompatible')
+    return true
+  })
+
+  // 4. PG .tar.gz with declared includes.engine='postgres'
+  const recPgDeclared = registerSyntheticBackup({
+    id: 'bak_pg_tar_declared',
+    fileName: 'kin-backup-2026-11-26-pg-declared.tar.gz',
+    content: pgTarBuf,
+    kind: 'manual',
+    includes: { db: true, engine: 'postgres', format: 'pg_dump_custom', vms: 0, config: 0 },
+  })
+  await assert.rejects(svc.restoreBackup(recPgDeclared.id), (err) => {
+    assert.equal(err.code, 'backup_incompatible')
+    return true
+  })
+
+  assert.equal(preRestoreCalls, 0, 'must not create pre_restore before preflight passes')
+  assert.equal(svc.list().filter((r) => r.kind === 'pre_restore').length, 0)
+  assert.equal(svc.isRestoring, false)
+  assert.deepEqual(listRestoreTmpDirs(), [], 'preflight temp dirs must be cleaned up')
+  assert.equal(new SettingsRepo(getDb()).get('sqlite_sentinel'), 'intact')
+  assert.deepEqual(fs.readFileSync(dbPath).subarray(0, 16), originalDbPrefix)
+})
+
+test('P2-14: PostgreSQL mode preflight rejects SQLite backups, corrupt inner snapshots, and missing pg_restore before pre_restore', async () => {
+  seedVm()
+  const sqliteTar = await svc.createBackup({ kind: 'manual' })
+  const sqliteDbGz = registerSyntheticBackup({
+    id: 'bak_sqlite_dbgz',
+    fileName: 'kin-backup-2026-11-26.db.gz',
+    content: zlib.gzipSync(fs.readFileSync(getDbPath())),
+    includes: null,
+  })
+  const standalonePgDump = registerSyntheticBackup({
+    id: 'bak_pg_standalone',
+    fileName: 'kin-backup-2026-11-26-standalone.pgdump',
+    content: Buffer.from('PGDMP-standalone', 'utf8'),
+    kind: 'manual',
+    includes: { db: true, engine: 'postgres', format: 'pg_dump_custom', vms: 0, config: 0 },
+  })
+
+  const innerPgDump = Buffer.from('PGDMP-inside-archive', 'utf8')
+  const innerPgDumpPath = path.join(root, 'inner.pgdump')
+  fs.writeFileSync(innerPgDumpPath, innerPgDump)
+  const innerPgDumpSha = sha256File(innerPgDumpPath)
+  const validPgTar = registerSyntheticBackup({
+    id: 'bak_pg_tar_valid',
+    fileName: 'kin-backup-2026-11-26-valid-pg.tar.gz',
+    content: buildTarArchive({
+      'db/kin.pgdump': innerPgDump,
+      'manifest.json': JSON.stringify({
+        version: 2,
+        engine: 'postgres',
+        format: 'pg_dump_custom',
+        sha256s: { 'db/kin.pgdump': innerPgDumpSha },
+      }),
+    }),
+    kind: 'manual',
+    includes: { db: true, engine: 'postgres', format: 'pg_dump_custom', vms: 0, config: 0 },
+  })
+  const corruptInnerPgTar = registerSyntheticBackup({
+    id: 'bak_pg_tar_corrupt_inner',
+    fileName: 'kin-backup-2026-11-26-corrupt-pg.tar.gz',
+    content: buildTarArchive({
+      'db/kin.pgdump': innerPgDump,
+      'manifest.json': JSON.stringify({
+        version: 2,
+        engine: 'postgres',
+        format: 'pg_dump_custom',
+        sha256s: { 'db/kin.pgdump': '0'.repeat(64) },
+      }),
+    }),
+    kind: 'manual',
+    includes: { db: true, engine: 'postgres', format: 'pg_dump_custom', vms: 0, config: 0 },
+  })
+
+  let preRestoreCalls = 0
+  const pgSvc = new BackupService({
+    dataDir,
+    projectRoot: root,
+    configDir,
+    getEngine: () => 'postgres',
+    isPgRestoreAvailable: async () => false,
+  })
+  pgSvc.createBackup = async () => {
+    preRestoreCalls += 1
+    throw new Error('pre_restore should not have been invoked')
+  }
+
+  // SQLite tar.gz rejected
+  await assert.rejects(pgSvc.restoreBackup(sqliteTar.id), (err) => {
+    assert.equal(err.code, 'backup_incompatible')
+    return true
+  })
+  // Standalone SQLite .db.gz rejected
+  await assert.rejects(pgSvc.restoreBackup(sqliteDbGz.id), (err) => {
+    assert.equal(err.code, 'backup_incompatible')
+    return true
+  })
+  // Standalone .pgdump rejected when pg_restore binary is missing
+  await assert.rejects(pgSvc.restoreBackup(standalonePgDump.id), (err) => {
+    assert.equal(err.code, 'pg_restore_missing')
+    return true
+  })
+  // .tar.gz with db/kin.pgdump rejected when pg_restore binary is missing
+  await assert.rejects(pgSvc.restoreBackup(validPgTar.id), (err) => {
+    assert.equal(err.code, 'pg_restore_missing')
+    return true
+  })
+  // Corrupt inner snapshot sha256 rejected as backup_corrupt before pre_restore
+  await assert.rejects(pgSvc.restoreBackup(corruptInnerPgTar.id), (err) => {
+    assert.equal(err.code, 'backup_corrupt')
+    return true
+  })
+
+  assert.equal(preRestoreCalls, 0, 'none of the failing preflight cases may create a pre_restore backup')
+  assert.equal(pgSvc.isRestoring, false)
+  assert.deepEqual(listRestoreTmpDirs(), [], 'all preflight staging dirs must be removed')
+
+  // When preflight succeeds but createBackup(pre_restore) subsequently fails, staging tmp is still cleaned up.
+  const pgSvcAfterPreflightFail = new BackupService({
+    dataDir,
+    projectRoot: root,
+    configDir,
+    getEngine: () => 'postgres',
+    isPgRestoreAvailable: async () => true,
+  })
+  pgSvcAfterPreflightFail.createBackup = async () => {
+    assert.equal(listRestoreTmpDirs().length, 1, 'preflight extracted archive before pre_restore')
+    throw new Error('pre_restore disk full')
+  }
+  await assert.rejects(pgSvcAfterPreflightFail.restoreBackup(validPgTar.id), /pre_restore disk full/)
+  assert.equal(pgSvcAfterPreflightFail.isRestoring, false)
+  assert.deepEqual(listRestoreTmpDirs(), [], 'finally must clean up preflight tmp dir on later errors')
+})
+
+test('P2-14: restoreBackup awaits async onRestored and resyncs redaction runtime', async () => {
+  seedVm()
+  fs.writeFileSync(
+    path.join(configDir, 'routing.json'),
+    JSON.stringify({ sticky: { enabled: true }, redaction: { enabled: false, secrets: true, personal: false } }),
+  )
+  const rec = await svc.createBackup({ kind: 'manual' })
+
+  // Simulate redaction running after the backup was taken.
+  const fakeChild = Object.assign(new EventEmitter(), {
+    exitCode: null,
+    signalCode: null,
+    killed: false,
+    kill() {
+      this.killed = true
+      this.signalCode = 'SIGTERM'
+      setImmediate(() => this.emit('close', null, 'SIGTERM'))
+    },
+  })
+  publishRedactionForTests({
+    enabled: true,
+    ready: true,
+    policy: { enabled: true, secrets: true, personal: false, words: [], rules: [] },
+    client: {},
+    child: fakeChild,
+    error: null,
+  })
+  assert.equal(redactionStatus().enabled, true)
+
+  let asyncHookFinished = false
+  svc.onRestored(async () => {
+    const restoredRouting = JSON.parse(fs.readFileSync(path.join(configDir, 'routing.json'), 'utf8'))
+    await ensureRedaction(restoredRouting, { projectRoot: root })
+    asyncHookFinished = true
+  })
+
+  const out = await svc.restoreBackup(rec.id)
+  assert.equal(out.ok, true)
+  assert.equal(asyncHookFinished, true, 'restoreBackup must await async onRestored callback')
+  assert.equal(fakeChild.killed, true, 'old kin-redact child must be stopped when restored config disables redaction')
+  assert.deepEqual(redactionStatus(), { enabled: false, ready: true, error: null })
+
+  // Async onRestored rejection must reject restoreBackup and clear isRestoring.
+  svc.onRestored(async () => {
+    await Promise.resolve()
+    throw new Error('async rebind failed')
+  })
+  await assert.rejects(svc.restoreBackup(rec.id), /async rebind failed/)
+  assert.equal(svc.isRestoring, false)
 })

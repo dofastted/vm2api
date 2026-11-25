@@ -463,7 +463,7 @@ export function SeedPolicyCard({
             label='遥测'
             detail={
               cragTelemetry
-                ? '使用原生 settings.json 和 CRAG 启动策略；生效可能需要排空并重启内核。此处不验证上传。'
+                ? '使用原生 settings.json 和 CRAG 启动策略；生效可能需要排空并重启内核，真实上传结果同步记入计数日志。'
                 : on
                   ? '只允许本 VM 的必要原生 1P 事件按周期合批；其他非必要流量仍受限。'
                   : '停止采集和新发送、取消未完成上传并清空队列；以 VM 确认为准。'
@@ -576,29 +576,27 @@ export function SeedPolicyCard({
             }
           }}
         />
-        {!cragTelemetry ? (
-          <div className='border-t px-4 py-3'>
-            <ToggleRow
-              id='seed-telemetry-debug'
-              label='调试上传'
-              detail={
-                debug
-                  ? '仅显示本 VM 的批次、事件数与错误码，不展示载荷或凭据。'
-                  : '默认关闭，不读取计数记录。'
-              }
-              checked={debug}
-              disabled={saving}
-              onCheckedChange={onDebug}
+        <div className='border-t px-4 py-3'>
+          <ToggleRow
+            id='seed-telemetry-debug'
+            label='调试上传'
+            detail={
+              debug
+                ? '仅显示本 VM 的批次、事件数与错误码，不展示载荷或凭据。'
+                : '默认关闭，不读取计数记录。'
+            }
+            checked={debug}
+            disabled={saving}
+            onCheckedChange={onDebug}
+          />
+          {debug ? (
+            <TelemetryUploadLog
+              lines={uploadLog}
+              loading={uploadLoading}
+              error={uploadError}
             />
-            {debug ? (
-              <TelemetryUploadLog
-                lines={uploadLog}
-                loading={uploadLoading}
-                error={uploadError}
-              />
-            ) : null}
-          </div>
-        ) : null}
+          ) : null}
+        </div>
       </aside>
     </div>
   )

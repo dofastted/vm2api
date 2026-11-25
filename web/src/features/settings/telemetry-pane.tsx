@@ -57,7 +57,7 @@ import { telemetrySeedFlags } from '@/features/vm/telemetry-policy'
 const LIVE: Record<LiveKey, { legend: string; swatch: string; text: string }> =
   {
     live: {
-      legend: '上传中',
+      legend: '上传中 / 已验证',
       swatch: 'bg-primary',
       text: 'text-primary',
     },
@@ -67,7 +67,7 @@ const LIVE: Record<LiveKey, { legend: string; swatch: string; text: string }> =
       text: 'text-[var(--status-caution)]',
     },
     policy: {
-      legend: 'CRAG 已开 · 未验证上传',
+      legend: 'CRAG 已开 · 待验证上传',
       swatch: 'bg-[var(--status-caution-solid)]',
       text: 'text-[var(--status-caution)]',
     },
@@ -428,8 +428,8 @@ export function TelemetryPane({
                 telemetry_disabled === false
               </code>{' '}
               才算开，缺这个值也是关），无需点击底部保存按钮。CRAG
-              的检测只核验原生启动策略，不发送测试遥测，也不证明上传。其他
-              Claude 槽由常驻 cli-node 发送，展开可查看最近 40 条计数日志。
+              核验原生启动策略并记录真实原生上传结果，不发送测试遥测；展开任意
+              Claude 槽可查看最近 40 条脱敏上传计数日志。
               {codexCount
                 ? ` GPT 使用独立统计链路，${codexCount} 个不在此列。`
                 : ''}
@@ -814,31 +814,27 @@ function SlotRow({
   onToggleOpen: () => void
   onSet: (enabled: boolean) => void
 }) {
-  const { vm, on, live, label, probing, confirmed, crag } = slot
+  const { vm, on, live, label, probing, confirmed } = slot
   const name = slotNameLabel(vm)
   const panelId = `telemetry-log-${vm.id}`
   return (
     <li>
       <div className='grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 gap-y-1 px-4 py-3 sm:grid-cols-[auto_minmax(0,1fr)_10rem_auto] sm:px-6'>
-        {crag ? (
-          <span className='w-4' />
-        ) : (
-          <button
-            type='button'
-            aria-expanded={open}
-            aria-controls={panelId}
-            aria-label={`${open ? '收起' : '展开'} ${vm.id} 上传记录`}
-            onClick={onToggleOpen}
-            className='-m-1 rounded-md p-1 text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
-          >
-            <ChevronRight
-              className={cn(
-                'size-4 motion-safe:transition-transform motion-safe:duration-200',
-                open && 'rotate-90'
-              )}
-            />
-          </button>
-        )}
+        <button
+          type='button'
+          aria-expanded={open}
+          aria-controls={panelId}
+          aria-label={`${open ? '收起' : '展开'} ${vm.id} 上传记录`}
+          onClick={onToggleOpen}
+          className='-m-1 rounded-md p-1 text-muted-foreground transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none'
+        >
+          <ChevronRight
+            className={cn(
+              'size-4 motion-safe:transition-transform motion-safe:duration-200',
+              open && 'rotate-90'
+            )}
+          />
+        </button>
         <div className='min-w-0'>
           <div className='flex min-w-0 items-baseline gap-2'>
             <span className='truncate text-sm font-medium'>{name}</span>
@@ -907,9 +903,7 @@ function SlotRow({
           })}
         </div>
       </div>
-      {open && !crag ? (
-        <UploadPanel id={vm.id} panelId={panelId} on={on} />
-      ) : null}
+      {open ? <UploadPanel id={vm.id} panelId={panelId} on={on} /> : null}
     </li>
   )
 }

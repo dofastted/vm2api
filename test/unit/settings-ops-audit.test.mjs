@@ -2,7 +2,9 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { PassThrough } from 'node:stream'
 import test from 'node:test'
+import { getDbEngine } from '../../src/lib/db/database.mjs'
 import {
   buildNotifyConsoleLink,
   formatNotifyMessage,
@@ -204,4 +206,138 @@ test('P2-15: GET /api/panel/version honors ?refresh=1 and failed refreshes do no
   assert.equal(retryRes.error, null)
   assert.equal(retryRes.cached, false)
   assert.equal(retryRes.release.tag, 'v1.4.203')
+})
+
+test('P2-14: backup panel routes expose engine, .pgdump MIME type, 422/503 restore status codes, and DELETE', async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-ops-backup-routes-'))
+  t.after(() => fs.rmSync(tmpDir, { recursive: true, force: true }))
+
+  const records = new Map()
+  for (const [id, fileName, content] of [
+    ['bak_pgdump', 'kin-backup-2026-11-26.pgdump', 'PGDMP-raw'],
+    ['bak_targz', 'kin-backup-2026-11-26.tar.gz', 'gzip-tar'],
+    ['bak_ndjson', 'kin-backup-2026-11-26.pg.ndjson.gz', 'gzip-ndjson'],
+    ['bak_dbgz', 'kin-backup-2026-11-26.db.gz', 'gzip-db'],
+  ]) {
+    const filePath = path.join(tmpDir, fileName)
+    fs.writeFileSync(filePath, content)
+    records.set(id, {
+      id,
+      file_name: fileName,
+      file_path: filePath,
+      sha256: 'abc123',
+      status: 'ok',
+      file_exists: true,
+    })
+  }
+
+  let nextRestoreError = null
+  const removed = []
+  const backupService = {
+    isRestoring: false,
+    list: () => [...records.values()],
+    getSchedule: () => ({ enabled: true, interval_hours: 24, retention: 7 }),
+    nextAutoAt: () => '2026-11-27T00:00:00.000Z',
+    get: (id) => records.get(id) || null,
+    async restoreBackup() {
+      if (nextRestoreError) throw nextRestoreError
+      return { ok: true, restored: 'bak_targz', pre_restore: 'bak_pre' }
+    },
+    remove: (id) => {
+      if (!records.has(id)) return false
+      records.delete(id)
+      removed.push(id)
+      return true
+    },
+  }
+
+  const invoke = async (method, urlPath, body = {}) => {
+    let jsonResponse = null
+    const streamRes = new PassThrough()
+    let streamStatus = null
+    let streamHeaders = null
+    streamRes.writeHead = (status, headers) => {
+      streamStatus = status
+      streamHeaders = headers
+    }
+    const handlePanel = createPanelHandler({
+      cfg: { paths: { project: tmpDir } },
+      backupService,
+      readBody: async () => body,
+      requireAuth(req) {
+        req.panelUser = 'admin'
+        req.panelRole = 'admin'
+        return true
+      },
+      json(_res, status, payload) {
+        jsonResponse = { status, body: payload }
+      },
+    })
+    await handlePanel({ method, headers: {} }, streamRes, new URL(`http://localhost${urlPath}`))
+    if (jsonResponse) return jsonResponse
+    const chunks = []
+    for await (const chunk of streamRes) chunks.push(chunk)
+    return {
+      status: streamStatus,
+      headers: streamHeaders,
+      raw: Buffer.concat(chunks).toString('utf8'),
+    }
+  }
+
+  // 1. GET /api/panel/backups includes current DB engine
+  const listed = await invoke('GET', '/api/panel/backups')
+  assert.equal(listed.status, 200)
+  assert.equal(listed.body.ok, true)
+  assert.equal(listed.body.engine, getDbEngine())
+  assert.equal(listed.body.items.length, 4)
+
+  // 2. GET /download serves application/octet-stream for .pgdump and application/gzip for gzip archives
+  const dlPgdump = await invoke('GET', '/api/panel/backups/bak_pgdump/download')
+  assert.equal(dlPgdump.status, 200)
+  assert.equal(dlPgdump.headers['content-type'], 'application/octet-stream')
+  assert.equal(dlPgdump.headers['content-disposition'], 'attachment; filename="kin-backup-2026-11-26.pgdump"')
+  assert.equal(dlPgdump.raw, 'PGDMP-raw')
+
+  for (const id of ['bak_targz', 'bak_ndjson', 'bak_dbgz']) {
+    const dl = await invoke('GET', `/api/panel/backups/${id}/download`)
+    assert.equal(dl.status, 200)
+    assert.equal(dl.headers['content-type'], 'application/gzip', `${id} must serve application/gzip`)
+  }
+
+  // 3. POST /restore maps backup_incompatible -> 422 and pg_restore_missing -> 503
+  nextRestoreError = Object.assign(new Error('cross-engine archive'), { code: 'backup_incompatible' })
+  const incompat = await invoke('POST', '/api/panel/backups/bak_pgdump/restore', { confirm: true })
+  assert.equal(incompat.status, 422)
+  assert.equal(incompat.body.error.code, 'backup_incompatible')
+
+  nextRestoreError = Object.assign(new Error('pg_restore binary missing'), { code: 'pg_restore_missing' })
+  const missingTool = await invoke('POST', '/api/panel/backups/bak_pgdump/restore', { confirm: true })
+  assert.equal(missingTool.status, 503)
+  assert.equal(missingTool.body.error.code, 'pg_restore_missing')
+
+  // 4. DELETE /api/panel/backups/:id
+  const delOk = await invoke('DELETE', '/api/panel/backups/bak_dbgz')
+  assert.equal(delOk.status, 200)
+  assert.deepEqual(delOk.body, { ok: true, deleted: 'bak_dbgz' })
+  assert.deepEqual(removed, ['bak_dbgz'])
+
+  const delMissing = await invoke('DELETE', '/api/panel/backups/bak_dbgz')
+  assert.equal(delMissing.status, 404)
+})
+
+test('P2-14: server.mjs backupService.onRestored awaits ensureRedaction and request-log header is engine-agnostic', () => {
+  const serverSrc = fs.readFileSync(path.join(process.cwd(), 'src/server.mjs'), 'utf8')
+  assert.match(serverSrc, /import\s+\{\s*ensureRedaction\s*\}\s+from\s+['"]\.\/lib\/redaction\/runtime\.mjs['"]/)
+  const onRestoredMatch = serverSrc.match(/backupService\.onRestored\(async\s*\(db\)\s*=>\s*\{([\s\S]*?)\n\}\)/)
+  assert.ok(onRestoredMatch, 'backupService.onRestored should register an async callback')
+  assert.match(
+    onRestoredMatch[1],
+    /try\s*\{\s*await ensureRedaction\(routingConfig,\s*\{\s*projectRoot:\s*cfg\.paths\.project\s*\}\)\s*\}\s*catch/,
+    'onRestored must await ensureRedaction inside try/catch so failures log without breaking restore',
+  )
+
+  const requestLogHead = fs
+    .readFileSync(path.join(process.cwd(), 'src/lib/admin/request-log.mjs'), 'utf8')
+    .slice(0, 200)
+  assert.doesNotMatch(requestLogHead, /SQLite-backed/i)
 })

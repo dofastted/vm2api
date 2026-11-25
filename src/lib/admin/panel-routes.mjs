@@ -232,7 +232,7 @@ import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } f
 import { snapshotDatabaseMetricsAsync } from '../db/database-metrics.mjs'
 import { queryActiveUsage } from '../oauth/active-usage-query.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
-import { getDb, getDbPath, getPgPool } from '../db/database.mjs'
+import { getDb, getDbEngine, getDbPath, getPgPool } from '../db/database.mjs'
 import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
 import { getCacheRuntime } from '../cache/index.mjs'
 import {
@@ -3244,6 +3244,7 @@ export function createPanelHandler(ctx) {
       if (req.method === 'GET' && p === '/api/panel/backups') {
         return json(res, 200, {
           ok: true,
+          engine: getDbEngine(),
           items: backupService.list(),
           config: backupService.getSchedule(),
           next_auto_at: backupService.nextAutoAt(),
@@ -3284,12 +3285,14 @@ export function createPanelHandler(ctx) {
         if (!rec || !rec.file_path || !fs.existsSync(rec.file_path)) {
           return json(res, 404, { ok: false, error: { message: 'backup file not found' } })
         }
+        const downloadName = rec.file_name || path.basename(rec.file_path)
+        const contentType = downloadName.endsWith('.pgdump') ? 'application/octet-stream' : 'application/gzip'
         res.writeHead(
           200,
           corsHeadersForRequest(req, {
-            'content-type': 'application/gzip',
+            'content-type': contentType,
             'content-length': fs.statSync(rec.file_path).size,
-            'content-disposition': `attachment; filename="${rec.file_name}"`,
+            'content-disposition': `attachment; filename="${downloadName}"`,
             'x-kin-backup-sha256': rec.sha256 || '',
             'access-control-expose-headers': 'content-disposition, x-kin-backup-sha256',
           }),
@@ -3316,6 +3319,8 @@ export function createPanelHandler(ctx) {
             restore_in_progress: 409,
             backup_corrupt: 422,
             backup_not_ok: 422,
+            backup_incompatible: 422,
+            pg_restore_missing: 503,
           }
           return json(res, map[e.code] || 500, {
             ok: false,

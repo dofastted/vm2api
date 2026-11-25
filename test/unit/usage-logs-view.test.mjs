@@ -277,6 +277,49 @@ test('row badges: via only when non-default, context1m from long_context, fast/p
   assert.equal(logs.find((r) => r.id === plain.id).context1mApplied, null)
 })
 
+test('legacy Gemini tier-suffix rows stored with model_mismatch=1 are normalized to match in view and filter', () => {
+  const db = freshDb()
+  const [tierBare, tierDowngrade, crossModel] = seed(db, [
+    {
+      model: 'gemini-4-neon-high',
+      requested_model: 'gemini-4-neon-high',
+      upstream_model: 'gemini-4-neon',
+      model_mismatch: 1,
+    },
+    {
+      model: 'gemini-4-neon-high',
+      requested_model: 'gemini-4-neon-high',
+      upstream_model: 'gemini-4-neon-low',
+      model_mismatch: 1,
+    },
+    {
+      model: 'gemini-4-hydrogen-high',
+      requested_model: 'gemini-4-hydrogen-high',
+      upstream_model: 'gemini-4-neon',
+      model_mismatch: 1,
+    },
+  ])
+  const view = new UsageLogsView(db)
+  const all = view.listBatch({}).logs
+  const byId = (id) => all.find((r) => r.id === id)
+  assert.equal(byId(tierBare.id).modelMismatch, 0)
+  assert.equal(
+    byId(tierBare.id).specialSettings.some((s) => s.key === 'mismatch'),
+    false,
+  )
+  assert.equal(byId(tierDowngrade.id).modelMismatch, 1)
+  assert.equal(
+    byId(tierDowngrade.id).specialSettings.some((s) => s.key === 'mismatch'),
+    true,
+  )
+  assert.equal(byId(crossModel.id).modelMismatch, 1)
+
+  const filteredIds = view.listBatch({ model_mismatch: true }).logs.map((r) => r.id)
+  assert.equal(filteredIds.includes(tierBare.id), false)
+  assert.equal(filteredIds.includes(tierDowngrade.id), true)
+  assert.equal(filteredIds.includes(crossModel.id), true)
+})
+
 test('request settings show sent Priority or Ultrafast and the upstream echo separately', () => {
   const db = freshDb()
   const [ultrafast, priority, unechoed] = seed(db, [

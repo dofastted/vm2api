@@ -12,6 +12,7 @@
 import { getDb } from '../database.mjs'
 import { DEFAULT_MUTED_ERROR_CLASSES, enrichLogRow, excludeErrorClassSql } from '../../admin/error-class.mjs'
 import { reportTimezone, zonedDayStartMs } from '../../core/timezone.mjs'
+import { modelMismatch } from '../../protocol/log-fields.mjs'
 import {
   ERROR_PRED,
   PROMPT_TOKENS_SQL,
@@ -134,13 +135,24 @@ function costBreakdown(row) {
   }
 }
 
+/** Re-evaluate stored mismatch=1 rows so legacy Gemini tier-suffix rows do not falsely flag as redirected. */
+function effectiveModelMismatch(row) {
+  if (row.model_mismatch == null) return null
+  const stored = Number(row.model_mismatch)
+  if (stored !== 1) return stored
+  const requested = row.requested_model || row.model
+  const upstream = row.upstream_model
+  if (requested && upstream && modelMismatch(requested, upstream) === 0) return 0
+  return stored
+}
+
 /** Switches that changed how this request was served. Fixed order; the UI does not sort. */
 function specialSettings(row) {
   const out = []
   if (row.stream) out.push({ key: 'stream', label: '流式' })
   if (row.has_tools) out.push({ key: 'tools', label: '工具调用' })
   if (row.log_mode === 'debug') out.push({ key: 'debug', label: '调试采样' })
-  if (row.model_mismatch === 1)
+  if (effectiveModelMismatch(row) === 1)
     out.push({ key: 'mismatch', label: '模型重定向', value: `${row.requested_model} → ${row.upstream_model}` })
   if (row.speed === 'fast') out.push({ key: 'fast', label: 'Fast 模式', value: row.speed })
   if (row.service_tier === 'priority') out.push({ key: 'priority', label: 'Priority', value: row.service_tier })
@@ -184,7 +196,7 @@ export function toUsageLogRow(row, names, chain = []) {
     model: row.model ?? null,
     originalModel: row.requested_model ?? null,
     actualResponseModel: row.upstream_model ?? null,
-    modelMismatch: row.model_mismatch == null ? null : Number(row.model_mismatch),
+    modelMismatch: effectiveModelMismatch(row),
     endpoint: row.path ?? null,
     protocol: row.protocol ?? null,
     method: row.method ?? null,
@@ -376,15 +388,23 @@ function buildFilter(filters, defaultMuted) {
   const excludeSql = excludeErrorClassSql(muted)
   if (excludeSql) where.push(excludeSql)
   const blocked = new Set(muted)
-  let keep = null
-  if (errorClass) keep = (row) => row.error_class === errorClass
-  else if (blocked.size) keep = (row) => !row.error_class || !blocked.has(row.error_class)
-  return { where, params, keep, sqlOnlySummary: !errorClass && muted.every((c) => c === 'auth') }
+  const predicates = []
+  if (errorClass) predicates.push((row) => row.error_class === errorClass)
+  else if (blocked.size) predicates.push((row) => !row.error_class || !blocked.has(row.error_class))
+  if (filters.model_mismatch) predicates.push((row) => effectiveModelMismatch(row) === 1)
+  const keep = predicates.length ? (row) => predicates.every((fn) => fn(row)) : null
+  return {
+    where,
+    params,
+    keep,
+    sqlOnlySummary: !errorClass && !filters.model_mismatch && muted.every((c) => c === 'auth'),
+  }
 }
 
 function exportRow(raw) {
   return enrichLogRow({
     ...raw,
+    model_mismatch: effectiveModelMismatch(raw),
     ts: raw.created_at,
     ip: raw.ip_address,
     stream: !!raw.stream,
