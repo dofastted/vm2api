@@ -1199,7 +1199,9 @@ function fatalUsageCredentialFailure(result = {}) {
   const text = String(result?.usage_error || result?.error || result?.fable?.error || '').toLowerCase()
   return (
     status === 401 ||
-    /oauth_revoked|token has been revoked|invalid_grant|oauth_invalid_grant|refresh token not found/.test(text)
+    /oauth_revoked|token has been revoked|token_revoked|invalidated oauth token|invalid_grant|oauth_invalid_grant|refresh token not found/.test(
+      text,
+    )
   )
 }
 

@@ -68,7 +68,7 @@ export function isCredentialRefreshTarget(vm) {
   return true
 }
 
-const REVOKED_ACCESS = /access token has been revoked|token has been revoked|oauth_revoked/i
+const REVOKED_ACCESS = /access token has been revoked|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i
 
 /** Operator hint only. Scheduled Ensure must not auto-force a still-unexpired ticket. */
 export function shouldForceRefresh(vm) {

@@ -202,8 +202,10 @@ function credentialEnsureFailure(result, ensured) {
   const rawError = ensured?.error
   const error = rawError && typeof rawError === 'object' ? rawError : {}
   const blob = `${error.code || ''} ${error.message || ''} ${typeof rawError === 'string' ? rawError : ''}`
-  const fatal = /invalid_grant|oauth_revoked|token has been revoked|refresh_token_missing/i.test(blob)
-  const revoked = /token has been revoked|oauth_revoked/i.test(blob)
+  const fatal = /invalid_grant|oauth_revoked|token has been revoked|token_revoked|invalidated oauth token|refresh_token_missing/i.test(
+    blob,
+  )
+  const revoked = /token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i.test(blob)
   return {
     ...result,
     ok: false,

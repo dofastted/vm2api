@@ -1466,7 +1466,7 @@ export class AccountQuota {
     if (!accountId) return null
     const acc = this.repo.get(accountId)
     if (!acc) return null
-    const revoke = /access token has been revoked|token has been revoked|oauth_revoked/i
+    const revoke = /access token has been revoked|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i
     const u = acc.unified || {}
     const lp = u.last_probe || acc.last_probe || null
     const fb = u.fable || null
