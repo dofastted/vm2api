@@ -62,19 +62,79 @@ export type { CragPlan, Presentation } from './crag-catalog'
 
 const shopRoot = '/api/panel/crag-shop'
 const hostRoot = '/api/panel/crag-subscription'
-const catalogIntervalMs = 25_000
-const catalogTimeoutMs = 12_000
+const catalogIntervalMs = 60_000
+const catalogTimeoutMs = 15_000
+const catalogFocusMinGapMs = 10_000
+const catalogCachePrefix = 'vm2api:crag-shop:catalog:v1:'
 type Catalog = {
   plans: CragPlan[]
   payment_methods: Method[]
   commerce?: CommerceRules
   presentation?: Presentation
   revision?: number
+  catalog_hash?: string
+  stale?: boolean
 }
+type CatalogResponse =
+  | Catalog
+  | {
+      unchanged: true
+      catalog_hash?: string
+      stale?: boolean
+    }
 type CatalogState =
   | { status: 'loading' }
   | { status: 'ready'; data: Catalog }
   | { status: 'error' }
+
+const isCatalogHash = (value: unknown): value is string =>
+  typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)
+
+function catalogStorageKey(device: boolean) {
+  return `${catalogCachePrefix}${device ? 'device' : 'panel'}`
+}
+
+function readCachedCatalog(device: boolean): Catalog | null {
+  try {
+    if (typeof localStorage === 'undefined') return null
+    const raw = localStorage.getItem(catalogStorageKey(device))
+    if (!raw) return null
+    const parsed = JSON.parse(raw) as unknown
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      Array.isArray(parsed) ||
+      !Array.isArray((parsed as Catalog).plans) ||
+      !Array.isArray((parsed as Catalog).payment_methods)
+    ) {
+      return null
+    }
+    return parsed as Catalog
+  } catch {
+    return null
+  }
+}
+
+function writeCachedCatalog(device: boolean, data: Catalog) {
+  try {
+    if (typeof localStorage === 'undefined') return
+    const { stale: _stale, ...snapshot } = data
+    localStorage.setItem(catalogStorageKey(device), JSON.stringify(snapshot))
+  } catch {
+    // Ignore storage quota or restricted browser mode failures.
+  }
+}
+
+function defaultPlanSku(data: Catalog): string | undefined {
+  const visiblePlans = data.plans.filter((plan) => plan.enabled !== false)
+  if (!visiblePlans.length && !data.commerce) return undefined
+  return (
+    visiblePlans.find((plan) => plan.remaining !== 0)?.sku ??
+    (data.commerce && data.commerce.custom_enabled !== false
+      ? 'custom'
+      : visiblePlans[0]?.sku)
+  )
+}
 type Order = {
   sku: string
   term: CragPlan['term'] | null
@@ -964,10 +1024,15 @@ function ShopOrders({
   const qc = useQueryClient()
   const request = device ? cragDeviceApi : api
   const root = device ? '' : shopRoot
+  const cachedCatalog = readCachedCatalog(device)
   const [applied, setApplied] = useState<string[]>([])
-  const [catalog, setCatalog] = useState<CatalogState>({ status: 'loading' })
+  const [catalog, setCatalog] = useState<CatalogState>(
+    cachedCatalog
+      ? { status: 'ready', data: cachedCatalog }
+      : { status: 'loading' }
+  )
   const [catalogRevision, setCatalogRevision] = useState(0)
-  const refreshCatalog = useRef<(() => void) | null>(null)
+  const refreshCatalog = useRef<((force?: boolean) => void) | null>(null)
   const [orders, setOrders] = useState<Order[]>()
   const [offset, setOffset] = useState(0)
   const [nextOffset, setNextOffset] = useState<number | null>(null)
@@ -975,7 +1040,9 @@ function ShopOrders({
   const [ordersFailed, setOrdersFailed] = useState(false)
   const [loading, setLoading] = useState(true)
   const [revision, refresh] = useState(0)
-  const [planSku, setPlanSku] = useState<string>()
+  const [planSku, setPlanSku] = useState<string | undefined>(
+    cachedCatalog ? defaultPlanSku(cachedCatalog) : undefined
+  )
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('')
   const [problem, setProblem] = useState('')
@@ -1029,51 +1096,92 @@ function ShopOrders({
 
   useEffect(() => {
     let active: { controller: AbortController; timeout: number } | undefined
+    const initial = readCachedCatalog(device)
+    let currentHash = isCatalogHash(initial?.catalog_hash)
+      ? initial.catalog_hash
+      : undefined
+    let hasReady = initial !== null
+    let lastCheckedAt = 0
 
-    function loadCatalog() {
+    function loadCatalog(force = false) {
       // Focus, interval and manual refresh share one bounded request.
       if (active) return
+      const now = Date.now()
+      if (
+        !force &&
+        hasReady &&
+        lastCheckedAt > 0 &&
+        now - lastCheckedAt < catalogFocusMinGapMs
+      ) {
+        return
+      }
       const controller = new AbortController()
       const timeout = window.setTimeout(() => {
         active = undefined
         controller.abort()
-        setCatalog({ status: 'error' })
+        setCatalog((current) =>
+          current.status === 'ready' ? current : { status: 'error' }
+        )
       }, catalogTimeoutMs)
       const catalogRequest = { controller, timeout }
       active = catalogRequest
 
-      void request<Catalog>(`${root}/plans`, {
+      const params = new URLSearchParams()
+      if (currentHash) params.set('hash', currentHash)
+      if (force) params.set('refresh', '1')
+      const suffix = params.toString() ? `?${params.toString()}` : ''
+
+      void request<CatalogResponse>(`${root}/plans${suffix}`, {
         signal: controller.signal,
         cache: 'no-store',
       })
         .then((data) => {
           if (active !== catalogRequest) return
+          lastCheckedAt = Date.now()
           if (
-            !Array.isArray(data?.plans) ||
-            !Array.isArray(data?.payment_methods)
+            data &&
+            typeof data === 'object' &&
+            'unchanged' in data &&
+            data.unchanged === true
           ) {
-            setCatalog({ status: 'error' })
+            if (isCatalogHash(data.catalog_hash)) {
+              currentHash = data.catalog_hash
+            }
             return
           }
-          setCatalog({ status: 'ready', data })
-          setCatalogRevision((current) => current + 1)
-          const visiblePlans = data.plans.filter(
-            (plan) => plan.enabled !== false
-          )
-          if (visiblePlans.length || data.commerce) {
-            // Keep the buyer's choice across refreshes, even while payment is closed.
-            setPlanSku(
-              (sku) =>
-                sku ??
-                visiblePlans.find((plan) => plan.remaining !== 0)?.sku ??
-                (data.commerce && data.commerce.custom_enabled !== false
-                  ? 'custom'
-                  : visiblePlans[0]?.sku)
+          const catalogData = data as Catalog
+          if (
+            !Array.isArray(catalogData?.plans) ||
+            !Array.isArray(catalogData?.payment_methods)
+          ) {
+            setCatalog((current) =>
+              current.status === 'ready' ? current : { status: 'error' }
             )
+            return
+          }
+          const nextHash = isCatalogHash(catalogData.catalog_hash)
+            ? catalogData.catalog_hash
+            : undefined
+          if (hasReady && nextHash && nextHash === currentHash) {
+            return
+          }
+          currentHash = nextHash
+          hasReady = true
+          writeCachedCatalog(device, catalogData)
+          setCatalog({ status: 'ready', data: catalogData })
+          setCatalogRevision((current) => current + 1)
+          const fallbackSku = defaultPlanSku(catalogData)
+          if (fallbackSku !== undefined) {
+            // Keep the buyer's choice across refreshes, even while payment is closed.
+            setPlanSku((sku) => sku ?? fallbackSku)
           }
         })
         .catch(() => {
-          if (active === catalogRequest) setCatalog({ status: 'error' })
+          if (active === catalogRequest) {
+            setCatalog((current) =>
+              current.status === 'ready' ? current : { status: 'error' }
+            )
+          }
         })
         .finally(() => {
           window.clearTimeout(timeout)
@@ -1082,18 +1190,25 @@ function ShopOrders({
     }
 
     function onVisible() {
-      if (document.visibilityState === 'visible') loadCatalog()
+      if (document.visibilityState === 'visible') loadCatalog(false)
     }
 
-    refreshCatalog.current = loadCatalog
-    loadCatalog()
-    const interval = window.setInterval(loadCatalog, catalogIntervalMs)
-    window.addEventListener('focus', loadCatalog)
+    function onFocus() {
+      loadCatalog(false)
+    }
+
+    refreshCatalog.current = (force = false) => loadCatalog(force)
+    loadCatalog(false)
+    const interval = window.setInterval(
+      () => loadCatalog(false),
+      catalogIntervalMs
+    )
+    window.addEventListener('focus', onFocus)
     document.addEventListener('visibilitychange', onVisible)
     return () => {
       refreshCatalog.current = null
       window.clearInterval(interval)
-      window.removeEventListener('focus', loadCatalog)
+      window.removeEventListener('focus', onFocus)
       document.removeEventListener('visibilitychange', onVisible)
       if (active) {
         window.clearTimeout(active.timeout)
@@ -1101,7 +1216,7 @@ function ShopOrders({
         active = undefined
       }
     }
-  }, [request, root])
+  }, [device, request, root])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -1315,7 +1430,7 @@ function ShopOrders({
             error.code === 'shop_activation_target_unavailable'
           )
             void targets.refetch()
-          refreshCatalog.current?.()
+          refreshCatalog.current?.(true)
           throw error
         })
         if (order.status === 'pending' && order.url && order.data) {
@@ -1709,7 +1824,7 @@ function ShopOrders({
                 type='button'
                 size='sm'
                 variant='ghost'
-                onClick={() => refreshCatalog.current?.()}
+                onClick={() => refreshCatalog.current?.(true)}
               >
                 刷新套餐
               </Button>

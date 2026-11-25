@@ -2309,6 +2309,15 @@ server.listen(cfg.port, cfg.host, () => {
       onLeaderStop(() => clearInterval(timer))
       expireOrders()
     }
+    if (process.env.KIN_CRS_MOCK !== '1' && typeof handleCragShop.warmPlans === 'function') {
+      const warmCatalog = () =>
+        void handleCragShop.warmPlans().catch(() => {
+          console.warn('[crag-shop] catalog cache warm deferred')
+        })
+      const timer = setInterval(warmCatalog, 5 * 60_000).unref()
+      onLeaderStop(() => clearInterval(timer))
+      warmCatalog()
+    }
     // Installation intent is durable; reconnecting nodes must not depend on a lost HTTP callback.
     if (process.env.KIN_CRS_MOCK !== '1') {
       let resuming = false
