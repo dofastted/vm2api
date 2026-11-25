@@ -1865,7 +1865,7 @@ export function createGeminiScheduler({
                 upstreamStatus: attemptUpstreamStatus,
                 errorScope,
                 action,
-                cooldownUntil: cooldownUntilMs > 0 ? new Date(cooldownUntilMs).toISOString() : null,
+                cooldownUntil: cooldownUntilMs > 0 ? Math.trunc(cooldownUntilMs) : null,
                 downstreamCommitted: emittedOutput,
                 terminalState: willFailover ? 'failed_retryable' : 'failed',
                 usage: error?.usage || null,
