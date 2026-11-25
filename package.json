@@ -12,15 +12,16 @@
     "test:e2e": "node scripts/run-isolated-tests.mjs test/e2e .e2e.test.mjs",
     "verify:oauth-egress": "node scripts/verify-oauth-egress.mjs",
     "test:node": "npm run test:unit",
-    "test:go": "cd worker && go test -race ./...",
+    "test:go": "cd worker && go test -race ./... && cd ../protofront && go test -race ./...",
     "test:all": "npm run test:unit && npm run test:go",
     "build:worker": "mkdir -p bin && cd worker && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-worker ./cmd/kin-worker",
     "build:egress": "mkdir -p bin && cd worker && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-egress ./cmd/kin-egress",
     "build:gate": "mkdir -p bin && cd worker && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-slot-gate ./cmd/kin-slot-gate",
+    "build:proto-front": "mkdir -p bin && cd protofront && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-proto-front ./cmd/kin-proto-front",
     "build:web": "pnpm -C web build",
     "fetch:payload": "node scripts/fetch-payload.mjs",
     "test:web": "pnpm -C web test",
-    "format": "biome format --write && gofmt -w worker && pnpm -C web format",
+    "format": "biome format --write && gofmt -w worker api-kernel redact protofront && pnpm -C web format",
     "format:check": "biome format && node scripts/check-gofmt.mjs && pnpm -C web format:check"
   },
   "dependencies": {

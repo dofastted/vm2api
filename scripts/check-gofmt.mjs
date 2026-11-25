@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 
 // Keep this list in sync with the CI gofmt step (.github/workflows/test.yml):
 // a local `npm run format:check` must catch what CI rejects.
-const DIRS = ['worker', 'api-kernel', 'redact']
+const DIRS = ['worker', 'api-kernel', 'redact', 'protofront']
 
 let files
 try {

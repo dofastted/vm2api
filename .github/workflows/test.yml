@@ -64,6 +64,7 @@ jobs:
               - 'worker/**'
               - 'api-kernel/**'
               - 'redact/**'
+              - 'protofront/**'
               - '.github/workflows/test.yml'
             web:
               - 'web/**'
@@ -122,7 +123,7 @@ jobs:
       - run: npm ci
         if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.oauth == 'true'
       - uses: actions/setup-go@v7
-        if: needs.changes.outputs.go == 'true' || inputs.full || contains(needs.changes.outputs.unit_tests, 'test/unit/egress.test.mjs')
+        if: needs.changes.outputs.go == 'true' || inputs.full || contains(needs.changes.outputs.unit_tests, 'test/unit/egress.test.mjs') || contains(needs.changes.outputs.unit_tests, 'test/unit/proto-front-sidecar.test.mjs')
         with:
           go-version: '1.25.x'
           cache-dependency-path: |
@@ -158,6 +159,10 @@ jobs:
           if [ "$FULL" = true ] || jq -e 'index("test/unit/egress.test.mjs") != null' <<< "$CHANGED_TESTS" >/dev/null; then
             (cd worker && CGO_ENABLED=0 go build -o ../bin/kin-egress ./cmd/kin-egress)
           fi
+          # proto-front-sidecar.test.mjs spawns the real sidecar from bin/kin-proto-front.
+          if [ "$FULL" = true ] || jq -e 'index("test/unit/proto-front-sidecar.test.mjs") != null' <<< "$CHANGED_TESTS" >/dev/null; then
+            (cd protofront && CGO_ENABLED=0 go build -o ../bin/kin-proto-front ./cmd/kin-proto-front)
+          fi
           if [ "$FULL" = true ]; then
             # Four workers for the four vCPUs a standard runner has. The suite is
             # 412 files and over a quarter of an hour one at a time.
@@ -176,6 +181,7 @@ jobs:
           (cd worker && go test ./...)
           (cd api-kernel && go test ./...)
           (cd redact && go test ./...)
+          (cd protofront && go test ./...)
       - uses: pnpm/action-setup@v6
         if: needs.changes.outputs.web == 'true'
         with:
@@ -218,7 +224,7 @@ jobs:
         if: inputs.full
         run: |
           npx biome format
-          test -z "$(gofmt -l worker api-kernel redact)" || { gofmt -l worker api-kernel redact; exit 1; }
+          test -z "$(gofmt -l worker api-kernel redact protofront)" || { gofmt -l worker api-kernel redact protofront; exit 1; }
           pnpm -C web format:check
 
   arm64-native-cli:

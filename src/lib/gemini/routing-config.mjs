@@ -7,6 +7,7 @@ export const GEMINI_STRATEGIES = Object.freeze(['balanced', 'fill', 'round_robin
 
 export const DEFAULT_GEMINI_ROUTING = Object.freeze({
   enabled: true,
+  official_passthrough: true,
   protocols: Object.freeze({
     'google.gemini': Object.freeze({ mode: 'native', enabled: true }),
     'anthropic.messages': Object.freeze({ mode: 'convert', enabled: true }),
@@ -86,6 +87,7 @@ export function validateGeminiRoutingPatch(body = {}) {
   const gem = asObject(body.gemini)
   if (!gem) throw typedError('gemini 必须是对象', 'invalid_gemini_routing')
   validateBoolean(gem, 'enabled', 'gemini', 'invalid_gemini_routing')
+  validateBoolean(gem, 'official_passthrough', 'gemini', 'invalid_gemini_routing')
 
   if (Object.hasOwn(gem, 'protocols') && gem.protocols !== undefined) {
     const protocols = asObject(gem.protocols)
@@ -131,10 +133,7 @@ export function validateGeminiRoutingPatch(body = {}) {
         throw typedError('gemini.pool.session_idle_ttl_secs 必须是 0 或 10 到 86400 之间的整数', 'invalid_gemini_pool')
       }
     }
-    if (
-      Object.hasOwn(pool, 'eligibility_probe_interval_secs') &&
-      pool.eligibility_probe_interval_secs !== undefined
-    ) {
+    if (Object.hasOwn(pool, 'eligibility_probe_interval_secs') && pool.eligibility_probe_interval_secs !== undefined) {
       const interval = pool.eligibility_probe_interval_secs
       if (
         typeof interval !== 'number' ||
@@ -220,15 +219,10 @@ export function normalizeGeminiRouting(raw = {}) {
   const maxSessions = clampInt(rawPool.max_sessions_per_account, 1, 64, defPool.max_sessions_per_account)
   const minWarm = Math.min(maxConc, clampInt(rawPool.min_warm_slots, 0, 16, defPool.min_warm_slots))
   const rawTtl = rawPool.session_idle_ttl_secs
-  const idleTtl =
-    rawTtl === 0
-      ? 0
-      : clampInt(rawTtl, 10, 86_400, defPool.session_idle_ttl_secs)
+  const idleTtl = rawTtl === 0 ? 0 : clampInt(rawTtl, 10, 86_400, defPool.session_idle_ttl_secs)
   const rawProbeInterval = rawPool.eligibility_probe_interval_secs
   const eligibilityProbeInterval =
-    rawProbeInterval === 0
-      ? 0
-      : clampInt(rawProbeInterval, 30, 3_600, defPool.eligibility_probe_interval_secs)
+    rawProbeInterval === 0 ? 0 : clampInt(rawProbeInterval, 30, 3_600, defPool.eligibility_probe_interval_secs)
   const pool = {
     strategy: GEMINI_STRATEGIES.includes(rawPool.strategy) ? rawPool.strategy : defPool.strategy,
     accounts_per_daemon: clampInt(rawPool.accounts_per_daemon, 1, 256, defPool.accounts_per_daemon),
@@ -272,6 +266,7 @@ export function normalizeGeminiRouting(raw = {}) {
 
   return {
     enabled: src.enabled !== false,
+    official_passthrough: src.official_passthrough !== false,
     protocols,
     pool,
     sticky,

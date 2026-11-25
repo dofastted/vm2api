@@ -203,6 +203,23 @@ export function OpenaiPane({
           <section className='min-w-0 space-y-2'>
             <h4 className='text-xs font-medium text-muted-foreground'>入口</h4>
             <div className='divide-y'>
+              <SettingRow
+                label='官方 Codex 请求体透传'
+                desc={
+                  codex.official_passthrough !== false
+                    ? '开：仅经校验的官方 Codex CLI /v1/responses 请求体走透传快路径（仍剥离身份字段并重建会话）；第三方与跨协议一律走 IR 归一化。'
+                    : '关：官方 Codex 客户端也强制走统一 IR 归一与字段裁剪，不透传原始请求体。'
+                }
+              >
+                <Switch
+                  checked={codex.official_passthrough !== false}
+                  disabled={saving}
+                  onCheckedChange={(official_passthrough) =>
+                    update({ official_passthrough })
+                  }
+                  aria-label='官方 Codex 请求体透传'
+                />
+              </SettingRow>
               <SettingRow label='/v1/responses' desc='ChatGPT native。'>
                 <Switch
                   checked={responsesOn}
