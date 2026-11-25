@@ -13,7 +13,7 @@ import subprocess
 import sys
 import threading
 import time
-from http.client import HTTPResponse
+from http.client import HTTPException, HTTPResponse
 from pathlib import Path
 
 MAX_BODY = 12 * 1024 * 1024
@@ -537,7 +537,7 @@ def open_worker_stream(
         return connection, response
     except NativeFailure:
         raise
-    except (OSError, TimeoutError):
+    except (OSError, TimeoutError, HTTPException):
         connection.close()
         raise NativeFailure("gemini_inference_failed", 502) from None
 
@@ -690,7 +690,7 @@ def run_request(request):
         if pending:
             raise NativeFailure("gemini_inference_invalid_output")
         return parse_sse(frames)
-    except (OSError, TimeoutError):
+    except (OSError, TimeoutError, HTTPException):
         raise NativeFailure("gemini_inference_failed") from None
     finally:
         connection.close()
