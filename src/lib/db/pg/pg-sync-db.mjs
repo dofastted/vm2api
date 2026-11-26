@@ -46,6 +46,8 @@ export class PgSyncDb {
     this._closed = false
     this._workerDead = false
     this._workerDeadReason = ''
+    this._staleDropped = 0
+    this._timeouts = 0
 
     if (this._worker) {
       const wakeDead = (reason) => {
@@ -84,6 +86,7 @@ export class PgSyncDb {
           { code: 'PG_SYNC_PROTOCOL_ERROR' },
         )
       }
+      this._staleDropped += 1
       envelope = receiveMessageOnPort(this._port)
     }
   }
@@ -110,6 +113,7 @@ export class PgSyncDb {
         const msg = envelope.message
         if (msg && typeof msg.id === 'number') {
           if (msg.id < id) {
+            this._staleDropped += 1
             envelope = receiveMessageOnPort(this._port)
             continue
           }
@@ -132,6 +136,7 @@ export class PgSyncDb {
 
       const remaining = deadline - Date.now()
       if (remaining <= 0) {
+        this._timeouts += 1
         if (op === 'begin') {
           // Best-effort async rollback so a late-completing BEGIN cannot leak state.txClient.
           try {
@@ -264,7 +269,13 @@ export class PgSyncDb {
 
   poolStats() {
     try {
-      return this._rpc('stats')
+      const stats = this._rpc('stats')
+      if (!stats || typeof stats !== 'object') return stats
+      return {
+        ...stats,
+        stale_dropped: this._staleDropped,
+        timeouts: this._timeouts,
+      }
     } catch {
       return null
     }

@@ -152,6 +152,34 @@ ensure_env
             self.assertIn("VM2API_DB_DRIVER=sqlite", env_text)
             self.assertNotIn("DATABASE_URL=postgresql://", env_text)
 
+    def test_local_database_url_and_redis_url_still_start_local_containers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".env.example").write_text("PORT=8787\n", encoding="utf-8")
+            (Path(tmp) / ".env").write_text(
+                "VM2API_DB_DRIVER=postgres\n"
+                "DATABASE_URL=postgresql://vm2api:secret@127.0.0.1:5432/vm2api?sslmode=disable\n"
+                "REDIS_URL=redis://:secret@localhost:6379/0\n"
+                "VM2API_REDIS_DISABLED=0\n",
+                encoding="utf-8",
+            )
+            trace = Path(tmp) / "compose.log"
+            body = f"""
+INSTALL_DIR="{tmp}"
+HOST_ARCH=amd64
+prepare_crag_host() {{ :; }}
+prepare_docker_crag_apparmor() {{ :; }}
+resolve_local_db_ports() {{ :; }}
+wait_health() {{ :; }}
+verify_db_runtime() {{ :; }}
+refresh_slot_services() {{ :; }}
+compose() {{ echo "$*" >> "{trace}"; return 0; }}
+start_stack
+"""
+            res = run_defs(body)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            calls = trace.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(calls, ["pull", "up -d"])
+
     def test_local_data_wires_docker_compose_local_yml(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / ".env.example").write_text("PORT=8787\n", encoding="utf-8")
@@ -288,6 +316,9 @@ class ReplaceDbToPgPreflightTests(unittest.TestCase):
             fake_bin = Path(tmp) / "bin"
             (root / "src" / "lib" / "db" / "pg").mkdir(parents=True)
             (root / "src" / "lib" / "db" / "pg" / "config.mjs").write_text("export {}\n", encoding="utf-8")
+            (root / "src" / "lib" / "db" / "pg" / "pg-sync-db.mjs").write_text(
+                "export const CODE = 'PG_SYNC_PROTOCOL_ERROR'\n", encoding="utf-8"
+            )
             (root / "data").mkdir(parents=True)
             (root / "data" / "kin.db").write_text("sqlite", encoding="utf-8")
             (root / "package.json").write_text('{"name":"vm2api","type":"module"}\n', encoding="utf-8")
@@ -333,6 +364,9 @@ class ReplaceDbToPgPreflightTests(unittest.TestCase):
             shutil.copy2(REPLACE_PG, isolated_script)
             (root / "src" / "lib" / "db" / "pg").mkdir(parents=True)
             (root / "src" / "lib" / "db" / "pg" / "config.mjs").write_text("export {}\n", encoding="utf-8")
+            (root / "src" / "lib" / "db" / "pg" / "pg-sync-db.mjs").write_text(
+                "export const CODE = 'PG_SYNC_PROTOCOL_ERROR'\n", encoding="utf-8"
+            )
             (root / "data").mkdir(parents=True)
             (root / "data" / "kin.db").write_text("sqlite", encoding="utf-8")
             fake_bin.mkdir()
@@ -409,6 +443,62 @@ exit 0
             self.assertIn(str(custom_db), res.stdout)
             self.assertIn("http://127.0.0.1:8788/health", res.stdout)
             self.assertIn("127.0.0.1:8788/health", curl_log.read_text(encoding="utf-8"))
+
+    def test_systemd_unsafe_pg_sync_db_aborts_before_stopping_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "app"
+            fake_bin = Path(tmp) / "bin"
+            (root / "src" / "lib" / "db" / "pg").mkdir(parents=True)
+            (root / "src" / "lib" / "db" / "pg" / "config.mjs").write_text("export {}\n", encoding="utf-8")
+            # Legacy pg-sync-db.mjs missing #1905 id-correlation fix
+            (root / "src" / "lib" / "db" / "pg" / "pg-sync-db.mjs").write_text(
+                "export class PgSyncDb {}\n", encoding="utf-8"
+            )
+            (root / "data").mkdir(parents=True)
+            (root / "data" / "kin.db").write_text("sqlite", encoding="utf-8")
+            fake_bin.mkdir()
+
+            stop_log = Path(tmp) / "systemctl.log"
+            make_exe(fake_bin / "systemctl", f'#!/usr/bin/env bash\necho "$*" >> "{stop_log}"\nexit 0\n')
+            for tool in ("curl", "openssl", "python3", "psql", "pg_dump", "pg_isready"):
+                make_exe(fake_bin / tool, "#!/usr/bin/env bash\nexit 0\n")
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            res = subprocess.run(
+                [
+                    "bash",
+                    str(REPLACE_PG),
+                    "--dir",
+                    str(root),
+                    "--mode",
+                    "systemd",
+                    "--database-url",
+                    "postgresql://u:p@127.0.0.1:5432/vm2api",
+                    "--no-redis",
+                    "--no-install-deps",
+                    "--yes",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("1.4.227", res.stderr + res.stdout)
+            calls = stop_log.read_text(encoding="utf-8").splitlines() if stop_log.exists() else []
+            mutating = [c for c in calls if c.split()[:1] in (["stop"], ["start"], ["restart"], ["daemon-reload"])]
+            self.assertEqual(mutating, [], f"must not stop service when pg-sync-db.mjs lacks #1905 fix: {mutating}")
+
+            status_res = subprocess.run(
+                ["bash", str(REPLACE_PG), "--dir", str(root), "--mode", "systemd", "--status"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(status_res.returncode, 0, status_res.stderr)
+            self.assertIn("UNSAFE", status_res.stdout)
 
 
 if __name__ == "__main__":

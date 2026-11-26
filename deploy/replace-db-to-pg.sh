@@ -664,11 +664,23 @@ ensure_host_migrator_script() {
   fi
 }
 
+verify_pg_sync_rpc_safety() {
+  local sync_file="${INSTALL_DIR}/src/lib/db/pg/pg-sync-db.mjs"
+  if [ ! -f "$sync_file" ] || ! grep -q 'PG_SYNC_PROTOCOL_ERROR' "$sync_file" 2>/dev/null; then
+    err "当前 ${INSTALL_DIR} 的 PostgreSQL 同步桥接层（src/lib/db/pg/pg-sync-db.mjs）缺少 #1905 RPC 关联修复（>= v1.4.227），在 Atomics.wait 虚假唤醒或超时后会发生永久查询错位！"
+    err "控制面尚未停止（零停机中止）。请先将控制面升级至 >= v1.4.227 再切换 PostgreSQL。"
+    return 1
+  fi
+}
+
 ensure_host_node_pg_deps() {
   local mode="$1"
-  if [ "$mode" = "systemd" ] && [ ! -f "${INSTALL_DIR}/src/lib/db/pg/config.mjs" ]; then
-    err "当前 ${INSTALL_DIR} 代码版本尚未包含 PostgreSQL 模块（缺少 src/lib/db/pg/config.mjs）。请先升级至支持 PostgreSQL 的版本再执行迁移！"
-    return 1
+  if [ "$mode" = "systemd" ]; then
+    if [ ! -f "${INSTALL_DIR}/src/lib/db/pg/config.mjs" ]; then
+      err "当前 ${INSTALL_DIR} 代码版本尚未包含 PostgreSQL 模块（缺少 src/lib/db/pg/config.mjs）。请先升级至支持 PostgreSQL 的版本再执行迁移！"
+      return 1
+    fi
+    verify_pg_sync_rpc_safety || return 1
   fi
 
   if ! command -v node >/dev/null 2>&1; then
@@ -712,22 +724,30 @@ ensure_host_node_pg_deps() {
 }
 
 verify_docker_migrator_image() {
-  local probe_js="import fs from 'node:fs'; if (!fs.existsSync('/opt/vm2api/scripts/migrate-sqlite-to-pg.mjs')) process.exit(2); await import('pg'); await import('ioredis'); await import('node:sqlite');"
-  info "校验 Docker 控制面镜像是否包含 PG 驱动（pg/ioredis）与迁移脚本..."
-  if compose_cmd run --rm --no-deps --entrypoint node "$SERVICE_NAME" -e "$probe_js" >/dev/null 2>&1; then
-    ok "Docker 控制面镜像 PG 迁移依赖校验通过"
+  local probe_js="import fs from 'node:fs'; if (!fs.existsSync('/opt/vm2api/scripts/migrate-sqlite-to-pg.mjs')) process.exit(2); const syncPath = '/opt/vm2api/src/lib/db/pg/pg-sync-db.mjs'; if (!fs.existsSync(syncPath) || !fs.readFileSync(syncPath, 'utf8').includes('PG_SYNC_PROTOCOL_ERROR')) process.exit(3); await import('pg'); await import('ioredis'); await import('node:sqlite');"
+  info "校验 Docker 控制面镜像是否包含 PG 驱动（pg/ioredis）、迁移脚本及 PgSyncDb 安全修复 (>= v1.4.227)..."
+  local rc=0
+  compose_cmd run --rm --no-deps --entrypoint node "$SERVICE_NAME" -e "$probe_js" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" = 0 ]; then
+    ok "Docker 控制面镜像 PG 迁移依赖与 PgSyncDb 安全门禁校验通过"
     return 0
   fi
   if [ "$AUTO_PULL" = 1 ]; then
-    warn "本地控制面镜像版本过旧（缺少 pg 或 migrate-sqlite-to-pg.mjs），尝试自动拉取最新镜像..."
+    warn "本地控制面镜像版本过旧（退出码 ${rc}：缺少 PG 依赖或 #1905 PgSyncDb 修复），尝试自动拉取最新镜像..."
     compose_cmd pull "$SERVICE_NAME"
-    if compose_cmd run --rm --no-deps --entrypoint node "$SERVICE_NAME" -e "$probe_js" >/dev/null 2>&1; then
-      ok "拉取新镜像后 PG 迁移依赖校验通过"
+    rc=0
+    compose_cmd run --rm --no-deps --entrypoint node "$SERVICE_NAME" -e "$probe_js" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" = 0 ]; then
+      ok "拉取新镜像后 PG 迁移依赖与 PgSyncDb 安全门禁校验通过"
       return 0
     fi
   fi
-  err "当前控制面镜像版本过旧，缺少 PostgreSQL 依赖（pg / ioredis）或 /opt/vm2api/scripts/migrate-sqlite-to-pg.mjs！"
-  err "控制面尚未停止（零停机中止）。请先升级控制面后再迁移："
+  if [ "$rc" = 3 ]; then
+    err "当前控制面镜像仍含旧版 PgSyncDb（缺少 #1905 RPC 关联修复，存在虚假唤醒/超时后永久查询错位风险）！"
+  else
+    err "当前控制面镜像版本过旧，缺少 PostgreSQL 依赖（pg / ioredis）或 /opt/vm2api/scripts/migrate-sqlite-to-pg.mjs！"
+  fi
+  err "控制面尚未停止（零停机中止）。请先升级控制面至 >= v1.4.227 后再迁移："
   info "  sudo bash ${INSTALL_DIR}/deploy/install.sh upgrade --auto-migrate"
   info "  或先执行: sudo bash ${INSTALL_DIR}/deploy/install.sh upgrade && sudo bash ${INSTALL_DIR}/deploy/replace-db-to-pg.sh"
   return 1
@@ -987,6 +1007,13 @@ show_status() {
   echo "DB 驱动:    ${driver:-auto}"
   echo "SQLite 文件: ${sqlite_file} ($([ -f "$sqlite_file" ] && ls -lh "$sqlite_file" | awk '{print $5}' || echo '不存在'))"
   echo "宿主依赖:   psql=$(command -v psql >/dev/null 2>&1 && echo ok || echo missing) pg_dump=$(command -v pg_dump >/dev/null 2>&1 && echo ok || echo missing) docker=$(command -v docker >/dev/null 2>&1 && echo ok || echo missing) node=$(command -v node >/dev/null 2>&1 && node -v || echo missing)"
+  if [ -f "${INSTALL_DIR}/src/lib/db/pg/pg-sync-db.mjs" ]; then
+    if grep -q 'PG_SYNC_PROTOCOL_ERROR' "${INSTALL_DIR}/src/lib/db/pg/pg-sync-db.mjs" 2>/dev/null; then
+      echo "PG 同步桥:  safe (已含 #1905 RPC 关联与虚假唤醒修复)"
+    else
+      echo "PG 同步桥:  UNSAFE (缺少 #1905 修复，请立即升级控制面至 >= v1.4.227)"
+    fi
+  fi
   if [ -f "$SYSTEMD_DROPIN_FILE" ]; then
     echo "Systemd PG: ${SYSTEMD_DROPIN_FILE} (已启用${SYSTEMD_PG_ENV_FILE:+, env=${SYSTEMD_PG_ENV_FILE}})"
   fi
@@ -1286,6 +1313,9 @@ start_local_pg_redis() {
           -c work_mem=16MB \
           -c maintenance_work_mem=128MB \
           -c wal_buffers=16MB \
+          -c checkpoint_completion_target=0.9 \
+          -c max_wal_size=1GB \
+          -c idle_in_transaction_session_timeout=60000 \
           -c random_page_cost=1.1
       else
         docker start "$PG_CONTAINER_NAME" >/dev/null
