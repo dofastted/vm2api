@@ -221,6 +221,7 @@ import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { formatPoolSelectionSummary } from '../pool/pool-scheduler.mjs'
 import { extraHeadersFromLimitError, isAccountQuotaExhausted } from '../pool/quota-window.mjs'
 import {
+  cragForeignThinkingMode,
   dropForeignThinkingForCrag,
   filterThinkingForAccount,
   recordThinkingOwners,
@@ -2356,19 +2357,26 @@ export function createHandleProtocol(deps) {
               // routing.compatibility.crag_drop_foreign_thinking (default off): signed
               // blocks this account did not mint (another account's, or never
               // recorded) never came from this kernel; drop them before the hop
-              // instead of waiting for the 400.
+              // instead of waiting for the 400. 'foreign_only' narrows that to
+              // blocks recorded against another account, so an incomplete record
+              // no longer costs the caller its own thinking.
+              const cragForeignMode = cragForeignThinkingMode(routingNow?.compatibility?.crag_drop_foreign_thinking)
               const cragOwned =
-                routingNow?.compatibility?.crag_drop_foreign_thinking === true
-                  ? dropForeignThinkingForCrag(source, selected.accountId, thinkingOwnerStore)
-                  : { body: source }
+                cragForeignMode === 'off'
+                  ? { body: source }
+                  : dropForeignThinkingForCrag(source, selected.accountId, thinkingOwnerStore, {
+                      mode: cragForeignMode,
+                    })
               source = cragOwned.body
               if (cragOwned.dropped || cragOwned.bailed) {
-                const { kept, dropped, droppedTurns, openLoop, thinkingOff, bailed } = cragOwned
+                const { kept, unknownKept, dropped, droppedTurns, openLoop, thinkingOff, bailed } = cragOwned
                 logBag.hop_meta = {
                   ...logBag.hop_meta,
                   thinking_owner_crag: {
                     account_id: selected.accountId,
+                    mode: cragForeignMode,
                     kept,
+                    unknown_kept: unknownKept,
                     dropped,
                     dropped_turns: droppedTurns,
                     open_loop: openLoop,

@@ -57,6 +57,65 @@ test('closed history: foreign and unknown blocks go, own stays, thinking stays o
   assert.equal(body.messages[1].content.length, 2)
 })
 
+test('foreign_only: unrecorded blocks stay, only another account goes', () => {
+  const body = {
+    thinking: { type: 'adaptive' },
+    messages: [
+      { role: 'user', content: 'a' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'x', signature: OTHER },
+          { type: 'text', text: 'one' },
+        ],
+      },
+      { role: 'user', content: 'b' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'y', signature: OWN },
+          { type: 'redacted_thinking', data: UNKNOWN },
+          { type: 'text', text: 'two' },
+        ],
+      },
+      { role: 'user', content: 'c' },
+    ],
+  }
+  const res = dropForeignThinkingForCrag(body, 'acct-a', seeded(), { mode: 'foreign_only' })
+  // Same body as the 'all' mode above: there the unrecorded block is dropped too
+  // (kept 1 / dropped 2); here it is kept, so only acct-b's block goes.
+  assert.equal(res.kept, 1)
+  assert.equal(res.unknownKept, 1)
+  assert.equal(res.dropped, 1)
+  assert.equal(res.openLoop, false)
+  assert.deepEqual(res.body.messages[1].content, [{ type: 'text', text: 'one' }])
+  assert.deepEqual(
+    res.body.messages[3].content.map((b) => b.type),
+    ['thinking', 'redacted_thinking', 'text'],
+  )
+  assert.equal(res.body.messages[3].content[1].data, UNKNOWN)
+})
+
+test('foreign_only: an all-unrecorded history comes back untouched', () => {
+  const body = {
+    messages: [
+      { role: 'user', content: 'a' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'x', signature: UNKNOWN },
+          { type: 'text', text: 'one' },
+        ],
+      },
+      { role: 'user', content: 'b' },
+    ],
+  }
+  const res = dropForeignThinkingForCrag(body, 'acct-a', seeded(), { mode: 'foreign_only' })
+  assert.equal(res.dropped, 0)
+  assert.equal(res.unknownKept, 1)
+  assert.equal(res.body, body)
+})
+
 test('all own: same body object back', () => {
   const body = {
     messages: [

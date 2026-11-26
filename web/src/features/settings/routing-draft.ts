@@ -7,6 +7,8 @@ import { SEAT_CAP_MAX } from '@/components/scheduler-viz'
 import { SETTINGS_TAB_LABELS, type SettingsTabId } from './navigation'
 import {
   cchEnabledFromCompat,
+  cragDropForeignThinkingFromCompat,
+  cragDropForeignThinkingToCompat,
   sessionIdleTtlFromInference,
   thinkingDisplayFromCompat,
 } from './protocol-authority'
@@ -405,6 +407,9 @@ export function buildRoutingSavePayload(
       official_cc_passthrough: compat.official_cc_passthrough === true,
       cch_enabled: cchEnabledFromCompat(compat),
       thinking_display: thinkingDisplayFromCompat(compat),
+      crag_drop_foreign_thinking: cragDropForeignThinkingToCompat(
+        cragDropForeignThinkingFromCompat(compat)
+      ),
     }
   }
   if (changedSections.has('inference')) {

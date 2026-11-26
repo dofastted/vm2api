@@ -167,6 +167,20 @@ function isThinkingBlock(block) {
   return block?.type === 'thinking' || block?.type === 'redacted_thinking'
 }
 
+/**
+ * `routing.compatibility.crag_drop_foreign_thinking` → what to drop.
+ *
+ * Three states, with the two historical ones byte-compatible: `true` keeps
+ * meaning "drop every block this account did not mint" and anything else that
+ * is not the middle value (including `false` and a missing key) stays off.
+ * @returns {'off'|'foreign_only'|'all'}
+ */
+export function cragForeignThinkingMode(value) {
+  if (value === true) return 'all'
+  if (value === 'foreign_only') return 'foreign_only'
+  return 'off'
+}
+
 function isPureToolResultTurn(message) {
   const content = Array.isArray(message?.content) ? message.content : null
   return !!content?.length && content.every((block) => block?.type === 'tool_result')
@@ -185,6 +199,16 @@ function isPureToolResultTurn(message) {
  * (a cleared table, sessions older than the record) drops the account's own
  * thinking and breaks the prompt cache.
  *
+ * `mode` picks what counts as droppable:
+ * - `'all'` (the `true` setting): every signed block this account did not mint,
+ *   including signatures with no record at all. What an incomplete record
+ *   mis-drops.
+ * - `'foreign_only'`: only blocks recorded against a *different* account. An
+ *   unrecorded signature stays, so a cleared table or a session older than the
+ *   record no longer costs the caller its own thinking or its prompt cache,
+ *   while a hop that really did inherit another account's reasoning is still
+ *   fixed before the 400.
+ *
  * - Only signed blocks this account did not mint go; its own stay byte-identical.
  * - A turn left with no blocks is dropped (it has no tool_use to orphan) unless it
  *   carries turn controls (output_config / clear_at); neighbours it leaves behind
@@ -194,10 +218,19 @@ function isPureToolResultTurn(message) {
  *   thinking is off for this hop: the shape signature repair already sends.
  * - A trailing assistant turn (prefill) carrying a foreign block is left alone.
  * - Without a reachable database the body goes unchanged.
- * @returns {{ body: object, kept: number, dropped: number, droppedTurns: number, openLoop: boolean, thinkingOff: boolean, bailed: string|null }}
+ * @returns {{ body: object, kept: number, unknownKept: number, dropped: number, droppedTurns: number, openLoop: boolean, thinkingOff: boolean, bailed: string|null }}
  */
-export function dropForeignThinkingForCrag(body, accountId, store = thinkingOwners) {
-  const counts = { kept: 0, dropped: 0, droppedTurns: 0, openLoop: false, thinkingOff: false, bailed: null }
+export function dropForeignThinkingForCrag(body, accountId, store = thinkingOwners, { mode = 'all' } = {}) {
+  const foreignOnly = mode === 'foreign_only'
+  const counts = {
+    kept: 0,
+    unknownKept: 0,
+    dropped: 0,
+    droppedTurns: 0,
+    openLoop: false,
+    thinkingOff: false,
+    bailed: null,
+  }
   const account = String(accountId || '')
   const messages = Array.isArray(body?.messages) ? body.messages : null
   if (!account || !messages?.length) return { body, ...counts }
@@ -223,8 +256,16 @@ export function dropForeignThinkingForCrag(body, accountId, store = thinkingOwne
     message.content.forEach((block, j) => {
       const key = thinkingSignatureKey(block)
       if (!key) return
-      if (owners.get(key) === account) {
+      const owner = owners.get(key)
+      if (owner === account) {
         counts.kept += 1
+        return
+      }
+      // foreign_only: no record is not proof of another account. Keep it and
+      // let the upstream 400 (plus the signature repair) handle the rare miss,
+      // rather than dropping the caller's own thinking on an incomplete table.
+      if (foreignOnly && owner == null) {
+        counts.unknownKept += 1
         return
       }
       foreign.add(j)
