@@ -72,7 +72,15 @@ const MAX_GATEWAY_CLOCK_MS = 86_400_000
 const CRAG_HEADER_ALLOWANCE_MS = 5_000
 const credentialRefreshTail = new Map()
 
-function withCredentialRefreshLock(key, fn) {
+/**
+ * Process-local per-key refresh serialization. Codex paths share the same lock
+ * (key = `codex:<vmId>`) so the panel refresh button, traffic-side quota
+ * rotation and the search path can never consume the same refresh token
+ * concurrently — the loser of a rotation race would otherwise replay a retired
+ * RT and clobber the winner's fresher ticket on the read-modify-write
+ * credential file.
+ */
+export function withCredentialRefreshLock(key, fn) {
   const prev = credentialRefreshTail.get(key) || Promise.resolve()
   let release
   const gate = new Promise((resolve) => {

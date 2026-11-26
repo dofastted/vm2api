@@ -76,6 +76,7 @@ import {
   resolveOutboundSessionId,
 } from '../identity/identity-rewrite.mjs'
 import { clientIp } from '../pool/sticky-router.mjs'
+import { withCredentialRefreshLock } from '../transport/go-worker-client.mjs'
 import { compileWithProtoFront, protoFrontMode, transcodeWithProtoFront } from '../transport/proto-front-client.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
@@ -1492,19 +1493,28 @@ function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl,
   if (!now.refresh) return ''
   let pending = searchRefreshes.get(vm.id)
   if (!pending) {
-    pending = (async () => {
-      const tok = await refresh({ refreshToken: now.refresh, proxyUrl, fetchImpl })
+    // 共锁（key=codex:<vmId>）且锁内重读：searchRefreshes 只去重本路径并发，
+    // 锁才挡与面板刷新/quota 轮换的跨路径竞争；等锁期间轮换出的新票直接采用。
+    pending = withCredentialRefreshLock(`codex:${vm.id}`, async () => {
+      const again = searchCredentials(projectRoot, vm)
+      if (again.access && again.access !== usedAccess) return again.access
+      const tok = await refresh({ refreshToken: again.refresh || now.refresh, proxyUrl, fetchImpl })
       // 吊销定论穿透共享缓存：并发等同一个 pending 的调用方都能看到 grant death。
       if (!tok?.ok && tok?.error === 'oauth_revoked') return `grant-dead:${tok.error}`
       if (!tok?.ok || !tok.access_token) return ''
+      const latest = readCodexAccounts(projectRoot, vm.id)[0] || {}
+      if (latest.refresh_token && latest.refresh_token !== (again.refresh || now.refresh)) {
+        // 并发方已轮换：直接采用其新票（本方结果作废，不覆盖写盘）。
+        return latest.access_token || tok.access_token
+      }
       upsertCodexAccount(projectRoot, vm.id, {
         access_token: tok.access_token,
-        refresh_token: tok.refresh_token || now.refresh,
-        id_token: tok.id_token || now.first.id_token,
-        expires_at: tok.expires_at || now.first.expires_at,
+        refresh_token: tok.refresh_token || again.refresh || now.refresh,
+        id_token: tok.id_token || latest.id_token || now.first.id_token,
+        expires_at: tok.expires_at || latest.expires_at || now.first.expires_at,
       })
       return tok.access_token
-    })().finally(() => searchRefreshes.delete(vm.id))
+    }).finally(() => searchRefreshes.delete(vm.id))
     searchRefreshes.set(vm.id, pending)
   }
   return pending
