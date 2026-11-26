@@ -7,6 +7,14 @@ import type { CragHostStatus } from './queries'
 /** 订单号形状，与授权服务对该列的 CHECK 一致。 */
 const validOrderId = (value: string) => /^[0-9a-zA-Z_-]{1,64}$/.test(value)
 
+/** 整机迁移归属凭证：原宿主机下任一订单号或 CRAGR1 兑换码。 */
+const validMigrationProof = (value: string) => {
+  const trimmed = value.trim()
+  return trimmed.startsWith('CRAGR1.')
+    ? trimmed.length > 7
+    : validOrderId(trimmed)
+}
+
 /** 64 位宿主机 ID 或 32 位 / 带连字符设备 UUID。 */
 const validHostOrUuid = (value: string) => {
   const trimmed = value.trim().toLowerCase()
@@ -26,7 +34,7 @@ export function CragDeviceIdentity({
   busy: boolean
   onUnbind: () => void
   onClaim: (orderId: string) => void
-  onMigrateHost?: (fromHostId: string) => void
+  onMigrateHost?: (fromHostId: string, proof: string) => void
 }) {
   const [confirming, setConfirming] = useState(false)
   const [claiming, setClaiming] = useState(false)
@@ -35,6 +43,7 @@ export function CragDeviceIdentity({
   )
   const [orderId, setOrderId] = useState('')
   const [fromHostId, setFromHostId] = useState('')
+  const [migrateProof, setMigrateProof] = useState('')
   const [copied, setCopied] = useState(false)
   const [copiedHost, setCopiedHost] = useState(false)
   const uuid = status?.device_uuid
@@ -43,9 +52,12 @@ export function CragDeviceIdentity({
   const retirable = status?.state === 'active' || status?.state === 'expired'
   const trimmedOrder = orderId.trim()
   const trimmedHost = fromHostId.trim()
+  const trimmedProof = migrateProof.trim()
   const useHostMode = Boolean(onMigrateHost) && migrateMode === 'host'
   const canSubmitMigration = useHostMode
-    ? validHostOrUuid(trimmedHost) && trimmedHost.toLowerCase() !== hostId
+    ? validHostOrUuid(trimmedHost) &&
+      trimmedHost.toLowerCase() !== hostId &&
+      validMigrationProof(trimmedProof)
     : validOrderId(trimmedOrder)
 
   return (
@@ -99,6 +111,7 @@ export function CragDeviceIdentity({
         onClick={() => {
           setOrderId('')
           setFromHostId('')
+          setMigrateProof('')
           setMigrateMode(onMigrateHost ? 'host' : 'order')
           setClaiming(true)
         }}
@@ -130,7 +143,7 @@ export function CragDeviceIdentity({
           if (!canSubmitMigration) return
           setClaiming(false)
           if (useHostMode && onMigrateHost) {
-            onMigrateHost(trimmedHost)
+            onMigrateHost(trimmedHost, trimmedProof)
           } else {
             onClaim(trimmedOrder)
           }
@@ -184,14 +197,24 @@ export function CragDeviceIdentity({
         }
       >
         {useHostMode ? (
-          <Input
-            value={fromHostId}
-            onChange={(event) => setFromHostId(event.target.value)}
-            placeholder='原宿主机 ID（64 位十六进制）或设备 UUID'
-            autoComplete='off'
-            spellCheck={false}
-            aria-label='原宿主机 ID'
-          />
+          <div className='space-y-2'>
+            <Input
+              value={fromHostId}
+              onChange={(event) => setFromHostId(event.target.value)}
+              placeholder='原宿主机 ID（64 位十六进制）或设备 UUID'
+              autoComplete='off'
+              spellCheck={false}
+              aria-label='原宿主机 ID'
+            />
+            <Input
+              value={migrateProof}
+              onChange={(event) => setMigrateProof(event.target.value)}
+              placeholder='归属验证：原宿主机任一订单号或 CRAGR1 兑换码'
+              autoComplete='off'
+              spellCheck={false}
+              aria-label='归属验证凭证'
+            />
+          </div>
         ) : (
           <Input
             value={orderId}

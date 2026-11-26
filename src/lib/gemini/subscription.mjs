@@ -530,16 +530,17 @@ export function createGeminiCragSubscription({
     let code = null
     let requestId = null
     try {
+      const headers = {
+        'content-type': 'application/json',
+        accept: 'application/json',
+      }
+      if (credential) headers.authorization = `Bearer ${credential}`
       const response = await fetchImpl(`${authorityOrigin}/v1/host-subscriptions/${action}`, {
         method: 'POST',
         redirect: 'error',
         cache: 'no-store',
         signal: AbortSignal.timeout(10_000),
-        headers: {
-          authorization: `Bearer ${credential}`,
-          'content-type': 'application/json',
-          accept: 'application/json',
-        },
+        headers,
         body: JSON.stringify({ host_id: hostId, ...body }),
       })
       status = response.status
@@ -671,20 +672,75 @@ export function createGeminiCragSubscription({
       local = null
     }
     const pendingSync = fs.existsSync(syncMarkerFile)
-    const cred = readOptionalFile(credentialFile, 128)?.trim()
-    if (!cred || !validVoucher(`CRAGR1.${cred}`)) {
+    const rawCred = readOptionalFile(credentialFile, 128)?.trim()
+    let cred = rawCred && validVoucher(`CRAGR1.${rawCred}`) ? rawCred : null
+
+    // Bootstrap path: no local entitlement and no pending sync. Probe Authority by
+    // host_id (with optional credential) so direct-credited or admin-migrated
+    // CRAGGemini hosts automatically pull their signed CRAGH2 entitlement and bind
+    // a random local device credential on first sync.
+    if (!local && !pendingSync) {
+      try {
+        const data = await callAuthority('status', hostId, cred, {})
+        if (typeof data?.entitlement === 'string' && data.entitlement.trim()) {
+          const trimmed = data.entitlement.trim()
+          const nextClaims = verifyCragGeminiHostEntitlement(trimmed, hostId, authority.publicKey, {
+            allowExpired: true,
+          })
+          ensureStorage()
+          resolveHostId(true)
+          publishFile(entitlementFile, `${trimmed}\n`, 0o644)
+          local = { hostId, code: trimmed, claims: nextClaims }
+          if (!cred) {
+            cred = resolveCredential(hostId, true)
+            await callAuthority('recover', hostId, cred, { entitlement: trimmed }).catch(() => {})
+          }
+          return { hostId, local, remote: data, clearedOrphan: false }
+        }
+        return { hostId, local: null, remote: null, clearedOrphan: false }
+      } catch (error) {
+        if (
+          error?.code === 'not_found' ||
+          error?.code === 'auth_forbidden' ||
+          error?.code === 'host_subscription_inactive'
+        ) {
+          return { hostId, local: null, remote: null, clearedOrphan: false }
+        }
+        throw error
+      }
+    }
+
+    if (!cred) {
       if (pendingSync && !local) {
         removeFile(syncMarkerFile)
         autoBindBackoff.clear()
         return { hostId, local: null, remote: null, clearedOrphan: true }
       }
-      return { hostId, local, remote: null, clearedOrphan: false }
+      if (local) {
+        // Local signed entitlement survived without a local credential: self-recover.
+        cred = resolveCredential(hostId, true)
+        try {
+          await callAuthority('recover', hostId, cred, { entitlement: local.code })
+        } catch {
+          return { hostId, local, remote: null, clearedOrphan: false }
+        }
+      } else {
+        return { hostId, local, remote: null, clearedOrphan: false }
+      }
     }
-    if (!local && !pendingSync) {
-      return { hostId, local: null, remote: null, clearedOrphan: false }
-    }
+
     try {
-      const data = await callAuthority('status', hostId, cred, {})
+      let data
+      try {
+        data = await callAuthority('status', hostId, cred, {})
+      } catch (error) {
+        if (error?.code === 'auth_forbidden' && local) {
+          await callAuthority('recover', hostId, cred, { entitlement: local.code })
+          data = await callAuthority('status', hostId, cred, {})
+        } else {
+          throw error
+        }
+      }
       if (typeof data?.entitlement === 'string' && data.entitlement.trim()) {
         const trimmed = data.entitlement.trim()
         const nextClaims = verifyCragGeminiHostEntitlement(trimmed, hostId, authority.publicKey, {

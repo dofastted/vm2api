@@ -1285,7 +1285,9 @@ export function createCragShopHandler({
       if (route === 'apply') {
         if (row.activation_phase === 'active') return ok(project(row))
         const receipt = deriveOrderReceipt(receiptKey(db), row.order_id)
-        const remote = row.status === 'fulfilled' ? null : await supplier.status(row, receipt)
+        // Always consult supplier status when no voucher digest is recorded yet so an already-
+        // fulfilled direct-credit order syncs host rights instead of falling through to /claim.
+        const remote = row.status === 'fulfilled' && row.redemption_sha256 ? null : await supplier.status(row, receipt)
         const current = remote ? reflectOrder(db, owner, remote) : row
         if (current.status !== 'fulfilled')
           throw failure(409, 'shop_claim_not_ready', 'The CRAG shop order has not been fulfilled')
@@ -1379,7 +1381,22 @@ export function createCragShopHandler({
         return ok({ ...project(current), ...(current.status === 'pending' && form ? form : {}) })
       }
       if (route === 'claim' || route === 'apply-renewal') {
-        if (row.status === 'reserved') reflectOrder(db, owner, await supplier.status(row, receipt))
+        let remote = null
+        if (row.status === 'reserved' || !row.redemption_sha256) {
+          remote = await supplier.status(row, receipt)
+          row = reflectOrder(db, owner, remote)
+        }
+        if (remote?.direct_credit === true) {
+          if (row.status !== 'fulfilled')
+            throw failure(409, 'shop_claim_not_ready', 'The CRAG shop order has not been fulfilled')
+          await syncDirectCredit(db, owner, row, remote)
+          if (route === 'apply-renewal') return ok(await subscription.status())
+          throw failure(
+            409,
+            'shop_direct_credit_no_voucher',
+            'This order was credited directly to your host subscription and does not issue a separate voucher code.',
+          )
+        }
         const result = await supplier.claim(row, receipt)
         let hostStatus
         if (route === 'apply-renewal') {

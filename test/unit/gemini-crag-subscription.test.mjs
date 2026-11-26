@@ -1628,3 +1628,91 @@ test('createGeminiCragSubscription.recover() reconciles stale sync-pending and a
   assert.deepEqual(res.boundIds, ['gemini-mismatch-1'])
   assert.ok(activatedCode?.startsWith('CRAGS1.'))
 })
+
+test('createGeminiCragSubscription status({ sync: true }) bootstraps direct-credited entitlement and binds local credential', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-direct-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const now = Math.floor(Date.now() / 1000)
+  const machineIdPath = path.join(root, 'machine-id')
+  fs.writeFileSync(machineIdPath, '55555555555555555555555555555555\n')
+
+  let statusCalls = 0
+  let recoverCalls = 0
+  let boundCredential = null
+  const fetchImpl = async (url, options) => {
+    const action = url.split('/').pop()
+    const body = JSON.parse(options.body)
+    const auth = options.headers?.authorization || null
+    const h2 = signToken(authority, 'CRAGH2', {
+      version: 2,
+      product: CRAG_GEMINI_PRODUCT,
+      host_id: body.host_id,
+      revision: 1,
+      issued_at: now - 60,
+      expires_at: now + 86400,
+      slot_limit: 3,
+      roster: [],
+    })
+    if (action === 'status') {
+      statusCalls += 1
+      if (boundCredential && auth !== boundCredential) {
+        return new Response(JSON.stringify({ ok: false, error: { code: 'auth_forbidden' } }), {
+          status: 403,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          data: { entitlement: h2, revision: 1, slot_limit: 3, used_slots: 0, available_slots: 3 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    if (action === 'recover') {
+      recoverCalls += 1
+      assert.ok(auth?.startsWith('Bearer '))
+      assert.equal(body.entitlement, h2)
+      boundCredential = auth
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          data: { entitlement: h2, revision: 1, slot_limit: 3, used_slots: 0, available_slots: 3 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    throw new Error(`unexpected action: ${action}`)
+  }
+
+  const sub = createGeminiCragSubscription({
+    projectRoot: root,
+    dataDir: path.join(root, 'data'),
+    resolveAuthority: () => ({
+      product: CRAG_GEMINI_PRODUCT,
+      publicKey: authority.publicKey,
+      publicKeyBytes: authority.publicBytes,
+      issuerId: authority.issuerId,
+      payloadKeyId: authority.payloadKeyId,
+    }),
+    callHost: async () => ({}),
+    fetchImpl,
+    origin: 'http://127.0.0.1:18790',
+    machineIdFile: machineIdPath,
+  })
+
+  // Fresh host with no local credential or entitlement pulls direct-credited CRAGH2 and binds credential.
+  const synced = await sub.status({ sync: true })
+  assert.equal(synced.active, true)
+  assert.equal(synced.slot_limit, 3)
+  assert.equal(statusCalls, 1)
+  assert.equal(recoverCalls, 1)
+  assert.ok(boundCredential)
+
+  // Subsequent sync uses the bound credential cleanly.
+  const again = await sub.status({ sync: true })
+  assert.equal(again.active, true)
+  assert.equal(statusCalls, 2)
+  assert.equal(recoverCalls, 1)
+})
