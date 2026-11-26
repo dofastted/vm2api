@@ -112,9 +112,10 @@ func ApplyClaudeCRAG(req *ir.Request, decision detect.Decision, settings detect.
 	}
 
 	if decision.AllowPassthrough {
-		// Official passthrough: validate cache breakpoints (max 4, 1h before 5m, none on thinking)
-		// without mutating caller system, omitted TTLs, or thinking chains.
-		return ValidateAnthropicCacheBreakpoints(req)
+		// Official passthrough: preserve valid caller system, omitted TTLs, and thinking chains,
+		// while auto-repairing non-conforming cache breakpoints (max 4, 1h before 5m, none on thinking).
+		RepairAnthropicCacheBreakpoints(req)
+		return nil
 	}
 
 	// Non-passthrough: strip caller billing headers, duplicate CLI identity, and stabilize volatile budget counters.
@@ -197,7 +198,8 @@ func ApplyClaudeCRAG(req *ir.Request, decision detect.Decision, settings detect.
 	if fold {
 		req.Messages = foldHistorySystemMessages(req.Messages)
 	}
-	return ValidateAnthropicCacheBreakpoints(req)
+	RepairAnthropicCacheBreakpoints(req)
+	return nil
 }
 
 func foldHistorySystemMessages(msgs []ir.Message) []ir.Message {
@@ -253,79 +255,310 @@ func foldHistorySystemMessages(msgs []ir.Message) []ir.Message {
 	return out
 }
 
-// ValidateAnthropicCacheBreakpoints enforces the exact Anthropic/CRAG 4-breakpoint and 1h-before-5m contract.
-func ValidateAnthropicCacheBreakpoints(req *ir.Request) error {
-	count := 0
+func normalizeCacheTTLOrDefault(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "5m", "5min", "300":
+		return "5m"
+	case "1h", "1hr", "60m", "3600", "hour", "1hour", "default":
+		return "1h"
+	default:
+		return "1h"
+	}
+}
+
+type cacheSlot struct {
+	section string
+	clear   func()
+	getTTL  func() (string, bool)
+	setTTL  func(string)
+}
+
+// repairCacheSlots enforces the shared Anthropic/CRAG breakpoint budget (<= max,
+// sacrificing nested -> stale messages (>2) -> tools -> system -> active messages)
+// and monotonic TTL ordering (1h before 5m/omitted).
+func repairCacheSlots(slots []cacheSlot, max int) bool {
+	changed := false
+	if len(slots) > max {
+		var nested, tools, system, messages, root []cacheSlot
+		for _, s := range slots {
+			switch s.section {
+			case "nested":
+				nested = append(nested, s)
+			case "tools":
+				tools = append(tools, s)
+			case "system":
+				system = append(system, s)
+			case "messages":
+				messages = append(messages, s)
+			case "body":
+				root = append(root, s)
+			}
+		}
+		msgTail := append(messages, root...)
+		keepCutoff := len(msgTail) - 2
+		if keepCutoff < 0 {
+			keepCutoff = 0
+		}
+		dropOrder := make([]cacheSlot, 0, len(slots))
+		dropOrder = append(dropOrder, nested...)
+		dropOrder = append(dropOrder, msgTail[:keepCutoff]...)
+		dropOrder = append(dropOrder, tools...)
+		dropOrder = append(dropOrder, system...)
+		dropOrder = append(dropOrder, msgTail[keepCutoff:]...)
+		excess := len(slots) - max
+		for i := 0; i < excess && i < len(dropOrder); i++ {
+			dropOrder[i].clear()
+			changed = true
+		}
+	}
+
 	sawShort := false
-	visit := func(cc *ir.CacheControl, param string) error {
-		if cc == nil {
-			return nil
+	for _, s := range slots {
+		ttl, alive := s.getTTL()
+		if !alive {
+			continue
 		}
-		if cc.Type != "ephemeral" || (cc.TTL != "" && cc.TTL != "5m" && cc.TTL != "1h") {
-			return &ir.ProtocolError{
-				Status:  400,
-				Code:    "invalid_cache_control",
-				Type:    "invalid_request_error",
-				Param:   param,
-				Message: "Cache control must be ephemeral with an optional 5m or 1h TTL.",
-			}
+		if sawShort && ttl == "1h" {
+			s.setTTL("5m")
+			ttl = "5m"
+			changed = true
 		}
-		if sawShort && cc.TTL == "1h" {
-			return &ir.ProtocolError{
-				Status:  400,
-				Code:    "invalid_cache_control",
-				Type:    "invalid_request_error",
-				Param:   param,
-				Message: "Cache TTL must place 1h before 5m (including missing TTL).",
-			}
-		}
-		if cc.TTL != "1h" {
+		if ttl != "1h" {
 			sawShort = true
 		}
-		count++
-		if count > 4 {
-			return &ir.ProtocolError{
-				Status:  400,
-				Code:    "invalid_cache_control",
-				Type:    "invalid_request_error",
-				Param:   param,
-				Message: "Cache control exceeds four breakpoints.",
-			}
-		}
-		return nil
 	}
-	for i, t := range req.Tools {
-		if err := visit(t.CacheControl, fmt.Sprintf("tools[%d].cache_control", i)); err != nil {
-			return err
-		}
+	return changed
+}
+
+// RepairAnthropicCacheBreakpoints auto-repairs non-conforming cache_control markers
+// in-place (stripping thinking/malformed markers, trimming >4 breakpoints while
+// retaining active message anchors and tail system/tool anchors, and fixing any
+// 5m/omitted -> 1h TTL inversion). Returns true when any mutation occurred.
+func RepairAnthropicCacheBreakpoints(req *ir.Request) bool {
+	if req == nil {
+		return false
 	}
-	for i, sb := range req.System {
-		if err := visit(sb.CacheControl, fmt.Sprintf("system[%d].cache_control", i)); err != nil {
-			return err
+	changed := false
+	cleanCC := func(cc *ir.CacheControl) (*ir.CacheControl, bool) {
+		if cc == nil {
+			return nil, false
 		}
+		if cc.Type != "ephemeral" {
+			return nil, true
+		}
+		if cc.TTL != "" && cc.TTL != "5m" && cc.TTL != "1h" {
+			cc.TTL = normalizeCacheTTLOrDefault(cc.TTL)
+			return cc, true
+		}
+		return cc, false
 	}
-	for i, m := range req.Messages {
-		for j, p := range m.Parts {
-			if (p.Kind == ir.PartThinking || p.Kind == ir.PartRedactedThinking) && p.CacheControl != nil {
-				return &ir.ProtocolError{
-					Status:  400,
-					Code:    "invalid_cache_control",
-					Type:    "invalid_request_error",
-					Param:   fmt.Sprintf("messages[%d].content[%d].cache_control", i, j),
-					Message: "Thinking blocks cannot carry cache_control.",
+	irSlot := func(section string, ref **ir.CacheControl) cacheSlot {
+		return cacheSlot{
+			section: section,
+			clear:   func() { *ref = nil },
+			getTTL: func() (string, bool) {
+				if *ref == nil {
+					return "", false
 				}
-			}
-			if err := visit(p.CacheControl, fmt.Sprintf("messages[%d].content[%d].cache_control", i, j)); err != nil {
-				return err
-			}
+				return (*ref).TTL, true
+			},
+			setTTL: func(ttl string) {
+				if *ref != nil {
+					(*ref).TTL = ttl
+				}
+			},
 		}
+	}
+
+	var slots []cacheSlot
+	var walkParts func(parts []ir.Part, nested bool)
+	walkParts = func(parts []ir.Part, nested bool) {
+		for idx := range parts {
+			p := &parts[idx]
+			if len(p.ResultParts) > 0 {
+				walkParts(p.ResultParts, true)
+			}
+			if p.CacheControl == nil {
+				continue
+			}
+			if p.Kind == ir.PartThinking || p.Kind == ir.PartRedactedThinking {
+				p.CacheControl = nil
+				changed = true
+				continue
+			}
+			cc, mod := cleanCC(p.CacheControl)
+			if mod {
+				changed = true
+			}
+			p.CacheControl = cc
+			if p.CacheControl == nil {
+				continue
+			}
+			section := "messages"
+			if nested {
+				section = "nested"
+			}
+			slots = append(slots, irSlot(section, &p.CacheControl))
+		}
+	}
+
+	for i := range req.Tools {
+		if req.Tools[i].CacheControl == nil {
+			continue
+		}
+		cc, mod := cleanCC(req.Tools[i].CacheControl)
+		if mod {
+			changed = true
+		}
+		req.Tools[i].CacheControl = cc
+		if req.Tools[i].CacheControl != nil {
+			slots = append(slots, irSlot("tools", &req.Tools[i].CacheControl))
+		}
+	}
+	for i := range req.System {
+		if req.System[i].CacheControl == nil {
+			continue
+		}
+		cc, mod := cleanCC(req.System[i].CacheControl)
+		if mod {
+			changed = true
+		}
+		req.System[i].CacheControl = cc
+		if req.System[i].CacheControl != nil {
+			slots = append(slots, irSlot("system", &req.System[i].CacheControl))
+		}
+	}
+	for i := range req.Messages {
+		walkParts(req.Messages[i].Parts, false)
 	}
 	if req.AutomaticCacheControl != nil {
-		if err := visit(req.AutomaticCacheControl, "cache_control"); err != nil {
-			return err
+		cc, mod := cleanCC(req.AutomaticCacheControl)
+		if mod {
+			changed = true
+		}
+		req.AutomaticCacheControl = cc
+		if req.AutomaticCacheControl != nil {
+			slots = append(slots, irSlot("body", &req.AutomaticCacheControl))
 		}
 	}
-	return nil
+
+	return repairCacheSlots(slots, 4) || changed
+}
+
+// RepairAnthropicMapCacheBreakpoints applies the same cache_control auto-repair
+// directly to a raw Anthropic JSON body map (used when passthrough clones req.Body).
+func RepairAnthropicMapCacheBreakpoints(body map[string]any) bool {
+	if body == nil {
+		return false
+	}
+	changed := false
+	cleanNode := func(node map[string]any, isThinking bool) bool {
+		raw, exists := node["cache_control"]
+		if !exists {
+			return false
+		}
+		if isThinking || raw == nil {
+			delete(node, "cache_control")
+			changed = true
+			return false
+		}
+		cc, ok := raw.(map[string]any)
+		if !ok {
+			delete(node, "cache_control")
+			changed = true
+			return false
+		}
+		typ, _ := cc["type"].(string)
+		if typ != "ephemeral" {
+			delete(node, "cache_control")
+			changed = true
+			return false
+		}
+		if rawTTL, hasTTL := cc["ttl"]; hasTTL && rawTTL != nil {
+			ttlStr, okStr := rawTTL.(string)
+			trimmed := strings.TrimSpace(ttlStr)
+			if !okStr || trimmed == "" {
+				delete(cc, "ttl")
+				changed = true
+			} else if trimmed != "5m" && trimmed != "1h" {
+				cc["ttl"] = normalizeCacheTTLOrDefault(trimmed)
+				changed = true
+			} else if ttlStr != trimmed {
+				cc["ttl"] = trimmed
+				changed = true
+			}
+		}
+		return true
+	}
+	mapSlot := func(section string, holder map[string]any) cacheSlot {
+		return cacheSlot{
+			section: section,
+			clear:   func() { delete(holder, "cache_control") },
+			getTTL: func() (string, bool) {
+				cc, ok := holder["cache_control"].(map[string]any)
+				if !ok || cc == nil {
+					return "", false
+				}
+				ttl, _ := cc["ttl"].(string)
+				return ttl, true
+			},
+			setTTL: func(ttl string) {
+				if cc, ok := holder["cache_control"].(map[string]any); ok && cc != nil {
+					cc["ttl"] = ttl
+				}
+			},
+		}
+	}
+
+	var slots []cacheSlot
+	var walkBlocks func(items []any, section string)
+	walkBlocks = func(items []any, section string) {
+		for _, item := range items {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if nested, ok := m["content"].([]any); ok {
+				walkBlocks(nested, "nested")
+			}
+			typ, _ := m["type"].(string)
+			isThink := typ == "thinking" || typ == "redacted_thinking"
+			if cleanNode(m, isThink) {
+				slots = append(slots, mapSlot(section, m))
+			}
+		}
+	}
+	if tools, ok := body["tools"].([]any); ok {
+		for _, item := range tools {
+			if m, ok := item.(map[string]any); ok && cleanNode(m, false) {
+				slots = append(slots, mapSlot("tools", m))
+			}
+		}
+	}
+	if sys, ok := body["system"].([]any); ok {
+		walkBlocks(sys, "system")
+	}
+	if cragPrompt, ok := body["crag_prompt"].(map[string]any); ok {
+		if blocks, ok := cragPrompt["blocks"].([]any); ok {
+			walkBlocks(blocks, "system")
+		}
+	}
+	if msgs, ok := body["messages"].([]any); ok {
+		for _, item := range msgs {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if content, ok := m["content"].([]any); ok {
+				walkBlocks(content, "messages")
+			}
+		}
+	}
+	if cleanNode(body, false) {
+		slots = append(slots, mapSlot("body", body))
+	}
+
+	return repairCacheSlots(slots, 4) || changed
 }
 
 // --- 2. Gemini CRAGGemini (agy) Anti-Collision Normalizer ---

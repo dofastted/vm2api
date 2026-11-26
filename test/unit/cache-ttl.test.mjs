@@ -13,6 +13,8 @@ import {
   validateCacheBreakpoints,
   normalizeCacheTtl,
   pinConversationCacheTtl,
+  removeCacheControlFields,
+  repairCacheBreakpoints,
   resolveCacheTtl,
   stripIllegalCacheControlFields,
   normalizeCacheTtlToBody,
@@ -447,4 +449,115 @@ test('materializeAutomaticCache defers to an explicit tail marker', () => {
   // The tail already caches the whole eligible prefix; the root marker just goes.
   assert.equal('cache_control' in out, false)
   assert.deepEqual(out.messages[0].content[0].cache_control, explicit)
+})
+
+test('repairCacheBreakpoints is a zero-copy no-op on already valid bodies', () => {
+  const valid = {
+    model: 'claude-opus-5-5',
+    tools: [{ name: 'Read', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' } }],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '5m' } }] },
+    ],
+  }
+  assert.strictEqual(repairCacheBreakpoints(valid), valid)
+})
+
+test('repairCacheBreakpoints strips thinking/malformed markers, trims >4 keeping active anchors, and fixes TTL order', () => {
+  const input = {
+    model: 'claude-opus-5-5',
+    tools: [{ name: 'Read', cache_control: { type: 'ephemeral', ttl: '5m' } }],
+    system: [
+      { type: 'text', text: 's1', cache_control: { type: 'ephemeral', ttl: '1h' } },
+      { type: 'text', text: 's2', cache_control: { type: 'bogus' } },
+    ],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'old1', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 't', signature: 'sig', cache_control: { type: 'ephemeral' } },
+          { type: 'redacted_thinking', data: 'r', cache_control: { type: 'ephemeral' } },
+        ],
+      },
+      { role: 'user', content: [{ type: 'text', text: 'old2', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+      { role: 'user', content: [{ type: 'text', text: 'mid', cache_control: { type: 'ephemeral', ttl: 'bad' } }] },
+      { role: 'user', content: [{ type: 'text', text: 'tail', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+    ],
+  }
+  const before = structuredClone(input)
+  const out = repairCacheBreakpoints(input, { limit: 4, fallbackTtl: '1h' })
+  assert.deepEqual(input, before)
+  assert.doesNotThrow(() => validateCacheBreakpoints(out))
+  assert.equal(out.system[1].cache_control, undefined)
+  assert.equal(out.messages[1].content[0].cache_control, undefined)
+  assert.equal(out.messages[1].content[1].cache_control, undefined)
+  // Stale old1 and old2 dropped first; tools[0], system[0], mid, tail survive (4 total), all <= 5m after tools[0]=5m.
+  assert.equal(out.messages[0].content[0].cache_control, undefined)
+  assert.equal(out.messages[2].content[0].cache_control, undefined)
+  assert.deepEqual(out.tools[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(out.messages[3].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(out.messages[4].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+})
+
+test('removeCacheControlFields strips nested tool_result.content and crag_prompt.blocks markers', () => {
+  const input = {
+    cache_control: { type: 'ephemeral' },
+    tools: [{ name: 'Read', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    crag_prompt: {
+      mode: 'replace',
+      text: 'sys',
+      blocks: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    },
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_1',
+            cache_control: { type: 'ephemeral', ttl: '5m' },
+            content: [{ type: 'text', text: 'nested', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+          },
+        ],
+      },
+    ],
+  }
+  const cleared = removeCacheControlFields(input)
+  assert.equal(cleared.cache_control, undefined)
+  assert.equal(cleared.tools[0].cache_control, undefined)
+  assert.equal(cleared.system[0].cache_control, undefined)
+  assert.equal(cleared.crag_prompt.blocks[0].cache_control, undefined)
+  assert.equal(cleared.messages[0].content[0].cache_control, undefined)
+  assert.equal(cleared.messages[0].content[0].content[0].cache_control, undefined)
+})
+
+test('normalizeCacheTtl honors custom fallback and stripIllegalCacheControlFields covers nested tool_result & crag_prompt', () => {
+  assert.equal(normalizeCacheTtl('bogus', '5m'), '5m')
+  assert.equal(normalizeCacheTtl('', '5m'), '5m')
+  assert.equal(normalizeCacheTtl('60m', '5m'), '1h')
+  const stripped = stripIllegalCacheControlFields({
+    crag_prompt: {
+      mode: 'replace',
+      blocks: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' } }],
+    },
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_nested',
+            content: [
+              { type: 'text', text: 'nested', cache_control: { type: 'ephemeral', ttl: '5m', scope: 'global' } },
+            ],
+          },
+        ],
+      },
+    ],
+  })
+  assert.deepEqual(stripped.crag_prompt.blocks[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.deepEqual(stripped.messages[0].content[0].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
 })

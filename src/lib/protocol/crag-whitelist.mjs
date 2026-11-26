@@ -8,12 +8,17 @@
  * into CRAG or Anthropic upstream.
  */
 import { CRS_OFFICIAL_CLI_SYSTEM } from '../identity/crs-persona.mjs'
-import { materializeAutomaticCache } from './cache-ttl.mjs'
+import {
+  DEFAULT_CACHE_TTL,
+  isCleanCacheControl,
+  materializeAutomaticCache,
+  normalizeCacheControlObject,
+  repairCacheBreakpoints,
+} from './cache-ttl.mjs'
 import { isEmptyEffortValue } from './log-fields.mjs'
 import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
 const BILLING_LINE_RE = /^x-anthropic-billing-header:/i
-const VALID_TTL = new Set(['5m', '1h'])
 
 export const CRAG_CORE_ALLOWED_TOP_KEYS = Object.freeze(
   new Set([
@@ -195,31 +200,19 @@ function hasOnlyAllowedKeys(source, allowedSet) {
   return true
 }
 
-/** Strict whitelist rebuild of cache_control: only `{ type: 'ephemeral', ttl?: '5m'|'1h' }`. */
-export function sanitizeCragCacheControl(control, param = 'cache_control') {
-  if (control == null) return undefined
-  if (!isPlainObject(control)) invalid(param, 'must be an object', 'invalid_cache_control')
-  if (control.type !== 'ephemeral') {
-    invalid(param, 'must use type "ephemeral"', 'invalid_cache_control')
-  }
-  const out = { type: 'ephemeral' }
-  if (control.ttl != null && String(control.ttl).trim() !== '') {
-    if (!VALID_TTL.has(control.ttl)) {
-      invalid(`${param}.ttl`, 'must be "5m" or "1h"', 'invalid_cache_control')
-    }
-    out.ttl = control.ttl
-  }
-  return out
+/** Strict whitelist rebuild of cache_control: repairs into `{ type: 'ephemeral', ttl?: '5m'|'1h' }` or drops unusable markers. */
+export function sanitizeCragCacheControl(control) {
+  return normalizeCacheControlObject(control, { stripExtraFields: true })
 }
 
-function isCleanCacheControl(control) {
-  if (control == null) return true
-  if (!isPlainObject(control) || control.type !== 'ephemeral') return false
-  for (const key of Object.keys(control)) {
-    if (key !== 'type' && key !== 'ttl') return false
-  }
-  if (control.ttl != null && !VALID_TTL.has(control.ttl)) return false
-  return true
+function applySanitizedCacheControl(target, control) {
+  const clean = sanitizeCragCacheControl(control)
+  if (clean !== undefined) target.cache_control = clean
+  else delete target.cache_control
+}
+
+function isCleanCragCacheControl(control) {
+  return control == null || isCleanCacheControl(control, { stripExtraFields: true })
 }
 
 /** True when system only carries the placeholder CLI identity left by third-party relocation. */
@@ -272,7 +265,7 @@ function sanitizeSystem(system) {
     if (!cleaned.trim()) continue
     const block = { type: 'text', text: cleaned }
     if (entry.cache_control != null) {
-      block.cache_control = sanitizeCragCacheControl(entry.cache_control, `${param}.cache_control`)
+      applySanitizedCacheControl(block, entry.cache_control)
     }
     out.push(block)
   }
@@ -327,7 +320,7 @@ function isCleanBlock(block) {
   const allowed = BLOCK_KEYS_BY_TYPE[block.type]
   if (allowed) {
     if (!hasOnlyAllowedKeys(block, allowed)) return false
-    if (!isCleanCacheControl(block.cache_control)) return false
+    if (!isCleanCragCacheControl(block.cache_control)) return false
     if (block.type === 'text' && typeof block.text !== 'string') return false
     if (block.type === 'tool_use') {
       if (
@@ -350,7 +343,7 @@ function isCleanBlock(block) {
     return true
   }
   if (PROVIDER_HISTORY_BLOCK_TYPES.has(block.type)) {
-    return !Object.hasOwn(block, 'annotations') && isCleanCacheControl(block.cache_control)
+    return !Object.hasOwn(block, 'annotations') && isCleanCragCacheControl(block.cache_control)
   }
   return false
 }
@@ -384,23 +377,17 @@ function sanitizeContentBlock(block, param, capabilities) {
   if (type === 'text') {
     if (typeof block.text !== 'string') invalid(`${param}.text`, 'must be a string')
     const out = { type: 'text', text: block.text }
-    if (block.cache_control != null) {
-      out.cache_control = sanitizeCragCacheControl(block.cache_control, `${param}.cache_control`)
-    }
+    if (block.cache_control != null) applySanitizedCacheControl(out, block.cache_control)
     return out
   }
   if (type === 'image') {
     const out = pickKeys(block, BLOCK_KEYS_BY_TYPE.image)
-    if (out.cache_control != null) {
-      out.cache_control = sanitizeCragCacheControl(out.cache_control, `${param}.cache_control`)
-    }
+    if (out.cache_control != null) applySanitizedCacheControl(out, out.cache_control)
     return out
   }
   if (type === 'document') {
     const out = pickKeys(block, BLOCK_KEYS_BY_TYPE.document)
-    if (out.cache_control != null) {
-      out.cache_control = sanitizeCragCacheControl(out.cache_control, `${param}.cache_control`)
-    }
+    if (out.cache_control != null) applySanitizedCacheControl(out, out.cache_control)
     return out
   }
   if (type === 'tool_use') {
@@ -408,9 +395,7 @@ function sanitizeContentBlock(block, param, capabilities) {
     if (typeof block.name !== 'string' || !block.name) invalid(`${param}.name`, 'is required')
     if (!isPlainObject(block.input)) invalid(`${param}.input`, 'must be an object')
     const out = pickKeys(block, BLOCK_KEYS_BY_TYPE.tool_use)
-    if (out.cache_control != null) {
-      out.cache_control = sanitizeCragCacheControl(out.cache_control, `${param}.cache_control`)
-    }
+    if (out.cache_control != null) applySanitizedCacheControl(out, out.cache_control)
     return out
   }
   if (type === 'tool_result') {
@@ -428,9 +413,7 @@ function sanitizeContentBlock(block, param, capabilities) {
         invalid(`${param}.content`, 'must be text or an array of content blocks')
       }
     }
-    if (block.cache_control != null) {
-      out.cache_control = sanitizeCragCacheControl(block.cache_control, `${param}.cache_control`)
-    }
+    if (block.cache_control != null) applySanitizedCacheControl(out, block.cache_control)
     return out
   }
   if (type === 'thinking') {
@@ -444,23 +427,23 @@ function sanitizeContentBlock(block, param, capabilities) {
   }
   if (type === 'tool_reference') {
     const out = pickKeys(block, BLOCK_KEYS_BY_TYPE.tool_reference)
-    if (out.cache_control != null) {
-      out.cache_control = sanitizeCragCacheControl(out.cache_control, `${param}.cache_control`)
-    }
+    if (out.cache_control != null) applySanitizedCacheControl(out, out.cache_control)
     return out
   }
   if (type === 'tool_addition' || type === 'tool_removal') {
     const out = { type, tool: sanitizeInlineTool(block.tool, `${param}.tool`, capabilities) }
-    if (block.cache_control != null) {
-      out.cache_control = sanitizeCragCacheControl(block.cache_control, `${param}.cache_control`)
-    }
+    if (block.cache_control != null) applySanitizedCacheControl(out, block.cache_control)
     return out
   }
   if (PROVIDER_HISTORY_BLOCK_TYPES.has(type)) {
     const out = {}
     for (const [k, v] of Object.entries(block)) {
       if (v === undefined || k === 'annotations') continue
-      out[k] = k === 'cache_control' ? sanitizeCragCacheControl(v, `${param}.cache_control`) : v
+      if (k === 'cache_control') {
+        applySanitizedCacheControl(out, v)
+        continue
+      }
+      out[k] = v
     }
     return out
   }
@@ -521,9 +504,7 @@ function sanitizeToolDefinition(tool, param, capabilities) {
       invalid(param, 'invalid native advisor tool definition')
     }
     const clean = pickKeys(tool, ADVISOR_TOOL_KEYS)
-    if (clean.cache_control != null) {
-      clean.cache_control = sanitizeCragCacheControl(clean.cache_control, `${param}.cache_control`)
-    }
+    if (clean.cache_control != null) applySanitizedCacheControl(clean, clean.cache_control)
     return clean
   }
   if (tool.type != null && tool.type !== 'custom') {
@@ -541,7 +522,11 @@ function sanitizeToolDefinition(tool, param, capabilities) {
     const clean = {}
     for (const [k, v] of Object.entries(tool)) {
       if (v === undefined || PROVIDER_TOOL_DROP_KEYS.has(k)) continue
-      clean[k] = k === 'cache_control' ? sanitizeCragCacheControl(v, `${param}.cache_control`) : v
+      if (k === 'cache_control') {
+        applySanitizedCacheControl(clean, v)
+        continue
+      }
+      clean[k] = v
     }
     return clean
   }
@@ -549,9 +534,7 @@ function sanitizeToolDefinition(tool, param, capabilities) {
     invalid(`${param}.input_schema`, 'must be an object schema')
   }
   const clean = pickKeys(tool, CUSTOM_TOOL_KEYS)
-  if (clean.cache_control != null) {
-    clean.cache_control = sanitizeCragCacheControl(clean.cache_control, `${param}.cache_control`)
-  }
+  if (clean.cache_control != null) applySanitizedCacheControl(clean, clean.cache_control)
   return clean
 }
 
@@ -608,44 +591,15 @@ export function sanitizeSafeguardsForCrag(safeguards, capabilities) {
   return { value: out.length ? out : undefined, stripped: false }
 }
 
-function validateBreakpointOrderAndBudget(body) {
-  let count = 0
-  let short = false
-  const visit = (node, param) => {
-    const control = node?.cache_control
-    if (control == null) return
-    if (control.type !== 'ephemeral' || (control.ttl != null && !VALID_TTL.has(control.ttl))) {
-      invalid(param, 'Cache control must be ephemeral with an optional 5m or 1h TTL.', 'invalid_cache_control')
-    }
-    if (short && control.ttl === '1h') {
-      invalid(param, 'Cache TTL must place 1h before 5m (including missing TTL).', 'invalid_cache_control')
-    }
-    if (control.ttl !== '1h') short = true
-    if (++count > 4) {
-      invalid(param, 'Cache control exceeds four breakpoints.', 'invalid_cache_control')
-    }
-  }
-  /**
-   * Nested blocks live inside the parent's prompt span, so a breakpoint on a
-   * `tool_result.content` child precedes the parent's own breakpoint. Visiting
-   * children first keeps the 1h-before-5m ordering check honest; visiting the
-   * parent first would report a false inversion.
-   */
-  const walk = (node, param) => {
-    if (node == null || typeof node !== 'object') return
-    if (Array.isArray(node.content)) {
-      for (const [k, child] of node.content.entries()) walk(child, `${param}.content[${k}]`)
-    }
-    visit(node, `${param}.cache_control`)
-  }
-  for (const [i, tool] of (body.tools || []).entries()) walk(tool, `tools[${i}]`)
-  if (Array.isArray(body.system)) {
-    for (const [i, block] of body.system.entries()) walk(block, `system[${i}]`)
-  }
-  for (const [i, msg] of (body.messages || []).entries()) {
-    if (!Array.isArray(msg?.content)) continue
-    for (const [j, block] of msg.content.entries()) walk(block, `messages[${i}].content[${j}]`)
-  }
+function repairCragCacheBreakpoints(body) {
+  const fallbackTtl = body.cache_ttl || body.crag_options?.cache_ttl || DEFAULT_CACHE_TTL
+  return repairCacheBreakpoints(body, {
+    limit: 4,
+    fallbackTtl,
+    fillMissing: false,
+    stripExtraFields: true,
+    liftNested: true,
+  })
 }
 
 /**
@@ -854,10 +808,22 @@ export function sanitizeCragBodyWhitelist(
       if (Object.keys(next).length) out[key] = next
       continue
     }
+    if (key === 'crag_prompt' && isPlainObject(value) && Array.isArray(value.blocks)) {
+      out[key] = {
+        ...value,
+        blocks: value.blocks.map((block) => {
+          if (!isPlainObject(block) || block.cache_control == null) return block
+          const next = { ...block }
+          applySanitizedCacheControl(next, block.cache_control)
+          return next
+        }),
+      }
+      continue
+    }
     out[key] = value
   }
 
-  if (validateCacheBudget) validateBreakpointOrderAndBudget(out)
+  const finalBody = validateCacheBudget ? repairCragCacheBreakpoints(out) : out
 
-  return { body: out, strippedFields, strippedSafeguards }
+  return { body: finalBody, strippedFields, strippedSafeguards }
 }

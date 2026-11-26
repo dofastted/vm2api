@@ -234,8 +234,9 @@ func Compile(req CompileRequest) CompileResponse {
 		}
 		if decision.AllowPassthrough {
 			// Verified official Claude Code passthrough with Web Setting ON:
-			// preserve caller's exact official body structure and cache breakpoints.
+			// preserve caller's exact official body structure and auto-repair invalid cache controls.
 			cloned := cloneMap(req.Body)
+			strip.RepairAnthropicMapCacheBreakpoints(cloned)
 			if canonicalHandoff {
 				cloned["stream"] = true
 			}
@@ -336,12 +337,8 @@ func Compile(req CompileRequest) CompileResponse {
 
 	case ir.TargetAPIAnthropic:
 		if decision.AllowPassthrough {
-			if !canonicalHandoff {
-				if err := strip.ValidateAnthropicCacheBreakpoints(irReq); err != nil {
-					return protocolErrResp(req.InboundProtocol, decision, err)
-				}
-			}
 			cloned := cloneMap(req.Body)
+			strip.RepairAnthropicMapCacheBreakpoints(cloned)
 			if canonicalHandoff {
 				cloned["stream"] = true
 			}
@@ -352,6 +349,9 @@ func Compile(req CompileRequest) CompileResponse {
 				OutboundBody: cloned,
 				IRMeta:       meta,
 			}
+		}
+		if !canonicalHandoff {
+			strip.RepairAnthropicCacheBreakpoints(irReq)
 		}
 		built, err := codec.Build(irReq, codec.BuildOptions{
 			Target:           ir.TargetAPIAnthropic,

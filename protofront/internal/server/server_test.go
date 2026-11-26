@@ -135,7 +135,7 @@ func TestClaudeCRAGAntiCollisionAndValidation(t *testing.T) {
 		t.Fatalf("expected 400 invalid_kernel_request for n=2, got %+v", respBadN)
 	}
 
-	// Reject 5m before 1h cache control order
+	// Auto-repair 5m before 1h cache control order instead of violently returning 400
 	var settingsOn detect.WebSettings
 	settingsOn.Compatibility.OfficialCCPassthrough = true
 	badTTL := officialCCBody()
@@ -153,8 +153,91 @@ func TestClaudeCRAGAntiCollisionAndValidation(t *testing.T) {
 		Body:            badTTL,
 		Routing:         settingsOn,
 	})
-	if respTTL.OK || respTTL.Status != 400 || respTTL.Code != "invalid_cache_control" {
-		t.Fatalf("expected 400 invalid_cache_control on 5m before 1h, got %+v", respTTL)
+	if !respTTL.OK || respTTL.Mode != "passthrough" {
+		t.Fatalf("expected auto-repaired passthrough on 5m before 1h, got %+v", respTTL)
+	}
+	msgs, _ := respTTL.OutboundBody["messages"].([]any)
+	firstMsg, _ := msgs[0].(map[string]any)
+	firstContent, _ := firstMsg["content"].([]any)
+	tailBlk, _ := firstContent[0].(map[string]any)
+	tailCC, _ := tailBlk["cache_control"].(map[string]any)
+	if tailCC["ttl"] != "5m" {
+		t.Fatalf("expected trailing 1h breakpoint downgraded to 5m, got %+v", tailCC)
+	}
+
+	// Auto-repair >4 breakpoints and thinking cache_control on non-passthrough without 400
+	overBudget := map[string]any{
+		"model": "claude-sonnet-5-5",
+		"system": []any{
+			map[string]any{"type": "text", "text": "s1", "cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"}},
+			map[string]any{"type": "text", "text": "s2", "cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"}},
+		},
+		"messages": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "text", "text": "u1", "cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"}},
+				map[string]any{"type": "text", "text": "u2", "cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"}},
+				map[string]any{"type": "text", "text": "u3", "cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"}},
+			}},
+		},
+	}
+	respBudget := Compile(CompileRequest{
+		InboundProtocol: ir.ProtoAnthropic,
+		TargetFamily:    ir.TargetClaudeCRAG,
+		Body:            overBudget,
+	})
+	if !respBudget.OK {
+		t.Fatalf("expected >4 breakpoints to auto-repair instead of 400, got %+v", respBudget)
+	}
+
+	// TargetAPIAnthropic passthrough and non-passthrough also auto-repair >4 breakpoints and 5m->1h
+	apiBad := officialCCBody()
+	apiBad["system"] = []any{
+		map[string]any{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.321; cc_entrypoint=sdk-cli; cch=00000;"},
+		map[string]any{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.", "cache_control": map[string]any{"type": "ephemeral", "ttl": "5m"}},
+	}
+	apiBad["messages"] = []any{
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "text", "text": "a1", "cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"}},
+			map[string]any{"type": "text", "text": "a2", "cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"}},
+			map[string]any{"type": "text", "text": "a3", "cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"}},
+			map[string]any{"type": "text", "text": "a4", "cache_control": map[string]any{"type": "ephemeral", "ttl": "1h"}},
+		}},
+	}
+	respAPIPass := Compile(CompileRequest{
+		InboundProtocol: ir.ProtoAnthropic,
+		TargetFamily:    ir.TargetAPIAnthropic,
+		HandoffMode:     "canonical",
+		Headers:         officialCCHeaders(),
+		Body:            apiBad,
+		Routing:         settingsOn,
+	})
+	if !respAPIPass.OK || respAPIPass.Mode != "passthrough" {
+		t.Fatalf("expected TargetAPIAnthropic passthrough auto-repair, got %+v", respAPIPass)
+	}
+	apiMsgs, _ := respAPIPass.OutboundBody["messages"].([]any)
+	apiFirst, _ := apiMsgs[0].(map[string]any)
+	apiContent, _ := apiFirst["content"].([]any)
+	liveCount := 0
+	for _, item := range apiContent {
+		blk, _ := item.(map[string]any)
+		if cc, ok := blk["cache_control"].(map[string]any); ok {
+			liveCount++
+			if cc["ttl"] != "5m" {
+				t.Fatalf("expected TargetAPIAnthropic trailing 1h downgraded to 5m, got %+v", cc)
+			}
+		}
+	}
+	if liveCount != 3 {
+		t.Fatalf("expected 1 system + 3 message breakpoints (4 total), got %d message markers", liveCount)
+	}
+
+	respAPIConv := Compile(CompileRequest{
+		InboundProtocol: ir.ProtoAnthropic,
+		TargetFamily:    ir.TargetAPIAnthropic,
+		Body:            overBudget,
+	})
+	if !respAPIConv.OK || respAPIConv.Mode != "convert" {
+		t.Fatalf("expected TargetAPIAnthropic convert auto-repair, got %+v", respAPIConv)
 	}
 
 	// Non-passthrough strips unsigned/dummy thinking, billing header, volatile token budget, folds mid-history system

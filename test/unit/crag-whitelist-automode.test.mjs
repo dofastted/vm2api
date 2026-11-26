@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { validateCacheBreakpoints } from '../../src/lib/protocol/cache-ttl.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../../src/lib/protocol/convert.mjs'
 import { prepareCragPrintBody } from '../../src/lib/protocol/crag-print-prompt.mjs'
 import {
@@ -231,47 +232,100 @@ test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_comp
     cache_control: { type: 'ephemeral', ttl: '5m' },
   })
 
-  // Inverted TTL (5m before 1h) fails closed 400
-  assert.throws(
-    () =>
-      prepareCragRequest(
-        {
-          model: 'claude-sonnet-5-5',
-          system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '5m' } }],
-          messages: [
-            { role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
-          ],
-        },
-        { capabilities: V3_CAPS },
-      ),
-    (err) => err.status === 400 && err.code === 'invalid_cache_control',
+  // Inverted TTL (5m before 1h) auto-repairs by downgrading trailing 1h to 5m instead of 400ing
+  const fixedOrder = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '5m' } }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+      ],
+    },
+    { capabilities: V3_CAPS },
   )
+  assert.deepEqual(fixedOrder.system[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(fixedOrder.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.doesNotThrow(() => validateCacheBreakpoints(fixedOrder))
 
-  // More than 4 breakpoints fails closed 400
-  assert.throws(
-    () =>
-      prepareCragRequest(
+  // More than 4 breakpoints auto-trims to 4 (dropping stale earlier message anchors first) instead of 400ing
+  const trimmed = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      system: [
+        { type: 'text', text: 's1', cache_control: { type: 'ephemeral', ttl: '1h' } },
+        { type: 'text', text: 's2', cache_control: { type: 'ephemeral', ttl: '1h' } },
+      ],
+      messages: [
         {
-          model: 'claude-sonnet-5-5',
-          system: [
-            { type: 'text', text: 's1', cache_control: { type: 'ephemeral', ttl: '1h' } },
-            { type: 'text', text: 's2', cache_control: { type: 'ephemeral', ttl: '1h' } },
-          ],
-          messages: [
-            {
-              role: 'user',
-              content: [
-                { type: 'text', text: 'u1', cache_control: { type: 'ephemeral', ttl: '1h' } },
-                { type: 'text', text: 'u2', cache_control: { type: 'ephemeral', ttl: '1h' } },
-                { type: 'text', text: 'u3', cache_control: { type: 'ephemeral', ttl: '1h' } },
-              ],
-            },
+          role: 'user',
+          content: [
+            { type: 'text', text: 'u1', cache_control: { type: 'ephemeral', ttl: '1h' } },
+            { type: 'text', text: 'u2', cache_control: { type: 'ephemeral', ttl: '1h' } },
+            { type: 'text', text: 'u3', cache_control: { type: 'ephemeral', ttl: '1h' } },
           ],
         },
-        { capabilities: V3_CAPS },
-      ),
-    (err) => err.status === 400 && err.code === 'invalid_cache_control',
+      ],
+    },
+    { capabilities: V3_CAPS },
   )
+  assert.doesNotThrow(() => validateCacheBreakpoints(trimmed))
+  assert.equal(trimmed.system.filter((b) => b.cache_control).length, 2)
+  assert.equal(trimmed.messages[0].content[0].cache_control, undefined)
+  assert.deepEqual(trimmed.messages[0].content[1].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.deepEqual(trimmed.messages[0].content[2].cache_control, { type: 'ephemeral', ttl: '1h' })
+
+  // Malformed cache_control (wrong type / non-object / invalid ttl) is repaired or stripped cleanly
+  const malformed = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      system: [{ type: 'text', text: 'sys', cache_control: { type: 'persistent' } }],
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'a', cache_control: true },
+            { type: 'text', text: 'b', cache_control: { type: 'ephemeral', ttl: 'bad' } },
+          ],
+        },
+      ],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.equal(malformed.system[0].cache_control, undefined)
+  assert.equal(malformed.messages[0].content[0].cache_control, undefined)
+  assert.deepEqual(malformed.messages[0].content[1].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.doesNotThrow(() => validateCacheBreakpoints(malformed))
+
+  // crag_prompt.blocks (zero replace mode) are also counted and repaired in budget/TTL order
+  const zeroPromptBudget = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      crag_prompt: {
+        mode: 'replace',
+        text: 'sys1sys2',
+        blocks: [
+          { type: 'text', text: 'sys1', cache_control: { type: 'ephemeral', ttl: '5m', scope: 'global' } },
+          { type: 'text', text: 'sys2', cache_control: { type: 'ephemeral', ttl: '1h' } },
+        ],
+      },
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'u1', cache_control: { type: 'ephemeral', ttl: '1h' } },
+            { type: 'text', text: 'u2', cache_control: { type: 'ephemeral', ttl: '1h' } },
+            { type: 'text', text: 'u3', cache_control: { type: 'ephemeral', ttl: '1h' } },
+          ],
+        },
+      ],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.doesNotThrow(() => validateCacheBreakpoints(zeroPromptBudget))
+  assert.deepEqual(zeroPromptBudget.crag_prompt.blocks[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(zeroPromptBudget.crag_prompt.blocks[1].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.equal(zeroPromptBudget.messages[0].content[0].cache_control, undefined)
+  assert.deepEqual(zeroPromptBudget.messages[0].content[2].cache_control, { type: 'ephemeral', ttl: '5m' })
 })
 
 test('#8 CRAG whitelist keeps thinking.block_binding so thinking-binding-controls can arm', () => {
@@ -334,38 +388,19 @@ test('#8 CRAG whitelist keeps thinking.block_binding so thinking-binding-control
   )
 })
 
-test('#7 CRAG whitelist counts cache breakpoints nested inside tool_result.content', () => {
+test('#7 CRAG whitelist lifts and repairs cache breakpoints nested inside tool_result.content', () => {
   const toolTurns = (resultContent) => [
     { role: 'user', content: [{ type: 'text', text: 'read it' }] },
     { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'read_file', input: { path: 'a' } }] },
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', ...resultContent }] },
   ]
 
-  // 1 top-level + 4 nested = 5 breakpoints. Before this fix only the top-level one
-  // was counted, so the request went out and Anthropic returned the 400 instead.
-  assert.throws(
-    () =>
-      prepareCragRequest(
-        {
-          model: 'claude-sonnet-5-5',
-          system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '1h' } }],
-          messages: toolTurns({
-            content: ['a', 'b', 'c', 'd'].map((text) => ({
-              type: 'text',
-              text,
-              cache_control: { type: 'ephemeral', ttl: '1h' },
-            })),
-          }),
-        },
-        { capabilities: V3_CAPS },
-      ),
-    (err) => err.status === 400 && err.code === 'invalid_cache_control' && /exceeds four breakpoints/.test(err.message),
-  )
-
-  // Exactly 4 nested breakpoints still passes: the fix must not reject legal requests.
-  const atBudget = prepareCragRequest(
+  // 1 top-level + 4 nested inside tool_result.content: instead of 400ing or
+  // tripping CRAG anchor mismatch, nested markers collapse onto the parent tool_result.
+  const lifted = prepareCragRequest(
     {
       model: 'claude-sonnet-5-5',
+      system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '1h' } }],
       messages: toolTurns({
         content: ['a', 'b', 'c', 'd'].map((text) => ({
           type: 'text',
@@ -376,10 +411,14 @@ test('#7 CRAG whitelist counts cache breakpoints nested inside tool_result.conte
     },
     { capabilities: V3_CAPS },
   )
-  assert.equal(atBudget.messages[2].content[0].content.length, 4)
+  assert.doesNotThrow(() => validateCacheBreakpoints(lifted))
+  assert.deepEqual(lifted.messages[2].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.equal(
+    lifted.messages[2].content[0].content.some((child) => child.cache_control != null),
+    false,
+  )
 
-  // Children occupy an earlier prompt span than the parent breakpoint, so a 1h
-  // child before a 5m parent is the legal order.
+  // Nested 1h child + 5m parent preserves parent's 5m breakpoint and strips child marker.
   const nestedOrder = prepareCragRequest(
     {
       model: 'claude-sonnet-5-5',
@@ -391,22 +430,22 @@ test('#7 CRAG whitelist counts cache breakpoints nested inside tool_result.conte
     { capabilities: V3_CAPS },
   )
   assert.deepEqual(nestedOrder.messages[2].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.equal(nestedOrder.messages[2].content[0].content[0].cache_control, undefined)
 
-  // ...and the inversion is now caught locally.
-  assert.throws(
-    () =>
-      prepareCragRequest(
-        {
-          model: 'claude-sonnet-5-5',
-          messages: toolTurns({
-            content: [{ type: 'text', text: 'short', cache_control: { type: 'ephemeral', ttl: '5m' } }],
-            cache_control: { type: 'ephemeral', ttl: '1h' },
-          }),
-        },
-        { capabilities: V3_CAPS },
-      ),
-    (err) => err.status === 400 && err.code === 'invalid_cache_control' && /1h before 5m/.test(err.message),
+  // Nested 5m child + 1h parent repairs cleanly without throwing 400.
+  const invertedNested = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      messages: toolTurns({
+        content: [{ type: 'text', text: 'short', cache_control: { type: 'ephemeral', ttl: '5m' } }],
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      }),
+    },
+    { capabilities: V3_CAPS },
   )
+  assert.doesNotThrow(() => validateCacheBreakpoints(invertedNested))
+  assert.equal(invertedNested.messages[2].content[0].content[0].cache_control, undefined)
+  assert.deepEqual(invertedNested.messages[2].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
 })
 
 test('#2 CRAG whitelist lets tool_addition / tool_removal through and still rebuilds the inline tool', () => {
