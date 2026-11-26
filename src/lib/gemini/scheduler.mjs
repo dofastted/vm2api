@@ -578,7 +578,14 @@ export function createGeminiScheduler({
     return null
   }
 
-  function recordToolContinuation(accountId, collected, ts, consumedCallIds = [], stickyKey = null) {
+  function recordToolContinuation(
+    accountId,
+    collected,
+    ts,
+    consumedCallIds = [],
+    stickyKey = null,
+    parentRequestId = null,
+  ) {
     if (Array.isArray(consumedCallIds)) {
       for (const cid of consumedCallIds) {
         if (typeof cid === 'string' && cid) toolContinuationBindings.delete(cid)
@@ -604,6 +611,7 @@ export function createGeminiScheduler({
       accountId,
       conversationId: meta.conversationId,
       stickyKey,
+      parentRequestId: parentRequestId || null,
       expiresAt: ts + TOOL_CONTINUATION_TTL_MS,
     }
     for (const tc of collected.toolCalls) {
@@ -1656,27 +1664,57 @@ export function createGeminiScheduler({
             const finishedAt = now()
             const attemptLatencyMs = Math.max(0, finishedAt - attemptStartedAt)
             if (reportedConvId) lastConversationId = reportedConvId
-            recordStickyAccount(effectiveStickyKey, id, reportedConvId, policy, finishedAt, attemptUsedConversationIds)
-            recordToolContinuation(id, collected, finishedAt, continuationCallIds, effectiveStickyKey)
-            recordAccountUsage(apiKeyRecord, resolved.publicId, collected.usage || {})
-            poolScheduler?.unitCircuit?.recordSuccess?.(selected.accountId)
-            poolScheduler?.lastUsed?.set?.(selected.accountId, finishedAt)
             const reportedModel =
               typeof collected.reportedModel === 'string' && collected.reportedModel.trim()
                 ? collected.reportedModel.trim()
                 : null
+            const usageObj = collected.usage || {}
+            const totalUsedTokens =
+              Number(usageObj.input_tokens || 0) +
+              Number(usageObj.output_tokens || 0) +
+              Number(usageObj.cache_read_tokens || 0) +
+              Number(usageObj.cache_read_input_tokens || 0) +
+              Number(usageObj.reasoning_tokens || 0)
+            const isLocalToolDrain =
+              target === 'antigravity' &&
+              Boolean(continuationBinding) &&
+              continuationBinding.accountId === id &&
+              collected.meta?.awaitingToolResults === true &&
+              Array.isArray(collected.toolCalls) &&
+              collected.toolCalls.length > 0 &&
+              totalUsedTokens === 0 &&
+              !reportedModel
+            const effectiveParentRequestId = isLocalToolDrain
+              ? continuationBinding.parentRequestId || null
+              : requestId || null
+            recordStickyAccount(effectiveStickyKey, id, reportedConvId, policy, finishedAt, attemptUsedConversationIds)
+            recordToolContinuation(
+              id,
+              collected,
+              finishedAt,
+              continuationCallIds,
+              effectiveStickyKey,
+              effectiveParentRequestId,
+            )
+            recordAccountUsage(apiKeyRecord, resolved.publicId, collected.usage || {})
+            poolScheduler?.unitCircuit?.recordSuccess?.(selected.accountId)
+            poolScheduler?.lastUsed?.set?.(selected.accountId, finishedAt)
             try {
-              attemptsRepoRef?.complete?.(requestId, attempts, {
-                upstreamStatus: lastUpstreamStatus ?? 200,
-                errorScope: null,
-                action: 'ok',
-                cooldownUntil: null,
-                downstreamCommitted: true,
-                terminalState: 'verified',
-                usage: collected.usage || null,
-                ttftMs: collected.timing?.ttftMs ?? null,
-                latencyMs: attemptLatencyMs,
-              })
+              if (isLocalToolDrain) {
+                attemptsRepoRef?.removeByRequestId?.(requestId)
+              } else {
+                attemptsRepoRef?.complete?.(requestId, attempts, {
+                  upstreamStatus: lastUpstreamStatus ?? 200,
+                  errorScope: null,
+                  action: 'ok',
+                  cooldownUntil: null,
+                  downstreamCommitted: true,
+                  terminalState: 'verified',
+                  usage: collected.usage || null,
+                  ttftMs: collected.timing?.ttftMs ?? null,
+                  latencyMs: attemptLatencyMs,
+                })
+              }
             } catch {}
             attemptRecords.push({
               attempt_no: attempts,
@@ -1704,6 +1742,14 @@ export function createGeminiScheduler({
               attempts: attemptRecords,
               upstream_status: lastUpstreamStatus ?? 200,
               ...(reportedConvId ? { conversation_id: reportedConvId } : {}),
+              ...(isLocalToolDrain
+                ? {
+                    local_tool_drain: true,
+                    ...(effectiveParentRequestId
+                      ? { tool_continuation_parent_request_id: effectiveParentRequestId }
+                      : {}),
+                  }
+                : {}),
             }
           } catch (error) {
             if (legacyRun) {

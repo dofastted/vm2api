@@ -217,7 +217,7 @@ test('Gemini cache + reasoning usage is never double-subtracted in RequestLogSto
   assert.equal(row.web_search_requests, 1)
   assert.equal(row.reasoning_effort, 'high')
   assert.equal(row.session_id, 'sess-gem-001')
-  assert.equal(row.outbound_session_id, 'sess-gem-001')
+  assert.match(row.outbound_session_id || '', /^gc_[a-f0-9]{24}$/)
   assert.equal(row.attempt_count, 1)
   assert.equal(row.upstream_status, 200)
   assert.equal(row.has_tools, true)
@@ -1046,4 +1046,338 @@ test('Gemini thinking-suffix request with bare upstream modelVersion does not fl
   assert.equal(rows[1].requested_model, 'gemini-4-neon-high')
   assert.equal(rows[1].upstream_model, 'gemini-4-neon-low')
   assert.equal(rows[1].model_mismatch, 1)
+})
+
+test('Gemini OAuth writes callback conversation_id to outbound_session_id, tags missing inbound session as 第三方, and groups activeSessions by conversation_id', async (t) => {
+  const store = tmpLogStore('debug')
+  t.after(() => {
+    store.db.close()
+    fs.rmSync(store.dataDir, { recursive: true, force: true })
+  })
+
+  let callIdx = 0
+  const callbackConvIds = ['gc_111111111111111111111111', 'gc_222222222222222222222222']
+  const scheduler = createGeminiScheduler({
+    callHost: async (op) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-conv-1',
+              proxy_id: 'px-1',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-4-neon-xhigh'],
+              capabilities: [...FULL_GEMINI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') return { id: 'env-conv-1', proxy_id: 'px-1', auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async () => {
+      const convId = callbackConvIds[callIdx++] || callbackConvIds[0]
+      return delayedSseResponse([
+        `data: ${JSON.stringify({
+          candidates: [{ content: { role: 'model', parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+          modelVersion: 'gemini-4-neon',
+          usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 20, totalTokenCount: 120 },
+          craggeminiMeta: { conversation_id: convId },
+        })}\n\n`,
+      ])
+    },
+    resolveProxy: () => 'socks5h://192.0.2.10:1080',
+  })
+
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler,
+    requestLog: store,
+    groupsRepo: { rateMultiplier: () => 1 },
+  })
+
+  // Two distinct conversations without inbound session/conversation IDs.
+  for (const prompt of ['first conversation prompt', 'second conversation prompt']) {
+    const res = makeRes()
+    await handler(
+      makeReq({
+        url: '/v1beta/models/gemini-4-neon-xhigh:streamGenerateContent?alt=sse',
+        body: { contents: [{ role: 'user', parts: [{ text: prompt }] }] },
+      }),
+      res,
+    )
+    assert.equal(res.statusCode, 200)
+  }
+
+  const rows = store.db
+    .prepare('SELECT request_id, session_id, outbound_session_id FROM usage_logs ORDER BY rowid ASC')
+    .all()
+  assert.equal(rows.length, 2)
+  assert.equal(rows[0].session_id, '第三方')
+  assert.equal(rows[0].outbound_session_id, 'gc_111111111111111111111111')
+  assert.equal(rows[1].session_id, '第三方')
+  assert.equal(rows[1].outbound_session_id, 'gc_222222222222222222222222')
+
+  const view = new UsageLogsView(store.db)
+  const listed = view.listBatch({ limit: 10 }).logs
+  assert.equal(listed.length, 2)
+  assert.equal(listed[0].sessionId, 'gc_222222222222222222222222')
+  assert.equal(listed[0].clientSessionId, '第三方')
+  assert.equal(listed[1].sessionId, 'gc_111111111111111111111111')
+  assert.equal(listed[1].clientSessionId, '第三方')
+
+  // Distinct third-party conversations must NOT collapse into a single "第三方" session bucket.
+  const active = view.activeSessions({ minutes: 10 })
+  assert.equal(active.total, 2)
+  assert.deepEqual(active.sessions.map((s) => s.sessionId).sort(), [
+    'gc_111111111111111111111111',
+    'gc_222222222222222222222222',
+  ])
+  assert.equal(view.overview({ tz: 'UTC' }).activeSessions, 2)
+})
+
+test('Gemini zero-token local MCP tool-drain continuations aggregate into parent token turn and do not create 0/0 rows', async (t) => {
+  const store = tmpLogStore('debug')
+  const { RequestAttemptsRepo } = await import('../../src/lib/db/repos/request-attempts-repo.mjs')
+  const attemptsRepo = new RequestAttemptsRepo(store.db)
+  t.after(() => {
+    store.db.close()
+    fs.rmSync(store.dataDir, { recursive: true, force: true })
+  })
+
+  const convId = 'gc_abcdef0123456789abcdef01'
+  let turnNo = 0
+  const scheduler = createGeminiScheduler({
+    attemptsRepo,
+    callHost: async (op) => {
+      if (op === 'list') {
+        return {
+          payload_state: 'installed',
+          environments: [
+            {
+              id: 'env-drain-1',
+              proxy_id: 'px-1',
+              auth_state: 'authorized',
+              auth_method: 'oauth',
+              models_discovered: true,
+              models: ['gemini-4-neon-xhigh'],
+              capabilities: [...FULL_GEMINI_CAPABILITIES],
+            },
+          ],
+        }
+      }
+      if (op === 'get') return { id: 'env-drain-1', proxy_id: 'px-1', auth_method: 'oauth' }
+      throw new Error(`unexpected op ${op}`)
+    },
+    callHostStream: async () => {
+      turnNo += 1
+      if (turnNo === 1) {
+        // Real upstream inference returning tool call #1 + usage + awaiting_tool_results.
+        return delayedSseResponse([
+          {
+            delayMs: 10,
+            data: `data: ${JSON.stringify({
+              candidates: [{ content: { role: 'model', parts: [{ text: 'planning', thought: true }] } }],
+              modelVersion: 'gemini-4-neon',
+              responseId: 'real-resp-1',
+            })}\n\n`,
+          },
+          {
+            delayMs: 10,
+            data: `data: ${JSON.stringify({
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [{ functionCall: { id: 'call_1', name: 'Bash', args: { command: 'pwd' } } }],
+                  },
+                  finishReason: 'STOP',
+                },
+              ],
+              modelVersion: 'gemini-4-neon',
+              responseId: 'real-resp-1',
+              usageMetadata: { promptTokenCount: 5000, candidatesTokenCount: 300, totalTokenCount: 5300 },
+              craggeminiMeta: { conversation_id: convId, awaiting_tool_results: true },
+            })}\n\n`,
+          },
+        ])
+      }
+      if (turnNo === 2) {
+        // Local MCP tool drain #2: no modelVersion, no usageMetadata, awaiting_tool_results=true.
+        return delayedSseResponse([
+          {
+            delayMs: 25,
+            data: `data: ${JSON.stringify({
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [{ functionCall: { id: 'call_2', name: 'Read', args: { file_path: 'VERSION' } } }],
+                  },
+                  finishReason: 'STOP',
+                },
+              ],
+              craggeminiMeta: { conversation_id: convId, awaiting_tool_results: true },
+            })}\n\n`,
+          },
+        ])
+      }
+      if (turnNo === 3) {
+        // Local MCP tool drain #3: chained off call_2, still zero tokens -> must fold into turn #1!
+        return delayedSseResponse([
+          {
+            delayMs: 25,
+            data: `data: ${JSON.stringify({
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [{ functionCall: { id: 'call_3', name: 'Write', args: { file_path: 'a.txt' } } }],
+                  },
+                  finishReason: 'STOP',
+                },
+              ],
+              craggeminiMeta: { conversation_id: convId, awaiting_tool_results: true },
+            })}\n\n`,
+          },
+        ])
+      }
+      // Turn #4: real upstream inference after all 3 tool results are supplied.
+      return delayedSseResponse([
+        {
+          delayMs: 10,
+          data: `data: ${JSON.stringify({
+            candidates: [{ content: { role: 'model', parts: [{ text: 'All done.' }] }, finishReason: 'STOP' }],
+            modelVersion: 'gemini-4-neon',
+            responseId: 'real-resp-2',
+            usageMetadata: {
+              promptTokenCount: 5500,
+              cachedContentTokenCount: 5000,
+              candidatesTokenCount: 120,
+              totalTokenCount: 5620,
+            },
+            craggeminiMeta: { conversation_id: convId },
+          })}\n\n`,
+        },
+      ])
+    },
+    resolveProxy: () => 'socks5h://192.0.2.10:1080',
+  })
+
+  const handler = createGeminiPublicHandler({
+    json: jsonResponder,
+    readBody: async () => ({}),
+    scheduler,
+    requestLog: store,
+    groupsRepo: { rateMultiplier: () => 1 },
+  })
+
+  const toolDecl = [{ functionDeclarations: [{ name: 'Bash' }, { name: 'Read' }, { name: 'Write' }] }]
+  const baseContents = [{ role: 'user', parts: [{ text: 'run checks' }] }]
+
+  // Turn 1: real inference -> tool #1
+  const res1 = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-neon-xhigh:streamGenerateContent?alt=sse',
+      body: { contents: baseContents, tools: toolDecl },
+    }),
+    res1,
+  )
+  assert.equal(res1.statusCode, 200)
+  const parentRowBefore = store.db.prepare('SELECT request_id, duration_ms FROM usage_logs').get()
+  assert.ok(parentRowBefore?.request_id)
+
+  // Turn 2: return call_1 result -> local drain emits call_2 (0 tokens)
+  const res2 = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-neon-xhigh:streamGenerateContent?alt=sse',
+      body: {
+        tools: toolDecl,
+        contents: [
+          ...baseContents,
+          { role: 'model', parts: [{ functionCall: { id: 'call_1', name: 'Bash', args: { command: 'pwd' } } }] },
+          { role: 'user', parts: [{ functionResponse: { id: 'call_1', name: 'Bash', response: { output: '/tmp' } } }] },
+        ],
+      },
+    }),
+    res2,
+  )
+  assert.equal(res2.statusCode, 200)
+
+  // Turn 3: return call_2 result -> local drain emits call_3 (0 tokens)
+  const res3 = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-neon-xhigh:streamGenerateContent?alt=sse',
+      body: {
+        tools: toolDecl,
+        contents: [
+          ...baseContents,
+          { role: 'model', parts: [{ functionCall: { id: 'call_2', name: 'Read', args: { file_path: 'VERSION' } } }] },
+          {
+            role: 'user',
+            parts: [{ functionResponse: { id: 'call_2', name: 'Read', response: { output: '1.4.223' } } }],
+          },
+        ],
+      },
+    }),
+    res3,
+  )
+  assert.equal(res3.statusCode, 200)
+
+  // Turn 4: return call_3 result -> real upstream inference finishes
+  const res4 = makeRes()
+  await handler(
+    makeReq({
+      url: '/v1beta/models/gemini-4-neon-xhigh:streamGenerateContent?alt=sse',
+      body: {
+        tools: toolDecl,
+        contents: [
+          ...baseContents,
+          { role: 'model', parts: [{ functionCall: { id: 'call_3', name: 'Write', args: { file_path: 'a.txt' } } }] },
+          { role: 'user', parts: [{ functionResponse: { id: 'call_3', name: 'Write', response: { ok: true } } }] },
+        ],
+      },
+    }),
+    res4,
+  )
+  assert.equal(res4.statusCode, 200)
+
+  // Only the 2 real token-bearing turns exist in usage_logs; zero 0/0 rows!
+  const rows = store.db
+    .prepare(
+      'SELECT request_id, input_tokens, output_tokens, cache_read_tokens, duration_ms, session_id, outbound_session_id FROM usage_logs ORDER BY rowid ASC',
+    )
+    .all()
+  assert.equal(rows.length, 2)
+  assert.equal(rows[0].request_id, parentRowBefore.request_id)
+  assert.equal(rows[0].input_tokens, 5000)
+  assert.equal(rows[0].output_tokens, 300)
+  assert.equal(rows[0].session_id, '第三方')
+  assert.equal(rows[0].outbound_session_id, convId)
+  assert.ok(rows[0].duration_ms > parentRowBefore.duration_ms, 'parent duration_ms includes drained continuations')
+  assert.equal(rows[1].input_tokens, 500)
+  assert.equal(rows[1].cache_read_tokens, 5000)
+  assert.equal(rows[1].output_tokens, 120)
+  assert.equal(rows[1].session_id, '第三方')
+  assert.equal(rows[1].outbound_session_id, convId)
+
+  // Parent debug record tracks both drained continuations in hop_meta.tool_continuations.
+  const parentDbg = store.getDebug(rows[0].request_id)
+  assert.equal(parentDbg.hop_meta?.tool_continuations?.length, 2)
+  assert.deepEqual(
+    parentDbg.hop_meta.tool_continuations.map((c) => c.tools),
+    [['Read'], ['Write']],
+  )
+
+  // No orphan request_attempts rows remain for the 2 drained continuations.
+  const attemptRows = store.db.prepare('SELECT request_id FROM request_attempts').all()
+  assert.equal(attemptRows.length, 2)
+  assert.deepEqual(attemptRows.map((a) => a.request_id).sort(), rows.map((r) => r.request_id).sort())
 })
