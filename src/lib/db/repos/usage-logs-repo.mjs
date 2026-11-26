@@ -165,6 +165,8 @@ const SUMMARY_COLUMNS = [
   'image_input_tokens',
   'image_output_tokens',
   'image_cost',
+  'advisor_usage',
+  'advisor_cost',
   'upstream_type',
   'error_details',
 ]
@@ -187,7 +189,7 @@ function toRow(rec) {
     if (c === 'ip_address') return rec.ip_address ?? rec.ip ?? null
     if (c === 'stream') return rec.stream ? 1 : 0
     if (c === 'has_tools') return rec.has_tools == null ? null : rec.has_tools ? 1 : 0
-    if (c === 'error_details') {
+    if (c === 'error_details' || c === 'advisor_usage') {
       if (rec[c] == null || rec[c] === '') return null
       return typeof rec[c] === 'string' ? rec[c] : JSON.stringify(rec[c])
     }
@@ -687,6 +689,13 @@ export class UsageLogsRepo {
   }
 
   _usageForPrice(row) {
+    let advisor_usage = null
+    if (row.advisor_usage) {
+      try {
+        const parsed = typeof row.advisor_usage === 'string' ? JSON.parse(row.advisor_usage) : row.advisor_usage
+        if (Array.isArray(parsed) && parsed.length) advisor_usage = parsed
+      } catch {}
+    }
     return {
       input_tokens: row.input_tokens,
       output_tokens: row.output_tokens,
@@ -697,6 +706,7 @@ export class UsageLogsRepo {
       web_search_requests: row.web_search_requests,
       service_tier: row.service_tier,
       speed: row.speed,
+      ...(advisor_usage ? { advisor_usage } : {}),
     }
   }
 
@@ -717,7 +727,7 @@ export class UsageLogsRepo {
       ? this.db.prepare(`
       UPDATE usage_logs
          SET input_cost = ?, output_cost = ?, cache_read_cost = ?,
-             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, total_cost = ?,
+             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, advisor_cost = ?, total_cost = ?,
              actual_cost = ?, pricing_model = ?, price_source = ?, price_version = ?,
              long_context = ?
        WHERE id = ?
@@ -725,7 +735,7 @@ export class UsageLogsRepo {
       : this.db.prepare(`
       UPDATE usage_logs
          SET input_cost = ?, output_cost = ?, cache_read_cost = ?,
-             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, total_cost = ?,
+             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, advisor_cost = ?, total_cost = ?,
              pricing_model = ?, price_source = ?, price_version = ?, long_context = ?
        WHERE id = ?
     `)
@@ -749,6 +759,7 @@ export class UsageLogsRepo {
           (r.cache_creation_cost ?? null) === (priced.cache_creation_cost ?? null) &&
           (r.web_search_cost ?? null) === (priced.web_search_cost ?? null) &&
           (r.image_cost ?? null) === (priced.image_cost ?? null) &&
+          (r.advisor_cost ?? null) === (priced.advisor_cost ?? null) &&
           (r.total_cost ?? null) === (priced.total_cost ?? null) &&
           (r.pricing_model ?? null) === (priced.pricing_model ?? null) &&
           (r.price_source ?? null) === (priced.price_source ?? null) &&
@@ -771,6 +782,7 @@ export class UsageLogsRepo {
             priced.cache_creation_cost ?? null,
             priced.web_search_cost ?? null,
             priced.image_cost ?? null,
+            priced.advisor_cost ?? null,
             priced.total_cost ?? null,
             actual,
             priced.pricing_model ?? UNPRICED_MODEL,
@@ -787,6 +799,7 @@ export class UsageLogsRepo {
             priced.cache_creation_cost ?? null,
             priced.web_search_cost ?? null,
             priced.image_cost ?? null,
+            priced.advisor_cost ?? null,
             priced.total_cost ?? null,
             priced.pricing_model ?? UNPRICED_MODEL,
             priced.price_source ?? null,
@@ -819,8 +832,9 @@ export class UsageLogsRepo {
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
              rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
-             input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
-             image_cost, total_cost, pricing_model, price_source, price_version, long_context
+             advisor_usage, input_cost, output_cost, cache_read_cost, cache_creation_cost,
+             web_search_cost, image_cost, advisor_cost, total_cost, pricing_model,
+             price_source, price_version, long_context
       FROM usage_logs
       WHERE pricing_model IS NULL
       LIMIT ?
@@ -840,8 +854,9 @@ export class UsageLogsRepo {
                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
                cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
                rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
-               input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
-               image_cost, total_cost, pricing_model, price_source, price_version, long_context
+               advisor_usage, input_cost, output_cost, cache_read_cost, cache_creation_cost,
+               web_search_cost, image_cost, advisor_cost, total_cost, pricing_model,
+               price_source, price_version, long_context
         FROM usage_logs ${where}
         ORDER BY id
         LIMIT 2000
@@ -868,8 +883,9 @@ export class UsageLogsRepo {
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
              rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
-             input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
-             image_cost, total_cost, pricing_model, price_source, price_version, long_context
+             advisor_usage, input_cost, output_cost, cache_read_cost, cache_creation_cost,
+             web_search_cost, image_cost, advisor_cost, total_cost, pricing_model,
+             price_source, price_version, long_context
       FROM usage_logs ${where}
       ORDER BY rowid
       LIMIT 2000
