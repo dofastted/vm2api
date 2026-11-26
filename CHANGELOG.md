@@ -7,6 +7,37 @@
   - **兼容性**：经宿主 `license-machine-code` / `license-activate` / `license-status` 暴露的 `crag_license.code` 在沙箱启动失败时为 `gemini_sandbox_*`，HTTP **503**（此前误为 **403** `license_invalid`）；`sync_pending` 时 bwrap 失败亦上报沙箱码而非许可错误。`src/lib/gemini/subscription.mjs` / `scheduler.mjs` 准入与调度不再将沙箱码回落为 `license_required`。
   - 前端 `web/src/features/import/gemini-environments.tsx`：沙箱失败时不突出「绑定 CRAG 席位」操作。
   - 回归：`test/unit/gemini-host-license-align.py`、`test/unit/gemini-license-sandbox-admission.test.mjs`。
+- **Ubuntu 26.04 受管 `bwrap` 入口与 AppArmor profile 扩展（#1895，#1929）**：
+  - 根因：在 `kernel.apparmor_restrict_unprivileged_userns=1` 下发行版 `bwrap-userns-restrict` 按路径将 `/usr/bin/bwrap` 附着到系统 `unpriv_bwrap` 策略，宿主 `vm2api-gemini` 虽可建 user namespace，但子进程 exec 系统 `bwrap` 时仍会被 `craggemini` 相关的 exec 拒绝（探针用 `/bin/true` 可通过，表现为「sandbox pass、原生失败」）。
+  - `scripts/gemini_host_apparmor.py`：新增 `resolve_bwrap_argv0()`（`VM2API_GEMINI_BWRAP` 可覆盖，否则优先 `/usr/local/lib/vm2api-gemini/exec/bwrap`）、`managed_bwrap_required()` / `managed_bwrap_entry_configured()`；`deploy/install.sh` 与 `scripts/gemini-maintenance.py` 在检测到 `bwrap-userns-restrict` 时将系统 `bwrap` 同步至受管路径，并在 `vm2api-gemini` profile 添加 `ix` 规则而不放宽全局 `/usr/bin/bwrap`。
+  - `scripts/gemini-host.py` 全部沙箱 argv 经统一入口解析；维护探针与静态检查在受管入口或 profile 规则缺失时上报 `gemini_sandbox_apparmor_restricted`。
+  - 回归：`test/unit/test_gemini_host_apparmor.py`、`test/deploy/test_gemini_apparmor.py`、`test/unit/gemini-sandbox-apparmor.py`、`test/unit/gemini-sandbox-apparmor.test.mjs`。
+- **Codex 续热读取官方 5h reset，面板保存保留 `mode` / `auto_renew`（Refs #1874，#1927）**：
+  - `VmTestScheduleRunner` 原先统一从 `accountQuota.unified['5h']` 取 `windowState` / `nextWindowEnd`；Codex 槽无 Claude 配额行，实际窗口在 `summarizeCodexSlot().usage.quota`，导致 `auto_renew` 的 `nextWindowEnd` 恒为 `null`、续热无法触发。
+  - 新增 `src/lib/admin/vm-test-preheat-window.mjs`：Codex 走 `summarizeCodexSlot` 的 5h 窗口，Claude 仍走 `accountQuota`；`server.mjs` 改用 `preheatWindowState` / `preheatNextWindowEnd`。
+  - `mergeVmTestSchedulePreserve`：`save()`、`applyScheduleStructure()` 与全量 sync 的 `_applyFullTest()` 在请求未显式携带字段时保留已存的 `mode` / `auto_renew`，修复 Web PUT 省略两项后把预热计划重置为 `test` + `auto_renew: false` 的问题。
+  - 回归：`test/unit/issue-1874.test.mjs`、`test/unit/vm-test-schedule.test.mjs`。
+- **agy 工具 schema 去重 `required` 并规避 CRAGGemini 桥接层 `toolSummary` 注入冲突（Refs #1915，#1925）**：
+  - 根因：桥接层再次注入 `toolSummary` 等字段时，若客户端 `parameters.required` 已声明同名必填项，下游会出现重复 `required`（`at '/required': items at 1 and 3 are equal`），首轮 `502 gemini_inference_failed`。
+  - `src/lib/protocol/gemini-convert.mjs`：`sanitizeGeminiSchema` 对 `required` 有序去重；`avoidAgyBridgeParamCollisions` 将根级碰撞字段重命名为 `_client_<name>`；`forwardAgyBridgeToolArgs` / `restoreAgyBridgeToolArgs` 在多轮 `functionCall` 与流式/非流式回流中按 schema 还原；`target: antigravity` 路径生效，直连 Gemini API 不变。
+  - 回归：`test/unit/gemini-convert.test.mjs`。
+- **KVM guest `kinhome` / `kinclaude` 9p 改用 `cache=none`，修复 `.claude.json` 原子写回卡死（#1877，#1924）**：
+  - 根因：`cache=mmap` 下 Claude Code 在 `~/.claude/` 创建 `.claude.json.tmp.*` 并 `fchmod` / `stat` 时触发 v9fs 脏页写回，guest 内核 6.8 上写回可能长时间不完成，CLI 进入 `D` 状态，槽卡在 `cleaning`、队列 504。
+  - `docker/kin-kvm/guest/kin-guest-setup`：`kinhome`、`kinclaude` 挂载由 `mmap` 改为 `cache=none`（`kinrun` 仍为 `none`，`kinpayload` 保持 `loose`）；`kin-crag-apparmor` 注释对齐。
+  - 部署说明：变更落在 guest 启动脚本；须经首次 `cloud-init` 的 `install-guest.sh` 将新版 `kin-guest-setup` 装入来宾，或槽重建/关机再开并由宿主同步 guest bin 后重新执行 setup——仅在不更新 guest 脚本的前提下重跑旧版 setup **不会**应用新挂载选项。
+  - 回归：`test/unit/kin-guest-9p-mount.test.mjs`、`test/unit/kvm-crag-apparmor.test.mjs`。
+- **Gemini `tool_continuation_aborted` 映射为 `409 gemini_session_conflict` 并清除 sticky 后重试一次（Refs #1837，#1923）**：
+  - 控制面此前将 worker `tool_continuation_aborted` 回落为 `502 gemini_inference_failed` 并计入熔断/故障转移；现 `direct-client.mjs`、`gemini_host_native.py`、`scheduler.mjs`、`routes.mjs` 统一公开 **`409 gemini_session_conflict`**（相对此前对外 **502** 的语义变更）。
+  - `gemini_session_conflict` 纳入 `NON_CIRCUIT_FAILURES`；首次命中时清除失效 sticky 绑定，同账号以新 `conversation_id` 自动重试一次（`session_retry`），第二次仍失败则原样返回。
+  - 回归：`test/unit/gemini-session-conflict.test.mjs`、`test/unit/gemini-host-native-smoke.py`。
+- **并发 SOCKS 探测误判 `timeout` 导致 Gemini `proxy_ready` 全 false（#1853，#1922）**：
+  - `src/lib/vm/proxy-pool.mjs`：新增 `isRemoteSocksProbeRow`；`probeAll` 对本机/HTTP 代理保持并发 4，对公网 SOCKS 行串行并在相邻探测间插入 400ms 错峰。
+  - `src/lib/gemini/routes.mjs`：`proxyFor` 仅在代理池将行标为 `dead` 时拒绝绑定；`fail` 态与池策略一致仍可调度，直至连续失败升格为 `dead`。
+  - 回归：`test/unit/gemini-proxy-ready.test.mjs`、`test/unit/proxy-probe-stagger.test.mjs`、`test/unit/gemini-host.test.mjs`。
+- **Codex 配额视图丢弃已过期窗口的 rate-limit 读数（#1920）**：
+  - `src/lib/protocol/codex-usage.mjs`：`codexLimitsToQuota` / `buildCodexUsageView` 在 `reset_at` 已过时将对应 `utilization` / `status` / `reset` 置为 `null`，与调度侧 `isLiveCap` 一致；未过期窗口与无 `reset` 的读数保持原语义。
+  - `summarizeVm`、集群 5h/7d 仪表与面板均经该视图，无需改调用点。
+  - 回归：`test/unit/codex-usage.test.mjs`（含过期 100% 窗口降为 unknown、仍存活的 cap 保留读数）。
 
 ## 1.4.231 — 2026-11-26 · Advisor 顾问用量独立计费与双库持久化、确定性 400 熔断豁免/平台归因、钉选 CRAG 3.1.23 与新版 `kin-kernel` 载荷
 
