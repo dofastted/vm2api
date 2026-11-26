@@ -97,7 +97,10 @@ const CUSTOM_TOOL_KEYS = new Set([
   'cache_control',
 ])
 
-const ADVISOR_TOOL_KEYS = new Set(['type', 'name', 'model', 'max_uses', 'caching', 'cache_control'])
+// `max_tokens` bounds the advisor's own output (thinking + text) per call; at the
+// cap the result block comes back with stop_reason "max_tokens". Dropping it
+// silently removed the caller's ceiling on advisor spend.
+const ADVISOR_TOOL_KEYS = new Set(['type', 'name', 'model', 'max_uses', 'max_tokens', 'caching', 'cache_control'])
 
 const PROVIDER_TOOL_DROP_KEYS = new Set(['annotations', 'function', 'parameters'])
 

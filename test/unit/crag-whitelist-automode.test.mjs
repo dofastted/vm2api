@@ -91,6 +91,49 @@ test('CRAG whitelist accepts L0 minimal request and strips all CC-native/diagnos
   assert.ok(strippedFields.includes('fallbacks'))
 })
 
+test('CRAG whitelist keeps every advisor tool option and still rejects a bad definition', () => {
+  const advisor = {
+    type: 'advisor_20260301',
+    name: 'advisor',
+    model: 'claude-opus-5-5',
+    max_uses: 3,
+    // Bounds the advisor's own output per call; it was being dropped, which
+    // silently removed the caller's ceiling on advisor spend.
+    max_tokens: 4096,
+    caching: { type: 'ephemeral', ttl: '1h' },
+  }
+  const { body } = sanitizeCragBodyWhitelist(
+    {
+      model: 'claude-sonnet-5-5',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'ask the advisor' }] }],
+      tools: [advisor],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(body.tools, [advisor])
+
+  // An advisor tool carrying input_schema is refused outright rather than cleaned:
+  // the upstream contract has no schema for it.
+  for (const bad of [
+    { ...advisor, input_schema: { type: 'object' } },
+    { ...advisor, name: 'helper' },
+    { ...advisor, model: '' },
+  ]) {
+    assert.throws(
+      () =>
+        sanitizeCragBodyWhitelist(
+          {
+            model: 'claude-sonnet-5-5',
+            messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+            tools: [bad],
+          },
+          { capabilities: V3_CAPS },
+        ),
+      /advisor/i,
+    )
+  }
+})
+
 test('CRAG whitelist fails closed 400 on unknown top-level and unrepresentable fields', () => {
   for (const extra of [{ seed: 42 }, { n: 2 }, { logprobs: true }, { unknown_vendor_flag: 'x' }]) {
     assert.throws(
