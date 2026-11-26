@@ -1531,6 +1531,25 @@ function isSearchFailover(out) {
   return status === 0 || status === 401 || status === 402 || status === 403 || status === 429 || status >= 500
 }
 
+/**
+ * search/images JSON 端点的 grant-death 写盘（与主请求路径同语义）：
+ * 401 响应体命中吊销文案 → 落盘摘池，防止死号继续换槽烧上游 401。
+ */
+function parkCodexGrantDeadIfHit(projectRoot, vmId, last) {
+  if (Number(last?.status) !== 401) return
+  const parsed = parseJson(last.text)
+  if (!isCodexGrantDead({ ok: false, status: last.status, body: parsed || null })) return
+  try {
+    persistCodexCredentialState(projectRoot, vmId, { error: 'oauth_revoked' })
+    markCodexGrantDead(projectRoot, vmId, {
+      description: parsed?.error?.message || parsed?.error?.code || null,
+      status: last.status,
+    })
+  } catch {
+    /* 写盘 best-effort；换槽逻辑继续 */
+  }
+}
+
 function parseJson(text) {
   try {
     return JSON.parse(text)
@@ -1632,6 +1651,8 @@ export async function handleCodexSearch({
           headers: last.headers || {},
           body: parseJson(last.text),
         })
+        // search/images 路径同样接 grant-death 写盘（与主请求路径同语义）。
+        parkCodexGrantDeadIfHit(projectRoot, vm.id, last)
         if (!isSearchFailover(last)) break
       } finally {
         admitted.lease.release()
@@ -1803,6 +1824,9 @@ export async function handleCodexImages({
           headers: last.headers || {},
           body: parseJson(last.text),
         })
+        // search/images 路径同样接 grant-death 写盘（与主请求路径同语义），
+        // 防止死号在 JSON 端点上继续换槽烧 401。
+        parkCodexGrantDeadIfHit(projectRoot, vm.id, last)
         if (last.status >= 200 && last.status < 300 && stickyRouter?.bind) {
           for (const key of admitted.picked.stickyKeys || []) stickyRouter.bind(key, { accountId: vm.id, vmId: vm.id })
         }
