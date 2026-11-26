@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import tempfile
 from pathlib import Path
 
 APPARMOR_MARKER = "# Managed by vm2api Gemini host userns preparation."
@@ -116,17 +117,40 @@ def managed_bwrap_entry_configured(*, host_root: Path = Path("/")) -> bool:
     return f"  {entry} ix," in body or f"{entry} ix," in body
 
 
+def _validate_managed_bwrap_entry(entry: Path) -> None:
+    info = entry.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("managed bwrap entry is not a regular file")
+    if info.st_mode & 0o022:
+        raise OSError("managed bwrap entry is group/world writable")
+
+
 def install_managed_bwrap(*, host_root: Path = Path("/")) -> Path:
     entry = host_path(host_root, GEMINI_BWRAP_ENTRY)
     source = shutil.which("bwrap")
     if not source:
         raise FileNotFoundError("bwrap")
     entry.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
-    shutil.copy2(source, entry)
-    os.chmod(entry, stat.S_IMODE(0o755))
-    info = entry.stat()
-    if not stat.S_ISREG(info.st_mode):
-        raise OSError("managed bwrap entry is not a regular file")
-    if info.st_mode & 0o022:
-        raise OSError("managed bwrap entry is group/world writable")
+    desired = Path(source).read_bytes()
+    if entry.is_file():
+        try:
+            if entry.read_bytes() == desired:
+                os.chmod(entry, stat.S_IMODE(0o755))
+                _validate_managed_bwrap_entry(entry)
+                return entry
+        except OSError:
+            pass
+    fd, tmp_name = tempfile.mkstemp(
+        dir=entry.parent, prefix=".bwrap-install-", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(desired)
+        os.chmod(tmp_path, stat.S_IMODE(0o755))
+        os.replace(tmp_path, entry)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    _validate_managed_bwrap_entry(entry)
     return entry
