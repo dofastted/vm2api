@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **更正 KVM 来宾 `kinhome`/`kinclaude` 9p `cache=none` 的既有来宾生效说明（Refs #1877）**：
+  - `#1924` 曾暗示「重新执行 setup 或关机再开」即可应用新挂载选项；仓库实现中 `install-guest.sh` 仅在 cloud-init 首次安装时把 `kin-guest-setup` 拷入 `/usr/local/sbin`，`mount_9p` 在挂载点已存在时直接跳过，故既有磁盘上单独 `systemctl restart kin-guest-setup.service` 不会更换 `cache=`，也不会重装仍保留旧 cache 的 9p。
+  - 既有来宾：升级含新 guest 脚本的 kin-kvm 运行器并启停槽以刷新 cidata seed 后，在 guest 内从 cidata 重装 `/usr/local/sbin/kin-guest-setup`（与 `install-guest.sh` 的 `install_files` 同源；仓库无其它自动路径），再对 guest 做完整关机→开机（或等价的全来宾重启）以便重新挂载；新建 overlay 来宾由首次 `install-guest.sh` 自动获得新脚本。详见 `docs/crag-kvm.md`「Guest 启动脚本升级」。
+  - 仅文档与注释：`docker/kin-kvm/guest/kin-guest-setup`、`install-guest.sh`、`kin-crag-apparmor`、`test/unit/kin-guest-9p-mount.test.mjs`。
+
 - **修复 Gemini 许可 CLI 将 bwrap 沙箱挂载/命名空间失败误报为 `license_invalid`（Refs #1892）**：
   - `scripts/gemini-host.py`：`classify_craggemini_license_cli_error` 在回落到许可无效前识别 `bwrap:` 致命启动失败（bind 源不可穿越、`Can't bind mount` / `Can't mount proc` / `execvp Permission denied`、user namespace 拒绝等），分别上报 `gemini_sandbox_unavailable` 与 `gemini_sandbox_apparmor_restricted`；忽略纯 `bwrap: Warning` 行以免掩盖真实许可结论；`license_status` 保留沙箱错误码。
   - **兼容性**：经宿主 `license-machine-code` / `license-activate` / `license-status` 暴露的 `crag_license.code` 在沙箱启动失败时为 `gemini_sandbox_*`，HTTP **503**（此前误为 **403** `license_invalid`）；`sync_pending` 时 bwrap 失败亦上报沙箱码而非许可错误。`src/lib/gemini/subscription.mjs` / `scheduler.mjs` 准入与调度不再将沙箱码回落为 `license_required`。

@@ -46,6 +46,24 @@ H1 尚不支持撤回绑定。删除已绑定槽后，控制面保留已确认�
 
 本机 KVM 的宿主订阅进程计入统一的运行额度；其 relay 缺失、不可连接或健康响应不能证明内部令牌认证时，计为未知。无法确认在额度内时拒绝新的宿主授权请求，不把未知运行情况当作零占用。
 
+## Guest 启动脚本升级（`kin-guest-setup`）
+
+KVM 来宾的 9p 挂载、`kincli` 用户与 payload 软链由 `kin-guest-setup.service` 在**每次来宾启动**时执行，参数来自宿主编好的 cidata seed（`docker/kin-kvm/kin-kvm-entry` 的 `write_seed()` 在每次槽启动时把当前 `/opt/kin-kvm/guest/` 打进 seed.iso）。
+
+首次安装由 cloud-init `runcmd` 调用 `install-guest.sh`（`guest/user-data`；instance-id 按 overlay 稳定时 **只跑一次**），把 `kin-guest-setup` 等文件安装到来宾磁盘的 `/usr/local/sbin`。此后 seed.iso 虽会随槽启停更新，但**不会**再自动覆盖磁盘上的 `/usr/local/sbin/kin-guest-setup`；仓库内没有与首次安装等价的自动升级路径。
+
+`kin-guest-setup` 的 `mount_9p` 在目标路径**已是挂载点**时直接返回，不会改 `cache=`。因此不能指望 `systemctl restart kin-guest-setup.service`（例如 `kin-crag-apparmor` 为恢复 `slot.env` 触发的重启）把既有来宾的 `kinhome`/`kinclaude` 从 `mmap` 换成 `cache=none`（#1877 / #1924）。
+
+**新建来宾**（新 overlay / 首次 cloud-init）：随当前 kin-kvm 镜像的 `install-guest.sh` 自动获得新脚本，下次启动即按新选项挂载。
+
+**已有磁盘的来宾**需同时满足：
+
+1. 宿主持有含新 guest 脚本的 kin-kvm 运行器；对该槽关机再开机（或等价地先停后起），以便附加当前 seed.iso。
+2. 在来宾内从 cidata 重装启动脚本，例如：`install -m 0755 /mnt/cidata/kin-guest-setup /usr/local/sbin/kin-guest-setup`（先按 `kin-guest-setup` 内逻辑挂载只读 cidata）。步骤与 `install-guest.sh` 的 `install_files` 一致。
+3. 对来宾再做一次**完整关机→开机**（面板「恢复服务」或停槽后起槽），让启动时 `kin-guest-setup.service` 在空挂载点上执行 9p 挂载。仅重载 CRAG 内核、仅 `restart kin-guest-setup` 或在不重装脚本的情况下重启来宾，均不足以单独完成 `cache=` 变更。
+
+与 `kin-crag-apparmor` 通过控制面下发并在下次 CRAG 启动应用的 tmpfs drop-in（#1741 / #1838）不同，`kin-guest-setup` 的挂载选项只由来宾磁盘上的脚本与冷启动挂载路径决定。
+
 ## AppArmor 与原生 Claude 启动权限
 
 Ubuntu 24.04 等启用了 `kernel.apparmor_restrict_unprivileged_userns=1` 的 guest 中，CRAG V2 健康检查可能正常，但实际请求仍报 `Claude native launch failed (guest identity requires user/mount namespaces and bind-mount permissions): Permission denied`。原生 Claude 的 guest identity 需要创建用户、挂载命名空间并执行 bind mount；AppArmor 的默认非特权用户命名空间策略可能阻止这些操作。

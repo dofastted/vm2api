@@ -2,6 +2,13 @@
 # Every boot: slot user, 9p mounts, payload links, identity, DNS.
 # Params come from guest.env on the NoCloud seed ISO (volid cidata),
 # regenerated each runner start; cloud-init itself runs once per overlay.
+#
+# The on-disk copy at /usr/local/sbin/kin-guest-setup is installed only by
+# install-guest.sh (cloud-init runcmd, first boot). mount_9p below keeps an
+# existing mount and does not change cache=; applying new mount options on an
+# already-provisioned guest requires reinstalling this script from the current
+# cidata seed, then a full guest reboot (stop→start), not merely restarting
+# kin-guest-setup.service while 9p mounts are still up.
 set -eu
 
 log() { echo "kin-guest-setup: $*" >&2; }
@@ -71,6 +78,8 @@ mount_9p() {
   dest=$2
   cache=$3
   mkdir -p "$dest"
+  # Keep steady-state mounts across kin-guest-setup.service re-runs (e.g. slot.env
+  # restore); changing cache= on existing guests needs a reboot so this branch is cold.
   if mountpoint -q "$dest" 2>/dev/null; then
     return 0
   fi
