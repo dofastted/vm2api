@@ -484,12 +484,7 @@ export function geminiFuncName(name) {
   return s
 }
 
-const MCP_CALL_PREFIXES = [
-  'mcp__craggemini__',
-  'mcp_craggemini_',
-  'mcp__crag__',
-  'mcp_crag_',
-]
+const MCP_CALL_PREFIXES = ['mcp__craggemini__', 'mcp_craggemini_', 'mcp__crag__', 'mcp_crag_']
 
 export function geminiToolNameFromCall(name) {
   let s = String(name || '')
@@ -824,6 +819,62 @@ function distinctStrings(values) {
   return [...new Set(values)]
 }
 
+function orderedDistinctStrings(values) {
+  const seen = new Set()
+  const out = []
+  for (const item of values) {
+    if (typeof item !== 'string' || seen.has(item)) continue
+    seen.add(item)
+    out.push(item)
+  }
+  return out
+}
+
+/** Parameter names CRAGGemini / agy may inject when materializing MCP tools (#1915). */
+const AGY_BRIDGE_INJECTED_PARAMS = new Set(['toolSummary'])
+
+function agyBridgeClientAlias(param) {
+  return `_client_${param}`
+}
+
+/**
+ * Rename client-declared tool parameters that collide with agy bridge injection so
+ * downstream schema merging does not duplicate `required` entries (#1915).
+ */
+export function avoidAgyBridgeParamCollisions(schema) {
+  if (!isPlainObject(schema)) return schema
+  return avoidAgyBridgeParamCollisionsWalk(schema)
+}
+
+function avoidAgyBridgeParamCollisionsWalk(node) {
+  if (!isPlainObject(node)) return node
+  const out = { ...node }
+  if (isPlainObject(out.properties)) {
+    const props = { ...out.properties }
+    const renames = new Map()
+    for (const key of Object.keys(props)) {
+      if (AGY_BRIDGE_INJECTED_PARAMS.has(key)) {
+        const alias = agyBridgeClientAlias(key)
+        if (!Object.hasOwn(props, alias)) {
+          renames.set(key, alias)
+          props[alias] = avoidAgyBridgeParamCollisionsWalk(props[key])
+          delete props[key]
+        }
+      } else {
+        props[key] = avoidAgyBridgeParamCollisionsWalk(props[key])
+      }
+    }
+    out.properties = props
+    if (Array.isArray(out.required)) {
+      out.required = orderedDistinctStrings(
+        out.required.map((n) => (typeof n === 'string' && renames.has(n) ? renames.get(n) : n)),
+      )
+    }
+  }
+  if (isPlainObject(out.items)) out.items = avoidAgyBridgeParamCollisionsWalk(out.items)
+  return out
+}
+
 /**
  * Clean JSON Schema for Gemini / Antigravity `functionDeclarations`.
  * When `plain: true`, reduces to Gemini's OpenAPI Schema subset (inlining
@@ -834,7 +885,16 @@ export function sanitizeGeminiSchema(raw, { plain = false } = {}) {
   const root = isPlainObject(raw) ? raw : { type: 'object', properties: {} }
   if (!plain) {
     const shaped = shapeJsonSchemaForGemini(root, true)
-    return isPlainObject(shaped) ? shaped : { type: 'object', properties: {} }
+    const result = isPlainObject(shaped) ? shaped : { type: 'object', properties: {} }
+    if (Array.isArray(result.required)) {
+      const props = isPlainObject(result.properties) ? result.properties : {}
+      const keep = orderedDistinctStrings(
+        result.required.filter((n) => typeof n === 'string' && Object.hasOwn(props, n)),
+      )
+      if (keep.length) result.required = keep
+      else delete result.required
+    }
+    return result
   }
   const defs = {}
   for (const key of ['$defs', 'definitions']) {
@@ -1081,7 +1141,7 @@ export function sanitizeGeminiSchema(raw, { plain = false } = {}) {
     }
     if (Array.isArray(out.required)) {
       const props = isPlainObject(out.properties) ? out.properties : {}
-      const keep = out.required.filter((n) => typeof n === 'string' && Object.hasOwn(props, n))
+      const keep = orderedDistinctStrings(out.required.filter((n) => typeof n === 'string' && Object.hasOwn(props, n)))
       if (keep.length) out.required = keep
       else delete out.required
     }
@@ -3374,7 +3434,7 @@ export function buildGeminiRequest(
           const wireName = tool.wireName || resolveWireName(tool.name)
           const decl = { name: wireName }
           if (tool.description) decl.description = stripIllegalControlChars(tool.description)
-          decl.parameters = sanitizeGeminiSchema(tool.schema, { plain: true })
+          decl.parameters = avoidAgyBridgeParamCollisions(sanitizeGeminiSchema(tool.schema, { plain: true }))
           return decl
         })
         agTools.push({ functionDeclarations: decls })

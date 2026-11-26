@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **CRAGGemini agy 默认工具 schema 与桥接层注入参数冲突导致首轮 502（#1915）**：`src/lib/protocol/gemini-convert.mjs` 在 `target: antigravity` 出站前对 `parameters` 去重 `required` 并将与 agy 桥接层注入名（如 `toolSummary`）冲突的客户端字段重命名为 `_client_*`，避免下游合并后出现重复 `required` 项而使工具 schema 无效；无冲突的工具声明保持原样。
+- 部署说明：本次改动仅涉及控制面（`src/lib/protocol/gemini-convert.mjs`）；`deploy/payload.json`（CRAGGemini `0.4.13`）、宿主脚本与槽位内核相对当前 Release 未变，重启 `vm2api` 即可生效。
+
 ## 1.4.230 — 2026-11-26 · 内核不再为带 type 的工具合成 `input_schema`（advisor 全链路放行）、新增 advisor 处理说明
 
 - **`kin-kernel` 新二进制：带显式非 `custom` `type` 的工具不再被补 `input_schema`（payload pin 变更）**：

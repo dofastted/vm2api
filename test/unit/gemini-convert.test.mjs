@@ -19,6 +19,7 @@ import {
   parseGeminiSseFrame,
   parseInboundToGemini,
   renderGeminiProtocolResponse,
+  avoidAgyBridgeParamCollisions,
   sanitizeGeminiSchema,
   sanitizeNativeTuiText,
   signedToolCallId,
@@ -160,6 +161,77 @@ test('sanitizeGeminiSchema handles JSON Schema and plain OpenAPI modes', () => {
   assert.deepEqual(plainMode.properties.bareArray, { type: 'array', items: {} })
   // Required prunes fields missing from properties.
   assert.deepEqual(plainMode.required.sort(), ['name', 'tag'])
+})
+
+test('sanitizeGeminiSchema dedupes duplicate required entries without changing property order', () => {
+  const raw = {
+    type: 'object',
+    properties: {
+      CommandLine: { type: 'string' },
+      toolSummary: { type: 'string' },
+      WaitMsBeforeAsync: { type: 'integer' },
+    },
+    required: ['CommandLine', 'toolSummary', 'WaitMsBeforeAsync', 'toolSummary'],
+  }
+  const plain = sanitizeGeminiSchema(raw, { plain: true })
+  assert.deepEqual(plain.required, ['CommandLine', 'toolSummary', 'WaitMsBeforeAsync'])
+  const json = sanitizeGeminiSchema(raw, { plain: false })
+  assert.deepEqual(json.required, ['CommandLine', 'toolSummary', 'WaitMsBeforeAsync'])
+})
+
+test('avoidAgyBridgeParamCollisions renames bridge-colliding parameters for antigravity', () => {
+  const runCommand = {
+    type: 'object',
+    properties: {
+      CommandLine: { type: 'string' },
+      toolSummary: { type: 'string', description: 'What this command does' },
+      WaitMsBeforeAsync: { type: 'integer' },
+    },
+    required: ['CommandLine', 'toolSummary', 'WaitMsBeforeAsync'],
+  }
+  const adjusted = avoidAgyBridgeParamCollisions(runCommand)
+  assert.equal(adjusted.properties.toolSummary, undefined)
+  assert.ok(adjusted.properties._client_toolSummary)
+  assert.deepEqual(adjusted.required, ['CommandLine', '_client_toolSummary', 'WaitMsBeforeAsync'])
+
+  const ir = parseInboundToGemini(
+    'gemini',
+    {
+      contents: [{ role: 'user', parts: [{ text: 'ok' }] }],
+      tools: [{ functionDeclarations: [{ name: 'run_command', parameters: runCommand }] }],
+    },
+    { routeModel: 'gemini-4-argon-high', routeStream: false },
+  )
+  const agReq = buildGeminiRequest(ir, { target: 'antigravity' })
+  const params = agReq.tools[0].functionDeclarations[0].parameters
+  assert.equal(params.properties.toolSummary, undefined)
+  assert.ok(params.properties._client_toolSummary)
+  assert.deepEqual(params.required, ['CommandLine', '_client_toolSummary', 'WaitMsBeforeAsync'])
+})
+
+test('avoidAgyBridgeParamCollisions leaves schemas without collisions unchanged', () => {
+  const readFile = {
+    type: 'object',
+    properties: { path: { type: 'string' }, offset: { type: 'integer' } },
+    required: ['path'],
+  }
+  const before = structuredClone(readFile)
+  const afterSanitize = sanitizeGeminiSchema(readFile, { plain: true })
+  const afterCollision = avoidAgyBridgeParamCollisions(afterSanitize)
+  assert.deepEqual(afterCollision, afterSanitize)
+  assert.deepEqual(before.properties, readFile.properties)
+
+  const ir = parseInboundToGemini(
+    'gemini',
+    {
+      contents: [{ role: 'user', parts: [{ text: 'read' }] }],
+      tools: [{ functionDeclarations: [{ name: 'read_file', parameters: readFile }] }],
+    },
+    { routeModel: 'gemini-4-argon-high', routeStream: false },
+  )
+  const agReq = buildGeminiRequest(ir, { target: 'antigravity' })
+  assert.deepEqual(agReq.tools[0].functionDeclarations[0].parameters.required, ['path'])
+  assert.deepEqual(Object.keys(agReq.tools[0].functionDeclarations[0].parameters.properties), ['path', 'offset'])
 })
 
 test('parseInboundToGemini + buildGeminiRequest convert all 4 protocols with history hardening', () => {
@@ -1849,10 +1921,7 @@ test('makeWireToolName caps wire names at 55 chars so mcp_crag_<wireName> stays 
   const seenWire = new Set()
   for (const decl of decls) {
     assert.ok(decl.name.length <= 55, `wire name exceeds 55 chars: ${decl.name} (${decl.name.length})`)
-    assert.ok(
-      `mcp_crag_${decl.name}`.length <= 64,
-      `prefixed MCP name exceeds 64 chars: mcp_crag_${decl.name}`,
-    )
+    assert.ok(`mcp_crag_${decl.name}`.length <= 64, `prefixed MCP name exceeds 64 chars: mcp_crag_${decl.name}`)
     assert.match(decl.name, /^[A-Za-z_][A-Za-z0-9_-]*$/, `invalid wire tool name: ${decl.name}`)
     assert.equal(seenWire.has(decl.name), false, `duplicate wire name: ${decl.name}`)
     seenWire.add(decl.name)
