@@ -181,6 +181,34 @@ test('refreshCodexAccessToken posts form grant and keeps fallback refresh token'
   assert.match(calls[0].body, /refresh_token=rt-old/)
 })
 
+// OpenAI 吊销回 401 + error.code=token_revoked：必须归类 oauth_revoked 而非笼统 refresh_rejected，
+// 上层（面板额度刷新/rotateIfNeeded）才能显示「凭证已被吊销」并写盘摘池。
+test('refreshCodexAccessToken classifies token_revoked 401 as oauth_revoked', async () => {
+  const tok = await refreshCodexAccessToken({
+    refreshToken: 'rt-dead',
+    fetchImpl: async () => ({
+      ok: false,
+      status: 401,
+      json: async () => ({
+        error: 'invalid_grant',
+        error_description: 'Encountered invalidated oauth token for user, failing request (token_revoked)',
+      }),
+    }),
+  })
+  assert.equal(tok.ok, false)
+  assert.equal(tok.error, 'oauth_revoked')
+  assert.equal(tok.revoked, true)
+  assert.match(String(tok.description), /invalidated oauth token/i)
+  // 普通 401 拒绝仍是 refresh_rejected（不能误伤暂时性拒绝）
+  const plain = await refreshCodexAccessToken({
+    refreshToken: 'rt-x',
+    fetchImpl: async () => ({ ok: false, status: 401, json: async () => ({ error: 'unauthorized' }) }),
+  })
+  assert.equal(plain.ok, false)
+  assert.equal(plain.error, 'refresh_rejected')
+  assert.equal(plain.revoked, undefined)
+})
+
 test('parseCodexModelCatalog keeps whitelisted catalog metadata', () => {
   const [row] = parseCodexModelCatalog({
     models: [

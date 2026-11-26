@@ -10,11 +10,14 @@ import {
   handleCodexProtocol,
   pickCodexCandidates,
   codexFailureHold,
+  isCodexGrantDead,
+  parkCodexGrantDeadIfHit,
   codexFailoverBudget,
 } from '../../src/lib/protocol/handle-codex.mjs'
 import { persistCodexUsage, getVm } from '../../src/lib/vm/vm-registry.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { markCodexGrantDead, persistCodexCredentialState } from '../../src/lib/vm/codex-slot.mjs'
 
 beforeEach(() => resetOpenAIAccountRuntime())
 
@@ -1133,6 +1136,147 @@ test('failure holds ignore committed streams and request-shaped 400s', () => {
     ),
     null,
   )
+})
+
+// OpenAI 吊销文案（token_revoked / invalidated oauth token）必须与普通 401 分开：
+// 5 分钟内存 hold 挡不住轮转调度，死号会反复被捞起打 401（vm-03/04/12 案）。
+test('token_revoked 401 is grant death: permanent hold + unschedulable park on disk', () => {
+  const now = 1_700_000_000_000
+  const revokedResult = {
+    ok: false,
+    status: 401,
+    committed: false,
+    body: {
+      error: {
+        message: 'Encountered invalidated oauth token for user, failing request',
+        type: null,
+        code: 'token_revoked',
+        param: null,
+      },
+    },
+  }
+  // 判定：isCodexGrantDead 命中
+  assert.equal(isCodexGrantDead(revokedResult), true)
+  // 普通 401 不是 grant death
+  assert.equal(isCodexGrantDead({ ok: false, status: 401, body: { error: { code: 'other' } } }), false)
+  assert.equal(isCodexGrantDead(null), false)
+  // hold 升级为永久，reason=oauth_revoked
+  assert.deepEqual(codexFailureHold(revokedResult, now), {
+    until: Number.MAX_SAFE_INTEGER,
+    reason: 'oauth_revoked',
+  })
+  // 落盘：unschedulable 四态 + paused + 双源 refresh_error
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-grantdead-'))
+  const vmId = 'vm-grantdead'
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  const vmFile = path.join(root, 'vms', `${vmId}.json`)
+  fs.writeFileSync(
+    vmFile,
+    JSON.stringify({ id: vmId, name: 'grantdead', status: 'running', schedulable: true, codex: {} }),
+  )
+  persistCodexCredentialState(root, vmId, { error: 'oauth_revoked' })
+  markCodexGrantDead(root, vmId, { description: 'Encountered invalidated oauth token for user', status: 401 })
+  const vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  assert.equal(vm.unschedulable?.reason, 'oauth_revoked')
+  assert.equal(vm.schedulable, false)
+  assert.equal(vm.schedule_disabled_reason, 'oauth_revoked')
+  assert.equal(vm.status, 'paused')
+  assert.equal(vm.codex.refresh_error, 'oauth_revoked')
+  // 幂等：重复标记不重写
+  const firstAt = vm.unschedulable.at
+  markCodexGrantDead(root, vmId, { description: 'again' })
+  const vm2 = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  assert.equal(vm2.unschedulable.at, firstAt)
+  // 成功快照清 refresh_error（persistCodexCredentialState error:null）
+  persistCodexCredentialState(root, vmId, { error: null })
+  const vm3 = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  assert.equal(vm3.codex.refresh_error, undefined)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+// 轮换竞态假阳性防护：invalid_grant 不升格 grant death（词表与 refreshCodexAccessToken 严格度对齐）。
+test('invalid_grant 401 is NOT grant death (rotation race false positive)', () => {
+  assert.equal(
+    isCodexGrantDead({ ok: false, status: 401, body: { error: { code: 'invalid_grant' } } }),
+    false,
+  )
+  // 普通 401 仍走 5 分钟 hold
+  const now = 1_700_000_000_000
+  assert.deepEqual(
+    codexFailureHold(
+      { ok: false, status: 401, committed: false, body: { error: { code: 'invalid_grant' } } },
+      now,
+    ),
+    { until: now + 5 * 60_000, reason: 'oauth_401' },
+  )
+})
+
+// 已有其他 unschedulable 诊断（organization_disabled）不被 grant-death park 覆盖。
+test('markCodexGrantDead preserves an existing unschedulable verdict', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-grantdead-org-'))
+  const vmId = 'vm-org'
+  const vmFile = path.join(root, 'vms', `${vmId}.json`)
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.writeFileSync(
+    vmFile,
+    JSON.stringify({
+      id: vmId,
+      status: 'running',
+      schedulable: false,
+      unschedulable: { reason: 'organization_disabled', detail: null, at: '2026-11-24T08:00:00Z' },
+    }),
+  )
+  markCodexGrantDead(root, vmId, { description: 'token_revoked', status: 401 })
+  const vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  assert.equal(vm.unschedulable.reason, 'organization_disabled')
+  assert.equal(vm.unschedulable.at, '2026-11-24T08:00:00Z')
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+// 磁盘票被操作员换新（_token_version 前进）后，迟到的 grant-death park 不打死新票。
+test('late grant-death park is refused after operator rotated the ticket', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-grantdead-late-'))
+  const vmId = 'vm-late'
+  const vmFile = path.join(root, 'vms', `${vmId}.json`)
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.writeFileSync(
+    vmFile,
+    JSON.stringify({ id: vmId, status: 'running', schedulable: true, codex: { _token_version: 5 } }),
+  )
+  const parked = markCodexGrantDead(root, vmId, { description: 'token_revoked', status: 401 }, { tokenVersion: 3 })
+  const vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  // 磁盘 version 5 > 请求时 version 3：park 被拒
+  assert.equal(vm.unschedulable, undefined)
+  assert.equal(vm.schedulable, true)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+// parkCodexGrantDeadIfHit：search/images JSON 端点的 401 响应体命中吊销文案才落盘。
+test('parkCodexGrantDeadIfHit parses upstream 401 body and parks on revoke wording', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-parkif-'))
+  const vmId = 'vm-parkif'
+  const vmFile = path.join(root, 'vms', `${vmId}.json`)
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.writeFileSync(vmFile, JSON.stringify({ id: vmId, status: 'running', schedulable: true, codex: {} }))
+  // 非 401 / 无吊销文案：不动盘
+  parkCodexGrantDeadIfHit(root, vmId, { status: 429, text: '{}' })
+  parkCodexGrantDeadIfHit(root, vmId, {
+    status: 401,
+    text: JSON.stringify({ error: { code: 'unauthorized' } }),
+  })
+  let vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  assert.equal(vm.unschedulable, undefined)
+  // 命中：落盘摘池
+  parkCodexGrantDeadIfHit(root, vmId, {
+    status: 401,
+    text: JSON.stringify({
+      error: { code: 'token_revoked', message: 'Encountered invalidated oauth token for user' },
+    }),
+  })
+  vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  assert.equal(vm.unschedulable?.reason, 'oauth_revoked')
+  assert.equal(vm.schedulable, false)
+  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('#A11: an OpenAI pool that stays full answers 429 pool_overloaded', async () => {

@@ -276,6 +276,12 @@ export async function refreshCodexAccessToken(opts = {}) {
     const status = Number(res?.status) || 0
     const payload = await readFetchBody(res)
     if (status === 401 || status === 403) {
+      // OpenAI 吊销文案（token_revoked / invalidated oauth token）与普通 401 分开，
+      // 让上层能区分「grant 死透需重授权」与「模糊拒绝」。
+      const blob = `${payload?.error || ''} ${payload?.error_description || ''}`
+      if (/token_revoked|invalidated oauth token|token has been revoked|oauth_revoked/i.test(blob)) {
+        return { ok: false, error: 'oauth_revoked', status, revoked: true, description: payload?.error_description || payload?.error || null }
+      }
       return { ok: false, error: 'refresh_rejected', status }
     }
     if (status >= 400) return { ok: false, error: 'refresh_failed', status }

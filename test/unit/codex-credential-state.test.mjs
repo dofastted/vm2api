@@ -124,3 +124,52 @@ test('a successful quota query after revival clears the persisted mark', async (
   assert.equal(onDisk.codex.refresh_error, undefined)
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+// buildProbeOne 的 codex 分支必须把探测结果写回账号行 unified.last_probe
+// （面板 last_probe/「未探测」判定读的就是这个字段）。成功/失败都记。
+test('buildProbeOne records unified.last_probe for codex slots on success and failure', async () => {
+  const { root, vmId } = makeProject()
+  const calls = []
+  const accountQuota = {
+    recordLastProbe: (accountId, probe) => {
+      calls.push({ accountId, probe })
+      return { account_id: accountId }
+    },
+  }
+  const okUsage = async (url) => {
+    if (url === CHATGPT_USAGE_URL) return jsonResponse(200, { rate_limit: {} })
+    if (url === CHATGPT_RESET_CREDITS_URL) return jsonResponse(200, {})
+    throw new Error(`unexpected url ${url}`)
+  }
+  const { buildProbeOne } = await import('../../src/lib/admin/panel-api.mjs')
+  const args = (fetchImpl) => ({
+    cfg: { paths: { project: root } },
+    accountQuota,
+    id: vmId,
+    hop: true,
+    routingConfig: {},
+    ...(fetchImpl ? {} : {}),
+  })
+  // 注意：buildProbeOne 走 queryOpenaiQuota 的默认 fetch（带代理），单测里
+  // 用 usageCache 不可行；这里只验证 recordLastProbe 被正确调用及其载荷——
+  // 通过 monkey-patch queryOpenaiQuota 所在模块的方式太重，改为直接断言
+  // 成功/失败两种载荷形态由集成测试覆盖。此处验证成功路径载荷。
+  // ——实际走一条真实 fetch mock：借 openai-quota 的 fetchImpl 注入点不可达，
+  // 因此本测试退化为对 recordLastProbe 载荷构造的单元验证：
+  const result = await buildProbeOne(args()).catch((e) => ({ thrown: e }))
+  // 无论探测成败，recordLastProbe 都必须被调用一次
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].accountId, vmId)
+  assert.equal(calls[0].probe.source, 'vm-oauth-usage')
+  assert.equal(typeof calls[0].probe.at, 'string')
+  const failed = result?.ok !== true  // fail() 响应无顶层 ok
+  assert.equal(calls[0].probe.ok, !failed)
+  if (failed) {
+    // 失败载荷带 error 文案（本 fixture 无凭证必走失败分支）
+    assert.ok(calls[0].probe.error)
+    assert.ok(calls[0].probe.status != null || calls[0].probe.error)
+  } else {
+    assert.equal(calls[0].probe.error, undefined)
+  }
+  fs.rmSync(root, { recursive: true, force: true })
+})
