@@ -429,6 +429,7 @@ test('only explicit platform SOCKS5 environments are created and credentials sta
     { ...bound, enabled: false },
     { ...bound, owner_user_id: 'tenant' },
     { ...bound, status: 'dead' },
+    { ...bound, status: 'fail', consecutive_failures: 1, last_error: 'timeout' },
   ]) {
     const blocked = setup(() => assert.fail('unavailable proxy must not reach the host'), proxy)
     assert.equal((await blocked('POST', `${root}/environments`, create)).status, 409)
@@ -452,9 +453,12 @@ test('Gemini routes mirror pool policy: fail stays schedulable, dead is unavaila
     })
     const allowed = await run('POST', `${environmentPath}/test-chat`, { model, prompt: 'ping' })
     assert.notEqual(allowed.status, 409)
+    const rebindFail = await run('PUT', `${environmentPath}/proxy`, { proxy_id: bound.id })
+    assert.equal(rebindFail.status, 409)
+    assert.equal(rebindFail.body.error.code, 'gemini_proxy_unavailable')
     assert.deepEqual(
       operations.map(([operation]) => operation),
-      ['get', 'proxy-probe', 'get', 'test-chat'],
+      ['get', 'proxy-probe', 'get', 'test-chat', 'get'],
     )
   }
   {
