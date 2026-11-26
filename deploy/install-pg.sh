@@ -102,7 +102,7 @@ INSTALLER=""
 TMP_INSTALLER=""
 if [ -n "$SCRIPT_DIR" ] && [ -f "${SCRIPT_DIR}/install.sh" ]; then
   INSTALLER="${SCRIPT_DIR}/install.sh"
-elif [ -f "${INSTALL_DIR}/deploy/install.sh" ] && [ "$ACTION" != "auto" ] && grep -q 'db-migrate)' "${INSTALL_DIR}/deploy/install.sh" 2>/dev/null; then
+elif [ -f "${INSTALL_DIR}/deploy/install.sh" ] && [ "$ACTION" != "auto" ] && grep -q 'url_points_to_local_host' "${INSTALL_DIR}/deploy/install.sh" 2>/dev/null; then
   INSTALLER="${INSTALL_DIR}/deploy/install.sh"
 else
   TMP_INSTALLER="$(mktemp)"

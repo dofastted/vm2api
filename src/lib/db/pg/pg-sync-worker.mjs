@@ -16,6 +16,18 @@ const pool = createPgPool(pgConfig, { maxOverride: pgConfig?.syncPoolMax ?? pgCo
 /** Per-port transaction state: each connected client can pin its own pg.Client inside a tx. */
 const portStates = new Map()
 
+function wakeAllPortsDead() {
+  for (const state of portStates.values()) {
+    const signal = state.signal
+    if (!signal || signal.length < 2) continue
+    try {
+      Atomics.store(signal, 1, 1)
+      Atomics.add(signal, 0, 1)
+      Atomics.notify(signal, 0)
+    } catch {}
+  }
+}
+
 function serializeError(err) {
   return {
     message: String(err?.message || err),
@@ -52,6 +64,7 @@ async function runStatementOnExecutor(executor, op, rawSql, rawParams) {
 
 async function handlePortMessage(port, state, msg) {
   const signal = msg?.sab ? new Int32Array(msg.sab) : null
+  if (signal) state.signal = signal
   const reply = (payload) => {
     try {
       port.postMessage(payload)
@@ -192,7 +205,7 @@ async function handlePortMessage(port, state, msg) {
 }
 
 function attachPort(port) {
-  const state = { txClient: null, queue: Promise.resolve() }
+  const state = { txClient: null, queue: Promise.resolve(), signal: null }
   portStates.set(port, state)
 
   // Serialize messages per port so BEGIN -> queries -> COMMIT execute in strict order,
@@ -220,6 +233,7 @@ parentPort.on('message', async (msg) => {
     return
   }
   if (msg?.op === 'shutdown') {
+    wakeAllPortsDead()
     for (const [port, state] of portStates) {
       if (state.txClient) {
         const client = state.txClient
@@ -239,6 +253,14 @@ parentPort.on('message', async (msg) => {
     } catch {}
     parentPort.postMessage({ shutdown: true })
   }
+})
+
+process.on('uncaughtException', (err) => {
+  wakeAllPortsDead()
+  try {
+    console.error('[pg-sync-worker] uncaughtException:', err?.message || err)
+  } catch {}
+  process.exit(1)
 })
 
 pool
