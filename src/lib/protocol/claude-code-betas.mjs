@@ -89,7 +89,9 @@ function contentHasInlineToolDefinition(content) {
 function contentHasAdvisorResult(content) {
   if (!Array.isArray(content)) return false
   for (const block of content) {
-    if (block && typeof block === 'object' && block.type === 'advisor_tool_result') return true
+    if (!block || typeof block !== 'object') continue
+    if (block.type === 'advisor_tool_result') return true
+    if (block.type === 'server_tool_use' && block.name === 'advisor') return true
   }
   return false
 }
@@ -135,7 +137,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
     for (const tool of body.tools) {
       if (tool?.strict === true) add('structured-outputs-2025-12-15')
       if (tool?.defer_loading || String(tool?.type || '').startsWith('tool_search_tool_')) add(BETA_ADVANCED_TOOL_USE)
-      if (tool?.type === 'advisor_20260301') add(BETA_ADVISOR_TOOL)
+      if (String(tool?.type || '').startsWith('advisor_')) add(BETA_ADVISOR_TOOL)
     }
   }
   if (body.thinking?.block_binding) add(BETA_THINKING_BINDING_CONTROLS)

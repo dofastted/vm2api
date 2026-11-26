@@ -511,12 +511,10 @@ function sanitizeToolDefinition(tool, param, capabilities) {
     invalid(param, 'must use a Claude tool definition')
   }
   if (tool.type === 'advisor_20260301') {
-    if (
-      tool.name !== 'advisor' ||
-      typeof tool.model !== 'string' ||
-      !tool.model.trim() ||
-      tool.input_schema !== undefined
-    ) {
+    // name and model are upstream contract fields and remain fail-closed; a stray
+    // input_schema (e.g. synthesized by an intermediate proxy) is stripped by
+    // pickKeys below instead of refusing the whole turn (aligned with CRAG PR #31).
+    if (tool.name !== 'advisor' || typeof tool.model !== 'string' || !tool.model.trim()) {
       invalid(param, 'invalid native advisor tool definition')
     }
     const clean = pickKeys(tool, ADVISOR_TOOL_KEYS)
