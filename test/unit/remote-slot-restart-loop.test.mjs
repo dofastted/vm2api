@@ -94,6 +94,7 @@ function fixture({
   mismatch = false,
   kind = 'docker',
   removeFails = false,
+  createFails = false,
   cragReady = false,
   subscription = false,
   computerRequired = false,
@@ -125,6 +126,8 @@ function fixture({
       : cragReady
         ? cragReadyContainer(base)
         : kernelContainer(base, cpuWrapped)
+  // The renamed-aside original between the rename and the rollback/cleanup.
+  let backupInfo = null
   const io = {
     resolveSlotRouting: (_root, routing) => routing || {},
     withCragRuntimeAdmission: (_vm, _root, _options, run) => run(),
@@ -146,17 +149,43 @@ function fixture({
     ensureRemoteEgress: async () => ({ ok: true, network: 'network' }),
     containerName: () => 'kin-fixture',
     clusterManager: () => ({ ensureSlotRelays: async () => ({}) }),
-    inspectContainerOrNull: async () => info,
+    // The production code stamps the aside name with this (63-char safe).
+    migrationBackupName: (name, stamp = 1750000000000) => `${String(name).slice(0, 47)}-legacy-${stamp}`,
+    // The cutover disconnects the renamed original from its user-defined
+    // networks (freeing the endpoints) and the rollback connects it back.
+    userDefinedNetworkNames: () => ['network'],
+    networkEndpointSnapshot: () => ({}),
+    disconnectContainerFromNetwork: async () => {},
+    connectContainerToNetwork: async () => {},
+    inspectContainerOrNull: async (_docker, id) => {
+      if (typeof id === 'string' && id.includes('-pre-recreate-')) return backupInfo
+      return info
+    },
     slotDockerCpus: () => 0,
     runtimeLabelOf: () => kind,
     runtimeKind: () => kind,
     codexRoleMatches: () => true,
     SLOT_LAYOUT: '2',
     applyRuntime: () => calls.push('runtime'),
-    removeContainer: async () => {
-      calls.push('remove')
+    // rename-aside recreate: the original keeps running until the replacement
+    // is up, then the backup is deleted; on failure it is rolled back in place.
+    renameContainer: async (_docker, _id, to) => {
+      calls.push(String(to).includes('-pre-recreate-') ? 'rename:aside' : 'rename:back')
+      if (String(to).includes('-pre-recreate-')) {
+        // The original now answers to its backup name only.
+        backupInfo = info
+        info = null
+      } else {
+        // Rollback: the backup returns to the real name.
+        info = backupInfo
+        backupInfo = null
+      }
+    },
+    removeContainer: async (_docker, id) => {
+      calls.push(String(id).includes('-pre-recreate-') ? 'remove:backup' : `remove:${id}`)
       if (removeFails) throw new Error('remove denied')
-      info = null
+      if (!id || id === 'kin-fixture' || id === 'fixture-cid') info = null
+      if (String(id).includes('-pre-recreate-')) backupInfo = null
     },
     writeWorkerFiles: () => calls.push('files'),
     ensureGuestMachineIdFile: () => {},
@@ -168,13 +197,17 @@ function fixture({
     releaseRemoteEgress: async () => {},
     createContainerRaw: async () => {
       calls.push('create')
+      if (createFails) throw new Error('socket hang up')
       info = { State: { Running: false, Restarting: false } }
     },
     slotContainerBody: () => ({}),
     containerAction: async (_docker, _name, action) => {
       calls.push(action)
-      if (info.State.Restarting) throw new Error('restart loop was not replaced')
-      info.State.Running = true
+      // Stopping the restart-looping original is legitimate (the rename-aside
+      // flow does it before the replacement is created); only starting the
+      // still-looping original must fail.
+      if (action === 'start' && info.State.Restarting) throw new Error('restart loop was not replaced')
+      info.State.Running = action === 'start'
     },
     chownRemoteKvmBinds: async () => {},
     startRemoteTelemetry: async () => {},
@@ -202,6 +235,7 @@ function fixture({
   return {
     calls,
     target,
+    io,
     boot: () => fns.startRemoteSlot(target, '/fixture'),
     reload: () => fns.reloadRemoteSlot(target, '/fixture'),
     state: () => info?.State,
@@ -212,12 +246,12 @@ test('a telemetry-on cluster Docker slot without computer binds is recreated on 
   const legacyStart = fixture({ cragReady: true, computerRequired: true, computerBinds: false })
   legacyStart.target.dataplane = 'crag'
   assert.equal((await legacyStart.boot()).action, 'created')
-  assert.deepEqual(legacyStart.calls, ['remove', 'files', 'create', 'start', 'runtime'])
+  assert.deepEqual(legacyStart.calls, ['stop', 'rename:aside', 'files', 'create', 'start', 'runtime', 'remove:backup'])
 
   const legacyReload = fixture({ cragReady: true, computerRequired: true, computerBinds: false })
   legacyReload.target.dataplane = 'crag'
   assert.equal((await legacyReload.reload()).action, 'created')
-  assert.deepEqual(legacyReload.calls, ['remove', 'files', 'create', 'start', 'runtime'])
+  assert.deepEqual(legacyReload.calls, ['stop', 'rename:aside', 'files', 'create', 'start', 'runtime', 'remove:backup'])
 
   const telemetryOff = fixture({ cragReady: true, computerBinds: false })
   telemetryOff.target.dataplane = 'crag'
@@ -230,7 +264,7 @@ test('a subscribed cluster Docker slot replaces the old container before startin
   f.target.dataplane = 'crag'
   f.target.crag_kernel_version = 'v2'
   assert.equal((await f.boot()).action, 'created')
-  assert.deepEqual(f.calls, ['remove', 'files', 'publish-subscription', 'create', 'start', 'runtime'])
+  assert.deepEqual(f.calls, ['stop', 'rename:aside', 'files', 'publish-subscription', 'create', 'start', 'runtime', 'remove:backup'])
   const body = slotContainerBody(f.target, {
     image: 'fixture',
     network: 'fixture',
@@ -256,7 +290,13 @@ for (const kind of ['docker', 'kvm']) {
     test(`${kind} restart-loop Running=${running} is removed, recreated and started`, async () => {
       const f = fixture({ kind, running, restarting: true })
       assert.equal((await f.boot()).action, 'created')
-      assert.deepEqual(f.calls, ['remove', 'files', 'create', 'start', 'runtime'])
+      // A running original is stopped before being renamed aside.
+      assert.deepEqual(
+        f.calls,
+        running
+          ? ['stop', 'rename:aside', 'files', 'create', 'start', 'runtime', 'remove:backup']
+          : ['rename:aside', 'files', 'create', 'start', 'runtime', 'remove:backup'],
+      )
       assert.equal(f.state().Restarting, false)
       assert.equal(f.state().Running, true)
     })
@@ -268,8 +308,8 @@ for (const [options, action, calls] of [
   [{ cpuWrapped: true }, 'already-running', ['runtime']],
   [{ running: false }, 'started', ['files', 'start', 'runtime']],
   [{ missing: true }, 'created', ['files', 'create', 'start', 'runtime']],
-  [{ mismatch: true }, 'created', ['remove', 'files', 'create', 'start', 'runtime']],
-  [{ cragReady: true }, 'created', ['remove', 'files', 'create', 'start', 'runtime']],
+  [{ mismatch: true }, 'created', ['stop', 'rename:aside', 'files', 'create', 'start', 'runtime', 'remove:backup']],
+  [{ cragReady: true }, 'created', ['stop', 'rename:aside', 'files', 'create', 'start', 'runtime', 'remove:backup']],
 ]) {
   test(`remote lifecycle preserves ${action} behavior: ${JSON.stringify(options)}`, async () => {
     const f = fixture(options)
@@ -277,7 +317,6 @@ for (const [options, action, calls] of [
     assert.deepEqual(f.calls, calls)
   })
 }
-
 test('remote readiness accepts direct and CPU-wrapped entries but not another executable', () => {
   const vm = { node_id: 'node-fixture' }
   for (const cpuWrapped of [false, true]) {
@@ -287,10 +326,42 @@ test('remote readiness accepts direct and CPU-wrapped entries but not another ex
   assert.equal(clusterDockerCommandReady(vm, { Config: { Cmd: wrong } }, {}), false)
 })
 
-test('failed restart-loop removal does not create or claim successful recovery', async () => {
-  const f = fixture({ restarting: true, removeFails: true })
+test('a failed recreate rolls the renamed original back under its name and restarts it', async () => {
+  // The node link dies between the rename and the replacement start: the
+  // original must return under its real name — and run again, because it was
+  // running before the cutover — so the slot is never gone for the watchdog.
+  const f = fixture({ mismatch: true, createFails: true })
+  const result = await f.boot()
+  assert.equal(result.ok, false)
+  // stop -> rename aside -> files -> create fails (nothing registered under
+  // the real name yet, so no leftover to remove) -> rename back -> start.
+  assert.deepEqual(f.calls, ['stop', 'rename:aside', 'files', 'create', 'rename:back', 'start'])
+  // The rollback returned the original under the real name, running.
+  assert.equal(f.state()?.Running, true)
+})
+
+test('a stopped original rolls back without being started', async () => {
+  const f = fixture({ running: false, mismatch: true, createFails: true })
   assert.equal((await f.boot()).ok, false)
-  assert.deepEqual(f.calls, ['remove'])
+  // No stop (it was not running), no start on rollback.
+  assert.deepEqual(f.calls, ['rename:aside', 'files', 'create', 'rename:back'])
+})
+
+test('a running mismatched original is stopped before being renamed aside', async () => {
+  const f = fixture({ running: true, mismatch: true })
+  assert.equal((await f.boot()).action, 'created')
+  assert.equal(f.calls[0], 'stop')
+  assert.equal(f.calls[1], 'rename:aside')
+  assert.equal(f.calls.at(-1), 'remove:backup')
+})
+
+test('backup cleanup failure does not fail the recreate that already succeeded', async () => {
+  const f = fixture({ restarting: true, removeFails: true })
+  // rename-aside + create + start already succeeded; only the now-redundant
+  // backup removal failed. The boot must still report success so the slot is
+  // not parked as failed while its replacement is actually running.
+  assert.equal((await f.boot()).action, 'created')
+  assert.ok(f.calls.includes('remove:backup'))
 })
 
 test('watchdog revival reaches the remote lifecycle and clears a restart loop without spending another attempt', async () => {
