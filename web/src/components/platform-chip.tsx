@@ -76,7 +76,8 @@ export function SlotIdentity({
     emptyLabel,
   })
   const name = String(vm?.name || '').trim()
-  const shown = rawEmail ? formatSlotEmail(rawEmail) : name || full
+  // 名称优先（识别靠名称体系）；无名称时列表面脱敏展示，完整地址放悬停 title
+  const shown = name || (rawEmail ? formatSlotEmail(rawEmail) : full)
   const tip = rawEmail
     ? name && name !== rawEmail
       ? `${name} · ${rawEmail}`

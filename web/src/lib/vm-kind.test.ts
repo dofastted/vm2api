@@ -94,23 +94,24 @@ describe('kindFromModel / slotAccountLabel', () => {
     expect(formatSlotEmail('  ')).toBe('')
   })
 
-  it('extracts and prefers detected email across Claude, Codex, and Gemini slots', () => {
+  it('prefers custom name, then full email (admin review surfaces), then id', () => {
+    // 自定义名称优先（识别靠名称体系）
     expect(
       slotDisplayTitle({
         id: 'vm-01',
         name: 'Claude 01',
         email: '12345678@gmail21321.com',
       })
-    ).toBe('12345...@gmail')
+    ).toBe('Claude 01')
+    // 无名称的详情面展示完整邮箱供管理员审阅
     expect(
       slotDisplayTitle({
         id: 'gem-01',
-        name: 'Gemini Pro',
         gemini: {
           account: { email: '12345678@gmail21321.com' },
         } as Vm['gemini'],
       })
-    ).toBe('12345...@gmail')
+    ).toBe('12345678@gmail21321.com')
     expect(slotRawEmail({})).toBe('')
     expect(slotDisplayTitle({ id: 'vm-01', name: 'Claude 01' })).toBe(
       'Claude 01'

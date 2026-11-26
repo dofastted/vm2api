@@ -478,7 +478,7 @@ export function KeyLimitsDialog({
                           />
                           <span
                             className='truncate'
-                            title={slotRawEmail(vm) || vm.name || vm.id}
+                            title={slotRawEmail(vm) || undefined}
                           >
                             {slotDisplayTitle(vm)}
                           </span>

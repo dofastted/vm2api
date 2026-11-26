@@ -21,7 +21,6 @@ import {
 import { fmtExpiresAt, fmtNum, fmtUsd } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import {
-  formatSlotEmail,
   isCodexVm,
   slotNameLabel,
   slotRawEmail,
@@ -209,8 +208,9 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
               )}
             </Field>
             <Field label='邮箱' compact>
-              <span className='text-xs' title={slotRawEmail(vm)}>
-                {slotRawEmail(vm) ? formatSlotEmail(slotRawEmail(vm)) : '-'}
+              {/* 详情面管理员审阅用：完整展示，不做脱敏 */}
+              <span className='text-xs break-all'>
+                {slotRawEmail(vm) || '-'}
               </span>
             </Field>
             <Field label='过期' compact>
