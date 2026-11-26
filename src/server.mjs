@@ -81,6 +81,7 @@ import { normalizeNotifyConfig, createNotifyMonitor } from './lib/admin/notify.m
 import { snapshotVmConnectivity } from './lib/admin/vm-connectivity.mjs'
 import { runVmTestChat } from './lib/admin/vm-test-chat.mjs'
 import { VmTestScheduleRunner } from './lib/admin/vm-test-schedule.mjs'
+import { preheatNextWindowEnd, preheatWindowState } from './lib/admin/vm-test-preheat-window.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
@@ -107,7 +108,6 @@ import {
   isCodexVm,
   syncCodexQuotaSchedule,
 } from './lib/vm/vm-registry.mjs'
-import { extraIsLiveOpen, parseResetMs } from './lib/pool/quota-window.mjs'
 import { createCragSubscription } from './lib/vm/crag-subscription.mjs'
 import { createCragRuntimeInventory } from './lib/vm/crag-runtime-inventory.mjs'
 import { configureCragRuntimeAdmission } from './lib/vm/slot-runtime-admission.mjs'
@@ -735,17 +735,7 @@ const vmTestSchedule = new VmTestScheduleRunner({
     try {
       const vm = getVm(cfg.paths.project, vmId)
       if (!vm) return { hasCredential: false, schedulable: false, windowLive: false }
-      const hasCredential = !!(vm.has_token || vm.claude?.has_access || vm.codex?.has_access)
-      const schedulable = vm.schedulable !== false
-      const acc = accountQuota
-        ?.snapshot?.()
-        .accounts?.find((row) => row.vm_id === vmId || row.account_id === (vm.claude?.account_uuid || vm.account_uuid))
-      if (!acc) return { hasCredential, schedulable, windowLive: false }
-      const w5 = acc.unified?.headers?.['5h'] || acc.unified?.['5h'] || {}
-      const resetMs = parseResetMs(w5.reset)
-      const windowLive =
-        extraIsLiveOpen(w5) || (Number.isFinite(resetMs) && resetMs > Date.now() && Number(w5.utilization) > 0)
-      return { hasCredential, schedulable, windowLive }
+      return preheatWindowState(vm, { projectRoot: cfg.paths.project, accountQuota })
     } catch {
       return null
     }
@@ -754,12 +744,7 @@ const vmTestSchedule = new VmTestScheduleRunner({
     try {
       const vm = getVm(cfg.paths.project, vmId)
       if (!vm) return null
-      const acc = accountQuota
-        ?.snapshot?.()
-        .accounts?.find((row) => row.vm_id === vmId || row.account_id === (vm.claude?.account_uuid || vm.account_uuid))
-      const w5 = acc?.unified?.headers?.['5h'] || acc?.unified?.['5h'] || {}
-      const resetMs = parseResetMs(w5.reset)
-      return Number.isFinite(resetMs) ? resetMs : null
+      return preheatNextWindowEnd(vm, { projectRoot: cfg.paths.project, accountQuota })
     } catch {
       return null
     }

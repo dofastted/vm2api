@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **修复 Codex 续热定时器不读官方 5h reset 与面板保存清空 `preheat`/`auto_renew`（#1874，仅 Bug）**：
+  - 续热窗口探测与 `auto_renew` 扫描改为：Codex 槽从 `summarizeCodexSlot` 的 `usage.quota` 读取 5h reset/占用，Claude 槽仍读 `accountQuota.unified['5h']`；不再因 Codex 缺少 Claude 配额行而永远读不到窗口。
+  - 面板 PUT 保存定时测试时若请求体未带 `mode`/`auto_renew`，服务端合并保留既有预热配置；`applyScheduleStructure` 与全量 sync 同样保留。
+  - 回归：`test/unit/issue-1874.test.mjs`。
+
 ## 1.4.230 — 2026-11-26 · 内核不再为带 type 的工具合成 `input_schema`（advisor 全链路放行）、新增 advisor 处理说明
 
 - **`kin-kernel` 新二进制：带显式非 `custom` `type` 的工具不再被补 `input_schema`（payload pin 变更）**：

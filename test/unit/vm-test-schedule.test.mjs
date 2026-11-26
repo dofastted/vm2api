@@ -321,7 +321,7 @@ test('preheat mode normalizes and round-trips through the store', () => {
   assert.equal(stored.auto_renew, false)
   // Unknown mode rejects; auto_renew requires preheat.
   assert.throws(() => schedule.save('vm-01', { ...preheatConfig, mode: 'both' }), /mode/)
-  assert.throws(() => schedule.save('vm-01', { ...claudeConfig, auto_renew: true }), /auto_renew/)
+  assert.throws(() => schedule.save('vm-01', { ...claudeConfig, mode: 'test', auto_renew: true }), /auto_renew/)
 })
 
 test('preheat fires only when the window is not live and the slot is healthy', async () => {
