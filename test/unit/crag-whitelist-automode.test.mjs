@@ -291,6 +291,82 @@ test('#8 CRAG whitelist keeps thinking.block_binding so thinking-binding-control
   )
 })
 
+test('#7 CRAG whitelist counts cache breakpoints nested inside tool_result.content', () => {
+  const toolTurns = (resultContent) => [
+    { role: 'user', content: [{ type: 'text', text: 'read it' }] },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'read_file', input: { path: 'a' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', ...resultContent }] },
+  ]
+
+  // 1 top-level + 4 nested = 5 breakpoints. Before this fix only the top-level one
+  // was counted, so the request went out and Anthropic returned the 400 instead.
+  assert.throws(
+    () =>
+      prepareCragRequest(
+        {
+          model: 'claude-sonnet-5-5',
+          system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+          messages: toolTurns({
+            content: ['a', 'b', 'c', 'd'].map((text) => ({
+              type: 'text',
+              text,
+              cache_control: { type: 'ephemeral', ttl: '1h' },
+            })),
+          }),
+        },
+        { capabilities: V3_CAPS },
+      ),
+    (err) =>
+      err.status === 400 && err.code === 'invalid_cache_control' && /exceeds four breakpoints/.test(err.message),
+  )
+
+  // Exactly 4 nested breakpoints still passes: the fix must not reject legal requests.
+  const atBudget = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      messages: toolTurns({
+        content: ['a', 'b', 'c', 'd'].map((text) => ({
+          type: 'text',
+          text,
+          cache_control: { type: 'ephemeral', ttl: '1h' },
+        })),
+      }),
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.equal(atBudget.messages[2].content[0].content.length, 4)
+
+  // Children occupy an earlier prompt span than the parent breakpoint, so a 1h
+  // child before a 5m parent is the legal order.
+  const nestedOrder = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      messages: toolTurns({
+        content: [{ type: 'text', text: 'long', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+        cache_control: { type: 'ephemeral', ttl: '5m' },
+      }),
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(nestedOrder.messages[2].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+
+  // ...and the inversion is now caught locally.
+  assert.throws(
+    () =>
+      prepareCragRequest(
+        {
+          model: 'claude-sonnet-5-5',
+          messages: toolTurns({
+            content: [{ type: 'text', text: 'short', cache_control: { type: 'ephemeral', ttl: '5m' } }],
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          }),
+        },
+        { capabilities: V3_CAPS },
+      ),
+    (err) => err.status === 400 && err.code === 'invalid_cache_control' && /1h before 5m/.test(err.message),
+  )
+})
+
 test('third-party system relocation + prepareCragPrintBody omits redundant CLI identity placeholder (prevents Extra Usage)', () => {
   const inbound = {
     model: 'claude-sonnet-5-5',
