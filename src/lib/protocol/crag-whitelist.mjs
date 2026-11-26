@@ -126,7 +126,7 @@ const PROVIDER_HISTORY_BLOCK_TYPES = new Set([
   'advisor_tool_result',
 ])
 
-const THINKING_KEYS = new Set(['type', 'budget_tokens', 'display'])
+const THINKING_KEYS = new Set(['type', 'budget_tokens', 'display', 'block_binding'])
 const TOOL_CHOICE_KEYS = new Set(['type', 'name', 'disable_parallel_tool_use'])
 const OUTPUT_CONFIG_KEYS = new Set(['effort', 'format', 'task_budget'])
 const CONTEXT_MANAGEMENT_KEYS = new Set(['edits'])
