@@ -120,6 +120,23 @@ class SandboxProbeTests(unittest.TestCase):
             self.mod._apparmor_sandbox_evidence(b"bwrap: Operation not permitted", host_root=self.host_root)
         )
 
+    def test_execvp_permission_denied_classified_as_sandbox_unavailable_not_apparmor(self):
+        """Real bwrap execvp stderr must match bind-launch patterns before AppArmor heuristics."""
+        self._write_aa_state(enabled="Y", restricted="1", current="unconfined")
+        real_stderr = "bwrap: execvp /opt/vm2api/share/gemini/current/craggemini: Permission denied"
+        self.assertEqual(
+            self.mod._classify_bwrap_launch_stderr(real_stderr, host_root=self.host_root),
+            (503, "gemini_sandbox_unavailable"),
+        )
+        self._write_aa_state(enabled="Y", restricted="1", current="unconfined")
+        self.assertEqual(
+            self.mod._classify_bwrap_launch_stderr(
+                "bwrap: setting up uid map: Permission denied",
+                host_root=self.host_root,
+            ),
+            (503, "gemini_sandbox_apparmor_restricted"),
+        )
+
     def test_probe_reports_missing_managed_bwrap_on_mediated_hosts(self):
         staged = self.host_root / "etc/apparmor.d/bwrap-userns-restrict"
         staged.parent.mkdir(parents=True, exist_ok=True)

@@ -244,7 +244,7 @@ BWRAP_FATAL_STDERR = re.compile(rb"bwrap:\s+(?!warning\b)", re.I)
 BWRAP_BIND_MOUNT_STDERR = re.compile(
     rb"can't find source path|can't bind mount|can't mount proc|"
     rb"failed to (?:open|mount)|no such file or directory|"
-    rb"execvp permission denied",
+    rb"execvp\s+\S+:\s*permission\s+denied",
     re.I,
 )
 

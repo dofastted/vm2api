@@ -889,8 +889,7 @@ export function createGeminiScheduler({
     if (environment.crag_license?.valid === true) {
       return { ok: true, seat_required: true }
     }
-    const licCode =
-      typeof environment.crag_license?.code === 'string' ? environment.crag_license.code : null
+    const licCode = typeof environment.crag_license?.code === 'string' ? environment.crag_license.code : null
     if (licCode && Object.hasOwn(FAILURES, licCode)) {
       const [status, message] = FAILURES[licCode]
       return { ok: false, status, code: licCode, message }
