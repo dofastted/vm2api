@@ -203,6 +203,20 @@ test('mergeUsage last-wins without summing tokens or reasoning', () => {
   assert.equal(merged.output_tokens_details.reasoning_tokens, 40)
 })
 
+test('mergeUsage preserves non-empty iterations when a later chunk sends empty iterations', () => {
+  const iterations = [
+    { type: 'message', model: 'claude-sonnet-5', input_tokens: 100, output_tokens: 20 },
+    { type: 'advisor_message', model: 'claude-opus-5-5', input_tokens: 300, output_tokens: 40 },
+  ]
+  const kept = mergeUsage({ input_tokens: 100, iterations }, { output_tokens: 20, iterations: [] })
+  assert.deepEqual(kept.iterations, iterations)
+  const replaced = mergeUsage(
+    { input_tokens: 100, iterations: [{ type: 'message', input_tokens: 100, output_tokens: 5 }] },
+    { output_tokens: 20, iterations },
+  )
+  assert.deepEqual(replaced.iterations, iterations)
+})
+
 test('preferUsage keeps inclusive mass and prefers cache detail on a tie', () => {
   const trailer = { input_tokens: 120, output_tokens: 9 }
   const sse = { input_tokens: 120, output_tokens: 9, input_tokens_details: { cached_tokens: 8 } }

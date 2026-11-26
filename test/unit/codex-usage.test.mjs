@@ -25,7 +25,9 @@ test('extra maps 5h/7d used percent without inversion', () => {
   const limits = normalizeCodexLimits(snap)
   assert.equal(limits.used_5h_percent, 6)
   assert.equal(limits.used_7d_percent, 34)
-  const view = buildCodexUsageView(snap)
+  // A fixed `now` inside the window keeps this testing the mapping; with the
+  // real clock the 2026-09 resets are elapsed and the view correctly drops them.
+  const view = buildCodexUsageView(snap, Date.parse('2026-09-07T00:00:00.000Z'))
   assert.equal(view.unit, 'percent_used')
   assert.equal(view.quota.utilization_5h, 0.06)
   assert.equal(view.quota.utilization_7d, 0.34)
@@ -55,7 +57,7 @@ test('live x-codex headers map to extra without assuming 5h/7d', () => {
     },
     now,
   )
-  const view = buildCodexUsageView(extra)
+  const view = buildCodexUsageView(extra, now)
   assert.equal(view.windows.find((w) => w.id === '5h').used_percent, 40)
   assert.equal(view.windows.find((w) => w.id === '7d').used_percent, 12.5)
   assert.equal(view.quota.utilization_5h, 0.4)
@@ -99,6 +101,49 @@ test('elapsed reset on a leftover 100% window is not parked', () => {
     now,
   )
   assert.equal(park.limited, false)
+})
+
+test('quota view drops elapsed 5h/7d readings instead of pinning the panel at the stale window', () => {
+  const now = Date.parse('2026-09-17T00:00:00.000Z')
+  // 5h reset elapsed, 7d still live: the 100% is the closed window's leftover.
+  const view = buildCodexUsageView(
+    {
+      codex_5h_used_percent: 100,
+      codex_5h_window_minutes: 300,
+      codex_5h_reset_at: new Date(now - 60_000).toISOString(),
+      codex_7d_used_percent: 67,
+      codex_7d_window_minutes: 10080,
+      codex_7d_reset_at: new Date(now + 3600_000).toISOString(),
+    },
+    now,
+  )
+  assert.equal(view.quota.utilization_5h, null)
+  assert.equal(view.quota.status_5h, null)
+  assert.equal(view.quota.reset_5h, null)
+  assert.equal(view.quota.utilization_7d, 0.67)
+  assert.equal(view.quota.status_7d, 'ok')
+  // Live caps keep their reading: scheduling treats them as restricted, so
+  // the panel must keep showing them.
+  const liveView = buildCodexUsageView(
+    {
+      codex_5h_used_percent: 100,
+      codex_5h_window_minutes: 300,
+      codex_5h_reset_at: new Date(now + 500_000).toISOString(),
+    },
+    now,
+  )
+  assert.equal(liveView.quota.utilization_5h, 1)
+  assert.equal(liveView.quota.status_5h, 'limited')
+  // No reset on the reading: unknown liveness stays conservative (unchanged).
+  const noResetView = buildCodexUsageView(
+    {
+      codex_5h_used_percent: 100,
+      codex_5h_window_minutes: 300,
+    },
+    now,
+  )
+  assert.equal(noResetView.quota.utilization_5h, 1)
+  assert.equal(noResetView.quota.status_5h, 'limited')
 })
 
 test('classifies 1440-minute window as 24h and ignores 0-minute records (#1744)', () => {
