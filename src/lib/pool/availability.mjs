@@ -47,6 +47,19 @@ function currentRefreshError(vm = {}, refreshError = null) {
   return refreshError || vm?.claude?.refresh_error || vm?.refresh_error || null
 }
 
+/**
+ * True when every expiry we can see for this slot is already in the past.
+ * Takes the latest of them so a stale control-plane copy cannot outvote a
+ * fresher ticket the worker reports. Unknown expiry is never "expired".
+ */
+export function isAccessExpiredEverywhere({ vm = {}, expiresAt = null, workerCredential = null, now = Date.now() } = {}) {
+  const known = [expiresAt, workerCredential?.expires_at, vm?.claude?.expires_at, vm?.expires_at]
+    .map((v) => expiresAtToMs(v))
+    .filter((ms) => Number.isFinite(ms) && ms > 0)
+  if (!known.length) return false
+  return Math.max(...known) <= now
+}
+
 /** True when the slot already has a live access ticket after a later refresh. */
 export function isLiveRefreshedAccess({ vm = {}, expiresAt = null, workerCredential = null, now = Date.now() } = {}) {
   const expMs = liveAccessTtlMs(vm, workerCredential || {}, expiresAt)
@@ -68,6 +81,13 @@ export function isCredentialRefreshFailed({
 } = {}) {
   if (isOfficialUsageRateLimited(probe)) return false
   const recordedError = currentRefreshError(vm, refreshError)
+  // Expired ticket + a recorded refresh failure cannot serve a single request:
+  // the CLI starts without a valid token and the slot only times out (the
+  // circuit then reports a "kernel fault"). Worker codes such as a bare
+  // `refresh_failed` carry no grant wording, so the regex below misses them.
+  // A later successful refresh or re-import clears refresh_error and moves the
+  // expiry forward, which releases the slot again.
+  if (recordedError && isAccessExpiredEverywhere({ vm, expiresAt, workerCredential, now })) return true
   const transientRecorded = TRANSIENT_CREDENTIAL_REFRESH_FAIL.test(String(recordedError || ''))
   const accessOutlives = currentAccessOutlivesGrantError(
     vm,

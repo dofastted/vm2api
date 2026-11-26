@@ -613,3 +613,79 @@ test('rest stays restricted even with a stale cooldown left on the slot', () => 
   assert.equal(triad.restriction_until, until)
   assert.equal(triad.restriction_text, '休息时段')
 })
+
+test('expired access with a bare worker refresh_failed is 无效凭证', () => {
+  // Production shape: token expired days ago, the worker reports a generic
+  // `refresh_failed`, the panel probe says "OAuth refresh failed". The slot only
+  // timed out and the circuit called it a kernel fault, while it stayed 可用.
+  const now = Date.now()
+  const expired = now - 3 * 86400_000
+  const av = evaluateAccount({
+    vm: {
+      claude: {
+        has_access: true,
+        has_refresh: true,
+        expires_at: Math.floor(expired / 1000),
+        refresh_error: 'refresh_failed',
+      },
+    },
+    schedulable: true,
+    lastProbe: { ok: false, source: 'official-cc-usage', error: 'OAuth refresh failed', transport: true },
+    workerCredential: { has_access: true, has_refresh: true, needs_refresh: true, expires_at: expired },
+    quota: { utilization_5h: 0, status_5h: 'allowed' },
+    now,
+  })
+  assert.equal(av.key, 'bad')
+  assert.equal(av.text, '无效凭证')
+  assert.equal(av.reason, 'credential_refresh_failed')
+  assert.equal(av.accept, false)
+})
+
+test('a bare refresh_failed does not eject a ticket that is still live', () => {
+  const now = Date.now()
+  const live = now + 3600_000
+  const av = evaluateAccount({
+    vm: { claude: { has_access: true, has_refresh: true, expires_at: Math.floor(live / 1000), refresh_error: 'refresh_failed' } },
+    schedulable: true,
+    lastProbe: usageOk,
+    workerCredential: { has_access: true, has_refresh: true, needs_refresh: false, expires_at: live },
+    quota: { utilization_5h: 0.1, status_5h: 'allowed' },
+    now,
+  })
+  assert.notEqual(av.key, 'bad')
+  assert.equal(av.accept, true)
+})
+
+test('expired access without a recorded refresh error stays schedulable', () => {
+  const now = Date.now()
+  const expired = now - 60_000
+  const av = evaluateAccount({
+    vm: { claude: { has_access: true, has_refresh: true, expires_at: Math.floor(expired / 1000) } },
+    schedulable: true,
+    lastProbe: usageOk,
+    workerCredential: { has_access: true, has_refresh: true, needs_refresh: true, expires_at: expired },
+    quota: { utilization_5h: 0.1, status_5h: 'allowed' },
+    now,
+  })
+  assert.notEqual(av.reason, 'credential_refresh_failed')
+})
+
+test('a fresher worker expiry outvotes a stale record with refresh_failed', () => {
+  const now = Date.now()
+  const av = evaluateAccount({
+    vm: {
+      claude: {
+        has_access: true,
+        has_refresh: true,
+        expires_at: Math.floor((now - 86400_000) / 1000),
+        refresh_error: 'refresh_failed',
+      },
+    },
+    schedulable: true,
+    lastProbe: usageOk,
+    workerCredential: { has_access: true, has_refresh: true, needs_refresh: false, expires_at: now + 3600_000 },
+    quota: { utilization_5h: 0.1, status_5h: 'allowed' },
+    now,
+  })
+  assert.notEqual(av.reason, 'credential_refresh_failed')
+})

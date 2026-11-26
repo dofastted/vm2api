@@ -75,3 +75,18 @@ test('missing record is never credential-ready', () => {
   assert.equal(vmHasSchedulableCredential(null), false)
   assert.equal(vmHasSchedulableCredential(undefined, '/tmp'), false)
 })
+
+test('Claude seat with an expired ticket and a bare refresh_failed is not schedulable', () => {
+  const vm = {
+    id: 'vm-03',
+    platform: 'anthropic',
+    family: 'claude',
+    claude: {
+      has_access: true,
+      has_refresh: true,
+      expires_at: Math.floor((Date.now() - 3 * 86400_000) / 1000),
+      refresh_error: 'refresh_failed',
+    },
+  }
+  assert.equal(vmHasSchedulableCredential(vm), false)
+})
