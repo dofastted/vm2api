@@ -34,10 +34,15 @@ def load_host_module():
 
 class SandboxProbeTests(unittest.TestCase):
     def setUp(self):
-        self.mod = load_host_module()
         self.tmp = tempfile.TemporaryDirectory(prefix="gemini-host-sandbox-")
         self.addCleanup(self.tmp.cleanup)
         self.host_root = Path(self.tmp.name)
+        self._host_root_env = patch.dict(
+            os.environ, {"VM2API_GEMINI_HOST_ROOT": str(self.host_root)}
+        )
+        self._host_root_env.start()
+        self.addCleanup(self._host_root_env.stop)
+        self.mod = load_host_module()
         self.host = self.mod.Host.__new__(self.mod.Host)
         self.host.uid_base = 29000
         self.host.egress = self.host_root / "kin-egress"
@@ -62,7 +67,7 @@ class SandboxProbeTests(unittest.TestCase):
 
     def test_probe_command_is_bounded_and_unprivileged(self):
         argv = self.mod._sandbox_probe_command(29000, true_bin="/usr/bin/true")
-        self.assertEqual(argv[:11], [
+        self.assertEqual(argv[:10], [
             "setpriv",
             "--reuid", "29000",
             "--regid", "29000",
@@ -71,8 +76,8 @@ class SandboxProbeTests(unittest.TestCase):
             "--inh-caps=-all",
             "--ambient-caps=-all",
             "--bounding-set=-all",
-            "bwrap",
         ])
+        self.assertTrue(argv[10].endswith("bwrap"))
         for flag in (
             "--unshare-pid",
             "--unshare-ipc",
@@ -114,6 +119,26 @@ class SandboxProbeTests(unittest.TestCase):
         self.assertFalse(
             self.mod._apparmor_sandbox_evidence(b"bwrap: Operation not permitted", host_root=self.host_root)
         )
+
+    def test_probe_reports_missing_managed_bwrap_on_mediated_hosts(self):
+        staged = self.host_root / "etc/apparmor.d/bwrap-userns-restrict"
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text("profile bwrap /usr/bin/bwrap {}\n", encoding="utf-8")
+        profiles = self.host_root / "sys/kernel/security/apparmor/profiles"
+        profiles.parent.mkdir(parents=True, exist_ok=True)
+        profiles.write_text("bwrap (enforce)\n", encoding="utf-8")
+        self._write_aa_state(enabled="Y", restricted="1", current="vm2api-gemini (unconfined)")
+
+        def which_side(tool, path=None):
+            if tool in {"setpriv", "bwrap"}:
+                return f"/usr/bin/{tool}"
+            return None
+
+        with patch.object(self.mod.shutil, "which", side_effect=which_side):
+            self.assertEqual(
+                self.host.probe_sandbox(force=True),
+                "gemini_sandbox_apparmor_restricted",
+            )
 
     def test_probe_pass_apparmor_restricted_generic_failure_and_timeout(self):
         self._write_aa_state(enabled="Y", restricted="1", current="unconfined")
