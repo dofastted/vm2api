@@ -61,6 +61,26 @@ assert impl.classify_craggemini_license_cli_error(
     "",
     "bwrap: Can't find source path /opt/vm2api/share/gemini/current/craggemini: Permission denied",
 ) == (503, "gemini_sandbox_unavailable")
+assert impl.classify_craggemini_license_cli_error(
+    "", "bwrap: Can't bind mount on /usr/var/www/bwrap-test: Permission denied"
+) == (503, "gemini_sandbox_unavailable")
+assert impl.classify_craggemini_license_cli_error(
+    "", "bwrap: Can't mount proc on /newroot/proc: Operation not permitted"
+) == (503, "gemini_sandbox_unavailable")
+assert impl.classify_craggemini_license_cli_error(
+    "", "bwrap: execvp /opt/craggemini: Permission denied"
+) == (503, "gemini_sandbox_unavailable")
+assert impl.classify_craggemini_license_cli_error(
+    "",
+    "bwrap: Warning: hiding non-empty subdir /tmp\n"
+    "craggemini: The CRAGGemini license or encrypted package is invalid.",
+    sync_pending=False,
+) == (403, "license_invalid")
+assert impl.classify_craggemini_license_cli_error(
+    "",
+    "bwrap: Can't find source path /opt/vm2api/share/gemini/current/craggemini: Permission denied",
+    sync_pending=True,
+) == (503, "gemini_sandbox_unavailable")
 with patch.object(impl, "_apparmor_sandbox_evidence", return_value=True):
     assert impl.classify_craggemini_license_cli_error(
         "", "bwrap: setting up uid map: Permission denied"

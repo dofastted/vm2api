@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **修复 Gemini 许可 CLI 将 bwrap 沙箱挂载/命名空间失败误报为 `license_invalid`（Refs #1892）**：
+  - `scripts/gemini-host.py`：`classify_craggemini_license_cli_error` 在回落到许可无效前识别 `bwrap:` 致命启动失败（bind 源不可穿越、`Can't bind mount` / `Can't mount proc` / `execvp Permission denied`、user namespace 拒绝等），分别上报 `gemini_sandbox_unavailable` 与 `gemini_sandbox_apparmor_restricted`；忽略纯 `bwrap: Warning` 行以免掩盖真实许可结论；`license_status` 保留沙箱错误码。
+  - **兼容性**：经宿主 `license-machine-code` / `license-activate` / `license-status` 暴露的 `crag_license.code` 在沙箱启动失败时为 `gemini_sandbox_*`，HTTP **503**（此前误为 **403** `license_invalid`）；`sync_pending` 时 bwrap 失败亦上报沙箱码而非许可错误。`src/lib/gemini/subscription.mjs` / `scheduler.mjs` 准入与调度不再将沙箱码回落为 `license_required`。
+  - 前端 `web/src/features/import/gemini-environments.tsx`：沙箱失败时不突出「绑定 CRAG 席位」操作。
+  - 回归：`test/unit/gemini-host-license-align.py`、`test/unit/gemini-license-sandbox-admission.test.mjs`。
+
 ## 1.4.231 — 2026-11-26 · Advisor 顾问用量独立计费与双库持久化、确定性 400 熔断豁免/平台归因、钉选 CRAG 3.1.23 与新版 `kin-kernel` 载荷
 
 - **Advisor 工具 `advisor_message` 独立计费、双库持久化与全链路清洗（#1928）**：

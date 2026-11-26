@@ -202,6 +202,11 @@ const PAYLOAD_ISSUES = {
   gemini_release_payload_mismatch: 'CRAGGemini 发行授权配置与签名载荷不匹配。',
 }
 
+const CRAG_LICENSE_SANDBOX_CODES = new Set([
+  'gemini_sandbox_apparmor_restricted',
+  'gemini_sandbox_unavailable',
+])
+
 const OAUTH_ISSUES = {
   gemini_oauth_tools_missing: '宿主缺少 Google 授权所需工具。',
   gemini_egress_unavailable: '宿主缺少可用的 kin-egress。',
@@ -1337,7 +1342,8 @@ export function GeminiEnvironments({
         ) : null}
         {isCragSubscription &&
           environment.auth_method === 'oauth' &&
-          !environment.crag_license?.valid ? (
+          !environment.crag_license?.valid &&
+          !CRAG_LICENSE_SANDBOX_CODES.has(environment.crag_license?.code ?? '') ? (
           <Button
             type='button'
             variant='outline'
