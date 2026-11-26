@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.25-worker-oauth-guard",
+  "release": "payload-2026.11.26-kernel-advisor-schema",
   "crag_release": "payload-2026.11.26-crag-3.1.21",
   "crag_authorization": {
     "family": "crag",
@@ -37,8 +37,8 @@
     {
       "path": "bin/kin-kernel",
       "asset": "kin-kernel",
-      "size": 13193840,
-      "sha256": "25cd83e35466d914d109c627d10a6e6e88bb4e8df1e3f9288dc0dcc18ae108ca"
+      "size": 13235464,
+      "sha256": "020d0790b622e008d9c4682c1021bd2ab47979983b10f268adcd2e4de9913369"
     },
     {
       "path": "bin/kin-codex-kernel",
@@ -85,8 +85,8 @@
     {
       "path": "share/wrap-cli/kin-kernel.bin",
       "asset": "kin-kernel",
-      "size": 13193840,
-      "sha256": "25cd83e35466d914d109c627d10a6e6e88bb4e8df1e3f9288dc0dcc18ae108ca"
+      "size": 13235464,
+      "sha256": "020d0790b622e008d9c4682c1021bd2ab47979983b10f268adcd2e4de9913369"
     },
     {
       "path": "share/wrap-cli/glibc239/ld-linux-x86-64.so.2",
