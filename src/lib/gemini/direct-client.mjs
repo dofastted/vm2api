@@ -381,6 +381,9 @@ export function mapCragWorkerError(httpStatus, payload) {
     if (contentRejected) err.contentRejected = true
     return err
   }
+  if (code === 'tool_continuation_aborted' || code === 'gemini_session_conflict') {
+    return makeErr(409, 'gemini_session_conflict', message)
+  }
   if (effectiveStatus === 401) return makeErr(401, 'gemini_oauth_required', message)
   if (effectiveStatus === 403) return makeErr(403, 'gemini_location_unsupported', message)
   if (effectiveStatus === 404) return makeErr(404, 'gemini_model_unavailable', message)

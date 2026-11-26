@@ -502,6 +502,8 @@ def _map_worker_error(http_status, payload):
         return NativeFailure("gemini_inference_timeout", 504, message)
     if code == "cancelled":
         return NativeFailure("gemini_inference_cancelled", 499, message)
+    if code in ("tool_continuation_aborted", "gemini_session_conflict"):
+        return NativeFailure("gemini_session_conflict", 409, message)
     if effective_status == 429:
         raw_retry = payload.get("retry_after_ms") if isinstance(payload, dict) else None
         retry_after_ms = (
