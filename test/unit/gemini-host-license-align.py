@@ -57,6 +57,39 @@ assert impl.classify_craggemini_license_cli_error(
     "", "craggemini: The CRAGGemini license or encrypted package is invalid.", sync_pending=False
 ) == (403, "license_invalid")
 
+assert impl.classify_craggemini_license_cli_error(
+    "",
+    "bwrap: Can't find source path /opt/vm2api/share/gemini/current/craggemini: Permission denied",
+) == (503, "gemini_sandbox_unavailable")
+assert impl.classify_craggemini_license_cli_error(
+    "", "bwrap: Can't bind mount on /usr/var/www/bwrap-test: Permission denied"
+) == (503, "gemini_sandbox_unavailable")
+assert impl.classify_craggemini_license_cli_error(
+    "", "bwrap: Can't mount proc on /newroot/proc: Operation not permitted"
+) == (503, "gemini_sandbox_unavailable")
+assert impl.classify_craggemini_license_cli_error(
+    "", "bwrap: execvp /opt/craggemini: Permission denied"
+) == (503, "gemini_sandbox_unavailable")
+assert impl.classify_craggemini_license_cli_error(
+    "",
+    "bwrap: Warning: hiding non-empty subdir /tmp\n"
+    "craggemini: The CRAGGemini license or encrypted package is invalid.",
+    sync_pending=False,
+) == (403, "license_invalid")
+assert impl.classify_craggemini_license_cli_error(
+    "",
+    "bwrap: Can't find source path /opt/vm2api/share/gemini/current/craggemini: Permission denied",
+    sync_pending=True,
+) == (503, "gemini_sandbox_unavailable")
+with patch.object(impl, "_apparmor_sandbox_evidence", return_value=True):
+    assert impl.classify_craggemini_license_cli_error(
+        "", "bwrap: setting up uid map: Permission denied"
+    ) == (503, "gemini_sandbox_apparmor_restricted")
+with patch.object(impl, "_apparmor_sandbox_evidence", return_value=False):
+    assert impl.classify_craggemini_license_cli_error(
+        "", "bwrap: failed to setup new user namespace: Operation not permitted"
+    ) == (503, "gemini_sandbox_unavailable")
+
 # 2. Permit payload_key_id extraction & status reconciliation (including v0.4.10 compatibility).
 assert impl.extract_permit_payload_key_id(make_permit(KEY_A)) == KEY_A
 assert impl.extract_permit_payload_key_id("invalid-token") is None
@@ -131,6 +164,15 @@ with tempfile.TemporaryDirectory(prefix="gemini-license-align-") as tmp:
     assert sync_status["valid"] is False
     assert sync_status["code"] == "gemini_subscription_sync_pending"
     assert sync_status["sync_pending"] is True
+
+    with patch.object(
+        host,
+        "run_craggemini_license_cli",
+        side_effect=impl.Failure(503, "gemini_sandbox_unavailable"),
+    ):
+        sandbox_status = host.license_status(env, use_cache=False)
+    assert sandbox_status["valid"] is False
+    assert sandbox_status["code"] == "gemini_sandbox_unavailable"
 
 # 4. Native worker error mapping preserves new codes with aligned HTTP statuses.
 err_key = native_impl._map_worker_error(403, {"code": "license_payload_key_mismatch", "error": "mismatch"})

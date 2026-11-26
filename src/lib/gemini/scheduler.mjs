@@ -83,6 +83,10 @@ const FAILURES = {
   gemini_inference_cancelled: [499, 'The Gemini turn was cancelled.'],
   gemini_inference_output_limit: [502, 'The Gemini response exceeded the text limit.'],
   gemini_inference_tool_blocked: [400, 'This Gemini route accepts one plain-text turn and no tools.'],
+  gemini_session_conflict: [
+    409,
+    'The outbound session cannot continue after appended input while a tool turn is still suspended.',
+  ],
   gemini_inference_failed: [502, 'The Gemini turn failed.'],
   gemini_unsupported_turn: [
     400,
@@ -99,6 +103,14 @@ const FAILURES = {
   gemini_egress_unavailable: [503, 'Gemini egress is not available.'],
   gemini_oauth_tools_missing: [503, 'Gemini OAuth runtime tools are missing.'],
   gemini_ipv4_forwarding_unavailable: [503, 'Gemini IPv4 forwarding is not available.'],
+  gemini_sandbox_apparmor_restricted: [
+    503,
+    'The host AppArmor policy blocks Gemini unprivileged sandboxes; run prepare-gemini or open Gemini maintenance.',
+  ],
+  gemini_sandbox_unavailable: [
+    503,
+    'The host unprivileged bwrap sandbox is unavailable; inspect Gemini maintenance and host service logs.',
+  ],
   license_required: [403, GEMINI_LICENSE_MESSAGES.license_required],
   license_expired: [403, GEMINI_LICENSE_MESSAGES.license_expired],
   license_not_yet_valid: [403, GEMINI_LICENSE_MESSAGES.license_not_yet_valid],
@@ -117,6 +129,7 @@ const NON_CIRCUIT_FAILURES = new Set([
   'gemini_model_unavailable',
   'gemini_unsupported_turn',
   'gemini_inference_tool_blocked',
+  'gemini_session_conflict',
   'gemini_tool_call_required',
   'gemini_native_config_invalid',
   'gemini_proxy_calibration_mismatch',
@@ -172,6 +185,23 @@ const CONTENT_OUTPUT_EVENTS = new Set([
 
 const GROUP_QUOTA_EXHAUSTED_REASONS = new Set(['QUOTA_EXHAUSTED', 'INSUFFICIENT_G1_CREDITS_BALANCE'])
 const SHORT_RATE_LIMIT_MAX_MS = 5_000
+const WORKER_SESSION_CONFLICT_CODES = new Set(['tool_continuation_aborted', 'gemini_session_conflict'])
+
+function resolveInferFailureCode(errBody, statusCode) {
+  const rawCode = typeof errBody?.code === 'string' ? errBody.code : null
+  if (rawCode && Object.hasOwn(FAILURES, rawCode)) return rawCode
+  if (rawCode && WORKER_SESSION_CONFLICT_CODES.has(rawCode)) return 'gemini_session_conflict'
+  if (statusCode === 429) {
+    const quotaMeta = parseUpstreamQuotaMeta(errBody)
+    return quotaMeta.contentRejected ? 'gemini_content_rejected' : 'gemini_quota_exhausted'
+  }
+  if (statusCode === 400) return 'gemini_invalid_request'
+  if (statusCode === 404) return 'gemini_model_unavailable'
+  if (statusCode === 409 && rawCode && WORKER_SESSION_CONFLICT_CODES.has(rawCode)) {
+    return 'gemini_session_conflict'
+  }
+  return 'gemini_inference_failed'
+}
 
 function parseGoDurationMs(raw) {
   if (typeof raw !== 'string') return null
@@ -859,11 +889,18 @@ export function createGeminiScheduler({
     if (environment.crag_license?.valid === true) {
       return { ok: true, seat_required: true }
     }
-    const code =
-      typeof environment.crag_license?.code === 'string' && Object.hasOwn(FAILURES, environment.crag_license.code)
-        ? environment.crag_license.code
-        : 'license_required'
-    return { ok: false, status: 403, code, message: FAILURES[code][1] }
+    const licCode =
+      typeof environment.crag_license?.code === 'string' ? environment.crag_license.code : null
+    if (licCode && Object.hasOwn(FAILURES, licCode)) {
+      const [status, message] = FAILURES[licCode]
+      return { ok: false, status, code: licCode, message }
+    }
+    return {
+      ok: false,
+      status: 403,
+      code: 'license_required',
+      message: FAILURES.license_required[1],
+    }
   }
 
   function recordAccountUsage(apiKeyRecord, model, usage) {
@@ -1107,6 +1144,7 @@ export function createGeminiScheduler({
       const excluded = new Set()
       const shortRetried = new Set()
       let preferredRetryAccountId = null
+      let sessionConflictRetried = false
       let reservation = null
       let selected = null
       let legacyRun = null
@@ -1517,18 +1555,7 @@ export function createGeminiScheduler({
                     legacyRun = { id, run_id: started.run_id }
                   } else {
                     const quotaMeta = parseUpstreamQuotaMeta(errBody)
-                    const errCode =
-                      typeof errBody?.code === 'string' && Object.hasOwn(FAILURES, errBody.code)
-                        ? errBody.code
-                        : res.statusCode === 429
-                          ? quotaMeta.contentRejected
-                            ? 'gemini_content_rejected'
-                            : 'gemini_quota_exhausted'
-                          : res.statusCode === 400
-                            ? 'gemini_invalid_request'
-                            : res.statusCode === 404
-                              ? 'gemini_model_unavailable'
-                              : 'gemini_inference_failed'
+                    const errCode = resolveInferFailureCode(errBody, res.statusCode)
                     const err = fail(
                       res.statusCode || FAILURES[errCode][0],
                       errCode,
@@ -1887,6 +1914,49 @@ export function createGeminiScheduler({
               } catch (sleepErr) {
                 throw attachAttemptMeta(sleepErr)
               }
+              continue
+            }
+
+            if (!emittedOutput && failureCode === 'gemini_session_conflict' && effectiveStickyKey) {
+              stickyBindings.delete(effectiveStickyKey)
+            }
+
+            const canSessionConflictRetry =
+              !emittedOutput &&
+              failureCode === 'gemini_session_conflict' &&
+              !sessionConflictRetried &&
+              attempts < maxAttempts
+
+            if (canSessionConflictRetry) {
+              sessionConflictRetried = true
+              preferredRetryAccountId = selected.accountId
+              try {
+                attemptsRepoRef?.complete?.(requestId, attempts, {
+                  upstreamStatus: attemptUpstreamStatus ?? 409,
+                  errorScope: 'request',
+                  action: 'session_retry',
+                  cooldownUntil: null,
+                  downstreamCommitted: false,
+                  terminalState: 'failed_retryable',
+                  usage: error?.usage || null,
+                  ttftMs: error?.timing?.ttftMs ?? null,
+                  latencyMs: attemptLatencyMs,
+                })
+              } catch {}
+              attemptRecords.push({
+                attempt_no: attempts,
+                account_id: id,
+                vm_id: selected.vmId,
+                upstream_model: resolved.upstreamModel,
+                ...(attemptConversationId ? { conversation_id: attemptConversationId } : {}),
+                selection_reason: selectionReason,
+                upstream_status: attemptUpstreamStatus ?? 409,
+                error_code: failureCode,
+                action: 'session_retry',
+                latency_ms: attemptLatencyMs,
+              })
+              lastError = attachAttemptMeta(failure)
+              selected = null
               continue
             }
 

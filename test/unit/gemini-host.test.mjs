@@ -429,21 +429,46 @@ test('only explicit platform SOCKS5 environments are created and credentials sta
     { ...bound, enabled: false },
     { ...bound, owner_user_id: 'tenant' },
     { ...bound, status: 'dead' },
+    { ...bound, status: 'fail', consecutive_failures: 1, last_error: 'timeout' },
   ]) {
     const blocked = setup(() => assert.fail('unavailable proxy must not reach the host'), proxy)
     assert.equal((await blocked('POST', `${root}/environments`, create)).status, 409)
   }
 })
 
-test('only a probe may use its currently bound enabled proxy with failed health', async () => {
-  for (const status of ['fail', 'dead']) {
+test('Gemini routes mirror pool policy: fail stays schedulable, dead is unavailable except probe', async () => {
+  {
     const operations = []
     const run = setup(
       (operation, payload) => {
         operations.push([operation, payload])
         return operation === 'get' ? record : { ok: false, latency_ms: 14, code: 'private', detail: proxyUrl }
       },
-      { ...bound, status },
+      { ...bound, status: 'fail' },
+    )
+    const probe = await run('POST', `${environmentPath}/proxy/probe`, { proxy_id: 'untrusted', proxy_url: 'untrusted' })
+    assert.deepEqual(probe, {
+      status: 200,
+      body: { ok: true, data: { ok: false, latency_ms: 14, code: 'gemini_proxy_probe_failed' } },
+    })
+    const allowed = await run('POST', `${environmentPath}/test-chat`, { model, prompt: 'ping' })
+    assert.notEqual(allowed.status, 409)
+    const rebindFail = await run('PUT', `${environmentPath}/proxy`, { proxy_id: bound.id })
+    assert.equal(rebindFail.status, 409)
+    assert.equal(rebindFail.body.error.code, 'gemini_proxy_unavailable')
+    assert.deepEqual(
+      operations.map(([operation]) => operation),
+      ['get', 'proxy-probe', 'get', 'test-chat', 'get'],
+    )
+  }
+  {
+    const operations = []
+    const run = setup(
+      (operation, payload) => {
+        operations.push([operation, payload])
+        return operation === 'get' ? record : { ok: false, latency_ms: 14, code: 'private', detail: proxyUrl }
+      },
+      { ...bound, status: 'dead' },
     )
     const probe = await run('POST', `${environmentPath}/proxy/probe`, { proxy_id: 'untrusted', proxy_url: 'untrusted' })
     assert.deepEqual(probe, {
@@ -651,8 +676,8 @@ test('OAuth account import redacts credentials and preserves the authorization b
   assert.equal(accepted.body.data.runtime_ready, false)
   assert.doesNotMatch(JSON.stringify(accepted.body), /fixture-access-never-returned/)
 
-  // CPA and sub2api OAuth formats normalize to minimal `{ access_token, expiry_timestamp }`
-  // before reaching the host and never forward refresh tokens.
+  // CPA, sub2api, and bare refresh_token formats normalize to minimal whitelisted OAuth fields
+  // before reaching the host, and responses never leak tokens back to clients.
   const forwarded = []
   const capture = setup((operation, payload) => {
     forwarded.push({ operation, payload })
@@ -660,10 +685,24 @@ test('OAuth account import redacts credentials and preserves the authorization b
       ...record,
       auth_state: 'authorized',
       auth_method: 'oauth',
-      oauth_imported: true,
-      account: { state: 'ok', email: 'converted@example.test' },
+      account: {
+        state: 'ok',
+        email: 'converted@example.test',
+        refresh_token: payload.oauth_account?.refresh_token,
+      },
     }
   })
+
+  const bareRtResp = await capture('POST', endpoint, {
+    name: 'rt-only',
+    proxy_id: record.proxy_id,
+    oauth_account: [{ email: 'rt@example.test', refresh_token: '1//06FixtureRtOnly_abc123' }],
+  })
+  assert.equal(bareRtResp.status, 200)
+  assert.deepEqual(forwarded.at(-1).payload.oauth_account, {
+    refresh_token: '1//06FixtureRtOnly_abc123',
+  })
+  assert.doesNotMatch(JSON.stringify(bareRtResp.body), /1\/\/06FixtureRtOnly_abc123/)
 
   const cpaResp = await capture('POST', endpoint, {
     name: 'cpa-ag',
@@ -671,12 +710,13 @@ test('OAuth account import redacts credentials and preserves the authorization b
     oauth_account: {
       type: 'antigravity',
       access_token: 'ya29.cpa-import-token',
-      refresh_token: '1//must-not-forward-cpa',
+      refresh_token: '1//06cpa-import-refresh',
       expired: '2030-01-01T00:00:00Z',
     },
   })
   assert.equal(cpaResp.status, 200)
   assert.deepEqual(forwarded.at(-1).payload.oauth_account, {
+    refresh_token: '1//06cpa-import-refresh',
     access_token: 'ya29.cpa-import-token',
     expiry_timestamp: 1893456000,
   })
@@ -694,7 +734,6 @@ test('OAuth account import redacts credentials and preserves the authorization b
           type: 'oauth',
           credentials: {
             access_token: 'ya29.sub2api-import-token',
-            refresh_token: '1//must-not-forward-sub2api',
             expires_at: '1893456000',
           },
         },

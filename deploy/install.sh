@@ -1041,6 +1041,31 @@ render_gemini_unit_apparmor() {
   mv -f "$tmp" "$unit_file" || { rm -f -- "$tmp"; return 1; }
 }
 
+gemini_bwrap_userns_mediated() {
+  local root="${1:-/}" staged profiles
+  staged="${root%/}/etc/apparmor.d/bwrap-userns-restrict"
+  [ -f "$staged" ] || return 1
+  profiles="${root%/}/sys/kernel/security/apparmor/profiles"
+  if [ -f "$profiles" ] && ! grep -Fq bwrap "$profiles" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+install_gemini_managed_bwrap() {
+  local root="${1:-/}" host_dir="${root%/}/usr/local/lib/vm2api-gemini"
+  local entry="${host_dir}/exec/bwrap" source
+  command -v install >/dev/null || { err "Gemini 沙箱需要 install(1)"; return 1; }
+  source="$(command -v bwrap)" || { err "Gemini 沙箱需要 bubblewrap（bwrap）"; return 1; }
+  install -d -m 755 "${host_dir}/exec" || return 1
+  if ! install -m 755 -- "$source" "$entry"; then
+    err "无法安装 Gemini 受管 bwrap 入口: $entry"
+    return 1
+  fi
+  ok "Gemini 受管 bwrap 入口已同步: $entry"
+  return 0
+}
+
 # Prepare a scoped, unattached AppArmor profile for vm2api-gemini.service when
 # the host restricts unprivileged user namespaces (e.g. Ubuntu 24.04).
 # Never modifies kernel sysctls or attaches globally to /usr/bin/bwrap.
@@ -1063,12 +1088,18 @@ prepare_gemini_apparmor() {
     err "拒绝覆盖非 vm2api 管理的 AppArmor profile: $profile"
     return 1
   fi
+  local bwrap_rule=""
+  if gemini_bwrap_userns_mediated "$root"; then
+    install_gemini_managed_bwrap "$root" || return 1
+    bwrap_rule='  /usr/local/lib/vm2api-gemini/exec/bwrap ix,'
+  fi
   candidate="$(mktemp "$directory/.vm2api-gemini.XXXXXX")" || return 1
   if ! printf '%s\n' \
     "$marker" \
     'abi <abi/4.0>,' \
     'profile vm2api-gemini flags=(unconfined) {' \
     '  userns,' \
+    ${bwrap_rule:+"$bwrap_rule"} \
     '}' > "$candidate" || ! chmod 644 "$candidate"; then
     rm -f -- "$candidate"
     return 1
@@ -1124,7 +1155,7 @@ PY
     return 1
   fi
   bundle="$(mktemp -d "${root}/bundles/bundle-${tag}.XXXXXX")" || return 1
-  local -a files=(scripts/gemini-maintenance.py deploy/gemini-maintenance.service.example
+  local -a files=(scripts/gemini-maintenance.py scripts/gemini_host_apparmor.py deploy/gemini-maintenance.service.example
     scripts/gemini-host.py scripts/gemini_host_account.py scripts/gemini_host_inference.py
     scripts/gemini_host_native.py scripts/gemini-host-egress.sh scripts/fetch-default-gemini.py
     scripts/install-gemini-payload.mjs src/lib/gemini/payload.mjs deploy/payload.json deploy/gemini-host.service.example)
@@ -1351,8 +1382,8 @@ prepare_gemini_host() (
     use_apparmor=1
   fi
 
-  local -a files=(deploy/gemini-host.service.example scripts/gemini-host.py scripts/gemini_host_account.py
-    scripts/gemini_host_inference.py scripts/gemini_host_native.py
+  local -a files=(deploy/gemini-host.service.example scripts/gemini-host.py scripts/gemini_host_apparmor.py
+    scripts/gemini_host_account.py scripts/gemini_host_inference.py scripts/gemini_host_native.py
     scripts/gemini-host-egress.sh scripts/install-gemini-payload.mjs src/lib/gemini/payload.mjs)
   for file in "${files[@]}"; do
     if ! fetch_gemini_host_file "$tag" "$mode" "$file" "${staging}/${file}"; then

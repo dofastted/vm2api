@@ -24,6 +24,24 @@ const PREHEAT_MAX_TOKENS = 64
 /** How often the auto-renew sweep looks for elapsed 5h windows (Croner unref'd). */
 const PREHEAT_RENEW_SWEEP_SEC = 60
 
+/**
+ * Web saves omit mode/auto_renew; partial sync paths omit them too. Preserve
+ * stored preheat settings unless the caller explicitly overrides.
+ */
+export function mergeVmTestSchedulePreserve(input, previous = {}) {
+  const prev = previous && typeof previous === 'object' && !Array.isArray(previous) ? previous : {}
+  const out = { ...(input && typeof input === 'object' ? input : {}) }
+  if (!Object.hasOwn(out, 'mode') || out.mode == null) {
+    const prevMode = String(prev.mode || '')
+    if (SCHEDULE_MODES.has(prevMode)) out.mode = prevMode
+  }
+  if (!Object.hasOwn(out, 'auto_renew') && prev.auto_renew === true) {
+    const effectiveMode = Object.hasOwn(out, 'mode') && out.mode != null ? String(out.mode) : String(prev.mode || '')
+    if (effectiveMode === 'preheat') out.auto_renew = true
+  }
+  return out
+}
+
 export class VmTestScheduleError extends Error {
   constructor(message, code = 'invalid_test_schedule', status = 400) {
     super(message)
@@ -522,7 +540,7 @@ export class VmTestScheduleRunner {
     const vm = this._vm(vmId)
     if (!vm) throw new VmTestScheduleError('vm not found', 'vm_not_found', 404)
     const previous = this._settings().get(keyFor(vmId)) || {}
-    const config = normalizeVmTestSchedule(input, vm)
+    const config = normalizeVmTestSchedule(mergeVmTestSchedulePreserve(input, previous), vm)
     this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
     if (this.started) this._syncJob(vmId, config)
     return this.get(vmId)
@@ -549,11 +567,14 @@ export class VmTestScheduleRunner {
     }
     const enabled = previous.enabled === true
     const config = normalizeVmTestSchedule(
-      {
-        enabled,
-        ...normalized,
-        ...dialog,
-      },
+      mergeVmTestSchedulePreserve(
+        {
+          enabled,
+          ...normalized,
+          ...dialog,
+        },
+        previous,
+      ),
       vm,
     )
     this._settings().set(keyFor(vmId), {
@@ -624,7 +645,10 @@ export class VmTestScheduleRunner {
         reasoning_effort: previous.reasoning_effort ?? null,
       }
     } else dialog = defaultDialogParams(vm)
-    const config = normalizeVmTestSchedule({ enabled: full.enabled, ...structure, ...dialog }, vm)
+    const config = normalizeVmTestSchedule(
+      mergeVmTestSchedulePreserve({ enabled: full.enabled, ...structure, ...dialog }, previous),
+      vm,
+    )
     this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
     if (this.started) this._syncJob(vmId, config)
   }

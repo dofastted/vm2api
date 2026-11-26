@@ -1,7 +1,8 @@
 #cloud-config
-# SSH key and first-boot install only. Per-boot identity/mounts are
-# kin-guest-setup.service (instance-id is stable per overlay, so this
-# datasource runs once).
+# SSH key and first-boot install only (runcmd → install-guest.sh; not re-run when
+# instance-id is stable per overlay). Per-boot 9p mounts/identity are
+# kin-guest-setup.service. Upgrading kin-guest-setup on existing disks: see
+# docs/crag-kvm.md «Guest 启动脚本升级».
 # Mask systemd-time-wait-sync before cloud-final/sshd so distros that enable it
 # (e.g. Arch cloud images) do not stall waiting for UDP NTP behind SOCKS5 egress.
 bootcmd:

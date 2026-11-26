@@ -105,6 +105,10 @@ const RUN_ERRORS = {
     '无法启动本地 Gemini 推理进程，请前往「设置 → Gemini 维护」检查宿主服务与载荷状态',
   ],
   gemini_inference_cancelled: [409, 'Gemini 测试已手动取消'],
+  gemini_session_conflict: [
+    409,
+    '当前出站会话无法在该消息后继续：工具调用仍在挂起等待结果，而请求在工具结果之后又追加了新的用户输入。网关已自动以新会话重试一次；若仍失败，请使用新的 X-Session-Id，或先仅回传工具结果再发送后续文本。',
+  ],
   gemini_inference_output_limit: [502, '模型单次回复超过测试输出上限，请精简提示词或限制回复长度后重试'],
   gemini_inference_tool_blocked: [502, '当前测试通道限制了该工具调用，请改用纯文本提示词重试'],
   gemini_inference_failed: [
@@ -789,7 +793,7 @@ function authorizationInput(body) {
   }
 }
 
-function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, ownerUserId = null } = {}) {
+function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, forBinding = false, ownerUserId = null } = {}) {
   if (!validId(proxyId)) throw hostError('gemini_proxy_unavailable', 409)
   const targetOwner = normalizeOwnerId(ownerUserId)
   const scopedList = proxyPool?.snapshot({ ownerUserId: targetOwner || null })?.proxies || []
@@ -803,7 +807,12 @@ function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, ownerUserId = nu
   const ownerAllowed = targetOwner ? !pOwner || pOwner === targetOwner : !pOwner
   if (
     !proxy?.enabled ||
-    (!allowUnhealthy && (proxy.status === 'dead' || proxy.status === 'fail')) ||
+    // Pool policy keeps enabled rows on `fail` until consecutive_failures reaches
+    // max_failures; Gemini scheduling should mirror that, not treat one timeout
+    // as unavailable while the row is still admitted for inference.
+    (!allowUnhealthy && proxy.status === 'dead') ||
+    // New binds mirror allocateForVm: a probe `fail` row is not offered for selection.
+    (forBinding && proxy.status === 'fail') ||
     !ownerAllowed ||
     proxy.blocked_reason
   ) {
@@ -1163,7 +1172,7 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
         }
         const ownerUserId = normalizeOwnerId(body?.owner_user_id)
-        const proxyUrl = proxyFor(proxyPool(), body.proxy_id, { ownerUserId })
+        const proxyUrl = proxyFor(proxyPool(), body.proxy_id, { ownerUserId, forBinding: true })
         let created = await callHost('create', {
           name,
           proxy_id: body.proxy_id,
@@ -1172,8 +1181,13 @@ export function createGeminiPanelHandler({
           ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
           ...(normalizedImport != null && {
             oauth_account: {
-              access_token: normalizedImport.access_token,
-              expiry_timestamp: normalizedImport.expiry_timestamp,
+              ...(normalizedImport.refresh_token ? { refresh_token: normalizedImport.refresh_token } : {}),
+              ...(normalizedImport.access_token ? { access_token: normalizedImport.access_token } : {}),
+              ...(normalizedImport.expiry_timestamp != null
+                ? { expiry_timestamp: normalizedImport.expiry_timestamp }
+                : {}),
+              ...(normalizedImport.auth_method ? { auth_method: normalizedImport.auth_method } : {}),
+              ...(normalizedImport.wif_provider ? { wif_provider: normalizedImport.wif_provider } : {}),
             },
           }),
         })
@@ -1367,7 +1381,7 @@ export function createGeminiPanelHandler({
           id,
           previous_proxy_id: environment.proxy_id,
           proxy_id: proxyId,
-          proxy_url: proxyFor(proxyPool(), proxyId, { ownerUserId: envOwner }),
+          proxy_url: proxyFor(proxyPool(), proxyId, { ownerUserId: envOwner, forBinding: true }),
         })
         geminiScheduler?.invalidateCatalogCache?.()
         return ok(toEnvView(result, { id, proxyId, ownerUserId: envOwner }))

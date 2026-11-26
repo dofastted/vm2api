@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 1.4.232 — 2026-11-26 · Gemini 多格式 RT 导入、Ubuntu 26.04 AppArmor 托管 bwrap、409 冲突重试、代理探测错峰、Codex 续热与配额窗口修复
+
+- **Gemini 宿主机安全与可靠性修复（#1922、#1923、#1925、#1926、#1929、#1932、#1933、#1934、#1935、#1938）**：
+  - **多格式 OAuth Refresh Token 导入与宿主机探针（#1938）**：支持裸 RT、Antigravity RT 导出数组、CPA / sub2api 导出格式归一化导入；OAuth 客户端配置通过宿主机环境变量（`KIN_GEMINI_OAUTH_*`）经标准输入 JSON 注入 `gemini_host_account.py`（零硬编码、未配置时 fail-closed 返回 `oauth_client_not_configured`）。
+  - **Ubuntu 26.04 AppArmor 托管 bwrap 与打包对齐（#1929、#1932）**：新增 `scripts/gemini_host_apparmor.py` 与原子安装托管 bwrap 入口，`gemini-maintenance.py` 的 `RUNTIME_FILES` 补齐 helper 打包。
+  - **bwrap 沙箱故障与许可错误解耦（#1926）**：`classify_craggemini_license_cli_error` 准确区分 `gemini_sandbox_unavailable` / `gemini_sandbox_apparmor_restricted`（HTTP 503），不再误报 `license_invalid`（403）。
+  - **409 会话冲突恢复与工具 schema 清洗（#1923、#1933、#1925、#1934）**：`tool_continuation_aborted` 映射为 `gemini_session_conflict`（409），清空粘性绑定（含 `mas=0` 场景）后重试一次且不记单元熔断；`gemini-convert.mjs` 去重 `required`、规避桥接层字段冲突并修复多轮 `toolSummary` 回流。
+  - **并发 SOCKS 探测错峰与 `proxy_ready` 对齐（#1922、#1935）**：远端 SOCKS 探测改为串行 400ms 错峰，`proxyFor` 与代理池一致仅在行 `dead` 时标记不可用，新建/改绑严格拒绝 `fail` 状态代理行。
+- **Codex 与管理台修复（#1920、#1927、#1939）**：
+  - 剔除配额视图中已过期的 rate-limit 窗口读数（#1920）；Codex 续热探针读取官方 5h reset 窗口并在面板保存时保留 `preheat` / `auto_renew` 与调度模式（#1927、#1939）。
+- **KVM 9p 稳定性修复（#1924、#1937）**：
+  - `kinhome`/`kinclaude` 9p 挂载改用 `cache=none` 避免 `.claude.json` 写回卡死，并补充既有来宾生效步骤文档。
+- 部署说明：本次改动涉及控制面（`src/lib/`、`src/server.mjs`）、前端（`web/src/`）与 Gemini 宿主及维护脚本（`scripts/gemini-host.py`、`scripts/gemini_host_account.py`、`scripts/gemini_host_apparmor.py`、`scripts/gemini_host_native.py`、`scripts/gemini-maintenance.py`）；`deploy/payload.json` 延续 `1.4.231` 钉选（`kin-kernel` `b2dbec57…`、`CRAG 3.1.23`、`CRAGGemini 0.4.13`）。从 `1.4.228` 直升时在线执行 PG `007` 增量加列迁移，需同步更新 Gemini 宿主与维护脚本并重启 `vm2api`、`vm2api-gemini` 与 `vm2api-gemini-maintenance`；`SLOT_SYNC=skip` 时不重启既有 `kin-*` 槽位。
 
 ## 1.4.231 — 2026-11-26 · Advisor 顾问用量独立计费与双库持久化、确定性 400 熔断豁免/平台归因、钉选 CRAG 3.1.23 与新版 `kin-kernel` 载荷
 

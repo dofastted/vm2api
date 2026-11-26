@@ -50,7 +50,9 @@ WORK_DROPIN = (MARKER + '\n'
                "{ mkdir -p /run/kin/work && [ ! -L /run/kin/work ] && "
                "mount -t tmpfs -o mode=0700,uid=$(id -u kincli),gid=$(id -g kincli),size=256m,nosuid,nodev "
                "vm2api-crag-work /run/kin/work; }; }'\n").encode()
-# The work directory is not the only hot file on 9p. CRAG starts the CLI in /run/kin/work with --resume, so every
+# ~/.claude/.claude.json atomic saves (temp siblings + fchmod) still go through the kinhome/kinclaude 9p mounts; kin-guest-setup
+# uses cache=none there (#1877) only after the on-disk script is updated from cidata and the guest reboots — restarting
+# kin-guest-setup.service here (slot.env restore below) does not remount 9p or change cache=. The work directory is not the only other hot file on 9p. CRAG starts the CLI in /run/kin/work with --resume, so every
 # request also writes a resume transcript under ~/.claude/projects/-run-kin-work/ and the CLI appends to and stat()s
 # it for the whole turn. ~ is the kinhome 9p share, so the same writeback wait still wedged sessions on a guest that
 # already had the work directory on tmpfs (zombie CLI, threads in folio_wait_bit_common). The transcripts only serve the
@@ -178,6 +180,7 @@ def preserve_guest_runtime(root):
         # First boot: setup has not finished yet and writes slot.env itself.
         state['guest_setup'] = 'pending'
         return state
+    # Restores slot.env only; does not refresh 9p cache= (see kin-guest-setup mount_9p).
     run([systemctl, 'restart', 'kin-guest-setup.service'], 'guest setup restore')
     if not slot_env.is_file():
         raise RuntimeError('kin-guest-setup did not restore ' + SLOT_ENV)

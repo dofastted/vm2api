@@ -1,0 +1,253 @@
+import assert from 'node:assert/strict'
+import { Readable } from 'node:stream'
+import test from 'node:test'
+import { mapCragWorkerError } from '../../src/lib/gemini/direct-client.mjs'
+import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
+import { NATIVE_TUI_CAPABILITIES } from '../../src/lib/protocol/gemini-convert.mjs'
+
+const OAUTH_ENV = {
+  id: 'env-sticky-a',
+  proxy_id: 'proxy-a',
+  auth_state: 'authorized',
+  auth_method: 'oauth',
+  models_discovered: true,
+  models: ['gemini-3-pro'],
+  capabilities: [...NATIVE_TUI_CAPABILITIES],
+}
+
+function jsonInferError(statusCode, body) {
+  const stream = new Readable({ read() {} })
+  stream.statusCode = statusCode
+  stream.headers = { 'content-type': 'application/json' }
+  process.nextTick(() => {
+    stream.push(JSON.stringify(body))
+    stream.push(null)
+  })
+  return stream
+}
+
+function sseOk(text) {
+  const stream = new Readable({ read() {} })
+  stream.statusCode = 200
+  stream.headers = { 'content-type': 'text/event-stream; charset=utf-8' }
+  process.nextTick(() => {
+    stream.push(
+      `data: ${JSON.stringify({
+        candidates: [{ content: { role: 'model', parts: [{ text }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 8, candidatesTokenCount: 4, totalTokenCount: 12 },
+      })}\n\n`,
+    )
+    stream.push(null)
+  })
+  return stream
+}
+
+function makeCircuitPool() {
+  const calls = { success: [], failure: [], probe: [] }
+  const accountId = `gemini:${OAUTH_ENV.id}`
+  const pool = {
+    unitCircuit: {
+      recordSuccess: (id) => calls.success.push(id),
+      recordFailure: (id) => calls.failure.push(id),
+      releaseProbe: (id) => calls.probe.push(id),
+    },
+    lastUsed: new Map(),
+    reserveExternalCandidates(candidates, { excluded }) {
+      const found = candidates.find((c) => !excluded.has(c.accountId))
+      if (!found) return null
+      return { selected: found, reservation: { release() {} } }
+    },
+  }
+  return { pool, accountId, calls }
+}
+
+function hostStub(environments, inferHandler) {
+  return {
+    callHost: async (op, payload) => {
+      if (op === 'list') return { payload_state: 'installed', environments }
+      if (op === 'get') {
+        return { id: payload.id, proxy_id: payload.id === OAUTH_ENV.id ? 'proxy-a' : 'proxy-b', auth_method: 'oauth' }
+      }
+      if (op === 'infer-cancel') return { cancelled: true }
+      throw new Error(`unexpected op: ${op}`)
+    },
+    callHostStream: inferHandler,
+    resolveProxy: () => 'socks5h://127.0.0.1:1080',
+    getRoutingConfig: () => ({
+      gemini: {
+        sticky: { enabled: true, ttl_seconds: 3600 },
+        pool: { strategy: 'balanced', max_concurrency_per_account: 4, timeout_ms: 120_000 },
+        failover: { max_account_switches: 3 },
+      },
+    }),
+  }
+}
+
+test('mapCragWorkerError maps tool_continuation_aborted to gemini_session_conflict (409)', () => {
+  const mapped = mapCragWorkerError(409, {
+    code: 'tool_continuation_aborted',
+    error: 'suspended tool slot cannot accept prompt turn',
+    upstream_status: 409,
+  })
+  assert.equal(mapped.code, 'gemini_session_conflict')
+  assert.equal(mapped.status, 409)
+  assert.equal(mapped.upstreamStatus, 409)
+})
+
+test('gemini_session_conflict does not increment unit circuit failures', async () => {
+  const { pool, accountId, calls } = makeCircuitPool()
+  const inferCalls = []
+  let attempt = 0
+
+  const scheduler = createGeminiScheduler({
+    ...hostStub([OAUTH_ENV], async (_op, payload) => {
+      inferCalls.push(payload)
+      attempt += 1
+      if (attempt === 1) {
+        return jsonInferError(409, { code: 'tool_continuation_aborted', message: 'aborted', error: 'aborted' })
+      }
+      return sseOk('recovered marker')
+    }),
+    poolScheduler: pool,
+  })
+
+  const turn = await scheduler.stream({
+    model: 'gemini-3-pro',
+    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'continue after tool' }] }] },
+    stickyKey: 'key:test:session-409',
+    apiKeyRecord: { id: 'key-test', group_type: 'gemini' },
+  })
+
+  assert.equal(turn.text, 'recovered marker')
+  assert.equal(inferCalls.length, 2)
+  assert.deepEqual(calls.failure, [])
+  assert.equal(calls.probe.length, 1)
+  assert.equal(calls.probe[0], accountId)
+  assert.equal(turn.attempt_count, 2)
+})
+
+test('gemini_session_conflict retries on same account with fresh conversation_id, without account switch', async () => {
+  const envB = { ...OAUTH_ENV, id: 'env-sticky-b', proxy_id: 'proxy-b' }
+  const inferCalls = []
+  let attempt = 0
+
+  const scheduler = createGeminiScheduler({
+    ...hostStub([OAUTH_ENV, envB], async (_op, payload) => {
+      inferCalls.push({ id: payload.id, convId: payload.body?.conversation_id })
+      attempt += 1
+      if (attempt === 1) {
+        return jsonInferError(409, { code: 'tool_continuation_aborted', error: 'aborted' })
+      }
+      return sseOk('OK409')
+    }),
+  })
+
+  const sticky = 'key:test:paired-1837'
+  const turn = await scheduler.stream({
+    model: 'gemini-3-pro',
+    geminiBody: { contents: [{ role: 'user', parts: [{ text: 'print marker' }] }] },
+    stickyKey: sticky,
+    apiKeyRecord: { id: 'key-test', group_type: 'gemini' },
+  })
+
+  assert.equal(turn.text, 'OK409')
+  assert.equal(inferCalls.length, 2)
+  assert.equal(inferCalls[0].id, OAUTH_ENV.id)
+  assert.equal(inferCalls[1].id, OAUTH_ENV.id, 'session conflict retry must stay on the same account')
+  assert.ok(inferCalls[0].convId)
+  assert.ok(inferCalls[1].convId)
+  assert.notEqual(inferCalls[1].convId, inferCalls[0].convId, 'retry must mint a fresh outbound conversation_id')
+  assert.equal(turn.attempts?.[0]?.action, 'session_retry')
+})
+
+test('gemini_session_conflict clears sticky when max_account_switches is 0 (no retry)', async () => {
+  const inferCalls = []
+  let attempt = 0
+  const sticky = 'key:test:mas0-sticky-clear'
+
+  const scheduler = createGeminiScheduler({
+    ...hostStub([OAUTH_ENV], async (_op, payload) => {
+      inferCalls.push({ convId: payload.body?.conversation_id })
+      attempt += 1
+      if (attempt === 1) return sseOk('seed sticky')
+      if (attempt === 2) {
+        return jsonInferError(409, { code: 'tool_continuation_aborted', error: 'aborted' })
+      }
+      return sseOk('after clear')
+    }),
+    getRoutingConfig: () => ({
+      gemini: {
+        sticky: { enabled: true, ttl_seconds: 3600 },
+        pool: { strategy: 'balanced', max_concurrency_per_account: 4, timeout_ms: 120_000 },
+        failover: { max_account_switches: 0 },
+      },
+    }),
+  })
+
+  const apiKey = { id: 'key-test', group_type: 'gemini' }
+  const body = { contents: [{ role: 'user', parts: [{ text: 'x' }] }] }
+
+  const first = await scheduler.stream({
+    model: 'gemini-3-pro',
+    geminiBody: body,
+    stickyKey: sticky,
+    apiKeyRecord: apiKey,
+  })
+  assert.equal(first.text, 'seed sticky')
+  const boundConv = inferCalls[0].convId
+  assert.ok(boundConv)
+
+  try {
+    await scheduler.stream({
+      model: 'gemini-3-pro',
+      geminiBody: body,
+      stickyKey: sticky,
+      apiKeyRecord: apiKey,
+    })
+    assert.fail('expected gemini_session_conflict')
+  } catch (err) {
+    assert.equal(err.code, 'gemini_session_conflict')
+    assert.equal(err.attemptCount, 1)
+  }
+  assert.equal(inferCalls[1].convId, boundConv)
+
+  const third = await scheduler.stream({
+    model: 'gemini-3-pro',
+    geminiBody: body,
+    stickyKey: sticky,
+    apiKeyRecord: apiKey,
+  })
+  assert.equal(third.text, 'after clear')
+  assert.notEqual(
+    inferCalls[2].convId,
+    boundConv,
+    'sticky clear must drop bound conversation after session conflict',
+  )
+})
+
+test('gemini_session_conflict is only retried once (no infinite retry)', async () => {
+  const inferCalls = []
+
+  const scheduler = createGeminiScheduler({
+    ...hostStub([OAUTH_ENV], async (_op, payload) => {
+      inferCalls.push(payload.id)
+      return jsonInferError(409, { code: 'tool_continuation_aborted', error: 'aborted' })
+    }),
+  })
+
+  try {
+    await scheduler.stream({
+      model: 'gemini-3-pro',
+      geminiBody: { contents: [{ role: 'user', parts: [{ text: 'fail twice' }] }] },
+      stickyKey: 'key:test:no-infinite',
+      apiKeyRecord: { id: 'key-test', group_type: 'gemini' },
+    })
+    assert.fail('expected gemini_session_conflict')
+  } catch (err) {
+    assert.equal(err.code, 'gemini_session_conflict')
+    assert.equal(err.status, 409)
+    assert.equal(err.attemptCount, 2)
+  }
+  assert.equal(inferCalls.length, 2)
+  assert.equal(inferCalls[0], inferCalls[1])
+})
