@@ -231,6 +231,66 @@ test('CRAG whitelist strictly rebuilds cache_control, strips scope/evict_on_comp
   )
 })
 
+test('#8 CRAG whitelist keeps thinking.block_binding so thinking-binding-controls can arm', () => {
+  // Field survives the whitelist rebuild, unknown siblings still drop.
+  const cleaned = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      thinking: { type: 'adaptive', budget_tokens: 2048, display: 'updates', block_binding: true, stray_key: 'drop' },
+      messages: [{ role: 'user', content: 'hi' }],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(cleaned.thinking, {
+    type: 'adaptive',
+    budget_tokens: 2048,
+    display: 'updates',
+    block_binding: true,
+  })
+
+  // Object form is passed through untouched as well.
+  const objectForm = prepareCragRequest(
+    {
+      model: 'claude-sonnet-5-5',
+      thinking: { type: 'adaptive', block_binding: { scope: 'turn' } },
+      messages: [{ role: 'user', content: 'hi' }],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(objectForm.thinking.block_binding, { scope: 'turn' })
+
+  // End to end: because the key now survives prepareCragRequest, withRequestProtocolBetas
+  // can finally see it and arm the beta. Before this fix the key was dropped at
+  // crag-whitelist before the beta check ran, so the capability never engaged on CRAG.
+  // `linux_tui_native_queue` is omitted on purpose: with it, nativeOwnsHeaders short-circuits
+  // and the slot's official CC owns beta selection instead of us.
+  const worker = finalizeWorkerPayload({
+    body: {
+      model: 'claude-sonnet-5-5',
+      max_tokens: 64,
+      thinking: { type: 'adaptive', block_binding: true },
+      messages: [{ role: 'user', content: 'hi' }],
+    },
+    reqHeaders: {},
+    exec: {
+      homeDir: '',
+      vm: { dataplane: 'crag', crag_kernel_version: 'v2', claude: { mode: 'setup-token', scope: 'user:inference' } },
+      workerStatus: {
+        runtime_variant: 'crag-v2',
+        capabilities: ['generation_controls_v3', 'prompt_append', 'prompt_replace', 'system_text_cache_v3'],
+      },
+    },
+    identity: null,
+    cliHop: true,
+    cragPrint: true,
+  })
+  assert.equal(worker.body.thinking.block_binding, true, 'block_binding must reach the slot')
+  assert.ok(
+    String(worker.headers['anthropic-beta'] || '').includes('thinking-binding-controls-2026-08-01'),
+    'the binding beta must arm once block_binding survives the whitelist',
+  )
+})
+
 test('third-party system relocation + prepareCragPrintBody omits redundant CLI identity placeholder (prevents Extra Usage)', () => {
   const inbound = {
     model: 'claude-sonnet-5-5',
