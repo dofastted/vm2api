@@ -655,10 +655,10 @@ describe('Gemini VM page full UI alignment', () => {
     expect(detail).toContain('成本')
     expect(detail).toContain('$3.45')
 
-    // 5. SlotIdentity identifies Gemini instead of Claude and formats detected email
+    // 5. SlotIdentity identifies Gemini instead of Claude; name-first with raw email on hover
     const identity = renderNode(<SlotIdentity vm={gemini} compact />)
     expect(identity).toContain('>Gemini</span>')
-    expect(identity).toContain('>gem@examp</span>')
+    expect(identity).toContain('>Gemini Pro 1</span>')
     expect(identity).toContain('title="Gemini Pro 1 · gem@example.com"')
     expect(identity).not.toContain('>Claude</span>')
 
@@ -692,8 +692,9 @@ describe('Gemini VM page full UI alignment', () => {
       expect(
         renderNode(<VmRack vms={[slot]} filter='all' size='s' />)
       ).toContain('>12345...@gmail</div>')
+      // SlotIdentity 名称优先（识别靠名称体系），完整邮箱放悬停 title
       expect(renderNode(<SlotIdentity vm={slot} compact />)).toContain(
-        '>12345...@gmail</span>'
+        `title="${slot.name} · ${sampleEmail}"`
       )
     }
 
