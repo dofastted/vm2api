@@ -169,6 +169,7 @@ import {
   isProxiedOfficialClaudeCode,
   officialFamilyBodyPassthrough,
   personaHidesUsageFromRoutingFile,
+  personaUsagePassthroughFromRoutingFile,
   standingUsageFromRoutingFile,
   personaModeFromRoutingFile,
 } from '../identity/crs-persona.mjs'
@@ -1968,7 +1969,10 @@ export function createHandleProtocol(deps) {
         })
       }
       personaHideTokens =
-        requestContext || apiNonAnthropic || preserveApiCallerBody
+        requestContext ||
+        apiNonAnthropic ||
+        preserveApiCallerBody ||
+        personaUsagePassthroughFromRoutingFile(routingConfigPath, personaMode)
           ? 0
           : personaHideForUnofficial(personaIn, ctx.body, {
               officialClient: officialPassthrough,
@@ -2659,12 +2663,14 @@ export function createHandleProtocol(deps) {
             )
             hopBody = officialMessagesBody(rewritten)
             for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
-            personaHideTokens = personaHideForUnofficial(personaIn, rewritten, {
-              officialClient: false,
-              mode: configuredMode,
-              hides: personaHidesUsageFromRoutingFile(routingConfigPath, configuredMode),
-              standing: standingUsageFromRoutingFile(routingConfigPath, configuredMode),
-            })
+            personaHideTokens = personaUsagePassthroughFromRoutingFile(routingConfigPath, configuredMode)
+              ? 0
+              : personaHideForUnofficial(personaIn, rewritten, {
+                  officialClient: false,
+                  mode: configuredMode,
+                  hides: personaHidesUsageFromRoutingFile(routingConfigPath, configuredMode),
+                  standing: standingUsageFromRoutingFile(routingConfigPath, configuredMode),
+                })
           }
           logBag.inference_engine = resolveInferenceEngine(selected.vm, routingNow)
           logBag.persona_preset = resolveSlotPersonaPreset(selected.vm, routingNow)

@@ -39,6 +39,7 @@ import {
   buildZeroBillingText,
   overlayPresetFromCompat,
   personaHidesUsageFromRoutingFile,
+  personaUsagePassthroughFromRoutingFile,
   personaPresetFromHopMode,
   personaTemplateSettingsFromRouting,
   personaTemplateVars,
@@ -211,6 +212,11 @@ test('agent standing preset flags default off and isolate per preset', () => {
   }
   assert.equal(presetFlagEnabled({}, 'persona_env_presets', 'official'), true)
   assert.equal(presetFlagEnabled({}, 'agent_standing_hide_presets', 'official'), true)
+  assert.equal(presetFlagEnabled({}, 'usage_passthrough_presets', 'zero'), false)
+  assert.equal(
+    presetFlagEnabled({ usage_passthrough_presets: { zero: true } }, 'usage_passthrough_presets', 'zero'),
+    true,
+  )
   assert.equal(
     agentStandingVar({ agent_standing_presets: { official: true } }, 'official'),
     `${DEFAULT_AGENT_STANDING}\n`,
@@ -250,6 +256,23 @@ test('whole-preset usage mask: persona_hide_presets > persona_hides > template h
   })
   assert.equal(parsePersonaHides(false), false)
   assert.equal(parsePersonaHides('off'), false)
+})
+
+test('usage passthrough is isolated by preset and honors slot overrides', () => {
+  withRoutingFile(
+    { persona_preset: 'official_full', usage_passthrough_presets: { zero: true, official_full: false } },
+    (file) => {
+      assert.equal(personaUsagePassthroughFromRoutingFile(file), false)
+      assert.equal(personaUsagePassthroughFromRoutingFile(file, 'zero'), true)
+      assert.equal(personaUsagePassthroughFromRoutingFile(file, 'official_prompt'), false)
+    },
+  )
+  assert.deepEqual(
+    validatePersonaRoutingPatch({
+      compatibility: { usage_passthrough_presets: { zero: true, official_full: false } },
+    }),
+    [],
+  )
 })
 
 test('official overlay renders byte-identical to wrapMandatoryConstraint', () => {

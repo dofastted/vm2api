@@ -419,11 +419,13 @@ export type PresetFlagField =
   | 'agent_standing_presets'
   | 'agent_standing_hide_presets'
   | 'persona_env_presets'
+  | 'usage_passthrough_presets'
   | 'model_env_extra_presets'
 
 function presetFlagDefault(field: PresetFlagField): boolean {
   return field === 'agent_standing_presets' ||
-    field === 'model_env_extra_presets'
+    field === 'model_env_extra_presets' ||
+    field === 'usage_passthrough_presets'
     ? false
     : true
 }
@@ -437,7 +439,11 @@ export function presetFlagEnabled(
   const map = compat?.[field]
   if (!map || typeof map !== 'object' || Array.isArray(map)) return defaultValue
   const value = (map as Record<string, unknown>)[preset]
-  if (field === 'agent_standing_presets' || field === 'model_env_extra_presets')
+  if (
+    field === 'agent_standing_presets' ||
+    field === 'model_env_extra_presets' ||
+    field === 'usage_passthrough_presets'
+  )
     return value === true
   return value !== false
 }

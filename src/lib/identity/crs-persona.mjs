@@ -1492,6 +1492,7 @@ export function personaTemplateSettingsFromRouting(routing = {}) {
       agent_standing_hide_presets: compat.agent_standing_hide_presets,
       persona_env_presets: compat.persona_env_presets,
       persona_hide_presets: compat.persona_hide_presets,
+      usage_passthrough_presets: compat.usage_passthrough_presets,
       persona_block_presets: compat.persona_block_presets,
       model_env_extra: compat.model_env_extra,
       model_env_extra_presets: compat.model_env_extra_presets,
@@ -1572,6 +1573,14 @@ export function personaHidesUsageFromRoutingFile(filePath, mode) {
   if (typeof settings.hides === 'boolean') return settings.hides
   if (!hopPreset && !personaUsesTemplate(settings)) return null
   return preset === 'zero' || templateHidesAnything(resolvePersonaTemplate(preset, settings.templates))
+}
+
+/** Whether the selected preset returns upstream usage without gateway deductions. */
+export function personaUsagePassthroughFromRoutingFile(filePath, mode) {
+  const settings = personaTemplateSettingsFromRoutingFile(filePath)
+  const hopPreset = mode != null ? personaPresetFromHopMode(mode) : null
+  const preset = templatePresetFor(hopPreset || settings.preset)
+  return settings.switches.usage_passthrough_presets?.[preset] === true
 }
 
 /**
