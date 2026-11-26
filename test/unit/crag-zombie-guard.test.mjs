@@ -290,3 +290,38 @@ test('cycles at most one slot per tick', async () => {
 test('maintenance_failed is a 不可调度 reason', () => {
   assert.equal(stateOfReason('maintenance_failed')?.state, 'unschedulable')
 })
+
+test('the scanner never counts its own argv as a gateway worker', (t) => {
+  assert.equal(ZOMBIE_SCAN_SCRIPT.includes('--gateway-worker'), false)
+  const root = procFixture(t, [
+    { pid: 50, ppid: 1, state: 'S', comm: 'sh', cmdline: `/bin/sh -c ${ZOMBIE_SCAN_SCRIPT.replace(/\s+/g, ' ')} scan` },
+    { pid: 51, ppid: 50, state: 'Z', comm: 'tr' },
+  ])
+  const out = runScan(root)
+  assert.equal(out.gateway, 0)
+  assert.equal(out.zombies, 0)
+  assert.equal(out.total, 1)
+})
+
+test('any outer recover refusal is retried; a thrown recover parks', async () => {
+  let h = harness({ recoverResult: { ok: false, code: 'crag_license_expired' } })
+  let { results } = await h.guard.tick()
+  assert.equal(results[0].action, 'refused')
+  assert.equal(h.state.parked.length, 0)
+  h = harness()
+  h.state.recoverResult = null
+  const guard = createCragZombieGuard({
+    config: { enabled: true },
+    listTargets: () => [cragVm()],
+    scan: async () => ({ gateway: 1, zombies: 5, total: 5, comms: [] }),
+    nativeHealth: async () => IDLE,
+    recover: async () => {
+      throw new Error('boom')
+    },
+    park: (id, detail) => h.state.parked.push({ id, ...detail }),
+    logger: quiet,
+  })
+  ;({ results } = await guard.tick())
+  assert.equal(results[0].code, 'recover_failed')
+  assert.equal(h.state.parked.length, 1)
+})

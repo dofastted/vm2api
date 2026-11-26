@@ -63,11 +63,16 @@ export const ZOMBIE_SCAN_MARKER = 'kin-zombie-scan'
 // parens, so fields are taken after the last ") ".
 export const ZOMBIE_SCAN_SCRIPT = `
 proc=\${KIN_GUARD_PROC:-/proc}
+# Built at runtime: this script's own argv (sh -c, kin-guest-exec) carries the
+# script text, and a literal flag here would count the scanner as a gateway.
+flag=--gateway
+flag="$flag-worker"
 gw=' '
 gwn=0
 for d in "$proc"/[0-9]*; do
+  [ "\${d##*/}" = "$$" ] && continue
   cmd=$(tr '\\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
-  case " $cmd" in *" --gateway-worker"*) gw="$gw\${d##*/} "; gwn=$((gwn + 1)) ;; esac
+  case " $cmd " in *" $flag "*) gw="$gw\${d##*/} "; gwn=$((gwn + 1)) ;; esac
 done
 z=0
 zt=0
@@ -157,14 +162,6 @@ function egressFingerprint(vm) {
   return JSON.stringify([proxy.id ?? null, proxy.host ?? null, proxy.port ?? null, proxy.url ?? null])
 }
 
-// recover() codes that mean "not now", not "the slot is broken": the cycle never ran.
-const REFUSED = new Set([
-  'recover_in_progress',
-  'slot_drain_timeout',
-  'slot_native_busy',
-  'slot_native_drain_unknown',
-  'vm_not_found',
-])
 
 export function createCragZombieGuard({
   config: initial = {},
@@ -253,8 +250,10 @@ export function createCragZombieGuard({
     } catch (error) {
       result = { ok: false, code: 'recover_threw', error: String(error?.message || error) }
     }
-    if (!result?.ok && REFUSED.has(result?.code)) {
-      // Nothing was stopped: the hold was rolled back. Try again on a later tick.
+    // recover() returns an outer ok:false only before stop/start ran (busy, drain timeout,
+    // license, admission): the hold was rolled back and the slot still serves. Retry later.
+    // A thrown recover() may have stopped the slot, so it goes down the failure path.
+    if (result?.ok === false && result.code !== 'recover_threw') {
       lastCycleAt.delete(vm.id)
       log(`${vm.id} cycle refused (${result.code}); will retry later`)
       return { ...row, action: 'refused', reason: result.code }
