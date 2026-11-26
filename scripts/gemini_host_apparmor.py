@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import stat
@@ -149,6 +150,13 @@ def install_managed_bwrap(*, host_root: Path = Path("/")) -> Path:
             handle.write(desired)
         os.chmod(tmp_path, stat.S_IMODE(0o755))
         os.replace(tmp_path, entry)
+        with open(entry, "rb") as installed:
+            os.fsync(installed.fileno())
+        directory = os.open(entry.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise

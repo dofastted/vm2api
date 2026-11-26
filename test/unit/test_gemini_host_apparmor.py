@@ -1,5 +1,6 @@
 """Unit tests for Gemini managed bwrap entry and AppArmor profile helpers."""
 
+import errno
 import os
 import stat
 import tempfile
@@ -96,6 +97,24 @@ class GeminiHostAppArmorTests(unittest.TestCase):
                 copy_mock.assert_not_called()
             self.assertEqual(result, entry)
             self.assertEqual(entry.stat().st_mtime_ns, before)
+
+    def test_install_managed_bwrap_surfaces_etxtbsy_from_replace(self):
+        source = self.root / "system-bwrap"
+        source.write_bytes(b"#!/bin/sh\nbusy\n")
+        os.chmod(source, 0o755)
+        entry = mod.host_path(self.root, mod.GEMINI_BWRAP_ENTRY)
+        entry.parent.mkdir(parents=True, exist_ok=True)
+
+        def busy_replace(*_args, **_kwargs):
+            raise OSError(errno.ETXTBSY, "Text file busy")
+
+        with (
+            patch.object(mod.shutil, "which", return_value=str(source)),
+            patch.object(mod.os, "replace", side_effect=busy_replace),
+        ):
+            with self.assertRaises(OSError) as caught:
+                mod.install_managed_bwrap(host_root=self.root)
+        self.assertEqual(caught.exception.errno, errno.ETXTBSY)
 
     def test_install_managed_bwrap_uses_atomic_replace(self):
         source = self.root / "system-bwrap"
