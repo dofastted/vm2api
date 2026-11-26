@@ -56,50 +56,77 @@ function webSearchRequestsOf(usage) {
 }
 
 /**
- * Per-model advisor token detail, read out of `usage.iterations`.
+ * Per-model advisor token detail, read out of `usage.iterations` (or a persisted
+ * `usage.advisor_usage` array during backfill/reprice).
  *
- * The advisor tool runs a second model inside one turn and reports it as an
- * `advisor_message` entry carrying its own `model`. Nothing in the codebase
- * parsed `iterations`, so that model's tokens were invisible.
- *
- * Detail only -- this deliberately does not feed `total_cost`. Whether the
- * top-level usage already includes these tokens is not settled: the one sample
- * in the tree (native-handoff, `type: 'message'` entries) has the top level
- * equal to the sum of its iterations, which would mean advisor tokens are
- * already billed at the main model's rate rather than unbilled. Advisor
- * requests are currently rejected upstream before any usage is produced, so
- * there is no real sample to decide on. Surfacing the detail first makes that
- * comparison possible the moment one exists; pricing it on a guess would
- * either double-charge or under-charge real money.
+ * Anthropic's top-level usage counts the executor model alone (`type: 'message'`
+ * iterations); each `advisor_message` entry reports the advisor model's own
+ * tokens and bills independently at that model's rates.
  *
  * @returns {Array<{model: string|null, iterations: number, input_tokens: number,
- *   output_tokens: number, cache_read_tokens: number, cache_creation_tokens: number}>|null}
+ *   output_tokens: number, cache_read_tokens: number, cache_creation_tokens: number,
+ *   cache_creation_5m_tokens: number, cache_creation_1h_tokens: number}>|null}
  */
 export function advisorUsageFromIterations(usage = {}) {
   const iterations = usage?.iterations
-  if (!Array.isArray(iterations) || !iterations.length) return null
-  const byModel = new Map()
-  for (const entry of iterations) {
-    if (!entry || typeof entry !== 'object' || entry.type !== 'advisor_message') continue
-    const model = typeof entry.model === 'string' && entry.model.trim() ? entry.model.trim() : null
-    const key = model ?? ''
-    const acc = byModel.get(key) || {
-      model,
-      iterations: 0,
-      input_tokens: 0,
-      output_tokens: 0,
-      cache_read_tokens: 0,
-      cache_creation_tokens: 0,
+  if (Array.isArray(iterations) && iterations.length) {
+    const byModel = new Map()
+    for (const entry of iterations) {
+      if (!entry || typeof entry !== 'object' || entry.type !== 'advisor_message') continue
+      const model = typeof entry.model === 'string' && entry.model.trim() ? entry.model.trim() : null
+      const key = model ?? ''
+      const acc = byModel.get(key) || {
+        model,
+        iterations: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        cache_creation_5m_tokens: 0,
+        cache_creation_1h_tokens: 0,
+      }
+      const raw5m = n(entry.cache_creation_5m_tokens ?? entry.cache_creation?.ephemeral_5m_input_tokens)
+      const raw1h = n(entry.cache_creation_1h_tokens ?? entry.cache_creation?.ephemeral_1h_input_tokens)
+      const rawCreate = n(entry.cache_creation_tokens ?? entry.cache_creation_input_tokens)
+      const cacheCreate = Math.max(rawCreate, raw5m + raw1h)
+      const unsplit = cacheCreate - raw5m - raw1h
+      const cache5m = raw5m + (unsplit > 0 && entry.cache_ttl !== '1h' ? unsplit : 0)
+      const cache1h = raw1h + (unsplit > 0 && entry.cache_ttl === '1h' ? unsplit : 0)
+      acc.iterations += 1
+      acc.input_tokens += n(entry.input_tokens)
+      acc.output_tokens += n(entry.output_tokens)
+      // Accept both the Anthropic wire names and the shortened ones used here.
+      acc.cache_read_tokens += n(entry.cache_read_tokens ?? entry.cache_read_input_tokens)
+      acc.cache_creation_tokens += cacheCreate
+      acc.cache_creation_5m_tokens += cache5m
+      acc.cache_creation_1h_tokens += cache1h
+      byModel.set(key, acc)
     }
-    acc.iterations += 1
-    acc.input_tokens += n(entry.input_tokens)
-    acc.output_tokens += n(entry.output_tokens)
-    // Accept both the Anthropic wire names and the shortened ones used here.
-    acc.cache_read_tokens += n(entry.cache_read_tokens ?? entry.cache_read_input_tokens)
-    acc.cache_creation_tokens += n(entry.cache_creation_tokens ?? entry.cache_creation_input_tokens)
-    byModel.set(key, acc)
+    return byModel.size ? [...byModel.values()] : null
   }
-  return byModel.size ? [...byModel.values()] : null
+  const stored = usage?.advisor_usage
+  if (!Array.isArray(stored) || !stored.length) return null
+  const out = []
+  for (const entry of stored) {
+    if (!entry || typeof entry !== 'object') continue
+    const model = typeof entry.model === 'string' && entry.model.trim() ? entry.model.trim() : null
+    const raw5m = n(entry.cache_creation_5m_tokens ?? entry.cache_creation?.ephemeral_5m_input_tokens)
+    const raw1h = n(entry.cache_creation_1h_tokens ?? entry.cache_creation?.ephemeral_1h_input_tokens)
+    const rawCreate = n(entry.cache_creation_tokens ?? entry.cache_creation_input_tokens)
+    const cacheCreate = Math.max(rawCreate, raw5m + raw1h)
+    const unsplit = cacheCreate - raw5m - raw1h
+    out.push({
+      model,
+      iterations: Math.max(1, Math.trunc(n(entry.iterations)) || 1),
+      input_tokens: n(entry.input_tokens),
+      output_tokens: n(entry.output_tokens),
+      cache_read_tokens: n(entry.cache_read_tokens ?? entry.cache_read_input_tokens),
+      cache_creation_tokens: cacheCreate,
+      cache_creation_5m_tokens: raw5m + (unsplit > 0 && entry.cache_ttl !== '1h' ? unsplit : 0),
+      cache_creation_1h_tokens: raw1h + (unsplit > 0 && entry.cache_ttl === '1h' ? unsplit : 0),
+    })
+  }
+  return out.length ? out : null
 }
 
 /**
@@ -199,6 +226,7 @@ function emptyCost(extra = {}) {
     cache_creation_5m_cost: 0,
     cache_creation_1h_cost: 0,
     web_search_cost: 0,
+    advisor_cost: 0,
     total_cost: 0,
     ...extra,
   }
@@ -233,12 +261,7 @@ function selectBand(price, mode, prompt) {
   return { rates: band, mode: selectedMode, long_context, unpriced: false }
 }
 
-/**
- * Official standard cost for one request's usage object.
- * After normalizeUsage, input_tokens is the uncached bucket for every vendor.
- */
-export function calculateCost(usage = {}, model = null, at) {
-  const u = normalizeUsage(usage)
+function calculateSingleModelCost(u, model = null, at) {
   const mid = model || u.model || u.upstream_model || u.requested_model || ''
   const resolved = resolvePrice(mid, at)
   const outputTokens = n(u.output_tokens)
@@ -331,7 +354,88 @@ export function calculateCost(usage = {}, model = null, at) {
     cache_creation_5m_cost: round8(cache_creation_5m_cost),
     cache_creation_1h_cost: round8(cache_creation_1h_cost),
     web_search_cost: round8(web_search_cost),
+    advisor_cost: 0,
     total_cost: round8(total_cost),
+  }
+}
+
+/**
+ * Price per-model `advisor_message` usage independently at each advisor model's rates.
+ * Fail-closed: if any advisor entry lacks a known priced model, `known` is false.
+ */
+export function advisorCostFromUsage(usage = {}, at) {
+  const detail = advisorUsageFromIterations(usage)
+  if (!detail || !detail.length) {
+    return { known: true, has_advisor: false, advisor_cost: 0, breakdown: null }
+  }
+  let total = 0
+  let known = true
+  const breakdown = []
+  for (const item of detail) {
+    const priced = item.model
+      ? calculateSingleModelCost(
+          {
+            input_tokens: item.input_tokens,
+            output_tokens: item.output_tokens,
+            cache_read_tokens: item.cache_read_tokens,
+            cache_creation_tokens: item.cache_creation_tokens,
+            cache_creation_5m_tokens: item.cache_creation_5m_tokens,
+            cache_creation_1h_tokens: item.cache_creation_1h_tokens,
+          },
+          item.model,
+          at,
+        )
+      : emptyCost({ model: null })
+    if (!priced.known) known = false
+    else total += priced.total_cost
+    breakdown.push({
+      ...item,
+      known: priced.known,
+      pricing_key: priced.pricing_key ?? null,
+      cost: priced.known ? priced.total_cost : null,
+    })
+  }
+  return {
+    known,
+    has_advisor: true,
+    advisor_cost: known ? round8(total) : null,
+    breakdown,
+  }
+}
+
+/**
+ * Official standard cost for one request's usage object.
+ * After normalizeUsage, input_tokens is the uncached bucket for every vendor.
+ * Independent `advisor_message` iterations are priced at each advisor model's rates
+ * and added to `total_cost`.
+ */
+export function calculateCost(usage = {}, model = null, at) {
+  const u = normalizeUsage(usage)
+  const base = calculateSingleModelCost(u, model, at)
+  const adv = advisorCostFromUsage(u, at)
+  if (!adv.has_advisor) return base
+  if (!base.known || !adv.known) {
+    return emptyCost({
+      model: base.model,
+      pricing_key: base.pricing_key,
+      price_source: base.price_source,
+      price_version: base.price_version,
+      mode: base.mode,
+      service_tier: base.service_tier,
+      speed: base.speed,
+      long_context: base.long_context,
+      input_tokens: base.input_tokens,
+      output_tokens: base.output_tokens,
+      cache_read_tokens: base.cache_read_tokens,
+      cache_creation_5m_tokens: base.cache_creation_5m_tokens,
+      cache_creation_1h_tokens: base.cache_creation_1h_tokens,
+      web_search_requests: base.web_search_requests,
+    })
+  }
+  return {
+    ...base,
+    advisor_cost: adv.advisor_cost,
+    total_cost: round8(base.total_cost + adv.advisor_cost),
   }
 }
 
@@ -418,7 +522,8 @@ export function imageCostFromUsage(usage, imageModel = null) {
  */
 export function costColumnsFromUsage(usage, model, image = null, at) {
   const img = image ? imageCostFromUsage(image.usage, image.model) : null
-  const band = billingBandFromUsage(normalizeUsage(usage))
+  const normalized = normalizeUsage(usage)
+  const band = billingBandFromUsage(normalized)
   if (image?.only) {
     const known = img.known
     return {
@@ -428,6 +533,7 @@ export function costColumnsFromUsage(usage, model, image = null, at) {
       cache_creation_cost: known ? 0 : null,
       web_search_cost: known ? 0 : null,
       image_cost: known ? img.image_cost : null,
+      advisor_cost: null,
       total_cost: known ? img.image_cost : null,
       pricing_model: known ? img.pricing_key : UNPRICED_MODEL,
       price_source: known ? img.price_source : null,
@@ -436,7 +542,8 @@ export function costColumnsFromUsage(usage, model, image = null, at) {
       long_context: known ? 0 : null,
     }
   }
-  const c = calculateCost(usage, model, at)
+  const c = calculateCost(normalized, model, at)
+  const hasAdvisor = Array.isArray(normalized.advisor_usage) && normalized.advisor_usage.length > 0
   const known = c.known && (!img || img.known)
   return {
     input_cost: known ? c.input_cost : null,
@@ -445,6 +552,7 @@ export function costColumnsFromUsage(usage, model, image = null, at) {
     cache_creation_cost: known ? c.cache_creation_cost : null,
     web_search_cost: known ? c.web_search_cost : null,
     image_cost: known && img ? img.image_cost : null,
+    advisor_cost: known && hasAdvisor ? c.advisor_cost : null,
     total_cost: known ? round8(c.total_cost + (img?.image_cost || 0)) : null,
     pricing_model: known ? c.pricing_key : UNPRICED_MODEL,
     price_source: known ? c.price_source : null,

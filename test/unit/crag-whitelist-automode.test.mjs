@@ -15,7 +15,7 @@ import {
   sanitizeSafeguardsForCrag,
 } from '../../src/lib/protocol/crag-whitelist.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
-import { prepareCragRequest } from '../../src/lib/protocol/kernel-request.mjs'
+import { prepareCliNodeRequest, prepareCragRequest } from '../../src/lib/protocol/kernel-request.mjs'
 import { classifyClaudeRequestPurpose, prepareClassifierBody } from '../../src/lib/protocol/request-purpose.mjs'
 import { relocateThirdPartySystem } from '../../src/lib/protocol/third-party-system.mjs'
 import { finalizeWorkerPayload } from '../../src/lib/transport/go-worker-client.mjs'
@@ -115,10 +115,34 @@ test('CRAG whitelist keeps every advisor tool option and still rejects a bad def
   )
   assert.deepEqual(body.tools, [advisor])
 
-  // An advisor tool carrying input_schema is refused outright rather than cleaned:
-  // the upstream contract has no schema for it.
+  // A stray input_schema from a proxy caller is stripped rather than rejected,
+  // matching CRAG's own advisor whitelist contract.
+  const { body: strippedBody } = sanitizeCragBodyWhitelist(
+    {
+      model: 'claude-sonnet-5-5',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      tools: [{ ...advisor, input_schema: { type: 'object', properties: {} } }],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(strippedBody.tools, [advisor])
+  assert.equal('input_schema' in strippedBody.tools[0], false)
+
+  // cli-node request preparation also strips stray input_schema on advisor_* tools
+  // while leaving custom tools untouched.
+  const cliPrepared = prepareCliNodeRequest({
+    model: 'claude-sonnet-5-5',
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [
+      { ...advisor, input_schema: { type: 'object', properties: {} } },
+      { name: 'lookup', input_schema: { type: 'object', properties: {} } },
+    ],
+  })
+  assert.equal('input_schema' in cliPrepared.tools[0], false)
+  assert.deepEqual(cliPrepared.tools[1].input_schema, { type: 'object', properties: {} })
+
+  // Invalid advisor identity (wrong name or missing model) still fails closed.
   for (const bad of [
-    { ...advisor, input_schema: { type: 'object' } },
     { ...advisor, name: 'helper' },
     { ...advisor, model: '' },
   ]) {
@@ -824,11 +848,11 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
     const runner = new FailoverRunner({
       scheduler: {
         async selectAndReserve() {
-          return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec, release() {} }
+          return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec, release() { } }
         },
-        markSuccess() {},
-        markCooldown() {},
-        releaseAccountSessions() {},
+        markSuccess() { },
+        markCooldown() { },
+        releaseAccountSessions() { },
       },
       config: { max_same_account_retries: 0 },
     })
@@ -843,9 +867,9 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
       once(ev, fn) {
         if (ev === 'finish') finishListeners.push(fn)
       },
-      off() {},
-      write() {},
-      end() {},
+      off() { },
+      write() { },
+      end() { },
     }
     const handler = createHandleProtocol({
       json(_res, status, body) {
@@ -855,7 +879,7 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
         for (const fn of finishListeners) fn()
         return body
       },
-      writeSSEHeaders() {},
+      writeSSEHeaders() { },
       readBody: async () => structuredClone(incoming),
       requireAuth: () => true,
       cfg: {
@@ -870,8 +894,8 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
         finish: (bag, second) => logs.push(second || bag),
       },
       stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
-      accountQuota: { ingestHeaders() {} },
-      apiKeyStore: { acquire: () => ({ ok: true }), release() {}, recordUsage() {} },
+      accountQuota: { ingestHeaders() { } },
+      apiKeyStore: { acquire: () => ({ ok: true }), release() { }, recordUsage() { } },
       apiScheduler: {},
       apiEndpointStore: {},
       stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
@@ -914,8 +938,8 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
         },
         apiKeyKind: 'managed',
         apiKeyRecord: { id: 'fixture' },
-        once() {},
-        off() {},
+        once() { },
+        off() { },
       },
       response,
       'anthropic.messages',

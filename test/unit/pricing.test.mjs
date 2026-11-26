@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  advisorCostFromUsage,
   advisorUsageFromIterations,
   calculateCost,
   shanghaiDay,
@@ -754,10 +755,9 @@ test('cache creation above the TTL split bills the remainder (#678)', () => {
 
 /**
  * #6: the advisor tool runs a second model inside one turn and reports it as an
- * `advisor_message` entry in `usage.iterations`, carrying its own model. Nothing
- * parsed `iterations`, so those tokens were invisible. These cases pin the
- * detail extraction and -- just as importantly -- that it stays out of pricing
- * until the top-level/iterations overlap is settled against a real sample.
+ * `advisor_message` entry in `usage.iterations`, carrying its own model.
+ * Anthropic's top-level `usage` counts only the executor (`type: 'message'`),
+ * so each advisor model bills independently and rolls into `advisor_cost` / `total_cost`.
  */
 const advisorUsage = () => ({
   input_tokens: 1000,
@@ -780,6 +780,8 @@ test('#6 advisor iterations are summed per advisor model', () => {
       output_tokens: 50,
       cache_read_tokens: 0,
       cache_creation_tokens: 0,
+      cache_creation_5m_tokens: 0,
+      cache_creation_1h_tokens: 0,
     },
     {
       model: 'claude-haiku-5-5',
@@ -788,6 +790,8 @@ test('#6 advisor iterations are summed per advisor model', () => {
       output_tokens: 5,
       cache_read_tokens: 0,
       cache_creation_tokens: 0,
+      cache_creation_5m_tokens: 0,
+      cache_creation_1h_tokens: 0,
     },
   ])
   // The main-model `message` entry must not leak into the advisor detail.
@@ -805,18 +809,64 @@ test('#6 advisor detail rides along on normalizeUsage and is idempotent', () => 
   assert.deepEqual(normalizeUsage(once), once)
 })
 
-test('#6 advisor detail does not move the bill', () => {
+test('#6 advisor iterations bill independently per advisor model and add into total_cost', () => {
   const withAdvisor = calculateCost(advisorUsage(), 'claude-sonnet-5')
   const { iterations: _dropped, ...withoutIterations } = advisorUsage()
   const plain = calculateCost(withoutIterations, 'claude-sonnet-5')
-  assert.equal(withAdvisor.total_cost, plain.total_cost, 'detail only: advisor tokens must not be priced yet')
+
+  const opusOnly = calculateCost({ input_tokens: 420, output_tokens: 50 }, 'claude-opus-5-5')
+  const haikuOnly = calculateCost({ input_tokens: 50, output_tokens: 5 }, 'claude-haiku-5-5')
+  const expectedAdvisorCost = Math.round((opusOnly.total_cost + haikuOnly.total_cost) * 1e8) / 1e8
+
+  assert.equal(withAdvisor.known, true)
   assert.equal(withAdvisor.input_tokens, plain.input_tokens)
   assert.equal(withAdvisor.output_tokens, plain.output_tokens)
+  assert.equal(withAdvisor.advisor_cost, expectedAdvisorCost)
+  assert.equal(withAdvisor.total_cost, Math.round((plain.total_cost + expectedAdvisorCost) * 1e8) / 1e8)
 
-  // Same for the persisted cost columns.
+  const advBreakdown = advisorCostFromUsage(advisorUsage())
+  assert.equal(advBreakdown.known, true)
+  assert.equal(advBreakdown.advisor_cost, expectedAdvisorCost)
+  assert.equal(advBreakdown.breakdown.length, 2)
+
+  // Persisted cost columns expose advisor_cost and roll it into total_cost without double-counting.
   const cols = costColumnsFromUsage(advisorUsage(), 'claude-sonnet-5')
   const plainCols = costColumnsFromUsage(withoutIterations, 'claude-sonnet-5')
-  assert.deepEqual(cols, plainCols)
+  assert.equal(plainCols.advisor_cost, null)
+  assert.equal(cols.advisor_cost, expectedAdvisorCost)
+  assert.equal(cols.total_cost, withAdvisor.total_cost)
+
+  // Re-pricing from persisted advisor_usage (without raw iterations) yields the exact same bill.
+  const fromStored = costColumnsFromUsage(
+    { input_tokens: 1000, output_tokens: 200, advisor_usage: advisorUsageFromIterations(advisorUsage()) },
+    'claude-sonnet-5',
+  )
+  assert.deepEqual(fromStored, cols)
+
+  // Fail-closed when an advisor iteration names an unpriced or missing model.
+  const unpricedAdvisor = calculateCost(
+    {
+      input_tokens: 1000,
+      output_tokens: 200,
+      iterations: [
+        { type: 'advisor_message', model: 'claude-unknown-advisor-99', input_tokens: 100, output_tokens: 10 },
+      ],
+    },
+    'claude-sonnet-5',
+  )
+  assert.equal(unpricedAdvisor.known, false)
+  assert.equal(unpricedAdvisor.total_cost, 0)
+  const unpricedCols = costColumnsFromUsage(
+    {
+      input_tokens: 1000,
+      output_tokens: 200,
+      iterations: [{ type: 'advisor_message', input_tokens: 100, output_tokens: 10 }],
+    },
+    'claude-sonnet-5',
+  )
+  assert.equal(unpricedCols.total_cost, null)
+  assert.equal(unpricedCols.advisor_cost, null)
+  assert.equal(unpricedCols.pricing_model, 'unpriced')
 })
 
 test('#6 usage without advisor iterations carries no advisor field', () => {
@@ -829,7 +879,7 @@ test('#6 usage without advisor iterations carries no advisor field', () => {
   assert.equal('advisor_usage' in normalizeUsage({ input_tokens: 10, output_tokens: 2 }), false)
 })
 
-test('#6 advisor detail accepts both cache field namings and a missing model', () => {
+test('#6 advisor detail accepts both cache field namings, 5m/1h split, and a missing model', () => {
   const detail = advisorUsageFromIterations({
     iterations: [
       {
@@ -837,6 +887,7 @@ test('#6 advisor detail accepts both cache field namings and a missing model', (
         model: 'claude-opus-5-5',
         cache_read_input_tokens: 70,
         cache_creation_input_tokens: 30,
+        cache_creation: { ephemeral_5m_input_tokens: 10, ephemeral_1h_input_tokens: 20 },
       },
       { type: 'advisor_message', model: 'claude-opus-5-5', cache_read_tokens: 5, cache_creation_tokens: 3 },
       { type: 'advisor_message', input_tokens: 11 },
@@ -845,6 +896,9 @@ test('#6 advisor detail accepts both cache field namings and a missing model', (
   const opus = detail.find((row) => row.model === 'claude-opus-5-5')
   assert.equal(opus.cache_read_tokens, 75)
   assert.equal(opus.cache_creation_tokens, 33)
+  // 10 explicit 5m + 3 unsplit (defaults to 5m) = 13; 20 explicit 1h.
+  assert.equal(opus.cache_creation_5m_tokens, 13)
+  assert.equal(opus.cache_creation_1h_tokens, 20)
   // An entry with no model is kept rather than silently dropped: the tokens
   // were really spent, and losing them would understate the detail.
   const unknown = detail.find((row) => row.model === null)

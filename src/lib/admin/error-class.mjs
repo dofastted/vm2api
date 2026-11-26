@@ -17,6 +17,7 @@ export const ERROR_CLASSES = {
   credential: { id: 'credential', owner: 'platform', label: '凭证' },
   proxy: { id: 'proxy', owner: 'platform', label: '代理' },
   upstream: { id: 'upstream', owner: 'provider', label: '上游' },
+  gateway_protocol: { id: 'gateway_protocol', owner: 'platform', label: '网关协议' },
   other: { id: 'other', owner: 'platform', label: '其它' },
   distill: { id: 'distill', owner: 'platform', label: '蒸馏拦截' },
   refusal: { id: 'refusal', owner: 'provider', label: '拒答拦截' },
@@ -261,6 +262,19 @@ export function classifyRequestError(row = {}) {
     !isOauthCredentialFailure(row, text, code)
   ) {
     id = 'refusal'
+  }
+  // Kernel / gateway protocol mismatches (e.g. stripped advisor beta or
+  // kernel-injected input_schema on a typed server tool) are platform bugs,
+  // not client request-format errors.
+  if (
+    code === 'gateway_protocol_error' ||
+    (id === 'request' &&
+      status === 400 &&
+      /(?:tools\.\d+\.advisor_\w+\.input_schema:\s*extra inputs are not permitted|input tag 'advisor_\w+' found using 'type' does not match)/i.test(
+        text,
+      ))
+  ) {
+    id = 'gateway_protocol'
   }
   // "Third-party apps now draw from your extra usage": the caller is not
   // Claude Code. Older rows logged it as refusal_guard; it is a client error.

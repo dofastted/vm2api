@@ -36,6 +36,15 @@ test('069 log error details and hop correlation is additive even on a huge datab
   assert.equal(v.additive, true, JSON.stringify(v.reasons))
 })
 
+test('070 usage_logs advisor billing is additive even on a huge database', () => {
+  const sql = fs.readFileSync(path.join(SQLITE_DIR, '070_usage_logs_advisor_billing.sql'), 'utf8')
+  const v = checkAdditive({
+    ...sqlite('070_usage_logs_advisor_billing.sql', sql),
+    rowCount: () => 10_000_000,
+  })
+  assert.equal(v.additive, true, JSON.stringify(v.reasons))
+})
+
 test('an index on an existing table above the row limit needs a restart', () => {
   const v = checkAdditive({
     ...sqlite('100_x.sql', 'CREATE INDEX IF NOT EXISTS idx_logs_x ON request_attempts(model);'),
