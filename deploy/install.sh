@@ -1818,6 +1818,30 @@ prepare_docker_crag_apparmor() {
   ok "Docker CRAG userns profile 已加载并保存: $profile"
 }
 
+url_points_to_local_host() {
+  local raw="${1:-}" rest host
+  [ -n "$raw" ] || return 1
+  # Strip scheme://, optional userinfo@, and path/query
+  rest="${raw#*://}"
+  rest="${rest%%/*}"
+  rest="${rest%%\?*}"
+  rest="${rest##*@}"
+  if [[ "$rest" == \[*\]:* ]]; then
+    host="${rest#\[}"
+    host="${host%%\]*}"
+  elif [[ "$rest" == \[*\] ]]; then
+    host="${rest#\[}"
+    host="${host%\]}"
+  else
+    host="${rest%%:*}"
+  fi
+  host="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
+  case "$host" in
+    127.0.0.1|localhost|::1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 need_local_pg() {
   local driver db_url db_host
   driver="$(env_get VM2API_DB_DRIVER)"
@@ -1826,11 +1850,11 @@ need_local_pg() {
   fi
   db_url="$(env_get DATABASE_URL)"
   db_url="${db_url:-$(env_get VM2API_DATABASE_URL)}"
-  if [ -n "$db_url" ]; then
+  if [ -n "$db_url" ] && ! url_points_to_local_host "$db_url"; then
     return 1
   fi
   db_host="$(env_get DATABASE_HOST)"
-  if [ -n "$db_host" ] && [ "$db_host" != "127.0.0.1" ] && [ "$db_host" != "localhost" ]; then
+  if [ -n "$db_host" ] && [ "$db_host" != "127.0.0.1" ] && [ "$db_host" != "localhost" ] && [ "$db_host" != "::1" ]; then
     return 1
   fi
   return 0
@@ -1848,11 +1872,11 @@ need_local_redis() {
   fi
   redis_url="$(env_get REDIS_URL)"
   redis_url="${redis_url:-$(env_get VM2API_REDIS_URL)}"
-  if [ -n "$redis_url" ]; then
+  if [ -n "$redis_url" ] && ! url_points_to_local_host "$redis_url"; then
     return 1
   fi
   redis_host="$(env_get REDIS_HOST)"
-  if [ -n "$redis_host" ] && [ "$redis_host" != "127.0.0.1" ] && [ "$redis_host" != "localhost" ]; then
+  if [ -n "$redis_host" ] && [ "$redis_host" != "127.0.0.1" ] && [ "$redis_host" != "localhost" ] && [ "$redis_host" != "::1" ]; then
     return 1
   fi
   return 0
@@ -2360,7 +2384,7 @@ ensure_migrate_script() {
       return 0
     fi
   fi
-  if [ -f "$script" ] && grep -q -- '--preflight' "$script" 2>/dev/null; then
+  if [ -f "$script" ] && grep -q 'verify_pg_sync_rpc_safety' "$script" 2>/dev/null; then
     echo "$script"
     return 0
   fi

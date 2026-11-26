@@ -38,6 +38,12 @@ services:
       - -c
       - wal_buffers=16MB
       - -c
+      - checkpoint_completion_target=${PG_CHECKPOINT_COMPLETION_TARGET:-0.9}
+      - -c
+      - max_wal_size=${PG_MAX_WAL_SIZE:-1GB}
+      - -c
+      - idle_in_transaction_session_timeout=${PG_IDLE_IN_TX_TIMEOUT_MS:-60000}
+      - -c
       - random_page_cost=1.1
     volumes:
       - postgres_data:/var/lib/postgresql/data

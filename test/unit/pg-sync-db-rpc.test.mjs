@@ -85,6 +85,10 @@ describe('PgSyncDb synchronous RPC framing & correlation', () => {
         reply(msg.sab, { id: msg.id, ok: true, result: { changes: 1, lastInsertRowid: 0 } })
         return
       }
+      if (msg.op === 'stats') {
+        reply(msg.sab, { id: msg.id, ok: true, result: { total: 2, idle: 2, waiting: 0, active: 0, max: 12 } })
+        return
+      }
       reply(msg.sab, { id: msg.id, ok: true, result: { from: msg.sql, id: msg.id } })
     }`)
     const db = new PgSyncDb({ worker, port, ownsWorker: true, rpcTimeoutMs: 80 })
@@ -118,6 +122,10 @@ describe('PgSyncDb synchronous RPC framing & correlation', () => {
       const listRows = db.prepare('SELECT * FROM proxies').all()
       assert.ok(Array.isArray(listRows))
       assert.equal(listRows[0].from, 'SELECT * FROM proxies')
+
+      const stats = db.poolStats()
+      assert.equal(stats.timeouts, 2)
+      assert.equal(stats.stale_dropped, 2)
     } finally {
       db.close()
     }
