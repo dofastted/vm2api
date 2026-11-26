@@ -8,6 +8,7 @@
 - [CRAG 面板历史复用](performance/crag-panel-history-reuse.md) — 入站优化过程、CPU 对照、长会话回放和缓存边界
 - [FORMAT.md](FORMAT.md) — 仅格式化改动文件；手动全量 CI 使用同一套 Biome / gofmt / Prettier 配置（LF）
 - [API.md](API.md) — `/v1`
+- [advisor.md](advisor.md) — `advisor_20260301` 工具：调用方真实形状、白名单校验、两条路径各自的 beta 声明、结果块的三态 union
 - [RISK.md](RISK.md) — 封控拦截（蒸馏 → 硬正则 → 拒答缓存 → 决策模型 → 放行出站）
 - [PANEL_API.md](PANEL_API.md) — 管理台 API
 - [CRAG 支付与鉴权验收](crag-payment-acceptance.md) — 商城调用、回调归属、宿主订阅兑换与实付复跑
