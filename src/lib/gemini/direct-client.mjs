@@ -294,7 +294,7 @@ export function prepareDirectNativeTurnBody(model, bodyObj) {
   return forwarded
 }
 
-export function buildDirectEnvelope({ model, requestId, bodyObj, gatewayPolicy = null }) {
+export function buildDirectEnvelope({ model, requestId, bodyObj, gatewayPolicy = null, restartResume = false }) {
   if (
     typeof model !== 'string' ||
     !MODEL_RE.test(model) ||
@@ -323,6 +323,9 @@ export function buildDirectEnvelope({ model, requestId, bodyObj, gatewayPolicy =
   }
   if (gatewayPolicy && typeof gatewayPolicy === 'object' && Object.keys(gatewayPolicy).length > 0) {
     envelope.gateway_policy = gatewayPolicy
+  }
+  if (restartResume === true) {
+    envelope.restart_resume = true
   }
   return envelope
 }
@@ -387,6 +390,18 @@ export function mapCragWorkerError(httpStatus, payload) {
   if (effectiveStatus === 401) return makeErr(401, 'gemini_oauth_required', message)
   if (effectiveStatus === 403) return makeErr(403, 'gemini_location_unsupported', message)
   if (effectiveStatus === 404) return makeErr(404, 'gemini_model_unavailable', message)
+  if (code === 'upstream_unavailable' || effectiveStatus === 503) {
+    const err = makeErr(
+      503,
+      'gemini_upstream_unavailable',
+      message || 'Gemini upstream service temporarily unavailable',
+    )
+    if (Number.isInteger(obj.retry_after_ms) && obj.retry_after_ms >= 1 && obj.retry_after_ms <= 3_600_000) {
+      err.retryAfterMs = obj.retry_after_ms
+      err.retryAfter = Math.ceil(obj.retry_after_ms / 1000)
+    }
+    return err
+  }
   return makeErr(
     effectiveStatus >= 400 && effectiveStatus <= 599 ? effectiveStatus : 502,
     'gemini_inference_failed',
@@ -497,9 +512,9 @@ export function createDirectCragClient({ callHost, now = () => Date.now() }) {
 
   const openDirectStream = (
     target,
-    { model, requestId, bodyObj, gatewayPolicy = null, signal, timeoutMs = 300_000 },
+    { model, requestId, bodyObj, gatewayPolicy = null, restartResume = false, signal, timeoutMs = 300_000 },
   ) => {
-    const envelope = buildDirectEnvelope({ model, requestId, bodyObj, gatewayPolicy })
+    const envelope = buildDirectEnvelope({ model, requestId, bodyObj, gatewayPolicy, restartResume })
     if (!envelope) {
       const err = new Error('The selected Gemini environment does not support the requested turn.')
       err.status = 400

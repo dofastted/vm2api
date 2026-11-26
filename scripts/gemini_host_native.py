@@ -531,6 +531,19 @@ def _map_worker_error(http_status, payload):
         return NativeFailure("gemini_location_unsupported", 403, message)
     if effective_status == 404:
         return NativeFailure("gemini_model_unavailable", 404, message)
+    if code == "upstream_unavailable" or effective_status == 503:
+        raw_retry = payload.get("retry_after_ms") if isinstance(payload, dict) else None
+        retry_after_ms = (
+            raw_retry
+            if type(raw_retry) is int and 1 <= raw_retry <= 3_600_000
+            else None
+        )
+        return NativeFailure(
+            "gemini_upstream_unavailable",
+            503,
+            message or "Gemini upstream service temporarily unavailable",
+            retry_after_ms=retry_after_ms,
+        )
     return NativeFailure("gemini_inference_failed", effective_status if 400 <= effective_status <= 599 else 502, message)
 
 
@@ -554,6 +567,7 @@ def open_worker_stream(
     startup_timeout=45,
     turn_timeout=TURN_TIMEOUT,
     gateway_policy=None,
+    restart_resume=False,
     diagnostic=None,
     account_id=None,
     is_alive=None,
@@ -624,6 +638,8 @@ def open_worker_stream(
         "stream": True,
         "body": wire_body,
     }
+    if restart_resume is True:
+        envelope["restart_resume"] = True
     if system_prompt_mode == "zero":
         envelope["system_prompt_mode"] = "zero"
     conv_id = wire_body.get("conversation_id") or wire_body.get("conversationId")

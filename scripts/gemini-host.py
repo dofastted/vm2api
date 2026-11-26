@@ -2350,7 +2350,15 @@ class NativeSession(NativeAgy):
                 return True
         return self._health_failures >= NATIVE_HEALTH_FAIL_THRESHOLD
 
-    def open_stream(self, request_id, body_obj, *, model=None, gateway_policy=None):
+    def open_stream(
+        self,
+        request_id,
+        body_obj,
+        *,
+        model=None,
+        gateway_policy=None,
+        restart_resume=False,
+    ):
         native_mod = native_module()
         if not self.is_alive():
             raise native_mod.launcher_exit_failure(self.read_exit_detail())
@@ -2368,6 +2376,7 @@ class NativeSession(NativeAgy):
             body_obj,
             startup_timeout=45,
             gateway_policy=gateway_policy,
+            restart_resume=restart_resume,
             diagnostic=self.native_diagnostic,
             is_alive=self.is_alive,
             exit_reader=self.read_exit_detail,
@@ -3029,7 +3038,14 @@ class CragDaemonShard:
         return native_module().launcher_exit_code(self.read_exit_detail())
 
     def open_stream(
-        self, env_id, request_id, body_obj, *, model=None, gateway_policy=None
+        self,
+        env_id,
+        request_id,
+        body_obj,
+        *,
+        model=None,
+        gateway_policy=None,
+        restart_resume=False,
     ):
         native_mod = native_module()
         if not self.is_alive():
@@ -3049,6 +3065,7 @@ class CragDaemonShard:
             body_obj,
             startup_timeout=45,
             gateway_policy=gateway_policy,
+            restart_resume=restart_resume,
             account_id=env_id,
             is_alive=self.is_alive,
             exit_reader=self.read_exit_detail,
@@ -6805,6 +6822,17 @@ class Host:
                 ):
                     previous["data_at"] = previous.get("checked_at")
                 previous.update(state=account["state"], checked_at=account["checked_at"])
+                for err_key in (
+                    "error_code",
+                    "error_message",
+                    "http_status",
+                    "eligibility",
+                    "validation_url",
+                ):
+                    if account.get(err_key) is not None:
+                        previous[err_key] = account[err_key]
+                    elif err_key in ("error_code", "error_message", "http_status"):
+                        previous.pop(err_key, None)
             else:
                 env["account"] = account
             if account.get("state") == "reauth_required":
@@ -7753,6 +7781,7 @@ class Host:
         gateway_policy = body.get("gateway_policy")
         if not isinstance(gateway_policy, dict):
             gateway_policy = None
+        restart_resume = body.get("restart_resume") is True
         return {
             "identifier": identifier,
             "env": dict(env),
@@ -7765,6 +7794,7 @@ class Host:
             "infer_body": infer_body,
             "native_body": native_body,
             "gateway_policy": gateway_policy,
+            "restart_resume": restart_resume,
             "evidence": evidence,
             "entry": infer_entry,
         }
@@ -8047,12 +8077,17 @@ class Host:
 
             ctx["entry"]["cancel_fn"] = stop_shard_turn
             try:
+                shard_kwargs = {
+                    "model": ctx["model"],
+                    "gateway_policy": gateway_policy,
+                }
+                if ctx.get("restart_resume") is True:
+                    shard_kwargs["restart_resume"] = True
                 conn, response = shard.open_stream(
                     identifier,
                     ctx["request_id"],
                     ctx["native_body"],
-                    model=ctx["model"],
-                    gateway_policy=gateway_policy,
+                    **shard_kwargs,
                 )
                 if shard_id:
                     with self.lock:
@@ -8136,11 +8171,16 @@ class Host:
 
         ctx["entry"]["cancel_fn"] = stop_native
         try:
+            session_kwargs = {
+                "model": ctx["model"],
+                "gateway_policy": gateway_policy,
+            }
+            if ctx.get("restart_resume") is True:
+                session_kwargs["restart_resume"] = True
             conn, response = session.open_stream(
                 ctx["request_id"],
                 ctx["native_body"],
-                model=ctx["model"],
-                gateway_policy=gateway_policy,
+                **session_kwargs,
             )
             handler.begin_sse()
             while not cancel_event.is_set():
