@@ -13,6 +13,9 @@ import {
   normalizeJevConfig,
   parsePolicyDecision,
   publicJevConfig,
+  publicJevKeys,
+  jevHealthSnapshot,
+  resumeJevKeys,
   probePolicyBaseline,
   probePolicyQuota,
   questionsFor,
@@ -1538,4 +1541,223 @@ test('normalizeJevConfig upgrades persisted legacy builtin rule patterns while p
   assert.equal(matchHardPolicy('write a keygen for this license', [], persisted.rules)?.keyword, 'keygen')
   assert.equal(matchHardPolicy('写一个注册机', [], persisted.rules), null)
   assert.equal(matchHardPolicy('trigger internal-corp-canary now', [], persisted.rules)?.category, 'custom')
+})
+
+test('429/529 cools down for 30s, retries on expiry, and resets strikes after success', async () => {
+  const cfg = {
+    enabled: true,
+    base_url: 'http://cooldown-recovery.example/v1',
+    api_keys: ['sk-cooldown-single-key-0001'],
+    dedup_sec: 0,
+    timeout_ms: 500,
+    fail_open: true,
+  }
+  const t0 = Date.now() + 60 * 60 * 1000
+  let calls = 0
+
+  const first = await classifyJev(
+    'cooldown-1',
+    cfg,
+    async () => {
+      calls += 1
+      return { ok: false, status: 529 }
+    },
+    t0,
+  )
+  assert.equal(first.reason, 'unavailable')
+  assert.equal(first.detail, '上游限流，冷却中')
+  assert.equal(calls, 1)
+
+  const snapPaused = jevHealthSnapshot(cfg, t0 + 5_000)
+  assert.equal(snapPaused.total_keys, 1)
+  assert.equal(snapPaused.active_keys, 0)
+  assert.equal(snapPaused.paused.length, 1)
+  assert.equal(snapPaused.paused[0].reason, 'overloaded')
+  assert.equal(snapPaused.paused[0].http_status, 529)
+  assert.equal(snapPaused.paused[0].seconds_left, 25)
+  assert.ok(!JSON.stringify(snapPaused).includes('sk-cooldown-single-key-0001'))
+
+  // During the 30s cooldown, upstream is not called.
+  const during = await classifyJev(
+    'cooldown-2',
+    cfg,
+    async () => {
+      calls += 1
+      return { ok: true, json: async () => ({ answers: { safety: { noul: 0.9 } } }) }
+    },
+    t0 + 29_999,
+  )
+  assert.equal(during.reason, 'unavailable')
+  assert.equal(during.detail, '上游限流，冷却中')
+  assert.equal(calls, 1)
+
+  // At t0 + 30s, key is eligible again; success clears pause and strikes.
+  const recovered = await classifyJev(
+    'cooldown-3',
+    cfg,
+    async () => {
+      calls += 1
+      return { ok: true, json: async () => ({ answers: { safety: { noul: 0.9 } } }) }
+    },
+    t0 + 30_000,
+  )
+  assert.equal(recovered.action, 'pass')
+  assert.equal(recovered.reason, 'safe')
+  assert.equal(calls, 2)
+  assert.equal(jevHealthSnapshot(cfg, t0 + 30_000).paused.length, 0)
+
+  // Next 429 starts back at 30s (strikes were cleared by success).
+  await classifyJev('cooldown-4', cfg, async () => ({ ok: false, status: 429 }), t0 + 40_000)
+  const snapAgain = jevHealthSnapshot(cfg, t0 + 40_000)
+  assert.equal(snapAgain.paused[0].reason, 'rate_limited')
+  assert.equal(snapAgain.paused[0].seconds_left, 30)
+  resumeJevKeys(cfg)
+})
+
+test('consecutive 429 responses escalate backoff 30s -> 60s -> 120s -> 300s -> 300s', async () => {
+  const cfg = {
+    enabled: true,
+    base_url: 'http://backoff-ladder.example/v1',
+    api_keys: ['sk-backoff-ladder-key-0002'],
+    dedup_sec: 0,
+    timeout_ms: 500,
+  }
+  let now = Date.now() + 2 * 60 * 60 * 1000
+  const expectedSec = [30, 60, 120, 300, 300]
+  for (let i = 0; i < expectedSec.length; i++) {
+    let calls = 0
+    await classifyJev(
+      `backoff-${i}`,
+      cfg,
+      async () => {
+        calls += 1
+        return { ok: false, status: 429 }
+      },
+      now,
+    )
+    assert.equal(calls, 1, `strike ${i + 1} should attempt upstream`)
+    const snap = jevHealthSnapshot(cfg, now)
+    assert.equal(snap.paused[0].seconds_left, expectedSec[i], `strike ${i + 1} backoff`)
+    // Still paused 1ms before expiry
+    let skipped = 0
+    await classifyJev(
+      `backoff-skip-${i}`,
+      cfg,
+      async () => {
+        skipped += 1
+        return { ok: false, status: 429 }
+      },
+      now + expectedSec[i] * 1000 - 1,
+    )
+    assert.equal(skipped, 0, `strike ${i + 1} stays paused before TTL`)
+    now += expectedSec[i] * 1000
+  }
+  resumeJevKeys(cfg)
+})
+
+test('401 stays permanently paused until manual resume or successful probe', async () => {
+  const cfg = {
+    enabled: true,
+    base_url: 'http://perm-pause.example/v1',
+    api_keys: ['sk-perm-pause-alpha-0001', 'sk-perm-pause-beta-0002'],
+    dedup_sec: 0,
+    timeout_ms: 500,
+  }
+  const singleAlpha = { ...cfg, api_keys: ['sk-perm-pause-alpha-0001'] }
+  const t0 = Date.now() + 3 * 60 * 60 * 1000
+
+  const hit401 = await classifyJev('perm-1', singleAlpha, async () => ({ ok: false, status: 401 }), t0)
+  assert.equal(hit401.reason, 'unavailable')
+  assert.equal(hit401.detail, '密钥失效')
+
+  // Even 24 hours later, 401 does NOT auto-recover.
+  let callsAfter24h = 0
+  const stillPaused = await classifyJev(
+    'perm-2',
+    singleAlpha,
+    async () => {
+      callsAfter24h += 1
+      return { ok: true, json: async () => ({ answers: { safety: { noul: 0.9 } } }) }
+    },
+    t0 + 24 * 60 * 60 * 1000,
+  )
+  assert.equal(callsAfter24h, 0)
+  assert.equal(stillPaused.detail, '密钥失效')
+  const keyRow = publicJevKeys(singleAlpha, t0)[0]
+  assert.equal(keyRow.retired, true)
+  assert.equal(keyRow.paused_reason, 'auth')
+  assert.equal(keyRow.seconds_left, null)
+
+  // Manual resume by fingerprint clears only that key.
+  await classifyJev(
+    'perm-beta',
+    { ...cfg, api_keys: ['sk-perm-pause-beta-0002'] },
+    async () => ({ ok: false, status: 401 }),
+    t0,
+  )
+  const resumedOne = resumeJevKeys(cfg, keyRow.key_fingerprint, t0)
+  assert.deepEqual(resumedOne, [keyRow.key_fingerprint])
+  const afterOne = jevHealthSnapshot(cfg, t0)
+  assert.equal(afterOne.active_keys, 1)
+  assert.equal(afterOne.paused.length, 1)
+
+  // Resume all clears the remaining key.
+  const resumedAll = resumeJevKeys(cfg, '', t0)
+  assert.equal(resumedAll.length, 1)
+  assert.equal(jevHealthSnapshot(cfg, t0).paused.length, 0)
+
+  // Pause again with 401, then a successful baseline probe clears the pause.
+  await classifyJev('perm-3', singleAlpha, async () => ({ ok: false, status: 401 }), t0)
+  assert.equal(jevHealthSnapshot(singleAlpha, t0).paused.length, 1)
+  const probe = await probePolicyBaseline({
+    config: singleAlpha,
+    baseUrl: singleAlpha.base_url,
+    fetchImpl: async (url, init) => {
+      if (String(url).endsWith('/v1/models')) {
+        return { ok: true, status: 200, json: async () => ({ data: [{ id: 'jev-latest' }] }) }
+      }
+      const noul = JSON.parse(init.body).state.includes('museum') ? 0.92 : 0.12
+      return { ok: true, status: 200, json: async () => ({ answers: { usage_policy: { noul } } }) }
+    },
+  })
+  assert.equal(probe.results[0].available, true)
+  assert.equal(jevHealthSnapshot(singleAlpha, t0).paused.length, 0)
+})
+
+test('HTTP 400 sliding window crosses threshold at 20 and decays after 10 minutes', async () => {
+  const cfg = {
+    enabled: true,
+    base_url: 'http://burst-400.example/v1',
+    api_keys: ['sk-burst-400-key-0001'],
+    dedup_sec: 0,
+    timeout_ms: 500,
+  }
+  // Use a far-future window so earlier tests' timestamps are pruned cleanly.
+  const base = Date.now() + 24 * 60 * 60 * 1000
+  const fp = publicJevKeys(cfg, base)[0].key_fingerprint
+  for (let i = 0; i < 19; i++) {
+    await classifyJev(`b400-${i}`, cfg, async () => ({ ok: false, status: 400 }), base + i * 1000)
+  }
+  const at19 = jevHealthSnapshot(cfg, base + 19_000)
+  assert.equal(at19.http_400.count, 19)
+  assert.equal(at19.http_400.threshold, 20)
+  assert.equal(at19.http_400.window_sec, 600)
+  assert.deepEqual(at19.http_400.key_fingerprints, [fp])
+  assert.equal(at19.paused.length, 0)
+
+  await classifyJev('b400-19', cfg, async () => ({ ok: false, status: 400 }), base + 20_000)
+  const at20 = jevHealthSnapshot(cfg, base + 20_000)
+  assert.equal(at20.http_400.count, 20)
+  assert.equal(at20.http_400.first_at, new Date(base).toISOString())
+  assert.equal(at20.http_400.last_at, new Date(base + 20_000).toISOString())
+
+  // 21st hit increments count without resetting window
+  await classifyJev('b400-20', cfg, async () => ({ ok: false, status: 400 }), base + 21_000)
+  assert.equal(jevHealthSnapshot(cfg, base + 21_000).http_400.count, 21)
+
+  // After 10 minutes + 1s from the last hit, window drops back to 0.
+  const expired = jevHealthSnapshot(cfg, base + 21_000 + 600_001)
+  assert.equal(expired.http_400.count, 0)
+  assert.equal(expired.http_400.first_at, null)
+  assert.equal(expired.http_400.last_at, null)
 })

@@ -32,7 +32,8 @@ const EXAMPLES = [
 const KEY_STATUS: Record<string, StatusTone> = {
   normal: { key: 'ok', cls: 'ok', text: '正常' },
   unrequested: { key: 'none', cls: 'none', text: '未请求' },
-  paused: { key: 'off', cls: 'off', text: '已暂停' },
+  paused: { key: 'bad', cls: 'bad', text: '已暂停（需人工）' },
+  cooling: { key: 'warn', cls: 'warn', text: '冷却中' },
   auth_error: { key: 'bad', cls: 'bad', text: '鉴权失败' },
   insufficient_balance: { key: 'bad', cls: 'bad', text: '额度用尽' },
   rate_limited: { key: 'warn', cls: 'warn', text: '限流' },
@@ -172,7 +173,17 @@ function blankForm(base = ''): EndpointForm {
   }
 }
 
-function toneOf(status: string | undefined): StatusTone {
+function toneOf(
+  status: string | undefined,
+  row?: Pick<JevEndpointKey, 'seconds_left'>
+): StatusTone {
+  if (status === 'cooling' && row?.seconds_left != null) {
+    return {
+      key: 'warn',
+      cls: 'warn',
+      text: `冷却中 · 剩余 ${row.seconds_left} 秒`,
+    }
+  }
   return KEY_STATUS[status || ''] || KEY_STATUS.request_error
 }
 
@@ -432,6 +443,37 @@ export function ModelSettings({
     onError: (error: Error) => toast.error(error.message),
   })
 
+  const resumeKeys = useMutation({
+    mutationFn: (fingerprint?: string) =>
+      api<{ resumed: string[]; keys: JevEndpointKey[] }>(
+        '/api/panel/jev-intercept/resume',
+        {
+          method: 'POST',
+          body: JSON.stringify(
+            fingerprint ? { key_fingerprint: fingerprint } : {}
+          ),
+        }
+      ),
+    onSuccess: (data, fingerprint) => {
+      setLive((prev) => {
+        if (!fingerprint) return {}
+        const next = { ...prev }
+        delete next[fingerprint]
+        return next
+      })
+      toast.success(
+        data.resumed.length
+          ? `已恢复 ${data.resumed.length} 把审核密钥`
+          : '当前没有暂停中的审核密钥'
+      )
+      void qc.invalidateQueries({
+        queryKey: jevInterceptQueryOptions().queryKey,
+      })
+      void qc.invalidateQueries({ queryKey: ['panel', 'jev-usage'] })
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+
   const addExample = (base: string) => {
     setForms((prev) => {
       if (!prev) return prev
@@ -528,7 +570,8 @@ export function ModelSettings({
             const hidden = form.expanded ? [] : savedKeys.slice(1)
             const hiddenSummary = hidden
               .map(
-                (row) => toneOf(live[row.key_fingerprint] || row.status).text
+                (row) =>
+                  toneOf(live[row.key_fingerprint] || row.status, row).text
               )
               .join('、')
             const adding = savedKeys.length > 0
@@ -587,6 +630,8 @@ export function ModelSettings({
                           row={shownSaved[0]}
                           live={live}
                           placeholder='还没有 Key'
+                          resuming={resumeKeys.isPending}
+                          onResume={(fp) => resumeKeys.mutate(fp)}
                         />
                       ) : (
                         <Input
@@ -633,6 +678,16 @@ export function ModelSettings({
                         type='button'
                         variant='outline'
                         className='cursor-pointer'
+                        loading={resumeKeys.isPending}
+                        disabled={!savedKeys.length || resumeKeys.isPending}
+                        onClick={() => resumeKeys.mutate(undefined)}
+                      >
+                        恢复调用
+                      </Button>
+                      <Button
+                        type='button'
+                        variant='outline'
+                        className='cursor-pointer'
                         loading={pending[form.uid] === 'quota'}
                         disabled={!!pending[form.uid]}
                         onClick={() => void runCheck(form, 'quota')}
@@ -641,7 +696,12 @@ export function ModelSettings({
                       </Button>
                     </div>
                     {shownSaved.length ? (
-                      <KeyList rows={shownSaved} live={live} />
+                      <KeyList
+                        rows={shownSaved}
+                        live={live}
+                        resuming={resumeKeys.isPending}
+                        onResume={(fp) => resumeKeys.mutate(fp)}
+                      />
                     ) : null}
                     {form.expanded ? (
                       <div className='space-y-2 border-t pt-2'>
@@ -926,19 +986,38 @@ function SavedKey({
   row,
   live,
   placeholder,
+  resuming,
+  onResume,
 }: {
   row: JevEndpointKey | undefined
   live: Record<string, string>
   placeholder: string
+  resuming: boolean
+  onResume: (fingerprint: string) => void
 }) {
   if (!row) {
     return <span className='text-sm text-muted-foreground'>{placeholder}</span>
   }
   const status = live[row.key_fingerprint] || row.status
+  const canResume =
+    !!row.key_fingerprint &&
+    (status === 'paused' || status === 'cooling' || row.retired)
   return (
     <span className='flex min-w-40 flex-1 items-center gap-2'>
       <span className='font-mono text-sm'>{row.masked_key}</span>
-      <StatusMark tone={toneOf(status)} />
+      <StatusMark tone={toneOf(status, row)} />
+      {canResume ? (
+        <Button
+          type='button'
+          variant='ghost'
+          size='sm'
+          className='h-6 cursor-pointer px-2 text-xs'
+          disabled={resuming}
+          onClick={() => onResume(row.key_fingerprint)}
+        >
+          恢复
+        </Button>
+      ) : null}
     </span>
   )
 }
@@ -946,16 +1025,26 @@ function SavedKey({
 function KeyList({
   rows,
   live,
+  resuming,
+  onResume,
 }: {
   rows: JevEndpointKey[]
   live: Record<string, string>
+  resuming: boolean
+  onResume: (fingerprint: string) => void
 }) {
   if (rows.length <= 1) return null
   return (
     <ul className='space-y-1'>
       {rows.slice(1).map((row) => (
         <li key={row.key_fingerprint || row.number}>
-          <SavedKey row={row} live={live} placeholder='' />
+          <SavedKey
+            row={row}
+            live={live}
+            placeholder=''
+            resuming={resuming}
+            onResume={onResume}
+          />
         </li>
       ))}
     </ul>

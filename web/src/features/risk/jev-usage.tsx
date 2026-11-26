@@ -32,6 +32,8 @@ type KeyUsage = {
   number: number
   key_fingerprint: string
   retired: boolean
+  paused_reason?: 'auth' | 'rate_limited' | 'overloaded' | null
+  seconds_left?: number | null
   requests: number
   successful: number
   estimated_cost_nano_usd: number
@@ -47,7 +49,8 @@ const keyStatus: Record<string, string> = {
   rate_limited: '请求限流',
   request_error: '请求异常',
   unrequested: '未请求',
-  paused: '已暂停',
+  paused: '已暂停（需人工）',
+  cooling: '冷却中',
 }
 type UsagePage = {
   keys: KeyUsage[]
@@ -172,17 +175,23 @@ export function JevUsagePanel({
                           {key.requests === 0
                             ? '暂无记录'
                             : usageMoney(
-                                key.unknown_cost_requests === key.requests
-                                  ? null
-                                  : key.estimated_cost_nano_usd
-                              )}
+                              key.unknown_cost_requests === key.requests
+                                ? null
+                                : key.estimated_cost_nano_usd
+                            )}
                         </td>
                         <td className='p-2'>
-                          {keyStatus[key.status] ?? '未知状态'}
+                          {key.status === 'cooling' && key.seconds_left != null
+                            ? `冷却中 · 剩余 ${key.seconds_left} 秒`
+                            : (keyStatus[key.status] ?? '未知状态')}
                           {key.last_http_status
                             ? ` · ${key.last_http_status}`
                             : ''}
-                          {key.retired ? '（已暂停轮询）' : ''}
+                          {key.retired &&
+                            key.status !== 'paused' &&
+                            key.status !== 'cooling'
+                            ? '（已暂停轮询）'
+                            : ''}
                         </td>
                         <td className='p-2'>
                           {tokens(key.requests)} / {tokens(key.successful)}
