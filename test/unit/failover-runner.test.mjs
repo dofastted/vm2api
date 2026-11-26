@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { FailoverRunner, opaque429Tracker } from '../../src/lib/pool/failover-runner.mjs'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -666,6 +666,109 @@ test('bare 429s on two accounts stop without cooling accounts or Fable', async (
     assert.deepEqual(scheduler.cooldowns, [])
     assert.deepEqual(scheduler.releasedAccounts, [])
   }
+})
+
+/**
+ * An opaque CRAG 429 is a bare 429 whose provider-side observation carries no
+ * rate-limit headers at all. #1139 made a single one stop the request without
+ * cooling anything down, because one such response proves nothing. These cases
+ * pin that first-hit behaviour and the escalation that follows repetition.
+ */
+function opaque429() {
+  return {
+    ok: false,
+    status: 429,
+    terminalState: 'rejected',
+    headers: {},
+    body: { error: { type: 'rate_limit_error', message: 'Error' } },
+    providerResult: {
+      schema_version: 2,
+      source: 'provider_http',
+      http_status: 429,
+      error: { type: 'rate_limit_error', message: 'Error' },
+      response_headers: {},
+    },
+  }
+}
+
+test('#4 a single opaque CRAG 429 still stops without cooling anything down', async () => {
+  opaque429Tracker.reset()
+  const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3)])
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'req-opaque-single',
+    model: 'claude-sonnet-test',
+    callAttempt: opaque429,
+  })
+  assert.equal(result.status, 429)
+  assert.equal(result.policy.reason, 'crag_opaque_429')
+  assert.equal(result.attemptCount, 1, 'must not walk the pool on the first hit')
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.deepEqual(scheduler.releasedAccounts, [])
+})
+
+test('#4 repeated opaque CRAG 429s cool the model down and move to another slot', async () => {
+  opaque429Tracker.reset()
+  const model = 'claude-sonnet-test'
+
+  // Hits below the threshold keep the #1139 behaviour verbatim.
+  for (const hit of [1, 2]) {
+    const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3)])
+    const runner = new FailoverRunner({ scheduler })
+    const hitResult = await runner.run({ requestId: `req-opaque-${hit}`, model, callAttempt: opaque429 })
+    assert.equal(hitResult.policy.reason, 'crag_opaque_429', `hit ${hit}`)
+    assert.deepEqual(scheduler.cooldowns, [], `hit ${hit} must not cool anything`)
+    assert.equal(opaque429Tracker.streak('account-1', model), hit)
+  }
+
+  // The third one escalates to a model-level cooldown and hops off the slot.
+  const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3)])
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({ requestId: 'req-opaque-3', model, callAttempt: opaque429 })
+  const cooled = scheduler.cooldowns.find((entry) => entry.update.reason === 'crag_opaque_429_model_cooldown')
+  assert.ok(cooled, 'the streak must produce a model cooldown')
+  assert.equal(cooled.candidate.accountId, 'account-1')
+  assert.equal(cooled.update.model, model, 'cooldown must be scoped to the model, not the whole account')
+  assert.ok(cooled.update.until > Date.now(), 'cooldown must be in the future')
+  assert.ok(result.attemptCount >= 2, 'escalation must try another slot')
+  // Model scope must not drag the account's other conversations off the slot.
+  assert.deepEqual(scheduler.releasedAccounts, [])
+})
+
+test('#4 the opaque 429 streak is per (account, model) and clears on success', async () => {
+  opaque429Tracker.reset()
+  const runner = (scheduler) => new FailoverRunner({ scheduler })
+
+  // Two hits on one model leave a sibling model untouched.
+  for (const hit of [1, 2]) {
+    const scheduler = new Scheduler([candidate(1), candidate(2)])
+    await runner(scheduler).run({
+      requestId: `req-opaque-sonnet-${hit}`,
+      model: 'claude-sonnet-test',
+      callAttempt: opaque429,
+    })
+  }
+  assert.equal(opaque429Tracker.streak('account-1', 'claude-sonnet-test'), 2)
+  assert.equal(opaque429Tracker.streak('account-1', 'claude-opus-test'), 0, 'must not bleed across models')
+  assert.equal(opaque429Tracker.streak('account-2', 'claude-sonnet-test'), 0, 'must not bleed across accounts')
+
+  // A verified success resets the streak, so the next hit starts from one.
+  const okScheduler = new Scheduler([candidate(1), candidate(2)])
+  await runner(okScheduler).run({
+    requestId: 'req-opaque-recover',
+    model: 'claude-sonnet-test',
+    callAttempt: () => success(),
+  })
+  assert.equal(opaque429Tracker.streak('account-1', 'claude-sonnet-test'), 0)
+
+  const afterScheduler = new Scheduler([candidate(1), candidate(2)])
+  const after = await runner(afterScheduler).run({
+    requestId: 'req-opaque-after',
+    model: 'claude-sonnet-test',
+    callAttempt: opaque429,
+  })
+  assert.equal(after.policy.reason, 'crag_opaque_429', 'a cleared streak must not escalate on the next hit')
+  assert.deepEqual(afterScheduler.cooldowns, [])
 })
 
 test('the optional account cap counts executions, not admission misses', async () => {
