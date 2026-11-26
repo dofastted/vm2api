@@ -5,6 +5,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { validateCacheBreakpoints } from '../../src/lib/protocol/cache-ttl.mjs'
+import { withRequestProtocolBetas } from '../../src/lib/protocol/claude-code-betas.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../../src/lib/protocol/convert.mjs'
 import { prepareCragPrintBody } from '../../src/lib/protocol/crag-print-prompt.mjs'
 import {
@@ -101,6 +102,7 @@ test('CRAG whitelist keeps every advisor tool option and still rejects a bad def
     // Bounds the advisor's own output per call; it was being dropped, which
     // silently removed the caller's ceiling on advisor spend.
     max_tokens: 4096,
+    defer_loading: true,
     caching: { type: 'ephemeral', ttl: '1h' },
   }
   const { body } = sanitizeCragBodyWhitelist(
@@ -133,6 +135,27 @@ test('CRAG whitelist keeps every advisor tool option and still rejects a bad def
       /advisor/i,
     )
   }
+})
+
+test('the advisor shape Claude Code actually sends keeps defer_loading and still arms its beta', () => {
+  // Exactly what Claude Code 2.1.x puts in `tools` for /advisor: no max_uses, no
+  // caching -- the optional knobs above are API surface, this is the real traffic.
+  const advisor = { type: 'advisor_20260301', name: 'advisor', model: 'claude-opus-5-5', defer_loading: true }
+  const { body } = sanitizeCragBodyWhitelist(
+    {
+      model: 'claude-sonnet-5-5',
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      tools: [advisor],
+    },
+    { capabilities: V3_CAPS },
+  )
+  assert.deepEqual(body.tools, [advisor])
+
+  // The other half of the regression: beta derivation runs on the sanitized body,
+  // so dropping the field here also cost the request its advanced-tool-use beta.
+  const betas = withRequestProtocolBetas([], body)
+  assert.ok(betas.includes('advanced-tool-use-2025-11-20'))
+  assert.ok(betas.includes('advisor-tool-2026-03-01'))
 })
 
 test('CRAG whitelist fails closed 400 on unknown top-level and unrepresentable fields', () => {
