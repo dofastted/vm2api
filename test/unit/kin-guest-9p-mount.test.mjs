@@ -1,6 +1,6 @@
-// Regression on kin-guest-setup source. Existing guest disks only pick up new cache=
-// after reinstalling /usr/local/sbin/kin-guest-setup from cidata and a full guest
-// reboot; see docs/crag-kvm.md and install-guest.sh (first-boot only).
+// Regression on kin-guest-setup source. Existing overlays need a new kin-kvm runner
+// image, cidata reinstall of /usr/local/sbin/kin-guest-setup, and guest reboot;
+// see docs/crag-kvm.md «Guest 启动脚本升级».
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import test from 'node:test'
