@@ -35,7 +35,10 @@ export function mergeVmTestSchedulePreserve(input, previous = {}) {
     const prevMode = String(prev.mode || '')
     if (SCHEDULE_MODES.has(prevMode)) out.mode = prevMode
   }
-  if (!Object.hasOwn(out, 'auto_renew') && prev.auto_renew === true) out.auto_renew = true
+  if (!Object.hasOwn(out, 'auto_renew') && prev.auto_renew === true) {
+    const effectiveMode = Object.hasOwn(out, 'mode') && out.mode != null ? String(out.mode) : String(prev.mode || '')
+    if (effectiveMode === 'preheat') out.auto_renew = true
+  }
   return out
 }
 

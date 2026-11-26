@@ -104,6 +104,11 @@ ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 CODE = re.compile(r"[A-Za-z0-9._~/-]{1,2048}\Z")
 API_KEY = re.compile(r"[A-Za-z0-9_-]{20,256}\Z")
 OAUTH_ACCESS_TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{1,4096}={0,2}\Z")
+OAUTH_REFRESH_TOKEN = re.compile(r"1//[0-9A-Za-z._~+/-]{6,2048}\Z")
+OAUTH_AUTH_METHODS = frozenset(
+    {"consumer", "personal_consumer", "gcp", "business_licensed_enterprise"}
+)
+WIF_PROVIDER = re.compile(r"[A-Za-z0-9._:/-]{1,512}\Z")
 RELEASE_CODE = re.compile(r"CGG1-[A-Za-z0-9_-]{43}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 MANUAL_RELEASE = Path("/etc/vm2api/gemini-release.json")
@@ -984,13 +989,33 @@ def account_command(uid, method, profile=None):
     ]
 
 
-def read_account(uid, proxy_url, method, api_key=None, profile=None, oauth_token=None):
+OAUTH_CLIENT_ENV_KEYS = (
+    "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_ID",
+    "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_SECRET",
+    "KIN_GEMINI_OAUTH_CLOUD_CLIENT_ID",
+    "KIN_GEMINI_OAUTH_CLOUD_CLIENT_SECRET",
+    "KIN_GEMINI_OAUTH_WIF_CLIENT_ID",
+)
+
+
+def read_account(
+    uid, proxy_url, method, api_key=None, profile=None, oauth_token=None, *, timeout=17
+):
+    payload = {"proxy_url": proxy_url, "api_key": api_key, "oauth_token": oauth_token}
+    if method == "oauth_refresh_import":
+        oauth_clients = {
+            key: os.environ[key].strip()
+            for key in OAUTH_CLIENT_ENV_KEYS
+            if isinstance(os.environ.get(key), str) and os.environ[key].strip()
+        }
+        if oauth_clients:
+            payload["oauth_clients"] = oauth_clients
     try:
         result = subprocess.run(
             account_command(uid, method, profile),
-            input=json.dumps({"proxy_url": proxy_url, "api_key": api_key, "oauth_token": oauth_token}).encode(),
+            input=json.dumps(payload).encode(),
             check=True,
-            timeout=17,
+            timeout=timeout,
             capture_output=True,
             env=SYSTEM_ENV,
         )
@@ -6628,6 +6653,45 @@ class Host:
             self.uid_base + (slot % MAX_NETNS_SLOTS), proxy_url, "oauth_import", oauth_token=credential
         )
 
+    def probe_refresh_imported_account(self, slot, proxy_url, credential):
+        result = read_account(
+            self.uid_base + (slot % MAX_NETNS_SLOTS),
+            proxy_url,
+            "oauth_refresh_import",
+            oauth_token=credential,
+            timeout=25,
+        )
+        if not isinstance(result, dict):
+            return {"account": {"state": "error", "checked_at": now()}}
+        if isinstance(result.get("account"), dict):
+            return result
+        return {"account": result}
+
+    def _write_imported_profile(self, env_dir, uid, token_doc, project_id=None):
+        profile_id = secrets.token_hex(16)
+        profile_dir = env_dir / profile_id
+        profile_dir.mkdir(mode=0o711)
+        home = profile_dir / "home"
+        settings = home / ".gemini" / "antigravity-cli"
+        for private in (home, home / ".gemini", settings):
+            private.mkdir(mode=0o700)
+            os.chown(private, uid, uid)
+        settings_file = settings / "settings.json"
+        private_json(settings_file, CLI_SETTINGS)
+        os.chown(settings_file, uid, uid)
+        token_file = settings / TOKEN_NAME
+        private_json(token_file, token_doc)
+        os.chown(token_file, uid, uid)
+        if isinstance(project_id, str) and 1 <= len(project_id.strip()) <= 128:
+            cache_dir = settings / "cache"
+            cache_dir.mkdir(mode=0o700, exist_ok=True)
+            os.chown(cache_dir, uid, uid)
+            proj_file = cache_dir / "default_project_id.txt"
+            proj_file.write_text(project_id.strip() + "\n", encoding="utf-8")
+            os.chmod(proj_file, 0o600)
+            os.chown(proj_file, uid, uid)
+        return profile_id
+
     def refresh_account(self, env, proxy_url, *, auto_pull_models=True):
         directory = self.directory / env["id"]
         if env.get("auth_method") == "api_key":
@@ -7039,19 +7103,47 @@ class Host:
                 raise Failure(400, "gemini_invalid_concurrency")
             imported = body.get("oauth_account")
             credential = None
+            refresh_credential = None
             if imported is not None:
                 if method != "oauth" or not isinstance(imported, dict):
                     raise Failure(400, "gemini_oauth_import_invalid")
+                refresh = imported.get("refresh_token")
                 access = imported.get("access_token")
                 expiry = imported.get("expiry_timestamp")
-                if (
-                    not isinstance(access, str)
-                    or not OAUTH_ACCESS_TOKEN.fullmatch(access)
-                    or type(expiry) is not int
-                    or not 0 < expiry < 253402300800
+                auth_method_hint = imported.get("auth_method")
+                wif_provider = imported.get("wif_provider")
+                if auth_method_hint is not None and (
+                    not isinstance(auth_method_hint, str)
+                    or auth_method_hint not in OAUTH_AUTH_METHODS
                 ):
                     raise Failure(400, "gemini_oauth_import_invalid")
-                credential = {"access_token": access, "expiry": expiry}
+                if wif_provider is not None and (
+                    not isinstance(wif_provider, str)
+                    or not WIF_PROVIDER.fullmatch(wif_provider)
+                ):
+                    raise Failure(400, "gemini_oauth_import_invalid")
+                has_access_pair = access is not None or expiry is not None
+                if has_access_pair:
+                    if (
+                        not isinstance(access, str)
+                        or not OAUTH_ACCESS_TOKEN.fullmatch(access)
+                        or type(expiry) is not int
+                        or not 0 < expiry < 253402300800
+                    ):
+                        raise Failure(400, "gemini_oauth_import_invalid")
+                if refresh is not None:
+                    if not isinstance(refresh, str) or not OAUTH_REFRESH_TOKEN.fullmatch(refresh):
+                        raise Failure(400, "gemini_oauth_import_invalid")
+                    refresh_credential = {
+                        "refresh_token": refresh,
+                        **({"access_token": access, "expiry": expiry} if has_access_pair else {}),
+                        **({"auth_method": auth_method_hint} if auth_method_hint else {}),
+                        **({"wif_provider": wif_provider} if wif_provider else {}),
+                    }
+                elif has_access_pair:
+                    credential = {"access_token": access, "expiry": expiry}
+                else:
+                    raise Failure(400, "gemini_oauth_import_invalid")
             taken = {env["slot"] for env in self.environments.values()}
             slot = next(
                 (slot for slot in range(MAX_ENVIRONMENTS) if slot not in taken), None
@@ -7061,6 +7153,7 @@ class Host:
             self.ensure_payload()
             account = {}
             call_models = None
+            imported_token_doc = None
             if method == "api_key":
                 account = read_account(
                     self.uid_base + (slot % MAX_NETNS_SLOTS), proxy_url, "api_key", api_key=api_key
@@ -7076,7 +7169,25 @@ class Host:
                     "models"
                 ):
                     call_models = chat_data["models"]
-            if credential:
+            if refresh_credential:
+                refresh_result = self.probe_refresh_imported_account(
+                    slot, proxy_url, refresh_credential
+                )
+                account = refresh_result.get("account") or {"state": "error", "checked_at": now()}
+                if account.get("state") == "reauth_required":
+                    raise Failure(400, "gemini_oauth_import_rejected")
+                if account.get("state") not in ("ok", "partial"):
+                    raise Failure(502, "gemini_account_read_failed")
+                if refresh_result.get("fallback_access_only") and refresh_credential.get("access_token"):
+                    credential = {
+                        "access_token": refresh_credential["access_token"],
+                        "expiry": refresh_credential["expiry"],
+                    }
+                elif isinstance(refresh_result.get("token_doc"), dict):
+                    imported_token_doc = refresh_result["token_doc"]
+                else:
+                    raise Failure(502, "gemini_account_read_failed")
+            elif credential:
                 account = self.probe_imported_account(slot, proxy_url, credential)
                 if account["state"] == "reauth_required":
                     raise Failure(400, "gemini_oauth_import_rejected")
@@ -7094,9 +7205,11 @@ class Host:
                 "max_concurrency": max_concurrency,
                 "auth_method": method,
                 "auth_state": (
-                    "authorized" if method == "api_key" or credential else "unverified"
+                    "authorized"
+                    if method == "api_key" or credential or imported_token_doc
+                    else "unverified"
                 ),
-                **({"oauth_imported": True} if credential else {}),
+                **({"oauth_imported": True} if credential and not imported_token_doc else {}),
                 **({"call_models": call_models} if call_models else {}),
                 "account": account,
                 "created_at": timestamp,
@@ -7105,10 +7218,22 @@ class Host:
             try:
                 if method == "api_key":
                     private_json(directory / "credential.json", {"api_key": api_key})
-                if credential:
+                if imported_token_doc:
+                    profile_id = self._write_imported_profile(
+                        directory,
+                        self.env_uid(env),
+                        imported_token_doc,
+                        project_id=account.get("project_id"),
+                    )
+                    env["profile"] = profile_id
+                elif credential:
                     private_json(directory / "oauth-import.json", credential)
                 self.environments[identifier] = env
                 self.save()
+                if imported_token_doc:
+                    self._remember_runtime_proxy(env, proxy_url)
+                    self._schedule_provision_locked(identifier, proxy_url)
+                    self._schedule_warm_locked(identifier)
             except OSError:
                 self.environments.pop(identifier, None)
                 shutil.rmtree(directory)
