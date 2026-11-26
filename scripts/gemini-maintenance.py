@@ -1751,6 +1751,19 @@ class Maintenance:
             except (Failure, OSError, ValueError, RecursionError):
                 pass
 
+    def is_default_crag_public_key(self, key_path):
+        if not self.crag_bundle or key_path is None:
+            return False
+        if (
+            (self.runtime / "defaults") in key_path.parents
+            and key_path.name == "crag-license-public.pem"
+        ):
+            return True
+        try:
+            return hash_pin(key_path, self.pins["crag-license-public.pem"])
+        except (OSError, ValueError):
+            return False
+
     def stage_pinned(self):
         if sys.platform != "linux" or platform.machine() not in {"x86_64", "amd64"}:
             raise fail("unsupported_host")
@@ -1763,19 +1776,22 @@ class Maintenance:
             *(self.bundle / name for name in VERIFIER_FILES),
         ):
             require_root(entry, stat.S_ISREG)
-        command(
-            [
-                "/usr/bin/python3",
-                "-I",
-                str(fetcher),
-                "--manifest",
-                str(self.descriptor),
-                "--dest",
-                str(source),
-            ],
-            600,
-            "fetch_failed",
-        )
+        argv = [
+            "/usr/bin/python3",
+            "-I",
+            str(fetcher),
+            "--manifest",
+            str(self.descriptor),
+            "--dest",
+            str(source),
+        ]
+        existing_agy = self.current / "agy"
+        try:
+            require_root(existing_agy, stat.S_ISREG)
+            argv.extend(["--reuse-agy", str(existing_agy)])
+        except (OSError, ValueError):
+            pass
+        command(argv, 600, "fetch_failed")
         self.phase("verifying")
         expected_assets = CRAG_ASSETS if self.crag_bundle else ASSETS
         if not all(hash_pin(source / name, self.pins[name]) for name in expected_assets):
@@ -2118,15 +2134,20 @@ class Maintenance:
                     verifier_root = candidate["verifier_root"]
                     materialized = True
                 if not materialized:
+                    configured_key = (
+                        Path(options["--public-key"]) if before is not None else None
+                    )
                     manual_trust_configured = (
                         "--release-verifier" in options
                         or exists(self.manual_release)
                         or (
-                            before is not None
-                            and Path(options["--public-key"]) != self.public_key
+                            configured_key is not None
+                            and configured_key != self.public_key
+                            and not self.is_default_crag_public_key(configured_key)
                         )
                         or (
-                            "--default-release-verifier" not in options
+                            not self.crag_bundle
+                            and "--default-release-verifier" not in options
                             and exists(self.public_key)
                         )
                     )
@@ -2135,11 +2156,11 @@ class Maintenance:
                     ):
                         # When current payload failed verification under standard default trust
                         # (e.g. corrupted manifest.json or mismatched old release digest), allow
-                        # repair/recover to replace it with a freshly verified signed release
+                        # install/repair/recover to replace it with a freshly verified signed release
                         # instead of deadlocking between update_requires_valid_payload and
                         # repair_release_unknown. Manual trust configurations still fail closed.
                         can_reinstall_broken = (
-                            action in {"repair", "recover"}
+                            action in {"install", "repair", "recover"}
                             and not manual_trust_configured
                             and (self.crag_bundle or target["pinned"])
                         )

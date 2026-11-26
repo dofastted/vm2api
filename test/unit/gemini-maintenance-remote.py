@@ -109,7 +109,53 @@ def test_host_maintenance_quiesce_stops_only_idle_resident_pools():
     assert "shard-1" in host.daemon_shards
 
 
+def test_crag_default_public_key_recognition_and_pinned_agy_reuse():
+    import hashlib
+    import tempfile
+
+    gm = load_module("gemini_maintenance", "scripts/gemini-maintenance.py")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        daemon = gm.Maintenance.__new__(gm.Maintenance)
+        daemon.crag_bundle = True
+        daemon.runtime = root / "runtime"
+        daemon.public_key = root / "etc/gemini-ed25519.pub"
+        pubkey_bytes = b"-----BEGIN PUBLIC KEY-----\nTEST\n-----END PUBLIC KEY-----\n"
+        daemon.pins = {
+            "crag-license-public.pem": {
+                "size": len(pubkey_bytes),
+                "sha256": hashlib.sha256(pubkey_bytes).hexdigest(),
+            }
+        }
+        # Any crag-license-public.pem under runtime/defaults/ is a default CRAG key.
+        assert (
+            daemon.is_default_crag_public_key(
+                daemon.runtime / "defaults" / ("a" * 64) / "crag-license-public.pem"
+            )
+            is True
+        )
+        assert (
+            daemon.is_default_crag_public_key(
+                daemon.runtime / "defaults/0.3.0/crag-license-public.pem"
+            )
+            is True
+        )
+        # An external custom key must fail closed unless it matches the pinned default key.
+        custom = root / "custom-key.pem"
+        custom.write_bytes(b"custom-third-party-key")
+        assert daemon.is_default_crag_public_key(custom) is False
+        # Non-CRAG bundles never treat external keys as default CRAG keys.
+        daemon.crag_bundle = False
+        assert (
+            daemon.is_default_crag_public_key(
+                daemon.runtime / "defaults/0.3.0/crag-license-public.pem"
+            )
+            is False
+        )
+
+
 if __name__ == "__main__":
     test_maintenance_remote_release_resolution_and_version_ordering()
     test_host_maintenance_quiesce_stops_only_idle_resident_pools()
+    test_crag_default_public_key_recognition_and_pinned_agy_reuse()
     print("gemini-maintenance remote release and quiesce verified")

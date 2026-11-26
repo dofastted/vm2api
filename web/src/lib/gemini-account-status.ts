@@ -130,6 +130,7 @@ export function geminiInferenceLabel(environment: InferenceEvidence): string {
 const INFERENCE_ERROR_LABELS: Readonly<Record<string, string>> = {
   gemini_location_unsupported: 'Google 地区资格受限',
   gemini_account_verification_required: 'Google 账号需先完成浏览器验证',
+  gemini_client_unsupported: 'Google 拒绝当前客户端版本（UNSUPPORTED_CLIENT）',
   gemini_account_ineligible: 'Google 账号不符合 Antigravity 资格',
   gemini_proxy_error: '代理连接错误',
   gemini_proxy_unavailable: '代理不可用',
@@ -263,6 +264,8 @@ const INFERENCE_ERROR_ACTIONS: Readonly<Record<string, string>> = {
     '处理方式：在对应 Google 账号已登录的浏览器中打开「账号」页的 Google 验证链接完成核验，随后刷新账号并重新测试。',
   gemini_location_unsupported:
     '处理方式：Google 限制当前出口地区（403 UNSUPPORTED_REGION），请在「代理」页更换支持地区（如美国住宅）的 SOCKS5 代理后重试。',
+  gemini_client_unsupported:
+    '处理方式：Google 拒绝当前 Antigravity 客户端版本或协议标识（403 UNSUPPORTED_CLIENT），不代表账号订阅失效；请先前往「设置 → Gemini 维护」更新 CRAGGemini，再刷新账号或重新测试。',
   gemini_account_ineligible:
     '处理方式：Google 判定该账号暂不符合 Antigravity 资格，请核对订阅/年龄限制或更换可用个人账号。',
   gemini_oauth_required:
@@ -407,6 +410,14 @@ export function geminiEligibilityNotice(
         label: 'Google 判定当前地区不支持 Antigravity（UNSUPPORTED_REGION）',
         action:
           '请在「代理」页更换至支持地区（如美国住宅）的 SOCKS5 代理后刷新账号。',
+        validationUrl: null,
+        advisory: false,
+      }
+    case 'client_unsupported':
+      return {
+        label: 'Google 拒绝当前客户端版本或标识（UNSUPPORTED_CLIENT）',
+        action:
+          '这通常与客户端版本或协议标识有关，不代表账号订阅失效；请前往「设置 → Gemini 维护」升级最新 CRAGGemini，再刷新账号或测试对话验证。',
         validationUrl: null,
         advisory: false,
       }

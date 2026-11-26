@@ -157,7 +157,11 @@ export type GeminiEnvironment = {
     plan: string | null
     expires_at: string | null
     eligibility?:
-      'verification_required' | 'location_unsupported' | 'ineligible' | null
+      | 'verification_required'
+      | 'location_unsupported'
+      | 'client_unsupported'
+      | 'ineligible'
+      | null
     validation_url?: string | null
     model_catalog?: GeminiModelCatalogEntry[]
     quotas: (QuotaReading & { model: string })[]

@@ -552,7 +552,12 @@ def strip_unsupported_kernel_policy(kernel_cfg, version):
         kernel_cfg.pop(field, None)
     return kernel_cfg
 BLOCKING_ACCOUNT_ELIGIBILITIES = frozenset(
-    {"verification_required", "location_unsupported", "ineligible"}
+    {
+        "verification_required",
+        "location_unsupported",
+        "client_unsupported",
+        "ineligible",
+    }
 )
 
 
@@ -587,6 +592,7 @@ INFERENCE_ERROR_CODES = frozenset(
         "gemini_account_ineligible",
         "gemini_account_verification_required",
         "gemini_api_key_invalid",
+        "gemini_client_unsupported",
         "gemini_inference_bad_input",
         "gemini_inference_cancelled",
         "gemini_inference_failed",
@@ -5129,6 +5135,7 @@ class Host:
         if error_code not in (
             "gemini_account_verification_required",
             "gemini_location_unsupported",
+            "gemini_client_unsupported",
             "gemini_account_ineligible",
         ):
             return
@@ -5139,6 +5146,7 @@ class Host:
         mapped = {
             "gemini_account_verification_required": "verification_required",
             "gemini_location_unsupported": "location_unsupported",
+            "gemini_client_unsupported": "client_unsupported",
             "gemini_account_ineligible": "ineligible",
         }[error_code]
         account.pop("eligibility_verified_at", None)
@@ -5308,6 +5316,7 @@ class Host:
                 elif err_code in (
                     "gemini_account_verification_required",
                     "gemini_location_unsupported",
+                    "gemini_client_unsupported",
                     "gemini_account_ineligible",
                 ):
                     with self.lock:
@@ -6638,7 +6647,7 @@ class Host:
                 or prev_verified_at
             )
             if inference_proven and (
-                account.get("eligibility") == "verification_required"
+                account.get("eligibility") in ("verification_required", "client_unsupported")
                 or (
                     account.get("eligibility") is None
                     and "validation_url" in account
@@ -7942,6 +7951,7 @@ class Host:
             if code in (
                 "gemini_location_unsupported",
                 "gemini_account_verification_required",
+                "gemini_client_unsupported",
                 "gemini_account_ineligible",
             ):
                 status = 403

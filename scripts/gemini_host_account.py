@@ -17,6 +17,10 @@ CODE_ASSIST_DAILY = "https://daily-cloudcode-pa.googleapis.com/v1internal:"
 ANTIGRAVITY_USER_AGENT = (
     "antigravity/hub/2.34.0 (aidev_client; os_type=linux; arch=amd64; cl=1026637980)"
 )
+ANTIGRAVITY_FALLBACK_USER_AGENTS = (
+    "antigravity/1.5.9 (aidev_client; os_type=linux; arch=amd64)",
+    "antigravity/1.23.2 linux/amd64",
+)
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_MODELS = GEMINI_API + "/models?pageSize=1000"
 ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin", "LANG": "C.UTF-8"}
@@ -159,8 +163,10 @@ def parse_ineligibility(assist_data):
             return "verification_required", safe_google_validation_url(
                 entry.get("validationUrl")
             )
-        if reason == "UNSUPPORTED_REGION" and fallback is None:
+        if reason == "UNSUPPORTED_REGION":
             fallback = ("location_unsupported", None)
+        elif reason == "UNSUPPORTED_CLIENT" and fallback is None:
+            fallback = ("client_unsupported", None)
         elif reason in _BLOCKING_INELIGIBLE_REASONS and fallback is None:
             fallback = ("ineligible", None)
     return fallback if fallback is not None else (None, None)
@@ -378,7 +384,13 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
         return checked("error")
     auth_header = f"Authorization: Bearer {access_token}"
     code_assist_headers = [auth_header, f"User-Agent: {ANTIGRAVITY_USER_AGENT}"]
-    metadata = {"metadata": {"ideType": "ANTIGRAVITY"}}
+    metadata = {
+        "metadata": {
+            "ideType": "ANTIGRAVITY",
+            "platform": "LINUX_AMD64",
+            "pluginType": "GEMINI",
+        }
+    }
     with ThreadPoolExecutor(max_workers=2) as executor:
         user = executor.submit(get_json, proxy_url, GOOGLE_USERINFO, auth_header)
         assist = executor.submit(
@@ -390,6 +402,26 @@ def probe_oauth_token(proxy_url, token, *, imported=False):
         )
         user_status, user_data = user.result()
         assist_status, assist_data = assist.result()
+    if (
+        assist_status == 200
+        and parse_ineligibility(assist_data)[0] == "client_unsupported"
+    ):
+        for fallback_ua in ANTIGRAVITY_FALLBACK_USER_AGENTS:
+            fallback_headers = [auth_header, f"User-Agent: {fallback_ua}"]
+            fb_status, fb_data = get_json(
+                proxy_url,
+                CODE_ASSIST + "loadCodeAssist",
+                fallback_headers,
+                metadata,
+            )
+            if (
+                fb_status == 200
+                and isinstance(fb_data, dict)
+                and parse_ineligibility(fb_data)[0] != "client_unsupported"
+            ):
+                assist_status, assist_data = fb_status, fb_data
+                code_assist_headers = fallback_headers
+                break
     if imported:
         email = user_data.get("email")
         if user_status in (401, 403) or assist_status in (401, 403):
