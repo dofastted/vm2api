@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **修复 Gemini 许可 CLI 将 bwrap 沙箱挂载/命名空间失败误报为 `license_invalid`（#1892）**：
+  - `scripts/gemini-host.py`：`classify_craggemini_license_cli_error` 在回落到许可无效前识别 `bwrap:` 启动失败（bind 源不可穿越、user namespace 拒绝等），分别上报 `gemini_sandbox_unavailable` 与 `gemini_sandbox_apparmor_restricted`；`license_status` 保留上述沙箱错误码而不再改写为 `license_unconfigured`。
+  - 回归测试：`test/unit/gemini-host-license-align.py` 覆盖挂载 `Permission denied` 与真实许可失败分流。
+
 ## 1.4.230 — 2026-11-26 · 内核不再为带 type 的工具合成 `input_schema`（advisor 全链路放行）、新增 advisor 处理说明
 
 - **`kin-kernel` 新二进制：带显式非 `custom` `type` 的工具不再被补 `input_schema`（payload pin 变更）**：

@@ -224,6 +224,29 @@ def extract_permit_payload_key_id(code):
     return None
 
 
+BWRAP_LAUNCH_STDERR = re.compile(rb"bwrap:\s", re.I)
+BWRAP_BIND_MOUNT_STDERR = re.compile(
+    rb"can't find source path|failed to (?:open|mount)|no such file or directory",
+    re.I,
+)
+
+
+def _classify_bwrap_launch_stderr(stderr, *, host_root=Path("/")):
+    if not isinstance(stderr, str) or not stderr.strip():
+        return None
+    lower = stderr.lower()
+    if "craggemini:" in lower and "bwrap:" not in lower:
+        return None
+    raw = stderr.encode("utf-8", errors="replace")
+    if not BWRAP_LAUNCH_STDERR.search(raw):
+        return None
+    if BWRAP_BIND_MOUNT_STDERR.search(raw):
+        return 503, "gemini_sandbox_unavailable"
+    if _apparmor_sandbox_evidence(raw, host_root=host_root):
+        return 503, "gemini_sandbox_apparmor_restricted"
+    return 503, "gemini_sandbox_unavailable"
+
+
 def classify_craggemini_license_cli_error(stdout, stderr, *, sync_pending=False):
     if isinstance(stdout, str) and stdout.strip():
         try:
@@ -258,6 +281,9 @@ def classify_craggemini_license_cli_error(stdout, stderr, *, sync_pending=False)
         or "permit or registration code is required" in text
     ):
         return 403, "license_required"
+    sandbox = _classify_bwrap_launch_stderr(stderr)
+    if sandbox is not None:
+        return sandbox
     if sync_pending:
         return 503, "gemini_subscription_sync_pending"
     return 403, "license_invalid"
@@ -6434,7 +6460,11 @@ class Host:
             status.setdefault("product", "craggemini")
             status["seat_required"] = True
         except Failure as error:
-            code = error.code if error.code in LICENSE_ERROR_CODES else "license_unconfigured"
+            code = (
+                error.code
+                if error.code in LICENSE_ERROR_CODES or error.code in SANDBOX_ERROR_CODES
+                else "license_unconfigured"
+            )
             status = {
                 "product": "craggemini",
                 "status": (
