@@ -258,6 +258,46 @@ export function refusalSessionBlockDecision(reason, classifier = null) {
   return { block: true }
 }
 
+/**
+ * Drop only genuine internal `response_headers` SSE control frames, never
+ * normal model deltas whose text or tool JSON happens to mention the literal
+ * substring `response_headers` (which would otherwise orphan `event:` with an
+ * empty `data` payload and trigger Claude Code's malformed-stream SyntaxError).
+ */
+export function createResponseHeadersSseFilter() {
+  let skipping = false
+  return function shouldSkip(line) {
+    const trimmed = String(line ?? '').trim()
+    if (skipping) {
+      if (trimmed === '') {
+        skipping = false
+        return true
+      }
+      if (trimmed.startsWith('event:') && !/^event:\s*response_headers$/.test(trimmed)) {
+        skipping = false
+      } else {
+        return true
+      }
+    }
+    if (/^event:\s*response_headers$/.test(trimmed)) {
+      skipping = true
+      return true
+    }
+    if (trimmed.startsWith('data:') && trimmed.includes('response_headers')) {
+      try {
+        const parsed = JSON.parse(trimmed.slice(5).trim())
+        if (parsed?.type === 'response_headers') {
+          skipping = true
+          return true
+        }
+      } catch {
+        // Non-JSON or partial line: never drop on substring match.
+      }
+    }
+    return false
+  }
+}
+
 function authenticatedTenant(req) {
   if (req.apiKeyRecord?.id != null) return `key:${req.apiKeyRecord.id}`
   if (req.apiKeyKind === 'master') return 'master'
@@ -652,6 +692,7 @@ export function createHandleProtocol(deps) {
     gatewayRequestId = null,
   }) {
     const assembler = createClaudeMessageAssembler()
+    const skipResponseHeaders = createResponseHeadersSseFilter()
     const workerResult = await dispatchStreamInference({
       exec: candidate.exec,
       admitCragInference: deps.admitCragInference,
@@ -682,7 +723,7 @@ export function createHandleProtocol(deps) {
       onEnvelope,
       onOutboundHeaders,
       onEvent: async (line) => {
-        if (/response_headers/.test(String(line))) return
+        if (skipResponseHeaders(line)) return
         applyClaudeSSELineToMessage(restoreToolNamesInSSELine(line, toolNames), assembler)
       },
     })
@@ -2713,6 +2754,7 @@ export function createHandleProtocol(deps) {
               },
             })
           keepalive.arm()
+          const skipResponseHeaders = createResponseHeadersSseFilter()
           try {
             const streamed = await dispatchStreamInference({
               exec: candidate.exec,
@@ -2750,7 +2792,7 @@ export function createHandleProtocol(deps) {
                 onCommit()
               },
               onEvent: async (line) => {
-                if (/response_headers/.test(String(line))) return
+                if (skipResponseHeaders(line)) return
                 line = restoreToolNamesInSSELine(line, attemptMeta?.toolNames || {})
                 if (personaHideTokens) line = hidePersonaUsageInSseLine(line, personaHideTokens, cacheTtl)
                 keepalive.observeLine(line)
