@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.4.229 — 2026-11-26 · 加固 PostgreSQL 一键安装/迁移脚本（#1905 安全门禁与本地 URL 识别）、PG 18 调优与同步桥可观测性
+
+- **PostgreSQL 一键安装/迁移脚本安全门禁与本地地址识别加固（#1911）**：
+  - `deploy/replace-db-to-pg.sh`：新增 `verify_pg_sync_rpc_safety()`，在停止控制面或执行 SQLite → PostgreSQL 迁移前，同时校验 systemd 与 Docker 模式下的 `src/lib/db/pg/pg-sync-db.mjs` 是否包含 `#1905` 的 `PG_SYNC_PROTOCOL_ERROR` 修复，阻断在未修复的旧版控制面（`<= 1.4.226`）上盲目切换至 PostgreSQL；`--status` 输出新增 `PG 同步桥` 安全状态项；为由脚本启动的 PostgreSQL 18 容器补齐 `checkpoint_completion_target=0.9`、`max_wal_size=1GB` 与 `idle_in_transaction_session_timeout=60000` 调优参数。
+  - `deploy/install.sh`、`deploy/install-pg.sh`：新增 `url_points_to_local_host()`，修正 `need_local_pg()` 与 `need_local_redis()` 此前将已指向 `127.0.0.1` / `localhost` / `::1` 的 `DATABASE_URL` / `REDIS_URL` 误判为「外部托管服务」而跳过本地依赖启动/托管的边界问题；同步更新本地脚本缓存刷新锚点（`verify_pg_sync_rpc_safety`、`url_points_to_local_host`），确保升级后自动拉取最新安装与迁移脚本。
+  - `docker-compose.yml`：为 PostgreSQL 18 服务对齐 `checkpoint_completion_target=0.9`、`max_wal_size=1GB` 与 `idle_in_transaction_session_timeout=60000`。
+- **PostgreSQL 同步桥运行时可观测性与异常快失败（#1911）**：
+  - `src/lib/db/pg/pg-sync-db.mjs`、`src/lib/db/pg/pg-sync-worker.mjs`：`poolStats()` 新增 `stale_dropped`（陈旧回包排空计数）与 `timeouts`（同步 RPC 超时计数）指标；worker 在 `shutdown` 或 `uncaughtException` 退出前向所有已挂载 `MessagePort` 的 `SharedArrayBuffer` 置位 `signal[1] = 1` 并广播 `Atomics.notify`，让正在等待的同步调用立即失败而不空等超时。
+  - 回归测试：扩充 `test/deploy/test_install_pg.py` 与 `test/unit/pg-sync-db-rpc.test.mjs`，覆盖本地/远端 URL 识别、安全门禁拦截、PG 18 调优参数、过期回包/超时计数及 worker 异常退出快失败路径。
+- 部署说明：本次改动涉及控制面（`src/lib/db/pg/`）与部署脚本/编排配置（`deploy/install.sh`、`deploy/install-pg.sh`、`deploy/replace-db-to-pg.sh`、`docker-compose.yml`）；前端（`web/src/`）、`deploy/payload.json`（CRAG `3.1.21` 与 CRAGGemini `0.4.13`）、数据库迁移结构、Gemini 宿主脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.228` 均未变，预期 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex/Gemini 槽位，重启 `vm2api` 一次即可生效。
+
 ## 1.4.228 — 2026-11-26 · 修复 Gemini 账号导入/授权后 `UNSUPPORTED_CLIENT` 误阻断与 CRAGGemini `CRAGR1` 兑换失败
 
 - **修复 Gemini 客户端版本标识与 `UNSUPPORTED_CLIENT`（`gemini_client_unsupported`）误阻断（#1908）**：
