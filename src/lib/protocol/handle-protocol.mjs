@@ -195,14 +195,15 @@ import {
   personaHideForCliZero,
 } from '../identity/crs-persona-usage.mjs'
 import {
+  applyCacheBreakpoints,
   applyCacheTtlToUsage,
-  enforceCacheTtlOrder,
-  fillMissingCacheTtl,
+  cacheTtlFromRouting,
   cacheBreakpointsFromRoutingFile,
   pinConversationCacheTtl,
+  repairCacheBreakpoints,
   resolveCacheTtl,
-  validateCacheBreakpoints,
 } from './cache-ttl.mjs'
+import { needsCragProviderCompatibility } from './kernel-request.mjs'
 import {
   confirmCachePrefix,
   describeCacheContinuity,
@@ -231,7 +232,6 @@ import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { credentialModeFromOauth, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import {
   prepareAnthropicRequest,
-  enforceCacheLimit,
   rewriteToolNames,
   scrubUpstreamClientBody,
   toStandardAnthropicBody,
@@ -1700,15 +1700,11 @@ export function createHandleProtocol(deps) {
       return json(res, error.status, error.body)
     }
     if (!requestContext && officialPassthrough) {
-      try {
-        validateCacheBreakpoints(ctx.body)
-      } catch (error) {
-        if (!error.body?.error) throw error
-        stats.errors++
-        logBag.error_code = error.body.error.code
-        logBag.error_message = error.body.error.message
-        return json(res, error.status, error.body)
-      }
+      ctx.body = repairCacheBreakpoints(ctx.body, {
+        limit: Number(getRouting()?.compatibility?.cache_control_limit) || 4,
+        fallbackTtl: cacheTtlFromRouting(getRouting()),
+        fillMissing: false,
+      })
     }
 
     if (
@@ -1889,16 +1885,25 @@ export function createHandleProtocol(deps) {
     // retaining explicit caller 5m/1h (and legal 1h → 5m). Official passthrough
     // and caller-policy API endpoints leave caller omissions untouched.
     if (!apiNonAnthropic && !requestContext && !officialPassthrough) {
+      const cacheLimit = Number(getRouting()?.compatibility?.cache_control_limit) || 4
       if (!preserveApiCallerBody) {
-        ctx.body = enforceCacheTtlOrder(fillMissingCacheTtl(ctx.body, requestedCacheTtl), requestedCacheTtl)
+        ctx.body = repairCacheBreakpoints(ctx.body, {
+          limit: cacheLimit,
+          fallbackTtl: requestedCacheTtl,
+          fillMissing: true,
+        })
         if (hasCragSystem) {
-          cragSystem = enforceCacheTtlOrder(
-            fillMissingCacheTtl({ tools: ctx.body.tools, system: cragSystem }, requestedCacheTtl),
-            requestedCacheTtl,
+          cragSystem = repairCacheBreakpoints(
+            { tools: ctx.body.tools, system: cragSystem },
+            { limit: cacheLimit, fallbackTtl: requestedCacheTtl, fillMissing: true },
           ).system
         }
       } else {
-        ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
+        ctx.body = repairCacheBreakpoints(ctx.body, {
+          limit: cacheLimit,
+          fallbackTtl: requestedCacheTtl,
+          fillMissing: false,
+        })
       }
     }
     // Anthropic 400s a subscription request whose system field carries a third-party
@@ -1956,9 +1961,11 @@ export function createHandleProtocol(deps) {
         })
       }
       if (!officialPassthrough && !requestContext && !apiGemini) {
-        ctx.body = preserveApiCallerBody
-          ? enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
-          : enforceCacheTtlOrder(fillMissingCacheTtl(ctx.body, requestedCacheTtl), requestedCacheTtl)
+        ctx.body = repairCacheBreakpoints(ctx.body, {
+          limit: Number(getRouting()?.compatibility?.cache_control_limit) || 4,
+          fallbackTtl: requestedCacheTtl,
+          fillMissing: !preserveApiCallerBody,
+        })
       }
       personaHideTokens =
         requestContext || apiNonAnthropic || preserveApiCallerBody
@@ -2327,13 +2334,21 @@ export function createHandleProtocol(deps) {
           // with none of them; the assembly rebuilds from caller input after the
           // repairs replay, so the decision has to ride along to it.
           const dropSampling = (extra.repairs || []).some((policy) => policy?.reason === 'sampling_repairable')
+          const cacheControlRepaired = (extra.repairs || []).some(
+            (policy) => policy?.reason === 'cache_control_repairable',
+          )
+          const thinkingRepaired =
+            repaired &&
+            !(extra.repairs || []).every((policy) =>
+              ['cache_control_repairable', 'sampling_repairable', 'search_repairable'].includes(policy?.reason),
+            )
           const preserveThinkingBlocks =
-            !repaired &&
+            !thinkingRepaired &&
             routingNow?.failover?.signature_repair !== true &&
             (!keptAccount || keptAccount === selected.accountId)
           // cli-node receives the cleaned body after this boundary. Keep every
           // thinking block on the first hop and only let a repaired retry strip it.
-          const preserveCliHopThinkingBlocks = !repaired
+          const preserveCliHopThinkingBlocks = !thinkingRepaired
           const cliHop = resolveOfficialCcInference(selected.vm, routingNow) === 'cli-hop'
           const resolvedPersona = resolveSlotPersonaPreset(selected.vm, routingNow)
           const preserveCallerEnvironment = !presetFlagEnabled(
@@ -2429,11 +2444,23 @@ export function createHandleProtocol(deps) {
               for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
               hopBody = prepareCragPrintBody(source, {
                 preset: cragPersona,
-                officialPassthrough,
+                officialPassthrough: officialPassthrough && !cacheControlRepaired,
                 capabilities: Array.isArray(caps) ? caps : [],
                 agentSummary: !!summarySession,
                 foldSystemMessages: routingNow?.compatibility?.crag_fold_history_system !== false,
               })
+              if (cacheControlRepaired && needsCragProviderCompatibility(hopBody, caps)) {
+                hopBody = repairCacheBreakpoints(
+                  applyCacheBreakpoints(hopBody, {
+                    ttl: requestedCacheTtl,
+                    config: cacheBreakpoints,
+                  }),
+                  {
+                    limit: Number(routingNow?.compatibility?.cache_control_limit) || 4,
+                    fallbackTtl: requestedCacheTtl,
+                  },
+                )
+              }
               const materialized = await materializeRemoteImageSources(hopBody)
               if (materialized !== hopBody) {
                 validateImageDimensions(materialized)
@@ -2460,7 +2487,7 @@ export function createHandleProtocol(deps) {
                 // Carry the resolved session/menu default separately from usage accounting.
                 hopBody.cache_ttl = requestedCacheTtl
               }
-              preserveCacheBreakpoints = officialPassthrough
+              preserveCacheBreakpoints = officialPassthrough && !cacheControlRepaired
               cacheTtl = null
               personaHideTokens = 0
               logBag.inference_engine = resolveInferenceEngine(selected.vm, routingNow)
@@ -2470,6 +2497,7 @@ export function createHandleProtocol(deps) {
                 persona: cragPersona,
                 prompt_mode: hopBody.crag_prompt?.mode || 'default',
                 safeguards_stripped: Boolean(personaIn.safeguards != null && hopBody.safeguards == null),
+                ...(cacheControlRepaired ? { cache_control_repaired: true } : {}),
               }
               logBag.official_cc_inference = 'crag-print'
               logBag.provider = 'local_cli'
@@ -2492,7 +2520,7 @@ export function createHandleProtocol(deps) {
                   requestContext,
                   // thinking was dropped for this hop: skip ensureOfficialPrintThinking, which
                   // would otherwise re-add adaptive thinking to a body whose loop lost its blocks.
-                  repaired: repaired || cragOwned.thinkingOff === true,
+                  repaired: thinkingRepaired || cragOwned.thinkingOff === true,
                   dropSampling,
                 },
               }
@@ -2518,11 +2546,11 @@ export function createHandleProtocol(deps) {
             }
             hopBody = prepareCliHopBody(hopBody, {
               stream: upstreamStream,
-              repaired,
+              repaired: thinkingRepaired,
               cacheTtl: requestedCacheTtl,
               requestContext,
               preserveSystem: false,
-              preserveCacheTtl: officialPassthrough,
+              preserveCacheTtl: officialPassthrough && !cacheControlRepaired,
               preserveThinkingBlocks: preserveCliHopThinkingBlocks,
               preserveCallerEnvironment,
               autoCompactWindow: ctx.autoCompactWindow,
@@ -2606,27 +2634,28 @@ export function createHandleProtocol(deps) {
             }
           }
 
-          preserveCacheBreakpoints = officialPassthrough
+          preserveCacheBreakpoints = officialPassthrough && !cacheControlRepaired
           cacheTtl = requestedCacheTtl
           if (!requestContext && !officialPassthrough) {
             const configuredMode = modeOverride || resolveSlotPersonaPreset(selected.vm, routingNow)
-            const rewritten = enforceCacheTtlOrder(
-              fillMissingCacheTtl(
-                applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
-                  officialClient: false,
-                  forceConfigured: true,
-                  routingFile: routingConfigPath,
-                  cacheTtl: requestedCacheTtl,
-                  mode: configuredMode,
-                  headers: req.headers,
-                  sessionId: attemptSessionId,
-                  model: personaIn?.model,
-                  cliVersion: OFFICIAL_CLI_VERSION,
-                  identity,
-                }),
-                requestedCacheTtl,
-              ),
-              requestedCacheTtl,
+            const rewritten = repairCacheBreakpoints(
+              applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
+                officialClient: false,
+                forceConfigured: true,
+                routingFile: routingConfigPath,
+                cacheTtl: requestedCacheTtl,
+                mode: configuredMode,
+                headers: req.headers,
+                sessionId: attemptSessionId,
+                model: personaIn?.model,
+                cliVersion: OFFICIAL_CLI_VERSION,
+                identity,
+              }),
+              {
+                limit: Number(routingNow?.compatibility?.cache_control_limit) || 4,
+                fallbackTtl: requestedCacheTtl,
+                fillMissing: true,
+              },
             )
             hopBody = officialMessagesBody(rewritten)
             for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)

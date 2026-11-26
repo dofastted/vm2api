@@ -188,7 +188,7 @@ CRAG 声明 `provider_managed_tools_v1` 且支持对应工具时使用独立的 
 3. 更早的型号仍逐块过滤：签名短于 24、空签名、dummy 签名删掉，合法签名块留下。`redacted_thinking` 不看 `data`，只在签名达到 24 字符时留。
 4. 保留路径（cli-hop 首跳，以及默认 HTTP hop）不走上面的拆链，只在 `stripInvalidThinkingBlocks` 的这一支里处理：`redacted_thinking` 不看 `data` 和签名，原样留。`thinking` 只有签名可用（非空、不少于 24、非 dummy）才留，空正文也留；缺失、空、短于 24、dummy 的删掉，不再补 `signature: ""`。不走保留路径时，`redacted_thinking` 仍按上面第 2、3 条删。当前没有按账号归属过滤签名的步骤。
 
-HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但缓存职责不同。cli-hop 首跳保留签名可用的 thinking 指纹，没有可用签名的删掉；签名修复重试才清除其余块。官方家族开启 `official_cc_passthrough` 时，Node 保留 system/tools/messages 的 caller marker、显式 TTL、缺失 TTL 和位置，不添点、不裁剪；超过四点、thinking marker、非法 TTL 或 5m（含缺失）后出现 1h，在调度前返回 `400 invalid_cache_control`。
+HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但缓存职责不同。cli-hop 首跳保留签名可用的 thinking 指纹，没有可用签名的删掉；签名修复重试才清除其余块。官方家族开启 `official_cc_passthrough` 时，合法的 caller marker、显式 TTL、缺失 TTL 和位置原样保留；若出现超过四点、thinking marker、嵌套 `tool_result.content` 断点、非法 TTL 或 `5m`（含缺失）后出现 `1h`，由统一缓存整流（`repairCacheBreakpoints` / `protofront`）自动纠错而不直接返回 `400 invalid_cache_control`。若 CRAG 内核在调度前因原生历史锚点或系统块不匹配拒绝（`CRAG_CACHE_CONTROL`），策略层触发 `cache_control_repairable` 单次同账号修复重试：剥离调用方 `cache_control`、保留 thinking 块，由 CRAG 按会话 TTL 重新打点。
 
 关闭透传或非官方请求仍按所选人设组装。调用方显式 TTL 保留：显式 `1h` 保留 `1h`，显式 `5m` 保留 `5m`，合法的 `1h → 5m` 各自保留；省略 `ttl` 的缺省 marker 在渲染与入核前按 Web `compatibility.cache_ttl`（会话 pin 值）补齐（前面已有显式 `5m` 时补 `5m`，避免 `5m → 1h` 逆序）。HTTP hop 的 `preserve_client=true` 保留已有 message marker 位置并补齐缺失 TTL；无 message marker 时，才按配置补最后消息及 `messages.length>=4` 时倒数第二 user 的点。
 

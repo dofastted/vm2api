@@ -119,7 +119,7 @@ curl -sS http://127.0.0.1:8787/v1/messages \
 
 支持的 Messages 字段原样进入清洗层：`system`、`tools`、`tool_choice`、`thinking`、`output_config`、`metadata`、`stop_sequences`、图片块、`cache_control`。非法 `role` 会洗掉。OpenAI 形态 tools 出现在本口时先转成 Anthropic tools，但仍判非官方。
 
-native cli-hop 开启官方家族透传时，调用方 `cache_control` 的位置、显式 TTL 与缺失 TTL 保留。超过四个 breakpoint、thinking 上打点、非法 TTL，或 `5m`（含缺失 TTL）之后出现 `1h`，返回 `400 invalid_cache_control`，不静默裁剪或降级、不执行上游。非透传仍按协议重写规则生成自产点；kernel 不再替前置层修复 TTL 顺序。
+native cli-hop 开启官方家族透传时，合法的调用方 `cache_control` 位置、显式 TTL 与缺失 TTL 保留。若入站存在超过四个 breakpoint、thinking 上打点、嵌套 `tool_result.content` 断点、非法 TTL，或 `5m`（含缺失 TTL）之后出现 `1h`，前置层会自动纠错（剥离非法点、收敛至 4 个以内并保持 `1h → 5m` 单调顺序）而不是直接拒单；若 CRAG 内核在调度前仍返回 `CRAG_CACHE_CONTROL`，网关会剥离调用方缓存点并同账号单次重试，由内核按会话 TTL 重打干净断点。非透传仍按协议重写规则补齐并生成自产点。
 
 ### Claude VM / CRAG 的 `service_tier` 能力边界
 

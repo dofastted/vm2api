@@ -9,11 +9,10 @@ import { readJsonParsedCached } from '../vm/vm-file.mjs'
 export const DEFAULT_CACHE_TTL = '1h'
 export const CACHE_TTL_HEADER = 'x-kin-cache-ttl'
 
-export function normalizeCacheTtl(value) {
+export function normalizeCacheTtl(value, fallback = DEFAULT_CACHE_TTL) {
   const raw = String(value ?? '')
     .trim()
     .toLowerCase()
-  if (!raw) return DEFAULT_CACHE_TTL
   if (
     raw === '1h' ||
     raw === '1hr' ||
@@ -25,7 +24,7 @@ export function normalizeCacheTtl(value) {
   )
     return '1h'
   if (raw === '5m' || raw === '5min' || raw === '300') return '5m'
-  return DEFAULT_CACHE_TTL
+  return fallback === DEFAULT_CACHE_TTL ? DEFAULT_CACHE_TTL : normalizeCacheTtl(fallback)
 }
 
 export function cacheTtlFromRouting(routing = {}) {
@@ -82,7 +81,255 @@ export function resolveCacheTtl({ headers = {}, body, routing, routingFile } = {
   return DEFAULT_CACHE_TTL
 }
 
-/** Native passthrough validates caller markers; it never repairs their budget or TTL. */
+function isPlainObject(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isThinkingNode(node) {
+  return node?.type === 'thinking' || node?.type === 'redacted_thinking'
+}
+
+/**
+ * Normalize a single cache_control value into a legal Anthropic ephemeral marker,
+ * returning undefined when the value is unusable (non-object or non-ephemeral).
+ */
+export function normalizeCacheControlObject(
+  control,
+  { fallbackTtl = DEFAULT_CACHE_TTL, stripExtraFields = false } = {},
+) {
+  if (control == null) return undefined
+  if (!isPlainObject(control)) return undefined
+  if (control.type !== 'ephemeral') return undefined
+  let ttl
+  if (control.ttl != null && String(control.ttl).trim() !== '') {
+    ttl = control.ttl === '5m' || control.ttl === '1h' ? control.ttl : normalizeCacheTtl(control.ttl, fallbackTtl)
+  }
+  if (stripExtraFields) {
+    return ttl ? { type: 'ephemeral', ttl } : { type: 'ephemeral' }
+  }
+  const out = { ...control, type: 'ephemeral' }
+  if (ttl === undefined) delete out.ttl
+  else out.ttl = ttl
+  return out
+}
+
+export function isCleanCacheControl(control, { stripExtraFields = false } = {}) {
+  if (!isPlainObject(control) || control.type !== 'ephemeral') return false
+  if (control.ttl != null && control.ttl !== '5m' && control.ttl !== '1h') return false
+  if (stripExtraFields) {
+    for (const key of Object.keys(control)) {
+      if (key !== 'type' && key !== 'ttl') return false
+    }
+  }
+  return true
+}
+
+function collectCacheEntries(body) {
+  const entries = []
+  const walkBlock = (node, section) => {
+    if (!node || typeof node !== 'object') return
+    if (Array.isArray(node.content)) {
+      for (const child of node.content) walkBlock(child, 'nested')
+    }
+    if (Object.prototype.hasOwnProperty.call(node, 'cache_control') && node.cache_control !== undefined) {
+      entries.push({ node, section })
+    }
+  }
+  for (const tool of Array.isArray(body?.tools) ? body.tools : []) {
+    if (
+      tool &&
+      typeof tool === 'object' &&
+      Object.prototype.hasOwnProperty.call(tool, 'cache_control') &&
+      tool.cache_control !== undefined
+    ) {
+      entries.push({ node: tool, section: 'tools' })
+    }
+  }
+  if (Array.isArray(body?.system)) {
+    for (const block of body.system) walkBlock(block, 'system')
+  }
+  if (Array.isArray(body?.crag_prompt?.blocks)) {
+    for (const block of body.crag_prompt.blocks) walkBlock(block, 'system')
+  }
+  for (const message of Array.isArray(body?.messages) ? body.messages : []) {
+    if (!Array.isArray(message?.content)) continue
+    for (const block of message.content) walkBlock(block, 'messages')
+  }
+  if (
+    body &&
+    typeof body === 'object' &&
+    Object.prototype.hasOwnProperty.call(body, 'cache_control') &&
+    body.cache_control !== undefined
+  ) {
+    entries.push({ node: body, section: 'body' })
+  }
+  return entries
+}
+
+function stripNestedCacheControls(blocks) {
+  let lastValid = null
+  for (const child of blocks) {
+    if (!child || typeof child !== 'object') continue
+    if (Array.isArray(child.content)) {
+      const inner = stripNestedCacheControls(child.content)
+      if (inner != null) lastValid = inner
+    }
+    if (child.cache_control != null) {
+      if (!isThinkingNode(child)) lastValid = child.cache_control
+      delete child.cache_control
+    } else if (Object.prototype.hasOwnProperty.call(child, 'cache_control')) {
+      delete child.cache_control
+    }
+  }
+  return lastValid
+}
+
+/**
+ * In-place SSOT repair of cache_control breakpoints so any inbound/outbound body
+ * satisfies Anthropic & CRAG rules without violently rejecting the request:
+ *  - drops cache_control on thinking/redacted_thinking blocks and malformed values
+ *  - optionally strips non-whitelisted fields (e.g. scope/evict_on_complete)
+ *  - optionally lifts nested tool_result.content breakpoints onto parent tool_result
+ *  - trims excess breakpoints to `limit` (default 4), keeping newest message anchors
+ *    and tail system/tool anchors
+ *  - optionally fills omitted TTLs and fixes any 5m/omitted -> 1h TTL inversion
+ */
+export function repairCacheBreakpointsInPlace(
+  body,
+  {
+    limit = 4,
+    fallbackTtl = DEFAULT_CACHE_TTL,
+    fillMissing = false,
+    stripExtraFields = false,
+    liftNested = false,
+  } = {},
+) {
+  if (!body || typeof body !== 'object') return body
+  const max = Number.isInteger(limit) && limit >= 0 ? limit : 4
+  const fallback = normalizeCacheTtl(fallbackTtl)
+
+  // 1. Clean individual markers and strip illegal thinking placements.
+  for (const { node } of collectCacheEntries(body)) {
+    if (isThinkingNode(node) || node.cache_control == null) {
+      delete node.cache_control
+      continue
+    }
+    const cleaned = normalizeCacheControlObject(node.cache_control, { fallbackTtl: fallback, stripExtraFields })
+    if (!cleaned) delete node.cache_control
+    else node.cache_control = cleaned
+  }
+
+  // 2. Lift nested tool_result.content markers onto their parent block when requested.
+  if (liftNested && Array.isArray(body.messages)) {
+    for (const message of body.messages) {
+      if (!Array.isArray(message?.content)) continue
+      for (const block of message.content) {
+        if (!block || typeof block !== 'object' || !Array.isArray(block.content)) continue
+        const lifted = stripNestedCacheControls(block.content)
+        if (lifted != null && block.cache_control == null && !isThinkingNode(block)) {
+          block.cache_control = lifted
+        }
+      }
+    }
+  }
+
+  // 3. Enforce breakpoint budget (<= max), sacrificing lowest-value anchors first.
+  const live = collectCacheEntries(body).filter((entry) => entry.node.cache_control != null)
+  if (live.length > max) {
+    const bySection = (name) => live.filter((entry) => entry.section === name)
+    const nested = bySection('nested')
+    const tools = bySection('tools')
+    const system = bySection('system')
+    const messages = bySection('messages')
+    const root = bySection('body')
+    const messageTail = [...messages, ...root]
+    const staleMessages = messageTail.slice(0, Math.max(0, messageTail.length - 2))
+    const activeMessages = messageTail.slice(Math.max(0, messageTail.length - 2))
+    const dropOrder = [...nested, ...staleMessages, ...tools, ...system, ...activeMessages]
+    for (const entry of dropOrder.slice(0, live.length - max)) {
+      delete entry.node.cache_control
+    }
+  }
+
+  // 4. Fill omitted TTLs (when enabled) and repair any 5m/omitted -> 1h inversion.
+  let short = false
+  for (const { node } of collectCacheEntries(body)) {
+    const control = node.cache_control
+    if (!control) continue
+    if (fillMissing && control.ttl == null) {
+      control.ttl = short ? '5m' : fallback
+    }
+    if (short && control.ttl === '1h') {
+      control.ttl = '5m'
+    }
+    if (control.ttl !== '1h') short = true
+  }
+  return body
+}
+
+/**
+ * Immutable SSOT cache breakpoint auto-repair. Returns the original `body`
+ * reference untouched when all breakpoints already satisfy the constraints.
+ */
+export function repairCacheBreakpoints(
+  body,
+  {
+    limit = 4,
+    fallbackTtl = DEFAULT_CACHE_TTL,
+    fillMissing = false,
+    stripExtraFields = false,
+    liftNested = false,
+  } = {},
+) {
+  if (!body || typeof body !== 'object') return body
+  const max = Number.isInteger(limit) && limit >= 0 ? limit : 4
+  const entries = collectCacheEntries(body)
+  let needsRepair = false
+  let count = 0
+  let short = false
+  for (const { node, section } of entries) {
+    const control = node.cache_control
+    if (control == null) {
+      needsRepair = true
+      break
+    }
+    if (isThinkingNode(node)) {
+      needsRepair = true
+      break
+    }
+    if (liftNested && section === 'nested') {
+      needsRepair = true
+      break
+    }
+    if (!isCleanCacheControl(control, { stripExtraFields })) {
+      needsRepair = true
+      break
+    }
+    if (fillMissing && control.ttl == null) {
+      needsRepair = true
+      break
+    }
+    if (short && control.ttl === '1h') {
+      needsRepair = true
+      break
+    }
+    if (control.ttl !== '1h') short = true
+    if (++count > max) {
+      needsRepair = true
+      break
+    }
+  }
+  if (!needsRepair) return body
+  return repairCacheBreakpointsInPlace(structuredClone(body), {
+    limit: max,
+    fallbackTtl,
+    fillMissing,
+    stripExtraFields,
+    liftNested,
+  })
+}
+
+/** Validate Anthropic/CRAG cache_control breakpoints (budget <= 4, 1h before 5m, no thinking markers). */
 export function validateCacheBreakpoints(body) {
   let count = 0
   let short = false
@@ -92,26 +339,19 @@ export function validateCacheBreakpoints(body) {
     error.body = { type: 'error', error: { type: 'invalid_request_error', code: 'invalid_cache_control', message } }
     throw error
   }
-  const check = (node) => {
-    const control = node?.cache_control
-    if (control == null) return
-    if (node.type === 'thinking' || node.type === 'redacted_thinking') {
+  for (const { node } of collectCacheEntries(body)) {
+    const control = node.cache_control
+    if (control == null) continue
+    if (isThinkingNode(node)) {
       invalid('Cache breakpoints are not allowed on thinking blocks.')
     }
-    if (control.type !== 'ephemeral' || (control.ttl != null && !['5m', '1h'].includes(control.ttl))) {
+    if (!isCleanCacheControl(control)) {
       invalid('Cache control must be ephemeral with an optional 5m or 1h TTL.')
     }
     if (short && control.ttl === '1h') invalid('Cache TTL must place 1h before 5m (including missing TTL).')
     if (control.ttl !== '1h') short = true
     if (++count > 4) invalid('Cache control exceeds four breakpoints.')
   }
-  for (const tool of body?.tools || []) check(tool)
-  for (const block of Array.isArray(body?.system) ? body.system : []) check(block)
-  for (const message of body?.messages || []) {
-    if (Array.isArray(message?.content)) for (const block of message.content) check(block)
-  }
-  // Automatic caching applies at the message tail, after explicit block markers.
-  check(body)
 }
 
 /**
@@ -241,49 +481,41 @@ function mapCacheControl(node, mapFn) {
   return { ...node, cache_control: mapFn(node.cache_control) }
 }
 
-function sanitizeSystemCacheControl(control) {
-  return sanitizePublicCacheControl(control)
-}
-
 /** Drop cache_control fields the public Messages schema rejects (scope, …). */
 export function stripIllegalCacheControlFields(body) {
   if (!body || typeof body !== 'object') return body
-  const out = { ...body }
-  if (out.cache_control) out.cache_control = sanitizePublicCacheControl(out.cache_control)
-  if (Array.isArray(out.system)) {
-    out.system = out.system.map((block) => mapCacheControl(block, sanitizeSystemCacheControl))
-  }
-  if (Array.isArray(out.tools)) {
-    out.tools = out.tools.map((tool) => mapCacheControl(tool, sanitizePublicCacheControl))
-  }
-  if (Array.isArray(out.messages)) {
-    out.messages = out.messages.map((message) => {
-      if (!Array.isArray(message?.content)) return message
-      return {
-        ...message,
-        content: message.content.map((block) => mapCacheControl(block, sanitizePublicCacheControl)),
-      }
-    })
-  }
-  return out
+  return walkCacheNodes(body, (node) => mapCacheControl(node, sanitizePublicCacheControl))
 }
-/** Drop caller cache_control so Node can restamp last + penultimate user. */
+/** Drop caller cache_control (including nested tool_result.content & crag_prompt.blocks). */
 export function removeCacheControlFields(body) {
   if (!body || typeof body !== 'object') return body
   const out = { ...body }
   delete out.cache_control
   const clearNode = (node) => {
     if (!node || typeof node !== 'object') return node
-    const next = { ...node }
-    delete next.cache_control
+    let next = node
+    if (Array.isArray(node.content)) {
+      const content = node.content.map(clearNode)
+      if (content.some((child, i) => child !== node.content[i])) {
+        next = { ...next, content }
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(next, 'cache_control')) {
+      next = next === node ? { ...node } : next
+      delete next.cache_control
+    }
     return next
   }
   if (Array.isArray(out.tools)) out.tools = out.tools.map(clearNode)
   if (Array.isArray(out.system)) out.system = out.system.map(clearNode)
+  if (Array.isArray(out.crag_prompt?.blocks)) {
+    out.crag_prompt = { ...out.crag_prompt, blocks: out.crag_prompt.blocks.map(clearNode) }
+  }
   if (Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) => {
       if (!Array.isArray(message?.content)) return message
-      return { ...message, content: message.content.map(clearNode) }
+      const content = message.content.map(clearNode)
+      return content.some((block, i) => block !== message.content[i]) ? { ...message, content } : message
     })
   }
   return out
@@ -298,29 +530,11 @@ function dropScopeOnNode(node) {
 export function stripCacheScopeFields(body) {
   if (!body || typeof body !== 'object') return body
   let changed = false
-  const map = (node) => {
+  const out = walkCacheNodes(body, (node) => {
     const next = dropScopeOnNode(node)
     if (next !== node) changed = true
     return next
-  }
-  const out = { ...body }
-  if (out.cache_control && Object.prototype.hasOwnProperty.call(out.cache_control, 'scope')) {
-    out.cache_control = dropCacheControlScope(out.cache_control)
-    changed = true
-  }
-  if (Array.isArray(out.system)) out.system = out.system.map(map)
-  if (Array.isArray(out.tools)) out.tools = out.tools.map(map)
-  if (Array.isArray(out.messages)) {
-    out.messages = out.messages.map((message) => {
-      if (!Array.isArray(message?.content)) return message
-      const content = message.content.map(map)
-      if (content.some((block, i) => block !== message.content[i])) {
-        changed = true
-        return { ...message, content }
-      }
-      return message
-    })
-  }
+  })
   return changed ? out : body
 }
 
@@ -338,13 +552,30 @@ export function ephemeralCacheTtl(control) {
 }
 
 function walkCacheNodes(body, mapFn) {
+  const walkBlock = (node) => {
+    if (!node || typeof node !== 'object') return node
+    let next = node
+    if (Array.isArray(node.content)) {
+      const content = node.content.map(walkBlock)
+      if (content.some((child, i) => child !== node.content[i])) {
+        next = { ...node, content }
+      }
+    }
+    return mapFn(next)
+  }
   const out = { ...body }
   if (Array.isArray(out.tools)) out.tools = out.tools.map(mapFn)
-  if (Array.isArray(out.system)) out.system = out.system.map(mapFn)
+  if (Array.isArray(out.system)) out.system = out.system.map(walkBlock)
+  if (Array.isArray(out.crag_prompt?.blocks)) {
+    const blocks = out.crag_prompt.blocks.map(walkBlock)
+    if (blocks.some((block, i) => block !== out.crag_prompt.blocks[i])) {
+      out.crag_prompt = { ...out.crag_prompt, blocks }
+    }
+  }
   if (Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) => {
       if (!Array.isArray(message?.content)) return message
-      const content = message.content.map(mapFn)
+      const content = message.content.map(walkBlock)
       return content.some((block, i) => block !== message.content[i]) ? { ...message, content } : message
     })
   }

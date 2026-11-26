@@ -636,37 +636,89 @@ for (const stream of [false, true]) {
   })
 }
 
-unixTest('CRAG cache policy rejection is returned without replay and without exposing diagnostics', async (t) => {
-  const rejection = { type: 'error', error: { type: 'api_error', message: 'Kernel rejected the request' } }
-  const facts = {
-    type: 'kin_provider_result',
-    schema_version: 2,
-    source: 'crag',
-    provider_complete: false,
-    usage_complete: false,
-    public_status: 502,
-    error: rejection.error,
-    observation: { policy_blocked: true, exception: { code: 'CRAG_CACHE_CONTROL', message: 'private observation' } },
-  }
-  const fx = await fixture(
-    (_req, res) => {
-      res.writeHead(200, { 'content-type': 'text/event-stream' })
-      res.end(resultFrame(facts) + frame(rejection))
-    },
-    { capabilities: ['native_handoff_v1', 'provider_result_v2'] },
-  )
-  t.after(() => fx.close())
-  const body = { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hello' }] }
-  const result = await streamGoWorker(options(fx, { envelope: { body, headers: {}, stream: true } }))
-  assert.equal(result.terminalState, 'rejected')
-  assert.equal(result.body.error.code, 'crag_policy_blocked')
-  assert.equal(result.body.error.details.retryable, false)
-  assert.doesNotMatch(JSON.stringify(result.body), /private observation/)
-  const policy = classifyUpstreamResult(result)
-  assert.equal(policy.action, 'stop')
-  assert.equal(policy.cooldownUntil, null)
-  assert.equal(policy.scope, 'request')
-})
+unixTest(
+  'CRAG cache policy rejection triggers one-shot cache_control repair-and-retry without exposing diagnostics',
+  async (t) => {
+    const rejection = { type: 'error', error: { type: 'api_error', message: 'Kernel rejected the request' } }
+    const facts = {
+      type: 'kin_provider_result',
+      schema_version: 2,
+      source: 'crag',
+      provider_complete: false,
+      usage_complete: false,
+      public_status: 502,
+      error: rejection.error,
+      observation: { policy_blocked: true, exception: { code: 'CRAG_CACHE_CONTROL', message: 'private observation' } },
+    }
+    const fx = await fixture(
+      (_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.end(resultFrame(facts) + frame(rejection))
+      },
+      { capabilities: ['native_handoff_v1', 'provider_result_v2'] },
+    )
+    t.after(() => fx.close())
+    const body = { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hello' }] }
+    const result = await streamGoWorker(options(fx, { envelope: { body, headers: {}, stream: true } }))
+    assert.equal(result.terminalState, 'rejected')
+    assert.equal(result.cragCacheControlBlocked, true)
+    assert.equal(result.body.error.code, 'crag_policy_blocked')
+    assert.equal(result.body.error.details.retryable, false)
+    assert.doesNotMatch(JSON.stringify(result.body), /private observation/)
+
+    // First attempt before dispatch: repair-and-retry on same account without cooldown.
+    const firstPolicy = classifyUpstreamResult(result, { repaired: false })
+    assert.equal(firstPolicy.action, 'repair-and-retry')
+    assert.equal(firstPolicy.reason, 'cache_control_repairable')
+    assert.equal(firstPolicy.retrySameAccount, true)
+    assert.equal(firstPolicy.cooldownUntil, null)
+    assert.equal(firstPolicy.scope, 'request')
+
+    // If still rejected after repair, stop cleanly without looping or cooling down the account.
+    const secondPolicy = classifyUpstreamResult(result, { repaired: true })
+    assert.equal(secondPolicy.action, 'stop')
+    assert.equal(secondPolicy.reason, 'crag_policy_blocked')
+    assert.equal(secondPolicy.cooldownUntil, null)
+    assert.equal(secondPolicy.scope, 'request')
+
+    // End-to-end FailoverRunner: first attempt rejects with CRAG_CACHE_CONTROL,
+    // second attempt strips broken caller cache_control and succeeds on the same slot.
+    const seenBodies = []
+    let selections = 0
+    const runner = new FailoverRunner({
+      scheduler: {
+        async selectAndReserve() {
+          selections++
+          return { ok: true, vmId: 'vm-01', accountId: 'acc-1', vm: { id: 'vm-01' }, release() {} }
+        },
+        markRateLimited() {
+          throw new Error('must not cool down account on CRAG_CACHE_CONTROL repair')
+        },
+      },
+    })
+    const runResult = await runner.run({
+      canonicalBody: {
+        model: 'claude-opus-5-5',
+        system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+        ],
+      },
+      model: 'claude-opus-5-5',
+      callAttempt: async ({ body: attemptBody }) => {
+        seenBodies.push(structuredClone(attemptBody))
+        if (seenBodies.length === 1) return result
+        return { ok: true, status: 200, committed: true, terminalState: 'verified', body: { id: 'msg_ok' } }
+      },
+    })
+    assert.equal(runResult.ok, true)
+    assert.equal(seenBodies.length, 2)
+    assert.equal(selections, 2)
+    assert.deepEqual(seenBodies[0].system[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+    assert.equal(seenBodies[1].system[0].cache_control, undefined)
+    assert.equal(seenBodies[1].messages[0].content[0].cache_control, undefined)
+  },
+)
 
 unixTest('#1139: opaque CRAG 429 returns once without restricting the account', async (t) => {
   const error = { type: 'rate_limit_error', message: 'Error' }

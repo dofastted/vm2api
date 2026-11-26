@@ -46,13 +46,11 @@ import {
 import {
   applyMessageBreakpoints,
   DEFAULT_CACHE_TTL,
-  enforceCacheTtlOrder,
   fillMissingCacheTtl,
   normalizeCacheTtl,
   listCacheMarkers,
   materializeAutomaticCache,
-  stripIllegalCacheControlFields,
-  validateCacheBreakpoints,
+  repairCacheBreakpoints,
 } from './cache-ttl.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 
@@ -303,7 +301,13 @@ export function prepareCliHopBody(
 ) {
   if (requestContext?.purpose === 'auto_mode_classifier') return prepareClassifierBody(canonicalBody, { stream })
   validateBetweenToolsThinking(canonicalBody)
-  if (preserveSystem) validateCacheBreakpoints(canonicalBody)
+  if (preserveSystem) {
+    canonicalBody = repairCacheBreakpoints(canonicalBody, {
+      limit: 4,
+      fallbackTtl: cacheTtl,
+      fillMissing: false,
+    })
+  }
   let body = officialMessagesBody(canonicalBody, { stream, preserveContentShape: true })
   const windowTokens = Number(autoCompactWindow)
   if (Number.isInteger(windowTokens) && windowTokens >= 100_000 && windowTokens <= 1_000_000) {
@@ -348,8 +352,8 @@ export function prepareCliHopBody(
   body = ensureOutputConfigSchema(body)
 
   if (preparedZero && !preserveSystem && !requestContext && body.cache_control != null) {
-    // Native passthrough judges the caller's markers before rewriting them.
-    validateCacheBreakpoints(body)
+    // Auto-repair non-conforming caller markers before materializing automatic cache.
+    body = repairCacheBreakpoints(body, { limit: 4, fallbackTtl: cacheTtl, fillMissing: false })
     body = materializeAutomaticCache(body)
   } else if (Object.prototype.hasOwnProperty.call(body, 'cache_control')) {
     delete body.cache_control
@@ -416,7 +420,9 @@ export function prepareCliHopBody(
     }
   }
   const prepared = applyEagerToolStreaming(body, routing)
-  return preserveSystem ? prepared : enforceCacheTtlOrder(prepared, cacheTtl)
+  return preserveSystem
+    ? prepared
+    : repairCacheBreakpoints(prepared, { limit: 4, fallbackTtl: cacheTtl, fillMissing: false })
 }
 
 export function prepareOutboundAttempt({
@@ -506,10 +512,12 @@ export function prepareOutboundAttempt({
     preserveThinkingBlocks,
     dropSampling,
   })
-  cleaned = stripIllegalCacheControlFields(cleaned)
-  const resolvedTtl = cacheTtl || DEFAULT_CACHE_TTL
-  if (!keepCallerSession) cleaned = fillMissingCacheTtl(cleaned, resolvedTtl)
-  cleaned = enforceCacheTtlOrder(cleaned, resolvedTtl)
+  cleaned = repairCacheBreakpoints(cleaned, {
+    limit: cacheControlLimit,
+    fallbackTtl: cacheTtl || DEFAULT_CACHE_TTL,
+    fillMissing: !keepCallerSession,
+    stripExtraFields: true,
+  })
   const scrubbed = scrubUpstreamClientBody(cleaned, {
     official: !unofficial,
     rewriteTools: toolNameRewrite !== false,
