@@ -103,4 +103,68 @@ describe('JEV usage display', () => {
   it('warns about storage failures instead of claiming complete totals', () => {
     expect(markup(2)).toContain('统计可能不完整')
   })
+  it('renders paused and cooling states with remaining seconds', () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+    })
+    client.setQueryData(['panel', 'jev-usage'], {
+      pages: [
+        {
+          started_at: '2026-10-25T00:00:00.000Z',
+          day: '2026-10-25',
+          keys: [
+            {
+              number: 1,
+              masked_key: 'auth********1111',
+              key_fingerprint: '111111111111',
+              retired: true,
+              paused_reason: 'auth',
+              seconds_left: null,
+              requests: 1,
+              successful: 1,
+              estimated_cost_nano_usd: 0,
+              unknown_cost_requests: 0,
+              status: 'paused',
+              last_request_at: '2026-10-25T01:00:00.000Z',
+              last_http_status: 200,
+            },
+            {
+              number: 2,
+              masked_key: 'cool********2222',
+              key_fingerprint: '222222222222',
+              retired: true,
+              paused_reason: 'overloaded',
+              seconds_left: 24,
+              requests: 1,
+              successful: 1,
+              estimated_cost_nano_usd: 0,
+              unknown_cost_requests: 0,
+              status: 'cooling',
+              last_request_at: '2026-10-25T01:00:00.000Z',
+              last_http_status: 529,
+            },
+          ],
+          total: counts,
+          today: counts,
+          storage_errors_since_start: 0,
+          rows: [],
+          has_more: false,
+          next_cursor: null,
+        },
+      ],
+      pageParams: [null],
+    })
+    try {
+      const html = renderToStaticMarkup(
+        <QueryClientProvider client={client}>
+          <JevUsagePanel defaultOpen />
+        </QueryClientProvider>
+      )
+      expect(html).toContain('已暂停（需人工）')
+      expect(html).toContain('冷却中 · 剩余 24 秒')
+      expect(html).not.toContain('正常请求')
+    } finally {
+      client.clear()
+    }
+  })
 })

@@ -131,6 +131,7 @@ import { snapshotCacheMetrics } from './lib/cache/index.mjs'
 import { armWriteBehind } from './lib/db/write-behind.mjs'
 import { JevUsageRepo } from './lib/db/repos/jev-usage-repo.mjs'
 import { installJevUsageRecorder } from './lib/protocol/jev-usage.mjs'
+import { jevHealthSnapshot, readJevConfig } from './lib/protocol/jev-intercept.mjs'
 import { runLegacyImport } from './lib/db/legacy-import.mjs'
 import { initVmDbSync, stopVmWatch } from './lib/vm/vm-db-sync.mjs'
 import { BackupService } from './lib/admin/backup-service.mjs'
@@ -865,6 +866,7 @@ catalogMonitor = createCatalogMonitor({
 })
 notifyMonitor = createNotifyMonitor({
   vmSnapshot: () => snapshotVmConnectivity(listVms(cfg.paths.project)),
+  jevSnapshot: () => jevHealthSnapshot(readJevConfig((k, d) => new SettingsRepo().get(k, d))),
   config: routingConfig.notify,
   baseUrl: cfg.base_url,
   snapshot: () =>

@@ -30,6 +30,9 @@ const DEFAULT_EVENTS: NotifyEvents = {
   account_down: false,
   account_up: false,
   vm_down: true,
+  jev_paused: true,
+  jev_resumed: true,
+  jev_http_400_burst: true,
 }
 
 const EVENT_FIELDS: {
@@ -50,6 +53,21 @@ const EVENT_FIELDS: {
     desc: '节点失联、内核故障或运行中的 VM 停止时，通过已启用的通知通道发送',
   },
   { key: 'account_up', label: '账号上线', desc: '单个账号恢复可用' },
+  {
+    key: 'jev_paused',
+    label: '审核密钥暂停',
+    desc: '审核密钥因 401 永久暂停或 429/529 进入冷却时发送',
+  },
+  {
+    key: 'jev_resumed',
+    label: '审核密钥恢复',
+    desc: '暂停或冷却中的审核密钥恢复可用时发送',
+  },
+  {
+    key: 'jev_http_400_burst',
+    label: '审核上游 400 突增',
+    desc: '10 分钟内审核上游累计返回 20 次 HTTP 400 时发送',
+  },
 ]
 
 function parseRecipients(raw: string): string[] {
