@@ -1917,6 +1917,10 @@ export function createGeminiScheduler({
               continue
             }
 
+            if (!emittedOutput && failureCode === 'gemini_session_conflict' && effectiveStickyKey) {
+              stickyBindings.delete(effectiveStickyKey)
+            }
+
             const canSessionConflictRetry =
               !emittedOutput &&
               failureCode === 'gemini_session_conflict' &&
@@ -1925,7 +1929,6 @@ export function createGeminiScheduler({
 
             if (canSessionConflictRetry) {
               sessionConflictRetried = true
-              if (effectiveStickyKey) stickyBindings.delete(effectiveStickyKey)
               preferredRetryAccountId = selected.accountId
               try {
                 attemptsRepoRef?.complete?.(requestId, attempts, {
