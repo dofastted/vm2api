@@ -110,10 +110,23 @@ function apiErrorFrom(payload: unknown, status: number, fallback: string) {
   return new ApiError(message, normalizedStatus, metadata)
 }
 
+/**
+ * 没有 message 的失败响应要带上状态码，否则用户反馈里只剩一句没有信息量的
+ * 「请求失败」：HTTP/2 下 `res.statusText` 恒为空串，网关返回 HTML 错误页时
+ * `res.json()` 又退化成 `{}`，两者叠加就把唯一的线索吞掉了。带上状态码才能
+ * 一眼分开网关拦截（403/502）和后端业务错误。
+ */
+function transportFailure(status: number, statusText = ''): string {
+  const text = String(statusText || '').trim()
+  if (!status) return '请求失败'
+  return text ? `请求失败 (${status} ${text})` : `请求失败 (${status})`
+}
+
 function unwrapEnvelope(payload: unknown, status: number): unknown {
   const body = asRecord(payload)
   if (!body) return payload
-  if (body.ok === false) throw apiErrorFrom(body, status, '请求失败')
+  if (body.ok === false)
+    throw apiErrorFrom(body, status, transportFailure(status))
   return body.data !== undefined ? body.data : payload
 }
 
@@ -146,7 +159,11 @@ export async function api<T = unknown>(
     throw apiErrorFrom(json, res.status, '登录已过期')
   }
   if (!res.ok) {
-    throw apiErrorFrom(json, res.status, res.statusText || '请求失败')
+    throw apiErrorFrom(
+      json,
+      res.status,
+      transportFailure(res.status, res.statusText)
+    )
   }
   return unwrapEnvelope(json, res.status) as T
 }
@@ -160,7 +177,11 @@ export async function cragDeviceApi<T>(path: string, opts: RequestInit = {}) {
   })
   const json: unknown = await res.json().catch(() => ({}))
   if (!res.ok)
-    throw apiErrorFrom(json, res.status, res.statusText || '请求失败')
+    throw apiErrorFrom(
+      json,
+      res.status,
+      transportFailure(res.status, res.statusText)
+    )
   return unwrapEnvelope(json, res.status) as T
 }
 
