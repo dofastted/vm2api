@@ -137,6 +137,7 @@ export function resolveGeminiReasoningEffort({
 }
 
 const SESSION_ID_MAX = 200
+export const THIRD_PARTY_CLIENT_SESSION_ID = '第三方'
 
 /** Caller session ids come from client headers/bodies; cap them before they hit an index. */
 export function sessionIdForLog(value) {

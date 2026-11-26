@@ -12,7 +12,7 @@
 import { getDb } from '../database.mjs'
 import { DEFAULT_MUTED_ERROR_CLASSES, enrichLogRow, excludeErrorClassSql } from '../../admin/error-class.mjs'
 import { reportTimezone, zonedDayStartMs } from '../../core/timezone.mjs'
-import { modelMismatch } from '../../protocol/log-fields.mjs'
+import { THIRD_PARTY_CLIENT_SESSION_ID, modelMismatch } from '../../protocol/log-fields.mjs'
 import {
   ERROR_PRED,
   PROMPT_TOKENS_SQL,
@@ -31,8 +31,8 @@ const SCAN_CAP = 2000
 const SUMMARY_SCAN_CAP = 5000
 /** Recent rows mined for distinct filter values / empty-prefix session suggestions. */
 const RECENT_SCAN = 5000
-/** One conversation = the caller's session id; rows without one fall back to the outbound id. */
-const CONVERSATION_KEY_SQL = "COALESCE(NULLIF(session_id, ''), outbound_session_id)"
+/** One conversation = the caller's session id; rows without one (or tagged as third-party) fall back to the outbound id. */
+const CONVERSATION_KEY_SQL = `COALESCE(NULLIF(NULLIF(session_id, ''), '${THIRD_PARTY_CLIENT_SESSION_ID}'), outbound_session_id)`
 const OPTION_LIMIT = 200
 const EXPORT_LIMIT_DEFAULT = 2000
 const EXPORT_LIMIT_MAX = 5000
