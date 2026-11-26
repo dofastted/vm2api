@@ -1179,8 +1179,13 @@ export function createGeminiPanelHandler({
           ...(method === 'api_key' ? { auth_method: method, api_key: apiKey } : {}),
           ...(normalizedImport != null && {
             oauth_account: {
-              access_token: normalizedImport.access_token,
-              expiry_timestamp: normalizedImport.expiry_timestamp,
+              ...(normalizedImport.refresh_token ? { refresh_token: normalizedImport.refresh_token } : {}),
+              ...(normalizedImport.access_token ? { access_token: normalizedImport.access_token } : {}),
+              ...(normalizedImport.expiry_timestamp != null
+                ? { expiry_timestamp: normalizedImport.expiry_timestamp }
+                : {}),
+              ...(normalizedImport.auth_method ? { auth_method: normalizedImport.auth_method } : {}),
+              ...(normalizedImport.wif_provider ? { wif_provider: normalizedImport.wif_provider } : {}),
             },
           }),
         })

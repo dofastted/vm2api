@@ -672,8 +672,8 @@ test('OAuth account import redacts credentials and preserves the authorization b
   assert.equal(accepted.body.data.runtime_ready, false)
   assert.doesNotMatch(JSON.stringify(accepted.body), /fixture-access-never-returned/)
 
-  // CPA and sub2api OAuth formats normalize to minimal `{ access_token, expiry_timestamp }`
-  // before reaching the host and never forward refresh tokens.
+  // CPA, sub2api, and bare refresh_token formats normalize to minimal whitelisted OAuth fields
+  // before reaching the host, and responses never leak tokens back to clients.
   const forwarded = []
   const capture = setup((operation, payload) => {
     forwarded.push({ operation, payload })
@@ -681,10 +681,24 @@ test('OAuth account import redacts credentials and preserves the authorization b
       ...record,
       auth_state: 'authorized',
       auth_method: 'oauth',
-      oauth_imported: true,
-      account: { state: 'ok', email: 'converted@example.test' },
+      account: {
+        state: 'ok',
+        email: 'converted@example.test',
+        refresh_token: payload.oauth_account?.refresh_token,
+      },
     }
   })
+
+  const bareRtResp = await capture('POST', endpoint, {
+    name: 'rt-only',
+    proxy_id: record.proxy_id,
+    oauth_account: [{ email: 'rt@example.test', refresh_token: '1//06FixtureRtOnly_abc123' }],
+  })
+  assert.equal(bareRtResp.status, 200)
+  assert.deepEqual(forwarded.at(-1).payload.oauth_account, {
+    refresh_token: '1//06FixtureRtOnly_abc123',
+  })
+  assert.doesNotMatch(JSON.stringify(bareRtResp.body), /1\/\/06FixtureRtOnly_abc123/)
 
   const cpaResp = await capture('POST', endpoint, {
     name: 'cpa-ag',
@@ -692,12 +706,13 @@ test('OAuth account import redacts credentials and preserves the authorization b
     oauth_account: {
       type: 'antigravity',
       access_token: 'ya29.cpa-import-token',
-      refresh_token: '1//must-not-forward-cpa',
+      refresh_token: '1//06cpa-import-refresh',
       expired: '2030-01-01T00:00:00Z',
     },
   })
   assert.equal(cpaResp.status, 200)
   assert.deepEqual(forwarded.at(-1).payload.oauth_account, {
+    refresh_token: '1//06cpa-import-refresh',
     access_token: 'ya29.cpa-import-token',
     expiry_timestamp: 1893456000,
   })
@@ -715,7 +730,6 @@ test('OAuth account import redacts credentials and preserves the authorization b
           type: 'oauth',
           credentials: {
             access_token: 'ya29.sub2api-import-token',
-            refresh_token: '1//must-not-forward-sub2api',
             expires_at: '1893456000',
           },
         },
