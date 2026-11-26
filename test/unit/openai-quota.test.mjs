@@ -297,6 +297,11 @@ test('persisted GPT quota survives summarizeVm and exposes plan_type', async () 
   const { getVm, summarizeVm } = await import('../../src/lib/vm/vm-registry.mjs')
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-openai-summary-'))
   writeGptSlot(root)
+  // Future-ish resets relative to the real clock keep this testing
+  // summarization; hardcoded past resets are elapsed readings that the view
+  // correctly drops.
+  const reset5h = Math.floor(Date.now() / 1000) + 600
+  const reset7d = Math.floor(Date.now() / 1000) + 6 * 86_400
   const result = await queryOpenaiQuota({
     projectRoot: root,
     vmId: 'vm-codex-01',
@@ -309,8 +314,8 @@ test('persisted GPT quota survives summarizeVm and exposes plan_type', async () 
           rate_limit: {
             allowed: false,
             limit_reached: true,
-            primary_window: { used_percent: 100, limit_window_seconds: 18000, reset_at: 1_790_449_975 },
-            secondary_window: { used_percent: 16, limit_window_seconds: 604800, reset_at: 1_791_012_272 },
+            primary_window: { used_percent: 100, limit_window_seconds: 18000, reset_at: reset5h },
+            secondary_window: { used_percent: 16, limit_window_seconds: 604800, reset_at: reset7d },
           },
         }),
       }
@@ -321,8 +326,8 @@ test('persisted GPT quota survives summarizeVm and exposes plan_type', async () 
   const s = summarizeVm(getVm(root, 'vm-codex-01'), root)
   assert.equal(s.utilization_5h, 1)
   assert.equal(s.utilization_7d, 0.16)
-  assert.equal(s.reset_5h, new Date(1_790_449_975_000).toISOString())
-  assert.equal(s.reset_7d, new Date(1_791_012_272_000).toISOString())
+  assert.equal(s.reset_5h, new Date(reset5h * 1000).toISOString())
+  assert.equal(s.reset_7d, new Date(reset7d * 1000).toISOString())
   assert.equal(s.status_5h, 'limited')
   assert.deepEqual(
     s.codex_usage.windows.map((w) => [w.id, w.used_percent]),
