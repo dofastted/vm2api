@@ -347,14 +347,16 @@ export function isRetryableCodexTransport(result) {
 
 /**
  * Grant-death 签名：OpenAI 吊销回 `error.code=token_revoked` /
- * "Encountered invalidated oauth token"。与 claude 池 GRANT_DEAD 词表对齐。
+ * "Encountered invalidated oauth token"。与 claude 池 GRANT_DEAD 词表对齐，
+ * 但不含 invalid_grant——那是轮换竞态的常见假阳性（旧 RT 重放），
+ * refreshCodexAccessToken 的严格分类同样把它留给 refresh_rejected。
  */
 export function isCodexGrantDead(result) {
   if (!result || result.ok === true) return false
   const status = Number(result.status) || 0
   if (status !== 401 && status !== 403) return false
   const hay = `${result.body?.error?.code || ''} ${result.body?.error?.message || ''} ${result.error_code || ''}`
-  return /token_revoked|invalidated oauth token|token has been revoked|oauth_revoked|invalid_grant/i.test(hay)
+  return /token_revoked|invalidated oauth token|token has been revoked|oauth_revoked/i.test(hay)
 }
 
 /**
@@ -1442,6 +1444,12 @@ function searchCredentials(projectRoot, vm) {
  * refresh token on its own, so first adopt a token it wrote meanwhile; otherwise refresh
  * once per slot, shared by concurrent callers.
  */
+/**
+ * Refresh the search/images access token once per slot, shared by concurrent callers.
+ * Resolves the new access token, '' when refresh is impossible/failed, or
+ * `grant-dead:<code>` when the token endpoint itself answered revocation
+ * (`oauth_revoked`) — the caller parks the slot instead of silently failing.
+ */
 function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh }) {
   const now = searchCredentials(projectRoot, vm)
   if (now.access && now.access !== usedAccess) return now.access
@@ -1450,6 +1458,8 @@ function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl,
   if (!pending) {
     pending = (async () => {
       const tok = await refresh({ refreshToken: now.refresh, proxyUrl, fetchImpl })
+      // 吊销定论穿透共享缓存：并发等同一个 pending 的调用方都能看到 grant death。
+      if (!tok?.ok && tok?.error === 'oauth_revoked') return `grant-dead:${tok.error}`
       if (!tok?.ok || !tok.access_token) return ''
       upsertCodexAccount(projectRoot, vm.id, {
         access_token: tok.access_token,
@@ -1517,6 +1527,15 @@ async function postCodexJson({
   let out = creds.access ? await send(creds.access) : { status: 401 }
   if (out.status === 401 || out.status === 403) {
     const access = await refreshSearchAccess(projectRoot, vm, creds.access, { proxyUrl, fetchImpl, refresh })
+    // Token 端点自己答了吊销：落盘摘池（合成 401 无响应体，词表判定走不到，
+    // 必须在这里短路），死号不再被 search/images 每轮换槽烧刷新 401。
+    if (typeof access === 'string' && access.startsWith('grant-dead:')) {
+      try {
+        persistCodexCredentialState(projectRoot, vm.id, { error: 'oauth_revoked' })
+        markCodexGrantDead(projectRoot, vm.id, { description: 'token endpoint answered revocation', status: 401 })
+      } catch {}
+      return { status: 401, error: 'oauth_revoked', grantDead: true, accountId: creds.accountId }
+    }
     if (access) out = await send(access)
   }
   return out
@@ -1535,7 +1554,7 @@ function isSearchFailover(out) {
  * search/images JSON 端点的 grant-death 写盘（与主请求路径同语义）：
  * 401 响应体命中吊销文案 → 落盘摘池，防止死号继续换槽烧上游 401。
  */
-function parkCodexGrantDeadIfHit(projectRoot, vmId, last) {
+export function parkCodexGrantDeadIfHit(projectRoot, vmId, last) {
   if (Number(last?.status) !== 401) return
   const parsed = parseJson(last.text)
   if (!isCodexGrantDead({ ok: false, status: last.status, body: parsed || null })) return

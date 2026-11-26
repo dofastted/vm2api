@@ -12,6 +12,7 @@ import {
   hasSpendableCodexCredits,
 } from '../protocol/codex-usage.mjs'
 import { openaiClaimsFromIdToken, openaiIdentityFromOauthTokens } from '../oauth/openai-jwt.mjs'
+import { applyUnschedulable } from '../pool/schedule-state.mjs'
 
 export { isCodexVm }
 
@@ -355,12 +356,13 @@ export function persistCodexCredentialState(projectRoot, vmId, { error = null, a
 }
 
 /**
- * Codex grant 死亡（oauth_revoked / invalid_grant）：对齐 claude 池 markVmRefreshError 的落点，
- * 写四态 unschedulable（仅操作员导入可清）并停调度。上游吊销文案常为
- * `token_revoked` / `Encountered invalidated oauth token`，靠 5 分钟内存 hold 挡不住，
- * 必须落盘摘池，面板才能显示「不可调度 · 凭证吊销」。
+ * Codex grant 死亡（token_revoked / invalidated oauth token）：对齐 claude 池
+ * markVmRefreshError 的落点，复用 schedule-state 权威 mutator 写四态
+ * unschedulable（仅操作员导入可清）并停调度。上游吊销文案靠 5 分钟内存 hold
+ * 挡不住，必须落盘摘池，面板才能显示「不可调度 · 凭证吊销」。
+ * 已有其他 unschedulable 诊断（如 organization_disabled）不覆盖，保留原判词。
  */
-export function markCodexGrantDead(projectRoot, vmId, detail = null) {
+export function markCodexGrantDead(projectRoot, vmId, detail = null, { tokenVersion = null } = {}) {
   if (!projectRoot || !vmId) return null
   const file = path.join(projectRoot, 'vms', `${vmId}.json`)
   let vm
@@ -370,18 +372,14 @@ export function markCodexGrantDead(projectRoot, vmId, detail = null) {
     return null
   }
   if (!vm || typeof vm !== 'object') return null
-  if (vm.unschedulable?.reason === 'oauth_revoked') return vm
-  const message = String(detail?.description || detail?.error || detail || '').slice(0, 300) || null
-  vm.unschedulable = {
-    reason: 'oauth_revoked',
-    detail: { message, upstream: detail?.status || null },
-    at: new Date().toISOString(),
+  if (vm.unschedulable?.reason) return vm
+  // 磁盘票在本次 401 之后被操作员换新（重导入/revive）：迟到 park 不得打死新票。
+  if (tokenVersion != null && vm.codex?._token_version != null && Number(vm.codex._token_version) > tokenVersion) {
+    return vm
   }
-  vm.schedule_updated_at = new Date().toISOString()
-  vm.updated_at = vm.schedule_updated_at
-  vm.schedulable = false
-  vm.schedule_manual = vm.schedule_off === true
-  vm.schedule_disabled_reason = 'oauth_revoked'
+  const message = String(detail?.description || detail?.error || detail || '').slice(0, 300) || null
+  // 复用四态权威 mutator：字段推导（schedulable/schedule_manual/…）与 claude 池同源。
+  applyUnschedulable(vm, 'oauth_revoked', { message, upstream: detail?.status || null })
   if (String(vm.status || '').toLowerCase() === 'running') vm.status = 'paused'
   atomicWriteJson(file, vm, { mode: 0o600 })
   return vm
