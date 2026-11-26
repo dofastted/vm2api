@@ -25,6 +25,7 @@ import {
 import { CODEX_OAUTH_ORIGINATOR, makeProxyFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 import { openaiIdentityFromJwt } from './openai-jwt.mjs'
 import { expiresAtToMs } from './oauth-credentials.mjs'
+import { withCredentialRefreshLock } from '../transport/go-worker-client.mjs'
 import { codexQuotaWindowReason, isCodexSlotParked } from '../pool/codex-slot-pool.mjs'
 import { openAIAccountHold } from '../pool/openai-account-runtime.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
@@ -306,12 +307,47 @@ async function quotaFetch(url, { method = 'GET', headers, body, proxyUrl, fetchI
 
 async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
   if (!slot.refresh) return slot
-  const tok = await refreshCodexAccessToken({
-    refreshToken: slot.refresh,
-    proxyUrl: slot.proxyUrl,
-    fetchImpl,
-    timeoutMs: OPENAI_QUOTA_TIMEOUT_MS,
+  // 共锁（key=codex:<vmId>）且锁内重读凭证：等待期间并发方（面板刷新/search）
+  // 轮换出的新票直接采用；本方成功后也用锁内快照落盘，不用锁外捕获的
+  // slot.first 旧元数据覆盖别人的新票。
+  const tok = await withCredentialRefreshLock(`codex:${vmId}`, async () => {
+    const live = readCodexAccounts(projectRoot, vmId)[0] || {}
+    const liveRefresh = String(live.refresh_token || slot.refresh || '').trim()
+    if (!liveRefresh) return { ok: false, error: 'missing_refresh_token' }
+    const result = await refreshCodexAccessToken({
+      refreshToken: liveRefresh,
+      proxyUrl: slot.proxyUrl,
+      fetchImpl,
+      timeoutMs: OPENAI_QUOTA_TIMEOUT_MS,
+    })
+    if (!result?.ok) return result
+    const latest = readCodexAccounts(projectRoot, vmId)[0] || {}
+    if (latest.refresh_token && latest.refresh_token !== liveRefresh) {
+      // 并发方已轮换：内存态采用其新票，本方轮换结果作废（不再写盘）。
+      return { ok: true, rotatedBy: 'concurrent', access_token: latest.access_token, refresh_token: latest.refresh_token }
+    }
+    const expiresAt = result.expires_at || latest.expires_at || slot.first.expires_at
+    upsertCodexAccount(projectRoot, vmId, {
+      access_token: result.access_token,
+      refresh_token: result.refresh_token,
+      id_token: result.id_token || latest.id_token,
+      expires_at: expiresAt,
+    })
+    // 凭证文件是过期时间真值；vm.json 的 codex.expires_at 是导入时快照，
+    // 不镜像会让面板读到「过期 14 天」的假死票。best-effort。
+    try {
+      if (expiresAt) {
+        patchVmRecord(projectRoot, vmId, (vm) => {
+          vm.codex = vm.codex && typeof vm.codex === 'object' ? { ...vm.codex } : {}
+          vm.codex.expires_at = expiresAt
+        })
+      }
+    } catch {}
+    return result
   })
+  if (tok.ok && tok.rotatedBy === 'concurrent') {
+    return { ...slot, access: tok.access_token, refresh: tok.refresh_token }
+  }
   if (!tok.ok) {
     // Surface dead credentials (refresh_rejected / refresh_empty / missing_refresh_token)
     // on the vm ticket instead of failing silently in memory. Transient errors
@@ -332,24 +368,6 @@ async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
     }
     return { ...slot, rotateError: tok.error || 'refresh_failed' }
   }
-  const expiresAt = tok.expires_at || slot.first.expires_at
-  upsertCodexAccount(projectRoot, vmId, {
-    access_token: tok.access_token,
-    refresh_token: tok.refresh_token,
-    id_token: tok.id_token || slot.first.id_token,
-    expires_at: expiresAt,
-  })
-  // 凭证文件是过期时间真值；vm.json 的 codex.expires_at 是导入时快照，
-  // 不镜像会导致面板/needsScheduledRefresh 读到「过期 14 天」的假死票。
-  // best-effort：镜像失败不影响内存态轮换结果。
-  try {
-    if (expiresAt) {
-      patchVmRecord(projectRoot, vmId, (vm) => {
-        vm.codex = vm.codex && typeof vm.codex === 'object' ? { ...vm.codex } : {}
-        vm.codex.expires_at = expiresAt
-      })
-    }
-  } catch {}
   return { ...slot, access: tok.access_token, refresh: tok.refresh_token || slot.refresh }
 }
 

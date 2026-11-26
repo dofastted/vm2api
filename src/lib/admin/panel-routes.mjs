@@ -359,7 +359,11 @@ import {
 import { createCragSubscriptionHandler, cragSubscriptionRoute } from './crag-subscription-routes.mjs'
 import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
-import { countTokensViaWorker, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
+import {
+  countTokensViaWorker,
+  syncClaudeClientCredentials,
+  withCredentialRefreshLock,
+} from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
 import { countTokensEnabled } from '../protocol/user-count-tokens.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
@@ -6935,10 +6939,36 @@ export function createPanelHandler(ctx) {
               error: { code: 'credential_mode_unsupported', message: 'GPT 槽没有 refresh_token，请重新导入 OAuth' },
             })
           }
-          const tok = await refreshCodexAccessToken({
-            refreshToken,
-            proxyUrl: hostProxyUrlForVm(vm),
+          // 共锁（key=codex:<vmId>）且锁内重读凭证：等待期间并发方轮换出的新票
+          // 直接采用，不用锁外捕获的旧 RT 重放、也不用旧票元数据落盘。
+          const tok = await withCredentialRefreshLock(`codex:${id}`, async () => {
+            const current = readCodexAccounts(cfg.paths.project, id)[0] || {}
+            const liveRefreshToken = String(current.refresh_token || '').trim()
+            if (!liveRefreshToken) return { ok: false, error: 'credential_mode_unsupported' }
+            const result = await refreshCodexAccessToken({
+              refreshToken: liveRefreshToken,
+              proxyUrl: hostProxyUrlForVm(vm),
+            })
+            if (!result?.ok) return result
+            const latest = readCodexAccounts(cfg.paths.project, id)[0] || {}
+            if (latest.refresh_token && latest.refresh_token !== liveRefreshToken) {
+              // 并发方已轮换：直接采用其新票，本方轮换结果作废。
+              return { ok: true, adopted: true }
+            }
+            upsertCodexAccount(cfg.paths.project, id, {
+              access_token: result.access_token,
+              refresh_token: result.refresh_token,
+              id_token: result.id_token || latest.id_token,
+              expires_at: result.expires_at || latest.expires_at,
+            })
+            return result
           })
+          if (tok?.error === 'credential_mode_unsupported') {
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'credential_mode_unsupported', message: 'GPT 槽没有 refresh_token，请重新导入 OAuth' },
+            })
+          }
           if (!tok.ok) {
             // 操作员手动刷新=最强的死活证据源：吊销结论立即落盘摘池（面板显示
             // 「不可调度 · 凭证吊销」），其余失败维持现状只回 502。
@@ -6960,13 +6990,8 @@ export function createPanelHandler(ctx) {
               error: { code: tok.error || 'refresh_failed', message },
             })
           }
-          upsertCodexAccount(cfg.paths.project, id, {
-            access_token: tok.access_token,
-            refresh_token: tok.refresh_token,
-            id_token: tok.id_token || first.id_token,
-            expires_at: tok.expires_at || first.expires_at,
-          })
-          // 刷新成功=活票：清掉 grant-death 内存 hold 与陈旧吊销标。
+          // upsert 已在锁内完成（并发轮换时采用对方新票）；成功=活票：
+          // 清掉 grant-death 内存 hold 与陈旧吊销标。
           clearOpenAIAccountHold(id)
           try {
             persistCodexCredentialState(cfg.paths.project, id, { error: null })
