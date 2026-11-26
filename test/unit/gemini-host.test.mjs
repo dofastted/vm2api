@@ -435,15 +435,36 @@ test('only explicit platform SOCKS5 environments are created and credentials sta
   }
 })
 
-test('only a probe may use its currently bound enabled proxy with failed health', async () => {
-  for (const status of ['fail', 'dead']) {
+test('Gemini routes mirror pool policy: fail stays schedulable, dead is unavailable except probe', async () => {
+  {
     const operations = []
     const run = setup(
       (operation, payload) => {
         operations.push([operation, payload])
         return operation === 'get' ? record : { ok: false, latency_ms: 14, code: 'private', detail: proxyUrl }
       },
-      { ...bound, status },
+      { ...bound, status: 'fail' },
+    )
+    const probe = await run('POST', `${environmentPath}/proxy/probe`, { proxy_id: 'untrusted', proxy_url: 'untrusted' })
+    assert.deepEqual(probe, {
+      status: 200,
+      body: { ok: true, data: { ok: false, latency_ms: 14, code: 'gemini_proxy_probe_failed' } },
+    })
+    const allowed = await run('POST', `${environmentPath}/test-chat`, { model, prompt: 'ping' })
+    assert.notEqual(allowed.status, 409)
+    assert.deepEqual(
+      operations.map(([operation]) => operation),
+      ['get', 'proxy-probe', 'get', 'test-chat'],
+    )
+  }
+  {
+    const operations = []
+    const run = setup(
+      (operation, payload) => {
+        operations.push([operation, payload])
+        return operation === 'get' ? record : { ok: false, latency_ms: 14, code: 'private', detail: proxyUrl }
+      },
+      { ...bound, status: 'dead' },
     )
     const probe = await run('POST', `${environmentPath}/proxy/probe`, { proxy_id: 'untrusted', proxy_url: 'untrusted' })
     assert.deepEqual(probe, {

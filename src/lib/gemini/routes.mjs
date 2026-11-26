@@ -803,7 +803,10 @@ function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, ownerUserId = nu
   const ownerAllowed = targetOwner ? !pOwner || pOwner === targetOwner : !pOwner
   if (
     !proxy?.enabled ||
-    (!allowUnhealthy && (proxy.status === 'dead' || proxy.status === 'fail')) ||
+    // Pool policy keeps enabled rows on `fail` until consecutive_failures reaches
+    // max_failures; Gemini scheduling should mirror that, not treat one timeout
+    // as unavailable while the row is still admitted for inference.
+    (!allowUnhealthy && proxy.status === 'dead') ||
     !ownerAllowed ||
     proxy.blocked_reason
   ) {
