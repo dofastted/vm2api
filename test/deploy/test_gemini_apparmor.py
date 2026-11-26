@@ -142,6 +142,69 @@ class InstallerGeminiAppArmorTests(unittest.TestCase):
         )
         self.assertNotIn("/usr/bin/bwrap", self.profile.read_text(encoding="utf-8"))
 
+    def test_restricted_ubuntu_26_installs_managed_bwrap_entry(self):
+        (self.root / "etc/apparmor.d/bwrap-userns-restrict").write_text(
+            "profile bwrap /usr/bin/bwrap {}\n", encoding="utf-8"
+        )
+        profiles = self.root / "sys/kernel/security/apparmor/profiles"
+        profiles.parent.mkdir(parents=True, exist_ok=True)
+        profiles.write_text("bwrap (enforce)\n", encoding="utf-8")
+        fake_bin = self.root / "exe-bin"
+        fake_bin.mkdir(exist_ok=True)
+        bwrap = fake_bin / "bwrap"
+        bwrap.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        bwrap.chmod(0o755)
+        install_path = fake_bin / "install"
+        real_install = subprocess.run(
+            ["which", "install"], capture_output=True, text=True
+        ).stdout.strip()
+        install_path.symlink_to(real_install)
+        env = dict(
+            os.environ,
+            PATH=f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            TEST_ROOT=str(self.root),
+            TEST_UNIT=str(self.unit),
+            FAIL_PARSER="",
+            APPARMOR_LOAD_STATE="loaded",
+            UNIT_APPARMOR_PROFILE="",
+        )
+        parser_path = self.root / "fake-bin" / "apparmor_parser"
+        self.root.joinpath("fake-bin").mkdir(exist_ok=True)
+        parser_path = self.root / "fake-bin" / "apparmor_parser"
+        parser_path.write_text(
+            "#!/usr/bin/env bash\n"
+            'printf "%s %s\\n" "$1" "$2" >> "$TEST_ROOT/parser.calls"\n'
+            'exit 0\n',
+            encoding="utf-8",
+        )
+        parser_path.chmod(0o755)
+        systemctl_path = self.root / "fake-bin" / "systemctl"
+        systemctl_path.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$*" = "show --property=LoadState --value apparmor.service" ]; then\n'
+            '  printf "loaded\\n"\n'
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        systemctl_path.chmod(0o755)
+        env["PATH"] = f"{fake_bin}:{self.root / 'fake-bin'}:{os.environ.get('PATH', '')}"
+        result = subprocess.run(
+            ["/usr/bin/bash", "-c", DEFINITIONS + '\nprepare_gemini_apparmor "$TEST_ROOT" "$TEST_UNIT"'],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        content = self.profile.read_text(encoding="utf-8")
+        self.assertIn("  /usr/local/lib/vm2api-gemini/exec/bwrap ix,", content)
+        entry = self.root / "usr/local/lib/vm2api-gemini/exec/bwrap"
+        self.assertTrue(entry.is_file())
+        self.assertEqual(entry.read_bytes(), bwrap.read_bytes())
+        self.assertNotIn("/usr/bin/bwrap", content)
+
     def test_accepts_enabled_1_and_yes_values(self):
         for val in ("1\n", "yes\n"):
             with self.subTest(enabled=val.strip()):
@@ -592,6 +655,19 @@ class MaintenanceAppArmorAndSandboxTests(unittest.TestCase):
             # Both profile loaded AND unit attached -> pass
             self.service_info["AppArmorProfile"] = "vm2api-gemini"
             self.assertEqual(self.m.assess_sandbox(self.service_info), ("pass", None))
+
+            # Ubuntu 26 bwrap-userns-restrict requires managed entry + profile rule
+            (self.host_root / "etc/apparmor.d/bwrap-userns-restrict").write_text(
+                "profile bwrap /usr/bin/bwrap {}\n", encoding="utf-8"
+            )
+            (self.host_root / "sys/kernel/security/apparmor/profiles").write_text(
+                "default (enforce)\nvm2api-gemini (unconfined)\nbwrap (enforce)\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                self.m.assess_sandbox(self.service_info),
+                ("fail", "gemini_sandbox_apparmor_restricted"),
+            )
 
             # Unrestricted host -> pass without requiring profile
             (self.host_root / "proc/sys/kernel/apparmor_restrict_unprivileged_userns").write_text(

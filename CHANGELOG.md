@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **修复 Ubuntu 26.04 `bwrap-userns-restrict` 导致 CRAGGemini 原生 exec 被拒绝（#1895）**：
+  - 新增 `scripts/gemini_host_apparmor.py`：在检测到发行版 `bwrap-userns-restrict` 且内核已加载 `bwrap` profile 时，将系统 `bwrap` 同步至受管入口 `/usr/local/lib/vm2api-gemini/exec/bwrap`，并在 `vm2api-gemini` profile 中授予 `ix`（不放宽 `/usr/bin/bwrap` 全局策略）；`scripts/gemini-host.py` 全部沙箱调用改经 `resolve_bwrap_argv0()` 解析该入口（支持 `VM2API_GEMINI_BWRAP` 覆盖）。
+  - `deploy/install.sh` 与 `scripts/gemini-maintenance.py` 在 `prepare_gemini_apparmor` / `prepare_apparmor` 路径自动安装受管入口并生成扩展 profile；维护静态检查与宿主沙箱探针在受管入口或 profile 规则缺失时报告 `gemini_sandbox_apparmor_restricted`。
+  - 回归测试：`test/unit/test_gemini_host_apparmor.py`、`test/deploy/test_gemini_apparmor.py`、`test/unit/gemini-sandbox-apparmor.py`。
+
 ## 1.4.230 — 2026-11-26 · 内核不再为带 type 的工具合成 `input_schema`（advisor 全链路放行）、新增 advisor 处理说明
 
 - **`kin-kernel` 新二进制：带显式非 `custom` `type` 的工具不再被补 `input_schema`（payload pin 变更）**：

@@ -33,6 +33,17 @@ import time
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+from gemini_host_apparmor import (
+    active_host_root,
+    managed_bwrap_entry_configured,
+    managed_bwrap_required,
+    resolve_bwrap_argv0,
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 MAX_NETNS_SLOTS = 8
 MAX_ENVIRONMENTS = 256
@@ -735,6 +746,13 @@ def _apparmor_sandbox_evidence(stderr_bytes=b"", *, host_root=Path("/")):
     return lacks_profile or stderr_match
 
 
+def _bwrap_tool_available():
+    if shutil.which("bwrap", path=SYSTEM_ENV["PATH"]):
+        return True
+    entry = Path(resolve_bwrap_argv0(host_root=active_host_root()))
+    return entry.is_file() and os.access(entry, os.X_OK)
+
+
 def _sandbox_probe_command(uid, *, true_bin=None):
     if true_bin is None:
         true_bin = "/usr/bin/true" if os.path.exists("/usr/bin/true") else "/bin/true"
@@ -749,7 +767,7 @@ def _sandbox_probe_command(uid, *, true_bin=None):
         "--inh-caps=-all",
         "--ambient-caps=-all",
         "--bounding-set=-all",
-        "bwrap",
+        resolve_bwrap_argv0(host_root=active_host_root()),
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
@@ -1389,7 +1407,7 @@ class Agy:
             except (Failure, OSError, subprocess.SubprocessError) as err:
                 raise Failure(503, getattr(err, "code", None), stage="egress_start") from err
         sandbox = [
-            "bwrap",
+            resolve_bwrap_argv0(host_root=active_host_root()),
             "--unshare-pid",
             "--unshare-ipc",
             "--unshare-uts",
@@ -2684,7 +2702,7 @@ class CragDaemonShard:
             "--inh-caps=-all",
             "--ambient-caps=-all",
             "--bounding-set=-all",
-            "bwrap",
+            resolve_bwrap_argv0(host_root=active_host_root()),
             "--unshare-pid",
             "--unshare-ipc",
             "--unshare-uts",
@@ -4314,11 +4332,13 @@ class Host:
         return {"kernel_version": self.payload_version}
 
     def _run_sandbox_probe(self):
-        if any(
-            not shutil.which(tool, path=SYSTEM_ENV["PATH"])
-            for tool in ("setpriv", "bwrap")
-        ):
+        if not shutil.which("setpriv", path=SYSTEM_ENV["PATH"]) or not _bwrap_tool_available():
             return "gemini_sandbox_unavailable"
+        host_root = active_host_root()
+        if managed_bwrap_required(host_root=host_root) and not managed_bwrap_entry_configured(
+            host_root=host_root
+        ):
+            return "gemini_sandbox_apparmor_restricted"
         argv = _sandbox_probe_command(self.uid_base)
         try:
             rc, stderr_bytes = _run_bounded_probe(argv)
@@ -4354,8 +4374,8 @@ class Host:
     def oauth_runtime_issue(self):
         if any(
             not shutil.which(tool, path=SYSTEM_ENV["PATH"])
-            for tool in ("ip", "nft", "setpriv", "bwrap", "curl", "openvt")
-        ):
+            for tool in ("ip", "nft", "setpriv", "curl", "openvt")
+        ) or not _bwrap_tool_available():
             return "gemini_oauth_tools_missing"
         try:
             check_root_owned(self.egress)
@@ -6167,7 +6187,7 @@ class Host:
                 "--inh-caps=-all",
                 "--ambient-caps=-all",
                 "--bounding-set=-all",
-                "bwrap",
+                resolve_bwrap_argv0(host_root=active_host_root()),
                 "--unshare-pid",
                 "--unshare-ipc",
                 "--unshare-uts",
