@@ -166,7 +166,7 @@ test('Gemini import only displays eligible platform SOCKS5 and leaves inventory 
   expect(html).toContain('不创建虚拟机')
   expect(html).toContain('兑换当前版本的 CRAGGemini 内核')
   expect(html).toContain('Gemini API Key')
-  expect(html).toContain('导入账号文件（Antigravity / CPA / sub2api）')
+  expect(html).toContain('导入账号 JSON / Refresh Token')
   expect(html).toContain('允许的平台代理')
   expect(html).not.toContain('租户代理')
   expect(html).not.toContain('宿主直连')

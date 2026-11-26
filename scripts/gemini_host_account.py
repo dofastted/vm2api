@@ -8,9 +8,54 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 
 MODEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,99}\Z")
+ACCESS_TOKEN_RE = re.compile(r"[A-Za-z0-9._~+/-]{1,4096}={0,2}\Z")
+REFRESH_TOKEN_RE = re.compile(r"1//[0-9A-Za-z._~+/-]{6,2048}\Z")
+GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_WIF_TOKEN_URL = "https://sts.googleapis.com/v1/oauthtoken"
+OAUTH_CLIENT_ENV_KEYS = (
+    "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_ID",
+    "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_SECRET",
+    "KIN_GEMINI_OAUTH_CLOUD_CLIENT_ID",
+    "KIN_GEMINI_OAUTH_CLOUD_CLIENT_SECRET",
+    "KIN_GEMINI_OAUTH_WIF_CLIENT_ID",
+)
+
+
+def _resolve_oauth_clients(oauth_clients=None):
+    source = oauth_clients if isinstance(oauth_clients, dict) else os.environ
+
+    def read_cfg(key):
+        value = source.get(key)
+        if not isinstance(value, str):
+            return None
+        trimmed = value.strip()
+        return trimmed or None
+
+    resolved = {}
+    consumer_id = read_cfg("KIN_GEMINI_OAUTH_CONSUMER_CLIENT_ID")
+    if consumer_id:
+        resolved["consumer"] = (
+            GOOGLE_OAUTH_TOKEN_URL,
+            consumer_id,
+            read_cfg("KIN_GEMINI_OAUTH_CONSUMER_CLIENT_SECRET"),
+            "consumer",
+        )
+    cloud_id = read_cfg("KIN_GEMINI_OAUTH_CLOUD_CLIENT_ID")
+    if cloud_id:
+        resolved["cloud"] = (
+            GOOGLE_OAUTH_TOKEN_URL,
+            cloud_id,
+            read_cfg("KIN_GEMINI_OAUTH_CLOUD_CLIENT_SECRET"),
+            "gcp",
+        )
+    wif_id = read_cfg("KIN_GEMINI_OAUTH_WIF_CLIENT_ID")
+    if wif_id:
+        resolved["wif"] = (GOOGLE_WIF_TOKEN_URL, wif_id, None, "gcp")
+    return resolved
 GOOGLE_USERINFO = "https://www.googleapis.com/oauth2/v2/userinfo"
 CODE_ASSIST = "https://cloudcode-pa.googleapis.com/v1internal:"
 CODE_ASSIST_DAILY = "https://daily-cloudcode-pa.googleapis.com/v1internal:"
@@ -102,6 +147,184 @@ def get_json(proxy_url, url, header=None, body=None, *, timeout=6):
         return (status, data) if isinstance(data, dict) else (0, {})
     except (OSError, subprocess.SubprocessError, ValueError):
         return 0, {}
+
+
+def post_form_json(proxy_url, url, form_fields, *, timeout=10):
+    encoded = urlencode(form_fields)
+    config_lines = [
+        f"proxy = {json.dumps(proxy_url)}\n",
+        'noproxy = ""\n',
+        f"data-binary = {json.dumps(encoded)}\n",
+    ]
+    args = [
+        "curl",
+        "--disable",
+        "--silent",
+        "--config",
+        "-",
+        "--proto",
+        "=https",
+        "--connect-timeout",
+        "4",
+        "--max-time",
+        str(timeout),
+        "--max-filesize",
+        "1048576",
+        "--header",
+        "Content-Type: application/x-www-form-urlencoded",
+        "--write-out",
+        "\n%{http_code}",
+        url,
+    ]
+    config = "".join(config_lines)
+    try:
+        output = subprocess.run(
+            args,
+            input=config.encode(),
+            capture_output=True,
+            timeout=timeout + 2,
+            env=ENV,
+        )
+        if output.returncode != 0:
+            return 0, {}
+        raw, _, status_raw = output.stdout.rpartition(b"\n")
+        status = int(status_raw)
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            data = {}
+        return status, data if isinstance(data, dict) else {}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0, {}
+
+
+def refresh_oauth_token(
+    proxy_url, refresh_token, *, auth_method=None, wif_provider=None, oauth_clients=None
+):
+    if not isinstance(refresh_token, str) or not REFRESH_TOKEN_RE.fullmatch(refresh_token):
+        return {"state": "reauth_required", "error": "invalid_refresh_token"}
+    method_tag = auth_method.strip().lower() if isinstance(auth_method, str) else ""
+    provider = wif_provider.strip() if isinstance(wif_provider, str) else ""
+    configured = _resolve_oauth_clients(oauth_clients)
+    if provider:
+        order = ("wif",)
+    elif method_tag in ("business_licensed_enterprise", "gcp"):
+        order = ("cloud", "consumer")
+    else:
+        order = ("consumer", "cloud")
+    clients = [configured[name] for name in order if name in configured]
+    if not clients:
+        return {"state": "error", "error": "oauth_client_not_configured"}
+
+    last_error = None
+    last_status = 0
+    for idx, (token_url, client_id, client_secret, resolved_method) in enumerate(clients):
+        form = {
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+        if client_secret:
+            form["client_secret"] = client_secret
+        status, data = post_form_json(proxy_url, token_url, form, timeout=10)
+        last_status = status
+        if status == 200:
+            access_token = data.get("access_token")
+            if not isinstance(access_token, str) or not ACCESS_TOKEN_RE.fullmatch(access_token):
+                return {"state": "error", "error": "invalid_access_token"}
+            raw_expires = data.get("expires_in")
+            try:
+                expires_in = int(raw_expires) if raw_expires is not None else 3600
+            except (TypeError, ValueError):
+                expires_in = 3600
+            if expires_in <= 0 or expires_in > 31536000:
+                expires_in = 3600
+            expiry_iso = datetime.fromtimestamp(
+                int(time.time()) + expires_in, timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            rotated = data.get("refresh_token")
+            effective_rt = (
+                rotated
+                if isinstance(rotated, str) and REFRESH_TOKEN_RE.fullmatch(rotated)
+                else refresh_token
+            )
+            token_type = data.get("token_type")
+            if not isinstance(token_type, str) or not token_type.strip():
+                token_type = "Bearer"
+            token_doc = {
+                "token": {
+                    "access_token": access_token,
+                    "token_type": token_type,
+                    "refresh_token": effective_rt,
+                    "expiry": expiry_iso,
+                },
+                "auth_method": resolved_method,
+            }
+            if provider:
+                token_doc["wif_provider"] = provider
+                token_doc["saved_wif_provider"] = provider
+            return {"state": "ok", "token_doc": token_doc}
+
+        err_code = data.get("error") if isinstance(data.get("error"), str) else ""
+        last_error = err_code
+        # Retry with the alternate official OAuth client only on client mismatch.
+        if (
+            idx == 0
+            and len(clients) > 1
+            and status in (400, 401)
+            and err_code in ("unauthorized_client", "invalid_client")
+        ):
+            continue
+        break
+
+    if last_status in (400, 401, 403):
+        return {"state": "reauth_required", "error": last_error or "refresh_rejected"}
+    return {"state": "error", "error": last_error or "refresh_transport_error"}
+
+
+def probe_oauth_refresh_import(proxy_url, oauth_token, *, oauth_clients=None):
+    if not isinstance(oauth_token, dict):
+        return {"account": checked("error")}
+    refresh_token = oauth_token.get("refresh_token")
+    auth_method = oauth_token.get("auth_method")
+    wif_provider = oauth_token.get("wif_provider")
+    refreshed = refresh_oauth_token(
+        proxy_url,
+        refresh_token,
+        auth_method=auth_method,
+        wif_provider=wif_provider,
+        oauth_clients=oauth_clients,
+    )
+    if refreshed.get("state") == "ok" and isinstance(refreshed.get("token_doc"), dict):
+        token_doc = refreshed["token_doc"]
+        account = probe_oauth_token(proxy_url, token_doc, imported=False)
+        if account.get("state") in ("ok", "partial"):
+            email = account.get("email")
+            if token_doc.get("auth_method") == "gcp" and isinstance(email, str) and email:
+                token_doc["id_token_email"] = email
+            return {"account": account, "token_doc": token_doc}
+        return {"account": account}
+
+    # If refresh failed due to a third-party OAuth client mismatch or unconfigured host client
+    # and the caller also supplied a non-expired access token, fall back to access-only import.
+    access_token = oauth_token.get("access_token")
+    expiry = oauth_token.get("expiry")
+    if (
+        refreshed.get("error")
+        in ("unauthorized_client", "invalid_client", "oauth_client_not_configured")
+        and isinstance(access_token, str)
+        and ACCESS_TOKEN_RE.fullmatch(access_token)
+        and type(expiry) is int
+        and expiry > time.time()
+    ):
+        fallback_account = probe_oauth_token(
+            proxy_url,
+            {"token": {"access_token": access_token, "expiry": expiry}},
+            imported=True,
+        )
+        return {"account": fallback_account, "fallback_access_only": True}
+
+    return {"account": checked(refreshed.get("state") or "error")}
 
 
 def checked(state, **data):
@@ -845,6 +1068,12 @@ if __name__ == "__main__":
     elif sys.argv[1] == "oauth_import":
         result = probe_oauth_token(
             request["proxy_url"], {"token": request["oauth_token"]}, imported=True
+        )
+    elif sys.argv[1] == "oauth_refresh_import":
+        result = probe_oauth_refresh_import(
+            request["proxy_url"],
+            request.get("oauth_token"),
+            oauth_clients=request.get("oauth_clients"),
         )
     else:
         result = checked("error")
