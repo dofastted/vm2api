@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.4.230 — 2026-11-26 · 内核不再为带 type 的工具合成 `input_schema`（advisor 全链路放行）、新增 advisor 处理说明
+
+- **`kin-kernel` 新二进制：带显式非 `custom` `type` 的工具不再被补 `input_schema`（payload pin 变更）**：
+  - 内核的 `is_server_tool_type` 原是手工维护的前缀白名单（`web_search_` / `web_fetch_` / `computer_` / `bash_` / `text_editor_` / `code_execution_` / `tool_search_`），`advisor_20260301` 不在其中；而 `ToolDefinition.input_schema` 带 `#[serde(default)]`，入站缺该字段时会在反序列化阶段被合成为 `{"type":"object","properties":{}}`，序列化时又写回出站 body，上游因此拒收：`tools.N.advisor_20260301.input_schema: Extra inputs are not permitted`。改为按结构判定（只有 `custom` 工具带 `input_schema`，有显式非 custom `type` 的工具其 schema 归上游），advisor 与未来新增的工具族一并覆盖，无需每次补前缀。
+  - 产物：`bin/kin-kernel` 与 `share/wrap-cli/kin-kernel.bin` 同步为 `13,235,464` / `sha256 020d0790…9913369`；`deploy/payload.json` 的 `release` 指向新 payload release `payload-2026.11.26-kernel-advisor-schema`（仅 `kin-kernel` 相对 `payload-2026.11.25-worker-oauth-guard` 变更，其余 11 个非 CRAG asset 原样重传）。容器内离线构建（`rust:1.98-bookworm`，rustc 1.98.1），最高 GLIBC 符号 `2.34` 与上一版基准一致，两次独立构建 sha256 逐字节相同。
+- **CRAG 内核白名单放行 advisor 的 `defer_loading`（#1916）**：`ADVISOR_TOOL_KEYS` 此前齐备了 `max_uses` / `caching` 这些真实流量从不发送的可选项，却漏掉 Claude Code 实际携带的 `defer_loading`（真实形状为 `{type, name, model, defer_loading}`），`pickKeys` 将其静默丢弃；该键在同文件的 `CUSTOM_TOOL_KEYS` 中早已放行。由于 beta 推导运行在清洗后的 body 上（`go-worker-client.mjs` 的 `main` 源自 `prepareCragRequest` 输出），丢键同时导致 `advanced-tool-use-2025-11-20` 不被声明，调用方要求的延迟加载两端皆失。
+- **新增 advisor 工具处理说明（#1917）**：`docs/advisor.md` 记录调用方真实请求形状、白名单三条 fail-closed 校验、cli-node 与 CRAG 两条路径各自的 beta 声明来源、`advisor_tool_result.content` 的三态 union，以及已修的键集遗漏形状；挂入 `docs/README.md` 索引。
+- **回退 Codex keep-alive join（#1904）**：OpenAI 的 grant 模型不需要该机制。
+- 部署说明：本次改动涉及控制面（`src/lib/protocol/`）与 **`deploy/payload.json` 的 `kin-kernel` pin**；前端（`web/src/`）、数据库迁移结构、CRAG（`3.1.21`）与 CRAGGemini（`0.4.13`）payload、Gemini 宿主脚本相对 `1.4.229` 均未变。因 Claude 槽内核二进制已更新，预期 **`SLOT_SYNC=required`**：升级后需执行 `wrap-cli/sync` 使既有 Claude 槽位取到新内核（集群槽会被重建）；Codex / Gemini 槽位不受影响。
+
 ## 1.4.229 — 2026-11-26 · 加固 PostgreSQL 一键安装/迁移脚本（#1905 安全门禁与本地 URL 识别）、PG 18 调优与同步桥可观测性
 
 - **PostgreSQL 一键安装/迁移脚本安全门禁与本地地址识别加固（#1911）**：
