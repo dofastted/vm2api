@@ -6,8 +6,6 @@ import path from 'node:path'
 import {
   isCredentialRefreshTarget,
   needsScheduledRefresh,
-  isCodexCredentialRefreshTarget,
-  codexNeedsScheduledRefresh,
   normalizeCredentialRefreshConfig,
   createCredentialRefreshMonitor,
   shouldForceRefresh,
@@ -16,6 +14,7 @@ import {
   classifyCredentialRefresh,
   markVmRefreshError,
   persistOauthToVm,
+  hasRefreshPresence,
 } from '../../src/lib/oauth/oauth-credentials.mjs'
 
 const offSlot = {
@@ -379,40 +378,22 @@ test('a slot is parked for the upgrade exactly where clearUpgradeRequired looks,
   assert.equal(isUpgradeParked(topOnly), false, 'a top-level code is not something clearUpgradeRequired can clear')
 })
 
-// Codex 槽进同一张凭证保活网（此前被 slot-oauth 路径漏掉：codex 槽无 kin-worker
-// oauth，refreshOne 必回 credential_required——vm-09 claude 段的
-// refresh_error=credential_required 即其反复撞出的痕迹）。
-test('codex slots join the credential refresh target net with their own due gate', () => {
-  const base = {
+// 协议事实锚定：OpenAI AT TTL=240h 且 RT 可重复使用，claude 式持续保活对 codex
+// 无必要且徒增 token 端点暴露（风控关联信号）。codex 槽必须留在保活网外，
+// 由流量随路轮换（rotateIfNeeded）覆盖。此测试防止回归。
+test('codex slots stay OUT of the claude keep-alive net (protocol asymmetry)', () => {
+  const codexSlot = {
     id: 'vm-09',
     platform: 'openai',
     family: 'codex',
     status: 'running',
     schedulable: true,
     has_refresh: true,
-    expires_at: Date.now() - 60_000, // 过期=due
+    expires_at: Date.now() - 60_000, // 哪怕 AT 临期
     proxy: { host: '127.0.0.1', port: 1080, url: 'socks5h://127.0.0.1:1080' },
     proxy_cli_enabled: true,
   }
-  // 目标判定：正常 codex 槽在网内
-  assert.equal(isCodexCredentialRefreshTarget(base), true)
-  // 无 refresh token 不进
-  assert.equal(isCodexCredentialRefreshTarget({ ...base, has_refresh: false }), false)
-  // grant 死亡已摘池不进（不再烧 token 端点）
-  assert.equal(
-    isCodexCredentialRefreshTarget({ ...base, schedule_disabled_reason: 'oauth_revoked' }),
-    false,
-  )
-  assert.equal(isCodexCredentialRefreshTarget({ ...base, schedule_disabled_reason: 'organization_disabled' }), false)
-  // 硬下线不进
-  assert.equal(isCodexCredentialRefreshTarget({ ...base, status: 'stopped' }), false)
-  // due 判定：过期票 due
-  assert.equal(codexNeedsScheduledRefresh(base), true)
-  // 未过期不 due
-  assert.equal(codexNeedsScheduledRefresh({ ...base, expires_at: Date.now() + 3600_000 }), false)
-  // 吊销标（终态）不 due；可重试标仍 due
-  assert.equal(codexNeedsScheduledRefresh({ ...base, refresh_error: 'oauth_revoked' }), false)
-  assert.equal(codexNeedsScheduledRefresh({ ...base, refresh_error: 'timeout' }), true)
-  // claude 槽不进 codex 分支（沿用原判定）
-  assert.equal(isCodexCredentialRefreshTarget({ ...base, platform: 'anthropic', family: 'claude' }), false)
+  // isCredentialRefreshTarget 读 claude 段：codex 槽（claude 段空/无 refresh）天然被挡
+  assert.equal(hasRefreshPresence(codexSlot.claude || {}), false)
+  assert.equal(isCredentialRefreshTarget(codexSlot), false)
 })

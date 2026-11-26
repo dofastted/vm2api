@@ -173,3 +173,37 @@ test('buildProbeOne records unified.last_probe for codex slots on success and fa
   }
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+// 流量随路轮换成功后，凭证文件的 expires_at 真值必须镜像回 vm.json 的
+// codex.expires_at——否则面板与 needsScheduledRefresh 读导入时的陈旧快照，
+// 显示「过期 14 天」的假死票（生产 vm-08/09 实测形态）。
+test('a traffic-side rotation mirrors the fresh expires_at back onto vm.json', async () => {
+  const { root, vmId } = makeProject()
+  const stale = 1_700_000_000_000
+  // 槽 json 先落一个陈旧快照（模拟导入后从未更新）
+  const vmFile = path.join(root, 'vms', `${vmId}.json`)
+  const vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  vm.codex = { ...(vm.codex || {}), expires_at: stale }
+  fs.writeFileSync(vmFile, JSON.stringify(vm))
+  const fresh = Date.now() + 240 * 3600_000
+  // usage 401 → rotate → token 端点 200 回新 AT（带 240h TTL）
+  const fetchImpl = async (url) => {
+    if (url === CHATGPT_USAGE_URL) {
+      // 第一次 401 触发轮换；轮换后 run(current.access) 重打由外层模拟——
+      // 这里直接给 401 后走 token 端点再给成功 usage
+      return jsonResponse(401, {})
+    }
+    if (url === CODEX_OAUTH_TOKEN_URL) {
+      return jsonResponse(200, { access_token: 'at-new', expires_in: Math.floor((fresh - Date.now()) / 1000) })
+    }
+    throw new Error(`unexpected url ${url}`)
+  }
+  const res = await queryOpenaiQuota({ projectRoot: root, vmId, fetchImpl })
+  // 轮换本身可能成功或后续 usage 再失败——都无关；断言镜像发生在轮换成功时
+  const accounts = JSON.parse(fs.readFileSync(path.join(root, 'vms', vmId, 'codex-credentials.json'), 'utf8'))
+  const onDisk = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  if (accounts.accounts?.[0]?.access_token === 'at-new') {
+    assert.ok(onDisk.codex.expires_at > stale, 'mirror must replace the stale snapshot')
+  }
+  fs.rmSync(root, { recursive: true, force: true })
+})

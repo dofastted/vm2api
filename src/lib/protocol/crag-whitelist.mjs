@@ -105,7 +105,23 @@ const CUSTOM_TOOL_KEYS = new Set([
 // `max_tokens` bounds the advisor's own output (thinking + text) per call; at the
 // cap the result block comes back with stop_reason "max_tokens". Dropping it
 // silently removed the caller's ceiling on advisor spend.
-const ADVISOR_TOOL_KEYS = new Set(['type', 'name', 'model', 'max_uses', 'max_tokens', 'caching', 'cache_control'])
+//
+// `defer_loading` is what Claude Code actually sends: its advisor arrives as
+// {type, name, model, defer_loading: true} -- no max_uses, no caching. It is
+// already allowed on custom tools (CUSTOM_TOOL_KEYS above), and dropping it only
+// here cost the caller both halves of deferred loading: the field itself, and the
+// advanced-tool-use beta, since beta derivation runs on the sanitized body
+// (go-worker-client.mjs builds `main` from prepareCragRequest's output).
+const ADVISOR_TOOL_KEYS = new Set([
+  'type',
+  'name',
+  'model',
+  'max_uses',
+  'max_tokens',
+  'caching',
+  'defer_loading',
+  'cache_control',
+])
 
 const PROVIDER_TOOL_DROP_KEYS = new Set(['annotations', 'function', 'parameters'])
 
