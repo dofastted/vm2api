@@ -2,11 +2,6 @@
 
 ## Unreleased
 
-- **Gemini 托管 bwrap 条目跟进：RUNTIME_FILES 打包 `gemini_host_apparmor.py`、原子安装与幂等跳过（Refs #1895）**：
-  - `scripts/gemini-maintenance.py`：将 `scripts/gemini_host_apparmor.py` 纳入 `RUNTIME_FILES` 随维护包下发；`VERIFIER_FILES` 仍指向 `install-gemini-payload.mjs` 与 `payload.mjs`。
-  - `scripts/gemini_host_apparmor.py`：`install_managed_bwrap` 先写入同目录临时文件再以 `os.replace` 落盘；目标内容已与系统 `bwrap` 一致时跳过重写。
-  - 回归：`test/unit/gemini-maintenance-runtime-files.py`、`test/unit/test_gemini_host_apparmor.py`。
-
 - **修复 Gemini 许可 CLI 将 bwrap 沙箱挂载/命名空间失败误报为 `license_invalid`（Refs #1892）**：
   - `scripts/gemini-host.py`：`classify_craggemini_license_cli_error` 在回落到许可无效前识别 `bwrap:` 致命启动失败（bind 源不可穿越、`Can't bind mount` / `Can't mount proc` / `execvp Permission denied`、user namespace 拒绝等），分别上报 `gemini_sandbox_unavailable` 与 `gemini_sandbox_apparmor_restricted`；忽略纯 `bwrap: Warning` 行以免掩盖真实许可结论；`license_status` 保留沙箱错误码。
   - **兼容性**：经宿主 `license-machine-code` / `license-activate` / `license-status` 暴露的 `crag_license.code` 在沙箱启动失败时为 `gemini_sandbox_*`，HTTP **503**（此前误为 **403** `license_invalid`）；`sync_pending` 时 bwrap 失败亦上报沙箱码而非许可错误。`src/lib/gemini/subscription.mjs` / `scheduler.mjs` 准入与调度不再将沙箱码回落为 `license_required`。
