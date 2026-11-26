@@ -229,6 +229,14 @@ export function mergeUsage(current, next) {
     if (value && typeof value === 'object' && !Array.isArray(value)) {
       const prev = out[key]
       out[key] = mergeUsage(prev && typeof prev === 'object' && !Array.isArray(prev) ? prev : {}, value)
+    } else if (
+      key === 'iterations' &&
+      Array.isArray(value) &&
+      value.length === 0 &&
+      Array.isArray(out[key]) &&
+      out[key].length > 0
+    ) {
+      continue
     } else {
       out[key] = value
     }

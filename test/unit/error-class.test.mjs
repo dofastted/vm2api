@@ -117,6 +117,28 @@ test('classifyRequestError maps known codes and statuses', () => {
     }).error_class,
     'request',
   )
+  for (const row of [
+    {
+      status: 400,
+      error_code: 'upstream_invalid_request',
+      error_message: 'tools.0.advisor_20260301.input_schema: Extra inputs are not permitted',
+    },
+    {
+      status: 400,
+      error_code: 'upstream_invalid_request',
+      error_message:
+        "tools.0: Input tag 'advisor_20260301' found using 'type' does not match any of the expected tags: 'bash_20250124'",
+    },
+    {
+      status: 400,
+      error_code: 'gateway_protocol_error',
+      error_message: 'synthetic protocol mismatch',
+    },
+  ]) {
+    const cls = classifyRequestError(row)
+    assert.equal(cls.error_class, 'gateway_protocol', row.error_message)
+    assert.equal(cls.error_owner, 'platform', row.error_message)
+  }
   assert.equal(
     classifyRequestError({
       status: 401,

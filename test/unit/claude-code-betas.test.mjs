@@ -241,11 +241,28 @@ test('the advisor tool and a replayed advisor result both append advisor-tool', 
   })
   assert.deepEqual(replayed, [beta])
 
+  const replayedServerTool = withRequestProtocolBetas([], {
+    messages: [
+      { role: 'user', content: 'hi' },
+      {
+        role: 'assistant',
+        content: [{ type: 'server_tool_use', id: 'srvtoolu_1', name: 'advisor', input: {} }],
+      },
+    ],
+  })
+  assert.deepEqual(replayedServerTool, [beta])
+
+  const futureAdvisorTool = withRequestProtocolBetas([], {
+    tools: [{ type: 'advisor_20260901', name: 'advisor', model: 'claude-opus-5-5' }],
+  })
+  assert.deepEqual(futureAdvisorTool, [beta])
+
   assert.deepEqual(withRequestProtocolBetas([beta], { tools: [tool] }), [beta])
   for (const body of [
     { tools: [{ type: 'custom', name: 'lookup', input_schema: { type: 'object' } }] },
     { tools: [{ name: 'advisor', input_schema: { type: 'object' } }] },
     { messages: [{ role: 'assistant', content: [{ type: 'text', text: 'advisor_tool_result' }] }] },
+    { messages: [{ role: 'assistant', content: [{ type: 'server_tool_use', name: 'web_search', input: {} }] }] },
     { messages: [{ role: 'user', content: 'advisor' }] },
   ]) {
     assert.ok(!withRequestProtocolBetas(['caller-beta'], body).includes(beta))

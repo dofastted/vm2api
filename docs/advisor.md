@@ -25,13 +25,12 @@ Claude Code（2.1.x，`/advisor`、`--advisor`）发出的工具定义就是这�
 
 ## 网关的校验与清洗
 
-`crag-whitelist.mjs:513-525` 对 advisor 工具 **fail-closed**，三条任一不满足就 400 `invalid native advisor tool definition`：
+`crag-whitelist.mjs:513-525` 对 advisor 工具的契约字段 **fail-closed**，不满足就 400 `invalid native advisor tool definition`：
 
 - `name` 必须正好是 `advisor`；
-- `model` 必须是非空字符串；
-- **不能带 `input_schema`** —— 上游契约里 advisor 没有 schema，带了会被拒。
+- `model` 必须是非空字符串。
 
-通过之后按 `ADVISOR_TOOL_KEYS`（`:115-124`）重建，只保留 `type` / `name` / `model` / `max_uses` / `max_tokens` / `caching` / `defer_loading` / `cache_control`。
+上游契约里 advisor **不能带 `input_schema`**；如果调用方或中间网关误带了 `input_schema`，面板侧（`crag-whitelist.mjs` 与 `kernel-request.mjs`）以及 CRAG 侧（`crag-standalone` PR `#31`）会统一将其剥离而非拒绝整轮请求。通过之后按 `ADVISOR_TOOL_KEYS`（`:115-124`）重建，只保留 `type` / `name` / `model` / `max_uses` / `max_tokens` / `caching` / `defer_loading` / `cache_control`。
 
 `kernel-request.mjs:62` 把 `advisor_20260301` 和 `custom` 一起跳过 provider 工具名校验 —— advisor 不参与「托管工具必须用官方名字」那套检查。
 
@@ -41,10 +40,10 @@ Claude Code（2.1.x，`/advisor`、`--advisor`）发出的工具定义就是这�
 
 上游用 `advisor-tool-2026-03-01` 门控这个工具。**两条推理路径各自声明，不要以为只有一处。**
 
-**cli-node（kin-kernel）**：出站 `anthropic-beta` 头是每跳重建的（`outbound-attempt.mjs` 的 `prepareOutboundHeaders`），调用方的入站 token 不透传，由 `withRequestProtocolBetas` 从 body 重新推导。两个触发条件（`claude-code-betas.mjs:138`、`:181`）：
+**cli-node（kin-kernel）**：控制面每跳重建协议 beta（`outbound-attempt.mjs` / `go-worker-client.mjs`），调用方的入站 token 不透传，由 `withRequestProtocolBetas` 从 body 重新推导并写入 `body.betas` 交给槽内 `kin-kernel` → `cli-node` 合并进最终出站头。两个触发条件（`claude-code-betas.mjs`）：
 
-- `tools` 里有 `type === 'advisor_20260301'` 的工具；
-- 历史里有任何 `advisor_tool_result` 块。
+- `tools` 里有 `type` 以 `advisor_` 开头的工具（如 `advisor_20260301`）；
+- 历史里有任何 `advisor_tool_result` 块或 `server_tool_use`（`name === 'advisor'`）块。
 
 第二条是必需的：后续轮次允许把工具从 `tools` 移除，但历史里重放的结果块**只在该 beta 仍被声明时才被接受**。该扫描放在 `output_config` 的 `continue` 之前，否则只能看到带 turn controls 的消息。
 
