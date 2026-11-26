@@ -99,6 +99,50 @@ export const vmTimeoutTracker = {
 
 export const TIMEOUT_FAULT_PREFIX = 'consecutive_timeouts:'
 
+const OPAQUE_429_THRESHOLD = 3
+const OPAQUE_429_COOLDOWN_MS = 60_000
+
+/**
+ * Consecutive opaque CRAG 429s per (account, model).
+ *
+ * A single bare 429 with no rate-limit headers proves nothing (#1139), so the
+ * classifier deliberately stops the request without cooling anything down.
+ * Repetition is different: the same conversation hammering one model while the
+ * slot's other models stay healthy is a model-level signal, not a request one.
+ * Keyed by model on purpose -- an account-level cooldown would take the slot's
+ * other models down with it.
+ */
+export const opaque429Tracker = {
+  counts: new Map(),
+  key(accountId, model) {
+    return `${accountId || ''}\u0000${model || ''}`
+  },
+  /** Returns true once the streak reaches `threshold`. */
+  record(accountId, model, threshold = OPAQUE_429_THRESHOLD) {
+    if (!accountId) return false
+    const key = this.key(accountId, model)
+    const count = (this.counts.get(key) || 0) + 1
+    this.counts.set(key, count)
+    return count >= threshold
+  },
+  streak(accountId, model) {
+    return this.counts.get(this.key(accountId, model)) || 0
+  },
+  clear(accountId, model) {
+    if (!accountId) return
+    this.counts.delete(this.key(accountId, model))
+  },
+  reset() {
+    this.counts.clear()
+  },
+}
+
+function opaque429Setting(value, fallback, min, max) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.min(max, Math.max(min, Math.trunc(n)))
+}
+
 const DEFAULTS = {
   max_account_switches: 3,
   max_total_attempts: 12,
@@ -1448,6 +1492,30 @@ export class FailoverRunner {
           policy = { ...policy, action: 'continue', cooldownUntil: null }
         } else if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
           policy = { ...policy, cooldownUntil: hardBlock.until }
+        }
+        // An opaque CRAG 429 stops the request without cooling anything down,
+        // which is right once (#1139) and wrong on repeat: the same conversation
+        // kept landing on one model for 47 minutes. Escalate to a model-level
+        // cooldown so the next attempt moves to another slot. `decision` is
+        // recomputed because scope and action both change here.
+        if (policy.reason === 'crag_opaque_429') {
+          const threshold = opaque429Setting(this.config.crag_opaque_429_threshold, OPAQUE_429_THRESHOLD, 2, 10)
+          if (opaque429Tracker.record(selected.accountId, model, threshold)) {
+            opaque429Tracker.clear(selected.accountId, model)
+            policy = attachFailureDecision({
+              ...policy,
+              decision: undefined,
+              scope: 'model',
+              action: 'continue-and-cooldown',
+              reason: 'crag_opaque_429_model_cooldown',
+              retrySameAccount: false,
+              cooldownUntil:
+                Date.now() +
+                opaque429Setting(this.config.crag_opaque_429_cooldown_ms, OPAQUE_429_COOLDOWN_MS, 10_000, 10 * 60_000),
+            })
+          }
+        } else if (verifiedSuccess(result)) {
+          opaque429Tracker.clear(selected.accountId, model)
         }
 
         lastResult = result
