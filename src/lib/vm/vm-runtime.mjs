@@ -328,8 +328,7 @@ function updateSlotRestartPolicy(existing, policy, run) {
   return { ...result, changed: result.ok === true }
 }
 
-function hasCragHostMount(projectRoot, slot) {
-  const result = sh(['docker', 'inspect', '--format', '{{json .Mounts}}', slot], { timeout: 3000 })
+function cragHostMountMatches(projectRoot, result) {
   if (!result.ok) throw new Error('Could not inspect Docker slot mounts')
   const mounts = JSON.parse(result.stdout)
   if (!Array.isArray(mounts)) throw new Error('Invalid Docker slot mount list')
@@ -338,18 +337,25 @@ function hasCragHostMount(projectRoot, slot) {
   return mount?.Type === 'bind' && mount.RW === false && mount.Source === source
 }
 
-/** Binding needs a compatible package, not a running worker. */
-export function assertCragSubscriptionTarget(
-  projectRoot,
-  vm,
-  routing,
-  { reclaim = false, allowPrepared = false } = {},
-) {
-  const unsupported = () =>
-    Object.assign(new Error('A compatible Linux CRAG slot is required.'), {
-      status: 409,
-      code: 'crag_subscription_target_unready',
-    })
+const mountInspectArgv = (slot) => ['docker', 'inspect', '--format', '{{json .Mounts}}', slot]
+
+function hasCragHostMount(projectRoot, slot) {
+  return cragHostMountMatches(projectRoot, sh(mountInspectArgv(slot), { timeout: 3000 }))
+}
+
+const subscriptionTargetUnready = () =>
+  Object.assign(new Error('A compatible Linux CRAG slot is required.'), {
+    status: 409,
+    code: 'crag_subscription_target_unready',
+  })
+
+/**
+ * Checks shared by the sync and async subscription target probes, written as a
+ * generator that yields each Docker command (`{ argv, timeout }`) and receives
+ * its `{ ok, stdout }` result. The driver decides whether the call blocks.
+ */
+function* subscriptionTargetChecks(projectRoot, vm, routing, { reclaim = false, allowPrepared = false } = {}) {
+  const unsupported = subscriptionTargetUnready
   if (
     process.platform !== 'linux' ||
     typeof vm?.id !== 'string' ||
@@ -385,19 +391,19 @@ export function assertCragSubscriptionTarget(
     return false
 
   const slot = containerName(vm.id)
-  const outcome = inspectContainerOutcome(slot, { run: (args) => sh(args, { timeout: 3000 }) })
-  if (outcome.status !== 'found' || !outcome.container?.running) throw unsupported()
+  const inspected = yield { argv: ['docker', 'inspect', '--format', INSPECT_FORMAT, slot], timeout: 3000 }
+  const found = inspectContainerOutcome(slot, { run: () => inspected })
+  if (found.status !== 'found' || !found.container?.running) throw unsupported()
   if (isKvmRuntime(vm)) {
-    const projected = sh(
-      ['docker', ...slotExecArgv(vm, kvmCragSubscriptionStatusCommand(vm, guestMachineId), { user: '0' })],
-      {
-        timeout: 5000,
-      },
-    )
+    const projected = yield {
+      argv: ['docker', ...slotExecArgv(vm, kvmCragSubscriptionStatusCommand(vm, guestMachineId), { user: '0' })],
+      timeout: 5000,
+    }
     if (!projected.ok) throw unsupported()
   } else {
+    const mounts = yield { argv: mountInspectArgv(slot), timeout: 3000 }
     try {
-      if (!hasCragHostMount(projectRoot, slot)) throw unsupported()
+      if (!cragHostMountMatches(projectRoot, mounts)) throw unsupported()
     } catch {
       throw unsupported()
     }
@@ -408,10 +414,10 @@ export function assertCragSubscriptionTarget(
   } catch {
     throw unsupported()
   }
-  const capabilities = sh(
-    ['docker', ...slotExecArgv(vm, ['/home/kincli/.kin/crag-v2/crag-v2', '--license-capabilities'])],
-    { timeout: 5000 },
-  )
+  const capabilities = yield {
+    argv: ['docker', ...slotExecArgv(vm, ['/home/kincli/.kin/crag-v2/crag-v2', '--license-capabilities'])],
+    timeout: 5000,
+  }
   try {
     if (capabilities.ok) {
       const flags = JSON.parse(capabilities.stdout)
@@ -421,13 +427,34 @@ export function assertCragSubscriptionTarget(
   throw unsupported()
 }
 
+/** Binding needs a compatible package, not a running worker. */
+export function assertCragSubscriptionTarget(projectRoot, vm, routing, opts = {}) {
+  const checks = subscriptionTargetChecks(projectRoot, vm, routing, opts)
+  let step = checks.next()
+  while (!step.done) step = checks.next(sh(step.value.argv, { timeout: step.value.timeout }))
+  return step.value
+}
+
+/**
+ * The same checks without blocking the event loop. Panel status counts enabled
+ * slots on every refresh; with `execFileSync` that was three Docker calls per
+ * slot in series, which on a host with ~30 CRAG slots held the single
+ * control-plane process (and every proxied request) for ~40 s.
+ */
+export async function assertCragSubscriptionTargetAsync(projectRoot, vm, routing, opts = {}, { run = shAsync } = {}) {
+  const checks = subscriptionTargetChecks(projectRoot, vm, routing, opts)
+  let step = checks.next()
+  while (!step.done) step = checks.next(await run(step.value.argv, { timeout: step.value.timeout }))
+  return step.value
+}
+
 /** An enabled slot has both current host authorization and a ready local runtime. */
-export function isCragSubscriptionSlotEnabled(projectRoot, vm, routing, opts) {
+export async function isCragSubscriptionSlotEnabled(projectRoot, vm, routing, opts, probe) {
   if (vm.status !== 'running' || vm.node_id || isCodexVm(vm)) return false
   const { ok, license } = checkCragLicense(projectRoot, vm, routing)
   if (!ok || license?.scope !== 'host') return false
   try {
-    return assertCragSubscriptionTarget(projectRoot, vm, routing, opts)
+    return await assertCragSubscriptionTargetAsync(projectRoot, vm, routing, opts, probe)
   } catch (error) {
     if (error.code === 'crag_subscription_target_unready') return false
     throw error
