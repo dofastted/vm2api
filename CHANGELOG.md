@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Gemini 工具结果后追加用户文本复用原会话的 409 会话冲突（#1837）**：
+  - `src/lib/gemini/{scheduler,direct-client}.mjs`、`scripts/gemini_host_native.py`：将 CRAGGemini `tool_continuation_aborted` 映射为独立的 `409 gemini_session_conflict`，不再回落为 `502 gemini_inference_failed` 与风控提示文案；该类冲突不计入账号熔断、不触发跨账号故障转移。
+  - `src/lib/gemini/scheduler.mjs`：收到 `gemini_session_conflict` 时清除失效的 sticky 会话绑定，并在同账号上以新的 `conversation_id` 自动重试一次（无无限重试）。
+  - 回归测试：`test/unit/gemini-session-conflict.test.mjs`。
+
 ## 1.4.230 — 2026-11-26 · 内核不再为带 type 的工具合成 `input_schema`（advisor 全链路放行）、新增 advisor 处理说明
 
 - **`kin-kernel` 新二进制：带显式非 `custom` `type` 的工具不再被补 `input_schema`（payload pin 变更）**：
