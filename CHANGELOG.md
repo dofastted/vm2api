@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **修复并发代理探测误杀健康远端 SOCKS5 与 Gemini `proxy_ready` 连坐（#1853）**：`proxy-pool.mjs` 的 `probeAll` 对公网 SOCKS greeting 改串行并加入 400ms 错峰，避免 4 路并发挤占同一超时预算；Gemini `proxyFor` 与代理池一致，仅在行被池政策标为 `dead`（达到 `max_failures`）时判定绑定代理不可用，单次 `fail`/timeout 不再把 `proxy_ready` 置 false。
+- 回归测试：`test/unit/gemini-proxy-ready.test.mjs`、`test/unit/proxy-probe-stagger.test.mjs`。
+
 ## 1.4.230 — 2026-11-26 · 内核不再为带 type 的工具合成 `input_schema`（advisor 全链路放行）、新增 advisor 处理说明
 
 - **`kin-kernel` 新二进制：带显式非 `custom` `type` 的工具不再被补 `input_schema`（payload pin 变更）**：
