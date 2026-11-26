@@ -2,6 +2,7 @@ import { queryOptions } from '@tanstack/react-query'
 import { ApiError, api, isApiError } from '@/lib/api'
 
 const ROOT = '/api/panel/gemini/maintenance'
+const MAINTENANCE_STATUS_TIMEOUT_MS = 15_000
 
 export const GEMINI_LOCAL_PREPARE_COMMAND =
   'sudo bash /opt/vm2api/deploy/install.sh prepare-gemini --dir /opt/vm2api'
@@ -338,9 +339,16 @@ export type MaintenanceStatus =
 export const maintenanceQueryOptions = queryOptions({
   queryKey: ['panel', 'gemini-maintenance'] as const,
   queryFn: async ({ signal }): Promise<MaintenanceStatus> => {
+    // The backend answers within its own 8s socket timeout; never let a
+    // stalled request leave the status view loading forever.
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    const timer = setTimeout(abort, MAINTENANCE_STATUS_TIMEOUT_MS)
+    if (signal.aborted) abort()
+    else signal.addEventListener('abort', abort, { once: true })
     try {
       const status = await api<MaintenanceStatus>(ROOT, {
-        signal,
+        signal: controller.signal,
         cache: 'no-store',
       })
       if (status?.available === true || status?.available === false)
@@ -354,7 +362,17 @@ export const maintenanceQueryOptions = queryOptions({
           code: 'maintenance_endpoint_missing',
         }
       }
+      if (controller.signal.aborted && !signal.aborted) {
+        throw new ApiError(
+          '读取宿主维护状态超时',
+          0,
+          'gemini_maintenance_timeout'
+        )
+      }
       throw error
+    } finally {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', abort)
     }
   },
   networkMode: 'always',
