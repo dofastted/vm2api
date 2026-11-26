@@ -76,6 +76,7 @@ RUNTIME_FILES = (
     "scripts/install-gemini-payload.mjs",
     "src/lib/gemini/payload.mjs",
     "bin/kin-egress",
+    "scripts/gemini_host_apparmor.py",
 )
 VERIFIER_FILES = RUNTIME_FILES[5:7]
 MEMBERS = ("manifest.json", "manifest.sig", "agy", "craggemini", "libagy_bridge.so")

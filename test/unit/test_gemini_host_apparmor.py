@@ -76,6 +76,42 @@ class GeminiHostAppArmorTests(unittest.TestCase):
         self.assertTrue(stat.S_ISREG(info.st_mode))
         self.assertEqual(info.st_mode & 0o777, 0o755)
 
+    def test_install_managed_bwrap_skips_when_content_matches(self):
+        source = self.root / "system-bwrap"
+        payload = b"#!/bin/sh\nnoop\n"
+        source.write_bytes(payload)
+        os.chmod(source, 0o755)
+        entry = mod.host_path(self.root, mod.GEMINI_BWRAP_ENTRY)
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_bytes(payload)
+        before = entry.stat().st_mtime_ns
+        with (
+            patch.object(mod.shutil, "which", return_value=str(source)),
+            patch.object(mod.os, "replace") as replace_mock,
+            patch.object(mod.shutil, "copy2") as copy_mock,
+        ):
+            with self.subTest("identical"):
+                result = mod.install_managed_bwrap(host_root=self.root)
+                replace_mock.assert_not_called()
+                copy_mock.assert_not_called()
+            self.assertEqual(result, entry)
+            self.assertEqual(entry.stat().st_mtime_ns, before)
+
+    def test_install_managed_bwrap_uses_atomic_replace(self):
+        source = self.root / "system-bwrap"
+        source.write_bytes(b"#!/bin/sh\nv2\n")
+        os.chmod(source, 0o755)
+        entry = mod.host_path(self.root, mod.GEMINI_BWRAP_ENTRY)
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_bytes(b"#!/bin/sh\nv1\n")
+        with (
+            patch.object(mod.shutil, "which", return_value=str(source)),
+            patch.object(mod.os, "replace", wraps=mod.os.replace) as replace_mock,
+        ):
+            mod.install_managed_bwrap(host_root=self.root)
+        replace_mock.assert_called_once()
+        self.assertEqual(entry.read_bytes(), source.read_bytes())
+
     def test_managed_entry_configuration_detection(self):
         self._stage_userns_restricted(mediated=True)
         self.assertFalse(mod.managed_bwrap_entry_configured(host_root=self.root))
