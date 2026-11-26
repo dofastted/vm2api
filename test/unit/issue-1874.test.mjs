@@ -16,21 +16,29 @@ import {
 } from '../../src/lib/admin/vm-test-preheat-window.mjs'
 import { parseResetMs } from '../../src/lib/pool/quota-window.mjs'
 
-const codexVm = {
-  id: 'vm-codex',
-  platform: 'openai',
-  codex: {
-    has_access: true,
-    extra: {
-      codex_secondary_used_percent: 42,
-      codex_secondary_window_minutes: 300,
-      codex_secondary_reset_at: '2026-11-26T18:00:00.000Z',
-      codex_primary_used_percent: 12,
-      codex_primary_window_minutes: 10080,
-      codex_primary_reset_at: '2026-12-01T00:00:00.000Z',
+const FIXED_NOW = Date.parse('2026-10-01T12:00:00.000Z')
+const RESET_FUTURE_MS = FIXED_NOW + 6 * 3600_000
+const RESET_EXPIRED_MS = FIXED_NOW - 3600_000
+
+function codexVmWithReset(resetAt) {
+  return {
+    id: 'vm-codex',
+    platform: 'openai',
+    codex: {
+      has_access: true,
+      extra: {
+        codex_secondary_used_percent: 42,
+        codex_secondary_window_minutes: 300,
+        codex_secondary_reset_at: resetAt,
+        codex_primary_used_percent: 12,
+        codex_primary_window_minutes: 10080,
+        codex_primary_reset_at: new Date(FIXED_NOW + 7 * 24 * 3600_000).toISOString(),
+      },
     },
-  },
+  }
 }
+
+const codexVm = codexVmWithReset(new Date(RESET_FUTURE_MS).toISOString())
 
 class MemorySettings {
   values = new Map()
@@ -66,8 +74,12 @@ test('mergeVmTestSchedulePreserve keeps preheat mode when the save body omits it
   })
   assert.equal(merged.mode, 'preheat')
   assert.equal(merged.auto_renew, true)
-  const explicit = mergeVmTestSchedulePreserve({ ...panelSaveBody, mode: 'test' }, { mode: 'preheat' })
+  const explicit = mergeVmTestSchedulePreserve(
+    { ...panelSaveBody, mode: 'test' },
+    { mode: 'preheat', auto_renew: true },
+  )
   assert.equal(explicit.mode, 'test')
+  assert.equal(explicit.auto_renew, undefined)
 })
 
 test('VmTestScheduleRunner.save preserves preheat fields from the panel payload', () => {
@@ -98,28 +110,119 @@ test('VmTestScheduleRunner.save preserves preheat fields from the panel payload'
   assert.equal(stored.prompt, 'new prompt')
 })
 
+test('VmTestScheduleRunner.save accepts mode=test when stored plan was preheat+auto_renew', () => {
+  const settings = new MemorySettings()
+  settings.set(`${VM_TEST_SCHEDULE_PREFIX}vm-codex`, {
+    enabled: true,
+    mode: 'preheat',
+    auto_renew: true,
+    frequency: 'daily',
+    time: '09:00',
+    timezone: 'Asia/Shanghai',
+    cron: '0 9 * * *',
+    model: 'gpt-5-codex',
+    prompt: 'old',
+    max_tokens: null,
+    reasoning_effort: 'medium',
+  })
+  const schedule = new VmTestScheduleRunner({
+    projectRoot: '/missing',
+    settings: () => settings,
+    list: () => [codexVm],
+    runTest: async () => ({ ok: true }),
+  })
+  const saved = schedule.save('vm-codex', { ...panelSaveBody, mode: 'test' })
+  assert.equal(saved.mode, 'test')
+  assert.equal(saved.auto_renew, false)
+})
+
 test('resolvePreheatFiveHourWindow reads Codex extra instead of accountQuota.unified', () => {
   const quota = {
     snapshot: () => ({
       accounts: [{ vm_id: 'vm-codex', account_id: 'vm-codex', unified: { '5h': { utilization: 0, reset: null } } }],
     }),
   }
-  const w5 = resolvePreheatFiveHourWindow(codexVm, { projectRoot: null, accountQuota: quota })
+  const w5 = resolvePreheatFiveHourWindow(codexVm, {
+    projectRoot: null,
+    accountQuota: quota,
+    now: FIXED_NOW,
+  })
   assert.ok(w5.reset)
   assert.equal(Number(w5.utilization).toFixed(2), '0.42')
 })
 
 test('preheatNextWindowEnd returns Codex 5h reset without a Claude quota row', () => {
-  const now = Date.parse('2026-11-26T12:00:00.000Z')
-  const end = preheatNextWindowEnd(codexVm, { projectRoot: null, accountQuota: { snapshot: () => ({ accounts: [] }) } })
-  assert.equal(end, Date.parse('2026-11-26T18:00:00.000Z'))
+  const end = preheatNextWindowEnd(codexVm, {
+    projectRoot: null,
+    accountQuota: { snapshot: () => ({ accounts: [] }) },
+    now: FIXED_NOW,
+  })
+  assert.equal(end, RESET_FUTURE_MS)
   const live = preheatWindowState(codexVm, {
     projectRoot: null,
     accountQuota: { snapshot: () => ({ accounts: [] }) },
-    now,
+    now: FIXED_NOW,
   })
   assert.equal(live.windowLive, true)
   assert.equal(live.hasCredential, true)
+})
+
+test('preheatNextWindowEnd keeps elapsed Codex reset for auto-renew sweeps', () => {
+  const expiredVm = codexVmWithReset(new Date(RESET_EXPIRED_MS).toISOString())
+  expiredVm.codex.extra.codex_secondary_used_percent = 100
+  const end = preheatNextWindowEnd(expiredVm, {
+    projectRoot: null,
+    accountQuota: { snapshot: () => ({ accounts: [] }) },
+    now: FIXED_NOW,
+  })
+  assert.equal(end, RESET_EXPIRED_MS)
+  const live = preheatWindowState(expiredVm, {
+    projectRoot: null,
+    accountQuota: { snapshot: () => ({ accounts: [] }) },
+    now: FIXED_NOW,
+  })
+  assert.equal(live.windowLive, false)
+})
+
+test('auto-renew sweep fires preheat when Codex 5h reset has elapsed', async () => {
+  const expiredVm = codexVmWithReset(new Date(RESET_EXPIRED_MS).toISOString())
+  expiredVm.codex.extra.codex_secondary_used_percent = 100
+  let calls = 0
+  const settings = new MemorySettings()
+  settings.set(`${VM_TEST_SCHEDULE_PREFIX}vm-codex`, {
+    enabled: true,
+    mode: 'preheat',
+    auto_renew: true,
+    frequency: 'daily',
+    time: '09:00',
+    timezone: 'Asia/Shanghai',
+    cron: '0 9 * * *',
+    model: 'gpt-5-codex',
+    prompt: 'ping',
+    max_tokens: null,
+    reasoning_effort: 'medium',
+  })
+  const schedule = new VmTestScheduleRunner({
+    projectRoot: '/missing',
+    settings: () => settings,
+    list: () => [expiredVm],
+    runTest: async () => {
+      calls += 1
+      return { ok: true, duration_ms: 1 }
+    },
+    windowState: () => ({ hasCredential: true, schedulable: true, windowLive: false }),
+    nextWindowEnd: (vmId) =>
+      preheatNextWindowEnd(expiredVm, {
+        projectRoot: null,
+        accountQuota: { snapshot: () => ({ accounts: [] }) },
+        now: FIXED_NOW,
+      }),
+    now: () => FIXED_NOW,
+  })
+  schedule.start()
+  await schedule._sweepElapsedWindows()
+  assert.equal(calls, 1)
+  schedule.stop()
 })
 
 test('fiveHourWindowFromCodexVm reads vm file extra on disk', () => {
@@ -127,15 +230,16 @@ test('fiveHourWindowFromCodexVm reads vm file extra on disk', () => {
   const vmId = 'vm-codex-disk'
   const vmDir = path.join(root, 'vms', vmId)
   fs.mkdirSync(vmDir, { recursive: true })
+  const diskReset = new Date(FIXED_NOW + 5 * 3600_000).toISOString()
   const extra = {
     codex_secondary_used_percent: 5,
     codex_secondary_window_minutes: 300,
-    codex_secondary_reset_at: '2026-11-27T10:00:00.000Z',
+    codex_secondary_reset_at: diskReset,
   }
   fs.writeFileSync(
     path.join(root, 'vms', `${vmId}.json`),
     JSON.stringify({ id: vmId, platform: 'openai', codex: { extra } }),
   )
-  const w5 = fiveHourWindowFromCodexVm(root, { id: vmId, platform: 'openai', codex: { extra } })
-  assert.equal(parseResetMs(w5.reset), Date.parse('2026-11-27T10:00:00.000Z'))
+  const w5 = fiveHourWindowFromCodexVm(root, { id: vmId, platform: 'openai' }, FIXED_NOW)
+  assert.equal(parseResetMs(w5.reset), Date.parse(diskReset))
 })
