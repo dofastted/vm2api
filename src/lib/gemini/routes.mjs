@@ -793,7 +793,7 @@ function authorizationInput(body) {
   }
 }
 
-function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, ownerUserId = null } = {}) {
+function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, forBinding = false, ownerUserId = null } = {}) {
   if (!validId(proxyId)) throw hostError('gemini_proxy_unavailable', 409)
   const targetOwner = normalizeOwnerId(ownerUserId)
   const scopedList = proxyPool?.snapshot({ ownerUserId: targetOwner || null })?.proxies || []
@@ -811,6 +811,8 @@ function proxyFor(proxyPool, proxyId, { allowUnhealthy = false, ownerUserId = nu
     // max_failures; Gemini scheduling should mirror that, not treat one timeout
     // as unavailable while the row is still admitted for inference.
     (!allowUnhealthy && proxy.status === 'dead') ||
+    // New binds mirror allocateForVm: a probe `fail` row is not offered for selection.
+    (forBinding && proxy.status === 'fail') ||
     !ownerAllowed ||
     proxy.blocked_reason
   ) {
@@ -1170,7 +1172,7 @@ export function createGeminiPanelHandler({
           return fail(400, 'gemini_oauth_import_invalid', HOST_ERRORS.gemini_oauth_import_invalid[1])
         }
         const ownerUserId = normalizeOwnerId(body?.owner_user_id)
-        const proxyUrl = proxyFor(proxyPool(), body.proxy_id, { ownerUserId })
+        const proxyUrl = proxyFor(proxyPool(), body.proxy_id, { ownerUserId, forBinding: true })
         let created = await callHost('create', {
           name,
           proxy_id: body.proxy_id,
@@ -1379,7 +1381,7 @@ export function createGeminiPanelHandler({
           id,
           previous_proxy_id: environment.proxy_id,
           proxy_id: proxyId,
-          proxy_url: proxyFor(proxyPool(), proxyId, { ownerUserId: envOwner }),
+          proxy_url: proxyFor(proxyPool(), proxyId, { ownerUserId: envOwner, forBinding: true }),
         })
         geminiScheduler?.invalidateCatalogCache?.()
         return ok(toEnvView(result, { id, proxyId, ownerUserId: envOwner }))
