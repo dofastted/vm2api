@@ -143,6 +143,68 @@ function opaque429Setting(value, fallback, min, max) {
   return Math.min(max, Math.max(min, Math.trunc(n)))
 }
 
+const CIRCUIT_DEDUPE_TTL_MS = 10 * 60_000
+const CIRCUIT_DEDUPE_MAX_ENTRIES = 5000
+
+/**
+ * One (session, unit) pair may only charge the unit circuit once per window.
+ *
+ * #1796 counts upstream 400/403 toward UnitCircuit on purpose: a slot that
+ * rejects what other slots accept is a slot problem, and three strikes park
+ * it. That reasoning holds when *some* slots are bad. When every slot shares
+ * the defect -- a kernel build that mangles the outbound body, say -- an
+ * unlucky client walks the pool and parks every slot in turn, so capacity
+ * drops to zero and no slot was ever going to answer. Charging each session
+ * once keeps the cross-session signal (several sessions failing on one slot
+ * still parks it) while denying any single caller the ability to take a slot
+ * down by retrying.
+ */
+export const sessionCircuitDedupe = {
+  seen: new Map(),
+  key(sessionKey, accountId) {
+    return `${sessionKey}\u0000${accountId}`
+  },
+  /** True when this pair has not been charged inside the window. */
+  shouldCount(sessionKey, accountId, now = Date.now()) {
+    // No session identity means no dedupe: fall back to #1796's behaviour.
+    if (!sessionKey || !accountId) return true
+    const key = this.key(sessionKey, accountId)
+    const last = this.seen.get(key)
+    if (last != null && now - last < CIRCUIT_DEDUPE_TTL_MS) return false
+    this.prune(now)
+    this.seen.set(key, now)
+    return true
+  },
+  clear(sessionKey, accountId) {
+    if (!sessionKey || !accountId) return
+    this.seen.delete(this.key(sessionKey, accountId))
+  },
+  /** Drop aged-out pairs once half full; hard-cap so a key explosion cannot grow it without bound. */
+  prune(now = Date.now()) {
+    if (this.seen.size < CIRCUIT_DEDUPE_MAX_ENTRIES / 2) return
+    for (const [key, at] of this.seen) {
+      if (now - at >= CIRCUIT_DEDUPE_TTL_MS) this.seen.delete(key)
+    }
+    // Still over the cap means live pairs, not stale ones. Dropping them only
+    // reverts to #1796's accounting, which is safe, just less forgiving.
+    if (this.seen.size >= CIRCUIT_DEDUPE_MAX_ENTRIES) this.seen.clear()
+  },
+  reset() {
+    this.seen.clear()
+  },
+}
+
+/**
+ * Only the request-scoped `stop` fallback is deduped. Unit-scoped circuits
+ * (provider_overloaded, organization_disabled, credential_refresh_failed) each
+ * describe the unit itself and must keep charging on every hit, or #1796 loses
+ * the sensitivity it was built for.
+ */
+function countsTowardCircuit(policy, sessionKey, accountId) {
+  if (policy?.scope !== 'request' || policy?.action !== 'stop') return true
+  return sessionCircuitDedupe.shouldCount(sessionKey, accountId)
+}
+
 const DEFAULTS = {
   max_account_switches: 3,
   max_total_attempts: 12,
@@ -759,12 +821,15 @@ export class FailoverRunner {
     })
   }
 
-  noteUnitHealth(selected, policy, result) {
+  noteUnitHealth(selected, policy, result, { sessionKey = null } = {}) {
     const circuit = this.scheduler?.unitCircuit
     if (circuit && selected?.accountId) {
-      if (policy?.circuit) circuit.recordFailure(selected.accountId)
-      else if (verifiedSuccess(result)) circuit.recordSuccess(selected.accountId)
-      else circuit.releaseProbe?.(selected.accountId)
+      if (policy?.circuit) {
+        if (countsTowardCircuit(policy, sessionKey, selected.accountId)) circuit.recordFailure(selected.accountId)
+      } else if (verifiedSuccess(result)) {
+        sessionCircuitDedupe.clear(sessionKey, selected.accountId)
+        circuit.recordSuccess(selected.accountId)
+      } else circuit.releaseProbe?.(selected.accountId)
     }
 
     const vmId = selected?.vmId
@@ -1520,7 +1585,7 @@ export class FailoverRunner {
 
         lastResult = result
         lastPolicy = policy
-        this.noteUnitHealth(selected, policy, result)
+        this.noteUnitHealth(selected, policy, result, { sessionKey: stickyKey })
         this.noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result)
         if (attemptMeta?.sessionId) {
           bindAll(
@@ -1755,7 +1820,7 @@ export class FailoverRunner {
         )
         lastResult = result
         lastPolicy = policy
-        this.noteUnitHealth(selected, policy, result)
+        this.noteUnitHealth(selected, policy, result, { sessionKey: stickyKey })
         this.noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result)
         notifyProxyFailure(this.onProxyFailure, selected, policy)
         this.attemptsRepo?.complete?.(requestId, attemptNo, {

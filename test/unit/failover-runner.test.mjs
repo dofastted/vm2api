@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { FailoverRunner, opaque429Tracker } from '../../src/lib/pool/failover-runner.mjs'
+import { FailoverRunner, opaque429Tracker, sessionCircuitDedupe } from '../../src/lib/pool/failover-runner.mjs'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -3611,4 +3611,145 @@ test('upstream 400 stops without failover while 400 and 403 both count toward Un
   })
   assert.equal(r5.ok, true)
   assert.deepEqual(hop5Vms, ['vm-B'])
+})
+
+/**
+ * #1796 counts upstream 400/403 toward the unit circuit on purpose. These
+ * cases pin the one exception: a single session may charge a given unit only
+ * once for the request-scoped stop fallback, so a client stuck on a body that
+ * every slot rejects cannot park the whole pool. Cross-session evidence and
+ * unit-scoped circuits are untouched.
+ */
+function circuitHarness() {
+  const now = 10_000
+  const unitCircuit = new UnitCircuit({ failureThreshold: 3, openMs: 30_000, now: () => now })
+  const candidates = [
+    { vmId: 'vm-A', accountId: 'account-A', waitMs: 0 },
+    { vmId: 'vm-B', accountId: 'account-B', waitMs: 0 },
+  ]
+  const scheduler = {
+    unitCircuit,
+    async selectAndReserve({ excluded }) {
+      const picked = candidates.find(
+        (item) =>
+          !excluded.has(item.accountId) && !excluded.has(item.vmId) && unitCircuit.inspect(item.accountId, now).ok,
+      )
+      if (!picked) return { ok: false, reason: 'no_eligible_accounts' }
+      const hold = unitCircuit.admit(picked.accountId, now)
+      if (!hold.ok) return { ok: false, reason: hold.reason }
+      return { ...picked, ok: true, release() {} }
+    },
+    markCooldown() {},
+    markSuccess() {},
+    releaseAccountSessions() {},
+  }
+  return {
+    unitCircuit,
+    runner: new FailoverRunner({ scheduler, config: { same_account_retry_delay_ms: 0 } }),
+  }
+}
+
+const genericUpstream400 = () => ({
+  ok: false,
+  status: 400,
+  terminalState: 'rejected',
+  body: { type: 'error', error: { type: 'invalid_request_error', message: 'bad upstream payload' } },
+})
+
+test('#5 one session charges a unit circuit once for the stop-400 fallback', async () => {
+  sessionCircuitDedupe.reset()
+  const { unitCircuit, runner } = circuitHarness()
+
+  for (const attempt of [1, 2, 3, 4]) {
+    const result = await runner.run({
+      requestId: `req-dedupe-${attempt}`,
+      stickyKey: 'session-A',
+      canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+      model: 'claude-sonnet-5',
+      callAttempt: genericUpstream400,
+    })
+    // The caller still gets its 400 every time; only the circuit accounting changes.
+    assert.equal(result.status, 400, `attempt ${attempt}`)
+  }
+  assert.equal(unitCircuit.snapshot('account-A').failures, 1, 'one session must not stack failures')
+  assert.equal(unitCircuit.snapshot('account-A').state, 'closed', 'the slot must stay routable')
+})
+
+test('#5 separate sessions still park a slot that rejects what others accept', async () => {
+  sessionCircuitDedupe.reset()
+  const { unitCircuit, runner } = circuitHarness()
+
+  for (const session of ['session-1', 'session-2', 'session-3']) {
+    await runner.run({
+      requestId: `req-cross-${session}`,
+      stickyKey: session,
+      canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+      model: 'claude-sonnet-5',
+      callAttempt: genericUpstream400,
+    })
+  }
+  assert.equal(unitCircuit.snapshot('account-A').failures, 3, 'cross-session evidence must still accumulate')
+  assert.equal(unitCircuit.snapshot('account-A').state, 'open')
+})
+
+test('#5 unit-scoped circuits keep charging on every hit from one session', async () => {
+  sessionCircuitDedupe.reset()
+  const { unitCircuit, runner } = circuitHarness()
+
+  // organization_disabled is account-scoped: it describes the unit, not the
+  // request, so the dedupe must not apply to it.
+  for (const attempt of [1, 2, 3]) {
+    await runner.run({
+      requestId: `req-org-${attempt}`,
+      stickyKey: 'session-A',
+      canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+      model: 'claude-sonnet-5',
+      callAttempt: ({ candidate }) =>
+        candidate.vmId === 'vm-A'
+          ? {
+              ok: false,
+              status: 400,
+              terminalState: 'rejected',
+              body: { type: 'error', error: { message: 'This organization has been disabled.' } },
+            }
+          : success('ok-from-b'),
+    })
+  }
+  assert.equal(unitCircuit.snapshot('account-A').failures, 3, 'unit-scoped failures must not be deduped')
+  assert.equal(unitCircuit.snapshot('account-A').state, 'open')
+})
+
+test('#5 a verified success clears the session dedupe so later failures count again', async () => {
+  sessionCircuitDedupe.reset()
+  const { unitCircuit, runner } = circuitHarness()
+  const body = { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] }
+
+  await runner.run({
+    requestId: 'req-clear-1',
+    stickyKey: 'session-A',
+    canonicalBody: body,
+    model: 'claude-sonnet-5',
+    callAttempt: genericUpstream400,
+  })
+  assert.equal(unitCircuit.snapshot('account-A').failures, 1)
+
+  // A success resets the circuit's own counter and the dedupe entry with it.
+  await runner.run({
+    requestId: 'req-clear-ok',
+    stickyKey: 'session-A',
+    canonicalBody: body,
+    model: 'claude-sonnet-5',
+    callAttempt: () => success(),
+  })
+  assert.equal(unitCircuit.snapshot('account-A').failures, 0)
+
+  // So the next failure is a fresh incident rather than a silenced repeat.
+  await runner.run({
+    requestId: 'req-clear-2',
+    stickyKey: 'session-A',
+    canonicalBody: body,
+    model: 'claude-sonnet-5',
+    callAttempt: genericUpstream400,
+  })
+  assert.equal(unitCircuit.snapshot('account-A').failures, 1)
 })
