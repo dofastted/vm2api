@@ -160,6 +160,71 @@ test('gemini_session_conflict retries on same account with fresh conversation_id
   assert.equal(turn.attempts?.[0]?.action, 'session_retry')
 })
 
+test('gemini_session_conflict clears sticky when max_account_switches is 0 (no retry)', async () => {
+  const inferCalls = []
+  let attempt = 0
+  const sticky = 'key:test:mas0-sticky-clear'
+
+  const scheduler = createGeminiScheduler({
+    ...hostStub([OAUTH_ENV], async (_op, payload) => {
+      inferCalls.push({ convId: payload.body?.conversation_id })
+      attempt += 1
+      if (attempt === 1) return sseOk('seed sticky')
+      if (attempt === 2) {
+        return jsonInferError(409, { code: 'tool_continuation_aborted', error: 'aborted' })
+      }
+      return sseOk('after clear')
+    }),
+    getRoutingConfig: () => ({
+      gemini: {
+        sticky: { enabled: true, ttl_seconds: 3600 },
+        pool: { strategy: 'balanced', max_concurrency_per_account: 4, timeout_ms: 120_000 },
+        failover: { max_account_switches: 0 },
+      },
+    }),
+  })
+
+  const apiKey = { id: 'key-test', group_type: 'gemini' }
+  const body = { contents: [{ role: 'user', parts: [{ text: 'x' }] }] }
+
+  const first = await scheduler.stream({
+    model: 'gemini-3-pro',
+    geminiBody: body,
+    stickyKey: sticky,
+    apiKeyRecord: apiKey,
+  })
+  assert.equal(first.text, 'seed sticky')
+  const boundConv = inferCalls[0].convId
+  assert.ok(boundConv)
+
+  try {
+    await scheduler.stream({
+      model: 'gemini-3-pro',
+      geminiBody: body,
+      stickyKey: sticky,
+      apiKeyRecord: apiKey,
+    })
+    assert.fail('expected gemini_session_conflict')
+  } catch (err) {
+    assert.equal(err.code, 'gemini_session_conflict')
+    assert.equal(err.attemptCount, 1)
+  }
+  assert.equal(inferCalls[1].convId, boundConv)
+
+  const third = await scheduler.stream({
+    model: 'gemini-3-pro',
+    geminiBody: body,
+    stickyKey: sticky,
+    apiKeyRecord: apiKey,
+  })
+  assert.equal(third.text, 'after clear')
+  assert.notEqual(
+    inferCalls[2].convId,
+    boundConv,
+    'sticky clear must drop bound conversation after session conflict',
+  )
+})
+
 test('gemini_session_conflict is only retried once (no infinite retry)', async () => {
   const inferCalls = []
 
