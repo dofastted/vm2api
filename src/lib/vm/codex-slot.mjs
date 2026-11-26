@@ -12,6 +12,7 @@ import {
   hasSpendableCodexCredits,
 } from '../protocol/codex-usage.mjs'
 import { openaiClaimsFromIdToken, openaiIdentityFromOauthTokens } from '../oauth/openai-jwt.mjs'
+import { applyUnschedulable } from '../pool/schedule-state.mjs'
 
 export { isCodexVm }
 
@@ -354,6 +355,36 @@ export function persistCodexCredentialState(projectRoot, vmId, { error = null, a
   return vm
 }
 
+/**
+ * Codex grant 死亡（token_revoked / invalidated oauth token）：对齐 claude 池
+ * markVmRefreshError 的落点，复用 schedule-state 权威 mutator 写四态
+ * unschedulable（仅操作员导入可清）并停调度。上游吊销文案靠 5 分钟内存 hold
+ * 挡不住，必须落盘摘池，面板才能显示「不可调度 · 凭证吊销」。
+ * 已有其他 unschedulable 诊断（如 organization_disabled）不覆盖，保留原判词。
+ */
+export function markCodexGrantDead(projectRoot, vmId, detail = null, { tokenVersion = null } = {}) {
+  if (!projectRoot || !vmId) return null
+  const file = path.join(projectRoot, 'vms', `${vmId}.json`)
+  let vm
+  try {
+    vm = readJsonCached(file)
+  } catch {
+    return null
+  }
+  if (!vm || typeof vm !== 'object') return null
+  if (vm.unschedulable?.reason) return vm
+  // 磁盘票在本次 401 之后被操作员换新（重导入/revive）：迟到 park 不得打死新票。
+  if (tokenVersion != null && vm.codex?._token_version != null && Number(vm.codex._token_version) > tokenVersion) {
+    return vm
+  }
+  const message = String(detail?.description || detail?.error || detail || '').slice(0, 300) || null
+  // 复用四态权威 mutator：字段推导（schedulable/schedule_manual/…）与 claude 池同源。
+  applyUnschedulable(vm, 'oauth_revoked', { message, upstream: detail?.status || null })
+  if (String(vm.status || '').toLowerCase() === 'running') vm.status = 'paused'
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  return vm
+}
+
 export function persistCodexQuotaSnapshot(projectRoot, vmId, { extra, resetCredits, credits, planType, now } = {}) {
   if (!projectRoot || !vmId) throw new Error('projectRoot and vmId required')
   const stampNow = Number.isFinite(now) ? Number(now) : Date.now()
@@ -425,5 +456,9 @@ export function summarizeCodexSlot(projectRoot, vm = {}) {
     reset_credits: vm.codex?.reset_credits || null,
     credits: vm.codex?.credits || null,
     plan_type: vm.codex?.plan_type || null,
+    // 凭证健康状态透出：oauth_revoked=吊销 / refresh_rejected=刷新被拒 / null=健康。
+    // 面板据此显示具体状态而非笼统「受限」。
+    refresh_error: vm.codex?.refresh_error || vm.refresh_error || null,
+    refresh_error_at: vm.codex?.refresh_error_at || null,
   }
 }

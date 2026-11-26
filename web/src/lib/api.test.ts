@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   ApiError,
+  api,
   cragDeviceApi,
   loginRequest,
   loginTotpRequest,
@@ -222,6 +223,75 @@ describe('two-step sign-in', () => {
     await expect(
       loginRequest({ username: 'admin', password: 'pw', base: '' })
     ).rejects.toBeInstanceOf(ApiError)
+  })
+})
+
+describe('没有 message 的失败响应', () => {
+  beforeEach(() => {
+    installBrowser()
+    setSession('kin-panel-test-token')
+  })
+
+  afterEach(() => vi.unstubAllGlobals())
+
+  function stubStatus(status: number, body = '{}', statusText?: string) {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(body, {
+            status,
+            ...(statusText === undefined ? {} : { statusText }),
+          })
+      )
+    )
+  }
+
+  it('带出状态码，不再只说一句「请求失败」', async () => {
+    // HTTP/2 下 `statusText` 恒为空串，状态码是唯一剩下的线索。
+    stubStatus(502)
+    await expect(api('/api/panel/vms/v1/oauth/exchange-code')).rejects.toThrow(
+      '请求失败 (502)'
+    )
+  })
+
+  it('网关返回 HTML 错误页时同样能看出状态码', async () => {
+    // 反代 / WAF 拦截时响应体不是 JSON，`res.json()` 退化成 `{}`；状态码
+    // 是此时唯一能把网关拦截和后端业务错误分开的依据。
+    stubStatus(403, '<!DOCTYPE html><title>403 Forbidden</title>')
+    await expect(api('/api/panel/vms/v1/oauth/exchange-code')).rejects.toThrow(
+      '请求失败 (403)'
+    )
+  })
+
+  it('保留 statusText 并补上状态码', async () => {
+    stubStatus(504, '{}', 'Gateway Timeout')
+    await expect(api('/api/panel/vms/v1/oauth/exchange-code')).rejects.toThrow(
+      '请求失败 (504 Gateway Timeout)'
+    )
+  })
+
+  it('2xx 的 ok:false envelope 报出那个 2xx', async () => {
+    stubStatus(200, JSON.stringify({ ok: false }))
+    await expect(api('/api/panel/vms/v1')).rejects.toThrow('请求失败 (200)')
+  })
+
+  it('后端给了 message 就不动它', async () => {
+    stubStatus(
+      400,
+      JSON.stringify({
+        ok: false,
+        error: { code: 'proxy_required', message: '虚拟机未绑定 SOCKS5' },
+      })
+    )
+    await expect(api('/api/panel/vms/v1/oauth/exchange-code')).rejects.toThrow(
+      '虚拟机未绑定 SOCKS5'
+    )
+  })
+
+  it('cragDeviceApi 走同一套兜底', async () => {
+    stubStatus(502)
+    await expect(cragDeviceApi('/orders')).rejects.toThrow('请求失败 (502)')
   })
 })
 

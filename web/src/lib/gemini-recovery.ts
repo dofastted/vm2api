@@ -28,6 +28,7 @@ const hostIssues: Record<string, true> = {
   gemini_native_worker_unavailable: true,
   gemini_native_config_invalid: true,
   gemini_native_bridge_timeout: true,
+  gemini_client_unsupported: true,
   gemini_terminal_unavailable: true,
   gemini_inference_start_failed: true,
   gemini_test_oauth_unsupported: true,

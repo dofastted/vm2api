@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## 1.4.225 — 2026-11-26 · 修复 Claude Code `response stream was malformed`（`response_headers` 子串误过滤与保活帧交错）；CRAG 内核白名单保留 `tool_use.extension`；恢复详情面完整邮箱展示与名称优先语义
+
+- **修复下游 Claude Code `API Error: The response stream was malformed` 且网关零错误日志（#1888）**：
+  - `src/lib/protocol/handle-protocol.mjs`：新增 `createResponseHeadersSseFilter()`，仅丢弃真正的 `response_headers` 控制帧（`event: response_headers` 或 JSON `type === "response_headers"`）。此前 `/response_headers/.test(line)` 会命中任何正文/思考/工具 JSON 中含该字面量的模型增量，而前导 `event: content_block_delta` 与尾随空行仍被写出，下游收到空 `data` 触发 `JSON.parse("")` → `SyntaxError`，网关侧却记录 `200 OK`。
+  - `src/lib/protocol/stream-keepalive.mjs`：保活心跳在具名 SSE 帧（`event:` 到空行之间）写入中时让行（`inFrame` 守卫），避免切断 SSE 帧；在 `message_start` / `message_delta` / `endAttempt()` 时清理活动块状态，支持 `server_tool_use`，并阻止已关闭索引的增量重新装载 `blockIndex`，消除 `StreamMalformedEventError("closed")`。
+  - `src/lib/transport/go-worker-client.mjs`：非 handoff SSE 读取改用 `StringDecoder("utf8")` + `decoder.end()`，修复跨 TCP 分块的多字节字符被 `chunk.toString("utf8")` 截断损坏。
+  - 新增回归 `test/unit/stream-keepalive.test.mjs`、`test/unit/stream-queue-keepalive.test.mjs`。
+- **恢复管理面详情页完整邮箱与名称优先标题语义（#1880，修 #1819 回归）**：
+  - `web/src/lib/vm-kind.ts`、`web/src/components/platform-chip.tsx`：`slotDisplayTitle` / `SlotIdentity` 恢复「自定义名称优先 → 邮箱 → id」，不再让脱敏邮箱顶掉自定义名称（此前破坏详情页标题、各弹窗标题、集群表与 key 弹窗的既有命名工作流）。
+  - `web/src/features/vm/vm-detail-card.tsx`、`detail-status-board.tsx`、`detail-account-tab.tsx`、`vm-row-detail.tsx`、`web/src/features/import/gemini-environments.tsx`：详情卡「邮箱」、状态板、账号 tab「ChatGPT 账号」、行展开详情与 Gemini 环境详情直出完整邮箱（admin-only 控制台的账号审阅、换邮箱核对与风控判读主键）；列表/网格/选择器维持 `formatSlotEmail` 脱敏 + 悬停 title 全文，防偷窥口径不变。
+  - `web/src/features/vm/vm-stats-dialog.tsx`、`web/src/features/keys/key-limits-dialog.tsx`：修正悬停 title 不再挂脱敏字符串。
+- **修复 CRAG 零信任白名单丢弃 `tool_use.extension` 致已发工具重放在逐跳净化时失效（#1893）**：
+  - `src/lib/protocol/crag-whitelist.mjs`：`BLOCK_KEYS_BY_TYPE.tool_use` 键集补回 `extension`。#1731 的零信任白名单按类型键集重建每个内容块，`tool_use` 键集遗漏该键，`pickKeys` 因此在 CRAG 路径上将其丢弃——`handle-protocol.mjs` 恢复的网关自有已发工具重放（含 `extension`）在随后的逐跳净化中被再次抹掉。该值由重放账本铸造并覆盖客户端回传内容，且 CRAG 续接哈希覆盖这些字节，必须原样透传（与 `thinking.block_binding` 同形，`cli-node` 侧 `kernel-request.mjs` 本就保留）。
+  - `test/unit/outbound-log-envelope.test.mjs` 对齐 #1731 的出站信封断言语义，并将 `outbound-log-envelope` 纳入 `package.json` 的核心测试集。
+- 部署说明：本次改动仅涉及控制面（`src/lib/protocol/`、`src/lib/transport/`）与前端（`web/src/`）；`deploy/payload.json`（CRAG `3.1.21` 与 CRAGGemini `0.4.13`）、数据库迁移结构、Gemini 宿主脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.224` 均未变，预期 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex/Gemini 槽位，重启 `vm2api` 一次即可生效。
+
+## 1.4.224 — 2026-11-26 · 加固 CRAG 订阅/商城归属与直充续费链路、对齐 CRAGGemini 订阅同步；CRAG 槽位内核能力重派与计费增强；Gemini 回调会话与零令牌排空归并
+
+- **CRAG 订阅与商城重构回归修复与归属安全加固（配套 `dofastted/crag#30` 与新版 `crag-shop`）**：
+  - `src/lib/vm/crag-subscription.mjs`、`src/lib/admin/crag-subscription-routes.mjs` 及前端 `crag-device-identity.tsx`、`crag-host-subscription.tsx`、`crag-cloud-orders.tsx`、`crag-subscription-errors.ts`、`queries.ts`：整机迁移（`POST /api/panel/crag-subscription/migrate`）要求提供原宿主机下任一历史订单号或原 `CRAGR1` 兑换码作为归属凭证并在迁入时立即绑定目标宿主机随机凭据；首次直充拉取 `CRAGH2` 权益后立即通过 `/recover` 替换临时占位凭据；修正云端历史订单面板有效兑换券计数（兼容 `active` 布尔字段）与续费后动态有效期展示（优先 `grant_expires_at`）。
+  - `src/lib/admin/crag-shop.mjs`：修复已完成直充订单在 `POST /apply` 与 `POST /apply-renewal` 时因跳过远端状态检查误调 `/claim` 失败的问题，对直充订单执行 `/claim` 返回明确 `409 shop_direct_credit_no_voucher` 并自动同步宿主机权益。
+  - `src/lib/gemini/subscription.mjs`：对齐 `crag-auth-gemini` 订阅链路，支持无本地凭据的直充/迁移宿主机首次 `status({ sync: true })` 自动拉取 `CRAGH2` 权益并立即绑定本地随机凭据，同时在凭据失配时借助本地已签名权益自动执行 `/recover` 恢复。
+- **CRAG 协议预检、号池故障隔离与按模型 Advisor 计费增强**：
+  - 支持 `crag_drop_foreign_thinking` 的 `foreign_only` 状态（#1887），允许 `tool_addition` / `tool_removal` 块通过内核预检、计入嵌套 `tool_result` 缓存断点并在内核白名单中保留 `thinking.block_binding`；当槽位因内核能力拒绝时自动重派一次、对重复不透明 CRAG 429 施加模型级冷却并将单会话 `stop-400` 熔断记账收口为单次；从 `usage.iterations` 上报按模型拆分的 Advisor 用量与费用（#1886）。
+- **Gemini 回调日志与零令牌工具排空**：记录回调 `conversation_id`、为第三方请求提供 `session_id` 回退，并折叠零令牌工具排空帧（#1882）。
+- 部署说明：本次改动仅涉及控制面（`src/`）与前端（`web/src/`）；`deploy/payload.json`（CRAG `3.1.21` 与 CRAGGemini `0.4.13`）、数据库迁移结构、Gemini 宿主脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.223` 均未变，预期 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex 槽位，重启 `vm2api` 一次即可生效（整机迁移归属校验与优惠券锁价续费需配套已部署的新版 `crag-auth` 与 `crag-shop`）。
+
 ## 1.4.223 — 2026-11-26 · 钉选 CRAGGemini 0.4.13（阻止 `agy` 20k MCP 工具截断）并收紧线协议工具名 55 字符上限
 
 - **阻止 `agy 1.5.9` 20k Token 预算静默截断客户端/MCP 工具，并钉选 `CRAGGemini 0.4.13` 签名载荷**：

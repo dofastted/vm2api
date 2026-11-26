@@ -68,6 +68,31 @@ export function isCredentialRefreshTarget(vm) {
   return true
 }
 
+/**
+ * Codex 槽与 claude 槽同一张目标网（调度关也保活）：凭证文件在
+ * codex-credentials.json、容器是 Go worker（不跑 kin-worker oauth），刷新
+ * 走 auth.openai.com token 端点直连（refreshCodexAccessToken），不进
+ * slot-oauth。吊销（token_revoked）在该路径已归类 oauth_revoked，与
+ * markCodexGrantDead 的四态摘池共享落点。
+ */
+export function isCodexCredentialRefreshTarget(vm) {
+  if (!vm?.id || !isCodexVm(vm)) return false
+  if (!vm.has_refresh) return false
+  const status = String(vm.status || '').toLowerCase()
+  if (HARD_DOWN.has(status)) return false
+  if (!vmHasProxyPath(vm)) return false
+  // Grant 死亡已摘池（unschedulable 四态）：不再烧上游 token 端点。
+  if (String(vm.schedule_disabled_reason || '').match(/oauth_revoked|organization_disabled/)) return false
+  return true
+}
+
+export function codexNeedsScheduledRefresh(vm, now = Date.now(), skewMs = PROACTIVE_REFRESH_SKEW_MS) {
+  // 吊销标是终态（操作员导入才能清），死票不进 due；可重试类错误照常轮换。
+  const errors = [vm?.refresh_error, vm?.codex_refresh_error, vm?.codex?.refresh_error].filter(Boolean)
+  if (errors.some((code) => classifyCredentialRefresh({ error: { code } }) !== 'retryable')) return false
+  return needsRefresh(vm?.expires_at, now, skewMs)
+}
+
 const REVOKED_ACCESS = /access token has been revoked|token has been revoked|token_revoked|invalidated oauth token|oauth_revoked/i
 
 /** Operator hint only. Scheduled Ensure must not auto-force a still-unexpired ticket. */
@@ -135,7 +160,12 @@ export function createCredentialRefreshMonitor(opts = {}) {
     inflight = (async () => {
       const started = nowFn()
       const vms = opts.listTargets?.() || []
-      const due = vms.filter((vm) => isCredentialRefreshTarget(vm) && needsScheduledRefresh(vm, started))
+      const due = vms.filter(
+        (vm) =>
+          (isCodexVm(vm)
+            ? isCodexCredentialRefreshTarget(vm) && codexNeedsScheduledRefresh(vm, started)
+            : isCredentialRefreshTarget(vm) && needsScheduledRefresh(vm, started)),
+      )
       const items = []
       if (due.length && typeof opts.refreshOne === 'function') {
         await mapPool(due, config.concurrency, async (vm) => {

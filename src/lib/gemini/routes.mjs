@@ -20,7 +20,12 @@ import {
   isGeminiSeriesId,
   resolveGeminiDefaultEffort,
 } from '../protocol/gemini-model-policy.mjs'
-import { reasoningEffortOf, resolveGeminiReasoningEffort, sessionIdForLog } from '../protocol/log-fields.mjs'
+import {
+  THIRD_PARTY_CLIENT_SESSION_ID,
+  reasoningEffortOf,
+  resolveGeminiReasoningEffort,
+  sessionIdForLog,
+} from '../protocol/log-fields.mjs'
 import { createGeminiTerminalBridge } from './terminal.mjs'
 import { createGeminiMaintenanceHandler } from './maintenance.mjs'
 import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedModel } from './model-catalog.mjs'
@@ -46,7 +51,12 @@ const API_KEY = /^[A-Za-z0-9_-]{20,256}$/
 const RELEASE_CODE = /^CGG1-[A-Za-z0-9_-]{43}$/
 const STATES = new Set(['unverified', 'authorizing', 'authorized', 'reauth_required', 'disabled'])
 const ACCOUNT_STATES = new Set(['ok', 'partial', 'error', 'reauth_required'])
-const ACCOUNT_ELIGIBILITIES = new Set(['verification_required', 'location_unsupported', 'ineligible'])
+const ACCOUNT_ELIGIBILITIES = new Set([
+  'verification_required',
+  'location_unsupported',
+  'client_unsupported',
+  'ineligible',
+])
 const PAYLOAD_STATES = new Set(['installed', 'install_on_create', 'awaiting_redemption', 'not_configured', 'invalid'])
 const RUN_STATES = new Set(['running', 'completed', 'failed'])
 const RUN_ERRORS = {
@@ -61,6 +71,10 @@ const RUN_ERRORS = {
   gemini_account_verification_required: [
     403,
     'Google 要求先在浏览器完成该账号的身份验证（403 VALIDATION_REQUIRED）；拉取模型成功不代表可对话，请在对应账号浏览器打开「账号」页的 Google 验证链接完成核验后再试',
+  ],
+  gemini_client_unsupported: [
+    403,
+    'Google 拒绝当前 Antigravity 客户端版本或标识（403 UNSUPPORTED_CLIENT），并非账号订阅失效；请前往「设置 → Gemini 维护」更新至最新 CRAGGemini / CLI 版本，或刷新账号重试',
   ],
   gemini_account_ineligible: [
     403,
@@ -2127,8 +2141,9 @@ export function createGeminiPublicHandler({
       model: targetModel,
       defaultEffort: defaultGeminiEffort,
     })
-    if (!logBag.session_id) logBag.session_id = sessionIdForLog(stickyHeader)
-    logBag.outbound_session_id = sessionIdForLog(stickyHeader)
+    const inboundSessionId = sessionIdForLog(logBag.session_id) || sessionIdForLog(stickyHeader)
+    logBag.session_id = inboundSessionId || THIRD_PARTY_CLIENT_SESSION_ID
+    logBag.outbound_session_id = inboundSessionId
 
     if (keyGroupType === 'all' && !isAntigravityRoutedModel(targetModel)) {
       const msg = 'All-access keys must address Antigravity non-Gemini models with the ag- prefix.'
@@ -2212,6 +2227,21 @@ export function createGeminiPublicHandler({
       logBag.final_state = 'verified'
       logBag.attempt_count = Number.isInteger(turn?.attempt_count) ? turn.attempt_count : 1
       logBag.upstream_status = turn?.upstream_status ?? 200
+      const resolvedConvId = sessionIdForLog(turn?.conversation_id)
+      if (resolvedConvId) {
+        logBag.outbound_session_id = resolvedConvId
+      }
+      if (turn?.local_tool_drain) {
+        if (turn.tool_continuation_parent_request_id) {
+          logBag.merge_into_request_id = turn.tool_continuation_parent_request_id
+          logBag.tool_continuation = {
+            ...(resolvedConvId ? { conversation_id: resolvedConvId } : {}),
+            tools: Array.isArray(turn.toolCalls) ? turn.toolCalls.map((tc) => tc?.name).filter(Boolean) : [],
+          }
+        } else {
+          logBag.skip_log = true
+        }
+      }
       if (Array.isArray(turn?.attempts) && turn.attempts.length > 0) {
         logBag.hop_meta = {
           ...logBag.hop_meta,
@@ -2260,6 +2290,10 @@ export function createGeminiPublicHandler({
       }
       if (error.authMethod) logBag.via = error.authMethod === 'api_key' ? 'gemini_api_key' : 'craggemini'
       if (error.upstreamModel) logBag.upstream_model = error.upstreamModel
+      const resolvedErrorConvId = sessionIdForLog(error.conversationId)
+      if (resolvedErrorConvId) {
+        logBag.outbound_session_id = resolvedErrorConvId
+      }
       if (Array.isArray(error.attempts) && error.attempts.length > 0) {
         logBag.hop_meta = {
           ...logBag.hop_meta,
@@ -2517,6 +2551,9 @@ export function createGeminiPublicHandler({
       })
       if (controller.signal.aborted) {
         applyTurnLog(turn)
+        delete logBag.merge_into_request_id
+        delete logBag.tool_continuation
+        delete logBag.skip_log
         logBag.error_code = 'gemini_inference_cancelled'
         logBag.final_state = 'cancelled'
         ownLogStatusOverride = 499

@@ -56,6 +56,53 @@ function webSearchRequestsOf(usage) {
 }
 
 /**
+ * Per-model advisor token detail, read out of `usage.iterations`.
+ *
+ * The advisor tool runs a second model inside one turn and reports it as an
+ * `advisor_message` entry carrying its own `model`. Nothing in the codebase
+ * parsed `iterations`, so that model's tokens were invisible.
+ *
+ * Detail only -- this deliberately does not feed `total_cost`. Whether the
+ * top-level usage already includes these tokens is not settled: the one sample
+ * in the tree (native-handoff, `type: 'message'` entries) has the top level
+ * equal to the sum of its iterations, which would mean advisor tokens are
+ * already billed at the main model's rate rather than unbilled. Advisor
+ * requests are currently rejected upstream before any usage is produced, so
+ * there is no real sample to decide on. Surfacing the detail first makes that
+ * comparison possible the moment one exists; pricing it on a guess would
+ * either double-charge or under-charge real money.
+ *
+ * @returns {Array<{model: string|null, iterations: number, input_tokens: number,
+ *   output_tokens: number, cache_read_tokens: number, cache_creation_tokens: number}>|null}
+ */
+export function advisorUsageFromIterations(usage = {}) {
+  const iterations = usage?.iterations
+  if (!Array.isArray(iterations) || !iterations.length) return null
+  const byModel = new Map()
+  for (const entry of iterations) {
+    if (!entry || typeof entry !== 'object' || entry.type !== 'advisor_message') continue
+    const model = typeof entry.model === 'string' && entry.model.trim() ? entry.model.trim() : null
+    const key = model ?? ''
+    const acc = byModel.get(key) || {
+      model,
+      iterations: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+    }
+    acc.iterations += 1
+    acc.input_tokens += n(entry.input_tokens)
+    acc.output_tokens += n(entry.output_tokens)
+    // Accept both the Anthropic wire names and the shortened ones used here.
+    acc.cache_read_tokens += n(entry.cache_read_tokens ?? entry.cache_read_input_tokens)
+    acc.cache_creation_tokens += n(entry.cache_creation_tokens ?? entry.cache_creation_input_tokens)
+    byModel.set(key, acc)
+  }
+  return byModel.size ? [...byModel.values()] : null
+}
+
+/**
  * DISJOINT usage, idempotent. OpenAI wire shape (inclusive input) is converted
  * to Anthropic cache names so a second pass is a no-op.
  */
@@ -74,6 +121,9 @@ export function normalizeUsage(usage = {}) {
     details.cache_write_tokens ??
     extracted?.cache_write_tokens
   const web_search_requests = webSearchRequestsOf(usage)
+  // Detail only, never priced. Recomputed from `iterations` on every pass, and
+  // `iterations` survives the spread below, so a second pass is a no-op.
+  const advisor_usage = advisorUsageFromIterations(usage)
   if (isOpenaiWireUsage(usage)) {
     const hasRead = cacheRead != null
     const hasWrite = cacheCreate != null
@@ -89,6 +139,7 @@ export function normalizeUsage(usage = {}) {
       cache_creation_tokens: hasWrite ? write : cacheCreate,
       cache_creation_input_tokens: hasWrite ? write : cacheCreate,
       web_search_requests,
+      ...(advisor_usage ? { advisor_usage } : {}),
     }
   }
   return {
@@ -100,6 +151,7 @@ export function normalizeUsage(usage = {}) {
     cache_creation_tokens: cacheCreate,
     cache_creation_input_tokens: usage.cache_creation_input_tokens ?? cacheCreate,
     web_search_requests,
+    ...(advisor_usage ? { advisor_usage } : {}),
   }
 }
 

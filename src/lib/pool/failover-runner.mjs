@@ -99,6 +99,144 @@ export const vmTimeoutTracker = {
 
 export const TIMEOUT_FAULT_PREFIX = 'consecutive_timeouts:'
 
+const OPAQUE_429_THRESHOLD = 3
+const OPAQUE_429_COOLDOWN_MS = 60_000
+
+/**
+ * Consecutive opaque CRAG 429s per (account, model).
+ *
+ * A single bare 429 with no rate-limit headers proves nothing (#1139), so the
+ * classifier deliberately stops the request without cooling anything down.
+ * Repetition is different: the same conversation hammering one model while the
+ * slot's other models stay healthy is a model-level signal, not a request one.
+ * Keyed by model on purpose -- an account-level cooldown would take the slot's
+ * other models down with it.
+ */
+export const opaque429Tracker = {
+  counts: new Map(),
+  key(accountId, model) {
+    return `${accountId || ''}\u0000${model || ''}`
+  },
+  /** Returns true once the streak reaches `threshold`. */
+  record(accountId, model, threshold = OPAQUE_429_THRESHOLD) {
+    if (!accountId) return false
+    const key = this.key(accountId, model)
+    const count = (this.counts.get(key) || 0) + 1
+    this.counts.set(key, count)
+    return count >= threshold
+  },
+  streak(accountId, model) {
+    return this.counts.get(this.key(accountId, model)) || 0
+  },
+  clear(accountId, model) {
+    if (!accountId) return
+    this.counts.delete(this.key(accountId, model))
+  },
+  reset() {
+    this.counts.clear()
+  },
+}
+
+function opaque429Setting(value, fallback, min, max) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.min(max, Math.max(min, Math.trunc(n)))
+}
+
+const CIRCUIT_DEDUPE_TTL_MS = 10 * 60_000
+const CIRCUIT_DEDUPE_MAX_ENTRIES = 5000
+
+/**
+ * One (session, unit) pair may only charge the unit circuit once per window.
+ *
+ * #1796 counts upstream 400/403 toward UnitCircuit on purpose: a slot that
+ * rejects what other slots accept is a slot problem, and three strikes park
+ * it. That reasoning holds when *some* slots are bad. When every slot shares
+ * the defect -- a kernel build that mangles the outbound body, say -- an
+ * unlucky client walks the pool and parks every slot in turn, so capacity
+ * drops to zero and no slot was ever going to answer. Charging each session
+ * once keeps the cross-session signal (several sessions failing on one slot
+ * still parks it) while denying any single caller the ability to take a slot
+ * down by retrying.
+ */
+export const sessionCircuitDedupe = {
+  seen: new Map(),
+  key(sessionKey, accountId) {
+    return `${sessionKey}\u0000${accountId}`
+  },
+  /** True when this pair has not been charged inside the window. */
+  shouldCount(sessionKey, accountId, now = Date.now()) {
+    // No session identity means no dedupe: fall back to #1796's behaviour.
+    if (!sessionKey || !accountId) return true
+    const key = this.key(sessionKey, accountId)
+    const last = this.seen.get(key)
+    if (last != null && now - last < CIRCUIT_DEDUPE_TTL_MS) return false
+    this.prune(now)
+    this.seen.set(key, now)
+    return true
+  },
+  clear(sessionKey, accountId) {
+    if (!sessionKey || !accountId) return
+    this.seen.delete(this.key(sessionKey, accountId))
+  },
+  /** Drop aged-out pairs once half full; hard-cap so a key explosion cannot grow it without bound. */
+  prune(now = Date.now()) {
+    if (this.seen.size < CIRCUIT_DEDUPE_MAX_ENTRIES / 2) return
+    for (const [key, at] of this.seen) {
+      if (now - at >= CIRCUIT_DEDUPE_TTL_MS) this.seen.delete(key)
+    }
+    // Still over the cap means live pairs, not stale ones. Dropping them only
+    // reverts to #1796's accounting, which is safe, just less forgiving.
+    if (this.seen.size >= CIRCUIT_DEDUPE_MAX_ENTRIES) this.seen.clear()
+  },
+  reset() {
+    this.seen.clear()
+  },
+}
+
+/**
+ * Only the request-scoped `stop` fallback is deduped. Unit-scoped circuits
+ * (provider_overloaded, organization_disabled, credential_refresh_failed) each
+ * describe the unit itself and must keep charging on every hit, or #1796 loses
+ * the sensitivity it was built for.
+ */
+function countsTowardCircuit(policy, sessionKey, accountId) {
+  if (policy?.scope !== 'request' || policy?.action !== 'stop') return true
+  return sessionCircuitDedupe.shouldCount(sessionKey, accountId)
+}
+
+/**
+ * Preflight rejections another kernel kind could plausibly accept.
+ *
+ * These come out of the CRAG-only rebuild (prepareCragRequest ->
+ * crag-whitelist), so a cli-node slot may answer the same body:
+ * `invalid_kernel_request` is that whitelist's default code and covers block
+ * types CRAG does not model, `unsupported_capability` is a capability gate by
+ * definition, `crag_prompt_too_large` is a CRAG-specific size limit, and
+ * `thinking_incompatible` depends on the kernel/model pairing.
+ *
+ * Deliberately excluded: invalid_cache_control (breakpoint budget and TTL
+ * order are Anthropic protocol rules), image_too_large, invalid_image_url and
+ * invalid_tool_schema. Every kernel rejects those, so re-dispatching would
+ * only delay the same answer.
+ */
+const KERNEL_CAPABILITY_400_CODES = new Set([
+  'invalid_kernel_request',
+  'unsupported_capability',
+  'thinking_incompatible',
+  'crag_prompt_too_large',
+])
+
+/**
+ * True for a `kernel-preflight` 400 whose code says the slot's kernel, not the
+ * request, is what refused it. `via` is set by invalidKernelResult in
+ * go-worker-client, so this never matches a rejection that came from upstream.
+ */
+function isKernelCapabilityRejection(result) {
+  if (result?.via !== 'kernel-preflight' || result?.status !== 400) return false
+  return KERNEL_CAPABILITY_400_CODES.has(result?.body?.error?.code)
+}
+
 const DEFAULTS = {
   max_account_switches: 3,
   max_total_attempts: 12,
@@ -715,12 +853,15 @@ export class FailoverRunner {
     })
   }
 
-  noteUnitHealth(selected, policy, result) {
+  noteUnitHealth(selected, policy, result, { sessionKey = null } = {}) {
     const circuit = this.scheduler?.unitCircuit
     if (circuit && selected?.accountId) {
-      if (policy?.circuit) circuit.recordFailure(selected.accountId)
-      else if (verifiedSuccess(result)) circuit.recordSuccess(selected.accountId)
-      else circuit.releaseProbe?.(selected.accountId)
+      if (policy?.circuit) {
+        if (countsTowardCircuit(policy, sessionKey, selected.accountId)) circuit.recordFailure(selected.accountId)
+      } else if (verifiedSuccess(result)) {
+        sessionCircuitDedupe.clear(sessionKey, selected.accountId)
+        circuit.recordSuccess(selected.accountId)
+      } else circuit.releaseProbe?.(selected.accountId)
     }
 
     const vmId = selected?.vmId
@@ -1044,6 +1185,10 @@ export class FailoverRunner {
     let homeAccountId = null
     let homeRetryPending = false
     let subagentSlotDeadline = null
+    // A kernel capability rejection gets exactly one re-dispatch. The split is
+    // CRAG vs cli-node, so one hop covers it; more would burn budget whenever
+    // every slot refuses and turn a clear 400 into pool exhaustion.
+    let kernelMismatchRetried = false
     const switchUnit = (unit, policy) => {
       budget.noteSwitch(unit.accountId, unit.vmId, { spill: policy.reason === 'slot_busy' })
       if (unit.isSubagent) {
@@ -1449,10 +1594,34 @@ export class FailoverRunner {
         } else if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
           policy = { ...policy, cooldownUntil: hardBlock.until }
         }
+        // An opaque CRAG 429 stops the request without cooling anything down,
+        // which is right once (#1139) and wrong on repeat: the same conversation
+        // kept landing on one model for 47 minutes. Escalate to a model-level
+        // cooldown so the next attempt moves to another slot. `decision` is
+        // recomputed because scope and action both change here.
+        if (policy.reason === 'crag_opaque_429') {
+          const threshold = opaque429Setting(this.config.crag_opaque_429_threshold, OPAQUE_429_THRESHOLD, 2, 10)
+          if (opaque429Tracker.record(selected.accountId, model, threshold)) {
+            opaque429Tracker.clear(selected.accountId, model)
+            policy = attachFailureDecision({
+              ...policy,
+              decision: undefined,
+              scope: 'model',
+              action: 'continue-and-cooldown',
+              reason: 'crag_opaque_429_model_cooldown',
+              retrySameAccount: false,
+              cooldownUntil:
+                Date.now() +
+                opaque429Setting(this.config.crag_opaque_429_cooldown_ms, OPAQUE_429_COOLDOWN_MS, 10_000, 10 * 60_000),
+            })
+          }
+        } else if (verifiedSuccess(result)) {
+          opaque429Tracker.clear(selected.accountId, model)
+        }
 
         lastResult = result
         lastPolicy = policy
-        this.noteUnitHealth(selected, policy, result)
+        this.noteUnitHealth(selected, policy, result, { sessionKey: stickyKey })
         this.noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result)
         if (attemptMeta?.sessionId) {
           bindAll(
@@ -1569,6 +1738,23 @@ export class FailoverRunner {
             releaseStickySlots()
             return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
           }
+        }
+        // The slot's kernel refused to assemble this body, which is a trait of
+        // the slot rather than of the request: the other kernel kind may accept
+        // it unchanged. Selection never consults capability bits, so without
+        // this hop the sticky binding kept feeding the conversation back to the
+        // one kernel that cannot serve it -- the same 400 for as long as the
+        // session lived. lastResult/lastPolicy are already set above, so an
+        // exhausted pool still answers with this 400 rather than a less useful
+        // pool_exhausted.
+        if (!shouldContinue(policy) && !kernelMismatchRetried && isKernelCapabilityRejection(result)) {
+          kernelMismatchRetried = true
+          // releaseStickySlots only returns the slot's concurrency seat; the
+          // session->unit binding has to be dropped explicitly or the next turn
+          // lands on the same kernel again.
+          for (const key of bindKeys) this.stickyRouter?.unbind?.(key)
+          switchUnit(selected, { reason: 'kernel_capability_mismatch' })
+          continue
         }
         if (!shouldContinue(policy)) {
           releaseStickySlots()
@@ -1687,7 +1873,7 @@ export class FailoverRunner {
         )
         lastResult = result
         lastPolicy = policy
-        this.noteUnitHealth(selected, policy, result)
+        this.noteUnitHealth(selected, policy, result, { sessionKey: stickyKey })
         this.noteSilentTimeout(stickyKey, canonicalBody, selected, policy, result)
         notifyProxyFailure(this.onProxyFailure, selected, policy)
         this.attemptsRepo?.complete?.(requestId, attemptNo, {

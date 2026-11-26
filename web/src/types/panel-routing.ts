@@ -211,6 +211,8 @@ export type JevEndpointKey = {
   masked_key: string
   key_fingerprint: string
   retired: boolean
+  paused_reason?: 'auth' | 'rate_limited' | 'overloaded' | null
+  seconds_left?: number | null
   status?: string
   last_http_status?: number | null
 }
@@ -287,6 +289,9 @@ export type NotifyEvents = {
   account_down: boolean
   account_up: boolean
   vm_down: boolean
+  jev_paused: boolean
+  jev_resumed: boolean
+  jev_http_400_burst: boolean
 }
 
 export type NotifyTelegramConfig = {

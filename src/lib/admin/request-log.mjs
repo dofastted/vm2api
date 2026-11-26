@@ -712,6 +712,37 @@ export class RequestLogStore {
   finish(ctx, extra = {}) {
     if (!ctx || ctx.mode === 'off') return null
     const duration_ms = Math.max(0, Date.now() - (ctx.t0 || Date.now()))
+    if (extra.merge_into_request_id) {
+      const parentId = String(extra.merge_into_request_id).trim()
+      if (parentId) {
+        const continuation =
+          ctx.mode === 'debug'
+            ? {
+                request_id: ctx.request_id,
+                ts: new Date().toISOString(),
+                duration_ms,
+                ...(extra.tool_continuation && typeof extra.tool_continuation === 'object'
+                  ? extra.tool_continuation
+                  : {}),
+              }
+            : null
+        const persistMerge = () => {
+          try {
+            withSavepoint(this.repo.db, 'reqlog_merge', () => {
+              this.repo.mergeToolContinuation(parentId, { durationMs: duration_ms, continuation })
+            })
+          } catch {}
+        }
+        const memParent = this._mem.find((item) => item?.request_id === parentId)
+        if (memParent) {
+          memParent.duration_ms = (Number(memParent.duration_ms) || 0) + duration_ms
+        }
+        if (writeBehindArmed()) enqueueWrite(persistMerge)
+        else persistMerge()
+      }
+      return null
+    }
+    if (extra.skip_log) return null
     const usage = normalizeUsage(disjointOpenaiUsage(extra.usage || {}) || {})
     const breakdown = cacheCreationBreakdown(usage)
     const webSearch = extra.web_search_requests ?? webSearchRequestsOf(usage)

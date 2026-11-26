@@ -17,7 +17,6 @@ import {
 } from '@/lib/gemini-account-status'
 import { isGeminiHostIssue } from '@/lib/gemini-recovery'
 import { cn } from '@/lib/utils'
-import { formatSlotEmail } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -157,7 +156,11 @@ export type GeminiEnvironment = {
     plan: string | null
     expires_at: string | null
     eligibility?:
-      'verification_required' | 'location_unsupported' | 'ineligible' | null
+      | 'verification_required'
+      | 'location_unsupported'
+      | 'client_unsupported'
+      | 'ineligible'
+      | null
     validation_url?: string | null
     model_catalog?: GeminiModelCatalogEntry[]
     quotas: (QuotaReading & { model: string })[]
@@ -715,9 +718,7 @@ function EnvironmentData({
       </div>
       <div>
         <dt className='text-muted-foreground'>账号</dt>
-        <dd title={account?.email || undefined}>
-          {account?.email ? formatSlotEmail(account.email) : '未提供'}
-        </dd>
+        <dd className='break-all'>{account?.email || '未提供'}</dd>
       </div>
       <div>
         <dt className='text-muted-foreground'>项目 / 地区 / 订阅</dt>

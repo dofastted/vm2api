@@ -105,6 +105,9 @@ export class RequestAttemptsRepo {
     this._list = db.prepare(`
       SELECT * FROM request_attempts WHERE request_id = ? ORDER BY attempt_no
     `)
+    this._removeByRequestId = db.prepare(`
+      DELETE FROM request_attempts WHERE request_id = ?
+    `)
     this._removeOld = db.prepare(`
       DELETE FROM request_attempts WHERE started_at < ?
     `)
@@ -216,6 +219,16 @@ export class RequestAttemptsRepo {
 
   list(requestId) {
     return this._list.all(requestId).map(rowToAttempt)
+  }
+
+  removeByRequestId(requestId) {
+    if (!requestId) return 0
+    const write = () => this._removeByRequestId.run(requestId).changes
+    if (writeBehindArmed()) {
+      enqueueWrite(write)
+      return 0
+    }
+    return write()
   }
 
   cleanup(retainDays = 7) {

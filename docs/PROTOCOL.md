@@ -97,7 +97,13 @@ Go worker JSON 透传，不必因人设重建 worker。
 
 `routing.compatibility.preserve_pruned_tool_results: true` 可为槽位推理开启 DSH 工具结果裁剪保护；缺省关闭，API 直连端点不启用。它不会修改客户端配置或路由粘性。
 
-`routing.compatibility.crag_drop_foreign_thinking: true` 让 CRAG print 在发出前丢掉不是本账号签发的 thinking 块（`thinking_signature_owners` 里没有记录或记在别的账号上）；命中进行中的工具循环时清掉循环内 thinking 并关闭 thinking，结果记在 `hop_meta.thinking_owner_crag`。缺省关闭：签名记录不完整时（清库、记录开始前的老会话）会误丢本账号的 thinking，并让提示缓存失效。
+`routing.compatibility.crag_drop_foreign_thinking` 让 CRAG print 在发出前丢掉不是本账号签发的 thinking 块，三态：
+
+- `false`（缺省）：不丢，原样重放调用方历史，等上游回 thinking 签名 400 再修。
+- `'foreign_only'`：只丢 `thinking_signature_owners` 里**记在别账号**上的块；没有记录的保留。换槽后不必先撞一次签名 400，也不会因签名记录不完整（清库、记录开始前的老会话）误丢本账号的 thinking。
+- `true`：记在别账号上的、以及**没有记录**的块一并丢。记录不完整时会误丢本账号的 thinking 并让提示缓存失效。
+
+命中进行中的工具循环时清掉循环内 thinking 并关闭 thinking。结果记在 `hop_meta.thinking_owner_crag`（`mode` 为生效档位，`unknown_kept` 为 `foreign_only` 下保留的无记录块数）。面板在「协议 → thinking 显示」里三档可切。
 
 DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pruned标记和后1024码点。开启后，网关在同一认证密钥、严格的DSH `session-UUID`、模型和完整历史前缀内，仅恢复精确等于该裁剪结果的旧文本。必须有此前完整verified且未重试的请求作为原文基线；仅收到keepalive、取消、失败或不完整流不会提交原文。真正的历史编辑、删消息、工具参数变化及摘要替换不还原。
 

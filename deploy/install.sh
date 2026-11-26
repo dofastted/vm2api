@@ -1240,15 +1240,32 @@ prepare_gemini_host() (
   prepare_gemini_maintenance "$tag" "$mode" || return 1
 
   local host_dir=/usr/local/lib/vm2api-gemini
-  local default_source="${host_dir}/defaults/0.3.0"
+  local defaults_dir="${host_dir}/defaults"
+  local legacy_default_source="${defaults_dir}/0.3.0"
+  local default_source="$legacy_default_source"
   local unit=/etc/systemd/system/vm2api-gemini.service
   local current="${INSTALL_DIR}/share/gemini/current"
-  if [ -z "$source" ] && command -v systemctl >/dev/null; then
-    # Keep a source supplied by an existing unit/drop-in without copying it into .env.
-    local exec_start source_pattern='(^|[[:space:]])--payload-source(=|[[:space:]]+)(/[A-Za-z0-9._/-]+)([[:space:]]|$)'
-    exec_start="$(systemctl show --property=ExecStart --value vm2api-gemini.service 2>/dev/null)" || exec_start=""
-    if [[ "$exec_start" =~ $source_pattern ]] && [ "${BASH_REMATCH[3]}" != "$default_source" ]; then
+  local existing_exec_start="" existing_public_key="" existing_egress=""
+  if command -v systemctl >/dev/null; then
+    existing_exec_start="$(systemctl show --property=ExecStart --value vm2api-gemini.service 2>/dev/null)" || existing_exec_start=""
+  fi
+  if [ -z "$existing_exec_start" ] && [ -f "$unit" ]; then
+    existing_exec_start="$(grep -m1 -E '^[[:space:]]*ExecStart=' "$unit" 2>/dev/null | sed 's/^[[:space:]]*ExecStart=//')" || existing_exec_start=""
+  fi
+  if [ -n "$existing_exec_start" ]; then
+    local source_pattern='(^|[[:space:]])--payload-source(=|[[:space:]]+)(/[A-Za-z0-9._/-]+)([[:space:]]|$)'
+    local pubkey_pattern='(^|[[:space:]])--public-key(=|[[:space:]]+)(/[A-Za-z0-9._/-]+)([[:space:]]|$)'
+    local egress_pattern='(^|[[:space:]])--egress(=|[[:space:]]+)(/[A-Za-z0-9._/-]+)([[:space:]]|$)'
+    if [ -z "$source" ] && [[ "$existing_exec_start" =~ $source_pattern ]] &&
+      [[ "${BASH_REMATCH[3]}" != "${defaults_dir}/"* ]]; then
+      # Keep an external manual source supplied by an existing unit/drop-in without copying it into .env.
       source="${BASH_REMATCH[3]}"
+    fi
+    if [[ "$existing_exec_start" =~ $pubkey_pattern ]]; then
+      existing_public_key="${BASH_REMATCH[3]}"
+    fi
+    if [[ "$existing_exec_start" =~ $egress_pattern ]]; then
+      existing_egress="${BASH_REMATCH[3]}"
     fi
   fi
   if [ "$mode" != source ] && ! command -v curl >/dev/null; then
@@ -1256,14 +1273,23 @@ prepare_gemini_host() (
     return 1
   fi
   local installed=0 want_default=0 use_default=0 default_args="" staging file dependency status host_mode
+  local has_manual_verifier=0
+  if [ -e /etc/vm2api/gemini-release.json ] || [[ "$existing_exec_start" == *"--release-verifier"* ]]; then
+    has_manual_verifier=1
+  fi
   if [ -e "$current" ] || [ -L "$current" ]; then
     installed=1
-    # Retain the trust inputs of an installed default payload, never replace current.
-    if { [ -f "${current}/manifest.json" ] &&
-      cmp -s -- "${current}/manifest.json" "${default_source}/manifest.json"; } ||
-      { [ -f "$unit" ] && grep -Fq -- "${default_source}/crag-license-public.pem" "$unit"; } ||
-      { [ -f "$unit" ] && grep -Fq -- "--default-public-key ${default_source}/gemini-ed25519.pub" "$unit"; }; then
-      want_default=1
+    if [ -z "$source" ] && [ "$has_manual_verifier" = 0 ]; then
+      # Recognize default installs created either by install.sh (defaults/0.3.0 or defaults/<digest>)
+      # or by vm2api-gemini-maintenance (which writes defaults/<digest>/crag-license-public.pem).
+      if { [ -f "${current}/manifest.json" ] && [ -f "${legacy_default_source}/manifest.json" ] &&
+        cmp -s -- "${current}/manifest.json" "${legacy_default_source}/manifest.json"; } ||
+        [[ "$existing_public_key" == "${defaults_dir}/"*"/crag-license-public.pem" ]] ||
+        { [ -f "$unit" ] && grep -Eq -- "--default-public-key(=|[[:space:]]+)${defaults_dir}/[^[:space:]]+/gemini-ed25519\.pub([[:space:]]|\$)" "$unit"; } ||
+        { [ -f "${current}/manifest.json" ] && grep -Fq '"family"' "${current}/manifest.json" &&
+          grep -Fq '"crag"' "${current}/manifest.json" && grep -Fq '"encrypted"' "${current}/manifest.json"; }; then
+        want_default=1
+      fi
     fi
   elif [ -z "$source" ]; then
     want_default=1
@@ -1343,6 +1369,7 @@ prepare_gemini_host() (
     err "Gemini 宿主目录必须由 root 拥有且不可由其他用户写入: ${host_dir}"
     return 1
   fi
+  local default_manifest_sha="" default_pubkey_sha="" pinned_egress_sha=""
   if [ "$use_default" = 1 ]; then
     file=scripts/fetch-default-gemini.py
     if ! fetch_gemini_host_file "$tag" "$mode" "$file" "${staging}/${file}" ||
@@ -1350,10 +1377,65 @@ prepare_gemini_host() (
       err "${tag} 缺少 Gemini 默认载荷下载脚本或服务模板配置"
       return 1
     fi
-    if [ ! -e "${default_source%/*}" ] && [ ! -L "${default_source%/*}" ]; then
-      install -d -m 700 "${default_source%/*}" || return 1
+    local pin_meta
+    pin_meta="$(python3 - "${staging}/deploy/payload.json" <<'PY'
+import json, re, sys
+data = json.loads(open(sys.argv[1], encoding="utf-8").read())
+d = data.get("geminiDefaultLinuxAmd64") or {}
+assets = d.get("assets") or {}
+m = (assets.get("manifest.json") or {}).get("sha256") or ""
+p = (assets.get("crag-license-public.pem") or {}).get("sha256") or ""
+e = ""
+for f in data.get("files") or []:
+    if isinstance(f, dict) and f.get("path") == "bin/kin-egress" and f.get("asset") == "kin-egress":
+        e = f.get("sha256") or ""
+        break
+hex64 = lambda v: v if isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) else ""
+print(hex64(m), hex64(p), hex64(e))
+PY
+    )" || pin_meta=""
+    read -r default_manifest_sha default_pubkey_sha pinned_egress_sha <<< "$pin_meta"
+    # Verify that an existing CRAG installation actually trusts the pinned default issuer key
+    # before treating it as default-managed; custom-signed payloads must never be overwritten.
+    if [ "$installed" = 1 ] && [ -n "$default_pubkey_sha" ] &&
+      [[ "$existing_public_key" != "${defaults_dir}/"*"/crag-license-public.pem" ]]; then
+      local key_to_check=""
+      if [ -n "$existing_public_key" ] && [ -f "$existing_public_key" ]; then
+        key_to_check="$existing_public_key"
+      elif [ -f "${current}/crag-license-public.pem" ]; then
+        key_to_check="${current}/crag-license-public.pem"
+      fi
+      if [ -n "$key_to_check" ] && ! python3 - "$key_to_check" "$default_pubkey_sha" <<'PY'
+import hashlib, sys
+raise SystemExit(0 if hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest() == sys.argv[2] else 1)
+PY
+      then
+        use_default=0
+      fi
     fi
-    if ! python3 -I "${staging}/${file}" --manifest "${staging}/deploy/payload.json" --dest "$default_source"; then
+  fi
+  if [ "$use_default" = 1 ]; then
+    # Use a content-addressed cache directory matching gemini-maintenance.py so upgrading to
+    # a newer CRAGGemini release never collides with an earlier defaults/0.3.0 cache.
+    if [ -n "$default_manifest_sha" ]; then
+      default_source="${defaults_dir}/${default_manifest_sha}"
+    fi
+    if [ ! -e "${defaults_dir}" ] && [ ! -L "${defaults_dir}" ]; then
+      install -d -m 700 "${defaults_dir}" || return 1
+    fi
+    local -a fetch_args=(--manifest "${staging}/deploy/payload.json" --dest "$default_source")
+    if grep -Fq -- '--reuse-agy' "${staging}/scripts/fetch-default-gemini.py"; then
+      local reuse_agy_candidate=""
+      if [ -f "${current}/agy" ] && [ ! -L "${current}/agy" ]; then
+        reuse_agy_candidate="${current}/agy"
+      elif [ -f "${legacy_default_source}/agy" ] && [ ! -L "${legacy_default_source}/agy" ]; then
+        reuse_agy_candidate="${legacy_default_source}/agy"
+      fi
+      if [ -n "$reuse_agy_candidate" ]; then
+        fetch_args+=(--reuse-agy "$reuse_agy_candidate")
+      fi
+    fi
+    if ! python3 -I "${staging}/scripts/fetch-default-gemini.py" "${fetch_args[@]}"; then
       err "无法准备 Gemini 默认签名载荷；请检查上述错误后重新执行 prepare-gemini"
       return 1
     fi
@@ -1376,6 +1458,20 @@ prepare_gemini_host() (
   local public_key_path=/etc/vm2api/gemini-ed25519.pub
   if [ "$use_default" = 1 ] && [ -f "${default_source}/crag-license-public.pem" ]; then
     public_key_path="${default_source}/crag-license-public.pem"
+  elif [ -n "$existing_public_key" ] && [ -f "$existing_public_key" ]; then
+    public_key_path="$existing_public_key"
+  fi
+  local egress_path="${INSTALL_DIR}/bin/kin-egress"
+  if [ "$existing_egress" = "${host_dir}/bin/kin-egress" ] && [ -x "${host_dir}/bin/kin-egress" ] && [ ! -L "${host_dir}/bin/kin-egress" ]; then
+    if [ ! -x "$egress_path" ] || [ -L "$egress_path" ] ||
+      { [ -n "$pinned_egress_sha" ] && python3 - "${host_dir}/bin/kin-egress" "$egress_path" "$pinned_egress_sha" <<'PY'
+import hashlib, sys
+h = lambda p: hashlib.sha256(open(p, "rb").read()).hexdigest()
+raise SystemExit(0 if h(sys.argv[1]) == sys.argv[3] and h(sys.argv[2]) != sys.argv[3] else 1)
+PY
+      }; then
+      egress_path="${host_dir}/bin/kin-egress"
+    fi
   fi
   local crag_data_dir="${INSTALL_DIR}/data"
   if [ ! -d "$crag_data_dir" ] && [ -d "${INSTALL_DIR}/src/data/crag-gemini-subscription" ]; then
@@ -1391,6 +1487,7 @@ prepare_gemini_host() (
   local crag_host_dir="${crag_data_dir}/crag-gemini-subscription/public"
   sed -e "s|@INSTALL_DIR@/data/crag-gemini-subscription/public|${crag_host_dir}|g" \
     -e "s|@INSTALL_DIR@/src/data/crag-gemini-subscription/public|${crag_host_dir}|g" \
+    -e "s|--egress @INSTALL_DIR@/bin/kin-egress|--egress ${egress_path}|g" \
     -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" -e "s|@PAYLOAD_SOURCE_ARG@|${source_arg}|g" \
     -e "s|@DEFAULT_PAYLOAD_ARGS@|${default_args}|g" \
     -e "s|--public-key /etc/vm2api/gemini-ed25519.pub|--public-key ${public_key_path}|g" \
@@ -1398,10 +1495,84 @@ prepare_gemini_host() (
   if [ "$use_apparmor" = 1 ]; then
     render_gemini_unit_apparmor "${staging}/vm2api-gemini.service" || return 1
   fi
+
+  # When an older default payload is already installed in share/gemini/current, /install-payload
+  # does not overwrite current. Stage-verify and atomically swap current so prepare-gemini and
+  # install.sh upgrade actually advance CRAGGemini to the latest pinned version.
+  local swapped_old=""
+  if [ "$use_default" = 1 ] && [ "$installed" = 1 ] && [ ! -L "$current" ] && [ -d "$current" ] &&
+    { [ ! -f "${current}/manifest.json" ] || ! cmp -s -- "${current}/manifest.json" "${default_source}/manifest.json"; }; then
+    if [ -e /var/lib/vm2api-gemini/maintenance.pending ] || [ -L /var/lib/vm2api-gemini/maintenance.pending ]; then
+      err "Gemini 上次维护未完成；请先在面板恢复后再升级载荷"
+      return 1
+    fi
+    local staged_payload
+    staged_payload="$(mktemp -d "${INSTALL_DIR}/share/gemini/.prepare-payload.XXXXXX")" || return 1
+    rmdir "$staged_payload" || return 1
+    if ! node "${staging}/scripts/install-gemini-payload.mjs" \
+      --source "$default_source" --public-key "$public_key_path" --dest "$staged_payload"; then
+      rm -rf -- "$staged_payload"
+      err "新版本 CRAGGemini 签名载荷校验失败，已保留现有版本"
+      return 1
+    fi
+    systemctl stop vm2api-gemini.service 2>/dev/null || true
+    if ! python3 - "$staged_payload" "$current" <<'PY'
+import ctypes, os, sys
+from pathlib import Path
+src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+AT_FDCWD = -100
+RENAME_EXCHANGE = 2
+rc = libc.renameat2(AT_FDCWD, os.fsencode(src), AT_FDCWD, os.fsencode(dst), RENAME_EXCHANGE)
+if rc != 0:
+    bak = dst.parent / f".prepare-prev.{os.getpid()}"
+    os.rename(dst, bak)
+    try:
+        os.rename(src, dst)
+    except BaseException:
+        os.rename(bak, dst)
+        raise
+    os.rename(bak, src)
+PY
+    then
+      rm -rf -- "$staged_payload"
+      err "无法原子切换 CRAGGemini 签名载荷，已保留现有版本"
+      return 1
+    fi
+    swapped_old="$staged_payload"
+  fi
+
+  local unit_backup=""
+  if [ -n "$swapped_old" ] && [ -f "$unit" ]; then
+    unit_backup="${staging}/vm2api-gemini.service.prev"
+    cp -p -- "$unit" "$unit_backup" || unit_backup=""
+  fi
   install -m 644 "${staging}/vm2api-gemini.service" "$unit" || return 1
   if ! (systemctl daemon-reload && systemctl enable vm2api-gemini.service && systemctl restart vm2api-gemini.service); then
+    if [ -n "$swapped_old" ] && [ -d "$swapped_old" ]; then
+      python3 - "$swapped_old" "$current" <<'PY' || true
+import ctypes, os, sys
+from pathlib import Path
+old_dir, cur_dir = Path(sys.argv[1]), Path(sys.argv[2])
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+if libc.renameat2(-100, os.fsencode(old_dir), -100, os.fsencode(cur_dir), 2) != 0:
+    bak = cur_dir.parent / f".prepare-rollback.{os.getpid()}"
+    os.rename(cur_dir, bak)
+    os.rename(old_dir, cur_dir)
+    os.rename(bak, old_dir)
+PY
+      rm -rf -- "$swapped_old"
+      if [ -n "$unit_backup" ] && [ -f "$unit_backup" ]; then
+        install -m 644 "$unit_backup" "$unit" || true
+        systemctl daemon-reload || true
+        systemctl restart vm2api-gemini.service || true
+      fi
+    fi
     err "Gemini 宿主服务未就绪，请检查 journalctl -u vm2api-gemini.service"
     return 1
+  fi
+  if [ -n "$swapped_old" ] && [ -d "$swapped_old" ]; then
+    rm -rf -- "$swapped_old"
   fi
 
   if [ -n "$source" ] || [ "$installed" = 1 ]; then

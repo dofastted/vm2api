@@ -94,6 +94,13 @@ class EligibilityDiagnostic:
                             self.code = "gemini_account_verification_required"
                     elif re.fullmatch(
                         rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
+                        rb"Account ineligible: [^\r\n]{0,256}(?:UNSUPPORTED_CLIENT|[Uu]nsupported client|client[^\r\n]{0,64}not supported)[^\r\n]{0,256}\r?\n",
+                        self.pending,
+                    ):
+                        with self._lock:
+                            self.code = "gemini_client_unsupported"
+                    elif re.fullmatch(
+                        rb"W[0-9]{4} [0-9:. ]+ [0-9]+ server_oauth\.go:[0-9]+\] "
                         rb"Account ineligible: [^\r\n]{1,512}\r?\n",
                         self.pending,
                     ):

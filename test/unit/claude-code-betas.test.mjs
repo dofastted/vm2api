@@ -212,3 +212,42 @@ test('a tool_addition tool_definition appends inline-tools and nothing else does
     assert.ok(!withRequestProtocolBetas(['caller-beta'], { messages }).includes(beta))
   }
 })
+
+test('the advisor tool and a replayed advisor result both append advisor-tool', () => {
+  const beta = 'advisor-tool-2026-03-01'
+  const tool = { type: 'advisor_20260301', name: 'advisor', model: 'claude-opus-5-5' }
+  const armed = withRequestProtocolBetas(['caller-beta'], {
+    model: 'claude-sonnet-5-5',
+    tools: [tool],
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  assert.ok(armed.includes(beta))
+  assert.equal(armed.filter((token) => token === beta).length, 1)
+  assert.equal(armed[0], 'caller-beta')
+
+  // Upstream only accepts replayed advisor_tool_result blocks while the beta is
+  // still declared, so the history alone has to arm it -- the caller is allowed
+  // to drop the tool from `tools` on a later turn.
+  const replayed = withRequestProtocolBetas([], {
+    messages: [
+      { role: 'user', content: 'hi' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'advisor_tool_result', content: { type: 'advisor_redacted_result', encrypted_content: 'x' } },
+        ],
+      },
+    ],
+  })
+  assert.deepEqual(replayed, [beta])
+
+  assert.deepEqual(withRequestProtocolBetas([beta], { tools: [tool] }), [beta])
+  for (const body of [
+    { tools: [{ type: 'custom', name: 'lookup', input_schema: { type: 'object' } }] },
+    { tools: [{ name: 'advisor', input_schema: { type: 'object' } }] },
+    { messages: [{ role: 'assistant', content: [{ type: 'text', text: 'advisor_tool_result' }] }] },
+    { messages: [{ role: 'user', content: 'advisor' }] },
+  ]) {
+    assert.ok(!withRequestProtocolBetas(['caller-beta'], body).includes(beta))
+  }
+})

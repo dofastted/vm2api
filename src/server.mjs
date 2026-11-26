@@ -107,6 +107,15 @@ import {
   isCodexVm,
   syncCodexQuotaSchedule,
 } from './lib/vm/vm-registry.mjs'
+import {
+  readCodexAccounts,
+  upsertCodexAccount,
+  persistCodexCredentialState,
+  markCodexGrantDead,
+} from './lib/vm/codex-slot.mjs'
+import { hostProxyUrlForVm } from './lib/vm/slot-host.mjs'
+import { refreshCodexAccessToken } from './lib/protocol/codex-models.mjs'
+import { clearOpenAIAccountHold } from './lib/pool/openai-account-runtime.mjs'
 import { extraIsLiveOpen, parseResetMs } from './lib/pool/quota-window.mjs'
 import { createCragSubscription } from './lib/vm/crag-subscription.mjs'
 import { createCragRuntimeInventory } from './lib/vm/crag-runtime-inventory.mjs'
@@ -131,6 +140,7 @@ import { snapshotCacheMetrics } from './lib/cache/index.mjs'
 import { armWriteBehind } from './lib/db/write-behind.mjs'
 import { JevUsageRepo } from './lib/db/repos/jev-usage-repo.mjs'
 import { installJevUsageRecorder } from './lib/protocol/jev-usage.mjs'
+import { jevHealthSnapshot, readJevConfig } from './lib/protocol/jev-intercept.mjs'
 import { runLegacyImport } from './lib/db/legacy-import.mjs'
 import { initVmDbSync, stopVmWatch } from './lib/vm/vm-db-sync.mjs'
 import { BackupService } from './lib/admin/backup-service.mjs'
@@ -787,14 +797,18 @@ credentialRefreshMonitor = createCredentialRefreshMonitor({
     return { revived: cleared }
   },
   refreshOne: (vm) =>
-    refreshWorkerCredentialForVm({
-      vmId: vm.id,
-      vmPath: path.join(cfg.paths.project, 'vms', `${vm.id}.json`),
-      homeDir: path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'),
-      vm: getVm(cfg.paths.project, vm.id) || vm,
-      force: false,
-      skewMs: PROACTIVE_REFRESH_SKEW_MS,
-    }),
+    // codex 槽走 token 端点直连分支（槽内无 kin-worker oauth 可跑），
+    // claude 槽维持既有 worker 链。
+    isCodexVm(vm)
+      ? refreshCodexCredentialForVm({ projectRoot: cfg.paths.project, vm })
+      : refreshWorkerCredentialForVm({
+          vmId: vm.id,
+          vmPath: path.join(cfg.paths.project, 'vms', `${vm.id}.json`),
+          homeDir: path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'),
+          vm: getVm(cfg.paths.project, vm.id) || vm,
+          force: false,
+          skewMs: PROACTIVE_REFRESH_SKEW_MS,
+        }),
 })
 function bootSlot(id) {
   return powerOnSlot({ projectRoot: cfg.paths.project, id, proxyPool, routing: routingConfig })
@@ -865,6 +879,7 @@ catalogMonitor = createCatalogMonitor({
 })
 notifyMonitor = createNotifyMonitor({
   vmSnapshot: () => snapshotVmConnectivity(listVms(cfg.paths.project)),
+  jevSnapshot: () => jevHealthSnapshot(readJevConfig((k, d) => new SettingsRepo().get(k, d))),
   config: routingConfig.notify,
   baseUrl: cfg.base_url,
   snapshot: () =>
@@ -1023,6 +1038,66 @@ async function refreshWorkerCredentialForVm({ vmId, vmPath, homeDir, vm, force =
     } catch {}
   }
   return published
+}
+
+/**
+ * Codex 凭证后台保活（credential-refresh monitor 的 codex 分支）：
+ * claude 槽靠槽内 kin-worker oauth 轮换，codex 槽凭证在
+ * codex-credentials.json、容器是 Go worker——正确路径是控制面直打
+ * auth.openai.com token 端点（refreshCodexAccessToken，同面板刷新）。
+ * 成功：upsertCodexAccount 落新票+清陈旧 refresh_error+清内存 hold；
+ * 吊销（token_revoked→oauth_revoked）：markCodexGrantDead 四态摘池；
+ * 瞬态（超时/网络）：不落标，下轮再来。
+ */
+async function refreshCodexCredentialForVm({ projectRoot, vm }) {
+  const vmId = vm?.id
+  if (!projectRoot || !vmId) return { ok: false, refresh_class: 'retryable', error: { code: 'vm_missing' } }
+  const first = readCodexAccounts(projectRoot, vmId)[0] || {}
+  const refreshToken = String(first.refresh_token || '').trim()
+  if (!refreshToken) {
+    return { ok: false, refresh_class: 'failed', error: { code: 'missing_refresh_token', message: 'no refresh token' } }
+  }
+  const result = await refreshCodexAccessToken({
+    refreshToken,
+    proxyUrl: hostProxyUrlForVm(vm),
+  })
+  if (result?.ok) {
+    upsertCodexAccount(projectRoot, vmId, {
+      access_token: result.access_token,
+      refresh_token: result.refresh_token || refreshToken,
+      id_token: result.id_token || first.id_token,
+      expires_at: result.expires_at || first.expires_at,
+    })
+    // 活票：清陈旧 refresh 标 + 内存 hold（与面板刷新成功路径同语义）。
+    try {
+      persistCodexCredentialState(projectRoot, vmId, { error: null })
+    } catch {}
+    try {
+      clearOpenAIAccountHold(vmId)
+    } catch {}
+    return { ok: true, status: 200, refreshed: true, refresh_class: 'rotated' }
+  }
+  const code = String(result?.error || 'refresh_failed')
+  if (code === 'oauth_revoked') {
+    // 吊销=终态：落标摘池（幂等、不覆盖其他诊断），下轮 isCodexCredentialRefreshTarget 排除。
+    try {
+      persistCodexCredentialState(projectRoot, vmId, { error: 'oauth_revoked' })
+      markCodexGrantDead(projectRoot, vmId, {
+        description: result?.description || 'token endpoint answered revocation',
+        status: result?.status || null,
+      })
+    } catch {}
+    return { ok: false, refresh_class: 'fatal', error: { code: 'oauth_revoked' } }
+  }
+  if (code === 'refresh_rejected') {
+    // 结构性拒绝但非吊销文案：落标供面板归因，不摘池（与 openai-quota rotateIfNeeded 同口径）。
+    try {
+      persistCodexCredentialState(projectRoot, vmId, { error: 'refresh_rejected' })
+    } catch {}
+    return { ok: false, refresh_class: 'failed', error: { code: 'refresh_rejected' } }
+  }
+  // timeout / fetch_failed / 4xx/5xx 模糊拒绝：瞬态，不落标。
+  return { ok: false, refresh_class: 'retryable', error: { code } }
 }
 
 const { json, writeSSEHeaders, readBody, readRawBody } = createRespond(cfg, {

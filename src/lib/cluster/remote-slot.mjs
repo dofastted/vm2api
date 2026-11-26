@@ -1696,12 +1696,18 @@ export async function startRemoteSlot(vm, projectRoot, opts = {}) {
 }
 
 async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pinnedImageId = null }) {
+  // Scoped outside the try so the catch can roll the original back in place.
+  let backupName = null
+  let backupWasRunning = false
+  let backupEndpoints = {}
+  let rollbackDocker = null
   try {
     if (!isKvmRuntime(vm)) slotDockerCpus(vm)
     const p = await prepare(vm, projectRoot, routing, { pinnedImageId })
     if (p.fail) return p.fail
     if (resolveKernelDataplane(vm, routing) === 'crag') await projectCragUniversalVm(projectRoot, vm)
     const { nodeId, session, image, egressImage, user, remoteDir, slotDir } = p
+    rollbackDocker = session.docker
     const kvm = isKvmRuntime(vm)
     const crag = !kvm && resolveKernelDataplane(vm, routing) === 'crag'
     const subscription = crag && !!readCragClusterSubscription(projectRoot, vm)
@@ -1765,10 +1771,28 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
       return { ok: true, action: 'already-running', runtime: vm.runtime }
     }
     let previousNetwork = null
+    let backupNetworks = []
     const envBroken = kvm && existing && kvmEnvMapIncomplete(dockerEnvMap(existing.Config?.Env), existing.Config?.Env)
+    // Keep the old container until its replacement is conclusively up. A node
+    // link can die anywhere below (image build, file push, create, start); a
+    // removed container then leaves the slot with nothing, leaking a
+    // maintenance hold until an operator rebuilds it by hand. Rename the old
+    // one aside instead (migrationBackupName keeps it under Docker's 63-char
+    // limit), disconnect it from its networks so their endpoints are free for
+    // the replacement and the old exit can be released, create+start the new
+    // container under the real name, then delete the backup. Any failure rolls
+    // the original back in place — network endpoints included.
     if (existing && (!matches || envBroken)) {
       previousNetwork = existing.HostConfig?.NetworkMode
-      await removeContainer(session.docker, name)
+      backupWasRunning = existing.State?.Running === true
+      backupName = migrationBackupName(`${name}-pre-recreate`)
+      backupNetworks = userDefinedNetworkNames(existing)
+      backupEndpoints = networkEndpointSnapshot(existing)
+      if (backupWasRunning) await containerAction(session.docker, existing.Id, 'stop', { t: 10 })
+      await renameContainer(session.docker, existing.Id, backupName)
+      for (const net of backupNetworks) {
+        await disconnectContainerFromNetwork(session.docker, net, existing.Id).catch(() => {})
+      }
       existing = null
     }
     writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
@@ -1812,8 +1836,31 @@ async function startRemoteSlotAdmitted(vm, projectRoot, { recreate, routing, pin
     await containerAction(session.docker, name, 'start')
     await chownRemoteKvmBinds(session, name, vm)
     applyRuntime(vm, { ...common, info: await inspectContainerOrNull(session.docker, name), sharedIp: eg.ip })
+    // The replacement is up under the real name: the renamed original is now garbage.
+    if (backupName) await removeContainer(session.docker, backupName).catch(() => {})
     return { ok: true, action, runtime: vm.runtime }
   } catch (err) {
+    // Roll the original back under its name so the slot still has a container
+    // — running again when it was running before, so the watchdog sees no
+    // gap at all. Same order as migrateRemoteContainer's rollback: remove the
+    // half-built replacement, rename the original back, restore the network
+    // endpoints the cutover disconnected, start it. `name`/`session` live
+    // inside the try block, so re-derive both: vm.id is a function argument
+    // and the docker connector was hoisted above.
+    if (backupName && rollbackDocker) {
+      try {
+        const slotName = containerName(vm.id)
+        const leftover = await inspectContainerOrNull(rollbackDocker, slotName)
+        if (leftover) await removeContainer(rollbackDocker, leftover.Id).catch(() => {})
+        const backup = await inspectContainerOrNull(rollbackDocker, backupName)
+        if (backup) {
+          await renameContainer(rollbackDocker, backup.Id, slotName).catch(() => {})
+          for (const [net, endpoint] of Object.entries(backupEndpoints))
+            await connectContainerToNetwork(rollbackDocker, net, slotName, endpoint).catch(() => {})
+          if (backupWasRunning) await containerAction(rollbackDocker, slotName, 'start').catch(() => {})
+        }
+      } catch {}
+    }
     return failure(err)
   }
 }
