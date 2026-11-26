@@ -131,7 +131,11 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     auth_scheme: kind.kind === 'codex' ? null : vm.claude?.auth_scheme || null,
     account_tier_source: kind.kind === 'codex' ? null : vm.claude?.account_tier_source || null,
     has_refresh: kind.kind === 'codex' ? !!codex?.has_refresh : hasRefreshPresence(vm.claude),
-    refresh_error: kind.kind === 'codex' ? null : vm.claude?.refresh_error || null,
+    // codex 槽同样透出刷票失败（oauth_revoked / refresh_rejected），面板不再一律显示健康。
+    refresh_error:
+      kind.kind === 'codex'
+        ? codex?.refresh_error || vm.codex?.refresh_error || vm.refresh_error || null
+        : vm.claude?.refresh_error || null,
     account_tier:
       kind.kind === 'codex' ? 'codex' : vm.claude?.account_tier || (hasAccessPresence(vm.claude) ? 'pro' : null),
     subscription_type: kind.kind === 'codex' ? null : normalizeSubscriptionType(vm.claude?.subscription_type),

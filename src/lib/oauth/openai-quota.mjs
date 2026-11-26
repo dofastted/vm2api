@@ -13,6 +13,7 @@ import {
   upsertCodexAccount,
   persistCodexQuotaSnapshot,
   persistCodexCredentialState,
+  markCodexGrantDead,
 } from '../vm/codex-slot.mjs'
 import {
   buildCodexUsageView,
@@ -316,10 +317,15 @@ async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
     // on the vm ticket instead of failing silently in memory. Transient errors
     // (timeout / fetch_failed) and ambiguous upstream 4xx/5xx stay unmarked; the
     // next successful quota snapshot clears the mark again.
-    const structural = ['refresh_rejected', 'refresh_empty', 'missing_refresh_token'].includes(tok.error)
+    const structural = ['refresh_rejected', 'refresh_empty', 'missing_refresh_token', 'oauth_revoked'].includes(
+      tok.error,
+    )
     if (structural) {
       try {
         persistCodexCredentialState(projectRoot, vmId, { error: tok.error })
+        // 吊销是 grant 死亡：与 claude 池同落点写四态 unschedulable（仅操作员可清），
+        // 面板立刻显示「不可调度 · 凭证吊销」而不是笼统受限。
+        if (tok.error === 'oauth_revoked') markCodexGrantDead(projectRoot, vmId, tok)
       } catch {
         // Persistence is best-effort; the in-memory rotateError still propagates.
       }
@@ -585,6 +591,10 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
   if (pack.error === 'upstream_auth' && rotate && current.refresh) {
     current = await rotateIfNeeded(current, projectRoot, vmId, fetchImpl)
     if (!current.access || current.rotateError) {
+      // 吊销（token_revoked）与普通刷新失败分开说，面板可据此显示具体状态。
+      if (current.rotateError === 'oauth_revoked') {
+        return fail('oauth_revoked', 'GPT OAuth 凭证已被吊销，需重新授权导入', 502)
+      }
       return fail(current.rotateError || 'refresh_failed', 'GPT OAuth 刷新失败，请重新导入', 502)
     }
     pack = await run(current.access)
@@ -668,6 +678,9 @@ export async function resetOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = 
   if ((res.status === 401 || res.status === 403) && rotate && current.refresh) {
     current = await rotateIfNeeded(current, projectRoot, vmId, fetchImpl)
     if (!current.access || current.rotateError) {
+      if (current.rotateError === 'oauth_revoked') {
+        return fail('oauth_revoked', 'GPT OAuth 凭证已被吊销，需重新授权导入', 502)
+      }
       return fail(current.rotateError || 'refresh_failed', 'GPT OAuth 刷新失败，请重新导入', 502)
     }
     res = await consume(current.access)

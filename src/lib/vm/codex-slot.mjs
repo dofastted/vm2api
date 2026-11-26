@@ -354,6 +354,39 @@ export function persistCodexCredentialState(projectRoot, vmId, { error = null, a
   return vm
 }
 
+/**
+ * Codex grant 死亡（oauth_revoked / invalid_grant）：对齐 claude 池 markVmRefreshError 的落点，
+ * 写四态 unschedulable（仅操作员导入可清）并停调度。上游吊销文案常为
+ * `token_revoked` / `Encountered invalidated oauth token`，靠 5 分钟内存 hold 挡不住，
+ * 必须落盘摘池，面板才能显示「不可调度 · 凭证吊销」。
+ */
+export function markCodexGrantDead(projectRoot, vmId, detail = null) {
+  if (!projectRoot || !vmId) return null
+  const file = path.join(projectRoot, 'vms', `${vmId}.json`)
+  let vm
+  try {
+    vm = readJsonCached(file)
+  } catch {
+    return null
+  }
+  if (!vm || typeof vm !== 'object') return null
+  if (vm.unschedulable?.reason === 'oauth_revoked') return vm
+  const message = String(detail?.description || detail?.error || detail || '').slice(0, 300) || null
+  vm.unschedulable = {
+    reason: 'oauth_revoked',
+    detail: { message, upstream: detail?.status || null },
+    at: new Date().toISOString(),
+  }
+  vm.schedule_updated_at = new Date().toISOString()
+  vm.updated_at = vm.schedule_updated_at
+  vm.schedulable = false
+  vm.schedule_manual = vm.schedule_off === true
+  vm.schedule_disabled_reason = 'oauth_revoked'
+  if (String(vm.status || '').toLowerCase() === 'running') vm.status = 'paused'
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  return vm
+}
+
 export function persistCodexQuotaSnapshot(projectRoot, vmId, { extra, resetCredits, credits, planType, now } = {}) {
   if (!projectRoot || !vmId) throw new Error('projectRoot and vmId required')
   const stampNow = Number.isFinite(now) ? Number(now) : Date.now()
@@ -425,5 +458,9 @@ export function summarizeCodexSlot(projectRoot, vm = {}) {
     reset_credits: vm.codex?.reset_credits || null,
     credits: vm.codex?.credits || null,
     plan_type: vm.codex?.plan_type || null,
+    // 凭证健康状态透出：oauth_revoked=吊销 / refresh_rejected=刷新被拒 / null=健康。
+    // 面板据此显示具体状态而非笼统「受限」。
+    refresh_error: vm.codex?.refresh_error || vm.refresh_error || null,
+    refresh_error_at: vm.codex?.refresh_error_at || null,
   }
 }

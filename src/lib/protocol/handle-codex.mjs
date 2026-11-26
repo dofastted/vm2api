@@ -41,7 +41,7 @@ import {
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
-import { openaiUsageAccountId, readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
+import { openaiUsageAccountId, readCodexAccounts, upsertCodexAccount, persistCodexCredentialState, markCodexGrantDead } from '../vm/codex-slot.mjs'
 import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
@@ -346,10 +346,23 @@ export function isRetryableCodexTransport(result) {
 }
 
 /**
+ * Grant-death 签名：OpenAI 吊销回 `error.code=token_revoked` /
+ * "Encountered invalidated oauth token"。与 claude 池 GRANT_DEAD 词表对齐。
+ */
+export function isCodexGrantDead(result) {
+  if (!result || result.ok === true) return false
+  const status = Number(result.status) || 0
+  if (status !== 401 && status !== 403) return false
+  const hay = `${result.body?.error?.code || ''} ${result.body?.error?.message || ''} ${result.error_code || ''}`
+  return /token_revoked|invalidated oauth token|token has been revoked|oauth_revoked|invalid_grant/i.test(hay)
+}
+
+/**
  * Short process-local hold for an account that just failed upstream. This is
  * not the operator scheduling switch: it expires by itself and keeps the next
  * request from spending another turn on the same dead 401 / rate-limited
  * account. Committed streams and request-shaped errors are never parked.
+ * Grant death (token_revoked) is permanent and handled by the disk park.
  */
 export function codexFailureHold(result, now = Date.now()) {
   if (!result || result.ok === true || result.committed === true) return null
@@ -363,7 +376,10 @@ export function codexFailureHold(result, now = Date.now()) {
     )
   )
     return null
-  if (status === 401) return { until: now + 5 * 60_000, reason: 'oauth_401' }
+  if (status === 401) {
+    if (isCodexGrantDead(result)) return { until: Number.MAX_SAFE_INTEGER, reason: 'oauth_revoked' }
+    return { until: now + 5 * 60_000, reason: 'oauth_401' }
+  }
   if (status === 403) return { until: now + 5 * 60_000, reason: 'permission_denied' }
   if (status === 429) return { until: now + 60_000, reason: 'rate_limited' }
   if (status === 408 || status >= 500) return { until: now + 30_000, reason: 'upstream_5xx' }
@@ -1254,6 +1270,19 @@ export async function handleCodexProtocol({
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
         const failureHold = !policyRefusal && codexFailureHold(result)
         if (failureHold) holdOpenAIAccount(vm.id, failureHold)
+        // Grant 死亡（OpenAI 吊销）：5 分钟内存 hold 挡不住轮转调度，必须落盘摘池，
+        // 面板才能显示「不可调度 · 凭证吊销」；与 claude 池 markVmRefreshError 同语义。
+        if (!policyRefusal && isCodexGrantDead(result)) {
+          try {
+            persistCodexCredentialState(projectRoot, vm.id, { error: 'oauth_revoked' })
+            markCodexGrantDead(projectRoot, vm.id, {
+              description: result?.body?.error?.message || result?.body?.error?.code || null,
+              status: Number(result.status) || 0,
+            })
+          } catch {
+            /* 写盘 best-effort；内存 hold 已在 */
+          }
+        }
         if (policyRefusal && policyRefusal !== 'upstream:billing_refusal') {
           stats.errors++
           const error = upstreamRiskClientError(policyRefusal, res._kinRequestId)
