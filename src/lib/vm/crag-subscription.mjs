@@ -1332,6 +1332,9 @@ export function createCragSubscription({
                   publish(hostFile, hostId, 0o644, true)
                 }
                 publish(entitlementFile, next.code, 0o644)
+                // Immediately bind our random local credential on the Authority to replace the
+                // temporary direct-credit placeholder so sensitive routes stay authenticated.
+                await recoverCredential(hostId).catch(() => {})
                 if (mayRetry) return status(next, false)
               }
             }
@@ -2500,20 +2503,56 @@ export function createCragSubscription({
         offset: Number.isSafeInteger(data.offset) ? data.offset : safeOffset,
       }
     },
-    migrate(fromHostInput) {
+    migrate(fromHostInput, proofInput) {
       return exclusive(
         async () => {
           const trimmed = typeof fromHostInput === 'string' ? fromHostInput.trim().toLowerCase() : ''
           const fromHostId = isDigest(trimmed) ? trimmed : uuidToHostId(trimmed)
           if (!fromHostId) throw fail('crag_subscription_invalid_request', 400)
+          const proofObj =
+            typeof proofInput === 'string'
+              ? { proof: proofInput }
+              : proofInput && typeof proofInput === 'object'
+                ? proofInput
+                : {}
+          const proofBody = {}
+          if (typeof proofObj.proof === 'string' && proofObj.proof.trim()) {
+            const p = proofObj.proof.trim()
+            if (p.startsWith('CRAGR1.')) {
+              proofBody.proof_redemption_code = p
+            } else if (/^[0-9a-zA-Z_-]{1,64}$/.test(p)) {
+              proofBody.proof_order_id = p
+            } else {
+              throw fail('crag_subscription_invalid_request', 400)
+            }
+          }
+          if (typeof proofObj.proof_order_id === 'string' && proofObj.proof_order_id.trim()) {
+            const oid = proofObj.proof_order_id.trim()
+            if (!/^[0-9a-zA-Z_-]{1,64}$/.test(oid)) throw fail('crag_subscription_invalid_request', 400)
+            proofBody.proof_order_id = oid
+          }
+          if (typeof proofObj.proof_redemption_code === 'string' && proofObj.proof_redemption_code.trim()) {
+            const code = proofObj.proof_redemption_code.trim()
+            if (!code.startsWith('CRAGR1.')) throw fail('crag_subscription_invalid_request', 400)
+            proofBody.proof_redemption_code = code
+          }
+          if (Object.keys(proofBody).length === 0) {
+            throw fail('crag_subscription_invalid_request', 400)
+          }
           const hostId = identity()
           if (fromHostId === hostId) throw fail('crag_subscription_invalid_request', 400)
           checkNoIntent()
           storage(true)
           const previous = current(hostId)
-          const data = await authority('migrate', hostId, optionalCredential(hostId), {
+          // Ensure the destination host presents a real local credential so the Authority
+          // binds it atomically when creating the migrated host record.
+          const destKey =
+            optionalCredential(hostId) ??
+            (!load(hostFile, 0o644, 64) && !load(keyFile, 0o600, 43) ? credential(hostId, true) : undefined)
+          const data = await authority('migrate', hostId, destKey, {
             from_host_id: fromHostId,
             to_host_id: hostId,
+            ...proofBody,
           })
           let confirmed
           if (data?.rights?.entitlement) {

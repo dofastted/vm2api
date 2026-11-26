@@ -141,9 +141,11 @@ export type CragCloudOrder = {
   renewed_from_order_id?: string | null
   original_host_id: string
   current_host_id: string
-  status: string
+  status?: string
+  active?: boolean
   paid_at: number
-  granted_at: number
+  granted_at?: number
+  grant_expires_at?: number
   expires_at: number
   created_at: number
 }
@@ -152,12 +154,13 @@ export type CragCloudVoucher = {
   code_id: string
   sku?: string | null
   slot_limit: number | 'unlimited'
-  months: number
+  months?: number | null
   redeemed_at?: number | null
   expires_at?: number | null
   revoked_at?: number | null
   order_id?: string | null
-  status: string
+  status?: string
+  active?: boolean
 }
 
 export type CragCloudOrdersResponse = {

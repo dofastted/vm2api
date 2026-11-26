@@ -192,8 +192,8 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
         onClaim={(orderId) =>
           void perform('claim-by-order', { order_id: orderId })
         }
-        onMigrateHost={(fromHostId) =>
-          void perform('migrate', { from_host_id: fromHostId })
+        onMigrateHost={(fromHostId, proof) =>
+          void perform('migrate', { from_host_id: fromHostId, proof })
         }
       />
       {status?.state === 'active' ? (

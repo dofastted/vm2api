@@ -52,10 +52,12 @@ export const cragSubscriptionErrors: Record<string, string> = {
  */
 export const cragHostMigrateErrors: Record<string, string> = {
   not_found: '未在原宿主机 ID 下找到可迁移的订阅、兑换券或历史订单。',
+  auth_forbidden:
+    '归属校验未通过：请核对原宿主机 ID，以及属于该宿主机的历史订单号或原兑换码。',
   crag_subscription_invalid_request:
-    '请输入有效的原宿主机 ID（64 位十六进制）或设备 UUID，且不能与当前宿主机相同。',
+    '请输入有效的原宿主机 ID（不能与本机相同）及原订单号或兑换码。',
   invalid_request:
-    '请输入有效的原宿主机 ID（64 位十六进制）或设备 UUID，且不能与当前宿主机相同。',
+    '请输入有效的原宿主机 ID（不能与本机相同）及原订单号或兑换码。',
 }
 
 export const cragOrderClaimErrors: Record<string, string> = {
