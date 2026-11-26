@@ -18,6 +18,7 @@ export const DEFAULT_STREAM_KEEPALIVE_MS = 10_000
 const DELTA_FOR_BLOCK = Object.freeze({
   text: 'text_delta',
   tool_use: 'input_json_delta',
+  server_tool_use: 'input_json_delta',
   thinking: 'thinking_delta',
 })
 
@@ -75,6 +76,11 @@ export function observeKeepaliveEvent(state, event) {
   const next = { ...state }
   const type = String(event.type || '')
   const index = Number(event.index)
+  if (type === 'message_start' || type === 'message_delta') {
+    next.blockIndex = -1
+    next.deltaType = ''
+    return next
+  }
   if (type === 'content_block_start') {
     const deltaType = keepaliveDeltaTypeForContentBlock(event.content_block?.type)
     if (Number.isInteger(index) && deltaType) {
@@ -88,8 +94,7 @@ export function observeKeepaliveEvent(state, event) {
   }
   if (type === 'content_block_delta') {
     const deltaType = String(event.delta?.type || '')
-    if (Number.isInteger(index) && FIELD_FOR_DELTA[deltaType]) {
-      next.blockIndex = index
+    if (Number.isInteger(index) && index === next.blockIndex && FIELD_FOR_DELTA[deltaType]) {
       next.deltaType = deltaType
     }
     return next
@@ -152,6 +157,9 @@ export function createDownstreamKeepalive({
   let armed = false
   let written = false
   let attemptActive = false
+  // True between a named `event:` line and its terminating blank line so a
+  // keepalive beat never splits an in-flight SSE frame in half.
+  let inFrame = false
   // Queue delay elapsed. The first byte is allowed even between attempts.
   let queueReleased = false
 
@@ -160,7 +168,7 @@ export function createDownstreamKeepalive({
   }
 
   const due = () => {
-    if (!armed || state.done || interval <= 0) return false
+    if (!armed || state.done || inFrame || interval <= 0) return false
     if (written) return Date.now() - lastWriteAt >= interval
     // Inside an attempt the first ping still waits one interval: a fast
     // upstream failure can change HTTP status and move to another slot.
@@ -211,6 +219,8 @@ export function createDownstreamKeepalive({
   // produced a byte; until then a short failure can still be an HTTP status.
   const endAttempt = () => {
     attemptActive = false
+    inFrame = false
+    state = { ...state, blockIndex: -1, deltaType: '' }
   }
 
   /**
@@ -239,7 +249,14 @@ export function createDownstreamKeepalive({
     armed = true
     written = true
     markWrite()
-    const event = parseSseDataLine(line)
+    const raw = String(line ?? '')
+    const trimmed = raw.trim()
+    if (trimmed === '' || /\r?\n\r?\n$/.test(raw)) {
+      inFrame = false
+    } else if (trimmed.startsWith('event:')) {
+      inFrame = true
+    }
+    const event = parseSseDataLine(raw)
     if (event) {
       state = observeKeepaliveEvent(state, event)
       if (state.done) stop()
@@ -254,6 +271,6 @@ export function createDownstreamKeepalive({
     endAttempt,
     observeLine,
     beat,
-    getState: () => ({ ...state, armed, lastWriteAt, written, attemptActive, queueReleased }),
+    getState: () => ({ ...state, armed, inFrame, lastWriteAt, written, attemptActive, queueReleased }),
   }
 }
