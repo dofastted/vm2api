@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- **修复 Gemini 许可 CLI 将 bwrap 沙箱挂载/命名空间失败误报为 `license_invalid`（Refs #1892）**：
+- **修复 Gemini 许可 CLI 将 bwrap 沙箱挂载/命名空间失败误报为 `license_invalid`（Refs #1892，#1926）**：
   - `scripts/gemini-host.py`：`classify_craggemini_license_cli_error` 在回落到许可无效前识别 `bwrap:` 致命启动失败（bind 源不可穿越、`Can't bind mount` / `Can't mount proc` / `execvp Permission denied`、user namespace 拒绝等），分别上报 `gemini_sandbox_unavailable` 与 `gemini_sandbox_apparmor_restricted`；忽略纯 `bwrap: Warning` 行以免掩盖真实许可结论；`license_status` 保留沙箱错误码。
-  - **兼容性**：经宿主 `license-machine-code` / `license-activate` / `license-status` 暴露的 `crag_license.code` 在沙箱启动失败时为 `gemini_sandbox_*`，HTTP **503**（此前误为 **403** `license_invalid`）；`sync_pending` 时 bwrap 失败亦上报沙箱码而非许可错误。`src/lib/gemini/subscription.mjs` / `scheduler.mjs` 准入与调度不再将沙箱码回落为 `license_required`。
+  - **兼容性**：宿主 `license-machine-code`、`license-activate`、`license-status` 在沙箱启动失败时返回 HTTP **503** 与 `gemini_sandbox_*`（此前误为 **403** `license_invalid`）；宿主持票 `sync_pending` 时 bwrap 失败亦上报沙箱码而非许可无效。`src/lib/gemini/subscription.mjs` / `scheduler.mjs` 准入与调度不再将沙箱码回落为 `license_required`。
   - 前端 `web/src/features/import/gemini-environments.tsx`：沙箱失败时不突出「绑定 CRAG 席位」操作。
   - 回归：`test/unit/gemini-host-license-align.py`、`test/unit/gemini-license-sandbox-admission.test.mjs`。
 - **Ubuntu 26.04 受管 `bwrap` 入口与 AppArmor profile 扩展（#1895，#1929）**：
@@ -12,14 +12,13 @@
   - `scripts/gemini_host_apparmor.py`：新增 `resolve_bwrap_argv0()`（`VM2API_GEMINI_BWRAP` 可覆盖，否则优先 `/usr/local/lib/vm2api-gemini/exec/bwrap`）、`managed_bwrap_required()` / `managed_bwrap_entry_configured()`；`deploy/install.sh` 与 `scripts/gemini-maintenance.py` 在检测到 `bwrap-userns-restrict` 时将系统 `bwrap` 同步至受管路径，并在 `vm2api-gemini` profile 添加 `ix` 规则而不放宽全局 `/usr/bin/bwrap`。
   - `scripts/gemini-host.py` 全部沙箱 argv 经统一入口解析；维护探针与静态检查在受管入口或 profile 规则缺失时上报 `gemini_sandbox_apparmor_restricted`。
   - 回归：`test/unit/test_gemini_host_apparmor.py`、`test/deploy/test_gemini_apparmor.py`、`test/unit/gemini-sandbox-apparmor.py`、`test/unit/gemini-sandbox-apparmor.test.mjs`。
-- **Codex 续热读取官方 5h reset，面板保存保留 `mode` / `auto_renew`（Refs #1874，#1927）**：
-  - `VmTestScheduleRunner` 原先统一从 `accountQuota.unified['5h']` 取 `windowState` / `nextWindowEnd`；Codex 槽无 Claude 配额行，实际窗口在 `summarizeCodexSlot().usage.quota`，导致 `auto_renew` 的 `nextWindowEnd` 恒为 `null`、续热无法触发。
-  - 新增 `src/lib/admin/vm-test-preheat-window.mjs`：Codex 走 `summarizeCodexSlot` 的 5h 窗口，Claude 仍走 `accountQuota`；`server.mjs` 改用 `preheatWindowState` / `preheatNextWindowEnd`。
-  - `mergeVmTestSchedulePreserve`：`save()`、`applyScheduleStructure()` 与全量 sync 的 `_applyFullTest()` 在请求未显式携带字段时保留已存的 `mode` / `auto_renew`，修复 Web PUT 省略两项后把预热计划重置为 `test` + `auto_renew: false` 的问题。
+- **Codex 续热窗口数据源与面板预热计划保存（Refs #1874，#1927）**：
+  - **续热读数**：`VmTestScheduleRunner` 原先对 Claude/Codex 槽位统一从 `accountQuota.unified['5h']` 取 `windowState` / `nextWindowEnd`；Codex 槽无 Claude 配额行，官方 5h 窗口实际在 `summarizeCodexSlot().usage.quota`。新增 `src/lib/admin/vm-test-preheat-window.mjs`，Codex 槽改读 Codex 配额、Claude 槽仍读 Claude 5h 行；`server.mjs` 改用 `preheatWindowState` / `preheatNextWindowEnd`。
+  - **PUT 保存**：Web `PUT /api/panel/vms/:id/test-schedule` 请求体通常省略 `mode` / `auto_renew`；`mergeVmTestSchedulePreserve` 在 `save()`、`applyScheduleStructure()` 与全量 sync 路径上于字段缺省时合并已存值，不再把计划重置为默认 `test` + `auto_renew: false`。
   - 回归：`test/unit/issue-1874.test.mjs`、`test/unit/vm-test-schedule.test.mjs`。
-- **agy 工具 schema 去重 `required` 并规避 CRAGGemini 桥接层 `toolSummary` 注入冲突（Refs #1915，#1925）**：
-  - 根因：桥接层再次注入 `toolSummary` 等字段时，若客户端 `parameters.required` 已声明同名必填项，下游会出现重复 `required`（`at '/required': items at 1 and 3 are equal`），首轮 `502 gemini_inference_failed`。
-  - `src/lib/protocol/gemini-convert.mjs`：`sanitizeGeminiSchema` 对 `required` 有序去重；`avoidAgyBridgeParamCollisions` 将根级碰撞字段重命名为 `_client_<name>`；`forwardAgyBridgeToolArgs` / `restoreAgyBridgeToolArgs` 在多轮 `functionCall` 与流式/非流式回流中按 schema 还原；`target: antigravity` 路径生效，直连 Gemini API 不变。
+- **agy 出站工具 schema：`required` 去重与桥接参数碰撞规避（Refs #1915，#1925）**：
+  - 根因：CRAGGemini / agy 在 MCP 工具上注入 `toolSummary` 时，若客户端 schema 已声明同名键并列入 `required`，下游合并会产生重复 `required` 条目，工具 schema 无效。
+  - `src/lib/protocol/gemini-convert.mjs`（`target: antigravity` 转发路径）：`sanitizeGeminiSchema` 对 `required` 有序去重并剔除无对应属性的项；`avoidAgyBridgeParamCollisions` 将根级与桥接注入碰撞的参数重命名为 `_client_<name>` 并同步改写 `required`；出站 `tool_call` 经 `restoreAgyBridgeToolArgs` 把 `_client_*` 还原为客户端名并剥除桥接泄漏的裸注入键（流式/非流式 OpenAI·Anthropic 回流）。直连 Gemini API 路径未改。
   - 回归：`test/unit/gemini-convert.test.mjs`。
 - **KVM guest `kinhome` / `kinclaude` 9p 改用 `cache=none`，修复 `.claude.json` 原子写回卡死（#1877，#1924）**：
   - 根因：`cache=mmap` 下 Claude Code 在 `~/.claude/` 创建 `.claude.json.tmp.*` 并 `fchmod` / `stat` 时触发 v9fs 脏页写回，guest 内核 6.8 上写回可能长时间不完成，CLI 进入 `D` 状态，槽卡在 `cleaning`、队列 504。
