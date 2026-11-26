@@ -1246,10 +1246,17 @@ export function createCragSubscription({
   async function countEnabledSlots(vms, opts) {
     let next = 0
     let enabled = 0
+    let failed = false
     const worker = async () => {
-      while (next < vms.length) {
+      while (!failed && next < vms.length) {
         const vm = vms[next++]
-        if (await isSlotEnabled(vm, opts)) enabled += 1
+        try {
+          if (await isSlotEnabled(vm, opts)) enabled += 1
+        } catch (error) {
+          // The count is void now; do not keep probing the remaining slots.
+          failed = true
+          throw error
+        }
       }
     }
     await Promise.all(Array.from({ length: Math.min(ENABLED_PROBE_CONCURRENCY, vms.length) }, worker))
