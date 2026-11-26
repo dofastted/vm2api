@@ -4,7 +4,7 @@
  * agent-identity recovery.
  */
 import crypto from 'node:crypto'
-import { getVm, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
+import { getVm, syncCodexQuotaSchedule, patchVmRecord } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
@@ -332,12 +332,24 @@ async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
     }
     return { ...slot, rotateError: tok.error || 'refresh_failed' }
   }
+  const expiresAt = tok.expires_at || slot.first.expires_at
   upsertCodexAccount(projectRoot, vmId, {
     access_token: tok.access_token,
     refresh_token: tok.refresh_token,
     id_token: tok.id_token || slot.first.id_token,
-    expires_at: tok.expires_at || slot.first.expires_at,
+    expires_at: expiresAt,
   })
+  // 凭证文件是过期时间真值；vm.json 的 codex.expires_at 是导入时快照，
+  // 不镜像会导致面板/needsScheduledRefresh 读到「过期 14 天」的假死票。
+  // best-effort：镜像失败不影响内存态轮换结果。
+  try {
+    if (expiresAt) {
+      patchVmRecord(projectRoot, vmId, (vm) => {
+        vm.codex = vm.codex && typeof vm.codex === 'object' ? { ...vm.codex } : {}
+        vm.codex.expires_at = expiresAt
+      })
+    }
+  } catch {}
   return { ...slot, access: tok.access_token, refresh: tok.refresh_token || slot.refresh }
 }
 
