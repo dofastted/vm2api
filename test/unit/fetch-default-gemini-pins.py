@@ -234,6 +234,105 @@ def test_prepare_remote_tag_rejects_mismatched_pubkey_or_agy():
         raise AssertionError(f"prepare_remote_tag accepted mismatched {key} digest")
 
 
+def test_prepare_pinned_reuses_verified_agy_and_skips_gcs_download():
+    """Pinned prepare() reuses a matching local agy binary instead of re-downloading 99MB."""
+    tag = "payload-2026.11.26-gemini-0.4.13"
+    release_url = RELEASE_PREFIX + tag
+    agy_bytes = b"verified-pinned-agy-binary"
+    native_bytes = {
+        "craggemini": b"craggemini-bin",
+        "craggemini.payload.enc": b"encrypted-payload",
+        "libagy_bridge.so": b"bridge-so",
+        "crag-license-public.pem": b"pubkey-pem",
+        "manifest.json": b'{"family":"crag","encrypted":true,"software_version":"0.4.13"}',
+    }
+    pins = {
+        "tag": tag,
+        "version": "0.4.13",
+        "release": release_url,
+        "assets": {
+            name: {"size": len(raw), "sha256": _sha256_hex(raw)}
+            for name, raw in native_bytes.items()
+        },
+    }
+    assets_by_url = {f"{release_url}/{name}": raw for name, raw in native_bytes.items()}
+    orig_agy_sha = impl.AGY_BINARY_SHA256
+    impl.AGY_BINARY_SHA256 = _sha256_hex(agy_bytes)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            parent = root / "private"
+            parent.mkdir(mode=0o700)
+            os.chmod(parent, 0o700)
+            reuse_agy = root / "existing-agy"
+            reuse_agy.write_bytes(agy_bytes)
+            os.chmod(reuse_agy, 0o644)
+            dest = parent / "pinned-dest"
+            verified = []
+            impl.prepare(
+                dest,
+                pins,
+                reuse_agy=reuse_agy,
+                opener=_FakeOpener(assets_by_url),
+                verify=lambda stage, ver: verified.append(
+                    (sorted(p.name for p in stage.iterdir()), ver)
+                ),
+            )
+            assert (dest / "agy").read_bytes() == agy_bytes
+            assert verified == [(sorted([*impl.NATIVE_ASSETS, "agy"]), "0.4.13")]
+    finally:
+        impl.AGY_BINARY_SHA256 = orig_agy_sha
+
+
+def test_download_retries_transient_error_but_not_digest_mismatch():
+    """Transient network drops retry and succeed; deterministic SHA-256 mismatch fails once."""
+    payload = b"reliable-asset-bytes"
+    sha = _sha256_hex(payload)
+    orig_delays = impl.DOWNLOAD_RETRY_DELAYS
+    impl.DOWNLOAD_RETRY_DELAYS = (0.0, 0.0)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            attempts = {"n": 0}
+
+            class _FlakyOpener:
+                def open(self, request, timeout=60):
+                    attempts["n"] += 1
+                    if attempts["n"] < 2:
+                        raise ConnectionResetError("connection reset by peer")
+                    return _FakeHttpResponse(payload)
+
+            dest = root / "ok.bin"
+            impl.download(_FlakyOpener(), "https://github.com/test/ok.bin", dest, len(payload), sha)
+            assert attempts["n"] == 2
+            assert dest.read_bytes() == payload
+
+            bad_attempts = {"n": 0}
+
+            class _WrongDigestOpener:
+                def open(self, request, timeout=60):
+                    bad_attempts["n"] += 1
+                    return _FakeHttpResponse(b"X" * len(payload))
+
+            bad_dest = root / "bad.bin"
+            try:
+                impl.download(
+                    _WrongDigestOpener(),
+                    "https://github.com/test/bad.bin",
+                    bad_dest,
+                    len(payload),
+                    sha,
+                )
+            except RuntimeError as error:
+                assert "SHA-256 does not match the pin" in str(error)
+                assert bad_attempts["n"] == 1
+                assert not bad_dest.exists()
+            else:
+                raise AssertionError("download accepted wrong SHA-256")
+    finally:
+        impl.DOWNLOAD_RETRY_DELAYS = orig_delays
+
+
 for name, case in sorted(globals().items()):
     if name.startswith("test_"):
         case()

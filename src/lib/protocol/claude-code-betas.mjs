@@ -32,6 +32,13 @@ export const BETA_THINKING_DISPLAY_UPDATES = 'thinking-display-updates-2026-08-1
 export const BETA_DANGEROUS_TOOL_USE = 'dangerous-tool-use-2026-09-03'
 /** Mid-conversation `tool_addition.tool` of type `tool_definition`. Not in the always-on prefix. */
 export const BETA_INLINE_TOOLS = 'inline-tools-2026-09-15'
+/**
+ * The `advisor_20260301` tool, and any `advisor_tool_result` block already in the
+ * history. Upstream needs the token for both: dropping the tool from `tools` on a
+ * later turn is allowed, but the replayed result blocks are only accepted while
+ * this beta is still declared. Not in the always-on prefix.
+ */
+export const BETA_ADVISOR_TOOL = 'advisor-tool-2026-03-01'
 
 const PER_TURN_MODELS = {
   'claude-haiku-5-5': true,
@@ -79,6 +86,14 @@ function contentHasInlineToolDefinition(content) {
   return false
 }
 
+function contentHasAdvisorResult(content) {
+  if (!Array.isArray(content)) return false
+  for (const block of content) {
+    if (block && typeof block === 'object' && block.type === 'advisor_tool_result') return true
+  }
+  return false
+}
+
 function hasHourCache(node) {
   if (Array.isArray(node)) return node.some(hasHourCache)
   if (!node || typeof node !== 'object') return false
@@ -120,6 +135,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
     for (const tool of body.tools) {
       if (tool?.strict === true) add('structured-outputs-2025-12-15')
       if (tool?.defer_loading || String(tool?.type || '').startsWith('tool_search_tool_')) add(BETA_ADVANCED_TOOL_USE)
+      if (tool?.type === 'advisor_20260301') add(BETA_ADVISOR_TOOL)
     }
   }
   if (body.thinking?.block_binding) add(BETA_THINKING_BINDING_CONTROLS)
@@ -141,6 +157,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
   if (Array.isArray(body.messages)) {
     let hasClearAt = false
     let hasInlineToolDefinition = false
+    let hasAdvisorResult = false
     let hasMessageOutputConfig = false
     let hasMessageEffort = false
     let hasMessageFormat = false
@@ -149,6 +166,9 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
       if (!message || typeof message !== 'object') continue
       if (message.clear_at != null) hasClearAt = true
       if (contentHasInlineToolDefinition(message.content)) hasInlineToolDefinition = true
+      // Before the output_config bail below: a replayed advisor result has to be
+      // seen on every message, not just the ones carrying turn controls.
+      if (contentHasAdvisorResult(message.content)) hasAdvisorResult = true
       const config = message.output_config
       if (!config || typeof config !== 'object') continue
       hasMessageOutputConfig = true
@@ -158,6 +178,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
     }
     if (hasClearAt) add(BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT)
     if (hasInlineToolDefinition) add(BETA_INLINE_TOOLS)
+    if (hasAdvisorResult) add(BETA_ADVISOR_TOOL)
     if (hasMessageOutputConfig) add(BETA_MID_CONVERSATION_OUTPUT_CONFIG)
     if (hasMessageEffort) add(BETA_EFFORT)
     if (hasMessageFormat) add('structured-outputs-2025-12-15')

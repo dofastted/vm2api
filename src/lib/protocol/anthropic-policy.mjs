@@ -26,7 +26,12 @@ import {
   validateBetweenToolsThinking,
 } from './model-policy.mjs'
 import { ensureOutputConfigSchema, rectifyUnofficialRequest } from './request-rectifier.mjs'
-import { DEFAULT_CACHE_TTL, applyCacheBreakpoints, stripCacheScopeFields } from './cache-ttl.mjs'
+import {
+  DEFAULT_CACHE_TTL,
+  applyCacheBreakpoints,
+  repairCacheBreakpointsInPlace,
+  stripCacheScopeFields,
+} from './cache-ttl.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
 import { normalizeToolInputSchemas } from './tool-input-schema.mjs'
 
@@ -62,48 +67,12 @@ function cleanContent(content, { keepEmptyIdentity = false } = {}) {
     )
 }
 
-function cacheControlLocations(body) {
-  const locations = []
-  const add = (block, section, index) => {
-    if (block?.cache_control) locations.push({ block, section, index })
-  }
-  for (const [index, tool] of (body.tools || []).entries()) add(tool, 'tools', index)
-  for (const [index, block] of (Array.isArray(body.system) ? body.system : []).entries()) add(block, 'system', index)
-  for (const [messageIndex, message] of (body.messages || []).entries()) {
-    if (!Array.isArray(message?.content)) continue
-    for (const [blockIndex, block] of message.content.entries()) {
-      if (block?.cache_control)
-        locations.push({
-          block,
-          section: 'messages',
-          index: messageIndex,
-          blockIndex,
-        })
-    }
-  }
-  return locations
-}
-
 function normalizeCacheTTL(_body) {
   // Official 2.1.241 uses ephemeral 1h. Do not coerce 1h back to 5m.
 }
 
 export function enforceCacheLimit(body, maximum = 4) {
-  const locations = cacheControlLocations(body)
-  // Anthropic rejects the marker on a thinking block regardless of the budget.
-  for (const location of locations) {
-    if (location.block?.type === 'thinking') delete location.block.cache_control
-  }
-  const live = locations.filter((location) => location.block?.cache_control)
-  if (live.length <= maximum) return
-  // Keep the message anchors: they advance the cache prefix on every turn.
-  // Tools are the cheapest to sacrifice, while system breakpoints preserve the
-  // stable persona prefix shared by the whole session.
-  const bySection = (name) => live.filter((location) => location.section === name)
-  const order = [...bySection('tools').reverse(), ...bySection('system').reverse(), ...bySection('messages')]
-  for (const location of order.slice(0, live.length - maximum)) {
-    delete location.block.cache_control
-  }
+  repairCacheBreakpointsInPlace(body, { limit: maximum })
 }
 
 const CLEAR_THINKING_EDIT = Object.freeze({

@@ -20,6 +20,7 @@ import {
   createResponsesSseEventNamer,
   assembleCodexBodyFromSse,
   codexBodyToAnthropicMessage,
+  codexCompatibleFunctionTools,
   isToolArgumentsError,
   toCodexResponses,
 } from './codex-convert.mjs'
@@ -41,7 +42,7 @@ import {
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
-import { openaiUsageAccountId, readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
+import { openaiUsageAccountId, readCodexAccounts, upsertCodexAccount, persistCodexCredentialState, markCodexGrantDead } from '../vm/codex-slot.mjs'
 import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
@@ -346,10 +347,25 @@ export function isRetryableCodexTransport(result) {
 }
 
 /**
+ * Grant-death 签名：OpenAI 吊销回 `error.code=token_revoked` /
+ * "Encountered invalidated oauth token"。与 claude 池 GRANT_DEAD 词表对齐，
+ * 但不含 invalid_grant——那是轮换竞态的常见假阳性（旧 RT 重放），
+ * refreshCodexAccessToken 的严格分类同样把它留给 refresh_rejected。
+ */
+export function isCodexGrantDead(result) {
+  if (!result || result.ok === true) return false
+  const status = Number(result.status) || 0
+  if (status !== 401 && status !== 403) return false
+  const hay = `${result.body?.error?.code || ''} ${result.body?.error?.message || ''} ${result.error_code || ''}`
+  return /token_revoked|invalidated oauth token|token has been revoked|oauth_revoked/i.test(hay)
+}
+
+/**
  * Short process-local hold for an account that just failed upstream. This is
  * not the operator scheduling switch: it expires by itself and keeps the next
  * request from spending another turn on the same dead 401 / rate-limited
  * account. Committed streams and request-shaped errors are never parked.
+ * Grant death (token_revoked) is permanent and handled by the disk park.
  */
 export function codexFailureHold(result, now = Date.now()) {
   if (!result || result.ok === true || result.committed === true) return null
@@ -363,7 +379,10 @@ export function codexFailureHold(result, now = Date.now()) {
     )
   )
     return null
-  if (status === 401) return { until: now + 5 * 60_000, reason: 'oauth_401' }
+  if (status === 401) {
+    if (isCodexGrantDead(result)) return { until: Number.MAX_SAFE_INTEGER, reason: 'oauth_revoked' }
+    return { until: now + 5 * 60_000, reason: 'oauth_401' }
+  }
   if (status === 403) return { until: now + 5 * 60_000, reason: 'permission_denied' }
   if (status === 429) return { until: now + 60_000, reason: 'rate_limited' }
   if (status === 408 || status >= 500) return { until: now + 30_000, reason: 'upstream_5xx' }
@@ -907,6 +926,7 @@ export async function handleCodexProtocol({
   let attempts = 0
   let switches = 0
   let counted = false
+  let compatibleTools = null
   try {
     for (;;) {
       const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, {
@@ -1014,7 +1034,7 @@ export async function handleCodexProtocol({
         }
         hops += 1
         logBag.vm_id = vm.id
-        logBag.attempt_count = hops
+        logBag.attempt_count += 1
         logBag.usage_account_id = openaiUsageAccountId(searchCredentials(projectRoot, vm).accountId)
         const chunks = []
         const nameSseEvent = createResponsesSseEventNamer()
@@ -1057,7 +1077,11 @@ export async function handleCodexProtocol({
           previous_response_id: inboundSession.previous_response_id,
         }
         logBag.outbound_session_id = sessionIdForLog(outboundSessionId)
-        const outboundBody = applyCodexRebuildBody({ ...converted.body, stream: true }, outboundSessionId, sessionMode)
+        let outboundBody = applyCodexRebuildBody(
+          { ...converted.body, ...(compatibleTools && { tools: compatibleTools }), stream: true },
+          outboundSessionId,
+          sessionMode,
+        )
         const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
@@ -1122,8 +1146,37 @@ export async function handleCodexProtocol({
               if (named) res.write(named)
             },
           })
-        let result = await runHop()
-        let policyRefusal = afterHop?.(result)
+        const runAttempt = async () => {
+          let result = await runHop()
+          let policyRefusal = afterHop?.(result)
+          const error = result?.body?.error
+          if (
+            !compatibleTools &&
+            !policyRefusal &&
+            !result?.ok &&
+            Number(result?.status) === 400 &&
+            error?.code === 'invalid_json_schema' &&
+            /^Invalid schema for 'tools\[\d+\]\.parameters': Unsatisfiable schema:/.test(error.message || '') &&
+            !result.committed &&
+            !result.transportError &&
+            !hopEmitted &&
+            !res.headersSent &&
+            !gone.signal.aborted &&
+            attempts < failoverBudget.maxAttempts
+          ) {
+            compatibleTools = codexCompatibleFunctionTools(outboundBody.tools)
+            if (compatibleTools) {
+              attempts += 1
+              logBag.attempt_count += 1
+              outboundBody = { ...outboundBody, tools: compatibleTools }
+              if (captureOutbound) logBag.outbound_body = outboundBody
+              result = await runHop()
+              policyRefusal = afterHop?.(result)
+            }
+          }
+          return { result, policyRefusal }
+        }
+        let { result, policyRefusal } = await runAttempt()
         // A transient seat-local failure gets the same account up to N retries
         // before the request spends a switch. 401/403/429 are never retried here:
         // they are credential/account state and must move to another seat.
@@ -1141,12 +1194,13 @@ export async function handleCodexProtocol({
           sameAccountRetries += 1
           attempts += 1
           hops += 1
-          logBag.attempt_count = hops
+          logBag.attempt_count += 1
           logBag.codex_same_account_retried = sameAccountRetries
           await new Promise((resolve) => setTimeout(resolve, sameRetryDelayMs))
           hopEmitted = false
-          result = await runHop()
-          policyRefusal = afterHop?.(result)
+          const retried = await runAttempt()
+          result = retried.result
+          policyRefusal = retried.policyRefusal
         }
         // The log and total duration share ingress time; pool scoring keeps hop TTFT.
         logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
@@ -1254,6 +1308,19 @@ export async function handleCodexProtocol({
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
         const failureHold = !policyRefusal && codexFailureHold(result)
         if (failureHold) holdOpenAIAccount(vm.id, failureHold)
+        // Grant 死亡（OpenAI 吊销）：5 分钟内存 hold 挡不住轮转调度，必须落盘摘池，
+        // 面板才能显示「不可调度 · 凭证吊销」；与 claude 池 markVmRefreshError 同语义。
+        if (!policyRefusal && isCodexGrantDead(result)) {
+          try {
+            persistCodexCredentialState(projectRoot, vm.id, { error: 'oauth_revoked' })
+            markCodexGrantDead(projectRoot, vm.id, {
+              description: result?.body?.error?.message || result?.body?.error?.code || null,
+              status: Number(result.status) || 0,
+            })
+          } catch {
+            /* 写盘 best-effort；内存 hold 已在 */
+          }
+        }
         if (policyRefusal && policyRefusal !== 'upstream:billing_refusal') {
           stats.errors++
           const error = upstreamRiskClientError(policyRefusal, res._kinRequestId)
@@ -1413,6 +1480,12 @@ function searchCredentials(projectRoot, vm) {
  * refresh token on its own, so first adopt a token it wrote meanwhile; otherwise refresh
  * once per slot, shared by concurrent callers.
  */
+/**
+ * Refresh the search/images access token once per slot, shared by concurrent callers.
+ * Resolves the new access token, '' when refresh is impossible/failed, or
+ * `grant-dead:<code>` when the token endpoint itself answered revocation
+ * (`oauth_revoked`) — the caller parks the slot instead of silently failing.
+ */
 function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh }) {
   const now = searchCredentials(projectRoot, vm)
   if (now.access && now.access !== usedAccess) return now.access
@@ -1421,6 +1494,8 @@ function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl,
   if (!pending) {
     pending = (async () => {
       const tok = await refresh({ refreshToken: now.refresh, proxyUrl, fetchImpl })
+      // 吊销定论穿透共享缓存：并发等同一个 pending 的调用方都能看到 grant death。
+      if (!tok?.ok && tok?.error === 'oauth_revoked') return `grant-dead:${tok.error}`
       if (!tok?.ok || !tok.access_token) return ''
       upsertCodexAccount(projectRoot, vm.id, {
         access_token: tok.access_token,
@@ -1488,6 +1563,15 @@ async function postCodexJson({
   let out = creds.access ? await send(creds.access) : { status: 401 }
   if (out.status === 401 || out.status === 403) {
     const access = await refreshSearchAccess(projectRoot, vm, creds.access, { proxyUrl, fetchImpl, refresh })
+    // Token 端点自己答了吊销：落盘摘池（合成 401 无响应体，词表判定走不到，
+    // 必须在这里短路），死号不再被 search/images 每轮换槽烧刷新 401。
+    if (typeof access === 'string' && access.startsWith('grant-dead:')) {
+      try {
+        persistCodexCredentialState(projectRoot, vm.id, { error: 'oauth_revoked' })
+        markCodexGrantDead(projectRoot, vm.id, { description: 'token endpoint answered revocation', status: 401 })
+      } catch {}
+      return { status: 401, error: 'oauth_revoked', grantDead: true, accountId: creds.accountId }
+    }
     if (access) out = await send(access)
   }
   return out
@@ -1500,6 +1584,25 @@ function postCodexSearch(args) {
 function isSearchFailover(out) {
   const status = Number(out?.status) || 0
   return status === 0 || status === 401 || status === 402 || status === 403 || status === 429 || status >= 500
+}
+
+/**
+ * search/images JSON 端点的 grant-death 写盘（与主请求路径同语义）：
+ * 401 响应体命中吊销文案 → 落盘摘池，防止死号继续换槽烧上游 401。
+ */
+export function parkCodexGrantDeadIfHit(projectRoot, vmId, last) {
+  if (Number(last?.status) !== 401) return
+  const parsed = parseJson(last.text)
+  if (!isCodexGrantDead({ ok: false, status: last.status, body: parsed || null })) return
+  try {
+    persistCodexCredentialState(projectRoot, vmId, { error: 'oauth_revoked' })
+    markCodexGrantDead(projectRoot, vmId, {
+      description: parsed?.error?.message || parsed?.error?.code || null,
+      status: last.status,
+    })
+  } catch {
+    /* 写盘 best-effort；换槽逻辑继续 */
+  }
 }
 
 function parseJson(text) {
@@ -1603,6 +1706,8 @@ export async function handleCodexSearch({
           headers: last.headers || {},
           body: parseJson(last.text),
         })
+        // search/images 路径同样接 grant-death 写盘（与主请求路径同语义）。
+        parkCodexGrantDeadIfHit(projectRoot, vm.id, last)
         if (!isSearchFailover(last)) break
       } finally {
         admitted.lease.release()
@@ -1774,6 +1879,9 @@ export async function handleCodexImages({
           headers: last.headers || {},
           body: parseJson(last.text),
         })
+        // search/images 路径同样接 grant-death 写盘（与主请求路径同语义），
+        // 防止死号在 JSON 端点上继续换槽烧 401。
+        parkCodexGrantDeadIfHit(projectRoot, vm.id, last)
         if (last.status >= 200 && last.status < 300 && stickyRouter?.bind) {
           for (const key of admitted.picked.stickyKeys || []) stickyRouter.bind(key, { accountId: vm.id, vmId: vm.id })
         }

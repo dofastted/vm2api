@@ -878,6 +878,7 @@ function restoreInferenceFailure(result, requestPath = '/internal/v1/messages') 
     status: 502,
     terminalState: 'rejected',
     cragPolicyBlock: true,
+    cragCacheControlBlocked: true,
     body: {
       type: 'error',
       error: {

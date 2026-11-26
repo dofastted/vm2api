@@ -1,4 +1,5 @@
 import { canRepairAdaptiveThinking, normalizeThinkingForModel } from '../protocol/thinking.mjs'
+import { removeCacheControlFields } from '../protocol/cache-ttl.mjs'
 import { flattenSearchResultHistory, rectifyUnofficialRequestForRetry } from '../protocol/request-rectifier.mjs'
 import {
   assistantStopReason,
@@ -80,10 +81,7 @@ const ORGANIZATION_DISABLED_PATTERNS = [
  * whole error body), so extract the human text before matching.
  */
 export function isOrganizationDisabledText(text) {
-  const blob =
-    typeof text === 'string'
-      ? text
-      : String(text?.message || text?.error || '')
+  const blob = typeof text === 'string' ? text : String(text?.message || text?.error || '')
   if (!blob) return false
   return ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(blob))
 }
@@ -93,8 +91,7 @@ export function isOrganizationDisabledUsageResult(result = {}) {
   if (result?.ok === true || result?.usage_scope_missing) return false
   const status = Number(result?.usage_status || result?.status || 0)
   if (status !== 400 && status !== 401 && status !== 403) return false
-  const text =
-    result?.usage_error || result?.error || result?.fable?.error || result?.message || ''
+  const text = result?.usage_error || result?.error || result?.fable?.error || result?.message || ''
   return isOrganizationDisabledText(text)
 }
 
@@ -441,6 +438,15 @@ function classifyUpstreamResultRaw(
     }
   }
   if (result.cragPolicyBlock === true && !result.committed) {
+    if (result.cragCacheControlBlocked === true && !repaired) {
+      return {
+        scope: 'request',
+        action: 'repair-and-retry',
+        reason: 'cache_control_repairable',
+        cooldownUntil: null,
+        retrySameAccount: true,
+      }
+    }
     return {
       scope: 'request',
       action: 'stop',
@@ -558,10 +564,7 @@ function classifyUpstreamResultRaw(
   // The org refuses this seat. Not a token death and not a timed cooldown:
   // pause the slot until an operator resumes it, and give the request to
   // another unit instead of returning the 403.
-  if (
-    (status === 400 || status === 401 || status === 403) &&
-    isOrganizationDisabledText(message)
-  ) {
+  if ((status === 400 || status === 401 || status === 403) && isOrganizationDisabledText(message)) {
     return {
       scope: 'account',
       action: result.committed ? 'stop' : 'continue',
@@ -1004,6 +1007,9 @@ export function repairAnthropicRequest(body = {}, policy = {}) {
   }
   if (reason === 'search_repairable') {
     return flattenSearchResultHistory(body)
+  }
+  if (reason === 'cache_control_repairable') {
+    return removeCacheControlFields(body)
   }
   if (reason === 'thinking_repairable') {
     const next = structuredClone(body)

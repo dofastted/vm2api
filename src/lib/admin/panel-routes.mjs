@@ -49,7 +49,14 @@ import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts } from '../vm/codex-slot.mjs'
+import {
+  parseCodexImportPayload,
+  upsertCodexAccount,
+  readCodexAccounts,
+  persistCodexCredentialState,
+  markCodexGrantDead,
+} from '../vm/codex-slot.mjs'
+import { clearOpenAIAccountHold } from '../pool/openai-account-runtime.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth, panelImportErrorPayload } from '../oauth/cookie-auth.mjs'
 import { enrichOauthIdentity } from '../oauth/oauth-identity.mjs'
@@ -565,6 +572,9 @@ async function commitImportedCodexVm({
   if (saved.access_token || saved.refresh_token) {
     const reopened = clearUnschedulable(cfg.paths.project, existing.id, { by: 'credential_import' })
     if (reopened) Object.assign(existing, getVm(cfg.paths.project, existing.id) || {})
+    // 凭证换新同时清进程内存 hold（含 grant-death 的 MAX_SAFE_INTEGER 永久占位），
+    // 否则复活号磁盘健康但调度层恒 cooldown，直到进程重启才回池。
+    clearOpenAIAccountHold(existing.id)
   }
   let catalog = null
   try {
@@ -6930,9 +6940,24 @@ export function createPanelHandler(ctx) {
             proxyUrl: hostProxyUrlForVm(vm),
           })
           if (!tok.ok) {
+            // 操作员手动刷新=最强的死活证据源：吊销结论立即落盘摘池（面板显示
+            // 「不可调度 · 凭证吊销」），其余失败维持现状只回 502。
+            if (tok.error === 'oauth_revoked') {
+              try {
+                persistCodexCredentialState(cfg.paths.project, id, { error: 'oauth_revoked' })
+                markCodexGrantDead(cfg.paths.project, id, {
+                  description: tok.description || 'oauth_revoked',
+                  status: tok.status || null,
+                })
+              } catch {}
+            }
+            const message =
+              tok.error === 'oauth_revoked'
+                ? 'GPT OAuth 凭证已被吊销，需重新授权导入'
+                : 'GPT OAuth 刷新失败，请重新导入'
             return json(res, 502, {
               ok: false,
-              error: { code: tok.error || 'refresh_failed', message: 'GPT OAuth 刷新失败，请重新导入' },
+              error: { code: tok.error || 'refresh_failed', message },
             })
           }
           upsertCodexAccount(cfg.paths.project, id, {
@@ -6941,6 +6966,11 @@ export function createPanelHandler(ctx) {
             id_token: tok.id_token || first.id_token,
             expires_at: tok.expires_at || first.expires_at,
           })
+          // 刷新成功=活票：清掉 grant-death 内存 hold 与陈旧吊销标。
+          clearOpenAIAccountHold(id)
+          try {
+            persistCodexCredentialState(cfg.paths.project, id, { error: null })
+          } catch {}
           return json(res, 200, panel.ok({ ok: true, refreshed: true, platform: 'openai' }))
         }
         if (isApiKeyMode(vm?.claude?.mode)) {

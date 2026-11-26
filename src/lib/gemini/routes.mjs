@@ -51,7 +51,12 @@ const API_KEY = /^[A-Za-z0-9_-]{20,256}$/
 const RELEASE_CODE = /^CGG1-[A-Za-z0-9_-]{43}$/
 const STATES = new Set(['unverified', 'authorizing', 'authorized', 'reauth_required', 'disabled'])
 const ACCOUNT_STATES = new Set(['ok', 'partial', 'error', 'reauth_required'])
-const ACCOUNT_ELIGIBILITIES = new Set(['verification_required', 'location_unsupported', 'ineligible'])
+const ACCOUNT_ELIGIBILITIES = new Set([
+  'verification_required',
+  'location_unsupported',
+  'client_unsupported',
+  'ineligible',
+])
 const PAYLOAD_STATES = new Set(['installed', 'install_on_create', 'awaiting_redemption', 'not_configured', 'invalid'])
 const RUN_STATES = new Set(['running', 'completed', 'failed'])
 const RUN_ERRORS = {
@@ -66,6 +71,10 @@ const RUN_ERRORS = {
   gemini_account_verification_required: [
     403,
     'Google 要求先在浏览器完成该账号的身份验证（403 VALIDATION_REQUIRED）；拉取模型成功不代表可对话，请在对应账号浏览器打开「账号」页的 Google 验证链接完成核验后再试',
+  ],
+  gemini_client_unsupported: [
+    403,
+    'Google 拒绝当前 Antigravity 客户端版本或标识（403 UNSUPPORTED_CLIENT），并非账号订阅失效；请前往「设置 → Gemini 维护」更新至最新 CRAGGemini / CLI 版本，或刷新账号重试',
   ],
   gemini_account_ineligible: [
     403,
