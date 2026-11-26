@@ -1239,6 +1239,18 @@ export async function buildProbeOne({
       rotate: true,
       policy: normalizeCodexRouting(routingConfig.codex).quota,
     })
+    // Codex 探测结果同样写回账号行 unified.last_probe（claude 池现成的闭环，
+    // codex 路径原先只写槽 json 不写账号行——面板 last_probe 恒空=「未探测」假象，
+    // 探测失败也无从在面板归因）。成功/失败都记，失败带 error 文案。
+    // source 用 vm-oauth-usage：USAGE_PROBE_SOURCES 判定集合认这个标签。
+    try {
+      accountQuota?.recordLastProbe?.(id, {
+        ok: !!result.ok,
+        source: 'vm-oauth-usage',
+        at: result.fetched_at || new Date().toISOString(),
+        ...(result.ok ? {} : { error: result.message || result.error || 'GPT quota probe failed', status: result.status || null }),
+      })
+    } catch {}
     if (!result.ok) return gptQuotaFail(result)
     return ok({
       vm_id: id,
