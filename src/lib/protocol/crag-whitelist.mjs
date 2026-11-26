@@ -540,13 +540,26 @@ function validateBreakpointOrderAndBudget(body) {
       invalid(param, 'Cache control exceeds four breakpoints.', 'invalid_cache_control')
     }
   }
-  for (const [i, tool] of (body.tools || []).entries()) visit(tool, `tools[${i}].cache_control`)
+  /**
+   * Nested blocks live inside the parent's prompt span, so a breakpoint on a
+   * `tool_result.content` child precedes the parent's own breakpoint. Visiting
+   * children first keeps the 1h-before-5m ordering check honest; visiting the
+   * parent first would report a false inversion.
+   */
+  const walk = (node, param) => {
+    if (node == null || typeof node !== 'object') return
+    if (Array.isArray(node.content)) {
+      for (const [k, child] of node.content.entries()) walk(child, `${param}.content[${k}]`)
+    }
+    visit(node, `${param}.cache_control`)
+  }
+  for (const [i, tool] of (body.tools || []).entries()) walk(tool, `tools[${i}]`)
   if (Array.isArray(body.system)) {
-    for (const [i, block] of body.system.entries()) visit(block, `system[${i}].cache_control`)
+    for (const [i, block] of body.system.entries()) walk(block, `system[${i}]`)
   }
   for (const [i, msg] of (body.messages || []).entries()) {
     if (!Array.isArray(msg?.content)) continue
-    for (const [j, block] of msg.content.entries()) visit(block, `messages[${i}].content[${j}].cache_control`)
+    for (const [j, block] of msg.content.entries()) walk(block, `messages[${i}].content[${j}]`)
   }
 }
 
