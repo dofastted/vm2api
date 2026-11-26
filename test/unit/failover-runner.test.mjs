@@ -3753,3 +3753,126 @@ test('#5 a verified success clears the session dedupe so later failures count ag
   })
   assert.equal(unitCircuit.snapshot('account-A').failures, 1)
 })
+
+/**
+ * A kernel-preflight 400 is a local rejection: the slot's kernel refused to
+ * assemble the body, and `via` marks it as such. When the code points at a
+ * capability rather than at the request, the other kernel kind may accept the
+ * same body, so the conversation gets one hop off that slot.
+ */
+function preflightReject(code, param = 'messages[1].content[0]') {
+  return {
+    ok: false,
+    status: 400,
+    via: 'kernel-preflight',
+    headers: {},
+    terminalState: 'rejected',
+    transportError: false,
+    committed: false,
+    upstreamExecutions: 0,
+    body: { type: 'error', error: { type: 'invalid_request_error', code, message: `rejected: ${code}`, param } },
+  }
+}
+
+function stickySpy() {
+  const unbound = []
+  return {
+    unbound,
+    router: {
+      resolve: () => null,
+      bind: () => {},
+      unbind: (key) => unbound.push(key),
+    },
+  }
+}
+
+test('#3 a kernel capability rejection re-dispatches once and drops the session binding', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const sticky = stickySpy()
+  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky.router })
+  const seen = []
+  const result = await runner.run({
+    requestId: 'req-kernel-mismatch',
+    stickyKey: 'session-A',
+    model: 'claude-sonnet-5',
+    canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      // The first slot cannot model this block type; the second one can.
+      return selected.accountId === 'account-1' ? preflightReject('invalid_kernel_request') : success('ok-from-2')
+    },
+  })
+  assert.equal(result.ok, true, 'the other kernel must get a chance to answer')
+  assert.deepEqual(seen, ['account-1', 'account-2'])
+  assert.ok(sticky.unbound.includes('session-A'), 'the session binding must be released, not just the slot seat')
+})
+
+test('#3 the re-dispatch happens at most once', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3)])
+  const sticky = stickySpy()
+  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky.router })
+  const seen = []
+  const result = await runner.run({
+    requestId: 'req-kernel-mismatch-all',
+    stickyKey: 'session-A',
+    model: 'claude-sonnet-5',
+    canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return preflightReject('unsupported_capability', 'tools[0].type')
+    },
+  })
+  // Two slots tried, then the clear 400 is returned instead of walking the pool.
+  assert.equal(seen.length, 2, 'must not keep hopping when every kernel refuses')
+  assert.equal(result.status, 400)
+  assert.equal(result.body.error.code, 'unsupported_capability')
+})
+
+test('#3 request-shaped preflight rejections are not re-dispatched', async () => {
+  for (const code of ['invalid_cache_control', 'image_too_large', 'invalid_image_url', 'invalid_tool_schema']) {
+    const scheduler = new Scheduler([candidate(1), candidate(2)])
+    const sticky = stickySpy()
+    const runner = new FailoverRunner({ scheduler, stickyRouter: sticky.router })
+    const seen = []
+    const result = await runner.run({
+      requestId: `req-fatal-${code}`,
+      stickyKey: 'session-A',
+      model: 'claude-sonnet-5',
+      canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+      callAttempt: ({ candidate: selected }) => {
+        seen.push(selected.accountId)
+        return preflightReject(code)
+      },
+    })
+    assert.equal(seen.length, 1, `${code} is refused by every kernel; one slot is enough`)
+    assert.equal(result.status, 400, code)
+    assert.deepEqual(sticky.unbound, [], `${code} must not disturb the session binding`)
+  }
+})
+
+test('#3 an upstream 400 with the same code is not treated as a capability mismatch', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const sticky = stickySpy()
+  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky.router })
+  const seen = []
+  // Same code, but no `via: kernel-preflight`: this came back from upstream, so
+  // the slot assembled the request fine and hopping proves nothing.
+  const result = await runner.run({
+    requestId: 'req-upstream-code',
+    stickyKey: 'session-A',
+    model: 'claude-sonnet-5',
+    canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return {
+        ok: false,
+        status: 400,
+        terminalState: 'rejected',
+        body: { type: 'error', error: { code: 'invalid_kernel_request', message: 'upstream said no' } },
+      }
+    },
+  })
+  assert.equal(seen.length, 1)
+  assert.equal(result.status, 400)
+  assert.deepEqual(sticky.unbound, [])
+})

@@ -205,6 +205,38 @@ function countsTowardCircuit(policy, sessionKey, accountId) {
   return sessionCircuitDedupe.shouldCount(sessionKey, accountId)
 }
 
+/**
+ * Preflight rejections another kernel kind could plausibly accept.
+ *
+ * These come out of the CRAG-only rebuild (prepareCragRequest ->
+ * crag-whitelist), so a cli-node slot may answer the same body:
+ * `invalid_kernel_request` is that whitelist's default code and covers block
+ * types CRAG does not model, `unsupported_capability` is a capability gate by
+ * definition, `crag_prompt_too_large` is a CRAG-specific size limit, and
+ * `thinking_incompatible` depends on the kernel/model pairing.
+ *
+ * Deliberately excluded: invalid_cache_control (breakpoint budget and TTL
+ * order are Anthropic protocol rules), image_too_large, invalid_image_url and
+ * invalid_tool_schema. Every kernel rejects those, so re-dispatching would
+ * only delay the same answer.
+ */
+const KERNEL_CAPABILITY_400_CODES = new Set([
+  'invalid_kernel_request',
+  'unsupported_capability',
+  'thinking_incompatible',
+  'crag_prompt_too_large',
+])
+
+/**
+ * True for a `kernel-preflight` 400 whose code says the slot's kernel, not the
+ * request, is what refused it. `via` is set by invalidKernelResult in
+ * go-worker-client, so this never matches a rejection that came from upstream.
+ */
+function isKernelCapabilityRejection(result) {
+  if (result?.via !== 'kernel-preflight' || result?.status !== 400) return false
+  return KERNEL_CAPABILITY_400_CODES.has(result?.body?.error?.code)
+}
+
 const DEFAULTS = {
   max_account_switches: 3,
   max_total_attempts: 12,
@@ -1153,6 +1185,10 @@ export class FailoverRunner {
     let homeAccountId = null
     let homeRetryPending = false
     let subagentSlotDeadline = null
+    // A kernel capability rejection gets exactly one re-dispatch. The split is
+    // CRAG vs cli-node, so one hop covers it; more would burn budget whenever
+    // every slot refuses and turn a clear 400 into pool exhaustion.
+    let kernelMismatchRetried = false
     const switchUnit = (unit, policy) => {
       budget.noteSwitch(unit.accountId, unit.vmId, { spill: policy.reason === 'slot_busy' })
       if (unit.isSubagent) {
@@ -1702,6 +1738,23 @@ export class FailoverRunner {
             releaseStickySlots()
             return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
           }
+        }
+        // The slot's kernel refused to assemble this body, which is a trait of
+        // the slot rather than of the request: the other kernel kind may accept
+        // it unchanged. Selection never consults capability bits, so without
+        // this hop the sticky binding kept feeding the conversation back to the
+        // one kernel that cannot serve it -- the same 400 for as long as the
+        // session lived. lastResult/lastPolicy are already set above, so an
+        // exhausted pool still answers with this 400 rather than a less useful
+        // pool_exhausted.
+        if (!shouldContinue(policy) && !kernelMismatchRetried && isKernelCapabilityRejection(result)) {
+          kernelMismatchRetried = true
+          // releaseStickySlots only returns the slot's concurrency seat; the
+          // session->unit binding has to be dropped explicitly or the next turn
+          // lands on the same kernel again.
+          for (const key of bindKeys) this.stickyRouter?.unbind?.(key)
+          switchUnit(selected, { reason: 'kernel_capability_mismatch' })
+          continue
         }
         if (!shouldContinue(policy)) {
           releaseStickySlots()
