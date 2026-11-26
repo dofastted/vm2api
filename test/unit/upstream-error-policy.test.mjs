@@ -1429,3 +1429,28 @@ test('upstream 400/403 count toward unit circuit while local validation, refusal
     assert.equal(policy.circuit, undefined, label)
   }
 })
+
+test('deterministic request-schema 400s stop without tripping unit circuits', () => {
+  const now = 1_700_000_000_000
+  for (const [label, message] of [
+    ['advisor_extra_input_schema', 'tools.0.advisor_20260301.input_schema: Extra inputs are not permitted'],
+    [
+      'advisor_missing_beta_tag',
+      "tools.0: Input tag 'advisor_20260301' found using 'type' does not match any of the expected tags: 'bash_20250124'",
+    ],
+    ['field_required', 'messages.0.content: Field required'],
+    ['type_validation', 'max_tokens: Input should be a valid integer'],
+    ['unknown_extra_input', 'tools.1.custom.foo: Extra inputs are not permitted'],
+  ]) {
+    const policy = classifyUpstreamResult(
+      { status: 400, body: { error: { type: 'invalid_request_error', message } } },
+      { model: 'claude-sonnet-5', now },
+    )
+    assert.equal(policy.scope, 'request', label)
+    assert.equal(policy.action, 'stop', label)
+    assert.equal(policy.reason, 'invalid_request_schema', label)
+    assert.equal(policy.cooldownUntil, null, label)
+    assert.equal(policy.circuit, undefined, label)
+    assert.equal(shouldContinue(policy), false, label)
+  }
+})

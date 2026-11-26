@@ -195,6 +195,16 @@ export function prepareCliNodeRequest(body, { requestContext = null } = {}) {
   const out = canonicalRequest(body, {
     preserveConsecutiveUser: requestContext?.purpose === 'auto_mode_classifier',
   })
+  if (
+    Array.isArray(out.tools) &&
+    out.tools.some((t) => String(t?.type || '').startsWith('advisor_') && Object.hasOwn(t, 'input_schema'))
+  ) {
+    out.tools = out.tools.map((t) => {
+      if (!t || !String(t.type || '').startsWith('advisor_') || !Object.hasOwn(t, 'input_schema')) return t
+      const { input_schema: _dropped, ...rest } = t
+      return rest
+    })
+  }
   for (const key of Object.keys(out)) {
     if (key.startsWith('crag_')) delete out[key]
   }

@@ -162,6 +162,15 @@ test('#1845: SQLite 069 and PostgreSQL 006 migrations add identical usage_logs a
       assert.ok(attemptCols.has(col), `SQLite request_attempts missing ${col}`)
       assert.match(pgSql, new RegExp(`ALTER TABLE request_attempts ADD COLUMN IF NOT EXISTS ${col}\\b`))
     }
+
+    const pgAdvisorSql = fs.readFileSync(
+      path.join(root, 'src/lib/db/pg/pg-migrations/007_usage_logs_advisor_billing.sql'),
+      'utf8',
+    )
+    for (const col of ['advisor_usage', 'advisor_cost']) {
+      assert.ok(usageCols.has(col), `SQLite usage_logs missing ${col}`)
+      assert.match(pgAdvisorSql, new RegExp(`ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS ${col}\\b`))
+    }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true })
   }
