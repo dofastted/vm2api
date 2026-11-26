@@ -20,6 +20,7 @@ import {
   parseInboundToGemini,
   renderGeminiProtocolResponse,
   avoidAgyBridgeParamCollisions,
+  restoreAgyBridgeToolArgs,
   sanitizeGeminiSchema,
   sanitizeNativeTuiText,
   signedToolCallId,
@@ -207,6 +208,111 @@ test('avoidAgyBridgeParamCollisions renames bridge-colliding parameters for anti
   assert.equal(params.properties.toolSummary, undefined)
   assert.ok(params.properties._client_toolSummary)
   assert.deepEqual(params.required, ['CommandLine', '_client_toolSummary', 'WaitMsBeforeAsync'])
+})
+
+test('restoreAgyBridgeToolArgs maps _client_toolSummary back and drops bridge-only duplicates', () => {
+  assert.deepEqual(restoreAgyBridgeToolArgs({ _client_toolSummary: 'deploy', CommandLine: 'ls' }), {
+    toolSummary: 'deploy',
+    CommandLine: 'ls',
+  })
+  assert.deepEqual(
+    restoreAgyBridgeToolArgs({ _client_toolSummary: 'from model', toolSummary: 'from bridge', CommandLine: 'ls' }),
+    { toolSummary: 'from model', CommandLine: 'ls' },
+  )
+  assert.deepEqual(restoreAgyBridgeToolArgs({ CommandLine: 'ls', path: '/tmp' }), { CommandLine: 'ls', path: '/tmp' })
+  assert.deepEqual(restoreAgyBridgeToolArgs({ toolSummary: 'bridge only', CommandLine: 'ls' }), { CommandLine: 'ls' })
+})
+
+test('createGeminiRestoreTransform restores agy bridge arg aliases for streaming and JSON responses', () => {
+  const runCommandSchema = {
+    type: 'object',
+    properties: {
+      CommandLine: { type: 'string' },
+      toolSummary: { type: 'string' },
+    },
+    required: ['CommandLine', 'toolSummary'],
+  }
+  const ir = parseInboundToGemini(
+    'openai-chat',
+    {
+      model: 'gemini-4-argon-high',
+      messages: [{ role: 'user', content: 'run ls' }],
+      tools: [{ type: 'function', function: { name: 'run_command', parameters: runCommandSchema } }],
+    },
+    { routeModel: 'gemini-4-argon-high', routeStream: false },
+  )
+  const restore = createGeminiRestoreTransform(ir.restoreContext, {
+    target: 'antigravity',
+    model: 'gemini-4-argon-high',
+  })
+  const collector = createGeminiCollector({ fallbackModel: 'gemini-4-argon-high' })
+  const inboundArgs = {
+    CommandLine: 'ls -la',
+    _client_toolSummary: 'list dir',
+    toolSummary: 'injected',
+    WaitMsBeforeAsync: 0,
+  }
+  for (const ev of [
+    { kind: 'start', responseId: 'rc1', model: 'gemini-4-argon-high' },
+    { kind: 'tool_call', id: 'call_rc1', name: 'run_command', args: inboundArgs, signature: '' },
+    { kind: 'stop', finishReason: 'STOP', stopReason: 'tool' },
+  ]) {
+    restore.push(ev, (out) => collector.push(out))
+  }
+  const turn = collector.result()
+  assert.deepEqual(turn.toolCalls[0].args, {
+    CommandLine: 'ls -la',
+    toolSummary: 'list dir',
+    WaitMsBeforeAsync: 0,
+  })
+
+  const chatJson = renderGeminiProtocolResponse('openai-chat', turn, {
+    model: 'gemini-4-argon-high',
+    restoreContext: ir.restoreContext,
+  })
+  const chatArgs = JSON.parse(chatJson.choices[0].message.tool_calls[0].function.arguments)
+  assert.deepEqual(chatArgs, turn.toolCalls[0].args)
+  assert.equal(chatArgs._client_toolSummary, undefined)
+
+  const anthropicJson = renderGeminiProtocolResponse('anthropic', turn, {
+    model: 'claude-sonnet-4-6',
+    restoreContext: ir.restoreContext,
+  })
+  const anthropicInput = anthropicJson.content.find((b) => b.type === 'tool_use').input
+  assert.deepEqual(anthropicInput, turn.toolCalls[0].args)
+
+  const encoder = createGeminiProtocolStreamEncoder('openai-chat', {
+    model: 'gemini-4-argon-high',
+    restoreContext: ir.restoreContext,
+  })
+  const frames = []
+  for (const ev of [
+    { kind: 'start', responseId: 'rc1', model: 'gemini-4-argon-high' },
+    { kind: 'tool_call', id: 'call_rc1', name: 'run_command', args: inboundArgs, signature: '' },
+    { kind: 'stop', finishReason: 'STOP', stopReason: 'tool' },
+  ]) {
+    restore.push(ev, (out) => {
+      const chunk = encoder.push(out)
+      if (chunk) frames.push(chunk)
+    })
+  }
+  frames.push(encoder.finish())
+  const streamArgs = frames
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('data: '))
+    .map((line) => {
+      try {
+        return JSON.parse(line.slice(6))
+      } catch {
+        return null
+      }
+    })
+    .filter(Boolean)
+    .flatMap((obj) => obj.choices?.[0]?.delta?.tool_calls || [])
+    .map((tc) => (tc.function?.arguments ? JSON.parse(tc.function.arguments) : null))
+    .filter(Boolean)
+  assert.ok(streamArgs.length >= 1)
+  assert.deepEqual(streamArgs.at(-1), turn.toolCalls[0].args)
 })
 
 test('avoidAgyBridgeParamCollisions leaves schemas without collisions unchanged', () => {

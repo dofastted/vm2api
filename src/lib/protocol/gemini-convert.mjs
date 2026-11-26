@@ -846,6 +846,34 @@ export function avoidAgyBridgeParamCollisions(schema) {
   return avoidAgyBridgeParamCollisionsWalk(schema)
 }
 
+/**
+ * Restore client parameter names after antigravity forwarding (#1915); drop bare
+ * bridge-injected keys when a `_client_*` alias carries the model's client value.
+ */
+export function restoreAgyBridgeToolArgs(args) {
+  if (!isPlainObject(args)) return args
+  let out = null
+  const touch = () => {
+    if (!out) out = { ...args }
+    return out
+  }
+  for (const name of AGY_BRIDGE_INJECTED_PARAMS) {
+    const alias = agyBridgeClientAlias(name)
+    const hasAlias = Object.hasOwn(args, alias)
+    const hasOrig = Object.hasOwn(args, name)
+    if (hasAlias) {
+      const o = touch()
+      o[name] = args[alias]
+      delete o[alias]
+    } else if (hasOrig) {
+      // After collision rename the outbound schema exposes only `_client_*`; bare injected keys leak.
+      const o = touch()
+      delete o[name]
+    }
+  }
+  return out || args
+}
+
 function avoidAgyBridgeParamCollisionsWalk(node) {
   if (!isPlainObject(node)) return node
   const out = { ...node }
@@ -4137,6 +4165,7 @@ export function createGeminiRestoreTransform(
         if (ctx.disableParallelTools && emittedToolCalls >= 1) return
         emittedToolCalls += 1
         let args = event.args || {}
+        if (ag) args = restoreAgyBridgeToolArgs(args)
         if (claudeModel && entry?.schema) {
           args = unquoteClaudeEnumArgs(args, entry.schema)
         }
