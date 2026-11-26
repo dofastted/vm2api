@@ -5,6 +5,7 @@ import { CRAG_GEMINI_PRODUCT, readCragGeminiPackageAuthority, readPinnedCragGemi
 
 const DEFAULT_AUTHORITY = 'https://www.vm2api.org/gemini'
 const HOST_DOMAIN = 'crag-gemini-host-v1:'
+const HOST_ID_MOUNT = '/run/crag-host-machine-id'
 const MAX_HOST_ENTITLEMENT_BYTES = 1536 * 1024
 const MAX_SUBSCRIPTION_TOKEN_BYTES = 8192
 const MAX_HOST_ROSTER_ENTRIES = 10_000
@@ -53,7 +54,8 @@ export const GEMINI_LICENSE_MESSAGES = {
   gemini_subscription_authority_unavailable: '无法连接 CRAGGemini 授权中心，请稍后重试。',
   gemini_subscription_invalid_entitlement: 'CRAGGemini 授权中心返回的宿主权益签名无效。',
   gemini_subscription_invalid_voucher: '请输入有效的 CRAGR1 兑换码。',
-  gemini_subscription_package_unready: '宿主机尚未安装可信的 CRAGGemini 加密载荷。',
+  gemini_subscription_package_unready:
+    '宿主机尚未安装可信的 CRAGGemini 加密载荷，请前往「设置 → Gemini 维护」安装或修复后再试。',
   gemini_subscription_busy: 'CRAGGemini 订阅操作正在进行中，请稍后重试。',
   gemini_subscription_invalid_code: '请输入有效的 CRAGS1 / CRAGL1 / CRAGK1 许可码。',
   slot_limit_reached: 'CRAGGemini 宿主机订阅席位已满，请先删除/释放旧环境或扩容订阅。',
@@ -432,7 +434,7 @@ export function createGeminiCragSubscription({
   callHost,
   fetchImpl = globalThis.fetch,
   origin = null,
-  machineIdFile = process.env.KIN_CRAG_HOST_ID_FILE || '/etc/machine-id',
+  machineIdFile = process.env.KIN_CRAG_HOST_ID_FILE || null,
 } = {}) {
   const authorityOrigin = resolveOrigin(origin)
   const publicDir = cragGeminiSubscriptionPublicDirectory(projectRoot, dataDir)
@@ -463,10 +465,18 @@ export function createGeminiCragSubscription({
       return saved
     }
     let raw = null
-    try {
-      const text = fs.readFileSync(machineIdFile, 'utf8').trim().toLowerCase().replaceAll('-', '')
-      if (/^[a-f0-9]{32}$/.test(text) && !/^(0{32}|f{32})$/.test(text)) raw = text
-    } catch {}
+    const machineIdCandidates = machineIdFile
+      ? [machineIdFile]
+      : [HOST_ID_MOUNT, '/etc/machine-id']
+    for (const candidate of machineIdCandidates) {
+      try {
+        const text = fs.readFileSync(candidate, 'utf8').trim().toLowerCase().replaceAll('-', '')
+        if (/^[a-f0-9]{32}$/.test(text) && !/^(0{32}|f{32})$/.test(text)) {
+          raw = text
+          break
+        }
+      } catch {}
+    }
     const derived = raw
       ? sha256Hex(`${HOST_DOMAIN}${raw}`)
       : sha256Hex(`${HOST_DOMAIN}${randomBytes(16).toString('hex')}`)
@@ -514,6 +524,22 @@ export function createGeminiCragSubscription({
       return readCragGeminiPackageAuthority(dir, trustedPem, { expectedPublicKeySha256: pinnedSha })
     } catch {
       throw fail('gemini_subscription_package_unready', 409)
+    }
+  }
+
+  async function ensurePackageAuthority() {
+    try {
+      return packageAuthority()
+    } catch (error) {
+      if (error?.code !== 'gemini_subscription_package_unready' || typeof callHost !== 'function') {
+        throw error
+      }
+      try {
+        await callHost('ensure-payload', {})
+      } catch {
+        throw error
+      }
+      return packageAuthority()
     }
   }
 
@@ -788,7 +814,7 @@ export function createGeminiCragSubscription({
         if (!fs.existsSync(syncMarkerFile)) return { recovered: false, pending: false }
         let authority
         try {
-          authority = packageAuthority()
+          authority = await ensurePackageAuthority()
         } catch {
           return { recovered: false, pending: true }
         }
@@ -843,7 +869,7 @@ export function createGeminiCragSubscription({
     async status({ sync = false } = {}) {
       let authority = null
       try {
-        authority = packageAuthority()
+        authority = sync ? await ensurePackageAuthority() : packageAuthority()
       } catch {
         return formatStatus({ hostId: readOptionalFile(hostIdFile, 128)?.trim() || null, authority: null, local: null })
       }
@@ -867,7 +893,7 @@ export function createGeminiCragSubscription({
       const code = typeof redemptionCode === 'string' ? redemptionCode.trim() : ''
       if (!validVoucher(code)) throw fail('gemini_subscription_invalid_voucher', 400)
       return withLock(async () => {
-        const authority = packageAuthority()
+        const authority = await ensurePackageAuthority()
         const hostId = resolveHostId(true)
         const cred = resolveCredential(hostId, true)
         const previous = readLocalEntitlement(authority)
@@ -899,7 +925,7 @@ export function createGeminiCragSubscription({
 
     async upgrade() {
       return withLock(async () => {
-        const authority = packageAuthority()
+        const authority = await ensurePackageAuthority()
         const hostId = resolveHostId(false)
         const cred = resolveCredential(hostId, false)
         const previous = readLocalEntitlement(authority)
@@ -928,7 +954,7 @@ export function createGeminiCragSubscription({
       return withLock(async () => {
         const env = await callHost('get', { id: envId })
         if (env?.auth_method === 'api_key') throw fail('gemini_subscription_oauth_only', 409)
-        const authority = packageAuthority()
+        const authority = await ensurePackageAuthority()
         const hostId = resolveHostId(false)
         const local = readLocalEntitlement(authority)
         if (!local) throw fail('gemini_subscription_not_active', 409)

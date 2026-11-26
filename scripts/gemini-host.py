@@ -561,9 +561,20 @@ BLOCKING_ACCOUNT_ELIGIBILITIES = frozenset(
 )
 
 
-def session_diagnostic(session, *, final=False):
+ADVISORY_SESSION_DIAGNOSTICS = frozenset({"gemini_client_unsupported"})
+
+
+def session_diagnostic(session, *, final=False, include_advisory=False):
     diag = getattr(session, "native_diagnostic", None)
-    return diag.poll(final=final) if diag is not None else None
+    if diag is None:
+        return None
+    if not include_advisory:
+        try:
+            code = diag.poll(final=final, include_advisory=False)
+        except TypeError:
+            code = diag.poll(final=final)
+        return None if code in ADVISORY_SESSION_DIAGNOSTICS else code
+    return diag.poll(final=final)
 MAX_INFER_BODY = 12 * 1024 * 1024
 NATIVE_RUNTIME_ROOT = Path("/run/vm2api-gemini-native")
 FULL_CAPABILITIES = (
@@ -2060,10 +2071,13 @@ class NativeAgy(Agy):
             }
         result = self.native_invocation.poll()
         if result["state"] == "completed":
+            if hasattr(self.native_diagnostic, "clear_advisory"):
+                self.native_diagnostic.clear_advisory()
             return result
         wrapper_exited = self.native_tui is None or self.native_tui.poll() is not None
-        diagnostic = self.native_diagnostic.poll(
-            final=wrapper_exited or result["state"] != "running"
+        terminal = wrapper_exited or result["state"] != "running"
+        diagnostic = session_diagnostic(
+            self, final=terminal, include_advisory=terminal
         )
         if diagnostic is not None:
             return {
@@ -3044,11 +3058,7 @@ class ResidentTestChatRun:
         )
 
     def poll(self):
-        diagnostic = (
-            self.session.native_diagnostic.poll()
-            if self.session.native_diagnostic is not None
-            else None
-        )
+        diagnostic = session_diagnostic(self.session, include_advisory=False)
         if diagnostic is not None:
             self._done = True
             return {"state": "failed", "text": "", "error": {"code": diagnostic}}
@@ -3056,7 +3066,11 @@ class ResidentTestChatRun:
         if result["state"] != "running":
             self._done = True
             self.session.last_used = time.monotonic()
-            if result["state"] == "failed" and self.session.native_diagnostic is not None:
+            if result["state"] == "completed":
+                diag = getattr(self.session, "native_diagnostic", None)
+                if diag is not None and hasattr(diag, "clear_advisory"):
+                    diag.clear_advisory()
+            elif result["state"] == "failed" and self.session.native_diagnostic is not None:
                 final_diag = self.session.native_diagnostic.poll(final=True)
                 if final_diag is not None:
                     return {"state": "failed", "text": "", "error": {"code": final_diag}}
@@ -6905,6 +6919,16 @@ class Host:
                 "version": self.payload_version,
                 "activation_required": self.payload_state == "awaiting_redemption",
             }
+        if operation == "ensure-payload":
+            if body:
+                raise Failure(400)
+            self.ensure_payload()
+            self._invalidate_license_cache()
+            return {
+                "version": self.payload_version,
+                "payload_state": self.payload_state,
+                "payload_mode": self.payload_mode,
+            }
         if operation == "redeem":
             result = self.redeem_payload(body.get("redemption_code"))
             self._invalidate_license_cache()
@@ -7939,6 +7963,11 @@ class Host:
                 had_error = True
                 return "cancelled", "gemini_inference_cancelled"
             session.last_used = time.monotonic()
+            if (
+                session.native_diagnostic is not None
+                and hasattr(session.native_diagnostic, "clear_advisory")
+            ):
+                session.native_diagnostic.clear_advisory()
             return "completed", None
         except native_mod.NativeFailure as error:
             had_error = error.code != "gemini_unsupported_turn"
@@ -8103,6 +8132,7 @@ class ControlHandler(BaseHTTPRequestHandler):
                 "terminal-io",
                 "terminal-stop",
                 "install-payload",
+                "ensure-payload",
                 "maintenance-status",
                 "maintenance-quiesce",
                 "maintenance-sandbox",

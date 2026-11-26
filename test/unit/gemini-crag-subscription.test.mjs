@@ -1716,3 +1716,74 @@ test('createGeminiCragSubscription status({ sync: true }) bootstraps direct-cred
   assert.equal(statusCalls, 2)
   assert.equal(recoverCalls, 1)
 })
+
+test('redeem auto-materializes staged payload via ensure-payload when share/gemini/current is absent', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-crag-ensure-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const authority = makeAuthority()
+  const now = Math.floor(Date.now() / 1000)
+  const machineIdPath = path.join(root, 'machine-id')
+  fs.writeFileSync(machineIdPath, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n')
+
+  const targetPayloadDir = path.join(root, 'share', 'gemini', 'current')
+  let ensureCalls = 0
+  const callHost = async (op) => {
+    if (op === 'ensure-payload') {
+      ensureCalls += 1
+      const { dir } = seedCragGeminiPayloadDir(path.join(root, 'staged'), authority, { agyDigestOverride: AGY_SHA256 })
+      fs.mkdirSync(path.dirname(targetPayloadDir), { recursive: true })
+      fs.cpSync(dir, targetPayloadDir, { recursive: true })
+      return { version: '0.4.13', payload_state: 'installed', payload_mode: 'crag_subscription' }
+    }
+    throw new Error(`unexpected host op: ${op}`)
+  }
+
+  const fetchImpl = async (url, options) => {
+    const action = url.split('/').pop()
+    assert.equal(action, 'redeem')
+    const body = JSON.parse(options.body)
+    assert.equal(body.issuer_public_key_id, authority.issuerId)
+    assert.equal(body.payload_key_id, authority.payloadKeyId)
+    const h2 = signToken(authority, 'CRAGH2', {
+      version: 2,
+      product: CRAG_GEMINI_PRODUCT,
+      host_id: body.host_id,
+      revision: 1,
+      issued_at: now - 60,
+      expires_at: now + 7 * 86400,
+      slot_limit: 10,
+      roster: [],
+    })
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        data: { entitlement: h2, revision: 1, slot_limit: 10, used_slots: 0, available_slots: 10 },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )
+  }
+
+  const sub = createGeminiCragSubscription({
+    projectRoot: root,
+    dataDir: path.join(root, 'data'),
+    publicKeyPem: authority.publicPem,
+    callHost,
+    fetchImpl,
+    origin: 'http://127.0.0.1:18790',
+    machineIdFile: machineIdPath,
+  })
+
+  // Before redeem, share/gemini/current does not exist yet (install_on_create).
+  assert.equal(fs.existsSync(targetPayloadDir), false)
+  const before = await sub.status()
+  assert.equal(before.configured, false)
+
+  // Redeem triggers ensure-payload once, materializes current, and succeeds.
+  const voucher = `CRAGR1.${'A'.repeat(43)}`
+  const redeemed = await sub.redeem(voucher)
+  assert.equal(ensureCalls, 1)
+  assert.equal(redeemed.configured, true)
+  assert.equal(redeemed.active, true)
+  assert.equal(redeemed.slot_limit, 10)
+  assert.equal(redeemed.available_slots, 10)
+})
