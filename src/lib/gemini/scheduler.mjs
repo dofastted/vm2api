@@ -614,6 +614,13 @@ export function createGeminiScheduler({
     return null
   }
 
+  function clearToolContinuation(callIds) {
+    if (!Array.isArray(callIds)) return
+    for (const cid of callIds) {
+      if (typeof cid === 'string' && cid) toolContinuationBindings.delete(cid)
+    }
+  }
+
   function recordToolContinuation(
     accountId,
     collected,
@@ -889,8 +896,7 @@ export function createGeminiScheduler({
     if (environment.crag_license?.valid === true) {
       return { ok: true, seat_required: true }
     }
-    const licCode =
-      typeof environment.crag_license?.code === 'string' ? environment.crag_license.code : null
+    const licCode = typeof environment.crag_license?.code === 'string' ? environment.crag_license.code : null
     if (licCode && Object.hasOwn(FAILURES, licCode)) {
       const [status, message] = FAILURES[licCode]
       return { ok: false, status, code: licCode, message }
@@ -1421,6 +1427,7 @@ export function createGeminiScheduler({
             if (target === 'antigravity') {
               if (
                 continuationBinding &&
+                !sessionConflictRetried &&
                 continuationBinding.accountId === id &&
                 CONV_ID.test(continuationBinding.conversationId)
               ) {
@@ -1917,8 +1924,9 @@ export function createGeminiScheduler({
               continue
             }
 
-            if (!emittedOutput && failureCode === 'gemini_session_conflict' && effectiveStickyKey) {
-              stickyBindings.delete(effectiveStickyKey)
+            if (!emittedOutput && failureCode === 'gemini_session_conflict') {
+              if (effectiveStickyKey) stickyBindings.delete(effectiveStickyKey)
+              clearToolContinuation(continuationCallIds)
             }
 
             const canSessionConflictRetry =
