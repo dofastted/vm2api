@@ -148,7 +148,9 @@ export function CragGeminiKernelRow({
     ? geminiPin?.tag || bundledReleases[0]?.id || null
     : bundledReleases[0]?.id || null
   const pinVersion = pinTag
-    ? (supportsRemote && geminiPin?.tag === pinTag ? geminiPin.version : null) ||
+    ? (supportsRemote && geminiPin?.tag === pinTag
+        ? geminiPin.version
+        : null) ||
       bundledReleases.find((item) => item.id === pinTag)?.version ||
       geminiReleaseVersionLabel(pinTag)
     : null
@@ -272,7 +274,8 @@ export function CragGeminiKernelRow({
   function requestInstall() {
     if (!canEdit || busy || !snapshot) return
     const targetTag = resolvedTarget?.tag
-    const targetVersion = resolvedTarget?.version || pinVersion || '默认锁定版本'
+    const targetVersion =
+      resolvedTarget?.version || pinVersion || '默认锁定版本'
     openConfirm({
       request: targetTag
         ? { action: 'install', release_id: targetTag }
@@ -287,7 +290,10 @@ export function CragGeminiKernelRow({
     })
   }
 
-  function requestUpdate(target: ReleaseOption | undefined, isPinUpgrade: boolean) {
+  function requestUpdate(
+    target: ReleaseOption | undefined,
+    isPinUpgrade: boolean
+  ) {
     if (!canEdit || busy || !snapshot) return
     if (!target) {
       toast.error('当前没有可用的 CRAGGemini 目标版本')
