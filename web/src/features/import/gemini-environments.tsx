@@ -129,7 +129,7 @@ export type GeminiEnvironment = {
   restriction?: GeminiEnvironmentRestriction | null
   circuit?: VmCircuit | null
   auth_state:
-    'unverified' | 'authorizing' | 'authorized' | 'reauth_required' | 'disabled'
+  'unverified' | 'authorizing' | 'authorized' | 'reauth_required' | 'disabled'
   runtime_ready: boolean
   billing_ready: boolean
   proxy_ready?: boolean
@@ -156,11 +156,11 @@ export type GeminiEnvironment = {
     plan: string | null
     expires_at: string | null
     eligibility?:
-      | 'verification_required'
-      | 'location_unsupported'
-      | 'client_unsupported'
-      | 'ineligible'
-      | null
+    | 'verification_required'
+    | 'location_unsupported'
+    | 'client_unsupported'
+    | 'ineligible'
+    | null
     validation_url?: string | null
     model_catalog?: GeminiModelCatalogEntry[]
     quotas: (QuotaReading & { model: string })[]
@@ -176,12 +176,12 @@ export type GeminiInventory = {
   available: boolean
   host_message?: string
   payload_state?:
-    | 'installed'
-    | 'install_on_create'
-    | 'awaiting_redemption'
-    | 'not_configured'
-    | 'invalid'
-    | 'unknown'
+  | 'installed'
+  | 'install_on_create'
+  | 'awaiting_redemption'
+  | 'not_configured'
+  | 'invalid'
+  | 'unknown'
   payload_mode?: 'legacy_release' | 'crag_subscription'
   payload_issue?: keyof typeof PAYLOAD_ISSUES | null
   release_activated?: boolean | null
@@ -651,7 +651,7 @@ function EnvironmentData({
             {environment.last_inference.model} ·{' '}
             {localTime(
               environment.last_inference.finished_at ||
-                environment.last_inference.started_at
+              environment.last_inference.started_at
             )}
             {environment.last_inference.state === 'failed'
               ? ` · ${geminiInferenceErrorLabel(environment.last_inference.error_code)}`
@@ -659,7 +659,7 @@ function EnvironmentData({
           </dd>
         ) : null}
         {environment.last_inference?.state === 'failed' &&
-        geminiInferenceErrorAction(environment.last_inference.error_code) ? (
+          geminiInferenceErrorAction(environment.last_inference.error_code) ? (
           <dd className='mt-0.5 text-xs text-muted-foreground'>
             {geminiInferenceErrorAction(environment.last_inference.error_code)}
           </dd>
@@ -694,13 +694,13 @@ function EnvironmentData({
                 ? `已绑定席位 #${environment.crag_license.seat}`
                 : '许可有效'
               : geminiInferenceErrorLabel(
-                  environment.crag_license.code ?? 'license_required'
-                )}
+                environment.crag_license.code ?? 'license_required'
+              )}
           </dd>
           {!environment.crag_license.valid &&
-          geminiInferenceErrorAction(
-            environment.crag_license.code ?? 'license_required'
-          ) ? (
+            geminiInferenceErrorAction(
+              environment.crag_license.code ?? 'license_required'
+            ) ? (
             <dd className='mt-0.5 text-xs text-muted-foreground'>
               {geminiInferenceErrorAction(
                 environment.crag_license.code ?? 'license_required'
@@ -1135,15 +1135,15 @@ export function GeminiEnvironments({
   const operation = useGeminiMutation({
     mutationFn: async (action: {
       type:
-        | 'create'
-        | 'authorize'
-        | 'complete'
-        | 'disable'
-        | 'delete'
-        | 'refresh'
-        | 'bind_seat'
-        | 'release_seat'
-        | 'sync_subscription'
+      | 'create'
+      | 'authorize'
+      | 'complete'
+      | 'disable'
+      | 'delete'
+      | 'refresh'
+      | 'bind_seat'
+      | 'release_seat'
+      | 'sync_subscription'
       id?: string
     }) => {
       const resource = `${ROOT}/environments${action.id ? `/${encodeURIComponent(action.id)}` : ''}`
@@ -1269,11 +1269,11 @@ export function GeminiEnvironments({
     : environment?.proxy_ready === false
       ? '绑定的 IPv4 SOCKS5 代理不可用。'
       : geminiPayloadIssue(inventory.data) ||
-        (inventory.data.oauth_runtime_issue
-          ? OAUTH_ISSUES[inventory.data.oauth_runtime_issue]
-          : awaitingRedemption
-            ? '请先兑换 CRAGGemini 内核。'
-            : null)
+      (inventory.data.oauth_runtime_issue
+        ? OAUTH_ISSUES[inventory.data.oauth_runtime_issue]
+        : awaitingRedemption
+          ? '请先兑换 CRAGGemini 内核。'
+          : null)
 
   const account = environment ? (
     <div className='space-y-4'>
@@ -1311,7 +1311,7 @@ export function GeminiEnvironments({
           </Button>
         ) : null}
         {environment.auth_state === 'authorized' ||
-        environment.auth_state === 'reauth_required' ? (
+          environment.auth_state === 'reauth_required' ? (
           <Button
             type='button'
             variant='outline'
@@ -1336,8 +1336,8 @@ export function GeminiEnvironments({
           </Button>
         ) : null}
         {isCragSubscription &&
-        environment.auth_method === 'oauth' &&
-        !environment.crag_license?.valid ? (
+          environment.auth_method === 'oauth' &&
+          !environment.crag_license?.valid ? (
           <Button
             type='button'
             variant='outline'
@@ -1347,16 +1347,16 @@ export function GeminiEnvironments({
             }
           >
             {environment.crag_license?.code &&
-            environment.crag_license.code !== 'license_required'
+              environment.crag_license.code !== 'license_required'
               ? '重新绑定 CRAG 席位'
               : '绑定 CRAG 席位'}
           </Button>
         ) : null}
         {isCragSubscription &&
-        environment.auth_method === 'oauth' &&
-        environment.crag_license?.valid &&
-        environment.crag_license.scope === 'host' &&
-        cragSub?.reclaim_supported ? (
+          environment.auth_method === 'oauth' &&
+          environment.crag_license?.valid &&
+          environment.crag_license.scope === 'host' &&
+          cragSub?.reclaim_supported ? (
           <Button
             type='button'
             variant='outline'
@@ -1368,12 +1368,12 @@ export function GeminiEnvironments({
             释放 CRAG 席位
           </Button>
         ) : null}
-        {!isImport &&
-        isCragSubscription &&
-        !cragSub?.active &&
-        !cragSub?.sync_pending ? (
+        {!isImport && isCragSubscription && !cragSub?.sync_pending ? (
           <GeminiRedeemDialog
             mode='crag_subscription'
+            triggerLabel={
+              cragSub?.active ? '叠加/续费 CRAGGemini 订阅' : undefined
+            }
             onRedeemed={() => {
               void client.invalidateQueries({ queryKey: QUERY_KEY })
             }}
@@ -1412,7 +1412,7 @@ export function GeminiEnvironments({
         )}
       </div>
       {environment.auth_method === 'oauth' &&
-      environment.auth_state === 'authorized' ? (
+        environment.auth_state === 'authorized' ? (
         terminalUnavailable ? (
           <p role='status' className='text-sm text-muted-foreground'>
             暂时无法启动 Gemini：{terminalUnavailable}
@@ -1426,8 +1426,8 @@ export function GeminiEnvironments({
         )
       ) : null}
       {payloadReady &&
-      challenge?.id === environment.id &&
-      environment.auth_state === 'authorizing' ? (
+        challenge?.id === environment.id &&
+        environment.auth_state === 'authorizing' ? (
         <GeminiAuthorizationChallenge
           key={challenge.attempt_id}
           environmentId={environment.id}
@@ -1638,8 +1638,8 @@ export function GeminiEnvironments({
                       : ''}
                   </p>
                   {selectedImportAccount.kind === 'oauth' &&
-                  accountImportParsedAt > 0 &&
-                  selectedImportAccount.oauth_account.expiry_timestamp * 1000 <=
+                    accountImportParsedAt > 0 &&
+                    selectedImportAccount.oauth_account.expiry_timestamp * 1000 <=
                     accountImportParsedAt ? (
                     <p className='text-xs text-amber-700 dark:text-amber-300'>
                       提示：文件中的访问令牌可能已过期，导入验证时可能会被

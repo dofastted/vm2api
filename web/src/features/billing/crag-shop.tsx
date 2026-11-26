@@ -450,8 +450,16 @@ const GEMINI_FALLBACK_DISPLAYABLE_ERRORS = new Set([
   'renewal_unavailable',
   'host_transfer_cooldown',
   'request_conflict',
+  'invalid_request',
+  'not_found',
   'gemini_subscription_busy',
+  'gemini_subscription_sync_pending',
+  'gemini_subscription_package_unready',
+  'gemini_subscription_authority_unavailable',
   'gemini_subscription_invalid_entitlement',
+  'gemini_subscription_invalid_voucher',
+  'license_unconfigured',
+  'license_invalid',
 ])
 
 function isGeminiSubscriptionRedeemResult(
@@ -585,7 +593,8 @@ function HostOverview({
         CRAGR1_VOUCHER_RE.test(redemptionCode) &&
         isApiError(error) &&
         (error.code === 'redeem_unavailable' ||
-          error.code === 'crag_subscription_host_package_unready')
+          error.code === 'crag_subscription_host_package_unready' ||
+          error.code === 'crag_subscription_host_identity_unavailable')
       if (canFallbackToGemini) {
         try {
           const geminiResult = await api<GeminiSubscriptionRedeemResult>(

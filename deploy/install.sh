@@ -1481,7 +1481,11 @@ PY
     local env_data_dir
     env_data_dir="$(grep -m1 '^KIN_DATA_DIR=' "${INSTALL_DIR}/.env" | cut -d= -f2- | tr -d '\r' | sed -e "s/^['\"]//" -e "s/['\"]$//")" || true
     if [[ "$env_data_dir" == /* && "$env_data_dir" != *[[:space:]\|]* ]]; then
-      crag_data_dir="${env_data_dir%/}"
+      local env_data_clean="${env_data_dir%/}"
+      if { [ "$env_data_clean" != "/opt/vm2api/data" ] || [ "$INSTALL_DIR" = "/opt/vm2api" ] || [ -d "/opt/vm2api/data/crag-gemini-subscription" ]; } &&
+        { [ -d "$env_data_clean" ] || [ -d "$(dirname "$env_data_clean")" ]; }; then
+        crag_data_dir="$env_data_clean"
+      fi
     fi
   fi
   local crag_host_dir="${crag_data_dir}/crag-gemini-subscription/public"
