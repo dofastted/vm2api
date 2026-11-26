@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **CRAGGemini agy 桥接层 `toolSummary` 回流与多轮 history 对齐（Refs #1915）**：`src/lib/protocol/gemini-convert.mjs` 跟进 #1925 合并遗漏：`forwardAgyBridgeToolArgs` 在 `target: antigravity` 出站时与根级 `_client_*` 声明同步重命名历史 `functionCall.args`；`restoreAgyBridgeToolArgs` 按工具 schema 剥除客户端未声明的裸 `toolSummary`（已声明则保留裸字段）；桥接注入仅顶层次级，嵌套 `toolSummary` 不重命名。无 schema 时非声明工具的回流路径同样剥除裸 `toolSummary`。
+- **CRAGGemini agy 桥接层 `toolSummary` 回流与多轮 history 对齐（Refs #1915）**：`src/lib/protocol/gemini-convert.mjs` 跟进 #1925 合并遗漏：`forwardAgyBridgeToolArgs` 在 `target: antigravity` 出站时与根级 `_client_*` 声明同步重命名历史 `functionCall.args`；`createGeminiRestoreTransform` 在 antigravity 回程对**每一**次工具调用的 args 执行 `restoreAgyBridgeToolArgs(args, entry.schema)`——根级 `properties` **未**声明 `toolSummary` 时（含 `schema` 缺失或为 `null`、`clientDeclaredAgyBridgeParam` 为假）一律剥除裸 `toolSummary`，与出站是否做过 `_client_*` 碰撞重命名无关；**已**在 schema 根级声明 `toolSummary` 的工具则保留模型直接输出的裸字段（有 `_client_*` 时先还原别名）。桥接注入仅顶层次级，嵌套 `toolSummary` 不重命名。
 
 - **修复 Gemini 许可 CLI 将 bwrap 沙箱挂载/命名空间失败误报为 `license_invalid`（Refs #1892）**：
   - `scripts/gemini-host.py`：`classify_craggemini_license_cli_error` 在回落到许可无效前识别 `bwrap:` 致命启动失败（bind 源不可穿越、`Can't bind mount` / `Can't mount proc` / `execvp Permission denied`、user namespace 拒绝等），分别上报 `gemini_sandbox_unavailable` 与 `gemini_sandbox_apparmor_restricted`；忽略纯 `bwrap: Warning` 行以免掩盖真实许可结论；`license_status` 保留沙箱错误码。
