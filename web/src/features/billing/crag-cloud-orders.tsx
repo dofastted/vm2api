@@ -36,17 +36,29 @@ function validHostOrUuid(value: string) {
   return /^[a-f0-9]{32}$/.test(flat) && !/^(0{32}|f{32})$/.test(flat)
 }
 
+function validMigrationProof(value: string) {
+  const trimmed = value.trim()
+  return trimmed.startsWith('CRAGR1.')
+    ? trimmed.length > 7
+    : /^[0-9a-zA-Z_-]{1,64}$/.test(trimmed)
+}
+
 function channelLabel(method: string) {
   if (method === 'alipay') return paymentLabels.alipay
   if (method === 'wxpay') return paymentLabels.wxpay
   return method || '—'
 }
 
+function orderEffectiveExpiry(order: CragCloudOrder) {
+  return order.grant_expires_at ?? order.expires_at
+}
+
 function orderStatusBadge(order: CragCloudOrder) {
   const now = Math.floor(Date.now() / 1000)
   if (order.status === 'revoked')
     return { label: '已吊销', variant: 'destructive' as const }
-  if (order.expires_at > 0 && order.expires_at <= now)
+  const expiry = orderEffectiveExpiry(order)
+  if (order.active === false || (expiry > 0 && expiry <= now))
     return { label: '已到期', variant: 'secondary' as const }
   return { label: '生效中', variant: 'default' as const }
 }
@@ -83,6 +95,7 @@ export function CragCloudOrdersPanel({
   const [copiedId, setCopiedId] = useState<string>()
   const [migrateOpen, setMigrateOpen] = useState(false)
   const [fromHostId, setFromHostId] = useState('')
+  const [migrateProof, setMigrateProof] = useState('')
   const [migrating, setMigrating] = useState(false)
   const [notice, setNotice] = useState<{ text: string; error?: boolean }>()
   const [renewTarget, setRenewTarget] = useState<CragCloudOrder>()
@@ -93,10 +106,15 @@ export function CragCloudOrdersPanel({
   const hostId = ordersQuery.data?.host_id || host?.host_id
   const orders = ordersQuery.data?.orders ?? []
   const vouchers = ordersQuery.data?.vouchers ?? []
-  const activeVouchers = vouchers.filter((v) => v.status === 'active').length
+  const activeVouchers = vouchers.filter(
+    (v) => v.active === true || v.status === 'active'
+  ).length
   const trimmedFrom = fromHostId.trim()
+  const trimmedProof = migrateProof.trim()
   const canMigrate =
-    validHostOrUuid(trimmedFrom) && trimmedFrom.toLowerCase() !== hostId
+    validHostOrUuid(trimmedFrom) &&
+    trimmedFrom.toLowerCase() !== hostId &&
+    validMigrationProof(trimmedProof)
 
   async function copyText(id: string, value: string) {
     try {
@@ -120,10 +138,14 @@ export function CragCloudOrdersPanel({
         status?: CragHostStatus
       }>('/api/panel/crag-subscription/migrate', {
         method: 'POST',
-        body: JSON.stringify({ from_host_id: trimmedFrom }),
+        body: JSON.stringify({
+          from_host_id: trimmedFrom,
+          proof: trimmedProof,
+        }),
       })
       setMigrateOpen(false)
       setFromHostId('')
+      setMigrateProof('')
       if (result.status) {
         qc.setQueryData(cragHostStatusQueryOptions().queryKey, result.status)
       }
@@ -205,6 +227,7 @@ export function CragCloudOrdersPanel({
             disabled={busy || migrating}
             onClick={() => {
               setFromHostId('')
+              setMigrateProof('')
               setMigrateOpen(true)
             }}
           >
@@ -302,7 +325,7 @@ export function CragCloudOrdersPanel({
                     <p className='text-xs text-muted-foreground'>
                       套餐 {order.sku} · {channelLabel(order.payment_method)} ·
                       付款 {formatSeconds(order.paid_at)} · 有效期至{' '}
-                      {formatSeconds(order.expires_at)}
+                      {formatSeconds(orderEffectiveExpiry(order))}
                     </p>
                     <div className='flex flex-wrap items-center gap-2 text-xs text-muted-foreground'>
                       <span className='font-mono break-all select-all'>
@@ -359,7 +382,8 @@ export function CragCloudOrdersPanel({
           <div className='space-y-2 text-sm'>
             <p>
               粘贴<strong>原宿主机 ID（64 位十六进制）或设备 UUID</strong>
-              ，即可将原宿主机的全部有效兑换券、剩余有效期及云端历史订单整机迁移到当前宿主机。
+              ，并填写原宿主机下任一<strong>历史订单号或原兑换码</strong>
+              作为归属验证，即可将全部有效兑换券、剩余有效期及云端历史订单整机迁移到当前宿主机。
             </p>
             <p className='text-muted-foreground'>
               迁移后原宿主机自动解绑，本机立即接管权益，无冷却期限制。
@@ -367,14 +391,24 @@ export function CragCloudOrdersPanel({
           </div>
         }
       >
-        <Input
-          value={fromHostId}
-          onChange={(event) => setFromHostId(event.target.value)}
-          placeholder='原宿主机 ID（64 位十六进制）或设备 UUID'
-          autoComplete='off'
-          spellCheck={false}
-          aria-label='原宿主机 ID'
-        />
+        <div className='space-y-2'>
+          <Input
+            value={fromHostId}
+            onChange={(event) => setFromHostId(event.target.value)}
+            placeholder='原宿主机 ID（64 位十六进制）或设备 UUID'
+            autoComplete='off'
+            spellCheck={false}
+            aria-label='原宿主机 ID'
+          />
+          <Input
+            value={migrateProof}
+            onChange={(event) => setMigrateProof(event.target.value)}
+            placeholder='归属验证：原宿主机任一订单号或 CRAGR1 兑换码'
+            autoComplete='off'
+            spellCheck={false}
+            aria-label='归属验证凭证'
+          />
+        </div>
       </ConfirmDialog>
 
       <ConfirmDialog
@@ -410,7 +444,7 @@ export function CragCloudOrdersPanel({
                 <dt className='text-muted-foreground'>延长时长</dt>
                 <dd>{renewQuote?.months ?? renewTarget.months} 个月</dd>
                 <dt className='text-muted-foreground'>当前到期</dt>
-                <dd>{formatSeconds(renewTarget.expires_at)}</dd>
+                <dd>{formatSeconds(orderEffectiveExpiry(renewTarget))}</dd>
               </dl>
               {renewLoading ? (
                 <p className='text-xs text-muted-foreground'>

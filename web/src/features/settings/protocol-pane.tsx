@@ -23,6 +23,8 @@ import { OutboundReference } from './outbound-reference'
 import {
   cchEnabledFromCompat,
   ccEntrypointFromCompat,
+  cragDropForeignThinkingFromCompat,
+  cragDropForeignThinkingToCompat,
   sessionIdleTtlFromInference,
   thinkingDisplayFromCompat,
 } from './protocol-authority'
@@ -279,6 +281,34 @@ export function ProtocolPane({
               })
             }
             aria-label='隐藏的 thinking 改为返回摘要'
+          />
+        </SettingRow>
+        <SettingRow
+          label='CRAG print 丢弃外来 thinking'
+          desc={
+            cragDropForeignThinkingFromCompat(compat) === 'all'
+              ? '全部：不是本账号签发的块都丢（含签名无记录的）。签名记录不完整时（清库、记录开始前的老会话）会误丢本账号 thinking 并让提示缓存失效。'
+              : cragDropForeignThinkingFromCompat(compat) === 'foreign_only'
+                ? '仅他账号：只丢明确记在别账号名下的块；签名无记录的保留，换槽后不必先撞一次签名 400。'
+                : '关：原样重放调用方历史，等上游回 thinking 签名 400 再修。'
+          }
+        >
+          <ChipGroup
+            label='CRAG print 丢弃外来 thinking'
+            value={cragDropForeignThinkingFromCompat(compat)}
+            options={[
+              ['off', '关'],
+              ['foreign_only', '仅他账号'],
+              ['all', '全部'],
+            ]}
+            onChange={(mode) =>
+              onCompatChange({
+                ...compat,
+                crag_drop_foreign_thinking: cragDropForeignThinkingToCompat(
+                  mode as 'off' | 'foreign_only' | 'all'
+                ),
+              })
+            }
           />
         </SettingRow>
       </PaneSection>

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { FailoverRunner, opaque429Tracker, sessionCircuitDedupe } from '../../src/lib/pool/failover-runner.mjs'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -666,6 +666,109 @@ test('bare 429s on two accounts stop without cooling accounts or Fable', async (
     assert.deepEqual(scheduler.cooldowns, [])
     assert.deepEqual(scheduler.releasedAccounts, [])
   }
+})
+
+/**
+ * An opaque CRAG 429 is a bare 429 whose provider-side observation carries no
+ * rate-limit headers at all. #1139 made a single one stop the request without
+ * cooling anything down, because one such response proves nothing. These cases
+ * pin that first-hit behaviour and the escalation that follows repetition.
+ */
+function opaque429() {
+  return {
+    ok: false,
+    status: 429,
+    terminalState: 'rejected',
+    headers: {},
+    body: { error: { type: 'rate_limit_error', message: 'Error' } },
+    providerResult: {
+      schema_version: 2,
+      source: 'provider_http',
+      http_status: 429,
+      error: { type: 'rate_limit_error', message: 'Error' },
+      response_headers: {},
+    },
+  }
+}
+
+test('#4 a single opaque CRAG 429 still stops without cooling anything down', async () => {
+  opaque429Tracker.reset()
+  const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3)])
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'req-opaque-single',
+    model: 'claude-sonnet-test',
+    callAttempt: opaque429,
+  })
+  assert.equal(result.status, 429)
+  assert.equal(result.policy.reason, 'crag_opaque_429')
+  assert.equal(result.attemptCount, 1, 'must not walk the pool on the first hit')
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.deepEqual(scheduler.releasedAccounts, [])
+})
+
+test('#4 repeated opaque CRAG 429s cool the model down and move to another slot', async () => {
+  opaque429Tracker.reset()
+  const model = 'claude-sonnet-test'
+
+  // Hits below the threshold keep the #1139 behaviour verbatim.
+  for (const hit of [1, 2]) {
+    const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3)])
+    const runner = new FailoverRunner({ scheduler })
+    const hitResult = await runner.run({ requestId: `req-opaque-${hit}`, model, callAttempt: opaque429 })
+    assert.equal(hitResult.policy.reason, 'crag_opaque_429', `hit ${hit}`)
+    assert.deepEqual(scheduler.cooldowns, [], `hit ${hit} must not cool anything`)
+    assert.equal(opaque429Tracker.streak('account-1', model), hit)
+  }
+
+  // The third one escalates to a model-level cooldown and hops off the slot.
+  const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3)])
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({ requestId: 'req-opaque-3', model, callAttempt: opaque429 })
+  const cooled = scheduler.cooldowns.find((entry) => entry.update.reason === 'crag_opaque_429_model_cooldown')
+  assert.ok(cooled, 'the streak must produce a model cooldown')
+  assert.equal(cooled.candidate.accountId, 'account-1')
+  assert.equal(cooled.update.model, model, 'cooldown must be scoped to the model, not the whole account')
+  assert.ok(cooled.update.until > Date.now(), 'cooldown must be in the future')
+  assert.ok(result.attemptCount >= 2, 'escalation must try another slot')
+  // Model scope must not drag the account's other conversations off the slot.
+  assert.deepEqual(scheduler.releasedAccounts, [])
+})
+
+test('#4 the opaque 429 streak is per (account, model) and clears on success', async () => {
+  opaque429Tracker.reset()
+  const runner = (scheduler) => new FailoverRunner({ scheduler })
+
+  // Two hits on one model leave a sibling model untouched.
+  for (const hit of [1, 2]) {
+    const scheduler = new Scheduler([candidate(1), candidate(2)])
+    await runner(scheduler).run({
+      requestId: `req-opaque-sonnet-${hit}`,
+      model: 'claude-sonnet-test',
+      callAttempt: opaque429,
+    })
+  }
+  assert.equal(opaque429Tracker.streak('account-1', 'claude-sonnet-test'), 2)
+  assert.equal(opaque429Tracker.streak('account-1', 'claude-opus-test'), 0, 'must not bleed across models')
+  assert.equal(opaque429Tracker.streak('account-2', 'claude-sonnet-test'), 0, 'must not bleed across accounts')
+
+  // A verified success resets the streak, so the next hit starts from one.
+  const okScheduler = new Scheduler([candidate(1), candidate(2)])
+  await runner(okScheduler).run({
+    requestId: 'req-opaque-recover',
+    model: 'claude-sonnet-test',
+    callAttempt: () => success(),
+  })
+  assert.equal(opaque429Tracker.streak('account-1', 'claude-sonnet-test'), 0)
+
+  const afterScheduler = new Scheduler([candidate(1), candidate(2)])
+  const after = await runner(afterScheduler).run({
+    requestId: 'req-opaque-after',
+    model: 'claude-sonnet-test',
+    callAttempt: opaque429,
+  })
+  assert.equal(after.policy.reason, 'crag_opaque_429', 'a cleared streak must not escalate on the next hit')
+  assert.deepEqual(afterScheduler.cooldowns, [])
 })
 
 test('the optional account cap counts executions, not admission misses', async () => {
@@ -3508,4 +3611,268 @@ test('upstream 400 stops without failover while 400 and 403 both count toward Un
   })
   assert.equal(r5.ok, true)
   assert.deepEqual(hop5Vms, ['vm-B'])
+})
+
+/**
+ * #1796 counts upstream 400/403 toward the unit circuit on purpose. These
+ * cases pin the one exception: a single session may charge a given unit only
+ * once for the request-scoped stop fallback, so a client stuck on a body that
+ * every slot rejects cannot park the whole pool. Cross-session evidence and
+ * unit-scoped circuits are untouched.
+ */
+function circuitHarness() {
+  const now = 10_000
+  const unitCircuit = new UnitCircuit({ failureThreshold: 3, openMs: 30_000, now: () => now })
+  const candidates = [
+    { vmId: 'vm-A', accountId: 'account-A', waitMs: 0 },
+    { vmId: 'vm-B', accountId: 'account-B', waitMs: 0 },
+  ]
+  const scheduler = {
+    unitCircuit,
+    async selectAndReserve({ excluded }) {
+      const picked = candidates.find(
+        (item) =>
+          !excluded.has(item.accountId) && !excluded.has(item.vmId) && unitCircuit.inspect(item.accountId, now).ok,
+      )
+      if (!picked) return { ok: false, reason: 'no_eligible_accounts' }
+      const hold = unitCircuit.admit(picked.accountId, now)
+      if (!hold.ok) return { ok: false, reason: hold.reason }
+      return { ...picked, ok: true, release() {} }
+    },
+    markCooldown() {},
+    markSuccess() {},
+    releaseAccountSessions() {},
+  }
+  return {
+    unitCircuit,
+    runner: new FailoverRunner({ scheduler, config: { same_account_retry_delay_ms: 0 } }),
+  }
+}
+
+const genericUpstream400 = () => ({
+  ok: false,
+  status: 400,
+  terminalState: 'rejected',
+  body: { type: 'error', error: { type: 'invalid_request_error', message: 'bad upstream payload' } },
+})
+
+test('#5 one session charges a unit circuit once for the stop-400 fallback', async () => {
+  sessionCircuitDedupe.reset()
+  const { unitCircuit, runner } = circuitHarness()
+
+  for (const attempt of [1, 2, 3, 4]) {
+    const result = await runner.run({
+      requestId: `req-dedupe-${attempt}`,
+      stickyKey: 'session-A',
+      canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+      model: 'claude-sonnet-5',
+      callAttempt: genericUpstream400,
+    })
+    // The caller still gets its 400 every time; only the circuit accounting changes.
+    assert.equal(result.status, 400, `attempt ${attempt}`)
+  }
+  assert.equal(unitCircuit.snapshot('account-A').failures, 1, 'one session must not stack failures')
+  assert.equal(unitCircuit.snapshot('account-A').state, 'closed', 'the slot must stay routable')
+})
+
+test('#5 separate sessions still park a slot that rejects what others accept', async () => {
+  sessionCircuitDedupe.reset()
+  const { unitCircuit, runner } = circuitHarness()
+
+  for (const session of ['session-1', 'session-2', 'session-3']) {
+    await runner.run({
+      requestId: `req-cross-${session}`,
+      stickyKey: session,
+      canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+      model: 'claude-sonnet-5',
+      callAttempt: genericUpstream400,
+    })
+  }
+  assert.equal(unitCircuit.snapshot('account-A').failures, 3, 'cross-session evidence must still accumulate')
+  assert.equal(unitCircuit.snapshot('account-A').state, 'open')
+})
+
+test('#5 unit-scoped circuits keep charging on every hit from one session', async () => {
+  sessionCircuitDedupe.reset()
+  const { unitCircuit, runner } = circuitHarness()
+
+  // organization_disabled is account-scoped: it describes the unit, not the
+  // request, so the dedupe must not apply to it.
+  for (const attempt of [1, 2, 3]) {
+    await runner.run({
+      requestId: `req-org-${attempt}`,
+      stickyKey: 'session-A',
+      canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+      model: 'claude-sonnet-5',
+      callAttempt: ({ candidate }) =>
+        candidate.vmId === 'vm-A'
+          ? {
+              ok: false,
+              status: 400,
+              terminalState: 'rejected',
+              body: { type: 'error', error: { message: 'This organization has been disabled.' } },
+            }
+          : success('ok-from-b'),
+    })
+  }
+  assert.equal(unitCircuit.snapshot('account-A').failures, 3, 'unit-scoped failures must not be deduped')
+  assert.equal(unitCircuit.snapshot('account-A').state, 'open')
+})
+
+test('#5 a verified success clears the session dedupe so later failures count again', async () => {
+  sessionCircuitDedupe.reset()
+  const { unitCircuit, runner } = circuitHarness()
+  const body = { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] }
+
+  await runner.run({
+    requestId: 'req-clear-1',
+    stickyKey: 'session-A',
+    canonicalBody: body,
+    model: 'claude-sonnet-5',
+    callAttempt: genericUpstream400,
+  })
+  assert.equal(unitCircuit.snapshot('account-A').failures, 1)
+
+  // A success resets the circuit's own counter and the dedupe entry with it.
+  await runner.run({
+    requestId: 'req-clear-ok',
+    stickyKey: 'session-A',
+    canonicalBody: body,
+    model: 'claude-sonnet-5',
+    callAttempt: () => success(),
+  })
+  assert.equal(unitCircuit.snapshot('account-A').failures, 0)
+
+  // So the next failure is a fresh incident rather than a silenced repeat.
+  await runner.run({
+    requestId: 'req-clear-2',
+    stickyKey: 'session-A',
+    canonicalBody: body,
+    model: 'claude-sonnet-5',
+    callAttempt: genericUpstream400,
+  })
+  assert.equal(unitCircuit.snapshot('account-A').failures, 1)
+})
+
+/**
+ * A kernel-preflight 400 is a local rejection: the slot's kernel refused to
+ * assemble the body, and `via` marks it as such. When the code points at a
+ * capability rather than at the request, the other kernel kind may accept the
+ * same body, so the conversation gets one hop off that slot.
+ */
+function preflightReject(code, param = 'messages[1].content[0]') {
+  return {
+    ok: false,
+    status: 400,
+    via: 'kernel-preflight',
+    headers: {},
+    terminalState: 'rejected',
+    transportError: false,
+    committed: false,
+    upstreamExecutions: 0,
+    body: { type: 'error', error: { type: 'invalid_request_error', code, message: `rejected: ${code}`, param } },
+  }
+}
+
+function stickySpy() {
+  const unbound = []
+  return {
+    unbound,
+    router: {
+      resolve: () => null,
+      bind: () => {},
+      unbind: (key) => unbound.push(key),
+    },
+  }
+}
+
+test('#3 a kernel capability rejection re-dispatches once and drops the session binding', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const sticky = stickySpy()
+  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky.router })
+  const seen = []
+  const result = await runner.run({
+    requestId: 'req-kernel-mismatch',
+    stickyKey: 'session-A',
+    model: 'claude-sonnet-5',
+    canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      // The first slot cannot model this block type; the second one can.
+      return selected.accountId === 'account-1' ? preflightReject('invalid_kernel_request') : success('ok-from-2')
+    },
+  })
+  assert.equal(result.ok, true, 'the other kernel must get a chance to answer')
+  assert.deepEqual(seen, ['account-1', 'account-2'])
+  assert.ok(sticky.unbound.includes('session-A'), 'the session binding must be released, not just the slot seat')
+})
+
+test('#3 the re-dispatch happens at most once', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3)])
+  const sticky = stickySpy()
+  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky.router })
+  const seen = []
+  const result = await runner.run({
+    requestId: 'req-kernel-mismatch-all',
+    stickyKey: 'session-A',
+    model: 'claude-sonnet-5',
+    canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return preflightReject('unsupported_capability', 'tools[0].type')
+    },
+  })
+  // Two slots tried, then the clear 400 is returned instead of walking the pool.
+  assert.equal(seen.length, 2, 'must not keep hopping when every kernel refuses')
+  assert.equal(result.status, 400)
+  assert.equal(result.body.error.code, 'unsupported_capability')
+})
+
+test('#3 request-shaped preflight rejections are not re-dispatched', async () => {
+  for (const code of ['invalid_cache_control', 'image_too_large', 'invalid_image_url', 'invalid_tool_schema']) {
+    const scheduler = new Scheduler([candidate(1), candidate(2)])
+    const sticky = stickySpy()
+    const runner = new FailoverRunner({ scheduler, stickyRouter: sticky.router })
+    const seen = []
+    const result = await runner.run({
+      requestId: `req-fatal-${code}`,
+      stickyKey: 'session-A',
+      model: 'claude-sonnet-5',
+      canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+      callAttempt: ({ candidate: selected }) => {
+        seen.push(selected.accountId)
+        return preflightReject(code)
+      },
+    })
+    assert.equal(seen.length, 1, `${code} is refused by every kernel; one slot is enough`)
+    assert.equal(result.status, 400, code)
+    assert.deepEqual(sticky.unbound, [], `${code} must not disturb the session binding`)
+  }
+})
+
+test('#3 an upstream 400 with the same code is not treated as a capability mismatch', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const sticky = stickySpy()
+  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky.router })
+  const seen = []
+  // Same code, but no `via: kernel-preflight`: this came back from upstream, so
+  // the slot assembled the request fine and hopping proves nothing.
+  const result = await runner.run({
+    requestId: 'req-upstream-code',
+    stickyKey: 'session-A',
+    model: 'claude-sonnet-5',
+    canonicalBody: { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] },
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return {
+        ok: false,
+        status: 400,
+        terminalState: 'rejected',
+        body: { type: 'error', error: { code: 'invalid_kernel_request', message: 'upstream said no' } },
+      }
+    },
+  })
+  assert.equal(seen.length, 1)
+  assert.equal(result.status, 400)
+  assert.deepEqual(sticky.unbound, [])
 })

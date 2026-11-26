@@ -65,7 +65,10 @@ const claimMessages = {
 
 const migrateMessages = {
   not_found: 'No subscription, vouchers, or historical orders were found for that source host ID.',
-  invalid_request: 'Enter a valid source host ID or device UUID that differs from the current host.',
+  invalid_request:
+    'Enter a valid source host ID or device UUID (different from the current host) along with an order ID or redemption code belonging to that host.',
+  auth_forbidden:
+    'Ownership verification failed. Check that the order ID or redemption code belongs to the source host.',
 }
 
 const authorityRequestId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
@@ -128,13 +131,22 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
       if (body === null || typeof body !== 'object' || Array.isArray(body)) {
         return reject(res, 400, 'crag_subscription_invalid_request')
       }
+      const migrateKeys = Object.keys(body)
+      const validMigrate =
+        action === 'migrate' &&
+        typeof body.from_host_id === 'string' &&
+        migrateKeys.length === 2 &&
+        migrateKeys.every((k) => ['from_host_id', 'proof', 'proof_order_id', 'proof_redemption_code'].includes(k)) &&
+        ((typeof body.proof === 'string' && body.proof.trim().length > 0) ||
+          (typeof body.proof_order_id === 'string' && body.proof_order_id.trim().length > 0) ||
+          (typeof body.proof_redemption_code === 'string' && body.proof_redemption_code.trim().length > 0))
       const valid =
         action === 'redeem'
           ? Object.keys(body).length === 1 && typeof body.redemption_code === 'string'
           : action === 'claim'
             ? Object.keys(body).length === 1 && typeof body.order_id === 'string'
             : action === 'migrate'
-              ? Object.keys(body).length === 1 && typeof body.from_host_id === 'string'
+              ? validMigrate
               : action === 'recover'
                 ? Object.keys(body).length === 0 ||
                   (Object.keys(body).length === 1 && body.use_current_package === true)
@@ -166,7 +178,16 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
       if (action === 'unbind') return ok(res, await subscription.unbind())
       if (action === 'claim') return ok(res, await subscription.claimByOrder(body.order_id))
       if (action === 'rebuild-identity') return ok(res, await subscription.rebuildIdentity())
-      if (action === 'migrate') return ok(res, await subscription.migrate(body.from_host_id))
+      if (action === 'migrate') {
+        return ok(
+          res,
+          await subscription.migrate(body.from_host_id, {
+            proof: body.proof,
+            proof_order_id: body.proof_order_id,
+            proof_redemption_code: body.proof_redemption_code,
+          }),
+        )
+      }
       if (action === 'bind') {
         const vm = getVm(id)
         if (!vm) return reject(res, 404, 'vm_not_found')

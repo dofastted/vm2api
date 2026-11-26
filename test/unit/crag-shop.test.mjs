@@ -1928,6 +1928,9 @@ test('direct-credit purchase injects host_id, auto-syncs host rights on fulfillm
           direct_credit: true,
         }
       },
+      async claim() {
+        throw new Error('supplier.claim must never be called for fulfilled direct_credit orders')
+      },
     },
   })
 
@@ -1995,4 +1998,14 @@ test('direct-credit purchase injects host_id, auto-syncs host rights on fulfillm
   assert.equal(renew.data.activation.state, 'active')
   assert.equal(renewalProofCalls, 0)
   assert.equal(statusSyncs, 2)
+
+  // 3. Fulfilled direct-credit order: /apply-renewal syncs rights without calling supplier.claim(),
+  //    and /claim returns clean 409 shop_direct_credit_no_voucher instead of hitting supplier.claim().
+  const applyRenew = await call('POST', `/orders/${renew.data.order_id}/apply-renewal`, {})
+  assert.equal(applyRenew.http, 200)
+  assert.equal(applyRenew.data.state, 'active')
+
+  const claimDirect = await call('POST', `/orders/${buy.data.order_id}/claim`, {})
+  assert.equal(claimDirect.http, 409)
+  assert.equal(claimDirect.error.code, 'shop_direct_credit_no_voucher')
 })

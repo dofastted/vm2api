@@ -30,6 +30,9 @@ export const DEFAULT_NOTIFY = Object.freeze({
     account_down: false,
     account_up: false,
     vm_down: true,
+    jev_paused: true,
+    jev_resumed: true,
+    jev_http_400_burst: true,
   }),
   email: Object.freeze({
     enabled: false,
@@ -75,6 +78,9 @@ const EVENT_TITLES = {
   digest: '账号池汇报',
   revoked: '发现新吊销',
   invalid: '发现失效凭证',
+  jev_paused: '审核密钥已暂停',
+  jev_resumed: '审核密钥已恢复',
+  jev_http_400_burst: '审核上游 400 突增',
   test: '账号池汇报',
 }
 
@@ -156,6 +162,9 @@ export function normalizeNotifyConfig(raw = {}) {
       account_down: asBool(evSrc.account_down, false),
       account_up: asBool(evSrc.account_up, false),
       vm_down: asBool(evSrc.vm_down, true),
+      jev_paused: asBool(evSrc.jev_paused, true),
+      jev_resumed: asBool(evSrc.jev_resumed, true),
+      jev_http_400_burst: asBool(evSrc.jev_http_400_burst, true),
     },
     email: {
       enabled: asBool(emailSrc.enabled, false),
@@ -469,7 +478,80 @@ export function detectPoolNotifyEvents(prev, next, cfg = DEFAULT_NOTIFY) {
       })
     }
   }
+  const nextJev = next.jev
+  const prevJev = prev?.jev
+  if (nextJev) {
+    const prevPaused = new Map((prevJev?.paused || []).map((row) => [row.key_fingerprint, row]))
+    const nextPaused = new Map((nextJev.paused || []).map((row) => [row.key_fingerprint, row]))
+    if (ev.jev_paused) {
+      for (const row of nextPaused.values()) {
+        if (!prevPaused.has(row.key_fingerprint)) {
+          events.push({
+            type: 'jev_paused',
+            title: EVENT_TITLES.jev_paused,
+            key_fingerprint: row.key_fingerprint,
+            masked_key: row.masked_key,
+            reason: row.reason,
+            http_status: row.http_status,
+            at: row.at,
+            until: row.until,
+            seconds_left: row.seconds_left,
+            active_keys: nextJev.active_keys,
+            total_keys: nextJev.total_keys,
+          })
+        }
+      }
+    }
+    if (ev.jev_resumed && prevJev) {
+      for (const row of prevPaused.values()) {
+        if (!nextPaused.has(row.key_fingerprint)) {
+          events.push({
+            type: 'jev_resumed',
+            title: EVENT_TITLES.jev_resumed,
+            key_fingerprint: row.key_fingerprint,
+            masked_key: row.masked_key,
+            reason: row.reason,
+            active_keys: nextJev.active_keys,
+            total_keys: nextJev.total_keys,
+          })
+        }
+      }
+    }
+    if (ev.jev_http_400_burst) {
+      const h400 = nextJev.http_400
+      const threshold = Number(h400?.threshold || 20)
+      const prevCount = Number(prevJev?.http_400?.count || 0)
+      const nextCount = Number(h400?.count || 0)
+      if (nextCount >= threshold && prevCount < threshold) {
+        events.push({
+          type: 'jev_http_400_burst',
+          title: EVENT_TITLES.jev_http_400_burst,
+          count: nextCount,
+          window_sec: Number(h400?.window_sec || 600),
+          threshold,
+          first_at: h400?.first_at || null,
+          last_at: h400?.last_at || null,
+          key_fingerprints: Array.isArray(h400?.key_fingerprints) ? h400.key_fingerprints : [],
+        })
+      }
+    }
+  }
   return events
+}
+
+const JEV_PAUSE_REASONS = {
+  auth: '凭据失效',
+  rate_limited: '限流',
+  overloaded: '过载',
+}
+
+function shanghaiTimeOnly(iso) {
+  if (!iso) return '—'
+  try {
+    return new Date(iso).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
+  } catch {
+    return String(iso)
+  }
 }
 
 function shanghaiClock(iso) {
@@ -538,6 +620,42 @@ export function formatNotifyMessage(event, snap, cfg = DEFAULT_NOTIFY, baseUrl =
     details.push(`节点 ${event.node_id || '本机'}`)
     details.push(`原因 ${event.reason}${event.detail ? ': ' + event.detail : ''}`)
     details.push('该 VM 当前不可连通，已退出调度。')
+  }
+  if (event?.type === 'jev_paused') {
+    const label = event.masked_key || event.key_fingerprint || '未知密钥'
+    const fpSuffix = event.key_fingerprint && event.masked_key ? ` (${event.key_fingerprint})` : ''
+    const reasonText = JEV_PAUSE_REASONS[event.reason] || event.reason || '异常'
+    const httpText = event.http_status ? `上游 ${event.http_status}（${reasonText}）` : reasonText
+    details.push(`密钥 ${label}${fpSuffix} · ${httpText}`)
+    if (event.until) {
+      const sec =
+        event.seconds_left != null
+          ? event.seconds_left
+          : Math.max(0, Math.ceil((Date.parse(event.until) - Date.now()) / 1000))
+      details.push(`自动恢复 ${sec} 秒后重试（预计 ${shanghaiTimeOnly(event.until)}）`)
+    } else {
+      details.push('永久暂停 · 需人工恢复：面板 → 风控 → 审核模型')
+    }
+    if (event.total_keys != null) {
+      details.push(`可用密钥 ${event.active_keys ?? 0} / ${event.total_keys}`)
+    }
+  }
+  if (event?.type === 'jev_resumed') {
+    const label = event.masked_key || event.key_fingerprint || '未知密钥'
+    const fpSuffix = event.key_fingerprint && event.masked_key ? ` (${event.key_fingerprint})` : ''
+    details.push(`密钥 ${label}${fpSuffix} 已恢复调用`)
+    if (event.total_keys != null) {
+      details.push(`可用密钥 ${event.active_keys ?? 0} / ${event.total_keys}`)
+    }
+  }
+  if (event?.type === 'jev_http_400_burst') {
+    const mins = Math.max(1, Math.round(Number(event.window_sec || 600) / 60))
+    details.push(
+      `${mins} 分钟内 ${event.count || 0} 次 400 · 首次 ${shanghaiTimeOnly(event.first_at)} · 最近 ${shanghaiTimeOnly(event.last_at)}`,
+    )
+    if (event.key_fingerprints?.length) {
+      details.push(`涉及密钥指纹 ${event.key_fingerprints.join('、')}`)
+    }
   }
   if (event?.ids?.length) {
     details.push(`新增 ${event.count || event.ids.length} 个`)
@@ -888,11 +1006,14 @@ const FEISHU_EVENT_COLORS = {
   pool_empty: 'red',
   vm_down: 'red',
   revoked: 'red',
+  jev_paused: 'red',
   invalid: 'orange',
   pool_low: 'orange',
   account_down: 'orange',
+  jev_http_400_burst: 'orange',
   pool_recovered: 'green',
   account_up: 'green',
+  jev_resumed: 'green',
 }
 
 function feishuSummaryTable(cells) {
@@ -1159,6 +1280,9 @@ export function createNotifyMonitor(opts = {}) {
             ? { ...vm, online: old.online, reason: old.reason, detail: old.detail }
             : vm
         })
+      }
+      if (next && typeof opts.jevSnapshot === 'function') {
+        next.jev = await opts.jevSnapshot()
       }
       snapshot = next
       const events = detectPoolNotifyEvents(prev, next, config)

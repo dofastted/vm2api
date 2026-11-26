@@ -3639,20 +3639,29 @@ test('cloud orders and whole-host migration work via host_id or device UUID and 
 
   const migrateRoute = cragSubscriptionRoute('POST', '/api/panel/crag-subscription/migrate')
   const selfMigrate = await handler(
-    { ...baseReq, rawBody: JSON.stringify({ from_host_id: toHost }) },
+    { ...baseReq, rawBody: JSON.stringify({ from_host_id: toHost, proof: 'ord-1' }) },
     res,
     migrateRoute,
   )
   assert.equal(selfMigrate.status, 400)
 
-  const migratedRes = await handler(
+  // Bare migration without ownership proof must be rejected before calling Authority.
+  const noProofMigrate = await handler(
     { ...baseReq, rawBody: JSON.stringify({ from_host_id: fromHost }) },
+    res,
+    migrateRoute,
+  )
+  assert.equal(noProofMigrate.status, 400)
+
+  const migratedRes = await handler(
+    { ...baseReq, rawBody: JSON.stringify({ from_host_id: fromHost, proof: 'ord-1' }) },
     res,
     migrateRoute,
   )
   assert.equal(migratedRes.status, 200)
   assert.equal(migratedPayload.from_host_id, fromHost)
   assert.equal(migratedPayload.to_host_id, toHost)
+  assert.equal(migratedPayload.proof_order_id, 'ord-1')
   assert.equal(migratedRes.body.data.migrated_vouchers, 2)
   assert.equal(migratedRes.body.data.migrated_orders, 3)
   assert.equal(migratedRes.body.data.status.state, 'active')

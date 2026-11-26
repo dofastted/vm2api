@@ -391,6 +391,9 @@ export class UsageLogsRepo {
     this._vmOwner = db.prepare('SELECT owner_user_id FROM vms WHERE id = ?')
     this._listDebug = db.prepare('SELECT record_json FROM request_log_debug ORDER BY ts DESC LIMIT ?')
     this._getByRequestId = db.prepare('SELECT * FROM usage_logs WHERE request_id = ?')
+    this._addDurationByRequestId = db.prepare(
+      'UPDATE usage_logs SET duration_ms = COALESCE(duration_ms, 0) + ? WHERE request_id = ?',
+    )
     // OCTET_LENGTH counts encoded bytes and lets SQLite read TEXT size from metadata without loading each body.
     this._debugBytes = db.prepare('SELECT COALESCE(SUM(OCTET_LENGTH(record_json)), 0) AS n FROM request_log_debug')
     this._debugCount = db.prepare('SELECT COUNT(*) AS n FROM request_log_debug')
@@ -450,6 +453,38 @@ export class UsageLogsRepo {
 
   insertDebugIfAbsent(requestId, ts, record) {
     return this._insertDebugIfAbsent.run(requestId, ts || new Date().toISOString(), JSON.stringify(record)).changes > 0
+  }
+
+  /**
+   * Fold a zero-token local tool-continuation drain turn into its parent
+   * token-bearing request row (adding wall time and, in debug mode, appending
+   * a compact continuation record onto `hop_meta.tool_continuations`).
+   */
+  mergeToolContinuation(parentRequestId, { durationMs = 0, continuation = null } = {}) {
+    if (!parentRequestId) return false
+    const deltaMs = Number.isFinite(Number(durationMs)) && Number(durationMs) > 0 ? Math.trunc(Number(durationMs)) : 0
+    let updated = false
+    if (deltaMs > 0) {
+      updated = this._addDurationByRequestId.run(deltaMs, parentRequestId).changes > 0
+    }
+    if (continuation && typeof continuation === 'object') {
+      const dbgRow = this._getDebug.get(parentRequestId)
+      if (dbgRow?.record_json) {
+        try {
+          const rec = JSON.parse(dbgRow.record_json)
+          if (rec && typeof rec === 'object') {
+            if (deltaMs > 0) rec.duration_ms = (Number(rec.duration_ms) || 0) + deltaMs
+            const hopMeta = rec.hop_meta && typeof rec.hop_meta === 'object' ? rec.hop_meta : {}
+            const list = Array.isArray(hopMeta.tool_continuations) ? [...hopMeta.tool_continuations] : []
+            if (list.length < 64) list.push(continuation)
+            rec.hop_meta = { ...hopMeta, tool_continuations: list }
+            this._insertDebug.run(parentRequestId, rec.ts || new Date().toISOString(), JSON.stringify(rec))
+            updated = true
+          }
+        } catch {}
+      }
+    }
+    return updated
   }
 
   getDebug(requestId) {

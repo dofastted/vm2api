@@ -39,14 +39,14 @@ describe('CragCloudOrdersPanel', () => {
           sku: 'starter-1m',
           slot_limit: 2,
           months: 1,
-          status: 'active',
+          active: true,
         },
         {
           code_id: 'v-2',
           sku: 'starter-1m',
           slot_limit: 2,
           months: 1,
-          status: 'expired',
+          active: false,
         },
       ],
       orders: [

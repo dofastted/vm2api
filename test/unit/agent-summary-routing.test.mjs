@@ -659,9 +659,12 @@ test('cancelling a queued summary removes its ticket without releasing the paren
   }
 })
 
-for (const enabled of [false, true]) {
-  test(`CRAG print ${enabled ? 'drops' : 'keeps'} unrecorded thinking when crag_drop_foreign_thinking is ${enabled}`, async () => {
-    const h = harness({ crag: true, compatibility: { crag_drop_foreign_thinking: enabled } })
+// 'foreign_only' keeps an unrecorded signature: only a block recorded against
+// another account is dropped, so this case must behave like the off setting.
+for (const setting of [false, true, 'foreign_only']) {
+  const drops = setting === true
+  test(`CRAG print ${drops ? 'drops' : 'keeps'} unrecorded thinking when crag_drop_foreign_thinking is ${setting}`, async () => {
+    const h = harness({ crag: true, compatibility: { crag_drop_foreign_thinking: setting } })
     const body = agentBody()
     body.messages = [
       { role: 'user', content: 'First question.' },
@@ -680,7 +683,7 @@ for (const enabled of [false, true]) {
       const sent = h.calls.find((call) => call.id === 'foreign').body
       const turn = sent.messages.find((message) => message.role === 'assistant')
       const types = turn.content.map((block) => block.type)
-      assert.equal(types.includes('thinking'), !enabled, JSON.stringify(turn.content))
+      assert.equal(types.includes('thinking'), !drops, JSON.stringify(turn.content))
       assert.ok(turn.content.some((block) => block.type === 'text' && block.text === 'First answer.'))
     } finally {
       h.close()
