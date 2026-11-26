@@ -226,6 +226,58 @@ test('backfillMissingCosts restores actual cost with the stored group multiplier
   assert.equal(store.repo.backfillMissingCosts(), 0)
 })
 
+test('advisor iterations persist advisor_usage/advisor_cost, bill into total_cost/actual_cost, and survive reprice/backfill', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  const sum = store.finish(ctx, {
+    status: 200,
+    model: 'claude-sonnet-5',
+    upstream_model: 'claude-sonnet-5',
+    rate_multiplier: 1.5,
+    usage: {
+      input_tokens: 1_000_000,
+      output_tokens: 0,
+      iterations: [
+        { type: 'message', model: 'claude-sonnet-5', input_tokens: 1_000_000, output_tokens: 0 },
+        { type: 'advisor_message', model: 'claude-opus-5-5', input_tokens: 1_000_000, output_tokens: 0 },
+      ],
+    },
+  })
+  // Sonnet 5 input = $2/MTok, Opus 5.5 input = $4/MTok -> advisor_cost = 4, total_cost = 6, actual_cost = 9
+  assert.equal(sum.input_cost, 2)
+  assert.equal(sum.advisor_cost, 4)
+  assert.equal(sum.total_cost, 6)
+  assert.equal(sum.actual_cost, 9)
+  assert.ok(sum.advisor_usage)
+  const parsed = JSON.parse(sum.advisor_usage)
+  assert.equal(parsed.length, 1)
+  assert.equal(parsed[0].model, 'claude-opus-5-5')
+  assert.equal(parsed[0].input_tokens, 1_000_000)
+
+  // Clearing cost columns and backfilling reproduces the exact advisor_cost/total_cost/actual_cost.
+  store.db
+    .prepare(
+      'UPDATE usage_logs SET pricing_model = NULL, advisor_cost = NULL, total_cost = NULL, actual_cost = NULL WHERE id = ?',
+    )
+    .run(sum.id)
+  assert.equal(store.repo.backfillMissingCosts(), 1)
+  const backfilled = store.db
+    .prepare('SELECT advisor_cost, total_cost, actual_cost, pricing_model FROM usage_logs WHERE id = ?')
+    .get(sum.id)
+  assert.equal(backfilled.advisor_cost, 4)
+  assert.equal(backfilled.total_cost, 6)
+  assert.equal(backfilled.actual_cost, 9)
+  assert.equal(backfilled.pricing_model, 'claude-sonnet-5')
+
+  // repriceRange is idempotent once priced.
+  const repriced = store.repo.repriceRange({})
+  assert.equal(repriced.changed, 0)
+  assert.equal(repriced.rows, 1)
+})
+
 function finishWith(store, model, usage) {
   const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { protocol: 'x', pathName: '/v1' })
   return store.finish(ctx, { status: 200, model, upstream_model: model, vm_id: 'vm-t', account_id: 'acc-t', usage })
