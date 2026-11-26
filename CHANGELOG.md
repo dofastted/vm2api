@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **CRAGGemini agy 桥接层 `toolSummary` 回流与多轮 history 对齐（Refs #1915）**：`src/lib/protocol/gemini-convert.mjs` 跟进 #1925 合并遗漏：`forwardAgyBridgeToolArgs` 在 `target: antigravity` 出站时与根级 `_client_*` 声明同步重命名历史 `functionCall.args`；`restoreAgyBridgeToolArgs` 按工具 schema 剥除客户端未声明的裸 `toolSummary`（已声明则保留裸字段）；桥接注入仅顶层次级，嵌套 `toolSummary` 不重命名。无 schema 时非声明工具的回流路径同样剥除裸 `toolSummary`。
+
 - **修复 Gemini 许可 CLI 将 bwrap 沙箱挂载/命名空间失败误报为 `license_invalid`（Refs #1892）**：
   - `scripts/gemini-host.py`：`classify_craggemini_license_cli_error` 在回落到许可无效前识别 `bwrap:` 致命启动失败（bind 源不可穿越、`Can't bind mount` / `Can't mount proc` / `execvp Permission denied`、user namespace 拒绝等），分别上报 `gemini_sandbox_unavailable` 与 `gemini_sandbox_apparmor_restricted`；忽略纯 `bwrap: Warning` 行以免掩盖真实许可结论；`license_status` 保留沙箱错误码。
   - **兼容性**：经宿主 `license-machine-code` / `license-activate` / `license-status` 暴露的 `crag_license.code` 在沙箱启动失败时为 `gemini_sandbox_*`，HTTP **503**（此前误为 **403** `license_invalid`）；`sync_pending` 时 bwrap 失败亦上报沙箱码而非许可错误。`src/lib/gemini/subscription.mjs` / `scheduler.mjs` 准入与调度不再将沙箱码回落为 `license_required`。

@@ -837,20 +837,67 @@ function agyBridgeClientAlias(param) {
   return `_client_${param}`
 }
 
-/**
- * Rename client-declared tool parameters that collide with agy bridge injection so
- * downstream schema merging does not duplicate `required` entries (#1915).
- */
-export function avoidAgyBridgeParamCollisions(schema) {
-  if (!isPlainObject(schema)) return schema
-  return avoidAgyBridgeParamCollisionsWalk(schema)
+/** Whether the caller's tool schema declares a bridge-colliding param at the root level only (#1915). */
+export function clientDeclaredAgyBridgeParam(schema, param) {
+  if (!AGY_BRIDGE_INJECTED_PARAMS.has(param) || !isPlainObject(schema)) return false
+  const props = isPlainObject(schema.properties) ? schema.properties : {}
+  return Object.hasOwn(props, param)
 }
 
 /**
- * Restore client parameter names after antigravity forwarding (#1915); drop bare
- * bridge-injected keys when a `_client_*` alias carries the model's client value.
+ * Rename client-declared tool parameters that collide with agy bridge injection so
+ * downstream schema merging does not duplicate `required` entries (#1915).
+ * Bridge injection is top-level only; renames apply only to root `properties`, not nested objects.
  */
-export function restoreAgyBridgeToolArgs(args) {
+export function avoidAgyBridgeParamCollisions(schema) {
+  if (!isPlainObject(schema)) return schema
+  const out = { ...schema }
+  if (!isPlainObject(out.properties)) return out
+  const props = { ...out.properties }
+  const renames = new Map()
+  for (const key of Object.keys(props)) {
+    if (AGY_BRIDGE_INJECTED_PARAMS.has(key)) {
+      const alias = agyBridgeClientAlias(key)
+      if (!Object.hasOwn(props, alias)) {
+        renames.set(key, alias)
+        props[alias] = props[key]
+        delete props[key]
+      }
+    }
+  }
+  out.properties = props
+  if (Array.isArray(out.required)) {
+    out.required = orderedDistinctStrings(
+      out.required.map((n) => (typeof n === 'string' && renames.has(n) ? renames.get(n) : n)),
+    )
+  }
+  return out
+}
+
+/**
+ * Align historical `functionCall.args` with the forwarded schema before antigravity (#1915).
+ */
+export function forwardAgyBridgeToolArgs(args, schema) {
+  if (!isPlainObject(args)) return args
+  let out = null
+  for (const name of AGY_BRIDGE_INJECTED_PARAMS) {
+    if (!clientDeclaredAgyBridgeParam(schema, name)) continue
+    const alias = agyBridgeClientAlias(name)
+    if (Object.hasOwn(args, name) && !Object.hasOwn(args, alias)) {
+      const o = out ?? { ...args }
+      out = o
+      o[alias] = args[name]
+      delete o[name]
+    }
+  }
+  return out ?? args
+}
+
+/**
+ * Restore client parameter names after antigravity forwarding (#1915).
+ * Drops bare bridge-injected keys only when the caller did not declare that param in the tool schema.
+ */
+export function restoreAgyBridgeToolArgs(args, schema = null) {
   if (!isPlainObject(args)) return args
   let out = null
   const touch = () => {
@@ -861,46 +908,17 @@ export function restoreAgyBridgeToolArgs(args) {
     const alias = agyBridgeClientAlias(name)
     const hasAlias = Object.hasOwn(args, alias)
     const hasOrig = Object.hasOwn(args, name)
+    const clientDeclared = clientDeclaredAgyBridgeParam(schema, name)
     if (hasAlias) {
       const o = touch()
       o[name] = args[alias]
       delete o[alias]
-    } else if (hasOrig) {
-      // After collision rename the outbound schema exposes only `_client_*`; bare injected keys leak.
+    } else if (hasOrig && !clientDeclared) {
       const o = touch()
       delete o[name]
     }
   }
   return out || args
-}
-
-function avoidAgyBridgeParamCollisionsWalk(node) {
-  if (!isPlainObject(node)) return node
-  const out = { ...node }
-  if (isPlainObject(out.properties)) {
-    const props = { ...out.properties }
-    const renames = new Map()
-    for (const key of Object.keys(props)) {
-      if (AGY_BRIDGE_INJECTED_PARAMS.has(key)) {
-        const alias = agyBridgeClientAlias(key)
-        if (!Object.hasOwn(props, alias)) {
-          renames.set(key, alias)
-          props[alias] = avoidAgyBridgeParamCollisionsWalk(props[key])
-          delete props[key]
-        }
-      } else {
-        props[key] = avoidAgyBridgeParamCollisionsWalk(props[key])
-      }
-    }
-    out.properties = props
-    if (Array.isArray(out.required)) {
-      out.required = orderedDistinctStrings(
-        out.required.map((n) => (typeof n === 'string' && renames.has(n) ? renames.get(n) : n)),
-      )
-    }
-  }
-  if (isPlainObject(out.items)) out.items = avoidAgyBridgeParamCollisionsWalk(out.items)
-  return out
 }
 
 /**
@@ -3313,6 +3331,13 @@ export function buildGeminiRequest(
   const cleanedMessages = dropDuplicateToolResults(ir.messages)
   const resolveWireName = (rawName) =>
     ir.restoreContext?.wireNameFor ? ir.restoreContext.wireNameFor(rawName) : geminiFuncName(rawName)
+  const schemaByToolName = new Map()
+  for (const tool of ir.tools || []) {
+    if (!tool?.name) continue
+    schemaByToolName.set(tool.name, tool.schema)
+    if (tool.wireName) schemaByToolName.set(tool.wireName, tool.schema)
+    if (tool.origName) schemaByToolName.set(tool.origName, tool.schema)
+  }
 
   for (const msg of cleanedMessages) {
     const role = msg.role === 'assistant' ? 'model' : 'user'
@@ -3348,7 +3373,12 @@ export function buildGeminiRequest(
       } else if (p.kind === 'tool_call') {
         const safeName = resolveWireName(p.name)
         if (p.id) callNames.set(p.id, safeName)
-        const fnCall = { name: safeName, args: isPlainObject(p.args) ? cleanUndefinedStrings(p.args) : {} }
+        let callArgs = isPlainObject(p.args) ? cleanUndefinedStrings(p.args) : {}
+        if (ag) {
+          const toolSchema = schemaByToolName.get(p.name) || schemaByToolName.get(safeName)
+          callArgs = forwardAgyBridgeToolArgs(callArgs, toolSchema)
+        }
+        const fnCall = { name: safeName, args: callArgs }
         if (p.id) fnCall.id = ag ? p.id.replace(/[^a-zA-Z0-9_-]/g, '_') : p.id
         const part = { functionCall: fnCall }
         if (ag) {
@@ -4165,7 +4195,7 @@ export function createGeminiRestoreTransform(
         if (ctx.disableParallelTools && emittedToolCalls >= 1) return
         emittedToolCalls += 1
         let args = event.args || {}
-        if (ag) args = restoreAgyBridgeToolArgs(args)
+        if (ag) args = restoreAgyBridgeToolArgs(args, entry?.schema)
         if (claudeModel && entry?.schema) {
           args = unquoteClaudeEnumArgs(args, entry.schema)
         }
