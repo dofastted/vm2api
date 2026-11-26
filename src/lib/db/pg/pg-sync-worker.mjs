@@ -53,10 +53,18 @@ async function runStatementOnExecutor(executor, op, rawSql, rawParams) {
 async function handlePortMessage(port, state, msg) {
   const signal = msg?.sab ? new Int32Array(msg.sab) : null
   const reply = (payload) => {
-    port.postMessage(payload)
+    try {
+      port.postMessage(payload)
+    } catch (postErr) {
+      port.postMessage({
+        id: payload?.id ?? msg?.id,
+        ok: false,
+        error: serializeError(postErr),
+      })
+    }
     if (signal) {
-      Atomics.store(signal, 0, 1)
-      Atomics.notify(signal, 0, 1)
+      Atomics.add(signal, 0, 1)
+      Atomics.notify(signal, 0)
     }
   }
 

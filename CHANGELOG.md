@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.4.227 — 2026-11-26 · 修复 PostgreSQL 同步桥接层 `PgSyncDb` 在 `Atomics.wait` 虚假唤醒或超时后的永久 RPC 响应错位
+
+- **修复 PostgreSQL 同步适配层（`PgSyncDb` + `pg-sync-worker`）RPC 协议永久错位导致的线上大面积 500 / 401 / 403（#1905）**：
+  - 根因：`src/lib/db/pg/pg-sync-db.mjs` 原先使用 4 字节二值 `0/1` `SharedArrayBuffer` 信号，且读取 `receiveMessageOnPort(this._port)` 时未校验 `msg.id === id`、也未排空过期回包。当 `Atomics.wait(signal, 0, 0, timeout)` 发生合法的 spurious wakeup（`signal[0]` 仍为 `0`）时，兜底循环 `Atomics.wait(signal, 0, 1, 1)` 因预期值不等在 `<0.1ms` 内空转 500 次提前抛错；任意早退（虚假唤醒或 `PG_SYNC_TIMEOUT`）都会把 worker 迟到的回包滞留在 FIFO `MessagePort` 中，导致进程后续全部同步 DB 查询永久偏移 ≥1 个槽位（表现为 `rows.map is not a function`、正常 API Key 误判 `401` / `403 api_key_disabled`、重复 `INSERT` 撞 `accounts_pkey` 与大面积 `500`），只能重启恢复。
+  - 修复：`src/lib/db/pg/pg-sync-worker.mjs` 将唤醒信号改为单调递增计数（`Atomics.add(signal, 0, 1)` + `Atomics.notify(signal, 0)`）并兜底捕获 `port.postMessage` 序列化异常；`src/lib/db/pg/pg-sync-db.mjs` 改为 8 字节 `SharedArrayBuffer`（分离回复计数与 worker 退出标志），请求前与等待循环中按 `msg.id < id` 排空陈旧回包、严格匹配 `msg.id === id`（遇到非法未来 id 闭失败报 `PG_SYNC_PROTOCOL_ERROR`），先读计数再读端口并按有界分片等待直至截止时间以免疫虚假唤醒与丢失唤醒；`BEGIN` 超时时异步补发 `rollback` 防止 worker 泄漏 `txClient`。
+  - 回归测试：新增 `test/unit/pg-sync-db-rpc.test.mjs`，覆盖 spurious wakeup、`PG_SYNC_TIMEOUT` 后迟到回包排空与自动自愈、`BEGIN` 超时回滚清理及结构化错误透传。
+- 部署说明：本次改动仅涉及控制面（`src/lib/db/pg/`）；前端（`web/src/`）、`deploy/payload.json`（CRAG `3.1.21` 与 CRAGGemini `0.4.13`）、数据库迁移结构、Gemini 宿主脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.226` 均未变，预期 `SLOT_SYNC=skip`，无需执行 `wrap-cli/sync` 或重启既有 Claude/Codex/Gemini 槽位，重启 `vm2api` 一次即可生效。建议所有启用 `db_engine=postgres` 的生产实例立即升级至本版本。
+
 ## 1.4.226 — 2026-11-26 · `cache_control` 非法断点自动纠错与 `CRAG_CACHE_CONTROL` 恢复；CRAGGemini 安装/升级与 `UNSUPPORTED_CLIENT` 修复；Codex 凭证吊销升级为不可调度与工具 schema 兼容重试；集群槽位容器先起后删
 
 - **`cache_control` 非法断点自动纠错与 `CRAG_CACHE_CONTROL` 零执行恢复（#1901）**：
