@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **KVM guest：home / `.claude` 9p 挂载改为 `cache=none`，避免 `.claude.json` 原子保存卡在写回（#1877）**：`docker/kin-kvm/guest/kin-guest-setup` 将 `kinhome` 与 `kinclaude` 从 `cache=mmap` 改为 `cache=none`。Claude Code 在 `~/.claude/` 侧写 `.claude.json.tmp.*` 并 `fchmod`/`stat` 时，mmap 写回会让线程永久阻塞；#1838 已为 `/run/kin/work` 与 `~/.claude/projects` 迁来宾 tmpfs，但配置临时文件与同目录 attrs 仍走 9p。与「配置目录 tmpfs + 写回宿主页」相比，`cache=none` 牺牲部分热点读缓存，重启后配置仍完整落在宿主目录、宿主 `/sync` 与换票立即可见，且无需额外 stop/sync 钩子。`kinrun`（已为 `none`）与 `kinpayload`（`loose`）不变。
+
 ## 1.4.230 — 2026-11-26 · 内核不再为带 type 的工具合成 `input_schema`（advisor 全链路放行）、新增 advisor 处理说明
 
 - **`kin-kernel` 新二进制：带显式非 `custom` `type` 的工具不再被补 `input_schema`（payload pin 变更）**：
