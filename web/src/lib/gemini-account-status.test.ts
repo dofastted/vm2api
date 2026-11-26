@@ -364,6 +364,22 @@ describe('Gemini account presentation', () => {
         validation_url: 'https://evil.example/phish',
       })?.validationUrl
     ).toBeNull()
+    expect(
+      geminiEligibilityNotice({
+        eligibility: 'client_unsupported',
+      })
+    ).toMatchObject({
+      label: expect.stringContaining('UNSUPPORTED_CLIENT'),
+      action: expect.stringContaining('设置 → Gemini 维护'),
+      validationUrl: null,
+      advisory: false,
+    })
+    expect(geminiInferenceErrorLabel('gemini_client_unsupported')).toContain(
+      'UNSUPPORTED_CLIENT'
+    )
+    expect(geminiInferenceErrorAction('gemini_client_unsupported')).toContain(
+      'UNSUPPORTED_CLIENT'
+    )
     expect(geminiEligibilityNotice({ eligibility: null })).toBeNull()
 
     const stale = {

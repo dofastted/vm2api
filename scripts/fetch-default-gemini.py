@@ -14,7 +14,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -57,6 +59,28 @@ ALLOWED_DOWNLOAD_HOSTS = frozenset(
 CHUNK_SIZE = 1024 * 1024
 MAX_MEMBER_SIZE = 512 * 1024 * 1024  # Same limit as the signed-payload verifier.
 MAX_MANIFEST_SIZE = 65536
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_RETRY_DELAYS = (1.0, 2.0)
+RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _is_retryable_download_error(error):
+    if isinstance(error, HTTPError):
+        return error.code in RETRYABLE_HTTP_STATUSES
+    if isinstance(error, (URLError, http.client.HTTPException, TimeoutError, ConnectionError)):
+        return True
+    if isinstance(error, OSError):
+        return True
+    if isinstance(error, ValueError):
+        # A truncated transfer from a dropped connection is worth retrying; digest/size
+        # mismatches are deterministic integrity failures and must not be retried.
+        return "truncated download" in str(error)
+    return False
+
+
+def _retry_sleep(attempt):
+    if attempt < len(DOWNLOAD_RETRY_DELAYS):
+        time.sleep(DOWNLOAD_RETRY_DELAYS[attempt])
 
 
 class HttpsRedirects(HTTPRedirectHandler):
@@ -123,38 +147,71 @@ def copy_checked(stream, size, sha256, output=None):
 
 def download(opener, url, dest, size, sha256):
     print(f"Fetching pinned Gemini asset: {dest.name}", flush=True)
-    try:
-        request = Request(url, headers={"User-Agent": "vm2api-gemini-payload"})
-        with opener.open(request, timeout=60) as response, dest.open("xb") as output:
-            if response.status != 200:
-                raise RuntimeError(f"unexpected HTTP status {response.status}")
-            copy_checked(response, size, sha256, output)
-    except (OSError, http.client.HTTPException, ValueError, RuntimeError) as error:
-        raise RuntimeError(f"download {dest.name} from {url}: {error}") from error
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        try:
+            request = Request(url, headers={"User-Agent": "vm2api-gemini-payload"})
+            with opener.open(request, timeout=60) as response, dest.open("xb") as output:
+                if response.status != 200:
+                    if (
+                        response.status in RETRYABLE_HTTP_STATUSES
+                        and attempt + 1 < DOWNLOAD_ATTEMPTS
+                    ):
+                        raise http.client.HTTPException(
+                            f"retryable HTTP status {response.status}"
+                        )
+                    raise RuntimeError(f"unexpected HTTP status {response.status}")
+                copy_checked(response, size, sha256, output)
+            return
+        except (OSError, http.client.HTTPException, ValueError, RuntimeError) as error:
+            dest.unlink(missing_ok=True)
+            if attempt + 1 < DOWNLOAD_ATTEMPTS and _is_retryable_download_error(error):
+                print(
+                    f"Retrying pinned Gemini asset {dest.name} ({attempt + 2}/{DOWNLOAD_ATTEMPTS}): {error}",
+                    flush=True,
+                )
+                _retry_sleep(attempt)
+                continue
+            raise RuntimeError(f"download {dest.name} from {url}: {error}") from error
 
 
 def download_bounded(opener, url, dest, max_size, expected_sha256=None):
     print(f"Fetching Gemini release asset: {dest.name}", flush=True)
-    digest = hashlib.sha256()
-    total = 0
-    try:
-        request = Request(url, headers={"User-Agent": "vm2api-gemini-payload"})
-        with opener.open(request, timeout=60) as response, dest.open("xb") as output:
-            if response.status != 200:
-                raise RuntimeError(f"unexpected HTTP status {response.status}")
-            while chunk := response.read(CHUNK_SIZE):
-                total += len(chunk)
-                if total > max_size:
-                    raise ValueError(f"download exceeds {max_size}-byte limit")
-                digest.update(chunk)
-                output.write(chunk)
-        if total == 0:
-            raise ValueError("empty download")
-        if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
-            raise ValueError("SHA-256 does not match signed manifest")
-    except (OSError, http.client.HTTPException, ValueError, RuntimeError) as error:
-        dest.unlink(missing_ok=True)
-        raise RuntimeError(f"download {dest.name} from {url}: {error}") from error
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        digest = hashlib.sha256()
+        total = 0
+        try:
+            request = Request(url, headers={"User-Agent": "vm2api-gemini-payload"})
+            with opener.open(request, timeout=60) as response, dest.open("xb") as output:
+                if response.status != 200:
+                    if (
+                        response.status in RETRYABLE_HTTP_STATUSES
+                        and attempt + 1 < DOWNLOAD_ATTEMPTS
+                    ):
+                        raise http.client.HTTPException(
+                            f"retryable HTTP status {response.status}"
+                        )
+                    raise RuntimeError(f"unexpected HTTP status {response.status}")
+                while chunk := response.read(CHUNK_SIZE):
+                    total += len(chunk)
+                    if total > max_size:
+                        raise ValueError(f"download exceeds {max_size}-byte limit")
+                    digest.update(chunk)
+                    output.write(chunk)
+            if total == 0:
+                raise ValueError("empty download")
+            if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+                raise ValueError("SHA-256 does not match signed manifest")
+            return
+        except (OSError, http.client.HTTPException, ValueError, RuntimeError) as error:
+            dest.unlink(missing_ok=True)
+            if attempt + 1 < DOWNLOAD_ATTEMPTS and _is_retryable_download_error(error):
+                print(
+                    f"Retrying Gemini release asset {dest.name} ({attempt + 2}/{DOWNLOAD_ATTEMPTS}): {error}",
+                    flush=True,
+                )
+                _retry_sleep(attempt)
+                continue
+            raise RuntimeError(f"download {dest.name} from {url}: {error}") from error
 
 
 def reuse_verified_agy(source_path, dest):
@@ -263,7 +320,7 @@ def verify_signed_payload(dest, version):
         raise RuntimeError(f"signed Gemini payload verification failed: {detail}")
 
 
-def prepare(dest, pins):
+def prepare(dest, pins, *, reuse_agy=None, opener=None, verify=verify_signed_payload):
     assets = pins["assets"]
     version = pins["version"]
     if not dest.is_absolute() or not dest.name or ".." in dest.parts:
@@ -277,7 +334,7 @@ def prepare(dest, pins):
         if os.path.lexists(dest):
             try:
                 check_cached(dest, assets)
-                verify_signed_payload(dest, version)
+                verify(dest, version)
             except (
                 OSError,
                 ValueError,
@@ -289,17 +346,21 @@ def prepare(dest, pins):
                 ) from error
             return
 
-        opener = build_opener(HttpsRedirects())
+        active_opener = opener if opener is not None else build_opener(HttpsRedirects())
         with tempfile.TemporaryDirectory(prefix=".gemini-", dir=dest.parent) as staging:
             stage = Path(staging)
             for name in NATIVE_ASSETS:
                 download(
-                    opener, f"{pins['release']}/{name}", stage / name, **assets[name]
+                    active_opener,
+                    f"{pins['release']}/{name}",
+                    stage / name,
+                    **assets[name],
                 )
-            archive = stage / "cli_linux_x64.tar.gz"
-            download(opener, AGY_URL, archive, AGY_SIZE, AGY_SHA256)
-            extract_agy(archive, stage / "agy")
-            verify_signed_payload(stage, version)
+            if not reuse_verified_agy(reuse_agy, stage / "agy"):
+                archive = stage / "cli_linux_x64.tar.gz"
+                download(active_opener, AGY_URL, archive, AGY_SIZE, AGY_SHA256)
+                extract_agy(archive, stage / "agy")
+            verify(stage, version)
             stage.rename(dest)
     finally:
         os.close(parent_fd)
@@ -393,7 +454,7 @@ def main():
                 reuse_agy=args.reuse_agy,
             )
         else:
-            prepare(args.dest, pins)
+            prepare(args.dest, pins, reuse_agy=args.reuse_agy)
             version = pins["version"]
     except (
         OSError,

@@ -62,6 +62,10 @@ const FAILURES = {
     403,
     'Google requires browser account verification before this account can use Antigravity.',
   ],
+  gemini_client_unsupported: [
+    403,
+    'Google rejected the current Antigravity client version or metadata (UNSUPPORTED_CLIENT).',
+  ],
   gemini_account_ineligible: [403, 'Google rejected this account as ineligible for Antigravity.'],
   gemini_proxy_error: [502, 'The bound Gemini proxy could not reach Google.'],
   gemini_quota_exhausted: [429, 'The selected Gemini account quota is exhausted.'],
@@ -130,6 +134,7 @@ const FAILOVER_ERRORS = new Set([
   'gemini_quota_exhausted',
   'gemini_account_verification_required',
   'gemini_location_unsupported',
+  'gemini_client_unsupported',
   'gemini_account_ineligible',
   'gemini_oauth_required',
   'gemini_operation_busy',
@@ -147,11 +152,12 @@ const FAILOVER_ERRORS = new Set([
 const ACCOUNT_WIDE_COOLDOWN_ERRORS = new Set([
   'gemini_account_verification_required',
   'gemini_location_unsupported',
+  'gemini_client_unsupported',
   'gemini_account_ineligible',
   'gemini_oauth_required',
 ])
 
-const INELIGIBLE_STATES = new Set(['verification_required', 'location_unsupported', 'ineligible'])
+const INELIGIBLE_STATES = new Set(['verification_required', 'location_unsupported', 'client_unsupported', 'ineligible'])
 
 const CONTENT_OUTPUT_EVENTS = new Set([
   'text',
