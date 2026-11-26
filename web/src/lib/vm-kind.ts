@@ -152,14 +152,20 @@ export function slotRawEmail(
   ).trim()
 }
 
-/** 槽位展示名：能探测到邮箱则优先显示脱敏邮箱，否则回退名称或 ID。 */
+/**
+ * 槽位展示名（详情/弹窗面）：自定义名称优先（识别靠名称体系）；
+ * 无名称时展示完整邮箱供管理员审阅；最后回退 ID。
+ * 列表/网格等紧凑面勿用此函数，改用 formatSlotEmail 脱敏。
+ */
 export function slotDisplayTitle(
   vm?: Pick<Vm, 'id' | 'name' | 'email' | 'gemini'> | null,
   fallbackEmail?: string | null
 ): string {
+  const name = String(vm?.name || '').trim()
+  if (name) return name
   const raw = slotRawEmail(vm, fallbackEmail)
-  if (raw) return formatSlotEmail(raw)
-  return String(vm?.name || vm?.id || '').trim() || '未绑定账号'
+  if (raw) return raw
+  return String(vm?.id || '').trim() || '未绑定账号'
 }
 
 /** 卡片 / 表格用：本地段优先，域名过长只留尾标。完整地址走 title。 */

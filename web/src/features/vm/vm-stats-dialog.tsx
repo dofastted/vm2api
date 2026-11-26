@@ -737,7 +737,7 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
           <div className='min-w-0'>
             <div
               className='truncate font-semibold'
-              title={slotRawEmail(vm) || vm.name || vm.id}
+              title={slotRawEmail(vm) || undefined}
             >
               {slotDisplayTitle(vm)}
             </div>

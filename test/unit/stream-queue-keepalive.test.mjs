@@ -645,3 +645,94 @@ test('an incomplete native handoff never becomes a successful output-limit termi
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('SSE stream preserves deltas containing literal response_headers and multi-byte UTF-8 across chunks', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-sse-response-headers-'))
+  const socketPath = path.join(root, 'kernel.sock')
+  const tokenPath = path.join(root, 'internal.token')
+  fs.writeFileSync(tokenPath, 'offline-sse-filter-token')
+  const server = http.createServer(async (req, response) => {
+    for await (const _chunk of req) {
+    }
+    response.writeHead(200, { 'content-type': 'text/event-stream' })
+    const raw = [
+      'event: response_headers\ndata: {"type":"response_headers","headers":{"x-request-id":"req_internal"}}\n\n',
+      `event: message_start\ndata: ${JSON.stringify({
+        type: 'message_start',
+        message: {
+          id: 'msg_response_headers_text',
+          type: 'message',
+          role: 'assistant',
+          model: MESSAGE.model,
+          content: [],
+          usage: { input_tokens: 2, output_tokens: 0 },
+        },
+      })}\n\n`,
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"check response_headers 字段"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":4}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join('')
+    const buf = Buffer.from(raw, 'utf8')
+    // Split directly inside the multi-byte UTF-8 sequence for "字".
+    const splitAt = buf.indexOf(Buffer.from('字', 'utf8')) + 1
+    response.write(buf.subarray(0, splitAt))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    response.end(buf.subarray(splitAt))
+  })
+  await new Promise((resolve) => server.listen(socketPath, resolve))
+  const exec = {
+    projectRoot: root,
+    homeDir: path.join(root, 'cli-home'),
+    vm: {
+      id: 'sse-filter-test',
+      runtime: { kernel_socket: socketPath, worker_run_dir: root, worker_token_file: tokenPath },
+    },
+  }
+  const res = createResponse()
+  const handler = createHandler({
+    root,
+    routing: { compatibility: {}, failover: { stream_keepalive_ms: 1000, queue_keepalive_delay_ms: 5000 } },
+    run: async ({ callAttempt }) =>
+      callAttempt({
+        candidate: { exec, vmId: 'sse-filter-test' },
+        body: { ...MESSAGE, stream: true },
+        attemptMeta: {
+          cliHop: true,
+          cragPrint: false,
+          preparedHop: { decision: { wanted: 'rust', blocked: false }, ready: { ok: true, health: { ok: true } } },
+        },
+        deliveryMode: 'realtime',
+        onCommit() {},
+      }),
+  })
+  try {
+    await invoke(handler, res)
+    const rawOut = res.chunks.join('')
+    const frames = rawOut
+      .split(/\r?\n\r?\n/)
+      .map((frame) => frame.trim())
+      .filter(Boolean)
+    const parsed = frames.map((frame) => {
+      const eventLine = frame.split('\n').find((line) => line.startsWith('event:'))
+      const dataLines = frame
+        .split('\n')
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart())
+      assert.ok(eventLine, `expected event line in frame: ${frame}`)
+      assert.ok(dataLines.length > 0, `expected non-empty data line in frame: ${frame}`)
+      return { event: eventLine.slice(6).trim(), data: JSON.parse(dataLines.join('\n')) }
+    })
+    assert.equal(
+      parsed.some((f) => f.event === 'response_headers' || f.data.type === 'response_headers'),
+      false,
+    )
+    const delta = parsed.find((f) => f.event === 'content_block_delta')
+    assert.equal(delta?.data?.delta?.text, 'check response_headers 字段')
+  } finally {
+    server.closeAllConnections()
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})

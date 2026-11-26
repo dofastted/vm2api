@@ -107,7 +107,13 @@ const BLOCK_KEYS_BY_TYPE = Object.freeze({
   text: new Set(['type', 'text', 'cache_control']),
   image: new Set(['type', 'source', 'cache_control']),
   document: new Set(['type', 'source', 'title', 'context', 'citations', 'cache_control']),
-  tool_use: new Set(['type', 'id', 'name', 'input', 'caller', 'cache_control']),
+  // `extension` rides along opaquely: it is minted by the gateway's issued-tool
+  // replay (issued-tool-replay.mjs), which restores its own remembered value over
+  // whatever the client echoed back before this sanitization runs. The CRAG
+  // continuation hash covers these bytes, so it cannot be reshaped or refilled --
+  // dropping it is what broke the replay on the CRAG path. cli-node keeps it too
+  // (see kernel-request.mjs "Keep official extension fields").
+  tool_use: new Set(['type', 'id', 'name', 'input', 'caller', 'extension', 'cache_control']),
   tool_result: new Set(['type', 'tool_use_id', 'content', 'is_error', 'cache_control']),
   thinking: new Set(['type', 'thinking', 'signature']),
   redacted_thinking: new Set(['type', 'data']),
