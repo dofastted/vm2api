@@ -20,6 +20,8 @@ import {
   parseInboundToGemini,
   renderGeminiProtocolResponse,
   avoidAgyBridgeParamCollisions,
+  clientDeclaredAgyBridgeParam,
+  forwardAgyBridgeToolArgs,
   restoreAgyBridgeToolArgs,
   sanitizeGeminiSchema,
   sanitizeNativeTuiText,
@@ -210,17 +212,98 @@ test('avoidAgyBridgeParamCollisions renames bridge-colliding parameters for anti
   assert.deepEqual(params.required, ['CommandLine', '_client_toolSummary', 'WaitMsBeforeAsync'])
 })
 
+const RUN_COMMAND_SCHEMA = {
+  type: 'object',
+  properties: {
+    CommandLine: { type: 'string' },
+    toolSummary: { type: 'string' },
+    WaitMsBeforeAsync: { type: 'integer' },
+  },
+  required: ['CommandLine', 'toolSummary'],
+}
+
 test('restoreAgyBridgeToolArgs maps _client_toolSummary back and drops bridge-only duplicates', () => {
-  assert.deepEqual(restoreAgyBridgeToolArgs({ _client_toolSummary: 'deploy', CommandLine: 'ls' }), {
+  assert.deepEqual(restoreAgyBridgeToolArgs({ _client_toolSummary: 'deploy', CommandLine: 'ls' }, RUN_COMMAND_SCHEMA), {
     toolSummary: 'deploy',
     CommandLine: 'ls',
   })
   assert.deepEqual(
-    restoreAgyBridgeToolArgs({ _client_toolSummary: 'from model', toolSummary: 'from bridge', CommandLine: 'ls' }),
+    restoreAgyBridgeToolArgs(
+      { _client_toolSummary: 'from model', toolSummary: 'from bridge', CommandLine: 'ls' },
+      RUN_COMMAND_SCHEMA,
+    ),
     { toolSummary: 'from model', CommandLine: 'ls' },
+  )
+  assert.deepEqual(
+    restoreAgyBridgeToolArgs({ CommandLine: 'ls', toolSummary: 'model used bare name' }, RUN_COMMAND_SCHEMA),
+    { CommandLine: 'ls', toolSummary: 'model used bare name' },
   )
   assert.deepEqual(restoreAgyBridgeToolArgs({ CommandLine: 'ls', path: '/tmp' }), { CommandLine: 'ls', path: '/tmp' })
   assert.deepEqual(restoreAgyBridgeToolArgs({ toolSummary: 'bridge only', CommandLine: 'ls' }), { CommandLine: 'ls' })
+  assert.equal(clientDeclaredAgyBridgeParam(RUN_COMMAND_SCHEMA, 'toolSummary'), true)
+  assert.equal(
+    clientDeclaredAgyBridgeParam({ type: 'object', properties: { path: { type: 'string' } } }, 'toolSummary'),
+    false,
+  )
+})
+
+test('forwardAgyBridgeToolArgs renames history functionCall args for antigravity only at root', () => {
+  const schema = {
+    type: 'object',
+    properties: {
+      CommandLine: { type: 'string' },
+      toolSummary: { type: 'string' },
+      nested: {
+        type: 'object',
+        properties: { toolSummary: { type: 'string' } },
+      },
+    },
+  }
+  const adjusted = avoidAgyBridgeParamCollisions(schema)
+  assert.ok(adjusted.properties._client_toolSummary)
+  assert.equal(adjusted.properties.nested.properties.toolSummary.type, 'string')
+
+  const historyArgs = { CommandLine: 'pwd', toolSummary: 'print cwd', nested: { toolSummary: 'inner kept' } }
+  const forwarded = forwardAgyBridgeToolArgs(historyArgs, schema)
+  assert.deepEqual(forwarded, {
+    CommandLine: 'pwd',
+    _client_toolSummary: 'print cwd',
+    nested: { toolSummary: 'inner kept' },
+  })
+
+  const ir = parseInboundToGemini(
+    'openai-chat',
+    {
+      model: 'gemini-4-argon-high',
+      messages: [
+        { role: 'user', content: 'go' },
+        {
+          role: 'assistant',
+          tool_calls: [
+            {
+              id: 'c1',
+              type: 'function',
+              function: {
+                name: 'run_command',
+                arguments: JSON.stringify(historyArgs),
+              },
+            },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+        { role: 'user', content: 'again' },
+      ],
+      tools: [{ type: 'function', function: { name: 'run_command', parameters: schema } }],
+    },
+    { routeModel: 'gemini-4-argon-high', routeStream: false },
+  )
+  const agReq = buildGeminiRequest(ir, { target: 'antigravity' })
+  const modelTurn = agReq.contents.find((c) => c.role === 'model')
+  const histCall = modelTurn.parts.find((p) => p.functionCall?.name)
+  assert.deepEqual(histCall.functionCall.args, forwarded)
+  assert.deepEqual(agReq.tools[0].functionDeclarations[0].parameters.properties._client_toolSummary, {
+    type: 'string',
+  })
 })
 
 test('createGeminiRestoreTransform restores agy bridge arg aliases for streaming and JSON responses', () => {
