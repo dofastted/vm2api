@@ -994,6 +994,31 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(state.hostInput?.value).toBe(code)
   })
 
+  it('surfaces gemini_subscription_package_unready instead of masking it with Claude redeem_unavailable', async () => {
+    const code = `CRAGR1.${'p'.repeat(43)}`
+    vi.mocked(api)
+      .mockRejectedValueOnce(
+        new ApiError('not claude', 404, 'redeem_unavailable')
+      )
+      .mockRejectedValueOnce(
+        new ApiError(
+          '宿主机尚未安装可信的 CRAGGemini 加密载荷，请前往「设置 → Gemini 维护」安装或修复后再试。',
+          409,
+          'gemini_subscription_package_unready'
+        )
+      )
+
+    render()
+    fillHostCode(code)
+    submitHostCode()
+    await settle()
+
+    const html = render()
+    expect(html).toContain('宿主机尚未安装可信的 CRAGGemini 加密载荷')
+    expect(html).not.toContain('此码不可用于本机订阅或已失效')
+    expect(state.hostInput?.value).toBe(code)
+  })
+
   it('does not try CRAGGemini fallback when Claude already recognizes the voucher as conflicting', async () => {
     const code = `CRAGR1.${'m'.repeat(43)}`
     vi.mocked(api).mockRejectedValueOnce(
