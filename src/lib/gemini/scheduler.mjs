@@ -103,6 +103,14 @@ const FAILURES = {
   gemini_egress_unavailable: [503, 'Gemini egress is not available.'],
   gemini_oauth_tools_missing: [503, 'Gemini OAuth runtime tools are missing.'],
   gemini_ipv4_forwarding_unavailable: [503, 'Gemini IPv4 forwarding is not available.'],
+  gemini_sandbox_apparmor_restricted: [
+    503,
+    'The host AppArmor policy blocks Gemini unprivileged sandboxes; run prepare-gemini or open Gemini maintenance.',
+  ],
+  gemini_sandbox_unavailable: [
+    503,
+    'The host unprivileged bwrap sandbox is unavailable; inspect Gemini maintenance and host service logs.',
+  ],
   license_required: [403, GEMINI_LICENSE_MESSAGES.license_required],
   license_expired: [403, GEMINI_LICENSE_MESSAGES.license_expired],
   license_not_yet_valid: [403, GEMINI_LICENSE_MESSAGES.license_not_yet_valid],
@@ -881,11 +889,18 @@ export function createGeminiScheduler({
     if (environment.crag_license?.valid === true) {
       return { ok: true, seat_required: true }
     }
-    const code =
-      typeof environment.crag_license?.code === 'string' && Object.hasOwn(FAILURES, environment.crag_license.code)
-        ? environment.crag_license.code
-        : 'license_required'
-    return { ok: false, status: 403, code, message: FAILURES[code][1] }
+    const licCode =
+      typeof environment.crag_license?.code === 'string' ? environment.crag_license.code : null
+    if (licCode && Object.hasOwn(FAILURES, licCode)) {
+      const [status, message] = FAILURES[licCode]
+      return { ok: false, status, code: licCode, message }
+    }
+    return {
+      ok: false,
+      status: 403,
+      code: 'license_required',
+      message: FAILURES.license_required[1],
+    }
   }
 
   function recordAccountUsage(apiKeyRecord, model, usage) {

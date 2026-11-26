@@ -39,6 +39,18 @@ export const RECOVERABLE_GEMINI_SEAT_CODES = new Set([
   'license_payload_key_mismatch',
 ])
 
+export const GEMINI_SANDBOX_ERROR_CODES = new Set([
+  'gemini_sandbox_apparmor_restricted',
+  'gemini_sandbox_unavailable',
+])
+
+export const GEMINI_SANDBOX_MESSAGES = {
+  gemini_sandbox_apparmor_restricted:
+    '宿主机 AppArmor 限制了非特权 user namespace，导致 Gemini 沙箱无法启动；请在宿主机执行 prepare-gemini 或前往「设置 → Gemini 维护」执行修复安装',
+  gemini_sandbox_unavailable:
+    '宿主机非特权沙箱（bwrap）不可用，无法启动 Gemini 隔离进程；请前往「设置 → Gemini 维护」诊断宿主并检查宿主服务日志',
+}
+
 export const GEMINI_LICENSE_MESSAGES = {
   license_required: '当前 Gemini OAuth 环境尚未绑定 CRAGGemini 订阅席位，请先绑定席位或激活许可。',
   license_expired: 'CRAGGemini 宿主机订阅或实例许可已过期，请续费或重新激活。',
@@ -1168,13 +1180,20 @@ export function createGeminiCragSubscription({
       if (lic?.valid === true) {
         return { ok: true, seat_required: true, seat: lic.seat ?? null }
       }
+      const licCode = typeof lic?.code === 'string' ? lic.code : null
+      if (licCode && GEMINI_SANDBOX_ERROR_CODES.has(licCode)) {
+        return {
+          ok: false,
+          status: 503,
+          code: licCode,
+          message: GEMINI_SANDBOX_MESSAGES[licCode],
+        }
+      }
       const code =
-        typeof lic?.code === 'string' && Object.hasOwn(GEMINI_LICENSE_MESSAGES, lic.code)
-          ? lic.code
-          : 'license_required'
+        licCode && Object.hasOwn(GEMINI_LICENSE_MESSAGES, licCode) ? licCode : 'license_required'
       return {
         ok: false,
-        status: 403,
+        status: code === 'gemini_subscription_sync_pending' ? 503 : 403,
         code,
         message: GEMINI_LICENSE_MESSAGES[code],
       }

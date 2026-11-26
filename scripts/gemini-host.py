@@ -235,6 +235,43 @@ def extract_permit_payload_key_id(code):
     return None
 
 
+BWRAP_FATAL_STDERR = re.compile(rb"bwrap:\s+(?!warning\b)", re.I)
+BWRAP_BIND_MOUNT_STDERR = re.compile(
+    rb"can't find source path|can't bind mount|can't mount proc|"
+    rb"failed to (?:open|mount)|no such file or directory|"
+    rb"execvp permission denied",
+    re.I,
+)
+
+
+def _bwrap_fatal_stderr(stderr):
+    if not isinstance(stderr, str) or not stderr.strip():
+        return None
+    fatal_lines = []
+    for line in stderr.splitlines():
+        stripped = line.lstrip()
+        lower = stripped.lower()
+        if lower.startswith("bwrap:") and not lower.startswith("bwrap: warning"):
+            fatal_lines.append(stripped)
+    if not fatal_lines:
+        return None
+    return "\n".join(fatal_lines)
+
+
+def _classify_bwrap_launch_stderr(stderr, *, host_root=Path("/")):
+    fatal = _bwrap_fatal_stderr(stderr)
+    if fatal is None:
+        return None
+    raw = fatal.encode("utf-8", errors="replace")
+    if not BWRAP_FATAL_STDERR.search(raw):
+        return None
+    if BWRAP_BIND_MOUNT_STDERR.search(raw):
+        return 503, "gemini_sandbox_unavailable"
+    if _apparmor_sandbox_evidence(raw, host_root=host_root):
+        return 503, "gemini_sandbox_apparmor_restricted"
+    return 503, "gemini_sandbox_unavailable"
+
+
 def classify_craggemini_license_cli_error(stdout, stderr, *, sync_pending=False):
     if isinstance(stdout, str) and stdout.strip():
         try:
@@ -269,6 +306,9 @@ def classify_craggemini_license_cli_error(stdout, stderr, *, sync_pending=False)
         or "permit or registration code is required" in text
     ):
         return 403, "license_required"
+    sandbox = _classify_bwrap_launch_stderr(stderr)
+    if sandbox is not None:
+        return sandbox
     if sync_pending:
         return 503, "gemini_subscription_sync_pending"
     return 403, "license_invalid"
@@ -6454,7 +6494,11 @@ class Host:
             status.setdefault("product", "craggemini")
             status["seat_required"] = True
         except Failure as error:
-            code = error.code if error.code in LICENSE_ERROR_CODES else "license_unconfigured"
+            code = (
+                error.code
+                if error.code in LICENSE_ERROR_CODES or error.code in SANDBOX_ERROR_CODES
+                else "license_unconfigured"
+            )
             status = {
                 "product": "craggemini",
                 "status": (
