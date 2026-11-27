@@ -7,6 +7,7 @@ prefix=vm2agy$2
 base=$((4 * $2))
 gateway=198.18.252.$((base + 1))
 guest=198.18.252.$((base + 2))
+rule_pref=$((50 + $2))
 namespace=$prefix
 host_link=${prefix}h
 peer_link=${prefix}p
@@ -54,6 +55,8 @@ allow_host_relay_input() {
 }
 
 cleanup() {
+    while ip -4 rule del pref "$rule_pref" to "$guest/32" lookup main 2>/dev/null; do :; done
+    while ip -4 rule del pref "$rule_pref" from "$guest/32" lookup main 2>/dev/null; do :; done
     if ip link show "$host_link" >/dev/null 2>&1; then ip link delete "$host_link"; fi
     if [[ -e /run/netns/$namespace ]]; then ip netns delete "$namespace"; fi
     if nft list table inet "$prefix" >/dev/null 2>&1; then nft delete table inet "$prefix"; fi
@@ -169,6 +172,15 @@ EOF
 fi
 ip address add "$gateway/30" dev "$host_link"
 ip link set "$host_link" up
+if [[ -w /proc/sys/net/ipv4/conf/$host_link/rp_filter ]]; then
+    echo 2 > "/proc/sys/net/ipv4/conf/$host_link/rp_filter" || true
+fi
+# Bypass host TUN / fake-ip policy rules (e.g. Clash/Mihomo/sing-box 198.18.0.0/15)
+# so traffic between the host gateway and isolated slot guest stays in the main table.
+while ip -4 rule del pref "$rule_pref" to "$guest/32" lookup main 2>/dev/null; do :; done
+while ip -4 rule del pref "$rule_pref" from "$guest/32" lookup main 2>/dev/null; do :; done
+ip -4 rule add pref "$rule_pref" to "$guest/32" lookup main
+ip -4 rule add pref "$rule_pref" from "$guest/32" lookup main
 ip -n "$namespace" link set "$peer_link" up
 ip -n "$namespace" route add default via "$gateway" dev "$peer_link" onlink
 trap - EXIT

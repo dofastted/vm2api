@@ -1909,3 +1909,90 @@ test('synchronous host errors and polled test-chat runs report the same resident
     assert.equal(startRes.body.error.message, pollRes.body.data.error.message)
   }
 })
+
+test('geminiProxyFor accepts HTTP and domain proxies, forwards egress_options when set, and maps 503 gemini_oauth_client_not_configured', async () => {
+  const { geminiProxyEgressOptionsFor, geminiProxyFor } = await import('../../src/lib/gemini/routes.mjs')
+  const makePool = (rows, urls) => ({
+    snapshot: () => ({ proxies: rows }),
+    getProxyByIdWithAuth: (id) => urls[id] || null,
+  })
+
+  const pool = makePool(
+    [
+      {
+        id: 'px-http',
+        enabled: true,
+        status: 'ok',
+        kind: 'http',
+        domain_forward: true,
+        dns_disable_svcb_https: true,
+        owner_user_id: null,
+      },
+      { id: 'px-dom', enabled: true, status: 'ok', kind: 'socks5', owner_user_id: null },
+      { id: 'px-http80', enabled: true, status: 'ok', kind: 'http', owner_user_id: null },
+      { id: 'px-local', enabled: true, status: 'ok', kind: 'http', owner_user_id: null },
+      { id: 'px-v6', enabled: true, status: 'ok', kind: 'socks5', owner_user_id: null },
+    ],
+    {
+      'px-http': { url: 'http://alice:pw@192.0.2.30:8080', domain_forward: true, dns_disable_svcb_https: true },
+      'px-dom': { url: 'socks5://u:p@proxy.example.com:1080' },
+      'px-http80': { url: 'http://proxy.example.com' },
+      'px-local': { url: 'http://localhost:8080' },
+      'px-v6': { url: 'socks5h://[2001:db8::1]:1080' },
+    },
+  )
+
+  assert.equal(geminiProxyFor(pool, 'px-http'), 'http://alice:pw@192.0.2.30:8080')
+  assert.equal(geminiProxyFor(pool, 'px-dom'), 'socks5h://u:p@proxy.example.com:1080')
+  assert.equal(geminiProxyFor(pool, 'px-http80'), 'http://proxy.example.com:80')
+  assert.throws(() => geminiProxyFor(pool, 'px-local'), { code: 'gemini_proxy_unavailable' })
+  assert.throws(() => geminiProxyFor(pool, 'px-v6'), { code: 'gemini_proxy_unavailable' })
+
+  assert.deepEqual(geminiProxyEgressOptionsFor(pool, 'px-http'), {
+    domain_forward: true,
+    dns_empty_types: [64, 65],
+  })
+  assert.equal(geminiProxyEgressOptionsFor(pool, 'px-dom'), null)
+
+  // Panel create forwards egress_options only when configured and maps 503 gemini_oauth_client_not_configured.
+  const calls = []
+  const response = { setHeader() {} }
+  const panel = createGeminiPanelHandler({
+    json: (_res, status, body) => ({ status, body }),
+    readBody: async (req) => req.body,
+    proxyPool: () => pool,
+    callHost: (op, payload) => {
+      calls.push([op, payload])
+      if (op === 'create' && payload.name === 'missing-oauth') {
+        throw Object.assign(new Error('gemini_oauth_client_not_configured'), {
+          code: 'gemini_oauth_client_not_configured',
+          status: 503,
+        })
+      }
+      return {
+        ...record,
+        proxy_id: payload.proxy_id,
+        account: { state: 'error', error_message: 'failed via http://alice:pw@192.0.2.30:8080' },
+      }
+    },
+  })
+  const runPanel = (method, pathname, body) => panel({ method, pathname, body }, response, pathname)
+
+  const okCreate = await runPanel('POST', '/api/panel/gemini/environments', {
+    name: 'http-env',
+    proxy_id: 'px-http',
+  })
+  assert.equal(okCreate.status, 200)
+  assert.deepEqual(calls[0][1].egress_options, { domain_forward: true, dns_empty_types: [64, 65] })
+  // HTTP proxy credentials in account error_message must be redacted.
+  assert.ok(!okCreate.body.data.account.error_message.includes('alice:pw'))
+  assert.ok(okCreate.body.data.account.error_message.includes('[redacted proxy URL]'))
+
+  const missingOAuth = await runPanel('POST', '/api/panel/gemini/environments', {
+    name: 'missing-oauth',
+    proxy_id: 'px-dom',
+  })
+  assert.equal(missingOAuth.status, 503)
+  assert.equal(missingOAuth.body.error.code, 'gemini_oauth_client_not_configured')
+  assert.equal('egress_options' in calls[1][1], false)
+})

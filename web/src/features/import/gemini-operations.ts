@@ -42,11 +42,13 @@ export const geminiProxyOptions = queryOptions({
     api<{ proxies: GeminiProxy[] }>('/api/panel/proxies', { signal }),
 })
 
+const GEMINI_PROXY_KINDS = new Set(['socks5', 'socks5h', 'http'])
+
 export function isGeminiProxy(proxy: GeminiProxy) {
   return (
     proxy.enabled &&
-    proxy.kind === 'socks5' &&
-    proxy.address_family === 4 &&
+    GEMINI_PROXY_KINDS.has(proxy.kind) &&
+    proxy.address_family !== 6 &&
     !proxy.owner_user_id &&
     !proxy.blocked_reason &&
     proxy.status !== 'dead' &&

@@ -534,6 +534,7 @@ export function createGeminiScheduler({
   callHost,
   callHostStream,
   resolveProxy,
+  resolveProxyEgressOptions = null,
   poolScheduler,
   stickyRouter = null,
   apiKeyStore,
@@ -1542,6 +1543,7 @@ export function createGeminiScheduler({
             }
             if (typeof proxyId !== 'string' || !ID.test(proxyId)) throw fail(502, 'gemini_host_protocol_error')
             const proxyUrl = resolveProxy ? resolveProxy(proxyId, envOwner) : undefined
+            const egressOptions = resolveProxyEgressOptions ? resolveProxyEgressOptions(proxyId, envOwner) : null
             signal?.throwIfAborted()
             lastAuthMethod = authMethod
             const target = authMethod === 'api_key' ? 'gemini' : 'antigravity'
@@ -1623,6 +1625,7 @@ export function createGeminiScheduler({
                   proxyId,
                   proxyUrl,
                   proxySha256,
+                  ...(egressOptions ? { egressOptions } : {}),
                   model: resolved.upstreamModel,
                 })
                 if (directTarget) {
@@ -1664,6 +1667,7 @@ export function createGeminiScheduler({
                     proxy_id: proxyId,
                     proxy_url: proxyUrl,
                     ...(proxySha256 ? { proxy_sha256: proxySha256 } : {}),
+                    ...(egressOptions ? { egress_options: egressOptions } : {}),
                     model: resolved.upstreamModel,
                     request_id: attemptRequestId,
                     ...(gatewayPolicy ? { gateway_policy: gatewayPolicy } : {}),
@@ -1692,6 +1696,7 @@ export function createGeminiScheduler({
                       id,
                       proxy_id: proxyId,
                       proxy_url: proxyUrl,
+                      ...(egressOptions ? { egress_options: egressOptions } : {}),
                       model: resolved.upstreamModel,
                       prompt: plainText,
                     })
@@ -1737,6 +1742,7 @@ export function createGeminiScheduler({
                 id,
                 proxy_id: proxyId,
                 proxy_url: proxyUrl,
+                ...(egressOptions ? { egress_options: egressOptions } : {}),
                 model: resolved.upstreamModel,
                 prompt: plainText,
               })
