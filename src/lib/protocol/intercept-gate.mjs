@@ -9,6 +9,7 @@ import {
 } from '../core/errors.mjs'
 import {
   blockedRiskTool,
+  classifyUpstreamError,
   DEFAULT_BAN_STEPS,
   matchRefusalSession,
   matchStoredRefusal,
@@ -128,6 +129,35 @@ function recordBan(decision, { devices, policy, requestId, now = Date.now() }) {
   return null
 }
 
+const OVER_REFUSAL_SAFE_FLOOR = 0.85
+
+/** Flatten JEV per-question scores into scalar error_details fields (`jev_score_<id>`). */
+export function jevScoreDetails(scores) {
+  if (!scores || typeof scores !== 'object') return {}
+  const out = {}
+  for (const [id, raw] of Object.entries(scores)) {
+    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(id)) continue
+    const num = Number(raw)
+    if (Number.isFinite(num) && num >= 0 && num <= 1) {
+      out[`jev_score_${id}`] = Math.round(num * 1000) / 1000
+    }
+  }
+  return out
+}
+
+function minJevScore(scores) {
+  if (!scores || typeof scores !== 'object') return null
+  const vals = Object.values(scores)
+    .map(Number)
+    .filter((n) => Number.isFinite(n) && n >= 0 && n <= 1)
+  return vals.length ? Math.min(...vals) : null
+}
+
+function mergeLogErrorDetails(logBag, patch) {
+  if (!logBag || !patch || !Object.keys(patch).length) return
+  logBag.error_details = { ...(logBag.error_details || {}), ...patch }
+}
+
 export function observeUpstreamRisk({ inbound, body, identity, result, logBag, requestId, policy, repo, devices }) {
   if (!result || result.upstreamExecutions === 0 || result.transportError === true) return ''
   const rawMessage =
@@ -135,20 +165,66 @@ export function observeUpstreamRisk({ inbound, body, identity, result, logBag, r
     result.body?.error?.message ||
     result.body?.message ||
     (typeof result.body === 'string' ? result.body : '')
-  const upstreamStatus = result.providerResult?.http_status ?? result.upstreamStatus ?? result.status
-  const isBadRequest = Number(upstreamStatus) === 400
-  const reason = upstreamRiskReason(result, policy?.risk_audit?.upstream_policy_phrases)
-  if (!isBadRequest && !reason) return ''
+  const classified = classifyUpstreamError(result, policy?.risk_audit?.upstream_policy_phrases)
+  const isBadRequest = classified.status === 400
+  const reason = classified.bucket === 'policy' ? classified.reason : ''
+  if (
+    !isBadRequest &&
+    classified.bucket !== 'policy' &&
+    classified.bucket !== 'third_party' &&
+    classified.bucket !== 'auth_suspect'
+  ) {
+    return ''
+  }
   const message = JSON.parse(redactSecrets(String(rawMessage))).slice(0, 500)
   if (isBadRequest) {
     logBag.audit_upstream_400 = true
     logBag.audit_upstream_400_message ||= message
   }
+  if (classified.bucket === 'protocol') {
+    mergeLogErrorDetails(logBag, { risk_bucket: 'protocol' })
+    return ''
+  }
+  if (classified.bucket === 'third_party') {
+    mergeLogErrorDetails(logBag, { risk_bucket: 'third_party' })
+    return ''
+  }
+  if (classified.bucket === 'auth_suspect') {
+    logBag.audit_upstream_error_status = classified.status
+    logBag.audit_upstream_400_message ||= message
+    if (logBag._jevPassState) logBag.jev_state ||= logBag._jevPassState
+    mergeLogErrorDetails(logBag, {
+      risk_bucket: 'auth_suspect',
+      ...(logBag._jevPassed ? { gate_miss: true } : {}),
+      ...jevScoreDetails(logBag._jevPassScores),
+    })
+    return ''
+  }
   if (!reason) return ''
   if (message) logBag.error_message = message
   logBag.error_code ||= 'content_filter_refusal'
-  if (!policy?.enabled) return reason
+  if (classified.status && classified.status >= 400 && !isBadRequest) {
+    logBag.audit_upstream_error_status = classified.status
+  }
+  if (logBag._jevPassState) logBag.jev_state ||= logBag._jevPassState
+  const minScore = minJevScore(logBag._jevPassScores)
   const fingerprint = reason === 'upstream:flagged_session' ? null : refusalFingerprint(body, inbound)
+  const alreadyKnown = !!(fingerprint && repo?.get?.(fingerprint))
+  // Dual-track anti-over-refusal guard: if JEV scored every question >= 0.85 and
+  // this exact prompt has not failed before, cache the exact fingerprint only
+  // (no global MinHash pollution and no device strike yet).
+  const suspectOverRefusal =
+    !!logBag._jevPassed &&
+    reason === 'upstream:usage_policy' &&
+    minScore !== null &&
+    minScore >= OVER_REFUSAL_SAFE_FLOOR &&
+    !alreadyKnown
+  mergeLogErrorDetails(logBag, {
+    risk_bucket: suspectOverRefusal ? 'policy_suspect' : 'policy',
+    ...(logBag._jevPassed ? { gate_miss: true } : {}),
+    ...jevScoreDetails(logBag._jevPassScores),
+  })
+  if (!policy?.enabled) return reason
   try {
     if (fingerprint)
       repo?.remember?.({
@@ -157,12 +233,12 @@ export function observeUpstreamRisk({ inbound, body, identity, result, logBag, r
         requestId,
         errorMessage: message || reason,
         preview: refusalPreview(body, inbound),
-        signature: refusalPromptSignature(inbound, body),
+        signature: suspectOverRefusal ? null : refusalPromptSignature(inbound, body),
       })
   } catch {
     console.warn('[risk-audit] failed to persist upstream refusal')
   }
-  if (reason !== 'upstream:billing_refusal') {
+  if (reason !== 'upstream:billing_refusal' && !suspectOverRefusal) {
     recordBan({ identity, fingerprint, reason, banDevice: true }, { devices, policy, requestId })
   }
   return reason
@@ -246,12 +322,13 @@ export function commitProtocolBlock(decision, { repo, devices, sessions, policy,
   }
 }
 
-function pass(by, keyword = '', route = null) {
+function pass(by, keyword = '', route = null, extra = null) {
   return {
     action: 'pass',
     route,
     wait: by === 'scope-wait',
     intercept: gateVerdict({ kind: 'pass', by, keyword, route }),
+    ...(extra || {}),
   }
 }
 
@@ -552,12 +629,16 @@ export async function evaluateProtocolIntercept({
       const steps = policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS
       const firstMinutes = Number(steps[0]) > 0 ? Number(steps[0]) : 10
       const error = makePolicyOverloadError({ requestId, retryAfterSec: firstMinutes * 60 })
+      const rootSessionId = refusalSessionId({ inbound, body, headers }) || identity.sessionId || ''
+      const banIdentity = rootSessionId && !identity.sessionId ? { ...identity, sessionId: rootSessionId } : identity
       return reject({
+        identity: banIdentity,
         kind: 'jev',
         via: 'jev',
         final_state: 'policy_blocked',
         error,
         logErrorCode: 'policy_blocked',
+        errorDetails: { reason: `jev:${category}`, ...jevScoreDetails(verdict.scores) },
         errorMessage: `${POLICY_BLOCK_MESSAGE}: ${category}`,
         intercept: gateVerdict({
           kind: 'block',
@@ -592,7 +673,11 @@ export async function evaluateProtocolIntercept({
             ? { kind: backend === 'api' ? 'endpoint' : 'pool', target: routeTarget, score: verdict.score }
             : null
         : null
-    return pass(by, verdict.reason === 'unavailable' ? verdict.detail || '' : '', route)
+    return pass(by, verdict.reason === 'unavailable' ? verdict.detail || '' : '', route, {
+      jevPassed: by === 'jev',
+      jevState: by === 'jev' ? verdict.state || '' : '',
+      jevScores: by === 'jev' ? verdict.scores || null : null,
+    })
   }
 
   return pass(scanned ? 'regex' : 'unchecked')

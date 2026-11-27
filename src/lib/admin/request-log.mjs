@@ -784,9 +784,11 @@ export class RequestLogStore {
       status: extra.status ?? null,
       upstream_status: extra.audit_upstream_400
         ? 400
-        : Number(extra.upstream_status) === 400
-          ? null
-          : (extra.upstream_status ?? null),
+        : Number.isInteger(extra.audit_upstream_error_status) && extra.audit_upstream_error_status >= 400
+          ? extra.audit_upstream_error_status
+          : Number(extra.upstream_status) === 400
+            ? null
+            : (extra.upstream_status ?? null),
       upstream_400_message: extra.audit_upstream_400_message
         ? String(extra.audit_upstream_400_message).slice(0, 300)
         : null,

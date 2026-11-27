@@ -228,6 +228,41 @@ export function upstreamRiskReason(result, phrases = []) {
   return phrases.some((phrase) => text.includes(phrase.trim().toLowerCase())) ? 'upstream:configured_policy' : ''
 }
 
+const AUTH_ACCOUNT_BAN_RE =
+  /\b(?:organization_disabled|account_disabled|account_suspended|account\s+has\s+been\s+(?:disabled|suspended|banned|terminated)|this\s+organization\s+has\s+been\s+disabled)\b/i
+
+/**
+ * Orthogonal post-hop error classifier so risk feedback never confuses protocol
+ * 400s, third-party billing rejections, or auth bans with content refusals.
+ */
+export function classifyUpstreamError(result, phrases = []) {
+  const status = Number(result?.providerResult?.http_status ?? result?.upstreamStatus ?? result?.status) || 0
+  const error = result?.body?.error
+  const text = [
+    error?.type,
+    error?.code,
+    error?.upstream_code,
+    result?.upstreamError?.type,
+    result?.upstreamError?.code,
+    result?.upstreamError?.message,
+    error?.message,
+    result?.body?.message,
+    typeof result?.body === 'string' ? result.body : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+  if (isThirdPartyClientMessage(text)) return { bucket: 'third_party', reason: '', status }
+  const reason = upstreamRiskReason(result, phrases)
+  if (reason) return { bucket: 'policy', reason, status }
+  if ((status === 401 || status === 403) && AUTH_ACCOUNT_BAN_RE.test(text)) {
+    return { bucket: 'auth_suspect', reason: 'upstream:auth_ban_suspect', status }
+  }
+  if (status === 400 || status === 409 || status === 410) {
+    return { bucket: 'protocol', reason: '', status }
+  }
+  return { bucket: 'other', reason: '', status }
+}
+
 function refusalBlockSuffix(match) {
   if (!match || typeof match !== 'object') return null
   if (match.kind === 'device') {

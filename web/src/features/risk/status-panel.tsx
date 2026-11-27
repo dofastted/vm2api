@@ -20,7 +20,13 @@ import {
 import { Panel } from './blocks'
 import { RiskFeed } from './feed'
 import { HitTable } from './hits'
-import { PASS_REASONS, PREFLIGHT_RULES, feedKindOf, share } from './model'
+import {
+  PASS_REASONS,
+  PREFLIGHT_RULES,
+  feedKindOf,
+  share,
+  stageViaFilter,
+} from './model'
 import {
   type GateStats,
   gateStatsQueryOptions,
@@ -40,10 +46,12 @@ export function RiskStatus({
   onLocateRule: (source: string) => void
 }) {
   const client = useQueryClient()
-  const stats = useQuery(gateStatsQueryOptions())
-  const feed = useQuery(riskFeedQueryOptions(stats.data?.since))
-  const upstream400 = useQuery(upstream400QueryOptions(stats.data?.since))
   const [stage, setStage] = useState('all')
+  const stats = useQuery(gateStatsQueryOptions())
+  const feed = useQuery(
+    riskFeedQueryOptions(stats.data?.since, stageViaFilter(stage))
+  )
+  const upstream400 = useQuery(upstream400QueryOptions(stats.data?.since))
   const rows = feed.data?.rows ?? []
   const blocks = (stats.data?.blocks ?? []).filter(
     (row) => stage === 'all' || row.by === stage
@@ -53,7 +61,12 @@ export function RiskStatus({
     return kind !== 'upstream' && (stage === 'all' || kind === stage)
   })
   const upstreamRows = rows.filter(
-    (row) => feedKindOf(row) === 'upstream' && row.upstreamStatus !== 400
+    (row) =>
+      feedKindOf(row) === 'upstream' &&
+      !(
+        row.upstreamStatus != null &&
+        [400, 401, 403, 422].includes(row.upstreamStatus)
+      )
   )
   const refreshing =
     stats.isFetching || feed.isFetching || upstream400.isFetching
@@ -176,12 +189,12 @@ export function RiskStatus({
       </Panel>
 
       <AuditFeed
-        title='上游 HTTP 400'
-        hint='仅列实际上游返回的 400；参数错误不计违规。'
+        title='上游 4xx 错误与风控复核'
+        hint='涵盖上游 400 / 401 / 403 / 422；参数错误记为 protocol 不计违规，高危 401/403 附带 JEV 送审正文与分数。'
         rows={upstream400.data?.logs ?? []}
         loading={stats.isLoading || upstream400.isLoading}
         error={stats.error || upstream400.error}
-        empty='今天没有上游 HTTP 400。'
+        empty='今天没有上游 4xx 风控/错误记录。'
         more={!!upstream400.data?.hasMore}
         onOpen={onOpen}
       />
@@ -247,6 +260,8 @@ function StatusMetrics({ stats }: { stats: GateStats | undefined }) {
       (count, row) => (row.by === 'fail-open' ? count + row.count : count),
       0
     ) ?? 0
+  const upstreamRefusals = stats?.upstreamRefusals ?? 0
+  const riskTotal = (stats?.blocked ?? 0) + upstreamRefusals
   const metrics = [
     { label: '入站', value: stats?.total, icon: LogIn },
     {
@@ -262,6 +277,17 @@ function StatusMetrics({ stats }: { stats: GateStats | undefined }) {
       hint: stats && `占入站 ${share(stats.passed, stats.total)}`,
     },
     {
+      label: '上游漏放',
+      value: stats && upstreamRefusals,
+      icon: CircleAlert,
+      caution: upstreamRefusals > 0,
+      hint:
+        stats &&
+        (riskTotal > 0
+          ? `前置拦截率 ${share(stats.blocked, riskTotal)}`
+          : '暂无风险命中'),
+    },
+    {
       label: '故障放行',
       value: stats && failOpen,
       icon: CircleAlert,
@@ -269,7 +295,7 @@ function StatusMetrics({ stats }: { stats: GateStats | undefined }) {
     },
   ]
   return (
-    <dl className='grid grid-cols-2 gap-px bg-border sm:grid-cols-4'>
+    <dl className='grid grid-cols-2 gap-px bg-border sm:grid-cols-5'>
       {metrics.map(({ label, value, icon: Icon, hint, caution }) => (
         <div key={label} className='min-w-0 space-y-1 bg-card px-4 py-3'>
           <dt className='flex items-center gap-1.5 text-xs text-muted-foreground'>

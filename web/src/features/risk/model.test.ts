@@ -1,5 +1,6 @@
+import type { UsageLogRow } from '@/types/panel-usage-logs'
 import { describe, expect, it } from 'vitest'
-import { riskSearch } from './model'
+import { evidenceOf, riskSearch, stageViaFilter } from './model'
 
 describe('risk audit navigation', () => {
   it.each(['distill', 'hard-regex', 'refusal'])(
@@ -27,5 +28,18 @@ describe('risk audit navigation', () => {
       view: 'preflight',
       rule: 'distill',
     })
+  })
+
+  it('maps refusal_session labels and server-side via filters', () => {
+    expect(stageViaFilter('jev')).toBe('jev')
+    expect(stageViaFilter('distill')).toBe('distill-detect')
+    expect(stageViaFilter('refusal')).toBe('refusal-guard')
+    expect(stageViaFilter('all')).toBeUndefined()
+    expect(
+      evidenceOf({
+        via: 'refusal-guard',
+        finalState: 'refusal_session',
+      } as UsageLogRow)
+    ).toBe('封禁会话')
   })
 })

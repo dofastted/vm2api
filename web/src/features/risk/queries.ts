@@ -26,6 +26,8 @@ export type GateStats = {
   total: number
   blocked: number
   passed: number
+  /** 今日通过前置关卡后仍被上游拒答的漏放请求数。 */
+  upstreamRefusals?: number
   keywords: { keyword: string; count: number }[]
   blocks?: GateRow[]
   passes?: GateRow[]
@@ -53,7 +55,7 @@ export function upstream400QueryOptions(since: string | undefined) {
     queryKey: ['panel', 'risk-upstream-400', since] as const,
     queryFn: async () => {
       const params = new URLSearchParams({
-        upstream_400: '1',
+        upstream_risk_errors: '1',
         include_muted: '1',
         limit: '100',
       })
@@ -68,16 +70,29 @@ export function upstream400QueryOptions(since: string | undefined) {
 /**
  * Blocked and upstream-refused requests since `since`. Gate blocks log as
  * error class `distill` or `refusal`; the upstream's own refusals share
- * `refusal`, so one feed covers both sides of the audit.
+ * `refusal`, so one feed covers both sides of the audit. Passing `via` filters
+ * server-side so repeated banned-device hits cannot drown out JEV / upstream rows.
  */
-export function riskFeedQueryOptions(since: string | undefined) {
+export function riskFeedQueryOptions(since: string | undefined, via?: string) {
   return queryOptions({
-    queryKey: ['panel', 'risk-feed', since] as const,
+    queryKey: ['panel', 'risk-feed', since, via || 'all'] as const,
     queryFn: async (): Promise<RiskFeed> => {
       const pull = (errorClass: string) => {
-        const qs = usageLogFiltersQuery({ errorClass, startTime: since })
+        const qs = usageLogFiltersQuery({
+          errorClass,
+          startTime: since,
+          via: via || undefined,
+        })
         qs.set('limit', '100')
         return api<UsageLogsBatchResult>(`/api/panel/usage-logs?${qs}`)
+      }
+      if (via === 'distill-detect') {
+        const distill = await pull('distill')
+        return { rows: distill.logs, more: distill.hasMore }
+      }
+      if (via) {
+        const refusal = await pull('refusal')
+        return { rows: refusal.logs, more: refusal.hasMore }
       }
       const [distill, refusal] = await Promise.all([
         pull('distill'),

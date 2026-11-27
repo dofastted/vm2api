@@ -4,7 +4,8 @@ import type { GateRow } from './queries'
 const REFUSAL_KEYWORDS: Record<string, string> = {
   exact: '精确指纹',
   similar: '近似正文',
-  device: '封禁 device',
+  device: '封禁设备',
+  session: '封禁会话',
 }
 
 /**

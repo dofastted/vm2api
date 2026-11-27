@@ -581,6 +581,11 @@ export function createHandleProtocol(deps) {
       if (!mandatoryOnly && decision?.intercept) logBag.intercept = decision.intercept
       if (decision?.route) logBag.risk_route = decision.route
       if (!mandatoryOnly) logBag.risk_wait = decision.wait === true
+      if (decision?.jevPassed) {
+        logBag._jevPassed = true
+        if (decision.jevState) logBag._jevPassState = decision.jevState
+        if (decision.jevScores) logBag._jevPassScores = decision.jevScores
+      }
       return false
     }
     stats.errors++
@@ -589,6 +594,9 @@ export function createHandleProtocol(deps) {
     logBag.final_state = decision.final_state
     logBag.error_code = decision.logErrorCode || decision.error?.body?.error?.code || null
     logBag.error_message = decision.errorMessage || decision.error?.body?.error?.message || null
+    if (decision.errorDetails) {
+      logBag.error_details = { ...(logBag.error_details || {}), ...decision.errorDetails }
+    }
     logBag.intercept = decision.intercept || null
     logBag.jev_state = decision.jevState || null
     if (res.headersSent && logBag.protocol === 'anthropic.messages') {

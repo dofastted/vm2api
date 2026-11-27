@@ -649,6 +649,16 @@ export function sanitizeErrorDetailsForLog(rawDetails, { status = null, upstream
   if (blockedBy) out.blocked_by = blockedBy
   const stream = sanitizeErrorToken(src.stream, 32)
   if (stream) out.stream = stream
+  if (typeof src.gate_miss === 'boolean') out.gate_miss = src.gate_miss
+  const riskBucket = sanitizeErrorToken(src.risk_bucket, 32)
+  if (riskBucket) out.risk_bucket = riskBucket
+  const punishment = sanitizeErrorToken(src.punishment, 64)
+  if (punishment) out.punishment = punishment
+  for (const [key, value] of Object.entries(src)) {
+    if (!/^jev_score_[a-z][a-z0-9_-]{0,31}$/.test(key)) continue
+    const num = Number(value)
+    if (Number.isFinite(num) && num >= 0 && num <= 1) out[key] = Math.round(num * 1000) / 1000
+  }
 
   if (!Object.keys(out).length) return null
   if (Buffer.byteLength(JSON.stringify(out), 'utf8') > ERROR_DETAILS_MAX_BYTES) {
@@ -663,6 +673,9 @@ export function sanitizeErrorDetailsForLog(rawDetails, { status = null, upstream
       'recovery_attempts',
       'max_recoveries',
       'recovery_exhausted',
+      'gate_miss',
+      'risk_bucket',
+      'punishment',
     ]) {
       if (Object.hasOwn(out, key)) compact[key] = out[key]
     }

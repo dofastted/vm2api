@@ -1253,7 +1253,7 @@ export class UsageLogsRepo {
     const block = `(
       COALESCE(error_code, '') = 'policy_blocked'
       OR COALESCE(via, '') IN ('hard-regex', 'jev', 'distill-detect', 'refusal-guard')
-      OR COALESCE(final_state, '') IN ('policy_blocked', 'distill_blocked', 'refusal_guard', 'refusal_similar', 'refusal_device')
+      OR COALESCE(final_state, '') IN ('policy_blocked', 'distill_blocked', 'refusal_guard', 'refusal_similar', 'refusal_device', 'refusal_session')
     )`
     const inference = `path IN ('/v1/messages', '/v1/responses', '/v1/chat/completions', '/v1/completions')`
     const row = this.db
@@ -1264,7 +1264,16 @@ export class UsageLogsRepo {
            SUM(CASE WHEN ${inference}
                      AND NOT ${block}
                      AND COALESCE(via, '') != 'warmup-intercept'
-                THEN 1 ELSE 0 END) AS passed
+                THEN 1 ELSE 0 END) AS passed,
+           SUM(CASE WHEN ${inference}
+                     AND NOT ${block}
+                     AND COALESCE(attempt_count, 0) > 0
+                     AND (
+                       COALESCE(error_code, '') IN ('content_filter_refusal', 'refusal_guard')
+                       OR COALESCE(stop_reason, '') = 'refusal'
+                       OR COALESCE(final_state, '') = 'content_filter'
+                     )
+                THEN 1 ELSE 0 END) AS upstream_refusals
          FROM usage_logs
          WHERE created_at >= ?`,
       )
@@ -1303,6 +1312,7 @@ export class UsageLogsRepo {
       total: Number(row?.total || 0),
       blocked: Number(row?.blocked || 0),
       passed: Number(row?.passed || 0),
+      upstreamRefusals: Number(row?.upstream_refusals || 0),
       keywords: collapseBlockKeywords(keywords),
       blocks: folded.blocks,
       passes: folded.passes,

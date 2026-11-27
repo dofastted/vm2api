@@ -103,4 +103,36 @@ describe('SummaryTab structured error diagnostics (#1845)', () => {
     expect(html).toContain('max_recoveries=2')
     expect(html).toContain('recovery_exhausted=false')
   })
+
+  it('renders risk audit card with disguised 429, gate_miss, JEV scores, and device/session', () => {
+    const html = renderToStaticMarkup(
+      <TooltipProvider>
+        <SummaryTab
+          row={baseRow({
+            statusCode: 429,
+            via: 'jev',
+            finalState: 'policy_blocked',
+            errorCode: 'policy_blocked',
+            inboundDeviceId: 'dev-audit-01',
+            clientSessionId: 'sess-audit-01',
+            errorDetails: {
+              gate_miss: true,
+              risk_bucket: 'policy_suspect',
+              jev_score_usage_policy: 0.91,
+              jev_score_abuse: 0.12,
+            },
+          })}
+          scrollToRedirect={false}
+        />
+      </TooltipProvider>
+    )
+    expect(html).toContain('风控与审核裁决')
+    expect(html).toContain('429（伪装负载）')
+    expect(html).toContain('内部裁决 jev')
+    expect(html).toContain('前置放行后上游拒答（漏放）')
+    expect(html).toContain('使用政策: 0.91')
+    expect(html).toContain('破限与攻击: 0.12')
+    expect(html).toContain('dev-audit-01')
+    expect(html).toContain('sess-audit-01')
+  })
 })

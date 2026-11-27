@@ -114,6 +114,18 @@ const REFUSAL_MATCH: Record<string, string> = {
   refusal_guard: '精确指纹',
   refusal_similar: '近似正文',
   refusal_device: '设备或会话封禁',
+  refusal_session: '封禁会话',
+}
+
+const STAGE_TO_VIA: Record<string, string> = {
+  distill: 'distill-detect',
+  'hard-regex': 'hard-regex',
+  refusal: 'refusal-guard',
+  jev: 'jev',
+}
+
+export function stageViaFilter(stage: string): string | undefined {
+  return STAGE_TO_VIA[stage]
 }
 
 /** The part of the stored block message that says why: `nsfw: 关键词`. */
