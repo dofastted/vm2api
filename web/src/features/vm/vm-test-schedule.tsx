@@ -33,8 +33,12 @@ import { TimezonePicker } from '@/features/vm/timezone-picker'
 
 type ScheduleFrequency = 'hourly' | 'daily' | 'weekly'
 
+export type ScheduleMode = 'test' | 'preheat'
+
 export type TestSchedule = {
   enabled: boolean
+  mode?: ScheduleMode | string | null
+  auto_renew?: boolean | null
   frequency: ScheduleFrequency
   minute?: number
   time?: string
@@ -55,8 +59,38 @@ export type TestSchedule = {
 
 export type ScheduleStructure = Pick<
   TestSchedule,
-  'frequency' | 'minute' | 'time' | 'weekdays' | 'timezone'
+  | 'frequency'
+  | 'minute'
+  | 'time'
+  | 'weekdays'
+  | 'timezone'
+  | 'mode'
+  | 'auto_renew'
 >
+
+export function scheduleModeFrom(
+  value: string | null | undefined
+): ScheduleMode {
+  return value === 'preheat' ? 'preheat' : 'test'
+}
+
+export function scheduleAutoRenewFrom(
+  schedule:
+    { mode?: string | null; auto_renew?: boolean | null } | null | undefined
+): boolean {
+  return (
+    scheduleModeFrom(schedule?.mode) === 'preheat' &&
+    schedule?.auto_renew === true
+  )
+}
+
+/** Payload shape for save/sync/default; auto_renew is only true in preheat mode. */
+export function scheduleModePayload(
+  mode: ScheduleMode,
+  autoRenew: boolean
+): { mode: ScheduleMode; auto_renew: boolean } {
+  return { mode, auto_renew: mode === 'preheat' && autoRenew }
+}
 
 type SchedulePayload = { schedule: TestSchedule | null }
 type DefaultPayload = { schedule: ScheduleStructure | null }
@@ -135,6 +169,8 @@ function structureFromSchedule(
 export type FormState = {
   enabled: boolean
   structure: ScheduleStructure
+  mode: ScheduleMode
+  autoRenew: boolean
   model: string
   prompt: string
   maxTokens: number
@@ -158,9 +194,12 @@ export function reconcileSchedule(
 }
 
 function formFrom(schedule: TestSchedule): FormState {
+  const mode = scheduleModeFrom(schedule.mode)
   return {
     enabled: schedule.enabled,
     structure: structureFromSchedule(schedule),
+    mode,
+    autoRenew: scheduleAutoRenewFrom(schedule),
     model: schedule.model,
     prompt: schedule.prompt,
     maxTokens: schedule.max_tokens ?? 0,
@@ -171,8 +210,11 @@ function formFrom(schedule: TestSchedule): FormState {
 
 /** True when the form still shows exactly this stored plan. */
 function formShows(form: FormState, schedule: TestSchedule) {
+  const mode = scheduleModeFrom(schedule.mode)
   return (
     form.enabled === schedule.enabled &&
+    form.mode === mode &&
+    form.autoRenew === scheduleAutoRenewFrom(schedule) &&
     structureEqual(form.structure, structureFromSchedule(schedule)) &&
     form.model === schedule.model &&
     form.prompt.trim() === schedule.prompt &&
@@ -216,6 +258,8 @@ export function VmTestSchedule({
   const base = useRef<TestSchedule | null>(null)
   const [stale, setStale] = useState(false)
   const [enabled, setEnabled] = useState(false)
+  const [scheduleMode, setScheduleMode] = useState<ScheduleMode>('test')
+  const [autoRenew, setAutoRenew] = useState(false)
   const [structure, setStructure] =
     useState<ScheduleStructure>(defaultStructure)
   const [syncOpen, setSyncOpen] = useState(false)
@@ -243,17 +287,22 @@ export function VmTestSchedule({
   const form: FormState = {
     enabled,
     structure,
+    mode: scheduleMode,
+    autoRenew,
     model: selectedModel,
     prompt,
     maxTokens,
     reasoningEffort,
     codex,
   }
+  const modeFields = scheduleModePayload(scheduleMode, autoRenew)
   const adopt = (schedule: TestSchedule) => {
     base.current = schedule
     setStale(false)
     setEnabled(schedule.enabled)
     setStructure(structureFromSchedule(schedule))
+    setScheduleMode(scheduleModeFrom(schedule.mode))
+    setAutoRenew(scheduleAutoRenewFrom(schedule))
     onLoadSchedule(schedule)
   }
 
@@ -264,7 +313,10 @@ export function VmTestSchedule({
       loaded.current = true
       if (schedule) adopt(schedule)
       else if (defaultQuery.data?.schedule) {
-        setStructure(structureFromSchedule(defaultQuery.data.schedule))
+        const template = defaultQuery.data.schedule
+        setStructure(structureFromSchedule(template))
+        setScheduleMode(scheduleModeFrom(template.mode))
+        setAutoRenew(scheduleAutoRenewFrom(template))
       }
       return
     }
@@ -287,6 +339,8 @@ export function VmTestSchedule({
   )
   const dirty = saved
     ? enabled !== saved.enabled ||
+      scheduleMode !== scheduleModeFrom(saved.mode) ||
+      autoRenew !== scheduleAutoRenewFrom(saved) ||
       !savedStructure ||
       !structureEqual(structure, savedStructure) ||
       selectedModel !== saved.model ||
@@ -294,7 +348,10 @@ export function VmTestSchedule({
       (codex
         ? reasoningEffort !== saved.reasoning_effort
         : maxTokens !== saved.max_tokens)
-    : enabled || !structureEqual(structure, defaultStructure())
+    : enabled ||
+      scheduleMode !== 'test' ||
+      autoRenew ||
+      !structureEqual(structure, defaultStructure())
 
   const save = useMutation({
     onMutate: () => qc.cancelQueries({ queryKey }),
@@ -304,6 +361,7 @@ export function VmTestSchedule({
         body: JSON.stringify({
           enabled,
           ...structure,
+          ...modeFields,
           model: selectedModel,
           prompt,
           ...(codex
@@ -318,6 +376,8 @@ export function VmTestSchedule({
         setStale(false)
         setEnabled(data.schedule.enabled)
         setStructure(structureFromSchedule(data.schedule))
+        setScheduleMode(scheduleModeFrom(data.schedule.mode))
+        setAutoRenew(scheduleAutoRenewFrom(data.schedule))
         onPromptChange(data.schedule.prompt)
       }
       toast.success(
@@ -335,6 +395,8 @@ export function VmTestSchedule({
       base.current = null
       setStale(false)
       setEnabled(false)
+      setScheduleMode('test')
+      setAutoRenew(false)
       setStructure(defaultStructure())
       toast.success('测试计划已删除')
     },
@@ -345,7 +407,9 @@ export function VmTestSchedule({
     mutationFn: () =>
       api<DefaultPayload>('/api/panel/test-schedule/default', {
         method: 'PUT',
-        body: JSON.stringify({ schedule: structure }),
+        body: JSON.stringify({
+          schedule: { ...structure, ...modeFields },
+        }),
       }),
     onSuccess: (data) => {
       qc.setQueryData(['panel', 'test-schedule', 'default'], data)
@@ -360,7 +424,7 @@ export function VmTestSchedule({
         body: JSON.stringify({
           scope,
           ...(scope === 'ids' ? { vm_ids: [vm.id] } : {}),
-          schedule: structure,
+          schedule: { ...structure, ...modeFields },
           // "All slots" copies the whole scheduled test, switch included.
           ...(scope === 'all'
             ? {
@@ -368,6 +432,7 @@ export function VmTestSchedule({
                   enabled,
                   model: selectedModel,
                   prompt: prompt.trim(),
+                  ...modeFields,
                   ...(codex
                     ? { reasoning_effort: reasoningEffort }
                     : { max_tokens: maxTokens }),
@@ -572,6 +637,42 @@ export function VmTestSchedule({
                 </div>
               </div>
             ) : null}
+
+            <div className='space-y-1.5 sm:col-span-2'>
+              <Label htmlFor={`vm-test-mode-${vm.id}`}>运行模式</Label>
+              <Select
+                value={scheduleMode}
+                onValueChange={(value: ScheduleMode) => {
+                  setScheduleMode(value)
+                  if (value !== 'preheat') setAutoRenew(false)
+                }}
+              >
+                <SelectTrigger id={`vm-test-mode-${vm.id}`}>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value='test'>定时测试</SelectItem>
+                  <SelectItem value='preheat'>窗口续热</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className='text-xs text-muted-foreground'>
+                续热模式在官方窗口已用尽时发一笔极小真实请求，窗口仍活跃时跳过。
+              </p>
+            </div>
+
+            <div className='space-y-2 sm:col-span-2'>
+              <label className='flex items-center gap-2 text-sm'>
+                <Checkbox
+                  checked={autoRenew}
+                  disabled={scheduleMode !== 'preheat'}
+                  onCheckedChange={(next) => setAutoRenew(next === true)}
+                />
+                5 小时窗口结束后自动续热
+              </label>
+              <p className='text-xs text-muted-foreground'>
+                仅「窗口续热」可启用；关闭后只按上方 cron 触发。
+              </p>
+            </div>
           </div>
 
           <div className='flex flex-wrap items-center gap-2'>
@@ -634,7 +735,10 @@ export function VmTestSchedule({
           {saved ? (
             <div className='space-y-1 text-xs text-muted-foreground'>
               <p>
-                当前计划：{saved.enabled ? '启用' : '暂停'} · {saved.model}
+                当前计划：{saved.enabled ? '启用' : '暂停'} ·{' '}
+                {scheduleModeFrom(saved.mode) === 'preheat' ? '续热' : '测试'} ·{' '}
+                {saved.model}
+                {scheduleAutoRenewFrom(saved) ? ' · 自动续热' : ''}
                 {saved.running ? ' · 运行中' : ''}
               </p>
               <p>下次运行：{formatAt(saved.next_run_at, saved.timezone)}</p>
@@ -664,7 +768,7 @@ export function VmTestSchedule({
           <AlertDialogHeader>
             <AlertDialogTitle>同步调度时间？</AlertDialogTitle>
             <AlertDialogDescription>
-              将把当前表单的调度时间（频率、时刻/分钟、星期、时区）覆盖写入本槽
+              将把当前表单的调度时间（频率、时刻/分钟、星期、时区）及运行模式、自动续热覆盖写入本槽
               {saved ? '' : '（若无计划将创建且保持关闭）'}
               。不会修改 Prompt、模型、token/effort 或启用开关。
             </AlertDialogDescription>
@@ -693,7 +797,7 @@ export function VmTestSchedule({
             <AlertDialogDescription>
               把本槽当前显示的定时测试整个覆盖到你有权限的全部槽（租户仅自己的槽）：
               开关（{enabled ? '启用' : '暂停'}
-              ）、频率、时刻/分钟、星期、时区、模型、Prompt、
+              ）、频率、时刻/分钟、星期、时区、运行模式、自动续热、模型、Prompt、
               {codex ? 'effort' : 'token 上限'}。不用先点保存。
               另一类槽（Claude/Codex 不同）只同步开关和时间，保留自己的模型与
               Prompt。

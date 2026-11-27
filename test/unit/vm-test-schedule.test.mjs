@@ -210,18 +210,149 @@ test('sync overwrites schedule only and creates disabled plans with default dial
   assert.equal(created.reasoning_effort, 'medium')
 })
 
-test('default template persists schedule structure only', () => {
+test('default template persists schedule structure and preheat fields', () => {
   const { schedule } = runner()
   const saved = schedule.saveDefaultTemplate({
     frequency: 'weekly',
     time: '10:15',
     weekdays: [5],
     timezone: 'Asia/Shanghai',
+    mode: 'preheat',
+    auto_renew: true,
   })
   assert.equal(saved.frequency, 'weekly')
+  assert.equal(saved.mode, 'preheat')
+  assert.equal(saved.auto_renew, true)
   assert.deepEqual(schedule.getDefaultTemplate(), saved)
+  assert.throws(
+    () =>
+      schedule.saveDefaultTemplate({
+        frequency: 'daily',
+        time: '08:00',
+        timezone: 'UTC',
+        mode: 'test',
+        auto_renew: true,
+      }),
+    /auto_renew/,
+  )
   schedule.clearDefaultTemplate()
   assert.equal(schedule.getDefaultTemplate(), null)
+})
+
+const syncTime = { frequency: 'daily', time: '09:00', timezone: 'UTC' }
+
+test('sync scope=ids applies explicit mode and auto_renew from the schedule payload', () => {
+  const { settings, schedule } = runner()
+  schedule.save('vm-01', claudeConfig)
+  assert.equal(settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-01`).mode, 'test')
+  schedule.syncSchedules({
+    scope: 'ids',
+    vmIds: ['vm-01'],
+    schedule: { ...syncTime, mode: 'preheat', auto_renew: true },
+  })
+  const stored = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-01`)
+  assert.equal(stored.mode, 'preheat')
+  assert.equal(stored.auto_renew, true)
+})
+
+test('sync scope=all applies explicit preheat mode from the test payload', () => {
+  const { settings, schedule } = runner()
+  schedule.save('vm-01', claudeConfig)
+  schedule.syncSchedules({
+    scope: 'all',
+    schedule: syncTime,
+    test: {
+      enabled: false,
+      model: 'claude-haiku-4-5',
+      prompt: 'hello',
+      max_tokens: 64,
+      mode: 'preheat',
+      auto_renew: true,
+    },
+  })
+  const stored = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-01`)
+  assert.equal(stored.mode, 'preheat')
+  assert.equal(stored.auto_renew, true)
+})
+
+test('sync scope=ids can clear preheat and auto_renew when switching to test', () => {
+  const { settings, schedule } = runner()
+  schedule.save('vm-01', { ...claudeConfig, mode: 'preheat', auto_renew: true })
+  schedule.syncSchedules({
+    scope: 'ids',
+    vmIds: ['vm-01'],
+    schedule: { ...syncTime, mode: 'test', auto_renew: false },
+  })
+  const stored = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-01`)
+  assert.equal(stored.mode, 'test')
+  assert.equal(stored.auto_renew, false)
+})
+
+test('sync scope=all can clear preheat and auto_renew when switching to test', () => {
+  const { settings, schedule } = runner()
+  schedule.save('vm-01', { ...claudeConfig, mode: 'preheat', auto_renew: true })
+  schedule.syncSchedules({
+    scope: 'all',
+    schedule: syncTime,
+    test: {
+      enabled: true,
+      model: 'claude-haiku-4-5',
+      prompt: 'hello',
+      max_tokens: 64,
+      mode: 'test',
+      auto_renew: false,
+    },
+  })
+  const stored = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-01`)
+  assert.equal(stored.mode, 'test')
+  assert.equal(stored.auto_renew, false)
+})
+
+test('sync scope=ids creates a disabled plan with preheat mode when the slot had none', () => {
+  const { settings, schedule } = runner()
+  schedule.syncSchedules({
+    scope: 'ids',
+    vmIds: ['vm-01'],
+    schedule: { ...syncTime, mode: 'preheat', auto_renew: true },
+  })
+  const stored = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-01`)
+  assert.ok(stored)
+  assert.equal(stored.enabled, false)
+  assert.equal(stored.mode, 'preheat')
+  assert.equal(stored.auto_renew, true)
+})
+
+test('sync scope=all copies mode and auto_renew onto another-kind slots while keeping dialog', () => {
+  const codexVm = { id: 'vm-02', platform: 'openai' }
+  const { settings, schedule } = runner({ list: () => [claudeVm, codexVm] })
+  schedule.save('vm-02', {
+    enabled: true,
+    frequency: 'daily',
+    time: '08:00',
+    timezone: 'UTC',
+    model: 'gpt-5.5',
+    prompt: 'codex-own',
+    max_tokens: null,
+    reasoning_effort: 'low',
+    mode: 'test',
+    auto_renew: false,
+  })
+  schedule.syncSchedules({
+    scope: 'all',
+    schedule: syncTime,
+    test: {
+      enabled: true,
+      model: 'claude-haiku-4-5',
+      prompt: 'ping',
+      max_tokens: 32,
+      mode: 'preheat',
+      auto_renew: true,
+    },
+  })
+  const codex = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-02`)
+  assert.equal(codex.mode, 'preheat', 'mode copies to Codex slots like timing and enabled')
+  assert.equal(codex.auto_renew, true)
+  assert.equal(codex.prompt, 'codex-own', 'cross-kind slots keep their own model and prompt')
 })
 
 test('unparseable stored cron surfaces parse_error without exposing cron string', () => {

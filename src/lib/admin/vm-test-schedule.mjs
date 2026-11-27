@@ -34,6 +34,15 @@ const PREHEAT_RENEW_SWEEP_SEC = 60
  * Web saves omit mode/auto_renew; partial sync paths omit them too. Preserve
  * stored preheat settings unless the caller explicitly overrides.
  */
+/** Mode fields carried beside structured schedule; absent keys leave stored values. */
+export function explicitScheduleModeFields(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {}
+  const out = {}
+  if (Object.hasOwn(input, 'mode')) out.mode = input.mode
+  if (Object.hasOwn(input, 'auto_renew')) out.auto_renew = input.auto_renew
+  return out
+}
+
 export function mergeVmTestSchedulePreserve(input, previous = {}) {
   const prev = previous && typeof previous === 'object' && !Array.isArray(previous) ? previous : {}
   const out = { ...(input && typeof input === 'object' ? input : {}) }
@@ -291,6 +300,7 @@ function normalizeSyncTest(test, structure) {
   }
   if (typeof test.enabled !== 'boolean') throw new VmTestScheduleError('test.enabled must be a boolean')
   const codex = test.reasoning_effort != null && String(test.reasoning_effort).trim() !== ''
+  const explicitMode = explicitScheduleModeFields(test)
   const config = normalizeVmTestSchedule(
     {
       enabled: test.enabled,
@@ -299,12 +309,16 @@ function normalizeSyncTest(test, structure) {
       prompt: test.prompt,
       max_tokens: test.max_tokens ?? null,
       reasoning_effort: test.reasoning_effort ?? null,
+      ...explicitMode,
     },
     { platform: codex ? 'openai' : 'anthropic' },
   )
   return {
     enabled: config.enabled,
     codex,
+    explicitMode,
+    mode: config.mode,
+    auto_renew: config.auto_renew,
     dialog: {
       model: config.model,
       prompt: config.prompt,
@@ -471,7 +485,10 @@ export class VmTestScheduleRunner {
     const raw = this._settings().get(VM_TEST_SCHEDULE_DEFAULT_KEY)
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
     try {
-      return normalizeScheduleStructure(raw)
+      const structure = normalizeScheduleStructure(raw)
+      const mode = SCHEDULE_MODES.has(String(raw.mode)) ? String(raw.mode) : 'test'
+      const auto_renew = mode === 'preheat' && raw.auto_renew === true
+      return { ...structure, mode, auto_renew }
     } catch {
       return null
     }
@@ -480,8 +497,15 @@ export class VmTestScheduleRunner {
   saveDefaultTemplate(input) {
     const structure = normalizeScheduleStructure(input)
     compileStructuredSchedule(structure)
-    this._settings().set(VM_TEST_SCHEDULE_DEFAULT_KEY, structure)
-    return structure
+    const mode = input.mode == null ? 'test' : String(input.mode)
+    if (!SCHEDULE_MODES.has(mode)) throw new VmTestScheduleError('mode must be test or preheat')
+    const auto_renew = input.auto_renew === true
+    if (auto_renew && mode !== 'preheat') {
+      throw new VmTestScheduleError('auto_renew requires mode=preheat')
+    }
+    const saved = { ...structure, mode, auto_renew }
+    this._settings().set(VM_TEST_SCHEDULE_DEFAULT_KEY, saved)
+    return saved
   }
 
   clearDefaultTemplate() {
@@ -560,7 +584,7 @@ export class VmTestScheduleRunner {
     return this.get(vmId)
   }
 
-  applyScheduleStructure(vmId, structure, { preserveDialog = true } = {}) {
+  applyScheduleStructure(vmId, structure, { preserveDialog = true, modeSource = null } = {}) {
     if (!isValidVmId(vmId)) throw new VmTestScheduleError('invalid vm id', 'invalid_vm_id')
     const vm = this._vm(vmId)
     if (!vm) throw new VmTestScheduleError('vm not found', 'vm_not_found', 404)
@@ -580,17 +604,9 @@ export class VmTestScheduleRunner {
       dialog = defaultDialogParams(vm)
     }
     const enabled = previous.enabled === true
-    const config = normalizeVmTestSchedule(
-      mergeVmTestSchedulePreserve(
-        {
-          enabled,
-          ...normalized,
-          ...dialog,
-        },
-        previous,
-      ),
-      vm,
-    )
+    const modeOverrides = explicitScheduleModeFields(modeSource)
+    const mergeInput = { enabled, ...normalized, ...dialog, ...modeOverrides }
+    const config = normalizeVmTestSchedule(mergeVmTestSchedulePreserve(mergeInput, previous), vm)
     this._settings().set(keyFor(vmId), {
       ...config,
       enabled,
@@ -632,7 +648,7 @@ export class VmTestScheduleRunner {
         continue
       }
       const hadPlan = !!this._settings().get(keyFor(vmId))
-      this.applyScheduleStructure(vmId, structure, { preserveDialog: hadPlan })
+      this.applyScheduleStructure(vmId, structure, { preserveDialog: hadPlan, modeSource: schedule })
       if (!hadPlan) {
         const stored = this._settings().get(keyFor(vmId))
         if (stored) {
@@ -659,10 +675,10 @@ export class VmTestScheduleRunner {
         reasoning_effort: previous.reasoning_effort ?? null,
       }
     } else dialog = defaultDialogParams(vm)
-    const config = normalizeVmTestSchedule(
-      mergeVmTestSchedulePreserve({ enabled: full.enabled, ...structure, ...dialog }, previous),
-      vm,
-    )
+    const mergeInput = { enabled: full.enabled, ...structure, ...dialog }
+    if (Object.hasOwn(full.explicitMode, 'mode')) mergeInput.mode = full.mode
+    if (Object.hasOwn(full.explicitMode, 'auto_renew')) mergeInput.auto_renew = full.auto_renew
+    const config = normalizeVmTestSchedule(mergeVmTestSchedulePreserve(mergeInput, previous), vm)
     this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
     if (this.started) this._syncJob(vmId, config)
   }
