@@ -1254,6 +1254,9 @@ const responsesWs = createResponsesWsHandler({
   json,
   getRouting: () => routingConfig,
   maxBodyBytes: cfg.limits.max_body_bytes,
+  cfg,
+  accountQuota,
+  apiKeyStore,
 })
 
 /**
@@ -1519,6 +1522,7 @@ const handleGeminiPublic = createGeminiPublicHandler({
   apiKeyStore,
   getRoutingConfig: () => routingConfig,
   getHealthMonitor: () => healthMonitor,
+  cfg,
 })
 const integrationTokenStore = new IntegrationTokenStore()
 const handlePanel = createPanelHandler({

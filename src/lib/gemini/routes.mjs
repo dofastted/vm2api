@@ -36,6 +36,12 @@ import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 import { createGeminiSlotPrefs, parseGeminiDisplayName, parseGeminiScheduleLevel } from './slot-prefs.mjs'
 import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
 import { compileWithProtoFront, protoFrontMode } from '../transport/proto-front-client.mjs'
+import {
+  clientBlockErrorOf,
+  isTrustedGateDecision,
+  resolveRiskRepos,
+  runUnifiedPreDispatch,
+} from '../protocol/unified-pre-dispatch.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
 const PUBLIC_PATH = '/v1/gemini/sessions'
@@ -2065,6 +2071,12 @@ export function createGeminiPublicHandler({
   apiKeyStore = null,
   getRoutingConfig = null,
   getHealthMonitor = null,
+  cfg = null,
+  settings = null,
+  refusalGuards = null,
+  refusalDevices = null,
+  refusalSessions = null,
+  preDispatch = null,
 }) {
   const geminiScopeFromReq = (req) => {
     const rec = req?.apiKeyRecord || null
@@ -2087,7 +2099,12 @@ export function createGeminiPublicHandler({
   return async function handleGeminiPublic(
     req,
     res,
-    { logBag: externalLogBag = null, logCtx: externalLogCtx = null, catalogSnapshot = null } = {},
+    {
+      logBag: externalLogBag = null,
+      logCtx: externalLogCtx = null,
+      catalogSnapshot = null,
+      preDispatchDecision = null,
+    } = {},
   ) {
     res.setHeader('Cache-Control', 'no-store')
     const keyGroupType = req.apiKeyKind === 'managed' ? req.apiKeyRecord?.group_type || 'all' : null
@@ -2374,6 +2391,64 @@ export function createGeminiPublicHandler({
         denied.status,
         protocolErrorBody(protocol, denied.status, denied.body.error.code, denied.body.error.message),
       )
+    }
+
+    // Bypasses #1-#4 closed: every public Gemini inference call must clear the
+    // unified pre-dispatch JEV gate BEFORE any Gemini account/slot reservation.
+    const existingDecision = preDispatchDecision || req._preDispatchDecision || null
+    let gateDecision = isTrustedGateDecision(existingDecision) ? existingDecision : null
+    if (!gateDecision) {
+      const riskState = resolveRiskRepos({ settings, refusalGuards, refusalDevices, refusalSessions })
+      const preDispatchInput = {
+        req,
+        inbound: body,
+        body:
+          body && typeof body === 'object' && !Array.isArray(body) && targetModel && !body.model
+            ? { ...body, model: targetModel }
+            : body,
+        headers: req.headers,
+        distillRules: cfg?.distill,
+        policy: riskState.policy,
+        settings,
+        repo: riskState.repo,
+        devices: riskState.devices,
+        sessions: riskState.sessions,
+        requestId: activeLogCtx?.request_id || '',
+        poolJevProfile: req.poolJevProfile || req.apiKeyRecord?.jev_profile || null,
+        channel: 'gemini',
+        enforceHardAndJev: true,
+        backend: 'oauth',
+        openaiPlatform: false,
+      }
+      gateDecision =
+        typeof preDispatch === 'function'
+          ? await preDispatch(preDispatchInput)
+          : await runUnifiedPreDispatch(preDispatchInput)
+    }
+    if (gateDecision?.action === 'block') {
+      logBag.via = gateDecision.via || 'jev'
+      logBag.attempt_count = 0
+      logBag.final_state = gateDecision.final_state || 'policy_blocked'
+      logBag.error_code = gateDecision.error_code || 'policy_blocked'
+      logBag.error_message = gateDecision.message || '请求被协议拦截'
+      if (gateDecision.error_details) {
+        logBag.error_details = { ...(logBag.error_details || {}), ...gateDecision.error_details }
+      }
+      logBag.intercept = gateDecision.intercept || null
+      logBag.jev_state = gateDecision.jev_state || null
+      const retryAfter = gateDecision.retry_after_sec || gateDecision.error?.retryAfterSec
+      if (retryAfter) res.setHeader?.('Retry-After', String(retryAfter))
+      const clientErr = clientBlockErrorOf(gateDecision)
+      return respondJson(
+        clientErr.status,
+        protocolErrorBody(protocol, clientErr.status, clientErr.code, clientErr.message, clientErr.details),
+      )
+    }
+    if (gateDecision?.intercept && !logBag.intercept) logBag.intercept = gateDecision.intercept
+    if (gateDecision?.jev_passed) {
+      logBag._jevPassed = true
+      if (gateDecision.jev_state) logBag._jevPassState = gateDecision.jev_state
+      if (gateDecision.scores) logBag._jevPassScores = gateDecision.scores
     }
 
     const healthMonitor = typeof getHealthMonitor === 'function' ? getHealthMonitor() : null

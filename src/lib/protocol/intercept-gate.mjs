@@ -380,6 +380,53 @@ function hardPolicyError(requestId, code, message, details = {}) {
   })
 }
 
+export const JEV_PROFILES = Object.freeze(['inherit_global', 'enforce', 'downgrade_only', 'bypass_trusted'])
+
+export function normalizeJevProfile(value) {
+  const raw = String(value || '')
+    .trim()
+    .toLowerCase()
+  return JEV_PROFILES.includes(raw) ? raw : 'inherit_global'
+}
+
+/**
+ * Resolve pre-dispatch scope statically so requests never wait for slot
+ * reservation (`scope-wait`) before running JEV.
+ */
+function resolvePreDispatchOutside({
+  jev,
+  jevProfile,
+  scopeMatched,
+  openaiPlatform,
+  enforceHardAndJev,
+  account,
+  candidateAccounts,
+  routeConfigured,
+}) {
+  if (jevProfile === 'bypass_trusted') return 'trusted'
+  if (jevProfile === 'enforce') return ''
+  if (scopeMatched) return ''
+  if (enforceHardAndJev) return ''
+  const scopePlatform = openaiPlatform ? 'gpt' : 'claude'
+  if (jevScopeConfigured(jev)) {
+    if (account) return jevAccountInScope(jev, account) ? '' : 'scope'
+    if (Array.isArray(candidateAccounts) && candidateAccounts.length > 0) {
+      return candidateAccounts.some((cand) => jevAccountInScope(jev, cand)) ? '' : 'scope'
+    }
+    if (routeConfigured) return ''
+    return jevScopeWaits(jev, scopePlatform) ? '' : 'scope'
+  }
+  if (openaiPlatform && jev?.openai_platform_enabled !== true) return 'platform'
+  return ''
+}
+
+function buildDowngradeRoute(audit, backend, score = null) {
+  const routeTarget = backend === 'api' ? audit?.downgrade_endpoint : audit?.downgrade_pool
+  if (audit?.downgrade_model) return { kind: 'model', target: audit.downgrade_model, score }
+  if (routeTarget) return { kind: backend === 'api' ? 'endpoint' : 'pool', target: routeTarget, score }
+  return null
+}
+
 /**
  * Does not write. `commitProtocolBlock` records hits and violations.
  */
@@ -400,6 +447,11 @@ export async function evaluateProtocolIntercept({
   requestId,
   account = null,
   scopeMatched = false,
+  candidateAccounts = null,
+  jevProfile = 'inherit_global',
+  preDispatch = false,
+  skipDistill = false,
+  enforceHardAndJev = false,
   fetchImpl,
   bodyCtx = null,
   interceptSession = null,
@@ -409,6 +461,7 @@ export async function evaluateProtocolIntercept({
   skipMandatory = false,
   now = Date.now(),
 } = {}) {
+  const profile = normalizeJevProfile(jevProfile)
   const audit = policy?.risk_audit
   const isAutoModeClassifier = classifier?.purpose === 'auto_mode_classifier'
   const rootSessionId = refusalSessionId({ inbound, body, headers }) || identity.sessionId || ''
@@ -504,7 +557,18 @@ export async function evaluateProtocolIntercept({
   const routeTarget = backend === 'api' ? audit?.downgrade_endpoint : audit?.downgrade_pool
   const routeConfigured = !!(jev?.enabled && (routeTarget || audit?.downgrade_model))
   let outside = ''
-  if (!scopeMatched && openaiPlatform) {
+  if (preDispatch || profile !== 'inherit_global' || enforceHardAndJev) {
+    outside = resolvePreDispatchOutside({
+      jev,
+      jevProfile: profile,
+      scopeMatched,
+      openaiPlatform,
+      enforceHardAndJev,
+      account,
+      candidateAccounts,
+      routeConfigured,
+    })
+  } else if (!scopeMatched && openaiPlatform) {
     if (!jevScopeConfigured(jev)) {
       if (jev?.openai_platform_enabled !== true) outside = 'platform'
     } else if (!jevScopeWaits(jev, 'gpt')) {
@@ -521,7 +585,8 @@ export async function evaluateProtocolIntercept({
   const hardEnabled = !mandatoryOnly && !outside
   let scanned = false
   if (hardEnabled) {
-    const distill = openaiPlatform ? null : detectDistill({ inbound, body, official, zeroInject }, distillRules)
+    const distill =
+      openaiPlatform || skipDistill ? null : detectDistill({ inbound, body, official, zeroInject }, distillRules)
     if (distill?.action === 'block') {
       const evidence = (distill.hits || [])
         .map((item) => item.evidence || item.rule)
@@ -543,7 +608,7 @@ export async function evaluateProtocolIntercept({
       stripReminders: jev?.strip_reminders !== false,
       expandBase64: jev?.expand_base64 !== false,
     })
-    const distillOn = distillRules?.enabled !== false
+    const distillOn = distillRules?.enabled !== false && !skipDistill
     const hardOn = jev?.hard_regex_enabled !== false
     const rules = hardRulesFor(jev, distillOn, openaiPlatform)
     const extra = hardOn ? jev?.patterns : []
@@ -667,6 +732,17 @@ export async function evaluateProtocolIntercept({
         })
       }
       const category = verdict.category || 'safety'
+      if (profile === 'downgrade_only') {
+        const downgradeRoute = buildDowngradeRoute(audit, backend, verdict.score ?? null)
+        if (downgradeRoute) {
+          return pass('jev-downgrade', category, downgradeRoute, {
+            jevPassed: false,
+            jevState: verdict.state || '',
+            jevScores: verdict.scores || null,
+            downgradeReason: `jev:${category}`,
+          })
+        }
+      }
       const escalateBan = shouldEscalateJevBan(verdict, jev)
       const steps = policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS
       const firstMinutes = Number(steps[0]) > 0 ? Number(steps[0]) : 10
