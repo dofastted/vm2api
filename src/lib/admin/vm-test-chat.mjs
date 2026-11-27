@@ -679,6 +679,17 @@ function extractResponsesText(body) {
   return parts.join('')
 }
 
+function strictFailureFromResponseStatus(status) {
+  if (status === 'completed') return null
+  if (status === 'incomplete') {
+    return { code: 'response_incomplete', message: 'upstream response status=incomplete' }
+  }
+  if (status === undefined || status === null || status === '') {
+    return { code: 'no_terminal_event', message: 'response.completed missing status=completed' }
+  }
+  return { code: 'response_not_completed', message: `upstream response status=${status}` }
+}
+
 function terminalResponsesFailure(code, message, partial = {}) {
   return {
     ok: false,
@@ -779,12 +790,12 @@ export async function consumeResponsesResponse(res, { requireTerminal = false } 
       if (ev.response.usage) usage = ev.response.usage
       const completed = extractResponsesText(ev.response)
       if (completed && !text) text = completed
-      stopReason = ev.response.status || 'completed'
+      const rawStatus = ev.response.status
+      stopReason = rawStatus || 'completed'
       if (requireTerminal) {
-        if (ev.response.status === 'completed') sawCompletedTerminal = true
-        else if (ev.response.status === 'incomplete') {
-          terminalFail = { code: 'response_incomplete', message: 'upstream response completed with status=incomplete' }
-        }
+        const fail = strictFailureFromResponseStatus(rawStatus)
+        if (fail) terminalFail = fail
+        else sawCompletedTerminal = true
       }
       return
     }

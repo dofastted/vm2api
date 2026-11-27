@@ -89,6 +89,54 @@ test('consumeResponsesResponse strict: response.incomplete fails', async () => {
   assert.equal(res.body?.error?.code, 'response_incomplete')
 })
 
+for (const [status, code] of [
+  ['failed', 'response_not_completed'],
+  ['cancelled', 'response_not_completed'],
+  ['incomplete', 'response_incomplete'],
+  [undefined, 'no_terminal_event'],
+]) {
+  test(`consumeResponsesResponse strict: response.completed status=${String(status)} fails as ${code}`, async () => {
+    const res = await consumeResponsesResponse(
+      sseResponse([
+        {
+          type: 'response.completed',
+          response: { id: 'r-bad', status, output_text: 'x' },
+        },
+      ]),
+      { requireTerminal: true },
+    )
+    assert.equal(res.ok, false)
+    assert.equal(res.body?.error?.code, code)
+  })
+}
+
+test('consumeResponsesResponse strict: non-streaming JSON status=failed', async () => {
+  const res = await consumeResponsesResponse(
+    await jsonResponse(200, { id: 'r1', status: 'failed', output_text: 'nope' }),
+    { requireTerminal: true },
+  )
+  assert.equal(res.ok, false)
+  assert.equal(res.body?.error?.code, 'response_not_completed')
+})
+
+test('consumeResponsesResponse strict: response.done only is not a terminal (no_terminal_event)', async () => {
+  const res = await consumeResponsesResponse(
+    sseResponse([{ type: 'response.done', response: { id: 'r-done', status: 'completed' } }]),
+    { requireTerminal: true },
+  )
+  assert.equal(res.ok, false)
+  assert.equal(res.body?.error?.code, 'no_terminal_event')
+})
+
+test('consumeResponsesResponse legacy: response.incomplete keeps ok but stop_reason=incomplete', async () => {
+  const res = await consumeResponsesResponse(
+    sseResponse([{ type: 'response.incomplete', response: { id: 'r-inc', status: 'incomplete' } }]),
+    { requireTerminal: false },
+  )
+  assert.equal(res.ok, true)
+  assert.equal(res.stop_reason, 'incomplete')
+})
+
 test('consumeResponsesResponse strict: completed terminal succeeds', async () => {
   const res = await consumeResponsesResponse(
     sseResponse([
@@ -190,6 +238,56 @@ test('runVmTestChat requireCodexTerminal rejects 200 JSON without status', async
   assert.equal(strict.ok, false)
   assert.equal(strict.error?.code, 'no_terminal_event')
   assert.equal(loose.ok, true)
+})
+
+test('runVmTestChat requireCodexTerminal applies strict check after OAuth refresh retry', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-term-oauth-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  seedCodexVm(root)
+  fs.mkdirSync(path.join(root, 'src', 'config'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'src', 'config', 'routing.json'), '{}')
+  let hits = 0
+  const baseUrl = await startCodexLoopback(t, () => {
+    hits += 1
+    if (hits === 1) {
+      return {
+        status: 502,
+        body: {
+          error: {
+            type: 'api_error',
+            code: 'upstream_transport',
+            message: 'HTTP error: 401 Unauthorized',
+          },
+        },
+      }
+    }
+    return {
+      status: 200,
+      body: { id: 'after-refresh', output_text: 'still-no-status' },
+    }
+  })
+  const result = await runVmTestChat({
+    projectRoot: root,
+    vmId: 'vm-codex-terminal',
+    model: 'gpt-5.4',
+    prompt: 'hello',
+    baseUrl,
+    apiKey: 'test-master-key',
+    requireCodexTerminal: true,
+    fetchImpl: async (url) => {
+      if (String(url).includes('/oauth/token')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ access_token: 'at-new', refresh_token: 'rt-new', expires_in: 60 }),
+        }
+      }
+      throw new Error(`unexpected fetch ${url}`)
+    },
+  })
+  assert.equal(hits, 2, 'OAuth refresh must retry loopback once')
+  assert.equal(result.ok, false)
+  assert.equal(result.error?.code, 'no_terminal_event')
 })
 
 test('VmTestScheduleRunner passes requireCodexTerminal for preheat only', async () => {
