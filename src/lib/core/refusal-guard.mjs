@@ -27,7 +27,7 @@ export const REFUSAL_DEVICE_BLOCK_SETTING = 'refusal_device_block_enabled'
 export const REFUSAL_SESSION_BLOCK_SETTING = 'refusal_session_block_enabled'
 export const REFUSAL_SIMILARITY_CHOICES = Object.freeze([80, 85, 90, 95])
 export const RISK_AUDIT_SETTING = 'risk_audit_policy'
-export const DEFAULT_BAN_STEPS = Object.freeze([10, 1440, 0])
+export const DEFAULT_BAN_STEPS = Object.freeze([10, 10, 0])
 const DEFAULT_RISK_POLICY = Object.freeze({
   ban_steps: DEFAULT_BAN_STEPS,
   blocked_tools: [],
@@ -228,6 +228,41 @@ export function upstreamRiskReason(result, phrases = []) {
   return phrases.some((phrase) => text.includes(phrase.trim().toLowerCase())) ? 'upstream:configured_policy' : ''
 }
 
+const AUTH_ACCOUNT_BAN_RE =
+  /\b(?:organization_disabled|account_disabled|account_suspended|account\s+has\s+been\s+(?:disabled|suspended|banned|terminated)|this\s+organization\s+has\s+been\s+disabled)\b/i
+
+/**
+ * Orthogonal post-hop error classifier so risk feedback never confuses protocol
+ * 400s, third-party billing rejections, or auth bans with content refusals.
+ */
+export function classifyUpstreamError(result, phrases = []) {
+  const status = Number(result?.providerResult?.http_status ?? result?.upstreamStatus ?? result?.status) || 0
+  const error = result?.body?.error
+  const text = [
+    error?.type,
+    error?.code,
+    error?.upstream_code,
+    result?.upstreamError?.type,
+    result?.upstreamError?.code,
+    result?.upstreamError?.message,
+    error?.message,
+    result?.body?.message,
+    typeof result?.body === 'string' ? result.body : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+  if (isThirdPartyClientMessage(text)) return { bucket: 'third_party', reason: '', status }
+  const reason = upstreamRiskReason(result, phrases)
+  if (reason) return { bucket: 'policy', reason, status }
+  if ((status === 401 || status === 403) && AUTH_ACCOUNT_BAN_RE.test(text)) {
+    return { bucket: 'auth_suspect', reason: 'upstream:auth_ban_suspect', status }
+  }
+  if (status === 400 || status === 409 || status === 410) {
+    return { bucket: 'protocol', reason: '', status }
+  }
+  return { bucket: 'other', reason: '', status }
+}
+
 function refusalBlockSuffix(match) {
   if (!match || typeof match !== 'object') return null
   if (match.kind === 'device') {
@@ -258,6 +293,14 @@ function refusalBlockSuffix(match) {
     }
   }
   if (match.kind === 'session') {
+    const jevBlocked = String(match.row?.reason || '').startsWith('jev:')
+    if (jevBlocked) {
+      return {
+        message: '此会话已封禁，请开启新会话。',
+        standalone: true,
+        details: { reason: 'session', ban_reason: String(match.row.reason).slice(0, 80) },
+      }
+    }
     return {
       message: ' 这个会话此前被上游拒答，已永久停止转发；请开启新会话。',
       details: { reason: 'session' },
@@ -403,10 +446,10 @@ function validateRiskPolicy(policy) {
         !Number.isInteger(minutes) ||
         minutes < 0 ||
         minutes > 525600 ||
-        (index < steps.length - 1 && (minutes === 0 || (index > 0 && minutes <= steps[index - 1]))),
+        (index < steps.length - 1 && (minutes === 0 || (index > 0 && minutes < steps[index - 1]))),
     )
   ) {
-    problems.push('封禁阶梯必须为递增的整数分钟，末项为 0（永久），最多十级')
+    problems.push('封禁阶梯必须为非递减的整数分钟，末项为 0（永久），最多十级')
   }
   if (
     !Array.isArray(policy.blocked_tools) ||

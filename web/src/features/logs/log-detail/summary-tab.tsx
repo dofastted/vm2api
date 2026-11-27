@@ -12,6 +12,7 @@ import {
   InfoIcon,
   Monitor,
   Settings2,
+  ShieldAlert,
   Zap,
 } from 'lucide-react'
 import {
@@ -109,6 +110,143 @@ function Cost({ value }: { value: number | null | undefined }) {
     <span className='ml-3 text-muted-foreground'>
       {formatCurrency(value, 6)}
     </span>
+  )
+}
+
+const JEV_QUESTION_LABELS: Record<string, string> = {
+  usage_policy: '使用政策',
+  nsfw: '色情',
+  abuse: '破限与攻击',
+  custom: '自定义',
+  safety: '综合',
+}
+
+const RISK_BUCKET_LABELS: Record<string, string> = {
+  policy: '上游政策拒答',
+  policy_suspect: '疑似上游误拒（仅精确指纹）',
+  third_party: '第三方客户端拒绝',
+  protocol: '协议参数错误',
+  auth_suspect: '高危账号 401/403 待复核',
+}
+
+function extractJevScores(details: UsageLogRow['errorDetails']) {
+  if (!details) return []
+  const items: { id: string; label: string; score: number }[] = []
+  for (const [key, value] of Object.entries(details)) {
+    if (!key.startsWith('jev_score_')) continue
+    const num = Number(value)
+    if (!Number.isFinite(num)) continue
+    const id = key.slice('jev_score_'.length)
+    items.push({ id, label: JEV_QUESTION_LABELS[id] || id, score: num })
+  }
+  return items
+}
+
+function RiskAuditCard({ row }: { row: UsageLogRow }) {
+  const details = row.errorDetails || {}
+  const jevScores = extractJevScores(details)
+  const riskVia = [
+    'jev',
+    'hard-regex',
+    'distill-detect',
+    'refusal-guard',
+  ].includes(row.via || '')
+  const riskBucket =
+    typeof details.risk_bucket === 'string' ? details.risk_bucket : null
+  const gateMiss = details.gate_miss === true
+  const hasRisk =
+    riskVia ||
+    !!row.jevState ||
+    row.intercept?.kind === 'block' ||
+    gateMiss ||
+    !!riskBucket ||
+    jevScores.length > 0
+  if (!hasRisk) return null
+  const disguised429 =
+    row.statusCode === 429 && (row.via === 'jev' || row.via === 'refusal-guard')
+
+  return (
+    <div className='space-y-2'>
+      <SectionTitle icon={ShieldAlert} color='text-amber-600'>
+        风控与审核裁决
+      </SectionTitle>
+      <div className='space-y-2.5 rounded-lg border bg-amber-50/60 p-3 text-xs dark:bg-amber-950/20'>
+        <div className='flex flex-wrap items-center gap-1.5'>
+          <Badge variant='outline' className='font-mono text-[10px]'>
+            对外状态{' '}
+            {disguised429
+              ? '429（伪装负载）'
+              : row.statusCode != null
+                ? `HTTP ${row.statusCode}`
+                : '—'}
+          </Badge>
+          {row.via ? (
+            <Badge variant='outline' className='font-mono text-[10px]'>
+              内部裁决 {row.via}
+            </Badge>
+          ) : null}
+          {row.finalState ? (
+            <Badge variant='outline' className='font-mono text-[10px]'>
+              终态 {row.finalState}
+            </Badge>
+          ) : null}
+          {gateMiss ? (
+            <Badge
+              variant='outline'
+              className='border-rose-400 text-[10px] text-rose-700 dark:text-rose-300'
+            >
+              前置放行后上游拒答（漏放）
+            </Badge>
+          ) : null}
+          {riskBucket ? (
+            <Badge variant='outline' className='text-[10px]'>
+              {RISK_BUCKET_LABELS[riskBucket] || riskBucket}
+            </Badge>
+          ) : null}
+        </div>
+        {jevScores.length > 0 ? (
+          <div className='space-y-1'>
+            <p className='text-[11px] text-muted-foreground'>
+              JEV 题目安全分（越低越危险）
+            </p>
+            <div className='flex flex-wrap gap-1.5'>
+              {jevScores.map((item) => (
+                <Badge
+                  key={item.id}
+                  variant='outline'
+                  className={cn(
+                    'font-mono text-[11px] tabular-nums',
+                    item.score < 0.5
+                      ? 'border-rose-400 bg-rose-500/10 text-rose-700 dark:text-rose-300'
+                      : item.score < 0.85
+                        ? 'border-amber-400 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+                        : 'border-emerald-400 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                  )}
+                >
+                  {item.label}: {item.score.toFixed(2)}
+                </Badge>
+              ))}
+            </div>
+          </div>
+        ) : null}
+        {row.inboundDeviceId || row.clientSessionId ? (
+          <div className='grid gap-1 border-t border-amber-200/70 pt-2 text-[11px] text-muted-foreground sm:grid-cols-2 dark:border-amber-800/50'>
+            <div className='min-w-0 break-all'>
+              入站设备：
+              <code className='font-mono text-foreground'>
+                {row.inboundDeviceId || '未提供'}
+              </code>
+            </div>
+            <div className='min-w-0 break-all'>
+              入站会话：
+              <code className='font-mono text-foreground'>
+                {row.clientSessionId || '未提供'}
+              </code>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </div>
   )
 }
 
@@ -651,6 +789,7 @@ export function SummaryTab({
           </div>
         </div>
       ) : null}
+      <RiskAuditCard row={row} />
       {row.jevState ? (
         <div className='space-y-2'>
           <SectionTitle icon={AlertCircle} color='text-amber-600'>

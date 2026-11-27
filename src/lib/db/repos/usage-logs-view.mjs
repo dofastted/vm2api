@@ -46,6 +46,7 @@ const BLOCKED_STATES = {
   refusal_guard: 'refusal_guard',
   refusal_similar: 'refusal_guard',
   refusal_device: 'refusal_guard',
+  refusal_session: 'refusal_guard',
   policy_blocked: 'policy',
 }
 
@@ -245,6 +246,7 @@ export function toUsageLogRow(row, names, chain = []) {
     inboundDeviceId: row.inbound_device_id ?? null,
     upstreamStatus: nullableNum(row.upstream_status),
     upstream400Message: row.upstream_400_message ?? null,
+    intercept: parseErrorDetails(row.intercept),
     jevState: row.jev_state || null,
     errorClass: row.error_class ?? null,
     errorLabel: row.error_label ?? null,
@@ -360,7 +362,10 @@ function buildFilter(filters, defaultMuted) {
   }
   eq('path', filters.endpoint)
   eq('protocol', filters.protocol)
-  if (filters.upstream_400) where.push('upstream_status = 400')
+  eq('via', filters.via)
+  eq('final_state', filters.final_state)
+  if (filters.upstream_risk_errors) where.push('upstream_status IN (400, 401, 403, 422)')
+  else if (filters.upstream_400) where.push('upstream_status = 400')
   eq('request_id', filters.request_id)
   if (filters.account_id) {
     where.push('(account_id = ? OR final_account_id = ?)')

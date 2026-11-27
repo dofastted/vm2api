@@ -101,6 +101,27 @@ describe('agent standing + system preview', () => {
     }
   })
 
+  it('keeps usage passthrough off by default and stores it per preset', () => {
+    for (const key of PERSONA_PRESETS)
+      expect(presetFlagEnabled({}, 'usage_passthrough_presets', key)).toBe(
+        false
+      )
+    const enabled = setPresetFlag(
+      {},
+      'usage_passthrough_presets',
+      'zero',
+      true,
+      {}
+    )
+    expect(enabled.usage_passthrough_presets).toEqual({
+      official: false,
+      official_full: false,
+      zero: true,
+      custom: false,
+      official_303: false,
+    })
+  })
+
   // d917dd2a: zero is the billing header only; billing never shows in the preview.
   it('zero previews no system blocks and standing defaults off in the official harness', () => {
     const zero = previewSystemBlocks(DEFAULT_PERSONA_TEMPLATES.zero, {

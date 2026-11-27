@@ -10,6 +10,7 @@ import { observeUpstreamRisk, runProtocolIntercept, systemRewrite } from '../../
 import {
   REFUSAL_GUARD_MESSAGE,
   REFUSAL_GUARD_SETTING,
+  classifyUpstreamError,
   isRefusalGuardEnabled,
   isUpstreamRefusal,
   refusalFingerprint,
@@ -58,8 +59,8 @@ test('strikes escalate after expiry; offending sessions stay blocked and device 
     assert.equal(devices.findBan(next, start + 600_000), null)
     const escalated = devices.recordViolation(next, { steps, now: start + 600_000 })
     assert.equal(escalated.violations, 2)
-    assert.equal(escalated.expires_at, '2026-11-18T00:10:00.000Z')
-    const permanent = devices.recordViolation(third, { steps, now: start + 600_000 + 86_400_000 })
+    assert.equal(escalated.expires_at, '2026-11-17T00:20:00.000Z')
+    const permanent = devices.recordViolation(third, { steps, now: start + 1_200_000 })
     assert.equal(permanent.violations, 3)
     assert.equal(permanent.expires_at, null)
     assert.equal(devices.findBan({ ...third, principal: 'user:b' }), null)
@@ -345,6 +346,7 @@ test('policy editor rejects ambiguous keywords and invalid punishments before wr
     false,
   )
   assert.equal(saved.size, 0)
+  assert.equal(applyRefusalGuardPatch(saved, { risk_audit: { ...policy, ban_steps: [10, 10, 0] } }).ok, true)
   assert.equal(applyRefusalGuardPatch(saved, { risk_audit: { ...policy, ban_steps: [5, 30, 60, 0] } }).ok, true)
   assert.equal(
     applyRefusalGuardPatch(saved, { risk_audit: { ...policy, block_system_prompt_rewrite: false } }).ok,
@@ -690,6 +692,116 @@ test('nsfw hard regex evidence still forces a device ban', async () => {
     assert.equal(blocked.action, 'block')
     const identity = refusalAuditIdentity({ inbound })
     assert.ok(devices.findBan(identity), 'explicit content still bans the device regardless of the panel switch')
+  } finally {
+    db.close()
+  }
+})
+
+test('classifyUpstreamError separates policy, third-party, protocol, and auth_suspect buckets', () => {
+  assert.equal(
+    classifyUpstreamError({ status: 400, body: { error: { message: 'violates our Usage Policy' } } }).bucket,
+    'policy',
+  )
+  assert.equal(
+    classifyUpstreamError({
+      status: 400,
+      body: { error: { message: 'Third-party apps now draw from your extra usage' } },
+    }).bucket,
+    'third_party',
+  )
+  assert.equal(
+    classifyUpstreamError({ status: 400, body: { error: { message: 'cache_control limit exceeded' } } }).bucket,
+    'protocol',
+  )
+  assert.equal(
+    classifyUpstreamError({
+      status: 401,
+      body: { error: { type: 'authentication_error', message: 'This organization has been disabled' } },
+    }).bucket,
+    'auth_suspect',
+  )
+})
+
+test('observeUpstreamRisk promotes gate-miss JEV evidence and guards MinHash against ultra-safe over-refusals', () => {
+  const db = createDatabase({ dbPath: ':memory:' })
+  try {
+    const devices = new RefusalDeviceBlocksRepo(db)
+    const repo = new RefusalGuardsRepo(db)
+    const policy = refusalGuardPolicy()
+    const identity = { deviceId: 'dev-over-refusal-01', sessionId: 'sess-over-01', principal: 'user:a' }
+    const inbound = body('Explain how to tune a bearing assembly in a CNC milling machine with proper tolerances.')
+
+    // First refusal after JEV scored all questions >= 0.85: exact fingerprint only, no device ban, gate_miss recorded.
+    const logBag1 = {
+      _jevPassed: true,
+      _jevPassState: '[user message 1]\nExplain how to tune a bearing assembly',
+      _jevPassScores: { usage_policy: 0.96, nsfw: 0.99, abuse: 0.95 },
+    }
+    const r1 = observeUpstreamRisk({
+      inbound,
+      body: inbound,
+      identity,
+      result: { status: 400, body: { error: { type: 'invalid_request_error', message: 'Usage Policy violation' } } },
+      logBag: logBag1,
+      requestId: 'req-over-1',
+      policy,
+      repo,
+      devices,
+    })
+    assert.equal(r1, 'upstream:usage_policy')
+    assert.equal(logBag1.jev_state, '[user message 1]\nExplain how to tune a bearing assembly')
+    assert.equal(logBag1.error_details.gate_miss, true)
+    assert.equal(logBag1.error_details.risk_bucket, 'policy_suspect')
+    assert.equal(logBag1.error_details.jev_score_usage_policy, 0.96)
+    assert.equal(repo.count(), 1)
+    assert.equal(devices.count(), 0)
+
+    // Repeat refusal of the same exact prompt promotes to full policy + device ban.
+    const logBag2 = {
+      _jevPassed: true,
+      _jevPassState: '[user message 1]\nExplain how to tune a bearing assembly',
+      _jevPassScores: { usage_policy: 0.96, nsfw: 0.99, abuse: 0.95 },
+    }
+    observeUpstreamRisk({
+      inbound,
+      body: inbound,
+      identity,
+      result: { status: 400, body: { error: { type: 'invalid_request_error', message: 'Usage Policy violation' } } },
+      logBag: logBag2,
+      requestId: 'req-over-2',
+      policy,
+      repo,
+      devices,
+    })
+    assert.equal(logBag2.error_details.risk_bucket, 'policy')
+    assert.ok(devices.findBan(identity))
+
+    // Auth-ban 401 suspect promotes JEV evidence without banning the caller device.
+    const logBagAuth = {
+      _jevPassed: true,
+      _jevPassState: '[user message 1]\nsuspect prompt',
+      _jevPassScores: { usage_policy: 0.62, nsfw: 0.44, abuse: 0.88 },
+    }
+    const rAuth = observeUpstreamRisk({
+      inbound: body('another prompt'),
+      body: body('another prompt'),
+      identity: { deviceId: 'dev-auth-check-01', sessionId: 'sess-auth-01', principal: 'user:b' },
+      result: {
+        status: 401,
+        body: { error: { type: 'authentication_error', message: 'This organization has been disabled.' } },
+      },
+      logBag: logBagAuth,
+      requestId: 'req-auth-1',
+      policy,
+      repo,
+      devices,
+    })
+    assert.equal(rAuth, '')
+    assert.equal(logBagAuth.audit_upstream_error_status, 401)
+    assert.equal(logBagAuth.jev_state, '[user message 1]\nsuspect prompt')
+    assert.equal(logBagAuth.error_details.risk_bucket, 'auth_suspect')
+    assert.equal(logBagAuth.error_details.jev_score_nsfw, 0.44)
+    assert.equal(devices.findBan({ deviceId: 'dev-auth-check-01', principal: 'user:b' }), null)
   } finally {
     db.close()
   }

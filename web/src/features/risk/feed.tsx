@@ -56,6 +56,13 @@ export function RiskFeed({
       {rows.map((row) => {
         const kind = feedKindOf(row)
         const evidence = row.upstream400Message || evidenceOf(row)
+        const hasUpstream4xx =
+          row.upstreamStatus != null &&
+          [400, 401, 403, 422].includes(row.upstreamStatus)
+        const disguised429 =
+          row.statusCode === 429 && (kind === 'jev' || kind === 'refusal')
+        const showIdentity =
+          hasUpstream4xx || !!row.inboundDeviceId || !!row.clientSessionId
         return (
           <li key={row.id}>
             <button
@@ -68,15 +75,24 @@ export function RiskFeed({
                 className='text-xs text-muted-foreground tabular-nums'
               />
               {showKind ? (
-                <span
-                  className={cn(
-                    'w-fit rounded-md px-1.5 py-0.5 text-xs whitespace-nowrap',
-                    kind === 'upstream'
-                      ? 'bg-[var(--status-caution-bg)] text-[var(--status-caution)]'
-                      : 'bg-muted text-foreground'
-                  )}
-                >
-                  {row.upstreamStatus === 400 ? '上游 400' : KIND_NAME[kind]}
+                <span className='flex flex-wrap items-center gap-1'>
+                  <span
+                    className={cn(
+                      'w-fit rounded-md px-1.5 py-0.5 text-xs whitespace-nowrap',
+                      kind === 'upstream' || hasUpstream4xx
+                        ? 'bg-[var(--status-caution-bg)] text-[var(--status-caution)]'
+                        : 'bg-muted text-foreground'
+                    )}
+                  >
+                    {hasUpstream4xx
+                      ? `上游 ${row.upstreamStatus}`
+                      : KIND_NAME[kind]}
+                  </span>
+                  {disguised429 ? (
+                    <span className='w-fit rounded-md bg-amber-500/15 px-1.5 py-0.5 text-[11px] whitespace-nowrap text-amber-700 dark:text-amber-300'>
+                      429 伪装
+                    </span>
+                  ) : null}
                 </span>
               ) : (
                 <span className='hidden md:block' />
@@ -96,7 +112,7 @@ export function RiskFeed({
                   </span>
                 ) : null}
               </span>
-              {row.upstreamStatus === 400 ? (
+              {showIdentity ? (
                 <dl className='col-start-2 grid gap-x-4 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2 md:col-span-2 md:col-start-3'>
                   <div className='min-w-0 break-all'>
                     <dt className='inline'>入站设备／机器：</dt>

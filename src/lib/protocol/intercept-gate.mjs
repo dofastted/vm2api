@@ -1,8 +1,15 @@
 import { detectDistill, distillBlockError, isOpenaiPlatformModel } from '../core/distill-detect.mjs'
 import { redactSecrets } from '../core/security.mjs'
-import { ErrorType, isThirdPartyClientMessage, makeError, makeRefusalGuardError } from '../core/errors.mjs'
+import {
+  ErrorType,
+  isThirdPartyClientMessage,
+  makeError,
+  makePolicyOverloadError,
+  makeRefusalGuardError,
+} from '../core/errors.mjs'
 import {
   blockedRiskTool,
+  classifyUpstreamError,
   DEFAULT_BAN_STEPS,
   matchRefusalSession,
   matchStoredRefusal,
@@ -11,10 +18,12 @@ import {
   refusalPreview,
   refusalPromptSignature,
   refusalAuditIdentity,
+  refusalSessionId,
   upstreamRiskReason,
 } from '../core/refusal-guard.mjs'
 import {
   HARD_POLICY_RULES,
+  POLICY_BLOCK_MESSAGE,
   classifyJev,
   isPolicyBlockMemory,
   jevDocument,
@@ -72,29 +81,81 @@ export function systemRewrite(document) {
   return ''
 }
 
-function enforcesBan(policy, row) {
-  return !!(policy?.enabled && (policy.device_block_enabled || row.reason?.endsWith(':nsfw')))
+function isJevReason(reason) {
+  return typeof reason === 'string' && reason.startsWith('jev:') && reason !== 'jev:unavailable'
 }
 
-function recordBan(decision, { devices, policy, requestId }) {
-  if (!decision.banDevice || !decision.identity) return
-  if (!policy?.enabled || (!policy.device_block_enabled && !decision.forceDeviceBan)) return
-  const identity = decision.identity
+function retryAfterFromExpiry(expiresAt, now, fallbackSec = 600) {
+  const ms = expiresAt ? Date.parse(expiresAt) - now : NaN
+  if (!Number.isFinite(ms) || ms <= 0) return fallbackSec
+  return Math.max(1, Math.ceil(ms / 1000))
+}
+
+function enforcesBan(policy, row) {
+  if (isJevReason(row?.reason)) {
+    if (row?.subject_kind === 'session' && policy?.session_block_enabled === false) return false
+    return true
+  }
+  return !!(policy?.enabled && (policy.device_block_enabled || row?.reason?.endsWith(':nsfw')))
+}
+
+function recordBan(decision, { devices, policy, requestId, now = Date.now() }) {
+  if (!decision.banDevice || !decision.identity) return null
+  const jevHit = isJevReason(decision.reason)
+  if (!jevHit && (!policy?.enabled || (!policy.device_block_enabled && !decision.forceDeviceBan))) return null
+  const identity =
+    policy?.session_block_enabled === false && decision.identity.sessionId
+      ? { ...decision.identity, sessionId: '' }
+      : decision.identity
   const store = devices
   const evidence = { requestId, fingerprint: decision.fingerprint || null, reason: decision.reason || decision.kind }
   try {
     if (store?.recordViolation) {
-      store.recordViolation(identity, {
-        ...evidence,
-        steps: policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS,
-        accepts: (row) => enforcesBan(policy, row),
-      })
-    } else if (identity.deviceId) {
-      store?.block?.({ ...evidence, deviceId: identity.deviceId })
+      return (
+        store.recordViolation(identity, {
+          ...evidence,
+          steps: policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS,
+          now,
+          accepts: (row) => enforcesBan(policy, row),
+        }) || null
+      )
+    }
+    if (identity.deviceId) {
+      return store?.block?.({ ...evidence, deviceId: identity.deviceId }) || null
     }
   } catch {
     console.warn('[risk-audit] failed to persist ban')
   }
+  return null
+}
+
+const OVER_REFUSAL_SAFE_FLOOR = 0.85
+
+/** Flatten JEV per-question scores into scalar error_details fields (`jev_score_<id>`). */
+export function jevScoreDetails(scores) {
+  if (!scores || typeof scores !== 'object') return {}
+  const out = {}
+  for (const [id, raw] of Object.entries(scores)) {
+    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(id)) continue
+    const num = Number(raw)
+    if (Number.isFinite(num) && num >= 0 && num <= 1) {
+      out[`jev_score_${id}`] = Math.round(num * 1000) / 1000
+    }
+  }
+  return out
+}
+
+function minJevScore(scores) {
+  if (!scores || typeof scores !== 'object') return null
+  const vals = Object.values(scores)
+    .map(Number)
+    .filter((n) => Number.isFinite(n) && n >= 0 && n <= 1)
+  return vals.length ? Math.min(...vals) : null
+}
+
+function mergeLogErrorDetails(logBag, patch) {
+  if (!logBag || !patch || !Object.keys(patch).length) return
+  logBag.error_details = { ...(logBag.error_details || {}), ...patch }
 }
 
 export function observeUpstreamRisk({ inbound, body, identity, result, logBag, requestId, policy, repo, devices }) {
@@ -104,20 +165,66 @@ export function observeUpstreamRisk({ inbound, body, identity, result, logBag, r
     result.body?.error?.message ||
     result.body?.message ||
     (typeof result.body === 'string' ? result.body : '')
-  const upstreamStatus = result.providerResult?.http_status ?? result.upstreamStatus ?? result.status
-  const isBadRequest = Number(upstreamStatus) === 400
-  const reason = upstreamRiskReason(result, policy?.risk_audit?.upstream_policy_phrases)
-  if (!isBadRequest && !reason) return ''
+  const classified = classifyUpstreamError(result, policy?.risk_audit?.upstream_policy_phrases)
+  const isBadRequest = classified.status === 400
+  const reason = classified.bucket === 'policy' ? classified.reason : ''
+  if (
+    !isBadRequest &&
+    classified.bucket !== 'policy' &&
+    classified.bucket !== 'third_party' &&
+    classified.bucket !== 'auth_suspect'
+  ) {
+    return ''
+  }
   const message = JSON.parse(redactSecrets(String(rawMessage))).slice(0, 500)
   if (isBadRequest) {
     logBag.audit_upstream_400 = true
     logBag.audit_upstream_400_message ||= message
   }
+  if (classified.bucket === 'protocol') {
+    mergeLogErrorDetails(logBag, { risk_bucket: 'protocol' })
+    return ''
+  }
+  if (classified.bucket === 'third_party') {
+    mergeLogErrorDetails(logBag, { risk_bucket: 'third_party' })
+    return ''
+  }
+  if (classified.bucket === 'auth_suspect') {
+    logBag.audit_upstream_error_status = classified.status
+    logBag.audit_upstream_400_message ||= message
+    if (logBag._jevPassState) logBag.jev_state ||= logBag._jevPassState
+    mergeLogErrorDetails(logBag, {
+      risk_bucket: 'auth_suspect',
+      ...(logBag._jevPassed ? { gate_miss: true } : {}),
+      ...jevScoreDetails(logBag._jevPassScores),
+    })
+    return ''
+  }
   if (!reason) return ''
   if (message) logBag.error_message = message
   logBag.error_code ||= 'content_filter_refusal'
-  if (!policy?.enabled) return reason
+  if (classified.status && classified.status >= 400 && !isBadRequest) {
+    logBag.audit_upstream_error_status = classified.status
+  }
+  if (logBag._jevPassState) logBag.jev_state ||= logBag._jevPassState
+  const minScore = minJevScore(logBag._jevPassScores)
   const fingerprint = reason === 'upstream:flagged_session' ? null : refusalFingerprint(body, inbound)
+  const alreadyKnown = !!(fingerprint && repo?.get?.(fingerprint))
+  // Dual-track anti-over-refusal guard: if JEV scored every question >= 0.85 and
+  // this exact prompt has not failed before, cache the exact fingerprint only
+  // (no global MinHash pollution and no device strike yet).
+  const suspectOverRefusal =
+    !!logBag._jevPassed &&
+    reason === 'upstream:usage_policy' &&
+    minScore !== null &&
+    minScore >= OVER_REFUSAL_SAFE_FLOOR &&
+    !alreadyKnown
+  mergeLogErrorDetails(logBag, {
+    risk_bucket: suspectOverRefusal ? 'policy_suspect' : 'policy',
+    ...(logBag._jevPassed ? { gate_miss: true } : {}),
+    ...jevScoreDetails(logBag._jevPassScores),
+  })
+  if (!policy?.enabled) return reason
   try {
     if (fingerprint)
       repo?.remember?.({
@@ -126,12 +233,12 @@ export function observeUpstreamRisk({ inbound, body, identity, result, logBag, r
         requestId,
         errorMessage: message || reason,
         preview: refusalPreview(body, inbound),
-        signature: refusalPromptSignature(inbound, body),
+        signature: suspectOverRefusal ? null : refusalPromptSignature(inbound, body),
       })
   } catch {
     console.warn('[risk-audit] failed to persist upstream refusal')
   }
-  if (reason !== 'upstream:billing_refusal') {
+  if (reason !== 'upstream:billing_refusal' && !suspectOverRefusal) {
     recordBan({ identity, fingerprint, reason, banDevice: true }, { devices, policy, requestId })
   }
   return reason
@@ -172,7 +279,7 @@ function similarityRatio(value) {
   return n > 1 ? n / 100 : n
 }
 
-export function commitProtocolBlock(decision, { repo, devices, sessions, policy, requestId } = {}) {
+export function commitProtocolBlock(decision, { repo, devices, sessions, policy, requestId, now = Date.now() } = {}) {
   if (!decision || decision.action !== 'block') return
   if (decision.kind === 'session') {
     try {
@@ -197,15 +304,31 @@ export function commitProtocolBlock(decision, { repo, devices, sessions, policy,
       console.warn('[risk-audit] failed to record refusal cache hit')
     }
   }
-  recordBan(decision, { devices, policy, requestId })
+  // JEV session bans are persisted tenant-scoped via devices.recordViolation
+  // (keyed by sha256(principal, 'session', rootSessionId)) instead of the
+  // unscoped global refusal_session_blocks table, preventing cross-tenant DoS.
+  const ban = recordBan(decision, { devices, policy, requestId, now })
+  if (decision.kind === 'jev' && isJevReason(decision.reason) && ban?.subject_kind === 'device') {
+    if (!ban.expires_at) {
+      decision.error = refusalGuardError(requestId, { kind: 'device', row: ban })
+      decision.errorMessage = `${POLICY_BLOCK_MESSAGE}: ${decision.category}（第 ${ban.violations || 3} 次违规，设备永久封禁）`
+    } else {
+      decision.error = makePolicyOverloadError({
+        requestId,
+        retryAfterSec: retryAfterFromExpiry(ban.expires_at, now),
+      })
+      decision.errorMessage = `${POLICY_BLOCK_MESSAGE}: ${decision.category}（第 ${ban.violations || 1} 次违规，设备封禁至 ${ban.expires_at}）`
+    }
+  }
 }
 
-function pass(by, keyword = '', route = null) {
+function pass(by, keyword = '', route = null, extra = null) {
   return {
     action: 'pass',
     route,
     wait: by === 'scope-wait',
     intercept: gateVerdict({ kind: 'pass', by, keyword, route }),
+    ...(extra || {}),
   }
 }
 
@@ -250,9 +373,13 @@ export async function evaluateProtocolIntercept({
   backend = 'oauth',
   openaiPlatform = isOpenaiPlatformModel(inbound, body),
   skipMandatory = false,
+  now = Date.now(),
 } = {}) {
   const audit = policy?.risk_audit
-  const reject = (fields) => block({ deviceId: identity.deviceId, identity, ...fields })
+  const rootSessionId = refusalSessionId({ inbound, body, headers }) || identity.sessionId || ''
+  const effectiveIdentity =
+    rootSessionId && rootSessionId !== identity.sessionId ? { ...identity, sessionId: rootSessionId } : identity
+  const reject = (fields) => block({ deviceId: effectiveIdentity.deviceId, identity: effectiveIdentity, ...fields })
   const interceptOpts = { interceptSession, ctx: bodyCtx }
   let rawDocument
   if (!skipMandatory) {
@@ -267,6 +394,7 @@ export async function evaluateProtocolIntercept({
           via: 'refusal-guard',
           final_state: 'refusal_session',
           error,
+          logErrorCode: 'refusal_guard',
           errorMessage: error.body?.error?.message,
           intercept: gateVerdict({ kind: 'block', by: 'refusal', keyword: 'session' }),
           sessionId: refused.sessionId,
@@ -276,17 +404,24 @@ export async function evaluateProtocolIntercept({
         })
       }
     }
-    const banned = devices?.findBan?.(identity, Date.now(), (row) => enforcesBan(policy, row))
+    const banned = devices?.findBan?.(effectiveIdentity, now, (row) => enforcesBan(policy, row))
     if (banned) {
-      const error = refusalGuardError(requestId, { kind: 'device', row: banned })
+      const tempJevBan = banned.subject_kind === 'device' && isJevReason(banned.reason) && !!banned.expires_at
+      const error = tempJevBan
+        ? makePolicyOverloadError({ requestId, retryAfterSec: retryAfterFromExpiry(banned.expires_at, now) })
+        : refusalGuardError(requestId, { kind: 'device', row: banned })
+      const errorMessage = tempJevBan
+        ? `此设备因 ${banned.reason} 临时封禁至 ${banned.expires_at}（第 ${banned.violations || 1} 次违规）`
+        : error.body.error.message
       return reject({
         kind: 'device',
-        reason: 'refusal_device',
+        reason: banned.subject_kind === 'session' ? 'refusal_session' : 'refusal_device',
         deviceId: banned.device_id,
         via: 'refusal-guard',
-        final_state: 'refusal_device',
+        final_state: banned.subject_kind === 'session' ? 'refusal_session' : 'refusal_device',
         error,
-        errorMessage: error.body.error.message,
+        logErrorCode: 'refusal_guard',
+        errorMessage,
         intercept: gateVerdict({ kind: 'block', by: 'refusal', keyword: banned.subject_kind }),
       })
     }
@@ -455,41 +590,68 @@ export async function evaluateProtocolIntercept({
 
   if (jev?.enabled) {
     const modelDocument = jevModelDocument(inbound, body, interceptOpts)
-    const verdict = await classifyJev(modelDocument, { ...jev, policy_request_id: requestId }, fetchImpl)
+    const verdict = await classifyJev(modelDocument, { ...jev, policy_request_id: requestId }, fetchImpl, now)
     if (verdict.action === 'block') {
       const unavailable = verdict.reason === 'unavailable'
-      const error = policyBlockError(requestId)
       const detail = String(verdict.detail || '')
         .replace(/\s+/g, ' ')
         .trim()
         .slice(0, 120)
       if (unavailable) {
+        const error = policyBlockError(requestId)
         error.status = 503
         error.body.error.type = ErrorType.OVERLOADED
         error.body.error.message = detail
           ? `${error.body.error.message}: 决策模型不可用（${detail}）。本次请求已拦截，未封禁设备`
           : `${error.body.error.message}: 决策模型不可用。本次请求已拦截，未封禁设备`
         error.body.error.details = { reason: 'unavailable', ...(detail ? { detail } : {}) }
+        return reject({
+          kind: 'jev',
+          via: 'jev',
+          final_state: 'policy_blocked',
+          error,
+          logErrorCode: 'policy_blocked',
+          errorMessage: error.body.error.message,
+          intercept: gateVerdict({
+            kind: 'block',
+            by: 'jev',
+            keyword: 'unavailable',
+          }),
+          jevState: '',
+          category: 'unavailable',
+          banSession: false,
+          banDevice: false,
+          forceDeviceBan: false,
+          reason: 'jev:unavailable',
+        })
       }
       const category = verdict.category || 'safety'
-      if (!unavailable) error.body.error.details = { reason: `jev:${category}`, retryable: false }
+      const steps = policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS
+      const firstMinutes = Number(steps[0]) > 0 ? Number(steps[0]) : 10
+      const error = makePolicyOverloadError({ requestId, retryAfterSec: firstMinutes * 60 })
       return reject({
         kind: 'jev',
         via: 'jev',
         final_state: 'policy_blocked',
         error,
-        errorMessage: unavailable ? error.body.error.message : `${error.body?.error?.message}: ${category}`,
+        logErrorCode: 'policy_blocked',
+        errorDetails: { reason: `jev:${category}`, ...jevScoreDetails(verdict.scores) },
+        errorMessage: `${POLICY_BLOCK_MESSAGE}: ${category}`,
         intercept: gateVerdict({
           kind: 'block',
           by: 'jev',
-          keyword: unavailable ? 'unavailable' : category,
+          keyword: category,
         }),
         // Exact payload.state. Context the model scored, not a span it named.
-        jevState: unavailable ? '' : verdict.state || '',
-        category: unavailable ? 'unavailable' : category,
-        banDevice: !unavailable,
-        forceDeviceBan: !unavailable && (category === 'nsfw' || (verdict.categories || []).includes('nsfw')),
-        reason: unavailable ? 'jev:unavailable' : `jev:${category}`,
+        jevState: verdict.state || '',
+        category,
+        sessionId: rootSessionId,
+        model: body?.model || inbound?.model || '',
+        preview: refusalPreview(body, inbound),
+        banSession: true,
+        banDevice: true,
+        forceDeviceBan: true,
+        reason: `jev:${category}`,
       })
     }
     const by =
@@ -508,7 +670,11 @@ export async function evaluateProtocolIntercept({
             ? { kind: backend === 'api' ? 'endpoint' : 'pool', target: routeTarget, score: verdict.score }
             : null
         : null
-    return pass(by, verdict.reason === 'unavailable' ? verdict.detail || '' : '', route)
+    return pass(by, verdict.reason === 'unavailable' ? verdict.detail || '' : '', route, {
+      jevPassed: by === 'jev',
+      jevState: by === 'jev' ? verdict.state || '' : '',
+      jevScores: by === 'jev' ? verdict.scores || null : null,
+    })
   }
 
   return pass(scanned ? 'regex' : 'unchecked')

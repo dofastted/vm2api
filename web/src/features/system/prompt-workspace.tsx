@@ -10,6 +10,8 @@ import {
   parsePersonaTemplateLines,
   personaPresetFromCompat,
   personaPresetLabel,
+  presetFlagEnabled,
+  setPresetFlag,
   presetSeed,
   stringifyPersonaTemplate,
   validatePersonaTemplate,
@@ -18,6 +20,7 @@ import {
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { Switch } from '@/components/ui/switch'
 import {
   type PersonaDrafts,
   personaDraftStoresEmpty,
@@ -214,6 +217,40 @@ export function SystemPromptWorkspace({
               </Button>
             </div>
             <div className='space-y-3 border-t border-border/60 px-5 py-4 sm:px-6'>
+              <div className='flex items-start gap-3 border-b border-border/50 pb-3'>
+                <div className='min-w-0 flex-1'>
+                  <label
+                    htmlFor={`usage-passthrough-${viewing}`}
+                    className='text-sm font-medium'
+                  >
+                    对外完整透传 usage
+                  </label>
+                  <p className='pt-1 text-xs leading-5 text-muted-foreground'>
+                    开启后不扣除网关注入的人设、环境、约束或工具 token，适合由
+                    NewAPI 面向客户计费。
+                  </p>
+                </div>
+                <Switch
+                  id={`usage-passthrough-${viewing}`}
+                  aria-label='对外完整透传 usage'
+                  checked={presetFlagEnabled(
+                    compat,
+                    'usage_passthrough_presets',
+                    viewing
+                  )}
+                  onCheckedChange={(enabled) =>
+                    onChange(
+                      setPresetFlag(
+                        compat,
+                        'usage_passthrough_presets',
+                        viewing,
+                        enabled,
+                        server
+                      )
+                    )
+                  }
+                />
+              </div>
               {viewing === 'custom' &&
               personaDraftStoresEmpty(text, 'custom') ? (
                 <Notice tone='caution'>空模板会回落官方提示词。</Notice>

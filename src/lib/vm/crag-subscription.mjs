@@ -29,6 +29,7 @@ const localFilesystems = new Set([0xef53, 0x794c7630, 0x58465342, 0x9123683e, 0x
 const MAX_DEFERRED_RELEASES = 10000
 const MAX_DEFERRED_RELEASE_BYTES = 4 * 1024 * 1024
 const MAX_REDEEM_INTENT_BYTES = 1024
+const ENABLED_PROBE_CONCURRENCY = 8
 const terminalRedeem = new Map([
   ['redeem_unavailable', 404],
   ['host_redeem_conflict', 409],
@@ -1239,6 +1240,29 @@ export function createCragSubscription({
     return second === EXCLUSIVE_BUSY ? usageUnverified(retryable) : second
   }
 
+  /** Each check runs Docker probes against one slot. In series they add up to
+   * tens of seconds on a host with dozens of CRAG slots, so run a bounded number
+   * at once. Any probe failure still fails the whole count. */
+  async function countEnabledSlots(vms, opts) {
+    let next = 0
+    let enabled = 0
+    let failed = false
+    const worker = async () => {
+      while (!failed && next < vms.length) {
+        const vm = vms[next++]
+        try {
+          if (await isSlotEnabled(vm, opts)) enabled += 1
+        } catch (error) {
+          // The count is void now; do not keep probing the remaining slots.
+          failed = true
+          throw error
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(ENABLED_PROBE_CONCURRENCY, vms.length) }, worker))
+    return enabled
+  }
+
   async function status(confirmed, mayRetry = true) {
     let targets
     let inventory = {}
@@ -1352,11 +1376,9 @@ export function createCragSubscription({
         targetReady = !!targets && !pending && (await ready({ allowPrepared: true }, targets))
         if (targets && claims?.version === 1 && !pending) upgrade_available = await ready({ reclaim: true }, targets)
         if (targets && isSlotEnabled && (claims || isSubscriptionSlot)) {
-          let enabled = 0
-          for (const vm of claims && !pending ? targets : []) {
-            if (await isSlotEnabled(vm, { reclaim: claims.version === 2 })) enabled += 1
-          }
-          enabled_slots = enabled
+          enabled_slots = await countEnabledSlots(claims && !pending ? targets : [], {
+            reclaim: claims?.version === 2,
+          })
         }
       } catch {
         target_probe_failed = true

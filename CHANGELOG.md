@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.4.234 — 2026-11-27 · JEV 题库 v2 与分级封禁/429 伪装闭环、上游 4xx 四分桶与风控日志诊断面板、CRAG 订阅异步并发探测、Codex 用量窗口巡检、按档透传 usage 与 CRAGGemini 维护行修复
+
+- **JEV 内置题库 v2 与会话/设备分级封禁闭环（#1958）**：
+  - 升级内置三题题库（`usage_policy` / `nsfw` / `abuse`）并对未手改面板文案自动无感迁移；长文本窗口（`>= 1024`）改为头 30% + 尾 70% 首尾保留（`sliceJevState`）；硬规则新增 `[MODE: UNRESTRICTED SANDBOX]` / `clr_all_context` 越狱检测；修复降级文案误报 `密钥失效`。
+  - 默认阶梯改为 `[10, 10, 0]`（支持非递减校验）；JEV 命中同步按 `sha256(principal, 'session', rootSessionId)` 严格分租永久封禁根会话（含 Claude Code 子 Agent，避免跨租户会话 DoS）并推进设备分级计数；第 1/2 次触发及 10 分钟临时封禁期间向客户端返回伪装 `429` 负载与 `Retry-After`（后台日志保留 `policy_blocked` / `refusal_guard`），第 3 次永久封禁返回 `400`。
+- **后置上游 4xx 四分桶、漏网 JEV 留证与风控/日志 UI 诊断（#1959）**：
+  - `classifyUpstreamError()` 精准区分 `policy` / `third_party` / `protocol` / `auth_suspect`，并引入双轨防误杀机制（JEV 全题 `>= 0.85` 首次触发 `usage_policy` 仅记精确指纹，不污染全局 MinHash 或罚设备）；仅当放行后遭上游拒答或高危 401/403 时落盘 `jev_state` 与各题安全分（`jev_score_*`、`gate_miss`、`risk_bucket`）；JEV 默认决策超时提升至 `4000ms`。
+  - 风控面板补齐根会话封禁管理、可读 `identity_value` 解封弹窗、服务端 `via` 筛选、「上游漏放 / 前置拦截率」指标卡与日志详情「风控与审核裁决」对照卡。
+- **CRAG 订阅状态异步并发探测与前端维护行修复（#1949、#1948）**：
+  - `assertCragSubscriptionTargetAsync` 与 `countEnabledSlots`（并发上限 8、单槽报错提前终止）将 `GET /api/panel/crag-subscription` 从串行同步阻塞改为非阻塞异步探测，消除多槽宿主事件循环长时间卡顿。
+  - 修复前端 CRAGGemini 内核行在首次查询取消或后端超时后永久停在「正在读取宿主状态…」的问题（新增 15s 超时 `gemini_maintenance_timeout`、`pending+idle` 自动重读与重试按钮）。
+- **Codex 用量窗口巡检与按档 usage 透传（#1951、#1946）**：
+  - `usageProbeMonitor` 新增 `codexUnifiedForUsageProbe` 从 `vm.codex_usage` 合成窗口视图，使 Codex 槽在 5h/7d 窗口过期后同样触发一次性 `/usage` 刷新（仍复用既有 `usage_probe.enabled` 开关）。
+  - 系统提示词配置新增按档默认关闭的 `usage_passthrough_presets`（「对外完整透传 usage」）开关，开启后不扣除网关注入的人设/环境/常驻约束 token。
+- 部署说明：本次改动仅涉及控制面（`src/lib/`、`src/server.mjs`）与前端（`web/src/`），零数据库迁移；`deploy/payload.json`（`kin-kernel` `b2dbec57…`、`CRAG 3.1.24`、`CRAGGemini 0.4.14`）、Gemini 宿主/维护脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.233` 均未变。预期 **`SLOT_SYNC=skip`**，无需执行 `wrap-cli/sync`、无需重启 `vm2api-gemini` 或任何既有 `kin-*` 槽位，重启 `vm2api` 一次即可生效。
+
 ## 1.4.233 — 2026-11-27 · 钉选 CRAG 3.1.24 与 CRAGGemini 0.4.14 签名载荷、Gemini 粘性调度与 429/502/503 容错、409 工具续接清理及宿主机 AppArmor/KVM 文档补齐
 
 - **钉选 CRAG `3.1.24` 与 CRAGGemini `0.4.14` 签名载荷（#1954、#1952，`dofastted/crag#34`，`dofastted/antigravity-cli-proxy#19`）**：

@@ -942,6 +942,55 @@ test('risk audit counts only routed hops and looks up upstream 400s by original 
   assert.equal(view.listBatch({ request_id: original.request_id }).logs[0].id, requests[0].id)
 })
 
+test('protocolEntryStats counts upstreamRefusals and UsageLogsView supports via/upstream_risk_errors + JEV details', () => {
+  const store = tmpStore()
+  logOne(store, {
+    status: 429,
+    via: 'jev',
+    final_state: 'policy_blocked',
+    error_code: 'policy_blocked',
+    error_details: {
+      reason: 'jev:abuse',
+      jev_score_usage_policy: 0.91,
+      jev_score_abuse: 0.14,
+      gate_miss: false,
+      risk_bucket: 'policy',
+    },
+    intercept: gateVerdict({ kind: 'block', by: 'jev', keyword: 'abuse' }),
+    jev_state: '[user message 1]\nbuild a cheat injector',
+  })
+  logOne(store, {
+    status: 400,
+    via: 'go-worker-pool',
+    attempt_count: 1,
+    error_code: 'content_filter_refusal',
+    audit_upstream_error_status: 403,
+    audit_upstream_400_message: 'Upstream content policy refused',
+    error_details: {
+      risk_bucket: 'policy',
+      gate_miss: true,
+      jev_score_abuse: 0.54,
+    },
+    intercept: gateVerdict({ kind: 'pass', by: 'jev' }),
+  })
+
+  const stats = store.protocolEntryStats({ since: '1970-01-01T00:00:00.000Z' })
+  assert.equal(stats.blocked, 1)
+  assert.equal(stats.upstreamRefusals, 1)
+
+  const view = new UsageLogsView(store.db)
+  const jevOnly = view.listBatch({ via: 'jev', include_muted: true }).logs
+  assert.equal(jevOnly.length, 1)
+  assert.equal(jevOnly[0].intercept?.by, 'jev')
+  assert.equal(jevOnly[0].errorDetails?.jev_score_abuse, 0.14)
+
+  const upstreamRisk = view.listBatch({ upstream_risk_errors: true, include_muted: true }).logs
+  assert.equal(upstreamRisk.length, 1)
+  assert.equal(upstreamRisk[0].upstreamStatus, 403)
+  assert.equal(upstreamRisk[0].errorDetails?.gate_miss, true)
+  assert.equal(upstreamRisk[0].errorDetails?.risk_bucket, 'policy')
+})
+
 test('queryNormal filters + pagination + total', () => {
   const store = tmpStore('normal')
   logOne(store, { api_key_id: 'key_a', model: 'm1', input_tokens: 10, output_tokens: 5 })

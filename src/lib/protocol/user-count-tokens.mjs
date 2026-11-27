@@ -313,7 +313,10 @@ export async function handleUserCountTokens(req, res, deps) {
     }
   }
   const gate = await blockCountTokensBeforeHop(req, parsed.body, { ...deps, rawInbound: inbound })
-  if (gate?.error) return json(res, gate.error.status, gate.error.body)
+  if (gate?.error) {
+    if (gate.error.retryAfterSec) res.setHeader?.('retry-after', String(gate.error.retryAfterSec))
+    return json(res, gate.error.status, gate.error.body)
+  }
   const peeked = await peekCurrentAccount({
     poolScheduler: typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler,
     stickyRouter: deps.stickyRouter,
@@ -329,7 +332,10 @@ export async function handleUserCountTokens(req, res, deps) {
       rawInbound: inbound,
       account: scopeAccountFromVm(peeked.vm, findAccount(deps.accountQuota, peeked.vm)?.unified),
     })
-    if (again?.error) return json(res, again.error.status, again.error.body)
+    if (again?.error) {
+      if (again.error.retryAfterSec) res.setHeader?.('retry-after', String(again.error.retryAfterSec))
+      return json(res, again.error.status, again.error.body)
+    }
   }
   const mode = credentialModeOfVm(peeked.vm)
   if (!canCountTokens(mode)) {

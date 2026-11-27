@@ -162,7 +162,7 @@ test('panel policy defaults on at 90 and rejects an unknown threshold', () => {
     device_block_enabled: true,
     session_block_enabled: true,
   })
-  assert.deepEqual(risk_audit.ban_steps, [10, 1440, 0])
+  assert.deepEqual(risk_audit.ban_steps, [10, 10, 0])
   const settings = new Map()
   const store = {
     get: (key, fallback) => (settings.has(key) ? settings.get(key) : fallback),
