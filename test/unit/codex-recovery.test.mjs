@@ -10,7 +10,8 @@ import {
   RECOVERY_EXTEND_MAX_MULTIPLIER,
   RECOVERY_MINUTES_MAX,
 } from '../../src/lib/pool/codex-recovery.mjs'
-import { codexScheduleLevel, orderCodexSessionSlots } from '../../src/lib/pool/codex-slot-pool.mjs'
+import { codexScheduleLevel, pickCodexSlots } from '../../src/lib/pool/codex-slot-pool.mjs'
+import { ingestCodexHop } from '../../src/lib/protocol/handle-codex.mjs'
 import { normalizeCodexRouting } from '../../src/lib/protocol/codex-route.mjs'
 import { VmTestScheduleRunner, VM_TEST_SCHEDULE_PREFIX } from '../../src/lib/admin/vm-test-schedule.mjs'
 import { getCodexRecoveryStore } from '../../src/lib/pool/codex-recovery.mjs'
@@ -145,6 +146,30 @@ test('tryStartAfterPreheat reset_not_refreshed when 5h unchanged', () => {
   assert.equal(out.reason, 'reset_not_refreshed')
 })
 
+test('tryStartAfterPreheat honors injected quotaPolicy on soft gate', () => {
+  const store = createCodexRecoveryStore({ now: () => NOW })
+  const vm = gpt('vm-a', {
+    codex: {
+      extra: {
+        ...freshExtra(),
+        codex_secondary_used_percent: 50,
+        codex_primary_used_percent: 50,
+      },
+    },
+  })
+  const tight = { limit_5h: 0.2, limit_7d: 0.2 }
+  const started = store.tryStartAfterPreheat({
+    vmId: 'vm-a',
+    result: { ok: true },
+    schedule: { mode: 'preheat', recovery_cooldown_minutes: 15 },
+    beforeResets: { reset5h: Date.parse(NEW_RESET) - 3600_000 },
+    vm,
+    quotaPolicy: tight,
+    at: NOW,
+  })
+  assert.equal(started.reason, 'above_soft_limit')
+})
+
 test('tryStartAfterPreheat above_soft_limit when over quota gate', () => {
   const store = createCodexRecoveryStore({ now: () => NOW })
   const vm = gpt('vm-a', {
@@ -185,7 +210,9 @@ test('tryStartAfterPreheat not_schedulable when slot disabled', () => {
 test('tryStartAfterPreheat refuses stale quota snapshot', () => {
   const store = createCodexRecoveryStore({ now: () => NOW })
   const stale = gpt('vm-a', {
-    codex: { extra: { ...freshExtra(NOW - 60 * 60_000), codex_usage_updated_at: new Date(NOW - 60 * 60_000).toISOString() } },
+    codex: {
+      extra: { ...freshExtra(NOW - 60 * 60_000), codex_usage_updated_at: new Date(NOW - 60 * 60_000).toISOString() },
+    },
   })
   const started = store.tryStartAfterPreheat({
     vmId: 'vm-a',
@@ -297,8 +324,9 @@ test('recordRateLimit extends active cooldown and respects 4x cap', () => {
   )
   assert.equal(store.recordRateLimit('vm-a', NOW), true)
   assert.equal(store.recordRateLimit('vm-a', NOW + 100), true)
-  const cap = NOW + 15 * 60_000 * RECOVERY_EXTEND_MAX_MULTIPLIER
-  assert.ok(store.get('vm-a', NOW).state.until <= cap)
+  const hardCap = NOW + 15 * 60_000 * 4
+  assert.ok(store.get('vm-a', NOW).state.until <= hardCap)
+  assert.equal(RECOVERY_EXTEND_MAX_MULTIPLIER, 4)
 })
 
 test('recordRateLimit no-op when slot not in recovery', () => {
@@ -339,7 +367,7 @@ test('recovery overlay preserves base_level on candidate priority', () => {
   assert.equal(level.base_level, 8)
 })
 
-test('sticky default migrates; sticky_keep true retains home', () => {
+test('pickCodexSlots ranks higher manual P above recovering home overlay', () => {
   const store = createCodexRecoveryStore({ now: () => NOW })
   setCodexRecoveryStore(store)
   store.put(
@@ -349,22 +377,12 @@ test('sticky default migrates; sticky_keep true retains home', () => {
   )
   const home = gpt('vm-home')
   const better = gpt('vm-high', { schedule_level_manual: 9, policy: { priority: 9, weight: 1 } })
-  const loose = orderCodexSessionSlots([home, better], {
-    boundVmId: 'vm-home',
-    sessionKey: 'sess',
-    now: NOW,
-    recoveryStickyKeep: false,
-    quotaPolicy: QUOTA,
-  })
-  assert.equal(loose.ids[0], 'vm-high')
-  const sticky = orderCodexSessionSlots([home, better], {
-    boundVmId: 'vm-home',
-    sessionKey: 'sess',
-    now: NOW,
-    recoveryStickyKeep: true,
-    quotaPolicy: QUOTA,
-  })
-  assert.equal(sticky.ids[0], 'vm-home')
+  const picked = pickCodexSlots([home, better], { now: NOW, quotaPolicy: QUOTA })
+  assert.equal(picked.ids[0], 'vm-high')
+})
+
+test('normalizeCodexRouting sticky_keep_session true only when configured', () => {
+  assert.equal(normalizeCodexRouting({ recovery: { sticky_keep_session: true } }).recovery.sticky_keep_session, true)
 })
 
 test('VmTestScheduleRunner invokes tryStartAfterPreheat on preheat ok', async () => {
@@ -440,12 +458,19 @@ test('VmTestScheduleRunner tryStart failure does not abort recordRun', async () 
   assert.equal(saved.last_ok, true)
 })
 
-test('handle-codex hook contract: getCodexRecoveryStore recordRateLimit', () => {
+test('ingestCodexHop records recovery rate limit on usage_limit 429', () => {
   const store = createCodexRecoveryStore({ now: () => NOW })
   setCodexRecoveryStore(store)
-  store.put('vm-a', { until: NOW + 60_000, started_at: NOW, minutes: 15, rate_limited: false, extended: 0 }, {
-    force: true,
-  })
-  getCodexRecoveryStore().recordRateLimit('vm-a', NOW)
+  store.put(
+    'vm-a',
+    { until: NOW + 60_000, started_at: NOW, minutes: 15, rate_limited: false, extended: 0 },
+    { force: true },
+  )
+  ingestCodexHop(
+    '/tmp',
+    'vm-a',
+    { ok: false, status: 429, body: { error: { code: 'usage_limit_reached' } }, headers: {} },
+    NOW,
+  )
   assert.equal(store.get('vm-a', NOW).state.rate_limited, true)
 })

@@ -222,7 +222,7 @@ function applyCodexRebuildBody(body, sessionId, mode) {
   return out
 }
 
-function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = null) {
+export function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = null) {
   const headers = result?.headers || {}
   const extra = extraFromCodexHeaders(headers, now)
   let limitedUntil = null
