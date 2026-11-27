@@ -15,6 +15,7 @@ DAEMON = ROOT / "scripts/gemini-maintenance.py"
 UNIT = Path("/etc/systemd/system/vm2api-gemini-maintenance.service")
 FILES = (
     "scripts/gemini-maintenance.py",
+    "scripts/gemini_host_apparmor.py",
     "deploy/gemini-maintenance.service.example",
     "scripts/gemini-host.py",
     "scripts/gemini_host_account.py",
@@ -119,6 +120,9 @@ prepare_gemini_maintenance v1.4.201 source
         assert (
             DAEMON.read_bytes() == (REPO / "scripts/gemini-maintenance.py").read_bytes()
         )
+        apparmor = ROOT / "scripts/gemini_host_apparmor.py"
+        assert apparmor.is_file()
+        assert apparmor.read_bytes() == (REPO / "scripts/gemini_host_apparmor.py").read_bytes()
         assert (
             json.loads((bundle / "catalog.json").read_bytes())[0]["id"]
             == json.loads((app / "deploy/payload.json").read_bytes())[

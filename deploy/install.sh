@@ -1191,7 +1191,7 @@ if not match:
 (bundle / 'catalog.json').write_text(json.dumps([{'id': tag, 'version': match[1], 'cli_version': '1.5.9'}]) + '\n')
 (bundle / 'maintenance-config.json').write_text(json.dumps({'install_dir': str(install), 'bundle_dir': str(bundle)}) + '\n')
 PY
-  for file in "$config" "$root/scripts/gemini-maintenance.py" "$unit"; do
+  for file in "$config" "$root/scripts/gemini-maintenance.py" "$root/scripts/gemini_host_apparmor.py" "$unit"; do
     if [ -e "$file" ] || [ -L "$file" ]; then
       [ ! -L "$file" ] && [ -f "$file" ] && [ "$(stat -c '%u:%h' "$file")" = 0:1 ] || { err "拒绝覆盖不受信的维护文件"; return 1; }
       local permissions
@@ -1228,9 +1228,11 @@ PY
   systemctl is-enabled --quiet vm2api-gemini-maintenance.service && was_enabled=1
   [ ! -f "$config" ] || install -m 600 "$config" "$backup/config.json" || return 1
   [ ! -f "$root/scripts/gemini-maintenance.py" ] || install -m 644 "$root/scripts/gemini-maintenance.py" "$backup/daemon.py" || return 1
+  [ ! -f "$root/scripts/gemini_host_apparmor.py" ] || install -m 644 "$root/scripts/gemini_host_apparmor.py" "$backup/apparmor.py" || return 1
   [ ! -f "$unit" ] || install -m 644 "$unit" "$backup/service" || return 1
   if atomic_maintenance_file "$bundle/maintenance-config.json" "$config" 600 &&
     atomic_maintenance_file "$bundle/scripts/gemini-maintenance.py" "$root/scripts/gemini-maintenance.py" 644 &&
+    atomic_maintenance_file "$bundle/scripts/gemini_host_apparmor.py" "$root/scripts/gemini_host_apparmor.py" 644 &&
     atomic_maintenance_file "$bundle/deploy/gemini-maintenance.service.example" "$unit" 644 &&
     systemctl daemon-reload && systemctl enable vm2api-gemini-maintenance.service && systemctl restart vm2api-gemini-maintenance.service; then
     ok "Gemini 维护服务已就绪，可在设置 → Gemini 维护 操作"
@@ -1239,6 +1241,7 @@ PY
   systemctl stop vm2api-gemini-maintenance.service || warn "无法停止未就绪的维护服务"
   if [ -f "$backup/config.json" ]; then atomic_maintenance_file "$backup/config.json" "$config" 600 || restored=0; else rm -f -- "$config" || restored=0; fi
   if [ -f "$backup/daemon.py" ]; then atomic_maintenance_file "$backup/daemon.py" "$root/scripts/gemini-maintenance.py" 644 || restored=0; else rm -f -- "$root/scripts/gemini-maintenance.py" || restored=0; fi
+  if [ -f "$backup/apparmor.py" ]; then atomic_maintenance_file "$backup/apparmor.py" "$root/scripts/gemini_host_apparmor.py" 644 || restored=0; else rm -f -- "$root/scripts/gemini_host_apparmor.py" || restored=0; fi
   if [ -f "$backup/service" ]; then atomic_maintenance_file "$backup/service" "$unit" 644 || restored=0; else rm -f -- "$unit" || restored=0; fi
   systemctl daemon-reload || restored=0
   [ "$was_enabled" = 1 ] || systemctl disable vm2api-gemini-maintenance.service || warn "无法恢复维护服务的启用状态"
