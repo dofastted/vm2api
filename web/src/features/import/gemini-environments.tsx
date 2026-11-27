@@ -26,6 +26,12 @@ import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { WsTerminal } from '@/components/ws-terminal-lazy'
 import { GeminiRedeemDialog } from '@/features/billing/gemini-redeem-dialog'
+import {
+  buildNodePoolsIndex,
+  NodePoolBadges,
+} from '@/features/pools/node-pool-badges'
+import { WeightTierBadge } from '@/features/pools/pool-badges'
+import { schedulerPoolsQueryOptions } from '@/features/pools/queries'
 import { GeminiMaintenanceLink } from '@/features/settings/gemini-maintenance-link'
 import { usersQueryOptions } from '@/features/users/queries'
 import { resolveOwnerUsername } from '@/features/vm/vm-owner'
@@ -462,6 +468,11 @@ function GeminiBasicPrefs({
 }) {
   const client = useQueryClient()
   const users = useQuery(usersQueryOptions())
+  const poolsQ = useQuery({
+    ...schedulerPoolsQueryOptions(),
+    retry: false,
+  })
+  const belongingPools = buildNodePoolsIndex(poolsQ.data).get(environment.id)
   const [name, setName] = useState(environment.name || '')
   const [concurrency, setConcurrency] = useState(
     environment.max_concurrency != null
@@ -574,11 +585,17 @@ function GeminiBasicPrefs({
         </div>
       </div>
       <div className='space-y-1.5'>
-        <div className='flex items-center justify-between text-sm'>
-          <span className='font-medium'>调度优先级</span>
-          <span className='text-xs text-muted-foreground'>
-            {levelMode === 'manual' ? `P${level} · 手动` : 'P5 · 自动'}
-          </span>
+        <div className='flex flex-wrap items-center justify-between gap-2 text-sm'>
+          <span className='font-medium'>权重模式与权重等级（1–10）</span>
+          <div className='flex flex-wrap items-center gap-1.5'>
+            <WeightTierBadge
+              tier={levelMode === 'manual' ? level : 5}
+              mode={levelMode}
+            />
+            <span className='text-xs text-muted-foreground'>
+              {levelMode === 'manual' ? `P${level} · manual` : 'P5 · auto'}
+            </span>
+          </div>
         </div>
         <div
           role='radiogroup'
@@ -622,6 +639,19 @@ function GeminiBasicPrefs({
             </button>
           ))}
         </div>
+      </div>
+      <div className='flex flex-wrap items-center justify-between gap-2 text-xs'>
+        <div className='flex flex-wrap items-center gap-1.5'>
+          <span className='text-muted-foreground'>所属分组池：</span>
+          {belongingPools?.length ? (
+            <NodePoolBadges pools={belongingPools} maxVisible={4} />
+          ) : (
+            <span className='text-muted-foreground'>未加入分组池</span>
+          )}
+        </div>
+        <Link to='/pools' className='text-primary underline underline-offset-4'>
+          管理分组池 →
+        </Link>
       </div>
       <div className='flex items-center gap-2'>
         <Button

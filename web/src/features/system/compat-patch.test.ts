@@ -27,26 +27,23 @@ describe('system prompt save body', () => {
 
   it('formats save toast for the active kernel tab instead of always reporting cli-node preset', () => {
     expect(
-      systemPromptSaveToast(
-        'craggemini',
-        { persona_preset: 'official_full', craggemini_persona_preset: 'zero' },
-        0
-      )
+      systemPromptSaveToast('craggemini', {
+        persona_preset: 'official_full',
+        craggemini_persona_preset: 'zero',
+      })
     ).toBe('已保存 · CRAGGemini · 0提示词')
     expect(
-      systemPromptSaveToast(
-        'crag',
-        { persona_preset: 'official_full', crag_persona_preset: 'zero' },
-        0
-      )
+      systemPromptSaveToast('crag', {
+        persona_preset: 'official_full',
+        crag_persona_preset: 'zero',
+      })
     ).toBe('已保存 · CRAG v2 print · 0注入')
-    expect(
-      systemPromptSaveToast(
-        'cli-node',
-        { persona_preset: 'official_full' },
-        0,
-        { updated: 0 }
-      )
-    ).toContain('官方完整提示词')
+    const cliNode = systemPromptSaveToast(
+      'cli-node',
+      { persona_preset: 'official_full' },
+      { updated: 0 }
+    )
+    expect(cliNode).toContain('官方完整提示词')
+    expect(cliNode).not.toContain('跟随全局')
   })
 })
