@@ -11,7 +11,9 @@ import {
 } from '../../src/lib/gemini/model-catalog.mjs'
 import { createGeminiPanelHandler, createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
+import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { FULL_GEMINI_CAPABILITIES, NATIVE_TUI_CAPABILITIES } from '../../src/lib/protocol/gemini-convert.mjs'
+import { makeMockGeminiRuntime } from '../fixtures/scheduler-runtime-mock.mjs'
 
 function makeRes() {
   const res = new EventEmitter()
@@ -167,9 +169,11 @@ test('scheduler isolates 3p 429 cooldown from gemini quota group and automatical
     },
   ]
 
+  const pool = new PoolScheduler()
   const scheduler = createGeminiScheduler({
     now: () => clock,
     quotaCooldownMs: 60_000,
+    poolScheduler: pool,
     callHost: async (op, payload) => {
       if (op === 'list') return { payload_state: 'installed', environments: envs }
       if (op === 'get') return envs.find((e) => e.id === payload.id)
@@ -194,7 +198,7 @@ test('scheduler isolates 3p 429 cooldown from gemini quota group and automatical
       ])
     },
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
-    schedulerRuntime: makeMockGeminiRuntime(),
+    schedulerRuntime: makeMockGeminiRuntime(pool),
   })
 
   // Catalog splits models into Google vs ag- prefixed Anthropic with accurate owned_by.
@@ -281,7 +285,9 @@ test('scheduler skips proactively exhausted accounts and fails over on verificat
   ]
 
   const attempted = []
+  const failPool = new PoolScheduler()
   const scheduler = createGeminiScheduler({
+    poolScheduler: failPool,
     callHost: async (op, payload) => {
       if (op === 'list') return { payload_state: 'installed', environments: envs }
       if (op === 'get') return envs.find((e) => e.id === payload.id)
@@ -302,7 +308,7 @@ test('scheduler skips proactively exhausted accounts and fails over on verificat
       ])
     },
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
-    schedulerRuntime: makeMockGeminiRuntime(),
+    schedulerRuntime: makeMockGeminiRuntime(failPool),
   })
 
   const turn = await scheduler.stream({
@@ -488,12 +494,3 @@ test('Gemini public handler records requestLog once on direct calls and populate
     { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
   ])
 })
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

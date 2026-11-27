@@ -10,6 +10,7 @@ import { CODEX_IMAGE_EDITS_URL, CODEX_IMAGE_GENERATIONS_URL } from '../../src/li
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { loadGptModelPolicy, saveGptModelPolicy } from '../../src/lib/protocol/gpt-model-policy.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { invalidateReadCache } from '../../src/lib/vm/vm-file.mjs'
 import { withM3SchedulerDeps, makeMockCodexRuntimeFor } from '../fixtures/scheduler-runtime-mock.mjs'
 
 function createM3HandleProtocol(deps) {
@@ -33,8 +34,9 @@ beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-image-model-'))
   const dir = path.join(root, 'vms', 'vm-a')
   fs.mkdirSync(dir, { recursive: true })
+  const vmPath = path.join(root, 'vms', 'vm-a.json')
   fs.writeFileSync(
-    path.join(root, 'vms', 'vm-a.json'),
+    vmPath,
     JSON.stringify({
       id: 'vm-a',
       name: 'vm-a',
@@ -44,6 +46,7 @@ beforeEach(() => {
       status: 'running',
     }),
   )
+  invalidateReadCache(vmPath)
   fs.writeFileSync(
     path.join(dir, 'codex-credentials.json'),
     JSON.stringify({ accounts: [{ id: 'acc', access_token: 'at', refresh_token: 'rt', chatgpt_account_id: 'vm-a' }] }),
@@ -83,6 +86,9 @@ async function serve(upstream) {
     stats: { errors: 0, requests: 0, by_route: {} },
     groupsRepo: { rateMultiplier: () => 1 },
     routingConfig: {},
+    schedulerRuntime: makeMockCodexRuntimeFor(root),
+    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    stickyRouter: {},
     codexOps: {
       fetchImpl: async (url, init) => {
         const body = JSON.parse(init.body)

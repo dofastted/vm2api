@@ -12,7 +12,10 @@ import {
   resetClaudeResetLeasesForTest,
 } from '../../src/lib/oauth/claude-reset-credits.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { formatNodeKey } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
+import { invalidateReadCache } from '../../src/lib/vm/vm-file.mjs'
+import { createM3FailoverRunner, createM3PoolScheduler } from '../fixtures/scheduler-runtime-mock.mjs'
 import { listQuotaFromHeaders } from '../../src/lib/pool/quota-window.mjs'
 import { RateLimitService } from '../../src/lib/pool/rate-limit-service.mjs'
 import { resolveUsageWindows } from '../../src/lib/protocol/user-count-tokens.mjs'
@@ -53,13 +56,15 @@ function makeFixture(t, { vmId = 'vm-1', accountUuid = 'acc-1', schedulable = fa
   quota.runtimeRepo = runtimeRepo
   const writeVm = (id = vmId, uuid = accountUuid, sched = schedulable) => {
     fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+    const vmRecordPath = path.join(root, 'vms', `${id}.json`)
     fs.writeFileSync(
-      path.join(root, 'vms', `${id}.json`),
+      vmRecordPath,
       JSON.stringify({
         id,
         platform: 'anthropic',
         family: 'claude',
         schedulable: sched,
+        status: 'running',
         claude: {
           mode: 'oauth',
           account_uuid: uuid,
@@ -67,6 +72,7 @@ function makeFixture(t, { vmId = 'vm-1', accountUuid = 'acc-1', schedulable = fa
         },
       }),
     )
+    invalidateReadCache(vmRecordPath)
   }
   writeVm()
   t.after(() => {
@@ -707,33 +713,36 @@ test('#1723 persisted reset boundaries survive restart for reconciliation, repla
 test('#1758 blocker 1 & minor 1: FailoverRunner skips applyCooldown on pre-reset account_quota_exhausted and fable_rate_limited 429s', async (t) => {
   // 1a. Pre-reset account_quota_exhausted 429 must not lock account or evict sessions.
   {
-    const { cfg, quota, runtimeRepo } = makeFixture(t)
+    const { cfg, quota, runtimeRepo, root, writeVm } = makeFixture(t, { schedulable: true })
+    writeVm('vm-1', 'acc-1', true)
     runtimeRepo.upsert({ account_id: 'acc-1', vm_id: 'vm-1', status: 'ready' })
     const rateLimitService = new RateLimitService({ runtimeRepo, accountQuota: quota })
     const cooldownCalls = []
     const sessionEvictions = []
     let selectCount = 0
-    const scheduler = {
-      accountQuota: quota,
-      async selectAndReserve() {
-        selectCount += 1
-        if (selectCount > 1) return { ok: false, reason: 'account_pool_exhausted' }
-        return { ok: true, accountId: 'acc-1', vmId: 'vm-1', release() {} }
-      },
-      markSuccess() {},
-      markCooldown(selected, opts) {
-        cooldownCalls.push({ selected, opts })
-        runtimeRepo.markCooldown(selected.accountId, { vmId: selected.vmId, ...opts })
-      },
-      releaseAccountSessions(info) {
-        sessionEvictions.push(info)
-      },
+    const pool = createM3PoolScheduler(root, { accountQuota: quota, runtimeRepo })
+    const nativeAcquire = pool.schedulerRuntime.acquireNode.bind(pool.schedulerRuntime)
+    pool.schedulerRuntime.acquireNode = async (params, opts) => {
+      selectCount += 1
+      if (selectCount > 1) {
+        throw new SchedulerApiError({ status: 429, code: 'account_pool_exhausted', message: 'exhausted' })
+      }
+      return nativeAcquire({ ...params, pinNodeKey: formatNodeKey('claude_vm', 'vm-1') }, opts)
     }
-    const runner = new FailoverRunner({
-      scheduler,
+    pool.markCooldown = (selected, opts) => {
+      cooldownCalls.push({ selected, opts })
+      runtimeRepo.markCooldown(selected.accountId, { vmId: selected.vmId, ...opts })
+    }
+    pool.releaseAccountSessions = (info) => sessionEvictions.push(info)
+    const runner = createM3FailoverRunner(root, {
+      scheduler: pool,
       rateLimitService,
-      config: { max_same_account_retries: 0, max_total_attempts: 2 },
-      schedulerRuntime: makeStubSchedulerRuntime(),
+      config: {
+        max_same_account_retries: 0,
+        max_total_attempts: 2,
+        fallback_wait_timeout_ms: 5,
+        sticky_wait_timeout_ms: 5,
+      },
     })
 
     const attemptPolicies = []
@@ -779,28 +788,35 @@ test('#1758 blocker 1 & minor 1: FailoverRunner skips applyCooldown on pre-reset
 
   // 1b. Pre-reset fable_rate_limited 429 must not apply Fable model cooldown after 7d_oi reset.
   {
-    const { cfg, quota, runtimeRepo } = makeFixture(t, { vmId: 'vm-f1', accountUuid: 'acc-f1' })
+    const { cfg, quota, runtimeRepo, root, writeVm } = makeFixture(t, {
+      vmId: 'vm-f1',
+      accountUuid: 'acc-f1',
+      schedulable: true,
+    })
+    writeVm('vm-f1', 'acc-f1', true)
     runtimeRepo.upsert({ account_id: 'acc-f1', vm_id: 'vm-f1', status: 'ready' })
     const rateLimitService = new RateLimitService({ runtimeRepo, accountQuota: quota })
     const cooldownCalls = []
     let selectCount = 0
-    const scheduler = {
-      accountQuota: quota,
-      async selectAndReserve() {
-        selectCount += 1
-        if (selectCount > 1) return { ok: false, reason: 'account_pool_exhausted' }
-        return { ok: true, accountId: 'acc-f1', vmId: 'vm-f1', release() {} }
-      },
-      markSuccess() {},
-      markCooldown(selected, opts) {
-        cooldownCalls.push({ selected, opts })
-      },
+    const pool = createM3PoolScheduler(root, { accountQuota: quota, runtimeRepo })
+    const nativeAcquire = pool.schedulerRuntime.acquireNode.bind(pool.schedulerRuntime)
+    pool.schedulerRuntime.acquireNode = async (params, opts) => {
+      selectCount += 1
+      if (selectCount > 1) {
+        throw new SchedulerApiError({ status: 429, code: 'account_pool_exhausted', message: 'exhausted' })
+      }
+      return nativeAcquire({ ...params, pinNodeKey: formatNodeKey('claude_vm', 'vm-f1') }, opts)
     }
-    const runner = new FailoverRunner({
-      scheduler,
+    pool.markCooldown = (selected, opts) => cooldownCalls.push({ selected, opts })
+    const runner = createM3FailoverRunner(root, {
+      scheduler: pool,
       rateLimitService,
-      config: { max_same_account_retries: 0, max_total_attempts: 2 },
-      schedulerRuntime: makeStubSchedulerRuntime(),
+      config: {
+        max_same_account_retries: 0,
+        max_total_attempts: 2,
+        fallback_wait_timeout_ms: 5,
+        sticky_wait_timeout_ms: 5,
+      },
     })
 
     const attemptPolicies = []
@@ -1304,12 +1320,3 @@ test('#1776 legacy 1.4.168 receipt without account_id never contaminates rebound
   assert.equal(listedB.utilization_5h, 0.42)
   assert.equal(listedB.utilization_7d, 0.76)
 })
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

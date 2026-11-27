@@ -12,6 +12,8 @@ import {
 } from '../../src/lib/gemini/routing-config.mjs'
 import { createGeminiPanelHandler, createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
+import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
+import { makeMockGeminiRuntime } from '../fixtures/scheduler-runtime-mock.mjs'
 
 test('routing-config defaults, validation, merge, and protocol gating', () => {
   const def = normalizeGeminiRouting({})
@@ -123,6 +125,7 @@ test('Gemini scheduler honors balanced, fill, round_robin, sticky TTL, and gatew
 
   const dispatched = []
   let holdRelease = null
+  const pool = new PoolScheduler()
   const scheduler = createGeminiScheduler({
     resolveProxy: () => 'socks5h://u:p@192.0.2.11:1080',
     callHost: async (op, payload) => {
@@ -145,7 +148,7 @@ test('Gemini scheduler honors balanced, fill, round_robin, sticky TTL, and gatew
       }
     },
     getRoutingConfig: () => routing,
-    schedulerRuntime: makeMockGeminiRuntime(),
+    schedulerRuntime: makeMockGeminiRuntime(pool),
   })
 
   // Hold 1 in-flight request on gemini-a, then balanced picks an idle account (gemini-b).
@@ -273,12 +276,3 @@ test('Gemini host sharded daemon policy, capacity=50 sharding, and fault isolati
     timeout: 12_000,
   })
 })
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

@@ -17,6 +17,11 @@ import {
   stopEgressProcess,
 } from '../../src/lib/vm/egress.mjs'
 
+const repoRoot = path.resolve(import.meta.dirname, '../..')
+test.before(() => {
+  if (!process.env.KIN_EGRESS_BIN) process.env.KIN_EGRESS_BIN = path.join(repoRoot, 'bin/kin-egress')
+})
+
 /** Minimal docker CLI double: tracks helper containers by name. */
 function fakeDocker() {
   const containers = new Map()

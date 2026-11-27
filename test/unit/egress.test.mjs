@@ -43,7 +43,12 @@ import {
 import { hostProxyUrlForVm } from '../../src/lib/vm/slot-host.mjs'
 
 // Process-ownership tests need the native helper so /proc/<pid>/exe identifies it.
-const egressBin = process.env.KIN_EGRESS_BIN || path.resolve(import.meta.dirname, '../../bin/kin-egress')
+const repoRoot = path.resolve(import.meta.dirname, '../..')
+if (!process.env.KIN_EGRESS_BIN) process.env.KIN_EGRESS_BIN = path.join(repoRoot, 'bin/kin-egress')
+const egressBin = process.env.KIN_EGRESS_BIN
+test.before(() => {
+  if (!process.env.KIN_EGRESS_BIN) process.env.KIN_EGRESS_BIN = path.join(repoRoot, 'bin/kin-egress')
+})
 
 async function waitForProcess(predicate, attempts = 100) {
   for (let i = 0; i < attempts; i++) {

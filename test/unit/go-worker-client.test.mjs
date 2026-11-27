@@ -24,7 +24,8 @@ import { callCodexKernel, streamCodexKernel } from '../../src/lib/transport/code
 import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-client.mjs'
 import { normalizeRedaction } from '../../src/lib/redaction/policy.mjs'
 import { publishRedactionForTests } from '../../src/lib/redaction/runtime.mjs'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { formatNodeKey } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+import { createM3FailoverRunner, seedAnthropicVmJson } from '../fixtures/scheduler-runtime-mock.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 import { mapUpstreamError } from '../../src/lib/core/errors.mjs'
 import { createAnthropicSseErrorRemapper } from '../../src/lib/protocol/stream-truncation.mjs'
@@ -2063,20 +2064,17 @@ unixTest('redaction 413 stops failover before any worker dispatch for call and s
       call === callCodexKernel || call === streamCodexKernel
         ? { input: 'fixture' }
         : { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'fixture' }] }
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'go-worker-redact-'))
+    seedAnthropicVmJson(root, { id: 'vm-fixture' }, { accountId: 'fixture' })
     let selections = 0
-    const runner = new FailoverRunner({
-      scheduler: {
-        async selectAndReserve() {
-          selections++
-          assert.equal(selections, 1, 'a local size error must not select another account')
-          return { ok: true, accountId: 'fixture', vmId: 'vm-fixture', release() {} }
-        },
-        markCooldown() {
-          assert.fail('a local size error must not cool down an account')
-        },
-      },
-      schedulerRuntime: makeStubSchedulerRuntime(),
-    })
+    const runner = createM3FailoverRunner(root, { execFactory: () => fx.exec })
+    const rt = runner.getSchedulerRuntime()
+    const nativeAcquire = rt.acquireNode.bind(rt)
+    rt.acquireNode = async (params, opts) => {
+      selections++
+      assert.equal(selections, 1, 'a local size error must not select another account')
+      return nativeAcquire({ ...params, pinNodeKey: formatNodeKey('claude_vm', 'vm-fixture') }, opts)
+    }
     const result = await runner.run({
       requestId: `redaction-size-${call.name}`,
       model: 'fixture-model',
@@ -2543,12 +2541,3 @@ unixTest(
     assert.equal(new Set([r1.hopRequestId, r2.hopRequestId, r3.hopRequestId]).size, 3)
   },
 )
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

@@ -11,6 +11,8 @@ import { RequestLogStore, summarizeBody } from '../../src/lib/admin/request-log.
 import { UsageLogsView } from '../../src/lib/db/repos/usage-logs-view.mjs'
 import { createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
+import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
+import { makeMockGeminiRuntime } from '../fixtures/scheduler-runtime-mock.mjs'
 import {
   FULL_GEMINI_CAPABILITIES,
   createGeminiCollector,
@@ -761,7 +763,9 @@ test('Gemini multi-attempt failover and all-429 errors populate hop_meta.attempt
     },
   ]
 
+  const hopPool = new PoolScheduler()
   const scheduler = createGeminiScheduler({
+    poolScheduler: hopPool,
     callHost: async (op, payload) => {
       if (op === 'list') return { payload_state: 'installed', environments: envs }
       if (op === 'get') return envs.find((e) => e.id === payload.id)
@@ -773,7 +777,7 @@ test('Gemini multi-attempt failover and all-429 errors populate hop_meta.attempt
         contentType: 'application/json',
       }),
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
-    schedulerRuntime: makeMockGeminiRuntime(),
+    schedulerRuntime: makeMockGeminiRuntime(hopPool),
   })
 
   const handler = createGeminiPublicHandler({
@@ -1394,11 +1398,4 @@ test('Gemini zero-token local MCP tool-drain continuations aggregate into parent
   assert.deepEqual(attemptRows.map((a) => a.request_id).sort(), rows.map((r) => r.request_id).sort())
 })
 
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'
+import { withM3SchedulerDeps } from '../fixtures/scheduler-runtime-mock.mjs'
