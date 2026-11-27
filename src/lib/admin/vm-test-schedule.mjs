@@ -769,6 +769,8 @@ export class VmTestScheduleRunner {
         prompt: schedule.prompt,
         max_tokens: schedule.max_tokens,
         reasoning_effort: schedule.reasoning_effort,
+        // #1874: preheat / auto-renew must not treat a bare 2xx as success.
+        requireCodexTerminal: schedule.mode === 'preheat',
       })
     } catch (error) {
       result = { ok: false, error }
