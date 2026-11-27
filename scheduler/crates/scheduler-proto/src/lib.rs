@@ -2,6 +2,7 @@ pub mod config;
 pub mod error;
 pub mod explain;
 pub mod ipc;
+pub mod serde_patch;
 pub mod types;
 
 pub use config::*;

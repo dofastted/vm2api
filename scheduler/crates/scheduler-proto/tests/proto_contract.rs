@@ -205,6 +205,20 @@ fn acquire_response_has_no_fallback_candidates_field() {
 }
 
 #[test]
+fn telemetry_temp_fields_json_null_means_clear_not_missing() {
+    let upd: NodeTelemetryUpdate = serde_json::from_str(
+        r#"{"node_key":"codex_vm:vm1","temp_unschedulable_until_ms":null,"temp_unschedulable_reason":null}"#,
+    )
+    .unwrap();
+    assert_eq!(upd.temp_unschedulable_until_ms, Some(None));
+    assert_eq!(upd.temp_unschedulable_reason, Some(None));
+
+    let partial: NodeTelemetryUpdate =
+        serde_json::from_str(r#"{"node_key":"codex_vm:vm1","schedulable":true}"#).unwrap();
+    assert_eq!(partial.temp_unschedulable_until_ms, None);
+}
+
+#[test]
 fn telemetry_batch_accepts_nodes_and_updates_alias() {
     let a: TelemetryBatchRequest =
         serde_json::from_str(r#"{"nodes":[{"node_key":"claude_vm:vm1","schedulable":false}]}"#)

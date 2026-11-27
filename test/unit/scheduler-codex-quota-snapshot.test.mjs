@@ -87,3 +87,37 @@ test('buildTelemetryBatch marks parked codex schedulable=false and exports temp 
   assert.equal(ok.schedulable, true)
   assert.equal(ok.temp_unschedulable_until_ms, null)
 })
+
+test('buildTelemetryBatch after manual restriction clear sends null temp fields for Rust clear', () => {
+  const now = Date.now()
+  const cleared = {
+    id: 'codex-cleared',
+    platform: 'openai',
+    status: 'running',
+    has_token: true,
+    schedulable: true,
+  }
+  const { runtime } = makeRuntime({ vms: [cleared] })
+  const update = runtime.buildTelemetryBatch({ now }).find((u) => u.node_key === 'codex_vm:codex-cleared')
+  assert.ok(update)
+  assert.equal(update.schedulable, true)
+  assert.equal(update.temp_unschedulable_until_ms, null)
+  assert.equal(update.temp_unschedulable_reason, null)
+})
+
+test('buildTelemetryBatch documents early clear: parked then VM fields removed yields schedulable + null', () => {
+  const now = Date.now()
+  const wasParkedNowClear = {
+    id: 'codex-early-clear',
+    platform: 'openai',
+    status: 'running',
+    has_token: true,
+    schedulable: true,
+  }
+  const { runtime } = makeRuntime({ vms: [wasParkedNowClear] })
+  const update = runtime.buildTelemetryBatch({ now }).find((u) => u.node_key === 'codex_vm:codex-early-clear')
+  assert.ok(update)
+  assert.equal(update.schedulable, true)
+  assert.equal(update.temp_unschedulable_until_ms, null)
+  assert.equal(update.temp_unschedulable_reason, null)
+})

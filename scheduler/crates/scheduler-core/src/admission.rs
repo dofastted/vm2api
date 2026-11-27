@@ -203,7 +203,11 @@ pub fn filter_members<'a>(
                 });
                 continue;
             }
-            if let Some(detail) = temp_park_detail(node, &st, now_ms) {
+            if let Some(detail) = temp_park_detail_live(
+                st.temp_unschedulable_until_ms,
+                st.temp_unschedulable_reason.as_deref(),
+                now_ms,
+            ) {
                 excluded.push(ExcludedEntry {
                     pool_id: pool.id.clone(),
                     node: node.node_key.clone(),
@@ -312,9 +316,7 @@ pub fn filter_members<'a>(
 
             snap_m
         } else {
-            if let Some(detail) =
-                temp_park_detail(node, &crate::node_state::NodeMutable::default(), now_ms)
-            {
+            if let Some(detail) = temp_park_detail_snapshot(node, now_ms) {
                 excluded.push(ExcludedEntry {
                     pool_id: pool.id.clone(),
                     node: node.node_key.clone(),
@@ -404,24 +406,22 @@ fn quota_soft_exhausted(
     st.quota_util_5h_pct >= lim5 || st.quota_util_7d_pct >= lim7
 }
 
-/// Fail-closed: prefer live telemetry, fall back to config snapshot baseline.
-fn temp_park_detail(
-    node: &BackendNodeConfig,
-    st: &crate::node_state::NodeMutable,
-    now_ms: u64,
-) -> Option<String> {
-    let until = st
-        .temp_unschedulable_until_ms
-        .or(node.temp_unschedulable_until_ms)
-        .filter(|u| *u > 0)?;
+fn temp_park_detail_live(until: Option<u64>, reason: Option<&str>, now_ms: u64) -> Option<String> {
+    let until = until.filter(|u| *u > 0)?;
     if until <= now_ms {
         return None;
     }
-    let reason = st
-        .temp_unschedulable_reason
-        .as_deref()
-        .or(node.temp_unschedulable_reason.as_deref())
+    let reason = reason
         .filter(|r| !r.is_empty())
         .unwrap_or("temp_unschedulable");
     Some(format!("temp_park_until_ms={until};reason={reason}"))
+}
+
+/// Bootstrap / no-runtime fail-closed: static snapshot baseline only.
+fn temp_park_detail_snapshot(node: &BackendNodeConfig, now_ms: u64) -> Option<String> {
+    temp_park_detail_live(
+        node.temp_unschedulable_until_ms,
+        node.temp_unschedulable_reason.as_deref(),
+        now_ms,
+    )
 }

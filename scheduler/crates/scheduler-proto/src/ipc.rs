@@ -84,7 +84,7 @@ pub struct NodeTelemetryUpdate {
     pub node_key: NodeKey,
     #[serde(default)]
     pub schedulable: Option<bool>,
-    #[serde(default)]
+    #[serde(default, with = "crate::serde_patch::double_option")]
     pub unschedulable_reason: Option<Option<CompactString>>,
     #[serde(default)]
     pub active_hours_ok: Option<bool>,
@@ -103,9 +103,9 @@ pub struct NodeTelemetryUpdate {
     pub external_in_flight: Option<u32>,
     #[serde(default)]
     pub runtime_capabilities: Option<BTreeMap<String, bool>>,
-    #[serde(default)]
+    #[serde(default, with = "crate::serde_patch::double_option")]
     pub temp_unschedulable_until_ms: Option<Option<u64>>,
-    #[serde(default)]
+    #[serde(default, with = "crate::serde_patch::double_option")]
     pub temp_unschedulable_reason: Option<Option<CompactString>>,
 }
 

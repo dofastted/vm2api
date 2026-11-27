@@ -129,15 +129,23 @@ impl NodeMutable {
             self.crag_license_ok = v;
         }
         if let Some(v) = &upd.temp_unschedulable_until_ms {
-            self.temp_unschedulable_until_ms = *v;
-            if v.map(|until| until <= u64::MAX / 2).unwrap_or(true) {
-                // Clearing or shortening the park window may free the node for admission.
-                if v.map(|until| until == 0).unwrap_or(true) {
+            if v.is_none() && self.temp_unschedulable_until_ms.is_some() {
+                became_freer = true;
+            } else if let Some(until) = v {
+                if self
+                    .temp_unschedulable_until_ms
+                    .map(|prev| prev > *until)
+                    .unwrap_or(false)
+                {
                     became_freer = true;
                 }
             }
+            self.temp_unschedulable_until_ms = *v;
         }
         if let Some(v) = &upd.temp_unschedulable_reason {
+            if v.is_none() && self.temp_unschedulable_reason.is_some() {
+                became_freer = true;
+            }
             self.temp_unschedulable_reason = v.clone();
         }
         if let Some(v) = upd.external_in_flight {

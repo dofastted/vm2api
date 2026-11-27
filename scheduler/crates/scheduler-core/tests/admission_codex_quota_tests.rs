@@ -253,3 +253,54 @@ fn temp_unschedulable_parks_slot_from_snapshot_baseline() {
     let (admitted_later, _) = filter_members(&snap, &snap.raw.pools[0], &req, &nodes, until + 1);
     assert_eq!(admitted_later.len(), 1);
 }
+
+#[test]
+fn temp_unschedulable_early_clear_via_telemetry_null_re_admits_despite_stale_snapshot() {
+    let until = 9_000_000u64;
+    let node = codex_node("clr", Some(until), Some("quota_5h_local"));
+    let snap = IndexedSnapshot::from_config(ConfigSnapshot {
+        config_version: 1,
+        pools: vec![pool_with(node.clone())],
+        nodes: vec![node.clone()],
+        ..Default::default()
+    });
+    let req = make_req("gpt-5.1-codex", ModelFamily::Openai);
+    let nodes: DashMap<NodeKey, Arc<NodeRuntimeState>> = DashMap::new();
+
+    seed_node(
+        &nodes,
+        &node.node_key,
+        NodeTelemetryUpdate {
+            node_key: node.node_key.clone(),
+            schedulable: Some(false),
+            temp_unschedulable_until_ms: Some(Some(until)),
+            temp_unschedulable_reason: Some(Some(CompactString::const_new("quota_5h_local"))),
+            ..Default::default()
+        },
+    );
+    let (_, excluded) = filter_members(&snap, &snap.raw.pools[0], &req, &nodes, until - 1);
+    assert_eq!(excluded.len(), 1);
+
+    let rt = nodes.get(&node.node_key).unwrap();
+    let clear = NodeTelemetryUpdate {
+        node_key: node.node_key.clone(),
+        schedulable: Some(true),
+        temp_unschedulable_until_ms: Some(None),
+        temp_unschedulable_reason: Some(None),
+        ..Default::default()
+    };
+    {
+        let mut st = rt.inner.lock();
+        st.apply_telemetry(&clear);
+    }
+    assert_eq!(rt.inner.lock().temp_unschedulable_until_ms, None);
+
+    let (admitted, excluded_after) =
+        filter_members(&snap, &snap.raw.pools[0], &req, &nodes, until - 1);
+    assert_eq!(
+        excluded_after.len(),
+        0,
+        "cleared telemetry must override stale snapshot until"
+    );
+    assert_eq!(admitted.len(), 1);
+}
