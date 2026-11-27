@@ -131,8 +131,8 @@ test('scheduler rejects stream with sandbox denial via checkAdmission (503, not 
   )
 })
 
-test('scheduler rejects stream with host resource denial via checkAdmission (503, not license_required)', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-host-resource-stream-'))
+test('scheduler catalog surfaces host resource denial via checkAdmission (503, not license_required)', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-host-resource-catalog-'))
   const subscription = makeSubscription(root)
   const scheduler = createGeminiScheduler({
     cragSubscription: subscription,
@@ -142,16 +142,13 @@ test('scheduler rejects stream with host resource denial via checkAdmission (503
     },
     proxyPool,
   })
-  await assert.rejects(
-    () =>
-      scheduler.stream({
-        model: 'gemini-2.5-flash',
-        geminiBody: { contents: [{ role: 'user', parts: [{ text: 'hi' }] }] },
-      }),
-    (err) =>
-      err.status === 503 &&
-      err.code === 'gemini_host_resource_exhausted' &&
-      err.message === GEMINI_HOST_RESOURCE_MESSAGES.gemini_host_resource_exhausted,
+  const catalog = await scheduler.catalog()
+  assert.equal(catalog.unlicensedAccounts.length, 1)
+  assert.equal(catalog.unlicensedAccounts[0].denial.status, 503)
+  assert.equal(catalog.unlicensedAccounts[0].denial.code, 'gemini_host_resource_exhausted')
+  assert.equal(
+    catalog.unlicensedAccounts[0].denial.message,
+    GEMINI_HOST_RESOURCE_MESSAGES.gemini_host_resource_exhausted,
   )
 })
 
