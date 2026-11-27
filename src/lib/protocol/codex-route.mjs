@@ -40,6 +40,10 @@ export const DEFAULT_CODEX_ROUTING = Object.freeze({
     unknown: 'allow',
   },
   quota: normalizeOpenAIQuotaPolicy(),
+  recovery: {
+    /** Default conservative: keep session on a recovering slot when higher-P normals exist. */
+    sticky_keep_session: true,
+  },
 })
 
 function typedError(message, code) {
@@ -168,6 +172,9 @@ export function normalizeCodexRouting(raw = {}) {
     clients,
     quota: normalizeOpenAIQuotaPolicy(src.quota),
     model_mappings: normalizeCodexModelMappings(src.model_mappings),
+    recovery: {
+      sticky_keep_session: src.recovery?.sticky_keep_session !== false,
+    },
   }
 }
 

@@ -3,6 +3,8 @@ import { Cron } from 'croner'
 import { validTimezone } from '../core/timezone.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
+import { normalizeRecoveryCooldownMinutes, RECOVERY_MINUTES_MAX } from '../pool/codex-recovery.mjs'
+import { isCodexVmTestTerminalSuccess } from './vm-test-terminal.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { listTestableModels } from './vm-test-chat.mjs'
 
@@ -38,6 +40,9 @@ export function mergeVmTestSchedulePreserve(input, previous = {}) {
   if (!Object.hasOwn(out, 'auto_renew') && prev.auto_renew === true) {
     const effectiveMode = Object.hasOwn(out, 'mode') && out.mode != null ? String(out.mode) : String(prev.mode || '')
     if (effectiveMode === 'preheat') out.auto_renew = true
+  }
+  if (!Object.hasOwn(out, 'recovery_cooldown_minutes') && prev.recovery_cooldown_minutes != null) {
+    out.recovery_cooldown_minutes = prev.recovery_cooldown_minutes
   }
   return out
 }
@@ -265,10 +270,20 @@ export function normalizeVmTestSchedule(input, vm) {
     throw new VmTestScheduleError('Claude schedules require max_tokens and omit reasoning_effort')
   }
 
+  let recoveryCooldownMinutes
+  if (isCodexVm(vm) && input.recovery_cooldown_minutes != null && input.recovery_cooldown_minutes !== '') {
+    const n = Number(input.recovery_cooldown_minutes)
+    if (!Number.isInteger(n) || n < 0 || n > RECOVERY_MINUTES_MAX) {
+      throw new VmTestScheduleError(`recovery_cooldown_minutes must be an integer from 0 to ${RECOVERY_MINUTES_MAX}`)
+    }
+    recoveryCooldownMinutes = n
+  }
+
   return {
     enabled,
     mode,
     auto_renew: autoRenew,
+    ...(recoveryCooldownMinutes != null ? { recovery_cooldown_minutes: recoveryCooldownMinutes } : {}),
     ...structure,
     cron,
     model,
@@ -397,6 +412,8 @@ export class VmTestScheduleRunner {
      */
     windowState = null,
     nextWindowEnd = null,
+    codexRecovery = null,
+    quotaPolicy = null,
   } = {}) {
     this.projectRoot = projectRoot
     this.settingsFactory = typeof settings === 'function' ? settings : () => settings
@@ -405,6 +422,8 @@ export class VmTestScheduleRunner {
     this.now = now
     this.windowState = typeof windowState === 'function' ? windowState : null
     this.nextWindowEnd = typeof nextWindowEnd === 'function' ? nextWindowEnd : null
+    this.codexRecovery = codexRecovery
+    this.quotaPolicy = quotaPolicy
     this.jobs = new Map()
     this.running = new Set()
     this.started = false
@@ -439,6 +458,7 @@ export class VmTestScheduleRunner {
         enabled: raw.enabled === true,
         mode: SCHEDULE_MODES.has(String(raw.mode)) ? String(raw.mode) : 'test',
         auto_renew: raw.auto_renew === true,
+        recovery_cooldown_minutes: raw.recovery_cooldown_minutes ?? undefined,
         ...structure,
         cron,
         model: String(raw.model || ''),
@@ -502,6 +522,7 @@ export class VmTestScheduleRunner {
         enabled: raw.enabled === true,
         mode: SCHEDULE_MODES.has(String(raw.mode)) ? String(raw.mode) : 'test',
         auto_renew: raw.auto_renew === true,
+        recovery_cooldown_minutes: raw.recovery_cooldown_minutes ?? null,
         model: String(raw.model || ''),
         prompt: String(raw.prompt || ''),
         max_tokens: raw.max_tokens ?? null,
@@ -752,6 +773,11 @@ export class VmTestScheduleRunner {
     const schedule = this._stored(vmId)
     if (!schedule?.enabled) return
     const startedAt = this.now()
+    const vm = this._vm(vmId)
+    const beforeResets =
+      schedule.mode === 'preheat' && vm && isCodexVm(vm) && this.codexRecovery
+        ? this.codexRecovery.snapshotResets(vm)
+        : null
     // #979: a preheat never fires into a live window, and never retries a
     // slot the pool already parked (no ticket, dead grant, 不可调度).
     if (schedule.mode === 'preheat') {
@@ -777,6 +803,17 @@ export class VmTestScheduleRunner {
     }
     if (!this.started) return
     this._recordRun(vmId, schedule, startedAt, result)
+    if (schedule.mode === 'preheat' && vm && isCodexVm(vm) && this.codexRecovery && result?.ok && !result?.skipped) {
+      this.codexRecovery.tryStartAfterPreheat({
+        projectRoot: this.projectRoot,
+        vmId,
+        result,
+        schedule,
+        beforeResets,
+        quotaPolicy: typeof this.quotaPolicy === 'function' ? this.quotaPolicy() : this.quotaPolicy,
+        at: this.now(),
+      })
+    }
   }
 
   /** Why a preheat did not fire: { fire: false, reason } or { fire: true }. */
@@ -796,7 +833,10 @@ export class VmTestScheduleRunner {
     const lastDuration =
       Number.isSafeInteger(duration) && duration >= 0 ? duration : Math.max(0, this.now() - startedAt)
     const skipped = result?.skipped || null
-    const lastOk = skipped ? null : result?.ok === true
+    const vm = this._vm(vmId)
+    const preheatCodex = schedule.mode === 'preheat' && vm && isCodexVm(vm)
+    let lastOk = skipped ? null : result?.ok === true
+    if (!skipped && preheatCodex) lastOk = isCodexVmTestTerminalSuccess(result)
     this._settings().set(keyFor(vmId), {
       ...current,
       last_run_at: new Date(startedAt).toISOString(),

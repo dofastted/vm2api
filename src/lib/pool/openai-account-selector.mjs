@@ -1,10 +1,3 @@
-/**
- * OpenAI / Codex account blocker diagnostics (stateless).
- *
- * M3 cutover (D4): all OpenAI/Codex account selection, tiering, SWRR, sticky
- * affinity, cooldowns, and session serialization live solely in the Rust
- * `kin-scheduler` engine. Legacy Node scoring/sorting selectors were removed.
- */
 import { isCodexSlotParked } from './codex-slot-pool.mjs'
 
 /**

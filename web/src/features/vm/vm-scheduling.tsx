@@ -484,7 +484,25 @@ export function VmSchedulingBlock({
           label='调度优先级'
           value={
             Number.isInteger(level) && level >= 1 && level <= 10
-              ? `${level} · ${vm.schedule_level_mode === 'manual' ? '手动' : '自动'}`
+              ? (() => {
+                  const effective = Number(vm.schedule_level_effective ?? level)
+                  const inRecovery =
+                    codex &&
+                    effective === 1 &&
+                    effective !== level &&
+                    (vm.recovery_cooldown_remaining_ms ?? 0) > 0
+                  const mode =
+                    vm.schedule_level_effective_mode === 'recovery'
+                      ? `有效 P${effective}（原 P${level} · ${
+                          vm.schedule_level_mode === 'manual' ? '手动' : '自动'
+                        }）`
+                      : `${level} · ${vm.schedule_level_mode === 'manual' ? '手动' : '自动'}`
+                  if (!inRecovery) return mode
+                  const mins = Math.ceil(
+                    (vm.recovery_cooldown_remaining_ms ?? 0) / 60_000
+                  )
+                  return `${mode} · 冷却剩余约 ${mins} 分`
+                })()
               : '—'
           }
           own={vm.schedule_level_mode === 'manual'}

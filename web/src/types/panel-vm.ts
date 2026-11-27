@@ -551,6 +551,11 @@ export type Vm = {
   schedule_level?: number
   /** 调度等级来源；缺失时按自动模式展示。 */
   schedule_level_mode?: 'auto' | 'manual'
+  /** Codex 恢复冷却期内的实际选槽优先级（常为 1）。 */
+  schedule_level_effective?: number
+  schedule_level_effective_mode?: string
+  recovery_cooldown_until?: string | null
+  recovery_cooldown_remaining_ms?: number
   /** 所属统一分组池列表（前端聚合或后端附带）。 */
   pools?: PoolBriefRef[]
   /** 本槽工作时段；null / 缺省 = 24h 接单。窗口外不参与调度。 */

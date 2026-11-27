@@ -93,6 +93,7 @@ import { normalizeNotifyConfig, createNotifyMonitor, dispatchNotify } from './li
 import { snapshotVmConnectivity } from './lib/admin/vm-connectivity.mjs'
 import { runVmTestChat } from './lib/admin/vm-test-chat.mjs'
 import { VmTestScheduleRunner } from './lib/admin/vm-test-schedule.mjs'
+import { createCodexRecoveryStore, setCodexRecoveryStore } from './lib/pool/codex-recovery.mjs'
 import { preheatNextWindowEnd, preheatWindowState } from './lib/admin/vm-test-preheat-window.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
@@ -760,10 +761,21 @@ healthMonitor = createHealthProbeMonitor({
     }
   },
 })
+const codexRecoveryStore = createCodexRecoveryStore({
+  settingsRepo: {
+    get: (key, fallback) => new SettingsRepo().get(key, fallback),
+    set: (key, value) => new SettingsRepo().set(key, value),
+    remove: (key) => new SettingsRepo().remove?.(key),
+  },
+})
+setCodexRecoveryStore(codexRecoveryStore)
+
 const vmTestSchedule = new VmTestScheduleRunner({
   projectRoot: cfg.paths.project,
   settings: () => new SettingsRepo(),
   list: () => listVms(cfg.paths.project),
+  codexRecovery: codexRecoveryStore,
+  quotaPolicy: () => routingConfig.codex?.quota,
   runTest: (vmId, params) =>
     runVmTestChat({
       projectRoot: cfg.paths.project,

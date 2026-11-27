@@ -15,6 +15,7 @@ import {
   resolvePreheatFiveHourWindow,
 } from '../../src/lib/admin/vm-test-preheat-window.mjs'
 import { parseResetMs } from '../../src/lib/pool/quota-window.mjs'
+import { createCodexRecoveryStore, setCodexRecoveryStore } from '../../src/lib/pool/codex-recovery.mjs'
 
 const FIXED_NOW = Date.parse('2026-10-01T12:00:00.000Z')
 const RESET_FUTURE_MS = FIXED_NOW + 6 * 3600_000
@@ -223,6 +224,38 @@ test('auto-renew sweep fires preheat when Codex 5h reset has elapsed', async () 
   await schedule._sweepElapsedWindows()
   assert.equal(calls, 1)
   schedule.stop()
+})
+
+test('preheat run records failure when terminal event is missing', async () => {
+  const settings = new MemorySettings()
+  settings.set(`${VM_TEST_SCHEDULE_PREFIX}vm-codex`, {
+    enabled: true,
+    mode: 'preheat',
+    auto_renew: false,
+    frequency: 'daily',
+    time: '09:00',
+    timezone: 'Asia/Shanghai',
+    cron: '0 9 * * *',
+    model: 'gpt-5-codex',
+    prompt: 'ping',
+    max_tokens: null,
+    reasoning_effort: 'medium',
+  })
+  const store = createCodexRecoveryStore({ settingsRepo: settings, now: () => FIXED_NOW })
+  setCodexRecoveryStore(store)
+  const schedule = new VmTestScheduleRunner({
+    projectRoot: '/missing',
+    settings: () => settings,
+    list: () => [codexVm],
+    runTest: async () => ({ ok: true, stop_reason: 'incomplete' }),
+    codexRecovery: store,
+    now: () => FIXED_NOW,
+  })
+  schedule.start()
+  await schedule._run('vm-codex')
+  schedule.stop()
+  const saved = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-codex`)
+  assert.equal(saved.last_ok, false)
 })
 
 test('fiveHourWindowFromCodexVm reads vm file extra on disk', () => {

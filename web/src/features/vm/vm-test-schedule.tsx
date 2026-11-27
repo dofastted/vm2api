@@ -51,6 +51,7 @@ export type TestSchedule = {
   last_error: string | null
   next_run_at: string | null
   running: boolean
+  recovery_cooldown_minutes?: number | null
 }
 
 export type ScheduleStructure = Pick<
@@ -220,6 +221,9 @@ export function VmTestSchedule({
     useState<ScheduleStructure>(defaultStructure)
   const [syncOpen, setSyncOpen] = useState(false)
   const [syncAllOpen, setSyncAllOpen] = useState(false)
+  const [recoveryCooldownMinutes, setRecoveryCooldownMinutes] = useState<
+    number | ''
+  >('')
   const scheduleQuery = useQuery({
     queryKey,
     queryFn: ({ queryKey: key, signal }) =>
@@ -254,6 +258,11 @@ export function VmTestSchedule({
     setStale(false)
     setEnabled(schedule.enabled)
     setStructure(structureFromSchedule(schedule))
+    setRecoveryCooldownMinutes(
+      schedule.recovery_cooldown_minutes != null
+        ? schedule.recovery_cooldown_minutes
+        : ''
+    )
     onLoadSchedule(schedule)
   }
 
@@ -293,7 +302,12 @@ export function VmTestSchedule({
       prompt.trim() !== saved.prompt ||
       (codex
         ? reasoningEffort !== saved.reasoning_effort
-        : maxTokens !== saved.max_tokens)
+        : maxTokens !== saved.max_tokens) ||
+      (codex &&
+        (recoveryCooldownMinutes === ''
+          ? saved.recovery_cooldown_minutes != null
+          : Number(recoveryCooldownMinutes) !==
+            (saved.recovery_cooldown_minutes ?? null)))
     : enabled || !structureEqual(structure, defaultStructure())
 
   const save = useMutation({
@@ -307,7 +321,16 @@ export function VmTestSchedule({
           model: selectedModel,
           prompt,
           ...(codex
-            ? { reasoning_effort: reasoningEffort }
+            ? {
+                reasoning_effort: reasoningEffort,
+                ...(recoveryCooldownMinutes === ''
+                  ? {}
+                  : {
+                      recovery_cooldown_minutes: Number(
+                        recoveryCooldownMinutes
+                      ),
+                    }),
+              }
             : { max_tokens: maxTokens }),
         }),
       }),
@@ -545,6 +568,31 @@ export function VmTestSchedule({
                 当前：{structure.timezone} · 真实调用会消耗额度
               </p>
             </div>
+
+            {codex ? (
+              <div className='space-y-1.5 sm:col-span-2'>
+                <Label htmlFor={`vm-test-recovery-${vm.id}`}>
+                  恢复冷却（分钟）
+                </Label>
+                <Input
+                  id={`vm-test-recovery-${vm.id}`}
+                  type='number'
+                  min={0}
+                  max={1440}
+                  placeholder='默认 15；0 关闭'
+                  value={recoveryCooldownMinutes}
+                  onChange={(event) => {
+                    const raw = event.target.value
+                    setRecoveryCooldownMinutes(
+                      raw === '' ? '' : Number.parseInt(raw, 10)
+                    )
+                  }}
+                />
+                <p className='text-xs text-muted-foreground'>
+                  续热成功并确认配额刷新后的临时 P1 冷却；仅 Codex 槽。
+                </p>
+              </div>
+            ) : null}
 
             {structure.frequency === 'weekly' ? (
               <div className='space-y-2 sm:col-span-2'>

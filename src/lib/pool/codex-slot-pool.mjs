@@ -20,6 +20,7 @@ import { modelMatchesAllowlist } from './slot-model-gate.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { activeHoursOf, evaluateActiveHours } from './active-hours.mjs'
 import { effectiveOpenAIPolicy, evaluateOpenAIQuotaGate, normalizeOpenAIQuotaPolicy } from './openai-quota-policy.mjs'
+import { codexRecoveryOverlay, RECOVERY_LEVEL } from './codex-recovery.mjs'
 
 // `stopped` is leftover Claude docker lifecycle. Codex kernel is independent.
 const HARD_UNAVAILABLE = new Set(['dead', 'error', 'disabled'])
@@ -136,8 +137,19 @@ export function isCodexSlotParked(vm, now = Date.now(), policy = null) {
   return extraPark(vm, now).limited || evaluateOpenAIQuotaGate(vm, policy || {}, now).limited
 }
 
-export function codexScheduleLevel(vm, now = Date.now(), resetAt = quotaReset7dAt(vm)) {
-  return resolveCredentialScheduleLevel({ vm, manualLevel: vm?.schedule_level_manual ?? undefined, resetAt, now })
+export function codexScheduleLevel(vm, now = Date.now(), resetAt = quotaReset7dAt(vm), { quotaPolicy = null } = {}) {
+  const base = resolveCredentialScheduleLevel({ vm, manualLevel: vm?.schedule_level_manual ?? undefined, resetAt, now })
+  const overlay = vm?.id ? codexRecoveryOverlay(vm.id, now, { vm, quotaPolicy }) : null
+  if (!overlay) return base
+  return {
+    ...base,
+    level: RECOVERY_LEVEL,
+    mode: 'recovery',
+    base_level: overlay.base_level ?? base.level,
+    base_mode: overlay.base_mode ?? base.mode,
+    recovery_until: new Date(overlay.until).toISOString(),
+    recovery_remaining_ms: overlay.remaining_ms,
+  }
 }
 
 export function codexAccountStatus(vm, now = Date.now(), policy = null) {
@@ -274,7 +286,9 @@ export function pickCodexSlots(vms, { pin = null, now = Date.now(), quotaPolicy 
     else ready.push(vm)
   }
   ready.sort((a, b) => {
-    const d = codexScheduleLevel(b, now).level - codexScheduleLevel(a, now).level || stressOf(a) - stressOf(b)
+    const d =
+      codexScheduleLevel(b, now, undefined, { quotaPolicy }).level -
+        codexScheduleLevel(a, now, undefined, { quotaPolicy }).level || stressOf(a) - stressOf(b)
     return d !== 0 ? d : String(a.id).localeCompare(String(b.id))
   })
   parked.sort((a, b) => {

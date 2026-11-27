@@ -66,6 +66,7 @@ import {
   refreshCodexAccessToken,
 } from './codex-models.mjs'
 import { codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
+import { getCodexRecoveryStore } from '../pool/codex-recovery.mjs'
 import { applyOpenaiWashLog } from './openai-wash.mjs'
 import { canonicalImageToolModel, imageGenerationTools } from './image-tool-models.mjs'
 import { isImageToolModelEnabled, resolveGptFastAlias } from './gpt-model-policy.mjs'
@@ -233,6 +234,9 @@ function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = nu
     const park = extra ? codexQuotaPark(extra, now) : { limited: true, until: now + CODEX_DEFAULT_PARK_MS }
     limitedUntil = park.until || now + CODEX_DEFAULT_PARK_MS
     quotaExceeded = String(result?.body?.error?.code || result?.error_code || '') === 'usage_limit_reached'
+    try {
+      getCodexRecoveryStore()?.recordRateLimit?.(vmId, now)
+    } catch {}
   }
   if (!extra && !limitedUntil && !codexCreditsFromHeaders(headers, now)) return null
   return persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUntil, quotaExceeded, now, policy })

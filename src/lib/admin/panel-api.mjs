@@ -66,6 +66,7 @@ import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { accountIdOf, familyLimitsOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { codexMaxSessions, codexScheduleLevel } from '../pool/codex-slot-pool.mjs'
+import { getCodexRecoveryStore } from '../pool/codex-recovery.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
 import { activeHoursZoneOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import {
@@ -1248,7 +1249,9 @@ export async function buildProbeOne({
         ok: !!result.ok,
         source: 'vm-oauth-usage',
         at: result.fetched_at || new Date().toISOString(),
-        ...(result.ok ? {} : { error: result.message || result.error || 'GPT quota probe failed', status: result.status || null }),
+        ...(result.ok
+          ? {}
+          : { error: result.message || result.error || 'GPT quota probe failed', status: result.status || null }),
       })
     } catch {}
     if (!result.ok) return gptQuotaFail(result)
@@ -2039,14 +2042,25 @@ function enrichVm(v, accountQuota, active, extras = {}) {
   )
   const fablePool = fablePoolFields(acc, runtime, extras.pool || {}, extras.routingConfig || {}, v)
   const isCodex = isCodexVm(v)
+  const openAIGlobalPolicy = normalizeOpenAIQuotaPolicy(extras.routingConfig?.codex?.quota)
+  if (isCodex && getCodexRecoveryStore()) {
+    getCodexRecoveryStore().maybeExpire(v.id, {
+      vm: v,
+      quotaPolicy: openAIGlobalPolicy,
+      projectRoot: extras.projectRoot,
+    })
+  }
   const scheduleLevel = isCodex
     ? codexScheduleLevel(v)
     : resolveCredentialScheduleLevel({ manualLevel: v.schedule_level_manual, unified: acc?.unified || {} })
+  const recoveryView =
+    isCodex && getCodexRecoveryStore()
+      ? getCodexRecoveryStore().get(v.id)
+      : { active: false, remaining_ms: 0, state: null }
   // OpenAI quota mirrors are observations; admission uses the current raw windows and policy.
   if (isCodex && isQuotaWindowReason(v.temp_unschedulable_reason)) {
     v = { ...v, temp_unschedulable_until: null, temp_unschedulable_reason: null }
   }
-  const openAIGlobalPolicy = normalizeOpenAIQuotaPolicy(extras.routingConfig?.codex?.quota)
   const openAIEffective = isCodex ? effectiveOpenAIPolicy(v, openAIGlobalPolicy) : null
   const mergedQuota = isCodex ? v.codex_usage?.quota || {} : q
   const u5 = mergedQuota.utilization_5h
@@ -2282,8 +2296,13 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     rpm: isCodex ? openAIRuntimeSignals(v.id).rpmCount : (acc?.rpm ?? 0),
     allowed_models: Array.isArray(v.allowed_models) ? v.allowed_models : null,
     weight: v.weight ?? 1,
-    schedule_level: scheduleLevel.level,
-    schedule_level_mode: scheduleLevel.mode,
+    schedule_level: scheduleLevel.base_level ?? scheduleLevel.level,
+    schedule_level_mode: scheduleLevel.base_mode ?? scheduleLevel.mode,
+    schedule_level_effective: scheduleLevel.level,
+    schedule_level_effective_mode: scheduleLevel.mode,
+    recovery_cooldown_until:
+      recoveryView.active && recoveryView.state?.until ? new Date(recoveryView.state.until).toISOString() : null,
+    recovery_cooldown_remaining_ms: recoveryView.active ? recoveryView.remaining_ms : 0,
     active_hours: activeHours,
     active_hours_timezone: activeHours ? activeHoursZone : null,
     // Window state on its own: availability may carry a stronger reason (cool, quota).
@@ -2492,8 +2511,8 @@ function findRuntime(accountQuota, vm, snap = null) {
         leftoverKey &&
         (!cred.has_access ||
           /refresh_token_missing|invalid_grant|token_revoked|invalidated oauth token|worker_unhealthy/.test(
-          err + String(state.status || '')
-        ))
+            err + String(state.status || ''),
+          ))
       const live = !!(vm.has_refresh || vm.has_token || vm.account_uuid)
       if (leftover && live) continue
       return freshenRuntimeState(state, vm, repo)
@@ -2527,7 +2546,7 @@ function freshenRuntimeState(state, vm, repo = null) {
   const lastError = String(state.worker_status?.last_error || state.worker_status?.error || '')
   const leftover =
     /invalid_grant|refresh token not found|oauth_revoked|credential_refresh_failed|token_revoked|invalidated oauth token/i.test(
-      lastError
+      lastError,
     )
   const wMs = expiresAtToMs(cred?.expires_at)
   const vMs = expiresAtToMs(vm.expires_at)
