@@ -37,6 +37,7 @@ const PASS_LABEL = {
   jev: 'Jev 模型放行',
   regex: '正则未命中',
   'fail-open': '模型故障放行',
+  classifier: '内置分类器豁免',
   unchecked: '未检查',
   platform: 'OpenAI 平台未接入',
   scope: '账号不在范围',
