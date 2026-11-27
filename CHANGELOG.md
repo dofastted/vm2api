@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.4.235 — 2026-11-27 · 过期且刷新失败的 Claude 槽自动移出调度、CRAG v2 槽位未回收子进程可选自动维护守卫
+## 1.4.236 — 2026-11-27 · 过期且刷新失败的 Claude 槽自动移出调度、CRAG v2 槽位未回收子进程可选自动维护守卫
 
 - **过期且刷新失败的 Claude 槽移出调度与实时凭证核验（#1947）**：
   - `src/lib/pool/availability.mjs` 新增 `isAccessExpiredEverywhere()` 与 `EXPIRED_CREDENTIAL_REFRESH_FAIL`：当所有可见过期时间（调用方传入、`workerCredential.expires_at`、`vm.claude.expires_at`、`vm.expires_at`，取最晚值）均已过期且记录了真正的 OAuth 刷新失败（`refresh_failed`、`oauth_refresh_failed`、`refresh_outcome_unknown`、`invalid_refresh_token`、`credential_required`）时，`isCredentialRefreshFailed()` 判为 `无效凭证`（`credential_refresh_failed`）并经 `vmHasSchedulableCredential()` 移出调度，避免无有效令牌的槽位持续启动 CLI 静默超时并误触发「内核故障」。
@@ -10,7 +10,18 @@
   - 新增默认关闭的 `routing.crag_zombie_guard`（`src/lib/vm/crag-zombie-guard.mjs`、`docs/crag-gateway-zombies.md`）：按间隔通过正常槽内执行路径只读扫描 `/proc`，统计父进程为 `--gateway-worker` 的僵尸子进程（防扫描脚本自身 argv 误计）；当计数达到阈值或内核故障且槽位空闲时，每轮至多通过 `withVmLock` + `recoverSlot` 重启一个槽位。
   - `nativeKernelBusy()` 计入 CRAG v2 `idle` 热复用进程（仅 `pids.length > idle` 或 `active_requests`/`continuations`/`queued`/`active`/`waiting`/`cleaning`/`recovering` 非空时判忙）；`recoverSlot()` 新增可选 `beforeStop`、`verifyAfter` 与 `clearUnschedulable: false`，在 `HOLD_MAINTENANCE` 与 `waitForSlotDrain` 之后复检目标、调度态与原生空闲，禁止后台守卫清除既有 `unschedulable`，并在释放维护持锁前完成出口指纹校验与僵尸复扫（单次瞬态 `null` 扫描自动重试一次）。
   - 校验失败时标记 `unschedulable`（新增 `maintenance_failed`「自动维护失败」原因码）并在 `routing.notify.enabled` 开启时发送告警通知；同步补齐 `src/lib/admin/routing-runtime.mjs` 与 `src/lib/admin/panel-routes.mjs` 的 `crag_zombie_guard` 配置热更新与回滚同步。
-- 部署说明：本次改动仅涉及控制面（`src/lib/`、`src/server.mjs`）与文档（`docs/crag-gateway-zombies.md`），零前端改动、零数据库迁移；`deploy/payload.json`（`kin-kernel` `b2dbec57…`、`CRAG 3.1.24`、`CRAGGemini 0.4.14`）、Gemini 宿主/维护脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.234` 均未变。预期 **`SLOT_SYNC=skip`**，无需执行 `wrap-cli/sync`、无需重启 `vm2api-gemini` 或任何既有 `kin-*` 槽位，重启 `vm2api` 一次即可生效。
+- 部署说明：本次改动仅涉及控制面（`src/lib/`、`src/server.mjs`）与文档（`docs/crag-gateway-zombies.md`），零前端改动、零数据库迁移；`deploy/payload.json`（`kin-kernel` `b2dbec57…`、`CRAG 3.1.24`、`CRAGGemini 0.4.14`）、Gemini 宿主/维护脚本与 `bin/` / `share/wrap-cli` 相对 `1.4.235` 均未变。预期 **`SLOT_SYNC=skip`**，无需执行 `wrap-cli/sync`、无需重启 `vm2api-gemini` 或任何既有 `kin-*` 槽位，重启 `vm2api` 一次即可生效。
+
+## 1.4.235 — 2026-11-27 · JEV 降误封热修：豁免 Claude Code `auto_mode_classifier`、内置题库 v2.1 与置信度分层封禁
+
+- **前置审查豁免 Claude Code `auto_mode_classifier` 旁路请求（#1962）**：
+  - `applyProtocolIntercept` 提前识别 `classifyClaudeRequestPurpose(inbound, { officialTraffic: official })`，对 `auto_mode_classifier` 旁路安全自检请求保留既有已封禁会话/设备拦阻，但跳过 `blocked_tool`、`system_prompt_rewrite`、硬正则、拒答缓存与 JEV 评审（标记 `by: 'classifier'` /「内置分类器豁免」），与后置 `refusalSessionBlockDecision` 保持一致，避免将审查模板误判并永久封死主编码会话。
+- **内置题库升级至 v2.1 并自动无感迁移（#1962）**：
+  - `USAGE_POLICY_INSTRUCTION` 补充豁免 Claude Code 自动安全审查模板（`<transcript>`、`err on the side of blocking`、`<block>`）与本地测试账号/密码脚本；`NSFW_INSTRUCTION` 明确放行不含露骨性内容或性器官描写的日常情感安慰与普通恋爱拥抱对话。
+  - 将 `1.4.234` v2 内置文案纳入 `LEGACY_BUILTIN_INSTRUCTIONS` / `LEGACY_SAFETY_INSTRUCTIONS`，未手改面板文案升级后自动刷新生效。
+- **JEV 封禁置信度分层（拦截与三振封禁解耦，#1962）**：
+  - 新增 `JEV_BAN_CONFIDENCE_FLOOR = 0.25` 与 `shouldEscalateJevBan()`：单题非 `nsfw` 处于中等区间（`0.25 <= score < threshold - 0.08`）时仅返回单次 `429`（`Retry-After: 60`、`error_details.ban_skipped = 'borderline_score'`），不再永久封禁会话或累加设备违规；高置信命中（`< 0.25`）、任意 `nsfw` 命中或多题同时命中仍执行原有「封会话 + `[10, 10, 0]` 三振设备封禁」。
+- 部署说明：本次改动仅涉及控制面（`src/lib/protocol/`），零数据库迁移，无前端、`bin/` 或 `deploy/payload.json` 变更。预期 **`SLOT_SYNC=skip`**，重启 `vm2api` 一次即可生效。
 
 ## 1.4.234 — 2026-11-27 · JEV 题库 v2 与分级封禁/429 伪装闭环、上游 4xx 四分桶与风控日志诊断面板、CRAG 订阅异步并发探测、Codex 用量窗口巡检、按档透传 usage 与 CRAGGemini 维护行修复
 
