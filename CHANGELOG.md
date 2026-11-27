@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.233 — 2026-11-27 · 钉选 CRAG 3.1.24 与 CRAGGemini 0.4.14 签名载荷、Gemini 粘性调度与 429/502/503 容错、409 工具续接清理及宿主机 AppArmor/KVM 文档补齐
+
+- **钉选 CRAG `3.1.24` 与 CRAGGemini `0.4.14` 签名载荷（#1954、#1952，`dofastted/crag#34`，`dofastted/antigravity-cli-proxy#19`）**：
+  - **CRAG `3.1.24`**（`deploy/payload.json` 的 `crag_release` 指向 `payload-2026.11.27-crag-3.1.24`，`src/lib/admin/kernel-catalog.mjs` 追加 `3.1.24` 并保留 `3.1.23`）：修复工具续接回合被上游拒绝（含空 `content: []` `reasoning_extraction`）后，客户端追加新用户输入触发 `409 refused_continuation_conflict` 永久死锁的问题，允许不同后续提交创建隔离快照分支；控制面 `src/lib/core/errors.mjs` 同步将终态 409 冲突标记为不可重试。
+  - **CRAGGemini `0.4.14`**（`deploy/payload.json` 的 `geminiDefaultLinuxAmd64.tag` 指向 `payload-2026.11.27-gemini-0.4.14`）：上游 503 时保持 `agy` 常驻不重启，支持 429 `restart_resume` 续传。
+- **Gemini 粘性调度、429/502/503 容错与定期账号状态巡检（#1952）**：
+  - 复用 `StickyRouter` 实现 Gemini 粘性路由：429 先在同账号执行一次 `restart_resume` 重试，二次 429 释放粘性并切换账号；503 故障转移不触发熔断或不可调度；502 支持 `unschedulable_on_502` 开关避免 502→503 循环；全池不可调度时返回 `429 gemini_pool_overloaded`；新增定期账号状态与配额巡检及面板展示。
+- **Gemini 会话冲突与宿主机安全加固收口（#1940、#1943、#1944）**：
+  - **工具续接 409 冲突清理（#1944）**：`gemini_session_conflict` 时除释放粘性绑定外，同步清理 `continuationCallIds` 对应的工具续接绑定；`!sessionConflictRetried` 与 `maxAccountSwitches > 0` 门禁确保同请求重试不再复用卡住的出站会话，且 `mas=0` 场景不重试；同步修正 `RUN_ERRORS` 文案。
+  - **AppArmor 与维护守护进程对齐（#1940、#1943）**：维护守护进程目录同步安装 `gemini_host_apparmor.py`；收紧 bwrap `execvp` stderr 分类正则，补齐 license-align CI 与 Biome 检查。
+- **KVM 升级文档更正（#1945）**：
+  - 明确 `kin-guest-setup` 升级后需按流程重建 runner 容器以使 9p `cache=none` 等来宾脚本改动生效。
+- 部署说明：本次改动涉及控制面（`src/lib/`、`src/server.mjs`）、前端（`web/src/`）、`deploy/install.sh`、`deploy/payload.json`（更新 `CRAG 3.1.24` 与 `CRAGGemini 0.4.14`，沿用 `kin-kernel` `b2dbec57…`）及 Gemini 宿主/维护脚本（`scripts/gemini-host.py`、`scripts/gemini_host_account.py`、`scripts/gemini_host_apparmor.py`、`scripts/gemini_host_native.py`）；无新增数据库迁移。因 `bin/kin-kernel` 与 `share/wrap-cli/cli-node` 字节未变，预期 **`SLOT_SYNC=skip`**（无需执行 `wrap-cli/sync` 或重启既有 `kin-*` 槽位）；需同步更新 Gemini 宿主/维护脚本并重启 `vm2api-gemini-maintenance`、`vm2api-gemini` 与 `vm2api`。
+
 ## 1.4.232 — 2026-11-26 · Gemini 多格式 RT 导入、Ubuntu 26.04 AppArmor 托管 bwrap、409 冲突重试、代理探测错峰、Codex 续热与配额窗口修复
 
 - **Gemini 宿主机安全与可靠性修复（#1922、#1923、#1925、#1926、#1929、#1932、#1933、#1934、#1935、#1938）**：
