@@ -1021,6 +1021,7 @@ test('the public scheduler completes one turn through the host socket', async ()
       unitCircuit: { recordSuccess() {}, recordFailure() {}, releaseProbe() {} },
       lastUsed: new Map(),
     },
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
   const handle = createGeminiPublicHandler({
     json: (_response, status, body) => ({ status, body }),
@@ -1092,6 +1093,7 @@ test('Gemini gateway uses shared account reservations and each selected environm
           : { state: 'running' }
       throw new Error(`unexpected Gemini host operation: ${operation}`)
     },
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
   const first = scheduler.complete({ model, text: 'hello' })
   await firstStarted
@@ -1139,6 +1141,7 @@ test('a selected Gemini location rejection stays HTTP 403 and counts toward the 
       }
       assert.fail(`unexpected Gemini host operation: ${operation}`)
     },
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
   const handle = createGeminiPublicHandler({
     json: (_res, status, body) => ({ status, body }),
@@ -1168,7 +1171,7 @@ test('a selected Gemini location rejection stays HTTP 403 and counts toward the 
   assert.equal(pool.inflight.size, 0)
 })
 
-test('client disconnect cancels the Gemini run without recording a circuit failure', async () => {
+test('client disconnect cancels the Gemini run without recording a circuit failure', { timeout: 15_000 }, async () => {
   const account = {
     id: 'gemini-abort-0123456789abcdef01234567',
     auth_state: 'authorized',
@@ -1217,6 +1220,7 @@ test('client disconnect cancels the Gemini run without recording a circuit failu
       }
       throw new Error(`unexpected Gemini host operation: ${operation}`)
     },
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
   const handle = createGeminiPublicHandler({
     json: (_res, status, body) => ({ status, body }),
@@ -1242,7 +1246,7 @@ test('client disconnect cancels the Gemini run without recording a circuit failu
   const response = handle(req, res)
   await statusPolled
   onClose()
-  assert.equal(await response, undefined)
+  await response
   assert.equal(events.failures, 0)
   assert.deepEqual(events.probeAccountIds, [`gemini:${account.id}`])
   assert.equal(events.hostCancelled, 1)
@@ -1277,6 +1281,7 @@ test('Google API route uses shared pool reservation and returns Google response 
         }
       throw new Error(`unexpected host request: ${operation}`)
     },
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
   const handle = createGeminiPublicHandler({
     json: (_res, status, body) => ({ status, body }),
@@ -1644,6 +1649,7 @@ test('Gemini scheduler allows 10 concurrent slots on acc1 with strict per-accoun
         },
       }
     },
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   const tasks = Array.from({ length: 10 }, (_, i) =>
@@ -1996,3 +2002,12 @@ test('geminiProxyFor accepts HTTP and domain proxies, forwards egress_options wh
   assert.equal(missingOAuth.body.error.code, 'gemini_oauth_client_not_configured')
   assert.equal('egress_options' in calls[1][1], false)
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

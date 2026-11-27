@@ -22,6 +22,10 @@ import { finalizeWorkerPayload } from '../../src/lib/transport/go-worker-client.
 import { clearRustHealthCache, rememberRustHealth } from '../../src/lib/transport/kernel-router.mjs'
 import { classifierFixture } from '../fixtures/auto-mode.mjs'
 
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
+
 const V3_CAPS = [
   'generation_controls_v3',
   'linux_tui_native_queue',
@@ -848,13 +852,14 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
     const runner = new FailoverRunner({
       scheduler: {
         async selectAndReserve() {
-          return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec, release() { } }
+          return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec, release() {} }
         },
-        markSuccess() { },
-        markCooldown() { },
-        releaseAccountSessions() { },
+        markSuccess() {},
+        markCooldown() {},
+        releaseAccountSessions() {},
       },
       config: { max_same_account_retries: 0 },
+      schedulerRuntime: makeStubSchedulerRuntime(),
     })
     const logs = []
     const finishListeners = []
@@ -867,11 +872,11 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
       once(ev, fn) {
         if (ev === 'finish') finishListeners.push(fn)
       },
-      off() { },
-      write() { },
-      end() { },
+      off() {},
+      write() {},
+      end() {},
     }
-    const handler = createHandleProtocol({
+    const handler = createM3HandleProtocol({
       json(_res, status, body) {
         response.status = status
         response.statusCode = status
@@ -879,7 +884,7 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
         for (const fn of finishListeners) fn()
         return body
       },
-      writeSSEHeaders() { },
+      writeSSEHeaders() {},
       readBody: async () => structuredClone(incoming),
       requireAuth: () => true,
       cfg: {
@@ -894,8 +899,8 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
         finish: (bag, second) => logs.push(second || bag),
       },
       stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
-      accountQuota: { ingestHeaders() { } },
-      apiKeyStore: { acquire: () => ({ ok: true }), release() { }, recordUsage() { } },
+      accountQuota: { ingestHeaders() {} },
+      apiKeyStore: { acquire: () => ({ ok: true }), release() {}, recordUsage() {} },
       apiScheduler: {},
       apiEndpointStore: {},
       stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
@@ -938,8 +943,8 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
         },
         apiKeyKind: 'managed',
         apiKeyRecord: { id: 'fixture' },
-        once() { },
-        off() { },
+        once() {},
+        off() {},
       },
       response,
       'anthropic.messages',
@@ -1041,3 +1046,12 @@ test('Claude VM / CRAG fails closed with 400 unsupported_capability on service_t
     (err) => err.status === 400 && err.code === 'invalid_kernel_request',
   )
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

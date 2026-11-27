@@ -45,6 +45,7 @@ import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { getVm, listVms } from '../../src/lib/vm/vm-registry.mjs'
 import { atomicWriteJson } from '../../src/lib/vm/vm-file.mjs'
 import { seedEncryptedPackage } from '../fixtures/crag-license.mjs'
+import { makePoolStubRuntimeForProject } from '../fixtures/scheduler-runtime-mock.mjs'
 const { Server, utils } = ssh2
 
 function tmpDir(prefix) {
@@ -485,10 +486,7 @@ test('explicit import strips email and replaces the node credential at 0600; ide
   const remoteText = node.files.get(node.remoteCred).toString()
   assert.doesNotMatch(remoteText, /panel-only@example\.test|"email"/)
   assert.equal(JSON.parse(remoteText).claudeAiOauth.refreshToken, 'imported-rt')
-  assert.equal(
-    fs.readFileSync(path.join(slotDir, 'cli-home', '.claude', 'credentials.json'), 'utf8'),
-    remoteText,
-  )
+  assert.equal(fs.readFileSync(path.join(slotDir, 'cli-home', '.claude', 'credentials.json'), 'utf8'), remoteText)
   assert.equal(node.modes.get(node.remoteCred), 0o600, 'a 0777 local checkout must not leak its mode to the node')
   assert.deepEqual(await pullSlotCredentials(vm, slotDir, node.session), { pulled: false, reason: 'same' })
 })
@@ -541,7 +539,10 @@ for (const identical of [false, true]) {
     assert.equal(JSON.parse(remoteStored).claudeAiOauth.refreshToken, 'node-refresh')
     assert.equal(fs.readFileSync(credentialFile, 'utf8'), remoteStored)
 
-    const pool = new PoolScheduler({ projectRoot: root })
+    const pool = new PoolScheduler({
+      projectRoot: root,
+      schedulerRuntime: makePoolStubRuntimeForProject(root),
+    })
     const selected = await pool.selectAndReserve({
       model: 'claude-sonnet-4-6',
       keyScope: { group_type: 'anthropic', allowed_vms: [vm.id] },

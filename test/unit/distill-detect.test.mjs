@@ -652,7 +652,7 @@ test('handleProtocol intercepts before credential hop', () => {
   assert.ok(early > 0 && early < codex)
   const before = src.indexOf("applyIntercept(cfg.intercept.rules, 'before_upstream'")
   const late = src.indexOf('await applyProtocolIntercept(', early + 1)
-  const apiHop = src.indexOf('picked: apiPicked')
+  const apiHop = src.indexOf('apiScheduler.acquire(')
   assert.ok(before > 0)
   assert.ok(late > before)
   assert.ok(apiHop > late)

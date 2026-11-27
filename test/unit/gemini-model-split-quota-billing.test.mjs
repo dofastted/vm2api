@@ -194,6 +194,7 @@ test('scheduler isolates 3p 429 cooldown from gemini quota group and automatical
       ])
     },
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   // Catalog splits models into Google vs ag- prefixed Anthropic with accurate owned_by.
@@ -301,6 +302,7 @@ test('scheduler skips proactively exhausted accounts and fails over on verificat
       ])
     },
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   const turn = await scheduler.stream({
@@ -402,6 +404,7 @@ test('Gemini public handler records requestLog once on direct calls and populate
         })}\n\n`,
       ]),
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   const handler = createGeminiPublicHandler({
@@ -485,3 +488,12 @@ test('Gemini public handler records requestLog once on direct calls and populate
     { id: 'gemini-4-neon', provider: 'google', quota_group: 'gemini' },
   ])
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

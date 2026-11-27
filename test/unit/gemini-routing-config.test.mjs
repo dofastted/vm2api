@@ -139,14 +139,13 @@ test('Gemini scheduler honors balanced, fill, round_robin, sticky TTL, and gatew
         headers: { 'content-type': 'text/event-stream' },
         async *[Symbol.asyncIterator]() {
           if (wait) await wait
-          yield Buffer.from(
-            'data: {"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}\n\n',
-          )
+          yield Buffer.from('data: {"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}\n\n')
         },
         destroy() {},
       }
     },
     getRoutingConfig: () => routing,
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   // Hold 1 in-flight request on gemini-a, then balanced picks an idle account (gemini-b).
@@ -274,3 +273,12 @@ test('Gemini host sharded daemon policy, capacity=50 sharding, and fault isolati
     timeout: 12_000,
   })
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

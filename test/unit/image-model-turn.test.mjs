@@ -10,6 +10,11 @@ import { CODEX_IMAGE_EDITS_URL, CODEX_IMAGE_GENERATIONS_URL } from '../../src/li
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { loadGptModelPolicy, saveGptModelPolicy } from '../../src/lib/protocol/gpt-model-policy.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { withM3SchedulerDeps, makeMockCodexRuntimeFor } from '../fixtures/scheduler-runtime-mock.mjs'
+
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
 
 const USAGE = {
   input_tokens: 300,
@@ -57,7 +62,7 @@ async function serve(upstream) {
   const respond = createRespond(cfg)
   const calls = []
   const rows = []
-  const { handleProtocol } = createHandleProtocol({
+  const { handleProtocol } = createM3HandleProtocol({
     json: respond.json,
     writeSSEHeaders: respond.writeSSEHeaders,
     readBody: respond.readBody,

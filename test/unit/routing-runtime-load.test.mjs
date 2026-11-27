@@ -744,3 +744,12 @@ test('persistRoutingPatch merges and normalizes batch_group and loadRoutingConfi
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

@@ -18,6 +18,15 @@ import {
   runApiInference,
 } from '../../src/lib/pool/api-protocol.mjs'
 import { createClaudeMessageAssembler, applyClaudeSSELineToMessage } from '../../src/lib/protocol/convert.mjs'
+import {
+  withM3SchedulerDeps,
+  makeStubSchedulerRuntime,
+  makePoolStubRuntimeForProject,
+} from '../fixtures/scheduler-runtime-mock.mjs'
+
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
 
 const unixTest = process.platform === 'win32' ? test.skip : test
 
@@ -53,7 +62,7 @@ test('only a managed key explicitly marked api uses the Anthropic address path',
 test('tenant api-category keys cannot reach platform API endpoints', async () => {
   const response = fakeResponse()
   let picked = 0
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json: (_res, status, body) => {
       response.status = status
       response.body = body
@@ -135,7 +144,7 @@ test('API backend applies the global official_full persona setting', async () =>
   })
   const response = fakeResponse()
   const stats = { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 }
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json: (_res, status, body) => {
       response.status = status
       response.body = body
@@ -251,7 +260,7 @@ async function apiBackendHop({ endpoint = {}, body, reqHeaders = {}, pick, routi
   })
   const response = fakeResponse()
   const picks = []
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json: (_res, status, payload) => {
       response.status = status
       response.body = payload
@@ -385,7 +394,7 @@ test('OAuth cli-hop applies the resolved Protocol custom persona template', asyn
   let prepared = null
   const response = fakeResponse()
   const stats = { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 }
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json: (_res, status, body) => {
       response.status = status
       response.body = body
@@ -459,7 +468,7 @@ test('logs the session id actually sent upstream, not the caller one', async () 
   let prepared = null
   let logged = null
   const response = { ...fakeResponse(), on: (event, fn) => event === 'finish' && (response.finish = fn) }
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json: (_res, status, body) => {
       response.status = status
       return body
@@ -526,6 +535,19 @@ for (const previousVm of [null, 'vm-01']) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-queued-session-'))
     const routingFile = path.join(root, 'routing.json')
     fs.writeFileSync(routingFile, JSON.stringify({ compatibility: {} }))
+    fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+    for (const id of ['vm-01', 'vm-02']) {
+      fs.writeFileSync(
+        path.join(root, 'vms', `${id}.json`),
+        JSON.stringify({
+          id,
+          platform: 'anthropic',
+          schedulable: true,
+          status: 'running',
+          claude: { account_uuid: 'account-1', access_token: 'at', refresh_token: 'rt' },
+        }),
+      )
+    }
     const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
     const key = sticky.canonicalSessionKey('queued-caller')
     if (previousVm) {
@@ -539,9 +561,15 @@ for (const previousVm of [null, 'vm-01']) {
       vm,
       exec: { vmId: vm.id, vm, homeDir: path.join(root, 'home'), oauth: { account_uuid: 'account-1' } },
     }
+    const poolRt = makePoolStubRuntimeForProject(root)
     const runner = new FailoverRunner({
-      scheduler: { selectAndReserve: async () => selected, markSuccess() {} },
+      scheduler: {
+        projectRoot: root,
+        selectAndReserve: async () => selected,
+        markSuccess() {},
+      },
       stickyRouter: sticky,
+      schedulerRuntime: poolRt,
     })
     let releaseFirst
     let enteredFirst
@@ -564,7 +592,7 @@ for (const previousVm of [null, 'vm-01']) {
     const logged = []
     let runs = 0
     let requests = 0
-    const handler = createHandleProtocol({
+    const handler = createM3HandleProtocol({
       json: (res, status, body) => {
         res.status = status
         return body
@@ -679,7 +707,7 @@ async function runManagedKeyHop(root, result) {
   const charges = []
   const logged = []
   const response = { ...fakeResponse(), on: (event, fn) => event === 'finish' && (response.finish = fn) }
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json: (_res, status, body) => {
       response.status = status
       return body
@@ -780,7 +808,7 @@ test('OpenAI chat carrying claude-opus-4-8 uses the Claude pool', async () => {
   let poolCalls = 0
   let requestedModel = null
   const response = fakeResponse()
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json: (_res, status, body) => {
       response.status = status
       response.body = body
@@ -872,7 +900,7 @@ function protocolHarness({ body, stickyRouter, failoverRunner, apiKeyRecord = nu
   const stats = { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 }
   const apiKeyCalls = { acquire: 0, release: 0 }
   const authCalls = { count: 0 }
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json: (_res, status, payload) => {
       response.status = status
       response.body = payload
@@ -1528,7 +1556,7 @@ test('API backend non-stream maps incomplete assistant hops to incomplete_respon
   })
   await new Promise((resolve) => kernel.listen(socketPath, resolve))
   const response = fakeResponse()
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json: (_res, status, body) => {
       response.status = status
       response.body = body
@@ -1738,3 +1766,4 @@ unixTest('API OpenAI flushes buffered metadata with the first real output', asyn
   assert.match(run.wire, /response\.output_text\.delta/)
   assert.match(run.wire, /response\.completed/)
 })
+

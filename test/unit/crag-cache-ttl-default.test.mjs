@@ -15,6 +15,10 @@ import {
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
+
 const unixTest = process.platform === 'win32' ? test.skip : test
 const control = (ttl) => ({ type: 'ephemeral', ...(ttl ? { ttl } : {}) })
 const text = (value, ttl) => ({ type: 'text', text: value, ...(ttl === null ? {} : { cache_control: control(ttl) }) })
@@ -157,6 +161,7 @@ async function runCragHop(t, { compatibility = {}, diskCompatibility = null, inp
       releaseAccountSessions() {},
     },
     config: { max_same_account_retries: 0 },
+    schedulerRuntime: makeStubSchedulerRuntime(),
   })
 
   const incoming = {
@@ -167,7 +172,7 @@ async function runCragHop(t, { compatibility = {}, diskCompatibility = null, inp
     ...input,
   }
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json(_res, status, body) {
       response.status = status
       response.body = body
@@ -329,3 +334,12 @@ unixTest(
     assert.equal(envelope.cache_ttl, '5m')
   },
 )
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

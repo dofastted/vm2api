@@ -1,3 +1,15 @@
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'
+
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
@@ -57,10 +69,11 @@ for (const { scope = {}, blocked, downgrade, denied } of [
         releaseAccountSessions() {},
       },
       config: { max_same_account_retries: 0, total_retry_deadline_ms: 100 },
+      schedulerRuntime: makeStubSchedulerRuntime(),
     })
     const attempts = []
     const logs = []
-    const handler = createHandleProtocol({
+    const handler = createM3HandleProtocol({
       json(res, status, body) {
         res.statusCode = status
         res.body = body

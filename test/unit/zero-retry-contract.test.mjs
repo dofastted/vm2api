@@ -7,6 +7,10 @@ import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { validateCacheBreakpoints } from '../../src/lib/protocol/cache-ttl.mjs'
 
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
+
 const rule = 'CALLER_SYSTEM_SURVIVES_REPAIR_38ba'
 const success = {
   ok: true,
@@ -105,11 +109,15 @@ async function runCase(t, fixture, { switchAfterRepair = false, repeatWithCached
     markCooldown() {},
     releaseAccountSessions() {},
   }
-  const runner = new FailoverRunner({ scheduler, config: { signature_repair: true, max_same_account_retries: 0 } })
+  const runner = new FailoverRunner({
+    scheduler,
+    config: { signature_repair: true, max_same_account_retries: 0 },
+    schedulerRuntime: makeStubSchedulerRuntime(),
+  })
   const hops = []
   const input = { model: 'claude-opus-5-5', max_tokens: 128, stream: false, system: rule, messages: fixture.messages }
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json: (_res, status, body) => {
       response.status = status
       response.body = body
@@ -196,3 +204,12 @@ test('a repaired request uses the next slot preset when failover switches accoun
   runCase(t, cases[0], { switchAfterRepair: true }))
 test('a cached search repair survives slot rendering on the next request without another retry', (t) =>
   runCase(t, cases[2], { repeatWithCachedSearchRepair: true }))
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

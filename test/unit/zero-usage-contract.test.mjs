@@ -9,6 +9,10 @@ import { applyCrsUnofficialPersona, CRS_OFFICIAL_SYSTEM } from '../../src/lib/id
 import { estimateClaudeInputTokens, personaHideForUnofficial } from '../../src/lib/identity/crs-persona-usage.mjs'
 import { costColumnsFromUsage } from '../../src/lib/admin/pricing.mjs'
 
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
+
 const unixTest = process.platform === 'win32' ? test.skip : test
 const environment =
   '# Environment\n - Timezone: UTC\n - Caller-owned rule: ' + 'Keep the application rules. '.repeat(100)
@@ -119,7 +123,7 @@ for (const stream of [false, true]) {
         end() {},
       }
       const input = { model, max_tokens: 128, stream, system: fixture.system, messages }
-      const handler = createHandleProtocol({
+      const handler = createM3HandleProtocol({
         json: (_res, status, body) => {
           response.status = status
           response.body = body
@@ -210,3 +214,12 @@ for (const stream of [false, true]) {
     })
   }
 }
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

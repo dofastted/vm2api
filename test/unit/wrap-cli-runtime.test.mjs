@@ -1023,3 +1023,12 @@ test('a re-verified CRAG v2 tree reuses member digests but still catches a same-
   assert.equal(verified.ok, false)
   assert.equal(verified.code, 'crag_v2_hash_mismatch')
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

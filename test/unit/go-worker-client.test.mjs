@@ -2075,6 +2075,7 @@ unixTest('redaction 413 stops failover before any worker dispatch for call and s
           assert.fail('a local size error must not cool down an account')
         },
       },
+      schedulerRuntime: makeStubSchedulerRuntime(),
     })
     const result = await runner.run({
       requestId: `redaction-size-${call.name}`,
@@ -2542,3 +2543,12 @@ unixTest(
     assert.equal(new Set([r1.hopRequestId, r2.hopRequestId, r3.hopRequestId]).size, 3)
   },
 )
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

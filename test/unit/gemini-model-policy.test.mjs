@@ -243,6 +243,7 @@ test('resolveUpstreamModel and Gemini scheduler respect default_effort and polic
         }
         throw new Error(`unexpected op: ${op}`)
       },
+      schedulerRuntime: makeMockGeminiRuntime(),
     })
 
     const cat = await scheduler.catalog()
@@ -400,3 +401,12 @@ test('gemini-4-carbon-high and parenthesized effort resolve cleanly across tiere
     setGeminiModelPolicyTestHooks(null)
   }
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

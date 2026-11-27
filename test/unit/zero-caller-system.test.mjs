@@ -209,3 +209,12 @@ test('zero preserves both top-level and supported mid-conversation system messag
   assert.equal(out.system[1].text, rules[0])
   assert.ok(out.messages.some((message) => message.role === 'system' && message.content === mid.content))
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

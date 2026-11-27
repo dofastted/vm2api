@@ -520,3 +520,12 @@ for (const key of ['5h', '7d', '7d_oi']) {
     assert.equal(quota.repo.get('acc-1').unified.headers[key].utilization, 0)
   })
 }
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

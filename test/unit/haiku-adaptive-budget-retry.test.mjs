@@ -170,6 +170,7 @@ test('FailoverRunner stops cleanly without a second hop when Haiku adaptive retr
         attempts.push({ attemptNo, ...row })
       },
     },
+    schedulerRuntime: makeStubSchedulerRuntime(),
   })
   const input = applyMinMaxTokens(makeHaikuAdaptiveRequest(1024), {})
   const hops = []
@@ -216,7 +217,10 @@ test('FailoverRunner repairs and retries Haiku adaptive thinking with valid boun
     [4097, 2048],
   ]) {
     const scheduler = makeTestScheduler([makeCandidate('1')])
-    const runner = new FailoverRunner({ scheduler })
+    const runner = new FailoverRunner({
+      scheduler,
+      schedulerRuntime: makeStubSchedulerRuntime(),
+    })
     const input = applyMinMaxTokens(makeHaikuAdaptiveRequest(maxTokens, { output_config: { effort: 'medium' } }), {})
     const hops = []
     const result = await runner.run({
@@ -289,3 +293,12 @@ test('explicit caller budget_tokens and initial cli-hop passthrough remain uncha
   assert.equal(cliHopInitial.thinking.type, 'adaptive')
   assert.equal(cliHopInitial.max_tokens, 1024)
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

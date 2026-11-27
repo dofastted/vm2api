@@ -410,7 +410,19 @@ test('native macOS still rejects licensed CRAG switching through both legacy end
   bindPlacement({ projectRoot: root, manager: { nodePlatform: () => 'darwin' } })
   t.after(unbindPlacement)
   seedEncryptedPackage(root)
-  activateCragLicense(root, vm, issueUniversalCode(root).code)
+  const licPath = path.join(root, 'vms', vm.id, 'crag-license.json')
+  fs.mkdirSync(path.dirname(licPath), { recursive: true })
+  fs.writeFileSync(
+    licPath,
+    JSON.stringify({
+      valid: true,
+      status: 'active',
+      product: 'crag-v2',
+      license_id: 'fixture-universal',
+      vm_id: vm.id,
+      universal: true,
+    }),
+  )
   const record = fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`))
   const operations = {
     kernelPolicyOps: {
@@ -950,3 +962,12 @@ test('async kernel switching preserves stopped intent when unlicensed and reject
   assert.equal(getVm(root, vm.id).status, 'stopped')
   assert.equal(getVm(root, vm.id).schedule_off, true)
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

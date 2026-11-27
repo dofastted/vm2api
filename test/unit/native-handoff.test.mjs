@@ -27,6 +27,10 @@ import {
   mergeAssembledAssistantHop,
 } from '../../src/lib/core/errors.mjs'
 
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
+
 const unixTest = process.platform === 'win32' ? test.skip : test
 const MODEL = 'claude-sonnet-5'
 const USAGE = { input_tokens: 47, output_tokens: 4096, cache_read_input_tokens: 100, cache_creation_input_tokens: 12 }
@@ -695,6 +699,7 @@ unixTest(
           throw new Error('must not cool down account on CRAG_CACHE_CONTROL repair')
         },
       },
+      schedulerRuntime: makeStubSchedulerRuntime(),
     })
     const runResult = await runner.run({
       canonicalBody: {
@@ -767,6 +772,7 @@ unixTest('#1139: opaque CRAG 429 returns once without restricting the account', 
       runtimeRepo: { updateWindow: (...args) => restrictions.push(args) },
       onUsageProbe: (...args) => restrictions.push(args),
     }),
+    schedulerRuntime: makeStubSchedulerRuntime(),
   })
   const root = path.dirname(fx.exec.homeDir)
   const cfg = {
@@ -777,7 +783,7 @@ unixTest('#1139: opaque CRAG 429 returns once without restricting the account', 
     paths: { project: root, data: root },
   }
   const routing = { failover: { stream_keepalive_ms: 0 } }
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     ...createRespond(cfg),
     readBody,
     cfg,
@@ -1633,6 +1639,7 @@ unixTest(
         markSuccess() {},
         markCooldown() {},
       },
+      schedulerRuntime: makeStubSchedulerRuntime(),
     })
 
     const cfg = {
@@ -1643,7 +1650,7 @@ unixTest(
       paths: { project: dataDir, data: dataDir },
     }
     const routing = { failover: { stream_keepalive_ms: 0 } }
-    const handler = createHandleProtocol({
+    const handler = createM3HandleProtocol({
       ...createRespond(cfg),
       readBody,
       cfg,
@@ -1779,3 +1786,12 @@ unixTest(
     assert.equal(row409.providerChain[0].providerRequestId, 'req_anthropic_409')
   },
 )
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

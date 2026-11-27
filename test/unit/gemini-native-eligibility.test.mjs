@@ -39,6 +39,7 @@ test('per-run CLI eligibility survives native failure, host transport and public
     callHost: callGeminiHost,
     resolveProxy: () => 'socks5h://192.0.2.1:1080',
     poolScheduler: pool,
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
   const handler = createGeminiPublicHandler({
     scheduler,
@@ -100,3 +101,12 @@ test('per-run CLI eligibility survives native failure, host transport and public
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

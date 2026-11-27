@@ -258,6 +258,7 @@ test('scheduler switches using requestRisk on the quotaRequest body estimate', a
     accountQuota,
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
+    schedulerRuntime: makeStubSchedulerRuntime(),
   })
   const selected = await pool.selectAndReserve({
     model: 'claude-sonnet-4-5',
@@ -283,6 +284,7 @@ test('all in-band accounts yield quota_guard_request_too_large', async (t) => {
     accountQuota,
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
+    schedulerRuntime: makeStubSchedulerRuntime(),
   })
   const selected = await pool.selectAndReserve({
     model: 'claude-sonnet-4-5',
@@ -296,6 +298,7 @@ test('all in-band accounts yield quota_guard_request_too_large', async (t) => {
       selectAndReserve: async () => selected,
     },
     config: { total_retry_deadline_ms: 50, fallback_wait_timeout_ms: 5 },
+    schedulerRuntime: makeStubSchedulerRuntime(),
   })
   const result = await runner.runOnce({
     requestId: 'r1',
@@ -560,3 +563,12 @@ test('admission and the panel agree near the gate (vm-10: pro, 7d 90% of a 95% l
   assert.equal(gated.accept, false)
   assert.equal(q.canAccept('vm10', { requestRisk: smallRisk }).ok, false)
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

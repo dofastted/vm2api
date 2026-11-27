@@ -390,3 +390,12 @@ test('a proxy hold left by a proxy the slot no longer uses says so (#1395)', () 
   maint.schedule_hold.reason = 'maintenance'
   assert.equal(textOf(maint), '维护中')
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

@@ -392,3 +392,12 @@ test('process runtime without a docker CLI behaves as before', async (t) => {
   assert.equal(stopEgressProcess(fx.root, 'px-ctr', { runtime: 'process', runDocker: noDocker }).ok, true)
   assert.equal(calls.filter((c) => c[0] === 'rm').length, 0)
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

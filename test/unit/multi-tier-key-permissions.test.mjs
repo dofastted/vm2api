@@ -34,6 +34,10 @@ import { createIntegrationHandler } from '../../src/lib/admin/integration-routes
 import { DEFAULT_INTEGRATION_SCOPES, IntegrationTokenStore } from '../../src/lib/admin/integration-tokens.mjs'
 import { readBody } from '../../src/lib/http/respond.mjs'
 
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
+
 function makeReq({ method = 'GET', url = '/', headers = {}, body, remoteAddress = '127.0.0.1' } = {}) {
   const chunks = body !== undefined ? [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))] : []
   const req = Readable.from(chunks)
@@ -246,6 +250,7 @@ test('two-way Gemini environment isolation across platform, tenant, and resource
         throw new Error(`unexpected op ${op}`)
       },
       resolveProxy: () => 'socks5h://1.2.3.4:1080',
+      schedulerRuntime: makeMockGeminiRuntime(),
     })
 
     const pub = createGeminiPublicHandler({
@@ -378,7 +383,7 @@ test('protocol dispatch enforces supplier-only official API access and blocks pl
 
     const makeHandler = (model) => {
       const response = makeRes()
-      const handler = createHandleProtocol({
+      const handler = createM3HandleProtocol({
         json: (_res, status, body) => {
           response.status = status
           response.body = body
@@ -684,3 +689,12 @@ test('write-side anti-escalation guards block cross-owner binding and integratio
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

@@ -15,6 +15,11 @@ import {
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { OFFICIAL_CLAUDE_CLI_UA } from '../../src/lib/identity/vm-identity.mjs'
 import { clearCachePrefixSessions } from '../../src/lib/protocol/cache-prefix.mjs'
+import { withM3SchedulerDeps, makeStubSchedulerRuntime } from '../fixtures/scheduler-runtime-mock.mjs'
+
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
 
 const unixTest = process.platform === 'win32' ? test.skip : test
 const control = (ttl) => ({ type: 'ephemeral', ...(ttl ? { ttl } : {}) })
@@ -85,6 +90,7 @@ async function outbound(
   }
   const vm = { id: 'fixture-slot', persona_preset: preset, official_cc_inference: 'cli-hop' }
   const runner = new FailoverRunner({
+
     scheduler: {
       async selectAndReserve() {
         return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
@@ -94,9 +100,10 @@ async function outbound(
       releaseAccountSessions() {},
     },
     config: { max_same_account_retries: 0 },
-  })
+  schedulerRuntime: makeStubSchedulerRuntime()
+})
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json(_res, status, body) {
       response.status = status
       response.body = body

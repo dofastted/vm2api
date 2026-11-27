@@ -733,6 +733,7 @@ test('#1758 blocker 1 & minor 1: FailoverRunner skips applyCooldown on pre-reset
       scheduler,
       rateLimitService,
       config: { max_same_account_retries: 0, max_total_attempts: 2 },
+      schedulerRuntime: makeStubSchedulerRuntime(),
     })
 
     const attemptPolicies = []
@@ -799,6 +800,7 @@ test('#1758 blocker 1 & minor 1: FailoverRunner skips applyCooldown on pre-reset
       scheduler,
       rateLimitService,
       config: { max_same_account_retries: 0, max_total_attempts: 2 },
+      schedulerRuntime: makeStubSchedulerRuntime(),
     })
 
     const attemptPolicies = []
@@ -1302,3 +1304,12 @@ test('#1776 legacy 1.4.168 receipt without account_id never contaminates rebound
   assert.equal(listedB.utilization_5h, 0.42)
   assert.equal(listedB.utilization_7d, 0.76)
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

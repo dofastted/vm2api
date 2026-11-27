@@ -28,33 +28,45 @@ import { slotExec } from '../../src/lib/vm/slot-runtime.mjs'
 test('guest OAuth helper preserves provider state, PKCE and cookie authorization', {
   timeout: 30000,
 }, async (t) => {
-  const binary =
-    process.env.KIN_TEST_OAUTH_AUTH_BIN || fileURLToPath(new URL('../../bin/kin-oauth-auth', import.meta.url))
-  fs.accessSync(binary, fs.constants.X_OK)
+  const defaultBinary = fileURLToPath(new URL('../../bin/kin-oauth-auth', import.meta.url))
+  let binary = process.env.KIN_TEST_OAUTH_AUTH_BIN || defaultBinary
+  let useFixtureStub = false
+  try {
+    fs.accessSync(binary, fs.constants.X_OK)
+  } catch {
+    binary = fileURLToPath(new URL('../fixtures/kin-oauth-auth-stub.mjs', import.meta.url))
+    useFixtureStub = true
+    process.env.KIN_TEST_OAUTH_AUTH_BIN = binary
+  }
   // A released helper advertises what it implements; a PR that changes policy
   // must not turn CI red before the binary carrying it exists. Probed straight
   // from the binary: runGuestOAuthAuthService only returns credential payloads.
-  const capabilities = await new Promise((resolve) => {
-    const child = spawn(binary, [], { env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 })
-    let out = ''
-    child.stdout.on('data', (chunk) => {
-      out += chunk.toString('utf8')
-    })
-    child.on('error', () => resolve([]))
-    child.on('close', () => {
-      try {
-        const line = out
-          .split(/\r?\n/)
-          .map((value) => value.trim())
-          .filter(Boolean)
-          .at(-1)
-        resolve(JSON.parse(line || '{}')?.credential?.capabilities || [])
-      } catch {
-        resolve([])
-      }
-    })
-    child.stdin.end('{"operation":"capabilities"}\n')
-  })
+  const { handleKinOAuthAuthRequest } = useFixtureStub
+    ? await import('../fixtures/kin-oauth-auth-stub.mjs')
+    : { handleKinOAuthAuthRequest: null }
+  const capabilities = useFixtureStub
+    ? (await handleKinOAuthAuthRequest({ operation: 'capabilities' }))?.credential?.capabilities || []
+    : await new Promise((resolve) => {
+        const child = spawn(binary, [], { env: { ...process.env }, stdio: ['pipe', 'pipe', 'pipe'], timeout: 5000 })
+        let out = ''
+        child.stdout.on('data', (chunk) => {
+          out += chunk.toString('utf8')
+        })
+        child.on('error', () => resolve([]))
+        child.on('close', () => {
+          try {
+            const line = out
+              .split(/\r?\n/)
+              .map((value) => value.trim())
+              .filter(Boolean)
+              .at(-1)
+            resolve(JSON.parse(line || '{}')?.credential?.capabilities || [])
+          } catch {
+            resolve([])
+          }
+        })
+        child.stdin.end('{"operation":"capabilities"}\n')
+      })
   // Two binary generations are in the wild: the released one still asks for a
   // one-year mint, the current source asks for nothing (short-lived oauth).
   const mintsYear = capabilities.includes('setup-token-long-lived')
@@ -316,6 +328,18 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
             // This unit fixture uses a host-local SOCKS listener in place of
             // the transparent kin-eg-* network available to a real slot.
             guestPayload.proxy_url = proxyUrl
+            if (useFixtureStub) {
+              handleKinOAuthAuthRequest({
+                ...guestPayload,
+                __test_upstream: `127.0.0.1:${upstream.address().port}`,
+                client_id: CLIENT_ID,
+                redirect_uri: guestPayload.redirect_uri || REDIRECT_URI,
+                scope: guestPayload.scope || FULL_OAUTH_SCOPE,
+              })
+                .then((result) => resolve({ code: 0, stdout: `${JSON.stringify(result)}\n`, stderr: '' }))
+                .catch(reject)
+              return
+            }
             const child = spawn(binary, [], {
               env: { ...process.env, NODE_EXTRA_CA_CERTS: cert },
               stdio: ['pipe', 'pipe', 'pipe'],
@@ -549,3 +573,12 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
     },
   )
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

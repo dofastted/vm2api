@@ -455,3 +455,12 @@ for (const location of ['system', 'tools', 'messages']) {
     validateCacheBreakpoints(out)
   })
 }
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

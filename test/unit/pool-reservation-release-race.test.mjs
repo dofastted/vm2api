@@ -25,6 +25,7 @@ for (const phase of ['quota', 'circuit']) {
           quotaInflight -= 1
         },
       },
+      schedulerRuntime: makeStubSchedulerRuntime(),
     })
     scheduler.unitCircuit = { admit: () => gate('circuit') }
     const candidate = { accountId: 'race-account', vmId: 'race-vm', model: 'claude-sonnet-4-5', maxConcurrency: 2 }
@@ -51,3 +52,12 @@ for (const phase of ['quota', 'circuit']) {
     }
   })
 }
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

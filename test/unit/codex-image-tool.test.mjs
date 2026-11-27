@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { handleCodexProtocol, imageGenUsageFromSseLine } from '../../src/lib/protocol/handle-codex.mjs'
+import { makeMockCodexRuntimeFor } from '../fixtures/scheduler-runtime-mock.mjs'
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { loadGptModelPolicy, saveGptModelPolicy } from '../../src/lib/protocol/gpt-model-policy.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
@@ -74,6 +75,7 @@ async function run(
     },
     routing: {},
     projectRoot: root,
+    schedulerRuntime: makeMockCodexRuntimeFor(root),
     ops: {
       writeCodexKernelConfig() {},
       ensureCodexKernel: async () => ({ ok: true }),

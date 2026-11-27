@@ -66,7 +66,10 @@ function ok() {
 // all_accounts_busy); this only pins how the runner treats that answer.
 test('allowQueue:false fails a busy pool at once with 529 and never dispatches', async () => {
   const scheduler = new BusyScheduler()
-  const runner = new FailoverRunner({ scheduler })
+  const runner = new FailoverRunner({
+    scheduler,
+    schedulerRuntime: makeStubSchedulerRuntime(),
+  })
   let dispatched = 0
   const result = await runner.run({
     requestId: 'no-queue',
@@ -88,7 +91,10 @@ test('allowQueue:false fails a busy pool at once with 529 and never dispatches',
 
 test('without allowQueue the runner still waits for a seat (default unchanged)', async () => {
   const scheduler = new BusyScheduler()
-  const runner = new FailoverRunner({ scheduler })
+  const runner = new FailoverRunner({
+    scheduler,
+    schedulerRuntime: makeStubSchedulerRuntime(),
+  })
   const result = await runner.run({
     requestId: 'queue-default',
     model: 'claude-sonnet-test',
@@ -106,3 +112,12 @@ test('browsers may send x-kin-queue cross-origin', () => {
       .includes(QUEUE_HINT_HEADER),
   )
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

@@ -14,6 +14,11 @@ import {
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
 } from '../../src/lib/identity/crs-persona.mjs'
+import { withM3SchedulerDeps } from '../fixtures/scheduler-runtime-mock.mjs'
+
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
 
 const CLI_UA = 'claude-cli/2.1.293 (external, cli)'
 const SESSION = '11111111-2222-4333-8444-555555555555'
@@ -180,7 +185,7 @@ const REACHED = new Error('reached-scheduler')
 function protocolHarness({ routing, body, healthMonitor, logs = [], users = null, onRun = null, routingConfigPath }) {
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
   const stats = { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 }
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json: (_res, status, payload) => {
       response.status = status
       response.body = payload

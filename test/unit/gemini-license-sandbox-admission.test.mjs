@@ -99,6 +99,7 @@ test('scheduler rejects stream with sandbox denial via checkAdmission (503, not 
       throw new Error(`unexpected host op ${op}`)
     },
     proxyPool,
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
   await assert.rejects(
     () =>
@@ -120,9 +121,19 @@ test('scheduler fallback checkEnvironmentLicense honors sandbox codes without cr
       throw new Error(`unexpected host op ${op}`)
     },
     proxyPool,
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
   const catalog = await scheduler.catalog()
   assert.equal(catalog.unlicensedAccounts.length, 1)
   assert.equal(catalog.unlicensedAccounts[0].denial.status, 503)
   assert.equal(catalog.unlicensedAccounts[0].denial.code, 'gemini_sandbox_apparmor_restricted')
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

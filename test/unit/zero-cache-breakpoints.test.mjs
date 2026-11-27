@@ -185,3 +185,12 @@ test('configured zero persona reaches cli-hop with cacheable messages for stream
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

@@ -900,3 +900,12 @@ test('the async egress probe returns the same verdict as the sync one (#1495)', 
   assert.deepEqual(await inspectEgressProcessAsync(dir, 'px-none', { runtime: 'process' }), sync)
   fs.rmSync(dir, { recursive: true, force: true })
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

@@ -1080,3 +1080,12 @@ test('switching a running slot to CRAG v2 when at running limit preserves CRAG c
   assert.equal(switched.body.data.vm.dataplane, 'crag')
   assert.equal(switched.body.data.vm.status, 'stopped')
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

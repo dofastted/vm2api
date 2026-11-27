@@ -7,6 +7,10 @@ import test from 'node:test'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
+
 const ORIGINAL = 'file output\n' + '0123456789abcdef'.repeat(900)
 const PRUNED = ORIGINAL.slice(0, 4096) + '\n\n[... tool result middle pruned ...]\n\n' + ORIGINAL.slice(-1024)
 const resultText = (body) =>
@@ -75,8 +79,9 @@ async function fixture(t, { enabled = true, failSeed = false } = {}) {
       releaseAccountSessions() {},
     },
     config: { max_same_account_retries: 0 },
+    schedulerRuntime: makeStubSchedulerRuntime(),
   })
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json(res, status, body) {
       res.statusCode = status
       res.body = body
@@ -224,3 +229,12 @@ for (const earlyEvent of ['close', 'aborted']) {
     assert.equal(resultText(f.posted.at(-1)), ORIGINAL)
   })
 }
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

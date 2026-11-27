@@ -8,6 +8,10 @@ import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
+
 const MESSAGE = {
   model: 'claude-haiku-4-5',
   max_tokens: 32,
@@ -64,7 +68,7 @@ function createResponse() {
 function createHandler({ root, routing, run, stream = true }) {
   const routingFile = path.join(root, 'routing.json')
   fs.writeFileSync(routingFile, JSON.stringify({ compatibility: {}, failover: routing.failover || {} }))
-  return createHandleProtocol({
+  return createM3HandleProtocol({
     json(res, status, body) {
       res.statusCode = status
       res.body = body
@@ -242,6 +246,7 @@ async function activeAttemptFailure({ block, delta, clusterDisconnect = false })
       max_total_attempts: 2,
       total_retry_deadline_ms: 4000,
     },
+    schedulerRuntime: makeStubSchedulerRuntime(),
   })
   let result
   const handler = createHandler({
@@ -461,7 +466,7 @@ test('zero-execution session_home_slot_busy 529 logs attribution without ingesti
   let ingested = 0
   let recorded = 0
   let finished = null
-  const handler = createHandleProtocol({
+  const handler = createM3HandleProtocol({
     json(res, status, body) {
       res.statusCode = status
       res.body = body
@@ -736,3 +741,12 @@ test('SSE stream preserves deltas containing literal response_headers and multi-
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

@@ -572,3 +572,12 @@ test('usage reads go through the read-only worker pool when it runs', async (t) 
   const local = logs.keyUsagePeriods({ apiKeyId: rec.id, periods: [{ name: 'today', since: '2026-11-06T00:00:00Z' }] })
   assert.deepEqual(pooled.body.periods.today, local.today)
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

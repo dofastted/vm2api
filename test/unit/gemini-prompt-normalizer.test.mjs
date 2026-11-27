@@ -375,6 +375,7 @@ test('end-to-end 4-protocol Codex/Claude/OpenCode requests normalize cleanly thr
       ])
     },
     resolveProxy: () => 'socks5h://127.0.0.1:1080',
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   const handler = createGeminiPublicHandler({
@@ -600,3 +601,12 @@ test('normalizes expanded upstream-429 trigger phrases (Hermes, omp, OpenCode, p
     'fenced code blocks inside user turns must stay untouched',
   )
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

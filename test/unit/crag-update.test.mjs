@@ -373,3 +373,12 @@ test('mixed-arch active local CRAG slots pull and verify each slot against its o
   assert.deepEqual(pulledArchs, ['primary', 'arm64'])
   assert.equal(verifyCragV2Tree(path.join(f.root, 'vms/vm-cache/cli-home/.kin/crag-v2'), { arch: 'arm64' }).ok, true)
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

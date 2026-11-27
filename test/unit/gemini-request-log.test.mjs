@@ -29,6 +29,10 @@ import {
 import { disjointOpenaiUsage } from '../../src/lib/protocol/openai-usage.mjs'
 import { normalizeUsage } from '../../src/lib/admin/pricing.mjs'
 
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
+
 function tmpLogStore(mode = 'debug') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-gem-rlog-'))
   return new RequestLogStore({ dataDir: dir, mode })
@@ -177,6 +181,7 @@ test('Gemini cache + reasoning usage is never double-subtracted in RequestLogSto
         },
       ]),
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   const handler = createGeminiPublicHandler({
@@ -420,6 +425,7 @@ test('delegated handle-protocol path captures inbound/outbound debug bodies, tim
       ])
     },
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   const geminiHandler = createGeminiPublicHandler({
@@ -430,7 +436,7 @@ test('delegated handle-protocol path captures inbound/outbound debug bodies, tim
     groupsRepo: { rateMultiplier: () => 1 },
   })
 
-  const protocolHandler = createHandleProtocol({
+  const protocolHandler = createM3HandleProtocol({
     json: jsonResponder,
     writeSSEHeaders(res) {
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' })
@@ -548,6 +554,7 @@ test('client cancel logs final_state=cancelled and error-class ignores gemini_in
       return stream
     },
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   const handler = createGeminiPublicHandler({
@@ -658,7 +665,7 @@ test('API-backend Gemini path records first_byte_ms, first_token_ms, generation_
     fs.rmSync(store.dataDir, { recursive: true, force: true })
   })
 
-  const protocolHandler = createHandleProtocol({
+  const protocolHandler = createM3HandleProtocol({
     json: jsonResponder,
     writeSSEHeaders(res) {
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' })
@@ -766,6 +773,7 @@ test('Gemini multi-attempt failover and all-429 errors populate hop_meta.attempt
         contentType: 'application/json',
       }),
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   const handler = createGeminiPublicHandler({
@@ -834,6 +842,7 @@ test('Gemini OAuth preserves upstream-reported modelVersion in logs, model_misma
       return delayedSseResponse(script)
     },
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   const handler = createGeminiPublicHandler({
@@ -983,6 +992,7 @@ test('Gemini thinking-suffix request with bare upstream modelVersion does not fl
     },
     callHostStream: async () => delayedSseResponse(script),
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   const handler = createGeminiPublicHandler({
@@ -1090,6 +1100,7 @@ test('Gemini OAuth writes callback conversation_id to outbound_session_id, tags 
       ])
     },
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   const handler = createGeminiPublicHandler({
@@ -1266,6 +1277,7 @@ test('Gemini zero-token local MCP tool-drain continuations aggregate into parent
       ])
     },
     resolveProxy: () => 'socks5h://192.0.2.10:1080',
+    schedulerRuntime: makeMockGeminiRuntime(),
   })
 
   const handler = createGeminiPublicHandler({
@@ -1381,3 +1393,12 @@ test('Gemini zero-token local MCP tool-drain continuations aggregate into parent
   assert.equal(attemptRows.length, 2)
   assert.deepEqual(attemptRows.map((a) => a.request_id).sort(), rows.map((r) => r.request_id).sort())
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'

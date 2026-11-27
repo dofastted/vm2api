@@ -140,6 +140,7 @@ function scheduler(root, extras = {}) {
       sticky_wait_timeout_ms: 5,
       ...extras.config,
     },
+    schedulerRuntime: makeStubSchedulerRuntime(),
   })
 }
 
@@ -367,3 +368,12 @@ test('kernel_lease observe: a content seat keeps the seat path', async (t) => {
   a.release()
   b.release()
 })
+
+import {
+  withM3SchedulerDeps,
+  ensureApiSchedulerM3,
+  makeStubSchedulerRuntime,
+  makeMockGeminiRuntime,
+  makeMockCodexRuntimeFor,
+  withM3FailoverRunner,
+} from '../fixtures/scheduler-runtime-mock.mjs'
