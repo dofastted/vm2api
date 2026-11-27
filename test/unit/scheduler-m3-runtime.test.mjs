@@ -23,12 +23,14 @@ import { AccountsRepo } from '../../src/lib/db/repos/accounts-repo.mjs'
 import { GroupsRepo } from '../../src/lib/db/repos/groups-repo.mjs'
 import { SchedulerPoolsRepo } from '../../src/lib/db/repos/scheduler-pools-repo.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
+import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import {
   PLATFORM_OWNER_SENTINEL,
   SchedulerApiError,
   SchedulerUnavailableError,
   VIRTUAL_POOL_IDS,
   createSchedulerRuntime,
+  formatSchedulerError,
   inferModelFamily,
 } from '../../src/lib/scheduler/scheduler-runtime.mjs'
 
@@ -1139,4 +1141,149 @@ test('M3 review fixes: dotted protocol inferModelFamily, panel JEV/refusal-guard
   const demoteIdx = handoverBlock.indexOf('demoteToStandby')
   assert.ok(drainIdx > 0 && demoteIdx > drainIdx, 'handoverLeadership must drain persistence before demoteToStandby')
   assert.equal(serverSrc.includes('apiScheduler.pick('), false, 'server.mjs should use apiScheduler.matchEndpoints')
+})
+
+test('M3 security: data-plane error mapping strips DecisionExplain from public client body while preserving internal explain & admin panel explain', async (t) => {
+  const secretPrompt = 'TOP_SECRET_ADMIN_SYSTEM_PROMPT_DO_NOT_LEAK'
+  const sensitiveExplain = {
+    request_id: 'req-sec-1',
+    config_version: 7,
+    origin_pool_id: 'pool_secret01',
+    resolved_pool_id: 'pool_secret01',
+    model: 'claude-sonnet-4-6',
+    is_downgraded: false,
+    fallback_chain: ['pool_secret02'],
+    session_gate: { wait_ms: 0, busy_at_peek: true, queue_depth_at_peek: 3 },
+    affinity: {
+      machine_id_present: true,
+      machine_home_node: 'claude_vm:vm-secret-home',
+      selected_node: null,
+      stood_in: false,
+      preserve_machine_home: true,
+    },
+    prompt_policy: {
+      mode: 'override',
+      preset: null,
+      text: secretPrompt,
+      client_system_policy: 'replace_client',
+      source: 'pool',
+    },
+    order: [
+      {
+        node: 'claude_vm:vm-secret-1',
+        tier: 9,
+        sub_weight: 20,
+        sub_bucket: 0,
+        in_flight: 4,
+        max_conc: 4,
+        active_sessions: 4,
+        max_sessions: 4,
+        sunk: false,
+      },
+    ],
+    excluded: [
+      {
+        pool_id: 'pool_secret01',
+        node: 'claude_vm:vm-secret-2',
+        reason: 'tenant_mismatch',
+        detail: 'owner=tenant-99',
+      },
+    ],
+    decide_us: 42,
+  }
+
+  const apiErr = new SchedulerApiError({
+    status: 529,
+    code: 'pool_exhausted',
+    message: 'All candidate nodes are saturated',
+    retryAfterSec: 3,
+    explain: sensitiveExplain,
+  })
+
+  // 1. formatSchedulerError (used by Codex, API Direct, Gemini, FailoverRunner)
+  const httpErr = formatSchedulerError(apiErr)
+  assert.equal(httpErr.status, 529)
+  assert.equal(httpErr.retryAfterSec, 3)
+  assert.deepEqual(Object.keys(httpErr.body.error).sort(), ['code', 'message', 'type'])
+  const serializedHttp = JSON.stringify(httpErr.body)
+  assert.equal(serializedHttp.includes('explain'), false, 'public HTTP body must not contain explain')
+  assert.equal(serializedHttp.includes('vm-secret-1'), false, 'public HTTP body must not leak order node_key')
+  assert.equal(serializedHttp.includes('vm-secret-2'), false, 'public HTTP body must not leak excluded node_key')
+  assert.equal(serializedHttp.includes('vm-secret-home'), false, 'public HTTP body must not leak machine_home_node')
+  assert.equal(serializedHttp.includes(secretPrompt), false, 'public HTTP body must not leak prompt_policy.text')
+  assert.equal(serializedHttp.includes('tenant-99'), false, 'public HTTP body must not leak tenant exclusion detail')
+  // Server-internal explain remains intact for internal audit logging
+  assert.equal(httpErr.explain?.prompt_policy?.text, secretPrompt)
+  assert.equal(httpErr.explain?.excluded?.[0]?.node, 'claude_vm:vm-secret-2')
+
+  // 2. FailoverRunner (Claude data plane): neither body.error.explain nor body.error.details may leak explain
+  const runner = new FailoverRunner({
+    scheduler: { markCooldown() {}, markSuccess() {}, setSchedulerRuntime() {} },
+    schedulerRuntime: {
+      async acquireNode() {
+        throw apiErr
+      },
+    },
+  })
+  const failoverRes = await runner.run({
+    requestId: 'req-sec-claude',
+    canonicalBody: { model: 'claude-sonnet-4-6' },
+    model: 'claude-sonnet-4-6',
+    callAttempt: async () => {
+      throw new Error('must not be called')
+    },
+  })
+  assert.equal(failoverRes.ok, false)
+  assert.equal(failoverRes.status, 529)
+  assert.equal(failoverRes.body.error.explain, undefined)
+  assert.equal(failoverRes.body.error.details, undefined)
+  const serializedFailover = JSON.stringify(failoverRes.body)
+  assert.equal(serializedFailover.includes('explain'), false)
+  assert.equal(serializedFailover.includes('vm-secret-1'), false)
+  assert.equal(serializedFailover.includes('vm-secret-2'), false)
+  assert.equal(serializedFailover.includes(secretPrompt), false)
+  assert.equal(failoverRes.explain?.prompt_policy?.text, secretPrompt)
+
+  // 3. Admin-authenticated POST /api/panel/scheduler/explain STILL returns full order/excluded/prompt_policy
+  const tmp = makeTempDir('vm2api-m3-sec-panel-')
+  const fx = makeFixtureState(tmp)
+  t.after(() => {
+    fx.db.close()
+    fs.rmSync(tmp, { recursive: true, force: true })
+  })
+  const handlePools = createSchedulerPoolsHandler({
+    getDb: () => fx.db,
+    getVms: () => fx.vms,
+    apiKeyStore: makeApiKeyStore(fx.db),
+    schedulerRuntime: () => ({
+      configVersion: 7,
+      async explainDispatch() {
+        return {
+          ok: true,
+          selected_node: { node_key: 'claude_vm:vm-secret-1', node_type: 'claude_vm', node_id: 'vm-secret-1' },
+          resolved_pool_id: fx.poolAnth.id,
+          prompt_policy: sensitiveExplain.prompt_policy,
+          stood_in: false,
+          preserve_machine_home: true,
+          explain: sensitiveExplain,
+        }
+      },
+    }),
+    json: makePanelJson(),
+    readBody: makeReadBody(),
+  })
+  const panelRes = makeMockRes()
+  await handlePools(
+    makeMockReq('POST', '/api/panel/scheduler/explain', {
+      body: { pool_id: fx.poolAnth.id, model: 'claude-sonnet-4-6' },
+    }),
+    panelRes,
+    '/api/panel/scheduler/explain',
+    new URL('http://localhost/api/panel/scheduler/explain'),
+  )
+  assert.equal(panelRes.statusCode, 200)
+  const panelData = panelRes.jsonBody().data
+  assert.equal(panelData.order[0].node_key, 'claude_vm:vm-secret-1')
+  assert.equal(panelData.excluded[0].node_key, 'claude_vm:vm-secret-2')
+  assert.equal(panelData.prompt_policy.text, secretPrompt)
 })

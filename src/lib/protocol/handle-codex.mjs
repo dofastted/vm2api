@@ -412,6 +412,7 @@ function respondCodexSchedulerError({ res, json, stats, logBag, err }) {
   const formatted = formatSchedulerError(err)
   logBag.error_code = formatted.code
   logBag.error_message = formatted.body?.error?.message || null
+  if (formatted.explain) logBag.scheduler_explain = formatted.explain
   logBag.final_state = formatted.status === 422 ? 'poison_abort' : 'failed'
   if (formatted.retryAfterSec != null && !res.headersSent) {
     res.setHeader?.('retry-after', String(formatted.retryAfterSec))

@@ -1515,7 +1515,9 @@ test('an all-rest OpenAI pool answers 503 with Retry-After for the next window',
     const out = await handleCodexProtocol(args)
     assert.equal(out.status, 503)
     assert.equal(out.body.error.code, 'pool_unavailable')
-    assert.equal(out.body.error.explain?.reason, 'pool_resting')
+    // Public client body MUST NOT leak internal scheduler explain details
+    assert.equal(out.body.error.explain, undefined)
+    assert.equal(args.logBag.scheduler_explain?.reason, 'pool_resting')
     const secs = Number(headers['retry-after'])
     assert.ok(secs > 2 * 3600 && secs <= 3 * 3600, `retry-after=${secs}`)
   } finally {

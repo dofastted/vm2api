@@ -619,7 +619,7 @@ export function createHandleProtocol(deps) {
         },
       }
     }
-    const details = result?.body?.error?.details || {}
+    const details = result?.explain || result?.body?.error?.details || {}
     const policyRefusal =
       !opaqueCrag429 && logBag.risk_upstream_reason && logBag.risk_upstream_reason !== 'upstream:billing_refusal'
     const mapped = policyRefusal
@@ -2706,6 +2706,7 @@ export function createHandleProtocol(deps) {
         const formatted = formatSchedulerError(err)
         logBag.error_code = formatted.code
         logBag.error_message = formatted.body?.error?.message || null
+        if (formatted.explain) logBag.scheduler_explain = formatted.explain
         logBag.final_state = formatted.status === 422 ? 'poison_abort' : 'failed'
         if (formatted.retryAfterSec != null) res.setHeader?.('retry-after', String(formatted.retryAfterSec))
         return json(res, formatted.status, formatted.body)

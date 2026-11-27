@@ -208,6 +208,10 @@ export function formatSchedulerError(err) {
     else if (status === 403) errorType = 'permission_error'
     else if (status === 400 || status === 422) errorType = 'invalid_request_error'
     else if (status === 503) errorType = 'overloaded_error'
+    // Security: NEVER copy `err.explain` (which carries internal `node_key`, `order`,
+    // `excluded`, `affinity`, and `prompt_policy.text`) into public client `body.error`.
+    // Keep `explain` ONLY on the top-level internal object for server audit logs and
+    // admin-authenticated panel routes.
     return {
       status,
       retryAfterSec,
@@ -220,7 +224,6 @@ export function formatSchedulerError(err) {
           type: errorType,
           code: err.code || 'scheduler_error',
           message: err.message || 'scheduler request rejected',
-          ...(err.explain ? { explain: err.explain } : {}),
         },
       },
     }

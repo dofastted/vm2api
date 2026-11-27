@@ -320,13 +320,16 @@ function isTerminalSwitchApiError(err) {
 function schedulerApiErrorResult(err, { extras = {}, lastResult = null, lastPolicy = null } = {}) {
   const formatted = formatSchedulerError(err)
   const retryAfterSec = formatted.retryAfterSec != null ? formatted.retryAfterSec : undefined
+  // Security: NEVER expose `err.explain` (`node_key`, `order`, `excluded`, `prompt_policy.text`)
+  // in public client `body.error` or `body.error.details`; keep it ONLY on the top-level
+  // internal `explain` property for server-side logging.
+  const explainField = formatted.explain && typeof formatted.explain === 'object' ? { explain: formatted.explain } : {}
   const body = formatted.body
     ? {
         ...formatted.body,
         error: {
           ...(formatted.body.error || {}),
           ...(formatted.status === 529 ? { type: 'overloaded_error' } : {}),
-          ...(err?.explain && typeof err.explain === 'object' ? { details: err.explain } : {}),
         },
       }
     : formatted.body
@@ -338,6 +341,7 @@ function schedulerApiErrorResult(err, { extras = {}, lastResult = null, lastPoli
       terminalState: 'poison_abort',
       finalState: 'poison_abort',
       body,
+      ...explainField,
       ...extras,
     }
   }
@@ -349,6 +353,7 @@ function schedulerApiErrorResult(err, { extras = {}, lastResult = null, lastPoli
       terminalState: 'rejected',
       finalState: 'rejected',
       body,
+      ...explainField,
       ...extras,
     }
   }
@@ -361,6 +366,7 @@ function schedulerApiErrorResult(err, { extras = {}, lastResult = null, lastPoli
       terminalState: 'exhausted',
       finalState: 'exhausted',
       body,
+      ...explainField,
       ...extras,
     }
   }
@@ -372,6 +378,7 @@ function schedulerApiErrorResult(err, { extras = {}, lastResult = null, lastPoli
     terminalState: 'exhausted',
     finalState: 'exhausted',
     body,
+    ...explainField,
   }
   return preferLastResult(lastResult, lastPolicy, fallback, extras)
 }
