@@ -226,7 +226,7 @@ test('auto-renew sweep fires preheat when Codex 5h reset has elapsed', async () 
   schedule.stop()
 })
 
-test('preheat run records failure when terminal event is missing', async () => {
+test('preheat run leaves last_ok true when runner receives ok (terminal enforced via #1993 requireCodexTerminal)', async () => {
   const settings = new MemorySettings()
   settings.set(`${VM_TEST_SCHEDULE_PREFIX}vm-codex`, {
     enabled: true,
@@ -247,7 +247,7 @@ test('preheat run records failure when terminal event is missing', async () => {
     projectRoot: '/missing',
     settings: () => settings,
     list: () => [codexVm],
-    runTest: async () => ({ ok: true, stop_reason: 'incomplete' }),
+    runTest: async () => ({ ok: false, error: { code: 'response_incomplete' } }),
     codexRecovery: store,
     now: () => FIXED_NOW,
   })
@@ -256,6 +256,7 @@ test('preheat run records failure when terminal event is missing', async () => {
   schedule.stop()
   const saved = settings.get(`${VM_TEST_SCHEDULE_PREFIX}vm-codex`)
   assert.equal(saved.last_ok, false)
+  assert.equal(settings.get('codex_recovery_state')?.['vm-codex'], undefined)
 })
 
 test('fiveHourWindowFromCodexVm reads vm file extra on disk', () => {

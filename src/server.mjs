@@ -761,13 +761,12 @@ healthMonitor = createHealthProbeMonitor({
     }
   },
 })
-const codexRecoveryStore = createCodexRecoveryStore({
-  settingsRepo: {
-    get: (key, fallback) => new SettingsRepo().get(key, fallback),
-    set: (key, value) => new SettingsRepo().set(key, value),
-    remove: (key) => new SettingsRepo().remove?.(key),
-  },
-})
+let panelSettingsRepo = null
+function sharedPanelSettingsRepo() {
+  if (!panelSettingsRepo) panelSettingsRepo = new SettingsRepo()
+  return panelSettingsRepo
+}
+const codexRecoveryStore = createCodexRecoveryStore({ settingsRepo: sharedPanelSettingsRepo() })
 setCodexRecoveryStore(codexRecoveryStore)
 
 const vmTestSchedule = new VmTestScheduleRunner({

@@ -3,8 +3,7 @@ import { Cron } from 'croner'
 import { validTimezone } from '../core/timezone.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { normalizeRecoveryCooldownMinutes, RECOVERY_MINUTES_MAX } from '../pool/codex-recovery.mjs'
-import { isCodexVmTestTerminalSuccess } from './vm-test-terminal.mjs'
+import { parseRecoveryCooldownMinutesStrict, RECOVERY_MINUTES_MAX } from '../pool/codex-recovery.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { listTestableModels } from './vm-test-chat.mjs'
 
@@ -271,12 +270,12 @@ export function normalizeVmTestSchedule(input, vm) {
   }
 
   let recoveryCooldownMinutes
-  if (isCodexVm(vm) && input.recovery_cooldown_minutes != null && input.recovery_cooldown_minutes !== '') {
-    const n = Number(input.recovery_cooldown_minutes)
-    if (!Number.isInteger(n) || n < 0 || n > RECOVERY_MINUTES_MAX) {
+  if (isCodexVm(vm) && Object.prototype.hasOwnProperty.call(input, 'recovery_cooldown_minutes')) {
+    const parsed = parseRecoveryCooldownMinutesStrict(input.recovery_cooldown_minutes)
+    if (!parsed.ok) {
       throw new VmTestScheduleError(`recovery_cooldown_minutes must be an integer from 0 to ${RECOVERY_MINUTES_MAX}`)
     }
-    recoveryCooldownMinutes = n
+    if (parsed.value != null) recoveryCooldownMinutes = parsed.value
   }
 
   return {
@@ -790,6 +789,7 @@ export class VmTestScheduleRunner {
     this.running.add(vmId)
     let result
     try {
+      // #1993 (merge before this PR): preheat passes requireCodexTerminal into runVmTestChat.
       result = await this.runTest(vmId, {
         model: schedule.model,
         prompt: schedule.prompt,
@@ -804,15 +804,23 @@ export class VmTestScheduleRunner {
     if (!this.started) return
     this._recordRun(vmId, schedule, startedAt, result)
     if (schedule.mode === 'preheat' && vm && isCodexVm(vm) && this.codexRecovery && result?.ok && !result?.skipped) {
-      this.codexRecovery.tryStartAfterPreheat({
-        projectRoot: this.projectRoot,
-        vmId,
-        result,
-        schedule,
-        beforeResets,
-        quotaPolicy: typeof this.quotaPolicy === 'function' ? this.quotaPolicy() : this.quotaPolicy,
-        at: this.now(),
-      })
+      try {
+        this.codexRecovery.tryStartAfterPreheat({
+          projectRoot: this.projectRoot,
+          vmId,
+          result,
+          schedule,
+          beforeResets,
+          quotaPolicy: typeof this.quotaPolicy === 'function' ? this.quotaPolicy() : this.quotaPolicy,
+          at: this.now(),
+        })
+      } catch (error) {
+        try {
+          console.warn(
+            `[vm-test-schedule] recovery cooldown skipped for ${vmId}: ${String(error?.message || error).slice(0, 200)}`,
+          )
+        } catch {}
+      }
     }
   }
 
@@ -833,10 +841,7 @@ export class VmTestScheduleRunner {
     const lastDuration =
       Number.isSafeInteger(duration) && duration >= 0 ? duration : Math.max(0, this.now() - startedAt)
     const skipped = result?.skipped || null
-    const vm = this._vm(vmId)
-    const preheatCodex = schedule.mode === 'preheat' && vm && isCodexVm(vm)
-    let lastOk = skipped ? null : result?.ok === true
-    if (!skipped && preheatCodex) lastOk = isCodexVmTestTerminalSuccess(result)
+    const lastOk = skipped ? null : result?.ok === true
     this._settings().set(keyFor(vmId), {
       ...current,
       last_run_at: new Date(startedAt).toISOString(),
