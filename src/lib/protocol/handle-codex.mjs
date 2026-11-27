@@ -852,7 +852,7 @@ export async function handleCodexProtocol({
       ? preCheck.scope.allowed_vms.map((id) => formatNodeKey('codex_vm', id))
       : undefined
   const baseAcquireParams = {
-    requestId: res?._kinRequestId || `codex_${crypto.randomBytes(8).toString('hex')}`,
+    requestId: crypto.randomUUID(),
     originPoolId: resolvedOriginPoolId,
     jevDowngradePoolId: jevDowngradePoolId || logBag.jev_downgrade_pool_id || null,
     apiKeyRecord: req.apiKeyRecord || null,
@@ -1605,7 +1605,7 @@ export async function handleCodexSearch({
   const effectivePoolAccess = poolAccess || req?._poolAccess || null
   const isSearchManagedPool = Boolean(effectivePoolAccess && effectivePoolAccess.legacy === false)
   const baseAcquireParams = {
-    requestId: res?._kinRequestId || `csearch_${crypto.randomBytes(8).toString('hex')}`,
+    requestId: crypto.randomUUID(),
     originPoolId:
       originPoolId ||
       effectivePoolAccess?.originPool?.id ||
@@ -1930,7 +1930,7 @@ export async function handleCodexImages({
   const post = ops.postCodexJson || postCodexJson
 
   const baseAcquireParams = {
-    requestId: res?._kinRequestId || `cimg_${crypto.randomBytes(8).toString('hex')}`,
+    requestId: crypto.randomUUID(),
     originPoolId:
       originPoolId ||
       effectivePoolAccess?.originPool?.id ||

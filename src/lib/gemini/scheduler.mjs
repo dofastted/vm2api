@@ -1254,8 +1254,11 @@ export function createGeminiScheduler({
         const resolvedSessionId =
           inboundIdentity?.sessionId || (effectiveStickyKey ? String(effectiveStickyKey) : '') || crypto.randomUUID()
 
+        // Security: mint an unpredictable per-dispatch UUIDv4 for Rust scheduler idempotency;
+        // never reuse client-controlled X-Request-Id (`requestId`) as Rust's acquire key.
+        const schedulerRequestId = crypto.randomUUID()
         const baseAcquireParams = {
-          requestId,
+          requestId: schedulerRequestId,
           originPoolId: resolvedOriginPoolId,
           jevDowngradePoolId: jevDowngradePoolId || null,
           apiKeyRecord: apiKeyRecord || null,

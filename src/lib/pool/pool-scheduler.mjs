@@ -551,7 +551,7 @@ export class PoolScheduler extends EventEmitter {
       args.inboundIdentity?.sessionId || (args.stickyKey ? String(args.stickyKey) : '') || crypto.randomUUID()
     const isManagedPool = Boolean(args.poolAccess && args.poolAccess.legacy === false)
     const acquireParams = {
-      requestId: args.requestId || `req_${crypto.randomBytes(8).toString('hex')}`,
+      requestId: args.requestId || crypto.randomUUID(),
       attemptNo: Number(args.attemptNo) || 1,
       originPoolId,
       jevDowngradePoolId: args.jevDowngradePoolId || null,

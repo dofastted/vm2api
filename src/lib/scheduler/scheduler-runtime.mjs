@@ -77,6 +77,38 @@ const PERMANENT_PENALTY_THRESHOLD_MS = 8e15
 
 const VIRTUAL_POOL_SET = new Set(Object.values(VIRTUAL_POOL_IDS))
 
+export function scopeSchedulerRequestId(rawRequestId, scope = {}) {
+  const raw = String(rawRequestId || '').trim() || crypto.randomUUID()
+  const apiScope = scope.api_key_scope || {}
+  const sortedUnique = (arr) =>
+    Array.isArray(arr) ? [...new Set(arr.map((v) => String(v || '').trim()).filter(Boolean))].sort() : []
+  const canonicalScope = JSON.stringify({
+    api_key_id: String(apiScope.api_key_id || ''),
+    pool_binding_mode: String(apiScope.pool_binding_mode || ''),
+    owner_id: apiScope.owner_id ?? null,
+    strict_tenant_only: Boolean(apiScope.strict_tenant_only),
+    origin_pool_id: String(scope.origin_pool_id || ''),
+    jev_downgrade_pool_id: scope.jev_downgrade_pool_id ?? null,
+    default_pool_id: apiScope.default_pool_id ?? null,
+    allowed_pool_ids: sortedUnique(apiScope.allowed_pool_ids),
+    allowed_models: sortedUnique(apiScope.allowed_models),
+    allowed_node_keys: sortedUnique(apiScope.allowed_node_keys),
+    model: String(scope.model || ''),
+    model_family: String(scope.model_family || ''),
+    protocol: String(scope.protocol || ''),
+    pin_node_key: scope.pin_node_key ?? null,
+    is_admin_diagnostic: Boolean(scope.is_admin_diagnostic),
+  })
+  const scopeHash = crypto.createHash('sha256').update(canonicalScope).digest('hex').slice(0, 24)
+  const prefix = `sr_${scopeHash}_`
+  // Idempotent when the same scoped request_id is forwarded into switchNode under the exact same scope.
+  if (raw.startsWith(prefix) && raw.length === prefix.length + 24) {
+    return raw
+  }
+  const idHash = crypto.createHash('sha256').update(raw).digest('hex').slice(0, 24)
+  return `${prefix}${idHash}`
+}
+
 export function isVirtualPoolId(poolId) {
   return VIRTUAL_POOL_SET.has(String(poolId || ''))
 }
@@ -1641,7 +1673,28 @@ export class SchedulerRuntime {
       })
     }
 
-    const requestId = String(params.requestId ?? params.request_id ?? '').trim() || `req_${crypto.randomUUID()}`
+    const rawRequestId = String(params.requestId ?? params.request_id ?? '').trim() || crypto.randomUUID()
+    const resolvedProtocol =
+      protocol ||
+      (modelFamily === 'claude'
+        ? 'anthropic'
+        : modelFamily === 'openai'
+          ? 'openai'
+          : modelFamily === 'gemini'
+            ? 'google'
+            : 'http')
+    const isAdminDiagnostic = Boolean(params.isAdminDiagnostic ?? params.is_admin_diagnostic ?? false)
+    const pinNodeKey = params.pinNodeKey ?? params.pin_node_key ?? null
+    const requestId = scopeSchedulerRequestId(rawRequestId, {
+      api_key_scope,
+      origin_pool_id: originPoolId,
+      jev_downgrade_pool_id: jevDowngradePoolId,
+      model,
+      model_family: modelFamily,
+      protocol: resolvedProtocol,
+      pin_node_key: pinNodeKey,
+      is_admin_diagnostic: isAdminDiagnostic,
+    })
     const sessionId = String(params.sessionId ?? params.session_id ?? '').trim() || crypto.randomUUID()
     const attemptNo = Math.max(1, Number(params.attemptNo ?? params.attempt_no ?? 1) || 1)
     const minConfigVersion =
@@ -1657,23 +1710,15 @@ export class SchedulerRuntime {
       api_key_scope,
       model,
       model_family: modelFamily,
-      protocol:
-        protocol ||
-        (modelFamily === 'claude'
-          ? 'anthropic'
-          : modelFamily === 'openai'
-            ? 'openai'
-            : modelFamily === 'gemini'
-              ? 'google'
-              : 'http'),
+      protocol: resolvedProtocol,
       machine_id: params.machineId !== undefined ? params.machineId : (params.machine_id ?? null),
       session_id: sessionId,
       session_id_source: params.sessionIdSource ?? params.session_id_source ?? null,
       parent_session_id: params.parentSessionId ?? params.parent_session_id ?? null,
       is_ephemeral_probe: Boolean(params.isEphemeralProbe ?? params.is_ephemeral_probe ?? false),
       no_queue: Boolean(params.noQueue ?? params.no_queue ?? false),
-      is_admin_diagnostic: Boolean(params.isAdminDiagnostic ?? params.is_admin_diagnostic ?? false),
-      pin_node_key: params.pinNodeKey ?? params.pin_node_key ?? null,
+      is_admin_diagnostic: isAdminDiagnostic,
+      pin_node_key: pinNodeKey,
       exclude_nodes: Array.isArray(params.excludeNodes ?? params.exclude_nodes)
         ? [...new Set((params.excludeNodes ?? params.exclude_nodes).map(String).filter(Boolean))]
         : [],

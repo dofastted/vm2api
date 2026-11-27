@@ -2,6 +2,7 @@
  * /v1 protocol handler. URLs, auth, and response envelopes stay with the
  * server wiring; this factory owns convert → pool → Go/Rust hop → client.
  */
+import crypto from 'node:crypto'
 import { applyIntercept } from '../core/intercept.mjs'
 import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
 import { hashKey } from '../core/security.mjs'
@@ -2716,7 +2717,8 @@ export function createHandleProtocol(deps) {
         try {
           activeApiSelection = await apiScheduler.acquire(ctx.body?.model, {
             schedulerRuntime: apiRt,
-            requestId: logCtx.request_id,
+            // Security: mint an unpredictable per-request UUID for Rust idempotency; never pass client X-Request-Id.
+            requestId: crypto.randomUUID(),
             attemptNo: 1,
             originPoolId: apiOriginPoolId,
             jevDowngradePoolId:

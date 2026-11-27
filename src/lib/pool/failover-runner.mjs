@@ -1006,6 +1006,9 @@ export class FailoverRunner {
     const bare429Accounts = new Set()
     const bindKeys = uniqueStickyKeys(stickyKey, stickyKeys)
     const reqId = String(requestId || '').trim() || `req_${crypto.randomBytes(8).toString('hex')}`
+    // Security: NEVER pass client-controlled X-Request-Id (`reqId`) as Rust scheduler's
+    // idempotency `request_id`; mint an unpredictable per-run UUIDv4 for Rust scheduling.
+    const schedulerRequestId = crypto.randomUUID()
 
     const sizeRefused = pinVmId ? [] : this.poisonGuard.refusedVms(canonicalBody)
     const excludedNodeKeys = new Set(sizeRefused.map((r) => formatNodeKey('claude_vm', r.vmId)).filter(Boolean))
@@ -1027,7 +1030,7 @@ export class FailoverRunner {
     const resolvedAdminDiagnostic = isAdminDiagnostic !== undefined ? Boolean(isAdminDiagnostic) : Boolean(pinVmId)
 
     const baseAcquireParams = {
-      requestId: reqId,
+      requestId: schedulerRequestId,
       originPoolId: resolvedOriginPoolId,
       jevDowngradePoolId: jevDowngradePoolId || null,
       apiKeyScope: apiKeyScope || undefined,

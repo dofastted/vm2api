@@ -356,11 +356,14 @@ function createProtocolReq(upgradeReq, body) {
   req.connection = upgradeReq.socket
   req.complete = false
   req.aborted = false
-  req.headers = {
+  const headers = {
     ...headerMap(upgradeReq.headers),
     'content-type': 'application/json',
     'content-length': String(payload.length),
   }
+  // Never inherit an upgrade-level client X-Request-Id across individual WS turns.
+  delete headers['x-request-id']
+  req.headers = headers
   req.apiKeyKind = upgradeReq.apiKeyKind
   req.apiKeyRecord = upgradeReq.apiKeyRecord
   req.presentedApiKey = upgradeReq.presentedApiKey

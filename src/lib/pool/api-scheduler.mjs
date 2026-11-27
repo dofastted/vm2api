@@ -284,7 +284,7 @@ export class ApiScheduler {
     requestedModel,
     {
       schedulerRuntime = null,
-      requestId = `api_${crypto.randomBytes(10).toString('hex')}`,
+      requestId = crypto.randomUUID(),
       attemptNo = 1,
       originPoolId = null,
       jevDowngradePoolId = null,

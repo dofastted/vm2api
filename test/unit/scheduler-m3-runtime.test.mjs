@@ -32,6 +32,7 @@ import {
   createSchedulerRuntime,
   formatSchedulerError,
   inferModelFamily,
+  scopeSchedulerRequestId,
 } from '../../src/lib/scheduler/scheduler-runtime.mjs'
 
 function resolveSchedulerBin() {
@@ -1286,4 +1287,144 @@ test('M3 security: data-plane error mapping strips DecisionExplain from public c
   assert.equal(panelData.order[0].node_key, 'claude_vm:vm-secret-1')
   assert.equal(panelData.excluded[0].node_key, 'claude_vm:vm-secret-2')
   assert.equal(panelData.prompt_policy.text, secretPrompt)
+})
+
+test('M3 security: request_id is isolated by authorization scope and data planes never forward untrusted X-Request-Id', async (t) => {
+  // 1. Real Rust kin-scheduler: colliding requestId across tenants / scopes MUST NOT share lease_id or node_key,
+  //    while identical caller + scope + requestId still hits Rust 60s idempotency cache.
+  const tmp = makeTempDir('vm2api-m3-reqid-')
+  const fx = makeFixtureState(tmp)
+  const runtime = createSchedulerRuntime({
+    getDb: () => fx.db,
+    getVms: () => fx.vms,
+    getRoutingConfig: () => ({}),
+    apiKeyStore: makeApiKeyStore(fx.db),
+    apiEndpointStore: { listRaw: () => fx.endpoints },
+    geminiScheduler: { listEnvironments: () => fx.geminiEnvs },
+    telemetryIntervalMs: 0,
+    clientOptions: {
+      binPath: BIN_PATH,
+      dataDir: tmp,
+      socketPath: path.join(tmp, 'reqid.sock'),
+      tokenPath: path.join(tmp, 'reqid.token'),
+      capFile: path.join(tmp, 'reqid.cap.json'),
+    },
+  })
+  t.after(async () => {
+    await runtime.shutdown({ drain: false, stopProcess: true })
+    fx.db.close()
+    fs.rmSync(tmp, { recursive: true, force: true })
+  })
+  await runtime.start({ waitMs: 5_000, startLoops: true })
+
+  const sharedClientReqId = 'attacker-chosen-x-request-id-999'
+
+  // Caller A (platform strict key) acquires with sharedClientReqId
+  const acqPlat = await runtime.acquireNode({
+    requestId: sharedClientReqId,
+    originPoolId: fx.poolAnth.id,
+    apiKeyRecord: { ...fx.strictKey, allowed_pool_ids: [fx.poolAnth.id] },
+    apiKeyKind: 'managed',
+    model: 'claude-sonnet-4-6',
+    protocol: 'anthropic',
+    sessionId: '550e8400-e29b-41d4-a716-446655440071',
+  })
+  assert.equal(acqPlat.selected_node.node_key, 'claude_vm:vm-c1')
+  assert.notEqual(acqPlat._request.request_id, sharedClientReqId)
+
+  // Caller B (tenant key) sends the EXACT SAME requestId within 60s -> MUST get own tenant VM & distinct lease_id!
+  const acqTenant = await runtime.acquireNode({
+    requestId: sharedClientReqId,
+    originPoolId: fx.poolAnth.id,
+    apiKeyRecord: { ...fx.tenantKey, allowed_pool_ids: [fx.poolAnth.id] },
+    apiKeyKind: 'managed',
+    model: 'claude-sonnet-4-6',
+    protocol: 'anthropic',
+    sessionId: '550e8400-e29b-41d4-a716-446655440072',
+  })
+  assert.equal(acqTenant.selected_node.node_key, 'claude_vm:vm-c-tenant')
+  assert.notEqual(acqTenant.lease_id, acqPlat.lease_id)
+  assert.notEqual(acqTenant._request.request_id, acqPlat._request.request_id)
+
+  // Same key with narrower allowedNodeKeys sends the EXACT SAME requestId -> MUST get distinct lease on vm-c2!
+  const acqNarrow = await runtime.acquireNode({
+    requestId: sharedClientReqId,
+    originPoolId: fx.poolAnth.id,
+    apiKeyRecord: { ...fx.strictKey, allowed_pool_ids: [fx.poolAnth.id] },
+    apiKeyKind: 'managed',
+    allowedNodeKeys: ['claude_vm:vm-c2'],
+    model: 'claude-sonnet-4-6',
+    protocol: 'anthropic',
+    sessionId: '550e8400-e29b-41d4-a716-446655440073',
+  })
+  assert.equal(acqNarrow.selected_node.node_key, 'claude_vm:vm-c2')
+  assert.notEqual(acqNarrow.lease_id, acqPlat.lease_id)
+  assert.notEqual(acqNarrow._request.request_id, acqPlat._request.request_id)
+
+  // Legitimate transport retry by Caller A with IDENTICAL scope & requestId STILL hits Rust 60s idempotency cache!
+  const acqPlatRetry = await runtime.acquireNode({
+    requestId: sharedClientReqId,
+    originPoolId: fx.poolAnth.id,
+    apiKeyRecord: { ...fx.strictKey, allowed_pool_ids: [fx.poolAnth.id] },
+    apiKeyKind: 'managed',
+    model: 'claude-sonnet-4-6',
+    protocol: 'anthropic',
+    sessionId: '550e8400-e29b-41d4-a716-446655440071',
+  })
+  assert.equal(acqPlatRetry.lease_id, acqPlat.lease_id)
+  assert.equal(acqPlatRetry._request.request_id, acqPlat._request.request_id)
+
+  // Re-scoping Caller A's already-scoped request_id under Caller A's scope is idempotent,
+  // while re-scoping it under Caller B's scope yields a completely different key.
+  const sameScopeAgain = scopeSchedulerRequestId(acqPlat._request.request_id, {
+    api_key_scope: acqPlat._request.api_key_scope,
+    origin_pool_id: acqPlat._request.origin_pool_id,
+    jev_downgrade_pool_id: acqPlat._request.jev_downgrade_pool_id,
+    model: acqPlat._request.model,
+    model_family: acqPlat._request.model_family,
+    protocol: acqPlat._request.protocol,
+    pin_node_key: acqPlat._request.pin_node_key,
+    is_admin_diagnostic: acqPlat._request.is_admin_diagnostic,
+  })
+  assert.equal(sameScopeAgain, acqPlat._request.request_id)
+  const crossScopeGuess = scopeSchedulerRequestId(acqPlat._request.request_id, {
+    api_key_scope: acqTenant._request.api_key_scope,
+    origin_pool_id: acqTenant._request.origin_pool_id,
+    model: acqTenant._request.model,
+    model_family: acqTenant._request.model_family,
+    protocol: acqTenant._request.protocol,
+  })
+  assert.notEqual(crossScopeGuess, acqPlat._request.request_id)
+
+  await runtime.releaseLease(acqPlat.lease_id, 'ok')
+  await runtime.releaseLease(acqTenant.lease_id, 'ok')
+  await runtime.releaseLease(acqNarrow.lease_id, 'ok')
+
+  // 2. Layer 1: FailoverRunner never forwards client-supplied requestId (X-Request-Id) into Rust acquireNode
+  const seenAcquireIds = []
+  const runner = new FailoverRunner({
+    scheduler: { markCooldown() {}, markSuccess() {}, setSchedulerRuntime() {} },
+    schedulerRuntime: {
+      async acquireNode(params) {
+        seenAcquireIds.push(params.requestId)
+        throw new SchedulerApiError({ status: 503, code: 'pool_exhausted', message: 'busy' })
+      },
+    },
+  })
+  await runner.run({
+    requestId: sharedClientReqId,
+    canonicalBody: { model: 'claude-sonnet-4-6' },
+    model: 'claude-sonnet-4-6',
+    callAttempt: async () => ({ ok: true }),
+  })
+  await runner.run({
+    requestId: sharedClientReqId,
+    canonicalBody: { model: 'claude-sonnet-4-6' },
+    model: 'claude-sonnet-4-6',
+    callAttempt: async () => ({ ok: true }),
+  })
+  assert.equal(seenAcquireIds.length, 2)
+  assert.notEqual(seenAcquireIds[0], sharedClientReqId)
+  assert.notEqual(seenAcquireIds[1], sharedClientReqId)
+  assert.notEqual(seenAcquireIds[0], seenAcquireIds[1])
 })
