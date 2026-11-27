@@ -118,6 +118,25 @@ export function preheatWindowStateForVm(
   })
 }
 
+/**
+ * Mirrors `server.mjs` vmTestSchedule `windowState`: read `routingConfig.codex?.quota`
+ * when the callback runs (routing reload replaces the whole object).
+ */
+export function preheatWindowStateLikeServer(
+  vm,
+  getRoutingConfig,
+  { projectRoot, accountQuota, now = Date.now() } = {},
+) {
+  const live = typeof getRoutingConfig === 'function' ? getRoutingConfig() : getRoutingConfig
+  const codexQuota = live?.codex?.quota
+  return preheatWindowStateForVm(vm, {
+    projectRoot,
+    accountQuota,
+    now,
+    routingConfig: { codex: { quota: codexQuota } },
+  })
+}
+
 function codexPreheatBlockedReason(vm, now, openaiQuotaPolicy) {
   const policy = normalizeOpenAIQuotaPolicy(openaiQuotaPolicy ?? OPENAI_QUOTA_DEFAULTS)
   if (!isCodexSlotParked(vm, now, policy)) return null

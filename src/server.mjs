@@ -784,10 +784,11 @@ const vmTestSchedule = new VmTestScheduleRunner({
     try {
       const vm = getVm(cfg.paths.project, vmId)
       if (!vm) return { hasCredential: false, schedulable: false, windowLive: false }
+      const codexQuota = routingConfig.codex?.quota
       return preheatWindowStateForVm(vm, {
         projectRoot: cfg.paths.project,
         accountQuota,
-        routingConfig,
+        routingConfig: { codex: { quota: codexQuota } },
       })
     } catch {
       return null

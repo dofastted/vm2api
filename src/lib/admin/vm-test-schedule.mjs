@@ -419,6 +419,8 @@ export class VmTestScheduleRunner {
     this.onRenewGateSkip = typeof onRenewGateSkip === 'function' ? onRenewGateSkip : null
     /** vmId -> { reason, at } — throttle gate-skip diagnostics without touching SettingsRepo. */
     this.renewGateSkipNotified = new Map()
+    /** vmId -> last skip reason persisted via _recordRun for auto-renew gate blocks. */
+    this.renewGateSkipRecorded = new Map()
     this.jobs = new Map()
     this.running = new Set()
     this.started = false
@@ -739,6 +741,26 @@ export class VmTestScheduleRunner {
     } catch {}
   }
 
+  /** Persist `last_skipped` at most once per unchanged auto-renew gate reason. */
+  _maybeRecordRenewGateSkip(vmId, reason) {
+    const normalized = String(reason || 'gate_blocked')
+    if (this.renewGateSkipRecorded.get(vmId) === normalized) {
+      this._noteRenewGateSkip(vmId, normalized)
+      return
+    }
+    const raw = this._settings().get(keyFor(vmId))
+    if (raw?.last_skipped === normalized) {
+      this.renewGateSkipRecorded.set(vmId, normalized)
+      this._noteRenewGateSkip(vmId, normalized)
+      return
+    }
+    const schedule = this._stored(vmId)
+    if (!schedule?.enabled) return
+    this.renewGateSkipRecorded.set(vmId, normalized)
+    this._recordRun(vmId, schedule, this.now(), { ok: null, skipped: normalized })
+    this._noteRenewGateSkip(vmId, normalized)
+  }
+
   async _sweepElapsedWindows() {
     if (!this.started) return
     const all = this._settings().all?.() || {}
@@ -756,7 +778,7 @@ export class VmTestScheduleRunner {
       if (!Number.isFinite(endMs) || endMs <= 0 || endMs > now) continue
       const gate = this._preheatGate(vmId, { autoRenew: true })
       if (!gate.fire) {
-        this._noteRenewGateSkip(vmId, gate.reason || 'gate_blocked')
+        this._maybeRecordRenewGateSkip(vmId, gate.reason || 'gate_blocked')
         continue
       }
       if (!this._tryClaimRenew(vmId, episode.key)) continue
