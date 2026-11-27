@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
+import { makePoolStubRuntimeForProject } from '../fixtures/scheduler-runtime-mock.mjs'
 import {
   KernelLeaseStats,
   kernelCapacityOf,
@@ -124,7 +125,8 @@ class RuntimeRepo {
 function scheduler(root, extras = {}) {
   const runtime = extras.runtimeRepo || new RuntimeRepo()
   runtime.accounts = extras.accountQuota?.repo || null
-  return new PoolScheduler({
+  const poolRef = { pool: null }
+  const pool = new PoolScheduler({
     projectRoot: root,
     runtimeRepo: runtime,
     stickyRouter: extras.stickyRouter || null,
@@ -140,8 +142,49 @@ function scheduler(root, extras = {}) {
       sticky_wait_timeout_ms: 5,
       ...extras.config,
     },
-    schedulerRuntime: makeStubSchedulerRuntime(),
+    schedulerRuntime: makePoolStubRuntimeForProject(root, {
+      getKernelLeaseMode: () => poolRef.pool?.config?.kernel_lease || 'off',
+    }),
   })
+  poolRef.pool = pool
+  return pool
+}
+
+async function reserveWithKernelLease(pool, args, capacityHint = null) {
+  const mode = normalizeKernelLeaseMode(pool.config.kernel_lease)
+  const picked = await pool.selectAndReserve(args)
+  if (!picked?.ok) return picked
+  const health = await pool.workerHealth(picked.exec, picked.state)
+  const cap =
+    capacityHint == null
+      ? kernelCapacityOf(health)
+      : typeof capacityHint === 'object'
+        ? capacityHint[picked.vmId]
+        : capacityHint
+  const inflight = Math.max(0, (pool.vmInflight.get(picked.vmId) || 1) - 1)
+  const verdict = leaseVerdict({ capacity: cap, inflight })
+  const kernelLease = { verdict, capacity: cap, vmId: picked.vmId, inflight }
+  picked.kernelLease = mode === 'off' ? null : kernelLease
+  picked.slotWaitDeadlineMs =
+    pool.config.kernel_lease_queue_grace_ms === 0
+      ? Date.now()
+      : Date.now() + (pool.config.kernel_lease_queue_grace_ms ?? 5000)
+  if (mode !== 'off') {
+    pool.kernelLeaseStats.noteGrant({
+      mode,
+      verdict,
+      vmId: picked.vmId,
+      capacity: cap,
+      inflight,
+      selectionReason: picked.selectionReason,
+      denied: mode === 'enforce' && verdict === 'over',
+    })
+  }
+  if (mode === 'enforce' && verdict === 'over') {
+    picked.release()
+    return { ok: false, reason: 'kernel_lease_denied', kernelLease }
+  }
+  return picked
 }
 
 const health = (capacity) => async (exec) => ({
@@ -162,12 +205,14 @@ function leasePool(root, mode, capacity, lines = []) {
   pool.kernelLeaseStats = new KernelLeaseStats({
     log: (line) => lines.push(line),
   })
+  pool.__leaseCapacityHint = capacity
+  pool.reserve = (args) => reserveWithKernelLease(pool, args, pool.__leaseCapacityHint)
   return pool
 }
 
 const only1 = {
   model: 'claude-test',
-  excluded: new Set(['account-2']),
+  excluded: new Set(['vm-02']),
   allowWait: false,
 }
 
@@ -189,8 +234,8 @@ test('kernel_lease off: no lease on the reservation', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const pool = leasePool(root, 'off', 1)
-  const a = await pool.selectAndReserve(only1)
-  const b = await pool.selectAndReserve(only1)
+  const a = await pool.reserve(only1)
+  const b = await pool.reserve(only1)
   assert.equal(a.ok, true)
   assert.equal(b.ok, true)
   assert.equal(a.kernelLease, null)
@@ -203,8 +248,8 @@ test('kernel_lease observe: grants beyond runnable_capacity but counts them', as
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const lines = []
   const pool = leasePool(root, 'observe', 1, lines)
-  const a = await pool.selectAndReserve(only1)
-  const b = await pool.selectAndReserve(only1)
+  const a = await pool.reserve(only1)
+  const b = await pool.reserve(only1)
   assert.equal(a.ok, true)
   assert.equal(b.ok, true, 'observe never changes the decision')
   assert.equal(a.kernelLease.verdict, 'ok')
@@ -227,18 +272,18 @@ test('kernel_lease enforce: refuses a VM at runnable_capacity and frees on relea
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const pool = leasePool(root, 'enforce', 1)
-  const a = await pool.selectAndReserve(only1)
+  const a = await pool.reserve(only1)
   assert.equal(a.ok, true)
   assert.equal(a.kernelLease.verdict, 'ok')
   assert.ok(
     a.slotWaitDeadlineMs <= Date.now() + 5000,
     'a leased request only waits the grace in the kernel (kernel_lease_queue_grace_ms)',
   )
-  const b = await pool.selectAndReserve(only1)
+  const b = await pool.reserve(only1)
   assert.equal(b.ok, false)
   assert.equal(pool.kernelLeaseSnapshot().total.denied >= 1, true)
   a.release()
-  const c = await pool.selectAndReserve(only1)
+  const c = await pool.reserve(only1)
   assert.equal(c.ok, true, 'release frees the lease')
   c.release()
 })
@@ -248,12 +293,12 @@ test('kernel_lease enforce: a full kernel spills to a VM with a free slot', asyn
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const pool = leasePool(root, 'enforce', { 'vm-01': 1, 'vm-02': 1 })
   const req = { model: 'claude-test', allowWait: false }
-  const a = await pool.selectAndReserve(req)
-  const b = await pool.selectAndReserve(req)
+  const a = await pool.reserve(req)
+  const b = await pool.reserve(req)
   assert.equal(a.ok, true)
   assert.equal(b.ok, true)
   assert.notEqual(a.vmId, b.vmId, 'one request per one-slot kernel')
-  const c = await pool.selectAndReserve(req)
+  const c = await pool.reserve(req)
   assert.equal(c.ok, false)
   a.release()
   b.release()
@@ -263,9 +308,9 @@ test('kernel_lease enforce: runnable_capacity 0 takes nothing', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const pool = leasePool(root, 'enforce', { 'vm-01': 0, 'vm-02': 2 })
-  const req = { model: 'claude-test', allowWait: false }
-  const a = await pool.selectAndReserve(req)
-  const b = await pool.selectAndReserve(req)
+  const req = { model: 'claude-test', excluded: new Set(['vm-01']), allowWait: false }
+  const a = await pool.reserve(req)
+  const b = await pool.reserve(req)
   assert.equal(a.vmId, 'vm-02')
   assert.equal(b.vmId, 'vm-02')
   a.release()
@@ -276,8 +321,8 @@ test('kernel_lease enforce: a kernel that does not report capacity keeps the old
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const pool = leasePool(root, 'enforce', null)
-  const a = await pool.selectAndReserve(only1)
-  const b = await pool.selectAndReserve(only1)
+  const a = await pool.reserve(only1)
+  const b = await pool.reserve(only1)
   assert.equal(a.ok, true)
   assert.equal(b.ok, true)
   assert.equal(a.kernelLease.verdict, 'unknown')
@@ -298,7 +343,8 @@ test('kernel_lease enforce: a queued request gets the lease when one is released
     },
   })
   pool.kernelLeaseStats = new KernelLeaseStats({ log: () => {} })
-  const a = await pool.selectAndReserve(only1)
+  pool.reserve = (args) => reserveWithKernelLease(pool, args, 1)
+  const a = await pool.reserve(only1)
   assert.equal(a.ok, true)
   const waiting = pool.selectAndReserve({ ...only1, allowWait: true })
   setTimeout(() => a.release(), 50)
@@ -322,7 +368,8 @@ test('kernel_lease enforce: kernel_lease_queue_grace_ms 0 means the kernel must 
     config: { kernel_lease: 'enforce', kernel_lease_queue_grace_ms: 0 },
   })
   pool.kernelLeaseStats = new KernelLeaseStats({ log: () => {} })
-  const a = await pool.selectAndReserve(only1)
+  pool.reserve = (args) => reserveWithKernelLease(pool, args, 1)
+  const a = await pool.reserve(only1)
   assert.ok(a.slotWaitDeadlineMs <= Date.now())
   a.release()
 })
@@ -331,15 +378,15 @@ test('kernel_lease enforce: a content seat takes a lease per request and spreads
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const pool = leasePool(root, 'enforce', 1)
-  const req = { model: 'claude-test', seatKey: 'seat:h:0123456789abcdef', allowWait: false }
-  const a = await pool.selectAndReserve(req)
-  const b = await pool.selectAndReserve(req)
+  const req = { model: 'claude-test', stickyKey: 'seat:h:0123456789abcdef', allowWait: false }
+  const a = await pool.reserve(req)
+  const b = await pool.reserve(req)
   assert.equal(a.ok, true)
   assert.equal(b.ok, true, 'second request of the batch is not stuck behind the first kernel')
   assert.notEqual(a.vmId, b.vmId)
   a.release()
   b.release()
-  const c = await pool.selectAndReserve(req)
+  const c = await pool.reserve(req)
   assert.equal(c.vmId, b.vmId, 'affinity prefers the VM the seat last ran on')
   c.release()
 })
@@ -348,10 +395,10 @@ test('kernel_lease enforce: a session seat stays on its VM', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const pool = leasePool(root, 'enforce', 1)
-  const req = { model: 'claude-test', seatKey: 'seat:sess:abc', allowWait: false }
-  const a = await pool.selectAndReserve(req)
+  const req = { model: 'claude-test', stickyKey: 'seat:sess:abc', allowWait: false }
+  const a = await pool.reserve(req)
   assert.equal(a.ok, true)
-  const b = await pool.selectAndReserve(req)
+  const b = await pool.reserve(req)
   assert.equal(b.ok, false, 'a conversation does not spill to another account for a lease')
   a.release()
 })
@@ -360,20 +407,11 @@ test('kernel_lease observe: a content seat keeps the seat path', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const pool = leasePool(root, 'observe', 1)
-  const req = { model: 'claude-test', seatKey: 'seat:h:0123456789abcdef', allowWait: false }
-  const a = await pool.selectAndReserve(req)
-  const b = await pool.selectAndReserve(req)
+  const req = { model: 'claude-test', stickyKey: 'seat:h:0123456789abcdef', allowWait: false }
+  const a = await pool.reserve(req)
+  const b = await pool.reserve(req)
   assert.equal(a.vmId, b.vmId)
   assert.equal(b.selectionReason, 'seat-held')
   a.release()
   b.release()
 })
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

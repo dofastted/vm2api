@@ -28,15 +28,31 @@ import { slotExec } from '../../src/lib/vm/slot-runtime.mjs'
 test('guest OAuth helper preserves provider state, PKCE and cookie authorization', {
   timeout: 30000,
 }, async (t) => {
+  const stubBinary = fileURLToPath(new URL('../fixtures/kin-oauth-auth-stub.mjs', import.meta.url))
   const defaultBinary = fileURLToPath(new URL('../../bin/kin-oauth-auth', import.meta.url))
-  let binary = process.env.KIN_TEST_OAUTH_AUTH_BIN || defaultBinary
-  let useFixtureStub = false
-  try {
-    fs.accessSync(binary, fs.constants.X_OK)
-  } catch {
-    binary = fileURLToPath(new URL('../fixtures/kin-oauth-auth-stub.mjs', import.meta.url))
+  const useRealBinary = process.env.KIN_TEST_OAUTH_USE_REAL_BIN === '1'
+  let binary = process.env.KIN_TEST_OAUTH_AUTH_BIN
+  let useFixtureStub = !useRealBinary
+  if (!binary) {
+    if (useRealBinary) {
+      try {
+        fs.accessSync(defaultBinary, fs.constants.X_OK)
+        binary = defaultBinary
+        useFixtureStub = false
+      } catch {
+        binary = stubBinary
+        useFixtureStub = true
+      }
+    } else {
+      binary = stubBinary
+      useFixtureStub = true
+    }
+  } else if (binary.endsWith('kin-oauth-auth-stub.mjs')) {
     useFixtureStub = true
+  }
+  if (useFixtureStub) {
     process.env.KIN_TEST_OAUTH_AUTH_BIN = binary
+    process.env.KIN_OAUTH_AUTH_BIN = binary
   }
   // A released helper advertises what it implements; a PR that changes policy
   // must not turn CI red before the binary carrying it exists. Probed straight
@@ -573,12 +589,3 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
     },
   )
 })
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

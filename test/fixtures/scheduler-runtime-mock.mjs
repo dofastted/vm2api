@@ -6,8 +6,12 @@ import { listVms } from '../../src/lib/vm/vm-registry.mjs'
  * Generic acquire/switch/commit/release mock for unit tests that wire M3 Rust dispatch
  * without starting kin-scheduler.
  */
-export function makeStubSchedulerRuntime({ defaultPoolId = null } = {}) {
+export function makeStubSchedulerRuntime({ defaultPoolId = null, getKernelLeaseMode = () => 'off' } = {}) {
   let seq = 0
+  let rr = 0
+  const sessionAffinity = new Map()
+  const seatLast = new Map()
+  const seatCalls = new Map()
   return {
     async acquireNode(params, _opts = {}) {
       const excluded = new Set(params.excludeNodes || [])
@@ -19,8 +23,8 @@ export function makeStubSchedulerRuntime({ defaultPoolId = null } = {}) {
           message: 'No schedulable node available',
         })
       }
-      const key = allowed.find((k) => !excluded.has(k))
-      if (!key) {
+      const eligible = allowed.filter((k) => !excluded.has(k))
+      if (!eligible.length) {
         throw new SchedulerApiError({
           status: 429,
           code: 'pool_exhausted',
@@ -28,14 +32,49 @@ export function makeStubSchedulerRuntime({ defaultPoolId = null } = {}) {
           retryAfterSec: 1,
         })
       }
+      let key = null
+      if (typeof params.pinNodeKey === 'string' && eligible.includes(params.pinNodeKey)) {
+        key = params.pinNodeKey
+      } else {
+        const sessionId = typeof params.sessionId === 'string' ? params.sessionId : ''
+        const kernelMode = String(getKernelLeaseMode() || 'off').toLowerCase()
+        const stickySession =
+          sessionId.includes('seat:sess') || (kernelMode === 'observe' && sessionId.includes('seat:h'))
+        if (stickySession && sessionAffinity.has(sessionId)) {
+          key = sessionAffinity.get(sessionId)
+          if (!eligible.includes(key)) key = null
+        }
+        if (!key) {
+          if (sessionId.includes('seat:h') && kernelMode === 'enforce') {
+            const n = (seatCalls.get(sessionId) || 0) + 1
+            seatCalls.set(sessionId, n)
+            const prior = seatLast.get(sessionId)
+            if (n >= 3 && prior && eligible.includes(prior)) {
+              key = prior
+            } else if (n === 2 && prior) {
+              key = eligible.find((k) => k !== prior) || eligible[rr++ % eligible.length]
+            } else {
+              key = eligible[rr++ % eligible.length]
+            }
+            seatLast.set(sessionId, key)
+          } else {
+            key = eligible[rr++ % eligible.length]
+          }
+          if (stickySession) sessionAffinity.set(sessionId, key)
+        }
+      }
       const nodeType = key.split(':')[0] || 'claude_vm'
       const nodeId = key.split(':').slice(1).join(':')
+      const selectionWhy =
+        sessionAffinity.get(params.sessionId) === key && String(params.sessionId || '').includes('seat:')
+          ? 'seat-held'
+          : 'rust-scheduler'
       return {
         lease_id: `stub-lease-${++seq}`,
         lease_ttl_ms: 30_000,
         resolved_pool_id: params.originPoolId || defaultPoolId || '__default_stub__',
         selected_node: { node_type: nodeType, node_id: nodeId, node_key: key },
-        explain: params.explain || null,
+        explain: { affinity: { why: selectionWhy } },
       }
     },
     async switchNode(body, opts) {
@@ -47,14 +86,17 @@ export function makeStubSchedulerRuntime({ defaultPoolId = null } = {}) {
 }
 
 /** Gemini environment picker aligned with gemini-scheduling-status.test.mjs */
-export function makeMockGeminiRuntime() {
+export function makeMockGeminiRuntime(poolScheduler = null) {
   let seq = 0
+  let rr = 0
+  const leases = new Map()
   return {
     async acquireNode(params) {
       const excluded = new Set(params.excludeNodes || [])
-      const allowed = Array.isArray(params.allowedNodeKeys) ? params.allowedNodeKeys : []
-      const key = allowed.find((k) => !excluded.has(k))
-      if (!key) {
+      const allowed = Array.isArray(params.allowedNodeKeys)
+        ? params.allowedNodeKeys.filter((k) => !excluded.has(k))
+        : []
+      if (!allowed.length) {
         throw new SchedulerApiError({
           status: 429,
           code: 'pool_exhausted',
@@ -62,9 +104,16 @@ export function makeMockGeminiRuntime() {
           retryAfterSec: 5,
         })
       }
+      const key = allowed[rr++ % allowed.length]
       const id = key.split(':').slice(1).join(':')
+      const accountKey = `gemini:${id}`
+      if (poolScheduler?.bumpInflight) {
+        poolScheduler.bumpInflight(accountKey, id, 1)
+      }
+      const lease_id = `gem-lease-${++seq}`
+      leases.set(lease_id, { accountKey, id })
       return {
-        lease_id: `gem-lease-${++seq}`,
+        lease_id,
         lease_ttl_ms: 30_000,
         resolved_pool_id: params.originPoolId || '__default_gemini__',
         selected_node: { node_type: 'gemini_env', node_id: id, node_key: key },
@@ -75,7 +124,13 @@ export function makeMockGeminiRuntime() {
       return this.acquireNode(body.next_attempt || {})
     },
     async commitLease() {},
-    async releaseLease() {},
+    async releaseLease(leaseId) {
+      const held = leaseId ? leases.get(leaseId) : null
+      if (held && poolScheduler?.bumpInflight) {
+        poolScheduler.bumpInflight(held.accountKey, held.id, -1)
+      }
+      if (leaseId) leases.delete(leaseId)
+    },
   }
 }
 
@@ -172,11 +227,20 @@ export function withM3SchedulerDeps(deps = {}) {
 }
 
 /** Minimal Codex vm picker from on-disk registry rows (handle-codex.test.mjs style). */
-export function makePoolStubRuntimeForProject(projectRoot) {
-  const rt = makeStubSchedulerRuntime()
+export function makePoolStubRuntimeForProject(projectRoot, { getKernelLeaseMode = () => 'off' } = {}) {
+  const rt = makeStubSchedulerRuntime({ getKernelLeaseMode })
   const acquire = rt.acquireNode.bind(rt)
   rt.acquireNode = async (params, opts) => {
-    const acquired = await acquire(params, opts)
+    const withAllowed =
+      Array.isArray(params.allowedNodeKeys) && params.allowedNodeKeys.length
+        ? params
+        : {
+            ...params,
+            allowedNodeKeys: listVms(projectRoot)
+              .filter((vm) => vm?.schedulable !== false)
+              .map((vm) => formatNodeKey('claude_vm', vm.id)),
+          }
+    const acquired = await acquire(withAllowed, opts)
     const id = acquired?.selected_node?.node_id
     if (id && !listVms(projectRoot).some((vm) => vm.id === id)) {
       throw new SchedulerApiError({
