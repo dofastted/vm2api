@@ -28,6 +28,8 @@ hypervisor/*.env
 .workflow/
 __pycache__/
 crates/
+!/scheduler/crates/
+/scheduler/target/
 patches/
 .local/
 /local-src/

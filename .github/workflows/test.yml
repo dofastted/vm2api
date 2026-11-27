@@ -32,6 +32,7 @@ jobs:
     outputs:
       backend: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.backend == 'true' }}
       go: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.go == 'true' }}
+      rust_scheduler: ${{ inputs.full || steps.filter.outputs.rust_scheduler == 'true' }}
       web: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.web == 'true' }}
       packaging: ${{ inputs.full || steps.filter.outputs.packaging == 'true' }}
       oauth: ${{ inputs.full || steps.filter.outputs.oauth == 'true' }}
@@ -65,6 +66,9 @@ jobs:
               - 'api-kernel/**'
               - 'redact/**'
               - 'protofront/**'
+              - '.github/workflows/test.yml'
+            rust_scheduler:
+              - 'scheduler/**'
               - '.github/workflows/test.yml'
             web:
               - 'web/**'
@@ -104,11 +108,11 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
         run: test "$CHANGES_RESULT" = success
       - uses: actions/checkout@v7
-        if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.go == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.packaging == 'true'
+        if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.go == 'true' || needs.changes.outputs.rust_scheduler == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.packaging == 'true'
         with:
           fetch-depth: 0
       - name: merge current base
-        if: github.event_name == 'pull_request' && (needs.changes.outputs.backend == 'true' || needs.changes.outputs.go == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.packaging == 'true')
+        if: github.event_name == 'pull_request' && (needs.changes.outputs.backend == 'true' || needs.changes.outputs.go == 'true' || needs.changes.outputs.rust_scheduler == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.packaging == 'true')
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
@@ -130,6 +134,14 @@ jobs:
             worker/go.sum
             api-kernel/go.sum
             redact/go.sum
+      - uses: dtolnay/rust-toolchain@1.86.0
+        if: needs.changes.outputs.rust_scheduler == 'true' || inputs.full || contains(needs.changes.outputs.unit_tests, 'test/unit/scheduler-client.test.mjs')
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.rust_scheduler == 'true' || inputs.full || contains(needs.changes.outputs.unit_tests, 'test/unit/scheduler-client.test.mjs')
+        with:
+          workspaces: scheduler
       - name: pinned payload
         if: needs.changes.outputs.packaging == 'true'
         run: |
@@ -164,6 +176,10 @@ jobs:
           if [ "$FULL" = true ] || jq -e 'index("test/unit/proto-front-sidecar.test.mjs") != null' <<< "$CHANGED_TESTS" >/dev/null; then
             (cd protofront && CGO_ENABLED=0 go build -o ../bin/kin-proto-front ./cmd/kin-proto-front)
           fi
+          # scheduler-client.test.mjs spawns the real Rust sidecar from bin/kin-scheduler.
+          if [ "$FULL" = true ] || jq -e 'index("test/unit/scheduler-client.test.mjs") != null' <<< "$CHANGED_TESTS" >/dev/null; then
+            (cd scheduler && RUSTUP_TOOLCHAIN=1.86.0 cargo build --release --locked --bin kin-scheduler && mkdir -p ../bin && cp target/release/kin-scheduler ../bin/kin-scheduler)
+          fi
           if [ "$FULL" = true ]; then
             # Four workers for the four vCPUs a standard runner has. The suite is
             # 412 files and over a quarter of an hour one at a time.
@@ -183,6 +199,15 @@ jobs:
           (cd api-kernel && go test ./...)
           (cd redact && go test ./...)
           (cd protofront && go test ./...)
+      - name: Rust scheduler checks
+        if: needs.changes.outputs.rust_scheduler == 'true' || inputs.full
+        working-directory: scheduler
+        env:
+          RUSTUP_TOOLCHAIN: '1.86.0'
+        run: |
+          cargo fmt --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --locked
       - uses: pnpm/action-setup@v6
         if: needs.changes.outputs.web == 'true'
         with:

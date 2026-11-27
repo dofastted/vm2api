@@ -1,0 +1,19 @@
+[package]
+name = "scheduler-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+compact_str.workspace = true
+dashmap.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+scheduler-proto.workspace = true
+sha2.workspace = true
+smallvec.workspace = true
+tokio.workspace = true
+tracing.workspace = true
