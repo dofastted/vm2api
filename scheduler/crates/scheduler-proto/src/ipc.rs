@@ -103,6 +103,10 @@ pub struct NodeTelemetryUpdate {
     pub external_in_flight: Option<u32>,
     #[serde(default)]
     pub runtime_capabilities: Option<BTreeMap<String, bool>>,
+    #[serde(default)]
+    pub temp_unschedulable_until_ms: Option<Option<u64>>,
+    #[serde(default)]
+    pub temp_unschedulable_reason: Option<Option<CompactString>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

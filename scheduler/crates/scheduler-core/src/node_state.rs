@@ -23,6 +23,8 @@ pub struct NodeMutable {
     pub host_memory_pressure: bool,
     pub proxy_ready: bool,
     pub crag_license_ok: bool,
+    pub temp_unschedulable_until_ms: Option<u64>,
+    pub temp_unschedulable_reason: Option<CompactString>,
     pub external_in_flight: u32,
     pub runtime_capabilities: BTreeMap<String, bool>,
 
@@ -56,6 +58,8 @@ impl Default for NodeMutable {
             host_memory_pressure: false,
             proxy_ready: true,
             crag_license_ok: true,
+            temp_unschedulable_until_ms: None,
+            temp_unschedulable_reason: None,
             external_in_flight: 0,
             runtime_capabilities: BTreeMap::new(),
             in_flight: 0,
@@ -123,6 +127,18 @@ impl NodeMutable {
                 became_freer = true;
             }
             self.crag_license_ok = v;
+        }
+        if let Some(v) = &upd.temp_unschedulable_until_ms {
+            self.temp_unschedulable_until_ms = *v;
+            if v.map(|until| until <= u64::MAX / 2).unwrap_or(true) {
+                // Clearing or shortening the park window may free the node for admission.
+                if v.map(|until| until == 0).unwrap_or(true) {
+                    became_freer = true;
+                }
+            }
+        }
+        if let Some(v) = &upd.temp_unschedulable_reason {
+            self.temp_unschedulable_reason = v.clone();
         }
         if let Some(v) = upd.external_in_flight {
             if v < self.external_in_flight {

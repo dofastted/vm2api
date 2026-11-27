@@ -46,6 +46,8 @@ import { resolveUpstreamModel, stripAntigravityPrefix } from '../gemini/model-ca
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import { endpointMatchesModel, stripPrefix } from '../pool/api-scheduler.mjs'
 import { isLeftoverQuotaScheduleOff } from '../pool/availability.mjs'
+import { isCodexSlotParked } from '../pool/codex-slot-pool.mjs'
+import { normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
 import { modelMatchesAllowlist } from '../pool/slot-model-gate.mjs'
 import { isConcurrencyPinned } from '../pool/tier-limits.mjs'
@@ -325,6 +327,23 @@ function extractQuotaPctsForVm(vm, acct) {
     }
   }
   return { u5, u7 }
+}
+
+function parseTempUnschedulableUntilMs(vm) {
+  const raw = vm?.temp_unschedulable_until ?? vm?.claude?.temp_unschedulable_until
+  if (raw == null || raw === '') return null
+  const asNum = Number(raw)
+  if (Number.isFinite(asNum) && asNum > 0) return Math.floor(asNum)
+  const parsed = Date.parse(String(raw))
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+}
+
+function tempUnschedulableState(vm, now = Date.now()) {
+  const untilMs = parseTempUnschedulableUntilMs(vm)
+  const reasonRaw = vm?.temp_unschedulable_reason ?? vm?.claude?.temp_unschedulable_reason ?? null
+  const reason = reasonRaw != null && String(reasonRaw).trim() ? String(reasonRaw).trim() : null
+  const active = untilMs != null && untilMs > now
+  return { active, untilMs: active ? untilMs : null, reason }
 }
 
 function buildAccountLookup(accountQuota) {
@@ -1025,6 +1044,11 @@ export class SchedulerRuntime {
         },
         enabled,
       }
+      const tempParkCfg = tempUnschedulableState(vm)
+      if (tempParkCfg.untilMs != null) {
+        nodeCfg.temp_unschedulable_until_ms = tempParkCfg.untilMs
+        if (tempParkCfg.reason) nodeCfg.temp_unschedulable_reason = tempParkCfg.reason
+      }
       nodes.push(nodeCfg)
       nodesByKey.set(node_key, nodeCfg)
       inventoryByKey.set(node_key, { kind: 'vm', item: vm, account: acct })
@@ -1274,12 +1298,17 @@ export class SchedulerRuntime {
       }
     }
 
+    const codexQuota = normalizeOpenAIQuotaPolicy(routing.codex?.quota || {})
     const snapshot = {
       config_version: version,
       global_prompt_policy: resolveGlobalPromptPolicy(routing),
       trusted_downgrade_pool_ids: [...trustedDowngradeSet],
       pools,
       nodes,
+      codex_quota: {
+        limit_5h: codexQuota.limit_5h,
+        limit_7d: codexQuota.limit_7d,
+      },
     }
     this.#lastSnapshot = snapshot
     this.#poolsById = poolsById
@@ -1298,6 +1327,7 @@ export class SchedulerRuntime {
     const acctLookup = buildAccountLookup(this.#accountQuota)
     const externalVms = this.#externalLoadProvider?.() || {}
     const routing = this.#getRoutingConfig() || {}
+    const quotaPolicy = normalizeOpenAIQuotaPolicy(routing.codex?.quota || {})
 
     for (const vm of vms) {
       if (!vm?.id) continue
@@ -1331,6 +1361,15 @@ export class SchedulerRuntime {
         unschedReason = `vm_status_${statusLower}`
       }
 
+      const tempPark = tempUnschedulableState(vm, now)
+      if (schedulable && tempPark.active) {
+        schedulable = false
+        unschedReason = tempPark.reason || 'temp_unschedulable'
+      } else if (schedulable && codex && isCodexSlotParked(vm, now, quotaPolicy)) {
+        schedulable = false
+        unschedReason = 'codex_slot_parked'
+      }
+
       const activeHoursRes = evaluateActiveHours(activeHoursOf(vm), now, vm.timezone)
       const memLevel = this.#hostMemoryPressure?.levelForVm?.(vm) ?? hostMemoryLevelForVm(vm)
       const hostMemoryPressure = memLevel === HOST_PRESSURE_CRITICAL
@@ -1361,6 +1400,8 @@ export class SchedulerRuntime {
       }
       if (u5 != null) update.quota_util_5h_pct = u5
       if (u7 != null) update.quota_util_7d_pct = u7
+      update.temp_unschedulable_until_ms = tempPark.untilMs
+      update.temp_unschedulable_reason = tempPark.reason
       const runtimeCaps = buildVmRuntimeCapabilities(vm, { projectRoot: this.#cfg?.paths?.project || '', routing })
       if (runtimeCaps) {
         update.runtime_capabilities = runtimeCaps

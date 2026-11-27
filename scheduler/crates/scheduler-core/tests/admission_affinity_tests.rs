@@ -32,6 +32,8 @@ fn node_cfg(
             ..Default::default()
         },
         enabled: true,
+        temp_unschedulable_until_ms: None,
+        temp_unschedulable_reason: None,
     }
 }
 

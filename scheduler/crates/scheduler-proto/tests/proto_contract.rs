@@ -39,6 +39,13 @@ fn provider_accepts_gemini_alias_as_google() {
 }
 
 #[test]
+fn config_snapshot_codex_quota_defaults_preserve_legacy_rust_95pct() {
+    let snap: ConfigSnapshot = serde_json::from_str(r#"{"config_version":1}"#).unwrap();
+    assert!((snap.codex_quota.limit_5h_percent() - 95.0).abs() < 0.01);
+    assert!((snap.codex_quota.limit_7d_percent() - 95.0).abs() < 0.01);
+}
+
+#[test]
 fn backend_node_weight_tier_clamping_and_auto_mode() {
     let mut n = BackendNodeConfig {
         node_key: CompactString::const_new("claude_vm:vm1"),
@@ -55,6 +62,8 @@ fn backend_node_weight_tier_clamping_and_auto_mode() {
         supported_models: vec![],
         capacity: NodeCapacityConfig::default(),
         enabled: true,
+        temp_unschedulable_until_ms: None,
+        temp_unschedulable_reason: None,
     };
     assert_eq!(n.effective_base_weight_tier(), 1);
     n.weight_tier = 99;
@@ -82,6 +91,8 @@ fn backend_node_anthropic_prompt_eligibility() {
         supported_models: vec![],
         capacity: NodeCapacityConfig::default(),
         enabled: true,
+        temp_unschedulable_until_ms: None,
+        temp_unschedulable_reason: None,
     };
     assert!(make(NodeType::ClaudeVm, Provider::Anthropic, None).is_anthropic_prompt_eligible());
     assert!(!make(NodeType::CodexVm, Provider::Openai, None).is_anthropic_prompt_eligible());
