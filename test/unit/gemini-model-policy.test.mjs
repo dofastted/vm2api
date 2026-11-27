@@ -19,6 +19,7 @@ import { buildGeminiRequest, parseInboundToGemini } from '../../src/lib/protocol
 import { resolveGeminiReasoningEffort } from '../../src/lib/protocol/log-fields.mjs'
 import { resolveUpstreamModel } from '../../src/lib/gemini/model-catalog.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { buildPricing } from '../../src/lib/admin/pricing-view.mjs'
 import { setPriceCatalogTestHooks, setPriceOverride } from '../../src/lib/admin/price-catalog.mjs'
 import { syncGeminiCatalog } from '../../src/lib/admin/catalog-monitor.mjs'
@@ -217,6 +218,7 @@ test('resolveUpstreamModel and Gemini scheduler respect default_effort and polic
     saveGeminiModelPolicy(pol)
 
     const scheduler = createGeminiScheduler({
+      schedulerRuntime: createMockSchedulerRuntime(),
       callHost: async (op) => {
         if (op === 'list') {
           return {

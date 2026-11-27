@@ -11,6 +11,7 @@ import {
 } from '../../src/lib/gemini/model-catalog.mjs'
 import { createGeminiPanelHandler, createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { FULL_GEMINI_CAPABILITIES, NATIVE_TUI_CAPABILITIES } from '../../src/lib/protocol/gemini-convert.mjs'
 
 function makeRes() {
@@ -170,6 +171,8 @@ test('scheduler isolates 3p 429 cooldown from gemini quota group and automatical
   const scheduler = createGeminiScheduler({
     now: () => clock,
     quotaCooldownMs: 60_000,
+    rateLimitRetryDelayMs: 0,
+    schedulerRuntime: createMockSchedulerRuntime({ now: () => clock, quotaCooldownMs: 60_000 }),
     callHost: async (op, payload) => {
       if (op === 'list') return { payload_state: 'installed', environments: envs }
       if (op === 'get') return envs.find((e) => e.id === payload.id)
@@ -215,6 +218,7 @@ test('scheduler isolates 3p 429 cooldown from gemini quota group and automatical
   assert.equal(turn1.text, 'reply-from-env-b')
   assert.deepEqual(calls, [
     { id: 'env-a', model: 'claude-sonnet-4-6-high' },
+    { id: 'env-a', model: 'claude-sonnet-4-6-high' },
     { id: 'env-b', model: 'claude-sonnet-4-6-high' },
   ])
 
@@ -226,8 +230,8 @@ test('scheduler isolates 3p 429 cooldown from gemini quota group and automatical
     apiKeyRecord: { id: 'k-all', group_type: 'all' },
   })
   assert.equal(turn2.account_id, 'env-b')
-  assert.equal(calls.length, 3)
-  assert.equal(calls[2].id, 'env-b')
+  assert.equal(calls.length, 4)
+  assert.equal(calls[3].id, 'env-b')
 
   // 3. Call to gemini-4-neon within the same 60s window STILL schedules env-a because `gemini` quota group is NOT cooled!
   const turn3 = await scheduler.stream({
@@ -281,6 +285,7 @@ test('scheduler skips proactively exhausted accounts and fails over on verificat
 
   const attempted = []
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime(),
     callHost: async (op, payload) => {
       if (op === 'list') return { payload_state: 'installed', environments: envs }
       if (op === 'get') return envs.find((e) => e.id === payload.id)
@@ -369,6 +374,7 @@ test('Gemini public handler records requestLog once on direct calls and populate
     },
   }
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime(),
     callHost: async (op) => {
       if (op === 'list') {
         return {

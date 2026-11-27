@@ -1,3 +1,4 @@
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -93,6 +94,7 @@ test('scheduler rejects stream with sandbox denial via checkAdmission (503, not 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gemini-sandbox-stream-'))
   const subscription = makeSubscription(root)
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime(),
     cragSubscription: subscription,
     callHost: async (op) => {
       if (op === 'list') return installedList([sandboxEnv('gemini_sandbox_unavailable')])
