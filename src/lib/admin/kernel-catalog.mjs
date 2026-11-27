@@ -44,6 +44,13 @@ const archFor = (projectRoot, kernel, runtimeOptions) =>
   kernel === 'crag' ? cragTargetArch(projectRoot, runtimeOptions) : 'amd64'
 const CRAG_PINNED_RELEASES = [
   {
+    tag: 'payload-2026.11.27-crag-3.1.25',
+    label: '3.1.25 修复空串 crag_prompt replace 静默回退官方提示词',
+    size: 171332562,
+    manifestSha256: '7d95b8f9228ce3248536193c995cd8ca6f39ad3742fdcf08681fb9202e26b09f',
+    sha256: '005a664e9358a78d94b216d7648d099ddfa7ddebc14f725e41ce248edffd121f',
+  },
+  {
     tag: 'payload-2026.11.27-crag-3.1.24',
     label: '3.1.24 修复工具续接拒答后追问死锁 409',
     size: 171335019,
