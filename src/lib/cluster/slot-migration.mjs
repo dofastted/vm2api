@@ -20,6 +20,18 @@ import {
   rollbackMigrationRuntime,
   finishMigration,
 } from './slot-migration-remote.mjs'
+import {
+  preflightLocalResize,
+  stopLocalSlot,
+  preserveLocalContainer,
+  publishLocalResize,
+  verifyLocalResize,
+  rollbackLocalResize,
+  finishLocalResize,
+} from '../vm/slot-resize-local.mjs'
+
+/** Target id the panel sends for an in-place resize of a control-plane (no node_id) slot. */
+export const LOCAL_TARGET = 'local'
 
 const active = new Map()
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -49,8 +61,11 @@ export function slotMigrationJob(projectRoot, id) {
 
 export function migrationRequest(vm, body, routing) {
   if (!vm) throw migrationError('vm_not_found', '槽位不存在', 404)
-  if (!vm.node_id || runtimeKind(vm) !== 'kvm' || isCodexVm(vm) || resolveKernelDataplane(vm, routing) === 'crag')
-    throw migrationError('migration_unsupported', '首版仅支持远程 Linux 节点上的 Claude KVM 槽（不含 crag）')
+  if (runtimeKind(vm) !== 'kvm' || isCodexVm(vm))
+    throw migrationError('migration_unsupported', '仅支持 Claude KVM 槽')
+  // Remote moves still exclude CRAG; a control-plane slot can only be resized in place (CRAG included).
+  if (vm.node_id && resolveKernelDataplane(vm, routing) === 'crag')
+    throw migrationError('migration_unsupported', '远程节点上的 crag 槽暂不支持迁移')
   if (vm.status !== 'running') throw migrationError('migration_not_running', '请先确认原槽已正常运行')
   if (migrationActive(vm) || vm.schedule_hold)
     throw migrationError('migration_busy', '槽位正在迁移或维护中，请先完成原任务')
@@ -59,11 +74,15 @@ export function migrationRequest(vm, body, routing) {
   const targetNodeId = body.target_node_id
   if (typeof targetNodeId !== 'string' || !/^[a-z0-9-]{1,64}$/.test(targetNodeId))
     throw migrationError('migration_invalid', '请选择目标节点', 400)
+  if (!vm.node_id && targetNodeId !== LOCAL_TARGET)
+    throw migrationError('migration_unsupported', '主控本机的槽只支持原地扩容', 400)
+  if (vm.node_id && targetNodeId === LOCAL_TARGET)
+    throw migrationError('migration_invalid', '远程槽请选择节点', 400)
   const current = slotMemory(vm, routing)
   const memory = body.memory ?? current
   if (!VM_MEMORY_OPTIONS.includes(memory) || parseMemoryBytes(memory) < parseMemoryBytes(current))
     throw migrationError('migration_invalid_memory', '只支持保留内存或扩容，不能缩容', 400)
-  if (targetNodeId === vm.node_id && memory === current)
+  if ((targetNodeId === vm.node_id || (!vm.node_id && targetNodeId === LOCAL_TARGET)) && memory === current)
     throw migrationError('migration_no_change', '请选择其他节点或更大的内存', 400)
   return { targetNodeId, memory }
 }
@@ -109,7 +128,8 @@ export function startSlotMigration(args) {
 
 async function runMigration(args, job) {
   const { projectRoot, id, body, routing, proxyPool, watchdog, poolScheduler, ops = {} } = args
-  const preflight = ops.preflight || preflightMigration
+  const local = !getVm(projectRoot, id)?.node_id
+  const preflight = ops.preflight || (local ? preflightLocalResize : preflightMigration)
   const power = ops.powerOn || powerOnSlot
   const wait = ops.wait || sleep
   let plan,
@@ -159,25 +179,31 @@ async function runMigration(args, job) {
     // A persistent marker also excludes the slot from watchdog/revive after a process restart.
     patchVmRecord(projectRoot, id, { status: 'stopped' })
     touched = true
-    const stopped = await (ops.stop || stopRemoteSlot)(vm)
+    const stopped = await (ops.stop || (local ? stopLocalSlot : stopRemoteSlot))(vm)
     if (!stopped?.ok) throw migrationError('migration_stop_failed', '原节点关机失败')
-    await (ops.preserve || preserveMigrationContainer)(plan)
+    await (ops.preserve || (local ? (p) => preserveLocalContainer(p, { projectRoot }) : preserveMigrationContainer))(plan)
     if (!plan.sameNode) {
       update({ phase: 'copying' })
       const receipt = await (ops.copy || copyMigrationTree)(plan)
       update({ copied_bytes: receipt.copied_bytes, checksum: receipt.sha256 })
     }
     update({ phase: 'switching' })
-    await (ops.publish || publishMigrationTree)(plan)
+    await (ops.publish || (local ? publishLocalResize : publishMigrationTree))(plan)
     patchVmRecord(projectRoot, id, (record) => ({
-      node_id: request.targetNodeId,
-      machine: { ...record.machine, memory: request.memory },
+      node_id: local ? record.node_id ?? null : request.targetNodeId,
+      // Local: boot the replacement on the exact base image the slot ran (qcow overlay backing).
+      machine: {
+        ...record.machine,
+        memory: request.memory,
+        ...(local && plan?.sourceInfo?.Image ? { kvm_image_id: plan.sourceInfo.Image } : {}),
+      },
       runtime: {},
     }))
     update({ phase: 'starting' })
     await boot()
     update({ phase: 'verifying' })
     await wait(3000)
+    if (local) await (ops.verifyLocal || verifyLocalResize)(plan)
     watchdog?.reset?.(id)
     const diagnosis = await (ops.diagnose || diagnoseSlotServices)(getVm(projectRoot, id), {
       projectRoot,
@@ -189,7 +215,7 @@ async function runMigration(args, job) {
     committed = true
     update({ phase: 'cleanup' })
     try {
-      await (ops.finish || finishMigration)(plan)
+      await (ops.finish || (local ? finishLocalResize : finishMigration))(plan)
     } catch {
       update({
         warning: '新槽已验证；旧容器/出口或备份整理未完成，请按文档核对保留资源',
@@ -206,7 +232,7 @@ async function runMigration(args, job) {
     if (!committed && touched) {
       update({ phase: 'rolling_back' })
       try {
-        await (ops.rollback || rollbackMigrationRuntime)(plan)
+        await (ops.rollback || (local ? rollbackLocalResize : rollbackMigrationRuntime))(plan)
         patchVmRecord(projectRoot, id, original)
         await boot()
         await wait(3000)

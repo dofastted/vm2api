@@ -58,7 +58,9 @@ export function MigrateSlotDialog({
 
 function MigrationForm({ vm, nodes }: { vm: Vm; nodes: ClusterApiNode[] }) {
   const qc = useQueryClient()
-  const [target, setTarget] = useState(vm.node_id || '')
+  // A control-plane slot (no node_id) can only be resized in place: target 'local'.
+  const local = !vm.node_id
+  const [target, setTarget] = useState(vm.node_id || (local ? 'local' : ''))
   const [memory, setMemory] = useState(vm.machine?.memory || '2g')
   const [confirmed, setConfirmed] = useState(false)
   const path = `/api/panel/vms/${encodeURIComponent(vm.id)}/migration`
@@ -94,10 +96,15 @@ function MigrationForm({ vm, nodes }: { vm: Vm; nodes: ClusterApiNode[] }) {
   const eligible = nodes.filter(
     (n) => n.platform !== 'darwin' && n.link.state === 'ready'
   )
-  const unchanged = target === vm.node_id && memory === vm.machine?.memory
+  const unchanged =
+    (target === vm.node_id || (local && target === 'local')) &&
+    memory === vm.machine?.memory
   return (
     <div className='space-y-4 text-sm'>
       <p className='font-medium'>{vm.name || vm.id}</p>
+      {local ? (
+        <p className='text-xs text-muted-foreground'>主控本机槽：原地扩内存</p>
+      ) : (
       <label className='grid gap-1.5'>
         目标节点
         <select
@@ -121,6 +128,7 @@ function MigrationForm({ vm, nodes }: { vm: Vm; nodes: ClusterApiNode[] }) {
           ))}
         </select>
       </label>
+      )}
       <label className='grid gap-1.5'>
         迁移后内存
         <select
@@ -141,8 +149,9 @@ function MigrationForm({ vm, nodes }: { vm: Vm; nodes: ClusterApiNode[] }) {
         </select>
       </label>
       <p className='text-xs leading-relaxed text-muted-foreground'>
-        仅支持运行中的远程 Linux Claude KVM（不含 crag）
-        槽和内存扩容。两端镜像须完全一致；跨节点的直连或回环出口会被拒绝。任务串行执行、限速传盘，可能需要数十分钟。原节点冷盘保留为回滚资料，不自动删除。
+        {local
+          ? '主控本机 KVM 槽（含 crag）原地扩内存：暂停调度、排空后关机，用同一基础镜像以新内存重建容器，槽位身份和磁盘不变；验证失败自动换回原容器。只能扩不能缩。'
+          : '远程 Linux Claude KVM 槽（不含 crag）迁移或扩内存。两端镜像须完全一致；跨节点的直连或回环出口会被拒绝。任务串行执行、限速传盘，可能需要数十分钟。原节点冷盘保留为回滚资料，不自动删除。'}
       </p>
       <label className='flex items-start gap-2'>
         <input
