@@ -12,6 +12,7 @@ import {
 } from '../../src/lib/gemini/routing-config.mjs'
 import { createGeminiPanelHandler, createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 
 test('routing-config defaults, validation, merge, and protocol gating', () => {
   const def = normalizeGeminiRouting({})
@@ -124,6 +125,7 @@ test('Gemini scheduler honors balanced, fill, round_robin, sticky TTL, and gatew
   const dispatched = []
   let holdRelease = null
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime({ getRoutingConfig: () => routing, maxConcurrency: 4 }),
     resolveProxy: () => 'socks5h://u:p@192.0.2.11:1080',
     callHost: async (op, payload) => {
       if (op === 'list') return { payload_state: 'installed', environments: envs }
@@ -139,9 +141,7 @@ test('Gemini scheduler honors balanced, fill, round_robin, sticky TTL, and gatew
         headers: { 'content-type': 'text/event-stream' },
         async *[Symbol.asyncIterator]() {
           if (wait) await wait
-          yield Buffer.from(
-            'data: {"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}\n\n',
-          )
+          yield Buffer.from('data: {"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}\n\n')
         },
         destroy() {},
       }

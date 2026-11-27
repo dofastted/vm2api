@@ -11,6 +11,7 @@ import { RequestLogStore, summarizeBody } from '../../src/lib/admin/request-log.
 import { UsageLogsView } from '../../src/lib/db/repos/usage-logs-view.mjs'
 import { createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import {
   FULL_GEMINI_CAPABILITIES,
   createGeminiCollector,
@@ -118,6 +119,7 @@ test('Gemini cache + reasoning usage is never double-subtracted in RequestLogSto
   assert.equal(normalized.reasoning_tokens, 80)
 
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime(),
     callHost: async (op) => {
       if (op === 'list') {
         return {
@@ -383,6 +385,8 @@ test('delegated handle-protocol path captures inbound/outbound debug bodies, tim
     },
   ]
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime(),
+    rateLimitRetryDelayMs: 0,
     callHost: async (op, payload) => {
       if (op === 'list') return { payload_state: 'installed', environments: envs }
       if (op === 'get') return envs.find((e) => e.id === payload.id)
@@ -520,6 +524,7 @@ test('client cancel logs final_state=cancelled and error-class ignores gemini_in
   })
 
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime(),
     callHost: async (op) => {
       if (op === 'list') {
         return {
@@ -676,6 +681,7 @@ test('API-backend Gemini path records first_byte_ms, first_token_ms, generation_
     stickyRouter: {},
     accountQuota: {},
     apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    schedulerRuntime: createMockSchedulerRuntime(),
     apiScheduler: {
       pick: () => ({
         ok: true,
@@ -684,6 +690,16 @@ test('API-backend Gemini path records first_byte_ms, first_token_ms, generation_
         upstream_model: 'gemini-3-pro',
         key: { id: 'key-upstream-1', api_key: 'secret-gem-key' },
       }),
+      acquire: async () => ({
+        ok: true,
+        leaseId: 'lease-api-gem-1',
+        endpoint: { id: 'ep-gem', kind: 'gemini', protocol: 'gemini', base_url: 'https://gemini.invalid' },
+        requested_model: 'gemini-3-pro-high',
+        upstream_model: 'gemini-3-pro',
+        key: { id: 'key-upstream-1', api_key: 'secret-gem-key' },
+      }),
+      commitLease: async () => {},
+      releaseLease: async () => {},
     },
     apiEndpointStore: {},
     stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
@@ -755,6 +771,8 @@ test('Gemini multi-attempt failover and all-429 errors populate hop_meta.attempt
   ]
 
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime(),
+    rateLimitRetryDelayMs: 0,
     callHost: async (op, payload) => {
       if (op === 'list') return { payload_state: 'installed', environments: envs }
       if (op === 'get') return envs.find((e) => e.id === payload.id)
@@ -787,16 +805,18 @@ test('Gemini multi-attempt failover and all-429 errors populate hop_meta.attempt
   )
   assert.equal(res.statusCode, 429)
   const row = store.queryNormal({ limit: 5 }).items[0]
-  assert.equal(row.attempt_count, 2)
+  assert.equal(row.attempt_count, 4)
   const dbg = store.getDebug(row.request_id)
   assert.equal(dbg.hop_meta?.via, 'craggemini')
-  assert.equal(dbg.hop_meta?.attempts?.length, 2)
+  assert.equal(dbg.hop_meta?.attempts?.length, 4)
   assert.deepEqual(
     dbg.hop_meta.attempts.map((a) => a.account_id),
-    ['env-hop-a', 'env-hop-b'],
+    ['env-hop-a', 'env-hop-a', 'env-hop-b', 'env-hop-b'],
   )
-  assert.equal(dbg.hop_meta.attempts[0].action, 'failover')
-  assert.equal(dbg.hop_meta.attempts[1].action, 'stop')
+  assert.deepEqual(
+    dbg.hop_meta.attempts.map((a) => a.action),
+    ['retry_restart_resume', 'failover', 'retry_restart_resume', 'stop'],
+  )
 })
 
 test('Gemini OAuth preserves upstream-reported modelVersion in logs, model_mismatch, and non-streaming responses (#1728)', async (t) => {
@@ -809,6 +829,7 @@ test('Gemini OAuth preserves upstream-reported modelVersion in logs, model_misma
   const dispatched = []
   let script = []
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime(),
     callHost: async (op) => {
       if (op === 'list') {
         return {
@@ -961,6 +982,7 @@ test('Gemini thinking-suffix request with bare upstream modelVersion does not fl
 
   let script = []
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime(),
     callHost: async (op) => {
       if (op === 'list') {
         return {
@@ -1058,6 +1080,7 @@ test('Gemini OAuth writes callback conversation_id to outbound_session_id, tags 
   let callIdx = 0
   const callbackConvIds = ['gc_111111111111111111111111', 'gc_222222222222222222222222']
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: createMockSchedulerRuntime(),
     callHost: async (op) => {
       if (op === 'list') {
         return {
@@ -1153,6 +1176,7 @@ test('Gemini zero-token local MCP tool-drain continuations aggregate into parent
   let turnNo = 0
   const scheduler = createGeminiScheduler({
     attemptsRepo,
+    schedulerRuntime: createMockSchedulerRuntime(),
     callHost: async (op) => {
       if (op === 'list') {
         return {
