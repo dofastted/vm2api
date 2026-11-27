@@ -1,10 +1,60 @@
 import { extraIsLiveOpen, parseResetMs } from '../pool/quota-window.mjs'
 import { buildCodexUsageView, extraToCodexSnapshot, normalizeCodexLimits } from '../protocol/codex-usage.mjs'
+import { isCodexSlotParked, codexQuotaWindowReason } from '../pool/codex-slot-pool.mjs'
+import {
+  OPENAI_QUOTA_DEFAULTS,
+  effectiveOpenAIPolicy,
+  evaluateOpenAIQuotaGate,
+  normalizeOpenAIQuotaPolicy,
+} from '../pool/openai-quota-policy.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 
 export function unified5hFromAccount(acc) {
   return acc?.unified?.headers?.['5h'] || acc?.unified?.['5h'] || {}
+}
+
+export function unified7dFromAccount(acc) {
+  return acc?.unified?.headers?.['7d'] || acc?.unified?.['7d'] || {}
+}
+
+/** Whole-second reset timestamps avoid episode-key jitter from sub-second ISO fields. */
+export function truncateResetSec(reset) {
+  const ms = parseResetMs(reset)
+  if (!Number.isFinite(ms)) return null
+  return Math.floor(ms / 1000)
+}
+
+export function codexPreheatResets(vm, { projectRoot, now = Date.now() } = {}) {
+  const loaded = projectRoot && vm?.id ? getVm(projectRoot, vm.id) || vm : vm
+  const snapshot = codexSnapshotForPreheat(loaded)
+  const limits = normalizeCodexLimits(snapshot)
+  return { reset5h: limits.reset_5h_at, reset7d: limits.reset_7d_at }
+}
+
+export function claudePreheatResets(vm, accountQuota) {
+  const acc = accountQuota
+    ?.snapshot?.()
+    .accounts?.find((row) => row.vm_id === vm.id || row.account_id === (vm.claude?.account_uuid || vm.account_uuid))
+  return {
+    reset5h: unified5hFromAccount(acc).reset ?? null,
+    reset7d: unified7dFromAccount(acc).reset ?? null,
+  }
+}
+
+/**
+ * Episode identity for auto-renew: one send per vm + account + prior 5h/7d resets.
+ * Returns null when no reset anchor is available.
+ */
+export function preheatRenewEpisodeKey(vm, { projectRoot, accountQuota, now = Date.now() } = {}) {
+  if (!vm?.id) return null
+  const accountId = String(vm.claude?.account_uuid || vm.account_uuid || vm.codex?.account_id || vm.account_id || vm.id)
+  const resets = isCodexVm(vm) ? codexPreheatResets(vm, { projectRoot, now }) : claudePreheatResets(vm, accountQuota)
+  const reset5hSec = truncateResetSec(resets.reset5h)
+  const reset7dSec = truncateResetSec(resets.reset7d)
+  if (reset5hSec == null && reset7dSec == null) return null
+  const key = `${vm.id}\x1e${accountId}\x1e${reset5hSec ?? ''}\x1e${reset7dSec ?? ''}`
+  return { key, accountId, reset5hSec, reset7dSec }
 }
 
 function codexSnapshotForPreheat(loaded) {
@@ -43,17 +93,42 @@ export function resolvePreheatFiveHourWindow(vm, { projectRoot, accountQuota, no
   return unified5hFromAccount(acc)
 }
 
-export function preheatWindowState(vm, { projectRoot, accountQuota, now = Date.now() } = {}) {
+function codexPreheatBlockedReason(vm, now, openaiQuotaPolicy) {
+  const global = normalizeOpenAIQuotaPolicy(openaiQuotaPolicy ?? OPENAI_QUOTA_DEFAULTS)
+  const policy = { ...global, ...effectiveOpenAIPolicy(vm, global) }
+  if (!isCodexSlotParked(vm, now, policy)) return null
+  const hard = codexQuotaWindowReason(vm, now)
+  if (hard) return hard
+  const local = evaluateOpenAIQuotaGate(vm, policy, now)
+  if (local.limited && local.reason) return local.reason
+  return 'quota_limited'
+}
+
+export function preheatWindowState(
+  vm,
+  { projectRoot, accountQuota, now = Date.now(), openaiQuotaPolicy = OPENAI_QUOTA_DEFAULTS } = {},
+) {
   const hasCredential = !!(vm?.has_token || vm?.claude?.has_access || vm?.codex?.has_access)
   const schedulable = vm?.schedulable !== false
+  if (isCodexVm(vm)) {
+    const blocked = codexPreheatBlockedReason(vm, now, openaiQuotaPolicy)
+    if (blocked) {
+      return { hasCredential, schedulable, windowLive: true, reason: blocked }
+    }
+  }
   const w5 = resolvePreheatFiveHourWindow(vm, { projectRoot, accountQuota, now })
   if (!w5.reset && w5.utilization == null) {
-    return { hasCredential, schedulable, windowLive: false }
+    return { hasCredential, schedulable, windowLive: false, reason: null }
   }
   const resetMs = parseResetMs(w5.reset)
   const windowLive =
     extraIsLiveOpen(w5, now) || (Number.isFinite(resetMs) && resetMs > now && Number(w5.utilization) > 0)
-  return { hasCredential, schedulable, windowLive }
+  return {
+    hasCredential,
+    schedulable,
+    windowLive,
+    reason: windowLive ? 'window_live' : null,
+  }
 }
 
 export function preheatNextWindowEnd(vm, { projectRoot, accountQuota, now = Date.now() } = {}) {
