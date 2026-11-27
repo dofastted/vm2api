@@ -44,7 +44,12 @@ import {
   createClaudeMessageAssembler,
   applyClaudeSSELineToMessage,
 } from './convert.mjs'
-import { sanitizeInboundBody, defaultSeedPolicy, callerAutoCompactWindow } from './seed-policy.mjs'
+import {
+  sanitizeInboundBody,
+  sanitizeOutboundHeaders,
+  defaultSeedPolicy,
+  callerAutoCompactWindow,
+} from './seed-policy.mjs'
 import { fingerprintRequest } from './client-fingerprint.mjs'
 import { validateOfficialModel } from './models.mjs'
 import { handleCodexImages, handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
@@ -138,6 +143,7 @@ import {
   extractFirstUserIdentity,
   outboundSessionMode,
   resolveInboundIdentity,
+  resolveSchedulerIdentity,
   resolveSeatIdentity,
   resolveOutboundSessionId,
   sessionIdFromOutboundBody,
@@ -305,6 +311,41 @@ function authenticatedTenant(req) {
   if (req.panelUserId != null) return `panel-id:${req.panelUserId}`
   if (req.panelUser) return `panel-user:${req.panelUser}`
   return ''
+}
+
+/**
+ * Extract read-only scheduler identity strictly before sanitizeInboundBody /
+ * sanitizeOutboundHeaders strip client machine_id/device_id/metadata.user_id.
+ */
+export function prepareInboundProtocolContext({
+  inbound,
+  headers = {},
+  pathName = '',
+  protocol = '',
+  poolId = '',
+  apiKeyId = '',
+  seedPolicy = defaultSeedPolicy(),
+  autoCompactWindow = callerAutoCompactWindow(inbound),
+} = {}) {
+  const inboundIdentity = resolveSchedulerIdentity({
+    inbound,
+    headers,
+    poolId,
+    apiKeyId,
+  })
+  const legacyInboundIdentity = resolveInboundIdentity({
+    inbound,
+    headers,
+  })
+  const ctx = {
+    path: pathName,
+    protocol,
+    body: sanitizeInboundBody(inbound, seedPolicy),
+    headers: sanitizeOutboundHeaders(headers),
+    autoCompactWindow,
+    inboundIdentity,
+  }
+  return { ctx, inboundIdentity, legacyInboundIdentity }
 }
 
 export function createHandleProtocol(deps) {
@@ -1066,13 +1107,18 @@ export function createHandleProtocol(deps) {
 
     const callerEnvironment = protocol === 'anthropic.messages' ? callerCwdDeclaration(inbound?.system) : null
     const autoCompactWindow = callerAutoCompactWindow(inbound)
-    let ctx = {
-      path: pathName,
+    const { ctx: preparedCtx, legacyInboundIdentity } = prepareInboundProtocolContext({
+      inbound,
+      headers: req.headers,
+      pathName,
       protocol,
-      body: sanitizeInboundBody(inbound, defaultSeedPolicy()),
-      headers: { ...req.headers },
+      poolId: req.apiKeyRecord?.default_pool_id || req.apiKeyRecord?.vm_pool_id || '',
+      apiKeyId: req.apiKeyRecord?.id ?? '',
+      seedPolicy: defaultSeedPolicy(),
       autoCompactWindow,
-    }
+    })
+    const outboundReqHeaders = preparedCtx.headers
+    let ctx = preparedCtx
     ctx = applyIntercept(cfg.intercept.rules, 'before_convert', ctx)
     const bodyCheck = protocol === 'google.gemini' ? { ok: true } : validateRequestBody(protocol, ctx.body)
     if (!bodyCheck.ok) {
@@ -1546,7 +1592,7 @@ export function createHandleProtocol(deps) {
           targetFamily: pfTarget,
           handoffMode: 'canonical',
           reqPath: pathName,
-          headers: req.headers,
+          headers: outboundReqHeaders,
           body: ctx.body,
           routing: getRouting() || {},
           endpointBodyPolicy: apiPicked?.endpoint?.body_policy || '',
@@ -1576,7 +1622,7 @@ export function createHandleProtocol(deps) {
         targetFamily: pfTarget,
         handoffMode: 'canonical',
         reqPath: pathName,
-        headers: req.headers,
+        headers: outboundReqHeaders,
         body: ctx.body,
         routing: getRouting() || {},
         endpointBodyPolicy: apiPicked?.endpoint?.body_policy || '',
@@ -1764,8 +1810,8 @@ export function createHandleProtocol(deps) {
       routing: getRouting(),
     }
     // Pool identity comes from inbound metadata.user_id (or an explicit device_id),
-    // read before outbound cleaning. API key never scopes it.
-    const inboundIdentity = resolveInboundIdentity({ inbound, body: ctx.body, headers: req.headers })
+    // extracted before sanitizeInboundBody ran. API key never scopes it.
+    const inboundIdentity = legacyInboundIdentity
     const stickyDeviceId = inboundIdentity.deviceId
     if (childDeclaredWithoutParent(inbound, req.headers)) {
       stats.errors++
@@ -2267,6 +2313,7 @@ export function createHandleProtocol(deps) {
         // Set only when a group member actually supplied the sticky key.
         batchMember: !isProbe && batchApplied,
         stickyDeviceId,
+        inboundIdentity: ctx.inboundIdentity,
         deviceKey,
         skipSessionSeat: seatless,
         familyKey: summarySession ? null : familyKey,
@@ -2483,7 +2530,7 @@ export function createHandleProtocol(deps) {
               }
               const nativeCragV3 = caps?.includes('generation_controls_v3') && caps?.includes('linux_tui_native_queue')
               if (identity && !nativeCragV3) {
-                hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
+                hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, outboundReqHeaders, {
                   officialClient: officialTraffic,
                   sessionId: attemptSessionId,
                   mode: sessionMode,
@@ -2588,7 +2635,7 @@ export function createHandleProtocol(deps) {
               hopBody = materialized
             }
             if (identity) {
-              hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
+              hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, outboundReqHeaders, {
                 officialClient: officialTraffic,
                 sessionId: attemptSessionId,
                 mode: sessionMode,
@@ -2714,7 +2761,7 @@ export function createHandleProtocol(deps) {
             cacheBreakpoints,
             preserveThinkingBlocks,
             preserveCallerEnvironment,
-            reqHeaders: req.headers,
+            reqHeaders: outboundReqHeaders,
             homeDir: selected.exec?.homeDir || '',
             credentialMode: credMode,
             authScheme: isApiKeyMode(credMode) ? 'apikey' : 'oauth',
@@ -2751,7 +2798,7 @@ export function createHandleProtocol(deps) {
             return streamAndAssembleClaudeMessage({
               candidate,
               body,
-              reqHeaders: req.headers,
+              reqHeaders: outboundReqHeaders,
               timeoutMs: cfg.limits.upstream_timeout_ms,
               idleTimeoutMs: streamIdleTimeoutMs,
               signal,
@@ -2815,7 +2862,7 @@ export function createHandleProtocol(deps) {
               dropSampling: attemptMeta?.dropSampling === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               body,
-              reqHeaders: req.headers,
+              reqHeaders: outboundReqHeaders,
               timeoutMs: cfg.limits.upstream_timeout_ms,
               idleTimeoutMs: streamIdleTimeoutMs,
               identity: loadVmIdentity(candidate.exec),

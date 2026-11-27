@@ -47,6 +47,8 @@ function createRuntime({ redisConfig, cacheConfig, pgPool = null } = {}) {
       if (set.has('api_keys')) {
         apiKeys.invalidateAll().catch(() => {})
         billing.invalidateAll().catch(() => {})
+      } else if (set.has('api_key_pool_bindings')) {
+        apiKeys.invalidateAll().catch(() => {})
       }
       if (set.has('users') || set.has('redeem_codes')) {
         billing.invalidateAll().catch(() => {})
@@ -59,6 +61,9 @@ function createRuntime({ redisConfig, cacheConfig, pgPool = null } = {}) {
         set.has('vms') ||
         set.has('vm_pools') ||
         set.has('vm_pool_members') ||
+        set.has('scheduler_pools') ||
+        set.has('scheduler_pool_members') ||
+        set.has('api_key_pool_bindings') ||
         set.has('proxies')
       ) {
         scheduler.bumpRevision({ eventType: `tables:${[...set].join(',')}` })

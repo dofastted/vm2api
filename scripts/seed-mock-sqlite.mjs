@@ -988,6 +988,98 @@ export function seedMockSqlite({ outPath, usageCount = 400, hashSecret = 'mock-v
     insGemOwner.run('gemini-alice-1', 'u_alice', nowIso)
     insGemOwner.run('gemini-alice-2', 'u_alice', nowIso)
 
+    // 30b. Unified scheduler center tables (071_scheduler_center)
+    const insSchedPool = db.prepare(`
+      INSERT INTO scheduler_pools (
+        id, slug, name, description, enabled, provider_scope, plan_tags_json,
+        pool_role, system_prompt_mode, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    insSchedPool.run(
+      'pool_alpha',
+      'alpha-pool',
+      'AlphaPool',
+      'Primary Anthropic pool',
+      1,
+      'anthropic',
+      '["max_20x"]',
+      'primary',
+      'official',
+      nowIso,
+      nowIso,
+    )
+    insSchedPool.run(
+      'pool_google',
+      'google-pool',
+      'GooglePool',
+      'Google Gemini pool',
+      1,
+      'google',
+      '["gemini_ultra"]',
+      'standard',
+      'passthrough',
+      nowIso,
+      nowIso,
+    )
+
+    const insSchedMember = db.prepare(`
+      INSERT INTO scheduler_pool_members (
+        pool_id, node_type, node_id, enabled, member_role, weight_tier_override, sub_weight_override,
+        member_order, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    insSchedMember.run('pool_alpha', 'claude_vm', 'vm-01', 1, 'active', 8, 20, 0, nowIso, nowIso)
+    insSchedMember.run('pool_google', 'gemini_env', 'gemini-alice-1', 1, 'active', 7, 10, 0, nowIso, nowIso)
+
+    const insKeyPoolBinding = db.prepare(
+      'INSERT INTO api_key_pool_bindings (api_key_id, pool_id, is_default, created_at) VALUES (?, ?, ?, ?)',
+    )
+    insKeyPoolBinding.run('key_alice_1', 'pool_alpha', 1, nowIso)
+
+    const insSchedSticky = db.prepare(`
+      INSERT INTO scheduler_sticky_bindings (
+        scope_kind, pool_id, model_family, identity_id, node_type, node_id, machine_id,
+        stood_in, bound_at_ms, last_seen_ms, expires_at_ms, hits, generation
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    insSchedSticky.run(
+      'machine',
+      'pool_alpha',
+      'claude',
+      'mach_mock_1',
+      'claude_vm',
+      'vm-01',
+      'mach_mock_1',
+      0,
+      nowMs - 60_000,
+      nowMs,
+      nowMs + 604_800_000,
+      5,
+      1,
+    )
+    insSchedSticky.run(
+      'session',
+      'pool_alpha',
+      'claude',
+      '11111111-1111-4111-8111-111111111111',
+      'claude_vm',
+      'vm-01',
+      'mach_mock_1',
+      0,
+      nowMs - 30_000,
+      nowMs,
+      nowMs + 86_400_000,
+      2,
+      1,
+    )
+
+    const insSchedPenalty = db.prepare(`
+      INSERT INTO scheduler_node_penalties (
+        node_type, node_id, model_scope, reason, cooldown_until_ms, ladder_step, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `)
+    insSchedPenalty.run('claude_vm', 'vm-02', 'claude-sonnet-4-5', 'rate_limit_429', nowMs + 120_000, 1, nowIso)
+
     // 31. usage_logs, 32. request_attempts, 33. request_log_debug
     const insUsage = db.prepare(`
       INSERT INTO usage_logs (

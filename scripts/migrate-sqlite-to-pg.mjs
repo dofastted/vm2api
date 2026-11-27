@@ -3,8 +3,8 @@
  * Streaming, idempotent SQLite -> PostgreSQL migrator for vm2api.
  *
  * Features:
- * - Applies PostgreSQL schema migrations (001..005) automatically under advisory lock.
- * - Streams all 32 active tables + thinking_signature_owners in FK-safe order using
+ * - Applies PostgreSQL schema migrations (001..008) automatically under advisory lock.
+ * - Streams all active tables + thinking_signature_owners in FK-safe order using
  *   rowid keyset pagination (constant memory even on multi-GB kin.db).
  * - Sanitizes UTF-8 NUL bytes (\u0000) which PostgreSQL TEXT/JSONB forbids.
  * - Handles self-referential FK (`cluster_nodes.jump_node_id`) in two passes.
@@ -58,6 +58,11 @@ export const MIGRATION_TABLES = [
   'sticky_sessions',
   'vm_pools',
   'vm_pool_members',
+  'scheduler_pools',
+  'scheduler_pool_members',
+  'api_key_pool_bindings',
+  'scheduler_sticky_bindings',
+  'scheduler_node_penalties',
   'vms',
   'thinking_signature_owners',
   'usage_logs',
@@ -494,6 +499,17 @@ async function verifyMigration(sqlite, pool, tables, { ignoreSyntheticOriginSett
     aggregates.vms = { ok, sqlite: sIds.length, postgres: pIds.length }
   }
 
+  if (tables.includes('scheduler_pools')) {
+    const sIds = sqlite
+      .prepare('SELECT id FROM scheduler_pools ORDER BY id')
+      .all()
+      .map((r) => r.id)
+    const pIds = (await pool.query('SELECT id FROM scheduler_pools ORDER BY id')).rows.map((r) => r.id)
+    const ok = sIds.length === pIds.length && sIds.every((id, idx) => id === pIds[idx])
+    if (!ok) mismatches += 1
+    aggregates.scheduler_pools = { ok, sqlite: sIds.length, postgres: pIds.length }
+  }
+
   // Verify BIGSERIAL sequences sit at or above MAX(id) so subsequent inserts never collide.
   const sequences = {}
   for (const table of SERIAL_ID_TABLES) {
@@ -628,6 +644,8 @@ export async function preflightSqliteToPostgres({
       ['cluster_node_direct_links', 'node_id', 'cluster_nodes', 'id'],
       ['risk_device_aliases', 'device_key', 'refusal_device_blocks', 'device_id'],
       ['vm_pool_members', 'pool_id', 'vm_pools', 'id'],
+      ['scheduler_pool_members', 'pool_id', 'scheduler_pools', 'id'],
+      ['api_key_pool_bindings', 'pool_id', 'scheduler_pools', 'id'],
     ]
     hazards.fkOrphans = {}
     for (const [child, childCol, parent, parentCol] of fkChecks) {
