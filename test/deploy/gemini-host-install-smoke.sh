@@ -15,7 +15,7 @@ stop() {
 }
 trap 'stop; rm -rf -- "$fixture"' EXIT
 mkdir -m 755 -p "$fixture"/{scripts,src/lib/gemini,source,payload}
-install -m 644 "$root"/scripts/{gemini-host.py,gemini-host-egress.sh,gemini_host_account.py,gemini_host_inference.py,gemini_host_native.py,install-gemini-payload.mjs} "$fixture/scripts/"
+install -m 644 "$root"/scripts/{gemini-host.py,gemini-host-egress.sh,gemini_agy_patch.py,gemini_host_account.py,gemini_host_apparmor.py,gemini_host_inference.py,gemini_host_native.py,install-gemini-payload.mjs} "$fixture/scripts/"
 install -m 644 "$root/src/lib/gemini/payload.mjs" "$fixture/src/lib/gemini/"
 install -m 644 "$public_key" "$fixture/public-key"
 for member in manifest.json manifest.sig agy craggemini libagy_bridge.so; do

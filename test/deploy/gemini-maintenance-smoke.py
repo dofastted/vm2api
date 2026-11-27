@@ -106,7 +106,10 @@ def make_bundle(root, source, broker):
     manifest = json.loads((source / "manifest.json").read_bytes())
     version, cli = manifest["version"], manifest["cli_version"]
     tag = "offline-fixture-gemini-" + version
-    for relative in (*broker.RUNTIME_FILES[:-1], "deploy/gemini-host.service.example"):
+    for relative in (
+        *(r for r in broker.RUNTIME_FILES if r != "bin/kin-egress"),
+        "deploy/gemini-host.service.example",
+    ):
         target = bundle / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(REPO / relative, target)
