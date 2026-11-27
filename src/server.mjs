@@ -818,11 +818,12 @@ usageProbeMonitor = createUsageProbeMonitor({
   config: routingConfig.usage_probe,
   listTargets: () => listVms(cfg.paths.project),
   // Codex quota lives on the slot file (vm.codex.extra), not in the accounts
-  // repo; synthesize the unified view the monitor reasons over so elapsed
-  // codex windows get the same one-shot /usage hop claude slots get.
+  // repo, and summarization drops the extra while keeping the built view — so
+  // synthesize from vm.codex_usage. Elapsed codex windows then get the same
+  // one-shot /usage hop claude slots get.
   accountForVm: (vm) =>
     isCodexVm(vm)
-      ? { vm_id: vm.id, unified: codexUnifiedForUsageProbe(vm?.codex?.extra || {}) }
+      ? { vm_id: vm.id, unified: codexUnifiedForUsageProbe(vm?.codex_usage || {}) }
       : accountForUsageProbe(vm),
   isActive: usageProbeActive,
   reconcile: (vm, account) => {

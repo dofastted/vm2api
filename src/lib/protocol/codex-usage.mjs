@@ -207,25 +207,35 @@ export function extraToCodexSnapshot(extra = {}) {
 
 /**
  * Synthesize the claude-shaped `unified` view the usage probe monitor reasons
- * over, from a codex slot's extra. Codex quota lives on the slot file, not in
- * the accounts repo, so without this the monitor is blind to codex windows:
+ * over, from a codex slot's quota data. Codex quota lives on the slot file, not
+ * in the accounts repo, so without this the monitor is blind to codex windows:
  * an elapsed 5h/7d reset never schedules the one /usage hop that would
  * refresh the stale snapshot (claude slots get this via `account.unified`).
  *
- * Only the fields the monitor reads: per-window `reset` for liveness, and the
- * newest sample time (`codex_usage_updated_at` is stamped by both sampling
- * paths — live `x-codex-*` headers and the usage endpoint).
+ * Accepts either a built usage view (`vm.codex_usage`, what a summarized slot
+ * carries — summarization drops the slot-file extra) or the raw extra (what a
+ * slot-file vm carries). Only the fields the monitor reads: per-window
+ * `reset` for liveness, and the newest sample time (`codex_usage_updated_at`
+ * is stamped by both sampling paths — live `x-codex-*` headers and the usage
+ * endpoint).
  */
-export function codexUnifiedForUsageProbe(extra = {}) {
-  if (!extra || typeof extra !== 'object' || Object.keys(extra).length === 0) return {}
-  const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
-  const sampled = extra.codex_usage_updated_at || extra.updated_at || null
-  const window = (reset) => (reset ? { reset } : null)
+export function codexUnifiedForUsageProbe(viewOrExtra = {}) {
+  const input = viewOrExtra && typeof viewOrExtra === 'object' ? viewOrExtra : {}
+  const view = Array.isArray(input.windows)
+    ? input
+    : buildCodexUsageView(extraToCodexSnapshot(input))
+  const rows = Array.isArray(view.windows) ? view.windows : []
+  const sampled = view.snapshot?.updated_at || null
+  const byId = new Map(rows.map((w) => [String(w?.id || ''), w]))
+  const window = (id) => {
+    const reset = byId.get(id)?.reset_at
+    return reset ? { reset } : null
+  }
   return {
     headers: {
       sampled_at: sampled,
-      '5h': window(limits.reset_5h_at),
-      '7d': window(limits.reset_7d_at),
+      '5h': window('5h'),
+      '7d': window('7d'),
     },
     last_probe: sampled ? { at: sampled } : null,
   }
