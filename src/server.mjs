@@ -96,7 +96,7 @@ import { VmTestScheduleRunner } from './lib/admin/vm-test-schedule.mjs'
 import {
   preheatNextWindowEnd,
   preheatRenewEpisodeKey,
-  preheatWindowStateForVm,
+  preheatWindowStateLikeServer,
 } from './lib/admin/vm-test-preheat-window.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
@@ -784,11 +784,9 @@ const vmTestSchedule = new VmTestScheduleRunner({
     try {
       const vm = getVm(cfg.paths.project, vmId)
       if (!vm) return { hasCredential: false, schedulable: false, windowLive: false }
-      const codexQuota = routingConfig.codex?.quota
-      return preheatWindowStateForVm(vm, {
+      return preheatWindowStateLikeServer(vm, () => routingConfig, {
         projectRoot: cfg.paths.project,
         accountQuota,
-        routingConfig: { codex: { quota: codexQuota } },
       })
     } catch {
       return null

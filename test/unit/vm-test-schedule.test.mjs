@@ -596,6 +596,53 @@ test('#1874 auto-renew with a throwing probe does not send', async () => {
   schedule.stop()
 })
 
+test('#1874 successful renew clears gate-skip memory so the same reason can be recorded again', async () => {
+  let calls = 0
+  let gateLive = true
+  const NOW = Date.parse('2026-10-16T00:00:00.000Z')
+  let tick = 0
+  const windowEnd = NOW - 60_000
+  let episodeKey = `vm-01\x1evm-01\x1e${Math.floor(windowEnd / 1000)}\x1e-old`
+  const { settings, schedule } = runner({
+    runTest: async () => {
+      calls += 1
+      return { ok: true, duration_ms: 3 }
+    },
+    nextWindowEnd: () => windowEnd,
+    renewEpisodeKey: () => ({ key: episodeKey }),
+    windowState: () =>
+      gateLive
+        ? { hasCredential: true, schedulable: true, windowLive: true, reason: 'quota_7d_local' }
+        : { hasCredential: true, schedulable: true, windowLive: false },
+    now: () => NOW + tick * 1000,
+  })
+  schedule.save('vm-01', { ...preheatConfig, enabled: true, auto_renew: true })
+  const scheduleKey = `${VM_TEST_SCHEDULE_PREFIX}vm-01`
+  schedule.start()
+
+  await schedule._sweepElapsedWindows()
+  const firstAt = settings.get(scheduleKey).last_run_at
+  assert.equal(settings.get(scheduleKey).last_skipped, 'quota_7d_local')
+  await schedule._sweepElapsedWindows()
+  assert.equal(settings.get(scheduleKey).last_run_at, firstAt)
+
+  gateLive = false
+  tick += 1
+  await schedule._sweepElapsedWindows()
+  assert.equal(calls, 1)
+  assert.equal(settings.get(scheduleKey).last_ok, true)
+  assert.equal(settings.get(scheduleKey).last_skipped, null)
+
+  episodeKey = `vm-01\x1evm-01\x1e${Math.floor(windowEnd / 1000)}\x1e-new`
+  gateLive = true
+  tick += 1
+  await schedule._sweepElapsedWindows()
+  const secondAt = settings.get(scheduleKey).last_run_at
+  assert.equal(settings.get(scheduleKey).last_skipped, 'quota_7d_local')
+  assert.notEqual(secondAt, firstAt)
+  schedule.stop()
+})
+
 test('#1874 repeated minute sweeps send only one auto-renew request', async () => {
   let calls = 0
   const NOW = Date.parse('2026-10-16T00:00:00.000Z')

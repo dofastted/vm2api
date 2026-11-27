@@ -4,10 +4,8 @@ import { isCodexSlotParked, codexQuotaWindowReason } from '../pool/codex-slot-po
 import {
   OPENAI_QUOTA_DEFAULTS,
   evaluateOpenAIQuotaGate,
-  mergeOpenAIQuotaPolicy,
   normalizeOpenAIQuotaPolicy,
 } from '../pool/openai-quota-policy.mjs'
-import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
 import { normalizeCodexRouting } from '../protocol/codex-route.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
@@ -95,15 +93,9 @@ export function resolvePreheatFiveHourWindow(vm, { projectRoot, accountQuota, no
   return unified5hFromAccount(acc)
 }
 
-/** Same quota resolution as summarizeVm / syncCodexQuotaSchedule: global codex.quota + optional vm.policy.quota limits. */
-export function preheatOpenAIQuotaPolicy(vm, routingConfig = null) {
-  const global = normalizeOpenAIQuotaPolicy(normalizeCodexRouting(routingConfig?.codex)?.quota || {})
-  const override = vmQuotaOverrideOf(vm)
-  if (!override) return global
-  const patch = {}
-  if (override.limit_5h != null) patch.limit_5h = override.limit_5h
-  if (override.limit_7d != null) patch.limit_7d = override.limit_7d
-  return Object.keys(patch).length ? mergeOpenAIQuotaPolicy(global, patch) : global
+/** Codex preheat gates use global routing only (Codex slots do not honor vm.policy.quota). */
+export function preheatOpenAIQuotaPolicy(_vm, routingConfig = null) {
+  return normalizeOpenAIQuotaPolicy(normalizeCodexRouting(routingConfig?.codex)?.quota || {})
 }
 
 export function preheatWindowStateForVm(
@@ -119,7 +111,7 @@ export function preheatWindowStateForVm(
 }
 
 /**
- * Mirrors `server.mjs` vmTestSchedule `windowState`: read `routingConfig.codex?.quota`
+ * Production vmTestSchedule `windowState` entry: read `routingConfig.codex?.quota`
  * when the callback runs (routing reload replaces the whole object).
  */
 export function preheatWindowStateLikeServer(

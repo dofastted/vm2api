@@ -363,12 +363,21 @@ test('preheatWindowStateForVm skips when 5h reset elapsed but 7d still exceeds c
   assert.equal(state.reason, 'quota_7d_local')
 })
 
-test('preheatOpenAIQuotaPolicy merges per-vm policy.quota limit overrides', () => {
+test('preheatOpenAIQuotaPolicy ignores vm.policy.quota on Codex (global routing only)', () => {
   const vm = codexExtraVm()
-  vm.policy = { quota: { limit_7d: 0.88 } }
+  vm.policy = { quota: { limit_7d: 0.5 } }
   const global = routingWithCodexQuota({ limit_7d: 0.9 })
-  const merged = preheatOpenAIQuotaPolicy(vm, global)
-  assert.equal(merged.limit_7d, 0.88)
+  const policy = preheatOpenAIQuotaPolicy(vm, global)
+  assert.equal(policy.limit_7d, 0.9)
+  const vm2 = codexExtraVm({
+    codex_primary_used_percent: 60,
+    codex_primary_reset_at: new Date(FIXED_NOW + 5 * 24 * 3600_000).toISOString(),
+    codex_secondary_used_percent: 100,
+    codex_secondary_reset_at: new Date(FIXED_NOW - 1_000).toISOString(),
+  })
+  vm2.policy = { quota: { limit_7d: 0.5 } }
+  const blocked = preheatWindowStateForVm(vm2, { projectRoot: null, routingConfig: global, now: FIXED_NOW })
+  assert.equal(blocked.windowLive, false, 'hand-edited per-vm limits must not tighten preheat vs scheduler')
 })
 
 test('auto-renew sweep survives stop/reload without resending the same episode', async () => {

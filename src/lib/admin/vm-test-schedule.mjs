@@ -873,6 +873,7 @@ export class VmTestScheduleRunner {
       Number.isSafeInteger(duration) && duration >= 0 ? duration : Math.max(0, this.now() - startedAt)
     const skipped = result?.skipped || null
     const lastOk = skipped ? null : result?.ok === true
+    if (lastOk === true) this.renewGateSkipRecorded.delete(vmId)
     this._settings().set(keyFor(vmId), {
       ...current,
       last_run_at: new Date(startedAt).toISOString(),
