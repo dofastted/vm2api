@@ -93,7 +93,11 @@ import { normalizeNotifyConfig, createNotifyMonitor, dispatchNotify } from './li
 import { snapshotVmConnectivity } from './lib/admin/vm-connectivity.mjs'
 import { runVmTestChat } from './lib/admin/vm-test-chat.mjs'
 import { VmTestScheduleRunner } from './lib/admin/vm-test-schedule.mjs'
-import { preheatNextWindowEnd, preheatWindowState } from './lib/admin/vm-test-preheat-window.mjs'
+import {
+  preheatNextWindowEnd,
+  preheatRenewEpisodeKey,
+  preheatWindowStateLikeServer,
+} from './lib/admin/vm-test-preheat-window.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
@@ -780,7 +784,10 @@ const vmTestSchedule = new VmTestScheduleRunner({
     try {
       const vm = getVm(cfg.paths.project, vmId)
       if (!vm) return { hasCredential: false, schedulable: false, windowLive: false }
-      return preheatWindowState(vm, { projectRoot: cfg.paths.project, accountQuota })
+      return preheatWindowStateLikeServer(vm, () => routingConfig, {
+        projectRoot: cfg.paths.project,
+        accountQuota,
+      })
     } catch {
       return null
     }
@@ -793,6 +800,18 @@ const vmTestSchedule = new VmTestScheduleRunner({
     } catch {
       return null
     }
+  },
+  renewEpisodeKey: (vmId) => {
+    try {
+      const vm = getVm(cfg.paths.project, vmId)
+      if (!vm) return null
+      return preheatRenewEpisodeKey(vm, { projectRoot: cfg.paths.project, accountQuota })
+    } catch {
+      return null
+    }
+  },
+  onRenewGateSkip: (event) => {
+    console.debug?.('[vm-test-renew-gate-skip]', JSON.stringify(event))
   },
 })
 credentialRefreshMonitor = createCredentialRefreshMonitor({

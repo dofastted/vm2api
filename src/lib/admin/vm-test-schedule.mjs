@@ -5,9 +5,15 @@ import { isValidVmId } from '../vm/vm-file.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { listTestableModels } from './vm-test-chat.mjs'
+import { preheatRenewEpisodeKey } from './vm-test-preheat-window.mjs'
 
 export const VM_TEST_SCHEDULE_PREFIX = 'vm_test_schedule:'
 export const VM_TEST_SCHEDULE_DEFAULT_KEY = 'vm_test_schedule_default'
+export const VM_TEST_RENEW_CLAIM_PREFIX = 'vm_test_renew_claim:'
+
+export function renewClaimKey(vmId) {
+  return `${VM_TEST_RENEW_CLAIM_PREFIX}${vmId}`
+}
 
 const MAX_CRON_LENGTH = 120
 const MAX_MODEL_LENGTH = 200
@@ -397,6 +403,10 @@ export class VmTestScheduleRunner {
      */
     windowState = null,
     nextWindowEnd = null,
+    /** Optional `(vmId) => preheatRenewEpisodeKey(...)`; defaults to vm file + projectRoot. */
+    renewEpisodeKey = null,
+    /** Optional debug hook when an auto-renew gate skip is throttled (at most once per sweep interval). */
+    onRenewGateSkip = null,
   } = {}) {
     this.projectRoot = projectRoot
     this.settingsFactory = typeof settings === 'function' ? settings : () => settings
@@ -405,12 +415,16 @@ export class VmTestScheduleRunner {
     this.now = now
     this.windowState = typeof windowState === 'function' ? windowState : null
     this.nextWindowEnd = typeof nextWindowEnd === 'function' ? nextWindowEnd : null
+    this.renewEpisodeKey = typeof renewEpisodeKey === 'function' ? renewEpisodeKey : null
+    this.onRenewGateSkip = typeof onRenewGateSkip === 'function' ? onRenewGateSkip : null
+    /** vmId -> { reason, at } — throttle gate-skip diagnostics without touching SettingsRepo. */
+    this.renewGateSkipNotified = new Map()
+    /** vmId -> last skip reason persisted via _recordRun for auto-renew gate blocks. */
+    this.renewGateSkipRecorded = new Map()
     this.jobs = new Map()
     this.running = new Set()
     this.started = false
     this.renewSweep = null
-    /** vmId -> ms, when the auto-renew sweep last fired this slot. */
-    this.renewFiredAt = new Map()
   }
 
   _settings() {
@@ -657,6 +671,7 @@ export class VmTestScheduleRunner {
     this.jobs.get(vmId)?.stop()
     this.jobs.delete(vmId)
     this._settings().remove?.(keyFor(vmId))
+    this._settings().remove?.(renewClaimKey(vmId))
     return null
   }
 
@@ -692,7 +707,58 @@ export class VmTestScheduleRunner {
   _stopRenewSweep() {
     this.renewSweep?.stop?.()
     this.renewSweep = null
-    this.renewFiredAt.clear()
+  }
+
+  _renewEpisodeKey(vmId) {
+    const vm = this._vm(vmId)
+    if (!vm) return null
+    if (this.renewEpisodeKey) return this.renewEpisodeKey(vmId)
+    return preheatRenewEpisodeKey(vm, { projectRoot: this.projectRoot, now: this.now() })
+  }
+
+  _isRenewEpisodeClaimed(vmId, episodeKey) {
+    const raw = this._settings().get(renewClaimKey(vmId))
+    return raw?.episode_key === episodeKey
+  }
+
+  /** Returns false when this episode was already claimed (another scan won). */
+  _tryClaimRenew(vmId, episodeKey) {
+    if (this._isRenewEpisodeClaimed(vmId, episodeKey)) return false
+    this._settings().set(renewClaimKey(vmId), {
+      episode_key: episodeKey,
+      claimed_at: new Date(this.now()).toISOString(),
+    })
+    return true
+  }
+
+  _noteRenewGateSkip(vmId, reason) {
+    const now = this.now()
+    const prev = this.renewGateSkipNotified.get(vmId)
+    if (prev?.reason === reason && Number.isFinite(prev.at) && now - prev.at < PREHEAT_RENEW_SWEEP_SEC * 1000) return
+    this.renewGateSkipNotified.set(vmId, { reason, at: now })
+    try {
+      this.onRenewGateSkip?.({ vmId, reason, at: now })
+    } catch {}
+  }
+
+  /** Persist `last_skipped` at most once per unchanged auto-renew gate reason. */
+  _maybeRecordRenewGateSkip(vmId, reason) {
+    const normalized = String(reason || 'gate_blocked')
+    if (this.renewGateSkipRecorded.get(vmId) === normalized) {
+      this._noteRenewGateSkip(vmId, normalized)
+      return
+    }
+    const raw = this._settings().get(keyFor(vmId))
+    if (raw?.last_skipped === normalized) {
+      this.renewGateSkipRecorded.set(vmId, normalized)
+      this._noteRenewGateSkip(vmId, normalized)
+      return
+    }
+    const schedule = this._stored(vmId)
+    if (!schedule?.enabled) return
+    this.renewGateSkipRecorded.set(vmId, normalized)
+    this._recordRun(vmId, schedule, this.now(), { ok: null, skipped: normalized })
+    this._noteRenewGateSkip(vmId, normalized)
   }
 
   async _sweepElapsedWindows() {
@@ -704,15 +770,19 @@ export class VmTestScheduleRunner {
       const vmId = key.slice(VM_TEST_SCHEDULE_PREFIX.length)
       const raw = all[key]
       if (!raw || raw.enabled !== true || raw.auto_renew !== true) continue
-      const endMs = safeCall(() => this.nextWindowEnd(vmId))
-      if (!Number.isFinite(endMs) || endMs <= 0) continue
-      // Fire once per elapsed window: arm again only after a fresh end is seen.
-      const firedAt = this.renewFiredAt.get(vmId) || 0
-      if (firedAt >= endMs) continue
-      if (endMs > now) continue
       if (!this._vm(vmId)) continue
-      this.renewFiredAt.set(vmId, endMs)
-      await this._run(vmId)
+      const episode = this._renewEpisodeKey(vmId)
+      if (!episode?.key) continue
+      if (this._isRenewEpisodeClaimed(vmId, episode.key)) continue
+      const endMs = safeCall(() => this.nextWindowEnd(vmId))
+      if (!Number.isFinite(endMs) || endMs <= 0 || endMs > now) continue
+      const gate = this._preheatGate(vmId, { autoRenew: true })
+      if (!gate.fire) {
+        this._maybeRecordRenewGateSkip(vmId, gate.reason || 'gate_blocked')
+        continue
+      }
+      if (!this._tryClaimRenew(vmId, episode.key)) continue
+      await this._run(vmId, { autoRenew: true, preheatGateChecked: true })
     }
   }
 
@@ -743,7 +813,7 @@ export class VmTestScheduleRunner {
     this.jobs.set(vmId, job)
   }
 
-  async _run(vmId) {
+  async _run(vmId, { autoRenew = false, preheatGateChecked = false } = {}) {
     if (!this.started || this.running.has(vmId)) return
     if (!this._vm(vmId)) {
       this.remove(vmId)
@@ -754,8 +824,8 @@ export class VmTestScheduleRunner {
     const startedAt = this.now()
     // #979: a preheat never fires into a live window, and never retries a
     // slot the pool already parked (no ticket, dead grant, 不可调度).
-    if (schedule.mode === 'preheat') {
-      const gate = this._preheatGate(vmId)
+    if (schedule.mode === 'preheat' && !preheatGateChecked) {
+      const gate = this._preheatGate(vmId, { autoRenew })
       if (!gate.fire) {
         this._recordRun(vmId, schedule, startedAt, { ok: null, skipped: gate.reason })
         return
@@ -782,11 +852,17 @@ export class VmTestScheduleRunner {
   }
 
   /** Why a preheat did not fire: { fire: false, reason } or { fire: true }. */
-  _preheatGate(vmId) {
+  _preheatGate(vmId, { autoRenew = false } = {}) {
     const probe = this.windowState ? safeCall(() => this.windowState(vmId)) : null
+    if (autoRenew) {
+      if (!probe || typeof probe !== 'object') return { fire: false, reason: 'probe_unavailable' }
+    }
     if (probe && probe.hasCredential === false) return { fire: false, reason: 'no_credential' }
     if (probe && probe.schedulable === false) return { fire: false, reason: 'slot_not_schedulable' }
-    if (probe && probe.windowLive === true) return { fire: false, reason: 'window_live' }
+    if (probe && probe.windowLive === true) {
+      const reason = probe.reason && String(probe.reason).trim() ? String(probe.reason) : 'window_live'
+      return { fire: false, reason }
+    }
     return { fire: true }
   }
 
@@ -799,6 +875,7 @@ export class VmTestScheduleRunner {
       Number.isSafeInteger(duration) && duration >= 0 ? duration : Math.max(0, this.now() - startedAt)
     const skipped = result?.skipped || null
     const lastOk = skipped ? null : result?.ok === true
+    if (lastOk === true) this.renewGateSkipRecorded.delete(vmId)
     this._settings().set(keyFor(vmId), {
       ...current,
       last_run_at: new Date(startedAt).toISOString(),

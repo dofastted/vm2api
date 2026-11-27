@@ -10,6 +10,7 @@ import {
   normalizeScheduleStructure,
   normalizeVmTestSchedule,
   VM_TEST_SCHEDULE_PREFIX,
+  VM_TEST_RENEW_CLAIM_PREFIX,
   VmTestScheduleRunner,
 } from '../../src/lib/admin/vm-test-schedule.mjs'
 
@@ -52,6 +53,7 @@ function runner({
   runTest = async () => ({ ok: true }),
   windowState = null,
   nextWindowEnd = null,
+  renewEpisodeKey = null,
   now = () => Date.parse('2026-10-16T00:00:00.000Z'),
 } = {}) {
   return {
@@ -63,6 +65,7 @@ function runner({
       runTest,
       windowState,
       nextWindowEnd,
+      renewEpisodeKey,
       now,
     }),
   }
@@ -399,6 +402,8 @@ test('auto-renew fires once per elapsed window and re-arms on the next window', 
   const { settings, schedule } = runner({
     runTest: async () => (calls++, { ok: true }),
     nextWindowEnd: () => windowEnd,
+    renewEpisodeKey: () => ({ key: `vm-01\x1evm-01\x1e${Math.floor(windowEnd / 1000)}\x1e` }),
+    windowState: () => ({ hasCredential: true, schedulable: true, windowLive: false }),
     now: () => NOW,
   })
   schedule.save('vm-01', { ...preheatConfig, enabled: true, auto_renew: true })
@@ -449,5 +454,209 @@ test('a skipped preheat is visible on the public read, a fired one clears it', a
   assert.equal(pub.last_skipped, 'window_live')
   assert.equal(pub.last_ok, null)
   assert.match(pub.last_error, /skipped: window_live/)
+  schedule.stop()
+})
+
+test('#1874 auto-renew persists episode claims across stop/reload', async () => {
+  let calls = 0
+  const NOW = Date.parse('2026-10-16T00:00:00.000Z')
+  const windowEnd = NOW - 60_000
+  const episodeKey = `vm-01\x1evm-01\x1e${Math.floor(windowEnd / 1000)}\x1e`
+  const settings = new MemorySettings()
+  const shared = {
+    settings,
+    runTest: async () => (calls++, { ok: true }),
+    nextWindowEnd: () => windowEnd,
+    renewEpisodeKey: () => ({ key: episodeKey }),
+    windowState: () => ({ hasCredential: true, schedulable: true, windowLive: false }),
+    now: () => NOW,
+    list: () => [claudeVm],
+  }
+  const first = runner(shared).schedule
+  first.save('vm-01', { ...preheatConfig, enabled: true, auto_renew: true })
+  first.start()
+  await first._sweepElapsedWindows()
+  assert.equal(calls, 1)
+  assert.equal(settings.get(`${VM_TEST_RENEW_CLAIM_PREFIX}vm-01`).episode_key, episodeKey)
+  first.stop()
+
+  const second = runner(shared).schedule
+  second.start()
+  await second._sweepElapsedWindows()
+  assert.equal(calls, 1, 'reload must not resend the same episode')
+  second.stop()
+})
+
+test('#1874 auto-renew gate skip writes last_run only once while the skip reason stays the same', async () => {
+  const NOW = Date.parse('2026-10-16T00:00:00.000Z')
+  const windowEnd = NOW - 60_000
+  const episodeKey = `vm-01\x1evm-01\x1e${Math.floor(windowEnd / 1000)}\x1e`
+  const { settings, schedule } = runner({
+    runTest: async () => ({ ok: true }),
+    nextWindowEnd: () => windowEnd,
+    renewEpisodeKey: () => ({ key: episodeKey }),
+    windowState: () => ({ hasCredential: true, schedulable: true, windowLive: true, reason: 'quota_7d_local' }),
+    now: () => NOW,
+  })
+  schedule.save('vm-01', { ...preheatConfig, enabled: true, auto_renew: true })
+  const scheduleKey = `${VM_TEST_SCHEDULE_PREFIX}vm-01`
+  settings.set(scheduleKey, {
+    ...settings.get(scheduleKey),
+    last_run_at: '2026-09-01T00:00:00.000Z',
+    last_ok: true,
+    last_skipped: null,
+  })
+  schedule.start()
+  await schedule._sweepElapsedWindows()
+  let stored = settings.get(scheduleKey)
+  const recordedAt = stored.last_run_at
+  assert.equal(stored.last_skipped, 'quota_7d_local')
+  assert.equal(stored.last_ok, null)
+  assert.notEqual(recordedAt, '2026-09-01T00:00:00.000Z')
+  for (let i = 0; i < 4; i++) await schedule._sweepElapsedWindows()
+  stored = settings.get(scheduleKey)
+  assert.equal(stored.last_run_at, recordedAt)
+  assert.equal(stored.last_skipped, 'quota_7d_local')
+  schedule.stop()
+})
+
+test('#1874 auto-renew gate skip records again when the skip reason changes', async () => {
+  const NOW = Date.parse('2026-10-16T00:00:00.000Z')
+  const windowEnd = NOW - 60_000
+  const episodeKey = `vm-01\x1evm-01\x1e${Math.floor(windowEnd / 1000)}\x1e`
+  let gateReason = 'quota_5h_local'
+  let tick = 0
+  const { settings, schedule } = runner({
+    runTest: async () => ({ ok: true }),
+    nextWindowEnd: () => windowEnd,
+    renewEpisodeKey: () => ({ key: episodeKey }),
+    windowState: () => ({ hasCredential: true, schedulable: true, windowLive: true, reason: gateReason }),
+    now: () => NOW + tick * 1000,
+  })
+  schedule.save('vm-01', { ...preheatConfig, enabled: true, auto_renew: true })
+  const scheduleKey = `${VM_TEST_SCHEDULE_PREFIX}vm-01`
+  schedule.start()
+  await schedule._sweepElapsedWindows()
+  let stored = settings.get(scheduleKey)
+  const firstAt = stored.last_run_at
+  assert.equal(stored.last_skipped, 'quota_5h_local')
+  for (let i = 0; i < 3; i++) await schedule._sweepElapsedWindows()
+  assert.equal(settings.get(scheduleKey).last_run_at, firstAt)
+  gateReason = 'quota_7d_local'
+  tick += 1
+  await schedule._sweepElapsedWindows()
+  stored = settings.get(scheduleKey)
+  assert.equal(stored.last_skipped, 'quota_7d_local')
+  assert.notEqual(stored.last_run_at, firstAt)
+  schedule.stop()
+})
+
+test('#1874 a skipped auto-renew sweep does not consume the episode claim', async () => {
+  let calls = 0
+  const NOW = Date.parse('2026-10-16T00:00:00.000Z')
+  const windowEnd = NOW - 60_000
+  const episodeKey = `vm-01\x1evm-01\x1e${Math.floor(windowEnd / 1000)}\x1e`
+  let live = true
+  const { settings, schedule } = runner({
+    runTest: async () => (calls++, { ok: true }),
+    nextWindowEnd: () => windowEnd,
+    renewEpisodeKey: () => ({ key: episodeKey }),
+    windowState: () => ({ hasCredential: true, schedulable: true, windowLive: live }),
+    now: () => NOW,
+  })
+  schedule.save('vm-01', { ...preheatConfig, enabled: true, auto_renew: true })
+  schedule.start()
+
+  await schedule._sweepElapsedWindows()
+  assert.equal(calls, 0)
+  assert.equal(settings.get(`${VM_TEST_RENEW_CLAIM_PREFIX}vm-01`), null)
+
+  live = false
+  await schedule._sweepElapsedWindows()
+  assert.equal(calls, 1)
+  schedule.stop()
+})
+
+test('#1874 auto-renew with a throwing probe does not send', async () => {
+  let calls = 0
+  const NOW = Date.parse('2026-10-16T00:00:00.000Z')
+  const { schedule } = runner({
+    runTest: async () => (calls++, { ok: true }),
+    nextWindowEnd: () => NOW - 1,
+    renewEpisodeKey: () => ({ key: 'vm-01\x1evm-01\x1e1\x1e' }),
+    windowState: () => {
+      throw new Error('probe exploded')
+    },
+    now: () => NOW,
+  })
+  schedule.save('vm-01', { ...preheatConfig, enabled: true, auto_renew: true })
+  schedule.start()
+  await schedule._sweepElapsedWindows()
+  assert.equal(calls, 0)
+  schedule.stop()
+})
+
+test('#1874 successful renew clears gate-skip memory so the same reason can be recorded again', async () => {
+  let calls = 0
+  let gateLive = true
+  const NOW = Date.parse('2026-10-16T00:00:00.000Z')
+  let tick = 0
+  const windowEnd = NOW - 60_000
+  let episodeKey = `vm-01\x1evm-01\x1e${Math.floor(windowEnd / 1000)}\x1e-old`
+  const { settings, schedule } = runner({
+    runTest: async () => {
+      calls += 1
+      return { ok: true, duration_ms: 3 }
+    },
+    nextWindowEnd: () => windowEnd,
+    renewEpisodeKey: () => ({ key: episodeKey }),
+    windowState: () =>
+      gateLive
+        ? { hasCredential: true, schedulable: true, windowLive: true, reason: 'quota_7d_local' }
+        : { hasCredential: true, schedulable: true, windowLive: false },
+    now: () => NOW + tick * 1000,
+  })
+  schedule.save('vm-01', { ...preheatConfig, enabled: true, auto_renew: true })
+  const scheduleKey = `${VM_TEST_SCHEDULE_PREFIX}vm-01`
+  schedule.start()
+
+  await schedule._sweepElapsedWindows()
+  const firstAt = settings.get(scheduleKey).last_run_at
+  assert.equal(settings.get(scheduleKey).last_skipped, 'quota_7d_local')
+  await schedule._sweepElapsedWindows()
+  assert.equal(settings.get(scheduleKey).last_run_at, firstAt)
+
+  gateLive = false
+  tick += 1
+  await schedule._sweepElapsedWindows()
+  assert.equal(calls, 1)
+  assert.equal(settings.get(scheduleKey).last_ok, true)
+  assert.equal(settings.get(scheduleKey).last_skipped, null)
+
+  episodeKey = `vm-01\x1evm-01\x1e${Math.floor(windowEnd / 1000)}\x1e-new`
+  gateLive = true
+  tick += 1
+  await schedule._sweepElapsedWindows()
+  const secondAt = settings.get(scheduleKey).last_run_at
+  assert.equal(settings.get(scheduleKey).last_skipped, 'quota_7d_local')
+  assert.notEqual(secondAt, firstAt)
+  schedule.stop()
+})
+
+test('#1874 repeated minute sweeps send only one auto-renew request', async () => {
+  let calls = 0
+  const NOW = Date.parse('2026-10-16T00:00:00.000Z')
+  const windowEnd = NOW - 5_000
+  const { schedule } = runner({
+    runTest: async () => (calls++, { ok: true }),
+    nextWindowEnd: () => windowEnd,
+    renewEpisodeKey: () => ({ key: `vm-01\x1evm-01\x1e${Math.floor(windowEnd / 1000)}\x1e` }),
+    windowState: () => ({ hasCredential: true, schedulable: true, windowLive: false }),
+    now: () => NOW,
+  })
+  schedule.save('vm-01', { ...preheatConfig, enabled: true, auto_renew: true })
+  schedule.start()
+  for (let i = 0; i < 5; i++) await schedule._sweepElapsedWindows()
+  assert.equal(calls, 1)
   schedule.stop()
 })
