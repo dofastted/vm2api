@@ -113,8 +113,20 @@ API_KEY = re.compile(r"[A-Za-z0-9_-]{20,256}\Z")
 OAUTH_ACCESS_TOKEN = re.compile(r"[A-Za-z0-9._~+/-]{1,4096}={0,2}\Z")
 OAUTH_REFRESH_TOKEN = re.compile(r"1//[0-9A-Za-z._~+/-]{6,2048}\Z")
 OAUTH_AUTH_METHODS = frozenset(
-    {"consumer", "personal_consumer", "gcp", "business_licensed_enterprise"}
+    {
+        "consumer",
+        "personal_consumer",
+        "gcp",
+        "business_licensed_enterprise",
+        "antigravity_enterprise",
+        "enterprise",
+        "gemini_cli",
+        "geminicli",
+        "oauth",
+    }
 )
+OAUTH_CLIENT_KEY = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
+OAUTH_PROJECT_ID = re.compile(r"[A-Za-z0-9._:/-]{1,128}\Z")
 WIF_PROVIDER = re.compile(r"[A-Za-z0-9._:/-]{1,512}\Z")
 RELEASE_CODE = re.compile(r"CGG1-[A-Za-z0-9_-]{43}\Z")
 SHA256 = re.compile(r"[a-f0-9]{64}\Z")
@@ -764,13 +776,18 @@ AUTH_FAILURE_STAGES = frozenset(
 
 
 class Failure(Exception):
-    def __init__(self, status, code=None, stage=None, reason=None):
+    def __init__(self, status, code=None, stage=None, reason=None, message=None):
         self.status = status
         self.code = code
         self.stage = stage if stage in AUTH_FAILURE_STAGES else None
         self.reason = (
             reason
             if isinstance(reason, str) and SAFE_AUTH_REASON.fullmatch(reason)
+            else None
+        )
+        self.message = (
+            re.sub(r"\s+", " ", message).strip()[:512]
+            if isinstance(message, str) and message.strip()
             else None
         )
 
@@ -1014,11 +1031,16 @@ OAUTH_CLIENT_ENV_KEYS = (
     "KIN_GEMINI_OAUTH_CONSUMER_CLIENT_SECRET",
     "KIN_GEMINI_OAUTH_CLOUD_CLIENT_ID",
     "KIN_GEMINI_OAUTH_CLOUD_CLIENT_SECRET",
+    "KIN_GEMINI_OAUTH_ENTERPRISE_CLIENT_ID",
+    "KIN_GEMINI_OAUTH_ENTERPRISE_CLIENT_SECRET",
+    "KIN_GEMINI_OAUTH_GEMINICLI_CLIENT_ID",
+    "KIN_GEMINI_OAUTH_GEMINICLI_CLIENT_SECRET",
     "KIN_GEMINI_OAUTH_WIF_CLIENT_ID",
 )
 _AGY_DEFAULT_OAUTH_CLIENT_IDS = {
     "consumer": "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
     "cloud": "884354919052-36trc1jjb3tguiac32ov6cod268c5blh.apps.googleusercontent.com",
+    "enterprise": "1098991175725-mdu1oe5cbbe1ckggsebobh94toiap657.apps.googleusercontent.com",
 }
 _AGY_OAUTH_SECRET_RE = re.compile(rb"GOCSPX-[A-Za-z0-9_-]{28}\Z")
 _AGY_LEA_RE = re.compile(
@@ -1031,8 +1053,9 @@ _AGY_OAUTH_CACHE_LOCK = threading.Lock()
 def _extract_agy_oauth_clients(agy_path):
     """Extract default OAuth client ID/secret pairs from the installed verified agy ELF64 binary.
 
-    Go concatenates .rodata string literals without NUL terminators, so secrets are paired
-    via x86_64 RIP-relative LEA references in .text rather than naive substring scanning.
+    Go concatenates .rodata string literals without NUL terminators, so on x86_64 secrets are
+    paired via RIP-relative LEA references in .text; non-x86_64 ELF64 binaries fall back to
+    strictly bounded .rodata adjacency.
     """
     if agy_path is None:
         return {}
@@ -1061,8 +1084,7 @@ def _extract_agy_oauth_clients(agy_path):
                 e_shentsize, e_shnum, e_shstrndx = struct.unpack_from("<HHH", hdr, 58)
                 result = {}
                 if (
-                    e_machine == 62
-                    and e_shoff > 0
+                    e_shoff > 0
                     and e_shentsize >= 64
                     and 0 < e_shnum <= 4096
                     and e_shstrndx < e_shnum
@@ -1087,51 +1109,81 @@ def _extract_agy_oauth_clients(agy_path):
                                 name = shstr[sh_name : end if end >= 0 else len(shstr)]
                                 if name in (b".text", b".rodata"):
                                     named[name] = (sh_addr, sh_offset, sh_size)
-                        if b".text" in named and b".rodata" in named:
-                            text_addr, text_off, text_size = named[b".text"]
+                        if b".rodata" in named:
                             ro_addr, ro_off, ro_size = named[b".rodata"]
-                            if (
-                                text_off + text_size <= info.st_size
-                                and ro_off + ro_size <= info.st_size
-                            ):
+                            if ro_off + ro_size <= info.st_size:
                                 stream.seek(ro_off)
                                 rodata = stream.read(ro_size)
                                 id_vas = {}
+                                id_ro_positions = {}
                                 for kind, cid in _AGY_DEFAULT_OAUTH_CLIENT_IDS.items():
                                     needle = cid.encode("ascii")
                                     pos = rodata.find(needle)
                                     while pos >= 0:
                                         id_vas[ro_addr + pos] = kind
+                                        id_ro_positions.setdefault(kind, []).append(
+                                            (pos, len(needle))
+                                        )
                                         pos = rodata.find(needle, pos + 1)
                                 sec_vas = {}
+                                sec_ro_positions = []
                                 pos = rodata.find(b"GOCSPX-")
                                 while pos >= 0:
                                     cand = rodata[pos : pos + 35]
                                     if _AGY_OAUTH_SECRET_RE.fullmatch(cand):
-                                        sec_vas[ro_addr + pos] = cand.decode("ascii")
+                                        sec_str = cand.decode("ascii")
+                                        sec_vas[ro_addr + pos] = sec_str
+                                        sec_ro_positions.append((pos, sec_str))
                                     pos = rodata.find(b"GOCSPX-", pos + 1)
-                                if id_vas and sec_vas:
-                                    stream.seek(text_off)
-                                    text_data = stream.read(text_size)
-                                    id_refs = {}
-                                    sec_refs = []
-                                    for match in _AGY_LEA_RE.finditer(text_data):
-                                        disp = struct.unpack_from("<i", match.group(1))[0]
-                                        target_va = text_addr + match.start() + 7 + disp
-                                        kind = id_vas.get(target_va)
-                                        if kind is not None:
-                                            id_refs.setdefault(kind, []).append(match.start())
-                                        else:
-                                            sec_val = sec_vas.get(target_va)
-                                            if sec_val is not None:
-                                                sec_refs.append((match.start(), sec_val))
-                                    for kind, positions in id_refs.items():
+                                if (
+                                    e_machine == 62
+                                    and b".text" in named
+                                    and id_vas
+                                    and sec_vas
+                                ):
+                                    text_addr, text_off, text_size = named[b".text"]
+                                    if text_off + text_size <= info.st_size:
+                                        stream.seek(text_off)
+                                        text_data = stream.read(text_size)
+                                        id_refs = {}
+                                        sec_refs = []
+                                        for match in _AGY_LEA_RE.finditer(text_data):
+                                            disp = struct.unpack_from("<i", match.group(1))[0]
+                                            target_va = text_addr + match.start() + 7 + disp
+                                            kind = id_vas.get(target_va)
+                                            if kind is not None:
+                                                id_refs.setdefault(kind, []).append(match.start())
+                                            else:
+                                                sec_val = sec_vas.get(target_va)
+                                                if sec_val is not None:
+                                                    sec_refs.append((match.start(), sec_val))
+                                        for kind, positions in id_refs.items():
+                                            best = None
+                                            for cp in positions:
+                                                for sp, sec_val in sec_refs:
+                                                    dist = abs(sp - cp)
+                                                    if dist <= 256 and (best is None or dist < best[0]):
+                                                        best = (dist, sec_val)
+                                            if best is not None:
+                                                result[kind] = (
+                                                    _AGY_DEFAULT_OAUTH_CLIENT_IDS[kind],
+                                                    best[1],
+                                                )
+                                elif (
+                                    (e_machine != 62 or b".text" not in named)
+                                    and id_ro_positions
+                                    and sec_ro_positions
+                                ):
+                                    for kind, entries in id_ro_positions.items():
                                         best = None
-                                        for cp in positions:
-                                            for sp, sec_val in sec_refs:
-                                                dist = abs(sp - cp)
-                                                if dist <= 256 and (best is None or dist < best[0]):
-                                                    best = (dist, sec_val)
+                                        for id_pos, id_len in entries:
+                                            id_end = id_pos + id_len
+                                            for sec_pos, sec_val in sec_ro_positions:
+                                                gap = sec_pos - id_end
+                                                if 0 <= gap <= 64 and (
+                                                    best is None or gap < best[0]
+                                                ):
+                                                    best = (gap, sec_val)
                                         if best is not None:
                                             result[kind] = (
                                                 _AGY_DEFAULT_OAUTH_CLIENT_IDS[kind],
@@ -1171,6 +1223,11 @@ def _resolve_host_oauth_clients(agy_path=None):
             "KIN_GEMINI_OAUTH_CLOUD_CLIENT_ID",
             "KIN_GEMINI_OAUTH_CLOUD_CLIENT_SECRET",
         ),
+        (
+            "enterprise",
+            "KIN_GEMINI_OAUTH_ENTERPRISE_CLIENT_ID",
+            "KIN_GEMINI_OAUTH_ENTERPRISE_CLIENT_SECRET",
+        ),
     ):
         env_id = env_cfg.get(id_key)
         env_sec = env_cfg.get(sec_key)
@@ -1183,6 +1240,14 @@ def _resolve_host_oauth_clients(agy_path=None):
             if pair:
                 resolved[id_key] = pair[0]
                 resolved[sec_key] = env_sec or pair[1]
+    if env_cfg.get("KIN_GEMINI_OAUTH_GEMINICLI_CLIENT_ID"):
+        resolved["KIN_GEMINI_OAUTH_GEMINICLI_CLIENT_ID"] = env_cfg[
+            "KIN_GEMINI_OAUTH_GEMINICLI_CLIENT_ID"
+        ]
+        if env_cfg.get("KIN_GEMINI_OAUTH_GEMINICLI_CLIENT_SECRET"):
+            resolved["KIN_GEMINI_OAUTH_GEMINICLI_CLIENT_SECRET"] = env_cfg[
+                "KIN_GEMINI_OAUTH_GEMINICLI_CLIENT_SECRET"
+            ]
     if env_cfg.get("KIN_GEMINI_OAUTH_WIF_CLIENT_ID"):
         resolved["KIN_GEMINI_OAUTH_WIF_CLIENT_ID"] = env_cfg[
             "KIN_GEMINI_OAUTH_WIF_CLIENT_ID"
@@ -1202,7 +1267,7 @@ def read_account(
     agy_path=None,
 ):
     payload = {"proxy_url": proxy_url, "api_key": api_key, "oauth_token": oauth_token}
-    if method == "oauth_refresh_import":
+    if method in ("oauth_refresh_import", "oauth", "oauth-models"):
         oauth_clients = _resolve_host_oauth_clients(agy_path=agy_path)
         if oauth_clients:
             payload["oauth_clients"] = oauth_clients
@@ -1343,6 +1408,55 @@ def proxy_config(value):
     except (ValueError, TypeError) as error:
         raise Failure(400) from error
     return resolved_host, str(port)
+
+
+def _is_ipv4_literal(host):
+    try:
+        ipaddress.IPv4Address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_proxy_ipv4(host, port):
+    if _is_ipv4_literal(host):
+        return host
+    try:
+        infos = socket.getaddrinfo(
+            host, int(port), family=socket.AF_INET, type=socket.SOCK_STREAM
+        )
+    except OSError as err:
+        raise Failure(503, "gemini_proxy_error", stage="network_prepare") from err
+    ips = [sockaddr[0] for *_, sockaddr in infos if sockaddr]
+    if not ips:
+        raise Failure(503, "gemini_proxy_error", stage="network_prepare")
+    for ip_str in ips:
+        try:
+            addr = ipaddress.IPv4Address(ip_str)
+        except ValueError as err:
+            raise Failure(503, "gemini_proxy_error", stage="network_prepare") from err
+        if _is_disallowed_ipv4(addr):
+            raise Failure(503, "gemini_proxy_error", stage="network_prepare")
+    return ips[0]
+
+
+def _ensure_traversable_dir(path):
+    """Self-heal env/profile directories created with 0700 under UMask=0077 to 0711."""
+    if path is None:
+        return
+    try:
+        info = path.lstat()
+    except OSError:
+        return
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        return
+    if info.st_uid != os.geteuid():
+        return
+    if (info.st_mode & 0o7777) != 0o711:
+        try:
+            os.chmod(path, 0o711)
+        except OSError:
+            pass
 
 
 def normalize_egress_options(raw):
@@ -1700,6 +1814,8 @@ class Agy:
         self.owns_directory = True
         self.directory.chmod(0o711)
         self.directory.parent.chmod(0o711)
+        if self.profile is not None:
+            _ensure_traversable_dir(self.profile)
         home = (self.profile or self.directory) / "home"
         work = self.directory / "work"
         work.mkdir(mode=0o700)
@@ -1738,22 +1854,96 @@ class Agy:
             self.egress = lease["egress"]
             self.egress_relay = lease.get("relay")
         else:
-            config = self.directory / "egress.json"
-            private_json(
-                config,
-                {
-                    "proxy_id": self.environment["proxy_id"],
-                    "proxy_url": proxy_url,
-                    "listen_tcp": "127.0.0.1:1080",
-                    "listen_dns": "127.0.0.1:1053",
-                    **self.egress_options,
-                },
-            )
-            os.chown(config, self.host.egress_uid, self.host.egress_uid)
-            try:
-                self.network_lock = self.host.start_network(self.directory, self.network)
-            except (Failure, OSError, subprocess.SubprocessError) as err:
-                raise Failure(503, getattr(err, "code", None), stage="network_prepare") from err
+            effective_proxy_url = proxy_url
+            target_host, target_port = self.network[2], self.network[3]
+            if not _is_ipv4_literal(target_host):
+                if hasattr(self.host, "_start_egress_relay"):
+                    gateway, guest = slot_network_addrs(self.slot)
+                    relay_port = pick_free_relay_port()
+                    self.network = [
+                        str(self.slot),
+                        str(self.host.egress_uid),
+                        gateway,
+                        str(relay_port),
+                    ]
+                    effective_proxy_url = rewrite_proxy_endpoint(
+                        proxy_url, gateway, relay_port
+                    )
+                    config = self.directory / "egress.json"
+                    private_json(
+                        config,
+                        {
+                            "proxy_id": self.environment["proxy_id"],
+                            "proxy_url": effective_proxy_url,
+                            "listen_tcp": "127.0.0.1:1080",
+                            "listen_dns": "127.0.0.1:1053",
+                            **self.egress_options,
+                        },
+                    )
+                    os.chown(config, self.host.egress_uid, self.host.egress_uid)
+                    try:
+                        self.network_lock = self.host.start_network(
+                            self.directory, self.network
+                        )
+                    except (Failure, OSError, subprocess.SubprocessError) as err:
+                        raise Failure(
+                            503, getattr(err, "code", None), stage="network_prepare"
+                        ) from err
+                    try:
+                        self.egress_relay = self.host._start_egress_relay(
+                            gateway, guest, relay_port, target_host, target_port
+                        )
+                    except (Failure, OSError, subprocess.SubprocessError) as err:
+                        raise Failure(
+                            503, getattr(err, "code", None), stage="relay_start"
+                        ) from err
+                else:
+                    resolved_ip = _resolve_proxy_ipv4(target_host, target_port)
+                    self.network[2] = resolved_ip
+                    effective_proxy_url = rewrite_proxy_endpoint(
+                        proxy_url, resolved_ip, target_port
+                    )
+                    config = self.directory / "egress.json"
+                    private_json(
+                        config,
+                        {
+                            "proxy_id": self.environment["proxy_id"],
+                            "proxy_url": effective_proxy_url,
+                            "listen_tcp": "127.0.0.1:1080",
+                            "listen_dns": "127.0.0.1:1053",
+                            **self.egress_options,
+                        },
+                    )
+                    os.chown(config, self.host.egress_uid, self.host.egress_uid)
+                    try:
+                        self.network_lock = self.host.start_network(
+                            self.directory, self.network
+                        )
+                    except (Failure, OSError, subprocess.SubprocessError) as err:
+                        raise Failure(
+                            503, getattr(err, "code", None), stage="network_prepare"
+                        ) from err
+            else:
+                config = self.directory / "egress.json"
+                private_json(
+                    config,
+                    {
+                        "proxy_id": self.environment["proxy_id"],
+                        "proxy_url": effective_proxy_url,
+                        "listen_tcp": "127.0.0.1:1080",
+                        "listen_dns": "127.0.0.1:1053",
+                        **self.egress_options,
+                    },
+                )
+                os.chown(config, self.host.egress_uid, self.host.egress_uid)
+                try:
+                    self.network_lock = self.host.start_network(
+                        self.directory, self.network
+                    )
+                except (Failure, OSError, subprocess.SubprocessError) as err:
+                    raise Failure(
+                        503, getattr(err, "code", None), stage="network_prepare"
+                    ) from err
             try:
                 subprocess.run(
                     self.launch_args(self.host.egress_uid)
@@ -2135,6 +2325,10 @@ class Headless(Agy):
             self._copy_profile_file(
                 src_cli / "cache" / "default_project_id.txt",
                 settings / "cache" / "default_project_id.txt",
+            )
+            self._copy_profile_file(
+                src_cli / "cache" / "onboarding.json",
+                settings / "cache" / "onboarding.json",
             )
         token = settings / TOKEN_NAME
         token.write_bytes(self.token_bytes)
@@ -2839,7 +3033,11 @@ class CragDaemonShard:
                 / "antigravity-cli"
             )
             src_uid = self.host.env_uid(env)
-            for rel in ("installation_id", "cache/default_project_id.txt"):
+            for rel in (
+                "installation_id",
+                "cache/default_project_id.txt",
+                "cache/onboarding.json",
+            ):
                 src = src_cli / rel
                 dst = settings_dir / rel
                 try:
@@ -2968,16 +3166,28 @@ class CragDaemonShard:
         accounts_cfg = []
         default_model = NATIVE_DEFAULT_MODEL
         boot_license_env_id = None
-        for env, proxy_url, auth, model in initial_members:
+        for member in initial_members:
+            if len(member) >= 5:
+                env, proxy_url, auth, model, raw_egress_opts = member[:5]
+            else:
+                env, proxy_url, auth, model = member[:4]
+                raw_egress_opts = None
+            egress_opts = normalize_egress_options(raw_egress_opts)
+            egress_key = egress_fingerprint(proxy_url, egress_opts)
             self._stage_account_files(env, auth)
             effective_model = model or self.host._initial_session_model(env)
             default_model = effective_model
+            # Note: CRAGGemini AccountBindingConfig enforces #[serde(deny_unknown_fields)],
+            # so egress_options are tracked in host shard metadata/egress_key rather than
+            # injected as unknown JSON keys into kernel.json.
             accounts_cfg.append(
                 self._account_binding_payload(env, proxy_url, effective_model)
             )
             self.members[env["id"]] = {
                 "proxy_id": env["proxy_id"],
                 "proxy_hash": hashlib.sha256(proxy_url.encode()).digest(),
+                "egress_key": egress_key,
+                "egress_options": egress_opts,
                 "max_concurrency": env_concurrency(env),
                 "model": effective_model,
             }
@@ -3257,12 +3467,14 @@ class CragDaemonShard:
                     all_ok = False
             return all_ok
 
-    def sync_account(self, env, proxy_url, auth, model=None):
+    def sync_account(self, env, proxy_url, auth, model=None, *, egress_options=None):
         with self._lock:
             if not self.is_alive():
                 raise Failure(503, "gemini_native_worker_unavailable")
             env_id = env["id"]
             proxy_hash = hashlib.sha256(proxy_url.encode()).digest()
+            egress_opts = normalize_egress_options(egress_options)
+            egress_key = egress_fingerprint(proxy_url, egress_opts)
             desired_conc = env_concurrency(env)
             effective_model = model or self.host._initial_session_model(env)
             self._stage_account_files(env, auth)
@@ -3283,12 +3495,15 @@ class CragDaemonShard:
                 self.members[env_id] = {
                     "proxy_id": env["proxy_id"],
                     "proxy_hash": proxy_hash,
+                    "egress_key": egress_key,
+                    "egress_options": egress_opts,
                     "max_concurrency": desired_conc,
                     "model": effective_model,
                 }
                 return True
+            existing_egress_key = existing.get("egress_key", existing["proxy_hash"])
             if existing["proxy_id"] != env["proxy_id"] or not secrets.compare_digest(
-                existing["proxy_hash"], proxy_hash
+                existing_egress_key, egress_key
             ):
                 status, _ = native_module().worker_json_request(
                     self.socket_path,
@@ -3307,6 +3522,8 @@ class CragDaemonShard:
                     raise Failure(503, "gemini_native_worker_unavailable")
                 existing["proxy_id"] = env["proxy_id"]
                 existing["proxy_hash"] = proxy_hash
+                existing["egress_key"] = egress_key
+                existing["egress_options"] = egress_opts
             if existing["max_concurrency"] != desired_conc:
                 status, _ = native_module().worker_json_request(
                     self.socket_path,
@@ -3948,6 +4165,7 @@ class Host:
         self.environments = (
             json.loads(self.state_file.read_bytes()) if self.state_file.exists() else {}
         )
+        _ensure_traversable_dir(self.directory)
         if (
             not isinstance(self.environments, dict)
             or len(self.environments) > MAX_ENVIRONMENTS
@@ -3978,6 +4196,7 @@ class Host:
             env_dir = self.directory / identifier
             if env_dir.exists():
                 check_root_owned(env_dir)
+                self._heal_env_dir_perms(env)
                 self.recover_network(env_dir, slot)
                 for stale in env_dir.iterdir():
                     name = (
@@ -4455,13 +4674,14 @@ class Host:
 
     def _acquire_shard_for_account(self, ctx):
         identifier = ctx["identifier"]
+        egress_opts = normalize_egress_options(ctx.get("egress_options"))
         with self.lock:
             shard_id = self._shard_id_for_account(identifier)
             if self._is_shard_isolated(shard_id):
                 return None, shard_id
         with self._shard_lock(shard_id):
             with self.lock:
-                self._remember_runtime_proxy(ctx["env"], ctx["proxy_url"])
+                self._remember_runtime_proxy(ctx["env"], ctx["proxy_url"], egress_opts)
                 if self._is_shard_isolated(shard_id):
                     return None, shard_id
                 shard = self.daemon_shards.get(shard_id)
@@ -4475,14 +4695,26 @@ class Host:
                     shard = CragDaemonShard(
                         self,
                         shard_id,
-                        [(ctx["env"], ctx["proxy_url"], ctx["auth"], ctx["model"])],
+                        [
+                            (
+                                ctx["env"],
+                                ctx["proxy_url"],
+                                ctx["auth"],
+                                ctx["model"],
+                                egress_opts,
+                            )
+                        ],
                         policy=self.runtime_policy,
                     )
                     with self.lock:
                         self.daemon_shards[shard_id] = shard
                 else:
                     shard.sync_account(
-                        ctx["env"], ctx["proxy_url"], ctx["auth"], model=ctx["model"]
+                        ctx["env"],
+                        ctx["proxy_url"],
+                        ctx["auth"],
+                        model=ctx["model"],
+                        egress_options=egress_opts,
                     )
                 return shard, shard_id
             except (Failure, OSError, subprocess.SubprocessError):
@@ -6126,6 +6358,8 @@ class Host:
                 return uid, key, None
             raise Failure(409, "gemini_api_key_invalid")
         profile = env.get("profile")
+        if profile:
+            self._heal_env_dir_perms(env)
         auth = profile and profile_secrets(directory / profile, uid, include_raw=True)
         if not auth:
             raise Failure(409, "gemini_oauth_required")
@@ -6251,18 +6485,81 @@ class Host:
             return False, False
         return bool(health.get("has_refresh")), bool(health.get("needs_refresh"))
 
+    _HEADLESS_ERROR_STATUS = {
+        "gemini_oauth_required": 401,
+        "gemini_api_key_invalid": 401,
+        "gemini_location_unsupported": 403,
+        "gemini_account_ineligible": 403,
+        "gemini_account_verification_required": 403,
+        "gemini_client_unsupported": 403,
+        "gemini_model_unavailable": 409,
+        "gemini_quota_exhausted": 429,
+        "gemini_inference_bad_input": 400,
+        "gemini_inference_timeout": 504,
+        "gemini_oauth_client_not_configured": 503,
+        "gemini_upstream_unavailable": 503,
+    }
+
+    @classmethod
+    def _raise_model_probe_failure(cls, data, *, api_key=False):
+        err_code = data.get("error_code") if isinstance(data, dict) else None
+        err_msg = data.get("error_message") if isinstance(data, dict) else None
+        http_status = data.get("http_status") if isinstance(data, dict) else None
+        state = data.get("state") if isinstance(data, dict) else None
+        if api_key:
+            if state == "reauth_required":
+                raise Failure(409, "gemini_api_key_invalid", message=err_msg)
+            if http_status == 429:
+                raise Failure(429, err_code or "gemini_quota_exhausted", message=err_msg)
+            if http_status == 403:
+                raise Failure(403, err_code or "gemini_api_key_invalid", message=err_msg)
+            if http_status == 503:
+                raise Failure(503, err_code or "gemini_upstream_unavailable", message=err_msg)
+            raise Failure(502, err_code or "gemini_proxy_error", message=err_msg)
+        if state == "reauth_required" or http_status == 401 or err_code == "gemini_oauth_required":
+            raise Failure(401, err_code or "gemini_oauth_required", message=err_msg)
+        if http_status == 403:
+            raise Failure(403, err_code or "gemini_account_ineligible", message=err_msg)
+        if http_status == 409:
+            raise Failure(409, err_code or "gemini_oauth_required", message=err_msg)
+        if http_status == 429:
+            raise Failure(429, err_code or "gemini_quota_exhausted", message=err_msg)
+        if http_status == 503 or err_code == "gemini_oauth_client_not_configured":
+            raise Failure(503, err_code or "gemini_upstream_unavailable", message=err_msg)
+        status = cls._HEADLESS_ERROR_STATUS.get(err_code, 502)
+        raise Failure(status, err_code or "gemini_proxy_error", message=err_msg)
+
     def pull_models(self, env, proxy_url, *, allow_reauth_probe=False, egress_options=None):
+        self._heal_env_dir_perms(env)
         uid, key, auth = self.operation_account(
             env, allow_concurrent_infer=True, allow_reauth_probe=allow_reauth_probe
         )
         opts = normalize_egress_options(egress_options)
+        fetched_data = None
         if key:
             data = read_account(uid, proxy_url, "api-key-models", api_key=key)
-            if data.get("state") == "reauth_required":
-                raise Failure(409, "gemini_api_key_invalid")
             if data.get("state") not in ("ok", "partial"):
-                raise Failure(502, "gemini_proxy_error")
+                self._raise_model_probe_failure(data, api_key=True)
             models = data.get("models", [])
+        elif env.get("auth_method", "oauth") == "oauth" and env.get("profile"):
+            project_hint = (env.get("account") or {}).get("project_id")
+            data = read_account(
+                uid,
+                proxy_url,
+                "oauth-models",
+                profile=self.directory / env["id"] / env["profile"],
+                oauth_token={"project_id": project_hint} if project_hint else None,
+                timeout=25,
+                agy_path=self._agy_path(),
+            )
+            if data.get("state") not in ("ok", "partial"):
+                self._raise_model_probe_failure(data, api_key=False)
+            fetched_data = data
+            models = [
+                m
+                for m in (data.get("models") or ())
+                if isinstance(m, str) and MODEL.fullmatch(m)
+            ]
         else:
             run = Headless(
                 self,
@@ -6283,7 +6580,11 @@ class Host:
                         raise Failure(504, "gemini_inference_timeout")
                     time.sleep(0.05)
                 if result["state"] != "completed":
-                    raise Failure(502, result["error"]["code"])
+                    err_obj = result.get("error") if isinstance(result.get("error"), dict) else {}
+                    err_code = err_obj.get("code") or "gemini_inference_failed"
+                    err_msg = err_obj.get("message")
+                    status = self._HEADLESS_ERROR_STATUS.get(err_code, 502)
+                    raise Failure(status, err_code, message=err_msg)
                 models = result.get("models", [])
             finally:
                 self._sync_profile_token(env, run)
@@ -6291,7 +6592,26 @@ class Host:
         if not models:
             raise Failure(502, "gemini_models_empty")
         with self.lock:
-            self.save_environment(env, {**env, "call_models": models, "updated_at": now()})
+            updated = {**env, "call_models": list(models), "updated_at": now()}
+            if fetched_data is not None:
+                updated_account = dict(env.get("account") or {})
+                updated_account["models"] = list(models)
+                if isinstance(fetched_data.get("quotas"), list) and fetched_data["quotas"]:
+                    updated_account["quotas"] = fetched_data["quotas"]
+                if (
+                    isinstance(fetched_data.get("model_catalog"), list)
+                    and fetched_data["model_catalog"]
+                ):
+                    updated_account["model_catalog"] = fetched_data["model_catalog"]
+                if updated_account.get("state") not in ("ok", "partial"):
+                    updated_account["state"] = "ok"
+                    updated_account["checked_at"] = fetched_data.get("checked_at") or now()
+                    for err_key in ("error_code", "error_message", "http_status"):
+                        updated_account.pop(err_key, None)
+                updated["account"] = updated_account
+                if env.get("auth_state") == "reauth_required":
+                    updated["auth_state"] = "authorized"
+            self.save_environment(env, updated)
             return self.view(env)
 
     def _start_oauth_test_chat(self, env, proxy_url, auth, model, prompt, *, egress_options=None):
@@ -6430,7 +6750,9 @@ class Host:
         new_id = body.get("proxy_id")
         if not isinstance(new_id, str) or not ID.fullmatch(new_id):
             raise Failure(400)
-        proxy_config(body.get("proxy_url"))
+        proxy_url = body.get("proxy_url")
+        proxy_config(proxy_url)
+        egress_opts = normalize_egress_options(body.get("egress_options"))
         identifier = env["id"]
         if (
             body.get("previous_proxy_id") != env["proxy_id"]
@@ -6439,6 +6761,12 @@ class Host:
             or identifier in self.pending
         ):
             raise Failure(409, "gemini_operation_busy")
+        new_egress_key = egress_fingerprint(proxy_url, egress_opts)
+        prev_cached = self._runtime_proxy_entry(identifier)
+        egress_changed = (
+            prev_cached is not None
+            and not secrets.compare_digest(prev_cached[2], new_egress_key)
+        )
         if new_id != env["proxy_id"]:
             self.stop_run(identifier)
             self.stop_native_session(identifier)
@@ -6448,6 +6776,11 @@ class Host:
             updated.pop("call_models", None)
             updated.pop("account", None)
             self.save_environment(env, updated)
+        elif egress_changed:
+            self.stop_run(identifier)
+            self.stop_native_session(identifier)
+            self._remove_account_from_shard(identifier)
+        self._remember_runtime_proxy(env, proxy_url, egress_opts)
         return self.view(env)
 
     def terminal_request(self, operation, env, body):
@@ -7206,17 +7539,29 @@ class Host:
             self.uid_base + (slot % MAX_NETNS_SLOTS), proxy_url, "oauth_import", oauth_token=credential
         )
 
+    def _agy_path(self):
+        return (self.payload / "agy") if getattr(self, "payload", None) is not None else None
+
+    def _heal_env_dir_perms(self, env):
+        if not isinstance(env, dict):
+            return
+        identifier = env.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            return
+        env_dir = self.directory / identifier
+        _ensure_traversable_dir(env_dir)
+        profile = env.get("profile")
+        if isinstance(profile, str) and ATTEMPT.fullmatch(profile):
+            _ensure_traversable_dir(env_dir / profile)
+
     def probe_refresh_imported_account(self, slot, proxy_url, credential):
-        agy_path = (
-            (self.payload / "agy") if getattr(self, "payload", None) is not None else None
-        )
         result = read_account(
             self.uid_base + (slot % MAX_NETNS_SLOTS),
             proxy_url,
             "oauth_refresh_import",
             oauth_token=credential,
             timeout=25,
-            agy_path=agy_path,
+            agy_path=self._agy_path(),
         )
         if not isinstance(result, dict):
             return {"account": {"state": "error", "checked_at": now()}}
@@ -7225,13 +7570,16 @@ class Host:
         return {"account": result}
 
     def _write_imported_profile(self, env_dir, uid, token_doc, project_id=None):
+        env_dir.chmod(0o711)
         profile_id = secrets.token_hex(16)
         profile_dir = env_dir / profile_id
         profile_dir.mkdir(mode=0o711)
+        profile_dir.chmod(0o711)
         home = profile_dir / "home"
         settings = home / ".gemini" / "antigravity-cli"
         for private in (home, home / ".gemini", settings):
             private.mkdir(mode=0o700)
+            os.chmod(private, 0o700)
             os.chown(private, uid, uid)
         settings_file = settings / "settings.json"
         private_json(settings_file, CLI_SETTINGS)
@@ -7239,10 +7587,15 @@ class Host:
         token_file = settings / TOKEN_NAME
         private_json(token_file, token_doc)
         os.chown(token_file, uid, uid)
+        cache_dir = settings / "cache"
+        cache_dir.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(cache_dir, 0o700)
+        os.chown(cache_dir, uid, uid)
+        onboarding_file = cache_dir / "onboarding.json"
+        private_json(onboarding_file, {"onboardingComplete": True})
+        os.chmod(onboarding_file, 0o600)
+        os.chown(onboarding_file, uid, uid)
         if isinstance(project_id, str) and 1 <= len(project_id.strip()) <= 128:
-            cache_dir = settings / "cache"
-            cache_dir.mkdir(mode=0o700, exist_ok=True)
-            os.chown(cache_dir, uid, uid)
             proj_file = cache_dir / "default_project_id.txt"
             proj_file.write_text(project_id.strip() + "\n", encoding="utf-8")
             os.chmod(proj_file, 0o600)
@@ -7264,6 +7617,7 @@ class Host:
             credential = json.loads((directory / "oauth-import.json").read_bytes())
             account = self.probe_imported_account(env["slot"], proxy_url, credential)
         else:
+            self._heal_env_dir_perms(env)
             has_refresh, is_expired = self._profile_token_state(env)
             with self.lock:
                 can_run_agy = (
@@ -7291,6 +7645,7 @@ class Host:
                 proxy_url,
                 "oauth",
                 profile=directory / env["profile"],
+                agy_path=self._agy_path(),
             )
             if (
                 account.get("state") == "reauth_required"
@@ -7308,6 +7663,7 @@ class Host:
                         proxy_url,
                         "oauth",
                         profile=directory / env["profile"],
+                        agy_path=self._agy_path(),
                     )
                 except Failure as error:
                     if error.code != "gemini_oauth_required":
@@ -7686,12 +8042,47 @@ class Host:
                     raise Failure(400, "gemini_oauth_import_invalid")
                 refresh = imported.get("refresh_token")
                 access = imported.get("access_token")
-                expiry = imported.get("expiry_timestamp")
+                raw_expiry = (
+                    imported.get("expiry_timestamp")
+                    if "expiry_timestamp" in imported
+                    else imported.get("expiry")
+                    if "expiry" in imported
+                    else imported.get("expires_at")
+                )
+                expiry = None
+                if raw_expiry is not None:
+                    if type(raw_expiry) is int or type(raw_expiry) is float:
+                        ts = int(raw_expiry / 1000) if raw_expiry >= 10_000_000_000 else int(raw_expiry)
+                        expiry = ts if 0 < ts < 253402300800 else -1
+                    elif isinstance(raw_expiry, str) and raw_expiry.strip():
+                        raw_str = raw_expiry.strip()
+                        if raw_str.isdigit():
+                            ts_num = int(raw_str)
+                            ts = ts_num // 1000 if ts_num >= 10_000_000_000 else ts_num
+                            expiry = ts if 0 < ts < 253402300800 else -1
+                        else:
+                            norm = re.sub(r"\.[0-9]+", "", raw_str)
+                            if norm.endswith("Z"):
+                                norm = norm[:-1] + "+00:00"
+                            try:
+                                parsed_dt = datetime.fromisoformat(norm)
+                                if parsed_dt.tzinfo is None:
+                                    parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+                                ts = int(parsed_dt.timestamp())
+                                expiry = ts if 0 < ts < 253402300800 else -1
+                            except ValueError:
+                                expiry = -1
+                    else:
+                        expiry = -1
                 auth_method_hint = imported.get("auth_method")
                 wif_provider = imported.get("wif_provider")
+                oauth_client_key = imported.get("oauth_client_key")
+                is_gcp_tos = imported.get("is_gcp_tos")
+                imported_project_id = imported.get("project_id")
+                imported_email = imported.get("email")
                 if auth_method_hint is not None and (
                     not isinstance(auth_method_hint, str)
-                    or auth_method_hint not in OAUTH_AUTH_METHODS
+                    or auth_method_hint.strip().lower() not in OAUTH_AUTH_METHODS
                 ):
                     raise Failure(400, "gemini_oauth_import_invalid")
                 if wif_provider is not None and (
@@ -7699,23 +8090,45 @@ class Host:
                     or not WIF_PROVIDER.fullmatch(wif_provider)
                 ):
                     raise Failure(400, "gemini_oauth_import_invalid")
-                has_access_pair = access is not None or expiry is not None
-                if has_access_pair:
-                    if (
-                        not isinstance(access, str)
-                        or not OAUTH_ACCESS_TOKEN.fullmatch(access)
-                        or type(expiry) is not int
-                        or not 0 < expiry < 253402300800
-                    ):
-                        raise Failure(400, "gemini_oauth_import_invalid")
+                if oauth_client_key is not None and (
+                    not isinstance(oauth_client_key, str)
+                    or not OAUTH_CLIENT_KEY.fullmatch(oauth_client_key.strip())
+                ):
+                    raise Failure(400, "gemini_oauth_import_invalid")
+                if is_gcp_tos is not None and type(is_gcp_tos) is not bool:
+                    raise Failure(400, "gemini_oauth_import_invalid")
+                if imported_project_id is not None and (
+                    not isinstance(imported_project_id, str)
+                    or not OAUTH_PROJECT_ID.fullmatch(imported_project_id.strip())
+                ):
+                    raise Failure(400, "gemini_oauth_import_invalid")
+                if imported_email is not None and (
+                    not isinstance(imported_email, str)
+                    or not 1 <= len(imported_email.strip()) <= 254
+                    or any(ch in imported_email for ch in "\r\n\x00")
+                ):
+                    raise Failure(400, "gemini_oauth_import_invalid")
+                has_access_pair = access is not None and expiry is not None
+                if access is not None and (
+                    not isinstance(access, str) or not OAUTH_ACCESS_TOKEN.fullmatch(access)
+                ):
+                    raise Failure(400, "gemini_oauth_import_invalid")
+                if raw_expiry is not None and (
+                    type(expiry) is not int or not 0 < expiry < 253402300800
+                ):
+                    raise Failure(400, "gemini_oauth_import_invalid")
                 if refresh is not None:
                     if not isinstance(refresh, str) or not OAUTH_REFRESH_TOKEN.fullmatch(refresh):
                         raise Failure(400, "gemini_oauth_import_invalid")
                     refresh_credential = {
                         "refresh_token": refresh,
                         **({"access_token": access, "expiry": expiry} if has_access_pair else {}),
-                        **({"auth_method": auth_method_hint} if auth_method_hint else {}),
+                        **({"auth_method": auth_method_hint.strip().lower()} if auth_method_hint else {}),
                         **({"wif_provider": wif_provider} if wif_provider else {}),
+                        **({"oauth_client_key": oauth_client_key.strip()} if oauth_client_key else {}),
+                        **({"is_gcp_tos": is_gcp_tos} if is_gcp_tos is not None else {}),
+                        **({"project_id": imported_project_id.strip()} if imported_project_id else {}),
+                        **({"email": imported_email.strip()} if imported_email else {}),
                     }
                 elif has_access_pair:
                     credential = {"access_token": access, "expiry": expiry}
@@ -7751,24 +8164,27 @@ class Host:
                     slot, proxy_url, refresh_credential
                 )
                 account = refresh_result.get("account") or {"state": "error", "checked_at": now()}
+                err_msg = refresh_result.get("error_message") or account.get("error_message")
                 if (
                     refresh_result.get("error") == "oauth_client_not_configured"
                     or account.get("error_code") == "oauth_client_not_configured"
                 ):
-                    raise Failure(503, "gemini_oauth_client_not_configured")
+                    raise Failure(503, "gemini_oauth_client_not_configured", message=err_msg)
                 if account.get("state") == "reauth_required":
-                    raise Failure(400, "gemini_oauth_import_rejected")
+                    raise Failure(400, "gemini_oauth_import_rejected", message=err_msg)
                 if account.get("state") not in ("ok", "partial"):
-                    raise Failure(502, "gemini_account_read_failed")
-                if refresh_result.get("fallback_access_only") and refresh_credential.get("access_token"):
-                    credential = {
-                        "access_token": refresh_credential["access_token"],
-                        "expiry": refresh_credential["expiry"],
-                    }
-                elif isinstance(refresh_result.get("token_doc"), dict):
+                    raise Failure(502, "gemini_account_read_failed", message=err_msg)
+                if isinstance(refresh_result.get("token_doc"), dict):
                     imported_token_doc = refresh_result["token_doc"]
+                    discovered = [
+                        m
+                        for m in (account.get("models") or ())
+                        if isinstance(m, str) and MODEL.fullmatch(m)
+                    ]
+                    if discovered:
+                        call_models = discovered
                 else:
-                    raise Failure(502, "gemini_account_read_failed")
+                    raise Failure(502, "gemini_account_read_failed", message=err_msg)
             elif credential:
                 account = self.probe_imported_account(slot, proxy_url, credential)
                 if account["state"] == "reauth_required":
@@ -7778,6 +8194,7 @@ class Host:
             identifier = f"gemini-{secrets.token_hex(12)}"
             directory = self.directory / identifier
             directory.mkdir(mode=0o711)
+            directory.chmod(0o711)
             timestamp = now()
             env = {
                 "id": identifier,
@@ -7805,7 +8222,10 @@ class Host:
                         directory,
                         self.env_uid(env),
                         imported_token_doc,
-                        project_id=account.get("project_id"),
+                        project_id=(
+                            account.get("project_id")
+                            or (refresh_credential.get("project_id") if refresh_credential else None)
+                        ),
                     )
                     env["profile"] = profile_id
                 elif credential:
@@ -8989,6 +9409,8 @@ class ControlHandler(BaseHTTPRequestHandler):
             status, payload = 200, self.server.host.request(operation, body)
         except Failure as error:
             payload = {"code": error.code} if error.code else {}
+            if error.message:
+                payload["message"] = error.message
             if error.stage in AUTH_FAILURE_STAGES:
                 payload["stage"] = error.stage
             status = error.status
