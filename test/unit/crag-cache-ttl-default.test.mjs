@@ -14,10 +14,7 @@ import {
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { invalidateReadCache } from '../../src/lib/vm/vm-file.mjs'
 import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
-import {
-  createM3FailoverRunner,
-  withM3SchedulerDeps,
-} from '../fixtures/scheduler-runtime-mock.mjs'
+import { createM3FailoverRunner, withM3SchedulerDeps } from '../fixtures/scheduler-runtime-mock.mjs'
 
 function createM3HandleProtocol(deps) {
   return createHandleProtocol(withM3SchedulerDeps(deps))
@@ -344,4 +341,3 @@ unixTest(
     assert.equal(envelope.cache_ttl, '5m')
   },
 )
-
