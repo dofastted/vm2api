@@ -288,11 +288,11 @@ const INFERENCE_ERROR_ACTIONS: Readonly<Record<string, string>> = {
   gemini_account_verification_required:
     '处理方式：在对应 Google 账号已登录的浏览器中打开「账号」页的 Google 验证链接完成核验，随后刷新账号并重新测试。',
   gemini_location_unsupported:
-    '处理方式：Google 限制当前出口地区（403 UNSUPPORTED_REGION），请在「代理」页更换支持地区（如美国住宅）的 SOCKS5 代理后重试。',
+    '处理方式：Google 返回 403 拒绝 Antigravity，可能因出口地区不受支持，也可能因账号被停用；资格查询有时仍显示正常，请以实际对话为准。若为地区限制（UNSUPPORTED_REGION），请在「代理」页更换支持地区（如美国住宅）的 SOCKS5 代理；若账号被停用，请申诉或更换账号。',
   gemini_client_unsupported:
     '处理方式：Google 拒绝当前 Antigravity 客户端版本或协议标识（403 UNSUPPORTED_CLIENT），不代表账号订阅失效；请先前往「设置 → Gemini 维护」更新 CRAGGemini，再刷新账号或重新测试。',
   gemini_account_ineligible:
-    '处理方式：Google 判定该账号暂不符合 Antigravity 资格，请核对订阅/年龄限制或更换可用个人账号。',
+    '处理方式：Google 因违反服务条款已停用该账号（403 TOS_VIOLATION）。请在 Google 侧申诉或更换其他可用账号；资格查询不一定反映停用状态，请以实际对话测试确认。',
   gemini_oauth_required:
     '处理方式：OAuth 凭据已失效或被吊销（401 / invalid_grant），请在「账号」页重新完成官方 Google 授权，并确保授权浏览器与代理出口地区一致。',
   gemini_api_key_invalid:
@@ -438,9 +438,9 @@ export function geminiEligibilityNotice(
       }
     case 'location_unsupported':
       return {
-        label: 'Google 判定当前地区不支持 Antigravity（UNSUPPORTED_REGION）',
+        label: 'Google 返回 403：地区可能不受支持，或账号已被停用',
         action:
-          '请在「代理」页更换至支持地区（如美国住宅）的 SOCKS5 代理后刷新账号。',
+          '资格/拉取模型有时仍显示正常，请以实际对话为准。若为地区限制（UNSUPPORTED_REGION），请在「代理」页更换支持地区（如美国住宅）的 SOCKS5 代理后刷新；若账号被停用，请申诉或更换账号。',
         validationUrl: null,
         advisory: false,
       }
@@ -454,8 +454,9 @@ export function geminiEligibilityNotice(
       }
     case 'ineligible':
       return {
-        label: 'Google 判定当前账号暂不符合 Antigravity 使用资格',
-        action: '请检查该 Google 账号订阅状态与年龄限制，或更换可用个人账号。',
+        label: 'Google 已停用该账号（含违反服务条款）',
+        action:
+          '若上游给出 TOS_VIOLATION，请在 Google 侧申诉或更换其他可用账号；资格查询不一定反映停用状态，请以实际对话测试确认。',
         validationUrl: null,
         advisory: false,
       }

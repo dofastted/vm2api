@@ -66,7 +66,10 @@ const FAILURES = {
   gemini_operation_busy: [503, 'Gemini accounts are busy. Retry shortly.'],
   gemini_oauth_required: [503, 'The selected Gemini account needs authorization again.'],
   gemini_api_key_invalid: [503, 'The selected Gemini API key is not valid.'],
-  gemini_location_unsupported: [403, 'Google rejected this account location for Antigravity.'],
+  gemini_location_unsupported: [
+    403,
+    'Google rejected Antigravity access (403). The account may be disabled or the egress region may be unsupported; eligibility checks can still look normal—confirm with an actual conversation.',
+  ],
   gemini_account_verification_required: [
     403,
     'Google requires browser account verification before this account can use Antigravity.',
@@ -75,7 +78,10 @@ const FAILURES = {
     403,
     'Google rejected the current Antigravity client version or metadata (UNSUPPORTED_CLIENT).',
   ],
-  gemini_account_ineligible: [403, 'Google rejected this account as ineligible for Antigravity.'],
+  gemini_account_ineligible: [
+    403,
+    'Google disabled this account for a terms-of-service violation (403 TOS_VIOLATION). Appeal with Google or use a different account.',
+  ],
   gemini_proxy_error: [502, 'The bound Gemini proxy could not reach Google.'],
   gemini_quota_exhausted: [429, 'The selected Gemini account quota is exhausted.'],
   gemini_content_rejected: [

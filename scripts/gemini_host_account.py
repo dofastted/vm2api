@@ -230,6 +230,10 @@ def classify_http_error(status, payload, *, default_code="gemini_inference_faile
             eligibility = "location_unsupported"
             code = "gemini_location_unsupported"
             fallback_msg = "当前账号或代理出口地区不受支持 (403 UNSUPPORTED_REGION)"
+        elif reason == "TOS_VIOLATION":
+            eligibility = "ineligible"
+            code = "gemini_account_ineligible"
+            fallback_msg = "Google 因违反服务条款已停用该账号 (403 TOS_VIOLATION)"
         elif reason == "UNSUPPORTED_CLIENT":
             eligibility = "client_unsupported"
             code = "gemini_client_unsupported"
@@ -484,7 +488,7 @@ def project_id_of(value):
 
 
 _BLOCKING_INELIGIBLE_REASONS = frozenset(
-    {"VALIDATION_REQUIRED", "UNSUPPORTED_REGION", "UNSUPPORTED_CLIENT"}
+    {"VALIDATION_REQUIRED", "UNSUPPORTED_REGION", "UNSUPPORTED_CLIENT", "TOS_VIOLATION"}
 )
 _ONBOARD_BLOCKING_REASONS = frozenset(
     {"VALIDATION_REQUIRED", "UNSUPPORTED_REGION"}
@@ -524,6 +528,8 @@ def parse_ineligibility(assist_data):
             )
         if reason == "UNSUPPORTED_REGION":
             fallback = ("location_unsupported", None)
+        elif reason == "TOS_VIOLATION" and fallback is None:
+            fallback = ("ineligible", None)
         elif reason == "UNSUPPORTED_CLIENT" and fallback is None:
             fallback = ("client_unsupported", None)
         elif reason in _BLOCKING_INELIGIBLE_REASONS and fallback is None:

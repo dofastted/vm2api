@@ -478,6 +478,41 @@ LICENSE_ERROR_CODES = frozenset(
     }
 )
 
+_UPSTREAM_403_REASON_TOKENS = frozenset(
+    {
+        "TOS_VIOLATION",
+        "UNSUPPORTED_REGION",
+        "VALIDATION_REQUIRED",
+        "UNSUPPORTED_CLIENT",
+    }
+)
+
+
+def _payload_upstream_reason(payload):
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("upstream_reason")
+    if isinstance(raw, str) and raw.strip():
+        token = raw.strip().upper()
+        if token in _UPSTREAM_403_REASON_TOKENS:
+            return token
+        return token
+    for key in ("message", "error"):
+        val = payload.get(key)
+        if isinstance(val, str) and val:
+            upper = val.upper()
+            for token in _UPSTREAM_403_REASON_TOKENS:
+                if token in upper:
+                    return token
+    return None
+
+
+def _map_effective_403(payload, message):
+    reason = _payload_upstream_reason(payload)
+    if reason == "TOS_VIOLATION":
+        return NativeFailure("gemini_account_ineligible", 403, message)
+    return NativeFailure("gemini_location_unsupported", 403, message)
+
 
 def _map_worker_error(http_status, payload):
     code = payload.get("code") if isinstance(payload, dict) else None
@@ -528,7 +563,7 @@ def _map_worker_error(http_status, payload):
     if effective_status == 401:
         return NativeFailure("gemini_oauth_required", 401, message)
     if effective_status == 403:
-        return NativeFailure("gemini_location_unsupported", 403, message)
+        return _map_effective_403(payload, message)
     if effective_status == 404:
         return NativeFailure("gemini_model_unavailable", 404, message)
     if code == "upstream_unavailable" or effective_status == 503:

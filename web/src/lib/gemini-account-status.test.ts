@@ -346,7 +346,16 @@ describe('Gemini account presentation', () => {
       geminiInferenceErrorAction('gemini_account_verification_required')
     ).toContain('验证链接')
     expect(geminiInferenceErrorAction('gemini_location_unsupported')).toContain(
+      '实际对话'
+    )
+    expect(geminiInferenceErrorAction('gemini_location_unsupported')).toContain(
       '代理'
+    )
+    expect(geminiInferenceErrorAction('gemini_account_ineligible')).toContain(
+      '服务条款'
+    )
+    expect(geminiInferenceErrorAction('gemini_account_ineligible')).toContain(
+      '申诉'
     )
     expect(geminiInferenceErrorAction('gemini_quota_exhausted')).toContain(
       '配额'

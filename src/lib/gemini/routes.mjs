@@ -78,7 +78,7 @@ const RUN_ERRORS = {
   ],
   gemini_location_unsupported: [
     403,
-    'Google 判定当前账号或出口地区不支持 Antigravity（403 UNSUPPORTED_REGION）；拉取模型成功不代表可对话，请在「代理」页更换支持地区（如美国住宅）的代理后重试，或更换账号',
+    'Google 拒绝使用 Antigravity（403）。可能因出口地区不受支持（UNSUPPORTED_REGION），也可能因账号被停用；资格/拉取模型界面有时仍显示正常，请以实际对话测试为准。若为地区限制，请在「代理」页更换支持地区（如美国住宅）的代理后重试；若账号被停用，请申诉或更换账号',
   ],
   gemini_account_verification_required: [
     403,
@@ -90,7 +90,7 @@ const RUN_ERRORS = {
   ],
   gemini_account_ineligible: [
     403,
-    'Google 判定当前账号暂不符合 Antigravity 使用资格（403），请检查账号订阅状态、年龄限制或更换可用个人账号',
+    'Google 因违反服务条款已停用该账号（403 TOS_VIOLATION）；请在 Google 侧申诉或更换其他可用账号。资格查询不一定反映停用状态，请以实际对话为准',
   ],
   gemini_proxy_error: [
     502,
