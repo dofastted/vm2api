@@ -102,6 +102,7 @@ import { ownerScopeFromRequest } from './lib/admin/resource-owner.mjs'
 import { filterModelCatalogForKey } from './lib/admin/key-models.mjs'
 import { GroupsRepo } from './lib/db/repos/groups-repo.mjs'
 import { GeminiOwnersRepo } from './lib/db/repos/gemini-owners-repo.mjs'
+import { bootstrapSchedulerPools } from './lib/db/repos/scheduler-pools-repo.mjs'
 import { SettingsRepo } from './lib/db/repos/settings-repo.mjs'
 import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
@@ -386,6 +387,13 @@ if (vmSync.proxy_cli_repaired) {
 if (vmSync.reclaimed_vm_ids.length) {
   console.log(`[vm] reclaimed ${vmSync.reclaimed_vm_ids.length} slot(s) assigned to deleted users`)
 }
+// Idempotent Leader-only backfill of legacy vm_pools -> scheduler_pools (skipped under KIN_STANDBY=1 until SIGUSR2).
+runAtActivation('scheduler-pools-bootstrap', () => {
+  const res = bootstrapSchedulerPools({ db: getDb(), isStandby: !standbyActive })
+  if (res.pools || res.members || res.bindings || res.apiKeysUpdated) {
+    console.log('[db] scheduler pools bootstrapped:', JSON.stringify(res))
+  }
+})
 
 // --- P3 sticky + quota ---
 
