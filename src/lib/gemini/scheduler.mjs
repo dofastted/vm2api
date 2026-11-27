@@ -621,6 +621,13 @@ export function createGeminiScheduler({
     return null
   }
 
+  function clearToolContinuation(callIds) {
+    if (!Array.isArray(callIds)) return
+    for (const cid of callIds) {
+      if (typeof cid === 'string' && cid) toolContinuationBindings.delete(cid)
+    }
+  }
+
   function recordToolContinuation(
     accountId,
     collected,
@@ -1557,6 +1564,7 @@ export function createGeminiScheduler({
                 outboundConversationId = restartResumeConvId
               } else if (
                 continuationBinding &&
+                !sessionConflictRetried &&
                 continuationBinding.accountId === id &&
                 CONV_ID.test(continuationBinding.conversationId)
               ) {
@@ -2094,14 +2102,16 @@ export function createGeminiScheduler({
               continue
             }
 
-            if (!emittedOutput && failureCode === 'gemini_session_conflict' && effectiveStickyKey) {
-              releaseStickyAccount(effectiveStickyKey)
+            if (!emittedOutput && failureCode === 'gemini_session_conflict') {
+              if (effectiveStickyKey) releaseStickyAccount(effectiveStickyKey)
+              clearToolContinuation(continuationCallIds)
             }
 
             const canSessionConflictRetry =
               !emittedOutput &&
               failureCode === 'gemini_session_conflict' &&
               !sessionConflictRetried &&
+              maxAccountSwitches > 0 &&
               attempts < maxAttempts
 
             if (canSessionConflictRetry) {
