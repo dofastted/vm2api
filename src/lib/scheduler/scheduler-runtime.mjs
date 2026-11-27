@@ -346,6 +346,15 @@ function tempUnschedulableState(vm, now = Date.now()) {
   return { active, untilMs: active ? untilMs : null, reason }
 }
 
+/** Telemetry wire values: cleared slots send `0` / `null` so Rust will not fall back to stale snapshot until. */
+function tempUnschedulableTelemetryFields(vm, now = Date.now()) {
+  const state = tempUnschedulableState(vm, now)
+  return {
+    temp_unschedulable_until_ms: state.active ? state.untilMs : 0,
+    temp_unschedulable_reason: state.active ? state.reason : null,
+  }
+}
+
 function buildAccountLookup(accountQuota) {
   const byId = new Map()
   const byVmId = new Map()
@@ -1400,8 +1409,7 @@ export class SchedulerRuntime {
       }
       if (u5 != null) update.quota_util_5h_pct = u5
       if (u7 != null) update.quota_util_7d_pct = u7
-      update.temp_unschedulable_until_ms = tempPark.untilMs
-      update.temp_unschedulable_reason = tempPark.reason
+      Object.assign(update, tempUnschedulableTelemetryFields(vm, now))
       const runtimeCaps = buildVmRuntimeCapabilities(vm, { projectRoot: this.#cfg?.paths?.project || '', routing })
       if (runtimeCaps) {
         update.runtime_capabilities = runtimeCaps

@@ -303,4 +303,44 @@ fn temp_unschedulable_early_clear_via_telemetry_null_re_admits_despite_stale_sna
         "cleared telemetry must override stale snapshot until"
     );
     assert_eq!(admitted.len(), 1);
+    assert!(rt.inner.lock().temp_park_live_authoritative);
+}
+
+#[test]
+fn temp_unschedulable_early_clear_via_zero_re_admits_despite_stale_snapshot() {
+    let until = 9_000_000u64;
+    let node = codex_node("z0", Some(until), Some("quota_5h_local"));
+    let snap = IndexedSnapshot::from_config(ConfigSnapshot {
+        config_version: 1,
+        pools: vec![pool_with(node.clone())],
+        nodes: vec![node.clone()],
+        ..Default::default()
+    });
+    let req = make_req("gpt-5.1-codex", ModelFamily::Openai);
+    let nodes: DashMap<NodeKey, Arc<NodeRuntimeState>> = DashMap::new();
+    seed_node(
+        &nodes,
+        &node.node_key,
+        NodeTelemetryUpdate {
+            node_key: node.node_key.clone(),
+            schedulable: Some(false),
+            temp_unschedulable_until_ms: Some(Some(until)),
+            temp_unschedulable_reason: Some(Some(CompactString::const_new("quota_5h_local"))),
+            ..Default::default()
+        },
+    );
+    let rt = nodes.get(&node.node_key).unwrap();
+    {
+        let mut st = rt.inner.lock();
+        st.apply_telemetry(&NodeTelemetryUpdate {
+            node_key: node.node_key.clone(),
+            schedulable: Some(true),
+            temp_unschedulable_until_ms: Some(Some(0)),
+            temp_unschedulable_reason: Some(None),
+            ..Default::default()
+        });
+    }
+    let (admitted, excluded) = filter_members(&snap, &snap.raw.pools[0], &req, &nodes, until - 1);
+    assert_eq!(excluded.len(), 0);
+    assert_eq!(admitted.len(), 1);
 }

@@ -203,11 +203,20 @@ pub fn filter_members<'a>(
                 });
                 continue;
             }
-            if let Some(detail) = temp_park_detail_live(
-                st.temp_unschedulable_until_ms,
-                st.temp_unschedulable_reason.as_deref(),
-                now_ms,
-            ) {
+            let park_until = if st.temp_park_live_authoritative {
+                st.temp_unschedulable_until_ms
+            } else {
+                st.temp_unschedulable_until_ms
+                    .or(node.temp_unschedulable_until_ms)
+            };
+            let park_reason = if st.temp_park_live_authoritative {
+                st.temp_unschedulable_reason.as_deref()
+            } else {
+                st.temp_unschedulable_reason
+                    .as_deref()
+                    .or(node.temp_unschedulable_reason.as_deref())
+            };
+            if let Some(detail) = temp_park_detail_live(park_until, park_reason, now_ms) {
                 excluded.push(ExcludedEntry {
                     pool_id: pool.id.clone(),
                     node: node.node_key.clone(),

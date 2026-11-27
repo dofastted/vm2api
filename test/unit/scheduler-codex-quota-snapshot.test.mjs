@@ -85,10 +85,10 @@ test('buildTelemetryBatch marks parked codex schedulable=false and exports temp 
   const ok = batch.find((u) => u.node_key === 'codex_vm:codex-a')
   assert.ok(ok)
   assert.equal(ok.schedulable, true)
-  assert.equal(ok.temp_unschedulable_until_ms, null)
+  assert.equal(ok.temp_unschedulable_until_ms, 0)
 })
 
-test('buildTelemetryBatch after manual restriction clear sends null temp fields for Rust clear', () => {
+test('buildTelemetryBatch after manual restriction clear sends until=0 for Rust clear (no snapshot fallback)', () => {
   const now = Date.now()
   const cleared = {
     id: 'codex-cleared',
@@ -101,23 +101,31 @@ test('buildTelemetryBatch after manual restriction clear sends null temp fields 
   const update = runtime.buildTelemetryBatch({ now }).find((u) => u.node_key === 'codex_vm:codex-cleared')
   assert.ok(update)
   assert.equal(update.schedulable, true)
-  assert.equal(update.temp_unschedulable_until_ms, null)
+  assert.equal(update.temp_unschedulable_until_ms, 0)
   assert.equal(update.temp_unschedulable_reason, null)
 })
 
-test('buildTelemetryBatch documents early clear: parked then VM fields removed yields schedulable + null', () => {
+test('cleared VM with stale snapshot-style fields absent still emits until=0 every batch', () => {
   const now = Date.now()
-  const wasParkedNowClear = {
+  const clearedAfterPark = {
     id: 'codex-early-clear',
     platform: 'openai',
     status: 'running',
     has_token: true,
     schedulable: true,
   }
-  const { runtime } = makeRuntime({ vms: [wasParkedNowClear] })
+  const { runtime, vms } = makeRuntime({ vms: [clearedAfterPark] })
+  const snap = runtime.buildConfigSnapshot()
+  assert.equal(snap.nodes[0].temp_unschedulable_until_ms, undefined)
+  vms[0].temp_unschedulable_until = new Date(now + 600_000).toISOString()
+  vms[0].temp_unschedulable_reason = 'quota_5h_local'
+  const snapStale = runtime.buildConfigSnapshot()
+  assert.ok(snapStale.nodes[0].temp_unschedulable_until_ms > now)
+  delete vms[0].temp_unschedulable_until
+  delete vms[0].temp_unschedulable_reason
+  delete vms[0].claude
   const update = runtime.buildTelemetryBatch({ now }).find((u) => u.node_key === 'codex_vm:codex-early-clear')
-  assert.ok(update)
   assert.equal(update.schedulable, true)
-  assert.equal(update.temp_unschedulable_until_ms, null)
+  assert.equal(update.temp_unschedulable_until_ms, 0)
   assert.equal(update.temp_unschedulable_reason, null)
 })

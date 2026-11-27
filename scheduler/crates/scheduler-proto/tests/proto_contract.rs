@@ -216,6 +216,11 @@ fn telemetry_temp_fields_json_null_means_clear_not_missing() {
     let partial: NodeTelemetryUpdate =
         serde_json::from_str(r#"{"node_key":"codex_vm:vm1","schedulable":true}"#).unwrap();
     assert_eq!(partial.temp_unschedulable_until_ms, None);
+
+    let zero: NodeTelemetryUpdate =
+        serde_json::from_str(r#"{"node_key":"codex_vm:vm1","temp_unschedulable_until_ms":0}"#)
+            .unwrap();
+    assert_eq!(zero.temp_unschedulable_until_ms, Some(Some(0)));
 }
 
 #[test]

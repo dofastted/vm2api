@@ -25,6 +25,8 @@ pub struct NodeMutable {
     pub crag_license_ok: bool,
     pub temp_unschedulable_until_ms: Option<u64>,
     pub temp_unschedulable_reason: Option<CompactString>,
+    /// Set after any telemetry update to `temp_unschedulable_until_ms` (park, clear, or `0`).
+    pub temp_park_live_authoritative: bool,
     pub external_in_flight: u32,
     pub runtime_capabilities: BTreeMap<String, bool>,
 
@@ -60,6 +62,7 @@ impl Default for NodeMutable {
             crag_license_ok: true,
             temp_unschedulable_until_ms: None,
             temp_unschedulable_reason: None,
+            temp_park_live_authoritative: false,
             external_in_flight: 0,
             runtime_capabilities: BTreeMap::new(),
             in_flight: 0,
@@ -129,18 +132,23 @@ impl NodeMutable {
             self.crag_license_ok = v;
         }
         if let Some(v) = &upd.temp_unschedulable_until_ms {
-            if v.is_none() && self.temp_unschedulable_until_ms.is_some() {
+            self.temp_park_live_authoritative = true;
+            let normalized = match v {
+                None | Some(0) => None,
+                Some(until) => Some(*until),
+            };
+            if normalized.is_none() && self.temp_unschedulable_until_ms.is_some() {
                 became_freer = true;
-            } else if let Some(until) = v {
+            } else if let Some(until) = normalized {
                 if self
                     .temp_unschedulable_until_ms
-                    .map(|prev| prev > *until)
+                    .map(|prev| prev > until)
                     .unwrap_or(false)
                 {
                     became_freer = true;
                 }
             }
-            self.temp_unschedulable_until_ms = *v;
+            self.temp_unschedulable_until_ms = normalized;
         }
         if let Some(v) = &upd.temp_unschedulable_reason {
             if v.is_none() && self.temp_unschedulable_reason.is_some() {
