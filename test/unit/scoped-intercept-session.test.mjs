@@ -1,15 +1,3 @@
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'
-
-function createM3HandleProtocol(deps) {
-  return createHandleProtocol(withM3SchedulerDeps(deps))
-}
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
@@ -19,8 +7,18 @@ import test from 'node:test'
 import http from 'node:http'
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { VmPoolsRepo } from '../../src/lib/db/repos/vm-pools-repo.mjs'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import {
+  createM3FailoverRunner,
+  createM3PoolScheduler,
+  m3FailoverRunnerFacade,
+  seedAnthropicVmJson,
+  withM3SchedulerDeps,
+} from '../fixtures/scheduler-runtime-mock.mjs'
+
+function createM3HandleProtocol(deps) {
+  return createHandleProtocol(withM3SchedulerDeps(deps))
+}
 
 for (const { scope = {}, blocked, downgrade, denied } of [
   { scope: { account_platform_plans: ['claude:max'] }, blocked: false },
@@ -44,8 +42,7 @@ for (const { scope = {}, blocked, downgrade, denied } of [
       const pools = new VmPoolsRepo(db)
       poolId = pools.insert({ name: 'limited' }).id
       pools.setMembers(poolId, [vm.id])
-      fs.mkdirSync(path.join(root, 'vms'))
-      fs.writeFileSync(path.join(root, 'vms', `${vm.id}.json`), JSON.stringify(vm))
+      seedAnthropicVmJson(root, vm, { accountId: vm.id })
       const audit = http.createServer((_req, res) => res.end(JSON.stringify({ answers: { safety: { noul: 0.6 } } })))
       await new Promise((resolve) => audit.listen(0, '127.0.0.1', resolve))
       auditUrl = `http://127.0.0.1:${audit.address().port}`
@@ -54,22 +51,22 @@ for (const { scope = {}, blocked, downgrade, denied } of [
         await new Promise((resolve) => audit.close(resolve))
       })
     }
-    const runner = new FailoverRunner({
-      scheduler: {
-        async selectAndReserve({ keyScope }) {
-          assert.equal(denied, downgrade ? false : undefined)
-          if (downgrade) {
-            assert.equal(keyScope.vm_pool_id, poolId)
-            assert.deepEqual(keyScope.allowed_vms, [vm.id])
-          }
-          return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
-        },
-        markSuccess() {},
-        markCooldown() {},
-        releaseAccountSessions() {},
-      },
+    if (!downgrade) seedAnthropicVmJson(root, vm, { accountId: vm.id })
+    const exec = { vmId: vm.id, vm, homeDir: root, projectRoot: root }
+    const pool = createM3PoolScheduler(root)
+    const nativeReserve = pool.selectAndReserve.bind(pool)
+    pool.selectAndReserve = async (args = {}) => {
+      if (downgrade) {
+        assert.equal(denied, false)
+        assert.equal(args.keyScope?.vm_pool_id, poolId)
+        assert.deepEqual(args.keyScope?.allowed_vms, [vm.id])
+      }
+      return nativeReserve(args)
+    }
+    const runner = createM3FailoverRunner(root, {
+      scheduler: pool,
       config: { max_same_account_retries: 0, total_retry_deadline_ms: 100 },
-      schedulerRuntime: makeStubSchedulerRuntime(),
+      execFactory: () => exec,
     })
     const attempts = []
     const logs = []
@@ -106,9 +103,9 @@ for (const { scope = {}, blocked, downgrade, denied } of [
       routingConfigPath: routingFile,
       routingConfig: routing,
       groupsRepo: { rateMultiplier: () => 1 },
-      failoverRunner: {
-        run(opts) {
-          return runner.run({
+      failoverRunner: m3FailoverRunnerFacade(runner, {
+        runWrap: (fr, opts) =>
+          fr.run({
             ...opts,
             callAttempt({ body, meta }) {
               attempts.push({ body, meta })
@@ -127,9 +124,8 @@ for (const { scope = {}, blocked, downgrade, denied } of [
                 },
               }
             },
-          })
-        },
-      },
+          }),
+      }),
     })
     const req = Object.assign(new EventEmitter(), {
       method: 'POST',

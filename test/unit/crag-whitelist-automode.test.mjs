@@ -3,7 +3,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import {
+  createM3FailoverRunner,
+  m3FailoverRunnerFacade,
+  seedAnthropicVmJson,
+  withM3SchedulerDeps,
+} from '../fixtures/scheduler-runtime-mock.mjs'
 import { validateCacheBreakpoints } from '../../src/lib/protocol/cache-ttl.mjs'
 import { withRequestProtocolBetas } from '../../src/lib/protocol/claude-code-betas.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../../src/lib/protocol/convert.mjs'
@@ -849,17 +854,10 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
       workerStatus: health,
     }
     rememberRustHealth(exec, { ok: true, health })
-    const runner = new FailoverRunner({
-      scheduler: {
-        async selectAndReserve() {
-          return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec, release() {} }
-        },
-        markSuccess() {},
-        markCooldown() {},
-        releaseAccountSessions() {},
-      },
-      config: { max_same_account_retries: 0 },
-      schedulerRuntime: makeStubSchedulerRuntime(),
+    seedAnthropicVmJson(root, vm, { accountId: vm.id })
+    const runner = createM3FailoverRunner(root, {
+      config: { max_same_account_retries: 0, fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
+      execFactory: () => exec,
     })
     const logs = []
     const finishListeners = []
@@ -907,9 +905,9 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
       routingConfigPath: routingFile,
       routingConfig: routing,
       groupsRepo: { rateMultiplier: () => 1 },
-      failoverRunner: {
-        run(opts) {
-          return runner.run({
+      failoverRunner: m3FailoverRunnerFacade(runner, {
+        runWrap: (fr, opts) =>
+          fr.run({
             ...opts,
             callAttempt({ body, attemptMeta }) {
               sent.push({ body: structuredClone(body), meta: attemptMeta })
@@ -928,9 +926,8 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
                 },
               }
             },
-          })
-        },
-      },
+          }),
+      }),
     })
     await handler.handleProtocol(
       {
@@ -1046,12 +1043,3 @@ test('Claude VM / CRAG fails closed with 400 unsupported_capability on service_t
     (err) => err.status === 400 && err.code === 'invalid_kernel_request',
   )
 })
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

@@ -6,7 +6,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { formatNodeKey } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+import { invalidateReadCache } from '../../src/lib/vm/vm-file.mjs'
 import { CRS_OFFICIAL_AGENT_PROMPT, CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
 import { OFFICIAL_303_HARNESS } from '../../src/lib/identity/official-profiles.mjs'
 import { sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
@@ -19,6 +20,8 @@ import {
 } from '../../src/lib/pool/api-protocol.mjs'
 import { createClaudeMessageAssembler, applyClaudeSSELineToMessage } from '../../src/lib/protocol/convert.mjs'
 import {
+  createM3FailoverRunner,
+  createM3PoolScheduler,
   withM3SchedulerDeps,
   makeStubSchedulerRuntime,
   makePoolStubRuntimeForProject,
@@ -537,8 +540,9 @@ for (const previousVm of [null, 'vm-01']) {
     fs.writeFileSync(routingFile, JSON.stringify({ compatibility: {} }))
     fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
     for (const id of ['vm-01', 'vm-02']) {
+      const vmRecordPath = path.join(root, 'vms', `${id}.json`)
       fs.writeFileSync(
-        path.join(root, 'vms', `${id}.json`),
+        vmRecordPath,
         JSON.stringify({
           id,
           platform: 'anthropic',
@@ -547,6 +551,7 @@ for (const previousVm of [null, 'vm-01']) {
           claude: { account_uuid: 'account-1', access_token: 'at', refresh_token: 'rt' },
         }),
       )
+      invalidateReadCache(vmRecordPath)
     }
     const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
     const key = sticky.canonicalSessionKey('queued-caller')
@@ -561,15 +566,15 @@ for (const previousVm of [null, 'vm-01']) {
       vm,
       exec: { vmId: vm.id, vm, homeDir: path.join(root, 'home'), oauth: { account_uuid: 'account-1' } },
     }
-    const poolRt = makePoolStubRuntimeForProject(root)
-    const runner = new FailoverRunner({
-      scheduler: {
-        projectRoot: root,
-        selectAndReserve: async () => selected,
-        markSuccess() {},
-      },
+    const pool = createM3PoolScheduler(root, { stickyRouter: sticky })
+    const nativeAcquire = pool.schedulerRuntime.acquireNode.bind(pool.schedulerRuntime)
+    pool.schedulerRuntime.acquireNode = async (params, opts) =>
+      nativeAcquire({ ...params, pinNodeKey: formatNodeKey('claude_vm', vm.id) }, opts)
+    pool.executionContext = () => selected.exec
+    const runner = createM3FailoverRunner(root, {
+      scheduler: pool,
       stickyRouter: sticky,
-      schedulerRuntime: poolRt,
+      config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
     })
     let releaseFirst
     let enteredFirst
@@ -629,6 +634,7 @@ for (const previousVm of [null, 'vm-01']) {
       routingConfig: { compatibility: {}, failover: {} },
       groupsRepo: { rateMultiplier: () => 1 },
       failoverRunner: {
+        getSchedulerRuntime: (override) => runner.getSchedulerRuntime(override),
         async run(opts) {
           const index = ++runs
           if (index === 2) enteredSecond()
@@ -1766,4 +1772,3 @@ unixTest('API OpenAI flushes buffered metadata with the first real output', asyn
   assert.match(run.wire, /response\.output_text\.delta/)
   assert.match(run.wire, /response\.completed/)
 })
-

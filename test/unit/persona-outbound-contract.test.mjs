@@ -5,7 +5,6 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { DEFAULT_PERSONA_TEMPLATES } from '../../src/lib/identity/persona-template.mjs'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import {
   clearConversationCacheTtls,
   fillMissingCacheTtl,
@@ -15,7 +14,12 @@ import {
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { OFFICIAL_CLAUDE_CLI_UA } from '../../src/lib/identity/vm-identity.mjs'
 import { clearCachePrefixSessions } from '../../src/lib/protocol/cache-prefix.mjs'
-import { withM3SchedulerDeps, makeStubSchedulerRuntime } from '../fixtures/scheduler-runtime-mock.mjs'
+import {
+  createM3FailoverRunner,
+  m3FailoverRunnerFacade,
+  seedAnthropicVmJson,
+  withM3SchedulerDeps,
+} from '../fixtures/scheduler-runtime-mock.mjs'
 
 function createM3HandleProtocol(deps) {
   return createHandleProtocol(withM3SchedulerDeps(deps))
@@ -88,20 +92,15 @@ async function outbound(
     })
     t.after(() => new Promise((resolve) => kernel.close(resolve)))
   }
-  const vm = { id: 'fixture-slot', persona_preset: preset, official_cc_inference: 'cli-hop' }
-  const runner = new FailoverRunner({
-
-    scheduler: {
-      async selectAndReserve() {
-        return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
-      },
-      markSuccess() {},
-      markCooldown() {},
-      releaseAccountSessions() {},
-    },
-    config: { max_same_account_retries: 0 },
-  schedulerRuntime: makeStubSchedulerRuntime()
-})
+  seedAnthropicVmJson(
+    root,
+    { id: 'fixture', persona_preset: preset, official_cc_inference: 'cli-hop' },
+    { accountId: 'fixture' },
+  )
+  const runner = createM3FailoverRunner(root, {
+    config: { max_same_account_retries: 0, fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
+    execFactory: (vm) => ({ vmId: vm.id, vm, homeDir: root, projectRoot: root }),
+  })
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
   const handler = createM3HandleProtocol({
     json(_res, status, body) {
@@ -136,17 +135,16 @@ async function outbound(
     routingConfigPath: routingFile,
     routingConfig: routing,
     groupsRepo: { rateMultiplier: () => 1 },
-    failoverRunner: {
-      run(opts) {
-        return runner.run({
+    failoverRunner: m3FailoverRunnerFacade(runner, {
+      runWrap: (fr, opts) =>
+        fr.run({
           ...opts,
           callAttempt({ body }) {
             sent.push(structuredClone(body))
             return { ok: true, status: 200, terminalState: 'verified', body: structuredClone(message) }
           },
-        })
-      },
-    },
+        }),
+    }),
   })
   const url = { 'anthropic.messages': '/v1/messages', 'openai.chat': '/v1/chat/completions' }[protocol]
   await handler.handleProtocol(

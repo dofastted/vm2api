@@ -5,8 +5,15 @@ import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { formatNodeKey } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
 import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
+import {
+  createM3FailoverRunner,
+  createM3PoolScheduler,
+  seedAnthropicVmJson,
+  withM3SchedulerDeps,
+} from '../fixtures/scheduler-runtime-mock.mjs'
 
 function createM3HandleProtocol(deps) {
   return createHandleProtocol(withM3SchedulerDeps(deps))
@@ -129,6 +136,7 @@ async function invoke(handler, res, extraHeaders = {}) {
 
 async function activeAttemptFailure({ block, delta, clusterDisconnect = false }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-active-keepalive-'))
+  seedEncryptedPackage(root)
   const socketPath = path.join(root, 'kernel.sock')
   const tokenPath = path.join(root, 'internal.token')
   fs.writeFileSync(tokenPath, 'offline-active-keepalive-token')
@@ -223,35 +231,70 @@ async function activeAttemptFailure({ block, delta, clusterDisconnect = false })
     }
   })
   const released = []
-  const runner = new FailoverRunner({
-    scheduler: {
-      async selectAndReserve({ excluded, avoid }) {
-        const selected = candidates.find(
-          (candidate) =>
-            !excluded.has(candidate.accountId) &&
-            !excluded.has(candidate.vmId) &&
-            !avoid?.has(candidate.accountId) &&
-            !avoid?.has(candidate.vmId),
-        )
-        return selected
-          ? { ...selected, ok: true, release: () => released.push(selected.accountId) }
-          : { ok: false, reason: 'no_eligible_accounts' }
-      },
-      markCooldown() {},
-      markSuccess() {},
-    },
+  for (const candidate of candidates) {
+    seedAnthropicVmJson(root, candidate.exec.vm, { accountId: candidate.accountId })
+    activateFixture(root, candidate.exec.vm)
+  }
+  const pool = createM3PoolScheduler(root)
+  const nativeAcquire = pool.schedulerRuntime.acquireNode.bind(pool.schedulerRuntime)
+  pool.schedulerRuntime.acquireNode = async (params, opts) => {
+    const excluded = new Set(params.excludeNodes || [])
+    const selected = candidates.find((candidate) => {
+      const key = formatNodeKey('claude_vm', candidate.vmId)
+      return !excluded.has(key) && !excluded.has(candidate.accountId) && !excluded.has(candidate.vmId)
+    })
+    if (!selected) {
+      throw new SchedulerApiError({ status: 429, code: 'pool_exhausted', message: 'no eligible accounts' })
+    }
+    return nativeAcquire({ ...params, pinNodeKey: formatNodeKey('claude_vm', selected.vmId) }, opts)
+  }
+  const nativeExec = pool.executionContext.bind(pool)
+  pool.executionContext = (vm, accountId) => {
+    const candidate = candidates.find((item) => item.vmId === vm.id)
+    if (candidate) {
+      return {
+        ...candidate.exec,
+        vm: { ...candidate.exec.vm, ...vm },
+        accountId: candidate.accountId,
+        vmId: candidate.vmId,
+      }
+    }
+    return nativeExec(vm, accountId)
+  }
+  const runner = createM3FailoverRunner(root, {
+    scheduler: pool,
     config: {
       max_same_account_retries: 0,
       max_account_switches: 1,
       max_total_attempts: 2,
       total_retry_deadline_ms: 4000,
+      fallback_wait_timeout_ms: 5,
+      sticky_wait_timeout_ms: 5,
     },
-    schedulerRuntime: makeStubSchedulerRuntime(),
+    execFactory: (vm) => pool.executionContext(vm, vm.id),
   })
+  const origSelect = pool.selectAndReserve.bind(pool)
+  pool.selectAndReserve = async (args) => {
+    const picked = await origSelect(args)
+    if (picked?.ok && typeof picked.release === 'function') {
+      const accountId = picked.accountId
+      const prior = picked.release
+      picked.release = (...releaseArgs) => {
+        released.push(accountId)
+        return prior(...releaseArgs)
+      }
+    }
+    return picked
+  }
   let result
   const handler = createHandler({
     root,
-    routing: { compatibility: {}, failover: { stream_keepalive_ms: 20, queue_keepalive_delay_ms: 60_000 } },
+    routing: {
+      sticky: { outbound_session: 'passthrough' },
+      inference: { engine: 'rust', dataplane: 'crag', crag_kernel_version: 'v2' },
+      compatibility: {},
+      failover: { stream_keepalive_ms: 20, queue_keepalive_delay_ms: 60_000 },
+    },
     run: async (opts) => {
       result = await runner.run({
         ...opts,
@@ -741,12 +784,3 @@ test('SSE stream preserves deltas containing literal response_headers and multi-
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

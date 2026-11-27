@@ -1,8 +1,11 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { mapUpstreamError } from '../../src/lib/core/errors.mjs'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createM3FailoverRunner, seedAnthropicVmJson } from '../fixtures/scheduler-runtime-mock.mjs'
 import { classifyUpstreamResult, repairAnthropicRequest } from '../../src/lib/pool/upstream-error-policy.mjs'
 import { prepareAnthropicRequest } from '../../src/lib/protocol/anthropic-policy.mjs'
 import { applyMinMaxTokens } from '../../src/lib/protocol/min-max-tokens.mjs'
@@ -38,33 +41,13 @@ function makeHaikuAdaptiveRequest(maxTokens, extra = {}) {
   }
 }
 
-function makeCandidate(id = '1') {
-  return {
-    ok: true,
-    accountId: `account-${id}`,
-    vmId: `vm-${id}`,
-    selectionReason: 'round_robin',
-    waitMs: 0,
-    queueWaitMs: 0,
-    schedulingMs: 0,
-    exec: { homeDir: '' },
-    release() {},
-  }
-}
-
-function makeTestScheduler(candidates) {
-  const cooldowns = []
-  return {
-    cooldowns,
-    async selectAndReserve() {
-      return candidates[0]
-    },
-    markSuccess() {},
-    markCooldown(candidate, opts) {
-      cooldowns.push({ candidate, opts })
-    },
-    releaseAccountSessions() {},
-  }
+function haikuRunnerRoot(t, id = '1') {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'haiku-failover-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const vmId = `vm-${id}`
+  const accountId = `account-${id}`
+  seedAnthropicVmJson(root, { id: vmId }, { accountId })
+  return { root, vmId, accountId }
 }
 
 test('adaptive retry on Haiku 4.5 bounds platform budget_tokens below caller max_tokens (2048, 4096, 4097, 8192)', () => {
@@ -159,18 +142,17 @@ test('adaptive conversion on Haiku 4.5 rejects max_tokens <= 1024 instead of gen
   }
 })
 
-test('FailoverRunner stops cleanly without a second hop when Haiku adaptive retry has max_tokens = 1024', async () => {
-  const scheduler = makeTestScheduler([makeCandidate('1')])
+test('FailoverRunner stops cleanly without a second hop when Haiku adaptive retry has max_tokens = 1024', async (t) => {
+  const { root } = haikuRunnerRoot(t, '1')
   const attempts = []
-  const runner = new FailoverRunner({
-    scheduler,
+  const runner = createM3FailoverRunner(root, {
+    execFactory: () => ({ homeDir: '' }),
     attemptsRepo: {
       begin() {},
       complete(_reqId, attemptNo, row) {
         attempts.push({ attemptNo, ...row })
       },
     },
-    schedulerRuntime: makeStubSchedulerRuntime(),
   })
   const input = applyMinMaxTokens(makeHaikuAdaptiveRequest(1024), {})
   const hops = []
@@ -198,7 +180,6 @@ test('FailoverRunner stops cleanly without a second hop when Haiku adaptive retr
   assert.equal(result.body.error.param, 'max_tokens')
   assert.equal(result.body.error.details.retryable, false)
   assert.match(result.body.error.message, /1024/)
-  assert.deepEqual(scheduler.cooldowns, [])
   assert.equal(attempts.length, 1)
   assert.equal(attempts[0].action, 'stop')
   assert.equal(attempts[0].errorScope, 'request')
@@ -210,17 +191,14 @@ test('FailoverRunner stops cleanly without a second hop when Haiku adaptive retr
   assert.equal(mapped.body.error.details.retryable, false)
 })
 
-test('FailoverRunner repairs and retries Haiku adaptive thinking with valid bounded budgets for max_tokens = 2048, 4096, 4097', async () => {
+test('FailoverRunner repairs and retries Haiku adaptive thinking with valid bounded budgets for max_tokens = 2048, 4096, 4097', async (t) => {
+  const { root } = haikuRunnerRoot(t, '1')
   for (const [maxTokens, expectedBudget] of [
     [2048, 1024],
     [4096, 2048],
     [4097, 2048],
   ]) {
-    const scheduler = makeTestScheduler([makeCandidate('1')])
-    const runner = new FailoverRunner({
-      scheduler,
-      schedulerRuntime: makeStubSchedulerRuntime(),
-    })
+    const runner = createM3FailoverRunner(root, { execFactory: () => ({ homeDir: '' }) })
     const input = applyMinMaxTokens(makeHaikuAdaptiveRequest(maxTokens, { output_config: { effort: 'medium' } }), {})
     const hops = []
     const result = await runner.run({
@@ -264,7 +242,6 @@ test('FailoverRunner repairs and retries Haiku adaptive thinking with valid boun
     assert.equal(hops[1].thinking.type, 'enabled')
     assert.equal(hops[1].thinking.budget_tokens, expectedBudget)
     assert.equal(hops[1].max_tokens, maxTokens)
-    assert.deepEqual(scheduler.cooldowns, [])
   }
 })
 
@@ -293,12 +270,3 @@ test('explicit caller budget_tokens and initial cli-hop passthrough remain uncha
   assert.equal(cliHopInitial.thinking.type, 'adaptive')
   assert.equal(cliHopInitial.max_tokens, 1024)
 })
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

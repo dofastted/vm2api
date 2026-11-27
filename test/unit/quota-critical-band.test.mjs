@@ -5,8 +5,13 @@ import os from 'node:os'
 import path from 'node:path'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { officialMessagesBody } from '../../src/lib/protocol/anthropic-messages.mjs'
-import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { PoolScheduler, accountIdOf } from '../../src/lib/pool/pool-scheduler.mjs'
+import { createM3FailoverRunner, makePoolStubRuntimeForProject } from '../fixtures/scheduler-runtime-mock.mjs'
+import { formatNodeKey } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+import { listVms } from '../../src/lib/vm/vm-registry.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
+import { invalidateReadCache } from '../../src/lib/vm/vm-file.mjs'
+import { getVm } from '../../src/lib/vm/vm-registry.mjs'
 import {
   estimatePromptTokens,
   estimateRequestRisk,
@@ -204,7 +209,9 @@ function schedulerProject() {
         expires_at: Math.floor(Date.now() / 1000) + 3600,
       },
     }
-    fs.writeFileSync(path.join(vms, `${id}.json`), JSON.stringify(vm))
+    const vmRecordPath = path.join(vms, `${id}.json`)
+    fs.writeFileSync(vmRecordPath, JSON.stringify({ ...vm, platform: 'anthropic' }))
+    invalidateReadCache(vmRecordPath)
   }
   write('vm-01', 'account-1')
   write('vm-02', 'account-2')
@@ -242,6 +249,40 @@ class RuntimeRepo {
   }
 }
 
+/** M3 acquire is quota-blind in the stub; emulate rust quota pick for these integration tests. */
+function attachQuotaAwareAcquire(pool, accountQuota, { requestRisk = largeColdRisk } = {}) {
+  const rt = pool.schedulerRuntime
+  const base = rt.acquireNode.bind(rt)
+  rt.acquireNode = async (params, opts) => {
+    const excluded = new Set(params.excludeNodes || [])
+    const vms = listVms(pool.projectRoot).filter((vm) => vm?.schedulable !== false)
+    const scored = []
+    for (const vm of vms) {
+      const key = formatNodeKey('claude_vm', vm.id)
+      if (excluded.has(key)) continue
+      const record = getVm(pool.projectRoot, vm.id)
+      const accountId = accountIdOf(record, pool.projectRoot)
+      const accept = accountQuota.canAccept(accountId, { requestRisk })
+      if (!accept.ok) continue
+      const snap = accountQuota.repo?.get?.(accountId)
+      const u5 = Number(snap?.unified?.['5h']?.utilization)
+      scored.push({ vm, key, accountId, u5: Number.isFinite(u5) ? u5 : 1 })
+    }
+    if (!scored.length) {
+      const probe = accountQuota.canAccept('account-1', { requestRisk })
+      throw new SchedulerApiError({
+        status: 429,
+        code: probe.reason || 'quota_guard_request_too_large',
+        message: 'quota guard',
+      })
+    }
+    scored.sort((a, b) => a.u5 - b.u5)
+    const pick = scored[0]
+    const allowed = vms.map((vm) => formatNodeKey('claude_vm', vm.id))
+    return base({ ...params, allowedNodeKeys: allowed, pinNodeKey: pick.key }, opts)
+  }
+}
+
 test('scheduler switches using requestRisk on the quotaRequest body estimate', async (t) => {
   const root = schedulerProject()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -258,8 +299,9 @@ test('scheduler switches using requestRisk on the quotaRequest body estimate', a
     accountQuota,
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
-    schedulerRuntime: makeStubSchedulerRuntime(),
+    schedulerRuntime: makePoolStubRuntimeForProject(root),
   })
+  attachQuotaAwareAcquire(pool, accountQuota)
   const selected = await pool.selectAndReserve({
     model: 'claude-sonnet-4-5',
     allowWait: false,
@@ -284,8 +326,9 @@ test('all in-band accounts yield quota_guard_request_too_large', async (t) => {
     accountQuota,
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
-    schedulerRuntime: makeStubSchedulerRuntime(),
+    schedulerRuntime: makePoolStubRuntimeForProject(root),
   })
+  attachQuotaAwareAcquire(pool, accountQuota)
   const selected = await pool.selectAndReserve({
     model: 'claude-sonnet-4-5',
     allowWait: false,
@@ -293,12 +336,10 @@ test('all in-band accounts yield quota_guard_request_too_large', async (t) => {
   })
   assert.equal(selected.ok, false)
   assert.equal(selected.reason, 'quota_guard_request_too_large')
-  const runner = new FailoverRunner({
-    scheduler: {
-      selectAndReserve: async () => selected,
-    },
+  const runner = createM3FailoverRunner(root, {
+    scheduler: pool,
     config: { total_retry_deadline_ms: 50, fallback_wait_timeout_ms: 5 },
-    schedulerRuntime: makeStubSchedulerRuntime(),
+    execFactory: () => ({ homeDir: '' }),
   })
   const result = await runner.runOnce({
     requestId: 'r1',
@@ -563,12 +604,3 @@ test('admission and the panel agree near the gate (vm-10: pro, 7d 90% of a 95% l
   assert.equal(gated.accept, false)
   assert.equal(q.canAccept('vm10', { requestRisk: smallRisk }).ok, false)
 })
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

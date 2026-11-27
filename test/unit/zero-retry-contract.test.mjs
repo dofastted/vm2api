@@ -4,7 +4,13 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { formatNodeKey } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+import {
+  createM3FailoverRunner,
+  m3FailoverRunnerFacade,
+  seedAnthropicVmJson,
+  withM3SchedulerDeps,
+} from '../fixtures/scheduler-runtime-mock.mjs'
 import { validateCacheBreakpoints } from '../../src/lib/protocol/cache-ttl.mjs'
 
 function createM3HandleProtocol(deps) {
@@ -98,22 +104,32 @@ async function runCase(t, fixture, { switchAfterRepair = false, repeatWithCached
   const routingFile = path.join(root, 'routing.json')
   fs.writeFileSync(routingFile, JSON.stringify(routing))
   let selections = 0
-  const scheduler = {
-    async selectAndReserve() {
-      const alternate = switchAfterRepair && selections++ >= 2
-      const vmId = alternate ? 'vm-other' : 'vm-zero'
-      const vm = { id: vmId, persona_preset: alternate ? 'official_full' : 'zero', official_cc_inference: 'cli-hop' }
-      return { ok: true, vmId, accountId: vmId, vm, exec: { vmId, vm, homeDir: root }, release() {} }
+  seedAnthropicVmJson(
+    root,
+    { id: 'vm-zero', persona_preset: 'zero', official_cc_inference: 'cli-hop' },
+    { accountId: 'vm-zero' },
+  )
+  seedAnthropicVmJson(
+    root,
+    { id: 'vm-other', persona_preset: 'official_full', official_cc_inference: 'cli-hop' },
+    { accountId: 'vm-other' },
+  )
+  const runner = createM3FailoverRunner(root, {
+    config: {
+      signature_repair: true,
+      max_same_account_retries: 0,
+      fallback_wait_timeout_ms: 5,
+      sticky_wait_timeout_ms: 5,
     },
-    markSuccess() {},
-    markCooldown() {},
-    releaseAccountSessions() {},
-  }
-  const runner = new FailoverRunner({
-    scheduler,
-    config: { signature_repair: true, max_same_account_retries: 0 },
-    schedulerRuntime: makeStubSchedulerRuntime(),
+    execFactory: (vm) => ({ vmId: vm.id, vm, homeDir: root, projectRoot: root }),
   })
+  const rt = runner.getSchedulerRuntime()
+  const nativeAcquire = rt.acquireNode.bind(rt)
+  rt.acquireNode = async (params, opts) => {
+    const alternate = switchAfterRepair && selections++ >= 2
+    const vmId = alternate ? 'vm-other' : 'vm-zero'
+    return nativeAcquire({ ...params, pinNodeKey: formatNodeKey('claude_vm', vmId) }, opts)
+  }
   const hops = []
   const input = { model: 'claude-opus-5-5', max_tokens: 128, stream: false, system: rule, messages: fixture.messages }
   const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
@@ -146,9 +162,9 @@ async function runCase(t, fixture, { switchAfterRepair = false, repeatWithCached
     routingConfigPath: routingFile,
     routingConfig: routing,
     groupsRepo: { rateMultiplier: () => 1 },
-    failoverRunner: {
-      run(opts) {
-        return runner.run({
+    failoverRunner: m3FailoverRunnerFacade(runner, {
+      runWrap: (fr, opts) =>
+        fr.run({
           ...opts,
           callAttempt({ body, attemptMeta, candidate }) {
             hops.push({
@@ -162,9 +178,8 @@ async function runCase(t, fixture, { switchAfterRepair = false, repeatWithCached
               return { ok: false, status: 529, terminalState: 'rejected', body: { error: { message: 'Overloaded' } } }
             return structuredClone(success)
           },
-        })
-      },
-    },
+        }),
+    }),
   })
   const request = {
     method: 'POST',
@@ -204,12 +219,3 @@ test('a repaired request uses the next slot preset when failover switches accoun
   runCase(t, cases[0], { switchAfterRepair: true }))
 test('a cached search repair survives slot rendering on the next request without another retry', (t) =>
   runCase(t, cases[2], { repeatWithCachedSearchRepair: true }))
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

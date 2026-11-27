@@ -1,8 +1,16 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { QUEUE_HINT_HEADER, queueAllowedByHeaders } from '../../src/lib/protocol/queue-hint.mjs'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { CORS_ALLOW_HEADERS } from '../../src/lib/http/cors.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
+import {
+  createM3FailoverRunner,
+  createM3PoolScheduler,
+  seedAnthropicVmJson,
+} from '../fixtures/scheduler-runtime-mock.mjs'
 
 test('x-kin-queue: off and its synonyms turn the seat queue off; anything else keeps it', () => {
   for (const value of [
@@ -32,17 +40,30 @@ test('x-kin-queue: off and its synonyms turn the seat queue off; anything else k
   assert.equal(queueAllowedByHeaders(undefined), true)
 })
 
-/** Busy pool: a seat is granted only to a caller willing to wait for it. */
-class BusyScheduler {
-  calls = []
-  async selectAndReserve({ allowWait = true } = {}) {
-    this.calls.push(allowWait)
-    if (!allowWait) return { ok: false, reason: 'all_accounts_busy', eligible: 1, available: 0 }
-    return { ok: true, vmId: 'vm-01', accountId: 'account-1', selectionReason: 'balanced', waitMs: 0, release() {} }
+function busyFailoverRunner(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-queue-hint-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  seedAnthropicVmJson(root, { id: 'vm-01' }, { accountId: 'account-1' })
+  const pool = createM3PoolScheduler(root)
+  const calls = []
+  const nativeAcquire = pool.schedulerRuntime.acquireNode.bind(pool.schedulerRuntime)
+  pool.schedulerRuntime.acquireNode = async (params, opts) => {
+    calls.push(params.noQueue !== true)
+    if (params.noQueue === true) {
+      throw new SchedulerApiError({
+        status: 529,
+        code: 'pool_overloaded',
+        message: 'all accounts busy',
+        explain: { reason: 'all_accounts_busy' },
+      })
+    }
+    return nativeAcquire(params, opts)
   }
-  markCooldown() {}
-  markSuccess() {}
-  releaseAccountSessions() {}
+  const runner = createM3FailoverRunner(root, {
+    scheduler: pool,
+    execFactory: () => ({ homeDir: '', projectRoot: root }),
+  })
+  return { runner, calls }
 }
 
 function ok() {
@@ -64,12 +85,8 @@ function ok() {
 // The stub ignores stickyKey: which seat a session may take without waiting is the
 // scheduler's call (pool-scheduler.mjs fails a held sticky seat with
 // all_accounts_busy); this only pins how the runner treats that answer.
-test('allowQueue:false fails a busy pool at once with 529 and never dispatches', async () => {
-  const scheduler = new BusyScheduler()
-  const runner = new FailoverRunner({
-    scheduler,
-    schedulerRuntime: makeStubSchedulerRuntime(),
-  })
+test('allowQueue:false fails a busy pool at once with 529 and never dispatches', async (t) => {
+  const { runner, calls } = busyFailoverRunner(t)
   let dispatched = 0
   const result = await runner.run({
     requestId: 'no-queue',
@@ -82,26 +99,22 @@ test('allowQueue:false fails a busy pool at once with 529 and never dispatches',
     },
   })
   assert.equal(dispatched, 0)
-  assert.deepEqual(scheduler.calls, [false])
+  assert.deepEqual(calls, [false])
   assert.equal(result.ok, false)
   assert.equal(result.status, 529)
   assert.equal(result.body.error.code, 'pool_overloaded')
-  assert.equal(result.body.error.details.reason, 'all_accounts_busy')
+  assert.equal(result.explain?.reason, 'all_accounts_busy')
 })
 
-test('without allowQueue the runner still waits for a seat (default unchanged)', async () => {
-  const scheduler = new BusyScheduler()
-  const runner = new FailoverRunner({
-    scheduler,
-    schedulerRuntime: makeStubSchedulerRuntime(),
-  })
+test('without allowQueue the runner still waits for a seat (default unchanged)', async (t) => {
+  const { runner, calls } = busyFailoverRunner(t)
   const result = await runner.run({
     requestId: 'queue-default',
     model: 'claude-sonnet-test',
     canonicalBody: { model: 'claude-sonnet-test' },
     callAttempt: () => ok(),
   })
-  assert.deepEqual(scheduler.calls, [true])
+  assert.deepEqual(calls, [true])
   assert.equal(result.ok, true)
 })
 
@@ -112,12 +125,3 @@ test('browsers may send x-kin-queue cross-origin', () => {
       .includes(QUEUE_HINT_HEADER),
   )
 })
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

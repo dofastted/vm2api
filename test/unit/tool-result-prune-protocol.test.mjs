@@ -4,8 +4,13 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import {
+  createM3FailoverRunner,
+  m3FailoverRunnerFacade,
+  seedAnthropicVmJson,
+  withM3SchedulerDeps,
+} from '../fixtures/scheduler-runtime-mock.mjs'
 
 function createM3HandleProtocol(deps) {
   return createHandleProtocol(withM3SchedulerDeps(deps))
@@ -69,17 +74,11 @@ async function fixture(t, { enabled = true, failSeed = false } = {}) {
   const logged = []
   let sequence = 0
   const vm = { id: 'fixture-slot', official_cc_inference: 'cli-hop' }
-  const runner = new FailoverRunner({
-    scheduler: {
-      async selectAndReserve() {
-        return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec: { vmId: vm.id, vm, homeDir: root }, release() {} }
-      },
-      markSuccess() {},
-      markCooldown() {},
-      releaseAccountSessions() {},
-    },
+  seedAnthropicVmJson(root, vm, { accountId: vm.id })
+  const exec = { vmId: vm.id, vm, homeDir: root, projectRoot: root }
+  const runner = createM3FailoverRunner(root, {
     config: { max_same_account_retries: 0 },
-    schedulerRuntime: makeStubSchedulerRuntime(),
+    execFactory: () => exec,
   })
   const handler = createM3HandleProtocol({
     json(res, status, body) {
@@ -111,9 +110,9 @@ async function fixture(t, { enabled = true, failSeed = false } = {}) {
     routingConfigPath: routingFile,
     routingConfig: routing,
     groupsRepo: { rateMultiplier: () => 1 },
-    failoverRunner: {
-      run(opts) {
-        return runner.run({
+    failoverRunner: m3FailoverRunnerFacade(runner, {
+      runWrap: (fr, opts) =>
+        fr.run({
           ...opts,
           callAttempt({ body }) {
             posted.push(structuredClone(body))
@@ -139,9 +138,8 @@ async function fixture(t, { enabled = true, failSeed = false } = {}) {
               },
             }
           },
-        })
-      },
-    },
+        }),
+    }),
   })
   return {
     posted,
@@ -229,12 +227,3 @@ for (const earlyEvent of ['close', 'aborted']) {
     assert.equal(resultText(f.posted.at(-1)), ORIGINAL)
   })
 }
-
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

@@ -1,8 +1,11 @@
+import fs from 'node:fs'
+import path from 'node:path'
 import { formatNodeKey } from '../../src/lib/scheduler/scheduler-runtime.mjs'
 import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { listVms } from '../../src/lib/vm/vm-registry.mjs'
+import { invalidateReadCache } from '../../src/lib/vm/vm-file.mjs'
 
 /**
  * Generic acquire/switch/commit/release mock for unit tests that wire M3 Rust dispatch
@@ -344,4 +347,39 @@ export function createM3FailoverRunner(projectRoot, opts = {}) {
       schedulerRuntime,
     }),
   )
+}
+
+/** Write a schedulable Anthropic VM row for M3 pool stub acquire. */
+export function seedAnthropicVmJson(projectRoot, vm, { accountId = 'acc-fixture' } = {}) {
+  fs.mkdirSync(path.join(projectRoot, 'vms'), { recursive: true })
+  const vmRecordPath = path.join(projectRoot, 'vms', `${vm.id}.json`)
+  fs.writeFileSync(
+    vmRecordPath,
+    JSON.stringify({
+      ...vm,
+      platform: vm.platform || 'anthropic',
+      schedulable: vm.schedulable !== false,
+      status: vm.status || 'running',
+      claude:
+        vm.claude ||
+        ({
+          account_uuid: accountId,
+          access_token: 'at-fixture',
+          refresh_token: 'rt-fixture',
+        }),
+    }),
+  )
+  invalidateReadCache(vmRecordPath)
+  return vmRecordPath
+}
+
+/** failoverRunner deps object that forwards run() and exposes M3 runtime to handle-protocol. */
+export function m3FailoverRunnerFacade(runner, { runWrap } = {}) {
+  return {
+    run(opts) {
+      if (typeof runWrap === 'function') return runWrap(runner, opts)
+      return runner.run(opts)
+    },
+    getSchedulerRuntime: (override) => runner.getSchedulerRuntime(override),
+  }
 }
