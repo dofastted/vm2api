@@ -6,10 +6,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { CRAG_GEMINI_PRODUCT } from '../../src/lib/gemini/payload.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
-import {
-  GEMINI_SANDBOX_MESSAGES,
-  createGeminiCragSubscription,
-} from '../../src/lib/gemini/subscription.mjs'
+import { GEMINI_SANDBOX_MESSAGES, createGeminiCragSubscription } from '../../src/lib/gemini/subscription.mjs'
 
 const GEMINI_ENV_ID = 'gemini-aaaaaaaaaaaaaaaaaaaaaaaa'
 const PROXY_ID = 'proxy-aaaaaaaaaaaaaaaaaaaa'

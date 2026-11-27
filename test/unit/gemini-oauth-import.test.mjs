@@ -32,10 +32,9 @@ test('normalizeGeminiRefreshToken trims, strips trailing project suffix, and rej
 
 test('normalizeGeminiOAuthImport accepts bare refresh token and Antigravity RT export arrays', () => {
   // Bare refresh token string
-  assert.deepEqual(
-    normalizeGeminiOAuthImport('1//06BareFixtureToken_abc-123'),
-    { refresh_token: '1//06BareFixtureToken_abc-123' },
-  )
+  assert.deepEqual(normalizeGeminiOAuthImport('1//06BareFixtureToken_abc-123'), {
+    refresh_token: '1//06BareFixtureToken_abc-123',
+  })
 
   // Antigravity Manager / Antigravity2API minimal `[{ email, refresh_token }]` array
   assert.deepEqual(

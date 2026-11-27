@@ -28,12 +28,7 @@ const MAX_EXPIRY_SECONDS = 253402300800
 const MILLISECOND_THRESHOLD = 1_000_000_000_000
 const GEMINI_PROVIDERS = new Set(['gemini', 'antigravity', 'gemini-cli'])
 const SUB2API_BUNDLE_TYPES = new Set(['sub2api-data', 'sub2api-bundle'])
-const ALLOWED_OAUTH_AUTH_METHODS = new Set([
-  'consumer',
-  'personal_consumer',
-  'gcp',
-  'business_licensed_enterprise',
-])
+const ALLOWED_OAUTH_AUTH_METHODS = new Set(['consumer', 'personal_consumer', 'gcp', 'business_licensed_enterprise'])
 const WIF_PROVIDER_RE = /^[A-Za-z0-9._:/-]{1,512}$/
 const MAX_RECURSION_DEPTH = 16
 
@@ -270,12 +265,7 @@ function collectNormalizedAccounts(node, results, seen, depth = 0) {
   if (platformTag && !GEMINI_PROVIDERS.has(platformTag)) return
 
   const typeTag = normalizedTag(node.type)
-  if (
-    typeTag &&
-    !GEMINI_PROVIDERS.has(typeTag) &&
-    typeTag !== 'oauth' &&
-    !SUB2API_BUNDLE_TYPES.has(typeTag)
-  ) {
+  if (typeTag && !GEMINI_PROVIDERS.has(typeTag) && typeTag !== 'oauth' && !SUB2API_BUNDLE_TYPES.has(typeTag)) {
     return
   }
 
