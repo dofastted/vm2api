@@ -50,9 +50,17 @@ fn default_prompt_preset() -> CompactString {
     CompactString::const_new("official_full")
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+fn default_global_prompt_mode() -> SystemPromptMode {
+    SystemPromptMode::Official
+}
+
+fn default_pool_prompt_mode() -> SystemPromptMode {
+    SystemPromptMode::InheritGlobal
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GlobalPromptPolicy {
-    #[serde(default)]
+    #[serde(default = "default_global_prompt_mode")]
     pub mode: SystemPromptMode,
     #[serde(default = "default_prompt_preset")]
     pub preset: CompactString,
@@ -60,6 +68,17 @@ pub struct GlobalPromptPolicy {
     pub text: String,
     #[serde(default)]
     pub client_system_policy: ClientSystemPolicy,
+}
+
+impl Default for GlobalPromptPolicy {
+    fn default() -> Self {
+        Self {
+            mode: default_global_prompt_mode(),
+            preset: default_prompt_preset(),
+            text: String::new(),
+            client_system_policy: ClientSystemPolicy::PrependPool,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -123,7 +142,7 @@ pub struct PoolConfig {
     /// Locked D2 default: SpillImmediately.
     #[serde(default)]
     pub session_overflow_policy: SessionOverflowPolicy,
-    #[serde(default)]
+    #[serde(default = "default_pool_prompt_mode")]
     pub system_prompt_mode: SystemPromptMode,
     #[serde(default = "default_prompt_preset")]
     pub system_prompt_preset: CompactString,
@@ -166,7 +185,7 @@ impl Default for PoolConfig {
             session_ttl_seconds: default_session_ttl_seconds(),
             session_busy_wait_ms: 0,
             session_overflow_policy: SessionOverflowPolicy::SpillImmediately,
-            system_prompt_mode: SystemPromptMode::Passthrough,
+            system_prompt_mode: default_pool_prompt_mode(),
             system_prompt_preset: default_prompt_preset(),
             system_prompt_text: String::new(),
             client_system_policy: ClientSystemPolicy::PrependPool,

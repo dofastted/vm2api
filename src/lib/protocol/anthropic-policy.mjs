@@ -682,8 +682,8 @@ export function restoreToolNamesInSSELine(line, reverse = {}) {
   } catch {
     return line
   }
-  if (payload?.content_block?.type === 'tool_use' && reverse[payload.content_block.name]) {
-    payload.content_block.name = reverse[payload.content_block.name]
+  if (payload?.content_block) {
+    payload.content_block = restoreToolNameBlock(payload.content_block, reverse)
   }
   if (payload?.delta?.type === 'tool_use' && reverse[payload.delta.name]) {
     payload.delta.name = reverse[payload.delta.name]

@@ -2587,34 +2587,42 @@ export function createHandleProtocol(deps) {
       nodeProvider: platform.platform,
       isInternalCall: Boolean(requestContext || (req.apiKeyKind === 'master' && isHealthRealBypass(req.headers))),
     })
-    const poolOwnsSystemDirectly =
-      preRelocatePoolPrompt.applies && ['zero_inject', 'override', 'passthrough'].includes(preRelocatePoolPrompt.mode)
     const preRelocateBody = ctx.body
     const preRelocateCragSystem = cragSystem
-    let cragRelocated = null
-    if (
+    const shouldRelocateForAttempt = (policy, routingSnap) =>
       !apiNonAnthropic &&
       inferenceBackend !== 'api' &&
       !requestContext &&
       !officialPassthrough &&
-      !poolOwnsSystemDirectly &&
-      (!officialTraffic || hasForeignSystemBlock(ctx.body.system)) &&
-      thirdPartyRelocateEnabled(getRouting())
-    ) {
+      !(policy?.applies && ['zero_inject', 'override', 'passthrough'].includes(policy.mode)) &&
+      (!officialTraffic || hasForeignSystemBlock(preRelocateBody.system)) &&
+      thirdPartyRelocateEnabled(routingSnap)
+    let relocatedCache = null
+    const getRelocatedForAttempt = () => {
+      if (!relocatedCache) {
+        const relocated = relocateThirdPartySystem(preRelocateBody, { onlyForeign: officialTraffic === true })
+        let cragBody = null
+        if (relocated.moved && hasCragSystem) {
+          cragBody = relocateThirdPartySystem(
+            { ...preRelocateBody, system: preRelocateCragSystem },
+            { onlyForeign: officialTraffic === true },
+          ).body
+        }
+        relocatedCache = {
+          body: relocated.moved ? relocated.body : preRelocateBody,
+          cragBody,
+          moved: relocated.moved,
+        }
+      }
+      return relocatedCache
+    }
+    if (shouldRelocateForAttempt(preRelocatePoolPrompt, getRouting())) {
       // Official traffic only gets here because the gate found a positively
       // foreign block, so move just that block: the real official envelope has
       // standalone harness/boundary/guidance blocks that the greedy predicate
       // would strip along with it.
-      const relocated = relocateThirdPartySystem(ctx.body, { onlyForeign: officialTraffic === true })
+      const relocated = getRelocatedForAttempt()
       if (relocated.moved) {
-        // A CRAG hop sends cragSystem (the caller system without its <cwd>
-        // declaration) instead of personaIn.system. Relocate that projection
-        // too, or the hop would put the third-party prompt back into system.
-        if (hasCragSystem)
-          cragRelocated = relocateThirdPartySystem(
-            { ...ctx.body, system: cragSystem },
-            { onlyForeign: officialTraffic === true },
-          ).body
         ctx.body = relocated.body
       }
     }
@@ -3299,6 +3307,14 @@ export function createHandleProtocol(deps) {
             'persona_env_presets',
             effectiveCliPersona,
           )
+          const attemptPoolOwnsSystemDirectly =
+            attemptPoolPrompt.applies && ['zero_inject', 'override', 'passthrough'].includes(attemptPoolPrompt.mode)
+          const attemptNeedsRelocate = shouldRelocateForAttempt(attemptPoolPrompt, routingNow)
+          const attemptPersonaIn = attemptPoolOwnsSystemDirectly
+            ? preRelocateBody
+            : attemptNeedsRelocate
+              ? getRelocatedForAttempt().body
+              : preRelocateBody
           let hopBody = body
           if (cliHop) {
             const transportRouting = getRouting()
@@ -3328,24 +3344,42 @@ export function createHandleProtocol(deps) {
                 !requestContext &&
                 protocol === 'anthropic.messages' &&
                 cragStrictPassthroughEnabled(officialPassthrough, routingNow)
-              const preserveToolNames = deferToolNameRewrite && caps?.includes('generation_controls_v3')
+              // CRAG V4 (headless_claude_bridge_v1) removed the claude CLI MCP
+              // tool-wrapping layer while still advertising generation_controls_v3,
+              // so vm2api must rewrite third-party tool names to mcp__<name> here.
+              const preserveToolNames =
+                deferToolNameRewrite && caps?.includes('generation_controls_v3') && !headlessBridge
               const customCragTemplate =
                 headlessBridge && !officialPassthrough && !strictPassthrough
                   ? resolveCragCustomTemplate(selected.vm, routingNow, cragPersona)
                   : null
-              const attemptPoolOwnsSystemDirectly =
-                attemptPoolPrompt.applies && ['zero_inject', 'override', 'passthrough'].includes(attemptPoolPrompt.mode)
+              const customCragTemplateUsesCallerSystem =
+                customCragTemplate != null &&
+                (customCragTemplate.preset === 'zero' ||
+                  (Array.isArray(customCragTemplate.blocks) &&
+                    customCragTemplate.blocks.some(
+                      (block) =>
+                        block?.id === 'caller_system' ||
+                        /\{\{\s*(?:caller_system|caller_agent|agent_official)\s*\}\}/i.test(String(block?.text || '')),
+                    )))
               const usePreRelocate =
-                headlessBridge &&
                 !officialPassthrough &&
-                (cragPersona === 'zero' || customCragTemplate != null || attemptPoolOwnsSystemDirectly)
+                (attemptPoolOwnsSystemDirectly ||
+                  (headlessBridge && (cragPersona === 'zero' || customCragTemplateUsesCallerSystem)))
+              const attemptRelocated =
+                !strictPassthrough && !usePreRelocate && attemptNeedsRelocate ? getRelocatedForAttempt() : null
               const cragInput = strictPassthrough
                 ? personaIn
                 : usePreRelocate
                   ? hasCragSystem
                     ? { ...preRelocateBody, system: preRelocateCragSystem }
                     : preRelocateBody
-                  : cragRelocated || (hasCragSystem ? { ...personaIn, system: cragSystem } : personaIn)
+                  : attemptRelocated?.cragBody ||
+                    (attemptRelocated?.moved
+                      ? attemptRelocated.body
+                      : hasCragSystem
+                        ? { ...preRelocateBody, system: preRelocateCragSystem }
+                        : preRelocateBody)
               const reuseHistory = !officialPassthrough && !repaired && !extra.repairs?.length
               const reuseIngress =
                 reuseHistory &&
@@ -3448,11 +3482,14 @@ export function createHandleProtocol(deps) {
                 entrypoint: entrypointNow,
                 cacheTtl: requestedCacheTtl,
               })
-              if (headlessBridge && !strictPassthrough && !officialPassthrough) {
+              const poolBlocksCragEnv =
+                attemptPoolPrompt.applies && ['zero_inject', 'passthrough'].includes(attemptPoolPrompt.mode)
+              if (headlessBridge && !strictPassthrough && !officialPassthrough && !poolBlocksCragEnv) {
                 const compat = canonicalPersonaCompat(routingNow?.compatibility || {})
-                const envEnabled = presetFlagEnabled(compat, 'persona_env_presets', resolvedPersona)
-                const tzEnabled = envEnabled && presetFlagEnabled(compat, 'persona_timezone_presets', resolvedPersona)
-                const localeEnabled = envEnabled && presetFlagEnabled(compat, 'persona_locale_presets', resolvedPersona)
+                const envPreset = effectiveCliPersona
+                const envEnabled = presetFlagEnabled(compat, 'persona_env_presets', envPreset)
+                const tzEnabled = envEnabled && presetFlagEnabled(compat, 'persona_timezone_presets', envPreset)
+                const localeEnabled = envEnabled && presetFlagEnabled(compat, 'persona_locale_presets', envPreset)
                 const tz = tzEnabled ? configuredTimezone(selected.vm, {}) || configuredTimezone(identity, {}) : ''
                 const loc = localeEnabled
                   ? String(
@@ -3538,6 +3575,11 @@ export function createHandleProtocol(deps) {
                   cliHop: true,
                   cragPrint: true,
                   strictPassthrough,
+                  stripClientBeta:
+                    headlessBridge &&
+                    !strictPassthrough &&
+                    !officialPassthrough &&
+                    !(attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'passthrough'),
                   safeguardsSanitized: !strictPassthrough,
                   // CRAG replays caller thinking unfiltered; signatures this pool never
                   // issued make an "Invalid signature" 400 safe to strip and retry.
@@ -3562,9 +3604,9 @@ export function createHandleProtocol(deps) {
             // Render once from caller input with the selected slot's identity, not the pre-selection environment.
             if (!requestContext && !effectiveOfficialPassthrough) {
               if (cliPoolPassthrough) {
-                hopBody = shallowCopyBody(personaIn)
+                hopBody = shallowCopyBody(attemptPersonaIn)
               } else if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'override') {
-                const overridden = applyPoolPromptToAnthropicBody(shallowCopyBody(personaIn), attemptPoolPrompt)
+                const overridden = applyPoolPromptToAnthropicBody(shallowCopyBody(attemptPersonaIn), attemptPoolPrompt)
                 hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(overridden, 'zero'), {
                   forceConfigured: true,
                   routingFile: routingConfigPath,
@@ -3578,7 +3620,7 @@ export function createHandleProtocol(deps) {
                 })
               } else {
                 hopBody = applyCrsUnofficialPersona(
-                  prepareCliPersonaInput(shallowCopyBody(personaIn), effectiveCliPersona),
+                  prepareCliPersonaInput(shallowCopyBody(attemptPersonaIn), effectiveCliPersona),
                   {
                     forceConfigured: true,
                     routingFile: routingConfigPath,
@@ -3701,11 +3743,11 @@ export function createHandleProtocol(deps) {
               : modeOverride || resolveSlotPersonaPreset(selected.vm, routingNow)
           if (!requestContext && !effectiveHttpOfficialPassthrough) {
             if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'passthrough') {
-              hopBody = officialMessagesBody(shallowCopyBody(personaIn))
+              hopBody = officialMessagesBody(shallowCopyBody(attemptPersonaIn))
               for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
               personaHideTokens = 0
             } else if (attemptPoolPrompt.applies && attemptPoolPrompt.mode === 'override') {
-              const overridden = applyPoolPromptToAnthropicBody(shallowCopyBody(personaIn), attemptPoolPrompt)
+              const overridden = applyPoolPromptToAnthropicBody(shallowCopyBody(attemptPersonaIn), attemptPoolPrompt)
               const rewritten = repairCacheBreakpoints(
                 applyCrsUnofficialPersona(overridden, {
                   officialClient: false,
@@ -3715,7 +3757,7 @@ export function createHandleProtocol(deps) {
                   mode: 'zero',
                   headers: req.headers,
                   sessionId: attemptSessionId,
-                  model: personaIn?.model,
+                  model: attemptPersonaIn?.model,
                   cliVersion: OFFICIAL_CLI_VERSION,
                   identity,
                 }),
@@ -3729,7 +3771,7 @@ export function createHandleProtocol(deps) {
               for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
               personaHideTokens = 0
             } else {
-              let rendered = applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
+              let rendered = applyCrsUnofficialPersona(shallowCopyBody(attemptPersonaIn), {
                 officialClient: false,
                 forceConfigured: true,
                 routingFile: routingConfigPath,
@@ -3737,7 +3779,7 @@ export function createHandleProtocol(deps) {
                 mode: configuredMode,
                 headers: req.headers,
                 sessionId: attemptSessionId,
-                model: personaIn?.model,
+                model: attemptPersonaIn?.model,
                 cliVersion: OFFICIAL_CLI_VERSION,
                 identity,
               })
@@ -3753,7 +3795,7 @@ export function createHandleProtocol(deps) {
               for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
               personaHideTokens = personaUsagePassthroughFromRoutingFile(routingConfigPath, configuredMode)
                 ? 0
-                : personaHideForUnofficial(personaIn, rewritten, {
+                : personaHideForUnofficial(attemptPersonaIn, rewritten, {
                     officialClient: false,
                     mode: configuredMode,
                     hides: personaHidesUsageFromRoutingFile(routingConfigPath, configuredMode),
@@ -3825,11 +3867,19 @@ export function createHandleProtocol(deps) {
         },
         onUpstreamRisk: afterHop,
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
+          const attemptReqHeaders =
+            attemptMeta?.stripClientBeta && outboundReqHeaders && typeof outboundReqHeaders === 'object'
+              ? Object.fromEntries(
+                  Object.entries(outboundReqHeaders).filter(
+                    ([k]) => String(k || '').toLowerCase() !== 'anthropic-beta',
+                  ),
+                )
+              : outboundReqHeaders
           if (!clientStream) {
             return streamAndAssembleClaudeMessage({
               candidate,
               body,
-              reqHeaders: outboundReqHeaders,
+              reqHeaders: attemptReqHeaders,
               timeoutMs: cfg.limits.upstream_timeout_ms,
               idleTimeoutMs: streamIdleTimeoutMs,
               signal,
@@ -3899,7 +3949,7 @@ export function createHandleProtocol(deps) {
               safeguardsSanitized: attemptMeta?.safeguardsSanitized === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               body,
-              reqHeaders: outboundReqHeaders,
+              reqHeaders: attemptReqHeaders,
               timeoutMs: cfg.limits.upstream_timeout_ms,
               idleTimeoutMs: streamIdleTimeoutMs,
               identity: loadVmIdentity(candidate.exec),

@@ -12,11 +12,13 @@ import {
   analyzeMemberConflicts,
   buildPoolPayload,
   createDefaultPoolDraft,
+  defaultSystemPromptModeForProvider,
   formatExplainSummary,
   formatTtlLabel,
   isPromptLockedProvider,
   normalizeProviderScope,
   POOL_LOCKED_DEFAULTS,
+  poolToDraft,
   secondsToTtlParts,
   SYSTEM_PROMPT_MAX_BYTES,
   ttlPartsToSeconds,
@@ -76,6 +78,7 @@ describe('v4 locked defaults & provider prompt lock', () => {
     expect(POOL_LOCKED_DEFAULTS.session_ttl_seconds).toBe(86400)
     expect(POOL_LOCKED_DEFAULTS.session_queue_max).toBe(16)
     expect(POOL_LOCKED_DEFAULTS.session_queue_timeout_ms).toBe(60000)
+    expect(POOL_LOCKED_DEFAULTS.system_prompt_mode).toBe('inherit_global')
 
     const draft = createDefaultPoolDraft()
     expect(draft.exclusive_members).toBe(false)
@@ -85,6 +88,37 @@ describe('v4 locked defaults & provider prompt lock', () => {
     expect(draft.session_ttl_seconds).toBe(86400)
     expect(draft.session_queue_max).toBe(16)
     expect(draft.session_queue_timeout_ms).toBe(60000)
+    expect(draft.system_prompt_mode).toBe('inherit_global')
+
+    expect(defaultSystemPromptModeForProvider('anthropic')).toBe(
+      'inherit_global'
+    )
+    expect(defaultSystemPromptModeForProvider('mixed')).toBe('inherit_global')
+    expect(defaultSystemPromptModeForProvider('api')).toBe('inherit_global')
+    expect(defaultSystemPromptModeForProvider('openai')).toBe('passthrough')
+    expect(defaultSystemPromptModeForProvider('google')).toBe('passthrough')
+    expect(defaultSystemPromptModeForProvider('gemini')).toBe('passthrough')
+
+    expect(
+      createDefaultPoolDraft({ provider_scope: 'mixed' }).system_prompt_mode
+    ).toBe('inherit_global')
+    expect(
+      createDefaultPoolDraft({ provider_scope: 'api' }).system_prompt_mode
+    ).toBe('inherit_global')
+    expect(
+      createDefaultPoolDraft({ provider_scope: 'openai' }).system_prompt_mode
+    ).toBe('passthrough')
+    expect(
+      createDefaultPoolDraft({ provider_scope: 'google' }).system_prompt_mode
+    ).toBe('passthrough')
+
+    const missingModeDraft = poolToDraft(
+      makePool({
+        provider_scope: 'anthropic',
+        system_prompt_mode: '' as SchedulerPool['system_prompt_mode'],
+      })
+    )
+    expect(missingModeDraft.system_prompt_mode).toBe('inherit_global')
   })
 
   it('locks openai and google (including gemini alias) pools to passthrough', () => {

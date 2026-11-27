@@ -752,6 +752,17 @@ function gateCragBody(body, print, health, isolated = false, dropSampling = fals
   return out
 }
 
+function stripClientNonCcHeaders(reqHeaders) {
+  if (!reqHeaders || typeof reqHeaders !== 'object') return reqHeaders
+  const out = {}
+  for (const [key, value] of Object.entries(reqHeaders)) {
+    const lower = String(key || '').toLowerCase()
+    if (lower === 'anthropic-beta' || lower === 'user-agent') continue
+    out[key] = value
+  }
+  return out
+}
+
 /**
  * `cliHop`: the slot cli-node builds the wire and always sends
  * mid-conversation-system; the kernel drops these envelope headers. Gating the
@@ -773,6 +784,7 @@ export function prepareWorkerPayload({
   repaired = false,
   dropSampling = false,
   strictPassthrough = false,
+  officialPassthrough = null,
   safeguardsSanitized = false,
 } = {}) {
   const health = exec?.workerStatus
@@ -806,13 +818,22 @@ export function prepareWorkerPayload({
   if (nativeOwnsHeaders) {
     if (callerHeaders) headers = callerHeaders
   } else {
-    headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, canonicalBody?.model || '', {
+    const nonPassthroughHeadless =
+      headlessBridge &&
+      !strictCrag &&
+      (officialPassthrough === false ||
+        body?.crag_persona_preset != null ||
+        body?.crag_prompt != null ||
+        body?.crag_env != null)
+    const headerReq = nonPassthroughHeadless ? stripClientNonCcHeaders(reqHeaders) : reqHeaders
+    headers = prepareOutboundHeaders(headerReq, exec?.homeDir, identity, canonicalBody?.model || '', {
       credentialMode: credentialModeFromOauth(exec?.vm?.claude || {}),
       routing,
       want1m: want1m === true,
     })
     if (callerHeaders) {
       for (const [k, v] of Object.entries(callerHeaders)) {
+        if (nonPassthroughHeadless && k === 'user-agent') continue
         headers[k] = v
       }
     }
