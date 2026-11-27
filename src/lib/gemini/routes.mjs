@@ -5,7 +5,9 @@ import path from 'node:path'
 import { filterModelCatalogForKey, keyModelError } from '../admin/key-models.mjs'
 import { formatHealthSse, synthesizeProtocolResponse } from '../admin/health-probe.mjs'
 import { summarizeBody } from '../admin/request-log.mjs'
-import { keyTierPolicyFromRecord } from '../admin/key-scope.mjs'
+import { filterModelsForPoolAccess, keyTierPolicyFromRecord, resolvePoolAccessForKey } from '../admin/key-scope.mjs'
+import { isDbOpen } from '../db/database.mjs'
+import { requestedPoolIdFromHeaders } from '../protocol/pool-prompt-policy.mjs'
 import { PLATFORM_SCOPE, normalizeOwnerId, ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import {
   buildGeminiRequest,
@@ -2077,6 +2079,8 @@ export function createGeminiPublicHandler({
   refusalDevices = null,
   refusalSessions = null,
   preDispatch = null,
+  poolsRepo = null,
+  geminiOwnerMap = null,
 }) {
   const geminiScopeFromReq = (req) => {
     const rec = req?.apiKeyRecord || null
@@ -2095,6 +2099,49 @@ export function createGeminiPublicHandler({
           ? policy.allowed_gemini_envs
           : null
     return { ownerScope, allowedEnvIds }
+  }
+  const resolveGeminiPoolAccess = (req, { model = null, ownerScope = null, geminiEnvs = null } = {}) => {
+    const requestedPoolId = requestedPoolIdFromHeaders(req?.headers || {})
+    const rec = req?.apiKeyRecord || null
+    const explicitIntent =
+      Boolean(requestedPoolId) ||
+      rec?.pool_binding_mode === 'strict_pool' ||
+      Boolean(rec?.default_pool_id) ||
+      (Array.isArray(rec?.allowed_pool_ids) && rec.allowed_pool_ids.length > 0)
+    if (!poolsRepo && !isDbOpen() && !explicitIntent) {
+      return {
+        ok: true,
+        status: 200,
+        code: null,
+        mode: 'legacy_scope',
+        legacy: true,
+        isDowngraded: false,
+        originPool: null,
+        effectivePool: null,
+        allowedPoolIds: [],
+        allowedMembers: null,
+        allowedGeminiEnvIds: null,
+        allowedModels: [],
+      }
+    }
+    return resolvePoolAccessForKey({
+      key: rec,
+      apiKeyKind: req?.apiKeyKind || null,
+      requestedPoolId,
+      model,
+      poolsRepo: poolsRepo || null,
+      geminiEnvs,
+      geminiOwnerMap: typeof geminiOwnerMap === 'function' ? geminiOwnerMap() : geminiOwnerMap,
+      ownerScope,
+    })
+  }
+  const narrowGeminiScope = (scope, poolAccess) => {
+    if (!poolAccess || poolAccess.legacy) return scope
+    const poolEnvIds = Array.isArray(poolAccess.allowedGeminiEnvIds) ? poolAccess.allowedGeminiEnvIds : []
+    const allowedEnvIds = Array.isArray(scope.allowedEnvIds)
+      ? scope.allowedEnvIds.filter((id) => poolEnvIds.includes(id))
+      : [...poolEnvIds]
+    return { ...scope, allowedEnvIds }
   }
   return async function handleGeminiPublic(
     req,
@@ -2117,7 +2164,7 @@ export function createGeminiPublicHandler({
         },
       })
     }
-    const geminiScope = geminiScopeFromReq(req)
+    const baseGeminiScope = geminiScopeFromReq(req)
     const url = new URL(req.url || PUBLIC_PATH, 'http://127.0.0.1')
     const googleModels = url.pathname === '/v1beta/models'
     const singleModelGet = req.method === 'GET' ? parseGeminiModelGetPath(url.pathname) : null
@@ -2125,10 +2172,30 @@ export function createGeminiPublicHandler({
       req.method === 'GET' &&
       ([PUBLIC_PATH, '/v1/models', '/models', '/v1beta/models'].includes(url.pathname) || singleModelGet)
     ) {
+      const modelsPoolAccess = resolveGeminiPoolAccess(req, { ownerScope: baseGeminiScope.ownerScope })
+      if (!modelsPoolAccess.ok) {
+        const status = modelsPoolAccess.status || 403
+        const code = modelsPoolAccess.code || 'pool_unavailable'
+        const message = modelsPoolAccess.message || '分组池不可用'
+        return json(
+          res,
+          status,
+          protocolErrorBody(
+            googleModels || singleModelGet?.version === 'v1beta' ? 'gemini' : 'openai-chat',
+            status,
+            code,
+            message,
+          ),
+        )
+      }
+      const effectiveModelScope = narrowGeminiScope(baseGeminiScope, modelsPoolAccess)
       try {
-        const catalog = await scheduler.catalog(geminiScope)
+        const catalog = await scheduler.catalog(effectiveModelScope)
+        const poolFilteredList = filterModelsForPoolAccess(publicModels(catalog, req), modelsPoolAccess, {
+          geminiEnvs: Array.isArray(catalog?.accounts) ? catalog.accounts : null,
+        })
         if (singleModelGet) {
-          const hit = findCatalogModel(publicModels(catalog, req).data, singleModelGet.model)
+          const hit = findCatalogModel(poolFilteredList.data, singleModelGet.model)
           if (!hit) {
             return json(
               res,
@@ -2143,7 +2210,7 @@ export function createGeminiPublicHandler({
           }
           return json(res, 200, singleModelGet.version === 'v1beta' ? googleModelEntry(hit) : hit)
         }
-        return json(res, 200, googleModels ? googleModelList(catalog, req) : publicModels(catalog, req))
+        return json(res, 200, googleModels ? formatGoogleModelList(poolFilteredList.data) : poolFilteredList)
       } catch (error) {
         const mapped = publicError(error)
         return json(
@@ -2393,6 +2460,36 @@ export function createGeminiPublicHandler({
       )
     }
 
+    // Fail-Closed pool authorization BEFORE JEV and BEFORE Gemini slot admission.
+    // Google/Gemini pools never inject Anthropic System Prompt policies.
+    const ownGeminiOwnerMap = typeof geminiOwnerMap === 'function' ? geminiOwnerMap() : geminiOwnerMap
+    const hasCatalogAccounts = Array.isArray(catalogSnapshot?.accounts)
+    const canReusePoolAccess =
+      Boolean(req._poolAccess) &&
+      (!ownGeminiOwnerMap || req._poolAccess._geminiOwnerMapChecked === true) &&
+      (!hasCatalogAccounts || req._poolAccess._geminiEnvsChecked === true)
+    const poolAccess = canReusePoolAccess
+      ? req._poolAccess
+      : resolveGeminiPoolAccess(req, {
+          model: targetModel,
+          ownerScope: baseGeminiScope.ownerScope,
+          geminiEnvs: hasCatalogAccounts ? catalogSnapshot.accounts : null,
+        })
+    if (!poolAccess.ok) {
+      const status = poolAccess.status || 403
+      const code = poolAccess.code || 'pool_unavailable'
+      const message = poolAccess.message || '分组池不可用'
+      logBag.error_code = code
+      logBag.error_message = message
+      logBag.final_state = 'policy_blocked'
+      logBag.attempt_count = 0
+      return respondJson(status, protocolErrorBody(protocol, status, code, message))
+    }
+    if (poolAccess.effectivePool?.id) {
+      logBag.resolved_pool_id = poolAccess.effectivePool.id
+    }
+    const geminiScope = narrowGeminiScope(baseGeminiScope, poolAccess)
+
     // Bypasses #1-#4 closed: every public Gemini inference call must clear the
     // unified pre-dispatch JEV gate BEFORE any Gemini account/slot reservation.
     const existingDecision = preDispatchDecision || req._preDispatchDecision || null
@@ -2414,7 +2511,9 @@ export function createGeminiPublicHandler({
         devices: riskState.devices,
         sessions: riskState.sessions,
         requestId: activeLogCtx?.request_id || '',
-        poolJevProfile: req.poolJevProfile || req.apiKeyRecord?.jev_profile || null,
+        poolJevProfile:
+          poolAccess.effectivePool?.jev_profile || req.poolJevProfile || req.apiKeyRecord?.jev_profile || null,
+        zeroInject: false,
         channel: 'gemini',
         enforceHardAndJev: true,
         backend: 'oauth',

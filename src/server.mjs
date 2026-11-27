@@ -97,7 +97,13 @@ import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
 import { ApiKeyStore, makeApiKeyGateError } from './lib/admin/api-keys.mjs'
-import { keyScopeFromRequest, keyTierPolicyFromRecord } from './lib/admin/key-scope.mjs'
+import {
+  filterModelsForPoolAccess,
+  keyScopeFromRequest,
+  keyTierPolicyFromRecord,
+  resolvePoolAccessForKey,
+} from './lib/admin/key-scope.mjs'
+import { requestedPoolIdFromHeaders } from './lib/protocol/pool-prompt-policy.mjs'
 import { ownerScopeFromRequest } from './lib/admin/resource-owner.mjs'
 import { filterModelCatalogForKey } from './lib/admin/key-models.mjs'
 import { GroupsRepo } from './lib/db/repos/groups-repo.mjs'
@@ -1213,6 +1219,7 @@ const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
   get geminiScheduler() {
     return geminiScheduler
   },
+  geminiOwnerMap: () => geminiOwnersProxy.ownerMap(),
   admitCragInference: (input) => cragSubscription.admitInference(input),
   json,
   writeSSEHeaders,
@@ -1523,6 +1530,7 @@ const handleGeminiPublic = createGeminiPublicHandler({
   getRoutingConfig: () => routingConfig,
   getHealthMonitor: () => healthMonitor,
   cfg,
+  geminiOwnerMap: () => geminiOwnersProxy.ownerMap(),
 })
 const integrationTokenStore = new IntegrationTokenStore()
 const handlePanel = createPanelHandler({
@@ -1908,11 +1916,55 @@ const server = http.createServer(async (req, res) => {
       (p === '/v1/models' || p === '/models' || p === '/v1beta/models' || Boolean(singleModelGet))
     ) {
       if (!requireAuth(req, res)) return
+      const modelOwnerScope = ownerScopeFromRequest(req, apiKeyStore?.users)
+      const modelVms = listVms(cfg.paths.project)
+      const modelApiEndpoints = apiEndpointStore.listRaw()
+      const modelPoolAccess = resolvePoolAccessForKey({
+        key: req.apiKeyRecord || null,
+        apiKeyKind: req.apiKeyKind || null,
+        requestedPoolId: requestedPoolIdFromHeaders(req.headers),
+        vms: Array.isArray(modelVms) ? modelVms : null,
+        geminiOwnerMap: geminiOwnersProxy.ownerMap(),
+        apiEndpoints: Array.isArray(modelApiEndpoints) ? modelApiEndpoints : null,
+        ownerScope: modelOwnerScope,
+      })
+      if (!modelPoolAccess.ok) {
+        const status = modelPoolAccess.status || 403
+        const code = modelPoolAccess.code || 'pool_unavailable'
+        const message = modelPoolAccess.message || '分组池不可用'
+        if (p === '/v1beta/models' || singleModelGet?.version === 'v1beta') {
+          return json(res, status, {
+            error: {
+              code: status,
+              status: 'PERMISSION_DENIED',
+              message,
+              details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: code }],
+            },
+          })
+        }
+        return json(res, status, makeError({ type: ErrorType.PERMISSION, code, message, status }).body)
+      }
       const groupType = keyScopeFromRequest(req).group_type
       const backend = resolveInferenceBackend(req)
-      const apiScopeForModels = apiScheduleScope(req, groupType, apiKeyStore?.users)
+      let apiScopeForModels = apiScheduleScope(req, groupType, apiKeyStore?.users)
+      if (!modelPoolAccess.legacy) {
+        const poolEps = modelPoolAccess.allowedEndpointIds || []
+        const existingEps = apiScopeForModels.allowedEndpointIds
+        apiScopeForModels = {
+          ...apiScopeForModels,
+          allowedEndpointIds:
+            Array.isArray(existingEps) && existingEps.length
+              ? existingEps.filter((id) => poolEps.includes(id))
+              : [...poolEps],
+        }
+      }
+      const poolFilterCtx = { vms: modelVms, apiEndpoints: modelApiEndpoints }
       if (backend === 'api') {
-        const filtered = filterModelCatalogForKey(apiScheduler.catalog(apiScopeForModels), req)
+        const filtered = filterModelsForPoolAccess(
+          filterModelCatalogForKey(apiScheduler.catalog(apiScopeForModels), req),
+          modelPoolAccess,
+          poolFilterCtx,
+        )
         if (singleModelGet) {
           const want = singleModelGet.model.replace(/^models\//i, '').toLowerCase()
           const hit = (filtered?.data || []).find((m) => String(m?.id || '').toLowerCase() === want)
@@ -1930,23 +1982,44 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, p === '/v1beta/models' ? formatGoogleModelList(filtered?.data || []) : filtered)
       }
       const modelPolicy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(req.apiKeyRecord) : null
-      const modelGeminiScope = {
-        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
-        allowedEnvIds:
-          modelPolicy?.permission_tier === 'resource'
+      let allowedGeminiEnvs =
+        modelPolicy?.permission_tier === 'resource'
+          ? modelPolicy.allowed_gemini_envs
+          : modelPolicy?.allowed_gemini_envs?.length
             ? modelPolicy.allowed_gemini_envs
-            : modelPolicy?.allowed_gemini_envs?.length
-              ? modelPolicy.allowed_gemini_envs
-              : null,
+            : null
+      if (!modelPoolAccess.legacy) {
+        const poolEnvs = modelPoolAccess.allowedGeminiEnvIds || []
+        allowedGeminiEnvs = Array.isArray(allowedGeminiEnvs)
+          ? allowedGeminiEnvs.filter((id) => poolEnvs.includes(id))
+          : [...poolEnvs]
+      }
+      const modelGeminiScope = {
+        ownerScope: modelOwnerScope,
+        allowedEnvIds: allowedGeminiEnvs,
       }
       if (p === '/v1beta/models' || singleModelGet?.version === 'v1beta' || groupType === 'gemini') {
         if (backend === 'all') {
           let gemModels = []
+          let gemAccounts = null
           try {
             const gemCat = await geminiScheduler.catalog(modelGeminiScope)
             gemModels = Array.isArray(gemCat?.models) ? gemCat.models : []
+            gemAccounts = Array.isArray(gemCat?.accounts) ? gemCat.accounts : null
           } catch {}
-          const apiCat = apiScheduler.catalog(apiScheduleScope(req, 'gemini', apiKeyStore?.users))
+          let gemApiScope = apiScheduleScope(req, 'gemini', apiKeyStore?.users)
+          if (!modelPoolAccess.legacy) {
+            const poolEps = modelPoolAccess.allowedEndpointIds || []
+            const existingEps = gemApiScope.allowedEndpointIds
+            gemApiScope = {
+              ...gemApiScope,
+              allowedEndpointIds:
+                Array.isArray(existingEps) && existingEps.length
+                  ? existingEps.filter((id) => poolEps.includes(id))
+                  : [...poolEps],
+            }
+          }
+          const apiCat = apiScheduler.catalog(gemApiScope)
           const merged = []
           const seen = new Set()
           for (const m of [...gemModels, ...(apiCat?.data || [])]) {
@@ -1955,7 +2028,11 @@ const server = http.createServer(async (req, res) => {
             seen.add(id)
             merged.push(m)
           }
-          const filtered = filterModelCatalogForKey({ object: 'list', data: merged }, req)
+          const filtered = filterModelsForPoolAccess(
+            filterModelCatalogForKey({ object: 'list', data: merged }, req),
+            modelPoolAccess,
+            { ...poolFilterCtx, geminiEnvs: gemAccounts },
+          )
           if (singleModelGet) {
             const want = singleModelGet.model.replace(/^models\//i, '').toLowerCase()
             const hit = (filtered?.data || []).find((m) => String(m?.id || '').toLowerCase() === want)
@@ -1975,9 +2052,11 @@ const server = http.createServer(async (req, res) => {
         return handleGeminiPublic(req, res)
       }
       const result = await fetchWorkerModels({ groupType })
+      let gemAccountsForAll = null
       if (groupType === 'all') {
         try {
           const gemCatalog = await geminiScheduler.catalog(modelGeminiScope)
+          gemAccountsForAll = Array.isArray(gemCatalog?.accounts) ? gemCatalog.accounts : null
           if (Array.isArray(gemCatalog?.models) && gemCatalog.models.length) {
             const existing = Array.isArray(result?.data) ? result.data : []
             const seen = new Set(existing.map((m) => m?.id).filter(Boolean))
@@ -1995,7 +2074,10 @@ const server = http.createServer(async (req, res) => {
           if (extra.length) result.data = [...existing, ...extra]
         }
       }
-      const filtered = filterModelCatalogForKey(result, req)
+      const filtered = filterModelsForPoolAccess(filterModelCatalogForKey(result, req), modelPoolAccess, {
+        ...poolFilterCtx,
+        geminiEnvs: gemAccountsForAll,
+      })
       if (singleModelGet) {
         const want = singleModelGet.model.replace(/^models\//i, '').toLowerCase()
         const hit = (filtered?.data || []).find((m) => String(m?.id || '').toLowerCase() === want)
@@ -2041,6 +2123,7 @@ const server = http.createServer(async (req, res) => {
         requireAuth,
         apiKeyStore,
         cfg,
+        projectRoot: cfg.paths.project,
         stickyRouter,
         accountQuota,
         getPoolScheduler: () => poolScheduler,

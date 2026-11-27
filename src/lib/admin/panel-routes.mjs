@@ -123,6 +123,7 @@ import {
   assertVmScope,
   keyTierPolicyFromRecord,
   normalizeGroupType,
+  normalizeKeyPoolBindingInput,
   normalizeKeyScope,
   normalizeMultiTierKeyConfig,
 } from './key-scope.mjs'
@@ -134,6 +135,12 @@ import {
   vmPoolHttpStatus,
   vmPoolsFor,
 } from './vm-pools.mjs'
+import { SchedulerPoolsRepo } from '../db/repos/scheduler-pools-repo.mjs'
+import {
+  createSchedulerPoolsHandler,
+  enrichApiKeyViewsWithPools,
+  syncVmPoolToSchedulerPool,
+} from './scheduler-pools-routes.mjs'
 import { publicEndpointView, fetchUpstreamModels, API_ENDPOINT_PRESETS } from './api-endpoints.mjs'
 import { runAnthropicConsole, resolveConsoleProxyUrl, savedEndpointKey } from './anthropic-console.mjs'
 import { publicUserView } from './panel-users.mjs'
@@ -851,6 +858,18 @@ export function createPanelHandler(ctx) {
     publicBaseUrl: cfg?.base_url,
     json,
     readRawBody,
+  })
+  const handleSchedulerPools = createSchedulerPoolsHandler({
+    getDb: () => apiKeyStore?.db || ctx.getDb?.() || getDb(),
+    cfg,
+    apiKeyStore: ctx.apiKeyStore,
+    apiEndpointStore: ctx.apiEndpointStore,
+    accountQuota: ctx.accountQuota,
+    poolScheduler: () => ctx.poolScheduler,
+    geminiScheduler: () => ctx.geminiScheduler,
+    geminiSlotPrefs: ctx.geminiSlotPrefs || null,
+    json,
+    readBody,
   })
   const routingConfigPath = ctx.routingConfigPath
   const stickyRouter = ctx.stickyRouter
@@ -2160,6 +2179,10 @@ export function createPanelHandler(ctx) {
         )
       }
       if (isGeminiPanelPath(p)) return geminiPanel(req, res, p)
+      if (p === '/api/panel/pools' || p.startsWith('/api/panel/pools/') || p === '/api/panel/scheduler/sticky') {
+        const handled = await handleSchedulerPools(req, res, p, url)
+        if (handled !== false) return
+      }
       if (!delegated && p.startsWith('/api/panel/integration')) {
         const handled = await handleIntegrationAdminRoute(req, res, p, {
           tokenStore: integrationTokenStore,
@@ -2455,7 +2478,9 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && p === '/api/panel/vm-pools') {
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
-          const pool = createVmPool(vmPoolsFor(apiKeyStore.db), body || {}, listVms(cfg.paths.project))
+          const allVms = listVms(cfg.paths.project)
+          const pool = createVmPool(vmPoolsFor(apiKeyStore.db), body || {}, allVms)
+          syncVmPoolToSchedulerPool(apiKeyStore.db, 'upsert', pool, allVms)
           return json(res, 201, panel.ok({ pool }))
         } catch (e) {
           return json(res, vmPoolHttpStatus(e.code), {
@@ -2468,8 +2493,10 @@ export function createPanelHandler(ctx) {
         const id = decodeURIComponent(p.split('/').pop())
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
-          const pool = updateVmPool(vmPoolsFor(apiKeyStore.db), id, body || {}, listVms(cfg.paths.project))
+          const allVms = listVms(cfg.paths.project)
+          const pool = updateVmPool(vmPoolsFor(apiKeyStore.db), id, body || {}, allVms)
           if (!pool) return json(res, 404, { ok: false, error: { message: '账号池不存在', code: 'vm_pool_not_found' } })
+          syncVmPoolToSchedulerPool(apiKeyStore.db, 'upsert', pool, allVms)
           return json(res, 200, panel.ok({ pool }))
         } catch (e) {
           return json(res, vmPoolHttpStatus(e.code), {
@@ -2491,6 +2518,7 @@ export function createPanelHandler(ctx) {
             },
           })
         }
+        syncVmPoolToSchedulerPool(apiKeyStore.db, 'delete', { id })
         return json(res, 200, { ok: true, deleted: id })
       }
       if (req.method === 'GET' && p === '/api/panel/api-keys') {
@@ -2500,11 +2528,13 @@ export function createPanelHandler(ctx) {
         const mine = (snap.keys || []).filter(
           (key) => panelOwnsKey(req, key) && (!filterOwner || normalizeOwnerId(key.owner_id) === filterOwner),
         )
+        const rawById = new Map((apiKeyStore.repo?.list?.() || []).map((r) => [r.id, r]))
+        const enrichedKeys = enrichApiKeyViewsWithPools(apiKeyStore.db, mine, rawById)
         return json(res, 200, {
           ok: true,
-          total: mine.length,
-          active: mine.filter((k) => k.status === 'active').length,
-          keys: mine,
+          total: enrichedKeys.length,
+          active: enrichedKeys.filter((k) => k.status === 'active').length,
+          keys: enrichedKeys,
         })
       }
       if (req.method === 'GET' && /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p)) {
@@ -2513,7 +2543,12 @@ export function createPanelHandler(ctx) {
         const rec = apiKeyStore.getById(id)
         if (!rec) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
         const usage_stats = requestLog?.keyUsageStats?.({ apiKeyId: id, days: 30 }) || null
-        return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }), usage_stats })
+        const [item] = enrichApiKeyViewsWithPools(
+          apiKeyStore.db,
+          [publicKeyView(rec, { reveal: false })],
+          new Map([[rec.id, rec]]),
+        )
+        return json(res, 200, { ok: true, item, usage_stats })
       }
       if (req.method === 'POST' && p === '/api/panel/api-keys') {
         const body = await readBody(req, API_KEY_BODY_MAX).catch(() => ({}))
@@ -2524,7 +2559,12 @@ export function createPanelHandler(ctx) {
             error: { code: 'gemini_key_forbidden', message: '只有管理员可以生成 Gemini 密钥' },
           })
         }
-        if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
+        const hasAdminPoolFields =
+          (body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') ||
+          (body?.default_pool_id != null && String(body.default_pool_id).trim() !== '') ||
+          (Array.isArray(body?.allowed_pool_ids) && body.allowed_pool_ids.length > 0) ||
+          body?.pool_binding_mode === 'strict_pool'
+        if (ident.role !== 'admin' && hasAdminPoolFields) {
           return json(res, 403, {
             ok: false,
             error: { code: 'key_pool_forbidden', message: '只有管理员可以设置账号池' },
@@ -2544,6 +2584,15 @@ export function createPanelHandler(ctx) {
           })
         }
         try {
+          const schedPoolsRepo = new SchedulerPoolsRepo(apiKeyStore.db)
+          const hasUnifiedPoolFields =
+            Object.hasOwn(body || {}, 'pool_binding_mode') ||
+            Object.hasOwn(body || {}, 'default_pool_id') ||
+            Object.hasOwn(body || {}, 'allowed_pool_ids')
+          const poolBinding =
+            ident.role === 'admin' && hasUnifiedPoolFields
+              ? normalizeKeyPoolBindingInput(body || {}, { partial: false, poolsRepo: schedPoolsRepo })
+              : null
           const tierCfg =
             ident.role === 'admin'
               ? normalizeMultiTierKeyConfig({ ...body, user_id: input.user_id }, { partial: false })
@@ -2556,22 +2605,34 @@ export function createPanelHandler(ctx) {
                 }
           const isApi = isApiCategory(tierCfg.category)
           const allowsEndpoint = isMixedOrApiCategory(tierCfg.category)
+          const reqGroupType = normalizeGroupType(body?.group_type)
           const scopeInput = {
-            group_type: body?.group_type,
-            allowed_vms: body?.allowed_vms,
+            group_type:
+              poolBinding?.pool_binding_mode === 'strict_pool' && reqGroupType !== 'gemini' ? 'all' : body?.group_type,
+            allowed_vms: poolBinding?.pool_binding_mode === 'strict_pool' ? [] : body?.allowed_vms,
             category: tierCfg.category,
             permission_tier: tierCfg.permission_tier,
             owner_id: tierCfg.owner_id,
           }
-          if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
+          if (ident.role === 'admin' && poolBinding) {
+            scopeInput.vm_pool_id =
+              reqGroupType !== 'gemini' &&
+              poolBinding.default_pool_id &&
+              /^pool_[a-f0-9]{8}$/.test(poolBinding.default_pool_id)
+                ? poolBinding.default_pool_id
+                : null
+          } else if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
           const scope = normalizeKeyScope(scopeInput, { isApi })
           const pools = vmPoolsFor(apiKeyStore.db)
           const validEndpointId = validateKeyEndpoint(input.api_endpoint_id, allowsEndpoint)
           if (!isApi) {
-            if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-            else assertVmScope(keyScopeVms(req), scope)
+            if (scope.vm_pool_id && !schedPoolsRepo.get(scope.vm_pool_id)) {
+              assertVmPoolExists(pools, scope.vm_pool_id)
+            } else if (!scope.vm_pool_id && !poolBinding?.default_pool_id) {
+              assertVmScope(keyScopeVms(req), scope)
+            }
           }
           const enforceMultiTierOwnership =
             req[INTEGRATION_DELEGATED] === true ||
@@ -2600,7 +2661,11 @@ export function createPanelHandler(ctx) {
               vms: listVms(cfg.paths.project),
               endpoints: apiEndpointStore?.listRaw?.() || [],
               geminiOwnerMap: ctx.geminiOwnersRepo?.ownerMap?.() || null,
-              policy,
+              policy: {
+                ...policy,
+                default_pool_id: poolBinding?.default_pool_id ?? null,
+                allowed_pool_ids: poolBinding?.allowed_pool_ids ?? [],
+              },
               ownerScope: keyOwnerScope,
             })
           }
@@ -2638,9 +2703,25 @@ export function createPanelHandler(ctx) {
                 ? new Date(Date.now() + Number(body.expires_in_days) * 86400_000).toISOString()
                 : null),
           })
+          if (ident.role === 'admin' && poolBinding) {
+            schedPoolsRepo.setKeyBindings(rec.id, poolBinding.allowed_pool_ids, {
+              defaultPoolId: poolBinding.default_pool_id,
+              bindingMode: poolBinding.pool_binding_mode,
+            })
+            apiKeyStore.reload()
+          } else if (ident.role === 'admin' && scope.vm_pool_id && schedPoolsRepo.get(scope.vm_pool_id)) {
+            schedPoolsRepo.setKeyBindings(rec.id, [scope.vm_pool_id], {
+              defaultPoolId: scope.vm_pool_id,
+              bindingMode: 'legacy_scope',
+            })
+            apiKeyStore.reload()
+          }
+          const latestRec = apiKeyStore.getById(rec.id) || rec
+          const baseView = publicKeyView({ ...latestRec, _plain_key: rec._plain_key }, { reveal: true })
+          const [item] = enrichApiKeyViewsWithPools(apiKeyStore.db, [baseView], new Map([[latestRec.id, latestRec]]))
           return json(res, 201, {
             ok: true,
-            item: publicKeyView(rec, { reveal: true }),
+            item,
             note: 'plaintext stays recoverable via POST /api/panel/api-keys/:id/reveal',
           })
         } catch (e) {
@@ -2666,7 +2747,16 @@ export function createPanelHandler(ctx) {
             error: { code: 'gemini_key_forbidden', message: '只有管理员可以修改 Gemini 密钥' },
           })
         }
-        if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
+        const hasAdminPoolPatch =
+          (body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') ||
+          (body?.default_pool_id != null && String(body.default_pool_id).trim() !== '') ||
+          (Array.isArray(body?.allowed_pool_ids) && body.allowed_pool_ids.length > 0) ||
+          body?.pool_binding_mode === 'strict_pool' ||
+          (currentRec?.pool_binding_mode === 'strict_pool' &&
+            (Object.hasOwn(body || {}, 'pool_binding_mode') ||
+              Object.hasOwn(body || {}, 'default_pool_id') ||
+              Object.hasOwn(body || {}, 'allowed_pool_ids')))
+        if (ident.role !== 'admin' && hasAdminPoolPatch) {
           return json(res, 403, {
             ok: false,
             error: { code: 'key_pool_forbidden', message: '只有管理员可以设置账号池' },
@@ -2679,6 +2769,19 @@ export function createPanelHandler(ctx) {
           })
         }
         try {
+          const schedPoolsRepo = new SchedulerPoolsRepo(apiKeyStore.db)
+          const hasUnifiedPoolPatch =
+            Object.hasOwn(body || {}, 'pool_binding_mode') ||
+            Object.hasOwn(body || {}, 'default_pool_id') ||
+            Object.hasOwn(body || {}, 'allowed_pool_ids')
+          const poolBinding =
+            ident.role === 'admin' && hasUnifiedPoolPatch
+              ? normalizeKeyPoolBindingInput(body || {}, {
+                  current: currentRec,
+                  partial: true,
+                  poolsRepo: schedPoolsRepo,
+                })
+              : null
           const input = normalizePanelApiKeyInput(body || {}, req)
           const tierCfg =
             ident.role === 'admin'
@@ -2697,13 +2800,22 @@ export function createPanelHandler(ctx) {
               currentRec?.api_endpoint_id,
             )
           }
+          const reqGroupType = normalizeGroupType(body?.group_type ?? currentRec?.group_type)
           const scopeInput = {
-            group_type: body?.group_type,
-            allowed_vms: body?.allowed_vms,
+            group_type:
+              poolBinding?.pool_binding_mode === 'strict_pool' && reqGroupType !== 'gemini' ? 'all' : body?.group_type,
+            allowed_vms: poolBinding?.pool_binding_mode === 'strict_pool' ? [] : body?.allowed_vms,
             category: effectiveCategory || 'oauth',
             ...(tierCfg ? { permission_tier: tierCfg.permission_tier, owner_id: tierCfg.owner_id } : {}),
           }
-          if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
+          if (ident.role === 'admin' && poolBinding) {
+            scopeInput.vm_pool_id =
+              reqGroupType !== 'gemini' &&
+              poolBinding.default_pool_id &&
+              /^pool_[a-f0-9]{8}$/.test(poolBinding.default_pool_id)
+                ? poolBinding.default_pool_id
+                : null
+          } else if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
           const scope = normalizeKeyScope(scopeInput, { partial: true, current: currentRec, isApi })
@@ -2713,8 +2825,11 @@ export function createPanelHandler(ctx) {
             }
             const pools = vmPoolsFor(apiKeyStore.db)
             if (!isApi) {
-              if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-              else assertVmScope(keyScopeVms(req), scope)
+              if (scope.vm_pool_id && !schedPoolsRepo.get(scope.vm_pool_id)) {
+                assertVmPoolExists(pools, scope.vm_pool_id)
+              } else if (!scope.vm_pool_id && !poolBinding?.default_pool_id) {
+                assertVmScope(keyScopeVms(req), scope)
+              }
             }
             input.group_type = scope.group_type
             input.allowed_vms = scope.allowed_vms
@@ -2754,7 +2869,11 @@ export function createPanelHandler(ctx) {
                 vms: listVms(cfg.paths.project),
                 endpoints: apiEndpointStore?.listRaw?.() || [],
                 geminiOwnerMap: ctx.geminiOwnersRepo?.ownerMap?.() || null,
-                policy,
+                policy: {
+                  ...policy,
+                  default_pool_id: poolBinding?.default_pool_id ?? currentRec?.default_pool_id ?? null,
+                  allowed_pool_ids: poolBinding?.allowed_pool_ids ?? [],
+                },
                 ownerScope: keyOwnerScope,
               })
             }
@@ -2763,7 +2882,35 @@ export function createPanelHandler(ctx) {
           if (!rec) {
             return json(res, 404, { ok: false, error: { message: 'api key not found' } })
           }
-          return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }) })
+          if (ident.role === 'admin' && poolBinding) {
+            schedPoolsRepo.setKeyBindings(rec.id, poolBinding.allowed_pool_ids, {
+              defaultPoolId: poolBinding.default_pool_id,
+              bindingMode: poolBinding.pool_binding_mode,
+            })
+            apiKeyStore.reload()
+          } else if (ident.role === 'admin' && Object.hasOwn(body || {}, 'vm_pool_id')) {
+            const legacyId = scope?.vm_pool_id ?? null
+            if (legacyId && schedPoolsRepo.get(legacyId)) {
+              schedPoolsRepo.setKeyBindings(rec.id, [legacyId], {
+                defaultPoolId: legacyId,
+                bindingMode: currentRec?.pool_binding_mode || 'legacy_scope',
+              })
+              apiKeyStore.reload()
+            } else if (!legacyId) {
+              schedPoolsRepo.setKeyBindings(rec.id, [], {
+                defaultPoolId: null,
+                bindingMode: currentRec?.pool_binding_mode === 'strict_pool' ? 'strict_pool' : 'legacy_scope',
+              })
+              apiKeyStore.reload()
+            }
+          }
+          const latestRec = apiKeyStore.getById(rec.id) || rec
+          const [item] = enrichApiKeyViewsWithPools(
+            apiKeyStore.db,
+            [publicKeyView(latestRec, { reveal: false })],
+            new Map([[latestRec.id, latestRec]]),
+          )
+          return json(res, 200, { ok: true, item })
         } catch (e) {
           const status = Number.isInteger(e.status) ? e.status : vmPoolHttpStatus(e.code)
           return json(res, status, {
@@ -2811,6 +2958,9 @@ export function createPanelHandler(ctx) {
         if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
         const ok = apiKeyStore.remove(id)
         if (!ok) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
+        try {
+          new SchedulerPoolsRepo(apiKeyStore.db).deleteBindingsForKey(id)
+        } catch {}
         return json(res, 200, { ok: true, deleted: id })
       }
 
