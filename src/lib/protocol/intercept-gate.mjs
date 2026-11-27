@@ -629,10 +629,7 @@ export async function evaluateProtocolIntercept({
       const steps = policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS
       const firstMinutes = Number(steps[0]) > 0 ? Number(steps[0]) : 10
       const error = makePolicyOverloadError({ requestId, retryAfterSec: firstMinutes * 60 })
-      const rootSessionId = refusalSessionId({ inbound, body, headers }) || identity.sessionId || ''
-      const banIdentity = rootSessionId && !identity.sessionId ? { ...identity, sessionId: rootSessionId } : identity
       return reject({
-        identity: banIdentity,
         kind: 'jev',
         via: 'jev',
         final_state: 'policy_blocked',
