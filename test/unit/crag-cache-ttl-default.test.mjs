@@ -5,7 +5,6 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { OFFICIAL_CLAUDE_CLI_UA } from '../../src/lib/identity/vm-identity.mjs'
-import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { clearCachePrefixSessions } from '../../src/lib/protocol/cache-prefix.mjs'
 import {
   clearConversationCacheTtls,
@@ -13,7 +12,12 @@ import {
   validateCacheBreakpoints,
 } from '../../src/lib/protocol/cache-ttl.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { invalidateReadCache } from '../../src/lib/vm/vm-file.mjs'
 import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
+import {
+  createM3FailoverRunner,
+  withM3SchedulerDeps,
+} from '../fixtures/scheduler-runtime-mock.mjs'
 
 function createM3HandleProtocol(deps) {
   return createHandleProtocol(withM3SchedulerDeps(deps))
@@ -144,6 +148,19 @@ async function runCragHop(t, { compatibility = {}, diskCompatibility = null, inp
   }
   seedEncryptedPackage(root)
   activateFixture(root, vm)
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  const vmRecordPath = path.join(root, 'vms', `${vm.id}.json`)
+  fs.writeFileSync(
+    vmRecordPath,
+    JSON.stringify({
+      ...vm,
+      platform: 'anthropic',
+      schedulable: true,
+      status: 'running',
+      claude: { account_uuid: 'acc-crag-ttl', access_token: 'at-fixture', refresh_token: 'rt-fixture' },
+    }),
+  )
+  invalidateReadCache(vmRecordPath)
   const exec = {
     vmId: vm.id,
     vm,
@@ -151,17 +168,10 @@ async function runCragHop(t, { compatibility = {}, diskCompatibility = null, inp
     projectRoot: root,
     workerStatus: CRAG_V3_HEALTH,
   }
-  const runner = new FailoverRunner({
-    scheduler: {
-      async selectAndReserve() {
-        return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec, release() {} }
-      },
-      markSuccess() {},
-      markCooldown() {},
-      releaseAccountSessions() {},
-    },
+  const runner = createM3FailoverRunner(root, {
     config: { max_same_account_retries: 0 },
-    schedulerRuntime: makeStubSchedulerRuntime(),
+    execFactory: () => exec,
+    workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true }, ...CRAG_V3_HEALTH }),
   })
 
   const incoming = {
@@ -335,11 +345,3 @@ unixTest(
   },
 )
 
-import {
-  withM3SchedulerDeps,
-  ensureApiSchedulerM3,
-  makeStubSchedulerRuntime,
-  makeMockGeminiRuntime,
-  makeMockCodexRuntimeFor,
-  withM3FailoverRunner,
-} from '../fixtures/scheduler-runtime-mock.mjs'

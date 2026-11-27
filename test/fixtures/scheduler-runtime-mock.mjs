@@ -1,5 +1,7 @@
 import { formatNodeKey } from '../../src/lib/scheduler/scheduler-runtime.mjs'
 import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
+import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { listVms } from '../../src/lib/vm/vm-registry.mjs'
 
 /**
@@ -221,7 +223,14 @@ export function ensureApiSchedulerM3(apiScheduler) {
 
 /** Spread onto createHandleProtocol deps for M3 scheduler isolation. */
 export function withM3SchedulerDeps(deps = {}) {
-  const schedulerRuntime = deps.schedulerRuntime || makeStubSchedulerRuntime()
+  let schedulerRuntime = deps.schedulerRuntime
+  if (!schedulerRuntime && typeof deps.failoverRunner?.getSchedulerRuntime === 'function') {
+    schedulerRuntime = deps.failoverRunner.getSchedulerRuntime()
+  }
+  if (!schedulerRuntime && deps.failoverRunner?.schedulerRuntime) {
+    schedulerRuntime = deps.failoverRunner.schedulerRuntime
+  }
+  if (!schedulerRuntime) schedulerRuntime = makeStubSchedulerRuntime()
   if (deps.apiScheduler) ensureApiSchedulerM3(deps.apiScheduler)
   return { ...deps, schedulerRuntime }
 }
@@ -288,4 +297,51 @@ export function makeMockCodexRuntimeFor(projectRoot) {
 export function withM3FailoverRunner(opts = {}) {
   const schedulerRuntime = opts.schedulerRuntime || makeStubSchedulerRuntime()
   return { ...opts, schedulerRuntime }
+}
+
+const defaultWorkerHealth = async () => ({
+  ok: true,
+  credential: { generation: 1, has_access: true },
+})
+
+/**
+ * PoolScheduler wired for M3 unit tests: fills allowed nodes from project VM registry.
+ */
+export function createM3PoolScheduler(projectRoot, opts = {}) {
+  const schedulerRuntime =
+    opts.schedulerRuntime || makePoolStubRuntimeForProject(projectRoot, { getKernelLeaseMode: opts.getKernelLeaseMode })
+  return new PoolScheduler({
+    projectRoot,
+    schedulerRuntime,
+    stickyRouter: opts.stickyRouter ?? null,
+    accountQuota: opts.accountQuota ?? { canAccept: () => ({ ok: true }) },
+    workerHealth: opts.workerHealth ?? defaultWorkerHealth,
+    runtimeRepo: opts.runtimeRepo,
+    config: {
+      fallback_wait_timeout_ms: 5,
+      sticky_wait_timeout_ms: 5,
+      ...(opts.config || {}),
+    },
+    ...opts.poolExtras,
+  })
+}
+
+/**
+ * FailoverRunner backed by a real PoolScheduler stub runtime (replaces legacy selectAndReserve mocks).
+ */
+export function createM3FailoverRunner(projectRoot, opts = {}) {
+  const pool = opts.scheduler || createM3PoolScheduler(projectRoot, opts)
+  if (typeof opts.execFactory === 'function') {
+    const base = pool.executionContext?.bind(pool)
+    pool.executionContext = (vm, accountId) => opts.execFactory(vm, accountId) ?? base?.(vm, accountId)
+  }
+  const schedulerRuntime =
+    opts.schedulerRuntime || pool.schedulerRuntime || makePoolStubRuntimeForProject(projectRoot, opts)
+  return new FailoverRunner(
+    withM3FailoverRunner({
+      ...opts,
+      scheduler: pool,
+      schedulerRuntime,
+    }),
+  )
 }
