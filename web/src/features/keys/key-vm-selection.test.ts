@@ -79,10 +79,18 @@ describe('key VM selection after reassignment', () => {
     expect(restored.draft.quota_usd).toBe(11)
   })
 
-  it('preserves API, mixed category=all, tenant-tier, global, pool and Gemini semantics', () => {
+  it('preserves API, mixed category=all, tenant-tier, strict_pool, global and Gemini semantics', () => {
     const cases: KeyLimitsDraft[] = [
       { ...draft, category: 'api' },
       { ...draft, category: 'all', allowed_vms: [] },
+      {
+        ...draft,
+        category: 'oauth',
+        pool_binding_mode: 'strict_pool',
+        default_pool_id: 'pool_12345678',
+        allowed_pool_ids: ['pool_12345678'],
+        allowed_vms: [],
+      },
       {
         ...draft,
         category: 'oauth',
@@ -90,7 +98,7 @@ describe('key VM selection after reassignment', () => {
         owner_id: 'u_alice',
         allowed_vms: [],
       },
-      ...(['all', 'pool', 'gemini'] as const).map((group_type) => ({
+      ...(['all', 'gemini'] as const).map((group_type) => ({
         ...draft,
         group_type,
       })),

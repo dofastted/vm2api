@@ -1,7 +1,9 @@
 import { lazy, Suspense, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
 import type { ApiKeyItem } from '@/types/panel-keys'
+import { ArrowRight, Network } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { copyText } from '@/lib/clipboard'
@@ -25,7 +27,10 @@ import { QueryGate } from '@/components/query-gate'
 import { StatusMark } from '@/components/status-mark'
 import { apiEndpointsQueryOptions } from '@/features/api-endpoints/queries'
 import { meQueryOptions } from '@/features/auth/queries'
+import { geminiInventoryOptions } from '@/features/import/gemini-environments'
 import { apiKeysQueryOptions } from '@/features/keys/queries'
+import { schedulerPoolsQueryOptions } from '@/features/pools/queries'
+import { usersQueryOptions } from '@/features/users/queries'
 import { vmsListQueryOptions } from '@/features/vm/queries'
 import {
   keyExpiryText,
@@ -40,7 +45,6 @@ import {
 import { KeyLimitsDialog } from './key-limits-dialog'
 import { keyLimitsPayload, type KeyLimitsDraft } from './key-payload'
 import { KeyRevealDialog, type RevealedKey } from './key-reveal-dialog'
-import { VmPoolsCard, vmPoolsQueryOptions } from './vm-pools-card'
 
 // 统计弹窗带 recharts（约 100 KB gzip），只在点开时加载。
 const KeyStatsDialog = lazy(() =>
@@ -52,7 +56,7 @@ export function KeysPage() {
   const q = useQuery(apiKeysQueryOptions())
   const me = useQuery(meQueryOptions())
   const isAdmin = me.data?.role === 'admin'
-  const pools = useQuery({ ...vmPoolsQueryOptions(), enabled: isAdmin })
+  const pools = useQuery({ ...schedulerPoolsQueryOptions(), enabled: isAdmin })
   const vms = useQuery(vmsListQueryOptions())
   const vmItems = vms.data?.items || []
   const [createOpen, setCreateOpen] = useState(false)
@@ -64,9 +68,18 @@ export function KeysPage() {
   const [rotateId, setRotateId] = useState('')
   const [revealed, setRevealed] = useState<RevealedKey | null>(null)
   const [delId, setDelId] = useState('')
+  const dialogOpen = createOpen || !!editId
   const channels = useQuery({
     ...apiEndpointsQueryOptions(),
-    enabled: isAdmin && (createOpen || !!editId),
+    enabled: isAdmin && dialogOpen,
+  })
+  const users = useQuery({
+    ...usersQueryOptions(),
+    enabled: isAdmin && dialogOpen,
+  })
+  const gemini = useQuery({
+    ...geminiInventoryOptions(),
+    enabled: isAdmin && dialogOpen,
   })
   const keys = q.data?.keys || []
   const editing = keys.find((k) => k.id === editId) || null
@@ -212,7 +225,33 @@ export function KeysPage() {
       description='发给客户端的 sk-vm- 密钥。请求走这张密钥，不要把主控密钥写进环境变量。'
       extra={<Button onClick={() => setCreateOpen(true)}>生成</Button>}
     >
-      {isAdmin ? <VmPoolsCard vms={vmItems} /> : null}
+      {isAdmin ? (
+        <div className='mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-card/70 px-4 py-3'>
+          <div className='flex items-start gap-2.5'>
+            <Network
+              className='mt-0.5 size-4 shrink-0 text-primary'
+              aria-hidden
+            />
+            <div>
+              <div className='text-sm font-medium'>
+                分组池管理已迁移至独立工作台
+                {pools.data ? `（当前 ${pools.data.length} 个分组池）` : ''}
+              </div>
+              <p className='text-xs text-muted-foreground'>
+                支持 Anthropic / OpenAI / Google / API
+                全平台建池、权重等级编排、双级粘性与 Anthropic System Prompt
+                隔离。在下方创建或编辑密钥可直接绑定默认池与允许池列表。
+              </p>
+            </div>
+          </div>
+          <Button asChild size='sm' variant='outline'>
+            <Link to='/pools'>
+              前往分组池
+              <ArrowRight className='size-3.5' />
+            </Link>
+          </Button>
+        </div>
+      ) : null}
       <QueryGate
         loading={q.isLoading}
         error={q.error}
@@ -276,10 +315,12 @@ export function KeysPage() {
         vms={vmItems}
         vmsReady={vms.isSuccess && !vms.isFetching}
         vmsError={vms.isError}
-        pools={isAdmin ? pools.data?.pools || [] : undefined}
+        pools={isAdmin ? pools.data || [] : undefined}
         channels={isAdmin ? channels.data?.items || [] : undefined}
         channelsLoading={channels.isPending}
         channelsError={channels.isError}
+        users={isAdmin ? users.data?.items || [] : undefined}
+        geminiEnvs={isAdmin ? gemini.data?.environments || [] : undefined}
         onSubmit={(draft) => create.mutate(draft)}
       />
       <KeyLimitsDialog
@@ -292,10 +333,12 @@ export function KeysPage() {
         vms={vmItems}
         vmsReady={vms.isSuccess && !vms.isFetching}
         vmsError={vms.isError}
-        pools={isAdmin ? pools.data?.pools || [] : undefined}
+        pools={isAdmin ? pools.data || [] : undefined}
         channels={isAdmin ? channels.data?.items || [] : undefined}
         channelsLoading={channels.isPending}
         channelsError={channels.isError}
+        users={isAdmin ? users.data?.items || [] : undefined}
+        geminiEnvs={isAdmin ? gemini.data?.environments || [] : undefined}
         pending={edit.isPending}
         onSubmit={(draft) => {
           if (!editId) return
@@ -484,8 +527,17 @@ function KeyRow({
 }
 
 function scopeText(item: ApiKeyItem): string {
+  const defaultPool = item.default_pool_id || item.vm_pool_id
+  const allowedCount = (item.allowed_pool_ids || []).length
+  if (item.pool_binding_mode === 'strict_pool' || defaultPool) {
+    const label =
+      item.default_pool_name || item.vm_pool_name || defaultPool || '未指定'
+    const extra = allowedCount > 1 ? ` +${allowedCount - 1} 池` : ''
+    const modeTag =
+      item.pool_binding_mode === 'strict_pool' ? '严格分组池' : '分组池'
+    return `${modeTag} · ${label}${extra}`
+  }
   if (item.group_type === 'gemini') return 'Gemini · CRAGAnti'
-  if (item.vm_pool_id) return `账号池 · ${item.vm_pool_name || item.vm_pool_id}`
   const count = item.allowed_vms?.length || 0
   const unpinnedMulti =
     count === 0 &&

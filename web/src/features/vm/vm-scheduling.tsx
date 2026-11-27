@@ -20,6 +20,8 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { SEAT_CAP_MAX, SeatCells } from '@/components/scheduler-viz'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import { NodePoolBadges } from '@/features/pools/node-pool-badges'
+import { WeightTierBadge } from '@/features/pools/pool-badges'
 import {
   ChipGroup,
   FamilyLimitSelect,
@@ -486,7 +488,7 @@ export function VmSchedulingBlock({
               : '—'
           }
           own={vm.schedule_level_mode === 'manual'}
-          title='数值越大越优先；自动模式按 7D 重置倒计时计算'
+          title='权重等级 1–10，数值越大越优先；manual 为手动固定，auto 按 7D 重置倒计时计算（1–7）'
         />
         <Tile
           label='工作时段'
@@ -526,6 +528,23 @@ export function VmSchedulingBlock({
               />
             ))}
       </div>
+      {Number.isInteger(level) && level >= 1 && level <= 10 ? (
+        <div className='flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-2 text-[11px]'>
+          <div className='flex flex-wrap items-center gap-1.5'>
+            <span className='text-muted-foreground'>权重模式</span>
+            <WeightTierBadge
+              tier={level}
+              mode={vm.schedule_level_mode === 'manual' ? 'manual' : 'auto'}
+            />
+          </div>
+          <NodePoolBadges pools={vm.pools} maxVisible={3} />
+        </div>
+      ) : vm.pools?.length ? (
+        <div className='flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-2 text-[11px]'>
+          <span className='text-muted-foreground'>所属分组池</span>
+          <NodePoolBadges pools={vm.pools} maxVisible={3} />
+        </div>
+      ) : null}
     </div>
   )
 }

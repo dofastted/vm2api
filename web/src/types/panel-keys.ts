@@ -35,6 +35,11 @@ export type ApiKeyItem = {
   /** all = 全局可调度。anthropic / openai 必须带 allowed_vms。 */
   group_type?: 'all' | 'anthropic' | 'openai' | 'gemini'
   allowed_vms?: string[]
+  /** 新版统一分组池绑定字段（兼容旧 vm_pool_id / vm_pool_name）。 */
+  pool_binding_mode?: 'strict_pool' | 'legacy_scope'
+  default_pool_id?: string | null
+  default_pool_name?: string | null
+  allowed_pool_ids?: string[]
   vm_pool_id?: string | null
   vm_pool_name?: string | null
   /** 允许的模型（按客户端请求里的名字精确匹配，不分大小写）。空 = 不限。 */

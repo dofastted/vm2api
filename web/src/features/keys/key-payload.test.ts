@@ -31,6 +31,9 @@ describe('API key limit payload', () => {
         group_type: 'gemini',
         category: 'oauth',
         allowed_vms: [],
+        pool_binding_mode: 'legacy_scope',
+        default_pool_id: null,
+        allowed_pool_ids: [],
         vm_pool_id: null,
       })
     }
@@ -41,6 +44,7 @@ describe('API key limit payload', () => {
       keyLimitsPayload({ ...gemini, category: 'api' }, 'create')
     ).toThrow('宿主机 OAuth')
   })
+
   it('keeps request and USD quotas separate', () => {
     expect(keyLimitsPayload(draft, 'create')).toEqual({
       name: 'ops',
@@ -83,16 +87,42 @@ describe('API key limit payload', () => {
     ).toThrow('最多 200 个')
   })
 
-  it('sends category only for admins', () => {
-    expect(keyLimitsPayload(draft, 'create', { isAdmin: true }).category).toBe(
-      'api'
+  it('sends category and permission fields only for admins', () => {
+    const adminPayload = keyLimitsPayload(
+      {
+        ...draft,
+        permission_tier: 'tenant',
+        owner_id: 'u_alice',
+        allowed_endpoints: ['ep_1', 'ep_1', ' ep_2 '],
+        allowed_gemini_envs: ['gem_1', ' '],
+      },
+      'create',
+      { isAdmin: true }
     )
-    expect(
-      keyLimitsPayload(draft, 'create', { isAdmin: false })
-    ).not.toHaveProperty('category')
-    expect(
-      keyLimitsPayload(draft, 'edit', { isAdmin: false })
-    ).not.toHaveProperty('category')
+    expect(adminPayload).toMatchObject({
+      category: 'api',
+      permission_tier: 'tenant',
+      owner_id: 'u_alice',
+      allowed_endpoints: ['ep_1', 'ep_2'],
+      allowed_gemini_envs: ['gem_1'],
+    })
+
+    const nonAdmin = keyLimitsPayload(
+      {
+        ...draft,
+        permission_tier: 'tenant',
+        owner_id: 'u_alice',
+        allowed_endpoints: ['ep_1'],
+        allowed_gemini_envs: ['gem_1'],
+      },
+      'create',
+      { isAdmin: false }
+    )
+    expect(nonAdmin).not.toHaveProperty('category')
+    expect(nonAdmin).not.toHaveProperty('permission_tier')
+    expect(nonAdmin).not.toHaveProperty('owner_id')
+    expect(nonAdmin).not.toHaveProperty('allowed_endpoints')
+    expect(nonAdmin).not.toHaveProperty('allowed_gemini_envs')
   })
 
   it('omits create-only fields from edits and rejects invalid quotas', () => {
@@ -162,54 +192,75 @@ describe('API key limit payload', () => {
       )
     ).toMatchObject({
       category: 'oauth',
+      permission_tier: 'tenant',
+      owner_id: 'u_alice',
       group_type: 'anthropic',
       allowed_vms: [],
     })
   })
 
-  it('handles vm_pool_id for admin and strips it for non-admin', () => {
-    const pooledDraft: KeyLimitsDraft = {
+  it('handles strict_pool & legacy_scope bindings for admin and strips pool fields for non-admin', () => {
+    const strictDraft: KeyLimitsDraft = {
       ...draft,
-      group_type: 'pool',
-      vm_pool_id: 'pool_12345678',
+      category: 'oauth',
+      group_type: 'all',
+      pool_binding_mode: 'strict_pool',
+      default_pool_id: 'pool_12345678',
+      allowed_pool_ids: ['pool_87654321'],
     }
 
-    // Admin creates key with pool
-    const adminCreate = keyLimitsPayload(pooledDraft, 'create', {
+    const adminCreate = keyLimitsPayload(strictDraft, 'create', {
       isAdmin: true,
     })
-    expect(adminCreate.vm_pool_id).toBe('pool_12345678')
-    expect(adminCreate.group_type).toBe('all')
-    expect(adminCreate.allowed_vms).toEqual([])
+    expect(adminCreate).toMatchObject({
+      pool_binding_mode: 'strict_pool',
+      default_pool_id: 'pool_12345678',
+      allowed_pool_ids: ['pool_12345678', 'pool_87654321'],
+      vm_pool_id: 'pool_12345678',
+      group_type: 'all',
+      allowed_vms: [],
+    })
 
-    // Admin edits key with non-pool group_type -> vm_pool_id cleared to null
-    const adminEditAll = keyLimitsPayload(
-      { ...draft, group_type: 'all', vm_pool_id: 'pool_12345678' },
+    // Empty strict_pool fails closed
+    expect(() =>
+      keyLimitsPayload(
+        {
+          ...strictDraft,
+          default_pool_id: '',
+          allowed_pool_ids: [],
+        },
+        'create',
+        { isAdmin: true }
+      )
+    ).toThrow('至少选择一个分组池')
+
+    // Legacy mode with cleared pool resets pool fields to null / []
+    const adminLegacy = keyLimitsPayload(
+      {
+        ...draft,
+        group_type: 'all',
+        pool_binding_mode: 'legacy_scope',
+        default_pool_id: '',
+        allowed_pool_ids: [],
+      },
       'edit',
       { isAdmin: true }
     )
-    expect(adminEditAll.vm_pool_id).toBeNull()
-
-    // Non-admin payload must not carry vm_pool_id under any mode or group_type
-    const tenantCreate = keyLimitsPayload(
-      { ...draft, group_type: 'all', vm_pool_id: 'pool_12345678' },
-      'create',
-      { isAdmin: false }
-    )
-    expect(tenantCreate).not.toHaveProperty('vm_pool_id')
-
-    const tenantEdit = keyLimitsPayload(
-      { ...draft, group_type: 'all', vm_pool_id: 'pool_12345678' },
-      'edit',
-      { isAdmin: false }
-    )
-    expect(tenantEdit).not.toHaveProperty('vm_pool_id')
-
-    // If non-admin passes group_type: 'pool' (e.g. from tampered client state), fallback cleanly without vm_pool_id
-    const tenantTampered = keyLimitsPayload(pooledDraft, 'create', {
-      isAdmin: false,
+    expect(adminLegacy).toMatchObject({
+      pool_binding_mode: 'legacy_scope',
+      default_pool_id: null,
+      allowed_pool_ids: [],
+      vm_pool_id: null,
     })
-    expect(tenantTampered).not.toHaveProperty('vm_pool_id')
-    expect(tenantTampered.group_type).toBe('all')
+
+    // Non-admin payload never carries pool fields
+    for (const mode of ['create', 'edit'] as const) {
+      const tenant = keyLimitsPayload(strictDraft, mode, { isAdmin: false })
+      expect(tenant).not.toHaveProperty('pool_binding_mode')
+      expect(tenant).not.toHaveProperty('default_pool_id')
+      expect(tenant).not.toHaveProperty('allowed_pool_ids')
+      expect(tenant).not.toHaveProperty('vm_pool_id')
+      expect(tenant.group_type).toBe('all')
+    }
   })
 })
