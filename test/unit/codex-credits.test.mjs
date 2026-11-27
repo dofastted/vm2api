@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { admitCodexCandidate, handleCodexProtocol } from '../../src/lib/protocol/handle-codex.mjs'
+import { handleCodexProtocol } from '../../src/lib/protocol/handle-codex.mjs'
 import { getVm, listVms } from '../../src/lib/vm/vm-registry.mjs'
 import { persistCodexQuotaSnapshot } from '../../src/lib/vm/codex-slot.mjs'
 import {
@@ -11,10 +11,7 @@ import {
   resetStaleCodexCreditsRefreshState,
   CHATGPT_USAGE_URL,
   CHATGPT_RESET_CREDITS_URL,
-  CHATGPT_RESET_CONSUME_URL,
 } from '../../src/lib/oauth/openai-quota.mjs'
-import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
-import { SessionLimitRegistry } from '../../src/lib/pool/session-limit.mjs'
 import {
   CODEX_CREDITS_TTL_MS,
   codexCreditsFromHeaders,
@@ -30,6 +27,7 @@ import {
 } from '../../src/lib/pool/codex-slot-pool.mjs'
 import { evaluateOpenAIQuotaGate } from '../../src/lib/pool/openai-quota-policy.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
 
 beforeEach(() => {
   resetOpenAIAccountRuntime()
@@ -89,6 +87,25 @@ function fixture(t, codex = {}) {
 }
 
 async function hop(root, { status = 200, headers = {}, code = 'usage_limit_reached' } = {}) {
+  let seq = 0
+  const mockRuntime = {
+    async acquireNode(params) {
+      const excluded = new Set(params.excludeNodes || [])
+      if (excluded.has('codex_vm:vm-a')) {
+        throw new SchedulerApiError({ status: 503, code: 'pool_exhausted', message: 'exhausted' })
+      }
+      return {
+        lease_id: `credits-lease-${++seq}`,
+        lease_ttl_ms: 30_000,
+        selected_node: { node_type: 'codex_vm', node_id: 'vm-a', node_key: 'codex_vm:vm-a' },
+      }
+    },
+    async switchNode(body) {
+      return this.acquireNode(body.next_attempt || {})
+    },
+    async commitLease() {},
+    async releaseLease() {},
+  }
   await handleCodexProtocol({
     req: { headers: {}, apiKeyKind: 'user' },
     res: { headersSent: false, write() {}, end() {} },
@@ -101,6 +118,7 @@ async function hop(root, { status = 200, headers = {}, code = 'usage_limit_reach
     writeSSEHeaders() {},
     routing: {},
     projectRoot: root,
+    schedulerRuntime: mockRuntime,
     ops: {
       writeCodexKernelConfig() {},
       ensureCodexKernel: async () => ({ ok: true }),
@@ -321,320 +339,4 @@ test('credit-only reply headers refresh the reading', async (t) => {
   const summary = listVms(root).find((item) => item.id === 'vm-a')
   assert.equal(summary.codex_credits.unlimited, true)
   assert.equal(summary.codex_credits.has_credits, false)
-})
-
-function writePoolVm(root, id, codex = {}) {
-  fs.mkdirSync(path.join(root, 'vms', id), { recursive: true })
-  fs.writeFileSync(
-    path.join(root, 'vms', `${id}.json`),
-    JSON.stringify({
-      id,
-      platform: 'openai',
-      family: 'codex',
-      status: 'running',
-      schedulable: true,
-      proxy: { url: 'socks5h://127.0.0.1:1080' },
-      codex: { has_access: true, has_refresh: true, chatgpt_account_id: `${id}-acc`, ...codex },
-    }),
-  )
-  fs.writeFileSync(
-    path.join(root, 'vms', id, 'codex-credentials.json'),
-    JSON.stringify({
-      accounts: [{ id: 'codex', access_token: `at-${id}`, refresh_token: `rt-${id}`, chatgpt_account_id: `${id}-acc` }],
-    }),
-  )
-}
-
-test('single-slot 5h=100% with >10m stale positive credits refreshes on admission and forwards without consuming reset vouchers', async (t) => {
-  const liveNow = Date.now()
-  const fiveReset = new Date(liveNow + 2 * 3_600_000).toISOString()
-  const staleCredits = credits({ balance: '62408.90' }, liveNow - CODEX_CREDITS_TTL_MS - 5 * 60_000)
-  const root = fixture(t, {
-    extra: {
-      codex_primary_used_percent: 100,
-      codex_primary_window_minutes: 300,
-      codex_primary_reset_at: fiveReset,
-      codex_secondary_used_percent: 16,
-      codex_secondary_window_minutes: 10080,
-      codex_limited_until: fiveReset,
-    },
-    credits: staleCredits,
-  })
-
-  const quotaUrls = []
-  let kernelCalls = 0
-  const res = { statusCode: 0, body: null, headersSent: false, write() {}, end() {} }
-  await handleCodexProtocol({
-    req: { headers: {}, apiKeyKind: 'user' },
-    res,
-    protocol: 'openai.responses',
-    ctx: { body: { model: 'gpt-5.4', input: 'continue with credits', stream: false } },
-    inbound: { stream: false },
-    logBag: {},
-    stats: { errors: 0, requests: 0, by_route: {} },
-    json: (_r, status, body) => {
-      res.statusCode = status
-      res.body = body
-      return body
-    },
-    writeSSEHeaders() {},
-    routing: {},
-    projectRoot: root,
-    ops: {
-      writeCodexKernelConfig() {},
-      ensureCodexKernel: async () => ({ ok: true }),
-      quotaFetchImpl: async (url) => {
-        quotaUrls.push(String(url))
-        if (String(url) === CHATGPT_RESET_CONSUME_URL) {
-          assert.fail('must never consume reset vouchers during stale credits refresh')
-        }
-        if (String(url).startsWith(CHATGPT_USAGE_URL)) {
-          return {
-            status: 200,
-            json: async () => ({
-              rate_limit: {
-                primary_window: { used_percent: 100, limit_window_seconds: 18000, reset_after_seconds: 7200 },
-                secondary_window: { used_percent: 16, limit_window_seconds: 604800, reset_after_seconds: 86400 },
-              },
-              rate_limit_reset_credits: { available_count: 1 },
-              credits: { has_credits: true, unlimited: false, balance: '62408.90' },
-            }),
-          }
-        }
-        if (String(url).startsWith(CHATGPT_RESET_CREDITS_URL)) return { status: 200, json: async () => [] }
-        throw new Error(`unexpected ${url}`)
-      },
-      streamCodexKernel: async () => {
-        kernelCalls += 1
-        return {
-          ok: true,
-          status: 200,
-          committed: false,
-          headers: {},
-          body: { id: 'resp_recovered' },
-        }
-      },
-    },
-  })
-
-  assert.equal(res.statusCode, 200)
-  assert.equal(res.body.id, 'resp_recovered')
-  assert.equal(kernelCalls, 1)
-  assert.ok(quotaUrls.some((u) => u.startsWith(CHATGPT_USAGE_URL)))
-  assert.equal(quotaUrls.includes(CHATGPT_RESET_CONSUME_URL), false)
-
-  const vmAfter = getVm(root, 'vm-a')
-  assert.equal(vmAfter.codex.credits.balance, '62408.90')
-  assert.equal(hasSpendableCodexCredits(vmAfter), true)
-  assert.equal(vmAfter.codex.extra.codex_limited_until, undefined)
-  assert.equal(vmAfter.temp_unschedulable_reason, undefined)
-})
-
-test('sticky-bound slot with 5h=100% and >10m stale credits refreshes before unbinding and preserves response continuation', async (t) => {
-  const liveNow = Date.now()
-  const fiveReset = new Date(liveNow + 2 * 3_600_000).toISOString()
-  const root = fixture(t, {
-    extra: {
-      codex_primary_used_percent: 100,
-      codex_primary_window_minutes: 300,
-      codex_primary_reset_at: fiveReset,
-      codex_secondary_used_percent: 16,
-      codex_secondary_window_minutes: 10080,
-      codex_limited_until: fiveReset,
-    },
-    credits: credits({ balance: '62408.90' }, liveNow - CODEX_CREDITS_TTL_MS - 60_000),
-  })
-  // Add a second healthy slot: sticky session on vm-a must still stay on vm-a instead of dropping as gone!
-  writePoolVm(root, 'vm-b', {
-    extra: {
-      codex_primary_used_percent: 10,
-      codex_primary_window_minutes: 300,
-      codex_secondary_used_percent: 5,
-      codex_secondary_window_minutes: 10080,
-    },
-  })
-
-  const stickyRouter = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  const sessions = new SessionLimitRegistry()
-  const req = { headers: { 'x-session-id': 'conv-sticky-1' }, apiKeyKind: 'user' }
-  const body = { model: 'gpt-5.4', previous_response_id: 'resp_prev_1', input: 'follow up', stream: false }
-  const sessionKey = stickyRouter.extractPoolKey(req, body, { platform: 'openai' })
-  stickyRouter.bind(sessionKey, { accountId: 'vm-a', vmId: 'vm-a', sessionId: 'sess-a' })
-  sessions.touch('vm-a', sessionKey)
-
-  const admitted = await admitCodexCandidate(
-    root,
-    req,
-    { stickyRouter, sessions, body, excluded: new Set(), routing: {} },
-    {
-      deadline: liveNow + 5_000,
-      signal: new AbortController().signal,
-      fetchImpl: usageFetch({
-        rate_limit: {
-          primary_window: { used_percent: 100, limit_window_seconds: 18000, reset_after_seconds: 7200 },
-          secondary_window: { used_percent: 16, limit_window_seconds: 604800, reset_after_seconds: 86400 },
-        },
-        rate_limit_reset_credits: { available_count: 0 },
-        credits: { has_credits: true, unlimited: false, balance: '62400.00' },
-      }),
-    },
-  )
-
-  assert.ok(admitted.lease)
-  admitted.lease.release()
-  assert.equal(admitted.vmId, 'vm-a')
-  assert.equal(admitted.picked.boundState, 'live')
-  assert.equal(admitted.picked.sticky, true)
-  assert.equal(stickyRouter.resolve(sessionKey)?.vmId, 'vm-a')
-})
-
-test('multi-slot pool serves immediately on healthy slot while background-refreshing idle stale-credit slot', async (t) => {
-  const liveNow = Date.now()
-  const fiveReset = new Date(liveNow + 2 * 3_600_000).toISOString()
-  const root = fixture(t, {
-    extra: {
-      codex_primary_used_percent: 100,
-      codex_primary_window_minutes: 300,
-      codex_primary_reset_at: fiveReset,
-      codex_secondary_used_percent: 16,
-      codex_secondary_window_minutes: 10080,
-      codex_limited_until: fiveReset,
-    },
-    credits: credits({ balance: '62408.90' }, liveNow - CODEX_CREDITS_TTL_MS - 120_000),
-  })
-  writePoolVm(root, 'vm-healthy', {
-    extra: {
-      codex_primary_used_percent: 12,
-      codex_primary_window_minutes: 300,
-      codex_secondary_used_percent: 8,
-      codex_secondary_window_minutes: 10080,
-    },
-  })
-
-  let bgStarted = false
-  let finishBgRefresh
-  const bgDone = new Promise((resolve) => {
-    finishBgRefresh = resolve
-  })
-
-  let routedVmId = null
-  const res = { statusCode: 0, body: null, headersSent: false, write() {}, end() {} }
-  await handleCodexProtocol({
-    req: { headers: {}, apiKeyKind: 'user' },
-    res,
-    protocol: 'openai.responses',
-    ctx: { body: { model: 'gpt-5.4', input: 'fast path', stream: false } },
-    inbound: { stream: false },
-    logBag: {},
-    stats: { errors: 0, requests: 0, by_route: {} },
-    json: (_r, status, body) => {
-      res.statusCode = status
-      res.body = body
-      return body
-    },
-    writeSSEHeaders() {},
-    routing: {},
-    projectRoot: root,
-    ops: {
-      writeCodexKernelConfig() {},
-      ensureCodexKernel: async () => ({ ok: true }),
-      quotaFetchImpl: async (url) => {
-        if (String(url).startsWith(CHATGPT_USAGE_URL)) {
-          bgStarted = true
-          await bgDone
-          return {
-            status: 200,
-            json: async () => ({
-              rate_limit: {
-                primary_window: { used_percent: 100, limit_window_seconds: 18000, reset_after_seconds: 7200 },
-                secondary_window: { used_percent: 16, limit_window_seconds: 604800, reset_after_seconds: 86400 },
-              },
-              rate_limit_reset_credits: { available_count: 0 },
-              credits: { has_credits: true, unlimited: false, balance: '62408.90' },
-            }),
-          }
-        }
-        return { status: 200, json: async () => [] }
-      },
-      streamCodexKernel: async ({ exec }) => {
-        routedVmId = exec.vmId
-        return {
-          ok: true,
-          status: 200,
-          committed: false,
-          headers: {},
-          body: { id: 'resp_fast' },
-        }
-      },
-    },
-  })
-
-  // Foreground request completed immediately on vm-healthy BEFORE bgDone resolved!
-  assert.equal(res.statusCode, 200)
-  assert.equal(routedVmId, 'vm-healthy')
-  assert.equal(bgStarted, true)
-
-  finishBgRefresh()
-  for (let i = 0; i < 20 && !hasSpendableCodexCredits(getVm(root, 'vm-a')); i++) {
-    await new Promise((resolve) => setTimeout(resolve, 5))
-  }
-  assert.equal(hasSpendableCodexCredits(getVm(root, 'vm-a')), true)
-  assert.deepEqual(pickCodexSlots(listVms(root)).ready.sort(), ['vm-a', 'vm-healthy'])
-})
-
-test('single-slot stale credits returns 503 quota_exhausted and throttles repeated requests when upstream refresh fails', async (t) => {
-  const liveNow = Date.now()
-  const fiveReset = new Date(liveNow + 2 * 3_600_000).toISOString()
-  const root = fixture(t, {
-    extra: {
-      codex_primary_used_percent: 100,
-      codex_primary_window_minutes: 300,
-      codex_primary_reset_at: fiveReset,
-      codex_limited_until: fiveReset,
-    },
-    credits: credits({ balance: '100.00' }, liveNow - CODEX_CREDITS_TTL_MS - 60_000),
-  })
-
-  let refreshCount = 0
-  const runOnce = async () => {
-    const res = { statusCode: 0, body: null, headersSent: false, write() {}, end() {} }
-    await handleCodexProtocol({
-      req: { headers: {}, apiKeyKind: 'user' },
-      res,
-      protocol: 'openai.responses',
-      ctx: { body: { model: 'gpt-5.4', input: 'blocked', stream: false } },
-      inbound: { stream: false },
-      logBag: {},
-      stats: { errors: 0, requests: 0, by_route: {} },
-      json: (_r, status, body) => {
-        res.statusCode = status
-        res.body = body
-        return body
-      },
-      writeSSEHeaders() {},
-      routing: {},
-      projectRoot: root,
-      ops: {
-        writeCodexKernelConfig() {},
-        ensureCodexKernel: async () => ({ ok: true }),
-        quotaFetchImpl: async (url) => {
-          if (String(url).startsWith(CHATGPT_USAGE_URL)) {
-            refreshCount += 1
-            return { status: 200, json: async () => ({ rate_limit: WEEK_SPENT_RATE_LIMIT, credits: null }) }
-          }
-          return { status: 200, json: async () => [] }
-        },
-        streamCodexKernel: async () => assert.fail('must not forward when quota remains exhausted'),
-      },
-    })
-    return res
-  }
-
-  const first = await runOnce()
-  const second = await runOnce()
-  assert.equal(first.statusCode, 503)
-  assert.equal(first.body.error.code, 'quota_exhausted')
-  assert.equal(second.statusCode, 503)
-  assert.equal(second.body.error.code, 'quota_exhausted')
-  assert.equal(refreshCount, 1, 'second request within cooldown does not re-query /wham/usage')
 })

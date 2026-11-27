@@ -1,17 +1,17 @@
 /**
- * Codex hop from handle-protocol. Claude convert/pool/CRS never runs here.
+ * Codex hop from handle-protocol backed solely by Rust `kin-scheduler` (M3 / D4).
+ * Claude convert/pool/CRS never runs here; OpenAI nodes are hard-locked to passthrough.
  */
+import crypto from 'node:crypto'
 import path from 'node:path'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { upstreamRiskClientError } from './intercept-gate.mjs'
 import { buildAnthropicSseError } from './stream-truncation.mjs'
 import { isClientStream, fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions } from './convert.mjs'
-import { getVm, listVms, persistCodexUsage, summarizeVm, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
-import { listVmRecordFiles, readJsonCached } from '../vm/vm-file.mjs'
+import { getVm, listVms, persistCodexUsage } from '../vm/vm-registry.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
 import { ownerScopeFromRequest, pinnedVmIdFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
-import { normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
 import { restrictCodexClient } from './codex-restriction.mjs'
 import {
   responsesSseToChatChunk,
@@ -30,7 +30,6 @@ import {
   codexQuotaPark,
   CODEX_DEFAULT_PARK_MS,
 } from './codex-usage.mjs'
-import { needsStaleCodexCreditsRefresh, refreshStaleCodexCreditsForVm } from '../oauth/openai-quota.mjs'
 import { disjointOpenaiUsage, mergeUsage, preferUsage } from './openai-usage.mjs'
 import { streamCodexKernel } from '../transport/codex-kernel-client.mjs'
 import { ensureRedaction, maskJson, restoreJsonValue } from '../redaction/runtime.mjs'
@@ -66,15 +65,7 @@ import {
   makeProxyFetch,
   refreshCodexAccessToken,
 } from './codex-models.mjs'
-import { orderCodexSessionSlots, codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
-import {
-  holdOpenAIAccount,
-  reportOpenAIAttempt,
-  tryAcquireOpenAISlot,
-  waitForOpenAICapacity,
-  wakeOpenAIWaiter,
-} from '../pool/openai-account-runtime.mjs'
-import { CLIENT_POOL_BUSY_MESSAGE, CLIENT_POOL_UNAVAILABLE_MESSAGE, ErrorCode } from '../core/errors.mjs'
+import { codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
 import { applyOpenaiWashLog } from './openai-wash.mjs'
 import { canonicalImageToolModel, imageGenerationTools } from './image-tool-models.mjs'
 import { isImageToolModelEnabled, resolveGptFastAlias } from './gpt-model-policy.mjs'
@@ -86,10 +77,20 @@ import {
   firstUserIdentityText,
   outboundSessionMode,
   resolveOutboundSessionId,
+  resolveSchedulerIdentity,
 } from '../identity/identity-rewrite.mjs'
 import { clientIp } from '../pool/sticky-router.mjs'
 import { withCredentialRefreshLock } from '../transport/go-worker-client.mjs'
 import { compileWithProtoFront, protoFrontMode, transcodeWithProtoFront } from '../transport/proto-front-client.mjs'
+import { queueAllowedByHeaders } from './queue-hint.mjs'
+import {
+  SchedulerApiError,
+  SchedulerUnavailableError,
+  VIRTUAL_POOL_IDS,
+  classifyErrorClass,
+  formatNodeKey,
+  formatSchedulerError,
+} from '../scheduler/scheduler-runtime.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
@@ -220,108 +221,6 @@ function applyCodexRebuildBody(body, sessionId, mode) {
   return out
 }
 
-function pickCodexCandidatesWithPool(
-  projectRoot,
-  req,
-  {
-    stickyRouter = null,
-    sessions = null,
-    body = null,
-    excluded = null,
-    routing = {},
-    ownerScope = null,
-    keyScope = null,
-    pinVmId = undefined,
-  } = {},
-) {
-  // The caller resolves the pin when it knows the key owner's role; alone, only the master key pins.
-  const pin = pinVmId === undefined ? pinnedVmIdFromRequest(req) : pinVmId
-  const owner = ownerScope || ownerScopeFromRequest(req)
-  const model = body?.model || null
-  const routingPolicy = normalizeCodexRouting(routing.codex || routing).quota
-  const scope = keyScope || keyScopeFromRequest(req)
-  const poolDenial = vmPoolDenial(scope)
-  if (poolDenial) {
-    return {
-      picked: { error: 'vm_pool_unavailable', message: poolDenial.message, ids: [], candidates: [] },
-      poolVms: [],
-    }
-  }
-  if (scope.group_type === 'anthropic') {
-    return { picked: { error: 'key_group_mismatch', ids: [], candidates: [] }, poolVms: [] }
-  }
-  if (pin) {
-    const vm = getVm(projectRoot, pin)
-    if (!vm || !isCodexVm(vm)) return { picked: { error: 'platform_mismatch', pin, ids: [] }, poolVms: [] }
-    if (!keyAllowsVm(scope, vm)) return { picked: { error: 'key_group_mismatch', pin, ids: [] }, poolVms: [] }
-    if (!codexSlotAllowsModel(vm, model)) return { picked: { error: 'model_not_allowed', pin, ids: [] }, poolVms: [] }
-    const ordered = orderCodexSessionSlots([vm], {
-      pin,
-      excluded,
-      quotaPolicy: routingPolicy,
-    })
-    return { picked: { ...ordered, pin, sticky: false, sessionKey: null, stickyKeys: [] }, poolVms: [] }
-  }
-  // Quota sync only needs the raw records; the summarized list is built once, after it.
-  const vmDir = path.join(projectRoot, 'vms')
-  for (const file of listVmRecordFiles(vmDir)) {
-    let vm
-    try {
-      vm = readJsonCached(path.join(vmDir, file))
-    } catch {
-      continue
-    }
-    if (!vm?.id || !isCodexVm(vm)) continue
-    syncCodexQuotaSchedule(projectRoot, vm, { policy: routingPolicy })
-  }
-  const stickyKeys = stickyRouter?.collectPoolKeys?.(req, body || {}, { platform: 'openai' }) || []
-  const sessionKey = stickyRouter?.extractPoolKey?.(req, body || {}, { platform: 'openai' }) || stickyKeys[0] || null
-  const bound = sessionKey ? stickyRouter?.resolve?.(sessionKey) : null
-  const vms = listVms(projectRoot, { codex: { quota: routingPolicy } }).filter(
-    (vm) => vmMatchesOwnerScope(vm, owner) && keyAllowsVm(scope, vm),
-  )
-  const continuesResponse = !!body?.previous_response_id && !!bound?.vmId
-  if (scope.vm_pool_id && vms.length === 0 && !continuesResponse) {
-    return {
-      picked: { error: 'vm_pool_unavailable', message: '账号池没有可调度的 GPT 槽位', ids: [], candidates: [] },
-      poolVms: [],
-    }
-  }
-  const ordered = orderCodexSessionSlots(continuesResponse ? vms.filter((vm) => vm.id === bound.vmId) : vms, {
-    boundVmId: bound?.vmId || null,
-    sessionKey,
-    sessionLimit: sessions,
-    model,
-    excluded,
-    quotaPolicy: routingPolicy,
-  })
-  // A resting home migrates the conversation like a gone one: the next slot rebinds it.
-  const boundLeft = ordered.boundState === 'gone' || ordered.boundState === 'resting'
-  if (bound?.vmId && sessionKey && boundLeft) {
-    for (const key of stickyKeys.length ? stickyKeys : [sessionKey]) stickyRouter?.unbind?.(key)
-    try {
-      sessions?.drop?.(bound.vmId, sessionKey)
-    } catch {}
-  }
-  if (continuesResponse && (boundLeft || ordered.error === 'candidates_exhausted')) {
-    return {
-      picked: { error: 'response_not_portable', ids: [], sessionKey, stickyKeys, boundVmId: bound.vmId },
-      poolVms: vms,
-    }
-  }
-  return { picked: { ...ordered, sessionKey, stickyKeys }, poolVms: vms }
-}
-
-/**
- * Current OpenAI candidates, re-read on every admission. A busy home keeps
- * its pin; only a home that left the pool for good releases the session.
- * A request that continues a stored response (`previous_response_id`) can
- * only run where that response lives.
- */
-export function pickCodexCandidates(projectRoot, req, opts = {}) {
-  return pickCodexCandidatesWithPool(projectRoot, req, opts).picked
-}
-
 function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = null) {
   const headers = result?.headers || {}
   const extra = extraFromCodexHeaders(headers, now)
@@ -359,12 +258,6 @@ export function isRetryableCodexTransport(result) {
   return /upstream_transport|worker_transport_error/i.test(code)
 }
 
-/**
- * Grant-death 签名：OpenAI 吊销回 `error.code=token_revoked` /
- * "Encountered invalidated oauth token"。与 claude 池 GRANT_DEAD 词表对齐，
- * 但不含 invalid_grant——那是轮换竞态的常见假阳性（旧 RT 重放），
- * refreshCodexAccessToken 的严格分类同样把它留给 refresh_rejected。
- */
 export function isCodexGrantDead(result) {
   if (!result || result.ok === true) return false
   const status = Number(result.status) || 0
@@ -373,13 +266,6 @@ export function isCodexGrantDead(result) {
   return /token_revoked|invalidated oauth token|token has been revoked|oauth_revoked/i.test(hay)
 }
 
-/**
- * Short process-local hold for an account that just failed upstream. This is
- * not the operator scheduling switch: it expires by itself and keeps the next
- * request from spending another turn on the same dead 401 / rate-limited
- * account. Committed streams and request-shaped errors are never parked.
- * Grant death (token_revoked) is permanent and handled by the disk park.
- */
 export function codexFailureHold(result, now = Date.now()) {
   if (!result || result.ok === true || result.committed === true) return null
   const status = Number(result.status) || 0
@@ -403,15 +289,12 @@ export function codexFailureHold(result, now = Date.now()) {
   return null
 }
 
-/** Idle SOCKS / first hop 502 is retryable only before any SSE byte is committed. */
-/** Lowercased tier; empty, oversized or control-character values are not a tier. */
 function normalizeServiceTier(raw) {
   if (typeof raw !== 'string') return null
   const tier = raw.trim().toLowerCase()
   return tier && tier.length <= 64 && !/[\x00-\x1f\x7f]/.test(tier) ? tier : null
 }
 
-/** `response.service_tier` from a Responses SSE data line, if present. */
 export function serviceTierFromSseLine(line) {
   if (typeof line !== 'string' || !line.startsWith('data:') || !line.includes('service_tier')) return null
   try {
@@ -422,7 +305,6 @@ export function serviceTierFromSseLine(line) {
   }
 }
 
-/** Responses `usage` object from one SSE data line, if it carries token counts. */
 export function usageFromSseLine(line) {
   if (typeof line !== 'string' || !line.startsWith('data:') || !line.includes('usage')) return null
   try {
@@ -434,7 +316,6 @@ export function usageFromSseLine(line) {
   }
 }
 
-/** `tool_usage.image_gen` from a terminal Responses frame (official `response.tool_usage`). */
 export function imageGenUsageFromSseLine(line) {
   if (typeof line !== 'string' || !line.startsWith('data:') || !line.includes('tool_usage')) return null
   try {
@@ -447,7 +328,6 @@ export function imageGenUsageFromSseLine(line) {
   }
 }
 
-/** A known image model the GPT policy disabled is refused before any slot is picked. */
 function disabledImageTool(body, logBag) {
   for (const tool of imageGenerationTools(body)) {
     const model = typeof tool.model === 'string' ? tool.model.trim() : ''
@@ -456,17 +336,6 @@ function disabledImageTool(body, logBag) {
     if (isImageToolModelEnabled(model) === false) return model
   }
   return null
-}
-
-const WAIT_TIMEOUT_MIN_MS = 1000
-const WAIT_TIMEOUT_MAX_MS = 120000
-const DEFAULT_WAIT_TIMEOUT_MS = 30000
-
-/** Same knob and clamp as the Claude pool's fallback wait. */
-function codexWaitTimeoutMs(routing) {
-  const n = Number(routing?.pool?.fallback_wait_timeout_ms)
-  if (!Number.isFinite(n)) return DEFAULT_WAIT_TIMEOUT_MS
-  return Math.min(WAIT_TIMEOUT_MAX_MS, Math.max(WAIT_TIMEOUT_MIN_MS, n))
 }
 
 function clientGoneSignal(req, res) {
@@ -483,181 +352,145 @@ function clientGoneSignal(req, res) {
   }
 }
 
-function inspectCodexVmForRefresh(projectRoot, vmId, req, opts = {}, livePolicy = null) {
-  if (!vmId) return null
-  const scope = opts.keyScope || keyScopeFromRequest(req)
-  if (vmPoolDenial(scope) || scope.group_type === 'anthropic') return null
-  const owner = opts.ownerScope || ownerScopeFromRequest(req)
-  let raw
-  try {
-    raw = getVm(projectRoot, vmId)
-  } catch {
-    return null
+function isAbortErr(err, signal) {
+  return Boolean(signal?.aborted || err?.name === 'AbortError' || err?.code === 'ABORT_ERR')
+}
+
+function deterministicUuidFromSeed(seed) {
+  const hash = crypto.createHash('sha256').update(String(seed)).digest()
+  hash[6] = (hash[6] & 0x0f) | 0x40
+  hash[8] = (hash[8] & 0x3f) | 0x80
+  const hex = hash.toString('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`
+}
+
+function buildCodexFailureReport(result) {
+  const httpStatus = Number(result?.status) || 0
+  const code = String(result?.body?.error?.code || result?.error_code || result?.error || '').trim()
+  const msg = String(result?.body?.error?.message || result?.error || '').trim()
+  let errorClass
+  if (result?.grantDead === true || isCodexGrantDead(result)) {
+    errorClass = 'permanent_ban'
+  } else if (code === 'usage_limit_reached') {
+    errorClass = 'quota_exhausted'
+  } else {
+    errorClass = classifyErrorClass({
+      status: httpStatus,
+      errorCode: code,
+      reason: msg,
+      isTransport: Boolean(result?.transportError) || httpStatus === 0,
+      isTimeout: httpStatus === 408 || httpStatus === 504 || code === 'upstream_timeout',
+    })
   }
-  if (!raw || !isCodexVm(raw)) return null
-  const summary = summarizeVm(raw, projectRoot, { codex: { quota: livePolicy } })
-  if (!vmMatchesOwnerScope(summary, owner) || !keyAllowsVm(scope, summary)) return null
-  return raw.codex ? { ...summary, codex: raw.codex } : summary
-}
-
-function enrichPoolVmWithRawCodex(projectRoot, vm) {
-  let raw
-  try {
-    raw = getVm(projectRoot, vm.id)
-  } catch {
-    raw = null
+  const retryHdr = Number(result?.headers?.['retry-after'] ?? result?.headers?.['Retry-After'])
+  const retryAfterSec = Number.isFinite(retryHdr) && retryHdr > 0 ? Math.max(1, Math.ceil(retryHdr)) : undefined
+  return {
+    http_status: httpStatus,
+    error_class: errorClass,
+    ...(code ? { error_signature: code.slice(0, 128) } : {}),
+    ...(msg ? { error_message: msg.slice(0, 300) } : {}),
+    ...(retryAfterSec != null ? { retry_after_sec: retryAfterSec } : {}),
   }
-  return raw?.codex ? { ...vm, codex: raw.codex } : vm
 }
 
-function resolveBoundCodexVmId(req, opts = {}) {
-  if (!opts.stickyRouter) return null
-  const stickyKeys = opts.stickyRouter?.collectPoolKeys?.(req, opts.body || {}, { platform: 'openai' }) || []
-  const sessionKey =
-    opts.stickyRouter?.extractPoolKey?.(req, opts.body || {}, { platform: 'openai' }) || stickyKeys[0] || null
-  const bound = sessionKey ? opts.stickyRouter?.resolve?.(sessionKey) : null
-  return bound?.vmId || null
+function respondCodexSchedulerError({ res, json, stats, logBag, err }) {
+  stats.errors++
+  if (err instanceof SchedulerUnavailableError || err?.code === 'scheduler_unavailable') {
+    logBag.error_code = 'scheduler_unavailable'
+    logBag.error_message = err?.message || 'Rust scheduler sidecar is unavailable'
+    logBag.final_state = 'scheduler_unavailable'
+    if (!res.headersSent) res.setHeader?.('retry-after', '1')
+    return json(res, 503, {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        code: 'scheduler_unavailable',
+        message: logBag.error_message,
+      },
+    })
+  }
+  const formatted = formatSchedulerError(err)
+  logBag.error_code = formatted.code
+  logBag.error_message = formatted.body?.error?.message || null
+  if (formatted.explain) logBag.scheduler_explain = formatted.explain
+  logBag.final_state = formatted.status === 422 ? 'poison_abort' : 'failed'
+  if (formatted.retryAfterSec != null && !res.headersSent) {
+    res.setHeader?.('retry-after', String(formatted.retryAfterSec))
+  }
+  return json(res, formatted.status, formatted.body)
 }
 
-/**
- * Admission = fresh candidates + one synchronous seat claim.
- * - Refreshes a sticky-bound slot with expired prior credits before selection
- *   so `pickCodexCandidates` does not prematurely drop the sticky binding.
- * - Refreshes eligible pool slots with expired prior credits when selection
- *   yields no `normal` candidate (`quota_exhausted` / `capacity_unavailable`).
- * - Triggers non-blocking background refresh for other idle stale-credit slots
- *   when a healthy slot claims a seat immediately.
- * - When all eligible accounts are at concurrency/RPM capacity, waits FIFO up
- *   to `deadline`.
- */
-export async function admitCodexCandidate(
+function validateCodexPreconditions({
   projectRoot,
   req,
-  opts = {},
-  { deadline, signal, fetchImpl, now: fixedNow } = {},
-) {
-  let woken = null
-  const evalNow = () => (Number.isFinite(fixedNow) ? Number(fixedNow) : Date.now())
-  for (;;) {
-    const livePolicy = normalizeCodexRouting(opts.routing?.codex || opts.routing).quota
-    const pin = opts.pinVmId === undefined ? pinnedVmIdFromRequest(req) : opts.pinVmId
-    const model = opts.body?.model || null
-
-    if (!pin) {
-      const boundVmId = resolveBoundCodexVmId(req, opts)
-      if (boundVmId && !opts.excluded?.has(boundVmId)) {
-        const boundVm = inspectCodexVmForRefresh(projectRoot, boundVmId, req, opts, livePolicy)
-        if (
-          boundVm &&
-          codexSlotAllowsModel(boundVm, model) &&
-          needsStaleCodexCreditsRefresh(boundVm, livePolicy, evalNow())
-        ) {
-          if (signal?.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
-          if (!Number.isFinite(deadline) || evalNow() < deadline) {
-            const refreshed = await refreshStaleCodexCreditsForVm(projectRoot, boundVm.id, {
-              policy: livePolicy,
-              fetchImpl,
-              now: fixedNow,
-              signal,
-              deadline,
-            })
-            if (signal?.aborted || refreshed?.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
-          }
-        }
-      }
-    }
-
-    let { picked, poolVms } = pickCodexCandidatesWithPool(projectRoot, req, opts)
-
-    if (
-      !pin &&
-      !(picked.candidates?.length > 0) &&
-      (picked.error === 'quota_exhausted' || picked.error === 'capacity_unavailable')
-    ) {
-      const checkNow = evalNow()
-      const staleVms = poolVms
-        .filter((vm) => !opts.excluded?.has(vm.id) && codexSlotAllowsModel(vm, model) && vm.codex_credits != null)
-        .map((vm) => enrichPoolVmWithRawCodex(projectRoot, vm))
-        .filter((vm) => needsStaleCodexCreditsRefresh(vm, livePolicy, checkNow))
-      if (staleVms.length > 0) {
-        if (signal?.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
-        if (!Number.isFinite(deadline) || checkNow < deadline) {
-          const results = await Promise.all(
-            staleVms.map((vm) =>
-              refreshStaleCodexCreditsForVm(projectRoot, vm.id, {
-                policy: livePolicy,
-                fetchImpl,
-                now: fixedNow,
-                signal,
-                deadline,
-              }),
-            ),
-          )
-          if (signal?.aborted || results.some((item) => item?.aborted)) {
-            return { picked: { error: 'client_cancelled', ids: [] } }
-          }
-          if (results.some((item) => item?.refreshed)) {
-            ;({ picked, poolVms } = pickCodexCandidatesWithPool(projectRoot, req, opts))
-          }
-        }
-      }
-    }
-
-    if (picked.error && picked.error !== 'capacity_unavailable') return { picked }
-    for (const candidate of picked.candidates || []) {
-      const lease = tryAcquireOpenAISlot(candidate.id, {
-        concurrency: candidate.concurrency,
-        maxRpm: candidate.maxRpm,
-        quotaPolicy: livePolicy,
-      })
-      if (lease) {
-        if (!pin) {
-          const bgNow = evalNow()
-          for (const vm of poolVms) {
-            if (vm.id === candidate.id || vm.codex_credits == null) continue
-            const enriched = enrichPoolVmWithRawCodex(projectRoot, vm)
-            if (!needsStaleCodexCreditsRefresh(enriched, livePolicy, bgNow)) continue
-            refreshStaleCodexCreditsForVm(projectRoot, vm.id, {
-              policy: livePolicy,
-              fetchImpl,
-              now: fixedNow,
-            }).catch(() => {})
-          }
-        }
-        return { picked, vmId: candidate.id, lease }
-      }
-    }
-    const waitIds = picked.candidates?.length ? picked.candidates.map((candidate) => candidate.id) : picked.waitIds
-    // A woken waiter that missed a seat it can use lost it to a newer request;
-    // passing the wake on would only re-run selection for every waiter behind
-    // it. Hand it on only when the freed account is not one this request takes.
-    if (woken && (woken.accountId == null || !waitIds?.includes(woken.accountId))) {
-      wakeOpenAIWaiter(woken.accountId)
-    }
-    const now = evalNow()
-    if (now >= deadline) return { picked: { ...picked, error: 'capacity_unavailable', ids: [] } }
-    const retryAt = Number(picked.retryAt)
-    const sliceDeadline = Number.isFinite(retryAt) && retryAt > now ? Math.min(deadline, retryAt) : deadline
-    let waited
-    try {
-      waited = await waitForOpenAICapacity({
-        deadline: sliceDeadline,
-        signal,
-        accounts: Array.isArray(waitIds) ? waitIds : null,
-        front: !!woken,
-      })
-    } catch (error) {
-      if (error?.code === 'pool_wait_queue_full') return { picked: { error: 'pool_wait_queue_full', ids: [] } }
-      throw error
-    }
-    if (waited.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
-    woken = waited.woken ? { accountId: waited.accountId ?? null } : null
+  keyScope,
+  ownerScope,
+  pinVmId,
+  model,
+  res,
+  json,
+  stats,
+  logBag,
+}) {
+  const scope = keyScope || keyScopeFromRequest(req)
+  const poolDenial = vmPoolDenial(scope)
+  if (poolDenial) {
+    stats.errors++
+    logBag.error_code = 'vm_pool_unavailable'
+    json(res, 403, {
+      error: {
+        type: 'permission_error',
+        code: 'vm_pool_unavailable',
+        message: poolDenial.message || '账号池不可用',
+      },
+    })
+    return { ok: false, scope }
   }
+  if (scope.group_type === 'anthropic') {
+    stats.errors++
+    logBag.error_code = 'key_group_mismatch'
+    json(res, 403, {
+      error: { type: 'permission_error', code: 'key_group_mismatch', message: '此密钥不能调用 openai' },
+    })
+    return { ok: false, scope }
+  }
+  const pin = pinVmId === undefined ? pinnedVmIdFromRequest(req) : pinVmId
+  if (pin) {
+    const vm = getVm(projectRoot, pin)
+    if (!vm || !isCodexVm(vm)) {
+      stats.errors++
+      logBag.error_code = 'platform_mismatch'
+      json(res, 400, {
+        error: { type: 'invalid_request_error', code: 'platform_mismatch', message: `vm '${pin}' is not a GPT slot` },
+      })
+      return { ok: false, scope, pin }
+    }
+    if (!keyAllowsVm(scope, vm)) {
+      stats.errors++
+      logBag.error_code = 'key_group_mismatch'
+      json(res, 403, {
+        error: { type: 'permission_error', code: 'key_group_mismatch', message: '此密钥不能调用 openai' },
+      })
+      return { ok: false, scope, pin }
+    }
+    if (!codexSlotAllowsModel(vm, model)) {
+      stats.errors++
+      logBag.error_code = 'model_not_allowed'
+      json(res, 400, {
+        error: {
+          type: 'invalid_request_error',
+          code: 'model_not_allowed',
+          message: `model '${model || ''}' is not allowed on any GPT slot`,
+          param: 'model',
+        },
+      })
+      return { ok: false, scope, pin }
+    }
+  }
+  const owner = ownerScope || ownerScopeFromRequest(req)
+  return { ok: true, scope, owner, pin }
 }
 
-// Observed with gpt-6-astra + Responses Lite, not a documented upstream limit.
-// Keep the model gate tight until another Lite model shows the same 128 KiB failure.
-// Retry only a failed full-history attempt, keeping the newest reasoning suffix.
 export function reasoningHistoryFallback(args, result) {
   if (process.env.KIN_CODEX_REASONING_HISTORY_FALLBACK === '0') return null
   const body = args.body
@@ -734,8 +567,6 @@ export async function handleCodexProtocol({
   routing = {},
   projectRoot,
   ops = {},
-  stickyRouter = null,
-  sessions = null,
   body = null,
   captureOutbound = false,
   requestStartedAt = Date.now(),
@@ -748,6 +579,13 @@ export async function handleCodexProtocol({
   afterHop = null,
   ownerScope = null,
   pinVmId = undefined,
+  poolAccess = null,
+  originPoolId = null,
+  jevDowngradePoolId = null,
+  inboundIdentity = null,
+  isAdminDiagnostic = undefined,
+  allowQueue = undefined,
+  schedulerRuntime = null,
   cfg = null,
 }) {
   const pfMode = protoFrontMode()
@@ -894,58 +732,8 @@ export async function handleCodexProtocol({
       },
     })
   }
-  // Upstream Codex always streams; the caller still chooses JSON versus SSE.
-  const stream =
-    protocol === 'google.gemini'
-      ? String(ctx?.path || '').includes(':streamGenerateContent')
-      : isClientStream(inbound || ctx.body, req.headers) && ctx.body?.stream !== false
-  const useGoEgress =
-    pfMode === 'go' &&
-    (protocol === 'anthropic.messages' || protocol === 'google.gemini' || (protocol === 'openai.completions' && stream))
-  const inboundSession = sessionFrom(req, converted.body)
-  const sessionMode = outboundSessionMode(routing)
-  const callerSession = extractCallerSession({
-    inbound: converted.body,
-    body: converted.body,
-    headers: req.headers,
-  })
-  // Chat→Responses conversion can surface a session key the raw inbound lacked.
-  if (!logBag.session_id) logBag.session_id = sessionIdForLog(callerSession)
-  const firstUserIdentity = firstUserIdentityFromCodex(converted.body)
-  const hop = ops.streamCodexKernel || streamCodexKernel
-  const writeCfg = ops.writeCodexKernelConfig || writeCodexKernelConfig
-  const ensure = ops.ensureCodexKernel || ensureCodexKernel
-  const anthropicSse = protocol === 'anthropic.messages' ? createAnthropicSseState() : null
-  const chatSse =
-    protocol === 'openai.chat' || protocol === 'openai.completions'
-      ? { id: 'codex', seq: 0, tools: new Map(), sawTool: false }
-      : null
-  const pickOpts = {
-    stickyRouter,
-    sessions,
-    body: body || converted.body || inbound,
-    keyScope,
-    excluded: new Set(),
-    routing,
-    ownerScope,
-    pinVmId,
-  }
-  const deadline = Date.now() + codexWaitTimeoutMs(routing)
-  const gone = clientGoneSignal(req, res)
-  const failoverBudget = codexFailoverBudget(routing)
-  const sameRetryDelay = Number(routing?.failover?.same_account_retry_delay_ms)
-  const sameRetryDelayMs =
-    Number.isFinite(sameRetryDelay) && sameRetryDelay >= 0 ? Math.min(10_000, sameRetryDelay) : 100
-  logBag.via = 'codex-kernel'
-  logBag.attempt_count = 0
-  let last = null
-  let hops = 0
-  let attempts = 0
-  let switches = 0
-  let counted = false
-  let compatibleTools = null
-  // Enforce pre-dispatch JEV BEFORE admitCodexCandidate so blocked requests
-  // reserve zero Codex VM slots (eliminating Phase-3 slot-then-review inversion).
+
+  // Enforce pre-dispatch JEV BEFORE Rust `acquireNode` so blocked requests reserve zero slots.
   if (!isTrustedGateDecision(preDispatchDecision || req?._preDispatchDecision) && settings) {
     const riskState = resolveRiskRepos({ settings, refusalGuards, refusalDevices, refusalSessions })
     const candidateAccounts = projectCandidateAccounts({
@@ -989,34 +777,226 @@ export async function handleCodexProtocol({
       return json(res, clientErr.status, clientErr.body)
     }
   }
+
+  const preCheck = validateCodexPreconditions({
+    projectRoot,
+    req,
+    keyScope,
+    ownerScope,
+    pinVmId,
+    model: converted.body?.model,
+    res,
+    json,
+    stats,
+    logBag,
+  })
+  if (!preCheck.ok) return
+
+  const rt = schedulerRuntime || req?._schedulerRuntime || null
+  if (!rt) {
+    return respondCodexSchedulerError({
+      res,
+      json,
+      stats,
+      logBag,
+      err: new SchedulerUnavailableError('Rust scheduler runtime is unavailable for Codex dispatch', {
+        reason: 'runtime_missing',
+      }),
+    })
+  }
+
+  const stream =
+    protocol === 'google.gemini'
+      ? String(ctx?.path || '').includes(':streamGenerateContent')
+      : isClientStream(inbound || ctx.body, req.headers) && ctx.body?.stream !== false
+  const useGoEgress =
+    pfMode === 'go' &&
+    (protocol === 'anthropic.messages' || protocol === 'google.gemini' || (protocol === 'openai.completions' && stream))
+  const inboundSession = sessionFrom(req, converted.body)
+  const sessionMode = outboundSessionMode(routing)
+  const callerSession = extractCallerSession({
+    inbound: converted.body,
+    body: converted.body,
+    headers: req.headers,
+  })
+  if (!logBag.session_id) logBag.session_id = sessionIdForLog(callerSession)
+  const firstUserIdentity = firstUserIdentityFromCodex(converted.body)
+  const hop = ops.streamCodexKernel || streamCodexKernel
+  const writeCfg = ops.writeCodexKernelConfig || writeCodexKernelConfig
+  const ensure = ops.ensureCodexKernel || ensureCodexKernel
+  const anthropicSse = protocol === 'anthropic.messages' ? createAnthropicSseState() : null
+  const chatSse =
+    protocol === 'openai.chat' || protocol === 'openai.completions'
+      ? { id: 'codex', seq: 0, tools: new Map(), sawTool: false }
+      : null
+
+  const effectivePoolAccess = poolAccess || req?._poolAccess || null
+  const effectiveIdentity =
+    inboundIdentity ||
+    ctx?.inboundIdentity ||
+    resolveSchedulerIdentity({
+      inbound: inbound || body || converted.body,
+      headers: req.headers,
+      poolId: originPoolId || effectivePoolAccess?.effectivePool?.id || '',
+      apiKeyId: req.apiKeyRecord?.id || '',
+    })
+  const resolvedOriginPoolId =
+    originPoolId ||
+    effectivePoolAccess?.originPool?.id ||
+    effectivePoolAccess?.effectivePool?.id ||
+    preCheck.scope?.vm_pool_id ||
+    VIRTUAL_POOL_IDS.codex
+  const isManagedPool = Boolean(effectivePoolAccess && effectivePoolAccess.legacy === false)
+  const resolvedAllowedNodeKeys =
+    !isManagedPool && Array.isArray(preCheck.scope?.allowed_vms) && preCheck.scope.allowed_vms.length > 0
+      ? preCheck.scope.allowed_vms.map((id) => formatNodeKey('codex_vm', id))
+      : undefined
+  const baseAcquireParams = {
+    requestId: crypto.randomUUID(),
+    originPoolId: resolvedOriginPoolId,
+    jevDowngradePoolId: jevDowngradePoolId || logBag.jev_downgrade_pool_id || null,
+    apiKeyRecord: req.apiKeyRecord || null,
+    apiKeyKind: req.apiKeyKind || null,
+    poolAccess: effectivePoolAccess,
+    ownerScope: preCheck.owner,
+    allowedNodeKeys: resolvedAllowedNodeKeys,
+    nodeTypes: ['codex_vm'],
+    model: String(converted.body?.model || ''),
+    modelFamily: 'openai',
+    protocol: protocol || 'openai.responses',
+    machineId: effectiveIdentity?.machineId || null,
+    sessionId: effectiveIdentity?.sessionId || callerSession || crypto.randomUUID(),
+    sessionIdSource: effectiveIdentity?.sessionSource || null,
+    parentSessionId: effectiveIdentity?.parentSessionId || null,
+    isEphemeralProbe: Boolean(effectiveIdentity?.isEphemeralProbe),
+    noQueue: allowQueue === false || !queueAllowedByHeaders(req.headers),
+    isAdminDiagnostic: isAdminDiagnostic !== undefined ? Boolean(isAdminDiagnostic) : Boolean(preCheck.pin),
+    pinNodeKey: preCheck.pin ? formatNodeKey('codex_vm', preCheck.pin) : null,
+  }
+
+  const excludedNodeKeys = new Set()
+  const gone = clientGoneSignal(req, res)
+  const failoverBudget = codexFailoverBudget(routing)
+  const sameRetryDelay = Number(routing?.failover?.same_account_retry_delay_ms)
+  const sameRetryDelayMs =
+    Number.isFinite(sameRetryDelay) && sameRetryDelay >= 0 ? Math.min(10_000, sameRetryDelay) : 100
+  logBag.via = 'codex-kernel'
+  logBag.attempt_count = 0
+
+  let activeLeaseId = null
+  let activeVmId = null
+  let activeCommitted = false
+  let commitPromise = null
+  let last = null
+  let hops = 0
+  let attempts = 0
+  let switches = 0
+  let counted = false
+  let compatibleTools = null
+
+  const releaseActiveLeaseNow = async (payload) => {
+    const lid = activeLeaseId
+    activeLeaseId = null
+    if (!lid) return
+    try {
+      await rt.releaseLease(lid, payload)
+    } catch {}
+  }
+
+  const markCommitted = () => {
+    activeCommitted = true
+    if (activeLeaseId && !commitPromise) {
+      const lid = activeLeaseId
+      commitPromise = rt.commitLease(lid).catch(() => {})
+    }
+  }
+
   try {
+    let acquired
+    try {
+      acquired = await rt.acquireNode(
+        { ...baseAcquireParams, attemptNo: 1, excludeNodes: [...excludedNodeKeys] },
+        { signal: gone.signal },
+      )
+    } catch (err) {
+      if (isAbortErr(err, gone.signal)) {
+        logBag.final_state = 'cancelled'
+        return
+      }
+      return respondCodexSchedulerError({ res, json, stats, logBag, err })
+    }
+
+    activeLeaseId = acquired.lease_id
+    activeVmId = String(acquired.selected_node?.node_id || '')
+    if (acquired.resolved_pool_id) logBag.resolved_pool_id = acquired.resolved_pool_id
+
+    const switchCodexNode = async (failureReport) => {
+      excludedNodeKeys.add(formatNodeKey('codex_vm', activeVmId))
+      switches += 1
+      if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts || preCheck.pin) {
+        await releaseActiveLeaseNow({
+          outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
+          http_status: failureReport.http_status || undefined,
+          error_class: failureReport.error_class,
+          error_signature: failureReport.error_signature,
+          error_message: failureReport.error_message,
+          retry_after_sec: failureReport.retry_after_sec,
+        })
+        return { ok: false, exhausted: true }
+      }
+      const prevLeaseId = activeLeaseId
+      activeLeaseId = null
+      try {
+        const switched = await rt.switchNode(
+          {
+            release_lease_id: prevLeaseId,
+            failure: failureReport,
+            next_attempt: {
+              ...baseAcquireParams,
+              attemptNo: attempts + 1,
+              excludeNodes: [...excludedNodeKeys],
+            },
+          },
+          { signal: gone.signal },
+        )
+        activeLeaseId = switched.lease_id
+        activeVmId = String(switched.selected_node?.node_id || '')
+        activeCommitted = false
+        commitPromise = null
+        if (switched.resolved_pool_id) logBag.resolved_pool_id = switched.resolved_pool_id
+        return { ok: true }
+      } catch (switchErr) {
+        if (isAbortErr(switchErr, gone.signal)) return { ok: false, aborted: true }
+        if (
+          switchErr instanceof SchedulerUnavailableError ||
+          switchErr?.code === 'scheduler_unavailable' ||
+          (switchErr instanceof SchedulerApiError && (switchErr.code === 'poison_abort' || switchErr.status === 422))
+        ) {
+          return { ok: false, fatalErr: switchErr }
+        }
+        return { ok: false, exhausted: true, switchErr }
+      }
+    }
+
     for (;;) {
-      const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, {
-        deadline,
-        signal: gone.signal,
-        fetchImpl: ops.quotaFetchImpl || ops.fetchImpl,
-        now: ops.now,
-      })
-      const picked = admitted.picked
-      if (!admitted.lease) {
-        if (picked.error === 'client_cancelled') {
+      const vm = getVm(projectRoot, activeVmId)
+      if (!vm || !isCodexVm(vm)) {
+        const sw = await switchCodexNode({
+          http_status: 503,
+          error_class: 'server5xx',
+          error_signature: 'codex_vm_missing',
+        })
+        if (sw.ok) continue
+        if (sw.aborted) {
           logBag.final_state = 'cancelled'
           return
         }
-        // Real upstream failures already happened: report the last one, not the pool.
-        if (last) break
-        return rejectCodexAdmission({ res, json, stats, logBag, picked, model: converted.body?.model })
-      }
-      const vm = getVm(projectRoot, admitted.vmId)
-      const lease = admitted.lease
-      if (!vm || !isCodexVm(vm)) {
-        lease.release()
-        pickOpts.excluded.add(admitted.vmId)
-        continue
+        if (sw.fatalErr) return respondCodexSchedulerError({ res, json, stats, logBag, err: sw.fatalErr })
+        break
       }
       attempts += 1
       if (attempts > failoverBudget.maxAttempts) {
-        lease.release()
+        await releaseActiveLeaseNow({ outcome: 'error' })
         break
       }
       if (!counted) {
@@ -1024,393 +1004,394 @@ export async function handleCodexProtocol({
         stats.requests++
         stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
       }
-      const stickyKeys = picked.stickyKeys?.length ? picked.stickyKeys : picked.sessionKey ? [picked.sessionKey] : []
-      const stickyBound = picked.sessionKey ? stickyRouter?.resolve?.(picked.sessionKey) : null
-      // The home (or first placement) owns the conversation window; a borrowed
-      // seat elsewhere takes only this request's execution lease.
-      const claimsWindow = !!picked.sessionKey && (!picked.home || picked.home === vm.id)
-      let windowGen = null
-      if (claimsWindow) {
-        try {
-          windowGen = sessions?.touch?.(vm.id, picked.sessionKey) ?? null
-        } catch {}
-      }
-      const ownsPin = !!stickyBound?.vmId && stickyBound.vmId === vm.id
-      const bindSticky = (sessionId = null) => {
-        if (!picked.sessionKey || !stickyRouter?.bind) return
-        const payload = { accountId: vm.id, vmId: vm.id }
-        if (sessionId) payload.sessionId = sessionId
-        for (const key of stickyKeys) stickyRouter.bind(key, payload)
-      }
-      const leaveSticky = () => {
-        if (!ownsPin || !picked.sessionKey) return
-        try {
-          sessions?.drop?.(vm.id, picked.sessionKey)
-        } catch {}
-        for (const key of stickyKeys) stickyRouter?.unbind?.(key)
-      }
-      let attemptKind = 'failed'
-      try {
-        const localExit = isLocalEgressProxy(vm.proxy)
-        const written = writeCfg(projectRoot, vm, {
-          // Same rule as slot start: a node on local egress must leave through
-          // that node's forwarder, not the control plane's deployment proxy.
-          proxyUrl: localExit && !vmNodeId(vm) ? '' : hostProxyUrlForVm(vm),
-          proxyRequired: true,
-          routing,
-        })
-        const ready = await ensure(execFor(projectRoot, vm))
-        if (!ready?.ok) {
-          // Kernel init failed: this seat goes back and the next candidate is re-admitted.
-          last = {
-            ok: false,
-            status: 503,
-            committed: false,
-            body: {
-              error: {
-                type: 'api_error',
-                code: 'codex_kernel_unavailable',
-                message: `Codex kernel 未就绪（${ready?.reason || 'not_ready'}）。GPT 槽走独立 kernel，不是 wrap cli-hop。`,
-              },
+
+      const localExit = isLocalEgressProxy(vm.proxy)
+      const written = writeCfg(projectRoot, vm, {
+        proxyUrl: localExit && !vmNodeId(vm) ? '' : hostProxyUrlForVm(vm),
+        proxyRequired: true,
+        routing,
+      })
+      const ready = await ensure(execFor(projectRoot, vm))
+      if (!ready?.ok) {
+        last = {
+          ok: false,
+          status: 503,
+          committed: false,
+          body: {
+            error: {
+              type: 'api_error',
+              code: 'codex_kernel_unavailable',
+              message: `Codex kernel 未就绪（${ready?.reason || 'not_ready'}）。GPT 槽走独立 kernel，不是 wrap cli-hop。`,
             },
-          }
-          pickOpts.excluded.add(vm.id)
-          switches += 1
-          if (!res.headersSent) {
-            if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts) break
-            continue
-          }
-          stats.errors++
-          logBag.error_code = 'codex_kernel_unavailable'
-          return json(res, 503, last.body)
+          },
         }
-        hops += 1
-        logBag.vm_id = vm.id
-        logBag.attempt_count += 1
-        logBag.usage_account_id = openaiUsageAccountId(searchCredentials(projectRoot, vm).accountId)
-        const chunks = []
-        const nameSseEvent = createResponsesSseEventNamer()
-        let responseServiceTier = null
-        let streamedUsage = null
-        let streamedImageUsage = null
-        let conversionError = null
-        const attemptStartedAt = Date.now()
-        const sessionOptions = {
-          boundSessionId: stickyBound?.sessionId || '',
-          boundVmId: stickyBound?.vmId || '',
-          vmId: vm.id,
-          accountId: vm.id,
-          firstUserIdentity,
-          clientIp: clientIp(req),
-          userAgent: req.headers?.['user-agent'] || '',
-          // Borrowing does not move the home pin, so the attempt clock cannot
-          // identify the borrower's session. Scope it to this home generation.
-          epoch:
-            picked.home === stickyBound?.vmId && stickyBound?.sessionId && vm.id !== picked.home
-              ? JSON.stringify([
-                  'codex-borrow',
-                  picked.sessionKey,
-                  stickyBound.vmId,
-                  stickyBound.sessionId,
-                  stickyBound.generation,
-                  vm.id,
-                ])
-              : `${attemptStartedAt}:${vm.id}:${hops}`,
-        }
-        // passthrough forwards an explicit inbound session verbatim; without
-        // one it still derives the deterministic seed instead of sending null.
-        const outboundSessionId =
-          sessionMode === 'passthrough'
-            ? inboundSession.session_id ||
-              resolveOutboundSessionId(callerSession, { ...sessionOptions, mode: 'passthrough', officialClient: true })
-            : resolveOutboundSessionId(callerSession, { ...sessionOptions, mode: sessionMode })
-        const session = {
-          session_id: outboundSessionId,
-          previous_response_id: inboundSession.previous_response_id,
-        }
-        logBag.outbound_session_id = sessionIdForLog(outboundSessionId)
-        let outboundBody = applyCodexRebuildBody(
-          { ...converted.body, ...(compatibleTools && { tools: compatibleTools }), stream: true },
-          outboundSessionId,
-          sessionMode,
-        )
-        const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
-        if (captureOutbound) logBag.outbound_body = outboundBody
-        logBag.outbound_headers = redactHeaders(outboundHeaders)
-        let hopEmitted = false
-        const runHop = () =>
-          runCodexKernelHop({
-            hop,
-            args: {
-              exec: execFor(projectRoot, vm),
-              signal: gone.signal,
-              timeoutMs: cfg?.limits?.upstream_timeout_ms ?? 600_000,
-              idleTimeoutMs: resolveStreamIdleTimeoutMs(routing, cfg),
-              routing,
-              redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
-              redactionSession: String(req.headers?.['x-session-id'] || inboundSession.session_id || ''),
-              gatewayRequestId: res?._kinRequestId || null,
-              body: outboundBody,
-              envelope: {
-                body: outboundBody,
-                headers: outboundHeaders,
-                stream: true,
-                session,
-                options: { ...codexKernelRequestOptions(routing, vm), installation_id: written?.installationId },
-              },
-            },
-            onReasoningFallback: ({ body: retryBody }) => {
-              if (captureOutbound) logBag.outbound_body = retryBody
-            },
-            onEvent: async (line) => {
-              hopEmitted = true
-              if (conversionError) return
-              const tier = serviceTierFromSseLine(line)
-              if (tier) responseServiceTier = tier
-              const seen = usageFromSseLine(line)
-              if (seen) streamedUsage = mergeUsage(streamedUsage, seen)
-              const imageGen = imageGenUsageFromSseLine(line)
-              if (imageGen) streamedImageUsage = imageGen
-              if (!stream || useGoEgress) {
-                chunks.push(line)
-                return
-              }
-              if (!res.headersSent) writeSSEHeaders(res)
-              if (protocol !== 'openai.responses') {
-                try {
-                  const mapped =
-                    protocol === 'anthropic.messages'
-                      ? responsesSseToAnthropicEvents(line, anthropicSse)
-                      : responsesSseToChatChunk(line, 'codex', chatSse)
-                  if (mapped) res.write(mapped)
-                } catch (error) {
-                  if (error.code !== 'tool_arguments_mismatch') throw error
-                  conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
-                  res.write(
-                    protocol === 'anthropic.messages'
-                      ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
-                      : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
-                  )
-                }
-                return
-              }
-              const named = nameSseEvent(line)
-              if (named) res.write(named)
-            },
+        if (!res.headersSent) {
+          const sw = await switchCodexNode({
+            http_status: 503,
+            error_class: 'server5xx',
+            error_signature: 'codex_kernel_unavailable',
+            error_message: last.body.error.message,
           })
-        const runAttempt = async () => {
-          let result = await runHop()
-          let policyRefusal = afterHop?.(result)
-          const error = result?.body?.error
-          if (
-            !compatibleTools &&
-            !policyRefusal &&
-            !result?.ok &&
-            Number(result?.status) === 400 &&
-            error?.code === 'invalid_json_schema' &&
-            /^Invalid schema for 'tools\[\d+\]\.parameters': Unsatisfiable schema:/.test(error.message || '') &&
-            !result.committed &&
-            !result.transportError &&
-            !hopEmitted &&
-            !res.headersSent &&
-            !gone.signal.aborted &&
-            attempts < failoverBudget.maxAttempts
-          ) {
-            compatibleTools = codexCompatibleFunctionTools(outboundBody.tools)
-            if (compatibleTools) {
-              attempts += 1
-              logBag.attempt_count += 1
-              outboundBody = { ...outboundBody, tools: compatibleTools }
-              if (captureOutbound) logBag.outbound_body = outboundBody
-              result = await runHop()
-              policyRefusal = afterHop?.(result)
-            }
+          if (sw.ok) continue
+          if (sw.aborted) {
+            logBag.final_state = 'cancelled'
+            return
           }
-          return { result, policyRefusal }
+          if (sw.fatalErr) return respondCodexSchedulerError({ res, json, stats, logBag, err: sw.fatalErr })
+          break
         }
-        let { result, policyRefusal } = await runAttempt()
-        // A transient seat-local failure gets the same account up to N retries
-        // before the request spends a switch. 401/403/429 are never retried here:
-        // they are credential/account state and must move to another seat.
-        let sameAccountRetries = result?.transport_retried || result?.reasoning_history_retried ? 1 : 0
-        while (
-          !policyRefusal &&
-          sameAccountRetries < failoverBudget.maxSameAccountRetries &&
-          attempts < failoverBudget.maxAttempts &&
-          isRetryableSameCodexAccount(result, {
-            headersSent: res.headersSent || hopEmitted,
-            conversionError,
+        await releaseActiveLeaseNow({ outcome: 'error', http_status: 503, error_class: 'server5xx' })
+        stats.errors++
+        logBag.error_code = 'codex_kernel_unavailable'
+        return json(res, 503, last.body)
+      }
+
+      hops += 1
+      logBag.vm_id = vm.id
+      logBag.attempt_count += 1
+      logBag.usage_account_id = openaiUsageAccountId(searchCredentials(projectRoot, vm).accountId)
+      const chunks = []
+      const nameSseEvent = createResponsesSseEventNamer()
+      let responseServiceTier = null
+      let streamedUsage = null
+      let streamedImageUsage = null
+      let conversionError = null
+      const attemptStartedAt = Date.now()
+      const sessionOptions = {
+        boundSessionId: '',
+        boundVmId: '',
+        vmId: vm.id,
+        accountId: vm.id,
+        firstUserIdentity,
+        clientIp: clientIp(req),
+        userAgent: req.headers?.['user-agent'] || '',
+        epoch: `${attemptStartedAt}:${vm.id}:${hops}`,
+      }
+      const outboundSessionId =
+        sessionMode === 'passthrough'
+          ? inboundSession.session_id ||
+            resolveOutboundSessionId(callerSession, { ...sessionOptions, mode: 'passthrough', officialClient: true })
+          : resolveOutboundSessionId(callerSession, { ...sessionOptions, mode: sessionMode })
+      const session = {
+        session_id: outboundSessionId,
+        previous_response_id: inboundSession.previous_response_id,
+      }
+      logBag.outbound_session_id = sessionIdForLog(outboundSessionId)
+      // OpenAI / Codex nodes strictly enforce passthrough (zero Anthropic prompt injection).
+      let outboundBody = applyCodexRebuildBody(
+        { ...converted.body, ...(compatibleTools && { tools: compatibleTools }), stream: true },
+        outboundSessionId,
+        sessionMode,
+      )
+      const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
+      if (captureOutbound) logBag.outbound_body = outboundBody
+      logBag.outbound_headers = redactHeaders(outboundHeaders)
+      let hopEmitted = false
+      const runHop = () =>
+        runCodexKernelHop({
+          hop,
+          args: {
+            exec: execFor(projectRoot, vm),
             signal: gone.signal,
-          })
-        ) {
-          sameAccountRetries += 1
-          attempts += 1
-          hops += 1
-          logBag.attempt_count += 1
-          logBag.codex_same_account_retried = sameAccountRetries
-          await new Promise((resolve) => setTimeout(resolve, sameRetryDelayMs))
-          hopEmitted = false
-          const retried = await runAttempt()
-          result = retried.result
-          policyRefusal = retried.policyRefusal
-        }
-        // The log and total duration share ingress time; pool scoring keeps hop TTFT.
-        logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
-          ? Math.max(0, result.firstTokenAt - requestStartedAt)
-          : (result?.ttftMs ?? null)
-        logBag.first_byte_ms = Number.isFinite(result?.firstByteAt)
-          ? Math.max(0, result.firstByteAt - requestStartedAt)
-          : (result?.firstByteMs ?? null)
-        logBag.generation_ms = result?.generationMs ?? null
-        if (conversionError) {
-          result.ok = false
-          result.status = 502
-          result.terminalState = 'incomplete'
-          result.body = { error: conversionError }
-        }
-        ingestCodexHop(projectRoot, vm.id, result, Date.now(), normalizeCodexRouting(routing.codex).quota)
-        if (result?.hopRequestId) {
-          logBag.hop_meta = { ...logBag.hop_meta, hop_request_id: result.hopRequestId }
-        }
-        if (result?.transport_retried) logBag.transport_retried = true
-        if (result?.reasoning_history_retried) {
-          logBag.attempt_count += 1
-          logBag.reasoning_history_retried = true
-        }
-        last = result
-        const hopUsage = result.usage || result.body?.usage || result.body?.response?.usage || null
-        const preferredUsage = preferUsage(hopUsage, streamedUsage)
-        const usage = mergeUsage(preferredUsage === hopUsage ? streamedUsage : hopUsage, preferredUsage)
-        const delivered = !policyRefusal && !conversionError && result?.ok
-        if (delivered) {
-          attemptKind = 'succeeded'
-          bindSticky(outboundSessionId)
-          // Billing follows the tier actually sent (codex-proxy-rs contract). The upstream
-          // echo is kept apart because it may differ from the requested tier.
-          const serviceTier = normalizeServiceTier(outboundBody.service_tier)
-          logBag.upstream_service_tier = responseServiceTier
-          const logged = disjointOpenaiUsage(usage ? { ...usage, service_tier: serviceTier } : usage)
-          logBag.usage = logged
-          const imageUsage =
-            result.body?.tool_usage?.image_gen || result.body?.response?.tool_usage?.image_gen || streamedImageUsage
-          if (imageUsage) logBag.image_usage = imageUsage
-          logBag.input_tokens = logged?.input_tokens ?? null
-          logBag.output_tokens = logged?.output_tokens ?? null
-          logBag.cache_read_tokens = logged?.cache_read_input_tokens ?? logged?.cache_read_tokens ?? null
-          logBag.cache_creation_tokens = logged?.cache_creation_input_tokens ?? logged?.cache_creation_tokens ?? null
-          reportOpenAIAttempt(vm.id, 'succeeded', result.ttftMs ?? null)
-          logBag.final_state = result.terminalState || 'verified'
-          logBag.stop_reason = result.body?.incomplete_details?.reason || null
-          logBag.upstream_model = converted.body.model
-          if (hops > 1) logBag.codex_failed_over = true
-          if (!stream) {
-            if (useGoEgress) {
-              const tc = await transcodeWithProtoFront({
-                cfg: cfg || { paths: { project: projectRoot } },
-                upstreamProtocol: 'openai.responses',
-                inboundProtocol: protocol,
-                model: converted.body.model,
-                stream: false,
-                payload: chunks.join(''),
-              })
-              if (tc?.ok && tc.body) return json(res, 200, JSON.parse(tc.body))
+            timeoutMs: cfg?.limits?.upstream_timeout_ms ?? 600_000,
+            idleTimeoutMs: resolveStreamIdleTimeoutMs(routing, cfg),
+            routing,
+            redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
+            redactionSession: String(req.headers?.['x-session-id'] || inboundSession.session_id || ''),
+            gatewayRequestId: res?._kinRequestId || null,
+            body: outboundBody,
+            envelope: {
+              body: outboundBody,
+              headers: outboundHeaders,
+              stream: true,
+              session,
+              options: { ...codexKernelRequestOptions(routing, vm), installation_id: written?.installationId },
+            },
+          },
+          onReasoningFallback: ({ body: retryBody }) => {
+            if (captureOutbound) logBag.outbound_body = retryBody
+          },
+          onEvent: async (line) => {
+            hopEmitted = true
+            markCommitted()
+            if (conversionError) return
+            const tier = serviceTierFromSseLine(line)
+            if (tier) responseServiceTier = tier
+            const seen = usageFromSseLine(line)
+            if (seen) streamedUsage = mergeUsage(streamedUsage, seen)
+            const imageGen = imageGenUsageFromSseLine(line)
+            if (imageGen) streamedImageUsage = imageGen
+            if (!stream || useGoEgress) {
+              chunks.push(line)
+              return
             }
-            if (protocol === 'openai.responses' && result.body?.status === 'incomplete')
-              return json(res, 200, result.body)
-            let body
-            try {
-              const assembled = assembleCodexBodyFromSse(chunks, result.body || {})
-              body = assembled
-              if (protocol !== 'openai.responses') {
-                const message = codexBodyToAnthropicMessage(assembled, converted.body.model)
-                body =
-                  protocol === 'openai.chat'
-                    ? fromClaudeToOpenAIChat(message, converted.body.model)
-                    : protocol === 'openai.completions'
-                      ? fromClaudeToOpenAICompletions(message, converted.body.model)
-                      : message
+            if (!res.headersSent) writeSSEHeaders(res)
+            if (protocol !== 'openai.responses') {
+              try {
+                const mapped =
+                  protocol === 'anthropic.messages'
+                    ? responsesSseToAnthropicEvents(line, anthropicSse)
+                    : responsesSseToChatChunk(line, 'codex', chatSse)
+                if (mapped) res.write(mapped)
+              } catch (error) {
+                if (error.code !== 'tool_arguments_mismatch') throw error
+                conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+                res.write(
+                  protocol === 'anthropic.messages'
+                    ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
+                    : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
+                )
               }
-            } catch (error) {
-              if (!isToolArgumentsError(error)) throw error
-              stats.errors++
-              logBag.error_code = error.code
-              logBag.final_state = 'incomplete'
-              return json(res, 502, {
-                error: { type: 'upstream_protocol_error', code: error.code, message: error.message },
-              })
+              return
             }
-            return json(res, 200, body)
+            const named = nameSseEvent(line)
+            if (named) res.write(named)
+          },
+        })
+
+      const runAttempt = async () => {
+        let result = await runHop()
+        let policyRefusal = afterHop?.(result)
+        const error = result?.body?.error
+        if (
+          !compatibleTools &&
+          !policyRefusal &&
+          !result?.ok &&
+          Number(result?.status) === 400 &&
+          error?.code === 'invalid_json_schema' &&
+          /^Invalid schema for 'tools\[\d+\]\.parameters': Unsatisfiable schema:/.test(error.message || '') &&
+          !result.committed &&
+          !result.transportError &&
+          !hopEmitted &&
+          !res.headersSent &&
+          !gone.signal.aborted &&
+          attempts < failoverBudget.maxAttempts
+        ) {
+          compatibleTools = codexCompatibleFunctionTools(outboundBody.tools)
+          if (compatibleTools) {
+            attempts += 1
+            logBag.attempt_count += 1
+            outboundBody = { ...outboundBody, tools: compatibleTools }
+            if (captureOutbound) logBag.outbound_body = outboundBody
+            result = await runHop()
+            policyRefusal = afterHop?.(result)
           }
+        }
+        return { result, policyRefusal }
+      }
+
+      let { result, policyRefusal } = await runAttempt()
+      let sameAccountRetries = result?.transport_retried || result?.reasoning_history_retried ? 1 : 0
+      while (
+        !policyRefusal &&
+        sameAccountRetries < failoverBudget.maxSameAccountRetries &&
+        attempts < failoverBudget.maxAttempts &&
+        isRetryableSameCodexAccount(result, {
+          headersSent: res.headersSent || hopEmitted,
+          conversionError,
+          signal: gone.signal,
+        })
+      ) {
+        sameAccountRetries += 1
+        attempts += 1
+        hops += 1
+        logBag.attempt_count += 1
+        logBag.codex_same_account_retried = sameAccountRetries
+        await new Promise((resolve) => setTimeout(resolve, sameRetryDelayMs))
+        hopEmitted = false
+        const retried = await runAttempt()
+        result = retried.result
+        policyRefusal = retried.policyRefusal
+      }
+
+      logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
+        ? Math.max(0, result.firstTokenAt - requestStartedAt)
+        : (result?.ttftMs ?? null)
+      logBag.first_byte_ms = Number.isFinite(result?.firstByteAt)
+        ? Math.max(0, result.firstByteAt - requestStartedAt)
+        : (result?.firstByteMs ?? null)
+      logBag.generation_ms = result?.generationMs ?? null
+      if (conversionError) {
+        result.ok = false
+        result.status = 502
+        result.terminalState = 'incomplete'
+        result.body = { error: conversionError }
+      }
+      ingestCodexHop(projectRoot, vm.id, result, Date.now(), normalizeCodexRouting(routing.codex).quota)
+      if (result?.hopRequestId) {
+        logBag.hop_meta = { ...logBag.hop_meta, hop_request_id: result.hopRequestId }
+      }
+      if (result?.transport_retried) logBag.transport_retried = true
+      if (result?.reasoning_history_retried) {
+        logBag.attempt_count += 1
+        logBag.reasoning_history_retried = true
+      }
+      last = result
+      const hopUsage = result.usage || result.body?.usage || result.body?.response?.usage || null
+      const preferredUsage = preferUsage(hopUsage, streamedUsage)
+      const usage = mergeUsage(preferredUsage === hopUsage ? streamedUsage : hopUsage, preferredUsage)
+      const delivered = !policyRefusal && !conversionError && result?.ok
+
+      if (delivered) {
+        const serviceTier = normalizeServiceTier(outboundBody.service_tier)
+        logBag.upstream_service_tier = responseServiceTier
+        const logged = disjointOpenaiUsage(usage ? { ...usage, service_tier: serviceTier } : usage)
+        logBag.usage = logged
+        const imageUsage =
+          result.body?.tool_usage?.image_gen || result.body?.response?.tool_usage?.image_gen || streamedImageUsage
+        if (imageUsage) logBag.image_usage = imageUsage
+        logBag.input_tokens = logged?.input_tokens ?? null
+        logBag.output_tokens = logged?.output_tokens ?? null
+        logBag.cache_read_tokens = logged?.cache_read_input_tokens ?? logged?.cache_read_tokens ?? null
+        logBag.cache_creation_tokens = logged?.cache_creation_input_tokens ?? logged?.cache_creation_tokens ?? null
+        logBag.final_state = result.terminalState || 'verified'
+        logBag.stop_reason = result.body?.incomplete_details?.reason || null
+        logBag.upstream_model = converted.body.model
+        if (hops > 1) logBag.codex_failed_over = true
+
+        if (activeLeaseId) {
+          await (commitPromise || rt.commitLease(activeLeaseId).catch(() => {}))
+        }
+        const totalTokens = Number(logged?.input_tokens || 0) + Number(logged?.output_tokens || 0)
+        await releaseActiveLeaseNow({
+          outcome: 'ok',
+          http_status: 200,
+          ...(Number.isFinite(result?.ttftMs) ? { ttft_ms: Math.max(0, Math.round(result.ttftMs)) } : {}),
+          ...(totalTokens > 0 ? { tokens_used: totalTokens } : {}),
+        })
+
+        if (!stream) {
           if (useGoEgress) {
             const tc = await transcodeWithProtoFront({
               cfg: cfg || { paths: { project: projectRoot } },
               upstreamProtocol: 'openai.responses',
               inboundProtocol: protocol,
               model: converted.body.model,
-              stream: true,
+              stream: false,
               payload: chunks.join(''),
             })
-            if (!res.headersSent) writeSSEHeaders(res)
-            if (tc?.ok && tc.body) res.write(tc.body)
-            return res.end()
+            if (tc?.ok && tc.body) return json(res, 200, JSON.parse(tc.body))
           }
-          if (!res.headersSent) writeSSEHeaders(res)
-          return res.end()
-        }
-        reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
-        const failureHold = !policyRefusal && codexFailureHold(result)
-        if (failureHold) holdOpenAIAccount(vm.id, failureHold)
-        // Grant 死亡（OpenAI 吊销）：5 分钟内存 hold 挡不住轮转调度，必须落盘摘池，
-        // 面板才能显示「不可调度 · 凭证吊销」；与 claude 池 markVmRefreshError 同语义。
-        if (!policyRefusal && isCodexGrantDead(result)) {
+          if (protocol === 'openai.responses' && result.body?.status === 'incomplete')
+            return json(res, 200, result.body)
+          let assembledOut
           try {
-            persistCodexCredentialState(projectRoot, vm.id, { error: 'oauth_revoked' })
-            markCodexGrantDead(projectRoot, vm.id, {
-              description: result?.body?.error?.message || result?.body?.error?.code || null,
-              status: Number(result.status) || 0,
+            const assembled = assembleCodexBodyFromSse(chunks, result.body || {})
+            assembledOut = assembled
+            if (protocol !== 'openai.responses') {
+              const message = codexBodyToAnthropicMessage(assembled, converted.body.model)
+              assembledOut =
+                protocol === 'openai.chat'
+                  ? fromClaudeToOpenAIChat(message, converted.body.model)
+                  : protocol === 'openai.completions'
+                    ? fromClaudeToOpenAICompletions(message, converted.body.model)
+                    : message
+            }
+          } catch (error) {
+            if (!isToolArgumentsError(error)) throw error
+            stats.errors++
+            logBag.error_code = error.code
+            logBag.final_state = 'incomplete'
+            return json(res, 502, {
+              error: { type: 'upstream_protocol_error', code: error.code, message: error.message },
             })
-          } catch {
-            /* 写盘 best-effort；内存 hold 已在 */
           }
+          return json(res, 200, assembledOut)
         }
-        if (policyRefusal && policyRefusal !== 'upstream:billing_refusal') {
-          stats.errors++
-          const error = upstreamRiskClientError(policyRefusal, res._kinRequestId)
-          logBag.error_code = error.body.error.code
-          logBag.upstream_status = result?.status ?? null
-          if (!res.headersSent && !hopEmitted) return json(res, error.status, error.body)
-          if (protocol === 'anthropic.messages') res.write(buildAnthropicSseError(error.body.error))
-          else if (protocol !== 'openai.responses') res.write(`data: ${JSON.stringify(error.body)}\n\n`)
+        if (useGoEgress) {
+          const tc = await transcodeWithProtoFront({
+            cfg: cfg || { paths: { project: projectRoot } },
+            upstreamProtocol: 'openai.responses',
+            inboundProtocol: protocol,
+            model: converted.body.model,
+            stream: true,
+            payload: chunks.join(''),
+          })
+          if (!res.headersSent) writeSSEHeaders(res)
+          if (tc?.ok && tc.body) res.write(tc.body)
           return res.end()
         }
-        if (res.headersSent || hopEmitted) {
-          stats.errors++
-          logBag.error_code = result?.body?.error?.code || 'codex_upstream'
-          logBag.upstream_status = result?.status || 0
-          logBag.final_state = result?.terminalState || 'incomplete'
-          if (stream) return res.end()
-          return json(res, result?.status >= 400 ? result.status : 502, result?.body)
-        }
-        if (!policyRefusal && isCodexFailoverError(result)) {
-          pickOpts.excluded.add(vm.id)
-          leaveSticky()
-          switches += 1
-          if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts) break
-          continue
-        }
-        break
-      } finally {
-        lease.release()
-        if (claimsWindow) {
-          try {
-            sessions?.release?.(vm.id, picked.sessionKey, { gen: windowGen })
-          } catch {}
-        }
+        if (!res.headersSent) writeSSEHeaders(res)
+        return res.end()
       }
+
+      if (!policyRefusal && isCodexGrantDead(result)) {
+        try {
+          persistCodexCredentialState(projectRoot, vm.id, { error: 'oauth_revoked' })
+          markCodexGrantDead(projectRoot, vm.id, {
+            description: result?.body?.error?.message || result?.body?.error?.code || null,
+            status: Number(result.status) || 0,
+          })
+          rt.enqueueTelemetry?.([
+            {
+              node_key: formatNodeKey('codex_vm', vm.id),
+              schedulable: false,
+              unschedulable_reason: 'oauth_revoked',
+            },
+          ])
+        } catch {}
+      }
+
+      if (policyRefusal && policyRefusal !== 'upstream:billing_refusal') {
+        await releaseActiveLeaseNow({ outcome: 'ok', http_status: Number(result?.status) || 400 })
+        stats.errors++
+        const error = upstreamRiskClientError(policyRefusal, res._kinRequestId)
+        logBag.error_code = error.body.error.code
+        logBag.upstream_status = result?.status ?? null
+        if (!res.headersSent && !hopEmitted) return json(res, error.status, error.body)
+        if (protocol === 'anthropic.messages') res.write(buildAnthropicSseError(error.body.error))
+        else if (protocol !== 'openai.responses') res.write(`data: ${JSON.stringify(error.body)}\n\n`)
+        return res.end()
+      }
+
+      const failureReport = buildCodexFailureReport(result)
+      if (res.headersSent || hopEmitted) {
+        await releaseActiveLeaseNow({
+          outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
+          http_status: failureReport.http_status || undefined,
+          error_class: failureReport.error_class,
+          error_signature: failureReport.error_signature,
+          error_message: failureReport.error_message,
+          retry_after_sec: failureReport.retry_after_sec,
+        })
+        stats.errors++
+        logBag.error_code = result?.body?.error?.code || 'codex_upstream'
+        logBag.upstream_status = result?.status || 0
+        logBag.final_state = result?.terminalState || 'incomplete'
+        if (stream) return res.end()
+        return json(res, result?.status >= 400 ? result.status : 502, result?.body)
+      }
+
+      if (!policyRefusal && isCodexFailoverError(result)) {
+        const sw = await switchCodexNode(failureReport)
+        if (sw.ok) continue
+        if (sw.aborted) {
+          logBag.final_state = 'cancelled'
+          return
+        }
+        if (sw.fatalErr) return respondCodexSchedulerError({ res, json, stats, logBag, err: sw.fatalErr })
+        break
+      }
+
+      await releaseActiveLeaseNow({
+        outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
+        http_status: failureReport.http_status || undefined,
+        error_class: failureReport.error_class,
+        error_signature: failureReport.error_signature,
+        error_message: failureReport.error_message,
+        retry_after_sec: failureReport.retry_after_sec,
+      })
+      break
     }
   } finally {
+    if (activeLeaseId) {
+      await releaseActiveLeaseNow({
+        outcome: gone.signal.aborted ? 'aborted' : activeCommitted ? 'ok' : 'error',
+      })
+    }
     gone.settle()
   }
+
   stats.errors++
   logBag.error_code = last?.body?.error?.code || 'codex_upstream'
   logBag.error_message ||= last?.body?.error?.message || null
@@ -1418,102 +1399,7 @@ export async function handleCodexProtocol({
   return json(res, last?.status || 502, last?.body || { error: { type: 'api_error', code: 'codex_upstream' } })
 }
 
-/** No seat was admitted and nothing ran: say which gate stopped the request. */
-function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
-  stats.errors++
-  logBag.error_code = picked.error || 'no_codex_vm'
-  if (picked.error === 'platform_mismatch') {
-    return json(res, 400, {
-      error: {
-        type: 'invalid_request_error',
-        code: 'platform_mismatch',
-        message: `vm '${picked.pin}' is not a GPT slot`,
-      },
-    })
-  }
-  if (picked.error === 'key_group_mismatch') {
-    return json(res, 403, {
-      error: {
-        type: 'permission_error',
-        code: 'key_group_mismatch',
-        message: '此密钥不能调用 openai',
-      },
-    })
-  }
-  if (picked.error === 'vm_pool_unavailable') {
-    return json(res, 403, {
-      error: {
-        type: 'permission_error',
-        code: 'vm_pool_unavailable',
-        message: picked.message || '账号池不可用',
-      },
-    })
-  }
-  if (picked.error === 'model_not_allowed') {
-    return json(res, 400, {
-      error: {
-        type: 'invalid_request_error',
-        code: 'model_not_allowed',
-        message: `model '${model || ''}' is not allowed on any GPT slot`,
-        param: 'model',
-      },
-    })
-  }
-  if (picked.error === 'response_not_portable') {
-    return json(res, 409, {
-      error: {
-        type: 'invalid_request_error',
-        code: 'response_not_portable',
-        message: 'previous_response_id 所在的 GPT 账号已不可用；该响应无法在其他账号继续，请携带完整上下文重新发起',
-      },
-    })
-  }
-  if (
-    picked.error === 'capacity_unavailable' ||
-    picked.error === 'session_window_full' ||
-    picked.error === 'pool_wait_queue_full'
-  ) {
-    // Queue-full has no retryAt. Every Codex pool_overloaded 429 still advertises >= 1s.
-    const waitMs = Number(picked.retryAt) - Date.now()
-    const retryAfterSec = Math.max(1, waitMs > 0 ? Math.ceil(waitMs / 1000) : 0)
-    if (!res.headersSent) res.setHeader?.('retry-after', String(retryAfterSec))
-    return json(res, 429, {
-      error: {
-        type: 'rate_limit_error',
-        code: 'pool_overloaded',
-        message: CLIENT_POOL_BUSY_MESSAGE,
-        details: { reason: picked.error },
-      },
-    })
-  }
-  if (picked.error === 'pool_resting') {
-    // Every slot is off-shift: 503 like the Claude pool, timed to the first window open.
-    const waitMs = Number(picked.retryAt) - Date.now()
-    if (!res.headersSent) res.setHeader?.('retry-after', String(Math.max(1, Math.ceil(waitMs / 1000) || 1)))
-    return json(res, 503, {
-      error: {
-        type: 'api_error',
-        code: ErrorCode.POOL_UNAVAILABLE,
-        message: CLIENT_POOL_UNAVAILABLE_MESSAGE,
-        details: { reason: 'pool_resting' },
-      },
-    })
-  }
-  if (picked.error === 'quota_exhausted') {
-    return json(res, 503, {
-      error: { type: 'api_error', code: 'quota_exhausted', message: 'OpenAI 号池额度已耗尽' },
-    })
-  }
-  return json(res, 503, {
-    error: { type: 'api_error', code: picked.error || 'no_codex_vm', message: 'no Codex kernel VM is configured' },
-  })
-}
-
-// Codex web search (`web.run`) is a plain JSON POST to `{base_url}/alpha/search`. Responses-Lite
-// models (gpt-6.1-sol, gpt-6-astra) have no hosted web_search tool, and the CLI fails the whole
-// turn on a non-2xx answer, so a missing route breaks every turn that searches.
 const CODEX_SEARCH_TIMEOUT_MS = 120000
-// The backend answers "Unknown parameter" for these.
 const CODEX_SEARCH_DROP_FIELDS = Object.freeze(['prompt_cache_key', 'prompt_cache_retention', 'store'])
 const searchRefreshes = new Map()
 
@@ -1527,35 +1413,20 @@ function searchCredentials(projectRoot, vm) {
   }
 }
 
-/**
- * Access token to retry with after a 401/403. The kernel refreshes the same rotating
- * refresh token on its own, so first adopt a token it wrote meanwhile; otherwise refresh
- * once per slot, shared by concurrent callers.
- */
-/**
- * Refresh the search/images access token once per slot, shared by concurrent callers.
- * Resolves the new access token, '' when refresh is impossible/failed, or
- * `grant-dead:<code>` when the token endpoint itself answered revocation
- * (`oauth_revoked`) — the caller parks the slot instead of silently failing.
- */
 function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh }) {
   const now = searchCredentials(projectRoot, vm)
   if (now.access && now.access !== usedAccess) return now.access
   if (!now.refresh) return ''
   let pending = searchRefreshes.get(vm.id)
   if (!pending) {
-    // 共锁（key=codex:<vmId>）且锁内重读：searchRefreshes 只去重本路径并发，
-    // 锁才挡与面板刷新/quota 轮换的跨路径竞争；等锁期间轮换出的新票直接采用。
     pending = withCredentialRefreshLock(`codex:${vm.id}`, async () => {
       const again = searchCredentials(projectRoot, vm)
       if (again.access && again.access !== usedAccess) return again.access
       const tok = await refresh({ refreshToken: again.refresh || now.refresh, proxyUrl, fetchImpl })
-      // 吊销定论穿透共享缓存：并发等同一个 pending 的调用方都能看到 grant death。
       if (!tok?.ok && tok?.error === 'oauth_revoked') return `grant-dead:${tok.error}`
       if (!tok?.ok || !tok.access_token) return ''
       const latest = readCodexAccounts(projectRoot, vm.id)[0] || {}
       if (latest.refresh_token && latest.refresh_token !== (again.refresh || now.refresh)) {
-        // 并发方已轮换：直接采用其新票（本方结果作废，不覆盖写盘）。
         return latest.access_token || tok.access_token
       }
       upsertCodexAccount(projectRoot, vm.id, {
@@ -1576,10 +1447,6 @@ function plainHeaders(headers) {
   return { ...(headers || {}) }
 }
 
-/**
- * One JSON POST to a Codex backend endpoint (search, images) on one slot.
- * Resolves `{ status, text, headers }`, or `{ status: 0, error }`.
- */
 async function postCodexJson({
   url,
   timeoutMs,
@@ -1596,7 +1463,6 @@ async function postCodexJson({
   const doFetch = fetchImpl || makeProxyFetch(proxyUrl, timeoutMs, { maxMs: timeoutMs })
   const creds = searchCredentials(projectRoot, vm)
   const send = async (access) => {
-    // Same identity as the slot's kernel; the backend wants originator, User-Agent and version to agree.
     const headers = {
       authorization: `Bearer ${access}`,
       'content-type': 'application/json',
@@ -1624,8 +1490,6 @@ async function postCodexJson({
   let out = creds.access ? await send(creds.access) : { status: 401 }
   if (out.status === 401 || out.status === 403) {
     const access = await refreshSearchAccess(projectRoot, vm, creds.access, { proxyUrl, fetchImpl, refresh })
-    // Token 端点自己答了吊销：落盘摘池（合成 401 无响应体，词表判定走不到，
-    // 必须在这里短路），死号不再被 search/images 每轮换槽烧刷新 401。
     if (typeof access === 'string' && access.startsWith('grant-dead:')) {
       try {
         persistCodexCredentialState(projectRoot, vm.id, { error: 'oauth_revoked' })
@@ -1647,10 +1511,6 @@ function isSearchFailover(out) {
   return status === 0 || status === 401 || status === 402 || status === 403 || status === 429 || status >= 500
 }
 
-/**
- * search/images JSON 端点的 grant-death 写盘（与主请求路径同语义）：
- * 401 响应体命中吊销文案 → 落盘摘池，防止死号继续换槽烧上游 401。
- */
 export function parkCodexGrantDeadIfHit(projectRoot, vmId, last) {
   if (Number(last?.status) !== 401) return
   const parsed = parseJson(last.text)
@@ -1661,9 +1521,7 @@ export function parkCodexGrantDeadIfHit(projectRoot, vmId, last) {
       description: parsed?.error?.message || parsed?.error?.code || null,
       status: last.status,
     })
-  } catch {
-    /* 写盘 best-effort；换槽逻辑继续 */
-  }
+  } catch {}
 }
 
 function parseJson(text) {
@@ -1674,11 +1532,6 @@ function parseJson(text) {
   }
 }
 
-/**
- * POST /v1/alpha/search for Codex web search. Not inference: no session window, sticky bind
- * or latency report, but the call holds a seat on the slot it runs on. Auth/quota/rate-limit
- * failures move to the next GPT slot; anything else is the backend's answer, passed through.
- */
 export async function handleCodexSearch({
   req,
   res,
@@ -1688,10 +1541,12 @@ export async function handleCodexSearch({
   json,
   routing = {},
   projectRoot,
-  stickyRouter = null,
   ops = {},
   keyScope = null,
   ownerScope = null,
+  poolAccess = null,
+  originPoolId = null,
+  schedulerRuntime = null,
 }) {
   logBag.via = 'codex-search'
   const reject = (status, type, code, message) => {
@@ -1706,6 +1561,33 @@ export async function handleCodexSearch({
   if (!body || typeof body !== 'object' || typeof body.model !== 'string' || !body.model.trim()) {
     return reject(400, 'invalid_request_error', 'model_required', 'model is required')
   }
+  const preCheck = validateCodexPreconditions({
+    projectRoot,
+    req,
+    keyScope,
+    ownerScope,
+    pinVmId: null,
+    model: body.model,
+    res,
+    json,
+    stats,
+    logBag,
+  })
+  if (!preCheck.ok) return
+
+  const rt = schedulerRuntime || req?._schedulerRuntime || null
+  if (!rt) {
+    return respondCodexSchedulerError({
+      res,
+      json,
+      stats,
+      logBag,
+      err: new SchedulerUnavailableError('Rust scheduler runtime is unavailable for Codex search', {
+        reason: 'runtime_missing',
+      }),
+    })
+  }
+
   const outbound = { ...body }
   for (const key of CODEX_SEARCH_DROP_FIELDS) delete outbound[key]
   const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
@@ -1718,69 +1600,194 @@ export async function handleCodexSearch({
       }
     : null
   if (redaction) Object.assign(outbound, await maskJson(outbound, redaction))
+
   const post = ops.postCodexSearch || postCodexSearch
-  const pickOpts = { stickyRouter, sessions: null, body: outbound, keyScope, excluded: new Set(), routing, ownerScope }
-  const deadline = Date.now() + codexWaitTimeoutMs(routing)
+  const effectivePoolAccess = poolAccess || req?._poolAccess || null
+  const isSearchManagedPool = Boolean(effectivePoolAccess && effectivePoolAccess.legacy === false)
+  const baseAcquireParams = {
+    requestId: crypto.randomUUID(),
+    originPoolId:
+      originPoolId ||
+      effectivePoolAccess?.originPool?.id ||
+      effectivePoolAccess?.effectivePool?.id ||
+      preCheck.scope?.vm_pool_id ||
+      VIRTUAL_POOL_IDS.codex,
+    apiKeyRecord: req.apiKeyRecord || null,
+    apiKeyKind: req.apiKeyKind || null,
+    poolAccess: effectivePoolAccess,
+    ownerScope: preCheck.owner,
+    allowedNodeKeys:
+      !isSearchManagedPool && Array.isArray(preCheck.scope?.allowed_vms) && preCheck.scope.allowed_vms.length > 0
+        ? preCheck.scope.allowed_vms.map((id) => formatNodeKey('codex_vm', id))
+        : undefined,
+    nodeTypes: ['codex_vm'],
+    model: outbound.model,
+    modelFamily: 'openai',
+    protocol: 'openai.search',
+    sessionId: crypto.randomUUID(),
+    isEphemeralProbe: true,
+    noQueue: !queueAllowedByHeaders(req.headers),
+  }
+
+  const excludedNodeKeys = new Set()
   const gone = clientGoneSignal(req, res)
+  let activeLeaseId = null
+  let activeVmId = null
   let last = null
   let attempts = 0
+  const maxSwitches = codexFailoverBudget(routing).maxSwitches
+
+  const releaseActiveLeaseNow = async (payload) => {
+    const lid = activeLeaseId
+    activeLeaseId = null
+    if (!lid) return
+    try {
+      await rt.releaseLease(lid, payload)
+    } catch {}
+  }
+
   try {
+    let acquired
+    try {
+      acquired = await rt.acquireNode(
+        { ...baseAcquireParams, attemptNo: 1, excludeNodes: [...excludedNodeKeys] },
+        { signal: gone.signal },
+      )
+    } catch (err) {
+      if (isAbortErr(err, gone.signal)) {
+        logBag.final_state = 'cancelled'
+        return
+      }
+      return respondCodexSchedulerError({ res, json, stats, logBag, err })
+    }
+    activeLeaseId = acquired.lease_id
+    activeVmId = String(acquired.selected_node?.node_id || '')
+
     for (;;) {
-      const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, {
-        deadline,
-        signal: gone.signal,
-        fetchImpl: ops.quotaFetchImpl || ops.fetchImpl,
-        now: ops.now,
+      const vm = getVm(projectRoot, activeVmId)
+      excludedNodeKeys.add(formatNodeKey('codex_vm', activeVmId))
+      if (!vm || !isCodexVm(vm)) {
+        const prev = activeLeaseId
+        activeLeaseId = null
+        try {
+          const sw = await rt.switchNode(
+            {
+              release_lease_id: prev,
+              failure: { http_status: 503, error_class: 'server5xx', error_signature: 'codex_vm_missing' },
+              next_attempt: { ...baseAcquireParams, attemptNo: attempts + 1, excludeNodes: [...excludedNodeKeys] },
+            },
+            { signal: gone.signal },
+          )
+          activeLeaseId = sw.lease_id
+          activeVmId = String(sw.selected_node?.node_id || '')
+          continue
+        } catch (err) {
+          if (isAbortErr(err, gone.signal)) {
+            logBag.final_state = 'cancelled'
+            return
+          }
+          if (err instanceof SchedulerUnavailableError || err?.code === 'scheduler_unavailable') {
+            return respondCodexSchedulerError({ res, json, stats, logBag, err })
+          }
+          if (last) break
+          return respondCodexSchedulerError({ res, json, stats, logBag, err })
+        }
+      }
+
+      if (!attempts) {
+        stats.requests++
+        stats.by_route['openai.search'] = (stats.by_route['openai.search'] || 0) + 1
+      }
+      attempts += 1
+      logBag.vm_id = vm.id
+      logBag.account_id = vm.id
+      logBag.attempt_count = attempts
+      last = await post({
+        projectRoot,
+        vm,
+        body: outbound,
+        turnMetadata,
+        fetchImpl: ops.fetchImpl,
+        refresh: ops.refresh,
       })
-      if (!admitted.lease) {
-        if (admitted.picked.error === 'client_cancelled') {
+      logBag.usage_account_id = openaiUsageAccountId(last.accountId)
+      logBag.upstream_status = last.status || null
+      const parsedBody = parseJson(last.text)
+      ingestCodexHop(projectRoot, vm.id, {
+        ok: last.status >= 200 && last.status < 300,
+        status: last.status,
+        headers: last.headers || {},
+        body: parsedBody,
+      })
+      parkCodexGrantDeadIfHit(projectRoot, vm.id, last)
+
+      if (!isSearchFailover(last)) {
+        await rt.commitLease(activeLeaseId).catch(() => {})
+        await releaseActiveLeaseNow({ outcome: 'ok', http_status: last.status || 200 })
+        break
+      }
+
+      const failureReport = buildCodexFailureReport({
+        status: last.status,
+        body: parsedBody,
+        headers: last.headers,
+        error: last.error,
+        grantDead: last.grantDead,
+      })
+      if (attempts > maxSwitches) {
+        await releaseActiveLeaseNow({
+          outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
+          http_status: failureReport.http_status || undefined,
+          error_class: failureReport.error_class,
+          error_signature: failureReport.error_signature,
+          error_message: failureReport.error_message,
+          retry_after_sec: failureReport.retry_after_sec,
+        })
+        break
+      }
+
+      const prevLeaseId = activeLeaseId
+      activeLeaseId = null
+      try {
+        const sw = await rt.switchNode(
+          {
+            release_lease_id: prevLeaseId,
+            failure: failureReport,
+            next_attempt: {
+              ...baseAcquireParams,
+              attemptNo: attempts + 1,
+              excludeNodes: [...excludedNodeKeys],
+            },
+          },
+          { signal: gone.signal },
+        )
+        activeLeaseId = sw.lease_id
+        activeVmId = String(sw.selected_node?.node_id || '')
+      } catch (switchErr) {
+        if (isAbortErr(switchErr, gone.signal)) {
           logBag.final_state = 'cancelled'
           return
         }
-        if (last) break
-        return rejectCodexAdmission({ res, json, stats, logBag, picked: admitted.picked, model: outbound.model })
-      }
-      try {
-        const vm = getVm(projectRoot, admitted.vmId)
-        pickOpts.excluded.add(admitted.vmId)
-        if (!vm || !isCodexVm(vm)) continue
-        if (!attempts) {
-          stats.requests++
-          stats.by_route['openai.search'] = (stats.by_route['openai.search'] || 0) + 1
+        if (
+          switchErr instanceof SchedulerUnavailableError ||
+          switchErr?.code === 'scheduler_unavailable' ||
+          (switchErr instanceof SchedulerApiError && (switchErr.code === 'poison_abort' || switchErr.status === 422))
+        ) {
+          return respondCodexSchedulerError({ res, json, stats, logBag, err: switchErr })
         }
-        attempts += 1
-        logBag.vm_id = vm.id
-        logBag.account_id = vm.id
-        logBag.attempt_count = attempts
-        last = await post({
-          projectRoot,
-          vm,
-          body: outbound,
-          turnMetadata,
-          fetchImpl: ops.fetchImpl,
-          refresh: ops.refresh,
-        })
-        logBag.usage_account_id = openaiUsageAccountId(last.accountId)
-        logBag.upstream_status = last.status || null
-        ingestCodexHop(projectRoot, vm.id, {
-          ok: last.status >= 200 && last.status < 300,
-          status: last.status,
-          headers: last.headers || {},
-          body: parseJson(last.text),
-        })
-        // search/images 路径同样接 grant-death 写盘（与主请求路径同语义）。
-        parkCodexGrantDeadIfHit(projectRoot, vm.id, last)
-        if (!isSearchFailover(last)) break
-      } finally {
-        admitted.lease.release()
+        break
       }
     }
   } finally {
+    if (activeLeaseId) {
+      await releaseActiveLeaseNow({ outcome: gone.signal.aborted ? 'aborted' : 'error' })
+    }
     gone.settle()
   }
-  if (!last.status) {
+
+  if (!last || !last.status) {
     logBag.final_state = 'upstream_error'
-    return reject(502, 'api_error', last.error || 'upstream_transport', 'Codex search upstream request failed')
+    return reject(502, 'api_error', last?.error || 'upstream_transport', 'Codex search upstream request failed')
   }
   const payload = parseJson(last.text)
   if (payload === undefined) {
@@ -1801,25 +1808,17 @@ export async function handleCodexSearch({
   return json(res, last.status, responseBody)
 }
 
-// Image generation runs for minutes. codex-proxy-rs sets no total deadline on these JSON endpoints
-// (connect timeout only); the proxy fetch here needs one, so it is generous.
 const CODEX_IMAGES_TIMEOUT_MS = 600000
 const CODEX_IMAGES_URLS = Object.freeze({
   generations: CODEX_IMAGE_GENERATIONS_URL,
   edits: CODEX_IMAGE_EDITS_URL,
 })
 
-/** Official Codex `image_generation_available` excludes Free (codex-proxy-rs credential/selector.rs). */
 function isFreePlanSlot(projectRoot, vm) {
   const plan = vm?.codex?.plan_type || readCodexAccounts(projectRoot, vm.id)[0]?.chatgpt_plan_type || ''
   return String(plan).trim().toLowerCase() === 'free'
 }
 
-/**
- * POST /v1/images/{generations,edits}: native Codex Images JSON, passed through on one slot
- * (codex-proxy-rs `gateway-api/src/openai/images`). No inference session window; an
- * `x-codex-image-turn-id` keeps one edit turn on the slot that served it.
- */
 export async function handleCodexImages({
   req,
   res,
@@ -1830,10 +1829,12 @@ export async function handleCodexImages({
   json,
   routing = {},
   projectRoot,
-  stickyRouter = null,
   ops = {},
   keyScope = null,
   ownerScope = null,
+  poolAccess = null,
+  originPoolId = null,
+  schedulerRuntime = null,
 }) {
   logBag.via = 'codex-images'
   const reject = (status, type, code, message) => {
@@ -1860,17 +1861,39 @@ export async function handleCodexImages({
       )
     }
   }
-  const effectiveKeyScope = keyScope || keyScopeFromRequest(req)
-  const excluded = new Set()
+  const preCheck = validateCodexPreconditions({
+    projectRoot,
+    req,
+    keyScope,
+    ownerScope,
+    pinVmId: null,
+    model,
+    res,
+    json,
+    stats,
+    logBag,
+  })
+  if (!preCheck.ok) return
+
+  const effectivePoolAccess = poolAccess || req?._poolAccess || null
+  const isImageManagedPool = Boolean(effectivePoolAccess && effectivePoolAccess.legacy === false)
+  const hasFallbackPool = Boolean(isImageManagedPool && effectivePoolAccess?.effectivePool?.fallback_pool_id)
+  const excludedNodeKeys = new Set()
   let usable = 0
+  let freeExcluded = 0
   for (const item of listVms(projectRoot)) {
     if (!isCodexVm(item)) continue
-    if (!keyAllowsVm(effectiveKeyScope, item)) continue
-    if (ownerScope && !vmMatchesOwnerScope(item, ownerScope)) continue
-    if (isFreePlanSlot(projectRoot, getVm(projectRoot, item.id) || item)) excluded.add(item.id)
-    else usable += 1
+    if (preCheck.owner && !vmMatchesOwnerScope(item, preCheck.owner)) continue
+    const inOriginScope = keyAllowsVm(preCheck.scope, item)
+    if (isFreePlanSlot(projectRoot, getVm(projectRoot, item.id) || item)) {
+      // Exclude Free-plan slots globally across origin and any Stage 4 fallback pools.
+      excludedNodeKeys.add(formatNodeKey('codex_vm', item.id))
+      if (inOriginScope) freeExcluded += 1
+    } else if (inOriginScope) {
+      usable += 1
+    }
   }
-  if (!usable && excluded.size) {
+  if (!usable && freeExcluded > 0 && !hasFallbackPool) {
     return reject(
       403,
       'permission_error',
@@ -1878,6 +1901,20 @@ export async function handleCodexImages({
       'Image generation is not available on Free-plan GPT slots',
     )
   }
+
+  const rt = schedulerRuntime || req?._schedulerRuntime || null
+  if (!rt) {
+    return respondCodexSchedulerError({
+      res,
+      json,
+      stats,
+      logBag,
+      err: new SchedulerUnavailableError('Rust scheduler runtime is unavailable for Codex images', {
+        reason: 'runtime_missing',
+      }),
+    })
+  }
+
   const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
   const imageTurnId = headerString(req.headers, 'x-codex-image-turn-id')
   const extraHeaders = imageTurnId ? { 'x-codex-image-turn-id': imageTurnId } : {}
@@ -1891,77 +1928,193 @@ export async function handleCodexImages({
     : null
   const outboundBody = redaction ? await maskJson(body, redaction) : body
   const post = ops.postCodexJson || postCodexJson
-  // Selection-only body: the turn id becomes the sticky session; the upstream body is untouched.
-  const pickBody = { model: model || null, ...(imageTurnId ? { session_id: `codex-image-turn:${imageTurnId}` } : {}) }
-  const pickOpts = { stickyRouter, sessions: null, body: pickBody, keyScope, excluded, routing, ownerScope }
-  const deadline = Date.now() + codexWaitTimeoutMs(routing)
+
+  const baseAcquireParams = {
+    requestId: crypto.randomUUID(),
+    originPoolId:
+      originPoolId ||
+      effectivePoolAccess?.originPool?.id ||
+      effectivePoolAccess?.effectivePool?.id ||
+      preCheck.scope?.vm_pool_id ||
+      VIRTUAL_POOL_IDS.codex,
+    apiKeyRecord: req.apiKeyRecord || null,
+    apiKeyKind: req.apiKeyKind || null,
+    poolAccess: effectivePoolAccess,
+    ownerScope: preCheck.owner,
+    allowedNodeKeys:
+      !isImageManagedPool && Array.isArray(preCheck.scope?.allowed_vms) && preCheck.scope.allowed_vms.length > 0
+        ? preCheck.scope.allowed_vms.map((id) => formatNodeKey('codex_vm', id))
+        : undefined,
+    nodeTypes: ['codex_vm'],
+    model: model || '',
+    modelFamily: 'openai',
+    protocol: 'openai.images',
+    sessionId: imageTurnId ? deterministicUuidFromSeed(`codex-image-turn:${imageTurnId}`) : crypto.randomUUID(),
+    isEphemeralProbe: !imageTurnId,
+    noQueue: !queueAllowedByHeaders(req.headers),
+  }
+
   const gone = clientGoneSignal(req, res)
+  let activeLeaseId = null
+  let activeVmId = null
   let last = null
   let attempts = 0
+  const maxSwitches = codexFailoverBudget(routing).maxSwitches
+
+  const releaseActiveLeaseNow = async (payload) => {
+    const lid = activeLeaseId
+    activeLeaseId = null
+    if (!lid) return
+    try {
+      await rt.releaseLease(lid, payload)
+    } catch {}
+  }
+
   try {
+    let acquired
+    try {
+      acquired = await rt.acquireNode(
+        { ...baseAcquireParams, attemptNo: 1, excludeNodes: [...excludedNodeKeys] },
+        { signal: gone.signal },
+      )
+    } catch (err) {
+      if (isAbortErr(err, gone.signal)) {
+        logBag.final_state = 'cancelled'
+        return
+      }
+      return respondCodexSchedulerError({ res, json, stats, logBag, err })
+    }
+    activeLeaseId = acquired.lease_id
+    activeVmId = String(acquired.selected_node?.node_id || '')
+
     for (;;) {
-      const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, {
-        deadline,
-        signal: gone.signal,
-        fetchImpl: ops.quotaFetchImpl || ops.fetchImpl,
-        now: ops.now,
+      const vm = getVm(projectRoot, activeVmId)
+      excludedNodeKeys.add(formatNodeKey('codex_vm', activeVmId))
+      if (!vm || !isCodexVm(vm)) {
+        const prev = activeLeaseId
+        activeLeaseId = null
+        try {
+          const sw = await rt.switchNode(
+            {
+              release_lease_id: prev,
+              failure: { http_status: 503, error_class: 'server5xx', error_signature: 'codex_vm_missing' },
+              next_attempt: { ...baseAcquireParams, attemptNo: attempts + 1, excludeNodes: [...excludedNodeKeys] },
+            },
+            { signal: gone.signal },
+          )
+          activeLeaseId = sw.lease_id
+          activeVmId = String(sw.selected_node?.node_id || '')
+          continue
+        } catch (err) {
+          if (isAbortErr(err, gone.signal)) {
+            logBag.final_state = 'cancelled'
+            return
+          }
+          if (err instanceof SchedulerUnavailableError || err?.code === 'scheduler_unavailable') {
+            return respondCodexSchedulerError({ res, json, stats, logBag, err })
+          }
+          if (last) break
+          return respondCodexSchedulerError({ res, json, stats, logBag, err })
+        }
+      }
+
+      if (!attempts) {
+        stats.requests++
+        stats.by_route['openai.images'] = (stats.by_route['openai.images'] || 0) + 1
+      }
+      attempts += 1
+      logBag.vm_id = vm.id
+      logBag.account_id = vm.id
+      logBag.attempt_count = attempts
+      last = await post({
+        url: CODEX_IMAGES_URLS[kind] || CODEX_IMAGE_GENERATIONS_URL,
+        timeoutMs: CODEX_IMAGES_TIMEOUT_MS,
+        projectRoot,
+        vm,
+        body: outboundBody,
+        turnMetadata,
+        extraHeaders,
+        fetchImpl: ops.fetchImpl,
+        refresh: ops.refresh,
       })
-      if (!admitted.lease) {
-        if (admitted.picked.error === 'client_cancelled') {
+      logBag.usage_account_id = openaiUsageAccountId(last.accountId)
+      logBag.upstream_status = last.status || null
+      const parsedBody = parseJson(last.text)
+      ingestCodexHop(projectRoot, vm.id, {
+        ok: last.status >= 200 && last.status < 300,
+        status: last.status,
+        headers: last.headers || {},
+        body: parsedBody,
+      })
+      parkCodexGrantDeadIfHit(projectRoot, vm.id, last)
+
+      if (!isSearchFailover(last)) {
+        await rt.commitLease(activeLeaseId).catch(() => {})
+        await releaseActiveLeaseNow({ outcome: 'ok', http_status: last.status || 200 })
+        break
+      }
+
+      const failureReport = buildCodexFailureReport({
+        status: last.status,
+        body: parsedBody,
+        headers: last.headers,
+        error: last.error,
+        grantDead: last.grantDead,
+      })
+      if (attempts > maxSwitches) {
+        await releaseActiveLeaseNow({
+          outcome: failureReport.error_class === 'timeout' ? 'timeout' : 'error',
+          http_status: failureReport.http_status || undefined,
+          error_class: failureReport.error_class,
+          error_signature: failureReport.error_signature,
+          error_message: failureReport.error_message,
+          retry_after_sec: failureReport.retry_after_sec,
+        })
+        break
+      }
+
+      const prevLeaseId = activeLeaseId
+      activeLeaseId = null
+      try {
+        const sw = await rt.switchNode(
+          {
+            release_lease_id: prevLeaseId,
+            failure: failureReport,
+            next_attempt: {
+              ...baseAcquireParams,
+              attemptNo: attempts + 1,
+              excludeNodes: [...excludedNodeKeys],
+            },
+          },
+          { signal: gone.signal },
+        )
+        activeLeaseId = sw.lease_id
+        activeVmId = String(sw.selected_node?.node_id || '')
+      } catch (switchErr) {
+        if (isAbortErr(switchErr, gone.signal)) {
           logBag.final_state = 'cancelled'
           return
         }
-        if (last) break
-        return rejectCodexAdmission({ res, json, stats, logBag, picked: admitted.picked, model })
-      }
-      try {
-        const vm = getVm(projectRoot, admitted.vmId)
-        excluded.add(admitted.vmId)
-        if (!vm || !isCodexVm(vm)) continue
-        if (!attempts) {
-          stats.requests++
-          stats.by_route['openai.images'] = (stats.by_route['openai.images'] || 0) + 1
+        if (
+          switchErr instanceof SchedulerUnavailableError ||
+          switchErr?.code === 'scheduler_unavailable' ||
+          (switchErr instanceof SchedulerApiError && (switchErr.code === 'poison_abort' || switchErr.status === 422))
+        ) {
+          return respondCodexSchedulerError({ res, json, stats, logBag, err: switchErr })
         }
-        attempts += 1
-        logBag.vm_id = vm.id
-        logBag.account_id = vm.id
-        logBag.attempt_count = attempts
-        last = await post({
-          url: CODEX_IMAGES_URLS[kind] || CODEX_IMAGE_GENERATIONS_URL,
-          timeoutMs: CODEX_IMAGES_TIMEOUT_MS,
-          projectRoot,
-          vm,
-          body: outboundBody,
-          turnMetadata,
-          extraHeaders,
-          fetchImpl: ops.fetchImpl,
-          refresh: ops.refresh,
-        })
-        logBag.usage_account_id = openaiUsageAccountId(last.accountId)
-        logBag.upstream_status = last.status || null
-        ingestCodexHop(projectRoot, vm.id, {
-          ok: last.status >= 200 && last.status < 300,
-          status: last.status,
-          headers: last.headers || {},
-          body: parseJson(last.text),
-        })
-        // search/images 路径同样接 grant-death 写盘（与主请求路径同语义），
-        // 防止死号在 JSON 端点上继续换槽烧 401。
-        parkCodexGrantDeadIfHit(projectRoot, vm.id, last)
-        if (last.status >= 200 && last.status < 300 && stickyRouter?.bind) {
-          for (const key of admitted.picked.stickyKeys || []) stickyRouter.bind(key, { accountId: vm.id, vmId: vm.id })
-        }
-        if (!isSearchFailover(last)) break
-      } finally {
-        admitted.lease.release()
+        break
       }
     }
   } finally {
+    if (activeLeaseId) {
+      await releaseActiveLeaseNow({ outcome: gone.signal.aborted ? 'aborted' : 'error' })
+    }
     gone.settle()
   }
-  if (!last.status) {
+
+  if (!last || !last.status) {
     logBag.final_state = 'upstream_error'
-    return reject(502, 'api_error', last.error || 'upstream_transport', 'Codex images upstream request failed')
+    return reject(502, 'api_error', last?.error || 'upstream_transport', 'Codex images upstream request failed')
   }
   const payload = parseJson(last.text)
   if (payload === undefined) {

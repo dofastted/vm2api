@@ -1,8 +1,5 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
 import {
   PoolScheduler,
   quotaGuardConfigOf,
@@ -16,75 +13,6 @@ import { adoptProviderResponseHeaders } from '../../src/lib/pool/failover-runner
 const HOUR = 3600_000
 const on = quotaGuardConfigOf({ exhaustion_guard: true })
 const off = quotaGuardConfigOf({})
-
-function project() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-quota-guard-'))
-  const vms = path.join(root, 'vms')
-  fs.mkdirSync(vms, { recursive: true })
-  for (const [id, accountId, port] of [
-    ['vm-01', 'account-1', 10001],
-    ['vm-02', 'account-2', 10002],
-  ]) {
-    const vm = {
-      id,
-      name: id,
-      status: 'running',
-      schedulable: true,
-      proxy_cli_enabled: true,
-      proxy: { id: `proxy-${id}`, url: `socks5h://127.0.0.1:${port}` },
-      runtime: { worker_socket: path.join(vms, id, 'run', 'worker.sock') },
-      // vm-01 outranks vm-02, so only the guard moves a new conversation off it.
-      policy: { maxConcurrency: 2, concurrencyOverride: true, weight: 1, priority: id === 'vm-01' ? 10 : 0 },
-      claude: {
-        account_uuid: accountId,
-        account_tier: 'pro',
-        access_token: `access-${accountId}`,
-        refresh_token: `refresh-${accountId}`,
-        expires_at: Math.floor(Date.now() / 1000) + 3600,
-      },
-    }
-    fs.writeFileSync(path.join(vms, `${id}.json`), JSON.stringify(vm))
-  }
-  return root
-}
-
-function poolWith(root, unifiedByAccount, { guard = true, sticky = null } = {}) {
-  const accounts = new Map(
-    Object.entries(unifiedByAccount).map(([id, unified]) => [id, { account_id: id, status: 'active', unified }]),
-  )
-  const runtimeRepo = {
-    states: new Map(),
-    get: (id) => runtimeRepo.states.get(id) || null,
-    clearExpired() {},
-    upsert(state) {
-      runtimeRepo.states.set(state.account_id, state)
-      return state
-    },
-    writeHeartbeat() {},
-    schedulingSnapshot: (ids) => new Map(ids.map((id) => [id, { state: null, account: accounts.get(id) || null }])),
-  }
-  const pool = new PoolScheduler({
-    projectRoot: root,
-    runtimeRepo,
-    stickyRouter: sticky ? { resolve: (key) => (key === sticky.key ? sticky.bound : null) } : null,
-    // Production shape: the legacy 5h/7d gates are off (safety 1, block_on_* false).
-    accountQuota: {
-      config: {
-        safety_ratio: 1,
-        weekly_safety_ratio: 1,
-        block_on_5h: false,
-        block_on_7d: false,
-        exhaustion_guard: guard,
-      },
-      policyFor: () => ({ limit_5h: 1, limit_7d: 1 }),
-      canAccept: () => ({ ok: true }),
-    },
-    workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
-    config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
-  })
-  pool.testAccounts = accounts
-  return pool
-}
 
 const at = (ratio, extra = {}) => ({
   headers: { '5h': { utilization: ratio, status: 'allowed', reset: new Date(Date.now() + 2 * HOUR).toISOString() } },
@@ -137,56 +65,6 @@ test('thresholds come from quota config and new-session never exceeds stop', () 
       stop_ratio: 0.8,
     },
   )
-})
-
-test('in the new-session band a new conversation goes elsewhere, a pinned one stays', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const fresh = poolWith(root, { 'account-1': at(0.9), 'account-2': at(0.1) })
-  const picked = await fresh.selectAndReserve({ model: 'claude-test', allowWait: false, excluded: new Set() })
-  assert.equal(picked.accountId, 'account-2')
-  picked.release()
-
-  const pinned = poolWith(
-    root,
-    { 'account-1': at(0.9), 'account-2': at(0.1) },
-    {
-      sticky: { key: 'conv-1', bound: { vmId: 'vm-01', accountId: 'account-1' } },
-    },
-  )
-  const kept = await pinned.selectAndReserve({ model: 'claude-test', stickyKey: 'conv-1', allowWait: false })
-  assert.equal(kept.accountId, 'account-1')
-  assert.equal(kept.selectionReason, 'sticky')
-  kept.release()
-})
-
-test('past the stop line even a pinned conversation leaves; all stopped is a 429 with the reset', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = poolWith(
-    root,
-    { 'account-1': at(0.96), 'account-2': at(0.1) },
-    {
-      sticky: { key: 'conv-1', bound: { vmId: 'vm-01', accountId: 'account-1' } },
-    },
-  )
-  const moved = await pool.selectAndReserve({ model: 'claude-test', stickyKey: 'conv-1', allowWait: false })
-  assert.equal(moved.accountId, 'account-2')
-  moved.release()
-
-  const dead = poolWith(root, { 'account-1': at(0.96), 'account-2': at(0.99) })
-  const none = await dead.selectAndReserve({ model: 'claude-test', allowWait: false })
-  assert.equal(none.ok, false)
-  assert.equal(none.reason, 'pool_rate_limited')
-})
-
-test('switch off keeps the old behaviour below a rejected window', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = poolWith(root, { 'account-1': at(0.97), 'account-2': at(0.98) }, { guard: false })
-  const picked = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
-  assert.equal(picked.ok, true)
-  picked.release()
 })
 
 test('a long Retry-After alone does not prove a plan window; the hop adopts provider headers', () => {
@@ -287,46 +165,6 @@ test('the hop keeps its own headers over provider ones', () => {
   assert.equal(result.headers['request-id'], 'req_x')
 })
 
-test('seat path: a new seat avoids the band, a session pinned there keeps its seat', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const fresh = poolWith(root, { 'account-1': at(0.9), 'account-2': at(0.1) })
-  const picked = await fresh.selectAndReserve({ model: 'claude-test', seatKey: 'seat-new', allowWait: false })
-  assert.equal(picked.accountId, 'account-2')
-  picked.release()
-
-  const pinned = poolWith(
-    root,
-    { 'account-1': at(0.9), 'account-2': at(0.1) },
-    {
-      sticky: { key: 'conv-1', bound: { vmId: 'vm-01', accountId: 'account-1' } },
-    },
-  )
-  const kept = await pinned.selectAndReserve({
-    model: 'claude-test',
-    seatKey: 'seat-old',
-    stickyKey: 'conv-1',
-    allowWait: false,
-  })
-  assert.equal(kept.accountId, 'account-1')
-  kept.release()
-})
-
-test('without the switch the same pool still sends a new conversation to the 90% account', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  for (const seatKey of [null, 'seat-new']) {
-    const pool = poolWith(root, { 'account-1': at(0.9), 'account-2': at(0.1) }, { guard: false })
-    const picked = await pool.selectAndReserve({
-      model: 'claude-test',
-      allowWait: false,
-      ...(seatKey ? { seatKey } : {}),
-    })
-    assert.equal(picked.accountId, 'account-1')
-    picked.release()
-  }
-})
-
 test('a legacy percent reading below 100 next to rejected is that percentage', () => {
   const now = Date.now()
   const reset = new Date(now + HOUR).toISOString()
@@ -337,25 +175,7 @@ test('a legacy percent reading below 100 next to rejected is that percentage', (
   assert.equal(quotaGuardLevel(full, off, now).level, 'stop')
 })
 
-test('admission re-reads the guard: a queued candidate cannot cross a line it saw open', async (t) => {
-  const root = project()
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = poolWith(root, { 'account-1': at(0.5), 'account-2': at(0.1) })
-  const candidates = await pool.eligibleCandidates({ model: 'claude-test', continuingVmIds: new Set() })
-  const first = candidates.find((item) => item.vmId === 'vm-01')
-  const ok = pool.reserve(first)
-  assert.ok(ok)
-  ok.release()
-
-  pool.testAccounts.set('account-1', { account_id: 'account-1', status: 'active', unified: at(0.9) })
-  assert.equal(pool.reserve(first), null, 'new conversation in the 85% band')
-  const pinned = (await pool.eligibleCandidates({ model: 'claude-test', continuingVmIds: new Set(['vm-01']) })).find(
-    (item) => item.vmId === 'vm-01',
-  )
-  const kept = pool.reserve(pinned)
-  assert.ok(kept, 'pinned conversation keeps its account in the band')
-  kept.release()
-
-  pool.testAccounts.set('account-1', { account_id: 'account-1', status: 'active', unified: at(0.96) })
-  assert.equal(pool.reserve(pinned), null, 'nothing past the stop line')
+test('M3 cutover (D4): PoolScheduler no longer exposes local eligibleCandidates or reserve paths', () => {
+  assert.equal(typeof PoolScheduler.prototype.eligibleCandidates, 'undefined')
+  assert.equal(typeof PoolScheduler.prototype.reserve, 'undefined')
 })

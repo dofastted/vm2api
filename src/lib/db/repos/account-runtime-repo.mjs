@@ -95,10 +95,6 @@ export class AccountRuntimeRepo {
       INSERT OR IGNORE INTO accounts (id, vm_id, name, extra, created_at, updated_at)
       VALUES (?, ?, ?, '{}', ?, ?)
     `)
-    this._linkDefaultGroup = db.prepare(`
-      INSERT OR IGNORE INTO account_groups (account_id, group_id, priority, created_at)
-      VALUES (?, 1, 50, ?)
-    `)
     this._updateAcc = db.prepare(`
       UPDATE accounts SET
         vm_id = ?,
@@ -185,7 +181,6 @@ export class AccountRuntimeRepo {
       updated_at: new Date().toISOString(),
     }
     this._ensureAcc.run(next.account_id, next.vm_id, next.account_id, next.updated_at, next.updated_at)
-    this._linkDefaultGroup.run(next.account_id, next.updated_at)
     this._updateAcc.run(
       next.vm_id,
       next.priority,

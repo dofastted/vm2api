@@ -1,11 +1,65 @@
-import test from 'node:test'
+import test, { before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { ApiScheduler } from '../../src/lib/pool/api-scheduler.mjs'
+import { createSchedulerRuntime } from '../../src/lib/scheduler/scheduler-runtime.mjs'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const REPO_ROOT = path.resolve(__dirname, '../..')
+
+function resolveSchedulerBin() {
+  for (const candidate of [
+    process.env.KIN_SCHEDULER_BIN,
+    path.join(REPO_ROOT, 'bin', process.platform === 'win32' ? 'kin-scheduler.exe' : 'kin-scheduler'),
+    '/tmp/vm2api-sched-m3-target/release/kin-scheduler',
+    '/tmp/vm2api-sched-target/release/kin-scheduler',
+  ]) {
+    if (candidate && fs.existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+let sharedSchedRoot = null
+let sharedSchedulerRuntime = null
+let activeEndpoints = []
+let apiReqSeq = 0
+
+before(async () => {
+  const binPath = resolveSchedulerBin()
+  assert.ok(binPath, 'kin-scheduler binary must exist for api-channel-routing tests (set KIN_SCHEDULER_BIN)')
+  sharedSchedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'api-channel-rust-sched-'))
+  sharedSchedulerRuntime = createSchedulerRuntime({
+    cfg: { paths: { data: sharedSchedRoot, project: sharedSchedRoot } },
+    getVms: () => [],
+    apiEndpointStore: { listRaw: () => activeEndpoints },
+    getRoutingConfig: () => ({}),
+    telemetryIntervalMs: 0,
+    clientOptions: {
+      binPath,
+      socketPath: path.join(sharedSchedRoot, 'run', 'scheduler.sock'),
+      tokenPath: path.join(sharedSchedRoot, 'run', 'scheduler.token'),
+      capFile: path.join(sharedSchedRoot, 'run', 'scheduler.cap.json'),
+      manageProcess: true,
+    },
+  })
+  await sharedSchedulerRuntime.start({ waitMs: 5_000, startLoops: false })
+})
+
+after(async () => {
+  if (sharedSchedulerRuntime) {
+    await sharedSchedulerRuntime.shutdown({ drain: false, stopProcess: true })
+    sharedSchedulerRuntime = null
+  }
+  if (sharedSchedRoot) {
+    fs.rmSync(sharedSchedRoot, { recursive: true, force: true })
+    sharedSchedRoot = null
+  }
+})
 
 for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
   ['anthropic.messages', 'relay/sonnet', 'anthropic'],
@@ -130,7 +184,7 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       res.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''))
     })
     await new Promise((resolve) => kernel.listen(path.join(root, 'run/api-kernel.sock'), resolve))
-    const scheduler = new ApiScheduler()
+    const scheduler = new ApiScheduler({ schedulerRuntime: sharedSchedulerRuntime })
     const primary = {
       id: 'ep',
       kind: 'custom',
@@ -149,7 +203,11 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
         { name: 'upstream-light', alias: 'claude-light' },
       ],
     }
-    scheduler.reload(review.route ? [primary, secondary] : [primary])
+    const endpoints = review.route ? [primary, secondary] : [primary]
+    scheduler.reload(endpoints)
+    activeEndpoints = endpoints
+    await sharedSchedulerRuntime.syncConfigNow('test_case')
+    await sharedSchedulerRuntime.pushTelemetryNow()
     const response = { headersSent: false, on() {}, once() {}, off() {}, end() {}, write() {} }
     const body =
       protocol === 'openai.responses'
@@ -219,7 +277,7 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
         limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
         paths: { data: root, project: root },
       },
-      requestLog: { start: () => ({ request_id: 'api-channel', t0: Date.now() }), finish() {} },
+      requestLog: { start: () => ({ request_id: `api-channel-${++apiReqSeq}`, t0: Date.now() }), finish() {} },
       stickyRouter: {},
       accountQuota: {},
       apiKeyStore: {
@@ -232,6 +290,7 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
         },
       },
       apiScheduler: scheduler,
+      schedulerRuntime: sharedSchedulerRuntime,
       apiEndpointStore: {},
       refusalGuards: {
         get: (fingerprint) => refusalCache.get(fingerprint),
@@ -416,8 +475,8 @@ for (const [protocol, inboundBody, routeMeta, assertOutput] of [
       )
     })
     await new Promise((resolve) => kernel.listen(path.join(root, 'run/api-kernel.sock'), resolve))
-    const scheduler = new ApiScheduler()
-    scheduler.reload([
+    const scheduler = new ApiScheduler({ schedulerRuntime: sharedSchedulerRuntime })
+    const gemEndpoints = [
       {
         id: 'ep-gem',
         kind: 'custom',
@@ -426,7 +485,11 @@ for (const [protocol, inboundBody, routeMeta, assertOutput] of [
         models: [{ name: 'gemini-upstream', alias: 'gemini-4-neon-low' }],
         api_key_entries: [{ id: 'ek-gem', api_key: 'sk-gem-upstream', proxy_url: '' }],
       },
-    ])
+    ]
+    scheduler.reload(gemEndpoints)
+    activeEndpoints = gemEndpoints
+    await sharedSchedulerRuntime.syncConfigNow('test_gemini_api')
+    await sharedSchedulerRuntime.pushTelemetryNow()
     const response = { headersSent: false, on() {}, once() {}, off() {}, end() {}, write() {} }
     const handler = createHandleProtocol({
       json: (_res, status, out) => {
@@ -443,11 +506,12 @@ for (const [protocol, inboundBody, routeMeta, assertOutput] of [
         limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
         paths: { data: root, project: root },
       },
-      requestLog: { start: () => ({ request_id: 'api-gem', t0: Date.now() }), finish() {} },
+      requestLog: { start: () => ({ request_id: `api-gem-${++apiReqSeq}`, t0: Date.now() }), finish() {} },
       stickyRouter: {},
       accountQuota: {},
       apiKeyStore: { acquire: () => ({ ok: true }), release: () => {}, recordUsage() {} },
       apiScheduler: scheduler,
+      schedulerRuntime: sharedSchedulerRuntime,
       apiEndpointStore: { listRaw: () => scheduler.endpoints },
       groupsRepo: { rateMultiplier: () => 1 },
       getRoutingConfig: () => ({}),

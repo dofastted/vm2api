@@ -2,6 +2,7 @@
  * /v1 protocol handler. URLs, auth, and response envelopes stay with the
  * server wiring; this factory owns convert → pool → Go/Rust hop → client.
  */
+import crypto from 'node:crypto'
 import { applyIntercept } from '../core/intercept.mjs'
 import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
 import { hashKey } from '../core/security.mjs'
@@ -264,6 +265,13 @@ import { materializeRemoteImageSources, validateImageDimensions } from './images
 import { applyMinMaxTokens } from './min-max-tokens.mjs'
 import { detectWarmupIntercept, formatWarmupSse, warmupMockMessage } from './warmup-intercept.mjs'
 import { queueAllowedByHeaders } from './queue-hint.mjs'
+import {
+  SchedulerApiError,
+  SchedulerUnavailableError,
+  VIRTUAL_POOL_IDS,
+  classifyErrorClass,
+  formatSchedulerError,
+} from '../scheduler/scheduler-runtime.mjs'
 
 /**
  * Which upstream refusals end the caller session. Claude Code's auto-mode
@@ -386,7 +394,55 @@ export function createHandleProtocol(deps) {
     typeof deps.getHealthMonitor === 'function' ? deps.getHealthMonitor() : deps.healthMonitor
   const getFailoverRunner = () =>
     typeof deps.getFailoverRunner === 'function' ? deps.getFailoverRunner() : deps.failoverRunner
+  const getSchedulerRuntime = (req = null) =>
+    (typeof deps.getSchedulerRuntime === 'function' ? deps.getSchedulerRuntime() : deps.schedulerRuntime) ||
+    req?._schedulerRuntime ||
+    null
   const thinkingOwnerStore = deps.thinkingOwners || defaultThinkingOwners
+
+  function resolveAttemptPoolPromptPolicy(
+    rustPolicy,
+    fallbackPool,
+    routing,
+    { nodeProvider = 'anthropic', isInternalCall = false } = {},
+  ) {
+    if (isInternalCall) {
+      return resolvePoolSystemPromptPolicy(fallbackPool, routing, { nodeProvider, isInternalCall: true })
+    }
+    if (!rustPolicy || typeof rustPolicy !== 'object') {
+      return resolvePoolSystemPromptPolicy(fallbackPool, routing, { nodeProvider, isInternalCall: false })
+    }
+    if (rustPolicy.source === 'provider_exempt') {
+      return resolvePoolSystemPromptPolicy(
+        { id: rustPolicy.pool_id || fallbackPool?.id || null, provider_scope: 'openai' },
+        routing,
+        { nodeProvider, isInternalCall: false },
+      )
+    }
+    if (rustPolicy.source === 'global') {
+      return resolvePoolSystemPromptPolicy(
+        {
+          id: rustPolicy.pool_id || fallbackPool?.id || null,
+          provider_scope: 'anthropic',
+          system_prompt_mode: 'inherit_global',
+        },
+        routing,
+        { nodeProvider, isInternalCall: false },
+      )
+    }
+    return resolvePoolSystemPromptPolicy(
+      {
+        id: rustPolicy.pool_id || fallbackPool?.id || null,
+        provider_scope: 'anthropic',
+        system_prompt_mode: rustPolicy.mode || 'inherit_global',
+        system_prompt_preset: rustPolicy.preset || 'official_full',
+        system_prompt_text: rustPolicy.text || '',
+        client_system_policy: rustPolicy.client_system_policy || 'prepend_pool',
+      },
+      routing,
+      { nodeProvider, isInternalCall: false },
+    )
+  }
   function responseClosed(res) {
     return !!(res?.destroyed || res?.writableEnded || res?.closed)
   }
@@ -511,7 +567,60 @@ export function createHandleProtocol(deps) {
     const opaqueCrag429 = result?.policy?.reason === 'crag_opaque_429'
     const explicitCode = opaqueCrag429 ? result.policy.reason : result?.body?.error?.code || null
     const originalMessage = result?.body?.error?.message || null
-    const details = result?.body?.error?.details || {}
+    if (explicitCode === 'scheduler_unavailable') {
+      logBag.error_code = 'scheduler_unavailable'
+      logBag.error_message = originalMessage || 'Rust scheduler sidecar is unavailable'
+      return {
+        status: 503,
+        retryAfterSec: 1,
+        body: {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            code: 'scheduler_unavailable',
+            message: logBag.error_message,
+          },
+        },
+      }
+    }
+    if (explicitCode === 'poison_abort') {
+      logBag.error_code = 'poison_abort'
+      logBag.error_message = originalMessage || 'Request rejected by scheduler poison guard'
+      return {
+        status: 422,
+        body: result?.body || {
+          type: 'error',
+          error: {
+            type: 'invalid_request_error',
+            code: 'poison_abort',
+            message: logBag.error_message,
+          },
+        },
+      }
+    }
+    if (
+      explicitCode === 'session_in_flight' ||
+      explicitCode === 'session_queue_full' ||
+      explicitCode === 'session_queue_timeout' ||
+      explicitCode === 'session_node_busy' ||
+      explicitCode === 'pool_queue_full'
+    ) {
+      logBag.error_code = explicitCode
+      logBag.error_message = originalMessage || 'Scheduler queue limit reached'
+      return {
+        status: 429,
+        retryAfterSec: Math.max(1, Math.ceil(Number(result?.retryAfterSec) || 1)),
+        body: result?.body || {
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            code: explicitCode,
+            message: logBag.error_message,
+          },
+        },
+      }
+    }
+    const details = result?.explain || result?.body?.error?.details || {}
     const policyRefusal =
       !opaqueCrag429 && logBag.risk_upstream_reason && logBag.risk_upstream_reason !== 'upstream:billing_refusal'
     const mapped = policyRefusal
@@ -1218,7 +1327,8 @@ export function createHandleProtocol(deps) {
             }
           }
           if (!hasOwnedGeminiEnv) {
-            const probe = apiScheduler.pick(
+            const probe = (apiScheduler.matchEndpoints || apiScheduler.pick).call(
+              apiScheduler,
               inbound?.model,
               Date.now(),
               apiScheduleScope(req, 'all', apiKeyStore?.users),
@@ -1578,7 +1688,24 @@ export function createHandleProtocol(deps) {
     // API endpoint protocols own routing; apply model overrides before choosing the channel.
     if (inferenceBackend === 'api') ctx = applyIntercept(cfg.intercept.rules, 'before_upstream', ctx)
     let apiInbound = inferenceBackend === 'api' ? ctx.body : null
-    let apiPicked = apiScope ? apiScheduler.pick(ctx.body?.model, Date.now(), apiScope) : null
+    // Pure read-only metadata lookup BEFORE JEV (zero slot reservation prior to JEV).
+    let apiPicked = apiScope
+      ? (apiScheduler.matchEndpoints || apiScheduler.pick).call(apiScheduler, ctx.body?.model, Date.now(), apiScope)
+      : null
+    if (
+      apiPicked &&
+      !apiPicked.ok &&
+      apiPicked.code === 'no_ready_api_key' &&
+      !activePoolAccess.legacy &&
+      effectivePool?.fallback_pool_id &&
+      !apiScope.endpointId
+    ) {
+      // Allow Stage 4 fallback_pool_id endpoints owned by the same scope when originPool keys are cooling down.
+      apiPicked = (apiScheduler.matchEndpoints || apiScheduler.pick).call(apiScheduler, ctx.body?.model, Date.now(), {
+        ...apiScope,
+        allowedEndpointIds: null,
+      })
+    }
     if (apiPicked && !apiPicked.ok) {
       stats.errors++
       logBag.error_code = apiPicked.code
@@ -1844,6 +1971,7 @@ export function createHandleProtocol(deps) {
             req._poolAccess = downgradedAccess
             logBag.resolved_pool_id = effectivePool?.id || route.target
             logBag.is_downgraded = true
+            logBag.jev_downgrade_pool_id = effectivePool?.id || route.target
             handledBySchedulerPool = true
           } else if (!activePoolAccess.legacy) {
             return unavailable()
@@ -1887,7 +2015,7 @@ export function createHandleProtocol(deps) {
           return unavailable()
         }
         apiInbound = ctx.body
-        apiPicked = apiScheduler.pick(ctx.body.model, Date.now(), {
+        apiPicked = (apiScheduler.matchEndpoints || apiScheduler.pick).call(apiScheduler, ctx.body.model, Date.now(), {
           groupType: platform.platform,
           endpointId: route.kind === 'endpoint' ? route.target : apiScope.endpointId,
           ownerScope: apiScope.ownerScope,
@@ -1909,6 +2037,14 @@ export function createHandleProtocol(deps) {
         pinVmId,
         keyScope,
         afterHop,
+        poolAccess: activePoolAccess,
+        originPoolId: activePoolAccess.originPool?.id || effectivePool?.id || null,
+        jevDowngradePoolId:
+          logBag.jev_downgrade_pool_id || (activePoolAccess.isDowngraded ? effectivePool?.id || null : null),
+        inboundIdentity: ctx.inboundIdentity,
+        isAdminDiagnostic: panelDiagnostics,
+        allowQueue: queueAllowedByHeaders(req.headers),
+        schedulerRuntime: getSchedulerRuntime(req),
       }
       // Pre-dispatch JEV has already run before slot admission (zero Phase-3 inversion).
       if (protocol === 'anthropic.messages') {
@@ -2460,55 +2596,52 @@ export function createHandleProtocol(deps) {
           (message) => Array.isArray(message?.content) && message.content.some((block) => block?.cache_control != null),
         ))
     let personaHideTokens = 0
-    if (inferenceBackend === 'api') {
-      if (apiPoolPrompt) {
-        logBag.prompt_policy = {
-          mode: apiPoolPrompt.mode,
-          source: apiPoolPrompt.source,
-          pool_id: apiPoolPrompt.poolId,
-        }
-      }
+    const renderApiAttemptBody = (attemptPrompt) => {
+      let attemptBody = shallowCopyBody(personaIn)
+      const attemptPreserveCaller =
+        !apiNonAnthropic && (attemptPrompt?.applies ? attemptPrompt.apiBodyPolicy === 'caller' : preserveApiCallerBody)
       if (!apiNonAnthropic && !requestContext) {
-        if (apiPoolPrompt?.applies && apiPoolPrompt.mode === 'override') {
-          ctx.body = applyPoolPromptToAnthropicBody(ctx.body, apiPoolPrompt)
-        } else if (!preserveApiCallerBody) {
-          ctx.body = applyCrsUnofficialPersona(ctx.body, {
+        if (attemptPrompt?.applies && attemptPrompt.mode === 'override') {
+          attemptBody = applyPoolPromptToAnthropicBody(attemptBody, attemptPrompt)
+        } else if (!attemptPreserveCaller) {
+          attemptBody = applyCrsUnofficialPersona(attemptBody, {
             officialClient: officialPassthrough,
             forceConfigured: !officialPassthrough,
-            ...(apiPoolPrompt?.applies && apiPoolPrompt.cliPreset ? { mode: apiPoolPrompt.cliPreset } : {}),
+            ...(attemptPrompt?.applies && attemptPrompt.cliPreset ? { mode: attemptPrompt.cliPreset } : {}),
             routingFile: routingConfigPath,
             cacheTtl: requestedCacheTtl,
             headers: req.headers,
             sessionId: outboundSessionId,
-            model: ctx.body?.model,
+            model: attemptBody?.model,
             cliVersion: OFFICIAL_CLI_VERSION,
           })
-          if (apiPoolPrompt?.applies && apiPoolPrompt.mode === 'append') {
-            ctx.body = applyPoolPromptToAnthropicBody(ctx.body, apiPoolPrompt)
+          if (attemptPrompt?.applies && attemptPrompt.mode === 'append') {
+            attemptBody = applyPoolPromptToAnthropicBody(attemptBody, attemptPrompt)
           }
         }
       }
       if (!officialPassthrough && !requestContext && !apiGemini) {
-        ctx.body = repairCacheBreakpoints(ctx.body, {
+        attemptBody = repairCacheBreakpoints(attemptBody, {
           limit: Number(getRouting()?.compatibility?.cache_control_limit) || 4,
           fallbackTtl: requestedCacheTtl,
-          fillMissing: !preserveApiCallerBody,
+          fillMissing: !attemptPreserveCaller,
         })
       }
       const apiEffectivePersonaMode =
-        apiPoolPrompt?.applies && apiPoolPrompt.cliPreset ? apiPoolPrompt.cliPreset : personaMode
-      personaHideTokens =
+        attemptPrompt?.applies && attemptPrompt.cliPreset ? attemptPrompt.cliPreset : personaMode
+      const hideTokens =
         requestContext ||
         apiNonAnthropic ||
-        preserveApiCallerBody ||
+        attemptPreserveCaller ||
         personaUsagePassthroughFromRoutingFile(routingConfigPath, apiEffectivePersonaMode)
           ? 0
-          : personaHideForUnofficial(personaIn, ctx.body, {
+          : personaHideForUnofficial(personaIn, attemptBody, {
               officialClient: officialPassthrough,
               mode: apiEffectivePersonaMode,
               hides: personaHidesUsageFromRoutingFile(routingConfigPath, apiEffectivePersonaMode),
               standing: standingUsageFromRoutingFile(routingConfigPath, apiEffectivePersonaMode),
             })
+      return { attemptBody, hideTokens }
     }
 
     if (inferenceBackend === 'api') {
@@ -2527,51 +2660,274 @@ export function createHandleProtocol(deps) {
       const requestedDelivery = String(
         req.headers['x-kin-delivery'] || getRouting()?.failover?.delivery_mode || 'realtime',
       )
-      // Worker hop stays realtime unless the caller asked for verified.
-      // stream:false only changes the client response shape (assembled JSON).
       const deliveryMode = requestedDelivery === 'verified' ? 'verified' : 'realtime'
       logBag.via = 'api-kernel'
-      // This backend forwards caller cache controls unchanged. Billing must
-      // use the upstream 5m/1h split, not the TTL requested for template fills.
       cacheTtl = null
-      let result
+
+      const apiRt = getSchedulerRuntime(req)
+      const apiAcquireScope = {
+        groupType: route?.kind === 'endpoint' ? platform.platform : apiScope.groupType,
+        endpointId: route?.kind === 'endpoint' ? route.target : apiScope.endpointId,
+        ownerScope: apiScope.ownerScope,
+        allowedEndpointIds: activePoolAccess.legacy ? apiScope.allowedEndpointIds : null,
+      }
+      const apiOriginPoolId = activePoolAccess.originPool?.id || effectivePool?.id || VIRTUAL_POOL_IDS.api
+      const apiNoQueue = !queueAllowedByHeaders(req.headers)
+      const apiMaxSwitches = Math.max(0, Number(getRouting()?.failover?.max_account_switches ?? 3))
+      const excludedApiNodes = new Set()
+      let activeApiLeaseId = null
+      let activeApiSelection = null
+      let apiAttempts = 0
+      let apiFinalConvertedBody = ctx.body
+      let result = null
+
+      const isRetryableApiFailure = (r) => {
+        if (!r || r.ok || res.headersSent || clientAbort.signal.aborted) return false
+        const st = Number(r.upstreamStatus ?? r.status) || 0
+        if (st === 0 || st === 408 || st === 429 || st === 529) return true
+        return st >= 500 && st < 600
+      }
+
+      const sendApiSchedulerError = (err) => {
+        stats.errors++
+        if (err instanceof SchedulerUnavailableError || err?.code === 'scheduler_unavailable') {
+          logBag.error_code = 'scheduler_unavailable'
+          logBag.error_message = err?.message || 'Rust scheduler sidecar is unavailable'
+          logBag.final_state = 'scheduler_unavailable'
+          res.setHeader?.('retry-after', '1')
+          return json(res, 503, {
+            type: 'error',
+            error: {
+              type: 'api_error',
+              code: 'scheduler_unavailable',
+              message: logBag.error_message,
+            },
+          })
+        }
+        const formatted = formatSchedulerError(err)
+        logBag.error_code = formatted.code
+        logBag.error_message = formatted.body?.error?.message || null
+        if (formatted.explain) logBag.scheduler_explain = formatted.explain
+        logBag.final_state = formatted.status === 422 ? 'poison_abort' : 'failed'
+        if (formatted.retryAfterSec != null) res.setHeader?.('retry-after', String(formatted.retryAfterSec))
+        return json(res, formatted.status, formatted.body)
+      }
+
       try {
-        result = await runApiInference({
-          req,
-          res,
-          cfg,
-          scheduler: apiScheduler,
-          picked: apiPicked,
-          store: apiEndpointStore,
-          protocol,
-          inbound: apiInbound,
-          convertedBody: ctx.body,
-          clientStream,
-          deliveryMode,
-          signal: clientAbort.signal,
-          timeoutMs: cfg.limits.upstream_timeout_ms,
-          personaHideTokens,
-          cacheTtl,
-          onPublicLine: publicStream ? (line) => publicStream.observe(line) : null,
-          requestContext,
-          passthrough: officialPassthrough,
-          routing: getRouting(),
-          redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
-          redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
-          converters: {
-            createClaudeMessageAssembler,
-            applyClaudeSSELineToMessage,
-            createOpenAIChatStreamState,
-            claudeSSELineToOpenAIChatChunks,
-            createOpenAICompletionStreamState,
-            claudeSSELineToOpenAICompletionChunks,
-            createResponsesStreamState: (model, id) => createResponsesStreamState(model, id, converted.responseTools),
-            claudeSSELineToResponsesEvents,
-            hidePersonaUsageInSseLine,
-            writeSSEHeaders,
-          },
-        })
+        try {
+          activeApiSelection = await apiScheduler.acquire(ctx.body?.model, {
+            schedulerRuntime: apiRt,
+            // Security: mint an unpredictable per-request UUID for Rust idempotency; never pass client X-Request-Id.
+            requestId: crypto.randomUUID(),
+            attemptNo: 1,
+            originPoolId: apiOriginPoolId,
+            jevDowngradePoolId:
+              logBag.jev_downgrade_pool_id || (activePoolAccess.isDowngraded ? effectivePool?.id || null : null),
+            apiKeyRecord: req.apiKeyRecord || null,
+            apiKeyKind: req.apiKeyKind || null,
+            poolAccess: activePoolAccess,
+            ownerScope: apiAcquireScope.ownerScope,
+            groupType: apiAcquireScope.groupType,
+            endpointId: apiAcquireScope.endpointId,
+            allowedEndpointIds: apiAcquireScope.allowedEndpointIds,
+            protocol,
+            inboundIdentity: summarySession
+              ? {
+                  ...(ctx.inboundIdentity || {}),
+                  sessionId: summarySession,
+                  sessionSource: 'summary_fork',
+                  parentSessionId: ctx.inboundIdentity?.sessionId || null,
+                  isEphemeralProbe: true,
+                }
+              : ctx.inboundIdentity,
+            noQueue: apiNoQueue,
+            isAdminDiagnostic: panelDiagnostics,
+            signal: clientAbort.signal,
+          })
+        } catch (err) {
+          if (clientAbort.signal.aborted || err?.name === 'AbortError' || err?.code === 'ABORT_ERR') {
+            return finishClientCancel(res, { cancelled: true }, logBag)
+          }
+          return sendApiSchedulerError(err)
+        }
+        if (!activeApiSelection?.ok) {
+          stats.errors++
+          logBag.error_code = activeApiSelection?.code || 'no_ready_api_key'
+          logBag.error_message = activeApiSelection?.message || 'No ready API endpoint'
+          return json(res, activeApiSelection?.code === 'model_not_found' ? 404 : 503, {
+            type: 'error',
+            error: { type: 'api_error', code: logBag.error_code, message: logBag.error_message },
+          })
+        }
+        activeApiLeaseId = activeApiSelection.leaseId
+        if (activeApiSelection.resolvedPoolId) logBag.resolved_pool_id = activeApiSelection.resolvedPoolId
+
+        for (;;) {
+          apiAttempts += 1
+          const attemptPrompt = resolveAttemptPoolPromptPolicy(
+            activeApiSelection.promptPolicy,
+            effectivePool,
+            getRouting() || {},
+            {
+              nodeProvider: apiNonAnthropic ? platform.platform : 'anthropic',
+              isInternalCall: Boolean(
+                requestContext || (req.apiKeyKind === 'master' && isHealthRealBypass(req.headers)),
+              ),
+            },
+          )
+          logBag.prompt_policy = {
+            mode: attemptPrompt.mode,
+            source: attemptPrompt.source,
+            pool_id: attemptPrompt.poolId,
+          }
+          const rendered = renderApiAttemptBody(attemptPrompt)
+          apiFinalConvertedBody = rendered.attemptBody
+          personaHideTokens = rendered.hideTokens
+
+          result = await runApiInference({
+            req,
+            res,
+            cfg,
+            scheduler: apiScheduler,
+            picked: activeApiSelection,
+            store: apiEndpointStore,
+            protocol,
+            inbound: apiInbound,
+            convertedBody: apiFinalConvertedBody,
+            clientStream,
+            deliveryMode,
+            signal: clientAbort.signal,
+            timeoutMs: cfg.limits.upstream_timeout_ms,
+            personaHideTokens,
+            cacheTtl,
+            onPublicLine: publicStream ? (line) => publicStream.observe(line) : null,
+            requestContext,
+            passthrough: officialPassthrough,
+            routing: getRouting(),
+            redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
+            redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
+            converters: {
+              createClaudeMessageAssembler,
+              applyClaudeSSELineToMessage,
+              createOpenAIChatStreamState,
+              claudeSSELineToOpenAIChatChunks,
+              createOpenAICompletionStreamState,
+              claudeSSELineToOpenAICompletionChunks,
+              createResponsesStreamState: (model, id) => createResponsesStreamState(model, id, converted.responseTools),
+              claudeSSELineToResponsesEvents,
+              hidePersonaUsageInSseLine,
+              writeSSEHeaders,
+            },
+          })
+
+          if (result?.ok) {
+            await apiScheduler.commitLease(activeApiLeaseId, { schedulerRuntime: apiRt }).catch(() => {})
+            const lid = activeApiLeaseId
+            activeApiLeaseId = null
+            await apiScheduler
+              .releaseLease(
+                lid,
+                {
+                  outcome: 'ok',
+                  http_status: Number(result.upstreamStatus) || 200,
+                  ...(Number.isFinite(result.ttftMs) ? { ttft_ms: Math.max(0, Math.round(result.ttftMs)) } : {}),
+                },
+                { schedulerRuntime: apiRt },
+              )
+              .catch(() => {})
+            break
+          }
+
+          const failStatus = Number(result?.upstreamStatus ?? result?.status) || 0
+          const failCode = String(result?.body?.error?.code || 'upstream_error')
+          const failMsg = String(result?.body?.error?.message || '').slice(0, 300)
+          const failureReport = {
+            http_status: failStatus,
+            error_class: classifyErrorClass({
+              status: failStatus,
+              errorCode: failCode,
+              reason: failMsg,
+              isTransport: failStatus === 0,
+            }),
+            error_signature: failCode.slice(0, 128),
+            ...(failMsg ? { error_message: failMsg } : {}),
+          }
+
+          if (!isRetryableApiFailure(result) || apiAttempts > apiMaxSwitches) {
+            const lid = activeApiLeaseId
+            activeApiLeaseId = null
+            await apiScheduler
+              .releaseLease(
+                lid,
+                {
+                  outcome: clientAbort.signal.aborted
+                    ? 'aborted'
+                    : failureReport.error_class === 'timeout'
+                      ? 'timeout'
+                      : 'error',
+                  http_status: failStatus || undefined,
+                  error_class: failureReport.error_class,
+                  error_signature: failureReport.error_signature,
+                  error_message: failureReport.error_message,
+                },
+                { schedulerRuntime: apiRt },
+              )
+              .catch(() => {})
+            break
+          }
+
+          if (activeApiSelection.nodeKey) excludedApiNodes.add(activeApiSelection.nodeKey)
+          const prevLeaseId = activeApiLeaseId
+          activeApiLeaseId = null
+          try {
+            const switched = await apiScheduler.switchEndpoint({
+              schedulerRuntime: apiRt,
+              releaseLeaseId: prevLeaseId,
+              failure: failureReport,
+              nextAttempt: {
+                ...(activeApiSelection.acquireParams || {}),
+                attemptNo: apiAttempts + 1,
+                excludeNodes: [...excludedApiNodes],
+              },
+              requestedModel: ctx.body?.model,
+              groupType: apiAcquireScope.groupType,
+              endpointId: apiAcquireScope.endpointId,
+              ownerScope: apiAcquireScope.ownerScope,
+              allowedEndpointIds: apiAcquireScope.allowedEndpointIds,
+              poolAccess: activePoolAccess,
+              signal: clientAbort.signal,
+            })
+            if (!switched?.ok) break
+            activeApiSelection = switched
+            activeApiLeaseId = switched.leaseId
+            if (switched.resolvedPoolId) logBag.resolved_pool_id = switched.resolvedPoolId
+          } catch (switchErr) {
+            if (clientAbort.signal.aborted || switchErr?.name === 'AbortError' || switchErr?.code === 'ABORT_ERR') {
+              return finishClientCancel(res, { cancelled: true }, logBag)
+            }
+            if (
+              switchErr instanceof SchedulerUnavailableError ||
+              switchErr?.code === 'scheduler_unavailable' ||
+              (switchErr instanceof SchedulerApiError &&
+                (switchErr.code === 'poison_abort' || switchErr.status === 422))
+            ) {
+              return sendApiSchedulerError(switchErr)
+            }
+            break
+          }
+        }
       } finally {
+        if (activeApiLeaseId) {
+          const lid = activeApiLeaseId
+          activeApiLeaseId = null
+          await apiScheduler
+            .releaseLease(
+              lid,
+              { outcome: clientAbort.signal.aborted ? 'aborted' : 'error' },
+              { schedulerRuntime: apiRt },
+            )
+            .catch(() => {})
+        }
         clientAbort.settle()
         if (managedKey) {
           try {
@@ -2579,6 +2935,7 @@ export function createHandleProtocol(deps) {
           } catch {}
         }
       }
+      ctx.body = apiFinalConvertedBody
       // The api backend forwards the converted body untouched: its session is the outbound one.
       logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(ctx.body) || logBag.session_id)
       if (result?.outboundBody != null) {
@@ -2607,7 +2964,7 @@ export function createHandleProtocol(deps) {
         : (result?.firstByteMs ?? null)
       logBag.generation_ms = result?.generationMs ?? null
       logBag.final_state = result?.terminalState || null
-      logBag.attempt_count = result?.endpointId ? 1 : 0
+      logBag.attempt_count = apiAttempts || (result?.endpointId ? 1 : 0)
       if (result?.upstreamStatus != null) afterHop(result)
       attachPricing(logBag, {
         managedKey,
@@ -2785,7 +3142,15 @@ export function createHandleProtocol(deps) {
         // Set only when a group member actually supplied the sticky key.
         batchMember: !isProbe && batchApplied,
         stickyDeviceId,
-        inboundIdentity: ctx.inboundIdentity,
+        inboundIdentity: summarySession
+          ? {
+              ...(ctx.inboundIdentity || {}),
+              sessionId: summarySession,
+              sessionSource: 'summary_fork',
+              parentSessionId: ctx.inboundIdentity?.sessionId || null,
+              isEphemeralProbe: true,
+            }
+          : ctx.inboundIdentity,
         deviceKey,
         skipSessionSeat: seatless,
         familyKey: summarySession ? null : familyKey,
@@ -2794,8 +3159,17 @@ export function createHandleProtocol(deps) {
         seatKey,
         familyVmId,
         pinVmId,
+        isAdminDiagnostic: panelDiagnostics,
         ownerScope,
         keyScope,
+        apiKeyRecord: req.apiKeyRecord || null,
+        apiKeyKind: req.apiKeyKind || null,
+        poolAccess: activePoolAccess,
+        originPoolId: activePoolAccess.originPool?.id || effectivePool?.id || null,
+        jevDowngradePoolId:
+          logBag.jev_downgrade_pool_id || (activePoolAccess.isDowngraded ? effectivePool?.id || null : null),
+        protocol,
+        schedulerRuntime: getSchedulerRuntime(req),
         countUsage: !healthReal,
         quotaRequest: {
           body: canonicalBody,
@@ -2870,10 +3244,11 @@ export function createHandleProtocol(deps) {
           const preserveCliHopThinkingBlocks = !thinkingRepaired
           const cliHop = resolveOfficialCcInference(selected.vm, routingNow) === 'cli-hop'
           const resolvedPersona = resolveSlotPersonaPreset(selected.vm, routingNow)
-          const attemptPoolPrompt = resolvePoolSystemPromptPolicy(effectivePool, routingNow, {
+          const attemptPoolPrompt = resolveAttemptPoolPromptPolicy(selected.promptPolicy, effectivePool, routingNow, {
             nodeProvider: 'anthropic',
             isInternalCall: Boolean(requestContext || healthReal),
           })
+          if (selected.resolvedPoolId) logBag.resolved_pool_id = selected.resolvedPoolId
           logBag.prompt_policy = {
             mode: attemptPoolPrompt.mode,
             source: attemptPoolPrompt.source,
@@ -3863,6 +4238,9 @@ export function createHandleProtocol(deps) {
         projectRoot: cfg.paths.project,
         stickyRouter,
         ownerScope: searchOwnerScope,
+        poolAccess: searchPoolAccess,
+        originPoolId: searchPoolAccess.originPool?.id || searchPoolAccess.effectivePool?.id || null,
+        schedulerRuntime: getSchedulerRuntime(req),
         ops: deps.codexOps || {},
         ...(searchKeyScope ? { keyScope: searchKeyScope } : {}),
       }),
@@ -3941,6 +4319,9 @@ export function createHandleProtocol(deps) {
           projectRoot: cfg.paths.project,
           stickyRouter,
           ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+          poolAccess: req._poolAccess || null,
+          originPoolId: req._poolAccess?.originPool?.id || req._poolAccess?.effectivePool?.id || null,
+          schedulerRuntime: getSchedulerRuntime(req),
           ops: deps.codexOps || {},
           ...(keyScope ? { keyScope } : {}),
         })
@@ -4136,6 +4517,9 @@ export function createHandleProtocol(deps) {
         projectRoot: cfg.paths.project,
         stickyRouter,
         ownerScope: imagesOwnerScope,
+        poolAccess: imagesPoolAccess,
+        originPoolId: imagesPoolAccess.originPool?.id || imagesPoolAccess.effectivePool?.id || null,
+        schedulerRuntime: getSchedulerRuntime(req),
         ops: deps.codexOps || {},
         ...(imagesKeyScope ? { keyScope: imagesKeyScope } : {}),
       }),

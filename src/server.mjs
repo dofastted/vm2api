@@ -110,6 +110,7 @@ import { filterModelCatalogForKey } from './lib/admin/key-models.mjs'
 import { GroupsRepo } from './lib/db/repos/groups-repo.mjs'
 import { GeminiOwnersRepo } from './lib/db/repos/gemini-owners-repo.mjs'
 import { bootstrapSchedulerPools } from './lib/db/repos/scheduler-pools-repo.mjs'
+import { createSchedulerRuntime } from './lib/scheduler/scheduler-runtime.mjs'
 import { SettingsRepo } from './lib/db/repos/settings-repo.mjs'
 import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
@@ -286,9 +287,11 @@ async function activateStandby(reason = 'signal') {
   // and count its live requests and seats against capacity until it has gone.
   setOverlap(true)
   try {
+    const foreign = createForeignLoad({ scheduler: poolScheduler, accountQuota, apiKeys: apiKeyStore })
+    schedulerRuntime?.setExternalLoadProvider?.(() => foreign.snapshot()?.vms || {})
     foreignLoadReader = startLoadReader({
       file: foreignLoadPath(dataDir),
-      foreign: createForeignLoad({ scheduler: poolScheduler, accountQuota, apiKeys: apiKeyStore }),
+      foreign,
       // Ends the overlap on its own if the deploy script never sends SIGHUP (watcher killed, host reboot).
       onGone: () => {
         console.log(JSON.stringify({ event: 'handover-peer-gone' }))
@@ -306,6 +309,13 @@ async function activateStandby(reason = 'signal') {
         out.catch((e) => console.warn(`[standby] ${name} failed`, e?.message || e))
     } catch (e) {
       console.warn(`[standby] ${name} failed`, e?.message || e)
+    }
+  }
+  if (schedulerRuntime) {
+    try {
+      await schedulerRuntime.promoteToLeader({ rebootstrap: true, startDrain: true })
+    } catch (e) {
+      console.warn('[standby] scheduler-runtime promote failed', e?.message || e)
     }
   }
   console.log(JSON.stringify({ event: 'standby-activated' }))
@@ -425,6 +435,7 @@ let attemptsRepo
 let poolScheduler
 let failoverRunner
 let groupsRepo
+let schedulerRuntime = null
 
 const routingRt = createRoutingRuntime({
   get routingConfig() {
@@ -453,6 +464,7 @@ const routingRt = createRoutingRuntime({
   },
   setPoolScheduler: (v) => {
     poolScheduler = v
+    if (schedulerRuntime) v?.setSchedulerRuntime?.(schedulerRuntime)
   },
   get healthMonitor() {
     return healthMonitor
@@ -481,6 +493,7 @@ const routingRt = createRoutingRuntime({
   },
   setFailoverRunner: (v) => {
     failoverRunner = v
+    if (schedulerRuntime) v?.setSchedulerRuntime?.(schedulerRuntime)
   },
   get runtimeRepo() {
     return runtimeRepo
@@ -952,6 +965,7 @@ backupService.onRestored(async (db) => {
   notifyMonitor?.setConfig(routingConfig.notify)
 
   initPoolRuntime()
+  void schedulerRuntime?.syncConfigNow?.('backup_restore').catch(() => {})
   reloadActiveVm(cfg)
   vmTestSchedule.reload()
   try {
@@ -1251,6 +1265,10 @@ const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
   get poolScheduler() {
     return poolScheduler
   },
+  getSchedulerRuntime: () => schedulerRuntime,
+  get schedulerRuntime() {
+    return schedulerRuntime
+  },
   get groupsRepo() {
     return groupsRepo
   },
@@ -1265,6 +1283,10 @@ const responsesWs = createResponsesWsHandler({
   cfg,
   accountQuota,
   apiKeyStore,
+  getSchedulerRuntime: () => schedulerRuntime,
+  get schedulerRuntime() {
+    return schedulerRuntime
+  },
 })
 
 /**
@@ -1520,6 +1542,10 @@ const geminiScheduler = createGeminiScheduler({
   cragSubscription: geminiCragSubscription,
   getRoutingConfig: () => routingConfig,
   getAttemptsRepo: () => attemptsRepo,
+  getSchedulerRuntime: () => schedulerRuntime,
+  get schedulerRuntime() {
+    return schedulerRuntime
+  },
   listCacheTtlMs: 2000,
 })
 const handleGeminiPublic = createGeminiPublicHandler({
@@ -1532,12 +1558,45 @@ const handleGeminiPublic = createGeminiPublicHandler({
   apiKeyStore,
   getRoutingConfig: () => routingConfig,
   getHealthMonitor: () => healthMonitor,
+  getSchedulerRuntime: () => schedulerRuntime,
+  get schedulerRuntime() {
+    return schedulerRuntime
+  },
   cfg,
   geminiOwnerMap: () => geminiOwnersProxy.ownerMap(),
 })
+schedulerRuntime = createSchedulerRuntime({
+  cfg,
+  isStandby: STANDBY,
+  getDb,
+  settings: () => new SettingsRepo(),
+  getVms: () => listVms(cfg.paths.project, routingConfig),
+  getRoutingConfig: () => routingConfig,
+  apiKeyStore,
+  apiEndpointStore,
+  accountQuota,
+  poolScheduler: () => poolScheduler,
+  geminiScheduler: () => geminiScheduler,
+  geminiSlotPrefs,
+  geminiOwnersRepo: geminiOwnersProxy,
+  cragSubscription,
+  geminiCragSubscription,
+  proxyPool: () => proxyPool,
+  hostMemoryPressure,
+  onError: (err, info) => {
+    console.warn(`[scheduler-runtime] ${info?.phase || 'error'}:`, err?.message || err)
+  },
+})
+poolScheduler?.setSchedulerRuntime?.(schedulerRuntime)
+failoverRunner?.setSchedulerRuntime?.(schedulerRuntime)
+apiScheduler?.setSchedulerRuntime?.(schedulerRuntime)
 const integrationTokenStore = new IntegrationTokenStore()
 const handlePanel = createPanelHandler({
   getDb,
+  getSchedulerRuntime: () => schedulerRuntime,
+  get schedulerRuntime() {
+    return schedulerRuntime
+  },
   integrationTokenStore,
   cragSubscription,
   geminiCragSubscription,
@@ -1691,6 +1750,9 @@ async function handoverLeadership() {
   }
   if (handoverRole() !== 'leader' || !standbyActive) return false
   stopLeaderJobs()
+  // Flush final dirty sticky/penalty deltas while still holding the leader flock.
+  await schedulerRuntime?.drainPersistenceNow?.().catch(() => {})
+  schedulerRuntime?.demoteToStandby?.()
   setHandoverRole('draining')
   // Publish our live load first, so the new leader counts it from its first scheduling decision.
   try {
@@ -1763,6 +1825,11 @@ const gracefulShutdown = createGracefulShutdown({
       await clusterManager.stop({ unlink: handoverRole() !== 'draining' })
     } catch {}
     try {
+      await schedulerRuntime?.shutdown?.({ drain: handoverRole() !== 'draining', stopProcess: true })
+    } catch (e) {
+      console.warn('[shutdown] scheduler-runtime shutdown failed', e?.message || e)
+    }
+    try {
       await closeDatabaseAsync()
     } catch {}
   },
@@ -1804,6 +1871,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (
       p === '/api/panel/pool/stream' ||
+      p === '/api/panel/scheduler/events' ||
       (p.startsWith('/api/panel/') && String(req.headers.accept || '').includes('text/event-stream'))
     ) {
       panelStreams.add(res)
@@ -2166,7 +2234,7 @@ const server = http.createServer(async (req, res) => {
         }
         if (
           !hasOwnedGemEnv &&
-          apiScheduler.pick(gemGen.model, Date.now(), apiScheduleScope(req, 'gemini', apiKeyStore?.users))?.ok
+          apiScheduler.matchEndpoints(gemGen.model, Date.now(), apiScheduleScope(req, 'gemini', apiKeyStore?.users))?.ok
         ) {
           return await handleProtocol(req, res, 'google.gemini', p, {
             routeModel: gemGen.model,
@@ -2306,6 +2374,7 @@ function runExclusivePass() {
     const keys = deferredKeys()
     foreignLoadReader?.stop()
     foreignLoadReader = null
+    schedulerRuntime?.setExternalLoadProvider?.(null)
     // Async: copying a new image's binaries can take a while and must not hold the event loop.
     const synced = await runCapture('/usr/local/bin/vm2api-entrypoint', ['sync'], { timeoutMs: 120_000 })
     const wrapChanged = /WRAP_CHANGED=1/.test(synced.stdout || '')
@@ -2404,6 +2473,13 @@ if (process.env.KIN_CRS_MOCK !== '1') {
 }
 await bootApiKernel(cfg)
 await bootProtoFront(cfg)
+if (process.env.KIN_CRS_MOCK !== '1' || fs.existsSync(schedulerRuntime.client.paths.binPath)) {
+  try {
+    await schedulerRuntime.start({ waitMs: 5_000, startLoops: true })
+  } catch (e) {
+    console.error('[scheduler-runtime] startup failed (Fail-Closed 503 until recovered):', e?.message || e)
+  }
+}
 server.keepAliveTimeout = 120_000
 server.headersTimeout = 125_000
 server.timeout = 0
