@@ -74,8 +74,8 @@ unixTest('load-hw-plan.sh safely parses hardware.json without eval and validates
       '-ceu',
       `
       source "$1"
-      KIN_KVM_HOST_CPU_VENDOR="intel"
-      KIN_KVM_ACCEL="kvm"
+      export KIN_KVM_HOST_CPU_VENDOR="intel"
+      export KIN_KVM_ACCEL="kvm"
       CPU_MODEL=""
       KIN_KVM_MEMORY_MB=""
       KIN_KVM_VCPUS=""

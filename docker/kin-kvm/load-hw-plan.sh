@@ -6,6 +6,9 @@ load_hw_plan() {
   local hardware_json=$1
   local plan_json
   plan_json=$(mktemp)
+  KIN_KVM_ACCEL="${KIN_KVM_ACCEL:-}" \
+  KIN_KVM_HOST_CPU_VENDOR="${KIN_KVM_HOST_CPU_VENDOR:-}" \
+  KIN_HOST_CPU_VENDOR="${KIN_HOST_CPU_VENDOR:-}" \
   python3 - "$hardware_json" "$plan_json" <<'PY'
 import json
 import os
