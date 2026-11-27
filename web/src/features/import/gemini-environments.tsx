@@ -1152,7 +1152,7 @@ export function GeminiEnvironments({
     enabled: inventory.data?.available === true,
   })
   const proxyPool = proxies.data?.proxies ?? []
-  const exits = proxyPool.filter(isGeminiProxy)
+  const exits = proxyPool.filter((proxy) => isGeminiProxy(proxy))
   const busy = useGeminiBusy()
   const [name, setName] = useState('')
   const [proxyId, setProxyId] = useState('')
@@ -1165,6 +1165,10 @@ export function GeminiEnvironments({
   const [accountImport, setAccountImport] =
     useState<ParsedGeminiImportResult | null>(null)
   const [accountImportIndex, setAccountImportIndex] = useState(0)
+  const [batchImport, setBatchImport] = useState(false)
+  const [batchImportSummary, setBatchImportSummary] = useState<string | null>(
+    null
+  )
   const [accountImportError, setAccountImportError] = useState<string | null>(
     null
   )
@@ -1190,6 +1194,8 @@ export function GeminiEnvironments({
     setAccountText('')
     setAccountImport(null)
     setAccountImportIndex(0)
+    setBatchImport(false)
+    setBatchImportSummary(null)
     setAccountImportError(null)
     setAccountImportParsedAt(0)
   }
@@ -1211,6 +1217,8 @@ export function GeminiEnvironments({
     if (file) setAccountText('')
     setAccountImport(null)
     setAccountImportIndex(0)
+    setBatchImport(false)
+    setBatchImportSummary(null)
     setAccountImportError(null)
     setAccountImportParsedAt(0)
     if (!file) return
@@ -1236,6 +1244,8 @@ export function GeminiEnvironments({
     if (rawText.trim()) setAccountFile(null)
     setAccountImport(null)
     setAccountImportIndex(0)
+    setBatchImport(false)
+    setBatchImportSummary(null)
     setAccountImportError(null)
     setAccountImportParsedAt(0)
     if (!rawText.trim()) return
@@ -1268,16 +1278,83 @@ export function GeminiEnvironments({
     }) => {
       const resource = `${ROOT}/environments${action.id ? `/${encodeURIComponent(action.id)}` : ''}`
       if (action.type === 'create') {
-        let importedAccount = selectedImportAccount
-        if (authMethod === 'oauth_file' && !importedAccount) {
-          const parsed = accountFile
+        let parsedResult = accountImport
+        if (authMethod === 'oauth_file' && !parsedResult) {
+          parsedResult = accountFile
             ? await readGeminiAccountImportFile(accountFile)
             : accountText.trim()
               ? parseGeminiAccountImportText(accountText)
               : null
-          importedAccount =
-            parsed?.accounts[accountImportIndex] ?? parsed?.accounts[0] ?? null
         }
+        if (
+          authMethod === 'oauth_file' &&
+          batchImport &&
+          parsedResult &&
+          parsedResult.accounts.length > 1
+        ) {
+          const prefix = name.trim()
+          const created: GeminiEnvironment[] = []
+          const failures: string[] = []
+          for (let idx = 0; idx < parsedResult.accounts.length; idx += 1) {
+            const item = parsedResult.accounts[idx]
+            const itemName = (
+              item.suggestedName ||
+              (prefix ? `${prefix}-${idx + 1}` : `gemini-${idx + 1}`)
+            ).slice(0, 80)
+            try {
+              const environment = await api<GeminiEnvironment>(resource, {
+                method: 'POST',
+                body: JSON.stringify({
+                  name: itemName,
+                  proxy_id: proxyId,
+                  auth_method: item.kind === 'api_key' ? 'api_key' : 'oauth',
+                  ...(item.kind === 'oauth'
+                    ? { oauth_account: item.oauth_account }
+                    : {}),
+                  ...(item.kind === 'api_key' ? { api_key: item.api_key } : {}),
+                }),
+              })
+              created.push(environment)
+              client.setQueryData<GeminiInventory>(
+                QUERY_KEY,
+                (current) =>
+                  current && {
+                    ...current,
+                    payload_state: 'installed',
+                    environments: [...current.environments, environment],
+                  }
+              )
+            } catch (err) {
+              const reason = err instanceof Error ? err.message : '导入失败'
+              failures.push(`${itemName}: ${reason}`)
+            }
+          }
+          if (!created.length) {
+            throw new Error(
+              failures[0] || '批量导入失败，请检查账号凭据与代理状态。'
+            )
+          }
+          setCreatedId(created[created.length - 1].id)
+          if (!failures.length) {
+            setName('')
+            nameAutoFilled.current = false
+            setApiKey('')
+            resetAccountImport()
+            const msg = `已批量导入 ${created.length} 个账号。`
+            setBatchImportSummary(msg)
+            toast.success(msg)
+          } else {
+            const msg = `已导入 ${created.length} / ${parsedResult.accounts.length} 个账号；${failures.length} 个失败（${failures[0]}）。`
+            setBatchImportSummary(msg)
+            toast.error(msg)
+          }
+          return
+        }
+        const importedAccount =
+          selectedImportAccount ??
+          parsedResult?.accounts[accountImportIndex] ??
+          parsedResult?.accounts[0] ??
+          null
         if (authMethod === 'oauth_file' && !importedAccount) {
           throw new Error('请选择有效的账号 JSON 文件或粘贴 Refresh Token。')
         }
@@ -1391,7 +1468,7 @@ export function GeminiEnvironments({
   const terminalUnavailable = environment?.oauth_imported
     ? '已导入 OAuth 凭据，仍需完成官方 Google 授权。'
     : environment?.proxy_ready === false
-      ? '绑定的 IPv4 SOCKS5 代理不可用。'
+      ? '绑定的 SOCKS5 / HTTP 代理不可用。'
       : geminiPayloadIssue(inventory.data) ||
         (inventory.data.oauth_runtime_issue
           ? OAUTH_ISSUES[inventory.data.oauth_runtime_issue]
@@ -1575,7 +1652,8 @@ export function GeminiEnvironments({
     >
       {isImport ? (
         <p className='text-sm text-muted-foreground'>
-          在宿主机创建环境，不创建虚拟机。必须绑定 IPv4 SOCKS5 代理。已有账号在{' '}
+          在宿主机创建环境，不创建虚拟机。必须绑定 SOCKS5 / HTTP 代理（支持 IPv4
+          或域名，不支持 IPv6 / HTTPS 代理）。已有账号在{' '}
           <Link to='/vm' className='text-primary underline'>
             虚拟机
           </Link>{' '}
@@ -1669,12 +1747,21 @@ export function GeminiEnvironments({
             </div>
           </fieldset>
           <div className='space-y-2'>
-            <Label htmlFor='gemini-name'>环境名称</Label>
+            <Label htmlFor='gemini-name'>
+              {authMethod === 'oauth_file' && batchImport
+                ? '环境名称前缀（可选）'
+                : '环境名称'}
+            </Label>
             <Input
               ref={nameInput}
               id='gemini-name'
-              required
+              required={!(authMethod === 'oauth_file' && batchImport)}
               maxLength={80}
+              placeholder={
+                authMethod === 'oauth_file' && batchImport
+                  ? '留空则按账号邮箱或标识自动命名'
+                  : undefined
+              }
               value={name}
               onChange={(event) => {
                 nameAutoFilled.current = false
@@ -1735,51 +1822,75 @@ export function GeminiEnvironments({
               {accountImport && selectedImportAccount ? (
                 <div className='space-y-2 rounded-md border bg-muted/30 p-3 text-sm'>
                   {accountImport.accounts.length > 1 ? (
-                    <div className='space-y-1.5'>
-                      <Label htmlFor='gemini-import-account'>
-                        选择要导入的账号（共 {accountImport.accounts.length}{' '}
-                        个）
-                      </Label>
-                      <select
-                        id='gemini-import-account'
-                        className='block w-full rounded-md border bg-background p-2 text-sm'
-                        disabled={operation.isPending}
-                        value={String(accountImportIndex)}
-                        onChange={(event) => {
-                          const nextIndex = Number(event.target.value)
-                          if (
-                            Number.isInteger(nextIndex) &&
-                            nextIndex >= 0 &&
-                            nextIndex < accountImport.accounts.length
-                          ) {
-                            setAccountImportIndex(nextIndex)
-                            applySuggestedName(
-                              accountImport.accounts[nextIndex]?.suggestedName
-                            )
+                    <div className='space-y-2'>
+                      <label className='flex items-center gap-2 text-sm font-medium'>
+                        <input
+                          type='checkbox'
+                          checked={batchImport}
+                          disabled={operation.isPending}
+                          onChange={(event) =>
+                            setBatchImport(event.target.checked)
                           }
-                        }}
-                      >
-                        {accountImport.accounts.map((item, idx) => (
-                          <option key={`${item.label}-${idx}`} value={idx}>
-                            {item.label}
-                          </option>
-                        ))}
-                      </select>
+                        />
+                        批量导入全部 {accountImport.accounts.length}{' '}
+                        个账号（共用所选代理）
+                      </label>
+                      {!batchImport ? (
+                        <div className='space-y-1.5'>
+                          <Label htmlFor='gemini-import-account'>
+                            选择要导入的账号（共 {accountImport.accounts.length}{' '}
+                            个）
+                          </Label>
+                          <select
+                            id='gemini-import-account'
+                            className='block w-full rounded-md border bg-background p-2 text-sm'
+                            disabled={operation.isPending}
+                            value={String(accountImportIndex)}
+                            onChange={(event) => {
+                              const nextIndex = Number(event.target.value)
+                              if (
+                                Number.isInteger(nextIndex) &&
+                                nextIndex >= 0 &&
+                                nextIndex < accountImport.accounts.length
+                              ) {
+                                setAccountImportIndex(nextIndex)
+                                applySuggestedName(
+                                  accountImport.accounts[nextIndex]
+                                    ?.suggestedName
+                                )
+                              }
+                            }}
+                          >
+                            {accountImport.accounts.map((item, idx) => (
+                              <option key={`${item.label}-${idx}`} value={idx}>
+                                {item.label}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      ) : null}
                     </div>
                   ) : null}
                   <p role='status' className='text-xs text-muted-foreground'>
                     已识别：{GEMINI_IMPORT_FORMAT_LABELS[accountImport.format]}{' '}
                     ·{' '}
-                    {selectedImportAccount.kind === 'api_key'
-                      ? 'Gemini API Key'
-                      : selectedImportAccount.hasRefreshToken
-                        ? 'OAuth Refresh Token（自动换票）'
-                        : 'OAuth 短期访问令牌'}
-                    {selectedImportAccount.email
+                    {batchImport && accountImport.accounts.length > 1
+                      ? `共 ${accountImport.accounts.length} 个账号将依次导入`
+                      : selectedImportAccount.kind === 'api_key'
+                        ? 'Gemini API Key'
+                        : selectedImportAccount.hasRefreshToken
+                          ? 'OAuth Refresh Token（自动换票）'
+                          : 'OAuth 短期访问令牌'}
+                    {!batchImport && selectedImportAccount.email
                       ? ` · ${selectedImportAccount.email}`
                       : ''}
-                    {selectedImportAccount.project_id
+                    {!batchImport && selectedImportAccount.project_id
                       ? ` · 项目 ${selectedImportAccount.project_id}`
+                      : ''}
+                    {!batchImport &&
+                    selectedImportAccount.kind === 'oauth' &&
+                    selectedImportAccount.oauth_client_key
+                      ? ` · 客户端 ${selectedImportAccount.oauth_client_key}`
                       : ''}
                     {accountImport.skippedNonGemini > 0
                       ? `（已忽略 ${accountImport.skippedNonGemini} 个非 Gemini/Antigravity 账号）`
@@ -1821,7 +1932,7 @@ export function GeminiEnvironments({
             </p>
           ) : null}
           <div className='space-y-2'>
-            <Label htmlFor='gemini-proxy'>SOCKS5 代理</Label>
+            <Label htmlFor='gemini-proxy'>出口代理（SOCKS5 / HTTP）</Label>
             <select
               id='gemini-proxy'
               className='block w-full rounded-md border bg-background p-2 text-sm'
@@ -1829,7 +1940,7 @@ export function GeminiEnvironments({
               value={proxyId}
               onChange={(event) => setProxyId(event.target.value)}
             >
-              <option value=''>选择代理</option>
+              <option value=''>选择 SOCKS5 / HTTP 代理</option>
               {exits.map((proxy) => (
                 <option key={proxy.id} value={proxy.id}>
                   {geminiProxyOptionLabel(proxy)}
@@ -1837,13 +1948,18 @@ export function GeminiEnvironments({
               ))}
             </select>
           </div>
-          {proxies.isError ? <p role='alert'>读取 SOCKS5 代理失败。</p> : null}
+          {proxies.isError ? <p role='alert'>读取代理列表失败。</p> : null}
+          {batchImportSummary ? (
+            <p role='status' className='text-sm text-muted-foreground'>
+              {batchImportSummary}
+            </p>
+          ) : null}
           <Button
             type='submit'
             disabled={
               busy ||
               !canInstall ||
-              !name.trim() ||
+              (!(authMethod === 'oauth_file' && batchImport) && !name.trim()) ||
               (authMethod === 'api_key' && !apiKey.trim()) ||
               (authMethod === 'oauth_file' &&
                 ((!accountFile && !accountText.trim()) ||
@@ -1853,7 +1969,9 @@ export function GeminiEnvironments({
             }
           >
             {authMethod === 'oauth_file'
-              ? '验证并导入账号'
+              ? batchImport && (accountImport?.accounts.length ?? 0) > 1
+                ? `批量验证并导入 ${accountImport?.accounts.length ?? 0} 个账号`
+                : '验证并导入账号'
               : '创建 Gemini 环境'}
           </Button>
         </form>

@@ -36,7 +36,7 @@ export const SCHEDULER_POOL_DEFAULTS = Object.freeze({
   session_ttl_seconds: 86400,
   session_busy_wait_ms: 0,
   session_overflow_policy: 'spill_immediately',
-  system_prompt_mode: 'passthrough',
+  system_prompt_mode: 'inherit_global',
   system_prompt_preset: 'official_full',
   system_prompt_text: '',
   client_system_policy: 'prepend_pool',
@@ -57,6 +57,14 @@ export function normalizeProviderScope(scope) {
   return raw || SCHEDULER_POOL_DEFAULTS.provider_scope
 }
 
+export function isPromptLockedProvider(scope) {
+  return PROMPT_EXEMPT_PROVIDERS.has(normalizeProviderScope(scope))
+}
+
+export function defaultSystemPromptModeForProvider(scope) {
+  return isPromptLockedProvider(scope) ? 'passthrough' : 'inherit_global'
+}
+
 export function slugifyPoolName(name, fallbackId = '') {
   const base = String(name || '')
     .trim()
@@ -73,7 +81,7 @@ export function slugifyPoolName(name, fallbackId = '') {
 }
 
 function assertPromptPolicyForProvider(providerScope, systemPromptMode) {
-  if (PROMPT_EXEMPT_PROVIDERS.has(providerScope) && systemPromptMode !== 'passthrough') {
+  if (isPromptLockedProvider(providerScope) && systemPromptMode !== 'passthrough') {
     throw Object.assign(new Error(`provider_scope=${providerScope} 仅支持 system_prompt_mode=passthrough`), {
       code: 'pool_prompt_unsupported_provider',
       status: 400,
@@ -445,7 +453,10 @@ export class SchedulerPoolsRepo {
     const name = String(input.name || '').trim()
     const slug = input.slug ? String(input.slug).trim().toLowerCase() : slugifyPoolName(name, id)
     const providerScope = normalizeProviderScope(input.provider_scope)
-    const systemPromptMode = String(input.system_prompt_mode ?? SCHEDULER_POOL_DEFAULTS.system_prompt_mode)
+    const systemPromptMode =
+      input.system_prompt_mode != null && String(input.system_prompt_mode).trim() !== ''
+        ? String(input.system_prompt_mode).trim()
+        : defaultSystemPromptModeForProvider(providerScope)
     assertPromptPolicyForProvider(providerScope, systemPromptMode)
 
     try {
@@ -943,7 +954,7 @@ export function bootstrapSchedulerPools({ db = getDb(), isStandby = false } = {}
   let apiKeysUpdated = 0
 
   withTransaction(db, () => {
-    // 1. Backfill vm_pools -> scheduler_pools (provider_scope='anthropic', all other columns via DDL defaults)
+    // 1. Backfill vm_pools -> scheduler_pools (provider_scope='anthropic', system_prompt_mode='inherit_global')
     const existingPools = db.prepare('SELECT id, slug, name FROM scheduler_pools').all()
     const existingIds = new Set(existingPools.map((r) => r.id))
     const usedSlugs = new Set(existingPools.map((r) => String(r.slug || '').toLowerCase()))
@@ -955,8 +966,8 @@ export function bootstrapSchedulerPools({ db = getDb(), isStandby = false } = {}
 
     const insertPool = db.prepare(`
       INSERT INTO scheduler_pools (
-        id, slug, name, enabled, provider_scope, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'anthropic', ?, ?)
+        id, slug, name, enabled, provider_scope, system_prompt_mode, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, 'anthropic', 'inherit_global', ?, ?)
       ON CONFLICT (id) DO NOTHING
     `)
 

@@ -2097,7 +2097,7 @@ function applyTemplatePersona(
       ? blocks
           .filter((block) =>
             block?.id === 'caller_system'
-              ? !block.role && (cragDirectReplace || hasUser)
+              ? !block.role && hasUser
               : block?.role === 'system'
                 ? !cragDirectReplace && withEnv && hasUser
                 : !block?.role,
@@ -2191,18 +2191,6 @@ function applyTemplatePersona(
     for (const block of system) templateOwned.add(block)
   }
   if (zero && !zeroVars.has('caller_system')) system = [...system, ...zeroRemaining]
-  if (cragDirectReplace) {
-    if (callerBlocks.length) {
-      const renderedCaller = renderPersonaTemplate(callerBlocks, vars, renderOptions).filter((block) =>
-        unwrapSystemReminder(block.text),
-      )
-      if (renderedCaller.length) system = [...system, ...renderedCaller]
-    }
-    let assembled = { ...body, system, messages }
-    if (zero && renderOptions.usedCallerCache.size)
-      assembled = deferReorderedCallerCache(assembled, body, templateOwned)
-    return mergeTemplateCache(assembled, templateOwned, zero ? normalizeCacheTtl(cacheTtl) : cacheTtl)
-  }
   let outMessages = messages
 
   // Preserve marked expansions through the reminder wrapper. Unmarked
@@ -2218,6 +2206,12 @@ function applyTemplatePersona(
     if (callerText) {
       outMessages = prependRawToFirstUserMessage(outMessages, `<system-reminder>\n${callerText}\n</system-reminder>\n`)
     }
+  }
+  if (cragDirectReplace) {
+    let assembled = { ...body, system, messages: outMessages }
+    if (zero && renderOptions.usedCallerCache.size)
+      assembled = deferReorderedCallerCache(assembled, body, templateOwned)
+    return mergeTemplateCache(assembled, templateOwned, zero ? normalizeCacheTtl(cacheTtl) : cacheTtl)
   }
   if (withEnv) {
     const environment = renderJoinedTemplateBlocks(officialBlocks, vars, { ...renderOptions, role: 'system' })
@@ -2435,5 +2429,7 @@ export function renderCragCustomSystemBlocks(
   if (!promptVersion && normalizePersonaPreset(preset) === 'zero') {
     promptVersion = CRS_OFFICIAL_CLI_SYSTEM
   }
-  return { blocks, promptVersion }
+  const changedMessages =
+    Array.isArray(rendered?.messages) && rendered.messages !== body?.messages ? rendered.messages : undefined
+  return changedMessages ? { blocks, promptVersion, messages: changedMessages } : { blocks, promptVersion }
 }

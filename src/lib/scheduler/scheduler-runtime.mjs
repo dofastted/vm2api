@@ -40,9 +40,14 @@ import {
 } from '../admin/resource-owner.mjs'
 import { HOST_PRESSURE_CRITICAL, hostMemoryLevelForVm } from '../cluster/host-memory-pressure.mjs'
 import { getDb, isDbOpen, withTransaction } from '../db/database.mjs'
-import { SchedulerPoolsRepo } from '../db/repos/scheduler-pools-repo.mjs'
+import {
+  SchedulerPoolsRepo,
+  defaultSystemPromptModeForProvider,
+  normalizeProviderScope,
+} from '../db/repos/scheduler-pools-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { resolveUpstreamModel, stripAntigravityPrefix } from '../gemini/model-catalog.mjs'
+import { OFFICIAL_303_PRESET, normalizePersonaPreset } from '../identity/persona-template.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import { endpointMatchesModel, stripPrefix } from '../pool/api-scheduler.mjs'
 import { isLeftoverQuotaScheduleOff } from '../pool/availability.mjs'
@@ -364,9 +369,33 @@ function findAccountForVm(vm, lookup) {
   return lookup.byVmId.get(String(vm.id)) || null
 }
 
-function resolveGlobalPromptPolicy(routingConfig = {}) {
+function normalizeGlobalOfficialPreset(rawValue) {
+  const raw = String(rawValue ?? '')
+    .trim()
+    .toLowerCase()
+  if (!raw) return null
+  if (raw === OFFICIAL_303_PRESET || raw === 'official-303' || raw === '303') return OFFICIAL_303_PRESET
+  const normalized = normalizePersonaPreset(raw)
+  if (normalized === 'official') return 'official'
+  return 'official_full'
+}
+
+export function resolveGlobalPromptPolicy(routingConfig = {}) {
   const compat = routingConfig?.compatibility || {}
-  if (resolveGlobalZeroInject(routingConfig)) {
+  const rawPersonaPreset = String(compat.persona_preset ?? '')
+    .trim()
+    .toLowerCase()
+  const rawCragPreset = String(compat.crag_persona_preset ?? '')
+    .trim()
+    .toLowerCase()
+  const inject = String(compat.persona_inject || '')
+    .trim()
+    .toLowerCase()
+
+  if (
+    resolveGlobalZeroInject(routingConfig) ||
+    (!rawPersonaPreset && rawCragPreset !== '' && normalizeCragPersonaPreset(rawCragPreset) === 'zero')
+  ) {
     return {
       mode: 'zero_inject',
       preset: 'official_full',
@@ -374,10 +403,14 @@ function resolveGlobalPromptPolicy(routingConfig = {}) {
       client_system_policy: 'prepend_pool',
     }
   }
-  const inject = String(compat.persona_inject || '')
-    .trim()
-    .toLowerCase()
-  if (inject === 'none' || inject === 'off' || inject === 'passthrough') {
+  if (
+    inject === 'none' ||
+    inject === 'off' ||
+    inject === 'passthrough' ||
+    rawPersonaPreset === 'none' ||
+    rawPersonaPreset === 'off' ||
+    rawPersonaPreset === 'passthrough'
+  ) {
     return {
       mode: 'passthrough',
       preset: 'official_full',
@@ -385,10 +418,14 @@ function resolveGlobalPromptPolicy(routingConfig = {}) {
       client_system_policy: 'prepend_pool',
     }
   }
-  const preset = normalizeCragPersonaPreset(compat.crag_persona_preset) || 'official_full'
+  const preset =
+    normalizeGlobalOfficialPreset(rawPersonaPreset) ??
+    normalizeGlobalOfficialPreset(inject) ??
+    (rawCragPreset ? normalizeGlobalOfficialPreset(rawCragPreset) : null) ??
+    'official_full'
   return {
     mode: 'official',
-    preset: preset === 'official' || preset === 'official_303' ? preset : 'official_full',
+    preset,
     text: '',
     client_system_policy: 'prepend_pool',
   }
@@ -1157,13 +1194,14 @@ export class SchedulerRuntime {
         sub_weight_override: m.sub_weight_override != null ? clampInt(m.sub_weight_override, 1, 1000, 10) : null,
         member_order: Number.isFinite(Number(m.member_order)) ? Number(m.member_order) : idx,
       }))
+      const providerScope = normalizeProviderScope(p.provider_scope)
       const poolCfg = {
         id: String(p.id),
         slug: String(p.slug || p.id),
         name: String(p.name || p.id),
         enabled: p.enabled !== false,
         exclusive_members: Boolean(p.exclusive_members),
-        provider_scope: p.provider_scope || 'mixed',
+        provider_scope: providerScope,
         plan_tags: Array.isArray(p.plan_tags) ? p.plan_tags.map(String) : [],
         pool_role: p.pool_role || 'standard',
         sort_order: Number(p.sort_order) || 0,
@@ -1180,7 +1218,7 @@ export class SchedulerRuntime {
         session_ttl_seconds: clampInt(p.session_ttl_seconds, 60, 604_800, 86_400),
         session_busy_wait_ms: clampInt(p.session_busy_wait_ms, 0, 30_000, 0),
         session_overflow_policy: p.session_overflow_policy || 'spill_immediately',
-        system_prompt_mode: p.system_prompt_mode || 'passthrough',
+        system_prompt_mode: p.system_prompt_mode || defaultSystemPromptModeForProvider(providerScope),
         system_prompt_preset: p.system_prompt_preset || 'official_full',
         system_prompt_text: String(p.system_prompt_text || ''),
         client_system_policy: p.client_system_policy || 'prepend_pool',

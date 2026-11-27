@@ -9,6 +9,8 @@
 import {
   SCHEDULER_POOL_DEFAULTS,
   SchedulerPoolsRepo,
+  defaultSystemPromptModeForProvider,
+  isPromptLockedProvider,
   normalizeProviderScope,
   slugifyPoolName,
 } from '../db/repos/scheduler-pools-repo.mjs'
@@ -35,7 +37,6 @@ const SYSTEM_PROMPT_MAX_BYTES = 64 * 1024
 const MAX_FALLBACK_DEPTH = 3
 
 const VALID_PROVIDER_SCOPES = new Set(['anthropic', 'openai', 'google', 'api', 'mixed'])
-const PROMPT_LOCKED_PROVIDERS = new Set(['openai', 'google'])
 const VALID_POOL_ROLES = new Set(['primary', 'standard', 'overflow', 'downgrade', 'dedicated'])
 const VALID_INTRA_TIER = new Set(['least_inflight_swrr', 'balanced', 'fill', 'ordered'])
 const VALID_OVERFLOW_POLICIES = new Set(['spill_immediately', 'wait_then_spill', 'strict'])
@@ -52,10 +53,6 @@ function badRequest(code, message, extra = {}) {
 
 function conflictError(code, message, extra = {}) {
   return Object.assign(new Error(message), { code, status: 409, ...extra })
-}
-
-function isPromptLockedProvider(scope) {
-  return PROMPT_LOCKED_PROVIDERS.has(normalizeProviderScope(scope))
 }
 
 function parseIntInRange(value, min, max, field) {
@@ -356,7 +353,7 @@ function validateAndNormalizePoolInput(body, { existing = null } = {}) {
       ? String(raw.system_prompt_mode).trim()
       : existing
         ? existing.system_prompt_mode
-        : SCHEDULER_POOL_DEFAULTS.system_prompt_mode
+        : defaultSystemPromptModeForProvider(provider_scope)
   const system_prompt_preset =
     raw.system_prompt_preset !== undefined
       ? String(raw.system_prompt_preset).trim()
@@ -840,6 +837,7 @@ export function syncVmPoolToSchedulerPool(db, action, pool, vms = null) {
         name: pool.name,
         enabled: pool.enabled !== false,
         provider_scope: 'anthropic',
+        system_prompt_mode: defaultSystemPromptModeForProvider('anthropic'),
       })
     } else {
       repo.update(pool.id, {

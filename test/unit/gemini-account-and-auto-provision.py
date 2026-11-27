@@ -585,19 +585,13 @@ def test_refresh_token_import_exchanges_and_creates_standard_profile():
     assert res["token_doc"]["token"]["access_token"] == "ya29.exchanged-cloud"
     assert res["token_doc"]["token"]["refresh_token"] == "1//06FixtureCloudRefreshToken"
 
-    # 2. probe_oauth_refresh_import falls back to non-expired access_token when RT client is incompatible or unconfigured.
+    # 2. probe_oauth_refresh_import must NOT silently degrade to access-only import when RT refresh fails.
     def fake_post_mismatch(proxy_url, url, form_fields, *, timeout=10):
-        return 401, {"error": "unauthorized_client"}
-
-    def fake_probe_access_only(proxy_url, token, *, imported=False):
-        assert imported is True
-        assert token["token"]["access_token"] == "ya29.valid-short-lived"
-        return {"state": "ok", "email": "short@example.test", "checked_at": "2030-01-01T00:00:00+00:00"}
+        return 401, {"error": "unauthorized_client", "error_description": "Unauthorized client"}
 
     with (
         patch.dict(os.environ, fixture_oauth_env, clear=True),
         patch.object(account_mod, "post_form_json", side_effect=fake_post_mismatch),
-        patch.object(account_mod, "probe_oauth_token", side_effect=fake_probe_access_only),
     ):
         fb = account_mod.probe_oauth_refresh_import(
             PROXY,
@@ -607,8 +601,10 @@ def test_refresh_token_import_exchanges_and_creates_standard_profile():
                 "expiry": int(time.time()) + 1800,
             },
         )
-    assert fb["fallback_access_only"] is True
-    assert fb["account"]["state"] == "ok"
+    assert "fallback_access_only" not in fb
+    assert fb["account"]["state"] == "reauth_required"
+    assert fb["error"] == "unauthorized_client"
+    assert fb["account"]["error_code"] == "unauthorized_client"
 
     # 2b. Host read_account forwards allowlisted OAuth client env vars via stdin payload (never child environ).
     seen_subproc = {}

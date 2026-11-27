@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.4.241 — 2026-11-28 · Gemini OAuth/RT 导入格式（Format 1 & 2）与多客户端回退、`UMask=0077` 目录权限自愈、直连模型拉取、代理绑定透传及 CRAGGemini `0.5.4` `GRPC_PROXY` 载荷钉选
+
+- **Gemini 宿主机 `UMask=0077` 权限自愈、多客户端 RT 导入与直连模型拉取（#2010）**：
+  - 修复 `scripts/gemini-host.py` 在 `UMask=0077` 下将新建槽位/导入配置目录创建为 `0700` 的问题：在 `create` 与 `_write_imported_profile` 后显式 `.chmod(0o711)`，并在启动加载、`operation_account`、`refresh_account`、`pull_models` 与 `Agy.start` 路径自动自愈既有 `0700` 目录；始终写入 `cache/onboarding.json`（`0600`、slot `uid:gid`）并同步至 headless/daemon 分片，新建槽位同步回填 `call_models` 与 `project_id`。
+  - `scripts/gemini_host_account.py` 补齐第 3 套内置 `agy` OAuth 客户端（`antigravity_enterprise`）并支持 `oauth_client_key` 优先、遇到 `invalid_grant` 时跨客户端自动回退、常规 `oauth`/`oauth-models` 刷新透传 `oauth_clients`，并移除僵尸 access-only 降级。
+  - `pull_models` 改为直连 Google OAuth `fetchAvailableModels`（`POST daily-cloudcode-pa...` 载荷 `{}` + 回退端点），直接持久化 `call_models` 并返回真实非 502 错误码；`bind_proxy` 保留 `_runtime_proxies`，`CragDaemonShard` 跟踪 `egress_options` 且不破坏 CRAGGemini `#[serde(deny_unknown_fields)]` 约束。
+- **Gemini 控制面与面板导入、代理绑定及模型错误透传（#2010）**：
+  - `src/lib/gemini/oauth-import.mjs`、`src/lib/gemini/routes.mjs` 与前端 `web/src/features/import/{gemini-account-import.ts,gemini-environments.tsx}` 全面支持 Format 1（裸数组 `[{ email, refresh_token }]`）与 Format 2（`{ schema_version: 2, accounts: [{ email, refresh_token, oauth_client_key, is_gcp_tos, project_id }] }`），支持多账号单选与一键批量导入。
+  - `PUT /api/panel/gemini/environments/:id/proxy` 经 `proxyEgressOptionsFor` 透传 `egress_options`；前端 `isGeminiProxy` 与后端 `proxyFor` SSOT 对齐并更新 `SOCKS5 / HTTP` 代理文案；`POST .../models` 维持 `HOST_ERRORS` 安全白名单同时精确映射未编码 `401`/`403`/`429` 并投影 `call_models` / `models`。
+- **CRAGGemini `0.5.4` 延续签名载荷钉选（#2010，`dofastted/antigravity-cli-proxy#24`）**：
+  - `deploy/payload.json` 的 `geminiDefaultLinuxAmd64` 升级至 `payload-2026.11.28-gemini-0.5.4`（零密钥轮换，沿用现役 `issuer_public_key_id=f9572077…` / `payload_key_id=d2470877…`），在 `LocalProxyBridge` 导出 `GRPC_PROXY`/`grpc_proxy` 并修复 IPv6/SOCKS5/HTTP 代理转发边界。
+- 部署说明：本次改动零新增数据库迁移（沿用 `1.4.238` 的 SQLite `071` / PostgreSQL `008`）；`release`、`crag_release`、`crag_debian13_release` 与 `bin/` / `share/wrap-cli` 相对 `1.4.240` 未变，预期 **`SLOT_SYNC=skip`**，无需重启既有 Claude/Codex 槽位。Gemini 宿主机需同步 `scripts/gemini-host.py`、`scripts/gemini_host_account.py` 与 `scripts/gemini-host-egress.sh`，切换至 CRAGGemini `0.5.4` 载荷后重启 `vm2api-gemini` 与 `vm2api`（既有 `0700` 环境目录会在重启/操作时自动自愈为 `0711`）。
+
 ## 1.4.240 — 2026-11-28 · CRAG V4 3.1.26 与 `crag-debian13` 定制系统/KVM EROFS 底座、导入流程接入与槽位占用提示、新版 `kin-computer` 载荷钉选及 M3 调度器 V4 能力投影
 
 - **CRAG V4 `3.1.26` 延续签名载荷与协议桥接增强（#2004，`dofastted/crag#37`）**：

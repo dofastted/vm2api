@@ -311,7 +311,7 @@ const INFERENCE_ERROR_ACTIONS: Readonly<Record<string, string>> = {
   gemini_proxy_error:
     '处理方式：请在「代理」页探活检查 SOCKS5 节点连通性与出口稳定性，或更换代理后重试。',
   gemini_proxy_unavailable:
-    '处理方式：绑定代理当前不可用，请在「代理」页重新绑定健康可用的 IPv4 SOCKS5 代理。',
+    '处理方式：绑定代理当前不可用，请在「代理」页重新绑定健康可用的 SOCKS5 / HTTP 代理（支持 IPv4 或域名）。',
   gemini_model_unavailable:
     '处理方式：所选模型未对当前账号开放，请先点击「拉取模型」刷新可用列表后再选。',
   gemini_models_empty:

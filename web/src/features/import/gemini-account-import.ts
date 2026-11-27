@@ -2,13 +2,51 @@ export const ACCOUNT_FILE_LIMIT = 2 * 1024 * 1024
 
 const OAUTH_ACCESS_TOKEN_RE = /^[A-Za-z0-9._~+/-]{1,4096}={0,2}$/
 const OAUTH_REFRESH_TOKEN_RE = /^1\/\/[0-9A-Za-z._~+/-]{6,2048}$/
-const BARE_REFRESH_TOKEN_RE = /1\/\/[0-9A-Za-z_-]{6,2048}/g
+const BARE_REFRESH_TOKEN_RE = /1\/\/[0-9A-Za-z._~+/-]{6,2048}/g
 const GEMINI_API_KEY_RE = /^[A-Za-z0-9_-]{20,256}$/
 const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}/
 const MAX_EXPIRY_SECONDS = 253402300800
 const MILLISECOND_THRESHOLD = 1_000_000_000_000
-const GEMINI_PROVIDERS = new Set(['gemini', 'antigravity', 'gemini-cli'])
-const SUB2API_BUNDLE_TYPES = new Set(['sub2api-data', 'sub2api-bundle'])
+const GEMINI_CPA_TYPES = new Set(['gemini', 'antigravity', 'gemini-cli'])
+const GEMINI_PLATFORMS = new Set([
+  'gemini',
+  'antigravity',
+  'gemini-cli',
+  'google',
+  'google-gemini',
+  'google-oauth',
+  'antigravity_enterprise',
+  'antigravity-enterprise',
+  'code-assist',
+  'code_assist',
+  'cloudcode',
+])
+const NON_GEMINI_PROVIDERS = new Set([
+  'claude',
+  'claude-code',
+  'anthropic',
+  'openai',
+  'codex',
+  'chatgpt',
+  'kimi',
+  'moonshot',
+  'xai',
+  'grok',
+  'deepseek',
+  'qwen',
+  'mistral',
+  'cohere',
+  'cursor',
+  'copilot',
+  'perplexity',
+  'openrouter',
+  'zhipu',
+  'minimax',
+  'doubao',
+  'azure',
+  'bedrock',
+  'iflow',
+])
 const ALLOWED_OAUTH_AUTH_METHODS = new Set([
   'consumer',
   'personal_consumer',
@@ -16,13 +54,12 @@ const ALLOWED_OAUTH_AUTH_METHODS = new Set([
   'business_licensed_enterprise',
 ])
 const WIF_PROVIDER_RE = /^[A-Za-z0-9._:/-]{1,512}$/
+const OAUTH_CLIENT_KEY_RE = /^[A-Za-z0-9._:-]{1,128}$/
+const PROJECT_ID_RE = /^[A-Za-z0-9._:/-]{1,128}$/
 const MAX_RECURSION_DEPTH = 16
 
 export type GeminiImportFormat =
-  | 'antigravity_rt'
-  | 'antigravity_tools'
-  | 'cpa'
-  | 'sub2api'
+  'antigravity_rt' | 'antigravity_tools' | 'cpa' | 'sub2api'
 
 export const GEMINI_IMPORT_FORMAT_LABELS: Record<GeminiImportFormat, string> = {
   antigravity_rt: 'Antigravity 账号 / Refresh Token',
@@ -38,10 +75,18 @@ export type GeminiOAuthImportPayload =
       expiry_timestamp?: number
       auth_method?: string
       wif_provider?: string
+      oauth_client_key?: string
+      is_gcp_tos?: boolean
+      project_id?: string
     }
   | {
       access_token: string
       expiry_timestamp: number
+      auth_method?: string
+      wif_provider?: string
+      oauth_client_key?: string
+      is_gcp_tos?: boolean
+      project_id?: string
     }
 
 export type ParsedGeminiAccount =
@@ -53,6 +98,8 @@ export type ParsedGeminiAccount =
       platform?: string
       email?: string
       project_id?: string
+      oauth_client_key?: string
+      is_gcp_tos?: boolean
       suggestedName?: string
       label: string
     }
@@ -223,14 +270,43 @@ function extractRefreshToken(
   return null
 }
 
+type OptionalAuthMeta = {
+  auth_method?: string
+  wif_provider?: string
+  oauth_client_key?: string
+  is_gcp_tos?: boolean
+  project_id?: string
+}
+
+type InheritedAccountContext = OptionalAuthMeta & {
+  name?: string
+  email?: string
+}
+
+function parseProjectIdValue(raw: unknown): string | undefined {
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    return trimmed && PROJECT_ID_RE.test(trimmed) ? trimmed : undefined
+  }
+  if (isRecord(raw)) {
+    return parseProjectIdValue(
+      raw.id ?? raw.project_id ?? raw.projectId ?? raw.name
+    )
+  }
+  return undefined
+}
+
 function extractOptionalAuthMeta(
-  primary: Record<string, unknown>,
-  fallback?: Record<string, unknown>
-): { auth_method?: string; wif_provider?: string } {
-  const sources = fallback ? [primary, fallback] : [primary]
+  sources: Array<Record<string, unknown> | undefined>,
+  fallbackProjectId?: string
+): OptionalAuthMeta {
   let authMethod: string | undefined
   let wifProvider: string | undefined
+  let oauthClientKey: string | undefined
+  let isGcpTos: boolean | undefined
+  let projectId: string | undefined
   for (const src of sources) {
+    if (!src) continue
     if (!authMethod) {
       const candidate = normalizedTag(src.auth_method ?? src.authMethod)
       if (candidate && ALLOWED_OAUTH_AUTH_METHODS.has(candidate)) {
@@ -246,10 +322,61 @@ function extractOptionalAuthMeta(
         }
       }
     }
+    if (!oauthClientKey) {
+      const raw = src.oauth_client_key ?? src.oauthClientKey
+      if (typeof raw === 'string') {
+        const trimmed = raw.trim()
+        if (trimmed && OAUTH_CLIENT_KEY_RE.test(trimmed)) {
+          oauthClientKey = trimmed
+        }
+      }
+    }
+    if (isGcpTos === undefined) {
+      const raw = src.is_gcp_tos !== undefined ? src.is_gcp_tos : src.isGcpTos
+      if (typeof raw === 'boolean') {
+        isGcpTos = raw
+      }
+    }
+    if (!projectId) {
+      projectId = parseProjectIdValue(
+        src.project_id ?? src.projectId ?? src.cloudaicompanionProject
+      )
+    }
+  }
+  if (
+    !projectId &&
+    fallbackProjectId &&
+    PROJECT_ID_RE.test(fallbackProjectId)
+  ) {
+    projectId = fallbackProjectId
   }
   return {
     ...(authMethod ? { auth_method: authMethod } : {}),
     ...(wifProvider ? { wif_provider: wifProvider } : {}),
+    ...(oauthClientKey ? { oauth_client_key: oauthClientKey } : {}),
+    ...(typeof isGcpTos === 'boolean' ? { is_gcp_tos: isGcpTos } : {}),
+    ...(projectId ? { project_id: projectId } : {}),
+  }
+}
+
+function mergeInheritedContext(
+  inherited: InheritedAccountContext | undefined,
+  node: Record<string, unknown>
+): InheritedAccountContext | undefined {
+  const name = cleanText(node.name, 80) || cleanText(node.label, 80)
+  const email =
+    cleanText(node.email, 254) ||
+    cleanText(node.email_address, 254) ||
+    cleanText(node.id_token_email, 254)
+  const meta = extractOptionalAuthMeta([node])
+  if (!inherited && !name && !email && !Object.keys(meta).length) {
+    return undefined
+  }
+  return {
+    ...(inherited ?? {}),
+    ...meta,
+    ...(name ? { name } : {}),
+    ...(email ? { email } : {}),
   }
 }
 
@@ -273,7 +400,7 @@ function buildOAuthPayload({
   refreshToken: string | null
   accessToken: string | null
   expiryTimestamp: number | null
-  meta: { auth_method?: string; wif_provider?: string }
+  meta: OptionalAuthMeta
 }): GeminiOAuthImportPayload | null {
   if (refreshToken) {
     return {
@@ -288,6 +415,7 @@ function buildOAuthPayload({
     return {
       access_token: accessToken,
       expiry_timestamp: expiryTimestamp,
+      ...meta,
     }
   }
   return null
@@ -326,35 +454,40 @@ function buildAccountLabel({
   if (email && email !== primary) details.push(email)
   if (platform) details.push(platform)
   details.push(
-    kind === 'api_key'
-      ? 'API Key'
-      : hasRefreshToken
-        ? 'Refresh Token'
-        : 'OAuth'
+    kind === 'api_key' ? 'API Key' : hasRefreshToken ? 'Refresh Token' : 'OAuth'
   )
   return `${primary}（${details.join(' · ')}）`
 }
 
 function parseSub2apiAccount(
   doc: Record<string, unknown>,
-  index?: number
+  index?: number,
+  inherited?: InheritedAccountContext
 ): ParsedGeminiAccount | null {
   const creds = doc.credentials
   if (!isRecord(creds)) return null
   const extra = isRecord(doc.extra) ? doc.extra : undefined
   const platform = normalizedTag(doc.platform) || undefined
   const accountType = normalizedTag(doc.type)
-  const name = cleanText(doc.name, 80)
+  const name = cleanText(doc.name, 80) || inherited?.name
   const email =
     cleanText(creds.email, 254) ||
     cleanText(creds.email_address, 254) ||
+    cleanText(doc.email, 254) ||
     cleanText(extra?.email_address, 254) ||
-    cleanText(extra?.email, 254)
+    cleanText(extra?.email, 254) ||
+    inherited?.email
   const rt = extractRefreshToken(creds, doc)
+  const meta = extractOptionalAuthMeta(
+    [creds, doc, extra, inherited],
+    rt?.projectId
+  )
   const projectId =
+    meta.project_id ||
     cleanText(creds.project_id, 128) ||
     cleanText(extra?.project_id, 128) ||
-    rt?.projectId
+    rt?.projectId ||
+    inherited?.project_id
   const suggestedName = cleanText(name || email || projectId, 80)
 
   const wantsApiKey = accountType === 'apikey' || accountType === 'api_key'
@@ -383,10 +516,9 @@ function parseSub2apiAccount(
     }
   }
 
-  if (accountType && accountType !== 'oauth') return null
+  if (accountType && NON_GEMINI_PROVIDERS.has(accountType)) return null
   const accessToken = extractAccessToken(creds)
   const expiryTimestamp = extractExpirySeconds(creds)
-  const meta = extractOptionalAuthMeta(creds, doc)
   const payload = buildOAuthPayload({
     refreshToken: rt?.token ?? null,
     accessToken,
@@ -403,6 +535,12 @@ function parseSub2apiAccount(
     platform,
     email,
     project_id: projectId,
+    ...(meta.oauth_client_key
+      ? { oauth_client_key: meta.oauth_client_key }
+      : {}),
+    ...(typeof meta.is_gcp_tos === 'boolean'
+      ? { is_gcp_tos: meta.is_gcp_tos }
+      : {}),
     suggestedName,
     label: buildAccountLabel({
       name,
@@ -419,28 +557,37 @@ function parseSub2apiAccount(
 
 function tryParseSingleObject(
   doc: Record<string, unknown>,
-  index?: number
+  index?: number,
+  inherited?: InheritedAccountContext
 ): ParsedGeminiAccount | null {
   // 1. sub2api single account object: `{ platform, type, credentials: { ... } }`
   if (isRecord(doc.credentials)) {
     const platform = normalizedTag(doc.platform)
-    if (platform && !GEMINI_PROVIDERS.has(platform)) return null
-    return parseSub2apiAccount(doc, index)
+    if (platform && !GEMINI_PLATFORMS.has(platform)) return null
+    return parseSub2apiAccount(doc, index, inherited)
   }
 
   // Reject explicitly non-Gemini providers (e.g. CPA claude / codex / kimi / xai)
   const typeTag = normalizedTag(doc.type)
-  if (typeTag && !GEMINI_PROVIDERS.has(typeTag) && typeTag !== 'oauth') {
+  if (typeTag && NON_GEMINI_PROVIDERS.has(typeTag)) {
     return null
   }
   const platformTag = normalizedTag(doc.platform)
-  if (platformTag && !GEMINI_PROVIDERS.has(platformTag)) {
+  if (platformTag && !GEMINI_PLATFORMS.has(platformTag)) {
     return null
   }
 
-  const name = cleanText(doc.name, 80) || cleanText(doc.label, 80)
-  const email = cleanText(doc.email, 254) || cleanText(doc.id_token_email, 254)
-  const baseProjectId = cleanText(doc.project_id, 128) || cleanText(doc.projectId, 128)
+  const name =
+    cleanText(doc.name, 80) || cleanText(doc.label, 80) || inherited?.name
+  const email =
+    cleanText(doc.email, 254) ||
+    cleanText(doc.email_address, 254) ||
+    cleanText(doc.id_token_email, 254) ||
+    inherited?.email
+  const baseProjectId =
+    parseProjectIdValue(
+      doc.project_id ?? doc.projectId ?? doc.cloudaicompanionProject
+    ) || inherited?.project_id
 
   // 2. Nested `token` shape: Antigravity Tools, official agy token, or CPA Gemini CLI
   if (isRecord(doc.token)) {
@@ -448,7 +595,10 @@ function tryParseSingleObject(
     const rt = extractRefreshToken(tokenObj, doc)
     const accessToken = extractAccessToken(tokenObj, doc)
     const expiryTimestamp = extractExpirySeconds(tokenObj, doc)
-    const meta = extractOptionalAuthMeta(doc, tokenObj)
+    const meta = extractOptionalAuthMeta(
+      [doc, tokenObj, inherited],
+      rt?.projectId
+    )
     const payload = buildOAuthPayload({
       refreshToken: rt?.token ?? null,
       accessToken,
@@ -457,9 +607,7 @@ function tryParseSingleObject(
     })
     if (!payload) return null
     const isCpa =
-      typeTag === 'gemini' ||
-      typeTag === 'gemini-cli' ||
-      typeTag === 'antigravity' ||
+      GEMINI_CPA_TYPES.has(typeTag) ||
       (tokenObj.expiry_timestamp === undefined &&
         (typeof tokenObj.expiry === 'string' ||
           typeof tokenObj.token_uri === 'string'))
@@ -468,25 +616,41 @@ function tryParseSingleObject(
       : accessToken
         ? 'antigravity_tools'
         : 'antigravity_rt'
-    const platform = typeTag || platformTag || (isCpa ? 'gemini' : 'antigravity')
+    const platform =
+      (GEMINI_CPA_TYPES.has(typeTag) ? typeTag : '') ||
+      platformTag ||
+      (isCpa ? 'gemini' : 'antigravity')
     const resolvedProject =
+      meta.project_id ||
       baseProjectId ||
-      cleanText(tokenObj.project_id, 128) ||
-      cleanText(tokenObj.projectId, 128) ||
+      parseProjectIdValue(tokenObj.project_id ?? tokenObj.projectId) ||
       rt?.projectId
-    const suggestedName = cleanText(name || email || resolvedProject, 80)
+    const resolvedEmail =
+      email ||
+      cleanText(tokenObj.email, 254) ||
+      cleanText(tokenObj.email_address, 254)
+    const suggestedName = cleanText(
+      name || resolvedEmail || resolvedProject,
+      80
+    )
     return {
       kind: 'oauth',
       format,
       oauth_account: payload,
       hasRefreshToken: Boolean(rt?.token),
       platform,
-      email,
+      email: resolvedEmail,
       project_id: resolvedProject,
+      ...(meta.oauth_client_key
+        ? { oauth_client_key: meta.oauth_client_key }
+        : {}),
+      ...(typeof meta.is_gcp_tos === 'boolean'
+        ? { is_gcp_tos: meta.is_gcp_tos }
+        : {}),
       suggestedName,
       label: buildAccountLabel({
         name,
-        email,
+        email: resolvedEmail,
         projectId: resolvedProject,
         refreshToken: rt?.token,
         platform,
@@ -498,11 +662,12 @@ function tryParseSingleObject(
   }
 
   // 3. Flat shape: Antigravity Manager / Antigravity2API (`{ email, refresh_token }`),
+  // schema_version 2 accounts (`{ email, refresh_token, oauth_client_key, is_gcp_tos, project_id }`),
   // opencode-antigravity-auth (`{ refreshToken }`), CPA Antigravity / Gemini top-level
   const rt = extractRefreshToken(doc)
   const accessToken = extractAccessToken(doc)
   const expiryTimestamp = extractExpirySeconds(doc)
-  const meta = extractOptionalAuthMeta(doc)
+  const meta = extractOptionalAuthMeta([doc, inherited], rt?.projectId)
   const payload = buildOAuthPayload({
     refreshToken: rt?.token ?? null,
     accessToken,
@@ -511,20 +676,23 @@ function tryParseSingleObject(
   })
   if (!payload) return null
 
-  const platform = typeTag || platformTag || 'antigravity'
+  const platform =
+    (GEMINI_CPA_TYPES.has(typeTag) ? typeTag : '') ||
+    platformTag ||
+    'antigravity'
   const isCpa = Boolean(
-    typeTag ||
-      doc.expired !== undefined ||
-      doc.expires_in !== undefined ||
-      doc.timestamp !== undefined ||
-      doc.expiry !== undefined
+    GEMINI_CPA_TYPES.has(typeTag) ||
+    doc.expired !== undefined ||
+    doc.expires_in !== undefined ||
+    doc.timestamp !== undefined ||
+    doc.expiry !== undefined
   )
   const format: GeminiImportFormat = isCpa
     ? 'cpa'
     : rt && !accessToken
       ? 'antigravity_rt'
       : 'antigravity_tools'
-  const resolvedProject = baseProjectId || rt?.projectId
+  const resolvedProject = meta.project_id || baseProjectId || rt?.projectId
   const suggestedName = cleanText(name || email || resolvedProject, 80)
   return {
     kind: 'oauth',
@@ -534,6 +702,12 @@ function tryParseSingleObject(
     platform,
     email,
     project_id: resolvedProject,
+    ...(meta.oauth_client_key
+      ? { oauth_client_key: meta.oauth_client_key }
+      : {}),
+    ...(typeof meta.is_gcp_tos === 'boolean'
+      ? { is_gcp_tos: meta.is_gcp_tos }
+      : {}),
     suggestedName,
     label: buildAccountLabel({
       name,
@@ -552,7 +726,10 @@ function accountDedupeKey(account: ParsedGeminiAccount): string {
   if (account.kind === 'api_key') {
     return `api_key:${account.api_key}`
   }
-  if ('refresh_token' in account.oauth_account && account.oauth_account.refresh_token) {
+  if (
+    'refresh_token' in account.oauth_account &&
+    account.oauth_account.refresh_token
+  ) {
     return `rt:${account.oauth_account.refresh_token}`
   }
   return `at:${account.oauth_account.access_token}:${account.oauth_account.expiry_timestamp}`
@@ -571,7 +748,10 @@ function looksLikeAccountNode(doc: Record<string, unknown>): boolean {
   )
 }
 
-function makeBareRefreshAccount(token: string, index: number): ParsedGeminiAccount {
+function makeBareRefreshAccount(
+  token: string,
+  index: number
+): Extract<ParsedGeminiAccount, { kind: 'oauth' }> {
   return {
     kind: 'oauth',
     format: 'antigravity_rt',
@@ -595,7 +775,10 @@ type CollectState = {
   skippedInvalid: number
 }
 
-function appendUniqueAccount(state: CollectState, account: ParsedGeminiAccount) {
+function appendUniqueAccount(
+  state: CollectState,
+  account: ParsedGeminiAccount
+) {
   const key = accountDedupeKey(account)
   if (state.seen.has(key)) return
   state.seen.add(key)
@@ -605,17 +788,36 @@ function appendUniqueAccount(state: CollectState, account: ParsedGeminiAccount) 
 function collectFromNode(
   node: unknown,
   state: CollectState,
-  depth = 0
+  depth = 0,
+  inherited?: InheritedAccountContext
 ): void {
   if (depth > MAX_RECURSION_DEPTH || node == null) return
 
   if (typeof node === 'string') {
     const parsed = normalizeGeminiRefreshToken(node)
     if (parsed) {
-      appendUniqueAccount(
-        state,
-        makeBareRefreshAccount(parsed.token, state.accounts.length)
-      )
+      const meta = extractOptionalAuthMeta([inherited], parsed.projectId)
+      const base = makeBareRefreshAccount(parsed.token, state.accounts.length)
+      const projectId =
+        meta.project_id || parsed.projectId || inherited?.project_id
+      const email = inherited?.email
+      const suggestedName = cleanText(inherited?.name || email || projectId, 80)
+      appendUniqueAccount(state, {
+        ...base,
+        oauth_account: {
+          refresh_token: parsed.token,
+          ...meta,
+        },
+        ...(email ? { email } : {}),
+        ...(projectId ? { project_id: projectId } : {}),
+        ...(meta.oauth_client_key
+          ? { oauth_client_key: meta.oauth_client_key }
+          : {}),
+        ...(typeof meta.is_gcp_tos === 'boolean'
+          ? { is_gcp_tos: meta.is_gcp_tos }
+          : {}),
+        ...(suggestedName ? { suggestedName } : {}),
+      })
     } else if (depth === 1) {
       state.skippedInvalid += 1
     }
@@ -624,11 +826,14 @@ function collectFromNode(
 
   if (Array.isArray(node)) {
     for (const item of node) {
-      if (item == null || (typeof item !== 'object' && typeof item !== 'string')) {
+      if (
+        item == null ||
+        (typeof item !== 'object' && typeof item !== 'string')
+      ) {
         state.skippedInvalid += 1
         continue
       }
-      collectFromNode(item, state, depth + 1)
+      collectFromNode(item, state, depth + 1, inherited)
     }
     return
   }
@@ -636,38 +841,33 @@ function collectFromNode(
   if (!isRecord(node)) return
 
   const platformTag = normalizedTag(node.platform)
-  if (platformTag && !GEMINI_PROVIDERS.has(platformTag)) {
+  if (platformTag && !GEMINI_PLATFORMS.has(platformTag)) {
     state.skippedNonGemini += 1
     return
   }
 
   const typeTag = normalizedTag(node.type)
-  if (
-    typeTag &&
-    !GEMINI_PROVIDERS.has(typeTag) &&
-    typeTag !== 'oauth' &&
-    typeTag !== 'apikey' &&
-    typeTag !== 'api_key' &&
-    !SUB2API_BUNDLE_TYPES.has(typeTag)
-  ) {
+  if (typeTag && NON_GEMINI_PROVIDERS.has(typeTag)) {
     if (looksLikeAccountNode(node)) {
       state.skippedNonGemini += 1
     }
     return
   }
 
-  const parsed = tryParseSingleObject(node, state.accounts.length)
+  const parsed = tryParseSingleObject(node, state.accounts.length, inherited)
   if (parsed) {
     appendUniqueAccount(state, parsed)
     return
   }
 
-  // Recurse into nested containers (`accounts`, `data.accounts`, arbitrary object maps/arrays).
+  // Recurse into nested containers (`accounts`, `tokens`, `data.accounts`, arbitrary object maps/arrays),
+  // preserving outer email/name/project_id/oauth_client_key/is_gcp_tos metadata.
+  const nextInherited = mergeInheritedContext(inherited, node)
   let recursed = false
   for (const child of Object.values(node)) {
     if (child && typeof child === 'object') {
       recursed = true
-      collectFromNode(child, state, depth + 1)
+      collectFromNode(child, state, depth + 1, nextInherited)
     }
   }
   if (!recursed && looksLikeAccountNode(node)) {
@@ -710,28 +910,28 @@ export function parseGeminiAccountImportData(
   if (isRecord(data)) {
     // Explicit top-level single-account provider errors for clear user feedback
     const bundle =
-      isRecord(data.data) && Array.isArray(data.data.accounts) ? data.data : data
-    if (Array.isArray(bundle.accounts)) {
+      isRecord(data.data) &&
+      (Array.isArray(data.data.accounts) || Array.isArray(data.data.tokens))
+        ? data.data
+        : data
+    const hasBundleArray =
+      Array.isArray(bundle.accounts) ||
+      Array.isArray(bundle.tokens) ||
+      Object.values(data).some((v) => Array.isArray(v))
+    if (hasBundleArray) {
       const bundleType = normalizedTag(bundle.type)
-      if (bundleType && !SUB2API_BUNDLE_TYPES.has(bundleType)) {
+      if (bundleType && NON_GEMINI_PROVIDERS.has(bundleType)) {
         throw new Error(`不支持的导出文件类型 "${bundleType}"。`)
       }
-    } else if (!Object.values(data).some((v) => Array.isArray(v))) {
+    } else {
       const platformTag = normalizedTag(data.platform)
-      if (platformTag && !GEMINI_PROVIDERS.has(platformTag)) {
+      if (platformTag && !GEMINI_PLATFORMS.has(platformTag)) {
         throw new Error(
           `不支持导入平台为 "${platformTag}" 的账号，请选择 Gemini 或 Antigravity 账号。`
         )
       }
       const typeTag = normalizedTag(data.type)
-      if (
-        typeTag &&
-        !GEMINI_PROVIDERS.has(typeTag) &&
-        typeTag !== 'oauth' &&
-        typeTag !== 'apikey' &&
-        typeTag !== 'api_key' &&
-        !SUB2API_BUNDLE_TYPES.has(typeTag)
-      ) {
+      if (typeTag && NON_GEMINI_PROVIDERS.has(typeTag)) {
         throw new Error(
           `不支持导入类型为 "${typeTag}" 的账号文件，请选择 Gemini 或 Antigravity 账号。`
         )

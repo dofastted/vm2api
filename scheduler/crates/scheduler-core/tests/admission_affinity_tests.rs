@@ -1733,6 +1733,102 @@ async fn anthropic_inherit_global_override_append_and_official_prompt_policies()
 }
 
 #[tokio::test]
+async fn default_pool_inherit_global_never_coerces_to_passthrough() {
+    let eng = SchedulerEngine::new(EngineOptions::default());
+    eng.bootstrap(BootstrapRequest {
+        controller_epoch: CompactString::const_new("ep1"),
+        role: Role::Leader,
+        config_version: Some(1),
+        config_snapshot: ConfigSnapshot {
+            config_version: 1,
+            // Malformed/recursive InheritGlobal in global_prompt_policy must fall back to Official, not Passthrough.
+            global_prompt_policy: GlobalPromptPolicy {
+                mode: SystemPromptMode::InheritGlobal,
+                preset: CompactString::const_new(""),
+                text: String::new(),
+                client_system_policy: ClientSystemPolicy::PrependPool,
+            },
+            pools: vec![
+                PoolConfig {
+                    id: CompactString::const_new("p_default_anth"),
+                    provider_scope: ProviderScope::Anthropic,
+                    members: vec![member_cfg("claude_vm:v1", NodeType::ClaudeVm, "v1", 1)],
+                    ..Default::default()
+                },
+                PoolConfig {
+                    id: CompactString::const_new("p_default_openai"),
+                    provider_scope: ProviderScope::Openai,
+                    members: vec![member_cfg("codex_vm:o1", NodeType::CodexVm, "o1", 1)],
+                    ..Default::default()
+                },
+            ],
+            nodes: vec![
+                node_cfg(
+                    "claude_vm:v1",
+                    NodeType::ClaudeVm,
+                    "v1",
+                    Provider::Anthropic,
+                    5,
+                    8,
+                    8,
+                ),
+                node_cfg(
+                    "codex_vm:o1",
+                    NodeType::CodexVm,
+                    "o1",
+                    Provider::Openai,
+                    5,
+                    8,
+                    8,
+                ),
+            ],
+            ..Default::default()
+        },
+        active_sticky_bindings: vec![],
+        active_penalties: vec![],
+        initial_telemetry: vec![],
+    });
+
+    let r_anth = eng
+        .acquire(base_req(
+            "r_anth",
+            "p_default_anth",
+            "claude-sonnet-4",
+            ModelFamily::Claude,
+            "s1",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r_anth.prompt_policy.mode, SystemPromptMode::Official);
+    assert_eq!(
+        r_anth.prompt_policy.preset.as_deref(),
+        Some("official_full")
+    );
+    assert_eq!(r_anth.prompt_policy.source, PromptPolicySource::Global);
+
+    let r_openai = eng
+        .acquire(base_req(
+            "r_openai",
+            "p_default_openai",
+            "gpt-5",
+            ModelFamily::Openai,
+            "s2",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r_openai.prompt_policy.mode, SystemPromptMode::Passthrough);
+    assert_eq!(
+        r_openai.prompt_policy.source,
+        PromptPolicySource::ProviderExempt
+    );
+
+    release_ok(&eng, &r_anth.lease_id);
+    release_ok(&eng, &r_openai.lease_id);
+}
+
+#[tokio::test]
 async fn ephemeral_probe_never_writes_sticky_or_active_sessions() {
     let eng = SchedulerEngine::new(EngineOptions::default());
     eng.bootstrap(BootstrapRequest {

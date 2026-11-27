@@ -21,10 +21,25 @@ describe('listSchedulerPools', () => {
     calls.length = 0
   })
 
-  it('reads only /api/panel/pools (single source of truth)', async () => {
-    next = () => ({ pools: [{ id: 'p1', provider_scope: 'anthropic' }] })
+  it('reads only /api/panel/pools (single source of truth) and normalizes provider-aware prompt defaults', async () => {
+    next = () => ({
+      pools: [
+        { id: 'p1', provider_scope: 'anthropic' },
+        { id: 'p2', provider_scope: 'openai' },
+        { id: 'p3', provider_scope: 'gemini' },
+      ],
+    })
     const pools = await listSchedulerPools()
-    expect(pools.map((p) => p.provider_scope)).toEqual(['anthropic'])
+    expect(pools.map((p) => p.provider_scope)).toEqual([
+      'anthropic',
+      'openai',
+      'google',
+    ])
+    expect(pools.map((p) => p.system_prompt_mode)).toEqual([
+      'inherit_global',
+      'passthrough',
+      'passthrough',
+    ])
     expect(calls).toEqual(['/api/panel/pools'])
   })
 
