@@ -45,6 +45,7 @@ import {
   isGeminiSharedPath,
   parseGeminiGeneratePath,
   parseGeminiModelGetPath,
+  checkGeminiAccounts,
   warmGeminiEnvironments,
 } from './lib/gemini/routes.mjs'
 import {
@@ -1423,6 +1424,7 @@ const geminiScheduler = createGeminiScheduler({
   callHost: callGeminiHost,
   resolveProxy: (proxyId, envOwnerId) => geminiProxyFor(proxyPool, proxyId, { ownerUserId: envOwnerId }),
   poolScheduler,
+  stickyRouter,
   apiKeyStore,
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
   geminiOwnersRepo: geminiOwnersProxy,
@@ -1436,6 +1438,7 @@ const handleGeminiPublic = createGeminiPublicHandler({
   json,
   readBody,
   scheduler: geminiScheduler,
+  stickyRouter,
   requestLog,
   groupsRepo: { rateMultiplier: (id) => groupsRepo.rateMultiplier(id) },
   apiKeyStore,
@@ -2354,6 +2357,30 @@ server.listen(cfg.port, cfg.host, () => {
       const timer = setInterval(warmGemini, 30_000)
       timer.unref()
       onLeaderStop(() => clearInterval(timer))
+
+      // Periodic Gemini account status, auth, eligibility, and quota replenishment checker.
+      let checkingGeminiAccounts = false
+      const checkGemini = async () => {
+        if (checkingGeminiAccounts) return
+        checkingGeminiAccounts = true
+        try {
+          await checkGeminiAccounts({
+            callHost: callGeminiHost,
+            proxyPool: () => proxyPool,
+            slotPrefs: geminiSlotPrefs,
+            geminiScheduler,
+            geminiOwnersRepo: geminiOwnersProxy,
+            getRoutingConfig: () => routingConfig,
+          })
+        } catch {
+          // Host daemon may be absent on non-Gemini installs; stay silent.
+        } finally {
+          checkingGeminiAccounts = false
+        }
+      }
+      const checkTimer = setInterval(checkGemini, 60_000)
+      checkTimer.unref()
+      onLeaderStop(() => clearInterval(checkTimer))
     }
     try {
       vmTestSchedule.start()

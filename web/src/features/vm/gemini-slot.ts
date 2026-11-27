@@ -1,7 +1,9 @@
 import type { ScheduleState, Vm, VmProxySnap } from '@/types/panel-vm'
 import {
+  geminiAccountErrorText,
   geminiAccountStatus,
   geminiHostBlocker,
+  geminiUnschedulableLabel,
 } from '@/lib/gemini-account-status'
 import {
   geminiPayloadIssue,
@@ -105,14 +107,36 @@ export function geminiSlot(
     environment.circuit && environment.circuit.state !== 'closed'
       ? environment.circuit
       : null
+  const persistedUnsched = environment.unschedulable ?? null
+  const accountError = geminiAccountErrorText(account)
   const scheduleState: ScheduleState =
     auth === 'disabled' || environment.schedulable === false
       ? 'off'
-      : auth === 'reauth_required' || Boolean(status.blocker)
+      : auth === 'reauth_required' ||
+          Boolean(persistedUnsched) ||
+          Boolean(status.blocker)
         ? 'unschedulable'
         : status.group === 'restricted'
           ? 'restricted'
           : 'on'
+  const unschedulableReason =
+    persistedUnsched?.reason ??
+    (auth === 'reauth_required'
+      ? 'reauth_required'
+      : (account?.eligibility ?? account?.error_code ?? null))
+  const unschedulableText = persistedUnsched
+    ? geminiUnschedulableLabel(persistedUnsched.reason, persistedUnsched.detail)
+    : (status.blocker ??
+      (auth === 'reauth_required' || account?.state === 'error'
+        ? accountError
+        : null) ??
+      hostBlocker)
+  const unschedulableDetail =
+    persistedUnsched?.detail ??
+    (account?.state === 'error' || account?.state === 'reauth_required'
+      ? accountError
+      : null) ??
+    undefined
   const seatsMax =
     typeof environment.max_concurrency === 'number' &&
     Number.isFinite(environment.max_concurrency) &&
@@ -203,7 +227,36 @@ export function geminiSlot(
           health_24h: usage.health_24h,
         }
       : {}),
-    // The host prerequisite is display context, not an inferred scheduler state.
-    unschedulable_text: hostBlocker,
+    ...(unschedulableReason
+      ? { unschedulable_reason: unschedulableReason }
+      : {}),
+    unschedulable_text: unschedulableText,
+    ...(unschedulableDetail
+      ? {
+          unschedulable_detail: {
+            message: unschedulableDetail,
+            ...(persistedUnsched?.upstream_status
+              ? { upstream_status: persistedUnsched.upstream_status }
+              : {}),
+            ...(persistedUnsched?.error_code
+              ? { error_code: persistedUnsched.error_code }
+              : {}),
+          },
+        }
+      : {}),
+    ...(account?.checked_at
+      ? {
+          last_probe: {
+            at: account.checked_at,
+            ok: account.state === 'ok' || account.state === 'partial',
+            source: 'gemini_account_check',
+            ...(account.error_code ? { code: account.error_code } : {}),
+            ...(accountError ? { error: accountError } : {}),
+            ...(typeof account.http_status === 'number'
+              ? { status: account.http_status }
+              : {}),
+          },
+        }
+      : {}),
   }
 }

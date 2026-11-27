@@ -737,6 +737,15 @@ function terminalRelayDetails(status, body) {
   if (status === 409 && body?.error?.type === 'partial_provider_output_nonretryable') {
     return { ...partialContinuationRelayDetails(body), retryable: false }
   }
+  // CRAG terminal continuation conflicts cannot clear by replaying the same
+  // submission; mark non-retryable so SDKs stop auto-retrying (x-should-retry: false).
+  if (
+    status === 409 &&
+    (body?.error?.type === 'refused_continuation_conflict' ||
+      body?.error?.type === 'tool_continuation_account_changed')
+  ) {
+    return { retryable: false }
+  }
   // 410 Gone is terminal by definition. An expired tool continuation cannot be
   // revived, so every retry of the same hop can only answer 410 again; forward
   // only allowlisted kernel-supplied expiration reasons (#1215).

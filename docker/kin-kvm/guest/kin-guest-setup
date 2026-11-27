@@ -6,9 +6,10 @@
 # The on-disk copy at /usr/local/sbin/kin-guest-setup is installed only by
 # install-guest.sh (cloud-init runcmd, first boot). mount_9p below keeps an
 # existing mount and does not change cache=; applying new mount options on an
-# already-provisioned guest requires reinstalling this script from the current
-# cidata seed, then a full guest reboot (stop→start), not merely restarting
-# kin-guest-setup.service while 9p mounts are still up.
+# already-provisioned guest requires a rebuilt kin-kvm runner image (new
+# seed), reinstalling this script from cidata, then a full guest reboot — not
+# panel stop/start or kin-guest-setup.service restart while 9p stays mounted.
+# See docs/crag-kvm.md «Guest 启动脚本升级».
 set -eu
 
 log() { echo "kin-guest-setup: $*" >&2; }
