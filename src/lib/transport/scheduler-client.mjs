@@ -264,7 +264,6 @@ function sleep(ms, signal) {
       signal?.removeEventListener('abort', onAbort)
       resolve()
     }, ms)
-    timer.unref?.()
     signal?.addEventListener('abort', onAbort, { once: true })
   })
 }
@@ -296,7 +295,6 @@ function raceWithDeadline(promise, ms, signal) {
       },
       Math.max(1, ms),
     )
-    timer.unref?.()
     signal?.addEventListener('abort', onAbort, { once: true })
     promise.then(
       (val) => {
@@ -615,6 +613,7 @@ export class SchedulerClient {
 
     return new Promise((resolve, reject) => {
       let settled = false
+      let resReceived = false
       const done = (fn, val) => {
         if (settled) return
         settled = true
@@ -623,6 +622,7 @@ export class SchedulerClient {
       }
 
       const req = http.request(reqOpts, (res) => {
+        resReceived = true
         const chunks = []
         let size = 0
         res.on('data', (chunk) => {
@@ -638,6 +638,21 @@ export class SchedulerClient {
             done(reject, makeAbortError(signal))
           } else {
             done(reject, Object.assign(new Error('scheduler response aborted'), { code: 'ECONNRESET' }))
+          }
+        })
+        res.once('error', (err) => {
+          if (isAbortError(err, signal)) {
+            done(reject, makeAbortError(signal))
+            return
+          }
+          done(reject, err)
+        })
+        res.once('close', () => {
+          if (settled) return
+          if (signal?.aborted) {
+            done(reject, makeAbortError(signal))
+          } else if (!res.complete) {
+            done(reject, Object.assign(new Error('scheduler response closed prematurely'), { code: 'ECONNRESET' }))
           }
         })
         res.on('end', () => {
@@ -673,7 +688,6 @@ export class SchedulerClient {
         })
         req.destroy(err)
       }, effectiveTimeout)
-      timer.unref?.()
 
       req.once('error', (err) => {
         if (isAbortError(err, signal)) {
@@ -681,6 +695,14 @@ export class SchedulerClient {
           return
         }
         done(reject, err)
+      })
+      req.once('close', () => {
+        if (settled || resReceived) return
+        if (signal?.aborted) {
+          done(reject, makeAbortError(signal))
+        } else {
+          done(reject, Object.assign(new Error('scheduler request closed before response'), { code: 'ECONNRESET' }))
+        }
       })
 
       if (payload) req.write(payload)
@@ -1384,6 +1406,7 @@ export class SchedulerClient {
     let closed = false
     let req = null
     let resRef = null
+    let connectTimer = null
     let lastCursor = after ? String(after) : null
     const queue = []
     let waiter = null
@@ -1429,9 +1452,17 @@ export class SchedulerClient {
       }
     }
 
+    const clearConnectTimer = () => {
+      if (!connectTimer) return
+      clearTimeout(connectTimer)
+      connectTimer = null
+    }
+
     const fail = (err) => {
       if (closed) return
       closed = true
+      clearConnectTimer()
+      signal?.removeEventListener('abort', onAbort)
       streamError = err
       rejectReady(err)
       onError?.(err)
@@ -1441,6 +1472,7 @@ export class SchedulerClient {
     const close = () => {
       if (closed) return
       closed = true
+      clearConnectTimer()
       signal?.removeEventListener('abort', onAbort)
       try {
         resRef?.destroy()
@@ -1466,8 +1498,9 @@ export class SchedulerClient {
         fail(err)
       }
       if (reqOpts && !closed) {
-        let connectTimer = setTimeout(
+        connectTimer = setTimeout(
           () => {
+            connectTimer = null
             const err = new SchedulerUnavailableError(`scheduler SSE connect timeout after ${connectTimeoutMs}ms`, {
               reason: 'sse_timeout',
             })
@@ -1478,11 +1511,9 @@ export class SchedulerClient {
           },
           Math.max(100, connectTimeoutMs),
         )
-        connectTimer.unref?.()
 
         req = http.request(reqOpts, (res) => {
-          clearTimeout(connectTimer)
-          connectTimer = null
+          clearConnectTimer()
           resRef = res
           const status = res.statusCode || 0
           if (status !== 200) {
@@ -1834,17 +1865,31 @@ export class SchedulerClient {
     this.#pendingTelemetry.clear()
     this.#removeExitHook()
 
+    // Destroy pooled Keep-Alive sockets BEFORE signalling the sidecar so graceful HTTP/1.1 servers
+    // (Axum/Hyper or Node http.Server) do not block waiting on our own idle connections to close.
+    try {
+      this.#agent?.destroy()
+    } catch {}
+
     const child = this.#child
     this.#child = null
     if (stopProcess && child && child.exitCode === null && child.signalCode === null) {
       await new Promise((resolve) => {
         let done = false
+        let killTimer = null
         const finish = () => {
           if (done) return
           done = true
-          clearTimeout(killTimer)
+          if (killTimer) clearTimeout(killTimer)
+          child.removeListener('exit', finish)
+          try {
+            child.stderr?.destroy()
+          } catch {}
+          child.unref?.()
           resolve()
         }
+        // Keep the event loop referenced while explicitly awaiting managed child exit.
+        child.ref?.()
         child.once('exit', finish)
         try {
           child.kill('SIGTERM')
@@ -1852,7 +1897,7 @@ export class SchedulerClient {
           finish()
           return
         }
-        const killTimer = setTimeout(
+        killTimer = setTimeout(
           () => {
             try {
               child.kill('SIGKILL')
@@ -1861,7 +1906,6 @@ export class SchedulerClient {
           },
           Math.max(100, timeoutMs),
         )
-        killTimer.unref?.()
       })
     }
 
@@ -1877,10 +1921,6 @@ export class SchedulerClient {
         } catch {}
       }
     }
-
-    try {
-      this.#agent?.destroy()
-    } catch {}
 
     return { ok: true, drainResult }
   }
