@@ -3,10 +3,12 @@ import { buildCodexUsageView, extraToCodexSnapshot, normalizeCodexLimits } from 
 import { isCodexSlotParked, codexQuotaWindowReason } from '../pool/codex-slot-pool.mjs'
 import {
   OPENAI_QUOTA_DEFAULTS,
-  effectiveOpenAIPolicy,
   evaluateOpenAIQuotaGate,
+  mergeOpenAIQuotaPolicy,
   normalizeOpenAIQuotaPolicy,
 } from '../pool/openai-quota-policy.mjs'
+import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
+import { normalizeCodexRouting } from '../protocol/codex-route.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 
@@ -93,9 +95,31 @@ export function resolvePreheatFiveHourWindow(vm, { projectRoot, accountQuota, no
   return unified5hFromAccount(acc)
 }
 
+/** Same quota resolution as summarizeVm / syncCodexQuotaSchedule: global codex.quota + optional vm.policy.quota limits. */
+export function preheatOpenAIQuotaPolicy(vm, routingConfig = null) {
+  const global = normalizeOpenAIQuotaPolicy(normalizeCodexRouting(routingConfig?.codex)?.quota || {})
+  const override = vmQuotaOverrideOf(vm)
+  if (!override) return global
+  const patch = {}
+  if (override.limit_5h != null) patch.limit_5h = override.limit_5h
+  if (override.limit_7d != null) patch.limit_7d = override.limit_7d
+  return Object.keys(patch).length ? mergeOpenAIQuotaPolicy(global, patch) : global
+}
+
+export function preheatWindowStateForVm(
+  vm,
+  { projectRoot, accountQuota, routingConfig = null, now = Date.now() } = {},
+) {
+  return preheatWindowState(vm, {
+    projectRoot,
+    accountQuota,
+    now,
+    openaiQuotaPolicy: preheatOpenAIQuotaPolicy(vm, routingConfig),
+  })
+}
+
 function codexPreheatBlockedReason(vm, now, openaiQuotaPolicy) {
-  const global = normalizeOpenAIQuotaPolicy(openaiQuotaPolicy ?? OPENAI_QUOTA_DEFAULTS)
-  const policy = { ...global, ...effectiveOpenAIPolicy(vm, global) }
+  const policy = normalizeOpenAIQuotaPolicy(openaiQuotaPolicy ?? OPENAI_QUOTA_DEFAULTS)
   if (!isCodexSlotParked(vm, now, policy)) return null
   const hard = codexQuotaWindowReason(vm, now)
   if (hard) return hard

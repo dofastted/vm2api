@@ -12,8 +12,10 @@ import {
 import {
   fiveHourWindowFromCodexVm,
   preheatNextWindowEnd,
+  preheatOpenAIQuotaPolicy,
   preheatRenewEpisodeKey,
   preheatWindowState,
+  preheatWindowStateForVm,
   resolvePreheatFiveHourWindow,
   truncateResetSec,
 } from '../../src/lib/admin/vm-test-preheat-window.mjs'
@@ -247,7 +249,9 @@ test('fiveHourWindowFromCodexVm reads vm file extra on disk', () => {
   assert.equal(parseResetMs(w5.reset), Date.parse(diskReset))
 })
 
-const SOFT_POLICY = { limit_5h: 0.85, limit_7d: 0.9 }
+function routingWithCodexQuota(quota) {
+  return { codex: { quota } }
+}
 
 function codexExtraVm(overrides = {}) {
   return {
@@ -312,15 +316,56 @@ test('preheatWindowState blocks when both 5h and 7d are capped', () => {
   assert.match(state.reason, /^quota_(5h|7d)_header$/)
 })
 
-test('preheatWindowState blocks at soft limits 85/90', () => {
+test('preheatWindowStateForVm applies routingConfig codex.quota soft limits without an explicit policy arg', () => {
   const vm = codexExtraVm({
     codex_secondary_used_percent: 86,
     codex_secondary_reset_at: new Date(FIXED_NOW + 3_600_000).toISOString(),
     codex_primary_used_percent: 50,
   })
-  const state = preheatWindowState(vm, { projectRoot: null, now: FIXED_NOW, openaiQuotaPolicy: SOFT_POLICY })
+  const routing = routingWithCodexQuota({ limit_5h: 0.85, limit_7d: 0.9 })
+  const state = preheatWindowStateForVm(vm, { projectRoot: null, routingConfig: routing, now: FIXED_NOW })
   assert.equal(state.windowLive, true)
   assert.equal(state.reason, 'quota_5h_local')
+  assert.equal(preheatOpenAIQuotaPolicy(vm, routing).limit_5h, 0.85)
+})
+
+test('preheatWindowStateForVm skips when 7d is above soft limit but below hard cap', () => {
+  const vm = codexExtraVm({
+    codex_primary_used_percent: 92,
+    codex_primary_reset_at: new Date(FIXED_NOW + 5 * 24 * 3600_000).toISOString(),
+    codex_secondary_used_percent: 40,
+  })
+  const state = preheatWindowStateForVm(vm, {
+    projectRoot: null,
+    routingConfig: routingWithCodexQuota({ limit_5h: 0.85, limit_7d: 0.9 }),
+    now: FIXED_NOW,
+  })
+  assert.equal(state.windowLive, true)
+  assert.equal(state.reason, 'quota_7d_local')
+})
+
+test('preheatWindowStateForVm skips when 5h reset elapsed but 7d still exceeds soft limit', () => {
+  const vm = codexExtraVm({
+    codex_secondary_used_percent: 100,
+    codex_secondary_reset_at: new Date(FIXED_NOW - 3_600_000).toISOString(),
+    codex_primary_used_percent: 91,
+    codex_primary_reset_at: new Date(FIXED_NOW + 5 * 24 * 3600_000).toISOString(),
+  })
+  const state = preheatWindowStateForVm(vm, {
+    projectRoot: null,
+    routingConfig: routingWithCodexQuota({ limit_5h: 0.85, limit_7d: 0.9 }),
+    now: FIXED_NOW,
+  })
+  assert.equal(state.windowLive, true)
+  assert.equal(state.reason, 'quota_7d_local')
+})
+
+test('preheatOpenAIQuotaPolicy merges per-vm policy.quota limit overrides', () => {
+  const vm = codexExtraVm()
+  vm.policy = { quota: { limit_7d: 0.88 } }
+  const merged = preheatOpenAIQuotaPolicy(vm, routingWithCodexQuota({ limit_5h: 0.85, limit_7d: 0.9 }))
+  assert.equal(merged.limit_5h, 0.85)
+  assert.equal(merged.limit_7d, 0.88)
 })
 
 test('auto-renew sweep survives stop/reload without resending the same episode', async () => {

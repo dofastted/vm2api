@@ -487,6 +487,41 @@ test('#1874 auto-renew persists episode claims across stop/reload', async () => 
   second.stop()
 })
 
+test('#1874 auto-renew gate skips do not persist last_run to SettingsRepo across sweeps', async () => {
+  const NOW = Date.parse('2026-10-16T00:00:00.000Z')
+  const windowEnd = NOW - 60_000
+  const episodeKey = `vm-01\x1evm-01\x1e${Math.floor(windowEnd / 1000)}\x1e`
+  const { settings, schedule } = runner({
+    runTest: async () => ({ ok: true }),
+    nextWindowEnd: () => windowEnd,
+    renewEpisodeKey: () => ({ key: episodeKey }),
+    windowState: () => ({ hasCredential: true, schedulable: true, windowLive: true, reason: 'quota_7d_local' }),
+    now: () => NOW,
+  })
+  const scheduleKey = `${VM_TEST_SCHEDULE_PREFIX}vm-01`
+  settings.set(scheduleKey, {
+    ...preheatConfig,
+    enabled: true,
+    auto_renew: true,
+    frequency: 'daily',
+    time: '09:00',
+    timezone: 'America/Los_Angeles',
+    cron: '0 9 * * *',
+    revision: 'rev-gate-skip',
+    last_run_at: '2026-09-01T00:00:00.000Z',
+    last_ok: true,
+    last_skipped: null,
+  })
+  schedule.start()
+  for (let i = 0; i < 5; i++) await schedule._sweepElapsedWindows()
+  const stored = settings.get(scheduleKey)
+  assert.equal(stored.last_run_at, '2026-09-01T00:00:00.000Z')
+  assert.equal(stored.last_ok, true)
+  assert.equal(stored.last_skipped, null)
+  assert.equal(settings.get(`${VM_TEST_RENEW_CLAIM_PREFIX}vm-01`), null)
+  schedule.stop()
+})
+
 test('#1874 a skipped auto-renew sweep does not consume the episode claim', async () => {
   let calls = 0
   const NOW = Date.parse('2026-10-16T00:00:00.000Z')

@@ -96,7 +96,7 @@ import { VmTestScheduleRunner } from './lib/admin/vm-test-schedule.mjs'
 import {
   preheatNextWindowEnd,
   preheatRenewEpisodeKey,
-  preheatWindowState,
+  preheatWindowStateForVm,
 } from './lib/admin/vm-test-preheat-window.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
@@ -784,7 +784,11 @@ const vmTestSchedule = new VmTestScheduleRunner({
     try {
       const vm = getVm(cfg.paths.project, vmId)
       if (!vm) return { hasCredential: false, schedulable: false, windowLive: false }
-      return preheatWindowState(vm, { projectRoot: cfg.paths.project, accountQuota })
+      return preheatWindowStateForVm(vm, {
+        projectRoot: cfg.paths.project,
+        accountQuota,
+        routingConfig,
+      })
     } catch {
       return null
     }
@@ -806,6 +810,9 @@ const vmTestSchedule = new VmTestScheduleRunner({
     } catch {
       return null
     }
+  },
+  onRenewGateSkip: (event) => {
+    console.debug?.('[vm-test-renew-gate-skip]', JSON.stringify(event))
   },
 })
 credentialRefreshMonitor = createCredentialRefreshMonitor({

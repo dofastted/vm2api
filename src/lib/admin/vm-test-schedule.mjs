@@ -405,6 +405,8 @@ export class VmTestScheduleRunner {
     nextWindowEnd = null,
     /** Optional `(vmId) => preheatRenewEpisodeKey(...)`; defaults to vm file + projectRoot. */
     renewEpisodeKey = null,
+    /** Optional debug hook when an auto-renew gate skip is throttled (at most once per sweep interval). */
+    onRenewGateSkip = null,
   } = {}) {
     this.projectRoot = projectRoot
     this.settingsFactory = typeof settings === 'function' ? settings : () => settings
@@ -414,6 +416,9 @@ export class VmTestScheduleRunner {
     this.windowState = typeof windowState === 'function' ? windowState : null
     this.nextWindowEnd = typeof nextWindowEnd === 'function' ? nextWindowEnd : null
     this.renewEpisodeKey = typeof renewEpisodeKey === 'function' ? renewEpisodeKey : null
+    this.onRenewGateSkip = typeof onRenewGateSkip === 'function' ? onRenewGateSkip : null
+    /** vmId -> { reason, at } — throttle gate-skip diagnostics without touching SettingsRepo. */
+    this.renewGateSkipNotified = new Map()
     this.jobs = new Map()
     this.running = new Set()
     this.started = false
@@ -724,6 +729,16 @@ export class VmTestScheduleRunner {
     return true
   }
 
+  _noteRenewGateSkip(vmId, reason) {
+    const now = this.now()
+    const prev = this.renewGateSkipNotified.get(vmId)
+    if (prev?.reason === reason && Number.isFinite(prev.at) && now - prev.at < PREHEAT_RENEW_SWEEP_SEC * 1000) return
+    this.renewGateSkipNotified.set(vmId, { reason, at: now })
+    try {
+      this.onRenewGateSkip?.({ vmId, reason, at: now })
+    } catch {}
+  }
+
   async _sweepElapsedWindows() {
     if (!this.started) return
     const all = this._settings().all?.() || {}
@@ -741,8 +756,7 @@ export class VmTestScheduleRunner {
       if (!Number.isFinite(endMs) || endMs <= 0 || endMs > now) continue
       const gate = this._preheatGate(vmId, { autoRenew: true })
       if (!gate.fire) {
-        const schedule = this._stored(vmId)
-        if (schedule?.enabled) this._recordRun(vmId, schedule, this.now(), { ok: null, skipped: gate.reason })
+        this._noteRenewGateSkip(vmId, gate.reason || 'gate_blocked')
         continue
       }
       if (!this._tryClaimRenew(vmId, episode.key)) continue
