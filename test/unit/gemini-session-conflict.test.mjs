@@ -145,6 +145,33 @@ function hostStub(environments, inferHandler) {
   }
 }
 
+test('mapCragWorkerError maps upstream 403 by upstream_reason (TOS, region, bare)', () => {
+  const tos = mapCragWorkerError(502, {
+    code: 'upstream_http',
+    upstream_status: 403,
+    upstream_reason: 'TOS_VIOLATION',
+  })
+  assert.equal(tos.code, 'gemini_account_ineligible')
+  assert.equal(tos.status, 403)
+
+  const region = mapCragWorkerError(502, {
+    code: 'upstream_http',
+    upstream_status: 403,
+    upstream_reason: 'UNSUPPORTED_REGION',
+  })
+  assert.equal(region.code, 'gemini_location_unsupported')
+
+  const bare = mapCragWorkerError(502, { code: 'upstream_http', upstream_status: 403 })
+  assert.equal(bare.code, 'gemini_location_unsupported')
+
+  const multi = mapCragWorkerError(502, {
+    code: 'upstream_http',
+    upstream_status: 403,
+    message: '403 UNSUPPORTED_REGION and TOS_VIOLATION',
+  })
+  assert.equal(multi.code, 'gemini_account_ineligible')
+})
+
 test('mapCragWorkerError maps tool_continuation_aborted to gemini_session_conflict (409)', () => {
   const mapped = mapCragWorkerError(409, {
     code: 'tool_continuation_aborted',

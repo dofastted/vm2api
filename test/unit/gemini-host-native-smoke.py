@@ -407,6 +407,26 @@ finally:
 # Error mapping checks for all CRAG upstream_status codes
 assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status": 429}).code == "gemini_quota_exhausted"
 assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status": 403}).code == "gemini_location_unsupported"
+assert (
+    native._map_worker_error(
+        502,
+        {"code": "upstream_http", "upstream_status": 403, "upstream_reason": "UNSUPPORTED_REGION"},
+    ).code
+    == "gemini_location_unsupported"
+)
+assert (
+    native._map_worker_error(
+        502,
+        {"code": "upstream_http", "upstream_status": 403, "upstream_reason": "TOS_VIOLATION"},
+    ).code
+    == "gemini_account_ineligible"
+)
+assert (
+    native._payload_upstream_reason(
+        {"message": "403 UNSUPPORTED_REGION and TOS_VIOLATION"},
+    )
+    == "TOS_VIOLATION"
+)
 assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status": 401}).code == "gemini_oauth_required"
 assert native._map_worker_error(502, {"code": "upstream_http", "upstream_status": 404}).code == "gemini_model_unavailable"
 assert native._map_worker_error(504, {"code": "first_byte_timeout"}).code == "gemini_inference_timeout"
