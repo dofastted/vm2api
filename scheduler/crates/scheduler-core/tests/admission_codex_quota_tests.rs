@@ -5,12 +5,12 @@ use dashmap::DashMap;
 use scheduler_core::admission::filter_members;
 use scheduler_core::node_state::NodeRuntimeState;
 use scheduler_core::snapshot::IndexedSnapshot;
+use scheduler_proto::AcquireRequest;
 use scheduler_proto::{
     ApiKeyScope, BackendNodeConfig, CodexQuotaPolicy, ConfigSnapshot, MemberRole, ModelFamily,
     NodeCapacityConfig, NodeKey, NodeTelemetryUpdate, NodeType, PoolConfig, PoolMemberConfig,
     Provider,
 };
-use scheduler_proto::AcquireRequest;
 use std::sync::Arc;
 
 fn codex_node(id: &str, until_ms: Option<u64>, reason: Option<&str>) -> BackendNodeConfig {
@@ -96,7 +96,11 @@ fn make_req(model: &str, family: ModelFamily) -> AcquireRequest {
     }
 }
 
-fn seed_node(nodes: &DashMap<NodeKey, Arc<NodeRuntimeState>>, node_key: &NodeKey, telemetry: NodeTelemetryUpdate) {
+fn seed_node(
+    nodes: &DashMap<NodeKey, Arc<NodeRuntimeState>>,
+    node_key: &NodeKey,
+    telemetry: NodeTelemetryUpdate,
+) {
     let rt = Arc::new(NodeRuntimeState::new());
     {
         let mut st = rt.inner.lock();
@@ -146,7 +150,10 @@ fn codex_soft_quota_uses_snapshot_fraction_not_hardcoded_95() {
     );
     let (_, excluded2) = filter_members(&snap, pool, &req, &nodes, 2_000);
     assert_eq!(excluded2.len(), 1);
-    assert_eq!(excluded2[0].reason, scheduler_proto::ExcludeReason::QuotaExhausted);
+    assert_eq!(
+        excluded2[0].reason,
+        scheduler_proto::ExcludeReason::QuotaExhausted
+    );
 }
 
 #[test]
@@ -237,7 +244,10 @@ fn temp_unschedulable_parks_slot_from_snapshot_baseline() {
     let nodes: DashMap<NodeKey, Arc<NodeRuntimeState>> = DashMap::new();
     let (_, excluded) = filter_members(&snap, &snap.raw.pools[0], &req, &nodes, until - 1);
     assert_eq!(excluded.len(), 1);
-    assert_eq!(excluded[0].reason, scheduler_proto::ExcludeReason::NotSchedulable);
+    assert_eq!(
+        excluded[0].reason,
+        scheduler_proto::ExcludeReason::NotSchedulable
+    );
     assert!(excluded[0].detail.contains("quota_5h_local"));
 
     let (admitted_later, _) = filter_members(&snap, &snap.raw.pools[0], &req, &nodes, until + 1);

@@ -386,10 +386,7 @@ fn effective_quota_thresholds_pct(
     policy: &CodexQuotaPolicy,
 ) -> (f32, f32) {
     if is_codex_node(node) {
-        (
-            policy.limit_5h_percent(),
-            policy.limit_7d_percent(),
-        )
+        (policy.limit_5h_percent(), policy.limit_7d_percent())
     } else {
         (
             CodexQuotaPolicy::LEGACY_FALLBACK_PCT,
