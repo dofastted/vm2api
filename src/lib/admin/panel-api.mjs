@@ -92,6 +92,7 @@ import { collectLivePanelCredentials } from './panel-live-credentials.mjs'
 import { officialCcHome, readOfficialCcStatus, normalizeOfficialCcConfig } from '../oauth/official-cc-bootstrap.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
+import { normalizeWarmupConfig } from '../pool/account-warmup.mjs'
 import { publicNotifyConfig, summarizePoolAvailability } from './notify.mjs'
 import { cacheHitStats } from './cache-metrics.mjs'
 import { estimateWindow, projectWindowRemaining, usedRatioOf } from './window-estimate.mjs'
@@ -1689,6 +1690,7 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     official_cc: normalizeOfficialCcConfig(routingConfig?.official_cc),
     health_probe: normalizeHealthProbeConfig(routingConfig?.health_probe),
     usage_probe: normalizeUsageProbeConfig(routingConfig?.usage_probe),
+    warmup: normalizeWarmupConfig(routingConfig?.warmup),
     notify: publicNotifyConfig(routingConfig?.notify),
     vm: normalizeVmConfig(routingConfig?.vm),
     telemetry: {

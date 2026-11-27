@@ -35,6 +35,7 @@ import { RequestAttemptsRepo } from '../db/repos/request-attempts-repo.mjs'
 import { normalizeOfficialCcConfig } from '../oauth/official-cc-bootstrap.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
+import { normalizeWarmupConfig } from '../pool/account-warmup.mjs'
 import { mergeNotifyConfig, validateNotifyRoutingPatch } from './notify.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
 import { ensureRedaction } from '../redaction/runtime.mjs'
@@ -83,6 +84,7 @@ export function createRoutingRuntime(ctx) {
   }
   const getHealth = () => (typeof ctx.getHealthMonitor === 'function' ? ctx.getHealthMonitor() : ctx.healthMonitor)
   const getUsage = () => ctx.usageProbeMonitor
+  const getWarmup = () => ctx.warmupMonitor
   const getNotify = () => ctx.notifyMonitor
   const setRuntimeRepo = (next) => {
     if (typeof ctx.setRuntimeRepo === 'function') ctx.setRuntimeRepo(next)
@@ -395,6 +397,16 @@ export function createRoutingRuntime(ctx) {
     getUsage()?.setConfig(routingConfig.usage_probe)
   }
 
+  function applyWarmupRoutingBody(body, previous = null) {
+    if (!body || typeof body !== 'object' || body.warmup == null) return
+    const routingConfig = getRouting()
+    routingConfig.warmup = normalizeWarmupConfig({
+      ...(previous && typeof previous === 'object' ? previous : {}),
+      ...(body.warmup && typeof body.warmup === 'object' ? body.warmup : {}),
+    })
+    getWarmup()?.setConfig(routingConfig.warmup)
+  }
+
   function applyNotifyRoutingBody(body, previous = null) {
     if (!body || typeof body !== 'object' || body.notify == null) return
     const routingConfig = getRouting()
@@ -520,6 +532,7 @@ export function createRoutingRuntime(ctx) {
     const prevOfficialCc = routingConfig.official_cc
     const prevHealthProbe = routingConfig.health_probe
     const prevUsageProbe = routingConfig.usage_probe
+    const prevWarmup = routingConfig.warmup
     const prevNotify = routingConfig.notify
     const prevTiers = routingConfig.tiers
     const prevIdleMs = streamIdleTimeoutMs(routingConfig)
@@ -599,6 +612,7 @@ export function createRoutingRuntime(ctx) {
     applyOfficialCcRoutingBody(body, prevOfficialCc)
     applyHealthProbeRoutingBody(body, prevHealthProbe)
     applyUsageProbeRoutingBody(body, prevUsageProbe)
+    applyWarmupRoutingBody(body, prevWarmup)
     applyNotifyRoutingBody(body, prevNotify)
     routingConfig.tiers = normalizeTiers(
       body.tiers ? mergeTierMaps(prevTiers, body.tiers) : prevTiers,
@@ -927,6 +941,7 @@ export function createRoutingRuntime(ctx) {
     applyOfficialCcRoutingBody,
     applyHealthProbeRoutingBody,
     applyUsageProbeRoutingBody,
+    applyWarmupRoutingBody,
     applyNotifyRoutingBody,
     applyRoutingConcurrency,
     applyRoutingTierConcurrency,

@@ -5,7 +5,8 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { withVmLock } from '../vm/vm-file.mjs'
+import { atomicWriteJson, withVmLock } from '../vm/vm-file.mjs'
+import { normalizeWarmupConfig, startWarmup } from '../pool/account-warmup.mjs'
 import {
   adoptVmProxyBinding,
   bindVmProxy,
@@ -256,6 +257,22 @@ export function createImportCommit(ctx) {
         ctx.accountQuota.clearGrantRevokeLeftover(accountId)
         ctx.poolScheduler?.clearAuthCooldownFor?.(vmId, accountId)
         ctx.poolScheduler?.clearGrantRevokeCooldownFor?.(vmId, accountId)
+      } catch {}
+      // Warm-up onboarding: a fresh (or swapped) account starts the rpm ramp
+      // when routing.warmup is enabled. Operator-imported same-account grants
+      // (credential refresh flows) never touch an in-flight warm-up.
+      try {
+        const warmupCfg = normalizeWarmupConfig(routing().warmup)
+        const prevUuid = existing.claude?.account_uuid || null
+        const nextUuid = importedCredential.account_uuid || null
+        if (warmupCfg.enabled && nextUuid && nextUuid !== prevUuid && !isCodexVm(existing)) {
+          const vmRecord = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          if (!vmRecord.policy?.warmup) {
+            startWarmup(vmRecord, { targetRpm: warmupCfg.target_rpm, config: warmupCfg })
+            atomicWriteJson(vmPath, vmRecord, { mode: 0o600 })
+            ctx.accountQuota?.setMaxRpmForVm?.(vmId, warmupCfg.target_rpm, { override: true })
+          }
+        }
       } catch {}
       try {
         rebindOauthAccount({ ...existing, ...JSON.parse(fs.readFileSync(vmPath, 'utf8')), id: vmId })
