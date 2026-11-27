@@ -167,70 +167,101 @@ function RiskAuditCard({ row }: { row: UsageLogRow }) {
 
   return (
     <div className='space-y-2'>
-      <SectionTitle icon={ShieldAlert} color='text-amber-600'>
+      <SectionTitle icon={ShieldAlert} color='text-[var(--status-warn)]'>
         风控与审核裁决
       </SectionTitle>
-      <div className='space-y-2.5 rounded-lg border bg-amber-50/60 p-3 text-xs dark:bg-amber-950/20'>
+      <div className='space-y-3 rounded-lg border border-[var(--hairline)] bg-card p-3.5 text-xs'>
         <div className='flex flex-wrap items-center gap-1.5'>
-          <Badge variant='outline' className='font-mono text-[10px]'>
+          <span
+            className={cn(
+              'rounded-md px-2 py-0.5 font-mono text-[11px] font-medium',
+              disguised429
+                ? 'bg-[var(--status-warn-bg)] text-[var(--status-warn)]'
+                : 'bg-muted text-foreground'
+            )}
+          >
             对外状态{' '}
             {disguised429
               ? '429（伪装负载）'
               : row.statusCode != null
                 ? `HTTP ${row.statusCode}`
                 : '—'}
-          </Badge>
+          </span>
           {row.via ? (
-            <Badge variant='outline' className='font-mono text-[10px]'>
+            <Badge variant='outline' className='font-mono text-[11px]'>
               内部裁决 {row.via}
             </Badge>
           ) : null}
           {row.finalState ? (
-            <Badge variant='outline' className='font-mono text-[10px]'>
+            <Badge variant='outline' className='font-mono text-[11px]'>
               终态 {row.finalState}
             </Badge>
           ) : null}
           {gateMiss ? (
-            <Badge
-              variant='outline'
-              className='border-rose-400 text-[10px] text-rose-700 dark:text-rose-300'
-            >
+            <span className='rounded-md bg-[var(--status-bad-bg)] px-2 py-0.5 text-[11px] font-medium text-[var(--status-bad)]'>
               前置放行后上游拒答（漏放）
-            </Badge>
+            </span>
           ) : null}
           {riskBucket ? (
-            <Badge variant='outline' className='text-[10px]'>
+            <span className='rounded-md bg-[var(--status-caution-bg)] px-2 py-0.5 text-[11px] font-medium text-[var(--status-caution)]'>
               {RISK_BUCKET_LABELS[riskBucket] || riskBucket}
-            </Badge>
+            </span>
           ) : null}
         </div>
         {jevScores.length > 0 ? (
-          <div className='space-y-1'>
-            <p className='text-[11px] text-muted-foreground'>
-              JEV 题目安全分（越低越危险）
+          <div className='space-y-2'>
+            <p className='text-[11px] text-[var(--text-tertiary)]'>
+              JEV 题目安全分（0–1，低于 0.50 拦截）
             </p>
-            <div className='flex flex-wrap gap-1.5'>
-              {jevScores.map((item) => (
-                <Badge
-                  key={item.id}
-                  variant='outline'
-                  className={cn(
-                    'font-mono text-[11px] tabular-nums',
-                    item.score < 0.5
-                      ? 'border-rose-400 bg-rose-500/10 text-rose-700 dark:text-rose-300'
-                      : item.score < 0.85
-                        ? 'border-amber-400 bg-amber-500/10 text-amber-700 dark:text-amber-300'
-                        : 'border-emerald-400 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-                  )}
-                >
-                  {item.label}: {item.score.toFixed(2)}
-                </Badge>
-              ))}
+            <div className='grid gap-2 sm:grid-cols-3'>
+              {jevScores.map((item) => {
+                const pct = Math.max(0, Math.min(100, item.score * 100))
+                const tone =
+                  item.score < 0.5
+                    ? {
+                        fg: 'text-[var(--status-bad)]',
+                        bar: 'bg-[var(--status-bad-solid)]',
+                      }
+                    : item.score < 0.85
+                      ? {
+                          fg: 'text-[var(--status-caution)]',
+                          bar: 'bg-[var(--status-caution-solid)]',
+                        }
+                      : {
+                          fg: 'text-[var(--status-ok)]',
+                          bar: 'bg-[var(--status-ok-solid)]',
+                        }
+                return (
+                  <div
+                    key={item.id}
+                    className='space-y-1 rounded-md border border-[var(--hairline)] bg-muted/20 px-2.5 py-2'
+                  >
+                    <div className='flex items-baseline justify-between gap-2 font-mono text-[11px] tabular-nums'>
+                      <span className='font-sans font-medium text-foreground'>
+                        {item.label}: {item.score.toFixed(2)}
+                      </span>
+                      <span className={cn('font-semibold', tone.fg)}>
+                        {Math.round(pct)}%
+                      </span>
+                    </div>
+                    <div className='relative h-1.5 w-full overflow-hidden rounded-full bg-[var(--track)]'>
+                      <div
+                        className={cn('h-full rounded-full', tone.bar)}
+                        style={{ width: `${Math.max(2, pct)}%` }}
+                      />
+                      <span
+                        aria-hidden='true'
+                        className='absolute inset-y-0 left-1/2 w-px bg-foreground/30'
+                      />
+                    </div>
+                  </div>
+                )
+              })}
             </div>
           </div>
         ) : null}
         {row.inboundDeviceId || row.clientSessionId ? (
-          <div className='grid gap-1 border-t border-amber-200/70 pt-2 text-[11px] text-muted-foreground sm:grid-cols-2 dark:border-amber-800/50'>
+          <div className='grid gap-1.5 border-t border-[var(--hairline)] pt-2.5 text-[11px] text-[var(--text-tertiary)] sm:grid-cols-2'>
             <div className='min-w-0 break-all'>
               入站设备：
               <code className='font-mono text-foreground'>

@@ -55,17 +55,41 @@ export function Panel({
         className
       )}
     >
-      <header className='flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b px-4 py-3'>
+      <header className='flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b border-[var(--hairline)] bg-muted/20 px-4 py-3'>
         <div className='min-w-0'>
-          <h3 className='text-sm font-semibold'>{title}</h3>
+          <h3 className='text-sm font-semibold tracking-[-0.01em]'>{title}</h3>
           {hint ? (
-            <p className='text-xs leading-5 text-muted-foreground'>{hint}</p>
+            <p className='mt-0.5 text-xs leading-5 text-muted-foreground'>
+              {hint}
+            </p>
           ) : null}
         </div>
         {action}
       </header>
       {children}
     </section>
+  )
+}
+
+export function EmptyNotice({
+  icon: Icon,
+  message,
+  action,
+}: {
+  icon?: React.ComponentType<{ className?: string; 'aria-hidden'?: boolean }>
+  message: string
+  action?: React.ReactNode
+}) {
+  return (
+    <div className='flex flex-col items-center justify-center gap-2 px-4 py-8 text-center'>
+      {Icon ? (
+        <span className='flex size-8 items-center justify-center rounded-lg bg-muted/60 text-muted-foreground'>
+          <Icon className='size-4' aria-hidden />
+        </span>
+      ) : null}
+      <p className='text-sm text-muted-foreground'>{message}</p>
+      {action}
+    </div>
   )
 }
 
@@ -93,9 +117,9 @@ export function Segmented<T extends string>({
             type='button'
             aria-pressed={on}
             className={cn(
-              'cursor-pointer rounded-md px-3 py-1.5 text-sm transition-colors duration-200',
+              'cursor-pointer rounded-md px-3 py-1.5 text-sm transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
               on
-                ? 'bg-background text-foreground shadow-sm'
+                ? 'bg-background font-medium text-foreground shadow-xs'
                 : 'text-muted-foreground hover:text-foreground'
             )}
             onClick={() => onChange(option.value)}
