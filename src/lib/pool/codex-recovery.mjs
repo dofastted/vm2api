@@ -214,13 +214,17 @@ export function createCodexRecoveryStore({ settingsRepo = null, now = () => Date
     return !!(vm.has_token || vm.has_refresh)
   }
 
-  function resetsRefreshed(vm, before, at, policy) {
+  function evaluateResetRefresh(vm, before, at) {
     const after = snapshotResets(vm)
     const next5 = after.reset5h
     const prev5 = resetEpochMs(before?.reset5h)
-    if (!Number.isFinite(next5) || next5 <= at) return false
-    if (Number.isFinite(prev5) && prev5 === next5) return false
-    return quotaBelowSoft(vm, normalizeOpenAIQuotaPolicy(policy), at)
+    if (!Number.isFinite(next5) || next5 <= at) return { ok: false, reason: 'reset_not_refreshed' }
+    if (Number.isFinite(prev5) && prev5 === next5) return { ok: false, reason: 'reset_not_refreshed' }
+    return { ok: true }
+  }
+
+  function resetsRefreshed(vm, before, at) {
+    return evaluateResetRefresh(vm, before, at).ok
   }
 
   function tryStartAfterPreheat({
@@ -240,7 +244,8 @@ export function createCodexRecoveryStore({ settingsRepo = null, now = () => Date
     const vm = vmOverride && isCodexVm(vmOverride) ? vmOverride : projectRoot ? getVm(projectRoot, vmId) : null
     if (!vm || !isCodexVm(vm)) return { started: false, reason: 'not_codex' }
     if (!codexQuotaSnapshotFresh(vm, at)) return { started: false, reason: 'stale_snapshot' }
-    if (!resetsRefreshed(vm, beforeResets, at, quotaPolicy)) return { started: false, reason: 'reset_not_refreshed' }
+    const refresh = evaluateResetRefresh(vm, beforeResets, at)
+    if (!refresh.ok) return { started: false, reason: refresh.reason }
     const policy = normalizeOpenAIQuotaPolicy(quotaPolicy)
     if (!quotaBelowSoft(vm, policy, at)) return { started: false, reason: 'above_soft_limit' }
     if (!schedulableHealthy(vm, at)) return { started: false, reason: 'not_schedulable' }
@@ -289,6 +294,7 @@ export function createCodexRecoveryStore({ settingsRepo = null, now = () => Date
     if (!state) return { active: false, state: null, remaining_ms: 0, expired: false }
     if (state.until > at) return viewForState(state, at)
     const vm = directVm || (projectRoot ? getVm(projectRoot, vmId) : null)
+    if (!vm) return viewForState(state, at)
     const policy = normalizeOpenAIQuotaPolicy(quotaPolicy)
 
     if (state.rate_limited) {
@@ -332,7 +338,8 @@ export function createCodexRecoveryStore({ settingsRepo = null, now = () => Date
       rate_limited: true,
       extended: (entry.state.extended || 0) + 1,
     }
-    const shouldPersist = !prevWrite || entry.state.rate_limited !== true || at - prevWrite.at >= RECOVERY_WRITE_THROTTLE_MS
+    const shouldPersist =
+      !prevWrite || entry.state.rate_limited !== true || at - prevWrite.at >= RECOVERY_WRITE_THROTTLE_MS
     put(vmId, next, { force: shouldPersist })
     return true
   }
@@ -364,6 +371,7 @@ export function createCodexRecoveryStore({ settingsRepo = null, now = () => Date
     recordRateLimit,
     overlayFor,
     snapshotResets,
+    evaluateResetRefresh,
     /** test hook */
     _readAll: readAll,
     _flushCache: () => {

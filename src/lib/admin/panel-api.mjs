@@ -1249,7 +1249,9 @@ export async function buildProbeOne({
         ok: !!result.ok,
         source: 'vm-oauth-usage',
         at: result.fetched_at || new Date().toISOString(),
-        ...(result.ok ? {} : { error: result.message || result.error || 'GPT quota probe failed', status: result.status || null }),
+        ...(result.ok
+          ? {}
+          : { error: result.message || result.error || 'GPT quota probe failed', status: result.status || null }),
       })
     } catch {}
     if (!result.ok) return gptQuotaFail(result)
@@ -2049,7 +2051,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     })
   }
   const scheduleLevel = isCodex
-    ? codexScheduleLevel(v)
+    ? codexScheduleLevel(v, undefined, undefined, { quotaPolicy: openAIGlobalPolicy })
     : resolveCredentialScheduleLevel({ manualLevel: v.schedule_level_manual, unified: acc?.unified || {} })
   const recoveryView =
     isCodex && getCodexRecoveryStore()
@@ -2509,8 +2511,8 @@ function findRuntime(accountQuota, vm, snap = null) {
         leftoverKey &&
         (!cred.has_access ||
           /refresh_token_missing|invalid_grant|token_revoked|invalidated oauth token|worker_unhealthy/.test(
-          err + String(state.status || '')
-        ))
+            err + String(state.status || ''),
+          ))
       const live = !!(vm.has_refresh || vm.has_token || vm.account_uuid)
       if (leftover && live) continue
       return freshenRuntimeState(state, vm, repo)

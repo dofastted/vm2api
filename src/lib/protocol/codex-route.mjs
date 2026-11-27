@@ -41,7 +41,7 @@ export const DEFAULT_CODEX_ROUTING = Object.freeze({
   },
   quota: normalizeOpenAIQuotaPolicy(),
   recovery: {
-    /** Default conservative: keep session on a recovering slot when higher-P normals exist. */
+    /** false = migrate sticky sessions to higher-P slots; true = keep affinity on recovering home. */
     sticky_keep_session: false,
   },
 })
