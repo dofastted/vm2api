@@ -27,6 +27,9 @@ const state = vi.hoisted(() => ({
   maintenance: undefined as MaintenanceStatus | undefined,
   maintenancePending: false,
   maintenanceError: false,
+  maintenanceErrorValue: null as unknown,
+  maintenanceFetchStatus: 'idle' as 'idle' | 'fetching' | 'paused',
+  refetch: vi.fn(),
   inventory: undefined as GeminiInventory | undefined,
   values: [] as unknown[],
   cursor: 0,
@@ -80,6 +83,10 @@ vi.mock('@tanstack/react-query', async (importOriginal) => ({
         data: state.maintenance,
         isPending: state.maintenancePending,
         isError: state.maintenanceError,
+        error: state.maintenanceErrorValue,
+        fetchStatus: state.maintenanceFetchStatus,
+        isFetching: state.maintenanceFetchStatus === 'fetching',
+        refetch: state.refetch,
       }
     }
     if (queryKey.includes('gemini-environments')) {
@@ -182,6 +189,8 @@ beforeEach(() => {
   state.maintenance = baseSnapshot()
   state.maintenancePending = false
   state.maintenanceError = false
+  state.maintenanceErrorValue = null
+  state.maintenanceFetchStatus = 'idle'
   state.inventory = {
     available: true,
     payload_state: 'installed',
@@ -382,12 +391,68 @@ describe('CragGeminiKernelRow', () => {
       code: 'gemini_maintenance_unavailable',
     }
     const html = renderRow()
-    expect(html).toContain('需要宿主机初始化')
+    expect(html).toContain('宿主维护未就绪，需先初始化')
+    expect(html).not.toContain('正在读取宿主状态')
     expect(html).toContain('install-gemini.sh')
     const installButton = state.buttons.find(
       (btn) => btn['aria-label'] === '安装 CRAGGemini 内核'
     )
     expect(installButton?.disabled).toBe(true)
+  })
+
+  it('shows the localized reason when the maintenance service is unavailable without bootstrap', () => {
+    state.maintenance = {
+      available: false,
+      bootstrap_required: false,
+      code: 'gemini_maintenance_denied',
+    }
+    const html = renderRow()
+    expect(html).toContain('控制面无权访问 Gemini 维护服务 socket')
+    expect(html).not.toContain('正在读取宿主状态')
+    expect(html).not.toContain('install-gemini.sh')
+  })
+
+  it('shows a loading indicator only while the status read is in flight', () => {
+    state.maintenance = undefined
+    state.maintenancePending = true
+    state.maintenanceFetchStatus = 'fetching'
+    expect(renderRow()).toContain('正在读取宿主状态')
+  })
+
+  it('does not spin forever when the first status read was cancelled', () => {
+    state.maintenance = undefined
+    state.maintenancePending = true
+    state.maintenanceFetchStatus = 'idle'
+    const html = renderRow()
+    expect(html).not.toContain('正在读取宿主状态')
+    expect(html).toContain('宿主状态尚未读取')
+    const retry = state.buttons.find(
+      (btn) => btn['aria-label'] === '重新读取 CRAGGemini 宿主状态'
+    )
+    expect(retry).toBeDefined()
+    retry?.onClick?.({} as never)
+    expect(state.refetch).toHaveBeenCalled()
+  })
+
+  it('surfaces a status read failure with its code and a retry action', async () => {
+    const { ApiError } = await import('@/lib/api')
+    state.maintenance = undefined
+    state.maintenancePending = false
+    state.maintenanceError = true
+    state.maintenanceErrorValue = new ApiError(
+      '读取宿主维护状态超时',
+      0,
+      'gemini_maintenance_timeout'
+    )
+    const html = renderRow()
+    expect(html).toContain('无法读取 CRAGGemini 维护状态')
+    expect(html).toContain('gemini_maintenance_timeout')
+    expect(html).not.toContain('正在读取宿主状态')
+    const retry = state.buttons.find(
+      (btn) => btn['aria-label'] === '重新读取 CRAGGemini 宿主状态'
+    )
+    retry?.onClick?.({} as never)
+    expect(state.refetch).toHaveBeenCalledTimes(1)
   })
 
   it('renders live Chinese phase while a maintenance job is running and translates failures', () => {
