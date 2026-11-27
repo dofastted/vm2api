@@ -261,7 +261,9 @@ location / {
 
 ## 本机 Node（备选）
 
-`npm run fetch:payload` 拉 `bin/kin-{kernel,codex-kernel,oauth-auth}` 与 `share/`；`npm run build:egress && npm run build:worker`；`npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`；以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
+`npm run fetch:payload` 拉 `bin/kin-{kernel,codex-kernel,oauth-auth}` 与 `share/`；`npm run build:egress && npm run build:worker`；`npm run build:scheduler`（需本机安装 Rust / Cargo 1.86+，等价于 `cd scheduler && cargo build --release --locked --bin kin-scheduler` 并安装到 `bin/kin-scheduler`，也可用 `KIN_SCHEDULER_BIN` 指定路径）；`npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`；以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
+
+> **注意**：`kin-scheduler` 仅随 Docker 控制面镜像预编译，不随 `deploy/payload.json` 或 GitHub Release 附件分发。本机 Node / systemd 部署若缺少可执行 `bin/kin-scheduler`，控制面虽能启动（`/health` 返回 `200`），但所有推理数据面将按 fail-closed 统一返回 `503`（`scheduler_unavailable`）。
 
 ## 不停服升级（蓝绿）
 
@@ -271,7 +273,7 @@ location / {
 
 ## 一键安装 / 更新
 
-`deploy/install.sh` 默认拉 ghcr 预构建镜像，不在目标机编译，只下载 `docker-compose.yml`、`.env.example`、`VERSION`、`CHANGELOG.md`、`deploy/install.sh`（ARM64 另加 `deploy/prepare-arm64.py`）。`--from-source` 在目标机按 `Dockerfile` 多阶段构建：编 `web/dist` 与 Go helper，按 `deploy/payload.json` 下载 payload。不碰已有非空 `.env` 字段、`vms/`、`data/`，不 `docker rm` 槽。
+`deploy/install.sh` 默认拉 ghcr 预构建镜像，不在目标机编译，只下载 `docker-compose.yml`、`.env.example`、`VERSION`、`CHANGELOG.md`、`deploy/install.sh`（ARM64 另加 `deploy/prepare-arm64.py`）。`--from-source` 在目标机按 `Dockerfile` 多阶段构建：编 `web/dist`、Go helper 与 Rust `kin-scheduler`，按 `deploy/payload.json` 下载 payload。不碰已有非空 `.env` 字段、`vms/`、`data/`，不 `docker rm` 槽。
 
 ### 两类安装错误
 

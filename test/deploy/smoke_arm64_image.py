@@ -39,6 +39,8 @@ for name in ('kin-worker', 'kin-egress'):
     elf(root / 'image-bin' / name, 183, static=True)
     elf(root / 'cluster-bin-amd64' / name, 62, static=True)
 elf(root / 'image-bin' / 'kin-api-kernel', 183, static=True)
+# Rust kin-scheduler links dynamically against bookworm glibc (not static).
+elf(root / 'image-bin' / 'kin-scheduler', 183)
 elf(Path('/usr/local/bin/docker'), 183, static=True)
 subprocess.run(['docker', '--version'], check=True, timeout=10)
 for name in ('kin-kernel', 'kin-codex-kernel', 'kin-oauth-auth', 'kin-computer'):
@@ -91,6 +93,8 @@ try:
     for name in ('kin-worker', 'kin-egress', 'kin-api-kernel'):
         elf(root / 'bin' / name, 183, static=True)
         assert (root / 'bin' / name).read_bytes() == (root / 'image-bin' / name).read_bytes()
+    elf(root / 'bin' / 'kin-scheduler', 183)
+    assert (root / 'bin' / 'kin-scheduler').read_bytes() == (root / 'image-bin' / 'kin-scheduler').read_bytes()
     subprocess.run(['node', '--input-type=module', '-e', r"""
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
