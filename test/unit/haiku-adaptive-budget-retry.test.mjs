@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { mapUpstreamError } from '../../src/lib/core/errors.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { classifyUpstreamResult, repairAnthropicRequest } from '../../src/lib/pool/upstream-error-policy.mjs'
 import { prepareAnthropicRequest } from '../../src/lib/protocol/anthropic-policy.mjs'
 import { applyMinMaxTokens } from '../../src/lib/protocol/min-max-tokens.mjs'
@@ -164,6 +165,7 @@ test('FailoverRunner stops cleanly without a second hop when Haiku adaptive retr
   const attempts = []
   const runner = new FailoverRunner({
     scheduler,
+    schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     attemptsRepo: {
       begin() {},
       complete(_reqId, attemptNo, row) {
@@ -216,7 +218,10 @@ test('FailoverRunner repairs and retries Haiku adaptive thinking with valid boun
     [4097, 2048],
   ]) {
     const scheduler = makeTestScheduler([makeCandidate('1')])
-    const runner = new FailoverRunner({ scheduler })
+    const runner = new FailoverRunner({
+      scheduler,
+      schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
+    })
     const input = applyMinMaxTokens(makeHaikuAdaptiveRequest(maxTokens, { output_config: { effort: 'medium' } }), {})
     const hops = []
     const result = await runner.run({

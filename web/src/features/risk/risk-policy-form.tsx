@@ -1,7 +1,7 @@
 import { useEffect, useId, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import type { RiskAuditPolicy } from '@/types/panel-routing'
-import { Check, ChevronsUpDown, Plus, X } from 'lucide-react'
+import { ArrowRight, Check, ChevronsUpDown, Plus, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
   Command,
@@ -209,7 +209,7 @@ export function RiskPolicyForm({
             <>
               <Group
                 title='分级封禁'
-                hint='按违规次数非递减配置；最后一级为永久。会话始终单独封禁。'
+                hint='按违规次数非递减配置；最后一级为永久。JEV 命中同步封禁当前会话，临时冷却期返回 429 负载。'
                 action={
                   <Button
                     type='button'
@@ -222,6 +222,41 @@ export function RiskPolicyForm({
                   </Button>
                 }
               >
+                <div
+                  aria-label='当前分级封禁阶梯预览'
+                  className='flex flex-wrap items-center gap-1.5 rounded-lg border border-[var(--hairline)] bg-muted/25 px-3 py-2 text-xs'
+                >
+                  {draft.ban_steps.map((minutes, index) => {
+                    const isPermanent = index === draft.ban_steps.length - 1
+                    const label = isPermanent
+                      ? '永久封禁'
+                      : minutes >= 1440 && minutes % 1440 === 0
+                        ? `${minutes / 1440} 天`
+                        : minutes >= 60 && minutes % 60 === 0
+                          ? `${minutes / 60} 小时`
+                          : `${minutes} 分钟`
+                    return (
+                      <div key={index} className='flex items-center gap-1.5'>
+                        {index > 0 ? (
+                          <ArrowRight
+                            aria-hidden='true'
+                            className='size-3 text-muted-foreground/60'
+                          />
+                        ) : null}
+                        <span
+                          className={
+                            isPermanent
+                              ? 'rounded-md bg-[var(--status-bad-bg)] px-2 py-0.5 font-medium text-[var(--status-bad)] tabular-nums'
+                              : 'rounded-md bg-[var(--status-warn-bg)] px-2 py-0.5 font-medium text-[var(--status-warn)] tabular-nums'
+                          }
+                        >
+                          第 {index + 1} 次 · {label}
+                          {!isPermanent ? ' (429)' : ''}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
                 <div className='grid items-start gap-3 sm:grid-cols-2 xl:grid-cols-3'>
                   {draft.ban_steps.slice(0, -1).map((minutes, index) => (
                     <div key={index} className='flex min-w-0 items-end gap-1'>

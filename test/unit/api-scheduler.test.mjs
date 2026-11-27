@@ -6,6 +6,7 @@ import {
   resolveUpstreamPool,
   modelIdsForEndpoint,
 } from '../../src/lib/pool/api-scheduler.mjs'
+import { formatNodeKey } from '../../src/lib/scheduler/scheduler-runtime.mjs'
 
 const ep = (over = {}) => ({
   id: 'ep1',
@@ -39,8 +40,27 @@ test('same alias builds upstream name pool', () => {
   assert.deepEqual(resolveUpstreamPool(ep(), 'team/pool'), ['upstream-a', 'upstream-b'])
 })
 
-test('grouped round-robin walks keys then endpoints', () => {
-  const s = new ApiScheduler()
+test('acquire delegates endpoint selection to Rust scheduler runtime across matching endpoints', async () => {
+  let cursor = 0
+  let leaseSeq = 0
+  const fakeRuntime = {
+    async acquireNode(params) {
+      const candidates = params.allowedNodeKeys || [
+        formatNodeKey('api_endpoint', 'a'),
+        formatNodeKey('api_endpoint', 'b'),
+      ]
+      const chosen = candidates[cursor++ % candidates.length]
+      const nodeId = chosen.split(':').slice(1).join(':')
+      return {
+        lease_id: `lease-${++leaseSeq}`,
+        lease_ttl_ms: 30_000,
+        resolved_pool_id: params.originPoolId,
+        selected_node: { node_type: 'api_endpoint', node_id: nodeId, node_key: chosen },
+      }
+    },
+    async releaseLease() {},
+  }
+  const s = new ApiScheduler({ schedulerRuntime: fakeRuntime })
   const a = ep({
     id: 'a',
     prefix: '',
@@ -54,8 +74,8 @@ test('grouped round-robin walks keys then endpoints', () => {
     api_key_entries: [{ id: 'b1', api_key: '2', disabled: false }],
   })
   s.reload([a, b])
-  const first = s.pick('m')
-  const second = s.pick('m')
+  const first = await s.acquire('m', { requestId: 'req-rr-1' })
+  const second = await s.acquire('m', { requestId: 'req-rr-2' })
   assert.equal(first.ok, true)
   assert.equal(second.ok, true)
   assert.notEqual(first.endpoint.id, second.endpoint.id)

@@ -51,6 +51,7 @@ jobs:
           filters: |
             backend:
               - 'src/**'
+              - 'scheduler/**'
               - 'deploy/payload.json'
               - 'test/unit/**'
               - 'test/fixtures/**'
@@ -135,11 +136,13 @@ jobs:
             api-kernel/go.sum
             redact/go.sum
       - uses: dtolnay/rust-toolchain@1.86.0
-        if: needs.changes.outputs.rust_scheduler == 'true' || inputs.full || contains(needs.changes.outputs.unit_tests, 'test/unit/scheduler-client.test.mjs')
+        if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.rust_scheduler == 'true' || inputs.full
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-        if: needs.changes.outputs.rust_scheduler == 'true' || inputs.full || contains(needs.changes.outputs.unit_tests, 'test/unit/scheduler-client.test.mjs')
+        if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.rust_scheduler == 'true' || inputs.full
+        env:
+          RUSTUP_TOOLCHAIN: '1.86.0'
         with:
           workspaces: scheduler
       - name: pinned payload
@@ -176,10 +179,8 @@ jobs:
           if [ "$FULL" = true ] || jq -e 'index("test/unit/proto-front-sidecar.test.mjs") != null' <<< "$CHANGED_TESTS" >/dev/null; then
             (cd protofront && CGO_ENABLED=0 go build -o ../bin/kin-proto-front ./cmd/kin-proto-front)
           fi
-          # scheduler-client.test.mjs spawns the real Rust sidecar from bin/kin-scheduler.
-          if [ "$FULL" = true ] || jq -e 'index("test/unit/scheduler-client.test.mjs") != null' <<< "$CHANGED_TESTS" >/dev/null; then
-            (cd scheduler && RUSTUP_TOOLCHAIN=1.86.0 cargo build --release --locked --bin kin-scheduler && mkdir -p ../bin && cp target/release/kin-scheduler ../bin/kin-scheduler)
-          fi
+          # Backend tests (pool-scheduler, api-channel-routing, scheduler-*) spawn the real Rust sidecar from bin/kin-scheduler.
+          (cd scheduler && RUSTUP_TOOLCHAIN=1.86.0 cargo build --release --locked --bin kin-scheduler && mkdir -p ../bin && cp target/release/kin-scheduler ../bin/kin-scheduler)
           if [ "$FULL" = true ]; then
             # Four workers for the four vCPUs a standard runner has. The suite is
             # 412 files and over a quarter of an hour one at a time.

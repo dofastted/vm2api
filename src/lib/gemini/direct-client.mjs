@@ -330,6 +330,28 @@ export function buildDirectEnvelope({ model, requestId, bodyObj, gatewayPolicy =
   return envelope
 }
 
+const UPSTREAM_403_REASON_TOKENS = ['TOS_VIOLATION', 'UNSUPPORTED_REGION', 'VALIDATION_REQUIRED', 'UNSUPPORTED_CLIENT']
+
+function payloadUpstreamReason(obj) {
+  const raw = typeof obj.upstream_reason === 'string' ? obj.upstream_reason.trim() : ''
+  if (raw.length > 0) return raw.toUpperCase()
+  for (const key of ['message', 'error']) {
+    const val = typeof obj[key] === 'string' ? obj[key].trim() : ''
+    if (val.length === 0) continue
+    const upper = val.toUpperCase()
+    for (const token of UPSTREAM_403_REASON_TOKENS) {
+      if (upper.includes(token)) return token
+    }
+  }
+  return null
+}
+
+function mapEffective403(obj, message, makeErr) {
+  const reason = payloadUpstreamReason(obj)
+  if (reason === 'TOS_VIOLATION') return makeErr(403, 'gemini_account_ineligible', message)
+  return makeErr(403, 'gemini_location_unsupported', message)
+}
+
 /**
  * Map a CRAGGemini kernel JSON error response identically to
  * `scripts/gemini_host_native.py::_map_worker_error`.
@@ -388,7 +410,7 @@ export function mapCragWorkerError(httpStatus, payload) {
     return makeErr(409, 'gemini_session_conflict', message)
   }
   if (effectiveStatus === 401) return makeErr(401, 'gemini_oauth_required', message)
-  if (effectiveStatus === 403) return makeErr(403, 'gemini_location_unsupported', message)
+  if (effectiveStatus === 403) return mapEffective403(obj, message, makeErr)
   if (effectiveStatus === 404) return makeErr(404, 'gemini_model_unavailable', message)
   if (code === 'upstream_unavailable' || effectiveStatus === 503) {
     const err = makeErr(

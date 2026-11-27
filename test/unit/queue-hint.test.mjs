@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { QUEUE_HINT_HEADER, queueAllowedByHeaders } from '../../src/lib/protocol/queue-hint.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { CORS_ALLOW_HEADERS } from '../../src/lib/http/cors.mjs'
 
 test('x-kin-queue: off and its synonyms turn the seat queue off; anything else keeps it', () => {
@@ -66,7 +67,10 @@ function ok() {
 // all_accounts_busy); this only pins how the runner treats that answer.
 test('allowQueue:false fails a busy pool at once with 529 and never dispatches', async () => {
   const scheduler = new BusyScheduler()
-  const runner = new FailoverRunner({ scheduler })
+  const runner = new FailoverRunner({
+    scheduler,
+    schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
+  })
   let dispatched = 0
   const result = await runner.run({
     requestId: 'no-queue',
@@ -83,12 +87,16 @@ test('allowQueue:false fails a busy pool at once with 529 and never dispatches',
   assert.equal(result.ok, false)
   assert.equal(result.status, 529)
   assert.equal(result.body.error.code, 'pool_overloaded')
-  assert.equal(result.body.error.details.reason, 'all_accounts_busy')
+  assert.equal(result.explain?.reason, 'all_accounts_busy')
+  assert.equal(result.body.error.details, undefined, 'DecisionExplain details must not leak into public error body')
 })
 
 test('without allowQueue the runner still waits for a seat (default unchanged)', async () => {
   const scheduler = new BusyScheduler()
-  const runner = new FailoverRunner({ scheduler })
+  const runner = new FailoverRunner({
+    scheduler,
+    schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
+  })
   const result = await runner.run({
     requestId: 'queue-default',
     model: 'claude-sonnet-test',

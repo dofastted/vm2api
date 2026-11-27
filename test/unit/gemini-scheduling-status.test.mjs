@@ -16,6 +16,39 @@ import {
 } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
 import { createGeminiSlotPrefs } from '../../src/lib/gemini/slot-prefs.mjs'
+import { SchedulerApiError } from '../../src/lib/transport/scheduler-client.mjs'
+
+function makeMockGeminiRuntime() {
+  let seq = 0
+  return {
+    async acquireNode(params) {
+      const excluded = new Set(params.excludeNodes || [])
+      const allowed = Array.isArray(params.allowedNodeKeys) ? params.allowedNodeKeys : []
+      const key = allowed.find((k) => !excluded.has(k))
+      if (!key) {
+        throw new SchedulerApiError({
+          status: 429,
+          code: 'pool_exhausted',
+          message: 'No gemini environment available',
+          retryAfterSec: 5,
+        })
+      }
+      const id = key.split(':').slice(1).join(':')
+      return {
+        lease_id: `gem-lease-${++seq}`,
+        lease_ttl_ms: 30_000,
+        resolved_pool_id: params.originPoolId || '__default_gemini__',
+        selected_node: { node_type: 'gemini_env', node_id: id, node_key: key },
+        explain: { affinity: { why: 'balanced' } },
+      }
+    },
+    async switchNode(body) {
+      return this.acquireNode(body.next_attempt || {})
+    },
+    async commitLease() {},
+    async releaseLease() {},
+  }
+}
 
 function sseResponse(chunks, { statusCode = 200, contentType = 'text/event-stream', headers = {} } = {}) {
   return {
@@ -111,7 +144,54 @@ test('Req 1: Gemini sticky session reuses Codex StickyRouter, retries 429 once w
   const inferCalls = []
   let failAWith429 = false
 
+  const stickyBySession = new Map()
+  const activeLeases = new Map()
+  let leaseSeq = 0
+  const stickyRuntime = {
+    async acquireNode(params) {
+      const excluded = new Set(params.excludeNodes || [])
+      const allowed = Array.isArray(params.allowedNodeKeys) ? params.allowedNodeKeys : []
+      const pinned = params.sessionId ? stickyBySession.get(params.sessionId) : null
+      const key =
+        pinned && allowed.includes(pinned) && !excluded.has(pinned) ? pinned : allowed.find((k) => !excluded.has(k))
+      if (!key) {
+        throw new SchedulerApiError({
+          status: 429,
+          code: 'pool_exhausted',
+          message: 'No gemini environment available',
+          retryAfterSec: 5,
+        })
+      }
+      const id = key.split(':').slice(1).join(':')
+      const leaseId = `gem-sticky-${++leaseSeq}`
+      activeLeases.set(leaseId, { sessionId: params.sessionId || null, nodeKey: key })
+      return {
+        lease_id: leaseId,
+        lease_ttl_ms: 30_000,
+        resolved_pool_id: params.originPoolId || '__default_gemini__',
+        selected_node: { node_type: 'gemini_env', node_id: id, node_key: key },
+        explain: { affinity: { why: pinned === key ? 'session_sticky' : 'balanced' } },
+      }
+    },
+    async switchNode(body) {
+      activeLeases.delete(body.release_lease_id)
+      return this.acquireNode(body.next_attempt || {})
+    },
+    async commitLease(leaseId) {
+      const rec = activeLeases.get(leaseId)
+      if (rec?.sessionId) stickyBySession.set(rec.sessionId, rec.nodeKey)
+    },
+    async releaseLease(leaseId, payload) {
+      const rec = activeLeases.get(leaseId)
+      activeLeases.delete(leaseId)
+      if (rec?.sessionId && payload?.outcome === 'ok') {
+        stickyBySession.set(rec.sessionId, rec.nodeKey)
+      }
+    },
+  }
+
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: stickyRuntime,
     stickyRouter,
     rateLimitRetryDelayMs: 0,
     resolveProxy: () => 'socks5h://u:p@192.0.2.10:1080',
@@ -137,16 +217,15 @@ test('Req 1: Gemini sticky session reuses Codex StickyRouter, retries 429 once w
     getRoutingConfig: () => ({ gemini: DEFAULT_GEMINI_ROUTING }),
   })
 
-  // Turn 1 pins sticky session to env-a in shared StickyRouter (platform: gemini).
+  // Turn 1 pins sticky session to env-a in Rust scheduler runtime and remembers outbound conversation_id.
   const t1 = await scheduler.complete({
     model: 'gemini-3-pro',
     text: 'first turn',
     stickyKey: 'k1:sess-429',
   })
   assert.equal(t1.account_id, 'env-a')
-  const bound1 = stickyRouter.resolve('k1:sess-429', { platform: 'gemini' })
-  assert.equal(bound1?.accountId, 'env-a')
-  assert.ok(bound1?.sessionId, 'outbound conversation_id is persisted in StickyRouter')
+  assert.equal(stickyBySession.get('k1:sess-429'), 'gemini_env:env-a')
+  assert.ok(t1.conversation_id, 'outbound conversation_id is minted and returned')
 
   // Turn 2: env-a hits 429 twice -> must actively retry env-a ONCE with restart_resume:true
   // keeping the same conversation_id, then release sticky and failover to env-b with new conv id!
@@ -176,8 +255,7 @@ test('Req 1: Gemini sticky session reuses Codex StickyRouter, retries 429 once w
     turn2Calls[0].conversation_id,
     'switching account must mint a new conversation_id',
   )
-  const bound2 = stickyRouter.resolve('k1:sess-429', { platform: 'gemini' })
-  assert.equal(bound2?.accountId, 'env-b', 'sticky binding migrated cleanly after failover')
+  assert.equal(stickyBySession.get('k1:sess-429'), 'gemini_env:env-b', 'sticky binding migrated cleanly after failover')
 
   // Verify buildDirectEnvelope forwards restart_resume: true when requested.
   const envPayload = buildDirectEnvelope({
@@ -210,6 +288,7 @@ test('Req 2: 503 fails over without tripping circuit or unschedulable; 502 honor
   const calls = []
 
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: makeMockGeminiRuntime(),
     slotPrefs,
     poolScheduler: pool,
     stickyRouter,
@@ -279,6 +358,7 @@ test('Req 3: All Gemini accounts unschedulable returns HTTP 429 High Load (gemin
   slotPrefs.patch('env-b', { schedulable: false })
 
   const scheduler = createGeminiScheduler({
+    schedulerRuntime: makeMockGeminiRuntime(),
     slotPrefs,
     resolveProxy: () => 'socks5h://u:p@192.0.2.10:1080',
     callHost: async (op) => {

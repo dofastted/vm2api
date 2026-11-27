@@ -9,6 +9,7 @@ import test from 'node:test'
 import { callGeminiHost, createGeminiPublicHandler } from '../../src/lib/gemini/routes.mjs'
 import { createGeminiScheduler } from '../../src/lib/gemini/scheduler.mjs'
 import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
+import { createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 
 test('per-run CLI eligibility survives native failure, host transport and public HTTP', {
   timeout: 20_000,
@@ -39,6 +40,7 @@ test('per-run CLI eligibility survives native failure, host transport and public
     callHost: callGeminiHost,
     resolveProxy: () => 'socks5h://192.0.2.1:1080',
     poolScheduler: pool,
+    schedulerRuntime: createMockSchedulerRuntime({ poolScheduler: pool }),
   })
   const handler = createGeminiPublicHandler({
     scheduler,

@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { validateCacheBreakpoints } from '../../src/lib/protocol/cache-ttl.mjs'
 import { withRequestProtocolBetas } from '../../src/lib/protocol/claude-code-betas.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../../src/lib/protocol/convert.mjs'
@@ -845,15 +846,17 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
       workerStatus: health,
     }
     rememberRustHealth(exec, { ok: true, health })
-    const runner = new FailoverRunner({
-      scheduler: {
-        async selectAndReserve() {
-          return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec, release() { } }
-        },
-        markSuccess() { },
-        markCooldown() { },
-        releaseAccountSessions() { },
+    const scheduler = {
+      async selectAndReserve() {
+        return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec, release() {} }
       },
+      markSuccess() {},
+      markCooldown() {},
+      releaseAccountSessions() {},
+    }
+    const runner = new FailoverRunner({
+      scheduler,
+      schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
       config: { max_same_account_retries: 0 },
     })
     const logs = []
@@ -867,9 +870,9 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
       once(ev, fn) {
         if (ev === 'finish') finishListeners.push(fn)
       },
-      off() { },
-      write() { },
-      end() { },
+      off() {},
+      write() {},
+      end() {},
     }
     const handler = createHandleProtocol({
       json(_res, status, body) {
@@ -879,7 +882,7 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
         for (const fn of finishListeners) fn()
         return body
       },
-      writeSSEHeaders() { },
+      writeSSEHeaders() {},
       readBody: async () => structuredClone(incoming),
       requireAuth: () => true,
       cfg: {
@@ -894,8 +897,8 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
         finish: (bag, second) => logs.push(second || bag),
       },
       stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
-      accountQuota: { ingestHeaders() { } },
-      apiKeyStore: { acquire: () => ({ ok: true }), release() { }, recordUsage() { } },
+      accountQuota: { ingestHeaders() {} },
+      apiKeyStore: { acquire: () => ({ ok: true }), release() {}, recordUsage() {} },
       apiScheduler: {},
       apiEndpointStore: {},
       stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
@@ -938,8 +941,8 @@ test('handleProtocol CRAG V3 path skips pre-slot persona bloat and fake metadata
         },
         apiKeyKind: 'managed',
         apiKeyRecord: { id: 'fixture' },
-        once() { },
-        off() { },
+        once() {},
+        off() {},
       },
       response,
       'anthropic.messages',

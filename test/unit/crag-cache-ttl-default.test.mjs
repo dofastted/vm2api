@@ -6,6 +6,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { OFFICIAL_CLAUDE_CLI_UA } from '../../src/lib/identity/vm-identity.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { createFailoverMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import { clearCachePrefixSessions } from '../../src/lib/protocol/cache-prefix.mjs'
 import {
   clearConversationCacheTtls,
@@ -147,15 +148,17 @@ async function runCragHop(t, { compatibility = {}, diskCompatibility = null, inp
     projectRoot: root,
     workerStatus: CRAG_V3_HEALTH,
   }
-  const runner = new FailoverRunner({
-    scheduler: {
-      async selectAndReserve() {
-        return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec, release() {} }
-      },
-      markSuccess() {},
-      markCooldown() {},
-      releaseAccountSessions() {},
+  const scheduler = {
+    async selectAndReserve() {
+      return { ok: true, vmId: vm.id, accountId: vm.id, vm, exec, release() {} }
     },
+    markSuccess() {},
+    markCooldown() {},
+    releaseAccountSessions() {},
+  }
+  const runner = new FailoverRunner({
+    scheduler,
+    schedulerRuntime: createFailoverMockSchedulerRuntime({ scheduler }),
     config: { max_same_account_retries: 0 },
   })
 

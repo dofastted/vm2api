@@ -34,7 +34,7 @@ import { ANTIGRAVITY_PROVIDERS, ANTIGRAVITY_QUOTA_GROUPS, isAntigravityRoutedMod
 import { normalizeGeminiOAuthImport } from './oauth-import.mjs'
 import { normalizeGeminiOutboundPrompt } from './prompt-normalizer.mjs'
 import { isGeminiProtocolAllowed } from './routing-config.mjs'
-import { GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
+import { GEMINI_HOST_RESOURCE_MESSAGES, GEMINI_LICENSE_MESSAGES } from './subscription.mjs'
 import { createGeminiSlotPrefs, parseGeminiDisplayName, parseGeminiScheduleLevel } from './slot-prefs.mjs'
 import { resolveCragGeminiPromptPolicy } from './system-prompt.mjs'
 import { configuredDnsUpstream, proxyDnsEmptyTypes } from '../vm/egress.mjs'
@@ -45,6 +45,9 @@ import {
   resolveRiskRepos,
   runUnifiedPreDispatch,
 } from '../protocol/unified-pre-dispatch.mjs'
+import { resolveSchedulerIdentity } from '../identity/identity-rewrite.mjs'
+import { queueAllowedByHeaders } from '../protocol/queue-hint.mjs'
+import { SchedulerApiError, SchedulerUnavailableError, formatSchedulerError } from '../scheduler/scheduler-runtime.mjs'
 
 const PANEL_PATH = '/api/panel/gemini'
 const PUBLIC_PATH = '/v1/gemini/sessions'
@@ -75,7 +78,7 @@ const RUN_ERRORS = {
   ],
   gemini_location_unsupported: [
     403,
-    'Google 判定当前账号或出口地区不支持 Antigravity（403 UNSUPPORTED_REGION）；拉取模型成功不代表可对话，请在「代理」页更换支持地区（如美国住宅）的代理后重试，或更换账号',
+    'Google 拒绝使用 Antigravity（403）。可能因出口地区不受支持（UNSUPPORTED_REGION），也可能因账号被停用；资格/拉取模型界面有时仍显示正常，请以实际对话测试为准。若为地区限制，请在「代理」页更换支持地区（如美国住宅）的代理后重试；若账号被停用，请申诉或更换账号',
   ],
   gemini_account_verification_required: [
     403,
@@ -87,7 +90,7 @@ const RUN_ERRORS = {
   ],
   gemini_account_ineligible: [
     403,
-    'Google 判定当前账号暂不符合 Antigravity 使用资格（403），请检查账号订阅状态、年龄限制或更换可用个人账号',
+    'Google 判定该账号不符合 Antigravity 资格或可能已被停用（403）。若上游原因为 TOS_VIOLATION，请在 Google 侧申诉或更换账号；资格查询不一定反映停用状态，请以实际对话为准',
   ],
   gemini_proxy_error: [
     502,
@@ -221,6 +224,7 @@ const HOST_ERRORS = {
     503,
     '宿主机非特权沙箱（bwrap）不可用，无法启动 Gemini 隔离进程；请前往「设置 → Gemini 维护」诊断宿主并检查宿主服务日志',
   ],
+  gemini_host_resource_exhausted: [503, GEMINI_HOST_RESOURCE_MESSAGES.gemini_host_resource_exhausted],
   // Unregistered codes fall through to FAILURE, which reads as "no host service at
   // all" -- the one answer this is not. The socket answered, so the host is up and
   // it is the authorization launch that failed; losing that sent #1622 looking at
@@ -879,9 +883,7 @@ function proxyEgressOptionsFor(proxyPool, proxyId, { ownerUserId = null } = {}) 
   if (proxy?.domain_forward === true || withAuth?.domain_forward === true) {
     opts.domain_forward = true
   }
-  const emptyTypes = proxyDnsEmptyTypes(
-    withAuth?.dns_disable_svcb_https !== undefined ? withAuth : proxy,
-  )
+  const emptyTypes = proxyDnsEmptyTypes(withAuth?.dns_disable_svcb_https !== undefined ? withAuth : proxy)
   if (emptyTypes.length) {
     opts.dns_empty_types = emptyTypes
   }
@@ -1832,6 +1834,33 @@ export function createGeminiPanelHandler({
 }
 
 function publicError(error) {
+  if (error instanceof SchedulerUnavailableError || error?.code === 'scheduler_unavailable') {
+    return {
+      status: 503,
+      retryAfter: 1,
+      body: {
+        error: {
+          type: 'api_error',
+          code: 'scheduler_unavailable',
+          message: error?.message || 'Rust scheduler sidecar is unavailable',
+        },
+      },
+    }
+  }
+  if (error instanceof SchedulerApiError) {
+    const formatted = formatSchedulerError(error)
+    return {
+      status: formatted.status,
+      retryAfter: formatted.retryAfterSec ?? undefined,
+      body: {
+        error: {
+          type: formatted.body?.error?.type || 'api_error',
+          code: formatted.code,
+          message: formatted.body?.error?.message || error.message || 'Scheduler rejected request',
+        },
+      },
+    }
+  }
   const code = typeof error?.code === 'string' ? error.code : FAILURE
   if (code === FAILURE || HOST_INFRASTRUCTURE_CODES.has(code)) {
     return {
@@ -2168,6 +2197,8 @@ export function createGeminiPublicHandler({
   readBody,
   scheduler,
   stickyRouter = null,
+  schedulerRuntime = null,
+  getSchedulerRuntime = null,
   requestLog = null,
   groupsRepo = null,
   apiKeyStore = null,
@@ -2182,6 +2213,8 @@ export function createGeminiPublicHandler({
   poolsRepo = null,
   geminiOwnerMap = null,
 }) {
+  const resolveRuntime = () =>
+    (typeof getSchedulerRuntime === 'function' ? getSchedulerRuntime() : schedulerRuntime) || null
   const geminiScopeFromReq = (req) => {
     const rec = req?.apiKeyRecord || null
     const policy = req.apiKeyKind === 'managed' ? keyTierPolicyFromRecord(rec) : null
@@ -2588,7 +2621,12 @@ export function createGeminiPublicHandler({
     if (poolAccess.effectivePool?.id) {
       logBag.resolved_pool_id = poolAccess.effectivePool.id
     }
-    const geminiScope = narrowGeminiScope(baseGeminiScope, poolAccess)
+    // For managed pools (legacy === false), Rust Stage 0/4 is the sole pool membership
+    // authority (origin_pool_id + allowed_pool_ids + fallback_pool_id); do not lock POST
+    // inference `allowedEnvIds` to originPool only, which would truncate Stage 4 fallback.
+    const geminiScope = poolAccess.legacy
+      ? baseGeminiScope
+      : { ownerScope: baseGeminiScope.ownerScope, allowedEnvIds: null }
 
     // Bypasses #1-#4 closed: every public Gemini inference call must clear the
     // unified pre-dispatch JEV gate BEFORE any Gemini account/slot reservation.
@@ -2819,6 +2857,17 @@ export function createGeminiPublicHandler({
       }
     }
 
+    const inboundIdentity = resolveSchedulerIdentity({
+      inbound: body,
+      headers: req.headers,
+      poolId: poolAccess.effectivePool?.id || '',
+      apiKeyId: req.apiKeyRecord?.id || '',
+    })
+    const jevDowngradePoolId =
+      gateDecision?.jev_downgrade_pool_id || req._preDispatchDecision?.jev_downgrade_pool_id || null
+    const noQueue = !queueAllowedByHeaders(req.headers)
+    const activeSchedulerRuntime = resolveRuntime()
+
     if (!supportsStream) {
       try {
         const turn = await scheduler.complete({
@@ -2827,9 +2876,16 @@ export function createGeminiPublicHandler({
           requestId: activeLogCtx?.request_id,
           startedAt,
           stickyKey: stickyHeader ? `${req.apiKeyRecord?.id || 'anon'}:${stickyHeader.slice(0, 128)}` : null,
+          inboundIdentity,
           signal: controller.signal,
           apiKeyRecord: req.apiKeyRecord,
+          apiKeyKind: req.apiKeyKind || null,
+          poolAccess,
+          originPoolId: poolAccess.originPool?.id || poolAccess.effectivePool?.id || null,
+          jevDowngradePoolId,
+          noQueue,
           allowUnprefixedNonGemini: keyGroupType === 'gemini',
+          ...(activeSchedulerRuntime ? { schedulerRuntime: activeSchedulerRuntime } : {}),
           ...(catalogSnapshot ? { catalogSnapshot } : {}),
           ...geminiScope,
         })
@@ -3024,9 +3080,16 @@ export function createGeminiPublicHandler({
         unsupportedFields: parsed.unsupportedFields,
         plainText: parsed.plainText,
         stickyKey,
+        inboundIdentity,
         signal: controller.signal,
         apiKeyRecord: req.apiKeyRecord,
+        apiKeyKind: req.apiKeyKind || null,
+        poolAccess,
+        originPoolId: poolAccess.originPool?.id || poolAccess.effectivePool?.id || null,
+        jevDowngradePoolId,
+        noQueue,
         allowUnprefixedNonGemini: keyGroupType === 'gemini',
+        ...(activeSchedulerRuntime ? { schedulerRuntime: activeSchedulerRuntime } : {}),
         ...(catalogSnapshot ? { catalogSnapshot } : {}),
         ...geminiScope,
         onEvent: wantStream

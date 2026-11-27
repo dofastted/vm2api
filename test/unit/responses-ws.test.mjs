@@ -1,15 +1,18 @@
-import { test, beforeEach } from 'node:test'
+import { test, before, after, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
+import { fileURLToPath } from 'node:url'
 import { WebSocket } from 'ws'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { listVms } from '../../src/lib/vm/vm-registry.mjs'
+import { createSchedulerRuntime, formatNodeKey } from '../../src/lib/scheduler/scheduler-runtime.mjs'
 import {
   createResponsesWsHandler,
   createSseJsonBridge,
@@ -18,6 +21,56 @@ import {
   isProtocolWarmup,
   responseInterruptAcceptedFrame,
 } from '../../src/lib/protocol/responses-ws.mjs'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const REPO_ROOT = path.resolve(__dirname, '../..')
+
+function resolveSchedulerBin() {
+  for (const candidate of [
+    process.env.KIN_SCHEDULER_BIN,
+    path.join(REPO_ROOT, 'bin', process.platform === 'win32' ? 'kin-scheduler.exe' : 'kin-scheduler'),
+    '/tmp/vm2api-sched-m3-target/release/kin-scheduler',
+    '/tmp/vm2api-sched-target/release/kin-scheduler',
+  ]) {
+    if (candidate && fs.existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+let sharedWsSchedRoot = null
+let sharedWsSchedulerRuntime = null
+let activeWsProjectRoot = null
+
+before(async () => {
+  const binPath = resolveSchedulerBin()
+  assert.ok(binPath, 'kin-scheduler binary must exist for responses-ws tests (set KIN_SCHEDULER_BIN)')
+  sharedWsSchedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'responses-ws-rust-sched-'))
+  sharedWsSchedulerRuntime = createSchedulerRuntime({
+    cfg: { paths: { data: sharedWsSchedRoot, project: sharedWsSchedRoot } },
+    getVms: () => (activeWsProjectRoot && fs.existsSync(activeWsProjectRoot) ? listVms(activeWsProjectRoot) : []),
+    getRoutingConfig: () => ({}),
+    telemetryIntervalMs: 0,
+    clientOptions: {
+      binPath,
+      socketPath: path.join(sharedWsSchedRoot, 'run', 'scheduler.sock'),
+      tokenPath: path.join(sharedWsSchedRoot, 'run', 'scheduler.token'),
+      capFile: path.join(sharedWsSchedRoot, 'run', 'scheduler.cap.json'),
+      manageProcess: true,
+    },
+  })
+  await sharedWsSchedulerRuntime.start({ waitMs: 5_000, startLoops: false })
+})
+
+after(async () => {
+  if (sharedWsSchedulerRuntime) {
+    await sharedWsSchedulerRuntime.shutdown({ drain: false, stopProcess: true })
+    sharedWsSchedulerRuntime = null
+  }
+  if (sharedWsSchedRoot) {
+    fs.rmSync(sharedWsSchedRoot, { recursive: true, force: true })
+    sharedWsSchedRoot = null
+  }
+})
 
 function json(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
@@ -195,12 +248,19 @@ async function listenWithHandleProtocol(
       codex: codexRouting,
     }),
   )
+  activeWsProjectRoot = root
+  await sharedWsSchedulerRuntime.syncConfigNow('responses_ws_test')
+  await sharedWsSchedulerRuntime.pushTelemetryNow()
+  for (const vm of listVms(root)) {
+    await sharedWsSchedulerRuntime.unrestNode(formatNodeKey('codex_vm', vm.id)).catch(() => {})
+  }
   const stats = { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 }
   const { handleProtocol } = createHandleProtocol({
     json,
     writeSSEHeaders,
     readBody: readJson,
     requireAuth,
+    schedulerRuntime: sharedWsSchedulerRuntime,
     cfg: {
       rewrite: { enabled: false },
       intercept: { rules: [] },
