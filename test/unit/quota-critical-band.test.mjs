@@ -7,6 +7,7 @@ import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { officialMessagesBody } from '../../src/lib/protocol/anthropic-messages.mjs'
 import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { SchedulerApiError } from '../../src/lib/scheduler/scheduler-runtime.mjs'
 import { createFailoverMockSchedulerRuntime, createMockSchedulerRuntime } from '../helpers/mock-scheduler-runtime.mjs'
 import {
   estimatePromptTokens,
@@ -305,15 +306,22 @@ test('all in-band accounts yield quota_guard_request_too_large', async (t) => {
       projectRoot: root,
       listNodes: () => [],
       exhaustedError: () =>
-        Object.assign(new Error('Request exceeds remaining quota band'), {
-          code: 'quota_guard_request_too_large',
+        new SchedulerApiError({
           status: 429,
+          code: 'quota_guard_request_too_large',
+          message: 'Request exceeds remaining quota band',
         }),
     }),
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
   })
-  const selected = { ok: false, reason: 'quota_guard_request_too_large' }
+  const selected = await pool.selectAndReserve({
+    model: 'claude-sonnet-4-5',
+    allowWait: false,
+    quotaRequest,
+  })
+  assert.equal(selected.ok, false)
+  assert.equal(selected.reason, 'quota_guard_request_too_large')
   const scheduler = {
     selectAndReserve: async () => selected,
   }
@@ -332,7 +340,6 @@ test('all in-band accounts yield quota_guard_request_too_large', async (t) => {
   })
   assert.equal(result.status, 429)
   assert.equal(result.body.error.code, 'quota_guard_request_too_large')
-  assert.equal(pool.accountQuota, accountQuota)
 })
 
 test('peek does not record; unconfirmed attempts stay cold', () => {
