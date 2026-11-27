@@ -101,10 +101,17 @@ export function SystemPreview({
   })
 
   const standing = agentStandingVar(compat, preset).trimEnd()
+  const usagePassthrough = presetFlagEnabled(
+    compat,
+    'usage_passthrough_presets',
+    preset
+  )
   const standingMasked =
     !!standing &&
+    !usagePassthrough &&
     presetFlagEnabled(compat, 'agent_standing_hide_presets', preset)
-  const blocksMasked = personaHideEnabled(compat, preset, blocks)
+  const blocksMasked =
+    !usagePassthrough && personaHideEnabled(compat, preset, blocks)
   const selected = selectedPreviewBlocks(
     migrateLegacyOfficialTemplate(preset, blocks),
     compat,

@@ -365,6 +365,7 @@ export function presetFlagEnabled(compat, field, preset) {
     'persona_timezone_presets',
     'persona_locale_presets',
     'persona_guidance_presets',
+    'usage_passthrough_presets',
   ].includes(field)
   const defaultValue = !optIn
   const map = compat?.[field]
@@ -388,6 +389,7 @@ export const PRESET_FLAG_FIELDS = Object.freeze([
   'persona_timezone_presets',
   'persona_locale_presets',
   'persona_guidance_presets',
+  'usage_passthrough_presets',
 ])
 
 /** zero、官方、官方完整都可按块 id 关掉。guidance 默认关，显式 true 才注入。 */
