@@ -1,6 +1,12 @@
 import { detectDistill, distillBlockError, isOpenaiPlatformModel } from '../core/distill-detect.mjs'
 import { redactSecrets } from '../core/security.mjs'
-import { ErrorType, isThirdPartyClientMessage, makeError, makeRefusalGuardError } from '../core/errors.mjs'
+import {
+  ErrorType,
+  isThirdPartyClientMessage,
+  makeError,
+  makePolicyOverloadError,
+  makeRefusalGuardError,
+} from '../core/errors.mjs'
 import {
   blockedRiskTool,
   DEFAULT_BAN_STEPS,
@@ -11,10 +17,12 @@ import {
   refusalPreview,
   refusalPromptSignature,
   refusalAuditIdentity,
+  refusalSessionId,
   upstreamRiskReason,
 } from '../core/refusal-guard.mjs'
 import {
   HARD_POLICY_RULES,
+  POLICY_BLOCK_MESSAGE,
   classifyJev,
   isPolicyBlockMemory,
   jevDocument,
@@ -72,29 +80,52 @@ export function systemRewrite(document) {
   return ''
 }
 
-function enforcesBan(policy, row) {
-  return !!(policy?.enabled && (policy.device_block_enabled || row.reason?.endsWith(':nsfw')))
+function isJevReason(reason) {
+  return typeof reason === 'string' && reason.startsWith('jev:') && reason !== 'jev:unavailable'
 }
 
-function recordBan(decision, { devices, policy, requestId }) {
-  if (!decision.banDevice || !decision.identity) return
-  if (!policy?.enabled || (!policy.device_block_enabled && !decision.forceDeviceBan)) return
-  const identity = decision.identity
+function retryAfterFromExpiry(expiresAt, now, fallbackSec = 600) {
+  const ms = expiresAt ? Date.parse(expiresAt) - now : NaN
+  if (!Number.isFinite(ms) || ms <= 0) return fallbackSec
+  return Math.max(1, Math.ceil(ms / 1000))
+}
+
+function enforcesBan(policy, row) {
+  if (isJevReason(row?.reason)) {
+    if (row?.subject_kind === 'session' && policy?.session_block_enabled === false) return false
+    return true
+  }
+  return !!(policy?.enabled && (policy.device_block_enabled || row?.reason?.endsWith(':nsfw')))
+}
+
+function recordBan(decision, { devices, policy, requestId, now = Date.now() }) {
+  if (!decision.banDevice || !decision.identity) return null
+  const jevHit = isJevReason(decision.reason)
+  if (!jevHit && (!policy?.enabled || (!policy.device_block_enabled && !decision.forceDeviceBan))) return null
+  const identity =
+    policy?.session_block_enabled === false && decision.identity.sessionId
+      ? { ...decision.identity, sessionId: '' }
+      : decision.identity
   const store = devices
   const evidence = { requestId, fingerprint: decision.fingerprint || null, reason: decision.reason || decision.kind }
   try {
     if (store?.recordViolation) {
-      store.recordViolation(identity, {
-        ...evidence,
-        steps: policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS,
-        accepts: (row) => enforcesBan(policy, row),
-      })
-    } else if (identity.deviceId) {
-      store?.block?.({ ...evidence, deviceId: identity.deviceId })
+      return (
+        store.recordViolation(identity, {
+          ...evidence,
+          steps: policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS,
+          now,
+          accepts: (row) => enforcesBan(policy, row),
+        }) || null
+      )
+    }
+    if (identity.deviceId) {
+      return store?.block?.({ ...evidence, deviceId: identity.deviceId }) || null
     }
   } catch {
     console.warn('[risk-audit] failed to persist ban')
   }
+  return null
 }
 
 export function observeUpstreamRisk({ inbound, body, identity, result, logBag, requestId, policy, repo, devices }) {
@@ -172,7 +203,7 @@ function similarityRatio(value) {
   return n > 1 ? n / 100 : n
 }
 
-export function commitProtocolBlock(decision, { repo, devices, sessions, policy, requestId } = {}) {
+export function commitProtocolBlock(decision, { repo, devices, sessions, policy, requestId, now = Date.now() } = {}) {
   if (!decision || decision.action !== 'block') return
   if (decision.kind === 'session') {
     try {
@@ -197,7 +228,22 @@ export function commitProtocolBlock(decision, { repo, devices, sessions, policy,
       console.warn('[risk-audit] failed to record refusal cache hit')
     }
   }
-  recordBan(decision, { devices, policy, requestId })
+  // JEV session bans are persisted tenant-scoped via devices.recordViolation
+  // (keyed by sha256(principal, 'session', rootSessionId)) instead of the
+  // unscoped global refusal_session_blocks table, preventing cross-tenant DoS.
+  const ban = recordBan(decision, { devices, policy, requestId, now })
+  if (decision.kind === 'jev' && isJevReason(decision.reason) && ban?.subject_kind === 'device') {
+    if (!ban.expires_at) {
+      decision.error = refusalGuardError(requestId, { kind: 'device', row: ban })
+      decision.errorMessage = `${POLICY_BLOCK_MESSAGE}: ${decision.category}（第 ${ban.violations || 3} 次违规，设备永久封禁）`
+    } else {
+      decision.error = makePolicyOverloadError({
+        requestId,
+        retryAfterSec: retryAfterFromExpiry(ban.expires_at, now),
+      })
+      decision.errorMessage = `${POLICY_BLOCK_MESSAGE}: ${decision.category}（第 ${ban.violations || 1} 次违规，设备封禁至 ${ban.expires_at}）`
+    }
+  }
 }
 
 function pass(by, keyword = '', route = null) {
@@ -250,9 +296,13 @@ export async function evaluateProtocolIntercept({
   backend = 'oauth',
   openaiPlatform = isOpenaiPlatformModel(inbound, body),
   skipMandatory = false,
+  now = Date.now(),
 } = {}) {
   const audit = policy?.risk_audit
-  const reject = (fields) => block({ deviceId: identity.deviceId, identity, ...fields })
+  const rootSessionId = refusalSessionId({ inbound, body, headers }) || identity.sessionId || ''
+  const effectiveIdentity =
+    rootSessionId && rootSessionId !== identity.sessionId ? { ...identity, sessionId: rootSessionId } : identity
+  const reject = (fields) => block({ deviceId: effectiveIdentity.deviceId, identity: effectiveIdentity, ...fields })
   const interceptOpts = { interceptSession, ctx: bodyCtx }
   let rawDocument
   if (!skipMandatory) {
@@ -267,6 +317,7 @@ export async function evaluateProtocolIntercept({
           via: 'refusal-guard',
           final_state: 'refusal_session',
           error,
+          logErrorCode: 'refusal_guard',
           errorMessage: error.body?.error?.message,
           intercept: gateVerdict({ kind: 'block', by: 'refusal', keyword: 'session' }),
           sessionId: refused.sessionId,
@@ -276,17 +327,24 @@ export async function evaluateProtocolIntercept({
         })
       }
     }
-    const banned = devices?.findBan?.(identity, Date.now(), (row) => enforcesBan(policy, row))
+    const banned = devices?.findBan?.(effectiveIdentity, now, (row) => enforcesBan(policy, row))
     if (banned) {
-      const error = refusalGuardError(requestId, { kind: 'device', row: banned })
+      const tempJevBan = banned.subject_kind === 'device' && isJevReason(banned.reason) && !!banned.expires_at
+      const error = tempJevBan
+        ? makePolicyOverloadError({ requestId, retryAfterSec: retryAfterFromExpiry(banned.expires_at, now) })
+        : refusalGuardError(requestId, { kind: 'device', row: banned })
+      const errorMessage = tempJevBan
+        ? `此设备因 ${banned.reason} 临时封禁至 ${banned.expires_at}（第 ${banned.violations || 1} 次违规）`
+        : error.body.error.message
       return reject({
         kind: 'device',
-        reason: 'refusal_device',
+        reason: banned.subject_kind === 'session' ? 'refusal_session' : 'refusal_device',
         deviceId: banned.device_id,
         via: 'refusal-guard',
-        final_state: 'refusal_device',
+        final_state: banned.subject_kind === 'session' ? 'refusal_session' : 'refusal_device',
         error,
-        errorMessage: error.body.error.message,
+        logErrorCode: 'refusal_guard',
+        errorMessage,
         intercept: gateVerdict({ kind: 'block', by: 'refusal', keyword: banned.subject_kind }),
       })
     }
@@ -455,41 +513,67 @@ export async function evaluateProtocolIntercept({
 
   if (jev?.enabled) {
     const modelDocument = jevModelDocument(inbound, body, interceptOpts)
-    const verdict = await classifyJev(modelDocument, { ...jev, policy_request_id: requestId }, fetchImpl)
+    const verdict = await classifyJev(modelDocument, { ...jev, policy_request_id: requestId }, fetchImpl, now)
     if (verdict.action === 'block') {
       const unavailable = verdict.reason === 'unavailable'
-      const error = policyBlockError(requestId)
       const detail = String(verdict.detail || '')
         .replace(/\s+/g, ' ')
         .trim()
         .slice(0, 120)
       if (unavailable) {
+        const error = policyBlockError(requestId)
         error.status = 503
         error.body.error.type = ErrorType.OVERLOADED
         error.body.error.message = detail
           ? `${error.body.error.message}: 决策模型不可用（${detail}）。本次请求已拦截，未封禁设备`
           : `${error.body.error.message}: 决策模型不可用。本次请求已拦截，未封禁设备`
         error.body.error.details = { reason: 'unavailable', ...(detail ? { detail } : {}) }
+        return reject({
+          kind: 'jev',
+          via: 'jev',
+          final_state: 'policy_blocked',
+          error,
+          logErrorCode: 'policy_blocked',
+          errorMessage: error.body.error.message,
+          intercept: gateVerdict({
+            kind: 'block',
+            by: 'jev',
+            keyword: 'unavailable',
+          }),
+          jevState: '',
+          category: 'unavailable',
+          banSession: false,
+          banDevice: false,
+          forceDeviceBan: false,
+          reason: 'jev:unavailable',
+        })
       }
       const category = verdict.category || 'safety'
-      if (!unavailable) error.body.error.details = { reason: `jev:${category}`, retryable: false }
+      const steps = policy?.risk_audit?.ban_steps || DEFAULT_BAN_STEPS
+      const firstMinutes = Number(steps[0]) > 0 ? Number(steps[0]) : 10
+      const error = makePolicyOverloadError({ requestId, retryAfterSec: firstMinutes * 60 })
       return reject({
         kind: 'jev',
         via: 'jev',
         final_state: 'policy_blocked',
         error,
-        errorMessage: unavailable ? error.body.error.message : `${error.body?.error?.message}: ${category}`,
+        logErrorCode: 'policy_blocked',
+        errorMessage: `${POLICY_BLOCK_MESSAGE}: ${category}`,
         intercept: gateVerdict({
           kind: 'block',
           by: 'jev',
-          keyword: unavailable ? 'unavailable' : category,
+          keyword: category,
         }),
         // Exact payload.state. Context the model scored, not a span it named.
-        jevState: unavailable ? '' : verdict.state || '',
-        category: unavailable ? 'unavailable' : category,
-        banDevice: !unavailable,
-        forceDeviceBan: !unavailable && (category === 'nsfw' || (verdict.categories || []).includes('nsfw')),
-        reason: unavailable ? 'jev:unavailable' : `jev:${category}`,
+        jevState: verdict.state || '',
+        category,
+        sessionId: rootSessionId,
+        model: body?.model || inbound?.model || '',
+        preview: refusalPreview(body, inbound),
+        banSession: true,
+        banDevice: true,
+        forceDeviceBan: true,
+        reason: `jev:${category}`,
       })
     }
     const by =

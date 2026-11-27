@@ -314,8 +314,13 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       assert.equal(audited.length, review.model && review.enabled ? 1 : 0)
       if (audited.length) assert.match(audited[0].state, /hello/)
       if (review.enabled && (review.risky || review.block)) {
-        assert.equal(response.status, 403, JSON.stringify(response.body))
-        assert.equal(response.body.error.code, 'policy_blocked')
+        if (review.block && !review.risky) {
+          assert.equal(response.status, 429, JSON.stringify(response.body))
+          assert.equal(response.body.error.code, 'pool_overloaded')
+        } else {
+          assert.equal(response.status, 403, JSON.stringify(response.body))
+          assert.equal(response.body.error.code, 'policy_blocked')
+        }
         assert.equal(captured.length, 0, 'blocked content must never reach the API upstream')
         assert.equal(acquired, 0)
         return

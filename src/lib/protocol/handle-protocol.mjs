@@ -587,7 +587,7 @@ export function createHandleProtocol(deps) {
     logBag.via = decision.via
     logBag.attempt_count = 0
     logBag.final_state = decision.final_state
-    logBag.error_code = decision.error?.body?.error?.code || null
+    logBag.error_code = decision.logErrorCode || decision.error?.body?.error?.code || null
     logBag.error_message = decision.errorMessage || decision.error?.body?.error?.message || null
     logBag.intercept = decision.intercept || null
     logBag.jev_state = decision.jevState || null
@@ -595,6 +595,7 @@ export function createHandleProtocol(deps) {
       res.write(buildAnthropicSseError(decision.error.body.error))
       res.end()
     } else {
+      if (decision.error?.retryAfterSec) res.setHeader?.('retry-after', String(decision.error.retryAfterSec))
       json(res, decision.error.status, decision.error.body)
     }
     return true
