@@ -1,5 +1,6 @@
 import type { Vm } from '@/types/panel-vm'
 import { describe, expect, it } from 'vitest'
+import { geminiSlot } from '@/features/vm/gemini-slot'
 import {
   DEFAULT_GEMINI_TEST_PROMPT,
   defaultGeminiTestModel,
@@ -252,12 +253,36 @@ describe('Gemini account presentation', () => {
       '宿主运行环境故障'
     )
     expect(geminiInferenceErrorLabel('gemini_inference_failed')).toBe(
-      '未知原因'
+      '上游推理失败（502）'
+    )
+    expect(geminiInferenceErrorLabel('gemini_upstream_unavailable')).toBe(
+      '上游服务暂时不可用（503）'
+    )
+    expect(geminiInferenceErrorLabel('gemini_pool_overloaded')).toBe(
+      '号池高负载（全部账号不可调度）'
     )
     expect(geminiInferenceErrorLabel('raw upstream failure or secret')).toBe(
       '未知原因'
     )
     expect(geminiInferenceErrorLabel(null)).toBe('未知原因')
+
+    // 502 persisted unschedulable state projects to unschedulable schedule_state and accurate error text.
+    const parked502 = geminiSlot({
+      ...candidate,
+      unschedulable: {
+        reason: 'upstream_502',
+        detail: '502 bad gateway',
+        at: '2026-11-26T12:00:00Z',
+        upstream_status: 502,
+      },
+    })
+    expect(parked502.schedule_state).toBe('unschedulable')
+    expect(parked502.unschedulable_reason).toBe('upstream_502')
+    expect(parked502.unschedulable_text).toBe('上游 502 异常 · 已暂停调度')
+    expect(parked502.unschedulable_detail).toMatchObject({
+      message: '502 bad gateway',
+      upstream_status: 502,
+    })
   })
 
   it('uses only current inventory evidence after a rebind or restart', () => {

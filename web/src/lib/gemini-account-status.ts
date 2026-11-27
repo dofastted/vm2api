@@ -42,15 +42,36 @@ type AccountCircuit = {
   open_ms: number
 }
 
+type AccountUnschedulable = {
+  reason: string
+  detail?: string
+  at?: string
+  upstream_status?: number
+  error_code?: string
+}
+
+type AccountCheckMeta = {
+  state?: 'ok' | 'partial' | 'error' | 'reauth_required'
+  checked_at?: string | null
+  error_code?: string | null
+  error_message?: string | null
+  http_status?: number | null
+  eligibility?: string | null
+}
+
 type Account = Authorization &
   InferenceEvidence & {
     models_discovered?: boolean
     models: readonly string[]
     proxy_ready?: boolean
     schedulable?: boolean
+    unschedulable?: AccountUnschedulable | null
+    unschedulable_reason?: string | null
+    unschedulable_detail?: string | null
     restriction?: AccountRestriction | null
     circuit?: AccountCircuit | null
     crag_license?: CragLicense | null
+    account?: AccountCheckMeta | null
   }
 
 type InventoryPrerequisites = {
@@ -140,6 +161,10 @@ const INFERENCE_ERROR_LABELS: Readonly<Record<string, string>> = {
   gemini_api_key_invalid: '该次请求的 API Key 被拒绝',
   gemini_api_key_rejected: '该次请求的 API Key 被拒绝',
   gemini_quota_exhausted: '额度用尽',
+  gemini_pool_overloaded: '号池高负载（全部账号不可调度）',
+  gemini_upstream_unavailable: '上游服务暂时不可用（503）',
+  gemini_content_rejected: '内容触发上游过滤（429）',
+  gemini_inference_failed: '上游推理失败（502）',
   gemini_inference_timeout: '请求超时',
   gemini_inference_bad_input: '推理输入不受支持',
   gemini_inference_invalid_output: '响应无法解析',
@@ -276,6 +301,12 @@ const INFERENCE_ERROR_ACTIONS: Readonly<Record<string, string>> = {
     '处理方式：请在 Google AI Studio 核对 API Key 有效性、计费状态与项目权限后重新填写。',
   gemini_quota_exhausted:
     '处理方式：上游配额已耗尽（429），请等待配额重置、改用其他模型或切换至其他可用账号。',
+  gemini_pool_overloaded:
+    '处理方式：当前所有 Gemini 账号均不可调度或处于冷却/高负载，请检查账号错误状态、恢复 502 暂停账号或稍后重试。',
+  gemini_upstream_unavailable:
+    '处理方式：Google 上游返回 503 临时不可用，调度器已自动保留 agy 进程并切号，无需人工重启。',
+  gemini_content_rejected:
+    '处理方式：提示词触发上游内容过滤（429），账号配额未受影响，请调整提示词后重试。',
   gemini_proxy_error:
     '处理方式：请在「代理」页探活检查 SOCKS5 节点连通性与出口稳定性，或更换代理后重试。',
   gemini_proxy_unavailable:
@@ -445,11 +476,63 @@ export function geminiEligibilityNotice(
 
 const PENDING_TONE: StatusTone = { key: 'pending', cls: 'none', text: '待验证' }
 
+const UNSCHEDULABLE_REASON_LABELS: Readonly<Record<string, string>> = {
+  upstream_502: '上游 502 异常 · 已暂停调度',
+  proxy_502: '代理 502 异常 · 已暂停调度',
+  reauth_required: 'OAuth 凭证失效 · 需重新授权',
+  verification_required: '需完成 Google 身份验证',
+  location_unsupported: '账号/代理地区不支持',
+  ineligible: '账号资格受限',
+}
+
+export function geminiUnschedulableLabel(
+  reason?: string | null,
+  detail?: string | null
+): string {
+  if (
+    reason &&
+    Object.prototype.hasOwnProperty.call(UNSCHEDULABLE_REASON_LABELS, reason)
+  ) {
+    return UNSCHEDULABLE_REASON_LABELS[reason]
+  }
+  if (detail && detail.trim()) return detail.trim()
+  return '不可调度'
+}
+
+export function geminiAccountErrorText(
+  account?: AccountCheckMeta | null
+): string | null {
+  if (!account) return null
+  if (account.error_message && account.error_message.trim()) {
+    const statusSuffix =
+      typeof account.http_status === 'number' && account.http_status > 0
+        ? ` (HTTP ${account.http_status})`
+        : ''
+    return `${account.error_message.trim()}${
+      account.error_message.includes(String(account.http_status ?? ''))
+        ? ''
+        : statusSuffix
+    }`
+  }
+  if (account.error_code) {
+    return geminiInferenceErrorLabel(account.error_code)
+  }
+  if (account.state === 'reauth_required') return '需要重新完成 Google 授权'
+  if (account.state === 'error') return '定时状态检查失败，请检查代理或刷新账号'
+  return null
+}
+
 function candidateBlocker(
   environment: Account,
   hostBlocker?: string | null
 ): string | null {
   if (environment.auth_state !== 'authorized') return null
+  if (environment.unschedulable?.reason) {
+    return geminiUnschedulableLabel(
+      environment.unschedulable.reason,
+      environment.unschedulable.detail
+    )
+  }
   if (environment.auth_method === 'oauth' && environment.oauth_imported) {
     return '需完成官方 Google 授权'
   }
